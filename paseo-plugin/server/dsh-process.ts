@@ -283,7 +283,7 @@ export class DshProcess {
 
   /** List the DSH sessions a user could import into Paseo. */
   async sessions(options: { query?: string; cwd?: string; limit?: number } = {}): Promise<
-    Array<{ sessionId: string; cwd?: string; title?: string; createdAt?: number }>
+    Array<{ sessionId: string; cwd?: string; title?: string; preview?: string; updatedAt?: string }>
   > {
     const result = (await this.#request(
       "paseo/sessions",
@@ -293,7 +293,7 @@ export class DshProcess {
         ...(options.limit === undefined ? {} : { limit: options.limit }),
       },
       60000,
-    )) as { sessions?: Array<{ sessionId: string; cwd?: string; title?: string; createdAt?: number }> };
+    )) as { sessions?: Array<{ sessionId: string; cwd?: string; title?: string; preview?: string; updatedAt?: string }> };
     return result.sessions ?? [];
   }
 

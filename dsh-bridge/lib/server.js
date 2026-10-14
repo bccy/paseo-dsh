@@ -384,26 +384,67 @@ export class PaseoHarnessServer {
     } catch {
       snapshots = [];
     }
-    // Titles come from the session-query corpus, which is not mounted for reads
-    // here and hangs instead of answering; the import list shows cwd instead.
     const query = typeof params.query === 'string' && params.query !== '' ? params.query.toLowerCase() : undefined;
     const cwdFilter = typeof params.cwd === 'string' && params.cwd !== '' ? params.cwd : undefined;
-    const rows = [];
+    const candidates = [];
     for (const snapshot of snapshots) {
       const id = snapshot?.header?.id === undefined ? undefined : String(snapshot.header.id);
       if (id === undefined || id === '') continue;
-      const cwd = snapshot.header.cwd;
-      if (cwdFilter !== undefined && cwd !== cwdFilter) continue;
+      if (cwdFilter !== undefined && snapshot.header.cwd !== cwdFilter) continue;
       if (query !== undefined && !id.toLowerCase().includes(query)) continue;
-      rows.push({
-        sessionId: id,
-        ...(cwd === undefined ? {} : { cwd }),
-        ...(snapshot.header.createdAt === undefined ? {} : { createdAt: snapshot.header.createdAt }),
-      });
+      candidates.push(snapshot);
     }
-    rows.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
-    const limit = typeof params.limit === 'number' && params.limit > 0 ? params.limit : 50;
-    return { available: true, sessions: rows.slice(0, limit) };
+    candidates.sort((a, b) => (b.header.createdAt ?? 0) - (a.header.createdAt ?? 0));
+    const limit = typeof params.limit === 'number' && params.limit > 0 ? params.limit : 40;
+    const picked = candidates.slice(0, limit);
+    // A title and a first-message preview make sessions distinguishable; both
+    // come from the log prefix, read concurrently so a long list stays quick.
+    const summaries = await Promise.all(picked.map((snapshot) => this.#sessionSummary(persistence, snapshot)));
+    return { available: true, sessions: summaries };
+  }
+
+  /** Read one session's log prefix for its title and first user message. */
+  async #sessionSummary(persistence, snapshot) {
+    const id = String(snapshot.header.id);
+    const row = {
+      sessionId: id,
+      ...(snapshot.header.cwd === undefined ? {} : { cwd: snapshot.header.cwd }),
+      ...(snapshot.header.createdAt === undefined
+        ? {}
+        : { updatedAt: new Date(snapshot.header.createdAt).toISOString() }),
+    };
+    let handle;
+    try {
+      handle = await withTimeout(persistence.open(id, 'read'), 10000, 'opening session summary');
+      const result = await withTimeout(handle.read(0, 200), 10000, 'reading session summary');
+      let title;
+      let preview;
+      for (const event of result.events ?? []) {
+        if (event.type === 'session/title' && typeof event.data?.title === 'string' && event.data.title !== '') {
+          title = event.data.title;
+        }
+        if (preview === undefined && event.type === 'user/message' && event.data?.source?.kind === 'user') {
+          const text = (event.data.content ?? [])
+            .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+            .map((block) => block.text)
+            .join(' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          if (text !== '') preview = text.slice(0, 120);
+        }
+      }
+      if (typeof title === 'string' && title !== '') row.title = title;
+      if (typeof preview === 'string' && preview !== '') row.preview = preview;
+    } catch {
+      /* A session that will not read is still listed, just without a summary. */
+    } finally {
+      try {
+        await handle?.close();
+      } catch {
+        /* idempotent close */
+      }
+    }
+    return row;
   }
 
   /**

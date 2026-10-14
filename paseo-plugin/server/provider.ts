@@ -290,7 +290,7 @@ class DshConnection implements ProviderConnection {
   /** List DSH's stored sessions so Paseo can offer to import them. */
   async #listSessions(input: Extract<ProviderInput, { type: "sessions" }>): Promise<void> {
     const cwd = input.cwd ?? process.cwd();
-    let sessions: Array<{ sessionId: string; cwd?: string; title?: string; createdAt?: number }>;
+    let sessions: Array<{ sessionId: string; cwd?: string; title?: string; preview?: string; updatedAt?: string }>;
     try {
       sessions = await listDshSessions(cwd, {
         ...(input.query === undefined ? {} : { query: input.query }),
@@ -307,7 +307,9 @@ class DshConnection implements ProviderConnection {
         persistence: { version: 1, data: { sessionId: session.sessionId } },
         cwd: session.cwd ?? cwd,
         ...(session.title === undefined ? {} : { title: session.title }),
-        ...(session.createdAt === undefined ? {} : { updatedAt: new Date(session.createdAt).toISOString() }),
+        // A short first-message preview, so rows with the same title still differ.
+        ...(session.preview === undefined ? {} : { description: session.preview }),
+        ...(session.updatedAt === undefined ? {} : { updatedAt: session.updatedAt }),
       })),
     });
   }
