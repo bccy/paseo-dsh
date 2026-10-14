@@ -41,6 +41,10 @@ const CAPABILITIES = [
   // handle"). Declaring the capability and emitting a handle in `session.opened`
   // lets Paseo reopen the session, which DSH then resumes by id.
   "session.persistence",
+  // Advertises that DSH sessions can be enumerated and imported ("Import
+  // session" lists providers that support this). Implemented over the session
+  // log below.
+  "session.list",
   "permission",
 ] as const;
 
@@ -57,6 +61,10 @@ const CATALOG_TTL_MS = 5 * 60 * 1000;
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 /** The DSH profile that must exist for this provider to work. */
@@ -97,6 +105,34 @@ async function loadCatalog(cwd: string): Promise<DisplayCatalog> {
     const value = toDisplayCatalog(raw);
     catalogCache = { at: Date.now(), cwd, value };
     return value;
+  } finally {
+    probe.kill();
+  }
+}
+
+/** List DSH's importable sessions through a short-lived process. */
+async function listDshSessions(
+  cwd: string,
+  options: { query?: string; limit?: number },
+): Promise<Array<{ sessionId: string; cwd?: string; title?: string; createdAt?: number }>> {
+  const probe = new DshProcess({
+    cwd,
+    sessionId: "sessions-probe",
+    route: FALLBACK_ROUTE,
+    initializeRoute: false,
+    onEvent: () => {},
+    onStatus: () => {},
+    onQuestion: async () => ({ answers: [] }),
+    onLog: () => {},
+    onExit: () => {},
+    onProtocolError: () => {},
+  });
+  try {
+    await probe.start();
+    return await probe.sessions({
+      ...(options.query === undefined ? {} : { query: options.query }),
+      ...(options.limit === undefined ? {} : { limit: options.limit }),
+    });
   } finally {
     probe.kill();
   }
@@ -204,6 +240,8 @@ class DshConnection implements ProviderConnection {
     switch (input.type) {
       case "catalog":
         return this.#catalog(input.requestId, input.cwd);
+      case "sessions":
+        return this.#listSessions(input);
       case "session.open":
         return this.#open(input);
       case "session.prompt":
@@ -249,14 +287,46 @@ class DshConnection implements ProviderConnection {
     this.#emit({ type: "catalog", requestId, catalog: display.defaults });
   }
 
+  /** List DSH's stored sessions so Paseo can offer to import them. */
+  async #listSessions(input: Extract<ProviderInput, { type: "sessions" }>): Promise<void> {
+    const cwd = input.cwd ?? process.cwd();
+    let sessions: Array<{ sessionId: string; cwd?: string; title?: string; createdAt?: number }>;
+    try {
+      sessions = await listDshSessions(cwd, {
+        ...(input.query === undefined ? {} : { query: input.query }),
+        ...(input.limit === undefined ? {} : { limit: input.limit }),
+      });
+    } catch (error) {
+      this.#emit({ type: "request.failed", requestId: input.requestId, error: { message: messageOf(error) } });
+      return;
+    }
+    this.#emit({
+      type: "sessions",
+      requestId: input.requestId,
+      sessions: sessions.map((session) => ({
+        persistence: { version: 1, data: { sessionId: session.sessionId } },
+        cwd: session.cwd ?? cwd,
+        ...(session.title === undefined ? {} : { title: session.title }),
+        ...(session.createdAt === undefined ? {} : { updatedAt: new Date(session.createdAt).toISOString() }),
+      })),
+    });
+  }
+
   async #open(input: Extract<ProviderInput, { type: "session.open" }>): Promise<void> {
     const { sessionId, config } = input;
     const display = this.#display ?? (await loadCatalog(config.cwd));
     this.#display = display;
 
+    // DSH's session id: the Paseo-minted one normally, but the native id when
+    // Paseo reopens an imported session under a fresh agent id.
+    const nativeId = input.persistence?.data;
+    const dshSessionId =
+      isRecord(nativeId) && typeof nativeId["sessionId"] === "string" ? nativeId["sessionId"] : sessionId;
+
     const route = parseRoute(config.model, display.fallbackRoute);
     const session = new DshSession({
       sessionId,
+      dshSessionId,
       cwd: config.cwd,
       env: config.env ?? {},
       route,
@@ -314,6 +384,17 @@ class DshConnection implements ProviderConnection {
       }
     }
 
+    // Paseo asks for `replay` when it reopens a session (restart or import).
+    // DSH's resume restores context but re-emits no events, so replay the stored
+    // conversation into the timeline or the reopened session shows as empty.
+    if (input.history === "replay") {
+      try {
+        await session.replayHistory();
+      } catch (error) {
+        process.stderr.write(`[${PROVIDER_ID}] history replay failed: ${messageOf(error)}\n`);
+      }
+    }
+
     this.#emit({
       type: "session.opened",
       requestId: input.requestId,
@@ -322,9 +403,9 @@ class DshConnection implements ProviderConnection {
       restoration: "core",
       cwd: config.cwd,
       // Reopen key: DSH persists the session under this exact id, so a plugin
-      // reload or daemon restart can resume it. `data` is provider-owned and
-      // carried back on `session.open`; the session id alone is enough for DSH.
-      persistence: { version: 1, data: { sessionId } },
+      // reload or daemon restart resumes it. `data.sessionId` is DSH's id, which
+      // stays the native one when an imported session is reopened.
+      persistence: { version: 1, data: { sessionId: dshSessionId } },
       ...(config.title === undefined ? {} : { title: config.title }),
     });
     this.#emit({ type: "session.config", sessionId, config: session.configState() });

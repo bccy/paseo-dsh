@@ -281,6 +281,32 @@ export class DshProcess {
     };
   }
 
+  /** List the DSH sessions a user could import into Paseo. */
+  async sessions(options: { query?: string; cwd?: string; limit?: number } = {}): Promise<
+    Array<{ sessionId: string; cwd?: string; title?: string; createdAt?: number }>
+  > {
+    const result = (await this.#request(
+      "paseo/sessions",
+      {
+        ...(options.query === undefined ? {} : { query: options.query }),
+        ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+        ...(options.limit === undefined ? {} : { limit: options.limit }),
+      },
+      60000,
+    )) as { sessions?: Array<{ sessionId: string; cwd?: string; title?: string; createdAt?: number }> };
+    return result.sessions ?? [];
+  }
+
+  /** Read this session's stored event log, for replaying into a timeline. */
+  async history(): Promise<Array<{ type: string; seq?: number; time?: number; data: unknown }>> {
+    const result = (await this.#request(
+      "paseo/history",
+      { sessionId: this.#options.sessionId },
+      60000,
+    )) as { events?: Array<{ type: string; seq?: number; time?: number; data: unknown }> };
+    return result.events ?? [];
+  }
+
   /** Ask the bridge to dispose the agent and exit. */
   async shutdown(): Promise<void> {
     if (this.#closed) return;

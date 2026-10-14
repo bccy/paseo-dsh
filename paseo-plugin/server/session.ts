@@ -37,6 +37,12 @@ export const MODES: ProviderMode[] = [
 
 export interface DshSessionOptions {
   sessionId: string;
+  /**
+   * DSH's own session id. Equal to {@link sessionId} for a Paseo-created
+   * session; different when a session is imported, where Paseo mints a new id
+   * but DSH keeps the native one.
+   */
+  dshSessionId?: string;
   cwd: string;
   env: Record<string, string>;
   route: DshRoute;
@@ -57,6 +63,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+/** Concatenate the text blocks of a DSH message's content. */
+function textBlocks(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((block): block is Record<string, unknown> => isRecord(block) && block.type === "text")
+    .map((block) => (typeof block.text === "string" ? block.text : ""))
+    .join("\n")
+    .trim();
+}
+
 /** Resolve Paseo's catalog id (`provider/model`) back into a DSH route. */
 export function parseRoute(model: string | undefined, fallback: DshRoute): DshRoute {
   if (model === undefined || model === "") return fallback;
@@ -67,6 +83,8 @@ export function parseRoute(model: string | undefined, fallback: DshRoute): DshRo
 
 export class DshSession {
   readonly id: string;
+  /** DSH's session id (see {@link DshSessionOptions.dshSessionId}). */
+  readonly #dshSessionId: string;
   readonly #options: DshSessionOptions;
   readonly #timeline = new TimelineBuilder();
   #process: DshProcess | undefined;
@@ -74,6 +92,7 @@ export class DshSession {
   #mode: string;
   #thinkingOption: string | undefined;
   #turnId: string | null = null;
+  #replaySeq = 0;
   #pendingPermissions = new Map<string, (response: ProviderPermissionResponse) => void>();
   /** Slash-menu entries by name, tagging why each exists. */
   #commandKinds = new Map<string, "command" | "skill">();
@@ -87,6 +106,7 @@ export class DshSession {
 
   constructor(options: DshSessionOptions) {
     this.id = options.sessionId;
+    this.#dshSessionId = options.dshSessionId ?? options.sessionId;
     this.#options = options;
     this.#route = options.route;
     this.#mode = options.mode === "plan" ? "plan" : "build";
@@ -98,7 +118,7 @@ export class DshSession {
     const process = new DshProcess({
       cwd: this.#options.cwd,
       route: this.#route,
-      sessionId: this.id,
+      sessionId: this.#dshSessionId,
       env: this.#options.env,
       onEvent: (payload) => this.#onSessionEvent(payload),
       onStatus: (status) => this.#onStatus(status),
@@ -224,6 +244,41 @@ export class DshSession {
       value: preset.id,
       label: preset.name ?? preset.id,
     }));
+  }
+
+  /**
+   * Replay a stored session's conversation into the Paseo timeline.
+   *
+   * Paseo asks for this (`history: "replay"`) when it reopens a session — after
+   * a restart, or when importing a native DSH session. DSH's resume restores the
+   * model's context but never re-emits the events, so without this the reopened
+   * session would show an empty conversation. Only real user turns are replayed
+   * as user messages; DSH's injected context (skill catalogs, runtime snapshots,
+   * approval notices) carries a different `source.kind` and is skipped.
+   */
+  async replayHistory(): Promise<void> {
+    const events = await this.#require().history();
+    if (events.length === 0) return;
+    const builder = new TimelineBuilder();
+    for (const event of events) {
+      const data = isRecord(event.data) ? event.data : {};
+      const seq = typeof event.seq === "number" ? event.seq : this.#replaySeq++;
+      if (event.type === "user/message") {
+        const source = isRecord(data.source) ? data.source : {};
+        if (source.kind !== "user") continue;
+        const text = textBlocks(data.content);
+        if (text === "") continue;
+        this.#options.emit({
+          type: "timeline.item",
+          sessionId: this.id,
+          item: { type: "user_message", id: `user:history:${seq}`, text, clientMessageId: `history:${seq}` },
+        });
+        continue;
+      }
+      for (const item of builder.consume({ type: event.type, seq, data })) {
+        this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
+      }
+    }
   }
 
   /** Accept one prompt and start its turn. */

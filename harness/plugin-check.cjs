@@ -51,6 +51,17 @@ async function until(predicate, label, ms = 120000) {
   throw new Error(`timed out waiting for ${label}`);
 }
 
+/** Like `until`, but ignores events recorded before `start` (stale matches). */
+async function untilSince(start, predicate, label, ms = 120000) {
+  const started = Date.now();
+  while (Date.now() - started < ms) {
+    const hit = events.slice(start).find(predicate);
+    if (hit) return hit;
+    await sleep(120);
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
+
 const results = [];
 const check = (name, pass, detail) => {
   results.push({ name, pass, detail });
@@ -69,6 +80,7 @@ const check = (name, pass, detail) => {
       "prompt.steer",
       "session.configure",
       "session.persistence",
+      "session.list",
       "permission",
     ],
   });
@@ -318,6 +330,39 @@ const check = (name, pass, detail) => {
     bogusFailed ? bogusFailed.error.message : "(no request.failed)",
   );
   check("unsupported input did not report request.completed", bogusCompleted === undefined);
+
+  // 4. session.list is advertised and the `sessions` input answers it.
+  check(
+    "provider declares session.list (import)",
+    Array.isArray(conn.capabilities) && conn.capabilities.includes("session.list"),
+    `capabilities=[${(conn.capabilities ?? []).join(", ")}]`,
+  );
+  await conn.send({ type: "sessions", requestId: "list-sessions", cwd: process.cwd() });
+  const sessionsEvent = await until((e) => e.type === "sessions" && e.requestId === "list-sessions", "sessions list");
+  check(
+    "sessions input returns a list (import source)",
+    Array.isArray(sessionsEvent.sessions),
+    `${(sessionsEvent.sessions ?? []).length} session(s), first has persistence=${sessionsEvent.sessions?.[0]?.persistence !== undefined}`,
+  );
+
+  // 5. reopening with history:"replay" replays the conversation. Close first so
+  // the native session has no live owner, exactly like a restart/import reopen.
+  await conn.send({ type: "session.close", sessionId });
+  await until((e) => e.type === "session.closed" && e.sessionId === sessionId, "session.closed");
+  const replayMark = events.length;
+  await conn.send({
+    type: "session.open",
+    requestId: "reopen",
+    sessionId,
+    config: { cwd: process.cwd(), mode: "build" },
+    persistence: { version: 1, data: { sessionId } },
+    history: "replay",
+  });
+  await untilSince(replayMark, (e) => e.type === "session.ready" && e.sessionId === sessionId, "reopened ready");
+  const replayed = events
+    .slice(replayMark)
+    .filter((e) => e.type === "timeline.item" && (e.item?.type === "user_message" || e.item?.type === "assistant_message"));
+  check("reopen replays conversation history", replayed.length > 0, `${replayed.length} replayed item(s)`);
 
   await conn.close();
 

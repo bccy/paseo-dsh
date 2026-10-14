@@ -81,6 +81,17 @@ function effortOf(value) {
   return ReasoningEffortId(value);
 }
 
+/** Await a promise, rejecting if it has not settled within `ms`. */
+function withTimeout(promise, ms, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timed out ${label}`)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 export class PaseoHarnessServer {
   constructor(ctx, transport, options = {}) {
     this.ctx = ctx;
@@ -359,6 +370,82 @@ export class PaseoHarnessServer {
   }
 
   /**
+   * List the DSH sessions a user can import into Paseo. Reads the persistence
+   * backend directly: the session-query corpus is not mounted for listing here
+   * (`openAt: never`), and it hangs rather than answering. Titles are
+   * best-effort; a missing title never hides an importable session.
+   */
+  async listSessions(params = {}) {
+    const persistence = this.ctx.get('sessionPersistence');
+    if (persistence === undefined) return { available: false, sessions: [] };
+    let snapshots = [];
+    try {
+      snapshots = await persistence.list();
+    } catch {
+      snapshots = [];
+    }
+    // Titles come from the session-query corpus, which is not mounted for reads
+    // here and hangs instead of answering; the import list shows cwd instead.
+    const query = typeof params.query === 'string' && params.query !== '' ? params.query.toLowerCase() : undefined;
+    const cwdFilter = typeof params.cwd === 'string' && params.cwd !== '' ? params.cwd : undefined;
+    const rows = [];
+    for (const snapshot of snapshots) {
+      const id = snapshot?.header?.id === undefined ? undefined : String(snapshot.header.id);
+      if (id === undefined || id === '') continue;
+      const cwd = snapshot.header.cwd;
+      if (cwdFilter !== undefined && cwd !== cwdFilter) continue;
+      if (query !== undefined && !id.toLowerCase().includes(query)) continue;
+      rows.push({
+        sessionId: id,
+        ...(cwd === undefined ? {} : { cwd }),
+        ...(snapshot.header.createdAt === undefined ? {} : { createdAt: snapshot.header.createdAt }),
+      });
+    }
+    rows.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+    const limit = typeof params.limit === 'number' && params.limit > 0 ? params.limit : 50;
+    return { available: true, sessions: rows.slice(0, limit) };
+  }
+
+  /**
+   * Read one stored session's raw event log, for replay into a Paseo timeline.
+   * Read-only, so it works while a live agent still owns the session.
+   */
+  async history(params) {
+    const persistence = this.ctx.get('sessionPersistence');
+    if (persistence === undefined) return { available: false, events: [] };
+    let handle;
+    try {
+      // A session mid-write can stall a read; bound it so a stuck read never
+      // stalls the session open that asked for the replay.
+      handle = await withTimeout(persistence.open(params.sessionId, 'read'), 15000, 'opening session history');
+    } catch {
+      // Unknown/unmaterialized session (or a stalled read): an empty history is
+      // the honest answer.
+      return { available: true, events: [] };
+    }
+    try {
+      const result = await withTimeout(handle.read(), 15000, 'reading session history');
+      return {
+        available: true,
+        events: (result.events ?? []).map((event) => ({
+          type: event.type,
+          ...(event.seq === undefined ? {} : { seq: event.seq }),
+          ...(event.time === undefined ? {} : { time: event.time }),
+          data: event.data,
+        })),
+      };
+    } catch {
+      return { available: true, events: [] };
+    } finally {
+      try {
+        await handle.close();
+      } catch {
+        /* handle close is idempotent; a failure here must not mask the read */
+      }
+    }
+  }
+
+  /**
    * The slash-commands the composer may offer for one session: the registered
    * human commands plus every user-invocable skill.
    *
@@ -564,6 +651,10 @@ export class PaseoHarnessServer {
         return this.permission(params);
       case 'paseo/presets':
         return this.presets(params);
+      case 'paseo/sessions':
+        return this.listSessions(params);
+      case 'paseo/history':
+        return this.history(params);
       case 'paseo/plan/get':
         return this.planGet(params);
       case 'paseo/plan/set':
