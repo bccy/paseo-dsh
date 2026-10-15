@@ -279,6 +279,46 @@ rm -rf ../.dbg
 - DSH 已安装且 `dsh` 在 PATH 上
 - Node ≥ 18（探测工具用了内建 `fetch`）
 
+## 界面语言（中文 / English）
+
+composer 里的模式、思考档位、权限/预设下拉，以及 `/` 斜杠菜单、计划卡片、工具卡片都会跟随
+界面语言显示。**显示归显示，调用值不变**——切语言不会改动任何发给 DSH 的 id：
+
+- 模式 `build` / `plan`、权限预设键（`read-only` / `workspace-write` / `danger-full-access`）、
+  模型与思考档位 id、命令名字，全部原样传输。
+- 斜杠命令**只翻译描述和参数提示，命令名保持英文**，菜单长这样：
+
+  ```text
+  /goal       设置或查看长任务的目标
+  /compact    压缩较早的对话历史
+  /permission 切换权限预设（沙箱模式 + 审批策略）
+  ```
+
+  参数提示里的控制词（`clear` / `pause` / `resume` / `edit` / `off`）也保持英文——那是命令
+  真正接受的语法，不是文案。**没有任何中文会上线**：DSH 收到的、会话里回显的都是 `/goal`。
+
+  为什么不连命令名一起翻译？Paseo 的 command 协议（`AgentSlashCommand`）只有 `name` /
+  `description` / `argumentHint` / `kind`，**没有单独的显示名字段**——菜单显示什么、回传给
+  插件的就是什么。翻译 `name` 会让中文名上线，而 DSH 自己的斜杠解析器只认
+  `[a-z][a-z0-9_-]*`，只能再映射回去；不如让名字始终是原名。
+
+语言按这个顺序决定：
+
+1. 环境变量 `DSH_PASEO_LANG`——`zh` 开头 → 中文，其他 → English，显式覆盖一切；
+2. daemon 自己的 `LC_ALL` / `LC_MESSAGES` / `LANG`——`zh` 开头 → 中文；
+3. 都没有 → English。
+
+所以中文系统上默认就是中文；英文系统上默认英文。要强制另一种语言，在**启动 daemon 的环境**
+里设置（改完重启 daemon，环境变量在进程内不会变）：
+
+```bash
+DSH_PASEO_LANG=en paseo ...
+```
+
+菜单里出现词典没收录的命令（profile 多挂了一个命令插件、或 DSH 版本更新加了命令）时，那条
+会保持原样显示，而不是消失——加中文只要在 `paseo-plugin/server/locale.ts` 的
+`COMMAND_COPY` 里补一条。
+
 ## 权限模式（放开沙箱）
 
 DSH 默认是 **`workspace-write`**：只能改会话工作目录内的文件，越界操作要审批。会话建好后，

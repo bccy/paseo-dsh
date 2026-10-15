@@ -20,7 +20,8 @@ import {
   type ProviderThinkingOption,
 } from "@getpaseo/plugin/server/provider";
 import { DshProcess, type DshCatalog } from "./dsh-process";
-import { DshChildSession, DshSession, MODES, parseRoute } from "./session";
+import { DshChildSession, DshSession, modes, parseRoute } from "./session";
+import { effortLabel } from "./locale";
 
 const CAPABILITIES = [
   "prompt.message",
@@ -149,7 +150,7 @@ function toDisplayCatalog(raw: DshCatalog): DisplayCatalog {
   const models: ProviderModel[] = raw.models.map((model) => {
     const thinkingOptions = (model.reasoning?.efforts ?? []).map((effort) => ({
       id: effort.id,
-      label: effort.name,
+      label: effortLabel(effort.id, effort.name),
       ...(effort.description === undefined ? {} : { description: effort.description }),
     }));
     return {
@@ -191,7 +192,7 @@ function toDisplayCatalog(raw: DshCatalog): DisplayCatalog {
         : FALLBACK_ROUTE,
     defaults: {
       models,
-      modes: MODES,
+      modes: modes(),
       thinkingOptions,
       ...(defaultModel === undefined ? {} : { defaultModel }),
       defaultMode: "build",

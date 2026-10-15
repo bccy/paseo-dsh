@@ -34,16 +34,17 @@ import {
   type DshUsage,
 } from "./dsh-process";
 import { TimelineBuilder } from "./timeline";
+import { UI, commandCopy } from "./locale";
 
-/** Modes Paseo offers in the composer. `plan` drives DSH's plan-mode service. */
-export const MODES: ProviderMode[] = [
-  { id: "build", label: "Build", description: "Investigate and implement changes directly." },
-  {
-    id: "plan",
-    label: "Plan",
-    description: "Investigate, then submit a plan for approval before implementing.",
-  },
-];
+/**
+ * Modes Paseo offers in the composer. `plan` drives DSH's plan-mode service.
+ *
+ * The ids are wire values and stay stable across locales; only the label and
+ * description are localized.
+ */
+export function modes(): ProviderMode[] {
+  return UI.modes.map((mode) => ({ id: mode.id, label: mode.label, description: mode.description }));
+}
 
 /** Bounded cap on child notices held until the root is ready or their parent appears. */
 const CHILD_BUFFER_LIMIT = 2000;
@@ -86,6 +87,15 @@ function messageOf(error: unknown): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/**
+ * The `/name args` line a command runs as, and the line the transcript echoes.
+ *
+ * One builder for both, so the row the user reads is always the command that ran.
+ */
+function slashLine(name: string, args: string): string {
+  return args.trim() === "" ? `/${name}` : `/${name} ${args}`;
 }
 
 /** Concatenate the text blocks of a DSH message's content. */
@@ -142,7 +152,12 @@ export class DshSession {
   #childBufferWarned = false;
   /** Guards {@link #flushPendingChildren} against re-entrant invocation. */
   #flushing = false;
-  /** Slash-menu entries by name, tagging why each exists. */
+  /**
+   * Slash-menu entries by name, tagging why each exists.
+   *
+   * The name is the one DSH registered: Paseo's command contract has no separate
+   * display name, so a command is localized in its description, never its name.
+   */
   #commandKinds = new Map<string, "command" | "skill">();
   /** Current DSH permission preset key, and the switchable ones. */
   #permission: string | null = null;
@@ -213,8 +228,8 @@ export class DshSession {
       settings.push({
         type: "select",
         id: "preset",
-        label: "Preset",
-        description: "DSH agent preset — persona and capabilities. Fixed once the session starts.",
+        label: UI.settings.preset.label,
+        description: UI.settings.preset.description,
         value: this.#preset,
         options: this.#presetOptions,
       });
@@ -232,8 +247,8 @@ export class DshSession {
       settings.push({
         type: "select",
         id: "permission",
-        label: "Permissions",
-        description: "DSH sandbox + approval preset for this session.",
+        label: UI.settings.permission.label,
+        description: UI.settings.permission.description,
         value: this.#permission,
         options: this.#permissionPresets.map((preset) => ({
           label: preset.name,
@@ -247,7 +262,7 @@ export class DshSession {
       mode: this.#mode,
       ...(this.#thinkingOption === undefined ? {} : { thinkingOption: this.#thinkingOption }),
       models: this.#models(),
-      modes: MODES,
+      modes: modes(),
       thinkingOptions,
       settings,
     };
@@ -283,15 +298,27 @@ export class DshSession {
   async loadCommands(): Promise<void> {
     const commands = await this.#require().commands();
     this.#commandKinds.clear();
-    for (const command of commands) this.#commandKinds.set(command.name, command.kind);
+    const advertised = commands.map((command) => {
+      this.#commandKinds.set(command.name, command.kind);
+      // A skill's name is the token DSH injects from a `/name` line and its
+      // description belongs to the skill's author, so neither is localized. Only
+      // a registered command has copy of ours to show.
+      if (command.kind !== "command") {
+        return {
+          name: command.name,
+          description: command.description,
+          ...(command.argumentHint === undefined ? {} : { argumentHint: command.argumentHint }),
+        };
+      }
+      return commandCopy(command.name, {
+        description: command.description,
+        ...(command.argumentHint === undefined ? {} : { argumentHint: command.argumentHint }),
+      });
+    });
     this.#options.emit({
       type: "session.commands",
       sessionId: this.id,
-      commands: commands.map((command) => ({
-        name: command.name,
-        description: command.description,
-        ...(command.argumentHint === undefined ? {} : { argumentHint: command.argumentHint }),
-      })),
+      commands: advertised,
     });
   }
 
@@ -477,29 +504,16 @@ export class DshSession {
     // the catalog recorded rather than on the name.
     if (prompt.input.type === "command") {
       const args = prompt.input.arguments ?? "";
-      const line = args.trim() === "" ? `/${prompt.input.name}` : `/${prompt.input.name} ${args}`;
-      this.#emitUserMessage(prompt.clientMessageId, line);
 
       if (this.#commandKinds.get(prompt.input.name) === "command") {
-        try {
-          const result = await process.runCommand(prompt.input.name, args);
-          if (result.kind === "error") throw new Error(result.text ?? `/${prompt.input.name} failed`);
-        } catch (error) {
-          this.#emitPromptFailed(prompt.clientMessageId, error);
-          return;
-        }
-        // A command answers with its own timeline items rather than a turn.
-        this.#options.emit({
-          type: "session.prompt_result",
-          sessionId: this.id,
-          clientMessageId: prompt.clientMessageId,
-          result: { type: "completed" },
-        });
+        await this.#runCommand(prompt.clientMessageId, prompt.input.name, args);
         return;
       }
 
       // A skill (or an unrecognized name): hand DSH the bare `/name` line. Its
       // skill tool injects a user-invocable skill from exactly that token.
+      const line = slashLine(prompt.input.name, args);
+      this.#emitUserMessage(prompt.clientMessageId, line);
       const issuedTurn = this.#openTurnId(prompt.clientMessageId, prompt.delivery);
       try {
         await process.prompt(line, [{ type: "text", text: line }], prompt.delivery);
@@ -533,6 +547,30 @@ export class DshSession {
     }
 
     this.#emitPromptAccepted(prompt.clientMessageId, prompt.delivery);
+  }
+
+  /**
+   * Run one registered command for a prompt.
+   *
+   * A command answers with its own timeline items instead of a model turn, so
+   * this settles the prompt result itself and never opens a turn. The transcript
+   * echoes the same line the runtime ran, built from the registered name.
+   */
+  async #runCommand(clientMessageId: string, name: string, args: string): Promise<void> {
+    this.#emitUserMessage(clientMessageId, slashLine(name, args));
+    try {
+      const result = await this.#require().runCommand(name, args);
+      if (result.kind === "error") throw new Error(result.text ?? `/${name} failed`);
+    } catch (error) {
+      this.#emitPromptFailed(clientMessageId, error);
+      return;
+    }
+    this.#options.emit({
+      type: "session.prompt_result",
+      sessionId: this.id,
+      clientMessageId,
+      result: { type: "completed" },
+    });
   }
 
   #emitUserMessage(clientMessageId: string, text: string): void {
@@ -1075,7 +1113,7 @@ export class DshSession {
       id: `${sessionId}:${request.callId ?? "question"}`,
       name: "ask_user_question",
       kind: "question",
-      title: request.questions.length === 1 ? (headers[0] as string) : "Questions",
+      title: request.questions.length === 1 ? (headers[0] as string) : UI.questionsTitle,
       input: {
         questions: request.questions.map((question, index) => ({
           question: question.question,
@@ -1109,17 +1147,23 @@ export class DshSession {
       id: `${sessionId}:${request.callId ?? "question"}:${question.id}`,
       name: "exit_plan_mode",
       kind: "plan",
-      title: "Plan",
-      description: "Review the proposed plan before implementation starts.",
+      title: UI.planCard.title,
+      description: UI.planCard.description,
       input: {
         plan: typeof question.detail === "string" ? question.detail : "",
         ...(question.intent === undefined ? {} : { intent: question.intent }),
       } as unknown as Readonly<Record<string, JsonValue>>,
       actions: [
-        { id: "dismiss", label: "Dismiss", behavior: "deny", variant: "danger", intent: "dismiss" },
+        {
+          id: "dismiss",
+          label: UI.planCard.dismiss,
+          behavior: "deny",
+          variant: "danger",
+          intent: "dismiss",
+        },
         {
           id: "implement",
-          label: "Implement",
+          label: UI.planCard.implement,
           behavior: "allow",
           variant: "primary",
           intent: "implement",

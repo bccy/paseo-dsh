@@ -242,6 +242,7 @@ function projectTimelineLikePaseo(items, turnId) {
   // model as literal text. `/goal` with no argument only reads state, so it is
   // safe to run here and must settle as `completed`, not `failed`.
   const commandMsgId = `cmd-${Date.now()}`;
+  const beforeCommand = events.length;
   await conn.send({
     type: "session.prompt",
     sessionId,
@@ -259,6 +260,68 @@ function projectTimelineLikePaseo(items, turnId) {
     commandResult.result?.type === "completed",
     JSON.stringify(commandResult.result),
   );
+
+  // 0c-bis. and the answer must reach the timeline. DSH records the command's
+  // lifecycle in the session log (`command/run` -> `command/done`), and a row
+  // whose output was dropped looks exactly like a command that did nothing.
+  const commandRow = await maybeSince(
+    beforeCommand,
+    (e) =>
+      e.type === "timeline.item" &&
+      e.item?.type === "tool_call" &&
+      e.item?.name === "/goal" &&
+      typeof e.item?.detail?.text === "string" &&
+      e.item.detail.text.length > 0,
+  );
+  check(
+    "a command's output lands in the timeline",
+    commandRow !== undefined,
+    `row=${JSON.stringify(commandRow?.item?.detail?.text ?? null).slice(0, 80)}`,
+  );
+
+  // 0d. the menu name *is* the command: Paseo's command contract carries one
+  // name for both display and dispatch, so the catalog must advertise the name
+  // DSH registered and the transcript must echo the line that actually ran. A
+  // menu name DSH's ASCII-only slash parser cannot read would come back as
+  // `unknown command`, so `completed` here is the assertion.
+  const goalEntry = advertised.find((c) => c.name === "goal");
+  if (goalEntry === undefined) {
+    console.log("  (no goal command advertised — menu-name dispatch check skipped)");
+  } else {
+    const menuMsgId = `cmd-menu-${Date.now()}`;
+    const beforeMenu = events.length;
+    await conn.send({
+      type: "session.prompt",
+      sessionId,
+      prompt: {
+        clientMessageId: menuMsgId,
+        input: { type: "command", name: goalEntry.name, arguments: "" },
+      },
+    });
+    const menuResult = await untilSince(
+      beforeMenu,
+      (e) => e.type === "session.prompt_result" && e.clientMessageId === menuMsgId,
+      "menu-name command prompt_result",
+    );
+    check(
+      "the advertised menu name runs the registered command",
+      menuResult.result?.type === "completed",
+      `menu=/${goalEntry.name} -> ${JSON.stringify(menuResult.result)}`,
+    );
+    const menuEcho = events
+      .slice(beforeMenu)
+      .find(
+        (e) =>
+          e.type === "timeline.item" &&
+          e.item?.type === "user_message" &&
+          e.item?.clientMessageId === menuMsgId,
+      );
+    check(
+      "the transcript echoes the line the runtime ran",
+      menuEcho?.item?.text === "/goal",
+      `echo=${JSON.stringify(menuEcho?.item?.text)}`,
+    );
+  }
 
   // A 1x1 PNG: tiny, valid, and unmistakably an image to anything downstream.
   const png =

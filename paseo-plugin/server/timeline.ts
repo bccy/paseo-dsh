@@ -12,6 +12,7 @@ import type {
   ProviderToolCallDetail,
 } from "@getpaseo/plugin/server/provider";
 import type { JsonValue } from "./dsh-process";
+import { UI } from "./locale";
 
 interface DshEvent {
   type: string;
@@ -115,9 +116,9 @@ function toolDetail(name: string, input: Record<string, unknown>, output?: strin
         ...(output === undefined ? {} : { result: output }),
       };
     case "todo_write":
-      return { type: "plain_text", label: "Update tasks", icon: "sparkles" };
+      return { type: "plain_text", label: UI.toolLabels.updateTasks, icon: "sparkles" };
     case "ask_user_question":
-      return { type: "plain_text", label: "Asked the user", icon: "sparkles" };
+      return { type: "plain_text", label: UI.toolLabels.askedUser, icon: "sparkles" };
     case "exit_plan_mode":
       // Paseo renders this as the readable plan card, and its own Codex adapter
       // emits the same item next to the approval buttons. The plan has to be
@@ -159,6 +160,8 @@ export class TimelineBuilder {
   #items = new Map<string, ProviderTimelineItem>();
   #toolNames = new Map<string, string>();
   #toolInputs = new Map<string, Record<string, unknown>>();
+  /** commandId -> the command name, so `command/done` can title its own row. */
+  #commands = new Map<string, string>();
 
   /**
    * Fold one DSH session event into zero or more complete Paseo item snapshots.
@@ -179,6 +182,10 @@ export class TimelineBuilder {
         return this.#toolCall(data);
       case "tool/result":
         return this.#toolResult(data);
+      case "command/run":
+        return this.#commandRun(data);
+      case "command/done":
+        return this.#commandDone(data);
       case "turn/end":
         return this.#turnEnd(data);
       default:
@@ -304,6 +311,44 @@ export class TimelineBuilder {
       }),
     );
     return out;
+  }
+
+  /**
+   * A slash command the human ran in the composer.
+   *
+   * DSH records the command in the session log, so the row is durable and
+   * replays on reopen like every other item. The command's own output only
+   * exists on `command/done`, so the row is written once there and `command/run`
+   * only remembers the name that titles it. Without this the composer runs the
+   * command, DSH answers, and the answer is thrown away — a command that looks
+   * like it did nothing.
+   */
+  #commandRun(data: Record<string, unknown>): ProviderTimelineItem[] {
+    const commandId = stringField(data, "commandId");
+    const name = stringField(data, "name");
+    if (commandId === undefined || name === undefined) return [];
+    this.#commands.set(commandId, name);
+    return [];
+  }
+
+  #commandDone(data: Record<string, unknown>): ProviderTimelineItem[] {
+    const commandId = stringField(data, "commandId");
+    if (commandId === undefined) return [];
+    const name = this.#commands.get(commandId) ?? "command";
+    this.#commands.delete(commandId);
+    const text = typeof data.text === "string" ? data.text : "";
+    const failed = data.kind === "error";
+    const line = `/${name}`;
+    return this.#put({
+      type: "tool_call",
+      id: `command:${commandId}`,
+      callId: commandId,
+      name: line,
+      detail: { type: "plain_text", label: line, text, icon: "square_terminal" },
+      ...(failed
+        ? { status: "failed" as const, error: { message: text === "" ? "command failed" : text } }
+        : { status: "completed" as const, error: null }),
+    });
   }
 
   #turnEnd(data: Record<string, unknown>): ProviderTimelineItem[] {
