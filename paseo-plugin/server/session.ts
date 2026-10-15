@@ -26,6 +26,7 @@ import {
   DshProcess,
   type DshAnswer,
   type DshChildOpened,
+  type DshMcpServer,
   type DshQuestion,
   type DshQuestionRequest,
   type DshRoute,
@@ -56,6 +57,12 @@ export interface DshSessionOptions {
   dshSessionId?: string;
   cwd: string;
   env: Record<string, string>;
+  /**
+   * MCP servers Paseo attached to this session. Forwarded verbatim: the process
+   * turns them into the `--patch` overlay DSH reads at boot, which is the only
+   * point DSH accepts them.
+   */
+  mcpServers?: Readonly<Record<string, DshMcpServer>>;
   route: DshRoute;
   mode: string;
   /** Models Paseo can switch to for this session, from the cached catalog. */
@@ -170,6 +177,7 @@ export class DshSession {
       route: this.#route,
       sessionId: this.#dshSessionId,
       env: this.#options.env,
+      mcpServers: this.#options.mcpServers,
       onEvent: (payload) => this.#onSessionEvent(payload),
       onStatus: (status, sessionId) => this.#onStatus(status, sessionId),
       onQuestion: (request, sessionId) => this.#onQuestion(request, sessionId),

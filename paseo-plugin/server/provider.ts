@@ -337,6 +337,16 @@ class DshConnection implements ProviderConnection {
       dshSessionId,
       cwd: config.cwd,
       env: config.env ?? {},
+      // Paseo injects its own `paseo` MCP server here for every provider that
+      // declares `supportsMcpServers` (plugin providers always do, and cannot
+      // take the native-tools path opencode uses). Dropping this map is what
+      // left the model with no `mcp__paseo__*` tools while nothing errored.
+      //
+      // `config.toolPolicy.preapproved` is intentionally not forwarded: it asks
+      // the runtime to pre-approve named MCP tools, and DSH has no such concept
+      // — its own permission preset decides. Inventing an equivalent here would
+      // be exactly the self-invented protocol shape this repo forbids.
+      mcpServers: config.mcpServers,
       route,
       mode: config.mode ?? "build",
       models: display.models,

@@ -8,7 +8,9 @@
  * @module dsh-paseo/server/dsh-process
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 /** JSON-compatible value tree. */
 export type JsonValue = string | number | boolean | null | { [key: string]: JsonValue } | JsonValue[];
@@ -19,6 +21,24 @@ export interface DshRoute {
   model: string;
   reasoningEffort?: string;
 }
+
+/**
+ * One MCP server Paseo attached to this session, mirroring the provider
+ * contract's `ProviderMcpServerConfig`. `alwaysLoad` is deliberately absent: it
+ * is a loading hint for runtimes that have one, and DSH has no equivalent.
+ */
+export type DshMcpServer =
+  | {
+      type: "stdio";
+      command: string;
+      args?: string[];
+      env?: Record<string, string>;
+    }
+  | {
+      type: "http" | "sse";
+      url: string;
+      headers?: Record<string, string>;
+    };
 
 /** One question the model asked, mirroring DSH's `AskUserQuestionItem`. */
 export interface DshQuestion {
@@ -130,6 +150,12 @@ export interface DshProcessOptions extends DshProcessHandlers {
   /** Extra environment for the child; merged over the daemon's environment. */
   env?: Record<string, string>;
   /**
+   * MCP servers Paseo handed this session. DSH resolves MCP servers only at
+   * boot, so `start()` turns them into a per-process `--patch` overlay; a
+   * session with none spawns exactly as before.
+   */
+  mcpServers?: Readonly<Record<string, DshMcpServer>>;
+  /**
    * Whether `start()` pins a route with `initialize`. Catalog reads skip it,
    * because `paseo/catalog` needs no agent and a bad route must not hide the
    * model list that would let the user pick a good one.
@@ -164,6 +190,90 @@ interface Pending {
   reject(error: Error): void;
 }
 
+/** The DSH plugin each injected MCP server is mounted through. */
+const MCP_CLIENT_PLUGIN = "@deepseek-ai/dsh-mcp-client";
+
+/** DSH's `serverName` contract: a tool-name namespace, not a free-form label. */
+const MCP_SERVER_NAME = /^[A-Za-z0-9_-]{1,32}$/;
+
+/** One prepared `--patch` overlay and the private directory holding it. */
+interface McpPatch {
+  path: string;
+  dir: string;
+}
+
+/** Translate one Paseo MCP server into a `dsh-mcp-client` patch entry. */
+function mcpEntry(name: string, server: DshMcpServer): Record<string, unknown> {
+  if (!MCP_SERVER_NAME.test(name)) {
+    throw new Error(
+      `MCP server "${name}" cannot be mounted in DSH: a serverName must match ${MCP_SERVER_NAME.source}`,
+    );
+  }
+  // `failOnStartupError` is what keeps a broken connection loud: DSH still boots
+  // and the entry is reported as "did not activate" on stderr, which this
+  // process forwards to the log, instead of the model silently getting no tools.
+  if (server.type === "stdio") {
+    return {
+      id: `mcp-${name}`,
+      name: MCP_CLIENT_PLUGIN,
+      config: {
+        serverName: name,
+        transport: "stdio",
+        command: server.command,
+        ...(server.args === undefined ? {} : { args: server.args }),
+        ...(server.env === undefined ? {} : { env: server.env }),
+        failOnStartupError: true,
+      },
+    };
+  }
+  if (server.type === "sse") {
+    // dsh-mcp-client speaks stdio and Streamable HTTP only. Retrying a legacy
+    // SSE endpoint as Streamable HTTP fails with an error that names the wrong
+    // cause, so refuse the server by name instead of guessing at a transport.
+    throw new Error(
+      `MCP server "${name}" uses the legacy "sse" transport, which DSH does not support`
+        + ' (only "stdio" and Streamable HTTP)',
+    );
+  }
+  return {
+    id: `mcp-${name}`,
+    name: MCP_CLIENT_PLUGIN,
+    config: {
+      serverName: name,
+      transport: "streamable-http",
+      url: server.url,
+      ...(server.headers === undefined ? {} : { headers: server.headers }),
+      failOnStartupError: true,
+    },
+  };
+}
+
+/**
+ * Write the `--patch` overlay that mounts Paseo's MCP servers into this DSH
+ * process, or `undefined` when the session was handed none.
+ *
+ * The overlay cannot live in the shared profile: the server Paseo injects
+ * carries this agent's id in its URL, so it differs per session. The file also
+ * carries the MCP auth token, so it is written 0600 inside a fresh 0700
+ * directory and removed together with the process.
+ */
+function prepareMcpPatch(
+  servers: Readonly<Record<string, DshMcpServer>> | undefined,
+): McpPatch | undefined {
+  const list = servers ?? {};
+  const names = Object.keys(list);
+  if (names.length === 0) return undefined;
+  // Translate and validate everything before touching the filesystem, so a
+  // rejected server leaves no directory behind.
+  const entries = names.map((name) => mcpEntry(name, list[name]));
+  const dir = mkdtempSync(join(tmpdir(), "dsh-paseo-mcp-"));
+  const path = join(dir, "mcp-patch.json");
+  // JSON is a YAML subset and DSH parses the patch as YAML, so emitting JSON is
+  // how a URL or token containing YAML-significant characters survives intact.
+  writeFileSync(path, `${JSON.stringify([{ insert: entries }], null, 2)}\n`, { mode: 0o600 });
+  return { path, dir };
+}
+
 export class DshProcess {
   readonly #options: DshProcessOptions;
   #child: ChildProcessWithoutNullStreams | undefined;
@@ -172,6 +282,7 @@ export class DshProcess {
   #nextId = 1;
   #closed = false;
   #initializeTask: Promise<void> | undefined;
+  #patch: McpPatch | undefined;
 
   constructor(options: DshProcessOptions) {
     this.#options = options;
@@ -184,7 +295,12 @@ export class DshProcess {
   }
 
   async #start(): Promise<void> {
-    const child = spawn(resolveBinary(), ["--profile", process.env.DSH_PASEO_PROFILE ?? "paseo"], {
+    // A rejected MCP server throws here, before any process exists: `start()`
+    // rejects, the provider reports it, and nothing is left on disk.
+    this.#patch = prepareMcpPatch(this.#options.mcpServers);
+    const args = ["--profile", process.env.DSH_PASEO_PROFILE ?? "paseo"];
+    if (this.#patch !== undefined) args.push("--patch", this.#patch.path);
+    const child = spawn(resolveBinary(), args, {
       cwd: this.#options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, ...this.#options.env },
@@ -200,10 +316,12 @@ export class DshProcess {
       }
     });
     child.on("error", (error) => {
+      this.#cleanupPatch();
       this.#failAll(error);
       this.#options.onProtocolError(error.message);
     });
     child.on("exit", (code, signal) => {
+      this.#cleanupPatch();
       this.#closed = true;
       this.#failAll(new Error("DeepSeek Harness process ended"));
       this.#options.onExit(code, signal);
@@ -410,6 +528,7 @@ export class DshProcess {
   /** Terminate the child without a protocol shutdown. */
   kill(): void {
     this.#closed = true;
+    this.#cleanupPatch();
     this.#child?.kill("SIGTERM");
     const child = this.#child;
     setTimeout(() => {
@@ -525,6 +644,22 @@ export class DshProcess {
       const error = frame.error as { message?: string } | undefined;
       if (error !== undefined) entry.reject(new Error(error.message ?? "bridge request failed"));
       else entry.resolve(frame.result);
+    }
+  }
+
+  /**
+   * Remove the per-process MCP overlay. The child reads it once at boot, so it
+   * is deleted as soon as the process is gone: the auth token it carries must
+   * not outlive the session. Idempotent.
+   */
+  #cleanupPatch(): void {
+    const patch = this.#patch;
+    if (patch === undefined) return;
+    this.#patch = undefined;
+    try {
+      rmSync(patch.dir, { recursive: true, force: true });
+    } catch {
+      /* the OS reaps the temp directory; never mask the real exit reason */
     }
   }
 

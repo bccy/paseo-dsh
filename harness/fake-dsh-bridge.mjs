@@ -33,16 +33,41 @@
  *
  * `DSH_FAKE_LOG` (a file path) records every request frame, so a test can assert
  * at the protocol boundary how many times a prompt was actually delivered.
+ * `DSH_FAKE_ARGV` (a file path) records this process's launcher arguments and,
+ * when `--patch <path>` is present, that file's content — the only way a check
+ * can see what the plugin handed DSH at boot.
  *
  * @module paseo-dsh/harness/fake-dsh-bridge
  */
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 const MODE = process.env.DSH_FAKE_MODE ?? "live";
 const LOG_PATH = process.env.DSH_FAKE_LOG;
 const out = (frame) => process.stdout.write(`${JSON.stringify(frame)}\n`);
 const notify = (method, params) => out({ jsonrpc: "2.0", method, params });
+
+/**
+ * `DSH_FAKE_ARGV` (a file path) records this process's own launcher arguments
+ * and, when the plugin passed `--patch <path>`, that file's content. No bridge
+ * frame can show what the plugin handed DSH at boot, so a check that asserts
+ * MCP injection has to read it from here.
+ */
+const ARGV_PATH = process.env.DSH_FAKE_ARGV;
+if (ARGV_PATH !== undefined && ARGV_PATH !== "") {
+  const argv = process.argv.slice(2);
+  const patchIndex = argv.indexOf("--patch");
+  const patchPath = patchIndex >= 0 ? argv[patchIndex + 1] : undefined;
+  let patch;
+  if (patchPath !== undefined) {
+    try {
+      patch = readFileSync(patchPath, "utf8");
+    } catch (error) {
+      patch = { error: String(error?.message ?? error) };
+    }
+  }
+  writeFileSync(ARGV_PATH, JSON.stringify({ argv, patchPath, patch }, null, 2));
+}
 
 /** Append one received request to `DSH_FAKE_LOG`, when the test asked for it. */
 function logFrame(method, params) {

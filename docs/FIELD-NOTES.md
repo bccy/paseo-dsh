@@ -406,6 +406,51 @@ running status 先于 prompt 回复）与 `late`（合成的防御性反序，�
 
 ---
 
+## 第九轮：Paseo 注入的工具全部缺席
+
+### 23. Paseo 注入的 MCP 工具一个都没到 DSH
+
+**症状**：无。会话照常开、照常答，只是模型手里没有 `mcp__paseo__*` 工具——不能
+`create_workspace`、不能 `send_agent_prompt`、不能 `respond_to_permission`。同一个 Paseo 里的
+opencode 会话有这些工具，插件接入的 DSH 会话没有。
+
+**根因**：Paseo 对**插件 provider** 的能力写死了 `supportsNativePaseoTools: false`
+（`@getpaseo/server` `agent/plugin-provider.js`），所以它拿不到 opencode 那种原生工具通道
+（opencode / opencode-v2 / omp 走 Paseo 自己塞进 opencode 的 `bridge-plugin.bundle.mjs` 加本地
+HTTP bridge；此时 Paseo 用 `resolveProviderLaunchConfig → stripInternalPaseoMcpServer` 把内部
+`paseo` MCP server 从 launch config 里剥掉，避免重复注册）。插件 provider 唯一被给的通道就是
+`session.open` 的 `config.mcpServers`，其中含 Paseo 注入的
+`{ type: "http", url: "<daemon>/mcp/agents?callerAgentId=<agentId>" }`。
+
+而本仓库插件从 `provider.ts#open` 到 `session.ts` 再到 `dsh-process.ts` **完全没有读这个字段**，
+也没有读 `config.toolPolicy`。Paseo 以为递到了，DSH 以为上游没配，全程零报错——与第 15/16/17/18
+条同一类静默降级。
+
+**修法**：
+
+- `provider.ts#open` 把 `config.mcpServers` 传给 `DshSession`；`session.ts` 原样透传给
+  `DshProcess`；`dsh-process.ts` 在 spawn 前翻译成一份 **per-session `--patch` overlay**，
+  命令行加 `--patch <file>`。DSH 只在启动时接受 MCP server（`dsh-mcp-client` 是 profile 条目），
+  而注入的 URL 带 `callerAgentId`，所以 overlay 不能放进共享 profile。
+- 映射：`stdio` → `stdio`（`command`/`args`/`env`）；`http` → `streamable-http`
+  （`url`/`headers`）；`sse` **响亮失败并点名 server**（`dsh-mcp-client` 只有 stdio 与 Streamable
+  HTTP，降级试连会报一个语义不准的错）；`alwaysLoad` 忽略（加载提示，不是能力）。
+- 每条都带 `failOnStartupError: true`：连不上时 DSH 打印 `warning: 1 entry did not activate`
+  加具体错误（子进程 stderr 已被插件转发），进程照常启动——响亮，但不把会话搞挂。
+- patch 文件含 MCP auth token，写进 `mkdtempSync` 的 0700 目录、文件 0600，进程
+  `exit` / `error` / `kill` 时整目录删除。
+
+**判定标准**：`harness/mcp-injection-check.cjs`（8 项）用脚本化假 `dsh` 断言：`http` server 变成
+`--patch` 且映射为 `streamable-http`（url/headers 原样）、`failOnStartupError` 为真、`stdio`
+server 保留 command/args/env、无 `mcpServers` 时**不**加 `--patch`、`sse` 回 `request.failed`
+并点名 server 且不 spawn 进程、patch 文件随进程一起消失。假桥新增 `DSH_FAKE_ARGV`（记录自身
+argv 与 patch 内容），因为没有任何 bridge 帧能反映启动参数。
+
+**未做**：`config.toolPolicy.preapproved` 不转发。它要求运行时预授权指定的 MCP 工具，而 DSH
+没有这个概念（由它自己的 permission preset 决定）；硬造一个等价物等于自造协议形状。
+
+---
+
 ## 已知限制（未修，有意为之）
 
 | 项 | 说明 |

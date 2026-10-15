@@ -72,6 +72,10 @@ cd paseo-plugin && npx tsc --noEmit
 它断言的是事件形状，而事件形状错了界面不会报错，只会悄悄不对。运行步骤写在那个文件
 的头部注释里（插件是 TS，要先编成 CJS 才能 require）。
 
+同一条编译流程还带三个假 `dsh` 驱动的回归脚本，动到对应区域时一并跑：
+`harness/subagent-check.cjs`（子会话可见性）、`harness/steer-check.cjs`（插话回执）、
+`harness/mcp-injection-check.cjs`（Paseo 注入的 MCP server 是否真的落到 `--patch`）。
+
 **注意一个反直觉的坑**：`waitFor` 式的等待会匹配到上一条陈旧事件。换阶段时清空事件数组，
 或按 `turnId` 过滤——有一次就是因为匹配到了被取消那一回合的事件，误判成"取消后对话
 无法继续"，差点去改一段本来正确的代码。
