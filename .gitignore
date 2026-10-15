@@ -4,6 +4,7 @@ node_modules/
 # TypeScript build output and one-off verification harnesses
 .dbg/
 .repro/
+.tmp-test/
 dist/
 *.tsbuildinfo
 
