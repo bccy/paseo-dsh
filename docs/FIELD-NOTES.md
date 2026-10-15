@@ -543,6 +543,125 @@ Antigravity provider 就是这么发的（`id` 与 `messageId` 同值、文本�
 
 ---
 
+---
+
+## 第十二轮：客户端渲染（思考行与工具行）
+
+Paseo 的 provider 协议只负责把时间线项送到 App，**长什么样由 App 决定**。插件能改的只有
+两处：`addTimelineTransformer` + `addTimelineRenderer` 替换单个内置项。这一轮给插件加了
+客户端入口（`index.client.tsx` + `client/`），只替换推理行和工具行，不动 Paseo 本体。
+
+### 26. 推理行要像 dsh web：单行滚动 + 点击展开，且不能抖动
+
+**症状**：第一版按 `phase === "streaming"` 决定展开/收起，结果思考过程中行会反复开合，
+思考完才停下。
+
+**根因**：宿主的 `phase` 不是"还在流式"的可靠信号。宿主对 thought 的判定是
+`"thought"===kind && "loading"===status`（宿主 bundle 里
+`I = ("assistant_message"===kind && "streaming"===c) || ("thought"===kind && "loading"===status) || ... ? "streaming" : "complete"`），
+而 chunk 一落定 status 就在 loading/ready 之间翻，于是 `phase` 抖。
+
+**修法**：不看 `phase`，看 `useRevealedText` **返回文本有没有变长**。变长就 latch 成
+"流式中"；只有在"文本不再变长 **且** 宿主报 complete"时才落定。折叠态是标签和滚动行
+**同一行**（`思考中… <当前行>`），点击才展开全文，右侧不加箭头。
+
+### 27. 工具行要保留 Paseo 自己的图标和单行形状，展开才给格式
+
+**症状**：第一版把工具行整个换成自定义的圆点 + 纯文本，图标没了；展开的 diff 是一整片
+没有颜色；短输出还默认展开，跟推理行的单行风格不一致。
+
+**根因**：替换 timeline item 就是**整项替换**，Paseo 原生的工具图标、单行摘要、展开里的
+代码高亮全都会丢。要"看起来还是原来的"，就得自己复刻。
+
+**修法**：
+- 图标照抄宿主的映射（`resolveToolCallIconName`）：`shell → SquareTerminal`、
+  `read → Eye`、`edit/write → Pencil`、`search/fetch → Search`、`sub_agent → Bot`、
+  `plan → Brain`、`plain_text` 用它自己的 `icon` 键、其余 `Wrench`，再用插件 SDK 的
+  `Icon`（Lucide 名）画出来。映射表在 `client/tool-call-data.ts`，有 harness 断言。
+- 折叠态跟推理行一样是**单行**（`numberOfLines={1}`），点击才展开。
+- 展开态跟推理行的展开一致：**纯文本、无外框**，等宽 + diff 行着色。
+- diff 的每一行都要带 `+`/`-` 前缀。DSH 的 `edit` 只给 `old_string`/`new_string`，
+  早期实现只给整体加一次前缀，多行替换只有第一行有色，看着像没着色。
+
+### 28. 已知限制：`read_image` 的图片无法内联显示
+
+DSH 的 `read_image` 返回的是**附件引用**（`{path, image:{attachmentId, mediaType, ...}}`），
+不是内联图片数据；而 Paseo 的工具详情联合类型里没有图片变体
+（`shell/read/edit/write/search/fetch/worktree_setup/sub_agent/plain_text/plan/unknown`）。
+插件渲染器只能拿到文本，`timeline.ts` 的 `textOf` 也只抽 text 块。所以工具行里直接画图
+需要 Paseo 侧新增图片型 tool detail，或允许插件时间线行携带附件——本仓库不改全局包。
+现阶段图片只能通过 Paseo 的文件预览打开路径查看。
+
+### 29. 替换内置行会丢掉"运行中"的流光，要自己补
+
+**症状**：把思考行和工具行换成插件渲染后，运行中的流光动画没了，界面变得"死"。
+
+**根因**：Paseo 的流光在宿主 App 里（web 端是 `background-clip:text` 的渐变 keyframes，
+原生端是 Reanimated + SVG 渐变遮罩），而插件 SDK 只导出 `Icon/Modal/useToast/
+useRevealedText/ScrollView/FlatList/copyText/TextInput`，**没有暴露任何 shimmer/spinner**。
+
+**修法（最终采用）**：用 React Native 的 `Animated` 做**整行 opacity 脉冲**
+（`client/shimmer.ts`，1 ↔ 0.35 循环），触发条件是"思考还在变长"和"工具 running"。
+期间试过"扫光"（叠一条高光从左到右平移）：没有真正的渐变时它就是一块硬边色块划过，
+用户评价**还不如脉冲**，所以回退了。要做扫光必须先解决渐变（宿主那套 `background-clip`
+/ Reanimated 遮罩没暴露给插件）。
+
+diff 行按 GitHub 的做法：浅绿/浅红底（低 alpha，深色主题也不刺眼）、`+`/`-` 标记单独
+上色、代码正文用 **muted 前景色**（用 `foreground` 会"太白"）。**不要**给每行加左侧亮色
+条——那会在行首形成一块更亮的区域，用户明确不喜欢。
+
+思考行还有一个反直觉的点：**思考结束后折叠态显示的是最后一行**（用户正在读的结尾），
+不是第一行摘要。折叠态文案 `已思考` + 尾行，展开才看全文。
+
+### 30. 展开态：往下铺满、不裁剪、不卡顿
+
+**症状一**：工具行的命令超宽时折叠态有省略号，点开后跟那条被截断的命令对不上；而且展开的
+命令挤在图标和标签旁边换行，宽度不够。
+
+**根因**：摘要和图标/标签同处一个 row，`numberOfLines={1}` 又写死，展开后要么仍是一行
+省略号，要么在剩余宽度里窄窄地折行。
+
+**修法**：折叠态头部保持单行摘要；**展开时头部不再显示摘要**，把完整命令 + 输出/diff 作为
+**独立块放在行下方**（`marginLeft` 对齐、占满整行宽度）。这样既不重复已经显示过的内容，
+也不会有省略号，跟思考行的展开方式一致。另外，**没有输出的命令也要可展开**
+（`canExpand = hasBody || summary !== ""`）——`cat > file` 这类命令 stdout 为空，早期实现
+直接不给展开，命令就永远截断。
+
+**症状二**：思考内容很长时，点开再关闭，界面会空白一小会儿才恢复；用户还要求**展开时不能
+省略前面的内容**，且**展开块里不要内层滚动**（内层滚动会吞掉点击，导致关不掉）。
+
+**根因**：展开态把 `revealed`（逐帧 pacing 的文本）塞进一个 `Text`；推理可能有几万字，
+每一帧都在重渲染这一大块，挂载/卸载时卡住 JS 线程。而只渲染尾部又违背"前面不能省略"。
+
+**修法**：
+- 展开态渲染**原始 `text`**，不是 `revealed`：`text` 只在 delta 到达时变，不会逐帧重渲染。
+- **不要**加内层 `ScrollView`（试过：它吞掉点击，展开后关不掉）。
+- **整个块（含展开的正文）都包在同一个 `Pressable` 里**，点哪里都能收起；展开的 `Text`
+  去掉 `selectable`，否则长按选择会和点击打架。
+- 展开时停掉流光（`useShimmer(growing && !open)`）。
+
+**补充**：
+- 思考行前面用**思考图标**（Lucide `Brain`，跟 Paseo 原生 thinking 行一致），不是竖线。
+- 流光的半周期从 650ms 放慢到 1100ms——650ms 看起来像"闪烁"，用户要求慢一点。
+- 工具行的标签文字从 `foreground` 改成 `foregroundMuted`（用户反馈"太白"）。
+- `toolCallData` 多一个 `code` 标志：`read/write/edit/search` 的正文是源码，展开时套一层
+  柔和代码底（`rgba(127,127,127,0.10)`，无边框）；`shell/fetch/sub_agent/...` 的正文不是
+  源码，保持普通文本。
+
+**判定标准**：
+- `npx tsc --noEmit` 干净（`tsconfig.json` 已加 `jsx`，并 `include **/*.tsx`）。
+- `harness/tool-call-check.cjs`（纯逻辑，离线）：图标映射、单行摘要、diff 每行前缀、
+  截断、状态回退。运行方式见文件头。
+- 宿主编译器 `compilePlugin({client, server})` 能产出 client bundle。
+- 真实 Paseo web UI 截图：思考行单行、工具行原生图标 + 单行、展开无外框且 diff 有
+  红/绿底 + 色条、运行中行有脉冲。
+
+**注意**：`paseo plugin reload` 会重启插件进程，连带杀掉它派生的 `dsh` 子进程——也就是
+正在改代码的那个 agent。改完客户端代码要重载时，先把要做的验证/文档做完，或用一个
+一次性 heartbeat 在重载后把自己唤醒。
+
+---
+
 ## 已知限制（未修，有意为之）
 
 | 项 | 说明 |
