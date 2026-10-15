@@ -163,13 +163,30 @@ const check = (name, pass, detail) => {
     .filter((e) => e.type === "session.config")
     .flatMap((e) => e.config?.settings ?? [])
     .find((s) => s.id === "permission");
+  const permissionOptions = permissionSetting?.options ?? [];
   check(
     "→ permission setting advertised",
     permissionSetting !== undefined &&
-      (permissionSetting.options ?? []).some((o) => o.value === "danger-full-access"),
+      permissionOptions.some((o) => o.value === "danger-full-access"),
     permissionSetting
-      ? `options=[${(permissionSetting.options ?? []).map((o) => o.value).join(", ")}]`
+      ? `options=[${permissionOptions.map((o) => `${o.label}=${o.value}`).join(", ")}]`
       : "(no permission setting)",
+  );
+  // The bridge must forward DSH's per-preset display name, not just the table
+  // key: a deployment that renames its presets — including into another
+  // language — would otherwise be shown raw keys, and nothing would fail. Every
+  // option therefore carries a non-empty `label` beside its switchable `value`.
+  check(
+    "→ permission options carry a display label beside the key",
+    permissionOptions.length > 0 &&
+      permissionOptions.every(
+        (o) =>
+          typeof o.label === "string" && o.label !== "" &&
+          typeof o.value === "string" && o.value !== "",
+      ),
+    permissionOptions.length > 0
+      ? permissionOptions.map((o) => `${o.label}=${o.value}`).join(", ")
+      : "(no options)",
   );
   await conn.send({
     type: "session.configure",

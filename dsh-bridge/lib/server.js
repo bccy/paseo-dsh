@@ -717,7 +717,16 @@ export class PaseoHarnessServer {
     };
   }
 
-  /** Report the session's permission preset and the switchable ones. */
+  /**
+   * Report the session's permission preset and the switchable ones.
+   *
+   * Each preset travels as `{ value, name, description? }` rather than a bare
+   * name, because the display label belongs to whoever configured the preset:
+   * DSH's own `PresetSpec.name` defaults to the raw table key, and a deployment
+   * that renames its presets (including into another language) must not be
+   * silently shown the key instead. `value` stays the key the `/permission`
+   * command accepts, so a renamed preset is still switchable.
+   */
   async permission(params) {
     const service = this.ctx.get('permissionPresets');
     if (service === undefined) return { available: false, current: null, presets: [] };
@@ -726,7 +735,11 @@ export class PaseoHarnessServer {
     return {
       available: true,
       current: service.current(rec.handle.agent.session),
-      presets: [...service.names],
+      presets: service.catalog().options.map((option) => ({
+        value: option.value,
+        name: option.name,
+        ...(option.description === undefined ? {} : { description: option.description }),
+      })),
     };
   }
 

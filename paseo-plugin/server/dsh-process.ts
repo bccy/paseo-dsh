@@ -40,6 +40,19 @@ export type DshMcpServer =
       headers?: Record<string, string>;
     };
 
+/**
+ * One switchable DSH permission preset. `name` is the display label its own
+ * configuration declares and defaults to `value` in DSH, so the composer shows
+ * the deployment's label instead of a raw key.
+ */
+export interface DshPermissionPreset {
+  /** The preset key `/permission` accepts; never the display label. */
+  value: string;
+  /** The display label, falling back to {@link value} when none is configured. */
+  name: string;
+  description?: string;
+}
+
 /** One question the model asked, mirroring DSH's `AskUserQuestionItem`. */
 export interface DshQuestion {
   id: string;
@@ -363,11 +376,22 @@ export class DshProcess {
     })) as { kind: "success" | "error"; text?: string };
   }
 
-  /** Read the session's current permission preset and the switchable ones. */
-  async permission(): Promise<{ available: boolean; current: string | null; presets: string[] }> {
+  /**
+   * Read the session's current permission preset and the switchable ones.
+   *
+   * `name` is the label the preset's own configuration declares (falling back to
+   * the key in DSH), so a deployment that renames its presets — including into
+   * another language — sees its label rather than the raw key. `value` stays the
+   * key `/permission` accepts.
+   */
+  async permission(): Promise<{
+    available: boolean;
+    current: string | null;
+    presets: DshPermissionPreset[];
+  }> {
     return (await this.#request("paseo/permission", {
       sessionId: this.#options.sessionId,
-    })) as { available: boolean; current: string | null; presets: string[] };
+    })) as { available: boolean; current: string | null; presets: DshPermissionPreset[] };
   }
 
   /**

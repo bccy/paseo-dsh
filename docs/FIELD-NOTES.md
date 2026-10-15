@@ -451,6 +451,40 @@ argv 与 patch 内容），因为没有任何 bridge 帧能反映启动参数。
 
 ---
 
+## 第十轮：权限档位的显示名
+
+### 24. 权限档位只能显示原始 key，配了显示名也不生效
+
+**症状**：Paseo 的 Permissions 面板列出 `read-only` / `workspace-write` /
+`danger-full-access`。DSH 的 `dsh-permission-presets` 本来就支持给每个档位配
+`name` / `description` 当显示名，但配了也不显示。
+
+**根因**：桥把显示名截断了。`dsh-bridge/lib/server.js` 的 `paseo/permission` 返回
+`presets: [...service.names]`——`names` 只有表键；DSH 的
+`PermissionPresetService.catalog()` 才带 `PresetOption { value, name, description }`。
+插件于是只能拿 key 当 label（`session.ts` 的 `label: name, value: name`），而面板标题
+和选项标签其实都是它自己传的字符串——它有能力呈现，只是手里没有显示名。
+
+**修法**：
+
+- 桥改用 `service.catalog().options`，每个档位返回 `{ value, name, description? }`；
+- 插件用 `name` 当 label、`value` 当值——`value` 仍是 `/permission` 接受的表键，所以
+  改标签不影响行为，部署自定义的档位也自动生效；
+- 显示名由部署在自己的 profile 里声明，插件不硬编码任何语言。
+- 面板标题 `Permissions` 保持英文：它没有任何 DSH 配置能覆盖，写死中文会把这层语言
+  偏好塞进一个给所有人用的插件。
+
+**判定标准**：`harness/plugin-check.cjs` 新增一项，断言 permission 的每个 option 同时
+带非空 `label` 与 `value`。桥若退回只返回 key，`preset.name` 会是 `undefined`，这一项
+立刻红。profile 配好显示名后，该项输出
+`只读=read-only, 工作区可写=workspace-write, 完全访问=danger-full-access`。
+
+**已知取舍**：DSH 的 per-preset `description` 桥会带出来，但 Paseo 的
+`ProviderSetting` select 选项没有 description 槽（只有 `{label, value}`），所以描述暂时
+到不了界面；桥保留它是为了将来有位置显示时不必再改协议。
+
+---
+
 ## 已知限制（未修，有意为之）
 
 | 项 | 说明 |

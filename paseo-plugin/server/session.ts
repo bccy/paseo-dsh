@@ -27,6 +27,7 @@ import {
   type DshAnswer,
   type DshChildOpened,
   type DshMcpServer,
+  type DshPermissionPreset,
   type DshQuestion,
   type DshQuestionRequest,
   type DshRoute,
@@ -143,9 +144,9 @@ export class DshSession {
   #flushing = false;
   /** Slash-menu entries by name, tagging why each exists. */
   #commandKinds = new Map<string, "command" | "skill">();
-  /** Current DSH permission preset name, and the ones it can switch to. */
+  /** Current DSH permission preset key, and the switchable ones. */
   #permission: string | null = null;
-  #permissionPresets: string[] = [];
+  #permissionPresets: DshPermissionPreset[] = [];
   /** Current agent preset (persona + capabilities), and the switchable ones. */
   #preset: string | null = null;
   #presetOptions: Array<{ label: string; value: string }> = [];
@@ -220,6 +221,13 @@ export class DshSession {
     }
     // Surface DSH's permission presets as a composer control, so switching
     // between sandboxed and full access doesn't require typing /permission.
+    //
+    // The label is the preset's own configured `name`, never its key: a
+    // deployment that renames presets (including into another language) must see
+    // its label, while `value` stays the key `/permission` accepts. DSH's
+    // per-preset `description` is not carried here because Paseo's select
+    // options have no description slot — it stays on the bridge response for a
+    // future UI that can show it.
     if (this.#permissionPresets.length > 0) {
       settings.push({
         type: "select",
@@ -227,7 +235,10 @@ export class DshSession {
         label: "Permissions",
         description: "DSH sandbox + approval preset for this session.",
         value: this.#permission,
-        options: this.#permissionPresets.map((name) => ({ label: name, value: name })),
+        options: this.#permissionPresets.map((preset) => ({
+          label: preset.name,
+          value: preset.value,
+        })),
       });
     }
     const thinkingOptions = this.#thinking();
