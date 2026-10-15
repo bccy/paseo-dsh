@@ -285,12 +285,136 @@ provider 显示名同步简化为 `DeepSeek Harness`，保留 Provider ID。
 
 ---
 
+## 第七轮：原生子代理可见性
+
+### 21. DSH 原生子代理在 Paseo 里完全看不见
+
+**症状**：DSH 能起子代理，父会话里也能看到 `subagent` 工具卡，但 Paseo 的子代理列表
+是空的——没有独立子会话、没有子状态、没有子工具过程。
+
+**根因有两层**：
+
+| 层 | 根因 | 修法 |
+|----|------|------|
+| 能力位 | `CAPABILITIES` 缺 `session.subsession`，Paseo 会丢弃所有 provider 发起的子 `session.opened`（`runtime.js` 在父会话未协商该能力时直接判定连接失败） | 声明 `session.subsession`，并在子会话用 `restoration: "parent"` 打开 |
+| 会话归属 | 插件按“一进程一会话”处理：`DshProcess` 的 `session.status` 丢掉 `sessionId`，`DshSession` 把所有事件一律以根会话 id 发出 | 桥透传原生 `sessionId` 并按 `session.header.origin === 'subagent'` 立即登记子会话；插件按 `sessionId` 路由到子视图，子状态/用量/时间线不再落到父级 |
+
+**修法要点**：
+- 桥新增 `session.child-opened`（来自子会话自己的 header：`origin:'subagent'` +
+  `parentSession`，权威且即时；父日志的 `subagent/catalog` 作为兜底），并新增只读的
+  `paseo/subagents`（`subagents.listDescendants`，排除 fork 继承事实，不加载/恢复子 agent）。
+- 插件把子会话映射成 Paseo 原生 provider 子会话：`restoration:"parent"`、
+  `parentSessionId` 指向父的 Paseo 会话 id（根）或子 id（嵌套）、能力位为空（只读视图）。
+- 一个根进程仍是唯一所有者，子视图不拥有新进程；恢复（`history:"replay"`）时按
+  `paseo/subagents` 的前序重建树并回放各自历史，不创建真实子 agent。
+
+**第二轮修复（独立审查阻断项）**：
+- **嵌套必须继续声明能力**：只读子会话也必须声明 `session.subsession`，否则它下面的孙级会
+  触发 Paseo `runtime.js` 的父能力检查，**整条连接失败**。子能力只保留这一位，不含
+  prompt/configure（仍是只读）。
+- **协商门控**：把协商结果传给 `DshSession`；宿主没给 `session.subsession` 时不发任何子事件，
+  父会话保持健康，而不是断连。
+- **终态来自 `turn/end`**：子会话的 `turn/end` reason 决定终态——`completed`→completed，
+  `aborted`→canceled，其余（error/max-tokens/blocked/interrupted）→failed；`agent/status idle`
+  只在没有 `turn/end` 时兜底为 completed。恢复时按子日志最后一个 `turn/end` 还原终态，避免
+  已完成/失败的孩子永远停在 running。
+- **恢复覆盖 skip 与 replay**：每次 `session.open` 都重建子树；子历史按 `handle.inheritedEventCount`
+  只回放**own-suffix**，fork 继承的父对话/兄弟工具过程不会被当成孩子的新消息。
+- **父子身份隔离**：子 provider id 采用 root-scoped 形式（`<rootPaseoId>:sub:<nativeChildId>`），
+  两个根观察同一 native 子会话不再冲突；权限卡 id 也带会话前缀，父子同 `toolCallId` 不串。
+- **父未就绪先缓冲**：root `session.ready` 之前、或嵌套子先于其父到达时，子 opened/事件/状态
+  进入有界缓冲，root ready 后按序释放；不丢弃最早输出，也不提前于父 opened 发送。
+- **label 补齐**：桥先登记子会话身份但不立即 open，等子自己的 `subagent/descriptor`（或父
+  catalog）拿到 label 后再首次 `session.child-opened`（宿主只在首次 attachChild 抓 title）；
+  缓冲有上限，溢出则无标题打开，绝不丢输出。
+- **列举失败要诚实**：`paseo/subagents` 在服务缺失时返回 `available:false`、读取失败时带
+  `error`、不可读分支进 `diagnostics`，绝不返回 `available:true` 的空数组假装成功。
+
+**第三轮修复（root 已 ready 后的孙级乱序）**：
+- root 已 ready 时，孙级 `session.child-opened` 可能先于父 child-opened 到达：此时该子只进
+  `#pendingOpened`，其后续 event/status 会被误判成 ghost 丢弃；父随后 opened 也不再触发
+  flush，孙级卡住且最早输出丢失。修法是：event/status 遇到“已知但父未到”的子时也进有界缓冲
+  （`#isPendingChild`），每次新父成功注册后都 flush，而不只在首次 `markRootReady`；
+  flush 只释放已能解析父边的子树与事件，仍未解析父的 held 事件保留（不清空），并用
+  `#flushing` 防重入、`#bufferOpened` 去重防重复 opened。完全未知的 ghost 仍只记诊断、不落父。
+- 回归：`harness/fake-dsh-bridge.mjs` 新增 `nested` 模式（root ready 后，great→grand→parent
+  逐层先于其父通知，且孙级最早消息/状态先到）；`harness/subagent-check.cjs` 断言父先 opened、
+  孙/曾孙按序 opened、最早输出各保留且只一次、宿主父能力门控通过、ghost 仍被丢弃。
+
+**宿主限制（Paseo 0.11.2，未改核心，不伪造）**：
+`agent/plugin-provider.js` 的 `acceptChildEvent` 只消费子会话的 `timeline.item`、终态
+`session.turn`、`session.runtime_failed`/`session.closed`；**忽略** `session.turn started`、
+`session.usage`、`session.permission`。因此：
+- 子卡首次打开即 `running`，可续接子代理**二次运行**的 `started` 不会把卡片状态恢复成运行中
+  （终态仍会更新）；这不是插件能修的，需要 Paseo 核心补丁。
+- 给子会话发 `session.permission` 并不能让 Paseo 出现审批 UI。桥的 `owns()` 仍只覆盖根会话，
+  子会话的问题**不转发**给 Paseo（避免挂起或误归属父会话），保持 DSH 自身的子代理审批语义。
+- 插件仍以正确的子 `sessionId` 发出 started/usage/permission 事件（不丢弃、不冒充父级），
+  只是当前宿主会忽略它们。
+
+**判定标准**：`harness/subagent-check.cjs` 用脚本化假 `dsh` 断言能力位、父子归属、
+多子混排、未知子不误归属、子只读拒绝、恢复去重、**Paseo 父能力门控**、**无 subsession 保持
+父健康**、**父未就绪缓冲**、**同 toolId 权限隔离**、**turn/end 终态**、**skip/replay 重建**、
+**fork own-suffix**、**两个根同 native 不冲突**——全程不启动真实子代理。
+
+---
+
+## 第八轮：运行中插话打断前台子代理
+
+### 22. 运行中发消息会打断正在等待前台子代理的回合
+
+**症状**：在 Paseo 里给一个**正在运行、正等待前台子代理**的 DSH 父会话发消息，父回合会被
+取消，前台子代理随之被 abort。同样的操作在 DSH 自身里不会打断——消息以插话（steer）方式
+进入当前回合。
+
+**根因**：插件把插话的回执**谎报**成了新回合。Paseo App 默认 `sendBehavior: "steer"`，运行中
+发消息走 daemon 的 `steerOrReplaceActiveTurn`：它要求插件回 `result.type === "steer"` 且
+`turnId === expectedTurnId` 才算 accepted，而 `expectedTurnId` 是开启该回合时**首次
+`session.prompt_result`** 报的 turnId（`agent-manager.js` 的
+`startPendingForegroundTurn → openActiveTurn`；provider 自己随后的 `session.turn started`
+在前台回合上会被 `onStreamTurnStarted` 抑制）。本仓库 `#emitPromptAccepted` 无论 `delivery`
+是什么都回 `{type:"turn"}`，于是每次 steer 都被判 `unavailable`，daemon 随即
+`replaceAdmittedForegroundTurn` → `cancelAgentRunBefore` → 插件 `interrupt()` → 桥
+`session/cancel` → DSH `agent.cancel({kind:'user'})`：当前回合被取消，绑在该回合 abort signal
+上的前台子代理被中止。附带后果是同一段文本先被 `agent.steer()` 注入一次、又被替换回合作为
+prompt 重发一次。
+
+**修法**：
+- `delivery === "steer"` 且确有运行中的回合（`#turnId !== null`）时，回
+  `{type:"steer", turnId: this.#turnId}`；其它情况维持 `{type:"turn"}`（无运行回合时不谎报
+  steer）。steer 路径不触发任何 cancel/interrupt。命令路径（`{type:"completed"}`）不变。
+- 顺带消掉一个 turnId 竞态：`prompt()` 在**开启新回合**时（`delivery !== "steer"` 且
+  `#turnId === null`）先预发 `#turnId = \`turn:${clientMessageId}\``，让**首次 prompt_result**
+  与随后 `session.turn started` 的 turnId 按构造相等——daemon 绑的是前者，steer 必须重复它。
+  真实 DSH 下 running 状态本就先于 prompt 回复到达，预发是**防御性**的、不依赖该跨进程时序，
+  同时兼作回归锚点。prompt 启动失败时把预发的 id 复位为 null，避免留下幽灵回合 id。
+
+**判定标准**：`harness/steer-check.cjs`（17 项）用脚本化假 `dsh` 断言：运行中 steer 被准入且
+`turnId` 与 `session.turn started` 一致、steer 不产生任何 `session/cancel`、消息只投递一次
+（无重复 user_message、无重复回合）、无运行回合时 steer 如实回 `turn`、父 steer 不影响子会话
+终态、失败后 id 复位且下一次回合仍一致、命令仍回 `completed`。假桥新增 `steer`（真实时序：
+running status 先于 prompt 回复）与 `late`（合成的防御性反序，非真实 DSH 时序）两个模式，以及
+`failonce`（首个 prompt 被拒）。真实 daemon 的 before/after 验证（重载插件后给等待前台子代理
+的会话发消息，观察子代理是否继续跑完）由主会话在部署后进行，本仓库不做。
+
+**已知窄边界（未修，均比原行为更窄）**：
+
+| 项 | 说明 |
+|----|------|
+| 失败复位可能丢掉已开回合的 id | `prompt()` 失败时只在**本次调用预发过 id**（`issuedTurn`）的情况下把 `#turnId` 复位为 null。只有桥在 `followup()` 之前就抛错（尚未进入 running）时，复位才是安全的；若失败发生在 DSH 已同步进入 running、插件已发出 `session.turn started` 之后，复位会丢掉这个仍然存活回合的 id，之后 idle 不再发 `session.turn completed`。daemon 侧仍能靠 `turn_failed` 收敛，只是语义变脏。属本轮新增逻辑的窄边界，未改行为，如实记录。 |
+| 无回合 steer 回 `turn` 会在宿主侧留一个悬空 id | 无运行回合时 steer 回 `{type:"turn", turnId}`，`@getpaseo/server` 的 `plugin-provider.js` `accept()` 会把 `turn` 结果的 turnId 加进 `activeTurnIds`，而该回合不存在、永远没有终态事件把它移除，仅在该连接 `connectionClosed` 时可能多报一次 `session.runtime_failed`。这是宿主行为；原实现**所有** steer 都回 `turn`，所以本轮是收窄而非新增。 |
+
+---
+
 ## 已知限制（未修，有意为之）
 
 | 项 | 说明 |
 |----|------|
 | `assistant/attempt` 被丢弃 | 该事件承载失败/重试/取消的尝试，所以**重试在界面上不可见**。但 `AssistantStreamRecord` 没有错误变体，无法可靠区分"失败重试"和"用户主动取消"，乱加会在每次取消时刷噪音。 |
 | 时间线只映射 13 种会话事件里的 4 种 | 其余多数是有意丢弃：`developer/message`、`system/message` 是系统提示，`request/header`、`request/context` 是内部记账。 |
+| 可续接子代理二次运行的状态不回到 running | Paseo 0.11.2 的 provider 子通道忽略子会话的 `session.turn started`、`session.usage`、`session.permission`。子卡首次打开即为 running，终态（completed/failed）仍会更新，但再次运行的 started 不会恢复运行中状态。需 Paseo 核心补丁，本仓库不改全局包。 |
+| 子代理审批不在 Paseo 出现 | 同上：子会话的 permission 事件被宿主忽略。桥只把根会话的问题转发给 Paseo，子会话问题保留 DSH 自身的子代理审批语义，避免挂起或误归属父会话。 |
+| 子代理运行中状态/用量/审批需 Paseo 核心补丁 | 精确方案：`@getpaseo/server` 的 `agent/plugin-provider.js` `acceptChildEvent`（本机 0.11.2 行 1217-1248）需额外消费子 `session.turn started`（恢复 running）、`session.usage`（子用量）、`session.permission`（子审批卡），并把子 permission 经会话 id 路由到子代理视图。本仓库不改全局包；插件侧已按正确子身份发出这些事件，补丁落地即生效。 |
 
 ## 关于"哪条路由能用"
 
