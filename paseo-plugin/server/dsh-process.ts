@@ -41,6 +41,21 @@ export interface DshQuestionRequest {
   callId: string | null;
   timed: boolean;
   questions: DshQuestion[];
+  /** Native session id of the asking agent; absent for older bridges. */
+  sessionId?: string;
+}
+
+/**
+ * A server -> client notice that a native subagent child session exists. The
+ * ids are DSH's own: `sessionId` is the child's native session id, and
+ * `parentSessionId` is the direct parent's native session id.
+ */
+export interface DshChildOpened {
+  sessionId: string;
+  parentSessionId: string;
+  mode?: string;
+  label?: string;
+  cwd?: string;
 }
 
 /** A `session.event` payload's outer envelope. */
@@ -98,8 +113,11 @@ export interface DshCommand {
 
 export interface DshProcessHandlers {
   onEvent(payload: DshSessionEvent): void;
-  onStatus(status: string): void;
-  onQuestion(request: DshQuestionRequest): Promise<DshAnswer>;
+  /** `sessionId` is DSH's own id, so the caller can route by session. */
+  onStatus(status: string, sessionId: string): void;
+  onQuestion(request: DshQuestionRequest, sessionId: string): Promise<DshAnswer>;
+  /** A native subagent child session was observed; Paseo may show it. */
+  onChildOpened?(payload: DshChildOpened): void;
   onLog(line: string): void;
   onExit(code: number | null, signal: string | null): void;
   onProtocolError(message: string): void;
@@ -324,14 +342,58 @@ export class DshProcess {
     return result.sessions ?? [];
   }
 
-  /** Read this session's stored event log, for replaying into a timeline. */
-  async history(): Promise<Array<{ type: string; seq?: number; time?: number; data: unknown }>> {
+  /** Read one session's stored event log, for replaying into a timeline. */
+  async history(sessionId = this.#options.sessionId): Promise<{
+    events: Array<{ type: string; seq?: number; time?: number; data: unknown }>;
+    /** Leading events inherited from a fork parent; own history starts here. */
+    inheritedEventCount: number;
+  }> {
     const result = (await this.#request(
       "paseo/history",
+      { sessionId },
+      60000,
+    )) as {
+      events?: Array<{ type: string; seq?: number; time?: number; data: unknown }>;
+      inheritedEventCount?: number;
+    };
+    return {
+      events: result.events ?? [],
+      inheritedEventCount:
+        typeof result.inheritedEventCount === "number" && result.inheritedEventCount > 0
+          ? result.inheritedEventCount
+          : 0,
+    };
+  }
+
+  /**
+   * List the native subagent children reachable from this session, for
+   * rebuilding the tree on replay. Read-only: DSH reads its durable catalog
+   * without loading or resuming any child agent. `available: false` means the
+   * runtime composes no subagent service; a failed read carries `error`, and an
+   * unreadable branch is reported in `diagnostics` — never a silent empty list.
+   */
+  async subagents(): Promise<{
+    available: boolean;
+    subagents: Array<{ sessionId: string; parentSessionId: string; mode?: string; label?: string }>;
+    diagnostics?: unknown[];
+    error?: { message: string };
+  }> {
+    const result = (await this.#request(
+      "paseo/subagents",
       { sessionId: this.#options.sessionId },
       60000,
-    )) as { events?: Array<{ type: string; seq?: number; time?: number; data: unknown }> };
-    return result.events ?? [];
+    )) as {
+      available?: boolean;
+      subagents?: Array<{ sessionId: string; parentSessionId: string; mode?: string; label?: string }>;
+      diagnostics?: unknown[];
+      error?: { message?: string };
+    };
+    return {
+      available: result.available === true,
+      subagents: result.subagents ?? [],
+      ...(result.diagnostics === undefined ? {} : { diagnostics: result.diagnostics }),
+      ...(result.error === undefined ? {} : { error: { message: result.error.message ?? "subagent listing failed" } }),
+    };
   }
 
   /** Ask the bridge to dispose the agent and exit. */
@@ -413,11 +475,15 @@ export class DshProcess {
     if (method === "paseo/question" && id !== undefined) {
       try {
         const params = (frame.params ?? {}) as DshQuestionRequest;
-        const answer = await this.#options.onQuestion({
-          callId: params.callId ?? null,
-          timed: params.timed === true,
-          questions: params.questions ?? [],
-        });
+        const answer = await this.#options.onQuestion(
+          {
+            callId: params.callId ?? null,
+            timed: params.timed === true,
+            questions: params.questions ?? [],
+            ...(typeof params.sessionId === "string" ? { sessionId: params.sessionId } : {}),
+          },
+          typeof params.sessionId === "string" ? params.sessionId : "",
+        );
         this.#send({ jsonrpc: "2.0", id, result: answer });
       } catch (error) {
         this.#send({
@@ -434,8 +500,15 @@ export class DshProcess {
       return;
     }
     if (method === "session.status") {
-      const params = frame.params as { status?: string } | undefined;
-      this.#options.onStatus(params?.status ?? "unknown");
+      const params = frame.params as { status?: string; sessionId?: string } | undefined;
+      this.#options.onStatus(params?.status ?? "unknown", params?.sessionId ?? "");
+      return;
+    }
+    if (method === "session.child-opened") {
+      const params = frame.params as DshChildOpened | undefined;
+      if (params !== undefined && typeof params.sessionId === "string" && params.sessionId !== "") {
+        this.#options.onChildOpened?.(params);
+      }
       return;
     }
     if (method !== undefined) {

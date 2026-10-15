@@ -95,6 +95,13 @@ function withTimeout(promise, ms, label) {
   ]).finally(() => clearTimeout(timer));
 }
 
+/**
+ * Bound on a child's held frames before it is opened without a label. A child's
+ * `subagent/descriptor` normally arrives within its first turn; the cap only
+ * guards an anomalous provider so its earliest output is never dropped.
+ */
+const CHILD_BUFFER_CAP = 500;
+
 export class PaseoHarnessServer {
   constructor(ctx, transport, options = {}) {
     this.ctx = ctx;
@@ -130,6 +137,14 @@ export class PaseoHarnessServer {
     /** sessionId -> { handle } for agents this server owns. */
     this.sessions = new Map();
     this.sessionCreations = new Map();
+    /**
+     * Native child session id -> { parentId, mode?, label? }. Populated from
+     * each child session's own durable header (`origin: 'subagent'`) the moment
+     * it first emits, with the parent catalog as a fallback. A child that
+     * appears here is reported to Paseo as a provider-owned subsession; the
+     * bridge never creates, resumes, or prompts a child to learn this.
+     */
+    this.children = new Map();
     this.disposers = [];
     this.initialized = false;
     this.shuttingDown = false;
@@ -138,14 +153,110 @@ export class PaseoHarnessServer {
 
     this.disposers.push(
       ctx.on('session/event', (session, event) => {
-        this.transport.notify('session.event', { sessionId: String(session.id), event });
+        // Register a child before forwarding its first event, so Paseo has the
+        // parent edge by the time the event lands and never misattributes it.
+        this.observeChildSession(session);
+        if (event.type === 'subagent/catalog') this.observeCatalogChild(session, event);
+        const sessionId = String(session.id);
+        const child = this.children.get(sessionId);
+        // A child's own events are held until its durable label is known (from
+        // its `subagent/descriptor` or the parent catalog), so the single
+        // `session.child-opened` Paseo attaches already carries the real title.
+        if (child !== undefined && !child.opened) {
+          this.holdChildFrame(sessionId, child, { kind: 'event', event });
+        } else {
+          this.transport.notify('session.event', { sessionId, event });
+        }
       }),
     );
     this.disposers.push(
       ctx.on('agent/status', ({ agent, status }) => {
-        this.transport.notify('session.status', { sessionId: String(agent.session.id), status });
+        this.observeChildSession(agent.session);
+        const sessionId = String(agent.session.id);
+        const child = this.children.get(sessionId);
+        if (child !== undefined && !child.opened) {
+          this.holdChildFrame(sessionId, child, { kind: 'status', status });
+        } else {
+          this.transport.notify('session.status', { sessionId, status });
+        }
       }),
     );
+  }
+
+  /**
+   * Record one native subagent child session from its own durable header.
+   * `origin: 'subagent'` is written by every subagent provider and the header's
+   * `parentSession` is the direct parent. The child is registered here but not
+   * yet reported: {@link holdChildFrame} opens it once a durable label is known.
+   * Idempotent.
+   */
+  observeChildSession(session) {
+    const id = String(session.id);
+    if (this.children.has(id)) return;
+    const header = session.header;
+    if (header === undefined || header.origin !== 'subagent') return;
+    const parentId = header.parentSession === undefined ? undefined : String(header.parentSession);
+    if (parentId === undefined || parentId === '') return;
+    this.children.set(id, {
+      parentId,
+      opened: false,
+      buffered: [],
+      ...(header.cwd === undefined ? {} : { cwd: header.cwd }),
+    });
+  }
+
+  /**
+   * Fallback registration from the parent-owned `subagent/catalog` fact, which
+   * also carries the child's creation label and lifecycle mode. Opens the child
+   * immediately when its own session was never observed directly.
+   */
+  observeCatalogChild(session, event) {
+    const data = event.data ?? {};
+    const childId = data.childId === undefined ? undefined : String(data.childId);
+    if (childId === undefined || childId === '') return;
+    const parentId = String(session.id);
+    let child = this.children.get(childId);
+    if (child === undefined) {
+      child = { parentId, opened: false, buffered: [], cwd: this.cwd };
+      this.children.set(childId, child);
+    }
+    if (child.label === undefined && data.label !== undefined) child.label = String(data.label);
+    if (child.mode === undefined && data.mode !== undefined) child.mode = data.mode;
+    if (!child.opened) this.openChild(childId, child);
+  }
+
+  /** Hold one child frame until the child is opened, bounded so output is never lost. */
+  holdChildFrame(sessionId, child, frame) {
+    // A `subagent/descriptor` is the child's own durable identity; its label is
+    // the creation label, so opening here is the first chance at a real title.
+    if (frame.kind === 'event' && frame.event.type === 'subagent/descriptor') {
+      const data = frame.event.data ?? {};
+      if (child.label === undefined && data.label !== undefined) child.label = String(data.label);
+      if (child.mode === undefined && data.mode !== undefined) child.mode = data.mode;
+    }
+    child.buffered.push(frame);
+    if (child.label !== undefined || child.buffered.length >= CHILD_BUFFER_CAP) {
+      this.openChild(sessionId, child);
+    }
+  }
+
+  /** Report a child to Paseo and flush every frame held for it, in order. */
+  openChild(sessionId, child) {
+    if (child.opened) return;
+    child.opened = true;
+    this.transport.notify('session.child-opened', {
+      sessionId,
+      parentSessionId: child.parentId,
+      ...(child.mode === undefined ? {} : { mode: child.mode }),
+      ...(child.label === undefined ? {} : { label: child.label }),
+      ...(child.cwd === undefined ? {} : { cwd: child.cwd }),
+    });
+    const buffered = child.buffered;
+    child.buffered = [];
+    for (const frame of buffered) {
+      if (frame.kind === 'event') this.transport.notify('session.event', { sessionId, event: frame.event });
+      else this.transport.notify('session.status', { sessionId, status: frame.status });
+    }
   }
 
   /** Whether this server owns the live agent behind a session id. */
@@ -456,7 +567,7 @@ export class PaseoHarnessServer {
    */
   async history(params) {
     const persistence = this.ctx.get('sessionPersistence');
-    if (persistence === undefined) return { available: false, events: [] };
+    if (persistence === undefined) return { available: false, events: [], inheritedEventCount: 0 };
     let handle;
     try {
       // A session mid-write can stall a read; bound it so a stuck read never
@@ -465,12 +576,20 @@ export class PaseoHarnessServer {
     } catch {
       // Unknown/unmaterialized session (or a stalled read): an empty history is
       // the honest answer.
-      return { available: true, events: [] };
+      return { available: true, events: [], inheritedEventCount: 0 };
     }
     try {
       const result = await withTimeout(handle.read(), 15000, 'reading session history');
+      // `inheritedEventCount` is the fork-inherited prefix length: a caller
+      // replaying a child must start after it, or a forked child re-shows its
+      // parent's conversation as its own.
+      const inheritedEventCount =
+        typeof handle.inheritedEventCount === 'number' && handle.inheritedEventCount > 0
+          ? handle.inheritedEventCount
+          : 0;
       return {
         available: true,
+        inheritedEventCount,
         events: (result.events ?? []).map((event) => ({
           type: event.type,
           ...(event.seq === undefined ? {} : { seq: event.seq }),
@@ -479,13 +598,55 @@ export class PaseoHarnessServer {
         })),
       };
     } catch {
-      return { available: true, events: [] };
+      return { available: true, inheritedEventCount: 0, events: [] };
     } finally {
       try {
         await handle.close();
       } catch {
         /* handle close is idempotent; a failure here must not mask the read */
       }
+    }
+  }
+
+  /**
+   * List the subagent children reachable from one session, for rebuilding the
+   * tree on replay. Reads DSH's own durable catalog through
+   * `subagents.listDescendants`, which excludes fork-inherited facts and never
+   * loads or resumes a child Agent.
+   *
+   * Failure is never disguised as an empty tree: a missing service returns
+   * `available: false`; a failed read returns `available: false` with `error`;
+   * and unreadable catalog branches (unknown modes, corrupt/unavailable child
+   * logs) are returned in `diagnostics`.
+   */
+  async subagents(params) {
+    const subagents = this.ctx.get('subagents');
+    if (subagents === undefined) return { available: false, subagents: [] };
+    if (typeof params.sessionId !== 'string' || params.sessionId === '') {
+      return { available: false, subagents: [], error: { message: 'subagents requires a sessionId' } };
+    }
+    try {
+      const rows = await subagents.listDescendants(params.sessionId);
+      return {
+        available: true,
+        subagents: rows
+          .filter((row) => row.kind === 'child')
+          .map((row) => ({
+            sessionId: String(row.id),
+            parentSessionId: String(row.parentId),
+            ...(row.mode === undefined ? {} : { mode: row.mode }),
+            ...(row.label === undefined ? {} : { label: row.label }),
+          })),
+        diagnostics: rows
+          .filter((row) => row.kind !== 'child')
+          .map((row) => ({ sessionId: String(row.id), reason: row.reason })),
+      };
+    } catch (error) {
+      return {
+        available: false,
+        subagents: [],
+        error: { message: error instanceof Error ? error.message : String(error) },
+      };
     }
   }
 
@@ -786,6 +947,8 @@ export class PaseoHarnessServer {
         return this.listSessions(params);
       case 'paseo/history':
         return this.history(params);
+      case 'paseo/subagents':
+        return this.subagents(params);
       case 'paseo/plan/get':
         return this.planGet(params);
       case 'paseo/plan/set':
@@ -836,8 +999,20 @@ export class PaseoHarnessServer {
       ...(this.reasoningEffort === undefined ? {} : { reasoningEffort: this.reasoningEffort }),
     };
     const control = { selection: { current: initial, assembled: undefined }, dispose: undefined };
+    // Paseo can deliver any message as `interrupt`, which cancels the parent turn
+    // before this plugin is involved; a foreground child holds that turn's abort
+    // signal and dies with it. Force delegation onto the detached background
+    // route so talking to the parent never terminates a running child.
     const installSelection = (agentCtx) => {
       control.dispose = installModelSelection(agentCtx, control.selection);
+      for (const name of ['subagent', 'subagent_fork']) {
+        const base = agentCtx.tools.get(name);
+        if (base === undefined) continue;
+        agentCtx.tools.register({
+          ...base,
+          execute: (args, exec) => base.execute({ ...args, run_in_background: true }, exec),
+        });
+      }
     };
 
     // A session that runs under an agent preset mounts it during setup, exactly

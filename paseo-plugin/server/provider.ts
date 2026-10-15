@@ -20,7 +20,7 @@ import {
   type ProviderThinkingOption,
 } from "@getpaseo/plugin/server/provider";
 import { DshProcess, type DshCatalog } from "./dsh-process";
-import { DshSession, MODES, parseRoute } from "./session";
+import { DshChildSession, DshSession, MODES, parseRoute } from "./session";
 
 const CAPABILITIES = [
   "prompt.message",
@@ -45,6 +45,12 @@ const CAPABILITIES = [
   // session" lists providers that support this). Implemented over the session
   // log below.
   "session.list",
+  // DSH's native subagents run as child sessions inside the root's own process.
+  // Without this Paseo drops every provider-initiated child `session.opened`
+  // (the daemon fails the connection when a parent did not negotiate it), so
+  // the whole subagent tree is invisible. Declaring it is what makes Paseo
+  // accept and display the children this provider opens.
+  "session.subsession",
   "permission",
 ] as const;
 
@@ -335,6 +341,10 @@ class DshConnection implements ProviderConnection {
       mode: config.mode ?? "build",
       models: display.models,
       thinkingOptions: display.thinkingOptions,
+      // Only offer child subsessions when Paseo negotiated the capability; when
+      // it did not, the host cannot accept a child and the session must stay
+      // root-only rather than fail the whole connection.
+      subsession: this.capabilities.includes("session.subsession"),
       emit: (event) => this.#emit(event),
       log: (line) => {
         process.stderr.write(`[${PROVIDER_ID}] ${line}\n`);
@@ -412,16 +422,29 @@ class DshConnection implements ProviderConnection {
     });
     this.#emit({ type: "session.config", sessionId, config: session.configState() });
     this.#emit({ type: "session.ready", requestId: input.requestId, sessionId });
+    // The root is open: release any child the bridge reported during the open,
+    // so a child is never emitted before its parent.
+    session.markRootReady();
     // A reopened session resumes DSH's stored context without a turn, so ask the
     // runtime for its occupancy now; otherwise the readout stays empty until the
     // next prompt even though the runtime already knows the numbers.
     void session.refreshUsage();
+    // Rebuild the native subagent tree on every open (a fresh `skip` or a reopen
+    // `replay`). It reads DSH's durable catalog and child logs; it never creates
+    // an agent, and a fresh session simply has none.
+    void session.replaySubagents();
   }
 
-  #require(sessionId: string): DshSession {
+  #require(sessionId: string): DshSession | DshChildSession {
     const session = this.#sessions.get(sessionId);
-    if (session === undefined) throw new Error(`unknown session: ${sessionId}`);
-    return session;
+    if (session !== undefined) return session;
+    // A native subagent child lives inside its root's process; the root owns it
+    // and routes operations to the child view by the child's own session id.
+    for (const root of this.#sessions.values()) {
+      const child = root.child(sessionId);
+      if (child !== undefined) return child;
+    }
+    throw new Error(`unknown session: ${sessionId}`);
   }
 
   #emit(event: ProviderEvent): void {
