@@ -35,7 +35,7 @@ export function InlineToolCall({ theme, layout, item }: PluginTimelineItemProps<
   const canExpand = hasBody || data.summary !== "";
   const compact = layout.compact;
   const iconSize = compact ? 14 : 16;
-  const shimmer = useShimmer(data.status === "running");
+  const shimmer = useShimmer(data.status === "running" || data.phase === "streaming");
 
   const styles = useMemo(
     () => ({
