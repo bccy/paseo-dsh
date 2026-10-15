@@ -485,12 +485,70 @@ argv 与 patch 内容），因为没有任何 bridge 帧能反映启动参数。
 
 ---
 
+## 第十一轮：整步快照导致"半天不出、突然一大批"
+
+### 25. 助手文本不流式：模型一步结束才整段出现
+
+**症状**：界面长时间没有任何内容，然后一个模型步的全部输出（推理 + 正文 + 工具行）
+一次性出现。真实会话日志统计：`step/start` 到 `assistant/message` 的静默间隔中位数
+9.1s、p90 20.2s，占回合墙钟的 68%。
+
+**根因有两层**：
+
+| 层 | 根因 |
+|----|------|
+| 数据源粒度 | DSH 的**持久**事件 `assistant/message` 只在 step settle 时 append 一次，携带整步内容；逐 chunk 的过程在进程内以 `agent/assistant-stream` 瞬时帧发出，从不进会话日志。 |
+| 桥没有订阅瞬时帧 | 桥只订阅 `session/event` 和 `agent/status`，所以中间过程在 DSH 进程里就被丢掉了。插件只能拿到整步快照，无法自行"变出"流式。 |
+
+而 Paseo 侧**本来就支持增量**：`@getpaseo/server` 的 `plugin-provider.js`
+`mapTimelineItem` 对同 id 的 `assistant_message`/`reasoning` 做前缀差分，Paseo 自己的
+Antigravity provider 就是这么发的（`id` 与 `messageId` 同值、文本单调增长）。桥没订阅
+瞬时帧，等于声明了流式却没有数据源——正是本仓库最忌讳的"能力声明与数据源不一致"。
+
+**修法**：
+
+- 桥订阅 `agent/assistant-stream`（`{global: true}`：它是 agent 作用域事件），用
+  `@deepseek-ai/dsh-llm` 导出的 `BlockAssembler` 把 chunk 折成 text/reasoning，按
+  **100ms** 节流，用 `session.event` 信封发一个桥自有类型 `paseo/assistant-delta`
+  （`{turn, step, text, reasoning}`，都是全量快照）。复用 `session.event` 是为了让插件
+  已有的根/子会话路由和 held-child 缓冲原样生效。
+- 插件 `timeline.ts` 把该类型折成稳定 id 的 `timeline.item`（`assistant:${turn}:${step}` /
+  `reasoning:${turn}:${step}`），并且 **`messageId` 必须等于该 id**。Paseo 的合并要求
+  相邻行的 `turnId` 相同、`messageId` 一致；此前持久项用的是 DSH 的 `message.id`，与增量
+  项的 id 不同，会让最终消息另起一行、文本重复。
+- 节流必须放桥侧：每个 token 一个 JSON-RPC 帧会把 stdio 打爆。终态持久事件覆盖尾差
+  （通常差值为空，Paseo 直接丢弃，不会重复）。
+- **Paseo 只合并"相邻"的同类行**，所以流式最容易被两个细节切成碎片，两个都要防：
+  1. 一帧里 reasoning 和 text 同时增长时，插件会交替发两种 item，同类行不再相邻。
+     桥因此**只发送本次变化的那一半**（未变的半边省略），让每一半的行保持连续。
+  2. durable `assistant/message` 在最后一个 chunk 之后才 append；若节流把尾巴压住了，
+     durable 会带来一个 Paseo 没见过的差值，落在正文行之后又把回答切开。桥在转发
+     durable 之前先**强制刷出**实时快照，使 durable 的差值恒为空。
+  这两点都是"日志看着对、界面被切成多条消息"的静默错误，只有按 Paseo 的合并规则投影
+  才能断言（`plugin-check.cjs` 新增了该项）。
+
+**判定标准**：
+
+- `harness/stream-probe.mjs`（真实 `dsh --profile paseo`）：一步内应出现多个
+  `paseo/assistant-delta`，文本前缀单调增长，durable 消息被最后一个快照覆盖，首个
+  delta 远早于 settle，且按 Paseo 规则投影后每种类型只有一行。
+- `harness/assistant-stream-check.cjs`（假桥，离线）：断言同一 `turn:step` 的
+  `assistant_message` 出现多次、前缀增长、`id === messageId`、持久项不另起一行。
+- `harness/plugin-check.cjs`（真实回合）：`live streaming does not fragment an assistant
+  step across rows`——每个 `messageId` 投影后恰好一行。
+
+**已知限制**：Paseo 的时间线是 append-only，没有"撤回"。一次在**已经流出一部分文本后**
+才失败重试的 attempt，其已发出的前缀会留在界面上（桥在每次 `start` 重置组装器，不会把
+两次 attempt 混成一份，但无法收回已经发出去的帧）。仅影响流式途中失败重试的罕见路径。
+
+---
+
 ## 已知限制（未修，有意为之）
 
 | 项 | 说明 |
 |----|------|
-| `assistant/attempt` 被丢弃 | 该事件承载失败/重试/取消的尝试，所以**重试在界面上不可见**。但 `AssistantStreamRecord` 没有错误变体，无法可靠区分"失败重试"和"用户主动取消"，乱加会在每次取消时刷噪音。 |
-| 时间线只映射 13 种会话事件里的 4 种 | 其余多数是有意丢弃：`developer/message`、`system/message` 是系统提示，`request/header`、`request/context` 是内部记账。 |
+| `assistant/attempt` 被丢弃 | 该事件承载失败/重试/取消的尝试，所以**重试的持久记录在界面上不可见**。但流式上线后，一次"已经流出一部分才失败重试"的 attempt，其已发出的前缀会留在时间线上（Paseo 时间线 append-only，无法撤回，见第 25 条）。`AssistantStreamRecord` 没有错误变体，无法可靠区分"失败重试"和"用户主动取消"，所以持久记录仍不加，乱加会在每次取消时刷噪音。 |
+| 时间线只映射 13 种会话事件里的 4 种 | 其余多数是有意丢弃：`developer/message`、`system/message` 是系统提示，`request/header`、`request/context` 是内部记账。流式另走桥自有的瞬时类型 `paseo/assistant-delta`，不进会话日志。 |
 | 可续接子代理二次运行的状态不回到 running | Paseo 0.11.2 的 provider 子通道忽略子会话的 `session.turn started`、`session.usage`、`session.permission`。子卡首次打开即为 running，终态（completed/failed）仍会更新，但再次运行的 started 不会恢复运行中状态。需 Paseo 核心补丁，本仓库不改全局包。 |
 | 子代理审批不在 Paseo 出现 | 同上：子会话的 permission 事件被宿主忽略。桥只把根会话的问题转发给 Paseo，子会话问题保留 DSH 自身的子代理审批语义，避免挂起或误归属父会话。 |
 | 子代理运行中状态/用量/审批需 Paseo 核心补丁 | 精确方案：`@getpaseo/server` 的 `agent/plugin-provider.js` `acceptChildEvent`（本机 0.11.2 行 1217-1248）需额外消费子 `session.turn started`（恢复 running）、`session.usage`（子用量）、`session.permission`（子审批卡），并把子 permission 经会话 id 路由到子代理视图。本仓库不改全局包；插件侧已按正确子身份发出这些事件，补丁落地即生效。 |

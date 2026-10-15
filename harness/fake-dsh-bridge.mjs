@@ -30,6 +30,10 @@
  *            regardless of that cross-process ordering
  *   failonce refuse the first prompt, then run later ones normally, so a ghost
  *            turn id left behind by the failure would be observable
+ *   stream   replay a growing `paseo/assistant-delta` stream (the bridge's
+ *            transient assistant snapshot) followed by the durable
+ *            `assistant/message` for the same turn/step, so the plugin's
+ *            folding into one stable item id can be asserted without a model
  *
  * `DSH_FAKE_LOG` (a file path) records every request frame, so a test can assert
  * at the protocol boundary how many times a prompt was actually delivered.
@@ -185,6 +189,43 @@ async function endRootTurn(text) {
   notify("session.status", { sessionId: rootId, status: "idle" });
 }
 
+/**
+ * Emit a scripted live assistant stream, then its durable settlement.
+ *
+ * `paseo/assistant-delta` is the bridge's own transient frame: what it forwards
+ * after folding DSH's per-chunk `agent/assistant-stream` frames. Each snapshot
+ * carries the full step text so far, exactly as the real bridge sends it. The
+ * durable `assistant/message` that follows must land on the same item id and
+ * add only the tail, never a second copy.
+ */
+async function emitStream() {
+  notify("session.status", { sessionId: rootId, status: "running" });
+  // Reasoning grows first, then text — the order DSH's adapters stream blocks
+  // in. Each snapshot carries only the half that changed, exactly as the real
+  // bridge now sends it, so each half's rows stay adjacent and Paseo can merge
+  // them into one row per type.
+  const frames = [
+    { reasoning: "thin" },
+    { reasoning: "think" },
+    { reasoning: "thinking" },
+    { text: "Hel" },
+    { text: "Hello" },
+    { text: "Hello world" },
+  ];
+  for (const data of frames) {
+    notify("session.event", {
+      sessionId: rootId,
+      event: { type: "paseo/assistant-delta", data: { turn: 1, step: 1, ...data } },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  // The durable settlement repeats the whole step; its deltas are empty and
+  // Paseo drops it, so it must not add a second row.
+  notify("session.event", { sessionId: rootId, event: { type: "assistant/message", seq: 1, data: { turn: 1, step: 1, message: { id: "sm1", content: [{ type: "reasoning", text: "thinking" }, { type: "text", text: "Hello world" }] } } } });
+  notify("session.event", { sessionId: rootId, event: { type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "completed" } } } });
+  notify("session.status", { sessionId: rootId, status: "idle" });
+}
+
 function reply(id, result) {
   out({ jsonrpc: "2.0", id, result });
 }
@@ -251,6 +292,10 @@ async function handle(method, params, id) {
       if (MODE === "nested" && !emitted) {
         emitted = true;
         setTimeout(() => { void emitNested(); }, 30);
+      }
+      if (MODE === "stream" && !emitted) {
+        emitted = true;
+        setTimeout(() => { void emitStream(); }, 20);
       }
       if (MODE === "steer") {
         if (params?.delivery === "steer") {

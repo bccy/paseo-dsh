@@ -19,6 +19,17 @@ interface DshEvent {
   [key: string]: unknown;
 }
 
+/**
+ * The bridge's transient assistant-snapshot event type.
+ *
+ * DSH's durable `assistant/message` only exists once a step settles, so the
+ * bridge subscribes to DSH's per-chunk `agent/assistant-stream` frames, folds
+ * them into a growing snapshot, and forwards it under this type over the same
+ * `session.event` envelope. It is a middle-layer frame: never appended to a
+ * session log, never seen by history replay.
+ */
+const ASSISTANT_DELTA_EVENT = "paseo/assistant-delta";
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -157,6 +168,10 @@ export class TimelineBuilder {
    */
   consume(event: DshEvent): ProviderTimelineItem[] {
     const data = isRecord(event.data) ? event.data : {};
+    // The bridge's own transient frame, not a DSH durable event: a growing
+    // snapshot of the step in flight, carrying the same turn/step the durable
+    // `assistant/message` will, so both fold into the same item id.
+    if (event.type === ASSISTANT_DELTA_EVENT) return this.#assistantDelta(data);
     switch (event.type) {
       case "assistant/message":
         return this.#assistantMessage(data);
@@ -201,14 +216,11 @@ export class TimelineBuilder {
 
     const text = textOf(content);
     if (text !== "") {
-      out.push(
-        ...this.#put({
-          type: "assistant_message",
-          id: `assistant:${turn}:${step}`,
-          text,
-          ...(typeof message?.id === "string" ? { messageId: message.id } : {}),
-        }),
-      );
+      // `messageId` is the item id, never DSH's per-message uuid: Paseo folds
+      // the live snapshots and this durable copy into one growing row only
+      // while `messageId` is identical across them.
+      const id = `assistant:${turn}:${step}`;
+      out.push(...this.#put({ type: "assistant_message", id, messageId: id, text }));
     }
 
     for (const block of content) {
@@ -219,6 +231,34 @@ export class TimelineBuilder {
       this.#toolNames.set(callId, name);
       this.#toolInputs.set(callId, input);
       out.push(...this.#emitToolCall(callId, name, input, "running"));
+    }
+    return out;
+  }
+
+  /**
+   * Fold one live snapshot from the bridge's transient assistant stream.
+   *
+   * The bridge assembles DSH's per-chunk frames into a growing step snapshot
+   * and sends it before the durable `assistant/message` exists. The ids match
+   * the durable items exactly and `messageId` equals the assistant id, because
+   * Paseo turns a same-id snapshot into the prefix delta of one growing row
+   * only while those agree — a differing `messageId` would start a second row
+   * and duplicate the text once the durable copy arrives.
+   */
+  #assistantDelta(data: Record<string, unknown>): ProviderTimelineItem[] {
+    const turn = typeof data.turn === "number" ? data.turn : undefined;
+    const step = typeof data.step === "number" ? data.step : undefined;
+    if (turn === undefined || step === undefined) return [];
+
+    const out: ProviderTimelineItem[] = [];
+    const reasoning = typeof data.reasoning === "string" ? data.reasoning : "";
+    if (reasoning !== "") {
+      out.push(...this.#put({ type: "reasoning", id: `reasoning:${turn}:${step}`, text: reasoning }));
+    }
+    const text = typeof data.text === "string" ? data.text : "";
+    if (text !== "") {
+      const id = `assistant:${turn}:${step}`;
+      out.push(...this.#put({ type: "assistant_message", id, messageId: id, text }));
     }
     return out;
   }

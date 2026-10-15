@@ -79,6 +79,42 @@ const check = (name, pass, detail) => {
   console.log(`  ${pass ? "PASS" : "FAIL"}  ${name}${detail ? `  — ${detail}` : ""}`);
 };
 
+/**
+ * Replay Paseo's own two fold rules over the emitted timeline items, exactly as
+ * `@getpaseo/server` does: `plugin-provider.js` turns a same-id snapshot into
+ * the prefix delta (dropping an empty one), and `timeline-projection.js`
+ * concatenates only adjacent same-type rows of one turn — refusing to merge two
+ * assistant rows with different `messageId`s. A live step must therefore
+ * project to exactly one row per item id; more means the answer was fragmented.
+ */
+function projectTimelineLikePaseo(items, turnId) {
+  const snapshots = new Map();
+  const rows = [];
+  for (const item of items) {
+    const previous = snapshots.get(item.id);
+    snapshots.set(item.id, item);
+    const previousText = previous && previous.type === item.type ? previous.text : "";
+    const delta = item.text.startsWith(previousText) ? item.text.slice(previousText.length) : item.text;
+    if (delta.length === 0) continue;
+    const last = rows[rows.length - 1];
+    const sameType = last && last.type === item.type && last.turnId === turnId;
+    const sameId =
+      item.type !== "assistant_message" || item.messageId === undefined || last?.messageId === item.messageId;
+    if (sameType && sameId) {
+      last.text += delta;
+      if (last.messageId === undefined && item.type === "assistant_message") last.messageId = item.messageId;
+    } else {
+      rows.push({
+        type: item.type,
+        text: delta,
+        turnId,
+        ...(item.type === "assistant_message" ? { messageId: item.messageId } : {}),
+      });
+    }
+  }
+  return rows;
+}
+
 (async () => {
   // Offer every capability the plugin could support. `prompt.image` is asserted
   // below: it is the switch that lets Paseo send an attached picture at all, and
@@ -311,6 +347,29 @@ const check = (name, pass, detail) => {
       item.text ?? (item.content ?? []).map((b) => b.text ?? `<${b.type}>`).join("") ?? "";
     console.log(`    [${item.type}] ${String(body).slice(0, 140).replace(/\n/g, " ")}`);
   }
+
+  // 2a. live streaming must not fragment the answer. A step streams as several
+  // same-id snapshots; Paseo folds them into one row only while they stay
+  // adjacent and share a `messageId`. Reasoning emitted between assistant
+  // snapshots would split the answer into two bubbles, which is exactly the
+  // regression a "looks fine in the log" check misses.
+  const streamedAssistant = events
+    .filter((e) => e.type === "timeline.item" && e.item?.type === "assistant_message")
+    .map((e) => e.item);
+  const projectedAssistant = projectTimelineLikePaseo(streamedAssistant, "turn:any");
+  const assistantIds = [...new Set(streamedAssistant.map((i) => i.messageId).filter((id) => id !== undefined))];
+  const fragmented = assistantIds.filter(
+    (id) => projectedAssistant.filter((r) => r.type === "assistant_message" && r.messageId === id).length !== 1,
+  );
+  check(
+    "live streaming does not fragment an assistant step across rows",
+    assistantIds.length > 0 && fragmented.length === 0,
+    assistantIds.length === 0
+      ? "(no streamed assistant items)"
+      : fragmented.length === 0
+        ? `${assistantIds.length} step(s), each one row`
+        : `fragmented: ${fragmented.join(", ")}`,
+  );
 
   const allText = events
     .filter((e) => e.type === "timeline.item")

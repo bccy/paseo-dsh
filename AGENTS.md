@@ -40,7 +40,7 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon 进程里）
 
 ### 改之前先读
 
-- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 24 个真实缺陷。里面有整整一类错误叫
+- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 25 个真实缺陷。里面有整整一类错误叫
   **静默降级**（把不知道的东西当成成功、把不支持的能力悄悄丢掉）。改动前先看一遍，
   避免重新发明这些 bug。
 - [docs/ADOPTION.md](./docs/ADOPTION.md) 第 4 节 — 教训按主题归纳。
@@ -72,9 +72,16 @@ cd paseo-plugin && npx tsc --noEmit
 它断言的是事件形状，而事件形状错了界面不会报错，只会悄悄不对。运行步骤写在那个文件
 的头部注释里（插件是 TS，要先编成 CJS 才能 require）。
 
-同一条编译流程还带三个假 `dsh` 驱动的回归脚本，动到对应区域时一并跑：
+同一条编译流程还带几个假 `dsh` 驱动的回归脚本，动到对应区域时一并跑：
 `harness/subagent-check.cjs`（子会话可见性）、`harness/steer-check.cjs`（插话回执）、
-`harness/mcp-injection-check.cjs`（Paseo 注入的 MCP server 是否真的落到 `--patch`）。
+`harness/mcp-injection-check.cjs`（Paseo 注入的 MCP server 是否真的落到 `--patch`）、
+`harness/assistant-stream-check.cjs`（助手文本流式：同 id 增长快照、`id === messageId`、
+经 Paseo 规则投影后合并成一行）。
+
+**动了流式（`agent/assistant-stream` / `paseo/assistant-delta`）还要跑真实端到端**
+`node harness/stream-probe.mjs`：它用真实 `dsh --profile paseo` 断言一步内出现多个
+增长快照、且首个 delta 远早于 durable `assistant/message`。插件层的假桥检查只能证明
+折叠，证明不了桥真的订阅到了 DSH 的瞬时帧。
 
 **注意一个反直觉的坑**：`waitFor` 式的等待会匹配到上一条陈旧事件。换阶段时清空事件数组，
 或按 `turnId` 过滤——有一次就是因为匹配到了被取消那一回合的事件，误判成"取消后对话

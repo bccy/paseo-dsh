@@ -18,7 +18,7 @@
  */
 import { resolve } from 'node:path';
 import { brandString } from '@deepseek-ai/dsh-brand';
-import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
+import { BlockAssembler, createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { admitEncodedImages } from '@deepseek-ai/dsh-attachment';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
 
@@ -102,6 +102,27 @@ function withTimeout(promise, ms, label) {
  */
 const CHILD_BUFFER_CAP = 500;
 
+/**
+ * Minimum spacing between live assistant snapshots forwarded to Paseo.
+ *
+ * DSH publishes one transient frame per streamed chunk, so forwarding every
+ * chunk would put a JSON-RPC frame on stdout per token. Paseo merges successive
+ * snapshots of the same timeline item into one growing row, so a ~100ms cadence
+ * already reads as continuous typing while keeping the pipe quiet.
+ */
+const ASSISTANT_STREAM_INTERVAL_MS = 100;
+
+/**
+ * The bridge's own transient event type for a growing assistant snapshot.
+ *
+ * DSH's durable `assistant/message` only exists once a step settles; the
+ * per-chunk `agent/assistant-stream` frames are what let Paseo show text while
+ * it is produced. This type rides the existing `session.event` envelope so the
+ * plugin's session routing (root, child, held-child buffer) applies unchanged.
+ * It is never appended to a session log and never seen by history replay.
+ */
+const ASSISTANT_DELTA_EVENT = 'paseo/assistant-delta';
+
 export class PaseoHarnessServer {
   constructor(ctx, transport, options = {}) {
     this.ctx = ctx;
@@ -145,6 +166,13 @@ export class PaseoHarnessServer {
      * bridge never creates, resumes, or prompts a child to learn this.
      */
     this.children = new Map();
+    /**
+     * sessionId -> live assistant assembly for the attempt in flight. Reset by
+     * each attempt's `start`, so the bridge never merges two attempts into one
+     * snapshot. (Paseo's timeline is append-only, so a retry that failed
+     * mid-stream can still leave its already-sent prefix visible.)
+     */
+    this.assistantStreams = new Map();
     this.disposers = [];
     this.initialized = false;
     this.shuttingDown = false;
@@ -158,6 +186,11 @@ export class PaseoHarnessServer {
         this.observeChildSession(session);
         if (event.type === 'subagent/catalog') this.observeCatalogChild(session, event);
         const sessionId = String(session.id);
+        // The durable settlement is appended only after every chunk, so publish
+        // the live snapshot first. Otherwise the durable copy carries a tail
+        // Paseo has not seen, lands after the text row, and splits the answer in
+        // two (and the same for reasoning).
+        if (event.type === 'assistant/message') this.flushAssistantStreamNow(sessionId);
         const child = this.children.get(sessionId);
         // A child's own events are held until its durable label is known (from
         // its `subagent/descriptor` or the parent catalog), so the single
@@ -180,6 +213,18 @@ export class PaseoHarnessServer {
           this.transport.notify('session.status', { sessionId, status });
         }
       }),
+    );
+    // Live text: DSH's durable session events only exist at step boundaries, so
+    // without this transient channel Paseo stays empty for the whole model step
+    // and then receives the entire answer at once.
+    this.disposers.push(
+      ctx.on(
+        'agent/assistant-stream',
+        ({ agent, frame }) => {
+          this.acceptAssistantStream(agent, frame);
+        },
+        { global: true },
+      ),
     );
   }
 
@@ -262,6 +307,112 @@ export class PaseoHarnessServer {
   /** Whether this server owns the live agent behind a session id. */
   owns(sessionId) {
     return this.sessions.has(sessionId) || this.sessionCreations.has(sessionId);
+  }
+
+  /**
+   * Fold one transient assistant frame into a throttled, growing snapshot.
+   *
+   * Only sessions this bridge drives are forwarded: a root it owns, or a child
+   * it has already announced to Paseo (so a snapshot never arrives before the
+   * `session.child-opened` that gives it a home). An internal agent — a title
+   * or compaction helper — is not Paseo's to show.
+   */
+  acceptAssistantStream(agent, frame) {
+    if (frame === null || typeof frame !== 'object') return;
+    const sessionId = String(agent.session.id);
+    if (!this.owns(sessionId) && this.children.get(sessionId)?.opened !== true) return;
+
+    if (frame.type === 'start') {
+      if (typeof frame.turn !== 'number' || typeof frame.step !== 'number') return;
+      this.assistantStreams.set(sessionId, {
+        assembler: new BlockAssembler(),
+        turn: frame.turn,
+        step: frame.step,
+        lastSentAt: 0,
+        reasoning: '',
+        text: '',
+      });
+      return;
+    }
+
+    const state = this.assistantStreams.get(sessionId);
+    // A chunk before `start` carries no turn/step to attach it to; dropping it
+    // is honest, and the durable `assistant/message` still carries the step.
+    if (state === undefined) return;
+
+    if (frame.type === 'chunk') {
+      if (frame.chunk === undefined) return;
+      state.assembler.push(frame.chunk);
+      this.flushAssistantStream(sessionId, state, false);
+      return;
+    }
+    if (frame.type === 'end') {
+      // Force one last snapshot so the final tokens are not left behind by the
+      // throttle; the durable message then contributes only the tail (usually
+      // nothing, which Paseo drops rather than duplicating).
+      this.flushAssistantStream(sessionId, state, true);
+      this.assistantStreams.delete(sessionId);
+    }
+  }
+
+  /**
+   * Force the in-flight live snapshot out before its durable settlement.
+   *
+   * Called from the `session/event` handler when `assistant/message` is about to
+   * be forwarded, so the durable copy contributes only an empty tail. Without
+   * it a throttled final chunk would make the durable carry text (or reasoning)
+   * Paseo had not seen, appended after the growing row, splitting the message.
+   */
+  flushAssistantStreamNow(sessionId) {
+    const state = this.assistantStreams.get(sessionId);
+    if (state !== undefined) this.flushAssistantStream(sessionId, state, true);
+  }
+
+  /** Publish the current snapshot when it grew and the cadence allows it. */
+  flushAssistantStream(sessionId, state, force) {
+    const now = Date.now();
+    if (!force && now - state.lastSentAt < ASSISTANT_STREAM_INTERVAL_MS) return;
+
+    let blocks;
+    try {
+      blocks = state.assembler.blocks();
+    } catch {
+      // An open block the assembler cannot render is not worth a frame; the
+      // durable `assistant/message` is still complete.
+      return;
+    }
+    const reasoning = blocks
+      .filter((block) => block.type === 'reasoning')
+      .map((block) => block.text)
+      .join('\n');
+    const text = blocks
+      .filter((block) => block.type === 'text')
+      .map((block) => block.text)
+      .join('');
+    // Send only the half that changed. Paseo merges a snapshot into the previous
+    // row only when they are adjacent and of the same type, so re-sending the
+    // unchanged half would interleave reasoning and text rows and fragment the
+    // answer; omitting it keeps each half's rows contiguous.
+    const reasoningChanged = reasoning !== state.reasoning;
+    const textChanged = text !== state.text;
+    if (!reasoningChanged && !textChanged) return;
+    state.lastSentAt = now;
+    state.reasoning = reasoning;
+    state.text = text;
+    if (text === '' && reasoning === '') return;
+
+    this.transport.notify('session.event', {
+      sessionId,
+      event: {
+        type: ASSISTANT_DELTA_EVENT,
+        data: {
+          turn: state.turn,
+          step: state.step,
+          ...(reasoningChanged ? { reasoning } : {}),
+          ...(textChanged ? { text } : {}),
+        },
+      },
+    });
   }
 
   /**
