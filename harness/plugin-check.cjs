@@ -436,6 +436,11 @@ function projectTimelineLikePaseo(items, turnId) {
 
   const allText = events
     .filter((e) => e.type === "timeline.item")
+    // The plugin echoes the prompt back as a `user_message`, so including it made
+    // this assertion match its own input: the prompt ends in `… reply with
+    // exactly: IMAGE-SEEN`, and `/image/i` hit that `IMAGE`. It is the model's
+    // own answer that has to show the attachment arrived.
+    .filter((e) => e.item?.type !== "user_message")
     .map((e) => {
       const item = e.item;
       return (

@@ -285,12 +285,11 @@ async function openSession(conn, sessionId, history) {
 
   // ---- a child DSH reports as archived ----------------------------------
   // Announcing it again would resurrect it in Paseo, which is exactly how
-  // "archive all" appeared to do nothing after a restart.
-  check(
-    "an archived child is not announced by the replay",
-    !events.some((e) => e.type === "session.opened" && e.sessionId.endsWith(":sub:child-Z")),
-    "child-Z was announced",
-  );
+  // "archive all" appeared to do nothing after a restart. Asserted against the
+  // **replay** connection below: `child-Z` only appears in the `replay` mode's
+  // `paseo/subagents` list, so checking `events` (the live connection, which
+  // lists nothing) could only ever pass — a mutation that removed the filter
+  // outright still reported 55/55.
 
   // ---- the archive round trip -------------------------------------------
   // Paseo's archive action must land on DSH's native archive set. Two things
@@ -466,6 +465,14 @@ async function openSession(conn, sessionId, history) {
     "fork-inherited history is not replayed as the child's own messages",
     replayed.some((e) => e.type === "timeline.item" && e.sessionId === childAScoped && e.item?.text === "child A answer") &&
       !replayed.some((e) => e.type === "timeline.item" && e.sessionId === childAScoped && /INHERITED-PARENT/.test(timelineText(e))),
+  );
+  const archivedAnnouncements = replayed.filter(
+    (e) => e.type === "session.opened" && e.sessionId.endsWith(":sub:child-Z"),
+  );
+  check(
+    "an archived child is not announced by the replay",
+    archivedAnnouncements.length === 0,
+    archivedAnnouncements.length === 0 ? "" : `child-Z was announced ${archivedAnnouncements.length}x`,
   );
 
   // ---- a child killed mid-turn: no terminal anywhere in its log ----------
