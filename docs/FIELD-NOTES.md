@@ -935,9 +935,9 @@ terminal → `SquareTerminal`，session → `History`，cordis → `Plug`…）�
   （以前只有 `unknown` 有），于是多行命令在块里读得全；有 description 时块也仍然以命令开头
   （headline 优先取 `detailHeadline`，不再被 description 顶掉——顺带修掉了审核第 2 条）。
 
-**验证**：`harness/tool-call-check.cjs` 84/84（新增 18 条：原生工具的标签/图标、MCP 仍是原始名 +
-扳手、typed detail 不被名字映射覆盖、`titled` 的两种取值、"块已承载时标题是主体"，
-以及 shell 的块一律以命令开头）。
+**验证**：`harness/tool-call-check.cjs` 89/89（新增 18 条：原生工具的标签/图标、typed detail 不被
+名字映射覆盖、`titled` 的两种取值、"块已承载时标题是主体"、shell 的块一律以命令开头；
+MCP 部分见第 36 条）。
 
 ### 35. 思考行的折叠预览：以 DSH 为准
 
@@ -961,6 +961,24 @@ const summary = summaryText.replaceAll("**", "");
 **验证**：`harness/thinking-check.cjs` 17/17 —— 首行取值、空串/无换行/以换行开头、段落的四种
 边界（未终结的末段不算、空行与缩进空行分段、`\r\n`）、`**` 剥离，以及一条直接钉住回归的断言
 "结束后返回第一行、且绝不返回尾行"。
+
+### 36. Paseo 自己的 MCP 工具也配中文名
+
+第 34 条给 DSH 原生工具补了名字/图标，但 MCP 那半边还是原始线名：一行读作
+`mcp__paseo__delete_heartbeat {"id":"…"}` —— 用户能看到的只有线名，而线名恰恰是它身上
+唯一没法用的信息。用户："这些能不能改成显示成中文的？"
+
+**Paseo 的 MCP 工具自带英文 `title`**，在它自己的注册表里（`server/agent/tools/paseo-tools.js`
+与 `server/browser-tools/tools.js`，共 **58 个**：40 个主工具 + 18 个 browser 工具），例如
+`registerTool("delete_heartbeat", { title: "Delete heartbeat", … })`。按这张表逐个译成中文，
+并配图标（heartbeat → `HeartPulse`，workspace → `FolderOpen`，schedule → `CalendarClock`，
+browser → `Globe`…）。
+
+**兜底**：认不出的名字仍然显示线名（`mcp__paseo__not_a_tool` 就还是它自己，别的 server 的
+`mcp__github__create_issue` 也一样）—— 上游新增工具时会以线名出现，而不是消失。
+
+**验证**：`harness/tool-call-check.cjs` 89/89，其中 MCP 部分断言了 `delete_heartbeat` →
+`删除心跳` + `HeartPulse`、browser 工具、以及两条兜底（未知 Paseo 工具、别的 server）。
 
 ---
 

@@ -346,9 +346,28 @@ console.log("DSH's own tools are not anonymous");
   equal("a session tool", toolLabel("session_search"), "搜索会话");
   equal("reading an image", toolLabel("read_image"), "读取图片");
 
-  // An MCP call is not a DSH tool: it keeps the raw name and the wrench.
-  equal("an MCP call is still its raw name", toolLabel("mcp__paseo__list_workspaces"), "mcp__paseo__list_workspaces");
-  equal("and the wrench", toolIcon("mcp__paseo__list_workspaces", { type: "unknown" }), "Wrench");
+  // Paseo's own MCP tools carry an English `title` in its registry; these are
+  // those titles in Chinese, so a row is not labelled with the wire name.
+  equal("a Paseo MCP tool gets a Chinese label", toolLabel("mcp__paseo__delete_heartbeat"), "删除心跳");
+  equal("and its own icon", toolIcon("mcp__paseo__delete_heartbeat", { type: "unknown" }), "HeartPulse");
+  equal("a browser tool too", toolLabel("mcp__paseo__browser_list_tabs"), "列出浏览器标签页");
+  equal("listing workspaces too", toolLabel("mcp__paseo__list_workspaces"), "列出工作区");
+  // Anything we do not know keeps its wire name rather than losing its identity.
+  equal(
+    "an unknown Paseo tool falls back to the wire name",
+    toolLabel("mcp__paseo__not_a_tool"),
+    "mcp__paseo__not_a_tool",
+  );
+  equal(
+    "another server's tool keeps its wire name",
+    toolLabel("mcp__github__create_issue"),
+    "mcp__github__create_issue",
+  );
+  equal(
+    "and the wrench",
+    toolIcon("mcp__github__create_issue", { type: "unknown" }),
+    "Wrench",
+  );
 
   // A typed detail still wins: the name map only fills the `unknown` gap.
   equal("a typed detail keeps its own icon", toolIcon("bash", { type: "shell" }), "SquareTerminal");

@@ -157,7 +157,7 @@ const TOOL_NAME_ICONS: Record<string, string> = {
 
 /** Human label for a tool call, falling back to its raw name. */
 export function toolLabel(name: string): string {
-  return TOOL_LABELS[name] ?? name;
+  return TOOL_LABELS[name] ?? paseoMcpLabel(name) ?? name;
 }
 
 /**
@@ -202,7 +202,7 @@ export function toolIcon(name: string, detail: ToolDetail | undefined): string {
   if (normalized === "task") return "Bot";
   // Only for `unknown` details: a typed detail (shell/read/edit/…) already
   // carries a better icon than the tool's name would suggest.
-  const named = TOOL_NAME_ICONS[normalized];
+  const named = TOOL_NAME_ICONS[normalized] ?? paseoMcpIcon(name);
   if (named !== undefined && (detail === undefined || detail.type === "unknown")) return named;
   if (detail !== undefined && typeof detail.type === "string") {
     return DETAIL_ICONS[detail.type] ?? "Wrench";
@@ -239,6 +239,162 @@ function stringifyValue(value: unknown, pretty = false): string {
   } catch {
     return "<unserializable>";
   }
+}
+
+
+/**
+ * Paseo's own MCP tools, keyed by the part after `mcp__paseo__`.
+ *
+ * Paseo ships 58 of them and each carries an English `title` in its own
+ * registry (`server/agent/tools/paseo-tools.js` and `browser-tools/tools.js`);
+ * these are those titles in Chinese. Without this a row reads
+ * `mcp__paseo__delete_heartbeat {"id":"…"}` — the wire name, which is the one
+ * thing about it a reader cannot use. A name we do not know still falls back to
+ * the wire name, so a tool added upstream shows up rather than disappearing.
+ */
+const PASEO_MCP_PREFIX = "mcp__paseo__";
+
+const PASEO_MCP_LABELS: Record<string, string> = {
+  speak: "朗读",
+  create_workspace: "创建工作区",
+  list_workspaces: "列出工作区",
+  archive_workspace: "归档工作区",
+  rename_workspace: "重命名工作区",
+  create_agent: "创建 agent",
+  send_agent_prompt: "给 agent 发任务",
+  get_agent_status: "查看 agent 状态",
+  list_agents: "列出 agent",
+  cancel_agent: "取消 agent 当前回合",
+  archive_agent: "归档 agent",
+  kill_agent: "终止 agent 会话",
+  update_agent: "更新 agent",
+  set_agent_mode: "切换 agent 模式",
+  get_agent_activity: "查看 agent 活动",
+  list_workspace_scripts: "列出工作区脚本",
+  start_workspace_script: "启动工作区脚本",
+  stop_workspace_script: "停止工作区脚本",
+  list_terminals: "列出终端",
+  create_terminal: "创建终端",
+  kill_terminal: "关闭终端",
+  capture_terminal: "读取终端输出",
+  send_terminal_keys: "向终端发送按键",
+  create_schedule: "创建定时任务",
+  create_heartbeat: "创建心跳",
+  delete_heartbeat: "删除心跳",
+  list_schedules: "列出定时任务",
+  inspect_schedule: "查看定时任务",
+  pause_schedule: "暂停定时任务",
+  resume_schedule: "恢复定时任务",
+  delete_schedule: "删除定时任务",
+  update_schedule: "更新定时任务",
+  schedule_logs: "定时任务日志",
+  run_schedule_once: "立即运行一次定时任务",
+  list_providers: "列出 provider",
+  list_models: "列出模型",
+  list_profiles: "列出 agent 配置档",
+  inspect_provider: "查看 provider",
+  list_pending_permissions: "列出待审批请求",
+  respond_to_permission: "响应审批请求",
+  browser_list_tabs: "列出浏览器标签页",
+  browser_new_tab: "新建浏览器标签页",
+  browser_close_tab: "关闭浏览器标签页",
+  browser_snapshot: "读取页面结构",
+  browser_screenshot: "页面截图",
+  browser_navigate: "打开网址",
+  browser_click: "点击页面元素",
+  browser_fill: "填写页面元素",
+  browser_type: "输入文本",
+  browser_keypress: "发送按键",
+  browser_select: "选择下拉项",
+  browser_drag: "拖拽页面元素",
+  browser_scroll: "滚动页面",
+  browser_resize: "调整视口大小",
+  browser_upload: "上传文件",
+  browser_wait: "等待页面条件",
+  browser_logs: "读取页面日志",
+  browser_evaluate: "执行页面脚本",
+};
+
+/** The same tools by icon. */
+const PASEO_MCP_ICONS: Record<string, string> = {
+  speak: "Volume2",
+  create_workspace: "FolderInput",
+  list_workspaces: "FolderOpen",
+  archive_workspace: "FolderOpen",
+  rename_workspace: "FolderOpen",
+  create_agent: "Bot",
+  send_agent_prompt: "Bot",
+  get_agent_status: "Bot",
+  list_agents: "Bot",
+  cancel_agent: "Bot",
+  archive_agent: "Bot",
+  kill_agent: "Bot",
+  update_agent: "Bot",
+  set_agent_mode: "Bot",
+  get_agent_activity: "Activity",
+  list_workspace_scripts: "ScrollText",
+  start_workspace_script: "Play",
+  stop_workspace_script: "Power",
+  list_terminals: "SquareTerminal",
+  create_terminal: "SquareTerminal",
+  kill_terminal: "SquareTerminal",
+  capture_terminal: "SquareTerminal",
+  send_terminal_keys: "SquareTerminal",
+  create_schedule: "CalendarClock",
+  create_heartbeat: "HeartPulse",
+  delete_heartbeat: "HeartPulse",
+  list_schedules: "CalendarClock",
+  inspect_schedule: "CalendarClock",
+  pause_schedule: "Pause",
+  resume_schedule: "RotateCw",
+  delete_schedule: "Trash2",
+  update_schedule: "CalendarClock",
+  schedule_logs: "ScrollText",
+  run_schedule_once: "Play",
+  list_providers: "Cpu",
+  list_models: "Cpu",
+  list_profiles: "UserCog",
+  inspect_provider: "Cpu",
+  list_pending_permissions: "ShieldCheck",
+  respond_to_permission: "ShieldCheck",
+  browser_list_tabs: "Globe",
+  browser_new_tab: "Globe",
+  browser_close_tab: "Globe",
+  browser_snapshot: "Globe",
+  browser_screenshot: "Globe",
+  browser_navigate: "Globe",
+  browser_click: "Globe",
+  browser_fill: "Globe",
+  browser_type: "Globe",
+  browser_keypress: "Globe",
+  browser_select: "Globe",
+  browser_drag: "Globe",
+  browser_scroll: "Globe",
+  browser_resize: "Globe",
+  browser_upload: "Globe",
+  browser_wait: "Globe",
+  browser_logs: "Globe",
+  browser_evaluate: "Globe",
+};
+
+/** The bare Paseo tool name behind an MCP wire name, or undefined. */
+function paseoMcpName(name: string): string | undefined {
+  const normalized = name.trim().toLowerCase();
+  return normalized.startsWith(PASEO_MCP_PREFIX)
+    ? normalized.slice(PASEO_MCP_PREFIX.length)
+    : undefined;
+}
+
+/** The Chinese label for a Paseo MCP tool, or undefined if we do not know it. */
+export function paseoMcpLabel(name: string): string | undefined {
+  const bare = paseoMcpName(name);
+  return bare === undefined ? undefined : PASEO_MCP_LABELS[bare];
+}
+
+/** The icon for a Paseo MCP tool, or undefined if we do not know it. */
+export function paseoMcpIcon(name: string): string | undefined {
+  const bare = paseoMcpName(name);
+  return bare === undefined ? undefined : PASEO_MCP_ICONS[bare];
 }
 
 /** Normalize one Paseo tool-call item into JSON-safe render data. */
