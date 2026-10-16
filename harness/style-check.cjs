@@ -146,7 +146,6 @@ const {
   searchLineTextStyle,
   searchSummaryTextStyle,
   separatorStyle,
-  summaryColor,
   summaryTextStyle,
   webCardBodyStyle,
   webFetchStyle,
@@ -161,6 +160,9 @@ const {
   webUrlTextStyle,
   withAlpha,
 } = require("./client/tokens.js");
+
+const { readFileSync } = require("node:fs");
+const { join } = require("node:path");
 
 let passed = 0;
 let failed = 0;
@@ -245,12 +247,23 @@ console.log("title and summary are split by a 2x2 square");
 
 console.log("the diff stat suffix");
 {
-  const stat = diffStatTextStyle(COLORS);
+  const added = diffStatTextStyle(COLORS, "added");
+  const removed = diffStatTextStyle(COLORS, "removed");
   equal("stat size (13 - 2)", DIFF_STAT_FONT_SIZE, 11);
   equal("stat left margin", DIFF_STAT_MARGIN_LEFT, 10);
-  equal("stat is monospace", stat.fontFamily, CODE_FONT_FAMILY);
-  equal("stat sits on the row line", stat.lineHeight, ROW_LINE_HEIGHT);
-  equal("and is grey until expanded colouring lands", stat.color, COLORS.foregroundMuted);
+  equal("the margin sits on the + run", added.marginLeft, DIFF_STAT_MARGIN_LEFT);
+  equal("and not on the - run, which carries the space itself", removed.marginLeft, 0);
+  equal("stat is monospace", added.fontFamily, CODE_FONT_FAMILY);
+  equal("stat sits on the row line", added.lineHeight, ROW_LINE_HEIGHT);
+  // Semantic colours, not the row's tone: the counts describe the diff.
+  equal("the added count is green", added.color, COLORS.statusSuccess);
+  equal("the removed count is red", removed.color, COLORS.statusDanger);
+  // One run cannot hold two colours, so the row has to draw two.
+  const row = readFileSync(join(__dirname, "..", "client", "tool-call.tsx"), "utf8");
+  check(
+    "the row draws the two counts as separate runs",
+    /styles\.statAdded/.test(row) && /styles\.statRemoved/.test(row),
+  );
 }
 
 console.log("the command banner and the output region are split");
@@ -622,18 +635,33 @@ console.log("the +A -R suffix is only shown when it is true");
 
 console.log("state colours");
 {
-  equal("a failure reddens the summary", summaryColor(COLORS, "failed"), COLORS.statusDanger);
-  equal("a completed row stays muted", summaryColor(COLORS, "completed"), COLORS.foregroundMuted);
-  equal("a running row stays muted", summaryColor(COLORS, "running"), COLORS.foregroundMuted);
-  equal(
-    "the summary style follows the state",
-    summaryTextStyle(COLORS, "failed").color,
-    COLORS.statusDanger,
+  // The leading icon is the row's only state signal: red when the call failed,
+  // green when an edit completed, muted otherwise. A deliberate deviation from
+  // DSH, which leaves the glyph muted and reddens the summary text instead, and
+  // has no success colour for an edit at all (see docs/RENDER-PLAN.md).
+  equal("a failure reddens the icon", rowIconColor(COLORS, "failed", false), COLORS.statusDanger);
+  equal("a failed edit is red, not green", rowIconColor(COLORS, "failed", true), COLORS.statusDanger);
+  equal("a completed edit turns the icon green", rowIconColor(COLORS, "completed", true), COLORS.statusSuccess);
+  equal("a completed read keeps a muted icon", rowIconColor(COLORS, "completed", false), COLORS.foregroundMuted);
+  equal("a running edit is not green yet", rowIconColor(COLORS, "running", true), COLORS.foregroundMuted);
+  equal("a canceled edit keeps a muted icon", rowIconColor(COLORS, "canceled", true), COLORS.foregroundMuted);
+
+  // The label and the summary never take a state colour — the icon says it.
+  equal("the label stays muted", rowLabelTextStyle(COLORS).color, COLORS.foregroundMuted);
+  equal("the summary stays muted", summaryTextStyle(COLORS).color, COLORS.foregroundMuted);
+
+  // The bug this replaced was a wiring one — the state colour reached a different
+  // run than intended — and asserting the helpers alone cannot catch that, so the
+  // row's own wiring is read.
+  const row = readFileSync(join(__dirname, "..", "client", "tool-call.tsx"), "utf8");
+  check(
+    "the row colours the icon from status and edit-ness",
+    /rowIconColor\(colors, data\.status, data\.diff\)/.test(row),
   );
-  equal(
-    "the icon never changes colour (DSH's behaviour)",
-    rowIconColor(COLORS),
-    COLORS.foregroundMuted,
+  check("and hands that colour to the icon", /color=\{iconColor\}/.test(row));
+  check(
+    "while the label and the summary take the plain colours",
+    /rowLabelTextStyle\(colors\)/.test(row) && /summaryTextStyle\(colors\)/.test(row),
   );
 }
 

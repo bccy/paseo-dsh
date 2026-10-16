@@ -84,9 +84,9 @@ import {
   readLineStyle,
   readLineTextStyle,
   rowHeadStyle,
-  rowIconColor,
   rowLabelTextStyle,
   rowRootStyle,
+  rowIconColor,
   searchEmptyTextStyle,
   searchExpandTextStyle,
   searchFileCountTextStyle,
@@ -673,7 +673,7 @@ function WebBlockView({ data, styles }: { data: WebBlockData; styles: BlockStyle
 /* Styles                                                                     */
 /* -------------------------------------------------------------------------- */
 
-function buildStyles(colors: TokenColors, hairline: number, status: string) {
+function buildStyles(colors: TokenColors, hairline: number) {
   // The wash is 8% on a light card and 12% on a dark one; the card's own
   // surface is what the diff lines are painted on.
   const light = isLightSurface(colors.surface1);
@@ -685,8 +685,9 @@ function buildStyles(colors: TokenColors, hairline: number, status: string) {
     text: { flexDirection: "row" as const, alignItems: "center" as const, flex: 1, minWidth: 0 },
     label: rowLabelTextStyle(colors),
     sep: separatorStyle(colors),
-    summary: summaryTextStyle(colors, status),
-    stat: diffStatTextStyle(colors),
+    summary: summaryTextStyle(colors),
+    statAdded: diffStatTextStyle(colors, "added"),
+    statRemoved: diffStatTextStyle(colors, "removed"),
     body: { marginLeft: BODY_INDENT },
     // RN has no hairline in a plain object; `StyleSheet.hairlineWidth` is the
     // device's own (0.5 at 1x/2x), which is what DSH's `.5px` means here.
@@ -808,11 +809,12 @@ export function InlineToolCall({
   // and no code flag and an "output" caption) only worked by accident.
   const terminal = data.kind === "terminal";
   const colors = theme.colors;
+  // The leading icon is the row's only state signal: red when the call failed,
+  // green when an edit completed, muted otherwise. The label and the summary stay
+  // muted on every state (`client/tokens.ts`).
+  const iconColor = rowIconColor(colors, data.status, data.diff);
 
-  const styles = useMemo(
-    () => buildStyles(colors, StyleSheet.hairlineWidth, data.status),
-    [colors, data.status],
-  );
+  const styles = useMemo(() => buildStyles(colors, StyleSheet.hairlineWidth), [colors]);
 
   return (
     <Pressable
@@ -824,9 +826,10 @@ export function InlineToolCall({
       style={styles.root}
     >
       <View style={styles.head}>
-        {/* DSH never recolours the icon: a failure shows up in the summary
-            text, not in the glyph beside it. */}
-        <Icon name={data.icon} size={iconSize} color={rowIconColor(colors)} />
+        {/* The glyph carries the state: red for a failure, green for a completed
+            edit. DSH leaves it muted and reddens the summary instead; see
+            `docs/RENDER-PLAN.md` for why this row inverts that. */}
+        <Icon name={data.icon} size={iconSize} color={iconColor} />
         <TextShimmer
           active={running}
           contentStyle={styles.text}
@@ -857,9 +860,19 @@ export function InlineToolCall({
                 </>
               ) : null}
               {stat !== null ? (
-                <Text style={[styles.stat, color === null ? null : { color }]}>
-                  {`+${stat.added} -${stat.removed}`}
-                </Text>
+                <>
+                  {/* Semantic colours rather than the row's tone: the counts
+                      describe the diff, so `+` is green and `-` is red whatever
+                      the row itself is doing. The separating space lives inside
+                      the `-` run, so the pair stays exactly as far apart as the
+                      single grey run it replaced. */}
+                  <Text style={[styles.statAdded, color === null ? null : { color }]}>
+                    {`+${stat.added}`}
+                  </Text>
+                  <Text style={[styles.statRemoved, color === null ? null : { color }]}>
+                    {` -${stat.removed}`}
+                  </Text>
+                </>
               ) : null}
             </>
           )}

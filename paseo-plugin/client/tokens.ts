@@ -104,7 +104,7 @@ export function rowHeadStyle(): {
   };
 }
 
-/** The row's title ("运行命令", "编辑"). */
+/** The row's label ("运行命令", "编辑"): always muted, never a state signal. */
 export function rowLabelTextStyle(colors: TokenColors): {
   color: string;
   fontSize: number;
@@ -114,16 +114,16 @@ export function rowLabelTextStyle(colors: TokenColors): {
 }
 
 /**
- * The row's summary: the UI font at 13/24, **not** monospace.
+ * The row's summary: the UI font at 13/24, **not** monospace, always muted.
  *
  * DSH's summary inherits the UI font; Paseo's stock row sets `monospace`, which
  * is the most visible remaining difference between the two. The absence of a
  * `fontFamily` here is the decision, so it is asserted offline.
+ *
+ * It carries no state colour of its own either — the leading icon is the row's
+ * only state signal (see `rowIconColor`).
  */
-export function summaryTextStyle(
-  colors: TokenColors,
-  status: string,
-): {
+export function summaryTextStyle(colors: TokenColors): {
   color: string;
   fontSize: number;
   lineHeight: number;
@@ -131,7 +131,7 @@ export function summaryTextStyle(
   minWidth: number;
 } {
   return {
-    color: summaryColor(colors, status),
+    color: colors.foregroundMuted,
     fontSize: ROW_FONT_SIZE,
     lineHeight: ROW_LINE_HEIGHT,
     flex: 1,
@@ -156,8 +156,14 @@ export function separatorStyle(colors: TokenColors): {
   };
 }
 
-/** The `+A -R` suffix: 11px monospace, grey until a later phase colours it. */
-export function diffStatTextStyle(colors: TokenColors): {
+/**
+ * The `+A -R` suffix: 11px monospace, each half in its own semantic colour.
+ *
+ * The margin sits on the `+` run only; the `-` run carries the separating space
+ * inside its own string so the two halves stay exactly as far apart as the single
+ * grey run they replaced.
+ */
+export function diffStatTextStyle(colors: TokenColors, kind: "added" | "removed"): {
   flexShrink: number;
   marginLeft: number;
   fontFamily: string;
@@ -167,11 +173,11 @@ export function diffStatTextStyle(colors: TokenColors): {
 } {
   return {
     flexShrink: 0,
-    marginLeft: DIFF_STAT_MARGIN_LEFT,
+    marginLeft: kind === "added" ? DIFF_STAT_MARGIN_LEFT : 0,
     fontFamily: CODE_FONT_FAMILY,
     fontSize: DIFF_STAT_FONT_SIZE,
     lineHeight: ROW_LINE_HEIGHT,
-    color: diffStatColor(colors),
+    color: diffStatColor(colors, kind),
   };
 }
 
@@ -468,26 +474,27 @@ export function diffBodyTextStyle(colors: TokenColors, kind: DiffKind): {
 /* -------------------------------------------------------------------------- */
 
 /**
- * The row's leading icon is never recoloured — DSH signals a failure with the
- * summary text only, and the icon keeps its muted colour on every state.
- */
-export function rowIconColor(colors: TokenColors): string {
-  return colors.foregroundMuted;
-}
-
-/**
- * A failed row's summary turns red (DSH: `--dsw-alias-state-error-primary`).
+ * The row's leading icon: red when the call failed, green when an edit completed,
+ * muted on every other state.
  *
- * DSH also has a stopped state that paints the summary in the warning colour;
- * Paseo's tool status carries no such state yet, so only failure maps here.
+ * **Deliberate deviation from DSH**, recorded in `docs/RENDER-PLAN.md`. DSH keeps
+ * the glyph muted and reddens the *summary text* instead, and it has no success
+ * colour for an edit at all; here the glyph is the row's state signal and the
+ * label and summary stay muted, so a failure and a finished edit read while
+ * *scanning* the timeline rather than by stopping to read the summary line.
+ *
+ * A running edit stays muted — it has not succeeded yet — and a canceled row is
+ * neither success nor failure, so it stays muted too.
  */
-export function summaryColor(colors: TokenColors, status: string): string {
-  return status === "failed" ? colors.statusDanger : colors.foregroundMuted;
+export function rowIconColor(colors: TokenColors, status: string, edit: boolean): string {
+  if (status === "failed") return colors.statusDanger;
+  if (edit && status === "completed") return colors.statusSuccess;
+  return colors.foregroundMuted;
 }
 
-/** The `+A -R` suffix stays grey until a later phase colours it on expand. */
-export function diffStatColor(colors: TokenColors): string {
-  return colors.foregroundMuted;
+/** The `+A -R` suffix: the added count green, the removed count red. */
+export function diffStatColor(colors: TokenColors, kind: "added" | "removed"): string {
+  return kind === "added" ? colors.statusSuccess : colors.statusDanger;
 }
 
 /** `alpha` of `color`, as `rgba(...)`. */
