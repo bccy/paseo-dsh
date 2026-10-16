@@ -34,7 +34,7 @@ import {
   type DshUsage,
 } from "./dsh-process";
 import { TimelineBuilder } from "./timeline";
-import { UI, commandCopy } from "./locale";
+import { UI, commandCopy, skillDescription } from "./locale";
 
 /**
  * Modes Paseo offers in the composer. `plan` drives DSH's plan-mode service.
@@ -300,13 +300,12 @@ export class DshSession {
     this.#commandKinds.clear();
     const advertised = commands.map((command) => {
       this.#commandKinds.set(command.name, command.kind);
-      // A skill's name is the token DSH injects from a `/name` line and its
-      // description belongs to the skill's author, so neither is localized. Only
-      // a registered command has copy of ours to show.
+      // A skill keeps its name — that token is what DSH injects from a `/name`
+      // line — and only its menu description is localized.
       if (command.kind !== "command") {
         return {
           name: command.name,
-          description: command.description,
+          description: skillDescription(command.name, command.description),
           ...(command.argumentHint === undefined ? {} : { argumentHint: command.argumentHint }),
         };
       }

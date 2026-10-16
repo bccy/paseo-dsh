@@ -198,6 +198,36 @@ export function commandCopy(
 }
 
 /**
+ * Menu descriptions for the skills Paseo ships into `~/.agents/skills`.
+ *
+ * Display-only, and the only place a skill is ever localized: the name is the
+ * token DSH injects from a `/name` line, and the description the model reads
+ * when it picks a skill must stay the author's. That is also why the files
+ * themselves are not the place to do this — Paseo manages them (each skill
+ * directory carries a `.paseo-managed-files.json` with the file's hash, and its
+ * sync rewrites a file whose content differs), so an edit there is reverted.
+ *
+ * A skill with no entry keeps its own description, so a user-installed skill
+ * shows unchanged.
+ */
+const SKILL_COPY: Record<Locale, Readonly<Record<string, string>>> = {
+  en: {},
+  "zh-CN": {
+    paseo: "用 MCP 或 CLI 管理 Paseo：项目、工作区、agent、定时任务、心跳",
+    "paseo-advisor": "找个 agent 当顾问，对当前任务给第二意见",
+    "paseo-committee": "组两人委员会，退一步做根因分析并给出方案",
+    "paseo-handoff": "把当前任务连上下文交接给另一个 agent",
+    "paseo-help": "回答 Paseo 产品与 App 的问题：配置、连接、provider、日志、排障",
+    "paseo-plugin": "开发和管理本地 Paseo 插件：贡献点、生命周期钩子、RPC、发布",
+  },
+};
+
+/** The menu description for one skill: localized when known, the author's otherwise. */
+export function skillDescription(name: string, fallback: string): string {
+  return SKILL_COPY[LOCALE][name] ?? fallback;
+}
+
+/**
  * Thinking-effort labels, keyed by the effort id the provider declares.
  *
  * DSH derives its English label by capitalizing the level, so there is nothing
