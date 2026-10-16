@@ -216,7 +216,11 @@ console.log("provider-native tools (every MCP call)");
   );
   equal("the arguments are the row's title, on one line", mcp.summary, '{"cron":"* * * *","maxRuns":2}');
   check("the result is the body", mcp.body.includes('"status": "active"'), mcp.body);
-  check("structured results are pretty-printed", mcp.body.includes("\n"), JSON.stringify(mcp.body));
+  equal(
+    "structured results are pretty-printed",
+    mcp.body,
+    '{\n  "id": "abc",\n  "status": "active"\n}',
+  );
   check("and so are the arguments in the block", mcp.headline.includes("\n"), JSON.stringify(mcp.headline));
   equal("and rendered as code", mcp.code, true);
 
@@ -236,8 +240,86 @@ console.log("provider-native tools (every MCP call)");
     "streaming",
   );
   equal("a running call has no body yet", silent.body, "");
-  equal("but is still expandable by its title", silent.summary, '{"a":1}');
-  check("and its block already has the arguments", silent.headline.includes("\n"), JSON.stringify(silent.headline));
+  equal("its title is still the arguments", silent.summary, '{"a":1}');
+  check("and its block already has them", silent.headline.includes("\n"), JSON.stringify(silent.headline));
+  equal("so it has something to reveal", silent.hasDetail, true);
+
+  // A description on an MCP call must not push the block back to the compact
+  // one-line JSON: the pretty form is the whole point of the block.
+  const described = toolCallData(
+    {
+      name: "mcp__x__y",
+      status: "completed",
+      detail: { type: "unknown", input: { description: "Do the thing", a: 1 }, output: "ok" },
+      metadata: { description: "Do the thing" },
+    },
+    "complete",
+  );
+  equal("the title is the description", described.summary, "Do the thing");
+  check(
+    "the block still leads with pretty arguments",
+    described.headline.includes("\n"),
+    JSON.stringify(described.headline),
+  );
+
+  const arrayInput = toolCallData(
+    { name: "mcp__x__z", status: "completed", detail: { type: "unknown", input: [1, 2], output: "" } },
+    "complete",
+  );
+  equal("an array argument is kept", arrayInput.summary, "[1,2]");
+
+  const cyclic = {};
+  cyclic.self = cyclic;
+  const broken = toolCallData(
+    { name: "mcp__x__w", status: "completed", detail: { type: "unknown", input: cyclic } },
+    "complete",
+  );
+  equal("an unserializable payload is reported, not swallowed", broken.summary, "<unserializable>");
+}
+
+console.log("a row only expands onto something");
+{
+  // Regression: every expansion went into a code surface, so a row whose only
+  // content is its title drew an empty grey bar. `hasDetail` is the data-layer
+  // answer to "is there anything to reveal", which is why it lives here.
+  const titleOnly = toolCallData(
+    { name: "todo_write", status: "completed", detail: { type: "plain_text", label: "更新任务", text: "" } },
+    "complete",
+  );
+  equal("a title-only row reveals nothing", titleOnly.hasDetail, false);
+  equal("and is still labelled", titleOnly.summary, "更新任务");
+
+  const command = toolCallData(
+    {
+      name: "goal",
+      status: "completed",
+      detail: { type: "plain_text", label: "/goal", text: "No goal is currently set." },
+    },
+    "complete",
+  );
+  equal("a slash command is labelled by the line that ran", command.summary, "/goal");
+  equal("and its output is the body, not dropped", command.body, "No goal is currently set.");
+  equal("so it has something to reveal", command.hasDetail, true);
+
+  const withDetail = toolCallData(
+    {
+      name: "mcp__paseo__list_workspaces",
+      status: "completed",
+      detail: { type: "unknown", input: {}, output: { workspaces: [] } },
+    },
+    "complete",
+  );
+  for (const [label, data] of [
+    ["result row", withDetail],
+    ["title-only row", titleOnly],
+    ["slash command", command],
+  ]) {
+    equal(
+      `${label}: hasDetail agrees with the block's content`,
+      data.hasDetail,
+      data.headline !== "" || data.body !== "",
+    );
+  }
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

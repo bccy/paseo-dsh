@@ -23,9 +23,21 @@ export interface ToolCallData {
   body: string;
   bodyLabel: string;
   diff: boolean;
-  /** Body is source code (read/write/edit/search), so render it as code. */
+  /**
+   * The body is source code. Every expansion renders in the same code surface
+   * now, so nothing branches on this any more; it stays part of the contract as
+   * a hint about the payload's nature.
+   */
   code: boolean;
   failed: boolean;
+  /**
+   * Whether expanding reveals anything beyond the title.
+   *
+   * A row whose only content is its title is still expandable — the title then
+   * wraps to its full width — but must not draw an empty code surface. Computed
+   * here rather than in the renderer so it can be asserted offline.
+   */
+  hasDetail: boolean;
 }
 
 type ToolDetail = Record<string, unknown>;
@@ -120,9 +132,13 @@ function stringifyValue(value: unknown, pretty = false): string {
   if (typeof value === "string") return value;
   if (value === null || value === undefined) return "";
   try {
-    return pretty ? JSON.stringify(value, null, 2) : JSON.stringify(value);
+    // `JSON.stringify` returns `undefined` (not a string) for a function or a
+    // symbol, and throws on a cycle or a BigInt. Returning "" for either made
+    // the whole payload vanish silently, so say so instead.
+    const text = pretty ? JSON.stringify(value, null, 2) : JSON.stringify(value);
+    return typeof text === "string" ? text : "<unserializable>";
   } catch {
-    return "";
+    return "<unserializable>";
   }
 }
 
@@ -213,7 +229,12 @@ export function toolCallData(
       bodyLabel = "计划";
       break;
     case "plain_text":
+      // A `/command` row: `label` is the line that ran, `text` is what it
+      // printed. Taking only the label threw the output away, so a slash
+      // command looked like it did nothing.
       primary = str(detail, "label") || str(detail, "text");
+      body = primary === str(detail, "text") ? "" : str(detail, "text");
+      bodyLabel = "输出";
       break;
     default:
       primary = "";
@@ -252,11 +273,19 @@ export function toolCallData(
       : "completed",
     phase,
     summary: truncate(description === "" ? primary : description),
-    headline: truncate(description === "" ? detailHeadline : primary),
+    // `unknown` always leads with its pretty arguments: a description on an MCP
+    // call must not push the block back to the compact one-line JSON.
+    headline: truncate(
+      type === "unknown" ? detailHeadline : description === "" ? "" : primary,
+    ),
     body: truncate(body),
     bodyLabel,
     diff,
     code,
     failed,
+    // Whether the expanded block has anything to show. A row whose only content
+    // is its title still expands — the title wraps to its full width — but must
+    // not draw an empty code surface.
+    hasDetail: truncate(description === "" ? detailHeadline : primary) !== "" || body !== "",
   };
 }

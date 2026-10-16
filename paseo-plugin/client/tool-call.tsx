@@ -79,12 +79,6 @@ export function InlineToolCall({
         lineHeight: compact ? 17 : 19,
         width: 12,
       },
-      bodyText: {
-        color: theme.colors.foregroundMuted,
-        fontFamily: "monospace" as const,
-        fontSize: compact ? 12 : 13,
-        lineHeight: compact ? 17 : 19,
-      },
       codeBlock: {
         backgroundColor: "rgba(127, 127, 127, 0.10)",
         borderRadius: 6,
@@ -141,7 +135,7 @@ export function InlineToolCall({
               {data.summary !== "" ? (
                 <Text
                   style={[styles.summary, color === null ? null : { color }]}
-                  numberOfLines={expanded ? 4 : 1}
+                  numberOfLines={expanded ? undefined : 1}
                 >
                   {data.summary}
                 </Text>
@@ -150,13 +144,17 @@ export function InlineToolCall({
           )}
         </TextShimmer>
       </View>
-      {expanded && canExpand ? (
+      {expanded && canExpand && data.hasDetail ? (
         <View style={styles.body}>
           {/* Everything a row reveals goes in one code surface, the way the edit
               rows already did: the subject the title describes (the command),
               then the payload (the output, the file, the diff). */}
           <View style={styles.codeBlock}>
-          {data.headline !== "" ? <Text style={styles.summaryFull}>{data.headline}</Text> : null}
+          {data.headline !== "" ? (
+            <Text style={styles.summaryFull} selectable>
+              {data.headline}
+            </Text>
+          ) : null}
           {hasBody ? (
             data.diff ? (
               data.body.split("\n").map((line, index) => {

@@ -873,8 +873,23 @@ MCP 调用的详情是 `{type:"unknown", input, output}`（`toolDetail` 的 defa
 `workspaces` 数组；命令行展开后文本是 `命令|展开 MCP 行并前后对比|cd /tmp && cat > ...`
 （**中文描述还在**，后接命令与输出），且行内命中一个背景为 `rgba(127, 127, 127, 0.1)` 的代码表面。
 
-**验证**：`harness/tool-call-check.cjs` 53/53（新增 unknown 分支 8 条：紧凑标题 / 美化 body /
-美化 headline / `code` / 字符串结果原样 / 空入参不出现在标题 / running 时无 body）。
+**验证**：`harness/tool-call-check.cjs` 66/66。除了 unknown 分支（紧凑标题 / 精确的美化 body /
+美化 headline / 字符串结果原样 / 空入参不出现在标题 / running 时无 body），还补了三条本轮
+审核揪出来的用例：**带 description 的 MCP 调用 headline 仍必须美化**（否则退回几千字符的一行）、
+**`/命令` 的 `text` 必须进 body**（否则输出永远不显示）、**不可序列化入参报占位串而不是静默消失**。
+
+**审核后的补充修正**（同一轮内）：
+
+- `hasDetail` 上提到 `ToolCallData`：展开块只在**真有内容**时画代码表面。之前 `canExpand` 只看
+  summary，于是 `todo_write`/`ask_user_question`/`/命令` 这类"只有标题"的行点开会得到一条
+  约 10px 高的空灰条——这是本轮直接引入的回归。同时它成了可离线断言的数据层不变量。
+- 展开态**去掉 4 行上限**（改回不限行）：没有 description 的长命令只存在于 `summary`，
+  4 行上限会让它永远读不全，和本节上面那句承诺不符。
+- `stringifyValue` 对 `JSON.stringify` 返回 `undefined`（函数/Symbol）与抛错（BigInt/循环引用）
+  都返回 `<unserializable>`，不再返回 `""` 让 payload 静默消失，也不再让 `truncate(undefined)` 抛错。
+- `emptyInput` 收窄为"非数组的空对象"。
+- 块内 headline 加 `selectable`（那是最值得复制的一行）；删掉已成死代码的 `styles.bodyText`；
+  修正 `code` 字段的注释（现在所有展开都走代码表面，渲染层不再读它）。
 
 ---
 
