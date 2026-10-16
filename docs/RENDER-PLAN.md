@@ -45,7 +45,7 @@
 
 ## 2. 阶段划分（每阶段独立可验收）
 
-### Phase 0 · 基础（其他阶段都依赖）
+### Phase 0 · 基础（其他阶段都依赖）—— 已完成（`d804dd1`）
 - **服务端**：`#toolResult()` 读 `data.meta`（DSH 的 `presentationMeta`）并透传（typed 分支 +
   `unknown` 都带上）；落到 **item 级 `metadata.presentationMeta`**（与既有的
   `metadata.description`、`metadata.locale` 合并）。
@@ -71,7 +71,7 @@
   meta 透传断言（构造带 meta 的 `tool/result`，断言 **item 的 `metadata.presentationMeta`**
   里能读到，并用 `ProviderEventSchema.parse` 真跑一遍确认过边界仍在）。
 
-### Phase 1 · 行头与命令、diff（纯样式，风险最低）
+### Phase 1 · 行头与命令、diff（纯样式，风险最低）—— 已完成（`3ca141b`；`5247ef9` 收口数值偏差）
 - 行头：固定 24px 单行、无 paddingVertical；摘要**去掉等宽**、13px/24；
   标题与摘要间的 **2×2 圆角方块**；diff 行的 `+A -R` 后缀（11px 等宽）。
 - 命令：命令/输出拆成 **banner（cwd 灰 + 命令高对比 + 复制）+ 0.5px 分隔线 + 输出区**；
@@ -80,7 +80,7 @@
 - 卡片：`radius 16` + `StyleSheet.hairlineWidth` 描边 + 卡片底色；展开体左缩进 12 → **4**。
 - 断言：样式常量快照（防止再漂移）。
 
-### Phase 2 · meta 驱动的块
+### Phase 2 · meta 驱动的块 —— 已完成（`bdcc5d1`；`5247ef9` 收口空态文案与数值）
 - **数据来源**：一律读 **item 的 `metadata.presentationMeta`**（Phase 0 的 strip 说明；客户端在
   `client/tool-call-data.ts` 里读，服务端在 `server/timeline.ts` 里写）。
 - **搜索（grep/glob）**：卡头统计「N 处匹配 · M 个文件」+ 复制；按文件分组的粗体路径 + 计数；
@@ -91,7 +91,7 @@
 - **网页搜索**：有序引用列表（14px 链接 + 13px 摘要 + 日期，320px 就地滚动）。
 - **网页抓取**：URL + `HTTP 200` + 截断提示。
 
-### Phase 3 · unknown 分支扩展
+### Phase 3 · unknown 分支扩展 —— 已完成（`3ca141b`；`5247ef9` 补 `run_code` 标签与图标）
 - `job_*`、`terminal_*`、`session_*`、`goal_*`、`workflow`、`skill`、`read_image`、
   MCP resources、`str_replace_editor` 等给出 typed detail（结构化展示，而非原始 JSON）。
 - 补齐标签/图标表：`skill`、`list_mcp_resources`、`read_mcp_resource`、
@@ -99,11 +99,17 @@
   （`lsp`、`spawn_teammate`、`team_task_*`、`wait_agent`）。
 
 ### Phase 4 · 图片、locale、两个漏行
-- **图片**：`read_image` / 浏览器截图不再被 `textOf()` 丢掉；先搞清 Paseo 附件通道能否喂图，
-  不行就降级为"路径 + 尺寸/字节"的信息行（**失败要响亮**，不静默丢）。
-- **locale**：客户端接上 `DSH_PASEO_LANG`（「思考」「计划」「展开/收起」「折叠/收起」等）。
-- **compaction**：`consume()` 增加分支，压缩过程可见。
-- **worktree_setup**：给 typed detail 或并入 `unknown`，不再出现空行。
+- **Phase 4a · locale / compaction / worktree_setup —— 已完成（`bdcc5d1`）**：
+  - **locale**：客户端接上 `DSH_PASEO_LANG`（「思考」「计划」「展开/收起」「折叠/收起」等）。
+  - **compaction**：`consume()` 增加分支，压缩过程可见。
+  - **worktree_setup**：给 typed detail 或并入 `unknown`，不再出现空行。
+- **Phase 4b · 图片 —— 调研结论已出，尚未实现**：`read_image` / 浏览器截图不再被
+  `textOf()` 丢掉。走 **Paseo 既有的形状**，不自造：图片做成一条**独立的
+  `assistant_message`**，正文是 markdown 图片 `![alt](<绝对路径>)`，宿主会经
+  **file-RPC** 取字节并渲染。桥这一侧要用 DSH 的 **`imageHostPath(ref)`**
+  （`@deepseek-ai/dsh-attachment-local` 的 `ImageAttachmentRef` → 宿主绝对路径；
+  `dsh-llm` 自己就是这么把图片交给宿主的）把路径透出来。**改了桥就要按硬性约束重生成
+  内嵌桥**（`node paseo-plugin/scripts/generate-bridge-assets.mjs`）。
 
 ### Phase 5 · 验收
 - 全部 harness（含新增断言）+ `tsc --noEmit` + 宿主编译器产包 + 真机 `archive-registry-check`。
@@ -119,3 +125,51 @@
   `box-shadow: inset` → `borderLeftWidth`；`::before` 前缀 → 独立 Text 列；
   `grid`/`sticky`/`color-mix`/`mask`/`:hover` 无解或已有替代。
 - 每个阶段结束跑对应 harness；动了服务端必跑 `plugin-check.cjs` 与 `subagent-check.cjs`。
+
+---
+
+## 4. 仍未做 / 已知偏差
+
+这一节是"**别让预览图承诺它交付不了的东西**"的清单。已提交的进度：
+`d804dd1`（Phase 0）→ `3ca141b`（Phase 1 + 3）→ `bdcc5d1`（Phase 2 + 4a）→ `5247ef9`
+（四处数值偏差 + `run_code` 标签/图标 + 空态文案拆分 + `web_fetch` 图标）。
+
+### 仍未做
+
+- **`run_code` 的 CodeBlock**：标签与图标已在 `5247ef9` 补上（「代码」/`Code`；此前标题
+  回落成线名、图标回落成扳手，同属静默降级），但**展开体仍是 `unknown` 的兜底代码面** ——
+  没有语言标签、没有复制、没有 `bodyScroll` 限高。决定不学的两条：banner 的
+  `position: sticky`（RN 无解）与 `lang` 硬编码 `typescript`（DSH 自己的瑕疵）。
+- **MCP / 未知的 ioCard 输入 / 输出两段**：现在是输入（美化 JSON）与输出挤在同一个代码面里；
+  DSH 是 `grid-template-columns: max-content 1fr` + 两段各自 `max-height: 150px`。
+  Phase 3 只写了"结构化展示，而非原始 JSON"，没点名这个形状 —— 严格说它**计划外**。
+- **图片（Phase 4b）**：调研结论已出（见 Phase 4），尚未实现。
+- **终端输出**：仍是会折行的 `Text`，不是 `white-space: pre` 的等价物（需要横向
+  `ScrollView`）；状态点 / 退出码 pill / 复制键也都还没做。
+- **思考行展开体的几何**：缩进 `4px` vs DSH `22px`、字号行高 `14/21` vs `13/24`、正文是纯
+  文本而非 Markdown；无预览时 DSH 把 2×2 方块与预览整段 `display: none`，我们仍渲染空预览。
+  DSH 展开时行头 **sticky 在 RN 无解**，放弃。
+- **`compaction/summary` 的摘要正文没有承载处**：Paseo 的 `compaction` marker 只承载
+  `status` / `trigger`（`preTokens` 也刻意不设 —— DSH 的 `shadowedTokenCount` 是另一个量，
+  标成"~Nk tokens"就是安静的谎），摘要文本到不了界面。
+- **`compaction/prune` 刻意不映射**：它是无模型工具结果剪枝的影子价格、不带
+  `compactionId`，它前面的事件是 `tool/result` 替换而不是压缩检查点，DSH 自己的 UI 也不为
+  它画标记。
+- **read / 代码卡的动作区**：是文字「复制」而非 24×24 图标，且没有换行开关。
+
+### 实现已落地、但断言待补
+
+- **`web_search` 行头图标 = Globe**：`5247ef9` 已经落地 —— `client/tool-call-data.ts` 的
+  `WEB_ROW_ICONS`（`web_search: "Globe"` / `web_fetch: "Eye"`）在 detail 分支**之前**判定，
+  绕过了"名字级图标只在 detail 缺失或为 `unknown` 时生效"这条规则（`web_search` 的 detail
+  是 `search`，grep/glob 继续用放大镜）。**但 `harness/tool-call-check.cjs` 只断言了
+  `web_fetch -> Eye`，没有 `web_search -> Globe` 的断言** —— 补一条，否则它会悄悄漂回去。
+
+### 刻意的偏离（DSH 本身没有，不是画错）
+
+- diff 卡的 `@@ -a,b +c,d @@` hunk 头（DSH 只有 `⋯` 分隔）、卡头里的路径与「新建 / 更新」
+  标记（DSH 的 CodeToolbar 有 `status` 槽，但 DiffBlock 从不传值）；diff 卡头的语言标签写死成
+  `diff`（DSH 用 `languageForPath` 推出 `tsx`），读取卡才用 meta 里的 `lang`。
+- MCP 行保留 Paseo 自己的中文名（DSH 是「工具调用 · 工具名」）。
+- diff 用 Paseo 语义色（低饱和），不是 DSH 的高饱和 `#22c55e` / `#f25a5a`。
+- `compaction` 不照抄 DSH 的可展开行形状，跟 Paseo 自己的 marker。

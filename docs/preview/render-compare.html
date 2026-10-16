@@ -336,14 +336,22 @@
 <h1>工具行渲染 · 三栏对比（DSH 原样 / 改造前 / 改造后）</h1>
 <p class="lede">
   每一类块占一行，左＝<b>DSH 原样</b>（数值逐字来自它自己的 CSS），中＝<b>改造前</b>（<code>git show 3ca141b^:paseo-plugin/client/tool-call.tsx</code> 与 <code>d804dd1^</code> 的真实实现，两者同源），右＝<b>改造后</b>（目标形态；<span class="badge done">已实现</span> 表示已提交，<span class="badge plan">计划</span> 表示尚未写）。
+  <b>读图前先看 §⑪「仍未实现 / 已知偏差」</b>——它列出这张图里<b>画了但还没交付</b>的形状，以及 DSH 本身没有、我们刻意保留的偏离，免得预览承诺交付不了的东西。
 </p>
 
 <div class="legend">
   <div><b>颜色＝栏位</b>：<span class="sw" style="background:#6b7075"></span><span class="c-dsh">DSH 灰</span>　
     <span class="sw" style="background:#8c4a44"></span><span class="c-before">改造前 红/暗</span>　
     <span class="sw" style="background:#3f7a55"></span><span class="c-after">改造后 绿</span></div>
-  <div><b>徽章＝进度</b>：<span class="badge done">已实现</span> 已提交（<code>d804dd1</code> Phase 0 · <code>3ca141b</code> Phase 1+3 · <code>bdcc5d1</code> Phase 2 + Phase 4a）·
-    <span class="badge plan">计划</span> 尚未写（Phase 4b 剩余：图片块 / ioCard 两段；或计划外）。快照 2026-10-16 21:35 CST，HEAD <code>bdcc5d1</code></div>
+  <div><b>徽章＝进度</b>：<span class="badge done">已实现</span> 已提交 —— <code>d804dd1</code> Phase 0 ·
+    <code>3ca141b</code> Phase 1+3 · <code>bdcc5d1</code> Phase 2 + Phase 4a · <code>5247ef9</code>
+    四处数值偏差（<code>ROW_GAP</code> 3→4、<code>COMMAND_LINE_HEIGHT</code> 16→18、<code>run_code</code>
+    标签 + 图标、空态文案拆分）+ <code>web_fetch</code> / <code>web_search</code> 图标。
+    <span class="badge plan">计划</span> 尚未写：图片块（Phase 4b）· ioCard 两段 · <code>run_code</code>
+    的 CodeBlock · 终端状态点 / pill / 复制 · 思考行几何。快照 2026-10-16 22:45 CST，HEAD <code>5247ef9</code></div>
+  <div><b>刻意偏离 DSH</b>（DSH 本身没有，不是画错）：diff 的 <code>@@</code> hunk 头、卡头路径与
+    「新建 / 更新」标注、MCP 行用 Paseo 中文名、diff 用 Paseo 语义色、<code>compaction</code> 跟 Paseo
+    自己的 marker 而不照抄 DSH 的可展开行。逐条见 §⑪。</div>
   <div><b>DSH 侧数值</b>：取自 <code>@deepseek-ai/dsh</code> 的 <code>*.module.css</code> 与 <code>dsh-client-ui-tool/lib/client.js</code>；暗色 token 十六进制取自 <code>dsh-client-ui-theme</code>。<code>--dsh-content-font-delta</code> 取默认 0，所以行高就是 24px、字号 13px。</div>
   <div><b>链接色</b>：DSH 已查到真值 —— <code>--dsw-alias-link</code> = <code>--dsw-static-deepseek-400</code> = <span style="color:#7aaaff">#7aaaff</span>（暗色），不再是近似；Paseo 一侧的 accent 仍是近似 <span style="color:#8ba4ff">#8ba4ff</span>（真值由宿主主题在运行时给出）。</div>
   <div><b>配色决策</b>：diff 用 Paseo 语义色（低饱和 <span style="color:#6cb17b">#6cb17b</span> / <span style="color:#d8847b">#d8847b</span>），DSH 栏照它原样用高饱和 <span style="color:#22c55e">#22c55e</span> / <span style="color:#f25a5a">#f25a5a</span>。标本托盘底色是中性面，不是任何一方的真实背景。</div>
@@ -361,7 +369,8 @@
   <a href="#b8">⑧ 代码展开</a>
   <a href="#b9">⑨ 思考行</a>
   <a href="#b10">⑩ 压缩行</a>
-  <a href="#b11">不确定项与已知偏差</a>
+  <a href="#b11">⑪ 仍未实现 / 已知偏差</a>
+  <a href="#b12">⑫ 不确定项</a>
 </nav>
 
 <!-- ============================ ① 行头 ============================ -->
@@ -396,7 +405,7 @@
       </div>
     </div>
   </div>
-  <p class="note"><b>要点</b>：DSH 是<b>固定 24px 单行、行自身零垂直 padding</b>；改造前是 <code>paddingVertical 5</code> + <code>gap 3</code> —— 同样 4 行明显更高更散。摘要在 DSH 是 <b>UI 字体 13/24</b>，改造前是<b>等宽 13/20</b>（最扎眼的一处差别，Phase 1 已改掉）。标题与摘要之间那个点是 <b>2×2px、圆角 1px 的方块</b>（<code>margin: 0 8px</code>，不是圆点）；<code>+A -R</code> 是 <b>11px 等宽、<code>margin-left: 10px</code></b>，改造前没有。RN 妥协：DSH 的 <code>:hover</code>（标题/摘要换色、图标换 chevron）在 RN 原生没有等价（RN Web 有 <code>hovered</code>，iOS 没有）→ <span class="warn">我们不做 hover 态</span>。标题文案已在 <code>bdcc5d1</code> 按 DSH 的 <code>tool.title.*</code> 对齐（「运行命令」「搜索文件内容」；英文表不规则就照抄：bash=<code>Bash</code>、grep=<code>Grep</code>、glob=<code>Glob</code>），只有 MCP 行仍用 Paseo 自己的中文名（DSH 是「工具调用 · 工具名」）——这是刻意的，不是遗漏。<span class="warn">仍差 1px</span>：DSH 行头与卡片之间的间距来自卡片自身的 <code>margin-top: 4px</code>，我们的 <code>ROW_GAP</code> 是 3px，未收口。</p>
+  <p class="note"><b>要点</b>：DSH 是<b>固定 24px 单行、行自身零垂直 padding</b>；改造前是 <code>paddingVertical 5</code> + <code>gap 3</code> —— 同样 4 行明显更高更散。摘要在 DSH 是 <b>UI 字体 13/24</b>，改造前是<b>等宽 13/20</b>（最扎眼的一处差别，Phase 1 已改掉）。标题与摘要之间那个点是 <b>2×2px、圆角 1px 的方块</b>（<code>margin: 0 8px</code>，不是圆点）；<code>+A -R</code> 是 <b>11px 等宽、<code>margin-left: 10px</code></b>，改造前没有。RN 妥协：DSH 的 <code>:hover</code>（标题/摘要换色、图标换 chevron）在 RN 原生没有等价（RN Web 有 <code>hovered</code>，iOS 没有）→ <span class="warn">我们不做 hover 态</span>。标题文案已在 <code>bdcc5d1</code> 按 DSH 的 <code>tool.title.*</code> 对齐（「运行命令」「搜索文件内容」；英文表不规则就照抄：bash=<code>Bash</code>、grep=<code>Grep</code>、glob=<code>Glob</code>），只有 MCP 行仍用 Paseo 自己的中文名（DSH 是「工具调用 · 工具名」）——这是刻意的，不是遗漏。<code>ROW_GAP</code> 已在 <code>5247ef9</code> 收口到 <b>4px</b>（DSH 的间距来自卡片自身的 <code>margin-top: 4px</code>，行头本身没有 gap / padding），并补上了此前缺失的那条断言。</p>
 </section>
 
 <!-- ============================ ② 命令展开 ============================ -->
@@ -457,7 +466,7 @@ PASS  thinking-check.cjs    17/17</div>
       </div>
     </div>
   </div>
-  <p class="note"><b>要点</b>：DSH <b>没有叉形失败图标</b> —— 四种实心态共用同一个实心圆点，只换 <code>currentColor</code>；运行中是唯一非圆点状态（14px 的环 + 呼吸弧，两者共用一个 1.5s 周期）。pill 自身 24px，在工具行里被压到 <b>18px</b>（<code>0 8px</code>、圆角 999、底 <code>bg-layer-2</code> = #2c2c2e、字 <code>state-error-primary</code>），<b>只在失败时渲染</b>。复制按钮 13/20、<code>label-secondary</code>，1000ms 反馈；出现条件是 <code>copyText !== undefined || (!running &amp;&amp; !empty)</code>。RN 妥协：<code>::after</code> 画核 → 内层绝对定位 <code>View</code>；旋转 + dash 呼吸 → <code>Animated</code> / <code>react-native-svg</code>（<code>strokeDasharray/Offset</code> 都支持，但"把两个动画的起点钉在一起"的 <code>getAnimations()+startTime=0</code> 是 Web 专有）；pill 与复制键的 <code>position: sticky</code>（长命令滚动时吸顶）<b>无解</b> → 只能把它们移出滚动容器；输出"对齐就是语义"的 <code>white-space: pre</code> <b>无等价</b> → 横向 ScrollView（<span class="warn">这一条还没接上</span>：改造后与改造前的输出区都是会折行的 <code>Text</code>，本图里也就是折行的样子，而 DSH 那一栏保持原样并横向滚）。结构上还差一列：DSH 卡片自带 30px 圆点栏，我们没做状态点，所以命令/输出从 14px 起排；另外 <code>COMMAND_LINE_HEIGHT</code> 现在写的是 16px，而 DSH 的 <code>.promptLine</code> 用的是 <code>--dsl-terminal-line-height</code>，被 ToolRow 重绑成 <b>18px</b>（16px 只是 <code>--dsl-terminal-font</code> 简写里的行高）。</p>
+  <p class="note"><b>要点</b>：DSH <b>没有叉形失败图标</b> —— 四种实心态共用同一个实心圆点，只换 <code>currentColor</code>；运行中是唯一非圆点状态（14px 的环 + 呼吸弧，两者共用一个 1.5s 周期）。pill 自身 24px，在工具行里被压到 <b>18px</b>（<code>0 8px</code>、圆角 999、底 <code>bg-layer-2</code> = #2c2c2e、字 <code>state-error-primary</code>），<b>只在失败时渲染</b>。复制按钮 13/20、<code>label-secondary</code>，1000ms 反馈；出现条件是 <code>copyText !== undefined || (!running &amp;&amp; !empty)</code>。RN 妥协：<code>::after</code> 画核 → 内层绝对定位 <code>View</code>；旋转 + dash 呼吸 → <code>Animated</code> / <code>react-native-svg</code>（<code>strokeDasharray/Offset</code> 都支持，但"把两个动画的起点钉在一起"的 <code>getAnimations()+startTime=0</code> 是 Web 专有）；pill 与复制键的 <code>position: sticky</code>（长命令滚动时吸顶）<b>无解</b> → 只能把它们移出滚动容器；输出"对齐就是语义"的 <code>white-space: pre</code> <b>无等价</b> → 横向 ScrollView（<span class="warn">这一条还没接上</span>：改造后与改造前的输出区都是会折行的 <code>Text</code>，本图里也就是折行的样子，而 DSH 那一栏保持原样并横向滚）。结构上还差一列：DSH 卡片自带 30px 圆点栏，我们没做状态点，所以命令/输出从 14px 起排；<code>COMMAND_LINE_HEIGHT</code> 已在 <code>5247ef9</code> 从 16 收到 <b>18</b>（DSH 的 <code>.promptLine</code> 用被 ToolRow 重绑成 18px 的 <code>--dsl-terminal-line-height</code>；16 只是 <code>--dsl-terminal-font</code> 简写里的行高，被元素上的显式 line-height 覆盖）。<span class="warn">仍未做</span>：终端输出仍是会折行的 <code>Text</code>，不是 <code>white-space: pre</code> 的等价物 —— 见 §⑪。</p>
 </section>
 
 <!-- ============================ ③ 搜索结果 ============================ -->
@@ -534,7 +543,7 @@ server/session.ts:812:  return handle;</div>
   <div class="cols">
     <div class="cell"><div class="clab dsh"><span class="dot"></span>DSH 原样</div>
       <div class="box">
-        <div class="d-row"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.1"/><path d="M10.1 10.1l3.3 3.3"/></svg></span><span class="d-title">读取</span><span class="d-sep"></span><span class="d-sum">client/newest.ts</span></div>
+        <div class="d-row"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><path d="M1.6 8S4.4 3.8 8 3.8 14.4 8 14.4 8 11.6 12.2 8 12.2 1.6 8 1.6 8z"/><circle cx="8" cy="8" r="2.1"/></svg></span><span class="d-title">读取</span><span class="d-sep"></span><span class="d-sum">client/newest.ts</span></div>
         <div class="d-card">
           <div class="d-chead">
             <span class="h"><span class="d-lang">typescript</span><span class="d-ctitle">client/newest.ts</span></span>
@@ -562,9 +571,9 @@ server/session.ts:812:  return handle;</div>
         </div>
       </div>
     </div>
-    <div class="cell"><div class="clab after"><span class="dot"></span>改造后<span class="badge done">已实现 · Phase 2</span></div>
+    <div class="cell"><div class="clab after"><span class="dot"></span>改造后<span class="badge done">已实现 · Phase 2</span><span class="badge plan">图片块 计划 · Phase 4b</span></div>
       <div class="box">
-        <div class="n-row"><span class="n-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.1"/><path d="M10.1 10.1l3.3 3.3"/></svg></span><span class="n-title">读取</span><span class="n-sep"></span><span class="n-sum">client/newest.ts</span></div>
+        <div class="n-row"><span class="n-lead"><svg class="i" viewBox="0 0 16 16"><path d="M1.6 8S4.4 3.8 8 3.8 14.4 8 14.4 8 11.6 12.2 8 12.2 1.6 8 1.6 8z"/><circle cx="8" cy="8" r="2.1"/></svg></span><span class="n-title">读取</span><span class="n-sep"></span><span class="n-sum">client/newest.ts</span></div>
         <div class="n-card">
           <div class="n-chead">
             <span class="h"><span class="n-lang">typescript</span><span class="n-ctitle">client/newest.ts</span></span>
@@ -692,7 +701,7 @@ server/session.ts:812:  return handle;</div>
           </div>
         </div>
         <div class="cap mt">网页抓取：同一个 .block，只有 URL 与状态行</div>
-        <div class="d-row"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.2"/><path d="M2.8 8h10.4"/><path d="M8 2.8c2.5 2.9 2.5 7.5 0 10.4"/></svg></span><span class="d-title">网页获取</span><span class="d-sep"></span><span class="d-sum" style="color:#7aaaff">https://docs.getpaseo.com/plugins</span></div>
+        <div class="d-row"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><path d="M1.6 8S4.4 3.8 8 3.8 14.4 8 14.4 8 11.6 12.2 8 12.2 1.6 8 1.6 8z"/><circle cx="8" cy="8" r="2.1"/></svg></span><span class="d-title">网页获取</span><span class="d-sep"></span><span class="d-sum" style="color:#7aaaff">https://docs.getpaseo.com/plugins</span></div>
         <div class="d-card">
           <div class="d-web"><span class="d-url">https://docs.getpaseo.com/plugins</span>
             <div class="d-meta"><span class="s">HTTP 200</span><span class="t">内容已截断</span></div>
@@ -738,7 +747,7 @@ timeline rows exports a client bundle.</div>
           </div>
         </div>
         <div class="cap mt">抓取：URL + 状态行（截断提示与状态同一行，<code>margin-top</code> 归零）</div>
-        <div class="n-row"><span class="n-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.2"/><path d="M2.8 8h10.4"/><path d="M8 2.8c2.5 2.9 2.5 7.5 0 10.4"/></svg></span><span class="n-title">网页获取</span><span class="n-sep"></span><span class="n-sum">https://docs.getpaseo.com/plugins</span></div>
+        <div class="n-row"><span class="n-lead"><svg class="i" viewBox="0 0 16 16"><path d="M1.6 8S4.4 3.8 8 3.8 14.4 8 14.4 8 11.6 12.2 8 12.2 1.6 8 1.6 8z"/><circle cx="8" cy="8" r="2.1"/></svg></span><span class="n-title">网页获取</span><span class="n-sep"></span><span class="n-sum">https://docs.getpaseo.com/plugins</span></div>
         <div class="n-card">
           <div class="n-web"><span class="n-url">https://docs.getpaseo.com/plugins</span>
             <div class="n-meta"><span class="s">HTTP 200</span><span class="t">内容已截断</span></div>
@@ -747,7 +756,7 @@ timeline rows exports a client bundle.</div>
       </div>
     </div>
   </div>
-  <p class="note"><b>要点</b>：两种形态<b>差别很大</b>，DSH 里它们是同一个 WebBlock 的两个分支，但结构不同：search 是<b>引用列表</b>（14/20 链接 + 13/19 摘要 + 13/20 日期，<code>gap: 10px</code>、<code>max-height: 320px</code> 就地滚动、序号占 <code>padding-left: 2.5em</code>）；fetch 是 <b>URL + 状态行</b>（<code>gap: 6px</code>，<code>HTTP 200</code> 用 secondary、截断提示用 tertiary，fetch 分支里 <code>.truncated</code> 的 <code>margin-top</code> 被归零，所以两行并排）。WebBlock 与 SearchBlock 的卡结构也不同：<b>整块 <code>padding: 12px 14px</code>，没有 banner、没有复制按钮、没有折叠</b>（全靠 320px 滚动）。DSH <b>不读</b> fetch 的 <code>snippet</code>，所以抓取卡里不会出现摘要 —— 我们照做。RN 妥协：<code>&lt;ol value&gt;</code> 自动序号不存在 → 自绘一个右对齐的数字列（宽度 24px + gap 8）；<code>em</code> 单位不存在 → 手算 px；<code>word-break: break-all / break-word</code> <b>无等价</b>（超长 URL 的换行会不理想）；<code>max-height + overflow-y</code> → <code>ScrollView</code> + <code>nestedScrollEnabled</code>；<code>align-items: baseline</code> → <code>flex-start</code>。链接色 DSH 真值 <span style="color:#7aaaff">#7aaaff</span>（暗），我们一侧用宿主 accent（此处为近似）。文案已对齐 DSH（「网页搜索」「网页获取」；<code>bdcc5d1</code> 的 31 条文案对齐）；只有空态文案仍是共用的一条「无结果」——它匹配 DSH 的 <code>search.noResults</code>，而 DSH 的 <code>web.noResults</code> 写的是「未找到结果」。</p>
+  <p class="note"><b>要点</b>：两种形态<b>差别很大</b>，DSH 里它们是同一个 WebBlock 的两个分支，但结构不同：search 是<b>引用列表</b>（14/20 链接 + 13/19 摘要 + 13/20 日期，<code>gap: 10px</code>、<code>max-height: 320px</code> 就地滚动、序号占 <code>padding-left: 2.5em</code>）；fetch 是 <b>URL + 状态行</b>（<code>gap: 6px</code>，<code>HTTP 200</code> 用 secondary、截断提示用 tertiary，fetch 分支里 <code>.truncated</code> 的 <code>margin-top</code> 被归零，所以两行并排）。WebBlock 与 SearchBlock 的卡结构也不同：<b>整块 <code>padding: 12px 14px</code>，没有 banner、没有复制按钮、没有折叠</b>（全靠 320px 滚动）。DSH <b>不读</b> fetch 的 <code>snippet</code>，所以抓取卡里不会出现摘要 —— 我们照做。RN 妥协：<code>&lt;ol value&gt;</code> 自动序号不存在 → 自绘一个右对齐的数字列（宽度 24px + gap 8）；<code>em</code> 单位不存在 → 手算 px；<code>word-break: break-all / break-word</code> <b>无等价</b>（超长 URL 的换行会不理想）；<code>max-height + overflow-y</code> → <code>ScrollView</code> + <code>nestedScrollEnabled</code>；<code>align-items: baseline</code> → <code>flex-start</code>。链接色 DSH 真值 <span style="color:#7aaaff">#7aaaff</span>（暗），我们一侧用宿主 accent（此处为近似）。文案已对齐 DSH（「网页搜索」「网页获取」；<code>bdcc5d1</code> 的 31 条文案对齐），空态也在 <code>5247ef9</code> 拆成两条 —— <code>search.noResults</code>「无结果」/ <code>web.noResults</code>「未找到结果」（拆之前是英文取 web 的措辞、中文取 search 的措辞，两边同时错）。行首图标：<code>web_search</code> 已是 Globe，<code>web_fetch</code> 已改用 DSH <code>WebRow</code> 的字形（<code>IconBrowseOutlineRegular</code> ≈ 眼睛，不是放大镜）—— 两者都在 <code>WEB_ROW_ICONS</code> 里、<b>先于</b> detail 分支判定；但 <code>web_search → Globe</code> 还缺一条断言，见 §⑪。<span class="warn">仍未做</span>：图片块（Phase 4b），见 §⑪。</p>
 </section>
 
 <!-- ============================ ⑦ MCP / 未知 ============================ -->
@@ -823,7 +832,7 @@ timeline rows exports a client bundle.</div>
       </div>
     </div>
   </div>
-  <p class="note"><b>要点</b>：ioCard 是 dispatching 的<b>兜底</b> —— askQuestion / terminal / diff / read / image / search / web / details 全没命中时才用它，所以任意 MCP 工具与未知工具都落在这里。结构是 <code>grid-template-columns: max-content 1fr</code> + <code>column-gap: 14px</code> + <code>padding: 12px 16px</code>，两段各自 <code>max-height: 150px</code> 滚动，标签逐字是「输入」「输出」（<code>row.input</code> / <code>row.output</code>），标签色 <code>label-caption</code> 并且 <code>position: sticky; top: 0</code>；正文 <code>label-secondary</code>、<code>white-space: pre-wrap</code>，失败时 <code>[data-error]</code> 转成 <code>state-error-primary</code>。行头摘要 DSH 是 <code>&lt;工具名&gt; · &lt;参数首行&gt;</code>（标题是 generic 的「工具调用」），我们保留 Paseo 自己的中文名（「列出工作区」），把参数首行放摘要。<span class="warn">现状与目标的差</span>：我们<b>还没有</b>两段结构，输入（美化 JSON）与输出挤在同一个代码面里 —— RENDER-PLAN 的 Phase 3 只写了"结构化展示，而非原始 JSON"，没有点名 ioCard 的两段形状，所以这一段严格说是<b>计划外</b>，本图按 DSH 的形状画作目标。RN 妥协：<code>grid</code> 没有 → 固定宽标签列 + gap；<code>position: sticky</code> 标签 <b>无解</b>（RN 没有 sticky）；<code>-webkit-scrollbar-*</code> → <code>indicatorStyle</code>。</p>
+  <p class="note"><b>要点</b>：ioCard 是 dispatching 的<b>兜底</b> —— askQuestion / terminal / diff / read / image / search / web / details 全没命中时才用它，所以任意 MCP 工具与未知工具都落在这里。结构是 <code>grid-template-columns: max-content 1fr</code> + <code>column-gap: 14px</code> + <code>padding: 12px 16px</code>，两段各自 <code>max-height: 150px</code> 滚动，标签逐字是「输入」「输出」（<code>row.input</code> / <code>row.output</code>），标签色 <code>label-caption</code> 并且 <code>position: sticky; top: 0</code>；正文 <code>label-secondary</code>、<code>white-space: pre-wrap</code>，失败时 <code>[data-error]</code> 转成 <code>state-error-primary</code>。行头摘要 DSH 是 <code>&lt;工具名&gt; · &lt;参数首行&gt;</code>（标题是 generic 的「工具调用」），我们保留 Paseo 自己的中文名（「列出工作区」），把参数首行放摘要。<span class="warn">现状与目标的差</span>：我们<b>还没有</b>两段结构，输入（美化 JSON）与输出挤在同一个代码面里 —— RENDER-PLAN 的 Phase 3 只写了"结构化展示，而非原始 JSON"，没有点名 ioCard 的两段形状，所以这一段严格说是<b>计划外</b>，本图按 DSH 的形状画作目标（<span class="warn">仍未做</span>，见 §⑪）。RN 妥协：<code>grid</code> 没有 → 固定宽标签列 + gap；<code>position: sticky</code> 标签 <b>无解</b>（RN 没有 sticky）；<code>-webkit-scrollbar-*</code> → <code>indicatorStyle</code>。</p>
 </section>
 
 <!-- ============================ ⑧ 代码 ============================ -->
@@ -859,10 +868,10 @@ return parsed.items.length;</div>
         </div>
       </div>
     </div>
-    <div class="cell"><div class="clab after"><span class="dot"></span>改造后<span class="badge plan">未覆盖 · 不在 Phase 0-4</span></div>
+    <div class="cell"><div class="clab after"><span class="dot"></span>改造后<span class="badge done">标签 / 图标 已实现 · 5247ef9</span><span class="badge plan">CodeBlock 计划</span></div>
       <div class="box">
-        <div class="cap">现状与改造前同形（只换成 Phase 1 的卡片样式）；下面是 DSH 的形状，作为<b>待决定</b>的目标</div>
-        <div class="n-row"><span class="n-lead"><svg class="i" viewBox="0 0 16 16"><path d="M9.9 2.6a3.4 3.4 0 00-3.1 4.7l-4 4a1.1 1.1 0 001.6 1.6l4-4a3.4 3.4 0 004.6-4.4l-2 2-1.6-1.6z"/></svg></span><span class="n-title">run_code</span><span class="n-sep"></span><span class="n-sum">跑一段解析</span></div>
+        <div class="cap">现状：标题与图标已对齐（「代码」+ Code 字形）；展开<b>仍</b>走 unknown 的兜底代码面。下面虚线是 DSH 的 CodeBlock 形状，作为<b>未实现</b>的目标（见 §⑪）</div>
+        <div class="n-row"><span class="n-lead"><svg class="i" viewBox="0 0 16 16"><path d="M6 4.6L3.3 8 6 11.4"/><path d="M10 4.6L12.7 8 10 11.4"/></svg></span><span class="n-title">代码</span><span class="n-sep"></span><span class="n-sum">跑一段解析</span></div>
         <div class="n-card">
           <div class="n-sbody" style="padding:12px 14px">
             <div class="n-pre">const parsed = JSON.parse(raw);
@@ -883,7 +892,7 @@ return parsed.items.length;</div>
       </div>
     </div>
   </div>
-  <p class="note"><b>要点</b>：<span class="warn">这一格是我们真正的空白</span> —— 客户端<i>完全没有</i> <code>code</code> 分支：<code>run_code</code> 在 <code>toolLabels</code> / <code>toolLabels.en</code> 里都没有条目（全仓库搜不到这个字符串），所以标题回落成<b>原始线名</b> <code>run_code</code>（DSH 是「代码」），图标回落成通用扳手，展开走 unknown 的兜底代码面 —— 没有语言标签、没有复制、没有 <code>bodyScroll</code> 限高。RENDER-PLAN 的 Phase 0–4 没有点名它，所以这是<b>计划外</b>的一格；要不要按 DSH 造一个 CodeBlock（以及那个硬编码 <code>typescript</code> 的瑕疵要不要学）需要先决定。已经决定不学的两条：<b>banner 的 <code>position: sticky</code></b>（RN 没有 sticky，要么 <code>stickyHeaderIndices</code> 要么改布局）与 <b><code>lang</code> 硬编码 <code>typescript</code></b>（DSH 自己的小瑕疵）。另外 DSH 的复制按钮复制的是<b>渲染后的 <code>pre</code> 文本</b>（<code>querySelector("pre").textContent</code>）而不是原始字符串 —— 我们若要照做，得注意 RN 上没有 DOM 可查，只能复制模型给的那份文本。</p>
+  <p class="note"><b>要点</b>：<span class="warn">这一格只补了一半</span> —— <code>5247ef9</code> 已给 <code>run_code</code> 补上标签（「代码」/「Code」）与 <code>Code</code> 字形：它此前在 <code>toolLabels</code> / <code>toolLabels.en</code> 里一个条目都没有，标题回落成<b>原始线名</b> <code>run_code</code>、图标回落成通用扳手（与之前修掉的"空白行"同属静默降级）。但客户端<i>仍然没有</i> <code>code</code> 分支，展开走 unknown 的兜底代码面 —— 没有语言标签、没有复制、没有 <code>bodyScroll</code> 限高。<b>CodeBlock 仍未做</b>（见 §⑪）；已经决定不学的两条：<b>banner 的 <code>position: sticky</code></b>（RN 没有 sticky，要么 <code>stickyHeaderIndices</code> 要么改布局）与 <b><code>lang</code> 硬编码 <code>typescript</code></b>（DSH 自己的小瑕疵）。另外 DSH 的复制按钮复制的是<b>渲染后的 <code>pre</code> 文本</b>（<code>querySelector("pre").textContent</code>）而不是原始字符串 —— 我们若要照做，得注意 RN 上没有 DOM 可查，只能复制模型给的那份文本。</p>
 </section>
 
 <!-- ============================ ⑨ 思考行 ============================ -->
@@ -923,7 +932,7 @@ return parsed.items.length;</div>
       </div>
     </div>
   </div>
-  <p class="note"><b>要点</b>：DSH 的折叠预览取法与我们一致 —— <b>结束后取正文第一行、运行中取"最后一个已终结段落的首行"</b>，并且把 <code>**</code> 剥掉、标签恒为「思考」（「已思考」属于它"整轮过程"折叠摘要，不是这一行）。差别在三处：<b>行高节奏</b>（DSH 13/24 且 <code>min-height: 24px</code>；改造前是标签 12px + 预览 14/21，外面还套 <code>paddingVertical 5</code>）、<b>展开体</b>（DSH <code>padding: 4px 0 4px 22px</code> + 13/24 + Markdown 渲染；我们 4px 缩进 + 14/21 + 纯文本）、<b>无预览时的处理</b>（DSH <code>.root:not([data-preview]) .separator, .root:not([data-preview]) .summary { display: none }</code>）。运行中的渐隐也不同：DSH 是 <code>mask-image: linear-gradient(90deg, #000 calc(100% - 48px), transparent)</code>，即右端 48px 的静态渐隐；我们走的是整套扫光（shimmer）。RN 妥协：<code>mask-image</code> 无等价（只能用渐变的 <code>View</code> 叠一层，或不做）；<b>展开时行头 sticky 无解</b>；Markdown 需要额外渲染器，目前渲染的是纯文本。</p>
+  <p class="note"><b>要点</b>：DSH 的折叠预览取法与我们一致 —— <b>结束后取正文第一行、运行中取"最后一个已终结段落的首行"</b>，并且把 <code>**</code> 剥掉、标签恒为「思考」（「已思考」属于它"整轮过程"折叠摘要，不是这一行）。差别在三处：<b>行高节奏</b>（DSH 13/24 且 <code>min-height: 24px</code>；改造前是标签 12px + 预览 14/21，外面还套 <code>paddingVertical 5</code>）、<b>展开体</b>（DSH <code>padding: 4px 0 4px 22px</code> + 13/24 + Markdown 渲染；我们 4px 缩进 + 14/21 + 纯文本）、<b>无预览时的处理</b>（DSH <code>.root:not([data-preview]) .separator, .root:not([data-preview]) .summary { display: none }</code>）。运行中的渐隐也不同：DSH 是 <code>mask-image: linear-gradient(90deg, #000 calc(100% - 48px), transparent)</code>，即右端 48px 的静态渐隐；我们走的是整套扫光（shimmer）。RN 妥协：<code>mask-image</code> 无等价（只能用渐变的 <code>View</code> 叠一层，或不做）；<b>展开时行头 sticky 无解</b>；Markdown 需要额外渲染器，目前渲染的是纯文本。<span class="warn">仍未做</span>：展开体缩进 4 vs DSH 22px、正文 14/21 vs 13/24、无预览时未把方块与预览整段隐藏 —— 见 §⑪。</p>
 </section>
 
 <!-- ============================ ⑩ 压缩行 ============================ -->
@@ -963,16 +972,48 @@ return parsed.items.length;</div>
       </div>
     </div>
   </div>
-  <p class="note"><b>要点</b>：DSH 的压缩行是一个<b>可展开行</b>，和工具行共用同一套 <code>DisclosureRow</code> 节奏（24px、13/24、2×2 方块、图标 hover 换 chevron），展开体 <code>padding: 4px 0 4px 22px</code>、13/24、tertiary，展开时行头 sticky 并画上 <code>bg-base</code> 底色。它的文案是 <code>message.compaction</code>「上下文已压缩」+ <code>.running</code>「正在压缩…」/ <code>.completed</code>「已压缩 {items} 条历史记录（约 {tokens} tokens）」/ <code>.expand</code>「点击查看压缩摘要」/ <code>.unavailable</code>「压缩摘要不可用」。<b>我们刻意不照抄</b>：Paseo 的 <code>compaction</code> 是它的一等 item（它自己的 omp / pi 适配器也发这个），行由宿主自己的 marker 渲染器画 —— 所以要跟的是 Paseo 的形状，而不是 DSH 的。<span class="warn">本格的"改造后"是形状示意</span>：Paseo 的 marker 渲染器不在本仓库，我无法逐像素核对，只画了它承载的字段。RN 妥协：DSH 那条 sticky 行头在这条路上不存在（宿主的 marker 自己决定），我们不需要面对。</p>
+  <p class="note"><b>要点</b>：DSH 的压缩行是一个<b>可展开行</b>，和工具行共用同一套 <code>DisclosureRow</code> 节奏（24px、13/24、2×2 方块、图标 hover 换 chevron），展开体 <code>padding: 4px 0 4px 22px</code>、13/24、tertiary，展开时行头 sticky 并画上 <code>bg-base</code> 底色。它的文案是 <code>message.compaction</code>「上下文已压缩」+ <code>.running</code>「正在压缩…」/ <code>.completed</code>「已压缩 {items} 条历史记录（约 {tokens} tokens）」/ <code>.expand</code>「点击查看压缩摘要」/ <code>.unavailable</code>「压缩摘要不可用」。<b>我们刻意不照抄</b>：Paseo 的 <code>compaction</code> 是它的一等 item（它自己的 omp / pi 适配器也发这个），行由宿主自己的 marker 渲染器画 —— 所以要跟的是 Paseo 的形状，而不是 DSH 的。<span class="warn">本格的"改造后"是形状示意</span>：Paseo 的 marker 渲染器不在本仓库，我无法逐像素核对，只画了它承载的字段。RN 妥协：DSH 那条 sticky 行头在这条路上不存在（宿主的 marker 自己决定），我们不需要面对。<span class="warn">仍未做</span>：<code>compaction/summary</code> 的摘要正文在 Paseo 的 marker 里没有承载处（marker 只承载 <code>status</code> / <code>trigger</code>），<code>compaction/prune</code> 刻意不映射 —— 见 §⑪。</p>
+</section>
+
+<!-- ============================ 仍未实现 ============================ -->
+<section class="cat" id="b11">
+  <h2><span class="num">⑪</span>仍未实现 / 已知偏差（本图不承诺这些）</h2>
+  <p class="desc">上面每一格右边都画着"改造后"的目标形状。这一节把其中<b>还没有交付</b>的部分单独列出来，免得预览被当成已完成 —— 也别让这张图承诺它交付不了的东西。快照 <code>5247ef9</code>（2026-10-16 22:45 CST）。</p>
+  <div class="note" style="border-left-color:#3a3a40">
+    <p style="margin:0 0 8px"><b>仍未做</b></p>
+    <ul style="margin:0 0 12px;padding-left:18px">
+      <li><b>图片块（Phase 4b）</b>：<code>read_image</code> / 浏览器截图仍被 <code>textOf()</code> 丢掉。调研结论已出 —— 走 Paseo 既有形状：图片做成一条独立的 <code>assistant_message</code>，正文是 markdown 图片 <code>![alt](&lt;绝对路径&gt;)</code>，宿主经 file-RPC 取字节渲染；桥这一侧用 DSH 的 <code>imageHostPath(ref)</code> 透出路径（改了桥要重生成内嵌桥）—— 但<b>尚未实现</b>。</li>
+      <li><b><code>run_code</code> 的 CodeBlock</b>：标签与图标已在 <code>5247ef9</code> 补上（「代码」/ <code>Code</code>），展开体<b>仍</b>是 unknown 的兜底代码面 —— 没有语言标签、没有复制、没有 <code>bodyScroll</code> 限高。不学 banner <code>sticky</code>（RN 无解）与硬编码 <code>lang</code>。</li>
+      <li><b>ioCard 的输入 / 输出两段</b>：MCP 与未知工具仍是输入（美化 JSON）与输出挤在同一个代码面；DSH 是两段各自 <code>max-height: 150px</code> 的就地滚动。Phase 3 没点名这个形状，严格说计划外。</li>
+      <li><b>终端输出</b>：仍是会折行的 <code>Text</code>，不是 <code>white-space: pre</code> 的等价物（要横向 <code>ScrollView</code>）；状态点 / 退出码 pill / 复制键也还没做。</li>
+      <li><b>思考行展开体的几何</b>：缩进 4px vs DSH 22px、正文 14/21 vs 13/24、纯文本而非 Markdown；无预览时 DSH 把 2×2 方块与预览整段隐藏，我们仍渲染空预览；DSH 展开时行头 <code>sticky</code> 在 RN 无解（放弃）。</li>
+      <li><b><code>compaction/summary</code> 的摘要正文</b>：Paseo 的 marker 只承载 <code>status</code> / <code>trigger</code>（<code>preTokens</code> 也刻意不设），摘要文本到不了界面。</li>
+      <li><b><code>compaction/prune</code> 刻意不映射</b>：它不带 <code>compactionId</code>，后面跟的是 <code>tool/result</code> 替换而不是压缩检查点，DSH 自己也不为它画标记。</li>
+      <li><b>动作区</b>：read / 代码卡是文字「复制」而非 24×24 图标，也没有换行开关。</li>
+    </ul>
+    <p style="margin:0 0 8px"><b>实现已落地、但断言待补</b></p>
+    <ul style="margin:0 0 12px;padding-left:18px">
+      <li><code>web_search</code> 行头 Globe：<code>5247ef9</code> 已在 <code>WEB_ROW_ICONS</code> 里落地（<code>web_search: "Globe"</code> / <code>web_fetch: "Eye"</code>，<b>先于</b> detail 分支判定），<b>但 <code>harness/tool-call-check.cjs</code> 只断言了 <code>web_fetch → Eye</code></b>，没有 <code>web_search → Globe</code> —— 补一条，否则它会悄悄漂回去。名字级图标表本身仍然只在 detail 缺失或为 <code>unknown</code> 时生效（grep/glob 的 detail 是 <code>search</code>，继续用放大镜），Globe 走的是显式例外通道。</li>
+    </ul>
+    <p style="margin:0 0 8px"><b>刻意的偏离（DSH 本身没有，不是画错）</b></p>
+    <ul style="margin:0;padding-left:18px">
+      <li>diff 的 <code>@@ -a,b +c,d @@</code> hunk 头（DSH 只有 <code>⋯</code> 分隔）。</li>
+      <li>diff 卡头里的路径与「新建 / 更新」标注（DSH 的 CodeToolbar 有 <code>status</code> 槽，但 DiffBlock 从不传值）。</li>
+      <li>diff 卡头的语言标签写死成 <code>diff</code>（DSH 用 <code>languageForPath</code> 推出 <code>tsx</code>），读取卡才用 meta 里的 <code>lang</code>。</li>
+      <li>MCP 行保留 Paseo 自己的中文名（DSH 是「工具调用 · 工具名」）。</li>
+      <li>diff 底纹用 Paseo 语义色（低饱和），不是 DSH 的 <span style="color:#22c55e">#22c55e</span> / <span style="color:#f25a5a">#f25a5a</span>。</li>
+      <li><code>compaction</code> 跟 Paseo 自己的 marker，不照抄 DSH 的可展开行形状。</li>
+    </ul>
+  </div>
 </section>
 
 <!-- ============================ 不确定项 ============================ -->
-<section class="cat" id="b11">
-  <h2><span class="num">※</span>不确定项与已知偏差（这一份会被当真值读，所以列在这里）</h2>
+<section class="cat" id="b12">
+  <h2><span class="num">⑫</span>不确定项（这一份会被当真值读，所以列在这里）</h2>
   <div class="note" style="border-left-color:#3a3a40">
     <p style="margin:0 0 7px"><b>本轮从源码核实、因而可以写死的</b>：暗色 token 十六进制（<code>bg-base #151517</code>、<code>label-primary #f9fafb</code>、<code>secondary #cfd3d6</code>、<code>tertiary #adb2b8</code>、<code>caption #81858c</code>、<code>border-l1 #ffffff0f</code>、<code>border-l2 #ffffff1f</code>、<code>code-block #1b1b1c</code>、<code>banner #2c2c2e</code>、<code>bg-layer-2 #2c2c2e</code>、<code>success #22c55e</code>、<code>error #f25a5a</code>、<code>link #7aaaff</code>、<code>idle #545557</code>）；行头 / 卡片 / 终端 / 搜索 / 读取 / diff / web / ioCard / CodeCard 的 padding、字号、行高、圆角、边框；折叠的 <code>maxLines</code> 与文案（<code>search 8</code>、<code>read 8</code>、<code>diff 9</code>、<code>terminal Infinity</code>）；DiffBlock <b>没有 <code>@@</code></b>（只有 path / gap / add / del / context 五种行）且卡头<b>不传 title / status</b>；CodeToolbar 的 <code>status</code> 在 CodeBlock 里永不触发、在 ReadBlock 里是「显示 X / Y 行」；<code>terminal</code> 的行高被 ToolRow 重绑成 18px。</p>
-    <p style="margin:0 0 7px"><b>仍未证实的（所以本图没有写死）</b>：① Paseo 原生 <code>compaction</code> marker 的几何 —— 渲染器在宿主里，本仓库看不到，第 ⑩ 格只画了它承载的字段；② Paseo 暗色主题里 <code>foregroundMuted</code> / <code>statusSuccess</code> / <code>statusDanger</code> / <code>accent</code> / <code>surface1</code> / <code>border</code> 的真实取值 —— 中右两栏用的是近似色（<code>#a1a1aa</code> / <code>#6cb17b</code> / <code>#d8847b</code> / <code>#8ba4ff</code> / <code>#1c1c1f</code> / <code>#2e2e33</code>），真值由宿主主题在运行时给出；③ <code>1ch</code> 在 11px 等宽下的实际宽度 —— 本图按 6.6px 折算 3ch ≈ 20px；④ DSH 的 <code>--dsw-font-markdown-code-block-small</code> 在非重构场景下的最终计算值（我按 11px/16px 记）；⑤ DSH <code>terminal</code> 折叠时 <code>--dsl-terminal-line-height</code> 与 <code>--dsl-terminal-font</code> 简写里行高的胜负 —— 我按 <code>.promptLine</code> 的 18px 画，<code>tokens.ts</code> 的 <code>COMMAND_LINE_HEIGHT = 16</code> 与此不一致。</p>
-    <p style="margin:0"><b>已知偏差（真实存在，不是画错）</b>：<code>ROW_GAP</code> 3px vs DSH 卡片 <code>margin-top: 4px</code>；思考行展开体 4px/14-21 vs DSH 22px/13-24 且不渲染 Markdown；读取/代码卡的动作区是文字「复制」而非 24×24 图标，且没有换行开关；diff 卡头多了语言标签 = <code>"diff"</code>、路径与「新建 / 更新」（DSH 无）；<code>run_code</code> 没有标签条目（标题回落成线名）；<code>web.noResults</code> 用「无结果」而 DSH 是「未找到结果」。</p>
+    <p style="margin:0 0 7px"><b>仍未证实的（所以本图没有写死）</b>：① Paseo 原生 <code>compaction</code> marker 的几何 —— 渲染器在宿主里，本仓库看不到，第 ⑩ 格只画了它承载的字段；② Paseo 暗色主题里 <code>foregroundMuted</code> / <code>statusSuccess</code> / <code>statusDanger</code> / <code>accent</code> / <code>surface1</code> / <code>border</code> 的真实取值 —— 中右两栏用的是近似色（<code>#a1a1aa</code> / <code>#6cb17b</code> / <code>#d8847b</code> / <code>#8ba4ff</code> / <code>#1c1c1f</code> / <code>#2e2e33</code>），真值由宿主主题在运行时给出；③ <code>1ch</code> 在 11px 等宽下的实际宽度 —— 本图按 6.6px 折算 3ch ≈ 20px；④ DSH 的 <code>--dsw-font-markdown-code-block-small</code> 在非重构场景下的最终计算值（我按 11px/16px 记）；⑤ 已定案：<code>terminal</code> 的行高按 <code>.promptLine</code> 的 <b>18px</b> —— <code>5247ef9</code> 已把 <code>COMMAND_LINE_HEIGHT</code> 从 16 改成 18，并加了 <code>COMMAND_LINE_HEIGHT === OUTPUT_LINE_HEIGHT</code> 的断言。</p>
+    <p style="margin:0"><b>已知偏差</b>：已按"仍未做 / 断言待补 / 刻意偏离"整理到 <b>§⑪</b> —— 那里是 <code>5247ef9</code> 收口后的最新状态（<code>ROW_GAP</code> 已 4、<code>run_code</code> 标签已补、<code>web.noResults</code> 已拆，都不再是偏差）。仍留在 §⑪ 的：思考行几何、动作区文字、ioCard 两段、终端折行、图片、CodeBlock、<code>compaction</code> 摘要与 <code>prune</code>。</p>
   </div>
 </section>
 

@@ -6,8 +6,9 @@
 它比 [ADOPTION.md](./ADOPTION.md) 更啰嗦——ADOPTION 把教训按主题归纳，这里保留
 时间顺序和当时的错误判断。**如果你正在接自己的运行时，这份清单可以当检查表用。**
 
-前 11 条来自界面反馈驱动的迭代，接下来 4 条来自一次针对"未完成实现"的专项审计，
-最后 1 条来自"重载一个正在运行的会话"这条平时不会走的路径。
+条目按发现顺序编号，并按发现它的那轮工作分段（基础契约 → 协议错配 → 能力声明 →
+专项审计 → 会话恢复 → … → 客户端渲染 → 协议边界与子代理生命周期）。编号里的
+`b`/`c`（29b、39b…）是同一症状的后续补记，不另起一个数字。
 
 ---
 
@@ -1171,6 +1172,89 @@ fork 不继承、环路终止、未知 header、Set/数组、空集）；真机 
 `6d0a20ce` 做往返——归档根前两个子会话 `archived=false`，归档根后变 `archived=true`，
 取消归档后回到 `false`，且 `workspace.json` 不留副作用；`subagent-check.cjs` **48/48**、
 `archive-registry-check.mjs` 2/2、`tsc --noEmit` 干净；内嵌桥（6 个文件）已重生成。
+
+---
+
+## 第十三轮：协议边界与子代理生命周期
+
+### 40. 写在 `detail` 上的额外字段会被协议静默剥掉 —— 只有 item 级 `metadata` 能过插件边界
+
+**症状**：结构化行全部退回纯文本 —— read 没有行号、edit 没有真 hunk diff、grep 没有分组、
+web 卡没有引用列表。真机上如此，而**本地离线断言全绿**。
+
+**根因**：插件子进程的出口会给每个事件跑一次 `ProviderEventSchema.parse(...)`，而
+`toolCallDetailSchema` 的**每个成员都是 `.strip()`**（`@getpaseo/plugin` 的
+`dist/server/provider.js:485` 起，包括最后的 `unknown` 成员）。`.strip()` 的语义是"schema
+没点名的键直接删掉，不报错" —— 所以挂在 `detail` 上的 `meta` 在过边界时无声消失。item 级
+`metadata` 是 `jsonObjectSchema.optional()`，原样过去。
+
+**复现**（一行 node 命令，用仓库 `paseo-plugin/node_modules` 里那份包）：
+
+```bash
+cd paseo-plugin
+node -e 'const {ProviderEventSchema}=require("@getpaseo/plugin/server/provider");
+  const item={id:"i",type:"tool_call",callId:"c",name:"read",status:"completed",error:null,
+    detail:{type:"read",filePath:"/a",content:"x",meta:{probe:1}},
+    metadata:{locale:"zh-CN",presentationMeta:{lines:[{number:1,text:"a"}]}}};
+  const p=ProviderEventSchema.parse({type:"timeline.item",sessionId:"s",item});
+  console.log("detail keys", JSON.stringify(Object.keys(p.item.detail)));
+  console.log("metadata", JSON.stringify(p.item.metadata));'
+# detail keys ["type","filePath","content"]                                         ← meta 没了
+# metadata {"locale":"zh-CN","presentationMeta":{"lines":[{"number":1,"text":"a"}]}} ← 原样保留
+```
+
+**后果**：我们曾把 DSH 的 `data.meta` 挂在 `detail.meta`，于是行号 / 真 hunk diff / grep
+分组 / web sources **在真机上全部到不了客户端**；而离线断言是绿的，因为断言直接调用
+`toolCallData(...)` 并把 detail 传进去，**根本没经过 `ProviderEventSchema.parse`**。这正是
+它危险的地方：断言打在了错误的层上 —— 测试通过只证明"函数能读到我给的字段"，不证明
+"这个字段能活着走到函数面前"。
+
+**正确做法**：
+
+- 数据走 **item 级 `metadata.presentationMeta`**（与既有的 `metadata.description`、
+  `metadata.locale` 合并），detail 只放协议点名的字段。
+- **断言要打在协议层**：真跑一遍 `ProviderEventSchema.parse`，断言字段在 parse **之后**
+  仍在；同时**反向断言** detail 上的额外字段确实被剥掉（否则将来有人"顺手放回 detail"
+  会一路绿到真机）。
+
+**验证**：`harness/timeline-check.cjs` 的 "the meta survives the plugin's own event schema"
+一段就是这套双向断言 —— 正向断言 `presentationMeta.lines[0].text` / `lang` / `locale` 过
+parse 仍在，反向断言 `!("meta" in parsed.item.detail)`，并额外构造一个把 meta 挂回 detail
+的 item，断言它确实被剥掉。
+
+**一句话教训**：**离线断言过了不等于过得了协议边界。** 两个独立代理给出相反结论时
+（一个说"字段在"、一个说"字段没了"），不用继续争论，跑一次复现命令就能定案。
+
+### 41. 被中断的子代理永远显示「运行中」（修复中）
+
+**症状**：被中断的子代理在 Paseo 里那一行永远 running、一直脉冲；重载插件也没用。
+
+**根因**：子会话日志的**末事件是 `step/start`、没有 `turn/end`**（实证：某个被中断的子代理）。
+`replaySubagents()` 重放这个日志后，只有 `turn/end` 能恢复终态，于是那一行永远 running。
+Paseo 对子会话 attach 时的默认状态就是 running，而它的宿主只消费**终态**的 `session.turn`；
+DSH 又不会为"这个进程已经死了"落任何事实，所以**光看日志形状分不出"还活着"和"被中断了"**
+—— 一个活着的 agent 在两步之间写下的尾巴同样是 `step/start`。唯一能区分的是 live 通道。
+
+**修法（进行中）**：重放时用 live 证据门控（桥在本进程播报过这个 child、或
+`#observedLive` 为真）；拿不到 live 证据、own suffix 里又没有终态的，收成 `canceled`
+（Paseo 自己的适配器给"被打断的回合"的就是这个状态），而不是留在 running。
+
+**状态**：**修复中**。`session.ts` 的 `replay()` 已按上述决定改，连同 `timeline.ts`、
+假桥、`subagent-check.cjs`、`timeline-check.cjs` 的用例，都在同一批**未提交**的工作区改动里；
+本文写作时尚未提交，真机行为以提交后的版本为准。
+
+### 42. `cancel_agent` 返回 `success:false`（待查）
+
+**症状**：在一个正在跑数数的 agent 上调 `cancel_agent`，返回失败（`success:false`），
+而那个 agent **照样跑完**。
+
+**状态**：**待查**（尚未定位根因）。
+
+**线索（只是线索，不是结论）**：可能与"**取消是取消回合，不是杀进程**"这条硬性约束有关
+（见 AGENTS.md 与第 11 条：`interrupt()` 直接 `kill()` 掉子进程会连会话一起报废，所以本
+仓库的取消走 `session/cancel` → `agent.cancel({ kind: "user" })`）。另外 `cancel_agent`
+是 **Paseo 自己的 agent 管理工具**，不在本仓库的插件工具表里，所以要查的是 Paseo 侧
+cancel 的语义、以及它对本 provider 的取消调用路径 —— 在查明之前不要动任何东西。
 
 ---
 

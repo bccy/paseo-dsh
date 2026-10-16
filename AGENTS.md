@@ -40,7 +40,8 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon 进程里）
 
 ### 改之前先读
 
-- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 25 个真实缺陷。里面有整整一类错误叫
+- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 四十余条真实缺陷（编号到 42，含 4 条
+  `b`/`c` 补记）。里面有整整一类错误叫
   **静默降级**（把不知道的东西当成成功、把不支持的能力悄悄丢掉）。改动前先看一遍，
   避免重新发明这些 bug。
 - [docs/ADOPTION.md](./docs/ADOPTION.md) 第 4 节 — 教训按主题归纳。
@@ -78,7 +79,9 @@ cd paseo-plugin && npx tsc --noEmit
 `harness/assistant-stream-check.cjs`（助手文本流式：同 id 增长快照、`id === messageId`、
 经 Paseo 规则投影后合并成一行）。
 
-还有七个**离线**脚本，直接 require 编译产物、不需要 daemon（运行步骤写在各自头部注释里）：
+还有九个**离线**脚本，直接 require 编译产物、不需要 daemon（运行步骤写在各自头部注释里）。
+下面清单里穿插的 `subagent-check.cjs` 归档用例与 `archive-registry-check.mjs` **不属于这九个**：
+前者是假 `dsh` 驱动的，后者要真 profile。
 
 - `harness/timeline-check.cjs` — `TimelineBuilder` 的工具行状态机：`tool/call` → `tool/result`、
   重复 `tool/call` 不能把完成行重置回 running 或清空输出、`turn/end`（含 `aborted`）要把仍
@@ -106,6 +109,21 @@ cd paseo-plugin && npx tsc --noEmit
 - `harness/sweep-check.cjs` — 原生扫光的几何：mask 曲线的停点、阶梯 alpha 的对称性与平铺、
   1.5s/0.3s/2-3 行程、`steps(48)`。**动了 `client/sweep-*.ts` 必跑。** iOS 上跑不了，这些
   数字就是"与 DSH 一致"的唯一凭据。
+- `harness/style-check.cjs` — `client/tokens.ts` 的共享样式常量表（Phase 1 把工具行每个数值
+  收进这里；13 还是 14、2×2 方块还是圆点、8% 还是 20% 底纹，漂移了在截图里都照样渲染，
+  所以断言表本身，React 组件刻意不断言）。**动了 `client/tokens.ts` 或行样式必跑。**
+- `harness/locale-check.cjs` — 客户端显示 locale 的纯函数解析链（`DSH_PASEO_LANG` 与
+  `LANG`/`LC_ALL` 的优先级）和标签表覆盖：每个工具名在**两种语言**下都要有值，英文列是
+  中文列的复制也要抓出来。**动了 `client/locale.ts` 或标签表必跑。**
+- `harness/context-usage-check.cjs` — 用编译后的真实 `DshSession`、只替换进程传输，断言
+  上下文占用的上报边界（打开会话上报已用量与容量、回合内合并更新、压缩后下降、未知容量
+  清除旧值、无效计数拒绝、切模型时迟到的旧响应不能覆盖、关闭后不再发）。参数是编译输出
+  目录：`node harness/context-usage-check.cjs <dir>`。**动了 `server/dsh-process.ts` 的用量
+  读取或 `DshSession` 的用量上报必跑。**
+
+离线清单之外还有三个容易被当成同类、其实不是的：`harness/tools.mjs`（真 `dsh` 的工具目录
+转储）、`harness/subagent-live.mjs`（实机子会话可见性）、`harness/fake-dsh-bridge.mjs`
+（上面几个假桥脚本共用的 scripted 替身，不是独立检查脚本）。
 
 客户端脉冲这条链最容易"看着对但静默失效"（`Animated` 在 RN Web 上只跑一段就停、`setValue`
 推不到原生 view、客户端不折叠只改 `metadata` 的 item），所以断言要打在数据层。
