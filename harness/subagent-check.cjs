@@ -468,6 +468,52 @@ async function openSession(conn, sessionId, history) {
       !replayed.some((e) => e.type === "timeline.item" && e.sessionId === childAScoped && /INHERITED-PARENT/.test(timelineText(e))),
   );
 
+  // ---- a child killed mid-turn: no terminal anywhere in its log ----------
+  // DSH appends no "the process died" fact, and a live child caught between two
+  // steps writes the very same tail (`step/start`, last turn never closed), so
+  // the stored shape alone cannot tell them apart. What can is the live channel:
+  // replay reads the durable catalog of a process that has just booted, where
+  // nothing is live. Without that, Paseo's default on attach is "running" and
+  // the row pulses forever.
+  const killedScoped = scoped(rootA, "child-K");
+  const killedTurns = replayed.filter((e) => e.type === "session.turn" && e.sessionId === killedScoped);
+  check(
+    "a replayed child whose log stops inside a turn is closed, not announced as running",
+    killedTurns.some((e) => e.state === "canceled") && !killedTurns.some((e) => e.state === "started"),
+    `turns=${JSON.stringify(killedTurns.map((e) => e.state))}`,
+  );
+  const killedItems = replayed.filter((e) => e.type === "timeline.item" && e.sessionId === killedScoped);
+  // The row is emitted running when its `tool/call` is replayed and then settled
+  // canceled; Paseo folds same-id items, so the *last* emission is the state the
+  // user sees. A row left running is the forever-pulsing bug.
+  const killedTool = killedItems.filter((e) => e.item?.callId === "ck-1");
+  check(
+    "and its tool call that never got a result is settled as canceled",
+    killedTool.length > 0 && killedTool[killedTool.length - 1].item?.status === "canceled",
+    JSON.stringify(killedTool.map((e) => e.item?.status)),
+  );
+  check(
+    "the killed child is still announced (closed, never hidden)",
+    replayed.some((e) => e.type === "session.opened" && e.sessionId === killedScoped && e.title === "Killed K"),
+  );
+
+  // ---- the same shape, but hosted live: it must stay running -------------
+  // The counter-case to the rule above. A child the bridge announced during this
+  // very open is live evidence; closing it would trade a stuck row for a lying
+  // one.
+  const liveScoped = scoped(rootA, "child-M");
+  check(
+    "a child the bridge hosts live keeps its open turn (same log shape, no cancel)",
+    !replayed.some((e) => e.type === "session.turn" && e.sessionId === liveScoped && e.state === "canceled"),
+    JSON.stringify(replayed.filter((e) => e.type === "session.turn" && e.sessionId === liveScoped).map((e) => e.state)),
+  );
+  const liveItems = replayed.filter((e) => e.type === "timeline.item" && e.sessionId === liveScoped);
+  check(
+    "and its in-flight tool row is left running",
+    liveItems.some((e) => e.item?.callId === "cm-1" && e.item?.status === "running"),
+    JSON.stringify(liveItems.map((e) => `${e.item?.type}/${e.item?.callId ?? "-"}=${e.item?.status ?? "-"}`)),
+  );
+
   const skipMark = events.length;
   await conn.send({ type: "session.open", requestId: "reopen-skip", sessionId: rootA, config: { cwd: process.cwd(), mode: "build" }, persistence: { version: 1, data: { sessionId: rootA } }, history: "skip" });
   await untilSince(skipMark, (e) => e.type === "session.ready" && e.sessionId === rootA, "skip ready", 30000);

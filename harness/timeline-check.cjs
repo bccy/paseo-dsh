@@ -7,6 +7,8 @@
  * - A tool call that never gets a result (an aborted turn takes the process with
  *   it) stayed `running` forever. The client pulses a running row with no time
  *   window, so that row blinked for the rest of the session and on every replay.
+ *   Both closures are asserted: `turn/end` (any reason) and `settleRunningTools`,
+ *   the replay path for a log that simply stops with no terminal at all.
  * - A repeated `tool/call` rebuilt the row from its input alone, which reset a
  *   finished tool to `running` and dropped the output it already carried.
  * - `tool/result` → `data.meta` (DSH's `presentationMeta`) was never read, so
@@ -200,6 +202,24 @@ console.log("replay of an interrupted session");
   call(replayed, "c9");
   const out = turnEnd(replayed, { kind: "aborted" });
   check("replay reaches canceled too", out[0]?.status === "canceled");
+}
+
+console.log("a log that simply stops closes its unfinished tools");
+{
+  // A killed process never appends `turn/end`, so the replay that folds its log
+  // has to settle the rows whose `tool/result` can never arrive — otherwise the
+  // client pulses them with no time window for the rest of the session.
+  const builder = new TimelineBuilder();
+  call(builder, "k1");
+  const out = builder.settleRunningTools();
+  check("the unfinished tool becomes canceled", out[0]?.status === "canceled" && out[0]?.error === null, JSON.stringify(out[0]));
+  check("the row keeps its call id and detail", out[0]?.callId === "k1" && out[0]?.detail !== undefined);
+  check("settling twice emits nothing the second time", builder.settleRunningTools().length === 0);
+
+  const finished = new TimelineBuilder();
+  call(finished, "k2");
+  result(finished, "k2");
+  check("a tool that already has its result is untouched", finished.settleRunningTools().length === 0);
 }
 
 console.log("the description rides on provider metadata");

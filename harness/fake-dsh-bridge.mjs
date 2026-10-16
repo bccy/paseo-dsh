@@ -16,7 +16,10 @@
  *            *before* its parent's child-opened, with its earliest message and
  *            status first, so the plugin must hold and release the subtree
  *   replay   answer `paseo/subagents`/`paseo/history` (child-A has an inherited
- *            fork prefix) so a reopen can rebuild the tree
+ *            fork prefix) so a reopen can rebuild the tree; the listing also
+ *            carries a killed child whose log stops inside a turn with no
+ *            terminal, and a live child with the same shape that the bridge
+ *            announces during the open, so the two can be told apart
  *   error    answer `paseo/subagents` with `available: false` and an error
  *   steer    hold one root turn open while a foreground child runs, so a steer
  *            sent into that turn can be judged against the turn id the daemon
@@ -81,6 +84,7 @@ function logFrame(method, params) {
 
 let rootId = null;
 let emitted = false;
+let liveChildEmitted = false;
 let rootTurnOpen = false;
 let promptAttempts = 0;
 
@@ -94,6 +98,33 @@ const childAEvents = () => [
 const childBEvents = () => [
   { type: "assistant/message", seq: 1, data: { turn: 1, step: 1, message: { id: "bm1", content: [{ type: "text", text: "child B answer" }] } } },
   { type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "aborted", reason: { kind: "user" } } } },
+];
+/**
+ * A child killed mid-turn, in the exact shape a real killed subagent leaves
+ * behind: the log stops on a `step/start`, the last turn was never closed with
+ * `turn/end`, and one `tool/call` never got its `tool/result`.
+ *
+ * The shape is deliberately identical to a *live* child caught between steps,
+ * because that is the point: DSH appends no "the process died" fact, so the log
+ * alone cannot tell the two apart — only the live channel can.
+ */
+const killedChildEvents = () => [
+  { type: "subagent/descriptor", seq: 0, data: { label: "Killed K" } },
+  { type: "turn/start", seq: 1, data: { turn: 1 } },
+  { type: "step/start", seq: 2, data: { turn: 1, step: 1 } },
+  { type: "assistant/message", seq: 3, data: { turn: 1, step: 1, message: { id: "kk1", content: [{ type: "text", text: "killed child line" }] } } },
+  { type: "tool/call", seq: 4, data: { turn: 1, step: 1, callId: "ck-1", name: "bash", arguments: { command: "sleep 999" } } },
+  { type: "step/end", seq: 5, data: { turn: 1, step: 1 } },
+  { type: "step/start", seq: 6, data: { turn: 1, step: 2 } },
+];
+/** The same unterminated shape, for a child the bridge *is* hosting live. */
+const liveChildEvents = () => [
+  { type: "subagent/descriptor", seq: 0, data: { label: "Live M" } },
+  { type: "turn/start", seq: 1, data: { turn: 1 } },
+  { type: "step/start", seq: 2, data: { turn: 1, step: 1 } },
+  { type: "tool/call", seq: 3, data: { turn: 1, step: 1, callId: "cm-1", name: "bash", arguments: { command: "sleep 999" } } },
+  { type: "step/end", seq: 4, data: { turn: 1, step: 1 } },
+  { type: "step/start", seq: 5, data: { turn: 1, step: 2 } },
 ];
 const rootEvents = () => [
   { type: "user/message", seq: 1, data: { source: { kind: "user" }, content: [{ type: "text", text: "hello root" }] } },
@@ -275,6 +306,15 @@ async function handle(method, params, id) {
     case "paseo/catalog":
       return { providers: [], models: [], planMode: false };
     case "paseo/commands": {
+      // A child this bridge is *hosting* right now is announced during the open
+      // (the notice precedes the reply, so it is buffered and registered before
+      // the replay runs). Its stored log has the same unterminated shape as the
+      // killed child below, and it must stay running: only a turn no live
+      // channel vouches for may be closed by the replay.
+      if (MODE === "replay" && !liveChildEmitted && rootId !== null) {
+        liveChildEmitted = true;
+        notify("session.child-opened", { sessionId: "child-M", parentSessionId: rootId, mode: "continuable", label: "Live M", cwd: "/tmp" });
+      }
       if (MODE === "early" && !emitted) {
         emitted = true;
         setTimeout(() => { void emitEarly(); }, 0);
@@ -329,6 +369,14 @@ async function handle(method, params, id) {
           // Archived in DSH's own registry: it must not be announced again, or
           // "archive all" would be undone by the next replay.
           { sessionId: "child-Z", parentSessionId: "child-A", mode: "one-shot", archived: true },
+          // Hosted live right now (announced during the open) *and* listed in
+          // the durable catalog with an unterminated log: the live channel is
+          // the evidence that its open turn is real.
+          { sessionId: "child-M", parentSessionId: String(params?.sessionId ?? ""), mode: "continuable", label: "Live M" },
+          // Killed mid-turn: in the durable catalog only, its log stops with no
+          // terminal. Nothing live vouches for it, so it must not be announced
+          // as running.
+          { sessionId: "child-K", parentSessionId: String(params?.sessionId ?? ""), mode: "continuable", label: "Killed K" },
         ],
       };
     case "paseo/history": {
@@ -355,6 +403,9 @@ async function handle(method, params, id) {
           ],
         };
       }
+      // Both end inside an open turn; only child-M has live evidence.
+      if (sid === "child-M") return { available: true, inheritedEventCount: 0, events: liveChildEvents() };
+      if (sid === "child-K") return { available: true, inheritedEventCount: 0, events: killedChildEvents() };
       return { available: true, inheritedEventCount: 0, events: rootEvents() };
     }
     case "session/prompt":

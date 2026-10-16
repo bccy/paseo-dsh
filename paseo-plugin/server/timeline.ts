@@ -571,6 +571,19 @@ export class TimelineBuilder {
     }
   }
 
+  /**
+   * Close every tool call still running because no `turn/end` will ever arrive.
+   *
+   * The same closure {@link #turnEnd} performs, exposed for a replay whose
+   * stored log simply stops: a killed process leaves a running tool row behind,
+   * and Paseo's client pulses a running row with no time window, so without this
+   * it blinks for the rest of the session and on every reopen. Idempotent — a
+   * closed row leaves the running set.
+   */
+  settleRunningTools(): ProviderTimelineItem[] {
+    return this.#cancelRunningTools();
+  }
+
   #put(item: ProviderTimelineItem): ProviderTimelineItem[] {
     if (item.type === "tool_call") {
       if (item.status === "running") this.#runningTools.add(item.callId);

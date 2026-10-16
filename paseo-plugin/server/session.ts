@@ -475,6 +475,8 @@ export class DshSession {
    * in pre-order so a nested child's parent view exists first. A child's own
    * suffix (past its fork-inherited prefix) is replayed, and its last `turn/end`
    * restores the terminal status, so a finished child is never stuck "running".
+   * A suffix with *no* terminal at all (a killed child) is closed as canceled
+   * instead of being announced as running — see {@link DshChildSession.replay}.
    * Live children that appear after this are handled by {@link #onChildOpened}.
    */
   async replaySubagents(): Promise<void> {
@@ -528,6 +530,15 @@ export class DshSession {
         continue;
       }
       if (this.#closed) return;
+      // The only proof that a child's open turn is still real is the *live*
+      // channel: the bridge announced that child, or streamed its frames, in
+      // this process. A durable catalog row is not proof — nothing is live in a
+      // process that just booted, DSH's `listDescendants` never loads or resumes
+      // a child agent, and a stored log that simply stops inside a turn is
+      // exactly what a killed child leaves behind. Sampled here, after the
+      // history read, so no await can interleave between the check and the
+      // replay that consumes it.
+      const announcedLive = this.#children.has(row.sessionId);
       // A one-shot child has no label in the durable catalog — DSH only requires
       // one for a continuable child — but the child's own `subagent/descriptor`
       // carries its creation label. Read it from the history *before* opening:
@@ -545,7 +556,7 @@ export class DshSession {
         this.#options.log(`subagent ${row.sessionId} has an unresolved parent ${row.parentSessionId}`);
         continue;
       }
-      child.replay(history.events, history.inheritedEventCount);
+      child.replay(history.events, history.inheritedEventCount, announcedLive);
     }
   }
 
@@ -1364,6 +1375,15 @@ export class DshChildSession {
   #turnEnded = false;
   #lastUsage: ProviderUsage | undefined;
   #opened = false;
+  /**
+   * Whether the live channel has carried a frame for this child.
+   *
+   * Set by {@link event} / {@link status}, which only ever receive frames the
+   * bridge pushed for a child it is hosting. It is the positive half of the
+   * replay rule: a stored log that stops inside a turn is a killed child unless
+   * this child is demonstrably live here.
+   */
+  #observedLive = false;
 
   constructor(options: DshChildSessionOptions) {
     this.id = options.id;
@@ -1402,6 +1422,7 @@ export class DshChildSession {
   /** Fold one native child session event into this child's timeline. */
   event(event: { type: string; [key: string]: unknown }): void {
     if (this.#options.closed()) return;
+    this.#observedLive = true;
     // The real turn terminal comes from `turn/end`, not from an idle status:
     // a failed, aborted, or token-capped turn must not read as completed.
     if (event.type === "turn/end") {
@@ -1430,6 +1451,7 @@ export class DshChildSession {
   /** Mirror the child's own agent lifecycle into its turn state. */
   status(status: string): void {
     if (this.#options.closed()) return;
+    this.#observedLive = true;
     if (status === "running") {
       if (this.#turnId === null) {
         this.#turnId = `turn:${Date.now()}`;
@@ -1457,19 +1479,42 @@ export class DshChildSession {
    * replayed, so a forked child does not re-show its parent's conversation or a
    * sibling's tool work as its own. The last `turn/end` in the own suffix
    * restores the terminal status.
+   *
+   * A suffix that carries *no* terminal — the last bracket is a `turn/start`, or
+   * the log never closed a turn at all — is not evidence of life. A child that
+   * is still running writes the same tail (a live agent between two steps ends
+   * on `step/start`), so the shape alone cannot tell the two apart, and DSH
+   * appends no "the process died" fact. The live channel is the only proof, so
+   * `live` (the bridge announced this child in this process) and
+   * {@link #observedLive} gate the decision: with no such proof the turn is
+   * closed as `canceled`, exactly the status Paseo's own adapters give an
+   * interrupted turn, instead of leaving the row pulsing forever — Paseo's
+   * default on attach is "running" and its host only consumes a *terminal*
+   * `session.turn`.
+   *
+   * @param live - positive live-channel evidence for this child, from the caller
+   *   that read the durable catalog.
    */
-  replay(events: Array<{ type: string; seq?: number; time?: number; data: unknown }>, inheritedEventCount = 0): void {
+  replay(
+    events: Array<{ type: string; seq?: number; time?: number; data: unknown }>,
+    inheritedEventCount = 0,
+    live = false,
+  ): void {
     if (this.#options.closed()) return;
     let fallbackSeq = 0;
     let lastTurnEnd: "completed" | "canceled" | "failed" | undefined;
     let turnOpen = false;
+    let sawTurn = false;
     for (const event of events) {
       const seq = typeof event.seq === "number" ? event.seq : fallbackSeq++;
       if (seq < inheritedEventCount) continue;
       const data = isRecord(event.data) ? event.data : {};
-      if (event.type === "turn/start") turnOpen = true;
-      else if (event.type === "turn/end") {
+      if (event.type === "turn/start") {
+        turnOpen = true;
+        sawTurn = true;
+      } else if (event.type === "turn/end") {
         turnOpen = false;
+        sawTurn = true;
         lastTurnEnd = childTurnState(data.reason);
       }
       if (event.type === "user/message") {
@@ -1488,19 +1533,43 @@ export class DshChildSession {
         this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
       }
     }
-    // A closed turn restores its terminal status; an open turn stays "running"
-    // (Paseo's default on attach). Only the terminal is emitted, so a failed or
-    // cancelled child is never shown as completed.
+    // The stored log's own terminal: only the terminal is emitted, so a failed
+    // or cancelled child is never shown as completed.
     if (!turnOpen && lastTurnEnd !== undefined) {
-      this.#turnId = null;
-      this.#turnEnded = true;
-      this.#options.emit({
-        type: "session.turn",
-        sessionId: this.id,
-        turnId: `replay:${this.id}`,
-        state: lastTurnEnd,
-      });
+      this.#endReplayedTurn(lastTurnEnd);
+      return;
     }
+    // Nothing in the suffix closes the turn (an open last turn, or no turn at
+    // all). Only positive live evidence may leave that as "running" — Paseo's
+    // default on attach; without it the child is closed as canceled rather than
+    // announced as something still running.
+    if (turnOpen || !sawTurn) {
+      if (live || this.#observedLive) return;
+      this.#options.log(
+        `subagent ${this.nativeId}: stored history ends with no turn terminal ` +
+          `(${turnOpen ? "the last turn was never closed" : "no turn was ever recorded"}); ` +
+          "closing it as canceled",
+      );
+      // The rows of a tool whose `tool/result` can never arrive would pulse
+      // forever too, so they are settled with the same status `turn/end` gives
+      // an aborted turn.
+      for (const item of this.#timeline.settleRunningTools()) {
+        this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
+      }
+      this.#endReplayedTurn("canceled");
+    }
+  }
+
+  /** Emit the single terminal `session.turn` a replay restores. */
+  #endReplayedTurn(state: "completed" | "canceled" | "failed"): void {
+    this.#turnId = null;
+    this.#turnEnded = true;
+    this.#options.emit({
+      type: "session.turn",
+      sessionId: this.id,
+      turnId: `replay:${this.id}`,
+      state,
+    });
   }
 
   // --- read-only surface: a child is never driven from Paseo ---
