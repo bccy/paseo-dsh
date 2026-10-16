@@ -1134,6 +1134,40 @@ catalog/sessions/archive 探测是 `initializeRoute: false` 起的——**刻意
 `composes no workspace registry`），再发一次 `paseo/unarchive`（不存在的 id 是幂等 no-op，
 返回 `available:true` 且不写任何状态）。修复前 0/2，修复后 2/2。
 
+#### 39c. 归档判定要照抄 DSH 的血缘规则，不能只看集合成员
+
+`archivedSessionIds` 里只记**被点名的** id，但 DSH 判定"这个会话是否处于归档之下"用的是
+session controller 的 `underArchivedSession`：沿 `origin:"subagent"` + `parentSession` 的血缘
+往上走，**任一祖先被归档就算**（fork 不继承；环路只访问一次）。也就是说归档一个根会话，
+它整棵子代理树在 gate 看来都已归档，而集合里只有根那一个 id。
+
+桥原先在两处都做**精确匹配** `archived.has(id)`，和这个语义不一致：
+
+- `paseo/subagents` 的 `archived` 标记 → 归档根之后，子会话仍被当作未归档，重放会把它们
+  重新播报（正是"归档后又复活"的一半原因）；
+- `listSessions` 的导入过滤 → 归档根之后，它的子会话仍出现在 Paseo 的导入列表里。
+
+**修法**：把规则抽成不依赖 DSH 包的纯模块 `dsh-bridge/lib/archived-lineage.js`
+（`underArchivedSession(headers, archivedIds, sessionId)`，逐字移植），桥再补两个私有 helper
+——`#archivedSessionIds()`（registry 读不到时给空集，保持"不过滤"的旧语义）与
+`#sessionHeaders()`（先读 `sessionPersistence.list()`，再叠上 live `sessions.list()`，因为
+子会话的祖先通常已经不 live，只有落盘 header 才走得上去）。`listSessions` 和
+`paseo/subagents` 都改用它。
+
+**同时留个记录**：Paseo 客户端目前**不会**对 provider 子代理发归档请求。它的
+`createArchiveFinishedSubagents` 把行分成两类——`kind:"paseo"`（真 agent，走
+`archiveAgent` → provider 原生归档）和 `kind:"provider"`（provider 子会话，走
+`useProviderSubagentStore.hideFromTrack(...)`，**只写客户端内存 Set，没有持久化、也不发请求**）。
+opencode 的 Task 子代理和 DSH 的原生子代理都属于后者（0.11.2 与 0.11.4 代码相同）。所以插件
+这一侧是"能力已备、入口未接"：Paseo 一旦补上 dismiss/archive 请求（或把 `hiddenFromTrack`
+持久化），`session.archive`/`unarchive` + persistence 句柄就能直接生效。
+
+**验证**：新增 `harness/archived-lineage-check.mjs` **12/12**（自身/父/祖父归档、无关 id、
+fork 不继承、环路终止、未知 header、Set/数组、空集）；真机 `dsh --profile paseo` 上对
+`6d0a20ce` 做往返——归档根前两个子会话 `archived=false`，归档根后变 `archived=true`，
+取消归档后回到 `false`，且 `workspace.json` 不留副作用；`subagent-check.cjs` **48/48**、
+`archive-registry-check.mjs` 2/2、`tsc --noEmit` 干净；内嵌桥（6 个文件）已重生成。
+
 ---
 
 ## 已知限制（未修，有意为之）

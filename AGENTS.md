@@ -99,6 +99,10 @@ cd paseo-plugin && npx tsc --noEmit
   ——它把 `paseo/archive` 作为**第一帧**发（不发 `initialize`，和插件的一次性 probe 同形状），
   断言请求到达了真 registry。`@deepseek-ai/dsh-workspace` 只在 web bundle 里，缺了就是
   "composes no workspace registry"；桥入口漏等 profile 装载时则是**不发 initialize 就必现**。
+- `harness/archived-lineage-check.mjs` — 纯模块离线检查（无需 profile/daemon）：桥里的
+  `dsh-bridge/lib/archived-lineage.js` 必须逐字等价于 DSH 的 `underArchivedSession`——自身
+  或任一 `origin:"subagent"` 祖先在 `archivedSessionIds` 即算已归档，fork 不继承、环路要终止。
+  **动了这个模块、`listSessions` 的归档过滤或 `paseo/subagents` 的 `archived` 判定必跑。**
 - `harness/sweep-check.cjs` — 原生扫光的几何：mask 曲线的停点、阶梯 alpha 的对称性与平铺、
   1.5s/0.3s/2-3 行程、`steps(48)`。**动了 `client/sweep-*.ts` 必跑。** iOS 上跑不了，这些
   数字就是"与 DSH 一致"的唯一凭据。

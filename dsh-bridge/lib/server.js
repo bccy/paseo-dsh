@@ -21,6 +21,7 @@ import { brandString } from '@deepseek-ai/dsh-brand';
 import { BlockAssembler, createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { admitEncodedImages } from '@deepseek-ai/dsh-attachment';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
+import { underArchivedSession } from './archived-lineage.js';
 
 function encodedImage(block) {
   return block.type === 'image' && 'data' in block;
@@ -635,6 +636,56 @@ export class PaseoHarnessServer {
   }
 
   /**
+   * DSH's registry-global archive set, as strings. An unreadable registry
+   * yields an empty set: callers then filter nothing, which is the honest
+   * answer when the state cannot be read.
+   */
+  #archivedSessionIds() {
+    try {
+      const registry = this.ctx.get('workspaceRegistry');
+      if (registry !== undefined) return new Set([...registry.archivedSessionIds].map(String));
+    } catch {
+      // fall through to the empty set
+    }
+    return new Set();
+  }
+
+  /**
+   * Durable headers for every Session this runtime can see, keyed by id.
+   *
+   * The archive-lineage rule walks `origin: 'subagent'` + `parentSession`
+   * through headers, and a descendant's ancestors are usually NOT live (they
+   * settled), so stored snapshots are what make the walk reach the root. Live
+   * headers are layered on top because DSH's own gate reads the live object.
+   */
+  async #sessionHeaders() {
+    const headers = new Map();
+    const persistence = this.ctx.get('sessionPersistence');
+    if (persistence !== undefined) {
+      try {
+        for (const snapshot of await persistence.list()) {
+          const header = snapshot?.header;
+          if (header?.id !== undefined) headers.set(String(header.id), header);
+        }
+      } catch {
+        // A storage fault leaves the walk to whatever it already has.
+      }
+    }
+    try {
+      const sessions = this.ctx.get('sessions');
+      if (sessions !== undefined) {
+        for (const session of sessions.list()) {
+          const header = session?.header;
+          if (header?.id !== undefined) headers.set(String(header.id), header);
+        }
+      }
+    } catch {
+      // Optional peer: its absence only narrows the walk.
+    }
+    return headers;
+  }
+
+  /**
    * List the DSH sessions a user can import into Paseo. Reads the persistence
    * backend directly: the session-query corpus is not mounted for listing here
    * (`openAt: never`), and it hangs rather than answering. Titles are
@@ -656,17 +707,18 @@ export class PaseoHarnessServer {
     // field for it (`ProviderSessionSummary` is persistence/cwd/title/description/
     // updatedAt), so the only honest way to mirror it is to leave archived
     // sessions out — which is also DSH's own default view ("隐藏已归档").
-    let archived = new Set();
-    try {
-      const registry = this.ctx.get('workspaceRegistry');
-      if (registry !== undefined) archived = new Set([...registry.archivedSessionIds].map(String));
-    } catch {
-      // Unreadable state leaves the list unfiltered rather than silently empty.
-    }
+    // The rule is DSH's lineage one, not exact membership: a subagent session
+    // whose root is archived is hidden with it, exactly as the gate blocks it.
+    const archived = this.#archivedSessionIds();
+    const headers = new Map(
+      snapshots
+        .filter((snapshot) => snapshot?.header?.id !== undefined)
+        .map((snapshot) => [String(snapshot.header.id), snapshot.header]),
+    );
     for (const snapshot of snapshots) {
       const id = snapshot?.header?.id === undefined ? undefined : String(snapshot.header.id);
       if (id === undefined || id === '') continue;
-      if (archived.has(id)) continue;
+      if (underArchivedSession(headers, archived, id)) continue;
       if (cwdFilter !== undefined && snapshot.header.cwd !== cwdFilter) continue;
       if (query !== undefined && !id.toLowerCase().includes(query)) continue;
       candidates.push(snapshot);
@@ -823,14 +875,11 @@ export class PaseoHarnessServer {
     // DSH's own archive state, so a replayed child that was archived is not
     // announced again: Paseo drops what the provider stops reporting, and
     // re-announcing it is exactly what resurrected an archived subagent.
-    let archived = new Set();
-    try {
-      const registry = this.ctx.get('workspaceRegistry');
-      if (registry !== undefined) archived = new Set([...registry.archivedSessionIds].map(String));
-    } catch {
-      // A runtime without a readable registry leaves every child unarchived,
-      // which is the honest answer when the state cannot be read.
-    }
+    // The lineage rule matters here too — archiving a root archives its whole
+    // subagent tree as far as DSH's gate is concerned, so the replay must skip
+    // descendants whose own id was never added to the set.
+    const archived = this.#archivedSessionIds();
+    const headers = await this.#sessionHeaders();
     try {
       const rows = await subagents.listDescendants(params.sessionId);
       return {
@@ -842,7 +891,7 @@ export class PaseoHarnessServer {
             parentSessionId: String(row.parentId),
             ...(row.mode === undefined ? {} : { mode: row.mode }),
             ...(row.label === undefined ? {} : { label: row.label }),
-            ...(archived.has(String(row.id)) ? { archived: true } : {}),
+            ...(underArchivedSession(headers, archived, String(row.id)) ? { archived: true } : {}),
           })),
         diagnostics: rows
           .filter((row) => row.kind !== 'child')
