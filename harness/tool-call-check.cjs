@@ -322,5 +322,56 @@ console.log("a row only expands onto something");
   }
 }
 
+console.log("DSH's own tools are not anonymous");
+{
+  // They arrive with an `unknown` detail — exactly like an MCP call — so without
+  // a name mapping both rendered as `wrench <raw_name>` and the two were
+  // indistinguishable. DSH titles them through `tool.title.*`; these are those
+  // names in Chinese.
+  equal("update_goal has a label", toolLabel("update_goal"), "更新目标");
+  equal("and its own icon", toolIcon("update_goal", { type: "unknown" }), "Target");
+  equal("get_goal too", toolIcon("get_goal", undefined), "Target");
+  equal("create_goal too", toolLabel("create_goal"), "创建目标");
+  equal("a schedule tool", toolIcon("schedule_create", { type: "unknown" }), "CalendarClock");
+  equal("a terminal tool", toolIcon("terminal_read", { type: "unknown" }), "SquareTerminal");
+  equal("a background job", toolIcon("job_output", { type: "unknown" }), "Timer");
+  equal("a plugin tool", toolIcon("cordis_run", { type: "unknown" }), "Plug");
+  equal("a session tool", toolLabel("session_search"), "搜索会话");
+  equal("reading an image", toolLabel("read_image"), "读取图片");
+
+  // An MCP call is not a DSH tool: it keeps the raw name and the wrench.
+  equal("an MCP call is still its raw name", toolLabel("mcp__paseo__list_workspaces"), "mcp__paseo__list_workspaces");
+  equal("and the wrench", toolIcon("mcp__paseo__list_workspaces", { type: "unknown" }), "Wrench");
+
+  // A typed detail still wins: the name map only fills the `unknown` gap.
+  equal("a typed detail keeps its own icon", toolIcon("bash", { type: "shell" }), "SquareTerminal");
+}
+
+console.log("the title is not repeated when the block carries it");
+{
+  const described = toolCallData(
+    {
+      name: "bash",
+      status: "completed",
+      detail: { type: "shell", command: "pwd", output: "/tmp" },
+      metadata: { description: "List DSH checkout root" },
+    },
+    "complete",
+  );
+  equal("a described row is titled", described.titled, true);
+
+  const bare = toolCallData(
+    {
+      name: "update_goal",
+      status: "completed",
+      detail: { type: "unknown", input: { action: "complete" }, output: "ok" },
+    },
+    "complete",
+  );
+  equal("a description-less row is not", bare.titled, false);
+  equal("its title is the subject", bare.summary, '{"action":"complete"}');
+  check("and the block carries the same subject in full", bare.headline.includes("\n"), JSON.stringify(bare.headline));
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

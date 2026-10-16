@@ -873,7 +873,7 @@ MCP 调用的详情是 `{type:"unknown", input, output}`（`toolDetail` 的 defa
 `workspaces` 数组；命令行展开后文本是 `命令|展开 MCP 行并前后对比|cd /tmp && cat > ...`
 （**中文描述还在**，后接命令与输出），且行内命中一个背景为 `rgba(127, 127, 127, 0.1)` 的代码表面。
 
-**验证**：`harness/tool-call-check.cjs` 66/66。除了 unknown 分支（紧凑标题 / 精确的美化 body /
+**验证**：`harness/tool-call-check.cjs` 83/83。除了 unknown 分支（紧凑标题 / 精确的美化 body /
 美化 headline / 字符串结果原样 / 空入参不出现在标题 / running 时无 body），还补了三条本轮
 审核揪出来的用例：**带 description 的 MCP 调用 headline 仍必须美化**（否则退回几千字符的一行）、
 **`/命令` 的 `text` 必须进 body**（否则输出永远不显示）、**不可序列化入参报占位串而不是静默消失**。
@@ -890,6 +890,37 @@ MCP 调用的详情是 `{type:"unknown", input, output}`（`toolDetail` 的 defa
 - `emptyInput` 收窄为"非数组的空对象"。
 - 块内 headline 加 `selectable`（那是最值得复制的一行）；删掉已成死代码的 `styles.bodyText`；
   修正 `code` 字段的注释（现在所有展开都走代码表面，渲染层不再读它）。
+
+### 34. DSH 原生工具被当成 MCP 渲染；展开时标题被挤成一列
+
+**一、原生工具和 MCP 工具长得一模一样**
+
+服务端 `toolDetail` 只显式处理 13 个名字（`bash`/`pwsh`/`read`/`write`/`edit`/`grep`/`glob`/
+`web_search`/`web_fetch`/`todo_write`/`ask_user_question`/`exit_plan_mode`/`subagent`），其余全部
+落到 `default` → `{type:"unknown"}`。于是 **DSH 自己的工具**（`get_goal`/`update_goal`/
+`schedule_*`/`job_*`/`terminal_*`/`session_*`/`cordis_*`…）和**真正的 MCP 调用**走同一条渲染
+路径：通用扳手 + 原始工具名 + 原始 JSON，用户根本分不出哪个是哪个。
+
+DSH 的客户端里有一张权威表（`dsh-client-ui-tool` 的 `tool.title.*` 映射，共 51 个工具），按它
+给原生工具补了中文名与图标（goal 家族 → `Target`，schedule → `CalendarClock`，job → `Timer`，
+terminal → `SquareTerminal`，session → `History`，cordis → `Plug`…）。名字映射**只在 detail 是
+`unknown` 时生效**，typed detail（shell/read/edit…）本来就有更准的图标；MCP 调用不在这张表里，
+所以仍然是原始名字 + 扳手 —— 这正是我们要的区分。
+
+**二、展开时标题被挤成一条窄列**
+
+头部是 flex row：`[图标][标签][摘要]`。标签很长（`mcp__paseo__create_heartbeat`）而摘要又是
+一长串 JSON 时，摘要只分到很窄的宽度，于是**一个字符一行地竖着排下来**，看起来像坏了
+（用户："点开会并行显示"）。
+
+修法：展开时文本容器从 row 换成 **column** —— 标签一行、摘要**另起一行占满宽度**（`numberOfLines`
+也不限）。同时补了一条：**展开块已经承载同样内容时不再重复显示摘要**（无 description 的行，
+摘要就是工具主体，而块里的 headline 是它的完整形式；有 description 的行，摘要才是真正的标题，
+必须留着——这就是第 33 条一的要求）。判据做成数据字段 `titled`，可离线断言。
+
+**验证**：`harness/tool-call-check.cjs` 83/83（新增 17 条：原生工具的标签/图标、
+MCP 仍是原始名 + 扳手、typed detail 不被名字映射覆盖、`titled` 的两种取值、
+以及"块已承载时标题是主体"）。
 
 ---
 

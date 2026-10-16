@@ -40,6 +40,9 @@ export function InlineToolCall({
   // Even a tool with no output can have a command longer than the row, so it
   // must still be expandable: expanding lays the full command out below.
   const canExpand = hasBody || data.summary !== "" || data.headline !== "";
+  // Once expanded the block carries the subject in full, so a row whose title
+  // *is* that subject does not repeat a compact copy of it above.
+  const showSummary = data.summary !== "" && !(expanded && !data.titled && data.headline !== "");
   const compact = layout.compact;
   const iconSize = compact ? 14 : 16;
   // Only the newest row is "running": while it runs, and for a window after it
@@ -52,8 +55,16 @@ export function InlineToolCall({
     () => ({
       root: { gap: 3, paddingVertical: compact ? 3 : 5 },
       head: { flexDirection: "row" as const, gap: 8, alignItems: "center" as const },
-      // The text run, and the flex row the shimmer's copy re-lays-out.
+      // The text run, and the two flex layouts the shimmer's copy re-lays-out:
+      // one line while collapsed, title over subject once expanded.
       text: { flexDirection: "row" as const, gap: 8, alignItems: "center" as const, flex: 1, minWidth: 0 },
+      textColumn: {
+        flexDirection: "column" as const,
+        gap: 2,
+        alignItems: "flex-start" as const,
+        flex: 1,
+        minWidth: 0,
+      },
       label: { color: theme.colors.foregroundMuted, fontSize: compact ? 13 : 14 },
       summary: {
         color: theme.colors.foregroundMuted,
@@ -64,6 +75,7 @@ export function InlineToolCall({
         minWidth: 0,
       },
       body: { marginLeft: compact ? 10 : 12, gap: 2 },
+      summaryBlock: { flex: 0, alignSelf: "stretch" as const },
       summaryFull: {
         color: theme.colors.foregroundMuted,
         fontFamily: "monospace" as const,
@@ -120,21 +132,26 @@ export function InlineToolCall({
         />
         <TextShimmer
           active={running}
-          contentStyle={styles.text}
+          contentStyle={expanded ? styles.textColumn : styles.text}
           highlightColor={theme.colors.foreground}
           surfaceColor={theme.colors.surface0}
         >
           {(color) => (
             <>
               <Text style={[styles.label, color === null ? null : { color }]}>{data.label}</Text>
-              {/* The row's title never disappears: expanding reveals the tool's
-                  own subject below, so hiding this left the row unnamed — DSH
-                  keeps the title and puts the command in the block under it.
-                  Expanded it wraps instead of clipping, which is where a long
-                  command that has no description becomes readable. */}
-              {data.summary !== "" ? (
+              {/* The row's title never disappears: hiding it left the row
+                  unnamed. Expanded it drops to its own full-width line instead
+                  of being squeezed beside the label — a long JSON there wrapped
+                  one character per line. The one case it is dropped is when the
+                  block below already carries the same subject in full, so a
+                  description-less row does not print its arguments twice. */}
+              {showSummary ? (
                 <Text
-                  style={[styles.summary, color === null ? null : { color }]}
+                  style={[
+                    styles.summary,
+                    color === null ? null : { color },
+                    expanded ? styles.summaryBlock : null,
+                  ]}
                   numberOfLines={expanded ? undefined : 1}
                 >
                   {data.summary}

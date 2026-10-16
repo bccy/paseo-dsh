@@ -31,6 +31,14 @@ export interface ToolCallData {
   code: boolean;
   failed: boolean;
   /**
+   * Whether the row's title is a description rather than the tool's own subject.
+   *
+   * When it is not, the title *is* the subject, and the expanded block carries
+   * that same subject in its full form — so the head drops the line instead of
+   * printing a compact copy next to a pretty one.
+   */
+  titled: boolean;
+  /**
    * Whether expanding reveals anything beyond the title.
    *
    * A row whose only content is its title is still expandable — the title then
@@ -58,6 +66,93 @@ const TOOL_LABELS: Record<string, string> = {
   ask_user_question: "提问",
   exit_plan_mode: "计划",
   subagent: "子代理",
+  // DSH's own tools. Its UI titles these through `tool.title.*`; these are the
+  // same names in Chinese, so a DSH tool row reads as a DSH tool rather than as
+  // an anonymous `wrench <raw_name>` — which is what every MCP-shaped row looks
+  // like too, and the two are not the same thing.
+  create_goal: "创建目标",
+  get_goal: "查看目标",
+  update_goal: "更新目标",
+  read_image: "读取图片",
+  schedule_create: "创建定时任务",
+  schedule_list: "列出定时任务",
+  schedule_update: "更新定时任务",
+  schedule_delete: "删除定时任务",
+  list_agents: "列出 agent",
+  send_message: "给 agent 发消息",
+  interrupt_agent: "打断 agent",
+  list_subagent_models: "列出子代理模型",
+  job_list: "列出后台任务",
+  job_output: "读取后台任务",
+  job_kill: "终止后台任务",
+  terminal_open: "打开终端",
+  terminal_read: "读取终端",
+  terminal_list: "列出终端",
+  terminal_signal: "发送终端信号",
+  terminal_close: "关闭终端",
+  workflow: "工作流",
+  ralph: "循环执行",
+  session_search: "搜索会话",
+  session_trace: "追踪会话",
+  session_event_read: "读取会话事件",
+  session_event_search: "搜索会话事件",
+  session_event_trace: "追踪会话事件",
+  cordis_run: "启动插件",
+  cordis_stop: "停止插件",
+  cordis_undefine: "卸载插件",
+  cordis_package_inspect: "检查插件包",
+  cordis_runtime_inspect: "检查运行时",
+  cordis_inspect_list: "列出 provider",
+  cordis_inspect_query: "查询运行时",
+  cordis_inspect_self: "检查插件",
+};
+
+/**
+ * Icons for DSH's own tools, which arrive with an `unknown` detail.
+ *
+ * Without this every one of them fell through to the wrench — the same glyph
+ * MCP tools get — so a goal update and an MCP call were indistinguishable.
+ */
+const TOOL_NAME_ICONS: Record<string, string> = {
+  create_goal: "Target",
+  get_goal: "Target",
+  update_goal: "Target",
+  read_image: "Image",
+  todo_write: "ListChecks",
+  ask_user_question: "MessageCircleQuestion",
+  exit_plan_mode: "ClipboardCheck",
+  subagent: "Bot",
+  list_agents: "Bot",
+  send_message: "Bot",
+  interrupt_agent: "Bot",
+  list_subagent_models: "Bot",
+  job_list: "Timer",
+  job_output: "Timer",
+  job_kill: "Timer",
+  terminal_open: "SquareTerminal",
+  terminal_read: "SquareTerminal",
+  terminal_list: "SquareTerminal",
+  terminal_signal: "SquareTerminal",
+  terminal_close: "SquareTerminal",
+  schedule_create: "CalendarClock",
+  schedule_list: "CalendarClock",
+  schedule_update: "CalendarClock",
+  schedule_delete: "CalendarClock",
+  workflow: "Workflow",
+  ralph: "Repeat",
+  session_search: "History",
+  session_trace: "History",
+  session_event_read: "History",
+  session_event_search: "History",
+  session_event_trace: "History",
+  cordis_run: "Plug",
+  cordis_stop: "Plug",
+  cordis_undefine: "Plug",
+  cordis_package_inspect: "Plug",
+  cordis_runtime_inspect: "Plug",
+  cordis_inspect_list: "Plug",
+  cordis_inspect_query: "Plug",
+  cordis_inspect_self: "Plug",
 };
 
 /** Human label for a tool call, falling back to its raw name. */
@@ -105,6 +200,10 @@ export function toolIcon(name: string, detail: ToolDetail | undefined): string {
   if (normalized === "thinking" && (detail === undefined || detail.type === "unknown")) return "Brain";
   if (normalized === "speak") return "MicVocal";
   if (normalized === "task") return "Bot";
+  // Only for `unknown` details: a typed detail (shell/read/edit/…) already
+  // carries a better icon than the tool's name would suggest.
+  const named = TOOL_NAME_ICONS[normalized];
+  if (named !== undefined && (detail === undefined || detail.type === "unknown")) return named;
   if (detail !== undefined && typeof detail.type === "string") {
     return DETAIL_ICONS[detail.type] ?? "Wrench";
   }
@@ -286,6 +385,7 @@ export function toolCallData(
     // Whether the expanded block has anything to show. A row whose only content
     // is its title still expands — the title wraps to its full width — but must
     // not draw an empty code surface.
+    titled: description !== "",
     hasDetail: truncate(description === "" ? detailHeadline : primary) !== "" || body !== "",
   };
 }
