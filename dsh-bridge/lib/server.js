@@ -652,9 +652,21 @@ export class PaseoHarnessServer {
     const query = typeof params.query === 'string' && params.query !== '' ? params.query.toLowerCase() : undefined;
     const cwdFilter = typeof params.cwd === 'string' && params.cwd !== '' ? params.cwd : undefined;
     const candidates = [];
+    // DSH's archive state is authoritative and Paseo's session summary has no
+    // field for it (`ProviderSessionSummary` is persistence/cwd/title/description/
+    // updatedAt), so the only honest way to mirror it is to leave archived
+    // sessions out — which is also DSH's own default view ("隐藏已归档").
+    let archived = new Set();
+    try {
+      const registry = this.ctx.get('workspaceRegistry');
+      if (registry !== undefined) archived = new Set([...registry.archivedSessionIds].map(String));
+    } catch {
+      // Unreadable state leaves the list unfiltered rather than silently empty.
+    }
     for (const snapshot of snapshots) {
       const id = snapshot?.header?.id === undefined ? undefined : String(snapshot.header.id);
       if (id === undefined || id === '') continue;
+      if (archived.has(id)) continue;
       if (cwdFilter !== undefined && snapshot.header.cwd !== cwdFilter) continue;
       if (query !== undefined && !id.toLowerCase().includes(query)) continue;
       candidates.push(snapshot);
@@ -808,6 +820,17 @@ export class PaseoHarnessServer {
     if (typeof params.sessionId !== 'string' || params.sessionId === '') {
       return { available: false, subagents: [], error: { message: 'subagents requires a sessionId' } };
     }
+    // DSH's own archive state, so a replayed child that was archived is not
+    // announced again: Paseo drops what the provider stops reporting, and
+    // re-announcing it is exactly what resurrected an archived subagent.
+    let archived = new Set();
+    try {
+      const registry = this.ctx.get('workspaceRegistry');
+      if (registry !== undefined) archived = new Set([...registry.archivedSessionIds].map(String));
+    } catch {
+      // A runtime without a readable registry leaves every child unarchived,
+      // which is the honest answer when the state cannot be read.
+    }
     try {
       const rows = await subagents.listDescendants(params.sessionId);
       return {
@@ -819,6 +842,7 @@ export class PaseoHarnessServer {
             parentSessionId: String(row.parentId),
             ...(row.mode === undefined ? {} : { mode: row.mode }),
             ...(row.label === undefined ? {} : { label: row.label }),
+            ...(archived.has(String(row.id)) ? { archived: true } : {}),
           })),
         diagnostics: rows
           .filter((row) => row.kind !== 'child')

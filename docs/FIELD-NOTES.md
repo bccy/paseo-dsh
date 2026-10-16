@@ -1057,6 +1057,11 @@ label 正确、子会话有自己的时间线）。
 - `paseo/subagents` 附带每个子会话的 DSH 归档状态（读 `archivedSessionIds`），
   `replaySubagents()` 跳过已归档的 → 归档重启后依然成立。
 
+**导入列表**：Paseo 的 `ProviderSessionSummary`（persistence/cwd/title/description/updatedAt）
+**没有** archived 字段，所以"告诉 Paseo 某个会话已归档"这条路不存在。唯一的杠杆是**不把它列进
+导入列表**——这也正是 DSH 自己的默认视图（"隐藏已归档"）。桥的 `listSessions` 因此按
+`archivedSessionIds` 过滤；读不到 registry 时**不过滤**，而不是静默给出空列表。
+
 **验证**：`harness/subagent-check.cjs` **42/42**（假桥的 replay 列表加了一条 `archived: true`
 的子会话，断言"已归档的子会话不被重放播报"）；`tsc --noEmit` 干净；其余离线套件
 89/29/19/25/17 全绿；内嵌桥按硬性约束重新生成。
