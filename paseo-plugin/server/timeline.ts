@@ -54,6 +54,101 @@ function textOf(content: unknown): string {
     .join("");
 }
 
+/*
+ * Paseo's markdown-image source rules, ported verbatim from the host's own
+ * provider-image-output.js (`renderProviderImageOutputAsAssistantMarkdown`).
+ *
+ * A provider draws a picture by emitting an `assistant_message` whose text is a
+ * markdown image; the host then fetches the bytes itself over its file RPC. The
+ * source has to be a URI it understands: an absolute path becomes `file://` plus
+ * the path with **each segment** `encodeURIComponent`-ed — a space in a
+ * directory name would otherwise split the destination — and Windows paths get
+ * their drive/UNC forms. Keeping these byte-for-byte equivalent to the host is
+ * the whole point: this is a copy of an existing shape, not a new one.
+ */
+
+/** Escape an image's alt text the way the host does (`\` and `]`). */
+function escapeMarkdownImageAlt(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/\]/g, "\\]");
+}
+
+/** Percent-encode a path segment by segment, leaving the separators alone. */
+function encodeFilePath(value: string): string {
+  return value
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+}
+
+/** The `file:` URI for a Windows path (drive letter or UNC share), or undefined. */
+function windowsFileUri(value: string): string | undefined {
+  const isWindowsNetworkPath = value.startsWith("\\\\");
+  let normalizedPath = value.replace(/\\/g, "/");
+  if (/^\/\/\?\/UNC\//i.test(normalizedPath)) {
+    normalizedPath = `//${normalizedPath.slice(8)}`;
+  } else if (/^\/\/\?\/[A-Za-z]:\//.test(normalizedPath)) {
+    normalizedPath = normalizedPath.slice(4);
+  }
+  if (/^[A-Za-z]:\//.test(normalizedPath)) {
+    const drive = normalizedPath.slice(0, 2);
+    return `file:///${drive}${encodeFilePath(normalizedPath.slice(2))}`;
+  }
+  if (isWindowsNetworkPath && normalizedPath.startsWith("//")) {
+    return `file:${encodeFilePath(normalizedPath)}`;
+  }
+  return undefined;
+}
+
+/** An absolute host path as a markdown image source (`file://` + encoding). */
+function markdownImageSource(value: string): string {
+  const windowsUri = windowsFileUri(value);
+  if (windowsUri !== undefined) return windowsUri;
+  if (value.startsWith("/")) return `file://${encodeFilePath(value)}`;
+  return value;
+}
+
+/** As {@link markdownImageSource}, plus the host's `)` escaping for markdown. */
+function escapeMarkdownImageSource(value: string): string {
+  return markdownImageSource(value).replace(/\\/g, "\\\\").replace(/\)/g, "\\)");
+}
+
+/**
+ * One picture row per image block the bridge stamped with a `hostPath`.
+ *
+ * The bridge appends `hostPath` — the attachment's durable absolute path — to
+ * each `{type:"image", attachment}` block of a `tool/result` (see
+ * `dsh-bridge/lib/image-host-path.js`); a block without one produces no row at
+ * all, so the tool result's own text stays the only trace of it rather than an
+ * empty picture with no source.
+ *
+ * `alt` is the attachment's own file name, run through the host's escaping rule,
+ * falling back to `Image` when DSH recorded none.
+ *
+ * The id is derived from the call and the block's position **on purpose**:
+ * Paseo folds a snapshot into the row it already has only while the id (and
+ * `messageId`) match, so replaying the same log emits the same id and the same
+ * text — which the host drops as an empty delta. That dedup is accepted
+ * behaviour, never a reason to randomize the id (`mapTimelineItem`:
+ * `text.startsWith(previousText) ? slice : text`, and an empty delta returns
+ * null).
+ */
+function imageRows(callId: string, content: unknown): Array<{ id: string; text: string }> {
+  if (!Array.isArray(content)) return [];
+  const rows: Array<{ id: string; text: string }> = [];
+  content.forEach((block, index) => {
+    if (!isRecord(block) || block.type !== "image") return;
+    const hostPath = stringField(block, "hostPath");
+    if (hostPath === undefined) return;
+    const attachment = isRecord(block.attachment) ? block.attachment : {};
+    const alt = escapeMarkdownImageAlt(stringField(attachment, "name") ?? "Image");
+    rows.push({
+      id: `image:${callId}:${index}`,
+      text: `![${alt}](${escapeMarkdownImageSource(hostPath)})`,
+    });
+  });
+  return rows;
+}
+
 function stringField(source: Record<string, unknown>, key: string): string | undefined {
   const value = source[key];
   return typeof value === "string" && value !== "" ? value : undefined;
@@ -508,8 +603,8 @@ export class TimelineBuilder {
   #items = new Map<string, ProviderTimelineItem>();
   #toolNames = new Map<string, string>();
   #toolInputs = new Map<string, Record<string, unknown>>();
-  /** commandId -> the command name, so `command/done` can title its own row. */
-  #commands = new Map<string, string>();
+  /** commandId -> the command that ran, so `command/done` can title its own row. */
+  #commands = new Map<string, { name: string; args: string }>();
   /**
    * Where an unrecognized `presentationMeta` is reported.
    *
@@ -527,13 +622,39 @@ export class TimelineBuilder {
    */
   #runningTools = new Set<string>();
   /**
-   * `compactionId`s whose `compaction/summary` already drew the marker.
+   * `compactionId`s whose completed marker is already out.
    *
-   * `compaction/end` closes the same bracket and would stack a second row, so it
-   * is dropped — and the entry is removed together with it, which keeps a replay
-   * of the same log byte-for-byte repeatable.
+   * The bracket is `start` (Paseo `loading`) → `summary` (completed) → `end`.
+   * Only the summary draws the completed state; an `end` for an id that already
+   * got it is dropped, and the entry is removed together with it, which keeps a
+   * replay of the same log byte-for-byte repeatable. **A second `completed` for
+   * the same bracket is the one thing that must never happen** — see
+   * {@link #compaction}.
    */
   #summarizedCompactions = new Set<string>();
+
+  /**
+   * `compactionId` -> trigger for markers still in Paseo's `loading` state.
+   *
+   * A log that stops on `compaction/start` (the process was killed mid-way)
+   * would otherwise leave a row that pulses forever — Paseo's client pulses a
+   * loading marker with no time window. {@link settleLoadingCompactions} closes
+   * those, the same way {@link settleRunningTools} closes a tool whose result
+   * never arrived. The trigger is kept beside the id so the settling row carries
+   * the same reading the loading one did.
+   */
+  #loadingCompactions = new Map<string, "manual" | "auto">();
+
+  /**
+   * `commandId`s a compaction took over.
+   *
+   * A `/compact` writes both a `command/*` bracket and a `compaction/*` one, and
+   * the compaction marker *is* that command's row: showing the command as well
+   * prints two rows for one action. The link is DSH's own
+   * (`compaction.sourceCommandId === command.commandId`), never the command name
+   * — see {@link #commandDone}.
+   */
+  #compactionCommands = new Set<string>();
 
   constructor(options: { warn?: (line: string) => void } = {}) {
     this.#warn = options.warn ?? ((line) => console.warn(line));
@@ -562,18 +683,18 @@ export class TimelineBuilder {
         return this.#commandRun(data);
       case "command/done":
         return this.#commandDone(data);
-      // DSH's open bracket. The marker itself is emitted once, by whichever of
-      // the two closing events lands first — see `#compaction`.
+      // DSH's open bracket. Paseo's marker has a real `loading` state, and the
+      // host merges the completed copy into it in place — see `#compaction`.
       case "compaction/start":
-        return [];
+        return this.#compaction(data, "start");
       // Both close the compaction: `compaction/summary` once the summary is
       // durable (the replacement `user/message` follows it), `compaction/end` as
       // the closing marker. Whichever arrives is enough, so a log that stops
-      // between the two still gets its row.
+      // between the two still gets its completed row.
       case "compaction/summary":
-        return this.#compaction(data, false);
+        return this.#compaction(data, "summary");
       case "compaction/end":
-        return this.#compaction(data, true);
+        return this.#compaction(data, "end");
       case "turn/end":
         return this.#turnEnd(data);
       default:
@@ -592,6 +713,33 @@ export class TimelineBuilder {
    */
   settleRunningTools(): ProviderTimelineItem[] {
     return this.#cancelRunningTools();
+  }
+
+  /**
+   * Close compaction markers a replay left in Paseo's `loading` state.
+   *
+   * The same replay problem {@link settleRunningTools} solves: a process killed
+   * between `compaction/start` and its close leaves a marker that never flips,
+   * and Paseo's client pulses a loading marker with no time window. The protocol
+   * has no "canceled" compaction, so the honest-looking single row is the
+   * completed one — and this is reported, because the compaction really did not
+   * finish. Idempotent: a settled id leaves the set.
+   *
+   * Only ever called for a replayed log whose owner is gone; a compaction still
+   * in flight in this process has not emitted its start yet at replay time.
+   */
+  settleLoadingCompactions(): ProviderTimelineItem[] {
+    const out: ProviderTimelineItem[] = [];
+    for (const [compactionId, trigger] of [...this.#loadingCompactions]) {
+      this.#loadingCompactions.delete(compactionId);
+      this.#warn(
+        `compaction: the replayed log ends with ${compactionId} still loading ` +
+          `(the process was killed mid-compaction?); closing the marker as completed ` +
+          `so the row does not pulse forever`,
+      );
+      out.push(...this.#put(this.#compactionItem(compactionId, "completed", trigger)));
+    }
+    return out;
   }
 
   #put(item: ProviderTimelineItem): ProviderTimelineItem[] {
@@ -727,6 +875,13 @@ export class TimelineBuilder {
           : { status: "completed" as const, error: null }),
       }),
     );
+    // A picture is not a tool row: Paseo's detail union has no image field, and
+    // its markdown renderer is the one surface that can draw bytes fetched over
+    // file RPC. So each stamped image block becomes its own assistant message,
+    // right after the row that produced it.
+    for (const row of imageRows(callId, message?.content)) {
+      out.push(...this.#put({ type: "assistant_message", id: row.id, messageId: row.id, text: row.text }));
+    }
     return out;
   }
 
@@ -736,32 +891,57 @@ export class TimelineBuilder {
    * DSH records the command in the session log, so the row is durable and
    * replays on reopen like every other item. The command's own output only
    * exists on `command/done`, so the row is written once there and `command/run`
-   * only remembers the name that titles it. Without this the composer runs the
-   * command, DSH answers, and the answer is thrown away — a command that looks
-   * like it did nothing.
+   * only remembers the name and arguments that shape it. Without this the
+   * composer runs the command, DSH answers, and the answer is thrown away — a
+   * command that looks like it did nothing.
+   *
+   * A command a compaction took over (`/compact`) is the exception: the
+   * compaction marker is that command's row, so {@link #commandDone} drops it.
    */
   #commandRun(data: Record<string, unknown>): ProviderTimelineItem[] {
     const commandId = stringField(data, "commandId");
     const name = stringField(data, "name");
     if (commandId === undefined || name === undefined) return [];
-    this.#commands.set(commandId, name);
+    // The arguments typed after the command name (`/goal ship it`). DSH records
+    // them beside the name, and they are the one part of the line the row's head
+    // does not already show: the head reads `label · summary` with the command
+    // itself as the label.
+    const args = typeof data.args === "string" ? data.args.trim() : "";
+    this.#commands.set(commandId, { name, args });
     return [];
   }
 
   #commandDone(data: Record<string, unknown>): ProviderTimelineItem[] {
     const commandId = stringField(data, "commandId");
     if (commandId === undefined) return [];
-    const name = this.#commands.get(commandId) ?? "command";
+    const command = this.#commands.get(commandId);
+    const name = command?.name ?? "command";
     this.#commands.delete(commandId);
     const text = typeof data.text === "string" ? data.text : "";
     const failed = data.kind === "error";
+    // A `/compact` writes two brackets for one action: this `command/*` one and
+    // the `compaction/*` one. The compaction marker *is* the row — showing both
+    // printed the command and the marker for the same keystroke — so a successful
+    // command a compaction claimed is dropped. The link is DSH's own ids
+    // (`compaction.sourceCommandId === command.commandId`), not the command name:
+    // a renamed or aliased compact command still maps.
+    //
+    // A failed one is *not* dropped: Paseo's marker has no failure state, so the
+    // failed row is the only place the error can be read. Fail loud.
+    if (!failed && this.#compactionCommands.has(commandId)) return [];
     const line = `/${name}`;
     return this.#put({
       type: "tool_call",
       id: `command:${commandId}`,
       callId: commandId,
       name: line,
-      detail: { type: "plain_text", label: line, text, icon: "square_terminal" },
+      // `label` is the **second half** of the row's head, not the row's title:
+      // the head already reads `label · summary` with the command itself as the
+      // first half. Putting `/${name}` here printed the command twice
+      // (`/compact · /compact`). The arguments are the only part of the line the
+      // head does not already show, so `/compact` (no arguments) leaves the
+      // second half empty and `/goal <target>` shows the target.
+      detail: { type: "plain_text", label: command?.args ?? "", text, icon: "square_terminal" },
       // A `/command` row goes through the client's tool-call transformer like any
       // other, so it carries the locale hint too: a session whose first row is
       // `/compact` must not be the one that misses it.
@@ -782,18 +962,35 @@ export class TimelineBuilder {
    * the marker as a first-class item (`{type:"compaction", status, trigger}`,
    * which its own omp/pi adapters emit), so the bracket maps onto it.
    *
-   * **One item per `compactionId`, and it is the closing state.** A provider item
-   * cannot update a row it emitted earlier: the daemon's `mapTimelineItem`
-   * (`@getpaseo/server`, `plugin-provider.js`) hands every non-message item on as
-   * `withoutIdentity` — it destructures `id` out — and only `assistant_message`,
-   * `reasoning` and `user_message` are ever compared against the `snapshots` entry
-   * left by the previous emission. A stable id therefore buys nothing here, and
-   * Paseo's `loading` state ("正在压缩...") is out of reach: emitting it would
-   * leave a second, permanent row next to the finished one. Measured, not
-   * reasoned — replaying this repo's own long session through `consume()` produced
-   * 3 items for a single compaction, and the daemon's activity feed for one
-   * `/compact` listed `[Compacted]` three times. The honest single row is the one
-   * that says the compaction happened.
+   * **Two items per `compactionId`: `loading` at the start, then exactly one
+   * `completed`.** The host merges them itself. Its web bundle's compaction
+   * reducer (decompiled from
+   * `@getpaseo/server/dist/server/web-ui/.../index-*.js`) does, on a `completed`
+   * payload:
+   *
+   * ```js
+   * const at = rows.findIndex((row) => row.kind === "compaction" && row.status === "loading");
+   * if (at >= 0) {
+   *   const merged = { ...rows[at], status: "completed", trigger, preTokens };
+   *   return [...rows.slice(0, at), merged, ...rows.slice(at + 1)]; // in place
+   * }
+   * // no loading row anywhere -> append a new one
+   * return [...rows, { kind: "compaction", …, status, trigger, preTokens }];
+   * ```
+   *
+   * So the search is over the whole table, by `kind` + `status` — never by id,
+   * and never by adjacency — and a `completed` with no loading row left is
+   * **appended**. That last line is what printed a compaction twice: emitting
+   * both the summary and the closing `end` as `completed` merged the first one
+   * into the loading row and appended the second. Hence the invariant this
+   * method exists to keep: **never two `completed` items for one bracket**. The
+   * summary draws it and the `end` is dropped; an `end` that arrives with no
+   * summary (DSH failed it, or the log is missing the summary) draws it instead.
+   *
+   * A provider item cannot be updated by a later item of its own — the daemon's
+   * `mapTimelineItem` hands every non-message item on as `withoutIdentity` — but
+   * that is beside the point here: the merge happens on the host's own reducer,
+   * keyed by `kind`/`status`, so a stable id is not what makes this work.
    *
    * `trigger` is DSH's own distinction and is exact, not inferred from timing.
    * Two signals agree on it and either is enough: `compactNow` (the `/compact`
@@ -814,7 +1011,10 @@ export class TimelineBuilder {
    * precedes is a `tool/result` replacement rather than a compaction checkpoint —
    * DSH's own UI shows no marker for it.
    */
-  #compaction(data: Record<string, unknown>, closing: boolean): ProviderTimelineItem[] {
+  #compaction(
+    data: Record<string, unknown>,
+    phase: "start" | "summary" | "end",
+  ): ProviderTimelineItem[] {
     const compactionId = stringField(data, "compactionId");
     if (compactionId === undefined) return [];
     // A failed compaction is closed with `error` on its `compaction/end` (the
@@ -832,22 +1032,37 @@ export class TimelineBuilder {
           `and the failure itself is on the turn or command that owned the compaction`,
       );
     }
-    if (closing) {
-      // `compaction/summary` already drew this compaction, so the closing bracket
-      // is the same state and would be a second row. Forget it at the same time,
-      // so replaying the same log emits exactly the same items again.
-      if (this.#summarizedCompactions.delete(compactionId)) return [];
-    } else {
-      this.#summarizedCompactions.add(compactionId);
+    const sourceCommandId = stringField(data, "sourceCommandId");
+    if (sourceCommandId !== undefined) this.#compactionCommands.add(sourceCommandId);
+    // `turn === null` is DSH's structural marker for a manual transaction; a
+    // missing `turn` is a malformed event, not a manual one.
+    const trigger = sourceCommandId !== undefined || data.turn === null ? "manual" : "auto";
+
+    if (phase === "start") {
+      this.#loadingCompactions.set(compactionId, trigger);
+      return this.#put(this.#compactionItem(compactionId, "loading", trigger));
     }
-    return this.#put({
-      type: "compaction",
-      id: `compaction:${compactionId}`,
-      status: "completed",
-      // `turn === null` is DSH's structural marker for a manual transaction; a
-      // missing `turn` is a malformed event, not a manual one.
-      trigger: stringField(data, "sourceCommandId") !== undefined || data.turn === null ? "manual" : "auto",
-    });
+    if (phase === "summary") {
+      // The summary is the completed state; its `end` must not draw a second.
+      this.#summarizedCompactions.add(compactionId);
+      this.#loadingCompactions.delete(compactionId);
+      return this.#put(this.#compactionItem(compactionId, "completed", trigger));
+    }
+    // phase === "end": dropped when the summary already completed this bracket,
+    // and forgotten at the same time so replaying the same log emits exactly the
+    // same items again.
+    if (this.#summarizedCompactions.delete(compactionId)) return [];
+    this.#loadingCompactions.delete(compactionId);
+    return this.#put(this.#compactionItem(compactionId, "completed", trigger));
+  }
+
+  /** One compaction marker payload; `id` is shared by the two states on purpose. */
+  #compactionItem(
+    compactionId: string,
+    status: "loading" | "completed",
+    trigger: "manual" | "auto",
+  ): ProviderTimelineItem {
+    return { type: "compaction", id: `compaction:${compactionId}`, status, trigger };
   }
 
   #turnEnd(data: Record<string, unknown>): ProviderTimelineItem[] {

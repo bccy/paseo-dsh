@@ -20,8 +20,15 @@
  *   last section of this file runs that parse for real so the boundary cannot
  *   silently swallow the field again.
  * - DSH's `compaction/*` bracket was dropped by `consume()`, so a compaction was
- *   invisible while it ran. Paseo has a native `compaction` marker; the mapping,
- *   both triggers and the failed-close path are asserted here.
+ *   invisible while it ran. Paseo has a native `compaction` marker, and the
+ *   host's own reducer merges a `completed` payload into the first row that is
+ *   still `loading` — in place, found by `kind`/`status` over the whole table.
+ *   The bracket therefore emits exactly two items (loading, then one completed),
+ *   both triggers and the failed-close path are asserted here, **and so is the
+ *   invariant that a second `completed` never goes out**: with no loading row
+ *   left the host *appends*, which is what printed a compaction twice. A
+ *   successful `/compact` command row is dropped because the marker is that
+ *   row; a failed one is not, because the marker cannot carry a failure.
  * - A detail type the plugin's *client* cannot draw renders as an icon over
  *   nothing (`{summary:"",headline:"",body:"",hasDetail:false}`), and
  *   `worktree_setup` was the protocol type that did it. The invariant — the
@@ -31,6 +38,15 @@
  *   client cannot read the daemon's environment, and React never re-renders a
  *   row that already transformed, so a hint on the first row only is a hint
  *   nobody sees.
+ * - An image content block in a `tool/result` was dropped by `textOf()`, so a
+ *   `read_image` result showed its text and nothing else. The bridge stamps each
+ *   image attachment with its durable host path (the source path DSH reports may
+ *   be long gone) and this builder turns a stamped block into its own
+ *   `assistant_message` — a markdown image with the host's own `file://` source
+ *   shape — while an unstamped block must add no row at all.
+ * - A `/command` row printed its own name twice (`/compact · /compact`): the
+ *   head already carries `item.name`, so `detail.label` now holds the command's
+ *   arguments, the one part of the line the head does not already show.
  *
  * `harness/plugin-check.cjs` drives the plugin end to end; this drives the
  * builder directly, which is the only way to stage those orderings.
@@ -507,147 +523,248 @@ console.log("web_search's query list");
   );
 }
 
-console.log("\ncompaction is visible, exactly once (DSH's compaction/* bracket -> Paseo's marker)");
+console.log("\ncompaction: loading, then exactly one completed (the host merges in place)");
 {
   // DSH brackets every compaction with `compaction/start` … `compaction/summary`
-  // + `compaction/end`, and none of it reaches its own surface. `consume()` used
-  // to return [] for all four types, so a compaction running for a minute looked
-  // like nothing happening. Paseo has the marker as a first-class item, which is
-  // what its own omp/pi adapters emit.
+  // + `compaction/end`, and none of it reaches its own surface. Paseo has the
+  // marker as a first-class item, which is what its own omp/pi adapters emit.
   //
-  // **But a provider row is append-only.** The daemon's `mapTimelineItem` hands
-  // non-message items on as `withoutIdentity` (it destructures `id` out) and only
-  // `assistant_message`/`reasoning`/`user_message` are matched against the
-  // previous emission, so a second item for the same `compactionId` is a second
-  // row on screen, not an update. So the marker is emitted once, at the close,
-  // and the open bracket draws nothing. Measured: replaying the repo's own long
-  // session through `consume()` gave 3 items for one compaction, and the daemon's
-  // activity feed for a single `/compact` listed `[Compacted]` three times.
-  const builder = new TimelineBuilder({ warn: (line) => warnings.push(line) });
-
-  const started = builder.consume({
-    type: "compaction/start",
-    seq: 10,
-    data: { compactionId: "cmp-1", turn: 4 },
+  // The host merges the two states itself. Its web bundle's compaction reducer
+  // (decompiled from `@getpaseo/server/dist/server/web-ui/.../index-*.js`) does,
+  // on a `completed` payload:
+  //
+  //   const at = rows.findIndex((row) => row.kind === "compaction" && row.status === "loading");
+  //   if (at >= 0) return [ ...rows.slice(0, at), { ...rows[at], status: "completed", trigger }, ...rows.slice(at + 1) ];
+  //   return [ ...rows, { kind: "compaction", …, status: "completed", trigger } ];
+  //
+  // So the lookup is by `kind` + `status` over the whole table — never by id and
+  // never by adjacency — and a `completed` with no loading row left is
+  // **appended**. That last line is the bug this block pins: emitting both the
+  // summary and the closing `end` as `completed` merged the first into the
+  // loading row and appended the second (the user saw two rows; the activity
+  // feed listed three, including the raw event).
+  const at = (id, phase, extra = {}) => ({
+    type: `compaction/${phase}`,
+    seq: 1,
+    data: { compactionId: id, turn: 4, ...extra },
   });
-  check("the open bracket draws nothing on its own", started.length === 0, JSON.stringify(started));
+  const run = (events, options = {}) => {
+    const builder = new TimelineBuilder(options);
+    return { builder, items: events.flatMap((event) => builder.consume(event)) };
+  };
 
-  const summarized = builder.consume({
-    type: "compaction/summary",
-    seq: 11,
-    data: {
-      compactionId: "cmp-1",
-      turn: 4,
-      summary: [{ type: "text", text: "…" }],
-      shadowedRange: { start: 1, end: 9 },
-      shadowedSeqs: [1, 2, 3],
-      shadowedTokenCount: 12345,
-      provider: "deepseek",
-      model: "deepseek-chat",
-    },
-  });
-  check("the summary emits exactly one item", summarized.length === 1, JSON.stringify(summarized));
-  check("it is Paseo's native compaction marker", summarized[0]?.type === "compaction", summarized[0]?.type);
-  check("it is the finished state", summarized[0]?.status === "completed", summarized[0]?.status);
+  // ---- a complete bracket --------------------------------------------------
+  const summary = (id, extra = {}) =>
+    at(id, "summary", { summary: [{ type: "text", text: "…" }], shadowedTokenCount: 12345, ...extra });
+  const bracketEvents = [at("cmp-1", "start"), summary("cmp-1"), at("cmp-1", "end")];
+  const bracket = run(bracketEvents, { warn: (line) => warnings.push(line) }).items;
   check(
-    "id is namespaced by compactionId",
-    summarized[0]?.id === "compaction:cmp-1",
-    summarized[0]?.id,
+    "a complete bracket is exactly two items (loading, then completed)",
+    bracket.length === 2,
+    JSON.stringify(bracket),
   );
-  check("an enclosed compaction is the automatic one", summarized[0]?.trigger === "auto", summarized[0]?.trigger);
+  check(
+    "the first is Paseo's loading marker",
+    bracket[0]?.type === "compaction" && bracket[0]?.status === "loading",
+    JSON.stringify(bracket[0]),
+  );
+  check("the second is the completed state", bracket[1]?.status === "completed", JSON.stringify(bracket[1]));
+  check(
+    "both carry the same id, namespaced by compactionId",
+    bracket[0]?.id === "compaction:cmp-1" && bracket[1]?.id === "compaction:cmp-1",
+    JSON.stringify(bracket.map((item) => item.id)),
+  );
+  check(
+    "the closing end draws no second completed (the host would append it)",
+    bracket.filter((item) => item.status === "completed").length === 1,
+    JSON.stringify(bracket.map((item) => item.status)),
+  );
+  check("an enclosed compaction is the automatic one", bracket[1]?.trigger === "auto", bracket[1]?.trigger);
   check(
     "preTokens is left unset (DSH has no tokens-before number)",
-    summarized[0] !== undefined && !("preTokens" in summarized[0]),
-    JSON.stringify(summarized[0]),
-  );
-
-  const ended = builder.consume({
-    type: "compaction/end",
-    seq: 12,
-    data: { compactionId: "cmp-1", turn: 4 },
-  });
-  check("the closing bracket does not stack a second row", ended.length === 0, JSON.stringify(ended));
-
-  // A manual `/compact` runs outside any turn and stamps the command that asked
-  // for it. Both are DSH's own signals, not a guess from timing.
-  const manual = builder.consume({
-    type: "compaction/summary",
-    seq: 13,
-    data: { compactionId: "cmp-2", sourceCommandId: "cmd-7", turn: null, summary: [{ type: "text", text: "…" }] },
-  });
-  check("a /compact marker says manual", manual[0]?.trigger === "manual", JSON.stringify(manual[0]));
-  check("a second compaction is a second marker", manual[0]?.id !== summarized[0]?.id, manual[0]?.id);
-
-  const standalone = builder.consume({
-    type: "compaction/end",
-    seq: 14,
-    data: { compactionId: "cmp-3", turn: null },
-  });
-  check(
-    "turn: null alone is enough to call it manual",
-    standalone[0]?.trigger === "manual",
-    JSON.stringify(standalone[0]),
-  );
-  check(
-    "a log that stops before the summary still gets its row",
-    standalone.length === 1 && standalone[0]?.status === "completed",
-    JSON.stringify(standalone),
-  );
-
-  // A failed compaction is closed with `error` and never gets a summary.
-  const before = warnings.length;
-  const failed = builder.consume({
-    type: "compaction/end",
-    seq: 15,
-    data: { compactionId: "cmp-4", sourceCommandId: "cmd-7", turn: null, error: "summary is not smaller" },
-  });
-  check("a failed compaction still closes the marker", failed[0]?.status === "completed", failed[0]?.status);
-  check(
-    "and the failure is reported, not swallowed",
-    warnings.length === before + 1 && warnings[before].includes("summary is not smaller"),
-    JSON.stringify(warnings.slice(before)),
-  );
-
-  check(
-    "compaction/prune is not a marker (no compactionId, and DSH draws nothing either)",
-    builder.consume({
-      type: "compaction/prune",
-      seq: 16,
-      data: { shadowedRange: { start: 1, end: 1 }, shadowedSeqs: [1], shadowedTokenCount: 40 },
-    }).length === 0,
-  );
-  check(
-    "a compaction event with no id emits nothing",
-    builder.consume({ type: "compaction/summary", seq: 17, data: { turn: 4 } }).length === 0,
-  );
-
-  // The regression this block exists for: one whole bracket, one row — however
-  // many events it is made of.
-  const one = new TimelineBuilder({ warn: () => {} });
-  const bracket = [
-    { type: "compaction/start", seq: 1, data: { compactionId: "cmp-9", turn: 1 } },
-    { type: "compaction/summary", seq: 2, data: { compactionId: "cmp-9", turn: 1 } },
-    { type: "compaction/end", seq: 3, data: { compactionId: "cmp-9", turn: 1 } },
-  ].flatMap((event) => one.consume(event));
-  check(
-    "one compaction bracket is exactly one row",
-    bracket.length === 1 && bracket[0]?.status === "completed",
+    bracket.every((item) => !("preTokens" in item)),
     JSON.stringify(bracket),
   );
 
-  // …and replaying the same log twice through one builder is repeatable: the
-  // summary/end handshake must not leave an id behind that swallows the second
-  // pass. (A reopened session replays its whole log again.)
-  const again = [
-    { type: "compaction/start", seq: 1, data: { compactionId: "cmp-9", turn: 1 } },
-    { type: "compaction/summary", seq: 2, data: { compactionId: "cmp-9", turn: 1 } },
-    { type: "compaction/end", seq: 3, data: { compactionId: "cmp-9", turn: 1 } },
-  ].flatMap((event) => one.consume(event));
+  // ---- the same log again through one builder, as a reopen replays it ------
+  const one = new TimelineBuilder({ warn: () => {} });
+  const firstPass = bracketEvents.flatMap((event) => one.consume(event));
+  const secondPass = bracketEvents.flatMap((event) => one.consume(event));
   check(
-    "replaying the same bracket emits it again",
-    again.length === 1 && again[0]?.id === "compaction:cmp-9",
-    JSON.stringify(again),
+    "replaying the same bracket emits loading+completed again (the end handshake forgets its id)",
+    firstPass.length === 2 &&
+      secondPass.length === 2 &&
+      secondPass[0]?.status === "loading" &&
+      secondPass[1]?.status === "completed",
+    JSON.stringify(secondPass.map((item) => item.status)),
   );
+  check(
+    "each pass has exactly one completed",
+    firstPass.filter((item) => item.status === "completed").length === 1 &&
+      secondPass.filter((item) => item.status === "completed").length === 1,
+  );
+
+  // ---- start + summary, no end --------------------------------------------
+  const noEnd = run([at("cmp-2", "start", { sourceCommandId: "cmd-7", turn: null }), summary("cmp-2", { sourceCommandId: "cmd-7", turn: null })], { warn: () => {} }).items;
+  check(
+    "a log that stops after the summary still has both states",
+    noEnd.length === 2 && noEnd[0]?.status === "loading" && noEnd[1]?.status === "completed",
+    JSON.stringify(noEnd.map((item) => item.status)),
+  );
+  check(
+    "a /compact marker says manual in both states",
+    noEnd[0]?.trigger === "manual" && noEnd[1]?.trigger === "manual",
+    JSON.stringify(noEnd.map((item) => item.trigger)),
+  );
+
+  // ---- start + end, no summary: the end draws the one completed ------------
+  const noSummary = run(
+    [
+      at("cmp-3", "start", { sourceCommandId: "cmd-7", turn: null }),
+      at("cmp-3", "end", { sourceCommandId: "cmd-7", turn: null }),
+    ],
+    { warn: () => {} },
+  ).items;
+  check(
+    "a bracket whose summary never landed is still two items (loading + one completed)",
+    noSummary.length === 2 &&
+      noSummary[0]?.status === "loading" &&
+      noSummary[1]?.status === "completed",
+    JSON.stringify(noSummary.map((item) => item.status)),
+  );
+  check("turn: null alone is enough to call it manual", noSummary[1]?.trigger === "manual", JSON.stringify(noSummary[1]));
+
+  // ---- a failed end still closes the marker, and reports why ---------------
+  const failedStart = warnings.length;
+  const failed = run(
+    [
+      at("cmp-4", "start"),
+      at("cmp-4", "end", { error: "summary is not smaller" }),
+    ],
+    { warn: (line) => warnings.push(line) },
+  ).items;
+  check(
+    "a failed compaction still closes the marker (loading + completed)",
+    failed.length === 2 && failed[1]?.status === "completed",
+    JSON.stringify(failed.map((item) => item.status)),
+  );
+  check(
+    "and the failure is reported, not swallowed",
+    warnings.length === failedStart + 1 && warnings[failedStart].includes("summary is not smaller"),
+    JSON.stringify(warnings.slice(failedStart)),
+  );
+
+  // ---- an end with no start: one completed row (the host appends it) -------
+  const orphan = run([at("cmp-5", "end", { turn: null })], { warn: () => {} }).items;
+  check(
+    "an end whose start is not in the log still draws one completed marker",
+    orphan.length === 1 && orphan[0]?.status === "completed" && orphan[0]?.trigger === "manual",
+    JSON.stringify(orphan),
+  );
+
+  // ---- events that are not a marker ---------------------------------------
+  const ignored = run(
+    [
+      { type: "compaction/prune", seq: 16, data: { shadowedRange: { start: 1, end: 1 }, shadowedSeqs: [1], shadowedTokenCount: 40 } },
+      { type: "compaction/summary", seq: 17, data: { turn: 4 } },
+    ],
+    { warn: () => {} },
+  ).items;
+  check(
+    "compaction/prune and an id-less compaction event emit nothing",
+    ignored.length === 0,
+    JSON.stringify(ignored),
+  );
+
+  // ---- a log that stops on start: settled at replay end --------------------
+  // Paseo's client pulses a loading marker with no time window, so a process
+  // killed mid-compaction would blink on every reopen. There is no canceled
+  // compaction in the protocol, so the settle closes it and says so.
+  const stuck = new TimelineBuilder({ warn: (line) => warnings.push(line) });
+  stuck.consume(at("cmp-9", "start", { sourceCommandId: "cmd-9", turn: null }));
+  const beforeSettle = warnings.length;
+  const settled = stuck.settleLoadingCompactions();
+  check(
+    "a log that stops on start is settled to one completed marker",
+    settled.length === 1 && settled[0]?.status === "completed" && settled[0]?.id === "compaction:cmp-9",
+    JSON.stringify(settled),
+  );
+  check(
+    "the settle keeps the trigger the loading marker carried",
+    settled[0]?.trigger === "manual",
+    JSON.stringify(settled[0]),
+  );
+  check(
+    "and reports that it invented the close",
+    warnings.length === beforeSettle + 1 && warnings[beforeSettle].includes("cmp-9"),
+    JSON.stringify(warnings.slice(beforeSettle)),
+  );
+  check("settling is idempotent", stuck.settleLoadingCompactions().length === 0);
+  const completed = new TimelineBuilder({ warn: () => {} });
+  for (const event of bracketEvents) completed.consume(event);
+  check(
+    "a bracket that did complete leaves nothing to settle",
+    completed.settleLoadingCompactions().length === 0,
+  );
+}
+
+console.log("\na /compact command row steps aside for the compaction marker");
+{
+  // One keystroke used to draw two rows: the command row and the marker. The
+  // link is DSH's own ids — `compaction.sourceCommandId === command.commandId`
+  // (a real sample: both `cmd-e0bf8ecc-1`) — never the command name, so a
+  // renamed or aliased compact command still maps.
+  const log = (kind) => [
+    { type: "command/run", seq: 1, data: { commandId: "cmd-e0bf8ecc-1", name: "compact", args: "", source: { kind: "user" } } },
+    { type: "compaction/start", seq: 2, data: { compactionId: "cmp-c1", sourceCommandId: "cmd-e0bf8ecc-1", turn: null } },
+    { type: "compaction/summary", seq: 3, data: { compactionId: "cmp-c1", sourceCommandId: "cmd-e0bf8ecc-1", turn: null, summary: [{ type: "text", text: "…" }] } },
+    { type: "command/done", seq: 4, data: { commandId: "cmd-e0bf8ecc-1", name: "compact", kind, text: kind === "error" ? "compaction failed" : "Compacted 3 history items." } },
+  ];
+  const run = (events) => {
+    const builder = new TimelineBuilder({ warn: (line) => warnings.push(line) });
+    return events.flatMap((event) => builder.consume(event));
+  };
+
+  const succeeded = run(log("success"));
+  check(
+    "a successful /compact produces no command row",
+    succeeded.filter((item) => item.type === "tool_call").length === 0,
+    JSON.stringify(succeeded.filter((item) => item.type === "tool_call")),
+  );
+  const markers = succeeded.filter((item) => item.type === "compaction");
+  check(
+    "the compaction marker is its row (loading + one completed)",
+    markers.length === 2 &&
+      markers[0]?.status === "loading" &&
+      markers[1]?.status === "completed",
+    JSON.stringify(markers.map((item) => item.status)),
+  );
+
+  const failedItems = run(log("error"));
+  const failedRow = failedItems.find((item) => item.type === "tool_call");
+  check(
+    "a failed /compact still gets its failed row (the marker cannot carry a failure)",
+    failedRow?.status === "failed" && failedRow?.name === "/compact",
+    JSON.stringify(failedRow),
+  );
+  check(
+    "and the row carries the command's own error text",
+    failedRow?.error?.message === "compaction failed",
+    JSON.stringify(failedRow?.error),
+  );
+
+  // A command no compaction claimed is untouched, and its arguments remain the
+  // head's second half (see the section above).
+  const goal = run([
+    { type: "command/run", seq: 1, data: { commandId: "cmd-g1", name: "goal", args: "  ship it  " } },
+    { type: "command/done", seq: 2, data: { commandId: "cmd-g1", kind: "success", text: "goal set" } },
+  ]);
+  check(
+    "a command with no compaction still gets its row",
+    goal.length === 1 && goal[0]?.name === "/goal",
+    JSON.stringify(goal),
+  );
+  check("and its arguments are the label", goal[0]?.detail?.label === "ship it", JSON.stringify(goal[0]?.detail));
 }
 
 console.log("\nthe resolved locale rides on every item the client transforms");
@@ -805,6 +922,225 @@ console.log("\nevery detail type the server can emit is one the client draws");
     const detail = runTool(name, { a: 1 }, "out").detail;
     check(`${name}: ${detail.type} is drawable`, DRAWABLE.has(detail.type), detail.type);
   }
+}
+
+console.log("\na /command row's second half is its arguments");
+{
+  // The head reads `label · summary`, and `item.name` is already `/name`: the
+  // old `detail.label = "/name"` printed the command twice (`/compact ·
+  // /compact`). The arguments are the one part of the line the head does not
+  // already show, and `/compact` has none.
+  const builder = new TimelineBuilder();
+  builder.consume({ type: "command/run", seq: 1, data: { commandId: "cmd-1", name: "compact", args: "" } });
+  const done = builder.consume({
+    type: "command/done",
+    seq: 2,
+    data: { commandId: "cmd-1", kind: "success", text: "Compacted 3 history items." },
+  });
+  check(
+    "an argument-less command labels its row with an empty string",
+    done[0]?.detail?.label === "",
+    JSON.stringify(done[0]?.detail),
+  );
+  check("the command itself is still the row's name", done[0]?.name === "/compact", JSON.stringify(done[0]?.name));
+  check(
+    "and the output is still carried",
+    done[0]?.detail?.text === "Compacted 3 history items.",
+    JSON.stringify(done[0]?.detail),
+  );
+
+  const withArgs = new TimelineBuilder();
+  withArgs.consume({ type: "command/run", seq: 1, data: { commandId: "cmd-2", name: "goal", args: "  ship the renderer  " } });
+  const goal = withArgs.consume({
+    type: "command/done",
+    seq: 2,
+    data: { commandId: "cmd-2", kind: "success", text: "goal set" },
+  });
+  check(
+    "a command's arguments are trimmed into the label",
+    goal[0]?.detail?.label === "ship the renderer",
+    JSON.stringify(goal[0]?.detail),
+  );
+
+  const odd = new TimelineBuilder();
+  odd.consume({ type: "command/run", seq: 1, data: { commandId: "cmd-3", name: "compact", args: { nope: true } } });
+  const oddDone = odd.consume({
+    type: "command/done",
+    seq: 2,
+    data: { commandId: "cmd-3", kind: "success", text: "x" },
+  });
+  check(
+    "a non-string args field degrades to empty, never back to the command",
+    oddDone[0]?.detail?.label === "",
+    JSON.stringify(oddDone[0]?.detail),
+  );
+
+  // A `command/done` whose `command/run` was never seen (a log that starts
+  // mid-bracket) still gets a row: the fallback title, and no arguments.
+  const orphan = new TimelineBuilder();
+  const orphanRow = orphan.consume({
+    type: "command/done",
+    seq: 1,
+    data: { commandId: "cmd-4", kind: "success", text: "x" },
+  });
+  check(
+    "a command whose run event is missing keeps the fallback title and an empty label",
+    orphanRow[0]?.name === "/command" && orphanRow[0]?.detail?.label === "",
+    JSON.stringify(orphanRow[0]),
+  );
+}
+
+console.log("\nan image block the bridge stamped becomes its own markdown row");
+{
+  const imageResult = (callId, blocks, isError) => ({
+    type: "tool/result",
+    seq: 2,
+    data: {
+      toolCallId: callId,
+      meta: { path: "/tmp/paseo-01.png" },
+      message: { content: blocks, ...(isError === true ? { isError: true } : {}) },
+    },
+  });
+  const attachment = (name) => ({
+    attachmentId: "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+    mediaType: "image/png",
+    bytes: 12344,
+    width: 1600,
+    height: 1000,
+    ...(name === undefined ? {} : { name }),
+  });
+  /** One `read_image` call plus its result, as the builder sees them. */
+  const run = (callId, blocks, isError) => {
+    const builder = new TimelineBuilder();
+    builder.consume({
+      type: "tool/call",
+      seq: 1,
+      data: { callId, name: "read_image", arguments: { file_path: "/tmp/paseo-01.png" } },
+    });
+    return builder.consume(imageResult(callId, blocks, isError));
+  };
+
+  const out = run("i1", [
+    { type: "text", text: "<type>image</type>" },
+    { type: "image", attachment: attachment("paseo-01.png"), hostPath: "/tmp/paseo dir/01 image.png" },
+  ]);
+  const image = out.find((item) => item.type === "assistant_message");
+  check(
+    "the tool row is still there, and the picture follows it",
+    out.length === 2 && out[0]?.type === "tool_call" && out[1]?.type === "assistant_message",
+    JSON.stringify(out.map((item) => item.type)),
+  );
+  check(
+    "the picture row's id is the call plus the block's position, and is its messageId too",
+    image?.id === "image:i1:1" && image?.messageId === "image:i1:1",
+    JSON.stringify(image),
+  );
+  check(
+    "its text is a markdown image with the path encoded segment by segment",
+    image?.text === "![paseo-01.png](file:///tmp/paseo%20dir/01%20image.png)",
+    JSON.stringify(image?.text),
+  );
+  check(
+    "the image block's own fields are not carried onto the row",
+    image !== undefined && !("attachment" in image) && !("hostPath" in image),
+    JSON.stringify(Object.keys(image ?? {})),
+  );
+
+  // The schema the plugin subprocess parses every outgoing event with: an
+  // `assistant_message` needs a non-empty id/messageId/text, so the row has to
+  // survive the boundary rather than only exist in this process.
+  const parsed = ProviderEventSchema.parse({ type: "timeline.item", sessionId: "s1", item: image });
+  check(
+    "the picture row survives ProviderEventSchema.parse",
+    parsed.item.type === "assistant_message" &&
+      parsed.item.text === "![paseo-01.png](file:///tmp/paseo%20dir/01%20image.png)" &&
+      parsed.item.messageId === "image:i1:1",
+    JSON.stringify(parsed.item),
+  );
+
+  // A block the bridge could not stamp — an unresolvable reference — produces no
+  // row at all, rather than an empty line or a picture with no source.
+  const unstamped = run("i2", [
+    { type: "text", text: "<type>image</type>" },
+    { type: "image", attachment: attachment("gone.png") },
+  ]);
+  check(
+    "a block with no hostPath adds no row (and no empty line)",
+    unstamped.length === 1 && unstamped[0]?.type === "tool_call",
+    JSON.stringify(unstamped.map((item) => item.type)),
+  );
+  check(
+    "a result with no image block adds no row",
+    run("i3", [{ type: "text", text: "plain output" }]).length === 1,
+  );
+
+  // The alt text is the attachment's own name, escaped the way the host escapes
+  // it; DSH does not always record a name.
+  const alt = run("i4", [
+    { type: "image", attachment: { attachmentId: "sha256:x", mediaType: "image/png" }, hostPath: "/tmp/a.png" },
+    { type: "image", attachment: attachment("a]b\\c.png"), hostPath: "/tmp/b.png" },
+  ]).filter((item) => item.type === "assistant_message");
+  check(
+    "a nameless attachment is alt-texted Image",
+    alt[0]?.text === "![Image](file:///tmp/a.png)",
+    JSON.stringify(alt[0]?.text),
+  );
+  check(
+    "a name's ] and \\ are escaped the way the host escapes them",
+    alt[1]?.text === "![a\\]b\\\\c.png](file:///tmp/b.png)",
+    JSON.stringify(alt[1]?.text),
+  );
+  check(
+    "a second image gets its own block index in the id",
+    alt[1]?.id === "image:i4:1",
+    JSON.stringify(alt.map((item) => item.id)),
+  );
+
+  // The source shape is the host's, byte for byte: percent-encoding per segment
+  // (a space or a CJK character would otherwise break the destination) and a
+  // `)` escaped so it cannot close the markdown destination early.
+  const encoded = run("i5", [
+    { type: "image", attachment: attachment("图 片.png"), hostPath: "/tmp/图 片/x.png" },
+    { type: "image", attachment: attachment("weird.png"), hostPath: "/tmp/a(b)/c.png" },
+  ]).filter((item) => item.type === "assistant_message");
+  check(
+    "a CJK/space path is percent-encoded segment by segment",
+    encoded[0]?.text === "![图 片.png](file:///tmp/%E5%9B%BE%20%E7%89%87/x.png)",
+    JSON.stringify(encoded[0]?.text),
+  );
+  check(
+    "a ')' in the path is escaped so the destination does not end early",
+    encoded[1]?.text === "![weird.png](file:///tmp/a(b\\)/c.png)",
+    JSON.stringify(encoded[1]?.text),
+  );
+
+  // A failed result whose content still carries a stamped image keeps it: the
+  // block is evidence, not decoration, and the alternative is a silent drop.
+  const failedOut = run(
+    "i6",
+    [{ type: "image", attachment: attachment("kept.png"), hostPath: "/tmp/kept.png" }],
+    true,
+  );
+  check(
+    "a failed result with a stamped image still gets its row",
+    failedOut.length === 2 && failedOut[1]?.text === "![kept.png](file:///tmp/kept.png)",
+    JSON.stringify(failedOut.map((item) => item.type)),
+  );
+
+  // Replay stability: the same log through two fresh builders produces the same
+  // id and the same text, which is what lets Paseo fold/dedup instead of
+  // stacking a second copy. Randomizing the id would break exactly that.
+  const replayed = run("i7", [
+    { type: "image", attachment: attachment("again.png"), hostPath: "/tmp/again.png" },
+  ]);
+  const replayedAgain = run("i7", [
+    { type: "image", attachment: attachment("again.png"), hostPath: "/tmp/again.png" },
+  ]);
+  check(
+    "replaying the same log emits the same id and text (the host then drops the repeat)",
+    JSON.stringify(replayed) === JSON.stringify(replayedAgain),
+    JSON.stringify(replayed[1]),
+  );
 }
 
 console.log("the meta survives the plugin's own event schema");

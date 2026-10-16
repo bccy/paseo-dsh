@@ -44,6 +44,11 @@
  *            transient assistant snapshot) followed by the durable
  *            `assistant/message` for the same turn/step, so the plugin's
  *            folding into one stable item id can be asserted without a model
+ *   image    replay two `read_image`-shaped `tool/result`s whose messages carry
+ *            `{type:"image", attachment}` content blocks: one block the bridge
+ *            stamped with `hostPath`, one it could not resolve. The plugin must
+ *            emit exactly one markdown-image `assistant_message` for the first
+ *            and none for the second
  *
  * `DSH_FAKE_LOG` (a file path) records every request frame, so a test can assert
  * at the protocol boundary how many times a prompt was actually delivered.
@@ -142,6 +147,74 @@ const rootEvents = () => [
   { type: "user/message", seq: 1, data: { source: { kind: "user" }, content: [{ type: "text", text: "hello root" }] } },
   { type: "assistant/message", seq: 2, data: { turn: 1, step: 1, message: { id: "rm1", content: [{ type: "text", text: "root answer" }] }, usage: { inputTokens: 1, outputTokens: 2 } } },
   { type: "turn/end", seq: 3, data: { turn: 1, reason: { kind: "completed" } } },
+];
+
+/**
+ * The `image` scenario: a `read_image` tool result carrying an image content
+ * block, in the shape DSH writes one — a rendered text block plus
+ * `{type:"image", attachment:{…}}`.
+ *
+ * The bridge appends `hostPath` (the attachment's durable absolute path) to a
+ * block whose reference it can resolve, and the plugin turns that into an
+ * `assistant_message` whose text is a markdown image. Two calls, so both halves
+ * can be asserted: `img-1` is stamped, and the space in its path proves the
+ * source is encoded segment by segment; `img-2` is not stamped (an attachment
+ * store that could not resolve the reference) and must produce no row at all.
+ */
+const imageRootEvents = () => [
+  { type: "user/message", seq: 1, data: { source: { kind: "user" }, content: [{ type: "text", text: "look at this picture" }] } },
+  { type: "tool/call", seq: 2, data: { callId: "img-1", name: "read_image", arguments: { file_path: "/tmp/paseo-01.png" } } },
+  {
+    type: "tool/result",
+    seq: 3,
+    data: {
+      toolCallId: "img-1",
+      meta: { path: "/tmp/paseo-01.png" },
+      message: {
+        content: [
+          { type: "text", text: "<path>/tmp/paseo-01.png</path>\n<type>image</type>\n<content>" },
+          {
+            type: "image",
+            attachment: {
+              attachmentId: "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+              mediaType: "image/png",
+              bytes: 12344,
+              width: 1600,
+              height: 1000,
+              name: "paseo-01.png",
+            },
+            hostPath: "/tmp/paseo dir/01 image.png",
+          },
+        ],
+      },
+    },
+  },
+  { type: "tool/call", seq: 4, data: { callId: "img-2", name: "read_image", arguments: { file_path: "/tmp/gone.png" } } },
+  {
+    type: "tool/result",
+    seq: 5,
+    data: {
+      toolCallId: "img-2",
+      meta: { path: "/tmp/gone.png" },
+      message: {
+        content: [
+          { type: "text", text: "<path>/tmp/gone.png</path>\n<type>image</type>\n<content>" },
+          {
+            type: "image",
+            attachment: {
+              attachmentId: "sha256:ffffffffffffffffffffffffffffffff",
+              mediaType: "image/png",
+              bytes: 10,
+              width: 1,
+              height: 1,
+              name: "gone.png",
+            },
+          },
+        ],
+      },
+    },
+  },
+  { type: "turn/end", seq: 6, data: { turn: 1, reason: { kind: "completed" } } },
 ];
 
 function question(id, sessionId, callId) {
@@ -359,6 +432,18 @@ async function emitStream() {
   notify("session.status", { sessionId: rootId, status: "idle" });
 }
 
+/**
+ * Emit the `image` scenario as one root turn: a running status, the two
+ * `read_image` calls and their results, then the terminal status.
+ */
+async function emitImage() {
+  notify("session.status", { sessionId: rootId, status: "running" });
+  for (const event of imageRootEvents()) {
+    notify("session.event", { sessionId: rootId, event });
+  }
+  notify("session.status", { sessionId: rootId, status: "idle" });
+}
+
 function reply(id, result) {
   out({ jsonrpc: "2.0", id, result });
 }
@@ -473,6 +558,9 @@ async function handle(method, params, id) {
       // Both end inside an open turn; only child-M has live evidence.
       if (sid === "child-M") return { available: true, inheritedEventCount: 0, events: liveChildEvents() };
       if (sid === "child-K") return { available: true, inheritedEventCount: 0, events: killedChildEvents() };
+      // The image scenario replays the same log, so a reopen proves the picture
+      // row is rebuilt from history and not only from the live turn.
+      if (MODE === "image") return { available: true, inheritedEventCount: 0, events: imageRootEvents() };
       return { available: true, inheritedEventCount: 0, events: rootEvents() };
     }
     case "session/prompt":
@@ -487,6 +575,10 @@ async function handle(method, params, id) {
       if (MODE === "stream" && !emitted) {
         emitted = true;
         setTimeout(() => { void emitStream(); }, 20);
+      }
+      if (MODE === "image" && !emitted) {
+        emitted = true;
+        setTimeout(() => { void emitImage(); }, 30);
       }
       if (MODE === "steer") {
         if (params?.delivery === "steer") {

@@ -1110,11 +1110,15 @@ export function toolCallData(
       bodyLabel = copy.bodyLabels.plan;
       break;
     case "plain_text":
-      // A `/command` row: `label` is the line that ran, `text` is what it
-      // printed. Taking only the label threw the output away, so a slash
-      // command looked like it did nothing.
-      primary = str(detail, "label") || str(detail, "text");
-      body = primary === str(detail, "text") ? "" : str(detail, "text");
+      // A `/command` row: `label` is the head's second half (the arguments the
+      // command ran with) and `text` is what it printed. The old `|| text`
+      // fallback derived one from the other, which is wrong in both directions:
+      // an argument-less command has an empty `label`, and reading that as "no
+      // label" promoted the output into the summary while the block lost it.
+      // `todo_write` / `ask_user_question` carry only a label, so they are
+      // unaffected — empty is a value here, not an absence.
+      primary = str(detail, "label");
+      body = str(detail, "text");
       bodyLabel = copy.bodyLabels.output;
       break;
     default:
@@ -1171,10 +1175,18 @@ export function toolCallData(
     detailHeadline !== "" ? detailHeadline : description === "" ? "" : primary,
   );
   const structured = search !== null || read !== null || diffBlock !== null || web !== null;
+  const label = toolLabel(item.name);
+  const rawSummary = truncate(description === "" ? primary : description);
+  // The head reads `label · summary`. Two halves saying the same sentence prints
+  // the same line twice — every `/command` row did (`/compact · /compact`), and
+  // so do Chinese `todo_write` (「更新任务清单 · 更新任务清单」) and
+  // `ask_user_question` (「提问 · 提问」). `label` is the row's identity; the
+  // summary either adds something or says nothing.
+  const summary = rawSummary === label ? "" : rawSummary;
 
   return {
     name: item.name,
-    label: toolLabel(item.name),
+    label,
     icon: toolIcon(item.name, detail),
     status: (["running", "completed", "failed", "canceled"] as const).includes(
       item.status as ToolCallData["status"],
@@ -1182,7 +1194,7 @@ export function toolCallData(
       ? (item.status as ToolCallData["status"])
       : "completed",
     phase,
-    summary: truncate(description === "" ? primary : description),
+    summary,
     // A block-specific lead (the pretty arguments of an `unknown` row, the
     // command of a shell row) always wins: a description must not push the block
     // back to the compact one-line form. Otherwise the block leads with the

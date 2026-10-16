@@ -22,6 +22,7 @@ import { BlockAssembler, createUserMessage, ReasoningEffortId } from '@deepseek-
 import { admitEncodedImages } from '@deepseek-ai/dsh-attachment';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import { underArchivedSession } from './archived-lineage.js';
+import { historyEvents, withImageHostPaths } from './image-host-path.js';
 
 function encodedImage(block) {
   return block.type === 'image' && 'data' in block;
@@ -199,7 +200,10 @@ export class PaseoHarnessServer {
         if (child !== undefined && !child.opened) {
           this.holdChildFrame(sessionId, child, { kind: 'event', event });
         } else {
-          this.transport.notify('session.event', { sessionId, event });
+          // An image attachment carries only its reference; the host path Paseo's
+          // renderer needs can be resolved here and nowhere else. See
+          // `image-host-path.js`.
+          this.transport.notify('session.event', { sessionId, event: withImageHostPaths(this.ctx, event) });
         }
       }),
     );
@@ -300,8 +304,14 @@ export class PaseoHarnessServer {
     const buffered = child.buffered;
     child.buffered = [];
     for (const frame of buffered) {
-      if (frame.kind === 'event') this.transport.notify('session.event', { sessionId, event: frame.event });
-      else this.transport.notify('session.status', { sessionId, status: frame.status });
+      if (frame.kind === 'event') {
+        // Held frames skipped the live stamp above, so they get it here, on the
+        // way out, exactly once.
+        this.transport.notify('session.event', {
+          sessionId,
+          event: withImageHostPaths(this.ctx, frame.event),
+        });
+      } else this.transport.notify('session.status', { sessionId, status: frame.status });
     }
   }
 
@@ -805,12 +815,10 @@ export class PaseoHarnessServer {
       return {
         available: true,
         inheritedEventCount,
-        events: (result.events ?? []).map((event) => ({
-          type: event.type,
-          ...(event.seq === undefined ? {} : { seq: event.seq }),
-          ...(event.time === undefined ? {} : { time: event.time }),
-          data: event.data,
-        })),
+        // The replay path Paseo rebuilds a reopened session from. Images are
+        // stamped here too — the source file a tool read is usually gone by
+        // reopen time, and only the attachment's host path still resolves.
+        events: historyEvents(this.ctx, result.events ?? []),
       };
     } catch {
       return { available: true, inheritedEventCount: 0, events: [] };

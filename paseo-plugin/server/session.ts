@@ -478,6 +478,16 @@ export class DshSession {
         this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
       }
     }
+    // A compaction the killed process never closed would otherwise pulse
+    // forever: the replay just emitted its `loading` marker and no completion
+    // will ever arrive. Replay runs during open, when no compaction of this
+    // session can be in flight here — a compaction is driven by a turn or a
+    // command, and neither is running yet — so whatever is still loading is a
+    // bracket the log never finished. The settle reports that it invented the
+    // close.
+    for (const item of builder.settleLoadingCompactions()) {
+      this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
+    }
   }
 
   /**
@@ -1589,6 +1599,11 @@ export class DshChildSession {
       // forever too, so they are settled with the same status `turn/end` gives
       // an aborted turn.
       for (const item of this.#timeline.settleRunningTools()) {
+        this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
+      }
+      // A compaction marker the log left in `loading` pulses for the same
+      // reason and is closed the same way (there is no canceled compaction).
+      for (const item of this.#timeline.settleLoadingCompactions()) {
         this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
       }
       this.#endReplayedTurn("canceled");

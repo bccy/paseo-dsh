@@ -6,6 +6,14 @@
  * icon just looks like a different tool call. So the checks live at the data
  * layer, matching this repo's rule that the UI is not a trustworthy oracle.
  *
+ * Two head-line rules are pinned here because the UI cannot show either one as
+ * wrong: a `plain_text` row's `label` and `text` are *not* interchangeable (an
+ * empty label is a value — a `/compact` with no arguments — and the old
+ * `|| text` fallback turned its output into the summary), and the head's
+ * `summary` is dropped when it repeats `label`, because `label · summary` would
+ * otherwise print the same sentence twice (`/compact · /compact`,
+ * 「更新任务清单 · 更新任务清单」).
+ *
  * Run (from paseo-plugin):
  *   npx tsc client/tool-call-data.ts client/tokens.ts \
  *     --outDir .dbg --rootDir . --module commonjs --moduleResolution node \
@@ -346,6 +354,11 @@ console.log("a row only expands onto something");
   // Regression: every expansion went into a code surface, so a row whose only
   // content is its title drew an empty grey bar. `hasDetail` is the data-layer
   // answer to "is there anything to reveal", which is why it lives here.
+  //
+  // The head reads `label · summary`. When the second half repeats the first it
+  // is not a title, it is the same line printed twice — `/compact · /compact`
+  // was the reported symptom, and Chinese `todo_write` / `ask_user_question`
+  // repeat their own labels the same way.
   const titleOnly = toolCallData(
     { name: "todo_write", status: "completed", detail: { type: "plain_text", label: "更新任务", text: "" } },
     "complete",
@@ -353,17 +366,54 @@ console.log("a row only expands onto something");
   equal("a title-only row reveals nothing", titleOnly.hasDetail, false);
   equal("and is still labelled", titleOnly.summary, "更新任务");
 
-  const command = toolCallData(
+  const todo = toolCallData(
     {
-      name: "goal",
+      name: "todo_write",
       status: "completed",
-      detail: { type: "plain_text", label: "/goal", text: "No goal is currently set." },
+      detail: { type: "plain_text", label: toolLabel("todo_write"), icon: "sparkles" },
     },
     "complete",
   );
-  equal("a slash command is labelled by the line that ran", command.summary, "/goal");
-  equal("and its output is the body, not dropped", command.body, "No goal is currently set.");
+  equal("todo_write: the summary does not repeat the label", todo.summary, "");
+
+  const question = toolCallData(
+    {
+      name: "ask_user_question",
+      status: "completed",
+      detail: { type: "plain_text", label: toolLabel("ask_user_question"), icon: "sparkles" },
+    },
+    "complete",
+  );
+  equal("ask_user_question: the summary does not repeat the label", question.summary, "");
+
+  // A `/command` row: the plugin puts the command in `name` and its *arguments*
+  // in `label`, because the head already carries the command as the label. An
+  // argument-less `/compact` therefore has an empty second half — which the old
+  // `|| text` fallback misread as "no label" and answered by promoting the
+  // command's output into the summary, losing it from the block.
+  const command = toolCallData(
+    {
+      name: "/goal",
+      status: "completed",
+      detail: { type: "plain_text", label: "", text: "No goal is currently set.", icon: "square_terminal" },
+    },
+    "complete",
+  );
+  equal("an argument-less slash command has no summary of its own", command.summary, "");
+  equal("and no block headline either (the label is the whole head)", command.headline, "");
+  equal("but its output is the body, not dropped", command.body, "No goal is currently set.");
   equal("so it has something to reveal", command.hasDetail, true);
+
+  const withArgs = toolCallData(
+    {
+      name: "/goal",
+      status: "completed",
+      detail: { type: "plain_text", label: "ship the renderer", text: "goal set", icon: "square_terminal" },
+    },
+    "complete",
+  );
+  equal("a slash command with arguments shows them as the summary", withArgs.summary, "ship the renderer");
+  equal("and its output is still the body", withArgs.body, "goal set");
 
   const withDetail = toolCallData(
     {
