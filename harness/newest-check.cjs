@@ -29,6 +29,7 @@ const {
   isPulsing,
   noteCommit,
   noteRender,
+  shouldPulse,
 } = require("./client/newest.js");
 
 let passed = 0;
@@ -155,6 +156,27 @@ async function main() {
     check("a newer Date claims it", noteRender(agent, new Date(base + 1000)) === true);
     const commit = noteCommit(agent, base);
     check("a commit is reported", typeof commit.seq === "number" && commit.seenAt === base);
+  }
+
+  console.log("the predicate the renderer actually uses");
+  {
+    // `running` is gated on `newest`. Ungated, an interrupted tool — stuck
+    // `running` in the daemon's store, never newest again — blinks for the rest
+    // of the session. That was measured on the live UI before the gate existed.
+    check("a newest running row pulses", shouldPulse("running", { newest: true, fresh: false }) === true);
+    check("a newest fresh row pulses", shouldPulse("completed", { newest: true, fresh: true }) === true);
+    check("a stale running row does not", shouldPulse("running", { newest: false, fresh: false }) === false);
+    check("a stale fresh row does not", shouldPulse("completed", { newest: false, fresh: true }) === false);
+    check(
+      "a newest but stale finished row does not",
+      shouldPulse("completed", { newest: true, fresh: false }) === false,
+    );
+    check(
+      "a just-committed finished row pulses whatever its outcome",
+      shouldPulse("canceled", { newest: true, fresh: true }) === true &&
+        shouldPulse("failed", { newest: true, fresh: true }) === true,
+    );
+    check("a stale canceled row does not", shouldPulse("canceled", { newest: false, fresh: false }) === false);
   }
 
   console.log(`\n${passed} passed, ${failed} failed`);

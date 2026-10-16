@@ -655,11 +655,16 @@ Reanimated 遮罩没暴露给插件）。
 isLast/index。位置只能在客户端自己算（见下），服务端标了也传不过来。
 
 **修法（最终采用，纯客户端）**：`client/newest.ts` 的 `useRowPulse(agentId, timestamp)` 回答
-"我是不是最新那一行、且刚提交过"。工具行的脉冲条件是：
+"我是不是最新那一行、且刚提交过"，`shouldPulse()` 把工具状态和它合起来。脉冲条件是：
 
 ```
-status === "running" || (newest && fresh)
+newest && (status === "running" || fresh)
 ```
+
+**`running` 也必须挂在 `newest` 下面**：被中断的工具调用（插件在工具执行中途重启，永远等不到
+`tool/result`）在 daemon 的存储里会一直是 `running`，而它再也不会是最新行——不加这道门它就会
+闪到会话结束。服务端会在下一个 `turn/end` 和每次回放时把它们收成 `canceled`，但**已经存进
+daemon 的 item 不会被追溯改写**（实测：重载后旧僵尸行仍在闪），所以客户端也要能自保。
 
 **五个坑，每一个都对应一次真实故障**（子代理审核后又修了一轮）：
 
@@ -686,7 +691,7 @@ reason，包括 `aborted`**）时把它们收成 `canceled`。被中断的工具
 而客户端对 `running` 行不加窗口，不收尾就是**永久脉冲**（live 和每次回放都闪）。同一处还修了
 "重复 `tool/call` 把已完成的行重置回 running 并清空输出"。
 
-**验证**：`harness/newest-check.cjs` 22/22（位置、批次、窗口、交接、回放、时钟）；
+**验证**：`harness/newest-check.cjs` 29/29（位置、批次、窗口、交接、回放、时钟、真实脉冲判据）；
 `harness/timeline-check.cjs` 16/16（工具生命周期、重复调用、中断收尾、回放）；
 `harness/tool-call-check.cjs` 37/37；`harness/plugin-check.cjs` 27/27；`npx tsc --noEmit` 干净。
 

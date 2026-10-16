@@ -159,6 +159,20 @@ export function isPulsing(agentId: string, commit: Commit, now: number): boolean
 }
 
 /**
+ * Whether a row should pulse: only the newest row does.
+ *
+ * `running` is gated on `newest` on purpose. A tool call that was interrupted
+ * (the plugin restarted mid-tool, so no `tool/result` ever arrives) stays
+ * `running` in the daemon's store forever, and it is never the newest row
+ * again — ungated it would blink for the rest of the session. The server closes
+ * those out on the next `turn/end` and on every replay, but an item already
+ * stored is not rewritten retroactively, so the client has to be defensive too.
+ */
+export function shouldPulse(status: string, pulse: RowPulse): boolean {
+  return pulse.newest && (status === "running" || pulse.fresh);
+}
+
+/**
  * The pulse for one timeline row.
  *
  * `newest` is read during render (safe: a running maximum); `fresh` needs the

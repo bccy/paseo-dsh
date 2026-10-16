@@ -19,7 +19,7 @@ import type { PluginTimelineItemProps } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/react-native";
 import { useMemo, useState } from "react";
 import { Pressable, Text, View } from "react-native";
-import { useRowPulse } from "./newest";
+import { shouldPulse, useRowPulse } from "./newest";
 import { useShimmer } from "./shimmer";
 import { type ToolCallData } from "./tool-call-data";
 
@@ -42,11 +42,11 @@ export function InlineToolCall({
   const canExpand = hasBody || data.summary !== "";
   const compact = layout.compact;
   const iconSize = compact ? 14 : 16;
-  // A running tool pulses for as long as it runs. A finished one still pulses
-  // while it is the newest row and recently committed, which is the only way a
-  // short command — call and result in the same tick — ever shows a pulse.
-  const { newest, fresh } = useRowPulse(agentId, timestamp);
-  const shimmer = useShimmer(data.status === "running" || (newest && fresh));
+  // Only the newest row pulses: while it runs, and for a window after it
+  // commits (the only way a short command — call and result in the same tick —
+  // ever shows a pulse). Gating on the newest row also keeps an interrupted
+  // tool, stuck `running` forever, from blinking for the rest of the session.
+  const shimmer = useShimmer(shouldPulse(data.status, useRowPulse(agentId, timestamp)));
 
   const styles = useMemo(
     () => ({
