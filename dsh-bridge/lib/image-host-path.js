@@ -53,7 +53,7 @@
  * @module dsh-paseo-bridge/image-host-path
  */
 
-import { copyFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, extname, join } from 'node:path';
 
@@ -93,6 +93,11 @@ function extensionFor(mediaType) {
 /**
  * Copy one attachment beside its extension, reusing an existing copy.
  *
+ * The copy lands by `rename`, never by writing the target in place: a reader can
+ * then never catch a half-written file, and a copy interrupted by a kill or a
+ * full disk is retried on the next event instead of being served truncated
+ * forever.
+ *
  * Every failure is a `undefined` answer rather than a throw: this runs on the
  * event path, and the caller's contract is that a picture which cannot be made
  * renderable still delivers its tool result. The alternative — throwing — would
@@ -106,13 +111,30 @@ function copyBeside(source, extension) {
   const name = basename(source);
   if (name === '') return undefined;
   const target = join(COPY_DIRECTORY, `${name}${extension}`);
+  const staging = `${target}.${process.pid}.tmp`;
   try {
-    // A zero-byte leftover from an interrupted copy is not an answer.
+    // An already-complete copy is the whole point of the cache.
     if (existsSync(target) && statSync(target).size > 0) return target;
     mkdirSync(COPY_DIRECTORY, { recursive: true });
-    copyFileSync(source, target);
+    // Stage beside the target, then rename into place. `rename` is atomic within
+    // one filesystem, and that is what makes the cache safe on both counts:
+    //   - the daemon runs several sessions, and two of them can replay the same
+    //     attachment at once; writing straight to `target` lets one read a
+    //     half-written file;
+    //   - a copy interrupted by a kill or a full disk would leave a *partial*
+    //     file at `target`, and the size guard above would then serve that
+    //     truncated image forever instead of retrying.
+    copyFileSync(source, staging);
+    renameSync(staging, target);
     return target;
   } catch {
+    // A leftover `.tmp` is untidy, never wrong — and the caller's answer below
+    // is the store's own path either way.
+    try {
+      unlinkSync(staging);
+    } catch {
+      // Nothing staged, or nothing we can do about it.
+    }
     return undefined;
   }
 }
