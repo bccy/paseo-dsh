@@ -222,6 +222,12 @@ console.log("the DSH titles, verbatim (its English table is not regular)");
   // `grep`/`glob` are "Grep"/"Glob" while `web_search` is plain "Search".
   // A later "consistency fix" is exactly what this catches.
   const cases = [
+    // `run_code` is DSH's PTC transport, and it has no `TOOL_TITLE_KEYS` entry
+    // of its own: `TOOL_VARIANTS.run_code = "code"` routes it to the `code`
+    // variant's title, `tool.title.code`. Without a label here the row showed
+    // the wire name `run_code`, which is the silent degradation this file is
+    // for.
+    ["run_code", "代码", "Code"],
     ["bash", "运行命令", "Bash"],
     ["pwsh", "运行命令", "Pwsh"],
     ["grep", "搜索文件内容", "Grep"],

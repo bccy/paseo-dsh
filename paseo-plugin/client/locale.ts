@@ -112,6 +112,12 @@ const TEXT: Record<Locale, UiText> = {
       // DSH's own tools. Its UI titles these through `tool.title.*`; a row that
       // fell through to the wire name + wrench was indistinguishable from an
       // MCP call, which is a different thing entirely.
+      //
+      // `run_code` has no key of its own in DSH: it is the PTC transport, whose
+      // variant is `code` (`TOOL_VARIANTS.run_code = "code"` in
+      // `dsh-client-ui-tool`), so its title is `tool.title.code` — 代码 / Code.
+      // It was the one DSH tool missing here, and it fell back to the wire name.
+      run_code: "Code",
       create_goal: "Create goal",
       get_goal: "View goal",
       update_goal: "Update goal",
@@ -252,6 +258,8 @@ const TEXT: Record<Locale, UiText> = {
       ask_user_question: "提问",
       exit_plan_mode: "计划",
       subagent: "创建子智能体",
+      // DSH 的 `tool.title.code`（`run_code` 是 PTC 传输，变体是 `code`）。
+      run_code: "代码",
       create_goal: "创建目标",
       get_goal: "查看目标",
       update_goal: "更新目标",

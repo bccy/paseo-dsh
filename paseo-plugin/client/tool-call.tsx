@@ -636,7 +636,7 @@ function WebBlockView({ data, styles }: { data: WebBlockData; styles: BlockStyle
       <View style={styles.webBody}>
         {data.answer === "" ? null : <Text style={styles.webSnippet}>{data.answer}</Text>}
         {data.sources.length === 0 ? (
-          <Text style={styles.webMeta}>{copy.noResults}</Text>
+          <Text style={styles.webMeta}>{copy.webNoResults}</Text>
         ) : (
           // DSH caps the citation list at 320px and scrolls it in place; the
           // whole list stays rendered, so scrolling never hides a source.

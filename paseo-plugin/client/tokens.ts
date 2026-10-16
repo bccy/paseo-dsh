@@ -52,8 +52,18 @@ export const ROW_LINE_HEIGHT = 24;
  * two adjacent rows sit 24px apart. (`paddingVertical` used to be 3/5.)
  */
 export const ROW_PADDING_VERTICAL = 0;
-/** Space between the head and the expanded block (DSH's body margin-top). */
-export const ROW_GAP = 3;
+/**
+ * Space between the head and the expanded block.
+ *
+ * The row root has no gap of its own in DSH (`.o3BgMG_root` is a bare
+ * `flex-direction: column`, no `gap`, no `padding`): the space comes from the
+ * card's own `margin: 4px 0 4px 4px`, which every expanded surface carries —
+ * `.o3BgMG_codeBody, .o3BgMG_terminalBody, .o3BgMG_diffBody, .o3BgMG_readBody,
+ * .o3BgMG_imageBody, .o3BgMG_searchBody, .o3BgMG_webBody` and `.o3BgMG_ioCard`
+ * all share that one rule. 4 is therefore the value that reproduces DSH's
+ * head-to-body rhythm (3 used to leave every expanded block 1px tight).
+ */
+export const ROW_GAP = 4;
 /** Icon -> title, DSH's `.leading { margin-right: 6px }`. */
 export const ROW_HEAD_GAP = 6;
 /** Left inset of the expanded block. DSH: `margin: 4px 0 4px 4px` (was 12). */
@@ -235,10 +245,26 @@ export const COMMAND_PADDING_VERTICAL = 9;
 export const COMMAND_PADDING_HORIZONTAL = 14;
 /** `--dsw-font-markdown-code-block-small`: 11px. */
 export const COMMAND_FONT_SIZE = 11;
-/** ToolRow rebinds `--dsl-terminal-line-height` to 18 for the output… */
+/**
+ * The card rebinds `--dsl-terminal-line-height` to 18px
+ * (`.o3BgMG_terminalBody { --dsl-terminal-font: var(--dsw-font-markdown-code-block-small);
+ * --dsl-terminal-line-height: 18px }`), and every line box on it reads that
+ * variable — `.line { min-height: var(--dsl-terminal-line-height) }` for the
+ * output, `.promptLine { line-height: var(--dsl-terminal-line-height) }` for the
+ * command. Both are 18 here because both are 18 there.
+ */
 export const OUTPUT_LINE_HEIGHT = 18;
-/** …but the command banner itself is 11/16. */
-export const COMMAND_LINE_HEIGHT = 16;
+/**
+ * The command banner is 18, the same as the output: `.promptLine` sets
+ * `line-height: var(--dsl-terminal-line-height)`, i.e. the rebound 18px.
+ *
+ * The 16px this used to carry is the line height *inside*
+ * `--dsw-font-markdown-code-block-small` (`11px/16px var(--ds-font-family-code)`,
+ * the shorthand `--dsl-terminal-font` expands to) — and a declared
+ * `line-height` on the element beats that inherited shorthand, so 16 was never
+ * the banner's line box.
+ */
+export const COMMAND_LINE_HEIGHT = 18;
 
 /** `.output { padding: 12px 14px 12px 0 }`, minus DSH's 30px dot gutter. */
 export const OUTPUT_PADDING_VERTICAL = 12;

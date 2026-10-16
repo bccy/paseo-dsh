@@ -101,7 +101,9 @@ console.log("icons (must match Paseo's own mapping)");
     ["edit", { type: "edit" }, "Pencil"],
     ["write", { type: "write" }, "Pencil"],
     ["grep", { type: "search" }, "Search"],
-    ["web_fetch", { type: "fetch" }, "Search"],
+    // DSH draws web_fetch through its own WebRow with IconBrowseOutlineRegular
+    // (the read variant's glyph), not the generic search magnifier.
+    ["web_fetch", { type: "fetch" }, "Eye"],
     ["subagent", { type: "sub_agent" }, "Bot"],
     ["exit_plan_mode", { type: "plan" }, "Brain"],
     ["mystery", { type: "unknown" }, "Wrench"],
@@ -392,6 +394,24 @@ console.log("DSH's own tools are not anonymous");
   // names in Chinese.
   equal("update_goal has a label", toolLabel("update_goal"), "更新目标");
   equal("and its own icon", toolIcon("update_goal", { type: "unknown" }), "Target");
+  // `run_code` is DSH's PTC transport: `TOOL_VARIANTS.run_code = "code"`, so its
+  // title is `tool.title.code` (代码 / Code) and its icon is that variant's
+  // `IconCodeOutlineRegular`. It was the one DSH tool with neither, and rendered
+  // as the wire name `run_code` next to the MCP wrench.
+  equal("run_code has a label", toolLabel("run_code"), "代码");
+  equal("and DSH's `code` variant icon", toolIcon("run_code", { type: "unknown" }), "Code");
+  equal("and keeps it with no detail at all", toolIcon("run_code", undefined), "Code");
+  // `cordis_define` is the one cordis tool whose keyed DSH row
+  // (`dsh-client-ui-cordis`) uses the code glyph rather than the plugin glyph.
+  equal(
+    "cordis_define draws the code glyph, not the wrench",
+    toolIcon("cordis_define", { type: "unknown" }),
+    "Code",
+  );
+  // `present` has a keyed DSH row of its own (`dsh-client-ui-deliverables`,
+  // 交付文件 / "Present files"); its `IconDeliverDocRegular` has no Lucide
+  // counterpart, so `FileOutput` is the documented semantic stand-in.
+  equal("present has the deliverable icon", toolIcon("present", { type: "unknown" }), "FileOutput");
   equal("get_goal too", toolIcon("get_goal", undefined), "Target");
   equal("create_goal too", toolLabel("create_goal"), "创建目标");
   equal("a schedule tool", toolIcon("schedule_create", { type: "unknown" }), "CalendarClock");
@@ -986,7 +1006,24 @@ console.log("web: citations and the fetch status");
   equal("the title is the link text", search.web?.sources[0].label, "Paseo Plugin API");
   equal("an untitled source falls back to its hostname", search.web?.sources[1].label, "docs.example");
   equal("truncated survives", search.web?.truncated, true);
-  equal("the no-results copy", blockCopy().noResults, "无结果");
+  // DSH has two empty-state keys, not one: `search.noResults` (无结果 /
+  // "No results") for the grep/glob card and `web.noResults` (未找到结果 /
+  // "No results found") for this one. The single shared string this used to read
+  // was the web wording in English and the search wording in Chinese — wrong on
+  // both sides at once.
+  equal("the web empty state (DSH web.noResults)", blockCopy().webNoResults, "未找到结果");
+  equal("the search empty state is a different string (DSH search.noResults)", blockCopy().noResults, "无结果");
+  check(
+    "and the two are not the same string in either language",
+    allBlockCopy().en.noResults !== allBlockCopy().en.webNoResults &&
+      allBlockCopy()["zh-CN"].noResults !== allBlockCopy()["zh-CN"].webNoResults,
+    JSON.stringify([
+      allBlockCopy().en.noResults,
+      allBlockCopy().en.webNoResults,
+      allBlockCopy()["zh-CN"].noResults,
+      allBlockCopy()["zh-CN"].webNoResults,
+    ]),
+  );
   equal("the truncation note", blockCopy().sourcesTruncated, "来源列表已截断");
 
   // The current DSH build sends only url/title (72 sources sampled, 0 with a
@@ -1099,6 +1136,8 @@ console.log("the block copy is localized and complete");
     blockCopy().matchesSummary(3, 12, 3, true),
     "显示 3 / 共 12 处匹配 · 3 个文件",
   );
+  equal("zh search empty state", blockCopy().noResults, "无结果");
+  equal("zh web empty state", blockCopy().webNoResults, "未找到结果");
 
   setLocale("en");
   equal("en copy", blockCopy().copy, "Copy");
@@ -1109,6 +1148,8 @@ console.log("the block copy is localized and complete");
     blockCopy().matchesSummary(3, 12, 3, true),
     "Showing 3 of 12 matches · 3 files",
   );
+  equal("en search empty state", blockCopy().noResults, "No results");
+  equal("en web empty state", blockCopy().webNoResults, "No results found");
   equal("en paths truncated", blockCopy().pathsSummary(2, 9, true), "Showing 2 of 9 paths");
   equal("en window", blockCopy().window(2, 120), "Showing 2 of 120 lines");
   equal("en content note", blockCopy().contentTruncated, "Content truncated");

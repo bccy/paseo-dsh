@@ -57,6 +57,7 @@ const {
   READ_GUTTER_MARGIN,
   READ_GUTTER_MIN_DIGITS,
   ROW_FONT_SIZE,
+  ROW_GAP,
   ROW_HEAD_GAP,
   ROW_HEIGHT,
   ROW_LINE_HEIGHT,
@@ -198,6 +199,13 @@ console.log("the row head is a fixed 24px line");
   equal("row font size", ROW_FONT_SIZE, 13);
   equal("row line height", ROW_LINE_HEIGHT, 24);
   equal("no vertical padding left on the row", rowRootStyle().paddingVertical, 0);
+  // DSH's row root has no gap either: the head-to-body 4px is the expanded
+  // card's own `margin: 4px 0 4px 4px` (`.o3BgMG_codeBody, .o3BgMG_terminalBody,
+  // .o3BgMG_diffBody, .o3BgMG_readBody, .o3BgMG_imageBody, .o3BgMG_searchBody,
+  // .o3BgMG_webBody` and `.o3BgMG_ioCard` share one rule). 3 was the last
+  // un-closed value from the old row.
+  equal("head-to-body gap (DSH's card margin-top)", ROW_GAP, 4);
+  equal("and that is the row root's gap", rowRootStyle().gap, 4);
   equal("the head line is exactly the row height", rowHeadStyle().height, 24);
   equal("icon to title gap", ROW_HEAD_GAP, 6);
   equal("expanded body indent", BODY_INDENT, 4);
@@ -250,11 +258,15 @@ console.log("the command banner and the output region are split");
   equal("banner padding V", COMMAND_PADDING_VERTICAL, 9);
   equal("banner padding H", COMMAND_PADDING_HORIZONTAL, 14);
   equal("command size", COMMAND_FONT_SIZE, 11);
-  equal("command line height", COMMAND_LINE_HEIGHT, 16);
+  // `.promptLine { line-height: var(--dsl-terminal-line-height) }`, and the card
+  // rebinds that variable to 18px (`.o3BgMG_terminalBody`). The 16px in
+  // `--dsl-terminal-font`'s shorthand (`11px/16px …`) is inherited, not declared,
+  // so it never wins on this element.
+  equal("command line height (the card's rebound 18)", COMMAND_LINE_HEIGHT, 18);
   equal("command region", JSON.stringify(commandRegionStyle()), JSON.stringify({ paddingVertical: 9, paddingHorizontal: 14 }));
   const command = commandTextStyle(COLORS);
   equal("command size in the style", command.fontSize, 11);
-  equal("command line height in the style", command.lineHeight, 16);
+  equal("command line height in the style", command.lineHeight, 18);
   equal("command uses the high-contrast foreground", command.color, COLORS.foreground);
   equal("command is monospace", command.fontFamily, CODE_FONT_FAMILY);
 
@@ -271,7 +283,17 @@ console.log("the command banner and the output region are split");
   equal("code size", CODE_FONT_SIZE, 11);
   equal("code line height", CODE_LINE_HEIGHT, 19);
   equal("code region", JSON.stringify(codeRegionStyle()), JSON.stringify({ paddingVertical: 12, paddingHorizontal: 14 }));
-  check("the command line is tighter than the output", COMMAND_LINE_HEIGHT < OUTPUT_LINE_HEIGHT);
+  // The old assertion here was `COMMAND_LINE_HEIGHT < OUTPUT_LINE_HEIGHT` ("the
+  // command line is tighter than the output"). That encoded a wrong reading of
+  // DSH: both are the same `--dsl-terminal-line-height` (18px) on the tool card.
+  // The assertion is not relaxed, it is replaced by the equality that is true —
+  // a future "make the banner tighter again" edit still fails here.
+  equal("the banner and the output share one line height (DSH rebinds both to 18)", COMMAND_LINE_HEIGHT, OUTPUT_LINE_HEIGHT);
+  check(
+    "and both are 18, the card's rebound value",
+    COMMAND_LINE_HEIGHT === 18 && OUTPUT_LINE_HEIGHT === 18,
+    `${COMMAND_LINE_HEIGHT} / ${OUTPUT_LINE_HEIGHT}`,
+  );
 }
 
 console.log("folding: DSH's headTailCap, shared by search, read and diff");

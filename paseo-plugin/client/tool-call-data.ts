@@ -195,7 +195,10 @@ export interface BlockCopy {
   collapseAria: string;
   pathsSummary(shown: number, total: number, truncated: boolean): string;
   matchesSummary(shown: number, total: number, files: number, truncated: boolean): string;
+  /** DSH's `search.noResults` — the grep/glob card's empty state. */
   noResults: string;
+  /** DSH's `web.noResults` — the web-search card's empty state, a different string. */
+  webNoResults: string;
   http: string;
   contentTruncated: string;
   sourcesTruncated: string;
@@ -218,7 +221,8 @@ const BLOCK_COPY: Record<"en" | "zh-CN", BlockCopy> = {
       truncated
         ? `Showing ${shown} of ${total} matches · ${files} files`
         : `${shown} matches · ${files} files`,
-    noResults: "No results found",
+    noResults: "No results",
+    webNoResults: "No results found",
     http: "HTTP",
     contentTruncated: "Content truncated",
     sourcesTruncated: "Sources truncated",
@@ -240,6 +244,7 @@ const BLOCK_COPY: Record<"en" | "zh-CN", BlockCopy> = {
         ? `显示 ${shown} / 共 ${total} 处匹配 · ${files} 个文件`
         : `${shown} 处匹配 · ${files} 个文件`,
     noResults: "无结果",
+    webNoResults: "未找到结果",
     http: "HTTP",
     contentTruncated: "内容已截断",
     sourcesTruncated: "来源列表已截断",
@@ -733,6 +738,11 @@ const BODY_LIMIT = 6000;
  * live in `./locale`.
  */
 const TOOL_NAME_ICONS: Record<string, string> = {
+  // `run_code` is DSH's PTC transport. Its variant is `code`
+  // (`TOOL_VARIANTS.run_code = "code"`), whose icon is
+  // `IconCodeOutlineRegular`; without this entry the row fell to
+  // `DETAIL_ICONS.unknown` and drew the MCP wrench.
+  run_code: "Code",
   create_goal: "Target",
   get_goal: "Target",
   update_goal: "Target",
@@ -772,6 +782,12 @@ const TOOL_NAME_ICONS: Record<string, string> = {
   cordis_inspect_list: "Plug",
   cordis_inspect_query: "Plug",
   cordis_inspect_self: "Plug",
+  // The one cordis tool DSH does *not* draw with the plugin glyph: its keyed
+  // row (`dsh-client-ui-cordis`, `CordisDefineRow`) uses
+  // `IconCodeOutlineRegular` — the same glyph as the `code` variant — because
+  // the call registers plugin source. Left out of the table above it drew the
+  // wrench.
+  cordis_define: "Code",
   // A profile other than this one's can mount these: the team tools come with
   // the agent-team bundle, `lsp` with the language-server profile, `skill` and
   // the MCP-resource tools are DSH's own. Without an entry each of them read as
@@ -788,6 +804,13 @@ const TOOL_NAME_ICONS: Record<string, string> = {
   list_mcp_resources: "Server",
   read_mcp_resource: "FileText",
   list_mcp_resource_templates: "Server",
+  // `present` is DSH's deliverable row (`dsh-client-ui-deliverables` registers a
+  // keyed toolview for it, titled 交付文件 / "Present files"). Its own glyph is
+  // `IconDeliverDocRegular` — a document over two perspective planes — which has
+  // no Lucide counterpart; `FileOutput` is the nearest *meaning* (files handed
+  // out of the session), the same way bash's `IconApiOutlineRegular` maps to
+  // `SquareTerminal`. Without an entry the row drew the wrench.
+  present: "FileOutput",
 };
 
 /**
@@ -831,12 +854,30 @@ const PLAIN_ICONS: Record<string, string> = {
   mic_vocal: "MicVocal",
 };
 
+/**
+ * The two web tools, which DSH draws with a row of its own (`WebRow`, in
+ * `dsh-client-ui-tool`'s `toolviews/web-row.js`) instead of a generic one.
+ *
+ * That row dispatches on the tool name and picks `IconGlobeOutlineRegular` for
+ * `web_search` and `IconBrowseOutlineRegular` for `web_fetch` — the browse glyph
+ * being the one the `read` row uses. Neither is the magnifier their *detail*
+ * would produce: `web_search` arrives as a `search` detail (shared with
+ * grep/glob, which keep the magnifier) and `web_fetch` as a `fetch` detail. So
+ * the name — not the detail — decides here, exactly as it does in DSH.
+ */
+const WEB_ROW_ICONS: Record<string, string> = {
+  web_search: "Globe",
+  web_fetch: "Eye",
+};
+
 /** Choose the same icon Paseo's stock row would. */
 export function toolIcon(name: string, detail: ToolDetail | undefined): string {
   const normalized = name.trim().toLowerCase();
   if (detail !== undefined && detail.type === "plain_text" && typeof detail.icon === "string") {
     return PLAIN_ICONS[detail.icon] ?? "Wrench";
   }
+  const webRow = WEB_ROW_ICONS[normalized];
+  if (webRow !== undefined) return webRow;
   if (normalized === "thinking" && (detail === undefined || detail.type === "unknown")) return "Sparkle";
   if (normalized === "speak") return "MicVocal";
   if (normalized === "task") return "Bot";
