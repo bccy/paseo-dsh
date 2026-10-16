@@ -285,7 +285,9 @@ async function handle(method, params, id) {
         available: true,
         subagents: [
           { sessionId: "child-A", parentSessionId: String(params?.sessionId ?? ""), mode: "continuable", label: "Research A" },
-          { sessionId: "child-B", parentSessionId: "child-A", mode: "one-shot", label: "Nested B" },
+          // A one-shot child has no label in the catalog (DSH only requires one
+          // for a continuable child); its label lives in its own descriptor.
+          { sessionId: "child-B", parentSessionId: "child-A", mode: "one-shot" },
         ],
       };
     case "paseo/history": {
@@ -302,7 +304,16 @@ async function handle(method, params, id) {
           ],
         };
       }
-      if (sid === "child-B") return { available: true, inheritedEventCount: 0, events: childBEvents() };
+      if (sid === "child-B") {
+        return {
+          available: true,
+          inheritedEventCount: 0,
+          events: [
+            { type: "subagent/descriptor", seq: 0, data: { label: "Nested B" } },
+            ...childBEvents(),
+          ],
+        };
+      }
       return { available: true, inheritedEventCount: 0, events: rootEvents() };
     }
     case "session/prompt":

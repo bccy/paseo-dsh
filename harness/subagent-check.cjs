@@ -249,6 +249,14 @@ async function openSession(conn, sessionId, history) {
     `ready#${readyIdx} child#${openedIdx}`,
   );
 
+  // ---- a replayed one-shot child: label only in its own history ----------
+  // The durable catalog omits the label of a one-shot child, but the title it
+  // opens with is the only one it can ever have (children have no configuration
+  // channel), so the replay has to read the descriptor out of the child's own
+  // history before opening it.
+  const replayOpens = events.filter((e) => e.type === "session.opened" && e.sessionId.endsWith(":sub:child-B"));
+  check("a replayed one-shot child opens with its own descriptor's label", replayOpens.length > 0 && replayOpens.every((e) => e.title === "Nested B"), JSON.stringify(replayOpens.map((e) => e.title)));
+
   // ---- a child whose label arrives after its notice ----------------------
   // Paseo shows a child whose title never arrived as "加载中…" forever, and a
   // child has no configuration channel, so the title it opens with is the only

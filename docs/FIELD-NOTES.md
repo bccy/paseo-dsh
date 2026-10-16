@@ -1008,10 +1008,23 @@ browser → `Globe`…）。
 `session.opened` 带的是真标题。兜底仍在：某个子会话压了 `CHILD_LABEL_WAIT_EVENTS = 40` 个事件
 还没等到 label，就按老办法无标题打开，绝不丢输出。
 
-**验证**：`harness/subagent-check.cjs` **40/40**。假桥新增 `label-late` 模式（先发无 label 的
+**第二个来源：重放路径**（同一症状的另一半）。`replaySubagents()` 用的是持久 catalog 的
+`row.label`，而 **one-shot 子会话在 catalog 里根本没有 label** —— DSH 只对 `continuable` 强制要求
+label（`catalogFact()` 的校验：`mode === "continuable" && typeof label !== "string"` 即非法）。
+所以每次重开session，重放都会把 one-shot 子会话**无标题**打开一遍。修法：**先读该子会话自己的
+历史**，从它的 `subagent/descriptor` 里取 label，再打开（顺序调换，代价只是本来就要发的
+`paseo/history`）。
+
+**还有一个不是我们能修的**：每次 `paseo plugin reload` 之后，插件内存清零，重开 session 时会把
+每个子会话**重新播报**一遍 `session.opened`，而 App 的 Subagent 面板**不会**把上一次的条目去掉，
+于是列表随着重载次数线性增长（用户观察到 4 → 14）。面板里有「归档已完成的 subagent」可以清。
+要根治得让 daemon 按 provider session id 去重，那不在本仓库范围内。
+
+**验证**：`harness/subagent-check.cjs` **41/41**。假桥新增 `label-late` 模式（先发无 label 的
 `session.child-opened`，再由 `subagent/descriptor` 补 label），断言三条：**标题等于 `Late L`**、
-**只打开一次**、**压住的输出仍然到齐**。原有的 37 条（父子次序、held 子树、replay、error、
-steer）全部保持通过。实机侧另有 `harness/subagent-live.mjs`（4/4，一次 `child-opened`、
+**只打开一次**、**压住的输出仍然到齐**；replay 场景里 child-B 也改成真实的 one-shot 形状
+（catalog 无 label、label 只在它自己的 descriptor 里），断言重放后标题仍是 `Nested B`。
+原有的 37 条（父子次序、held 子树、replay、error、steer）全部保持通过。实机侧另有 `harness/subagent-live.mjs`（4/4，一次 `child-opened`、
 label 正确、子会话有自己的时间线）。
 
 ---

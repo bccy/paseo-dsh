@@ -106,6 +106,18 @@ function subagentLabel(data: unknown): string | undefined {
   return typeof label === "string" && label !== "" ? label : undefined;
 }
 
+/** The first durable creation label in a replayed child's own history. */
+function labelFromHistory(
+  events: Array<{ type: string; data?: unknown }>,
+): string | undefined {
+  for (const event of events) {
+    if (event.type !== "subagent/descriptor") continue;
+    const label = subagentLabel(event.data);
+    if (label !== undefined) return label;
+  }
+  return undefined;
+}
+
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -494,16 +506,6 @@ export class DshSession {
     }
     for (const row of listing.subagents) {
       if (this.#closed) return;
-      const child = this.#openChildNow({
-        sessionId: row.sessionId,
-        parentSessionId: row.parentSessionId,
-        ...(row.mode === undefined ? {} : { mode: row.mode }),
-        ...(row.label === undefined ? {} : { label: row.label }),
-      });
-      if (child === undefined) {
-        this.#options.log(`subagent ${row.sessionId} has an unresolved parent ${row.parentSessionId}`);
-        continue;
-      }
       let history: {
         events: Array<{ type: string; seq?: number; time?: number; data: unknown }>;
         inheritedEventCount: number;
@@ -515,6 +517,23 @@ export class DshSession {
         continue;
       }
       if (this.#closed) return;
+      // A one-shot child has no label in the durable catalog — DSH only requires
+      // one for a continuable child — but the child's own `subagent/descriptor`
+      // carries its creation label. Read it from the history *before* opening:
+      // a child has no configuration channel, so the title it is opened with is
+      // the only one it can ever have, and opening without one leaves Paseo
+      // showing "加载中…" forever.
+      const label = row.label ?? labelFromHistory(history.events);
+      const child = this.#openChildNow({
+        sessionId: row.sessionId,
+        parentSessionId: row.parentSessionId,
+        ...(row.mode === undefined ? {} : { mode: row.mode }),
+        ...(label === undefined ? {} : { label }),
+      });
+      if (child === undefined) {
+        this.#options.log(`subagent ${row.sessionId} has an unresolved parent ${row.parentSessionId}`);
+        continue;
+      }
       child.replay(history.events, history.inheritedEventCount);
     }
   }
