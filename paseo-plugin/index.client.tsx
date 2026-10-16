@@ -69,6 +69,7 @@ export default function contribute(client: PluginClientContext) {
       status: z.enum(["running", "completed", "failed", "canceled"]),
       phase: z.enum(["streaming", "complete"]),
       summary: z.string(),
+      headline: z.string(),
       body: z.string(),
       bodyLabel: z.string(),
       diff: z.boolean(),

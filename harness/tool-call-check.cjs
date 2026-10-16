@@ -159,5 +159,43 @@ console.log("labels");
   equal("unknown tool keeps its name", toolLabel("frobnicate"), "frobnicate");
 }
 
+console.log("the description is the row's label");
+{
+  // DSH's bash tool requires a model-written `description` on every call and its
+  // own UI titles the row with it ("List DSH checkout root"), not with the
+  // command. The plugin carries it on the item's provider metadata because the
+  // `shell` detail has no field for it.
+  const described = toolCallData(
+    {
+      name: "bash",
+      status: "completed",
+      detail: { type: "shell", command: "pwd; ls -d /tmp", output: "/tmp" },
+      metadata: { description: "List DSH checkout root" },
+    },
+    "complete",
+  );
+  equal("the description is the label", described.summary, "List DSH checkout root");
+  equal("the command moves to the expanded headline", described.headline, "pwd; ls -d /tmp");
+  equal("the output is still the body", described.body, "/tmp");
+
+  const plain = toolCallData(
+    { name: "bash", status: "completed", detail: { type: "shell", command: "pwd", output: "/tmp" } },
+    "complete",
+  );
+  equal("without a description the command is the label", plain.summary, "pwd");
+  equal("and nothing is repeated when expanded", plain.headline, "");
+
+  const empty = toolCallData(
+    {
+      name: "bash",
+      status: "completed",
+      detail: { type: "shell", command: "pwd", output: "" },
+      metadata: { description: "" },
+    },
+    "complete",
+  );
+  equal("an empty description is ignored", empty.summary, "pwd");
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

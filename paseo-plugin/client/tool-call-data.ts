@@ -13,7 +13,13 @@ export interface ToolCallData {
   icon: string;
   status: "running" | "completed" | "failed" | "canceled";
   phase: "streaming" | "complete";
+  /** The row's one-line label: the tool's description when it has one. */
   summary: string;
+  /**
+   * What the expanded block shows first: the tool's own subject (the command,
+   * the path, the query). Empty when it would just repeat `summary`.
+   */
+  headline: string;
   body: string;
   bodyLabel: string;
   diff: boolean;
@@ -109,13 +115,22 @@ export function toolCallData(
     status: string;
     detail: unknown;
     error?: unknown;
+    metadata?: unknown;
   },
   phase: "streaming" | "complete",
 ): ToolCallData {
   const detail = (item.detail ?? {}) as ToolDetail;
+  const metadata = (item.metadata ?? {}) as ToolDetail;
   const type = str(detail, "type");
   const failed = item.status === "failed";
-  let summary = "";
+  // DSH's bash tool requires a model-written `description` for every call and
+  // its own UI titles the row with it ("List DSH checkout root"), not with the
+  // command. The plugin carries it on the item's provider metadata because the
+  // shell detail has no field for it.
+  const description = str(metadata, "description");
+  // The tool's own subject. It becomes the row's label only when there is no
+  // description, and is what the expanded block shows.
+  let primary = "";
   let body = "";
   let bodyLabel = "输出";
   let diff = false;
@@ -123,25 +138,25 @@ export function toolCallData(
 
   switch (type) {
     case "shell":
-      summary = str(detail, "command");
+      primary = str(detail, "command");
       body = str(detail, "output");
       bodyLabel = "输出";
       break;
     case "read":
-      summary = str(detail, "filePath");
+      primary = str(detail, "filePath");
       body = str(detail, "content");
       bodyLabel = "内容";
       code = true;
       break;
     case "write":
-      summary = str(detail, "filePath");
+      primary = str(detail, "filePath");
       body = str(detail, "content");
       bodyLabel = "写入内容";
       diff = true;
       code = true;
       break;
     case "edit":
-      summary = str(detail, "filePath");
+      primary = str(detail, "filePath");
       body = str(detail, "unifiedDiff");
       if (body === "") {
         const oldText = str(detail, "oldString");
@@ -157,40 +172,40 @@ export function toolCallData(
       code = true;
       break;
     case "search":
-      summary = str(detail, "query");
+      primary = str(detail, "query");
       body = str(detail, "content");
       bodyLabel = "结果";
       code = true;
       break;
     case "fetch":
-      summary = str(detail, "url");
+      primary = str(detail, "url");
       body = str(detail, "result");
       bodyLabel = "响应";
       break;
     case "sub_agent":
-      summary = str(detail, "description") || str(detail, "subAgentType");
+      primary = str(detail, "description") || str(detail, "subAgentType");
       body = str(detail, "log");
       bodyLabel = "日志";
       break;
     case "plan":
-      summary = "计划";
+      primary = "计划";
       body = str(detail, "text");
       bodyLabel = "计划";
       break;
     case "plain_text":
-      summary = str(detail, "label") || str(detail, "text");
+      primary = str(detail, "label") || str(detail, "text");
       break;
     default:
-      summary = "";
+      primary = "";
       body = "";
       break;
   }
 
-  if (summary === "" && type === "unknown") {
+  if (primary === "" && type === "unknown") {
     try {
-      summary = JSON.stringify(detail.input ?? "");
+      primary = JSON.stringify(detail.input ?? "");
     } catch {
-      summary = "";
+      primary = "";
     }
   }
 
@@ -204,7 +219,8 @@ export function toolCallData(
       ? (item.status as ToolCallData["status"])
       : "completed",
     phase,
-    summary: truncate(summary),
+    summary: truncate(description === "" ? primary : description),
+    headline: truncate(description === "" ? "" : primary),
     body: truncate(body),
     bodyLabel,
     diff,

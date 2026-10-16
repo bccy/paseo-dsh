@@ -146,5 +146,45 @@ console.log("replay of an interrupted session");
   check("replay reaches canceled too", out[0]?.status === "canceled");
 }
 
+console.log("the description rides on provider metadata");
+{
+  // Paseo's `shell` detail has no field for DSH's model-written description, so
+  // it travels on the item's provider-owned `metadata`. The client reads it back
+  // to title the row the way DSH's own UI does.
+  const builder = new TimelineBuilder();
+  const started = builder.consume({
+    type: "tool/call",
+    seq: 1,
+    data: {
+      callId: "d1",
+      name: "bash",
+      arguments: { command: "pwd", description: "List DSH checkout root" },
+    },
+  });
+  check(
+    "a described call carries it",
+    started[0]?.metadata?.description === "List DSH checkout root",
+    JSON.stringify(started[0]?.metadata),
+  );
+  const done = builder.consume({
+    type: "tool/result",
+    seq: 2,
+    data: { toolCallId: "d1", message: { content: [{ type: "text", text: "/tmp" }] } },
+  });
+  check(
+    "and the finished row still carries it",
+    done[0]?.metadata?.description === "List DSH checkout root",
+    JSON.stringify(done[0]?.metadata),
+  );
+
+  const bare = new TimelineBuilder();
+  const plain = bare.consume({
+    type: "tool/call",
+    seq: 1,
+    data: { callId: "d2", name: "bash", arguments: { command: "pwd" } },
+  });
+  check("a call with no description adds no metadata", plain[0]?.metadata === undefined);
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

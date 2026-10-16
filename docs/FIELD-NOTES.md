@@ -759,6 +759,33 @@ diff 行按 GitHub 的做法：浅绿/浅红底（低 alpha，深色主题也不
 正在改代码的那个 agent。改完客户端代码要重载时，先把要做的验证/文档做完，或用一个
 一次性 heartbeat 在重载后把自己唤醒。
 
+### 31. 工具行的标题用 DSH 的 `description`，不是原始命令
+
+**症状**：DSH 原版界面里命令行显示的是 `运行命令 · List DSH checkout root` 这种**人写的描述**，
+Paseo 这边却是 `命令 pwd; ls -d /home/yywl/.dsh 2>/dev/null && ...` 一长串原始命令。
+
+**根因**：`dsh-tool-bash` 的入参里**必带 `description`**（`validateBashArgs` 里
+`args.description.trim().length === 0` 直接抛错），DSH 的 UI 拿它当标题；插件这边把
+`input.description` 丢掉了，客户端只能拿 `detail.command` 当摘要。
+
+**坑：协议里没有它的位置。** Paseo 的 `shell` detail 只有 `command / cwd / output / exitCode`，
+而仓库硬性约束是"不要自造协议形状"。所以描述走 **item 的 `metadata`**——那是 provider 自己的
+袋子（`ProviderToolCallItem.metadata?: Record<string, JsonValue>`），daemon 的
+`mapTimelineItem` 对 tool_call 返回 `withoutIdentity`，`metadata` 会原样带到客户端。
+
+**实现**：`server/timeline.ts` 的 `toolMetadata(input)` 在 `tool/call` 和 `tool/result` 两条
+路径上挂 `{ description }`；`client/tool-call-data.ts` 读 `item.metadata.description`，产出
+
+- `summary` = 描述（没有描述时退回命令/路径/查询）；
+- `headline` = 工具自己的主体（命令），**仅在两者不同时非空**，展开时显示在输出上方，避免
+  重复折叠态已经给过的信息。
+
+DSH 原版那行还有 `● yywl`（执行者）和"复制"按钮，我们没有跟进——那是它的宿主 chrome，
+不是这行信息本身。
+
+**验证**：`harness/timeline-check.cjs`（描述确实挂在 metadata 上、结果行仍带着、没描述就不加）、
+`harness/tool-call-check.cjs`（描述 → `summary`，命令 → `headline`，空描述忽略）。
+
 ---
 
 ## 已知限制（未修，有意为之）

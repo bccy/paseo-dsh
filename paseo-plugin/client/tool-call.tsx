@@ -39,7 +39,7 @@ export function InlineToolCall({
   const hasBody = data.body !== "";
   // Even a tool with no output can have a command longer than the row, so it
   // must still be expandable: expanding lays the full command out below.
-  const canExpand = hasBody || data.summary !== "";
+  const canExpand = hasBody || data.summary !== "" || data.headline !== "";
   const compact = layout.compact;
   const iconSize = compact ? 14 : 16;
   // Only the newest row pulses: while it runs, and for a window after it
@@ -135,7 +135,9 @@ export function InlineToolCall({
       </View>
       {expanded && canExpand ? (
         <View style={styles.body}>
-          {data.summary !== "" ? <Text style={styles.summaryFull}>{data.summary}</Text> : null}
+          {/* The row's own line is the tool's description; the expanded block
+              leads with the subject it describes — the actual command. */}
+          {data.headline !== "" ? <Text style={styles.summaryFull}>{data.headline}</Text> : null}
           {hasBody ? (
             data.diff ? (
               data.body.split("\n").map((line, index) => {

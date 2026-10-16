@@ -60,6 +60,19 @@ function stringField(source: Record<string, unknown>, key: string): string | und
 }
 
 /** Map one DSH tool call onto the richest Paseo tool detail available. */
+/**
+ * Provider metadata for one tool call.
+ *
+ * DSH's bash tool requires a model-written `description` on every call, and
+ * DSH's own UI titles the row with it rather than with the command. Paseo's
+ * `shell` detail has no field for it, so it rides on the item's provider-owned
+ * `metadata`, which the client reads back in `toolCallData`.
+ */
+function toolMetadata(input: Record<string, unknown>): Record<string, JsonValue> | undefined {
+  const description = stringField(input, "description");
+  return description === undefined || description === "" ? undefined : { description };
+}
+
 function toolDetail(name: string, input: Record<string, unknown>, output?: string): ProviderToolCallDetail {
   const filePath = stringField(input, "file_path") ?? stringField(input, "filePath");
   switch (name) {
@@ -318,6 +331,7 @@ export class TimelineBuilder {
         callId,
         name,
         detail: toolDetail(name, input, output === "" ? undefined : output),
+        ...(toolMetadata(input) === undefined ? {} : { metadata: toolMetadata(input) as Record<string, JsonValue> }),
         ...(failed
           ? { status: "failed" as const, error: { message: output || "tool failed" } }
           : { status: "completed" as const, error: null }),
@@ -414,6 +428,7 @@ export class TimelineBuilder {
       callId,
       name,
       detail: toolDetail(name, input),
+      ...(toolMetadata(input) === undefined ? {} : { metadata: toolMetadata(input) as Record<string, JsonValue> }),
       ...(status === "failed"
         ? { status: "failed" as const, error: { message: "tool failed" } }
         : { status, error: null }),
