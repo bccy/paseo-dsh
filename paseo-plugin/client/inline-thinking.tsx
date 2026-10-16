@@ -18,7 +18,7 @@
 import type { PluginTimelineItemProps } from "@getpaseo/plugin/client";
 import { Icon, useRevealedText } from "@getpaseo/plugin/client/react-native";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Animated, Pressable, Text, View } from "react-native";
+import { Pressable, Text, View } from "react-native";
 import { useShimmer } from "./shimmer";
 
 export interface InlineThinkingData {
@@ -117,14 +117,14 @@ export function InlineThinking({
           size={layout.compact ? 14 : 16}
           color={theme.colors.foregroundMuted}
         />
-        <Animated.View style={[styles.textRow, { opacity: shimmer }]}>
+        <View style={[styles.textRow, { opacity: shimmer }]}>
           <Text style={styles.label}>{growing ? "思考中…" : "已思考"}</Text>
           {!open ? (
             <Text style={styles.line} numberOfLines={1}>
               {line}
             </Text>
           ) : null}
-        </Animated.View>
+        </View>
       </View>
       {open ? (
         // Render the raw source, not the paced reveal: a per-frame re-render of

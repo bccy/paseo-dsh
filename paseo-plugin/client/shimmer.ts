@@ -3,75 +3,71 @@
  *
  * Paseo's own loading rows shimmer, but that lives in the host app and is not
  * exposed to plugins (`@getpaseo/plugin` exports no spinner or shimmer
- * primitive). What a plugin *can* do is pulse the row's opacity through React
- * Native's `Animated.Value`, which reads as the same "this is still running"
- * signal on web, desktop and mobile without any host module.
+ * primitive). So the plugin drives the row's opacity itself.
  *
- * Three details are deliberate, each learned from a version that failed:
+ * The opacity is plain React state, not an `Animated.Value`. Every
+ * `Animated`-based version failed on at least one client:
  *
- * - The cycle is a plain `setInterval` calling `setValue`, not `Animated.loop`
- *   or `Animated.timing`. Under React Native Web both run one leg and then stop,
- *   freezing the row at the dim end.
- * - The animated value is a module-level singleton, so a row that remounts (the
- *   host rebuilds timeline items freely) joins the cycle already in progress
- *   instead of restarting it from full opacity.
- * - `useShimmer` hands that singleton to a row **only while it is running**; an
- *   idle row gets a constant 1. Returning the shared value unconditionally was
- *   a real bug: every row bound to the same value, so all of history pulsed
- *   together instead of only the running row.
+ * - `Animated.loop` / `Animated.timing` run one leg and stop under React Native
+ *   Web, freezing the row at the dim end.
+ * - `setValue` on an `Animated.Value` updates the DOM on web but did not reach
+ *   the native view on the app, so the app showed no pulse at all.
+ *
+ * A 20 fps state tick is cheap (only running rows subscribe) and behaves the
+ * same on web, desktop and mobile. One module-level timer drives every
+ * subscriber, so there is exactly one interval no matter how many rows run.
  *
  * @module dsh-paseo/client/shimmer
  */
 import { useEffect, useState } from "react";
-import { Animated } from "react-native";
 
 const MIN = 0.35;
 const MAX = 1;
-/** 20 fps is plenty for an opacity pulse and cheap on every platform. */
 const STEP_MS = 50;
 const PERIOD_MS = 2200;
 
-const shared = new Animated.Value(MAX);
-/** Constant full opacity handed to every row that is not running. */
-const IDLE = new Animated.Value(MAX);
+type Subscriber = (opacity: number) => void;
 
-let users = 0;
+const subscribers = new Set<Subscriber>();
 let timer: ReturnType<typeof setInterval> | null = null;
 let elapsed = 0;
 
+function opacityAt(ms: number): number {
+  const phase = (ms / PERIOD_MS) * Math.PI * 2;
+  return (MIN + MAX) / 2 + ((MAX - MIN) / 2) * Math.cos(phase);
+}
+
 function tick(): void {
   elapsed = (elapsed + STEP_MS) % PERIOD_MS;
-  const phase = (elapsed / PERIOD_MS) * Math.PI * 2;
-  shared.setValue((MIN + MAX) / 2 + ((MAX - MIN) / 2) * Math.cos(phase));
+  const opacity = opacityAt(elapsed);
+  for (const notify of subscribers) notify(opacity);
 }
 
-function acquire(): void {
-  users += 1;
-  if (timer !== null) return;
-  elapsed = 0;
-  tick();
-  timer = setInterval(tick, STEP_MS);
+function subscribe(notify: Subscriber): () => void {
+  subscribers.add(notify);
+  if (timer === null) {
+    elapsed = 0;
+    notify(MAX);
+    timer = setInterval(tick, STEP_MS);
+  }
+  return () => {
+    subscribers.delete(notify);
+    if (subscribers.size === 0 && timer !== null) {
+      clearInterval(timer);
+      timer = null;
+    }
+  };
 }
 
-function release(): void {
-  users = Math.max(0, users - 1);
-  if (users > 0 || timer === null) return;
-  clearInterval(timer);
-  timer = null;
-  shared.setValue(MAX);
-}
-
-/** The shared animated opacity while this row runs; constant 1 otherwise. */
-export function useShimmer(active: boolean): Animated.Value {
-  const [value, setValue] = useState<Animated.Value>(IDLE);
+/** Current pulse opacity while `active`; constant 1 otherwise. */
+export function useShimmer(active: boolean): number {
+  const [opacity, setOpacity] = useState(MAX);
   useEffect(() => {
     if (!active) {
-      setValue(IDLE);
+      setOpacity(MAX);
       return;
     }
-    acquire();
-    setValue(shared);
-    return release;
+    return subscribe(setOpacity);
   }, [active]);
-  return value;
+  return opacity;
 }

@@ -600,16 +600,16 @@ DSH 的 `read_image` 返回的是**附件引用**（`{path, image:{attachmentId,
 原生端是 Reanimated + SVG 渐变遮罩），而插件 SDK 只导出 `Icon/Modal/useToast/
 useRevealedText/ScrollView/FlatList/copyText/TextInput`，**没有暴露任何 shimmer/spinner**。
 
-**修法（最终采用）**：`client/shimmer.ts` 用一个**模块级共享** `Animated.Value`，由普通
-`setInterval`（50ms）按余弦调 `setValue()` 驱动；`useShimmer(active)` **只在 active 时**
-把共享值交给这一行，空闲行拿一个恒为 1 的静态值。触发条件是"思考还在变长"和"工具 running /
-phase streaming"。
+**修法（最终采用）**：`client/shimmer.ts` 用**普通 React state** 驱动 opacity：一个模块级
+`setInterval`（50ms）按余弦算出透明度，推给所有订阅者；`useShimmer(active)` 只在 active 时
+订阅，空闲行恒为 1。触发条件是"思考还在变长"和"工具 running / phase streaming"。
+20fps 的 state 重渲染只发生在正在运行的那几行上，两端行为一致。
 
 期间试过"扫光"（叠一条高光从左到右平移）：没有真正的渐变时它就是一块硬边色块划过，
 用户评价**还不如脉冲**，所以回退了。要做扫光必须先解决渐变（宿主那套 `background-clip` /
 Reanimated 遮罩没暴露给插件）。
 
-### 29b. 脉冲实现踩过的三个坑
+### 29b. 脉冲实现踩过的四个坑
 
 **一、`Animated.loop` 在 RN Web 上只跑一段就停**
 
@@ -617,17 +617,22 @@ Reanimated 遮罩没暴露给插件）。
 `style.opacity` 会冻结在 0.37 / 0.63 / 0.88 之类的中间值。排除项：无头 Chromium 里
 `requestAnimationFrame` 是**正常 60fps**（`frames: 60 / 1000ms`），不是 rAF 节流；单段
 `Animated.timing` 会动，停住的是循环；`useNativeDriver: true/false` 都不影响；手动用完成
-回调链式 `Animated.timing` 也一样。**所以不要用 `Animated` 的驱动，用 `setInterval` +
-`setValue`。**
+回调链式 `Animated.timing` 也一样。
 
-**二、共享值必须"只发给正在运行的行"**
+**二、`Animated.Value.setValue()` 在原生上不推更新**
 
-为了让重挂载不重置动画，值改成了模块级共享。但 `useShimmer(active)` 如果**无条件返回共享
-值**，所有历史行都会绑到同一个 `Animated.Value` 上，于是**整屏的命令行和思考行一起闪**。
-用户原话："整个所有的命令工具和思考都在闪"。修法是空闲行返回恒为 1 的静态值，只有 active
-行拿到共享值。实测两条 active 行在动（0.373 / 0.48），5 条历史行恒为 1。
+改成 `setInterval` + `setValue` 后 web 上正常循环了（实测运行行 0.379 → 0.499 → 0.948），
+但用户在 App（原生）上仍然看不到闪。`setValue` 在 web 会更新 DOM 的内联 style，却没有把
+更新推到原生 view。**结论：两端都可靠的做法是用 state 重渲染，不要依赖 `Animated`。**
 
-**三、僵尸 running 行会一直闪**
+**三、共享值必须"只发给正在运行的行"**
+
+为了让重挂载不重置，值曾经是模块级共享。但 `useShimmer(active)` 如果**无条件返回共享值**，
+所有历史行都会绑到同一个值上，于是**整屏的命令行和思考行一起闪**。用户原话："整个所有的
+命令工具和思考都在闪"。修法是空闲行恒为 1，只有 active 行订阅。实测两条 active 行在动
+（0.373 / 0.48），5 条历史行恒为 1。
+
+**四、僵尸 running 行会一直闪**
 
 被中断的工具调用（比如正在 `paseo plugin reload` 时插件把自己重启了）永远等不到
 `tool/result`，在时间线里就一直是 `running`，于是永远脉冲。这不是脉冲的 bug，是"工具没有

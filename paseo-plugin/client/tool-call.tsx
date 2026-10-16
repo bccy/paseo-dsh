@@ -18,7 +18,7 @@
 import type { PluginTimelineItemProps } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/react-native";
 import { useMemo, useState } from "react";
-import { Animated, Pressable, Text, View } from "react-native";
+import { Pressable, Text, View } from "react-native";
 import { useShimmer } from "./shimmer";
 import { type ToolCallData } from "./tool-call-data";
 
@@ -105,7 +105,7 @@ export function InlineToolCall({ theme, layout, item }: PluginTimelineItemProps<
       }}
       style={styles.root}
     >
-      <Animated.View style={[styles.head, { opacity: shimmer }]}>
+      <View style={[styles.head, { opacity: shimmer }]}>
         <Icon
           name={data.icon}
           size={iconSize}
@@ -121,7 +121,7 @@ export function InlineToolCall({ theme, layout, item }: PluginTimelineItemProps<
         ) : !expanded ? (
           <View style={styles.summary} />
         ) : null}
-      </Animated.View>
+      </View>
       {expanded && canExpand ? (
         <View style={styles.body}>
           {data.summary !== "" ? <Text style={styles.summaryFull}>{data.summary}</Text> : null}
