@@ -883,15 +883,17 @@ export class DshSession {
   }
 
   /**
-   * Archive or unarchive this session in DSH's own registry.
+   * Archive or unarchive one DSH session in this root's DSH process.
    *
    * The plugin keeps no archive flag of its own: DSH has the concept, and
    * Paseo's adapters translate their archive action into the provider's native
-   * one. An unknown or refusing registry throws, so a click that cannot be
-   * honoured reports a failure instead of a false success.
+   * one. DSH's registry is process-global, so any open root can carry the
+   * request — which is what lets a native child, which has no process of its
+   * own, be archived. An unknown or refusing registry throws, so a click that
+   * cannot be honoured reports a failure instead of a false success.
    */
-  async setArchived(archived: boolean): Promise<void> {
-    const result = await this.#require().setArchived(this.#dshSessionId, archived);
+  async archiveDshSession(dshSessionId: string, archived: boolean): Promise<void> {
+    const result = await this.#require().setArchived(dshSessionId, archived);
     if (!result.available) {
       throw new Error(result.error?.message ?? `${archived ? "archive" : "unarchive"} failed`);
     }
@@ -1342,6 +1344,11 @@ export class DshChildSession {
       capabilities: this.#options.subsession ? ["session.subsession"] : [],
       restoration: "parent",
       cwd: this.#options.cwd,
+      // Paseo addresses an archive request by persistence handle, not by session
+      // id (its opencode adapter archives through the provider's native handle
+      // for the same reason). Without one a subagent cannot be archived at all:
+      // the click would be a Paseo-local mark that the next replay undoes.
+      persistence: { version: 1, data: { sessionId: this.#options.nativeId } },
       ...(this.#options.title === undefined ? {} : { title: this.#options.title }),
     });
   }

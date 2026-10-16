@@ -474,14 +474,14 @@ class DshConnection implements ProviderConnection {
         `cannot ${archived ? "archive" : "unarchive"}: the persistence handle names no DSH session`,
       );
     }
+    // DSH's registry is process-global, and a native child has no process of its
+    // own, so any open root can carry the request for it.
     for (const session of this.#sessions.values()) {
-      if (session.dshId === dshSessionId) {
-        await session.setArchived(archived);
-        return;
-      }
+      await session.archiveDshSession(dshSessionId, archived);
+      return;
     }
     throw new Error(
-      `cannot ${archived ? "archive" : "unarchive"}: no open session has DSH id ${dshSessionId}`,
+      `cannot ${archived ? "archive" : "unarchive"} ${dshSessionId}: no DSH session is open`,
     );
   }
 
