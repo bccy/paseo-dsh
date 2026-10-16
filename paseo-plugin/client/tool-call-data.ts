@@ -814,6 +814,16 @@ const TOOL_NAME_ICONS: Record<string, string> = {
 };
 
 /**
+ * Every tool name with a keyed icon, for the coverage check in `harness/`.
+ *
+ * Exported because the gap it closes was invisible: an icon with no label
+ * renders the row as `FileOutput  cordis_define` — the wire name, which is
+ * exactly what this table exists to prevent — and neither `toolIcon` nor
+ * `toolLabel` can enumerate its own keys from outside.
+ */
+export const TOOL_ICON_NAMES: readonly string[] = Object.freeze(Object.keys(TOOL_NAME_ICONS));
+
+/**
  * Human label for a tool call, falling back to its raw name.
  *
  * Read through `localeText()` on every call: the tables live in `./locale`, one

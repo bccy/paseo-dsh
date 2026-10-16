@@ -561,10 +561,36 @@ export interface DiffTotals {
 export function diffTotals(body: string): DiffTotals {
   let added = 0;
   let removed = 0;
+  // Above a hunk's first line, `--- x` / `+++ y` are the file headers; inside a
+  // hunk they are content, because a deleted line whose text began with `-- `
+  // renders as `--- …` and an added one that began with `++ ` renders as
+  // `+++ …`. Skipping every such line therefore undercounted any diff touching
+  // a SQL or Lua `--` comment or a Markdown `---` rule. Counting the lines each
+  // hunk declares is what tells the two apart — a hunk is over when its own
+  // `@@ -a,b +c,d @@` has been consumed, and the file-header state resumes.
+  let oldLeft = 0;
+  let newLeft = 0;
   for (const line of body.split("\n")) {
-    if (line.startsWith("+++") || line.startsWith("---")) continue;
-    if (line.startsWith("+")) added += 1;
-    else if (line.startsWith("-")) removed += 1;
+    if (oldLeft <= 0 && newLeft <= 0) {
+      const hunk = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+      if (hunk !== null) {
+        // A missing count means one line, per the unified-diff grammar.
+        oldLeft = hunk[2] === undefined ? 1 : Number(hunk[2]);
+        newLeft = hunk[4] === undefined ? 1 : Number(hunk[4]);
+        continue;
+      }
+      if (line.startsWith("---") || line.startsWith("+++")) continue;
+    }
+    if (line.startsWith("+")) {
+      added += 1;
+      newLeft -= 1;
+    } else if (line.startsWith("-")) {
+      removed += 1;
+      oldLeft -= 1;
+    } else {
+      oldLeft -= 1;
+      newLeft -= 1;
+    }
   }
   return { added, removed };
 }

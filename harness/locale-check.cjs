@@ -36,7 +36,7 @@
 "use strict";
 
 const { allText, currentLocale, localeFromMetadata, resolveLocale, setLocale } = require("./client/locale.js");
-const { toolCallData, toolIcon, toolLabel } = require("./client/tool-call-data.js");
+const { TOOL_ICON_NAMES, toolCallData, toolIcon, toolLabel } = require("./client/tool-call-data.js");
 
 let passed = 0;
 let failed = 0;
@@ -158,6 +158,21 @@ console.log("the two tables carry the same keys");
       JSON.stringify([en[key], zh[key]]),
     );
   }
+}
+
+console.log("every tool that draws an icon can also name itself");
+{
+  // An icon with no label renders the row as `FileOutput  cordis_define` — the
+  // wire name, which is the silent downgrade the label tables exist to prevent.
+  // The icon table was not enumerable from here until `TOOL_ICON_NAMES` was
+  // exported, so `cordis_define` and `present` sat label-less and no check saw
+  // it; `tool-call-check.cjs` only asserted their glyphs.
+  const en = allText().en.toolLabels;
+  const zh = allText()["zh-CN"].toolLabels;
+  const missing = TOOL_ICON_NAMES.filter((name) => en[name] === undefined || zh[name] === undefined).map(
+    (name) => `${name} (${en[name] === undefined ? "en" : ""}${zh[name] === undefined ? "zh" : ""})`,
+  );
+  equal("every tool with an icon has a label in both languages", missing, []);
 }
 
 console.log("the tools that used to render as wire names + a wrench");

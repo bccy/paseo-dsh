@@ -563,6 +563,26 @@ console.log("diff totals");
   equal("adds and removes", JSON.stringify(diffTotals("@@\n-old\n+new\n keep")), '{"added":1,"removed":1}');
   equal("file headers do not count", JSON.stringify(diffTotals("+++ b/x\n--- a/x\n+one")), '{"added":1,"removed":0}');
   equal("an empty body counts nothing", JSON.stringify(diffTotals("")), '{"added":0,"removed":0}');
+  // Inside a hunk, `---`/`+++` are content: a deleted `-- x` renders as `--- x`
+  // and an added `++ x` as `+++ x`. Skipping them undercounted every diff that
+  // touched a SQL/Lua `--` comment or a Markdown `---` rule.
+  equal(
+    "a deleted line starting with -- counts",
+    JSON.stringify(
+      diffTotals("--- a.txt\n+++ a.txt\n@@ -1,2 +1,2 @@\n--- section marker\n+-- section marker\n unchanged"),
+    ),
+    '{"added":1,"removed":1}',
+  );
+  equal(
+    "an added line starting with ++ counts",
+    JSON.stringify(diffTotals("--- a\n+++ a\n@@ -1,1 +1,1 @@\n--- old\n+++ new")),
+    '{"added":1,"removed":1}',
+  );
+  equal(
+    "each file's headers still do not count",
+    JSON.stringify(diffTotals("--- /a\n+++ /a\n@@ -1,1 +1,1 @@\n-a\n+A\n--- /b\n+++ /b\n@@ -1,1 +1,1 @@\n-b\n+B")),
+    '{"added":2,"removed":2}',
+  );
 
   check("a unified diff is diff-shaped", diffShaped("@@ -1 +1 @@\n-a\n+b\n c") === true);
   check(
