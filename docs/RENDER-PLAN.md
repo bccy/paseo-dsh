@@ -77,7 +77,8 @@
 - 命令：命令/输出拆成 **banner（命令 + 0.5px 分隔线 + 输出区）**；
   输出 11px/18。（banner 与输出原按 DSH 用全对比前景色，后按用户反馈统一成 muted，
   见文末「刻意的偏离」与 FIELD-NOTES #46。）
-- diff：**3px 实色左竖条** + 8%（暗 12%）底色 + `+ `/`- ` 前缀 + 上下文两空格 + 卡头。
+- diff：**3px 实色左竖条** + 8%（暗 12%）底色 + `+ `/`- ` 前缀 + 上下文两空格 + 卡头；
+  **无行号**（DSH 原样，见文末「DSH 原样、别当成缺口」）。
 - 卡片：`radius 16` + `StyleSheet.hairlineWidth` 描边 + 卡片底色；展开体左缩进 12 → **4**。
 - 断言：样式常量快照（防止再漂移）。
 
@@ -197,3 +198,18 @@
   兜底代码面）：DSH 这些行是全对比前景色，但本仓库的思考行与行头标题都是 muted，混在一屏里
   "有的字灰、有的字白"。diff 的 `+`/`-` 语义色是唯一保留的内联格式（FIELD-NOTES #46）。
 - `compaction` 不照抄 DSH 的可展开行形状，跟 Paseo 自己的 marker。
+
+### DSH 原样、别当成缺口
+
+- **diff 卡没有行号**（`edit` / `write` 的展开体）。这不是漏做：本机
+  `@deepseek-ai/dsh@0.2.0-rc.2` 的 `dsh-web-frontend` 里，diff 的行只有
+  `path / del / add / context / gap` 五种，渲染是
+  `jsx("div", { className: ue(line, kind), children: text })` —— **一层文本**，没有第二个
+  `<span>`；它的 CSS 模块（`17vb8`）类表是 `block · body · line · path · gap · del · add ·
+  context · expand`，**没有 `lineNumber` / `gutter`**，`.body` 还是
+  `grid-template-columns: minmax(max-content,1fr)` 的单列，`+ `/`- `/两空格全部来自
+  `::before{content}`。行号在 DSH 里只属于另外三处：读取（`_gutter_1ay0u_7` + 变量
+  `--dsl-read-gutter`）、搜索（`_lineNumber_1u3n2_60`）、代码块（`_numbered_7gxqk_122`）。
+  我们照抄：数字列只出现在 `readGutterTextStyle` 与 `searchLineNumberTextStyle`；
+  "这是文件的哪一段"由我们多出来的 `@@ -a,b +c,d @@` 头回答。2026-10-17 与用户确认过，
+  **保持无行号**（加行号 = 再记一条刻意偏离，数据层已具备：`DiffHunk.oldStart/newStart`）。
