@@ -80,7 +80,15 @@ function startBridge(ctx, config = {}) {
   };
 
   transport.onRequest(async (method, params) => {
-    if (method === 'initialize') await ctx.get('loader')?.await();
+    // Every method reads services the profile mounts asynchronously
+    // (`workspaceRegistry`, `sessionPersistence`, adapters). Waiting only for
+    // `initialize` left every other method racing the loader: a one-shot probe
+    // never sends `initialize`, so its `paseo/archive` arrived before
+    // `@deepseek-ai/dsh-workspace` was mounted and was answered with "this DSH
+    // runtime composes no workspace registry". `loader.await()` is idempotent,
+    // so gating every request on it is the honest fix — a method is never
+    // answered from a half-composed runtime.
+    await ctx.get('loader')?.await();
     const result = await server.handleRequest(method, params);
     if (method === 'shutdown') {
       setImmediate(() => {

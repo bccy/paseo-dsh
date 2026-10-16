@@ -1110,6 +1110,30 @@ cannot unarchive 6d0a20ce-...: no DSH session is open   # 取消归档：我们�
 `mcp-injection-check` 8/8、`steer-check` 17/17、`assistant-stream-check` 7/7；`tsc --noEmit`
 干净；内嵌桥已重生成。
 
+#### 39b. 同一个症状的第三个洞：桥只在 `initialize` 上等 profile 装载
+
+上面三条修完、插件重载之后，用户复测**仍然**报 `this DSH runtime composes no workspace
+registry`。真机二分复现：只要先发 `initialize` 再发 `paseo/archive` 就成功，把
+`paseo/archive` 作为**第一帧**发就 100% 失败。
+
+根因在桥的入口 `transport.onRequest`：它原本只对 `initialize` 做
+`await ctx.get('loader')?.await()`，其它方法直接进 `server.handleRequest`。而插件的
+catalog/sessions/archive 探测是 `initializeRoute: false` 起的——**刻意不发 `initialize`**
+（发了会创建 agent），于是 `paseo/archive` 在 `@deepseek-ai/dsh-workspace` 挂载完成之前
+就被处理，`ctx.get('workspaceRegistry')` 自然是 `undefined`。
+
+这也解释了为什么第 38/39 条的其它探测"看起来正常"：`paseo/sessions` 读不到 registry 时
+按设计**不过滤**（静默降级成"没归档"），`paseo/catalog` 根本不碰 registry，所以只有归档
+这条把竞态暴露成硬失败。
+
+**修法**：`transport.onRequest` 对**每个**方法都先 `await ctx.get('loader')?.await()`
+（幂等），任何请求都不再从"半装好的 runtime"里取服务。
+
+**验证**：新增 `harness/archive-registry-check.mjs`——真 `dsh --profile <p>`、**第一帧**
+就是 `paseo/archive`（不存在的 id，应当被 registry 拒绝并报出该 id，而不是报
+`composes no workspace registry`），再发一次 `paseo/unarchive`（不存在的 id 是幂等 no-op，
+返回 `available:true` 且不写任何状态）。修复前 0/2，修复后 2/2。
+
 ---
 
 ## 已知限制（未修，有意为之）
