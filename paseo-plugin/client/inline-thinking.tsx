@@ -21,6 +21,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Image, Pressable, Text, View } from "react-native";
 import { TextShimmer } from "./text-shimmer";
 import { reasoningPreview } from "./thinking-text";
+import { BODY_INDENT, ROW_FONT_SIZE, ROW_GAP, ROW_HEAD_GAP, ROW_HEIGHT, ROW_LINE_HEIGHT } from "./tokens";
+import { localeText } from "./locale";
 
 /**
  * DSH's thinking icon (`PROCESS_ICONS.thinking` = `IconThinkOutlineRegular`:
@@ -68,6 +70,10 @@ export function InlineThinking({
   const growing = useGrowing(revealed, phase);
   const [manual, setManual] = useState<boolean | null>(null);
   const open = manual ?? false;
+  // Read per render, not hoisted: `./locale` follows a locale the host relays
+  // after this module loaded, and the label and the two screen-reader strings
+  // have to move with it.
+  const copy = localeText();
 
 
   // DSH's own preview: the first line once settled, the latest completed
@@ -76,30 +82,39 @@ export function InlineThinking({
 
   const styles = useMemo(
     () => ({
-      root: { gap: 3, paddingVertical: layout.compact ? 3 : 5 },
-      row: { flexDirection: "row" as const, alignItems: "center" as const, gap: 8 },
+      // DSH renders a thought and a tool call through the same DisclosureRow, so
+      // the two rows must not disagree about their rhythm: same 24px line, same
+      // head gap, no vertical padding of their own.
+      root: { gap: ROW_GAP, paddingVertical: 0 },
+      row: {
+        flexDirection: "row" as const,
+        alignItems: "center" as const,
+        gap: ROW_HEAD_GAP,
+        minHeight: ROW_HEIGHT,
+      },
       textRow: {
         flex: 1,
         minWidth: 0,
         flexDirection: "row" as const,
         alignItems: "center" as const,
-        gap: 8,
+        gap: ROW_HEAD_GAP,
       },
       label: {
         color: theme.colors.foregroundMuted,
-        fontSize: layout.compact ? 11 : 12,
+        fontSize: ROW_FONT_SIZE,
+        lineHeight: ROW_LINE_HEIGHT,
         opacity: growing ? 0.9 : 0.6,
       },
       line: {
         flex: 1,
         minWidth: 0,
         color: theme.colors.foregroundMuted,
-        fontSize: layout.compact ? 13 : 14,
-        lineHeight: layout.compact ? 19 : 21,
+        fontSize: ROW_FONT_SIZE,
+        lineHeight: ROW_LINE_HEIGHT,
         opacity: growing ? 0.95 : 0.7,
       },
       full: {
-        marginLeft: layout.compact ? 10 : 12,
+        marginLeft: BODY_INDENT,
         color: theme.colors.foregroundMuted,
         fontSize: layout.compact ? 13 : 14,
         lineHeight: layout.compact ? 19 : 21,
@@ -114,7 +129,7 @@ export function InlineThinking({
     // text) closes it. No inner ScrollView: an inner scroll swallows the tap.
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={open ? "收起思考" : "展开思考"}
+      accessibilityLabel={open ? copy.collapseThinking : copy.expandThinking}
       onPress={() => setManual((value) => !(value ?? false))}
       style={styles.root}
     >
@@ -132,10 +147,11 @@ export function InlineThinking({
         >
           {(color) => (
             <>
-              {/* DSH titles every reasoning row "思考" and never swaps it for
-                  a finished form; the "已思考" string it ships belongs to its
-                  collapsed whole-turn summary, not to this row. */}
-              <Text style={[styles.label, color === null ? null : { color }]}>思考</Text>
+              {/* DSH titles every reasoning row "思考" (its English table says
+                  "Thinking") and never swaps it for a finished form; the
+                  "已思考" string it ships belongs to its collapsed whole-turn
+                  summary, not to this row. */}
+              <Text style={[styles.label, color === null ? null : { color }]}>{copy.thinking}</Text>
               {!open ? (
                 <Text style={[styles.line, color === null ? null : { color }]} numberOfLines={1}>
                   {line}

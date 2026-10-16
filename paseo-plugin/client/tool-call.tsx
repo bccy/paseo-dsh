@@ -3,12 +3,15 @@
  *
  * Paseo's stock tool row is a single line that expands on click. This keeps
  * that shape and its icon, and expands downward the way the reasoning row
- * does: the full command and the output/diff are laid out below the row at
- * full width, not squeezed beside the icon and label.
+ * does: the block below the row is a card at full width, not a squeeze beside
+ * the icon and label.
  *
- * Code is monospaced, and an edit diff follows GitHub's convention: a soft
- * green/red line background, a coloured +/- marker, and the code itself in the
- * muted foreground colour.
+ * The row head and the card follow DSH's own metrics (`./tokens`): a fixed
+ * 24px line, a 13px UI-font summary, a 2x2 separator square, 16px card radius
+ * on a card surface, and a `+A -R` suffix on diff rows. A command row splits
+ * into a command banner, a hairline, and an output region; a diff row gives
+ * every line a 3px semantic left bar and an 8%/12% wash; everything else is
+ * one code surface.
  *
  * While the tool is running the row pulses (see `./shimmer`), matching the
  * "still working" feel Paseo's own loading rows have.
@@ -18,14 +21,36 @@
 import type { PluginTimelineItemProps } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/react-native";
 import { useMemo, useState } from "react";
-import { Pressable, Text, View } from "react-native";
+import { Pressable, StyleSheet, Text, View } from "react-native";
 import { shouldPulse, useRowPulse } from "./newest";
+import { localeText } from "./locale";
 import { TextShimmer } from "./text-shimmer";
 import { type ToolCallData } from "./tool-call-data";
-
-/** GitHub's diff line tints, at low alpha so both themes stay readable. */
-const ADD_BG = "rgba(46, 160, 67, 0.12)";
-const DEL_BG = "rgba(248, 81, 73, 0.12)";
+import {
+  BODY_INDENT,
+  cardStyle,
+  codeRegionStyle,
+  codeTextStyle,
+  commandRegionStyle,
+  commandTextStyle,
+  DIFF_LINE_PADDING_HORIZONTAL,
+  diffBodyTextStyle,
+  diffLineStyle,
+  diffMarkerTextStyle,
+  diffStat,
+  diffStatTextStyle,
+  dividerStyle,
+  isCommandBlock,
+  isLightSurface,
+  outputRegionStyle,
+  outputTextStyle,
+  rowHeadStyle,
+  rowIconColor,
+  rowLabelTextStyle,
+  rowRootStyle,
+  separatorStyle,
+  summaryTextStyle,
+} from "./tokens";
 
 export function InlineToolCall({
   theme,
@@ -46,67 +71,62 @@ export function InlineToolCall({
   // *is* that subject does not repeat a compact copy of it above.
   const showSummary = data.summary !== "" && !(expanded && !data.titled && data.headline !== "");
   const compact = layout.compact;
+  // Icon size is Paseo's own (and was settled in an earlier round); everything
+  // else in the row now comes from the shared token table.
   const iconSize = compact ? 14 : 16;
   // Only the newest row is "running": while it runs, and for a window after it
   // commits (the only way a short command — call and result in the same tick —
   // ever shows a signal). Gating on the newest row also keeps an interrupted
   // tool, stuck `running` forever, from blinking for the rest of the session.
   const running = shouldPulse(data.status, useRowPulse(agentId, timestamp));
+  // `+A -R` beside the summary, for a row whose body is a real diff and which
+  // did not settle with a cue (DSH hides the stat on error/stopped rows).
+  const stat = diffStat(data);
+  // A shell (or `/`-command) block: command banner, hairline, output region.
+  // The caption is read from the locale so this keeps working once the data
+  // layer localizes `bodyLabel`; the literal covers a tree where it has not.
+  const command = isCommandBlock(data, [localeText().bodyLabels.output, "输出"]);
 
-  const styles = useMemo(
-    () => ({
-      root: { gap: 3, paddingVertical: compact ? 3 : 5 },
-      head: { flexDirection: "row" as const, gap: 8, alignItems: "center" as const },
-      // The text run, and the flex row the shimmer's copy re-lays-out.
-      text: { flexDirection: "row" as const, gap: 8, alignItems: "center" as const, flex: 1, minWidth: 0 },
-      label: { color: theme.colors.foregroundMuted, fontSize: compact ? 13 : 14 },
-      summary: {
-        color: theme.colors.foregroundMuted,
-        fontFamily: "monospace" as const,
-        fontSize: compact ? 12 : 13,
-        lineHeight: compact ? 18 : 20,
-        flex: 1,
-        minWidth: 0,
+  const styles = useMemo(() => {
+    // The wash is 8% on a light card and 12% on a dark one; the card's own
+    // surface is what the diff lines are painted on.
+    const light = isLightSurface(theme.colors.surface1);
+    return {
+      root: rowRootStyle(),
+      head: rowHeadStyle(),
+      // The text run, and the flex row the shimmer's copy re-lays-out. No gap:
+      // the separator carries its own margins, the way DSH's `.sep` does.
+      text: { flexDirection: "row" as const, alignItems: "center" as const, flex: 1, minWidth: 0 },
+      label: rowLabelTextStyle(theme.colors),
+      sep: separatorStyle(theme.colors),
+      summary: summaryTextStyle(theme.colors, data.status),
+      stat: diffStatTextStyle(theme.colors),
+      body: { marginLeft: BODY_INDENT },
+      // RN has no hairline in a plain object; `StyleSheet.hairlineWidth` is the
+      // device's own (0.5 at 1x/2x), which is what DSH's `.5px` means here.
+      card: cardStyle(theme.colors, StyleSheet.hairlineWidth),
+      divider: dividerStyle(theme.colors, StyleSheet.hairlineWidth),
+      command: commandRegionStyle(),
+      commandText: commandTextStyle(theme.colors),
+      output: outputRegionStyle(),
+      outputText: outputTextStyle(theme.colors),
+      code: codeRegionStyle(),
+      codeText: codeTextStyle(theme.colors),
+      diffLine: {
+        flexDirection: "row" as const,
+        paddingHorizontal: DIFF_LINE_PADDING_HORIZONTAL,
       },
-      body: { marginLeft: compact ? 10 : 12, gap: 2 },
-      summaryFull: {
-        color: theme.colors.foregroundMuted,
-        fontFamily: "monospace" as const,
-        fontSize: compact ? 12 : 13,
-        lineHeight: compact ? 18 : 20,
-      },
-      diffLine: { flexDirection: "row" as const, paddingHorizontal: 6 },
-      diffAdd: { backgroundColor: ADD_BG },
-      diffDel: { backgroundColor: DEL_BG },
-      marker: {
-        fontFamily: "monospace" as const,
-        fontSize: compact ? 12 : 13,
-        lineHeight: compact ? 17 : 19,
-        width: 12,
-      },
-      codeBlock: {
-        backgroundColor: "rgba(127, 127, 127, 0.10)",
-        borderRadius: 6,
-        paddingVertical: compact ? 5 : 6,
-        paddingHorizontal: compact ? 6 : 8,
-      },
-      codeText: {
-        color: theme.colors.foregroundMuted,
-        fontFamily: "monospace" as const,
-        fontSize: compact ? 12 : 13,
-        lineHeight: compact ? 17 : 19,
-      },
-      diffText: {
-        color: theme.colors.foregroundMuted,
-        fontFamily: "monospace" as const,
-        fontSize: compact ? 12 : 13,
-        lineHeight: compact ? 17 : 19,
-        flex: 1,
-        minWidth: 0,
-      },
-    }),
-    [theme, compact],
-  );
+      diffAdd: diffLineStyle(theme.colors, "add", light),
+      diffDel: diffLineStyle(theme.colors, "del", light),
+      diffContext: diffLineStyle(theme.colors, "context", light),
+      markerAdd: diffMarkerTextStyle(theme.colors, "add"),
+      markerDel: diffMarkerTextStyle(theme.colors, "del"),
+      markerContext: diffMarkerTextStyle(theme.colors, "context"),
+      diffTextAdd: diffBodyTextStyle(theme.colors, "add"),
+      diffTextDel: diffBodyTextStyle(theme.colors, "del"),
+      diffTextContext: diffBodyTextStyle(theme.colors, "context"),
+    };
+  }, [theme, data.status]);
 
   return (
     <Pressable
@@ -118,11 +138,9 @@ export function InlineToolCall({
       style={styles.root}
     >
       <View style={styles.head}>
-        <Icon
-          name={data.icon}
-          size={iconSize}
-          color={data.failed ? theme.colors.statusDanger : theme.colors.foregroundMuted}
-        />
+        {/* DSH never recolours the icon: a failure shows up in the summary
+            text, not in the glyph beside it. */}
+        <Icon name={data.icon} size={iconSize} color={rowIconColor(theme.colors)} />
         <TextShimmer
           active={running}
           contentStyle={styles.text}
@@ -132,72 +150,133 @@ export function InlineToolCall({
           {(color) => (
             <>
               <Text style={[styles.label, color === null ? null : { color }]}>{data.label}</Text>
-              {/* The row stays one line, label and title together: moving the
-                  title onto its own line just pushed it away from the row it
+              {/* The row stays one line, label and summary together: moving the
+                  summary onto its own line just pushed it away from the row it
                   names. It is only dropped once the block below carries the same
                   subject in full, so a description-less row does not print its
                   arguments twice. `numberOfLines` stays 1 for the same reason —
                   an unbounded line beside a long label wrapped one character per
                   line, which is what "并行显示" was. */}
               {showSummary ? (
-                <Text
-                  style={[styles.summary, color === null ? null : { color }]}
-                  numberOfLines={1}
-                >
-                  {data.summary}
+                <>
+                  {/* A 2x2 square with 1px corners, not a dot — DSH's separator
+                      between the title and its summary. */}
+                  <View style={styles.sep} />
+                  <Text
+                    style={[styles.summary, color === null ? null : { color }]}
+                    numberOfLines={1}
+                  >
+                    {data.summary}
+                  </Text>
+                </>
+              ) : null}
+              {stat !== null ? (
+                <Text style={[styles.stat, color === null ? null : { color }]}>
+                  {`+${stat.added} -${stat.removed}`}
                 </Text>
               ) : null}
             </>
           )}
         </TextShimmer>
       </View>
-      {expanded && canExpand && data.hasDetail ? (
+      {expanded && canExpand ? (
         <View style={styles.body}>
-          {/* Everything a row reveals goes in one code surface, the way the edit
-              rows already did: the subject the title describes (the command),
-              then the payload (the output, the file, the diff). */}
-          <View style={styles.codeBlock}>
-          {data.headline !== "" ? (
-            <Text style={styles.summaryFull} selectable>
-              {data.headline}
-            </Text>
-          ) : null}
-          {hasBody ? (
-            data.diff ? (
-              data.body.split("\n").map((line, index) => {
-                const added = line.startsWith("+");
-                const removed = line.startsWith("-");
-                const marker = added ? "+" : removed ? "-" : " ";
-                const text = added || removed ? line.slice(1) : line;
-                return (
-                  <View
-                    key={index}
-                    style={[styles.diffLine, added ? styles.diffAdd : removed ? styles.diffDel : null]}
-                  >
-                    <Text
-                      style={[
-                        styles.marker,
-                        {
-                          color: added
-                            ? theme.colors.statusSuccess
-                            : removed
-                              ? theme.colors.statusDanger
-                              : theme.colors.foregroundMuted,
-                        },
-                      ]}
-                    >
-                      {marker}
+          {/* One card per expanded block, the way DSH's TerminalBlock, DiffBlock
+              and ReadBlock all are: same radius, same hairline, same surface. */}
+          <View style={styles.card}>
+            {command ? (
+              <>
+                {/* The command the row ran, at full contrast and on its own
+                    line, then a hairline, then what it printed. A running
+                    command that has printed nothing yet draws no divider, the
+                    same as DSH's banner-only terminal card. */}
+                <View style={styles.command}>
+                  <Text style={styles.commandText} selectable>
+                    {data.headline}
+                  </Text>
+                </View>
+                {hasBody ? <View style={styles.divider} /> : null}
+                {hasBody ? (
+                  <View style={styles.output}>
+                    <Text style={styles.outputText} selectable>
+                      {data.body}
                     </Text>
-                    <Text style={styles.diffText}>{text === "" ? " " : text}</Text>
                   </View>
-                );
-              })
-            ) : (
-              <Text style={styles.codeText} selectable>
-                {data.body}
-              </Text>
-            )
-          ) : null}
+                ) : null}
+              </>
+            ) : data.diff ? (
+              <>
+                {data.headline !== "" ? (
+                  <View style={styles.code}>
+                    <Text style={styles.codeText} selectable>
+                      {data.headline}
+                    </Text>
+                  </View>
+                ) : null}
+                {hasBody
+                  ? data.body.split("\n").map((line, index) => {
+                      const added = line.startsWith("+");
+                      const removed = line.startsWith("-");
+                      const kind = added ? "add" : removed ? "del" : "context";
+                      // The marker column stays a separate Text so the code
+                      // starts at the same x on every row, and the `+ `/`- `
+                      // prefix keeps DSH's meaning: the sign is the marker, the
+                      // text is the line without it.
+                      const marker = added ? "+" : removed ? "-" : " ";
+                      const text = added || removed ? line.slice(1) : line;
+                      return (
+                        <View
+                          key={index}
+                          style={[
+                            styles.diffLine,
+                            kind === "add"
+                              ? styles.diffAdd
+                              : kind === "del"
+                                ? styles.diffDel
+                                : styles.diffContext,
+                          ]}
+                        >
+                          <Text
+                            style={
+                              kind === "add"
+                                ? styles.markerAdd
+                                : kind === "del"
+                                  ? styles.markerDel
+                                  : styles.markerContext
+                            }
+                          >
+                            {marker}
+                          </Text>
+                          <Text
+                            style={
+                              kind === "add"
+                                ? styles.diffTextAdd
+                                : kind === "del"
+                                  ? styles.diffTextDel
+                                  : styles.diffTextContext
+                            }
+                          >
+                            {text === "" ? " " : text}
+                          </Text>
+                        </View>
+                      );
+                    })
+                  : null}
+              </>
+            ) : data.headline !== "" || hasBody ? (
+              <View style={styles.code}>
+                {data.headline !== "" ? (
+                  <Text style={styles.codeText} selectable>
+                    {data.headline}
+                  </Text>
+                ) : null}
+                {hasBody ? (
+                  <Text style={styles.codeText} selectable>
+                    {data.body}
+                  </Text>
+                ) : null}
+              </View>
+            ) : null}
           </View>
         </View>
       ) : null}

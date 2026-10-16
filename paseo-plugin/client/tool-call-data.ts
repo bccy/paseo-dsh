@@ -2,10 +2,14 @@
  * Normalize a Paseo tool-call timeline item into JSON-safe render data.
  *
  * Kept free of React and React Native imports so it can be exercised by the
- * offline harness without a host runtime.
+ * offline harness without a host runtime. Every label it produces comes from
+ * `./locale`, read at call time rather than baked in at import, so a locale the
+ * host relays later takes effect on the next row instead of never.
  *
  * @module dsh-paseo/client/tool-call-data
  */
+import { localeText } from "./locale";
+
 export interface ToolCallData {
   name: string;
   label: string;
@@ -52,66 +56,13 @@ type ToolDetail = Record<string, unknown>;
 
 const BODY_LIMIT = 6000;
 
-const TOOL_LABELS: Record<string, string> = {
-  bash: "命令",
-  pwsh: "命令",
-  read: "读取",
-  write: "写入",
-  edit: "编辑",
-  grep: "搜索",
-  glob: "查找文件",
-  web_search: "联网搜索",
-  web_fetch: "抓取网页",
-  todo_write: "更新任务",
-  ask_user_question: "提问",
-  exit_plan_mode: "计划",
-  subagent: "子智能体",
-  // DSH's own tools. Its UI titles these through `tool.title.*`; these are the
-  // same names in Chinese, so a DSH tool row reads as a DSH tool rather than as
-  // an anonymous `wrench <raw_name>` — which is what every MCP-shaped row looks
-  // like too, and the two are not the same thing.
-  create_goal: "创建目标",
-  get_goal: "查看目标",
-  update_goal: "更新目标",
-  read_image: "读取图片",
-  schedule_create: "创建定时任务",
-  schedule_list: "列出定时任务",
-  schedule_update: "更新定时任务",
-  schedule_delete: "删除定时任务",
-  list_agents: "列出 agent",
-  send_message: "给 agent 发消息",
-  interrupt_agent: "打断 agent",
-  list_subagent_models: "列出子智能体模型",
-  job_list: "列出后台任务",
-  job_output: "读取后台任务",
-  job_kill: "终止后台任务",
-  terminal_open: "打开终端",
-  terminal_read: "读取终端",
-  terminal_list: "列出终端",
-  terminal_signal: "发送终端信号",
-  terminal_close: "关闭终端",
-  workflow: "工作流",
-  ralph: "循环执行",
-  session_search: "搜索会话",
-  session_trace: "追踪会话",
-  session_event_read: "读取会话事件",
-  session_event_search: "搜索会话事件",
-  session_event_trace: "追踪会话事件",
-  cordis_run: "启动插件",
-  cordis_stop: "停止插件",
-  cordis_undefine: "卸载插件",
-  cordis_package_inspect: "检查插件包",
-  cordis_runtime_inspect: "检查运行时",
-  cordis_inspect_list: "列出 provider",
-  cordis_inspect_query: "查询运行时",
-  cordis_inspect_self: "检查插件",
-};
-
 /**
  * Icons for DSH's own tools, which arrive with an `unknown` detail.
  *
  * Without this every one of them fell through to the wrench — the same glyph
  * MCP tools get — so a goal update and an MCP call were indistinguishable.
+ * Icons are language-independent, so this table stays here; the names next to it
+ * live in `./locale`.
  */
 const TOOL_NAME_ICONS: Record<string, string> = {
   create_goal: "Target",
@@ -153,11 +104,32 @@ const TOOL_NAME_ICONS: Record<string, string> = {
   cordis_inspect_list: "Plug",
   cordis_inspect_query: "Plug",
   cordis_inspect_self: "Plug",
+  // A profile other than this one's can mount these: the team tools come with
+  // the agent-team bundle, `lsp` with the language-server profile, `skill` and
+  // the MCP-resource tools are DSH's own. Without an entry each of them read as
+  // `wrench <raw_name>`. Every name here is a Lucide export the host bundle
+  // re-exports (`Node <name>` in Paseo's `lucide-react` list).
+  lsp: "SearchCode",
+  spawn_teammate: "UserPlus",
+  team_task_create: "ListTodo",
+  team_task_get: "ListTodo",
+  team_task_list: "ListTodo",
+  team_task_update: "ListTodo",
+  wait_agent: "Hourglass",
+  skill: "BookOpen",
+  list_mcp_resources: "Server",
+  read_mcp_resource: "FileText",
+  list_mcp_resource_templates: "Server",
 };
 
-/** Human label for a tool call, falling back to its raw name. */
+/**
+ * Human label for a tool call, falling back to its raw name.
+ *
+ * Read through `localeText()` on every call: the tables live in `./locale`, one
+ * per language, and a locale relayed after import must apply to the next row.
+ */
 export function toolLabel(name: string): string {
-  return TOOL_LABELS[name] ?? paseoMcpLabel(name) ?? name;
+  return localeText().toolLabels[name] ?? paseoMcpLabel(name) ?? name;
 }
 
 /**
@@ -216,7 +188,7 @@ function str(source: ToolDetail, key: string): string {
 }
 
 function truncate(text: string): string {
-  return text.length > BODY_LIMIT ? `${text.slice(0, BODY_LIMIT)}\n…（已截断）` : text;
+  return text.length > BODY_LIMIT ? `${text.slice(0, BODY_LIMIT)}${localeText().truncated}` : text;
 }
 
 /**
@@ -247,73 +219,12 @@ function stringifyValue(value: unknown, pretty = false): string {
  *
  * Paseo ships 58 of them and each carries an English `title` in its own
  * registry (`server/agent/tools/paseo-tools.js` and `browser-tools/tools.js`);
- * these are those titles in Chinese. Without this a row reads
+ * the labels in `./locale` are those titles. Without this a row reads
  * `mcp__paseo__delete_heartbeat {"id":"…"}` — the wire name, which is the one
  * thing about it a reader cannot use. A name we do not know still falls back to
  * the wire name, so a tool added upstream shows up rather than disappearing.
  */
 const PASEO_MCP_PREFIX = "mcp__paseo__";
-
-const PASEO_MCP_LABELS: Record<string, string> = {
-  speak: "朗读",
-  create_workspace: "创建工作区",
-  list_workspaces: "列出工作区",
-  archive_workspace: "归档工作区",
-  rename_workspace: "重命名工作区",
-  create_agent: "创建 agent",
-  send_agent_prompt: "给 agent 发任务",
-  get_agent_status: "查看 agent 状态",
-  list_agents: "列出 agent",
-  cancel_agent: "取消 agent 当前回合",
-  archive_agent: "归档 agent",
-  kill_agent: "终止 agent 会话",
-  update_agent: "更新 agent",
-  set_agent_mode: "切换 agent 模式",
-  get_agent_activity: "查看 agent 活动",
-  list_workspace_scripts: "列出工作区脚本",
-  start_workspace_script: "启动工作区脚本",
-  stop_workspace_script: "停止工作区脚本",
-  list_terminals: "列出终端",
-  create_terminal: "创建终端",
-  kill_terminal: "关闭终端",
-  capture_terminal: "读取终端输出",
-  send_terminal_keys: "向终端发送按键",
-  create_schedule: "创建定时任务",
-  create_heartbeat: "创建心跳",
-  delete_heartbeat: "删除心跳",
-  list_schedules: "列出定时任务",
-  inspect_schedule: "查看定时任务",
-  pause_schedule: "暂停定时任务",
-  resume_schedule: "恢复定时任务",
-  delete_schedule: "删除定时任务",
-  update_schedule: "更新定时任务",
-  schedule_logs: "定时任务日志",
-  run_schedule_once: "立即运行一次定时任务",
-  list_providers: "列出 provider",
-  list_models: "列出模型",
-  list_profiles: "列出 agent 配置档",
-  inspect_provider: "查看 provider",
-  list_pending_permissions: "列出待审批请求",
-  respond_to_permission: "响应审批请求",
-  browser_list_tabs: "列出浏览器标签页",
-  browser_new_tab: "新建浏览器标签页",
-  browser_close_tab: "关闭浏览器标签页",
-  browser_snapshot: "读取页面结构",
-  browser_screenshot: "页面截图",
-  browser_navigate: "打开网址",
-  browser_click: "点击页面元素",
-  browser_fill: "填写页面元素",
-  browser_type: "输入文本",
-  browser_keypress: "发送按键",
-  browser_select: "选择下拉项",
-  browser_drag: "拖拽页面元素",
-  browser_scroll: "滚动页面",
-  browser_resize: "调整视口大小",
-  browser_upload: "上传文件",
-  browser_wait: "等待页面条件",
-  browser_logs: "读取页面日志",
-  browser_evaluate: "执行页面脚本",
-};
 
 /** The same tools by icon. */
 const PASEO_MCP_ICONS: Record<string, string> = {
@@ -385,10 +296,10 @@ function paseoMcpName(name: string): string | undefined {
     : undefined;
 }
 
-/** The Chinese label for a Paseo MCP tool, or undefined if we do not know it. */
+/** The label for a Paseo MCP tool in the reader's language, or undefined. */
 export function paseoMcpLabel(name: string): string | undefined {
   const bare = paseoMcpName(name);
-  return bare === undefined ? undefined : PASEO_MCP_LABELS[bare];
+  return bare === undefined ? undefined : localeText().paseoMcpLabels[bare];
 }
 
 /** The icon for a Paseo MCP tool, or undefined if we do not know it. */
@@ -412,6 +323,9 @@ export function toolCallData(
   const metadata = (item.metadata ?? {}) as ToolDetail;
   const type = str(detail, "type");
   const failed = item.status === "failed";
+  // Copy is read here, once per call, rather than at module load: a locale the
+  // host relays later must reach the next row, not only the ones after a reload.
+  const copy = localeText();
   // DSH's bash tool requires a model-written `description` for every call and
   // its own UI titles the row with it ("List DSH checkout root"), not with the
   // command. The plugin carries it on the item's provider metadata because the
@@ -421,7 +335,7 @@ export function toolCallData(
   // description, and is what the expanded block shows.
   let primary = "";
   let body = "";
-  let bodyLabel = "输出";
+  let bodyLabel = copy.bodyLabels.output;
   let diff = false;
   let code = false;
   /** Block-only first line, for rows whose title is something else. */
@@ -434,18 +348,18 @@ export function toolCallData(
       // in the block — lead it with the command the way DSH's own row does.
       detailHeadline = primary;
       body = str(detail, "output");
-      bodyLabel = "输出";
+      bodyLabel = copy.bodyLabels.output;
       break;
     case "read":
       primary = str(detail, "filePath");
       body = str(detail, "content");
-      bodyLabel = "内容";
+      bodyLabel = copy.bodyLabels.content;
       code = true;
       break;
     case "write":
       primary = str(detail, "filePath");
       body = str(detail, "content");
-      bodyLabel = "写入内容";
+      bodyLabel = copy.bodyLabels.writeContent;
       diff = true;
       code = true;
       break;
@@ -461,30 +375,30 @@ export function toolCallData(
         const added = newText === "" ? [] : newText.split("\n").map((line) => `+ ${line}`);
         body = [...removed, ...added].join("\n");
       }
-      bodyLabel = "改动";
+      bodyLabel = copy.bodyLabels.diff;
       diff = true;
       code = true;
       break;
     case "search":
       primary = str(detail, "query");
       body = str(detail, "content");
-      bodyLabel = "结果";
+      bodyLabel = copy.bodyLabels.result;
       code = true;
       break;
     case "fetch":
       primary = str(detail, "url");
       body = str(detail, "result");
-      bodyLabel = "响应";
+      bodyLabel = copy.bodyLabels.response;
       break;
     case "sub_agent":
       primary = str(detail, "description") || str(detail, "subAgentType");
       body = str(detail, "log");
-      bodyLabel = "日志";
+      bodyLabel = copy.bodyLabels.log;
       break;
     case "plan":
-      primary = "计划";
+      primary = copy.planTitle;
       body = str(detail, "text");
-      bodyLabel = "计划";
+      bodyLabel = copy.bodyLabels.plan;
       break;
     case "plain_text":
       // A `/command` row: `label` is the line that ran, `text` is what it
@@ -492,7 +406,7 @@ export function toolCallData(
       // command looked like it did nothing.
       primary = str(detail, "label") || str(detail, "text");
       body = primary === str(detail, "text") ? "" : str(detail, "text");
-      bodyLabel = "输出";
+      bodyLabel = copy.bodyLabels.output;
       break;
     default:
       primary = "";
@@ -516,7 +430,7 @@ export function toolCallData(
     if (primary === "" && !emptyInput) primary = stringifyValue(input);
     detailHeadline = emptyInput ? "" : stringifyValue(input, true);
     body = stringifyValue(detail.output, true);
-    bodyLabel = "结果";
+    bodyLabel = copy.bodyLabels.result;
     code = true;
   }
 
