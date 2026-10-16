@@ -257,6 +257,15 @@ async function openSession(conn, sessionId, history) {
   const replayOpens = events.filter((e) => e.type === "session.opened" && e.sessionId.endsWith(":sub:child-B"));
   check("a replayed one-shot child opens with its own descriptor's label", replayOpens.length > 0 && replayOpens.every((e) => e.title === "Nested B"), JSON.stringify(replayOpens.map((e) => e.title)));
 
+  // ---- a child DSH reports as archived ----------------------------------
+  // Announcing it again would resurrect it in Paseo, which is exactly how
+  // "archive all" appeared to do nothing after a restart.
+  check(
+    "an archived child is not announced by the replay",
+    !events.some((e) => e.type === "session.opened" && e.sessionId.endsWith(":sub:child-Z")),
+    "child-Z was announced",
+  );
+
   // ---- a child whose label arrives after its notice ----------------------
   // Paseo shows a child whose title never arrived as "加载中…" forever, and a
   // child has no configuration channel, so the title it opens with is the only

@@ -1027,6 +1027,40 @@ label（`catalogFact()` 的校验：`mode === "continuable" && typeof label !== 
 原有的 37 条（父子次序、held 子树、replay、error、steer）全部保持通过。实机侧另有 `harness/subagent-live.mjs`（4/4，一次 `child-opened`、
 label 正确、子会话有自己的时间线）。
 
+### 38. 归档：能力没声明 = 用户的操作被静默吞掉
+
+现象链：在 App 里归档一个会话/子代理 → 界面报「归档成功」→ 重启 Paseo 后它**还在**；在 DSH
+里看也**没有**归档。三个独立缺陷叠在一起：
+
+1. **能力没声明**。`PROVIDER_CAPABILITIES` 里有 `session.archive`/`session.unarchive`，但插件的
+   `CAPABILITIES` 没声明它们 → Paseo 把归档当**本地标记**处理 → 请求根本不会发给我们。这是
+   本仓库反复出现的那一类错误：**声明的能力决定 UI 长什么样，也决定对方的意图能不能到达我们**。
+2. **子会话不可寻址**。Paseo 的归档请求按 **persistence 句柄**寻址（它的 opencode 适配器
+   `setNativeSessionArchived(handle, archivedAt)` 同样按 provider 原生句柄归档），而子会话是
+   `restoration:"parent"`、**不带句柄** → 「归档子代理」永远到不了我们这里。
+3. **重放复活**。`replaySubagents()` 每次 `session.open` 都把每个持久子会话重新播报一遍
+   `session.opened`；Paseo 会丢掉 provider 不再报告的条目，而我们照报不误 → 归档被撤销。
+
+**语义参照**：DSH 的归档是一等概念（`ctx.workspaceRegistry.archiveSession(sessionId,
+{stopActivity})` / `unarchiveSession(sessionId)` / `archivedSessionIds`，活跃会话必须
+`stopActivity`，否则 `WorkspaceActiveSessionError`）；Paseo 的语义是**照抄 provider**，不自己
+维护状态。所以正确做法是把 Paseo 的归档**落到 DSH 的原生归档**，而不是发明一个本地标志。
+
+**修法**：
+
+- 能力清单加 `session.archive` / `session.unarchive`；桥新增 `paseo/archive` /
+  `paseo/unarchive`，经 `ctx.get('workspaceRegistry')` 转调 DSH；失败返回 `available:false`
+  + 原因，**绝不把没做的事报成成功**。
+- 子会话 `open()` 带上 `persistence: {version:1, data:{sessionId:<nativeId>}}`，从此可寻址。
+- 子会话在 DSH 里跑在**根的进程**里、自己没有进程，而 DSH 的 registry 是**进程全局**的 →
+  `archiveDshSession(dshSessionId, archived)` 由任意一个打开的根代为转发。
+- `paseo/subagents` 附带每个子会话的 DSH 归档状态（读 `archivedSessionIds`），
+  `replaySubagents()` 跳过已归档的 → 归档重启后依然成立。
+
+**验证**：`harness/subagent-check.cjs` **42/42**（假桥的 replay 列表加了一条 `archived: true`
+的子会话，断言"已归档的子会话不被重放播报"）；`tsc --noEmit` 干净；其余离线套件
+89/29/19/25/17 全绿；内嵌桥按硬性约束重新生成。
+
 ---
 
 ## 已知限制（未修，有意为之）

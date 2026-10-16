@@ -537,7 +537,7 @@ export class DshProcess {
 
   async subagents(): Promise<{
     available: boolean;
-    subagents: Array<{ sessionId: string; parentSessionId: string; mode?: string; label?: string }>;
+    subagents: Array<{ sessionId: string; parentSessionId: string; mode?: string; label?: string; archived?: boolean }>;
     diagnostics?: unknown[];
     error?: { message: string };
   }> {

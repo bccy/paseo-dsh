@@ -483,7 +483,14 @@ export class DshSession {
     if (process === undefined) return;
     let listing: {
       available: boolean;
-      subagents: Array<{ sessionId: string; parentSessionId: string; mode?: string; label?: string }>;
+      subagents: Array<{
+        sessionId: string;
+        parentSessionId: string;
+        mode?: string;
+        label?: string;
+        /** Archived in DSH's own registry: replaying it would resurrect it. */
+        archived?: boolean;
+      }>;
       diagnostics?: unknown[];
       error?: { message: string };
     };
@@ -506,6 +513,10 @@ export class DshSession {
     }
     for (const row of listing.subagents) {
       if (this.#closed) return;
+      // An archived child stays archived: DSH holds that state, Paseo drops what
+      // the provider stops reporting, and re-announcing it is precisely what
+      // made "archive all" look like it did nothing after a restart.
+      if (row.archived === true) continue;
       let history: {
         events: Array<{ type: string; seq?: number; time?: number; data: unknown }>;
         inheritedEventCount: number;

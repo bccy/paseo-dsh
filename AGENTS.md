@@ -90,6 +90,9 @@ cd paseo-plugin && npx tsc --noEmit
 - `harness/thinking-check.cjs` — 思考行折叠预览：结束后取**第一行**、运行中取最后一个首行已终结
   的段落、标签恒为 `思考`（都是 DSH 的行为，逐字移植在 `client/thinking-text.ts`）。
   **动了思考行显示必跑。**
+- `harness/subagent-check.cjs` 里另有归档用例：假桥的 replay 列表带一条 `archived: true` 的
+  子会话，断言它**不被重放播报**（归档重启后必须仍然成立）。**动了 `dsh-bridge/` 或
+  `replaySubagents()` 必跑。**
 - `harness/sweep-check.cjs` — 原生扫光的几何：mask 曲线的停点、阶梯 alpha 的对称性与平铺、
   1.5s/0.3s/2-3 行程、`steps(48)`。**动了 `client/sweep-*.ts` 必跑。** iOS 上跑不了，这些
   数字就是"与 DSH 一致"的唯一凭据。

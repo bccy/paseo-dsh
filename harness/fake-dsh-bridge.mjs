@@ -288,6 +288,9 @@ async function handle(method, params, id) {
           // A one-shot child has no label in the catalog (DSH only requires one
           // for a continuable child); its label lives in its own descriptor.
           { sessionId: "child-B", parentSessionId: "child-A", mode: "one-shot" },
+          // Archived in DSH's own registry: it must not be announced again, or
+          // "archive all" would be undone by the next replay.
+          { sessionId: "child-Z", parentSessionId: "child-A", mode: "one-shot", archived: true },
         ],
       };
     case "paseo/history": {
