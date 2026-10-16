@@ -78,7 +78,7 @@ cd paseo-plugin && npx tsc --noEmit
 `harness/assistant-stream-check.cjs`（助手文本流式：同 id 增长快照、`id === messageId`、
 经 Paseo 规则投影后合并成一行）。
 
-还有三个**离线**脚本，直接 require 编译产物、不需要 daemon（运行步骤写在各自头部注释里）：
+还有四个**离线**脚本，直接 require 编译产物、不需要 daemon（运行步骤写在各自头部注释里）：
 
 - `harness/timeline-check.cjs` — `TimelineBuilder` 的工具行状态机：`tool/call` → `tool/result`、
   重复 `tool/call` 不能把完成行重置回 running 或清空输出、`turn/end`（含 `aborted`）要把仍
@@ -87,6 +87,9 @@ cd paseo-plugin && npx tsc --noEmit
   提交批次（回放历史不闪）、窗口、交接、时钟。**动了客户端脉冲条件必跑。**
 - `harness/tool-call-check.cjs` — `client/tool-call-data.ts` 的工具行映射（图标、命令、diff、
   截断）。**动了工具行渲染必跑。**
+- `harness/sweep-check.cjs` — 原生扫光的几何：mask 曲线的停点、阶梯 alpha 的对称性与平铺、
+  1.5s/0.3s/2-3 行程、`steps(48)`。**动了 `client/sweep-*.ts` 必跑。** iOS 上跑不了，这些
+  数字就是"与 DSH 一致"的唯一凭据。
 
 客户端脉冲这条链最容易"看着对但静默失效"（`Animated` 在 RN Web 上只跑一段就停、`setValue`
 推不到原生 view、客户端不折叠只改 `metadata` 的 item），所以断言要打在数据层。

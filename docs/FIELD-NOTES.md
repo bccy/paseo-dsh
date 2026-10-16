@@ -600,17 +600,19 @@ DSH 的 `read_image` 返回的是**附件引用**（`{path, image:{attachmentId,
 原生端是 Reanimated + SVG 渐变遮罩），而插件 SDK 只导出 `Icon/Modal/useToast/
 useRevealedText/ScrollView/FlatList/copyText/TextInput`，**没有暴露任何 shimmer/spinner**。
 
-**修法（最终采用）**：`client/shimmer.ts` 用**普通 React state** 驱动 opacity：一个模块级
-`setInterval`（50ms）按余弦算出透明度，推给所有订阅者；`useShimmer(active)` 只在 active 时
-订阅，空闲行恒为 1。20fps 的 state 重渲染只发生在正在运行的那几行上，两端行为一致。
+**修法（当前）**：`client/text-shimmer.tsx` —— **web 用 DSH 的 CSS 扫光，原生用等价几何重建**，
+详见第 32 条。下面这段透明度脉冲是**历史**，已被扫光取代（`client/shimmer.ts` 已删除）：
 
-**关键：脉冲的触发条件是"位置"而不是"状态"**（见第 29c 条）。思考行仍是"文本还在变长"，
+> 曾经用普通 React state 驱动整行 opacity（模块级 `setInterval` 按余弦推给订阅者）。它在
+> 两端都能跑，但观感只是"忽明忽暗"，用户明确要 DSH 那种**扫光**。
+
+**关键：触发的条件是"位置"而不是"状态"**（见第 29c 条）。思考行仍是"文本还在变长"，
 工具行是 `useRowPulse()`——**在客户端**算出来的"我是不是最新那一行、且刚提交过"。
-服务端标不出来（见 29c 里那条失败的尝试）。
+服务端标不出来（见 29c 里那条失败的尝试）。扫光与脉冲共用这个判据（`shouldPulse()`）。
 
-期间试过"扫光"（叠一条高光从左到右平移）：没有真正的渐变时它就是一块硬边色块划过，
-用户评价**还不如脉冲**，所以回退了。要做扫光必须先解决渐变（宿主那套 `background-clip` /
-Reanimated 遮罩没暴露给插件）。
+**早期试过的扫光**（叠一条高光从左到右平移）被否掉了：没有真正的渐变时它就是一块硬边色块
+划过，用户评价**还不如脉冲**。**这个结论后来被第 32 条推翻**——问题不在"扫光"，在于当时只是
+平移一个纯色块，既没有 mask 也没有反向位移。
 
 ### 29b. 脉冲实现踩过的四个坑
 
@@ -785,6 +787,52 @@ DSH 原版那行还有 `● yywl`（执行者）和"复制"按钮，我们没有
 
 **验证**：`harness/timeline-check.cjs`（描述确实挂在 metadata 上、结果行仍带着、没描述就不加）、
 `harness/tool-call-check.cjs`（描述 → `summary`，命令 → `headline`，空描述忽略）。
+
+### 32. 扫光：web 复用 DSH 的 CSS，原生用等价几何重建
+
+**要求**：用户要的是 **DSH web 那种扫光**（`运行命令 · List DSH checkout root` 上有一道亮光
+扫过），而且**必须在 App（iOS）上跑**，不是网页版。
+
+**DSH 的实现**（`@deepseek-ai/dsh-client-ui-primitives` 的 `TextShimmer.module.css`，原样抄下来）：
+
+```
+.sweep      { mask-image: linear-gradient(105deg, transparent 0%, black 40% 60%, transparent 100%);
+              transform: translateX(-100%); animation: dsh-row-shimmer-sweep ... }
+.highlight  { transform: translateX(100%);  animation: dsh-row-shimmer-highlight ... }
+@keyframes dsh-row-shimmer-sweep     { 0%{translateX(-100%)} 66.6667%,100%{translateX(100%)} }
+@keyframes dsh-row-shimmer-highlight { 0%{translateX(100%)}  66.6667%,100%{translateX(-100%)} }
+/* 1.5s / delay .3s / steps(48,end) / infinite；配色 color-mix(neutral-00 45%, transparent) */
+```
+
+关键不是"渐变背景"，而是**两层反向位移**：`.sweep` 往右、`.highlight` 往左，两者相加为 0，
+所以**副本字形一动不动，动的只有 mask**。早期那版"平移一个纯色块"之所以难看，就是缺了这两点。
+
+**web**：`client/shimmer-css.ts` 把上面那段 CSS **原样**注入（类名换成 `[data-testid]` 选择器，
+RN 会内联设置的地方补 `!important`），`client/text-shimmer.tsx` 按 DSH 的 DOM 结构渲染。
+唯一的改动是 DSH 用 `::after { content: attr(data-shimmer-text) }` 把装饰副本挡在无障碍树外，
+我们直接渲染它并标 `aria-hidden`。
+
+**原生（App）**：RN 既没有 `mask-image` 也没有渐变，所以 `client/sweep-native.tsx` **重建同样的
+几何**：把 mask 切成 `SWEEP_BANDS = 8` 条等宽带，每条的 alpha 取 DSH 那条渐变曲线在带中点的
+采样（`client/sweep-geometry.ts` 的 `sweepProfile`）；每条带是一个 `overflow: hidden` 的裁剪
+窗口，整排一起 `translateX`（= DSH 的 `.sweep`），窗口里的副本**反向平移同样的距离**
+（= DSH 的 `.highlight`），于是副本仍然不动。一个 `Animated.Value` 同时驱动两者，
+`useNativeDriver` 跑 UI 线程，扫动期间不产生任何 React 重渲染。
+
+**实测**（在 web 上用 `localStorage.setItem("dsh-sweep","native")` 强制走原生那条路径，
+直接读 DOM，因为两条实现不共享任何原语）：
+
+```
+bands 8, bandW 97.5 (= 780/8), 8 条带 left 依次相差 97.5（无缝平铺）
+alpha [0.156, 0.469, 0.781, 1, 1, 0.781, 0.469, 0.156]   ← 正是 sweepProfile((i+0.5)/8)
+counterX 全部 = -sweepX                                    ← 副本字形完全不动
+transform 序列 780 → -468 → -131 → 207 → 572 → 780 → 780   ← 1.5s 一个周期，末段保持
+```
+
+**验证**：`harness/sweep-check.cjs` 25/25（mask 曲线的四个停点、阶梯对称性与平铺、1.5s/0.3s/
+2-3 行程、`steps(48)` 量化）。**iOS 上无法本地运行**（这台机器是 Linux，没有模拟器），
+原生那条路径只能靠上面的结构断言 + 用户在真机上看；两条路径的几何常量是同一份，
+所以 web 上量到的数字就是原生用的数字。
 
 ---
 

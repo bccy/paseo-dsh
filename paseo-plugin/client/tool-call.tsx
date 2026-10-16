@@ -20,7 +20,7 @@ import { Icon } from "@getpaseo/plugin/client/react-native";
 import { useMemo, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import { shouldPulse, useRowPulse } from "./newest";
-import { useShimmer } from "./shimmer";
+import { TextShimmer } from "./text-shimmer";
 import { type ToolCallData } from "./tool-call-data";
 
 /** GitHub's diff line tints, at low alpha so both themes stay readable. */
@@ -42,16 +42,18 @@ export function InlineToolCall({
   const canExpand = hasBody || data.summary !== "" || data.headline !== "";
   const compact = layout.compact;
   const iconSize = compact ? 14 : 16;
-  // Only the newest row pulses: while it runs, and for a window after it
+  // Only the newest row is "running": while it runs, and for a window after it
   // commits (the only way a short command — call and result in the same tick —
-  // ever shows a pulse). Gating on the newest row also keeps an interrupted
+  // ever shows a signal). Gating on the newest row also keeps an interrupted
   // tool, stuck `running` forever, from blinking for the rest of the session.
-  const shimmer = useShimmer(shouldPulse(data.status, useRowPulse(agentId, timestamp)));
+  const running = shouldPulse(data.status, useRowPulse(agentId, timestamp));
 
   const styles = useMemo(
     () => ({
       root: { gap: 3, paddingVertical: compact ? 3 : 5 },
       head: { flexDirection: "row" as const, gap: 8, alignItems: "center" as const },
+      // The text run, and the flex row the shimmer's copy re-lays-out.
+      text: { flexDirection: "row" as const, gap: 8, alignItems: "center" as const, flex: 1, minWidth: 0 },
       label: { color: theme.colors.foregroundMuted, fontSize: compact ? 13 : 14 },
       summary: {
         color: theme.colors.foregroundMuted,
@@ -116,22 +118,37 @@ export function InlineToolCall({
       }}
       style={styles.root}
     >
-      <View style={[styles.head, { opacity: shimmer }]}>
+      <View style={styles.head}>
         <Icon
           name={data.icon}
           size={iconSize}
           color={data.failed ? theme.colors.statusDanger : theme.colors.foregroundMuted}
         />
-        <Text style={styles.label}>{data.label}</Text>
-        {/* When expanded the summary moves below at full width, so the head
-            does not show a truncated copy of what the body already carries. */}
-        {!expanded && data.summary !== "" ? (
-          <Text style={styles.summary} numberOfLines={1}>
-            {data.summary}
-          </Text>
-        ) : !expanded ? (
-          <View style={styles.summary} />
-        ) : null}
+        <TextShimmer
+          active={running}
+          contentStyle={styles.text}
+          highlightColor={theme.colors.foreground}
+          surfaceColor={theme.colors.surface0}
+        >
+          {(color) => (
+            <>
+              <Text style={[styles.label, color === null ? null : { color }]}>{data.label}</Text>
+              {/* When expanded the summary moves below at full width, so the
+                  head does not show a truncated copy of what the body already
+                  carries. */}
+              {!expanded && data.summary !== "" ? (
+                <Text
+                  style={[styles.summary, color === null ? null : { color }]}
+                  numberOfLines={1}
+                >
+                  {data.summary}
+                </Text>
+              ) : !expanded ? (
+                <View style={styles.summary} />
+              ) : null}
+            </>
+          )}
+        </TextShimmer>
       </View>
       {expanded && canExpand ? (
         <View style={styles.body}>
