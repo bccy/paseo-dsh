@@ -913,14 +913,22 @@ terminal → `SquareTerminal`，session → `History`，cordis → `Plug`…）�
 一长串 JSON 时，摘要只分到很窄的宽度，于是**一个字符一行地竖着排下来**，看起来像坏了
 （用户："点开会并行显示"）。
 
-修法：展开时文本容器从 row 换成 **column** —— 标签一行、摘要**另起一行占满宽度**（`numberOfLines`
-也不限）。同时补了一条：**展开块已经承载同样内容时不再重复显示摘要**（无 description 的行，
-摘要就是工具主体，而块里的 headline 是它的完整形式；有 description 的行，摘要才是真正的标题，
-必须留着——这就是第 33 条一的要求）。判据做成数据字段 `titled`，可离线断言。
+**第一版修法是错的**：把展开时的文本容器从 row 换成 column（标签一行、摘要另起一行）。这样确实
+不再竖排，但**有 description 的行也被拆成两行**——中文标题离开了它命名的那个标签，用户立刻
+指出来："中文的标题也被换到第二行了"。
 
-**验证**：`harness/tool-call-check.cjs` 83/83（新增 17 条：原生工具的标签/图标、
-MCP 仍是原始名 + 扳手、typed detail 不被名字映射覆盖、`titled` 的两种取值、
-以及"块已承载时标题是主体"）。
+**真正的根因是展开时取消了 `numberOfLines` 上限**：宽度窄 + 不限行 = 竖排。所以：
+
+- 头部**永远一行**（`numberOfLines={1}` 恒定），撤回 column，标题回到标签旁边；
+- 展开时只在**摘要不是标题**（没有 description）且**块里已经有同样内容**时把它省掉，避免
+  紧凑 JSON 与块里的美化 JSON 重复。判据是数据字段 `titled`，可离线断言；
+- 为了让"省掉摘要"不丢信息，**块一律以工具主体开头**：shell 的 `detailHeadline` 设成命令
+  （以前只有 `unknown` 有），于是多行命令在块里读得全；有 description 时块也仍然以命令开头
+  （headline 优先取 `detailHeadline`，不再被 description 顶掉——顺带修掉了审核第 2 条）。
+
+**验证**：`harness/tool-call-check.cjs` 84/84（新增 18 条：原生工具的标签/图标、MCP 仍是原始名 +
+扳手、typed detail 不被名字映射覆盖、`titled` 的两种取值、"块已承载时标题是主体"，
+以及 shell 的块一律以命令开头）。
 
 ---
 

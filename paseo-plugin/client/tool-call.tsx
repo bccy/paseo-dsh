@@ -55,16 +55,8 @@ export function InlineToolCall({
     () => ({
       root: { gap: 3, paddingVertical: compact ? 3 : 5 },
       head: { flexDirection: "row" as const, gap: 8, alignItems: "center" as const },
-      // The text run, and the two flex layouts the shimmer's copy re-lays-out:
-      // one line while collapsed, title over subject once expanded.
+      // The text run, and the flex row the shimmer's copy re-lays-out.
       text: { flexDirection: "row" as const, gap: 8, alignItems: "center" as const, flex: 1, minWidth: 0 },
-      textColumn: {
-        flexDirection: "column" as const,
-        gap: 2,
-        alignItems: "flex-start" as const,
-        flex: 1,
-        minWidth: 0,
-      },
       label: { color: theme.colors.foregroundMuted, fontSize: compact ? 13 : 14 },
       summary: {
         color: theme.colors.foregroundMuted,
@@ -75,7 +67,6 @@ export function InlineToolCall({
         minWidth: 0,
       },
       body: { marginLeft: compact ? 10 : 12, gap: 2 },
-      summaryBlock: { flex: 0, alignSelf: "stretch" as const },
       summaryFull: {
         color: theme.colors.foregroundMuted,
         fontFamily: "monospace" as const,
@@ -132,27 +123,24 @@ export function InlineToolCall({
         />
         <TextShimmer
           active={running}
-          contentStyle={expanded ? styles.textColumn : styles.text}
+          contentStyle={styles.text}
           highlightColor={theme.colors.foreground}
           surfaceColor={theme.colors.surface0}
         >
           {(color) => (
             <>
               <Text style={[styles.label, color === null ? null : { color }]}>{data.label}</Text>
-              {/* The row's title never disappears: hiding it left the row
-                  unnamed. Expanded it drops to its own full-width line instead
-                  of being squeezed beside the label — a long JSON there wrapped
-                  one character per line. The one case it is dropped is when the
-                  block below already carries the same subject in full, so a
-                  description-less row does not print its arguments twice. */}
+              {/* The row stays one line, label and title together: moving the
+                  title onto its own line just pushed it away from the row it
+                  names. It is only dropped once the block below carries the same
+                  subject in full, so a description-less row does not print its
+                  arguments twice. `numberOfLines` stays 1 for the same reason —
+                  an unbounded line beside a long label wrapped one character per
+                  line, which is what "并行显示" was. */}
               {showSummary ? (
                 <Text
-                  style={[
-                    styles.summary,
-                    color === null ? null : { color },
-                    expanded ? styles.summaryBlock : null,
-                  ]}
-                  numberOfLines={expanded ? undefined : 1}
+                  style={[styles.summary, color === null ? null : { color }]}
+                  numberOfLines={1}
                 >
                   {data.summary}
                 </Text>

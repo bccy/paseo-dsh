@@ -274,6 +274,9 @@ export function toolCallData(
   switch (type) {
     case "shell":
       primary = str(detail, "command");
+      // The head keeps one line, so a multi-line command is only ever readable
+      // in the block — lead it with the command the way DSH's own row does.
+      detailHeadline = primary;
       body = str(detail, "output");
       bodyLabel = "输出";
       break;
@@ -372,10 +375,12 @@ export function toolCallData(
       : "completed",
     phase,
     summary: truncate(description === "" ? primary : description),
-    // `unknown` always leads with its pretty arguments: a description on an MCP
-    // call must not push the block back to the compact one-line JSON.
+    // A block-specific lead (the pretty arguments of an `unknown` row, the
+    // command of a shell row) always wins: a description must not push the block
+    // back to the compact one-line form. Otherwise the block leads with the
+    // subject only when the head is showing something else — the description.
     headline: truncate(
-      type === "unknown" ? detailHeadline : description === "" ? "" : primary,
+      detailHeadline !== "" ? detailHeadline : description === "" ? "" : primary,
     ),
     body: truncate(body),
     bodyLabel,
@@ -386,6 +391,6 @@ export function toolCallData(
     // is its title still expands — the title wraps to its full width — but must
     // not draw an empty code surface.
     titled: description !== "",
-    hasDetail: truncate(description === "" ? detailHeadline : primary) !== "" || body !== "",
+    hasDetail: truncate(detailHeadline !== "" ? detailHeadline : description === "" ? "" : primary) !== "" || body !== "",
   };
 }

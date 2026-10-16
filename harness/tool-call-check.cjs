@@ -183,7 +183,14 @@ console.log("the description is the row's label");
     "complete",
   );
   equal("without a description the command is the label", plain.summary, "pwd");
-  equal("and nothing is repeated when expanded", plain.headline, "");
+  // The head is always one line, so the command itself lives in the block —
+  // that is where a multi-line command becomes readable.
+  equal("and the block leads with the command", plain.headline, "pwd");
+  equal(
+    "even when the head is showing a description instead",
+    described.headline,
+    "pwd; ls -d /tmp",
+  );
 
   const empty = toolCallData(
     {
