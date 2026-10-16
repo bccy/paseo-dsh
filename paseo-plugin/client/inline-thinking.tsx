@@ -20,17 +20,14 @@ import { Icon, useRevealedText } from "@getpaseo/plugin/client/react-native";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import { TextShimmer } from "./text-shimmer";
+import { reasoningPreview } from "./thinking-text";
 
 export interface InlineThinkingData {
   text: string;
   phase: "streaming" | "complete";
 }
 
-/** Last non-empty line: the current (or final) line of the thought. */
-function lastLine(text: string): string {
-  const lines = text.split("\n").filter((line) => line.trim() !== "");
-  return lines[lines.length - 1] ?? "";
-}
+
 
 /**
  * Track "still producing text" without trusting the flickering `phase`.
@@ -65,7 +62,9 @@ export function InlineThinking({
   const open = manual ?? false;
 
 
-  const line = lastLine(revealed);
+  // DSH's own preview: the first line once settled, the latest completed
+  // paragraph's first line while streaming (`./thinking-text`).
+  const line = reasoningPreview(revealed, growing);
 
   const styles = useMemo(
     () => ({
@@ -125,9 +124,10 @@ export function InlineThinking({
         >
           {(color) => (
             <>
-              <Text style={[styles.label, color === null ? null : { color }]}>
-                {growing ? "思考中…" : "已思考"}
-              </Text>
+              {/* DSH titles every reasoning row "思考" and never swaps it for
+                  a finished form; the "已思考" string it ships belongs to its
+                  collapsed whole-turn summary, not to this row. */}
+              <Text style={[styles.label, color === null ? null : { color }]}>思考</Text>
               {!open ? (
                 <Text style={[styles.line, color === null ? null : { color }]} numberOfLines={1}>
                   {line}

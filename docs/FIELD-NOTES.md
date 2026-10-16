@@ -711,8 +711,17 @@ diff 行按 GitHub 的做法：浅绿/浅红底（低 alpha，深色主题也不
 上色、代码正文用 **muted 前景色**（用 `foreground` 会"太白"）。**不要**给每行加左侧亮色
 条——那会在行首形成一块更亮的区域，用户明确不喜欢。
 
-思考行还有一个反直觉的点：**思考结束后折叠态显示的是最后一行**（用户正在读的结尾），
-不是第一行摘要。折叠态文案 `已思考` + 尾行，展开才看全文。
+思考行还有一个点，**一度做反了**：折叠态曾经显示**最后一行**（当时的理由是"用户正在读的结尾"）。
+用户指出应**以 DSH 为准**，而 DSH 的 `ReasoningRow` 是：
+
+```js
+const summaryText = running ? latestCompletedParagraphFirstLine(text) : firstLine(text);
+```
+
+即**结束后显示第一行**，运行中显示"最后一个首行已被换行终结的段落"的首行（按段落推进，
+不是逐 token 抖动）；标签恒为 `思考`（`message.think`），**不会**变成 `已思考`——DSH 的
+`已思考` 属于它"整轮过程"折叠摘要，是另一个元素。现按 DSH 原样移植到 `client/thinking-text.ts`，
+断言见 `harness/thinking-check.cjs`。
 
 ### 30. 展开态：往下铺满、不裁剪、不卡顿
 
@@ -929,6 +938,29 @@ terminal → `SquareTerminal`，session → `History`，cordis → `Plug`…）�
 **验证**：`harness/tool-call-check.cjs` 84/84（新增 18 条：原生工具的标签/图标、MCP 仍是原始名 +
 扳手、typed detail 不被名字映射覆盖、`titled` 的两种取值、"块已承载时标题是主体"，
 以及 shell 的块一律以命令开头）。
+
+### 35. 思考行的折叠预览：以 DSH 为准
+
+用户："这个'已思考'的显示好像是用的结尾的，你看一下 DSH 本身思考结束以后显示的是什么，以 dsh 为准。"
+
+DSH 的 `ReasoningRow`（`dsh-client-ui-chat`）里就一行：
+
+```js
+const summaryText = running ? latestCompletedParagraphFirstLine(text) : firstLine(text);
+const summary = summaryText.replaceAll("**", "");
+```
+
+- **结束后**：`firstLine(text)` —— **第一行**。我们以前显示最后一行，做反了。
+- **运行中**：`latestCompletedParagraphFirstLine(text)` —— 取**最后一个"首行已被换行终结"的段落**
+  的首行，所以预览按段落推进，不会每个 token 抖一次。注意它取的是最后一个满足条件的段落，
+  不一定是最末段落（末段首行还没换行就不算）。
+- **标签恒为 `思考`**（`message.think`）。DSH 里那个 `已思考`（`message.turnProcess.thoughtForAWhile`）
+  属于"整轮过程"折叠摘要，跟这一行不是同一个元素，所以这里不再在结束时改成 `已思考`。
+- 两个函数**逐字移植**到 `client/thinking-text.ts`（纯函数），`**` 也照 DSH 剥掉。
+
+**验证**：`harness/thinking-check.cjs` 17/17 —— 首行取值、空串/无换行/以换行开头、段落的四种
+边界（未终结的末段不算、空行与缩进空行分段、`\r\n`）、`**` 剥离，以及一条直接钉住回归的断言
+"结束后返回第一行、且绝不返回尾行"。
 
 ---
 
