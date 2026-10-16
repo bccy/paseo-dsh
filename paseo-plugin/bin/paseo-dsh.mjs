@@ -30,6 +30,14 @@ Install the plugin itself with:  paseo plugin add npm:paseo-dsh
 
 const [command, ...rest] = process.argv.slice(2);
 
+// `paseo-dsh doctor | head -1` closes stdout early. Unhandled, that dies with an
+// `'error'` event and exit code 1 — the same code `doctor` uses for a blocking
+// issue, so a consumer cannot tell a crash from a diagnosis.
+process.stdout.on("error", (error) => {
+  if (error.code === "EPIPE") process.exit(process.exitCode ?? 0);
+  throw error;
+});
+
 switch (command) {
   case undefined:
   case "doctor":
