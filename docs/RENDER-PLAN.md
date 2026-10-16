@@ -101,7 +101,10 @@
 ### Phase 4 · 图片、locale、两个漏行
 - **Phase 4a · locale / compaction / worktree_setup —— 已完成（`bdcc5d1`）**：
   - **locale**：客户端接上 `DSH_PASEO_LANG`（「思考」「计划」「展开/收起」「折叠/收起」等）。
-  - **compaction**：`consume()` 增加分支，压缩过程可见。
+  - **compaction**：`consume()` 增加分支，压缩完成时出一条 Paseo 原生 marker。
+    **一个 `compactionId` 只出一条，且是收尾态**：provider 行是只追加的
+    （`mapTimelineItem` 把非消息类 item 的 `id` 剥掉），所以 `loading` 在插件通道上做不到
+    —— 发了就会在完成行旁边永久留一行。详见 FIELD-NOTES 第 44 条。
   - **worktree_setup**：给 typed detail 或并入 `unknown`，不再出现空行。
 - **Phase 4b · 图片 —— 调研结论已出，尚未实现**：`read_image` / 浏览器截图不再被
   `textOf()` 丢掉。走 **Paseo 既有的形状**，不自造：图片做成一条**独立的

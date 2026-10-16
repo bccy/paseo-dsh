@@ -1243,18 +1243,89 @@ DSH 又不会为"这个进程已经死了"落任何事实，所以**光看日志
 假桥、`subagent-check.cjs`、`timeline-check.cjs` 的用例，都在同一批**未提交**的工作区改动里；
 本文写作时尚未提交，真机行为以提交后的版本为准。
 
-### 42. `cancel_agent` 返回 `success:false`（待查）
+### 42. `cancel_agent` 返回 `success:false`（已结案：时序，不是缺陷）
 
 **症状**：在一个正在跑数数的 agent 上调 `cancel_agent`，返回失败（`success:false`），
 而那个 agent **照样跑完**。
 
-**状态**：**待查**（尚未定位根因）。
+**结论**：**时序** —— 取消落到时那一回合已经收尾了。`{success:false}` 在 Paseo 侧只有一条
+来源：`agent-manager.js` 的 `hasInFlightRun(agentId)` 为假 → `lifecycle-command.js`
+提前返回 `{cancelled:false, cancellation:{status:"not_running"}}` → MCP 翻成
+`{success:false}`。该分支只有 `logger.trace`，默认 info 级别**不留任何日志**，所以现场什么
+都不打印。
 
-**线索（只是线索，不是结论）**：可能与"**取消是取消回合，不是杀进程**"这条硬性约束有关
-（见 AGENTS.md 与第 11 条：`interrupt()` 直接 `kill()` 掉子进程会连会话一起报废，所以本
-仓库的取消走 `session/cancel` → `agent.cancel({ kind: "user" })`）。另外 `cancel_agent`
-是 **Paseo 自己的 agent 管理工具**，不在本仓库的插件工具表里，所以要查的是 Paseo 侧
-cancel 的语义、以及它对本 provider 的取消调用路径 —— 在查明之前不要动任何东西。
+另有一条路能产出"被拒绝"的形状，但**不是**这个：provider 回 `request.failed` 时，
+`interruptSession` 会打 **ERROR** `Failed to interrupt session`，等 rescue 超时后抛
+`AgentRunCancellationError` → MCP 返回 **tool error**，不会是 `{success:false}`。本机四份
+daemon 日志里 `Failed to interrupt session` 计数为 **0**。
+
+三次真机实验（一次性靶子，全部已归档）：
+
+| 靶子 | 场景 | 返回 | DSH 会话日志的 `turn/end` | 实际 |
+|---|---|---|---|---|
+| A | 数到 500，在它收尾瞬间取消 | `{"success":false}` | `reason {"kind":"completed"}`（**自己跑完**） | 不是被忽略，是已经结束 |
+| B | 根代理 `sleep 30` 中取消 | `{"success":true}` | `{"kind":"aborted","reason":{"kind":"user"}}` | 只跑了 step1 |
+| C | 子代理 `sleep 30` 中取消 | `{"success":true}` | `aborted/user` | 只跑了 step1 |
+
+**教训**：Paseo 的 `cancel_agent` 对"回合已经结束"和"拒绝取消"返回**同一个**
+`{success:false}`。要分清两者，唯一可靠的证据是 DSH 会话日志里那一回合的 `turn/end`
+reason —— 先看它，再决定往哪查。另外：**我们本来就实现了 `session.interrupt`**
+（`provider.ts` 的 `case "session.interrupt"`），不是漏实现。
+
+### 43. 被取消的根回合被上报成 `completed`（已修）
+
+**症状**：点"停止"之后，界面显示这一回合**正常完成**，而不是被取消。
+
+**根因**：根回合的终态只在 `session.ts` 的 `#onStatus` 里以**硬编码的 `"completed"`** 发出；
+`aborted → canceled` 的映射（`childTurnState`）只用在子会话上。而 Paseo 自己的 opencode /
+claude / codex 三个适配器在中断时**全部**上报 `turn_canceled`，协议侧
+（`plugin-provider.js` 把 `session.turn state:"canceled"` 翻成 `turn_canceled`）消费的也正是
+这个值。于是"用户按了停止"在界面上变成"一切正常"。
+
+**修法**：记住 DSH `turn/end` 的 reason（新字段 `#turnEndState`），`aborted → canceled`，
+**其余 reason 一律保持原行为**（控制爆炸半径：以 `error` / `max-tokens` / `blocked` /
+`interrupted` 结束的回合仍报 `completed`，那是另一件事，这次没动）。
+
+**验证**：`harness/steer-check.cjs` 新增 `cancel` 模式的假桥驱动，断言回执是
+`request.completed` 且带 requestId、真的发了 `session/cancel`、取消后该回合不再有任何输出、
+终态是 `canceled` 且 turnId 一致、同会话还能跑下一回合、**全程无 `shutdown` 帧**（＝不是杀
+进程）。负向验证两条：把 `provider.ts` 改成"只回执不停"→ 20/24 失败；把 `session.ts` 退回恒
+`completed` → 恰好命中那一条断言，23/24 失败。真机 `dsh --profile paseo` 端到端探针：回执
+`request.completed`、终态 `canceled`、只有 step1 的 `sleep 45` 被起过。
+
+**仍未修（见下节）**：DSH 原生子代理**无法取消** —— `DshChildSession.interrupt()` 抛
+`subagent sessions are read-only`，桥的 `session/cancel` 也只认 Paseo 根会话。DSH 本身支持
+（`dsh-subagent` 的 archive-admission 就是 `child.cancel({kind:"parent"})`），修它必须改
+`dsh-bridge/`（要重生成内嵌桥）。目前从 Paseo 侧也够不着：provider 子代理不是 agent，
+UI 只有 `provider_subagents.list/.timeline.get/.update`，没有停止入口。
+
+### 44. 一次压缩在界面上变成三行 —— provider 行是只追加的（已修）
+
+**症状**：在 App 里手动发一次 `/compact`，时间线上出现**不止一行**压缩标记。查会话日志：
+`compaction/start` 只有**一条**（带 `sourceCommandId`），DSH 确实只压缩了一次。
+
+**根因在本仓库，不在 DSH、也不在文案。** 插件对 `compaction/start`、`compaction/summary`、
+`compaction/end` **各发一个 item**，当时的注释写着"同一个 `compactionId`，所以行会原地更新
+而不是叠一行"。**这句是错的**：守护进程的 `mapTimelineItem`
+（`@getpaseo/server` 的 `plugin-provider.js`）对**非消息类** item 一律走
+`return withoutIdentity` —— 它把 `id` 解构掉了 —— 而只有 `assistant_message` / `reasoning` /
+`user_message` 会拿 `snapshots` 里上一次的条目做比较。**所以 provider 发来的行永远是新增，
+id 再稳也没用。**
+
+**实测（不是推断）**：把本仓库自己那个长会话的日志喂给 `TimelineBuilder`，一次压缩产出
+**3 个 item**；守护进程自己的活动流里，那**一次** `/compact` 对应
+`[User] /compact` → `[Compacted]` ×3 → `[/compact]`。
+
+**修法**：一个 `compactionId` **只发一个 item，且是收尾态**。`compaction/start` 不发；
+`compaction/summary` 发（并记下 id）；`compaction/end` 若该 id 已发过就丢弃（同时删掉记录，
+保证同一份日志重放两遍产出完全一致），没发过就补发（覆盖"日志停在 summary 之前"和失败收尾
+两种情形）。
+
+**代价（有意接受）**：Paseo 的 `loading` 状态（"正在压缩..."）在插件通道上**做不到** —— 发了
+就会在完成行旁边永久留一行。所以压缩期间不显示运行态，压完出现一行。
+
+**验证**：`harness/timeline-check.cjs` 的压缩段改写成"一个括号恰好一行"，并加一条"同一份日志
+重放两遍仍各发一次"。
 
 ---
 
