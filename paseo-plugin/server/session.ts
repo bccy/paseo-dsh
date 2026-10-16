@@ -158,7 +158,7 @@ export class DshSession {
   /** DSH's session id (see {@link DshSessionOptions.dshSessionId}). */
   readonly #dshSessionId: string;
   readonly #options: DshSessionOptions;
-  readonly #timeline = new TimelineBuilder();
+  readonly #timeline = new TimelineBuilder({ warn: (line) => this.#options.log(line) });
   #process: DshProcess | undefined;
   #route: DshRoute;
   #mode: string;
@@ -444,7 +444,7 @@ export class DshSession {
   async replayHistory(): Promise<void> {
     const { events } = await this.#require().history();
     if (events.length === 0) return;
-    const builder = new TimelineBuilder();
+    const builder = new TimelineBuilder({ warn: (line) => this.#options.log(line) });
     for (const event of events) {
       const data = isRecord(event.data) ? event.data : {};
       const seq = typeof event.seq === "number" ? event.seq : this.#replaySeq++;
@@ -1359,7 +1359,7 @@ export class DshChildSession {
   readonly id: string;
   readonly nativeId: string;
   readonly #options: DshChildSessionOptions;
-  readonly #timeline = new TimelineBuilder();
+  readonly #timeline = new TimelineBuilder({ warn: (line) => this.#options.log(line) });
   #turnId: string | null = null;
   #turnEnded = false;
   #lastUsage: ProviderUsage | undefined;

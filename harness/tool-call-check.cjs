@@ -19,6 +19,9 @@
  */
 "use strict";
 
+const fs = require("node:fs");
+const path = require("node:path");
+
 const { toolCallData, toolIcon, toolLabel } = require("./client/tool-call-data.js");
 
 let passed = 0;
@@ -36,6 +39,44 @@ function check(label, condition, detail) {
 
 function equal(label, actual, expected) {
   check(label, JSON.stringify(actual) === JSON.stringify(expected), `got ${JSON.stringify(actual)}`);
+}
+
+/**
+ * The top-level field names of the `dsh-tool` renderer's zod schema.
+ *
+ * The renderer is a `.tsx` entry point that imports React Native, so it cannot
+ * be `require`d under plain node — its schema is read from the source text
+ * instead. The scan is brace-depth aware so a nested object field (a future
+ * `meta` shape, say) does not leak its own keys into the set.
+ */
+function dshToolSchemaKeys(source) {
+  const marker = source.indexOf('kind: "dsh-tool"');
+  if (marker < 0) return [];
+  const at = source.indexOf("z.object(", marker);
+  if (at < 0) return [];
+  const open = source.indexOf("{", at);
+  if (open < 0) return [];
+  let depth = 0;
+  let end = -1;
+  for (let i = open; i < source.length; i += 1) {
+    if (source[i] === "{") depth += 1;
+    else if (source[i] === "}" && (depth -= 1) === 0) {
+      end = i;
+      break;
+    }
+  }
+  if (end < 0) return [];
+  const keys = [];
+  let nested = 0;
+  for (const line of source.slice(open + 1, end).split("\n")) {
+    const match = /^\s*([A-Za-z_$][\w$]*)\s*:/.exec(line);
+    if (nested === 0 && match !== null) keys.push(match[1]);
+    for (const character of line) {
+      if (character === "{" || character === "(" || character === "[") nested += 1;
+      else if (character === "}" || character === ")" || character === "]") nested -= 1;
+    }
+  }
+  return keys;
 }
 
 console.log("icons (must match Paseo's own mapping)");
@@ -397,6 +438,41 @@ console.log("the title is not repeated when the block carries it");
   equal("a description-less row is not", bare.titled, false);
   equal("its title is the subject", bare.summary, '{"action":"complete"}');
   check("and the block carries the same subject in full", bare.headline.includes("\n"), JSON.stringify(bare.headline));
+}
+
+console.log("the renderer's schema and ToolCallData cannot drift apart");
+{
+  // The client half hands the renderer `{ ...toolCallData(item, phase) }`, and
+  // Paseo validates that payload against the zod schema registered next to it.
+  // A field added to only one side is invisible: the extra key is stripped
+  // before the component sees it, or the component quietly stops receiving it.
+  // Nothing errors in either case, so the two key sets are asserted here — at
+  // the data layer, where this repo's rules say silent failures must be caught.
+  const candidates = [
+    path.join(__dirname, "..", "index.client.tsx"),
+    path.join(__dirname, "index.client.tsx"),
+  ];
+  const sourcePath = candidates.find((candidate) => fs.existsSync(candidate));
+  check(
+    "index.client.tsx is readable",
+    sourcePath !== undefined,
+    `looked in ${candidates.join(", ")}`,
+  );
+
+  const schemaKeys = sourcePath === undefined ? [] : dshToolSchemaKeys(fs.readFileSync(sourcePath, "utf8"));
+  check("the dsh-tool renderer's schema was found", schemaKeys.length > 0, JSON.stringify(schemaKeys));
+
+  const dataKeys = Object.keys(
+    toolCallData(
+      { name: "bash", status: "completed", detail: { type: "shell", command: "ls" } },
+      "complete",
+    ),
+  );
+  equal(
+    "the schema's field set matches ToolCallData exactly",
+    [...schemaKeys].sort(),
+    [...dataKeys].sort(),
+  );
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

@@ -59,7 +59,230 @@ function stringField(source: Record<string, unknown>, key: string): string | und
   return typeof value === "string" && value !== "" ? value : undefined;
 }
 
-/** Map one DSH tool call onto the richest Paseo tool detail available. */
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+/**
+ * Paseo's tool detail, plus DSH's raw result metadata (`tool/result` → `data.meta`).
+ *
+ * Paseo's detail union is closed and has no member for what DSH publishes there:
+ * numbered `read` lines, hunk-level diffs, matches grouped by file, web sources,
+ * the `write` operation. Those fields are what the whole rendering plan hangs on,
+ * and inventing a parallel protocol shape for them would be exactly the mistake
+ * this repo keeps warning about. So the raw meta travels verbatim under `meta`:
+ * Paseo's wire validator checks the fields it knows and leaves unknown ones
+ * alone, and the plugin's own renderer reads a detail as a plain record.
+ *
+ * The protocol fields that *do* exist are filled as well — see
+ * {@link withPresentationMeta} — so Paseo's stock `read`/`search`/`fetch`
+ * rendering keeps working off the same result.
+ */
+export type ToolDetail = ProviderToolCallDetail & { meta?: JsonValue };
+
+/** One member of {@link ToolDetail}, for filling its protocol fields in place. */
+type ToolDetailOf<T extends ProviderToolCallDetail["type"]> =
+  Extract<ProviderToolCallDetail, { type: T }> & { meta?: JsonValue };
+
+/** `meta.lines` of a DSH `read` result, or undefined for any other shape. */
+function metaLines(meta: Record<string, unknown>): Array<{ number: number; text: string }> | undefined {
+  if (!Array.isArray(meta.lines)) return undefined;
+  const lines: Array<{ number: number; text: string }> = [];
+  for (const line of meta.lines) {
+    if (!isRecord(line) || typeof line.number !== "number" || typeof line.text !== "string") {
+      return undefined;
+    }
+    lines.push({ number: line.number, text: line.text });
+  }
+  return lines;
+}
+
+/** `meta.files` of a DSH `grep` result: matched lines grouped by file. */
+function metaMatchFiles(
+  meta: Record<string, unknown>,
+): Array<{ path: string; matches: Array<{ lineNumber: number; line: string }> }> | undefined {
+  if (!Array.isArray(meta.files)) return undefined;
+  const files: Array<{ path: string; matches: Array<{ lineNumber: number; line: string }> }> = [];
+  for (const file of meta.files) {
+    if (!isRecord(file) || typeof file.path !== "string" || !Array.isArray(file.matches)) return undefined;
+    const matches: Array<{ lineNumber: number; line: string }> = [];
+    for (const match of file.matches) {
+      if (!isRecord(match) || typeof match.lineNumber !== "number" || typeof match.line !== "string") {
+        return undefined;
+      }
+      matches.push({ lineNumber: match.lineNumber, line: match.line });
+    }
+    files.push({ path: file.path, matches });
+  }
+  return files;
+}
+
+/**
+ * `meta.diffs` of a DSH `edit`/`write` result: hunk-level replacements with
+ * context. `write` sends `[]` for a create, which is a valid list.
+ */
+function metaDiffs(
+  meta: Record<string, unknown>,
+): Array<{ path: string; oldText: string; newText: string }> | undefined {
+  if (!Array.isArray(meta.diffs)) return undefined;
+  const diffs: Array<{ path: string; oldText: string; newText: string }> = [];
+  for (const diff of meta.diffs) {
+    if (
+      !isRecord(diff) ||
+      typeof diff.path !== "string" ||
+      typeof diff.oldText !== "string" ||
+      typeof diff.newText !== "string"
+    ) {
+      return undefined;
+    }
+    diffs.push({ path: diff.path, oldText: diff.oldText, newText: diff.newText });
+  }
+  return diffs;
+}
+
+/**
+ * `meta.sources` of a DSH `web_search` result as Paseo's `webResults`.
+ *
+ * DSH's source title is optional; Paseo's `webResults` requires one, and an
+ * empty link text would read as a broken row, so an untitled source falls back
+ * to its URL. The source itself still rides in `meta` untouched.
+ */
+function metaSources(meta: Record<string, unknown>): Array<{ title: string; url: string }> | undefined {
+  if (!Array.isArray(meta.sources)) return undefined;
+  const sources: Array<{ title: string; url: string }> = [];
+  for (const source of meta.sources) {
+    if (!isRecord(source) || typeof source.url !== "string") return undefined;
+    const title = stringField(source, "title") ?? source.url;
+    sources.push({ title, url: source.url });
+  }
+  return sources;
+}
+
+/**
+ * Fold DSH's `presentationMeta` into a tool detail.
+ *
+ * Two halves, in this order:
+ *   1. Fill the protocol fields Paseo already defines for this kind of result —
+ *      `offset`, `filePaths`, `numFiles`, `numMatches`, `truncated`, `mode`,
+ *      `webResults`, `code` — so the stock row keeps rendering.
+ *   2. Keep `meta` verbatim for everything the protocol cannot express (line
+ *      numbers and `lang`, hunk diffs, grouped matches, sources' snippets).
+ *
+ * A meta whose shape does not match its tool is *reported*, never swallowed:
+ * the row keeps the plain result text and loses only structure it never had. An
+ * absent meta is the normal case for a failed tool and for DSH's `bash`, which
+ * declares no `presentationMeta` at all — that is not a mismatch.
+ */
+function withPresentationMeta(
+  detail: ToolDetail,
+  name: string,
+  meta: unknown,
+  warn: (line: string) => void,
+): ToolDetail {
+  if (meta === undefined || meta === null) return detail;
+  if (!isRecord(meta)) {
+    warn(`meta: ${name} returned a non-object presentation meta (${typeof meta}); kept the plain result text`);
+    return detail;
+  }
+  const out: ToolDetail = { ...detail, meta: meta as JsonValue };
+  const unmatched = (expected: string): void => {
+    warn(`meta: ${name} returned an unrecognized presentation meta (expected ${expected}); kept the plain result text`);
+  };
+  switch (detail.type) {
+    case "read": {
+      // {path, offset, lines:[{number,text}], totalLines, lang?}
+      if (metaLines(meta) === undefined || typeof meta.totalLines !== "number") {
+        unmatched("path/offset/lines[]/totalLines");
+        break;
+      }
+      const read = out as ToolDetailOf<"read">;
+      if (typeof meta.offset === "number") read.offset = meta.offset;
+      break;
+    }
+    case "edit": {
+      // {diffs:[{path, oldText, newText}]} — hunk-level, with context lines.
+      if (metaDiffs(meta) === undefined) unmatched("diffs[]");
+      break;
+    }
+    case "write": {
+      // {operation:"create"|"update", diffs:[{path, oldText, newText}]}
+      // A create carries `diffs: []` — an empty list is a valid create, not a
+      // mismatched shape.
+      const operation = meta.operation;
+      if ((operation !== "create" && operation !== "update") || metaDiffs(meta) === undefined) {
+        unmatched("operation/diffs[]");
+      }
+      break;
+    }
+    case "search": {
+      const search = out as ToolDetailOf<"search">;
+      if (detail.toolName === "web_search") {
+        // {sources:[{url, title?}], truncated, answer?}
+        const sources = metaSources(meta);
+        if (sources === undefined || typeof meta.truncated !== "boolean") {
+          unmatched("sources[]/truncated");
+          break;
+        }
+        if (sources.length > 0) search.webResults = sources;
+        search.truncated = meta.truncated;
+        break;
+      }
+      if (meta.shape === "matches") {
+        // grep: {shape:"matches", files:[{path,matches:[{lineNumber,line}]}], truncated, total}
+        // `total` counts every parsed match; the groups hold what survived the
+        // inline and meta caps, which is what `numMatches` reports.
+        const files = metaMatchFiles(meta);
+        if (files === undefined || typeof meta.total !== "number") {
+          unmatched('shape:"matches"/files[]/total');
+          break;
+        }
+        if (files.length > 0) search.filePaths = files.map((file) => file.path);
+        search.numFiles = files.length;
+        search.numMatches = files.reduce((sum, file) => sum + file.matches.length, 0);
+        search.mode = "content";
+        if (typeof meta.truncated === "boolean") search.truncated = meta.truncated;
+        break;
+      }
+      if (meta.shape === "paths") {
+        // glob: {shape:"paths", paths:[...], truncated, total}
+        if (!isStringArray(meta.paths) || typeof meta.total !== "number") {
+          unmatched('shape:"paths"/paths[]/total');
+          break;
+        }
+        if (meta.paths.length > 0) search.filePaths = meta.paths;
+        search.numFiles = meta.paths.length;
+        search.mode = "files_with_matches";
+        if (typeof meta.truncated === "boolean") search.truncated = meta.truncated;
+        break;
+      }
+      unmatched('shape:"matches"|"paths"');
+      break;
+    }
+    case "fetch": {
+      // {url, statusCode, truncated} — `url` is the final URL after redirects.
+      if (typeof meta.url !== "string" || typeof meta.statusCode !== "number") {
+        unmatched("url/statusCode");
+        break;
+      }
+      const fetch = out as ToolDetailOf<"fetch">;
+      fetch.url = meta.url;
+      fetch.code = meta.statusCode;
+      break;
+    }
+    case "unknown": {
+      // `read_image` is the only DSH tool that lands here carrying a meta: {path}.
+      if (name === "read_image" && typeof meta.path !== "string") unmatched("path");
+      break;
+    }
+    default:
+      // `shell` (DSH's bash declares no `presentationMeta`), `plan`,
+      // `plain_text`, `sub_agent`: no protocol field to fill. The raw meta still
+      // rides along for a renderer that knows what to do with it.
+      break;
+  }
+  return out;
+}
+
 /**
  * Provider metadata for one tool call.
  *
@@ -73,12 +296,43 @@ function toolMetadata(input: Record<string, unknown>): Record<string, JsonValue>
   return description === undefined || description === "" ? undefined : { description };
 }
 
-function toolDetail(name: string, input: Record<string, unknown>, output?: string): ProviderToolCallDetail {
+/**
+ * The query list DSH's `web_search` takes (`queries: string[]`, 1..N merged).
+ *
+ * DSH titles its own search card with `args.queries.join(", ")`. Paseo's search
+ * detail has a single-line `query`, so each query contributes its first line and
+ * the parts join with that same separator. Returns undefined for anything that
+ * is not a non-empty array of non-empty strings, so the caller can fall through
+ * to its other candidate fields.
+ */
+function queryList(raw: unknown): string | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const parts = raw
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.split("\n")[0].trim())
+    .filter((item) => item !== "");
+  return parts.length === 0 ? undefined : parts.join(", ");
+}
+
+/**
+ * Map one DSH tool call onto the richest Paseo tool detail available.
+ *
+ * Built from the call's arguments and its rendered result text only; DSH's
+ * structured result metadata is folded in separately by
+ * {@link withPresentationMeta}, because it belongs to the result event rather
+ * than to the call.
+ */
+function toolDetail(name: string, input: Record<string, unknown>, output?: string): ToolDetail {
   const filePath = stringField(input, "file_path") ?? stringField(input, "filePath");
   switch (name) {
     case "bash":
     case "pwsh": {
       const command = stringField(input, "command") ?? "";
+      // `exitCode` is in the protocol, but DSH cannot fill it today: its bash
+      // tool declares no `presentationMeta` (0 of 1836 real bash results carry
+      // one) and no DSH tool takes an `exit_code` argument, so the read below
+      // never matches. Kept for a provider/tool that does report one — do not
+      // mistake it for a working data source.
       const exitCode = typeof input.exit_code === "number" ? input.exit_code : undefined;
       return {
         type: "shell",
@@ -114,9 +368,13 @@ function toolDetail(name: string, input: Record<string, unknown>, output?: strin
     case "web_search":
       return {
         type: "search",
+        // `pattern` stays first: it is what grep/glob carry. `web_search` has no
+        // string query at all — DSH passes `queries: string[]` — which is why
+        // this row used to come out with an empty query.
         query:
           stringField(input, "pattern") ??
           stringField(input, "query") ??
+          queryList(input.queries) ??
           stringField(input, "path") ??
           "",
         toolName: name === "web_search" ? "web_search" : name,
@@ -176,6 +434,13 @@ export class TimelineBuilder {
   /** commandId -> the command name, so `command/done` can title its own row. */
   #commands = new Map<string, string>();
   /**
+   * Where an unrecognized `presentationMeta` is reported.
+   *
+   * The plugin passes its session log here; the bare default still prints, so a
+   * shape that stops matching is never silent just because a caller forgot.
+   */
+  readonly #warn: (line: string) => void;
+  /**
    * Tool calls that are still running.
    *
    * A turn that ends with entries here means no `tool/result` is coming — an
@@ -184,6 +449,10 @@ export class TimelineBuilder {
    * blinks for the rest of the session's life and on every replay.
    */
   #runningTools = new Set<string>();
+
+  constructor(options: { warn?: (line: string) => void } = {}) {
+    this.#warn = options.warn ?? ((line) => console.warn(line));
+  }
 
   /**
    * Fold one DSH session event into zero or more complete Paseo item snapshots.
@@ -316,6 +585,15 @@ export class TimelineBuilder {
     const input = this.#toolInputs.get(callId) ?? {};
     const output = message === undefined ? "" : textOf(message.content);
     const failed = message?.isError === true;
+    // DSH attaches the tool's `presentationMeta` to the result event itself
+    // (`data.meta`), next to the message. It is the only copy of the structured
+    // result there is: `message.content` is already the rendered text.
+    const detail = withPresentationMeta(
+      toolDetail(name, input, output === "" ? undefined : output),
+      name,
+      data.meta,
+      this.#warn,
+    );
 
     const out: ProviderTimelineItem[] = [];
     if (name === "todo_write" && !failed) {
@@ -330,7 +608,7 @@ export class TimelineBuilder {
         id: `tool:${callId}`,
         callId,
         name,
-        detail: toolDetail(name, input, output === "" ? undefined : output),
+        detail,
         ...(toolMetadata(input) === undefined ? {} : { metadata: toolMetadata(input) as Record<string, JsonValue> }),
         ...(failed
           ? { status: "failed" as const, error: { message: output || "tool failed" } }
