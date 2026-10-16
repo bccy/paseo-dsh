@@ -600,32 +600,34 @@ DSH 的 `read_image` 返回的是**附件引用**（`{path, image:{attachmentId,
 原生端是 Reanimated + SVG 渐变遮罩），而插件 SDK 只导出 `Icon/Modal/useToast/
 useRevealedText/ScrollView/FlatList/copyText/TextInput`，**没有暴露任何 shimmer/spinner**。
 
-**修法（最终采用）**：用 React Native 的 `Animated.Value` 做**整行 opacity 脉冲**
-（`client/shimmer.ts`，1 ↔ 0.35 循环），触发条件是"思考还在变长"和"工具 running / phase
-streaming"。期间试过"扫光"（叠一条高光从左到右平移）：没有真正的渐变时它就是一块硬边色块
-划过，用户评价**还不如脉冲**，所以回退了。要做扫光必须先解决渐变（宿主那套 `background-clip`
-/ Reanimated 遮罩没暴露给插件）。
+**修法（最终采用）**：用 React Native 的 `Animated` 做**整行 opacity 脉冲**
+（`client/shimmer.ts`：`Animated.loop(Animated.sequence([to DIM, to 1]))`，每行一个
+`Animated.Value`），触发条件是"思考还在变长"和"工具 running / phase streaming"。期间试过
+"扫光"（叠一条高光从左到右平移）：没有真正的渐变时它就是一块硬边色块划过，用户评价
+**还不如脉冲**，所以回退了。要做扫光必须先解决渐变（宿主那套 `background-clip` /
+Reanimated 遮罩没暴露给插件）。
 
-### 29b. `Animated.loop` 在 RN Web 上只跑一段就停
+### 29b. 试过的两个脉冲实现，都回退了
 
-**症状**：脉冲代码看起来对（`Animated.loop(Animated.sequence([to DIM, to 1]))`），但 web 上
-工具行一直停在某个中间透明度不动。实测运行行的内联 `style.opacity` 冻结在 0.37 / 0.63 /
-0.88 之类的值上，且不随时间变化。
+**一、模块级共享 `Animated.Value` + `setInterval` 调 `setValue()`**
 
-**排查要点**：先确认不是 headless 的锅——`requestAnimationFrame` 在无头 Chromium 里是
-**正常 60fps** 的（`frames: 60 / 1000ms`），所以不是 rAF 节流；`Animated.timing` 单段是
-会动的（值确实从 1 变到某个中间值），停住的是**循环**。
+动机是 RN Web 上 `Animated.loop` 只跑一段就停（见下）。但它引入了一个更糟的 bug：
+`useShimmer(active)` 如果**无条件返回共享值**，所有历史行都会绑到同一个 `Animated.Value`
+上，于是**整屏的命令行和思考行一起闪**。用户原话："整个所有的命令工具和思考都在闪"。
+即使改成"只有 active 的行返回共享值、其余返回恒为 1 的静态值"，也只是把问题缩小，仍然
+不如每行一个 `Animated.Value` 干净。**结论：脉冲值必须每行一个，不要共享。**
 
-**根因**：RN Web 的 `Animated` 移植里，`Animated.loop`（以及手动用完成回调链式的
-`Animated.timing`）跑完一段后不会继续。`useNativeDriver: true/false` 都不影响。
+**二、RN Web 上 `Animated.loop` 不循环（已知限制）**
 
-**修法**：完全不用 Animated 的驱动，改成**普通 `setInterval` 每 50ms 调一次
-`Animated.Value.setValue()`**，按余弦算透明度（`client/shimmer.ts`）。`setValue` 会通知绑定的
-`Animated.View` 更新，20fps 对透明度脉冲足够，且 web/原生同一套代码。
+实测：web 上 `Animated.loop(Animated.sequence([...]))` 跑完一段就停，运行行的内联
+`style.opacity` 会冻结在 0.37 / 0.63 / 0.88 之类的中间值。排除项：无头 Chromium 里
+`requestAnimationFrame` 是**正常 60fps**（`frames: 60 / 1000ms`），不是 rAF 节流；单段
+`Animated.timing` 会动，停住的是循环；`useNativeDriver: true/false` 都不影响；手动用完成
+回调链式 `Animated.timing` 也一样。
 
-**另一个坑**：`Animated.Value` 要放**模块级单例**，不要每个行一个。宿主会重建时间线项，
-每行一个 value 会在重建时从满透明度重新开始，看上去就是"根本没闪"。共享单例还带 1s 的
-停止宽限，避免重挂载时把循环停掉。
+**当前决定**：保留 `Animated.loop` 版本。它在原生（用户实际使用的 App）上正常，web 上会
+冻在暗端——这是一个**已知限制**，不是回归。要同时修 web，只能换成 `setInterval` +
+`setValue` 驱动，但那又需要共享值（见上），得不偿失。
 
 diff 行按 GitHub 的做法：浅绿/浅红底（低 alpha，深色主题也不刺眼）、`+`/`-` 标记单独
 上色、代码正文用 **muted 前景色**（用 `foreground` 会"太白"）。**不要**给每行加左侧亮色
