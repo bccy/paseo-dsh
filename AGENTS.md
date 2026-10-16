@@ -40,7 +40,7 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon 进程里）
 
 ### 改之前先读
 
-- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 四十余条真实缺陷（编号到 44，含 4 条
+- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 四十余条真实缺陷（编号到 45，含 4 条
   `b`/`c` 补记）。里面有整整一类错误叫
   **静默降级**（把不知道的东西当成成功、把不支持的能力悄悄丢掉）。改动前先看一遍，
   避免重新发明这些 bug。
@@ -77,10 +77,12 @@ cd paseo-plugin && npx tsc --noEmit
 `harness/subagent-check.cjs`（子会话可见性）、`harness/steer-check.cjs`（插话回执）、
 `harness/mcp-injection-check.cjs`（Paseo 注入的 MCP server 是否真的落到 `--patch`）、
 `harness/assistant-stream-check.cjs`（助手文本流式：同 id 增长快照、`id === messageId`、
-经 Paseo 规则投影后合并成一行）。
+经 Paseo 规则投影后合并成一行）、`harness/image-check.cjs`（图片工具结果：带 `hostPath` 的
+图片块**恰好**多出一条 markdown `assistant_message`、路径逐段编码、无 `hostPath` 不出行、
+过 `ProviderEventSchema`、`history: "replay"` 重建同一条）。
 
-还有九个**离线**脚本，直接 require 编译产物、不需要 daemon（运行步骤写在各自头部注释里）。
-下面清单里穿插的 `subagent-check.cjs` 归档用例与 `archive-registry-check.mjs` **不属于这九个**：
+还有十个**离线**脚本，直接 require 编译产物、不需要 daemon（运行步骤写在各自头部注释里）。
+下面清单里穿插的 `subagent-check.cjs` 归档用例与 `archive-registry-check.mjs` **不属于这十个**：
 前者是假 `dsh` 驱动的，后者要真 profile。
 
 - `harness/timeline-check.cjs` — `TimelineBuilder` 的工具行状态机：`tool/call` → `tool/result`、
@@ -106,6 +108,12 @@ cd paseo-plugin && npx tsc --noEmit
   `dsh-bridge/lib/archived-lineage.js` 必须逐字等价于 DSH 的 `underArchivedSession`——自身
   或任一 `origin:"subagent"` 祖先在 `archivedSessionIds` 即算已归档，fork 不继承、环路要终止。
   **动了这个模块、`listSessions` 的归档过滤或 `paseo/subagents` 的 `archived` 判定必跑。**
+- `harness/image-host-path-check.mjs` — 纯模块离线检查（无需 profile/daemon）：桥里的
+  `dsh-bridge/lib/image-host-path.js` 给 `tool/result` 的每个图片块**追加** `hostPath`，原有
+  字段一个不动；attachments 缺失、`imageHostPath` 抛错（无效 ref 抛 `AttachmentError`）、
+  返回非字符串、或事件不是 `tool/result` → **原样返回**。`historyEvents` 把同一规则用在
+  `history()` 的重放投影上（`{type, seq?, time?, data}`）。**动了这个模块、桥的三处注入点或
+  `history()` 的事件投影必跑。**
 - `harness/sweep-check.cjs` — 原生扫光的几何：mask 曲线的停点、阶梯 alpha 的对称性与平铺、
   1.5s/0.3s/2-3 行程、`steps(48)`。**动了 `client/sweep-*.ts` 必跑。** iOS 上跑不了，这些
   数字就是"与 DSH 一致"的唯一凭据。

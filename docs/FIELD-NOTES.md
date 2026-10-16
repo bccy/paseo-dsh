@@ -1299,33 +1299,95 @@ claude / codex 三个适配器在中断时**全部**上报 `turn_canceled`，协
 `dsh-bridge/`（要重生成内嵌桥）。目前从 Paseo 侧也够不着：provider 子代理不是 agent，
 UI 只有 `provider_subagents.list/.timeline.get/.update`，没有停止入口。
 
-### 44. 一次压缩在界面上变成三行 —— provider 行是只追加的（已修）
+### 44. 一次压缩在界面上变成两/三行 —— 宿主按 loading 行原地合并（已修）
 
 **症状**：在 App 里手动发一次 `/compact`，时间线上出现**不止一行**压缩标记。查会话日志：
 `compaction/start` 只有**一条**（带 `sourceCommandId`），DSH 确实只压缩了一次。
 
-**根因在本仓库，不在 DSH、也不在文案。** 插件对 `compaction/start`、`compaction/summary`、
-`compaction/end` **各发一个 item**，当时的注释写着"同一个 `compactionId`，所以行会原地更新
-而不是叠一行"。**这句是错的**：守护进程的 `mapTimelineItem`
-（`@getpaseo/server` 的 `plugin-provider.js`）对**非消息类** item 一律走
-`return withoutIdentity` —— 它把 `id` 解构掉了 —— 而只有 `assistant_message` / `reasoning` /
-`user_message` 会拿 `snapshots` 里上一次的条目做比较。**所以 provider 发来的行永远是新增，
-id 再稳也没用。**
+**第一次修（`f241ac3`）方向错了。** 当时的判断是"provider 行是只追加的、`loading` 在插件
+通道上做不到"，于是把三条事件压成**一条 completed**。这确实去掉了重复，但也把
+Paseo+opencode 那种「正在压缩…」的体验一并去掉了。
 
-**实测（不是推断）**：把本仓库自己那个长会话的日志喂给 `TimelineBuilder`，一次压缩产出
-**3 个 item**；守护进程自己的活动流里，那**一次** `/compact` 对应
-`[User] /compact` → `[Compacted]` ×3 → `[/compact]`。
+**真正的宿主行为（反编译证据，不是推断）。** 从宿主 web bundle
+（`@getpaseo/server/dist/server/web-ui/_expo/static/js/web/index-*.js`）里挖出的压缩归并
+函数：
 
-**修法**：一个 `compactionId` **只发一个 item，且是收尾态**。`compaction/start` 不发；
-`compaction/summary` 发（并记下 id）；`compaction/end` 若该 id 已发过就丢弃（同时删掉记录，
-保证同一份日志重放两遍产出完全一致），没发过就补发（覆盖"日志停在 summary 之前"和失败收尾
-两种情形）。
+```js
+function ne(e, t, n, s) {
+  if ("completed" === t.status) {
+    const n = e.findIndex(e => "compaction" === e.kind && "loading" === e.status);
+    const i = n >= 0 ? e[n] : void 0;
+    if (n >= 0 && i && "compaction" === i.kind) {
+      const o = Object.assign({}, i, s ? { timelineCursor: s } : {},
+        { status: "completed", trigger: t.trigger ?? i.trigger, preTokens: t.preTokens ?? i.preTokens });
+      return [...e.slice(0, n), o, ...e.slice(n + 1)];   // ← 原地改在 loading 那一行上
+    }
+    if (n >= 0) return e;
+  }
+  // 找不到 loading 行 → 追加一条新行
+  const i = Object.assign({ kind: "compaction", id: u(e, "compaction", t.status, n) }, ...,
+    { timestamp: n, status: t.status, trigger: t.trigger, preTokens: t.preTokens });
+  return [...e, i];
+}
+```
 
-**代价（有意接受）**：Paseo 的 `loading` 状态（"正在压缩..."）在插件通道上**做不到** —— 发了
-就会在完成行旁边永久留一行。所以压缩期间不显示运行态，压完出现一行。
+**关键结论**：
+- 收到 `completed` 时，宿主**全表查找第一条 `kind === "compaction" && status === "loading"`**
+  的行并**原地合并** —— **不是按 id，也不是按相邻**；
+- **只有找不到 loading 行时才追加新行**。
 
-**验证**：`harness/timeline-check.cjs` 的压缩段改写成"一个括号恰好一行"，并加一条"同一份日志
-重放两遍仍各发一次"。
+所以 `loading` + **一条** `completed` = **一行**，并且会从「正在压缩上下文」翻成
+「上下文已手动压缩」。而当时发了两条 `completed`（summary 一条、end 一条）→ 第一条合并进
+loading，第二条找不到 loading 行 → **追加** → 用户看到的两行（活动流里三条还含原始事件）。
+
+**修法**：`compaction/start` 发 `loading`；`compaction/summary` 发**一条** `completed` 并记下
+id；`compaction/end` 对该 id 已发过 summary 就丢弃（同时 `delete()`，保证同一份日志重放两遍
+一致），没发过就补发（覆盖失败收尾与日志停在 summary 之前两种情形）。**绝不为同一个
+`compactionId` 发第二条 `completed`。** 另外，被压缩接管的那条 `/compact` 命令行整条不发
+（压缩标记就是它的行），关联用 DSH 自己的
+`compaction.sourceCommandId === command.commandId`（真实样本两者都是 `cmd-e0bf8ecc-1`）；
+`kind:"error"` 时照旧发 failed 行，因为 marker 承载不了失败。日志停在 `compaction/start`
+（进程被杀）时，重放收尾把仍 loading 的行收成 completed 并打 warning
+（`TimelineBuilder.settleLoadingCompactions`），否则那一行会永远 pulse。
+
+**验证**：`harness/timeline-check.cjs` 的压缩段断言 —— 完整括号恰好 2 条（loading +
+completed，同 id）、`completed` 条数恒为 1、只有 start+end / start+summary 也是 2 条、重放两遍
+仍各 2 条、`/compact` 命令行 0 条、failed `/compact` 1 条 failed 行、settle 幂等。
+
+---
+
+### 45. `/compact · /compact` —— 行头的两半印了同一句话（已修）
+
+**症状**（用户在 App 里截图报的）：发一次 `/compact`，行头读作 `/compact · /compact`，同一个
+字符串出现两遍。
+
+**根因**：行头是 `label · summary` 两半拼的。
+
+- `label = toolLabel(item.name)`，而命令行 item 的 `name` 就是 `/${name}`；
+- `summary = truncate(description === "" ? primary : description)`，命令行没有 `description`，
+  于是 `summary = primary`；
+- 而 `#commandDone` 把 `detail.label` 也设成了同一行 `/${name}` —— `primary` 与 `label` 同值。
+
+同一类共三处，判据都是"两半说同一句话"：`todo_write`（`detail.label` = `UI.toolLabels.
+updateTasks` = 工具名标签「更新任务清单」）和 `ask_user_question`（「提问」）走的是同一条路。
+
+**修法**（三处）：
+
+1. **服务端**：`#commandDone` 的 `detail.label` 改放**参数**（`command/run` 的 `data.args`，
+   `trim()` 后）。行头的第一半已经是命令本身，参数才是屏幕上还没有的信息：`/compact` 没有
+   参数 → 第二半为空；`/goal <目标>` → 显示目标。
+2. **客户端** `plain_text` 分支去掉 `|| text` 回退：空 `label` 是一个**值**，不是"没有
+   label"；旧回退把输出提升成 summary，同时让展开体丢掉那段输出。`label` 归 label、`text`
+   归 body。
+3. **客户端**在数据层做通用去重：`summary === label` 时置空。**放在 `tool-call-data.ts`
+   而不是 `.tsx`** —— 本仓库的约定是纯函数才断言，React 组件刻意不断言。
+
+**验证**：`harness/tool-call-check.cjs`（289 条全过）新增 —— 无参数命令行 `summary` 与
+`headline` 均为空且输出仍在 `body`、带参数命令行 `summary` 就是那段参数、`todo_write` /
+`ask_user_question` 的 `summary` 为空（用 `toolLabel()` 取值，不硬编码语言）。
+`harness/timeline-check.cjs` 断言 `command/done` 的 `label` 是参数（空参数 → 空串、非字符串
+`args` 退化成空串、`command/run` 缺失时仍用兜底标题且 label 为空），以及被压缩接管的
+`/compact` 整条不发。
 
 ---
 
@@ -1338,6 +1400,7 @@ id 再稳也没用。**
 | 可续接子代理二次运行的状态不回到 running | Paseo 0.11.2 的 provider 子通道忽略子会话的 `session.turn started`、`session.usage`、`session.permission`。子卡首次打开即为 running，终态（completed/failed）仍会更新，但再次运行的 started 不会恢复运行中状态。需 Paseo 核心补丁，本仓库不改全局包。 |
 | 子代理审批不在 Paseo 出现 | 同上：子会话的 permission 事件被宿主忽略。桥只把根会话的问题转发给 Paseo，子会话问题保留 DSH 自身的子代理审批语义，避免挂起或误归属父会话。 |
 | 子代理运行中状态/用量/审批需 Paseo 核心补丁 | 精确方案：`@getpaseo/server` 的 `agent/plugin-provider.js` `acceptChildEvent`（本机 0.11.2 行 1217-1248）需额外消费子 `session.turn started`（恢复 running）、`session.usage`（子用量）、`session.permission`（子审批卡），并把子 permission 经会话 id 路由到子代理视图。本仓库不改全局包；插件侧已按正确子身份发出这些事件，补丁落地即生效。 |
+| 子代理列表固定"旧→新"，要滚到底才看得到最新的 | 顺序由**宿主 App** 决定，不是在插件侧：宿主按自己盖的 `createdAt` **升序**排（最旧在上）。服务端 `@getpaseo/server/dist/server/server/agent/provider-subagents/store.js` 的 `list()` 是 `.sort((l, r) => l.createdAt.localeCompare(r.createdAt))`，`createdAt` 只在首次 upsert 时写入（`apply()`：`previous?.createdAt ?? timestamp`）；而**决定性的那一遍在 App 里** —— web bundle 模块 4997 有三处 `sort((e,t) => e.createdAt.getTime() - t.createdAt.getTime())`（`useSubagentsForParent` / `selectProviderSubagentsForParent` / `selectSubagentsForParent`），客户端不理会服务端返回顺序、自己从 Map 取出重排，所以**只改服务端 `list()` 界面上不会有任何变化**。渲染器（模块 5004 `SubagentsTrack`）是 `c.map(t)` 直接铺，没有 `column-reverse`。公开插件契约 `ProviderEvent.session.opened` **没有时间戳字段**，宿主是在 `attachChild()` 收到 upsert 那刻自己盖的章，所以插件既改不了方向也改不了时间；方向是升序，真正最新的必然在最后，唯一能挪到顶上的办法是**伪造 `createdAt`**（不做）。**需 Paseo 核心补丁**：把 App 侧那个 selector 的排序反向（最小改法是在 `useSubagentsForParent` 的 `useMemo` 末尾 `reverse()`，一处覆盖两类行与嵌套分支；别只改渲染器，否则面板的 segments/「已完成 N 个」统计会与行序不一致）。实测 0.11.2：某父会话返回 55 条，`createdAt` 严格升序，最新的（就是那次调查本身）在最后一条。 |
 
 ## 关于"哪条路由能用"
 

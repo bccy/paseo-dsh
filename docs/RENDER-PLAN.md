@@ -101,18 +101,35 @@
 ### Phase 4 · 图片、locale、两个漏行
 - **Phase 4a · locale / compaction / worktree_setup —— 已完成（`bdcc5d1`）**：
   - **locale**：客户端接上 `DSH_PASEO_LANG`（「思考」「计划」「展开/收起」「折叠/收起」等）。
-  - **compaction**：`consume()` 增加分支，压缩完成时出一条 Paseo 原生 marker。
-    **一个 `compactionId` 只出一条，且是收尾态**：provider 行是只追加的
-    （`mapTimelineItem` 把非消息类 item 的 `id` 剥掉），所以 `loading` 在插件通道上做不到
-    —— 发了就会在完成行旁边永久留一行。详见 FIELD-NOTES 第 44 条。
+  - **compaction**：`consume()` 增加分支，把 DSH 的 `compaction/*` 括号映射成 Paseo 原生 marker。
+    **一个 `compactionId` 恰好两条 item：`start` 发 `loading`、收尾发**一条** `completed`**。
+    宿主的压缩归并函数（从 web bundle 反编译，见 FIELD-NOTES 第 44 条）在收到 `completed`
+    时**全表查找第一条 `kind === "compaction" && status === "loading"`** 的行并**原地合并**；
+    **找不到 loading 行才会追加新行**。所以压缩期间显示「正在压缩…」，完成后翻转成
+    「上下文已手动压缩」，而**第二条 `completed` 会被追加成第二行**——这正是当初三行/两行的
+    来源。`summary` 出 `completed`，`end` 只在没有 `summary` 时才补一条。成功的 `/compact`
+    命令行整条不发（压缩标记就是它的行，靠 DSH 自己的 `sourceCommandId === commandId`
+    关联）；`kind:"error"` 时照旧发 failed 行，因为 marker 承载不了失败。
   - **worktree_setup**：给 typed detail 或并入 `unknown`，不再出现空行。
-- **Phase 4b · 图片 —— 调研结论已出，尚未实现**：`read_image` / 浏览器截图不再被
-  `textOf()` 丢掉。走 **Paseo 既有的形状**，不自造：图片做成一条**独立的
-  `assistant_message`**，正文是 markdown 图片 `![alt](<绝对路径>)`，宿主会经
-  **file-RPC** 取字节并渲染。桥这一侧要用 DSH 的 **`imageHostPath(ref)`**
-  （`@deepseek-ai/dsh-attachment-local` 的 `ImageAttachmentRef` → 宿主绝对路径；
-  `dsh-llm` 自己就是这么把图片交给宿主的）把路径透出来。**改了桥就要按硬性约束重生成
-  内嵌桥**（`node paseo-plugin/scripts/generate-bridge-assets.mjs`）。
+- **Phase 4b · 图片 —— 已完成**：`read_image` / 浏览器截图不再被 `textOf()` 丢掉。做法走
+  **Paseo 既有的形状**，不自造：
+  - **桥**（`dsh-bridge/lib/image-host-path.js`）在 `tool/result` 的每个
+    `{type:"image", attachment}` 块上**追加** `hostPath` =
+    `ctx.get('attachments').imageHostPath(ref)`（`<DSH_HOME>/attachments/v1/objects/<xx>/<sha>`，
+    持久副本；`data.meta.path` 是源路径，源文件常已被删）。实时转发、被 hold 的子会话帧、
+    `history()` 重放三条路都过一遍；解析不了就原样返回，绝不让事件失败。
+  - **插件**（`server/timeline.ts`）为每个带 `hostPath` 的图片块多发一条
+    `assistant_message`：`![<alt>](file://<每段 encodeURIComponent 的绝对路径>)`，辅助函数
+    逐字照抄宿主 `provider-image-output.js` 的 `encodeFilePath` / `escapeMarkdownImageAlt` /
+    `markdownImageSource` / `escapeMarkdownImageSource`。id 稳定为
+    `image:<toolCallId>:<块序号>`；没有 `hostPath` 的块**不产生任何行**（回落原文）。
+  - **已知行为**：同一份日志重放两次会发出**同一个 id + 同一段文本**，宿主的
+    `mapTimelineItem` 把它切成空 delta 后 `return null` —— 即重复被去重丢弃。这是可接受的
+    （重复即去重），**不是**把 id 随机化的理由。
+  - **证据**：`harness/image-check.cjs`（假桥集成：恰好一条、文本编码、无 hostPath 不出行、
+    过 `ProviderEventSchema`、重放重建）、`harness/image-host-path-check.mjs`（纯模块：
+    加字段/缺 store/抛错/非 tool-result/history 投影 26 条）、`harness/timeline-check.cjs`
+    的图片段。
 
 ### Phase 5 · 验收
 - 全部 harness（含新增断言）+ `tsc --noEmit` + 宿主编译器产包 + 真机 `archive-registry-check`。
@@ -135,7 +152,8 @@
 
 这一节是"**别让预览图承诺它交付不了的东西**"的清单。已提交的进度：
 `d804dd1`（Phase 0）→ `3ca141b`（Phase 1 + 3）→ `bdcc5d1`（Phase 2 + 4a）→ `5247ef9`
-（四处数值偏差 + `run_code` 标签/图标 + 空态文案拆分 + `web_fetch` 图标）。
+（四处数值偏差 + `run_code` 标签/图标 + 空态文案拆分 + `web_fetch` 图标）。**Phase 4b 已落地**
+（图片行、压缩行的 loading→completed、命令行行头的两处重复，见 Phase 4 与 FIELD-NOTES 44/45）。
 
 ### 仍未做
 
@@ -146,7 +164,6 @@
 - **MCP / 未知的 ioCard 输入 / 输出两段**：现在是输入（美化 JSON）与输出挤在同一个代码面里；
   DSH 是 `grid-template-columns: max-content 1fr` + 两段各自 `max-height: 150px`。
   Phase 3 只写了"结构化展示，而非原始 JSON"，没点名这个形状 —— 严格说它**计划外**。
-- **图片（Phase 4b）**：调研结论已出（见 Phase 4），尚未实现。
 - **终端输出**：仍是会折行的 `Text`，不是 `white-space: pre` 的等价物（需要横向
   `ScrollView`）；状态点 / 退出码 pill / 复制键也都还没做。
 - **思考行展开体的几何**：缩进 `4px` vs DSH `22px`、字号行高 `14/21` vs `13/24`、正文是纯

@@ -982,7 +982,6 @@ return parsed.items.length;</div>
   <div class="note" style="border-left-color:#3a3a40">
     <p style="margin:0 0 8px"><b>仍未做</b></p>
     <ul style="margin:0 0 12px;padding-left:18px">
-      <li><b>图片块（Phase 4b）</b>：<code>read_image</code> / 浏览器截图仍被 <code>textOf()</code> 丢掉。调研结论已出 —— 走 Paseo 既有形状：图片做成一条独立的 <code>assistant_message</code>，正文是 markdown 图片 <code>![alt](&lt;绝对路径&gt;)</code>，宿主经 file-RPC 取字节渲染；桥这一侧用 DSH 的 <code>imageHostPath(ref)</code> 透出路径（改了桥要重生成内嵌桥）—— 但<b>尚未实现</b>。</li>
       <li><b><code>run_code</code> 的 CodeBlock</b>：标签与图标已在 <code>5247ef9</code> 补上（「代码」/ <code>Code</code>），展开体<b>仍</b>是 unknown 的兜底代码面 —— 没有语言标签、没有复制、没有 <code>bodyScroll</code> 限高。不学 banner <code>sticky</code>（RN 无解）与硬编码 <code>lang</code>。</li>
       <li><b>ioCard 的输入 / 输出两段</b>：MCP 与未知工具仍是输入（美化 JSON）与输出挤在同一个代码面；DSH 是两段各自 <code>max-height: 150px</code> 的就地滚动。Phase 3 没点名这个形状，严格说计划外。</li>
       <li><b>终端输出</b>：仍是会折行的 <code>Text</code>，不是 <code>white-space: pre</code> 的等价物（要横向 <code>ScrollView</code>）；状态点 / 退出码 pill / 复制键也还没做。</li>
