@@ -30,6 +30,8 @@ export interface TokenColors {
   readonly border: string;
   readonly foreground: string;
   readonly foregroundMuted: string;
+  /** The theme's link colour (DSH uses `--dsw-alias-link` for every web URL). */
+  readonly accent: string;
   readonly statusSuccess: string;
   readonly statusWarning: string;
   readonly statusDanger: string;
@@ -339,8 +341,14 @@ export const DIFF_BAR_WIDTH = 3;
 /** Added/removed wash over the card: 8% on light, 12% on dark. */
 export const DIFF_TINT_LIGHT = 0.08;
 export const DIFF_TINT_DARK = 0.12;
-/** `.line { padding: 0 22px }`, trimmed to the card's own body padding. */
-export const DIFF_LINE_PADDING_HORIZONTAL = 14;
+/**
+ * `.line { padding: 0 22px }` — DSH's own inset, not the card's body padding.
+ *
+ * Phase 1 trimmed this to 14 because every surface then carried its own 14px
+ * body padding; the diff card now has DSH's `padding: 6px 0 20px`, so the lines
+ * pad themselves to 22 and line up with the card head's own 22px left inset.
+ */
+export const DIFF_LINE_PADDING_HORIZONTAL = 22;
 /** The `+`/`-` marker column, so a full-width body still aligns under itself. */
 export const DIFF_MARKER_WIDTH = 12;
 
@@ -561,49 +569,675 @@ export function diffStat(data: {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Block shapes                                                               */
+/* Card head (DSH's `CodeToolbar`)                                            */
 /* -------------------------------------------------------------------------- */
-
-/** The fields of `ToolCallData` a block shape is decided from. */
-export interface CommandBlockShape {
-  readonly diff: boolean;
-  readonly code: boolean;
-  readonly headline: string;
-  readonly bodyLabel: string;
-}
-
-/** The payload caption the data layer uses today (`tool-call-data.ts`). */
-const DEFAULT_OUTPUT_LABELS: readonly string[] = ["输出"];
 
 /**
- * Whether a row expands into "command + divider + output".
+ * `.header { padding: 10px 18px 8px 22px }` on DSH's code card.
  *
- * `ToolCallData` has no "this is a shell row" flag and this phase may not touch
- * the data layer, so the shape is recognised by what the data layer puts in it:
- * a command in `headline`, the printed result under the *output* caption, and
- * neither a diff nor a code surface. That covers the shell detail (bash/pwsh)
- * and a `/`-command row that carries a description, and it excludes `web_fetch`
- * ("响应"), `sub_agent` ("日志") and `read` ("内容") — all of which also carry a
- * headline of their own.
- *
- * The caption is passed in rather than compared to a literal, because the data
- * layer is being localized (`./locale`): the renderer hands over the current
- * locale's caption *and* the literal it uses today, so the split survives a tree
- * in which only one of the two has moved. A later phase should replace this with
- * a real field on `ToolCallData`.
+ * The asymmetry is DSH's own: the head lines up with the diff body's own
+ * `padding: 0 22px` on the left and with its narrower right inset on the right.
  */
-export function isCommandBlock(
-  data: CommandBlockShape,
-  outputLabels: readonly string[] = DEFAULT_OUTPUT_LABELS,
-): boolean {
-  return (
-    !data.diff && !data.code && data.headline !== "" && outputLabels.includes(data.bodyLabel)
-  );
+export const CARD_HEAD_PADDING_TOP = 10;
+export const CARD_HEAD_PADDING_RIGHT = 18;
+export const CARD_HEAD_PADDING_BOTTOM = 8;
+export const CARD_HEAD_PADDING_LEFT = 22;
+/** `.heading { gap: 12px }` between the language tag and the title. */
+export const CARD_HEAD_GAP = 12;
+/** `font: 11px/18px` on the whole banner; the language tag is monospace. */
+export const CARD_HEAD_FONT_SIZE = 11;
+export const CARD_HEAD_LINE_HEIGHT = 18;
+/** `.status { margin-right: 8px }`, so the copy control is not glued to it. */
+export const CARD_HEAD_STATUS_MARGIN_RIGHT = 8;
+/** `.actions { gap: 4px }`. */
+export const CARD_HEAD_ACTION_GAP = 4;
+
+/** `.heading { gap: 12px; min-width: 0 }` — the language tag and the title. */
+export function cardHeadHeadingStyle(): {
+  flexDirection: "row";
+  alignItems: "baseline";
+  gap: number;
+  flexShrink: number;
+  minWidth: number;
+} {
+  return { flexDirection: "row", alignItems: "baseline", gap: CARD_HEAD_GAP, flexShrink: 1, minWidth: 0 };
+}
+
+/** `.actions { gap: 4px }` — the status and the copy control. */
+export function cardHeadActionsStyle(): {
+  flexDirection: "row";
+  alignItems: "center";
+  gap: number;
+  flexShrink: number;
+} {
+  return { flexDirection: "row", alignItems: "center", gap: CARD_HEAD_ACTION_GAP, flexShrink: 0 };
+}
+
+/** The banner above a read/diff body: language, title, status, copy. */
+export function cardHeadStyle(): {
+  flexDirection: "row";
+  alignItems: "center";
+  justifyContent: "space-between";
+  gap: number;
+  paddingTop: number;
+  paddingRight: number;
+  paddingBottom: number;
+  paddingLeft: number;
+} {
+  return {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: CARD_HEAD_GAP,
+    paddingTop: CARD_HEAD_PADDING_TOP,
+    paddingRight: CARD_HEAD_PADDING_RIGHT,
+    paddingBottom: CARD_HEAD_PADDING_BOTTOM,
+    paddingLeft: CARD_HEAD_PADDING_LEFT,
+  };
+}
+
+/** The language tag: `--dsw-alias-label-tertiary`, monospace, never shrunk. */
+export function cardHeadLangTextStyle(colors: TokenColors): {
+  flexShrink: number;
+  fontFamily: string;
+  fontSize: number;
+  lineHeight: number;
+  color: string;
+} {
+  return {
+    flexShrink: 0,
+    fontFamily: CODE_FONT_FAMILY,
+    fontSize: CARD_HEAD_FONT_SIZE,
+    lineHeight: CARD_HEAD_LINE_HEIGHT,
+    color: colors.foregroundMuted,
+  };
+}
+
+/** The title (usually the path): tertiary, one line, ellipsised by the caller. */
+export function cardHeadTitleTextStyle(colors: TokenColors): {
+  flexShrink: number;
+  fontSize: number;
+  lineHeight: number;
+  color: string;
+} {
+  return {
+    flexShrink: 1,
+    fontSize: CARD_HEAD_FONT_SIZE,
+    lineHeight: CARD_HEAD_LINE_HEIGHT,
+    color: colors.foregroundMuted,
+  };
+}
+
+/** The status slot DSH uses for the read card's `显示 X / Y 行`. */
+export function cardHeadStatusTextStyle(colors: TokenColors): {
+  flexShrink: number;
+  marginRight: number;
+  fontSize: number;
+  lineHeight: number;
+  color: string;
+} {
+  return {
+    flexShrink: 0,
+    marginRight: CARD_HEAD_STATUS_MARGIN_RIGHT,
+    fontSize: CARD_HEAD_FONT_SIZE,
+    lineHeight: CARD_HEAD_LINE_HEIGHT,
+    color: colors.foregroundMuted,
+  };
+}
+
+/** The copy control: DSH's `.copyButton`, 13px secondary, no chrome of its own. */
+export function cardHeadActionTextStyle(colors: TokenColors): {
+  flexShrink: number;
+  fontSize: number;
+  lineHeight: number;
+  color: string;
+} {
+  return {
+    flexShrink: 0,
+    fontSize: ROW_FONT_SIZE,
+    lineHeight: SEARCH_SUMMARY_LINE_HEIGHT,
+    color: colors.foregroundMuted,
+  };
 }
 
 /* -------------------------------------------------------------------------- */
-/* Folding and caps (next phase; recorded here so they cannot drift)          */
+/* Search block (DSH's `SearchBlock`)                                         */
 /* -------------------------------------------------------------------------- */
+
+/** `.header { padding: 9px 14px; gap: 12px }` — the stats banner. */
+export const SEARCH_HEAD_PADDING_VERTICAL = 9;
+export const SEARCH_HEAD_PADDING_HORIZONTAL = 14;
+export const SEARCH_HEAD_GAP = 12;
+/** `.summary { font: var(--dsw-font-xs-13) }` = 13px/20px, one ellipsised line. */
+export const SEARCH_SUMMARY_FONT_SIZE = 13;
+export const SEARCH_SUMMARY_LINE_HEIGHT = 20;
+/** `.body { padding: 8px 14px 12px 0 }` — right 0, so a long line scrolls flush. */
+export const SEARCH_BODY_PADDING_TOP = 8;
+export const SEARCH_BODY_PADDING_BOTTOM = 12;
+export const SEARCH_BODY_PADDING_RIGHT = 14;
+/** `--dsl-search-line-height: 22px` on every row (a `min-height`, not a line box). */
+export const SEARCH_LINE_MIN_HEIGHT = 22;
+/** `.line { padding-left: 14px }`. */
+export const SEARCH_LINE_PADDING_LEFT = 14;
+/** `.fileHeader { gap: 8px }` between a group's path and its match count. */
+export const SEARCH_FILE_GAP = 8;
+/** `.empty { padding: 12px 14px }`. */
+export const SEARCH_EMPTY_PADDING_VERTICAL = 12;
+export const SEARCH_EMPTY_PADDING_HORIZONTAL = 14;
+
+/**
+ * The stats banner: 9/14 padding, one line of 13/20 with the copy on the right.
+ *
+ * Unlike the code card's head (which shares the card's surface), DSH paints this
+ * one on `--dsw-alias-markdown-code-block-banner`; `surface2` is the theme's
+ * nearest raised surface. The card's `overflow: hidden` clips it to the corners.
+ */
+export function searchHeadStyle(colors: TokenColors): {
+  flexDirection: "row";
+  alignItems: "center";
+  gap: number;
+  paddingVertical: number;
+  paddingHorizontal: number;
+  backgroundColor: string;
+} {
+  return {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: SEARCH_HEAD_GAP,
+    paddingVertical: SEARCH_HEAD_PADDING_VERTICAL,
+    paddingHorizontal: SEARCH_HEAD_PADDING_HORIZONTAL,
+    backgroundColor: colors.surface2,
+  };
+}
+
+/** The statistics line: 13/20 secondary, takes the free space, one line. */
+export function searchSummaryTextStyle(colors: TokenColors): {
+  flex: number;
+  minWidth: number;
+  fontSize: number;
+  lineHeight: number;
+  color: string;
+} {
+  return {
+    flex: 1,
+    minWidth: 0,
+    fontSize: SEARCH_SUMMARY_FONT_SIZE,
+    lineHeight: SEARCH_SUMMARY_LINE_HEIGHT,
+    color: colors.foregroundMuted,
+  };
+}
+
+/**
+ * One search row's box: a 22px slot, indented 14px.
+ *
+ * DSH keeps matches on one line (`white-space: pre`) and scrolls sideways; RN
+ * has no `pre`, so the renderer puts these rows inside a horizontal scroll view
+ * and the text is never asked to shrink (`flexShrink: 0` on the text styles).
+ */
+export function searchLineStyle(): {
+  flexDirection: "row";
+  alignItems: "flex-start";
+  minHeight: number;
+  paddingLeft: number;
+} {
+  return {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    minHeight: SEARCH_LINE_MIN_HEIGHT,
+    paddingLeft: SEARCH_LINE_PADDING_LEFT,
+  };
+}
+
+/** The same slot for a file group's header, which sets its own side padding. */
+export function searchFileHeadStyle(): {
+  flexDirection: "row";
+  alignItems: "flex-start";
+  gap: number;
+  minHeight: number;
+  paddingHorizontal: number;
+} {
+  return {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: SEARCH_FILE_GAP,
+    minHeight: SEARCH_LINE_MIN_HEIGHT,
+    paddingHorizontal: SEARCH_LINE_PADDING_LEFT,
+  };
+}
+
+/** A match's `行号: ` prefix — 11/19 monospace, tertiary, never shrunk. */
+export function searchLineNumberTextStyle(colors: TokenColors): {
+  flexShrink: number;
+  fontFamily: string;
+  fontSize: number;
+  lineHeight: number;
+  color: string;
+} {
+  return {
+    flexShrink: 0,
+    fontFamily: CODE_FONT_FAMILY,
+    fontSize: CODE_FONT_SIZE,
+    lineHeight: CODE_LINE_HEIGHT,
+    color: colors.foregroundMuted,
+  };
+}
+
+/** A match line's text — the code surface, never shrunk (it scrolls instead). */
+export function searchLineTextStyle(colors: TokenColors): {
+  flexShrink: number;
+  fontFamily: string;
+  fontSize: number;
+  lineHeight: number;
+  color: string;
+} {
+  return {
+    flexShrink: 0,
+    fontFamily: CODE_FONT_FAMILY,
+    fontSize: CODE_FONT_SIZE,
+    lineHeight: CODE_LINE_HEIGHT,
+    color: colors.foreground,
+  };
+}
+
+/** A group's path: bold 600 primary, DSH's `.filePath`. */
+export function searchFilePathTextStyle(colors: TokenColors): {
+  flexShrink: number;
+  fontFamily: string;
+  fontSize: number;
+  lineHeight: number;
+  fontWeight: "600";
+  color: string;
+} {
+  return {
+    flexShrink: 0,
+    fontFamily: CODE_FONT_FAMILY,
+    fontSize: CODE_FONT_SIZE,
+    lineHeight: CODE_LINE_HEIGHT,
+    fontWeight: "600",
+    color: colors.foreground,
+  };
+}
+
+/** A group's match count: tertiary, DSH's `.fileCount`. */
+export function searchFileCountTextStyle(colors: TokenColors): {
+  flexShrink: number;
+  fontFamily: string;
+  fontSize: number;
+  lineHeight: number;
+  color: string;
+} {
+  return {
+    flexShrink: 0,
+    fontFamily: CODE_FONT_FAMILY,
+    fontSize: CODE_FONT_SIZE,
+    lineHeight: CODE_LINE_HEIGHT,
+    color: colors.foregroundMuted,
+  };
+}
+
+/** The fold control. Same 11/19 mono, tertiary, aligned with the rows. */
+export function searchExpandTextStyle(colors: TokenColors): {
+  flexShrink: number;
+  paddingLeft: number;
+  fontFamily: string;
+  fontSize: number;
+  lineHeight: number;
+  color: string;
+} {
+  return {
+    flexShrink: 0,
+    paddingLeft: SEARCH_LINE_PADDING_LEFT,
+    fontFamily: CODE_FONT_FAMILY,
+    fontSize: CODE_FONT_SIZE,
+    lineHeight: CODE_LINE_HEIGHT,
+    color: colors.foregroundMuted,
+  };
+}
+
+/** `.empty { padding: 12px 14px }`, tertiary. */
+export function searchEmptyTextStyle(colors: TokenColors): {
+  paddingVertical: number;
+  paddingHorizontal: number;
+  fontFamily: string;
+  fontSize: number;
+  lineHeight: number;
+  color: string;
+} {
+  return {
+    paddingVertical: SEARCH_EMPTY_PADDING_VERTICAL,
+    paddingHorizontal: SEARCH_EMPTY_PADDING_HORIZONTAL,
+    fontFamily: CODE_FONT_FAMILY,
+    fontSize: CODE_FONT_SIZE,
+    lineHeight: CODE_LINE_HEIGHT,
+    color: colors.foregroundMuted,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Read block (DSH's `ReadBlock`)                                             */
+/* -------------------------------------------------------------------------- */
+
+/** `.body { padding: 6px 22px 20px }` on the read/diff card. */
+export const READ_BODY_PADDING_TOP = 6;
+export const READ_BODY_PADDING_BOTTOM = 20;
+export const READ_BODY_PADDING_HORIZONTAL = 22;
+/** `.gutter { margin-right: 12px }`, between the line number and the code. */
+export const READ_GUTTER_MARGIN = 12;
+/**
+ * The gutter's width in DSH is `max(3, digits)ch` — a `ch` is the width of `0` in
+ * the current font, and RN has no `ch`, so the same measure is taken here as
+ * `0.6em` of the 11px code size.
+ */
+export const READ_GUTTER_MIN_DIGITS = 3;
+export const READ_GUTTER_CHAR_WIDTH = 6.6;
+
+/** The gutter's width for the widest line number in the block, in device px. */
+export function readGutterWidth(digits: number): number {
+  return Math.max(READ_GUTTER_MIN_DIGITS, digits) * READ_GUTTER_CHAR_WIDTH;
+}
+
+/** One read row: gutter + content, kept on one line. */
+export function readLineStyle(): {
+  flexDirection: "row";
+  alignItems: "flex-start";
+  minHeight: number;
+} {
+  return { flexDirection: "row", alignItems: "flex-start", minHeight: CODE_LINE_HEIGHT };
+}
+
+/** The line number: right-aligned, tertiary, and never selected (see renderer). */
+export function readGutterTextStyle(colors: TokenColors, digits: number): {
+  width: number;
+  marginRight: number;
+  textAlign: "right";
+  fontFamily: string;
+  fontSize: number;
+  lineHeight: number;
+  color: string;
+} {
+  return {
+    width: readGutterWidth(digits),
+    marginRight: READ_GUTTER_MARGIN,
+    textAlign: "right",
+    fontFamily: CODE_FONT_FAMILY,
+    fontSize: CODE_FONT_SIZE,
+    lineHeight: CODE_LINE_HEIGHT,
+    color: colors.foregroundMuted,
+  };
+}
+
+/** The code itself: primary contrast, never shrunk (it scrolls instead). */
+export function readLineTextStyle(colors: TokenColors): {
+  flexShrink: number;
+  fontFamily: string;
+  fontSize: number;
+  lineHeight: number;
+  color: string;
+} {
+  return {
+    flexShrink: 0,
+    fontFamily: CODE_FONT_FAMILY,
+    fontSize: CODE_FONT_SIZE,
+    lineHeight: CODE_LINE_HEIGHT,
+    color: colors.foreground,
+  };
+}
+
+/** `.expand { padding-left: calc(gutter + 12px) }` — aligned with the code. */
+export function readExpandTextStyle(colors: TokenColors, digits: number): {
+  flexShrink: number;
+  paddingLeft: number;
+  fontFamily: string;
+  fontSize: number;
+  lineHeight: number;
+  color: string;
+} {
+  return {
+    flexShrink: 0,
+    paddingLeft: readGutterWidth(digits) + READ_GUTTER_MARGIN,
+    fontFamily: CODE_FONT_FAMILY,
+    fontSize: CODE_FONT_SIZE,
+    lineHeight: CODE_LINE_HEIGHT,
+    color: colors.foregroundMuted,
+  };
+}
+
+/** A diff row's path header and hunk header share one muted line style. */
+export function diffChromeTextStyle(colors: TokenColors): {
+  fontFamily: string;
+  fontSize: number;
+  lineHeight: number;
+  color: string;
+} {
+  return {
+    fontFamily: CODE_FONT_FAMILY,
+    fontSize: CODE_FONT_SIZE,
+    lineHeight: CODE_LINE_HEIGHT,
+    color: colors.foregroundMuted,
+  };
+}
+
+/** A diff row's box: the same `padding: 0 22px` and 19px line as the read block. */
+export function diffRowStyle(): {
+  flexDirection: "row";
+  paddingHorizontal: number;
+} {
+  return { flexDirection: "row", paddingHorizontal: DIFF_LINE_PADDING_HORIZONTAL };
+}
+
+/** `.body { padding: 6px 0 20px }` on the diff card (the lines pad themselves). */
+export function diffBodyStyle(): { paddingTop: number; paddingBottom: number } {
+  return { paddingTop: READ_BODY_PADDING_TOP, paddingBottom: READ_BODY_PADDING_BOTTOM };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Web block (DSH's `WebBlock`)                                               */
+/* -------------------------------------------------------------------------- */
+
+/** `.block { padding: 12px 14px }` — one surface, no banner of its own. */
+export const WEB_PADDING_VERTICAL = 12;
+export const WEB_PADDING_HORIZONTAL = 14;
+/** `.fetch { gap: 6px }` between the URL and its status row. */
+export const WEB_GAP = 6;
+/** `.fetchUrl { font-family: code; font-size: 13px; line-height: 19px }`. */
+export const WEB_URL_FONT_SIZE = 13;
+export const WEB_URL_LINE_HEIGHT = 19;
+/** `.fetchMeta { gap: 12px }`, `.status { font: 13px/20px }`. */
+export const WEB_META_GAP = 12;
+export const WEB_STATUS_FONT_SIZE = 13;
+export const WEB_STATUS_LINE_HEIGHT = 20;
+/** `.sources { max-height: 320px; overflow-y: auto; gap: 10px }`. */
+export const WEB_SOURCES_MAX_HEIGHT = 320;
+export const WEB_SOURCE_GAP = 10;
+/**
+ * RN has no `<ol>` and no `value` attribute, so the reference number is drawn as
+ * a column of its own. DSH reserves `2.5em` of padding for it (~32px against the
+ * 13px list font); the column here is that measure, minus the gap it already has.
+ */
+export const WEB_SOURCE_INDEX_WIDTH = 24;
+export const WEB_SOURCE_INDEX_GAP = 8;
+/** `.sourceLink { font-size: 14px; line-height: 20px; font-weight: 500 }`. */
+export const WEB_SOURCE_LINK_FONT_SIZE = 14;
+export const WEB_SOURCE_LINK_LINE_HEIGHT = 20;
+/** `.snippet { margin-top: 2px; font-size: 13px; line-height: 19px }`. */
+export const WEB_SNIPPET_FONT_SIZE = 13;
+export const WEB_SNIPPET_LINE_HEIGHT = 19;
+export const WEB_SNIPPET_MARGIN_TOP = 2;
+/** `.published { margin-top: 2px; font: 13px/20px }`, and `.truncated` too. */
+export const WEB_PUBLISHED_LINE_HEIGHT = 20;
+
+/** The card's own box: one padded surface for both web shapes. */
+export function webCardBodyStyle(): {
+  paddingVertical: number;
+  paddingHorizontal: number;
+} {
+  return { paddingVertical: WEB_PADDING_VERTICAL, paddingHorizontal: WEB_PADDING_HORIZONTAL };
+}
+
+/** The fetch shape's column: URL over a status/truncation row. */
+export function webFetchStyle(): {
+  flexDirection: "column";
+  gap: number;
+} {
+  return { flexDirection: "column", gap: WEB_GAP };
+}
+
+/** The fetch URL: link colour, monospace 13/19, weight 500. */
+export function webUrlTextStyle(colors: TokenColors): {
+  fontFamily: string;
+  fontSize: number;
+  lineHeight: number;
+  fontWeight: "500";
+  color: string;
+} {
+  return {
+    fontFamily: CODE_FONT_FAMILY,
+    fontSize: WEB_URL_FONT_SIZE,
+    lineHeight: WEB_URL_LINE_HEIGHT,
+    fontWeight: "500",
+    color: colors.accent,
+  };
+}
+
+/** The status row's `HTTP 200`: 13/20 secondary. */
+export function webMetaTextStyle(colors: TokenColors): {
+  fontSize: number;
+  lineHeight: number;
+  color: string;
+} {
+  return {
+    fontSize: WEB_STATUS_FONT_SIZE,
+    lineHeight: WEB_STATUS_LINE_HEIGHT,
+    color: colors.foregroundMuted,
+  };
+}
+
+/** `.truncated { margin-top: 8px }` — zeroed inside the fetch card. */
+export const WEB_TRUNCATED_MARGIN_TOP = 8;
+
+/** The truncation notes (both shapes): 13/20 tertiary. */
+export function webTruncatedTextStyle(
+  colors: TokenColors,
+  marginTop: number = 0,
+): {
+  marginTop: number;
+  fontSize: number;
+  lineHeight: number;
+  color: string;
+} {
+  return {
+    marginTop,
+    fontSize: WEB_STATUS_FONT_SIZE,
+    lineHeight: WEB_PUBLISHED_LINE_HEIGHT,
+    color: colors.foregroundMuted,
+  };
+}
+
+/** The scroll container the whole citation list lives in (`max-height: 320px`). */
+export function webSourcesStyle(): { maxHeight: number } {
+  return { maxHeight: WEB_SOURCES_MAX_HEIGHT };
+}
+
+/** One numbered reference row: the number column plus the source. */
+export function webSourceRowStyle(): {
+  flexDirection: "row";
+  alignItems: "flex-start";
+  marginBottom: number;
+} {
+  return { flexDirection: "row", alignItems: "flex-start", marginBottom: WEB_SOURCE_GAP };
+}
+
+/** The reference number: right-aligned in its own column, muted. */
+export function webSourceIndexTextStyle(colors: TokenColors): {
+  width: number;
+  marginRight: number;
+  textAlign: "right";
+  fontSize: number;
+  lineHeight: number;
+  color: string;
+} {
+  return {
+    width: WEB_SOURCE_INDEX_WIDTH,
+    marginRight: WEB_SOURCE_INDEX_GAP,
+    textAlign: "right",
+    fontSize: WEB_SNIPPET_FONT_SIZE,
+    lineHeight: WEB_SOURCE_LINK_LINE_HEIGHT,
+    color: colors.foregroundMuted,
+  };
+}
+
+/** A source's title (or hostname): link colour, 14/20, weight 500. */
+export function webSourceLinkTextStyle(colors: TokenColors): {
+  fontSize: number;
+  lineHeight: number;
+  fontWeight: "500";
+  color: string;
+} {
+  return {
+    fontSize: WEB_SOURCE_LINK_FONT_SIZE,
+    lineHeight: WEB_SOURCE_LINK_LINE_HEIGHT,
+    fontWeight: "500",
+    color: colors.accent,
+  };
+}
+
+/** A source's snippet: 13/19 secondary, 2px under the title. */
+export function webSnippetTextStyle(colors: TokenColors): {
+  marginTop: number;
+  fontSize: number;
+  lineHeight: number;
+  color: string;
+} {
+  return {
+    marginTop: WEB_SNIPPET_MARGIN_TOP,
+    fontSize: WEB_SNIPPET_FONT_SIZE,
+    lineHeight: WEB_SNIPPET_LINE_HEIGHT,
+    color: colors.foregroundMuted,
+  };
+}
+
+/** A source's date: 13/20 tertiary, 2px under the snippet. */
+export function webPublishedTextStyle(colors: TokenColors): {
+  marginTop: number;
+  fontSize: number;
+  lineHeight: number;
+  color: string;
+} {
+  return {
+    marginTop: WEB_SNIPPET_MARGIN_TOP,
+    fontSize: WEB_SNIPPET_FONT_SIZE,
+    lineHeight: WEB_PUBLISHED_LINE_HEIGHT,
+    color: colors.foregroundMuted,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Folding                                                                    */
+/* -------------------------------------------------------------------------- */
+
+export interface FoldWindow {
+  /** Rows the cap hides. `<= 0` means the block is short enough to show whole. */
+  readonly hidden: number;
+  /** Whether the middle is actually folded right now. */
+  readonly capped: boolean;
+  /** Rows kept at the top while folded. */
+  readonly headLines: number;
+  /** Rows kept at the bottom while folded. */
+  readonly tailLines: number;
+}
+
+/**
+ * DSH's `headTailCap` (`dsh-client-ui-primitives/lib/index.js`), verbatim.
+ *
+ * Shared by the search, read and diff blocks and asserted offline, because the
+ * numbers are invisible-but-exact: an 8-line cap shows 4 + 4, a 9-line cap shows
+ * 5 + 4, and "is it folded at all" is `hidden > 0 && !expanded`.
+ */
+export function foldWindow(total: number, maxLines: number, expanded: boolean): FoldWindow {
+  const hidden = total - maxLines;
+  const headLines = Math.ceil(maxLines / 2);
+  return { hidden, capped: hidden > 0 && !expanded, headLines, tailLines: maxLines - headLines };
+}
 
 /**
  * Lines a block shows before folding, per DSH's `maxLines`.

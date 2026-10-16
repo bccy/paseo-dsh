@@ -8,7 +8,112 @@
  *
  * @module dsh-paseo/client/tool-call-data
  */
-import { localeText } from "./locale";
+import { currentLocale, localeText } from "./locale";
+
+/**
+ * Which of DSH's expanded blocks a row draws.
+ *
+ * DSH dispatches its body on the call's own variant
+ * (`terminalBody ?? diffBody ?? readBody ?? imageBody ?? searchBody ?? webBody ??
+ * detailsBody`), and the renderer used to infer the shell case from the absence
+ * of a diff and a code flag plus a body caption — a combination that only worked
+ * because no other block happened to share it. The mapping is computed here,
+ * once, and the renderer reads the field. `generic` is DSH's `detailsBody` (and
+ * the `ioCard` fallback): MCP calls, `/` commands, plans, subagents.
+ */
+export type ToolBlockKind = "terminal" | "diff" | "read" | "search" | "web" | "generic";
+
+/** One match line of a grep result. */
+export type SearchMatch = {
+  lineNumber: number;
+  line: string;
+};
+
+/** One file group of a grep result, with its match count. */
+export type SearchFile = {
+  path: string;
+  matches: SearchMatch[];
+  count: number;
+};
+
+/**
+ * The structured search card (`grep`/`glob`), from `meta.shape` plus `meta.total`.
+ *
+ * `shown` is DSH's `shownCount`: the retained result count, not the number of
+ * rows the height cap happens to be showing, so collapsing a group or folding
+ * the block never changes the banner. `total` is the pre-cap count from
+ * `meta.total`, and `truncated` says the *tool* capped the result — a separate
+ * fact from whether this card is folded.
+ */
+export type SearchBlockData = {
+  shape: "matches" | "paths";
+  files: SearchFile[];
+  paths: string[];
+  shown: number;
+  total: number;
+  truncated: boolean;
+  /** The plain-text form the copy control writes (DSH's `copyText`). */
+  text: string;
+};
+
+/** A numbered `read` result, with the language its card head names. */
+export type ReadBlockData = {
+  path: string;
+  lang: string;
+  lines: { number: number; text: string }[];
+  totalLines: number;
+  /** The whole result as text, for the copy control. */
+  text: string;
+};
+
+/** One row of a rendered diff: chrome, a hunk header, or a changed line. */
+export type DiffRow = {
+  kind: "path" | "hunk" | "gap" | "add" | "del" | "context";
+  /** The line without its `+ `/`- `/two-space prefix; chrome rows keep theirs. */
+  text: string;
+};
+
+/**
+ * The structured edit/write card, built from `meta.diffs` as real hunks.
+ *
+ * `body` is the same diff as a unified-diff string (`---`/`+++`, `@@`, context
+ * lines), so the `+A -R` stat keeps working off `diffStat()` unchanged. `rows`
+ * is what the renderer draws; it differs from `body` only in how a file change
+ * is announced (a bare path row rather than the two `---`/`+++` lines) and in
+ * carrying no hunk header when there is nothing to separate.
+ */
+export type DiffBlockData = {
+  rows: DiffRow[];
+  body: string;
+  /** `write`'s `meta.operation`; empty for `edit`. */
+  operation: "create" | "update" | "";
+  /** The first changed file, for the card head. */
+  path: string;
+};
+
+/** One web-search citation. */
+export type WebSource = {
+  url: string;
+  title: string;
+  /** The link text DSH would use: title, else hostname, else the raw URL. */
+  label: string;
+  snippet: string;
+  publishedAt: string;
+};
+
+/**
+ * The structured web card. `web_search` and `web_fetch` are one component with
+ * two shapes in DSH; the fetch shape carries no sources and the search shape no
+ * status code.
+ */
+export type WebBlockData = {
+  shape: "search" | "fetch";
+  sources: WebSource[];
+  answer: string;
+  url: string;
+  statusCode: number | null;
+  truncated: boolean;
+};
 
 export interface ToolCallData {
   name: string;
@@ -50,9 +155,572 @@ export interface ToolCallData {
    * here rather than in the renderer so it can be asserted offline.
    */
   hasDetail: boolean;
+  /** The block this row expands into. See {@link ToolBlockKind}. */
+  kind: ToolBlockKind;
+  /**
+   * The structured search card, or null when the result carried no usable meta.
+   *
+   * Null is not "empty": the renderer falls back to the plain text body, which
+   * is what the row showed before this phase. A blank card would be the silent
+   * failure this repo keeps warning about.
+   */
+  search: SearchBlockData | null;
+  /** The structured read card, or null when the result carried no usable meta. */
+  read: ReadBlockData | null;
+  /** The structured edit/write card, or null when the meta was unusable. */
+  diffBlock: DiffBlockData | null;
+  /** The structured web card, or null when the result carried no usable meta. */
+  web: WebBlockData | null;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Block copy                                                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The language-dependent copy the new blocks draw.
+ *
+ * It lives here rather than in `./locale` because this phase owns
+ * `tool-call-data.ts` and not `locale.ts`; it reads `currentLocale()` on every
+ * call, exactly like `localeText()`, so a relayed locale reaches the next row.
+ * Every string is DSH's own (`search.*`, `read.*`, `diff.*`, `web.*` and the
+ * `copy`/`copied`/`collapse` keys from its common namespace).
+ */
+export interface BlockCopy {
+  copy: string;
+  copied: string;
+  collapse: string;
+  expandRest(count: number): string;
+  expandAria(count: number): string;
+  collapseAria: string;
+  pathsSummary(shown: number, total: number, truncated: boolean): string;
+  matchesSummary(shown: number, total: number, files: number, truncated: boolean): string;
+  noResults: string;
+  http: string;
+  contentTruncated: string;
+  sourcesTruncated: string;
+  window(shown: number, total: number): string;
+  create: string;
+  update: string;
+}
+
+const BLOCK_COPY: Record<"en" | "zh-CN", BlockCopy> = {
+  en: {
+    copy: "Copy",
+    copied: "Copied",
+    collapse: "Collapse",
+    expandRest: (count) => `… ${count} more lines`,
+    expandAria: (count) => `Expand ${count} more lines`,
+    collapseAria: "Collapse",
+    pathsSummary: (shown, total, truncated) =>
+      truncated ? `Showing ${shown} of ${total} paths` : `${shown} paths`,
+    matchesSummary: (shown, total, files, truncated) =>
+      truncated
+        ? `Showing ${shown} of ${total} matches · ${files} files`
+        : `${shown} matches · ${files} files`,
+    noResults: "No results found",
+    http: "HTTP",
+    contentTruncated: "Content truncated",
+    sourcesTruncated: "Sources truncated",
+    window: (shown, total) => `Showing ${shown} of ${total} lines`,
+    create: "New file",
+    update: "Updated",
+  },
+  "zh-CN": {
+    copy: "复制",
+    copied: "复制成功",
+    collapse: "收起",
+    expandRest: (count) => `… 其余 ${count} 行`,
+    expandAria: (count) => `展开其余 ${count} 行`,
+    collapseAria: "收起内容",
+    pathsSummary: (shown, total, truncated) =>
+      truncated ? `显示 ${shown} / 共 ${total} 个路径` : `${shown} 个路径`,
+    matchesSummary: (shown, total, files, truncated) =>
+      truncated
+        ? `显示 ${shown} / 共 ${total} 处匹配 · ${files} 个文件`
+        : `${shown} 处匹配 · ${files} 个文件`,
+    noResults: "无结果",
+    http: "HTTP",
+    contentTruncated: "内容已截断",
+    sourcesTruncated: "来源列表已截断",
+    window: (shown, total) => `显示 ${shown} / ${total} 行`,
+    create: "新建",
+    update: "更新",
+  },
+};
+
+/** The block copy for the locale in force right now. */
+export function blockCopy(): BlockCopy {
+  return BLOCK_COPY[currentLocale()];
+}
+
+/** Every locale's block copy, so the harness can assert the tables line up. */
+export function allBlockCopy(): Record<"en" | "zh-CN", BlockCopy> {
+  return BLOCK_COPY;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Reading DSH's presentation meta                                            */
+/* -------------------------------------------------------------------------- */
+
 type ToolDetail = Record<string, unknown>;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * The `metadata` key DSH's raw result meta travels under.
+ *
+ * Mirrors `PRESENTATION_META_KEY` in `server/timeline.ts`. It cannot be imported
+ * from there: this module is compiled for plain `node` (the offline harness) and
+ * bundled for React Native, and the server half is a different build.
+ * `harness/tool-call-check.cjs` reads both sources and asserts the two literals
+ * are equal, so a rename on one side cannot silently orphan the other.
+ *
+ * It is **not** on `detail`: the plugin subprocess runs every event through
+ * `ProviderEventSchema.parse`, whose `toolCallDetailSchema` members are all
+ * `.strip()`, so an unknown `detail.meta` is deleted before the client sees it.
+ * `metadata` is a `jsonObjectSchema` and survives the parse.
+ */
+const PRESENTATION_META_KEY = "presentationMeta";
+
+/**
+ * DSH's raw `presentationMeta`, off the item's own `metadata`.
+ *
+ * The server keeps it verbatim; a shape it could not match still arrives here,
+ * and anything that fails a field check below makes that parser return null,
+ * which puts the row back on its plain-text rendering.
+ */
+function metaOf(metadata: Record<string, unknown>): Record<string, unknown> | undefined {
+  const meta = metadata[PRESENTATION_META_KEY];
+  return isRecord(meta) ? meta : undefined;
+}
+
+function numberField(source: Record<string, unknown>, key: string): number | null {
+  const value = source[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/** `grep`'s `meta.files`, or null for anything that is not the documented shape. */
+function parseMatchFiles(raw: unknown): SearchFile[] | null {
+  if (!Array.isArray(raw)) return null;
+  const files: SearchFile[] = [];
+  for (const file of raw) {
+    if (!isRecord(file) || typeof file.path !== "string" || !Array.isArray(file.matches)) return null;
+    const matches: SearchMatch[] = [];
+    for (const match of file.matches) {
+      if (!isRecord(match)) return null;
+      const lineNumber = numberField(match, "lineNumber");
+      if (lineNumber === null || typeof match.line !== "string") return null;
+      matches.push({ lineNumber, line: match.line });
+    }
+    files.push({ path: file.path, matches, count: matches.length });
+  }
+  return files;
+}
+
+/** The plain-text form of a search card, byte-for-byte DSH's `copyText`. */
+function searchCopyText(data: {
+  shape: "matches" | "paths";
+  files: SearchFile[];
+  paths: string[];
+}): string {
+  if (data.shape === "paths") return data.paths.join("\n");
+  return data.files
+    .map((file) => [file.path, ...file.matches.map((match) => `${match.lineNumber}: ${match.line}`)].join("\n"))
+    .join("\n\n");
+}
+
+function parseSearch(meta: Record<string, unknown>): SearchBlockData | null {
+  const total = numberField(meta, "total");
+  if (total === null) return null;
+  const truncated = meta.truncated === true;
+  if (meta.shape === "matches") {
+    const files = parseMatchFiles(meta.files);
+    if (files === null) return null;
+    const shown = files.reduce((sum, file) => sum + file.count, 0);
+    return { shape: "matches", files, paths: [], shown, total, truncated, text: searchCopyText({ shape: "matches", files, paths: [] }) };
+  }
+  if (meta.shape === "paths") {
+    if (!Array.isArray(meta.paths) || !meta.paths.every((path) => typeof path === "string")) return null;
+    const paths = [...(meta.paths as string[])];
+    return { shape: "paths", files: [], paths, shown: paths.length, total, truncated, text: searchCopyText({ shape: "paths", files: [], paths }) };
+  }
+  return null;
+}
+
+function parseRead(detail: ToolDetail, meta: Record<string, unknown>): ReadBlockData | null {
+  if (!Array.isArray(meta.lines)) return null;
+  const totalLines = numberField(meta, "totalLines");
+  if (totalLines === null) return null;
+  const lines: Array<{ number: number; text: string }> = [];
+  for (const line of meta.lines) {
+    if (!isRecord(line)) return null;
+    const number = numberField(line, "number");
+    if (number === null || typeof line.text !== "string") return null;
+    lines.push({ number, text: line.text });
+  }
+  const path = typeof meta.path === "string" && meta.path !== "" ? meta.path : str(detail, "filePath");
+  const lang = typeof meta.lang === "string" ? meta.lang : "";
+  return { path, lang, lines, totalLines, text: lines.map((line) => line.text).join("\n") };
+}
+
+function parseWeb(meta: Record<string, unknown>, shape: "search" | "fetch"): WebBlockData | null {
+  const truncated = meta.truncated === true;
+  if (shape === "fetch") {
+    if (typeof meta.url !== "string") return null;
+    const statusCode = numberField(meta, "statusCode");
+    if (statusCode === null) return null;
+    return { shape, sources: [], answer: "", url: meta.url, statusCode, truncated };
+  }
+  if (!Array.isArray(meta.sources)) return null;
+  const sources: WebSource[] = [];
+  for (const source of meta.sources) {
+    if (!isRecord(source) || typeof source.url !== "string") return null;
+    const title = typeof source.title === "string" ? source.title : "";
+    sources.push({
+      url: source.url,
+      title,
+      label: linkLabel(source.url, title),
+      snippet: typeof source.snippet === "string" ? source.snippet : "",
+      publishedAt: typeof source.publishedAt === "string" ? source.publishedAt : "",
+    });
+  }
+  return {
+    shape,
+    sources,
+    answer: typeof meta.answer === "string" ? meta.answer : "",
+    url: "",
+    statusCode: null,
+    truncated,
+  };
+}
+
+/**
+ * DSH's `linkLabel`: the title, else the hostname, else the URL as given.
+ *
+ * A hand-rolled hostname rather than `new URL(...)`: the data layer is compiled
+ * for plain `node` (the offline harness) *and* bundled for React Native, where
+ * `URL` availability depends on the host's polyfills. A URL this cannot take
+ * apart keeps its full text, which is what DSH does too.
+ */
+export function linkLabel(url: string, title: string): string {
+  if (title !== "") return title;
+  const match = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)/i.exec(url);
+  if (match === null) return url;
+  const authority = match[1].replace(/^[^@]*@/, "");
+  const host = authority.replace(/:\d+$/, "");
+  return host === "" ? url : host;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Turning `meta.diffs` into hunks                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Context lines DSH keeps around a change (`structuredPatch(..., {context: 3})`).
+ */
+export const DIFF_CONTEXT_LINES = 3;
+/**
+ * The edit-graph budget, mirroring DSH's `MAX_DIFF_EDIT_LENGTH`.
+ *
+ * DSH asks the `diff` package for a patch with `maxEditLength: 256` and falls
+ * back to "every old line removed, every new line added" when the search would
+ * cost more than that. This is a cell budget for the same reason: a whole-file
+ * rewrite must not turn into an unbounded LCS table.
+ */
+export const MAX_DIFF_CELLS = 250_000;
+
+/**
+ * A side's content lines, with DSH's terminator rule.
+ *
+ * Empty text is zero lines (a create has no `oldText` side), and one trailing
+ * newline terminates the last line rather than opening an empty one. An interior
+ * blank line survives.
+ */
+export function contentLines(text: string): string[] {
+  if (text === "") return [];
+  return (text.endsWith("\n") ? text.slice(0, -1) : text).split("\n");
+}
+
+interface DiffOp {
+  readonly kind: "context" | "del" | "add";
+  readonly text: string;
+}
+
+/** Every old line removed, then every new line added (DSH's fallback patch). */
+function replaceAll(oldLines: readonly string[], newLines: readonly string[]): DiffOp[] {
+  return [
+    ...oldLines.map((text): DiffOp => ({ kind: "del", text })),
+    ...newLines.map((text): DiffOp => ({ kind: "add", text })),
+  ];
+}
+
+/** A minimal line edit script over the two middles, or null past the budget. */
+function lcsOps(oldLines: readonly string[], newLines: readonly string[]): DiffOp[] | null {
+  const n = oldLines.length;
+  const m = newLines.length;
+  if (n === 0) return newLines.map((text): DiffOp => ({ kind: "add", text }));
+  if (m === 0) return oldLines.map((text): DiffOp => ({ kind: "del", text }));
+  if (n * m > MAX_DIFF_CELLS) return null;
+  const width = m + 1;
+  const table = new Int32Array((n + 1) * width);
+  for (let i = n - 1; i >= 0; i -= 1) {
+    for (let j = m - 1; j >= 0; j -= 1) {
+      table[i * width + j] =
+        oldLines[i] === newLines[j]
+          ? table[(i + 1) * width + (j + 1)] + 1
+          : Math.max(table[(i + 1) * width + j], table[i * width + (j + 1)]);
+    }
+  }
+  const ops: DiffOp[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (oldLines[i] === newLines[j]) {
+      ops.push({ kind: "context", text: oldLines[i] });
+      i += 1;
+      j += 1;
+    } else if (table[(i + 1) * width + j] >= table[i * width + (j + 1)]) {
+      ops.push({ kind: "del", text: oldLines[i] });
+      i += 1;
+    } else {
+      ops.push({ kind: "add", text: newLines[j] });
+      j += 1;
+    }
+  }
+  while (i < n) {
+    ops.push({ kind: "del", text: oldLines[i] });
+    i += 1;
+  }
+  while (j < m) {
+    ops.push({ kind: "add", text: newLines[j] });
+    j += 1;
+  }
+  return ops;
+}
+
+/**
+ * A line-level edit script for one hunk pair, with common prefix/suffix trimming.
+ *
+ * Trimming first is what keeps the LCS table small on the common case (DSH hands
+ * over the changed fragment, not the whole file), and it is also what preserves
+ * the surrounding context lines.
+ */
+export function diffOps(oldText: string, newText: string): DiffOp[] {
+  const oldLines = contentLines(oldText);
+  const newLines = contentLines(newText);
+  let prefix = 0;
+  while (prefix < oldLines.length && prefix < newLines.length && oldLines[prefix] === newLines[prefix]) {
+    prefix += 1;
+  }
+  let suffix = 0;
+  while (
+    suffix < oldLines.length - prefix &&
+    suffix < newLines.length - prefix &&
+    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+  ) {
+    suffix += 1;
+  }
+  const oldMiddle = oldLines.slice(prefix, oldLines.length - suffix);
+  const newMiddle = newLines.slice(prefix, newLines.length - suffix);
+  const middle = lcsOps(oldMiddle, newMiddle) ?? replaceAll(oldMiddle, newMiddle);
+  return [
+    ...oldLines.slice(0, prefix).map((text): DiffOp => ({ kind: "context", text })),
+    ...middle,
+    ...oldLines.slice(oldLines.length - suffix).map((text): DiffOp => ({ kind: "context", text })),
+  ];
+}
+
+/** One hunk of a diff: a slice of the op list plus its line numbers. */
+interface DiffHunk {
+  readonly ops: readonly DiffOp[];
+  readonly oldStart: number;
+  readonly oldCount: number;
+  readonly newStart: number;
+  readonly newCount: number;
+}
+
+/** `@@ -a,b +c,d @@`, with GNU's `,1` elision. */
+function hunkHeader(hunk: DiffHunk): string {
+  const range = (start: number, count: number): string =>
+    count === 1 ? `${start}` : `${start},${count}`;
+  return `@@ -${range(hunk.oldStart, hunk.oldCount)} +${range(hunk.newStart, hunk.newCount)} @@`;
+}
+
+/**
+ * Group an edit script into `@@` hunks with at most `context` lines of context.
+ *
+ * Two change runs merge into one hunk when no more than `2 * context` equal
+ * lines separate them — GNU diff's own merge rule, and what DSH's `diff`
+ * dependency produces.
+ */
+export function diffHunks(ops: readonly DiffOp[], context: number = DIFF_CONTEXT_LINES): DiffHunk[] {
+  const changes: number[] = [];
+  ops.forEach((op, index) => {
+    if (op.kind !== "context") changes.push(index);
+  });
+  if (changes.length === 0) return [];
+  const groups: Array<[number, number]> = [];
+  let start = changes[0];
+  let previous = changes[0];
+  for (const index of changes.slice(1)) {
+    if (index - previous <= 2 * context) {
+      previous = index;
+      continue;
+    }
+    groups.push([start, previous]);
+    start = index;
+    previous = index;
+  }
+  groups.push([start, previous]);
+
+  const oldBefore = new Array<number>(ops.length + 1).fill(0);
+  const newBefore = new Array<number>(ops.length + 1).fill(0);
+  ops.forEach((op, index) => {
+    oldBefore[index + 1] = oldBefore[index] + (op.kind === "add" ? 0 : 1);
+    newBefore[index + 1] = newBefore[index] + (op.kind === "del" ? 0 : 1);
+  });
+
+  return groups.map(([first, last]) => {
+    const from = Math.max(0, first - context);
+    const to = Math.min(ops.length - 1, last + context);
+    const oldCount = oldBefore[to + 1] - oldBefore[from];
+    const newCount = newBefore[to + 1] - newBefore[from];
+    return {
+      ops: ops.slice(from, to + 1),
+      oldStart: oldCount === 0 ? oldBefore[from] : oldBefore[from] + 1,
+      oldCount,
+      newStart: newCount === 0 ? newBefore[from] : newBefore[from] + 1,
+      newCount,
+    };
+  });
+}
+
+/** A diff pair as DSH's `meta.diffs` sends it. */
+interface MetaDiff {
+  readonly path: string;
+  readonly oldText: string;
+  readonly newText: string;
+}
+
+/** `meta.diffs`, or null when any entry is not the documented shape. */
+function parseDiffs(raw: unknown): MetaDiff[] | null {
+  if (!Array.isArray(raw)) return null;
+  const diffs: MetaDiff[] = [];
+  for (const diff of raw) {
+    if (
+      !isRecord(diff) ||
+      typeof diff.path !== "string" ||
+      typeof diff.oldText !== "string" ||
+      typeof diff.newText !== "string"
+    ) {
+      return null;
+    }
+    diffs.push({ path: diff.path, oldText: diff.oldText, newText: diff.newText });
+  }
+  return diffs;
+}
+
+/** The body text one diff pair contributes: `---`/`+++` and its hunks. */
+function diffPairBody(diff: MetaDiff): string {
+  const lines: string[] = [`--- ${diff.path}`, `+++ ${diff.path}`];
+  for (const hunk of diffHunks(diffOps(diff.oldText, diff.newText))) {
+    lines.push(hunkHeader(hunk));
+    for (const op of hunk.ops) {
+      if (op.kind === "add") lines.push(`+${op.text}`);
+      else if (op.kind === "del") lines.push(`-${op.text}`);
+      else lines.push(` ${op.text}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+/** The rows one diff pair contributes, without its own file announcement. */
+function diffPairRows(diff: MetaDiff): DiffRow[] {
+  const rows: DiffRow[] = [];
+  for (const hunk of diffHunks(diffOps(diff.oldText, diff.newText))) {
+    rows.push({ kind: "hunk", text: hunkHeader(hunk) });
+    for (const op of hunk.ops) {
+      if (op.kind === "add") rows.push({ kind: "add", text: op.text });
+      else if (op.kind === "del") rows.push({ kind: "del", text: op.text });
+      else rows.push({ kind: "context", text: op.text });
+    }
+  }
+  return rows;
+}
+
+/**
+ * Build the diff card from `meta.diffs`.
+ *
+ * A `write` with an empty `diffs` list is DSH's create (and its "successful
+ * update with empty metadata" case): DSH then falls back to the argument-derived
+ * whole-file diff, so the file's contents become the added side. Returns null
+ * whenever the meta is missing or malformed, which puts the row back on the
+ * plain-text body the row showed before this phase.
+ */
+function parseDiffBlock(
+  detail: ToolDetail,
+  metadata: ToolDetail,
+  type: string,
+): DiffBlockData | null {
+  const meta = metaOf(metadata);
+  if (meta === undefined) return null;
+  const diffs = parseDiffs(meta.diffs);
+  if (diffs === null) return null;
+  if (type === "write" && diffs.length === 0) {
+    const content = str(detail, "content");
+    if (content === "") return null;
+    diffs.push({ path: str(detail, "filePath"), oldText: "", newText: content });
+  }
+  if (diffs.length === 0) return null;
+  const distinctPaths = new Set(diffs.map((diff) => diff.path)).size;
+  const rows: DiffRow[] = [];
+  diffs.forEach((diff, index) => {
+    if (index === 0) {
+      // A single-file diff leaves the path to the card head (the preview's own
+      // shape); once there are several, every group announces itself. A repeat
+      // of the same path gets DSH's `⋯` instead, so two hunks of one file do
+      // not read as two files.
+      if (distinctPaths > 1) rows.push({ kind: "path", text: diff.path });
+    } else if (diffs[index - 1].path === diff.path) {
+      rows.push({ kind: "gap", text: "⋯" });
+    } else {
+      rows.push({ kind: "path", text: diff.path });
+    }
+    rows.push(...diffPairRows(diff));
+  });
+  if (rows.length === 0) return null;
+  const operation = meta.operation === "create" || meta.operation === "update" ? meta.operation : "";
+  return {
+    rows,
+    body: diffs.map(diffPairBody).join("\n"),
+    operation,
+    path: diffs[0].path,
+  };
+}
+
+/** The block a detail type dispatches to, mirroring DSH's own order. */
+function blockKind(type: string, toolName: string): ToolBlockKind {
+  switch (type) {
+    case "shell":
+      return "terminal";
+    case "read":
+      return "read";
+    case "write":
+    case "edit":
+      return "diff";
+    case "fetch":
+      return "web";
+    case "search":
+      // `web_search` arrives as Paseo's `search` detail (it has a query and
+      // results); DSH draws it with the same component as `web_fetch`.
+      return toolName === "web_search" ? "web" : "search";
+    default:
+      return "generic";
+  }
+}
 
 const BODY_LIMIT = 6000;
 
@@ -434,6 +1102,35 @@ export function toolCallData(
     code = true;
   }
 
+  // DSH's own block for this call, then the structured card for it. Each parser
+  // returns null for anything that is not the documented shape, and null keeps
+  // the plain-text body above — a recognisable row, never a blank card.
+  const kind = blockKind(type, str(detail, "toolName") || item.name);
+  const meta = metaOf(metadata);
+  const search = kind === "search" && meta !== undefined ? parseSearch(meta) : null;
+  const read = kind === "read" && meta !== undefined ? parseRead(detail, meta) : null;
+  const diffBlock = kind === "diff" ? parseDiffBlock(detail, metadata, type) : null;
+  const web =
+    kind === "web" && meta !== undefined
+      ? parseWeb(meta, type === "fetch" ? "fetch" : "search")
+      : null;
+  if (diffBlock !== null) {
+    // A real hunk diff replaces the raw file contents (`write` used to hand the
+    // whole file to the diff surface) and the protocol's flat diff alike. It is
+    // a unified diff, so `diffStat()` reads its `+A -R` straight off `body`;
+    // that is also why this one body is not size-capped — a truncated diff would
+    // lose both the stat and the copy.
+    body = diffBlock.body;
+    bodyLabel = copy.bodyLabels.diff;
+    diff = true;
+    code = true;
+  }
+
+  const headline = truncate(
+    detailHeadline !== "" ? detailHeadline : description === "" ? "" : primary,
+  );
+  const structured = search !== null || read !== null || diffBlock !== null || web !== null;
+
   return {
     name: item.name,
     label: toolLabel(item.name),
@@ -449,18 +1146,22 @@ export function toolCallData(
     // command of a shell row) always wins: a description must not push the block
     // back to the compact one-line form. Otherwise the block leads with the
     // subject only when the head is showing something else — the description.
-    headline: truncate(
-      detailHeadline !== "" ? detailHeadline : description === "" ? "" : primary,
-    ),
-    body: truncate(body),
+    headline,
+    body: diffBlock !== null ? body : truncate(body),
     bodyLabel,
     diff,
     code,
     failed,
     // Whether the expanded block has anything to show. A row whose only content
     // is its title still expands — the title wraps to its full width — but must
-    // not draw an empty code surface.
+    // not draw an empty code surface. A structured card counts even when the
+    // plain text is empty: the card is the content.
     titled: description !== "",
-    hasDetail: truncate(detailHeadline !== "" ? detailHeadline : description === "" ? "" : primary) !== "" || body !== "",
+    hasDetail: headline !== "" || body !== "" || structured,
+    kind,
+    search,
+    read,
+    diffBlock,
+    web,
   };
 }

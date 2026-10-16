@@ -210,6 +210,98 @@ console.log("the tools that used to render as wire names + a wrench");
   setLocale(previous);
 }
 
+console.log("the DSH titles, verbatim (its English table is not regular)");
+{
+  // Every pair below was read out of the installed DSH bundle: the tool's own
+  // row title key (`TOOL_TITLE_KEYS` / `VARIANT_TITLE_KEYS` in
+  // `dsh-client-ui-tool`, the `SEARCH_TITLE_KEYS` and `WEB_TITLE_KEYS` used by
+  // the search and web rows) resolved against `dsh-client-ui-conversation`'s
+  // zh/en tables. They are pinned by hand because the harness is offline and
+  // cannot read that bundle, and because DSH's English column is *not* a tidy
+  // translation of the Chinese one: `bash` is "Bash" but `pwsh` is "Pwsh",
+  // `grep`/`glob` are "Grep"/"Glob" while `web_search` is plain "Search".
+  // A later "consistency fix" is exactly what this catches.
+  const cases = [
+    ["bash", "运行命令", "Bash"],
+    ["pwsh", "运行命令", "Pwsh"],
+    ["grep", "搜索文件内容", "Grep"],
+    ["glob", "查找文件", "Glob"],
+    ["web_search", "网页搜索", "Search"],
+    ["web_fetch", "网页获取", "Fetch"],
+    ["todo_write", "更新任务清单", "Update to-do list"],
+    ["subagent", "创建子智能体", "Create subagent"],
+    ["list_agents", "查看子智能体", "List subagents"],
+    ["send_message", "发送消息", "Send message"],
+    ["interrupt_agent", "中断智能体", "Interrupt agent"],
+    ["list_subagent_models", "查看可用模型", "List models"],
+    ["job_list", "查看后台任务", "List background jobs"],
+    ["job_output", "读取任务输出", "Read job output"],
+    ["job_kill", "取消后台任务", "Cancel background job"],
+    ["terminal_open", "创建终端", "Open terminal"],
+    ["terminal_list", "查看终端", "List terminals"],
+    ["workflow", "运行工作流", "Run workflow"],
+    ["ralph", "运行循环工作流", "Run ralph loop"],
+    ["schedule_list", "查看定时任务", "List reminders"],
+    ["schedule_update", "修改定时任务", "Update reminder"],
+    ["session_event_read", "读取事件", "Read event"],
+    ["session_event_search", "搜索事件", "Search events"],
+    ["session_event_trace", "追踪事件", "Trace event"],
+    ["cordis_run", "运行 Cordis 插件", "Run Cordis Plugin"],
+    ["cordis_stop", "停止 Cordis 插件", "Stop Cordis Plugin"],
+    ["cordis_undefine", "移除 Cordis 插件", "Remove Cordis Plugin"],
+    ["cordis_package_inspect", "查询 Cordis 环境", "Query Cordis environment"],
+    ["cordis_runtime_inspect", "查询 Cordis 环境", "Query Cordis environment"],
+    ["cordis_inspect_list", "检查提供方", "Inspect providers"],
+    ["cordis_inspect_self", "检查动态插件", "Inspect plugins"],
+    // `skill` is the trap this list exists for: it is not in DSH's
+    // TOOL_TITLE_KEYS at all (its own package, `dsh-client-ui-skill`, titles the
+    // row), so a mechanical resolution silently falls back to the generic row's
+    // 工具调用 / Tool call. It was wrong here once already.
+    ["skill", "加载技能", "Skill"],
+  ];
+  for (const [name, zh, en] of cases) {
+    setLocale("zh-CN");
+    equal(`${name} (zh)`, toolLabel(name), zh);
+    setLocale("en");
+    equal(`${name} (en)`, toolLabel(name), en);
+  }
+  setLocale(undefined);
+}
+
+console.log("a tool row adopts the locale its item carries");
+{
+  // The transformer calls `setLocale(localeFromMetadata(item.metadata))` before
+  // it maps the item (asserted against the source in `tool-call-check.cjs`); the
+  // data-layer half of that contract is what runs here. `metadata` is the only
+  // free-form passthrough the protocol has, and only a tool-call item carries
+  // one — the reasoning and assistant schemas have no `metadata` field — so a
+  // session that opens with thinking text renders that row in the default until
+  // the first tool call arrives. That is a protocol limit, not a bug.
+  const item = {
+    name: "bash",
+    status: "completed",
+    detail: { type: "shell", command: "ls", output: "x" },
+    metadata: { locale: "en" },
+  };
+  setLocale(undefined);
+  equal("with no relay the default stands", currentLocale(), "zh-CN");
+  equal("so the row is Chinese", toolCallData(item, "complete").label, "运行命令");
+
+  setLocale(localeFromMetadata(item.metadata));
+  equal("the item's locale is adopted", currentLocale(), "en");
+  equal("and the row follows", toolCallData(item, "complete").label, "Bash");
+
+  setLocale(localeFromMetadata({ locale: "zh-CN" }));
+  equal("the other direction too", toolCallData(item, "complete").label, "运行命令");
+
+  setLocale(localeFromMetadata({}));
+  equal("an item with no locale clears the relay", currentLocale(), "zh-CN");
+  equal("back to the default row", toolCallData(item, "complete").label, "运行命令");
+
+  setLocale(localeFromMetadata("not-an-object"));
+  equal("an unreadable hint does not guess", currentLocale(), "zh-CN");
+}
+
 console.log("row copy follows the locale, not the import");
 {
   const shell = { name: "bash", status: "completed", detail: { type: "shell", command: "npm test", output: "ok" } };
@@ -217,13 +309,13 @@ console.log("row copy follows the locale, not the import");
   const mcp = { name: "mcp__paseo__delete_heartbeat", status: "completed", detail: { type: "unknown", input: { id: "x" }, output: "ok" } };
 
   setLocale("zh-CN");
-  equal("a shell row is labelled in Chinese", toolCallData(shell, "complete").label, "命令");
+  equal("a shell row is labelled in Chinese", toolCallData(shell, "complete").label, "运行命令");
   equal("its block caption too", toolCallData(shell, "complete").bodyLabel, "输出");
   equal("a plan row leads with the Chinese title", toolCallData(plan, "complete").summary, "计划");
   equal("a Paseo MCP row is labelled in Chinese", toolCallData(mcp, "complete").label, "删除心跳");
 
   setLocale("en");
-  equal("the same row is labelled in English once the locale is relayed", toolCallData(shell, "complete").label, "Command");
+  equal("the same row is labelled in English once the locale is relayed", toolCallData(shell, "complete").label, "Bash");
   equal("and so is the block caption", toolCallData(shell, "complete").bodyLabel, "Output");
   equal("the plan row follows", toolCallData(plan, "complete").summary, "Plan");
   equal("the Paseo MCP row follows", toolCallData(mcp, "complete").label, "Delete heartbeat");

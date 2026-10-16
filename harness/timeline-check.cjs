@@ -12,7 +12,23 @@
  * - `tool/result` → `data.meta` (DSH's `presentationMeta`) was never read, so
  *   every structured row was rendered from the lossy result text. The meta
  *   pass-through and the protocol fields it fills are asserted here, as are the
- *   nine detail branches that had no assertion at all.
+ *   nine detail branches that had no assertion at all. It rides on the item's
+ *   `metadata`, **not** on the detail: `ProviderEventSchema.parse` strips every
+ *   unknown detail field before the event leaves the plugin process, and the
+ *   last section of this file runs that parse for real so the boundary cannot
+ *   silently swallow the field again.
+ * - DSH's `compaction/*` bracket was dropped by `consume()`, so a compaction was
+ *   invisible while it ran. Paseo has a native `compaction` marker; the mapping,
+ *   both triggers and the failed-close path are asserted here.
+ * - A detail type the plugin's *client* cannot draw renders as an icon over
+ *   nothing (`{summary:"",headline:"",body:"",hasDetail:false}`), and
+ *   `worktree_setup` was the protocol type that did it. The invariant — the
+ *   server only emits detail types `client/tool-call-data.ts` draws — is
+ *   asserted for every branch.
+ * - The resolved locale must ride on *every* tool-call item's `metadata`: the
+ *   client cannot read the daemon's environment, and React never re-renders a
+ *   row that already transformed, so a hint on the first row only is a hint
+ *   nobody sees.
  *
  * `harness/plugin-check.cjs` drives the plugin end to end; this drives the
  * builder directly, which is the only way to stage those orderings.
@@ -21,6 +37,7 @@
  *   npx tsc server/timeline.ts \
  *     --outDir .dbg --rootDir . --module commonjs --moduleResolution node \
  *     --target ES2022 --skipLibCheck
+ *   # `server/locale.ts` comes along: `timeline.js` imports it for `UI`/`LOCALE`.
  *   echo '{"type":"commonjs"}' > .dbg/package.json
  *   cp ../harness/timeline-check.cjs .dbg/
  *   cd .dbg && node timeline-check.cjs
@@ -31,6 +48,21 @@
 "use strict";
 
 const { TimelineBuilder } = require("./server/timeline.js");
+/** The same module the builder reads, so the relay can be compared to its source. */
+const { LOCALE } = require("./server/locale.js");
+/**
+ * The schema the plugin subprocess parses every outgoing event with
+ * (`@getpaseo/plugin/dist/server/plugin-process.js`). Imported here rather than
+ * assumed: the last section feeds a real builder item through it, because the
+ * one thing that must be true is that the structured meta still exists *after*
+ * the process boundary.
+ */
+const { ProviderEventSchema } = require("@getpaseo/plugin/server/provider");
+
+/** DSH's raw result meta, wherever the item carries it. */
+function itemMeta(item) {
+  return item?.metadata?.presentationMeta;
+}
 
 let passed = 0;
 let failed = 0;
@@ -207,7 +239,12 @@ console.log("the description rides on provider metadata");
     seq: 1,
     data: { callId: "d2", name: "bash", arguments: { command: "pwd" } },
   });
-  check("a call with no description adds no metadata", plain[0]?.metadata === undefined);
+  check("a call with no description still carries metadata", plain[0]?.metadata !== undefined);
+  check(
+    "and that metadata has no description to confuse the title",
+    plain[0]?.metadata?.description === undefined,
+    JSON.stringify(plain[0]?.metadata),
+  );
 }
 
 console.log("every detail branch carries what it claims");
@@ -243,8 +280,22 @@ console.log("every detail branch carries what it claims");
 
   const plain = runTool("todo_write", { todos: [{ content: "Task", status: "pending" }] }, "ok").detail;
   check("plain_text: type", plain.type === "plain_text");
-  check("plain_text: label", plain.label === "更新任务");
+  // DSH's own wording, from the `TOOL_TITLE_KEYS` table in
+  // `@deepseek-ai/dsh-client-ui-tool`: `todo_write` → `todo.rowTitle`,
+  // `ask_user_question` → `ask.rowTitle`. Pinned per locale because the server's
+  // `toolLabels` is the only copy of it ("更新任务" without 清单, and "已询问用户"
+  // for a row DSH titles "提问", were both Phase 3 audit findings), and read
+  // through `LOCALE` so the assertion does not depend on this machine's `LANG`.
+  const DSH_TOOL_TITLES = {
+    "zh-CN": { todoWrite: "更新任务清单", askUser: "提问" },
+    en: { todoWrite: "Update to-do list", askUser: "Ask question" },
+  }[LOCALE];
+  check("plain_text: label is DSH's todo.rowTitle", plain.label === DSH_TOOL_TITLES.todoWrite, plain.label);
   check("plain_text: icon key", plain.icon === "sparkles");
+
+  const asked = runTool("ask_user_question", { questions: [] }, "answered").detail;
+  check("ask_user_question: type", asked.type === "plain_text");
+  check("ask_user_question: label is DSH's ask.rowTitle", asked.label === DSH_TOOL_TITLES.askUser, asked.label);
 
   const plan = runTool("exit_plan_mode", { plan: "## Plan" }, "ok").detail;
   check("plan: type", plan.type === "plan");
@@ -261,38 +312,43 @@ console.log("every detail branch carries what it claims");
   check("unknown: output", unknown.output === "result text");
 }
 
-console.log("DSH's presentationMeta reaches the detail");
+console.log("DSH's presentationMeta reaches the item's metadata");
 {
   // The bridge forwards `tool/result` verbatim, `data.meta` included; the server
   // used to take `textOf(message.content)` and throw the rest away. Every
   // structured row in the plan — line numbers, hunk diffs, grouped matches, web
-  // sources — hangs on this pass-through.
-  const read = runTool("read", { file_path: "/repo/src/app.ts" }, "1: const a = 1;", {
+  // sources — hangs on this pass-through, and it has to land on `metadata`:
+  // `detail` is schema-stripped at the process boundary (asserted at the end of
+  // this file).
+  const readItem = runTool("read", { file_path: "/repo/src/app.ts" }, "1: const a = 1;", {
     path: "/repo/src/app.ts",
     offset: 1,
     lines: [{ number: 1, text: "const a = 1;" }],
     totalLines: 40,
     lang: "typescript",
-  }).detail;
-  check("read: meta is verbatim", read.meta?.lines?.[0]?.text === "const a = 1;", JSON.stringify(read.meta));
-  check("read: the protocol offset is filled", read.offset === 1);
-  check("read: lang is kept (no protocol field for it)", read.meta.lang === "typescript");
+  });
+  const read = readItem.detail;
+  check("read: meta is verbatim", itemMeta(readItem)?.lines?.[0]?.text === "const a = 1;", JSON.stringify(itemMeta(readItem)));
+  check("read: the protocol offset is filled on the detail", read.offset === 1);
+  check("read: lang is kept (no protocol field for it)", itemMeta(readItem)?.lang === "typescript");
+  check("read: and nothing rides on the detail itself", !("meta" in read), JSON.stringify(Object.keys(read)));
 
-  const edit = runTool("edit", { file_path: "app.ts" }, "Edited", {
+  const editItem = runTool("edit", { file_path: "app.ts" }, "Edited", {
     diffs: [{ path: "app.ts", oldText: "a", newText: "b" }],
-  }).detail;
-  check("edit: hunk diffs are kept", edit.meta.diffs[0].newText === "b", JSON.stringify(edit.meta));
+  });
+  check("edit: hunk diffs are kept", itemMeta(editItem)?.diffs?.[0]?.newText === "b", JSON.stringify(itemMeta(editItem)));
 
   const warningsBeforeWrite = warnings.length;
-  const write = runTool("write", { file_path: "new.ts" }, "Created", { operation: "create", diffs: [] }).detail;
-  check("write: the operation is kept", write.meta.operation === "create");
+  const writeItem = runTool("write", { file_path: "new.ts" }, "Created", { operation: "create", diffs: [] });
+  check("write: the operation is kept", itemMeta(writeItem)?.operation === "create");
+  check("write: and it is not on the detail", !("meta" in writeItem.detail));
   check(
     "write: an empty diff list is a valid create, not a mismatch",
     warnings.length === warningsBeforeWrite,
     JSON.stringify(warnings.slice(warningsBeforeWrite)),
   );
 
-  const grep = runTool("grep", { pattern: "needle" }, "app.ts:3:hit", {
+  const grepItem = runTool("grep", { pattern: "needle" }, "app.ts:3:hit", {
     shape: "matches",
     files: [
       { path: "app.ts", matches: [{ lineNumber: 3, line: "hit" }] },
@@ -300,13 +356,19 @@ console.log("DSH's presentationMeta reaches the detail");
     ],
     truncated: true,
     total: 90,
-  }).detail;
+  });
+  const grep = grepItem.detail;
   check("grep: filePaths are filled", JSON.stringify(grep.filePaths) === '["app.ts","b.ts"]', JSON.stringify(grep.filePaths));
   check("grep: numFiles is filled", grep.numFiles === 2);
   check("grep: numMatches counts what the groups hold", grep.numMatches === 3);
   check("grep: mode is filled", grep.mode === "content");
   check("grep: truncated is filled", grep.truncated === true);
-  check("grep: the pre-cap total stays in meta", grep.meta.total === 90);
+  check("grep: the pre-cap total stays in the metadata", itemMeta(grepItem)?.total === 90);
+  check(
+    "grep: the grouped matches stay in the metadata",
+    itemMeta(grepItem)?.files?.[1]?.matches?.length === 2,
+    JSON.stringify(itemMeta(grepItem).files),
+  );
 
   const glob = runTool("glob", { pattern: "**/*.ts" }, "a.ts", {
     shape: "paths",
@@ -319,10 +381,11 @@ console.log("DSH's presentationMeta reaches the detail");
   check("glob: mode is filled", glob.mode === "files_with_matches");
   check("glob: truncated is filled", glob.truncated === false);
 
-  const web = runTool("web_search", { queries: ["one", "two"] }, "sources", {
+  const webItem = runTool("web_search", { queries: ["one", "two"] }, "sources", {
     sources: [{ url: "https://a.example", title: "A" }, { url: "https://b.example" }],
     truncated: false,
-  }).detail;
+  });
+  const web = webItem.detail;
   check(
     "web_search: webResults are filled, an untitled source falls back to its URL",
     JSON.stringify(web.webResults) ===
@@ -330,66 +393,70 @@ console.log("DSH's presentationMeta reaches the detail");
     JSON.stringify(web.webResults),
   );
   check("web_search: truncated is filled", web.truncated === false);
-  check("web_search: the raw sources stay in meta", web.meta.sources[0].title === "A");
+  check("web_search: the raw sources stay in the metadata", itemMeta(webItem)?.sources?.[0]?.title === "A");
 
-  const fetched = runTool("web_fetch", { url: "https://start.example" }, "body", {
+  const fetchedItem = runTool("web_fetch", { url: "https://start.example" }, "body", {
     url: "https://final.example",
     statusCode: 200,
     truncated: true,
-  }).detail;
+  });
+  const fetched = fetchedItem.detail;
   check("web_fetch: the final URL comes from meta", fetched.url === "https://final.example");
   check("web_fetch: the status code is filled", fetched.code === 200);
-  check("web_fetch: truncation is kept (no protocol field for it)", fetched.meta.truncated === true);
+  check("web_fetch: truncation is kept (no protocol field for it)", itemMeta(fetchedItem)?.truncated === true);
 
-  const image = runTool("read_image", { file_path: "/tmp/shot.png" }, "image/png 100x100", {
+  const imageItem = runTool("read_image", { file_path: "/tmp/shot.png" }, "image/png 100x100", {
     path: "/tmp/shot.png",
-  }).detail;
-  check("read_image: stays an unknown detail", image.type === "unknown");
-  check("read_image: its path is kept", image.meta.path === "/tmp/shot.png");
+  });
+  check("read_image: stays an unknown detail", imageItem.detail.type === "unknown");
+  check("read_image: its path is kept", itemMeta(imageItem)?.path === "/tmp/shot.png");
 
-  const bash = runTool("bash", { command: "ls" }, "file.txt").detail;
-  check("bash: no meta to pass through", !("meta" in bash), JSON.stringify(bash));
+  const bashItem = runTool("bash", { command: "ls" }, "file.txt");
+  const bash = bashItem.detail;
+  check("bash: no meta to pass through", itemMeta(bashItem) === undefined, JSON.stringify(bashItem.metadata));
   check("bash: and still no exit code (DSH declares none)", bash.exitCode === undefined);
 }
 
 console.log("an unrecognized meta shape is reported, not swallowed");
 {
   const before = warnings.length;
-  const read = runTool("read", { file_path: "a.ts" }, "1: const a = 1;", {
+  const readItem = runTool("read", { file_path: "a.ts" }, "1: const a = 1;", {
     lines: "not-an-array",
     totalLines: 3,
-  }).detail;
+  });
+  const read = readItem.detail;
   check("a mismatched shape warns", warnings.length === before + 1, JSON.stringify(warnings.slice(before)));
   check("the warning names the tool", warnings[before].includes("read"), warnings[before]);
   check("the row keeps the plain result text", read.content === "1: const a = 1;");
-  check("and the raw meta still travels for a human", read.meta.lines === "not-an-array");
+  check("and the raw meta still travels for a human", itemMeta(readItem)?.lines === "not-an-array");
 
   const beforeScalar = warnings.length;
-  const scalar = runTool("bash", { command: "ls" }, "out", "not-an-object").detail;
+  const scalarItem = runTool("bash", { command: "ls" }, "out", "not-an-object");
   check(
     "a non-object meta warns too",
     warnings.length === beforeScalar + 1,
     JSON.stringify(warnings.slice(beforeScalar)),
   );
-  check("and is not attached as a detail field", !("meta" in scalar));
+  check("and is not attached as a detail field", !("meta" in scalarItem.detail));
+  check("nor as an item metadata field", itemMeta(scalarItem) === undefined);
 
   const beforeWrite = warnings.length;
-  const badWrite = runTool("write", { file_path: "new.ts" }, "Created", {
+  const badWriteItem = runTool("write", { file_path: "new.ts" }, "Created", {
     operation: "create",
     diffs: [{ path: "new.ts", oldText: 1, newText: "b" }],
-  }).detail;
+  });
   check(
     "a malformed diff entry warns",
     warnings.length === beforeWrite + 1,
     JSON.stringify(warnings.slice(beforeWrite)),
   );
-  check("and the raw meta is still there", badWrite.meta.diffs[0].oldText === 1);
+  check("and the raw meta is still there", itemMeta(badWriteItem)?.diffs?.[0]?.oldText === 1);
 
   const beforeAbsent = warnings.length;
-  const absent = runTool("bash", { command: "ls" }, "out").detail;
+  const absentItem = runTool("bash", { command: "ls" }, "out");
   check(
     "an absent meta is the normal case, not a mismatch",
-    warnings.length === beforeAbsent && !("meta" in absent),
+    warnings.length === beforeAbsent && !("meta" in absentItem.detail) && itemMeta(absentItem) === undefined,
     JSON.stringify(warnings.slice(beforeAbsent)),
   );
 }
@@ -417,6 +484,317 @@ console.log("web_search's query list");
   check(
     "an empty list falls through to the next candidate",
     runTool("web_search", { queries: [] }, "x").detail.query === "",
+  );
+}
+
+console.log("\ncompaction is visible (DSH's compaction/* bracket -> Paseo's marker)");
+{
+  // DSH brackets every compaction with `compaction/start` … `compaction/summary`
+  // + `compaction/end`, and none of it reaches its own surface. `consume()` used
+  // to return [] for all four types, so a compaction running for a minute looked
+  // like nothing happening. Paseo has the marker as a first-class item, which is
+  // what its own omp/pi adapters emit.
+  const builder = new TimelineBuilder({ warn: (line) => warnings.push(line) });
+
+  const started = builder.consume({
+    type: "compaction/start",
+    seq: 10,
+    data: { compactionId: "cmp-1", turn: 4 },
+  });
+  check("a start emits exactly one item", started.length === 1, JSON.stringify(started));
+  check("it is Paseo's native compaction marker", started[0]?.type === "compaction", started[0]?.type);
+  check("and it is loading", started[0]?.status === "loading", started[0]?.status);
+  check("an enclosed compaction is the automatic one", started[0]?.trigger === "auto", started[0]?.trigger);
+  check(
+    "preTokens is left unset (DSH has no tokens-before number)",
+    started[0] !== undefined && !("preTokens" in started[0]),
+    JSON.stringify(started[0]),
+  );
+
+  const summarized = builder.consume({
+    type: "compaction/summary",
+    seq: 11,
+    data: {
+      compactionId: "cmp-1",
+      turn: 4,
+      summary: [{ type: "text", text: "…" }],
+      shadowedRange: { start: 1, end: 9 },
+      shadowedSeqs: [1, 2, 3],
+      shadowedTokenCount: 12345,
+      provider: "deepseek",
+      model: "deepseek-chat",
+    },
+  });
+  check("the summary updates the row in place", summarized[0]?.id === started[0]?.id, summarized[0]?.id);
+  check("and clears loading", summarized[0]?.status === "completed", summarized[0]?.status);
+  check("without losing the trigger", summarized[0]?.trigger === "auto", summarized[0]?.trigger);
+
+  const ended = builder.consume({
+    type: "compaction/end",
+    seq: 12,
+    data: { compactionId: "cmp-1", turn: 4 },
+  });
+  check(
+    "the closing marker is the same row, still completed",
+    ended[0]?.id === started[0]?.id && ended[0]?.status === "completed",
+    JSON.stringify(ended[0]),
+  );
+
+  // A manual `/compact` runs outside any turn and stamps the command that asked
+  // for it. Both are DSH's own signals, not a guess from timing.
+  const manual = builder.consume({
+    type: "compaction/start",
+    seq: 13,
+    data: { compactionId: "cmp-2", sourceCommandId: "cmd-7", turn: null },
+  });
+  check("a /compact start says manual", manual[0]?.trigger === "manual", JSON.stringify(manual[0]));
+  check("a second compaction is a second row", manual[0]?.id !== started[0]?.id, manual[0]?.id);
+  const standalone = builder.consume({
+    type: "compaction/start",
+    seq: 14,
+    data: { compactionId: "cmp-3", turn: null },
+  });
+  check(
+    "turn: null alone is enough to call it manual",
+    standalone[0]?.trigger === "manual",
+    JSON.stringify(standalone[0]),
+  );
+
+  // A failed compaction is closed with `error` and never gets a summary.
+  const before = warnings.length;
+  const failed = builder.consume({
+    type: "compaction/end",
+    seq: 15,
+    data: { compactionId: "cmp-2", sourceCommandId: "cmd-7", turn: null, error: "summary is not smaller" },
+  });
+  check("a failed compaction still clears loading", failed[0]?.status === "completed", failed[0]?.status);
+  check(
+    "and the failure is reported, not swallowed",
+    warnings.length === before + 1 && warnings[before].includes("summary is not smaller"),
+    JSON.stringify(warnings.slice(before)),
+  );
+
+  check(
+    "compaction/prune is not a marker (no compactionId, and DSH draws nothing either)",
+    builder.consume({
+      type: "compaction/prune",
+      seq: 16,
+      data: { shadowedRange: { start: 1, end: 1 }, shadowedSeqs: [1], shadowedTokenCount: 40 },
+    }).length === 0,
+  );
+  check(
+    "a compaction event with no id emits nothing",
+    builder.consume({ type: "compaction/start", seq: 17, data: { turn: 4 } }).length === 0,
+  );
+}
+
+console.log("\nthe resolved locale rides on every item the client transforms");
+{
+  // The client half cannot resolve a locale for itself — the bundle is built for
+  // a neutral platform with no `define`, so `process.env` is unreachable. The
+  // protocol's free-form `metadata` is the passthrough, and *every* tool-call
+  // item has to carry it: the client adopts the locale while transforming a row,
+  // and React never re-renders a row that already transformed.
+  const builder = new TimelineBuilder();
+  const started = builder.consume({
+    type: "tool/call",
+    seq: 1,
+    data: { callId: "l1", name: "bash", arguments: { command: "pwd", description: "Where am I" } },
+  });
+  check(
+    "a running call relays the locale the server resolved",
+    started[0]?.metadata?.locale === LOCALE,
+    JSON.stringify(started[0]?.metadata),
+  );
+  check(
+    "alongside the description it already carried",
+    started[0]?.metadata?.description === "Where am I",
+    JSON.stringify(started[0]?.metadata),
+  );
+
+  const done = builder.consume({
+    type: "tool/result",
+    seq: 2,
+    data: { toolCallId: "l1", message: { content: [{ type: "text", text: "/tmp" }] } },
+  });
+  check(
+    "the finished row still relays it",
+    done[0]?.metadata?.locale === LOCALE,
+    JSON.stringify(done[0]?.metadata),
+  );
+
+  // A `/command` row goes through the same client transformer, so it needs the
+  // hint too: a session whose first row is `/compact` must not be the one that
+  // misses it.
+  const second = new TimelineBuilder();
+  second.consume({ type: "command/run", seq: 1, data: { commandId: "cmd-1", name: "compact" } });
+  const command = second.consume({
+    type: "command/done",
+    seq: 2,
+    data: { commandId: "cmd-1", kind: "success", text: "Compacted 3 history items." },
+  });
+  check(
+    "a /command row relays it too",
+    command[0]?.metadata?.locale === LOCALE,
+    JSON.stringify(command[0]?.metadata),
+  );
+
+  // Canceling keeps the row it was built from, metadata included.
+  const canceled = new TimelineBuilder();
+  canceled.consume({
+    type: "tool/call",
+    seq: 1,
+    data: { callId: "l2", name: "bash", arguments: { command: "sleep 9" } },
+  });
+  const closed = canceled.consume({ type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "aborted" } } });
+  check(
+    "a canceled row keeps the hint",
+    closed[0]?.metadata?.locale === LOCALE,
+    JSON.stringify(closed[0]?.metadata),
+  );
+}
+
+console.log("\nworktree_setup cannot render as an icon over nothing");
+{
+  // Paseo's protocol has a typed `worktree_setup` detail, but this plugin's own
+  // client half replaces the drawing of *every* tool row, and its switch has no
+  // case for that type: an unhandled detail type falls to a `default` that
+  // leaves the summary, headline and body empty (measured
+  // `{summary:"",headline:"",body:"",hasDetail:false}`), because the
+  // raw-argument fallback is gated on `type === "unknown"`. So the server must
+  // never emit it.
+  const setup = runTool(
+    "worktree_setup",
+    { worktreePath: "/tmp/wt", branchName: "paseo/x", commands: [] },
+    "created /tmp/wt",
+  ).detail;
+  check("it is not the type the client cannot draw", setup.type !== "worktree_setup", setup.type);
+  check("it is the raw-argument detail instead", setup.type === "unknown", setup.type);
+  check(
+    "the call's arguments survive",
+    JSON.stringify(setup.input) === '{"worktreePath":"/tmp/wt","branchName":"paseo/x","commands":[]}',
+    JSON.stringify(setup.input),
+  );
+  check("so does its output", setup.output === "created /tmp/wt", JSON.stringify(setup.output));
+  // Blank, in the client's own terms: every one of input/output empty. A
+  // `worktree_setup` call always carries required arguments, so this holds.
+  check(
+    "nothing the row draws is empty",
+    setup.input !== null &&
+      typeof setup.input === "object" &&
+      Object.keys(setup.input).length > 0 &&
+      setup.output !== null &&
+      setup.output !== "",
+    JSON.stringify({ input: setup.input, output: setup.output }),
+  );
+
+  const withMeta = runTool(
+    "worktree_setup",
+    { worktreePath: "/tmp/wt" },
+    "log",
+    { branchName: "paseo/x" },
+  );
+  check(
+    "a presentationMeta still rides along for a client that learns the shape",
+    itemMeta(withMeta)?.branchName === "paseo/x",
+    JSON.stringify(itemMeta(withMeta)),
+  );
+}
+
+console.log("\nevery detail type the server can emit is one the client draws");
+{
+  // A copy of the `switch (type)` in `client/tool-call-data.ts`, on purpose: that
+  // switch is the contract, and a provider-side type outside it is a blank row
+  // waiting to happen (which is how `worktree_setup` was found). If the client
+  // gains a branch, add it here; nothing else in this file has to change.
+  const DRAWABLE = new Set([
+    "shell",
+    "read",
+    "write",
+    "edit",
+    "search",
+    "fetch",
+    "sub_agent",
+    "plain_text",
+    "plan",
+    "unknown",
+  ]);
+  const names = [
+    "bash",
+    "pwsh",
+    "read",
+    "write",
+    "edit",
+    "grep",
+    "glob",
+    "web_search",
+    "web_fetch",
+    "todo_write",
+    "ask_user_question",
+    "exit_plan_mode",
+    "subagent",
+    "worktree_setup",
+    "read_image",
+    "job_kill",
+    "skill",
+    "mcp__paseo__list_workspaces",
+  ];
+  for (const name of names) {
+    const detail = runTool(name, { a: 1 }, "out").detail;
+    check(`${name}: ${detail.type} is drawable`, DRAWABLE.has(detail.type), detail.type);
+  }
+}
+
+console.log("the meta survives the plugin's own event schema");
+{
+  // The plugin subprocess parses every outgoing event with `ProviderEventSchema`
+  // before it leaves the process, and `toolCallDetailSchema`'s members are all
+  // `.strip()` — a field on `detail` that the schema does not name is deleted,
+  // with no error anywhere. That is exactly how the first version of this
+  // pass-through was lost: the builder attached `detail.meta`, the parse dropped
+  // it, and the client rendered every structured row from the lossy text. So the
+  // boundary itself is exercised here, not assumed.
+  const item = runTool("read", { file_path: "/repo/src/app.ts" }, "1: const a = 1;", {
+    path: "/repo/src/app.ts",
+    offset: 1,
+    lines: [{ number: 1, text: "const a = 1;" }],
+    totalLines: 40,
+    lang: "typescript",
+  });
+  const parsed = ProviderEventSchema.parse({ type: "timeline.item", sessionId: "s1", item });
+
+  check(
+    "the raw meta is still there after ProviderEventSchema.parse",
+    parsed.item.metadata?.presentationMeta?.lines?.[0]?.text === "const a = 1;",
+    JSON.stringify(parsed.item.metadata),
+  );
+  check(
+    "the language survives too",
+    parsed.item.metadata?.presentationMeta?.lang === "typescript",
+    JSON.stringify(parsed.item.metadata?.presentationMeta),
+  );
+  check(
+    "the description and locale keys are not clobbered by it",
+    parsed.item.metadata?.locale === LOCALE,
+    JSON.stringify(parsed.item.metadata),
+  );
+  check(
+    "the detail arrives without a meta field",
+    !("meta" in parsed.item.detail),
+    JSON.stringify(Object.keys(parsed.item.detail)),
+  );
+
+  // And the pitfall itself, so a future "just put it back on the detail" change
+  // fails here rather than silently on a device.
+  const withDetailMeta = ProviderEventSchema.parse({
+    type: "timeline.item",
+    sessionId: "s1",
+    item: { ...item, detail: { ...item.detail, meta: { probe: true } } },
+  });
+  check(
+    "a detail-level meta is still stripped (why it lives on metadata)",
+    !("meta" in withDetailMeta.item.detail),
+    JSON.stringify(Object.keys(withDetailMeta.item.detail)),
   );
 }
 

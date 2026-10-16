@@ -46,13 +46,30 @@
 ## 2. 阶段划分（每阶段独立可验收）
 
 ### Phase 0 · 基础（其他阶段都依赖）
-- **服务端**：`#toolResult()` 读 `data.meta` 并透传（typed 分支 + `unknown` 都带上）；
-  新增 `detail.meta` 或按块展开成协议字段。
+- **服务端**：`#toolResult()` 读 `data.meta`（DSH 的 `presentationMeta`）并透传（typed 分支 +
+  `unknown` 都带上）；落到 **item 级 `metadata.presentationMeta`**（与既有的
+  `metadata.description`、`metadata.locale` 合并）。
+  **不能放 `detail.meta`**：插件子进程出口会跑 `ProviderEventSchema.parse`，而
+  `toolCallDetailSchema` 的每个成员都是 `.strip()`——detail 上的额外字段在过边界时被静默删掉；
+  `metadata` 是 `jsonObjectSchema`，原样过去。复现：
+  ```bash
+  cd paseo-plugin
+  node -e 'const {ProviderEventSchema}=require("@getpaseo/plugin/server/provider");
+    const item={id:"i",type:"tool_call",callId:"c",name:"read",status:"completed",error:null,
+      detail:{type:"read",filePath:"/a",content:"x",meta:{probe:1}},
+      metadata:{locale:"zh-CN",presentationMeta:{lines:[{number:1,text:"a"}]}}};
+    const p=ProviderEventSchema.parse({type:"timeline.item",sessionId:"s",item});
+    console.log(Object.keys(p.item.detail), p.item.metadata);'
+  # → [ 'type', 'filePath', 'content' ] { locale: 'zh-CN', presentationMeta: { … } }
+  ```
+  其余协议字段（`offset`/`filePaths`/`numMatches`/`webResults`/`code`…）照旧填在 detail 上，
+  Paseo 的原生行渲染不受影响。
 - **服务端**：`web_search` 读 `queries[]`（数组）而不是只读字符串。
 - **客户端**：新增共享样式常量模块（字号/行高/圆角/描边/内边距/颜色/折叠行数），
   各块不再各写一套。
 - **断言**：`index.client.tsx` 的 zod schema 与 `ToolCallData` 做**键集一致**断言；
-  meta 透传断言（构造带 meta 的 `tool/result`，断言 detail 里能读到）。
+  meta 透传断言（构造带 meta 的 `tool/result`，断言 **item 的 `metadata.presentationMeta`**
+  里能读到，并用 `ProviderEventSchema.parse` 真跑一遍确认过边界仍在）。
 
 ### Phase 1 · 行头与命令、diff（纯样式，风险最低）
 - 行头：固定 24px 单行、无 paddingVertical；摘要**去掉等宽**、13px/24；
@@ -64,6 +81,8 @@
 - 断言：样式常量快照（防止再漂移）。
 
 ### Phase 2 · meta 驱动的块
+- **数据来源**：一律读 **item 的 `metadata.presentationMeta`**（Phase 0 的 strip 说明；客户端在
+  `client/tool-call-data.ts` 里读，服务端在 `server/timeline.ts` 里写）。
 - **搜索（grep/glob）**：卡头统计「N 处匹配 · M 个文件」+ 复制；按文件分组的粗体路径 + 计数；
   匹配行 `行号: ` 前缀；折叠 **8 行**（头 4 + 「… 其余 N 行」+ 尾 4），同一按钮变「收起」。
   （DSH **不高亮**匹配子串，只弱化行号 —— 照做。）

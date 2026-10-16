@@ -18,6 +18,7 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { z } from "zod";
 import { InlineThinking } from "./client/inline-thinking";
+import { localeFromMetadata, setLocale } from "./client/locale";
 import { InlineToolCall } from "./client/tool-call";
 import { toolCallData } from "./client/tool-call-data";
 
@@ -47,21 +48,41 @@ export default function contribute(client: PluginClientContext) {
   client.addTimelineTransformer({
     id: "dsh-inline-tool",
     query: { itemType: "tool_call" },
-    transform: ({ item, phase }) => ({
-      items: [
-        {
-          type: "plugin",
-          kind: "dsh-tool",
-          version: 1,
-          data: { ...toolCallData(item, phase) },
-        },
-      ],
-    }),
+    transform: ({ item, phase }) => {
+      // The server half resolved the daemon's locale and put it on this item's
+      // `metadata` (`server/timeline.ts`: every tool-call item carries it, not
+      // just the first — React never re-renders a row that already transformed,
+      // so a hint on one row only would be a hint nobody sees). Adopt it here,
+      // before mapping, because every lookup below reads the locale at call
+      // time.
+      //
+      // Only a tool-call item can carry this hint: `metadata` is the protocol's
+      // one free-form passthrough, and the reasoning and assistant schemas are
+      // `.strip()`ed with no such field. So a session that opens with thinking
+      // text or an assistant message renders those rows in the client's default
+      // (`zh-CN`) until the first tool call arrives, and rows already on screen
+      // keep the locale they were built with. That is a protocol limit, not a
+      // bug — there is nowhere on those items to put the hint.
+      setLocale(localeFromMetadata(item.metadata));
+      return {
+        items: [
+          {
+            type: "plugin",
+            kind: "dsh-tool",
+            version: 1,
+            data: { ...toolCallData(item, phase) },
+          },
+        ],
+      };
+    },
   });
 
   client.addTimelineRenderer({
     kind: "dsh-tool",
     version: 1,
+    // The schema's top-level key set is asserted against `ToolCallData` by
+    // `harness/tool-call-check.cjs`: Paseo strips a key the schema does not
+    // declare, and the component then silently loses a block.
     schema: z.object({
       name: z.string(),
       label: z.string(),
@@ -77,6 +98,66 @@ export default function contribute(client: PluginClientContext) {
       failed: z.boolean(),
       titled: z.boolean(),
       hasDetail: z.boolean(),
+      // DSH's block dispatch: terminal/diff/read/image/search/web/details. The
+      // image block is a later phase; `read_image` lands in `generic` for now.
+      kind: z.enum(["terminal", "diff", "read", "search", "web", "generic"]),
+      search: z
+        .object({
+          shape: z.enum(["matches", "paths"]),
+          files: z.array(
+            z.object({
+              path: z.string(),
+              matches: z.array(z.object({ lineNumber: z.number(), line: z.string() })),
+              count: z.number(),
+            }),
+          ),
+          paths: z.array(z.string()),
+          shown: z.number(),
+          total: z.number(),
+          truncated: z.boolean(),
+          text: z.string(),
+        })
+        .nullable(),
+      read: z
+        .object({
+          path: z.string(),
+          lang: z.string(),
+          lines: z.array(z.object({ number: z.number(), text: z.string() })),
+          totalLines: z.number(),
+          text: z.string(),
+        })
+        .nullable(),
+      diffBlock: z
+        .object({
+          rows: z.array(
+            z.object({
+              kind: z.enum(["path", "hunk", "gap", "add", "del", "context"]),
+              text: z.string(),
+            }),
+          ),
+          body: z.string(),
+          operation: z.enum(["create", "update", ""]),
+          path: z.string(),
+        })
+        .nullable(),
+      web: z
+        .object({
+          shape: z.enum(["search", "fetch"]),
+          sources: z.array(
+            z.object({
+              url: z.string(),
+              title: z.string(),
+              label: z.string(),
+              snippet: z.string(),
+              publishedAt: z.string(),
+            }),
+          ),
+          answer: z.string(),
+          url: z.string(),
+          statusCode: z.number().nullable(),
+          truncated: z.boolean(),
+        })
+        .nullable(),
     }),
     Component: InlineToolCall,
   });

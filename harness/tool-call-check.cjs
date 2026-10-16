@@ -7,22 +7,36 @@
  * layer, matching this repo's rule that the UI is not a trustworthy oracle.
  *
  * Run (from paseo-plugin):
- *   npx tsc client/tool-call-data.ts \
+ *   npx tsc client/tool-call-data.ts client/tokens.ts \
  *     --outDir .dbg --rootDir . --module commonjs --moduleResolution node \
  *     --target ES2022 --skipLibCheck
  *   echo '{"type":"commonjs"}' > .dbg/package.json
  *   cp ../harness/tool-call-check.cjs .dbg/
  *   cd .dbg && node tool-call-check.cjs
  *
- * Only the pure module is compiled: the React renderer imports the host
- * runtime, which plain `node` resolution cannot see.
+ * Only the pure modules are compiled: the React renderer imports the host
+ * runtime, which plain `node` resolution cannot see. `tokens.ts` comes along
+ * because `diffStat()` reading the generated diff body is exactly the claim
+ * being checked.
  */
 "use strict";
 
 const fs = require("node:fs");
 const path = require("node:path");
 
-const { toolCallData, toolIcon, toolLabel } = require("./client/tool-call-data.js");
+const {
+  allBlockCopy,
+  blockCopy,
+  contentLines,
+  diffHunks,
+  diffOps,
+  linkLabel,
+  toolCallData,
+  toolIcon,
+  toolLabel,
+} = require("./client/tool-call-data.js");
+const { diffStat } = require("./client/tokens.js");
+const { setLocale } = require("./client/locale.js");
 
 let passed = 0;
 let failed = 0;
@@ -116,7 +130,7 @@ console.log("shell");
   );
   equal("summary is the command", shell.summary, "npm test");
   equal("body is the output", shell.body, "ok\nok2");
-  equal("label", shell.label, "命令");
+  equal("label", shell.label, "运行命令");
   equal("icon", shell.icon, "SquareTerminal");
   check("not a diff", shell.diff === false);
 }
@@ -196,7 +210,7 @@ console.log("limits");
 
 console.log("labels");
 {
-  equal("known tool label", toolLabel("bash"), "命令");
+  equal("known tool label", toolLabel("bash"), "运行命令");
   equal("unknown tool keeps its name", toolLabel("frobnicate"), "frobnicate");
 }
 
@@ -438,6 +452,744 @@ console.log("the title is not repeated when the block carries it");
   equal("a description-less row is not", bare.titled, false);
   equal("its title is the subject", bare.summary, '{"action":"complete"}');
   check("and the block carries the same subject in full", bare.headline.includes("\n"), JSON.stringify(bare.headline));
+}
+
+console.log("the block kind is explicit (DSH's own dispatch)");
+{
+  // The renderer used to guess "this is a shell row" from the absence of a diff
+  // and a code flag plus the body caption. `kind` replaces that guess, so a row
+  // that changes shape without changing caption can no longer pick the wrong
+  // block — and a caption that changes language cannot either.
+  const cases = [
+    ["bash", { type: "shell", command: "ls" }, "terminal"],
+    ["pwsh", { type: "shell", command: "ls" }, "terminal"],
+    ["read", { type: "read", filePath: "/a.ts" }, "read"],
+    ["edit", { type: "edit", filePath: "/a.ts" }, "diff"],
+    ["write", { type: "write", filePath: "/a.ts" }, "diff"],
+    ["grep", { type: "search", toolName: "grep", query: "x" }, "search"],
+    ["glob", { type: "search", toolName: "glob", query: "x" }, "search"],
+    ["web_search", { type: "search", toolName: "web_search", query: "x" }, "web"],
+    ["web_fetch", { type: "fetch", url: "https://x" }, "web"],
+    ["subagent", { type: "sub_agent" }, "generic"],
+    ["exit_plan_mode", { type: "plan" }, "generic"],
+    ["todo_write", { type: "plain_text" }, "generic"],
+    ["mcp__paseo__list_workspaces", { type: "unknown", input: {} }, "generic"],
+  ];
+  for (const [name, detail, expected] of cases) {
+    equal(
+      `${name} -> ${expected}`,
+      toolCallData({ name, status: "completed", detail }, "complete").kind,
+      expected,
+    );
+  }
+  // An older item may not carry `toolName`; the item's own name answers then.
+  equal(
+    "a search detail with no toolName is still a file search",
+    toolCallData(
+      { name: "grep", status: "completed", detail: { type: "search", query: "x" } },
+      "complete",
+    ).kind,
+    "search",
+  );
+  // The old guess required a non-empty command; the explicit field does not.
+  equal(
+    "a shell row with no command is still the terminal block",
+    toolCallData(
+      { name: "bash", status: "completed", detail: { type: "shell", command: "", output: "boom" } },
+      "complete",
+    ).kind,
+    "terminal",
+  );
+}
+
+console.log("grep: matches grouped by file, with the tool's own totals");
+{
+  const files = [
+    {
+      path: "client/newest.ts",
+      matches: [
+        { lineNumber: 42, line: "  const handle = persistence.handle;" },
+        { lineNumber: 88, line: "  if (handle === undefined) return;" },
+      ],
+    },
+    {
+      path: "server/session.ts",
+      matches: [{ lineNumber: 563, line: "  // persistence handle names a DSH session" }],
+    },
+  ];
+  const grep = toolCallData(
+    {
+      name: "grep",
+      status: "completed",
+      detail: {
+        type: "search",
+        toolName: "grep",
+        query: "handle",
+        content: "raw result text",
+      },
+      metadata: {
+        presentationMeta: { shape: "matches", total: 12, truncated: true, files }
+      },
+    },
+    "complete",
+  );
+  check("the grep card exists at all", grep.search !== null);
+  equal("kind", grep.kind, "search");
+  equal("shape", grep.search?.shape, "matches");
+  equal("one group per file", grep.search?.files.length, 2);
+  equal("the first group's path", grep.search?.files[0].path, "client/newest.ts");
+  equal("the first group's count", grep.search?.files[0].count, 2);
+  equal("the second group's count", grep.search?.files[1].count, 1);
+  equal("a match keeps its line number", grep.search?.files[0].matches[0].lineNumber, 42);
+  equal("and its line", grep.search?.files[0].matches[0].line, "  const handle = persistence.handle;");
+  equal("shown is the retained match count, not the folded row count", grep.search?.shown, 3);
+  equal("total is the pre-cap count", grep.search?.total, 12);
+  equal("truncated survives", grep.search?.truncated, true);
+  equal(
+    "the copy text is DSH's (path, then `line: text`, blank line between files)",
+    grep.search?.text,
+    "client/newest.ts\n42:   const handle = persistence.handle;\n88:   if (handle === undefined) return;\n\nserver/session.ts\n563:   // persistence handle names a DSH session",
+  );
+  equal(
+    "the banner reads shown / total / files",
+    blockCopy().matchesSummary(
+      grep.search?.shown,
+      grep.search?.total,
+      grep.search?.files.length,
+      grep.search?.truncated,
+    ),
+    "显示 3 / 共 12 处匹配 · 2 个文件",
+  );
+
+  const whole = toolCallData(
+    {
+      name: "grep",
+      status: "completed",
+      detail: {
+        type: "search",
+        toolName: "grep",
+        query: "handle",
+        content: "raw",
+      },
+      metadata: {
+        presentationMeta: { shape: "matches", total: 3, truncated: false, files }
+      },
+    },
+    "complete",
+  );
+  equal("an untruncated banner drops the total clause", whole.search?.truncated, false);
+  equal(
+    "and reads as a plain count",
+    blockCopy().matchesSummary(3, 3, 2, false),
+    "3 处匹配 · 2 个文件",
+  );
+
+  const emptyGroup = toolCallData(
+    {
+      name: "grep",
+      status: "completed",
+      detail: {
+        type: "search",
+        toolName: "grep",
+        query: "nothing",
+        content: "raw",
+      },
+      metadata: {
+        presentationMeta: { shape: "matches", total: 0, truncated: false, files: [{ path: "a.ts", matches: [] }] }
+      },
+    },
+    "complete",
+  );
+  equal("a file group with no matches is still a group", emptyGroup.search?.files[0].count, 0);
+  equal("and shown is zero", emptyGroup.search?.shown, 0);
+}
+
+console.log("glob: a flat path list");
+{
+  const glob = toolCallData(
+    {
+      name: "glob",
+      status: "completed",
+      detail: {
+        type: "search",
+        toolName: "glob",
+        query: "**/*.ts",
+      },
+      metadata: {
+        presentationMeta: { shape: "paths", paths: ["a.ts", "b/c.ts"], total: 9, truncated: true }
+      },
+    },
+    "complete",
+  );
+  check("the glob card exists at all", glob.search !== null);
+  equal("kind", glob.kind, "search");
+  equal("shape", glob.search?.shape, "paths");
+  equal("the paths", JSON.stringify(glob.search?.paths), '["a.ts","b/c.ts"]');
+  equal("shown is the path count", glob.search?.shown, 2);
+  equal("total is the pre-cap count", glob.search?.total, 9);
+  equal("the copy text is one path per line", glob.search?.text, "a.ts\nb/c.ts");
+  equal("the truncated banner", blockCopy().pathsSummary(2, 9, true), "显示 2 / 共 9 个路径");
+  equal("the plain banner", blockCopy().pathsSummary(2, 2, false), "2 个路径");
+}
+
+console.log("an unrecognized meta falls back to the plain text row");
+{
+  // `失败要响亮`: a shape the parser does not know must not produce a blank card.
+  // The row keeps the kind it dispatches to (so the block is still the right
+  // one) but carries no structured payload, and the renderer draws the body it
+  // drew before this phase.
+  const cases = [
+    ["grep without a total", { type: "search", toolName: "grep", content: "raw" }, { shape: "matches", files: [] }],
+    [
+      "grep with a non-numeric line number",
+      { type: "search", toolName: "grep", content: "raw" },
+      { shape: "matches", total: 1, files: [{ path: "a", matches: [{ lineNumber: "42", line: "x" }] }] },
+    ],
+    ["grep with an unknown shape", { type: "search", toolName: "grep", content: "raw" }, { shape: "lines", total: 1 }],
+    ["glob with a non-string path", { type: "search", toolName: "glob", content: "raw" }, { shape: "paths", paths: [1], total: 1 }],
+    ["read without lines", { type: "read", filePath: "/a.ts", content: "raw" }, { totalLines: 3, lang: "typescript" }],
+    ["read with an incomplete line", { type: "read", filePath: "/a.ts", content: "raw" }, { totalLines: 3, lines: [{ number: 1 }] }],
+    ["write with an incomplete diff", { type: "write", filePath: "/a.ts", content: "raw" }, { operation: "update", diffs: [{ path: "/a.ts", oldText: "a" }] }],
+    ["edit with diffs that are not a list", { type: "edit", filePath: "/a.ts", unifiedDiff: "@@\n-a\n+b" }, { diffs: "nope" }, "@@\n-a\n+b"],
+    ["web_search with a non-array sources", { type: "search", toolName: "web_search", content: "raw" }, { sources: {}, truncated: false }],
+    ["web_fetch without a status code", { type: "fetch", url: "https://x", result: "raw" }, { url: "https://x", truncated: false }],
+    ["a non-object meta", { type: "read", filePath: "/a.ts", content: "raw" }, "nope"],
+  ];
+  for (const [label, detail, meta, expectedBody] of cases) {
+    const data = toolCallData(
+      { name: "grep", status: "completed", detail, metadata: { presentationMeta: meta } },
+      "complete",
+    );
+    const payload = data.search ?? data.read ?? data.diffBlock ?? data.web;
+    check(`${label}: the structured payload is refused`, payload === null, JSON.stringify(payload));
+    check(
+      `${label}: the plain body survives`,
+      data.body === (expectedBody ?? "raw"),
+      JSON.stringify(data.body),
+    );
+    check(`${label}: and the row still expands`, data.hasDetail === true);
+  }
+
+  // No meta at all is the normal case for a failed tool and for `bash`.
+  const noMeta = toolCallData(
+    { name: "read", status: "completed", detail: { type: "read", filePath: "/a.ts", content: "raw" } },
+    "complete",
+  );
+  check("no meta: no read card", noMeta.read === null);
+  equal("but the content is still the body", noMeta.body, "raw");
+  equal("and the kind is still read", noMeta.kind, "read");
+
+  // Where the meta is read from, stated both ways. The plugin subprocess parses
+  // every outgoing event with `ProviderEventSchema.parse`, whose
+  // `toolCallDetailSchema` members are all `.strip()` — a `detail.meta` is
+  // deleted before the client ever sees it, which is why the field lives on the
+  // item's `metadata`. `timeline-check.cjs` runs that parse for real.
+  const readMeta = {
+    path: "client/newest.ts",
+    offset: 41,
+    lang: "typescript",
+    totalLines: 120,
+    lines: [{ number: 41, text: "export function noteRender(agentId, at) {" }],
+  };
+  const onDetail = toolCallData(
+    {
+      name: "read",
+      status: "completed",
+      detail: { type: "read", filePath: "/abs/a.ts", content: "raw", meta: readMeta },
+    },
+    "complete",
+  );
+  check(
+    "a detail-level meta is ignored (the schema strips it in transit)",
+    onDetail.read === null,
+    JSON.stringify(onDetail.read),
+  );
+  const onMetadata = toolCallData(
+    {
+      name: "read",
+      status: "completed",
+      detail: { type: "read", filePath: "/abs/a.ts", content: "raw" },
+      metadata: { locale: "zh-CN", presentationMeta: readMeta },
+    },
+    "complete",
+  );
+  check(
+    "the item's metadata is where the card reads it from",
+    onMetadata.read !== null && onMetadata.read.lang === "typescript",
+    JSON.stringify(onMetadata.read),
+  );
+  check(
+    "and the rest of the metadata is untouched by it",
+    onMetadata.read.path === "client/newest.ts",
+    JSON.stringify(onMetadata.read),
+  );
+}
+
+console.log("read: numbered lines and the language");
+{
+  const read = toolCallData(
+    {
+      name: "read",
+      status: "completed",
+      detail: {
+        type: "read",
+        filePath: "/abs/a.ts",
+        content: "raw",
+      },
+      metadata: {
+        presentationMeta: {
+          path: "client/newest.ts",
+          offset: 41,
+          lang: "typescript",
+          totalLines: 120,
+          lines: [
+            { number: 41, text: "export function noteRender(agentId, at) {" },
+            { number: 42, text: "  const handle = persistence.handle;" },
+          ],
+        }
+      },
+    },
+    "complete",
+  );
+  check("the read card exists at all", read.read !== null);
+  equal("kind", read.kind, "read");
+  equal("the card's path is the meta's own", read.read?.path, "client/newest.ts");
+  equal("the language", read.read?.lang, "typescript");
+  equal("the line count", read.read?.lines.length, 2);
+  equal("the first number", read.read?.lines[0].number, 41);
+  equal("the first text", read.read?.lines[0].text, "export function noteRender(agentId, at) {");
+  equal("the file's total", read.read?.totalLines, 120);
+  check("the card is windowed (DSH shows `显示 X / Y 行`)", read.read?.lines.length < read.read?.totalLines);
+  equal(
+    "the copy text is the lines",
+    read.read?.text,
+    "export function noteRender(agentId, at) {\n  const handle = persistence.handle;",
+  );
+  equal("the window copy", blockCopy().window(2, 120), "显示 2 / 120 行");
+
+  const noPath = toolCallData(
+    {
+      name: "read",
+      status: "completed",
+      detail: { type: "read", filePath: "/abs/a.ts", content: "raw" },
+      metadata: { presentationMeta: { totalLines: 1, lines: [{ number: 1, text: "x" }] } },
+    },
+    "complete",
+  );
+  equal("without meta.path the protocol path is used", noPath.read?.path, "/abs/a.ts");
+  equal("a missing lang is empty, not fabricated", noPath.read?.lang, "");
+}
+
+console.log("edit: a real hunk diff from meta.diffs");
+{
+  const edit = toolCallData(
+    {
+      name: "edit",
+      status: "completed",
+      detail: {
+        type: "edit",
+        filePath: "/a.ts",
+      },
+      metadata: {
+        presentationMeta: { diffs: [{ path: "/a.ts", oldText: "a\nb\nc\nd", newText: "a\nb\nX\nd" }] }
+      },
+    },
+    "complete",
+  );
+  check("the edit card exists at all", edit.diffBlock !== null);
+  equal("kind", edit.kind, "diff");
+  equal("operation is empty for an edit", edit.diffBlock?.operation, "");
+  equal("the card's path", edit.diffBlock?.path, "/a.ts");
+  equal(
+    "rows: a hunk header, then context/remove/add with DSH's own line ordering",
+    JSON.stringify(edit.diffBlock?.rows),
+    JSON.stringify([
+      { kind: "hunk", text: "@@ -1,4 +1,4 @@" },
+      { kind: "context", text: "a" },
+      { kind: "context", text: "b" },
+      { kind: "del", text: "c" },
+      { kind: "add", text: "X" },
+      { kind: "context", text: "d" },
+    ]),
+  );
+  equal(
+    "the body is a unified diff",
+    edit.body,
+    "--- /a.ts\n+++ /a.ts\n@@ -1,4 +1,4 @@\n a\n b\n-c\n+X\n d",
+  );
+  equal("the +A -R stat reads straight off that body", JSON.stringify(diffStat(edit)), '{"added":1,"removed":1}');
+
+  const oldLines = Array.from({ length: 20 }, (_, index) => `line ${index + 1}`);
+  const newLines = [...oldLines];
+  newLines[0] = "zero";
+  newLines[19] = "nineteen";
+  const multi = toolCallData(
+    {
+      name: "edit",
+      status: "completed",
+      detail: {
+        type: "edit",
+        filePath: "/a.ts",
+      },
+      metadata: {
+        presentationMeta: { diffs: [{ path: "/a.ts", oldText: oldLines.join("\n"), newText: newLines.join("\n") }] }
+      },
+    },
+    "complete",
+  );
+  const hunks = multi.diffBlock?.rows.filter((row) => row.kind === "hunk").map((row) => row.text);
+  equal("two distant changes make two hunks", JSON.stringify(hunks), '["@@ -1,4 +1,4 @@","@@ -17,4 +17,4 @@"]');
+  check(
+    "each hunk keeps exactly three context lines at its inner edge",
+    multi.diffBlock?.rows.filter((row) => row.kind === "context").length === 3 + 3,
+    String(multi.diffBlock?.rows.filter((row) => row.kind === "context").length),
+  );
+  equal("and the stat counts both", JSON.stringify(diffStat(multi)), '{"added":2,"removed":2}');
+
+  const twoFiles = toolCallData(
+    {
+      name: "edit",
+      status: "completed",
+      detail: {
+        type: "edit",
+        filePath: "/a.ts",
+      },
+      metadata: {
+        presentationMeta: {
+          diffs: [
+            { path: "/a.ts", oldText: "a", newText: "b" },
+            { path: "/b.ts", oldText: "c", newText: "d" },
+          ],
+        }
+      },
+    },
+    "complete",
+  );
+  equal(
+    "a second file gets its own path row",
+    JSON.stringify(twoFiles.diffBlock?.rows.filter((row) => row.kind === "path").map((row) => row.text)),
+    '["/a.ts","/b.ts"]',
+  );
+  check(
+    "and the body names both",
+    twoFiles.body.includes("--- /a.ts") && twoFiles.body.includes("+++ /b.ts"),
+    twoFiles.body,
+  );
+
+  const sameFileTwice = toolCallData(
+    {
+      name: "edit",
+      status: "completed",
+      detail: {
+        type: "edit",
+        filePath: "/a.ts",
+      },
+      metadata: {
+        presentationMeta: {
+          diffs: [
+            { path: "/a.ts", oldText: "a", newText: "b" },
+            { path: "/a.ts", oldText: "c", newText: "d" },
+          ],
+        }
+      },
+    },
+    "complete",
+  );
+  check(
+    "two hunks of one file are separated by DSH's gap row, not a second path row",
+    sameFileTwice.diffBlock?.rows.some((row) => row.kind === "gap" && row.text === "⋯") &&
+      !sameFileTwice.diffBlock?.rows.some((row) => row.kind === "path"),
+  );
+}
+
+console.log("write: create and update are told apart");
+{
+  const created = toolCallData(
+    {
+      name: "write",
+      status: "completed",
+      detail: {
+        type: "write",
+        filePath: "/new.ts",
+        content: "one\ntwo\n",
+      },
+      metadata: {
+        presentationMeta: { operation: "create", diffs: [] }
+      },
+    },
+    "complete",
+  );
+  check("the create card exists at all (a write with empty diffs uses its content)", created.diffBlock !== null);
+  equal("kind", created.kind, "diff");
+  equal("operation", created.diffBlock?.operation, "create");
+  equal(
+    "a create is all additions (DSH's argument-derived whole-file diff)",
+    JSON.stringify(created.diffBlock?.rows),
+    JSON.stringify([
+      { kind: "hunk", text: "@@ -0,0 +1,2 @@" },
+      { kind: "add", text: "one" },
+      { kind: "add", text: "two" },
+    ]),
+  );
+  equal("the body", created.body, "--- /new.ts\n+++ /new.ts\n@@ -0,0 +1,2 @@\n+one\n+two");
+  equal("the stat is +2 -0, so the row's suffix now appears", JSON.stringify(diffStat(created)), '{"added":2,"removed":0}');
+  equal("the create label", blockCopy().create, "新建");
+
+  const updated = toolCallData(
+    {
+      name: "write",
+      status: "completed",
+      detail: {
+        type: "write",
+        filePath: "/a.ts",
+        content: "a\nc",
+      },
+      metadata: {
+        presentationMeta: { operation: "update", diffs: [{ path: "/a.ts", oldText: "a\nb", newText: "a\nc" }] }
+      },
+    },
+    "complete",
+  );
+  equal("operation", updated.diffBlock?.operation, "update");
+  equal("the body", updated.body, "--- /a.ts\n+++ /a.ts\n@@ -1,2 +1,2 @@\n a\n-b\n+c");
+  equal("the stat", JSON.stringify(diffStat(updated)), '{"added":1,"removed":1}');
+  equal("the update label", blockCopy().update, "更新");
+}
+
+console.log("web: citations and the fetch status");
+{
+  const search = toolCallData(
+    {
+      name: "web_search",
+      status: "completed",
+      detail: {
+        type: "search",
+        toolName: "web_search",
+        query: "paseo plugin api",
+      },
+      metadata: {
+        presentationMeta: {
+          truncated: true,
+          sources: [
+            { url: "https://docs.example/a", title: "Paseo Plugin API" },
+            { url: "https://docs.example/b" },
+          ],
+        }
+      },
+    },
+    "complete",
+  );
+  check("the web search card exists at all", search.web !== null);
+  equal("kind", search.kind, "web");
+  equal("shape", search.web?.shape, "search");
+  equal("one entry per source", search.web?.sources.length, 2);
+  equal("the title is the link text", search.web?.sources[0].label, "Paseo Plugin API");
+  equal("an untitled source falls back to its hostname", search.web?.sources[1].label, "docs.example");
+  equal("truncated survives", search.web?.truncated, true);
+  equal("the no-results copy", blockCopy().noResults, "无结果");
+  equal("the truncation note", blockCopy().sourcesTruncated, "来源列表已截断");
+
+  // The current DSH build sends only url/title (72 sources sampled, 0 with a
+  // snippet). Optional fields are carried when present and left empty when not,
+  // so a newer tool's snippet shows up rather than being invented or dropped.
+  const rich = toolCallData(
+    {
+      name: "web_search",
+      status: "completed",
+      detail: {
+        type: "search",
+        toolName: "web_search",
+        query: "q",
+      },
+      metadata: {
+        presentationMeta: {
+          truncated: false,
+          answer: "The answer.",
+          sources: [{ url: "https://a.example", title: "A", snippet: "snip", publishedAt: "2026-03-02" }],
+        }
+      },
+    },
+    "complete",
+  );
+  equal("an answer survives", rich.web?.answer, "The answer.");
+  equal("a snippet survives", rich.web?.sources[0].snippet, "snip");
+  equal("and a date survives", rich.web?.sources[0].publishedAt, "2026-03-02");
+  equal("a source without one has an empty snippet, not a fabricated one", search.web?.sources[0].snippet, "");
+  equal("and an empty date", search.web?.sources[0].publishedAt, "");
+  equal("and no answer", search.web?.answer, "");
+
+  const fetch = toolCallData(
+    {
+      name: "web_fetch",
+      status: "completed",
+      detail: {
+        type: "fetch",
+        url: "https://x/y",
+        result: "raw",
+      },
+      metadata: {
+        presentationMeta: { url: "https://x/y", statusCode: 200, truncated: true }
+      },
+    },
+    "complete",
+  );
+  check("the fetch card exists at all", fetch.web !== null);
+  equal("kind", fetch.kind, "web");
+  equal("shape", fetch.web?.shape, "fetch");
+  equal("the final url (after redirects)", fetch.web?.url, "https://x/y");
+  equal("the status code", fetch.web?.statusCode, 200);
+  equal("the http label", blockCopy().http, "HTTP");
+  equal("the content note", blockCopy().contentTruncated, "内容已截断");
+  equal("a fetch card has no sources", fetch.web?.sources.length, 0);
+}
+
+console.log("link labels (DSH's linkLabel)");
+{
+  equal("a title wins", linkLabel("https://x/y", "T"), "T");
+  equal("the hostname is the fallback", linkLabel("https://docs.example/a?b=1", ""), "docs.example");
+  equal("a port is dropped", linkLabel("http://localhost:8080/x", ""), "localhost");
+  equal("credentials are dropped", linkLabel("https://user:pw@x.example/y", ""), "x.example");
+  equal("a non-URL keeps its text", linkLabel("not a url", ""), "not a url");
+}
+
+console.log("the hunk builder's own rules");
+{
+  equal("contentLines drops one trailing newline", JSON.stringify(contentLines("a\nb\n")), '["a","b"]');
+  equal("an interior blank line survives", JSON.stringify(contentLines("a\n\nb")), '["a","","b"]');
+  equal("empty text is no lines", JSON.stringify(contentLines("")), "[]");
+  equal(
+    "the edit script keeps the lines both sides share as context",
+    JSON.stringify(diffOps("a\nb\nc", "a\nX\nc").map((op) => `${op.kind}:${op.text}`)),
+    '["context:a","del:b","add:X","context:c"]',
+  );
+  equal(
+    "a whole-file create is additions only",
+    JSON.stringify(diffOps("", "one\ntwo").map((op) => `${op.kind}:${op.text}`)),
+    '["add:one","add:two"]',
+  );
+  equal("no changes is no hunks", diffHunks(diffOps("a\nb", "a\nb")).length, 0);
+
+  const one = toolCallData(
+    {
+      name: "edit",
+      status: "completed",
+      detail: { type: "edit", filePath: "/a.ts" },
+      metadata: { presentationMeta: { diffs: [{ path: "/a.ts", oldText: "a", newText: "b" }] } },
+    },
+    "complete",
+  );
+  equal(
+    "a one-line hunk elides the `,1` the way unified diffs do",
+    one.diffBlock?.rows[0].text,
+    "@@ -1 +1 @@",
+  );
+}
+
+console.log("the block copy is localized and complete");
+{
+  equal("zh copy", blockCopy().copy, "复制");
+  equal("zh copied", blockCopy().copied, "复制成功");
+  equal("zh collapse", blockCopy().collapse, "收起");
+  equal("zh expandRest", blockCopy().expandRest(3), "… 其余 3 行");
+  equal("zh expandAria", blockCopy().expandAria(3), "展开其余 3 行");
+  equal("zh collapseAria", blockCopy().collapseAria, "收起内容");
+  equal("zh matches", blockCopy().matchesSummary(12, 12, 3, false), "12 处匹配 · 3 个文件");
+  equal(
+    "zh matches truncated",
+    blockCopy().matchesSummary(3, 12, 3, true),
+    "显示 3 / 共 12 处匹配 · 3 个文件",
+  );
+
+  setLocale("en");
+  equal("en copy", blockCopy().copy, "Copy");
+  equal("en expandRest", blockCopy().expandRest(3), "… 3 more lines");
+  equal("en matches", blockCopy().matchesSummary(12, 12, 3, false), "12 matches · 3 files");
+  equal(
+    "en matches truncated",
+    blockCopy().matchesSummary(3, 12, 3, true),
+    "Showing 3 of 12 matches · 3 files",
+  );
+  equal("en paths truncated", blockCopy().pathsSummary(2, 9, true), "Showing 2 of 9 paths");
+  equal("en window", blockCopy().window(2, 120), "Showing 2 of 120 lines");
+  equal("en content note", blockCopy().contentTruncated, "Content truncated");
+  setLocale(undefined);
+
+  const tables = allBlockCopy();
+  equal(
+    "both locales define the same block-copy keys",
+    Object.keys(tables.en).sort(),
+    Object.keys(tables["zh-CN"]).sort(),
+  );
+  equal("and the client is back to zh-CN", blockCopy().copy, "复制");
+}
+
+console.log("the meta key is the same on both sides of the plugin");
+{
+  // The server half and the client half are separate builds and neither can
+  // import the other's constant, so the one thing they must agree on is the
+  // string. A rename on one side would leave every structured block silently
+  // falling back to plain text — the exact failure this phase exists to avoid.
+  const readKey = (candidates, label) => {
+    const file = candidates.find((candidate) => fs.existsSync(candidate));
+    check(`${label} is readable`, file !== undefined, candidates.join(", "));
+    if (file === undefined) return null;
+    const match = /PRESENTATION_META_KEY[^=]*=\s*"([^"]+)"/.exec(fs.readFileSync(file, "utf8"));
+    check(`${label} declares the key as a literal`, match !== null);
+    return match === null ? null : match[1];
+  };
+  const serverKey = readKey(
+    [path.join(__dirname, "..", "server", "timeline.ts"), path.join(__dirname, "server", "timeline.ts")],
+    "server/timeline.ts",
+  );
+  const clientKey = readKey(
+    [
+      path.join(__dirname, "..", "client", "tool-call-data.ts"),
+      path.join(__dirname, "client", "tool-call-data.ts"),
+    ],
+    "client/tool-call-data.ts",
+  );
+  equal("both halves name the same metadata key", clientKey, serverKey);
+  equal("and it is the one the tests feed in", serverKey, "presentationMeta");
+}
+
+console.log("the tool transformer adopts the item's locale before it maps");
+{
+  // The relay is one line in `index.client.tsx`, and the file cannot be
+  // `require`d offline (it pulls in the renderers, which import the host
+  // runtime). So the wiring is read out of the source, and the *behaviour* of
+  // the two functions it calls is asserted in `locale-check.cjs`
+  // ("a tool row adopts the locale its item carries"). Together they cover the
+  // line: remove it and this fails, break what it calls and that fails.
+  const candidates = [
+    path.join(__dirname, "..", "index.client.tsx"),
+    path.join(__dirname, "index.client.tsx"),
+  ];
+  const sourcePath = candidates.find((candidate) => fs.existsSync(candidate));
+  check("index.client.tsx is readable", sourcePath !== undefined, candidates.join(", "));
+  const source = sourcePath === undefined ? "" : fs.readFileSync(sourcePath, "utf8");
+
+  const relay = source.search(/setLocale\(localeFromMetadata\(item\.metadata\)\)/);
+  check(
+    "the transformer relays metadata.locale with setLocale(localeFromMetadata(...))",
+    relay >= 0,
+  );
+  const toolTransformer = source.indexOf('id: "dsh-inline-tool"');
+  const thinkingTransformer = source.indexOf('id: "dsh-inline-thinking"');
+  const mapping = source.indexOf("toolCallData(item, phase)", relay < 0 ? 0 : relay);
+  check(
+    "and it sits inside the tool transformer",
+    toolTransformer >= 0 && relay > toolTransformer,
+    `transformer at ${toolTransformer}, relay at ${relay}`,
+  );
+  check(
+    "before the item is mapped",
+    relay >= 0 && mapping > relay,
+    `relay at ${relay}, toolCallData at ${mapping}`,
+  );
+  check(
+    "the reasoning transformer is left alone (its item has no metadata to relay)",
+    thinkingTransformer >= 0 && toolTransformer > thinkingTransformer && !/setLocale/.test(source.slice(thinkingTransformer, toolTransformer)),
+  );
 }
 
 console.log("the renderer's schema and ToolCallData cannot drift apart");

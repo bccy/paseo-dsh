@@ -65,6 +65,15 @@ export interface UiCopy {
     dismiss: string;
     implement: string;
   };
+  /**
+   * Titles for the two tools this half draws as a `plain_text` row.
+   *
+   * Both are DSH's own wording verbatim, from the `TOOL_TITLE_KEYS` table in
+   * `@deepseek-ai/dsh-client-ui-tool`: `todo_write` → `todo.rowTitle`,
+   * `ask_user_question` → `ask.rowTitle`. Everything else in DSH's `tool.title.*`
+   * table belongs to rows the *client* half draws, and lives in
+   * `client/locale.ts`.
+   */
   toolLabels: {
     updateTasks: string;
     askedUser: string;
@@ -99,8 +108,8 @@ const UI_COPY: Record<Locale, UiCopy> = {
       implement: "Implement",
     },
     toolLabels: {
-      updateTasks: "Update tasks",
-      askedUser: "Asked the user",
+      updateTasks: "Update to-do list",
+      askedUser: "Ask question",
     },
   },
   "zh-CN": {
@@ -126,8 +135,8 @@ const UI_COPY: Record<Locale, UiCopy> = {
       implement: "实施",
     },
     toolLabels: {
-      updateTasks: "更新任务",
-      askedUser: "已询问用户",
+      updateTasks: "更新任务清单",
+      askedUser: "提问",
     },
   },
 };

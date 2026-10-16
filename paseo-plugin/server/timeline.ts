@@ -12,7 +12,7 @@ import type {
   ProviderToolCallDetail,
 } from "@getpaseo/plugin/server/provider";
 import type { JsonValue } from "./dsh-process";
-import { UI } from "./locale";
+import { LOCALE, UI } from "./locale";
 
 interface DshEvent {
   type: string;
@@ -64,25 +64,37 @@ function isStringArray(value: unknown): value is string[] {
 }
 
 /**
- * Paseo's tool detail, plus DSH's raw result metadata (`tool/result` → `data.meta`).
+ * Paseo's tool detail, as the protocol defines it.
  *
- * Paseo's detail union is closed and has no member for what DSH publishes there:
- * numbered `read` lines, hunk-level diffs, matches grouped by file, web sources,
- * the `write` operation. Those fields are what the whole rendering plan hangs on,
- * and inventing a parallel protocol shape for them would be exactly the mistake
- * this repo keeps warning about. So the raw meta travels verbatim under `meta`:
- * Paseo's wire validator checks the fields it knows and leaves unknown ones
- * alone, and the plugin's own renderer reads a detail as a plain record.
- *
- * The protocol fields that *do* exist are filled as well — see
- * {@link withPresentationMeta} — so Paseo's stock `read`/`search`/`fetch`
- * rendering keeps working off the same result.
+ * DSH's `presentationMeta` (`tool/result` → `data.meta`) is the only copy of the
+ * structured result there is: numbered `read` lines, hunk-level diffs, matches
+ * grouped by file, web sources, the `write` operation. It does **not** ride on
+ * this detail. The plugin subprocess runs every outgoing event through
+ * `ProviderEventSchema.parse(...)` (`@getpaseo/plugin/dist/server/provider.js`),
+ * and `toolCallDetailSchema`'s members are all `.strip()` — an unknown `detail.meta`
+ * is deleted at that boundary, silently. It travels on the item's own
+ * `metadata` instead (see {@link toolMetadata}), which is a `jsonObjectSchema`
+ * and survives the parse. The protocol fields that *do* exist are filled here as
+ * well — see {@link withPresentationMeta} — so Paseo's stock `read`/`search`/
+ * `fetch` rendering keeps working off the same result.
  */
-export type ToolDetail = ProviderToolCallDetail & { meta?: JsonValue };
+export type ToolDetail = ProviderToolCallDetail;
 
 /** One member of {@link ToolDetail}, for filling its protocol fields in place. */
-type ToolDetailOf<T extends ProviderToolCallDetail["type"]> =
-  Extract<ProviderToolCallDetail, { type: T }> & { meta?: JsonValue };
+type ToolDetailOf<T extends ProviderToolCallDetail["type"]> = Extract<
+  ProviderToolCallDetail,
+  { type: T }
+>;
+
+/**
+ * The `metadata` key DSH's raw result meta travels under.
+ *
+ * A literal rather than a shared import: the server half and the client half are
+ * compiled and shipped separately (the client bundle is platform-neutral and
+ * cannot import this file), so the one thing they must agree on is the string.
+ * `harness/tool-call-check.cjs` reads both sources and asserts they match.
+ */
+export const PRESENTATION_META_KEY = "presentationMeta";
 
 /** `meta.lines` of a DSH `read` result, or undefined for any other shape. */
 function metaLines(meta: Record<string, unknown>): Array<{ number: number; text: string }> | undefined {
@@ -165,26 +177,33 @@ function metaSources(meta: Record<string, unknown>): Array<{ title: string; url:
  *   1. Fill the protocol fields Paseo already defines for this kind of result —
  *      `offset`, `filePaths`, `numFiles`, `numMatches`, `truncated`, `mode`,
  *      `webResults`, `code` — so the stock row keeps rendering.
- *   2. Keep `meta` verbatim for everything the protocol cannot express (line
- *      numbers and `lang`, hunk diffs, grouped matches, sources' snippets).
+ *   2. Hand the raw meta back, for `metadata.presentationMeta` to carry: line
+ *      numbers and `lang`, hunk diffs, grouped matches, sources' snippets are
+ *      all things the closed detail union cannot express.
+ *
+ * It deliberately does **not** return the meta on the detail: `detail.meta` is
+ * stripped by `ProviderEventSchema.parse` before the event leaves this process
+ * (see {@link ToolDetail}), so a field written there never reaches the client.
  *
  * A meta whose shape does not match its tool is *reported*, never swallowed:
  * the row keeps the plain result text and loses only structure it never had. An
  * absent meta is the normal case for a failed tool and for DSH's `bash`, which
- * declares no `presentationMeta` at all — that is not a mismatch.
+ * declares no `presentationMeta` at all — that is not a mismatch. The verbatim
+ * meta still travels even when a shape did not match, so the client half — which
+ * owns the fallback — is the one that decides.
  */
 function withPresentationMeta(
   detail: ToolDetail,
   name: string,
   meta: unknown,
   warn: (line: string) => void,
-): ToolDetail {
-  if (meta === undefined || meta === null) return detail;
+): { detail: ToolDetail; presentationMeta: JsonValue | undefined } {
+  if (meta === undefined || meta === null) return { detail, presentationMeta: undefined };
   if (!isRecord(meta)) {
     warn(`meta: ${name} returned a non-object presentation meta (${typeof meta}); kept the plain result text`);
-    return detail;
+    return { detail, presentationMeta: undefined };
   }
-  const out: ToolDetail = { ...detail, meta: meta as JsonValue };
+  const out: ToolDetail = { ...detail };
   const unmatched = (expected: string): void => {
     warn(`meta: ${name} returned an unrecognized presentation meta (expected ${expected}); kept the plain result text`);
   };
@@ -277,23 +296,58 @@ function withPresentationMeta(
     default:
       // `shell` (DSH's bash declares no `presentationMeta`), `plan`,
       // `plain_text`, `sub_agent`: no protocol field to fill. The raw meta still
-      // rides along for a renderer that knows what to do with it.
+      // rides along on the item's metadata for a renderer that knows what to do
+      // with it.
       break;
   }
-  return out;
+  return { detail: out, presentationMeta: meta as JsonValue };
 }
 
 /**
  * Provider metadata for one tool call.
  *
- * DSH's bash tool requires a model-written `description` on every call, and
- * DSH's own UI titles the row with it rather than with the command. Paseo's
- * `shell` detail has no field for it, so it rides on the item's provider-owned
- * `metadata`, which the client reads back in `toolCallData`.
+ * Three entries, and every tool-call item carries the first two:
+ *
+ * - `description`: DSH's bash tool requires a model-written description on every
+ *   call, and DSH's own UI titles the row with it rather than with the command.
+ *   Paseo's `shell` detail has no field for it, so it rides here, and the client
+ *   reads it back in `toolCallData`.
+ * - `locale`: the language this process resolved (`server/locale.ts`). The
+ *   client half cannot resolve one for itself — the bundle is compiled for a
+ *   `neutral` platform with no `define`, so `process.env` is unreachable, and
+ *   the host app's own i18n is not a plugin export. `metadata` is the protocol's
+ *   one free-form provider-owned passthrough, so the resolved locale travels on
+ *   every row rather than being asked for again.
+ * - `presentationMeta`: DSH's raw `data.meta`, verbatim, on the completed row
+ *   only. It cannot live on `detail` (the schema strips unknown detail fields —
+ *   see {@link ToolDetail}); `metadata` is a `jsonObjectSchema` and crosses the
+ *   process boundary intact. The client half validates the shape and falls back
+ *   to the plain result text when it does not match.
+ *
+ * Every item, not just the first: the client adopts the locale while
+ * transforming a row, and React never re-renders a row that already
+ * transformed. A session whose only row arrived before the hint would keep the
+ * client's default for good, which is why a bare `{ locale }` is a *complete*
+ * metadata rather than something the caller may skip.
  */
-function toolMetadata(input: Record<string, unknown>): Record<string, JsonValue> | undefined {
+function toolMetadata(
+  input: Record<string, unknown>,
+  presentationMeta?: JsonValue,
+): Record<string, JsonValue> {
   const description = stringField(input, "description");
-  return description === undefined || description === "" ? undefined : { description };
+  return {
+    ...(description === undefined || description === "" ? {} : { description }),
+    locale: LOCALE,
+    ...(presentationMeta === undefined ? {} : { [PRESENTATION_META_KEY]: presentationMeta }),
+  };
+}
+
+/**
+ * The locale hint on its own, for a tool-call item that has no arguments to read
+ * a description from (a `/command` row) and no result meta yet.
+ */
+function localeMetadata(): Record<string, JsonValue> {
+  return { locale: LOCALE };
 }
 
 /**
@@ -403,6 +457,29 @@ function toolDetail(name: string, input: Record<string, unknown>, output?: strin
           : { description: stringField(input, "description") as string }),
         log: output ?? "",
       };
+    case "worktree_setup":
+      // Paseo's protocol *does* have a typed `worktree_setup` detail (its Codex
+      // provider emits one), and this is the one place that must not emit it.
+      //
+      // The client half replaces the drawing of every tool row, and its
+      // `toolCallData` switch has no case for that type: an unhandled type falls
+      // to a `default` that leaves the summary, headline and body empty, while
+      // the raw-argument fallback is gated on `type === "unknown"`. So a typed
+      // `worktree_setup` renders as an icon over nothing — measured
+      // `{summary:"",headline:"",body:"",hasDetail:false}`. Folding it into
+      // `unknown` is what keeps the row readable, and it costs nothing: DSH has
+      // no such tool (it is not among the 62 tool names real sessions carry), so
+      // this branch only has to hold the invariant "no detail type the client
+      // cannot draw". Whatever `presentationMeta` DSH sends still rides along
+      // on the item's `metadata.presentationMeta` via
+      // {@link withPresentationMeta} — a shape it does not recognize warns
+      // rather than throwing — so a client that learns the typed shape later has
+      // the raw result to read.
+      return {
+        type: "unknown",
+        input: input as unknown as JsonValue,
+        output: (output ?? null) as JsonValue,
+      };
     default:
       return {
         type: "unknown",
@@ -477,6 +554,16 @@ export class TimelineBuilder {
         return this.#commandRun(data);
       case "command/done":
         return this.#commandDone(data);
+      case "compaction/start":
+        return this.#compaction(data, "loading");
+      // Both are success evidence: `compaction/summary` is appended once the
+      // summary is durable and the replacement `user/message` follows it, and
+      // `compaction/end` is the closing marker. Whichever arrives is enough to
+      // stop claiming the compaction is still running, so a log that ends
+      // between the two cannot strand a pulsing row.
+      case "compaction/summary":
+      case "compaction/end":
+        return this.#compaction(data, "completed");
       case "turn/end":
         return this.#turnEnd(data);
       default:
@@ -587,8 +674,10 @@ export class TimelineBuilder {
     const failed = message?.isError === true;
     // DSH attaches the tool's `presentationMeta` to the result event itself
     // (`data.meta`), next to the message. It is the only copy of the structured
-    // result there is: `message.content` is already the rendered text.
-    const detail = withPresentationMeta(
+    // result there is: `message.content` is already the rendered text. It ends up
+    // on the item's `metadata`, not on the detail — the detail schema strips
+    // unknown fields at this process's boundary (see {@link ToolDetail}).
+    const { detail, presentationMeta } = withPresentationMeta(
       toolDetail(name, input, output === "" ? undefined : output),
       name,
       data.meta,
@@ -609,7 +698,7 @@ export class TimelineBuilder {
         callId,
         name,
         detail,
-        ...(toolMetadata(input) === undefined ? {} : { metadata: toolMetadata(input) as Record<string, JsonValue> }),
+        metadata: toolMetadata(input, presentationMeta),
         ...(failed
           ? { status: "failed" as const, error: { message: output || "tool failed" } }
           : { status: "completed" as const, error: null }),
@@ -650,9 +739,75 @@ export class TimelineBuilder {
       callId: commandId,
       name: line,
       detail: { type: "plain_text", label: line, text, icon: "square_terminal" },
+      // A `/command` row goes through the client's tool-call transformer like any
+      // other, so it carries the locale hint too: a session whose first row is
+      // `/compact` must not be the one that misses it.
+      metadata: localeMetadata(),
       ...(failed
         ? { status: "failed" as const, error: { message: text === "" ? "command failed" : text } }
         : { status: "completed" as const, error: null }),
+    });
+  }
+
+  /**
+   * DSH's compaction lifecycle -> Paseo's own `compaction` marker.
+   *
+   * DSH compacts the model-visible history under a durable open/close bracket
+   * (`compaction/start` … `compaction/summary` + `compaction/end`), and none of
+   * those events reaches the surface: DSH's web UI draws its marker from the
+   * replacement `user/message` checkpoint the summary is paired with. Paseo has
+   * the marker as a first-class item (`{type:"compaction", status, trigger}`,
+   * which its own omp/pi adapters emit), so the bracket maps onto it directly —
+   * same id for every event of one `compactionId`, so the row updates in place
+   * instead of stacking a second one.
+   *
+   * `trigger` is DSH's own distinction and is exact, not inferred from timing.
+   * Two signals agree on it and either is enough: `compactNow` (the `/compact`
+   * command) stamps `sourceCommandId`, and it is the only path that runs with
+   * `owner: null` — a standalone transaction between turns — while the
+   * token-meter-driven path calls `compactSurfaceRegion` with
+   * `owner: "current-turn"` and no command id.
+   *
+   * `preTokens` is deliberately left unset. Paseo fills it from the provider's
+   * *tokens before compaction* (`omp`'s mapper reads `tokensBefore`); DSH's
+   * `compaction/summary` reports `shadowedTokenCount`, the estimated size of the
+   * range that was replaced. Similar numbers, different quantity — a label
+   * reading "~Nk tokens" off it would be a quiet lie, and DSH has nothing that
+   * answers the question Paseo is asking.
+   *
+   * `compaction/prune` is not mapped either: it is the shadow price of a
+   * model-free tool-result prune, it carries no `compactionId`, and the event it
+   * precedes is a `tool/result` replacement rather than a compaction checkpoint —
+   * DSH's own UI shows no marker for it.
+   */
+  #compaction(
+    data: Record<string, unknown>,
+    status: "loading" | "completed",
+  ): ProviderTimelineItem[] {
+    const compactionId = stringField(data, "compactionId");
+    if (compactionId === undefined) return [];
+    // A failed compaction is closed with `error` on its `compaction/end` (the
+    // summary event never lands). Paseo's marker has only `loading`/`completed`,
+    // exactly as its own omp mapper notes ("every end event clears loading"), so
+    // the marker cannot carry the failure. It does not have to: DSH's error
+    // travels to the turn or the command that owned the compaction, and this
+    // builder already renders both (`turn/end` -> an `error` item,
+    // `command/done` kind "error" -> a failed `/compact` row). What would be
+    // silent is losing it entirely, so it is also reported here.
+    const error = stringField(data, "error");
+    if (error !== undefined) {
+      this.#warn(
+        `compaction: DSH ended ${compactionId} with an error (${error}); the marker is cleared, ` +
+          `and the failure itself is on the turn or command that owned the compaction`,
+      );
+    }
+    return this.#put({
+      type: "compaction",
+      id: `compaction:${compactionId}`,
+      status,
+      // `turn === null` is DSH's structural marker for a manual transaction; a
+      // missing `turn` is a malformed event, not a manual one.
+      trigger: stringField(data, "sourceCommandId") !== undefined || data.turn === null ? "manual" : "auto",
     });
   }
 
@@ -706,7 +861,7 @@ export class TimelineBuilder {
       callId,
       name,
       detail: toolDetail(name, input),
-      ...(toolMetadata(input) === undefined ? {} : { metadata: toolMetadata(input) as Record<string, JsonValue> }),
+      metadata: toolMetadata(input),
       ...(status === "failed"
         ? { status: "failed" as const, error: { message: "tool failed" } }
         : { status, error: null }),
