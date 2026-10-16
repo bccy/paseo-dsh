@@ -1,0 +1,438 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><style>
+  * { box-sizing: border-box; }
+  body { margin:0; padding:20px; background:#0d0d0e;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    -webkit-font-smoothing:antialiased; color:#e4e4e7; }
+  .mono { font-family:"SF Mono",Menlo,Consolas,"Liberation Mono",monospace; }
+  h1 { font-size:13px; font-weight:600; margin:0 0 14px; color:#a1a1aa; letter-spacing:.3px; }
+  h1 b { color:#fafafa; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:22px; align-items:start; }
+  .col > .hd { font-size:12px; font-weight:600; margin:0 0 10px; padding-bottom:6px;
+    border-bottom:1px solid #26262a; }
+  .col.dsh > .hd { color:#81858c; }
+  .col.new > .hd { color:#7dd3a0; }
+  .sec { margin-bottom:18px; }
+  .sec > .t { font-size:11px; color:#6b6b73; margin:0 0 7px; letter-spacing:.4px; }
+  .box { background:#101011; border:1px solid #232326; border-radius:10px; padding:14px 14px 16px; }
+
+  /* ================= DSH 原样（暗色实测 token） ================= */
+  .d-row { display:flex; align-items:center; height:24px; color:#adb2b8; }
+  .d-lead { flex:none; width:16px; height:16px; display:inline-flex; align-items:center; justify-content:center; margin-right:6px; }
+  .d-title { flex:none; font-size:13px; line-height:24px; font-weight:400; }
+  .d-sep { flex:none; width:2px; height:2px; border-radius:1px; background:#81858c; margin:0 8px; }
+  .d-sum { font-size:13px; line-height:24px; flex:auto; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .d-stat { font-family:"SF Mono",Menlo,monospace; font-size:11px; margin-left:10px; flex:none; color:#81858c; }
+  .d-card { border:.5px solid #ffffff0f; border-radius:16px; background:#1b1b1c; margin:4px 0 4px 4px; overflow:hidden; }
+
+  /* bash */
+  .d-term { position:relative; }
+  .d-termhd { display:flex; align-items:flex-start; gap:12px; padding:9px 14px 9px 30px; border-bottom:.5px solid #ffffff1f;
+    font-family:"SF Mono",Menlo,monospace; font-size:11px; line-height:16px; position:relative; }
+  .d-dot { position:absolute; left:8px; top:50%; transform:translateY(-50%); width:10px; height:10px; }
+  .d-dot i { position:absolute; inset:20%; border-radius:50%; background:#22c55e; display:block; }
+  .d-dot.run i { background:#adb2b8; }
+  .d-cwd { flex:none; color:#adb2b8; }
+  .d-cmd { flex:1; min-width:0; color:#f9fafb; overflow:hidden; text-overflow:ellipsis; white-space:pre; }
+  .d-pill { flex:none; height:18px; padding:0 8px; border-radius:999px; background:#232327; color:#f25a5a;
+    font-size:12px; line-height:18px; font-family:-apple-system,"PingFang SC",sans-serif; }
+  .d-copy { flex:none; color:#cfd3d6; font-size:13px; line-height:18px; font-family:-apple-system,"PingFang SC",sans-serif; }
+  .d-out { padding:12px 14px 12px 0; font-family:"SF Mono",Menlo,monospace; font-size:11px; line-height:18px; color:#f9fafb; white-space:pre; }
+
+  /* 通用：带 banner 的卡（search / code） */
+  .d-banner { display:flex; align-items:center; gap:12px; padding:9px 14px; background:#2c2c2e; font-size:13px; line-height:20px; }
+  .d-banner .l { flex:1; min-width:0; color:#cfd3d6; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .d-banner .r { flex:none; color:#cfd3d6; }
+  .d-body { padding:8px 14px 12px 0; font-family:"SF Mono",Menlo,monospace; font-size:11px; line-height:19px; color:#f9fafb; }
+  .d-sline { min-height:22px; padding-left:14px; white-space:pre; }
+  .d-ln { color:#adb2b8; }
+  .d-fh { display:flex; align-items:baseline; gap:8px; min-height:22px; padding:0 14px; }
+  .d-fp { font-weight:600; color:#f9fafb; white-space:pre; }
+  .d-fc { flex:none; color:#adb2b8; }
+  .d-more { display:block; padding:0 14px; color:#adb2b8; }
+
+  /* read */
+  .d-readbody { padding:6px 22px 20px; font-family:"SF Mono",Menlo,monospace; font-size:11px; line-height:19px; }
+  .d-rline { display:flex; min-height:19px; white-space:pre; }
+  .d-gut { flex:none; width:28px; margin-right:12px; text-align:right; color:#adb2b8; }
+  .d-rc { min-width:0; color:#f9fafb; }
+
+  /* diff */
+  .d-dhead { display:flex; justify-content:space-between; gap:12px; padding:10px 18px 8px 22px; font-size:11px; line-height:18px; color:#cfd3d6; }
+  .d-dlang { color:#adb2b8; font-family:"SF Mono",Menlo,monospace; }
+  .d-dpath { color:#adb2b8; }
+  .d-dbody { padding:6px 0 20px; font-family:"SF Mono",Menlo,monospace; font-size:11px; line-height:19px; }
+  .d-line { min-height:19px; padding:0 22px; white-space:pre; }
+  .d-add { color:#22c55e; background:#22c55e1f; box-shadow:inset 3px 0 0 #22c55e; }
+  .d-del { color:#f25a5a; background:#f25a5a1f; box-shadow:inset 3px 0 0 #f25a5a; }
+  .d-ctx { color:#cfd3d6; }
+
+  /* web */
+  .d-web { padding:12px 14px; display:flex; flex-direction:column; gap:6px; }
+  .d-url { color:#7c9cff; font-family:"SF Mono",Menlo,monospace; font-size:13px; line-height:19px; font-weight:500; word-break:break-all; }
+  .d-meta { display:flex; align-items:baseline; gap:12px; font-size:13px; line-height:20px; }
+  .d-meta .s { color:#cfd3d6; } .d-meta .t { color:#adb2b8; }
+  .d-src { padding:12px 14px; }
+  .d-ol { margin:0; padding-left:2.5em; display:flex; flex-direction:column; gap:10px; max-height:320px; overflow-y:auto; }
+  .d-slink { color:#7c9cff; font-size:14px; line-height:20px; font-weight:500; }
+  .d-snip { margin-top:2px; color:#cfd3d6; font-size:13px; line-height:19px; }
+  .d-pub { margin-top:2px; color:#adb2b8; font-size:13px; line-height:20px; }
+
+  /* ioCard */
+  .d-io { border:.5px solid #ffffff0f; border-radius:16px; background:#1b1b1c; margin:4px 0 4px 4px;
+    font-family:"SF Mono",Menlo,monospace; font-size:11px; line-height:16px; }
+  .d-ios { display:grid; grid-template-columns:max-content 1fr; align-items:baseline; column-gap:14px;
+    max-height:150px; padding:12px 16px; overflow-y:auto; }
+  .d-iol { color:#81858c; }
+  .d-iot { white-space:pre-wrap; word-break:break-word; color:#cfd3d6; }
+  .d-iod { height:.5px; background:#ffffff1f; }
+
+  /* ================= 建议改后（Paseo 配色 + DSH 结构） ================= */
+  .n-row { display:flex; align-items:center; height:24px; color:#a1a1aa; }
+  .n-lead { flex:none; width:16px; height:16px; display:inline-flex; align-items:center; justify-content:center; margin-right:6px; }
+  .n-title { flex:none; font-size:13px; line-height:24px; }
+  .n-sep { flex:none; width:2px; height:2px; border-radius:1px; background:#71717a; margin:0 8px; }
+  .n-sum { font-size:13px; line-height:24px; flex:auto; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .n-stat { font-family:"SF Mono",Menlo,monospace; font-size:11px; margin-left:10px; flex:none; color:#71717a; }
+  .n-card { border:.5px solid #2e2e33; border-radius:16px; background:#1c1c1f; margin:4px 0 4px 4px; overflow:hidden; }
+
+  .n-term { position:relative; }
+  .n-termhd { display:flex; align-items:flex-start; gap:12px; padding:9px 14px 9px 30px; border-bottom:.5px solid #2e2e33;
+    font-family:"SF Mono",Menlo,monospace; font-size:11px; line-height:16px; position:relative; }
+  .n-dot { position:absolute; left:8px; top:50%; transform:translateY(-50%); width:10px; height:10px; }
+  .n-dot i { position:absolute; inset:20%; border-radius:50%; background:#6cb17b; display:block; }
+  .n-dot.run i { background:#a1a1aa; }
+  .n-cwd { flex:none; color:#a1a1aa; }
+  .n-cmd { flex:1; min-width:0; color:#fafafa; overflow:hidden; text-overflow:ellipsis; white-space:pre; }
+  .n-pill { flex:none; height:18px; padding:0 8px; border-radius:999px; background:#26262a; color:#d8847b; font-size:12px; line-height:18px; font-family:-apple-system,"PingFang SC",sans-serif; }
+  .n-copy { flex:none; color:#a1a1aa; font-size:13px; line-height:18px; font-family:-apple-system,"PingFang SC",sans-serif; }
+  .n-out { padding:12px 14px 12px 0; font-family:"SF Mono",Menlo,monospace; font-size:11px; line-height:18px; color:#fafafa; white-space:pre; }
+
+  .n-banner { display:flex; align-items:center; gap:12px; padding:9px 14px; background:#232327; font-size:13px; line-height:20px; }
+  .n-banner .l { flex:1; min-width:0; color:#a1a1aa; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .n-banner .r { flex:none; color:#a1a1aa; }
+  .n-body { padding:8px 14px 12px 0; font-family:"SF Mono",Menlo,monospace; font-size:11px; line-height:19px; color:#fafafa; }
+  .n-sline { min-height:22px; padding-left:14px; white-space:pre; }
+  .n-ln { color:#71717a; }
+  .n-fh { display:flex; align-items:baseline; gap:8px; min-height:22px; padding:0 14px; }
+  .n-fp { font-weight:600; color:#fafafa; white-space:pre; }
+  .n-fc { flex:none; color:#71717a; }
+  .n-more { display:block; padding:0 14px; color:#71717a; }
+
+  .n-readbody { padding:6px 22px 20px; font-family:"SF Mono",Menlo,monospace; font-size:11px; line-height:19px; }
+  .n-rline { display:flex; min-height:19px; white-space:pre; }
+  .n-gut { flex:none; width:28px; margin-right:12px; text-align:right; color:#71717a; }
+  .n-rc { min-width:0; color:#fafafa; }
+
+  .n-dhead { display:flex; justify-content:space-between; gap:12px; padding:10px 18px 8px 22px; font-size:11px; line-height:18px; color:#a1a1aa; }
+  .n-dlang { color:#71717a; font-family:"SF Mono",Menlo,monospace; }
+  .n-dbody { padding:6px 0 20px; font-family:"SF Mono",Menlo,monospace; font-size:11px; line-height:19px; }
+  .n-line { min-height:19px; padding:0 22px; white-space:pre; }
+  .n-add { color:#6cb17b; background:rgba(108,177,123,.12); box-shadow:inset 3px 0 0 #6cb17b; }
+  .n-del { color:#d8847b; background:rgba(216,132,123,.12); box-shadow:inset 3px 0 0 #d8847b; }
+  .n-ctx { color:#a1a1aa; }
+
+  .n-web { padding:12px 14px; display:flex; flex-direction:column; gap:6px; }
+  .n-url { color:#8ba4ff; font-family:"SF Mono",Menlo,monospace; font-size:13px; line-height:19px; font-weight:500; word-break:break-all; }
+  .n-meta { display:flex; align-items:baseline; gap:12px; font-size:13px; line-height:20px; }
+  .n-meta .s { color:#a1a1aa; } .n-meta .t { color:#71717a; }
+  .n-src { padding:12px 14px; }
+  .n-ol { margin:0; padding-left:2.5em; display:flex; flex-direction:column; gap:10px; max-height:320px; overflow-y:auto; }
+  .n-slink { color:#8ba4ff; font-size:14px; line-height:20px; font-weight:500; }
+  .n-snip { margin-top:2px; color:#a1a1aa; font-size:13px; line-height:19px; }
+  .n-pub { margin-top:2px; color:#71717a; font-size:13px; line-height:20px; }
+
+  .n-io { border:.5px solid #2e2e33; border-radius:16px; background:#1c1c1f; margin:4px 0 4px 4px;
+    font-family:"SF Mono",Menlo,monospace; font-size:11px; line-height:16px; }
+  .n-ios { display:flex; gap:14px; max-height:150px; padding:12px 16px; overflow-y:auto; }
+  .n-iol { flex:none; width:32px; color:#71717a; }
+  .n-iot { white-space:pre-wrap; word-break:break-word; color:#a1a1aa; flex:1; min-width:0; }
+  .n-iod { height:.5px; background:#2e2e33; }
+  .note { font-size:11px; line-height:17px; color:#6b6b73; margin-top:8px; }
+  .note b { color:#a1a1aa; font-weight:500; }
+  .tick { color:#6cb17b; } .cross { color:#d8847b; }
+
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:22px; align-items:start; margin-bottom:20px; }
+  .cell > .sec { margin-bottom:0; }
+  .cell:first-child .sec > .t::before { content:"DSH 原样 · "; color:#81858c; }
+  .cell:last-child  .sec > .t::before { content:"建议改后 · "; color:#7dd3a0; }
+  .cell:first-child .sec > .box { border-color:#232326; }
+
+  .wrap { display:block; }
+  .row, .cell { display:block; margin:0; }
+  .cell > .sec { margin-bottom:0; }
+  .sec { border-left:2px solid #26262a; padding-left:12px; margin-bottom:16px; }
+  .sec:has(.t.new) { border-left-color:#2f4d3c; }
+  .t .side { display:inline-block; font-size:10px; padding:1px 6px; border-radius:999px; margin-right:8px;
+    vertical-align:1px; letter-spacing:.3px; }
+  .t .side.dsh { background:#232326; color:#a1a1aa; }
+  .t .side.new { background:#1d3327; color:#7dd3a0; }
+  .t.dsh { color:#81858c; } .t.new { color:#7dd3a0; }
+</style></head>
+<body>
+<h1>工具行渲染对齐 · <b>左＝DSH 原样（实测 token）</b> · <b>右＝建议改后（Paseo 配色 + DSH 结构）</b></h1>
+
+<div class="wrap"><div class="row"><div class="cell"><div class="sec">
+    <div class="t dsh"><span class="side dsh">DSH 原样</span>① 行头（折叠态）· 固定 24px 单行</div>
+    <div class="box">
+      <div class="d-row"><span class="d-lead">▸</span><span class="d-title">运行命令</span><span class="d-sep"></span><span class="d-sum">List DSH checkout root</span></div>
+      <div class="d-row"><span class="d-lead">▸</span><span class="d-title">搜索文件内容</span><span class="d-sep"></span><span class="d-sum">persistence handle</span></div>
+      <div class="d-row"><span class="d-lead">▸</span><span class="d-title">编辑</span><span class="d-sep"></span><span class="d-sum">client/tool-call.tsx</span><span class="d-stat">+12 -3</span></div>
+      <div class="d-row"><span class="d-lead">▸</span><span class="d-title">工具调用</span><span class="d-sep"></span><span class="d-sum">mcp__paseo__create_heartbeat · {"cron":"* * * * *"}</span></div>
+      <div class="note"><b>要点</b>：摘要用 UI 字体（非等宽）· 标题与摘要之间是 <b>2×2 圆角方块</b>（不是圆点）· diff 行右侧有 <b>+12 -3</b>（11px 等宽，仅 hover/展开时着色）· 未知/MCP 工具的摘要是 <b>「工具名 · 参数首行」</b> · 失败时摘要变红、图标不变色。</div>
+    </div>
+  </div></div><div class="cell"></div></div>
+<div class="row"><div class="cell"><div class="sec">
+    <div class="t dsh"><span class="side dsh">DSH 原样</span>② 命令展开 · banner + 分隔线 + 输出</div>
+    <div class="box">
+      <div class="d-row"><span class="d-lead">▸</span><span class="d-title">运行命令</span><span class="d-sep"></span><span class="d-sum">List DSH checkout root</span></div>
+      <div class="d-card d-term">
+        <div class="d-termhd"><span class="d-dot"><i></i></span><span class="d-cwd">~/apps/paseo-dsh</span><span class="d-cmd">pnpm test --filter paseo-plugin</span><span class="d-copy">复制</span></div>
+        <div class="d-out">PASS  tool-call-check.cjs   89/89
+PASS  subagent-check.cjs    50/50
+PASS  thinking-check.cjs    17/17</div>
+      </div>
+      <div style="height:12px"></div>
+      <div class="d-card d-term">
+        <div class="d-termhd"><span class="d-dot"><i style="background:#f25a5a"></i></span><span class="d-cwd">~</span><span class="d-cmd">pnpm lint</span><span class="d-pill">退出码 1</span><span class="d-copy">复制</span></div>
+        <div class="d-out">✖ 3 problems (3 errors, 0 warnings)</div>
+      </div>
+      <div class="note"><b>状态点</b>：运行中 = 14px 旋转环（1.5s），成功 = <b>绿实心点</b>（10px 外径／6px 核），失败 = 红实心点 —— <b>没有叉形</b>。<b>Pill 只在失败时出现</b>（「退出码 1」/「信号 SIGTERM」/「未正常退出」），成功时没有 pill。</div>
+    </div>
+  </div>
+
+  <div class="sec">
+    <div class="t new"><span class="side new">建议改后</span>② 命令展开</div>
+    <div class="box">
+      <div class="n-row"><span class="n-lead">▸</span><span class="n-title">命令</span><span class="n-sep"></span><span class="n-sum">List DSH checkout root</span></div>
+      <div class="n-card n-term">
+        <div class="n-termhd"><span class="n-dot"><i></i></span><span class="n-cwd">~/apps/paseo-dsh</span><span class="n-cmd">pnpm test --filter paseo-plugin</span><span class="n-copy">复制</span></div>
+        <div class="n-out">PASS  tool-call-check.cjs   89/89
+PASS  subagent-check.cjs    50/50
+PASS  thinking-check.cjs    17/17</div>
+      </div>
+      <div style="height:12px"></div>
+      <div class="n-card n-term">
+        <div class="n-termhd"><span class="n-dot"><i style="background:#d8847b"></i></span><span class="n-cwd">~</span><span class="n-cmd">pnpm lint</span><span class="n-pill">退出码 1</span><span class="n-copy">复制</span></div>
+        <div class="n-out">✖ 3 problems (3 errors, 0 warnings)</div>
+      </div>
+      <div class="note">命令用<b>高对比前景色</b>、cwd 用灰；输出字号从 13 降到 <b>11</b>、行高 18；卡片 <b>圆角 16 + hairline 描边</b>；展开体左缩进 12 → <b>4</b>。</div>
+    </div>
+  </div></div><div class="cell"></div></div>
+<div class="row"><div class="cell"><div class="sec">
+    <div class="t dsh"><span class="side dsh">DSH 原样</span>③ 搜索结果展开（你点名的）</div>
+    <div class="box">
+      <div class="d-row"><span class="d-lead">▸</span><span class="d-title">搜索文件内容</span><span class="d-sep"></span><span class="d-sum">persistence handle</span></div>
+      <div class="d-card">
+        <div class="d-banner"><span class="l">12 处匹配 · 3 个文件</span><span class="r">复制</span></div>
+        <div class="d-body">
+          <div class="d-fh"><span class="d-fp">client/newest.ts</span><span class="d-fc">5</span></div>
+          <div class="d-sline"><span class="d-ln">42: </span>  const handle = persistence.handle;</div>
+          <div class="d-sline"><span class="d-ln">88: </span>  if (handle === undefined) return;</div>
+          <div class="d-fh"><span class="d-fp">server/session.ts</span><span class="d-fc">4</span></div>
+          <div class="d-sline"><span class="d-ln">563: </span>  // persistence handle names a DSH session</div>
+          <div class="d-more">… 其余 3 行</div>
+        </div>
+      </div>
+      <div class="note"><b>这里没有"命中高亮"</b> —— DSH 不高亮匹配子串，只有行号被弱化成灰。<b>文件分组</b>是粗体路径 + 匹配计数，整行可点开合。折叠是 <b>8 行</b>（头 4 + 「… 其余 N 行」+ 尾 4），点一下同一个按钮变「收起」。统计文案是 <b>「12 处匹配 · 3 个文件」</b>（匹配数在前）。</div>
+    </div>
+  </div>
+
+  <div class="sec">
+    <div class="t new"><span class="side new">建议改后</span>③ 搜索结果展开</div>
+    <div class="box">
+      <div class="n-row"><span class="n-lead">▸</span><span class="n-title">搜索文件内容</span><span class="n-sep"></span><span class="n-sum">persistence handle</span></div>
+      <div class="n-card">
+        <div class="n-banner"><span class="l">12 处匹配 · 3 个文件</span><span class="r">复制</span></div>
+        <div class="n-body">
+          <div class="n-fh"><span class="n-fp">client/newest.ts</span><span class="n-fc">5</span></div>
+          <div class="n-sline"><span class="n-ln">42: </span>  const handle = persistence.handle;</div>
+          <div class="n-sline"><span class="n-ln">88: </span>  if (handle === undefined) return;</div>
+          <div class="n-fh"><span class="n-fp">server/session.ts</span><span class="n-fc">4</span></div>
+          <div class="n-sline"><span class="n-ln">563: </span>  // persistence handle names a DSH session</div>
+          <div class="n-more">… 其余 3 行</div>
+        </div>
+      </div>
+      <div class="note"><b>要做这个，数据层得先补东西</b>：我们现在只把 grep 的原始输出塞进 body，没有<b>文件名 / 行号 / 命中数</b>的结构。服务端要从 DSH 的 grep 结果里解析出「文件 → 行号 → 行内容」并统计，客户端才能画分组。</div>
+    </div>
+  </div></div><div class="cell"></div></div>
+<div class="row"><div class="cell"><div class="sec">
+    <div class="t dsh"><span class="side dsh">DSH 原样</span>④ 读取展开 · 行号栏 + 正文</div>
+    <div class="box">
+      <div class="d-row"><span class="d-lead">▸</span><span class="d-title">读取</span><span class="d-sep"></span><span class="d-sum" style="text-decoration:underline 1px dotted;text-underline-offset:3px">client/newest.ts</span></div>
+      <div class="d-card">
+        <div class="d-dhead"><span class="d-dlang">typescript</span><span class="d-dpath">client/newest.ts</span></div>
+        <div class="d-readbody">
+          <div class="d-rline"><span class="d-gut">41</span><span class="d-rc">export function noteRender(agentId, at) {</span></div>
+          <div class="d-rline"><span class="d-gut">42</span><span class="d-rc">  const handle = persistence.handle;</span></div>
+          <div class="d-rline"><span class="d-gut">43</span><span class="d-rc">  return handle !== undefined;</span></div>
+        </div>
+      </div>
+      <div class="note">行号栏 <b>右对齐 + 灰色 + 不可选中</b>，与正文间距 12px；正文用前景色。行头里的路径是<b>虚线下划线</b>（可点开文件）。折叠 <b>8 行</b>。</div>
+    </div>
+  </div>
+
+  <div class="sec">
+    <div class="t new"><span class="side new">建议改后</span>④ 读取展开</div>
+    <div class="box">
+      <div class="n-row"><span class="n-lead">▸</span><span class="n-title">读取</span><span class="n-sep"></span><span class="n-sum">client/newest.ts</span></div>
+      <div class="n-card">
+        <div class="n-dhead"><span class="n-dlang">typescript</span><span class="n-dpath">client/newest.ts</span></div>
+        <div class="n-readbody">
+          <div class="n-rline"><span class="n-gut">41</span><span class="n-rc">export function noteRender(agentId, at) {</span></div>
+          <div class="n-rline"><span class="n-gut">42</span><span class="n-rc">  const handle = persistence.handle;</span></div>
+          <div class="n-rline"><span class="n-gut">43</span><span class="n-rc">  return handle !== undefined;</span></div>
+        </div>
+      </div>
+      <div class="note"><b>数据层缺行号</b>：DSH 的 read 结果带行号，我们目前把它整段当纯文本。</div>
+    </div>
+  </div></div><div class="cell"></div></div>
+<div class="row"><div class="cell"><div class="sec">
+    <div class="t dsh"><span class="side dsh">DSH 原样</span>⑤ 编辑 / 新建展开 · 3px 左竖条</div>
+    <div class="box">
+      <div class="d-row"><span class="d-lead">▸</span><span class="d-title">编辑</span><span class="d-sep"></span><span class="d-sum">client/tool-call.tsx</span><span class="d-stat">+12 -3</span></div>
+      <div class="d-card">
+        <div class="d-dhead"><span class="d-dlang">diff</span><span class="d-dpath">client/tool-call.tsx</span></div>
+        <div class="d-dbody">
+          <div class="d-line d-ctx">  const styles = {</div>
+          <div class="d-line d-del">-   borderRadius: 6,</div>
+          <div class="d-line d-add">+   borderRadius: 16,</div>
+          <div class="d-line d-add">+   borderWidth: 0.5,</div>
+          <div class="d-line d-ctx">  }</div>
+        </div>
+      </div>
+      <div class="note">增删行 = <b>3px 实色左竖条 + 8%(暗 12%) 底色 + 「+ 」/「- 」前缀</b>，上下文行有 <b>两个空格</b>前缀对齐。折叠 <b>9 行</b>（头 5 + 尾 4）。<b>新建文件走同一个 DiffBlock</b>，只是全是 + 行。</div>
+    </div>
+  </div>
+
+  <div class="sec">
+    <div class="t new"><span class="side new">建议改后</span>⑤ 编辑 / 新建展开</div>
+    <div class="box">
+      <div class="n-row"><span class="n-lead">▸</span><span class="n-title">编辑</span><span class="n-sep"></span><span class="n-sum">client/tool-call.tsx</span><span class="n-stat">+12 -3</span></div>
+      <div class="n-card">
+        <div class="n-dhead"><span class="n-dlang">diff</span><span class="n-dpath">client/tool-call.tsx</span></div>
+        <div class="n-dbody">
+          <div class="n-line n-ctx">  const styles = {</div>
+          <div class="n-line n-del">-   borderRadius: 6,</div>
+          <div class="n-line n-add">+   borderRadius: 16,</div>
+          <div class="n-line n-add">+   borderWidth: 0.5,</div>
+          <div class="n-line n-ctx">  }</div>
+        </div>
+      </div>
+      <div class="note">颜色保留 Paseo 语义色（低饱和），换掉的是<b>结构</b>：竖条、前缀、卡头、圆角、字号。若你要"更像 DSH"，把状态色换成 <span class="tick">#22c55e</span> / <span class="cross">#f25a5a</span> 即可。</div>
+    </div>
+  </div></div><div class="cell"></div></div>
+<div class="row"><div class="cell"><div class="sec">
+    <div class="t dsh"><span class="side dsh">DSH 原样</span>⑥ 网页搜索 / 抓取展开</div>
+    <div class="box">
+      <div class="d-row"><span class="d-lead">▸</span><span class="d-title">网页搜索</span><span class="d-sep"></span><span class="d-sum">paseo plugin api</span></div>
+      <div class="d-card">
+        <div class="d-src">
+          <ol class="d-ol">
+            <li><div class="d-slink">Paseo Plugin API</div><div class="d-snip">Plugins run in the daemon process and may declare capabilities…</div><div class="d-pub">2026-03-02</div></li>
+            <li><div class="d-slink">docs.getpaseo.com</div><div class="d-snip">Timeline renderers let a provider replace a row…</div></li>
+          </ol>
+        </div>
+      </div>
+      <div style="height:12px"></div>
+      <div class="d-row"><span class="d-lead">▸</span><span class="d-title">网页获取</span><span class="d-sep"></span><span class="d-sum" style="color:#7c9cff">https://docs.getpaseo.com/plugins</span></div>
+      <div class="d-card">
+        <div class="d-web"><span class="d-url">https://docs.getpaseo.com/plugins</span>
+          <div class="d-meta"><span class="s">HTTP 200</span><span class="t">内容已截断</span></div></div>
+      </div>
+      <div class="note">两种形态完全不同：<b>网页搜索</b>是有序引用列表（14px 链接 + 13px 摘要 + 日期，最多 320px 就地滚动）；<b>网页获取</b>只有 URL + <b>HTTP 200</b> + 截断提示，<b>没有摘要</b>。</div>
+    </div>
+  </div>
+
+  <div class="sec">
+    <div class="t new"><span class="side new">建议改后</span>⑥ 网页搜索 / 抓取展开</div>
+    <div class="box">
+      <div class="n-row"><span class="n-lead">▸</span><span class="n-title">网页搜索</span><span class="n-sep"></span><span class="n-sum">paseo plugin api</span></div>
+      <div class="n-card">
+        <div class="n-src">
+          <ol class="n-ol">
+            <li><div class="n-slink">Paseo Plugin API</div><div class="n-snip">Plugins run in the daemon process and may declare capabilities…</div><div class="n-pub">2026-03-02</div></li>
+            <li><div class="n-slink">docs.getpaseo.com</div><div class="n-snip">Timeline renderers let a provider replace a row…</div></li>
+          </ol>
+        </div>
+      </div>
+      <div style="height:12px"></div>
+      <div class="n-row"><span class="n-lead">▸</span><span class="n-title">网页获取</span><span class="n-sep"></span><span class="n-sum">https://docs.getpaseo.com/plugins</span></div>
+      <div class="n-card">
+        <div class="n-web"><span class="n-url">https://docs.getpaseo.com/plugins</span>
+          <div class="n-meta"><span class="s">HTTP 200</span><span class="t">内容已截断</span></div></div>
+      </div>
+      <div class="note">链接色我用的是近似的蓝（DSH 的 <b>link token 十六进制我没查到</b>，Paseo 的 accent 我会在实现时从主题取真值）。</div>
+    </div>
+  </div></div><div class="cell"></div></div>
+<div class="row"><div class="cell"><div class="sec">
+    <div class="t dsh"><span class="side dsh">DSH 原样</span>⑦ MCP / 未知工具展开 · 输入·输出</div>
+    <div class="box">
+      <div class="d-row"><span class="d-lead">▸</span><span class="d-title">工具调用</span><span class="d-sep"></span><span class="d-sum">mcp__paseo__list_workspaces · {}</span></div>
+      <div class="d-io">
+        <div class="d-ios"><span class="d-iol">输入</span><span class="d-iot">{}</span></div>
+        <div class="d-iod"></div>
+        <div class="d-ios"><span class="d-iol">输出</span><span class="d-iot">workspaces_count=4
+
+{
+  "workspaces": [
+    { "workspaceId": "wks_e7c9c95102eff71d", "title": "测试" },
+    { "workspaceId": "wks_8898ac5429c579e8", "title": "开发" }
+  ]
+}</span></div>
+      </div>
+      <div class="note">两列网格（标签列 <b>max-content</b> + 内容列，间距 14），各段自己滚动（150px 上限）。标签是「<b>输入</b>」「<b>输出</b>」。</div>
+    </div>
+  </div>
+
+  <div class="sec">
+    <div class="t new"><span class="side new">建议改后</span>⑦ MCP / 未知工具展开</div>
+    <div class="box">
+      <div class="n-row"><span class="n-lead">▸</span><span class="n-title">列出工作区</span><span class="n-sep"></span><span class="n-sum">{}</span></div>
+      <div class="n-io">
+        <div class="n-ios"><span class="n-iol">输入</span><span class="n-iot">{}</span></div>
+        <div class="n-iod"></div>
+        <div class="n-ios"><span class="n-iol">输出</span><span class="n-iot">workspaces_count=4
+
+{
+  "workspaces": [
+    { "workspaceId": "wks_e7c9c95102eff71d", "title": "测试" },
+    { "workspaceId": "wks_8898ac5429c579e8", "title": "开发" }
+  ]
+}</span></div>
+      </div>
+      <div class="note">RN 没有 <code>grid</code>，用固定宽标签列 + gap 模拟（sticky 放弃）。标题我们已经有中文（「列出工作区」），DSH 是「工具调用 · 工具名」。</div>
+    </div>
+  </div></div><div class="cell"></div></div>
+<div class="row"><div class="cell"><div class="sec">
+    <div class="t dsh"><span class="side dsh">DSH 原样</span>⑧ 代码工具展开 · banner + pre</div>
+    <div class="box">
+      <div class="d-row"><span class="d-lead">▸</span><span class="d-title">代码</span><span class="d-sep"></span><span class="d-sum">跑一段解析</span></div>
+      <div class="d-card">
+        <div class="d-dhead" style="align-items:center"><span class="d-dlang">typescript</span><span style="color:#adb2b8">自动换行 · 复制</span></div>
+        <div class="d-dbody" style="padding:6px 22px 20px">
+          <div class="d-line d-ctx">const parsed = JSON.parse(raw);</div>
+          <div class="d-line d-ctx">return parsed.items.length;</div>
+        </div>
+      </div>
+      <div class="note">工具行的代码块 <b>lang 硬编码成 typescript</b>（DSH 自身的小瑕疵），且<b>默认不显示行号</b>；banner 是 sticky（RN 上要改布局）。</div>
+    </div>
+  </div>
+
+  <div class="sec">
+    <div class="t new"><span class="side new">建议改后</span>⑧ 代码工具展开</div>
+    <div class="box">
+      <div class="n-row"><span class="n-lead">▸</span><span class="n-title">代码</span><span class="n-sep"></span><span class="n-sum">跑一段解析</span></div>
+      <div class="n-card">
+        <div class="n-dhead" style="align-items:center"><span class="n-dlang">typescript</span><span style="color:#71717a">复制</span></div>
+        <div class="n-dbody" style="padding:6px 22px 20px">
+          <div class="n-line n-ctx">const parsed = JSON.parse(raw);</div>
+          <div class="n-line n-ctx">return parsed.items.length;</div>
+        </div>
+      </div>
+      <div class="note">这个我们自己定 lang（不学 DSH 硬编码），也不做 sticky。</div>
+    </div>
+  </div>
+
+</div></div><div class="cell"></div></div></div>
+</body></html>
