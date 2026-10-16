@@ -1,0 +1,979 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>工具行渲染三栏对比 · DSH 原样 / 改造前 / 改造后</title>
+<style>
+  * { box-sizing:border-box; }
+  html { -webkit-text-size-adjust:100%; }
+  body { margin:0; padding:26px 22px 70px; background:#0d0d0e; color:#e4e4e7;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    -webkit-font-smoothing:antialiased; }
+  .mono, code { font-family:"SF Mono",Menlo,Consolas,"Liberation Mono",monospace; }
+
+  h1 { font-size:15px; font-weight:600; margin:0 0 7px; color:#fafafa; letter-spacing:.2px; }
+  .lede { font-size:12px; line-height:19px; color:#8b8b93; margin:0 0 14px; max-width:1100px; }
+  .lede b { color:#c9c9d1; font-weight:600; }
+
+  .legend { border:1px solid #232326; background:#111113; border-radius:10px;
+    padding:12px 14px; margin:0 0 16px; font-size:11.5px; line-height:19px; color:#8f8f97;
+    display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:4px 26px; }
+  .legend div { min-width:0; }
+  .legend b { color:#c9c9d1; font-weight:600; }
+  .sw { display:inline-block; width:9px; height:9px; border-radius:2px; vertical-align:0;
+    margin-right:5px; }
+  .c-dsh { color:#a9aeb4 } .c-before { color:#d8847b } .c-after { color:#7dd3a0 }
+
+  nav.toc { display:flex; flex-wrap:wrap; gap:6px; margin:0 0 24px; }
+  nav.toc a { font-size:11.5px; color:#a1a1aa; text-decoration:none; background:#17171a;
+    border:1px solid #26262a; border-radius:999px; padding:3px 10px; white-space:nowrap; }
+  nav.toc a:hover { color:#fafafa; border-color:#3f3f46; }
+
+  .cat { margin:0 0 32px; scroll-margin-top:14px; }
+  .cat > h2 { font-size:13.5px; font-weight:600; color:#fafafa; margin:0 0 5px; }
+  .cat > h2 .num { color:#6b6b73; margin-right:7px; font-weight:500; }
+  .cat > .desc { font-size:11.5px; line-height:18px; color:#7c7c85; margin:0 0 12px; }
+
+  .cols { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; align-items:start; }
+  .cell { min-width:0; }
+  .clab { display:flex; align-items:center; gap:6px; font-size:10.5px; font-weight:600;
+    letter-spacing:.4px; padding:0 0 6px; margin:0 0 9px; border-bottom:1px solid #232326; }
+  .clab .dot { width:7px; height:7px; border-radius:2px; flex:none; }
+  .clab.dsh { color:#a9aeb4 } .clab.dsh .dot { background:#6b7075 }
+  .clab.before { color:#d8847b } .clab.before .dot { background:#8c4a44 }
+  .clab.after { color:#7dd3a0 } .clab.after .dot { background:#3f7a55 }
+  .badge { margin-left:auto; font-weight:500; font-size:9.5px; letter-spacing:.2px;
+    padding:2px 7px; border-radius:999px; white-space:nowrap; }
+  .badge.done { background:#1b3124; color:#7dd3a0 }
+  .badge.plan { background:#232326; color:#8b8b93 }
+
+  .box { background:#131316; border:1px solid #232326; border-radius:10px; padding:12px;
+    overflow-x:auto; }
+  .cap { font-size:10px; color:#6b6b73; letter-spacing:.35px; margin:0 0 6px; }
+  .cap.mt { margin-top:13px; }
+  .ghost { border:1px dashed #3a3a40; border-radius:8px; padding:9px 10px; margin-top:6px; }
+  .note { font-size:11.5px; line-height:19px; color:#8b8b93; margin:13px 0 0;
+    border-left:2px solid #26262a; padding:2px 0 2px 12px; }
+  .note b { color:#c9c9d1; font-weight:600; }
+  .note code { font-size:11px; color:#a9aeb4; }
+  .note .ok { color:#7dd3a0 } .note .no { color:#d8847b } .note .warn { color:#d9b26a }
+
+  /* ---------- 行首图标（内联示意） ---------- */
+  .i { width:14px; height:14px; flex:none; display:block; fill:none; stroke:currentColor;
+    stroke-width:1.35; stroke-linecap:round; stroke-linejoin:round; }
+  .spin { width:14px; height:14px; display:block; fill:none; stroke:currentColor;
+    stroke-width:2; stroke-linecap:round; }
+  .spin .trk { opacity:.25 }
+  .spin .arc { stroke-dasharray:12 150; transform-origin:center; animation:dspin 1.5s linear infinite }
+  @keyframes dspin { to { transform:rotate(360deg) } }
+  @media (prefers-reduced-motion:reduce) { .spin .arc { animation:none; stroke-dasharray:18 150 } }
+
+  /* ================= ① DSH 原样（暗色 token 实测） =================
+     token 十六进制取自 @deepseek-ai/dsh-client-ui-theme（body[data-ds-dark-theme]）：
+     bg-base #151517 · label-primary #f9fafb · secondary #cfd3d6 · tertiary #adb2b8
+     caption #81858c · border-l1 #ffffff0f · border-l2 #ffffff1f · code-block #1b1b1c
+     code-block-banner #2c2c2e · success #22c55e · error #f25a5a · link #7aaaff
+     --dsh-content-font-delta 取默认 0 → 行高就是 24px、字号 13px。 */
+  .d-row { display:flex; align-items:center; height:24px; color:#adb2b8; }
+  .d-lead { flex:none; width:16px; height:16px; display:inline-flex; align-items:center;
+    justify-content:center; margin-right:6px; }
+  .d-title { flex:none; font-size:13px; line-height:24px; font-weight:400; }
+  .d-sep { flex:none; width:2px; height:2px; border-radius:1px; background:#81858c; margin:0 8px; }
+  .d-sum { flex:auto; min-width:0; font-size:13px; line-height:24px; overflow:hidden;
+    white-space:nowrap; text-overflow:ellipsis; }
+  .d-stat { flex:none; margin-left:10px; font-family:"SF Mono",Menlo,monospace; font-size:11px;
+    line-height:24px; color:#81858c; }
+  .d-card { border:.5px solid #ffffff0f; border-radius:16px; background:#1b1b1c;
+    margin:4px 0 4px 4px; overflow:hidden; }
+
+  /* terminal：卡片自身留 30px 圆点栏，命令与输出都从 30px 起排 */
+  .d-term { position:relative; padding-left:30px; }
+  .d-termhd { position:relative; display:flex; align-items:flex-start; gap:12px;
+    margin-left:-30px; padding:9px 14px 9px 30px; font-family:"SF Mono",Menlo,monospace;
+    font-size:11px; line-height:18px; }
+  .d-termhd.bd { border-bottom:.5px solid #ffffff1f; }
+  .d-dot { position:absolute; left:8px; top:50%; transform:translateY(-50%);
+    width:10px; height:10px; color:#22c55e; }
+  .d-dot i { position:absolute; inset:20%; border-radius:50%; background:currentColor; display:block; }
+  .d-dot.err { color:#f25a5a }
+  .d-dot.run { width:14px; height:14px; color:#adb2b8; }
+  .d-cwd { flex:none; color:#adb2b8; }
+  .d-cmd { flex:1; min-width:0; color:#f9fafb; white-space:pre; overflow:hidden;
+    text-overflow:ellipsis; }
+  .d-pill { flex:none; height:18px; padding:0 8px; border-radius:999px; background:#2c2c2e;
+    color:#f25a5a; font-family:-apple-system,"PingFang SC",sans-serif; font-size:12px;
+    line-height:18px; }
+  .d-copy { flex:none; color:#cfd3d6; font-family:-apple-system,"PingFang SC",sans-serif;
+    font-size:13px; line-height:18px; }
+  .d-act { flex:none; width:24px; height:24px; display:inline-flex; align-items:center;
+    justify-content:center; color:#cfd3d6; }
+  .d-out { padding:12px 14px 12px 0; font-family:"SF Mono",Menlo,monospace; font-size:11px;
+    line-height:18px; color:#f9fafb; white-space:pre; overflow-x:auto; }
+
+  /* search：banner + body 两段 */
+  .d-banner { display:flex; align-items:center; gap:12px; padding:9px 14px; background:#2c2c2e;
+    font-size:13px; line-height:20px; }
+  .d-banner .l { flex:1; min-width:0; color:#cfd3d6; overflow:hidden; white-space:nowrap;
+    text-overflow:ellipsis; }
+  .d-banner .r { flex:none; color:#cfd3d6; }
+  .d-sbody { padding:8px 14px 12px 0; font-family:"SF Mono",Menlo,monospace; font-size:11px;
+    line-height:19px; color:#f9fafb; overflow-x:auto; }
+  .d-sline { min-height:22px; padding-left:14px; white-space:pre; }
+  .d-ln { color:#adb2b8; }
+  .d-fh { display:flex; align-items:baseline; gap:8px; min-height:22px; padding:0 14px; }
+  .d-fp { min-width:0; font-weight:600; color:#f9fafb; white-space:pre; }
+  .d-fc { flex:none; color:#adb2b8; }
+  .d-more { display:block; padding:0 14px; color:#adb2b8; }
+
+  /* 卡头 = CodeToolbar（read / diff / code 共用） */
+  .d-chead { display:flex; align-items:center; justify-content:space-between; gap:12px;
+    padding:10px 18px 8px 22px; font:11px/18px -apple-system,"PingFang SC",sans-serif;
+    color:#cfd3d6; }
+  .d-chead .h { display:flex; align-items:baseline; gap:12px; min-width:0; }
+  .d-lang { flex:none; font-family:"SF Mono",Menlo,monospace; color:#adb2b8; }
+  .d-ctitle { min-width:0; color:#adb2b8; white-space:nowrap; overflow:hidden;
+    text-overflow:ellipsis; }
+  .d-acts { display:flex; align-items:center; gap:4px; flex:none; }
+  .d-cstatus { margin-right:8px; color:#adb2b8; white-space:nowrap; }
+
+  .d-rbody { padding:6px 22px 20px; font-family:"SF Mono",Menlo,monospace; font-size:11px;
+    line-height:19px; overflow-x:auto; }
+  .d-rline { display:flex; min-height:19px; white-space:pre; }
+  .d-gut { flex:none; width:20px; margin-right:12px; text-align:right; color:#adb2b8; }
+  .d-rc { min-width:0; color:#f9fafb; }
+
+  .d-dbody { padding:6px 0 20px; font-family:"SF Mono",Menlo,monospace; font-size:11px;
+    line-height:19px; overflow-x:auto; }
+  .d-dline { min-height:19px; padding:0 22px; white-space:pre; }
+  .d-path { color:#cfd3d6; font-weight:500; }
+  .d-gap { color:#adb2b8; }
+  .d-add { color:#22c55e; background:#22c55e1f; box-shadow:inset 3px 0 0 #22c55e; }
+  .d-del { color:#f25a5a; background:#f25a5a1f; box-shadow:inset 3px 0 0 #f25a5a; }
+  .d-ctx { color:#cfd3d6; }
+
+  .d-web { padding:12px 14px; display:flex; flex-direction:column; gap:6px; }
+  .d-url { font-family:"SF Mono",Menlo,monospace; font-size:13px; font-weight:500;
+    line-height:19px; color:#7aaaff; word-break:break-all; }
+  .d-meta { display:flex; align-items:baseline; gap:12px; }
+  .d-meta .s { color:#cfd3d6; font-size:13px; line-height:20px; }
+  .d-meta .t { color:#adb2b8; font-size:13px; line-height:20px; }
+  .d-src { padding:12px 14px; }
+  .d-ol { list-style:none; margin:0; padding-left:32px; display:flex; flex-direction:column;
+    gap:10px; max-height:320px; overflow-y:auto; }
+  .d-ol li { position:relative; }
+  .d-ol li::before { content:attr(data-n); position:absolute; left:-32px; width:24px;
+    text-align:right; color:#cfd3d6; font-size:13px; line-height:20px; }
+  .d-slink { color:#7aaaff; font-size:14px; font-weight:500; line-height:20px; }
+  .d-snip { margin-top:2px; color:#cfd3d6; font-size:13px; line-height:19px; }
+  .d-pub { margin-top:2px; color:#adb2b8; font-size:13px; line-height:20px; }
+
+  .d-io { border:.5px solid #ffffff0f; border-radius:16px; background:#1b1b1c;
+    margin:4px 0 4px 4px; font:11px/16px "SF Mono",Menlo,monospace; }
+  .d-ios { display:grid; grid-template-columns:max-content 1fr; align-items:baseline;
+    column-gap:14px; max-height:150px; padding:12px 16px; overflow-y:auto; }
+  .d-iol { color:#81858c; }
+  .d-iot { min-width:0; white-space:pre-wrap; word-break:break-word; color:#cfd3d6; }
+  .d-iod { height:.5px; background:#ffffff1f; }
+
+  .d-thinkbody { padding:4px 0 4px 22px; font-size:13px; line-height:24px; color:#adb2b8; }
+
+  /* ================= ② 改造前（commit b0d6cd9 的真实实现） =================
+     client/tool-call.tsx@3ca141b^（= d804dd1^，206 行）+ tool-call-data.ts@3ca141b^。
+     Paseo 语义色为暗色近似：foregroundMuted #a1a1aa · statusSuccess #6cb17b
+     statusDanger #d8847b（真值由宿主主题在运行时给出）。 */
+  .b-root { display:flex; flex-direction:column; gap:3px; padding:5px 0; }
+  .b-head { display:flex; flex-direction:row; gap:8px; align-items:center; }
+  .b-lead { flex:none; width:16px; height:16px; display:inline-flex; align-items:center;
+    justify-content:center; color:#a1a1aa; }
+  .b-lead.err { color:#d8847b }
+  .b-label { flex:none; color:#a1a1aa; font-size:14px; }
+  .b-sum { flex:1; min-width:0; color:#a1a1aa; font-family:"SF Mono",Menlo,monospace;
+    font-size:13px; line-height:20px; overflow:hidden; white-space:nowrap;
+    text-overflow:ellipsis; }
+  .b-body { margin-left:12px; }
+  .b-surface { background:rgba(127,127,127,.10); border-radius:6px; padding:6px 8px;
+    display:flex; flex-direction:column; gap:2px; }
+  .b-code { color:#a1a1aa; font-family:"SF Mono",Menlo,monospace; font-size:13px;
+    line-height:19px; white-space:pre-wrap; word-break:break-word; }
+  .b-code.head { font-size:13px; line-height:20px; }
+  .b-dline { display:flex; padding:0 6px; }
+  .b-dline.add { background:rgba(46,160,67,.12); }
+  .b-dline.del { background:rgba(248,81,73,.12); }
+  .b-marker { flex:none; width:12px; font-family:"SF Mono",Menlo,monospace; font-size:13px;
+    line-height:19px; color:#a1a1aa; }
+  .b-marker.add { color:#6cb17b } .b-marker.del { color:#d8847b }
+  .b-dtext { flex:1; min-width:0; font-family:"SF Mono",Menlo,monospace; font-size:13px;
+    line-height:19px; color:#a1a1aa; white-space:pre-wrap; word-break:break-word; }
+  .b-think { display:flex; align-items:center; gap:8px; padding:5px 0; color:#a1a1aa; }
+  .b-think .l { flex:none; font-size:12px; opacity:.6 }
+  .b-think .t { flex:1; min-width:0; font-size:14px; line-height:21px; opacity:.7;
+    overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .b-thinkbody { margin-left:12px; color:#a1a1aa; font-size:14px; line-height:21px; opacity:.8; }
+  .b-absent { display:flex; align-items:center; gap:8px; font-size:12px; color:#6b6b73;
+    padding:10px 0; }
+
+  /* ================= ③ 改造后（Paseo 语义色 + DSH 结构） ================= */
+  .n-row { display:flex; align-items:center; height:24px; color:#a1a1aa; }
+  .n-lead { flex:none; width:16px; height:16px; display:inline-flex; align-items:center;
+    justify-content:center; margin-right:6px; }
+  .n-title { flex:none; font-size:13px; line-height:24px; }
+  .n-sep { flex:none; width:2px; height:2px; border-radius:1px; background:#a1a1aa;
+    margin:0 8px; }
+  .n-sum { flex:auto; min-width:0; font-size:13px; line-height:24px; overflow:hidden;
+    white-space:nowrap; text-overflow:ellipsis; }
+  .n-sum.err { color:#d8847b }
+  .n-stat { flex:none; margin-left:10px; font-family:"SF Mono",Menlo,monospace; font-size:11px;
+    line-height:24px; color:#71717a; }
+  .n-card { border:.5px solid #2e2e33; border-radius:16px; background:#1c1c1f;
+    margin:4px 0 4px 4px; overflow:hidden; }
+
+  .n-termhd { display:flex; align-items:flex-start; gap:12px; padding:9px 14px;
+    font-family:"SF Mono",Menlo,monospace; font-size:11px; line-height:18px; }
+  .n-termhd.bd { border-bottom:.5px solid #2e2e33; }
+  .n-cwd { flex:none; color:#a1a1aa; }
+  .n-cmd { flex:1; min-width:0; color:#fafafa; white-space:pre; overflow:hidden;
+    text-overflow:ellipsis; }
+  .n-pill { flex:none; height:18px; padding:0 8px; border-radius:999px; background:#26262a;
+    color:#d8847b; font-family:-apple-system,"PingFang SC",sans-serif; font-size:12px;
+    line-height:18px; }
+  .n-copy { flex:none; color:#a1a1aa; font-family:-apple-system,"PingFang SC",sans-serif;
+    font-size:13px; line-height:18px; }
+  .n-dot { flex:none; width:10px; height:10px; border-radius:50%; background:#6cb17b;
+    align-self:center; }
+  .n-dot.err { background:#d8847b }
+  .n-out { padding:12px 14px; font-family:"SF Mono",Menlo,monospace; font-size:11px;
+    line-height:18px; color:#fafafa; white-space:pre-wrap; word-break:break-word; }
+
+  .n-banner { display:flex; align-items:center; gap:12px; padding:9px 14px; background:#232327;
+    font-size:13px; line-height:20px; }
+  .n-banner .l { flex:1; min-width:0; color:#a1a1aa; overflow:hidden; white-space:nowrap;
+    text-overflow:ellipsis; }
+  .n-banner .r { flex:none; color:#a1a1aa; }
+  .n-sbody { padding:8px 14px 12px 0; font-family:"SF Mono",Menlo,monospace; font-size:11px;
+    line-height:19px; color:#fafafa; }
+  /* 代码正文（11/19、前景色）—— 兜底代码面用 */
+  .n-pre { font-family:"SF Mono",Menlo,monospace; font-size:11px; line-height:19px;
+    color:#fafafa; white-space:pre-wrap; word-break:break-word; }
+  .n-sline { min-height:22px; padding-left:14px; white-space:pre; }
+  .n-ln { color:#71717a; }
+  .n-fh { display:flex; align-items:flex-start; gap:8px; min-height:22px; padding:0 14px; }
+  .n-fp { min-width:0; font-weight:600; color:#fafafa; white-space:pre; }
+  .n-fc { flex:none; color:#71717a; }
+  .n-more { display:block; padding:0 14px; color:#71717a; }
+
+  .n-chead { display:flex; align-items:center; justify-content:space-between; gap:12px;
+    padding:10px 18px 8px 22px; font:11px/18px -apple-system,"PingFang SC",sans-serif;
+    color:#a1a1aa; }
+  .n-chead .h { display:flex; align-items:baseline; gap:12px; min-width:0; }
+  .n-lang { flex:none; font-family:"SF Mono",Menlo,monospace; color:#71717a; }
+  .n-ctitle { min-width:0; color:#71717a; white-space:nowrap; overflow:hidden;
+    text-overflow:ellipsis; }
+  .n-acts { display:flex; align-items:center; gap:4px; flex:none; }
+  .n-cstatus { margin-right:8px; color:#71717a; white-space:nowrap; }
+  .n-copy2 { flex:none; color:#71717a; font-size:13px; line-height:20px; }
+
+  .n-rbody { padding:6px 22px 20px; font-family:"SF Mono",Menlo,monospace; font-size:11px;
+    line-height:19px; overflow-x:auto; }
+  .n-rline { display:flex; min-height:19px; white-space:pre; }
+  .n-gut { flex:none; width:20px; margin-right:12px; text-align:right; color:#71717a; }
+  .n-rc { min-width:0; color:#fafafa; }
+
+  .n-dbody { padding:6px 0 20px; font-family:"SF Mono",Menlo,monospace; font-size:11px;
+    line-height:19px; overflow-x:auto; }
+  .n-dline { display:flex; min-height:19px; padding:0 22px; white-space:pre-wrap;
+    word-break:break-word; border-left:3px solid transparent; }
+  .n-dline.chrome { border-left-color:transparent; }
+  .n-path { color:#a1a1aa; font-weight:500; }
+  .n-gap { color:#71717a; }
+  .n-add { color:#6cb17b; background:rgba(108,177,123,.12); border-left-color:#6cb17b; }
+  .n-del { color:#d8847b; background:rgba(216,132,123,.12); border-left-color:#d8847b; }
+  .n-ctx { color:#a1a1aa; }
+  .n-mk { flex:none; width:12px; }
+
+  .n-web { padding:12px 14px; display:flex; flex-direction:column; gap:6px; }
+  .n-url { font-family:"SF Mono",Menlo,monospace; font-size:13px; font-weight:500;
+    line-height:19px; color:#8ba4ff; word-break:break-all; }
+  .n-meta { display:flex; align-items:baseline; gap:12px; }
+  .n-meta .s { color:#a1a1aa; font-size:13px; line-height:20px; }
+  .n-meta .t { color:#71717a; font-size:13px; line-height:20px; }
+  .n-ol { list-style:none; margin:0; padding:0; display:flex; flex-direction:column;
+    gap:10px; max-height:320px; overflow-y:auto; }
+  .n-li { display:flex; align-items:flex-start; }
+  .n-idx { flex:none; width:24px; margin-right:8px; text-align:right; color:#71717a;
+    font-size:13px; line-height:20px; }
+  .n-lib { flex:1; min-width:0; }
+  .n-slink { color:#8ba4ff; font-size:14px; font-weight:500; line-height:20px; }
+  .n-snip { margin-top:2px; color:#a1a1aa; font-size:13px; line-height:19px; }
+  .n-pub { margin-top:2px; color:#71717a; font-size:13px; line-height:20px; }
+
+  .n-io { border:.5px solid #2e2e33; border-radius:16px; background:#1c1c1f;
+    margin:4px 0 4px 4px; font:11px/16px "SF Mono",Menlo,monospace; }
+  .n-ios { display:flex; gap:14px; max-height:150px; padding:12px 16px; overflow-y:auto; }
+  .n-iol { flex:none; width:32px; color:#71717a; }
+  .n-iot { flex:1; min-width:0; white-space:pre-wrap; word-break:break-word; color:#a1a1aa; }
+  .n-iod { height:.5px; background:#2e2e33; }
+
+  .n-thinkbody { margin-left:4px; color:#a1a1aa; font-size:14px; line-height:21px; opacity:.8; }
+
+  /* 压缩行的 Paseo 原生 marker：形状示意（渲染器不在本仓库） */
+  .n-marker { display:flex; align-items:center; gap:8px; color:#71717a; }
+  .n-marker .rule { flex:1; height:1px; background:#2e2e33; }
+  .n-marker .lbl { flex:none; font-size:12px; line-height:18px; color:#a1a1aa;
+    background:#232327; border-radius:999px; padding:2px 10px; }
+  .n-marker .sp { width:12px; height:12px; border-radius:50%; border:1.5px solid #71717a;
+    border-top-color:transparent; flex:none; }
+  .kv { font-family:"SF Mono",Menlo,monospace; font-size:10.5px; line-height:17px;
+    color:#7c7c85; margin-top:8px; }
+  .kv b { color:#a9aeb4; font-weight:500; }
+
+  @media (max-width:1000px) {
+    .cols { grid-template-columns:minmax(0,1fr); gap:22px; }
+    body { padding:20px 14px 60px; }
+    .d-sum, .b-sum, .n-sum { min-width:0; }
+  }
+</style></head>
+<body>
+
+<h1>工具行渲染 · 三栏对比（DSH 原样 / 改造前 / 改造后）</h1>
+<p class="lede">
+  每一类块占一行，左＝<b>DSH 原样</b>（数值逐字来自它自己的 CSS），中＝<b>改造前</b>（<code>git show 3ca141b^:paseo-plugin/client/tool-call.tsx</code> 与 <code>d804dd1^</code> 的真实实现，两者同源），右＝<b>改造后</b>（目标形态；<span class="badge done">已实现</span> 表示已提交，<span class="badge plan">计划</span> 表示尚未写）。
+</p>
+
+<div class="legend">
+  <div><b>颜色＝栏位</b>：<span class="sw" style="background:#6b7075"></span><span class="c-dsh">DSH 灰</span>　
+    <span class="sw" style="background:#8c4a44"></span><span class="c-before">改造前 红/暗</span>　
+    <span class="sw" style="background:#3f7a55"></span><span class="c-after">改造后 绿</span></div>
+  <div><b>徽章＝进度</b>：<span class="badge done">已实现</span> 已提交（<code>d804dd1</code> Phase 0 · <code>3ca141b</code> Phase 1+3 · <code>bdcc5d1</code> Phase 2 + Phase 4a）·
+    <span class="badge plan">计划</span> 尚未写（Phase 4b 剩余：图片块 / ioCard 两段；或计划外）。快照 2026-10-16 21:35 CST，HEAD <code>bdcc5d1</code></div>
+  <div><b>DSH 侧数值</b>：取自 <code>@deepseek-ai/dsh</code> 的 <code>*.module.css</code> 与 <code>dsh-client-ui-tool/lib/client.js</code>；暗色 token 十六进制取自 <code>dsh-client-ui-theme</code>。<code>--dsh-content-font-delta</code> 取默认 0，所以行高就是 24px、字号 13px。</div>
+  <div><b>链接色</b>：DSH 已查到真值 —— <code>--dsw-alias-link</code> = <code>--dsw-static-deepseek-400</code> = <span style="color:#7aaaff">#7aaaff</span>（暗色），不再是近似；Paseo 一侧的 accent 仍是近似 <span style="color:#8ba4ff">#8ba4ff</span>（真值由宿主主题在运行时给出）。</div>
+  <div><b>配色决策</b>：diff 用 Paseo 语义色（低饱和 <span style="color:#6cb17b">#6cb17b</span> / <span style="color:#d8847b">#d8847b</span>），DSH 栏照它原样用高饱和 <span style="color:#22c55e">#22c55e</span> / <span style="color:#f25a5a">#f25a5a</span>。标本托盘底色是中性面，不是任何一方的真实背景。</div>
+  <div><b>图标</b>：行首图标是内联示意 SVG（DSH 的真图标是它自己的 icon 组件）——只影响图形，不影响任何数值。下方虚线框＝计划中、尚未落地的形状。</div>
+</div>
+
+<nav class="toc">
+  <a href="#b1">① 行头（折叠态）</a>
+  <a href="#b2">② 命令展开</a>
+  <a href="#b3">③ 搜索结果展开</a>
+  <a href="#b4">④ 读取展开</a>
+  <a href="#b5">⑤ 编辑 / 新建展开</a>
+  <a href="#b6">⑥ 网页搜索 / 抓取</a>
+  <a href="#b7">⑦ MCP / 未知工具</a>
+  <a href="#b8">⑧ 代码展开</a>
+  <a href="#b9">⑨ 思考行</a>
+  <a href="#b10">⑩ 压缩行</a>
+  <a href="#b11">不确定项与已知偏差</a>
+</nav>
+
+<!-- ============================ ① 行头 ============================ -->
+<section class="cat" id="b1">
+  <h2><span class="num">①</span>行头（折叠态）</h2>
+  <p class="desc">命令行 / 搜索行 / 编辑行 / MCP 行各一条。DSH 的规则：固定 24px 单行、无垂直 padding，前导图标（hover 时换成 chevron）→ 标题 → 2×2 方块 → 摘要 →（diff 行）+A -R。</p>
+  <div class="cols">
+    <div class="cell"><div class="clab dsh"><span class="dot"></span>DSH 原样</div>
+      <div class="box">
+        <div class="d-row"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><path d="M3 5.2l2.5 2.5L3 10.2"/><path d="M8.3 10.4h4.9"/></svg></span><span class="d-title">运行命令</span><span class="d-sep"></span><span class="d-sum">List DSH checkout root</span></div>
+        <div class="d-row"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.1"/><path d="M10.1 10.1l3.3 3.3"/></svg></span><span class="d-title">搜索文件内容</span><span class="d-sep"></span><span class="d-sum">persistence handle</span></div>
+        <div class="d-row"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><path d="M10.6 2.9l2.5 2.5-7.3 7.3-3.2.7.7-3.2z"/><path d="M9.3 4.2l2.5 2.5"/></svg></span><span class="d-title">编辑</span><span class="d-sep"></span><span class="d-sum">client/tool-call.tsx</span><span class="d-stat">+12 -3</span></div>
+        <div class="d-row"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><path d="M9.9 2.6a3.4 3.4 0 00-3.1 4.7l-4 4a1.1 1.1 0 001.6 1.6l4-4a3.4 3.4 0 004.6-4.4l-2 2-1.6-1.6z"/></svg></span><span class="d-title">工具调用</span><span class="d-sep"></span><span class="d-sum">mcp__paseo__list_workspaces · {}</span></div>
+      </div>
+    </div>
+    <div class="cell"><div class="clab before"><span class="dot"></span>改造前</div>
+      <div class="box">
+        <div class="b-root">
+          <div class="b-head"><span class="b-lead"><svg class="i" viewBox="0 0 16 16"><path d="M3 5.2l2.5 2.5L3 10.2"/><path d="M8.3 10.4h4.9"/></svg></span><span class="b-label">命令</span><span class="b-sum">pnpm test --filter paseo-plugin</span></div>
+          <div class="b-head"><span class="b-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.1"/><path d="M10.1 10.1l3.3 3.3"/></svg></span><span class="b-label">搜索</span><span class="b-sum">persistence handle</span></div>
+          <div class="b-head"><span class="b-lead"><svg class="i" viewBox="0 0 16 16"><path d="M10.6 2.9l2.5 2.5-7.3 7.3-3.2.7.7-3.2z"/><path d="M9.3 4.2l2.5 2.5"/></svg></span><span class="b-label">编辑</span><span class="b-sum">client/tool-call.tsx</span></div>
+          <div class="b-head"><span class="b-lead"><svg class="i" viewBox="0 0 16 16"><path d="M9.9 2.6a3.4 3.4 0 00-3.1 4.7l-4 4a1.1 1.1 0 001.6 1.6l4-4a3.4 3.4 0 004.6-4.4l-2 2-1.6-1.6z"/></svg></span><span class="b-label">创建心跳</span><span class="b-sum">{"cron":"* * * * *"}</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="cell"><div class="clab after"><span class="dot"></span>改造后<span class="badge done">已实现 · Phase 1/3</span></div>
+      <div class="box">
+        <div class="n-row"><span class="n-lead"><svg class="i" viewBox="0 0 16 16"><path d="M3 5.2l2.5 2.5L3 10.2"/><path d="M8.3 10.4h4.9"/></svg></span><span class="n-title">运行命令</span><span class="n-sep"></span><span class="n-sum">List DSH checkout root</span></div>
+        <div class="n-row"><span class="n-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.1"/><path d="M10.1 10.1l3.3 3.3"/></svg></span><span class="n-title">搜索文件内容</span><span class="n-sep"></span><span class="n-sum">persistence handle</span></div>
+        <div class="n-row"><span class="n-lead"><svg class="i" viewBox="0 0 16 16"><path d="M10.6 2.9l2.5 2.5-7.3 7.3-3.2.7.7-3.2z"/><path d="M9.3 4.2l2.5 2.5"/></svg></span><span class="n-title">编辑</span><span class="n-sep"></span><span class="n-sum">client/tool-call.tsx</span><span class="n-stat">+12 -3</span></div>
+        <div class="n-row"><span class="n-lead"><svg class="i" viewBox="0 0 16 16"><path d="M9.9 2.6a3.4 3.4 0 00-3.1 4.7l-4 4a1.1 1.1 0 001.6 1.6l4-4a3.4 3.4 0 004.6-4.4l-2 2-1.6-1.6z"/></svg></span><span class="n-title">创建心跳</span><span class="n-sep"></span><span class="n-sum">{"cron":"* * * * *"}</span></div>
+      </div>
+    </div>
+  </div>
+  <p class="note"><b>要点</b>：DSH 是<b>固定 24px 单行、行自身零垂直 padding</b>；改造前是 <code>paddingVertical 5</code> + <code>gap 3</code> —— 同样 4 行明显更高更散。摘要在 DSH 是 <b>UI 字体 13/24</b>，改造前是<b>等宽 13/20</b>（最扎眼的一处差别，Phase 1 已改掉）。标题与摘要之间那个点是 <b>2×2px、圆角 1px 的方块</b>（<code>margin: 0 8px</code>，不是圆点）；<code>+A -R</code> 是 <b>11px 等宽、<code>margin-left: 10px</code></b>，改造前没有。RN 妥协：DSH 的 <code>:hover</code>（标题/摘要换色、图标换 chevron）在 RN 原生没有等价（RN Web 有 <code>hovered</code>，iOS 没有）→ <span class="warn">我们不做 hover 态</span>。标题文案已在 <code>bdcc5d1</code> 按 DSH 的 <code>tool.title.*</code> 对齐（「运行命令」「搜索文件内容」；英文表不规则就照抄：bash=<code>Bash</code>、grep=<code>Grep</code>、glob=<code>Glob</code>），只有 MCP 行仍用 Paseo 自己的中文名（DSH 是「工具调用 · 工具名」）——这是刻意的，不是遗漏。<span class="warn">仍差 1px</span>：DSH 行头与卡片之间的间距来自卡片自身的 <code>margin-top: 4px</code>，我们的 <code>ROW_GAP</code> 是 3px，未收口。</p>
+</section>
+
+<!-- ============================ ② 命令展开 ============================ -->
+<section class="cat" id="b2">
+  <h2><span class="num">②</span>命令展开（terminal）</h2>
+  <p class="desc">三种状态：运行中（14px 旋转环）/ 成功（绿实心点）/ 失败（红实心点 + 「退出码 1」pill）。复制按钮在三种状态下都在。</p>
+  <div class="cols">
+    <div class="cell"><div class="clab dsh"><span class="dot"></span>DSH 原样</div>
+      <div class="box">
+        <div class="cap">运行中 · 卡片自身预留 30px 圆点栏，命令与输出都从 30px 起排</div>
+        <div class="d-card d-term">
+          <div class="d-termhd"><span class="d-dot run"><svg class="spin" viewBox="0 0 24 24"><circle class="trk" cx="12" cy="12" r="9.5"/><circle class="arc" cx="12" cy="12" r="9.5"/></svg></span><span class="d-cwd">~/apps/paseo-dsh</span><span class="d-cmd">pnpm test --filter paseo-plugin</span><span class="d-copy">复制</span></div>
+        </div>
+        <div class="cap mt">成功 · 实心点外径 10px（<code>inset: 20%</code> → 6px 核）</div>
+        <div class="d-card d-term">
+          <div class="d-termhd bd"><span class="d-dot"><i></i></span><span class="d-cwd">~/apps/paseo-dsh</span><span class="d-cmd">pnpm test --filter paseo-plugin</span><span class="d-copy">复制</span></div>
+          <div class="d-out">PASS  tool-call-check.cjs   89/89
+PASS  subagent-check.cjs    50/50
+PASS  thinking-check.cjs    17/17</div>
+        </div>
+        <div class="cap mt">失败 · 同一个实心点换 currentColor，pill 只在失败时出现</div>
+        <div class="d-card d-term">
+          <div class="d-termhd bd"><span class="d-dot err"><i></i></span><span class="d-cwd">~</span><span class="d-cmd">pnpm lint</span><span class="d-pill">退出码 1</span><span class="d-copy">复制</span></div>
+          <div class="d-out">✖ 3 problems (3 errors, 0 warnings)</div>
+        </div>
+      </div>
+    </div>
+    <div class="cell"><div class="clab before"><span class="dot"></span>改造前</div>
+      <div class="box">
+        <div class="cap">一个灰底圆角面里，命令与输出同色同字号</div>
+        <div class="b-root">
+          <div class="b-head"><span class="b-lead"><svg class="i" viewBox="0 0 16 16"><path d="M3 5.2l2.5 2.5L3 10.2"/><path d="M8.3 10.4h4.9"/></svg></span><span class="b-label">命令</span><span class="b-sum">List DSH checkout root</span></div>
+          <div class="b-body"><div class="b-surface">
+            <div class="b-code head">pnpm test --filter paseo-plugin</div>
+            <div class="b-code">PASS  tool-call-check.cjs   89/89
+PASS  subagent-check.cjs    50/50
+PASS  thinking-check.cjs    17/17</div>
+          </div></div>
+        </div>
+      </div>
+    </div>
+    <div class="cell"><div class="clab after"><span class="dot"></span>改造后<span class="badge done">已实现</span><span class="badge plan">状态点 / 退出码 pill / 终端复制 计划</span></div>
+      <div class="box">
+        <div class="cap">已实现（Phase 1）：命令区 + 0.5px 分隔线 + 输出区，无输出时不画线</div>
+        <div class="n-row"><span class="n-lead"><svg class="i" viewBox="0 0 16 16"><path d="M3 5.2l2.5 2.5L3 10.2"/><path d="M8.3 10.4h4.9"/></svg></span><span class="n-title">命令</span><span class="n-sep"></span><span class="n-sum">List DSH checkout root</span></div>
+        <div class="n-card">
+          <div class="n-termhd bd"><span class="n-cwd">~/apps/paseo-dsh</span><span class="n-cmd">pnpm test --filter paseo-plugin</span></div>
+          <div class="n-out">PASS  tool-call-check.cjs   89/89
+PASS  subagent-check.cjs    50/50
+PASS  thinking-check.cjs    17/17</div>
+        </div>
+        <div class="cap mt">计划：状态点 + 失败 pill + 复制（虚线＝尚未落地；卡片不再留 30px 栏，命令/输出从 14px 起排）</div>
+        <div class="ghost">
+          <div class="n-termhd bd"><span class="n-dot err"></span><span class="n-cwd">~</span><span class="n-cmd">pnpm lint</span><span class="n-pill">退出码 1</span><span class="n-copy">复制</span></div>
+          <div class="n-out">✖ 3 problems (3 errors, 0 warnings)</div>
+          <div class="kv">载入状态：<b>running</b> → 14px 旋转环（1.5s）· <b>exitCode 0</b> → 绿实心点 · <b>非 0 / signal / exitCode null</b> → 红实心点 + pill「退出码 N」「信号 X」「未正常退出」</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <p class="note"><b>要点</b>：DSH <b>没有叉形失败图标</b> —— 四种实心态共用同一个实心圆点，只换 <code>currentColor</code>；运行中是唯一非圆点状态（14px 的环 + 呼吸弧，两者共用一个 1.5s 周期）。pill 自身 24px，在工具行里被压到 <b>18px</b>（<code>0 8px</code>、圆角 999、底 <code>bg-layer-2</code> = #2c2c2e、字 <code>state-error-primary</code>），<b>只在失败时渲染</b>。复制按钮 13/20、<code>label-secondary</code>，1000ms 反馈；出现条件是 <code>copyText !== undefined || (!running &amp;&amp; !empty)</code>。RN 妥协：<code>::after</code> 画核 → 内层绝对定位 <code>View</code>；旋转 + dash 呼吸 → <code>Animated</code> / <code>react-native-svg</code>（<code>strokeDasharray/Offset</code> 都支持，但"把两个动画的起点钉在一起"的 <code>getAnimations()+startTime=0</code> 是 Web 专有）；pill 与复制键的 <code>position: sticky</code>（长命令滚动时吸顶）<b>无解</b> → 只能把它们移出滚动容器；输出"对齐就是语义"的 <code>white-space: pre</code> <b>无等价</b> → 横向 ScrollView（<span class="warn">这一条还没接上</span>：改造后与改造前的输出区都是会折行的 <code>Text</code>，本图里也就是折行的样子，而 DSH 那一栏保持原样并横向滚）。结构上还差一列：DSH 卡片自带 30px 圆点栏，我们没做状态点，所以命令/输出从 14px 起排；另外 <code>COMMAND_LINE_HEIGHT</code> 现在写的是 16px，而 DSH 的 <code>.promptLine</code> 用的是 <code>--dsl-terminal-line-height</code>，被 ToolRow 重绑成 <b>18px</b>（16px 只是 <code>--dsl-terminal-font</code> 简写里的行高）。</p>
+</section>
+
+<!-- ============================ ③ 搜索结果 ============================ -->
+<section class="cat" id="b3">
+  <h2><span class="num">③</span>搜索结果展开（grep / glob）</h2>
+  <p class="desc">统计文案 + 文件分组 + <code>行号: </code> 前缀 + 折叠按钮。9 处匹配、2 个文件、折叠 8 行（头 4 + 尾 4）。</p>
+  <div class="cols">
+    <div class="cell"><div class="clab dsh"><span class="dot"></span>DSH 原样</div>
+      <div class="box">
+        <div class="d-row"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.1"/><path d="M10.1 10.1l3.3 3.3"/></svg></span><span class="d-title">搜索文件内容</span><span class="d-sep"></span><span class="d-sum">persistence handle</span></div>
+        <div class="d-card">
+          <div class="d-banner"><span class="l">9 处匹配 · 2 个文件</span><span class="r">复制</span></div>
+          <div class="d-sbody">
+            <div class="d-fh"><span class="d-fp">client/newest.ts</span><span class="d-fc">5</span></div>
+            <div class="d-sline"><span class="d-ln">42: </span>  const handle = persistence.handle;</div>
+            <div class="d-sline"><span class="d-ln">88: </span>  if (handle === undefined) return;</div>
+            <div class="d-sline"><span class="d-ln">101: </span>  noteRender(handle, at);</div>
+            <div class="d-more">… 其余 3 行</div>
+            <div class="d-fh"><span class="d-fp">server/session.ts</span><span class="d-fc">4</span></div>
+            <div class="d-sline"><span class="d-ln">601: </span>  // persistence handle names a session</div>
+            <div class="d-sline"><span class="d-ln">748: </span>  const handle = session.handle;</div>
+            <div class="d-sline"><span class="d-ln">812: </span>  return handle;</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="cell"><div class="clab before"><span class="dot"></span>改造前</div>
+      <div class="box">
+        <div class="cap">grep 的原始文本整段塞进 body，没有分组、没有行号语义</div>
+        <div class="b-root">
+          <div class="b-head"><span class="b-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.1"/><path d="M10.1 10.1l3.3 3.3"/></svg></span><span class="b-label">搜索</span><span class="b-sum">persistence handle</span></div>
+          <div class="b-body"><div class="b-surface">
+            <div class="b-code">client/newest.ts:42:  const handle = persistence.handle;
+client/newest.ts:88:  if (handle === undefined) return;
+client/newest.ts:101:  noteRender(handle, at);
+client/newest.ts:120:  persistence.handle = handle;
+client/newest.ts:134:  if (persistence.handle) return true;
+server/session.ts:563:  // persistence handle names a session
+server/session.ts:601:  // persistence handle names a session
+server/session.ts:748:  const handle = session.handle;
+server/session.ts:812:  return handle;</div>
+          </div></div>
+        </div>
+        <div class="cap mt">整段原始文本：没有统计、没有文件分组、没有「… 其余 N 行」；RN 的 <code>Text</code> 默认折行，所以长行会断开（DSH 是 <code>pre</code>）</div>
+      </div>
+    </div>
+    <div class="cell"><div class="clab after"><span class="dot"></span>改造后<span class="badge done">已实现 · Phase 2</span></div>
+      <div class="box">
+        <div class="n-row"><span class="n-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.1"/><path d="M10.1 10.1l3.3 3.3"/></svg></span><span class="n-title">搜索文件内容</span><span class="n-sep"></span><span class="n-sum">persistence handle</span></div>
+        <div class="n-card">
+          <div class="n-banner"><span class="l">9 处匹配 · 2 个文件</span><span class="r">复制</span></div>
+          <div class="n-sbody">
+            <div class="n-fh"><span class="n-fp">client/newest.ts</span><span class="n-fc">5</span></div>
+            <div class="n-sline"><span class="n-ln">42: </span>  const handle = persistence.handle;</div>
+            <div class="n-sline"><span class="n-ln">88: </span>  if (handle === undefined) return;</div>
+            <div class="n-sline"><span class="n-ln">101: </span>  noteRender(handle, at);</div>
+            <div class="n-more">… 其余 3 行</div>
+            <div class="n-fh"><span class="n-fp">server/session.ts</span><span class="n-fc">4</span></div>
+            <div class="n-sline"><span class="n-ln">601: </span>  // persistence handle names a session</div>
+            <div class="n-sline"><span class="n-ln">748: </span>  const handle = session.handle;</div>
+            <div class="n-sline"><span class="n-ln">812: </span>  return handle;</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <p class="note"><b>要点</b>：DSH <b>不高亮命中子串</b>（没有 <code>&lt;mark&gt;</code>、没有切片），被弱化的只有行号（<code>label-tertiary</code>）—— 我们照做，不发明高亮。统计文案逐字一致，含截断变体：<code>{shown} 处匹配 · {files} 个文件</code> / 截断时 <code>显示 {shown} / 共 {total} 处匹配 · {files} 个文件</code>（匹配数在前）。文件分组是<b>粗体 600 路径（label-primary）+ 计数</b>，整行可点开合。折叠 8 行 = <b>头 4 + 「… 其余 N 行」+ 尾 4</b>，同一个控件展开后变「收起」；尾部若从组中间开始且组头没在头部出现，DSH 会<b>补画一个文件头占掉尾部第一行</b>（我们逐字照做，<code>head.some(...)</code> 判断一致）。RN 妥协：<code>white-space: pre</code> + <code>overflow-x: auto</code> <b>没有等价物</b>（<code>numberOfLines={1}</code> 是截断不是滚动）→ 每行放进横向 <code>ScrollView</code>；<code>align-items: baseline</code> 在 Yoga 里不存在 → <code>flex-start</code>；<code>:hover</code> 换色 → 不做。数据早就有：DSH 的 grep meta 带 <code>files[{path,matches[{lineNumber,line}]}]</code>、<code>total</code>、<code>truncated</code>，Phase 0 已透传，Phase 2 才画出来。</p>
+</section>
+
+<!-- ============================ ④ 读取 ============================ -->
+<section class="cat" id="b4">
+  <h2><span class="num">④</span>读取展开（read）</h2>
+  <p class="desc">行号栏 + 卡头（语言标签 / 路径 / 「显示 X / Y 行」/ 复制）。</p>
+  <div class="cols">
+    <div class="cell"><div class="clab dsh"><span class="dot"></span>DSH 原样</div>
+      <div class="box">
+        <div class="d-row"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.1"/><path d="M10.1 10.1l3.3 3.3"/></svg></span><span class="d-title">读取</span><span class="d-sep"></span><span class="d-sum">client/newest.ts</span></div>
+        <div class="d-card">
+          <div class="d-chead">
+            <span class="h"><span class="d-lang">typescript</span><span class="d-ctitle">client/newest.ts</span></span>
+            <span class="d-acts"><span class="d-cstatus">显示 3 / 128 行</span><span class="d-act"><svg class="i" viewBox="0 0 16 16"><rect x="5.6" y="5.6" width="7.6" height="7.6" rx="1.6"/><path d="M10.4 5.6V3.9a1.3 1.3 0 00-1.3-1.3H3.9a1.3 1.3 0 00-1.3 1.3v5.2a1.3 1.3 0 001.3 1.3h1.7"/></svg></span><span class="d-act"><svg class="i" viewBox="0 0 16 16"><path d="M2.4 4h11.2"/><path d="M2.4 8h7.4a2.6 2.6 0 010 5.2H7.6"/><path d="M9.2 11.4l-1.8 1.8 1.8 1.8"/><path d="M2.4 12.6h3.4"/></svg></span></span>
+          </div>
+          <div class="d-rbody">
+            <div class="d-rline"><span class="d-gut">41</span><span class="d-rc">export function noteRender(id, at) {</span></div>
+            <div class="d-rline"><span class="d-gut">42</span><span class="d-rc">  const handle = persistence.handle;</span></div>
+            <div class="d-rline"><span class="d-gut">43</span><span class="d-rc">  return handle !== undefined;</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="cell"><div class="clab before"><span class="dot"></span>改造前</div>
+      <div class="box">
+        <div class="cap">文件正文整段当纯文本，没有行号、没有卡头</div>
+        <div class="b-root">
+          <div class="b-head"><span class="b-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.1"/><path d="M10.1 10.1l3.3 3.3"/></svg></span><span class="b-label">读取</span><span class="b-sum">client/newest.ts</span></div>
+          <div class="b-body"><div class="b-surface">
+            <div class="b-code">export function noteRender(agentId, at) {
+  const handle = persistence.handle;
+  return handle !== undefined;
+}</div>
+          </div></div>
+        </div>
+      </div>
+    </div>
+    <div class="cell"><div class="clab after"><span class="dot"></span>改造后<span class="badge done">已实现 · Phase 2</span></div>
+      <div class="box">
+        <div class="n-row"><span class="n-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.1"/><path d="M10.1 10.1l3.3 3.3"/></svg></span><span class="n-title">读取</span><span class="n-sep"></span><span class="n-sum">client/newest.ts</span></div>
+        <div class="n-card">
+          <div class="n-chead">
+            <span class="h"><span class="n-lang">typescript</span><span class="n-ctitle">client/newest.ts</span></span>
+            <span class="n-acts"><span class="n-cstatus">显示 3 / 128 行</span><span class="n-copy2">复制</span></span>
+          </div>
+          <div class="n-rbody">
+            <div class="n-rline"><span class="n-gut">41</span><span class="n-rc">export function noteRender(id, at) {</span></div>
+            <div class="n-rline"><span class="n-gut">42</span><span class="n-rc">  const handle = persistence.handle;</span></div>
+            <div class="n-rline"><span class="n-gut">43</span><span class="n-rc">  return handle !== undefined;</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <p class="note"><b>要点</b>：行号栏 DSH 是 <code>width: max(3, 位数)ch; margin-right: 12px; text-align: right;</code> 色 <code>label-tertiary</code>，并且 <code>user-select: none</code>（行号是装饰，复制正文不该带上它）；正文 <code>label-primary</code>，行高 19px。卡头就是 CodeToolbar：<code>padding: 10px 18px 8px 22px</code>、<code>font: 11px/18px</code>，语言标签等宽 + tertiary，标题 tertiary 单行省略，状态槽放「显示 X / Y 行」（<code>read.window</code>，只在 <code>lines.length &lt; totalLines</code> 时出现），动作区 <code>gap: 4px</code>。RN 妥协：<code>ch</code> 单位不存在 → 按位数 × 6.6px（11px 等宽下 1ch 的实测值）手算，本图里的 3 位数就是 20px；<code>user-select: none</code> → 不 <code>selectable</code> + <code>aria-hidden</code>；<code>white-space: pre</code> → 横向 ScrollView。<b>我们和 DSH 有两处形制差异</b>：动作区 DSH 是两个 24×24 图标按钮（复制 + 换行开关），我们是文字「复制」且<b>没有换行开关</b>（插件不能假设宿主有哪个图标名；而"换行开关"在 RN 上本来就没有意义，因为 RN 的 Text 一直会换行）。折叠同样是 8 行（4+4）。</p>
+</section>
+
+<!-- ============================ ⑤ 编辑 / 新建 ============================ -->
+<section class="cat" id="b5">
+  <h2><span class="num">⑤</span>编辑 / 新建展开（edit / write → DiffBlock）</h2>
+  <p class="desc">3px 左竖条 + <code>+ </code>/<code>- </code> 前缀 + 卡头；DSH 没有 <code>@@</code>，同一文件的多段用 <code>⋯</code> 分隔。</p>
+  <div class="cols">
+    <div class="cell"><div class="clab dsh"><span class="dot"></span>DSH 原样</div>
+      <div class="box">
+        <div class="d-row"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><path d="M10.6 2.9l2.5 2.5-7.3 7.3-3.2.7.7-3.2z"/><path d="M9.3 4.2l2.5 2.5"/></svg></span><span class="d-title">编辑</span><span class="d-sep"></span><span class="d-sum">client/tool-call.tsx</span><span class="d-stat">+12 -3</span></div>
+        <div class="d-card">
+          <div class="d-chead">
+            <span class="h"><span class="d-lang">tsx</span></span>
+            <span class="d-acts"><span class="d-act"><svg class="i" viewBox="0 0 16 16"><rect x="5.6" y="5.6" width="7.6" height="7.6" rx="1.6"/><path d="M10.4 5.6V3.9a1.3 1.3 0 00-1.3-1.3H3.9a1.3 1.3 0 00-1.3 1.3v5.2a1.3 1.3 0 001.3 1.3h1.7"/></svg></span><span class="d-act"><svg class="i" viewBox="0 0 16 16"><path d="M2.4 4h11.2"/><path d="M2.4 8h7.4a2.6 2.6 0 010 5.2H7.6"/><path d="M9.2 11.4l-1.8 1.8 1.8 1.8"/><path d="M2.4 12.6h3.4"/></svg></span></span>
+          </div>
+          <div class="d-dbody">
+            <div class="d-dline d-path">client/tool-call.tsx</div>
+            <div class="d-dline d-del">-   borderRadius: 6,</div>
+            <div class="d-dline d-add">+   borderRadius: 16,</div>
+            <div class="d-dline d-add">+   borderWidth: 0.5,</div>
+            <div class="d-dline d-ctx">  }</div>
+            <div class="d-dline d-gap">⋯</div>
+            <div class="d-dline d-ctx">  gap: 8,</div>
+            <div class="d-dline d-add">+   gap: 6,</div>
+          </div>
+        </div>
+        <div class="cap mt">新建（write）走同一个 DiffBlock —— 只是整块都是 <code>+</code> 行，没有"新建"标记</div>
+        <div class="d-card">
+          <div class="d-chead"><span class="h"><span class="d-lang">markdown</span></span><span class="d-acts"><span class="d-act"><svg class="i" viewBox="0 0 16 16"><rect x="5.6" y="5.6" width="7.6" height="7.6" rx="1.6"/><path d="M10.4 5.6V3.9a1.3 1.3 0 00-1.3-1.3H3.9a1.3 1.3 0 00-1.3 1.3v5.2a1.3 1.3 0 001.3 1.3h1.7"/></svg></span></span></div>
+          <div class="d-dbody">
+            <div class="d-dline d-path">docs/NOTES.md</div>
+            <div class="d-dline d-add">+ # 现场笔记</div>
+            <div class="d-dline d-add">+ </div>
+            <div class="d-dline d-add">+ 静默降级是最贵的一类错。</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="cell"><div class="clab before"><span class="dot"></span>改造前</div>
+      <div class="box">
+        <div class="cap">同一个灰底面上画 diff：只有底色 + 彩色 <code>+/-</code> 标记，没有竖条、没有卡头</div>
+        <div class="b-root">
+          <div class="b-head"><span class="b-lead"><svg class="i" viewBox="0 0 16 16"><path d="M10.6 2.9l2.5 2.5-7.3 7.3-3.2.7.7-3.2z"/><path d="M9.3 4.2l2.5 2.5"/></svg></span><span class="b-label">编辑</span><span class="b-sum">client/tool-call.tsx</span></div>
+          <div class="b-body"><div class="b-surface">
+            <div class="b-dline"><span class="b-marker"> </span><span class="b-dtext">  const styles = {</span></div>
+            <div class="b-dline del"><span class="b-marker del">-</span><span class="b-dtext">  borderRadius: 6,</span></div>
+            <div class="b-dline add"><span class="b-marker add">+</span><span class="b-dtext">  borderRadius: 16,</span></div>
+            <div class="b-dline add"><span class="b-marker add">+</span><span class="b-dtext">  borderWidth: 0.5,</span></div>
+            <div class="b-dline"><span class="b-marker"> </span><span class="b-dtext">  }</span></div>
+          </div></div>
+        </div>
+        <div class="cap mt">新建同样是这一块面，没有"新建 / 更新"的区分</div>
+      </div>
+    </div>
+    <div class="cell"><div class="clab after"><span class="dot"></span>改造后<span class="badge done">已实现 · Phase 1 + Phase 2</span></div>
+      <div class="box">
+        <div class="n-row"><span class="n-lead"><svg class="i" viewBox="0 0 16 16"><path d="M10.6 2.9l2.5 2.5-7.3 7.3-3.2.7.7-3.2z"/><path d="M9.3 4.2l2.5 2.5"/></svg></span><span class="n-title">编辑</span><span class="n-sep"></span><span class="n-sum">client/tool-call.tsx</span><span class="n-stat">+12 -3</span></div>
+        <div class="n-card">
+          <div class="n-chead">
+            <span class="h"><span class="n-lang">diff</span><span class="n-ctitle">client/tool-call.tsx</span></span>
+            <span class="n-acts"><span class="n-copy2">复制</span></span>
+          </div>
+          <div class="n-dbody">
+            <div class="n-dline chrome"><span class="n-path">client/tool-call.tsx</span></div>
+            <div class="n-dline chrome"><span class="n-gap">@@ -12,7 +12,8 @@</span></div>
+            <div class="n-dline n-del"><span class="n-mk">-</span>  borderRadius: 6,</div>
+            <div class="n-dline n-add"><span class="n-mk">+</span>  borderRadius: 16,</div>
+            <div class="n-dline n-add"><span class="n-mk">+</span>  borderWidth: 0.5,</div>
+            <div class="n-dline n-ctx"><span class="n-mk"> </span>  }</div>
+            <div class="n-dline chrome"><span class="n-gap">⋯</span></div>
+            <div class="n-dline chrome"><span class="n-gap">@@ -48,6 +49,7 @@</span></div>
+            <div class="n-dline n-ctx"><span class="n-mk"> </span>  gap: 8,</div>
+            <div class="n-dline n-add"><span class="n-mk">+</span>  gap: 6,</div>
+          </div>
+        </div>
+        <div class="cap mt">新建：卡头状态槽写「新建」（DSH 没有这个槽位的内容）</div>
+        <div class="n-card">
+          <div class="n-chead">
+            <span class="h"><span class="n-lang">diff</span><span class="n-ctitle">docs/NOTES.md</span></span>
+            <span class="n-acts"><span class="n-cstatus">新建</span><span class="n-copy2">复制</span></span>
+          </div>
+          <div class="n-dbody">
+            <div class="n-dline chrome"><span class="n-path">docs/NOTES.md</span></div>
+            <div class="n-dline chrome"><span class="n-gap">@@ -0,0 +1,3 @@</span></div>
+            <div class="n-dline n-add"><span class="n-mk">+</span> # 现场笔记</div>
+            <div class="n-dline n-add"><span class="n-mk">+</span> </div>
+            <div class="n-dline n-add"><span class="n-mk">+</span> 静默降级是最贵的一类错。</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <p class="note"><b>要点</b>：<b>DSH 的 diff 卡没有 <code>@@</code></b> —— 卡头只有语言标签（<code>languageForPath</code>，<code>.tsx</code> → <code>tsx</code>），<b>没有路径、没有状态</b>；路径是正文里的<b>一行</b>（<code>label-secondary</code>，<code>font-weight: 500</code>），同一文件的多段之间用一个 <code>⋯</code>（<code>label-tertiary</code>）分隔。增删行 = <b><code>box-shadow: inset 3px 0 0</code> 的实色左竖条 + 12%（暗）底色 + <code>::before</code> 的 <code>+ </code>/<code>- </code> 前缀</b>，上下文行前缀是两个空格且用 <code>label-secondary</code>。<span class="warn">我们刻意多了两样 DSH 没有的东西</span>：<code>@@ -a,b +c,d @@</code> hunk 头（让"这是文件的哪一段"可读；DSH 只能靠 <code>⋯</code>）与卡头里的路径 + 「新建 / 更新」标记（DSH 的 CodeToolbar 有一个 <code>status</code> 槽，但 DiffBlock 从不传值）。RN 妥协：<code>box-shadow: inset</code> <b>无等价</b> → <code>borderLeftWidth: 3</code>，代价是上下文行也必须给一条<b>透明</b> 3px 边，否则整块错位；<code>::before</code> 前缀 → 独立 <code>&lt;Text&gt;</code> 列；<code>grid-template-columns: minmax(max-content,1fr)</code> + 横向 <code>overflow</code> → 不照抄。<b>颜色是刻意的偏离</b>：我们底纹 8%（亮）/12%（暗）与 DSH 的 <code>code-diff-added/deleted</code> 比例相同，但用的是 Paseo 语义色（低饱和）而不是 DSH 的 <span style="color:#22c55e">#22c55e</span> / <span style="color:#f25a5a">#f25a5a</span>。折叠 9 行（头 5 + 尾 4）。</p>
+</section>
+
+<!-- ============================ ⑥ 网页 ============================ -->
+<section class="cat" id="b6">
+  <h2><span class="num">⑥</span>网页搜索 / 网页抓取展开（web，两种形态）</h2>
+  <p class="desc">search 是有序引用列表（就地滚动）；fetch 只有 URL + <code>HTTP 200</code> + 截断提示，<b>没有摘要</b>。两者共用同一张整块卡片。</p>
+  <div class="cols">
+    <div class="cell"><div class="clab dsh"><span class="dot"></span>DSH 原样</div>
+      <div class="box">
+        <div class="d-row"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.2"/><path d="M2.8 8h10.4"/><path d="M8 2.8c2.5 2.9 2.5 7.5 0 10.4"/></svg></span><span class="d-title">网页搜索</span><span class="d-sep"></span><span class="d-sum">paseo plugin api</span></div>
+        <div class="d-card">
+          <div class="d-src">
+            <ul class="d-ol">
+              <li data-n="1."><div class="d-slink">Paseo Plugin API</div><div class="d-snip">Plugins run in the daemon process and may declare capabilities…</div><div class="d-pub">2026-03-02</div></li>
+              <li data-n="2."><div class="d-slink">docs.getpaseo.com</div><div class="d-snip">Timeline renderers let a provider replace a row…</div></li>
+            </ul>
+          </div>
+        </div>
+        <div class="cap mt">网页抓取：同一个 .block，只有 URL 与状态行</div>
+        <div class="d-row"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.2"/><path d="M2.8 8h10.4"/><path d="M8 2.8c2.5 2.9 2.5 7.5 0 10.4"/></svg></span><span class="d-title">网页获取</span><span class="d-sep"></span><span class="d-sum" style="color:#7aaaff">https://docs.getpaseo.com/plugins</span></div>
+        <div class="d-card">
+          <div class="d-web"><span class="d-url">https://docs.getpaseo.com/plugins</span>
+            <div class="d-meta"><span class="s">HTTP 200</span><span class="t">内容已截断</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="cell"><div class="clab before"><span class="dot"></span>改造前</div>
+      <div class="box">
+        <div class="cap">两种形态长得一样：都是"一行摘要 + 一个灰底文本面"</div>
+        <div class="b-root">
+          <div class="b-head"><span class="b-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.2"/><path d="M2.8 8h10.4"/><path d="M8 2.8c2.5 2.9 2.5 7.5 0 10.4"/></svg></span><span class="b-label">联网搜索</span><span class="b-sum">paseo plugin api</span></div>
+          <div class="b-body"><div class="b-surface">
+            <div class="b-code">1. Paseo Plugin API
+   https://docs.getpaseo.com/plugins
+   Plugins run in the daemon process...
+2. Paseo plugin reference
+   https://docs.getpaseo.com/</div>
+          </div></div>
+        </div>
+        <div class="cap mt">抓取：整页正文当纯文本</div>
+        <div class="b-root">
+          <div class="b-head"><span class="b-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.2"/><path d="M2.8 8h10.4"/><path d="M8 2.8c2.5 2.9 2.5 7.5 0 10.4"/></svg></span><span class="b-label">抓取网页</span><span class="b-sum">https://docs.getpaseo.com/plugins</span></div>
+          <div class="b-body"><div class="b-surface">
+            <div class="b-code"># Paseo Plugins
+
+Plugins run in the daemon process and may
+declare capabilities. A plugin that renders
+timeline rows exports a client bundle.</div>
+          </div></div>
+        </div>
+      </div>
+    </div>
+    <div class="cell"><div class="clab after"><span class="dot"></span>改造后<span class="badge done">已实现 · Phase 2</span></div>
+      <div class="box">
+        <div class="n-row"><span class="n-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.2"/><path d="M2.8 8h10.4"/><path d="M8 2.8c2.5 2.9 2.5 7.5 0 10.4"/></svg></span><span class="n-title">网页搜索</span><span class="n-sep"></span><span class="n-sum">paseo plugin api</span></div>
+        <div class="n-card">
+          <div class="n-web">
+            <ul class="n-ol">
+              <li class="n-li"><span class="n-idx">1.</span><div class="n-lib"><span class="n-slink">Paseo Plugin API</span><div class="n-snip">Plugins run in the daemon process and may declare capabilities…</div><div class="n-pub">2026-03-02</div></div></li>
+              <li class="n-li"><span class="n-idx">2.</span><div class="n-lib"><span class="n-slink">docs.getpaseo.com</span><div class="n-snip">Timeline renderers let a provider replace a row…</div></div></li>
+            </ul>
+          </div>
+        </div>
+        <div class="cap mt">抓取：URL + 状态行（截断提示与状态同一行，<code>margin-top</code> 归零）</div>
+        <div class="n-row"><span class="n-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.2"/><path d="M2.8 8h10.4"/><path d="M8 2.8c2.5 2.9 2.5 7.5 0 10.4"/></svg></span><span class="n-title">网页获取</span><span class="n-sep"></span><span class="n-sum">https://docs.getpaseo.com/plugins</span></div>
+        <div class="n-card">
+          <div class="n-web"><span class="n-url">https://docs.getpaseo.com/plugins</span>
+            <div class="n-meta"><span class="s">HTTP 200</span><span class="t">内容已截断</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <p class="note"><b>要点</b>：两种形态<b>差别很大</b>，DSH 里它们是同一个 WebBlock 的两个分支，但结构不同：search 是<b>引用列表</b>（14/20 链接 + 13/19 摘要 + 13/20 日期，<code>gap: 10px</code>、<code>max-height: 320px</code> 就地滚动、序号占 <code>padding-left: 2.5em</code>）；fetch 是 <b>URL + 状态行</b>（<code>gap: 6px</code>，<code>HTTP 200</code> 用 secondary、截断提示用 tertiary，fetch 分支里 <code>.truncated</code> 的 <code>margin-top</code> 被归零，所以两行并排）。WebBlock 与 SearchBlock 的卡结构也不同：<b>整块 <code>padding: 12px 14px</code>，没有 banner、没有复制按钮、没有折叠</b>（全靠 320px 滚动）。DSH <b>不读</b> fetch 的 <code>snippet</code>，所以抓取卡里不会出现摘要 —— 我们照做。RN 妥协：<code>&lt;ol value&gt;</code> 自动序号不存在 → 自绘一个右对齐的数字列（宽度 24px + gap 8）；<code>em</code> 单位不存在 → 手算 px；<code>word-break: break-all / break-word</code> <b>无等价</b>（超长 URL 的换行会不理想）；<code>max-height + overflow-y</code> → <code>ScrollView</code> + <code>nestedScrollEnabled</code>；<code>align-items: baseline</code> → <code>flex-start</code>。链接色 DSH 真值 <span style="color:#7aaaff">#7aaaff</span>（暗），我们一侧用宿主 accent（此处为近似）。文案已对齐 DSH（「网页搜索」「网页获取」；<code>bdcc5d1</code> 的 31 条文案对齐）；只有空态文案仍是共用的一条「无结果」——它匹配 DSH 的 <code>search.noResults</code>，而 DSH 的 <code>web.noResults</code> 写的是「未找到结果」。</p>
+</section>
+
+<!-- ============================ ⑦ MCP / 未知 ============================ -->
+<section class="cat" id="b7">
+  <h2><span class="num">⑦</span>MCP / 未知工具展开（ioCard）</h2>
+  <p class="desc">DSH 的兜底块：输入 / 输出两段，各 150px 就地滚动。行头摘要是「工具名 · 参数首行」。</p>
+  <div class="cols">
+    <div class="cell"><div class="clab dsh"><span class="dot"></span>DSH 原样</div>
+      <div class="box">
+        <div class="d-row"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><path d="M9.9 2.6a3.4 3.4 0 00-3.1 4.7l-4 4a1.1 1.1 0 001.6 1.6l4-4a3.4 3.4 0 004.6-4.4l-2 2-1.6-1.6z"/></svg></span><span class="d-title">工具调用</span><span class="d-sep"></span><span class="d-sum">mcp__paseo__list_workspaces · {}</span></div>
+        <div class="d-io">
+          <div class="d-ios"><span class="d-iol">输入</span><span class="d-iot">{}</span></div>
+          <div class="d-iod"></div>
+          <div class="d-ios"><span class="d-iol">输出</span><span class="d-iot">workspaces_count=4
+
+{
+  "workspaces": [
+    { "workspaceId": "wks_e7c9c95102eff71d", "title": "测试" },
+    { "workspaceId": "wks_8898ac5429c579e8", "title": "开发" }
+  ]
+}</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="cell"><div class="clab before"><span class="dot"></span>改造前</div>
+      <div class="box">
+        <div class="cap">一个代码面里先放美化的输入 JSON，再放美化的输出 JSON</div>
+        <div class="b-root">
+          <div class="b-head"><span class="b-lead"><svg class="i" viewBox="0 0 16 16"><path d="M9.9 2.6a3.4 3.4 0 00-3.1 4.7l-4 4a1.1 1.1 0 001.6 1.6l4-4a3.4 3.4 0 004.6-4.4l-2 2-1.6-1.6z"/></svg></span><span class="b-label">列出工作区</span><span class="b-sum">{}</span></div>
+          <div class="b-body"><div class="b-surface">
+            <div class="b-code">workspaces_count=4
+
+{
+  "workspaces": [
+    { "workspaceId": "wks_e7c9c95", "title": "测试" },
+    { "workspaceId": "wks_8898ac5", "title": "开发" }
+  ]
+}</div>
+          </div></div>
+        </div>
+        <div class="cap mt">无参数调用连摘要都是空的（<code>{}</code> 被当成"没参数"丢掉），只剩标题</div>
+      </div>
+    </div>
+    <div class="cell"><div class="clab after"><span class="dot"></span>改造后<span class="badge done">现状 已实现 · Phase 2/3</span><span class="badge plan">两段 计划</span></div>
+      <div class="box">
+        <div class="cap">现在（Phase 1 之后）：换成 16px 圆角卡片 + hairline + 11/19 前景色代码面</div>
+        <div class="n-row"><span class="n-lead"><svg class="i" viewBox="0 0 16 16"><path d="M9.9 2.6a3.4 3.4 0 00-3.1 4.7l-4 4a1.1 1.1 0 001.6 1.6l4-4a3.4 3.4 0 004.6-4.4l-2 2-1.6-1.6z"/></svg></span><span class="n-title">列出工作区</span><span class="n-sep"></span><span class="n-sum">{}</span></div>
+        <div class="n-card">
+          <div class="n-sbody" style="padding:12px 14px">
+            <div class="n-pre">workspaces_count=4
+
+{
+  "workspaces": [
+    { "workspaceId": "wks_e7c9c95", "title": "测试" },
+    { "workspaceId": "wks_8898ac5", "title": "开发" }
+  ]
+}</div>
+          </div>
+        </div>
+        <div class="cap mt">计划：DSH 那样的输入 / 输出两段（虚线＝尚未落地）</div>
+        <div class="ghost">
+          <div class="n-io">
+            <div class="n-ios"><span class="n-iol">输入</span><span class="n-iot">{}</span></div>
+            <div class="n-iod"></div>
+            <div class="n-ios"><span class="n-iol">输出</span><span class="n-iot">workspaces_count=4
+
+{
+  "workspaces": [ … ]
+}</span></div>
+          </div>
+          <div class="kv">两段各自 <b>max-height: 150px</b> 就地滚动 · 标签列 <b>max-content</b> + 间距 <b>14px</b> · 分隔线 .5px</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <p class="note"><b>要点</b>：ioCard 是 dispatching 的<b>兜底</b> —— askQuestion / terminal / diff / read / image / search / web / details 全没命中时才用它，所以任意 MCP 工具与未知工具都落在这里。结构是 <code>grid-template-columns: max-content 1fr</code> + <code>column-gap: 14px</code> + <code>padding: 12px 16px</code>，两段各自 <code>max-height: 150px</code> 滚动，标签逐字是「输入」「输出」（<code>row.input</code> / <code>row.output</code>），标签色 <code>label-caption</code> 并且 <code>position: sticky; top: 0</code>；正文 <code>label-secondary</code>、<code>white-space: pre-wrap</code>，失败时 <code>[data-error]</code> 转成 <code>state-error-primary</code>。行头摘要 DSH 是 <code>&lt;工具名&gt; · &lt;参数首行&gt;</code>（标题是 generic 的「工具调用」），我们保留 Paseo 自己的中文名（「列出工作区」），把参数首行放摘要。<span class="warn">现状与目标的差</span>：我们<b>还没有</b>两段结构，输入（美化 JSON）与输出挤在同一个代码面里 —— RENDER-PLAN 的 Phase 3 只写了"结构化展示，而非原始 JSON"，没有点名 ioCard 的两段形状，所以这一段严格说是<b>计划外</b>，本图按 DSH 的形状画作目标。RN 妥协：<code>grid</code> 没有 → 固定宽标签列 + gap；<code>position: sticky</code> 标签 <b>无解</b>（RN 没有 sticky）；<code>-webkit-scrollbar-*</code> → <code>indicatorStyle</code>。</p>
+</section>
+
+<!-- ============================ ⑧ 代码 ============================ -->
+<section class="cat" id="b8">
+  <h2><span class="num">⑧</span>代码展开（run_code → CodeBlock）</h2>
+  <p class="desc">DSH 有专门的代码块：banner（语言标签 + 复制 / 换行）+ <code>pre</code>，默认换行、不显示行号、banner sticky。</p>
+  <div class="cols">
+    <div class="cell"><div class="clab dsh"><span class="dot"></span>DSH 原样</div>
+      <div class="box">
+        <div class="d-row"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><path d="M6 4.6L3.3 8 6 11.4"/><path d="M10 4.6L12.7 8 10 11.4"/></svg></span><span class="d-title">代码</span><span class="d-sep"></span><span class="d-sum">跑一段解析</span></div>
+        <div class="d-card">
+          <div class="d-chead">
+            <span class="h"><span class="d-lang">typescript</span></span>
+            <span class="d-acts"><span class="d-act"><svg class="i" viewBox="0 0 16 16"><rect x="5.6" y="5.6" width="7.6" height="7.6" rx="1.6"/><path d="M10.4 5.6V3.9a1.3 1.3 0 00-1.3-1.3H3.9a1.3 1.3 0 00-1.3 1.3v5.2a1.3 1.3 0 001.3 1.3h1.7"/></svg></span><span class="d-act"><svg class="i" viewBox="0 0 16 16"><path d="M2.4 4h11.2"/><path d="M2.4 8h7.4a2.6 2.6 0 010 5.2H7.6"/><path d="M9.2 11.4l-1.8 1.8 1.8 1.8"/><path d="M2.4 12.6h3.4"/></svg></span></span>
+          </div>
+          <div class="d-dbody" style="padding:6px 22px 20px">
+            <div class="d-dline d-ctx" style="padding:0">const parsed = JSON.parse(raw);</div>
+            <div class="d-dline d-ctx" style="padding:0">return parsed.items.length;</div>
+          </div>
+        </div>
+        <div class="cap mt">banner 是 <code>position: sticky; top: 0</code>，卡片体 <code>max-height: 260px</code>；复制的是渲染后的 <code>pre</code> 文本，反馈 1000ms；<code>lang</code> 在工具行里硬编码成 <code>typescript</code></div>
+      </div>
+    </div>
+    <div class="cell"><div class="clab before"><span class="dot"></span>改造前</div>
+      <div class="box">
+        <div class="cap"><code>run_code</code> 没有 typed detail → 落到 unknown：标题是<b>原始线名</b>，展开是一个普通代码面</div>
+        <div class="b-root">
+          <div class="b-head"><span class="b-lead"><svg class="i" viewBox="0 0 16 16"><path d="M9.9 2.6a3.4 3.4 0 00-3.1 4.7l-4 4a1.1 1.1 0 001.6 1.6l4-4a3.4 3.4 0 004.6-4.4l-2 2-1.6-1.6z"/></svg></span><span class="b-label">run_code</span><span class="b-sum">跑一段解析</span></div>
+          <div class="b-body"><div class="b-surface">
+            <div class="b-code">const parsed = JSON.parse(raw);
+return parsed.items.length;</div>
+          </div></div>
+        </div>
+      </div>
+    </div>
+    <div class="cell"><div class="clab after"><span class="dot"></span>改造后<span class="badge plan">未覆盖 · 不在 Phase 0-4</span></div>
+      <div class="box">
+        <div class="cap">现状与改造前同形（只换成 Phase 1 的卡片样式）；下面是 DSH 的形状，作为<b>待决定</b>的目标</div>
+        <div class="n-row"><span class="n-lead"><svg class="i" viewBox="0 0 16 16"><path d="M9.9 2.6a3.4 3.4 0 00-3.1 4.7l-4 4a1.1 1.1 0 001.6 1.6l4-4a3.4 3.4 0 004.6-4.4l-2 2-1.6-1.6z"/></svg></span><span class="n-title">run_code</span><span class="n-sep"></span><span class="n-sum">跑一段解析</span></div>
+        <div class="n-card">
+          <div class="n-sbody" style="padding:12px 14px">
+            <div class="n-pre">const parsed = JSON.parse(raw);
+return parsed.items.length;</div>
+          </div>
+        </div>
+        <div class="ghost">
+          <div class="n-chead" style="padding:0 0 8px">
+            <span class="h"><span class="n-lang">typescript</span></span>
+            <span class="n-acts"><span class="n-copy2">复制</span><span class="n-copy2">换行</span></span>
+          </div>
+          <div class="n-dbody" style="padding:0">
+            <div class="n-dline chrome" style="padding:0">const parsed = JSON.parse(raw);</div>
+            <div class="n-dline chrome" style="padding:0">return parsed.items.length;</div>
+          </div>
+          <div class="kv">DSH：banner <b>10px 18px 8px 22px</b>·<b>11/18</b>，<code>pre</code> <b>6px 22px 20px</b>·<b>11/19</b>，默认 <b>wrapped</b>、<b>不显示行号</b>，banner <b>sticky</b>（RN 无解，不学）</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <p class="note"><b>要点</b>：<span class="warn">这一格是我们真正的空白</span> —— 客户端<i>完全没有</i> <code>code</code> 分支：<code>run_code</code> 在 <code>toolLabels</code> / <code>toolLabels.en</code> 里都没有条目（全仓库搜不到这个字符串），所以标题回落成<b>原始线名</b> <code>run_code</code>（DSH 是「代码」），图标回落成通用扳手，展开走 unknown 的兜底代码面 —— 没有语言标签、没有复制、没有 <code>bodyScroll</code> 限高。RENDER-PLAN 的 Phase 0–4 没有点名它，所以这是<b>计划外</b>的一格；要不要按 DSH 造一个 CodeBlock（以及那个硬编码 <code>typescript</code> 的瑕疵要不要学）需要先决定。已经决定不学的两条：<b>banner 的 <code>position: sticky</code></b>（RN 没有 sticky，要么 <code>stickyHeaderIndices</code> 要么改布局）与 <b><code>lang</code> 硬编码 <code>typescript</code></b>（DSH 自己的小瑕疵）。另外 DSH 的复制按钮复制的是<b>渲染后的 <code>pre</code> 文本</b>（<code>querySelector("pre").textContent</code>）而不是原始字符串 —— 我们若要照做，得注意 RN 上没有 DOM 可查，只能复制模型给的那份文本。</p>
+</section>
+
+<!-- ============================ ⑨ 思考行 ============================ -->
+<section class="cat" id="b9">
+  <h2><span class="num">⑨</span>思考行（折叠 + 展开）</h2>
+  <p class="desc">折叠＝24px 单行：图标 + 「思考」+ 2×2 方块 + 预览首行；没有预览时方块与预览<b>整段不渲染</b>。展开＝左缩进 22px 的正文。</p>
+  <div class="cols">
+    <div class="cell"><div class="clab dsh"><span class="dot"></span>DSH 原样</div>
+      <div class="box">
+        <div class="cap">折叠 · 运行中（预览是"最后一个已终结段落的首行"，右端 48px 渐隐）</div>
+        <div class="d-row" style="color:#adb2b8"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.3"/><circle cx="8" cy="8" r="1.5" fill="currentColor" stroke="none"/></svg></span><span class="d-title">思考</span><span class="d-sep"></span><span class="d-sum" style="-webkit-mask-image:linear-gradient(90deg,#000 calc(100% - 48px),transparent);mask-image:linear-gradient(90deg,#000 calc(100% - 48px),transparent)">先看插件客户端怎么拿到主题，再决定 token 放哪</span></div>
+        <div class="cap mt">折叠 · 已结束且无预览（方块与预览 <code>display: none</code>，只剩图标 + 标题）</div>
+        <div class="d-row" style="color:#adb2b8"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.3"/><circle cx="8" cy="8" r="1.5" fill="currentColor" stroke="none"/></svg></span><span class="d-title">思考</span></div>
+        <div class="cap mt">展开 · 正文从 22px 起排，行高 24px；行头变 sticky（吸在 bg-base 上）</div>
+        <div class="d-row" style="color:#adb2b8"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.3"/><circle cx="8" cy="8" r="1.5" fill="currentColor" stroke="none"/></svg></span><span class="d-title">思考</span><span class="d-sep"></span><span class="d-sum">先看插件客户端怎么拿到主题，再决定 token 放哪</span></div>
+        <div class="d-thinkbody">主题从 <code style="font-size:12px">PluginTimelineItemProps.theme</code> 来，所以 token 只能做成函数…</div>
+      </div>
+    </div>
+    <div class="cell"><div class="clab before"><span class="dot"></span>改造前</div>
+      <div class="box">
+        <div class="cap">标签 12px、预览 14/21、gap 8、外面还套 5px 垂直 padding</div>
+        <div class="b-think"><span class="b-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.3"/><circle cx="8" cy="8" r="1.5" fill="currentColor" stroke="none"/></svg></span><span class="l">思考</span><span class="t">先看插件客户端怎么拿到主题，再决定 token 放哪</span></div>
+        <div class="cap mt">展开：正文左缩进 12px、14/21、opacity .8</div>
+        <div class="b-think"><span class="b-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.3"/><circle cx="8" cy="8" r="1.5" fill="currentColor" stroke="none"/></svg></span><span class="l">思考</span><span class="t">先看插件客户端怎么拿到主题，再决定 token 放哪</span></div>
+        <div class="b-thinkbody">主题从 PluginTimelineItemProps.theme 来，所以 token 只能做成函数…</div>
+      </div>
+    </div>
+    <div class="cell"><div class="clab after"><span class="dot"></span>改造后<span class="badge done">已实现 · Phase 1/3</span><span class="badge plan">正文缩进待收口</span></div>
+      <div class="box">
+        <div class="cap">折叠：13/24、min-height 24、gap 6，与工具行同一套节奏</div>
+        <div class="n-row"><span class="n-lead"><svg class="i" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.3"/><circle cx="8" cy="8" r="1.5" fill="currentColor" stroke="none"/></svg></span><span class="n-title">思考</span><span class="n-sep"></span><span class="n-sum">先看插件客户端怎么拿到主题，再决定 token 放哪</span></div>
+        <div class="cap mt">展开：正文左缩进 4px、14/21、opacity .8（DSH 是 22px / 13/24）</div>
+        <div class="n-thinkbody">主题从 PluginTimelineItemProps.theme 来，所以 token 只能做成函数…</div>
+        <div class="ghost">
+          <div class="kv">待收口：① 正文左缩进 <b>4 → 22px</b>、字号 <b>14/21 → 13/24</b>；② DSH 展开时行头 <b>sticky</b>（RN 无解，放弃）；③ 无预览时 DSH 把方块与预览整段藏掉，我们仍渲染空预览</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <p class="note"><b>要点</b>：DSH 的折叠预览取法与我们一致 —— <b>结束后取正文第一行、运行中取"最后一个已终结段落的首行"</b>，并且把 <code>**</code> 剥掉、标签恒为「思考」（「已思考」属于它"整轮过程"折叠摘要，不是这一行）。差别在三处：<b>行高节奏</b>（DSH 13/24 且 <code>min-height: 24px</code>；改造前是标签 12px + 预览 14/21，外面还套 <code>paddingVertical 5</code>）、<b>展开体</b>（DSH <code>padding: 4px 0 4px 22px</code> + 13/24 + Markdown 渲染；我们 4px 缩进 + 14/21 + 纯文本）、<b>无预览时的处理</b>（DSH <code>.root:not([data-preview]) .separator, .root:not([data-preview]) .summary { display: none }</code>）。运行中的渐隐也不同：DSH 是 <code>mask-image: linear-gradient(90deg, #000 calc(100% - 48px), transparent)</code>，即右端 48px 的静态渐隐；我们走的是整套扫光（shimmer）。RN 妥协：<code>mask-image</code> 无等价（只能用渐变的 <code>View</code> 叠一层，或不做）；<b>展开时行头 sticky 无解</b>；Markdown 需要额外渲染器，目前渲染的是纯文本。</p>
+</section>
+
+<!-- ============================ ⑩ 压缩行 ============================ -->
+<section class="cat" id="b10">
+  <h2><span class="num">⑩</span>压缩行（compaction）</h2>
+  <p class="desc">DSH 是<b>一个可展开的行</b>（与工具行同构）；Paseo 是它自己的 <code>compaction</code> marker（另一种形状）。这一格我们<b>刻意不学 DSH 的形状</b>。</p>
+  <div class="cols">
+    <div class="cell"><div class="clab dsh"><span class="dot"></span>DSH 原样</div>
+      <div class="box">
+        <div class="cap">折叠：24px 行 + 图标（hover 换成 chevron）+ 标题 + 2×2 方块 + 统计摘要</div>
+        <div class="d-row" style="color:#adb2b8"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><path d="M2.5 8h11"/><path d="M5 5.2L2.6 8 5 10.8"/><path d="M11 5.2L13.4 8 11 10.8"/></svg></span><span class="d-title">上下文已压缩</span><span class="d-sep"></span><span class="d-sum">已压缩 128 条历史记录（约 42k tokens）</span></div>
+        <div class="cap mt">另一种摘要：不给统计时是「点击查看压缩摘要」；不可用时「压缩摘要不可用」</div>
+        <div class="d-row" style="color:#adb2b8"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><path d="M2.5 8h11"/><path d="M5 5.2L2.6 8 5 10.8"/><path d="M11 5.2L13.4 8 11 10.8"/></svg></span><span class="d-title">上下文已压缩</span><span class="d-sep"></span><span class="d-sum">点击查看压缩摘要</span></div>
+        <div class="cap mt">展开：正文 <code>padding: 4px 0 4px 22px</code>、13/24、tertiary；行头变 sticky</div>
+        <div class="d-row" style="color:#adb2b8"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><path d="M2.5 8h11"/><path d="M5 5.2L2.6 8 5 10.8"/><path d="M11 5.2L13.4 8 11 10.8"/></svg></span><span class="d-title">上下文已压缩</span><span class="d-sep"></span><span class="d-sum">已压缩 128 条历史记录（约 42k tokens）</span></div>
+        <div class="d-thinkbody">（压缩摘要正文，13/24，tertiary）</div>
+        <div class="cap mt">运行中：同一行，摘要换成「正在压缩…」</div>
+        <div class="d-row" style="color:#adb2b8"><span class="d-lead"><svg class="i" viewBox="0 0 16 16"><path d="M2.5 8h11"/><path d="M5 5.2L2.6 8 5 10.8"/><path d="M11 5.2L13.4 8 11 10.8"/></svg></span><span class="d-title">上下文已压缩</span><span class="d-sep"></span><span class="d-sum">正在压缩…</span></div>
+      </div>
+    </div>
+    <div class="cell"><div class="clab before"><span class="dot"></span>改造前</div>
+      <div class="box">
+        <div class="cap">什么都不显示</div>
+        <div class="b-absent">（这一行不存在）</div>
+        <div class="kv" style="color:#7c7c85">DSH 的 <code>compaction/start</code> → <code>compaction/summary</code> → <code>compaction/end</code> 四个事件在 <code>TimelineBuilder.consume()</code> 里走到 <code>default: return []</code>，整段被丢掉。压缩跑了整整一分钟，界面上什么都看不到 —— 这是 FIELD-NOTES 里"静默降级"那一类的典型：不报错，只是没有。</div>
+      </div>
+    </div>
+    <div class="cell"><div class="clab after"><span class="dot"></span>改造后<span class="badge done">服务端 已实现 · Phase 4a</span><span class="badge plan">形状 示意</span></div>
+      <div class="box">
+        <div class="cap">Paseo 原生 marker（形状示意 —— 渲染器在宿主里，不在本仓库）</div>
+        <div class="ghost">
+          <div class="n-marker"><span class="sp"></span><span class="lbl">上下文已压缩</span><span class="rule"></span></div>
+          <div class="kv">载入状态：<b>compaction/start</b> → <code>status: "loading"</code>；<b>compaction/summary</b> 或 <b>compaction/end</b> → <code>status: "completed"</code>。触发方式：<code>sourceCommandId</code> 存在或 <code>turn === null</code> → <code>trigger: "manual"</code>，否则 <code>"auto"</code>。<code>preTokens</code> <b>不设</b>（DSH 没有"压缩前 token 数"这个字段）。</div>
+        </div>
+        <div class="cap mt">失败时</div>
+        <div class="kv" style="color:#7c7c85">DSH 的 <code>compaction/end</code> 可以带 <code>error</code>；Paseo 的 marker 只有 <code>loading</code>/<code>completed</code> 两个状态（它自己的 omp 适配器也这么处理），所以失败<b>不落在这个 marker 上</b>，而是回到拥有这次压缩的回合或 <code>/compact</code> 命令行 —— 我们额外记一条 warning，不静默吞掉。</div>
+      </div>
+    </div>
+  </div>
+  <p class="note"><b>要点</b>：DSH 的压缩行是一个<b>可展开行</b>，和工具行共用同一套 <code>DisclosureRow</code> 节奏（24px、13/24、2×2 方块、图标 hover 换 chevron），展开体 <code>padding: 4px 0 4px 22px</code>、13/24、tertiary，展开时行头 sticky 并画上 <code>bg-base</code> 底色。它的文案是 <code>message.compaction</code>「上下文已压缩」+ <code>.running</code>「正在压缩…」/ <code>.completed</code>「已压缩 {items} 条历史记录（约 {tokens} tokens）」/ <code>.expand</code>「点击查看压缩摘要」/ <code>.unavailable</code>「压缩摘要不可用」。<b>我们刻意不照抄</b>：Paseo 的 <code>compaction</code> 是它的一等 item（它自己的 omp / pi 适配器也发这个），行由宿主自己的 marker 渲染器画 —— 所以要跟的是 Paseo 的形状，而不是 DSH 的。<span class="warn">本格的"改造后"是形状示意</span>：Paseo 的 marker 渲染器不在本仓库，我无法逐像素核对，只画了它承载的字段。RN 妥协：DSH 那条 sticky 行头在这条路上不存在（宿主的 marker 自己决定），我们不需要面对。</p>
+</section>
+
+<!-- ============================ 不确定项 ============================ -->
+<section class="cat" id="b11">
+  <h2><span class="num">※</span>不确定项与已知偏差（这一份会被当真值读，所以列在这里）</h2>
+  <div class="note" style="border-left-color:#3a3a40">
+    <p style="margin:0 0 7px"><b>本轮从源码核实、因而可以写死的</b>：暗色 token 十六进制（<code>bg-base #151517</code>、<code>label-primary #f9fafb</code>、<code>secondary #cfd3d6</code>、<code>tertiary #adb2b8</code>、<code>caption #81858c</code>、<code>border-l1 #ffffff0f</code>、<code>border-l2 #ffffff1f</code>、<code>code-block #1b1b1c</code>、<code>banner #2c2c2e</code>、<code>bg-layer-2 #2c2c2e</code>、<code>success #22c55e</code>、<code>error #f25a5a</code>、<code>link #7aaaff</code>、<code>idle #545557</code>）；行头 / 卡片 / 终端 / 搜索 / 读取 / diff / web / ioCard / CodeCard 的 padding、字号、行高、圆角、边框；折叠的 <code>maxLines</code> 与文案（<code>search 8</code>、<code>read 8</code>、<code>diff 9</code>、<code>terminal Infinity</code>）；DiffBlock <b>没有 <code>@@</code></b>（只有 path / gap / add / del / context 五种行）且卡头<b>不传 title / status</b>；CodeToolbar 的 <code>status</code> 在 CodeBlock 里永不触发、在 ReadBlock 里是「显示 X / Y 行」；<code>terminal</code> 的行高被 ToolRow 重绑成 18px。</p>
+    <p style="margin:0 0 7px"><b>仍未证实的（所以本图没有写死）</b>：① Paseo 原生 <code>compaction</code> marker 的几何 —— 渲染器在宿主里，本仓库看不到，第 ⑩ 格只画了它承载的字段；② Paseo 暗色主题里 <code>foregroundMuted</code> / <code>statusSuccess</code> / <code>statusDanger</code> / <code>accent</code> / <code>surface1</code> / <code>border</code> 的真实取值 —— 中右两栏用的是近似色（<code>#a1a1aa</code> / <code>#6cb17b</code> / <code>#d8847b</code> / <code>#8ba4ff</code> / <code>#1c1c1f</code> / <code>#2e2e33</code>），真值由宿主主题在运行时给出；③ <code>1ch</code> 在 11px 等宽下的实际宽度 —— 本图按 6.6px 折算 3ch ≈ 20px；④ DSH 的 <code>--dsw-font-markdown-code-block-small</code> 在非重构场景下的最终计算值（我按 11px/16px 记）；⑤ DSH <code>terminal</code> 折叠时 <code>--dsl-terminal-line-height</code> 与 <code>--dsl-terminal-font</code> 简写里行高的胜负 —— 我按 <code>.promptLine</code> 的 18px 画，<code>tokens.ts</code> 的 <code>COMMAND_LINE_HEIGHT = 16</code> 与此不一致。</p>
+    <p style="margin:0"><b>已知偏差（真实存在，不是画错）</b>：<code>ROW_GAP</code> 3px vs DSH 卡片 <code>margin-top: 4px</code>；思考行展开体 4px/14-21 vs DSH 22px/13-24 且不渲染 Markdown；读取/代码卡的动作区是文字「复制」而非 24×24 图标，且没有换行开关；diff 卡头多了语言标签 = <code>"diff"</code>、路径与「新建 / 更新」（DSH 无）；<code>run_code</code> 没有标签条目（标题回落成线名）；<code>web.noResults</code> 用「无结果」而 DSH 是「未找到结果」。</p>
+  </div>
+</section>
+
+</body></html>
