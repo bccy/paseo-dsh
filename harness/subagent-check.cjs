@@ -646,6 +646,37 @@ async function openSession(conn, sessionId, history) {
       !conn4Events.some((e) => e.type === "session.runtime_failed"),
   );
 
+  // ---- a failed open leaves no session (or process) behind ----------------
+  // The daemon drops its own maps and rethrows on a failed open without ever
+  // sending `session.close` (`PluginProvider.openSession`'s catch), while the
+  // plugin used to keep its entry — plus the `dsh` process `open()` had already
+  // spawned. Every retry arrives under a fresh session id, so they accumulate for
+  // the life of the connection. The observable proof that the rollback ran is the
+  // `shutdown` frame the plugin sends, which the fake bridge logs.
+  const failOpenLog = path.join(require("node:os").tmpdir(), `dsh-fake-log-${Date.now()}.jsonl`);
+  const connFailOpen = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+  const connFailOpenEvents = [];
+  connFailOpen.onEvent((e) => connFailOpenEvents.push(e));
+  const rootFailOpen = `subFO-${Date.now()}`;
+  process.env.DSH_FAKE_MODE = "failopen";
+  process.env.DSH_FAKE_LOG = failOpenLog;
+  await connFailOpen
+    .send({ type: "session.open", sessionId: rootFailOpen, config: { cwd: process.cwd(), mode: "build" } })
+    .catch(() => undefined);
+  await sleep(600);
+  const failOpenFrames = fs
+    .readFileSync(failOpenLog, "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line).method);
+  check(
+    "a session whose open failed is closed, not left holding its process",
+    failOpenFrames.includes("initialize") && failOpenFrames.includes("shutdown"),
+    failOpenFrames.join(", "),
+  );
+  await connFailOpen.close();
+  delete process.env.DSH_FAKE_LOG;
+
   // ---- a turn DSH ended for a reason that is not a clean finish ----------
   // The root's terminal `session.turn` is emitted later, from the remembered
   // reason. Reading every non-`aborted` reason as `completed` meant the daemon

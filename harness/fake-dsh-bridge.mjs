@@ -454,6 +454,11 @@ async function handle(method, params, id) {
   }
   switch (method) {
     case "initialize":
+      // `failopen` refuses the first thing the plugin asks for, so `session.open`
+      // throws. The daemon then drops its own session without ever sending
+      // `session.close` (`PluginProvider.openSession`'s catch), which is the path
+      // that used to leave the plugin's map entry — and this process — behind.
+      if (MODE === "failopen") throw new Error("the runtime refused to initialize");
       return { serverInfo: { name: "fake-dsh-bridge", version: "0" }, route: { provider: "fake", model: "fake" } };
     case "paseo/catalog":
       return { providers: [], models: [], planMode: false };

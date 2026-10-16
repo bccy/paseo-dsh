@@ -406,7 +406,26 @@ class DshConnection implements ProviderConnection {
     });
     this.#sessions.set(sessionId, session);
 
-    await session.open();
+    try {
+      await session.open();
+    } catch (error) {
+      // The daemon drops its own maps and rethrows on a failed open
+      // (`PluginProvider.openSession`'s catch never sends `session.close`), so
+      // this entry — and the `dsh` process `open()` has already spawned — would
+      // otherwise live as long as the connection does. Every retry arrives under
+      // a fresh session id, so they accumulate rather than replace each other.
+      this.#sessions.delete(sessionId);
+      try {
+        await session.close();
+      } catch (closeError) {
+        // Best-effort: the entry is gone either way, but say so rather than
+        // leaving a live process and no trace of why.
+        process.stderr.write(
+          `[${PROVIDER_ID}] closing a session whose open failed: ${messageOf(closeError)}\n`,
+        );
+      }
+      throw error;
+    }
 
     if (config.thinkingOption !== undefined) {
       await session.configure({ thinkingOption: config.thinkingOption });
