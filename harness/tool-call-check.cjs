@@ -159,37 +159,5 @@ console.log("labels");
   equal("unknown tool keeps its name", toolLabel("frobnicate"), "frobnicate");
 }
 
-console.log("current marker");
-{
-  // The pulse keys off `metadata.current`, not `status`: a short command's call
-  // and result reach the client in the same tick, so there is no observable
-  // running state to pulse on. The plugin's builder owns the marker.
-  const plain = toolCallData(
-    { name: "bash", status: "completed", detail: { type: "shell", command: "ls", output: "" } },
-    "complete",
-  );
-  equal("no marker -> not current", plain.current, false);
-  const marked = toolCallData(
-    {
-      name: "bash",
-      status: "completed",
-      detail: { type: "shell", command: "ls", output: "" },
-      metadata: { current: true },
-    },
-    "complete",
-  );
-  equal("metadata.current -> current", marked.current, true);
-  const other = toolCallData(
-    {
-      name: "bash",
-      status: "completed",
-      detail: { type: "shell", command: "ls", output: "" },
-      metadata: { current: false },
-    },
-    "complete",
-  );
-  equal("metadata.current=false -> not current", other.current, false);
-}
-
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

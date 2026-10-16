@@ -651,20 +651,30 @@ Reanimated 遮罩没暴露给插件）。
 
 **为什么不能直接"取最后一条"**：插件时间线渲染器的 props 只有
 `theme / host / layout / agentId / item / timestamp`——**看不到自己在列表里的位置**，也没有
-isLast/index。所以"是不是最后一条"这个信息必须由插件的服务端给出来。
+isLast/index。位置只能在客户端自己算（见下），服务端标了也传不过来。
 
-**修法**：`server/timeline.ts` 的 `TimelineBuilder` 在 `#put()` 里把 `metadata.current` 标在
-**最新那一行**上，并清掉上一行的标记；`turn/end` 时清空（否则回合结束后最后一行会一直闪）。
-客户端 `toolCallData` 读 `item.metadata.current`，工具行的脉冲条件就是 `data.current`。
-只有 `tool_call` 行带标记——思考行在一步里会被 `#put` 很多次（流式快照），带标记会来回抖。
+**修法（最终采用，纯客户端）**：`client/newest.ts` 让每一行在渲染时上报自己的 `timestamp`，
+按 `agentId` 记下见过的最大值——那就是"最新一行"。工具行的脉冲条件是：
 
-**验证**：`harness/plugin-check.cjs` 新增两条断言（"最新行带 current 标记"、"新行出现时清掉
-旧标记"），29/29 通过；`harness/tool-call-check.cjs` 覆盖 `metadata.current -> current` 的映射，
-40/40 通过。
+```
+status === "running" || (isNewest(agentId, timestamp) && isFresh(timestamp, Date.now()))
+```
 
-**顺带**：历史回放走的是同一个 builder（`replayHistory` 里 `new TimelineBuilder()` 后逐条
-`consume`），所以回放出来的最后一行也会被后面的 `turn/end` 清掉标记，不会出现"打开旧会话
-最后一行一直在闪"。
+两个细节：
+
+- **"不再是最后一行"能自愈**：正在闪的行每 50ms 重渲染一次，顺便重新求值，一旦有更新的行
+  上报过就立刻停。不需要服务端推任何东西。
+- **`isFresh` 窗口（2.5s）**：最新的行只闪一小会儿就停，这样回合结束后的最后一行、以及打开
+  旧会话回放出来的最后一行都不会一直闪；还在 `running` 的行不受窗口限制。
+
+**试过但不可行的方案**：服务端在 `TimelineBuilder.#put()` 里给最新行打
+`metadata.current`、新行出现时清掉旧行、`turn/end` 清空。协议层是对的（`harness/plugin-check.cjs`
+的断言能通过），但**客户端不会把"只有 `metadata` 变化"的 item 重新折进去**：历史回放时每一行
+都被短暂标过 `current`，之后就一直保持 `C` 且全部卡在 0.35。实测 web UI 上十几行同时是 `C`。
+所以"位置"这个信息只能在客户端算。
+
+**验证**：`harness/newest-check.cjs` 覆盖"最新行判定 / 每个 agent 独立 / 新鲜度窗口"，12/12
+通过；`npx tsc --noEmit` 干净。
 
 diff 行按 GitHub 的做法：浅绿/浅红底（低 alpha，深色主题也不刺眼）、`+`/`-` 标记单独
 上色、代码正文用 **muted 前景色**（用 `foreground` 会"太白"）。**不要**给每行加左侧亮色

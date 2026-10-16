@@ -279,32 +279,6 @@ function projectTimelineLikePaseo(items, turnId) {
     `row=${JSON.stringify(commandRow?.item?.detail?.text ?? null).slice(0, 80)}`,
   );
 
-  // 0c-ter. The client pulses by *position*, not by status. A short command's
-  // `tool/call` and `tool/result` reach the client in the same tick, so a
-  // renderer keying off `status === "running"` never observes a running state
-  // and never pulses — which is exactly what the user saw. The builder therefore
-  // marks the newest row with `metadata.current`, and clears the marker from the
-  // row that was newest before. A plugin timeline renderer cannot see whether it
-  // is last (`PluginTimelineItemProps` carries only its own item), so this is
-  // the only place the information can come from.
-  check(
-    "the newest row is marked current (position, not status)",
-    commandRow?.item?.metadata?.current === true,
-    `metadata=${JSON.stringify(commandRow?.item?.metadata ?? null)}`,
-  );
-  const markedCurrent = new Set();
-  let clearedCurrent = false;
-  for (const e of events) {
-    if (e.type !== "timeline.item" || e.item?.type !== "tool_call") continue;
-    if (e.item.metadata?.current === true) markedCurrent.add(e.item.id);
-    else if (markedCurrent.has(e.item.id)) clearedCurrent = true;
-  }
-  check(
-    "a newer row clears the previous current marker",
-    clearedCurrent,
-    `${markedCurrent.size} row(s) were marked current`,
-  );
-
   // 0d. the menu name *is* the command: Paseo's command contract carries one
   // name for both display and dispatch, so the catalog must advertise the name
   // DSH registered and the transcript must echo the line that actually ran. A

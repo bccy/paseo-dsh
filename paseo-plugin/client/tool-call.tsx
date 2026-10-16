@@ -19,6 +19,7 @@ import type { PluginTimelineItemProps } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/react-native";
 import { useMemo, useState } from "react";
 import { Pressable, Text, View } from "react-native";
+import { isFresh, isNewest } from "./newest";
 import { useShimmer } from "./shimmer";
 import { type ToolCallData } from "./tool-call-data";
 
@@ -26,7 +27,13 @@ import { type ToolCallData } from "./tool-call-data";
 const ADD_BG = "rgba(46, 160, 67, 0.12)";
 const DEL_BG = "rgba(248, 81, 73, 0.12)";
 
-export function InlineToolCall({ theme, layout, item }: PluginTimelineItemProps<ToolCallData>) {
+export function InlineToolCall({
+  theme,
+  layout,
+  item,
+  agentId,
+  timestamp,
+}: PluginTimelineItemProps<ToolCallData>) {
   const data = item.data;
   const [expanded, setExpanded] = useState(false);
   const hasBody = data.body !== "";
@@ -35,7 +42,12 @@ export function InlineToolCall({ theme, layout, item }: PluginTimelineItemProps<
   const canExpand = hasBody || data.summary !== "";
   const compact = layout.compact;
   const iconSize = compact ? 14 : 16;
-  const shimmer = useShimmer(data.current);
+  // A running tool pulses for as long as it runs. A finished one still pulses
+  // while it is the newest row and still fresh, which is the only way a short
+  // command — call and result in the same tick — ever shows a pulse at all.
+  const shimmer = useShimmer(
+    data.status === "running" || (isNewest(agentId, timestamp) && isFresh(timestamp, Date.now())),
+  );
 
   const styles = useMemo(
     () => ({
