@@ -197,7 +197,7 @@ export function toolIcon(name: string, detail: ToolDetail | undefined): string {
   if (detail !== undefined && detail.type === "plain_text" && typeof detail.icon === "string") {
     return PLAIN_ICONS[detail.icon] ?? "Wrench";
   }
-  if (normalized === "thinking" && (detail === undefined || detail.type === "unknown")) return "Brain";
+  if (normalized === "thinking" && (detail === undefined || detail.type === "unknown")) return "Sparkle";
   if (normalized === "speak") return "MicVocal";
   if (normalized === "task") return "Bot";
   // Only for `unknown` details: a typed detail (shell/read/edit/…) already

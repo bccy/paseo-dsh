@@ -16,11 +16,19 @@
  * @module dsh-paseo/client/inline-thinking
  */
 import type { PluginTimelineItemProps } from "@getpaseo/plugin/client";
-import { Icon, useRevealedText } from "@getpaseo/plugin/client/react-native";
+import { useRevealedText } from "@getpaseo/plugin/client/react-native";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Pressable, Text, View } from "react-native";
+import { Image, Pressable, Text, View } from "react-native";
 import { TextShimmer } from "./text-shimmer";
 import { reasoningPreview } from "./thinking-text";
+
+/**
+ * DSH's thinking icon (`PROCESS_ICONS.thinking` = `IconThinkOutlineRegular`:
+ * two petals crossed on the diagonal plus a filled centre dot, `viewBox 16`,
+ * 1px stroke, drawn at 16). Rasterized at exactly 4x and shown at 16 so the
+ * stroke lands on whole pixels; `tintColor` replaces `currentColor`.
+ */
+const THINK_ICON = "data:image/png;base64,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";
 
 export interface InlineThinkingData {
   text: string;
@@ -111,10 +119,10 @@ export function InlineThinking({
       style={styles.root}
     >
       <View style={styles.row}>
-        <Icon
-          name="Brain"
-          size={layout.compact ? 14 : 16}
-          color={theme.colors.foregroundMuted}
+        <Image
+          source={{ uri: THINK_ICON }}
+          style={{ width: 16, height: 16 }}
+          tintColor={theme.colors.foregroundMuted}
         />
         <TextShimmer
           active={growing && !open}
