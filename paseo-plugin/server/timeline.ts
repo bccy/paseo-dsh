@@ -149,6 +149,66 @@ function imageRows(callId: string, content: unknown): Array<{ id: string; text: 
   return rows;
 }
 
+/**
+ * The questions an `ask_user_question` call asked, and the answers it settled
+ * with.
+ *
+ * Paseo's own Codex adapter writes both into this row's text, and the questions
+ * are the only durable record there is: the permission card is transient and is
+ * never replayed, so without this a reopened session could not say what was
+ * asked or what was chosen. The answers are the result's JSON body —
+ * `{"answers":[{"id","selected","custom"}]}`, the shape DSH's own
+ * `user-questions` package reads back.
+ */
+function askedAndAnswered(input: Record<string, unknown>, output: string | undefined): string {
+  const questions = Array.isArray(input.questions) ? input.questions : [];
+  const asked = questions
+    .map((question) => {
+      if (!isRecord(question)) return "";
+      const head = stringField(question, "header") ?? stringField(question, "id") ?? "";
+      const prompt = stringField(question, "question") ?? "";
+      const labels = Array.isArray(question.options)
+        ? question.options
+            .map((option) => (isRecord(option) ? stringField(option, "label") : undefined))
+            .filter((label): label is string => label !== undefined)
+        : [];
+      const lines = [head === "" ? prompt : `${head}: ${prompt}`];
+      if (labels.length > 0) lines.push(`Options: ${labels.join(", ")}`);
+      return lines.join("\n");
+    })
+    .filter((text) => text !== "")
+    .join("\n\n")
+    .trim();
+  const answers = answerLines(output);
+  if (asked === "") return answers ?? "";
+  return answers === undefined ? asked : `${asked}\n\nAnswers:\n${answers}`;
+}
+
+/** `id: selected, …` lines from an answer batch, when the result carried one. */
+function answerLines(output: string | undefined): string | undefined {
+  if (output === undefined || output === "") return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(output);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(parsed) || !Array.isArray(parsed.answers)) return undefined;
+  const lines = parsed.answers
+    .map((answer) => {
+      if (!isRecord(answer)) return "";
+      const id = stringField(answer, "id") ?? "";
+      const selected = Array.isArray(answer.selected)
+        ? answer.selected.filter((value): value is string => typeof value === "string")
+        : [];
+      const custom = stringField(answer, "custom");
+      const values = custom === undefined ? selected : [...selected, custom];
+      return `${id}: ${values.join(", ")}`;
+    })
+    .filter((line) => line !== "");
+  return lines.length === 0 ? undefined : lines.join("\n");
+}
+
 function stringField(source: Record<string, unknown>, key: string): string | undefined {
   const value = source[key];
   return typeof value === "string" && value !== "" ? value : undefined;
@@ -538,7 +598,18 @@ function toolDetail(name: string, input: Record<string, unknown>, output?: strin
     case "todo_write":
       return { type: "plain_text", label: UI.toolLabels.updateTasks, icon: "sparkles" };
     case "ask_user_question":
-      return { type: "plain_text", label: UI.toolLabels.askedUser, icon: "sparkles" };
+      // Paseo's own Codex adapter fills this row's text with the prompts *and*
+      // the answers (`mapCodexQuestionRequestToToolCall`). Without them the row
+      // expands onto nothing, and — because the permission card is transient and
+      // never replayed — a reopened session could not say what was asked or what
+      // was chosen. Both halves are already in hand: the questions ride on the
+      // call's arguments, the answers are the result's JSON body.
+      return {
+        type: "plain_text",
+        label: UI.toolLabels.askedUser,
+        icon: "sparkles",
+        text: askedAndAnswered(input, output),
+      };
     case "exit_plan_mode":
       // Paseo renders this as the readable plan card, and its own Codex adapter
       // emits the same item next to the approval buttons. The plan has to be

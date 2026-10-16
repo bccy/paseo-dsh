@@ -332,6 +332,38 @@ console.log("every detail branch carries what it claims");
   const asked = runTool("ask_user_question", { questions: [] }, "answered").detail;
   check("ask_user_question: type", asked.type === "plain_text");
   check("ask_user_question: label is DSH's ask.rowTitle", asked.label === DSH_TOOL_TITLES.askUser, asked.label);
+  check("ask_user_question: a call with no questions has no body", asked.text === "", JSON.stringify(asked.text));
+
+  // Paseo's own Codex adapter writes the prompts *and* the answers into this
+  // row's text. Without them the row expands onto nothing, and because the
+  // permission card is transient and never replayed, a reopened session could
+  // not say what was asked or what was chosen.
+  const askedDetailed = runTool(
+    "ask_user_question",
+    {
+      questions: [
+        { id: "q1", header: "Pick", question: "Which one?", options: [{ label: "yes" }, { label: "no" }] },
+        { id: "q2", header: "Note", question: "Anything else?" },
+      ],
+    },
+    JSON.stringify({ answers: [{ id: "q1", selected: ["yes"] }, { id: "q2", selected: [], custom: "a note" }] }),
+  ).detail;
+  check(
+    "ask_user_question: the row carries what was asked and what was chosen",
+    askedDetailed.text ===
+      "Pick: Which one?\nOptions: yes, no\n\nNote: Anything else?\n\nAnswers:\nq1: yes\nq2: a note",
+    JSON.stringify(askedDetailed.text),
+  );
+  const askedUnanswered = runTool(
+    "ask_user_question",
+    { questions: [{ id: "q1", header: "Pick", question: "Which one?" }] },
+    "not json at all",
+  ).detail;
+  check(
+    "ask_user_question: a result that is not an answer batch still shows the question",
+    askedUnanswered.text === "Pick: Which one?",
+    JSON.stringify(askedUnanswered.text),
+  );
 
   const plan = runTool("exit_plan_mode", { plan: "## Plan" }, "ok").detail;
   check("plan: type", plan.type === "plan");
