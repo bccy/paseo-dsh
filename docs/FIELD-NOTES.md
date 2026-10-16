@@ -834,6 +834,48 @@ transform 序列 780 → -468 → -131 → 207 → 572 → 780 → 780   ← 1.5
 原生那条路径只能靠上面的结构断言 + 用户在真机上看；两条路径的几何常量是同一份，
 所以 web 上量到的数字就是原生用的数字。
 
+### 33. 展开态的三个代表性问题
+
+**一、展开后中文标题会消失**
+
+第 31 条把折叠态的摘要换成了模型写的 `description`（常常是中文）。但更早那条"展开后不要重复
+已经显示过的内容"的规则还写着 `!expanded &&`，于是**一展开，整行就没有名字了**——用户原话
+"有些时候会有命令展开的时候不要隐藏中文标题"。
+
+修法：摘要**始终渲染**，只是折叠时 `numberOfLines={1}`、展开时放宽到 4 行（换行而不是截断，
+没有 description 的长命令因此也能读全）。展开块里的 `headline` 是**命令本身**，头部是**描述**，
+两者不同，所以不违反"不重复"。
+
+**二、只有 read/write/search 有代码格式**
+
+`code` 标志只在这几类工具上为 true，于是 shell 的输出是裸文本，视觉上和编辑行的 diff 完全
+不是一个体系。修法：**所有展开内容都进同一个 `styles.codeBlock`**（浅灰底 + 圆角，没有硬边框
+——那个是被用户否掉的），里面先一行 headline（工具主体）再是 body（输出/diff）。原来按
+`code`/`diff` 分支的三套渲染合并成两套（diff 逐行着色 / 其余代码文本）。
+
+**三、MCP 工具行"展不开"**
+
+MCP 调用的详情是 `{type:"unknown", input, output}`（`toolDetail` 的 default 分支）。而
+`toolCallData` 的 default 分支只把 `input` 塞进了 `primary`，**`output` 从来没进 `body`**：
+折叠态显示入参、展开后还是只显示入参，看起来就是"点了没反应"。
+
+修法：`type === "unknown"` 时
+
+- `body` = 美化缩进后的 `output`（对象用 `JSON.stringify(v, null, 2)`，一行 JSON 在代码块里
+  没法读）；
+- `headline` = 美化后的 `input`；
+- `summary` = **紧凑单行**的 `input` —— 折叠态只有一行，美化后的首行只会是 `{`，等于没有标题；
+- `code = true`；
+- 空入参（`{}`）不再当标题，那一行只显示工具名。
+
+**实测**（真实 Paseo web UI，点击后读 DOM）：MCP 行展开前 `h:30`、文本
+`mcp__paseo__list_workspaces|{}`，展开后 `h:787`、文本里出现 `workspaces_count=4` 与缩进过的
+`workspaces` 数组；命令行展开后文本是 `命令|展开 MCP 行并前后对比|cd /tmp && cat > ...`
+（**中文描述还在**，后接命令与输出），且行内命中一个背景为 `rgba(127, 127, 127, 0.1)` 的代码表面。
+
+**验证**：`harness/tool-call-check.cjs` 53/53（新增 unknown 分支 8 条：紧凑标题 / 美化 body /
+美化 headline / `code` / 字符串结果原样 / 空入参不出现在标题 / running 时无 body）。
+
 ---
 
 ## 已知限制（未修，有意为之）

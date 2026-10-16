@@ -197,5 +197,48 @@ console.log("the description is the row's label");
   equal("an empty description is ignored", empty.summary, "pwd");
 }
 
+console.log("provider-native tools (every MCP call)");
+{
+  // Paseo has no detail shape for these, so the row owns both halves. Without
+  // the output an expanded row showed exactly what it already showed collapsed
+  // — which reads as "this row will not expand".
+  const mcp = toolCallData(
+    {
+      name: "mcp__paseo__create_heartbeat",
+      status: "completed",
+      detail: {
+        type: "unknown",
+        input: { cron: "* * * *", maxRuns: 2 },
+        output: { id: "abc", status: "active" },
+      },
+    },
+    "complete",
+  );
+  equal("the arguments are the row's title, on one line", mcp.summary, '{"cron":"* * * *","maxRuns":2}');
+  check("the result is the body", mcp.body.includes('"status": "active"'), mcp.body);
+  check("structured results are pretty-printed", mcp.body.includes("\n"), JSON.stringify(mcp.body));
+  check("and so are the arguments in the block", mcp.headline.includes("\n"), JSON.stringify(mcp.headline));
+  equal("and rendered as code", mcp.code, true);
+
+  const text = toolCallData(
+    {
+      name: "mcp__paseo__browser_list_tabs",
+      status: "completed",
+      detail: { type: "unknown", input: {}, output: "No Paseo browser tabs are open." },
+    },
+    "complete",
+  );
+  equal("a string result is kept verbatim", text.body, "No Paseo browser tabs are open.");
+  equal("an argument-less call is labelled by its tool name alone", text.summary, "");
+
+  const silent = toolCallData(
+    { name: "mcp__x__y", status: "running", detail: { type: "unknown", input: { a: 1 } } },
+    "streaming",
+  );
+  equal("a running call has no body yet", silent.body, "");
+  equal("but is still expandable by its title", silent.summary, '{"a":1}');
+  check("and its block already has the arguments", silent.headline.includes("\n"), JSON.stringify(silent.headline));
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

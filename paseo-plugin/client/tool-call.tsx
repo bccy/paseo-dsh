@@ -133,18 +133,18 @@ export function InlineToolCall({
           {(color) => (
             <>
               <Text style={[styles.label, color === null ? null : { color }]}>{data.label}</Text>
-              {/* When expanded the summary moves below at full width, so the
-                  head does not show a truncated copy of what the body already
-                  carries. */}
-              {!expanded && data.summary !== "" ? (
+              {/* The row's title never disappears: expanding reveals the tool's
+                  own subject below, so hiding this left the row unnamed — DSH
+                  keeps the title and puts the command in the block under it.
+                  Expanded it wraps instead of clipping, which is where a long
+                  command that has no description becomes readable. */}
+              {data.summary !== "" ? (
                 <Text
                   style={[styles.summary, color === null ? null : { color }]}
-                  numberOfLines={1}
+                  numberOfLines={expanded ? 4 : 1}
                 >
                   {data.summary}
                 </Text>
-              ) : !expanded ? (
-                <View style={styles.summary} />
               ) : null}
             </>
           )}
@@ -152,8 +152,10 @@ export function InlineToolCall({
       </View>
       {expanded && canExpand ? (
         <View style={styles.body}>
-          {/* The row's own line is the tool's description; the expanded block
-              leads with the subject it describes — the actual command. */}
+          {/* Everything a row reveals goes in one code surface, the way the edit
+              rows already did: the subject the title describes (the command),
+              then the payload (the output, the file, the diff). */}
+          <View style={styles.codeBlock}>
           {data.headline !== "" ? <Text style={styles.summaryFull}>{data.headline}</Text> : null}
           {hasBody ? (
             data.diff ? (
@@ -185,20 +187,13 @@ export function InlineToolCall({
                   </View>
                 );
               })
-            ) : data.code ? (
-              // Source code (read/write/search): a soft code surface so it
-              // reads as code, without the hard box the user rejected.
-              <View style={styles.codeBlock}>
-                <Text style={styles.codeText} selectable>
-                  {data.body}
-                </Text>
-              </View>
             ) : (
-              <Text style={styles.bodyText} selectable>
+              <Text style={styles.codeText} selectable>
                 {data.body}
               </Text>
             )
           ) : null}
+          </View>
         </View>
       ) : null}
     </Pressable>

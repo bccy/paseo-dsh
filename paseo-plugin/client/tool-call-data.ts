@@ -108,6 +108,24 @@ function truncate(text: string): string {
   return text.length > BODY_LIMIT ? `${text.slice(0, BODY_LIMIT)}\n…（已截断）` : text;
 }
 
+/**
+ * Render a JSON-ish value as display text.
+ *
+ * `pretty` is for the expanded block: an MCP payload arrives as structured JSON
+ * and one long line of it is unreadable in a code surface. The row's one-line
+ * title must stay compact — pretty-printed JSON starts with `{`, which is all a
+ * clipped single line would ever show.
+ */
+function stringifyValue(value: unknown, pretty = false): string {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined) return "";
+  try {
+    return pretty ? JSON.stringify(value, null, 2) : JSON.stringify(value);
+  } catch {
+    return "";
+  }
+}
+
 /** Normalize one Paseo tool-call item into JSON-safe render data. */
 export function toolCallData(
   item: {
@@ -135,6 +153,8 @@ export function toolCallData(
   let bodyLabel = "输出";
   let diff = false;
   let code = false;
+  /** Block-only first line, for rows whose title is something else. */
+  let detailHeadline = "";
 
   switch (type) {
     case "shell":
@@ -201,12 +221,24 @@ export function toolCallData(
       break;
   }
 
-  if (primary === "" && type === "unknown") {
-    try {
-      primary = JSON.stringify(detail.input ?? "");
-    } catch {
-      primary = "";
-    }
+  if (type === "unknown") {
+    // Provider-native tools land here — every MCP call, and anything else Paseo
+    // has no detail shape for. The row has to carry both halves itself: the
+    // arguments it was called with, and whatever came back. Without the output
+    // an expanded row showed exactly what it already showed collapsed, which
+    // reads as "this row will not expand".
+    // An argument-less call (`list_workspaces`) would otherwise label itself
+    // `{}` and open onto another `{}`; the tool's own name is already the label.
+    const input = detail.input;
+    const emptyInput =
+      input === null ||
+      input === undefined ||
+      (typeof input === "object" && !Array.isArray(input) && Object.keys(input).length === 0);
+    if (primary === "" && !emptyInput) primary = stringifyValue(input);
+    detailHeadline = emptyInput ? "" : stringifyValue(input, true);
+    body = stringifyValue(detail.output, true);
+    bodyLabel = "结果";
+    code = true;
   }
 
   return {
@@ -220,7 +252,7 @@ export function toolCallData(
       : "completed",
     phase,
     summary: truncate(description === "" ? primary : description),
-    headline: truncate(description === "" ? "" : primary),
+    headline: truncate(description === "" ? detailHeadline : primary),
     body: truncate(body),
     bodyLabel,
     diff,
