@@ -26,6 +26,17 @@
  * that cross-process ordering, and `failonce` covers the reset of an id issued
  * for a turn that never started.
  *
+ * The last scenario is the other half of "a turn in progress": a *cancel*. With
+ * `DSH_FAKE_MODE=cancel` a root turn stays open and keeps emitting output, a
+ * `session.interrupt` arrives mid-turn, and the fake ends the turn exactly as
+ * real DSH does for `agent.cancel({kind:'user'})` — `turn/end` with
+ * `{kind:'aborted', reason:{kind:'user'}}`, then an idle status. The check
+ * asserts the receipt (`request.completed` naming the requestId), that the
+ * runtime was really told to stop (`session/cancel`) and produced nothing more
+ * for that turn, that the terminal is `canceled` rather than `completed`, and
+ * that the same session still runs the next turn — cancel is a turn cancel,
+ * never a kill.
+ *
  * Compile the plugin first (tsc type errors under `--moduleResolution node` are
  * expected; the emitted JS is what runs):
  *
@@ -91,6 +102,21 @@ const untilIn = async (list, predicate, label, ms = 30000) => {
     await sleep(25);
   }
   throw new Error(`timed out waiting for ${label}`);
+};
+/**
+ * Like `untilIn`, but returns undefined instead of throwing.
+ *
+ * A regression must show up as a named FAIL, not as an abort that hides every
+ * assertion after it.
+ */
+const maybeIn = async (list, predicate, ms = 30000) => {
+  const started = Date.now();
+  while (Date.now() - started < ms) {
+    const hit = list.find(predicate);
+    if (hit) return hit;
+    await sleep(25);
+  }
+  return undefined;
 };
 
 const results = [];
@@ -312,9 +338,120 @@ let conn;
     `result=${recovered.result?.turnId} started=${recoveredStarted.turnId}`,
   );
 
+  // ---- cancel: a stop must stop the turn, and must say so -------------------
+  //
+  // Paseo's own cancel path is `ProviderRuntimeSession.interrupt()` →
+  // `session.interrupt` (`@getpaseo/server` `agent/plugin-provider.js`), awaited
+  // through `complete()`, which settles only on `request.completed` /
+  // `request.failed`. Its adapters stop the provider's own run and report the
+  // turn as canceled (`turn_canceled` in opencode/claude/codex). So three things
+  // have to hold on the wire, and each of them failed at least once in a way the
+  // UI could not show:
+  //   1. the request is answered with a success receipt naming its requestId
+  //   2. the runtime is actually told to stop (`session/cancel`), and the turn
+  //      produces no further output afterwards — a receipt without a stop is
+  //      "回成功但没停"
+  //   3. the turn terminal is `canceled`, not `completed`, so a stop is not
+  //      indistinguishable from a finish
+  // The session must also stay usable: cancel is a turn cancel, never a kill.
+  process.env.DSH_FAKE_MODE = "cancel";
+  const conn4 = await registration.connect({ capabilities: ["prompt.message", "prompt.steer"] });
+  const events4 = [];
+  conn4.onEvent((event) => events4.push(event));
+  const cancelSessionId = `cancel-${Date.now()}`;
+  await conn4.send({ type: "session.open", sessionId: cancelSessionId, config: { cwd: process.cwd(), mode: "build" }, history: "skip" });
+  await untilIn(events4, (e) => e.type === "session.ready" && e.sessionId === cancelSessionId, `ready ${cancelSessionId}`);
+
+  const cancelMark = events4.length;
+  const framesBefore = frames().length;
+  await conn4.send({
+    type: "session.prompt",
+    sessionId: cancelSessionId,
+    prompt: { clientMessageId: "c1", input: { type: "message", content: [{ type: "text", text: "count forever" }] } },
+  });
+  const cancelStarted = await untilIn(events4, (e) => e.type === "session.turn" && e.sessionId === cancelSessionId && e.state === "started", "cancel turn started");
+  // Wait until the turn has demonstrably produced a stream of output, so a
+  // no-op cancel cannot pass by being sent into a turn that never ran.
+  const cancelOutput = (mark) =>
+    events4.slice(mark).filter((e) => e.type === "timeline.item" && e.sessionId === cancelSessionId).length;
+  const cancelWaitStart = Date.now();
+  while (cancelOutput(cancelMark) < 3 && Date.now() - cancelWaitStart < 30000) await sleep(20);
+  const outputBeforeCancel = cancelOutput(cancelMark);
+  check("the turn is demonstrably producing output before the cancel", outputBeforeCancel >= 3, `${outputBeforeCancel} item(s) before the cancel`);
+
+  const interruptRequestId = `interrupt-cancel-${Date.now()}`;
+  await conn4.send({ type: "session.interrupt", sessionId: cancelSessionId, requestId: interruptRequestId });
+  const interruptReceipt = await maybeIn(
+    events4,
+    (e) => e.type === "request.completed" && e.requestId === interruptRequestId,
+    10000,
+  );
+  check(
+    "a cancel is acknowledged with a request.completed naming its requestId",
+    interruptReceipt !== undefined &&
+      events4.every((e) => !(e.type === "request.failed" && e.requestId === interruptRequestId)),
+    JSON.stringify(interruptReceipt ?? "(no receipt)"),
+  );
+
+  const cancelFrames = frames().slice(framesBefore).filter((frame) => frame.method === "session/cancel");
+  check(
+    "the cancel reaches the runtime as a session/cancel for that session",
+    cancelFrames.length === 1 && cancelFrames[0].params?.sessionId === cancelSessionId,
+    `${cancelFrames.length} session/cancel frame(s)`,
+  );
+
+  // Silence after the cancel: the fake keeps ticking until it is told to stop,
+  // so a receipt that never stopped anything shows up here as a growing count.
+  const outputAtCancel = cancelOutput(cancelMark);
+  await sleep(600);
+  const outputAfterCancel = cancelOutput(cancelMark);
+  check(
+    "no further output for the cancelled turn after the cancel",
+    outputAfterCancel === outputAtCancel,
+    `${outputAtCancel} item(s) at the cancel, ${outputAfterCancel} after 600ms`,
+  );
+
+  const cancelTerminal = await maybeIn(
+    events4,
+    (e) => e.type === "session.turn" && e.sessionId === cancelSessionId && e.state !== "started",
+    8000,
+  );
+  check(
+    "the cancelled turn is reported as canceled, not completed",
+    cancelTerminal?.state === "canceled" && cancelTerminal?.turnId === cancelStarted.turnId,
+    `state=${cancelTerminal?.state} turnId=${cancelTerminal?.turnId} started=${cancelStarted.turnId}`,
+  );
+
+  // Cancel is a turn cancel, never a kill: the same session takes another turn.
+  const afterMark = events4.length;
+  await conn4.send({
+    type: "session.prompt",
+    sessionId: cancelSessionId,
+    prompt: { clientMessageId: "c2", input: { type: "message", content: [{ type: "text", text: "are you alive" }] } },
+  });
+  const afterTerminal = await maybeIn(
+    events4,
+    (e) => e.type === "session.turn" && e.sessionId === cancelSessionId && e.state === "completed" && e.turnId !== cancelStarted.turnId,
+    15000,
+  );
+  check(
+    "the session survives the cancel and runs the next turn",
+    afterTerminal !== undefined &&
+      events4
+        .slice(afterMark)
+        .some((e) => e.type === "timeline.item" && e.sessionId === cancelSessionId && /still alive/.test(e.item?.text ?? "")),
+    `next turn state=${afterTerminal?.state}`,
+  );
+  check(
+    "the cancel did not kill the runtime process",
+    frames().filter((frame) => frame.method === "shutdown").length === 0,
+    `${frames().filter((frame) => frame.method === "shutdown").length} shutdown frame(s)`,
+  );
+
   await conn.close();
   await conn2.close();
   await conn3.close();
+  await conn4.close();
   fs.rmSync(path.dirname(frameLog), { recursive: true, force: true });
 
   const failed = results.filter((r) => !r.pass).length;

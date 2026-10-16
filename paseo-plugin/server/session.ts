@@ -164,6 +164,20 @@ export class DshSession {
   #mode: string;
   #thinkingOption: string | undefined;
   #turnId: string | null = null;
+  /**
+   * How DSH ended the turn that is currently open, from its own `turn/end`.
+   *
+   * The root's terminal `session.turn` is emitted when the agent goes idle, so
+   * without this the state would be a guess — and the guess was always
+   * `completed`. A turn the user stopped then reached Paseo as a *finished* one:
+   * Paseo's `turn_completed` branch never resolves the pending permissions an
+   * interruption abandons, and the UI cannot tell "stopped" from "done". The
+   * state is read from DSH's reason instead, exactly as {@link DshChildSession}
+   * already does for a subagent and as Paseo's own adapters report a canceled
+   * turn. `null` means no `turn/end` has been seen for this turn, which is the
+   * status-only ending the idle fallback still closes as `completed`.
+   */
+  #turnEndState: "completed" | "canceled" | null = null;
   #replaySeq = 0;
   /**
    * Pending question cards keyed by permission id, remembering which session
@@ -680,6 +694,9 @@ export class DshSession {
   #openTurnId(clientMessageId: string, delivery: "auto" | "steer"): boolean {
     if (delivery === "steer" || this.#turnId !== null) return false;
     this.#turnId = `turn:${clientMessageId}`;
+    // The id is issued before the bridge starts the turn, so no `turn/end` can
+    // belong to it yet; the previous turn's state must not leak into it.
+    this.#turnEndState = null;
     return true;
   }
 
@@ -875,13 +892,18 @@ export class DshSession {
     if (status === "running") {
       const turnId = this.#turnId ?? `turn:${Date.now()}`;
       this.#turnId = turnId;
+      // A new turn has no `turn/end` yet; a stale state from the previous one
+      // must not colour its terminal event.
+      this.#turnEndState = null;
       this.#options.emit({ type: "session.turn", sessionId: this.id, turnId, state: "started" });
       return;
     }
     if (this.#turnId !== null) {
       const turnId = this.#turnId;
+      const state = this.#turnEndState ?? "completed";
       this.#turnId = null;
-      this.#options.emit({ type: "session.turn", sessionId: this.id, turnId, state: "completed" });
+      this.#turnEndState = null;
+      this.#options.emit({ type: "session.turn", sessionId: this.id, turnId, state });
       // The turn's request reported fresh provider usage; refresh the occupancy
       // now so the readout is current even when no further turn arrives.
       void this.refreshUsage();
@@ -1163,6 +1185,19 @@ export class DshSession {
       return;
     }
     const event = payload.event;
+    // DSH says how the turn ended; the root's terminal `session.turn` is emitted
+    // when the agent goes idle, so the reason has to be remembered here or a
+    // stopped turn would reach Paseo as a finished one. `aborted` is what
+    // `agent.cancel({kind:'user'})` records, and `canceled` is the state Paseo's
+    // own adapters report for an interruption (`turn_canceled`), so a user's stop
+    // is no longer indistinguishable from a normal finish. Every other reason
+    // keeps the previous reading, so nothing about a completed or capped turn
+    // changes here.
+    if (event.type === "turn/end") {
+      const data = isRecord(event.data) ? event.data : {};
+      const kind = isRecord(data.reason) ? data.reason.kind : undefined;
+      this.#turnEndState = kind === "aborted" ? "canceled" : "completed";
+    }
     // The model can leave plan mode on its own, for example by submitting a plan
     // for approval. Mirror that into the composer's mode selection so the toggle
     // never disagrees with the runtime.

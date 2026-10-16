@@ -33,6 +33,13 @@
  *            regardless of that cross-process ordering
  *   failonce refuse the first prompt, then run later ones normally, so a ghost
  *            turn id left behind by the failure would be observable
+ *   cancel   hold a root turn open and keep emitting its output on a timer, so a
+ *            `session.interrupt` arrives while the turn is unmistakably live.
+ *            `session/cancel` then ends that turn the way real DSH does for
+ *            `agent.cancel({kind:'user'})` — `turn/end` with
+ *            `{kind:'aborted', reason:{kind:'user'}}`, then an idle status, and
+ *            no further output for the turn. A later prompt still runs, so the
+ *            check can prove the process and the conversation survived
  *   stream   replay a growing `paseo/assistant-delta` stream (the bridge's
  *            transient assistant snapshot) followed by the durable
  *            `assistant/message` for the same turn/step, so the plugin's
@@ -87,6 +94,11 @@ let emitted = false;
 let liveChildEmitted = false;
 let rootTurnOpen = false;
 let promptAttempts = 0;
+/** The cancel scenario's live output timer, and how many steps it has emitted. */
+let cancelTicker = null;
+let cancelSteps = 0;
+/** Prompts seen in `cancel` mode: the first opens the turn, the rest follow it. */
+let cancelPrompts = 0;
 
 const childAEvents = () => [
   { type: "user/message", seq: 1, data: { source: { kind: "user" }, content: [{ type: "text", text: "child A prompt" }] } },
@@ -252,6 +264,61 @@ async function finishSteerTurn() {
 async function endRootTurn(text) {
   notify("session.event", { sessionId: rootId, event: { type: "assistant/message", seq: 1, data: { turn: 1, step: 1, message: { id: "lm1", content: [{ type: "text", text }] } } } });
   notify("session.event", { sessionId: rootId, event: { type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "completed" } } } });
+  notify("session.status", { sessionId: rootId, status: "idle" });
+}
+
+/**
+ * Open a root turn that stays open and keeps producing output.
+ *
+ * The point is that a cancel arrives while the turn is *demonstrably* running:
+ * real DSH emits the running status synchronously inside `followup()`, before
+ * the prompt reply, and the model then streams step after step. A turn that
+ * merely "exists" would let a no-op cancel pass the check.
+ */
+async function openCancelTurn() {
+  rootTurnOpen = true;
+  notify("session.status", { sessionId: rootId, status: "running" });
+  cancelTicker = setInterval(() => {
+    if (!rootTurnOpen) return;
+    cancelSteps += 1;
+    notify("session.event", {
+      sessionId: rootId,
+      event: {
+        type: "assistant/message",
+        seq: cancelSteps,
+        data: { turn: 1, step: cancelSteps, message: { id: `cm${cancelSteps}`, content: [{ type: "text", text: `counting ${cancelSteps}` }] } },
+      },
+    });
+  }, 40);
+}
+
+/**
+ * End the open turn the way real DSH ends a cancelled one.
+ *
+ * `agent.cancel({kind:'user'})` closes the turn with
+ * `turn/end {kind:'aborted', reason:{kind:'user'}}` and the agent then reports
+ * `idle`; both halves matter, because the plugin's terminal `session.turn` is
+ * emitted on the idle status and its state is read from the reason. Nothing more
+ * is written for the turn afterwards — that silence is what "the cancel stopped
+ * it" means on the wire.
+ */
+function cancelTurn() {
+  if (!rootTurnOpen) return false;
+  rootTurnOpen = false;
+  if (cancelTicker !== null) {
+    clearInterval(cancelTicker);
+    cancelTicker = null;
+  }
+  notify("session.event", { sessionId: rootId, event: { type: "turn/end", seq: cancelSteps + 1, data: { turn: 1, reason: { kind: "aborted", reason: { kind: "user" } } } } });
+  notify("session.status", { sessionId: rootId, status: "idle" });
+  return true;
+}
+
+/** The turn after a cancel: the session is still alive and still usable. */
+async function runAfterCancelTurn() {
+  notify("session.status", { sessionId: rootId, status: "running" });
+  notify("session.event", { sessionId: rootId, event: { type: "assistant/message", seq: 1, data: { turn: 2, step: 1, message: { id: "ac1", content: [{ type: "text", text: "still alive after cancel" }] } } } });
+  notify("session.event", { sessionId: rootId, event: { type: "turn/end", seq: 2, data: { turn: 2, reason: { kind: "completed" } } } });
   notify("session.status", { sessionId: rootId, status: "idle" });
 }
 
@@ -461,9 +528,18 @@ async function handle(method, params, id) {
           setTimeout(() => { void endRootTurn("recovered answer"); }, 40);
         }
       }
+      if (MODE === "cancel" && params?.delivery !== "steer") {
+        cancelPrompts += 1;
+        if (cancelPrompts === 1) setTimeout(() => { void openCancelTurn(); }, 20);
+        else setTimeout(() => { void runAfterCancelTurn(); }, 20);
+      }
       return { messageId: "m-1" };
-    case "session/cancel":
+    case "session/cancel": {
+      // The one thing this scenario exists to observe: the plugin really asked
+      // the runtime to stop the turn it thinks is running.
+      if (MODE === "cancel") cancelTurn();
       return { canceled: true };
+    }
     case "paseo/plan/get":
       return { available: false, active: false, pending: false };
     case "paseo/plan/set":
@@ -471,6 +547,7 @@ async function handle(method, params, id) {
     case "paseo/config/set":
       return { provider: "fake", model: "fake", reasoningEffort: null, preset: null };
     case "shutdown":
+      if (cancelTicker !== null) clearInterval(cancelTicker);
       setTimeout(() => process.exit(0), 10);
       return {};
     default:
