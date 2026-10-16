@@ -646,11 +646,42 @@ async function openSession(conn, sessionId, history) {
       !conn4Events.some((e) => e.type === "session.runtime_failed"),
   );
 
+  // ---- a turn DSH ended for a reason that is not a clean finish ----------
+  // The root's terminal `session.turn` is emitted later, from the remembered
+  // reason. Reading every non-`aborted` reason as `completed` meant the daemon
+  // took its `turn_completed` branch, which never resolves the permissions an
+  // abandoned turn leaves behind — so a card from a turn that died stayed pending
+  // forever — and the UI could not tell a failed turn from a finished one.
+  const connFail = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+  const connFailEvents = [];
+  connFail.onEvent((e) => connFailEvents.push(e));
+  const rootFail = `subF-${Date.now()}`;
+  process.env.DSH_FAKE_MODE = "failturn";
+  await connFail.send({ type: "session.open", sessionId: rootFail, config: { cwd: process.cwd(), mode: "build" } });
+  await untilIn(connFailEvents, (e) => e.type === "session.ready" && e.sessionId === rootFail, "rootFail ready", 30000);
+  await connFail.send({
+    type: "session.prompt",
+    sessionId: rootFail,
+    prompt: { clientMessageId: "failturn-1", input: { type: "message", content: [{ type: "text", text: "go" }] } },
+  });
+  const failedTurn = await untilIn(
+    connFailEvents,
+    (e) => e.type === "session.turn" && e.sessionId === rootFail && e.state !== "started",
+    "failed turn terminal",
+    30000,
+  );
+  check(
+    "a turn DSH ended with an error reaches Paseo as failed, with the reason",
+    failedTurn.state === "failed" && /error/.test(failedTurn.error?.message ?? ""),
+    JSON.stringify({ state: failedTurn.state, error: failedTurn.error?.message }),
+  );
+  await connFail.close();
+
   await conn.close();
   await conn2.close();
   await conn3.close();
   await conn4.close();
-  await conn5.close();
+  await connFail.close();
 
   const failed = results.filter((r) => !r.pass).length;
   console.log(`\n  ${results.length - failed}/${results.length} passed`);

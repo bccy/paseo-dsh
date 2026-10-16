@@ -334,9 +334,9 @@ async function finishSteerTurn() {
 }
 
 /** Emit one root assistant answer and close the root turn. */
-async function endRootTurn(text) {
+async function endRootTurn(text, reason = "completed") {
   notify("session.event", { sessionId: rootId, event: { type: "assistant/message", seq: 1, data: { turn: 1, step: 1, message: { id: "lm1", content: [{ type: "text", text }] } } } });
-  notify("session.event", { sessionId: rootId, event: { type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "completed" } } } });
+  notify("session.event", { sessionId: rootId, event: { type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: reason } } } });
   notify("session.status", { sessionId: rootId, status: "idle" });
 }
 
@@ -592,6 +592,13 @@ async function handle(method, params, id) {
       if (MODE === "stream" && !emitted) {
         emitted = true;
         setTimeout(() => { void emitStream(); }, 20);
+      }
+      if (MODE === "failturn" && !emitted) {
+        emitted = true;
+        // DSH can end a turn for reasons that are not a clean finish. The root's
+        // terminal `session.turn` is emitted later, from the remembered reason,
+        // so this is the only place that can say the turn failed.
+        setTimeout(() => { void endRootTurn("partial answer", "error"); }, 20);
       }
       if (MODE === "image" && !emitted) {
         emitted = true;

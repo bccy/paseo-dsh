@@ -177,7 +177,7 @@ export class DshSession {
    * turn. `null` means no `turn/end` has been seen for this turn, which is the
    * status-only ending the idle fallback still closes as `completed`.
    */
-  #turnEndState: "completed" | "canceled" | null = null;
+  #turnEndState: { state: "completed" | "canceled" | "failed"; error?: string } | null = null;
   #replaySeq = 0;
   /**
    * Pending question cards keyed by permission id, remembering which session
@@ -965,10 +965,17 @@ export class DshSession {
     }
     if (this.#turnId !== null) {
       const turnId = this.#turnId;
-      const state = this.#turnEndState ?? "completed";
+      const ended = this.#turnEndState;
+      const state = ended?.state ?? "completed";
       this.#turnId = null;
       this.#turnEndState = null;
-      this.#options.emit({ type: "session.turn", sessionId: this.id, turnId, state });
+      this.#options.emit({
+        type: "session.turn",
+        sessionId: this.id,
+        turnId,
+        state,
+        ...(ended?.error === undefined ? {} : { error: { message: ended.error } }),
+      });
       // The turn's request reported fresh provider usage; refresh the occupancy
       // now so the readout is current even when no further turn arrives.
       void this.refreshUsage();
@@ -1261,7 +1268,21 @@ export class DshSession {
     if (event.type === "turn/end") {
       const data = isRecord(event.data) ? event.data : {};
       const kind = isRecord(data.reason) ? data.reason.kind : undefined;
-      this.#turnEndState = kind === "aborted" ? "canceled" : "completed";
+      // `aborted`/`abandoned` is the turn being stopped; `completed` is the only
+      // clean finish. Everything else DSH can say — `error`, `blocked`,
+      // `max-tokens`, `interrupted`, `forked` — is a *failure*, and reading it as
+      // `completed` was not cosmetic: the daemon's `turn_completed` branch never
+      // resolves the permissions an abandoned turn leaves behind, so a card from
+      // a turn that died stayed pending forever, and the UI could not tell a
+      // stopped or failed turn from a finished one.
+      const state =
+        kind === "aborted" || kind === "abandoned"
+          ? "canceled"
+          : kind === undefined || kind === "completed"
+            ? "completed"
+            : "failed";
+      this.#turnEndState =
+        state === "failed" ? { state, error: `the turn ended with ${String(kind)}` } : { state };
     }
     // The model can leave plan mode on its own, for example by submitting a plan
     // for approval. Mirror that into the composer's mode selection so the toggle
