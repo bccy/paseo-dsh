@@ -97,6 +97,29 @@ function withTimeout(promise, ms, label) {
   ]).finally(() => clearTimeout(timer));
 }
 
+/** A `withTimeout` rejection, as opposed to a lookup that simply found nothing. */
+function isTimeout(error) {
+  return error instanceof Error && error.message.startsWith('timed out ');
+}
+
+/**
+ * The loud answer for a stored log that exists but could not be read.
+ *
+ * `available: false` is the same contract `subagents()` uses next door. The
+ * quiet `available: true, events: []` it replaced is indistinguishable from a
+ * session that genuinely has no history, and the plugin renders both as a blank
+ * timeline — so a replay that timed out on a large log looked to the user like
+ * "my history is gone" with nothing anywhere saying otherwise.
+ */
+function unavailableHistory(error) {
+  return {
+    available: false,
+    inheritedEventCount: 0,
+    events: [],
+    error: { message: error instanceof Error ? error.message : String(error) },
+  };
+}
+
 /**
  * Bound on a child's held frames before it is opened without a label. A child's
  * `subagent/descriptor` normally arrives within its first turn; the cap only
@@ -798,9 +821,10 @@ export class PaseoHarnessServer {
       // A session mid-write can stall a read; bound it so a stuck read never
       // stalls the session open that asked for the replay.
       handle = await withTimeout(persistence.open(params.sessionId, 'read'), 15000, 'opening session history');
-    } catch {
-      // Unknown/unmaterialized session (or a stalled read): an empty history is
-      // the honest answer.
+    } catch (error) {
+      // A session that was never materialized has no history, and an empty list
+      // is the honest answer for it. A stalled open is a different fact.
+      if (isTimeout(error)) return unavailableHistory(error);
       return { available: true, events: [], inheritedEventCount: 0 };
     }
     try {
@@ -820,8 +844,10 @@ export class PaseoHarnessServer {
         // reopen time, and only the attachment's host path still resolves.
         events: historyEvents(this.ctx, result.events ?? []),
       };
-    } catch {
-      return { available: true, inheritedEventCount: 0, events: [] };
+    } catch (error) {
+      // The open succeeded, so this log exists; failing to read it is never
+      // "this session has no history".
+      return unavailableHistory(error);
     } finally {
       try {
         await handle.close();

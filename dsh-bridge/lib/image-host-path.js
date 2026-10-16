@@ -75,8 +75,17 @@ const EXTENSION_BY_MEDIA_TYPE = new Map([
  * Where the compatibility copies live. Under the OS temp dir on purpose: DSH's
  * attachment store is content addressed and read-only to us, and a copy beside
  * it would be collected by nothing.
+ *
+ * Named per uid because `tmpdir()` is world-writable on Linux: a fixed name
+ * there is a directory another local user can create first, then read (the
+ * digests enumerate every picture this user has looked at) and write into. The
+ * atomic rename below already stops a pre-placed symlink from being written
+ * through; owning the directory stops the rest.
  */
-const COPY_DIRECTORY = join(tmpdir(), 'paseo-dsh-attachments');
+const COPY_DIRECTORY = join(
+  tmpdir(),
+  `paseo-dsh-attachments-${typeof process.getuid === 'function' ? process.getuid() : 'user'}`,
+);
 
 /**
  * The extension one media type needs, or `undefined` when the host has no image
@@ -113,9 +122,14 @@ function copyBeside(source, extension) {
   const target = join(COPY_DIRECTORY, `${name}${extension}`);
   const staging = `${target}.${process.pid}.tmp`;
   try {
-    // An already-complete copy is the whole point of the cache.
-    if (existsSync(target) && statSync(target).size > 0) return target;
-    mkdirSync(COPY_DIRECTORY, { recursive: true });
+    // Reuse only a copy that is the same size as the source: a truncated one
+    // left by an interrupted write is not an answer, and neither is a foreign
+    // file that happens to sit at this name. (A same-size substitution would
+    // still pass; that is the residual, and hashing every hit would cost a full
+    // read on the hot path.)
+    const sourceSize = statSync(source).size;
+    if (sourceSize > 0 && existsSync(target) && statSync(target).size === sourceSize) return target;
+    mkdirSync(COPY_DIRECTORY, { recursive: true, mode: 0o700 });
     // Stage beside the target, then rename into place. `rename` is atomic within
     // one filesystem, and that is what makes the cache safe on both counts:
     //   - the daemon runs several sessions, and two of them can replay the same
@@ -228,9 +242,14 @@ export function withImageHostPaths(ctx, event) {
  * Reopening a session replays through here, and that is the path an image
  * matters most on: `data.meta.path` is the *source* file, which is typically
  * long gone, while the attachment copy is the durable one. The field projection
- * (`type`, `seq?`, `time?`, `data`) is exactly what `history()` used to inline;
- * it lives beside the injection rule so the replay path can be asserted without
- * a DSH profile.
+ * (`type`, `seq?`, `time?`, `ignorable?`, `data`) is exactly what `history()`
+ * used to inline; it lives beside the injection rule so the replay path can be
+ * asserted without a DSH profile.
+ *
+ * `ignorable` rides along even though nothing here reads it: DSH's contract is
+ * that an event *without* the marker MUST make a reader refuse to reconstruct
+ * the session rather than drop it silently, so stripping the marker removes the
+ * only thing that tells a future event type apart from a skippable one.
  *
  * @param {{get(name: string): unknown}} ctx - the DSH profile context.
  * @param {unknown} events - the stored events read from session persistence.
@@ -243,6 +262,7 @@ export function historyEvents(ctx, events) {
       type: event.type,
       ...(event.seq === undefined ? {} : { seq: event.seq }),
       ...(event.time === undefined ? {} : { time: event.time }),
+      ...(event.ignorable === undefined ? {} : { ignorable: event.ignorable }),
       data: event.data,
     }),
   );

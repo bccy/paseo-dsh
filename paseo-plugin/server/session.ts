@@ -456,7 +456,14 @@ export class DshSession {
    * approval notices) carries a different `source.kind` and is skipped.
    */
   async replayHistory(): Promise<void> {
-    const { events } = await this.#require().history();
+    const { events, available, error } = await this.#require().history();
+    // A failed read is not an empty session. Returning silently here is what
+    // made "the replay timed out" look exactly like "there was nothing to
+    // replay": the user saw a blank conversation and no reason for it.
+    if (!available) {
+      this.#options.log(`paseo-dsh: session history could not be read: ${error ?? "unknown error"}`);
+      return;
+    }
     if (events.length === 0) return;
     const builder = new TimelineBuilder({ warn: (line) => this.#options.log(line) });
     for (const event of events) {

@@ -484,11 +484,23 @@ export class DshProcess {
     return result.sessions ?? [];
   }
 
-  /** Read one session's stored event log, for replaying into a timeline. */
+  /**
+   * Read one session's stored event log, for replaying into a timeline.
+   *
+   * `available: false` means the log could not be read — a stalled or failed
+   * read — as opposed to a session that genuinely has no history. The caller
+   * has to tell them apart: both used to arrive as an empty `events` array, so
+   * a reopen whose replay failed rendered a blank conversation with no error,
+   * which reads to the user as "my history is gone".
+   */
   async history(sessionId = this.#options.sessionId): Promise<{
     events: Array<{ type: string; seq?: number; time?: number; data: unknown }>;
     /** Leading events inherited from a fork parent; own history starts here. */
     inheritedEventCount: number;
+    /** False when the log exists but could not be read. */
+    available: boolean;
+    /** Why it could not be read, when `available` is false. */
+    error?: string;
   }> {
     const result = (await this.#request(
       "paseo/history",
@@ -497,6 +509,8 @@ export class DshProcess {
     )) as {
       events?: Array<{ type: string; seq?: number; time?: number; data: unknown }>;
       inheritedEventCount?: number;
+      available?: boolean;
+      error?: { message?: string };
     };
     return {
       events: result.events ?? [],
@@ -504,6 +518,10 @@ export class DshProcess {
         typeof result.inheritedEventCount === "number" && result.inheritedEventCount > 0
           ? result.inheritedEventCount
           : 0,
+      available: result.available !== false,
+      ...(result.available === false
+        ? { error: typeof result.error?.message === "string" ? result.error.message : "the history read failed" }
+        : {}),
     };
   }
 

@@ -81,7 +81,12 @@ const DIGEST = '0f1e2d3c4b5a69788796a5b4c3d2e1f0';
 const STORE_PATH = join(WORK, DIGEST);
 writeFileSync(STORE_PATH, BYTES);
 /** Where the deterministic copy lands, derived the way the module derives it. */
-const copyFor = (extension) => join(tmpdir(), 'paseo-dsh-attachments', `${DIGEST}${extension}`);
+const copyFor = (extension) =>
+  join(
+    tmpdir(),
+    `paseo-dsh-attachments-${typeof process.getuid === "function" ? process.getuid() : "user"}`,
+    `${DIGEST}${extension}`,
+  );
 const copyHolds = (extension) => {
   try {
     return readFileSync(copyFor(extension)).equals(BYTES);
@@ -99,6 +104,14 @@ const copyHolds = (extension) => {
     `${out.data.message.content[1].hostPath} (expected ${copyFor('.png')})`,
   );
   check('the copy holds the very bytes the store handed us', copyHolds('.png'));
+  // An interrupted write leaves a short file. The old `size > 0` guard served it
+  // forever, so the picture stayed broken with nothing to recover it.
+  writeFileSync(copyFor('.png'), BYTES.subarray(0, 5));
+  const repaired = withImageHostPaths(ctxWith(resolvingStore(STORE_PATH)), toolResult(imageBlock()));
+  check(
+    'a copy that is not the size of its source is rewritten, not served',
+    repaired.data.message.content[1].hostPath === copyFor('.png') && copyHolds('.png'),
+  );
   check(
     'the reference itself is untouched (nothing removed or rewritten)',
     JSON.stringify(out.data.message.content[1].attachment) === JSON.stringify(REF) &&
@@ -260,7 +273,7 @@ const copyHolds = (extension) => {
       time: 1700000000000,
       data: { toolCallId: 'call_x', message: { content: [{ type: 'text', text: 't' }, imageBlock()] } },
     },
-    { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+    { type: 'turn/end', ignorable: true, data: { turn: 1, reason: { kind: 'completed' } } },
   ];
   const before = JSON.stringify(log);
   const out = historyEvents(ctxWith(resolvingStore('/history/object.png')), log);
@@ -280,6 +293,10 @@ const copyHolds = (extension) => {
     JSON.stringify(out[1].data.message.content[1]),
   );
   check('historyEvents does not mutate the stored log', JSON.stringify(log) === before);
+  // DSH's contract: an event *without* this marker MUST make a reader refuse to
+  // reconstruct rather than drop it silently. Stripping it here left both halves
+  // unable to honour that for any event type added later.
+  check('the ignorable marker survives the projection', out[2].ignorable === true);
   check('a stored event without seq/time gains neither key', !('seq' in out[2]) && !('time' in out[2]));
   check(
     'a history whose image cannot be resolved is projected unchanged',
