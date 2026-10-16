@@ -16,6 +16,13 @@
  *
  * What is asserted:
  *   - a resolvable reference gets `hostPath`; every original field survives
+ *   - an extensionless store path (today's DSH) is replaced by a deterministic
+ *     copy carrying the extension its `mediaType` implies, byte for byte, and
+ *     the extension comes from `mediaType` rather than the file's `name`
+ *   - a store path that already carries an extension is stamped untouched: the
+ *     official answer wins and nothing is copied
+ *   - an unknown media type, or a source that has gone, falls back to the
+ *     store's own path — the shim can never do worse than no shim
  *   - a missing attachment store, a throwing `imageHostPath` (an invalid
  *     reference throws DSH's `AttachmentError`) and a non-string answer all
  *     leave the event untouched — a lost tool result is never the price of a
@@ -28,6 +35,9 @@
  *
  * Usage: node harness/image-host-path-check.mjs
  */
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { historyEvents, withImageHostPaths } from '../dsh-bridge/lib/image-host-path.js';
 
 const results = [];
@@ -61,15 +71,34 @@ const toolResult = (imageBlock) => ({
 
 const imageBlock = (attachment = REF) => ({ type: 'image', attachment });
 
-// ---- a resolvable reference gets its host path ---------------------------
+// ---- the extensionless store path is the one the shim exists for ----------
+// The bytes are real files on purpose: the copy is the thing under test, and a
+// check against a path that does not exist would silently assert the fallback
+// branch instead — green, and measuring nothing.
+const WORK = mkdtempSync(join(tmpdir(), 'image-host-path-check-'));
+const BYTES = Buffer.from('the bytes are the point, not the format');
+const DIGEST = '0f1e2d3c4b5a69788796a5b4c3d2e1f0';
+const STORE_PATH = join(WORK, DIGEST);
+writeFileSync(STORE_PATH, BYTES);
+/** Where the deterministic copy lands, derived the way the module derives it. */
+const copyFor = (extension) => join(tmpdir(), 'paseo-dsh-attachments', `${DIGEST}${extension}`);
+const copyHolds = (extension) => {
+  try {
+    return readFileSync(copyFor(extension)).equals(BYTES);
+  } catch {
+    return false;
+  }
+};
+
 {
   const event = toolResult(imageBlock());
-  const out = withImageHostPaths(ctxWith(resolvingStore('/tmp/dsh/attachments/v1/objects/0f/0f1e2d')), event);
+  const out = withImageHostPaths(ctxWith(resolvingStore(STORE_PATH)), event);
   check(
-    'a resolvable image block gains hostPath',
-    out.data.message.content[1].hostPath === '/tmp/dsh/attachments/v1/objects/0f/0f1e2d',
-    JSON.stringify(out.data.message.content[1]),
+    'an extensionless store path is replaced by a copy carrying the media type’s extension',
+    out.data.message.content[1].hostPath === copyFor('.png'),
+    `${out.data.message.content[1].hostPath} (expected ${copyFor('.png')})`,
   );
+  check('the copy holds the very bytes the store handed us', copyHolds('.png'));
   check(
     'the reference itself is untouched (nothing removed or rewritten)',
     JSON.stringify(out.data.message.content[1].attachment) === JSON.stringify(REF) &&
@@ -87,6 +116,52 @@ const imageBlock = (attachment = REF) => ({ type: 'image', attachment });
   );
   check('the caller’s original object is not mutated', event.data.message.content[1].hostPath === undefined);
   check('a changed event is a new object (the original is left alone)', out !== event);
+}
+
+// ---- the extension comes from mediaType, never from the name --------------
+// DSH re-encodes on the way in, so a file called `tool-rows.png` can be a JPEG.
+// Writing `.png` over JPEG bytes is the mismatch this shim must not add itself.
+{
+  const event = toolResult(imageBlock({ ...REF, mediaType: 'image/jpeg', name: 'tool-rows.png' }));
+  const out = withImageHostPaths(ctxWith(resolvingStore(STORE_PATH)), event);
+  check(
+    'a JPEG media type under a .png name is written .jpg',
+    out.data.message.content[1].hostPath === copyFor('.jpg') && copyHolds('.jpg'),
+    out.data.message.content[1].hostPath,
+  );
+}
+
+// ---- the official answer wins the moment it carries an extension ----------
+{
+  const official = join(WORK, 'already-named.png');
+  writeFileSync(official, BYTES);
+  const event = toolResult(imageBlock());
+  const out = withImageHostPaths(ctxWith(resolvingStore(official)), event);
+  check(
+    'a store path that already has an extension is stamped untouched (no copy)',
+    out.data.message.content[1].hostPath === official,
+    out.data.message.content[1].hostPath,
+  );
+}
+
+// ---- the fallbacks: the shim is never worse than no shim ------------------
+{
+  const gone = join(WORK, 'not-on-disk');
+  const missing = withImageHostPaths(ctxWith(resolvingStore(gone)), toolResult(imageBlock()));
+  check(
+    'a source that has gone falls back to the store’s own path',
+    missing.data.message.content[1].hostPath === gone,
+    missing.data.message.content[1].hostPath,
+  );
+  const unknown = withImageHostPaths(
+    ctxWith(resolvingStore(STORE_PATH)),
+    toolResult(imageBlock({ ...REF, mediaType: 'image/tiff' })),
+  );
+  check(
+    'a media type the host has no image entry for falls back to the store’s own path',
+    unknown.data.message.content[1].hostPath === STORE_PATH,
+    unknown.data.message.content[1].hostPath,
+  );
 }
 
 // ---- an already-stamped block is not recomputed ---------------------------
@@ -212,6 +287,10 @@ const imageBlock = (attachment = REF) => ({ type: 'image', attachment });
   );
   check('a non-array history is an empty list', historyEvents(ctxWith(resolvingStore('/x.png')), undefined).length === 0);
 }
+
+// The copies are a cache the module reuses, so clear only what this run wrote.
+rmSync(WORK, { recursive: true, force: true });
+for (const extension of ['.png', '.jpg']) rmSync(copyFor(extension), { force: true });
 
 const failed = results.filter((result) => !result.pass).length;
 console.log(`\n  ${results.length - failed}/${results.length} passed`);

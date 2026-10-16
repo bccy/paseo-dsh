@@ -18,6 +18,33 @@
  * its block untouched and the event is still delivered: a picture the host
  * cannot fetch is a missing row, never a lost tool result.
  *
+ * ### Why an extension-bearing copy exists at all
+ *
+ * The host's file explorer classifies a file as an image by its *extension* and
+ * never sniffs the bytes — `IMAGE_MIME_TYPES` is keyed by `.png/.jpg/.jpeg/
+ * .gif/.webp/.svg`, and anything else that is not valid UTF-8 falls through to
+ * `kind: "binary"` (`@getpaseo/server/dist/server/server/file-explorer/
+ * service.js`). DSH's store is content addressed and writes the digest *alone*:
+ * `<DSH_HOME>/attachments/v1/objects/<xx>/<sha256>`, no extension. A JPEG
+ * therefore resolves to `kind: "binary"`, the host's picture row throws
+ * `"image" !== kind` **after** the bytes have crossed the wire, and the user
+ * sees "Image preview unavailable" — a row that looks like a rendering bug and
+ * is really a naming one.
+ *
+ * So an extensionless path is replaced by a copy named `<sha256><ext>`, the
+ * extension taken from the attachment's `mediaType` and never from its `name`
+ * (DSH re-encodes on the way in, so a file called `tool-rows.png` can be
+ * `image/jpeg`, and `name` would write the wrong extension). The copy name is
+ * deterministic because the plugin's replay dedup depends on it: the same stored
+ * log has to rebuild byte-identical markdown, and a random name would emit a
+ * second picture row on every reopen.
+ *
+ * **The official answer wins.** The moment `imageHostPath()` returns a path that
+ * already carries an extension, nothing is copied and the store's own path is
+ * stamped. That branch is the point of the shim rather than a detail of it: the
+ * copy is a compatibility bridge for today's extensionless store, and it must
+ * retire itself silently once the store starts naming its own files.
+ *
  * This lives in its own dependency-free module, beside `archived-lineage.js`,
  * because `server.js` imports profile-only packages (`@deepseek-ai/dsh-brand`,
  * `dsh-llm`, …) and so cannot be loaded by an offline check. Server tests
@@ -25,6 +52,91 @@
  *
  * @module dsh-paseo-bridge/image-host-path
  */
+
+import { copyFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, extname, join } from 'node:path';
+
+/**
+ * The media types the host classifies as an image, mapped to the extension it
+ * needs to see. The host's own table is keyed by extension, so this is its
+ * inverse and has to be kept in step with it.
+ */
+const EXTENSION_BY_MEDIA_TYPE = new Map([
+  ['image/png', '.png'],
+  ['image/jpeg', '.jpg'],
+  ['image/jpg', '.jpg'],
+  ['image/gif', '.gif'],
+  ['image/webp', '.webp'],
+  ['image/svg+xml', '.svg'],
+]);
+
+/**
+ * Where the compatibility copies live. Under the OS temp dir on purpose: DSH's
+ * attachment store is content addressed and read-only to us, and a copy beside
+ * it would be collected by nothing.
+ */
+const COPY_DIRECTORY = join(tmpdir(), 'paseo-dsh-attachments');
+
+/**
+ * The extension one media type needs, or `undefined` when the host has no image
+ * entry for it. Parameters are dropped (`image/svg+xml; charset=utf-8`).
+ *
+ * @param {unknown} mediaType - the attachment's own media type.
+ * @returns {string | undefined} e.g. `.jpg`, or `undefined`.
+ */
+function extensionFor(mediaType) {
+  if (typeof mediaType !== 'string') return undefined;
+  return EXTENSION_BY_MEDIA_TYPE.get(mediaType.split(';')[0].trim().toLowerCase());
+}
+
+/**
+ * Copy one attachment beside its extension, reusing an existing copy.
+ *
+ * Every failure is a `undefined` answer rather than a throw: this runs on the
+ * event path, and the caller's contract is that a picture which cannot be made
+ * renderable still delivers its tool result. The alternative — throwing — would
+ * turn a cosmetic gap into a lost tool row.
+ *
+ * @param {string} source - the store's own absolute path.
+ * @param {string} extension - the extension the host needs, with its dot.
+ * @returns {string | undefined} the copy's absolute path, or `undefined`.
+ */
+function copyBeside(source, extension) {
+  const name = basename(source);
+  if (name === '') return undefined;
+  const target = join(COPY_DIRECTORY, `${name}${extension}`);
+  try {
+    // A zero-byte leftover from an interrupted copy is not an answer.
+    if (existsSync(target) && statSync(target).size > 0) return target;
+    mkdirSync(COPY_DIRECTORY, { recursive: true });
+    copyFileSync(source, target);
+    return target;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The path the host should fetch for one resolved attachment.
+ *
+ * The store's own path is returned whenever it already carries an extension —
+ * the official answer always wins, and no copy is made. Only an extensionless
+ * path is replaced by a copy carrying the extension its `mediaType` implies.
+ * When no copy can be made (an unknown media type, a source that is gone, an
+ * unwritable temp dir) the store's path comes back unchanged, so the worst case
+ * is exactly the row that failed before this shim existed.
+ *
+ * @param {string} hostPath - what `attachments.imageHostPath()` answered.
+ * @param {unknown} mediaType - the attachment's own media type.
+ * @returns {string} an absolute path, never empty.
+ */
+export function hostImagePath(hostPath, mediaType) {
+  if (extname(hostPath) !== '') return hostPath;
+  const extension = extensionFor(mediaType);
+  if (extension === undefined) return hostPath;
+  return copyBeside(hostPath, extension) ?? hostPath;
+}
 
 /**
  * One event, with `hostPath` appended to each image block of a tool result that
@@ -81,7 +193,7 @@ export function withImageHostPaths(ctx, event) {
     }
     if (typeof hostPath !== 'string' || hostPath === '') return block;
     changed = true;
-    return { ...block, hostPath };
+    return { ...block, hostPath: hostImagePath(hostPath, attachment.mediaType) };
   });
   if (!changed) return event;
   return { ...event, data: { ...data, message: { ...message, content: next } } };

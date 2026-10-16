@@ -584,14 +584,40 @@ Paseo 的 provider 协议只负责把时间线项送到 App，**长什么样由 
 - diff 的每一行都要带 `+`/`-` 前缀。DSH 的 `edit` 只给 `old_string`/`new_string`，
   早期实现只给整体加一次前缀，多行替换只有第一行有色，看着像没着色。
 
-### 28. 已知限制：`read_image` 的图片无法内联显示
+### 28. `read_image` 的图片：从"看不见"到"看得见"再到"转圈后失败"
 
-DSH 的 `read_image` 返回的是**附件引用**（`{path, image:{attachmentId, mediaType, ...}}`），
-不是内联图片数据；而 Paseo 的工具详情联合类型里没有图片变体
-（`shell/read/edit/write/search/fetch/worktree_setup/sub_agent/plain_text/plan/unknown`）。
-插件渲染器只能拿到文本，`timeline.ts` 的 `textOf` 也只抽 text 块。所以工具行里直接画图
-需要 Paseo 侧新增图片型 tool detail，或允许插件时间线行携带附件——本仓库不改全局包。
-现阶段图片只能通过 Paseo 的文件预览打开路径查看。
+**第一段（看不见）**：DSH 的 `read_image` 返回的是**附件引用**
+（`{path, image:{attachmentId, mediaType, ...}}`），不是内联图片数据；而 Paseo 的工具详情
+联合类型里没有图片变体（`shell/read/edit/write/search/fetch/worktree_setup/sub_agent/
+plain_text/plan/unknown`）。插件渲染器只能拿到文本，`timeline.ts` 的 `textOf` 也只抽
+text 块。所以工具行里直接画图需要 Paseo 侧新增图片型 tool detail，或允许插件时间线行
+携带附件——本仓库不改全局包。
+
+**第二段（看得见，但只做了一半）**：`3c3941f` 之后，桥给每个图片块**追加** `hostPath`
+（`dsh-bridge/lib/image-host-path.js`），插件为它多发一条文本是
+`![name](file:///绝对路径)` 的 `assistant_message`——这是 Paseo 唯一会去取字节的形状。
+当时的验收是"解码后文件存在"，**断言打在路径存在，没打在宿主能把它读成图片**。
+
+**第三段（转圈后失败）**：宿主按**扩展名**判图片，从不嗅探 magic bytes
+（`IMAGE_MIME_TYPES` 的键是 `.png/.jpg/.jpeg/.gif/.webp/.svg`，其余二进制落到
+`kind:"binary"`）。而 DSH 的附件存储是内容寻址、**只写摘要、没有扩展名**：
+`<DSH_HOME>/attachments/v1/objects/<xx>/<sha256>`。于是 JPEG 被判成 `binary`，前端
+`if ("image" !== kind) throw` → 界面**先 loading 再报"图片预览不可用"**（字节真的传了
+189KB 才被拒）。所以原文那句"只能通过文件预览查看"变成了**更糟**的状态：看着像渲染
+bug，其实是命名 bug。
+
+**修法**：`hostImagePath(hostPath, mediaType)`——官方路径**带扩展名就原样用**（零复制；
+将来 DSH 自己命名后这个 shim 自动退场）；只有没有扩展名时才把字节复制到
+`<tmp>/paseo-dsh-attachments/<sha256><ext>` 并指向副本。扩展名**只从 `mediaType` 推**：
+DSH 入库时会重编码，`name` 可能是 `tool-rows.png` 而实际是 `image/jpeg`，按 name 会写错。
+副本名**确定性**，因为插件重放靠它去重（随机名会在每次重开时多出一行）。复制失败一律
+回退到官方路径——最坏情况不比没有这个 shim 更差。
+
+**验证方式（这次的教训）**：不要断言"文件存在"，要断言**宿主能把它读成图片**。同一份
+字节、只差一个后缀，判定就翻转——这条用 `/tmp` 下同名不同后缀的两个副本即可当场复现。
+`harness/image-host-path-check.mjs`（31 条：物化副本且字节一致、mediaType 压过 name、
+官方带后缀不复制、源文件消失/未知 mediaType 回退）与 `harness/image-check.cjs`（插件侧
+8 条）覆盖。
 
 ### 29. 替换内置行会丢掉"运行中"的流光，要自己补
 
