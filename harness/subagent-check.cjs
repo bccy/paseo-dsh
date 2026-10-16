@@ -541,6 +541,44 @@ async function openSession(conn, sessionId, history) {
     archivedAnnouncements.length === 0 ? "" : `child-Z was announced ${archivedAnnouncements.length}x`,
   );
 
+  // ---- a root killed with a tool in flight -------------------------------
+  // The root replay builds its rows with a *local* builder, so the live builder
+  // never learns they exist and no later `turn/end` can close them. Without an
+  // explicit settle the row pulsed for the rest of the session and again on every
+  // reopen; the child replay already did this, the root path did not.
+  const killedRoot = `killed-root-${Date.now()}`;
+  const killedMark = events.length;
+  await conn.send({
+    type: "session.open",
+    requestId: "reopen-killed",
+    sessionId: killedRoot,
+    config: { cwd: process.cwd(), mode: "build" },
+    persistence: { version: 1, data: { sessionId: killedRoot } },
+    history: "replay",
+  });
+  await untilSince(
+    killedMark,
+    (e) => e.type === "session.ready" && e.sessionId === killedRoot,
+    "killed root ready",
+    30000,
+  );
+  await sleep(300);
+  const killedRows = events
+    .slice(killedMark)
+    .filter(
+      (e) =>
+        e.type === "timeline.item" &&
+        e.sessionId === killedRoot &&
+        e.item?.type === "tool_call" &&
+        e.item?.callId === "killed-1",
+    )
+    .map((e) => e.item);
+  check(
+    "a root replay that stops mid-tool closes the running row instead of pulsing forever",
+    killedRows.length > 0 && killedRows[killedRows.length - 1].status === "canceled",
+    JSON.stringify(killedRows.map((row) => row.status)),
+  );
+
   // ---- a child killed mid-turn: no terminal anywhere in its log ----------
   // DSH appends no "the process died" fact, and a live child caught between two
   // steps writes the very same tail (`step/start`, last turn never closed), so

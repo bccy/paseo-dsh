@@ -533,6 +533,23 @@ async function handle(method, params, id) {
       };
     case "paseo/history": {
       const sid = String(params?.sessionId ?? "");
+      if (sid.startsWith("killed-root-")) {
+        // A root whose process was killed with a tool in flight: the log stops
+        // after `tool/call`, with no `tool/result` and no `turn/end`. Those rows
+        // come from the replay's own builder, so nothing else can ever close
+        // them — they would pulse for the rest of the session, and again on every
+        // reopen.
+        return {
+          available: true,
+          inheritedEventCount: 0,
+          events: [
+            { type: "user/message", seq: 1, data: { source: { kind: "user" }, content: [{ type: "text", text: "run something long" }] } },
+            { type: "turn/start", seq: 2, data: { turn: 1 } },
+            { type: "step/start", seq: 3, data: { turn: 1, step: 1 } },
+            { type: "tool/call", seq: 4, data: { turn: 1, step: 1, callId: "killed-1", name: "bash", arguments: { command: "sleep 999" } } },
+          ],
+        };
+      }
       if (sid === "child-A") {
         // Fork-inherited prefix (seq < 2) plus the child's own suffix.
         return {

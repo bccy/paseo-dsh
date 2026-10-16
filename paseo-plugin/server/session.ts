@@ -485,6 +485,16 @@ export class DshSession {
         this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
       }
     }
+    // A tool whose `tool/result` never arrived needs the same treatment for the
+    // same reason, and the root replay used to skip it while the child replay
+    // (`child.replay`) did not. The rows come from a *local* builder, so the live
+    // builder never learns they exist and no later `turn/end` can close them:
+    // a session whose process was killed mid-tool opened with a row that pulsed
+    // for the rest of the session and again on every reopen. Idempotent — a log
+    // that did reach its `turn/end` has nothing left running.
+    for (const item of builder.settleRunningTools()) {
+      this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
+    }
     // A compaction the killed process never closed would otherwise pulse
     // forever: the replay just emitted its `loading` marker and no completion
     // will ever arrive. Replay runs during open, when no compaction of this
