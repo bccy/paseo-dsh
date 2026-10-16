@@ -514,6 +514,27 @@ export class DshProcess {
    * runtime composes no subagent service; a failed read carries `error`, and an
    * unreadable branch is reported in `diagnostics` — never a silent empty list.
    */
+  /**
+   * Ask DSH to archive or unarchive one of its sessions.
+   *
+   * The plugin owns no archive state of its own: DSH does, and Paseo's adapters
+   * translate their archive action into the provider's native one.
+   */
+  async setArchived(sessionId: string, archived: boolean): Promise<{ available: boolean; error?: { message: string } }> {
+    try {
+      const result = (await this.#request(
+        archived ? "paseo/archive" : "paseo/unarchive",
+        { sessionId },
+      )) as { available?: boolean; error?: { message?: string } };
+      return {
+        available: result.available === true,
+        ...(result.error?.message === undefined ? {} : { error: { message: result.error.message } }),
+      };
+    } catch (error) {
+      return { available: false, error: { message: toError(error, "archive request failed").message } };
+    }
+  }
+
   async subagents(): Promise<{
     available: boolean;
     subagents: Array<{ sessionId: string; parentSessionId: string; mode?: string; label?: string }>;

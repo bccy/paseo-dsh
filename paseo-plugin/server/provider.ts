@@ -42,6 +42,13 @@ const CAPABILITIES = [
   // handle"). Declaring the capability and emitting a handle in `session.opened`
   // lets Paseo reopen the session, which DSH then resumes by id.
   "session.persistence",
+  // Archiving is a first-class DSH concept (`workspaceRegistry.archiveSession`),
+  // and Paseo maps its archive action onto a provider's native archive rather
+  // than keeping a private flag — its opencode adapter's `setNativeSessionArchived`
+  // is the reference. Without these two declared, Paseo archives locally, the
+  // request never reaches us, and DSH silently never learns about it.
+  "session.archive",
+  "session.unarchive",
   // Advertises that DSH sessions can be enumerated and imported ("Import
   // session" lists providers that support this). Implemented over the session
   // log below.
@@ -251,6 +258,10 @@ class DshConnection implements ProviderConnection {
         return this.#listSessions(input);
       case "session.open":
         return this.#open(input);
+      case "session.archive":
+        return this.#setArchived(input.persistence, true);
+      case "session.unarchive":
+        return this.#setArchived(input.persistence, false);
       case "session.prompt":
         return this.#require(input.sessionId).prompt(input.prompt);
       case "session.permission":
@@ -444,6 +455,34 @@ class DshConnection implements ProviderConnection {
     // `replay`). It reads DSH's durable catalog and child logs; it never creates
     // an agent, and a fresh session simply has none.
     void session.replaySubagents();
+  }
+
+  /**
+   * Archive or unarchive the DSH session a persistence handle names.
+   *
+   * Paseo's archive request carries the handle this plugin minted in
+   * `session.opened`, so it resolves to the DSH session id the registry knows.
+   * A handle we cannot resolve fails loudly: reporting success for an archive
+   * that did nothing is exactly the bug this replaces.
+   */
+  async #setArchived(persistence: unknown, archived: boolean): Promise<void> {
+    const data = isRecord(persistence) ? persistence["data"] : undefined;
+    const dshSessionId =
+      isRecord(data) && typeof data["sessionId"] === "string" ? data["sessionId"] : "";
+    if (dshSessionId === "") {
+      throw new Error(
+        `cannot ${archived ? "archive" : "unarchive"}: the persistence handle names no DSH session`,
+      );
+    }
+    for (const session of this.#sessions.values()) {
+      if (session.dshId === dshSessionId) {
+        await session.setArchived(archived);
+        return;
+      }
+    }
+    throw new Error(
+      `cannot ${archived ? "archive" : "unarchive"}: no open session has DSH id ${dshSessionId}`,
+    );
   }
 
   #require(sessionId: string): DshSession | DshChildSession {

@@ -877,6 +877,26 @@ export class DshSession {
     return this.#childByProviderId.get(sessionId);
   }
 
+  /** This session's own DSH id, which is what DSH's registry knows it by. */
+  get dshId(): string {
+    return this.#dshSessionId;
+  }
+
+  /**
+   * Archive or unarchive this session in DSH's own registry.
+   *
+   * The plugin keeps no archive flag of its own: DSH has the concept, and
+   * Paseo's adapters translate their archive action into the provider's native
+   * one. An unknown or refusing registry throws, so a click that cannot be
+   * honoured reports a failure instead of a false success.
+   */
+  async setArchived(archived: boolean): Promise<void> {
+    const result = await this.#require().setArchived(this.#dshSessionId, archived);
+    if (!result.available) {
+      throw new Error(result.error?.message ?? `${archived ? "archive" : "unarchive"} failed`);
+    }
+  }
+
   /** Create and open a native child whose parent is already known. */
   #openChildNow(payload: DshChildOpened): DshChildSession | undefined {
     const existing = this.#children.get(payload.sessionId);

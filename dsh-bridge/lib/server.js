@@ -770,6 +770,38 @@ export class PaseoHarnessServer {
    * and unreadable catalog branches (unknown modes, corrupt/unavailable child
    * logs) are returned in `diagnostics`.
    */
+  /**
+   * Archive or unarchive one DSH session in DSH's own registry.
+   *
+   * Archiving is a first-class DSH concept (`workspaceRegistry.archiveSession`
+   * and `archivedSessionIds`), and Paseo maps its archive action onto a
+   * provider's *native* archive rather than keeping a private flag — its own
+   * opencode adapter does exactly that in `setNativeSessionArchived`. So this is
+   * a translation, not a local mark.
+   *
+   * An active session must be stopped first, which is what `stopActivity` asks
+   * the registry to do; without it the registry refuses with
+   * `WorkspaceActiveSessionError`. A refusal is reported as `available: false`
+   * with the message, never as success — an archive that quietly does nothing is
+   * the bug this replaces.
+   */
+  async applyArchived(params = {}, archived) {
+    const sessionId = typeof params.sessionId === 'string' ? params.sessionId : '';
+    const what = archived ? 'paseo/archive' : 'paseo/unarchive';
+    if (sessionId === '') return { available: false, error: { message: `${what} requires a sessionId` } };
+    const registry = this.ctx.get('workspaceRegistry');
+    if (registry === undefined) {
+      return { available: false, error: { message: 'this DSH runtime composes no workspace registry' } };
+    }
+    try {
+      if (archived) await registry.archiveSession(sessionId, { stopActivity: true });
+      else await registry.unarchiveSession(sessionId);
+    } catch (error) {
+      return { available: false, error: { message: error instanceof Error ? error.message : String(error) } };
+    }
+    return { available: true };
+  }
+
   async subagents(params) {
     const subagents = this.ctx.get('subagents');
     if (subagents === undefined) return { available: false, subagents: [] };
@@ -1113,6 +1145,10 @@ export class PaseoHarnessServer {
         return this.history(params);
       case 'paseo/subagents':
         return this.subagents(params);
+      case 'paseo/archive':
+        return this.applyArchived(params, true);
+      case 'paseo/unarchive':
+        return this.applyArchived(params, false);
       case 'paseo/plan/get':
         return this.planGet(params);
       case 'paseo/plan/set':
