@@ -526,6 +526,14 @@ export class TimelineBuilder {
    * blinks for the rest of the session's life and on every replay.
    */
   #runningTools = new Set<string>();
+  /**
+   * `compactionId`s whose `compaction/summary` already drew the marker.
+   *
+   * `compaction/end` closes the same bracket and would stack a second row, so it
+   * is dropped — and the entry is removed together with it, which keeps a replay
+   * of the same log byte-for-byte repeatable.
+   */
+  #summarizedCompactions = new Set<string>();
 
   constructor(options: { warn?: (line: string) => void } = {}) {
     this.#warn = options.warn ?? ((line) => console.warn(line));
@@ -554,16 +562,18 @@ export class TimelineBuilder {
         return this.#commandRun(data);
       case "command/done":
         return this.#commandDone(data);
+      // DSH's open bracket. The marker itself is emitted once, by whichever of
+      // the two closing events lands first — see `#compaction`.
       case "compaction/start":
-        return this.#compaction(data, "loading");
-      // Both are success evidence: `compaction/summary` is appended once the
-      // summary is durable and the replacement `user/message` follows it, and
-      // `compaction/end` is the closing marker. Whichever arrives is enough to
-      // stop claiming the compaction is still running, so a log that ends
-      // between the two cannot strand a pulsing row.
+        return [];
+      // Both close the compaction: `compaction/summary` once the summary is
+      // durable (the replacement `user/message` follows it), `compaction/end` as
+      // the closing marker. Whichever arrives is enough, so a log that stops
+      // between the two still gets its row.
       case "compaction/summary":
+        return this.#compaction(data, false);
       case "compaction/end":
-        return this.#compaction(data, "completed");
+        return this.#compaction(data, true);
       case "turn/end":
         return this.#turnEnd(data);
       default:
@@ -770,9 +780,20 @@ export class TimelineBuilder {
    * those events reaches the surface: DSH's web UI draws its marker from the
    * replacement `user/message` checkpoint the summary is paired with. Paseo has
    * the marker as a first-class item (`{type:"compaction", status, trigger}`,
-   * which its own omp/pi adapters emit), so the bracket maps onto it directly —
-   * same id for every event of one `compactionId`, so the row updates in place
-   * instead of stacking a second one.
+   * which its own omp/pi adapters emit), so the bracket maps onto it.
+   *
+   * **One item per `compactionId`, and it is the closing state.** A provider item
+   * cannot update a row it emitted earlier: the daemon's `mapTimelineItem`
+   * (`@getpaseo/server`, `plugin-provider.js`) hands every non-message item on as
+   * `withoutIdentity` — it destructures `id` out — and only `assistant_message`,
+   * `reasoning` and `user_message` are ever compared against the `snapshots` entry
+   * left by the previous emission. A stable id therefore buys nothing here, and
+   * Paseo's `loading` state ("正在压缩...") is out of reach: emitting it would
+   * leave a second, permanent row next to the finished one. Measured, not
+   * reasoned — replaying this repo's own long session through `consume()` produced
+   * 3 items for a single compaction, and the daemon's activity feed for one
+   * `/compact` listed `[Compacted]` three times. The honest single row is the one
+   * that says the compaction happened.
    *
    * `trigger` is DSH's own distinction and is exact, not inferred from timing.
    * Two signals agree on it and either is enough: `compactNow` (the `/compact`
@@ -793,10 +814,7 @@ export class TimelineBuilder {
    * precedes is a `tool/result` replacement rather than a compaction checkpoint —
    * DSH's own UI shows no marker for it.
    */
-  #compaction(
-    data: Record<string, unknown>,
-    status: "loading" | "completed",
-  ): ProviderTimelineItem[] {
+  #compaction(data: Record<string, unknown>, closing: boolean): ProviderTimelineItem[] {
     const compactionId = stringField(data, "compactionId");
     if (compactionId === undefined) return [];
     // A failed compaction is closed with `error` on its `compaction/end` (the
@@ -814,10 +832,18 @@ export class TimelineBuilder {
           `and the failure itself is on the turn or command that owned the compaction`,
       );
     }
+    if (closing) {
+      // `compaction/summary` already drew this compaction, so the closing bracket
+      // is the same state and would be a second row. Forget it at the same time,
+      // so replaying the same log emits exactly the same items again.
+      if (this.#summarizedCompactions.delete(compactionId)) return [];
+    } else {
+      this.#summarizedCompactions.add(compactionId);
+    }
     return this.#put({
       type: "compaction",
       id: `compaction:${compactionId}`,
-      status,
+      status: "completed",
       // `turn === null` is DSH's structural marker for a manual transaction; a
       // missing `turn` is a malformed event, not a manual one.
       trigger: stringField(data, "sourceCommandId") !== undefined || data.turn === null ? "manual" : "auto",

@@ -507,13 +507,22 @@ console.log("web_search's query list");
   );
 }
 
-console.log("\ncompaction is visible (DSH's compaction/* bracket -> Paseo's marker)");
+console.log("\ncompaction is visible, exactly once (DSH's compaction/* bracket -> Paseo's marker)");
 {
   // DSH brackets every compaction with `compaction/start` … `compaction/summary`
   // + `compaction/end`, and none of it reaches its own surface. `consume()` used
   // to return [] for all four types, so a compaction running for a minute looked
   // like nothing happening. Paseo has the marker as a first-class item, which is
   // what its own omp/pi adapters emit.
+  //
+  // **But a provider row is append-only.** The daemon's `mapTimelineItem` hands
+  // non-message items on as `withoutIdentity` (it destructures `id` out) and only
+  // `assistant_message`/`reasoning`/`user_message` are matched against the
+  // previous emission, so a second item for the same `compactionId` is a second
+  // row on screen, not an update. So the marker is emitted once, at the close,
+  // and the open bracket draws nothing. Measured: replaying the repo's own long
+  // session through `consume()` gave 3 items for one compaction, and the daemon's
+  // activity feed for a single `/compact` listed `[Compacted]` three times.
   const builder = new TimelineBuilder({ warn: (line) => warnings.push(line) });
 
   const started = builder.consume({
@@ -521,15 +530,7 @@ console.log("\ncompaction is visible (DSH's compaction/* bracket -> Paseo's mark
     seq: 10,
     data: { compactionId: "cmp-1", turn: 4 },
   });
-  check("a start emits exactly one item", started.length === 1, JSON.stringify(started));
-  check("it is Paseo's native compaction marker", started[0]?.type === "compaction", started[0]?.type);
-  check("and it is loading", started[0]?.status === "loading", started[0]?.status);
-  check("an enclosed compaction is the automatic one", started[0]?.trigger === "auto", started[0]?.trigger);
-  check(
-    "preTokens is left unset (DSH has no tokens-before number)",
-    started[0] !== undefined && !("preTokens" in started[0]),
-    JSON.stringify(started[0]),
-  );
+  check("the open bracket draws nothing on its own", started.length === 0, JSON.stringify(started));
 
   const summarized = builder.consume({
     type: "compaction/summary",
@@ -545,32 +546,40 @@ console.log("\ncompaction is visible (DSH's compaction/* bracket -> Paseo's mark
       model: "deepseek-chat",
     },
   });
-  check("the summary updates the row in place", summarized[0]?.id === started[0]?.id, summarized[0]?.id);
-  check("and clears loading", summarized[0]?.status === "completed", summarized[0]?.status);
-  check("without losing the trigger", summarized[0]?.trigger === "auto", summarized[0]?.trigger);
+  check("the summary emits exactly one item", summarized.length === 1, JSON.stringify(summarized));
+  check("it is Paseo's native compaction marker", summarized[0]?.type === "compaction", summarized[0]?.type);
+  check("it is the finished state", summarized[0]?.status === "completed", summarized[0]?.status);
+  check(
+    "id is namespaced by compactionId",
+    summarized[0]?.id === "compaction:cmp-1",
+    summarized[0]?.id,
+  );
+  check("an enclosed compaction is the automatic one", summarized[0]?.trigger === "auto", summarized[0]?.trigger);
+  check(
+    "preTokens is left unset (DSH has no tokens-before number)",
+    summarized[0] !== undefined && !("preTokens" in summarized[0]),
+    JSON.stringify(summarized[0]),
+  );
 
   const ended = builder.consume({
     type: "compaction/end",
     seq: 12,
     data: { compactionId: "cmp-1", turn: 4 },
   });
-  check(
-    "the closing marker is the same row, still completed",
-    ended[0]?.id === started[0]?.id && ended[0]?.status === "completed",
-    JSON.stringify(ended[0]),
-  );
+  check("the closing bracket does not stack a second row", ended.length === 0, JSON.stringify(ended));
 
   // A manual `/compact` runs outside any turn and stamps the command that asked
   // for it. Both are DSH's own signals, not a guess from timing.
   const manual = builder.consume({
-    type: "compaction/start",
+    type: "compaction/summary",
     seq: 13,
-    data: { compactionId: "cmp-2", sourceCommandId: "cmd-7", turn: null },
+    data: { compactionId: "cmp-2", sourceCommandId: "cmd-7", turn: null, summary: [{ type: "text", text: "…" }] },
   });
-  check("a /compact start says manual", manual[0]?.trigger === "manual", JSON.stringify(manual[0]));
-  check("a second compaction is a second row", manual[0]?.id !== started[0]?.id, manual[0]?.id);
+  check("a /compact marker says manual", manual[0]?.trigger === "manual", JSON.stringify(manual[0]));
+  check("a second compaction is a second marker", manual[0]?.id !== summarized[0]?.id, manual[0]?.id);
+
   const standalone = builder.consume({
-    type: "compaction/start",
+    type: "compaction/end",
     seq: 14,
     data: { compactionId: "cmp-3", turn: null },
   });
@@ -579,15 +588,20 @@ console.log("\ncompaction is visible (DSH's compaction/* bracket -> Paseo's mark
     standalone[0]?.trigger === "manual",
     JSON.stringify(standalone[0]),
   );
+  check(
+    "a log that stops before the summary still gets its row",
+    standalone.length === 1 && standalone[0]?.status === "completed",
+    JSON.stringify(standalone),
+  );
 
   // A failed compaction is closed with `error` and never gets a summary.
   const before = warnings.length;
   const failed = builder.consume({
     type: "compaction/end",
     seq: 15,
-    data: { compactionId: "cmp-2", sourceCommandId: "cmd-7", turn: null, error: "summary is not smaller" },
+    data: { compactionId: "cmp-4", sourceCommandId: "cmd-7", turn: null, error: "summary is not smaller" },
   });
-  check("a failed compaction still clears loading", failed[0]?.status === "completed", failed[0]?.status);
+  check("a failed compaction still closes the marker", failed[0]?.status === "completed", failed[0]?.status);
   check(
     "and the failure is reported, not swallowed",
     warnings.length === before + 1 && warnings[before].includes("summary is not smaller"),
@@ -604,7 +618,35 @@ console.log("\ncompaction is visible (DSH's compaction/* bracket -> Paseo's mark
   );
   check(
     "a compaction event with no id emits nothing",
-    builder.consume({ type: "compaction/start", seq: 17, data: { turn: 4 } }).length === 0,
+    builder.consume({ type: "compaction/summary", seq: 17, data: { turn: 4 } }).length === 0,
+  );
+
+  // The regression this block exists for: one whole bracket, one row — however
+  // many events it is made of.
+  const one = new TimelineBuilder({ warn: () => {} });
+  const bracket = [
+    { type: "compaction/start", seq: 1, data: { compactionId: "cmp-9", turn: 1 } },
+    { type: "compaction/summary", seq: 2, data: { compactionId: "cmp-9", turn: 1 } },
+    { type: "compaction/end", seq: 3, data: { compactionId: "cmp-9", turn: 1 } },
+  ].flatMap((event) => one.consume(event));
+  check(
+    "one compaction bracket is exactly one row",
+    bracket.length === 1 && bracket[0]?.status === "completed",
+    JSON.stringify(bracket),
+  );
+
+  // …and replaying the same log twice through one builder is repeatable: the
+  // summary/end handshake must not leave an id behind that swallows the second
+  // pass. (A reopened session replays its whole log again.)
+  const again = [
+    { type: "compaction/start", seq: 1, data: { compactionId: "cmp-9", turn: 1 } },
+    { type: "compaction/summary", seq: 2, data: { compactionId: "cmp-9", turn: 1 } },
+    { type: "compaction/end", seq: 3, data: { compactionId: "cmp-9", turn: 1 } },
+  ].flatMap((event) => one.consume(event));
+  check(
+    "replaying the same bracket emits it again",
+    again.length === 1 && again[0]?.id === "compaction:cmp-9",
+    JSON.stringify(again),
   );
 }
 
