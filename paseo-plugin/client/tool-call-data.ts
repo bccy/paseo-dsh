@@ -65,7 +65,7 @@ const TOOL_LABELS: Record<string, string> = {
   todo_write: "更新任务",
   ask_user_question: "提问",
   exit_plan_mode: "计划",
-  subagent: "子代理",
+  subagent: "子智能体",
   // DSH's own tools. Its UI titles these through `tool.title.*`; these are the
   // same names in Chinese, so a DSH tool row reads as a DSH tool rather than as
   // an anonymous `wrench <raw_name>` — which is what every MCP-shaped row looks
@@ -81,7 +81,7 @@ const TOOL_LABELS: Record<string, string> = {
   list_agents: "列出 agent",
   send_message: "给 agent 发消息",
   interrupt_agent: "打断 agent",
-  list_subagent_models: "列出子代理模型",
+  list_subagent_models: "列出子智能体模型",
   job_list: "列出后台任务",
   job_output: "读取后台任务",
   job_kill: "终止后台任务",
