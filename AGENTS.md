@@ -78,6 +78,19 @@ cd paseo-plugin && npx tsc --noEmit
 `harness/assistant-stream-check.cjs`（助手文本流式：同 id 增长快照、`id === messageId`、
 经 Paseo 规则投影后合并成一行）。
 
+还有三个**离线**脚本，直接 require 编译产物、不需要 daemon（运行步骤写在各自头部注释里）：
+
+- `harness/timeline-check.cjs` — `TimelineBuilder` 的工具行状态机：`tool/call` → `tool/result`、
+  重复 `tool/call` 不能把完成行重置回 running 或清空输出、`turn/end`（含 `aborted`）要把仍
+  running 的工具收成 `canceled`。**动了 `server/timeline.ts` 必跑。**
+- `harness/newest-check.cjs` — `client/newest.ts` 的"哪一行是最新、该不该脉冲"：位置判定、
+  提交批次（回放历史不闪）、窗口、交接、时钟。**动了客户端脉冲条件必跑。**
+- `harness/tool-call-check.cjs` — `client/tool-call-data.ts` 的工具行映射（图标、命令、diff、
+  截断）。**动了工具行渲染必跑。**
+
+客户端脉冲这条链最容易"看着对但静默失效"（`Animated` 在 RN Web 上只跑一段就停、`setValue`
+推不到原生 view、客户端不折叠只改 `metadata` 的 item），所以断言要打在数据层。
+
 **动了流式（`agent/assistant-stream` / `paseo/assistant-delta`）还要跑真实端到端**
 `node harness/stream-probe.mjs`：它用真实 `dsh --profile paseo` 断言一步内出现多个
 增长快照、且首个 delta 远早于 durable `assistant/message`。插件层的假桥检查只能证明

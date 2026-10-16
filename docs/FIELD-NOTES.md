@@ -605,7 +605,8 @@ useRevealedText/ScrollView/FlatList/copyText/TextInput`，**没有暴露任何 s
 订阅，空闲行恒为 1。20fps 的 state 重渲染只发生在正在运行的那几行上，两端行为一致。
 
 **关键：脉冲的触发条件是"位置"而不是"状态"**（见第 29c 条）。思考行仍是"文本还在变长"，
-工具行是 `metadata.current`——由插件的服务端标在**最新的那一行**上。
+工具行是 `useRowPulse()`——**在客户端**算出来的"我是不是最新那一行、且刚提交过"。
+服务端标不出来（见 29c 里那条失败的尝试）。
 
 期间试过"扫光"（叠一条高光从左到右平移）：没有真正的渐变时它就是一块硬边色块划过，
 用户评价**还不如脉冲**，所以回退了。要做扫光必须先解决渐变（宿主那套 `background-clip` /
@@ -653,28 +654,51 @@ Reanimated 遮罩没暴露给插件）。
 `theme / host / layout / agentId / item / timestamp`——**看不到自己在列表里的位置**，也没有
 isLast/index。位置只能在客户端自己算（见下），服务端标了也传不过来。
 
-**修法（最终采用，纯客户端）**：`client/newest.ts` 让每一行在渲染时上报自己的 `timestamp`，
-按 `agentId` 记下见过的最大值——那就是"最新一行"。工具行的脉冲条件是：
+**修法（最终采用，纯客户端）**：`client/newest.ts` 的 `useRowPulse(agentId, timestamp)` 回答
+"我是不是最新那一行、且刚提交过"。工具行的脉冲条件是：
 
 ```
-status === "running" || (isNewest(agentId, timestamp) && isFresh(timestamp, Date.now()))
+status === "running" || (newest && fresh)
 ```
 
-两个细节：
+**五个坑，每一个都对应一次真实故障**（子代理审核后又修了一轮）：
 
+- **`timestamp` 不是 item 自己的时间。** Paseo 的投影在合并同一个 tool_call 时把行的时间戳
+  换成**最后一次快照**的时间，而插件服务端根本不发 timestamp，daemon 用记录时刻补
+  （`agent-timeline-store.js` 的 `?? new Date()`）。所以**回放出来的历史行也带着"现在"的
+  时间戳**，跟实时活动一模一样——任何基于时间的判据都分不出历史和实时。于是改用
+  **提交批次**区分：400ms 内提交 ≥5 行就是历史加载，整批不闪（`BULK_*`）。人手动敲两条命令
+  不会触发。
+- **`fresh` 必须用客户端自己的时钟。** 早先写成 `Date.now() - timestamp`：item 的 timestamp
+  来自 daemon 的钟，`Date.now()` 来自手机的钟，**手机快几秒，刚到的新行就被判成旧的**，
+  短命令又完全不闪。现在窗口从"本客户端**提交**这一行的时刻"起算。
+- **渲染 ≠ 提交。** React 可能丢弃一次渲染（并发/offscreen 预渲染），所以"第一次看到"记在
+  **effect 里**（提交之后）。写在渲染期的话，被丢弃的那次渲染会把窗口用掉，等它真正提交时
+  已经过期 → 又是不闪。取最大值那部分写在渲染期是安全的（幂等）。
+- **首批渲染谁都不能自称最新。** 最大值初值为空时若返回 `newest: true`，回放时每一行首渲染
+  都会自称最新 → **整屏一起闪**（用户吐槽过的症状）。没有先验值时一律返回 false；并且本批次
+  的最大值要**等这一批渲染结束**（微任务）再合并，否则同一批里后面的行会看到前面行刚写的值。
 - **"不再是最后一行"能自愈**：正在闪的行每 50ms 重渲染一次，顺便重新求值，一旦有更新的行
-  上报过就立刻停。不需要服务端推任何东西。
-- **`isFresh` 窗口（2.5s）**：最新的行只闪一小会儿就停，这样回合结束后的最后一行、以及打开
-  旧会话回放出来的最后一行都不会一直闪；还在 `running` 的行不受窗口限制。
+  提交过就立刻停。不需要服务端推任何东西。
 
-**试过但不可行的方案**：服务端在 `TimelineBuilder.#put()` 里给最新行打
-`metadata.current`、新行出现时清掉旧行、`turn/end` 清空。协议层是对的（`harness/plugin-check.cjs`
-的断言能通过），但**客户端不会把"只有 `metadata` 变化"的 item 重新折进去**：历史回放时每一行
-都被短暂标过 `current`，之后就一直保持 `C` 且全部卡在 0.35。实测 web UI 上十几行同时是 `C`。
-所以"位置"这个信息只能在客户端算。
+**配套的服务端修复**：`TimelineBuilder` 现在记住仍 `running` 的工具，`turn/end`（**任何
+reason，包括 `aborted`**）时把它们收成 `canceled`。被中断的工具永远等不到 `tool/result`，
+而客户端对 `running` 行不加窗口，不收尾就是**永久脉冲**（live 和每次回放都闪）。同一处还修了
+"重复 `tool/call` 把已完成的行重置回 running 并清空输出"。
 
-**验证**：`harness/newest-check.cjs` 覆盖"最新行判定 / 每个 agent 独立 / 新鲜度窗口"，12/12
-通过；`npx tsc --noEmit` 干净。
+**验证**：`harness/newest-check.cjs` 22/22（位置、批次、窗口、交接、回放、时钟）；
+`harness/timeline-check.cjs` 16/16（工具生命周期、重复调用、中断收尾、回放）；
+`harness/tool-call-check.cjs` 37/37；`harness/plugin-check.cjs` 27/27；`npx tsc --noEmit` 干净。
+
+**试过但不可行的方案（重要教训）**：先试的是服务端方案——`TimelineBuilder.#put()` 给最新行打
+`metadata.current`，新行出现时清掉旧行的标记，`turn/end` 清空。协议层是对的
+（`harness/plugin-check.cjs` 的断言全部通过），但**客户端不会把"只有 `metadata` 变化"的 item
+重新折进去**：历史回放时每一行都被短暂标过 `current`，之后就一直保持 `C`，实测 web UI 上十几
+行同时是 `C` 且全部卡在 0.35。**"位置"这个信息传不过来，只能在客户端算。**
+
+**已知缺口（未修）**：插件客户端没有 locale 来源，`tool-call-data.ts` 的工具名（`命令`/`读取`/
+`编辑`…）和思考行的 `思考中…`/`已思考` 都是硬编码中文，英文系统下也显示中文。服务端的
+`locale.ts` 只覆盖菜单文案。要修得给客户端一条 locale 通道（RPC 或在渲染数据里带上）。
 
 diff 行按 GitHub 的做法：浅绿/浅红底（低 alpha，深色主题也不刺眼）、`+`/`-` 标记单独
 上色、代码正文用 **muted 前景色**（用 `foreground` 会"太白"）。**不要**给每行加左侧亮色

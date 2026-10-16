@@ -162,6 +162,15 @@ export class TimelineBuilder {
   #toolInputs = new Map<string, Record<string, unknown>>();
   /** commandId -> the command name, so `command/done` can title its own row. */
   #commands = new Map<string, string>();
+  /**
+   * Tool calls that are still running.
+   *
+   * A turn that ends with entries here means no `tool/result` is coming — an
+   * aborted turn takes the process with it. Left alone the row stays `running`
+   * forever, and the client pulses a running row without any window, so it
+   * blinks for the rest of the session's life and on every replay.
+   */
+  #runningTools = new Set<string>();
 
   /**
    * Fold one DSH session event into zero or more complete Paseo item snapshots.
@@ -194,6 +203,10 @@ export class TimelineBuilder {
   }
 
   #put(item: ProviderTimelineItem): ProviderTimelineItem[] {
+    if (item.type === "tool_call") {
+      if (item.status === "running") this.#runningTools.add(item.callId);
+      else this.#runningTools.delete(item.callId);
+    }
     this.#items.set(item.id, item);
     return [item];
   }
@@ -277,9 +290,9 @@ export class TimelineBuilder {
     const input = parseArguments(data.arguments);
     this.#toolNames.set(callId, name);
     this.#toolInputs.set(callId, input);
-    const previous = this.#items.get(`tool:${callId}`);
-    const status = previous !== undefined && previous.type === "tool_call" ? previous.status : "running";
-    return this.#emitToolCall(callId, name, input, status === "running" ? "running" : status);
+    // Always "running": `#emitToolCall` ignores a repeat for a row that already
+    // reached a terminal state, so this cannot undo a finished tool.
+    return this.#emitToolCall(callId, name, input, "running");
   }
 
   #toolResult(data: Record<string, unknown>): ProviderTimelineItem[] {
@@ -352,13 +365,30 @@ export class TimelineBuilder {
   }
 
   #turnEnd(data: Record<string, unknown>): ProviderTimelineItem[] {
+    // Any reason, not just failure: a turn that ends with a tool still running
+    // will never see its `tool/result`. DSH cancels turns with
+    // `reason.kind === "aborted"`, which used to fall through here and leave the
+    // row `running` forever — the client pulses a running row unconditionally.
+    const out = this.#cancelRunningTools();
     const reason = isRecord(data.reason) ? data.reason : undefined;
-    if (reason?.kind !== "error" && reason?.kind !== "failed") return [];
+    if (reason?.kind !== "error" && reason?.kind !== "failed") return out;
     const error = isRecord(reason.error) ? reason.error : undefined;
     const message =
       (error === undefined ? undefined : stringField(error, "message")) ?? "The turn failed.";
     const turn = typeof data.turn === "number" ? data.turn : 0;
-    return this.#put({ type: "error", id: `error:${turn}`, message });
+    out.push(...this.#put({ type: "error", id: `error:${turn}`, message }));
+    return out;
+  }
+
+  /** Close out tool calls whose result never arrived. */
+  #cancelRunningTools(): ProviderTimelineItem[] {
+    const out: ProviderTimelineItem[] = [];
+    for (const callId of [...this.#runningTools]) {
+      const previous = this.#items.get(`tool:${callId}`);
+      if (previous === undefined || previous.type !== "tool_call") continue;
+      out.push(...this.#put({ ...previous, status: "canceled" as const, error: null }));
+    }
+    return out;
   }
 
   #emitToolCall(
@@ -367,6 +397,17 @@ export class TimelineBuilder {
     input: Record<string, unknown>,
     status: "running" | "completed" | "failed" | "canceled",
   ): ProviderTimelineItem[] {
+    const previous = this.#items.get(`tool:${callId}`);
+    if (
+      previous !== undefined &&
+      previous.type === "tool_call" &&
+      previous.status !== "running"
+    ) {
+      // A duplicate or replayed `tool/call` for a tool that already finished.
+      // Rebuilding the row would reset it to running and, because the detail is
+      // rebuilt from the input alone, drop the output it already carries.
+      return [];
+    }
     const item: ProviderTimelineItem = {
       type: "tool_call",
       id: `tool:${callId}`,
