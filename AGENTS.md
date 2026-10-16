@@ -129,9 +129,16 @@ cd paseo-plugin && npx tsc --noEmit
   目录：`node harness/context-usage-check.cjs <dir>`。**动了 `server/dsh-process.ts` 的用量
   读取或 `DshSession` 的用量上报必跑。**
 
-离线清单之外还有三个容易被当成同类、其实不是的：`harness/tools.mjs`（真 `dsh` 的工具目录
+离线清单之外还有四个容易被当成同类、其实不是的：`harness/tools.mjs`（真 `dsh` 的工具目录
 转储）、`harness/subagent-live.mjs`（实机子会话可见性）、`harness/fake-dsh-bridge.mjs`
-（上面几个假桥脚本共用的 scripted 替身，不是独立检查脚本）。
+（上面几个假桥脚本共用的 scripted 替身，不是独立检查脚本），以及
+`harness/session-calls.mjs`——**诊断工具，不是回归**：它读 `$DSH_HOME/sessions` 下的会话
+日志，把每个 `tool/call` 的参数**键**与同一会话里 `request/header` 真正下发给模型的 schema
+做 diff，报出未声明的键并以 `exit 1` 结束。用来回答"我到底发出去了什么"：界面和模型读到的
+转写都是渲染，不能当证据。它刻意绕开两个坑——会话日志是**多帧** zstd
+（`zlib.zstdDecompressSync` 只解第一帧，会把 1.6 MB 的会话读成 172 字节的头部），以及
+**绝不静默跳过**解不开的文件。用法：`node harness/session-calls.mjs --list` /
+`--latest` / `--session <id>`，可再加 `--tool <name>`、`--raw`。
 
 客户端脉冲这条链最容易"看着对但静默失效"（`Animated` 在 RN Web 上只跑一段就停、`setValue`
 推不到原生 view、客户端不折叠只改 `metadata` 的 item），所以断言要打在数据层。

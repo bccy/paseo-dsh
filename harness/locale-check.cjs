@@ -317,13 +317,20 @@ console.log("row copy follows the locale, not the import");
   setLocale("zh-CN");
   equal("a shell row is labelled in Chinese", toolCallData(shell, "complete").label, "运行命令");
   equal("its block caption too", toolCallData(shell, "complete").bodyLabel, "输出");
-  equal("a plan row leads with the Chinese title", toolCallData(plan, "complete").summary, "计划");
+  // A plan row's title *is* its label: `planTitle` and the `exit_plan_mode` tool
+  // label are the same string in both tables, so the summary dedup
+  // (`rawSummary === label ? "" : rawSummary`) drops it and the head reads
+  // 「计划」once instead of「计划 · 计划」. The title still leads the expanded
+  // card; `tool-call-check.cjs` asserts that half against the source.
+  equal("a plan row leads with the Chinese title on its label", toolCallData(plan, "complete").label, "计划");
+  equal("and its summary does not repeat it", toolCallData(plan, "complete").summary, "");
   equal("a Paseo MCP row is labelled in Chinese", toolCallData(mcp, "complete").label, "删除心跳");
 
   setLocale("en");
   equal("the same row is labelled in English once the locale is relayed", toolCallData(shell, "complete").label, "Bash");
   equal("and so is the block caption", toolCallData(shell, "complete").bodyLabel, "Output");
-  equal("the plan row follows", toolCallData(plan, "complete").summary, "Plan");
+  equal("the plan row follows", toolCallData(plan, "complete").label, "Plan");
+  equal("with no repeated summary", toolCallData(plan, "complete").summary, "");
   equal("the Paseo MCP row follows", toolCallData(mcp, "complete").label, "Delete heartbeat");
 
   const huge = { name: "bash", status: "completed", detail: { type: "shell", command: "x", output: "y".repeat(7000) } };
