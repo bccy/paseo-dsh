@@ -1,0 +1,11 @@
+# The embedded bridge is generated base64, chunked to a fixed width. There is
+# nothing to read in a diff of it — `harness/bridge-assets-check.mjs` is what
+# verifies it — and rendering a thousand changed lines of base64 helps no one.
+# Marked `-diff` so diff viewers show "binary files differ" and stop there.
+#
+# The chunking is the part that matters: one string per file put ~77 K
+# characters on a single line, and character-level diffing is quadratic
+# (77318² ≈ 6.0e9 cells), which froze Paseo's own checkout-diff panel for this
+# repository only. `-diff` is the second line of defence, for viewers that ask
+# git rather than reading the file themselves.
+paseo-plugin/server/bridge-assets.ts -diff linguist-generated
