@@ -162,6 +162,8 @@ export class TimelineBuilder {
   #toolInputs = new Map<string, Record<string, unknown>>();
   /** commandId -> the command name, so `command/done` can title its own row. */
   #commands = new Map<string, string>();
+  /** Id of the newest row; the one the client pulses. See `#put`. */
+  #tailId: string | null = null;
 
   /**
    * Fold one DSH session event into zero or more complete Paseo item snapshots.
@@ -193,9 +195,43 @@ export class TimelineBuilder {
     }
   }
 
+  /**
+   * Store one snapshot and move the "this is the current row" marker onto it.
+   *
+   * A plugin timeline renderer only receives its own item (`theme`, `item`,
+   * `timestamp`) — it cannot see whether it is the last row. Position is exactly
+   * what the client pulses on, though: a short command's `tool/call` and
+   * `tool/result` land in the same tick, so a renderer keying off
+   * `status === "running"` never observes a running state and never pulses.
+   *
+   * So the builder marks the newest row here, and clears the marker from the
+   * tool row that was newest before. Only tool rows carry it: a streaming
+   * reasoning row is re-put many times per step and would otherwise churn.
+   */
   #put(item: ProviderTimelineItem): ProviderTimelineItem[] {
-    this.#items.set(item.id, item);
-    return [item];
+    const out: ProviderTimelineItem[] = [];
+    if (this.#tailId !== null && this.#tailId !== item.id) {
+      out.push(...this.#clearTail());
+    }
+    const next = item.type === "tool_call" ? { ...item, metadata: { current: true } } : item;
+    this.#tailId = next.id;
+    this.#items.set(next.id, next);
+    out.push(next);
+    return out;
+  }
+
+  /** Drop the marker from the row that was newest, if it carried one. */
+  #clearTail(): ProviderTimelineItem[] {
+    const id = this.#tailId;
+    this.#tailId = null;
+    if (id === null) return [];
+    const previous = this.#items.get(id);
+    if (previous === undefined || previous.type !== "tool_call" || previous.metadata === undefined) {
+      return [];
+    }
+    const cleared: ProviderTimelineItem = { ...previous, metadata: undefined };
+    this.#items.set(cleared.id, cleared);
+    return [cleared];
   }
 
   #assistantMessage(data: Record<string, unknown>): ProviderTimelineItem[] {
@@ -352,13 +388,17 @@ export class TimelineBuilder {
   }
 
   #turnEnd(data: Record<string, unknown>): ProviderTimelineItem[] {
+    // The turn is over, so nothing is "current" any more. Without this the last
+    // tool row of a finished turn would keep pulsing on the client.
+    const out = this.#clearTail();
     const reason = isRecord(data.reason) ? data.reason : undefined;
-    if (reason?.kind !== "error" && reason?.kind !== "failed") return [];
+    if (reason?.kind !== "error" && reason?.kind !== "failed") return out;
     const error = isRecord(reason.error) ? reason.error : undefined;
     const message =
       (error === undefined ? undefined : stringField(error, "message")) ?? "The turn failed.";
     const turn = typeof data.turn === "number" ? data.turn : 0;
-    return this.#put({ type: "error", id: `error:${turn}`, message });
+    out.push(...this.#put({ type: "error", id: `error:${turn}`, message }));
+    return out;
   }
 
   #emitToolCall(

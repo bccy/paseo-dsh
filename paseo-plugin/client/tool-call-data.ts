@@ -20,6 +20,14 @@ export interface ToolCallData {
   /** Body is source code (read/write/edit/search), so render it as code. */
   code: boolean;
   failed: boolean;
+  /**
+   * This is the newest row of the timeline, so the client pulses it.
+   *
+   * Comes from the plugin's own `metadata.current`, not from `status`: a short
+   * command's call and result reach the client in the same tick, so there is no
+   * observable running state to key a pulse off.
+   */
+  current: boolean;
 }
 
 type ToolDetail = Record<string, unknown>;
@@ -109,12 +117,14 @@ export function toolCallData(
     status: string;
     detail: unknown;
     error?: unknown;
+    metadata?: unknown;
   },
   phase: "streaming" | "complete",
 ): ToolCallData {
   const detail = (item.detail ?? {}) as ToolDetail;
   const type = str(detail, "type");
   const failed = item.status === "failed";
+  const metadata = (item.metadata ?? {}) as Record<string, unknown>;
   let summary = "";
   let body = "";
   let bodyLabel = "输出";
@@ -210,5 +220,6 @@ export function toolCallData(
     diff,
     code,
     failed,
+    current: metadata.current === true,
   };
 }

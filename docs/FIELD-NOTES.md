@@ -602,8 +602,10 @@ useRevealedText/ScrollView/FlatList/copyText/TextInput`，**没有暴露任何 s
 
 **修法（最终采用）**：`client/shimmer.ts` 用**普通 React state** 驱动 opacity：一个模块级
 `setInterval`（50ms）按余弦算出透明度，推给所有订阅者；`useShimmer(active)` 只在 active 时
-订阅，空闲行恒为 1。触发条件是"思考还在变长"和"工具 running / phase streaming"。
-20fps 的 state 重渲染只发生在正在运行的那几行上，两端行为一致。
+订阅，空闲行恒为 1。20fps 的 state 重渲染只发生在正在运行的那几行上，两端行为一致。
+
+**关键：脉冲的触发条件是"位置"而不是"状态"**（见第 29c 条）。思考行仍是"文本还在变长"，
+工具行是 `metadata.current`——由插件的服务端标在**最新的那一行**上。
 
 期间试过"扫光"（叠一条高光从左到右平移）：没有真正的渐变时它就是一块硬边色块划过，
 用户评价**还不如脉冲**，所以回退了。要做扫光必须先解决渐变（宿主那套 `background-clip` /
@@ -637,6 +639,32 @@ Reanimated 遮罩没暴露给插件）。
 被中断的工具调用（比如正在 `paseo plugin reload` 时插件把自己重启了）永远等不到
 `tool/result`，在时间线里就一直是 `running`，于是永远脉冲。这不是脉冲的 bug，是"工具没有
 终态"的固有现象；要根治得让插件在会话恢复时把未完成的工具标记为 canceled。
+
+### 29c. 短命令不会闪：脉冲要看"位置"，不能看"状态"
+
+**症状**：长命令会闪，短命令（`echo`、`ls` 这种）永远不闪。用户的原话是"直接把最后一条去
+闪烁就行了，而不是说一定要看它的什么状态不状态的"。
+
+**根因**：`dsh-agent-loop` 在执行**开始**时就 append `tool/call`，执行完 append
+`tool/result`。短命令这两条几乎在同一个 tick 里到达客户端，渲染器根本观察不到
+`status === "running"`，按状态触发的脉冲自然一次都不跑。
+
+**为什么不能直接"取最后一条"**：插件时间线渲染器的 props 只有
+`theme / host / layout / agentId / item / timestamp`——**看不到自己在列表里的位置**，也没有
+isLast/index。所以"是不是最后一条"这个信息必须由插件的服务端给出来。
+
+**修法**：`server/timeline.ts` 的 `TimelineBuilder` 在 `#put()` 里把 `metadata.current` 标在
+**最新那一行**上，并清掉上一行的标记；`turn/end` 时清空（否则回合结束后最后一行会一直闪）。
+客户端 `toolCallData` 读 `item.metadata.current`，工具行的脉冲条件就是 `data.current`。
+只有 `tool_call` 行带标记——思考行在一步里会被 `#put` 很多次（流式快照），带标记会来回抖。
+
+**验证**：`harness/plugin-check.cjs` 新增两条断言（"最新行带 current 标记"、"新行出现时清掉
+旧标记"），29/29 通过；`harness/tool-call-check.cjs` 覆盖 `metadata.current -> current` 的映射，
+40/40 通过。
+
+**顺带**：历史回放走的是同一个 builder（`replayHistory` 里 `new TimelineBuilder()` 后逐条
+`consume`），所以回放出来的最后一行也会被后面的 `turn/end` 清掉标记，不会出现"打开旧会话
+最后一行一直在闪"。
 
 diff 行按 GitHub 的做法：浅绿/浅红底（低 alpha，深色主题也不刺眼）、`+`/`-` 标记单独
 上色、代码正文用 **muted 前景色**（用 `foreground` 会"太白"）。**不要**给每行加左侧亮色

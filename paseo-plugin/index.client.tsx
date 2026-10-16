@@ -74,6 +74,7 @@ export default function contribute(client: PluginClientContext) {
       diff: z.boolean(),
       code: z.boolean(),
       failed: z.boolean(),
+      current: z.boolean(),
     }),
     Component: InlineToolCall,
   });
