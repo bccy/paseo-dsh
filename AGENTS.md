@@ -78,7 +78,7 @@ cd paseo-plugin && npx tsc --noEmit
 `harness/assistant-stream-check.cjs`（助手文本流式：同 id 增长快照、`id === messageId`、
 经 Paseo 规则投影后合并成一行）。
 
-还有五个**离线**脚本，直接 require 编译产物、不需要 daemon（运行步骤写在各自头部注释里）：
+还有七个**离线**脚本，直接 require 编译产物、不需要 daemon（运行步骤写在各自头部注释里）：
 
 - `harness/timeline-check.cjs` — `TimelineBuilder` 的工具行状态机：`tool/call` → `tool/result`、
   重复 `tool/call` 不能把完成行重置回 running 或清空输出、`turn/end`（含 `aborted`）要把仍

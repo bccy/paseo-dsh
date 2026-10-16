@@ -173,6 +173,24 @@ async function emitLateLabel() {
   notify("session.status", { sessionId: "child-L", status: "idle" });
 }
 
+/**
+ * Report a child with no label and then never send its descriptor.
+ *
+ * The plugin holds a label-less notice so the child can open with its real
+ * title, but a provider that never supplies one must not leave the child
+ * unopened: its output would buffer and then be dropped in silence. This is the
+ * shape that used to be dead code — the wait was only ever evaluated before any
+ * of the child's frames existed.
+ */
+async function emitLabelNever() {
+  notify("session.child-opened", { sessionId: "child-N", parentSessionId: rootId, mode: "one-shot", cwd: "/tmp" });
+  for (let i = 1; i <= 45; i += 1) {
+    notify("session.event", { sessionId: "child-N", event: { type: "assistant/message", seq: i, data: { turn: 1, step: 1, message: { id: `cn${i}`, content: [{ type: "text", text: `never-labelled line ${i}` }] } } } });
+  }
+  notify("session.event", { sessionId: "child-N", event: { type: "turn/end", seq: 46, data: { turn: 1, reason: { kind: "completed" } } } });
+  notify("session.status", { sessionId: "child-N", status: "idle" });
+}
+
 async function emitEarly() {
   notify("session.child-opened", { sessionId: "child-E", parentSessionId: rootId, mode: "continuable", label: "Early E", cwd: "/tmp" });
   notify("session.event", { sessionId: "child-E", event: { type: "assistant/message", seq: 1, data: { turn: 1, step: 1, message: { id: "em1", content: [{ type: "text", text: "early child answer" }] } } } });
@@ -264,6 +282,10 @@ async function handle(method, params, id) {
       if (MODE === "label-late" && !emitted) {
         emitted = true;
         setTimeout(() => { void emitLateLabel(); }, 0);
+      }
+      if (MODE === "label-never" && !emitted) {
+        emitted = true;
+        setTimeout(() => { void emitLabelNever(); }, 0);
       }
       // The steer scenario advertises one registered command so the command
       // branch (a `completed` result, never a turn) stays covered.

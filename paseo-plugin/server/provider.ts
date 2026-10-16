@@ -508,20 +508,39 @@ class DshConnection implements ProviderConnection {
     }
     // DSH's registry is process-global, so a session that is already open can
     // carry the request — which is what lets a native child, with no process of
-    // its own, be archived through its root. When nothing is open (the state
-    // after Paseo archived the last session), fall back to a throwaway runtime:
-    // the archive set lives in DSH's home, not in this process. A live session
-    // that refuses is not fatal either — a fresh runtime reads the same durable
-    // state without a stale process's missing services, so it gets the last word.
-    for (const session of this.#sessions.values()) {
+    // its own, be archived through its root. But the archive *record* and the
+    // act of stopping live work are different things: the record lands on disk,
+    // while stopping happens in the process that owns the session. So the root
+    // actually holding this id goes first, and every other root is only a
+    // fallback. When nothing is open (the state after Paseo archived the last
+    // session), fall back to a throwaway runtime: the archive set lives in DSH's
+    // home, not in this process.
+    const ordered = [...this.#sessions.values()].sort(
+      (a, b) => Number(b.holdsDshSession(dshSessionId)) - Number(a.holdsDshSession(dshSessionId)),
+    );
+    const reasons: string[] = [];
+    for (const session of ordered) {
       try {
         await session.archiveDshSession(dshSessionId, archived);
         return;
-      } catch {
-        // Try the next open root, then the fresh runtime below.
+      } catch (error) {
+        // A rescued failure still means this process did not do it, so it is
+        // reported rather than swallowed; the reasons are also what the caller
+        // sees if every attempt fails.
+        reasons.push(messageOf(error));
+        process.stderr.write(
+          `[${PROVIDER_ID}] ${archived ? "archive" : "unarchive"} via ${session.dshId} failed: ${messageOf(error)}\n`,
+        );
       }
     }
-    await applyArchivedStandalone(dshSessionId, archived);
+    try {
+      await applyArchivedStandalone(dshSessionId, archived);
+    } catch (error) {
+      reasons.push(messageOf(error));
+      throw new Error(
+        `cannot ${archived ? "archive" : "unarchive"} ${dshSessionId}: ${reasons.join("; ")}`,
+      );
+    }
   }
 
   #require(sessionId: string): DshSession | DshChildSession {

@@ -29,6 +29,7 @@ const {
   isPulsing,
   noteCommit,
   noteRender,
+  pulseRemainingMs,
   shouldPulse,
 } = require("./client/newest.js");
 
@@ -179,7 +180,25 @@ async function main() {
     check("a stale canceled row does not", shouldPulse("canceled", { newest: false, fresh: false }) === false);
   }
 
-  console.log(`\n${passed} passed, ${failed} failed`);
+  console.log("how long a pulse has left");
+{
+  // The row schedules its own wake-up from this, because nothing else re-renders
+  // it: the sweep runs in an Animated loop on native and in CSS on web, and the
+  // state timer that used to drive it went away with the opacity pulse. A wrong
+  // answer here is a row that shimmers until unrelated news arrives.
+  const commit = { seq: 1, seenAt: 1_000, bulk: false };
+  check("a full window remains at commit time", pulseRemainingMs(commit, 1_000) === PULSE_MS, String(pulseRemainingMs(commit, 1_000)));
+  check("halfway through, half is left", pulseRemainingMs(commit, 4_000) === PULSE_MS / 2, String(pulseRemainingMs(commit, 4_000)));
+  check("the closing instant is still positive", pulseRemainingMs(commit, 1_000 + PULSE_MS - 1) === 1, String(pulseRemainingMs(commit, 1_000 + PULSE_MS - 1)));
+  check("an expired window is zero, never negative", pulseRemainingMs(commit, 1_000 + PULSE_MS) === 0, String(pulseRemainingMs(commit, 1_000 + PULSE_MS)));
+  check("and stays zero afterwards", pulseRemainingMs(commit, 999_999) === 0, String(pulseRemainingMs(commit, 999_999)));
+  const agent = "agent-remaining";
+  const committed = noteCommit(agent, 1_000);
+  check("an expired window is exactly what isPulsing refuses", isPulsing(agent, committed, 1_000 + PULSE_MS) === false, "still pulsing");
+  check("and it is still pulsing one millisecond earlier", isPulsing(agent, committed, 1_000 + PULSE_MS - 1) === true, "stopped early");
+}
+
+console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 }
 

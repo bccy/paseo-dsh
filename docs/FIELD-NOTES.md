@@ -694,7 +694,7 @@ reason，包括 `aborted`**）时把它们收成 `canceled`。被中断的工具
 "重复 `tool/call` 把已完成的行重置回 running 并清空输出"。
 
 **验证**：`harness/newest-check.cjs` 29/29（位置、批次、窗口、交接、回放、时钟、真实脉冲判据）；
-`harness/timeline-check.cjs` 16/16（工具生命周期、重复调用、中断收尾、回放）；
+`harness/timeline-check.cjs` 19/19（工具生命周期、重复调用、中断收尾、回放）；
 `harness/tool-call-check.cjs` 37/37；`harness/plugin-check.cjs` 27/27；`npx tsc --noEmit` 干净。
 
 **试过但不可行的方案（重要教训）**：先试的是服务端方案——`TimelineBuilder.#put()` 给最新行打
@@ -773,7 +773,7 @@ const summaryText = running ? latestCompletedParagraphFirstLine(text) : firstLin
 ### 31. 工具行的标题用 DSH 的 `description`，不是原始命令
 
 **症状**：DSH 原版界面里命令行显示的是 `运行命令 · List DSH checkout root` 这种**人写的描述**，
-Paseo 这边却是 `命令 pwd; ls -d /home/yywl/.dsh 2>/dev/null && ...` 一长串原始命令。
+Paseo 这边却是 `命令 pwd; ls -d ~/.dsh 2>/dev/null && ...` 一长串原始命令。
 
 **根因**：`dsh-tool-bash` 的入参里**必带 `description`**（`validateBashArgs` 里
 `args.description.trim().length === 0` 直接抛错），DSH 的 UI 拿它当标题；插件这边把
@@ -791,7 +791,7 @@ Paseo 这边却是 `命令 pwd; ls -d /home/yywl/.dsh 2>/dev/null && ...` 一长
 - `headline` = 工具自己的主体（命令），**仅在两者不同时非空**，展开时显示在输出上方，避免
   重复折叠态已经给过的信息。
 
-DSH 原版那行还有 `● yywl`（执行者）和"复制"按钮，我们没有跟进——那是它的宿主 chrome，
+DSH 原版那行还有 `● <执行者>` 和"复制"按钮，我们没有跟进——那是它的宿主 chrome，
 不是这行信息本身。
 
 **验证**：`harness/timeline-check.cjs`（描述确实挂在 metadata 上、结果行仍带着、没描述就不加）、
@@ -1051,7 +1051,11 @@ label 正确、子会话有自己的时间线）。
 - 能力清单加 `session.archive` / `session.unarchive`；桥新增 `paseo/archive` /
   `paseo/unarchive`，经 `ctx.get('workspaceRegistry')` 转调 DSH；失败返回 `available:false`
   + 原因，**绝不把没做的事报成成功**。
-- 子会话 `open()` 带上 `persistence: {version:1, data:{sessionId:<nativeId>}}`，从此可寻址。
+- 子会话 `open()` 带上 `persistence: {version:1, data:{sessionId:<nativeId>}}`。**但要说清：Paseo
+  0.11.2 的 daemon 只对 `restoration:"core"` 的会话保留这个句柄**（`plugin-provider.js`：
+  `this.persistence = this.restoration === "core" ? (event.persistence ?? null) : null`），子会话是
+  `restoration:"parent"`，句柄在宿主侧被直接丢弃 —— 所以「子会话可被归档」在**当前宿主版本上并不会
+  真正发生**，这一条是为将来版本预留的。子会话的归档目前只能由根会话的归档连带覆盖。
 - 子会话在 DSH 里跑在**根的进程**里、自己没有进程，而 DSH 的 registry 是**进程全局**的 →
   `archiveDshSession(dshSessionId, archived)` 由任意一个打开的根代为转发。
 - `paseo/subagents` 附带每个子会话的 DSH 归档状态（读 `archivedSessionIds`），

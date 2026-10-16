@@ -257,6 +257,32 @@ async function openSession(conn, sessionId, history) {
   const replayOpens = events.filter((e) => e.type === "session.opened" && e.sessionId.endsWith(":sub:child-B"));
   check("a replayed one-shot child opens with its own descriptor's label", replayOpens.length > 0 && replayOpens.every((e) => e.title === "Nested B"), JSON.stringify(replayOpens.map((e) => e.title)));
 
+  // ---- a child whose label never arrives --------------------------------
+  // The hold exists so a child opens with its real title; it must still be
+  // bounded by something other than a check that can only ever read zero. With
+  // the wait evaluated only at `child-opened` time the child never opened at
+  // all, and its output was buffered and quietly dropped.
+  const conn3c = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+  const conn3cEvents = [];
+  conn3c.onEvent((e) => conn3cEvents.push(e));
+  const rootN = `subN-${Date.now()}`;
+  process.env.DSH_FAKE_MODE = "label-never";
+  await conn3c.send({ type: "session.open", sessionId: rootN, config: { cwd: process.cwd(), mode: "build" }, history: "skip" });
+  const neverChild = await untilIn(
+    conn3cEvents,
+    (e) => e.type === "session.opened" && e.sessionId === scoped(rootN, "child-N"),
+    "child-N opened despite never being labelled",
+    30000,
+  );
+  check("a label-less child still opens once it has waited long enough", neverChild.title === undefined, `title=${JSON.stringify(neverChild.title)}`);
+  await untilIn(
+    conn3cEvents,
+    (e) => e.type === "timeline.item" && e.sessionId === scoped(rootN, "child-N") && e.item?.text === "never-labelled line 45",
+    "the never-labelled child's output",
+    30000,
+  );
+  check("and its output reaches the timeline instead of being dropped", true, "never-labelled line 45");
+
   // ---- a child DSH reports as archived ----------------------------------
   // Announcing it again would resurrect it in Paseo, which is exactly how
   // "archive all" appeared to do nothing after a restart.

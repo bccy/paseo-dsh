@@ -894,6 +894,17 @@ export class DshSession {
   }
 
   /**
+   * Whether this root's DSH process is the one holding that DSH session.
+   *
+   * Either it is the root itself, or a native child of it — children are keyed
+   * by their DSH session id. Used to route an archive to the process that can
+   * actually stop the work, not merely record the archive.
+   */
+  holdsDshSession(dshSessionId: string): boolean {
+    return this.#dshSessionId === dshSessionId || this.#children.has(dshSessionId);
+  }
+
+  /**
    * Archive or unarchive one DSH session in this root's DSH process.
    *
    * The plugin keeps no archive flag of its own: DSH has the concept, and
@@ -1018,6 +1029,25 @@ export class DshSession {
   #bufferChildEvent(item: { kind: "event"; sessionId: string; event: { type: string; [key: string]: unknown } } | { kind: "status"; sessionId: string; status: string }): void {
     this.#trimChildBuffer();
     this.#pendingChildEvents.push(item);
+    // A label-less notice is held so the child still opens with its real title,
+    // but the wait has to be re-evaluated as its frames accumulate. The check in
+    // `#onChildOpened` can never fire: the bridge does not forward a child's
+    // frames before that child's `child-opened`, so the count is always 0 there.
+    // Without this the fallback was dead code and a provider that never sent a
+    // descriptor left the child unopened — its output buffered, then dropped at
+    // CHILD_BUFFER_LIMIT, with nothing said.
+    this.#openIfLabelWaitExceeded(item.sessionId);
+  }
+
+  /** Open a held, label-less child once it has waited long enough for one. */
+  #openIfLabelWaitExceeded(nativeId: string): void {
+    const held = this.#pendingOpened.find((payload) => payload.sessionId === nativeId);
+    if (held === undefined || held.label !== undefined) return;
+    if (!this.#labelWaitExceeded(nativeId)) return;
+    this.#options.log(
+      `subagent ${nativeId} held ${CHILD_LABEL_WAIT_EVENTS} frames with no label; opening it untitled`,
+    );
+    this.#flushPendingChildren();
   }
 
   /** Keep the held-child buffer bounded, dropping the oldest on overflow. */
@@ -1047,8 +1077,13 @@ export class DshSession {
         progress = false;
         const remaining: DshChildOpened[] = [];
         for (const payload of this.#pendingOpened) {
-          if (this.#parentScopedId(payload.parentSessionId) === undefined) remaining.push(payload);
-          else {
+          // The root gate applies here too: a held notice must never be opened
+          // before `session.ready`, which is the same promise `#onChildOpened`
+          // makes. Without it a child whose descriptor arrived early could be
+          // announced ahead of its own root.
+          if (!this.#rootReady || this.#parentScopedId(payload.parentSessionId) === undefined) {
+            remaining.push(payload);
+          } else {
             this.#openChildNow(payload);
             progress = true;
           }

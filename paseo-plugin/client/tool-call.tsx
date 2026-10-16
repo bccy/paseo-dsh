@@ -37,9 +37,11 @@ export function InlineToolCall({
   const data = item.data;
   const [expanded, setExpanded] = useState(false);
   const hasBody = data.body !== "";
-  // Even a tool with no output can have a command longer than the row, so it
-  // must still be expandable: expanding lays the full command out below.
-  const canExpand = hasBody || data.summary !== "" || data.headline !== "";
+  // Expanding is only worth offering when the block below actually has
+  // something in it — `hasDetail` is that answer, computed in the data layer.
+  // The row is a Pressable, so promising an expansion that never renders left a
+  // button which did nothing when pressed.
+  const canExpand = data.hasDetail;
   // Once expanded the block carries the subject in full, so a row whose title
   // *is* that subject does not repeat a compact copy of it above.
   const showSummary = data.summary !== "" && !(expanded && !data.titled && data.headline !== "");

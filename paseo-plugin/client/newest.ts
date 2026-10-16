@@ -172,13 +172,24 @@ export function shouldPulse(status: string, pulse: RowPulse): boolean {
   return pulse.newest && (status === "running" || pulse.fresh);
 }
 
+/** Milliseconds until this commit's pulse window closes; 0 once it has. */
+export function pulseRemainingMs(commit: Commit, now: number): number {
+  return Math.max(0, commit.seenAt + PULSE_MS - now);
+}
+
 /**
  * The pulse for one timeline row.
  *
  * `newest` is read during render (safe: a running maximum); `fresh` needs the
- * commit, so it is set from an effect and costs one extra render. A row that
- * stops being the last one corrects itself, because while it pulses it
- * re-renders 20 times a second and re-evaluates.
+ * commit, so it is set from an effect and costs one extra render.
+ *
+ * Nothing else re-renders a pulsing row. The sweep animates through
+ * `Animated.loop` on native and through CSS on web, and the 50ms state timer
+ * that used to drive a re-render went away with the opacity pulse — so a row
+ * has to schedule its own wake-up for the moment its window closes. Without it
+ * a short command keeps shimmering until some unrelated timeline update happens
+ * to re-render it, and a row that stops being the last one keeps its
+ * `newest` claim for just as long.
  */
 export function useRowPulse(
   agentId: string,
@@ -187,11 +198,18 @@ export function useRowPulse(
   const at = atOf(timestamp);
   const newest = noteRender(agentId, at);
   const [commit, setCommit] = useState<Commit | null>(null);
+  const [, setTick] = useState(0);
   useEffect(() => {
     setCommit(noteCommit(agentId, Date.now()));
   }, [agentId, at]);
-  return {
-    newest,
-    fresh: commit !== null && isPulsing(agentId, commit, Date.now()),
-  };
+  const fresh = commit !== null && isPulsing(agentId, commit, Date.now());
+  useEffect(() => {
+    if (commit === null) return;
+    const remaining = pulseRemainingMs(commit, Date.now());
+    if (remaining <= 0) return;
+    // One frame past the window, so the re-render reads an expired window.
+    const timer = setTimeout(() => setTick((n) => n + 1), remaining + 16);
+    return () => clearTimeout(timer);
+  }, [commit, fresh]);
+  return { newest, fresh };
 }
