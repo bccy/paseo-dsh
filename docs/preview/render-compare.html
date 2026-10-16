@@ -230,7 +230,7 @@
     font-family:"SF Mono",Menlo,monospace; font-size:11px; line-height:18px; }
   .n-termhd.bd { border-bottom:.5px solid #2e2e33; }
   .n-cwd { flex:none; color:#a1a1aa; }
-  .n-cmd { flex:1; min-width:0; color:#fafafa; white-space:pre; overflow:hidden;
+  .n-cmd { flex:1; min-width:0; color:#a1a1aa; white-space:pre; overflow:hidden;
     text-overflow:ellipsis; }
   .n-pill { flex:none; height:18px; padding:0 8px; border-radius:999px; background:#26262a;
     color:#d8847b; font-family:-apple-system,"PingFang SC",sans-serif; font-size:12px;
@@ -241,7 +241,7 @@
     align-self:center; }
   .n-dot.err { background:#d8847b }
   .n-out { padding:12px 14px; font-family:"SF Mono",Menlo,monospace; font-size:11px;
-    line-height:18px; color:#fafafa; white-space:pre-wrap; word-break:break-word; }
+    line-height:18px; color:#a1a1aa; white-space:pre-wrap; word-break:break-word; }
 
   .n-banner { display:flex; align-items:center; gap:12px; padding:9px 14px; background:#232327;
     font-size:13px; line-height:20px; }
@@ -249,14 +249,14 @@
     text-overflow:ellipsis; }
   .n-banner .r { flex:none; color:#a1a1aa; }
   .n-sbody { padding:8px 14px 12px 0; font-family:"SF Mono",Menlo,monospace; font-size:11px;
-    line-height:19px; color:#fafafa; }
-  /* 代码正文（11/19、前景色）—— 兜底代码面用 */
+    line-height:19px; color:#a1a1aa; }
+  /* 代码正文（11/19、muted）—— 兜底代码面用。全对比前景色只有 diff 的 +/- 保留 */
   .n-pre { font-family:"SF Mono",Menlo,monospace; font-size:11px; line-height:19px;
-    color:#fafafa; white-space:pre-wrap; word-break:break-word; }
+    color:#a1a1aa; white-space:pre-wrap; word-break:break-word; }
   .n-sline { min-height:22px; padding-left:14px; white-space:pre; }
   .n-ln { color:#71717a; }
   .n-fh { display:flex; align-items:flex-start; gap:8px; min-height:22px; padding:0 14px; }
-  .n-fp { min-width:0; font-weight:600; color:#fafafa; white-space:pre; }
+  .n-fp { min-width:0; font-weight:600; color:#a1a1aa; white-space:pre; }
   .n-fc { flex:none; color:#71717a; }
   .n-more { display:block; padding:0 14px; color:#71717a; }
 
@@ -275,7 +275,7 @@
     line-height:19px; overflow-x:auto; }
   .n-rline { display:flex; min-height:19px; white-space:pre; }
   .n-gut { flex:none; width:20px; margin-right:12px; text-align:right; color:#71717a; }
-  .n-rc { min-width:0; color:#fafafa; }
+  .n-rc { min-width:0; color:#a1a1aa; }
 
   .n-dbody { padding:6px 0 20px; font-family:"SF Mono",Menlo,monospace; font-size:11px;
     line-height:19px; overflow-x:auto; }

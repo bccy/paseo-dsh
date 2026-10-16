@@ -287,8 +287,12 @@ export function commandRegionStyle(): {
 }
 
 /**
- * The command: full-contrast foreground, so it reads as the subject of the card
- * while the cwd and the status stay grey.
+ * The command: the same grey as the row's own title.
+ *
+ * DSH paints this line at full contrast (it is the subject of the card), but the
+ * user asked for the whole expanded card to read as one quiet grey block like
+ * the thinking row: only the diff's own `+`/`-` lines keep a colour. See
+ * `docs/FIELD-NOTES.md` #46.
  */
 export function commandTextStyle(colors: TokenColors): {
   fontFamily: string;
@@ -300,7 +304,7 @@ export function commandTextStyle(colors: TokenColors): {
     fontFamily: CODE_FONT_FAMILY,
     fontSize: COMMAND_FONT_SIZE,
     lineHeight: COMMAND_LINE_HEIGHT,
-    color: colors.foreground,
+    color: colors.foregroundMuted,
   };
 }
 
@@ -315,7 +319,7 @@ export function outputRegionStyle(): {
   };
 }
 
-/** The printed output: 11/18, foreground contrast (DSH's `.line`). */
+/** The printed output: 11/18, the expanded card's one grey (DSH's `.line`). */
 export function outputTextStyle(colors: TokenColors): {
   fontFamily: string;
   fontSize: number;
@@ -326,7 +330,7 @@ export function outputTextStyle(colors: TokenColors): {
     fontFamily: CODE_FONT_FAMILY,
     fontSize: OUTPUT_FONT_SIZE,
     lineHeight: OUTPUT_LINE_HEIGHT,
-    color: colors.foreground,
+    color: colors.foregroundMuted,
   };
 }
 
@@ -341,7 +345,13 @@ export function codeRegionStyle(): {
   };
 }
 
-/** Read/search/unknown bodies and the block's leading subject. */
+/**
+ * Read/search/unknown bodies and the block's leading subject.
+ *
+ * Grey, not `foreground`: this is the style every non-diff expanded block falls
+ * back to, and the user asked for those blocks to read like the thinking row
+ * (see `commandTextStyle`).
+ */
 export function codeTextStyle(colors: TokenColors): {
   fontFamily: string;
   fontSize: number;
@@ -352,7 +362,7 @@ export function codeTextStyle(colors: TokenColors): {
     fontFamily: CODE_FONT_FAMILY,
     fontSize: CODE_FONT_SIZE,
     lineHeight: CODE_LINE_HEIGHT,
-    color: colors.foreground,
+    color: colors.foregroundMuted,
   };
 }
 
@@ -848,7 +858,7 @@ export function searchLineNumberTextStyle(colors: TokenColors): {
   };
 }
 
-/** A match line's text — the code surface, never shrunk (it scrolls instead). */
+/** A match line's text — grey like the rest of the card, never shrunk (it scrolls). */
 export function searchLineTextStyle(colors: TokenColors): {
   flexShrink: number;
   fontFamily: string;
@@ -861,11 +871,11 @@ export function searchLineTextStyle(colors: TokenColors): {
     fontFamily: CODE_FONT_FAMILY,
     fontSize: CODE_FONT_SIZE,
     lineHeight: CODE_LINE_HEIGHT,
-    color: colors.foreground,
+    color: colors.foregroundMuted,
   };
 }
 
-/** A group's path: bold 600 primary, DSH's `.filePath`. */
+/** A group's path: bold 600 grey, DSH's `.filePath` weight on our muted colour. */
 export function searchFilePathTextStyle(colors: TokenColors): {
   flexShrink: number;
   fontFamily: string;
@@ -880,7 +890,7 @@ export function searchFilePathTextStyle(colors: TokenColors): {
     fontSize: CODE_FONT_SIZE,
     lineHeight: CODE_LINE_HEIGHT,
     fontWeight: "600",
-    color: colors.foreground,
+    color: colors.foregroundMuted,
   };
 }
 
@@ -992,7 +1002,7 @@ export function readGutterTextStyle(colors: TokenColors, digits: number): {
   };
 }
 
-/** The code itself: primary contrast, never shrunk (it scrolls instead). */
+/** The code itself: grey like the card's chrome, never shrunk (it scrolls instead). */
 export function readLineTextStyle(colors: TokenColors): {
   flexShrink: number;
   fontFamily: string;
@@ -1005,7 +1015,7 @@ export function readLineTextStyle(colors: TokenColors): {
     fontFamily: CODE_FONT_FAMILY,
     fontSize: CODE_FONT_SIZE,
     lineHeight: CODE_LINE_HEIGHT,
-    color: colors.foreground,
+    color: colors.foregroundMuted,
   };
 }
 

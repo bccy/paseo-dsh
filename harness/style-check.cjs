@@ -267,7 +267,7 @@ console.log("the command banner and the output region are split");
   const command = commandTextStyle(COLORS);
   equal("command size in the style", command.fontSize, 11);
   equal("command line height in the style", command.lineHeight, 18);
-  equal("command uses the high-contrast foreground", command.color, COLORS.foreground);
+  equal("the command is grey like the row title", command.color, COLORS.foregroundMuted);
   equal("command is monospace", command.fontFamily, CODE_FONT_FAMILY);
 
   equal("output padding V", OUTPUT_PADDING_VERTICAL, 12);
@@ -278,11 +278,16 @@ console.log("the command banner and the output region are split");
   const output = outputTextStyle(COLORS);
   equal("output size in the style", output.fontSize, 11);
   equal("output line height in the style", output.lineHeight, 18);
-  equal("output keeps foreground contrast", output.color, COLORS.foreground);
+  equal("the output is the same grey", output.color, COLORS.foregroundMuted);
 
   equal("code size", CODE_FONT_SIZE, 11);
   equal("code line height", CODE_LINE_HEIGHT, 19);
   equal("code region", JSON.stringify(codeRegionStyle()), JSON.stringify({ paddingVertical: 12, paddingHorizontal: 14 }));
+  // The fallback every non-diff expanded block uses (a `write` body, a plain
+  // `bash` detail, a row whose meta did not parse). It is grey on purpose: the
+  // user asked for those blocks to read like the thinking row, and only the
+  // diff's own `+`/`-` lines keep a colour (asserted in the diff section below).
+  equal("the code surface is grey too", codeTextStyle(COLORS).color, COLORS.foregroundMuted);
   // The old assertion here was `COMMAND_LINE_HEIGHT < OUTPUT_LINE_HEIGHT` ("the
   // command line is tighter than the output"). That encoded a wrong reading of
   // DSH: both are the same `--dsl-terminal-line-height` (18px) on the tool card.
@@ -383,10 +388,10 @@ console.log("the search card");
   equal("a row is indented 14", line.paddingLeft, SEARCH_LINE_PADDING_LEFT);
   equal("a file header carries its own padding", searchFileHeadStyle().paddingHorizontal, 14);
   equal("the file path is bold", searchFilePathTextStyle(COLORS).fontWeight, "600");
-  equal("the file path is primary", searchFilePathTextStyle(COLORS).color, COLORS.foreground);
+  equal("the file path is muted, not primary", searchFilePathTextStyle(COLORS).color, COLORS.foregroundMuted);
   equal("the count is muted", searchFileCountTextStyle(COLORS).color, COLORS.foregroundMuted);
   equal("the line number is muted", searchLineNumberTextStyle(COLORS).color, COLORS.foregroundMuted);
-  equal("the match text is primary", searchLineTextStyle(COLORS).color, COLORS.foreground);
+  equal("the match text is muted, not primary", searchLineTextStyle(COLORS).color, COLORS.foregroundMuted);
   check("nothing shrinks: the row scrolls sideways instead", searchLineTextStyle(COLORS).flexShrink === 0 && searchLineNumberTextStyle(COLORS).flexShrink === 0);
   equal("the fold control aligns with the rows", searchExpandTextStyle(COLORS).paddingLeft, SEARCH_LINE_PADDING_LEFT);
   equal("the empty state is muted", searchEmptyTextStyle(COLORS).color, COLORS.foregroundMuted);
@@ -407,6 +412,7 @@ console.log("the read card");
   equal("the number is right-aligned", gutter.textAlign, "right");
   equal("and muted", gutter.color, COLORS.foregroundMuted);
   equal("the code takes the rest without shrinking", readLineTextStyle(COLORS).flexShrink, 0);
+  equal("the read code is grey like its gutter", readLineTextStyle(COLORS).color, COLORS.foregroundMuted);
   equal("a read row is one code line tall", readLineStyle().minHeight, CODE_LINE_HEIGHT);
   equal(
     "the fold control starts where the code starts",

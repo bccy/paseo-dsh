@@ -1389,6 +1389,39 @@ updateTasks` = 工具名标签「更新任务清单」）和 `ask_user_question`
 `args` 退化成空串、`command/run` 缺失时仍用兜底标题且 label 为空），以及被压缩接管的
 `/compact` 整条不发。
 
+### 46. 展开的正文"太白"：非 diff 块一律用 muted 前景色（已改）
+
+**症状**（用户报）：点开工具行，只有带 `+`/`-` 内联格式的 diff 块有颜色层次，**其余展开块
+（命令 banner、命令输出、读取的代码、搜索命中、兜底代码面）通篇是全对比前景色**，在深色主题
+下"太白"，和旁边的思考行、行头标题（都是 muted）不是一路。
+
+**根因**：Phase 1 把每个数值收进 `client/tokens.ts` 时，正文色照抄了 DSH —— DSH 的
+`.line` / `.readBody` / `.match` 确实是全对比前景色。但那是 DSH 自己的排版语境；本仓库的
+思考行（`inline-thinking.tsx`）和行头标签用的是 `foregroundMuted`（第 30 条里"标签太白"
+那次就是这个结论），两套并存就出现了"同一屏里有的字灰、有的字白"。
+
+**修法**：只改 token 表，组件一行不动 —— 六个正文样式从 `colors.foreground` 换成
+`colors.foregroundMuted`：
+
+| 样式 | 覆盖的块 |
+|---|---|
+| `commandTextStyle` | 命令 banner 的命令行 |
+| `outputTextStyle` | 命令输出 |
+| `codeTextStyle` | 读取/搜索/兜底代码面（`headline` 与 `body` 共用） |
+| `searchLineTextStyle` | 搜索命中的那一行 |
+| `searchFilePathTextStyle` | 搜索分组的文件路径（保留 600 字重） |
+| `readLineTextStyle` | 读取卡里的代码 |
+
+**边界**：diff 块**不动** —— `+`/`-` 行仍按 `diffTextColor` 上语义色（成功/危险），上下文
+行本来就是 muted；这是用户唯一明确要保留的"内联格式"。web 块也没动：URL 与来源标题是
+`accent` 链接色，正文本来就是 muted。
+
+**验证**：`harness/style-check.cjs` 240/240（四条旧断言从 `foreground` 改成
+`foregroundMuted`，新增 `codeTextStyle` 与 `readLineTextStyle` 两条，diff 的语义色断言原样
+保留）；`npx tsc --noEmit` 干净；`harness/tool-call-check.cjs` 289/289（tokens 参与编译）。
+这是**有意偏离 DSH**，与第 30 条"标签用 muted"同源，已记进
+`docs/RENDER-PLAN.md` 的「刻意的偏离」。
+
 ---
 
 ## 已知限制（未修，有意为之）
