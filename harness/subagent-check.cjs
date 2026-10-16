@@ -249,6 +249,37 @@ async function openSession(conn, sessionId, history) {
     `ready#${readyIdx} child#${openedIdx}`,
   );
 
+  // ---- a child whose label arrives after its notice ----------------------
+  // Paseo shows a child whose title never arrived as "加载中…" forever, and a
+  // child has no configuration channel, so the title it opens with is the only
+  // one it can have. The durable label lives in the child's own descriptor.
+  const conn3b = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+  const conn3bEvents = [];
+  conn3b.onEvent((e) => conn3bEvents.push(e));
+  const rootL = `subL-${Date.now()}`;
+  process.env.DSH_FAKE_MODE = "label-late";
+  await conn3b.send({ type: "session.open", sessionId: rootL, config: { cwd: process.cwd(), mode: "build" }, history: "skip" });
+  const lateChild = await untilIn(
+    conn3bEvents,
+    (e) => e.type === "session.opened" && e.sessionId === scoped(rootL, "child-L"),
+    "child-L opened",
+    30000,
+  );
+  check(
+    "a label-less notice opens with the child's durable label as its title",
+    lateChild.title === "Late L",
+    `title=${JSON.stringify(lateChild.title)}`,
+  );
+  const lateOpens = conn3bEvents.filter((e) => e.type === "session.opened" && e.sessionId === scoped(rootL, "child-L"));
+  check("and it is opened exactly once", lateOpens.length === 1, `${lateOpens.length} open(s)`);
+  await untilIn(
+    conn3bEvents,
+    (e) => e.type === "timeline.item" && e.sessionId === scoped(rootL, "child-L") && e.item?.text === "late-label child answer",
+    "the held child's output",
+    30000,
+  );
+  check("its buffered output still arrives", true, "late-label child answer");
+
   // ---- grandchild reported before its parent, root already ready ---------
   const conn5 = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
   const conn5Events = [];

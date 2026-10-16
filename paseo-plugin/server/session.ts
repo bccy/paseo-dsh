@@ -49,6 +49,19 @@ export function modes(): ProviderMode[] {
 /** Bounded cap on child notices held until the root is ready or their parent appears. */
 const CHILD_BUFFER_LIMIT = 2000;
 
+/**
+ * Held events for one label-less child before it is opened without a title.
+ *
+ * Paseo renders a child whose title never arrived as "加载中…" forever: children
+ * have no configuration channel (`DshChildSession.configState` throws), so the
+ * title carried by the single `session.opened` is the only one they can ever
+ * have. A child's durable label lives in its own `subagent/descriptor`, so a
+ * notice that arrives without one is held until that descriptor lands — but
+ * only this long, because a provider that never sends one must still have its
+ * earliest output delivered rather than dropped.
+ */
+const CHILD_LABEL_WAIT_EVENTS = 40;
+
 export interface DshSessionOptions {
   sessionId: string;
   /**
@@ -79,6 +92,18 @@ export interface DshSessionOptions {
   subsession: boolean;
   emit(event: ProviderEvent): void;
   log(line: string): void;
+}
+
+/**
+ * The durable creation label of a `subagent/descriptor` event, when it has one.
+ *
+ * This is the same field the bridge reads to title a child; reading it here too
+ * is what lets a held notice open with a real title.
+ */
+function subagentLabel(data: unknown): string | undefined {
+  if (!isRecord(data)) return undefined;
+  const label = data.label;
+  return typeof label === "string" && label !== "" ? label : undefined;
 }
 
 function messageOf(error: unknown): string {
@@ -881,8 +906,13 @@ export class DshSession {
     if (this.#children.has(payload.sessionId)) return;
     // The parent edge may not exist yet: the root may still be opening, or a
     // nested child may precede its parent. Hold it (bounded) instead of dropping
-    // the child's earliest output.
-    if (!this.#rootReady || this.#parentScopedId(payload.parentSessionId) === undefined) {
+    // the child's earliest output. A notice with no label is held the same way,
+    // so the one title this child will ever have is its real one.
+    if (
+      !this.#rootReady ||
+      this.#parentScopedId(payload.parentSessionId) === undefined ||
+      (payload.label === undefined && !this.#labelWaitExceeded(payload.sessionId))
+    ) {
       this.#bufferOpened(payload);
       return;
     }
@@ -911,6 +941,26 @@ export class DshSession {
     if (this.#pendingOpened.some((held) => held.sessionId === payload.sessionId)) return;
     this.#trimChildBuffer();
     this.#pendingOpened.push(payload);
+  }
+
+  /** How many events are already waiting for one held child. */
+  #heldEventCount(nativeId: string): number {
+    let count = 0;
+    for (const item of this.#pendingChildEvents) if (item.sessionId === nativeId) count += 1;
+    return count;
+  }
+
+  /** Whether a label-less child has waited long enough to be opened without one. */
+  #labelWaitExceeded(nativeId: string): boolean {
+    return this.#heldEventCount(nativeId) >= CHILD_LABEL_WAIT_EVENTS;
+  }
+
+  /** Attach a late label to a held notice and try to open it. */
+  #completeHeldChild(nativeId: string, label: string): void {
+    const held = this.#pendingOpened.find((payload) => payload.sessionId === nativeId);
+    if (held === undefined) return;
+    held.label = label;
+    this.#flushPendingChildren();
   }
 
   #bufferChildEvent(item: { kind: "event"; sessionId: string; event: { type: string; [key: string]: unknown } } | { kind: "status"; sessionId: string; status: string }): void {
@@ -996,6 +1046,13 @@ export class DshSession {
         // never the parent timeline.
         this.#routeChildEvent(sid, payload.event);
         return;
+      }
+      // A held notice is waiting for this child's own durable label: the
+      // descriptor is where it lives, and it is the last chance to open the
+      // child with a real title rather than a permanent "加载中…".
+      if (this.#isPendingChild(sid) && payload.event.type === "subagent/descriptor") {
+        const label = subagentLabel(payload.event.data);
+        if (label !== undefined) this.#completeHeldChild(sid, label);
       }
       // A known child whose parent notice has not arrived yet (a grandchild can
       // precede its parent) keeps its earliest output buffered rather than

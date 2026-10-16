@@ -156,6 +156,23 @@ async function emitNested() {
   notify("session.event", { sessionId: "child-P", event: { type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "completed" } } } });
 }
 
+/**
+ * Report a child with no label, then let the child's own durable descriptor
+ * supply one.
+ *
+ * Paseo titles a child only from the single `session.opened` it accepts, and a
+ * child has no configuration channel, so a notice that arrives without a label
+ * used to open a row stuck on "加载中…" forever. The descriptor is where the
+ * durable label lives; the plugin has to hold the notice for it.
+ */
+async function emitLateLabel() {
+  notify("session.child-opened", { sessionId: "child-L", parentSessionId: rootId, mode: "one-shot", cwd: "/tmp" });
+  notify("session.event", { sessionId: "child-L", event: { type: "subagent/descriptor", seq: 1, data: { label: "Late L" } } });
+  notify("session.event", { sessionId: "child-L", event: { type: "assistant/message", seq: 2, data: { turn: 1, step: 1, message: { id: "cl1", content: [{ type: "text", text: "late-label child answer" }] } } } });
+  notify("session.event", { sessionId: "child-L", event: { type: "turn/end", seq: 3, data: { turn: 1, reason: { kind: "completed" } } } });
+  notify("session.status", { sessionId: "child-L", status: "idle" });
+}
+
 async function emitEarly() {
   notify("session.child-opened", { sessionId: "child-E", parentSessionId: rootId, mode: "continuable", label: "Early E", cwd: "/tmp" });
   notify("session.event", { sessionId: "child-E", event: { type: "assistant/message", seq: 1, data: { turn: 1, step: 1, message: { id: "em1", content: [{ type: "text", text: "early child answer" }] } } } });
@@ -243,6 +260,10 @@ async function handle(method, params, id) {
       if (MODE === "early" && !emitted) {
         emitted = true;
         setTimeout(() => { void emitEarly(); }, 0);
+      }
+      if (MODE === "label-late" && !emitted) {
+        emitted = true;
+        setTimeout(() => { void emitLateLabel(); }, 0);
       }
       // The steer scenario advertises one registered command so the command
       // branch (a `completed` result, never a turn) stays covered.

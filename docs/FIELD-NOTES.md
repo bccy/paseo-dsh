@@ -980,6 +980,40 @@ browser → `Globe`…）。
 **验证**：`harness/tool-call-check.cjs` 89/89，其中 MCP 部分断言了 `delete_heartbeat` →
 `删除心跳` + `HeartPulse`、browser 工具、以及两条兜底（未知 Paseo 工具、别的 server）。
 
+### 37. 子会话标题：为什么会出现「加载中…」
+
+用户在 App 的 **Subagent 面板**里看到同一个 subagent 出现两条：一条 `加载中…`、一条真标题，
+而且"打开加载中的是可以正常显示的"。
+
+**机制**（Paseo 侧）：面板由 daemon 的 `ProviderSubagentStore` 喂（`agent.provider_subagents.list`），
+条目按 `(parentAgentId, event.id)` 记账，`title` 是 **sticky** 的（`agent-manager.js` /
+`provider-subagents/store.js`）。**标题为空时 App 就渲染成 `加载中…`**（这个字符串在 App 自己
+的包里，Paseo 的 daemon dist 里搜不到）。
+
+**机制**（我们侧）：子会话的标题只能随**那一条** `session.opened` 发出——`DshChildSession` 的
+`configState()` 是直接抛错的（"subagent sessions have no configuration"），子会话**没有**配置
+通道，所以**发出去时没有标题，就永远不会有**。
+
+**两个确凿的洞**（都在代码里）：
+
+1. `dsh-bridge/lib/server.js` 的 `CHILD_BUFFER_CAP = 500`：一个子会话在被压住 500 帧后仍拿不到
+   label，就**无标题打开**。500 帧在一个回合内是很容易到的（子会话的每种事件都算一帧）。
+2. 更致命的是**晚到的 label 会被丢掉**：桥的 `openChild()` 有 `if (child.opened) return`，
+   插件的 `#openChildNow()` 对已存在的子会话直接 early return，两处都只在"尚未打开"时采纳
+   label。于是**一旦无标题打开，就永久是 `加载中…`**。
+
+**修法**：插件的 `#onChildOpened()` 现在把**没有 label 的通知先压住**（复用已有的
+`#pendingOpened` / `#bufferChildEvent` / `#flushPendingChildren` 机制），并在这个子会话自己的
+`subagent/descriptor` 事件（持久 label 就在那里）到达时补上 label 再打开——所以那条
+`session.opened` 带的是真标题。兜底仍在：某个子会话压了 `CHILD_LABEL_WAIT_EVENTS = 40` 个事件
+还没等到 label，就按老办法无标题打开，绝不丢输出。
+
+**验证**：`harness/subagent-check.cjs` **40/40**。假桥新增 `label-late` 模式（先发无 label 的
+`session.child-opened`，再由 `subagent/descriptor` 补 label），断言三条：**标题等于 `Late L`**、
+**只打开一次**、**压住的输出仍然到齐**。原有的 37 条（父子次序、held 子树、replay、error、
+steer）全部保持通过。实机侧另有 `harness/subagent-live.mjs`（4/4，一次 `child-opened`、
+label 正确、子会话有自己的时间线）。
+
 ---
 
 ## 已知限制（未修，有意为之）
