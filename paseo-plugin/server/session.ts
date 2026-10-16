@@ -618,6 +618,7 @@ export class DshSession {
         this.#emitPromptFailed(prompt.clientMessageId, error);
         return;
       }
+      if (prompt.clearPendingPermissions === true) this.#clearPendingPermissionsForSteer();
       this.#emitPromptAccepted(prompt.clientMessageId, prompt.delivery);
       return;
     }
@@ -625,7 +626,23 @@ export class DshSession {
     // Paseo and the bridge already agree on the text/image block shape, so the
     // blocks ride through untouched. They used to be collapsed to a text label,
     // which silently discarded every non-text attachment.
-    const blocks = prompt.input.content.map(toDshContent);
+    //
+    // The translation can fail: Paseo's `ProviderContent` is wider than DSH's
+    // block set (`uploaded_file`, `review`, `forge_*`, `github_*` all ride in on
+    // the same prompt, and only `image` is gated by a capability bit). A throw
+    // here used to escape `prompt()` entirely and land in the connection's
+    // fallback catch, which reports `session.runtime_failed` — terminal for the
+    // daemon: it rejects the pending prompt, drops the session and spawns a fresh
+    // `dsh` for the same native id, while the old process and this DshSession
+    // stayed behind. One unsupported block killed the conversation. A prompt that
+    // cannot be translated is a failed *prompt*, which is what this now says.
+    let blocks: Array<Record<string, unknown>>;
+    try {
+      blocks = prompt.input.content.map(toDshContent);
+    } catch (error) {
+      this.#emitPromptFailed(prompt.clientMessageId, error);
+      return;
+    }
     const label = blocks
       .map((block) => (block.type === "text" ? (block.text as string) : ""))
       .filter((text) => text !== "")
@@ -642,6 +659,7 @@ export class DshSession {
       return;
     }
 
+    if (prompt.clearPendingPermissions === true) this.#clearPendingPermissionsForSteer();
     this.#emitPromptAccepted(prompt.clientMessageId, prompt.delivery);
   }
 
@@ -860,6 +878,26 @@ export class DshSession {
     // card must resolve on the child, not the parent.
     this.#options.emit({ type: "session.permission_resolved", sessionId: entry.sessionId, permissionId });
     entry.resolve(response);
+  }
+
+  /**
+   * Answer every card this session is still blocked on, because the user typed a
+   * message instead of clicking one.
+   *
+   * Paseo's own adapters do exactly this when a steer carries
+   * `clearPendingPermissions` (`clearPendingPermissionsForSteer` in its Codex and
+   * pi agents): deny with one fixed sentence, since the user's message is the
+   * answer that follows. The daemon sends the flag on every steer; ignoring it
+   * left the request in the daemon's `pendingPermissions` map forever — the card
+   * stays pending in the UI and in `getPendingPermissions()`, which is also what
+   * an agent reload restores — while the promise held here never settled, so a
+   * later click answered a question nobody was waiting for.
+   */
+  #clearPendingPermissionsForSteer(): void {
+    const message = "The user answered with a message instead of approving. Their message follows.";
+    for (const permissionId of [...this.#pendingPermissions.keys()]) {
+      this.resolvePermission(permissionId, { behavior: "deny", message });
+    }
   }
 
   /**

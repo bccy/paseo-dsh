@@ -190,6 +190,72 @@ async function openSession(conn, sessionId, history) {
   const resolved = await until((e) => e.type === "session.permission_resolved" && e.permissionId === childPerm.request.id, "child permission resolved");
   check("a child's permission resolves on the child, not the parent", resolved.sessionId === childAScoped, resolved.sessionId);
 
+  // ---- a steer answers whatever the agent was blocked on ------------------
+  // The daemon sends `clearPendingPermissions` on every steer, because a typed
+  // message *is* the answer. Ignoring the flag (which is what happened) left the
+  // request in the daemon's own `pendingPermissions` map forever: the card stays
+  // pending in the UI and in `getPendingPermissions()`, and the promise the
+  // plugin is holding never settles, so a later click answers nobody.
+  const steerClears = "steer-clears-1";
+  await conn.send({
+    type: "session.prompt",
+    sessionId: rootA,
+    prompt: {
+      clientMessageId: steerClears,
+      delivery: "steer",
+      clearPendingPermissions: true,
+      input: { type: "message", content: [{ type: "text", text: "just take the first option" }] },
+    },
+  });
+  const clearedBySteer = await until(
+    (e) => e.type === "session.permission_resolved" && e.permissionId === rootPerm.request.id,
+    "root permission cleared by the steer",
+  );
+  check(
+    "a steer carrying clearPendingPermissions answers the card the agent was blocked on",
+    clearedBySteer.sessionId === rootA,
+    clearedBySteer.sessionId,
+  );
+
+  // ---- a block DSH has no counterpart for fails the *prompt* --------------
+  // Paseo's `ProviderContent` is wider than DSH's block set (`uploaded_file`,
+  // `review`, `forge_*`, `github_*` all ride in on the same prompt, and only
+  // `image` is capability-gated). A throw out of the translation used to escape
+  // `prompt()` entirely and surface as `session.runtime_failed`, which the daemon
+  // treats as terminal: it rejects the pending prompt, drops the session and
+  // spawns a fresh `dsh` for the same native id, while the old process and this
+  // DshSession stayed behind. One unsupported block ended the conversation.
+  const badBlock = "bad-block-1";
+  const beforeBadBlock = events.length;
+  await conn.send({
+    type: "session.prompt",
+    sessionId: rootA,
+    prompt: {
+      clientMessageId: badBlock,
+      input: {
+        type: "message",
+        content: [
+          { type: "text", text: "look at this" },
+          { type: "uploaded_file", mimeType: "application/pdf", data: "x" },
+        ],
+      },
+    },
+  });
+  const badResult = await until(
+    (e) => e.type === "session.prompt_result" && e.clientMessageId === badBlock,
+    "untranslatable prompt result",
+  );
+  check(
+    "a prompt block with no DSH counterpart fails the prompt, with the reason",
+    badResult.result?.type === "failed" &&
+      /unsupported prompt content type/.test(badResult.result?.error?.message ?? ""),
+    JSON.stringify(badResult.result),
+  );
+  check(
+    "and it never becomes session.runtime_failed (which would kill the session)",
+    !events.slice(beforeBadBlock).some((e) => e.type === "session.runtime_failed"),
+  );
+
   // ---- read-only surface -------------------------------------------------
   const childPromptId = "child-prompt-1";
   await conn.send({ type: "session.prompt", sessionId: childAScoped, prompt: { clientMessageId: childPromptId, input: { type: "message", content: [{ type: "text", text: "hi" }] } } });
