@@ -266,6 +266,68 @@ async function openSession(conn, sessionId, history) {
     "child-Z was announced",
   );
 
+  // ---- the archive round trip -------------------------------------------
+  // Paseo's archive action must land on DSH's native archive set. Two things
+  // were silently wrong before: a success emitted no reply (Paseo awaits one,
+  // so the click would hang), and the request was refused outright when no
+  // Paseo session was open — which is the state after archiving the last
+  // session, because Paseo closes that session's DSH process as part of
+  // archiving it. Both directions must now answer, and an id the registry
+  // refuses must fail loud.
+  const archHandle = events.find((e) => e.type === "session.opened" && e.sessionId === rootA)?.persistence;
+  check(
+    "session.opened carries the persistence handle archive addresses",
+    archHandle !== undefined && typeof archHandle.data?.sessionId === "string",
+    JSON.stringify(archHandle ?? null),
+  );
+
+  const isReply = (requestId) => (e) => e.requestId === requestId && (e.type === "request.completed" || e.type === "request.failed");
+
+  await conn.send({ type: "session.archive", requestId: "arch-live", persistence: archHandle });
+  const archLive = await until(isReply("arch-live"), "archive via an open session");
+  check("archive answers on an open session", archLive.type === "request.completed", JSON.stringify(archLive.error ?? archLive.type));
+
+  await conn.send({ type: "session.unarchive", requestId: "unarch-live", persistence: archHandle });
+  const unarchLive = await until(isReply("unarch-live"), "unarchive via an open session");
+  check("unarchive answers on an open session", unarchLive.type === "request.completed", JSON.stringify(unarchLive.error ?? unarchLive.type));
+
+  // A connection with nothing open has no process to borrow, so the plugin must
+  // stand a throwaway runtime up. This is the click that used to fail with
+  // "no DSH session is open".
+  const connArchive = await registration.connect({ capabilities: ["session.persistence"] });
+  const connArchiveEvents = [];
+  connArchive.onEvent((e) => connArchiveEvents.push(e));
+  const probeHandle = { version: 1, data: { sessionId: "child-A" } };
+
+  await connArchive.send({ type: "session.archive", requestId: "arch-probe", persistence: probeHandle });
+  const archProbe = await untilIn(connArchiveEvents, isReply("arch-probe"), "archive with no open session", 30000);
+  check(
+    "archive answers with no open session (throwaway runtime)",
+    archProbe.type === "request.completed",
+    JSON.stringify(archProbe.error ?? archProbe.type),
+  );
+
+  await connArchive.send({ type: "session.unarchive", requestId: "unarch-probe", persistence: probeHandle });
+  const unarchProbe = await untilIn(connArchiveEvents, isReply("unarch-probe"), "unarchive with no open session", 30000);
+  check(
+    "unarchive answers with no open session (throwaway runtime)",
+    unarchProbe.type === "request.completed",
+    JSON.stringify(unarchProbe.error ?? unarchProbe.type),
+  );
+
+  await connArchive.send({
+    type: "session.unarchive",
+    requestId: "unarch-unknown",
+    persistence: { version: 1, data: { sessionId: "unknown-session" } },
+  });
+  const unarchUnknown = await untilIn(connArchiveEvents, isReply("unarch-unknown"), "unknown handle", 30000);
+  check(
+    "an id the registry refuses fails loud, never reports success",
+    unarchUnknown.type === "request.failed" && /unknown-session/.test(unarchUnknown.error?.message ?? ""),
+    JSON.stringify(unarchUnknown.error ?? unarchUnknown.type),
+  );
+  await connArchive.close();
+
   // ---- a child whose label arrives after its notice ----------------------
   // Paseo shows a child whose title never arrived as "加载中…" forever, and a
   // child has no configuration channel, so the title it opens with is the only

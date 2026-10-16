@@ -278,6 +278,22 @@ async function handle(method, params, id) {
       return { available: false, presets: [], current: null, default: null };
     case "paseo/usage":
       return { available: false };
+    // DSH's native archive set. The plugin routes an archive request through an
+    // open session when it has one and through a throwaway probe when it does
+    // not; both paths must reach this method and both must fail loud on an id
+    // the registry refuses. An id prefixed `unknown-` is the refusal.
+    case "paseo/archive":
+    case "paseo/unarchive": {
+      const archiveSessionId = typeof params?.sessionId === "string" ? params.sessionId : "";
+      const verb = method === "paseo/archive" ? "archive" : "unarchive";
+      if (archiveSessionId === "" || archiveSessionId.startsWith("unknown-")) {
+        return {
+          available: false,
+          error: { message: `cannot ${verb} session '${archiveSessionId}': live sessions and session persistence hold no such session` },
+        };
+      }
+      return { available: true };
+    }
     case "paseo/subagents":
       if (MODE === "error") return { available: false, subagents: [], error: { message: "subagent catalog exploded" } };
       if (MODE !== "replay") return { available: true, subagents: [] };

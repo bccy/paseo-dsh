@@ -91,8 +91,13 @@ cd paseo-plugin && npx tsc --noEmit
   的段落、标签恒为 `思考`（都是 DSH 的行为，逐字移植在 `client/thinking-text.ts`）。
   **动了思考行显示必跑。**
 - `harness/subagent-check.cjs` 里另有归档用例：假桥的 replay 列表带一条 `archived: true` 的
-  子会话，断言它**不被重放播报**（归档重启后必须仍然成立）。**动了 `dsh-bridge/` 或
-  `replaySubagents()` 必跑。**
+  子会话，断言它**不被重放播报**（归档重启后必须仍然成立）；还断言归档往返本身——有打开的
+  会话时代为转发、**没有**打开的会话时经一次性 probe 仍能往返、以及 registry 拒绝的 id 必须
+  `request.failed`。**动了 `dsh-bridge/`、`replaySubagents()` 或 provider 的归档分支必跑。**
+  但假桥证明不了"真实 profile 里到底有没有 `workspaceRegistry`"：改过桥的 bundle patch 后，
+  一定要在真 `dsh --profile paseo` 上跑一次 `paseo/archive` → `paseo/unarchive` 往返
+  （`@deepseek-ai/dsh-workspace` 只在 web bundle 里，缺了就是"composes no workspace
+  registry"）。
 - `harness/sweep-check.cjs` — 原生扫光的几何：mask 曲线的停点、阶梯 alpha 的对称性与平铺、
   1.5s/0.3s/2-3 行程、`steps(48)`。**动了 `client/sweep-*.ts` 必跑。** iOS 上跑不了，这些
   数字就是"与 DSH 一致"的唯一凭据。

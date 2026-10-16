@@ -1066,6 +1066,50 @@ label 正确、子会话有自己的时间线）。
 的子会话，断言"已归档的子会话不被重放播报"）；`tsc --noEmit` 干净；其余离线套件
 89/29/19/25/17 全绿；内嵌桥按硬性约束重新生成。
 
+### 39. 归档（续）：第 38 条只验证了假桥，真机上两个洞都没堵上
+
+第 38 条交付后用户在真机复测：在 App 里归档 → 界面**报成功** → 打开还在；再次点「取消归档」
+则直接失败。daemon 日志把两个洞都摊开了：
+
+```
+Archiving agent 8b6d26de-...
+Failed to archive native session (best-effort)          # 归档：Paseo 吞掉了失败
+...
+cannot unarchive 6d0a20ce-...: no DSH session is open   # 取消归档：我们自己的报错
+```
+
+1. **`paseo` profile 根本没有 workspace registry**。`@deepseek-ai/dsh-workspace`（提供
+   `ctx.get('workspaceRegistry')`）只在 `dsh-web-app` bundle 里挂载；`dsh-base` 与桥的
+   bundle 都没有。于是 `applyArchived()` 每次都返回 `this DSH runtime composes no workspace
+   registry`，`listSessions` 的归档过滤和 `replaySubagents` 的归档跳过也全都读不到状态。
+   第 38 条的"归档链路生效"只被**假桥**证明过——假桥凭空应答 `available:true`，把真实运行
+   时缺服务这件事整个掩盖了。教训升级：**假桥不是协议层**，凡是"某能力是否真的存在"必须
+   在真 `dsh --profile paseo` 上跑一次。
+2. **归档一个没有打开的会话被硬拒**。provider 的 `#setArchived()` 只在 `#sessions`（已打开的
+   Paseo 会话）里找一个进程代为转发；而 Paseo 归档一个会话时会**先把这个会话的 DSH 进程
+   关掉**，所以"归档会话自身"这次操作必然走到"没有进程可借"，抛出 `no DSH session is open`。
+   取消归档同理。
+3. **成功路径不发回执**。`session.archive`/`session.unarchive` 成功时既不 `request.completed`
+   也不 `request.failed`；Paseo 的 `runtime.archive()` 等的是 `complete()` 的回复，所以真修好
+   服务之后，点击会一直悬着。之前从未走到过成功路径，这个洞才没暴露。
+
+**修法**：
+
+- 桥的 bundle patch 插入 `@deepseek-ai/dsh-workspace`（与 web bundle 同一行）。DSH 的归档集
+  于是成为真正的持久状态，导入过滤与子会话重放跳过也真正生效。
+- 没有已打开会话时，用**一次性 probe 进程**执行（与 catalog/sessions 探测同一套
+  `probeProcess`）。DSH 的归档集在 `$DSH_HOME/storages` 的全局域，`unarchiveSession` 不做
+  存在性检查，`archiveSession` 查的是全局 session persistence，所以 probe 在哪个 cwd 都能
+  代劳；被 registry 拒绝（未知会话、活跃会话、缺服务）依旧抛错，绝不报假成功。
+- 成功路径补 `request.completed`。
+
+**验证**：真机 `dsh --profile paseo`（补丁已写进 profile，**不带** `--patch`）跑归档往返：
+`archive -> {available:true}`，此时导入列表不含该会话；`unarchive -> {available:true}`，列表
+恢复。从无关 cwd（`/tmp`）起进程同样成立。`harness/subagent-check.cjs` **48/48**（新增 6 条：
+句柄可寻址、有会话时归档/取消归档都有回执、无会话时经 probe 仍能往返、未知 id 必须响亮失败）；
+`mcp-injection-check` 8/8、`steer-check` 17/17、`assistant-stream-check` 7/7；`tsc --noEmit`
+干净；内嵌桥已重生成。
+
 ---
 
 ## 已知限制（未修，有意为之）

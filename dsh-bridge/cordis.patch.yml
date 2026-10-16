@@ -26,3 +26,13 @@
 - insert:
     - id: tool-ask-user
       name: '@deepseek-ai/dsh-tool-ask-user'
+
+    # The Workspace registry owns DSH's native session archive set:
+    # `archiveSession` / `unarchiveSession` write `archivedSessionIds`. Paseo's
+    # archive action is translated onto it (the way Paseo's opencode adapter
+    # translates onto `setNativeSessionArchived`), and the import list plus the
+    # subagent replay read it to hide archived sessions — so the bridge must
+    # compose the same row the web bundle does. Without it every archive request
+    # failed with "this DSH runtime composes no workspace registry".
+    - id: workspace
+      name: '@deepseek-ai/dsh-workspace'

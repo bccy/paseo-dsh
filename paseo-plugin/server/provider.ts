@@ -96,14 +96,18 @@ interface DisplayCatalog {
   defaults: ProviderCatalog;
 }
 
-/** Read the runtime catalog through a short-lived process and cache it. */
-async function loadCatalog(cwd: string): Promise<DisplayCatalog> {
-  if (catalogCache !== undefined && catalogCache.cwd === cwd && Date.now() - catalogCache.at < CATALOG_TTL_MS) {
-    return catalogCache.value;
-  }
-  const probe = new DshProcess({
+/**
+ * A throwaway runtime used for reads and one-shot registry writes.
+ *
+ * It never sends `initialize`, so it creates no agent and no session log: it
+ * boots the profile's services, answers one request, and is killed. The archive
+ * set and the session store are global (a home-level storage domain and the
+ * session root), so a probe run in any directory sees them.
+ */
+function probeProcess(cwd: string, sessionId: string): DshProcess {
+  return new DshProcess({
     cwd,
-    sessionId: "catalog-probe",
+    sessionId,
     route: FALLBACK_ROUTE,
     initializeRoute: false,
     onEvent: () => {},
@@ -113,6 +117,14 @@ async function loadCatalog(cwd: string): Promise<DisplayCatalog> {
     onExit: () => {},
     onProtocolError: () => {},
   });
+}
+
+/** Read the runtime catalog through a short-lived process and cache it. */
+async function loadCatalog(cwd: string): Promise<DisplayCatalog> {
+  if (catalogCache !== undefined && catalogCache.cwd === cwd && Date.now() - catalogCache.at < CATALOG_TTL_MS) {
+    return catalogCache.value;
+  }
+  const probe = probeProcess(cwd, "catalog-probe");
   try {
     await probe.start();
     const raw: DshCatalog = await probe.catalog();
@@ -129,24 +141,37 @@ async function listDshSessions(
   cwd: string,
   options: { query?: string; limit?: number },
 ): Promise<Array<{ sessionId: string; cwd?: string; title?: string; createdAt?: number }>> {
-  const probe = new DshProcess({
-    cwd,
-    sessionId: "sessions-probe",
-    route: FALLBACK_ROUTE,
-    initializeRoute: false,
-    onEvent: () => {},
-    onStatus: () => {},
-    onQuestion: async () => ({ answers: [] }),
-    onLog: () => {},
-    onExit: () => {},
-    onProtocolError: () => {},
-  });
+  const probe = probeProcess(cwd, "sessions-probe");
   try {
     await probe.start();
     return await probe.sessions({
       ...(options.query === undefined ? {} : { query: options.query }),
       ...(options.limit === undefined ? {} : { limit: options.limit }),
     });
+  } finally {
+    probe.kill();
+  }
+}
+
+/**
+ * Apply one archive change through a throwaway runtime.
+ *
+ * This is the fallback for the archive Paseo performs on a session that is not
+ * open — including the session itself, whose DSH process Paseo closes as part
+ * of archiving it. Requiring a live process there meant the most common archive
+ * click could never be honoured. DSH's archive set is a global storage domain,
+ * and `unarchiveSession` needs no live session at all, so the probe can carry
+ * it; a refusal (unknown session, active session, absent registry) still
+ * throws, so a click that does nothing is never reported as success.
+ */
+async function applyArchivedStandalone(dshSessionId: string, archived: boolean): Promise<void> {
+  const probe = probeProcess(process.cwd(), "archive-probe");
+  try {
+    await probe.start();
+    const result = await probe.setArchived(dshSessionId, archived);
+    if (!result.available) {
+      throw new Error(result.error?.message ?? `${archived ? "archive" : "unarchive"} failed`);
+    }
   } finally {
     probe.kill();
   }
@@ -259,9 +284,16 @@ class DshConnection implements ProviderConnection {
       case "session.open":
         return this.#open(input);
       case "session.archive":
-        return this.#setArchived(input.persistence, true);
-      case "session.unarchive":
-        return this.#setArchived(input.persistence, false);
+      case "session.unarchive": {
+        const archived = input.type === "session.archive";
+        await this.#setArchived(input.persistence, archived);
+        // Paseo awaits `complete()` for this request and resolves it only on a
+        // request reply, so a silent success would hang the archive click
+        // forever. Failures are emitted by `send()`'s catch; this is the
+        // success half that makes the round trip observable at all.
+        this.#emit({ type: "request.completed", requestId: input.requestId });
+        return;
+      }
       case "session.prompt":
         return this.#require(input.sessionId).prompt(input.prompt);
       case "session.permission":
@@ -474,15 +506,22 @@ class DshConnection implements ProviderConnection {
         `cannot ${archived ? "archive" : "unarchive"}: the persistence handle names no DSH session`,
       );
     }
-    // DSH's registry is process-global, and a native child has no process of its
-    // own, so any open root can carry the request for it.
+    // DSH's registry is process-global, so a session that is already open can
+    // carry the request — which is what lets a native child, with no process of
+    // its own, be archived through its root. When nothing is open (the state
+    // after Paseo archived the last session), fall back to a throwaway runtime:
+    // the archive set lives in DSH's home, not in this process. A live session
+    // that refuses is not fatal either — a fresh runtime reads the same durable
+    // state without a stale process's missing services, so it gets the last word.
     for (const session of this.#sessions.values()) {
-      await session.archiveDshSession(dshSessionId, archived);
-      return;
+      try {
+        await session.archiveDshSession(dshSessionId, archived);
+        return;
+      } catch {
+        // Try the next open root, then the fresh runtime below.
+      }
     }
-    throw new Error(
-      `cannot ${archived ? "archive" : "unarchive"} ${dshSessionId}: no DSH session is open`,
-    );
+    await applyArchivedStandalone(dshSessionId, archived);
   }
 
   #require(sessionId: string): DshSession | DshChildSession {
