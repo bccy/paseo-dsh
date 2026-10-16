@@ -34,6 +34,7 @@ let buffer = "";
 const startedAt = Date.now();
 const deltas = [];
 let durable = null;
+let durableAt = -1;
 let turnCompleted = false;
 let failed = null;
 
@@ -72,6 +73,11 @@ function handleFrame(frame) {
         .filter((b) => b.type === "text")
         .map((b) => b.text ?? "")
         .join("");
+      // Stamped here, on arrival. Reading the clock at assertion time measured
+      // how long the *check* took — it waits for the turn to end and then sleeps
+      // 500 ms — so "the first delta arrived well before the durable message"
+      // held even when the durable message arrived first.
+      durableAt = Date.now() - startedAt;
       console.log(`  ${at()}s  DURABLE assistant/message (${durable.length} chars)`);
       return;
     }
@@ -181,7 +187,6 @@ try {
   const texts = deltas.map((d) => d.text);
   const nonDecreasing = texts.every((t, i) => i === 0 || t.startsWith(texts[i - 1]));
   const firstAt = deltas[0]?.at ?? -1;
-  const durableAt = durable === null ? -1 : Date.now() - startedAt;
 
   console.log("");
   check(

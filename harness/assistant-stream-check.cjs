@@ -154,6 +154,12 @@ function projectLikePaseo(emitted, turnId) {
   // least two real growth steps.
   const assistant = items("assistant_message", "assistant:1:1");
   const assistantTexts = assistant.map((i) => i.text);
+  // Every assistant item in the session, not just the ones under the id we
+  // expect. Filtering by id is exactly what hid a durable message that opened a
+  // second one: the audit renamed the durable id to `assistant:1:1:durable` and
+  // this file still reported 7/7, even though the user would see the answer
+  // twice — the regression the header says it exists to catch.
+  const assistantIds = [...new Set(items("assistant_message").map((i) => i.id))];
   check(
     "one step emits several growing assistant snapshots (not one lump)",
     assistant.length >= 2 && nonDecreasingByPrefix(assistantTexts) && growthSteps(assistantTexts) >= 2,
@@ -170,8 +176,8 @@ function projectLikePaseo(emitted, turnId) {
   // ---- 3. the durable settlement extends the same id, no second copy ------
   check(
     "durable assistant/message lands on the same id and only extends it",
-    assistant.length >= 2 && assistant[assistant.length - 1].text === "Hello world",
-    assistant.length ? `final=${JSON.stringify(assistant[assistant.length - 1].text)}` : "(none)",
+    assistantIds.length === 1 && assistant.length >= 2 && assistant[assistant.length - 1].text === "Hello world",
+    `ids=${assistantIds.join(", ") || "(none)"} final=${JSON.stringify(assistant[assistant.length - 1]?.text ?? null)}`,
   );
 
   // ---- 4. reasoning streams under its own stable id ----------------------
@@ -186,12 +192,14 @@ function projectLikePaseo(emitted, turnId) {
   // This is the invariant the whole feature exists for: a user must see one
   // growing message, not N little messages. The plugin cannot assert this alone
   // (Paseo does the folding), so replay Paseo's two rules over what was emitted.
+  // Every assistant/reasoning item, whatever id it carried: whitelisting the two
+  // expected ids kept a second one out of the projection, so the fold looked
+  // clean while the user saw the answer twice.
   const emitted = events
     .filter(
       (e) =>
         e.type === "timeline.item" &&
-        (e.item?.type === "assistant_message" || e.item?.type === "reasoning") &&
-        (e.item.id === "assistant:1:1" || e.item.id === "reasoning:1:1"),
+        (e.item?.type === "assistant_message" || e.item?.type === "reasoning"),
     )
     .map((e) => e.item);
   const projected = projectLikePaseo(emitted, "turn:1");
