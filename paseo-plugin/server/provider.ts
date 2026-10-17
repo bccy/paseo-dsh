@@ -407,11 +407,29 @@ class DshConnection implements ProviderConnection {
    * process, and a reply racing that restart would surface as a failed rewind.
    */
   #refreshAgent(sessionId: string): void {
+    const binary = process.env.PASEO_BIN ?? "paseo";
     const timer = setTimeout(() => {
       try {
-        const child = spawn("paseo", ["agent", "reload", sessionId], {
+        const child = spawn(binary, ["agent", "reload", sessionId], {
           detached: true,
-          stdio: "ignore",
+          stdio: ["ignore", "ignore", "pipe"],
+        });
+        // `spawn` reports a missing binary as an event, not a throw: without this
+        // listener the refresh failed silently and the rewind looked applied only
+        // to the conversation (that cost a whole debug round).
+        child.on("error", (error) => {
+          process.stderr.write(`[${PROVIDER_ID}] agent reload spawn failed (${binary}): ${messageOf(error)}\n`);
+        });
+        let stderrText = "";
+        child.stderr?.setEncoding("utf8");
+        child.stderr?.on("data", (chunk: string) => {
+          stderrText += chunk;
+        });
+        child.on("exit", (code) => {
+          const trimmed = stderrText.trim();
+          process.stderr.write(
+            `[${PROVIDER_ID}] agent reload ${sessionId} exited ${String(code)}${trimmed === "" ? "" : `: ${trimmed.slice(0, 400)}`}\n`,
+          );
         });
         child.unref();
       } catch (error) {
