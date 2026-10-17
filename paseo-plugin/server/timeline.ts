@@ -15,12 +15,16 @@ import type { JsonValue } from "./dsh-process";
 import { LOCALE, UI } from "./locale";
 
 /**
- * Command names `dsh-rewind` registers for the rewind button.
+ * Commands this provider runs on the user's behalf, whose rows are dropped.
  *
- * The provider runs them itself; the user never types them, so their rows are
- * dropped from the timeline (see `#commandDone`).
+ * `rewind`/`undo` are `dsh-rewind`'s names for the rewind button; `permission`
+ * is how a session applies its preset on open and when Paseo switches it. The
+ * user never types any of them, so a row would be the only trace of an
+ * implementation detail (and, after a reload, it reappeared at the top of the
+ * conversation). Their effects are visible elsewhere — the conversation is gone
+ * and the preset is shown in the session header.
  */
-const REWIND_COMMAND_NAMES = new Set(["rewind", "undo"]);
+const PROVIDER_COMMAND_NAMES = new Set(["rewind", "undo", "permission"]);
 
 
 interface DshEvent {
@@ -1014,7 +1018,7 @@ export class TimelineBuilder {
     // only trace of an implementation detail the user never typed. Drop the
     // successful one; a failed rewind keeps its row because Paseo's marker has no
     // failure state and the row is where the error can be read.
-    if (!failed && REWIND_COMMAND_NAMES.has(name)) return [];
+    if (!failed && PROVIDER_COMMAND_NAMES.has(name)) return [];
     const line = `/${name}`;
     return this.#put({
       type: "tool_call",
