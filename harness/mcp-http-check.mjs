@@ -19,7 +19,7 @@
  * Usage: node harness/mcp-http-check.mjs
  */
 import { createServer } from 'node:http';
-import { McpHttpClient, isEventStream, mcpRequest, parseSseFrames, pickResult } from '../dsh-bridge/lib/mcp-http.js';
+import { McpHttpClient, browserHostGapOf, isEventStream, mcpRequest, parseSseFrames, pickResult, unavailableBrowserTools } from '../dsh-bridge/lib/mcp-http.js';
 
 const results = [];
 const check = (name, pass, detail) => results.push({ name, pass, detail });
@@ -127,6 +127,57 @@ try {
     'pickResult refuses a missing id',
     (() => { try { pickResult([{ jsonrpc: '2.0', method: 'notifications/progress' }], 9); return false; } catch { return true; } })(),
     'notifications must never be mistaken for the reply',
+  );
+
+  // ── browser-host labelling (the gateway probes before promising browser tools) ──
+  const catalog = [
+    { name: 'browser_click' },
+    { name: 'browser_screenshot' },
+    { name: 'list_agents' },
+    { name: 'create_heartbeat' },
+  ];
+  // Paseo answers "no host" as an ordinary tool result, not a JSON-RPC error.
+  const noHostResult = {
+    content: [{ type: 'text', text: 'No browser automation host is connected.' }],
+    structuredContent: { ok: false, error: { code: 'browser_no_host', message: 'No browser automation host is connected.', retryable: true } },
+  };
+  const gap = browserHostGapOf(noHostResult);
+  check(
+    'a no-host probe result is recognised from its structured error code',
+    gap === 'No browser automation host is connected.',
+    String(gap),
+  );
+  check(
+    'an unreachable browser host marks every browser tool unavailable',
+    JSON.stringify(unavailableBrowserTools(catalog, gap)) === JSON.stringify(['browser_click', 'browser_screenshot']),
+    JSON.stringify(unavailableBrowserTools(catalog, gap)),
+  );
+  check(
+    'the no-host text alone is enough for an older host',
+    browserHostGapOf({ content: [{ type: 'text', text: 'No browser automation host is connected.' }] }) !== undefined,
+    'structuredContent is not required',
+  );
+  check(
+    'a reachable host (tab list) marks nothing',
+    browserHostGapOf({ content: [{ type: 'text', text: 'Found 1 Paseo browser tab.' }], structuredContent: { ok: true } }) === undefined &&
+      unavailableBrowserTools(catalog, undefined).length === 0,
+    'normal listing or no probe leaves tools unlabelled',
+  );
+  check(
+    'an unrelated probe failure marks nothing',
+    browserHostGapOf(new Error('mcp: browser_list_tabs timed out after 60000ms')) === undefined &&
+      browserHostGapOf({ content: [{ type: 'text', text: 'some other tool failure' }] }) === undefined,
+    'a timeout must not be reported as "no host"',
+  );
+  check(
+    'a catalog without browser tools marks nothing',
+    unavailableBrowserTools([{ name: 'list_agents' }], gap).length === 0,
+    'non-browser servers are unaffected',
+  );
+  check(
+    'a non-array catalog is tolerated',
+    unavailableBrowserTools(undefined, gap).length === 0 && unavailableBrowserTools('nope', gap).length === 0,
+    'defensive for untyped JSON-RPC input',
   );
 
   // ── one round trip ─────────────────────────────────────────────────────────

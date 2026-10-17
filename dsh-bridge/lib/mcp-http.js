@@ -133,6 +133,53 @@ export async function mcpRequest({
 }
 
 /**
+ * Whether a probe of Paseo's browser tools reported that no desktop browser host
+ * is attached.
+ *
+ * Paseo answers the probe as an ordinary tool result, not a JSON-RPC error, and
+ * marks it in two places: `structuredContent.error.code === "browser_no_host"`
+ * and the one-line text "No browser automation host is connected.". Both are
+ * accepted (the code is authoritative; the text survives older hosts), and a
+ * probe that failed for any other reason — timeout, transport — returns
+ * undefined so a transient failure never hides a capability.
+ *
+ * @param outcome - The probe's tool result, or the error it rejected with.
+ * @returns The host-gap message when the probe says no host is attached.
+ */
+export function browserHostGapOf(outcome) {
+  if (outcome === undefined || outcome === null) return undefined;
+  if (outcome instanceof Error) {
+    return /browser automation host/i.test(outcome.message) ? outcome.message : undefined;
+  }
+  const result = outcome;
+  const structured = result?.structuredContent;
+  if (structured?.error?.code === 'browser_no_host') {
+    return typeof structured.error.message === 'string' ? structured.error.message : 'no browser automation host';
+  }
+  const content = Array.isArray(result?.content) ? result.content : [];
+  for (const block of content) {
+    if (block?.type === 'text' && typeof block.text === 'string' && /browser automation host/i.test(block.text)) return block.text;
+  }
+  return undefined;
+}
+
+/**
+ * Browser tools whose execution needs a connected desktop browser host.
+ *
+ * Paseo registers its browser tools in the MCP catalog unconditionally — the
+ * broker that knows whether a host is attached is not consulted when the catalog
+ * is built — so a listing can offer tools that cannot run right now. The gateway
+ * probes once and labels them instead of hiding them: the capability is real,
+ * only its reachability is missing, and the next listing re-probes.
+ */
+export function unavailableBrowserTools(tools, hostGap) {
+  if (hostGap === undefined) return [];
+  return (Array.isArray(tools) ? tools : [])
+    .map((tool) => (tool !== null && typeof tool === 'object' ? tool.name : undefined))
+    .filter((name) => typeof name === 'string' && name.startsWith('browser_'));
+}
+
+/**
  * One MCP server connection: initialize once, then list and call tools.
  *
  * `tools/list` is fetched per call unless `cacheTools` is set, because a browser

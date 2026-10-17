@@ -23,7 +23,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Schema from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { DEFAULT_MCP_TIMEOUT_MS, McpHttpClient } from './mcp-http.js';
+import { DEFAULT_MCP_TIMEOUT_MS, McpHttpClient, browserHostGapOf, unavailableBrowserTools } from './mcp-http.js';
 
 /** Stable Cordis plugin name. */
 export const name = 'paseo-mcp-gateway';
@@ -153,16 +153,40 @@ export function apply(ctx, config = {}) {
               },
             },
           },
+          unavailable: {
+            type: 'array',
+            required: true,
+            description: 'Browser tools that cannot run until a desktop browser host connects.',
+            items: { type: 'string' },
+          },
         },
       },
       render: (_args, value) => [{
         type: 'text',
-        text: `${value.server}: ${value.total} tool(s)\n${value.tools.map((tool) => `- ${tool.name}: ${tool.description}`).join('\n')}`,
+        text: `${value.server}: ${value.total} tool(s)\n${value.tools.map((tool) => `- ${tool.name}: ${tool.description}`).join('\n')}`
+          + (value.unavailable.length === 0
+            ? ''
+            : `\n\n[unavailable] ${value.unavailable.length} browser tool(s) need a connected desktop browser host: ${value.unavailable.join(', ')}`),
       }],
     },
     async execute(args) {
       const server = serverFor(args.server);
-      const all = await clientFor(server).listTools();
+      const client = clientFor(server);
+      const all = await client.listTools();
+      // Browser tools are registered whether or not a host is attached, so prove
+      // the host before promising them: an unreachable listing is cheap to learn
+      // here and expensive to discover as a failed model turn. Paseo answers the
+      // probe as an ordinary result (`browser_no_host`) rather than a JSON-RPC
+      // error, so both shapes go through `browserHostGapOf`.
+      let hostGap;
+      if (all.some((tool) => typeof tool?.name === 'string' && tool.name.startsWith('browser_'))) {
+        try {
+          hostGap = browserHostGapOf(await client.callTool('browser_list_tabs', {}));
+        } catch (error) {
+          hostGap = browserHostGapOf(error);
+        }
+      }
+      const unavailable = unavailableBrowserTools(all, hostGap);
       const query = String(args.query ?? '').trim().toLowerCase();
       const matched = query === ''
         ? all
@@ -174,6 +198,7 @@ export function apply(ctx, config = {}) {
           name: tool.name,
           description: String(tool.description ?? '').replace(/\s+/g, ' ').slice(0, DESCRIPTION_LIMIT),
         })),
+        unavailable,
       };
     },
   }));
