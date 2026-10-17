@@ -572,43 +572,67 @@ export class PaseoHarnessServer {
     if (llm === undefined) {
       return { providers: [], models: [], planMode: this.ctx.get('planMode') !== undefined };
     }
-    const providers = llm.listProviders().map((entry) => ({ id: entry.id, name: entry.name }));
-    const models = [];
-    // A provider with no credential, or a model with no resolved capability
-    // record, reports nothing; it must not take the whole catalog down.
-    for (const provider of providers) {
+    // DSH 0.2.1 materializes a provider's model catalog asynchronously after a
+    // route resolves. The Paseo catalog probe deliberately skips `initialize`
+    // (it must not pin a route), so warm the profile's default and then poll
+    // briefly while the adapters finish registering their models.
+    const warm = this.profileDefault();
+    if (warm !== undefined) {
       try {
-        for (const model of await llm.listModels(provider.id)) {
-          let reasoning;
-          try {
-            const info = await llm.resolveModelInfo(provider.id, model.id);
-            if (info?.reasoning !== undefined) {
-              reasoning = {
-                ...(info.reasoning.defaultEffort === undefined
-                  ? {}
-                  : { defaultEffort: String(info.reasoning.defaultEffort) }),
-                efforts: (info.reasoning.efforts ?? []).map((effort) => ({
-                  id: String(effort.id),
-                  name: effort.name,
-                  ...(effort.description === undefined ? {} : { description: effort.description }),
-                })),
-              };
-            }
-          } catch {
-            /* model declares no reasoning control */
-          }
-          models.push({
-            provider: model.provider,
-            id: model.id,
-            name: model.name,
-            ...(model.description === undefined ? {} : { description: model.description }),
-            ...(reasoning === undefined ? {} : { reasoning }),
-          });
-        }
+        await llm.resolveCallConfig({ provider: warm.provider, model: warm.model });
       } catch {
-        /* provider advertises no usable catalog */
+        /* best-effort: an unresolvable default may still leave other routes */
       }
     }
+
+    const collect = async () => {
+      const providers = llm.listProviders().map((entry) => ({ id: entry.id, name: entry.name }));
+      const models = [];
+      // A provider with no credential, or a model with no resolved capability
+      // record, reports nothing; it must not take the whole catalog down.
+      for (const provider of providers) {
+        try {
+          for (const model of await llm.listModels(provider.id)) {
+            let reasoning;
+            try {
+              const info = await llm.resolveModelInfo(provider.id, model.id);
+              if (info?.reasoning !== undefined) {
+                reasoning = {
+                  ...(info.reasoning.defaultEffort === undefined
+                    ? {}
+                    : { defaultEffort: String(info.reasoning.defaultEffort) }),
+                  efforts: (info.reasoning.efforts ?? []).map((effort) => ({
+                    id: String(effort.id),
+                    name: effort.name,
+                    ...(effort.description === undefined ? {} : { description: effort.description }),
+                  })),
+                };
+              }
+            } catch {
+              /* model declares no reasoning control */
+            }
+            models.push({
+              provider: model.provider,
+              id: model.id,
+              name: model.name,
+              ...(model.description === undefined ? {} : { description: model.description }),
+              ...(reasoning === undefined ? {} : { reasoning }),
+            });
+          }
+        } catch {
+          /* provider advertises no usable catalog yet */
+        }
+      }
+      return { providers, models };
+    };
+
+    let { providers, models } = await collect();
+    const deadline = Date.now() + 3000;
+    while (models.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      ({ providers, models } = await collect());
+    }
+
     // A catalog read happens before any session pins a route, so the profile's
     // configured default is the honest answer.
     let defaultProvider = this.provider;

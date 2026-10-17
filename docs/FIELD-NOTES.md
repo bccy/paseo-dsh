@@ -265,9 +265,14 @@ unknown prompt variable "{{cwd}}" in section "deployment:persona-suffix"; regist
 模型的工作目录由运行时上下文/工具侧提供，不靠这个变量。删掉后对 `0.2.0` 也无害（只是少一句
 cwd 提示）。
 
+**同一版本还有第二个坑**：`0.2.1` 的模型目录是**异步物化**的。Paseo 的 catalog 探测**故意不
+`initialize`**（避免钉住路由），于是启动瞬间读到的 `models` 恒为 0 —— 表现是 **provider 可用、
+但模型选择器里一个模型都没有**。修法：catalog 里先用 profile 默认路由做一次
+`resolveCallConfig` warm-up，再对空结果做**有界重试**（~3s），等适配器注册完。
+
 > **教训**：**升级上游运行时属于"重载之外的第二条隐藏路径"**。它不会改你的代码，却会因为
-> 提示词变量、插件 schema、服务名这类"软契约"让每个回合静默失败。升版后必须重跑
-> `plugin-check`，而不是只看 `doctor`（`doctor` 只查安装完整性，查不出回合层失败）。
+> 提示词变量、插件 schema、服务名、异步就绪时机这类"软契约"让功能静默失效。升版后必须重跑
+> `plugin-check`，而不是只看 `doctor`（`doctor` 只查安装完整性，查不出回合层失败和空目录）。
 
 ---
 

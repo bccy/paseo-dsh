@@ -102,6 +102,17 @@ const check = (name, pass, detail) => {
     `capabilities=[${(conn.capabilities ?? []).join(", ")}]`,
   );
 
+  // The catalog must list models even though the probe skips `initialize`:
+  // DSH 0.2.1 materializes model catalogs asynchronously, so a bare read used
+  // to return zero and Paseo's model picker was empty.
+  await conn.send({ type: "catalog", requestId: "cat-early" });
+  const catalogEvent = await until((e) => e.type === "catalog" && e.requestId === "cat-early", "catalog");
+  check(
+    "catalog lists models without initialize (0.2.1 readiness)",
+    Array.isArray(catalogEvent.catalog?.models) && catalogEvent.catalog.models.length > 0,
+    `${catalogEvent.catalog?.models?.length ?? 0} model(s)`,
+  );
+
   await conn.send({
     type: "session.open",
     sessionId: `check-${Date.now()}`,
