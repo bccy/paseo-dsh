@@ -17,13 +17,16 @@
  * @module dsh-paseo-bridge/server
  */
 import { execFileSync } from 'node:child_process';
-import { resolve } from 'node:path';
+import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { brandString } from '@deepseek-ai/dsh-brand';
 import { BlockAssembler, createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { admitEncodedImages } from '@deepseek-ai/dsh-attachment';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import { underArchivedSession } from './archived-lineage.js';
-import { dirtyWorkspaceError, restoresFiles, revertOrdinal } from './revert.js';
+import { dirtyWorkspaceError, restoresFiles, revertOrdinal, tokenMessageId } from './revert.js';
+import { ledgerLine, restore, snapshot, snapshotFor, worktreeState as gitWorktreeState } from './git-snapshot.js';
 import { visibleEvents } from './surface.js';
 import { historyEvents, withImageHostPaths } from './image-host-path.js';
 import { promptSource } from './paseo-system-envelope.js';
@@ -526,6 +529,10 @@ export class PaseoHarnessServer {
     // A steer belongs inside the turn already running; a plain prompt starts the
     // next one. Without this distinction an interjection queues behind the very
     // turn it was meant to correct.
+    // Record the worktree this message could be rewound to. Best effort: a
+    // non-git cwd or a git failure must never block the prompt — the rewind then
+    // refuses to restore files instead of guessing.
+    this.recordSnapshot(rec.handle.agent.session, String(message.id));
     if (params.delivery === 'steer') rec.handle.agent.steer(message);
     else rec.handle.agent.followup(message);
     return { messageId: String(message.id) };
@@ -1029,6 +1036,35 @@ export class PaseoHarnessServer {
    * than reverting half of it: leaving the conversation ahead of the files is
    * exactly the inconsistency this feature exists to fix.
    */
+  /** Ledger path for one session's file snapshots. */
+  ledgerPath(session) {
+    const dir = join(homedir(), '.dsh', 'rewind-ledger');
+    mkdirSync(dir, { recursive: true });
+    return join(dir, `${String(session.id)}.jsonl`);
+  }
+
+  /**
+   * Append one worktree snapshot for a user message.
+   *
+   * A rewind restores the snapshot of the withdrawn message — the tree as it was
+   * just before that message was sent. Never throws: the prompt is the hot path,
+   * and a missing snapshot only narrows what a rewind may do.
+   */
+  recordSnapshot(session, messageId) {
+    const cwd = session.header?.cwd ?? this.cwd;
+    try {
+      if (!gitWorktreeState(cwd).repo) return;
+      const snap = snapshot(cwd);
+      appendFileSync(
+        this.ledgerPath(session),
+        ledgerLine({ seq: 0, messageId, head: snap.head, stash: snap.stash }),
+        'utf8',
+      );
+    } catch (error) {
+      process.stderr.write(`[bridge] recording a rewind snapshot: ${String(error?.message ?? error)}\n`);
+    }
+  }
+
   async revert(params) {
     const rec = this.requireSession(params.sessionId);
     const agent = rec.handle.agent;
@@ -1043,10 +1079,20 @@ export class PaseoHarnessServer {
         throw new Error('该工作区不是 git 仓库，无法回退文件；请改用「只回退对话」。');
       }
       if (worktree.dirty.length > 0) throw new Error(dirtyWorkspaceError(worktree.dirty));
-      // The snapshot ledger is wired in the next stage; until it is, refusing is
-      // the only honest answer — a silent half rollback would drop the files while
-      // claiming success.
-      throw new Error('文件回退正在实现中：请先选择「只回退对话」。');
+      const messageId = tokenMessageId(params.token);
+      if (messageId === undefined) throw new Error('这条消息没有撤回令牌，无法回退文件');
+      let ledger = '';
+      try {
+        ledger = readFileSync(this.ledgerPath(session), 'utf8');
+      } catch {
+        ledger = '';
+      }
+      const snap = snapshotFor(ledger, messageId);
+      if (snap === undefined) {
+        // Refusing beats guessing: restoring the wrong commit would lose work.
+        throw new Error('这条消息没有文件快照，无法回退文件；请改用「只回退对话」。');
+      }
+      restore(cwd, snap);
     }
     const nodes = session.surface.nodes;
     const endSeq = nodes[nodes.length - 1];
