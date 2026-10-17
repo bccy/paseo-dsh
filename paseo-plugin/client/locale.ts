@@ -109,6 +109,7 @@ const TEXT: Record<Locale, UiText> = {
       ask_user_question: "Ask question",
       exit_plan_mode: "Plan",
       subagent: "Create subagent",
+      subagent_fork: "Fork a subagent",
       // DSH's own tools. Its UI titles these through `tool.title.*`; a row that
       // fell through to the wire name + wrench was indistinguishable from an
       // MCP call, which is a different thing entirely.
@@ -168,6 +169,9 @@ const TEXT: Record<Locale, UiText> = {
       list_mcp_resources: "List MCP resources",
       read_mcp_resource: "Read MCP resource",
       list_mcp_resource_templates: "List MCP resource templates",
+      mcp_list_tools: "List MCP tools",
+      mcp_tool_schema: "Show MCP tool schema",
+      mcp_call_tool: "Call MCP tool",
     },
     paseoMcpLabels: {
       speak: "Speak",
@@ -216,8 +220,12 @@ const TEXT: Record<Locale, UiText> = {
       browser_snapshot: "Read page structure",
       browser_screenshot: "Screenshot the page",
       browser_navigate: "Open a URL",
+      browser_back: "Browser back",
+      browser_forward: "Browser forward",
+      browser_reload: "Browser reload",
       browser_click: "Click a page element",
       browser_fill: "Fill a page element",
+      browser_hover: "Hover browser element",
       browser_type: "Type text",
       browser_keypress: "Send a key",
       browser_select: "Select a dropdown option",
@@ -260,6 +268,7 @@ const TEXT: Record<Locale, UiText> = {
       ask_user_question: "提问",
       exit_plan_mode: "计划",
       subagent: "创建子智能体",
+      subagent_fork: "派生子智能体分支",
       // DSH 的 `tool.title.code`（`run_code` 是 PTC 传输，变体是 `code`）。
       run_code: "代码",
       create_goal: "创建目标",
@@ -310,6 +319,9 @@ const TEXT: Record<Locale, UiText> = {
       list_mcp_resources: "列出 MCP 资源",
       read_mcp_resource: "读取 MCP 资源",
       list_mcp_resource_templates: "列出 MCP 资源模板",
+      mcp_list_tools: "列出 MCP 工具",
+      mcp_tool_schema: "查看 MCP 工具参数",
+      mcp_call_tool: "调用 MCP 工具",
     },
     paseoMcpLabels: {
       speak: "朗读",
@@ -358,8 +370,12 @@ const TEXT: Record<Locale, UiText> = {
       browser_snapshot: "读取页面结构",
       browser_screenshot: "页面截图",
       browser_navigate: "打开网址",
+      browser_back: "浏览器后退",
+      browser_forward: "浏览器前进",
+      browser_reload: "刷新浏览器页面",
       browser_click: "点击页面元素",
       browser_fill: "填写页面元素",
+      browser_hover: "悬停页面元素",
       browser_type: "输入文本",
       browser_keypress: "发送按键",
       browser_select: "选择下拉项",

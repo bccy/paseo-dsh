@@ -120,6 +120,16 @@ export interface ToolCallData {
   label: string;
   /** Lucide icon name, chosen to match Paseo's own tool-call icon. */
   icon: string;
+  /**
+   * Draw Paseo's own mark instead of the Lucide glyph.
+   *
+   * True only for a Paseo-owned tool we have **no** specific glyph for — one that
+   * would otherwise come out as the generic wrench. Paseo's own UI gives every
+   * one of its tools a single mark (`isPaseoToolName` → `paseo` in
+   * `resolveToolCallIconName`); this row prefers a specific glyph where we have
+   * one and falls back to the mark rather than to a wrench.
+   */
+  paseoMark: boolean;
   status: "running" | "completed" | "failed" | "canceled";
   phase: "streaming" | "complete";
   /** The row's one-line label: the tool's description when it has one. */
@@ -751,6 +761,10 @@ const TOOL_NAME_ICONS: Record<string, string> = {
   ask_user_question: "MessageCircleQuestion",
   exit_plan_mode: "ClipboardCheck",
   subagent: "Bot",
+  // A fork, not a spawn: the child inherits this conversation. DSH names the tool
+  // itself in `standard.patch.yml` (`provider: fork`, `toolName: subagent_fork`)
+  // and ships no row title for it, so the label below is ours.
+  subagent_fork: "GitFork",
   list_agents: "Bot",
   send_message: "Bot",
   interrupt_agent: "Bot",
@@ -804,6 +818,11 @@ const TOOL_NAME_ICONS: Record<string, string> = {
   list_mcp_resources: "Server",
   read_mcp_resource: "FileText",
   list_mcp_resource_templates: "Server",
+  // The bridge's own MCP gateway (`dsh-bridge/lib/mcp-gateway.js`): list what a
+  // server exposes, read one tool's schema, then proxy a call to it.
+  mcp_list_tools: "Server",
+  mcp_tool_schema: "FileJson",
+  mcp_call_tool: "Play",
   // `present` is DSH's deliverable row (`dsh-client-ui-deliverables` registers a
   // keyed toolview for it, titled 交付文件 / "Present files"). Its own glyph is
   // `IconDeliverDocRegular` — a document over two perspective planes — which has
@@ -943,8 +962,6 @@ function stringifyValue(value: unknown, pretty = false): string {
  * thing about it a reader cannot use. A name we do not know still falls back to
  * the wire name, so a tool added upstream shows up rather than disappearing.
  */
-const PASEO_MCP_PREFIX = "mcp__paseo__";
-
 /** The same tools by icon. */
 const PASEO_MCP_ICONS: Record<string, string> = {
   speak: "Volume2",
@@ -1007,12 +1024,41 @@ const PASEO_MCP_ICONS: Record<string, string> = {
   browser_evaluate: "Globe",
 };
 
-/** The bare Paseo tool name behind an MCP wire name, or undefined. */
+/**
+ * The bare Paseo tool name behind a wire name, or undefined.
+ *
+ * Mirrors Paseo's own `getPaseoToolLeafName` (it ships in the daemon's web UI
+ * bundle, `tools/tool-call-icons`): a Paseo tool arrives three ways —
+ * `mcp__paseo__<tool>`, `mcp__paseo_<server>__<tool>`, and the dotted
+ * `paseo.<tool>` / `paseo_<server>.<tool>`. Keying only on the first spelling,
+ * which is what this used to do, missed the other two and drew a wrench.
+ */
 function paseoMcpName(name: string): string | undefined {
   const normalized = name.trim().toLowerCase();
-  return normalized.startsWith(PASEO_MCP_PREFIX)
-    ? normalized.slice(PASEO_MCP_PREFIX.length)
-    : undefined;
+  if (normalized.includes("__")) {
+    const parts = normalized.split("__").filter((part) => part.length > 0);
+    const ours =
+      parts.length >= 3 && parts[0] === "mcp" && (parts[1] === "paseo" || parts[1].startsWith("paseo_"));
+    return ours ? parts.slice(2).join("__") : undefined;
+  }
+  if (normalized.includes(".")) {
+    const [first] = normalized.split(".");
+    if (first !== "paseo" && !first.startsWith("paseo_")) return undefined;
+    return normalized.split(".").slice(1).join(".");
+  }
+  return undefined;
+}
+
+/**
+ * Whether a tool belongs to Paseo itself.
+ *
+ * The same rule as `paseoMcpName`, with Paseo's own exception: a `speak` tool is
+ * never one of its own (`isPaseoToolName` excludes it there too).
+ */
+function isPaseoToolName(name: string): boolean {
+  const tokens = name.trim().toLowerCase().match(/[a-z0-9]+/g);
+  if (tokens !== null && tokens[tokens.length - 1] === "speak") return false;
+  return paseoMcpName(name) !== undefined;
 }
 
 /** The label for a Paseo MCP tool in the reader's language, or undefined. */
@@ -1185,6 +1231,11 @@ export function toolCallData(
     detailHeadline !== "" ? detailHeadline : description === "" ? "" : primary,
   );
   const structured = search !== null || read !== null || diffBlock !== null || web !== null;
+  const icon = toolIcon(item.name, detail);
+  // A Paseo-owned tool with no glyph of its own would draw the generic wrench.
+  // Draw Paseo's mark there instead, so it still reads as Paseo's rather than as
+  // unknown; a tool we do have a glyph for keeps it (the mark is coarser).
+  const paseoMark = icon === "Wrench" && isPaseoToolName(item.name);
   const label = toolLabel(item.name);
   const rawSummary = truncate(description === "" ? primary : description);
   // The head reads `label · summary`. Two halves saying the same sentence prints
@@ -1197,7 +1248,8 @@ export function toolCallData(
   return {
     name: item.name,
     label,
-    icon: toolIcon(item.name, detail),
+    icon,
+    paseoMark,
     status: (["running", "completed", "failed", "canceled"] as const).includes(
       item.status as ToolCallData["status"],
     )

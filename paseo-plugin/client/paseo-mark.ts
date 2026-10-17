@@ -1,0 +1,23 @@
+/**
+ * Paseo's own mark, for rows that would otherwise draw a generic wrench.
+ *
+ * Taken from Paseo's own web UI, which ships inside the daemon package
+ * (`@getpaseo/server/dist/server/web-ui/_expo/static/js/web/index-*.js`): there
+ * `resolveToolCallIconName` returns `"paseo"` for every tool `isPaseoToolName`
+ * accepts, and `componentForToolCallIcon` maps that to the single `PaseoLogo`
+ * component — a 700x700 viewBox with one path, filled with the foreground colour.
+ * Paseo has no per-tool icon table for its own tools.
+ *
+ * The path was rasterized to a 64x64 white-on-transparent PNG (4x the 16px row
+ * glyph, the same ratio the thinking row's icon uses) so it can be drawn with
+ * `<Image tintColor>` and take the row's state colour. Nothing is fetched at
+ * runtime — the bytes are here.
+ *
+ * Regenerate: serve the SVG path from that bundle with a temporary HTTP server,
+ * draw it on a canvas in a browser, and POST `canvas.toBlob()` back to the
+ * server. There is no SVG rasterizer on this machine, so the browser does it.
+ *
+ * @module dsh-paseo/client/paseo-mark
+ */
+export const PASEO_MARK_ICON =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAH4ElEQVR4AeyaeahVRRzH3wuKyPbFstUwLKNCKjOySFugIinThDKzaHVNLbMoUGnBqLC9NDOttDBL04KUTDOVkiT7o0VINGgvbV+I4vX53nfPcc6c3z33bO89xff4fd9v5je/mfnN986dMzPn7tSwg/+1E7CDT4CG9hnQPgN2cAbavwJlT4CmpqauoLeDzmX3UWZ7pc0ABjwSLCO49UA6wEbsW8BKIJ89Kd9mpBQCGNh0RvQI6A0s2QdjLyCfdfhPBLuTb3MpTAADmcworgFp5UgcJ4DV1B2CblMpRAADuJDox4M8cjyVZtLGfNCddJtIIQKI+Hrgy7cYRoE+4DxwA9BXBGXKxViXQcJodKtLbgIIWJ9+Xy/itY2NjZ3Ao2A5WAymgevwOwcsBJbsjXEKbb6MblXJTQBRWp/+NOymQMJScBGFl4P3gSUDIGGpVdBStiIEnOoFpU+/JgGBLyS8CFT3qcDm6bMg4T3PVlrWbygXAQR4HA0dAFz5yM3US0PCUHzuBJb0pI9nrYKybbkIIAhr1f4EeyaBhHuocCb4C/hyFSRM9I1l5/MScJQRyFrDVtcECSvAbjiuAb5MaGkS8hLgB1o4Dwk9aWQ58GU8JJzsG8vKbzMEVAd0AdonYVdst4EWkW2KAGaB1oIxjPQ34Ep/ZsHVrqGsdF4CfjYCOMywZTZBwjoqaXFERWQ0JGg2RIxFM3kJ2GR0fLRhy2WChPuo+DZw5QQyI0CpUiYBx5QaWUPDFKO9EcyCAw17blOZBBybOwqjIrPgdcyLgCtHkOkPSpNcBBCc1oANXhTd+HT292xFs9bWWoeqou2G9XMRUK29uKpdZe0Q3fJMaYjWLPjcqxQjAOI7gX5AV26D0F29OjWzRQh4xWi1O53rkTUMfQcYDLSv39fwTWt6zXPcgzbDqzfS2i5/gM+rQFduL6DXY6919KZ4q+QmgE/HX6XV6v38mwceB3eD54BOdpsJaC64lHxWsYjuRVsdwdM0puu1g9G+9KXcnz2+T/5XYzR+Bq3pBhiVSjR4kaDbn8NT1Wh2+qZZRf6fRm4WuBYkSRfivDfJIdcMoFFNwRU0nOfZr7pf0Mbp1E8jXxtOumHWdZtRFDWRS9xBZiaAwA+lUd35owrJu7S1c70W+Kr9Y/jsZdh0naavwiSv7CD6OdGzhdlMBNDQLtScAeqJ1gJtW3Vs1uWo8lYda7Nj+dWzzYaogUBfF2uXWvNlTCYCiOImcC6oJ7rh7UVAG4AuR2+lwkDgy3BI1e2Sbw/zlIvEMG8kJtHHFY499ph0ymLJrARoIfMb0ZTzP2FNbZEQ+hKkpui40LA1oe/z1lw8dX7cFFo0eD0GKwbIOonEIOCKTpirXYObTk0AjSuQHm5l0vp0FYAeef7U02PIf2OkRyTVIpKXgBmQqr7dxqyb6iX4WetIpV5qAvAWAaiIVF540MGvWEUCKiLTIc6dNbr6ijiQ6QBMoe5lFFj9ag8ynLJQ8NULFp+Af3HQqzuULUUI2MLAZwfNkn6GtLU91rP/FgLULbK1Dvgzh2ZC0ZoTZqoJnUGG09/f1XwDbR9C2rpFnoyfNmIU25KKADrQp+QvRtZ01pT8xehKa8T32LVrQ0XEfKTS50y8dE+ICuU/UiMY1GdoV1aS0dslVCgfkkr89ClPvRPUpyd/F7H3AAQmtjUVXb+k9CLq6MAT8WHw2tNbb441+DddZ3xFoP8jDE39cbT9h+trpVPNACpaBHyJPSZ0qktNbTz+jBVGDR+TjV12MqC7sI8Evmg6R94m4avBa2fp+95MHKlesaUloNHvISlP55p+2jFaBxlVlV0bl8jLFAY0mELrbdEc2rydslDwrTX4qfhqBoW+SYm0BPxoNKIBGuZmE0H8BAaQ0w8i9Ilq1dbL0Y6yA3/wuvPT6ZEqEVlFTq/YUc2SMPgFtHtjs1e6/2kJ2Gw0182wxUwEtAk8Bp4AC8EPMadmQ2xNwfwVGEKd39EVSRi8XsX3qzhl+JeKAALQyv6d165+H+CZsmcZkC44mmrU1NdEj71KMb4631vf+XeIMe3psNJW8C8VAVXn56s6UJ0JKMuKH9QLNfX1/NYmKrQ5iUsYVGULi59+dqfZ0MUpD5Jr8LNICcoTdRYCrE3OBILzn7+JHQaF1NM1uvkkwWcog5qPDkT7Bx11g3ygV+EX2SsEBWl1agLo6C0a1SMOFYouQRVcaEiTYPCn4PcpsGQifUUedzhZj+GX8Et7qUITtqQmoFpdJ79qMlR6ZfVgmKuTYPBn41LrJzLDGJTVxxLquKJToM4Jri1XOhMBBKcZYAU4loHNAonX0ZRrldZMsoLVgvekVUC/Y7HrYkXn/v3Ia8uNqbhkIkDdVTufo7SHK8nrOlqXnqMYbA+ghbIDWovYXMp1dY2KiQav+4JYQWCgXx29dfOzJbCVoTMToE4JRpcOU5U2oBX5Yez6xcdGtJ7h2rW5x2LModQdfOjZAolcBCgOSNCO6wGlC6BNB6+4cxOgypCgKy6tCf7xVMVJ0G8A+lE/cdonNVBWWSECFASD0GNL22JN8Xqvo/T9fYh6fai3AN3mUpiAYAQMaB7QYUfvAaV1+NHsCKCts35GOwY/vV0OqrapLo2AYBQMTqdAHXp0+NHsCPAGZTUvJ4P6ra1LJ6C1B1C0v3YCijK4vddvnwHb+ydYNP7tfgYUJeB/AAAA//9UAk2rAAAABklEQVQDALLZTJ+/PW0cAAAAAElFTkSuQmCC";

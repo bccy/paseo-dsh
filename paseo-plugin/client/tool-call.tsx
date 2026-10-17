@@ -30,6 +30,7 @@ import { Icon, ScrollView, copyText } from "@getpaseo/plugin/client/react-native
 import { ExternalLink } from "@getpaseo/plugin/client/ui";
 import { type ReactNode, useCallback, useMemo, useState } from "react";
 import {
+  Image,
   Pressable,
   StyleSheet,
   Text,
@@ -39,6 +40,7 @@ import {
   type ViewStyle,
 } from "react-native";
 import { shouldPulse, useRowPulse } from "./newest";
+import { PASEO_MARK_ICON } from "./paseo-mark";
 import { blockCopy, type ReadBlockData, type SearchBlockData, type ToolCallData, type WebBlockData } from "./tool-call-data";
 import { TextShimmer } from "./text-shimmer";
 import {
@@ -828,8 +830,19 @@ export function InlineToolCall({
       <View style={styles.head}>
         {/* The glyph carries the state: red for a failure, green for a completed
             edit. DSH leaves it muted and reddens the summary instead; see
-            `docs/RENDER-PLAN.md` for why this row inverts that. */}
-        <Icon name={data.icon} size={iconSize} color={iconColor} />
+            `docs/RENDER-PLAN.md` for why this row inverts that. A Paseo-owned
+            tool with no glyph of its own draws Paseo's mark, tinted the same —
+            Paseo's own UI gives every one of its tools that mark and none of them
+            a per-tool glyph. */}
+        {data.paseoMark ? (
+          <Image
+            source={{ uri: PASEO_MARK_ICON }}
+            style={{ width: iconSize, height: iconSize }}
+            tintColor={iconColor}
+          />
+        ) : (
+          <Icon name={data.icon} size={iconSize} color={iconColor} />
+        )}
         <TextShimmer
           active={running}
           contentStyle={styles.text}

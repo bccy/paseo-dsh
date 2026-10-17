@@ -87,6 +87,8 @@ export default function contribute(client: PluginClientContext) {
       name: z.string(),
       label: z.string(),
       icon: z.string(),
+      // Paseo's own mark instead of the Lucide glyph (see `ToolCallData`).
+      paseoMark: z.boolean(),
       status: z.enum(["running", "completed", "failed", "canceled"]),
       phase: z.enum(["streaming", "complete"]),
       summary: z.string(),

@@ -208,6 +208,26 @@
   那也是 Paseo 自带行、也就是 opencode 那套的观感。）
   `style-check` 除了断言判据，还**读组件源码断言接线**：光断言辅助函数抓不到"状态色接到了
   另一个 run 上"这类毛病，而上一版正是这么错的。
+- **Paseo 自己的 MCP 工具保留细分图标**。Paseo 的 UI 对 `isPaseoToolName` 命中的工具一律画同一个
+  品牌标记（`resolveToolCallIconName` → `"paseo"` → `PaseoLogo`，700×700 单路径），**没有任何
+  按工具名的图标表**——实测：Paseo 的 58 个工具名在它的前端 bundle 里只出现在"字段顺序/输出字段"
+  元数据中，没有一处进图标表。本仓库的 58 条细分图标（浏览器=Globe、终端=SquareTerminal、
+  日程=CalendarClock、子代理=Bot…）是**多出来的信息**，所以只在**我们还没有细分图标**时才回落到
+  品牌标记（`paseoMark`），而不是回到通用扳手。
+  标记取自 Paseo 自己的 web UI bundle（在 daemon 发行包
+  `@getpaseo/server/dist/server/web-ui/_expo/static/js/web/index-*.js` 里），路径在浏览器里
+  栅格化成 64×64 白底透明 PNG（`client/paseo-mark.ts`），用 `<Image tintColor>` 跟着状态色。
+  工具名判定照 Paseo 的 `isPaseoToolName` / `getPaseoToolLeafName` 实现，覆盖
+  `mcp__paseo__<t>`、`mcp__paseo_<s>__<t>`、`paseo.<t>`、`paseo_<s>.<t>` 四种写法，以及
+  "叶名是 speak 就不算 Paseo 工具"的例外。
+  **现状**：18 个 `browser_*` 工具里我们漏了 4 个——`browser_back`、`browser_forward`、
+  `browser_hover`、`browser_reload`（Paseo 前端字段表里有，我们的 `PASEO_MCP_ICONS` 没收录）。
+  这 4 个就是本标记实际生效的行：它们的 `icon` 仍是 `Wrench`，`paseoMark` 为 true，于是画品牌
+  标记而不是扳手。**不要**为了"消灭扳手"把它们补进图标表——补了就再也不会出现品牌标记，而
+  这条规则的意思正是"Paseo 的、又只有扳手的，就用 Paseo 的标记"。
+  它们的**中英标签**已经补进 `client/locale.ts` 的 `paseoMcpLabels`（否则那一行会把 wire name
+  当标题印出来）；**图标仍然故意不补**——标签和图标是两张独立的表，补标签不会让品牌标记消失。
+  其余 54 个工具都有细分图标，不受影响。
 - **`+A -R` 的两个数字始终着色**（`+` 绿、`-` 红）。**颜色本身与 DSH 一致**——DSH 的
   `.diffAdded` 绿 / `.diffRemoved` 红——但它**只在 hover 或 `aria-expanded=true` 时着色**
   （调研报告 `dsh-blocks-2-report.md` 第 2083 行）。手机上没有 hover，照抄的结果是"永远灰着、

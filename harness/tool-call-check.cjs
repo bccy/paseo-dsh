@@ -477,6 +477,22 @@ console.log("DSH's own tools are not anonymous");
   equal("and its own icon", toolIcon("mcp__paseo__delete_heartbeat", { type: "unknown" }), "HeartPulse");
   equal("a browser tool too", toolLabel("mcp__paseo__browser_list_tabs"), "列出浏览器标签页");
   equal("listing workspaces too", toolLabel("mcp__paseo__list_workspaces"), "列出工作区");
+
+  // The four browser tools that `PASEO_MCP_ICONS` does not cover. They carry a
+  // label now — a wire name in the row read badly — but still no glyph, because
+  // that is what makes the row fall to the wrench and draw Paseo's mark instead.
+  equal("browser back is labelled", toolLabel("mcp__paseo__browser_back"), "浏览器后退");
+  equal("browser forward is labelled", toolLabel("mcp__paseo__browser_forward"), "浏览器前进");
+  equal("browser reload is labelled", toolLabel("mcp__paseo__browser_reload"), "刷新浏览器页面");
+  equal("browser hover is labelled", toolLabel("mcp__paseo__browser_hover"), "悬停页面元素");
+  for (const bare of ["browser_back", "browser_forward", "browser_hover", "browser_reload"]) {
+    const row = toolCallData(
+      { name: `mcp__paseo__${bare}`, status: "completed", detail: { type: "unknown" } },
+      "complete",
+    );
+    check(`${bare} keeps no glyph, so it draws Paseo's mark`, row.icon === "Wrench" && row.paseoMark === true);
+    check(`${bare} no longer prints its wire name`, row.label !== `mcp__paseo__${bare}`, row.label);
+  }
   // Anything we do not know keeps its wire name rather than losing its identity.
   equal(
     "an unknown Paseo tool falls back to the wire name",
@@ -492,6 +508,49 @@ console.log("DSH's own tools are not anonymous");
     "and the wrench",
     toolIcon("mcp__github__create_issue", { type: "unknown" }),
     "Wrench",
+  );
+
+  // An unknown Paseo tool would draw the wrench; the row asks for Paseo's own mark
+  // instead (`paseoMark`). A tool we do have a glyph for keeps it — Paseo's own UI
+  // gives every one of its tools the same mark, which is coarser than this row.
+  const unknownPaseo = toolCallData(
+    { name: "mcp__paseo__not_a_tool", status: "completed", detail: { type: "unknown" } },
+    "complete",
+  );
+  equal("an unknown Paseo tool still falls back to the wrench glyph", unknownPaseo.icon, "Wrench");
+  check("…but is flagged for Paseo's own mark", unknownPaseo.paseoMark === true);
+  check(
+    "a mapped Paseo tool keeps its glyph and asks for no mark",
+    unknownPaseo.paseoMark === true &&
+      toolCallData(
+        { name: "mcp__paseo__browser_list_tabs", status: "completed", detail: { type: "unknown" } },
+        "complete",
+      ).paseoMark === false,
+  );
+  check(
+    "another server's unknown tool is not Paseo's",
+    toolCallData({ name: "mcp__github__create_issue", status: "completed", detail: { type: "unknown" } }, "complete")
+      .paseoMark === false,
+  );
+  // Paseo accepts four spellings of its own tool names; all of them must reach the
+  // mark, not just the `mcp__paseo__` one this used to key on.
+  for (const name of [
+    "mcp__paseo__brand_new",
+    "mcp__paseo_browser__brand_new",
+    "paseo.brand_new",
+    "paseo_browser.brand_new",
+  ]) {
+    check(
+      `a Paseo tool spelled "${name}" gets the mark`,
+      toolCallData({ name, status: "completed", detail: { type: "unknown" } }, "complete").paseoMark === true,
+    );
+  }
+  // …and Paseo's own exception: a tool whose leaf is `speak` is never one of its
+  // own, so an unmapped one must not borrow the mark.
+  check(
+    "a speak tool is not counted as Paseo's own",
+    toolCallData({ name: "mcp__paseo__foo_speak", status: "completed", detail: { type: "unknown" } }, "complete")
+      .paseoMark === false,
   );
 
   // A typed detail still wins: the name map only fills the `unknown` gap.
@@ -1315,6 +1374,47 @@ console.log("the renderer's schema and ToolCallData cannot drift apart");
     "the schema's field set matches ToolCallData exactly",
     [...schemaKeys].sort(),
     [...dataKeys].sort(),
+  );
+}
+
+console.log("Paseo's own mark");
+{
+  const { PASEO_MARK_ICON } = require("./client/paseo-mark.js");
+  check("is a PNG data URI", PASEO_MARK_ICON.startsWith("data:image/png;base64,"));
+  const bytes = Buffer.from(PASEO_MARK_ICON.slice("data:image/png;base64,".length), "base64");
+  // Read the header rather than trusting the file: a truncated paste would still
+  // start with the magic but decode to a broken image.
+  equal("decodes to a PNG", bytes.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+  equal("IHDR says 64 wide", bytes.readUInt32BE(16), 64);
+  equal("IHDR says 64 tall", bytes.readUInt32BE(20), 64);
+  check("and the payload is not empty", bytes.length > 500, `${bytes.length} bytes`);
+}
+
+console.log("the bridge's own MCP gateway tools");
+{
+  // These three are ours (`dsh-bridge/lib/mcp-gateway.js`). They declare only a
+  // name and a description — no `title`, no `presentationMeta` — so without an
+  // entry here the row printed the wire name (`mcp_tool_schema`) over raw JSON
+  // and drew the wrench.
+  equal("list tools label", toolLabel("mcp_list_tools"), "列出 MCP 工具");
+  equal("list tools icon", toolIcon("mcp_list_tools", { type: "unknown" }), "Server");
+  equal("tool schema label", toolLabel("mcp_tool_schema"), "查看 MCP 工具参数");
+  equal("tool schema icon", toolIcon("mcp_tool_schema", { type: "unknown" }), "FileJson");
+  equal("call tool label", toolLabel("mcp_call_tool"), "调用 MCP 工具");
+  equal("call tool icon", toolIcon("mcp_call_tool", { type: "unknown" }), "Play");
+}
+
+console.log("a forked subagent is not a spawned one");
+{
+  // `subagent_fork` comes from the subagent service's `fork` provider and DSH
+  // ships no row title for it, so both halves are ours; without them the row
+  // printed `subagent_fork` over raw JSON with the wrench.
+  equal("fork label", toolLabel("subagent_fork"), "派生子智能体分支");
+  equal("fork icon", toolIcon("subagent_fork", { type: "unknown" }), "GitFork");
+  check(
+    "and it is not the same row as a plain subagent",
+    toolLabel("subagent_fork") !== toolLabel("subagent") &&
+      toolIcon("subagent_fork", { type: "unknown" }) !== toolIcon("subagent", { type: "unknown" }),
   );
 }
 
