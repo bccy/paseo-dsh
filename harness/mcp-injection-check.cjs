@@ -9,6 +9,11 @@
  * turn that map into one. Dropping it — which is what used to happen — left the
  * model with no `mcp__paseo__*` tools and produced no error anywhere.
  *
+ * Streamable-HTTP servers are proxied by the bridge's own MCP gateway
+ * (`dsh-paseo-bridge/mcp-gateway`): one row for the whole server map, three
+ * meta-tools instead of one schema per tool. stdio servers still mount the
+ * stock client, and an unsupported transport is still refused by name.
+ *
  * This drives the real plugin against a scripted fake `dsh`
  * (`harness/fake-dsh-bridge.mjs`), which records its own launcher arguments and
  * the patch file it was pointed at (`DSH_FAKE_ARGV`). That is the only place the
@@ -82,6 +87,16 @@ async function readRecord(file, ms = 5000) {
   return undefined;
 }
 
+/** Parse every mounted entry out of a recorded patch file, in patch order. */
+function allEntries(record) {
+  if (record === undefined || typeof record.patch !== "string") return [];
+  try {
+    return (JSON.parse(record.patch)?.[0]?.insert ?? []);
+  } catch {
+    return [];
+  }
+}
+
 /** Parse the first mounted entry out of a recorded patch file. */
 function firstEntry(record) {
   if (record === undefined || typeof record.patch !== "string") return undefined;
@@ -130,19 +145,19 @@ const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-mcp-check-"));
   );
 
   const httpEntry = firstEntry(httpRecord);
+  const gatewayServer = httpEntry?.config?.servers?.paseo;
   check(
-    "the http server is mounted as Streamable HTTP with its URL and headers",
-    httpEntry?.name === "@deepseek-ai/dsh-mcp-client" &&
-      httpEntry?.config?.serverName === "paseo" &&
-      httpEntry?.config?.transport === "streamable-http" &&
-      httpEntry?.config?.url === "http://127.0.0.1:6767/mcp/agents?callerAgentId=check" &&
-      httpEntry?.config?.headers?.Authorization === "Bearer check-token",
-    httpEntry ? JSON.stringify(httpEntry.config) : "(no patch content)",
+    "the http server is proxied by the bridge gateway with its URL and headers",
+    httpEntry?.id === "paseo-mcp-gateway" &&
+      httpEntry?.name === "dsh-paseo-bridge/mcp-gateway" &&
+      gatewayServer?.url === "http://127.0.0.1:6767/mcp/agents?callerAgentId=check" &&
+      gatewayServer?.headers?.Authorization === "Bearer check-token",
+    httpEntry ? JSON.stringify(httpEntry) : "(no patch content)",
   );
   check(
-    "the mounted server fails loudly at startup",
-    httpEntry?.config?.failOnStartupError === true,
-    `failOnStartupError=${String(httpEntry?.config?.failOnStartupError)}`,
+    "the gateway row declares the tool registry it registers into",
+    JSON.stringify(httpEntry?.inject) === JSON.stringify(["tools"]),
+    `inject=${JSON.stringify(httpEntry?.inject)}`,
   );
 
   // ---- a stdio server keeps its command, args and env --------------------
@@ -170,6 +185,36 @@ const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-mcp-check-"));
       JSON.stringify(stdioEntry?.config?.args) === JSON.stringify(["-y", "server-github"]) &&
       stdioEntry?.config?.env?.GITHUB_TOKEN === "t",
     stdioEntry ? JSON.stringify(stdioEntry.config) : "(no patch content)",
+  );
+
+  // ---- a mixed session keeps stdio native and coalesces HTTP into one row ----
+  const mixedProbe = path.join(scratch, "mixed.json");
+  const mixedSession = `mcp-mixed-${Date.now()}`;
+  await conn.send({
+    type: "session.open",
+    requestId: "open-mixed",
+    sessionId: mixedSession,
+    config: {
+      cwd: process.cwd(),
+      mode: "build",
+      env: { DSH_FAKE_ARGV: mixedProbe },
+      mcpServers: {
+        paseo: { type: "http", url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=mixed" },
+        github: { type: "stdio", command: "npx", args: ["-y", "server-github"] },
+      },
+    },
+  });
+  await until((e) => e.type === "session.ready" && e.sessionId === mixedSession, "mixed session ready");
+  const mixedEntries = allEntries(await readRecord(mixedProbe));
+  const mixedGateway = mixedEntries.find((entry) => entry?.id === "paseo-mcp-gateway");
+  const mixedStdio = mixedEntries.find((entry) => entry?.config?.transport === "stdio");
+  check(
+    "a mixed session mounts stdio natively and proxies HTTP through one gateway row",
+    mixedEntries.length === 2 &&
+      Object.keys(mixedGateway?.config?.servers ?? {}).join(",") === "paseo" &&
+      mixedStdio?.config?.command === "npx" &&
+      mixedGateway?.config?.servers?.github === undefined,
+    `entries=${JSON.stringify(mixedEntries.map((entry) => entry?.id ?? entry?.config?.serverName))}`,
   );
 
   // ---- no servers means no overlay --------------------------------------
