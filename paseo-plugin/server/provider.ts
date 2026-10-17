@@ -8,6 +8,7 @@
  *
  * @module dsh-paseo/server/provider
  */
+import { spawn } from "node:child_process";
 import {
   negotiateProviderCapabilities,
   type ProviderCatalog,
@@ -319,6 +320,13 @@ class DshConnection implements ProviderConnection {
       }
       case "session.revert": {
         await this.#require(input.sessionId).revert(input.token, input.scope);
+        // Replaying `PluginProviderSession.streamHistory` cannot drop rows (the
+        // buffer only grows and the plugin contract has no removal event), so the
+        // timeline keeps the withdrawn messages until Paseo refreshes the agent.
+        // Paseo's own docs define that refresh as "close the provider session and
+        // open it again" — which replays the bridge's surface-folded history — and
+        // the provider cannot trigger it, so ask the daemon for it below.
+        this.#refreshAgent(input.sessionId);
         // Paseo awaits `complete()` and resolves it only on a reply, so a silent
         // success would leave the rewind button spinning forever.
         this.#emit({ type: "request.completed", requestId: input.requestId });
@@ -384,6 +392,33 @@ class DshConnection implements ProviderConnection {
         ...(session.updatedAt === undefined ? {} : { updatedAt: session.updatedAt }),
       })),
     });
+  }
+
+  /**
+   * Ask Paseo to refresh one agent, the way `paseo agent reload <id>` does.
+   *
+   * The plugin server context exposes no refresh hook (`registerSettings`,
+   * `handle`, `registerProvider`, `registerUsageSource` only), and closing the
+   * provider session from here makes it terminal instead of refreshed — that
+   * experiment surfaced as "Provider session … closed" in the UI. Spawning the
+   * shipped CLI hits the daemon's own refresh path instead.
+   *
+   * Delayed so this request's reply lands first: the refresh restarts the `dsh`
+   * process, and a reply racing that restart would surface as a failed rewind.
+   */
+  #refreshAgent(sessionId: string): void {
+    const timer = setTimeout(() => {
+      try {
+        const child = spawn("paseo", ["agent", "reload", sessionId], {
+          detached: true,
+          stdio: "ignore",
+        });
+        child.unref();
+      } catch (error) {
+        process.stderr.write(`[${PROVIDER_ID}] refreshing the agent after a rewind: ${messageOf(error)}\n`);
+      }
+    }, 500);
+    timer.unref();
   }
 
   async #open(input: Extract<ProviderInput, { type: "session.open" }>): Promise<void> {
