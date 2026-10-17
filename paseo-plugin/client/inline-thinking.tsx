@@ -9,18 +9,23 @@
  * The host's transformer `phase` is not a reliable "still streaming" signal:
  * a thought is `streaming` only while its render-model status is `loading`, so
  * it flips back and forth as chunks settle and would make this row open and
- * close repeatedly. Instead the row watches the *revealed text* grow: while it
- * grows the row stays in its scrolling state, and it settles only once the
- * reveal has caught up and the host reports `complete`.
+ * close repeatedly. Instead the row watches the text itself grow: while it grows
+ * the row stays in its scrolling state, and it settles once the text has stopped
+ * arriving and the host reports `complete`.
+ *
+ * The text is used **as it arrives**, never through the host's paced reveal
+ * (`useRevealedText`). That hook re-plays the reasoning at a rate it owns — its
+ * signature takes no speed — so the collapsed preview trailed the expanded one,
+ * which always read the raw text. dsh web applies the same preview rule to the
+ * live text; this row now does too.
  *
  * @module dsh-paseo/client/inline-thinking
  */
 import type { PluginTimelineItemProps } from "@getpaseo/plugin/client";
-import { useRevealedText } from "@getpaseo/plugin/client/react-native";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Image, Pressable, Text, View } from "react-native";
 import { TextShimmer } from "./text-shimmer";
-import { reasoningPreview } from "./thinking-text";
+import { reasoningPreview, streamingTail } from "./thinking-text";
 import { BODY_INDENT, ROW_FONT_SIZE, ROW_GAP, ROW_HEAD_GAP, ROW_HEIGHT, ROW_LINE_HEIGHT } from "./tokens";
 import { localeText } from "./locale";
 
@@ -42,21 +47,21 @@ export interface InlineThinkingData {
 /**
  * Track "still producing text" without trusting the flickering `phase`.
  *
- * Any growth latches the row on; it turns off only when the reveal stopped
+ * Any growth latches the row on; it turns off only when the text stopped
  * growing *and* the host says the item is complete.
  */
-function useGrowing(revealed: string, phase: "streaming" | "complete"): boolean {
+function useGrowing(text: string, phase: "streaming" | "complete"): boolean {
   const [growing, setGrowing] = useState(phase === "streaming");
-  const lastLength = useRef(revealed.length);
+  const lastLength = useRef(text.length);
   useEffect(() => {
-    const grew = revealed.length > lastLength.current;
-    lastLength.current = revealed.length;
+    const grew = text.length > lastLength.current;
+    lastLength.current = text.length;
     if (grew) {
       setGrowing(true);
       return;
     }
     if (phase === "complete") setGrowing(false);
-  }, [revealed, phase]);
+  }, [text, phase]);
   return growing;
 }
 
@@ -66,8 +71,10 @@ export function InlineThinking({
   item,
 }: PluginTimelineItemProps<InlineThinkingData>) {
   const { text, phase } = item.data;
-  const revealed = useRevealedText(text, phase);
-  const growing = useGrowing(revealed, phase);
+  const growing = useGrowing(text, phase);
+  // The width the preview line has to work with, reported by its own layout: one
+  // measurement per resize, not per frame.
+  const [boxWidth, setBoxWidth] = useState(0);
   const [manual, setManual] = useState<boolean | null>(null);
   const open = manual ?? false;
   // Read per render, not hoisted: `./locale` follows a locale the host relays
@@ -76,9 +83,15 @@ export function InlineThinking({
   const copy = localeText();
 
 
-  // DSH's own preview: the first line once settled, the latest completed
-  // paragraph's first line while streaming (`./thinking-text`).
-  const line = reasoningPreview(revealed, growing);
+  // While streaming the collapsed line is a **tail window**: it advances with
+  // every arrived character instead of waiting for a paragraph to finish, which
+  // is what made it lag the expanded view. Before the box has been measured (the
+  // very first frame) and once the thought settles, dsh's own rule applies —
+  // the latest completed paragraph's first line, then the first line outright.
+  const line =
+    growing && boxWidth > 0
+      ? streamingTail(text, boxWidth, ROW_FONT_SIZE)
+      : reasoningPreview(text, growing);
 
   const styles = useMemo(
     () => ({
@@ -153,7 +166,11 @@ export function InlineThinking({
                   summary, not to this row. */}
               <Text style={[styles.label, color === null ? null : { color }]}>{copy.thinking}</Text>
               {!open ? (
-                <Text style={[styles.line, color === null ? null : { color }]} numberOfLines={1}>
+                <Text
+                  style={[styles.line, color === null ? null : { color }]}
+                  numberOfLines={1}
+                  onLayout={(event) => setBoxWidth(event.nativeEvent.layout.width)}
+                >
                   {line}
                 </Text>
               ) : null}
