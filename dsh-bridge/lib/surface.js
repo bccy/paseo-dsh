@@ -14,15 +14,18 @@
  */
 
 /**
- * Seqs that a replace operation removed from the surface.
+ * Visible seqs in surface order.
  *
- * @param {readonly {seq?: number, surfaceOp?: unknown}[]} events - persisted events.
- * @returns {Set<number>}
+ * Events without a surface marker are not surface-eligible and never become
+ * nodes; log-only events (`command/run`, `turn/end`, …) are exactly that.
+ *
+ * @param {readonly {seq?: number, surfaceOp?: unknown}[]} events - persisted events. A
+ *   replace op carries `startSeq`/`endSeq` (DSH's own spelling), not `start`/`end`.
+ * @returns {number[]} visible seqs, oldest first.
  */
-export function shadowedSeqs(events) {
+export function surfaceNodes(events) {
   /** @type {number[]} */
   const nodes = [];
-  const shadowed = new Set();
   for (const event of events) {
     const seq = event?.seq;
     if (typeof seq !== 'number') continue;
@@ -40,27 +43,26 @@ export function shadowedSeqs(events) {
     const to = nodes.indexOf(end);
     // A range that is not (or no longer) contiguous in the surface is a log the
     // replay cannot honour; dropping the replacement would silently resurrect
-    // whatever it shadowed, so leave the nodes alone rather than guess.
+    // whatever it shadowed, so keep the nodes as they are and let the event sort
+    // itself out — DSH's own replay rejects such a log.
     if (from === -1 || to === -1 || to < from) continue;
-    for (let index = from; index <= to; index += 1) shadowed.add(nodes[index]);
     nodes.splice(from, to - from + 1, seq);
   }
-  return shadowed;
+  return nodes;
 }
 
 /**
- * The log with the shadowed events removed, in log order.
+ * The events of a log, reduced to the visible surface and ordered by it.
  *
- * Only the shadowed events are dropped: log-only events (`turn/end`,
- * `command/*`, compaction markers) carry no surface marker and are still what
- * the timeline builder folds a replayed conversation from — filtering them out
- * would rebuild a session with no settled tools and no compaction row.
- *
- * @param {readonly {seq?: number}[]} events
- * @returns {{seq?: number}[]}
+ * @param {readonly {seq?: number, surfaceOp?: unknown}[]} events
+ * @returns {{seq?: number, surfaceOp?: unknown}[]}
  */
-export function visibleEvents(events) {
-  const shadowed = shadowedSeqs(events);
-  if (shadowed.size === 0) return [...events];
-  return events.filter((event) => !shadowed.has(event?.seq));
+export function surfaceEvents(events) {
+  const bySeq = new Map();
+  for (const event of events) {
+    if (typeof event?.seq === 'number') bySeq.set(event.seq, event);
+  }
+  return surfaceNodes(events)
+    .map((seq) => bySeq.get(seq))
+    .filter((event) => event !== undefined);
 }

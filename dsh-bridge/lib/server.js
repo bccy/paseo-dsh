@@ -24,7 +24,7 @@ import { admitEncodedImages } from '@deepseek-ai/dsh-attachment';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import { underArchivedSession } from './archived-lineage.js';
 import { dirtyWorkspaceError, restoresFiles, revertOrdinal, rewindLine } from './revert.js';
-import { visibleEvents } from './surface.js';
+import { surfaceEvents } from './surface.js';
 import { historyEvents, withImageHostPaths } from './image-host-path.js';
 import { promptSource } from './paseo-system-envelope.js';
 
@@ -850,7 +850,7 @@ export class PaseoHarnessServer {
         // showed. Images are stamped here too — the source file a tool read is
         // usually gone by reopen time, and only the attachment's host path still
         // resolves.
-        events: historyEvents(this.ctx, visibleEvents(result.events ?? [])),
+        events: historyEvents(this.ctx, surfaceEvents(result.events ?? [])),
       };
     } catch (error) {
       // The open succeeded, so this log exists; failing to read it is never

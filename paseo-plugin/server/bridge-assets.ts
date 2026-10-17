@@ -988,7 +988,7 @@ export const BRIDGE_FILES: Readonly<Record<string, string>> = {
     "c2gtYWdlbnQnOwppbXBvcnQgeyB1bmRlckFyY2hpdmVkU2Vzc2lvbiB9IGZyb20gJy4vYXJjaGl2" +
     "ZWQtbGluZWFnZS5qcyc7CmltcG9ydCB7IGRpcnR5V29ya3NwYWNlRXJyb3IsIHJlc3RvcmVzRmls" +
     "ZXMsIHJldmVydE9yZGluYWwsIHJld2luZExpbmUgfSBmcm9tICcuL3JldmVydC5qcyc7CmltcG9y" +
-    "dCB7IHZpc2libGVFdmVudHMgfSBmcm9tICcuL3N1cmZhY2UuanMnOwppbXBvcnQgeyBoaXN0b3J5" +
+    "dCB7IHN1cmZhY2VFdmVudHMgfSBmcm9tICcuL3N1cmZhY2UuanMnOwppbXBvcnQgeyBoaXN0b3J5" +
     "RXZlbnRzLCB3aXRoSW1hZ2VIb3N0UGF0aHMgfSBmcm9tICcuL2ltYWdlLWhvc3QtcGF0aC5qcyc7" +
     "CmltcG9ydCB7IHByb21wdFNvdXJjZSB9IGZyb20gJy4vcGFzZW8tc3lzdGVtLWVudmVsb3BlLmpz" +
     "JzsKCmZ1bmN0aW9uIGVuY29kZWRJbWFnZShibG9jaykgewogIHJldHVybiBibG9jay50eXBlID09" +
@@ -1598,7 +1598,7 @@ export const BRIDGE_FILES: Readonly<Record<string, string>> = {
     "YWdlcyBhcmUgc3RhbXBlZCBoZXJlIHRvbyDigJQgdGhlIHNvdXJjZSBmaWxlIGEgdG9vbCByZWFk" +
     "IGlzCiAgICAgICAgLy8gdXN1YWxseSBnb25lIGJ5IHJlb3BlbiB0aW1lLCBhbmQgb25seSB0aGUg" +
     "YXR0YWNobWVudCdzIGhvc3QgcGF0aCBzdGlsbAogICAgICAgIC8vIHJlc29sdmVzLgogICAgICAg" +
-    "IGV2ZW50czogaGlzdG9yeUV2ZW50cyh0aGlzLmN0eCwgdmlzaWJsZUV2ZW50cyhyZXN1bHQuZXZl" +
+    "IGV2ZW50czogaGlzdG9yeUV2ZW50cyh0aGlzLmN0eCwgc3VyZmFjZUV2ZW50cyhyZXN1bHQuZXZl" +
     "bnRzID8/IFtdKSksCiAgICAgIH07CiAgICB9IGNhdGNoIChlcnJvcikgewogICAgICAvLyBUaGUg" +
     "b3BlbiBzdWNjZWVkZWQsIHNvIHRoaXMgbG9nIGV4aXN0czsgZmFpbGluZyB0byByZWFkIGl0IGlz" +
     "IG5ldmVyCiAgICAgIC8vICJ0aGlzIHNlc3Npb24gaGFzIG5vIGhpc3RvcnkiLgogICAgICByZXR1" +
@@ -2198,41 +2198,41 @@ export const BRIDGE_FILES: Readonly<Record<string, string>> = {
     "ZWQgdG8gZG8gbm90aGluZy4gRm9sZGluZyBoZXJlLCBvbmNlLCBrZWVwcyBldmVyeSByZXBsYXkg" +
     "cGF0aAogKiAocm9vdCwgY2hpbGQsIGltcG9ydCkgaG9uZXN0LgogKgogKiBQdXJlOiBhIHNlcSBs" +
     "aXN0IGluLCBhIHNlcSBsaXN0IG91dCwgc28gaXQgY2FuIGJlIGFzc2VydGVkIG9mZmxpbmUuCiAq" +
-    "CiAqIEBtb2R1bGUgZHNoLWJyaWRnZS9zdXJmYWNlCiAqLwoKLyoqCiAqIFNlcXMgdGhhdCBhIHJl" +
-    "cGxhY2Ugb3BlcmF0aW9uIHJlbW92ZWQgZnJvbSB0aGUgc3VyZmFjZS4KICoKICogQHBhcmFtIHty" +
-    "ZWFkb25seSB7c2VxPzogbnVtYmVyLCBzdXJmYWNlT3A/OiB1bmtub3dufVtdfSBldmVudHMgLSBw" +
-    "ZXJzaXN0ZWQgZXZlbnRzLgogKiBAcmV0dXJucyB7U2V0PG51bWJlcj59CiAqLwpleHBvcnQgZnVu" +
-    "Y3Rpb24gc2hhZG93ZWRTZXFzKGV2ZW50cykgewogIC8qKiBAdHlwZSB7bnVtYmVyW119ICovCiAg" +
-    "Y29uc3Qgbm9kZXMgPSBbXTsKICBjb25zdCBzaGFkb3dlZCA9IG5ldyBTZXQoKTsKICBmb3IgKGNv" +
-    "bnN0IGV2ZW50IG9mIGV2ZW50cykgewogICAgY29uc3Qgc2VxID0gZXZlbnQ/LnNlcTsKICAgIGlm" +
-    "ICh0eXBlb2Ygc2VxICE9PSAnbnVtYmVyJykgY29udGludWU7CiAgICBjb25zdCBvcCA9IGV2ZW50" +
-    "Py5zdXJmYWNlT3A7CiAgICBpZiAob3AgPT09IHVuZGVmaW5lZCkgY29udGludWU7CiAgICBpZiAo" +
-    "b3AgPT09ICdhcHBlbmQnKSB7CiAgICAgIG5vZGVzLnB1c2goc2VxKTsKICAgICAgY29udGludWU7" +
-    "CiAgICB9CiAgICBpZiAodHlwZW9mIG9wICE9PSAnb2JqZWN0JyB8fCBvcCA9PT0gbnVsbCB8fCBv" +
-    "cC5vcCAhPT0gJ3JlcGxhY2UnKSBjb250aW51ZTsKICAgIGNvbnN0IHN0YXJ0ID0gb3Auc3RhcnRT" +
-    "ZXE7CiAgICBjb25zdCBlbmQgPSBvcC5lbmRTZXE7CiAgICBpZiAodHlwZW9mIHN0YXJ0ICE9PSAn" +
-    "bnVtYmVyJyB8fCB0eXBlb2YgZW5kICE9PSAnbnVtYmVyJykgY29udGludWU7CiAgICBjb25zdCBm" +
-    "cm9tID0gbm9kZXMuaW5kZXhPZihzdGFydCk7CiAgICBjb25zdCB0byA9IG5vZGVzLmluZGV4T2Yo" +
-    "ZW5kKTsKICAgIC8vIEEgcmFuZ2UgdGhhdCBpcyBub3QgKG9yIG5vIGxvbmdlcikgY29udGlndW91" +
-    "cyBpbiB0aGUgc3VyZmFjZSBpcyBhIGxvZyB0aGUKICAgIC8vIHJlcGxheSBjYW5ub3QgaG9ub3Vy" +
-    "OyBkcm9wcGluZyB0aGUgcmVwbGFjZW1lbnQgd291bGQgc2lsZW50bHkgcmVzdXJyZWN0CiAgICAv" +
-    "LyB3aGF0ZXZlciBpdCBzaGFkb3dlZCwgc28gbGVhdmUgdGhlIG5vZGVzIGFsb25lIHJhdGhlciB0" +
-    "aGFuIGd1ZXNzLgogICAgaWYgKGZyb20gPT09IC0xIHx8IHRvID09PSAtMSB8fCB0byA8IGZyb20p" +
-    "IGNvbnRpbnVlOwogICAgZm9yIChsZXQgaW5kZXggPSBmcm9tOyBpbmRleCA8PSB0bzsgaW5kZXgg" +
-    "Kz0gMSkgc2hhZG93ZWQuYWRkKG5vZGVzW2luZGV4XSk7CiAgICBub2Rlcy5zcGxpY2UoZnJvbSwg" +
-    "dG8gLSBmcm9tICsgMSwgc2VxKTsKICB9CiAgcmV0dXJuIHNoYWRvd2VkOwp9CgovKioKICogVGhl" +
-    "IGxvZyB3aXRoIHRoZSBzaGFkb3dlZCBldmVudHMgcmVtb3ZlZCwgaW4gbG9nIG9yZGVyLgogKgog" +
-    "KiBPbmx5IHRoZSBzaGFkb3dlZCBldmVudHMgYXJlIGRyb3BwZWQ6IGxvZy1vbmx5IGV2ZW50cyAo" +
-    "YHR1cm4vZW5kYCwKICogYGNvbW1hbmQvKmAsIGNvbXBhY3Rpb24gbWFya2VycykgY2Fycnkgbm8g" +
-    "c3VyZmFjZSBtYXJrZXIgYW5kIGFyZSBzdGlsbCB3aGF0CiAqIHRoZSB0aW1lbGluZSBidWlsZGVy" +
-    "IGZvbGRzIGEgcmVwbGF5ZWQgY29udmVyc2F0aW9uIGZyb20g4oCUIGZpbHRlcmluZyB0aGVtIG91" +
-    "dAogKiB3b3VsZCByZWJ1aWxkIGEgc2Vzc2lvbiB3aXRoIG5vIHNldHRsZWQgdG9vbHMgYW5kIG5v" +
-    "IGNvbXBhY3Rpb24gcm93LgogKgogKiBAcGFyYW0ge3JlYWRvbmx5IHtzZXE/OiBudW1iZXJ9W119" +
-    "IGV2ZW50cwogKiBAcmV0dXJucyB7e3NlcT86IG51bWJlcn1bXX0KICovCmV4cG9ydCBmdW5jdGlv" +
-    "biB2aXNpYmxlRXZlbnRzKGV2ZW50cykgewogIGNvbnN0IHNoYWRvd2VkID0gc2hhZG93ZWRTZXFz" +
-    "KGV2ZW50cyk7CiAgaWYgKHNoYWRvd2VkLnNpemUgPT09IDApIHJldHVybiBbLi4uZXZlbnRzXTsK" +
-    "ICByZXR1cm4gZXZlbnRzLmZpbHRlcigoZXZlbnQpID0+ICFzaGFkb3dlZC5oYXMoZXZlbnQ/LnNl" +
-    "cSkpOwp9Cg==",
+    "CiAqIEBtb2R1bGUgZHNoLWJyaWRnZS9zdXJmYWNlCiAqLwoKLyoqCiAqIFZpc2libGUgc2VxcyBp" +
+    "biBzdXJmYWNlIG9yZGVyLgogKgogKiBFdmVudHMgd2l0aG91dCBhIHN1cmZhY2UgbWFya2VyIGFy" +
+    "ZSBub3Qgc3VyZmFjZS1lbGlnaWJsZSBhbmQgbmV2ZXIgYmVjb21lCiAqIG5vZGVzOyBsb2ctb25s" +
+    "eSBldmVudHMgKGBjb21tYW5kL3J1bmAsIGB0dXJuL2VuZGAsIOKApikgYXJlIGV4YWN0bHkgdGhh" +
+    "dC4KICoKICogQHBhcmFtIHtyZWFkb25seSB7c2VxPzogbnVtYmVyLCBzdXJmYWNlT3A/OiB1bmtu" +
+    "b3dufVtdfSBldmVudHMgLSBwZXJzaXN0ZWQgZXZlbnRzLiBBCiAqICAgcmVwbGFjZSBvcCBjYXJy" +
+    "aWVzIGBzdGFydFNlcWAvYGVuZFNlcWAgKERTSCdzIG93biBzcGVsbGluZyksIG5vdCBgc3RhcnRg" +
+    "L2BlbmRgLgogKiBAcmV0dXJucyB7bnVtYmVyW119IHZpc2libGUgc2Vxcywgb2xkZXN0IGZpcnN0" +
+    "LgogKi8KZXhwb3J0IGZ1bmN0aW9uIHN1cmZhY2VOb2RlcyhldmVudHMpIHsKICAvKiogQHR5cGUg" +
+    "e251bWJlcltdfSAqLwogIGNvbnN0IG5vZGVzID0gW107CiAgZm9yIChjb25zdCBldmVudCBvZiBl" +
+    "dmVudHMpIHsKICAgIGNvbnN0IHNlcSA9IGV2ZW50Py5zZXE7CiAgICBpZiAodHlwZW9mIHNlcSAh" +
+    "PT0gJ251bWJlcicpIGNvbnRpbnVlOwogICAgY29uc3Qgb3AgPSBldmVudD8uc3VyZmFjZU9wOwog" +
+    "ICAgaWYgKG9wID09PSB1bmRlZmluZWQpIGNvbnRpbnVlOwogICAgaWYgKG9wID09PSAnYXBwZW5k" +
+    "JykgewogICAgICBub2Rlcy5wdXNoKHNlcSk7CiAgICAgIGNvbnRpbnVlOwogICAgfQogICAgaWYg" +
+    "KHR5cGVvZiBvcCAhPT0gJ29iamVjdCcgfHwgb3AgPT09IG51bGwgfHwgb3Aub3AgIT09ICdyZXBs" +
+    "YWNlJykgY29udGludWU7CiAgICBjb25zdCBzdGFydCA9IG9wLnN0YXJ0U2VxOwogICAgY29uc3Qg" +
+    "ZW5kID0gb3AuZW5kU2VxOwogICAgaWYgKHR5cGVvZiBzdGFydCAhPT0gJ251bWJlcicgfHwgdHlw" +
+    "ZW9mIGVuZCAhPT0gJ251bWJlcicpIGNvbnRpbnVlOwogICAgY29uc3QgZnJvbSA9IG5vZGVzLmlu" +
+    "ZGV4T2Yoc3RhcnQpOwogICAgY29uc3QgdG8gPSBub2Rlcy5pbmRleE9mKGVuZCk7CiAgICAvLyBB" +
+    "IHJhbmdlIHRoYXQgaXMgbm90IChvciBubyBsb25nZXIpIGNvbnRpZ3VvdXMgaW4gdGhlIHN1cmZh" +
+    "Y2UgaXMgYSBsb2cgdGhlCiAgICAvLyByZXBsYXkgY2Fubm90IGhvbm91cjsgZHJvcHBpbmcgdGhl" +
+    "IHJlcGxhY2VtZW50IHdvdWxkIHNpbGVudGx5IHJlc3VycmVjdAogICAgLy8gd2hhdGV2ZXIgaXQg" +
+    "c2hhZG93ZWQsIHNvIGtlZXAgdGhlIG5vZGVzIGFzIHRoZXkgYXJlIGFuZCBsZXQgdGhlIGV2ZW50" +
+    "IHNvcnQKICAgIC8vIGl0c2VsZiBvdXQg4oCUIERTSCdzIG93biByZXBsYXkgcmVqZWN0cyBzdWNo" +
+    "IGEgbG9nLgogICAgaWYgKGZyb20gPT09IC0xIHx8IHRvID09PSAtMSB8fCB0byA8IGZyb20pIGNv" +
+    "bnRpbnVlOwogICAgbm9kZXMuc3BsaWNlKGZyb20sIHRvIC0gZnJvbSArIDEsIHNlcSk7CiAgfQog" +
+    "IHJldHVybiBub2RlczsKfQoKLyoqCiAqIFRoZSBldmVudHMgb2YgYSBsb2csIHJlZHVjZWQgdG8g" +
+    "dGhlIHZpc2libGUgc3VyZmFjZSBhbmQgb3JkZXJlZCBieSBpdC4KICoKICogQHBhcmFtIHtyZWFk" +
+    "b25seSB7c2VxPzogbnVtYmVyLCBzdXJmYWNlT3A/OiB1bmtub3dufVtdfSBldmVudHMKICogQHJl" +
+    "dHVybnMge3tzZXE/OiBudW1iZXIsIHN1cmZhY2VPcD86IHVua25vd259W119CiAqLwpleHBvcnQg" +
+    "ZnVuY3Rpb24gc3VyZmFjZUV2ZW50cyhldmVudHMpIHsKICBjb25zdCBieVNlcSA9IG5ldyBNYXAo" +
+    "KTsKICBmb3IgKGNvbnN0IGV2ZW50IG9mIGV2ZW50cykgewogICAgaWYgKHR5cGVvZiBldmVudD8u" +
+    "c2VxID09PSAnbnVtYmVyJykgYnlTZXEuc2V0KGV2ZW50LnNlcSwgZXZlbnQpOwogIH0KICByZXR1" +
+    "cm4gc3VyZmFjZU5vZGVzKGV2ZW50cykKICAgIC5tYXAoKHNlcSkgPT4gYnlTZXEuZ2V0KHNlcSkp" +
+    "CiAgICAuZmlsdGVyKChldmVudCkgPT4gZXZlbnQgIT09IHVuZGVmaW5lZCk7Cn0K",
   "lib/transport.js":
     "LyoqCiAqIE5ld2xpbmUtZGVsaW1pdGVkIEpTT04tUlBDIDIuMCBvdmVyIGJ5dGUgc3RyZWFtcy4K" +
     "ICoKICogVGhpcyBpcyBkZWxpYmVyYXRlbHkgbW9kZWxsZWQgb24gdGhlIHNoaXBwZWQgYGRzaC1z" +
