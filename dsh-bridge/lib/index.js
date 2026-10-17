@@ -68,6 +68,26 @@ function startBridge(ctx, config = {}) {
   const transport = new PaseoTransport(process.stdin, process.stdout);
   const server = new PaseoHarnessServer(ctx, transport, { adapters: config.adapters ?? {} });
   const rootFiber = ctx.root.fiber;
+
+  // File snapshots for the rewind's file rollback. DSH dispatches the tool
+  // lifecycle through the same event bus plugins use; these listeners only read
+  // the editing tools' arguments/results and never change execution. They are
+  // scoped through the `fs` service so the backend is composed before any tool
+  // can run, and each listener defers to `next()` exactly as the shipped tool
+  // policies do.
+  ctx.inject(['fs'], (scope) => {
+    scope.on('tools/execute', async (exec, next) => {
+      await server.captureFileBeforeTool(exec);
+      return next();
+    });
+    scope.on('tools/post-execute', async (exec, result, next) => {
+      await server.commitFileTool(exec, result);
+      return next();
+    });
+    scope.on('tools/result', (exec) => {
+      server.dropFileTool(exec);
+    });
+  });
   let exitTask;
 
   const disposeAndExit = (code) => {

@@ -22,7 +22,8 @@ import { BlockAssembler, createSystemMessage, createUserMessage, ReasoningEffort
 import { admitEncodedImages } from '@deepseek-ai/dsh-attachment';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import { underArchivedSession } from './archived-lineage.js';
-import { planRewind, restoresFiles, revertScope, successText } from './revert.js';
+import { FileSnapshots, isTrackedTool, mutationPathOf, resolveMutationPath } from './file-snapshots.js';
+import { isHumanUserMessage, planRewind, restoresFiles, revertScope, successText } from './revert.js';
 import { visibleEvents } from './surface.js';
 import { historyEvents, withImageHostPaths } from './image-host-path.js';
 import { promptSource } from './paseo-system-envelope.js';
@@ -193,6 +194,13 @@ export class PaseoHarnessServer {
      * conversation it named would no longer exist.
      */
     this.revertInflight = new Set();
+    /**
+     * Write-ahead file backups for the agent's editing tools, so a rewind can
+     * undo exactly the files the agent changed (and nothing else). The hooks
+     * that feed it are registered by the bridge entry point, which owns the
+     * DSH `fs` service.
+     */
+    this.fileSnapshots = new FileSnapshots();
     /**
      * Native child session id -> { parentId, mode?, label? }. Populated from
      * each child session's own durable header (`origin: 'subagent'`) the moment
@@ -1058,6 +1066,95 @@ export class PaseoHarnessServer {
     for (const pending of [...agent.inbox.nextStep]) agent.inbox.remove(pending.id);
   }
 
+  /**
+   * The newest human user message seq on a session's visible surface.
+   *
+   * File snapshots are grouped by this anchor: rewinding to message T restores
+   * every file the agent first touched after T. Injected user-role messages
+   * (Paseo envelopes, compaction checkpoints) are not user turns and must not
+   * become anchors themselves.
+   *
+   * @param {object} session
+   * @returns {number | undefined}
+   */
+  latestHumanAnchor(session) {
+    const nodes = session.surface.nodes;
+    for (let index = nodes.length - 1; index >= 0; index -= 1) {
+      const seq = nodes[index];
+      if (isHumanUserMessage(session.eventAt(seq))) return seq;
+    }
+    return undefined;
+  }
+
+  /**
+   * Snapshot one file before a tracked editing tool mutates it.
+   *
+   * Called from `tools/execute`; never throws, because a snapshot problem must
+   * not stop the agent's turn (the rewind reports a missing snapshot instead).
+   *
+   * @param {{name?: string, callId?: unknown, arguments?: unknown, agent?: {session?: object}}} exec
+   */
+  async captureFileBeforeTool(exec) {
+    try {
+      const session = exec?.agent?.session;
+      if (session === undefined) return;
+      if (session.header?.origin === 'subagent' || (session.header?.delegationDepth ?? 0) > 0) return;
+      if (!isTrackedTool(exec)) return;
+      const rawPath = mutationPathOf(exec);
+      if (rawPath === undefined) return;
+      const anchorSeq = this.latestHumanAnchor(session);
+      if (anchorSeq === undefined) return;
+      const path = resolveMutationPath(session.header?.cwd ?? this.cwd, rawPath);
+      const result = await this.fileSnapshots.capture({
+        sessionId: String(session.id),
+        anchorSeq,
+        callId: String(exec.callId),
+        path,
+      });
+      if (result.ok && result.skipped !== undefined) {
+        process.stderr.write(`[bridge] file snapshot skipped for ${path}: ${result.skipped}\n`);
+      } else if (!result.ok) {
+        process.stderr.write(`[bridge] file snapshot failed for ${path}: ${result.error}\n`);
+      }
+    } catch (error) {
+      process.stderr.write(`[bridge] file snapshot hook: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
+  }
+
+  /**
+   * Commit a successful tool call's pending snapshot to the session journal.
+   *
+   * @param {{callId?: unknown, agent?: {session?: object}}} exec
+   * @param {{isError?: boolean}} [result]
+   */
+  async commitFileTool(exec, result) {
+    try {
+      const session = exec?.agent?.session;
+      if (session === undefined) return;
+      await this.fileSnapshots.commit(
+        { sessionId: String(session.id), callId: String(exec.callId) },
+        result,
+      );
+    } catch (error) {
+      process.stderr.write(`[bridge] file snapshot commit: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
+  }
+
+  /**
+   * Drop a pending snapshot when a tool fails or is cancelled.
+   *
+   * @param {{callId?: unknown, agent?: {session?: object}}} exec
+   */
+  dropFileTool(exec) {
+    try {
+      const session = exec?.agent?.session;
+      if (session === undefined) return;
+      this.fileSnapshots.discard({ sessionId: String(session.id), callId: String(exec.callId) });
+    } catch {
+      /* dropping a pending snapshot cannot fail in a way worth reporting */
+    }
+  }
+
   async revert(params) {
     const rec = this.requireSession(params.sessionId);
     const agent = rec.handle.agent;
@@ -1077,8 +1174,17 @@ export class PaseoHarnessServer {
       await this.settleAgentForRevert(agent);
       const resolved = planRewind(session.surface.nodes, (seq) => session.eventAt(seq), params.token);
       if (!resolved.ok) throw new Error(resolved.reason);
+      // Plan the file restore before touching the log: an unreadable journal or
+      // a target outside the session must fail while the conversation is still
+      // untouched. An empty plan is not an error — the agent may not have edited
+      // any file since that message.
+      let filePlan;
       if (restoresFiles(scope)) {
-        throw new Error('文件回退尚未接入（下一步实现）；请改用「只回退对话」。');
+        const planned = await this.fileSnapshots.planRestore(sessionKey, resolved.targetSeq);
+        if (planned.skippedLines > 0) {
+          process.stderr.write(`[bridge] ${planned.skippedLines} unreadable file-snapshot journal line(s) were ignored\n`);
+        }
+        filePlan = planned.actions;
       }
       // The one write: a positional surface replacement, validated by DSH before
       // it is appended. The range comes from the surface snapshot planRewind
@@ -1092,7 +1198,26 @@ export class PaseoHarnessServer {
           sourceEventSeqs: [...shadowed],
         },
       );
-      return { kind: 'success', text: successText(resolved.targetSeq) };
+      let files;
+      if (filePlan !== undefined && filePlan.length > 0) {
+        files = await this.fileSnapshots.restore(sessionKey, filePlan);
+        await this.fileSnapshots.prune(sessionKey, resolved.targetSeq).catch((error) => {
+          process.stderr.write(`[bridge] pruning the file-snapshot journal failed: ${error instanceof Error ? error.message : String(error)}\n`);
+        });
+        await this.fileSnapshots.trim(sessionKey).catch(() => {});
+        if (files.failed.length > 0) {
+          process.stderr.write(
+            `[bridge] file restore failed for ${files.failed.map((entry) => entry.path).join(', ')}; rescue copies in ${files.rescueDir}\n`,
+          );
+        }
+      } else if (filePlan !== undefined) {
+        files = { restored: [], deleted: [], skipped: [], failed: [], rescue: [], rescueDir: this.fileSnapshots.rescueDir(sessionKey) };
+      }
+      return {
+        kind: 'success',
+        text: successText(resolved.targetSeq),
+        ...(files === undefined ? {} : { files }),
+      };
     } finally {
       this.revertInflight.delete(sessionKey);
     }

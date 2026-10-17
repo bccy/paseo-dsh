@@ -188,6 +188,41 @@ console.log('wiring (the pure module is useless if nothing calls it)');
     'the old assistant/message placeholder is gone',
     /append\(\s*'assistant\/message'[\s\S]{0,120}surfaceOp/.test(bridge) === false,
   );
+
+  // File layer: editing-tool write-ahead snapshots wired around the rewind.
+  check('the bridge owns a FileSnapshots store', /new FileSnapshots\(/.test(bridge));
+  const planIndex = bridge.indexOf('planRestore(');
+  const appendIndex = bridge.indexOf("session.append(\n        'system/message'");
+  const restoreIndex = bridge.indexOf('fileSnapshots.restore(');
+  check(
+    'files are planned before the log write and restored after it',
+    planIndex !== -1 && appendIndex !== -1 && restoreIndex !== -1 && planIndex < appendIndex && appendIndex < restoreIndex,
+    `plan ${planIndex}, append ${appendIndex}, restore ${restoreIndex}`,
+  );
+  check(
+    'the receipt carries the file outcome',
+    /files === undefined \? \{\} : \{ files \}/.test(bridge),
+  );
+
+  const bridgeEntry = read('dsh-bridge/lib/index.js');
+  check(
+    'the bridge entry observes tools/execute for before-capture',
+    /scope\.on\('tools\/execute'[\s\S]{0,160}captureFileBeforeTool/.test(bridgeEntry),
+  );
+  check(
+    'and tools/post-execute for the successful commit',
+    /scope\.on\('tools\/post-execute'[\s\S]{0,160}commitFileTool/.test(bridgeEntry),
+  );
+  check(
+    'and tools/result to drop failed/cancelled captures',
+    /scope\.on\('tools\/result'[\s\S]{0,120}dropFileTool/.test(bridgeEntry),
+  );
+
+  const snapshotsModule = read('dsh-bridge/lib/file-snapshots.js');
+  check('the file layer tracks the write/edit tools', /'write', 'edit'/.test(snapshotsModule));
+  check('before-content is captured into content-addressed objects', /createHash\('sha256'\)/.test(snapshotsModule));
+  check('current content is rescued before a restore overwrites it', /#rescue\(/.test(snapshotsModule) && /rescueDir/.test(snapshotsModule));
+  check('a failed journal line never invalidates earlier snapshots', /skippedLines/.test(snapshotsModule));
 }
 
 const failed = results.filter((result) => !result.pass);
