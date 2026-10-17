@@ -8,6 +8,9 @@
  *
  * @module dsh-paseo/server/provider
  */
+import { readdirSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { spawn } from "node:child_process";
 import {
   negotiateProviderCapabilities,
@@ -407,10 +410,17 @@ class DshConnection implements ProviderConnection {
    * process, and a reply racing that restart would surface as a failed rewind.
    */
   #refreshAgent(sessionId: string): void {
-    const binary = process.env.PASEO_BIN ?? "paseo";
     const timer = setTimeout(() => {
+      const agentId = findPaseoAgentId(sessionId);
+      if (agentId === undefined) {
+        process.stderr.write(
+          `[${PROVIDER_ID}] agent reload skipped: no agent record under ~/.paseo/agents carries session ${sessionId}\n`,
+        );
+        return;
+      }
+      const binary = process.env.PASEO_BIN ?? "paseo";
       try {
-        const child = spawn(binary, ["agent", "reload", sessionId], {
+        const child = spawn(binary, ["agent", "reload", agentId], {
           detached: true,
           stdio: ["ignore", "ignore", "pipe"],
         });
@@ -428,7 +438,7 @@ class DshConnection implements ProviderConnection {
         child.on("exit", (code) => {
           const trimmed = stderrText.trim();
           process.stderr.write(
-            `[${PROVIDER_ID}] agent reload ${sessionId} exited ${String(code)}${trimmed === "" ? "" : `: ${trimmed.slice(0, 400)}`}\n`,
+            `[${PROVIDER_ID}] agent reload ${agentId} exited ${String(code)}${trimmed === "" ? "" : `: ${trimmed.slice(0, 400)}`}\n`,
           );
         });
         child.unref();
@@ -674,3 +684,56 @@ export function createDshProvider(): ProviderRegistration {
 }
 
 export { profileName };
+
+/**
+ * Resolve the Paseo agent id that owns one provider session.
+ *
+ * Paseo hands the provider a session id, but `paseo agent reload` takes the
+ * *agent* id, and the plugin API exposes no mapping — `PaseoApi.agents` is
+ * list/ref/create/subscribe and the list payload has no session id. The daemon's
+ * own agent record does carry both: `~/.paseo/agents/<workspace>/<agentId>.json`
+ * stores `persistence.sessionId` (a JSON string that embeds the provider session
+ * id). Scanning those small files is cheap enough for a rewind, which is rare.
+ *
+ * A missing or unreadable store is not an error: it means "cannot refresh", and
+ * the caller says so rather than failing the rewind that already happened.
+ *
+ * @param sessionId - the provider session id Paseo opened this session with.
+ * @returns the owning agent id, or undefined when no record claims that session.
+ */
+function findPaseoAgentId(sessionId: string): string | undefined {
+  const root = join(homedir(), ".paseo", "agents");
+  let workspaces: string[];
+  try {
+    workspaces = readdirSync(root);
+  } catch {
+    return undefined;
+  }
+  for (const workspace of workspaces) {
+    const dir = join(root, workspace);
+    let files: string[];
+    try {
+      files = readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue;
+      let raw: string;
+      try {
+        raw = readFileSync(join(dir, file), "utf8");
+      } catch {
+        continue;
+      }
+      // Cheap pre-filter before parsing: most records do not mention this session.
+      if (!raw.includes(sessionId)) continue;
+      try {
+        const parsed = JSON.parse(raw) as { id?: unknown };
+        if (typeof parsed.id === "string" && parsed.id !== "") return parsed.id;
+      } catch {
+        continue;
+      }
+    }
+  }
+  return undefined;
+}
