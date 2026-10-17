@@ -6,7 +6,10 @@
 
 - id: system-prompt
   config:
-    personaSuffix: Your working directory is {{cwd}}.
+    # DSH 0.2.1 registers only `provider` and `model` as prompt variables;
+    # `{{cwd}}` is no longer one, and referencing it fails every turn with
+    # `unknown prompt variable "{{cwd}}"`. The model learns its cwd from the
+    # runtime context / shell instead.
     personaPrefix: >-
       You are a coding agent powered by the {{model}} model.
 

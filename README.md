@@ -329,7 +329,7 @@ DSH 的 agent preset 能把"人设 + 一套能力"打包成一个选项。插件
             name: '@deepseek-ai/dsh-persona'
             config:
               prefix: You are a helpful assistant.
-              suffix: Your working directory is {{cwd}}.
+              # 注意：DSH 0.2.1 起只注册 provider/model 变量，{{cwd}} 会导致每回合失败
 ```
 
 > 想让某个人设自带额外工具（例如挂一个领域工具插件），把它加进对应 preset 的 `plugins:` 即可——
@@ -344,7 +344,7 @@ patch 位是插件自己的发布计数。装的时候挑与 daemon 上 `dsh` �
 ## 相关文档
 
 - [docs/ADOPTION.md](docs/ADOPTION.md) — 改造指南：改动点、配置方法、踩坑清单
-- [docs/FIELD-NOTES.md](docs/FIELD-NOTES.md) — 19 个真实缺陷的症状 → 根因 → 修法
+- [docs/FIELD-NOTES.md](docs/FIELD-NOTES.md) — 20 个真实缺陷的症状 → 根因 → 修法
 - [AGENTS.md](AGENTS.md) — 给 AI Agent 的说明（Codex 等会自动读取）。不管你是被叫来
   装它、还是被叫来改它，先看这个
 
