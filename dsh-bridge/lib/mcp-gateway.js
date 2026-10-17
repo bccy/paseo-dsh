@@ -24,6 +24,7 @@ import { join } from 'node:path';
 import Schema from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { DEFAULT_MCP_TIMEOUT_MS, McpHttpClient, browserHostGapOf, unavailableBrowserTools } from './mcp-http.js';
+import { registerSubagentArchiveTool } from './subagent-archive.js';
 
 /** Stable Cordis plugin name. */
 export const name = 'paseo-mcp-gateway';
@@ -97,6 +98,11 @@ function projectContent(server, tool, content) {
  * Paseo's overlay costs nothing.
  */
 export function apply(ctx, config = {}) {
+  // Registered before the server check: archiving subagents is independent of
+  // any MCP server, and the one session that needs it is exactly one that may
+  // have no servers mounted.
+  registerSubagentArchiveTool(ctx);
+
   const servers = config?.servers ?? {};
   const serverNames = Object.keys(servers);
   if (serverNames.length === 0) return;
