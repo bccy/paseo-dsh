@@ -23,7 +23,7 @@ import { BlockAssembler, createUserMessage, ReasoningEffortId } from '@deepseek-
 import { admitEncodedImages } from '@deepseek-ai/dsh-attachment';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import { underArchivedSession } from './archived-lineage.js';
-import { dirtyWorkspaceError, restoresFiles, revertOrdinal, rewindLine } from './revert.js';
+import { dirtyWorkspaceError, restoresFiles, revertOrdinal } from './revert.js';
 import { visibleEvents } from './surface.js';
 import { historyEvents, withImageHostPaths } from './image-host-path.js';
 import { promptSource } from './paseo-system-envelope.js';
@@ -1043,18 +1043,30 @@ export class PaseoHarnessServer {
         throw new Error('该工作区不是 git 仓库，无法回退文件；请改用「只回退对话」。');
       }
       if (worktree.dirty.length > 0) throw new Error(dirtyWorkspaceError(worktree.dirty));
+      // The snapshot ledger is wired in the next stage; until it is, refusing is
+      // the only honest answer — a silent half rollback would drop the files while
+      // claiming success.
+      throw new Error('文件回退正在实现中：请先选择「只回退对话」。');
     }
-    const line = rewindLine(resolved.seq, scope);
-    if (line === undefined) {
-      throw new Error('当前后端不支持只回退文件；请选择「回退对话和文件」或「只回退对话」。');
-    }
-    const commands = this.ctx.get('commands');
-    if (commands === undefined) throw new Error('command registry is not mounted in this profile');
-    const execution = await commands.execute(agent, line, [], new AbortController().signal);
-    if (execution === undefined) throw new Error('the rewind command is not registered in this profile');
+    const nodes = session.surface.nodes;
+    const endSeq = nodes[nodes.length - 1];
+    if (endSeq === undefined) throw new Error('会话还没有可撤回的内容');
+    // The one write: a surface replacement, the same mechanism compaction uses.
+    // It is a `surfaceOp` on a new event — nothing is deleted, and every event in
+    // [startSeq, endSeq] leaves the visible surface, so the model (which derives
+    // its messages from `surface.nodes`) stops seeing it too.
+    //
+    // It is `assistant/message` with empty content on purpose: `deriveEventMessage`
+    // skips an empty assistant message, so the replacement itself never appears in
+    // the conversation — unlike an empty user message, which the model would read.
+    session.append(
+      'assistant/message',
+      { message: { content: [] } },
+      { surfaceOp: { op: 'replace', startSeq: resolved.seq, endSeq } },
+    );
     return {
-      kind: execution.result.kind,
-      ...(execution.result.text === undefined ? {} : { text: execution.result.text }),
+      kind: 'success',
+      text: `Withdrawn seq ${resolved.seq} and everything after it`,
     };
   }
 
