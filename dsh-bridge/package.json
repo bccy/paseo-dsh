@@ -16,7 +16,8 @@
   "exports": {
     ".": "./lib/index.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./mcp-gateway": "./lib/mcp-gateway.js"
   },
   "files": [
     "lib",

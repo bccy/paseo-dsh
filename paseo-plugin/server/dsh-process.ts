@@ -203,8 +203,20 @@ interface Pending {
   reject(error: Error): void;
 }
 
-/** The DSH plugin each injected MCP server is mounted through. */
+/** The DSH plugin each injected stdio MCP server is mounted through. */
 const MCP_CLIENT_PLUGIN = "@deepseek-ai/dsh-mcp-client";
+
+/**
+ * The bridge bundle's MCP gateway: three discovery/call tools instead of one
+ * schema per MCP tool.
+ *
+ * Streamable-HTTP servers are proxied rather than mounted directly because a
+ * server with dozens of tools costs that many schemas in every request — Paseo's
+ * own server is 61 tools (~33 KB). The gateway keeps the same endpoint and token
+ * flowing (they arrive through this overlay either way) while the model pays for
+ * only the tools it actually discovers.
+ */
+const MCP_GATEWAY_PLUGIN = "dsh-paseo-bridge/mcp-gateway";
 
 /** DSH's `serverName` contract: a tool-name namespace, not a free-form label. */
 const MCP_SERVER_NAME = /^[A-Za-z0-9_-]{1,32}$/;
@@ -215,50 +227,65 @@ interface McpPatch {
   dir: string;
 }
 
-/** Translate one Paseo MCP server into a `dsh-mcp-client` patch entry. */
-function mcpEntry(name: string, server: DshMcpServer): Record<string, unknown> {
-  if (!MCP_SERVER_NAME.test(name)) {
-    throw new Error(
-      `MCP server "${name}" cannot be mounted in DSH: a serverName must match ${MCP_SERVER_NAME.source}`,
-    );
-  }
-  // `failOnStartupError` is what keeps a broken connection loud: DSH still boots
-  // and the entry is reported as "did not activate" on stderr, which this
-  // process forwards to the log, instead of the model silently getting no tools.
-  if (server.type === "stdio") {
-    return {
-      id: `mcp-${name}`,
-      name: MCP_CLIENT_PLUGIN,
-      config: {
-        serverName: name,
-        transport: "stdio",
-        command: server.command,
-        ...(server.args === undefined ? {} : { args: server.args }),
-        ...(server.env === undefined ? {} : { env: server.env }),
-        failOnStartupError: true,
-      },
-    };
-  }
-  if (server.type === "sse") {
-    // dsh-mcp-client speaks stdio and Streamable HTTP only. Retrying a legacy
-    // SSE endpoint as Streamable HTTP fails with an error that names the wrong
-    // cause, so refuse the server by name instead of guessing at a transport.
-    throw new Error(
-      `MCP server "${name}" uses the legacy "sse" transport, which DSH does not support`
-        + ' (only "stdio" and Streamable HTTP)',
-    );
-  }
-  return {
-    id: `mcp-${name}`,
-    name: MCP_CLIENT_PLUGIN,
-    config: {
-      serverName: name,
-      transport: "streamable-http",
+/**
+ * Translate Paseo's MCP servers into patch entries.
+ *
+ * Streamable-HTTP servers ride the gateway (one row, three tools); stdio servers
+ * keep the stock client because the gateway only speaks HTTP, and dropping them
+ * would silently remove tools a user configured. Legacy SSE stays refused.
+ */
+function mcpEntries(
+  servers: Readonly<Record<string, DshMcpServer>>,
+): Record<string, unknown>[] {
+  const entries: Record<string, unknown>[] = [];
+  const proxied: Record<string, { url: string; headers?: Record<string, string> }> = {};
+  for (const [name, server] of Object.entries(servers)) {
+    if (!MCP_SERVER_NAME.test(name)) {
+      throw new Error(
+        `MCP server "${name}" cannot be mounted in DSH: a serverName must match ${MCP_SERVER_NAME.source}`,
+      );
+    }
+    if (server.type === "stdio") {
+      // `failOnStartupError` is what keeps a broken connection loud: DSH still boots
+      // and the entry is reported as "did not activate" on stderr, which this
+      // process forwards to the log, instead of the model silently getting no tools.
+      entries.push({
+        id: `mcp-${name}`,
+        name: MCP_CLIENT_PLUGIN,
+        config: {
+          serverName: name,
+          transport: "stdio",
+          command: server.command,
+          ...(server.args === undefined ? {} : { args: server.args }),
+          ...(server.env === undefined ? {} : { env: server.env }),
+          failOnStartupError: true,
+        },
+      });
+      continue;
+    }
+    if (server.type === "sse") {
+      // The gateway speaks Streamable HTTP only. Retrying a legacy SSE endpoint as
+      // Streamable HTTP fails with an error that names the wrong cause, so refuse
+      // the server by name instead of guessing at a transport.
+      throw new Error(
+        `MCP server "${name}" uses the legacy "sse" transport, which DSH does not support`
+          + ' (only "stdio" and Streamable HTTP)',
+      );
+    }
+    proxied[name] = {
       url: server.url,
       ...(server.headers === undefined ? {} : { headers: server.headers }),
-      failOnStartupError: true,
-    },
-  };
+    };
+  }
+  if (Object.keys(proxied).length > 0) {
+    entries.push({
+      id: "paseo-mcp-gateway",
+      name: MCP_GATEWAY_PLUGIN,
+      inject: ["tools"],
+      config: { servers: proxied },
+    });
+  }
+  return entries;
 }
 
 /**
@@ -278,7 +305,7 @@ function prepareMcpPatch(
   if (names.length === 0) return undefined;
   // Translate and validate everything before touching the filesystem, so a
   // rejected server leaves no directory behind.
-  const entries = names.map((name) => mcpEntry(name, list[name]));
+  const entries = mcpEntries(list);
   const dir = mkdtempSync(join(tmpdir(), "dsh-paseo-mcp-"));
   const path = join(dir, "mcp-patch.json");
   // JSON is a YAML subset and DSH parses the patch as YAML, so emitting JSON is
