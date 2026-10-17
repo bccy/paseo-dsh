@@ -42,6 +42,11 @@ export function shadowedSeqs(events) {
     // replay cannot honour; dropping the replacement would silently resurrect
     // whatever it shadowed, so leave the nodes alone rather than guess.
     if (from === -1 || to === -1 || to < from) continue;
+    // Every event in the span is shadowed, not just the surface nodes: a replace
+    // covers seqs, and the log-only events in between (`turn/end`, usage updates)
+    // are what a replayed turn footer ("工作了 37s", the copy button) is drawn
+    // from — leaving them behind replayed a turn whose messages were gone.
+    for (let shadowedSeq = start; shadowedSeq <= end; shadowedSeq += 1) shadowed.add(shadowedSeq);
     for (let index = from; index <= to; index += 1) shadowed.add(nodes[index]);
     nodes.splice(from, to - from + 1, seq);
   }

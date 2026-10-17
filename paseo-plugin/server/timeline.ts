@@ -14,6 +14,15 @@ import type {
 import type { JsonValue } from "./dsh-process";
 import { LOCALE, UI } from "./locale";
 
+/**
+ * Command names `dsh-rewind` registers for the rewind button.
+ *
+ * The provider runs them itself; the user never types them, so their rows are
+ * dropped from the timeline (see `#commandDone`).
+ */
+const REWIND_COMMAND_NAMES = new Set(["rewind", "undo"]);
+
+
 interface DshEvent {
   type: string;
   seq?: number;
@@ -1000,6 +1009,12 @@ export class TimelineBuilder {
     // A failed one is *not* dropped: Paseo's marker has no failure state, so the
     // failed row is the only place the error can be read. Fail loud.
     if (!failed && this.#compactionCommands.has(commandId)) return [];
+    // A rewind is executed by this provider on the user's behalf — the button
+    // runs `dsh-rewind`'s `/rewind @<seq> chat|both` — so the row would be the
+    // only trace of an implementation detail the user never typed. Drop the
+    // successful one; a failed rewind keeps its row because Paseo's marker has no
+    // failure state and the row is where the error can be read.
+    if (!failed && REWIND_COMMAND_NAMES.has(name)) return [];
     const line = `/${name}`;
     return this.#put({
       type: "tool_call",

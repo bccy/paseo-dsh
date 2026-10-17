@@ -29,6 +29,11 @@ console.log('shadowed seqs');
   const logOnly = (seq) => ({ seq });
   check('appends are never shadowed', shadowedSeqs([append(0), append(1)]).size === 0);
   check('a whole range is shadowed', JSON.stringify([...shadowedSeqs([append(0), append(1), append(2), append(3), replace(4, 1, 3)])]) === '[1,2,3]');
+  check(
+    'log-only events inside the range are shadowed too',
+    shadowedSeqs([append(0), append(1), { seq: 2 }, append(3), replace(4, 1, 3)]).has(2) === true,
+    'a turn footer would otherwise replay',
+  );
   check('a single node is shadowed', JSON.stringify([...shadowedSeqs([append(0), append(1), append(2), replace(3, 2, 2)])]) === '[2]');
   check('an unknown range shadows nothing', shadowedSeqs([append(0), append(1), replace(2, 9, 1)]).size === 0);
   check('a reversed range shadows nothing', shadowedSeqs([append(0), append(1), append(2), replace(3, 2, 0)]).size === 0);
@@ -51,7 +56,10 @@ console.log('visible events keep the log-only ones');
   ];
   const kept = visibleEvents(events).map((event) => event.seq);
   check('the shadowed messages are gone', kept.includes(1) === false && kept.includes(2) === false && kept.includes(4) === false, JSON.stringify(kept));
-  check('log-only events survive the fold', kept.includes(3) === true && kept.includes(6) === true, JSON.stringify(kept));
+  // seq 3 is inside the replaced range, so it is shadowed like everything else in
+  // that span; seq 6 comes after the replacement and must survive.
+  check('a log-only event inside the range is shadowed', kept.includes(3) === false, JSON.stringify(kept));
+  check('a log-only event after the range survives', kept.includes(6) === true, JSON.stringify(kept));
   check('the replacement itself is kept', kept.includes(5) === true);
   check('later appends survive', kept.includes(7) === true);
   check('nothing is reordered', JSON.stringify(kept) === JSON.stringify([...kept].sort((a, b) => a - b)), JSON.stringify(kept));
