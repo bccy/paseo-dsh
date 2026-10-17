@@ -192,17 +192,41 @@ console.log("the tail window the collapsed line shows while streaming");
 
 console.log("the row wires the window in");
 {
-  // The window is worthless if the component neither measures its box nor prefers
-  // the tail while the thought is still growing.
+  // The window is worthless if the component neither measures a usable width nor
+  // prefers the tail while the thought is still growing.
+  //
+  // The width must NOT be taken from the line itself: the sweep container is
+  // content-sized, so a `flex: 1` child inside it reports its own content width
+  // and the window collapses — the desktop client showed two characters. It has
+  // to come from the row and the label, which are definite on every platform.
   const code = readFileSync(join(__dirname, "..", "client", "inline-thinking.tsx"), "utf8")
     .split("\n")
     .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
     .join("\n");
-  check("the row measures the preview box", /onLayout=\{[^}]*layout\.width/.test(code));
+  check(
+    "the row measures itself, not the line inside the content-sized sweep",
+    /style=\{styles\.row\}\s*\n\s*onLayout=\{/.test(code),
+    "row measurement is missing",
+  );
+  check(
+    "and measures the label it has to subtract",
+    /style=\{\[styles\.label[^\n]*\]\}\s*\n\s*onLayout=\{/.test(code),
+    "label measurement is missing",
+  );
+  check(
+    "and derives the line width from both",
+    /const lineWidth = Math\.max\(/.test(code) && /rowWidth - THINK_ICON_SIZE - ROW_HEAD_GAP - labelWidth/.test(code),
+    "lineWidth derivation is missing",
+  );
   check(
     "and shows the tail while growing, dsh's rule otherwise",
-    /growing && boxWidth > 0\s*\?\s*streamingTail\(\s*text\s*,\s*boxWidth\s*,/.test(code),
+    /growing && lineWidth > 0\s*\?\s*streamingTail\(\s*text\s*,\s*lineWidth\s*,/.test(code),
     (code.match(/streamingTail\([^)]*\)/g) ?? []).join(" | ") || "(no call found)",
+  );
+  check(
+    "the preview line never measures itself",
+    !/numberOfLines=\{1\}[\s\S]{0,80}onLayout=\{/.test(code),
+    "the line still measures itself",
   );
 }
 
