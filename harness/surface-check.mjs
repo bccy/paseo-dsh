@@ -18,7 +18,7 @@
  *
  * Usage: node harness/surface-check.mjs
  */
-import { isEmptySystemMessage, isRewindSeam, visibleEvents } from '../dsh-bridge/lib/surface.js';
+import { isRewindMarker, visibleEvents } from '../dsh-bridge/lib/surface.js';
 
 const results = [];
 const check = (name, pass, detail) => {
@@ -31,13 +31,22 @@ const assistantMessage = (seq) => ({ seq, type: 'assistant/message', surfaceOp: 
 const systemMessage = (seq, text = 'SYS') => ({ seq, type: 'system/message', surfaceOp: 'append', data: { message: { id: `s${seq}`, role: 'system', content: text === '' ? [] : [{ type: 'text', text }], source: { kind: 'system-prompt' } } } });
 const logOnly = (seq, type) => ({ seq, type, data: {} });
 
-/** The rewind marker this bridge appends. */
+/** The rewind marker this bridge appends (source kind is the durable identity). */
 const rewindSeam = (seq, start, end, shadowed) => ({
+  seq,
+  type: 'user/message',
+  surfaceOp: { op: 'replace', startSeq: start, endSeq: end },
+  sourceEventSeqs: shadowed,
+  data: { id: `mark${seq}`, role: 'user', content: [{ type: 'text', text: '(empty message)' }], source: { kind: 'paseo-rewind' } },
+});
+
+/** DSH's own system-prompt maintenance: a system node replaced by an empty one. */
+const systemReplace = (seq, start, end, shadowed) => ({
   seq,
   type: 'system/message',
   surfaceOp: { op: 'replace', startSeq: start, endSeq: end },
   sourceEventSeqs: shadowed,
-  data: { message: { id: `mark${seq}`, role: 'system', content: [], source: { kind: 'system-prompt' } } },
+  data: { turn: 1, step: 1, message: { id: `sys${seq}`, role: 'system', content: [], source: { kind: 'system-prompt' } } },
 });
 
 /** A compaction checkpoint (DSH's own replacement carrier). */
@@ -53,9 +62,11 @@ const seqs = (events) => events.map((event) => event.seq);
 
 console.log('marker recognition');
 {
-  check('an empty system message is a marker', isEmptySystemMessage(systemMessage(1, '')));
-  check('a system message with text is not', isEmptySystemMessage(systemMessage(1, 'SYS')) === false);
-  check('a user message is not', isEmptySystemMessage(userMessage(1)) === false);
+  check('the paseo-rewind user message is a marker', isRewindMarker(rewindSeam(1, 0, 0, [0])));
+  check('a human user message is not', isRewindMarker(userMessage(1)) === false);
+  check('a dsh-rewind legacy marker is not', isRewindMarker({ seq: 1, type: 'user/message', data: { id: 'x', source: { kind: 'dsh-rewind' }, content: [] } }) === false);
+  check('a compaction checkpoint is not', isRewindMarker(compactionCheckpoint(1, 0, 0, [0])) === false);
+  check('an empty system message is not', isRewindMarker(systemMessage(1, '')) === false);
 }
 
 console.log('a rewind seam drops its whole span (trailing log events included)');
@@ -108,7 +119,7 @@ console.log('DSH system-prompt maintenance is not a rewind');
     assistantMessage(3),
     // Replace one non-head system node with an empty system message: DSH's own
     // SystemPromptProjection does this, and it must not fold the transcript.
-    rewindSeam(4, 1, 1, [1]),
+    systemReplace(4, 1, 1, [1]),
   ];
   const kept = visibleEvents(events);
   check('a single system->system replacement drops nothing', kept.length === events.length, `${kept.length}/${events.length}`);
@@ -172,10 +183,22 @@ console.log('a non-bridge user/message replacement is not a rewind seam');
   check('legacy markers do not fold the transcript', kept.length === events.length, `${kept.length}/${events.length}`);
 }
 
-console.log('isRewindSeam needs content in the shadowed range');
+console.log('an empty system replacement is not a rewind seam any more');
 {
-  check('system content under the range is not a rewind seam', isRewindSeam(rewindSeam(1, 0, 0, [0]), [systemMessage(0, '')]) === false);
-  check('user content under the range is', isRewindSeam(rewindSeam(1, 0, 0, [0]), [userMessage(0)]) === true);
+  const events = [
+    systemMessage(0),
+    userMessage(1),
+    assistantMessage(2),
+    {
+      seq: 3,
+      type: 'system/message',
+      surfaceOp: { op: 'replace', startSeq: 1, endSeq: 2 },
+      sourceEventSeqs: [1, 2],
+      data: { message: { id: 'm', role: 'system', content: [], source: { kind: 'system-prompt' } } },
+    },
+  ];
+  const kept = visibleEvents(events);
+  check('the empty system replacement folds nothing', kept.length === events.length, `${kept.length}/${events.length}`);
 }
 
 const failed = results.filter((result) => !result.pass);

@@ -16,10 +16,11 @@
  *   already read (measured on a real session: 205 user messages would replay as
  *   60). So compaction replacements are left alone.
  *
- * The two are distinguished structurally: this bridge's rewind marker is an
- * empty `system/message` replacement whose shadowed range contains at least one
- * non-system node. Compaction replacements are `user/message` checkpoints, and
- * DSH's own system-prompt maintenance replaces one system node with another.
+ * The two are distinguished by the replacement's source kind, which the log
+ * format keeps durable: this bridge's rewind marker is a `user/message` whose
+ * `source.kind` is `paseo-rewind`. Compaction checkpoints use
+ * `compact-checkpoint`, and other producers keep their own kinds, so no
+ * heuristic (empty content, range shape) has to be guessed from the payload.
  *
  * Shadowed rewind events are dropped through `seamSeq - 1`, which covers the
  * log-only tail of the withdrawn turn (the last surface node's seq comes before
@@ -39,28 +40,22 @@ const SURFACE_EVENT_TYPES = new Set([
   'tool/result',
 ]);
 
-/**
- * Whether one event is this bridge's rewind marker (an empty system message).
- *
- * @param {{type?: string, data?: {message?: {content?: unknown}}}} event
- * @returns {boolean}
- */
-export function isEmptySystemMessage(event) {
-  if (event?.type !== 'system/message') return false;
-  const content = event?.data?.message?.content;
-  return Array.isArray(content) && content.length === 0;
-}
+/** The `source.kind` this bridge claims for its own rewind marker. */
+export const REWIND_MARKER_SOURCE_KIND = 'paseo-rewind';
 
 /**
- * Whether one event is a rewind seam over `shadowed` surface nodes.
+ * Whether one event is this bridge's rewind marker.
  *
- * @param {{type?: string, data?: {message?: {content?: unknown}}}} event
- * @param {{type?: string}[]} shadowedEvents - the events the replacement shadows.
+ * The source kind is part of the durable record (the v4 log format preserves
+ * message sources), so replay after a restart can tell this bridge's marker from
+ * a compaction checkpoint or another plugin's marker without inspecting payload
+ * shapes.
+ *
+ * @param {{type?: string, data?: {source?: {kind?: string}}}} event
  * @returns {boolean}
  */
-export function isRewindSeam(event, shadowedEvents) {
-  if (!isEmptySystemMessage(event)) return false;
-  return shadowedEvents.some((shadowed) => shadowed?.type !== 'system/message');
+export function isRewindMarker(event) {
+  return event?.type === 'user/message' && event?.data?.source?.kind === REWIND_MARKER_SOURCE_KIND;
 }
 
 /**
@@ -75,10 +70,6 @@ export function isRewindSeam(event, shadowedEvents) {
  * @returns {{seq?: number, type?: string, surfaceOp?: unknown, data?: unknown}[]}
  */
 export function visibleEvents(events) {
-  const bySeq = new Map();
-  for (const event of events) {
-    if (typeof event?.seq === 'number') bySeq.set(event.seq, event);
-  }
   /** @type {number[]} */
   const nodes = [];
   const dropped = new Set();
@@ -98,10 +89,8 @@ export function visibleEvents(events) {
     const from = nodes.indexOf(start);
     const to = nodes.indexOf(end);
     if (from === -1 || to === -1 || to < from) continue; // cannot honour; leave nodes alone
-    const shadowed = nodes.slice(from, to + 1);
-    const shadowedEvents = shadowed.map((nodeSeq) => bySeq.get(nodeSeq)).filter((entry) => entry !== undefined);
     nodes.splice(from, to - from + 1, seq);
-    if (!isRewindSeam(event, shadowedEvents)) continue; // compaction / system maintenance
+    if (!isRewindMarker(event)) continue; // compaction / system maintenance / another plugin
     // Drop the whole span the rewind replaced, including the log-only tail that
     // sits between the last shadowed node and the marker itself.
     for (let droppedSeq = start; droppedSeq <= seq - 1; droppedSeq += 1) dropped.add(droppedSeq);

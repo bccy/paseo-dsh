@@ -35,6 +35,9 @@ const system = () => ({ message: { id: 's1', role: 'system', content: [{ type: '
 const user = (id, text) => ({ id: `u-${id}`, role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } });
 const assistant = (id, text) => ({ message: { id: `a-${id}`, role: 'assistant', content: [{ type: 'text', text }], source: { kind: 'model', provider: 'p', model: 'm' } } });
 
+/** The marker this bridge appends: a user/message with a private source kind. */
+const markerMessage = (id) => ({ id, role: 'user', content: [{ type: 'text', text: '(empty message)' }], source: { kind: 'paseo-rewind' } });
+
 /** Build a two-turn session with real surface-append events. */
 function makeSession() {
   const session = Session.create('rewind-shape-probe');
@@ -82,8 +85,8 @@ console.log('the bridge replacement shape is accepted');
   const target = nodes[3];
   const shadowed = nodes.slice(3);
   const event = session.append(
-    'system/message',
-    { message: { id: 'rewind-marker', role: 'system', content: [], source: { kind: 'system-prompt' } } },
+    'user/message',
+    markerMessage('rewind-marker'),
     {
       surfaceOp: { op: 'replace', startSeq: shadowed[0], endSeq: shadowed[shadowed.length - 1] },
       sourceEventSeqs: [...shadowed],
@@ -95,7 +98,11 @@ console.log('the bridge replacement shape is accepted');
   const derived = derivedText(session);
   check('the model no longer sees the withdrawn turn', derived.some((line) => line.includes('two') || line.includes('reply two')) === false, derived.join(' / '));
   check('the kept turns stay visible', derived.includes('user:one') && derived.includes('assistant:reply one'), derived.join(' / '));
-  check('the marker never reaches the model', derived.some((line) => line.startsWith('system:') && line === 'system:') === false, derived.join(' / '));
+  check(
+    'the marker reaches the model as the documented empty-message turn',
+    derived.some((line) => line === 'user:(empty message)'),
+    derived.join(' / '),
+  );
 }
 
 console.log('a second rewind over the new surface is valid');
@@ -103,18 +110,18 @@ console.log('a second rewind over the new surface is valid');
   const session = makeSession();
   const nodes = session.surface.nodes;
   const shadowed = nodes.slice(3);
-  session.append('system/message', { message: { id: 'rewind-marker-1', role: 'system', content: [], source: { kind: 'system-prompt' } } }, {
+  session.append('user/message', markerMessage('rewind-marker-1'), {
     surfaceOp: { op: 'replace', startSeq: shadowed[0], endSeq: shadowed[shadowed.length - 1] },
     sourceEventSeqs: [...shadowed],
   });
   const again = session.surface.nodes;
   const shadowed2 = again.slice(1);
-  const event = session.append('system/message', { message: { id: 'rewind-marker-2', role: 'system', content: [], source: { kind: 'system-prompt' } } }, {
+  const event = session.append('user/message', markerMessage('rewind-marker-2'), {
     surfaceOp: { op: 'replace', startSeq: shadowed2[0], endSeq: shadowed2[shadowed2.length - 1] },
     sourceEventSeqs: [...shadowed2],
   });
   check('a second rewind appends and shrinks further', JSON.stringify(session.surface.nodes) === JSON.stringify([0, 8]) && event.seq === 8, JSON.stringify(session.surface.nodes));
-  check('only the system prompt remains visible', session.deriveMessages().length === 1, JSON.stringify(derivedText(session)));
+  check('only the system prompt and the last marker remain', session.deriveMessages().length === 2, JSON.stringify(derivedText(session)));
 }
 
 const failed = results.filter((result) => !result.pass);

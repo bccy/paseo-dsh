@@ -65,11 +65,10 @@ function newestLog() {
 
 const isHumanUser = (event) => event?.type === 'user/message' && event?.data?.source?.kind === 'user';
 const isAppendOrigin = (event) => isHumanUser(event) && event?.surfaceOp === 'append';
-const isRewindSeam = (event) => event?.type === 'system/message'
+const isRewindSeam = (event) => event?.type === 'user/message'
   && event?.surfaceOp !== undefined
   && typeof event.surfaceOp === 'object'
-  && Array.isArray(event?.data?.message?.content)
-  && event.data.message.content.length === 0;
+  && event?.data?.source?.kind === 'paseo-rewind';
 
 const results = [];
 const check = (name, pass, detail) => {
@@ -138,10 +137,10 @@ if (events.length > 10) {
     const shadowed = nodes.slice(targetIndex);
     const marker = {
       seq: stateText + 1,
-      type: 'system/message',
+      type: 'user/message',
       surfaceOp: { op: 'replace', startSeq: shadowed[0], endSeq: shadowed.at(-1) },
       sourceEventSeqs: shadowed,
-      data: { message: { id: 'probe-marker', role: 'system', content: [], source: { kind: 'system-prompt' } } },
+      data: { id: 'probe-marker', role: 'user', content: [{ type: 'text', text: '(empty message)' }], source: { kind: 'paseo-rewind' } },
     };
     const folded = visibleEvents([...events, marker]);
     // Lines without a seq are the log header/format marker, not events of the

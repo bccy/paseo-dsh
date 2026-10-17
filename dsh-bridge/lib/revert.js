@@ -131,3 +131,4 @@ export function restoresFiles(scope) {
 export function successText(targetSeq) {
   return `Withdrawn seq ${targetSeq} and everything after it`;
 }
+

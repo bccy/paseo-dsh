@@ -18,7 +18,7 @@
  */
 import { resolve } from 'node:path';
 import { brandString } from '@deepseek-ai/dsh-brand';
-import { BlockAssembler, createSystemMessage, createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
+import { BlockAssembler, createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { admitEncodedImages } from '@deepseek-ai/dsh-attachment';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import { underArchivedSession } from './archived-lineage.js';
@@ -843,6 +843,13 @@ export class PaseoHarnessServer {
       // A session that was never materialized has no history, and an empty list
       // is the honest answer for it. A stalled open is a different fact.
       if (isTimeout(error)) return unavailableHistory(error);
+      // A session that never materialized has no history; anything else is a real
+      // read failure and must be visible (a silently empty replay is
+      // indistinguishable from "the conversation is gone").
+      if (error instanceof Error && error.name.includes("NotFound")) {
+        return { available: true, events: [], inheritedEventCount: 0 };
+      }
+      process.stderr.write(`[bridge] history read failed for ${params.sessionId}: ${error instanceof Error ? error.message : String(error)}\n`);
       return { available: true, events: [], inheritedEventCount: 0 };
     }
     try {
@@ -1190,14 +1197,39 @@ export class PaseoHarnessServer {
       // it is appended. The range comes from the surface snapshot planRewind
       // read, so it cannot move between planning and appending.
       const shadowed = resolved.shadowed;
+      // The marker is a `user/message` with a non-`user` source kind:
+      //  - the durable v4 log only admits `system`/`developer`/`assistant`
+      //    messages inside an open turn+step (a rewind runs while the agent is
+      //    idle, so those can never be appended here), while `user/message` has
+      //    no such constraint — the same reason dsh-rewind uses one;
+      //  - a non-`user` source keeps it out of every human-message path: it is
+      //    not a rewind anchor, Paseo's replay skips it, and the memory plugin
+      //    ignores it.
+      // `deriveEventMessage` does surface it to the model as one "(empty message)"
+      // turn among the kept conversation, which is the cost of a durable marker.
+      const marker = createUserMessage({
+        content: [{ type: 'text', text: '(empty message)' }],
+        source: { kind: 'paseo-rewind' },
+      });
       session.append(
-        'system/message',
-        { message: createSystemMessage('') },
+        'user/message',
+        marker,
         {
           surfaceOp: { op: 'replace', startSeq: shadowed[0], endSeq: shadowed[shadowed.length - 1] },
           sourceEventSeqs: [...shadowed],
         },
       );
+      // Make the replacement durable before answering. The daemon rehydrates the
+      // timeline by reading this log right after the reply, and Paseo's reload
+      // replays it too; a buffered append would let both read a log that still
+      // contains the withdrawn turn.
+      try {
+        const sessions = this.ctx.get('sessions');
+        if (sessions !== undefined) await sessions.flush(session);
+        else process.stderr.write('[bridge] rewind marker not flushed: this profile composes no session store\n');
+      } catch (error) {
+        process.stderr.write(`[bridge] flushing the rewind marker failed: ${error instanceof Error ? error.message : String(error)}\n`);
+      }
       let files;
       if (filePlan !== undefined && filePlan.length > 0) {
         files = await this.fileSnapshots.restore(sessionKey, filePlan);

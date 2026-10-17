@@ -118,6 +118,25 @@ console.log('scope handling (only the advertised scopes)');
   check('conversation does not', restoresFiles('conversation') === false);
 }
 
+console.log('replacement marker shape (durable v4 log constraints)');
+{
+  const bridge = readFileSync(join(import.meta.dirname, '..', 'dsh-bridge/lib/server.js'), 'utf8');
+  const surfaceModule = readFileSync(join(import.meta.dirname, '..', 'dsh-bridge/lib/surface.js'), 'utf8');
+  check(
+    'the marker is a user/message (system messages require an open turn in v4)',
+    /createUserMessage\(\{\s*content: \[\{ type: 'text', text: '\(empty message\)' \}\],\s*source: \{ kind: 'paseo-rewind' \},\s*\}\)/.test(bridge),
+  );
+  check(
+    'and it is appended as user/message with the replacement intent',
+    /session\.append\(\s*'user\/message',\s*marker,\s*\{\s*surfaceOp: \{ op: 'replace'/.test(bridge),
+  );
+  check(
+    'the replay fold identifies the marker by its durable source kind',
+    /REWIND_MARKER_SOURCE_KIND = 'paseo-rewind'/.test(surfaceModule) && /isRewindMarker\(event\)/.test(surfaceModule),
+  );
+  check('no system-message marker is left in the bridge', /createSystemMessage\(''\)/.test(bridge) === false);
+}
+
 console.log('receipt');
 {
   check('the receipt names the withdrawn seq', successText(42) === 'Withdrawn seq 42 and everything after it', successText(42));
@@ -203,8 +222,8 @@ console.log('wiring (the pure module is useless if nothing calls it)');
   check('the bridge serves the non-command permission write', /case 'paseo\/permission\/set':/.test(bridge) && /service\.set\(/.test(bridge));
   check('the bridge resolves the token against the visible surface', /planRewind\(session\.surface\.nodes/.test(bridge));
   check(
-    'the bridge appends an empty system message as the replacement',
-    /session\.append\(\s*'system\/message',\s*\{ message: createSystemMessage\(''\) \}/.test(bridge),
+    'the bridge appends the durable user/message replacement marker',
+    /session\.append\(\s*'user\/message',\s*marker/.test(bridge),
   );
   check(
     'the replacement carries sourceEventSeqs for every shadowed node',
@@ -228,7 +247,7 @@ console.log('wiring (the pure module is useless if nothing calls it)');
   // File layer: editing-tool write-ahead snapshots wired around the rewind.
   check('the bridge owns a FileSnapshots store', /new FileSnapshots\(/.test(bridge));
   const planIndex = bridge.indexOf('planRestore(');
-  const appendIndex = bridge.indexOf("session.append(\n        'system/message'");
+  const appendIndex = bridge.indexOf("session.append(\n        'user/message',\n        marker,");
   const restoreIndex = bridge.indexOf('fileSnapshots.restore(');
   check(
     'files are planned before the log write and restored after it',
