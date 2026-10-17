@@ -228,20 +228,20 @@ let conn;
     `${steerDeliveries.length} steer delivery(ies), ${allPrompts.length} prompt(s) total`,
   );
   const steerEchoes = events.filter((e) => e.type === "timeline.item" && e.item?.type === "user_message" && e.item.clientMessageId === "s2");
-  // The row is emitted once to show the message immediately and re-emitted under
-  // the SAME id once the bridge names the DSH message, because that message id is
-  // what Paseo's rewind button hands back as a revert token. Paseo's timeline is
-  // upsert-by-id, so this is one row updated — not two rows.
+  // The row is emitted exactly once, after the bridge named the DSH message, so it
+  // carries its revert token from the start. Splitting it into "shown now, token
+  // later" left a window where Paseo's rewind button appeared on a row the daemon
+  // could not map to a provider token.
   const steerRowIds = new Set(steerEchoes.map((event) => event.item.id));
   check(
     "the steered message lands in the timeline as exactly one row",
-    steerEchoes.length >= 1 && steerRowIds.size === 1,
+    steerEchoes.length === 1 && steerRowIds.size === 1,
     `${steerEchoes.length} echo(es) over ${steerRowIds.size} row id(s)`,
   );
   check(
-    "and the row ends up carrying a revert token",
-    steerEchoes.at(-1)?.item?.revertToken?.messageId !== undefined,
-    JSON.stringify(steerEchoes.at(-1)?.item?.revertToken ?? null),
+    "and the row carries a revert token",
+    steerEchoes[0]?.item?.revertToken?.messageId !== undefined,
+    JSON.stringify(steerEchoes[0]?.item?.revertToken ?? null),
   );
 
   // ---- the child the parent was waiting on is untouched -------------------

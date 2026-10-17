@@ -492,7 +492,16 @@ async function handle(method, params, id) {
     case "paseo/command/run":
       return { kind: "success", text: "goal: none" };
     case "paseo/permission":
-      return { available: false, current: null, presets: [] };
+      return {
+        available: true,
+        current: "workspace-write",
+        presets: [
+          { value: "workspace-write", name: "Workspace write" },
+          { value: "danger-full-access", name: "Full access" },
+        ],
+      };
+    case "paseo/permission/set":
+      return { current: typeof params?.preset === "string" ? params.preset : null };
     case "paseo/presets":
       return { available: false, presets: [], current: null, default: null };
     case "paseo/usage":

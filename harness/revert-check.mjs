@@ -142,15 +142,48 @@ console.log('wiring (the pure module is useless if nothing calls it)');
     'provider dispatches session.revert to the session',
     /case "session\.revert":/.test(provider) && /\.revert\(input\.token,\s*input\.scope\)/.test(provider),
   );
+  check(
+    'provider records the daemon-injected agent id',
+    /PASEO_AGENT_ID/.test(provider) && /#agentIds\.set\(sessionId, agentId\)/.test(provider),
+  );
+  check(
+    'provider answers the rewind before scheduling the refresh',
+    provider.indexOf('this.#emit({ type: "request.completed", requestId: input.requestId });\n        const failedFiles')
+      !== -1 && provider.indexOf('this.#refreshAgent(input.sessionId);') > provider.indexOf('case "session.revert":'),
+  );
+  check(
+    'provider resolves the paseo binary explicitly',
+    /#resolvePaseoBinary\(\)/.test(provider) && /PASEO_BIN/.test(provider),
+  );
+  check(
+    'provider surfaces a failed file restore as a timeline notice',
+    /#notice\(\s*input\.sessionId,\s*"error",\s*"文件回退未完成"/.test(provider),
+  );
+  check(
+    'provider warns when the auto-refresh did not run',
+    /时间线未自动刷新/.test(provider),
+  );
 
   const session = read('paseo-plugin/server/session.ts');
   check(
-    'the live row carries a revert token once the bridge names the message',
-    /#emitUserMessage\(prompt\.clientMessageId, label, \{ messageId \}\)/.test(session),
+    'the live row is emitted once, with its revert token',
+    /#emitUserMessage\(prompt\.clientMessageId, label, messageId === undefined \? undefined : \{ messageId \}\)/.test(session),
+  );
+  check(
+    'no token-less live row is emitted before the prompt',
+    session.indexOf('#emitUserMessage(prompt.clientMessageId, label)') === -1,
   );
   check(
     'the replayed row carries the same token',
     /revertToken: \{ messageId: data\.id \}/.test(session),
+  );
+  check(
+    'the skill row also carries a token',
+    /#emitUserMessage\(prompt\.clientMessageId, line, messageId === undefined \? undefined : \{ messageId \}\)/.test(session),
+  );
+  check(
+    'the permission preset is written without the slash command',
+    /process\.setPermission\(requestedPermission\)/.test(session) && /runCommand\("permission"/.test(session) === false,
   );
   check('both replay sites are wired', (session.match(/revertToken: \{ messageId: data\.id \}/g) ?? []).length === 2);
   check(
@@ -162,9 +195,12 @@ console.log('wiring (the pure module is useless if nothing calls it)');
   const process = read('paseo-plugin/server/dsh-process.ts');
   check('the plugin reaches the bridge', process.includes('"paseo/revert"'));
   check('and forwards the scope', /revert\(token: unknown, scope: "conversation" \| "files" \| "both"\)/.test(process));
+  check('the permission switch is its own bridge call', /"paseo\/permission\/set"/.test(process));
+  check('the revert receipt type carries the file outcome', /interface DshRevertFiles[\s\S]{0,200}failed: Array<\{ path: string; error: string \}>/.test(process));
 
   const bridge = read('dsh-bridge/lib/server.js');
   check('the bridge serves paseo/revert', /case 'paseo\/revert':/.test(bridge) && /return this\.revert\(params\)/.test(bridge));
+  check('the bridge serves the non-command permission write', /case 'paseo\/permission\/set':/.test(bridge) && /service\.set\(/.test(bridge));
   check('the bridge resolves the token against the visible surface', /planRewind\(session\.surface\.nodes/.test(bridge));
   check(
     'the bridge appends an empty system message as the replacement',
@@ -216,6 +252,13 @@ console.log('wiring (the pure module is useless if nothing calls it)');
   check(
     'and tools/result to drop failed/cancelled captures',
     /scope\.on\('tools\/result'[\s\S]{0,120}dropFileTool/.test(bridgeEntry),
+  );
+
+  const timeline = read('paseo-plugin/server/timeline.ts');
+  const timelineRaw = readFileSync(join(import.meta.dirname, '..', 'paseo-plugin/server/timeline.ts'), 'utf8');
+  check(
+    'internal command rows are filtered only as legacy cleanup',
+    /LEGACY_INTERNAL_COMMANDS/.test(timeline) && /legacy/.test(timelineRaw),
   );
 
   const snapshotsModule = read('dsh-bridge/lib/file-snapshots.js');

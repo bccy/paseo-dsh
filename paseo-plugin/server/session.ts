@@ -30,6 +30,7 @@ import {
   type DshPermissionPreset,
   type DshQuestion,
   type DshQuestionRequest,
+  type DshRevertResult,
   type DshRoute,
   type DshUsage,
 } from "./dsh-process";
@@ -391,13 +392,17 @@ export class DshSession {
    * row carried. The bridge owns the translation and the refusal cases (row no
    * longer visible, worktree dirty), so this only forwards.
    */
-  async revert(token: unknown, scope: "conversation" | "files" | "both"): Promise<void> {
-    await this.#require().revert(token, scope);
+  async revert(
+    token: unknown,
+    scope: "conversation" | "files" | "both",
+  ): Promise<DshRevertResult | undefined> {
+    const result = await this.#require().revert(token, scope);
     // A rewind removes the turn that asked the question, so any card still waiting
     // belongs to a conversation that no longer exists. Left pending, the daemon
     // keeps showing it and a later click answers a question nobody is waiting for
     // — the same failure a steer used to have.
     this.#clearPendingPermissions("The conversation was rewound past this question, so it is no longer waiting for an answer.");
+    return result;
   }
 
   async loadPresets(): Promise<void> {
@@ -644,15 +649,19 @@ export class DshSession {
       // A skill (or an unrecognized name): hand DSH the bare `/name` line. Its
       // skill tool injects a user-invocable skill from exactly that token.
       const line = slashLine(prompt.input.name, args);
-      this.#emitUserMessage(prompt.clientMessageId, line);
       const issuedTurn = this.#openTurnId(prompt.clientMessageId, prompt.delivery);
+      let messageId: string | undefined;
       try {
-        await process.prompt(line, [{ type: "text", text: line }], prompt.delivery);
+        messageId = await process.prompt(line, [{ type: "text", text: line }], prompt.delivery);
       } catch (error) {
         if (issuedTurn) this.#turnId = null;
         this.#emitPromptFailed(prompt.clientMessageId, error);
         return;
       }
+      // One row, emitted once it carries its revert token: splitting the row into
+      // "shown now, token later" left a window where the rewind button appeared
+      // on a row the daemon could not map to a provider token.
+      this.#emitUserMessage(prompt.clientMessageId, line, messageId === undefined ? undefined : { messageId });
       if (prompt.clearPendingPermissions === true) this.#clearPendingPermissionsForSteer();
       this.#emitPromptAccepted(prompt.clientMessageId, prompt.delivery);
       return;
@@ -683,17 +692,19 @@ export class DshSession {
       .filter((text) => text !== "")
       .join("\n");
 
-    this.#emitUserMessage(prompt.clientMessageId, label);
-
     const issuedTurn = this.#openTurnId(prompt.clientMessageId, prompt.delivery);
+    let messageId: string | undefined;
     try {
-      const messageId = await process.prompt(label, blocks.length === 0 ? undefined : blocks, prompt.delivery);
-      if (messageId !== undefined) this.#emitUserMessage(prompt.clientMessageId, label, { messageId });
+      messageId = await process.prompt(label, blocks.length === 0 ? undefined : blocks, prompt.delivery);
     } catch (error) {
       if (issuedTurn) this.#turnId = null;
       this.#emitPromptFailed(prompt.clientMessageId, error);
       return;
     }
+    // One row, emitted once it carries its revert token: splitting the row into
+    // "shown now, token later" left a window where the rewind button appeared on
+    // a row the daemon could not map to a provider token.
+    this.#emitUserMessage(prompt.clientMessageId, label, messageId === undefined ? undefined : { messageId });
 
     if (prompt.clearPendingPermissions === true) this.#clearPendingPermissionsForSteer();
     this.#emitPromptAccepted(prompt.clientMessageId, prompt.delivery);
@@ -885,13 +896,12 @@ export class DshSession {
       requestedPermission !== "" &&
       requestedPermission !== this.#permission
     ) {
-      // Switch the DSH permission preset through its own `/permission` command,
-      // which owns both the sandbox mode and the approval policy.
-      const result = await process.runCommand("permission", requestedPermission);
-      if (result.kind === "error") {
-        throw new Error(result.text ?? `could not set permission preset "${requestedPermission}"`);
-      }
-      this.#permission = requestedPermission;
+      // Switch the preset through DSH's projection API rather than its
+      // `/permission` command: both own the sandbox mode and approval policy, but
+      // only the command appends `command/run`/`command/done`, which Paseo would
+      // show as a row the user never typed.
+      const applied = await process.setPermission(requestedPermission);
+      this.#permission = applied.current ?? requestedPermission;
     }
 
     const requestedPreset = changes.settings?.["preset"];

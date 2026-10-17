@@ -15,16 +15,19 @@ import type { JsonValue } from "./dsh-process";
 import { LOCALE, UI } from "./locale";
 
 /**
- * Commands this provider runs on the user's behalf, whose rows are dropped.
+ * Command names this provider used to run on the user's behalf, kept only so old
+ * logs replay cleanly.
  *
- * `rewind`/`undo` are `dsh-rewind`'s names for the rewind button; `permission`
- * is how a session applies its preset on open and when Paseo switches it. The
- * user never types any of them, so a row would be the only trace of an
- * implementation detail (and, after a reload, it reappeared at the top of the
- * conversation). Their effects are visible elsewhere — the conversation is gone
- * and the preset is shown in the session header.
+ * The current code produces none of these command events: the rewind is a
+ * surface replacement appended without a command (`/rewind` is gone), and the
+ * permission preset is written through DSH's projection API instead of its
+ * `/permission` command. Sessions recorded before the change still contain those
+ * `command/run`/`command/done` pairs, and replaying them as rows would show an
+ * implementation detail the user never typed. This list is therefore a legacy
+ * cleanup, not a policy: it can be deleted once no replayable session predates
+ * the change.
  */
-const PROVIDER_COMMAND_NAMES = new Set(["rewind", "undo", "permission"]);
+const LEGACY_INTERNAL_COMMANDS = new Set(["rewind", "undo", "permission"]);
 
 
 interface DshEvent {
@@ -1018,7 +1021,7 @@ export class TimelineBuilder {
     // only trace of an implementation detail the user never typed. Drop the
     // successful one; a failed rewind keeps its row because Paseo's marker has no
     // failure state and the row is where the error can be read.
-    if (!failed && PROVIDER_COMMAND_NAMES.has(name)) return [];
+    if (!failed && LEGACY_INTERNAL_COMMANDS.has(name)) return [];
     const line = `/${name}`;
     return this.#put({
       type: "tool_call",

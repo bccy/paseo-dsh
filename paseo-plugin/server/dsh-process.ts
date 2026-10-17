@@ -124,6 +124,30 @@ export interface DshCatalog {
  * Fields are absent when the runtime does not know them; a caller must never
  * substitute a default, because a fabricated window is worse than none.
  */
+/**
+ * The outcome of a rewind's file rollback, as reported by the bridge.
+ *
+ * `failed` is the only field that means "the conversation was rewound but a file
+ * was not restored"; the provider turns it into a timeline notice. `rescue`
+ * lists copies of the content that the restore overwrote, so a user can recover
+ * a mistaken restore by hand.
+ */
+export interface DshRevertFiles {
+  restored: string[];
+  deleted: string[];
+  skipped: string[];
+  failed: Array<{ path: string; error: string }>;
+  rescue: string[];
+  rescueDir: string;
+}
+
+/** The bridge's `paseo/revert` receipt. */
+export interface DshRevertResult {
+  kind: "success" | "error";
+  text?: string;
+  files?: DshRevertFiles;
+}
+
 export interface DshUsage {
   available: boolean;
   /** Current context capacity of the live route, in tokens. */
@@ -449,21 +473,36 @@ export class DshProcess {
   }
 
   /**
+   * Switch the session's permission preset through DSH's projection API.
+   *
+   * The preset owns both the sandbox mode and the approval policy. Going through
+   * this non-command write keeps the timeline free of a `/permission` row the
+   * user never typed; the command path remains only for DSH's own `/permission`
+   * slash usage.
+   */
+  async setPermission(name: string): Promise<{ current: string | null }> {
+    return (await this.#request("paseo/permission/set", {
+      sessionId: this.#options.sessionId,
+      preset: name,
+    })) as { current: string | null };
+  }
+
+  /**
    * Rewind to just before one user message.
    *
    * The token is opaque to Paseo: it hands back whatever `revertToken` our
-   * timeline row carried (`{ messageId }`). The bridge translates it into
-   * `dsh-rewind`'s ordinal and refuses loudly when the row is no longer
-   * rewindable (already rewound, or compacted away) or when the worktree cannot
-   * be restored. Nothing here guesses — a refused revert must surface as a failed
-   * request, never as a silent no-op on a history-changing operation.
+   * timeline row carried (`{ messageId }`). The bridge resolves it against the
+   * visible surface and refuses loudly when the row is no longer rewindable
+   * (already rewound, or compacted away). With `both` it also restores the files
+   * the agent's editing tools touched since that message, and reports the outcome
+   * so the provider can surface a partial failure instead of pretending.
    */
-  async revert(token: unknown, scope: "conversation" | "files" | "both"): Promise<void> {
-    await this.#request(
+  async revert(token: unknown, scope: "conversation" | "files" | "both"): Promise<DshRevertResult | undefined> {
+    return (await this.#request(
       "paseo/revert",
       { sessionId: this.#options.sessionId, token, scope },
       120000,
-    );
+    )) as DshRevertResult | undefined;
   }
 
   /** Cancel the running turn while keeping the session usable afterwards. */

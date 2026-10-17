@@ -11,7 +11,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
   negotiateProviderCapabilities,
   type ProviderCatalog,
@@ -65,15 +65,15 @@ const CAPABILITIES = [
   "session.subsession",
   // The rewind button under each message is capability-gated: Paseo only shows it
   // when the provider declares which scopes it can revert, and it hands the
-  // request back with the `revertToken` our timeline row carried. All three are
-  // declared because `dsh-rewind` implements all three (`/rewind <n>` with no
-  // flag, `--conversation`, `--code`), and Paseo's menu offers exactly the
-  // intersection of these bits and its own UI.
+  // request back with the `revertToken` our timeline row carried. This bridge
+  // implements exactly two scopes: conversation only, and conversation + the
+  // files the agent's editing tools touched. Paseo's menu offers the intersection
+  // of these bits and its own UI.
   "session.revert.both",
   "session.revert.conversation",
-  // NOT `session.revert.files`: the installed `dsh-rewind-plugin` has no
-  // files-only mode (`/rewind @<seq> chat|both`), and advertising a capability
-  // the backend cannot honour is worse than a missing menu entry.
+  // NOT `session.revert.files`: the bridge has no files-only rewind (the file
+  // rollback is part of `both`); advertising a capability the backend cannot
+  // honour is worse than a missing menu entry.
   "permission",
 ] as const;
 
@@ -255,7 +255,15 @@ class DshConnection implements ProviderConnection {
   readonly capabilities: readonly string[];
   readonly #listeners = new Set<(event: ProviderEvent) => void>();
   readonly #sessions = new Map<string, DshSession>();
+  /**
+   * provider session id -> Paseo agent id. The daemon hands the provider the
+   * agent id in `config.env.PASEO_AGENT_ID` (documented lifecycle order: it is
+   * set after the session_open hooks and before the provider session opens), and
+   * the post-rewind refresh needs the *agent* id, which no plugin API maps.
+   */
+  readonly #agentIds = new Map<string, string>();
   #display: DisplayCatalog | undefined;
+  #paseoBinary: string | undefined;
   #closed = false;
 
   constructor(capabilities: readonly string[]) {
@@ -322,17 +330,34 @@ class DshConnection implements ProviderConnection {
         return;
       }
       case "session.revert": {
-        await this.#require(input.sessionId).revert(input.token, input.scope);
+        const session = this.#require(input.sessionId);
+        const result = await session.revert(input.token, input.scope);
+        // Answer first, refresh second, and never await the refresh: the daemon's
+        // rewind holds a pending run until this request resolves, while the
+        // refresh it would trigger closes this very provider session
+        // (`reloadAgentSession` cancels in-flight runs) — awaiting it here
+        // deadlocks the two. The 500 ms timer in `#refreshAgent` keeps the reply
+        // ahead of the restart.
+        this.#emit({ type: "request.completed", requestId: input.requestId });
+        const failedFiles = result?.files?.failed ?? [];
+        if (failedFiles.length > 0) {
+          // The conversation rewind succeeded; only some files did not. Say so
+          // instead of leaving the user to discover it.
+          this.#notice(
+            input.sessionId,
+            "error",
+            "文件回退未完成",
+            `${failedFiles.map((entry) => entry.path).join("、")} 恢复失败；恢复前的原内容已备份到 ${result?.files?.rescueDir ?? "(未知目录)"}。`,
+          );
+        }
         // Replaying `PluginProviderSession.streamHistory` cannot drop rows (the
         // buffer only grows and the plugin contract has no removal event), so the
         // timeline keeps the withdrawn messages until Paseo refreshes the agent.
         // Paseo's own docs define that refresh as "close the provider session and
         // open it again" — which replays the bridge's surface-folded history — and
-        // the provider cannot trigger it, so ask the daemon for it below.
+        // the provider cannot trigger it through the SDK, so ask the daemon for it
+        // below.
         this.#refreshAgent(input.sessionId);
-        // Paseo awaits `complete()` and resolves it only on a reply, so a silent
-        // success would leave the rewind button spinning forever.
-        this.#emit({ type: "request.completed", requestId: input.requestId });
         return;
       }
       case "session.interrupt": {
@@ -343,6 +368,7 @@ class DshConnection implements ProviderConnection {
       case "session.close": {
         const session = this.#sessions.get(input.sessionId);
         this.#sessions.delete(input.sessionId);
+        this.#agentIds.delete(input.sessionId);
         await session?.close();
         this.#emit({ type: "session.closed", sessionId: input.sessionId });
         this.#emit({ type: "request.completed", requestId: input.requestId });
@@ -398,27 +424,88 @@ class DshConnection implements ProviderConnection {
   }
 
   /**
+   * Emit one provider notice, which Paseo renders as a timeline notification.
+   *
+   * Notices are the only channel a provider has for telling the user about a
+   * partial outcome (e.g. the conversation was rewound but one file restore
+   * failed). They are dropped when the session is already gone.
+   *
+   * @param sessionId - provider session the notice belongs to.
+   * @param severity - provider notice severity.
+   * @param title - one-line headline.
+   * @param description - optional detail.
+   */
+  #notice(sessionId: string, severity: "info" | "warning" | "error", title: string, description?: string): void {
+    if (!this.#sessions.has(sessionId)) return;
+    this.#emit({
+      type: "session.notice",
+      sessionId,
+      notice: {
+        id: `rewind-${String(Date.now())}-${String(Math.trunc(Math.random() * 1e6))}`,
+        severity,
+        title,
+        ...(description === undefined ? {} : { description }),
+      },
+    });
+  }
+
+  /**
+   * Resolve the `paseo` executable once: an explicit `PASEO_BIN` wins, else
+   * `which` (a daemon may not carry the npm-global bin directory on PATH), else
+   * the bare name so the failure is reported by spawn's error event.
+   *
+   * @returns the binary to spawn.
+   */
+  #resolvePaseoBinary(): string {
+    if (this.#paseoBinary !== undefined) return this.#paseoBinary;
+    const configured = process.env["PASEO_BIN"]?.trim();
+    if (configured !== undefined && configured !== "") {
+      this.#paseoBinary = configured;
+      return configured;
+    }
+    try {
+      const found = execFileSync("which", ["paseo"], { encoding: "utf8" }).trim();
+      if (found !== "") {
+        this.#paseoBinary = found;
+        return found;
+      }
+    } catch {
+      /* fall through to the bare name */
+    }
+    this.#paseoBinary = "paseo";
+    return "paseo";
+  }
+
+  /**
    * Ask Paseo to refresh one agent, the way `paseo agent reload <id>` does.
    *
-   * The plugin server context exposes no refresh hook (`registerSettings`,
-   * `handle`, `registerProvider`, `registerUsageSource` only), and closing the
-   * provider session from here makes it terminal instead of refreshed — that
-   * experiment surfaced as "Provider session … closed" in the UI. Spawning the
-   * shipped CLI hits the daemon's own refresh path instead.
+   * Why this exists at all: Paseo's plugin-provider adapter keeps an
+   * append-only translated history and `revert()` cannot truncate it, while the
+   * daemon rehydrates the timeline from exactly that history after a rewind
+   * (upstream issue #4667, still open). The documented refresh semantics —
+   * "close the current provider session and open it again with persistence" —
+   * is the only way to make the timeline reflect the rewind, and the plugin SDK
+   * exposes no call for it. Spawning the shipped CLI hits the daemon's own
+   * `refresh_agent_request` path.
    *
-   * Delayed so this request's reply lands first: the refresh restarts the `dsh`
-   * process, and a reply racing that restart would surface as a failed rewind.
+   * The delay is deliberate: the caller must answer `session.revert` first (the
+   * daemon holds a pending run until it is answered, and the refresh cancels
+   * in-flight runs). Failures are reported to the user via a notice and the
+   * plugin log; the rewind itself has already succeeded.
+   *
+   * @param sessionId - provider session whose agent should be reloaded.
    */
   #refreshAgent(sessionId: string): void {
     const timer = setTimeout(() => {
-      const agentId = findPaseoAgentId(sessionId);
+      const agentId = this.#agentIds.get(sessionId) ?? findPaseoAgentId(sessionId);
       if (agentId === undefined) {
         process.stderr.write(
-          `[${PROVIDER_ID}] agent reload skipped: no agent record under ~/.paseo/agents carries session ${sessionId}\n`,
+          `[${PROVIDER_ID}] agent reload skipped: no agent record carries session ${sessionId}\n`,
         );
+        this.#notice(sessionId, "warning", "时间线未自动刷新", "撤回已完成，但未找到该会话对应的 agent；请手动执行 Reload agent。");
         return;
       }
-      const binary = process.env.PASEO_BIN ?? "paseo";
+      const binary = this.#resolvePaseoBinary();
       try {
         const child = spawn(binary, ["agent", "reload", agentId], {
           detached: true,
@@ -429,6 +516,7 @@ class DshConnection implements ProviderConnection {
         // to the conversation (that cost a whole debug round).
         child.on("error", (error) => {
           process.stderr.write(`[${PROVIDER_ID}] agent reload spawn failed (${binary}): ${messageOf(error)}\n`);
+          this.#notice(sessionId, "warning", "时间线未自动刷新", "自动 Reload agent 启动失败；撤回已完成，请手动执行 Reload agent。");
         });
         let stderrText = "";
         child.stderr?.setEncoding("utf8");
@@ -440,10 +528,14 @@ class DshConnection implements ProviderConnection {
           process.stderr.write(
             `[${PROVIDER_ID}] agent reload ${agentId} exited ${String(code)}${trimmed === "" ? "" : `: ${trimmed.slice(0, 400)}`}\n`,
           );
+          if (code !== 0) {
+            this.#notice(sessionId, "warning", "时间线未自动刷新", "自动 Reload agent 未成功；撤回已完成，请手动执行 Reload agent。");
+          }
         });
         child.unref();
       } catch (error) {
         process.stderr.write(`[${PROVIDER_ID}] refreshing the agent after a rewind: ${messageOf(error)}\n`);
+        this.#notice(sessionId, "warning", "时间线未自动刷新", "自动 Reload agent 失败；撤回已完成，请手动执行 Reload agent。");
       }
     }, 500);
     timer.unref();
@@ -459,6 +551,14 @@ class DshConnection implements ProviderConnection {
     const nativeId = input.persistence?.data;
     const dshSessionId =
       isRecord(nativeId) && typeof nativeId["sessionId"] === "string" ? nativeId["sessionId"] : sessionId;
+
+    // The daemon injects the Paseo agent id into the provider session env; the
+    // post-rewind refresh needs it because `paseo agent reload` takes the agent
+    // id, and no plugin API maps a provider session to one.
+    const agentId = typeof config.env?.["PASEO_AGENT_ID"] === "string"
+      ? config.env["PASEO_AGENT_ID"].trim()
+      : "";
+    if (agentId !== "") this.#agentIds.set(sessionId, agentId);
 
     const route = parseRoute(config.model, display.fallbackRoute);
     const session = new DshSession({
