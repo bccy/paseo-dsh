@@ -16,12 +16,14 @@
  *
  * @module dsh-paseo-bridge/server
  */
+import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { brandString } from '@deepseek-ai/dsh-brand';
 import { BlockAssembler, createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { admitEncodedImages } from '@deepseek-ai/dsh-attachment';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import { underArchivedSession } from './archived-lineage.js';
+import { dirtyWorkspaceError, restoresFiles, revertOrdinal, rewindLine } from './revert.js';
 import { historyEvents, withImageHostPaths } from './image-host-path.js';
 import { promptSource } from './paseo-system-envelope.js';
 
@@ -1009,6 +1011,45 @@ export class PaseoHarnessServer {
   }
 
   /**
+   * Rewind one session to just before the user message Paseo named.
+   *
+   * Paseo's rewind button is capability-gated, and the token it hands back is
+   * the `revertToken` our own timeline row carried (`{ seq }`). The rewind
+   * itself is `dsh-rewind`'s `/rewind <n>`: it appends the same
+   * surface-replacement event compaction uses — so the reverted turns leave the
+   * model's view without any trace of the rewind — and restores the worktree
+   * from its git snapshot.
+   *
+   * A missing git repository or a dirty worktree aborts the whole revert rather
+   * than reverting half of it: leaving the conversation ahead of the files is
+   * exactly the inconsistency this feature exists to fix.
+   */
+  async revert(params) {
+    const rec = this.requireSession(params.sessionId);
+    const agent = rec.handle.agent;
+    const session = agent.session;
+    const resolved = revertOrdinal(session.surface.nodes, session.events, params.token);
+    if (!resolved.ok) throw new Error(resolved.reason);
+    const scope = params.scope === 'conversation' || params.scope === 'files' ? params.scope : 'both';
+    if (restoresFiles(scope)) {
+      const cwd = session.header?.cwd ?? this.cwd;
+      const worktree = worktreeState(cwd);
+      if (!worktree.git) {
+        throw new Error('该工作区不是 git 仓库，无法回退文件；请改用「只回退对话」。');
+      }
+      if (worktree.dirty.length > 0) throw new Error(dirtyWorkspaceError(worktree.dirty));
+    }
+    const commands = this.ctx.get('commands');
+    if (commands === undefined) throw new Error('command registry is not mounted in this profile');
+    const execution = await commands.execute(agent, rewindLine(resolved.n, scope), [], new AbortController().signal);
+    if (execution === undefined) throw new Error('the rewind command is not registered in this profile');
+    return {
+      kind: execution.result.kind,
+      ...(execution.result.text === undefined ? {} : { text: execution.result.text }),
+    };
+  }
+
+  /**
    * Report the session's permission preset and the switchable ones.
    *
    * Each preset travels as `{ value, name, description? }` rather than a bare
@@ -1241,6 +1282,8 @@ export class PaseoHarnessServer {
         return this.commands(params);
       case 'paseo/command/run':
         return this.runCommand(params);
+      case 'paseo/revert':
+        return this.revert(params);
       case 'paseo/permission':
         return this.permission(params);
       case 'paseo/usage':
@@ -1394,4 +1437,24 @@ export class PaseoHarnessServer {
   hasAdapterFor(provider) {
     return this.ctx.get('llm')?.listProviders().some((entry) => entry.id === provider) ?? false;
   }
+}
+
+/**
+ * Whether a directory is a git worktree, and which entries are uncommitted.
+ *
+ * `dsh-rewind` snapshots files through git, so outside a repository its file
+ * restore would silently do nothing. Returning `git: false` lets the caller
+ * refuse loudly instead of reporting a revert that did not restore anything.
+ *
+ * @param {string} cwd
+ * @returns {{git: boolean, dirty: string[]}}
+ */
+function worktreeState(cwd) {
+  try {
+    execFileSync('git', ['rev-parse', '--git-dir'], { cwd, stdio: 'ignore', timeout: 15000 });
+  } catch {
+    return { git: false, dirty: [] };
+  }
+  const out = execFileSync('git', ['status', '--porcelain'], { cwd, encoding: 'utf8', timeout: 15000 });
+  return { git: true, dirty: out.split('\n').filter((line) => line.trim() !== '') };
 }

@@ -437,12 +437,33 @@ export class DshProcess {
     text: string,
     contentBlocks?: unknown[],
     delivery?: "auto" | "steer",
-  ): Promise<void> {
-    await this.#request("session/prompt", {
+  ): Promise<string | undefined> {
+    const result = (await this.#request("session/prompt", {
       sessionId: this.#options.sessionId,
       contentBlocks: contentBlocks ?? [{ type: "text", text }],
       ...(delivery === undefined ? {} : { delivery }),
-    });
+    })) as { messageId?: unknown } | undefined;
+    // The DSH message id is what Paseo's rewind button hands back as its revert
+    // token, so it has to travel on the timeline row that represents the message.
+    return typeof result?.messageId === "string" ? result.messageId : undefined;
+  }
+
+  /**
+   * Rewind to just before one user message.
+   *
+   * The token is opaque to Paseo: it hands back whatever `revertToken` our
+   * timeline row carried (`{ messageId }`). The bridge translates it into
+   * `dsh-rewind`'s ordinal and refuses loudly when the row is no longer
+   * rewindable (already rewound, or compacted away) or when the worktree cannot
+   * be restored. Nothing here guesses — a refused revert must surface as a failed
+   * request, never as a silent no-op on a history-changing operation.
+   */
+  async revert(token: unknown, scope: "conversation" | "files" | "both"): Promise<void> {
+    await this.#request(
+      "paseo/revert",
+      { sessionId: this.#options.sessionId, token, scope },
+      120000,
+    );
   }
 
   /** Cancel the running turn while keeping the session usable afterwards. */

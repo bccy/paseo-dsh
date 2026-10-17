@@ -59,6 +59,15 @@ const CAPABILITIES = [
   // the whole subagent tree is invisible. Declaring it is what makes Paseo
   // accept and display the children this provider opens.
   "session.subsession",
+  // The rewind button under each message is capability-gated: Paseo only shows it
+  // when the provider declares which scopes it can revert, and it hands the
+  // request back with the `revertToken` our timeline row carried. All three are
+  // declared because `dsh-rewind` implements all three (`/rewind <n>` with no
+  // flag, `--conversation`, `--code`), and Paseo's menu offers exactly the
+  // intersection of these bits and its own UI.
+  "session.revert.both",
+  "session.revert.conversation",
+  "session.revert.files",
   "permission",
 ] as const;
 
@@ -306,6 +315,13 @@ class DshConnection implements ProviderConnection {
         this.#emit({ type: "request.completed", requestId: input.requestId });
         return;
       }
+      case "session.revert": {
+        await this.#require(input.sessionId).revert(input.token, input.scope);
+        // Paseo awaits `complete()` and resolves it only on a reply, so a silent
+        // success would leave the rewind button spinning forever.
+        this.#emit({ type: "request.completed", requestId: input.requestId });
+        return;
+      }
       case "session.interrupt": {
         await this.#require(input.sessionId).interrupt();
         this.#emit({ type: "request.completed", requestId: input.requestId });
@@ -319,15 +335,19 @@ class DshConnection implements ProviderConnection {
         this.#emit({ type: "request.completed", requestId: input.requestId });
         return;
       }
-      default:
-        // This provider declares no capability for the input, so the caller must
-        // not be told it succeeded. Reporting `request.completed` here made an
-        // unimplemented request indistinguishable from a finished one.
+      default: {
+        // Every `ProviderInput` variant is handled above, so this is a net for an
+        // SDK upgrade that adds one: reporting `request.completed` here would make
+        // an unimplemented request indistinguishable from a finished one, so the
+        // cast is only to keep the net compiling while the union is exhaustive.
+        const unhandled = input as { requestId?: string; type: string };
         this.#emit({
           type: "request.failed",
-          requestId: input.requestId,
-          error: { message: `unsupported provider input "${input.type}"` },
+          requestId: unhandled.requestId ?? "",
+          error: { message: `unsupported provider input "${unhandled.type}"` },
         });
+        return;
+      }
     }
   }
 

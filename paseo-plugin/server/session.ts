@@ -384,6 +384,17 @@ export class DshSession {
    * Read the agent presets the profile declares, for the composer. Optional: a
    * profile that mounts no preset registry simply gets no Preset control.
    */
+  /**
+   * Rewind to just before one user message.
+   *
+   * The token is opaque to Paseo: it hands back the `revertToken` our timeline
+   * row carried. The bridge owns the translation and the refusal cases (row no
+   * longer visible, worktree dirty), so this only forwards.
+   */
+  async revert(token: unknown, scope: "conversation" | "files" | "both"): Promise<void> {
+    await this.#require().revert(token, scope);
+  }
+
   async loadPresets(): Promise<void> {
     const info = await this.#require().presets();
     if (!info.available) return;
@@ -477,7 +488,16 @@ export class DshSession {
         this.#options.emit({
           type: "timeline.item",
           sessionId: this.id,
-          item: { type: "user_message", id: `user:history:${seq}`, text, clientMessageId: `history:${seq}` },
+          item: {
+            type: "user_message",
+            id: `user:history:${seq}`,
+            text,
+            clientMessageId: `history:${seq}`,
+            // The DSH event carries the message id the bridge returned, which is
+            // exactly the token a live row would carry — so a replayed
+            // conversation is rewindable to the same places.
+            ...(typeof data.id === "string" ? { revertToken: { messageId: data.id } } : {}),
+          },
         });
         continue;
       }
@@ -662,7 +682,8 @@ export class DshSession {
 
     const issuedTurn = this.#openTurnId(prompt.clientMessageId, prompt.delivery);
     try {
-      await process.prompt(label, blocks.length === 0 ? undefined : blocks, prompt.delivery);
+      const messageId = await process.prompt(label, blocks.length === 0 ? undefined : blocks, prompt.delivery);
+      if (messageId !== undefined) this.#emitUserMessage(prompt.clientMessageId, label, { messageId });
     } catch (error) {
       if (issuedTurn) this.#turnId = null;
       this.#emitPromptFailed(prompt.clientMessageId, error);
@@ -697,11 +718,22 @@ export class DshSession {
     });
   }
 
-  #emitUserMessage(clientMessageId: string, text: string): void {
+  #emitUserMessage(clientMessageId: string, text: string, token?: { messageId: string }): void {
     this.#options.emit({
       type: "timeline.item",
       sessionId: this.id,
-      item: { type: "user_message", id: `user:${clientMessageId}`, text, clientMessageId },
+      // `revertToken` is opaque to Paseo: it caches it per row and hands it back
+      // when the user rewinds from that row (provider capability
+      // `session.revert.*`). Re-emitting the same id upserts the row, which is
+      // how the live message gains its token once the bridge has named the DSH
+      // message it created.
+      item: {
+        type: "user_message",
+        id: `user:${clientMessageId}`,
+        text,
+        clientMessageId,
+        ...(token === undefined ? {} : { revertToken: token }),
+      },
     });
   }
 
@@ -1506,6 +1538,15 @@ export class DshChildSession {
    */
   #observedLive = false;
 
+  /**
+   * Child sessions are a read-only projection: they have no process of their own
+   * to rewind, and Paseo only offers the button on the root conversation anyway.
+   * Failing loudly keeps a mis-gated button from looking like a silent no-op.
+   */
+  async revert(_token: unknown, _scope: "conversation" | "files" | "both"): Promise<void> {
+    throw new Error("子会话不支持撤回");
+  }
+
   constructor(options: DshChildSessionOptions) {
     this.id = options.id;
     this.nativeId = options.nativeId;
@@ -1646,7 +1687,16 @@ export class DshChildSession {
         this.#options.emit({
           type: "timeline.item",
           sessionId: this.id,
-          item: { type: "user_message", id: `user:history:${seq}`, text, clientMessageId: `history:${seq}` },
+          item: {
+            type: "user_message",
+            id: `user:history:${seq}`,
+            text,
+            clientMessageId: `history:${seq}`,
+            // The DSH event carries the message id the bridge returned, which is
+            // exactly the token a live row would carry — so a replayed
+            // conversation is rewindable to the same places.
+            ...(typeof data.id === "string" ? { revertToken: { messageId: data.id } } : {}),
+          },
         });
         continue;
       }
