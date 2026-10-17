@@ -1,33 +1,32 @@
 /**
- * Offline check for the bridge's revert-token translation.
+ * Offline check for the bridge's revert planning and its wiring.
  *
  * Paseo hands back whatever `revertToken` our timeline row carried and expects
- * the provider to rewind to just before that message. Two properties make this
- * dangerous to get wrong, and both are asserted here:
+ * the provider to rewind to just before that message. The dangerous decisions
+ * live in `dsh-bridge/lib/revert.js` as pure functions, so they are asserted
+ * here without a DSH profile:
  *
- * 1. **The anchor list must be `dsh-rewind`'s own.** We pass our ordinal to its
- *    `/rewind <n>`, so a list that differs by even one row rewinds to the wrong
- *    message — silently. The rule is mirrored from `isRewindAnchorEvent`.
- * 2. **Counting must happen over DSH's visible surface.** A compaction and an
- *    earlier rewind both leave their events on disk while removing them from
- *    `session.surface.nodes`.
+ * 1. **Which rows are rewind targets.** Only `user/message` with
+ *    `data.source.kind === "user"` — injected user-role messages (Paseo
+ *    envelopes, compaction checkpoints, plugin markers) must never resolve.
+ * 2. **Ranges come from the visible surface.** `session.surface.nodes`, not the
+ *    raw event log, so a compacted or already-rewound message is refused.
  *
- * Pure-module check: no DSH profile, no daemon, no model.
+ * The second half of this file asserts the wiring by reading sources: a perfect
+ * helper that nothing calls looks exactly like a working feature until the
+ * button is pressed, and the offline layer cannot see the DSH session itself.
  *
  * Usage: node harness/revert-check.mjs
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-  anchorText,
-  dirtyWorkspaceError,
-  isRewindAnchor,
+  isHumanUserMessage,
+  planRewind,
   restoresFiles,
-  revertOrdinal,
-  rewindLine,
-  rewindMode,
+  revertScope,
+  successText,
   tokenMessageId,
-  visibleAnchorSeqs,
 } from '../dsh-bridge/lib/revert.js';
 
 const results = [];
@@ -38,42 +37,23 @@ const check = (name, pass, detail) => {
 
 /** A real user message event. */
 const user = (id) => ({ type: 'user/message', data: { id, source: { kind: 'user' }, content: [{ type: 'text', text: id }] } });
-/** A Paseo system envelope: a user-role event that is NOT a rewind anchor. */
+/** A Paseo system envelope: a user-role event that is NOT a rewind target. */
 const envelope = () => ({ type: 'user/message', data: { id: 'env', source: { kind: 'paseo' }, content: [{ type: 'text', text: '⏰' }] } });
-/** `dsh-rewind`'s own unrewind anchor (the restored original bubble). */
-const pluginAnchor = (text) => ({ type: 'user/message', data: { id: `a-${text}`, source: { kind: 'plugin', plugin: 'dsh-rewind' }, content: [{ type: 'text', text }] } });
-/** dsh-rewind's marker line: a user-role event that is explicitly not an anchor. */
-const marker = (text) => ({ type: 'user/message', data: { id: `m-${text}`, source: { kind: 'plugin', plugin: 'dsh-rewind' }, content: [{ type: 'text', text }] } });
+/** A compaction checkpoint: a user-role event that replaced history. */
+const checkpoint = () => ({ type: 'user/message', data: { id: 'cp', source: { kind: 'model', provider: 'p', model: 'm' }, content: [{ type: 'text', text: 'summary' }] } });
 /** A visible assistant message event. */
-const assistant = () => ({ type: 'assistant/message', data: { source: { kind: 'model' } } });
+const assistant = (id = 'a') => ({ type: 'assistant/message', data: { id, source: { kind: 'model' } } });
+/** The replacement event this bridge appends: an empty system message. */
+const rewindMarker = () => ({ type: 'system/message', data: { message: { id: 'mark', role: 'system', content: [], source: { kind: 'system-prompt' } } } });
 
-console.log('anchor rule (mirrors dsh-rewind-plugin@0.15.3, byte for byte)');
+console.log('human user message predicate');
 {
-  const user = (id) => ({ type: 'user/message', data: { id, source: { kind: 'user' }, content: [{ type: 'text', text: id }] } });
-  check('a user message is an anchor', isRewindAnchor(user('u1')) === true);
-  check('a Paseo envelope is not', isRewindAnchor({ type: 'user/message', data: { id: 'env', source: { kind: 'paseo' }, content: [] } }) === false);
-  check('a plugin bubble is not (0.15.x dropped them)', isRewindAnchor({ type: 'user/message', data: { id: 'p', source: { kind: 'plugin', plugin: 'dsh-rewind' }, content: [{ type: 'text', text: '原话' }] } }) === false);
-  check('an assistant message is not', isRewindAnchor({ type: 'assistant/message', data: {} }) === false);
-  check('undefined is not', isRewindAnchor(undefined) === false);
-  check('text is still readable', anchorText(user('u1')) === 'u1', anchorText(user('u1')));
-}
-
-console.log('visible anchors');
-{
-  const events = {
-    1: { type: 'user/message', data: { id: 'u1', source: { kind: 'user' }, content: [] } },
-    2: { type: 'assistant/message', data: {} },
-    3: { type: 'user/message', data: { id: 'env', source: { kind: 'paseo' }, content: [] } },
-    4: { type: 'user/message', data: { id: 'u2', source: { kind: 'user' }, content: [] } },
-    5: { type: 'user/message', data: { id: 'p', source: { kind: 'plugin', plugin: 'dsh-rewind' }, content: [{ type: 'text', text: 'x' }] } },
-  };
-  check(
-    'only source.kind=user messages count',
-    JSON.stringify(visibleAnchorSeqs([1, 2, 3, 4, 5], (seq) => events[seq])) === JSON.stringify([1, 4]),
-    JSON.stringify(visibleAnchorSeqs([1, 2, 3, 4, 5], (seq) => events[seq])),
-  );
-  check('surface order is preserved', JSON.stringify(visibleAnchorSeqs([4, 1], (seq) => events[seq])) === JSON.stringify([4, 1]));
-  check('a node with no event is skipped', visibleAnchorSeqs([1, 99], (seq) => events[seq]).length === 1);
+  check('a user message is a target', isHumanUserMessage(user('u1')) === true);
+  check('a Paseo envelope is not', isHumanUserMessage(envelope()) === false);
+  check('a compaction checkpoint is not', isHumanUserMessage(checkpoint()) === false);
+  check('an assistant message is not', isHumanUserMessage(assistant()) === false);
+  check('the bridge marker is not', isHumanUserMessage(rewindMarker()) === false);
+  check('undefined is not', isHumanUserMessage(undefined) === false);
 }
 
 console.log('token validation');
@@ -85,29 +65,36 @@ console.log('token validation');
   check('a bare string is refused', tokenMessageId('abc') === undefined);
 }
 
-console.log('ordinal numbering (1 = newest)');
+console.log('range planning (target and everything after it)');
 {
   const events = { 1: user('u1'), 2: assistant(), 3: user('u2'), 4: assistant(), 5: user('u3') };
   const nodes = [1, 2, 3, 4, 5];
-  const newest = revertOrdinal(nodes, (seq) => events[seq], { messageId: 'u3' });
-  check('the newest is 1', newest.ok === true && newest.n === 1, JSON.stringify(newest));
-  const middle = revertOrdinal(nodes, (seq) => events[seq], { messageId: 'u2' });
-  check('the middle is 2', middle.ok === true && middle.n === 2, JSON.stringify(middle));
-  const oldest = revertOrdinal(nodes, (seq) => events[seq], { messageId: 'u1' });
-  check('the oldest is 3', oldest.ok === true && oldest.n === 3, JSON.stringify(oldest));
-  check('the total is reported', oldest.ok === true && oldest.total === 3);
-  check('the resolved seq rides along', middle.ok === true && middle.seq === 3, JSON.stringify(middle));
+  const newest = planRewind(nodes, (seq) => events[seq], { messageId: 'u3' });
+  check('the newest target resolves', newest.ok === true);
+  check('and its range starts at the target itself', newest.ok === true && newest.targetSeq === 5, newest.ok === true ? String(newest.targetSeq) : newest.reason);
+  check('and covers everything after it', newest.ok === true && JSON.stringify(newest.shadowed) === JSON.stringify([5]), newest.ok === true ? JSON.stringify(newest.shadowed) : newest.reason);
+  const oldest = planRewind(nodes, (seq) => events[seq], { messageId: 'u1' });
+  check('the oldest target shadows the whole surface', oldest.ok === true && JSON.stringify(oldest.shadowed) === JSON.stringify([1, 2, 3, 4, 5]), JSON.stringify(oldest));
+  const middle = planRewind(nodes, (seq) => events[seq], { messageId: 'u2' });
+  check('a middle target shadows itself and the tail', middle.ok === true && JSON.stringify(middle.shadowed) === JSON.stringify([3, 4, 5]), JSON.stringify(middle));
+}
+
+console.log('injected user-role messages are never targets');
+{
+  const events = { 1: user('u1'), 2: envelope(), 3: checkpoint(), 4: assistant() };
+  const nodes = [1, 2, 3, 4];
+  check('a Paseo envelope is refused', planRewind(nodes, (seq) => events[seq], { messageId: 'env' }).ok === false);
+  check('a compaction checkpoint is refused', planRewind(nodes, (seq) => events[seq], { messageId: 'cp' }).ok === false);
 }
 
 console.log('surface awareness (the whole point)');
 {
-  // A compaction removed 1..5 from the surface; only u4 is still rewindable.
+  // A compaction removed 1..3 from the surface; only u4 is still rewindable.
   const events = { 1: user('u1'), 3: user('u2'), 5: user('u3'), 7: user('u4') };
   const nodes = [7];
-  const visible = revertOrdinal(nodes, (seq) => events[seq], { messageId: 'u4' });
-  check('a still-visible message counts from the surface only', visible.ok === true && visible.n === 1 && visible.total === 1, JSON.stringify(visible));
-  const gone = revertOrdinal(nodes, (seq) => events[seq], { messageId: 'u2' });
-  check('a compacted-away message is refused', gone.ok === false, JSON.stringify(gone));
+  check('a still-visible message resolves', planRewind(nodes, (seq) => events[seq], { messageId: 'u4' }).ok === true);
+  const gone = planRewind(nodes, (seq) => events[seq], { messageId: 'u2' });
+  check('a compacted-away message is refused', gone.ok === false);
   check('and the refusal names it', gone.ok === false && gone.reason.includes('u2'), gone.ok === false ? gone.reason : '');
 }
 
@@ -115,33 +102,25 @@ console.log('bad tokens fail instead of guessing');
 {
   const events = { 1: user('u1') };
   const nodes = [1];
-  check('unknown id is refused', revertOrdinal(nodes, (seq) => events[seq], { messageId: 'nope' }).ok === false);
-  check('malformed token is refused', revertOrdinal(nodes, (seq) => events[seq], { messageId: 1 }).ok === false);
-  check('missing token is refused', revertOrdinal(nodes, (seq) => events[seq], {}).ok === false);
+  check('unknown id is refused', planRewind(nodes, (seq) => events[seq], { messageId: 'nope' }).ok === false);
+  check('malformed token is refused', planRewind(nodes, (seq) => events[seq], { messageId: 1 }).ok === false);
+  check('missing token is refused', planRewind(nodes, (seq) => events[seq], {}).ok === false);
+  check('undefined token is refused', planRewind(nodes, (seq) => events[seq], undefined).ok === false);
 }
 
-console.log('scope mapping (dsh-rewind-plugin@0.15.3: /rewind @<seq> chat|both)');
+console.log('scope handling (only the advertised scopes)');
 {
-  check('conversation maps to chat', rewindMode('conversation') === 'chat');
-  check('both maps to both', rewindMode('both') === 'both');
-  check('files has no mode at all', rewindMode('files') === undefined);
-  check('both touches the worktree', restoresFiles('both') === true);
-  check('files touches the worktree', restoresFiles('files') === true);
+  check('conversation is accepted', revertScope('conversation') === 'conversation');
+  check('both is accepted', revertScope('both') === 'both');
+  check('files is refused (never advertised)', revertScope('files') === undefined);
+  check('an unknown scope is refused', revertScope('everything') === undefined);
+  check('both restores files', restoresFiles('both') === true);
   check('conversation does not', restoresFiles('conversation') === false);
-  check('the line targets a seq, not an ordinal', rewindLine(42, 'both') === '/rewind @42 both', rewindLine(42, 'both'));
-  check('chat rewinds only the conversation', rewindLine(7, 'conversation') === '/rewind @7 chat', rewindLine(7, 'conversation'));
-  check('files has no line', rewindLine(7, 'files') === undefined);
-  let threw = false;
-  try { rewindLine(-1, 'both'); } catch { threw = true; }
-  check('an invalid seq cannot become a line', threw);
 }
 
-console.log('dirty-worktree refusal');
+console.log('receipt');
 {
-  check('one file is named', dirtyWorkspaceError([' M a.txt']).includes('a.txt'));
-  check('the count is stated for many files', dirtyWorkspaceError([' M a', ' M b', ' M c', ' M d']).includes('4 处'));
-  check('it says the revert was abandoned', dirtyWorkspaceError([' M a']).includes('放弃撤回'));
-  check('it says what to do', dirtyWorkspaceError([' M a']).includes('stash'));
+  check('the receipt names the withdrawn seq', successText(42) === 'Withdrawn seq 42 and everything after it', successText(42));
 }
 
 console.log('wiring (the pure module is useless if nothing calls it)');
@@ -158,8 +137,6 @@ console.log('wiring (the pure module is useless if nothing calls it)');
   for (const capability of ['session.revert.both', 'session.revert.conversation']) {
     check(`provider declares ${capability}`, provider.includes(`"${capability}"`));
   }
-  // The installed plugin has no files-only mode, so advertising this one would
-  // put a menu entry in front of a backend that cannot honour it.
   check('provider does NOT declare session.revert.files', provider.includes('"session.revert.files"') === false);
   check(
     'provider dispatches session.revert to the session',
@@ -175,24 +152,42 @@ console.log('wiring (the pure module is useless if nothing calls it)');
     'the replayed row carries the same token',
     /revertToken: \{ messageId: data\.id \}/.test(session),
   );
+  check('both replay sites are wired', (session.match(/revertToken: \{ messageId: data\.id \}/g) ?? []).length === 2);
   check(
     'a rewind settles any question card still waiting for an answer',
     /#clearPendingPermissions\("The conversation was rewound past this question/.test(session),
     'pending question cards would outlive the turn that asked them',
   );
-  check('both replay sites are wired', (session.match(/revertToken: \{ messageId: data\.id \}/g) ?? []).length === 2);
 
   const process = read('paseo-plugin/server/dsh-process.ts');
   check('the plugin reaches the bridge', process.includes('"paseo/revert"'));
   check('and forwards the scope', /revert\(token: unknown, scope: "conversation" \| "files" \| "both"\)/.test(process));
 
   const bridge = read('dsh-bridge/lib/server.js');
+  check('the bridge serves paseo/revert', /case 'paseo\/revert':/.test(bridge) && /return this\.revert\(params\)/.test(bridge));
+  check('the bridge resolves the token against the visible surface', /planRewind\(session\.surface\.nodes/.test(bridge));
   check(
-    'the bridge serves paseo/revert',
-    /case 'paseo\/revert':/.test(bridge) && /return this\.revert\(params\)/.test(bridge),
+    'the bridge appends an empty system message as the replacement',
+    /session\.append\(\s*'system\/message',\s*\{ message: createSystemMessage\(''\) \}/.test(bridge),
   );
-  check('and refuses a dirty worktree', /dirtyWorkspaceError\(worktree\.dirty\)/.test(bridge));
-  check('and refuses outside a git repository', /不是 git 仓库/.test(bridge));
+  check(
+    'the replacement carries sourceEventSeqs for every shadowed node',
+    /sourceEventSeqs: \[\.\.\.shadowed\]/.test(bridge),
+  );
+  check(
+    'the bridge settles the agent before replacing (cancel -> idle -> steering)',
+    /agent\.cancel\(\{ kind: 'user' \}, \{ keepInbox: true \}\)/.test(bridge)
+      && /agent\.whenIdle\(\)/.test(bridge)
+      && /agent\.inbox\.nextStep/.test(bridge),
+  );
+  check(
+    'the bridge refuses unknown scopes instead of widening them',
+    /unsupported revert scope/.test(bridge),
+  );
+  check(
+    'the old assistant/message placeholder is gone',
+    /append\(\s*'assistant\/message'[\s\S]{0,120}surfaceOp/.test(bridge) === false,
+  );
 }
 
 const failed = results.filter((result) => !result.pass);

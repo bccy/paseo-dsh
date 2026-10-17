@@ -16,17 +16,13 @@
  *
  * @module dsh-paseo-bridge/server
  */
-import { execFileSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import { brandString } from '@deepseek-ai/dsh-brand';
-import { BlockAssembler, createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
+import { BlockAssembler, createSystemMessage, createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { admitEncodedImages } from '@deepseek-ai/dsh-attachment';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import { underArchivedSession } from './archived-lineage.js';
-import { dirtyWorkspaceError, restoresFiles, revertOrdinal, tokenMessageId } from './revert.js';
-import { ledgerLine, restore, snapshot, snapshotFor, worktreeState as gitWorktreeState } from './git-snapshot.js';
+import { planRewind, restoresFiles, revertScope, successText } from './revert.js';
 import { visibleEvents } from './surface.js';
 import { historyEvents, withImageHostPaths } from './image-host-path.js';
 import { promptSource } from './paseo-system-envelope.js';
@@ -190,6 +186,13 @@ export class PaseoHarnessServer {
     /** sessionId -> { handle } for agents this server owns. */
     this.sessions = new Map();
     this.sessionCreations = new Map();
+    /**
+     * DSH session ids with a rewind currently running. A second rewind would
+     * compute its range from the same surface that the first is about to
+     * replace, so it is refused instead of serialised — by the time it ran, the
+     * conversation it named would no longer exist.
+     */
+    this.revertInflight = new Set();
     /**
      * Native child session id -> { parentId, mode?, label? }. Populated from
      * each child session's own durable header (`origin: 'subagent'`) the moment
@@ -529,10 +532,6 @@ export class PaseoHarnessServer {
     // A steer belongs inside the turn already running; a plain prompt starts the
     // next one. Without this distinction an interjection queues behind the very
     // turn it was meant to correct.
-    // Record the worktree this message could be rewound to. Best effort: a
-    // non-git cwd or a git failure must never block the prompt — the rewind then
-    // refuses to restore files instead of guessing.
-    this.recordSnapshot(rec.handle.agent.session, String(message.id));
     if (params.delivery === 'steer') rec.handle.agent.steer(message);
     else rec.handle.agent.followup(message);
     return { messageId: String(message.id) };
@@ -1026,94 +1025,77 @@ export class PaseoHarnessServer {
    * Rewind one session to just before the user message Paseo named.
    *
    * Paseo's rewind button is capability-gated, and the token it hands back is
-   * the `revertToken` our own timeline row carried (`{ seq }`). The rewind
-   * itself is `dsh-rewind`'s `/rewind <n>`: it appends the same
-   * surface-replacement event compaction uses — so the reverted turns leave the
-   * model's view without any trace of the rewind — and restores the worktree
-   * from its git snapshot.
+   * the `revertToken` our own timeline row carried (`{ messageId }`). The rewind
+   * itself is a surface replacement appended to DSH's own log — the same
+   * mechanism compaction uses — so the withdrawn turns leave the model's view
+   * without any trace of the rewind, and nothing is deleted: the log stays the
+   * durable, auditable record.
    *
-   * A missing git repository or a dirty worktree aborts the whole revert rather
-   * than reverting half of it: leaving the conversation ahead of the files is
-   * exactly the inconsistency this feature exists to fix.
+   * The replacement is a single empty `system/message`. `deriveEventMessage`
+   * returns null for an empty system message, so it never enters the model's
+   * context; it is also the only surface-eligible placeholder that can carry the
+   * `sourceEventSeqs` DSH's replace validation requires (an `assistant/message`
+   * may not cite source events, which rules it out as a replacement carrier).
    */
-  /** Ledger path for one session's file snapshots. */
-  ledgerPath(session) {
-    const dir = join(homedir(), '.dsh', 'rewind-ledger');
-    mkdirSync(dir, { recursive: true });
-    return join(dir, `${String(session.id)}.jsonl`);
-  }
-
   /**
-   * Append one worktree snapshot for a user message.
+   * Settle one agent before a rewind.
    *
-   * A rewind restores the snapshot of the withdrawn message — the tree as it was
-   * just before that message was sent. Never throws: the prompt is the hot path,
-   * and a missing snapshot only narrows what a rewind may do.
+   * A surface replacement freezes its range when it is appended. If a turn keeps
+   * producing events afterwards, they append *after* the replacement node and
+   * stay visible — the withdrawn content "comes back". DSH's own rewind plugin
+   * settles the agent the same way: cancel the running turn, wait for idle, drop
+   * steering input queued for the dropped turn.
    */
-  recordSnapshot(session, messageId) {
-    const cwd = session.header?.cwd ?? this.cwd;
-    try {
-      if (!gitWorktreeState(cwd).repo) return;
-      const snap = snapshot(cwd);
-      appendFileSync(
-        this.ledgerPath(session),
-        ledgerLine({ seq: 0, messageId, head: snap.head, stash: snap.stash }),
-        'utf8',
+  async settleAgentForRevert(agent) {
+    if (agent.status !== 'idle') {
+      agent.cancel({ kind: 'user' }, { keepInbox: true });
+      await withTimeout(
+        agent.whenIdle(),
+        15000,
+        'waiting for the agent to become idle before rewinding',
       );
-    } catch (error) {
-      process.stderr.write(`[bridge] recording a rewind snapshot: ${String(error?.message ?? error)}\n`);
     }
+    for (const pending of [...agent.inbox.nextStep]) agent.inbox.remove(pending.id);
   }
 
   async revert(params) {
     const rec = this.requireSession(params.sessionId);
     const agent = rec.handle.agent;
     const session = agent.session;
-    const resolved = revertOrdinal(session.surface.nodes, (seq) => session.eventAt(seq), params.token);
-    if (!resolved.ok) throw new Error(resolved.reason);
-    const scope = params.scope === 'conversation' || params.scope === 'files' ? params.scope : 'both';
-    if (restoresFiles(scope)) {
-      const cwd = session.header?.cwd ?? this.cwd;
-      const worktree = worktreeState(cwd);
-      if (!worktree.git) {
-        throw new Error('该工作区不是 git 仓库，无法回退文件；请改用「只回退对话」。');
-      }
-      if (worktree.dirty.length > 0) throw new Error(dirtyWorkspaceError(worktree.dirty));
-      const messageId = tokenMessageId(params.token);
-      if (messageId === undefined) throw new Error('这条消息没有撤回令牌，无法回退文件');
-      let ledger = '';
-      try {
-        ledger = readFileSync(this.ledgerPath(session), 'utf8');
-      } catch {
-        ledger = '';
-      }
-      const snap = snapshotFor(ledger, messageId);
-      if (snap === undefined) {
-        // Refusing beats guessing: restoring the wrong commit would lose work.
-        throw new Error('这条消息没有文件快照，无法回退文件；请改用「只回退对话」。');
-      }
-      restore(cwd, snap);
+    const scope = revertScope(params.scope);
+    if (scope === undefined) {
+      // Never widen an unknown scope into a full rewind: that is the most
+      // destructive interpretation of a request we do not understand.
+      throw new Error(`unsupported revert scope "${String(params.scope)}"`);
     }
-    const nodes = session.surface.nodes;
-    const endSeq = nodes[nodes.length - 1];
-    if (endSeq === undefined) throw new Error('会话还没有可撤回的内容');
-    // The one write: a surface replacement, the same mechanism compaction uses.
-    // It is a `surfaceOp` on a new event — nothing is deleted, and every event in
-    // [startSeq, endSeq] leaves the visible surface, so the model (which derives
-    // its messages from `surface.nodes`) stops seeing it too.
-    //
-    // It is `assistant/message` with empty content on purpose: `deriveEventMessage`
-    // skips an empty assistant message, so the replacement itself never appears in
-    // the conversation — unlike an empty user message, which the model would read.
-    session.append(
-      'assistant/message',
-      { message: { content: [] } },
-      { surfaceOp: { op: 'replace', startSeq: resolved.seq, endSeq } },
-    );
-    return {
-      kind: 'success',
-      text: `Withdrawn seq ${resolved.seq} and everything after it`,
-    };
+    const sessionKey = String(session.id);
+    if (this.revertInflight.has(sessionKey)) {
+      throw new Error('a rewind is already in progress for this session');
+    }
+    this.revertInflight.add(sessionKey);
+    try {
+      await this.settleAgentForRevert(agent);
+      const resolved = planRewind(session.surface.nodes, (seq) => session.eventAt(seq), params.token);
+      if (!resolved.ok) throw new Error(resolved.reason);
+      if (restoresFiles(scope)) {
+        throw new Error('文件回退尚未接入（下一步实现）；请改用「只回退对话」。');
+      }
+      // The one write: a positional surface replacement, validated by DSH before
+      // it is appended. The range comes from the surface snapshot planRewind
+      // read, so it cannot move between planning and appending.
+      const shadowed = resolved.shadowed;
+      session.append(
+        'system/message',
+        { message: createSystemMessage('') },
+        {
+          surfaceOp: { op: 'replace', startSeq: shadowed[0], endSeq: shadowed[shadowed.length - 1] },
+          sourceEventSeqs: [...shadowed],
+        },
+      );
+      return { kind: 'success', text: successText(resolved.targetSeq) };
+    } finally {
+      this.revertInflight.delete(sessionKey);
+    }
   }
 
   /**
@@ -1504,24 +1486,4 @@ export class PaseoHarnessServer {
   hasAdapterFor(provider) {
     return this.ctx.get('llm')?.listProviders().some((entry) => entry.id === provider) ?? false;
   }
-}
-
-/**
- * Whether a directory is a git worktree, and which entries are uncommitted.
- *
- * `dsh-rewind` snapshots files through git, so outside a repository its file
- * restore would silently do nothing. Returning `git: false` lets the caller
- * refuse loudly instead of reporting a revert that did not restore anything.
- *
- * @param {string} cwd
- * @returns {{git: boolean, dirty: string[]}}
- */
-function worktreeState(cwd) {
-  try {
-    execFileSync('git', ['rev-parse', '--git-dir'], { cwd, stdio: 'ignore', timeout: 15000 });
-  } catch {
-    return { git: false, dirty: [] };
-  }
-  const out = execFileSync('git', ['status', '--porcelain'], { cwd, encoding: 'utf8', timeout: 15000 });
-  return { git: true, dirty: out.split('\n').filter((line) => line.trim() !== '') };
 }
