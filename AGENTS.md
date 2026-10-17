@@ -130,6 +130,33 @@ cd paseo-plugin && npx tsc --noEmit
   目录：`node harness/context-usage-check.cjs <dir>`。**动了 `server/dsh-process.ts` 的用量
   读取或 `DshSession` 的用量上报必跑。**
 
+### 撤回（rewind）
+
+撤回实现跨越 DSH 会话日志、桥与插件三层，**离线断言全绿不等于能用**（曾经两次出现
+"mock 通过、真实 append 必挂"）。改到撤回或 `dsh-bridge/` 时按顺序跑：
+
+```bash
+node harness/revert-check.mjs          # 令牌/区间/前置/回执/文件层/停放接线
+node harness/surface-check.mjs         # 只折撤回缝、compaction 保留、尾随日志事件
+node harness/file-snapshot-check.mjs   # 编辑工具级写前备份（真实临时目录）
+node harness/revert-shape-probe.mjs    # 真实 DSH Session：旧写法必抛、新写法通过
+node harness/replay-fidelity-probe.mjs <session.v4.jsonl.zstd>  # 真实日志重放保真
+node harness/rewind-e2e.mjs            # 真 dsh --profile paseo，3 回合端到端（耗 token）
+
+# 停放会话（先按 plugin-check.cjs 头部步骤把插件编译到 .dbg）
+node harness/parked-sessions-check.cjs paseo-plugin/.dbg
+```
+
+**三条不能破的约束**（都是真机踩出来的）：
+
+1. 撤回的替换事件必须是 `user/message` + `source.kind="paseo-rewind"`：DSH 日志 v4 要求
+   `system/developer/assistant` 消息处于打开的 turn/step 内，空闲时追加会让整份日志被判 corrupt。
+2. append 之后必须 `await sessions.flush(session)`：宿主回执后立刻读日志重建时间线。
+3. 重放折叠只折本桥撤回缝；compaction 的 replace 不折，否则重开会话丢压缩前对话。
+
+真机验收要用**新会话**（能力位只对新会话生效）：发两条消息 → 撤回第二条 → 消息消失、
+无 `/rewind` 行/回合页脚、编辑工具改的文件恢复、模型不知道被撤内容、重开会话仍正确。
+
 离线清单之外还有四个容易被当成同类、其实不是的：`harness/tools.mjs`（真 `dsh` 的工具目录
 转储）、`harness/subagent-live.mjs`（实机子会话可见性）、`harness/fake-dsh-bridge.mjs`
 （上面几个假桥脚本共用的 scripted 替身，不是独立检查脚本），以及

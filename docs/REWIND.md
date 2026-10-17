@@ -1,8 +1,12 @@
 # 撤回（Rewind）
 
-Paseo 在每条用户消息下方提供一个撤回按钮；点开是「此操作无法撤销」+「回退对话和文件」。
+Paseo 在每条用户消息下方提供一个撤回按钮；点开是「此操作无法撤销」+ 回退范围。
 OpenCode / Codex provider 有这个按钮，DSH provider 原本没有——本文记录它现在是怎么接的、
 为什么这么接、以及哪些前提不能破。
+
+**实现路线：自研（不安装任何 DSH 撤回插件）。** 对话回退是一条约 30 行的表面替换事件；
+文件回退是编辑工具级的写前备份；界面刷新走「Reload agent」旁路 + 停放会话优化。
+历史上曾复用 `dsh-rewind-plugin`（方案 A），已废止，仓库不再依赖它。
 
 ## 契约（来自 Paseo，不是我们编的）
 
@@ -12,74 +16,143 @@ OpenCode / Codex provider 有这个按钮，DSH provider 原本没有——本�
 | 请求形状 | 同文件：`{ type:"session.revert", requestId, sessionId, token, scope }` |
 | 令牌来源 | 时间线项的 `revertToken`（`ProviderTimelineIdentity`）；Paseo 按行缓存，点击时原样回传 |
 | 按钮显示条件 | `plugin-provider.js`：`supportsRewindBoth/Conversation/Files` 由能力位算出 |
+| 宿主刷新语义 | `public-docs/plugins/providers`：Paseo 用「关闭当前 provider 会话并带 persistence 重开」刷新 agent，没有单独的 reload 操作 |
 
 所以"加一个按钮"需要三处同时成立：**声明能力位**、**行上带令牌**、**处理请求**。
 
-## 实现
+## 实现（自研）
 
 ```
 Paseo 撤回按钮
-  → provider.ts   capabilities + case "session.revert"
+  → provider.ts      声明 session.revert.both / .conversation；分发 session.revert
   → DshSession.revert(token, scope) → DshProcess.revert
   → 桥 paseo/revert { sessionId, token, scope }
-  → dsh-bridge/lib/revert.js：令牌 → /rewind <n> 命令
-  → ctx.commands.execute(agent, "/rewind <n> [--conversation|--code]")
-  → dsh-rewind：表面替换（对话）+ git 快照恢复（文件）
+  → dsh-bridge/lib/revert.js：令牌 → 锚点 user/message 的 seq → 表面节点区间
+  → 可选：file-snapshots.js 恢复该消息之后被编辑工具改过的文件
+  → session.append('user/message', marker, { surfaceOp:{op:'replace',startSeq,endSeq}, sourceEventSeqs })
+  → await sessions.flush(session)（保证回执前落盘）
+  → 回执成功；插件先回 request.completed，再延迟 spawn `paseo agent reload <agentId>`
 ```
 
-**为什么复用 `dsh-rewind`**：它已经实现了 DSH 的对话回退语义（用与 compaction 相同的
-surface replacement 事件把作废消息从模型可见面移除，且模型上下文里不会出现任何回退痕迹）
-以及文件回退的 git 快照账本。撤回是"改历史"的高风险操作，自己重写边界（未跟踪文件、rename、
-非 git 工作区）收益远小于风险。
+### 对话回退：一条表面替换
 
-**依赖**：`dsh-rewind-plugin@0.15.3`，装在 `~/.dsh/profiles/paseo`。它的客户端部分是
-`platform: "web"`，在 paseo profile 里只用到它的**服务端命令**。
+撤回 = 向 DSH 会话**追加**一条替换事件，把「目标消息（含）→ 当前可见面尾部」整段遮蔽。
+日志只追加、不删除；模型上下文由 `surface.nodes` 推导，所以下一次请求自然看不到被撤内容。
 
-装的时候要注意两点：
+标记事件是 `user/message`，`source.kind = "paseo-rewind"`：
 
-- **版本门禁豁免**：它对 `@deepseek-ai/dsh-*` 的 peer 要求是 `^0.2.1-rc.1`，本机 DSH 是
-  `0.2.0-rc.2`，需要用 `dsh plugin allow-version` 显式豁免才能装上。装上后实测可用。
-- **不要装 0.11.x**：那一版读 `session.events[seq]`，而本机 DSH 已移除该属性（改用
-  `session.eventAt(seq)`），命令一执行就抛 `Cannot read properties of undefined`。
+- **为什么不是 `system/message`**：DSH 会话日志 v4 格式要求 `system`/`developer`/`assistant`
+  消息必须处于**打开的 turn+step** 内；撤回发生在 agent 空闲时，追加系统消息会让整份日志被
+  判定 corrupt（`history` 读回空、重开会话丢失全部历史）。`user/message` 没有这个约束。
+- **为什么 source 不是 `user`**：非 user 源让它同时满足四件事——不会被当作撤回锚点、
+  Paseo 重放会跳过它（不显示成用户气泡）、记忆插件不采集、`storage` 侧不需要 turn 归属。
+- **代价**：`deriveEventMessage` 会把它投影成一条 `(empty message)` 用户消息，模型上下文里
+  多一轮无内容用户消息（与 `dsh-rewind-plugin` 的做法一致，实测无副作用）。
+- `surfaceOp` 必须恰好 `op`/`startSeq`/`endSeq` 三键，两端必须是**当前 surface.nodes 里的
+  seq**（不能用日志 seq）；`sourceEventSeqs` 必须覆盖全部被遮蔽节点，否则 `append` 抛错。
+- 追加前必须使 agent **空闲**：`cancel` 当前回合 → `await whenIdle(15s)` → 清 pending
+  steering → 会话级 inflight 互斥。否则撤回后仍在产生的事件会追加到替换节点之后，被撤内容
+  "复活"。
+- 撤回成功后必须 `sessions.flush(session)`：宿主在回执后立刻读日志重建时间线，缓冲未落盘的
+  标记会让重放仍带着被撤行。
 
-## 两条不能破的规则
+### 重放折叠：只折撤回缝
 
-1. **锚点判定必须逐字复刻 `dsh-rewind`**。我们算出序号 `n` 再交给它的 `/rewind <n>`，两边
-   的"可回退消息清单"只要差一条，就会回退到**错误的消息**——而且不会报错。因此
-   `dsh-bridge/lib/revert.js` 的 `isRewindAnchor` 与它的 `isRewindAnchorEvent` 完全一致：
-   `source.kind === 'user'` 的消息，**没有别的**（0.11.x 还额外算自己的 plugin 锚点、并排除
-   标记行，0.15.x 不需要）。**升级插件后必须重新核对这条规则**，`harness/revert-check.mjs`
-   里有一整组断言。
-2. **目标必须用 `@<seq>`，不能用序号**。0.15.x 的 `/rewind` 接受 `<index>` 或 `@<seq>`，
-   传 seq 让插件自己在可见面上解析，两边就不可能对"第几条"产生分歧。我们自己的锚点判定
-   只用于**提前拒绝**已不可回退的行（给出可读错误），不用于编号。
+桥的 `history()` 是 Paseo 重开会话时重建时间线的数据源，必须折叠撤回缝。规则：
 
-**能力位的取舍**：0.15.x 只有 `chat` 和 `both` 两种模式，**没有"只回退文件"**。所以
-`provider.ts` 只声明 `session.revert.both` 和 `session.revert.conversation`，不声明
-`session.revert.files`——声明一个后端做不到的能力，比菜单里少一项更糟。
+- 只折叠 `source.kind === "paseo-rewind"` 的替换事件，遮蔽 `[startSeq, seamSeq-1]`
+  （含被撤回合的 `step/end`、`turn/end`、`command/*` 等尾随日志事件）。
+- **compaction 的 replace 不折叠**：DSH 的 surface 是模型可见面，不是人类转写；把 compaction
+  也折掉会让重开的会话丢掉压缩前的全部对话（实测 205 条用户消息剩 60 条）。
 
-## 行为约定
+### 文件回退：编辑工具级写前备份
 
-- **工作区有未提交改动 → 完全拒绝**，不做"只回对话"的半回退。错误信息会列出改动并要求
-  先提交或 stash。理由：让对话跑到文件前面，正是这个功能要消除的不一致。
-- **非 git 工作区 → 拒绝文件回退**，提示改用「只回退对话」。
-- **子会话不支持撤回**（只读投影，没有自己的进程）。
-- **不做 `/unrewind`**：Paseo 的菜单本身就是「此操作无法撤销」。
+只撤「智能体用编辑工具改过的文件」，不碰用户自己的改动，也不要求 git/干净工作区：
 
-## 回滚
+- 桥通过 DSH 原生钩子 `ctx.inject(['fs'])` 监听 `tools/execute` / `tools/post-execute` /
+  `tools/result`：`write`/`edit` 执行前读旧内容，成功后按「最近一条 human 用户消息 seq」
+  记一行 journal；失败/中断丢弃。
+- 根目录 `~/.dsh/paseo-rewind/<sessionId>/`：`journal.jsonl` + `objects/`（内容寻址）+
+  `rescue/`（恢复前当前内容的备份）。
+- 撤回 `both` 时：读 journal，取每个路径「目标消息及之后最早一次改动前的状态」——新建的
+  文件删除，被改的写回，未被工具的动的不碰；覆盖前把当前内容存入 rescue。
+- 不跟踪：bash/pwsh 等命令产生的改动、用户或外部进程直接改的文件、符号链接、> 8 MiB 文件、
+  子代理会话。这是本方案的语义边界，写进已知限制。
 
-- 代码：`git revert <commit>`
-- profile 依赖：`dsh plugin --profile paseo remove dsh-rewind`，然后重启（`paseo plugin reload dsh-paseo`）
-- profile 备份：`~/paseo-profile-backup-rewind-*.tgz`
+### 刷新：Reload 旁路 + 停放会话
+
+Paseo 的插件 provider 适配层把翻译后的时间线事件放进一个**只追加**的内存数组，撤回只把
+请求转给插件、不动该数组；宿主撤回后强制从它重建时间线，于是旧行复活。这是上游已知缺陷
+（getpaseo/paseo issue #4667，open，p2；修复 PR #4668 关闭未合并；0.11.2/0.11.4/0.12 beta
+均未修）。插件协议也没有"删除/替换时间线"事件。
+
+唯一干净旁路是走宿主自己的刷新语义：
+
+```
+撤回成功 → 先回 request.completed
+→ 延迟 500ms spawn `paseo agent reload <agentId>`
+→ daemon reloadAgentSession({rehydrateFromDisk:true})：关旧 provider 会话、带 persistence 重开
+→ 桥重放折叠后的 history → 新 epoch → 客户端重建时间线（旧行消失）
+```
+
+- **不能 await 刷新**：daemon 撤回持有 pending run，reload 会 cancel 在飞回合，二者互相等待。
+- agent id 取 daemon 注入的 `config.env.PASEO_AGENT_ID`；`paseo` 二进制按 `PASEO_BIN` →
+  `which` → PATH 解析，spawn 的 `error`/`exit` 都必须写日志。
+- 刷新失败/文件恢复失败用 provider `session.notice` 显示到时间线，不静默。
+- **停放会话**：`session.close` 时若会话空闲，把 dsh 子进程放进池（TTL 30s、上限 3、
+  cwd/route 一致才复用）；reload 重开时按 DSH 原生 session id 接管同一进程，省掉 1.5–2.7s
+  的冷启动。池里进程用静默处理器，退出自动出池；provider 整体关闭时清池。
+- 上游修复 #4667 后可删掉 Reload 旁路与停放会话。
+
+### 权限预设：非命令写入
+
+`/permission` 命令会留下 `command/run`/`command/done`，时间线上多一条用户没输入过的行。
+改为调用 DSH 的投影 API：
+
+```js
+this.ctx.get('permissionPresets').set(session, name);
+```
+
+只 append `permission/preset` + `sandbox/mode` + `approval/policy`，无命令事件。已知偏差：
+命令路径会额外注入一条「审批策略已变更」提示，本路径没有；会话头的预设控件仍显示当前值。
+
+## 行为约定与边界
+
+- 能力位只声明 `session.revert.both` 与 `session.revert.conversation`；**不声明 `files`**
+  （没有"只回文件"语义；该模式 daemon 也不重建时间线）。
+- 撤回**不可撤销**：不实现 `/unrewind`（Paseo 菜单本身就这么写）。
+- 子会话（DSH 原生 child）不支持撤回：只读投影，没有自己的进程。
+- 文件回退失败时对话仍然已经撤回：回执带 `files.failed` + rescue 目录，插件发时间线通知。
+- 时间线折叠后仍会保留压缩前的完整对话（撤回只影响它自己那段）。
+- 记忆插件可能仍召回被撤内容（模型"记得"）——已知缺口，不在本次范围。
 
 ## 验证
 
-`harness/revert-check.mjs` 离线断言两层：
+```bash
+# 纯函数 + 接线（不需要 daemon）
+node harness/revert-check.mjs        # 令牌/区间/前置/回执/文件层/停放接线
+node harness/surface-check.mjs       # 只折撤回缝、compaction 保留、尾随事件
+node harness/file-snapshot-check.mjs # 写前备份/新建删除/多工具/救援/上限
+node harness/revert-shape-probe.mjs  # 真实 DSH Session：旧写法必抛、新写法通过、marker 不进上下文
+node harness/replay-fidelity-probe.mjs <session.v4.jsonl.zstd>  # 真实日志重放保真
 
-- **纯函数**：锚点判定（含标记行、空 plugin 气泡、信封）、令牌校验、序号计算（含"压缩后
-  只剩一条可见"的场景）、scope → 命令参数、脏工作区文案。
-- **接线（读源码）**：provider 声明三项能力位并分发 `session.revert`；实时行与重放行都带
-  `revertToken`；插件确实请求 `paseo/revert`；桥确实拒绝脏工作区与非 git 目录。
+# 端到端（真 dsh --profile paseo，3 个真实模型回合；会消耗少量 token）
+node harness/rewind-e2e.mjs
+# 断言：成功回执、文件删除、history 折叠成 1 条用户消息、无 command/run、
+#       模型仍知道 ALPHA、不再知道 BETA
 
-`harness/steer-check.cjs` 另断言：同一用户消息行二次下发（先显示、后补令牌）共享同一个
-行 id，且末次带令牌——Paseo 的 timeline 按 id upsert，所以这是一行更新而不是两行。
+# 插件层（先按 plugin-check.cjs 头部步骤编译到 .dbg）
+node harness/parked-sessions-check.cjs paseo-plugin/.dbg
+```
+
+真机验收（新会话，能力位只对新会话生效）：发两条消息 → 撤回第二条 → 消息行消失、无
+`/rewind` 行/回合页脚、文件回到消息前、模型不知道被撤内容；重开会话后仍正确。
+
+## 回滚
+
+- 代码：`git revert` 撤回相关提交（或切回 `main` 重载插件）。
+- 运行时：`git checkout main` → 重新生成内嵌桥（`node paseo-plugin/scripts/generate-bridge-assets.mjs`）
+  → `paseo plugin reload dsh-paseo`。
+- 外部状态：`~/.dsh/paseo-rewind/`（journal/objects/rescue）可直接清理，丢失的只是文件回退能力；
+  旧实现残留（`~/.dsh/rewind-ledger`、`~/.dsh/rewind-git`、`~/.dsh/rewind-snapshots`）已不再读取。
+- profile 备份：`~/.dsh/backups/paseo-profile-before-rewind-*.tgz`、`profile-bridge-before-file-layer-*.tgz`。

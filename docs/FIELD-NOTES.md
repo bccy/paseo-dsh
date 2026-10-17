@@ -1493,6 +1493,100 @@ base64 还有雪崩性质：源文件中间改一个字节，它后面所有字�
 
 ---
 
+## 第十四轮：撤回——表面替换的正确写法、v4 日志格式与刷新旁路
+
+这一轮把「撤回（rewind）」从方案 A（复用 `dsh-rewind-plugin`）改成自研，并在真实
+`dsh --profile paseo` 上跑通端到端。**离线断言全绿、真实 append 必挂**在这里发生了两次，
+值得逐条记下。
+
+### 46. `assistant/message` + replace 是死路：DSH 的 replace 校验与消息类型契约互斥
+
+**症状**：撤回请求成功返回 `kind:"success"`，但会话日志里没有任何替换事件，模型上下文也
+没有变化；真实桥进程里错误被 `request.failed` 吞成一句失败。
+
+**根因**：DSH rc.2 的 `session.append(...)` 对 replace 调用
+`assertSourceEventReferences(event, shadowedSeqs)`，要求 `sourceEventSeqs` **覆盖每一个被
+遮蔽的 surface 节点**；而 `assistant/message` 被契约禁止携带 `sourceEventSeqs`
+（"embeds its source stream"）。两者互斥，只要区间非空必抛。
+
+**修法**：占位事件换成可携带 `sourceEventSeqs` 的类型（`user`/`system`/`developer`），
+并显式传 `sourceEventSeqs: [...shadowed]`。区间两端必须是**当前 `surface.nodes` 的 seq**，
+不能用日志 seq；`endSeq` 取可见面尾部。
+
+**教训**：`session.append` 在写前校验，失败不会改日志，所以"回执成功"不代表事件真的写进去了。
+断言必须打在**真实 DSH Session/log**上（`harness/revert-shape-probe.mjs`、`harness/rewind-e2e.mjs`），
+mock 只能证明纯函数。
+
+### 47. v4 日志格式：`system/message` 必须处于打开的 turn/step 内
+
+第一版修法用空 `system/message` 当占位（`deriveEventMessage` 返回 null，不进模型上下文）。
+真实跑起来后：
+
+- 撤回回执成功，但 `paseo/history` 读回 **0 条事件**；
+- 会话日志尾部确实多了一行 `system/message`，但整份日志被判定 **corrupt**
+  （`session "…": stored log is corrupt: SessionFormatError: system/message does not match an
+  open turn and step`）；
+- 后果不是"少一行"，而是**重开会话时历史全部丢失**。
+
+**根因**：会话日志 v4 编解码器（`@deepseek-ai/dsh-session-format-v3-to-v4`）的状态机要求
+`system/message`、`developer/message`、`assistant/message` 必须匹配当前打开的 turn/step；
+撤回发生在 agent 空闲（`turn/end` 之后），没有打开的 turn，这条事件无法被合法编码。
+`user/message` 没有这个约束。
+
+**修法**：标记改用 `user/message` + **非 `user` 的 source kind**（本仓库用
+`source.kind = "paseo-rewind"`）。非 user 源同时满足：不是撤回锚点、Paseo 重放跳过不显示、
+记忆插件不采集。模型上下文会多一条 `(empty message)` 用户消息（与 `dsh-rewind-plugin`
+同款取舍），实测无副作用。
+
+**第二个坑**：标记 append 之后还要 `await ctx.get('sessions').flush(session)`。宿主的
+时间线重建/重开会话紧跟在回执之后读日志，缓冲未落盘的标记会让重放仍带着被撤行
+（"回执成功但界面没变"）。调试时 `history` 读回空、日志尾却没有标记，就是这个原因。
+
+### 48. 重放折叠不能折 compaction：surface 是模型可见面，不是人类转写
+
+第一版 `history()` 把所有 replace 都折叠。在真实会话上量化：8494 条事件 → 2447 条、
+205 条用户消息 → 60 条。DSH 源码注释明确说模型可见面故意遮蔽被替换区间，
+append-origin 事件才是人类转写的素材。
+
+**修法**：只折叠本桥的撤回缝（按持久化的 `source.kind` 识别），遮蔽
+`[startSeq, seamSeq-1]`（含尾随 `step/end`/`turn/end`）；compaction 的 replace 不折。
+用真实会话日志副本做「重放保真」断言（`harness/replay-fidelity-probe.mjs`）。
+
+### 49. 插件 provider 的 append-only history（上游 #4667）只能靠 Reload 旁路
+
+Paseo 的 `plugin-provider` 把翻译后的事件推进一个只追加数组，`revert()` 只转发、不动它；
+撤回后宿主强制从该数组重建时间线，于是旧行复活。上游 issue #4667（open，p2），
+修复 PR #4668 关闭未合并；0.11.4/0.12 beta 均未修，插件协议也没有"删行"事件。
+
+可行方案：撤回成功后**先回 `request.completed`**，再延迟 ~500ms spawn
+`paseo agent reload <agentId>`（等价用户点 Reload agent：关会话再带 persistence 重开，
+桥重放折叠后的 history）。**不能 await**：daemon 撤回持有 pending run，reload 会取消在飞
+回合，两者互相等待。agent id 用 daemon 注入的 `config.env.PASEO_AGENT_ID`。
+再加「停放会话」（空闲 dsh 进程 TTL 30s、同 cwd/route 才复用）把冷启动 1.5–2.7s 省掉。
+
+### 50. 用户消息行的令牌不要"先显示后补"
+
+旧实现先发一条无 `revertToken` 的用户行，拿到 DSH `messageId` 后再用同一个 id 补发。
+Paseo 的按钮是**按 agent 能力位**显示的，不按行过滤：两次发射之间的窗口里点击撤回，
+宿主报 `No provider revert token for message …`。改成拿到 `messageId` 后只发一次。
+
+### 51. 停放进程的三条底线
+
+1. 只停放**空闲**会话（有回合在跑就 shutdown）；
+2. 只用**相同 cwd + route** 复用（否则初始化过的旧 route 会被静默沿用）；
+3. 停放期间把处理器换成静默集（游离帧不能发给已关闭的会话）；进程退出要从池中移除，
+   TTL/上限兜底，provider 整体关闭时清池。
+
+**验证**（本轮新增，改撤回/桥后必跑）：`harness/revert-check.mjs`、
+`harness/surface-check.mjs`、`harness/file-snapshot-check.mjs`、
+`harness/revert-shape-probe.mjs`（真实 DSH Session）、
+`harness/replay-fidelity-probe.mjs <log>`（真实日志）、
+`harness/rewind-e2e.mjs`（真 profile 3 回合端到端：回执/文件/history 折叠/无 command 行/
+暗号测试）、`harness/parked-sessions-check.cjs`（编译后的插件）。
+真机验收要用**新会话**（能力位只对新会话生效）。
+
+---
+
 ## 已知限制（未修，有意为之）
 
 | 项 | 说明 |
