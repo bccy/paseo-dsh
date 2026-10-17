@@ -23,6 +23,7 @@ import { admitEncodedImages } from '@deepseek-ai/dsh-attachment';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import { underArchivedSession } from './archived-lineage.js';
 import { historyEvents, withImageHostPaths } from './image-host-path.js';
+import { promptSource } from './paseo-system-envelope.js';
 
 function encodedImage(block) {
   return block.type === 'image' && 'data' in block;
@@ -518,7 +519,7 @@ export class PaseoHarnessServer {
     this.assertLiveAgent(rec, params.sessionId);
     const content = await durablePromptContent(this.ctx, params.contentBlocks ?? []);
     this.assertLiveAgent(rec, params.sessionId);
-    const message = createUserMessage({ content, source: { kind: 'user' } });
+    const message = createUserMessage({ content, source: promptSource(content) });
     // A steer belongs inside the turn already running; a plain prompt starts the
     // next one. Without this distinction an interjection queues behind the very
     // turn it was meant to correct.
