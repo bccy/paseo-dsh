@@ -393,6 +393,11 @@ export class DshSession {
    */
   async revert(token: unknown, scope: "conversation" | "files" | "both"): Promise<void> {
     await this.#require().revert(token, scope);
+    // A rewind removes the turn that asked the question, so any card still waiting
+    // belongs to a conversation that no longer exists. Left pending, the daemon
+    // keeps showing it and a later click answers a question nobody is waiting for
+    // — the same failure a steer used to have.
+    this.#clearPendingPermissions("The conversation was rewound past this question, so it is no longer waiting for an answer.");
   }
 
   async loadPresets(): Promise<void> {
@@ -935,11 +940,14 @@ export class DshSession {
    * an agent reload restores — while the promise held here never settled, so a
    * later click answered a question nobody was waiting for.
    */
-  #clearPendingPermissionsForSteer(): void {
-    const message = "The user answered with a message instead of approving. Their message follows.";
+  #clearPendingPermissions(message: string): void {
     for (const permissionId of [...this.#pendingPermissions.keys()]) {
       this.resolvePermission(permissionId, { behavior: "deny", message });
     }
+  }
+
+  #clearPendingPermissionsForSteer(): void {
+    this.#clearPendingPermissions("The user answered with a message instead of approving. Their message follows.");
   }
 
   /**

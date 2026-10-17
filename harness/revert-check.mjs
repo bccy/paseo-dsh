@@ -175,6 +175,11 @@ console.log('wiring (the pure module is useless if nothing calls it)');
     'the replayed row carries the same token',
     /revertToken: \{ messageId: data\.id \}/.test(session),
   );
+  check(
+    'a rewind settles any question card still waiting for an answer',
+    /#clearPendingPermissions\("The conversation was rewound past this question/.test(session),
+    'pending question cards would outlive the turn that asked them',
+  );
   check('both replay sites are wired', (session.match(/revertToken: \{ messageId: data\.id \}/g) ?? []).length === 2);
 
   const process = read('paseo-plugin/server/dsh-process.ts');
