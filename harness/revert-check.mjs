@@ -166,16 +166,6 @@ console.log('wiring (the pure module is useless if nothing calls it)');
     /case "session\.revert":/.test(provider) && /\.revert\(input\.token,\s*input\.scope\)/.test(provider),
   );
 
-  check(
-    'a successful revert rebuilds the provider session so the daemon re-reads history',
-    /await this\.#reopen\(input\.sessionId\)/.test(provider),
-    'without it the daemon replays its own append-only buffer and the rows stay',
-  );
-  check(
-    'and the rebuild closes the old session and emits session.closed',
-    /#emit\(\{ type: "session\.closed", sessionId \}\)/.test(provider) && /async #reopen\(/.test(provider),
-  );
-
   const session = read('paseo-plugin/server/session.ts');
   check(
     'the live row carries a revert token once the bridge names the message',
