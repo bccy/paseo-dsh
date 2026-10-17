@@ -996,6 +996,25 @@ export class PaseoHarnessServer {
   }
 
   /**
+   * Mark a command as run by the provider rather than typed by the user.
+   *
+   * The timeline is rebuilt from the session log, so "this row is plumbing" has
+   * to be persisted beside the command it belongs to: filtering by command name
+   * needs a growing list of names and eventually swallows a command a human did
+   * type. The marker carries the exact line the provider is about to run; the
+   * plugin matches it against the next `command/run` and drops that row.
+   *
+   * A failed marker only means a row shows up, so it must never fail the command.
+   */
+  markInternalCommand(session, line) {
+    try {
+      session.append('paseo/internal-command', { line });
+    } catch (error) {
+      process.stderr.write(`[bridge] marking an internal command: ${String(error.message ?? error)}\n`);
+    }
+  }
+
+  /**
    * Run one registered command for a session. A skill is not handled here: the
    * plugin sends its `/name` line as ordinary user input, which is how DSH's own
    * `skill` tool injects it.
@@ -1007,6 +1026,7 @@ export class PaseoHarnessServer {
     const line = typeof params.arguments === 'string' && params.arguments.trim() !== ''
       ? `/${params.name} ${params.arguments}`
       : `/${params.name}`;
+    this.markInternalCommand(rec.handle.agent.session, line);
     const execution = await commands.execute(rec.handle.agent, line, [], new AbortController().signal);
     if (execution === undefined) throw new Error(`unknown command "${params.name}"`);
     return {
@@ -1050,6 +1070,7 @@ export class PaseoHarnessServer {
     }
     const commands = this.ctx.get('commands');
     if (commands === undefined) throw new Error('command registry is not mounted in this profile');
+    this.markInternalCommand(agent.session, line);
     const execution = await commands.execute(agent, line, [], new AbortController().signal);
     if (execution === undefined) throw new Error('the rewind command is not registered in this profile');
     return {

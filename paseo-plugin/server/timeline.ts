@@ -14,19 +14,6 @@ import type {
 import type { JsonValue } from "./dsh-process";
 import { LOCALE, UI } from "./locale";
 
-/**
- * Commands this provider runs on the user's behalf, whose rows are dropped.
- *
- * `rewind`/`undo` are `dsh-rewind`'s names for the rewind button; `permission`
- * is how a session applies its preset on open and when Paseo switches it. The
- * user never types any of them, so a row would be the only trace of an
- * implementation detail (and, after a reload, it reappeared at the top of the
- * conversation). Their effects are visible elsewhere — the conversation is gone
- * and the preset is shown in the session header.
- */
-const PROVIDER_COMMAND_NAMES = new Set(["rewind", "undo", "permission"]);
-
-
 interface DshEvent {
   type: string;
   seq?: number;
@@ -42,6 +29,9 @@ interface DshEvent {
  * `session.event` envelope. It is a middle-layer frame: never appended to a
  * session log, never seen by history replay.
  */
+/** The bridge's marker for a command it runs on the provider's behalf. */
+const INTERNAL_COMMAND_EVENT = "paseo/internal-command";
+
 const ASSISTANT_DELTA_EVENT = "paseo/assistant-delta";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -690,6 +680,17 @@ export class TimelineBuilder {
   /** commandId -> the command that ran, so `command/done` can title its own row. */
   #commands = new Map<string, { name: string; args: string }>();
   /**
+   * Commands the provider ran itself, and the ids resolved for them.
+   *
+   * The bridge writes `paseo/internal-command { line }` into the session log just
+   * before executing one (the rewind button, applying the permission preset).
+   * Because the marker is persisted, the same filter works on a live turn and on
+   * a replay after a reload — a name list would need extending for every future
+   * internal command and would eventually swallow one a human really typed.
+   */
+  readonly #internalCommandMarkers: string[] = [];
+  readonly #internalCommandIds = new Set<string>();
+  /**
    * Where an unrecognized `presentationMeta` is reported.
    *
    * The plugin passes its session log here; the bare default still prints, so a
@@ -767,6 +768,8 @@ export class TimelineBuilder {
         return this.#commandRun(data);
       case "command/done":
         return this.#commandDone(data);
+      case INTERNAL_COMMAND_EVENT:
+        return this.#internalCommand(data);
       // DSH's open bracket. Paseo's marker has a real `loading` state, and the
       // host merges the completed copy into it in place — see `#compaction`.
       case "compaction/start":
@@ -982,6 +985,18 @@ export class TimelineBuilder {
    * A command a compaction took over (`/compact`) is the exception: the
    * compaction marker is that command's row, so {@link #commandDone} drops it.
    */
+  /**
+   * A bridge marker that says the next command is provider plumbing.
+   *
+   * The marker is written before the command executes, so the line is queued
+   * until `#commandRun` sees the matching command and stamps that id as internal.
+   */
+  #internalCommand(data: Record<string, unknown>): ProviderTimelineItem[] {
+    const line = typeof data.line === "string" ? data.line : "";
+    if (line !== "") this.#internalCommandMarkers.push(line);
+    return [];
+  }
+
   #commandRun(data: Record<string, unknown>): ProviderTimelineItem[] {
     const commandId = stringField(data, "commandId");
     const name = stringField(data, "name");
@@ -992,6 +1007,13 @@ export class TimelineBuilder {
     // itself as the label.
     const args = typeof data.args === "string" ? data.args.trim() : "";
     this.#commands.set(commandId, { name, args });
+    // The bridge marks a command just before it runs it; match FIFO because
+    // commands execute one at a time.
+    const line = args === "" ? `/${name}` : `/${name} ${args}`;
+    if (this.#internalCommandMarkers[0] === line) {
+      this.#internalCommandMarkers.shift();
+      this.#internalCommandIds.add(commandId);
+    }
     return [];
   }
 
@@ -1013,12 +1035,10 @@ export class TimelineBuilder {
     // A failed one is *not* dropped: Paseo's marker has no failure state, so the
     // failed row is the only place the error can be read. Fail loud.
     if (!failed && this.#compactionCommands.has(commandId)) return [];
-    // A rewind is executed by this provider on the user's behalf — the button
-    // runs `dsh-rewind`'s `/rewind @<seq> chat|both` — so the row would be the
-    // only trace of an implementation detail the user never typed. Drop the
-    // successful one; a failed rewind keeps its row because Paseo's marker has no
-    // failure state and the row is where the error can be read.
-    if (!failed && PROVIDER_COMMAND_NAMES.has(name)) return [];
+    // A provider-run command (rewind, preset application) is plumbing the user
+    // never typed; its marker came from the bridge. A failed one keeps its row:
+    // Paseo's marker has no failure state, so that row is where the error reads.
+    if (!failed && this.#internalCommandIds.has(commandId)) return [];
     const line = `/${name}`;
     return this.#put({
       type: "tool_call",
