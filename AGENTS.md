@@ -81,3 +81,21 @@ cd paseo-plugin && npx tsc --noEmit
 - 跑一遍 `node --check` / `tsc --noEmit`
 - 确认没有引入任何具体的 provider 名、模型 id、base URL、密钥
 - 用户本机路径（`/Users/...`）不要出现在任何文件里
+
+## 三、发布流程（硬性）
+
+**产物推送必须等用户本机测试通过并明确确认。** 本地改完可以先 commit / push 代码到仓库，
+但 `npm publish`、`npm deprecate`、目录收录（paseo.cafe 等）、打 tag、发 Release 一律
+等用户说"测试通过"之后再动。
+
+顺序固定为：
+
+1. 用户提需求
+2. 本地改动 + 自测（见上面的验证命令）
+3. 交回用户，在真实环境里测试
+4. 用户明确确认
+5. 才推产物到各平台
+
+违反这条的代价很具体：0.2.8 修了 `{{cwd}}` 却漏了 DSH 0.2.1 的 catalog 异步物化，用户装到
+一个"能装、模型列表却是空"的版本，比不发布更糟。已误发的坏版本用
+`npm deprecate paseo-dsh@<ver> "..."` 兜底（registry 必须显式指向 npmjs，默认镜像发不了）。
