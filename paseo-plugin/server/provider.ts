@@ -251,6 +251,15 @@ class DshConnection implements ProviderConnection {
   readonly capabilities: readonly string[];
   readonly #listeners = new Set<(event: ProviderEvent) => void>();
   readonly #sessions = new Map<string, DshSession>();
+  /**
+   * The `session.open` input each live session was built from.
+   *
+   * A rewind has to rebuild the provider session (see {@link #reopen}), and that
+   * needs the same route, cwd, env, MCP servers and persistence handle Paseo
+   * opened it with — asking the daemon again would race the revert it is still
+   * awaiting.
+   */
+  readonly #opened = new Map<string, Extract<ProviderInput, { type: "session.open" }>>();
   #display: DisplayCatalog | undefined;
   #closed = false;
 
@@ -319,6 +328,14 @@ class DshConnection implements ProviderConnection {
       }
       case "session.revert": {
         await this.#require(input.sessionId).revert(input.token, input.scope);
+        // Paseo's rewind refreshes the timeline by replaying what this provider
+        // already published (`PluginProviderSession.streamHistory`), and that
+        // buffer only ever grows — the plugin contract has no "remove a row"
+        // event, so the withdrawn messages would stay on screen. Rebuilding the
+        // provider session is the one in-contract way to make the daemon re-read
+        // the bridge's surface-folded history: the daemon drops the closed
+        // session, opens a fresh one, and hydrates the timeline from it.
+        await this.#reopen(input.sessionId);
         // Paseo awaits `complete()` and resolves it only on a reply, so a silent
         // success would leave the rewind button spinning forever.
         this.#emit({ type: "request.completed", requestId: input.requestId });
@@ -332,6 +349,7 @@ class DshConnection implements ProviderConnection {
       case "session.close": {
         const session = this.#sessions.get(input.sessionId);
         this.#sessions.delete(input.sessionId);
+        this.#opened.delete(input.sessionId);
         await session?.close();
         this.#emit({ type: "session.closed", sessionId: input.sessionId });
         this.#emit({ type: "request.completed", requestId: input.requestId });
@@ -386,6 +404,27 @@ class DshConnection implements ProviderConnection {
     });
   }
 
+  /**
+   * Rebuild one session from the input it was opened with.
+   *
+   * Used after a rewind. A failure here must not swallow the revert that already
+   * happened: the data is correct, only the redraw would be missing, so the
+   * error is logged and the session is left closed for Paseo to reopen.
+   */
+  async #reopen(sessionId: string): Promise<void> {
+    const opened = this.#opened.get(sessionId);
+    const previous = this.#sessions.get(sessionId);
+    if (opened === undefined || previous === undefined) return;
+    this.#sessions.delete(sessionId);
+    try {
+      await previous.close();
+    } catch (error) {
+      process.stderr.write(`[${PROVIDER_ID}] closing a session for a rewind redraw: ${messageOf(error)}\n`);
+    }
+    this.#emit({ type: "session.closed", sessionId });
+    await this.#open({ ...opened, requestId: `${opened.requestId}:rewind` });
+  }
+
   async #open(input: Extract<ProviderInput, { type: "session.open" }>): Promise<void> {
     const { sessionId, config } = input;
     const display = this.#display ?? (await loadCatalog(config.cwd));
@@ -427,6 +466,7 @@ class DshConnection implements ProviderConnection {
       },
     });
     this.#sessions.set(sessionId, session);
+    this.#opened.set(sessionId, input);
 
     try {
       await session.open();
