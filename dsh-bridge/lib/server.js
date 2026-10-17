@@ -24,6 +24,7 @@ import { admitEncodedImages } from '@deepseek-ai/dsh-attachment';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import { underArchivedSession } from './archived-lineage.js';
 import { dirtyWorkspaceError, restoresFiles, revertOrdinal, rewindLine } from './revert.js';
+import { surfaceEvents } from './surface.js';
 import { historyEvents, withImageHostPaths } from './image-host-path.js';
 import { promptSource } from './paseo-system-envelope.js';
 
@@ -842,10 +843,14 @@ export class PaseoHarnessServer {
       return {
         available: true,
         inheritedEventCount,
-        // The replay path Paseo rebuilds a reopened session from. Images are
-        // stamped here too — the source file a tool read is usually gone by
-        // reopen time, and only the attachment's host path still resolves.
-        events: historyEvents(this.ctx, result.events ?? []),
+        // The replay path Paseo rebuilds a reopened session from. Folded to the
+        // visible surface first: a rewind appends a replace operation rather than
+        // deleting events, so replaying the raw log would resurrect exactly what
+        // the user just removed — which is what Paseo's post-rewind re-hydrate
+        // showed. Images are stamped here too — the source file a tool read is
+        // usually gone by reopen time, and only the attachment's host path still
+        // resolves.
+        events: historyEvents(this.ctx, surfaceEvents(result.events ?? [])),
       };
     } catch (error) {
       // The open succeeded, so this log exists; failing to read it is never
