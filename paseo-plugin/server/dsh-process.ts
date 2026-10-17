@@ -340,6 +340,13 @@ function prepareMcpPatch(
 
 export class DshProcess {
   readonly #options: DshProcessOptions;
+  /**
+   * The handlers this process reports to. Mutable on purpose: a rewind's reload
+   * parks the idle process and a fresh provider session adopts it, so the same
+   * child must start reporting to a new session without being killed and
+   * respawned (that spawn is the 1.5–2.7 s half of the refresh latency).
+   */
+  #handlers: DshProcessHandlers;
   #child: ChildProcessWithoutNullStreams | undefined;
   #buffer = "";
   #pending = new Map<number, Pending>();
@@ -350,6 +357,45 @@ export class DshProcess {
 
   constructor(options: DshProcessOptions) {
     this.#options = options;
+    this.#handlers = {
+      onEvent: (payload) => options.onEvent(payload),
+      onStatus: (status, sessionId) => options.onStatus(status, sessionId),
+      onQuestion: (request, sessionId) => options.onQuestion(request, sessionId),
+      ...(options.onChildOpened === undefined
+        ? {}
+        : { onChildOpened: (payload: DshChildOpened) => options.onChildOpened?.(payload) }),
+      onLog: (line) => options.onLog(line),
+      onExit: (code, signal) => options.onExit(code, signal),
+      onProtocolError: (message) => options.onProtocolError(message),
+    };
+  }
+
+  /** Whether the child is still alive and usable. */
+  get running(): boolean {
+    return this.#closed === false && this.#child !== undefined;
+  }
+
+  /**
+   * Point this process at a different set of handlers.
+   *
+   * Used when an idle process is parked and later adopted by a new provider
+   * session: the child keeps running, but its events/questions/exit now belong
+   * to the new session (or to a silent set while nobody owns it).
+   *
+   * @param handlers - the new handler set.
+   */
+  setHandlers(handlers: DshProcessHandlers): void {
+    this.#handlers = {
+      onEvent: (payload) => handlers.onEvent(payload),
+      onStatus: (status, sessionId) => handlers.onStatus(status, sessionId),
+      onQuestion: (request, sessionId) => handlers.onQuestion(request, sessionId),
+      ...(handlers.onChildOpened === undefined
+        ? {}
+        : { onChildOpened: (payload: DshChildOpened) => handlers.onChildOpened?.(payload) }),
+      onLog: (line) => handlers.onLog(line),
+      onExit: (code, signal) => handlers.onExit(code, signal),
+      onProtocolError: (message) => handlers.onProtocolError(message),
+    };
   }
 
   /** Spawn the child and complete `initialize`. Idempotent. */
@@ -376,19 +422,19 @@ export class DshProcess {
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
       for (const line of chunk.split("\n")) {
-        if (line.trim() !== "") this.#options.onLog(line);
+        if (line.trim() !== "") this.#handlers.onLog(line);
       }
     });
     child.on("error", (error) => {
       this.#cleanupPatch();
       this.#failAll(error);
-      this.#options.onProtocolError(error.message);
+      this.#handlers.onProtocolError(error.message);
     });
     child.on("exit", (code, signal) => {
       this.#cleanupPatch();
       this.#closed = true;
       this.#failAll(new Error("DeepSeek Harness process ended"));
-      this.#options.onExit(code, signal);
+      this.#handlers.onExit(code, signal);
     });
 
     if (this.#options.initializeRoute === false) return;
@@ -716,7 +762,7 @@ export class DshProcess {
     try {
       this.#child?.stdin.write(`${JSON.stringify(frame)}\n`);
     } catch (error) {
-      this.#options.onProtocolError(toError(error, "failed to write to the bridge").message);
+      this.#handlers.onProtocolError(toError(error, "failed to write to the bridge").message);
     }
   }
 
@@ -730,7 +776,7 @@ export class DshProcess {
       try {
         frame = JSON.parse(line) as Record<string, unknown>;
       } catch {
-        this.#options.onLog(line);
+        this.#handlers.onLog(line);
         continue;
       }
       void this.#dispatch(frame);
@@ -744,7 +790,7 @@ export class DshProcess {
     if (method === "paseo/question" && id !== undefined) {
       try {
         const params = (frame.params ?? {}) as DshQuestionRequest;
-        const answer = await this.#options.onQuestion(
+        const answer = await this.#handlers.onQuestion(
           {
             callId: params.callId ?? null,
             timed: params.timed === true,
@@ -765,18 +811,18 @@ export class DshProcess {
     }
 
     if (method === "session.event") {
-      this.#options.onEvent(frame.params as DshSessionEvent);
+      this.#handlers.onEvent(frame.params as DshSessionEvent);
       return;
     }
     if (method === "session.status") {
       const params = frame.params as { status?: string; sessionId?: string } | undefined;
-      this.#options.onStatus(params?.status ?? "unknown", params?.sessionId ?? "");
+      this.#handlers.onStatus(params?.status ?? "unknown", params?.sessionId ?? "");
       return;
     }
     if (method === "session.child-opened") {
       const params = frame.params as DshChildOpened | undefined;
       if (params !== undefined && typeof params.sessionId === "string" && params.sessionId !== "") {
-        this.#options.onChildOpened?.(params);
+        this.#handlers.onChildOpened?.(params);
       }
       return;
     }

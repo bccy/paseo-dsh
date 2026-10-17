@@ -25,6 +25,7 @@ import {
 } from "@getpaseo/plugin/server/provider";
 import { DshProcess, type DshCatalog } from "./dsh-process";
 import { DshChildSession, DshSession, modes, parseRoute } from "./session";
+import { ParkedSessions } from "./parked-sessions";
 import { effortLabel } from "./locale";
 
 const CAPABILITIES = [
@@ -265,9 +266,19 @@ class DshConnection implements ProviderConnection {
   #display: DisplayCatalog | undefined;
   #paseoBinary: string | undefined;
   #closed = false;
+  /**
+   * Idle DSH processes kept across a provider-session close. The rewind refresh
+   * closes and immediately reopens the session; adopting the parked child turns
+   * that cold start into a replay, which is what makes the timeline update in
+   * about a second instead of three to four.
+   */
+  readonly #parked = new ParkedSessions({
+    log: (line) => process.stderr.write(`[${PROVIDER_ID}] ${line}\n`),
+  });
 
   constructor(capabilities: readonly string[]) {
     this.capabilities = capabilities;
+    this.#parked.start();
   }
 
   onEvent(listener: (event: ProviderEvent) => void): () => void {
@@ -295,7 +306,11 @@ class DshConnection implements ProviderConnection {
     this.#closed = true;
     const sessions = [...this.#sessions.values()];
     this.#sessions.clear();
-    await Promise.allSettled(sessions.map((session) => session.close()));
+    // Provider teardown is not a reload: shut the sessions down and kill the
+    // parked children instead of keeping them alive for a reopen that will not
+    // happen on this connection.
+    await Promise.allSettled(sessions.map((session) => session.close({ park: false })));
+    this.#parked.stop();
   }
 
   async #dispatch(input: ProviderInput): Promise<void> {
@@ -369,7 +384,9 @@ class DshConnection implements ProviderConnection {
         const session = this.#sessions.get(input.sessionId);
         this.#sessions.delete(input.sessionId);
         this.#agentIds.delete(input.sessionId);
-        await session?.close();
+        // Park an idle child: the daemon closes this session right before a
+        // rewind refresh reopens it with the same persistence.
+        await session?.close({ park: true });
         this.#emit({ type: "session.closed", sessionId: input.sessionId });
         this.#emit({ type: "request.completed", requestId: input.requestId });
         return;
@@ -588,6 +605,14 @@ class DshConnection implements ProviderConnection {
       log: (line) => {
         process.stderr.write(`[${PROVIDER_ID}] ${line}\n`);
       },
+      takeParked: (dshSessionId, expected) => this.#parked.take(dshSessionId, expected)?.process,
+      parkProcess: (process, meta) => this.#parked.park({
+        process,
+        sessionId: meta.sessionId,
+        dshSessionId: meta.dshSessionId,
+        cwd: meta.cwd,
+        routeKey: meta.routeKey,
+      }),
     });
     this.#sessions.set(sessionId, session);
 
@@ -600,8 +625,10 @@ class DshConnection implements ProviderConnection {
       // otherwise live as long as the connection does. Every retry arrives under
       // a fresh session id, so they accumulate rather than replace each other.
       this.#sessions.delete(sessionId);
+      this.#agentIds.delete(sessionId);
       try {
-        await session.close();
+        // A failed open is not a reload: shut the child down rather than park it.
+        await session.close({ park: false });
       } catch (closeError) {
         // Best-effort: the entry is gone either way, but say so rather than
         // leaving a live process and no trace of why.

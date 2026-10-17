@@ -1,0 +1,188 @@
+/**
+ * Offline check for the parked-process pool (`server/parked-sessions.ts`).
+ *
+ * The pool exists so a rewind's agent reload reuses the running `dsh` child
+ * instead of spawning a new one. That trade has exactly four failure modes worth
+ * pinning, because each one is invisible until the refresh path misbehaves:
+ *
+ * - a parked process must be silenced (stray frames from the closed session must
+ *   not reach a session that is gone);
+ * - it is only reused for the same cwd + route, otherwise a reload with a new
+ *   configuration would silently serve the old one;
+ * - a crashed/expired/over-cap entry must be killed, not handed out or leaked;
+ * - a miss must be a miss (cold start), never a throw.
+ *
+ * The check drives the compiled module with a fake process, so it does not need
+ * a DSH profile. Compile the plugin first (same steps as plugin-check.cjs):
+ *
+ *   cd paseo-plugin
+ *   npx tsc --noEmit false --outDir .dbg --declaration false \
+ *     --module commonjs --moduleResolution node
+ *   echo '{"type":"commonjs"}' > .dbg/package.json
+ *   cd .dbg && node ../harness/parked-sessions-check.cjs
+ *
+ * Usage: node harness/parked-sessions-check.cjs [compiled-plugin-dir]
+ */
+const path = require("node:path");
+const fs = require("node:fs");
+
+const dir = process.argv[2] ?? path.join(__dirname, "..", "paseo-plugin", ".dbg");
+const compiled = path.resolve(dir, "parked-sessions.js");
+const modulePath = fs.existsSync(compiled) ? compiled : path.resolve(dir, "server", "parked-sessions.js");
+if (!fs.existsSync(modulePath)) {
+  console.error(`compiled plugin not found at ${modulePath}\nSee the header of this file for compile steps.`);
+  process.exit(2);
+}
+const { ParkedSessions } = require(modulePath);
+
+async function main() {
+
+const results = [];
+const check = (name, pass, detail) => {
+  results.push({ name, pass });
+  console.log(`  ${pass ? "PASS" : "FAIL"}  ${name}${detail === undefined ? "" : `  — ${detail}`}`);
+};
+
+let now = 1_000;
+const logs = [];
+const makePool = (options = {}) => new ParkedSessions({
+  ttlMs: options.ttlMs ?? 30_000,
+  max: options.max ?? 3,
+  now: () => now,
+  log: (line) => logs.push(line),
+});
+
+function fakeProcess(name) {
+  return {
+    name,
+    running: true,
+    killed: false,
+    handlers: undefined,
+    setHandlers(handlers) {
+      this.handlers = handlers;
+    },
+    kill() {
+      this.killed = true;
+      this.running = false;
+    },
+  };
+}
+
+const entry = (process, overrides = {}) => ({
+  process,
+  sessionId: "provider-1",
+  dshSessionId: "dsh-1",
+  cwd: "/work",
+  routeKey: "p/m/max",
+  ...overrides,
+});
+
+console.log("park and take");
+{
+  const pool = makePool();
+  const child = fakeProcess("a");
+  check("park accepts a live process", pool.park(entry(child)) === true);
+  check("size grows", pool.size === 1);
+  check("the parked process is silenced", typeof child.handlers?.onEvent === "function" && child.handlers.onEvent({}) === undefined);
+  check("its questions answer an empty batch", JSON.stringify(await child.handlers.onQuestion()) === JSON.stringify({ answers: [] }));
+  const taken = pool.take("dsh-1", { cwd: "/work", routeKey: "p/m/max" });
+  check("take returns the process", taken?.process === child);
+  check("and empties the slot", pool.size === 0 && pool.has("dsh-1") === false);
+  check("a second take misses", pool.take("dsh-1", { cwd: "/work", routeKey: "p/m/max" }) === undefined);
+}
+
+console.log("configuration mismatch kills instead of reusing");
+{
+  const pool = makePool();
+  const child = fakeProcess("b");
+  pool.park(entry(child));
+  const taken = pool.take("dsh-1", { cwd: "/other", routeKey: "p/m/max" });
+  check("a different cwd is refused", taken === undefined);
+  check("and the stale process is killed", child.killed === true);
+  const routeChild = fakeProcess("c");
+  pool.park(entry(routeChild));
+  const routeTaken = pool.take("dsh-1", { cwd: "/work", routeKey: "p/m/high" });
+  check("a different route is refused", routeTaken === undefined);
+  check("and that process is killed too", routeChild.killed === true);
+}
+
+console.log("a dead process is not parked or handed out");
+{
+  const pool = makePool();
+  const dead = fakeProcess("d");
+  dead.running = false;
+  check("park refuses a dead process", pool.park(entry(dead)) === false);
+  check("nothing was stored", pool.size === 0);
+  const dying = fakeProcess("e");
+  pool.park(entry(dying));
+  dying.running = false;
+  check("a process that died while parked is not taken", pool.take("dsh-1", { cwd: "/work", routeKey: "p/m/max" }) === undefined);
+  check("and the slot is gone", pool.size === 0);
+}
+
+console.log("TTL and cap bound the pool");
+{
+  const pool = makePool({ ttlMs: 100 });
+  const child = fakeProcess("f");
+  pool.park(entry(child));
+  now += 50;
+  check("a fresh entry survives a sweep", pool.sweep() === 0 && pool.size === 1);
+  now += 51;
+  check("an expired entry is swept", pool.sweep() === 1 && pool.size === 0);
+  check("and its process is killed", child.killed === true);
+
+  const capped = makePool({ max: 2 });
+  const processes = ["g", "h", "i"].map((name) => fakeProcess(name));
+  capped.park(entry(processes[0], { dshSessionId: "d1" }));
+  now += 1;
+  capped.park(entry(processes[1], { dshSessionId: "d2" }));
+  now += 1;
+  capped.park(entry(processes[2], { dshSessionId: "d3" }));
+  check("the cap evicts the oldest", capped.size === 2 && processes[0].killed === true);
+  check("the newest are kept", processes[1].killed === false && processes[2].killed === false);
+  check("eviction is logged", logs.some((line) => line.includes("parked:evict")));
+}
+
+console.log("re-parking the same native session replaces the old child");
+{
+  const pool = makePool();
+  const first = fakeProcess("j");
+  const second = fakeProcess("k");
+  pool.park(entry(first));
+  pool.park(entry(second));
+  check("the old process is killed", first.killed === true);
+  check("the new one is kept", pool.size === 1 && pool.take("dsh-1", { cwd: "/work", routeKey: "p/m/max" })?.process === second);
+}
+
+console.log("forget on a parked process exit");
+{
+  const pool = makePool();
+  const child = fakeProcess("l");
+  pool.park(entry(child));
+  child.handlers.onExit(1, null);
+  check("an exited parked process is forgotten", pool.size === 0);
+}
+
+console.log("stop kills everything");
+{
+  const pool = makePool();
+  const one = fakeProcess("m");
+  const two = fakeProcess("n");
+  pool.park(entry(one, { dshSessionId: "d1" }));
+  pool.park(entry(two, { dshSessionId: "d2" }));
+  pool.start();
+  pool.stop();
+  check("all parked processes are killed", one.killed === true && two.killed === true);
+  check("the pool is empty", pool.size === 0);
+  check("a stop is idempotent", (() => { pool.stop(); return true; })());
+}
+
+const failed = results.filter((result) => !result.pass);
+console.log(`\n${results.length - failed.length} passed, ${failed.length} failed`);
+if (failed.length > 0) process.exitCode = 1;
+}
+
+main().catch((error) => {
+  console.error("parked-sessions-check crashed:", error);
+  process.exit(1);
+});

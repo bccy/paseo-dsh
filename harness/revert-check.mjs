@@ -254,6 +254,28 @@ console.log('wiring (the pure module is useless if nothing calls it)');
     /scope\.on\('tools\/result'[\s\S]{0,120}dropFileTool/.test(bridgeEntry),
   );
 
+  check(
+    'the session parks an idle process instead of killing it',
+    /session\??\.close\(\{ park: true \}\)/.test(provider),
+  );
+  check(
+    'the provider owns and stops the parked-process pool',
+    /new ParkedSessions\(/.test(provider) && /#parked\.stop\(\)/.test(provider),
+  );
+  const idleParkReturn = read('paseo-plugin/server/session.ts');
+  check(
+    'a running turn or a refused park falls back to shutdown',
+    /this\.#turnId === null/.test(idleParkReturn) && /await process\.shutdown\(\);/.test(idleParkReturn),
+  );
+  check(
+    'provider teardown shuts sessions down instead of parking',
+    /session\.close\(\{ park: false \}\)/.test(provider),
+  );
+  check(
+    'the reopened session adopts the parked process',
+    /takeParked: \(dshSessionId, expected\) => this\.#parked\.take/.test(provider),
+  );
+
   const timeline = read('paseo-plugin/server/timeline.ts');
   const timelineRaw = readFileSync(join(import.meta.dirname, '..', 'paseo-plugin/server/timeline.ts'), 'utf8');
   check(

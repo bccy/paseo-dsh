@@ -28,6 +28,7 @@ import {
   type DshChildOpened,
   type DshMcpServer,
   type DshPermissionPreset,
+  type DshProcessHandlers,
   type DshQuestion,
   type DshQuestionRequest,
   type DshRevertResult,
@@ -93,6 +94,21 @@ export interface DshSessionOptions {
   subsession: boolean;
   emit(event: ProviderEvent): void;
   log(line: string): void;
+  /**
+   * Adopt a parked, idle process for this native session id instead of spawning.
+   *
+   * Used by the rewrite refresh path: the daemon's "reload agent" closes the
+   * provider session and reopens it with persistence, and a cold spawn is the
+   * slow half of that refresh. A miss (undefined) cold-starts as before.
+   */
+  takeParked?(dshSessionId: string, expected: { cwd: string; routeKey: string }): DshProcess | undefined;
+  /**
+   * Offer this session's idle process for reuse instead of shutting it down.
+   *
+   * @returns whether the caller accepted it; a false answer falls back to a
+   *   protocol shutdown.
+   */
+  parkProcess?(process: DshProcess, meta: { sessionId: string; dshSessionId: string; cwd: string; routeKey: string }): boolean;
 }
 
 /**
@@ -152,6 +168,11 @@ export function parseRoute(model: string | undefined, fallback: DshRoute): DshRo
   const slash = model.indexOf("/");
   if (slash <= 0) return { ...fallback, model };
   return { provider: model.slice(0, slash), model: model.slice(slash + 1) };
+}
+
+/** The identity a parked process is reused under (route changes cold-start). */
+function routeKeyOf(route: DshRoute): string {
+  return `${route.provider}/${route.model}/${route.reasoningEffort ?? ""}`;
 }
 
 export class DshSession {
@@ -238,14 +259,14 @@ export class DshSession {
     this.#subsession = options.subsession === true;
   }
 
-  /** Spawn the process, pin the route, and reconcile the requested mode. */
-  async open(): Promise<void> {
-    const process = new DshProcess({
-      cwd: this.#options.cwd,
-      route: this.#route,
-      sessionId: this.#dshSessionId,
-      env: this.#options.env,
-      mcpServers: this.#options.mcpServers,
+  /**
+   * The callbacks a DSH process reports to. Extracted so a parked process can be
+   * re-pointed at a new session without respawning (see {@link DshSessionOptions}).
+   *
+   * @returns the handler set for one process.
+   */
+  #processHandlers(): DshProcessHandlers {
+    return {
       onEvent: (payload) => this.#onSessionEvent(payload),
       onStatus: (status, sessionId) => this.#onStatus(status, sessionId),
       onQuestion: (request, sessionId) => this.#onQuestion(request, sessionId),
@@ -262,7 +283,29 @@ export class DshSession {
         });
       },
       onProtocolError: (message) => this.#options.log(`protocol: ${message}`),
-    });
+    };
+  }
+
+  /** Adopt a parked process or spawn one, pin the route, reconcile the mode. */
+  async open(): Promise<void> {
+    const expected = { cwd: this.#options.cwd, routeKey: routeKeyOf(this.#route) };
+    const adopted = this.#options.takeParked?.(this.#dshSessionId, expected);
+    let process: DshProcess;
+    if (adopted !== undefined) {
+      // The child kept running across the provider-session close; re-point its
+      // events at this session and skip the spawn + profile load entirely.
+      process = adopted;
+      process.setHandlers(this.#processHandlers());
+    } else {
+      process = new DshProcess({
+        cwd: this.#options.cwd,
+        route: this.#route,
+        sessionId: this.#dshSessionId,
+        env: this.#options.env,
+        mcpServers: this.#options.mcpServers,
+        ...this.#processHandlers(),
+      });
+    }
     this.#process = process;
     await process.start();
     if (this.#mode === "plan") {
@@ -968,12 +1011,34 @@ export class DshSession {
     await this.#require().cancel();
   }
 
-  /** Release the process. */
-  async close(): Promise<void> {
+  /**
+   * Release the process.
+   *
+   * An idle process is offered to the caller's park callback first: a rewind's
+   * refresh closes and immediately reopens this session, and handing the running
+   * child to the reopened session removes the cold start from that path. A
+   * running turn, a missing callback, or a refusal falls back to shutdown.
+   *
+   * @param options - `park: false` forces a shutdown (provider teardown).
+   */
+  async close(options: { park?: boolean } = {}): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
     clearTimeout(this.#usageRefreshTimer);
-    await this.#process?.shutdown();
+    const process = this.#process;
+    this.#process = undefined;
+    if (process === undefined) return;
+    const park = options.park !== false
+      && this.#turnId === null
+      && process.running
+      && this.#options.parkProcess?.(process, {
+        sessionId: this.id,
+        dshSessionId: this.#dshSessionId,
+        cwd: this.#options.cwd,
+        routeKey: routeKeyOf(this.#route),
+      }) === true;
+    if (park) return;
+    await process.shutdown();
   }
 
   #require(): DshProcess {
