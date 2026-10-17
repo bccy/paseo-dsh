@@ -25,7 +25,7 @@ import {
   restoresFiles,
   revertOrdinal,
   rewindLine,
-  scopeFlag,
+  rewindMode,
   tokenMessageId,
   visibleAnchorSeqs,
 } from '../dsh-bridge/lib/revert.js';
@@ -47,31 +47,33 @@ const marker = (text) => ({ type: 'user/message', data: { id: `m-${text}`, sourc
 /** A visible assistant message event. */
 const assistant = () => ({ type: 'assistant/message', data: { source: { kind: 'model' } } });
 
-console.log('anchor rule (mirrors dsh-rewind, byte for byte)');
+console.log('anchor rule (mirrors dsh-rewind-plugin@0.15.3, byte for byte)');
 {
+  const user = (id) => ({ type: 'user/message', data: { id, source: { kind: 'user' }, content: [{ type: 'text', text: id }] } });
   check('a user message is an anchor', isRewindAnchor(user('u1')) === true);
-  check('a Paseo envelope is not', isRewindAnchor(envelope()) === false);
-  check('an assistant message is not', isRewindAnchor(assistant()) === false);
-  check('a dsh-rewind plugin bubble is', isRewindAnchor(pluginAnchor('原话')) === true);
-  check('an empty plugin bubble is not', isRewindAnchor(pluginAnchor('  ')) === false);
-  check('the /rewind marker is not', isRewindAnchor(marker('↩ /rewind 已回退')) === false);
-  check('the /vault marker is not', isRewindAnchor(marker('🔖 /vault 备份')) === false);
-  check('the /unrewind marker is not', isRewindAnchor(marker('🔖 /unrewind 找回')) === false);
-  check('another plugin is not', isRewindAnchor({ type: 'user/message', data: { source: { kind: 'plugin', plugin: 'other' }, content: [{ type: 'text', text: 'x' }] } }) === false);
+  check('a Paseo envelope is not', isRewindAnchor({ type: 'user/message', data: { id: 'env', source: { kind: 'paseo' }, content: [] } }) === false);
+  check('a plugin bubble is not (0.15.x dropped them)', isRewindAnchor({ type: 'user/message', data: { id: 'p', source: { kind: 'plugin', plugin: 'dsh-rewind' }, content: [{ type: 'text', text: '原话' }] } }) === false);
+  check('an assistant message is not', isRewindAnchor({ type: 'assistant/message', data: {} }) === false);
   check('undefined is not', isRewindAnchor(undefined) === false);
-  check('text is read like dsh-rewind does', anchorText(user('u1')) === 'u1', anchorText(user('u1')));
+  check('text is still readable', anchorText(user('u1')) === 'u1', anchorText(user('u1')));
 }
 
 console.log('visible anchors');
 {
-  const events = { 1: user('u1'), 2: assistant(), 3: envelope(), 4: user('u2'), 5: pluginAnchor('原话') };
+  const events = {
+    1: { type: 'user/message', data: { id: 'u1', source: { kind: 'user' }, content: [] } },
+    2: { type: 'assistant/message', data: {} },
+    3: { type: 'user/message', data: { id: 'env', source: { kind: 'paseo' }, content: [] } },
+    4: { type: 'user/message', data: { id: 'u2', source: { kind: 'user' }, content: [] } },
+    5: { type: 'user/message', data: { id: 'p', source: { kind: 'plugin', plugin: 'dsh-rewind' }, content: [{ type: 'text', text: 'x' }] } },
+  };
   check(
-    'user messages and plugin anchors count, envelopes do not',
-    JSON.stringify(visibleAnchorSeqs([1, 2, 3, 4, 5], events)) === JSON.stringify([1, 4, 5]),
-    JSON.stringify(visibleAnchorSeqs([1, 2, 3, 4, 5], events)),
+    'only source.kind=user messages count',
+    JSON.stringify(visibleAnchorSeqs([1, 2, 3, 4, 5], (seq) => events[seq])) === JSON.stringify([1, 4]),
+    JSON.stringify(visibleAnchorSeqs([1, 2, 3, 4, 5], (seq) => events[seq])),
   );
-  check('surface order is preserved', JSON.stringify(visibleAnchorSeqs([5, 1], events)) === JSON.stringify([5, 1]));
-  check('a node with no event is skipped', visibleAnchorSeqs([1, 99], events).length === 1);
+  check('surface order is preserved', JSON.stringify(visibleAnchorSeqs([4, 1], (seq) => events[seq])) === JSON.stringify([4, 1]));
+  check('a node with no event is skipped', visibleAnchorSeqs([1, 99], (seq) => events[seq]).length === 1);
 }
 
 console.log('token validation');
@@ -87,11 +89,11 @@ console.log('ordinal numbering (1 = newest)');
 {
   const events = { 1: user('u1'), 2: assistant(), 3: user('u2'), 4: assistant(), 5: user('u3') };
   const nodes = [1, 2, 3, 4, 5];
-  const newest = revertOrdinal(nodes, events, { messageId: 'u3' });
+  const newest = revertOrdinal(nodes, (seq) => events[seq], { messageId: 'u3' });
   check('the newest is 1', newest.ok === true && newest.n === 1, JSON.stringify(newest));
-  const middle = revertOrdinal(nodes, events, { messageId: 'u2' });
+  const middle = revertOrdinal(nodes, (seq) => events[seq], { messageId: 'u2' });
   check('the middle is 2', middle.ok === true && middle.n === 2, JSON.stringify(middle));
-  const oldest = revertOrdinal(nodes, events, { messageId: 'u1' });
+  const oldest = revertOrdinal(nodes, (seq) => events[seq], { messageId: 'u1' });
   check('the oldest is 3', oldest.ok === true && oldest.n === 3, JSON.stringify(oldest));
   check('the total is reported', oldest.ok === true && oldest.total === 3);
   check('the resolved seq rides along', middle.ok === true && middle.seq === 3, JSON.stringify(middle));
@@ -102,9 +104,9 @@ console.log('surface awareness (the whole point)');
   // A compaction removed 1..5 from the surface; only u4 is still rewindable.
   const events = { 1: user('u1'), 3: user('u2'), 5: user('u3'), 7: user('u4') };
   const nodes = [7];
-  const visible = revertOrdinal(nodes, events, { messageId: 'u4' });
+  const visible = revertOrdinal(nodes, (seq) => events[seq], { messageId: 'u4' });
   check('a still-visible message counts from the surface only', visible.ok === true && visible.n === 1 && visible.total === 1, JSON.stringify(visible));
-  const gone = revertOrdinal(nodes, events, { messageId: 'u2' });
+  const gone = revertOrdinal(nodes, (seq) => events[seq], { messageId: 'u2' });
   check('a compacted-away message is refused', gone.ok === false, JSON.stringify(gone));
   check('and the refusal names it', gone.ok === false && gone.reason.includes('u2'), gone.ok === false ? gone.reason : '');
 }
@@ -113,24 +115,25 @@ console.log('bad tokens fail instead of guessing');
 {
   const events = { 1: user('u1') };
   const nodes = [1];
-  check('unknown id is refused', revertOrdinal(nodes, events, { messageId: 'nope' }).ok === false);
-  check('malformed token is refused', revertOrdinal(nodes, events, { messageId: 1 }).ok === false);
-  check('missing token is refused', revertOrdinal(nodes, events, {}).ok === false);
+  check('unknown id is refused', revertOrdinal(nodes, (seq) => events[seq], { messageId: 'nope' }).ok === false);
+  check('malformed token is refused', revertOrdinal(nodes, (seq) => events[seq], { messageId: 1 }).ok === false);
+  check('missing token is refused', revertOrdinal(nodes, (seq) => events[seq], {}).ok === false);
 }
 
-console.log('scope mapping');
+console.log('scope mapping (dsh-rewind-plugin@0.15.3: /rewind @<seq> chat|both)');
 {
-  check('both sends no flag', scopeFlag('both') === '');
-  check('conversation sends --conversation', scopeFlag('conversation') === ' --conversation');
-  check('files sends --code', scopeFlag('files') === ' --code');
+  check('conversation maps to chat', rewindMode('conversation') === 'chat');
+  check('both maps to both', rewindMode('both') === 'both');
+  check('files has no mode at all', rewindMode('files') === undefined);
   check('both touches the worktree', restoresFiles('both') === true);
   check('files touches the worktree', restoresFiles('files') === true);
   check('conversation does not', restoresFiles('conversation') === false);
-  check('the line composes', rewindLine(2, 'both') === '/rewind 2', rewindLine(2, 'both'));
-  check('the line carries the flag', rewindLine(1, 'files') === '/rewind 1 --code', rewindLine(1, 'files'));
+  check('the line targets a seq, not an ordinal', rewindLine(42, 'both') === '/rewind @42 both', rewindLine(42, 'both'));
+  check('chat rewinds only the conversation', rewindLine(7, 'conversation') === '/rewind @7 chat', rewindLine(7, 'conversation'));
+  check('files has no line', rewindLine(7, 'files') === undefined);
   let threw = false;
-  try { rewindLine(0, 'both'); } catch { threw = true; }
-  check('an invalid ordinal cannot become a line', threw);
+  try { rewindLine(-1, 'both'); } catch { threw = true; }
+  check('an invalid seq cannot become a line', threw);
 }
 
 console.log('dirty-worktree refusal');
@@ -152,9 +155,12 @@ console.log('wiring (the pure module is useless if nothing calls it)');
     .join('\n');
 
   const provider = read('paseo-plugin/server/provider.ts');
-  for (const capability of ['session.revert.both', 'session.revert.conversation', 'session.revert.files']) {
+  for (const capability of ['session.revert.both', 'session.revert.conversation']) {
     check(`provider declares ${capability}`, provider.includes(`"${capability}"`));
   }
+  // The installed plugin has no files-only mode, so advertising this one would
+  // put a menu entry in front of a backend that cannot honour it.
+  check('provider does NOT declare session.revert.files', provider.includes('"session.revert.files"') === false);
   check(
     'provider dispatches session.revert to the session',
     /case "session\.revert":/.test(provider) && /\.revert\(input\.token,\s*input\.scope\)/.test(provider),

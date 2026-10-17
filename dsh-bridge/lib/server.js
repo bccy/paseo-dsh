@@ -1028,7 +1028,7 @@ export class PaseoHarnessServer {
     const rec = this.requireSession(params.sessionId);
     const agent = rec.handle.agent;
     const session = agent.session;
-    const resolved = revertOrdinal(session.surface.nodes, session.events, params.token);
+    const resolved = revertOrdinal(session.surface.nodes, (seq) => session.eventAt(seq), params.token);
     if (!resolved.ok) throw new Error(resolved.reason);
     const scope = params.scope === 'conversation' || params.scope === 'files' ? params.scope : 'both';
     if (restoresFiles(scope)) {
@@ -1039,9 +1039,13 @@ export class PaseoHarnessServer {
       }
       if (worktree.dirty.length > 0) throw new Error(dirtyWorkspaceError(worktree.dirty));
     }
+    const line = rewindLine(resolved.seq, scope);
+    if (line === undefined) {
+      throw new Error('当前后端不支持只回退文件；请选择「回退对话和文件」或「只回退对话」。');
+    }
     const commands = this.ctx.get('commands');
     if (commands === undefined) throw new Error('command registry is not mounted in this profile');
-    const execution = await commands.execute(agent, rewindLine(resolved.n, scope), [], new AbortController().signal);
+    const execution = await commands.execute(agent, line, [], new AbortController().signal);
     if (execution === undefined) throw new Error('the rewind command is not registered in this profile');
     return {
       kind: execution.result.kind,

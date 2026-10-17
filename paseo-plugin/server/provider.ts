@@ -67,7 +67,9 @@ const CAPABILITIES = [
   // intersection of these bits and its own UI.
   "session.revert.both",
   "session.revert.conversation",
-  "session.revert.files",
+  // NOT `session.revert.files`: the installed `dsh-rewind-plugin` has no
+  // files-only mode (`/rewind @<seq> chat|both`), and advertising a capability
+  // the backend cannot honour is worse than a missing menu entry.
   "permission",
 ] as const;
 

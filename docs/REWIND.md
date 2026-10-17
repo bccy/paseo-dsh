@@ -32,19 +32,31 @@ surface replacement 事件把作废消息从模型可见面移除，且模型上
 以及文件回退的 git 快照账本。撤回是"改历史"的高风险操作，自己重写边界（未跟踪文件、rename、
 非 git 工作区）收益远小于风险。
 
-**依赖**：`dsh-rewind@0.11.12`，装在 `~/.dsh/profiles/paseo`。它的客户端部分是
-`platform: "web"`，在 paseo profile 里只用到它的**服务端命令**（`/rewind`、`/unrewind`）。
+**依赖**：`dsh-rewind-plugin@0.15.3`，装在 `~/.dsh/profiles/paseo`。它的客户端部分是
+`platform: "web"`，在 paseo profile 里只用到它的**服务端命令**。
+
+装的时候要注意两点：
+
+- **版本门禁豁免**：它对 `@deepseek-ai/dsh-*` 的 peer 要求是 `^0.2.1-rc.1`，本机 DSH 是
+  `0.2.0-rc.2`，需要用 `dsh plugin allow-version` 显式豁免才能装上。装上后实测可用。
+- **不要装 0.11.x**：那一版读 `session.events[seq]`，而本机 DSH 已移除该属性（改用
+  `session.eventAt(seq)`），命令一执行就抛 `Cannot read properties of undefined`。
 
 ## 两条不能破的规则
 
 1. **锚点判定必须逐字复刻 `dsh-rewind`**。我们算出序号 `n` 再交给它的 `/rewind <n>`，两边
    的"可回退消息清单"只要差一条，就会回退到**错误的消息**——而且不会报错。因此
    `dsh-bridge/lib/revert.js` 的 `isRewindAnchor` 与它的 `isRewindAnchorEvent` 完全一致：
-   `source.kind === 'user'` 的消息，加上它自己的非空 plugin 锚点（`/unrewind` 恢复出的原话
-   气泡），减去它的标记行（`↩ /rewind`、`🔖 /vault`、`🔖 /unrewind`）。
-   **升级 `dsh-rewind` 后必须重新核对这条规则**，`harness/revert-check.mjs` 里有一整组断言。
-2. **序号必须在可见面上数**（`session.surface.nodes`），不能在 `session.events` 上数。
-   压缩和更早的撤回都会把事件留在盘上、同时从可见面移除；数错就会回退到错误位置。
+   `source.kind === 'user'` 的消息，**没有别的**（0.11.x 还额外算自己的 plugin 锚点、并排除
+   标记行，0.15.x 不需要）。**升级插件后必须重新核对这条规则**，`harness/revert-check.mjs`
+   里有一整组断言。
+2. **目标必须用 `@<seq>`，不能用序号**。0.15.x 的 `/rewind` 接受 `<index>` 或 `@<seq>`，
+   传 seq 让插件自己在可见面上解析，两边就不可能对"第几条"产生分歧。我们自己的锚点判定
+   只用于**提前拒绝**已不可回退的行（给出可读错误），不用于编号。
+
+**能力位的取舍**：0.15.x 只有 `chat` 和 `both` 两种模式，**没有"只回退文件"**。所以
+`provider.ts` 只声明 `session.revert.both` 和 `session.revert.conversation`，不声明
+`session.revert.files`——声明一个后端做不到的能力，比菜单里少一项更糟。
 
 ## 行为约定
 
