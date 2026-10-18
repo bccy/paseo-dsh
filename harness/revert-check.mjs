@@ -156,6 +156,22 @@ console.log('replay timestamps (per-turn "worked for" durations survive a reopen
   );
 }
 
+console.log('rewinding the whole conversation still reaches the client');
+{
+  const session = readFileSync(join(import.meta.dirname, '..', 'paseo-plugin/server/session.ts'), 'utf8');
+  check(
+    'the replay recognizes this bridge\'s rewind markers by their durable source kind',
+    /const REWIND_MARKER_SOURCE_KIND = "paseo-rewind";/.test(session)
+      && /source\.kind === REWIND_MARKER_SOURCE_KIND/.test(session),
+  );
+  check(
+    'an emptied conversation emits one first-epoch notice (so Paseo resets the stale timeline)',
+    /!sawHumanMessage && sawRewindMarker/.test(session)
+      && /id: "paseo-rewind:empty"/.test(session)
+      && /type: "notification"/.test(session),
+  );
+}
+
 console.log('receipt');
 {
   check('the receipt names the withdrawn seq', successText(42) === 'Withdrawn seq 42 and everything after it', successText(42));

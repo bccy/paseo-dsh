@@ -53,6 +53,16 @@ function replayTimestamp(event: { time?: unknown }): string | undefined {
     ? new Date(event.time).toISOString()
     : undefined;
 }
+
+/**
+ * The source kind this bridge uses for its own rewind markers.
+ *
+ * Mirrors `dsh-bridge/lib/surface.js`'s constant: the marker is a `user/message`
+ * with a private source, so it is durable in the session log without becoming a
+ * rewind anchor or a replayed user row. The plugin only reads it here to tell
+ * "everything was rewound away" from "the session is simply empty".
+ */
+const REWIND_MARKER_SOURCE_KIND = "paseo-rewind";
 import { UI, commandCopy, skillDescription } from "./locale";
 
 /**
@@ -556,6 +566,8 @@ export class DshSession {
     if (events.length === 0) return;
     const builder = new TimelineBuilder({ warn: (line) => this.#options.log(line) });
     let lastTimestamp: string | undefined;
+    let sawHumanMessage = false;
+    let sawRewindMarker = false;
     for (const event of events) {
       const data = isRecord(event.data) ? event.data : {};
       const seq = typeof event.seq === "number" ? event.seq : this.#replaySeq++;
@@ -563,9 +575,14 @@ export class DshSession {
       if (timestamp !== undefined) lastTimestamp = timestamp;
       if (event.type === "user/message") {
         const source = isRecord(data.source) ? data.source : {};
+        if (source.kind === REWIND_MARKER_SOURCE_KIND) {
+          sawRewindMarker = true;
+          continue;
+        }
         if (source.kind !== "user") continue;
         const text = textBlocks(data.content);
         if (text === "") continue;
+        sawHumanMessage = true;
         this.#options.emit({
           type: "timeline.item",
           sessionId: this.id,
@@ -592,6 +609,24 @@ export class DshSession {
           item,
         });
       }
+    }
+    // A rewind can withdraw the *entire* conversation. The rebuilt timeline is
+    // then empty, so nothing is emitted for the new epoch — and Paseo's client
+    // only resets a live timeline when it receives a row in the new epoch
+    // (epoch mismatch + seq 1). Without this notice the previous rows stayed on
+    // screen and clicking one hit "No provider revert token for message …".
+    if (!sawHumanMessage && sawRewindMarker) {
+      this.#options.emit({
+        type: "timeline.item",
+        sessionId: this.id,
+        ...(lastTimestamp === undefined ? {} : { timestamp: lastTimestamp }),
+        item: {
+          type: "notification",
+          id: "paseo-rewind:empty",
+          level: "info",
+          message: "会话已回退到起点",
+        },
+      });
     }
     // A tool whose `tool/result` never arrived needs the same treatment for the
     // same reason, and the root replay used to skip it while the child replay
