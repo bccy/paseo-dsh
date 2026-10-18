@@ -187,6 +187,24 @@ console.log('replay timestamps (per-turn "worked for" durations survive a reopen
   );
 }
 
+console.log('a successful rewind shows a transient "working" notice');
+{
+  const provider = readFileSync(join(import.meta.dirname, '..', 'paseo-plugin/server/provider.ts'), 'utf8');
+  const noticeIndex = provider.indexOf('"正在回退，请稍候"');
+  const caseStart = provider.lastIndexOf('case "session.revert"', noticeIndex);
+  const completedIndex = provider.indexOf('request.completed', caseStart);
+  const refreshIndex = provider.indexOf('this.#refreshAgent(input.sessionId)', caseStart);
+  check(
+    'the notice is emitted after the revert succeeded and before the reload',
+    caseStart !== -1 && completedIndex !== -1 && noticeIndex !== -1 && refreshIndex !== -1
+      && completedIndex < noticeIndex && noticeIndex < refreshIndex,
+  );
+  check(
+    'and it is an info notice with the short working text',
+    /this\.#notice\(input\.sessionId, "info", "正在回退，请稍候"\)/.test(provider),
+  );
+}
+
 console.log('the first-message refusal does not interrupt a running turn');
 {
   const bridge = readFileSync(join(import.meta.dirname, '..', 'dsh-bridge/lib/server.js'), 'utf8');
@@ -228,8 +246,12 @@ console.log('wiring (the pure module is useless if nothing calls it)');
   );
   check(
     'provider answers the rewind before scheduling the refresh',
-    provider.indexOf('this.#emit({ type: "request.completed", requestId: input.requestId });\n        const failedFiles')
-      !== -1 && provider.indexOf('this.#refreshAgent(input.sessionId);') > provider.indexOf('case "session.revert":'),
+    (() => {
+      const caseStart = provider.indexOf('case "session.revert":');
+      const completed = provider.indexOf('this.#emit({ type: "request.completed", requestId: input.requestId });', caseStart);
+      const refresh = provider.indexOf('this.#refreshAgent(input.sessionId);', caseStart);
+      return caseStart !== -1 && completed !== -1 && refresh !== -1 && completed < refresh;
+    })(),
   );
   check(
     'provider resolves the paseo binary explicitly',

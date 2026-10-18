@@ -354,6 +354,14 @@ class DshConnection implements ProviderConnection {
         // deadlocks the two. The 500 ms timer in `#refreshAgent` keeps the reply
         // ahead of the restart.
         this.#emit({ type: "request.completed", requestId: input.requestId });
+        // The daemon only rebuilds the timeline after the reload below, and the
+        // click itself gives no feedback while that takes a second or so. A
+        // notice is the one channel this provider has for a transient "working"
+        // row: it lands after the revert succeeded (a refused or failed revert
+        // never reaches here), and the rebuild that follows drops it with the
+        // rest of the old timeline epoch. If the reload fails it stays next to
+        // the "timeline was not refreshed" warning, which is honest.
+        this.#notice(input.sessionId, "info", "正在回退，请稍候");
         const failedFiles = result?.files?.failed ?? [];
         if (failedFiles.length > 0) {
           // The conversation rewind succeeded; only some files did not. Say so
