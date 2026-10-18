@@ -141,9 +141,15 @@ export interface DshRevertFiles {
   rescueDir: string;
 }
 
-/** The bridge's `paseo/revert` receipt. */
+/**
+ * The bridge's `paseo/revert` receipt.
+ *
+ * A failed rewind is a thrown RPC error, never a receipt: the bridge writes
+ * nothing until its plan is valid, so there is no partial-success `error` kind
+ * to represent here.
+ */
 export interface DshRevertResult {
-  kind: "success" | "error";
+  kind: "success";
   text?: string;
   files?: DshRevertFiles;
 }

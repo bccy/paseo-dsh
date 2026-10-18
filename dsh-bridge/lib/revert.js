@@ -87,7 +87,7 @@ export function isHumanUserMessage(event) {
  */
 export function planRewind(nodes, eventAt, token) {
   const messageId = tokenMessageId(token);
-  if (messageId === undefined) return { ok: false, reason: 'revert token carries no message id' };
+  if (messageId === undefined) return { ok: false, reason: '撤回令牌无效（缺少消息 id）' };
   const targetIndex = nodes.findIndex((seq) => {
     const event = /** @type {{data?: {id?: unknown}} | undefined} */ (eventAt(seq));
     return isHumanUserMessage(event) && event?.data?.id === messageId;
@@ -97,7 +97,7 @@ export function planRewind(nodes, eventAt, token) {
     // the visible surface: an earlier rewind or a compaction already removed it.
     return {
       ok: false,
-      reason: `message ${messageId} is not a revertible user message in the visible conversation`,
+      reason: `这条消息已不在可撤回的对话中（可能已被撤回或压缩）：${messageId}`,
     };
   }
   // The first human message cannot be withdrawn: doing so clears the whole

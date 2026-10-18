@@ -1654,6 +1654,25 @@ reload 竞争（被 cancel、丢失或追加到冻结区间之后）。provider 
 「正在回退，请稍候」；reload 成功关闭会话、拒绝撤回、刷新失败、或 15s 兜底时释放。
 
 ---
+### 57. 审计 P2/P3 收尾：文件层生命周期、agent 定位与死代码
+
+- **rescue 覆盖**：同一路径第二次撤回时，rescue 文件名只按 counter 生成会被覆盖；改为
+  `时间戳-counter-编码路径`，两次撤回各留一份。
+- **objects 无回收**：prune/trim 只改 journal，内容对象永久残留。新增 `collectGarbage`：
+  按当前 journal 的 backup 引用集删未引用对象；撤回的 prune/trim 后调用。
+- **journal 并发**：并行编辑工具的 `appendFile` 与 prune/trim 重写可能交错，坏行会被读取端
+  静默跳过。所有 journal 读改写进私有写队列 `#enqueue`（串行）。
+- **chmod 失败语义**：内容已恢复但 chmod 失败时不再把路径报成 failed，只 warn。
+- **agent 定位**：自动 reload 的兜底扫描从“原文包含 sessionId 即返回第一个”改为解析
+  persistence/runtimeInfo 的 plugin handle、精确匹配 DSH session id；多个记录命中则放弃并记日志。
+- **停放接管**：take 返回后进程可能在重接 handler 前退出 → 回退冷启动；接管后按目标 mode
+  重置 plan（失败只记日志，不失败 open）。mcp-injection 的补丁生命周期断言也按停放语义更新：
+  idle session.close 会停车，provider teardown 才删 patch（10/10）。
+- **用户可见错误**：撤回令牌无效/消息不在可见面/范围不支持/撤回进行中改中文提示。
+- **死代码/注释**：删未用导入、`pendingSkips`、`str_replace_editor`、`DshRevertResult` 的
+  error 分支；修正孤儿 JSDoc、"500ms"、`dsh-rewind`、emit 等过时注释。
+
+---
 ## 已知限制（未修，有意为之）
 
 | 项 | 说明 |

@@ -18,7 +18,6 @@ import type {
   ProviderPrompt,
   ProviderSetting,
   ProviderThinkingOption,
-  ProviderToolCallDetail,
   ProviderUsage,
 } from "@getpaseo/plugin/server/provider";
 import type { JsonValue } from "./dsh-process";
@@ -314,7 +313,15 @@ export class DshSession {
   /** Adopt a parked process or spawn one, pin the route, reconcile the mode. */
   async open(): Promise<void> {
     const expected = { cwd: this.#options.cwd, routeKey: routeKeyOf(this.#route) };
-    const adopted = this.#options.takeParked?.(this.#dshSessionId, expected);
+    const offered = this.#options.takeParked?.(this.#dshSessionId, expected);
+    // `take` checks `running`, but the child can exit between that check and the
+    // moment its handlers are re-pointed. A dead adoption would produce a session
+    // that never answers; cold-start instead (the pool entry is already gone).
+    const adopted = offered !== undefined && offered.running ? offered : undefined;
+    if (offered !== undefined && adopted === undefined) {
+      this.#options.log(`parked process for ${this.#dshSessionId} exited before adoption; cold-starting`);
+      offered.kill();
+    }
     let process: DshProcess;
     if (adopted !== undefined) {
       // The child kept running across the provider-session close; re-point its
@@ -333,8 +340,20 @@ export class DshSession {
     }
     this.#process = process;
     await process.start();
-    if (this.#mode === "plan") {
-      await process.setPlan(true);
+    // A parked child may still be in plan mode from its previous session; the
+    // reopen's mode is authoritative, so reconcile both directions. A freshly
+    // spawned child starts in build, so only a plan open needs the extra write.
+    // A profile that composes no plan-mode service must not fail the whole open
+    // here: the conversation is usable in build mode and the log says why the
+    // toggle could not be applied.
+    if (adopted !== undefined || this.#mode === "plan") {
+      try {
+        await process.setPlan(this.#mode === "plan");
+      } catch (error) {
+        this.#options.log(
+          `plan mode could not be reconciled on open (${this.#mode}): ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     }
   }
 
@@ -841,9 +860,9 @@ export class DshSession {
       sessionId: this.id,
       // `revertToken` is opaque to Paseo: it caches it per row and hands it back
       // when the user rewinds from that row (provider capability
-      // `session.revert.*`). Re-emitting the same id upserts the row, which is
-      // how the live message gains its token once the bridge has named the DSH
-      // message it created.
+      // `session.revert.*`). The prompt path emits this row once, after the
+      // bridge named the DSH message, so the token is always present; command
+      // rows carry none because DSH has no user/message for them.
       item: {
         type: "user_message",
         id: `user:${clientMessageId}`,

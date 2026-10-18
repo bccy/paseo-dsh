@@ -15,7 +15,6 @@ import { execFileSync, spawn } from "node:child_process";
 import {
   negotiateProviderCapabilities,
   type ProviderCatalog,
-  type ProviderConfigState,
   type ProviderConnection,
   type ProviderEvent,
   type ProviderInput,
@@ -648,6 +647,9 @@ class DshConnection implements ProviderConnection {
    */
   #refreshAgent(sessionId: string): void {
     const timer = setTimeout(() => {
+      // The provider can be torn down between the rewind and this timer; do not
+      // spawn a CLI reload for a connection that no longer exists.
+      if (this.#closed) return;
       const agentId = this.#agentIds.get(sessionId) ?? findPaseoAgentId(sessionId);
       if (agentId === undefined) {
         process.stderr.write(
@@ -999,6 +1001,7 @@ function findPaseoAgentId(sessionId: string): string | undefined {
   } catch {
     return undefined;
   }
+  const matches: string[] = [];
   for (const workspace of workspaces) {
     const dir = join(root, workspace);
     let files: string[];
@@ -1017,13 +1020,60 @@ function findPaseoAgentId(sessionId: string): string | undefined {
       }
       // Cheap pre-filter before parsing: most records do not mention this session.
       if (!raw.includes(sessionId)) continue;
+      let parsed: unknown;
       try {
-        const parsed = JSON.parse(raw) as { id?: unknown };
-        if (typeof parsed.id === "string" && parsed.id !== "") return parsed.id;
+        parsed = JSON.parse(raw);
       } catch {
         continue;
       }
+      if (!isRecord(parsed) || typeof parsed["id"] !== "string" || parsed["id"] === "") continue;
+      // Exact claim only: a substring match could pick an agent whose record
+      // merely mentions this session id (a child, an archive copy). Reloading the
+      // wrong agent is worse than not reloading at all.
+      const claimed = claimedSessionIds(parsed);
+      if (!claimed.includes(sessionId)) continue;
+      if (!matches.includes(parsed["id"])) matches.push(parsed["id"]);
     }
   }
-  return undefined;
+  if (matches.length > 1) {
+    process.stderr.write(
+      `[${PROVIDER_ID}] cannot map session ${sessionId} to one agent (${matches.length} records claim it); skipping automatic reload\n`,
+    );
+    return undefined;
+  }
+  return matches[0];
+}
+
+/**
+ * Session ids one stored agent record claims through its persistence handle.
+ *
+ * The daemon's registry stores the provider handle as a JSON string
+ * (`plugin:{"version":1,"data":{"sessionId":"…"}}`); runtimeInfo carries the
+ * same handle. Parsing it is the exact match the substring scan was missing.
+ *
+ * @param record - parsed agent record.
+ * @returns every DSH session id the record claims.
+ */
+function claimedSessionIds(record: Record<string, unknown>): string[] {
+  const ids: string[] = [];
+  const values: unknown[] = [];
+  const persistence = record["persistence"];
+  if (typeof persistence === "string") values.push(persistence);
+  else if (isRecord(persistence)) values.push(persistence["sessionId"]);
+  const runtime = record["runtimeInfo"];
+  if (isRecord(runtime)) values.push(runtime["sessionId"]);
+  for (const value of values) {
+    if (typeof value !== "string" || value === "") continue;
+    if (value.startsWith("plugin:")) {
+      try {
+        const parsed = JSON.parse(value.slice("plugin:".length)) as { data?: { sessionId?: unknown } };
+        if (typeof parsed.data?.sessionId === "string") ids.push(parsed.data.sessionId);
+      } catch {
+        // Not a plugin persistence handle; ignore instead of guessing.
+      }
+    } else {
+      ids.push(value);
+    }
+  }
+  return ids;
 }

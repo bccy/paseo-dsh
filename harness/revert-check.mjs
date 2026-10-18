@@ -356,7 +356,7 @@ console.log('wiring (the pure module is useless if nothing calls it)');
   );
   check(
     'the bridge refuses unknown scopes instead of widening them',
-    /unsupported revert scope/.test(bridge),
+    /不支持的回退范围/.test(bridge),
   );
   check(
     'the old assistant/message placeholder is gone',

@@ -1016,11 +1016,11 @@ export class TimelineBuilder {
     // A failed one is *not* dropped: Paseo's marker has no failure state, so the
     // failed row is the only place the error can be read. Fail loud.
     if (!failed && this.#compactionCommands.has(commandId)) return [];
-    // A rewind is executed by this provider on the user's behalf — the button
-    // runs `dsh-rewind`'s `/rewind @<seq> chat|both` — so the row would be the
-    // only trace of an implementation detail the user never typed. Drop the
-    // successful one; a failed rewind keeps its row because Paseo's marker has no
-    // failure state and the row is where the error can be read.
+    // Historical logs from the retired `/rewind`-command implementation contain
+    // command rows for internal commands the user never typed; drop the
+    // successful ones on replay. (The current implementation appends a surface
+    // replacement directly, so it never produces these rows.) A failed command
+    // keeps its row because Paseo's marker has no failure state.
     if (!failed && LEGACY_INTERNAL_COMMANDS.has(name)) return [];
     const line = `/${name}`;
     return this.#put({

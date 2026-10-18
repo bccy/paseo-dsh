@@ -1108,6 +1108,11 @@ export class PaseoHarnessServer {
     try {
       const session = exec?.agent?.session;
       if (session === undefined) return;
+      // A child session's edits are its own: they are anchored to the child's
+      // log, which a parent rewind cannot address. Tracking them here would
+      // record them under an anchor of the parent surface that means nothing for
+      // the child. Documented limitation: a parent `both` rewind does not undo
+      // files a subagent edited.
       if (session.header?.origin === 'subagent' || (session.header?.delegationDepth ?? 0) > 0) return;
       if (!isTrackedTool(exec)) return;
       const rawPath = mutationPathOf(exec);
@@ -1173,11 +1178,11 @@ export class PaseoHarnessServer {
     if (scope === undefined) {
       // Never widen an unknown scope into a full rewind: that is the most
       // destructive interpretation of a request we do not understand.
-      throw new Error(`unsupported revert scope "${String(params.scope)}"`);
+      throw new Error(`不支持的回退范围：${String(params.scope)}`);
     }
     const sessionKey = String(session.id);
     if (this.revertInflight.has(sessionKey)) {
-      throw new Error('a rewind is already in progress for this session');
+      throw new Error('该会话已有撤回正在进行，请稍候再试');
     }
     this.revertInflight.add(sessionKey);
     try {
@@ -1245,7 +1250,14 @@ export class PaseoHarnessServer {
         await this.fileSnapshots.prune(sessionKey, resolved.targetSeq).catch((error) => {
           process.stderr.write(`[bridge] pruning the file-snapshot journal failed: ${error instanceof Error ? error.message : String(error)}\n`);
         });
-        await this.fileSnapshots.trim(sessionKey).catch(() => {});
+        await this.fileSnapshots.trim(sessionKey).catch((error) => {
+          process.stderr.write(`[bridge] trimming the file-snapshot journal failed: ${error instanceof Error ? error.message : String(error)}\n`);
+        });
+        // Pruning/trimming only rewrites the index; drop the content objects that
+        // are no longer referenced so a long-lived session does not grow forever.
+        await this.fileSnapshots.collectGarbage(sessionKey).catch((error) => {
+          process.stderr.write(`[bridge] collecting unused file-snapshot objects failed: ${error instanceof Error ? error.message : String(error)}\n`);
+        });
         if (files.failed.length > 0) {
           process.stderr.write(
             `[bridge] file restore failed for ${files.failed.map((entry) => entry.path).join(', ')}; rescue copies in ${files.rescueDir}\n`,

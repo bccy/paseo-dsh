@@ -264,17 +264,34 @@ const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-mcp-check-"));
     fs.existsSync(sseProbe) ? "a process was spawned anyway" : "no process spawned",
   );
 
-  // ---- the overlay does not outlive the process -------------------------
+  // ---- the overlay lives exactly as long as the process ------------------
+  // An idle session is *parked* on close (the rewind refresh reuses the child),
+  // so `session.close` alone must not remove the overlay: the process is still
+  // alive. Provider teardown shuts the parked child down for real, and only then
+  // may the patch file disappear.
   await conn.send({ type: "session.close", sessionId: httpSession, requestId: "close-http" });
   await until((e) => e.type === "session.closed" && e.sessionId === httpSession, "http session closed");
-  await sleep(200);
+  await sleep(300);
   check(
-    "the patch file is removed with its process",
-    httpRecord?.patchPath !== undefined && !fs.existsSync(httpRecord.patchPath),
+    "an idle session keeps its process (and its overlay) after session.close",
+    httpRecord?.patchPath !== undefined && fs.existsSync(httpRecord.patchPath),
     httpRecord?.patchPath ?? "(no patch path recorded)",
   );
 
   await conn.close();
+  let patchRemoved = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (httpRecord?.patchPath === undefined || !fs.existsSync(httpRecord.patchPath)) {
+      patchRemoved = true;
+      break;
+    }
+    await sleep(50);
+  }
+  check(
+    "provider teardown removes the patch file with its process",
+    httpRecord?.patchPath !== undefined && patchRemoved,
+    httpRecord?.patchPath ?? "(no patch path recorded)",
+  );
   fs.rmSync(scratch, { recursive: true, force: true });
 
   const failed = results.filter((r) => !r.pass).length;

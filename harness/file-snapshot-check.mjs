@@ -219,6 +219,57 @@ console.log('deduplicated objects');
   check('only one object file exists', objects.length === 1, JSON.stringify(objects));
 }
 
+console.log('rescue copies from separate rewinds are not overwritten');
+{
+  const session = 'rescue-check';
+  const file = join(root, 'rescue-target.txt');
+  await writeFile(file, 'A', 'utf8');
+  await snapshots.capture({ sessionId: session, anchorSeq: 5, callId: 'c1', path: file });
+  await snapshots.commit({ sessionId: session, callId: 'c1' }, { isError: false });
+  await writeFile(file, 'B', 'utf8');
+  const first = await snapshots.planRestore(session, 5);
+  await snapshots.restore(session, first.actions);
+  await writeFile(file, 'C', 'utf8');
+  const second = await snapshots.planRestore(session, 5);
+  await snapshots.restore(session, second.actions);
+  const rescues = await readdir(join(root, encodeURIComponent(session), 'rescue'));
+  check('two rewinds produce two rescue copies', rescues.length === 2, JSON.stringify(rescues));
+  check('and both contain real pre-restore content', rescues.length === 2);
+}
+
+console.log('journal writes are serialised under parallel tool commits');
+{
+  const session = 'queue-check';
+  const firstFile = join(root, 'queue-a.txt');
+  const secondFile = join(root, 'queue-b.txt');
+  await writeFile(firstFile, 'one', 'utf8');
+  await writeFile(secondFile, 'two', 'utf8');
+  await snapshots.capture({ sessionId: session, anchorSeq: 7, callId: 'q1', path: firstFile });
+  await snapshots.capture({ sessionId: session, anchorSeq: 7, callId: 'q2', path: secondFile });
+  // Both commits race, like two editing tools finishing in the same instant.
+  await Promise.all([
+    snapshots.commit({ sessionId: session, callId: 'q1' }, { isError: false }),
+    snapshots.commit({ sessionId: session, callId: 'q2' }, { isError: false }),
+  ]);
+  const journal = await snapshots.readJournal(session);
+  check('parallel commits produce two readable journal lines', journal.entries.length === 2 && journal.skippedLines === 0, JSON.stringify(journal));
+}
+
+console.log('unreferenced objects are collected');
+{
+  const session = 'gc-check';
+  const file = join(root, 'gc-target.txt');
+  await writeFile(file, 'keep-me', 'utf8');
+  await snapshots.capture({ sessionId: session, anchorSeq: 9, callId: 'g1', path: file });
+  await snapshots.commit({ sessionId: session, callId: 'g1' }, { isError: false });
+  const objectsDir = join(root, encodeURIComponent(session), 'objects');
+  await writeFile(join(objectsDir, 'deadbeefdeadbeef'), 'orphan', 'utf8');
+  const collected = await snapshots.collectGarbage(session);
+  const left = await readdir(objectsDir);
+  check('one unreferenced object is removed', collected.removed === 1, JSON.stringify(collected));
+  check('the referenced object is kept', left.length === 1, JSON.stringify(left));
+}
+
 await rm(root, { recursive: true, force: true });
 const failed = results.filter((result) => !result.pass);
 console.log(`\n${results.length - failed.length} passed, ${failed.length} failed`);

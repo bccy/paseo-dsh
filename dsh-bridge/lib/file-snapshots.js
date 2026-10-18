@@ -33,12 +33,12 @@
 
 import { createHash } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
-import { appendFile, chmod, copyFile, mkdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, copyFile, mkdir, readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve as resolvePath } from 'node:path';
 
 /** Tools whose file mutations are checkpointed. */
-const TRACKED_TOOLS = new Set(['write', 'edit', 'str_replace_editor']);
+const TRACKED_TOOLS = new Set(['write', 'edit']);
 
 /** Default cap for one snapshot; larger files are skipped and reported. */
 const DEFAULT_MAX_FILE_BYTES = 8 * 1024 * 1024;
@@ -50,8 +50,9 @@ const MAX_ANCHORS = 100;
  * The path a tracked tool is about to mutate.
  *
  * DSH's `write`/`edit` tools take `file_path` (resolved by the filesystem
- * backend); `str_replace_editor` takes the same key when mounted. Anything else
- * is not a file mutation this module can checkpoint.
+ * backend). Anything else is not a file mutation this module can checkpoint.
+ * (`str_replace_editor` only exists in the legacy client UI vocabulary; DSH
+ * core has no such tool, so tracking it here was dead code.)
  *
  * @param {{name?: string, arguments?: unknown}} exec
  * @returns {string | undefined}
@@ -102,6 +103,9 @@ function objectKey(bytes) {
  * a journal, content-addressed objects and rescue copies.
  */
 export class FileSnapshots {
+  /** Tail of the serialised journal-write chain. */
+  #writeQueue;
+
   /**
    * @param {object} [options]
    * @param {string} [options.rootDir] - override for tests.
@@ -114,9 +118,24 @@ export class FileSnapshots {
     this.maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
     /** `${sessionId}:${callId}` -> pending entry, between tools/execute and post-execute. */
     this.pending = new Map();
-    /** `${sessionId}:${callId}` -> skip reason, so the post-execute can log it. */
-    this.pendingSkips = new Map();
+    /**
+     * Serialises journal read-modify-write operations. Editing tools can run in
+     * parallel inside one turn; two `appendFile`/rewrite operations interleaving
+     * would corrupt the JSONL (the reader skips bad lines, i.e. silently loses
+     * snapshots).
+     */
+    this.#writeQueue = Promise.resolve();
     this.warn = options.warn ?? ((line) => process.stderr.write(`[bridge] ${line}\n`));
+  }
+
+  /** Run one journal mutation after the previous one has settled. */
+  #enqueue(task) {
+    const run = this.#writeQueue.then(task, task);
+    this.#writeQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
 
   /** @param {string} sessionId */
@@ -217,7 +236,6 @@ export class FileSnapshots {
     const key = pendingKey(input.sessionId, input.callId);
     const pending = this.pending.get(key);
     this.pending.delete(key);
-    this.pendingSkips.delete(key);
     if (pending === undefined) return;
     if (result?.isError === true) return;
     if (pending.skip !== undefined) {
@@ -225,16 +243,18 @@ export class FileSnapshots {
       return;
     }
     try {
-      await mkdir(this.sessionDir(input.sessionId), { recursive: true });
-      const line = `${JSON.stringify({
-        anchorSeq: pending.anchorSeq,
-        callId: pending.callId,
-        path: pending.path,
-        backup: pending.backup,
-        mode: pending.mode,
-        time: new Date().toISOString(),
-      })}\n`;
-      await appendFile(this.journalPath(input.sessionId), line, 'utf8');
+      await this.#enqueue(async () => {
+        await mkdir(this.sessionDir(input.sessionId), { recursive: true });
+        const line = `${JSON.stringify({
+          anchorSeq: pending.anchorSeq,
+          callId: pending.callId,
+          path: pending.path,
+          backup: pending.backup,
+          mode: pending.mode,
+          time: new Date().toISOString(),
+        })}\n`;
+        await appendFile(this.journalPath(input.sessionId), line, 'utf8');
+      });
     } catch (error) {
       this.warn(`could not record a file snapshot for ${input.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -249,7 +269,6 @@ export class FileSnapshots {
     const key = pendingKey(input.sessionId, input.callId);
     const pending = this.pending.get(key);
     this.pending.delete(key);
-    this.pendingSkips.delete(key);
     return pending;
   }
 
@@ -353,7 +372,15 @@ export class FileSnapshots {
         await mkdir(dirname(action.path), { recursive: true });
         await writeFile(action.path, bytes);
         if (action.mode !== null) {
-          await chmod(action.path, action.mode);
+          try {
+            await chmod(action.path, action.mode);
+          } catch (error) {
+            // The bytes are back; only the permission bits failed. Reporting the
+            // path as failed would claim the content was not restored.
+            this.warn(
+              `file content restored but chmod failed for ${action.path}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
         }
         outcome.restored.push(action.path);
       } catch (error) {
@@ -373,40 +400,46 @@ export class FileSnapshots {
    */
   async #rescue(rescueDir, path, counter) {
     await mkdir(rescueDir, { recursive: true });
-    const name = `${counter}-${encodeURIComponent(path)}`;
+    // Timestamp + counter: two rewinds restoring the same path must not
+    // overwrite the earlier rescue copy (it is the manual-recovery material).
+    const name = `${Date.now()}-${counter}-${encodeURIComponent(path)}`;
     const target = join(rescueDir, name);
     await copyFile(path, target, fsConstants.COPYFILE_FICLONE ?? 0);
     return target;
   }
 
   /**
-   * Keep only journal entries at or before the restored target.
+   * Keep journal entries that can still matter for a future rewind.
    *
-   * After a rewind the entries it just applied are no longer useful: a later
-   * rewind to the same place must not restore a second time from a state that is
-   * already gone. Objects stay content-addressed and shared; v1 does not delete
-   * them (bounded by the per-session anchor cap below).
+   * Entries **after** the target belong to turns that were just withdrawn and
+   * are dropped. Entries at the target stay: their backup is the state before
+   * the target turn, which a later rewind to an earlier message may still need
+   * as the earliest post-target state for that path (`file-snapshot-check`
+   * asserts this cutoff explicitly). Rewriting the journal is serialised with
+   * the appends so a concurrent tool commit cannot interleave.
    *
    * @param {string} sessionId
    * @param {number} targetSeq
    * @returns {Promise<{kept: number, dropped: number}>}
    */
   async prune(sessionId, targetSeq) {
-    const { entries } = await this.readJournal(sessionId);
-    const kept = entries.filter((entry) => entry.anchorSeq <= targetSeq);
-    const dropped = entries.length - kept.length;
-    if (dropped === 0) return { kept: kept.length, dropped: 0 };
-    const lines = kept.map((entry) => `${JSON.stringify({
-      anchorSeq: entry.anchorSeq,
-      ...(entry.callId === undefined ? {} : { callId: entry.callId }),
-      path: entry.path,
-      backup: entry.backup,
-      mode: entry.mode,
-      time: new Date().toISOString(),
-    })}\n`).join('');
-    await mkdir(this.sessionDir(sessionId), { recursive: true });
-    await writeFile(this.journalPath(sessionId), lines, 'utf8');
-    return { kept: kept.length, dropped };
+    return this.#enqueue(async () => {
+      const { entries } = await this.readJournal(sessionId);
+      const kept = entries.filter((entry) => entry.anchorSeq <= targetSeq);
+      const dropped = entries.length - kept.length;
+      if (dropped === 0) return { kept: kept.length, dropped: 0 };
+      const lines = kept.map((entry) => `${JSON.stringify({
+        anchorSeq: entry.anchorSeq,
+        ...(entry.callId === undefined ? {} : { callId: entry.callId }),
+        path: entry.path,
+        backup: entry.backup,
+        mode: entry.mode,
+        time: new Date().toISOString(),
+      })}\n`).join('');
+      await mkdir(this.sessionDir(sessionId), { recursive: true });
+      await writeFile(this.journalPath(sessionId), lines, 'utf8');
+      return { kept: kept.length, dropped };
+    });
   }
 
   /**
@@ -417,21 +450,59 @@ export class FileSnapshots {
    * @returns {Promise<{dropped: number}>}
    */
   async trim(sessionId) {
-    const { entries } = await this.readJournal(sessionId);
-    const anchors = [...new Set(entries.map((entry) => entry.anchorSeq))].sort((left, right) => left - right);
-    if (anchors.length <= MAX_ANCHORS) return { dropped: 0 };
-    const cutoff = anchors[anchors.length - MAX_ANCHORS];
-    const kept = entries.filter((entry) => entry.anchorSeq >= cutoff);
-    const lines = kept.map((entry) => `${JSON.stringify({
-      anchorSeq: entry.anchorSeq,
-      ...(entry.callId === undefined ? {} : { callId: entry.callId }),
-      path: entry.path,
-      backup: entry.backup,
-      mode: entry.mode,
-      time: new Date().toISOString(),
-    })}\n`).join('');
-    await writeFile(this.journalPath(sessionId), lines, 'utf8');
-    return { dropped: entries.length - kept.length };
+    return this.#enqueue(async () => {
+      const { entries } = await this.readJournal(sessionId);
+      const anchors = [...new Set(entries.map((entry) => entry.anchorSeq))].sort((left, right) => left - right);
+      if (anchors.length <= MAX_ANCHORS) return { dropped: 0 };
+      const cutoff = anchors[anchors.length - MAX_ANCHORS];
+      const kept = entries.filter((entry) => entry.anchorSeq >= cutoff);
+      const lines = kept.map((entry) => `${JSON.stringify({
+        anchorSeq: entry.anchorSeq,
+        ...(entry.callId === undefined ? {} : { callId: entry.callId }),
+        path: entry.path,
+        backup: entry.backup,
+        mode: entry.mode,
+        time: new Date().toISOString(),
+      })}\n`).join('');
+      await writeFile(this.journalPath(sessionId), lines, 'utf8');
+      return { dropped: entries.length - kept.length };
+    });
+  }
+
+  /**
+   * Delete content objects the journal no longer references.
+   *
+   * Pruning/trimming only rewrites the index; without this the `objects/`
+   * directory grew forever (each edit stored a full before-image). Only hashes
+   * referenced by the current journal are kept, so this is safe after
+   * prune/trim and cheap: one journal read plus one directory listing.
+   *
+   * @param {string} sessionId
+   * @returns {Promise<{removed: number}>}
+   */
+  async collectGarbage(sessionId) {
+    return this.#enqueue(async () => {
+      const { entries } = await this.readJournal(sessionId);
+      const referenced = new Set(entries.map((entry) => entry.backup).filter((backup) => typeof backup === 'string'));
+      let names;
+      try {
+        names = await readdir(this.objectsDir(sessionId));
+      } catch (error) {
+        if (error?.code === 'ENOENT') return { removed: 0 };
+        throw error;
+      }
+      let removed = 0;
+      for (const name of names) {
+        if (referenced.has(name)) continue;
+        try {
+          await unlink(join(this.objectsDir(sessionId), name));
+          removed += 1;
+        } catch (error) {
+          this.warn(`could not remove unreferenced snapshot object ${name}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      return { removed };
+    });
   }
 }
 
