@@ -28,6 +28,16 @@
 const USER_MESSAGE = 'user/message';
 
 /**
+ * Why the first human message is not rewindable, as user-facing text.
+ *
+ * Withdrawing it would empty the conversation; Paseo rebuilds an emptied
+ * timeline unreliably in a live client (stale rows stay until a reopen), so the
+ * product rule is: start a new session instead of rewinding the first message.
+ */
+export const FIRST_MESSAGE_REFUSAL =
+  '当前对话的第一条消息不支持撤回：撤掉它等于清空整个对话。请新建一个会话重新开始，或从第二条消息开始撤回。';
+
+/**
  * The DSH message id a token carries.
  *
  * Paseo round-trips the token through JSON untouched, so a string id arrives as
@@ -90,6 +100,14 @@ export function planRewind(nodes, eventAt, token) {
       reason: `message ${messageId} is not a revertible user message in the visible conversation`,
     };
   }
+  // The first human message cannot be withdrawn: doing so clears the whole
+  // conversation, and Paseo's client does not reliably apply the empty rebuild
+  // (it keeps the stale rows on screen until a manual refresh, and clicking one
+  // then fails with "No provider revert token"). The rewind menu is offered per
+  // provider capability, not per row, so the bridge refuses here with a readable
+  // reason instead of emptying the session.
+  const firstHumanIndex = nodes.findIndex((seq) => isHumanUserMessage(eventAt(seq)));
+  if (targetIndex === firstHumanIndex) return { ok: false, reason: FIRST_MESSAGE_REFUSAL };
   const shadowed = nodes.slice(targetIndex);
   return { ok: true, messageId, targetSeq: nodes[targetIndex], targetIndex, shadowed };
 }

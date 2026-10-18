@@ -21,6 +21,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
+  FIRST_MESSAGE_REFUSAL,
   isHumanUserMessage,
   planRewind,
   restoresFiles,
@@ -74,9 +75,29 @@ console.log('range planning (target and everything after it)');
   check('and its range starts at the target itself', newest.ok === true && newest.targetSeq === 5, newest.ok === true ? String(newest.targetSeq) : newest.reason);
   check('and covers everything after it', newest.ok === true && JSON.stringify(newest.shadowed) === JSON.stringify([5]), newest.ok === true ? JSON.stringify(newest.shadowed) : newest.reason);
   const oldest = planRewind(nodes, (seq) => events[seq], { messageId: 'u1' });
-  check('the oldest target shadows the whole surface', oldest.ok === true && JSON.stringify(oldest.shadowed) === JSON.stringify([1, 2, 3, 4, 5]), JSON.stringify(oldest));
+  check(
+    'the first human message is refused (rewinding it would empty the conversation)',
+    oldest.ok === false && oldest.reason === FIRST_MESSAGE_REFUSAL,
+    oldest.ok === false ? oldest.reason : 'resolved',
+  );
   const middle = planRewind(nodes, (seq) => events[seq], { messageId: 'u2' });
   check('a middle target shadows itself and the tail', middle.ok === true && JSON.stringify(middle.shadowed) === JSON.stringify([3, 4, 5]), JSON.stringify(middle));
+}
+
+console.log('the first message refusal is about position, not token shape');
+{
+  const nodes = [0, 1, 3, 5];
+  const events = {
+    0: { type: 'system/message', data: { message: { content: [] } } },
+    1: { type: 'user/message', data: { source: { kind: 'user' }, id: 'u1' } },
+    3: { type: 'assistant/message', data: { message: { content: [] } } },
+    5: { type: 'user/message', data: { source: { kind: 'user' }, id: 'u2' } },
+  };
+  const first = planRewind(nodes, (seq) => events[seq], { messageId: 'u1' });
+  check('the first human message is refused', first.ok === false && first.reason === FIRST_MESSAGE_REFUSAL);
+  check('the refusal explains what to do instead', FIRST_MESSAGE_REFUSAL.includes('第一条消息') && FIRST_MESSAGE_REFUSAL.includes('新建'));
+  const second = planRewind(nodes, (seq) => events[seq], { messageId: 'u2' });
+  check('the second message is still rewindable', second.ok === true && JSON.stringify(second.shadowed) === JSON.stringify([5]), JSON.stringify(second));
 }
 
 console.log('injected user-role messages are never targets');
@@ -89,10 +110,16 @@ console.log('injected user-role messages are never targets');
 
 console.log('surface awareness (the whole point)');
 {
-  // A compaction removed 1..3 from the surface; only u4 is still rewindable.
+  // A compaction removed 1..3 from the surface; u4 is now the *first* visible
+  // human message, and rewinding it would empty the visible conversation.
   const events = { 1: user('u1'), 3: user('u2'), 5: user('u3'), 7: user('u4') };
   const nodes = [7];
-  check('a still-visible message resolves', planRewind(nodes, (seq) => events[seq], { messageId: 'u4' }).ok === true);
+  const visibleFirst = planRewind(nodes, (seq) => events[seq], { messageId: 'u4' });
+  check(
+    'the first visible message after a compaction is still refused',
+    visibleFirst.ok === false && visibleFirst.reason === FIRST_MESSAGE_REFUSAL,
+    visibleFirst.ok === false ? visibleFirst.reason : 'resolved',
+  );
   const gone = planRewind(nodes, (seq) => events[seq], { messageId: 'u2' });
   check('a compacted-away message is refused', gone.ok === false);
   check('and the refusal names it', gone.ok === false && gone.reason.includes('u2'), gone.ok === false ? gone.reason : '');
@@ -169,6 +196,17 @@ console.log('rewinding the whole conversation still reaches the client');
     /!sawHumanMessage && sawRewindMarker/.test(session)
       && /id: "paseo-rewind:empty"/.test(session)
       && /type: "notification"/.test(session),
+  );
+}
+
+console.log('the first-message refusal does not interrupt a running turn');
+{
+  const bridge = readFileSync(join(import.meta.dirname, '..', 'dsh-bridge/lib/server.js'), 'utf8');
+  const preliminary = bridge.indexOf('const preliminary = planRewind(');
+  const settle = bridge.indexOf('await this.settleAgentForRevert(agent)');
+  check(
+    'the bridge plans (and may refuse) before it settles the agent',
+    preliminary !== -1 && settle !== -1 && preliminary < settle,
   );
 }
 

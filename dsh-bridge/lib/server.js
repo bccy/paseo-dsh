@@ -1178,6 +1178,12 @@ export class PaseoHarnessServer {
     }
     this.revertInflight.add(sessionKey);
     try {
+      // Plan once before cancelling anything: a request that cannot be honoured
+      // (the first human message, a stale or injected row) must not interrupt a
+      // running turn. The range may move while the agent settles, so plan again
+      // after it is idle and use that.
+      const preliminary = planRewind(session.surface.nodes, (seq) => session.eventAt(seq), params.token);
+      if (!preliminary.ok) throw new Error(preliminary.reason);
       await this.settleAgentForRevert(agent);
       const resolved = planRewind(session.surface.nodes, (seq) => session.eventAt(seq), params.token);
       if (!resolved.ok) throw new Error(resolved.reason);
