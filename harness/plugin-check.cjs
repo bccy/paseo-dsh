@@ -539,6 +539,7 @@ function projectTimelineLikePaseo(items, turnId) {
   await conn.send({ type: "session.close", sessionId });
   await until((e) => e.type === "session.closed" && e.sessionId === sessionId, "session.closed");
   const replayMark = events.length;
+  const replayStartWallClock = Date.now();
   await conn.send({
     type: "session.open",
     requestId: "reopen",
@@ -552,6 +553,31 @@ function projectTimelineLikePaseo(items, turnId) {
     .slice(replayMark)
     .filter((e) => e.type === "timeline.item" && (e.item?.type === "user_message" || e.item?.type === "assistant_message"));
   check("reopen replays conversation history", replayed.length > 0, `${replayed.length} replayed item(s)`);
+
+  // Paseo stamps replayed rows with their arrival time when the provider omits
+  // `timestamp`, and the client derives each turn's "worked for" duration from
+  // its rows' timestamps (last item minus the turn's user message). Without the
+  // stored event times, every earlier turn's duration collapses to ~0 after a
+  // reload/rewind reopen. The reopen itself is the clock: replayed rows must
+  // carry timestamps from *before* it, and in the log's order.
+  const replayStartedAt = replayStartWallClock;
+  const replayedItems = events.slice(replayMark).filter((e) => e.type === "timeline.item");
+  const replayedTimes = replayedItems.map((e) => (typeof e.timestamp === "string" ? Date.parse(e.timestamp) : Number.NaN));
+  check(
+    "every replayed row carries a stored event time",
+    replayedItems.length > 0 && replayedTimes.every((time) => Number.isFinite(time)),
+    `${replayedTimes.filter((time) => Number.isFinite(time)).length}/${replayedItems.length} stamped`,
+  );
+  check(
+    "replayed event times predate the reopen (not the arrival clock)",
+    replayedTimes.every((time) => time < replayStartedAt - 500),
+    `replay at ${new Date(replayStartedAt).toISOString()}, newest row ${new Date(Math.max(...replayedTimes)).toISOString()}`,
+  );
+  check(
+    "replayed event times keep the log order",
+    replayedTimes.every((time, index) => index === 0 || time >= replayedTimes[index - 1]),
+    `${replayedItems.length} row(s)`,
+  );
 
   // 5b. A resumed session already carries DSH's stored context, so its
   // occupancy must appear without waiting for a new turn — otherwise the

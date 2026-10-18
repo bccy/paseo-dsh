@@ -137,6 +137,25 @@ console.log('replacement marker shape (durable v4 log constraints)');
   check('no system-message marker is left in the bridge', /createSystemMessage\(''\)/.test(bridge) === false);
 }
 
+console.log('replay timestamps (per-turn "worked for" durations survive a reopen)');
+{
+  const session = readFileSync(join(import.meta.dirname, '..', 'paseo-plugin/server/session.ts'), 'utf8');
+  check(
+    'a replayed row gets the stored DSH event time as its provider timestamp',
+    /function replayTimestamp\(event: \{ time\?: unknown \}\)/.test(session)
+      && /new Date\(event\.time\)\.toISOString\(\)/.test(session),
+  );
+  check(
+    'both replay paths pass it on every item (user row and builder rows)',
+    (session.match(/\.\.\.\(timestamp === undefined \? \{\} : \{ timestamp \}\)/g) ?? []).length >= 2
+      && (session.match(/\.\.\.\(itemTimestamp === undefined \? \{\} : \{ timestamp: itemTimestamp \}\)/g) ?? []).length >= 2,
+  );
+  check(
+    'the synthesized settling rows fall back to the last stored time',
+    (session.match(/lastTimestamp === undefined \? \{\} : \{ timestamp: lastTimestamp \}/g) ?? []).length >= 2,
+  );
+}
+
 console.log('receipt');
 {
   check('the receipt names the withdrawn seq', successText(42) === 'Withdrawn seq 42 and everything after it', successText(42));

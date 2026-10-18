@@ -36,6 +36,23 @@ import {
   type DshUsage,
 } from "./dsh-process";
 import { TimelineBuilder } from "./timeline";
+
+/**
+ * The durable event time as the provider timestamp for a replayed row.
+ *
+ * Paseo stamps each `timeline.item` with its own arrival time when the provider
+ * omits `timestamp` — correct while live, catastrophic for a replay: every
+ * historical row would be stamped at reopen time. The client derives each
+ * turn's "worked for" duration from its rows' timestamps (last item minus the
+ * turn's user message), so a reload/rewind reopen collapsed every earlier
+ * turn's displayed duration to 0. The stored DSH event time is the only source
+ * that survives.
+ */
+function replayTimestamp(event: { time?: unknown }): string | undefined {
+  return typeof event.time === "number" && Number.isFinite(event.time)
+    ? new Date(event.time).toISOString()
+    : undefined;
+}
 import { UI, commandCopy, skillDescription } from "./locale";
 
 /**
@@ -538,9 +555,12 @@ export class DshSession {
     }
     if (events.length === 0) return;
     const builder = new TimelineBuilder({ warn: (line) => this.#options.log(line) });
+    let lastTimestamp: string | undefined;
     for (const event of events) {
       const data = isRecord(event.data) ? event.data : {};
       const seq = typeof event.seq === "number" ? event.seq : this.#replaySeq++;
+      const timestamp = replayTimestamp(event);
+      if (timestamp !== undefined) lastTimestamp = timestamp;
       if (event.type === "user/message") {
         const source = isRecord(data.source) ? data.source : {};
         if (source.kind !== "user") continue;
@@ -549,6 +569,7 @@ export class DshSession {
         this.#options.emit({
           type: "timeline.item",
           sessionId: this.id,
+          ...(timestamp === undefined ? {} : { timestamp }),
           item: {
             type: "user_message",
             id: `user:history:${seq}`,
@@ -562,8 +583,14 @@ export class DshSession {
         });
         continue;
       }
+      const itemTimestamp = timestamp ?? lastTimestamp;
       for (const item of builder.consume({ type: event.type, seq, data })) {
-        this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
+        this.#options.emit({
+          type: "timeline.item",
+          sessionId: this.id,
+          ...(itemTimestamp === undefined ? {} : { timestamp: itemTimestamp }),
+          item,
+        });
       }
     }
     // A tool whose `tool/result` never arrived needs the same treatment for the
@@ -574,7 +601,12 @@ export class DshSession {
     // for the rest of the session and again on every reopen. Idempotent — a log
     // that did reach its `turn/end` has nothing left running.
     for (const item of builder.settleRunningTools()) {
-      this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
+      this.#options.emit({
+        type: "timeline.item",
+        sessionId: this.id,
+        ...(lastTimestamp === undefined ? {} : { timestamp: lastTimestamp }),
+        item,
+      });
     }
     // A compaction the killed process never closed would otherwise pulse
     // forever: the replay just emitted its `loading` marker and no completion
@@ -584,7 +616,12 @@ export class DshSession {
     // bracket the log never finished. The settle reports that it invented the
     // close.
     for (const item of builder.settleLoadingCompactions()) {
-      this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
+      this.#options.emit({
+        type: "timeline.item",
+        sessionId: this.id,
+        ...(lastTimestamp === undefined ? {} : { timestamp: lastTimestamp }),
+        item,
+      });
     }
   }
 
@@ -1758,10 +1795,13 @@ export class DshChildSession {
     let lastTurnEnd: "completed" | "canceled" | "failed" | undefined;
     let turnOpen = false;
     let sawTurn = false;
+    let lastTimestamp: string | undefined;
     for (const event of events) {
       const seq = typeof event.seq === "number" ? event.seq : fallbackSeq++;
       if (seq < inheritedEventCount) continue;
       const data = isRecord(event.data) ? event.data : {};
+      const timestamp = replayTimestamp(event);
+      if (timestamp !== undefined) lastTimestamp = timestamp;
       if (event.type === "turn/start") {
         turnOpen = true;
         sawTurn = true;
@@ -1778,6 +1818,7 @@ export class DshChildSession {
         this.#options.emit({
           type: "timeline.item",
           sessionId: this.id,
+          ...(timestamp === undefined ? {} : { timestamp }),
           item: {
             type: "user_message",
             id: `user:history:${seq}`,
@@ -1791,8 +1832,14 @@ export class DshChildSession {
         });
         continue;
       }
+      const itemTimestamp = timestamp ?? lastTimestamp;
       for (const item of this.#timeline.consume({ type: event.type, seq, data })) {
-        this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
+        this.#options.emit({
+          type: "timeline.item",
+          sessionId: this.id,
+          ...(itemTimestamp === undefined ? {} : { timestamp: itemTimestamp }),
+          item,
+        });
       }
     }
     // The stored log's own terminal: only the terminal is emitted, so a failed

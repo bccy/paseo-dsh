@@ -150,6 +150,20 @@ const rootEvents = () => [
 ];
 
 /**
+ * Stored event times for replayed logs.
+ *
+ * The plugin must carry each stored event's `time` into its `timeline.item`
+ * events as `timestamp`: Paseo stamps items with their arrival time when the
+ * provider omits it, so without this every replayed row is stamped at reopen
+ * time and each previous turn's "worked for" duration collapses to zero. The
+ * fixed base + 1s spacing makes the expectation exact.
+ */
+const HISTORY_BASE_TIME = Date.UTC(2026, 0, 2, 3, 4, 5);
+const withHistoryTimes = (events) => events.map((event, index) => (
+  typeof event.time === "number" ? event : { ...event, time: HISTORY_BASE_TIME + index * 1000 }
+));
+
+/**
  * The `image` scenario: a `read_image` tool result carrying an image content
  * block, in the shape DSH writes one — a rendered text block plus
  * `{type:"image", attachment:{…}}`.
@@ -556,12 +570,12 @@ async function handle(method, params, id) {
         return {
           available: true,
           inheritedEventCount: 0,
-          events: [
+          events: withHistoryTimes([
             { type: "user/message", seq: 1, data: { source: { kind: "user" }, content: [{ type: "text", text: "run something long" }] } },
             { type: "turn/start", seq: 2, data: { turn: 1 } },
             { type: "step/start", seq: 3, data: { turn: 1, step: 1 } },
             { type: "tool/call", seq: 4, data: { turn: 1, step: 1, callId: "killed-1", name: "bash", arguments: { command: "sleep 999" } } },
-          ],
+          ]),
         };
       }
       if (sid === "child-A") {
@@ -569,30 +583,30 @@ async function handle(method, params, id) {
         return {
           available: true,
           inheritedEventCount: 2,
-          events: [
+          events: withHistoryTimes([
             { type: "user/message", seq: 0, data: { source: { kind: "user" }, content: [{ type: "text", text: "INHERITED-PARENT-TEXT" }] } },
             { type: "assistant/message", seq: 1, data: { turn: 0, step: 0, message: { id: "inh", content: [{ type: "text", text: "INHERITED-PARENT-REPLY" }] } } },
             ...childAEvents(),
-          ],
+          ]),
         };
       }
       if (sid === "child-B") {
         return {
           available: true,
           inheritedEventCount: 0,
-          events: [
+          events: withHistoryTimes([
             { type: "subagent/descriptor", seq: 0, data: { label: "Nested B" } },
             ...childBEvents(),
-          ],
+          ]),
         };
       }
       // Both end inside an open turn; only child-M has live evidence.
-      if (sid === "child-M") return { available: true, inheritedEventCount: 0, events: liveChildEvents() };
-      if (sid === "child-K") return { available: true, inheritedEventCount: 0, events: killedChildEvents() };
+      if (sid === "child-M") return { available: true, inheritedEventCount: 0, events: withHistoryTimes(liveChildEvents()) };
+      if (sid === "child-K") return { available: true, inheritedEventCount: 0, events: withHistoryTimes(killedChildEvents()) };
       // The image scenario replays the same log, so a reopen proves the picture
       // row is rebuilt from history and not only from the live turn.
-      if (MODE === "image") return { available: true, inheritedEventCount: 0, events: imageRootEvents() };
-      return { available: true, inheritedEventCount: 0, events: rootEvents() };
+      if (MODE === "image") return { available: true, inheritedEventCount: 0, events: withHistoryTimes(imageRootEvents()) };
+      return { available: true, inheritedEventCount: 0, events: withHistoryTimes(rootEvents()) };
     }
     case "session/prompt":
       if (MODE === "live" && !emitted) {
