@@ -41,7 +41,7 @@ What you get that the ACP boundary can't carry:
 - Session **reopen and import**: a reopened session replays its conversation
   history, and native DSH sessions can be imported from Paseo
 
-Full documentation, the adoption guide, and 19 real defects with their fixes
+Full documentation, the adoption guide, and 20 real defects with their fixes
 live in the main repository: **https://github.com/liuxing7954/paseo-dsh**
 
 Requires Paseo ≥ 0.9.2 and the official `dsh` on the daemon's `PATH`.
@@ -95,7 +95,7 @@ ACP 承载不了、而这里都有：
   建会话时选、首个回合后锁定
 - **会话恢复与导入**：重开会话会回放历史；并可从 Paseo 导入 DSH 原生会话
 
-完整文档、改造指南、以及 19 个真实缺陷的修复记录都在主仓库：
+完整文档、改造指南、以及 20 个真实缺陷的修复记录都在主仓库：
 **https://github.com/liuxing7954/paseo-dsh**
 
 需要 Paseo ≥ 0.9.2，且 daemon 的 `PATH` 上有官方 `dsh`。

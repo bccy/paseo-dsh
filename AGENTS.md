@@ -40,8 +40,8 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon 进程里）
 
 ### 改之前先读
 
-- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 四十余条真实缺陷（编号到 45，含 4 条
-  `b`/`c` 补记）。里面有整整一类错误叫
+- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 六十余条真实缺陷（编号到 58，含 `b`/`c`
+  补记与 DSH 0.2.1 升版教训）。里面有整整一类错误叫
   **静默降级**（把不知道的东西当成成功、把不支持的能力悄悄丢掉）。改动前先看一遍，
   避免重新发明这些 bug。
 - [docs/ADOPTION.md](./docs/ADOPTION.md) 第 4 节 — 教训按主题归纳。
@@ -185,3 +185,21 @@ node harness/parked-sessions-check.cjs paseo-plugin/.dbg
 - 跑一遍 `node --check` / `tsc --noEmit`
 - 确认没有引入任何具体的 provider 名、模型 id、base URL、密钥
 - 用户本机路径（`/Users/...`）不要出现在任何文件里
+
+## 三、发布流程（硬性）
+
+**产物推送必须等用户本机测试通过并明确确认。** 本地改完可以先 commit / push 代码到仓库，
+但 `npm publish`、`npm deprecate`、目录收录（paseo.cafe 等）、打 tag、发 Release 一律
+等用户说"测试通过"之后再动。
+
+顺序固定为：
+
+1. 用户提需求
+2. 本地改动 + 自测（见上面的验证命令）
+3. 交回用户，在真实环境里测试
+4. 用户明确确认
+5. 才推产物到各平台
+
+违反这条的代价很具体：0.2.8 修了 `{{cwd}}` 却漏了 DSH 0.2.1 的 catalog 异步物化，用户装到
+一个"能装、模型列表却是空"的版本，比不发布更糟。已误发的坏版本用
+`npm deprecate paseo-dsh@<ver> "..."` 兜底（registry 必须显式指向 npmjs，默认镜像发不了）。

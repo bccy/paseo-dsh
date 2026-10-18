@@ -250,6 +250,8 @@ store），只有最上层把它们映射成空字符串并传了 `undefined`—
 > **能力位没声明 + 一个 inject 违规**。两个都不会在正常使用中报错，只有"重载一个活着的
 > 会话"这条路径才会把两者同时暴露出来——所以**重载测试要单独做**，别指望日常冒烟能覆盖。
 
+
+
 ---
 
 ## 第六轮：上下文占用读数
@@ -1671,6 +1673,33 @@ reload 竞争（被 cancel、丢失或追加到冻结区间之后）。provider 
 - **用户可见错误**：撤回令牌无效/消息不在可见面/范围不支持/撤回进行中改中文提示。
 - **死代码/注释**：删未用导入、`pendingSkips`、`str_replace_editor`、`DshRevertResult` 的
   error 分支；修正孤儿 JSDoc、"500ms"、`dsh-rewind`、emit 等过时注释。
+
+---
+
+### 58. 升到 DSH 0.2.1-rc 后每个回合都失败
+
+**症状**：升级 DSH（`0.2.0-rc.2` → `0.2.1-rc.2`）后，所有回合直接失败；时间线上只有一条
+空的 `[error]`，用量/重放都跟着空。界面看不出原因。
+
+**根因**：`0.2.1` 收紧了 system-prompt 的模板变量——**只注册 `provider` 和 `model`**，
+`{{cwd}}` 不再存在。而 bridge 的 `system-prompt.personaSuffix` 和 `preset-standard` 的人设里
+都写了 `Your working directory is {{cwd}}.`，于是每个回合在提示词装配阶段就抛：
+```
+unknown prompt variable "{{cwd}}" in section "deployment:persona-suffix"; registered variables: provider, model
+```
+
+**修法**：删掉人设里的 `{{cwd}}`（`dsh-bridge/cordis.patch.yml` 与 profile 的 `preset-standard`）。
+模型的工作目录由运行时上下文/工具侧提供，不靠这个变量。删掉后对 `0.2.0` 也无害（只是少一句
+cwd 提示）。
+
+**同一版本还有第二个坑**：`0.2.1` 的模型目录是**异步物化**的。Paseo 的 catalog 探测**故意不
+`initialize`**（避免钉住路由），于是启动瞬间读到的 `models` 恒为 0 —— 表现是 **provider 可用、
+但模型选择器里一个模型都没有**。修法：catalog 里先用 profile 默认路由做一次
+`resolveCallConfig` warm-up，再对空结果做**有界重试**（~3s），等适配器注册完。
+
+> **教训**：**升级上游运行时属于"重载之外的第二条隐藏路径"**。它不会改你的代码，却会因为
+> 提示词变量、插件 schema、服务名、异步就绪时机这类"软契约"让功能静默失效。升版后必须重跑
+> `plugin-check`，而不是只看 `doctor`（`doctor` 只查安装完整性，查不出回合层失败和空目录）。
 
 ---
 ## 已知限制（未修，有意为之）
