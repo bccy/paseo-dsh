@@ -95,7 +95,11 @@ console.log('the first message refusal is about position, not token shape');
   };
   const first = planRewind(nodes, (seq) => events[seq], { messageId: 'u1' });
   check('the first human message is refused', first.ok === false && first.reason === FIRST_MESSAGE_REFUSAL);
-  check('the refusal explains what to do instead', FIRST_MESSAGE_REFUSAL.includes('第一条消息') && FIRST_MESSAGE_REFUSAL.includes('新建'));
+  check(
+    'the refusal is the short toast text',
+    FIRST_MESSAGE_REFUSAL === '首条消息禁止撤回',
+    FIRST_MESSAGE_REFUSAL,
+  );
   const second = planRewind(nodes, (seq) => events[seq], { messageId: 'u2' });
   check('the second message is still rewindable', second.ok === true && JSON.stringify(second.shadowed) === JSON.stringify([5]), JSON.stringify(second));
 }
@@ -180,22 +184,6 @@ console.log('replay timestamps (per-turn "worked for" durations survive a reopen
   check(
     'the synthesized settling rows fall back to the last stored time',
     (session.match(/lastTimestamp === undefined \? \{\} : \{ timestamp: lastTimestamp \}/g) ?? []).length >= 2,
-  );
-}
-
-console.log('rewinding the whole conversation still reaches the client');
-{
-  const session = readFileSync(join(import.meta.dirname, '..', 'paseo-plugin/server/session.ts'), 'utf8');
-  check(
-    'the replay recognizes this bridge\'s rewind markers by their durable source kind',
-    /const REWIND_MARKER_SOURCE_KIND = "paseo-rewind";/.test(session)
-      && /source\.kind === REWIND_MARKER_SOURCE_KIND/.test(session),
-  );
-  check(
-    'an emptied conversation emits one first-epoch notice (so Paseo resets the stale timeline)',
-    /!sawHumanMessage && sawRewindMarker/.test(session)
-      && /id: "paseo-rewind:empty"/.test(session)
-      && /type: "notification"/.test(session),
   );
 }
 

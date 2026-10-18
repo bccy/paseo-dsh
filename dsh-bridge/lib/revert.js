@@ -28,14 +28,14 @@
 const USER_MESSAGE = 'user/message';
 
 /**
- * Why the first human message is not rewindable, as user-facing text.
+ * Why the first visible human message is not rewindable.
  *
- * Withdrawing it would empty the conversation; Paseo rebuilds an emptied
- * timeline unreliably in a live client (stale rows stay until a reopen), so the
- * product rule is: start a new session instead of rewinding the first message.
+ * Withdrawing it would empty the conversation, and Paseo's live client does not
+ * reliably apply an emptied rebuild (stale rows stay until a reopen). The
+ * product rule is therefore a flat refusal; the message stays short because it
+ * is shown as a toast.
  */
-export const FIRST_MESSAGE_REFUSAL =
-  '当前对话的第一条消息不支持撤回：撤掉它等于清空整个对话。请新建一个会话重新开始，或从第二条消息开始撤回。';
+export const FIRST_MESSAGE_REFUSAL = '首条消息禁止撤回';
 
 /**
  * The DSH message id a token carries.

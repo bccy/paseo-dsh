@@ -1601,32 +1601,25 @@ Paseo 的按钮是**按 agent 能力位**显示的，不按行过滤：两次发
 是启动完成后才写的，重放没有提交时刻可用。这是数据缺口，不是算法 bug；Paseo 没把提交时间
 传给 provider，无法可靠还原。
 
-### 53. 撤回整段对话后客户端残留旧行 → 再点报 "No provider revert token"
-
-**症状**：把会话撤到空后再点界面上的旧消息，报 `No provider revert token for message …`。
-看起来像"第一条消息不能撤"，实际第一条撤回是成功的。
-
-**根因**：重建后的时间线为空 → 插件重放不产生任何事件。Paseo 客户端只在收到「新 epoch +
-seq 1」的时间线行时才重置 live 时间线（bundle 里 `drop_epoch && seq===1 → resetLiveTimeline`），
-没有事件就保留旧行。
-
-**修法**：重放识别本桥的 `paseo-rewind` 标记；若整段对话被撤空，发一条 info 通知
-「会话已回退到起点」作为新 epoch 第一行。真机探针 `harness/`/`~/.dsh/empty-rewind-probe.mjs`
-断言：重建后恰好一条通知、`seqStart=1`、无旧 user/assistant 行。
-
----
-### 54. 「撤到空」在 live 客户端刷不干净 → 第一条消息直接拒绝撤回
+### 53. 「撤到空」在 live 客户端刷不干净 → 第一条消息直接拒绝撤回
 
 **症状**：把会话撤到只剩系统提示后，App 仍显示旧消息；再点旧消息报
-`No provider revert token for message user:history:N`；重启 App 才看到「会话已回退到起点」。
+`No provider revert token for message user:history:N`，重启 App 才看到刷新后的状态。
 
-**根因**：空重建的新 epoch 里没有可应用的行（或只有一条通知），而 Paseo 客户端只在
-「epoch 不匹配 + seq 1」时重置 live 时间线；撤回成功后客户端紧跟着的 refetch 又与 reload
-竞争，事件可能在基线未就绪时被丢弃。通知行只能覆盖"刷新成功"的情况，无法保证 live 一定应用。
+**根因**：空重建的新 epoch 里没有事件（或只有一条通知），而 Paseo 客户端只在收到
+「epoch 不匹配 + seq 1」的时间线行时才重置 live 时间线（bundle 里
+`drop_epoch && seq===1 → resetLiveTimeline`）；撤回成功后客户端紧跟着的 refetch 又与
+reload 竞争，事件可能在基线未就绪时被丢弃。
 
-**决策**：撤回**当前可见对话的第一条消息**在桥侧直接拒绝（不写日志、不打断回合、不触发
-刷新），并给出可读原因。Paseo 的撤回菜单按 provider 能力位渲染、不能按行隐藏（token 缺失
-只在点击时报错），所以只能做成"点击被明确拒绝"，按行隐藏需要上游契约。
+**走过的弯路**：先尝试在空重放时发一条 info 通知「会话已回退到起点」作为新 epoch 第一行。
+daemon 层探针 PASS，但真机 App 仍可能因上述竞态不应用，且它只是把"刷新失败"包装成
+"有提示"，不解决不确定的 live 刷新。
+
+**最终决策**：撤回**当前可见对话的第一条消息**（含 compaction 后成为第一条的情况）在桥侧
+直接拒绝，返回短提示「首条消息禁止撤回」——不写日志、不打断运行中回合、不触发 reload。
+第一条之后的撤回完全不变。通知行补丁随之移除（空重建不再可达；历史遗留空会话重开就是
+空对话）。Paseo 的撤回菜单按 provider 能力位渲染、不能按行隐藏（token 缺失只在点击时报错），
+所以体验是"能点、点了被明确拒绝"；按行隐藏需要上游契约。
 
 ---
 ## 已知限制（未修，有意为之）
