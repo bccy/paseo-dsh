@@ -1587,6 +1587,34 @@ Paseo 的按钮是**按 agent 能力位**显示的，不按行过滤：两次发
 
 ---
 
+### 52. 时间线重建后「工作时长」归零 / 少一段：重放必须带原始时间
+
+**症状**：撤回触发 reload 重建时间线后，之前所有消息的「Worked for」都变成 0；修好时间戳后，
+首轮又从 5s 变成 2s。
+
+**根因**：Paseo 客户端用 `deriveStreamTurnTiming` 按时间线行的时间戳算时长（回合最后一行 −
+用户消息行）。provider 的 `timeline.item` 不带 `timestamp` 时，daemon 按**事件到达时间**盖章：
+重建时所有历史行都盖成同一时刻 → 全部 0 秒。修法是重放时把 DSH 存储事件的 `time` 转成 ISO
+返回（主/子会话、user/builder/settle 行全覆盖）。
+
+首轮少 3 秒是另一层：live 的首次提交时刻早于 DSH 进程启动，而 DSH 日志里的 `user/message`
+是启动完成后才写的，重放没有提交时刻可用。这是数据缺口，不是算法 bug；Paseo 没把提交时间
+传给 provider，无法可靠还原。
+
+### 53. 撤回整段对话后客户端残留旧行 → 再点报 "No provider revert token"
+
+**症状**：把会话撤到空后再点界面上的旧消息，报 `No provider revert token for message …`。
+看起来像"第一条消息不能撤"，实际第一条撤回是成功的。
+
+**根因**：重建后的时间线为空 → 插件重放不产生任何事件。Paseo 客户端只在收到「新 epoch +
+seq 1」的时间线行时才重置 live 时间线（bundle 里 `drop_epoch && seq===1 → resetLiveTimeline`），
+没有事件就保留旧行。
+
+**修法**：重放识别本桥的 `paseo-rewind` 标记；若整段对话被撤空，发一条 info 通知
+「会话已回退到起点」作为新 epoch 第一行。真机探针 `harness/`/`~/.dsh/empty-rewind-probe.mjs`
+断言：重建后恰好一条通知、`seqStart=1`、无旧 user/assistant 行。
+
+---
 ## 已知限制（未修，有意为之）
 
 | 项 | 说明 |
