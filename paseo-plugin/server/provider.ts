@@ -23,7 +23,7 @@ import {
   type ProviderRegistration,
   type ProviderThinkingOption,
 } from "@getpaseo/plugin/server/provider";
-import { DshProcess, type DshCatalog } from "./dsh-process";
+import { DshProcess, type DshCatalog, type DshRevertResult } from "./dsh-process";
 import { DshChildSession, DshSession, modes, parseRoute } from "./session";
 import { ParkedSessions } from "./parked-sessions";
 import { effortLabel } from "./locale";
@@ -80,6 +80,16 @@ const CAPABILITIES = [
 
 /** Provider id registered with Paseo; distinct from the ACP `deepseek-harness` entry. */
 export const PROVIDER_ID = "deepseek-harness-native";
+
+/** A notice kept until the provider session it belongs to is reopened. */
+interface DeferredNotice {
+  severity: "info" | "warning" | "error";
+  title: string;
+  description?: string;
+}
+
+/** Cap on queued notices per DSH session, so a failing refresh cannot grow forever. */
+const MAX_DEFERRED_NOTICES = 20;
 
 /**
  * Last-resort route. The DSH profile's `agent-default-model` is the real source
@@ -263,6 +273,17 @@ class DshConnection implements ProviderConnection {
    * the post-rewind refresh needs the *agent* id, which no plugin API maps.
    */
   readonly #agentIds = new Map<string, string>();
+  /**
+   * provider session id -> DSH native session id. Kept across `session.close`
+   * on purpose: the rewind reload closes this provider session and reopens a
+   * new one for the same DSH session, and notices produced in that window must
+   * find their way to the reopened timeline.
+   */
+  readonly #dshIds = new Map<string, string>();
+  /** Notices waiting for their DSH session to be reopened, keyed by DSH session id. */
+  readonly #deferredNotices = new Map<string, DeferredNotice[]>();
+  /** Provider sessions whose rewind is in flight: prompts are refused until the reload. */
+  readonly #reverting = new Set<string>();
   #display: DisplayCatalog | undefined;
   #paseoBinary: string | undefined;
   #closed = false;
@@ -306,6 +327,10 @@ class DshConnection implements ProviderConnection {
     this.#closed = true;
     const sessions = [...this.#sessions.values()];
     this.#sessions.clear();
+    this.#agentIds.clear();
+    this.#dshIds.clear();
+    this.#deferredNotices.clear();
+    this.#reverting.clear();
     // Provider teardown is not a reload: shut the sessions down and kill the
     // parked children instead of keeping them alive for a reopen that will not
     // happen on this connection.
@@ -332,8 +357,23 @@ class DshConnection implements ProviderConnection {
         this.#emit({ type: "request.completed", requestId: input.requestId });
         return;
       }
-      case "session.prompt":
+      case "session.prompt": {
+        // The rewind's automatic reload runs after `session.revert` answered and
+        // closes this provider session. A prompt accepted in that window races
+        // the close: it can be cancelled by the reload, interleave with the
+        // surface replacement, or append after the frozen replacement range.
+        // Refuse it with a readable reason instead of losing it silently.
+        if (this.#reverting.has(input.sessionId)) {
+          this.#emit({
+            type: "session.prompt_result",
+            sessionId: input.sessionId,
+            clientMessageId: input.prompt.clientMessageId,
+            result: { type: "failed", error: { message: "正在回退，请稍候" } },
+          });
+          return;
+        }
         return this.#require(input.sessionId).prompt(input.prompt);
+      }
       case "session.permission":
         this.#require(input.sessionId).resolvePermission(input.permissionId, input.response);
         return;
@@ -346,13 +386,25 @@ class DshConnection implements ProviderConnection {
       }
       case "session.revert": {
         const session = this.#require(input.sessionId);
-        const result = await session.revert(input.token, input.scope);
+        // From here until `session.close` the timeline is being rebuilt: prompts
+        // are refused (see the `session.prompt` gate) so none is lost or left
+        // outside the replacement range. A refused rewind must release the flag
+        // immediately — nothing changes in that case.
+        this.#reverting.add(input.sessionId);
+        let result: DshRevertResult | undefined;
+        try {
+          // Child sessions throw before returning; the root session returns the bridge receipt.
+          result = (await session.revert(input.token, input.scope)) as DshRevertResult | undefined;
+        } catch (error) {
+          this.#reverting.delete(input.sessionId);
+          throw error;
+        }
         // Answer first, refresh second, and never await the refresh: the daemon's
         // rewind holds a pending run until this request resolves, while the
         // refresh it would trigger closes this very provider session
         // (`reloadAgentSession` cancels in-flight runs) — awaiting it here
-        // deadlocks the two. The 500 ms timer in `#refreshAgent` keeps the reply
-        // ahead of the restart.
+        // deadlocks the two. The 50 ms timer plus the CLI's own boot time keeps
+        // the reply ahead of the restart.
         this.#emit({ type: "request.completed", requestId: input.requestId });
         // The daemon only rebuilds the timeline after the reload below, and the
         // click itself gives no feedback while that takes a second or so. A
@@ -364,14 +416,15 @@ class DshConnection implements ProviderConnection {
         this.#notice(input.sessionId, "info", "正在回退，请稍候");
         const failedFiles = result?.files?.failed ?? [];
         if (failedFiles.length > 0) {
-          // The conversation rewind succeeded; only some files did not. Say so
-          // instead of leaving the user to discover it.
-          this.#notice(
-            input.sessionId,
-            "error",
-            "文件回退未完成",
-            `${failedFiles.map((entry) => entry.path).join("、")} 恢复失败；恢复前的原内容已备份到 ${result?.files?.rescueDir ?? "(未知目录)"}。`,
-          );
+          // The conversation rewind succeeded; only some files did not. Defer
+          // the notice until the reload opens the new session: emitted now, the
+          // epoch rebuild would discard it and the user would never learn the
+          // file side failed.
+          this.#deferNotice(input.sessionId, {
+            severity: "error",
+            title: "文件回退未完成",
+            description: `${failedFiles.map((entry) => entry.path).join("、")} 恢复失败；恢复前的原内容已备份到 ${result?.files?.rescueDir ?? "(未知目录)"}。`,
+          });
         }
         // Replaying `PluginProviderSession.streamHistory` cannot drop rows (the
         // buffer only grows and the plugin contract has no removal event), so the
@@ -390,6 +443,7 @@ class DshConnection implements ProviderConnection {
       }
       case "session.close": {
         const session = this.#sessions.get(input.sessionId);
+        this.#reverting.delete(input.sessionId);
         this.#sessions.delete(input.sessionId);
         this.#agentIds.delete(input.sessionId);
         // Park an idle child: the daemon closes this session right before a
@@ -453,7 +507,11 @@ class DshConnection implements ProviderConnection {
    *
    * Notices are the only channel a provider has for telling the user about a
    * partial outcome (e.g. the conversation was rewound but one file restore
-   * failed). They are dropped when the session is already gone.
+   * failed). A notice for a provider session that has already been closed is
+   * **deferred** to the next session opened for the same DSH session, because
+   * the rewind reload closes this provider session and the old timeline epoch
+   * (including any notice in it) is discarded when it comes back. Dropping it
+   * silently is what made a failed file restore invisible.
    *
    * @param sessionId - provider session the notice belongs to.
    * @param severity - provider notice severity.
@@ -461,17 +519,80 @@ class DshConnection implements ProviderConnection {
    * @param description - optional detail.
    */
   #notice(sessionId: string, severity: "info" | "warning" | "error", title: string, description?: string): void {
-    if (!this.#sessions.has(sessionId)) return;
-    this.#emit({
-      type: "session.notice",
-      sessionId,
-      notice: {
-        id: `rewind-${String(Date.now())}-${String(Math.trunc(Math.random() * 1e6))}`,
-        severity,
-        title,
-        ...(description === undefined ? {} : { description }),
-      },
-    });
+    if (this.#sessions.has(sessionId)) {
+      this.#emit({
+        type: "session.notice",
+        sessionId,
+        notice: {
+          id: `rewind-${String(Date.now())}-${String(Math.trunc(Math.random() * 1e6))}`,
+          severity,
+          title,
+          ...(description === undefined ? {} : { description }),
+        },
+      });
+      return;
+    }
+    this.#deferNotice(sessionId, { severity, title, ...(description === undefined ? {} : { description }) });
+  }
+
+  /**
+   * Queue a notice for the next session opened on the same DSH session.
+   *
+   * Used by the rewind path for outcomes that only become true after the
+   * reload: a file restore failure, or a refresh failure. Queueing (rather than
+   * emitting into the current epoch) is required because `reloadAgentSession`
+   * discards the committed timeline and rebuilds it from the reopened
+   * provider session's replay — anything emitted before that is gone.
+   *
+   * @param sessionId - provider session id the caller knows (may already be closed).
+   * @param notice - notice payload.
+   */
+  #deferNotice(sessionId: string, notice: DeferredNotice): void {
+    const dshSessionId = this.#dshIds.get(sessionId);
+    if (dshSessionId === undefined) {
+      process.stderr.write(
+        `[${PROVIDER_ID}] dropping notice "${notice.title}": no DSH session is known for ${sessionId}\n`,
+      );
+      return;
+    }
+    const queue = this.#deferredNotices.get(dshSessionId) ?? [];
+    queue.push(notice);
+    if (queue.length > MAX_DEFERRED_NOTICES) {
+      const dropped = queue.splice(0, queue.length - MAX_DEFERRED_NOTICES);
+      process.stderr.write(
+        `[${PROVIDER_ID}] dropping ${String(dropped.length)} old deferred notice(s) for ${dshSessionId}\n`,
+      );
+    }
+    this.#deferredNotices.set(dshSessionId, queue);
+    process.stderr.write(
+      `[${PROVIDER_ID}] deferred notice "${notice.title}" until session ${dshSessionId} reopens\n`,
+    );
+  }
+
+  /**
+   * Deliver notices queued while the provider session was closed.
+   *
+   * Called from `#open` after `session.ready` — before the daemon builds the new
+   * timeline from this session's replayed history — so the notice becomes a row
+   * of the rebuilt epoch and survives on screen.
+   *
+   * @param sessionId - provider session that just opened.
+   * @param dshSessionId - its DSH session id (the reload key).
+   */
+  #flushDeferredNotices(sessionId: string, dshSessionId: string): void {
+    const queue = this.#deferredNotices.get(dshSessionId);
+    if (queue === undefined || queue.length === 0) return;
+    this.#deferredNotices.delete(dshSessionId);
+    for (const notice of queue) {
+      this.#emit({
+        type: "session.notice",
+        sessionId,
+        notice: {
+          id: `rewind-${String(Date.now())}-${String(Math.trunc(Math.random() * 1e6))}`,
+          ...notice,
+        },
+      });
+    }
   }
 
   /**
@@ -532,6 +653,7 @@ class DshConnection implements ProviderConnection {
         process.stderr.write(
           `[${PROVIDER_ID}] agent reload skipped: no agent record carries session ${sessionId}\n`,
         );
+        this.#reverting.delete(sessionId);
         this.#notice(sessionId, "warning", "时间线未自动刷新", "撤回已完成，但未找到该会话对应的 agent；请手动执行 Reload agent。");
         return;
       }
@@ -546,6 +668,9 @@ class DshConnection implements ProviderConnection {
         // to the conversation (that cost a whole debug round).
         child.on("error", (error) => {
           process.stderr.write(`[${PROVIDER_ID}] agent reload spawn failed (${binary}): ${messageOf(error)}\n`);
+          // No reload will close the session: the conversation is usable again,
+          // so stop refusing prompts and report through whatever channel exists.
+          this.#reverting.delete(sessionId);
           this.#notice(sessionId, "warning", "时间线未自动刷新", "自动 Reload agent 启动失败；撤回已完成，请手动执行 Reload agent。");
         });
         let stderrText = "";
@@ -559,14 +684,29 @@ class DshConnection implements ProviderConnection {
             `[${PROVIDER_ID}] agent reload ${agentId} exited ${String(code)}${trimmed === "" ? "" : `: ${trimmed.slice(0, 400)}`}\n`,
           );
           if (code !== 0) {
+            this.#reverting.delete(sessionId);
+            // If the old session is already closed this is queued and delivered
+            // by the next session opened for the same DSH session.
             this.#notice(sessionId, "warning", "时间线未自动刷新", "自动 Reload agent 未成功；撤回已完成，请手动执行 Reload agent。");
           }
         });
         child.unref();
       } catch (error) {
         process.stderr.write(`[${PROVIDER_ID}] refreshing the agent after a rewind: ${messageOf(error)}\n`);
+        this.#reverting.delete(sessionId);
         this.#notice(sessionId, "warning", "时间线未自动刷新", "自动 Reload agent 失败；撤回已完成，请手动执行 Reload agent。");
       }
+      // Safety net: a reload that never reaches `session.close` must not leave
+      // the session permanently prompt-blocked. The normal close clears the flag
+      // far earlier; this only fires when the refresh path died silently.
+      const safety = setTimeout(() => {
+        if (this.#reverting.delete(sessionId)) {
+          process.stderr.write(
+            `[${PROVIDER_ID}] rewind reload did not close session ${sessionId} in 15s; prompts allowed again\n`,
+          );
+        }
+      }, 15_000);
+      safety.unref();
     }, 50);
     timer.unref();
   }
@@ -581,6 +721,10 @@ class DshConnection implements ProviderConnection {
     const nativeId = input.persistence?.data;
     const dshSessionId =
       isRecord(nativeId) && typeof nativeId["sessionId"] === "string" ? nativeId["sessionId"] : sessionId;
+    // Remember the reload key for this provider session: notices produced by the
+    // rewind path after this session closes are queued under the DSH id and
+    // delivered when the reload opens the next provider session for it.
+    this.#dshIds.set(sessionId, dshSessionId);
 
     // The daemon injects the Paseo agent id into the provider session env; the
     // post-rewind refresh needs it because `paseo agent reload` takes the agent
@@ -720,6 +864,12 @@ class DshConnection implements ProviderConnection {
     });
     this.#emit({ type: "session.config", sessionId, config: session.configState() });
     this.#emit({ type: "session.ready", requestId: input.requestId, sessionId });
+    // Deliver what the previous session could not: a deferred file-restore
+    // failure, or "the timeline was not refreshed". Emitted here — after the
+    // session is usable and while the daemon is still collecting this session's
+    // history — the notice is part of the rebuilt timeline instead of a row of
+    // the old epoch that the reload discards.
+    this.#flushDeferredNotices(sessionId, dshSessionId);
     // The root is open: release any child the bridge reported during the open,
     // so a child is never emitted before its parent.
     session.markRootReady();

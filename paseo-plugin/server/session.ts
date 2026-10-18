@@ -550,7 +550,20 @@ export class DshSession {
     // made "the replay timed out" look exactly like "there was nothing to
     // replay": the user saw a blank conversation and no reason for it.
     if (!available) {
-      this.#options.log(`paseo-dsh: session history could not be read: ${error ?? "unknown error"}`);
+      const reason = error ?? "unknown error";
+      this.#options.log(`paseo-dsh: session history could not be read: ${reason}`);
+      // An empty replay would look exactly like an empty conversation. Surface
+      // the failure in the timeline of the session that just opened.
+      this.#options.emit({
+        type: "session.notice",
+        sessionId: this.id,
+        notice: {
+          id: `history-${String(Date.now())}`,
+          severity: "warning",
+          title: "会话历史读取失败",
+          description: `重放历史时读不到会话日志：${reason}`,
+        },
+      });
       return;
     }
     if (events.length === 0) return;

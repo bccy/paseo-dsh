@@ -849,8 +849,11 @@ export class PaseoHarnessServer {
       if (error instanceof Error && error.name.includes("NotFound")) {
         return { available: true, events: [], inheritedEventCount: 0 };
       }
+      // Failing to open a log that should exist is not "this session has no
+      // history": returning an empty list here would replay as a blank
+      // conversation with the real reason only in this process's stderr.
       process.stderr.write(`[bridge] history read failed for ${params.sessionId}: ${error instanceof Error ? error.message : String(error)}\n`);
-      return { available: true, events: [], inheritedEventCount: 0 };
+      return unavailableHistory(error);
     }
     try {
       const result = await withTimeout(handle.read(), 15000, 'reading session history');

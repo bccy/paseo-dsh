@@ -190,8 +190,8 @@ console.log('replay timestamps (per-turn "worked for" durations survive a reopen
 console.log('a successful rewind shows a transient "working" notice');
 {
   const provider = readFileSync(join(import.meta.dirname, '..', 'paseo-plugin/server/provider.ts'), 'utf8');
-  const noticeIndex = provider.indexOf('"正在回退，请稍候"');
-  const caseStart = provider.lastIndexOf('case "session.revert"', noticeIndex);
+  const caseStart = provider.indexOf('case "session.revert"');
+  const noticeIndex = provider.indexOf('"正在回退，请稍候"', caseStart);
   const completedIndex = provider.indexOf('request.completed', caseStart);
   const refreshIndex = provider.indexOf('this.#refreshAgent(input.sessionId)', caseStart);
   check(
@@ -202,6 +202,42 @@ console.log('a successful rewind shows a transient "working" notice');
   check(
     'and it is an info notice with the short working text',
     /this\.#notice\(input\.sessionId, "info", "正在回退，请稍候"\)/.test(provider),
+  );
+}
+
+console.log('post-reload notices and the rewind prompt gate');
+{
+  const provider = readFileSync(join(import.meta.dirname, '..', 'paseo-plugin/server/provider.ts'), 'utf8');
+  check(
+    'the provider keeps a provider-session -> DSH-session key after the session closes',
+    /readonly #dshIds = new Map<string, string>\("\)?;?/.test(provider.replace(/\s+/g, ' ')) || /#dshIds = new Map<string, string>/.test(provider),
+  );
+  check(
+    'a file restore failure is deferred until the reopened session (not lost in the old epoch)',
+    /this\.#deferNotice\(input\.sessionId, \{\s*severity: "error",\s*title: "文件回退未完成"/.test(provider),
+  );
+  check(
+    'deferred notices are flushed right after session.ready of the reopened session',
+    provider.indexOf('this.#flushDeferredNotices(sessionId, dshSessionId);') > provider.indexOf('type: "session.ready"'),
+  );
+  check(
+    'a prompt arriving during the rewind is refused with a readable reason',
+    /if \(this\.#reverting\.has\(input\.sessionId\)\)/.test(provider)
+      && /正在回退，请稍候/.test(provider),
+  );
+  check(
+    'the rewind flag is released on a refused rewind, on close, and on every refresh failure',
+    (provider.match(/this\.#reverting\.delete\(input\.sessionId\)|this\.#reverting\.delete\(sessionId\)/g) ?? []).length >= 5,
+  );
+  const bridge = readFileSync(join(import.meta.dirname, '..', 'dsh-bridge/lib/server.js'), 'utf8');
+  check(
+    'a history read failure is reported as unavailable, not as an empty conversation',
+    /history read failed for \$\{params\.sessionId\}[\s\S]{0,400}?return unavailableHistory\(error\)/.test(bridge),
+  );
+  const session = readFileSync(join(import.meta.dirname, '..', 'paseo-plugin/server/session.ts'), 'utf8');
+  check(
+    'the plugin surfaces an unreadable history as a timeline warning',
+    /title: "会话历史读取失败"/.test(session),
   );
 }
 
@@ -258,8 +294,8 @@ console.log('wiring (the pure module is useless if nothing calls it)');
     /#resolvePaseoBinary\(\)/.test(provider) && /PASEO_BIN/.test(provider),
   );
   check(
-    'provider surfaces a failed file restore as a timeline notice',
-    /#notice\(\s*input\.sessionId,\s*"error",\s*"文件回退未完成"/.test(provider),
+    'provider surfaces a failed file restore as a (deferred) timeline notice',
+    /#deferNotice\(input\.sessionId, \{\s*severity: "error",\s*title: "文件回退未完成"/.test(provider),
   );
   check(
     'provider warns when the auto-refresh did not run',

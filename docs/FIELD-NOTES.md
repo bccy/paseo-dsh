@@ -1634,6 +1634,26 @@ RPC 往返，覆盖不到 reload）。
 通知行不可更新，只能依赖 epoch 重建清理。
 
 ---
+### 56. 审计收尾：reload 前的通知会被新 epoch 吞掉、history 失败不能伪装成空
+
+**P1-1/P1-2 跨刷新通知**：撤回成功到 daemon 重建时间线之间约 1 秒。插件在 reload **之前**发出的
+`session.notice`（文件恢复失败、自动刷新失败）属于旧 provider 会话；`reloadAgentSession` 会
+丢弃已提交时间线并从新会话的 replay 重建，旧 epoch 的 notice 行随之消失——用户只看到文件
+“没回来”或界面没刷新，却没有任何提示。修法：provider 维护
+`providerSessionId → dshSessionId` 与按 dshSessionId 的延迟通知队列；新会话 `session.ready`
+之后、daemon 采集 history 之前 flush，通知就成为新时间线的一行。文件失败通知改为显式延迟；
+刷新失败按“旧会话还在就立即发，否则入队”。
+
+**P1-3 history 读取失败**：`history()` 的 open 失败（非 NotFound）曾返回
+`{available:true, events:[]}`，重开会话就是空白对话，只有 bridge stderr 有原因。改为
+`unavailableHistory(error)`；插件侧同时发一条「会话历史读取失败」时间线警告。
+
+**P1-4 撤回窗口的 prompt**：`session.revert` 成功后到 reload 关闭会话之间，prompt 会与
+reload 竞争（被 cancel、丢失或追加到冻结区间之后）。provider 在撤回开始置
+`#reverting`，该窗口内 prompt 直接以 `session.prompt_result failed` 拒绝并提示
+「正在回退，请稍候」；reload 成功关闭会话、拒绝撤回、刷新失败、或 15s 兜底时释放。
+
+---
 ## 已知限制（未修，有意为之）
 
 | 项 | 说明 |
