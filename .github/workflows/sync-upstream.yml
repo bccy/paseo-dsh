@@ -1,0 +1,86 @@
+name: Sync upstream
+
+# 每日把 upstream（liuxing7954/paseo-dsh）的 main 合并进本仓库 main。
+# - 干净合并：自动 push 到 origin/main
+# - 有冲突：把 upstream 推成 sync/upstream 分支并开 PR，留待人工解决
+# 也可以从 Actions 页面手动触发（workflow_dispatch）。
+
+on:
+  schedule:
+    # 每天 02:00 UTC（北京时间 10:00）
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write        # push merge commit / sync branch
+  pull-requests: write   # create the conflict PR
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream/main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/liuxing7954/paseo-dsh.git 2>/dev/null || true
+          git fetch upstream main --prune
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date with upstream/main."
+            exit 0
+          fi
+
+          upstream_sha="$(git rev-parse --short upstream/main)"
+          echo "Upstream has new commits: ${upstream_sha}"
+
+          if git merge --no-ff --no-edit upstream/main; then
+            # 轻量校验：桥语法 + 生成物与桥源码一致；失败则不 push。
+            node --check dsh-bridge/lib/server.js
+            node harness/bridge-assets-check.mjs
+
+            git push origin main
+            echo "Merged upstream ${upstream_sha} into main."
+          else
+            git merge --abort
+            git branch -f sync/upstream upstream/main
+            git push origin "upstream/main:refs/heads/sync/upstream" --force
+
+            body=$(
+              printf '%s\n' \
+                "自动合并 upstream \`${upstream_sha}\` 到 \`main\` 时发生冲突，未改动 main。" \
+                "" \
+                "处理方式（本地）：" \
+                '```bash' \
+                "git fetch upstream" \
+                "git checkout main" \
+                "git merge upstream/main   # 手动解决冲突" \
+                "node --check dsh-bridge/lib/server.js" \
+                "node harness/bridge-assets-check.mjs" \
+                "git push origin main" \
+                '```' \
+                "" \
+                "解决后可关闭本 PR。"
+            )
+            gh pr create \
+              --base main \
+              --head sync/upstream \
+              --title "Upstream sync ${upstream_sha} (conflicts)" \
+              --body "${body}" \
+              || echo "::warning::PR creation failed (PRs may be disabled); resolve the conflict locally."
+            echo "::warning::Upstream ${upstream_sha} conflicts with main; left main untouched."
+          fi
