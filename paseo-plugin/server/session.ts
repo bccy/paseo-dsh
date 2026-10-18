@@ -170,9 +170,17 @@ export function parseRoute(model: string | undefined, fallback: DshRoute): DshRo
   return { provider: model.slice(0, slash), model: model.slice(slash + 1) };
 }
 
-/** The identity a parked process is reused under (route changes cold-start). */
+/**
+ * The identity a parked process is reused under.
+ *
+ * Only provider+model are pinned at process boot (`initialize`); the thinking
+ * effort is applied by `session.configure` after the session opens, so it must
+ * NOT take part in reuse: a reload reopens the session before that configure
+ * runs, and including the effort here made every reload look like a route change
+ * and kill a perfectly reusable child (measured +2.2s of cold start).
+ */
 function routeKeyOf(route: DshRoute): string {
-  return `${route.provider}/${route.model}/${route.reasoningEffort ?? ""}`;
+  return `${route.provider}/${route.model}`;
 }
 
 export class DshSession {

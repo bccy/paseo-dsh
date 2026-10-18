@@ -282,6 +282,7 @@ console.log('wiring (the pure module is useless if nothing calls it)');
     /new ParkedSessions\(/.test(provider) && /#parked\.stop\(\)/.test(provider),
   );
   const idleParkReturn = read('paseo-plugin/server/session.ts');
+  const sessionRaw = readFileSync(join(import.meta.dirname, '..', 'paseo-plugin/server/session.ts'), 'utf8');
   check(
     'a running turn or a refused park falls back to shutdown',
     /this\.#turnId === null/.test(idleParkReturn) && /await process\.shutdown\(\);/.test(idleParkReturn),
@@ -293,6 +294,22 @@ console.log('wiring (the pure module is useless if nothing calls it)');
   check(
     'the reopened session adopts the parked process',
     /takeParked: \(dshSessionId, expected\) => this\.#parked\.take/.test(provider),
+  );
+  // Reuse identity must be the boot-time route only: the thinking effort is
+  // applied by session.configure after open, so including it made every reload
+  // look like a route change and killed a reusable child (+2.2s measured).
+  const routeKeyBody = /function routeKeyOf\([\s\S]{0,200}?\n}/.exec(sessionRaw)?.[0] ?? '';
+  check(
+    'the parked route key excludes the thinking effort',
+    /return `\$\{route\.provider\}\/\$\{route\.model\}`;/.test(routeKeyBody)
+      && /reasoningEffort/.test(routeKeyBody) === false,
+    routeKeyBody.split('\n').find((line) => line.includes('return')) ?? '',
+  );
+  const refreshDelay = Number((provider.match(/\}, (\d+)\);\s*timer\.unref\(\)/) ?? [])[1]);
+  check(
+    'the refresh trigger is short (the CLI spawn itself covers the settle window)',
+    Number.isFinite(refreshDelay) && refreshDelay <= 200,
+    `${refreshDelay}ms`,
   );
 
   const timeline = read('paseo-plugin/server/timeline.ts');

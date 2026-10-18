@@ -90,10 +90,17 @@ Paseo 的插件 provider 适配层把翻译后的时间线事件放进一个**�
 
 ```
 撤回成功 → 先回 request.completed
-→ 延迟 500ms spawn `paseo agent reload <agentId>`
+→ 延迟 50ms spawn `paseo agent reload <agentId>`（CLI 自身启动约 0.5s，天然覆盖 daemon settle 窗口）
 → daemon reloadAgentSession({rehydrateFromDisk:true})：关旧 provider 会话、带 persistence 重开
+→ 关闭时把空闲 dsh 进程放进停放池；重开时按 DSH 原生 session id 接管（省掉冷启动）
 → 桥重放折叠后的 history → 新 epoch → 客户端重建时间线（旧行消失）
 ```
+
+实测耗时（2026-10-18）：`agent.rewind.start → complete` 52ms；插件延迟 50ms；CLI 启动+连接约 0.5–0.8s；
+命中停放时 daemon `refresh_agent_request` 约 0.2–0.4s，未命中（冷启动）约 2.8s。修复前用户实测
+「点击→消失」约 4.2s，两个根因：① 刷新延迟固定 500ms；② 停放路由键把 thinking effort 也算进去，
+reload 重开时 effort 由 `session.configure` 后才生效 → 每次都被判成 route mismatch、杀掉可复用进程走冷启动。
+现在路由键只含 provider/model，effort 在 open 后单独配置；延迟降到 50ms。
 
 - **不能 await 刷新**：daemon 撤回持有 pending run，reload 会 cancel 在飞回合，二者互相等待。
 - agent id 取 daemon 注入的 `config.env.PASEO_AGENT_ID`；`paseo` 二进制按 `PASEO_BIN` →

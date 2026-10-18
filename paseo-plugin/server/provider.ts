@@ -505,10 +505,15 @@ class DshConnection implements ProviderConnection {
    * exposes no call for it. Spawning the shipped CLI hits the daemon's own
    * `refresh_agent_request` path.
    *
-   * The delay is deliberate: the caller must answer `session.revert` first (the
-   * daemon holds a pending run until it is answered, and the refresh cancels
-   * in-flight runs). Failures are reported to the user via a notice and the
-   * plugin log; the rewind itself has already succeeded.
+   * The small delay is deliberate: the caller answers `session.revert` first
+   * (the daemon holds a pending run until it is answered, and the refresh cancels
+   * in-flight runs). It is kept short on purpose — spawning the CLI itself costs
+   * ~500ms of node boot before the request even leaves, which comfortably covers
+   * the daemon's rewind settle (measured: rewind start → complete ≈ 52ms), so a
+   * long timer only adds latency to the user-visible refresh.
+   *
+   * Failures are reported to the user via a notice and the plugin log; the
+   * rewind itself has already succeeded.
    *
    * @param sessionId - provider session whose agent should be reloaded.
    */
@@ -554,7 +559,7 @@ class DshConnection implements ProviderConnection {
         process.stderr.write(`[${PROVIDER_ID}] refreshing the agent after a rewind: ${messageOf(error)}\n`);
         this.#notice(sessionId, "warning", "时间线未自动刷新", "自动 Reload agent 失败；撤回已完成，请手动执行 Reload agent。");
       }
-    }, 500);
+    }, 50);
     timer.unref();
   }
 

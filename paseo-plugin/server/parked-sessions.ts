@@ -35,7 +35,10 @@ export interface ParkedEntry {
   /** DSH native session id, the pool key. */
   dshSessionId: string;
   cwd: string;
-  /** `provider/model/reasoningEffort`, to refuse reuse under a different route. */
+  /**
+   * `provider/model` — the route pinned at process boot. Thinking effort is
+   * applied after a session opens, so it is not part of reuse identity.
+   */
   routeKey: string;
   parkedAt: number;
 }
