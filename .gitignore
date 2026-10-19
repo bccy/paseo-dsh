@@ -17,6 +17,10 @@ dist/
 *.credentials.yaml
 credentials.json
 
+# iOS build output and signing material: never commit these
+*.ipa
+证书.zip
+
 # Editor and OS noise
 .DS_Store
 .idea/
