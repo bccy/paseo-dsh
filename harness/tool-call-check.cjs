@@ -39,6 +39,25 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
+/**
+ * Locate a repo source file from wherever this check runs. The documented
+ * compile step copies the check into `paseo-plugin/.dbg` (one level below
+ * `paseo-plugin`), but a scratch build dir such as `.tmp-test/<name>` sits one
+ * level deeper; walking up finds the source either way instead of failing on
+ * `__dirname/..`.
+ */
+function findRepoFile(relative, levels = 4) {
+  let dir = __dirname;
+  for (let i = 0; i < levels; i += 1) {
+    const candidate = path.join(dir, relative);
+    if (fs.existsSync(candidate)) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return undefined;
+}
+
 const {
   allBlockCopy,
   blockCopy,
@@ -1320,25 +1339,15 @@ console.log("the meta key is the same on both sides of the plugin");
   // import the other's constant, so the one thing they must agree on is the
   // string. A rename on one side would leave every structured block silently
   // falling back to plain text — the exact failure this phase exists to avoid.
-  const readKey = (candidates, label) => {
-    const file = candidates.find((candidate) => fs.existsSync(candidate));
-    check(`${label} is readable`, file !== undefined, candidates.join(", "));
+  const readKey = (file, label) => {
+    check(`${label} is readable`, file !== undefined, `looked above ${__dirname}`);
     if (file === undefined) return null;
     const match = /PRESENTATION_META_KEY[^=]*=\s*"([^"]+)"/.exec(fs.readFileSync(file, "utf8"));
     check(`${label} declares the key as a literal`, match !== null);
     return match === null ? null : match[1];
   };
-  const serverKey = readKey(
-    [path.join(__dirname, "..", "server", "timeline.ts"), path.join(__dirname, "server", "timeline.ts")],
-    "server/timeline.ts",
-  );
-  const clientKey = readKey(
-    [
-      path.join(__dirname, "..", "client", "tool-call-data.ts"),
-      path.join(__dirname, "client", "tool-call-data.ts"),
-    ],
-    "client/tool-call-data.ts",
-  );
+  const serverKey = readKey(findRepoFile("server/timeline.ts"), "server/timeline.ts");
+  const clientKey = readKey(findRepoFile("client/tool-call-data.ts"), "client/tool-call-data.ts");
   equal("both halves name the same metadata key", clientKey, serverKey);
   equal("and it is the one the tests feed in", serverKey, "presentationMeta");
 }
@@ -1351,12 +1360,8 @@ console.log("the tool transformer adopts the item's locale before it maps");
   // the two functions it calls is asserted in `locale-check.cjs`
   // ("a tool row adopts the locale its item carries"). Together they cover the
   // line: remove it and this fails, break what it calls and that fails.
-  const candidates = [
-    path.join(__dirname, "..", "index.client.tsx"),
-    path.join(__dirname, "index.client.tsx"),
-  ];
-  const sourcePath = candidates.find((candidate) => fs.existsSync(candidate));
-  check("index.client.tsx is readable", sourcePath !== undefined, candidates.join(", "));
+  const sourcePath = findRepoFile("index.client.tsx");
+  check("index.client.tsx is readable", sourcePath !== undefined, path.join(__dirname, "index.client.tsx"));
   const source = sourcePath === undefined ? "" : fs.readFileSync(sourcePath, "utf8");
 
   const relay = source.search(/setLocale\(localeFromMetadata\(item\.metadata\)\)/);
@@ -1391,15 +1396,11 @@ console.log("the renderer's schema and ToolCallData cannot drift apart");
   // before the component sees it, or the component quietly stops receiving it.
   // Nothing errors in either case, so the two key sets are asserted here — at
   // the data layer, where this repo's rules say silent failures must be caught.
-  const candidates = [
-    path.join(__dirname, "..", "index.client.tsx"),
-    path.join(__dirname, "index.client.tsx"),
-  ];
-  const sourcePath = candidates.find((candidate) => fs.existsSync(candidate));
+  const sourcePath = findRepoFile("index.client.tsx");
   check(
     "index.client.tsx is readable",
     sourcePath !== undefined,
-    `looked in ${candidates.join(", ")}`,
+    `looked above ${__dirname}`,
   );
 
   const schemaKeys = sourcePath === undefined ? [] : dshToolSchemaKeys(fs.readFileSync(sourcePath, "utf8"));

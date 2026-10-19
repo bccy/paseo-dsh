@@ -17,8 +17,8 @@
  */
 "use strict";
 
-const { readFileSync } = require("node:fs");
-const { join } = require("node:path");
+const { readFileSync, existsSync } = require("node:fs");
+const { dirname, join } = require("node:path");
 const {
   advanceEm,
   firstLine,
@@ -26,6 +26,31 @@ const {
   reasoningPreview,
   streamingTail,
 } = require("./client/thinking-text.js");
+
+/**
+ * Locate a repo source file from wherever this check runs. The documented
+ * compile step copies the check into `paseo-plugin/.dbg` (one level below
+ * `paseo-plugin`), but a scratch build dir such as `.tmp-test/<name>` sits one
+ * level deeper; walking up finds the source either way instead of failing on
+ * `__dirname/..`.
+ */
+function findRepoFile(relative, levels = 4) {
+  let dir = __dirname;
+  for (let i = 0; i < levels; i += 1) {
+    const candidate = join(dir, relative);
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return undefined;
+}
+
+const INLINE_THINKING_SOURCE = findRepoFile("client/inline-thinking.tsx");
+if (INLINE_THINKING_SOURCE === undefined) {
+  console.error(`could not find paseo-plugin/client/inline-thinking.tsx above ${__dirname}`);
+  process.exit(1);
+}
 
 let passed = 0;
 let failed = 0;
@@ -119,7 +144,7 @@ console.log("the preview is computed from the text as it arrives");
   //
   // Asserted at the source because it is a wiring property, and this repo asserts
   // pure modules and constant tables rather than React components.
-  const source = readFileSync(join(__dirname, "..", "client", "inline-thinking.tsx"), "utf8");
+  const source = readFileSync(INLINE_THINKING_SOURCE, "utf8");
   // Comment lines are dropped first: the module header explains the hook by name.
   const code = source
     .split("\n")
@@ -199,7 +224,7 @@ console.log("the row wires the window in");
   // content-sized, so a `flex: 1` child inside it reports its own content width
   // and the window collapses — the desktop client showed two characters. It has
   // to come from the row and the label, which are definite on every platform.
-  const code = readFileSync(join(__dirname, "..", "client", "inline-thinking.tsx"), "utf8")
+  const code = readFileSync(INLINE_THINKING_SOURCE, "utf8")
     .split("\n")
     .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
     .join("\n");

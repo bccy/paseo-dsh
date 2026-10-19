@@ -9,6 +9,9 @@
  *   post-target content back, and a file untouched since the target is left alone;
  * - bash side effects and the user's own edits are never recorded (they never go
  *   through the tracked tools);
+ * - `write`/`edit` are not the only tracked tools: `str_replace_editor` names the
+ *   file with `path` and only its writing commands (`create`/`str_replace`/
+ *   `insert`) count — `view`, an unknown command or a missing path are not edits;
  * - the current content is rescued before restore overwrites it, and one failed
  *   path does not abort the rest.
  *
@@ -62,6 +65,26 @@ console.log('tracked tools and path extraction');
   check('another key is ignored', mutationPathOf({ name: 'write', arguments: { path: 'a.txt' } }) === undefined);
   check('relative paths resolve against cwd', resolveMutationPath('/w', 'a.txt') === '/w/a.txt');
   check('absolute paths stay absolute', resolveMutationPath('/w', '/tmp/a.txt') === '/tmp/a.txt');
+
+  // `str_replace_editor` names the file with `path` and only three of its
+  // commands write. Getting this wrong is silent in both directions: a missing
+  // entry lets a `both` rewind report success while the file stays modified, and
+  // a read command would journal an edit that never happened. Driven through the
+  // real bridge module (`mutationPathOf`), not the source text.
+  const editor = (command, path) => ({ name: 'str_replace_editor', arguments: { command, path } });
+  check("str_replace_editor 'create' takes path as the edit", mutationPathOf(editor('create', 'new.txt')) === 'new.txt');
+  check(
+    "str_replace_editor 'str_replace' takes path as the edit",
+    mutationPathOf(editor('str_replace', 'a.txt')) === 'a.txt',
+  );
+  check("str_replace_editor 'insert' takes path as the edit", mutationPathOf(editor('insert', 'a.txt')) === 'a.txt');
+  check("str_replace_editor 'view' is not an edit", mutationPathOf(editor('view', 'a.txt')) === undefined);
+  check(
+    'an unrecognized command or a missing path is not an edit',
+    mutationPathOf(editor('undo_edit', 'a.txt')) === undefined &&
+      mutationPathOf({ name: 'str_replace_editor', arguments: { command: 'str_replace' } }) === undefined,
+    'unknown command and missing path both yield no mutation',
+  );
 }
 
 console.log('before-content is captured only on success');

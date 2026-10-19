@@ -54,7 +54,7 @@ const request = (method, params, timeoutMs = 240000) =>
     send({ jsonrpc: '2.0', id, method, params });
     setTimeout(() => {
       if (pending.delete(id)) reject(new Error(`timeout: ${method}`));
-    }, timeoutMs);
+    }, timeoutMs).unref();
   });
 
 child.stdout.setEncoding('utf8');

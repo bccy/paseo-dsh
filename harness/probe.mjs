@@ -46,9 +46,12 @@ function request(method, params) {
   return new Promise((resolve, reject) => {
     pending.set(id, { resolve, reject });
     send({ jsonrpc: '2.0', id, method, params });
+    // `unref()`: a response normally clears `pending`, but the timer itself
+    // would otherwise keep the event loop alive for up to 180s after the last
+    // request — a finished probe looked like a hang.
     setTimeout(() => {
       if (pending.delete(id)) reject(new Error(`timeout: ${method}`));
-    }, 180000);
+    }, 180000).unref();
   });
 }
 
@@ -135,13 +138,24 @@ async function main() {
   await sleep(20000);
 
   log('\n--- paseo/plan/get ---');
-  log(JSON.stringify(await request('paseo/plan/get', { sessionId: SESSION_ID })));
+  const planBefore = await request('paseo/plan/get', { sessionId: SESSION_ID });
+  log(JSON.stringify(planBefore));
 
-  log('\n--- paseo/plan/set active=true ---');
-  log(JSON.stringify(await request('paseo/plan/set', { sessionId: SESSION_ID, active: true })));
+  if (planBefore?.available === false) {
+    // Not a bridge defect: this profile composes no plan-mode service at all.
+    // `@deepseek-ai/dsh-web-app` disables the base `plan-mode` row by id, so a
+    // profile that layers the web bundle over the bridge (or a bare `dsh-base`
+    // without the bridge's own row) has no plan mode; `paseo/plan/set` can only
+    // answer "not mounted". The plugin reports the mode as unavailable instead
+    // of offering one that fails, so the probe skips the set instead of dying.
+    log('--- plan mode is not mounted in this profile; skipping set (expected when dsh-web-app is layered in) ---');
+  } else {
+    log('\n--- paseo/plan/set active=true ---');
+    log(JSON.stringify(await request('paseo/plan/set', { sessionId: SESSION_ID, active: true })));
 
-  log('\n--- paseo/plan/get ---');
-  log(JSON.stringify(await request('paseo/plan/get', { sessionId: SESSION_ID })));
+    log('\n--- paseo/plan/get ---');
+    log(JSON.stringify(await request('paseo/plan/get', { sessionId: SESSION_ID })));
+  }
 
   log('\n--- paseo/config/set reasoningEffort=low ---');
   log(JSON.stringify(await request('paseo/config/set', { sessionId: SESSION_ID, reasoningEffort: 'low' })));
@@ -151,11 +165,10 @@ async function main() {
 
   log(`\n=== questions received: ${questions.length} ===`);
   log('--- shutdown ---');
-  try {
-    await request('shutdown', {});
-  } catch {
-    /* shutdown may close the transport first */
-  }
+  // Fire-and-forget: the bridge's `shutdown` handler disposes the runtime and
+  // may close the transport before answering, so awaiting the reply sits on
+  // `request()`'s 180s timeout and makes a successful probe look like a hang.
+  send({ jsonrpc: '2.0', id: nextId++, method: 'shutdown', params: {} });
   await sleep(1500);
   child.kill();
 }
@@ -164,4 +177,9 @@ main().catch((error) => {
   console.error('PROBE FAILED:', error);
   child.kill();
   process.exitCode = 1;
+}).finally(() => {
+  // `frames-probe.jsonl` is an open WriteStream: without this the event loop
+  // stays alive after the probe is done and the process hangs until its
+  // `timeout` wrapper kills it (a successful run looked like a hang).
+  rawOut.end();
 });

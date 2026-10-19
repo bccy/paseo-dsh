@@ -56,6 +56,15 @@
  * when `--patch <path>` is present, that file's content — the only way a check
  * can see what the plugin handed DSH at boot.
  *
+ * Outside the scenarios it also answers the two bridge requests the plugin makes
+ * without a turn, whose shapes mirror `dsh-bridge/lib/server.js`:
+ * `paseo/sessions` — the import list (`{available, sessions:[{sessionId, cwd?,
+ * title?, preview?, updatedAt?}]}`), which the provider turns into persistence
+ * handles for Paseo's "Import session"; `paseo/revert` — the rewind receipt
+ * (`{kind:"success", text}`), where a `token.messageId` of `revert-unknown`
+ * fails the way the real bridge fails an unresolvable target (a JSON-RPC error
+ * the plugin surfaces as `request.failed`).
+ *
  * @module paseo-dsh/harness/fake-dsh-bridge
  */
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
@@ -483,9 +492,20 @@ async function handle(method, params, id) {
       // `session.close` (`PluginProvider.openSession`'s catch), which is the path
       // that used to leave the plugin's map entry — and this process — behind.
       if (MODE === "failopen") throw new Error("the runtime refused to initialize");
-      return { serverInfo: { name: "fake-dsh-bridge", version: "0" }, route: { provider: "fake", model: "fake" } };
+      return { serverInfo: { name: "fake-dsh-bridge", version: "0" }, route: { provider: "fake", model: "fake", reasoningEffort: null } };
     case "paseo/catalog":
-      return { providers: [], models: [], planMode: false };
+      // The real catalog also reports the profile's configured default route
+      // (`server.js` `catalog()`), which the plugin reads for the composer's
+      // initial selection; omitting them here would make a fake-driven check
+      // blind to a regression in that mapping.
+      return {
+        providers: [],
+        models: [],
+        defaultProvider: "fake",
+        defaultModel: "fake",
+        defaultReasoningEffort: null,
+        planMode: false,
+      };
     case "paseo/commands": {
       // A child this bridge is *hosting* right now is announced during the open
       // (the notice precedes the reply, so it is buffered and registered before
@@ -545,6 +565,36 @@ async function handle(method, params, id) {
         };
       }
       return { available: true };
+    }
+    // The import list behind Paseo's "Import session". The real bridge filters
+    // archived sessions and sorts by `createdAt`; the shape is
+    // `{available, sessions:[{sessionId, cwd?, title?, preview?, updatedAt?}]}`
+    // (`server.js` `listSessions()`), and the provider turns each row into a
+    // persistence handle. Two rows: one fully described, one bare.
+    case "paseo/sessions":
+      return {
+        available: true,
+        sessions: [
+          {
+            sessionId: "stored-A",
+            cwd: "/tmp/stored-project",
+            title: "Stored A",
+            preview: "first message of A",
+            updatedAt: "2026-10-19T00:00:00.000Z",
+          },
+          { sessionId: "stored-B", cwd: "/tmp/stored-project" },
+        ],
+      };
+    // The rewind receipt. The real bridge plans the range from the visible
+    // surface, appends the replacement and answers `{kind:"success", text}`;
+    // every failure (an unknown scope, an unresolvable token, a rewind already
+    // in flight) is a thrown error, which the plugin surfaces as
+    // `request.failed`. `revert-unknown` pins that failure branch.
+    case "paseo/revert": {
+      const token = params === undefined || params === null ? undefined : params.token;
+      const messageId = token !== null && typeof token === "object" ? token.messageId : undefined;
+      if (messageId === "revert-unknown") throw new Error("撤回目标无法解析：该消息不在会话表面上");
+      return { kind: "success", text: "Withdrawn seq 3 and everything after it" };
     }
     case "paseo/subagents":
       if (MODE === "error") return { available: false, subagents: [], error: { message: "subagent catalog exploded" } };
@@ -632,7 +682,17 @@ async function handle(method, params, id) {
       if (sid === "child-M") return { available: true, inheritedEventCount: 0, events: withHistoryTimes(liveChildEvents()) };
       if (sid === "child-K") return { available: true, inheritedEventCount: 0, events: withHistoryTimes(killedChildEvents()) };
       if (sid === "child-N") return { available: true, inheritedEventCount: 0, events: withHistoryTimes(neverStartedChildEvents()) };
-      if (sid === "child-U") return { available: false, error: { message: "child U history exploded" } };
+      if (sid === "child-U") {
+        // Same shape as the real bridge's `unavailableHistory()`: a failed read
+        // is still a history object, so callers can rely on `events` being a
+        // list instead of guessing around a missing field.
+        return {
+          available: false,
+          inheritedEventCount: 0,
+          events: [],
+          error: { message: "child U history exploded" },
+        };
+      }
       if (sid === "child-R") {
         // The terminal races the history read: emitted BEFORE this reply, so it
         // reaches the plugin while child-R's replay is still in flight.

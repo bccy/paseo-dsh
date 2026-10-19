@@ -47,6 +47,25 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
+/**
+ * Locate a repo source file from wherever this check runs. The documented
+ * compile step copies the check into `paseo-plugin/.dbg-am` (one level below
+ * `paseo-plugin`), but a scratch build dir such as `.tmp-test/<name>` sits one
+ * level deeper; walking up finds the source either way instead of failing on
+ * `__dirname/..`.
+ */
+function findRepoFile(relative, levels = 4) {
+  let dir = __dirname;
+  for (let i = 0; i < levels; i += 1) {
+    const candidate = path.join(dir, relative);
+    if (fs.existsSync(candidate)) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return undefined;
+}
+
 const { AGENT_MESSAGE_EVENTS, allText, setLocale } = require("./client/locale.js");
 const { toolCallData } = require("./client/tool-call-data.js");
 
@@ -367,12 +386,8 @@ console.log("the transformer hands an agent message without agentMessage back to
   // its condition is extracted and exercised against the three item shapes, and
   // the source is asserted to `return undefined` in that branch, before any
   // mapping, without reading the plain_text payload.
-  const candidates = [
-    path.join(__dirname, "..", "index.client.tsx"),
-    path.join(__dirname, "index.client.tsx"),
-  ];
-  const sourcePath = candidates.find((candidate) => fs.existsSync(candidate));
-  check("index.client.tsx is readable", sourcePath !== undefined, candidates.join(", "));
+  const sourcePath = findRepoFile("index.client.tsx");
+  check("index.client.tsx is readable", sourcePath !== undefined, path.join(__dirname, "index.client.tsx"));
   const source = sourcePath === undefined ? "" : fs.readFileSync(sourcePath, "utf8");
 
   const toolTransformer = source.indexOf('id: "dsh-inline-tool"');

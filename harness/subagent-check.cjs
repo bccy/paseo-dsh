@@ -22,12 +22,29 @@
  *   rm -rf ../.dbg
  */
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 
 const fakeBridge = path.join(__dirname, "fake-dsh-bridge.mjs");
 fs.chmodSync(fakeBridge, 0o755);
 process.env.DSH_BINARY = fakeBridge;
 process.env.DSH_FAKE_MODE = "live";
+
+// Never touch the user's live profile. Loading the plugin calls
+// `ensurePaseoProfile()`, which unconditionally rewrites
+// `$DSH_HOME/profiles/<name>/node_modules/dsh-paseo-bridge` from the bridge
+// embedded in `bridge-assets.ts`. A stale asset would therefore be installed
+// into the real profile by a check that is supposed to be offline, and every
+// later "real profile" check would go green on the old bridge. The fake `dsh`
+// needs no profile at all, so point DSH_HOME at a throwaway tree.
+process.env.DSH_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-subagent-check-"));
+process.on("exit", () => {
+  try {
+    fs.rmSync(process.env.DSH_HOME, { recursive: true, force: true });
+  } catch {
+    /* best-effort cleanup */
+  }
+});
 
 const plugin = require("./index.server.js").default;
 
@@ -369,7 +386,10 @@ async function openSession(conn, sessionId, history) {
   const archHandle = events.find((e) => e.type === "session.opened" && e.sessionId === rootA)?.persistence;
   check(
     "session.opened carries the persistence handle archive addresses",
-    archHandle !== undefined && typeof archHandle.data?.sessionId === "string",
+    archHandle !== undefined &&
+      archHandle.version === 1 &&
+      typeof archHandle.data?.sessionId === "string" &&
+      archHandle.data.sessionId !== "",
     JSON.stringify(archHandle ?? null),
   );
 

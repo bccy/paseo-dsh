@@ -69,9 +69,12 @@ function request(method, params, timeoutMs = 180000) {
   return new Promise((resolve, reject) => {
     pending.set(id, { resolve, reject });
     child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    // `unref()`: a response normally clears `pending`, but the timer would keep
+    // the event loop alive for up to `timeoutMs` after the last request, so a
+    // finished probe looked like a hang until its wrapper killed it.
     setTimeout(() => {
       if (pending.has(id)) { pending.delete(id); reject(new Error(`${method} timed out`)); }
-    }, timeoutMs);
+    }, timeoutMs).unref();
   });
 }
 

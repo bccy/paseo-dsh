@@ -51,7 +51,7 @@ function request(method, params, timeoutMs = 180000) {
     send({ jsonrpc: "2.0", id, method, params });
     setTimeout(() => {
       if (pending.delete(id)) reject(new Error(`timeout: ${method}`));
-    }, timeoutMs);
+    }, timeoutMs).unref();
   });
 }
 

@@ -161,8 +161,33 @@ const {
   withAlpha,
 } = require("./client/tokens.js");
 
-const { readFileSync } = require("node:fs");
-const { join } = require("node:path");
+const { readFileSync, existsSync } = require("node:fs");
+const { dirname, join } = require("node:path");
+
+/**
+ * Locate a repo source file from wherever this check runs. The documented
+ * compile step copies the check into `paseo-plugin/.dbg` (one level below
+ * `paseo-plugin`), but a scratch build dir such as `.tmp-test/<name>` sits one
+ * level deeper; walking up finds the source either way instead of failing on
+ * `__dirname/..`.
+ */
+function findRepoFile(relative, levels = 4) {
+  let dir = __dirname;
+  for (let i = 0; i < levels; i += 1) {
+    const candidate = join(dir, relative);
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return undefined;
+}
+
+const TOOL_CALL_SOURCE = findRepoFile("client/tool-call.tsx");
+if (TOOL_CALL_SOURCE === undefined) {
+  console.error(`could not find paseo-plugin/client/tool-call.tsx above ${__dirname}`);
+  process.exit(1);
+}
 
 let passed = 0;
 let failed = 0;
@@ -259,7 +284,7 @@ console.log("the diff stat suffix");
   equal("the added count is green", added.color, COLORS.statusSuccess);
   equal("the removed count is red", removed.color, COLORS.statusDanger);
   // One run cannot hold two colours, so the row has to draw two.
-  const row = readFileSync(join(__dirname, "..", "client", "tool-call.tsx"), "utf8");
+  const row = readFileSync(TOOL_CALL_SOURCE, "utf8");
   check(
     "the row draws the two counts as separate runs",
     /styles\.statAdded/.test(row) && /styles\.statRemoved/.test(row),
@@ -653,7 +678,7 @@ console.log("state colours");
   // The bug this replaced was a wiring one — the state colour reached a different
   // run than intended — and asserting the helpers alone cannot catch that, so the
   // row's own wiring is read.
-  const row = readFileSync(join(__dirname, "..", "client", "tool-call.tsx"), "utf8");
+  const row = readFileSync(TOOL_CALL_SOURCE, "utf8");
   check(
     "the row colours the icon from status and edit-ness",
     /rowIconColor\(colors, data\.status, data\.diff\)/.test(row),

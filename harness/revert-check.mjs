@@ -303,21 +303,35 @@ console.log('wiring (the pure module is useless if nothing calls it)');
   );
 
   const session = read('paseo-plugin/server/session.ts');
+  // `session.ts` emits the row from one helper, and its argument list spans
+  // several lines after the refactor. Match the *whole call* (helper name + its
+  // exact arguments), not one line: "the helper appears somewhere" would let a
+  // second, token-less emission through. Each branch must emit exactly one row
+  // and each row must carry the token built from the bridge's message id.
+  const emitUserMessageCalls = [...session.matchAll(/#emitUserMessage\(([\s\S]*?)\);/g)]
+    .map((match) => match[1].replace(/\s+/g, ' ').trim());
+  const carriesReplyToken = (body) =>
+    /reply\.messageId === undefined \? undefined : \{ messageId: reply\.messageId \}/.test(body);
+  const labelRows = emitUserMessageCalls.filter((body) => body.startsWith('prompt.clientMessageId, label'));
   check(
     'the live row is emitted once, with its revert token',
-    /#emitUserMessage\(prompt\.clientMessageId, label, messageId === undefined \? undefined : \{ messageId \}\)/.test(session),
+    labelRows.length === 1 && carriesReplyToken(labelRows[0]),
+    `${labelRows.length} emission(s)`,
   );
   check(
     'no token-less live row is emitted before the prompt',
-    session.indexOf('#emitUserMessage(prompt.clientMessageId, label)') === -1,
+    emitUserMessageCalls.every((body) => !body.startsWith('prompt.clientMessageId,') || carriesReplyToken(body)),
+    emitUserMessageCalls.filter((body) => body.startsWith('prompt.clientMessageId,') && !carriesReplyToken(body)).join(' | '),
   );
   check(
     'the replayed row carries the same token',
     /revertToken: \{ messageId: data\.id \}/.test(session),
   );
+  const skillRows = emitUserMessageCalls.filter((body) => body.startsWith('prompt.clientMessageId, line'));
   check(
     'the skill row also carries a token',
-    /#emitUserMessage\(prompt\.clientMessageId, line, messageId === undefined \? undefined : \{ messageId \}\)/.test(session),
+    skillRows.length === 1 && carriesReplyToken(skillRows[0]),
+    `${skillRows.length} emission(s)`,
   );
   check(
     'the permission preset is written without the slash command',

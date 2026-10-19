@@ -259,6 +259,10 @@ function projectTimelineLikePaseo(items, turnId) {
     sessionId,
     prompt: {
       clientMessageId: commandMsgId,
+      // `ProviderPrompt` requires both fields; a prompt without them is not a
+      // shape the daemon ever sends, and the plugin's turn id falls back to
+      // `turn:${undefined}` when `clientMessageId` is missing.
+      delivery: "auto",
       input: { type: "command", name: "goal", arguments: "" },
     },
   });
@@ -306,6 +310,7 @@ function projectTimelineLikePaseo(items, turnId) {
       sessionId,
       prompt: {
         clientMessageId: menuMsgId,
+        delivery: "auto",
         input: { type: "command", name: goalEntry.name, arguments: "" },
       },
     });
@@ -337,10 +342,16 @@ function projectTimelineLikePaseo(items, turnId) {
   // A 1x1 PNG: tiny, valid, and unmistakably an image to anything downstream.
   const png =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+  // `clientMessageId` is what the plugin turns into the turn id
+  // (`turn:${clientMessageId}`), so the assertion below can name the exact id
+  // the daemon would have bound. Both fields are required by `ProviderPrompt`.
+  const imageMsgId = "check-image-1";
   await conn.send({
     type: "session.prompt",
     sessionId,
     prompt: {
+      clientMessageId: imageMsgId,
+      delivery: "auto",
       input: {
         type: "message",
         content: [
@@ -368,9 +379,9 @@ function projectTimelineLikePaseo(items, turnId) {
   );
   if (withNumbers[0]) {
     check(
-      "usage carries a turnId",
-      typeof withNumbers[0].turnId === "string" && withNumbers[0].turnId !== "",
-      `turnId=${withNumbers[0].turnId}`,
+      "usage carries the turn id the prompt opened",
+      withNumbers[0].turnId === `turn:${imageMsgId}`,
+      `turnId=${withNumbers[0].turnId} expected=turn:${imageMsgId}`,
     );
   }
 
@@ -485,6 +496,8 @@ function projectTimelineLikePaseo(items, turnId) {
     type: "session.prompt",
     sessionId,
     prompt: {
+      clientMessageId: "check-mislabel-1",
+      delivery: "auto",
       input: {
         type: "message",
         content: [

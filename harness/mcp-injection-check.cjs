@@ -39,6 +39,19 @@ fs.chmodSync(fakeBridge, 0o755);
 process.env.DSH_BINARY = fakeBridge;
 process.env.DSH_FAKE_MODE = "live";
 
+// Never touch the user's live profile: loading the plugin calls
+// `ensurePaseoProfile()`, which rewrites `$DSH_HOME/profiles/<name>/
+// node_modules/dsh-paseo-bridge` from the bridge embedded in the plugin. The
+// fake `dsh` needs no profile, so point DSH_HOME at a throwaway tree.
+process.env.DSH_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-mcp-check-"));
+process.on("exit", () => {
+  try {
+    fs.rmSync(process.env.DSH_HOME, { recursive: true, force: true });
+  } catch {
+    /* best-effort cleanup */
+  }
+});
+
 const plugin = require("./index.server.js").default;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
