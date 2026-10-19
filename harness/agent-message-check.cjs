@@ -17,6 +17,14 @@
  * list, so a reworded catalog there fails here; the Chinese labels, the sender
  * fallbacks and every degradation path are pinned by hand.
  *
+ * One degradation is a host defect, not a payload one: Paseo 0.12's app rebuilds
+ * tool-call items before handing them to a plugin transformer and drops
+ * `agentMessage` (`projectPluginTimelineItems`; FIELD-NOTES #64). The transformer
+ * then returns `undefined` and leaves the row to Paseo's own renderer rather than
+ * faking a message out of the `plain_text` echo. That branch lives in
+ * `index.client.tsx`, which cannot be `require`d offline, so it is asserted from
+ * its source text — condition included, exercised against the three item shapes.
+ *
  * Run (from paseo-plugin):
  *   npx tsc client/tool-call-data.ts client/tokens.ts client/paseo-mark.ts \
  *     --outDir .dbg-am --rootDir . --module node16 --moduleResolution node16 \
@@ -340,12 +348,25 @@ console.log("status and size");
   setLocale(undefined);
 }
 
-console.log("the transformer forwards the whole item (agentMessage rides along)");
+console.log("the transformer hands an agent message without agentMessage back to Paseo");
 {
-  // `index.client.tsx` imports the renderers, which pull in the host runtime, so
-  // it cannot be `require`d here. The contract it must keep is one line: pass the
-  // item itself to `toolCallData`, not a picked subset. A pick would drop
-  // `agentMessage` and this whole phase would be silently dead in the UI.
+  // Two halves of one contract live in `index.client.tsx`, which imports the
+  // renderers (and through them the host runtime) and therefore cannot be
+  // `require`d here:
+  //
+  // 1. A row that *is* mapped forwards the whole item, so `agentMessage` travels
+  //    with it. Picking fields would silently drop the semantic half.
+  // 2. A row with `name === "agent_message"` but no `agentMessage` returns
+  //    `undefined`. That keeps the source item and lets Paseo's own renderer
+  //    draw it from the field it already holds; mapping it instead would print
+  //    the wire name over the plain_text echo. This is the 0.12 app boundary:
+  //    `projectPluginTimelineItems` rebuilds the item with only
+  //    callId/name/status/error/detail/metadata (see FIELD-NOTES #64).
+  //
+  // The transformer cannot run offline, so the guard is checked in two parts:
+  // its condition is extracted and exercised against the three item shapes, and
+  // the source is asserted to `return undefined` in that branch, before any
+  // mapping, without reading the plain_text payload.
   const candidates = [
     path.join(__dirname, "..", "index.client.tsx"),
     path.join(__dirname, "index.client.tsx"),
@@ -353,13 +374,72 @@ console.log("the transformer forwards the whole item (agentMessage rides along)"
   const sourcePath = candidates.find((candidate) => fs.existsSync(candidate));
   check("index.client.tsx is readable", sourcePath !== undefined, candidates.join(", "));
   const source = sourcePath === undefined ? "" : fs.readFileSync(sourcePath, "utf8");
+
+  const toolTransformer = source.indexOf('id: "dsh-inline-tool"');
+  check("the tool transformer was found", toolTransformer >= 0);
+  const rendererAfter = source.indexOf("client.addTimelineRenderer", toolTransformer);
+  const transformer =
+    toolTransformer < 0 ? "" : source.slice(toolTransformer, rendererAfter < 0 ? undefined : rendererAfter);
+
   check(
     "the transformer calls toolCallData(item, phase) with the item itself",
-    /toolCallData\(\s*item\s*,\s*phase\s*\)/.test(source),
+    /toolCallData\(\s*item\s*,\s*phase\s*\)/.test(transformer),
   );
   check(
     "it does not build a picked literal (which would drop agentMessage)",
-    !/toolCallData\(\s*\{/.test(source),
+    !/toolCallData\(\s*\{/.test(transformer),
+  );
+
+  const guard =
+    /if \(\s*(item\.name === "agent_message"\s*&&\s*item\.agentMessage === undefined)\s*\)\s*\{\s*return undefined;\s*\}/.exec(
+      transformer,
+    );
+  check("the missing-agentMessage guard exists", guard !== null);
+  if (guard !== null) {
+    const guardAt = transformer.indexOf(guard[0]);
+    const mappingAt = transformer.indexOf("toolCallData(item, phase)");
+    check(
+      "the guard returns undefined instead of mapping a legacy row",
+      guardAt >= 0 && mappingAt > guardAt,
+      `guard at ${guardAt}, mapping at ${mappingAt}`,
+    );
+
+    // The condition itself, run against the three shapes: the message row with
+    // the field dropped (the app boundary), the same row with the field present
+    // (a future host that forwards it), and an unrelated tool call.
+    const holds = new Function("item", `return (${guard[1]});`);
+    const legacy = {
+      name: "agent_message",
+      status: "completed",
+      detail: { type: "plain_text", text: "raw echo", icon: "bot" },
+    };
+    equal("no agentMessage: the guard fires (source item kept for Paseo's renderer)", holds(legacy), true);
+    equal(
+      "…even when the field is present but undefined",
+      holds({ ...legacy, agentMessage: undefined }),
+      true,
+    );
+    equal(
+      "with agentMessage: the guard does not fire (the semantic row is built)",
+      holds({ ...legacy, agentMessage: { event: "finished", sender: { id: "a" }, text: "t" } }),
+      false,
+    );
+    equal(
+      "another tool call is unaffected",
+      holds({ name: "bash", status: "completed", detail: { type: "shell", command: "ls" } }),
+      false,
+    );
+  }
+
+  // The fallback must not fabricate the message from the echo: this repo reads a
+  // document field only from the field the protocol defines as its carrier. Read
+  // the code with its comments stripped — the comments above *name* what must not
+  // be parsed, and that is not the failure mode.
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  check(
+    "the fallback does not parse the plain_text payload",
+    !/detail\s*\.\s*text/.test(code) && !/plain_text/.test(code),
+    "code still references detail.text or plain_text",
   );
 }
 

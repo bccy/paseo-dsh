@@ -1963,6 +1963,49 @@ journal；stderr 出现 `interrupted 1 delegated agent(s)`）、`rewind-e2e` 12/
 其实用户看到的是整个提问不可用；同时**对齐要连边角一起照抄**（neutral 兜底、diff 行前缀、字段顺序），
 否则"差不多"的格式会在下一次上游改动时静默漂移。
 
+### 64. `agent_message` 行在真机退回原文：0.12 App 的插件边界重建 item 时丢了 `agentMessage`
+
+**症状**：0.12 适配给 `agent_message` 行加了语义渲染（事件 + 发送者 + 正文），离线喂
+daemon 投影形状的 fixture 是语义行，**真机上那一行仍是 `agent_message` 加原文**。不是 bundle
+缓存：同一份代码、同一份 fixture，差别只在"字段到没到插件手里"。
+
+**根因（在宿主，不在本仓库）**：daemon 的投影**带**字段——`projectAgentMessage` 产出
+`tool_call{name:"agent_message", agentMessage:{event,sender,text}, detail:{type:"plain_text",…}}`
+（`@getpaseo/server@0.12.0` `dist/server/server/agent/agent-messages/index.js:127-155`）。但 App 在把
+timeline entry 交给插件 transformer 之前**重建 item**，只挑选
+`callId/name/status/error/detail/metadata`：
+`const{callId:s,name:n,status:o,error:c,detail:u,metadata:l}=t; p=Object.assign({type:"tool_call",callId:s,name:n,detail:u},l?{metadata:l}:{})`
+——**没有 `agentMessage`**；随后 `function c(t,n,c)` 调 `n({item:s(u),phase:I,sourceId:t.id})`
+（0.12.0 web UI bundle `.../server/dist/server/web-ui/_expo/static/js/web/index-07fb71ae403dd83a2c7484a3338718f8.js`，
+模块 **4778**：`projectPluginTimelineItems`；重建函数是同一模块里的 `function n(t)`）。于是插件的
+transformer 永远看不到 `agentMessage`，只能落到 `plain_text` 分支，行头读成 wire name。
+
+**为什么"交还宿主"是正确兜底**：同一 bundle 的 `transformTimelineItem`（模块 **4837**）对 `undefined`
+的处理是 `if(void 0===f)continue; return n(f).items.map(...)`，调用方 `return void 0===f?[t]:…`
+——**插件返回 `undefined` 即"保留源 item"**。源 item（重建之前那份）里 `agentMessage` 还在，
+Paseo 自己的行用官方 `buildAgentMessageDisplay` 正常渲染（事件标签 + 发送者）。所以最小修法不是
+去解析 `detail.text`（仓库规则：字段的载体由协议定义），而是**把这一行还给宿主**。
+
+**修法**（`paseo-plugin/index.client.tsx`）：tool_call transformer 在映射前加一个分支——
+`item.name === "agent_message" && item.agentMessage === undefined` → `return undefined`；带
+`agentMessage` 时照旧走语义渲染（上游修好后自动受益，插件无需再改）。分支注释写明原因与回退条件。
+
+**验证（本机 Node 22.23.1，2026-10-20）**：`cd paseo-plugin && npx tsc --noEmit` 干净；
+`harness/agent-message-check.cjs` **111/111**（新增 8 条：guard 存在、位于 `toolCallData` 之前、
+条件在「无字段 / 字段为 undefined / 带字段 / 别的 tool_call」四种形状下分别命中或不命中、
+且不解析 `detail.text`/`plain_text`；该 `.tsx` 不能离线 require，故为源码级断言）；
+`harness/tool-call-check.cjs` **335/335**。变异验证两轮：删掉 guard → `FAIL the missing-agentMessage
+guard exists`（105 passed, 1 failed）；把条件改成无条件 skip → 同样 FAIL（105/1）；两次还原后均 111/0。
+
+**何时可回退**：上游把 `agentMessage` 一并传给插件（或 timeline 契约改成整条透传）之后，删掉这个分支即可。
+判据：真机 `agent_message` 行走**我们**的语义行（中文事件标签 + 发送者），而不是 Paseo 官方的英文标签。
+在此之前，该行显示官方英文标签，是**有意的降级**，不是缺陷。
+
+**教训**：**「离线 fixture 全绿」证明不了真机——宿主插件边界会重建 item**。凡"接管/替换宿主 timeline 行"
+的插件，都要按「协议字段可能在入口被筛掉」设计：先确认字段真的到了插件（打一条日志或看宿主 bundle 的
+重建函数），再决定兜底；兜底应**交还宿主原生渲染**，而不是从旁路载荷（`detail.text`）里把内容猜回来——
+那只是把一次静默降级换成另一次。
+
 ---
 
 ## 已知限制（未修，有意为之）
