@@ -74,15 +74,19 @@ Paseo 撤回按钮
   记一行 journal；失败/中断丢弃。
 - **子代理编辑归并到根会话**：工具跑在原生子会话里时，沿 `header.parentSession` 上溯到
   根会话（`dsh-bridge/lib/snapshot-owners.js`），用**根会话**当时最新的人类消息当锚，
-  快照写进**根会话**的 journal/objects；commit/discard 通过 `callId → owner` 内存映射
-  找回同一个 pending 键。因此父会话 `both` 撤回会连子代理改过的文件一起回退。
+  快照写进**根会话**的 journal/objects；commit/discard 通过 `sessionId:callId → owner`
+  内存映射找回同一个 pending 键（callId 只在会话内唯一，键必须带会话维度）。
+  因此父会话 `both` 撤回会连子代理改过的文件一起回退（后台子代理的锚语义见已知限制）。
+- 相对路径按**工作目录服务**的当前目录解析（`ctx.get('workingDirectory').get(session)`；
+  `cd` 与子代理的 `cwd` 参数都生效，服务不可用时才回退 `header.cwd`），与 `write`/`edit`
+  的解析方式一致——`header.cwd` 只是会话最初的项目目录，不是工具执行时的目录。
 - 根目录 `~/.dsh/paseo-rewind/<sessionId>/`：`journal.jsonl` + `objects/`（内容寻址）+
   `rescue/`（恢复前当前内容的备份）。
 - 撤回 `both` 时：读 journal，取每个路径「目标消息及之后最早一次改动前的状态」——新建的
   文件删除，被改的写回，未被工具的动的不碰；覆盖前把当前内容存入 rescue。
 - 不跟踪：bash/pwsh 等命令产生的改动、用户或外部进程直接改的文件、符号链接、> 8 MiB 文件。
   子代理编辑属于归并而不是跳过；只有上溯失败（父会话不 live、header 缺 `parentSession`、
-  血缘成环）时才退化为不跟踪（fail-open，stderr 记一行原因）。
+  血缘成环）时才退化为不跟踪（fail-open，stderr 记一行跳过日志）。
 
 ### 刷新：Reload 旁路 + 停放会话
 
@@ -157,10 +161,21 @@ this.ctx.get('permissionPresets').set(session, name);
 - 由于首条被拒绝，本实现不会再产生"空对话"；历史上已被旧版本撤空的会话，重开时就是一个
   没有消息的空对话（不再额外插入提示行）。
 - **子代理编辑已归并到根会话（2026-10-19 起）**：父会话 `both` 撤回会回退子代理在目标消息
-  之后用 `write`/`edit` 改过的文件（含孙级；锚 = 执行时根会话最新人类消息）。这与
+  之后用 `write`/`edit` 改过的文件（含孙级；锚 = **执行时**根会话最新人类消息）。这与
   `dsh-rewind`/Claude Code checkpoint 的「子代理编辑不恢复」不同，是本项目的有意扩展；
   上溯失败（父会话不 live、header 缺 `parentSession`、血缘成环）时退化为旧行为（不跟踪）。
-  真机验收见 FIELD-NOTES 第 59 条。
+  真机验收见 FIELD-NOTES 第 59/60 条。
+- **后台子代理的锚是"执行时"而不是"派发回合"**：子代理工具立即返回，父回合结束后它仍可能
+  继续改文件，此时编辑会记到**当时最新**的人类消息上。两个边界后果：① 用户在子代理运行
+  期间发了新消息 H2、子代理随后写文件 → 撤回 H2 会一并回退这些文件，尽管派发它们的是 H1；
+  ② 撤回时子代理仍在跑（`settleAgentForRevert` 只取消根 agent）→ 撤回后最新人类消息回落
+  到更早一条，子代理之后写的文件锚到它；若那是会话首条（首条禁止撤回），这些改动再也
+  撤不掉。要改成"派发回合取锚"需要子会话投递消息的时间并在根表面按时间定位，当前按
+  时间语义记录。
+- **rescue 副本不在界面提示**：撤回恢复/删除一个文件前会把当前内容复制到
+  `~/.dsh/paseo-rewind/<sessionId>/rescue/`，回执与插件日志都带路径，但 UI 只在
+  `files.failed` 时提示。若你在撤回前手动改过该文件，"改动被覆盖"需要自己到 rescue 目录
+  找回（文件名带时间戳，按次独立）。
 - **注册的 slash 命令行不可撤回**：命令行没有对应的 DSH `user/message`，因此没有可回退锚点；
   Paseo 的撤回菜单按 provider 能力位渲染，无法按行隐藏，点击会得到"没有撤回令牌"的错误。
   按行隐藏/禁用需要上游契约。
@@ -189,6 +204,7 @@ node harness/replay-fidelity-probe.mjs <session.v4.jsonl.zstd>  # 真实日志�
 node harness/rewind-e2e.mjs
 # 断言：成功回执、文件删除、history 折叠成 1 条用户消息、无 command/run、
 #       模型仍知道 ALPHA、不再知道 BETA
+node harness/rewind-merge-e2e.mjs    # 父写 + 子代理写 → both 撤回 → 两个文件都删除、子会话无 journal
 
 # 插件层（先按 plugin-check.cjs 头部步骤编译到 .dbg）
 node harness/parked-sessions-check.cjs paseo-plugin/.dbg
@@ -196,7 +212,8 @@ node harness/parked-sessions-check.cjs paseo-plugin/.dbg
 
 真机验收（新会话，能力位只对新会话生效）：发两条消息 → 撤回第二条 → 消息行消失、无
 `/rewind` 行/回合页脚、文件回到消息前、模型不知道被撤内容；重开会话后仍正确。
-父会话派子代理改的文件同样随 `both` 撤回回退（归并到根会话，见 FIELD-NOTES 第 59 条）。
+父会话派子代理改的文件同样随 `both` 撤回回退（归并到根会话，见 FIELD-NOTES 第 59/60 条）；
+后台子代理跨轮与撤回竞态的边界见上文「已知限制」。
 
 ## 回滚
 

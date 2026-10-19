@@ -144,15 +144,22 @@ if (events.length > 10) {
     };
     const folded = visibleEvents([...events, marker]);
     // The log may already carry this bridge's own seams (a real rewind happened
-    // in it). A freshly appended synthetic seam is therefore asserted against
-    // the ALREADY folded baseline — everything the fold keeps before the new
-    // target, plus the new marker — not against the raw event list, whose old
-    // seam spans are hidden already.
-    const baseline = visibleEvents(events);
+    // in it). Build the expectation INDEPENDENTLY from the raw log: a rewind
+    // marker drops every seq from its `surfaceOp.startSeq` through its own
+    // `seq - 1` (`surface.js`), so the kept set is the raw events minus those
+    // spans, then minus everything the synthetic seam withdraws. Deriving it
+    // from the surfaceOps (not from `visibleEvents` output) keeps this a real
+    // check even when prior seams exist.
+    const priorSpans = seams
+      .filter((event) => typeof event.surfaceOp?.startSeq === 'number')
+      .map((event) => [event.surfaceOp.startSeq, event.seq - 1]);
+    const droppedByPriorSeam = (seq) => seq !== undefined
+      && priorSpans.some(([from, to]) => seq >= from && seq <= to);
     // Lines without a seq are the log header/format marker, not events of the
     // span; they always survive the fold.
     const expected = [
-      ...baseline.filter((event) => event.seq === undefined || event.seq < shadowed[0]),
+      ...events.filter((event) => !droppedByPriorSeam(event.seq)
+        && (event.seq === undefined || event.seq < shadowed[0])),
       marker,
     ];
     check(
@@ -160,10 +167,11 @@ if (events.length > 10) {
       JSON.stringify(folded.map((event) => event.seq)) === JSON.stringify(expected.map((event) => event.seq)),
       `${folded.length} kept vs ${expected.length} expected`,
     );
+    const expectedHumans = expected.filter(isHumanUser).length;
     check(
       'the span before the rewind target is untouched',
-      folded.filter(isHumanUser).length === baseline.filter((event) => isHumanUser(event) && event.seq < shadowed[0]).length,
-      `${folded.filter(isHumanUser).length} vs ${baseline.filter((event) => isHumanUser(event) && event.seq < shadowed[0]).length}`,
+      folded.filter(isHumanUser).length === expectedHumans,
+      `${folded.filter(isHumanUser).length} vs ${expectedHumans}`,
     );
   } else {
     console.log('SKIP  no human user message on the surface to build a probe rewind from');

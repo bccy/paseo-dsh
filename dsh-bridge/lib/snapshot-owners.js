@@ -58,3 +58,22 @@ export function rootSessionFor(session, getSession) {
   }
   return current;
 }
+
+/**
+ * The bridge's in-memory key for one tool call's pending file snapshot.
+ *
+ * The executing session id is part of the key because the call id alone is not
+ * process-unique: models/providers mint it, and DSH only guarantees it links a
+ * call to its result *within one session* (forked sessions even carry copies of
+ * their source's calls). `FileSnapshots` already keys its pending entries per
+ * session for the same reason; owner resolution must not be looser than that, or
+ * one session's commit could resolve to another session's owner and journal a
+ * path under the wrong conversation.
+ *
+ * @param {object} session - the session that ran the tool.
+ * @param {string} callId
+ * @returns {string}
+ */
+export function snapshotOwnerKey(session, callId) {
+  return `${String(session?.id ?? '')}:${String(callId)}`;
+}

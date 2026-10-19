@@ -1720,14 +1720,16 @@ DSH 日志里有一条 `write`，`file_path=<工作区根>/subagent-rewind-probe
   （沿 `header.parentSession` 用 live `ctx.sessions` 上溯到非子会话；缺 `parentSession` /
   父不 live / 血缘成环 → 返回 undefined，fail-open）。
 - `captureFileBeforeTool` 改为**先解析根会话**：锚 = 根会话当时最新人类消息 seq，快照写
-  **根会话**的 journal/objects；新增 `callId → owner` 内存映射，供 `commitFileTool` /
-  `dropFileTool` 找回同一个 pending 键。路径仍按**执行会话**的 cwd 解析（工具语义不变）。
+  **根会话**的 journal/objects；新增 `sessionId:callId → owner` 内存映射，供 `commitFileTool` /
+  `dropFileTool` 找回同一个 pending 键。路径按**工作目录服务**的当前目录解析（与
+  `write`/`edit` 一致；`header.cwd` 只是会话最初的项目目录，不是执行时的目录）。
 - 孙级逐层上溯；bash/外部进程/用户改动的边界不变。
 
 **验收**：
-- 新增 `harness/rewind-merge-check.mjs`（31/31）：解析（子/孙/仅 `delegationDepth` 都到根；
-  缺链/死链/环 fail-open）、归属（子/孙编辑落根 journal、子会话无目录、相对路径按子 cwd）、
-  失败/未跟踪不记录、双树隔离、`planRestore`/`restore` 覆盖子代理编辑。
+- 新增 `harness/rewind-merge-check.mjs`（当时 31/31，第 60 条修后 37/37）：解析（子/孙/仅
+  `delegationDepth` 都到根；缺链/死链/环 fail-open）、归属（子/孙编辑落根 journal、
+  子会话无目录、相对路径按工作目录服务的当前目录）、失败/未跟踪不记录、双树隔离、
+  `planRestore`/`restore` 覆盖子代理编辑。
 - 既有离线回归：`file-snapshot-check` 41、`revert-check` 98、`surface-check` 18、
   `revert-shape-probe` 10，全部 PASS。
 - 程序化真机探针（新 `dsh --profile paseo`，`paseo/revert both`）13/13：父会话
@@ -1741,6 +1743,61 @@ DSH 日志里有一条 `write`，`file_path=<工作区根>/subagent-rewind-probe
 > **教训**：**"不可撤回"要先分清是语义边界还是实现缺口**。原先写进"已知限制"的理由
 > （子会话没有父锚点、seq 不可比）只说明"不能直接复用子会话锚"，不说明"不能归并"——
 > 按执行时的**根锚**把编辑记进**根 journal** 即可，代价只是一次 `sessions.get` 上溯。
+
+### 60. 归并实现的审计修正：callId 键维度、工作目录解析、后台子代理锚边界
+
+**背景**：第 59 条提交（`4fea24b`）后做了一次独立全链审查（只读子代理，报告在仓库外）。
+结论「有条件通过」：无 blocker，3 个 major + 1 个接线测试空洞。
+
+**M1 `callId → owner` 键丢了会话维度**：
+- 证据：`exec.callId = block.id` 由 provider 铸造（`dsh-agent-loop/lib/index.js:512`），DSH 只
+  约束会话内的 call→result 关联（`dsh-session/lib/index.js:1217`），没有进程级唯一分配器；
+  审查扫本机 474 份日志，14860 个 callId 里 32 个跨 4 个会话重复（`session/fork` 复制日志，
+  `dsh-session:2008`）。原 `FileSnapshots.pending` 的键已经是 `sessionId:callId`。
+- 后果：两个会话/兄弟子代理拿到同一 callId 时，一方的 commit 会按另一方 owner 提交 →
+  A 工作区的路径写进 B 的 journal（B 撤回时改到 A 的文件），A 的 pending 永久泄漏，且不报错。
+- 修：抽出 `snapshotOwnerKey(session, callId) = "sessionId:callId"`；capture/commit/drop
+  都用执行会话重算键；`exec.callId` 缺失直接返回。
+
+**M3 相对路径按 `header.cwd` 解析（可能删错文件）**：
+- 证据：`write`/`edit` 按 `ctx.workingDirectory.ensure(agent)` 的当前目录解析
+  （`dsh-tool-fs/lib/index.js` session-cwd）；子会话 `header.cwd` 复制自父会话
+  （`dsh-subagent/lib/index.js:350`），实际工作目录是 `create.cwd`（`:1524`，
+  `workingDirectory.set(child, create.cwd)` 在 `:1804`）。
+- 后果（真反例）：父会话在 /repo、子代理 `cwd:"sub"`、`write {"file_path":"note.txt"}` 实际写
+  /repo/sub/note.txt；快照却 stat /repo/note.txt 并记成"新建"（backup=null），撤回时若
+  /repo/note.txt 已被别人创建就会被删除（rescue 有副本，但 UI 不提示）。`cd` 后的根会话
+  自己也有同样问题。
+- 修：`workingDirectoryOf(session)` 优先
+  `ctx.get('workingDirectory')?.get(session)`，服务缺失/异常才回退 `header.cwd`；
+  测试用 `workingDir` 字段显式建模该服务，并断言 `header.cwd ≠ workingDir` 时按后者解析。
+
+**M2 后台子代理的锚是"执行时"而不是"派发回合"（未改代码，文档化）**：
+- 子代理工具立即返回（`dsh-tool-subagent`），父回合结束后它仍可能继续写文件；锚取
+  "执行时根会话最新人类消息"，不是派发它的那条消息。
+- 反例 A：H1 派子代理 → 父回合结束 → 用户发 H2 → 子代理在 H2 期间写文件 → 撤回 H2 会
+  回退这些文件，尽管派发它们的是 H1（对话里 H1 的派发仍在）。
+- 反例 B：撤回 H2 时子代理仍在跑（`settleAgentForRevert` 只取消根 agent）→ 撤回后根会话
+  最新人类消息回落到 H1，子代理随后写的文件锚到 H1；两消息会话里 H1 是首条（首条禁止
+  撤回），这些改动**再也撤不掉**。
+- 处理：写进 `docs/REWIND.md` 已知限制，把"父 both 撤回会回退子代理文件"改成有条件表述；
+  "派发回合取锚"（用子会话投递消息的 time，在根表面按 time<=该时刻定位）留作后续设计。
+
+**M4 测试与探针补齐**：
+- `harness/rewind-merge-check.mjs` 31 → 37 条：新增 fork 形状（`parentSession` 但非委派必须
+  停在自身）、owner key 跨会话不同、工作目录解析、同路径父子先后写（earliest-touch 恢复）。
+- 新增 `harness/rewind-merge-e2e.mjs`：真机可复跑探针（父写 + 子代理写 → both 撤回 →
+  两个文件都删除、子会话无 journal）。
+- `harness/replay-fidelity-probe.mjs` 的期望改为从原始 `surfaceOps` 独立推导（不再是
+  fold-vs-fold），带缝日志与干净日志各 4/4。
+
+**仍存在的边界**：M2 语义（未改）；rescue 覆盖手动改动无 UI 提示；fail-open 只有固定
+日志行、无原因码；server 接线（事件顺序）仍无离线覆盖，靠真机探针兜底。
+
+> **教训**：审查「键」和「路径」这类基础设施维度时，要直接查上游契约（callId 唯一性、
+> 路径解析入口），不要因为默认 provider 行为"看起来没问题"就放过——它们决定的是
+> 错归/错删这类**无声故障**。另外，测试如果自己复刻了被测实现的关键判断，就只证明了
+> 复刻是对的；真机探针要入库、可复跑，才算验收证据。
 
 ---
 ## 已知限制（未修，有意为之）

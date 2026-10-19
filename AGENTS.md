@@ -40,7 +40,7 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon 进程里）
 
 ### 改之前先读
 
-- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 六十余条真实缺陷（编号到 58，含 `b`/`c`
+- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 六十余条真实缺陷（编号到 60，含 `b`/`c`
   补记与 DSH 0.2.1 升版教训）。里面有整整一类错误叫
   **静默降级**（把不知道的东西当成成功、把不支持的能力悄悄丢掉）。改动前先看一遍，
   避免重新发明这些 bug。
@@ -139,9 +139,11 @@ cd paseo-plugin && npx tsc --noEmit
 node harness/revert-check.mjs          # 令牌/区间/前置/回执/文件层/停放接线
 node harness/surface-check.mjs         # 只折撤回缝、compaction 保留、尾随日志事件
 node harness/file-snapshot-check.mjs   # 编辑工具级写前备份（真实临时目录）
+node harness/rewind-merge-check.mjs    # 父子归并：子/孙编辑落根会话 journal、断链 fail-open
 node harness/revert-shape-probe.mjs    # 真实 DSH Session：旧写法必抛、新写法通过
 node harness/replay-fidelity-probe.mjs <session.v4.jsonl.zstd>  # 真实日志重放保真
 node harness/rewind-e2e.mjs            # 真 dsh --profile paseo，3 回合端到端（耗 token）
+node harness/rewind-merge-e2e.mjs      # 真机父子归并：父写+子代理写 → both 撤回 → 两文件都删（耗 token）
 
 # 停放会话（先按 plugin-check.cjs 头部步骤把插件编译到 .dbg）
 node harness/parked-sessions-check.cjs paseo-plugin/.dbg

@@ -23,7 +23,7 @@ import { admitEncodedImages } from '@deepseek-ai/dsh-attachment';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import { underArchivedSession } from './archived-lineage.js';
 import { FileSnapshots, isTrackedTool, mutationPathOf, resolveMutationPath } from './file-snapshots.js';
-import { rootSessionFor as resolveRootSession } from './snapshot-owners.js';
+import { rootSessionFor as resolveRootSession, snapshotOwnerKey } from './snapshot-owners.js';
 import { isHumanUserMessage, planRewind, restoresFiles, revertScope, successText } from './revert.js';
 import { visibleEvents } from './surface.js';
 import { historyEvents, withImageHostPaths } from './image-host-path.js';
@@ -203,12 +203,15 @@ export class PaseoHarnessServer {
      */
     this.fileSnapshots = new FileSnapshots();
     /**
-     * tool callId -> the session id its pending file snapshot is keyed under.
+     * Pending file-snapshot key (`sessionId:callId`) -> the session id its
+     * snapshot is journaled under.
      *
      * A subagent's edit is snapshotted under the ROOT session (the one a human
      * can rewind), not under the child that ran the tool, so `commit` and
-     * `discard` cannot recompute the key from `exec.agent.session`. Captured
+     * `discard` cannot recompute the owner from `exec.agent.session`. Captured
      * here at `tools/execute` and consumed by `tools/post-execute`/`tools/result`.
+     * The key carries the executing session because a call id is only unique
+     * within its session (see `snapshot-owners.js`).
      */
     this.snapshotOwners = new Map();
     /**
@@ -1128,6 +1131,28 @@ export class PaseoHarnessServer {
   }
 
   /**
+   * The directory a relative editing path resolves against.
+   *
+   * `header.cwd` is a session's ORIGINAL project directory, not its current one:
+   * `cd`-style changes and a subagent's `cwd` argument move the effective
+   * working directory (the `workingDirectory` service owns it). A snapshot must
+   * resolve exactly like the tool does, or it records the wrong path — and a
+   * wrong path means a rewind could delete an unrelated file.
+   *
+   * @param {object} session
+   * @returns {string}
+   */
+  workingDirectoryOf(session) {
+    try {
+      const current = this.ctx.get('workingDirectory')?.get(session);
+      if (typeof current === 'string' && current !== '') return current;
+    } catch {
+      /* fall back to the header: never fail the turn over a snapshot path */
+    }
+    return session?.header?.cwd ?? this.cwd;
+  }
+
+  /**
    * Snapshot one file before a tracked editing tool mutates it.
    *
    * Called from `tools/execute`; never throws, because a snapshot problem must
@@ -1145,6 +1170,7 @@ export class PaseoHarnessServer {
       const session = exec?.agent?.session;
       if (session === undefined) return;
       if (!isTrackedTool(exec)) return;
+      if (exec?.callId === undefined) return;
       const rawPath = mutationPathOf(exec);
       if (rawPath === undefined) return;
       const owner = this.rootSessionFor(session);
@@ -1154,7 +1180,9 @@ export class PaseoHarnessServer {
       }
       const anchorSeq = this.latestHumanAnchor(owner);
       if (anchorSeq === undefined) return;
-      const path = resolveMutationPath(session.header?.cwd ?? this.cwd, rawPath);
+      // Resolve exactly like the editing tool does: its current working
+      // directory, not the durable header's original cwd.
+      const path = resolveMutationPath(this.workingDirectoryOf(session), rawPath);
       const callId = String(exec.callId);
       const result = await this.fileSnapshots.capture({
         sessionId: String(owner.id),
@@ -1162,7 +1190,7 @@ export class PaseoHarnessServer {
         callId,
         path,
       });
-      if (result.ok) this.snapshotOwners.set(callId, String(owner.id));
+      if (result.ok) this.snapshotOwners.set(snapshotOwnerKey(session, callId), String(owner.id));
       if (result.ok && result.skipped !== undefined) {
         process.stderr.write(`[bridge] file snapshot skipped for ${path}: ${result.skipped}\n`);
       } else if (!result.ok) {
@@ -1181,10 +1209,13 @@ export class PaseoHarnessServer {
    */
   async commitFileTool(exec, result) {
     try {
-      const callId = String(exec?.callId);
-      const owner = this.snapshotOwners.get(callId);
+      const session = exec?.agent?.session;
+      if (session === undefined || exec?.callId === undefined) return;
+      const callId = String(exec.callId);
+      const key = snapshotOwnerKey(session, callId);
+      const owner = this.snapshotOwners.get(key);
       if (owner === undefined) return;
-      this.snapshotOwners.delete(callId);
+      this.snapshotOwners.delete(key);
       await this.fileSnapshots.commit({ sessionId: owner, callId }, result);
     } catch (error) {
       process.stderr.write(`[bridge] file snapshot commit: ${error instanceof Error ? error.message : String(error)}\n`);
@@ -1198,9 +1229,12 @@ export class PaseoHarnessServer {
    */
   dropFileTool(exec) {
     try {
-      const callId = String(exec?.callId);
-      const owner = this.snapshotOwners.get(callId);
-      this.snapshotOwners.delete(callId);
+      const session = exec?.agent?.session;
+      if (session === undefined || exec?.callId === undefined) return;
+      const callId = String(exec.callId);
+      const key = snapshotOwnerKey(session, callId);
+      const owner = this.snapshotOwners.get(key);
+      this.snapshotOwners.delete(key);
       if (owner === undefined) return;
       this.fileSnapshots.discard({ sessionId: owner, callId });
     } catch {
