@@ -144,6 +144,43 @@ const UI_COPY: Record<Locale, UiCopy> = {
 /** The copy for the resolved locale. */
 export const UI: UiCopy = UI_COPY[LOCALE];
 
+/**
+ * Display names for DSH's built-in agent presets.
+ *
+ * The preset `id` is the wire value Paseo sends back and is never translated.
+ * These names are DSH's own wording, copied verbatim from
+ * `@deepseek-ai/dsh-client-ui-agent-preset` (`presetStandardName`, `presetPtcName`,
+ * `presetMinimalName`, `presetCordisName`), so both clients name the same preset
+ * the same way. A preset this table does not know about — one a deployment added,
+ * or a newer DSH — keeps the name DSH reports, and otherwise its id.
+ */
+const PRESET_LABELS: Record<Locale, Readonly<Record<string, string>>> = {
+  en: {
+    standard: "Standard mode",
+    ptc: "PTC mode",
+    minimal: "Minimal mode",
+    cordis: "Creator mode",
+  },
+  "zh-CN": {
+    standard: "标准模式",
+    ptc: "PTC 模式",
+    minimal: "极简模式",
+    cordis: "创造模式",
+  },
+};
+
+/**
+ * The display name for one agent preset.
+ *
+ * @param id - the preset id DSH reported; the only value Paseo ever sends back.
+ * @param reported - the name DSH itself reported. It wins when present, because a
+ *   deployment that renamed a preset locally already chose its wording.
+ */
+export function presetLabel(id: string, reported?: string): string {
+  if (reported !== undefined && reported !== "") return reported;
+  return PRESET_LABELS[LOCALE][id] ?? id;
+}
+
 /** One command's menu copy. The name is the runtime's own and never translated. */
 export interface CommandCopy {
   name: string;

@@ -52,7 +52,7 @@ function replayTimestamp(event: { time?: unknown }): string | undefined {
     ? new Date(event.time).toISOString()
     : undefined;
 }
-import { UI, commandCopy, skillDescription } from "./locale";
+import { UI, commandCopy, presetLabel, skillDescription } from "./locale";
 
 /**
  * Modes Paseo offers in the composer. `plan` drives DSH's plan-mode service.
@@ -520,7 +520,9 @@ export class DshSession {
     this.#preset = info.current ?? info.default;
     this.#presetOptions = info.presets.map((preset) => ({
       value: preset.id,
-      label: preset.name ?? preset.id,
+      // DSH reports the id; the display name comes from DSH's own wording for its
+      // built-in presets (locale.ts), so the app names them like the web UI does.
+      label: presetLabel(preset.id, preset.name),
     }));
   }
 
