@@ -1701,6 +1701,47 @@ cwd 提示）。
 > 提示词变量、插件 schema、服务名、异步就绪时机这类"软契约"让功能静默失效。升版后必须重跑
 > `plugin-check`，而不是只看 `doctor`（`doctor` 只查安装完整性，查不出回合层失败和空目录）。
 
+### 59. 子代理编辑的文件不随父会话撤回 → 归并到根会话
+
+**症状**：主会话 `both` 撤回成功（daemon 日志 `agent.rewind.start` / `agent.rewind.complete`
+均为 `mode:"both"`；DSH 日志写入 `source.kind=paseo-rewind` 标记并遮蔽目标区间），但主会话
+派子代理用 `write` 改的文件仍在工作区；回执 `files` 为空，父会话 journal 里没有该路径，
+`~/.dsh/paseo-rewind/` 下也没有子会话目录。
+
+**根因**（2026-10-19 真机取证）：`captureFileBeforeTool` 对 `header.origin==='subagent'`
+（或 `delegationDepth>0`）直接 return；journal 按 sessionId 分目录，撤回只读父会话自己的
+journal。子会话的编辑只在子会话日志里，父撤回寻址不到。实测证据：子会话 `9ef84cb2…` 的
+DSH 日志里有一条 `write`，`file_path=<工作区根>/subagent-rewind-probe.txt`
+（mtime 13:02:21.97）；13:02:39 撤回 `mode:"both"` 后文件仍在（内容 `SUBAGENT-EDITED-IN-WORKSPACE`），
+父 journal 只有更早的两条无关记录。
+
+**修法**：
+- 新增纯模块 `dsh-bridge/lib/snapshot-owners.js`：`isDelegatedSession` + `rootSessionFor`
+  （沿 `header.parentSession` 用 live `ctx.sessions` 上溯到非子会话；缺 `parentSession` /
+  父不 live / 血缘成环 → 返回 undefined，fail-open）。
+- `captureFileBeforeTool` 改为**先解析根会话**：锚 = 根会话当时最新人类消息 seq，快照写
+  **根会话**的 journal/objects；新增 `callId → owner` 内存映射，供 `commitFileTool` /
+  `dropFileTool` 找回同一个 pending 键。路径仍按**执行会话**的 cwd 解析（工具语义不变）。
+- 孙级逐层上溯；bash/外部进程/用户改动的边界不变。
+
+**验收**：
+- 新增 `harness/rewind-merge-check.mjs`（31/31）：解析（子/孙/仅 `delegationDepth` 都到根；
+  缺链/死链/环 fail-open）、归属（子/孙编辑落根 journal、子会话无目录、相对路径按子 cwd）、
+  失败/未跟踪不记录、双树隔离、`planRestore`/`restore` 覆盖子代理编辑。
+- 既有离线回归：`file-snapshot-check` 41、`revert-check` 98、`surface-check` 18、
+  `revert-shape-probe` 10，全部 PASS。
+- 程序化真机探针（新 `dsh --profile paseo`，`paseo/revert both`）13/13：父会话
+  `parent-control.txt` 与子代理 `subagent-test.txt` 均进根 journal（anchorSeq=25），
+  子会话 `1294f547…` 无 journal；回执 `files.deleted` 同时列出两者，两文件均被删除。
+- `rewind-e2e`（3 回合真机）12/12 PASS，既有文件回退与上下文撤回未回归。
+
+**边界**：与 `dsh-rewind` / Claude Code checkpoint 的「子代理编辑不恢复」相反，是本项目的
+有意扩展；上溯失败时退化为旧行为（不跟踪）。子会话自身仍不可撤回（只读投影）。
+
+> **教训**：**"不可撤回"要先分清是语义边界还是实现缺口**。原先写进"已知限制"的理由
+> （子会话没有父锚点、seq 不可比）只说明"不能直接复用子会话锚"，不说明"不能归并"——
+> 按执行时的**根锚**把编辑记进**根 journal** 即可，代价只是一次 `sessions.get` 上溯。
+
 ---
 ## 已知限制（未修，有意为之）
 

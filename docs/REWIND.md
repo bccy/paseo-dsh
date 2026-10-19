@@ -72,12 +72,17 @@ Paseo 撤回按钮
 - 桥通过 DSH 原生钩子 `ctx.inject(['fs'])` 监听 `tools/execute` / `tools/post-execute` /
   `tools/result`：`write`/`edit` 执行前读旧内容，成功后按「最近一条 human 用户消息 seq」
   记一行 journal；失败/中断丢弃。
+- **子代理编辑归并到根会话**：工具跑在原生子会话里时，沿 `header.parentSession` 上溯到
+  根会话（`dsh-bridge/lib/snapshot-owners.js`），用**根会话**当时最新的人类消息当锚，
+  快照写进**根会话**的 journal/objects；commit/discard 通过 `callId → owner` 内存映射
+  找回同一个 pending 键。因此父会话 `both` 撤回会连子代理改过的文件一起回退。
 - 根目录 `~/.dsh/paseo-rewind/<sessionId>/`：`journal.jsonl` + `objects/`（内容寻址）+
   `rescue/`（恢复前当前内容的备份）。
 - 撤回 `both` 时：读 journal，取每个路径「目标消息及之后最早一次改动前的状态」——新建的
   文件删除，被改的写回，未被工具的动的不碰；覆盖前把当前内容存入 rescue。
-- 不跟踪：bash/pwsh 等命令产生的改动、用户或外部进程直接改的文件、符号链接、> 8 MiB 文件、
-  子代理会话。这是本方案的语义边界，写进已知限制。
+- 不跟踪：bash/pwsh 等命令产生的改动、用户或外部进程直接改的文件、符号链接、> 8 MiB 文件。
+  子代理编辑属于归并而不是跳过；只有上溯失败（父会话不 live、header 缺 `parentSession`、
+  血缘成环）时才退化为不跟踪（fail-open，stderr 记一行原因）。
 
 ### 刷新：Reload 旁路 + 停放会话
 
@@ -151,8 +156,11 @@ this.ctx.get('permissionPresets').set(session, name);
 - 记忆插件可能仍召回被撤内容（模型"记得"）——已知缺口，不在本次范围。
 - 由于首条被拒绝，本实现不会再产生"空对话"；历史上已被旧版本撤空的会话，重开时就是一个
   没有消息的空对话（不再额外插入提示行）。
-- **子代理编辑的文件不跟踪**：文件快照只记主会话编辑工具的动作；子代理改的文件在第 2 层
-  没有父会话可用的锚点，父会话 `both` 撤回不会回退它们（已知限制）。
+- **子代理编辑已归并到根会话（2026-10-19 起）**：父会话 `both` 撤回会回退子代理在目标消息
+  之后用 `write`/`edit` 改过的文件（含孙级；锚 = 执行时根会话最新人类消息）。这与
+  `dsh-rewind`/Claude Code checkpoint 的「子代理编辑不恢复」不同，是本项目的有意扩展；
+  上溯失败（父会话不 live、header 缺 `parentSession`、血缘成环）时退化为旧行为（不跟踪）。
+  真机验收见 FIELD-NOTES 第 59 条。
 - **注册的 slash 命令行不可撤回**：命令行没有对应的 DSH `user/message`，因此没有可回退锚点；
   Paseo 的撤回菜单按 provider 能力位渲染，无法按行隐藏，点击会得到"没有撤回令牌"的错误。
   按行隐藏/禁用需要上游契约。
@@ -173,6 +181,7 @@ this.ctx.get('permissionPresets').set(session, name);
 node harness/revert-check.mjs        # 令牌/区间/前置/回执/文件层/停放接线
 node harness/surface-check.mjs       # 只折撤回缝、compaction 保留、尾随事件
 node harness/file-snapshot-check.mjs # 写前备份/新建删除/多工具/救援/上限
+node harness/rewind-merge-check.mjs  # 父子归并：子/孙编辑落根会话 journal、断链 fail-open
 node harness/revert-shape-probe.mjs  # 真实 DSH Session：旧写法必抛、新写法通过、marker 不进上下文
 node harness/replay-fidelity-probe.mjs <session.v4.jsonl.zstd>  # 真实日志重放保真
 
@@ -187,6 +196,7 @@ node harness/parked-sessions-check.cjs paseo-plugin/.dbg
 
 真机验收（新会话，能力位只对新会话生效）：发两条消息 → 撤回第二条 → 消息行消失、无
 `/rewind` 行/回合页脚、文件回到消息前、模型不知道被撤内容；重开会话后仍正确。
+父会话派子代理改的文件同样随 `both` 撤回回退（归并到根会话，见 FIELD-NOTES 第 59 条）。
 
 ## 回滚
 

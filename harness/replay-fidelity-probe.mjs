@@ -143,10 +143,16 @@ if (events.length > 10) {
       data: { id: 'probe-marker', role: 'user', content: [{ type: 'text', text: '(empty message)' }], source: { kind: 'paseo-rewind' } },
     };
     const folded = visibleEvents([...events, marker]);
+    // The log may already carry this bridge's own seams (a real rewind happened
+    // in it). A freshly appended synthetic seam is therefore asserted against
+    // the ALREADY folded baseline — everything the fold keeps before the new
+    // target, plus the new marker — not against the raw event list, whose old
+    // seam spans are hidden already.
+    const baseline = visibleEvents(events);
     // Lines without a seq are the log header/format marker, not events of the
     // span; they always survive the fold.
     const expected = [
-      ...events.filter((event) => event.seq === undefined || event.seq < shadowed[0]),
+      ...baseline.filter((event) => event.seq === undefined || event.seq < shadowed[0]),
       marker,
     ];
     check(
@@ -156,8 +162,8 @@ if (events.length > 10) {
     );
     check(
       'the span before the rewind target is untouched',
-      folded.filter(isHumanUser).length === appendUser.filter((event) => event.seq < shadowed[0]).length,
-      `${folded.filter(isHumanUser).length} vs ${appendUser.filter((event) => event.seq < shadowed[0]).length}`,
+      folded.filter(isHumanUser).length === baseline.filter((event) => isHumanUser(event) && event.seq < shadowed[0]).length,
+      `${folded.filter(isHumanUser).length} vs ${baseline.filter((event) => isHumanUser(event) && event.seq < shadowed[0]).length}`,
     );
   } else {
     console.log('SKIP  no human user message on the surface to build a probe rewind from');

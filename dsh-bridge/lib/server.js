@@ -23,6 +23,7 @@ import { admitEncodedImages } from '@deepseek-ai/dsh-attachment';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import { underArchivedSession } from './archived-lineage.js';
 import { FileSnapshots, isTrackedTool, mutationPathOf, resolveMutationPath } from './file-snapshots.js';
+import { rootSessionFor as resolveRootSession } from './snapshot-owners.js';
 import { isHumanUserMessage, planRewind, restoresFiles, revertScope, successText } from './revert.js';
 import { visibleEvents } from './surface.js';
 import { historyEvents, withImageHostPaths } from './image-host-path.js';
@@ -201,6 +202,15 @@ export class PaseoHarnessServer {
      * DSH `fs` service.
      */
     this.fileSnapshots = new FileSnapshots();
+    /**
+     * tool callId -> the session id its pending file snapshot is keyed under.
+     *
+     * A subagent's edit is snapshotted under the ROOT session (the one a human
+     * can rewind), not under the child that ran the tool, so `commit` and
+     * `discard` cannot recompute the key from `exec.agent.session`. Captured
+     * here at `tools/execute` and consumed by `tools/post-execute`/`tools/result`.
+     */
+    this.snapshotOwners = new Map();
     /**
      * Native child session id -> { parentId, mode?, label? }. Populated from
      * each child session's own durable header (`origin: 'subagent'`) the moment
@@ -1097,10 +1107,36 @@ export class PaseoHarnessServer {
   }
 
   /**
+   * The session a rewind can address for this tool call: the root (non-subagent)
+   * ancestor of the executing session.
+   *
+   * A native subagent edits files from its own session, whose log a parent
+   * rewind cannot address; the human rewinds the root session. Recording the
+   * edit under the root — anchored to the root's newest human message at
+   * execution time — is what lets the parent's `both` rewind undo it.
+   *
+   * Fails open: when the chain cannot be resolved (a parent session is not
+   * live, a header lacks `parentSession`, or the chain loops) the edit is not
+   * tracked, exactly like the pre-existing subagent skip.
+   *
+   * @param {object} session
+   * @returns {object | undefined}
+   */
+  rootSessionFor(session) {
+    const sessions = this.ctx.get('sessions');
+    return resolveRootSession(session, (id) => sessions?.get(id));
+  }
+
+  /**
    * Snapshot one file before a tracked editing tool mutates it.
    *
    * Called from `tools/execute`; never throws, because a snapshot problem must
    * not stop the agent's turn (the rewind reports a missing snapshot instead).
+   *
+   * The snapshot is keyed under the ROOT session: a rewind restores files by
+   * reading that session's journal, so an edit made by a delegated subagent is
+   * recorded against the newest human message of the conversation the user
+   * actually rewinds.
    *
    * @param {{name?: string, callId?: unknown, arguments?: unknown, agent?: {session?: object}}} exec
    */
@@ -1108,24 +1144,25 @@ export class PaseoHarnessServer {
     try {
       const session = exec?.agent?.session;
       if (session === undefined) return;
-      // A child session's edits are its own: they are anchored to the child's
-      // log, which a parent rewind cannot address. Tracking them here would
-      // record them under an anchor of the parent surface that means nothing for
-      // the child. Documented limitation: a parent `both` rewind does not undo
-      // files a subagent edited.
-      if (session.header?.origin === 'subagent' || (session.header?.delegationDepth ?? 0) > 0) return;
       if (!isTrackedTool(exec)) return;
       const rawPath = mutationPathOf(exec);
       if (rawPath === undefined) return;
-      const anchorSeq = this.latestHumanAnchor(session);
+      const owner = this.rootSessionFor(session);
+      if (owner === undefined) {
+        process.stderr.write('[bridge] file snapshot skipped: no root session for a subagent edit\n');
+        return;
+      }
+      const anchorSeq = this.latestHumanAnchor(owner);
       if (anchorSeq === undefined) return;
       const path = resolveMutationPath(session.header?.cwd ?? this.cwd, rawPath);
+      const callId = String(exec.callId);
       const result = await this.fileSnapshots.capture({
-        sessionId: String(session.id),
+        sessionId: String(owner.id),
         anchorSeq,
-        callId: String(exec.callId),
+        callId,
         path,
       });
+      if (result.ok) this.snapshotOwners.set(callId, String(owner.id));
       if (result.ok && result.skipped !== undefined) {
         process.stderr.write(`[bridge] file snapshot skipped for ${path}: ${result.skipped}\n`);
       } else if (!result.ok) {
@@ -1137,19 +1174,18 @@ export class PaseoHarnessServer {
   }
 
   /**
-   * Commit a successful tool call's pending snapshot to the session journal.
+   * Commit a successful tool call's pending snapshot to the owning journal.
    *
-   * @param {{callId?: unknown, agent?: {session?: object}}} exec
+   * @param {{callId?: unknown}} exec
    * @param {{isError?: boolean}} [result]
    */
   async commitFileTool(exec, result) {
     try {
-      const session = exec?.agent?.session;
-      if (session === undefined) return;
-      await this.fileSnapshots.commit(
-        { sessionId: String(session.id), callId: String(exec.callId) },
-        result,
-      );
+      const callId = String(exec?.callId);
+      const owner = this.snapshotOwners.get(callId);
+      if (owner === undefined) return;
+      this.snapshotOwners.delete(callId);
+      await this.fileSnapshots.commit({ sessionId: owner, callId }, result);
     } catch (error) {
       process.stderr.write(`[bridge] file snapshot commit: ${error instanceof Error ? error.message : String(error)}\n`);
     }
@@ -1158,13 +1194,15 @@ export class PaseoHarnessServer {
   /**
    * Drop a pending snapshot when a tool fails or is cancelled.
    *
-   * @param {{callId?: unknown, agent?: {session?: object}}} exec
+   * @param {{callId?: unknown}} exec
    */
   dropFileTool(exec) {
     try {
-      const session = exec?.agent?.session;
-      if (session === undefined) return;
-      this.fileSnapshots.discard({ sessionId: String(session.id), callId: String(exec.callId) });
+      const callId = String(exec?.callId);
+      const owner = this.snapshotOwners.get(callId);
+      this.snapshotOwners.delete(callId);
+      if (owner === undefined) return;
+      this.fileSnapshots.discard({ sessionId: owner, callId });
     } catch {
       /* dropping a pending snapshot cannot fail in a way worth reporting */
     }
