@@ -357,9 +357,19 @@ console.log("every detail branch carries what it claims");
     JSON.stringify(askedDetailed.text),
   );
   check(
-    "ask_user_question: the head's second half is the first question's header",
-    askedDetailed.label === "Pick",
+    "ask_user_question: the head's second half is the first question's prompt",
+    askedDetailed.label === "Which one?",
     askedDetailed.label,
+  );
+  const askedHeaderOnly = runTool(
+    "ask_user_question",
+    { questions: [{ id: "q1", header: "Pick" }] },
+    "ok",
+  ).detail;
+  check(
+    "ask_user_question: a prompt-less question falls back to its header",
+    askedHeaderOnly.label === "Pick",
+    askedHeaderOnly.label,
   );
   const askedNoHeader = runTool(
     "ask_user_question",

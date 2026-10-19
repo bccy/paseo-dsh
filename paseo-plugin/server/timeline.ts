@@ -234,20 +234,20 @@ function stringField(source: Record<string, unknown>, key: string): string | und
 const QUESTION_TITLE_LIMIT = 80;
 
 /**
- * The first question's `header` (or its prompt) as the row's second half.
+ * The first question's prompt (or its header) as the row's second half.
  *
  * A `plain_text` row's head is `label · summary`: `label` comes from the tool's
  * own title (「提问」) and `summary` from this detail's `label`. Leaving DSH's
  * generic row title there made both halves identical — the client dedupes them —
  * so the row read just 「提问」 and the question itself only appeared after
- * expanding. The question header is the title the user is actually looking for;
- * the prompt is the fallback when the caller gave no header.
+ * expanding. The prompt is what the user wants to read in the head; the header
+ * (a short category label) is only the fallback for a prompt-less question.
  */
 function questionRowTitle(input: Record<string, unknown>): string | undefined {
   const questions = Array.isArray(input.questions) ? input.questions : [];
   for (const question of questions) {
     if (!isRecord(question)) continue;
-    const title = stringField(question, "header") ?? stringField(question, "question");
+    const title = stringField(question, "question") ?? stringField(question, "header");
     const trimmed = title?.trim() ?? "";
     if (trimmed === "") continue;
     return trimmed.length > QUESTION_TITLE_LIMIT ? `${trimmed.slice(0, QUESTION_TITLE_LIMIT)}…` : trimmed;
@@ -647,9 +647,9 @@ function toolDetail(name: string, input: Record<string, unknown>, output?: strin
       // call's arguments, the answers are the result's JSON body.
       //
       // The label is the row's second half, not the body title: use the first
-      // question's header/prompt so the head reads 「提问 · <问题标题>」. No
-      // questions falls back to DSH's own row title (then the client dedupes the
-      // two halves and the head is just 「提问」).
+      // question's prompt (header only when it has no prompt) so the head reads
+      // 「提问 · <问题正文>」. No questions falls back to DSH's own row title
+      // (then the client dedupes the two halves and the head is just 「提问」).
       return {
         type: "plain_text",
         label: questionRowTitle(input) ?? UI.toolLabels.askedUser,
