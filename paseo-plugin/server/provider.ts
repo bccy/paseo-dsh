@@ -91,6 +91,18 @@ interface DeferredNotice {
 const MAX_DEFERRED_NOTICES = 20;
 
 /**
+ * Cap on retained provider-session → DSH-session id mappings.
+ *
+ * `session.close` keeps the mapping on purpose (a notice deferred for the closed
+ * session still has to reach the reopened timeline), and every reload mints a new
+ * provider session id for the same DSH session, so a long-lived daemon would
+ * otherwise accumulate one entry per reload forever. Old entries only serve
+ * notices for long-closed sessions; past the cap the oldest is dropped and the
+ * drop is logged rather than growing without bound.
+ */
+const MAX_DSH_ID_MAPPINGS = 500;
+
+/**
  * Last-resort route. The DSH profile's `agent-default-model` is the real source
  * of truth and is read from every catalog; this only backs a profile that
  * composes no default at all, so it deliberately names nothing anyone runs.
@@ -104,11 +116,6 @@ function messageOf(error: unknown): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
-}
-
-/** The DSH profile that must exist for this provider to work. */
-function profileName(): string {
-  return process.env.DSH_PASEO_PROFILE ?? "paseo";
 }
 
 let catalogCache: { at: number; cwd: string; value: DisplayCatalog } | undefined;
@@ -215,7 +222,6 @@ function toDisplayCatalog(raw: DshCatalog): DisplayCatalog {
       id: `${model.provider}/${model.id}`,
       label: model.name,
       description: providerName.get(model.provider) ?? model.provider,
-      ...(model.description === undefined ? {} : {}),
       ...(model.reasoning?.defaultEffort === undefined || thinkingOptions.length === 0
         ? {}
         : {
@@ -240,6 +246,27 @@ function toDisplayCatalog(raw: DshCatalog): DisplayCatalog {
       ? `${raw.defaultProvider}/${raw.defaultModel}`
       : models[0]?.id;
 
+  // A mode the runtime does not compose must not be advertised: Paseo renders the
+  // selector from this list, and a pick the backend cannot apply is dropped (the
+  // plan-mode switch then fails on `paseo/plan/set`). The bridge reports the truth
+  // in `planMode`; an older bridge omits it, so absence keeps the previous list
+  // rather than hiding a working mode.
+  const providerModes = modes();
+  const advertisedModes =
+    raw.planMode === false ? providerModes.filter((mode) => mode.id !== "plan") : providerModes;
+
+  // The provider-wide default has to be one of the provider-wide options. The
+  // daemon applies `defaultThinkingOption` to every model that carries no default
+  // of its own (`mapModel` in `@getpaseo/server`), so an effort outside the
+  // intersection advertises a default some model cannot serve; the configure path
+  // then drops it, which is a choice the user is shown and loses.
+  const defaultThinkingOption =
+    raw.defaultReasoningEffort !== undefined &&
+    raw.defaultReasoningEffort !== null &&
+    thinkingOptions.some((option) => option.id === raw.defaultReasoningEffort)
+      ? raw.defaultReasoningEffort
+      : undefined;
+
   return {
     models,
     thinkingOptions,
@@ -249,13 +276,11 @@ function toDisplayCatalog(raw: DshCatalog): DisplayCatalog {
         : FALLBACK_ROUTE,
     defaults: {
       models,
-      modes: modes(),
+      modes: advertisedModes,
       thinkingOptions,
       ...(defaultModel === undefined ? {} : { defaultModel }),
       defaultMode: "build",
-      ...(raw.defaultReasoningEffort === undefined || raw.defaultReasoningEffort === null
-        ? {}
-        : { defaultThinkingOption: raw.defaultReasoningEffort }),
+      ...(defaultThinkingOption === undefined ? {} : { defaultThinkingOption }),
     },
   };
 }
@@ -283,6 +308,14 @@ class DshConnection implements ProviderConnection {
   readonly #deferredNotices = new Map<string, DeferredNotice[]>();
   /** Provider sessions whose rewind is in flight: prompts are refused until the reload. */
   readonly #reverting = new Set<string>();
+  /**
+   * DSH session ids with an `#open` transaction in flight.
+   *
+   * Two concurrent opens for one DSH session would both pass the holder check and
+   * spawn a process, while only one can own the session log's write lock. The entry
+   * is released when the open transaction ends (not when the session closes).
+   */
+  readonly #opening = new Set<string>();
   #display: DisplayCatalog | undefined;
   #paseoBinary: string | undefined;
   #closed = false;
@@ -330,6 +363,7 @@ class DshConnection implements ProviderConnection {
     this.#dshIds.clear();
     this.#deferredNotices.clear();
     this.#reverting.clear();
+    this.#opening.clear();
     // Provider teardown is not a reload: shut the sessions down and kill the
     // parked children instead of keeping them alive for a reopen that will not
     // happen on this connection.
@@ -717,13 +751,15 @@ class DshConnection implements ProviderConnection {
         this.#reverting.delete(sessionId);
         this.#notice(sessionId, "warning", "时间线未自动刷新", "自动 Reload agent 失败；撤回已完成，请手动执行 Reload agent。");
       }
-      // Safety net: a reload that never reaches `session.close` must not leave
-      // the session permanently prompt-blocked. The normal close clears the flag
-      // far earlier; this only fires when the refresh path died silently.
+      // Safety net: a reload that never reaches the reopen must not leave the
+      // session permanently prompt-blocked. The reload's reopen clears the flag
+      // (`#releaseRevertingFor`, keyed by DSH session id); this only fires when the
+      // refresh path died silently, so the wording says that instead of claiming a
+      // close that did happen.
       const safety = setTimeout(() => {
         if (this.#reverting.delete(sessionId)) {
           process.stderr.write(
-            `[${PROVIDER_ID}] rewind reload did not close session ${sessionId} in 15s; prompts allowed again\n`,
+            `[${PROVIDER_ID}] rewind reload did not reopen session ${sessionId} in 15s; prompts allowed again\n`,
           );
         }
       }, 15_000);
@@ -746,6 +782,18 @@ class DshConnection implements ProviderConnection {
     // rewind path after this session closes are queued under the DSH id and
     // delivered when the reload opens the next provider session for it.
     this.#dshIds.set(sessionId, dshSessionId);
+    if (this.#dshIds.size > MAX_DSH_ID_MAPPINGS) {
+      const excess = this.#dshIds.size - MAX_DSH_ID_MAPPINGS;
+      let dropped = 0;
+      for (const key of this.#dshIds.keys()) {
+        if (dropped >= excess) break;
+        this.#dshIds.delete(key);
+        dropped += 1;
+      }
+      process.stderr.write(
+        `[${PROVIDER_ID}] dropped ${String(dropped)} oldest provider→DSH session id mapping(s) (cap ${String(MAX_DSH_ID_MAPPINGS)})\n`,
+      );
+    }
 
     // The daemon injects the Paseo agent id into the provider session env; the
     // post-rewind refresh needs it because `paseo agent reload` takes the agent
@@ -756,6 +804,90 @@ class DshConnection implements ProviderConnection {
     if (agentId !== "") this.#agentIds.set(sessionId, agentId);
 
     const route = parseRoute(config.model, display.fallbackRoute);
+
+    // One DSH session can be materialized by one process only: its log carries a
+    // kernel write lock (`SessionWriteLease` in
+    // `@deepseek-ai/dsh-session-persistence-jsonl`), so a second live owner fails
+    // every session-scoped request with "already owned by an active write handle".
+    // Paseo normally closes the previous provider session before opening the next
+    // one (that is what the rewind's reload does), so a holder here is an anomaly;
+    // leaving both alive makes both unusable, and this provider used to report the
+    // new one ready with an empty `/` menu. Resolve it the way the reload does:
+    // close the session that already holds this DSH session first — an idle child
+    // is parked and adopted by the open below, so nothing is killed unnecessarily.
+    // If that close fails the open fails loudly: guessing would leave an unknown
+    // number of owners.
+    const holder = this.#sessionHolding(dshSessionId, sessionId);
+    if (holder !== undefined) {
+      process.stderr.write(
+        `[${PROVIDER_ID}] DSH session ${dshSessionId} is already held by provider session ${holder.id}; closing it before opening ${sessionId}\n`,
+      );
+      try {
+        // Close first, forget after: if the close throws, the session stays tracked
+        // (its own `close()` is idempotent, so a retry takes the same path) instead
+        // of leaving an untracked live process that still owns the session log.
+        await holder.close({ park: true });
+      } catch (error) {
+        throw new Error(
+          `cannot open ${sessionId}: DSH session ${dshSessionId} is held by provider session ${holder.id} and `
+            + `closing it failed (${messageOf(error)})`,
+        );
+      }
+      this.#sessions.delete(holder.id);
+      this.#agentIds.delete(holder.id);
+      // Tell the daemon the session it still believes is open is gone: silence
+      // would leave prompts routed at a provider session this connection no longer
+      // owns, surfacing later as an unexplained `runtime_failed`.
+      this.#emit({ type: "session.closed", sessionId: holder.id });
+    }
+
+    // A parked child that cannot be reused may still be dying: TTL expiry, capacity
+    // eviction or a route change killed it, and the session log's write lock is
+    // released only when the OS reaps the process. Spawning the next process into
+    // that window makes every session-scoped request fail with "already owned by an
+    // active write handle". Wait (bounded) for the old owner before spawning; a
+    // timeout is logged by the pool and the open proceeds, which is no worse than
+    // the previous behavior. `routeKey` is the same identity `DshSession.open()`
+    // uses to reuse a parked child (`routeKeyOf` in session.ts): provider + model,
+    // never the effort.
+    await this.#parked.quiesce(dshSessionId, {
+      cwd: config.cwd,
+      routeKey: `${route.provider}/${route.model}`,
+    });
+
+    // Paseo fills `config.systemPrompt` from the agent's own system prompt and the
+    // daemon's `appendSystemPrompt` (`mapSessionConfig` in `@getpaseo/server`'s
+    // `plugin-provider.js`). This provider has **no channel** for it: the bridge's
+    // `initialize` carries cwd/route/effort only, and the profile's `system-prompt`
+    // row is static. Silently ignoring it would let a user believe their
+    // instructions reached the model, so it is reported loudly (stderr now, plus a
+    // timeline notice once the session is ready) and never faked. The complete fix
+    // needs a bridge-level per-session prompt section; until that exists this stays
+    // explicitly unsupported.
+    const unsupportedSystemPrompt =
+      typeof config.systemPrompt === "string" && config.systemPrompt.trim() !== ""
+        ? config.systemPrompt
+        : undefined;
+    if (unsupportedSystemPrompt !== undefined) {
+      process.stderr.write(
+        `[${PROVIDER_ID}] session ${sessionId}: Paseo supplied a ${String(unsupportedSystemPrompt.length)}-character system prompt, but this provider has no channel for it — it will NOT be applied\n`,
+      );
+    }
+
+    /** Warnings collected during the open, emitted after `session.ready` so Paseo has the session. */
+    const openWarnings: DeferredNotice[] = [];
+
+    // The concurrent counterpart of the holder check above: two opens for one DSH
+    // session must not interleave (both would pass the check and spawn a process,
+    // and only one can own the log's write lock). There is no await between this
+    // check and the insert, so it is atomic; the entry is released when the open
+    // transaction ends, not when the session closes.
+    if (this.#opening.has(dshSessionId)) {
+      throw new Error(
+        `cannot open ${sessionId}: another open for DSH session ${dshSessionId} is already in flight`,
+      );
+    }
+
     const session = new DshSession({
       sessionId,
       dshSessionId,
@@ -795,6 +927,11 @@ class DshConnection implements ProviderConnection {
     this.#sessions.set(sessionId, session);
 
     try {
+      // Registered inside the try so no throw can leave the marker behind: an
+      // entry that outlives its open would block every later open of this DSH
+      // session. There is no await between the guard above and this insert, so the
+      // check-and-set is still atomic.
+      this.#opening.add(dshSessionId);
       await session.open();
       // Post-open initialisation is part of the open transaction: the daemon
       // drops its maps on a failed open (`PluginProvider.openSession`'s catch
@@ -822,15 +959,25 @@ class DshConnection implements ProviderConnection {
       }
 
       // Advertise the `/` menu before `session.ready` so the composer has it the
-      // moment the session is usable. A command catalog is an enhancement, never a
-      // precondition: a discovery failure logs and leaves the menu empty rather
-      // than failing the whole open.
+      // moment the session is usable. A command catalog is an enhancement in the
+      // sense that its absence must not fail the whole open — but a *throw* here
+      // is a real failure (an empty catalog is `available`/`[]`, not an error),
+      // and this request is what materializes the DSH session
+      // (`getOrCreateSession` in the bridge). Swallowing it silently left the
+      // composer without the `/` menu and the permission select while the session
+      // reported ready, so the failure becomes a timeline warning below.
       try {
         await session.loadCommands();
         await session.loadPermission();
         await session.loadPresets();
       } catch (error) {
-        process.stderr.write(`[${PROVIDER_ID}] command catalog failed: ${messageOf(error)}\n`);
+        const message = messageOf(error);
+        process.stderr.write(`[${PROVIDER_ID}] command catalog failed: ${message}\n`);
+        openWarnings.push({
+          severity: "warning",
+          title: "命令目录加载失败",
+          description: `DSH 未返回命令/权限目录：${message}。斜杠菜单与权限选择器可能不可用。`,
+        });
       }
 
       // Permission applies to the live agent (it runs `/permission`), so it must
@@ -840,7 +987,16 @@ class DshConnection implements ProviderConnection {
         try {
           await session.configure({ settings: { permission } });
         } catch (error) {
-          process.stderr.write(`[${PROVIDER_ID}] permission "${permission}" rejected: ${messageOf(error)}\n`);
+          const message = messageOf(error);
+          process.stderr.write(`[${PROVIDER_ID}] permission "${permission}" rejected: ${message}\n`);
+          // The chosen preset owns the sandbox mode and the approval policy; a
+          // silent failure would leave the session on the profile default, which
+          // can be broader than what the user picked. Say it on the timeline.
+          openWarnings.push({
+            severity: "warning",
+            title: "权限预设未应用",
+            description: `Paseo 选择的权限预设「${permission}」未生效（${message}）；本会话仍使用 profile 的默认权限。`,
+          });
         }
       }
 
@@ -854,8 +1010,16 @@ class DshConnection implements ProviderConnection {
           process.stderr.write(`[${PROVIDER_ID}] history replay failed: ${messageOf(error)}\n`);
         }
       }
+      // The materialization window is over: another open for this DSH session may
+      // start (it would see this session as the holder and take it over), so the
+      // in-flight marker must not outlive it.
+      this.#opening.delete(dshSessionId);
     } catch (error) {
-      this.#reverting.delete(sessionId);
+      // The gate is keyed by DSH session id: the host mints a fresh provider
+      // session id for every open, so the id that was gated is not the one this
+      // call is opening.
+      this.#releaseRevertingFor(dshSessionId);
+      this.#opening.delete(dshSessionId);
       // The daemon drops its own maps and rethrows on a failed open
       // (`PluginProvider.openSession`'s catch never sends `session.close`), so
       // this entry — and the `dsh` process `open()` has already spawned — would
@@ -893,14 +1057,32 @@ class DshConnection implements ProviderConnection {
     this.#emit({ type: "session.ready", requestId: input.requestId, sessionId });
     // The reload's reopen is complete: prompts are safe again. (A prompt sent
     // during close→reopen was refused by the `session.prompt` gate; the gate
-    // must stay armed until here, not until `session.close`.)
-    this.#reverting.delete(sessionId);
+    // must stay armed until here, not until `session.close`.) Release by DSH
+    // session id: the host reopened this DSH session under a **new** provider
+    // session id, so releasing only `sessionId` left the old id gated until the
+    // 15 s safety timer and printed a misleading "reload did not close" warning
+    // after every successful rewind.
+    this.#releaseRevertingFor(dshSessionId);
     // Deliver what the previous session could not: a deferred file-restore
     // failure, or "the timeline was not refreshed". Emitted here — after the
     // session is usable and while the daemon is still collecting this session's
     // history — the notice is part of the rebuilt timeline instead of a row of
     // the old epoch that the reload discards.
     this.#flushDeferredNotices(sessionId, dshSessionId);
+    // Report what this open degraded: a system prompt this provider cannot carry,
+    // a command catalog that failed to load, or a permission preset that was not
+    // applied. All three were previously either stderr-only or silent.
+    if (unsupportedSystemPrompt !== undefined) {
+      this.#notice(
+        sessionId,
+        "warning",
+        "自定义 system prompt 未生效",
+        "Paseo 为该会话配置了 system prompt，但本插件目前没有把它交给 DSH 的通道（需要桥提供会话级 prompt section）。该指令未生效；请改用 AGENTS.md 或 profile 配置。",
+      );
+    }
+    for (const warning of openWarnings) {
+      this.#notice(sessionId, warning.severity, warning.title, warning.description);
+    }
     // The root is open: release any child the bridge reported during the open,
     // so a child is never emitted before its parent.
     session.markRootReady();
@@ -968,6 +1150,40 @@ class DshConnection implements ProviderConnection {
     }
   }
 
+  /**
+   * The open session that already owns one DSH session, if any.
+   *
+   * One DSH session may only be materialized by one process (its log carries a
+   * kernel write lock); two owners would make both unusable. Excludes the provider
+   * session currently being opened.
+   *
+   * @param dshSessionId - DSH native session id.
+   * @param except - provider session id to ignore (the one being opened).
+   * @returns the owning session, or undefined when there is none.
+   */
+  #sessionHolding(dshSessionId: string, except: string): DshSession | undefined {
+    for (const session of this.#sessions.values()) {
+      if (session.id !== except && session.dshId === dshSessionId) return session;
+    }
+    return undefined;
+  }
+
+  /**
+   * Release the rewind prompt gate for every provider session of one DSH session.
+   *
+   * A provider session id is minted by the host on **every** open (`resumeSession`
+   * included), so after the reload's reopen the gate sits under the previous id.
+   * Releasing by DSH session id is what lets the reopen clear it; the 15 s safety
+   * timer in `#refreshAgent` stays as a backstop for a refresh that never reports.
+   *
+   * @param dshSessionId - DSH session id the gate was armed for.
+   */
+  #releaseRevertingFor(dshSessionId: string): void {
+    for (const [providerId, mapped] of this.#dshIds) {
+      if (mapped === dshSessionId) this.#reverting.delete(providerId);
+    }
+  }
+
   #require(sessionId: string): DshSession | DshChildSession {
     const session = this.#sessions.get(sessionId);
     if (session !== undefined) return session;
@@ -1004,20 +1220,22 @@ export function createDshProvider(): ProviderRegistration {
   };
 }
 
-export { profileName };
-
 /**
  * Resolve the Paseo agent id that owns one provider session.
  *
  * Paseo hands the provider a session id, but `paseo agent reload` takes the
  * *agent* id, and the plugin API exposes no mapping — `PaseoApi.agents` is
- * list/ref/create/subscribe and the list payload has no session id. The daemon's
- * own agent record does carry both: `~/.paseo/agents/<workspace>/<agentId>.json`
- * stores `persistence.sessionId` (a JSON string that embeds the provider session
- * id). Scanning those small files is cheap enough for a rewind, which is rare.
+ * list/ref/create/subscribe and the list payload has no session id.
  *
- * A missing or unreadable store is not an error: it means "cannot refresh", and
- * the caller says so rather than failing the rewind that already happened.
+ * The authoritative mapping is `config.env.PASEO_AGENT_ID`, which the daemon sets
+ * on every open (`#agentIds`). This scan of `~/.paseo/agents/<workspace>/<agentId>.json`
+ * is only a fallback, and a deliberately limited one: the record stores the plugin
+ * persistence handle, whose `data.sessionId` is the **DSH** session id — equal to
+ * the provider session id only for a session that was never reopened (a reload
+ * mints a new provider session id). So it can rescue a fresh session, not a
+ * reopened one; there is no honest way to map the latter from the records. A
+ * missing or unreadable store is not an error: it means "cannot refresh", and the
+ * caller reports that rather than failing the rewind that already happened.
  *
  * @param sessionId - the provider session id Paseo opened this session with.
  * @returns the owning agent id, or undefined when no record claims that session.

@@ -45,10 +45,37 @@ import { createHash } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import { appendFile, chmod, copyFile, lstat, mkdir, readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, resolve as resolvePath } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve as resolvePath } from 'node:path';
 
-/** Tools whose file mutations are checkpointed. */
+/**
+ * Tools whose file mutations are checkpointed.
+ *
+ * These two are DSH's own filesystem tools and name the file with `file_path`.
+ * A profile may also compose a third one, `str_replace_editor`, which is
+ * tracked separately below because it names the file differently.
+ */
 const TRACKED_TOOLS = new Set(['write', 'edit']);
+
+/**
+ * `@deepseek-ai/dsh-tool-str-replace-editor`'s model-facing tool.
+ *
+ * A first-party 0.2.1-rc.2 package: the base/web bundles do not mount it, but a
+ * deployment can, and its tool name is `str_replace_editor` (not a client-UI
+ * artifact — an earlier comment here claimed DSH had no such tool and dropped
+ * tracking, which would have let a `both` rewind report success while leaving
+ * every file that tool touched modified). Its commands name the file with
+ * `path`, never `file_path`, which is why it cannot share {@link TRACKED_TOOLS}.
+ */
+const STR_REPLACE_EDITOR = 'str_replace_editor';
+
+/**
+ * The `str_replace_editor` commands that write.
+ *
+ * `view` is read-only: journaling it would record a read as "the edit that
+ * announces this file's latest state", so a rewind could rewrite a file that
+ * nothing had changed. An unknown command is treated the same way (not a write).
+ */
+const STR_REPLACE_EDITOR_WRITES = new Set(['create', 'str_replace', 'insert']);
 
 /** Default cap for one snapshot; larger files are skipped and reported. */
 const DEFAULT_MAX_FILE_BYTES = 8 * 1024 * 1024;
@@ -77,30 +104,42 @@ const GC_GRACE_MS = 5 * 60 * 1000;
 /**
  * The path a tracked tool is about to mutate.
  *
- * DSH's `write`/`edit` tools take `file_path` (resolved by the filesystem
- * backend). Anything else is not a file mutation this module can checkpoint.
- * (`str_replace_editor` only exists in the legacy client UI vocabulary; DSH
- * core has no such tool, so tracking it here was dead code.)
+ * DSH's `write`/`edit` take `file_path`; `str_replace_editor` takes `path` and
+ * only its three writing commands count — a `view` (or an unknown command) is not
+ * a mutation this module can checkpoint, and journaling it would let a rewind
+ * treat a read as an edit. Anything else returns `undefined`, which the caller
+ * treats as "nothing to snapshot".
  *
  * @param {{name?: string, arguments?: unknown}} exec
  * @returns {string | undefined}
  */
 export function mutationPathOf(exec) {
-  if (!TRACKED_TOOLS.has(exec?.name)) return undefined;
   const args = exec?.arguments;
   if (typeof args !== 'object' || args === null) return undefined;
+  if (exec?.name === STR_REPLACE_EDITOR) {
+    const command = /** @type {{command?: unknown}} */ (args).command;
+    if (typeof command !== 'string' || !STR_REPLACE_EDITOR_WRITES.has(command)) return undefined;
+    const editorPath = /** @type {{path?: unknown}} */ (args).path;
+    return typeof editorPath === 'string' && editorPath !== '' ? editorPath : undefined;
+  }
+  if (!TRACKED_TOOLS.has(exec?.name)) return undefined;
   const path = /** @type {{file_path?: unknown}} */ (args).file_path;
   return typeof path === 'string' && path !== '' ? path : undefined;
 }
 
 /**
- * Whether one tool call is one whose mutations a rewind restores.
+ * Whether one tool *name* is one whose mutations a rewind restores.
+ *
+ * Name-level only: the argument-level check (which command of
+ * `str_replace_editor`, whether the path is present at all) lives in
+ * {@link mutationPathOf}, and a tracked name with no usable path simply yields
+ * no snapshot.
  *
  * @param {{name?: string}} exec
  * @returns {boolean}
  */
 export function isTrackedTool(exec) {
-  return TRACKED_TOOLS.has(exec?.name);
+  return TRACKED_TOOLS.has(exec?.name) || exec?.name === STR_REPLACE_EDITOR;
 }
 
 /**
@@ -498,6 +537,19 @@ export class FileSnapshots {
   /**
    * Copy a file's current content into the rescue directory.
    *
+   * The name is bounded on purpose. It used to be the URI-encoded absolute path,
+   * which for any path over roughly 240 characters produced a file name past
+   * NAME_MAX (255 bytes on Linux/macOS): `copyFile` then failed with
+   * ENAMETOOLONG and took the restore of that path down with it (the file stayed
+   * modified and the receipt reported the whole path as failed). A sha256 prefix
+   * keeps the name short and unique per path; a truncated, sanitised basename
+   * keeps it recognisable by eye.
+   *
+   * This only changes how recovery copies are *named*: rescue files are
+   * write-only material (nothing reads them back, and the journal/objects
+   * formats are untouched), so journals written by earlier builds still restore
+   * unchanged.
+   *
    * @param {string} rescueDir
    * @param {string} path
    * @param {number} counter
@@ -507,7 +559,9 @@ export class FileSnapshots {
     await mkdir(rescueDir, { recursive: true });
     // Timestamp + counter: two rewinds restoring the same path must not
     // overwrite the earlier rescue copy (it is the manual-recovery material).
-    const name = `${Date.now()}-${counter}-${encodeURIComponent(path)}`;
+    const digest = createHash('sha256').update(path).digest('hex').slice(0, 16);
+    const readable = basename(path).replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 64) || 'file';
+    const name = `${Date.now()}-${counter}-${digest}-${readable}`;
     const target = join(rescueDir, name);
     await copyFile(path, target, fsConstants.COPYFILE_FICLONE ?? 0);
     return target;

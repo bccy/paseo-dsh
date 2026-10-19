@@ -54,6 +54,18 @@ const IMAGE_EXTENSIONS = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp'
 const DESCRIPTION_LIMIT = 160;
 
 /**
+ * Process-wide sequence for image file names.
+ *
+ * The name has to be unique across *calls*, not merely across the blocks of one
+ * call: the model calls the same MCP tool repeatedly (screenshot → click →
+ * screenshot), so a per-call index would hand the second call the same paths as
+ * the first and silently overwrite those files. Every earlier tool-result row
+ * that names a path would then resolve to newer bytes — a wrong picture with no
+ * error anywhere. One temp directory per process, hence one module counter.
+ */
+let imageSequence = 0;
+
+/**
  * Image blocks are written next to the session's temp files and reported by path:
  * the gateway cannot admit MCP images into DSH's attachment store the way the
  * official client does, and inlining base64 would cost more context than the
@@ -68,7 +80,6 @@ function imageDirectory() {
 function projectContent(server, tool, content) {
   const texts = [];
   const images = [];
-  let index = 0;
   for (const block of Array.isArray(content) ? content : []) {
     if (block === null || typeof block !== 'object') continue;
     if (block.type === 'text' && typeof block.text === 'string') {
@@ -78,8 +89,8 @@ function projectContent(server, tool, content) {
     if (block.type === 'image' && typeof block.data === 'string') {
       const mimeType = typeof block.mimeType === 'string' ? block.mimeType : 'image/png';
       const extension = IMAGE_EXTENSIONS[mimeType] ?? 'bin';
-      index += 1;
-      const path = join(imageDirectory(), `${server}-${tool}-${process.pid}-${index}.${extension}`);
+      imageSequence += 1;
+      const path = join(imageDirectory(), `${server}-${tool}-${process.pid}-${imageSequence}.${extension}`);
       writeFileSync(path, Buffer.from(block.data, 'base64'));
       images.push({ path, mimeType });
       continue;

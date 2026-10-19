@@ -60,6 +60,26 @@ export interface ParkedSessionsOptions {
 const DEFAULT_TTL_MS = 30_000;
 const DEFAULT_MAX = 3;
 const SWEEP_INTERVAL_MS = 5_000;
+/**
+ * Upper bound on waiting for a killed parked child to really exit.
+ *
+ * A DSH session log carries a kernel write lock (`SessionWriteLease` in
+ * `@deepseek-ai/dsh-session-persistence-jsonl`) that outlives SIGTERM until the
+ * OS reaps the process. A successor spawned before that fails to materialize the
+ * session with "already owned by an active write handle". `kill()` also arms a
+ * 4 s SIGKILL fallback, so 5 s covers the worst case; a timeout is logged and the
+ * caller cold-starts anyway rather than blocking the open forever.
+ */
+const RELEASE_TIMEOUT_MS = 5_000;
+/** Bound on remembered dying processes, so a pathological sequence cannot grow the pool. */
+const DYING_TRACK_LIMIT = 64;
+
+/** One parked process that was killed and may still be releasing its session lock. */
+interface DyingEntry {
+  dshSessionId: string;
+  process: DshProcess;
+  gone: boolean;
+}
 
 /** The no-op handler set a parked (unowned) process reports to. */
 function silentHandlers(entry: { forget: () => void }, log: (line: string) => void) {
@@ -79,6 +99,8 @@ export class ParkedSessions {
   readonly #log: (line: string) => void;
   readonly #now: () => number;
   readonly #pool = new Map<string, ParkedEntry>();
+  /** Killed entries, kept until they are observed gone (see {@link quiesce}). */
+  #dying: DyingEntry[] = [];
   #timer: ReturnType<typeof setInterval> | undefined;
 
   constructor(options: ParkedSessionsOptions = {}) {
@@ -130,6 +152,7 @@ export class ParkedSessions {
       this.#log(`parked:replace ${entry.dshSessionId}`);
       existing.process.kill();
       this.#pool.delete(entry.dshSessionId);
+      this.#markDying(entry.dshSessionId, existing.process);
     }
     if (!entry.process.running) return false;
     const stored: ParkedEntry = { ...entry, parkedAt: this.#now() };
@@ -143,6 +166,7 @@ export class ParkedSessions {
     } catch (error) {
       this.#log(`parked:handlers ${entry.dshSessionId}: ${error instanceof Error ? error.message : String(error)}`);
       entry.process.kill();
+      this.#markDying(entry.dshSessionId, entry.process);
       return false;
     }
     this.#pool.set(entry.dshSessionId, stored);
@@ -175,10 +199,60 @@ export class ParkedSessions {
         `parked:mismatch ${dshSessionId} (cwd ${entry.cwd === expected.cwd ? "same" : "different"}, route ${entry.routeKey} -> ${expected.routeKey}), killing`,
       );
       entry.process.kill();
+      this.#markDying(dshSessionId, entry.process);
       return undefined;
     }
     this.#log(`parked:take ${dshSessionId}`);
     return entry;
+  }
+
+  /**
+   * Release a parked process this session cannot reuse, and wait (bounded) until
+   * it is really gone.
+   *
+   * `take()` is synchronous because the session's `open()` is written around a
+   * synchronous reuse check, so it cannot await a kill it performs. A caller that
+   * is about to hand the same DSH session to a **new** process must not spawn into
+   * that window: the dying child still holds the session log's kernel write lock,
+   * and the new process then fails to materialize the session while this provider
+   * reports it ready. Calling this before the open closes that hole.
+   *
+   * A reusable entry (same cwd and route, process alive) is left untouched — the
+   * open's `take()` will adopt it, and no new process is spawned.
+   *
+   * @param dshSessionId - DSH native session id about to be opened.
+   * @param expected - the cwd and route the new session will use.
+   * @param timeoutMs - bound on the total wait (defaults to the shipped value).
+   * @returns whether every killed owner is gone; a timeout is logged, not thrown.
+   */
+  async quiesce(
+    dshSessionId: string,
+    expected: ParkedExpectation,
+    timeoutMs: number = RELEASE_TIMEOUT_MS,
+  ): Promise<boolean> {
+    const entry = this.#pool.get(dshSessionId);
+    if (entry !== undefined && !this.#reusable(entry, expected)) {
+      this.#pool.delete(dshSessionId);
+      this.#log(`parked:release ${dshSessionId} (cannot be reused by the open)`);
+      entry.process.kill();
+      this.#markDying(dshSessionId, entry.process);
+    }
+    const pending = this.#dying.filter((item) => !item.gone && item.dshSessionId === dshSessionId);
+    if (pending.length === 0) return true;
+    const deadline = this.#now() + timeoutMs;
+    let allGone = true;
+    for (const item of pending) {
+      const remaining = Math.max(0, deadline - this.#now());
+      item.gone = (await item.process.waitForExit(remaining)) === true;
+      if (!item.gone) allGone = false;
+    }
+    this.#dying = this.#dying.filter((item) => !item.gone);
+    if (!allGone) {
+      this.#log(
+        `parked:release ${dshSessionId} timed out after ${timeoutMs}ms; the previous owner may still hold the session log`,
+      );
+    }
+    return allGone;
   }
 
   /** Forget an entry whose process exited while parked. */
@@ -197,6 +271,7 @@ export class ParkedSessions {
       if (now - entry.parkedAt < this.#ttlMs) continue;
       this.#pool.delete(key);
       entry.process.kill();
+      this.#markDying(key, entry.process);
       expired += 1;
       this.#log(`parked:expire ${key}`);
     }
@@ -206,6 +281,26 @@ export class ParkedSessions {
   /** Whether one native session id is currently parked (tests/diagnostics). */
   has(dshSessionId: string): boolean {
     return this.#pool.has(dshSessionId);
+  }
+
+  /** Whether `take()` would adopt this entry instead of killing it. */
+  #reusable(entry: ParkedEntry, expected: ParkedExpectation): boolean {
+    return entry.process.running && entry.cwd === expected.cwd && entry.routeKey === expected.routeKey;
+  }
+
+  /**
+   * Remember a killed process until it is observed gone.
+   *
+   * Only used so {@link quiesce} can wait for the session lock's release; the list
+   * is bounded because a process that never exits (a wedged child) must not grow it
+   * without limit — the entry is dropped from the front when the cap is exceeded,
+   * which only means a later open will not wait for that one.
+   */
+  #markDying(dshSessionId: string, process: DshProcess): void {
+    this.#dying.push({ dshSessionId, process, gone: false });
+    if (this.#dying.length > DYING_TRACK_LIMIT) {
+      this.#dying.splice(0, this.#dying.length - DYING_TRACK_LIMIT);
+    }
   }
 
   /** Kill the oldest entries over the cap. */
@@ -223,6 +318,7 @@ export class ParkedSessions {
       const entry = this.#pool.get(oldestKey);
       this.#pool.delete(oldestKey);
       entry?.process.kill();
+      if (entry !== undefined) this.#markDying(oldestKey, entry.process);
       this.#log(`parked:evict ${oldestKey} (over cap ${this.#max})`);
     }
   }

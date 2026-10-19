@@ -14,8 +14,15 @@
  */
 import { StringDecoder } from 'node:string_decoder';
 
-/** A JSON-RPC error response, preserving the wire `code` and optional `data`. */
-export class JsonRpcResponseError extends Error {
+/**
+ * A JSON-RPC error response, preserving the wire `code` and optional `data`.
+ *
+ * Internal on purpose: it is the rejection value for a failed server -> client
+ * request (`paseo/question`), and no consumer outside this module catches it by
+ * class — the caller only sees an Error, so exporting the type would advertise a
+ * contract nobody reads.
+ */
+class JsonRpcResponseError extends Error {
   constructor(code, message, data) {
     super(message);
     this.name = 'JsonRpcResponseError';
@@ -32,7 +39,6 @@ export class PaseoTransport {
   #started = false;
   #closed = false;
   #requestHandler;
-  #notificationHandler;
   #pending = new Map();
   #nextId = 1;
 
@@ -50,9 +56,20 @@ export class PaseoTransport {
     this.#input.on('end', this.#onEnd);
   }
 
-  /** Detach listeners and reject pending requests without destroying streams. */
+  /**
+   * Detach listeners, mark the transport closed, and reject pending requests
+   * without destroying streams.
+   *
+   * `#closed` used to be declared and checked but never set, so every "closed"
+   * guard below was dead. Closing is final here: a later write would target a
+   * surface the peer may already have torn down (the point of the flag), and
+   * nothing restarts a closed transport. Idempotent, and safe before `start()`:
+   * `off()` on streams that never got the listeners is a no-op, while the
+   * pending-request drain still matters.
+   */
   close() {
-    if (!this.#started) return;
+    if (this.#closed) return;
+    this.#closed = true;
     this.#started = false;
     this.#input.off('data', this.#onData);
     this.#input.off('error', this.#onError);
@@ -63,11 +80,6 @@ export class PaseoTransport {
   /** Install the handler for client -> server requests, replacing any prior one. */
   onRequest(handler) {
     this.#requestHandler = handler;
-  }
-
-  /** Install the handler for client -> server notifications, replacing any prior one. */
-  onNotification(handler) {
-    this.#notificationHandler = handler;
   }
 
   /** Wait for prior frame write callbacks; the empty barrier emits no bytes. */
@@ -146,6 +158,11 @@ export class PaseoTransport {
       try {
         frame = JSON.parse(trimmed);
       } catch {
+        // A frame the peer means us to act on is JSON by contract (one
+        // JSON-RPC message per line). A torn or non-JSON line is therefore a
+        // protocol bug, and dropping it silently turns a bug into a timeout on
+        // the other side. Say so; never guess at a repair.
+        process.stderr.write(`[bridge] dropped an unparseable JSON-RPC frame: ${trimmed.slice(0, 120)}\n`);
         continue;
       }
       void this.#handleFrame(frame);
@@ -165,7 +182,15 @@ export class PaseoTransport {
     const hasMethod = typeof frame.method === 'string';
     const hasId = frame.id !== undefined && frame.id !== null;
     if (hasMethod && hasId) return this.#handleIncomingRequest(frame);
-    if (hasMethod) return this.#handleIncomingNotification(frame);
+    if (hasMethod) {
+      // A notification (a method without an id) is legitimate JSON-RPC but has
+      // no consumer on this side: Paseo's plugin sends every frame as a request
+      // (`DshProcess` mints an id for each), and the protocol this repository
+      // defines has no server-bound notifications. Tolerated and dropped — it
+      // must never be answered, since that would send a response to a request
+      // that never had an id.
+      return;
+    }
     if (hasId) return this.#handleIncomingResponse(frame);
   }
 
@@ -182,14 +207,6 @@ export class PaseoTransport {
         id: frame.id,
         error: { code: -32603, message: error instanceof Error ? error.message : String(error) },
       });
-    }
-  }
-
-  #handleIncomingNotification(frame) {
-    try {
-      this.#notificationHandler?.(frame.method, frame.params ?? {});
-    } catch {
-      /* notifications are fire-and-forget */
     }
   }
 

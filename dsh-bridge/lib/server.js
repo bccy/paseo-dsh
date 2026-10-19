@@ -555,20 +555,39 @@ export class PaseoHarnessServer {
     };
   }
 
-  /** Queue one identified prompt for a session, creating its agent on first use. */
+  /**
+   * Queue one identified prompt for a session, creating its agent on first use.
+   *
+   * The receipt carries `sourceKind` as an OPTIONAL addition to the SDK-shaped
+   * `{ messageId }` reply: the producer kind the `user/message` event for this
+   * prompt carries (`{ messageId, sourceKind? }`), so the plugin can report a
+   * host-injected message as injected context instead of as a user bubble. It is
+   * the same `source` object handed to `createUserMessage`, i.e. exactly
+   * `event.data.source.kind` of the DSH event this call appends — today `'user'`
+   * for anything the human authored and `'paseo'` for Paseo's own
+   * `<paseo-system>` envelopes (see `paseo-system-envelope.js`); Paseo's
+   * `kind="user-message"` wrapper quotes human text and stays `'user'`.
+   *
+   * A consumer that predates the field sees the old reply unchanged, and a
+   * consumer reading it treats a missing `sourceKind` as `'user'` — there is no
+   * other producer that could have sent the prompt without the bridge seeing it.
+   */
   async prompt(params) {
     if (!this.initialized) throw new Error('paseo bridge is not initialized');
     const rec = await this.getOrCreateSession(params.sessionId);
     this.assertLiveAgent(rec, params.sessionId);
     const content = await durablePromptContent(this.ctx, params.contentBlocks ?? []);
     this.assertLiveAgent(rec, params.sessionId);
-    const message = createUserMessage({ content, source: promptSource(content) });
+    // The exact value `append('user/message', …)` will record as its
+    // `source.kind` — computed once so the receipt cannot disagree with the log.
+    const source = promptSource(content);
+    const message = createUserMessage({ content, source });
     // A steer belongs inside the turn already running; a plain prompt starts the
     // next one. Without this distinction an interjection queues behind the very
     // turn it was meant to correct.
     if (params.delivery === 'steer') rec.handle.agent.steer(message);
     else rec.handle.agent.followup(message);
-    return { messageId: String(message.id) };
+    return { messageId: String(message.id), sourceKind: String(source.kind) };
   }
 
   /**
@@ -677,21 +696,116 @@ export class PaseoHarnessServer {
   }
 
   /**
-   * Choose a session's agent preset. Before the agent exists the choice is
-   * queued; once it does, DSH's `select` applies it — and refuses once the
-   * session's first turn has started, which is the lock the composer must honor.
+   * Resolve one preset id, dropping a queued choice that can never succeed.
+   *
+   * `agentPresets.resolve` throws for an unknown id (`agent-preset/not-found`)
+   * and reports an unusable declaration through `broken`. A queued id is not
+   * validated anywhere else, so a stale one — a preset removed or renamed
+   * between the composer's catalog read and the session's creation — used to
+   * make every later creation attempt throw the same error: the Paseo session
+   * was unopenable for the rest of the process's life. Dropping the queue on the
+   * two terminal failures turns that into one readable failure; the next attempt
+   * then composes the stored header's preset (or the default) instead of failing
+   * forever. A transient failure keeps the choice, because retrying may work.
+   *
+   * @param {string} sessionId
+   * @param {string | undefined} id - requested preset, or undefined for the default.
+   * @returns {Promise<string>} the resolved preset id.
    */
-  async setPreset(sessionId, id) {
+  async resolvePreset(sessionId, id) {
     const service = this.ctx.get('agentPresets');
     if (service === undefined) throw new Error('agent presets are not mounted in this profile');
+    let resolved;
+    try {
+      resolved = await service.resolve(id);
+    } catch (error) {
+      // Only the terminal failure drops the queued choice: retrying an id the
+      // registry does not declare can never succeed, while a transient failure
+      // (a diagnostic that could not settle yet) must not throw the user's
+      // selection away. The code is matched structurally, like DSH's own
+      // `remoteErrorOf`, so a cross-bundle copy of the error still counts.
+      if (error?.isDSHRemoteError === true && error.code === 'agent-preset/not-found') {
+        this.pendingPresets.delete(sessionId);
+      }
+      throw error;
+    }
+    if (resolved.broken !== undefined) {
+      this.pendingPresets.delete(sessionId);
+      throw new Error(`agent preset "${resolved.id}" cannot be used: ${resolved.broken}`);
+    }
+    return resolved.id;
+  }
+
+  /**
+   * The agent preset a stored Session was created with, read from its durable
+   * header.
+   *
+   * A Session being resumed is not live yet — that is *why* creation failed with
+   * "already exists" — and `sessions.get` answers only for live Sessions, so
+   * reading the preset there always produced `undefined` and the resume silently
+   * composed the default. The durable header is the same source the
+   * `agentPreset` projection seeds itself from
+   * (`init: (header) => header.agentPreset ?? null`, dsh-agent-preset-registry),
+   * so mounting this id keeps the composition, the projection and the log
+   * agreeing.
+   *
+   * @param {string} sessionId
+   * @returns {Promise<string | undefined>}
+   */
+  async storedAgentPreset(sessionId) {
+    const persistence = this.ctx.get('sessionPersistence');
+    if (persistence === undefined) return undefined;
+    try {
+      const snapshot = await persistence.stat(sessionId);
+      const preset = snapshot?.header?.agentPreset;
+      return typeof preset === 'string' && preset !== '' ? preset : undefined;
+    } catch (error) {
+      // An unreadable header is not "no preset"; say so, then let the resume
+      // compose the default rather than failing the whole open.
+      process.stderr.write(
+        `[bridge] could not read the stored agent preset for ${sessionId}: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return undefined;
+    }
+  }
+
+  /**
+   * Choose a session's agent preset. Before the agent exists the choice is
+   * queued (after it has been resolved, so a stale id fails here rather than at
+   * every later session creation); once it does, DSH's `select` applies it — and
+   * refuses once the session's first turn has started, which is the lock the
+   * composer must honor.
+   */
+  async setPreset(sessionId, id) {
+    const resolved = await this.resolvePreset(sessionId, id);
     const rec = this.sessions.get(sessionId);
     if (rec === undefined) {
-      this.pendingPresets.set(sessionId, id);
+      this.pendingPresets.set(sessionId, resolved);
       return;
     }
     this.assertLiveAgent(rec, sessionId);
-    const applied = await service.select(rec.handle.agent, id);
-    this.pendingPresets.set(sessionId, applied ?? id);
+    const service = this.ctx.get('agentPresets');
+    if (service === undefined) throw new Error('agent presets are not mounted in this profile');
+    const applied = await service.select(rec.handle.agent, resolved);
+    const target = applied ?? resolved;
+    this.pendingPresets.set(sessionId, target);
+    // Durable record of the switch. `select` itself logs nothing ("nothing is
+    // logged or announced" in the registry contract) and the `agentPreset`
+    // projection only folds this log-only event — plus the creation header — so
+    // without it a cold reopen would compose the creation preset again. The
+    // shape and the placement mirror the official session controller's
+    // `reuseSetup`: `session.append('agent-preset/selected', { agentPreset })`,
+    // log-only (no `surfaceOp`) and legal outside a turn, which is where the
+    // controller appends it (before publication).
+    let projected;
+    try {
+      projected = this.ctx.get('sessionProjections')?.stateOf(rec.handle.agent.session, 'agentPreset');
+    } catch {
+      projected = undefined;
+    }
+    if (projected !== target) {
+      rec.handle.agent.session.append('agent-preset/selected', { agentPreset: target });
+    }
   }
 
   /** Report the configured agent presets and the one this session runs. */
@@ -767,15 +881,22 @@ export class PaseoHarnessServer {
    * backend directly: the session-query corpus is not mounted for listing here
    * (`openAt: never`), and it hangs rather than answering. Titles are
    * best-effort; a missing title never hides an importable session.
+   *
+   * A failed read is `available: false` + `error`, never an empty list: "there
+   * are no sessions to import" and "the store could not be read" look identical
+   * in the import dialog, and only one of them is true (`history()` and
+   * `subagents()` answer the same failure the same way).
    */
   async listSessions(params = {}) {
     const persistence = this.ctx.get('sessionPersistence');
     if (persistence === undefined) return { available: false, sessions: [] };
-    let snapshots = [];
+    let snapshots;
     try {
       snapshots = await persistence.list();
-    } catch {
-      snapshots = [];
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      process.stderr.write(`[bridge] listing stored sessions failed: ${message}\n`);
+      return { available: false, sessions: [], error: { message } };
     }
     const query = typeof params.query === 'string' && params.query !== '' ? params.query.toLowerCase() : undefined;
     const cwdFilter = typeof params.cwd === 'string' && params.cwd !== '' ? params.cwd : undefined;
@@ -1066,40 +1187,34 @@ export class PaseoHarnessServer {
   }
 
   /**
-   * Rewind one session to just before the user message Paseo named.
-   *
-   * Paseo's rewind button is capability-gated, and the token it hands back is
-   * the `revertToken` our own timeline row carried (`{ messageId }`). The rewind
-   * itself is a surface replacement appended to DSH's own log — the same
-   * mechanism compaction uses — so the withdrawn turns leave the model's view
-   * without any trace of the rewind, and nothing is deleted: the log stays the
-   * durable, auditable record.
-   *
-   * The replacement is a single empty `system/message`. `deriveEventMessage`
-   * returns null for an empty system message, so it never enters the model's
-   * context; it is also the only surface-eligible placeholder that can carry the
-   * `sourceEventSeqs` DSH's replace validation requires (an `assistant/message`
-   * may not cite source events, which rules it out as a replacement carrier).
-   */
-  /**
    * Settle one agent before a rewind.
    *
    * A surface replacement freezes its range when it is appended. If a turn keeps
    * producing events afterwards, they append *after* the replacement node and
    * stay visible — the withdrawn content "comes back". DSH's own rewind plugin
-   * settles the agent the same way: cancel the running turn, wait for idle, drop
-   * steering input queued for the dropped turn.
+   * settles the agent the same way: cancel the running turn, wait for idle, then
+   * drop the work queued for the withdrawn turn.
+   *
+   * BOTH inbox lists are dropped, not just steering. A queued follow-up turn
+   * (`nextTurn`) wakes the driver the moment the aborted turn reaches idle, so
+   * `whenIdle()` would wait for that entire extra turn: a rewind could sit on the
+   * 15s bound and then fail *after* already cancelling the user's turn. Those
+   * messages are not on the surface yet, i.e. they are after the target by
+   * construction, so withdrawing them matches the rewind's scope.
    */
   async settleAgentForRevert(agent) {
+    if (agent.status !== 'idle') agent.cancel({ kind: 'user' }, { keepInbox: true });
+    // Synchronous, and before the first await: cancellation converges
+    // asynchronously, so removing the queued work here is the only way to be sure
+    // the driver cannot claim it while we wait for idle.
+    for (const pending of [...agent.inbox.nextStep, ...agent.inbox.nextTurn]) agent.inbox.remove(pending.id);
     if (agent.status !== 'idle') {
-      agent.cancel({ kind: 'user' }, { keepInbox: true });
       await withTimeout(
         agent.whenIdle(),
         15000,
         'waiting for the agent to become idle before rewinding',
       );
     }
-    for (const pending of [...agent.inbox.nextStep]) agent.inbox.remove(pending.id);
   }
 
   /**
@@ -1190,23 +1305,45 @@ export class PaseoHarnessServer {
   }
 
   /**
-   * The directory a relative editing path resolves against.
+   * The directory a tracked tool's relative path resolves against.
    *
    * `header.cwd` is a session's ORIGINAL project directory, not its current one:
    * `cd`-style changes and a subagent's `cwd` argument move the effective
    * working directory (the `workingDirectory` service owns it). A snapshot must
    * resolve exactly like the tool does, or it records the wrong path — and a
-   * wrong path means a rewind could delete an unrelated file.
+   * wrong path means a rewind could act on a file the tool never touched.
    *
-   * @param {object} session
-   * @returns {string}
+   * DSH's own editing tools call `workingDirectory.ensure(agent, signal)`
+   * (`dsh-tool-fs`), which validates the directory and, when it has disappeared,
+   * commits the recovery back to the original project before the tool runs. The
+   * synchronous `get()` skips both steps, so for a session whose current
+   * directory was deleted it returns the vanished path while the tool writes into
+   * the recovered one. Use the same call, with the same arguments, as the tool.
+   *
+   * Fail-open: when resolution fails, the caller skips the snapshot rather than
+   * journaling a guessed path — a wrong path is the one thing a rewind must never
+   * act on, and a missing restore is already reported through the receipt.
+   *
+   * @param {{agent?: object, signal?: AbortSignal}} exec - the tool dispatch execution.
+   * @returns {Promise<string | undefined>}
    */
-  workingDirectoryOf(session) {
+  async workingDirectoryFor(exec) {
+    const session = exec?.agent?.session;
+    const service = this.ctx.get('workingDirectory');
     try {
-      const current = this.ctx.get('workingDirectory')?.get(session);
+      const current = await service?.ensure?.(exec.agent, exec.signal);
+      if (typeof current === 'string' && current !== '') return current;
+    } catch (error) {
+      process.stderr.write(
+        `[bridge] file snapshot skipped: cannot resolve the working directory: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return undefined;
+    }
+    try {
+      const current = service?.get?.(session);
       if (typeof current === 'string' && current !== '') return current;
     } catch {
-      /* fall back to the header: never fail the turn over a snapshot path */
+      /* fall back to the session's original project directory */
     }
     return session?.header?.cwd ?? this.cwd;
   }
@@ -1239,9 +1376,11 @@ export class PaseoHarnessServer {
       }
       const anchorSeq = this.snapshotAnchorFor(session, owner);
       if (anchorSeq === undefined) return;
-      // Resolve exactly like the editing tool does: its current working
-      // directory, not the durable header's original cwd.
-      const path = resolveMutationPath(this.workingDirectoryOf(session), rawPath);
+      // Resolve exactly like the editing tool does: `workingDirectory.ensure`
+      // (validation + recovery), not the recorded value and not the header.
+      const cwd = await this.workingDirectoryFor(exec);
+      if (cwd === undefined) return;
+      const path = resolveMutationPath(cwd, rawPath);
       const callId = String(exec.callId);
       const result = await this.fileSnapshots.capture({
         // The journal/objects belong to the root; the pending entry belongs to
@@ -1400,6 +1539,23 @@ export class PaseoHarnessServer {
     return humanSeqs.length >= 2 ? humanSeqs[1] : Number.POSITIVE_INFINITY;
   }
 
+  /**
+   * Rewind one session to just before the user message Paseo named.
+   *
+   * Paseo's rewind button is capability-gated, and the token it hands back is
+   * the `revertToken` our own timeline row carried (`{ messageId }`). The rewind
+   * itself is a surface replacement appended to DSH's own log — the same
+   * mechanism compaction uses — so the withdrawn turns leave the model's view
+   * without any trace of the rewind, and nothing is deleted: the log stays the
+   * durable, auditable record.
+   *
+   * The replacement is a `user/message` whose `source.kind` is `paseo-rewind` and
+   * whose content is the literal text `(empty message)` (the marker shape and its
+   * two reasons are spelled out where it is built below; note that
+   * `deriveEventMessage` DOES surface it to the model as one `(empty message)`
+   * user turn — `harness/revert-shape-probe.mjs` asserts exactly that, and it is
+   * the accepted cost of a durable marker, not a claim that it is invisible).
+   */
   async revert(params) {
     const rec = this.requireSession(params.sessionId);
     const agent = rec.handle.agent;
@@ -1469,14 +1625,24 @@ export class PaseoHarnessServer {
       // contains the withdrawn turn. A failure here must be loud: reporting
       // success would let the reload restore the withdrawn conversation while
       // the file layer has already been rolled back.
+      //
+      // `SessionStore.flush` resolves to whether at least ONE durability listener
+      // participated, not merely "no error": `false` means nothing actually
+      // persisted the append (a profile composing the session store without a
+      // persistence backend). Treat that as the same failure — otherwise the
+      // receipt claims durability the log does not have.
       const sessions = this.ctx.get('sessions');
       if (sessions === undefined) {
         throw new Error('撤回标记无法持久化：该 profile 没有会话存储；已停止文件回退');
       }
+      let durable;
       try {
-        await sessions.flush(session);
+        durable = await sessions.flush(session);
       } catch (error) {
         throw new Error(`撤回标记无法持久化，已停止文件回退：${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (durable !== true) {
+        throw new Error('撤回标记未获得任何持久化参与者（该 profile 未组合会话持久化后端）；已停止文件回退');
       }
       let files;
       // Stop the delegated agents this rewind withdrew before restoring files:
@@ -1874,20 +2040,17 @@ export class PaseoHarnessServer {
       ...(this.reasoningEffort === undefined ? {} : { reasoningEffort: this.reasoningEffort }),
     };
     const control = { selection: { current: initial, assembled: undefined }, dispose: undefined };
-    // Paseo can deliver any message as `interrupt`, which cancels the parent turn
-    // before this plugin is involved; a foreground child holds that turn's abort
-    // signal and dies with it. Force delegation onto the detached background
-    // route so talking to the parent never terminates a running child.
+    // Model-selection only. The delegation tools need no wrapper here: DSH
+    // 0.2.1-rc.2 starts every delegation as an independently managed activation
+    // (`startActivation` returns the child id immediately and the runtime
+    // notifies the parent on completion), so there is no foreground mode whose
+    // child could inherit the parent turn's abort signal. An earlier build
+    // injected `run_in_background: true` for that reason; the parameter does not
+    // exist on `subagent`/`subagent_fork` (it belongs to bash/workflow), the
+    // extra key was ignored, and the re-registration only shadowed the standing
+    // tool with an identical definition.
     const installSelection = (agentCtx) => {
       control.dispose = installModelSelection(agentCtx, control.selection);
-      for (const name of ['subagent', 'subagent_fork']) {
-        const base = agentCtx.tools.get(name);
-        if (base === undefined) continue;
-        agentCtx.tools.register({
-          ...base,
-          execute: (args, exec) => base.execute({ ...args, run_in_background: true }, exec),
-        });
-      }
     };
 
     // A session that runs under an agent preset mounts it during setup, exactly
@@ -1898,7 +2061,9 @@ export class PaseoHarnessServer {
     let agentPreset;
     let setup = installSelection;
     if (presets !== undefined) {
-      const resolvedId = (await presets.resolve(this.pendingPresets.get(sessionId))).id;
+      // `resolvePreset` validates before the session exists, so a stale queued id
+      // fails here (readably) instead of poisoning every later attempt.
+      const resolvedId = await this.resolvePreset(sessionId, this.pendingPresets.get(sessionId));
       agentPreset = resolvedId;
       setup = async (agentCtx, agent) => {
         installSelection(agentCtx);
@@ -1927,19 +2092,59 @@ export class PaseoHarnessServer {
       if (!/already exists/i.test(String(error?.message ?? error))) throw error;
       // A resumed session keeps the preset it was created with; re-mount the same
       // one so its projected composition stays consistent.
+      //
+      // At this point the session is NOT live — that is exactly why `create`
+      // failed — and `sessions.get` answers only for live Sessions, so reading
+      // the projection there always yielded `undefined` and the resume silently
+      // composed the default preset against a log recorded under another one.
+      // The durable header is the right source (the `agentPreset` projection
+      // seeds itself from that same header). A preset Paseo explicitly sent for
+      // this reopen (`setPreset` queues only ids that already resolved) wins over
+      // the header, because it is the user's latest intent.
+      //
+      // A header naming a preset this deployment no longer declares is a special
+      // case, and the one place this bridge deliberately DIVERGES from DSH:
+      // upstream's session controller resolves the stored preset and lets the
+      // failure abort the open (`dsh-api-session-controller` `composeAgent` ->
+      // `presets.resolve`, which throws `agent-preset/not-found`). Here that
+      // would make the session unopenable FOREVER — every retry reads the same
+      // durable header — so the bridge composes the default instead, writes the
+      // reason to stderr, and records the composition that actually ran (see the
+      // append below) so `paseo/presets.current` cannot keep naming the preset
+      // that is gone. Rationale: a readable conversation under a different preset
+      // beats a conversation that can never be opened. This can happen after a
+      // deployment renames a preset, or when a newer DSH renames the built-in
+      // default that every existing session's header recorded.
       let resumeSetup = installSelection;
       if (presets !== undefined) {
-        const session = this.ctx.get('sessions')?.get(brandString(sessionId));
-        let storedPreset;
-        try {
-          storedPreset = session === undefined ? undefined : this.ctx.get('sessionProjections')?.stateOf(session, 'agentPreset');
-        } catch {
-          storedPreset = undefined;
+        const requested = this.pendingPresets.get(sessionId);
+        let resolvedId;
+        let fellBack = false;
+        if (requested !== undefined) {
+          resolvedId = await this.resolvePreset(sessionId, requested);
+        } else {
+          const stored = await this.storedAgentPreset(sessionId);
+          try {
+            resolvedId = await this.resolvePreset(sessionId, stored);
+          } catch (error) {
+            process.stderr.write(
+              `[bridge] session ${sessionId} records agent preset ${String(stored)} which this profile cannot compose `
+              + `(${error instanceof Error ? error.message : String(error)}); composing the default preset instead\n`,
+            );
+            resolvedId = await this.resolvePreset(sessionId, undefined);
+            fellBack = true;
+          }
         }
-        const resolvedId = (await presets.resolve(storedPreset ?? this.pendingPresets.get(sessionId))).id;
-        resumeSetup = async (agentCtx) => {
+        resumeSetup = async (agentCtx, agent) => {
           installSelection(agentCtx);
           await presets.mount(agentCtx, resolvedId);
+          // Record the composition that actually ran, so `paseo/presets.current`
+          // (which folds this event over the header) cannot keep naming the
+          // preset the fallback replaced. Log-only, same shape as the official
+          // controller's `reuseSetup`, and legal before publication.
+          if (fellBack && agent !== undefined) {
+            agent.session.append('agent-preset/selected', { agentPreset: resolvedId });
+          }
         };
       }
       handle = await this.ctx.agents.resume({

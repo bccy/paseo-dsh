@@ -156,13 +156,20 @@ export function registerSubagentArchiveTool(ctx) {
       // Skip turning children: `stopActivity` would interrupt their in-flight
       // turn, and archiving something the user is still watching is not what
       // "archive finished subagents" means.
+      //
+      // The live state is `Agent.status`, the lifecycle field DSH exposes on the
+      // bare Agent (`'idle' | 'running'`, dsh-agent runtime-types). There is no
+      // snapshot accessor on that object, so the previous
+      // `live.session.getSnapshot?.().running` silently evaluated to `false` for
+      // every child: this guard never fired, and a running child was archived —
+      // `stopActivity` stopping its turn — while the report claimed it had been
+      // skipped.
       const agents = ctx.get('agents');
       const running = [];
       const targets = [];
       for (const id of pending) {
         const live = agents?.get?.(id);
-        const isRunning = live !== undefined && live.session?.getSnapshot?.().running === true;
-        (isRunning ? running : targets).push(id);
+        (live?.status === 'running' ? running : targets).push(id);
       }
 
       const archived = [];

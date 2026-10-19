@@ -178,6 +178,53 @@ function textBlocks(content: unknown): string {
     .trim();
 }
 
+/**
+ * The text one user row carries for a DSH message's content blocks.
+ *
+ * {@link textBlocks} alone is not enough: a prompt may carry only an image
+ * (Paseo sends pictures with no text at all), and a replay that skipped every
+ * text-less message dropped the user's turn — and with it the row's revert
+ * token — on each reopen. A block with no text is named by its kind instead, so
+ * the row says what it was rather than nothing, and the live row is built by
+ * this same function so a reopened conversation looks like the live one.
+ *
+ * Only the block *kind* is stated: the bytes cannot ride a Paseo user_message
+ * row (the protocol has no attachment field), and a path here would put a
+ * host-local path into the transcript.
+ */
+function messageRowText(content: unknown): string {
+  const text = textBlocks(content);
+  if (text !== "") return text;
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const block of content) {
+    if (!isRecord(block)) continue;
+    const type = typeof block.type === "string" ? block.type : "";
+    if (type === "" || type === "text") continue;
+    parts.push(`[${type}]`);
+  }
+  return parts.join(" ");
+}
+
+/**
+ * Whether a prompt's DSH source kind is the human's own turn.
+ *
+ * `sourceKind` is the DSH `source.kind` of the user message the bridge appended
+ * (`DshProcess.prompt`'s reply carries it). Paseo wraps everything it says on its
+ * own behalf — a schedule fire, a notify-on-finish notice — in a
+ * `<paseo-system>` envelope, and the bridge records those prompts under a
+ * non-`user` kind so the transcript does not attribute the host's own notice to
+ * the human (see `dsh-bridge/lib/paseo-system-envelope.js`). Live rows and the
+ * replay filter must agree, so a non-`user` kind gets no user row.
+ *
+ * A missing kind (an older bridge) keeps the previous behaviour: treat the
+ * prompt as the human's own and emit the row, rather than silently drop a real
+ * turn.
+ */
+function isUserSource(sourceKind: string | undefined): boolean {
+  return sourceKind === undefined || sourceKind === "user";
+}
+
 /** Resolve Paseo's catalog id (`provider/model`) back into a DSH route. */
 export function parseRoute(model: string | undefined, fallback: DshRoute): DshRoute {
   if (model === undefined || model === "") return fallback;
@@ -267,6 +314,19 @@ export class DshSession {
    * delivered right after the replay; `#flushPendingChildren` routes them.
    */
   #replayPending = new Set<string>();
+  /**
+   * True while {@link replaySubagents} awaits the child listing.
+   *
+   * `#replayPending` cannot be filled before that RPC returns (the ids are its
+   * payload), and a child already running in an adopted parked process is never
+   * announced again by the bridge — so a frame arriving inside that one await
+   * window has no child view, no held notice and no replay entry, and would be
+   * classified as a ghost and dropped. A `turn/end` lost there leaves the child
+   * row running after a rewind reload (the failure FIELD-NOTES 61/62 fixed on the
+   * other side of the same window). Frames are therefore held for the length of
+   * the RPC and routed by the ordinary flush once the listing is in.
+   */
+  #childReplayWindow = false;
   #childBufferWarned = false;
   /** Guards {@link #flushPendingChildren} against re-entrant invocation. */
   #flushing = false;
@@ -491,10 +551,6 @@ export class DshSession {
   }
 
   /**
-   * Read the agent presets the profile declares, for the composer. Optional: a
-   * profile that mounts no preset registry simply gets no Preset control.
-   */
-  /**
    * Rewind to just before one user message.
    *
    * The token is opaque to Paseo: it hands back the `revertToken` our timeline
@@ -514,6 +570,10 @@ export class DshSession {
     return result;
   }
 
+  /**
+   * Read the agent presets the profile declares, for the composer. Optional: a
+   * profile that mounts no preset registry simply gets no Preset control.
+   */
   async loadPresets(): Promise<void> {
     const info = await this.#require().presets();
     if (!info.available) return;
@@ -620,7 +680,11 @@ export class DshSession {
       if (event.type === "user/message") {
         const source = isRecord(data.source) ? data.source : {};
         if (source.kind !== "user") continue;
-        const text = textBlocks(data.content);
+        // `messageRowText`, not `textBlocks`: a prompt that carried only an
+        // image has no text block, and skipping it made the user's turn (and its
+        // revert token) disappear on every reopen. A genuinely empty message —
+        // no blocks at all — still has no row.
+        const text = messageRowText(data.content);
         if (text === "") continue;
         this.#options.emit({
           type: "timeline.item",
@@ -711,11 +775,19 @@ export class DshSession {
       diagnostics?: unknown[];
       error?: { message: string };
     };
+    // Hold every child frame for the one RPC below: the ids that belong to a
+    // replay are not known until it returns, and a frame dropped in this window
+    // can be a terminal (see `#childReplayWindow`).
+    this.#childReplayWindow = true;
     try {
       listing = await process.subagents();
     } catch (error) {
       this.#options.log(`subagent enumeration failed: ${messageOf(error)}`);
       return;
+    } finally {
+      // The gap between this and the `#replayPending` assignment below is
+      // synchronous, so no frame can be misclassified in between.
+      this.#childReplayWindow = false;
     }
     if (!listing.available) {
       // No subagent service composed: an honest empty tree, never a silent
@@ -862,9 +934,9 @@ export class DshSession {
       // skill tool injects a user-invocable skill from exactly that token.
       const line = slashLine(prompt.input.name, args);
       const issuedTurn = this.#openTurnId(prompt.clientMessageId, prompt.delivery);
-      let messageId: string | undefined;
+      let reply: { messageId?: string; sourceKind?: string };
       try {
-        messageId = await process.prompt(line, [{ type: "text", text: line }], prompt.delivery);
+        reply = await process.prompt(line, [{ type: "text", text: line }], prompt.delivery);
       } catch (error) {
         if (issuedTurn) this.#turnId = null;
         this.#emitPromptFailed(prompt.clientMessageId, error);
@@ -873,7 +945,16 @@ export class DshSession {
       // One row, emitted once it carries its revert token: splitting the row into
       // "shown now, token later" left a window where the rewind button appeared
       // on a row the daemon could not map to a provider token.
-      this.#emitUserMessage(prompt.clientMessageId, line, messageId === undefined ? undefined : { messageId });
+      //
+      // Emitted only for the human's own source kind, the same rule the replay
+      // filter applies — see {@link isUserSource}.
+      if (isUserSource(reply.sourceKind)) {
+        this.#emitUserMessage(
+          prompt.clientMessageId,
+          line,
+          reply.messageId === undefined ? undefined : { messageId: reply.messageId },
+        );
+      }
       if (prompt.clearPendingPermissions === true) this.#clearPendingPermissionsForSteer();
       this.#emitPromptAccepted(prompt.clientMessageId, prompt.delivery);
       return;
@@ -899,15 +980,16 @@ export class DshSession {
       this.#emitPromptFailed(prompt.clientMessageId, error);
       return;
     }
-    const label = blocks
-      .map((block) => (block.type === "text" ? (block.text as string) : ""))
-      .filter((text) => text !== "")
-      .join("\n");
+    // The row's own text: the text blocks when there are any, otherwise the
+    // kinds of the blocks that have no text (an image-only prompt). The live row
+    // and the replayed row are built by the same rule, so a reopened
+    // conversation shows the same messages the live one did.
+    const label = messageRowText(blocks);
 
     const issuedTurn = this.#openTurnId(prompt.clientMessageId, prompt.delivery);
-    let messageId: string | undefined;
+    let reply: { messageId?: string; sourceKind?: string };
     try {
-      messageId = await process.prompt(label, blocks.length === 0 ? undefined : blocks, prompt.delivery);
+      reply = await process.prompt(label, blocks.length === 0 ? undefined : blocks, prompt.delivery);
     } catch (error) {
       if (issuedTurn) this.#turnId = null;
       this.#emitPromptFailed(prompt.clientMessageId, error);
@@ -916,7 +998,20 @@ export class DshSession {
     // One row, emitted once it carries its revert token: splitting the row into
     // "shown now, token later" left a window where the rewind button appeared on
     // a row the daemon could not map to a provider token.
-    this.#emitUserMessage(prompt.clientMessageId, label, messageId === undefined ? undefined : { messageId });
+    //
+    // Paseo's own prompts — a schedule fire, a notify-on-finish notice — arrive
+    // wrapped in a `<paseo-system>` envelope and the bridge records them under a
+    // non-`user` source kind, because they are the host talking to the agent, not
+    // the human. Emitting the row anyway printed the envelope XML as if the user
+    // had typed it, and the replay filter then dropped the same message on the
+    // next reopen (see `replayHistory`). The rule is the same on both sides now.
+    if (isUserSource(reply.sourceKind)) {
+      this.#emitUserMessage(
+        prompt.clientMessageId,
+        label,
+        reply.messageId === undefined ? undefined : { messageId: reply.messageId },
+      );
+    }
 
     if (prompt.clearPendingPermissions === true) this.#clearPendingPermissionsForSteer();
     this.#emitPromptAccepted(prompt.clientMessageId, prompt.delivery);
@@ -1178,6 +1273,13 @@ export class DshSession {
    */
   async interrupt(): Promise<void> {
     await this.#require().cancel();
+    // A cancelled turn's pending question cards can never be answered: DSH aborts
+    // the question with the turn, and the bridge drops its pending request without
+    // telling this process, so a later click would answer nobody. Deny them here —
+    // the same resolution the daemon applies when it interrupts a run — which also
+    // releases the promise this session holds for each card instead of keeping it
+    // until the session closes.
+    this.#clearPendingPermissions("The turn was interrupted, so this question is no longer waiting for an answer.");
   }
 
   /**
@@ -1230,8 +1332,9 @@ export class DshSession {
         return;
       }
       // Not open yet: hold the status while its history replay is in flight (the
-      // replay-time mirror of the `#rootReady` gate below).
-      if (this.#replayPending.has(sid)) {
+      // replay-time mirror of the `#rootReady` gate below), or while the child
+      // listing that names those replays is still being read.
+      if (this.#childReplayWindow || this.#replayPending.has(sid)) {
         this.#bufferChildEvent({ kind: "status", sessionId: sid, status });
         return;
       }
@@ -1535,10 +1638,20 @@ export class DshSession {
       if (this.#isPendingChild(sid) && payload.event.type === "subagent/descriptor") {
         const label = subagentLabel(payload.event.data);
         if (label !== undefined) this.#completeHeldChild(sid, label);
+        // Opening the child may have just resolved its parent edge. The
+        // `#children` check above ran before that, so this frame belongs to the
+        // view now — falling through would drop it and log it as an unknown
+        // session, which is exactly the kind of line that misleads a later
+        // investigation.
+        if (this.#children.has(sid)) {
+          this.#routeChildEvent(sid, payload.event);
+          return;
+        }
       }
       // A child whose history replay is in flight can emit frames during that
-      // await window; hold them for the replayed child instead of dropping.
-      if (this.#replayPending.has(sid)) {
+      // await window; hold them for the replayed child instead of dropping. The
+      // same holds while the child listing itself is being read.
+      if (this.#childReplayWindow || this.#replayPending.has(sid)) {
         this.#bufferChildEvent({ kind: "event", sessionId: sid, event: payload.event });
         return;
       }
@@ -1577,8 +1690,24 @@ export class DshSession {
           : kind === undefined || kind === "completed"
             ? "completed"
             : "failed";
+      // A failed turn's own message is what the user needs to read: it is the
+      // text the daemon renders in its system-error row and the text this
+      // plugin's timeline error item carries. The generic sentence stays as the
+      // fallback for failure kinds that carry no error payload (`blocked`,
+      // `max-tokens`, `interrupted`).
+      const reason = isRecord(data.reason) ? data.reason : undefined;
+      const failure = isRecord(reason?.error) ? reason.error : undefined;
+      const failureMessage = failure === undefined ? undefined : failure["message"];
       this.#turnEndState =
-        state === "failed" ? { state, error: `the turn ended with ${String(kind)}` } : { state };
+        state === "failed"
+          ? {
+              state,
+              error:
+                typeof failureMessage === "string" && failureMessage !== ""
+                  ? failureMessage
+                  : `the turn ended with ${String(kind)}`,
+            }
+          : { state };
     }
     // The model can leave plan mode on its own, for example by submitting a plan
     // for approval. Mirror that into the composer's mode selection so the toggle
@@ -1651,23 +1780,32 @@ export class DshSession {
    */
   async #onQuestion(request: DshQuestionRequest, sessionId: string): Promise<DshAnswer> {
     const target = this.#parentScopedId(sessionId === "" ? this.#dshSessionId : sessionId) ?? this.id;
-    const headers = request.questions.map((question, index) => headerOf(question, index));
+    // One answer key per question: Paseo collects `updatedInput.answers` keyed by
+    // these headers, while DSH does not require a header to be unique — see
+    // {@link uniqueHeaders}.
+    const headers = uniqueHeaders(request.questions);
     const planIndex = request.questions.findIndex((question) => question.intent?.kind === "plan-review");
     const response =
       planIndex < 0
         ? await this.#askQuestions(target, request, headers)
         : await this.#reviewPlan(target, request, request.questions[planIndex] as DshQuestion);
 
-    const answers = request.questions.map((question, index) => ({
-      id: question.id,
-      selected:
-        index === planIndex
-          ? planAnswer(question, response)
-          : selectAnswer(question, headers[index] as string, response),
-      ...(response.behavior === "deny" && response.message !== undefined
-        ? { custom: response.message }
-        : {}),
-    }));
+    const answers = request.questions.map((question, index) => {
+      if (index === planIndex) {
+        return {
+          id: question.id,
+          selected: planAnswer(question, response),
+          // A dismissed plan review carries the user's own words; DSH's plan tool
+          // reads them as `custom` and hands them to the model as feedback.
+          ...(response.behavior === "deny" && response.message !== undefined
+            ? { custom: response.message }
+            : {}),
+        };
+      }
+      // `selectAnswer` already splits the answer into DSH's two channels: chosen
+      // labels in `selected`, the picker's "Other" text in `custom`.
+      return { id: question.id, ...selectAnswer(question, headers[index] as string, response) };
+    });
 
     return { answers };
   }
@@ -1955,7 +2093,11 @@ export class DshChildSession {
       if (event.type === "user/message") {
         const source = isRecord(data.source) ? data.source : {};
         if (source.kind !== "user") continue;
-        const text = textBlocks(data.content);
+        // `messageRowText`, not `textBlocks`: a prompt that carried only an
+        // image has no text block, and skipping it made the user's turn (and its
+        // revert token) disappear on every reopen. A genuinely empty message —
+        // no blocks at all — still has no row.
+        const text = messageRowText(data.content);
         if (text === "") continue;
         this.#options.emit({
           type: "timeline.item",
@@ -2317,31 +2459,77 @@ function headerOf(question: DshQuestion, index: number): string {
 }
 
 /**
- * Recover the chosen labels from a permission response. Paseo answers through
- * `updatedInput.answers[<header>]` — a string, comma-joined when multi-select —
- * so `selectedActionId` is only a fallback for button-style resolutions.
+ * One distinct answer key per question of a card.
+ *
+ * Paseo's shared picker collects the whole batch into
+ * `updatedInput.answers`, keyed by the question's `header` (its own
+ * `buildQuestionFormAnswers`), and this plugin sends that same string as the
+ * card's question key. DSH only requires a question `id` to be unique, so a model
+ * may give two questions the same header; both would then share one answer slot
+ * and the second selection would silently overwrite the first. The header is
+ * generated on this side of the protocol, so duplicates are made unique here
+ * rather than losing an answer. A later duplicate gets a ` (n)` suffix; the loop
+ * also covers a model header that already looks like one.
+ */
+function uniqueHeaders(questions: readonly DshQuestion[]): string[] {
+  const used = new Set<string>();
+  return questions.map((question, index) => {
+    const base = headerOf(question, index);
+    let header = base;
+    let suffix = 1;
+    while (used.has(header)) {
+      suffix += 1;
+      header = `${base} (${suffix})`;
+    }
+    used.add(header);
+    return header;
+  });
+}
+
+/**
+ * Recover one question's answer from a permission response.
+ *
+ * Paseo answers through `updatedInput.answers[<header>]` — a string, comma-joined
+ * when multi-select — so `selectedActionId` is only a fallback for button-style
+ * resolutions. A string that matches none of the question's option labels is the
+ * picker's "Other" free text rather than a chosen label: DSH's answer item has a
+ * separate `custom` field for exactly that, so it travels there instead of being
+ * reported as an option label the model never offered.
+ *
+ * Multi-select stays one list: the picker joins labels (and an "Other" entry,
+ * when present) into the same comma-separated string, and Paseo's own adapters
+ * split it the same way, so there is no reliable boundary to recover.
  */
 function selectAnswer(
   question: DshQuestion,
   header: string,
   response: ProviderPermissionResponse,
-): string[] {
-  if (response.behavior === "deny") return [];
+): { selected: string[]; custom?: string } {
+  if (response.behavior === "deny") {
+    return {
+      selected: [],
+      ...(response.message === undefined ? {} : { custom: response.message }),
+    };
+  }
   const answers = isRecord(response.updatedInput) ? response.updatedInput["answers"] : undefined;
   const raw = isRecord(answers) ? answers[header] : undefined;
   if (typeof raw === "string" && raw.trim().length > 0) {
+    const answer = raw.trim();
     if (question.multiSelect === true) {
-      return raw
-        .split(",")
-        .map((entry) => entry.trim())
-        .filter((entry) => entry.length > 0);
+      return {
+        selected: answer
+          .split(",")
+          .map((entry) => entry.trim())
+          .filter((entry) => entry.length > 0),
+      };
     }
-    return [raw.trim()];
+    const match = (question.options ?? []).find((option) => option.label === answer);
+    return match === undefined ? { selected: [], custom: answer } : { selected: [match.label] };
   }
   const options = question.options ?? [];
   const index = Number(response.selectedActionId);
   const label = Number.isInteger(index) ? options[index]?.label : undefined;
-  return label === undefined ? [] : [label];
+  return { selected: label === undefined ? [] : [label] };
 }
 
 /**
@@ -2350,8 +2538,8 @@ function selectAnswer(
  * revise the plan rather than to start implementing it.
  */
 function planAnswer(question: DshQuestion, response: ProviderPermissionResponse): string[] {
-  const picked = selectAnswer(question, headerOf(question, 0), response);
-  if (picked.length > 0) return picked;
+  const { selected } = selectAnswer(question, headerOf(question, 0), response);
+  if (selected.length > 0) return selected;
   const approve = question.intent?.approve;
   if (response.behavior === "allow" && response.selectedActionId === "implement") {
     return approve === undefined ? [] : [approve];

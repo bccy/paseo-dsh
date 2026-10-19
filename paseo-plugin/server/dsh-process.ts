@@ -11,6 +11,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { profileName } from "./bootstrap";
 
 /** JSON-compatible value tree. */
 export type JsonValue = string | number | boolean | null | { [key: string]: JsonValue } | JsonValue[];
@@ -120,11 +121,6 @@ export interface DshCatalog {
 }
 
 /**
- * The session's current context occupancy, measured by DSH's own token meter.
- * Fields are absent when the runtime does not know them; a caller must never
- * substitute a default, because a fabricated window is worse than none.
- */
-/**
  * The outcome of a rewind's file rollback, as reported by the bridge.
  *
  * `failed` is the only field that means "the conversation was rewound but a file
@@ -154,6 +150,11 @@ export interface DshRevertResult {
   files?: DshRevertFiles;
 }
 
+/**
+ * The session's current context occupancy, measured by DSH's own token meter.
+ * Fields are absent when the runtime does not know them; a caller must never
+ * substitute a default, because a fabricated window is worse than none.
+ */
 export interface DshUsage {
   available: boolean;
   /** Current context capacity of the live route, in tokens. */
@@ -360,6 +361,9 @@ export class DshProcess {
   #closed = false;
   #initializeTask: Promise<void> | undefined;
   #patch: McpPatch | undefined;
+  /** Resolved once the child is gone; created lazily by {@link waitForExit}. */
+  #exited: Promise<void> | undefined;
+  #resolveExited: (() => void) | undefined;
 
   constructor(options: DshProcessOptions) {
     this.#options = options;
@@ -414,7 +418,11 @@ export class DshProcess {
     // A rejected MCP server throws here, before any process exists: `start()`
     // rejects, the provider reports it, and nothing is left on disk.
     this.#patch = prepareMcpPatch(this.#options.mcpServers);
-    const args = ["--profile", process.env.DSH_PASEO_PROFILE ?? "paseo"];
+    // The profile is resolved from the environment the child will actually get,
+    // not the daemon's: a session may override `DSH_PASEO_PROFILE`, and asking DSH
+    // for a profile the session did not provision is a failure with no local
+    // explanation. `profileName` is the single definition of that lookup.
+    const args = ["--profile", profileName({ ...process.env, ...this.#options.env })];
     if (this.#patch !== undefined) args.push("--patch", this.#patch.path);
     const child = spawn(resolveBinary(), args, {
       cwd: this.#options.cwd,
@@ -435,12 +443,14 @@ export class DshProcess {
       this.#cleanupPatch();
       this.#failAll(error);
       this.#handlers.onProtocolError(error.message);
+      this.#markExited();
     });
     child.on("exit", (code, signal) => {
       this.#cleanupPatch();
       this.#closed = true;
       this.#failAll(new Error("DeepSeek Harness process ended"));
       this.#handlers.onExit(code, signal);
+      this.#markExited();
     });
 
     if (this.#options.initializeRoute === false) return;
@@ -508,20 +518,36 @@ export class DshProcess {
     })) as DshUsage;
   }
 
-  /** Send one text prompt. Resolves when the bridge accepts it, not when the turn ends. */
+  /**
+   * Send one text prompt. Resolves when the bridge accepts it, not when the turn ends.
+   *
+   * The receipt carries the DSH message id — Paseo's rewind button hands it back as
+   * its revert token, so it has to travel on the timeline row that represents the
+   * message — and, when the bridge can attribute the message, `sourceKind`: the DSH
+   * event's `source.kind`, which tells a human message apart from a synthetic one
+   * (a notification, a rewind marker) so only the former becomes a rewind anchor.
+   * Both fields are optional: an older bridge reports neither, and a missing field
+   * stays absent rather than being guessed.
+   *
+   * @param text - prompt text, used when `contentBlocks` is omitted.
+   * @param contentBlocks - pre-built content blocks (text and/or attachments).
+   * @param delivery - `steer` injects into the running turn, `auto` opens the next one.
+   * @returns the message id and the message's DSH source kind when reported.
+   */
   async prompt(
     text: string,
     contentBlocks?: unknown[],
     delivery?: "auto" | "steer",
-  ): Promise<string | undefined> {
+  ): Promise<{ messageId?: string; sourceKind?: string }> {
     const result = (await this.#request("session/prompt", {
       sessionId: this.#options.sessionId,
       contentBlocks: contentBlocks ?? [{ type: "text", text }],
       ...(delivery === undefined ? {} : { delivery }),
-    })) as { messageId?: unknown } | undefined;
-    // The DSH message id is what Paseo's rewind button hands back as its revert
-    // token, so it has to travel on the timeline row that represents the message.
-    return typeof result?.messageId === "string" ? result.messageId : undefined;
+    })) as { messageId?: unknown; sourceKind?: unknown } | undefined;
+    return {
+      ...(typeof result?.messageId === "string" ? { messageId: result.messageId } : {}),
+      ...(typeof result?.sourceKind === "string" ? { sourceKind: result.sourceKind } : {}),
+    };
   }
 
   /**
@@ -607,7 +633,23 @@ export class DshProcess {
     };
   }
 
-  /** List the DSH sessions a user could import into Paseo. */
+  /**
+   * List the DSH sessions a user could import into Paseo.
+   *
+   * A failed read is not an empty list. The bridge answers
+   * `{available:false, sessions:[], error?}` when the runtime composes no session
+   * store or the store cannot be listed; Paseo renders its import view from
+   * whatever rows arrive, so folding that into `[]` would show "nothing to import"
+   * for a runtime that actually failed. The failure is thrown instead, and the
+   * caller's `request.failed` carries it to the UI (`history`/`subagents` report the
+   * same condition as data; this method's return type is a bare list, so a throw is
+   * the loud channel). An older bridge reports neither field — absence means the
+   * list is usable, which keeps the legacy behavior.
+   *
+   * @param options - query/cwd/limit filters forwarded to the bridge.
+   * @returns the bridge's stored-session rows.
+   * @throws when the bridge reports `available:false`.
+   */
   async sessions(options: { query?: string; cwd?: string; limit?: number } = {}): Promise<
     Array<{ sessionId: string; cwd?: string; title?: string; preview?: string; updatedAt?: string }>
   > {
@@ -619,7 +661,18 @@ export class DshProcess {
         ...(options.limit === undefined ? {} : { limit: options.limit }),
       },
       60000,
-    )) as { sessions?: Array<{ sessionId: string; cwd?: string; title?: string; preview?: string; updatedAt?: string }> };
+    )) as {
+      available?: boolean;
+      sessions?: Array<{ sessionId: string; cwd?: string; title?: string; preview?: string; updatedAt?: string }>;
+      error?: { message?: string };
+    };
+    if (result.available === false) {
+      const detail =
+        typeof result.error?.message === "string" && result.error.message !== ""
+          ? result.error.message
+          : "the runtime composes no session store";
+      throw new Error(`the session list is unavailable: ${detail}`);
+    }
     return result.sessions ?? [];
   }
 
@@ -665,13 +718,6 @@ export class DshProcess {
   }
 
   /**
-   * List the native subagent children reachable from this session, for
-   * rebuilding the tree on replay. Read-only: DSH reads its durable catalog
-   * without loading or resuming any child agent. `available: false` means the
-   * runtime composes no subagent service; a failed read carries `error`, and an
-   * unreadable branch is reported in `diagnostics` — never a silent empty list.
-   */
-  /**
    * Ask DSH to archive or unarchive one of its sessions.
    *
    * The plugin owns no archive state of its own: DSH does, and Paseo's adapters
@@ -692,6 +738,13 @@ export class DshProcess {
     }
   }
 
+  /**
+   * List the native subagent children reachable from this session, for
+   * rebuilding the tree on replay. Read-only: DSH reads its durable catalog
+   * without loading or resuming any child agent. `available: false` means the
+   * runtime composes no subagent service; a failed read carries `error`, and an
+   * unreadable branch is reported in `diagnostics` — never a silent empty list.
+   */
   async subagents(): Promise<{
     available: boolean;
     subagents: Array<{ sessionId: string; parentSessionId: string; mode?: string; label?: string; archived?: boolean }>;
@@ -738,6 +791,47 @@ export class DshProcess {
         child.kill("SIGKILL");
       }
     }, 4000).unref?.();
+  }
+
+  /**
+   * Resolve once the child is gone, or `false` when `timeoutMs` elapses.
+   *
+   * Used before a DSH session is handed to a new process: the dead child released
+   * the session log's kernel write lock only when the OS actually reaped it, and a
+   * successor spawned into that window cannot materialize the session ("already
+   * owned by an active write handle"). `kill()` returns before that happens, so
+   * callers that must not race it need this await with a bound.
+   *
+   * @param timeoutMs - upper bound on the wait; the caller decides what to do on
+   *   timeout (this method never rejects).
+   * @returns `true` when the child is gone (or was never spawned), `false` on timeout.
+   */
+  waitForExit(timeoutMs: number): Promise<boolean> {
+    const child = this.#child;
+    if (child === undefined || child.exitCode !== null || child.signalCode !== null) {
+      return Promise.resolve(true);
+    }
+    this.#exited ??= new Promise<void>((resolve) => {
+      this.#resolveExited = resolve;
+    });
+    const exited = this.#exited;
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        resolve(false);
+      }, timeoutMs);
+      timer.unref?.();
+      void exited.then(() => {
+        clearTimeout(timer);
+        resolve(true);
+      });
+    });
+  }
+
+  /** Wake every {@link waitForExit} caller; idempotent. */
+  #markExited(): void {
+    const resolve = this.#resolveExited;
+    this.#resolveExited = undefined;
+    resolve?.();
   }
 
   #request(method: string, params: unknown, timeoutMs = 120000): Promise<unknown> {

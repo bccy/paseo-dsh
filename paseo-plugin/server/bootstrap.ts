@@ -15,7 +15,7 @@
  */
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { BRIDGE_FILES, BRIDGE_PACKAGE_NAME, PROFILE_PATCH_TEMPLATE_BASE64 } from "./bridge-assets";
 
 const CORDIS_YML = `# dsh profile root — an empty entry list. The tree is composed as patches:
@@ -31,13 +31,54 @@ nodeLinker: hoisted
 autoInstallPeers: false
 `;
 
-/** The DSH profile name the bridge runs under. */
-export function profileName(): string {
-  return process.env.DSH_PASEO_PROFILE ?? "paseo";
+/**
+ * The DSH profile name this plugin drives.
+ *
+ * The single definition of the lookup: `ensurePaseoProfile()` provisions what the
+ * daemon's environment names, and the spawned child is given `--profile` with the
+ * value resolved from *its own* environment (see `dsh-process.ts`), so both sides
+ * always agree on which profile directory is meant.
+ *
+ * @param env - environment to read (a child's merged env, or the daemon's).
+ * @returns the configured profile name, or `paseo` when unset.
+ */
+export function profileName(env: Readonly<Record<string, string | undefined>> = process.env): string {
+  return env["DSH_PASEO_PROFILE"] ?? "paseo";
 }
 
-function dshHome(): string {
-  return process.env.DSH_HOME ?? join(homedir(), ".dsh");
+/**
+ * Expand a leading `~` exactly like DSH's own home resolver.
+ *
+ * Copied verbatim from `@deepseek-ai/dsh-home-paths` `expandHomePath`: a leading
+ * `~`, `~/` or `~\` is the OS home, anything else is returned unchanged.
+ *
+ * @param value - configured path that may begin with `~`.
+ * @returns the expanded path, or the original value when no prefix matched.
+ */
+function expandHomePath(value: string): string {
+  if (value === "~") return homedir();
+  if (value.startsWith("~/") || value.startsWith("~\\")) return join(homedir(), value.slice(2));
+  return value;
+}
+
+/**
+ * Resolve `$DSH_HOME` the way DSH itself does.
+ *
+ * DSH's resolver (`resolveRoot` in `@deepseek-ai/dsh-home-paths`) treats a `~`
+ * prefix as the OS home, treats an empty/whitespace-only override as unset, and
+ * `path.resolve()`s the result — so a deployment that sets `DSH_HOME=~/dsh-alt`
+ * or a relative path gets a different directory than a literal `join(raw, …)`
+ * would produce. Provisioning into the wrong tree is invisible until *every*
+ * session fails to find its profile, so the two resolvers must agree.
+ *
+ * @param env - environment to read (defaults to the daemon's own).
+ * @returns the absolute DSH home directory.
+ */
+function dshHome(env: Readonly<Record<string, string | undefined>> = process.env): string {
+  const configured = env["DSH_HOME"];
+  const base =
+    configured !== undefined && configured.trim() !== "" ? configured : join(homedir(), ".dsh");
+  return resolve(expandHomePath(base));
 }
 
 function profilePackageJson(profile: string): string {

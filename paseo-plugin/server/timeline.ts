@@ -328,6 +328,15 @@ function metaMatchFiles(
 /**
  * `meta.diffs` of a DSH `edit`/`write` result: hunk-level replacements with
  * context. `write` sends `[]` for a create, which is a valid list.
+ *
+ * DSH's `FileDiff.oldText` is `string | null`: `null` is a pure-insertion hunk —
+ * a create, or the first write into a file that was empty at call time — and it
+ * is documented as "no prior content available at call time"
+ * (`@deepseek-ai/dsh-tools` `presentation.d.ts`). Paseo's diff has no null side,
+ * so it normalizes to the empty string here: the removed side really is empty,
+ * which is what `""` renders as. Rejecting it (the previous behaviour) made a
+ * legitimate meta look unrecognized — the diff card silently fell back to the
+ * plain result text while a warning blamed DSH for a shape it declares.
  */
 function metaDiffs(
   meta: Record<string, unknown>,
@@ -335,15 +344,12 @@ function metaDiffs(
   if (!Array.isArray(meta.diffs)) return undefined;
   const diffs: Array<{ path: string; oldText: string; newText: string }> = [];
   for (const diff of meta.diffs) {
-    if (
-      !isRecord(diff) ||
-      typeof diff.path !== "string" ||
-      typeof diff.oldText !== "string" ||
-      typeof diff.newText !== "string"
-    ) {
+    if (!isRecord(diff) || typeof diff.path !== "string" || typeof diff.newText !== "string") {
       return undefined;
     }
-    diffs.push({ path: diff.path, oldText: diff.oldText, newText: diff.newText });
+    const oldText = diff.oldText;
+    if (oldText !== null && typeof oldText !== "string") return undefined;
+    diffs.push({ path: diff.path, oldText: oldText ?? "", newText: diff.newText });
   }
   return diffs;
 }
@@ -908,7 +914,7 @@ export class TimelineBuilder {
       const input = parseArguments(block.arguments);
       this.#toolNames.set(callId, name);
       this.#toolInputs.set(callId, input);
-      out.push(...this.#emitToolCall(callId, name, input, "running"));
+      out.push(...this.#emitToolCall(callId, name, input));
     }
     return out;
   }
@@ -948,9 +954,10 @@ export class TimelineBuilder {
     const input = parseArguments(data.arguments);
     this.#toolNames.set(callId, name);
     this.#toolInputs.set(callId, input);
-    // Always "running": `#emitToolCall` ignores a repeat for a row that already
-    // reached a terminal state, so this cannot undo a finished tool.
-    return this.#emitToolCall(callId, name, input, "running");
+    // The row only ever opens as running: `#emitToolCall` ignores a repeat for a
+    // row that already reached a terminal state, so this cannot undo a finished
+    // tool.
+    return this.#emitToolCall(callId, name, input);
   }
 
   #toolResult(data: Record<string, unknown>): ProviderTimelineItem[] {
@@ -1196,7 +1203,11 @@ export class TimelineBuilder {
     // row `running` forever — the client pulses a running row unconditionally.
     const out = this.#cancelRunningTools();
     const reason = isRecord(data.reason) ? data.reason : undefined;
-    if (reason?.kind !== "error" && reason?.kind !== "failed") return out;
+    // `"error"` is the one failure reason that carries a message to show; the
+    // other failure kinds (`max-tokens`, `blocked`, `interrupted`) have none and
+    // are reported by the terminal turn instead. An earlier `"failed"` comparison
+    // here was dead: DSH's TurnEndReason has no such kind.
+    if (reason?.kind !== "error") return out;
     const error = isRecord(reason.error) ? reason.error : undefined;
     const message =
       (error === undefined ? undefined : stringField(error, "message")) ?? "The turn failed.";
@@ -1216,12 +1227,15 @@ export class TimelineBuilder {
     return out;
   }
 
-  #emitToolCall(
-    callId: string,
-    name: string,
-    input: Record<string, unknown>,
-    status: "running" | "completed" | "failed" | "canceled",
-  ): ProviderTimelineItem[] {
+  /**
+   * Open (or re-open) one tool row, always as `running`.
+   *
+   * The terminal states are produced from `tool/result` and from the turn/replay
+   * closures, which rebuild the same row id; every caller here means "the model
+   * asked for this tool". Keeping a status parameter for those states made a
+   * `failed` branch that no caller could reach.
+   */
+  #emitToolCall(callId: string, name: string, input: Record<string, unknown>): ProviderTimelineItem[] {
     const previous = this.#items.get(`tool:${callId}`);
     if (
       previous !== undefined &&
@@ -1240,9 +1254,8 @@ export class TimelineBuilder {
       name,
       detail: toolDetail(name, input),
       metadata: toolMetadata(input),
-      ...(status === "failed"
-        ? { status: "failed" as const, error: { message: "tool failed" } }
-        : { status, error: null }),
+      status: "running",
+      error: null,
     };
     return this.#put(item);
   }
