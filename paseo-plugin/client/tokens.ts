@@ -4,9 +4,12 @@
  * Every number here is copied from DSH's own stylesheet (`docs/RENDER-PLAN.md`,
  * `/tmp/dsh-blocks-2-report.md`, and `docs/preview/tool-rows-dsh-vs-proposed.png`)
  * so each block stops carrying its own idea of "13px" and "8px". The values are
- * grouped by the block they belong to; the fold counts and heights at the end
- * are here for the meta-driven blocks of the next phase, which is why they have
- * no consumer yet.
+ * grouped by the block they belong to. The fold counts at the end are consumed
+ * by the meta-driven blocks; the two caps DSH puts on a terminal card (150px on
+ * the command banner, 224px on the output region) are deliberately **not**
+ * declared here, because no block applies them yet — a constant nothing reads
+ * is a promise the code does not keep. The gap is tracked in
+ * `docs/RENDER-PLAN.md` §4 ("仍未做"), not as tokens here.
  *
  * Deliberately free of React and React Native imports, so the offline harness
  * can compile and `require` this module with plain `node`
@@ -276,10 +279,6 @@ export const COMMAND_LINE_HEIGHT = 18;
 export const OUTPUT_PADDING_VERTICAL = 12;
 export const OUTPUT_PADDING_HORIZONTAL = 14;
 export const OUTPUT_FONT_SIZE = 11;
-/** A long command scrolls inside its banner instead of pushing the output off. */
-export const COMMAND_MAX_HEIGHT = 150;
-/** `.output { max-height: 224px }` under ToolRow. */
-export const OUTPUT_MAX_HEIGHT = 224;
 
 /** The command banner's own box. */
 export function commandRegionStyle(): {

@@ -172,6 +172,7 @@ const TEXT: Record<Locale, UiText> = {
       terminal_open: "Open terminal",
       terminal_read: "Read terminal",
       terminal_list: "List terminals",
+      terminal_send: "Send terminal input",
       terminal_signal: "Signal terminal",
       terminal_close: "Close terminal",
       workflow: "Run workflow",
@@ -182,6 +183,11 @@ const TEXT: Record<Locale, UiText> = {
       session_event_search: "Search events",
       session_event_trace: "Trace event",
       present: "Present files",
+      // Rows Paseo's own daemon appends to the agent timeline when a
+      // worktree-isolated workspace is created (`worktree-bootstrap.js`). They
+      // are not DSH tools, but they arrive as `tool_call` items like any other.
+      paseo_worktree_setup: "Prepare worktree",
+      paseo_worktree_terminals: "Start worktree terminals",
       cordis_define: "Register Cordis Plugin",
       cordis_run: "Run Cordis Plugin",
       cordis_stop: "Stop Cordis Plugin",
@@ -207,6 +213,10 @@ const TEXT: Record<Locale, UiText> = {
       mcp_list_tools: "List MCP tools",
       mcp_tool_schema: "Show MCP tool schema",
       mcp_call_tool: "Call MCP tool",
+      // The bridge's own archive tool (`dsh-bridge/lib/subagent-archive.js`):
+      // our tool, but it arrives as an `unknown` detail, so without a label the
+      // row printed the wire name next to a wrench.
+      archive_subagents: "Archive subagents",
     },
     paseoMcpLabels: {
       speak: "Speak",
@@ -333,6 +343,7 @@ const TEXT: Record<Locale, UiText> = {
       terminal_open: "创建终端",
       terminal_read: "读取终端",
       terminal_list: "查看终端",
+      terminal_send: "发送终端输入",
       terminal_signal: "发送终端信号",
       terminal_close: "关闭终端",
       workflow: "运行工作流",
@@ -343,6 +354,8 @@ const TEXT: Record<Locale, UiText> = {
       session_event_search: "搜索事件",
       session_event_trace: "追踪事件",
       present: "交付文件",
+      paseo_worktree_setup: "准备 worktree",
+      paseo_worktree_terminals: "初始化 worktree 终端",
       cordis_define: "注册 Cordis 插件",
       cordis_run: "运行 Cordis 插件",
       cordis_stop: "停止 Cordis 插件",
@@ -366,6 +379,7 @@ const TEXT: Record<Locale, UiText> = {
       mcp_list_tools: "列出 MCP 工具",
       mcp_tool_schema: "查看 MCP 工具参数",
       mcp_call_tool: "调用 MCP 工具",
+      archive_subagents: "归档子智能体",
     },
     paseoMcpLabels: {
       speak: "朗读",

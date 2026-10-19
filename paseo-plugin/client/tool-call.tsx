@@ -20,8 +20,9 @@
  * this row showed before those blocks existed, so an unrecognized meta is a
  * plainer row rather than an empty card.
  *
- * While the tool is running the row pulses (see `./shimmer`), matching the
- * "still working" feel Paseo's own loading rows have.
+ * While the tool is running the row pulses (see `./text-shimmer` for the sweep
+ * and `./newest` for the position rule that decides *which* row runs it),
+ * matching the "still working" feel Paseo's own loading rows have.
  *
  * @module dsh-paseo/client/tool-call
  */
@@ -319,11 +320,9 @@ function searchRows(data: SearchBlockData, collapsed: ReadonlySet<number>): Sear
 function SearchBlockView({
   data,
   styles,
-  colors,
 }: {
   data: SearchBlockData;
   styles: BlockStyles;
-  colors: TokenColors;
 }) {
   const copy = blockCopy();
   const [expanded, setExpanded] = useState(false);
@@ -621,9 +620,9 @@ function WebBlockView({ data, styles }: { data: WebBlockData; styles: BlockStyle
               {data.url}
             </Link>
             <View style={styles.webMetaRow}>
-              {data.statusCode === null ? null : (
-                <Text style={styles.webMeta}>{`${copy.http} ${data.statusCode}`}</Text>
-              )}
+              {/* `parseWeb` returns a fetch card only when its meta carried a
+                  numeric status code, so this is never null on this shape. */}
+              <Text style={styles.webMeta}>{`${copy.http} ${data.statusCode}`}</Text>
               {data.truncated ? (
                 <Text style={styles.webTruncated}>{copy.contentTruncated}</Text>
               ) : null}
@@ -919,7 +918,7 @@ export function InlineToolCall({
               ) : null}
             </View>
           ) : data.search !== null ? (
-            <SearchBlockView data={data.search} styles={styles} colors={colors} />
+            <SearchBlockView data={data.search} styles={styles} />
           ) : data.read !== null ? (
             <ReadBlockView data={data.read} styles={styles} colors={colors} />
           ) : data.diffBlock !== null ? (

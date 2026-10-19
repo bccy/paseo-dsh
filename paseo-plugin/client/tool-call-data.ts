@@ -152,7 +152,6 @@ export interface ToolCallData {
    */
   paseoMark: boolean;
   status: "running" | "completed" | "failed" | "canceled";
-  phase: "streaming" | "complete";
   /**
    * The row's second half: the tool's description when it has one, else its own
    * subject. A 0.12 agent-to-agent message row puts its sender here
@@ -646,20 +645,31 @@ interface MetaDiff {
   readonly newText: string;
 }
 
+/**
+ * One side of a diff pair as text, or `""` for a `null` side.
+ *
+ * DSH's `FileDiff.oldText` is `string | null` — a create has no old side — and
+ * the server half normalizes `null` to `""` before it writes `meta.diffs`. This
+ * accepts the raw `null` as well so a row stays readable when an older daemon or
+ * a replayed reply still carries it; anything else is a malformed pair.
+ */
+function diffSide(value: unknown): string | null {
+  if (value === null) return "";
+  return typeof value === "string" ? value : null;
+}
+
 /** `meta.diffs`, or null when any entry is not the documented shape. */
 function parseDiffs(raw: unknown): MetaDiff[] | null {
   if (!Array.isArray(raw)) return null;
   const diffs: MetaDiff[] = [];
   for (const diff of raw) {
-    if (
-      !isRecord(diff) ||
-      typeof diff.path !== "string" ||
-      typeof diff.oldText !== "string" ||
-      typeof diff.newText !== "string"
-    ) {
-      return null;
-    }
-    diffs.push({ path: diff.path, oldText: diff.oldText, newText: diff.newText });
+    if (!isRecord(diff) || typeof diff.path !== "string") return null;
+    // The server already folds `null` sides to `""`; this is tolerance for old
+    // data / an older daemon's reply, not the primary contract.
+    const oldText = diffSide(diff.oldText);
+    const newText = diffSide(diff.newText);
+    if (oldText === null || newText === null) return null;
+    diffs.push({ path: diff.path, oldText, newText });
   }
   return diffs;
 }
@@ -801,6 +811,7 @@ const TOOL_NAME_ICONS: Record<string, string> = {
   terminal_open: "SquareTerminal",
   terminal_read: "SquareTerminal",
   terminal_list: "SquareTerminal",
+  terminal_send: "SquareTerminal",
   terminal_signal: "SquareTerminal",
   terminal_close: "SquareTerminal",
   schedule_create: "CalendarClock",
@@ -849,6 +860,16 @@ const TOOL_NAME_ICONS: Record<string, string> = {
   mcp_list_tools: "Server",
   mcp_tool_schema: "FileJson",
   mcp_call_tool: "Play",
+  // The bridge's other tool (`dsh-bridge/lib/subagent-archive.js`): finish
+  // native subagent child sessions in DSH's own registry. It arrives as an
+  // `unknown` detail, so without this entry the row read
+  // `wrench archive_subagents {"agentIds":[…]}`.
+  archive_subagents: "Archive",
+  // Rows Paseo's own daemon appends to the timeline (`worktree-bootstrap.js`),
+  // not rows this provider emits. `paseo_worktree_setup` carries a typed
+  // `worktree_setup` detail and takes its glyph from `DETAIL_ICONS`; the
+  // terminals row is `unknown`, so it needs the entry.
+  paseo_worktree_terminals: "SquareTerminal",
   // `present` is DSH's deliverable row (`dsh-client-ui-deliverables` registers a
   // keyed toolview for it, titled 交付文件 / "Present files"). Its own glyph is
   // `IconDeliverDocRegular` — a document over two perspective planes — which has
@@ -1193,7 +1214,15 @@ export function toolCallData(
      */
     agentMessage?: AgentMessage;
   },
-  phase: "streaming" | "complete",
+  /**
+   * The host's streaming phase. Accepted for the transformer's call shape but
+   * deliberately **not** carried onto the row: `phase` is not a reliable
+   * "still streaming" signal (`./inline-thinking` documents why), so the row
+   * derives its running state from `status` plus `./newest`'s position rule.
+   * Keeping it in the signature also keeps the transformer call site and the
+   * harness's source-level assertion on it unchanged.
+   */
+  _phase: "streaming" | "complete",
 ): ToolCallData {
   const detail = (item.detail ?? {}) as ToolDetail;
   const metadata = (item.metadata ?? {}) as ToolDetail;
@@ -1271,6 +1300,19 @@ export function toolCallData(
       break;
     case "sub_agent":
       primary = str(detail, "description") || str(detail, "subAgentType");
+      body = str(detail, "log");
+      bodyLabel = copy.bodyLabels.log;
+      break;
+    case "worktree_setup":
+      // Paseo's own daemon appends these rows to the agent timeline when a
+      // worktree-isolated workspace is created (`buildSetupTimelineItem` in
+      // `@getpaseo/server`'s `worktree-bootstrap.js`), for **any** provider.
+      // The app runs every plugin timeline transformer over the whole timeline,
+      // so the row lands here even though this provider never emits it. The
+      // protocol's `worktree_setup` detail has no `input`/`output`, so the
+      // `unknown` fallback below cannot carry it: without this case the row drew
+      // an icon over nothing (`{summary:"",headline:"",body:"",hasDetail:false}`).
+      primary = str(detail, "branchName") || str(detail, "worktreePath");
       body = str(detail, "log");
       bodyLabel = copy.bodyLabels.log;
       break;
@@ -1403,7 +1445,6 @@ export function toolCallData(
     )
       ? (item.status as ToolCallData["status"])
       : "completed",
-    phase,
     summary,
     // A block-specific lead (the pretty arguments of an `unknown` row, the
     // command of a shell row) always wins: a description must not push the block
