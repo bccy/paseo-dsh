@@ -9,11 +9,19 @@ own plugin installer:
 
 ```bash
 paseo plugin add npm:paseo-dsh
-# or from a checkout:
-paseo plugin add liuxing7954/paseo-dsh --path paseo-plugin
+# or from a checkout (Paseo >= 0.9.2 requires the explicit github: prefix and
+# the :plugin/path suffix; the legacy `--path` flag and a bare `owner/slug` are
+# a registry reference on Paseo >= 0.9 and fail):
+paseo plugin add github:liuxing7954/paseo-dsh:paseo-plugin
 ```
 
-On load it provisions `$DSH_HOME/profiles/paseo` (the DSH profile it drives),
+> **Version note (2026-10-20):** the newest npm release is `0.2.9`
+> (2026-10-17), which predates the Paseo 0.12 adapter. On Paseo 0.12 install
+> from the repository command above (or wait for `0.2.10`). The npm line stays
+> the simplest path for Paseo <= 0.11.
+
+On load it provisions `$DSH_HOME/profiles/paseo` (the DSH profile it drives; set
+`DSH_PASEO_PROFILE` to use another name — the daemon must use the same value),
 including the stdio bridge bundle it carries — no shell script, no manual
 profile setup. The only thing left is your model route in
 `~/.dsh/profiles/paseo/cordis.patch.yml`.
@@ -41,10 +49,13 @@ What you get that the ACP boundary can't carry:
 - Session **reopen and import**: a reopened session replays its conversation
   history, and native DSH sessions can be imported from Paseo
 
-Full documentation, the adoption guide, and 20 real defects with their fixes
+Full documentation, the adoption guide, and 60+ real defects with their fixes
 live in the main repository: **https://github.com/liuxing7954/paseo-dsh**
 
-Requires Paseo ≥ 0.9.2 and the official `dsh` on the daemon's `PATH`.
+Requires Paseo ≥ 0.9.2, **DSH ≥ 0.2.1** and the official `dsh` on the daemon's
+`PATH`. The bridge imports five DSH-internal packages (`dsh-cmdline`,
+`dsh-brand`, `dsh-llm`, `dsh-attachment`, `dsh-agent`); `0.2.1-rc.2` is the
+verified build and 0.2.0 and older are unverified (doctor fails them).
 
 ## Versioning
 
@@ -65,11 +76,16 @@ Paseo 的**原生** provider 接入——**不是 ACP**。
 
 ```bash
 paseo plugin add npm:paseo-dsh
-# 或从仓库：
-paseo plugin add liuxing7954/paseo-dsh --path paseo-plugin
+# 或从仓库（Paseo >= 0.9.2 必须带 github: 前缀和 :plugin/path 后缀；
+# 旧的 --path 写法与裸 owner/slug 在 >= 0.9 会被当成 registry 引用而失败）：
+paseo plugin add github:liuxing7954/paseo-dsh:paseo-plugin
 ```
 
-插件**首次加载会自己准备好** `$DSH_HOME/profiles/paseo`（它驱动的 DSH profile），并把内嵌的
+> **版本提醒（2026-10-20）**：npm 上最新是 `0.2.9`（2026-10-17），不含 Paseo 0.12
+> 适配。在 Paseo 0.12 上用上面的仓库命令装（或等 `0.2.10`）；Paseo ≤0.11 用 npm 最省事。
+
+插件**首次加载会自己准备好** `$DSH_HOME/profiles/paseo`（它驱动的 DSH profile；可用
+`DSH_PASEO_PROFILE` 改名——daemon 必须用同一个值），并把内嵌的
 stdio bridge 落盘——不用 clone、不用跑脚本、不用手动配 profile。你只需要在
 `~/.dsh/profiles/paseo/cordis.patch.yml` 里填自己的模型路由。
 
@@ -95,10 +111,12 @@ ACP 承载不了、而这里都有：
   建会话时选、首个回合后锁定
 - **会话恢复与导入**：重开会话会回放历史；并可从 Paseo 导入 DSH 原生会话
 
-完整文档、改造指南、以及 20 个真实缺陷的修复记录都在主仓库：
+完整文档、改造指南、以及 60+ 个真实缺陷的修复记录都在主仓库：
 **https://github.com/liuxing7954/paseo-dsh**
 
-需要 Paseo ≥ 0.9.2，且 daemon 的 `PATH` 上有官方 `dsh`。
+需要 Paseo ≥ 0.9.2、**DSH ≥ 0.2.1**，且 daemon 的 `PATH` 上有官方 `dsh`。桥直接 import
+五个 DSH 内部包（`dsh-cmdline` / `dsh-brand` / `dsh-llm` / `dsh-attachment` / `dsh-agent`）；
+`0.2.1-rc.2` 是实测通过的版本，0.2.0 及更早未验证（`doctor` 会判 blocking）。
 
 ### 版本策略
 

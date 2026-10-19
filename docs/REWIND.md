@@ -50,9 +50,14 @@ Paseo 撤回按钮
   多一轮无内容用户消息（与 `dsh-rewind-plugin` 的做法一致，实测无副作用）。
 - `surfaceOp` 必须恰好 `op`/`startSeq`/`endSeq` 三键，两端必须是**当前 surface.nodes 里的
   seq**（不能用日志 seq）；`sourceEventSeqs` 必须覆盖全部被遮蔽节点，否则 `append` 抛错。
-- 追加前必须使 agent **空闲**：`cancel` 当前回合 → `await whenIdle(15s)` → 清 pending
-  steering → 会话级 inflight 互斥。否则撤回后仍在产生的事件会追加到替换节点之后，被撤内容
-  "复活"。
+- 追加前必须使 agent **空闲**（`settleAgentForRevert`，`dsh-bridge/lib/server.js:1205-1216`）：
+  `cancel` 当前回合 → **同步**丢弃两条收件箱队列 `nextStep` + `nextTurn` → `await
+  whenIdle(15s)` → 会话级 inflight 互斥。清队列必须在第一个 `await` 之前：取消是异步收敛的，
+  晚一步驱动就可能领走排队回合。**排队回合不在撤回范围内，但必须一起丢**——只清 steering
+  （`nextStep`）时，排队的 follow-up 回合（`nextTurn`）会在被取消回合落 idle 的瞬间把驱动
+  叫醒，`whenIdle()` 于是还要等一整个额外回合：撤回可能卡到 15s 上限，在**已经取消用户回合
+  之后**才失败；而这些消息尚未进入 surface，按构造就在目标之后，丢弃与撤回范围一致。否则
+  撤回后仍在产生的事件会追加到替换节点之后，被撤内容"复活"。
 - 撤回成功后必须 `sessions.flush(session)`：宿主在回执后立刻读日志重建时间线，缓冲未落盘的
   标记会让重放仍带着被撤行。flush 失败（或 profile 没有 session store）时整个撤回直接失败：
   **不做文件回退、也不取消子代理**——否则会出现「对话仍带被撤行、文件已回滚」的不可见错位。
@@ -111,6 +116,12 @@ Paseo 撤回按钮
   `turn/end` 会被当未知 child 丢掉，adopted 子代理永久 running）；若缓冲里已有
   `turn/end`，重放不再先发一个 canceled 终态。`history.available === false` 时跳过该
   child 并弹 `session.notice`（「子代理历史读取失败」），不再把不可读当空历史。
+- **追踪哪些工具**：`write`/`edit` 用 `file_path`；`str_replace_editor` 用 `path`，且只认
+  `create`/`str_replace`/`insert` 三个写命令——`view` 是读，未知命令同样不算写（把一次读记成
+  "宣告该文件最新状态的编辑"，撤回会去重写一个根本没被改过的文件）。名字级过滤是
+  `isTrackedTool`，参数级判断在 `mutationPathOf`（`dsh-bridge/lib/file-snapshots.js:69-78,
+  116-142`）；该工具由一等公民包 `@deepseek-ai/dsh-tool-str-replace-editor` 提供，base/web
+  bundle 默认不挂载，部署挂上就生效。
 - 不跟踪：bash/pwsh 等命令产生的改动、用户或外部进程直接改的文件、符号链接目标、> 8 MiB
   文件。子代理编辑属于归并而不是跳过；只有上溯失败（父会话不 live、header 缺
   `parentSession`、血缘成环）时才退化为不跟踪，stderr 记一行跳过日志。

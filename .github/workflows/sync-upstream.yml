@@ -1,7 +1,7 @@
 name: Sync upstream
 
 # 每日把 upstream（liuxing7954/paseo-dsh）的 main 合并进本仓库 main。
-# - 干净合并：自动 push 到 origin/main
+# - 干净合并：先过下面「最小可信门」，全绿才自动 push 到 origin/main
 # - 有冲突：把 upstream 推成 sync/upstream 分支并开 PR，留待人工解决
 # 也可以从 Actions 页面手动触发（workflow_dispatch）。
 
@@ -29,6 +29,11 @@ jobs:
           ref: main
           fetch-depth: 0
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: Verify push permission (dry-run)
         run: git push --dry-run origin HEAD:main
 
@@ -52,9 +57,24 @@ jobs:
           echo "Upstream has new commits: ${upstream_sha}"
 
           if git merge --no-ff --no-edit upstream/main; then
-            # 轻量校验：桥语法 + 生成物与桥源码一致；失败则不 push。
+            # 最小可信门：依赖 + 类型检查 + 零依赖离线回归。任何一步失败，
+            # `set -e` 都会中止，main 不会被 push（合并只留在 runner 上）。
+            # 需要 .dbg 编译的脚本（plugin-check/timeline/…）与要真 daemon、
+            # 真 profile 或 token 的脚本不在这里跑，见 AGENTS.md 的分层清单。
+            ( cd paseo-plugin && npm ci --no-audit --no-fund )
+            ( cd paseo-plugin && npx tsc --noEmit )
             node --check dsh-bridge/lib/server.js
             node harness/bridge-assets-check.mjs
+            node harness/archived-lineage-check.mjs
+            node harness/image-host-path-check.mjs
+            node harness/paseo-system-envelope-check.mjs
+            node harness/revert-check.mjs
+            node harness/surface-check.mjs
+            node harness/file-snapshot-check.mjs
+            node harness/rewind-merge-check.mjs
+            node harness/mcp-http-check.mjs
+            node harness/doctor-check.mjs
+            node harness/probe-check.mjs
 
             git push origin main
             echo "Merged upstream ${upstream_sha} into main."
@@ -72,8 +92,14 @@ jobs:
                 "git fetch upstream" \
                 "git checkout main" \
                 "git merge upstream/main   # 手动解决冲突" \
+                "( cd paseo-plugin && npm ci && npx tsc --noEmit )" \
                 "node --check dsh-bridge/lib/server.js" \
                 "node harness/bridge-assets-check.mjs" \
+                "# 其余离线回归与 CI 的门保持一致：" \
+                "for s in archived-lineage-check image-host-path-check paseo-system-envelope-check revert-check \\" \
+                "         surface-check file-snapshot-check rewind-merge-check mcp-http-check doctor-check probe-check; do" \
+                "  node \"harness/\$s.mjs\" || exit 1" \
+                "done" \
                 "git push origin main" \
                 '```' \
                 "" \

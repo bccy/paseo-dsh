@@ -37,14 +37,21 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon 进程里）
 - **Paseo 源码不需要改，DSH 也不需要 fork。** 两边都走公开扩展点。
 - `paseo-plugin/server/*.ts` 是 Paseo 那一侧的契约实现；`dsh-bridge/lib/*.js` 是
   运行时的桥接。**中间那层协议是这个仓库自己定的**，改它要同时改两边。
+- 桥的 profile 是 `dsh-base` + `dsh-paseo-bridge`（见 `server/bootstrap.ts`）。**不要往这个
+  profile 里叠 `@deepseek-ai/dsh-web-app`**：那个 bundle 会按 id 把 base 的 `plan-mode` 行
+  `disabled: true`（`dsh-web-app/cordis.patch.yml`），于是桥的 `paseo/plan/get|set` 只能回答
+  "not mounted"，插件会把 Plan 模式从能力里摘掉（如实降级，但功能就没了）。实测对照：
+  `base+bridge` plan 可用，`+web-app` 不可用。
 
 ### 改之前先读
 
-- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 六十余条真实缺陷（编号到 62，含 `b`/`c`
+- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 六十余条真实缺陷（编号到 64，含 `b`/`c`
   补记与 DSH 0.2.1 升版教训）。里面有整整一类错误叫
   **静默降级**（把不知道的东西当成成功、把不支持的能力悄悄丢掉）。改动前先看一遍，
   避免重新发明这些 bug。
 - [docs/ADOPTION.md](./docs/ADOPTION.md) 第 4 节 — 教训按主题归纳。
+- [docs/FULL-AUDIT-20261020.md](./docs/FULL-AUDIT-20261020.md) — 2026-10-20 全量审查：
+  8 个 P1 的成因与修法、有意偏差清单、未修项与待用户决定项。改动前先看有没有踩在同一处。
 
 ### 硬性约束
 
@@ -63,16 +70,25 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon 进程里）
 界面不可信，断言要打在协议层：
 
 ```bash
-npx paseo-dsh doctor          # 一眼看安装是否完整：CLI/版本/profile/bridge/路由/key
+node paseo-plugin/bin/paseo-dsh.mjs doctor   # 一眼看安装是否完整：CLI/版本/profile/bridge/路由/key
 node harness/catalog.mjs      # provider / 模型 / 每个模型的真实思考档位
 node harness/probe.mjs        # 端到端提问往返
 node harness/route-test.mjs   # 逐条路由跑真实回合
 cd paseo-plugin && npx tsc --noEmit
 ```
 
+改**这个 checkout** 时一律用 `node paseo-plugin/bin/paseo-dsh.mjs ...` 跑本地源码的
+doctor/probe；`npx paseo-dsh` 解析的是**已发布到 npm 的包**，可能落后于工作区（发布的
+`0.2.9` 就不含 Paseo 0.12 适配），拿它自检会把"旧行为"当成通过。
+
 **动了插件层（`paseo-plugin/server/*.ts`）就一定跑 `harness/plugin-check.cjs`**——
 它断言的是事件形状，而事件形状错了界面不会报错，只会悄悄不对。运行步骤写在那个文件
 的头部注释里（插件是 TS，要先编成 CJS 才能 require）。
+
+注意它**不是纯离线**：不设 `DSH_BINARY` 时会起真实 `dsh --profile` 跑真实模型回合（耗
+token），并且加载插件会把内嵌桥重写进 `~/.dsh/profiles/<name>/node_modules/dsh-paseo-bridge`。
+所以**跑它之前先跑 `node harness/bridge-assets-check.mjs`**：内嵌桥是新的才跑，否则会把旧桥
+装进 live profile，让之后的真机检查在旧代码上"假绿"。
 
 同一条编译流程还带几个假 `dsh` 驱动的回归脚本，动到对应区域时一并跑：
 `harness/subagent-check.cjs`（子会话可见性）、`harness/steer-check.cjs`（插话回执）、
@@ -81,9 +97,10 @@ cd paseo-plugin && npx tsc --noEmit
 经 Paseo 规则投影后合并成一行）、`harness/image-check.cjs`（图片工具结果：带 `hostPath` 的
 图片块**恰好**多出一条 markdown `assistant_message`、路径逐段编码、无 `hostPath` 不出行、
 过 `ProviderEventSchema`、`history: "replay"` 重建同一条）。
+这批假桥脚本各自用**一次性 `DSH_HOME`**，不会改写你 `~/.dsh` 里正在用的 profile。
 
-还有十个**离线**脚本，直接 require 编译产物、不需要 daemon（运行步骤写在各自头部注释里）。
-下面清单里穿插的 `subagent-check.cjs` 归档用例与 `archive-registry-check.mjs` **不属于这十个**：
+还有一组**离线**脚本，直接 require 编译产物、不需要 daemon（运行步骤写在各自头部注释里）。
+下面清单里穿插的 `subagent-check.cjs` 归档用例与 `archive-registry-check.mjs` **不属于这组**：
 前者是假 `dsh` 驱动的，后者要真 profile。
 
 - `harness/timeline-check.cjs` — `TimelineBuilder` 的工具行状态机：`tool/call` → `tool/result`、
@@ -129,6 +146,30 @@ cd paseo-plugin && npx tsc --noEmit
   清除旧值、无效计数拒绝、切模型时迟到的旧响应不能覆盖、关闭后不再发）。参数是编译输出
   目录：`node harness/context-usage-check.cjs <dir>`。**动了 `server/dsh-process.ts` 的用量
   读取或 `DshSession` 的用量上报必跑。**
+- `harness/agent-message-check.cjs` — Paseo 0.12 的 `agent_message` 行：`agentMessage` 字段
+  取用、英文标签对齐官方 display model、缺 `agentMessage` 时**交还宿主原生渲染**。
+  **动了 `client/tool-call-data.ts` 的 `agent_message` 分支或 `index.client.tsx` 的
+  transformer 必跑。**
+- `harness/uploaded-file-check.cjs` — 附件块翻译与官方 `renderPromptAttachmentAsText` 逐字
+  一致；text/image 形状不变、未知类型抛错。**动了 `server/session.ts` 的 `toDshContent` 必跑。**
+- `harness/paseo-system-envelope-check.mjs` — 桥的 `<paseo-system>` 信封翻译（无属性/版本化
+  两形、system 消息保持 user turn、非字符串拒绝）。**动了
+  `dsh-bridge/lib/paseo-system-envelope.js` 必跑。**
+- `harness/mcp-http-check.mjs` — 桥的 MCP streamable-HTTP 客户端（SSE/JSON、session id 有无、
+  JSON-RPC 错误），本地 loopback，不需要外部服务。**动了 `dsh-bridge/lib/mcp-http.js` 必跑。**
+- `harness/bridge-assets-check.mjs` — `server/bridge-assets.ts` 必须与 `dsh-bridge/` 和
+  `templates/` 逐字节一致（只读，不起进程）。**改桥后先跑它、再跑任何插件级脚本。**
+- `harness/doctor-check.mjs` — `paseo-plugin/lib/doctor.mjs` 的判定：空 provider/model、缺
+  default-model、YAML 错、无值/refs 外凭据都必须 fail，完整配置仍通过（沙箱 `DSH_HOME`）。
+  **动了 doctor 必跑。**
+- `harness/probe-check.mjs` — `paseo-plugin/lib/probe-provider.mjs` 的退出码与泄密防护
+  （200+error/HTML 判失败、4xx 回显 Authorization 不得泄 key、全 429 报 unknown、什么都没
+  探测到必须非零）。**动了 probe 必跑。**
+- `harness/session-request-check.cjs` — 两段非回合请求：`paseo/sessions` 导入列表
+  （persistence handle/cwd/title/preview→description/updatedAt）与 `paseo/revert` 撤回回执
+  （成功 `request.completed` +「正在回退」通知、找不到 agent 的刷新告警、被拒必须
+  `request.failed`、被拒后门禁释放）。假桥 + 一次性 `DSH_HOME`。**动了 provider 的
+  `session.revert`/`sessions` 分支、`dsh-process.ts` 的这两个请求、或假桥对应分支必跑。**
 
 ### 撤回（rewind）
 
@@ -140,7 +181,7 @@ node harness/revert-check.mjs          # 令牌/区间/前置/回执/文件层/�
 node harness/surface-check.mjs         # 只折撤回缝、compaction 保留、尾随日志事件
 node harness/file-snapshot-check.mjs   # 编辑工具级写前备份（真实临时目录）
 node harness/rewind-merge-check.mjs    # 父子归并：子/孙编辑落根会话 journal、断链 fail-open
-node harness/revert-shape-probe.mjs    # 真实 DSH Session：旧写法必抛、新写法通过
+node harness/revert-shape-probe.mjs    # 纯内存离线（用本机已装 @deepseek-ai/dsh-session，DSH_SESSION_MODULE 可覆盖路径）：旧写法必抛、新写法通过
 node harness/replay-fidelity-probe.mjs <session.v4.jsonl.zstd>  # 真实日志重放保真
 node harness/rewind-e2e.mjs            # 真 dsh --profile paseo，3 回合端到端（耗 token）
 node harness/rewind-merge-e2e.mjs      # 真机父子归并：父写+子代理写 → both 撤回 → 两文件都删（耗 token）

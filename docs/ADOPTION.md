@@ -281,10 +281,17 @@ if (provider === undefined || model === undefined) {
 npx paseo-dsh doctor
 ```
 
-只读不改：查 `dsh`/`paseo` 版本、插件是否已把 DSH profile 建好、bridge 是否落地、
-`cordis.patch.yml` 是否填了路由、每个 `apiKeyEnv` 是否有对应凭证，缺什么直接点出来。
-它回答的是"**装好了没**"；下面几节回答的是"**行为对不对**"——两者互补。绝大多数
-"接不上"的报障，跑一遍 `doctor` 就定位了。
+**如果你是从 checkout 装的**（`install.sh` 或 `paseo plugin add …:paseo-plugin`），
+要用仓库自己的 CLI，别让 `npx` 去下已发布包——两者版本可能不同：
+
+```bash
+DSH_PASEO_PROFILE=paseo node paseo-plugin/bin/paseo-dsh.mjs doctor
+```
+
+只读不改：查 `dsh`/`paseo` 版本（DSH 低于 0.2.1 会判 blocking）、插件是否已把
+DSH profile 建好、bridge 是否落地、`cordis.patch.yml` 是否填了路由、每个 `apiKeyEnv`
+是否有对应凭证，缺什么直接点出来。它回答的是"**装好了没**"；下面几节回答的是
+"**行为对不对**"——两者互补。绝大多数"接不上"的报障，跑一遍 `doctor` 就定位了。
 
 ### 5.1 用一次性脚本断言事件流
 
@@ -368,5 +375,5 @@ dsh-bridge/           ← 应交付：bridge bundle（你的运行时那一侧�
 paseo-plugin/         ← 应交付：Paseo provider 插件
 tools/probe-provider.mjs  ← 应交付：能力探测（帮别人填 C）
 harness/              ← 可选：验证脚本，展示第 5 节的方法
-docs/NOTES.md         ← 不交付：作者本机的具体配置与记录
+docs/FIELD-NOTES.md   ← 不交付：作者本机的具体缺陷记录（历史，只读）
 ```

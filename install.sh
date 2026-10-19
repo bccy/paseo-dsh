@@ -3,10 +3,17 @@
 # Install the DSH <-> Paseo bridge on this machine.
 #
 # What it does:
-#   1. creates a DSH profile that serves the stdio bridge
-#   2. links this checkout's bridge bundle into that profile
+#   1. creates (or leaves alone) the DSH profile the plugin will drive
+#   2. links this checkout's bridge bundle into that profile — a convenience
+#      for the window before the plugin loads: the plugin replaces the whole
+#      directory from its embedded copy on every load
 #   3. installs the Paseo provider plugin
 #   4. enables plugins in Paseo's config and registers the plugin
+#
+# The profile the plugin actually boots is `$DSH_PASEO_PROFILE` (default
+# `paseo`), because the daemon resolves it from its own environment. An explicit
+# `--profile NAME` therefore has to agree with that variable; this script
+# refuses to install into a profile the daemon would never start.
 #
 # It never overwrites an existing model configuration: an existing
 # `cordis.patch.yml` is left exactly as it is, and every config file it does
@@ -15,7 +22,8 @@
 # Usage:
 #   ./install.sh [--profile NAME] [--repo PATH] [--check] [--yes]
 #
-#   --profile NAME   DSH profile to create (default: paseo)
+#   --profile NAME   DSH profile to create. Must equal $DSH_PASEO_PROFILE
+#                    (default: $DSH_PASEO_PROFILE, else paseo)
 #   --repo PATH      checkout to link from (default: this script's directory)
 #   --check          verify prerequisites and report, change nothing
 #   --yes, -y        skip the confirmation prompt (the security notice is still
@@ -23,18 +31,19 @@
 #
 set -euo pipefail
 
-PROFILE="paseo"
+PROFILE="${DSH_PASEO_PROFILE:-paseo}"
+PROFILE_FROM_ARG=0
 REPO=""
 CHECK_ONLY=0
 ASSUME_YES=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --profile) PROFILE="${2:?--profile needs a value}"; shift 2 ;;
+    --profile) PROFILE="${2:?--profile needs a value}"; PROFILE_FROM_ARG=1; shift 2 ;;
     --repo)    REPO="${2:?--repo needs a value}"; shift 2 ;;
     --check)   CHECK_ONLY=1; shift ;;
     --yes|-y)  ASSUME_YES=1; shift ;;
-    -h|--help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -49,7 +58,7 @@ PROFILE_DIR="$DSH_HOME/profiles/$PROFILE"
 
 say()  { printf '  %s\n' "$*"; }
 head() { printf '\n== %s\n' "$*"; }
-die()  { printf '\nerror: %s\n' "$*" >&2; exit 1; }
+die()  { printf '\nerror: %b\n' "$*" >&2; exit 1; }
 
 # Paseo ships its own CLI inside the app bundle, and a `paseo` on PATH is often a
 # stale npm install. Prefer the bundled one.
@@ -73,8 +82,27 @@ say "paseo       $PASEO_BIN"
 [ -d "$REPO/paseo-plugin" ] || die "$REPO/paseo-plugin is missing; pass --repo with the checkout path"
 say "checkout    $REPO"
 
+# The plugin spawns `dsh --profile $DSH_PASEO_PROFILE` (default paseo), resolved
+# from the daemon's own environment. A profile this script creates but the
+# daemon never starts would be silently useless, so refuse the split brain here
+# instead of printing "done".
+ENV_PROFILE="${DSH_PASEO_PROFILE:-}"
+DAEMON_PROFILE="${ENV_PROFILE:-paseo}"
+if [ "$PROFILE" != "$DAEMON_PROFILE" ]; then
+  die "--profile $PROFILE cannot take effect: the plugin boots \`dsh --profile $DAEMON_PROFILE\` (DSH_PASEO_PROFILE ${ENV_PROFILE:+is set to $ENV_PROFILE}${ENV_PROFILE:-is unset}).
+       Re-run with the same value in this shell, then persist it for the daemon:
+         DSH_PASEO_PROFILE=$PROFILE ./install.sh --profile $PROFILE
+         # paseo.service: Environment=DSH_PASEO_PROFILE=$PROFILE"
+fi
+if [ -n "$ENV_PROFILE" ]; then
+  say "profile     $PROFILE (from DSH_PASEO_PROFILE)"
+else
+  say "profile     $PROFILE (default; set DSH_PASEO_PROFILE to use another)"
+fi
+
 if [ "$CHECK_ONLY" -eq 1 ]; then
   printf '\nall prerequisites present (--check: nothing was changed)\n'
+  printf 'a real install would write the model route to %s\n' "$PROFILE_DIR/cordis.patch.yml"
   exit 0
 fi
 
@@ -149,8 +177,22 @@ fi
 
 mkdir -p "$PROFILE_DIR/node_modules"
 LINK="$PROFILE_DIR/node_modules/dsh-paseo-bridge"
-ln -sfn "$REPO/dsh-bridge" "$LINK"
-say "linked node_modules/dsh-paseo-bridge -> $REPO/dsh-bridge"
+# `ln -sfn <checkout> <existing real directory>` would create a nested link
+# INSIDE that directory instead of replacing it (and the old script printed
+# "linked" anyway). Replace our own symlink; never touch a directory the plugin
+# provisioned; fail loudly if the link did not end up where we said it would.
+if [ -L "$LINK" ]; then
+  rm -f "$LINK"
+fi
+if [ -e "$LINK" ]; then
+  say "node_modules/dsh-paseo-bridge is a real directory (plugin-provisioned); leaving it alone"
+else
+  ln -s "$REPO/dsh-bridge" "$LINK"
+  if [ ! -L "$LINK" ] || [ "$(readlink "$LINK")" != "$REPO/dsh-bridge" ]; then
+    die "could not link $LINK -> $REPO/dsh-bridge"
+  fi
+  say "linked node_modules/dsh-paseo-bridge -> $REPO/dsh-bridge (transient: the plugin replaces it from its embedded copy on load)"
+fi
 
 # The model route is the one part that differs per person, so an existing file
 # is never touched. A fresh one gets a template with nothing configured.
@@ -187,8 +229,18 @@ head "done"
 cat <<EOF
   Next steps:
 
-    1. Fill in your model route in:
+    1. Make the Paseo daemon use this profile. The plugin boots the profile
+       named by DSH_PASEO_PROFILE (default paseo) from the daemon's own
+       environment, so the daemon must carry:
+         Environment=DSH_PASEO_PROFILE=$PROFILE
+       in paseo.service (then \`systemctl --user daemon-reload\`), or the
+       equivalent for however you launch the daemon.
+
+    2. Fill in your model route in:
          $PROFILE_DIR/cordis.patch.yml
+
+       It only has a starter skeleton; templates/cordis.patch.yml in this
+       checkout is a worked example with the common pitfalls annotated.
 
        Not sure what your endpoint supports? Probe it first:
          node $REPO/tools/probe-provider.mjs \\
@@ -196,12 +248,19 @@ cat <<EOF
            --api-key-env <YOUR_KEY_ENV_VAR> \\
            --model <your-model-id>
 
-    2. Self-check the install:
-         npx paseo-dsh doctor
+    3. Self-check the install. This is a checkout, so use its own CLI — \`npx\`
+       would download the published package instead — with the same profile the
+       daemon will use:
+         DSH_PASEO_PROFILE=$PROFILE node $REPO/paseo-plugin/bin/paseo-dsh.mjs doctor
 
-    3. Restart the Paseo daemon so it loads the plugin and the new config.
+    4. Restart the Paseo daemon so it loads the plugin and the new config.
 
-    4. In Paseo, pick the "DeepSeek Harness" provider.
+    5. In Paseo, pick the "DeepSeek Harness" provider.
+
+  Note: the profile's bridge is provisioned by the plugin from the copy embedded
+  in paseo-plugin/server/bridge-assets.ts, not from this checkout. After editing
+  dsh-bridge/, regenerate it (and commit the result):
+    node $REPO/paseo-plugin/scripts/generate-bridge-assets.mjs
 
   See docs/ADOPTION.md for the full walkthrough and the pitfalls to avoid.
 EOF

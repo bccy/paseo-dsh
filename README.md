@@ -38,7 +38,7 @@ DSH 侧是一个 profile bundle。
 先完整读一遍 docs/ADOPTION.md 再动手。不要凭猜测改任何文件。
 
 ■ 第一步：检查前提
-确认 dsh、paseo、node 都在 PATH 上，且 paseo 版本 >= 0.9.2。
+确认 dsh、paseo、node 都在 PATH 上，paseo 版本 >= 0.9.2，dsh 版本 >= 0.2.1。
 缺任何一样就停下来告诉我，不要替我安装它们。
 
 ■ 第二步：确定用哪个模型
@@ -64,6 +64,8 @@ DSH 侧是一个 profile bundle。
 把 Paseo 会打印的那段「Plugins are trusted, unsandboxed code...」安全提示
 【原文转述给我】，并明确问我是否继续。得到我同意之后再装：
   paseo plugin add npm:paseo-dsh
+如果 daemon 是 Paseo 0.12：npm 上最新发布（0.2.9）还不含 0.12 适配，改用源码装：
+  paseo plugin add github:liuxing7954/paseo-dsh:paseo-plugin
 （插件首次加载会自己准备好 DSH profile，不需要跑任何脚本。）
 装完重启 Paseo daemon。
 
@@ -74,6 +76,8 @@ DSH 侧是一个 profile bundle。
 
 ■ 第六步：验证（不许跳）
   npx paseo-dsh doctor
+（源码/github 安装时用仓库自己的 CLI，别让 npx 去下已发布包：
+  node <repo>/paseo-plugin/bin/paseo-dsh.mjs doctor）
 确认全绿（dsh/paseo 版本、profile、bridge、路由、key）。有问题就修，修完再跑一次。
 然后重启 Paseo daemon。
 
@@ -95,9 +99,22 @@ paseo plugin add npm:paseo-dsh
 paseo plugin ls          # 确认 dsh-paseo 已装
 ```
 
-插件**首次加载会自己准备好 DSH profile**（`~/.dsh/profiles/paseo`）和内嵌的 stdio
-bridge——不用 clone、不用跑脚本。更新同样只走 Paseo 这一条链路：npm 源用
-`paseo plugin update`，Git 源用 `git pull`，然后重启 daemon，profile 会随插件一起更新。
+> **npm 版本提醒（2026-10-20）**：npm 上最新发布的是 `0.2.9`（2026-10-17），**不含**
+> Paseo 0.12 的适配（版本化 `paseo-system` 信封、`agent_message` 行语义、官方标签图标、
+> 附件内容块）。在 Paseo 0.12 上请从源码装，或等 `0.2.10` 发布：
+>
+> ```bash
+> paseo plugin add github:liuxing7954/paseo-dsh:paseo-plugin
+> ```
+>
+> 注意 `liuxing7954/paseo-dsh`（不带前缀）会被 Paseo 当成 **registry** 源；`--path` 是
+> `:plugin/path` 后缀的旧写法，对 registry 源会直接报错。
+
+插件**首次加载会自己准备好 DSH profile**（默认 `~/.dsh/profiles/paseo`，用
+`DSH_PASEO_PROFILE` 可改名——改了之后 daemon 也必须用同一个值）和内嵌的 stdio
+bridge——不用 clone、不用跑脚本。更新只走 Paseo 这一条链路：`paseo plugin update`
+（npm / Git 托管源都适用），然后重启 daemon，profile 会随插件一起更新。本地
+`directory` 源（`install.sh`）则 `git pull` + 重启，见下节。
 
 装完之后还差**一步：填模型路由**（这一步因人而异，没法自动）。分两小步：
 
@@ -179,17 +196,29 @@ npx paseo-dsh doctor
 
 ## 本地开发 / 离线安装
 
-改本仓库代码时，用 `install.sh` 把 checkout 作为**目录源**接入：它会建好 profile、
-把 `dsh-bridge` 链进 profile，并替你注册插件。之后 `git pull` + 重启 daemon 即生效。
+改本仓库代码时，用 `install.sh` 把 checkout 作为**目录源**接入：它会建好（或沿用）DSH
+profile、注册插件。`dsh-bridge` 的符号链接只是给「插件还没加载」这段窗口用的：插件每次
+加载都会把 profile 里的桥**整个删除并重写**成 `paseo-plugin/server/bridge-assets.ts`
+里的内嵌副本，所以运行时生效的永远是内嵌资产，不是这个 checkout 目录。
 
 ```bash
 git clone https://github.com/liuxing7954/paseo-dsh && cd paseo-dsh
-./install.sh --check     # 先看前提条件，不做改动
-./install.sh             # 创建 profile + 链接 bridge + 注册插件
+./install.sh --check     # 先看前提条件与将要使用的 profile，不做改动
+./install.sh             # 创建/初始化 profile + 注册插件
 ```
 
-> 开发时改了 `dsh-bridge/`，记得跑 `node paseo-plugin/scripts/generate-bridge-assets.mjs`
-> 重新内嵌 bridge（`npm publish` 也会自动跑），否则插件自举用的还是旧桥。
+> **改了 `dsh-bridge/` 必须重新生成内嵌桥**：`node paseo-plugin/scripts/generate-bridge-assets.mjs`
+> （`npm publish` 的 `prepack` 也会跑），再重载插件 / 重启 daemon，否则插件自举用的还是旧桥。
+> **只 `git pull` + 重启不会更新桥。**
+
+`--profile NAME` 必须与 daemon 的 `DSH_PASEO_PROFILE` 一致——插件按该变量决定启动哪个
+profile，install.sh 会拒绝不一致的用法。自定义 profile 这样跑，并把变量持久化进
+`paseo.service`：
+
+```bash
+DSH_PASEO_PROFILE=dev ./install.sh --profile dev
+# paseo.service: Environment=DSH_PASEO_PROFILE=dev
+```
 
 安装脚本不会覆盖你已有的模型配置，动到的每个文件都会先备份。
 
@@ -260,6 +289,8 @@ node harness/route-test.mjs   # 逐个路由测试可用性
 cd paseo-plugin
 npx tsc --noEmit false --outDir .dbg --declaration false \
   --module commonjs --moduleResolution node
+# ↑ 在 --moduleResolution node 下会打印 @getpaseo/plugin/client 的 TS2307，属预期：
+#   这里只要 emit 出的 JS，类型检查请用 `npx tsc --noEmit`
 echo '{"type":"commonjs"}' > .dbg/package.json
 cp ../harness/plugin-check.cjs .dbg/ && cd .dbg && node plugin-check.cjs
 rm -rf ../.dbg
@@ -276,8 +307,12 @@ rm -rf ../.dbg
 ## 环境要求
 
 - Paseo ≥ 0.9.2（需要 direct provider 插件 API）
-- DSH 已安装且 `dsh` 在 PATH 上
-- Node ≥ 18（探测工具用了内建 `fetch`）
+- **DSH ≥ 0.2.1**（随 0.2.x 线）：桥直接 import 五个 DSH 内部包
+  （`@deepseek-ai/dsh-cmdline` / `dsh-brand` / `dsh-llm` / `dsh-attachment` / `dsh-agent`），
+  并且 0.2.1 改过 prompt 变量注册与 catalog 物化时机。实测通过的是 `0.2.1-rc.2`
+  （2026-10-20）；**0.2.0 及更早未验证**，`doctor` 会把低于 0.2.1 判为 blocking。
+- Node ≥ 18（`paseo-dsh probe/doctor` 用了内建 `fetch`；本机实测 Node 22.23.1）。插件本身跑在
+  Paseo daemon 的 Node 里，包**不**声明 `engines`——没有实测过的最小版本不写进声明
 
 ## 界面语言（中文 / English）
 
@@ -387,6 +422,9 @@ DSH 的 agent preset 能把"人设 + 一套能力"打包成一个选项。插件
 
 插件的 `major.minor` **跟随它所适配的 DSH 线**：`0.2.x` 的插件对应 DSH `0.2.x`，
 patch 位是插件自己的发布计数。装的时候挑与 daemon 上 `dsh` 同一条线的版本即可。
+
+仓库里当前是 `0.2.10`（含 Paseo 0.12 适配，**尚未发布**）；npm 上最新是 `0.2.9`
+（2026-10-17，Paseo ≤0.11 适配）。发布等本机实测确认后再做。
 
 ## 相关文档
 

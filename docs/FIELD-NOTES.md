@@ -1674,6 +1674,46 @@ reload 竞争（被 cancel、丢失或追加到冻结区间之后）。provider 
 - **死代码/注释**：删未用导入、`pendingSkips`、`str_replace_editor`、`DshRevertResult` 的
   error 分支；修正孤儿 JSDoc、"500ms"、`dsh-rewind`、emit 等过时注释。
 
+#### 57b. rescue 文件名再改：编码全路径会 ENAMETOOLONG（2026-10-20 全量审查补记）
+
+**症状**：路径很深的文件在 `both` 撤回时恢复失败，文件保持已改、回执把该路径整体报
+`failed`；rescue 目录里没有它的备份（而 rescue 正是手工重试的唯一材料）。
+
+**根因**：上面第 57 条把 rescue 名改成 `时间戳-counter-编码全路径`。URI 编码后的绝对路径
+在约 240 字符以上就超过 Linux/macOS 的 `NAME_MAX`（255 字节），`copyFile` 抛
+`ENAMETOOLONG`，整个恢复随之失败。
+
+**修法**（`dsh-bridge/lib/file-snapshots.js:538-566`）：名字改为
+`<Date.now()>-<counter>-<sha256(路径) 前 16 位 hex>-<净化并截断到 64 字符的 basename>`。
+长度有界、每路径可区分（sha256 前缀）、basename 仍可辨认；`counter` 继续保证同一路径的两次
+撤回各留一份。只改 rescue 文件的**命名**：journal/objects 格式未动，旧版本写下的 journal
+仍能原样恢复。
+
+**验证**：`node harness/file-snapshot-check.mjs` 49/0，其中含“rescue 内容是恢复前内容”
+（:103-106）与“两次撤回的 rescue 互不覆盖”（:312 起）两条用例；240+ 字符长路径本身未单独
+构造实跑（本条为代码审查修正）。
+
+#### 57c. 「DSH 没有 str_replace_editor」这个前提不成立（2026-10-20 全量审查补记）
+
+第 57 条把 `str_replace_editor` 当死代码删掉，依据是“DSH 没有这个工具”。**前提是错的**：
+`@deepseek-ai/dsh-tool-str-replace-editor@0.2.1-rc.2` 是一等公民包（base/web bundle 不默认
+挂载，部署显式挂上就有；`dsh-workspace-changes` 也依赖它）。模型看到的工具名是
+`str_replace_editor`，写命令 `create`/`str_replace`/`insert`，文件参数是 `path`（不是
+`file_path`）。
+
+**后果**：只撤 `write`/`edit` 时，一个只用该工具改过文件的会话做 `both` 撤回会**报成功却
+不恢复文件**——正是本仓库最贵的那类“静默降级”。
+
+**修法**（`dsh-bridge/lib/file-snapshots.js:57-78, 116-142`）：`TRACKED_TOOLS`（write/edit）
+之外单独识别该工具；`mutationPathOf` 从 `path` 取路径且只认三个写命令，`view`/未知命令返回
+`undefined`（不算写——把一次读记成“宣告该文件最新状态的编辑”，撤回会去重写一个根本没被改过
+的文件）。`isTrackedTool` 只做名字级过滤，参数级判断在 `mutationPathOf`。
+
+**验证/缺口**：`node harness/file-snapshot-check.mjs` 49/0，但只断言了 write/edit/read/bash
+四例，**未覆盖 `str_replace_editor` 的三个写命令与 `view`/未知命令分支**（建议补 5 条：
+tracked、三个写命令各取到 path、view → undefined、未知命令 → undefined、缺 path →
+undefined）。本条为代码审查修正，离线检查待补。
+
 ---
 
 ### 58. 升到 DSH 0.2.1-rc 后每个回合都失败

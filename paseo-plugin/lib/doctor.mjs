@@ -43,6 +43,17 @@ const RESET = "\u001b[0m";
 /** Paseo gained the direct-provider-plugin API in this release. */
 const MINIMUM_PASEO = "0.9.2";
 
+/**
+ * The DSH version this build was verified against (`0.2.1-rc.2`, 2026-10-20).
+ *
+ * The bridge imports five DSH-internal packages (`@deepseek-ai/dsh-cmdline`,
+ * `dsh-brand`, `dsh-llm`, `dsh-attachment`, `dsh-agent`), and 0.2.1 changed both
+ * the prompt-variable registry and catalog materialization. An older line is a
+ * blocking issue, not a warning: the plugin's version line tracks DSH only at
+ * `major.minor`, which cannot tell `0.2.0` from `0.2.1`.
+ */
+const MINIMUM_DSH = "0.2.1";
+
 // `doctor | head -1` closes stdout early. Unhandled, that dies with an
 // `'error'` event and exit code 1 — which is exactly the code that means
 // "blocking issue", so a consumer cannot tell a crash from a diagnosis.
@@ -112,6 +123,32 @@ function atLeast(version, minimum) {
   return true;
 }
 
+/** `major.minor.patch` plus the prerelease tag, or `undefined` when unreadable. */
+function parseVersion(value) {
+  const match = String(value ?? "").match(/(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?/);
+  if (match === null) return undefined;
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+    prerelease: match[4],
+  };
+}
+
+/**
+ * Compare only `major.minor.patch`.
+ *
+ * A prerelease of the minimum counts as the minimum: `0.2.1-rc.2` is the build
+ * this repository was verified against, and semver would otherwise rank it below
+ * `0.2.1` and fail the very version the project runs on.
+ */
+function compareCore(a, b) {
+  for (const key of ["major", "minor", "patch"]) {
+    if (a[key] !== b[key]) return a[key] > b[key] ? 1 : -1;
+  }
+  return 0;
+}
+
 /** Strip full-line comments so "route configured?" isn't fooled by the template. */
 function activeLines(text) {
   return text
@@ -143,10 +180,14 @@ export function runDoctor() {
   }
   const pluginVersion = JSON.parse(pluginRead.text).version;
   const dshHome = process.env.DSH_HOME ?? join(homedir(), ".dsh");
+  const profileFromEnv = process.env.DSH_PASEO_PROFILE !== undefined;
   const profile = process.env.DSH_PASEO_PROFILE ?? "paseo";
   const profileDir = join(dshHome, "profiles", profile);
 
-  process.stdout.write(`\n${DIM}paseo-dsh doctor  (plugin ${pluginVersion})${RESET}\n\n`);
+  process.stdout.write(`\n${DIM}paseo-dsh doctor  (plugin ${pluginVersion})${RESET}\n`);
+  process.stdout.write(
+    `${DIM}profile "${profile}" (${profileFromEnv ? "DSH_PASEO_PROFILE" : "default; the daemon must use the same value"})${RESET}\n\n`,
+  );
 
   // 1. CLIs
   const dshVersion = run("dsh", ["--version"]);
@@ -154,10 +195,25 @@ export function runDoctor() {
     report("fail", "dsh on PATH", "install the official DeepSeek Harness and put `dsh` on the daemon's PATH");
   } else {
     const dshLine = line(dshVersion);
-    const dshMM = dshLine.match(/(\d+)\.(\d+)/);
+    const got = parseVersion(dshLine);
+    const minimum = parseVersion(MINIMUM_DSH);
     const pluginMM = pluginVersion.match(/^(\d+)\.(\d+)/);
-    if (dshMM && pluginMM && `${dshMM[1]}.${dshMM[2]}` !== `${pluginMM[1]}.${pluginMM[2]}`) {
-      report("warn", `dsh ${dshLine}`, `plugin ${pluginVersion} targets the ${pluginMM[1]}.${pluginMM[2]}.x DSH line`);
+    if (got === undefined) {
+      // "We could not check this" and "this is fine" are different answers; the
+      // bridge imports five DSH packages, so refuse to assume.
+      report("warn", `dsh ${dshLine}`, `could not read a version; this plugin needs DSH >= ${MINIMUM_DSH}`);
+    } else if (minimum !== undefined && compareCore(got, minimum) < 0) {
+      report(
+        "fail",
+        `dsh ${dshLine}`,
+        `needs DSH >= ${MINIMUM_DSH}: the bridge imports @deepseek-ai/dsh-{cmdline,brand,llm,attachment,agent}, and 0.2.1 changed prompt variables and catalog materialization`,
+      );
+    } else if (pluginMM && `${got.major}.${got.minor}` !== `${pluginMM[1]}.${pluginMM[2]}`) {
+      report(
+        "warn",
+        `dsh ${dshLine}`,
+        `plugin ${pluginVersion} targets the ${pluginMM[1]}.${pluginMM[2]}.x DSH line; this line was not verified`,
+      );
     } else {
       report("ok", `dsh ${dshLine}`);
     }
@@ -178,7 +234,11 @@ export function runDoctor() {
     } else {
       const row = listed.split("\n").find((entry) => entry.trimStart().startsWith("dsh-paseo"));
       if (row === undefined) {
-        report("fail", "dsh-paseo is not installed in Paseo", "install it with `paseo plugin add npm:paseo-dsh`");
+        report(
+          "fail",
+          "dsh-paseo is not installed in Paseo",
+          "install it with `paseo plugin add npm:paseo-dsh`; on Paseo 0.12 npm 0.2.9 predates the 0.12 adapter, so use the repo source: `paseo plugin add github:liuxing7954/paseo-dsh:paseo-plugin`",
+        );
       } else if (!/\brunning\b/.test(row)) {
         report("warn", "dsh-paseo is installed but not running", "enable it and restart the daemon");
       } else {
