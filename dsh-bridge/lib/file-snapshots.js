@@ -15,25 +15,35 @@
  *   read and stored by content hash under the session's `objects/` directory. A
  *   missing file is recorded as `backup: null` (the rewind deletes it).
  * - After the tool succeeds, one line is appended to the session journal:
- *   `{anchorSeq, callId, path, backup, mode}`. `anchorSeq` is the newest human
- *   user message seq at execution time, so a rewind to seq T restores every path
- *   whose first post-T touch has a pre-touch state.
- * - A rewind marks restore actions: for each path, the *earliest* touch after T
+ *   `{anchorSeq, captureSeq, callId, path, backup, mode}`. `anchorSeq` is the
+ *   delegated turn's dispatch anchor or, for the root session, the newest human
+ *   user message seq at execution time. `captureSeq` is the process-local
+ *   capture order, so concurrent parent/child edits of one path restore the
+ *   state before the *first* touch, not the first *commit*.
+ * - A rewind marks restore actions: for each path, the earliest capture after T
  *   decides — restore that `before` content, or delete the file if it did not
  *   exist yet. A file touched several times after T is still restored once.
  * - Before overwriting a file during restore, the current content is copied into
  *   `rescue/` so a failed or regretted restore can be recovered by hand; the
- *   rescue path is reported in the receipt and the plugin log.
+ *   rescue path is reported in the receipt and the plugin log. That copy is the
+ *   content the rewind is about to replace (already including agent edits), not
+ *   the pre-edit backup — the backup stays in the journal until a rewind with no
+ *   failures prunes it.
+ *
+ * Trust boundaries: the journal is local state, but a rewind writes and deletes
+ * paths it names, so `readJournal` only accepts absolute paths and content
+ * hashes, and `restore` refuses symlinks and non-regular files instead of
+ * following them out of the workspace.
  *
  * Deliberately out of scope (documented): bash/pwsh side effects, edits made by
- * the user or another process, symlinks, and files above the size cap.
+ * the user or another process, symlinked targets, and files above the size cap.
  *
  * @module dsh-bridge/file-snapshots
  */
 
 import { createHash } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
-import { appendFile, chmod, copyFile, mkdir, readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, copyFile, lstat, mkdir, readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve as resolvePath } from 'node:path';
 
@@ -43,8 +53,26 @@ const TRACKED_TOOLS = new Set(['write', 'edit']);
 /** Default cap for one snapshot; larger files are skipped and reported. */
 const DEFAULT_MAX_FILE_BYTES = 8 * 1024 * 1024;
 
-/** How many journal lines are kept when a rewind prunes a session's history. */
-const MAX_ANCHORS = 100;
+/**
+ * Hard cap on distinct journal anchors.
+ *
+ * It is a safety bound, not the semantic cutoff: `trim` already drops entries
+ * that no future rewind can reach (below the oldest rewindable human message).
+ * A session that exceeds this many *reachable* anchors keeps the newest ones and
+ * warns — the trimmed range becomes unrecoverable, which is loudly reported
+ * rather than silently losing a restore.
+ */
+const MAX_ANCHORS = 1000;
+
+/**
+ * Minimum age before an unreferenced object may be garbage-collected.
+ *
+ * A capture writes its object before the tool commits the journal line, so a
+ * rewind racing a still-running edit could GC an object whose journal line does
+ * not exist yet. The grace period (plus excluding pending snapshots) closes that
+ * window; five minutes is far longer than any capture-to-commit gap.
+ */
+const GC_GRACE_MS = 5 * 60 * 1000;
 
 /**
  * The path a tracked tool is about to mutate.
@@ -91,6 +119,23 @@ function pendingKey(sessionId, callId) {
   return `${sessionId}:${callId}`;
 }
 
+/**
+ * The in-memory key of one pending snapshot.
+ *
+ * The key must identify the *executing* session, not the session whose journal
+ * receives the entry: a parent and a delegated child both journal into the root
+ * session while the same callId namespace is provider-minted, so keying by the
+ * owner alone would let one capture overwrite the other's pending state.
+ *
+ * @param {{sessionId: string, callId: string, pendingKey?: string}} input
+ * @returns {string}
+ */
+function pendingKeyOf(input) {
+  return typeof input?.pendingKey === 'string' && input.pendingKey !== ''
+    ? input.pendingKey
+    : pendingKey(input.sessionId, input.callId);
+}
+
 /** Content-addressed object name, so identical snapshots share one file. */
 function objectKey(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
@@ -107,16 +152,32 @@ export class FileSnapshots {
   #writeQueue;
 
   /**
+   * Monotonic capture order for journal entries.
+   *
+   * Journal lines are appended in *commit* order, which a parallel parent/child
+   * edit can invert: both capture the same path, the child commits first. The
+   * rewind wants the state before the earliest *capture* after the target, so
+   * the order has to travel with the entry.
+   */
+  #captureSequence = 0;
+
+  /**
    * @param {object} [options]
    * @param {string} [options.rootDir] - override for tests.
    * @param {number} [options.maxFileBytes] - override for tests.
+   * @param {number} [options.gcGraceMs] - override for tests.
+   * @param {(line: string) => void} [options.warn] - override for tests.
    */
   constructor(options = {}) {
+    // Follow DSH_HOME like the rest of the plugin/bootstrap chain: a deployment
+    // that relocates its DSH home must not have rewind state written to the
+    // default one (possibly unwritable, possibly another user's).
     this.rootDir = options.rootDir
       ?? process.env.DSH_PASEO_REWIND_DIR
-      ?? join(homedir(), '.dsh', 'paseo-rewind');
+      ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'paseo-rewind');
     this.maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
-    /** `${sessionId}:${callId}` -> pending entry, between tools/execute and post-execute. */
+    this.gcGraceMs = options.gcGraceMs ?? GC_GRACE_MS;
+    /** Pending key (see `pendingKeyOf`) -> snapshot entry between execute and post-execute. */
     this.pending = new Map();
     /**
      * Serialises journal read-modify-write operations. Editing tools can run in
@@ -165,11 +226,12 @@ export class FileSnapshots {
    * are returned so the caller can log them; a skipped file simply will not be
    * restored (and the bridge says so in the receipt).
    *
-   * @param {{sessionId: string, anchorSeq: number, callId: string, path: string}} input
+   * @param {{sessionId: string, anchorSeq: number, callId: string, path: string, pendingKey?: string}} input
    * @returns {Promise<{ok: true, skipped?: string} | {ok: false, error: string}>}
    */
   async capture(input) {
-    const key = pendingKey(input.sessionId, input.callId);
+    const key = pendingKeyOf(input);
+    const captureSeq = (this.#captureSequence += 1);
     try {
       let info;
       try {
@@ -179,6 +241,7 @@ export class FileSnapshots {
           // The tool is about to create the file: the rewind deletes it.
           this.pending.set(key, {
             anchorSeq: input.anchorSeq,
+            captureSeq,
             callId: input.callId,
             path: input.path,
             backup: null,
@@ -189,11 +252,11 @@ export class FileSnapshots {
         throw error;
       }
       if (!info.isFile()) {
-        this.pending.set(key, { skip: 'not-a-regular-file', path: input.path });
+        this.pending.set(key, { skip: 'not-a-regular-file', path: input.path, captureSeq });
         return { ok: true, skipped: 'not-a-regular-file' };
       }
       if (info.size > this.maxFileBytes) {
-        this.pending.set(key, { skip: `larger than ${this.maxFileBytes} bytes`, path: input.path });
+        this.pending.set(key, { skip: `larger than ${this.maxFileBytes} bytes`, path: input.path, captureSeq });
         return { ok: true, skipped: `larger than ${this.maxFileBytes} bytes` };
       }
       const bytes = await readFile(input.path);
@@ -211,6 +274,7 @@ export class FileSnapshots {
       }
       this.pending.set(key, {
         anchorSeq: input.anchorSeq,
+        captureSeq,
         callId: input.callId,
         path: input.path,
         backup,
@@ -228,12 +292,12 @@ export class FileSnapshots {
    *
    * Failures are logged and dropped: a failed write did not change the file.
    *
-   * @param {{sessionId: string, callId: string}} input
+   * @param {{sessionId: string, callId: string, pendingKey?: string}} input
    * @param {{isError?: boolean}} [result]
    * @returns {Promise<void>}
    */
   async commit(input, result) {
-    const key = pendingKey(input.sessionId, input.callId);
+    const key = pendingKeyOf(input);
     const pending = this.pending.get(key);
     this.pending.delete(key);
     if (pending === undefined) return;
@@ -247,6 +311,7 @@ export class FileSnapshots {
         await mkdir(this.sessionDir(input.sessionId), { recursive: true });
         const line = `${JSON.stringify({
           anchorSeq: pending.anchorSeq,
+          ...(typeof pending.captureSeq === 'number' ? { captureSeq: pending.captureSeq } : {}),
           callId: pending.callId,
           path: pending.path,
           backup: pending.backup,
@@ -263,20 +328,26 @@ export class FileSnapshots {
   /**
    * Drop a pending snapshot (tool failed, was cancelled, or never committed).
    *
-   * @param {{sessionId: string, callId: string}} input
+   * @param {{sessionId: string, callId: string, pendingKey?: string}} input
    */
   discard(input) {
-    const key = pendingKey(input.sessionId, input.callId);
+    const key = pendingKeyOf(input);
     const pending = this.pending.get(key);
     this.pending.delete(key);
     return pending;
   }
 
   /**
-   * Read one session's journal, skipping (and reporting) unreadable lines.
+   * Read one session's journal, skipping (and reporting) unusable lines.
+   *
+   * The journal is local state, but a rewind writes and deletes every path it
+   * names, so a line is only accepted when it is an absolute path and carries a
+   * content hash (or an explicit `null` for "did not exist"). Anything else — a
+   * relative path, a traversal-prone `backup`, a truncated tail — is skipped and
+   * counted, never acted on.
    *
    * @param {string} sessionId
-   * @returns {Promise<{entries: Array<{anchorSeq: number, callId?: string, path: string, backup: string | null, mode?: number | null}>, skippedLines: number}>}
+   * @returns {Promise<{entries: Array<{anchorSeq: number, captureSeq?: number, callId?: string, path: string, backup: string | null, mode?: number | null}>, skippedLines: number}>}
    */
   async readJournal(sessionId) {
     let text;
@@ -297,15 +368,21 @@ export class FileSnapshots {
         skippedLines += 1; // a truncated tail must not invalidate earlier snapshots
         continue;
       }
-      if (typeof parsed?.anchorSeq !== 'number' || typeof parsed?.path !== 'string') {
+      const backupValid = parsed?.backup === null
+        || (typeof parsed?.backup === 'string' && /^[0-9a-f]{64}$/.test(parsed.backup));
+      if (typeof parsed?.anchorSeq !== 'number'
+        || typeof parsed?.path !== 'string'
+        || !isAbsolute(parsed.path)
+        || !backupValid) {
         skippedLines += 1;
         continue;
       }
       entries.push({
         anchorSeq: parsed.anchorSeq,
+        captureSeq: typeof parsed.captureSeq === 'number' ? parsed.captureSeq : undefined,
         callId: typeof parsed.callId === 'string' ? parsed.callId : undefined,
         path: parsed.path,
-        backup: typeof parsed.backup === 'string' ? parsed.backup : null,
+        backup: parsed.backup,
         mode: typeof parsed.mode === 'number' ? parsed.mode : null,
       });
     }
@@ -315,10 +392,12 @@ export class FileSnapshots {
   /**
    * Compute the files a rewind to `targetSeq` must restore or delete.
    *
-   * Per path the *earliest* touch at or after `targetSeq` wins: a tool runs
-   * after its user message was appended, so the anchor equals the message seq
-   * of the turn that changed the file. A path whose first touch created the file
-   * is deleted; a path last touched by an earlier turn is left alone.
+   * Per path the earliest *capture* at or after `targetSeq` decides. Journal
+   * lines are appended in commit order, and a parallel parent/child edit can
+   * commit in the opposite order from its captures, so the recorded
+   * `captureSeq` is authoritative; legacy lines without one keep the old
+   * first-in-file behavior (they predate the sequence and are effectively
+   * earlier than any numbered capture).
    *
    * @param {string} sessionId
    * @param {number} targetSeq
@@ -326,14 +405,26 @@ export class FileSnapshots {
    */
   async planRestore(sessionId, targetSeq) {
     const { entries, skippedLines } = await this.readJournal(sessionId);
-    /** @type {Map<string, {path: string, backup: string | null, mode: number | null}>} */
+    /** @type {Map<string, {path: string, backup: string | null, mode: number | null, rank: number}>} */
     const byPath = new Map();
     for (const entry of entries) {
       if (entry.anchorSeq < targetSeq) continue;
-      if (byPath.has(entry.path)) continue;
-      byPath.set(entry.path, { path: entry.path, backup: entry.backup, mode: entry.mode ?? null });
+      // Legacy lines have no capture order; they are older than any numbered
+      // capture written by this build, so they rank first.
+      const rank = typeof entry.captureSeq === 'number' ? entry.captureSeq : Number.NEGATIVE_INFINITY;
+      const current = byPath.get(entry.path);
+      if (current !== undefined && current.rank <= rank) continue;
+      byPath.set(entry.path, {
+        path: entry.path,
+        backup: entry.backup,
+        mode: entry.mode ?? null,
+        rank,
+      });
     }
-    return { actions: [...byPath.values()], skippedLines };
+    return {
+      actions: [...byPath.values()].map(({ path, backup, mode }) => ({ path, backup, mode })),
+      skippedLines,
+    };
   }
 
   /**
@@ -341,6 +432,10 @@ export class FileSnapshots {
    *
    * A single failed path does not stop the others; the caller reports the whole
    * outcome (the conversation rewind already happened).
+   *
+   * A rewind must not be a way around the sandbox: a symlink or special file is
+   * skipped, never followed, so a journal entry (or the tool path it recorded)
+   * cannot make the restore write through a link into something else.
    *
    * @param {string} sessionId
    * @param {Array<{path: string, backup: string | null, mode: number | null}>} actions
@@ -352,10 +447,20 @@ export class FileSnapshots {
     let rescueCounter = 0;
     for (const action of actions) {
       try {
-        const exists = await stat(action.path).then(() => true).catch((error) => {
-          if (error?.code === 'ENOENT') return false;
-          throw error;
-        });
+        let info;
+        try {
+          info = await lstat(action.path);
+        } catch (error) {
+          if (error?.code !== 'ENOENT') throw error;
+          info = undefined;
+        }
+        if (info !== undefined && !info.isFile()) {
+          // Symlink (lstat never follows), directory, socket …: the rewind does
+          // not touch it. Reported so the receipt is not a silent claim.
+          outcome.skipped.push(action.path);
+          continue;
+        }
+        const exists = info !== undefined;
         if (action.backup === null) {
           if (!exists) {
             outcome.skipped.push(action.path);
@@ -430,6 +535,7 @@ export class FileSnapshots {
       if (dropped === 0) return { kept: kept.length, dropped: 0 };
       const lines = kept.map((entry) => `${JSON.stringify({
         anchorSeq: entry.anchorSeq,
+        ...(entry.captureSeq === undefined ? {} : { captureSeq: entry.captureSeq }),
         ...(entry.callId === undefined ? {} : { callId: entry.callId }),
         path: entry.path,
         backup: entry.backup,
@@ -443,29 +549,59 @@ export class FileSnapshots {
   }
 
   /**
-   * Trim a session's journal to the newest `MAX_ANCHORS` anchors (unbounded
-   * growth would otherwise make every prompt append forever).
+   * Trim journal entries no future rewind can reach, with a hard safety cap.
+   *
+   * A rewind to target T restores entries anchored at or after T, and T is always
+   * a visible non-first human message. Entries anchored below the oldest such
+   * message can therefore never be selected again — dropping them is lossless.
+   * When no such message exists (the session was rewound down to its first
+   * message), nothing currently visible is rewindable and future targets are
+   * newer messages, so every existing entry is equally unreachable.
+   *
+   * `MAX_ANCHORS` is a hard bound on the reachable set, not the semantic cutoff:
+   * beyond it the oldest reachable entries are dropped **and warned about**, so a
+   * later rewind that would have needed them is loudly limited instead of
+   * silently missing part of its restore.
    *
    * @param {string} sessionId
-   * @returns {Promise<{dropped: number}>}
+   * @param {number} [keepFromAnchor] - oldest seq a future rewind can target;
+   *   omitted preserves the legacy cap-only behavior (bridge callers pass it).
+   * @returns {Promise<{dropped: number, capped: boolean}>}
    */
-  async trim(sessionId) {
+  async trim(sessionId, keepFromAnchor) {
     return this.#enqueue(async () => {
       const { entries } = await this.readJournal(sessionId);
-      const anchors = [...new Set(entries.map((entry) => entry.anchorSeq))].sort((left, right) => left - right);
-      if (anchors.length <= MAX_ANCHORS) return { dropped: 0 };
-      const cutoff = anchors[anchors.length - MAX_ANCHORS];
-      const kept = entries.filter((entry) => entry.anchorSeq >= cutoff);
+      // A caller may pass `Infinity` (no future rewind target exists), which must
+      // drop everything; only a missing/NaN argument falls back to legacy keep-all.
+      const reachableFloor = typeof keepFromAnchor === 'number' && !Number.isNaN(keepFromAnchor)
+        ? keepFromAnchor
+        : Number.NEGATIVE_INFINITY;
+      const reachable = entries.filter((entry) => entry.anchorSeq >= reachableFloor);
+      const anchors = [...new Set(reachable.map((entry) => entry.anchorSeq))].sort((left, right) => left - right);
+      let kept = reachable;
+      let capped = false;
+      if (anchors.length > MAX_ANCHORS) {
+        const cutoff = anchors[anchors.length - MAX_ANCHORS];
+        kept = reachable.filter((entry) => entry.anchorSeq >= cutoff);
+        capped = true;
+        this.warn(
+          `file-snapshot journal capped at ${MAX_ANCHORS} anchors; entries anchored below ${cutoff} are no longer restorable`,
+        );
+      }
+      const dropped = entries.length - kept.length;
+      if (dropped === 0) return { dropped: 0, capped: false };
       const lines = kept.map((entry) => `${JSON.stringify({
         anchorSeq: entry.anchorSeq,
+        ...(entry.captureSeq === undefined ? {} : { captureSeq: entry.captureSeq }),
         ...(entry.callId === undefined ? {} : { callId: entry.callId }),
         path: entry.path,
         backup: entry.backup,
         mode: entry.mode,
         time: new Date().toISOString(),
       })}\n`).join('');
+      await mkdir(this.sessionDir(sessionId), { recursive: true });
       await writeFile(this.journalPath(sessionId), lines, 'utf8');
-      return { dropped: entries.length - kept.length };
+      return { dropped, capped };
     });
   }
 
@@ -473,37 +609,53 @@ export class FileSnapshots {
    * Delete content objects the journal no longer references.
    *
    * Pruning/trimming only rewrites the index; without this the `objects/`
-   * directory grew forever (each edit stored a full before-image). Only hashes
-   * referenced by the current journal are kept, so this is safe after
-   * prune/trim and cheap: one journal read plus one directory listing.
+   * directory grew forever (each edit stored a full before-image).
+   *
+   * Two guards keep a concurrent capture alive: an object whose hash is in the
+   * in-memory pending map is never removed (its journal line may still be on its
+   * way), and objects younger than `GC_GRACE_MS` are kept (covers the window
+   * between writing the object and registering the pending entry).
    *
    * @param {string} sessionId
-   * @returns {Promise<{removed: number}>}
+   * @returns {Promise<{removed: number, keptRecent: number}>}
    */
   async collectGarbage(sessionId) {
     return this.#enqueue(async () => {
       const { entries } = await this.readJournal(sessionId);
       const referenced = new Set(entries.map((entry) => entry.backup).filter((backup) => typeof backup === 'string'));
+      // Captures that have not committed yet: the object is written before the
+      // journal line exists, so a rewind racing a still-running edit would
+      // otherwise delete a backup the tool is about to reference.
+      for (const pending of this.pending.values()) {
+        if (typeof pending?.backup === 'string') referenced.add(pending.backup);
+      }
       let names;
       try {
         names = await readdir(this.objectsDir(sessionId));
       } catch (error) {
-        if (error?.code === 'ENOENT') return { removed: 0 };
+        if (error?.code === 'ENOENT') return { removed: 0, keptRecent: 0 };
         throw error;
       }
       let removed = 0;
+      let keptRecent = 0;
       for (const name of names) {
         if (referenced.has(name)) continue;
+        const target = join(this.objectsDir(sessionId), name);
         try {
-          await unlink(join(this.objectsDir(sessionId), name));
+          const info = await stat(target);
+          if (Date.now() - info.mtimeMs < this.gcGraceMs) {
+            keptRecent += 1;
+            continue;
+          }
+          await unlink(target);
           removed += 1;
         } catch (error) {
           this.warn(`could not remove unreferenced snapshot object ${name}: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
-      return { removed };
+      return { removed, keptRecent };
     });
   }
 }
 
-export { DEFAULT_MAX_FILE_BYTES, MAX_ANCHORS, TRACKED_TOOLS };
+export { DEFAULT_MAX_FILE_BYTES, GC_GRACE_MS, MAX_ANCHORS, TRACKED_TOOLS };

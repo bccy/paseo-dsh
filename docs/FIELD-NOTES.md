@@ -1817,8 +1817,12 @@ rescue 覆盖手动改动无 UI 提示；fail-open 只有固定日志行、无�
 - daemon 的 provider 子代理行 `status: "canceled"`。
 
 **根因链**：
-1. 撤回刷新 = 关 provider 会话 + 带 persistence 重开（`reloadAgentSession(rehydrateFromDisk)`）；
-   重开前 daemon `cancelRunningProviderSubagents()` 把子代理行标 canceled、`deleteParent` 清行。
+1. 撤回刷新 = 关 provider 会话 + 带 persistence 重开（`reloadAgentSession(rehydrateFromDisk)`）。
+   **重开前** daemon `cancelRunningProviderSubagents()` 把子代理行标 canceled；清行的
+   `deleteParent` 反而在**重开之后**的 `resumeSession` 路径里（本机 0.11.2
+   `@getpaseo/server` `agent-manager.js:867-885`）——所以旧行先被标 canceled，接着靠插件
+   `replaySubagents()` 重新播报重建。重放判错就会直接表现为「子代理消失/停止」，而不是
+   一个可自愈的短暂状态。
 2. 插件 `session.close({park:true})` 只在根回合空闲时停放 → 进入停放池（进程存活）。
 3. 重开后插件 `replaySubagents()` 用 `announcedLive = #children.has(id)` 判活：新 provider
    会话没有桥的再次播报（桥里该 child `opened=true`，不会对第二个会话重发
@@ -1851,6 +1855,80 @@ rescue 覆盖手动改动无 UI 提示；fail-open 只有固定日志行、无�
 > 继续在已撤回的指令上写文件。
 
 ---
+### 62. 撤回实现全量审查：7 个桥侧 major + 7 个插件侧 major 的修复
+
+**背景**：第 59/60/61 条把父子归并、派发回合锚、范围内中断做完后，用两个**全新上下文、
+只读**的审查子代理分别审「桥 + 测试资产层」与「插件 + 生命周期 + 协议 + 文档层」
+（报告存 `/tmp/full-review-{bridge,plugin}.md`，不在仓库）。两侧均「有条件通过，无 blocker，
+7 个 major」。主代理逐条核实后确认，仅一条插件侧断言为误报（见下）。
+
+**桥侧（`dsh-bridge/`）修复**：
+1. **pending 键撞 callId**：父子共享 owner 命名空间后，`FileSnapshots.pending` 仍用
+   `owner:callId`；同 callId 的两次 capture 后一次覆盖前一次，一方编辑静默不进 journal。
+   改为 pending 键 =「执行会话 id + callId」（`pendingKeyOf`），journal/objects 仍归 owner。
+2. **恢复取了 commit 顺序**：journal 行按 commit 追加，父子并行编辑同一路径时可能反序；
+   `planRestore` 取「文件里第一行」会恢复成子代理的中间态。每行新增进程内单调 `captureSeq`，
+   恢复按它取最早捕获；无该字段的旧行按旧文件序（它们本来就比新行早）。
+3. **部分恢复失败仍 prune/GC**：失败路径的撤回前备份与 journal 行被删，不可重试；插件还把
+   rescue（当前内容）说成恢复材料。现在有任一失败就跳过 prune/trim/GC，回执 + stderr +
+   插件提示共同说明「备份保留、可重试；rescue 是被替换的当前内容」。
+4. **GC 与未提交 capture 竞态**：capture 先写 objects、后（post-execute）才 commit journal；
+   撤回期间的 GC 会把在跑子代理刚写的对象当未引用删掉，journal 随后引用缺失对象、恢复必失败。
+   GC 现在排除 pending 里的 backup，并保留 5 分钟内新对象（`GC_GRACE_MS`）。
+5. **flush 失败被吞**：`sessions.flush` 失败只写 stderr 仍返回成功；reload 读旧日志会把被撤
+   内容复活，文件却已回滚。现在 flush 失败（或 profile 无 session store）直接抛错，且不取消
+   子代理、不动文件。
+6. **restore 信任 journal**：绝对路径/哈希不校验、跟随符号链接，`backup` 可 `..` 穿越
+   objects。`readJournal` 只收绝对路径与 64 位十六进制哈希；`restore` 用 `lstat`，符号链接/
+   目录/socket 一律跳过；新增 harness 用恶意 journal + symlink 验证。
+7. **trim 静默丢可达锚点**：原「只留最新 100 锚点」在 >100 锚点会话里，先撤较新目标后再撤
+   更早目标会漏恢复。trim 改为「删掉最早可撤回人类消息之前的锚点（未来撤回永远选不到）」，
+   1000 锚点仅作硬上限且超限记 stderr 警告；bridge 用 `minRewindableAnchor(session)` 计算底线。
+8. **取消策略可测**：把「哪些 child 被 interrupt」抽成 `delegated-cancel.js` 纯函数
+   （interrupt 注入），补 harness：child 集合/顺序、一次拒绝不中断其余、未知锚不猜、目标之后
+   不调用；桥在 interrupt 后最多等 3s（`waitForChildren`）再恢复文件。
+9. **fork 形状误报**：审查称「DSH fork child 实际带 `origin:'subagent'`，会被归并」；核对本机
+   DSH `SessionStore.fork`（`dsh-session/lib/index.js:2015-2021`）只写
+   `{cwd, parentSession, isSeeded}`，无 origin/depth，现有 fork fixture 正确。
+
+**插件侧（`paseo-plugin/`）修复**：
+1. **重放窗口丢子会话事件**：`replaySubagents()` 先 await 每个 child 的 history 再打开；期间
+   到达的 `turn/end` 被当未知 child 丢弃，adopted 子代理永久 running。现在 listing 后先把
+   这些 child 的实时帧缓冲（`#replayPending`），重放后立刻派发；缓冲里已有 `turn/end` 时
+   重放不再先发 canceled（`terminalBuffered`）。
+2. **adopted 语义过宽**：进程级布尔把「从未开始 turn」的 child 也当活，只有「历史停在 turn
+   中途」才是接管进程的活证据。现在 `live` 只在 `turnOpen` 时放行，`!sawTurn` 仍 canceled；
+   补 adopted + 无 turn 用例。
+3. **撤回 prompt 门两个洞**：刷新期间重复撤回的失败路径会删掉第一次的门；`session.close`
+   就删门，close→reopen 间隙的 prompt 变成 `runtime_failed`。现在重复撤回直接
+   `request.failed` 且不碰门；门保持到新会话 `session.ready`（`#open` 末尾释放），窗口内
+   prompt 回可读的「正在回退，请稍候」。
+4. **open 部分失败泄漏**：`configure({thinkingOption})` 在清理 try 之外，抛错会留下
+   `#sessions`/`#agentIds`/dsh 进程。post-open 初始化全部并入同一 try，失败统一
+   delete + `close({park:false})`（并由 tsc/假桥验证）。
+5. **history `available:false` 当空历史**：改为跳过该 child、发
+   `session.notice`（「子代理历史读取失败」），不再冷启动按 canceled / adopted 按 running
+   去猜一个不可读的日志。
+6. **文档修正**：第 61 条把 `deleteParent` 写成「重开前」，实际在重开后的 `resumeSession`
+   路径（`@getpaseo/server` `agent-manager.js:867-885`）；REWIND 的 fail-open 措辞改为
+   「该子代理编辑不记录」、adopted 只对 turnOpen、补 flush/trim/GC/rescue/门/等待边界。
+
+**验收（2026-10-19，本机）**：`file-snapshot` 49/49（新增 capture 顺序、pending 键、
+恶意 journal/symlink、trim 语义、GC pending/宽限）、`rewind-merge` 49/49（新增取消策略 4 条、
+删掉 1 条自证断言）、`subagent-check` 68/68（新增 adopted 无 turn、history 不可读、重放窗口
+竞态各 1 条）、`plugin-check` 32/32、`parked` 27/27、`revert` 98、`surface` 18、
+`revert-shape` 10、`replay-fidelity` 4/4×3 份真实日志、`tool-call` 331/331、
+`tsc --noEmit` 干净、内嵌桥重新生成后字节一致。真机（重新部署 profile 桥后）：
+`rewind-merge-e2e` 13/13（父+子写 → both 撤回 → 两文件删除、根 journal 两行、子会话无
+journal；stderr 出现 `interrupted 1 delegated agent(s)`）、`rewind-e2e` 12/12
+（撤回、文件删除、surface 1 条人类消息、无 command/run、模型知道 ALPHA 不知道 BETA）。
+
+**教训**：**并发与失败路径才是撤回的数据丢失面**——正常路径的离线断言早已全绿，丢文件的是
+「谁先 commit」「GC 和写对象谁先跑」「恢复失败后还 prune」「flush 失败仍报成功」这些次序；
+另外**取消是 fire-and-return，恢复不能假设它已生效**，必须等一个有界窗口并把超时说出来。
+
+---
+
 ## 已知限制（未修，有意为之）
 
 | 项 | 说明 |

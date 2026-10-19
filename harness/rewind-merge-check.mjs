@@ -25,6 +25,7 @@ import { join } from 'node:path';
 import { FileSnapshots, isTrackedTool, resolveMutationPath } from '../dsh-bridge/lib/file-snapshots.js';
 import { isDelegatedSession, rootSessionFor, snapshotOwnerKey } from '../dsh-bridge/lib/snapshot-owners.js';
 import { ChildAnchors } from '../dsh-bridge/lib/child-anchors.js';
+import { cancelWithdrawnDelegations } from '../dsh-bridge/lib/delegated-cancel.js';
 
 const results = [];
 const check = (name, pass, detail) => {
@@ -67,8 +68,10 @@ const loopA = session({ id: 'loop-a', origin: 'subagent', parentSession: 'loop-b
 const loopB = session({ id: 'loop-b', origin: 'subagent', parentSession: 'loop-a', delegationDepth: 2 });
 const root2 = session({ id: 'root-2' });
 const child2 = session({ id: 'child-2', origin: 'subagent', parentSession: 'root-2', delegationDepth: 1 });
-// A forked child carries a `parentSession` but is not delegated: it must stop at
-// itself, or the owner would jump into the source conversation.
+// A forked child carries a `parentSession` but is not delegated: DSH's
+// `SessionStore.fork` writes only `{cwd, parentSession, isSeeded}` and no
+// origin/delegationDepth (dsh-session lib/index.js:2015-2021), so it must stop at
+// itself — otherwise the owner would jump into the source conversation.
 const forked = session({ id: 'fork-1', parentSession: 'root-1' });
 // A subagent whose `cwd` argument is a subdirectory: header cwd stays the
 // parent's, the committed working directory is the child's own.
@@ -158,14 +161,38 @@ check(
 );
 check('a rewind to a later message leaves them running', anchors.withdrawnSince(13).length === 0);
 check('an invalid target withdraws nothing', anchors.withdrawnSince(Number.NaN).length === 0);
-// The snapshot anchor rule: a delegated edit takes the recorded dispatch anchor
-// even when a newer human message has arrived (the M2 cross-turn case).
-const delegatedAnchor = anchors.anchorFor(child.id);
-check(
-  'a delegated edit anchors to its dispatch turn, not the newest message',
-  delegatedAnchor === 12,
-  JSON.stringify({ delegatedAnchor, newestHuman: 33 }),
-);
+
+console.log('== withdrawing delegated work ==');
+{
+  // The policy that decides which children a rewind interrupts, with the
+  // interrupt injected: ids, order, and that one refusal never aborts the rest.
+  const policy = new ChildAnchors();
+  policy.record('older-child', 5);
+  policy.record('dispatch-child', 12);
+  policy.record('sibling-child', 12);
+  policy.record('unknown-anchor-child');
+  const interrupted = [];
+  const errors = [];
+  const result = cancelWithdrawnDelegations(
+    policy,
+    12,
+    (childId) => {
+      interrupted.push(childId);
+      if (childId === 'dispatch-child') throw new Error('UNAUTHORIZED');
+    },
+    (childId) => errors.push(childId),
+  );
+  check(
+    'only children dispatched at or after the target are interrupted',
+    !interrupted.includes('older-child') && interrupted.includes('dispatch-child') && interrupted.includes('sibling-child'),
+    JSON.stringify(interrupted),
+  );
+  check('a refusal does not stop the remaining children', interrupted.includes('sibling-child'), JSON.stringify(interrupted));
+  check('and is reported for logging', result.failed.length === 1 && errors.includes('dispatch-child'), JSON.stringify(result.failed));
+  check('unknown anchors are never guessed into a cancel', !interrupted.includes('unknown-anchor-child'), JSON.stringify(interrupted));
+  const none = cancelWithdrawnDelegations(policy, 99, () => { throw new Error('must not be called'); });
+  check('a target after every dispatch interrupts nothing', none.signalled.length === 0 && none.failed.length === 0);
+}
 
 console.log('== journal attribution ==');
 const createdByChild = join(workspace, 'child-created.txt');

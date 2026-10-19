@@ -25,6 +25,7 @@ import { underArchivedSession } from './archived-lineage.js';
 import { FileSnapshots, isTrackedTool, mutationPathOf, resolveMutationPath } from './file-snapshots.js';
 import { isDelegatedSession, rootSessionFor as resolveRootSession, snapshotOwnerKey } from './snapshot-owners.js';
 import { ChildAnchors } from './child-anchors.js';
+import { cancelWithdrawnDelegations as cancelDelegatedWork } from './delegated-cancel.js';
 import { isHumanUserMessage, planRewind, restoresFiles, revertScope, successText } from './revert.js';
 import { visibleEvents } from './surface.js';
 import { historyEvents, withImageHostPaths } from './image-host-path.js';
@@ -1243,7 +1244,11 @@ export class PaseoHarnessServer {
       const path = resolveMutationPath(this.workingDirectoryOf(session), rawPath);
       const callId = String(exec.callId);
       const result = await this.fileSnapshots.capture({
+        // The journal/objects belong to the root; the pending entry belongs to
+        // the session that ran the tool (a parent and a child share neither the
+        // callId namespace nor the commit moment).
         sessionId: String(owner.id),
+        pendingKey: snapshotOwnerKey(session, callId),
         anchorSeq,
         callId,
         path,
@@ -1274,7 +1279,11 @@ export class PaseoHarnessServer {
       const owner = this.snapshotOwners.get(key);
       if (owner === undefined) return;
       this.snapshotOwners.delete(key);
-      await this.fileSnapshots.commit({ sessionId: owner, callId }, result);
+      await this.fileSnapshots.commit({
+        sessionId: owner,
+        callId,
+        pendingKey: snapshotOwnerKey(session, callId),
+      }, result);
     } catch (error) {
       process.stderr.write(`[bridge] file snapshot commit: ${error instanceof Error ? error.message : String(error)}\n`);
     }
@@ -1294,7 +1303,7 @@ export class PaseoHarnessServer {
       const owner = this.snapshotOwners.get(key);
       this.snapshotOwners.delete(key);
       if (owner === undefined) return;
-      this.fileSnapshots.discard({ sessionId: owner, callId });
+      this.fileSnapshots.discard({ sessionId: owner, callId, pendingKey: snapshotOwnerKey(session, callId) });
     } catch {
       /* dropping a pending snapshot cannot fail in a way worth reporting */
     }
@@ -1321,27 +1330,74 @@ export class PaseoHarnessServer {
    * @returns {string[]} child session ids the bridge signalled.
    */
   cancelWithdrawnDelegations(agent, targetSeq) {
-    const childIds = this.childAnchors.withdrawnSince(targetSeq);
-    if (childIds.length === 0) return [];
     const subagents = this.ctx.get('subagents');
     if (subagents === undefined) return [];
-    const signalled = [];
-    for (const childId of childIds) {
-      try {
+    const result = cancelDelegatedWork(
+      this.childAnchors,
+      targetSeq,
+      (childId) => {
         subagents.interrupt(childId, { kind: 'ancestor', agent });
-        signalled.push(childId);
-      } catch (error) {
+      },
+      (childId, error) => {
         process.stderr.write(
           `[bridge] could not interrupt withdrawn subagent ${childId}: ${error instanceof Error ? error.message : String(error)}\n`,
         );
-      }
-    }
-    if (signalled.length > 0) {
+      },
+    );
+    if (result.signalled.length > 0) {
       process.stderr.write(
-        `[bridge] interrupted ${signalled.length} delegated agent(s) whose dispatch turn was withdrawn\n`,
+        `[bridge] interrupted ${result.signalled.length} delegated agent(s) whose dispatch turn was withdrawn\n`,
       );
     }
-    return signalled;
+    return result.signalled;
+  }
+
+  /**
+   * Give interrupted delegated work a bounded moment to observe the cancel.
+   *
+   * `SubagentRuntime.interrupt` is fire-and-return, and the file restore runs
+   * right after it. `waitForChildren` joins progressing descendants (it never
+   * cancels anything); the three-second cap bounds the rewind's latency. A
+   * timeout is reported because files restored after it could still be written
+   * by a child that had not noticed the cancel.
+   *
+   * @param {object} agent - the root agent whose descendants were interrupted.
+   */
+  async settleDelegatedWork(agent) {
+    const subagents = this.ctx.get('subagents');
+    if (subagents === undefined || typeof subagents.waitForChildren !== 'function') return;
+    try {
+      await withTimeout(
+        subagents.waitForChildren(agent),
+        3000,
+        'waiting for delegated work to observe the rewind interrupt',
+      );
+    } catch (error) {
+      process.stderr.write(
+        `[bridge] delegated work did not settle after the rewind interrupt: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
+  }
+
+  /**
+   * The oldest seq a future rewind can target in this session, or Infinity.
+   *
+   * A rewind target is a visible, non-first human message: the first cannot be
+   * withdrawn and later targets are larger. So a future target is never below the
+   * second-oldest visible human message, and journal entries anchored below that
+   * seq can never be selected again. Infinity means no visible message is
+   * rewindable (only the first survives) — every existing entry is unreachable,
+   * because future messages get larger seqs.
+   *
+   * @param {object} session
+   * @returns {number}
+   */
+  minRewindableAnchor(session) {
+    const humanSeqs = [];
+    for (const seq of session.surface.nodes) {
+      if (isHumanUserMessage(session.eventAt(seq))) humanSeqs.push(seq);
+    }
+    return humanSeqs.length >= 2 ? humanSeqs[1] : Number.POSITIVE_INFINITY;
   }
 
   async revert(params) {
@@ -1410,37 +1466,48 @@ export class PaseoHarnessServer {
       // Make the replacement durable before answering. The daemon rehydrates the
       // timeline by reading this log right after the reply, and Paseo's reload
       // replays it too; a buffered append would let both read a log that still
-      // contains the withdrawn turn.
+      // contains the withdrawn turn. A failure here must be loud: reporting
+      // success would let the reload restore the withdrawn conversation while
+      // the file layer has already been rolled back.
+      const sessions = this.ctx.get('sessions');
+      if (sessions === undefined) {
+        throw new Error('撤回标记无法持久化：该 profile 没有会话存储；已停止文件回退');
+      }
       try {
-        const sessions = this.ctx.get('sessions');
-        if (sessions !== undefined) await sessions.flush(session);
-        else process.stderr.write('[bridge] rewind marker not flushed: this profile composes no session store\n');
+        await sessions.flush(session);
       } catch (error) {
-        process.stderr.write(`[bridge] flushing the rewind marker failed: ${error instanceof Error ? error.message : String(error)}\n`);
+        throw new Error(`撤回标记无法持久化，已停止文件回退：${error instanceof Error ? error.message : String(error)}`);
       }
       let files;
       // Stop the delegated agents this rewind withdrew before restoring files:
       // a child still working on the withdrawn instruction would otherwise keep
       // writing behind the restore (and anchor those writes to an older message,
-      // leaving them impossible to revert).
+      // leaving them impossible to revert). `interrupt` is fire-and-return, so
+      // give the children a bounded moment to observe it before touching files.
       this.cancelWithdrawnDelegations(agent, resolved.targetSeq);
+      await this.settleDelegatedWork(agent);
       if (filePlan !== undefined && filePlan.length > 0) {
         files = await this.fileSnapshots.restore(sessionKey, filePlan);
-        await this.fileSnapshots.prune(sessionKey, resolved.targetSeq).catch((error) => {
-          process.stderr.write(`[bridge] pruning the file-snapshot journal failed: ${error instanceof Error ? error.message : String(error)}\n`);
-        });
-        await this.fileSnapshots.trim(sessionKey).catch((error) => {
-          process.stderr.write(`[bridge] trimming the file-snapshot journal failed: ${error instanceof Error ? error.message : String(error)}\n`);
-        });
-        // Pruning/trimming only rewrites the index; drop the content objects that
-        // are no longer referenced so a long-lived session does not grow forever.
-        await this.fileSnapshots.collectGarbage(sessionKey).catch((error) => {
-          process.stderr.write(`[bridge] collecting unused file-snapshot objects failed: ${error instanceof Error ? error.message : String(error)}\n`);
-        });
         if (files.failed.length > 0) {
+          // Do not prune/trim/GC after a partial failure: the failed paths' backup
+          // objects and journal lines are the only retry material, and dropping
+          // them would make a second rewind silently no-op.
           process.stderr.write(
-            `[bridge] file restore failed for ${files.failed.map((entry) => entry.path).join(', ')}; rescue copies in ${files.rescueDir}\n`,
+            `[bridge] file restore failed for ${files.failed.map((entry) => entry.path).join(', ')}; `
+            + `journal kept for retry, rescue copies in ${files.rescueDir}\n`,
           );
+        } else {
+          await this.fileSnapshots.prune(sessionKey, resolved.targetSeq).catch((error) => {
+            process.stderr.write(`[bridge] pruning the file-snapshot journal failed: ${error instanceof Error ? error.message : String(error)}\n`);
+          });
+          await this.fileSnapshots.trim(sessionKey, this.minRewindableAnchor(session)).catch((error) => {
+            process.stderr.write(`[bridge] trimming the file-snapshot journal failed: ${error instanceof Error ? error.message : String(error)}\n`);
+          });
+          // Pruning/trimming only rewrites the index; drop the content objects that
+          // are no longer referenced so a long-lived session does not grow forever.
+          await this.fileSnapshots.collectGarbage(sessionKey).catch((error) => {
+            process.stderr.write(`[bridge] collecting unused file-snapshot objects failed: ${error instanceof Error ? error.message : String(error)}\n`);
+          });
         }
       } else if (filePlan !== undefined) {
         files = { restored: [], deleted: [], skipped: [], failed: [], rescue: [], rescueDir: this.fileSnapshots.rescueDir(sessionKey) };

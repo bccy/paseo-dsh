@@ -132,7 +132,9 @@ try {
   evidence.childSessions = childOpened;
 
   // The merged journal must already record BOTH edits under the root session.
-  const rootJournalPath = join(homedir(), '.dsh', 'paseo-rewind', sessionId, 'journal.jsonl');
+  // Follow DSH_HOME exactly like the bridge's FileSnapshots root.
+  const rewindRoot = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'paseo-rewind');
+  const rootJournalPath = join(rewindRoot, sessionId, 'journal.jsonl');
   const journalLines = existsSync(rootJournalPath)
     ? readFileSync(rootJournalPath, 'utf8').split('\n').filter((line) => line.trim() !== '').map((line) => JSON.parse(line))
     : [];
@@ -149,7 +151,7 @@ try {
   );
   check(
     'the subagent session owns no journal of its own',
-    childIds.length > 0 && childIds.every((id) => !existsSync(join(homedir(), '.dsh', 'paseo-rewind', id, 'journal.jsonl'))),
+    childIds.length > 0 && childIds.every((id) => !existsSync(join(rewindRoot, id, 'journal.jsonl'))),
     JSON.stringify(childIds),
   );
   const snapshotLog = stderr.join('').split('\n').filter((line) => line.includes('file snapshot'));

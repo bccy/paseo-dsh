@@ -384,6 +384,17 @@ class DshConnection implements ProviderConnection {
         return;
       }
       case "session.revert": {
+        // A second rewind while the first one is refreshing would fail inside the
+        // bridge, and its catch would clear the FIRST rewind's prompt gate while
+        // the rebuild is still running. Refuse it without touching the gate.
+        if (this.#reverting.has(input.sessionId)) {
+          this.#emit({
+            type: "request.failed",
+            requestId: input.requestId,
+            error: { message: "该会话已有撤回正在进行，请稍候" },
+          });
+          return;
+        }
         const session = this.#require(input.sessionId);
         // From here until `session.close` the timeline is being rebuilt: prompts
         // are refused (see the `session.prompt` gate) so none is lost or left
@@ -422,7 +433,11 @@ class DshConnection implements ProviderConnection {
           this.#deferNotice(input.sessionId, {
             severity: "error",
             title: "文件回退未完成",
-            description: `${failedFiles.map((entry) => entry.path).join("、")} 恢复失败；恢复前的原内容已备份到 ${result?.files?.rescueDir ?? "(未知目录)"}。`,
+            // The rescue copy is the content the restore was about to replace
+            // (already including the agent's edits), NOT the pre-edit state. The
+            // pre-edit backups stay in the journal because the bridge skips
+            // prune/trim/GC after a failure, so a second rewind retries them.
+            description: `${failedFiles.map((entry) => entry.path).join("、")} 恢复失败；撤回前备份已保留（可重试撤回），被替换的当前内容已另存到 ${result?.files?.rescueDir ?? "(未知目录)"}。`,
           });
         }
         // Replaying `PluginProviderSession.streamHistory` cannot drop rows (the
@@ -442,7 +457,11 @@ class DshConnection implements ProviderConnection {
       }
       case "session.close": {
         const session = this.#sessions.get(input.sessionId);
-        this.#reverting.delete(input.sessionId);
+        // Keep the rewind gate: the daemon closes this session right before the
+        // reload reopens it, and a prompt sent in that window must still get a
+        // readable refusal (it would otherwise surface as `runtime_failed`).
+        // The gate is released when `#open` reports the new session ready, by a
+        // refresh-failure path, or by the 15s safety timer.
         this.#sessions.delete(input.sessionId);
         this.#agentIds.delete(input.sessionId);
         // Park an idle child: the daemon closes this session right before a
@@ -777,7 +796,66 @@ class DshConnection implements ProviderConnection {
 
     try {
       await session.open();
+      // Post-open initialisation is part of the open transaction: the daemon
+      // drops its maps on a failed open (`PluginProvider.openSession`'s catch
+      // never sends `session.close`), so a throwing configure or catalog load
+      // would otherwise leak this session's maps and its `dsh` process — every
+      // retry arrives under a fresh session id, so they accumulate rather than
+      // replace each other.
+      if (config.thinkingOption !== undefined) {
+        await session.configure({ thinkingOption: config.thinkingOption });
+      }
+
+      const settings = config.settings ?? {};
+      // The agent preset is a creation-time choice: apply it BEFORE the agent is
+      // created (loadCommands creates it) so the session is born under the chosen
+      // preset. DSH locks the preset after the session's first turn, so applying it
+      // after `session.ready` would already be too late — the pick would snap back
+      // to the profile default.
+      const preset = settings["preset"];
+      if (typeof preset === "string" && preset !== "") {
+        try {
+          await session.configure({ settings: { preset } });
+        } catch (error) {
+          process.stderr.write(`[${PROVIDER_ID}] preset "${preset}" rejected: ${messageOf(error)}\n`);
+        }
+      }
+
+      // Advertise the `/` menu before `session.ready` so the composer has it the
+      // moment the session is usable. A command catalog is an enhancement, never a
+      // precondition: a discovery failure logs and leaves the menu empty rather
+      // than failing the whole open.
+      try {
+        await session.loadCommands();
+        await session.loadPermission();
+        await session.loadPresets();
+      } catch (error) {
+        process.stderr.write(`[${PROVIDER_ID}] command catalog failed: ${messageOf(error)}\n`);
+      }
+
+      // Permission applies to the live agent (it runs `/permission`), so it must
+      // wait until one exists.
+      const permission = settings["permission"];
+      if (typeof permission === "string" && permission !== "") {
+        try {
+          await session.configure({ settings: { permission } });
+        } catch (error) {
+          process.stderr.write(`[${PROVIDER_ID}] permission "${permission}" rejected: ${messageOf(error)}\n`);
+        }
+      }
+
+      // Paseo asks for `replay` when it reopens a session (restart or import).
+      // DSH's resume restores context but re-emits no events, so replay the stored
+      // conversation into the timeline or the reopened session shows as empty.
+      if (input.history === "replay") {
+        try {
+          await session.replayHistory();
+        } catch (error) {
+          process.stderr.write(`[${PROVIDER_ID}] history replay failed: ${messageOf(error)}\n`);
+        }
+      }
     } catch (error) {
+      this.#reverting.delete(sessionId);
       // The daemon drops its own maps and rethrows on a failed open
       // (`PluginProvider.openSession`'s catch never sends `session.close`), so
       // this entry — and the `dsh` process `open()` has already spawned — would
@@ -798,59 +876,6 @@ class DshConnection implements ProviderConnection {
       throw error;
     }
 
-    if (config.thinkingOption !== undefined) {
-      await session.configure({ thinkingOption: config.thinkingOption });
-    }
-
-    const settings = config.settings ?? {};
-    // The agent preset is a creation-time choice: apply it BEFORE the agent is
-    // created (loadCommands creates it) so the session is born under the chosen
-    // preset. DSH locks the preset after the session's first turn, so applying it
-    // after `session.ready` would already be too late — the pick would snap back
-    // to the profile default.
-    const preset = settings["preset"];
-    if (typeof preset === "string" && preset !== "") {
-      try {
-        await session.configure({ settings: { preset } });
-      } catch (error) {
-        process.stderr.write(`[${PROVIDER_ID}] preset "${preset}" rejected: ${messageOf(error)}\n`);
-      }
-    }
-
-    // Advertise the `/` menu before `session.ready` so the composer has it the
-    // moment the session is usable. A command catalog is an enhancement, never a
-    // precondition: a discovery failure logs and leaves the menu empty rather
-    // than failing the whole open.
-    try {
-      await session.loadCommands();
-      await session.loadPermission();
-      await session.loadPresets();
-    } catch (error) {
-      process.stderr.write(`[${PROVIDER_ID}] command catalog failed: ${messageOf(error)}\n`);
-    }
-
-    // Permission applies to the live agent (it runs `/permission`), so it must
-    // wait until one exists.
-    const permission = settings["permission"];
-    if (typeof permission === "string" && permission !== "") {
-      try {
-        await session.configure({ settings: { permission } });
-      } catch (error) {
-        process.stderr.write(`[${PROVIDER_ID}] permission "${permission}" rejected: ${messageOf(error)}\n`);
-      }
-    }
-
-    // Paseo asks for `replay` when it reopens a session (restart or import).
-    // DSH's resume restores context but re-emits no events, so replay the stored
-    // conversation into the timeline or the reopened session shows as empty.
-    if (input.history === "replay") {
-      try {
-        await session.replayHistory();
-      } catch (error) {
-        process.stderr.write(`[${PROVIDER_ID}] history replay failed: ${messageOf(error)}\n`);
-      }
-    }
-
     this.#emit({
       type: "session.opened",
       requestId: input.requestId,
@@ -866,6 +891,10 @@ class DshConnection implements ProviderConnection {
     });
     this.#emit({ type: "session.config", sessionId, config: session.configState() });
     this.#emit({ type: "session.ready", requestId: input.requestId, sessionId });
+    // The reload's reopen is complete: prompts are safe again. (A prompt sent
+    // during close→reopen was refused by the `session.prompt` gate; the gate
+    // must stay armed until here, not until `session.close`.)
+    this.#reverting.delete(sessionId);
     // Deliver what the previous session could not: a deferred file-restore
     // failure, or "the timeline was not refreshed". Emitted here — after the
     // session is usable and while the daemon is still collecting this session's

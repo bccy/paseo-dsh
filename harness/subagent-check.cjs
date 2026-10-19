@@ -698,6 +698,81 @@ async function openSession(conn, sessionId, history) {
       !conn4Events.some((e) => e.type === "session.runtime_failed"),
   );
 
+  // ---- adopted reopen: a child that never started is NOT kept running -----
+  // Adopting the parked process proves its OPEN TURN is real, not that some
+  // other child was ever running: a child with no turn at all must still be
+  // closed as canceled (the pre-rewind symptom was "running" forever).
+  process.env.DSH_FAKE_MODE = "replay-no-turn";
+  const rootN2 = `subN-${Date.now()}`;
+  const noTurnOpenMark = events.length;
+  await conn.send({
+    type: "session.open",
+    requestId: "noturn-open",
+    sessionId: rootN2,
+    config: { cwd: process.cwd(), mode: "build" },
+    persistence: { version: 1, data: { sessionId: rootN2 } },
+    history: "replay",
+  });
+  await untilSince(noTurnOpenMark, (e) => e.type === "session.ready" && e.sessionId === rootN2, "noturn root ready", 30000);
+  await sleep(200);
+  await conn.send({ type: "session.close", sessionId: rootN2 });
+  await sleep(200);
+  const noTurnMark = events.length;
+  await conn.send({
+    type: "session.open",
+    requestId: "noturn-reopen",
+    sessionId: rootN2,
+    config: { cwd: process.cwd(), mode: "build" },
+    persistence: { version: 1, data: { sessionId: rootN2 } },
+    history: "replay",
+  });
+  await untilSince(noTurnMark, (e) => e.type === "session.ready" && e.sessionId === rootN2, "noturn reopen ready", 30000);
+  await sleep(300);
+  const noTurnChild = scoped(rootN2, "child-N");
+  check(
+    "an adopted reopen still closes a never-started child as canceled",
+    since(noTurnMark).some((e) => e.type === "session.turn" && e.sessionId === noTurnChild && e.state === "canceled"),
+    JSON.stringify(since(noTurnMark).filter((e) => e.type === "session.turn" && e.sessionId === noTurnChild)),
+  );
+
+  // ---- unreadable child history: skip, never replay as empty -------------
+  const connH = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+  const connHEvents = [];
+  connH.onEvent((e) => connHEvents.push(e));
+  const rootU = `subU-${Date.now()}`;
+  process.env.DSH_FAKE_MODE = "replay-history-unavailable";
+  await connH.send({ type: "session.open", requestId: "hist-unavail", sessionId: rootU, config: { cwd: process.cwd(), mode: "build" }, history: "replay" });
+  await untilIn(connHEvents, (e) => e.type === "session.ready" && e.sessionId === rootU, "rootU ready", 30000);
+  await sleep(400);
+  const unreadableChild = scoped(rootU, "child-U");
+  check(
+    "an unreadable child history is skipped instead of replayed as empty",
+    !connHEvents.some((e) => e.type === "session.opened" && e.sessionId === unreadableChild) &&
+      !connHEvents.some((e) => e.type === "session.turn" && e.sessionId === unreadableChild),
+  );
+  check(
+    "and the user is told",
+    connHEvents.some((e) => e.type === "session.notice" && e.notice?.title === "子代理历史读取失败"),
+    JSON.stringify(connHEvents.filter((e) => e.type === "session.notice").map((e) => e.notice?.title)),
+  );
+
+  // ---- a terminal arriving during the replay window is not lost ---------
+  const connR = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+  const connREvents = [];
+  connR.onEvent((e) => connREvents.push(e));
+  const rootR = `subR-${Date.now()}`;
+  process.env.DSH_FAKE_MODE = "replay-race";
+  await connR.send({ type: "session.open", requestId: "race-open", sessionId: rootR, config: { cwd: process.cwd(), mode: "build" }, history: "replay" });
+  await untilIn(connREvents, (e) => e.type === "session.ready" && e.sessionId === rootR, "rootR ready", 30000);
+  await sleep(500);
+  const racingChild = scoped(rootR, "child-R");
+  const racingTurns = connREvents.filter((e) => e.type === "session.turn" && e.sessionId === racingChild);
+  check(
+    "a terminal emitted during the history read ends the child exactly once",
+    racingTurns.length === 1 && racingTurns[0].state === "completed",
+    JSON.stringify(racingTurns.map((e) => e.state)),
+  );
+
   // ---- a failed open leaves no session (or process) behind ----------------
   // The daemon drops its own maps and rethrows on a failed open without ever
   // sending `session.close` (`PluginProvider.openSession`'s catch), while the

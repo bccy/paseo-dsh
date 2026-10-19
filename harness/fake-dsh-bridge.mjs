@@ -143,6 +143,16 @@ const liveChildEvents = () => [
   { type: "step/end", seq: 4, data: { turn: 1, step: 1 } },
   { type: "step/start", seq: 5, data: { turn: 1, step: 2 } },
 ];
+/** A child created but never started: no turn kind of evidence at all. */
+const neverStartedChildEvents = () => [
+  { type: "subagent/descriptor", seq: 0, data: { label: "No turn" } },
+];
+/** An open turn; its terminal is emitted *while* the history read is in flight. */
+const racingChildEvents = () => [
+  { type: "subagent/descriptor", seq: 0, data: { label: "Racing R" } },
+  { type: "turn/start", seq: 1, data: { turn: 1 } },
+  { type: "step/start", seq: 2, data: { turn: 1, step: 1 } },
+];
 const rootEvents = () => [
   { type: "user/message", seq: 1, data: { source: { kind: "user" }, content: [{ type: "text", text: "hello root" }] } },
   { type: "assistant/message", seq: 2, data: { turn: 1, step: 1, message: { id: "rm1", content: [{ type: "text", text: "root answer" }] }, usage: { inputTokens: 1, outputTokens: 2 } } },
@@ -538,6 +548,24 @@ async function handle(method, params, id) {
     }
     case "paseo/subagents":
       if (MODE === "error") return { available: false, subagents: [], error: { message: "subagent catalog exploded" } };
+      if (MODE === "replay-no-turn") {
+        return {
+          available: true,
+          subagents: [{ sessionId: "child-N", parentSessionId: String(params?.sessionId ?? ""), mode: "continuable", label: "No turn" }],
+        };
+      }
+      if (MODE === "replay-history-unavailable") {
+        return {
+          available: true,
+          subagents: [{ sessionId: "child-U", parentSessionId: String(params?.sessionId ?? ""), mode: "continuable", label: "Unreadable U" }],
+        };
+      }
+      if (MODE === "replay-race") {
+        return {
+          available: true,
+          subagents: [{ sessionId: "child-R", parentSessionId: String(params?.sessionId ?? ""), mode: "continuable", label: "Racing R" }],
+        };
+      }
       if (MODE !== "replay") return { available: true, subagents: [] };
       return {
         available: true,
@@ -603,6 +631,17 @@ async function handle(method, params, id) {
       // Both end inside an open turn; only child-M has live evidence.
       if (sid === "child-M") return { available: true, inheritedEventCount: 0, events: withHistoryTimes(liveChildEvents()) };
       if (sid === "child-K") return { available: true, inheritedEventCount: 0, events: withHistoryTimes(killedChildEvents()) };
+      if (sid === "child-N") return { available: true, inheritedEventCount: 0, events: withHistoryTimes(neverStartedChildEvents()) };
+      if (sid === "child-U") return { available: false, error: { message: "child U history exploded" } };
+      if (sid === "child-R") {
+        // The terminal races the history read: emitted BEFORE this reply, so it
+        // reaches the plugin while child-R's replay is still in flight.
+        notify("session.event", {
+          sessionId: "child-R",
+          event: { type: "turn/end", seq: 3, data: { turn: 1, reason: { kind: "completed" } } },
+        });
+        return { available: true, inheritedEventCount: 0, events: withHistoryTimes(racingChildEvents()) };
+      }
       // The image scenario replays the same log, so a reopen proves the picture
       // row is rebuilt from history and not only from the live turn.
       if (MODE === "image") return { available: true, inheritedEventCount: 0, events: withHistoryTimes(imageRootEvents()) };

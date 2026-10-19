@@ -17,7 +17,7 @@
  *
  * Usage: node harness/file-snapshot-check.mjs
  */
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -183,10 +183,10 @@ console.log('prune drops entries the rewind already applied');
   check('before count matches', before.entries.length === kept + dropped);
 }
 
-console.log('journal trimming keeps the newest anchors only');
+console.log('journal trimming drops only unreachable anchors');
 {
   const trimRoot = join(root, 'trim');
-  const trimmer = new FileSnapshots({ rootDir: trimRoot });
+  const trimmer = new FileSnapshots({ rootDir: trimRoot, warn: (line) => warnings.push(line) });
   const file = join(trimRoot, 'x.txt');
   await mkdir(trimRoot, { recursive: true });
   await writeFile(file, 'x', 'utf8');
@@ -194,12 +194,102 @@ console.log('journal trimming keeps the newest anchors only');
     await trimmer.capture({ sessionId: SESSION, anchorSeq: anchor, callId: `c${anchor}`, path: file });
     await trimmer.commit({ sessionId: SESSION, callId: `c${anchor}` }, { isError: false });
   }
-  const { dropped } = await trimmer.trim(SESSION);
-  check('more than 100 anchors are trimmed', dropped > 0, `dropped ${dropped}`);
+  const reachable = await trimmer.trim(SESSION, 60);
   const after = await trimmer.readJournal(SESSION);
-  const anchors = [...new Set(after.entries.map((entry) => entry.anchorSeq))];
-  check('exactly 100 anchors remain', anchors.length === 100, `${anchors.length} anchors`);
-  check('the newest anchors are the ones kept', anchors.includes(101) && anchors.includes(0) === false, JSON.stringify([anchors[0], anchors.at(-1)]));
+  check('entries below the oldest rewindable anchor are dropped', reachable.dropped === 60, `dropped ${reachable.dropped}`);
+  check('and every reachable entry stays', after.entries.length === 42 && after.entries.every((entry) => entry.anchorSeq >= 60), `${after.entries.length} entries`);
+  await trimmer.trim(SESSION, Number.POSITIVE_INFINITY);
+  check('no visible rewind target drops the whole journal', (await trimmer.readJournal(SESSION)).entries.length === 0);
+
+  const capRoot = join(root, 'trim-cap');
+  const capWarnings = [];
+  const capped = new FileSnapshots({ rootDir: capRoot, warn: (line) => capWarnings.push(line) });
+  const capFile = join(capRoot, 'y.txt');
+  await mkdir(capRoot, { recursive: true });
+  await writeFile(capFile, 'y', 'utf8');
+  for (let anchor = 0; anchor < 1002; anchor += 1) {
+    await capped.capture({ sessionId: SESSION, anchorSeq: anchor, callId: `k${anchor}`, path: capFile });
+    await capped.commit({ sessionId: SESSION, callId: `k${anchor}` }, { isError: false });
+  }
+  const capResult = await capped.trim(SESSION, 0);
+  const capAnchors = new Set((await capped.readJournal(SESSION)).entries.map((entry) => entry.anchorSeq));
+  check('the hard cap keeps the newest anchors', capAnchors.size === 1000 && capAnchors.has(1001) && !capAnchors.has(0), `${capAnchors.size} anchors`);
+  check(
+    'and reports the cap loudly',
+    capResult.capped === true && capWarnings.some((line) => line.includes('capped at')),
+    JSON.stringify(capWarnings.slice(-1)),
+  );
+}
+
+console.log('a delegated edit and a root edit with the same callId stay separate');
+{
+  const session = 'pending-scope';
+  const firstFile = join(root, 'pending-root.txt');
+  const secondFile = join(root, 'pending-child.txt');
+  await writeFile(firstFile, 'ROOT', 'utf8');
+  await writeFile(secondFile, 'CHILD', 'utf8');
+  const scoped = new FileSnapshots({ rootDir: join(root, 'pending'), warn: (line) => warnings.push(line) });
+  // Same provider-minted callId, different executing sessions: an owner-scoped
+  // key alone would let the second capture overwrite the first pending entry.
+  await scoped.capture({ sessionId: session, pendingKey: 'root:call_0', anchorSeq: 5, callId: 'call_0', path: firstFile });
+  await scoped.capture({ sessionId: session, pendingKey: 'child:call_0', anchorSeq: 5, callId: 'call_0', path: secondFile });
+  await Promise.all([
+    scoped.commit({ sessionId: session, pendingKey: 'root:call_0', callId: 'call_0' }, { isError: false }),
+    scoped.commit({ sessionId: session, pendingKey: 'child:call_0', callId: 'call_0' }, { isError: false }),
+  ]);
+  const journal = await scoped.readJournal(session);
+  const paths = journal.entries.map((entry) => entry.path);
+  check(
+    'both pending entries commit under their own key',
+    journal.entries.length === 2 && paths.includes(firstFile) && paths.includes(secondFile),
+    JSON.stringify(paths),
+  );
+}
+
+console.log('a rewind restores the state before the earliest capture');
+{
+  const session = 'capture-order';
+  const file = join(root, 'capture-order.txt');
+  await writeFile(file, 'BASE', 'utf8');
+  const ordered = new FileSnapshots({ rootDir: join(root, 'order'), warn: (line) => warnings.push(line) });
+  // Parent captures first, then the child captures; the child commits first
+  // (parallel tool calls can finish out of order).
+  await ordered.capture({ sessionId: session, pendingKey: 'p1', anchorSeq: 5, callId: 'c1', path: file });
+  await writeFile(file, 'PARENT', 'utf8');
+  await ordered.capture({ sessionId: session, pendingKey: 'p2', anchorSeq: 5, callId: 'c2', path: file });
+  await writeFile(file, 'CHILD', 'utf8');
+  await ordered.commit({ sessionId: session, pendingKey: 'p2', callId: 'c2' }, { isError: false });
+  await ordered.commit({ sessionId: session, pendingKey: 'p1', callId: 'c1' }, { isError: false });
+  const plan = await ordered.planRestore(session, 5);
+  await ordered.restore(session, plan.actions);
+  check('the earliest captured pre-image wins over commit order', (await readFile(file, 'utf8')) === 'BASE');
+}
+
+console.log('a hostile journal cannot make the rewind escape the session');
+{
+  const session = 'guard';
+  const sessionDir = join(root, encodeURIComponent(session));
+  await mkdir(sessionDir, { recursive: true });
+  const outside = join(root, 'guard-outside.txt');
+  await writeFile(outside, 'SAFE', 'utf8');
+  const link = join(root, 'guard-link.txt');
+  await rm(link, { force: true });
+  await symlink(outside, link);
+  const lines = [
+    JSON.stringify({ anchorSeq: 5, path: 'relative.txt', backup: null }),
+    JSON.stringify({ anchorSeq: 5, path: join(root, 'guard-escape.txt'), backup: '../../../../etc/passwd' }),
+    JSON.stringify({ anchorSeq: 5, path: link, backup: null }),
+  ].join('\n');
+  await writeFile(join(sessionDir, 'journal.jsonl'), `${lines}\n`, 'utf8');
+  const read = await snapshots.readJournal(session);
+  check('relative paths and traversal-prone backups are skipped', read.entries.length === 1 && read.skippedLines === 2, JSON.stringify(read));
+  const plan = await snapshots.planRestore(session, 5);
+  const outcome = await snapshots.restore(session, plan.actions);
+  check(
+    'a symlinked target is skipped, never deleted',
+    outcome.skipped.includes(link) && existsSync(link) && (await readFile(outside, 'utf8')) === 'SAFE',
+    JSON.stringify(outcome.skipped),
+  );
 }
 
 console.log('deduplicated objects');
@@ -260,14 +350,38 @@ console.log('unreferenced objects are collected');
   const session = 'gc-check';
   const file = join(root, 'gc-target.txt');
   await writeFile(file, 'keep-me', 'utf8');
-  await snapshots.capture({ sessionId: session, anchorSeq: 9, callId: 'g1', path: file });
-  await snapshots.commit({ sessionId: session, callId: 'g1' }, { isError: false });
+  const gc = new FileSnapshots({ rootDir: root, warn: (line) => warnings.push(line), gcGraceMs: 0 });
+  await gc.capture({ sessionId: session, anchorSeq: 9, callId: 'g1', path: file });
+  await gc.commit({ sessionId: session, callId: 'g1' }, { isError: false });
   const objectsDir = join(root, encodeURIComponent(session), 'objects');
   await writeFile(join(objectsDir, 'deadbeefdeadbeef'), 'orphan', 'utf8');
-  const collected = await snapshots.collectGarbage(session);
+  const collected = await gc.collectGarbage(session);
   const left = await readdir(objectsDir);
   check('one unreferenced object is removed', collected.removed === 1, JSON.stringify(collected));
   check('the referenced object is kept', left.length === 1, JSON.stringify(left));
+
+  // A capture whose journal line is still in flight must survive GC.
+  const pendingFile = join(root, 'gc-pending.txt');
+  await writeFile(pendingFile, 'not-committed-yet', 'utf8');
+  await gc.capture({ sessionId: session, anchorSeq: 10, callId: 'g2', path: pendingFile });
+  const pendingBackup = [...gc.pending.values()].find((entry) => typeof entry?.backup === 'string')?.backup;
+  await gc.collectGarbage(session);
+  check(
+    'an uncommitted capture protects its object',
+    typeof pendingBackup === 'string' && existsSync(join(objectsDir, pendingBackup)),
+    String(pendingBackup),
+  );
+  gc.discard({ sessionId: session, callId: 'g2' });
+
+  // A just-written unreferenced object is protected by the grace period.
+  const young = new FileSnapshots({ rootDir: root, warn: (line) => warnings.push(line) });
+  await writeFile(join(objectsDir, 'feedfacefeedface'), 'young', 'utf8');
+  const swept = await young.collectGarbage(session);
+  check(
+    'a freshly written unreferenced object is kept (race guard)',
+    swept.keptRecent >= 1 && existsSync(join(objectsDir, 'feedfacefeedface')),
+    JSON.stringify(swept),
+  );
 }
 
 await rm(root, { recursive: true, force: true });

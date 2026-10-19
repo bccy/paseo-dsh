@@ -258,6 +258,15 @@ export class DshSession {
     | { kind: "event"; sessionId: string; event: { type: string; [key: string]: unknown } }
     | { kind: "status"; sessionId: string; status: string }
   > = [];
+  /**
+   * Children whose stored history is being replayed (read + open + replay).
+   *
+   * Their frames can arrive during the history round trip, before the child view
+   * exists. Dropping one there loses a terminal `turn/end` (or `tool/result`) and
+   * leaves an adopted mid-turn child running forever, so they are buffered and
+   * delivered right after the replay; `#flushPendingChildren` routes them.
+   */
+  #replayPending = new Set<string>();
   #childBufferWarned = false;
   /** Guards {@link #flushPendingChildren} against re-entrant invocation. */
   #flushing = false;
@@ -717,54 +726,119 @@ export class DshSession {
     for (const diagnostic of listing.diagnostics ?? []) {
       this.#options.log(`subagent catalog diagnostic: ${JSON.stringify(diagnostic).slice(0, 200)}`);
     }
-    for (const row of listing.subagents) {
-      if (this.#closed) return;
-      // An archived child stays archived: DSH holds that state, Paseo drops what
-      // the provider stops reporting, and re-announcing it is precisely what
-      // made "archive all" look like it did nothing after a restart.
-      if (row.archived === true) continue;
-      let history: {
-        events: Array<{ type: string; seq?: number; time?: number; data: unknown }>;
-        inheritedEventCount: number;
-      };
-      try {
-        history = await process.history(row.sessionId);
-      } catch (error) {
-        this.#options.log(`subagent history failed for ${row.sessionId}: ${messageOf(error)}`);
-        continue;
+    // Frames for these children are buffered (not dropped) while their history
+    // round trip runs; each child is released right after its replay so the
+    // stored history is emitted before any live continuation.
+    this.#replayPending = new Set(
+      listing.subagents.filter((subagent) => subagent.archived !== true).map((subagent) => subagent.sessionId),
+    );
+    try {
+      for (const row of listing.subagents) {
+        if (this.#closed) return;
+        // An archived child stays archived: DSH holds that state, Paseo drops what
+        // the provider stops reporting, and re-announcing it is precisely what
+        // made "archive all" look like it did nothing after a restart.
+        if (row.archived === true) continue;
+        let history: {
+          events: Array<{ type: string; seq?: number; time?: number; data: unknown }>;
+          inheritedEventCount: number;
+          /** False when the log exists but could not be read. */
+          available: boolean;
+          error?: string;
+        };
+        try {
+          history = await process.history(row.sessionId);
+        } catch (error) {
+          this.#options.log(`subagent history failed for ${row.sessionId}: ${messageOf(error)}`);
+          this.#replayPending.delete(row.sessionId);
+          continue;
+        }
+        if (this.#closed) return;
+        if (history.available === false) {
+          // Never replay an unreadable log as "no history": that would guess the
+          // child's state (canceled on a cold start, running when adopted). Skip
+          // it and say so instead of pretending the child is empty.
+          this.#options.log(
+            `subagent ${row.sessionId}: history unavailable (${history.error ?? "unknown error"}); skipped`,
+          );
+          this.#noticeChildHistoryUnavailable(row.sessionId, history.error);
+          this.#replayPending.delete(row.sessionId);
+          this.#dropBufferedChild(row.sessionId);
+          continue;
+        }
+        // The proof that a child's open turn is still real is live evidence: the
+        // bridge announced that child, or streamed its frames, in this process —
+        // or this session adopted the SAME parked process that hosted the child
+        // (the rewind refresh's close/reopen). Adopting keeps a running child
+        // running, so its open turn is live even though the new provider session
+        // never saw the announcement. Cold starts keep the strict rule: nothing is
+        // live in a process that just booted, DSH's `listDescendants` never loads
+        // or resumes a child agent, and a stored log that simply stops inside a
+        // turn is exactly what a killed child leaves behind. Sampled here, after
+        // the history read, so no await can interleave between the check and the
+        // replay that consumes it.
+        const announcedLive = this.#children.has(row.sessionId) || this.#adoptedParkedProcess;
+        // A one-shot child has no label in the durable catalog — DSH only requires
+        // one for a continuable child — but the child's own `subagent/descriptor`
+        // carries its creation label. Read it from the history *before* opening:
+        // a child has no configuration channel, so the title it is opened with is
+        // the only one it can ever have, and opening without one leaves Paseo
+        // showing "加载中…" forever.
+        const label = row.label ?? labelFromHistory(history.events);
+        const child = this.#openChildNow({
+          sessionId: row.sessionId,
+          parentSessionId: row.parentSessionId,
+          ...(row.mode === undefined ? {} : { mode: row.mode }),
+          ...(label === undefined ? {} : { label }),
+        });
+        if (child === undefined) {
+          this.#options.log(`subagent ${row.sessionId} has an unresolved parent ${row.parentSessionId}`);
+          this.#replayPending.delete(row.sessionId);
+          continue;
+        }
+        child.replay(
+          history.events,
+          history.inheritedEventCount,
+          announcedLive,
+          this.#hasBufferedTerminal(row.sessionId),
+        );
+        // The stored history is in: release the frames held during the round trip
+        // (their child view now exists) and stop buffering for this child.
+        this.#replayPending.delete(row.sessionId);
+        this.#flushPendingChildren();
       }
-      if (this.#closed) return;
-      // The proof that a child's open turn is still real is live evidence: the
-      // bridge announced that child, or streamed its frames, in this process —
-      // or this session adopted the SAME parked process that hosted the child
-      // (the rewind refresh's close/reopen). Adopting keeps a running child
-      // running, so its open turn is live even though the new provider session
-      // never saw the announcement. Cold starts keep the strict rule: nothing is
-      // live in a process that just booted, DSH's `listDescendants` never loads
-      // or resumes a child agent, and a stored log that simply stops inside a
-      // turn is exactly what a killed child leaves behind. Sampled here, after
-      // the history read, so no await can interleave between the check and the
-      // replay that consumes it.
-      const announcedLive = this.#children.has(row.sessionId) || this.#adoptedParkedProcess;
-      // A one-shot child has no label in the durable catalog — DSH only requires
-      // one for a continuable child — but the child's own `subagent/descriptor`
-      // carries its creation label. Read it from the history *before* opening:
-      // a child has no configuration channel, so the title it is opened with is
-      // the only one it can ever have, and opening without one leaves Paseo
-      // showing "加载中…" forever.
-      const label = row.label ?? labelFromHistory(history.events);
-      const child = this.#openChildNow({
-        sessionId: row.sessionId,
-        parentSessionId: row.parentSessionId,
-        ...(row.mode === undefined ? {} : { mode: row.mode }),
-        ...(label === undefined ? {} : { label }),
-      });
-      if (child === undefined) {
-        this.#options.log(`subagent ${row.sessionId} has an unresolved parent ${row.parentSessionId}`);
-        continue;
-      }
-      child.replay(history.events, history.inheritedEventCount, announcedLive);
+    } finally {
+      this.#replayPending.clear();
     }
+  }
+
+  /** Report a child whose stored log could not be read (never guess its state). */
+  #noticeChildHistoryUnavailable(nativeId: string, error?: string): void {
+    this.#options.emit({
+      type: "session.notice",
+      sessionId: this.id,
+      notice: {
+        id: `subagent-history-${nativeId}-${String(Date.now())}`,
+        severity: "warning",
+        title: "子代理历史读取失败",
+        description: `子代理 ${nativeId} 的历史未能读取，已跳过重放（${error ?? "未知原因"}）。`,
+      },
+    });
+  }
+
+  /** Drop held frames of a child that will not be opened. */
+  #dropBufferedChild(nativeId: string): void {
+    this.#pendingOpened = this.#pendingOpened.filter((payload) => payload.sessionId !== nativeId);
+    this.#pendingChildEvents = this.#pendingChildEvents.filter((item) => item.sessionId !== nativeId);
+  }
+
+  /** Whether this child's terminal already arrived and is held for delivery. */
+  #hasBufferedTerminal(nativeId: string): boolean {
+    for (const item of this.#pendingChildEvents) {
+      if (item.sessionId !== nativeId || item.kind !== "event") continue;
+      if (item.event.type === "turn/end") return true;
+    }
+    return false;
   }
 
   /** Accept one prompt and start its turn. */
@@ -1153,6 +1227,12 @@ export class DshSession {
         child.status(status);
         return;
       }
+      // Not open yet: hold the status while its history replay is in flight (the
+      // replay-time mirror of the `#rootReady` gate below).
+      if (this.#replayPending.has(sid)) {
+        this.#bufferChildEvent({ kind: "status", sessionId: sid, status });
+        return;
+      }
       // Not open yet: hold the status if the root is still opening, or if this
       // child is already a known-but-unparented notice. Otherwise it is a ghost.
       if (!this.#rootReady || this.#isPendingChild(sid)) {
@@ -1453,6 +1533,12 @@ export class DshSession {
       if (this.#isPendingChild(sid) && payload.event.type === "subagent/descriptor") {
         const label = subagentLabel(payload.event.data);
         if (label !== undefined) this.#completeHeldChild(sid, label);
+      }
+      // A child whose history replay is in flight can emit frames during that
+      // await window; hold them for the replayed child instead of dropping.
+      if (this.#replayPending.has(sid)) {
+        this.#bufferChildEvent({ kind: "event", sessionId: sid, event: payload.event });
+        return;
       }
       // A known child whose parent notice has not arrived yet (a grandchild can
       // precede its parent) keeps its earliest output buffered rather than
@@ -1832,11 +1918,17 @@ export class DshChildSession {
    *
    * @param live - positive live-channel evidence for this child, from the caller
    *   that read the durable catalog.
+   * @param terminalBuffered - the child's `turn/end` already arrived and is held
+   *   in the replay buffer (it landed during the history read). The replayed
+   *   suffix still ends inside the turn, but closing it as canceled would emit a
+   *   spurious terminal right before the real one; the buffered terminal is the
+   *   live proof, exactly like `live`.
    */
   replay(
     events: Array<{ type: string; seq?: number; time?: number; data: unknown }>,
     inheritedEventCount = 0,
     live = false,
+    terminalBuffered = false,
   ): void {
     if (this.#options.closed()) return;
     let fallbackSeq = 0;
@@ -1901,7 +1993,12 @@ export class DshChildSession {
     // default on attach; without it the child is closed as canceled rather than
     // announced as something still running.
     if (turnOpen || !sawTurn) {
-      if (live || this.#observedLive) return;
+      // Adopting the parked process proves the OPEN TURN is still real: that
+      // process never stopped. It does not prove a child with no recorded turn
+      // was ever running — that shape is a child created but never started (or a
+      // dead one), so only the live channel may keep it running. A terminal that
+      // arrived during the replay window is equally positive evidence.
+      if (((live || terminalBuffered) && turnOpen) || this.#observedLive) return;
       this.#options.log(
         `subagent ${this.nativeId}: stored history ends with no turn terminal ` +
           `(${turnOpen ? "the last turn was never closed" : "no turn was ever recorded"}); ` +
