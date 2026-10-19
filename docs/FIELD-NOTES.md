@@ -1927,6 +1927,42 @@ journal；stderr 出现 `interrupted 1 delegated agent(s)`）、`rewind-e2e` 12/
 「谁先 commit」「GC 和写对象谁先跑」「恢复失败后还 prune」「flush 失败仍报成功」这些次序；
 另外**取消是 fire-and-return，恢复不能假设它已生效**，必须等一个有界窗口并把超时说出来。
 
+### 63. iOS 上传 zip 报 `[System Error] unsupported prompt content type "uploaded_file"`
+
+**背景**：Paseo 0.12 手机端把附件（zip 等）以 `uploaded_file` 内容块下发：文件已由 daemon 落盘到
+`~/.paseo/uploads/<id>/<fileName>`，块里带 `fileName/mimeType/size/path`（绝对路径）。
+插件 `paseo-plugin/server/session.ts` 的 `toDshContent` 只认 `text`/`image`，其余一律抛
+`unsupported prompt content type "<type>"`，于是整个提问失败，报 `[System Error]`——文件其实好好的，
+只是桥不认这个块。
+
+**根因不是"DSH 不支持附件"**：Paseo 自己的 provider（Claude、Codex、OpenCode、Pi）收到这些块时都
+`renderPromptAttachmentAsText()` 渲染成**文本**再交给底层 agent，官方从不复制文件、只给绝对路径
+（`@getpaseo/server@0.12.0` `dist/server/server/agent/prompt-attachments.js:30-110`；Claude 侧
+`providers/claude/agent.js:2922`、Codex 侧 `providers/codex-app-server-agent.js:2437`）。
+
+**修复**（`paseo-plugin/server/session.ts`）：`toDshContent` 改为 text/image 原样、其余交给逐字移植的
+`renderPromptAttachmentAsText`：
+- `uploaded_file` → `Uploaded file: <fileName>` / `Path: <path>` / `MIME: <mimeType>` / `Size: <n> bytes`（四行，字段顺序照抄）
+- `review` → `Paseo review attachment (<mode>)` + `CWD:`/`Base:` + 每条 comment 的 hunk 与 diff 行
+  （目标行前缀 `> `、其余两空格；行号 `padStart(2)`，缺行号渲染 `-`；add/remove/context → `+`/`-`/空格）
+- `forge_change_request`/legacy `github_pr` → `<显示名> <PR|MR> <前缀#|!><n>: <title>` + url + Project/Base/Head/body
+- `forge_issue`/legacy `github_issue` → `<显示名> Issue <前缀><n>: <title>` + url + Project/body
+- 显示名/缩写/编号前缀取自 `@getpaseo/protocol/forge-manifest`（github/gitlab/gitea/forgejo/codeberg，
+  未知 forge 走 neutral）；表是**照抄的数据**，@getpaseo/server 不是插件运行时依赖。
+- `text` 块 / 文本附件块 / `image` 块行为逐字不变；**真正未知的类型仍抛错**（带 wire type），不静默丢。
+
+**验证**：新增 `harness/uploaded-file-check.cjs`（17/17，编译到仓库内 `.dbg-attach`，
+详见文件头运行步骤）；11 个 fixture 与官方 `renderPromptAttachmentAsText` 的输出**逐字节比对一致**
+（含无 forge 的 neutral 怪癖 `undefined PR #3: …`，有意保留上游行为）；两条变异验证
+（删 `" bytes"` → 3 条 FAIL；未知类型改静默返回 → 2 条 FAIL，还原后 17/17）。
+`harness/subagent-check.cjs` 里「无 DSH 对应物的块必须失败」的 fixture 随之从 `uploaded_file`
+改成真正未知的 `mystery_attachment`（68/68），否则它会断言这次已支持的块仍应失败。
+真机 plugin-check 32/32。
+
+**教训**：**「协议比我认识的宽」时先看上游适配器怎么翻译，而不是抛错**——抛错看起来"响亮"，
+其实用户看到的是整个提问不可用；同时**对齐要连边角一起照抄**（neutral 兜底、diff 行前缀、字段顺序），
+否则"差不多"的格式会在下一次上游改动时静默漂移。
+
 ---
 
 ## 已知限制（未修，有意为之）

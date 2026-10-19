@@ -6,9 +6,30 @@
  * `./locale`, read at call time rather than baked in at import, so a locale the
  * host relays later takes effect on the next row instead of never.
  *
+ * One row is not a tool call despite the wire shape: 0.12 projects an
+ * agent-to-agent message as `tool_call{name:"agent_message", detail:plain_text}`
+ * and puts its meaning on `item.agentMessage` (event, sender, text). That row is
+ * rendered semantically here — event + sender in the head, the message in the
+ * block — rather than as the raw legacy row.
+ *
  * @module dsh-paseo/client/tool-call-data
  */
-import { currentLocale, localeText } from "./locale";
+import { agentMessageLabel, currentLocale, localeText } from "./locale";
+
+/**
+ * The protocol's semantic half of a 0.12 agent-to-agent message row.
+ *
+ * Type-only, from the protocol package's own schema
+ * (`@getpaseo/protocol`'s `agent-message.ts`): the plugin bundle imports nothing
+ * at run time from it. The inline `resolution-mode` attribute is what lets that
+ * package's ESM types be read from this CommonJS module under the offline
+ * harness's `--module node16` compile (see `harness/agent-message-check.cjs`);
+ * Paseo's own compiler resolves it through `tsconfig.json`'s `bundler`
+ * resolution and erases it before the bundle is built.
+ */
+type AgentMessage = import("@getpaseo/protocol/agent-message", {
+  with: { "resolution-mode": "import" },
+}).AgentMessage;
 
 /**
  * Which of DSH's expanded blocks a row draws.
@@ -132,7 +153,12 @@ export interface ToolCallData {
   paseoMark: boolean;
   status: "running" | "completed" | "failed" | "canceled";
   phase: "streaming" | "complete";
-  /** The row's one-line label: the tool's description when it has one. */
+  /**
+   * The row's second half: the tool's description when it has one, else its own
+   * subject. A 0.12 agent-to-agent message row puts its sender here
+   * (`sender.title` when it has one, else `sender.id`), matching the protocol's
+   * own display model.
+   */
   summary: string;
   /**
    * What the expanded block shows first: the tool's own subject (the command,
@@ -1024,6 +1050,14 @@ const PASEO_MCP_ICONS: Record<string, string> = {
   browser_snapshot: "Globe",
   browser_screenshot: "Globe",
   browser_navigate: "Globe",
+  // The four browser tools with a standard action glyph rather than the page
+  // glyph the rest of this family shares. They had no entry at all, so each fell
+  // to the wrench and then to Paseo's mark (the coarser fallback); the official
+  // catalog gives them labels, and these glyphs say what the call did.
+  browser_back: "ArrowLeft",
+  browser_forward: "ArrowRight",
+  browser_reload: "RotateCw",
+  browser_hover: "MousePointer",
   browser_click: "Globe",
   browser_fill: "Globe",
   browser_type: "Globe",
@@ -1112,6 +1146,37 @@ function gatewayPaseoTool(name: string, detail: ToolDetail | undefined): string 
   return `mcp__paseo__${tool}`;
 }
 
+/** The semantic half of a 0.12 agent-to-agent message row. */
+interface AgentMessageFacts {
+  /** The protocol event, unvalidated: the label table decides what is known. */
+  event: unknown;
+  /** The sender's title when it has one, else its id, else "". */
+  sender: string;
+  /** The message text, or undefined when the payload carried none. */
+  text: string | undefined;
+}
+
+/**
+ * Read the semantic half of a 0.12 agent-to-agent message row, or undefined.
+ *
+ * `item.agentMessage` is the protocol's own projection
+ * (`{ event, sender: { id, title? }, text }`), and it is the only place the row
+ * learns who sent what: the `plain_text` detail beside it is an echo kept for
+ * clients that predate the field. It is read defensively — history replayed from
+ * another daemon, or a payload from a newer one, can carry anything — and an
+ * object with none of the three fields returns undefined, which leaves the row
+ * on the plain-text path it had before 0.12.
+ */
+function agentMessageOf(value: unknown): AgentMessageFacts | undefined {
+  if (!isRecord(value)) return undefined;
+  const sender = isRecord(value.sender) ? value.sender : undefined;
+  const title = sender !== undefined && typeof sender.title === "string" ? sender.title.trim() : "";
+  const id = sender !== undefined && typeof sender.id === "string" ? sender.id.trim() : "";
+  const text = typeof value.text === "string" ? value.text : undefined;
+  if (value.event === undefined && title === "" && id === "" && text === undefined) return undefined;
+  return { event: value.event, sender: title !== "" ? title : id, text };
+}
+
 /** Normalize one Paseo tool-call item into JSON-safe render data. */
 export function toolCallData(
   item: {
@@ -1120,6 +1185,13 @@ export function toolCallData(
     detail: unknown;
     error?: unknown;
     metadata?: unknown;
+    /**
+     * 0.12's semantic projection of an agent-to-agent message row. The daemon
+     * also sends a `plain_text` detail beside it, but that is only an echo
+     * older clients understand; the sender, the event and the authoritative
+     * text live here.
+     */
+    agentMessage?: AgentMessage;
   },
   phase: "streaming" | "complete",
 ): ToolCallData {
@@ -1130,6 +1202,9 @@ export function toolCallData(
   // Copy is read here, once per call, rather than at module load: a locale the
   // host relays later must reach the next row, not only the ones after a reload.
   const copy = localeText();
+  // The semantic half of an agent-message row; undefined keeps the pre-0.12
+  // plain-text path for every other call (and for a broken payload).
+  const agentMessage = agentMessageOf(item.agentMessage);
   // DSH's bash tool requires a model-written `description` for every call and
   // its own UI titles the row with it ("List DSH checkout root"), not with the
   // command. The plugin carries it on the item's provider metadata because the
@@ -1222,7 +1297,22 @@ export function toolCallData(
       break;
   }
 
-  if (type === "unknown") {
+  if (agentMessage !== undefined) {
+    // The message's own text is authoritative whatever the echo detail says:
+    // `detail.text` happens to carry the same string today, but the field 0.12
+    // documents is `agentMessage.text`. A payload with no text keeps the echo,
+    // which is still better than a blank row.
+    if (agentMessage.text !== undefined) body = agentMessage.text;
+    bodyLabel = copy.bodyLabels.message;
+    // Prose, not a diff or source code — even if the detail shape would have
+    // dispatched to one.
+    diff = false;
+    code = false;
+    detailHeadline = "";
+    primary = "";
+  }
+
+  if (type === "unknown" && agentMessage === undefined) {
     // Provider-native tools land here — every MCP call, and anything else Paseo
     // has no detail shape for. The row has to carry both halves itself: the
     // arguments it was called with, and whatever came back. Without the output
@@ -1230,6 +1320,7 @@ export function toolCallData(
     // reads as "this row will not expand".
     // An argument-less call (`list_workspaces`) would otherwise label itself
     // `{}` and open onto another `{}`; the tool's own name is already the label.
+    // A message row is exempt: its text is the payload, not this JSON shape.
     const input = detail.input;
     const emptyInput =
       input === null ||
@@ -1245,7 +1336,12 @@ export function toolCallData(
   // DSH's own block for this call, then the structured card for it. Each parser
   // returns null for anything that is not the documented shape, and null keeps
   // the plain-text body above — a recognisable row, never a blank card.
-  const kind = blockKind(type, str(detail, "toolName") || item.name);
+  //
+  // An agent message is prose: it draws the generic block whatever detail shape
+  // the daemon happened to send beside it, so no structured parser can claim a
+  // card it does not have.
+  const kind =
+    agentMessage !== undefined ? "generic" : blockKind(type, str(detail, "toolName") || item.name);
   const meta = metaOf(metadata);
   const search = kind === "search" && meta !== undefined ? parseSearch(meta) : null;
   const read = kind === "read" && meta !== undefined ? parseRead(detail, meta) : null;
@@ -1270,13 +1366,26 @@ export function toolCallData(
     detailHeadline !== "" ? detailHeadline : description === "" ? "" : primary,
   );
   const structured = search !== null || read !== null || diffBlock !== null || web !== null;
-  const icon = toolIcon(item.name, detail);
+  // The daemon hints an agent-message row's glyph with `icon: "bot"`; when that
+  // hint is missing the row would fall to the wrench, so a message always reads
+  // as an agent's row.
+  const rowIcon = toolIcon(item.name, detail);
+  const icon = agentMessage !== undefined && rowIcon === "Wrench" ? "Bot" : rowIcon;
   // A Paseo-owned tool with no glyph of its own would draw the generic wrench.
   // Draw Paseo's mark there instead, so it still reads as Paseo's rather than as
   // unknown; a tool we do have a glyph for keeps it (the mark is coarser).
   const paseoMark = icon === "Wrench" && isPaseoToolName(item.name);
-  const label = toolLabel(item.name, detail);
-  const rawSummary = truncate(description === "" ? primary : description);
+  // An agent-message row is titled by what happened ("Agent finished"), and the
+  // sender is its second half — the protocol's own display model puts the
+  // sender in the summary (`buildAgentMessageDisplay`). Its block carries the
+  // message text, so the title is never a repeated subject.
+  const label =
+    agentMessage === undefined
+      ? toolLabel(item.name, detail)
+      : agentMessageLabel(agentMessage.event);
+  const rawSummary = truncate(
+    agentMessage !== undefined ? agentMessage.sender : description === "" ? primary : description,
+  );
   // The head reads `label · summary`. Two halves saying the same sentence prints
   // the same line twice — every `/command` row did (`/compact · /compact`), and
   // so do Chinese `todo_write` (「更新任务清单 · 更新任务清单」) and
@@ -1310,7 +1419,7 @@ export function toolCallData(
     // is its title still expands — the title wraps to its full width — but must
     // not draw an empty code surface. A structured card counts even when the
     // plain text is empty: the card is the content.
-    titled: description !== "",
+    titled: agentMessage !== undefined || description !== "",
     hasDetail: headline !== "" || body !== "" || structured,
     kind,
     search,

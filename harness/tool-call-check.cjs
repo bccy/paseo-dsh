@@ -16,11 +16,17 @@
  *
  * Run (from paseo-plugin):
  *   npx tsc client/tool-call-data.ts client/tokens.ts client/paseo-mark.ts \
- *     --outDir .dbg --rootDir . --module commonjs --moduleResolution node \
+ *     --outDir .dbg --rootDir . --module node16 --moduleResolution node16 \
  *     --target ES2022 --skipLibCheck
  *   echo '{"type":"commonjs"}' > .dbg/package.json
  *   cp ../harness/tool-call-check.cjs .dbg/
  *   cd .dbg && node tool-call-check.cjs
+ *
+ * `--module node16` is required, not cosmetic: `client/tool-call-data.ts` reads
+ * the 0.12 `AgentMessage` type from the protocol package's ESM declarations, and
+ * node16 is the resolution mode that honours its `exports` map while still
+ * emitting CommonJS for this harness to `require`. The source carries the
+ * matching `resolution-mode` attribute.
  *
  * Only the pure modules are compiled: the React renderer imports the host
  * runtime, which plain `node` resolution cannot see. `tokens.ts` and
@@ -479,19 +485,25 @@ console.log("DSH's own tools are not anonymous");
   equal("a browser tool too", toolLabel("mcp__paseo__browser_list_tabs"), "列出浏览器标签页");
   equal("listing workspaces too", toolLabel("mcp__paseo__list_workspaces"), "列出工作区");
 
-  // The four browser tools that `PASEO_MCP_ICONS` does not cover. They carry a
-  // label now — a wire name in the row read badly — but still no glyph, because
-  // that is what makes the row fall to the wrench and draw Paseo's mark instead.
-  equal("browser back is labelled", toolLabel("mcp__paseo__browser_back"), "浏览器后退");
-  equal("browser forward is labelled", toolLabel("mcp__paseo__browser_forward"), "浏览器前进");
-  equal("browser reload is labelled", toolLabel("mcp__paseo__browser_reload"), "刷新浏览器页面");
-  equal("browser hover is labelled", toolLabel("mcp__paseo__browser_hover"), "悬停页面元素");
-  for (const bare of ["browser_back", "browser_forward", "browser_hover", "browser_reload"]) {
+  // The four browser tools whose action has a standard glyph rather than the
+  // page glyph the rest of the family shares. They used to have no entry at all,
+  // so each fell to the wrench and then to Paseo's mark; 0.12's official catalog
+  // gives every one of them a label (`harness/locale-check.cjs` compares those),
+  // and these four now draw their own action glyph.
+  const browserActionGlyphs = [
+    ["browser_back", "后退", "ArrowLeft"],
+    ["browser_forward", "前进", "ArrowRight"],
+    ["browser_hover", "悬停元素", "MousePointer"],
+    ["browser_reload", "刷新页面", "RotateCw"],
+  ];
+  for (const [bare, label, glyph] of browserActionGlyphs) {
+    equal(`${bare} is labelled`, toolLabel(`mcp__paseo__${bare}`), label);
+    equal(`${bare} draws its own glyph`, toolIcon(`mcp__paseo__${bare}`, { type: "unknown" }), glyph);
     const row = toolCallData(
       { name: `mcp__paseo__${bare}`, status: "completed", detail: { type: "unknown" } },
       "complete",
     );
-    check(`${bare} keeps no glyph, so it draws Paseo's mark`, row.icon === "Wrench" && row.paseoMark === true);
+    check(`${bare} no longer asks for Paseo's mark`, row.icon === glyph && row.paseoMark === false, row.icon);
     check(`${bare} no longer prints its wire name`, row.label !== `mcp__paseo__${bare}`, row.label);
   }
   // The bridge's MCP gateway exposes three meta tools; a proxied call carries

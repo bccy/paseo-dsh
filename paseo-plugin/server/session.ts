@@ -2072,13 +2072,210 @@ export class DshChildSession {
 /**
  * Translate one Paseo content block into the shape the bridge hands DSH.
  *
- * A block with no DSH counterpart fails loudly rather than being dropped: the
- * model would otherwise receive a prompt silently missing its evidence.
+ * DSH's prompt content is `text` and `image` only, while Paseo's
+ * `ProviderContent` is wider: an uploaded file, a review, a forge change
+ * request/issue. Paseo's own providers (Claude, Codex, …) render those to a
+ * text block and hand that text to the agent — uploaded files are never copied,
+ * the absolute path on disk is the payload — so this mirrors that mapping
+ * instead of rejecting the prompt. The rendered text is
+ * {@link renderPromptAttachmentAsText}, byte-for-byte Paseo's own format.
+ *
+ * A block with no DSH counterpart and no Paseo rendering fails loudly rather
+ * than being dropped: the model would otherwise receive a prompt silently
+ * missing its evidence.
  */
-function toDshContent(block: ProviderContent): Record<string, unknown> {
+export function toDshContent(block: ProviderContent): Record<string, unknown> {
   if (block.type === "text") return { type: "text", text: block.text };
   if (block.type === "image") return { type: "image", data: block.data, mimeType: block.mimeType };
-  throw new Error(`unsupported prompt content type "${block.type}"`);
+  return { type: "text", text: renderPromptAttachmentAsText(block) };
+}
+
+/**
+ * How Paseo brands one git forge in prompt text.
+ *
+ * Ported from `@getPaseo/protocol/forge-manifest` (the declarative half the
+ * daemon's renderer reads). @getpaseo/server is not a runtime dependency of this
+ * plugin, so the table is copied rather than imported.
+ */
+interface ForgePresentation {
+  displayName: string | undefined;
+  changeRequestAbbrev: string;
+  changeRequestNumberPrefix: string;
+  issueNumberPrefix: string;
+}
+
+const FORGE_PRESENTATIONS: Readonly<Record<string, ForgePresentation>> = {
+  github: { displayName: "GitHub", changeRequestAbbrev: "PR", changeRequestNumberPrefix: "#", issueNumberPrefix: "#" },
+  gitlab: { displayName: "GitLab", changeRequestAbbrev: "MR", changeRequestNumberPrefix: "!", issueNumberPrefix: "#" },
+  gitea: { displayName: "Gitea", changeRequestAbbrev: "PR", changeRequestNumberPrefix: "#", issueNumberPrefix: "#" },
+  forgejo: { displayName: "Forgejo", changeRequestAbbrev: "PR", changeRequestNumberPrefix: "#", issueNumberPrefix: "#" },
+  codeberg: { displayName: "Codeberg", changeRequestAbbrev: "PR", changeRequestNumberPrefix: "#", issueNumberPrefix: "#" },
+};
+
+/**
+ * A forge id's presentation, or Paseo's neutral shape for an id this build does
+ * not know (a self-hosted forge a newer daemon reports). Every neutral field is
+ * named exactly like `getForgeDefinitionOrNeutral`'s, quirks included.
+ */
+function forgePresentation(forge: string | undefined): ForgePresentation {
+  return FORGE_PRESENTATIONS[forge as string] ?? {
+    displayName: forge,
+    changeRequestAbbrev: "PR",
+    changeRequestNumberPrefix: "#",
+    issueNumberPrefix: "#",
+  };
+}
+
+/** The per-line diff markers of a review attachment. */
+const REVIEW_LINE_MARKERS = { add: "+", remove: "-", context: " " } as const;
+
+/** One review context line number, left-padded; an absent side renders `-`. */
+function padLineNumber(lineNumber: number | null): string {
+  return (lineNumber?.toString() ?? "-").padStart(2);
+}
+
+interface ChangeRequestFields {
+  forge: string | undefined;
+  number: number;
+  title: string;
+  url: string;
+  body?: string | null;
+  projectPath?: string;
+  baseRefName?: string | null;
+  headRefName?: string | null;
+}
+
+/** A forge change request, exactly as Paseo's own renderer writes it. */
+function renderChangeRequestAttachment(input: ChangeRequestFields): string {
+  const forge = forgePresentation(input.forge);
+  const lines = [
+    `${forge.displayName} ${forge.changeRequestAbbrev} ${forge.changeRequestNumberPrefix}${input.number}: ${input.title}`,
+    input.url,
+  ];
+  if (input.projectPath) lines.push(`Project: ${input.projectPath}`);
+  if (input.baseRefName) lines.push(`Base: ${input.baseRefName}`);
+  if (input.headRefName) lines.push(`Head: ${input.headRefName}`);
+  if (input.body) lines.push("", input.body);
+  return lines.join("\n");
+}
+
+/** A forge issue, exactly as Paseo's own renderer writes it. */
+function renderIssueAttachment(input: {
+  forge: string | undefined;
+  number: number;
+  title: string;
+  url: string;
+  body?: string | null;
+  projectPath?: string;
+}): string {
+  const forge = forgePresentation(input.forge);
+  const lines = [`${forge.displayName} Issue ${forge.issueNumberPrefix}${input.number}: ${input.title}`, input.url];
+  if (input.projectPath) lines.push(`Project: ${input.projectPath}`);
+  if (input.body) lines.push("", input.body);
+  return lines.join("\n");
+}
+
+/** A code review with its surrounding diff lines, as Paseo's renderer writes it. */
+function renderReviewAttachment(attachment: Extract<ProviderContent, { type: "review" }>): string {
+  const lines = [`Paseo review attachment (${attachment.mode})`, `CWD: ${attachment.cwd}`];
+  if (attachment.baseRef) lines.push(`Base: ${attachment.baseRef}`);
+  attachment.comments.forEach((comment, index) => {
+    lines.push(
+      "",
+      `Comment ${index + 1}: ${comment.filePath}:${comment.side}:${comment.lineNumber}`,
+      comment.body,
+      comment.context.hunkHeader,
+    );
+    const target = comment.context.targetLine;
+    for (const line of comment.context.lines) {
+      const isTarget =
+        line.oldLineNumber === target.oldLineNumber &&
+        line.newLineNumber === target.newLineNumber &&
+        line.type === target.type &&
+        line.content === target.content;
+      const prefix = isTarget ? "> " : "  ";
+      lines.push(
+        `${prefix}${padLineNumber(line.oldLineNumber)} ${padLineNumber(line.newLineNumber)} ${REVIEW_LINE_MARKERS[line.type]}${line.content}`,
+      );
+    }
+  });
+  return lines.join("\n");
+}
+
+/**
+ * Render one Paseo attachment block as the text its own providers send to the
+ * model.
+ *
+ * Ported line-for-line from `@getpaseo/server@0.12.0`
+ * (`dist/server/server/agent/prompt-attachments.js`, `renderPromptAttachmentAsText`),
+ * including the legacy `github_pr`/`github_issue` wire kinds. Text and image
+ * blocks never reach this function: they have native DSH counterparts. An
+ * unknown type throws — Paseo's protocol may grow a block this build cannot
+ * translate, and a prompt silently missing an attachment is worse than a failed
+ * prompt.
+ */
+export function renderPromptAttachmentAsText(block: ProviderContent): string {
+  switch (block.type) {
+    case "forge_change_request":
+      return renderChangeRequestAttachment({
+        forge: block.forge,
+        number: block.number,
+        title: block.title,
+        url: block.url,
+        body: block.body,
+        projectPath: block.projectPath,
+        baseRefName: block.baseRefName,
+        headRefName: block.headRefName,
+      });
+    // COMPAT(githubAttachmentKinds): legacy wire kinds for older clients and
+    // daemons, same window Paseo's own renderer keeps them.
+    case "github_pr":
+      return renderChangeRequestAttachment({
+        forge: "github",
+        number: block.number,
+        title: block.title,
+        url: block.url,
+        body: block.body,
+        baseRefName: block.baseRefName,
+        headRefName: block.headRefName,
+      });
+    case "forge_issue":
+      return renderIssueAttachment({
+        forge: block.forge,
+        number: block.number,
+        title: block.title,
+        url: block.url,
+        body: block.body,
+        projectPath: block.projectPath,
+      });
+    case "github_issue":
+      return renderIssueAttachment({
+        forge: "github",
+        number: block.number,
+        title: block.title,
+        url: block.url,
+        body: block.body,
+      });
+    case "text":
+      return block.text;
+    case "review":
+      return renderReviewAttachment(block);
+    case "uploaded_file":
+      // The file already sits on disk at this absolute path — Paseo does not
+      // inline or copy it, so the path is the whole attachment.
+      return [
+        `Uploaded file: ${block.fileName}`,
+        `Path: ${block.path}`,
+        `MIME: ${block.mimeType}`,
+        `Size: ${block.size} bytes`,
+      ].join("\n");
+    default: {
+      // The protocol is wider than this build's union at runtime. Report the
+      // wire type so the failure names the block the daemon sent.
+      const unknown = block as { type?: unknown };
+      throw new Error(`unsupported prompt content type "${String(unknown.type)}"`);
+    }
+  }
 }
 
 /**

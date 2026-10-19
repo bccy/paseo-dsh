@@ -15,27 +15,49 @@
  *    are asserted by name, and every table entry is asserted to have a value in
  *    *both* languages — an English column that is a copy of the Chinese one is
  *    indistinguishable from a translated one until someone switches.
+ * 3. **Drift from the official catalog.** Paseo 0.12 ships `PASEO_TOOL_CATALOG`
+ *    in `@getpaseo/protocol` (61 tools). The plugin's English MCP column is
+ *    asserted equal to those labels *verbatim* and the icon table is asserted to
+ *    cover every one of them, so a hand-written "nicer" label or a forgotten new
+ *    tool is a test failure instead of a row that reads differently from Paseo's
+ *    own UI. `speak` is Paseo's documented exception (its own `isPaseoToolName`
+ *    excludes it) and is the only entry allowed beyond the catalog.
  *
  * Icon names are Lucide exports of the host bundle, not strings this repo can
  * resolve offline. They were checked against the installed Paseo web bundle with
  * `grep -o ',"<Name>",{enumerable:!0,get:' <web-ui>/index-*.js` (the lucide-react
  * re-export list), so what is asserted here is that each new name *has* an icon,
- * not that the host can draw it.
+ * not that the host can draw it. That grep was also run for the four browser
+ * action glyphs added in 0.12 (`ArrowLeft`, `ArrowRight`, `RotateCw`,
+ * `MousePointer`).
  *
  * Run (from paseo-plugin):
  *   npx tsc client/locale.ts client/tool-call-data.ts \
- *     --outDir .dbg --rootDir . --module commonjs --moduleResolution node \
+ *     --outDir .dbg --rootDir . --module node16 --moduleResolution node16 \
  *     --target ES2022 --skipLibCheck
  *   echo '{"type":"commonjs"}' > .dbg/package.json
  *   cp ../harness/locale-check.cjs .dbg/
  *   cd .dbg && node locale-check.cjs
+ *
+ * `--module node16` is required, not cosmetic: `client/tool-call-data.ts` reads
+ * the 0.12 `AgentMessage` type from the protocol package's ESM declarations, and
+ * node16 is the resolution mode that honours its `exports` map while still
+ * emitting CommonJS for this harness to `require`. The source carries the
+ * matching `resolution-mode` attribute.
  *
  * Only pure modules are compiled: the React renderers import the host runtime,
  * which plain `node` resolution cannot see.
  */
 "use strict";
 
-const { allText, currentLocale, localeFromMetadata, resolveLocale, setLocale } = require("./client/locale.js");
+const {
+  AGENT_MESSAGE_EVENTS,
+  allText,
+  currentLocale,
+  localeFromMetadata,
+  resolveLocale,
+  setLocale,
+} = require("./client/locale.js");
 const { TOOL_ICON_NAMES, toolCallData, toolIcon, toolLabel } = require("./client/tool-call-data.js");
 
 let passed = 0;
@@ -138,7 +160,7 @@ console.log("the two tables carry the same keys");
   equal("both languages are shipped, under the ids the server uses", Object.keys(allText()).sort(), [...LOCALES].sort());
   equal("top-level keys match", Object.keys(en).sort(), Object.keys(zh).sort());
 
-  for (const table of ["toolLabels", "paseoMcpLabels", "bodyLabels"]) {
+  for (const table of ["toolLabels", "paseoMcpLabels", "agentMessageEvents", "bodyLabels"]) {
     equal(`${table} keys match`, Object.keys(en[table]).sort(), Object.keys(zh[table]).sort());
     equal(`${table} is not empty`, Object.keys(en[table]).length > 0, true);
     for (const locale of LOCALES) {
@@ -173,6 +195,111 @@ console.log("every tool that draws an icon can also name itself");
     (name) => `${name} (${en[name] === undefined ? "en" : ""}${zh[name] === undefined ? "zh" : ""})`,
   );
   equal("every tool with an icon has a label in both languages", missing, []);
+}
+
+console.log("the Paseo tool table matches the official catalog (0.12)");
+{
+  // `@getpaseo/protocol` is ESM; Node >= 20.19 can `require` it from this CJS
+  // harness. A missing module is a failed assertion, not a crash — the checks
+  // below simply cannot run without it, which is exactly the state to report.
+  let catalog;
+  try {
+    catalog = require("@getpaseo/protocol/paseo-tool-presentation/catalog").PASEO_TOOL_CATALOG;
+  } catch (error) {
+    console.log(`  (could not load the official catalog: ${error.message})`);
+  }
+  check(
+    "the official catalog is loadable",
+    catalog !== undefined && Object.keys(catalog).length > 0,
+    catalog === undefined ? "require failed" : `${Object.keys(catalog).length} tools`,
+  );
+
+  if (catalog !== undefined) {
+    const officialNames = Object.keys(catalog);
+    const en = allText().en.paseoMcpLabels;
+    const zh = allText()["zh-CN"].paseoMcpLabels;
+
+    const missing = officialNames.filter(
+      (name) => typeof en[name] !== "string" || typeof zh[name] !== "string",
+    );
+    equal("every official tool has a label in both languages", missing, []);
+
+    // The English column is not a translation target: it is the catalog itself.
+    const drifted = officialNames
+      .filter((name) => en[name] !== catalog[name].label)
+      .map((name) => `${name}: ${JSON.stringify(en[name])} != ${JSON.stringify(catalog[name].label)}`);
+    equal("the English column is the official label, verbatim", drifted, []);
+
+    const copied = officialNames.filter((name) => zh[name] === en[name]);
+    equal("no Chinese label is a copy of the English one", copied, []);
+
+    // Paseo's own `isPaseoToolName` exempts `speak`; the plugin's table follows
+    // that, so it is the one entry allowed beyond the catalog.
+    const extra = Object.keys(en)
+      .filter((name) => catalog[name] === undefined)
+      .sort();
+    equal("speak is the only tool beyond the official catalog", extra, ["speak"]);
+
+    // Every official tool must resolve to a glyph of its own: `Wrench` is the
+    // fallback, and a row that draws it is the silent gap this file exists for.
+    const iconless = [...officialNames, "speak"].filter(
+      (name) => toolIcon(`mcp__paseo__${name}`, { type: "unknown" }) === "Wrench",
+    );
+    equal("every Paseo tool draws its own glyph (none falls to the wrench)", iconless, []);
+
+    // The four tools 0.12 gave an action glyph instead of the family's page one.
+    // `tool-call-check.cjs` pins the same four; this keeps the *coverage* claim
+    // above honest for the ones that used to be missing entirely.
+    const actionGlyphs = {
+      browser_back: "ArrowLeft",
+      browser_forward: "ArrowRight",
+      browser_hover: "MousePointer",
+      browser_reload: "RotateCw",
+    };
+    const wrongGlyph = Object.entries(actionGlyphs)
+      .filter(([name, glyph]) => toolIcon(`mcp__paseo__${name}`, { type: "unknown" }) !== glyph)
+      .map(([name, glyph]) => `${name}: ${toolIcon(`mcp__paseo__${name}`, { type: "unknown" })} != ${glyph}`);
+    equal("the four browser action tools draw their own glyph", wrongGlyph, []);
+  }
+}
+
+console.log("the agent-message headings are complete in both languages");
+{
+  // The row head is `event · sender`; the five event headings come from the
+  // protocol's own `buildAgentMessageDisplay`, and `agent-message-check.cjs`
+  // compares the English ones against that model. What is checked here is the
+  // table's own shape: the protocol's five keys, a value in both languages, and
+  // a real translation rather than a copied column.
+  const en = allText().en.agentMessageEvents;
+  const zh = allText()["zh-CN"].agentMessageEvents;
+  equal(
+    "the table's keys are the protocol's five events",
+    Object.keys(en).sort(),
+    [...AGENT_MESSAGE_EVENTS].sort(),
+  );
+  for (const event of AGENT_MESSAGE_EVENTS) {
+    check(
+      `${event} is labelled in both languages`,
+      typeof en[event] === "string" &&
+        en[event].trim() !== "" &&
+        typeof zh[event] === "string" &&
+        zh[event].trim() !== "",
+      JSON.stringify([en[event], zh[event]]),
+    );
+    check(`${event} is translated, not copied`, en[event] !== zh[event], JSON.stringify(en[event]));
+  }
+  const fallbackEn = allText().en.agentMessageFallback;
+  const fallbackZh = allText()["zh-CN"].agentMessageFallback;
+  check(
+    "an unknown event has a generic heading in both languages",
+    fallbackEn.trim() !== "" && fallbackZh.trim() !== "" && fallbackEn !== fallbackZh,
+    JSON.stringify([fallbackEn, fallbackZh]),
+  );
+  check(
+    "the generic heading is not one of the five event labels",
+    !AGENT_MESSAGE_EVENTS.some((event) => en[event] === fallbackEn || zh[event] === fallbackZh),
+    fallbackEn,
+  );
 }
 
 console.log("the tools that used to render as wire names + a wrench");

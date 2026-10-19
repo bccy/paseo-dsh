@@ -41,8 +41,18 @@
  *   `row.title`. The three MCP-resource tools have no DSH title at all — DSH
  *   renders them as a generic row — so their labels are the short form of the
  *   tool's own registered description in `dsh-mcp-resources`.
- * - `paseoMcpLabels`: Paseo's English `title` for each MCP tool, in Chinese
- *   (that table's existing convention) and back in English beside it.
+ * - `paseoMcpLabels`: the English label is the official `PASEO_TOOL_CATALOG`
+ *   entry from `@getpaseo/protocol@0.12.0`, verbatim; the Chinese column is a
+ *   translation of that label. `harness/locale-check.cjs` compares the English
+ *   column against the catalog, so a "nicer" wording here is a test failure,
+ *   not an improvement. `speak` is the one tool outside the catalog (Paseo's
+ *   own `isPaseoToolName` exempts it too), kept because a daemon can still send
+ *   it.
+ * - `agentMessageEvents` / `agentMessageFallback`: the five headings of 0.12's
+ *   agent-to-agent message rows, taken from the protocol's own
+ *   `buildAgentMessageDisplay` (`EVENT_LABELS`: "Message received", "Agent
+ *   finished", "Agent errored", "Agent needs permission", "Agent closed"), plus
+ *   the generic heading a row whose event is unknown or missing degrades to.
  * - `bodyLabels`: block captions. The current renderer does not draw them
  *   (`bodyLabel` is a contract field the row never reads), so they are carried
  *   for completeness only.
@@ -51,6 +61,25 @@
  */
 
 export type Locale = "en" | "zh-CN";
+
+/**
+ * The event a 0.12 agent-to-agent message row reports.
+ *
+ * The five values are the protocol's own `AgentMessage.event` enum
+ * (`@getpaseo/protocol`'s `agent-message`). Written out here rather than
+ * imported so this module stays a pure copy table; a value the protocol adds
+ * later degrades to `agentMessageFallback` instead of rendering nothing.
+ */
+export type AgentMessageEvent = "message" | "finished" | "errored" | "permission-required" | "closed";
+
+/** Every event the row can label, in the protocol's own order. */
+export const AGENT_MESSAGE_EVENTS: readonly AgentMessageEvent[] = Object.freeze([
+  "message",
+  "finished",
+  "errored",
+  "permission-required",
+  "closed",
+]);
 
 /**
  * The locale these rows render in until something tells the client otherwise.
@@ -71,6 +100,8 @@ export interface BodyLabels {
   response: string;
   log: string;
   plan: string;
+  /** An agent-to-agent message's own text (0.12's `agent_message` row). */
+  message: string;
 }
 
 /** Everything the client renders that is language-dependent. */
@@ -79,6 +110,10 @@ export interface UiText {
   toolLabels: Record<string, string>;
   /** Row label per Paseo MCP tool, keyed by the bare name after `mcp__paseo__`. */
   paseoMcpLabels: Record<string, string>;
+  /** Head label of an agent-to-agent message row, per protocol event. */
+  agentMessageEvents: Record<AgentMessageEvent, string>;
+  /** Head label when that row's event is unknown or missing. */
+  agentMessageFallback: string;
   /** Captions for an expanded block. */
   bodyLabels: BodyLabels;
   /** Label of a reasoning row. DSH titles every one of them `思考`. */
@@ -180,63 +215,71 @@ const TEXT: Record<Locale, UiText> = {
       archive_workspace: "Archive workspace",
       rename_workspace: "Rename workspace",
       create_agent: "Create agent",
-      send_agent_prompt: "Send an agent a task",
-      get_agent_status: "Get agent status",
+      send_agent_prompt: "Send message",
+      get_agent_status: "Check agent",
       list_agents: "List agents",
-      cancel_agent: "Cancel the agent's turn",
+      cancel_agent: "Cancel agent",
       archive_agent: "Archive agent",
-      kill_agent: "Terminate agent session",
+      kill_agent: "Kill agent",
       update_agent: "Update agent",
       set_agent_mode: "Set agent mode",
       get_agent_activity: "Read agent activity",
-      list_workspace_scripts: "List workspace scripts",
-      start_workspace_script: "Start workspace script",
-      stop_workspace_script: "Stop workspace script",
+      list_workspace_scripts: "List scripts",
+      start_workspace_script: "Start script",
+      stop_workspace_script: "Stop script",
       list_terminals: "List terminals",
       create_terminal: "Create terminal",
-      kill_terminal: "Close terminal",
-      capture_terminal: "Read terminal output",
-      send_terminal_keys: "Send terminal keys",
-      create_schedule: "Create reminder",
+      kill_terminal: "Kill terminal",
+      capture_terminal: "Read terminal",
+      send_terminal_keys: "Send keys",
+      create_schedule: "Create schedule",
       create_heartbeat: "Create heartbeat",
       delete_heartbeat: "Delete heartbeat",
-      list_schedules: "List reminders",
-      inspect_schedule: "Inspect reminder",
-      pause_schedule: "Pause reminder",
-      resume_schedule: "Resume reminder",
-      delete_schedule: "Delete reminder",
-      update_schedule: "Update reminder",
-      schedule_logs: "Reminder logs",
-      run_schedule_once: "Run reminder once",
+      list_schedules: "List schedules",
+      inspect_schedule: "Inspect schedule",
+      pause_schedule: "Pause schedule",
+      resume_schedule: "Resume schedule",
+      delete_schedule: "Delete schedule",
+      update_schedule: "Update schedule",
+      schedule_logs: "Read schedule logs",
+      run_schedule_once: "Run schedule",
       list_providers: "List providers",
       list_models: "List models",
-      list_profiles: "List agent profiles",
+      list_profiles: "List profiles",
       inspect_provider: "Inspect provider",
-      list_pending_permissions: "List pending permissions",
-      respond_to_permission: "Respond to a permission request",
+      list_pending_permissions: "List permissions",
+      respond_to_permission: "Respond to permission",
       browser_list_tabs: "List browser tabs",
-      browser_new_tab: "Open a browser tab",
+      browser_new_tab: "Open browser tab",
       browser_close_tab: "Close browser tab",
-      browser_snapshot: "Read page structure",
-      browser_screenshot: "Screenshot the page",
-      browser_navigate: "Open a URL",
-      browser_back: "Browser back",
-      browser_forward: "Browser forward",
-      browser_reload: "Browser reload",
-      browser_click: "Click a page element",
-      browser_fill: "Fill a page element",
-      browser_hover: "Hover browser element",
+      browser_snapshot: "Snapshot page",
+      browser_screenshot: "Take screenshot",
+      browser_navigate: "Navigate",
+      browser_back: "Go back",
+      browser_forward: "Go forward",
+      browser_reload: "Reload page",
+      browser_click: "Click element",
+      browser_fill: "Fill field",
+      browser_hover: "Hover element",
       browser_type: "Type text",
-      browser_keypress: "Send a key",
-      browser_select: "Select a dropdown option",
-      browser_drag: "Drag a page element",
-      browser_scroll: "Scroll the page",
-      browser_resize: "Resize the viewport",
-      browser_upload: "Upload a file",
-      browser_wait: "Wait for a page condition",
-      browser_logs: "Read page logs",
-      browser_evaluate: "Run a page script",
+      browser_keypress: "Press key",
+      browser_select: "Select option",
+      browser_drag: "Drag element",
+      browser_scroll: "Scroll page",
+      browser_resize: "Resize browser",
+      browser_upload: "Upload files",
+      browser_wait: "Wait for page",
+      browser_logs: "Read browser logs",
+      browser_evaluate: "Run JavaScript",
     },
+    agentMessageEvents: {
+      message: "Message received",
+      finished: "Agent finished",
+      errored: "Agent errored",
+      "permission-required": "Agent needs permission",
+      closed: "Agent closed",
+    },
+    agentMessageFallback: "Agent message",
     bodyLabels: {
       output: "Output",
       content: "Content",
@@ -246,6 +289,7 @@ const TEXT: Record<Locale, UiText> = {
       response: "Response",
       log: "Log",
       plan: "Plan",
+      message: "Message",
     },
     thinking: "Thinking",
     expandThinking: "Expand thinking",
@@ -330,23 +374,23 @@ const TEXT: Record<Locale, UiText> = {
       archive_workspace: "归档工作区",
       rename_workspace: "重命名工作区",
       create_agent: "创建 agent",
-      send_agent_prompt: "给 agent 发任务",
+      send_agent_prompt: "发送消息",
       get_agent_status: "查看 agent 状态",
       list_agents: "列出 agent",
-      cancel_agent: "取消 agent 当前回合",
+      cancel_agent: "取消 agent",
       archive_agent: "归档 agent",
-      kill_agent: "终止 agent 会话",
+      kill_agent: "终止 agent",
       update_agent: "更新 agent",
       set_agent_mode: "切换 agent 模式",
       get_agent_activity: "查看 agent 活动",
-      list_workspace_scripts: "列出工作区脚本",
-      start_workspace_script: "启动工作区脚本",
-      stop_workspace_script: "停止工作区脚本",
+      list_workspace_scripts: "列出脚本",
+      start_workspace_script: "启动脚本",
+      stop_workspace_script: "停止脚本",
       list_terminals: "列出终端",
       create_terminal: "创建终端",
       kill_terminal: "关闭终端",
-      capture_terminal: "读取终端输出",
-      send_terminal_keys: "向终端发送按键",
+      capture_terminal: "读取终端",
+      send_terminal_keys: "发送按键",
       create_schedule: "创建定时任务",
       create_heartbeat: "创建心跳",
       delete_heartbeat: "删除心跳",
@@ -356,37 +400,45 @@ const TEXT: Record<Locale, UiText> = {
       resume_schedule: "恢复定时任务",
       delete_schedule: "删除定时任务",
       update_schedule: "更新定时任务",
-      schedule_logs: "定时任务日志",
-      run_schedule_once: "立即运行一次定时任务",
+      schedule_logs: "读取定时任务日志",
+      run_schedule_once: "立即运行定时任务",
       list_providers: "列出 provider",
       list_models: "列出模型",
-      list_profiles: "列出 agent 配置档",
+      list_profiles: "列出配置档",
       inspect_provider: "查看 provider",
       list_pending_permissions: "列出待审批请求",
       respond_to_permission: "响应审批请求",
       browser_list_tabs: "列出浏览器标签页",
-      browser_new_tab: "新建浏览器标签页",
+      browser_new_tab: "打开浏览器标签页",
       browser_close_tab: "关闭浏览器标签页",
-      browser_snapshot: "读取页面结构",
+      browser_snapshot: "页面快照",
       browser_screenshot: "页面截图",
-      browser_navigate: "打开网址",
-      browser_back: "浏览器后退",
-      browser_forward: "浏览器前进",
-      browser_reload: "刷新浏览器页面",
-      browser_click: "点击页面元素",
-      browser_fill: "填写页面元素",
-      browser_hover: "悬停页面元素",
+      browser_navigate: "导航",
+      browser_back: "后退",
+      browser_forward: "前进",
+      browser_reload: "刷新页面",
+      browser_click: "点击元素",
+      browser_fill: "填写输入框",
+      browser_hover: "悬停元素",
       browser_type: "输入文本",
-      browser_keypress: "发送按键",
-      browser_select: "选择下拉项",
-      browser_drag: "拖拽页面元素",
+      browser_keypress: "按下按键",
+      browser_select: "选择选项",
+      browser_drag: "拖拽元素",
       browser_scroll: "滚动页面",
-      browser_resize: "调整视口大小",
+      browser_resize: "调整浏览器窗口",
       browser_upload: "上传文件",
-      browser_wait: "等待页面条件",
-      browser_logs: "读取页面日志",
-      browser_evaluate: "执行页面脚本",
+      browser_wait: "等待页面",
+      browser_logs: "读取浏览器日志",
+      browser_evaluate: "执行 JavaScript",
     },
+    agentMessageEvents: {
+      message: "收到消息",
+      finished: "智能体已完成",
+      errored: "智能体出错",
+      "permission-required": "智能体需要授权",
+      closed: "智能体已关闭",
+    },
+    agentMessageFallback: "智能体消息",
     bodyLabels: {
       output: "输出",
       content: "内容",
@@ -396,6 +448,7 @@ const TEXT: Record<Locale, UiText> = {
       response: "响应",
       log: "日志",
       plan: "计划",
+      message: "消息",
     },
     thinking: "思考",
     expandThinking: "展开思考",
@@ -467,6 +520,24 @@ export function currentLocale(): Locale {
 /** The copy for the current locale. Read it per render, never hoist it. */
 export function localeText(): UiText {
   return TEXT[currentLocale()];
+}
+
+/**
+ * The head label of an agent-to-agent message row.
+ *
+ * `event` is the protocol's `AgentMessage.event`, but it is typed `string` here
+ * on purpose: history from an older or newer daemon can carry a value this
+ * table does not know, and the row must degrade to a generic heading rather
+ * than show nothing (or throw). Read through `localeText()` per call, like the
+ * rest of this module.
+ */
+export function agentMessageLabel(event: unknown): string {
+  const text = localeText();
+  if (typeof event === "string") {
+    const known = (text.agentMessageEvents as Record<string, string>)[event];
+    if (known !== undefined) return known;
+  }
+  return text.agentMessageFallback;
 }
 
 /** Every locale's copy. Exported so the harness can compare the tables. */

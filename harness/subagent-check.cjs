@@ -217,14 +217,15 @@ async function openSession(conn, sessionId, history) {
     clearedBySteer.sessionId,
   );
 
-  // ---- a block DSH has no counterpart for fails the *prompt* --------------
-  // Paseo's `ProviderContent` is wider than DSH's block set (`uploaded_file`,
-  // `review`, `forge_*`, `github_*` all ride in on the same prompt, and only
-  // `image` is capability-gated). A throw out of the translation used to escape
+  // ---- a block this build cannot translate fails the *prompt* -------------
+  // Paseo's `ProviderContent` is wider than DSH's block set, but the attachment
+  // kinds it carries today (`uploaded_file`, `review`, `forge_*`, `github_*`)
+  // are rendered to text, so they no longer fail — only a block this build has
+  // no rendering for does. A throw out of the translation used to escape
   // `prompt()` entirely and surface as `session.runtime_failed`, which the daemon
   // treats as terminal: it rejects the pending prompt, drops the session and
   // spawns a fresh `dsh` for the same native id, while the old process and this
-  // DshSession stayed behind. One unsupported block ended the conversation.
+  // DshSession stayed behind. One untranslatable block ended the conversation.
   const badBlock = "bad-block-1";
   const beforeBadBlock = events.length;
   await conn.send({
@@ -236,7 +237,7 @@ async function openSession(conn, sessionId, history) {
         type: "message",
         content: [
           { type: "text", text: "look at this" },
-          { type: "uploaded_file", mimeType: "application/pdf", data: "x" },
+          { type: "mystery_attachment", payload: "x" },
         ],
       },
     },

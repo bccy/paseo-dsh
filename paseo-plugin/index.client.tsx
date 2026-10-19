@@ -70,6 +70,11 @@ export default function contribute(client: PluginClientContext) {
             type: "plugin",
             kind: "dsh-tool",
             version: 1,
+            // The item is forwarded whole, never field-picked: 0.12 projects an
+            // agent-to-agent message as a tool call whose meaning lives on
+            // `item.agentMessage` (the `plain_text` detail beside it is only an
+            // echo), and `toolCallData` reads it from there. Picking `name` /
+            // `detail` / `metadata` here would drop that half silently.
             data: { ...toolCallData(item, phase) },
           },
         ],
