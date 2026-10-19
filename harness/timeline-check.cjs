@@ -331,7 +331,9 @@ console.log("every detail branch carries what it claims");
 
   const asked = runTool("ask_user_question", { questions: [] }, "answered").detail;
   check("ask_user_question: type", asked.type === "plain_text");
-  check("ask_user_question: label is DSH's ask.rowTitle", asked.label === DSH_TOOL_TITLES.askUser, asked.label);
+  // No questions means no derived title: fall back to DSH's own row title, which
+  // the client dedupes with the identity label (head = just 「提问」).
+  check("ask_user_question: no questions falls back to DSH's ask.rowTitle", asked.label === DSH_TOOL_TITLES.askUser, asked.label);
   check("ask_user_question: a call with no questions has no body", asked.text === "", JSON.stringify(asked.text));
 
   // Paseo's own Codex adapter writes the prompts *and* the answers into this
@@ -353,6 +355,28 @@ console.log("every detail branch carries what it claims");
     askedDetailed.text ===
       "Pick: Which one?\nOptions: yes, no\n\nNote: Anything else?\n\nAnswers:\nq1: yes\nq2: a note",
     JSON.stringify(askedDetailed.text),
+  );
+  check(
+    "ask_user_question: the head's second half is the first question's header",
+    askedDetailed.label === "Pick",
+    askedDetailed.label,
+  );
+  const askedNoHeader = runTool(
+    "ask_user_question",
+    { questions: [{ id: "q1", question: "Which one?" }] },
+    "not json at all",
+  ).detail;
+  check(
+    "ask_user_question: a headerless question titles the row with its prompt",
+    askedNoHeader.label === "Which one?",
+    askedNoHeader.label,
+  );
+  const longQuestion = "x".repeat(200);
+  const askedLong = runTool("ask_user_question", { questions: [{ question: longQuestion }] }, "ok").detail;
+  check(
+    "ask_user_question: a long prompt is cut to a readable title",
+    askedLong.label.length === 81 && askedLong.label.endsWith("…"),
+    `${askedLong.label.length} chars`,
   );
   const askedUnanswered = runTool(
     "ask_user_question",

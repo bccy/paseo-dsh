@@ -230,6 +230,31 @@ function stringField(source: Record<string, unknown>, key: string): string | und
   return typeof value === "string" && value !== "" ? value : undefined;
 }
 
+/** Cap for a question-derived row title; longer prompts are cut with an ellipsis. */
+const QUESTION_TITLE_LIMIT = 80;
+
+/**
+ * The first question's `header` (or its prompt) as the row's second half.
+ *
+ * A `plain_text` row's head is `label · summary`: `label` comes from the tool's
+ * own title (「提问」) and `summary` from this detail's `label`. Leaving DSH's
+ * generic row title there made both halves identical — the client dedupes them —
+ * so the row read just 「提问」 and the question itself only appeared after
+ * expanding. The question header is the title the user is actually looking for;
+ * the prompt is the fallback when the caller gave no header.
+ */
+function questionRowTitle(input: Record<string, unknown>): string | undefined {
+  const questions = Array.isArray(input.questions) ? input.questions : [];
+  for (const question of questions) {
+    if (!isRecord(question)) continue;
+    const title = stringField(question, "header") ?? stringField(question, "question");
+    const trimmed = title?.trim() ?? "";
+    if (trimmed === "") continue;
+    return trimmed.length > QUESTION_TITLE_LIMIT ? `${trimmed.slice(0, QUESTION_TITLE_LIMIT)}…` : trimmed;
+  }
+  return undefined;
+}
+
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
@@ -613,19 +638,25 @@ function toolDetail(name: string, input: Record<string, unknown>, output?: strin
       };
     case "todo_write":
       return { type: "plain_text", label: UI.toolLabels.updateTasks, icon: "sparkles" };
-    case "ask_user_question":
+    case "ask_user_question": {
       // Paseo's own Codex adapter fills this row's text with the prompts *and*
       // the answers (`mapCodexQuestionRequestToToolCall`). Without them the row
       // expands onto nothing, and — because the permission card is transient and
       // never replayed — a reopened session could not say what was asked or what
       // was chosen. Both halves are already in hand: the questions ride on the
       // call's arguments, the answers are the result's JSON body.
+      //
+      // The label is the row's second half, not the body title: use the first
+      // question's header/prompt so the head reads 「提问 · <问题标题>」. No
+      // questions falls back to DSH's own row title (then the client dedupes the
+      // two halves and the head is just 「提问」).
       return {
         type: "plain_text",
-        label: UI.toolLabels.askedUser,
+        label: questionRowTitle(input) ?? UI.toolLabels.askedUser,
         icon: "sparkles",
         text: askedAndAnswered(input, output),
       };
+    }
     case "exit_plan_mode":
       // Paseo renders this as the readable plan card, and its own Codex adapter
       // emits the same item next to the approval buttons. The plan has to be
