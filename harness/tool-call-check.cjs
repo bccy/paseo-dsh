@@ -15,7 +15,7 @@
  * 「更新任务清单 · 更新任务清单」).
  *
  * Run (from paseo-plugin):
- *   npx tsc client/tool-call-data.ts client/tokens.ts \
+ *   npx tsc client/tool-call-data.ts client/tokens.ts client/paseo-mark.ts \
  *     --outDir .dbg --rootDir . --module commonjs --moduleResolution node \
  *     --target ES2022 --skipLibCheck
  *   echo '{"type":"commonjs"}' > .dbg/package.json
@@ -23,9 +23,10 @@
  *   cd .dbg && node tool-call-check.cjs
  *
  * Only the pure modules are compiled: the React renderer imports the host
- * runtime, which plain `node` resolution cannot see. `tokens.ts` comes along
- * because `diffStat()` reading the generated diff body is exactly the claim
- * being checked.
+ * runtime, which plain `node` resolution cannot see. `tokens.ts` and
+ * `paseo-mark.ts` come along because `diffStat()` and the Paseo-mark fallback
+ * are exactly the claims being checked (this script requires both directly, and
+ * `tsc` only emits modules it was handed or that are imported transitively).
  */
 "use strict";
 
@@ -493,6 +494,34 @@ console.log("DSH's own tools are not anonymous");
     check(`${bare} keeps no glyph, so it draws Paseo's mark`, row.icon === "Wrench" && row.paseoMark === true);
     check(`${bare} no longer prints its wire name`, row.label !== `mcp__paseo__${bare}`, row.label);
   }
+  // The bridge's MCP gateway exposes three meta tools; a proxied call carries
+  // the real Paseo tool in its input. The row should keep the underlying tool's
+  // icon/label, not the generic meta one.
+  const gatewayDetail = { type: "unknown", input: { server: "paseo", tool: "delete_heartbeat" } };
+  equal("a gateway call borrows the proxied tool's icon", toolIcon("mcp_call_tool", gatewayDetail), "HeartPulse");
+  equal("and its Chinese label", toolLabel("mcp_call_tool", gatewayDetail), "删除心跳");
+  equal(
+    "the gateway row falls back to its own label for an unknown target",
+    toolLabel("mcp_call_tool", { type: "unknown", input: { server: "paseo", tool: "not_a_paseo_tool" } }),
+    "调用 MCP 工具",
+  );
+  equal(
+    "another server's proxied call keeps the meta icon",
+    toolIcon("mcp_call_tool", { type: "unknown", input: { server: "other", tool: "delete_heartbeat" } }),
+    "Play",
+  );
+  equal("a gateway call with no detail keeps the meta icon", toolIcon("mcp_call_tool", undefined), "Play");
+  const gatewayRow = toolCallData(
+    {
+      name: "mcp_call_tool",
+      status: "completed",
+      detail: { type: "unknown", input: { server: "paseo", tool: "create_heartbeat" }, output: { ok: true } },
+    },
+    "complete",
+  );
+  check("the rendered gateway row borrows the proxied icon", gatewayRow.icon === "HeartPulse", gatewayRow.icon);
+  check("and its label", gatewayRow.label === "创建心跳", gatewayRow.label);
+
   // Anything we do not know keeps its wire name rather than losing its identity.
   equal(
     "an unknown Paseo tool falls back to the wire name",

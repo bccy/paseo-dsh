@@ -845,10 +845,20 @@ export const TOOL_ICON_NAMES: readonly string[] = Object.freeze(Object.keys(TOOL
 /**
  * Human label for a tool call, falling back to its raw name.
  *
+ * `detail` lets a gateway meta-call borrow the label of the Paseo tool it
+ * proxies: the row the user sees is `mcp_call_tool`, but
+ * `{"server":"paseo","tool":"delete_heartbeat"}` in its input names the tool
+ * whose own label («删除心跳») is the useful one.
+ *
  * Read through `localeText()` on every call: the tables live in `./locale`, one
  * per language, and a locale relayed after import must apply to the next row.
  */
-export function toolLabel(name: string): string {
+export function toolLabel(name: string, detail?: ToolDetail): string {
+  const gateway = gatewayPaseoTool(name, detail);
+  if (gateway !== undefined) {
+    const label = paseoMcpLabel(gateway);
+    if (label !== undefined) return label;
+  }
   return localeText().toolLabels[name] ?? paseoMcpLabel(name) ?? name;
 }
 
@@ -911,8 +921,12 @@ export function toolIcon(name: string, detail: ToolDetail | undefined): string {
   if (normalized === "speak") return "MicVocal";
   if (normalized === "task") return "Bot";
   // Only for `unknown` details: a typed detail (shell/read/edit/…) already
-  // carries a better icon than the tool's name would suggest.
-  const named = TOOL_NAME_ICONS[normalized] ?? paseoMcpIcon(name);
+  // carries a better icon than the tool's name would suggest. A gateway
+  // meta-call borrows the proxied Paseo tool's icon when its input names one.
+  const gateway = gatewayPaseoTool(name, detail);
+  const named = (gateway === undefined ? undefined : paseoMcpIcon(gateway))
+    ?? TOOL_NAME_ICONS[normalized]
+    ?? paseoMcpIcon(name);
   if (named !== undefined && (detail === undefined || detail.type === "unknown")) return named;
   if (detail !== undefined && typeof detail.type === "string") {
     return DETAIL_ICONS[detail.type] ?? "Wrench";
@@ -1071,6 +1085,31 @@ export function paseoMcpLabel(name: string): string | undefined {
 export function paseoMcpIcon(name: string): string | undefined {
   const bare = paseoMcpName(name);
   return bare === undefined ? undefined : PASEO_MCP_ICONS[bare];
+}
+
+/**
+ * The Paseo MCP tool a gateway meta-call proxies, as a wire name, or undefined.
+ *
+ * The bridge's MCP gateway exposes `mcp_list_tools` / `mcp_tool_schema` /
+ * `mcp_call_tool` instead of Paseo's ~60 tools (context budget), so the row's
+ * tool name is the meta tool and the real target rides in its `arguments`.
+ * Without this hop the row kept the generic meta icon/label even though the
+ * mapping for the underlying tool exists. Only `mcp_call_tool` proxies a call;
+ * the list and schema meta tools stay generic on purpose.
+ *
+ * A missing `server` means the single server Paseo injected ("paseo"); any other
+ * server keeps the generic row, because its tools are not in our tables.
+ */
+function gatewayPaseoTool(name: string, detail: ToolDetail | undefined): string | undefined {
+  if (name.trim().toLowerCase() !== "mcp_call_tool") return undefined;
+  if (detail === undefined || detail.type !== "unknown") return undefined;
+  const input = detail.input;
+  if (!isRecord(input)) return undefined;
+  const tool = typeof input.tool === "string" ? input.tool.trim() : "";
+  if (tool === "") return undefined;
+  const server = typeof input.server === "string" ? input.server.trim().toLowerCase() : "";
+  if (server !== "" && server !== "paseo" && !server.startsWith("paseo_")) return undefined;
+  return `mcp__paseo__${tool}`;
 }
 
 /** Normalize one Paseo tool-call item into JSON-safe render data. */
@@ -1236,7 +1275,7 @@ export function toolCallData(
   // Draw Paseo's mark there instead, so it still reads as Paseo's rather than as
   // unknown; a tool we do have a glyph for keeps it (the mark is coarser).
   const paseoMark = icon === "Wrench" && isPaseoToolName(item.name);
-  const label = toolLabel(item.name);
+  const label = toolLabel(item.name, detail);
   const rawSummary = truncate(description === "" ? primary : description);
   // The head reads `label · summary`. Two halves saying the same sentence prints
   // the same line twice — every `/command` row did (`/compact · /compact`), and
