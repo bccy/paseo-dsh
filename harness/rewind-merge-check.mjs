@@ -24,6 +24,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FileSnapshots, isTrackedTool, resolveMutationPath } from '../dsh-bridge/lib/file-snapshots.js';
 import { isDelegatedSession, rootSessionFor, snapshotOwnerKey } from '../dsh-bridge/lib/snapshot-owners.js';
+import { ChildAnchors } from '../dsh-bridge/lib/child-anchors.js';
 
 const results = [];
 const check = (name, pass, detail) => {
@@ -138,6 +139,33 @@ check(
   JSON.stringify(sameCallAcrossSessions),
 );
 check('and the same session+callId is stable', sameCallAcrossSessions.a === sameCallAcrossSessions.again);
+
+console.log('== delegated turn anchors ==');
+const anchors = new ChildAnchors();
+check('a child\'s turn start records its dispatch anchor', anchors.record(child.id, 12) === true && anchors.anchorFor(child.id) === 12);
+check('a resumed run refreshes the anchor', anchors.record(child.id, 40) === true && anchors.anchorFor(child.id) === 40);
+check(
+  'an invalid anchor is ignored',
+  anchors.record('bad-child', Number.NaN) === false && anchors.record('', 12) === false && anchors.anchorFor('bad-child') === undefined,
+);
+check('an unobserved child has no anchor', anchors.anchorFor('never-started') === undefined);
+anchors.record(child.id, 12);
+anchors.record(grand.id, 12);
+check(
+  'a rewind at the dispatch message withdraws those children',
+  anchors.withdrawnSince(12).includes(child.id) && anchors.withdrawnSince(12).includes(grand.id),
+  JSON.stringify(anchors.withdrawnSince(12)),
+);
+check('a rewind to a later message leaves them running', anchors.withdrawnSince(13).length === 0);
+check('an invalid target withdraws nothing', anchors.withdrawnSince(Number.NaN).length === 0);
+// The snapshot anchor rule: a delegated edit takes the recorded dispatch anchor
+// even when a newer human message has arrived (the M2 cross-turn case).
+const delegatedAnchor = anchors.anchorFor(child.id);
+check(
+  'a delegated edit anchors to its dispatch turn, not the newest message',
+  delegatedAnchor === 12,
+  JSON.stringify({ delegatedAnchor, newestHuman: 33 }),
+);
 
 console.log('== journal attribution ==');
 const createdByChild = join(workspace, 'child-created.txt');

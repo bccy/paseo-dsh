@@ -226,6 +226,18 @@ export class DshSession {
   #turnEndState: { state: "completed" | "canceled" | "failed"; error?: string } | null = null;
   #replaySeq = 0;
   /**
+   * Whether this session adopted a parked `dsh` process (what the rewind
+   * refresh's close/reopen does) instead of cold-starting one.
+   *
+   * An adopted process never stopped: its running child agents kept running
+   * while this provider session was closed, so a child's open turn is live
+   * evidence even though the bridge announced that child to the *previous*
+   * provider session and will not announce it again. A cold start keeps the old
+   * rule — a child log that stops inside a turn with no live channel is a killed
+   * child and closes as canceled (see `replaySubagents`).
+   */
+  #adoptedParkedProcess = false;
+  /**
    * Pending question cards keyed by permission id, remembering which session
    * (root or a native subagent child) asked so the resolution is attributed
    * back to the same session.
@@ -318,6 +330,7 @@ export class DshSession {
     // moment its handlers are re-pointed. A dead adoption would produce a session
     // that never answers; cold-start instead (the pool entry is already gone).
     const adopted = offered !== undefined && offered.running ? offered : undefined;
+    this.#adoptedParkedProcess = adopted !== undefined;
     if (offered !== undefined && adopted === undefined) {
       this.#options.log(`parked process for ${this.#dshSessionId} exited before adoption; cold-starting`);
       offered.kill();
@@ -721,15 +734,18 @@ export class DshSession {
         continue;
       }
       if (this.#closed) return;
-      // The only proof that a child's open turn is still real is the *live*
-      // channel: the bridge announced that child, or streamed its frames, in
-      // this process. A durable catalog row is not proof — nothing is live in a
-      // process that just booted, DSH's `listDescendants` never loads or resumes
-      // a child agent, and a stored log that simply stops inside a turn is
-      // exactly what a killed child leaves behind. Sampled here, after the
-      // history read, so no await can interleave between the check and the
+      // The proof that a child's open turn is still real is live evidence: the
+      // bridge announced that child, or streamed its frames, in this process —
+      // or this session adopted the SAME parked process that hosted the child
+      // (the rewind refresh's close/reopen). Adopting keeps a running child
+      // running, so its open turn is live even though the new provider session
+      // never saw the announcement. Cold starts keep the strict rule: nothing is
+      // live in a process that just booted, DSH's `listDescendants` never loads
+      // or resumes a child agent, and a stored log that simply stops inside a
+      // turn is exactly what a killed child leaves behind. Sampled here, after
+      // the history read, so no await can interleave between the check and the
       // replay that consumes it.
-      const announcedLive = this.#children.has(row.sessionId);
+      const announcedLive = this.#children.has(row.sessionId) || this.#adoptedParkedProcess;
       // A one-shot child has no label in the durable catalog — DSH only requires
       // one for a continuable child — but the child's own `subagent/descriptor`
       // carries its creation label. Read it from the history *before* opening:

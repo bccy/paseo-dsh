@@ -631,6 +631,58 @@ async function openSession(conn, sessionId, history) {
   await untilSince(skipMark, (e) => e.type === "session.opened" && e.sessionId === childAScoped, "skip-reopened child-A", 30000);
   check("reopen with history:skip also rebuilds the tree", since(skipMark).some((e) => e.type === "session.opened" && e.sessionId === childAScoped && e.parentSessionId === rootA));
 
+  // ---- adopted reopen: a mid-turn child hosted by the SAME process ---------
+  // The rewind refresh closes the provider session and reopens it on the parked
+  // dsh process. That process never stopped, so a child whose stored log ends
+  // inside a turn is still running. Closing it as canceled (correct on a cold
+  // start — see child-K above) would be a lie here, and it is what made a
+  // running subagent show as stopped after every rewind.
+  process.env.DSH_FAKE_MODE = "replay";
+  const rootP = `subP-${Date.now()}`;
+  const parkOpenMark = events.length;
+  await conn.send({
+    type: "session.open",
+    requestId: "adopt-open",
+    sessionId: rootP,
+    config: { cwd: process.cwd(), mode: "build" },
+    persistence: { version: 1, data: { sessionId: rootP } },
+    history: "replay",
+  });
+  await untilSince(parkOpenMark, (e) => e.type === "session.ready" && e.sessionId === rootP, "adopt root ready", 30000);
+  await sleep(300);
+  // The daemon normally closes the old provider session right before the reopen;
+  // an idle session is parked (not killed), which is the adoption precondition.
+  await conn.send({ type: "session.close", sessionId: rootP });
+  await sleep(300);
+  const adoptMark = events.length;
+  await conn.send({
+    type: "session.open",
+    requestId: "adopt-reopen",
+    sessionId: rootP,
+    config: { cwd: process.cwd(), mode: "build" },
+    persistence: { version: 1, data: { sessionId: rootP } },
+    history: "replay",
+  });
+  await untilSince(adoptMark, (e) => e.type === "session.ready" && e.sessionId === rootP, "adopt reopen ready", 30000);
+  await sleep(400);
+  const adopted = since(adoptMark);
+  const adoptedChildK = scoped(rootP, "child-K");
+  const adoptedKilledTurns = adopted.filter((e) => e.type === "session.turn" && e.sessionId === adoptedChildK);
+  check(
+    "an adopted reopen keeps a mid-turn child running instead of closing it as canceled",
+    adoptedKilledTurns.length === 0,
+    JSON.stringify(adoptedKilledTurns.map((e) => e.state)),
+  );
+  check(
+    "and it still announces that child (closed-looking logs are never hidden)",
+    adopted.some((e) => e.type === "session.opened" && e.sessionId === adoptedChildK),
+  );
+  // Contrast: cold opens are unchanged — child-K is still closed as canceled.
+  check(
+    "a cold reopen of the same fixture still closes child-K as canceled",
+    replayed.some((e) => e.type === "session.turn" && e.sessionId === killedScoped && e.state === "canceled"),
+  );
+
   // ---- subagent listing failure is honest, not a silent empty tree -------
   const conn4 = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
   const conn4Events = [];

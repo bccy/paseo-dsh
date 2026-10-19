@@ -1791,13 +1791,64 @@ DSH 日志里有一条 `write`，`file_path=<工作区根>/subagent-rewind-probe
 - `harness/replay-fidelity-probe.mjs` 的期望改为从原始 `surfaceOps` 独立推导（不再是
   fold-vs-fold），带缝日志与干净日志各 4/4。
 
-**仍存在的边界**：M2 语义（未改）；rescue 覆盖手动改动无 UI 提示；fail-open 只有固定
-日志行、无原因码；server 接线（事件顺序）仍无离线覆盖，靠真机探针兜底。
+**仍存在的边界**：M2 语义在提交时未改（第 61 条已落地：锚绑派发回合 + 撤回范围取消）；
+rescue 覆盖手动改动无 UI 提示；fail-open 只有固定日志行、无原因码；server 接线（事件顺序）
+仍无离线覆盖，靠真机探针兜底。
 
 > **教训**：审查「键」和「路径」这类基础设施维度时，要直接查上游契约（callId 唯一性、
 > 路径解析入口），不要因为默认 provider 行为"看起来没问题"就放过——它们决定的是
 > 错归/错删这类**无声故障**。另外，测试如果自己复刻了被测实现的关键判断，就只证明了
 > 复刻是对的；真机探针要入库、可复跑，才算验收证据。
+
+### 61. 撤回后的会话重开把活着的子代理误标 canceled；派发回合锚与撤回取消
+
+**症状**：撤回一条「派遣子代理之后」的消息后，仍在运行的后台子代理在 Paseo 里变成
+已取消/停止；实际它还在后台跑完。
+
+**真机复现**（2026-10-19，真实 Paseo daemon 路径：`paseo run` 建 agent → 派后台子代理跑
+60 秒、每秒写 progress.log → 发后续消息 → 用 DaemonClient 发 `agent.rewind.request` 撤回
+后续消息）：
+- daemon 日志：`parked:park … (size 1)` → `parked:take …` → `agent reload … exited 0`
+  （同一 dsh 进程被停放复用，**没被杀**）；
+- 插件日志：`subagent 499cbf5d…: stored history ends with no turn terminal (the last turn was
+  never closed); closing it as canceled`；
+- 子会话日志之后仍写入 `seq 31 turn/end {reason: completed}`，progress.log 60 行写满，
+  父会话收到 DONE；
+- daemon 的 provider 子代理行 `status: "canceled"`。
+
+**根因链**：
+1. 撤回刷新 = 关 provider 会话 + 带 persistence 重开（`reloadAgentSession(rehydrateFromDisk)`）；
+   重开前 daemon `cancelRunningProviderSubagents()` 把子代理行标 canceled、`deleteParent` 清行。
+2. 插件 `session.close({park:true})` 只在根回合空闲时停放 → 进入停放池（进程存活）。
+3. 重开后插件 `replaySubagents()` 用 `announcedLive = #children.has(id)` 判活：新 provider
+   会话没有桥的再次播报（桥里该 child `opened=true`，不会对第二个会话重发
+   `session.child-opened`）→ 历史停在 turn 中途 → 按被杀处理，收尾 canceled。**子代理实际
+   仍在跑**，只是 UI 与后续事件归属错了。
+
+**修法**：
+- 插件 `DshSession` 记录 `#adoptedParkedProcess`（`open()` 取到停放进程时置 true）；
+  `replaySubagents()` 的 `announcedLive` 改为 `#children.has(id) || #adoptedParkedProcess`——
+  接管的同一进程里「历史停在 turn 中途」是活证据；冷启动仍按被杀处理。
+- 桥新增 `dsh-bridge/lib/child-anchors.js`：子会话每次 `turn/start` 记录
+  「根会话当时最新人类消息 seq」（派发/续接回合）。文件快照优先用该锚，修掉第 60 条 M2 的
+  跨轮归属问题。
+- `revert()` 在 append+flush 之后、文件 restore 之前调用 `cancelWithdrawnDelegations()`：
+  锚 `>= targetSeq` 的子代理通过 DSH `subagents.interrupt(childId, {kind:'ancestor', agent:根agent})`
+  中止；锚更早的保留继续运行。`interrupt` fire-and-return；锚未知不取消（保守）。
+
+**验收**：`rewind-merge-check` 45/45（新增 ChildAnchors 8 条）；`subagent-check` 64/64
+（新增 adopted 重开不 canceled、冷启动仍 canceled、子代理仍播报 3 条）；`file-snapshot` 41、
+`revert` 98、`surface` 18、`revert-shape` 10、`plugin-check` 32、`parked` 27；`tsc --noEmit`
+干净；内嵌桥 16 文件已重生成。
+
+**边界**：`interrupt` fire-and-return（子代理可能再写几笔）；未知锚不取消；续接子代理在新
+`turn/start` 刷新锚；取消保留 Activation/pending inbox，可被再次唤醒。
+
+> **教训**：**「进程没死」不等于「UI 认为它活着」**。provider 会话的 close/reopen 是刷新
+> 时间线的必要路径，任何跨会话存活的对象（这里是从子会话重放出来的子代理）都必须有明确的
+> 「仍在运行」证据来源，否则重放只能默认「它已被杀」——这个默认会让用户以为后台工作停了。
+> 同时，活着的子代理必须与「撤回范围内的副作用」绑定：撤回覆盖派发回合就该真停，否则它会
+> 继续在已撤回的指令上写文件。
 
 ---
 ## 已知限制（未修，有意为之）

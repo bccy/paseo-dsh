@@ -23,7 +23,8 @@ import { admitEncodedImages } from '@deepseek-ai/dsh-attachment';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import { underArchivedSession } from './archived-lineage.js';
 import { FileSnapshots, isTrackedTool, mutationPathOf, resolveMutationPath } from './file-snapshots.js';
-import { rootSessionFor as resolveRootSession, snapshotOwnerKey } from './snapshot-owners.js';
+import { isDelegatedSession, rootSessionFor as resolveRootSession, snapshotOwnerKey } from './snapshot-owners.js';
+import { ChildAnchors } from './child-anchors.js';
 import { isHumanUserMessage, planRewind, restoresFiles, revertScope, successText } from './revert.js';
 import { visibleEvents } from './surface.js';
 import { historyEvents, withImageHostPaths } from './image-host-path.js';
@@ -215,6 +216,16 @@ export class PaseoHarnessServer {
      */
     this.snapshotOwners = new Map();
     /**
+     * Delegated session id -> the root human-message seq its current turn was
+     * dispatched by (see `child-anchors.js`). Two consumers:
+     *
+     * - file snapshots made by a subagent anchor to the turn that dispatched it,
+     *   not to whatever human message happens to be newest at edit time;
+     * - a rewind interrupts exactly the children whose dispatch turn it withdraws,
+     *   and leaves the others running.
+     */
+    this.childAnchors = new ChildAnchors();
+    /**
      * Native child session id -> { parentId, mode?, label? }. Populated from
      * each child session's own durable header (`origin: 'subagent'`) the moment
      * it first emits, with the parent catalog as a fallback. A child that
@@ -240,6 +251,7 @@ export class PaseoHarnessServer {
         // Register a child before forwarding its first event, so Paseo has the
         // parent edge by the time the event lands and never misattributes it.
         this.observeChildSession(session);
+        this.observeDelegatedTurn(session, event);
         if (event.type === 'subagent/catalog') this.observeCatalogChild(session, event);
         const sessionId = String(session.id);
         // The durable settlement is appended only after every chunk, so publish
@@ -1110,6 +1122,52 @@ export class PaseoHarnessServer {
   }
 
   /**
+   * Remember which root human message dispatched a delegated session's current
+   * turn.
+   *
+   * Called for every session event; only a child's own `turn/start` matters. A
+   * fresh delegation starts its turn inside the dispatching turn, and a resumed
+   * continuable child starts it while the parent's new turn is running — in both
+   * cases the root's newest human message at that moment is the instruction the
+   * child is executing. See `child-anchors.js`.
+   *
+   * @param {object} session
+   * @param {{type?: string}} event
+   */
+  observeDelegatedTurn(session, event) {
+    if (event?.type !== 'turn/start') return;
+    if (!isDelegatedSession(session)) return;
+    try {
+      const root = this.rootSessionFor(session);
+      if (root === undefined) return;
+      const anchorSeq = this.latestHumanAnchor(root);
+      if (anchorSeq === undefined) return;
+      this.childAnchors.record(session.id, anchorSeq);
+    } catch (error) {
+      process.stderr.write(
+        `[bridge] could not record a delegated turn anchor: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
+  }
+
+  /**
+   * The journal anchor for one editing tool call.
+   *
+   * A delegated session anchors to the turn that dispatched its current run; a
+   * root session (or a child whose turn start this process never saw) anchors to
+   * the root's newest human message, which is the pre-existing behavior.
+   *
+   * @param {object} session - the session that ran the tool.
+   * @param {object} root - the root session whose journal receives the snapshot.
+   * @returns {number | undefined}
+   */
+  snapshotAnchorFor(session, root) {
+    const recorded = this.childAnchors.anchorFor(session.id);
+    if (recorded !== undefined) return recorded;
+    return this.latestHumanAnchor(root);
+  }
+
+  /**
    * The session a rewind can address for this tool call: the root (non-subagent)
    * ancestor of the executing session.
    *
@@ -1178,7 +1236,7 @@ export class PaseoHarnessServer {
         process.stderr.write('[bridge] file snapshot skipped: no root session for a subagent edit\n');
         return;
       }
-      const anchorSeq = this.latestHumanAnchor(owner);
+      const anchorSeq = this.snapshotAnchorFor(session, owner);
       if (anchorSeq === undefined) return;
       // Resolve exactly like the editing tool does: its current working
       // directory, not the durable header's original cwd.
@@ -1240,6 +1298,50 @@ export class PaseoHarnessServer {
     } catch {
       /* dropping a pending snapshot cannot fail in a way worth reporting */
     }
+  }
+
+  /**
+   * Interrupt every delegated agent whose current turn this rewind withdraws.
+   *
+   * A child's dispatch anchor is the root human message whose turn started it
+   * (see `child-anchors.js`). `targetSeq` and everything after it is being
+   * withdrawn, so a child anchored at or after `targetSeq` is working on
+   * instructions the user just removed: interrupt it. Children anchored earlier
+   * belong to a conversation that stays, and must keep running.
+   *
+   * Fail-open by design: no subagent service, an unknown anchor, or a refused
+   * interrupt leaves the child alone. Interrupting the wrong child kills work the
+   * user kept, which is worse than a child that keeps running.
+   *
+   * `SubagentRuntime.interrupt` is fire-and-return: the child may still perform a
+   * little work before observing the cancel signal.
+   *
+   * @param {object} agent - the root agent (an exact live ancestor authority).
+   * @param {number} targetSeq
+   * @returns {string[]} child session ids the bridge signalled.
+   */
+  cancelWithdrawnDelegations(agent, targetSeq) {
+    const childIds = this.childAnchors.withdrawnSince(targetSeq);
+    if (childIds.length === 0) return [];
+    const subagents = this.ctx.get('subagents');
+    if (subagents === undefined) return [];
+    const signalled = [];
+    for (const childId of childIds) {
+      try {
+        subagents.interrupt(childId, { kind: 'ancestor', agent });
+        signalled.push(childId);
+      } catch (error) {
+        process.stderr.write(
+          `[bridge] could not interrupt withdrawn subagent ${childId}: ${error instanceof Error ? error.message : String(error)}\n`,
+        );
+      }
+    }
+    if (signalled.length > 0) {
+      process.stderr.write(
+        `[bridge] interrupted ${signalled.length} delegated agent(s) whose dispatch turn was withdrawn\n`,
+      );
+    }
+    return signalled;
   }
 
   async revert(params) {
@@ -1317,6 +1419,11 @@ export class PaseoHarnessServer {
         process.stderr.write(`[bridge] flushing the rewind marker failed: ${error instanceof Error ? error.message : String(error)}\n`);
       }
       let files;
+      // Stop the delegated agents this rewind withdrew before restoring files:
+      // a child still working on the withdrawn instruction would otherwise keep
+      // writing behind the restore (and anchor those writes to an older message,
+      // leaving them impossible to revert).
+      this.cancelWithdrawnDelegations(agent, resolved.targetSeq);
       if (filePlan !== undefined && filePlan.length > 0) {
         files = await this.fileSnapshots.restore(sessionKey, filePlan);
         await this.fileSnapshots.prune(sessionKey, resolved.targetSeq).catch((error) => {

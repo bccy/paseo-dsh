@@ -70,13 +70,15 @@ Paseo 撤回按钮
 只撤「智能体用编辑工具改过的文件」，不碰用户自己的改动，也不要求 git/干净工作区：
 
 - 桥通过 DSH 原生钩子 `ctx.inject(['fs'])` 监听 `tools/execute` / `tools/post-execute` /
-  `tools/result`：`write`/`edit` 执行前读旧内容，成功后按「最近一条 human 用户消息 seq」
-  记一行 journal；失败/中断丢弃。
+  `tools/result`：`write`/`edit` 执行前读旧内容，成功后按锚点记一行 journal；失败/中断丢弃。
 - **子代理编辑归并到根会话**：工具跑在原生子会话里时，沿 `header.parentSession` 上溯到
-  根会话（`dsh-bridge/lib/snapshot-owners.js`），用**根会话**当时最新的人类消息当锚，
-  快照写进**根会话**的 journal/objects；commit/discard 通过 `sessionId:callId → owner`
-  内存映射找回同一个 pending 键（callId 只在会话内唯一，键必须带会话维度）。
-  因此父会话 `both` 撤回会连子代理改过的文件一起回退（后台子代理的锚语义见已知限制）。
+  根会话（`dsh-bridge/lib/snapshot-owners.js`），快照写进**根会话**的 journal/objects；
+  commit/discard 通过 `sessionId:callId → owner` 内存映射找回同一个 pending 键
+  （callId 只在会话内唯一，键必须带会话维度）。
+- **锚点 = 派发/续接该子代理回合的根人类消息**：子会话每次 `turn/start` 时记录
+  「根会话当时最新人类消息 seq」（`dsh-bridge/lib/child-anchors.js`），文件快照优先用它；
+  根会话自己的编辑仍取执行时的最新人类消息。进程没观察到（如桥冷启动前）才回退旧规则
+  （fail-open）。这样后台子代理跨轮写文件不会被归到下一轮。
 - 相对路径按**工作目录服务**的当前目录解析（`ctx.get('workingDirectory').get(session)`；
   `cd` 与子代理的 `cwd` 参数都生效，服务不可用时才回退 `header.cwd`），与 `write`/`edit`
   的解析方式一致——`header.cwd` 只是会话最初的项目目录，不是工具执行时的目录。
@@ -84,6 +86,12 @@ Paseo 撤回按钮
   `rescue/`（恢复前当前内容的备份）。
 - 撤回 `both` 时：读 journal，取每个路径「目标消息及之后最早一次改动前的状态」——新建的
   文件删除，被改的写回，未被工具的动的不碰；覆盖前把当前内容存入 rescue。
+- **撤回范围内的子代理被中断**：`targetSeq` 及其之后被撤回，锚 `>= targetSeq` 的子代理
+  （派发回合被撤）通过 DSH `subagents.interrupt` 中止；锚更早的继续运行。`interrupt` 是
+  fire-and-return，子代理可能再写几笔才观察到信号；锚未知时不取消（保守）。
+- **重开时活着的子代理保持 running**：撤回后的刷新会关 provider 会话再带 persistence 重开；
+  若接管的是停放中的同一个 dsh 进程（`parked:take`），插件重放子代理时把「历史停在 turn
+  中途」视为仍在运行，不再误标 canceled（冷启动仍按被杀处理）。
 - 不跟踪：bash/pwsh 等命令产生的改动、用户或外部进程直接改的文件、符号链接、> 8 MiB 文件。
   子代理编辑属于归并而不是跳过；只有上溯失败（父会话不 live、header 缺 `parentSession`、
   血缘成环）时才退化为不跟踪（fail-open，stderr 记一行跳过日志）。
@@ -161,17 +169,14 @@ this.ctx.get('permissionPresets').set(session, name);
 - 由于首条被拒绝，本实现不会再产生"空对话"；历史上已被旧版本撤空的会话，重开时就是一个
   没有消息的空对话（不再额外插入提示行）。
 - **子代理编辑已归并到根会话（2026-10-19 起）**：父会话 `both` 撤回会回退子代理在目标消息
-  之后用 `write`/`edit` 改过的文件（含孙级；锚 = **执行时**根会话最新人类消息）。这与
-  `dsh-rewind`/Claude Code checkpoint 的「子代理编辑不恢复」不同，是本项目的有意扩展；
+  之后用 `write`/`edit` 改过的文件（含孙级；锚 = **派发/续接该子代理回合**的根人类消息）。
+  这与 `dsh-rewind`/Claude Code checkpoint 的「子代理编辑不恢复」不同，是本项目的有意扩展；
   上溯失败（父会话不 live、header 缺 `parentSession`、血缘成环）时退化为旧行为（不跟踪）。
-  真机验收见 FIELD-NOTES 第 59/60 条。
-- **后台子代理的锚是"执行时"而不是"派发回合"**：子代理工具立即返回，父回合结束后它仍可能
-  继续改文件，此时编辑会记到**当时最新**的人类消息上。两个边界后果：① 用户在子代理运行
-  期间发了新消息 H2、子代理随后写文件 → 撤回 H2 会一并回退这些文件，尽管派发它们的是 H1；
-  ② 撤回时子代理仍在跑（`settleAgentForRevert` 只取消根 agent）→ 撤回后最新人类消息回落
-  到更早一条，子代理之后写的文件锚到它；若那是会话首条（首条禁止撤回），这些改动再也
-  撤不掉。要改成"派发回合取锚"需要子会话投递消息的时间并在根表面按时间定位，当前按
-  时间语义记录。
+  真机验收见 FIELD-NOTES 第 59/60/61 条。
+- **子代理取消的边界**：撤回覆盖派发回合时，桥用 `subagents.interrupt` 中止该子代理；但
+  `interrupt` 是 fire-and-return，子代理可能再写几笔文件才观察到信号；锚未知（桥冷启动前
+  已在跑的子代理）时不取消（保守）；续接子代理在新 `turn/start` 刷新锚。若撤回时子代理仍有
+  未记录的写入发生在恢复之后，该文件会按旧锚留待更早的撤回点，可能再也撤不掉。
 - **rescue 副本不在界面提示**：撤回恢复/删除一个文件前会把当前内容复制到
   `~/.dsh/paseo-rewind/<sessionId>/rescue/`，回执与插件日志都带路径，但 UI 只在
   `files.failed` 时提示。若你在撤回前手动改过该文件，"改动被覆盖"需要自己到 rescue 目录
@@ -212,8 +217,9 @@ node harness/parked-sessions-check.cjs paseo-plugin/.dbg
 
 真机验收（新会话，能力位只对新会话生效）：发两条消息 → 撤回第二条 → 消息行消失、无
 `/rewind` 行/回合页脚、文件回到消息前、模型不知道被撤内容；重开会话后仍正确。
-父会话派子代理改的文件同样随 `both` 撤回回退（归并到根会话，见 FIELD-NOTES 第 59/60 条）；
-后台子代理跨轮与撤回竞态的边界见上文「已知限制」。
+父会话派子代理改的文件同样随 `both` 撤回回退（归并到根会话，见 FIELD-NOTES 第 59/60/61 条）；
+撤回覆盖派发回合时该子代理被中断，锚更早的子代理继续运行且重开后保持 running；
+`interrupt` 的 fire-and-return 边界见上文「已知限制」。
 
 ## 回滚
 
