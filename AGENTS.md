@@ -37,11 +37,13 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon 进程里）
 - **Paseo 源码不需要改，DSH 也不需要 fork。** 两边都走公开扩展点。
 - `paseo-plugin/server/*.ts` 是 Paseo 那一侧的契约实现；`dsh-bridge/lib/*.js` 是
   运行时的桥接。**中间那层协议是这个仓库自己定的**，改它要同时改两边。
-- 桥的 profile 是 `dsh-base` + `dsh-paseo-bridge`（见 `server/bootstrap.ts`）。**不要往这个
-  profile 里叠 `@deepseek-ai/dsh-web-app`**：那个 bundle 会按 id 把 base 的 `plan-mode` 行
-  `disabled: true`（`dsh-web-app/cordis.patch.yml`），于是桥的 `paseo/plan/get|set` 只能回答
-  "not mounted"，插件会把 Plan 模式从能力里摘掉（如实降级，但功能就没了）。实测对照：
-  `base+bridge` plan 可用，`+web-app` 不可用。
+- 桥的 profile 是 `dsh-base` + `dsh-paseo-bridge`（见 `server/bootstrap.ts`）。`@deepseek-ai/dsh-web-app`
+  会按 id 把 base 的 `plan-mode` 行 `disabled: true`（`dsh-web-app/cordis.patch.yml`），于是桥的
+  `paseo/plan/get|set` 只能回答 "not mounted"，插件会把 Plan 模式从能力里摘掉。叠加了 web-app 的
+  profile（例如 `dsh-prime-memory` 需要它的 `webServer`/`connection`）在 `cordis.patch.yml` 末尾加
+  `- id: plan-mode` + `disabled: false` 即可恢复（按 id 合并，base 的 `config.section` 保留）；改完用
+  `dsh --profile <name> --dump-config` 和桥的 `paseo/catalog`.`planMode` 验证。实测对照：
+  `base+bridge` plan 可用，`+web-app` 不可用，`+web-app+补丁` 又可用。
 
 ### 改之前先读
 

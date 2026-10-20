@@ -151,8 +151,23 @@ patch **显式禁用** `plan-mode`（`dsh-web-app/cordis.patch.yml:529-530` → 
   Paseo 里 **Plan 选项消失**（正确降级）。
 - 实测对照：`dsh-base + dsh-paseo-bridge`（仓库自举的 profile）→ plan 可用（`paseo/plan/set` queued）；
   再叠加 `dsh-web-app` → plan 不可用。因此**不是本仓库代码问题**，是 profile 组合问题。
-- 若需要 Paseo 里保留 Plan 模式：从该 profile 的 `dsh.profile.bundles` 移除 `@deepseek-ai/dsh-web-app`
-  （`dsh web` 的浏览器界面不需要它也能用 DSH 自己的 CLI/Web 入口，二者取舍需用户决定）。
+- **恢复方法（2026-10-20 在本机验证通过）**：不要删 `dsh-web-app` —— 它提供 `webServer`/`connection`
+  服务，`dsh-prime-memory` 依赖它们，删掉会让记忆插件永久 pending。正确做法是在 profile 自己的
+  `cordis.patch.yml` 末尾按 id **只覆盖 `disabled`**（DSH 的 patch 按 id 合并覆盖键，`config` 不写就
+  沿用 base 那份，计划模式的政策文本不会丢）：
+
+  ```yaml
+  - id: plan-mode
+    disabled: false
+  ```
+
+  验证链（本机实测）：`dsh --profile paseo --dump-config` 里 `plan-mode` 行存在且带 `config.section`；
+  桥 `paseo/catalog` 返回 `planMode: true`；`paseo/plan/get` → `available:true`、
+  `paseo/plan/set active=true` → `outcome:"queued"`；启动无 "entry did not activate" 告警。
+  备份：`~/.dsh/profiles/paseo/cordis.patch.yml.bak-plan-restore-<时间戳>`；回退就是还原该备份。
+- **生效时机**：profile 只在新的 `dsh --profile paseo` 子进程里生效；插件对 catalog 有 5 分钟 TTL
+  缓存（`provider.ts` 的 `CATALOG_TTL_MS`），所以**等 ≥5 分钟后开一个新会话**即可看到 Plan；
+  不想等就 `paseo daemon restart`（会中断正在跑的 agent，别在有任务时做）。
 - `harness/probe.mjs` 已改为在 `available:false` 时**跳过** plan set 并打印原因，不再把
   「profile 没挂 plan mode」当成 probe 失败。
 
