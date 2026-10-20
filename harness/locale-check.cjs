@@ -22,6 +22,15 @@
  *    tool is a test failure instead of a row that reads differently from Paseo's
  *    own UI. `speak` is Paseo's documented exception (its own `isPaseoToolName`
  *    excludes it) and is the only entry allowed beyond the catalog.
+ * 4. **Coverage of the mount, not just of the tables.** The `PASEO_TOOL_CATALOG`
+ *    is Paseo's own tools; the profile also mounts DSH/plugin tools whose names
+ *    no table in this repo can enumerate. A checked-in snapshot of every tool
+ *    name a real `request/header` on this machine has offered the model
+ *    (`docs/research/table-labels.md` has the scan) is asserted end-to-end: each
+ *    one must have a label in both languages and its own glyph. This is the check
+ *    that would have caught `memory_search` printing the wire name next to a
+ *    wrench. Another MCP server's tools and model-invented names are asserted to
+ *    keep the wire name, because that is the documented fallback — not a gap.
  *
  * Icon names are Lucide exports of the host bundle, not strings this repo can
  * resolve offline. They were checked against the installed Paseo web bundle with
@@ -195,6 +204,163 @@ console.log("every tool that draws an icon can also name itself");
     (name) => `${name} (${en[name] === undefined ? "en" : ""}${zh[name] === undefined ? "zh" : ""})`,
   );
   equal("every tool with an icon has a label in both languages", missing, []);
+}
+
+console.log("the tools this machine has really been offered are never anonymous");
+{
+  // Provenance (2026-10-20): every `request/header` in this machine's own
+  // `~/.dsh/sessions/**/session.v4.jsonl.zstd` (multi-frame zstd) — 855 headers
+  // over 655 files — carried 161 distinct tool names, and the `tool/call` events
+  // in the same logs carried 96 (a subset, plus one model-invented name handled
+  // below). That catalog is the "possible set": the model can only call what its
+  // header lists. The list is checked in because this harness must stay offline
+  // and machine-independent; `docs/research/table-labels.md` records the scan
+  // commands, the before/after gap list and how to refresh this snapshot.
+  //
+  // Both halves of the failure are invisible in a green run: a name with no label
+  // renders as its wire name, and one with no glyph draws the wrench. A phone
+  // screenshot showing `memory_search · {"query":…}` next to a wrench is why this
+  // check exists.
+  const MOUNTED_TOOLS = [
+    "archive_subagents", "ask_user_question", "bash", "conversation_search",
+    "create_goal", "edit", "exit_plan_mode", "get_goal",
+    "glob", "grep", "interrupt_agent", "job_kill",
+    "job_list", "job_output", "list_agents", "list_mcp_resource_templates",
+    "list_mcp_resources", "mcp__paseo__archive_agent", "mcp__paseo__archive_workspace", "mcp__paseo__browser_back",
+    "mcp__paseo__browser_click", "mcp__paseo__browser_close_tab", "mcp__paseo__browser_drag", "mcp__paseo__browser_evaluate",
+    "mcp__paseo__browser_fill", "mcp__paseo__browser_forward", "mcp__paseo__browser_hover", "mcp__paseo__browser_keypress",
+    "mcp__paseo__browser_list_tabs", "mcp__paseo__browser_logs", "mcp__paseo__browser_navigate", "mcp__paseo__browser_new_tab",
+    "mcp__paseo__browser_reload", "mcp__paseo__browser_resize", "mcp__paseo__browser_screenshot", "mcp__paseo__browser_scroll",
+    "mcp__paseo__browser_select", "mcp__paseo__browser_snapshot", "mcp__paseo__browser_type", "mcp__paseo__browser_upload",
+    "mcp__paseo__browser_wait", "mcp__paseo__cancel_agent", "mcp__paseo__capture_terminal", "mcp__paseo__create_agent",
+    "mcp__paseo__create_heartbeat", "mcp__paseo__create_schedule", "mcp__paseo__create_terminal", "mcp__paseo__create_workspace",
+    "mcp__paseo__delete_heartbeat", "mcp__paseo__delete_schedule", "mcp__paseo__get_agent_activity", "mcp__paseo__get_agent_status",
+    "mcp__paseo__inspect_provider", "mcp__paseo__inspect_schedule", "mcp__paseo__kill_agent", "mcp__paseo__kill_terminal",
+    "mcp__paseo__list_agents", "mcp__paseo__list_models", "mcp__paseo__list_pending_permissions", "mcp__paseo__list_profiles",
+    "mcp__paseo__list_providers", "mcp__paseo__list_schedules", "mcp__paseo__list_terminals", "mcp__paseo__list_workspace_scripts",
+    "mcp__paseo__list_workspaces", "mcp__paseo__pause_schedule", "mcp__paseo__rename_workspace", "mcp__paseo__respond_to_permission",
+    "mcp__paseo__resume_schedule", "mcp__paseo__run_schedule_once", "mcp__paseo__schedule_logs", "mcp__paseo__send_agent_prompt",
+    "mcp__paseo__send_terminal_keys", "mcp__paseo__set_agent_mode", "mcp__paseo__start_workspace_script", "mcp__paseo__stop_workspace_script",
+    "mcp__paseo__update_agent", "mcp__paseo__update_schedule", "mcp_call_tool", "mcp_list_tools",
+    "mcp_tool_schema", "memory_add", "memory_conflicts", "memory_conflicts_rejected",
+    "memory_delete", "memory_expand_graph_node", "memory_import", "memory_read_scene",
+    "memory_receipts", "memory_resolve_conflict", "memory_room_admin", "memory_room_review",
+    "memory_ruminate", "memory_ruminate_cancel", "memory_ruminate_status", "memory_search",
+    "memory_search_graph", "memory_slot_close", "memory_slot_list", "memory_slot_write",
+    "present", "read", "read_image", "read_mcp_resource",
+    "schedule_create", "schedule_delete", "schedule_list", "schedule_update",
+    "send_message", "session_event_read", "session_event_search", "session_event_trace",
+    "session_search", "session_trace", "skill", "spawn_teammate",
+    "subagent", "subagent_fork", "team_task_create", "team_task_get",
+    "team_task_list", "team_task_update", "terminal_close", "terminal_list",
+    "terminal_open", "terminal_read", "terminal_send", "terminal_signal",
+    "todo_write", "update_goal", "wait_agent", "web_fetch",
+    "web_search", "workflow", "working_directory", "write",
+  ];
+
+  // Another plugin's MCP server (`mcp__server_browser__*`, the Server Browser
+  // plugin's browser tools). This repo's documented behaviour for a foreign
+  // server is the wire name — the plugin cannot know that server's catalog, and
+  // `tool-call-check.cjs` pins the same rule for `mcp__github__create_issue`. The
+  // exclusion is asserted below, not skipped, so it stays visible.
+  const FOREIGN_SERVER_TOOLS = [
+    "mcp__server_browser__browser_click", "mcp__server_browser__browser_console_messages", "mcp__server_browser__browser_diagnostics",
+    "mcp__server_browser__browser_drag", "mcp__server_browser__browser_drop", "mcp__server_browser__browser_emulate_media",
+    "mcp__server_browser__browser_evaluate", "mcp__server_browser__browser_file_upload", "mcp__server_browser__browser_fill_form",
+    "mcp__server_browser__browser_find", "mcp__server_browser__browser_handle_dialog", "mcp__server_browser__browser_hover",
+    "mcp__server_browser__browser_navigate", "mcp__server_browser__browser_navigate_back", "mcp__server_browser__browser_network_request",
+    "mcp__server_browser__browser_network_requests", "mcp__server_browser__browser_press_key", "mcp__server_browser__browser_read_page",
+    "mcp__server_browser__browser_resize", "mcp__server_browser__browser_select_option", "mcp__server_browser__browser_snapshot",
+    "mcp__server_browser__browser_tabs", "mcp__server_browser__browser_take_screenshot", "mcp__server_browser__browser_type",
+    "mcp__server_browser__browser_wait_for",
+  ];
+
+  // A model-invented name: DSH logged one `mcp__paseo__mcp_list_tools` call whose
+  // result was `ToolNotFoundError: unknown tool` (session
+  // `b9a2b365-e63e-4b88-afe2-c25cacabe5fe`, seq 4560/4561); the header's real
+  // name was the gateway's `mcp_list_tools`. Mapping it would dress up a call
+  // that never existed, so it keeps the wire name like any other unknown tool.
+  const FABRICATED = "mcp__paseo__mcp_list_tools";
+
+  // The detail type `server/timeline.ts`'s `toolDetail()` sends for each name;
+  // everything else arrives as `unknown`. The glyph a row draws depends on this
+  // shape, so the icon check has to use the same one the daemon sends.
+  const TYPED_DETAILS = {
+    bash: "shell",
+    pwsh: "shell",
+    read: "read",
+    write: "write",
+    edit: "edit",
+    grep: "search",
+    glob: "search",
+    web_search: "search",
+    web_fetch: "fetch",
+    exit_plan_mode: "plan",
+    subagent: "sub_agent",
+  };
+  const detailFor = (name) =>
+    name === "todo_write" || name === "ask_user_question"
+      ? { type: "plain_text", icon: "sparkles" }
+      : TYPED_DETAILS[name] !== undefined
+        ? { type: TYPED_DETAILS[name] }
+        : { type: "unknown", input: {}, output: null };
+
+  check(
+    "the mounted-tool snapshot is the full scan",
+    MOUNTED_TOOLS.length === 136 && FOREIGN_SERVER_TOOLS.length === 25,
+    `${MOUNTED_TOOLS.length} mounted / ${FOREIGN_SERVER_TOOLS.length} foreign`,
+  );
+
+  const previous = currentLocale();
+  const labelMissing = [];
+  const iconMissing = [];
+  const untranslated = [];
+  for (const name of MOUNTED_TOOLS) {
+    const labels = {};
+    for (const locale of LOCALES) {
+      setLocale(locale);
+      labels[locale] = toolLabel(name);
+      if (labels[locale] === name || labels[locale].trim() === "") {
+        labelMissing.push(`${name} (${locale})`);
+      }
+    }
+    if (labels.en === labels["zh-CN"]) untranslated.push(name);
+    setLocale("zh-CN");
+    const icon = toolIcon(name, detailFor(name));
+    if (icon === "Wrench" || icon === "") iconMissing.push(`${name}: ${icon}`);
+  }
+  setLocale(previous);
+  equal("every mounted tool has a label in both languages", labelMissing, []);
+  equal("every mounted tool draws its own glyph (none falls to the wrench)", iconMissing, []);
+  equal("no mounted tool's English label is a copy of its Chinese one", untranslated, []);
+
+  // The memory family is the set that was missing entirely. Its glyphs must not
+  // repeat inside the family (19 tools, 19 distinct glyphs), which is the part a
+  // bulk "give them all a Brain" would silently get wrong.
+  const memoryTools = MOUNTED_TOOLS.filter((name) => name.startsWith("memory_"));
+  equal("the memory family is the plugin's 19 mounted tools", memoryTools.length, 19);
+  setLocale("zh-CN");
+  const memoryIcons = memoryTools.map((name) => toolIcon(name, { type: "unknown" }));
+  equal(
+    "the memory family's glyphs are pairwise distinct",
+    [...new Set(memoryIcons)].length,
+    memoryIcons.length,
+  );
+
+  // Foreign servers and invented names keep the wire name: the documented
+  // fallback, asserted here so a future "helpful" mapping has to change this
+  // test on purpose.
+  const foreignMapped = FOREIGN_SERVER_TOOLS.filter((name) => {
+    setLocale("zh-CN");
+    const zh = toolLabel(name);
+    setLocale("en");
+    return zh !== name || toolLabel(name) !== name;
+  });
+  equal("another MCP server's tools keep their wire name", foreignMapped, []);
+  setLocale("zh-CN");
+  equal("a model-invented tool name is not dressed up", toolLabel(FABRICATED), FABRICATED);
+  equal("and it keeps the neutral glyph", toolIcon(FABRICATED, { type: "unknown" }), "Wrench");
+  setLocale(previous);
 }
 
 console.log("the Paseo tool table matches the official catalog (0.12)");

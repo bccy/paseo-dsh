@@ -877,6 +877,35 @@ const TOOL_NAME_ICONS: Record<string, string> = {
   // out of the session), the same way bash's `IconApiOutlineRegular` maps to
   // `SquareTerminal`. Without an entry the row drew the wrench.
   present: "FileOutput",
+  // The memory plugin's tools (`dsh-prime-memory`), `conversation_search` and
+  // DSH's working-directory tool. They arrive as provider-native `unknown`
+  // details, so each row needs a name-keyed glyph or it falls to the wrench — the
+  // phone screenshot that reopened this was `memory_search` with a wrench. The
+  // glyphs are distinct inside the family (search / graph / node / add / …), and
+  // every name is a Lucide export the host bundle re-exports (`Node <name>` in
+  // Paseo's `lucide-react` list); `docs/research/table-labels.md` records the
+  // scan that decided which names were missing.
+  memory_search: "SearchCheck",
+  memory_search_graph: "Network",
+  memory_expand_graph_node: "Waypoints",
+  memory_add: "Plus",
+  memory_import: "Import",
+  memory_delete: "Trash2",
+  memory_conflicts: "Scale",
+  memory_conflicts_rejected: "FileX2",
+  memory_resolve_conflict: "Gavel",
+  memory_receipts: "ReceiptText",
+  memory_read_scene: "BookOpenText",
+  memory_room_admin: "LayoutGrid",
+  memory_room_review: "ClipboardList",
+  memory_ruminate: "RefreshCw",
+  memory_ruminate_cancel: "CircleStop",
+  memory_ruminate_status: "Gauge",
+  memory_slot_list: "List",
+  memory_slot_write: "PenLine",
+  memory_slot_close: "PackageCheck",
+  conversation_search: "MessagesSquare",
+  working_directory: "FolderTree",
 };
 
 /**

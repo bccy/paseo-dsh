@@ -217,6 +217,35 @@ const TEXT: Record<Locale, UiText> = {
       // our tool, but it arrives as an `unknown` detail, so without a label the
       // row printed the wire name next to a wrench.
       archive_subagents: "Archive subagents",
+      // The profile's own plugins register tools DSH has no `tool.title.*` for.
+      // Without an entry each row printed its wire name next to the wrench — the
+      // phone screenshot that reopened this was `memory_search`. Provenance:
+      // `dsh-prime-memory` registers the 19 `memory_*` tools and
+      // `conversation_search` (`dist/tools/index.js`); DSH's
+      // `dsh-tool-working-directory` registers `working_directory`. Every name
+      // here also appears in a real `request/header` tool list on this machine —
+      // the scan and the gap list live in `docs/research/table-labels.md`.
+      memory_search: "Search memory",
+      memory_search_graph: "Search memory graph",
+      memory_expand_graph_node: "Expand graph node",
+      memory_add: "Add memory",
+      memory_import: "Import memory",
+      memory_delete: "Delete memory",
+      memory_conflicts: "List memory conflicts",
+      memory_conflicts_rejected: "List rejected conflict decisions",
+      memory_resolve_conflict: "Resolve memory conflict",
+      memory_receipts: "Read memory receipts",
+      memory_read_scene: "Read memory scene",
+      memory_room_admin: "Manage memory rooms",
+      memory_room_review: "Review orphan memories",
+      memory_ruminate: "Run memory distillation",
+      memory_ruminate_cancel: "Cancel memory distillation",
+      memory_ruminate_status: "Check distillation status",
+      memory_slot_list: "List memory slots",
+      memory_slot_write: "Write memory slot",
+      memory_slot_close: "Close memory slot",
+      conversation_search: "Search conversations",
+      working_directory: "Show or change working directory",
       // The placeholder a tool row carries when the wire never named its tool.
       // The server no longer invents such a row (`server/timeline.ts` skips a
       // name-less call and drops a result with no call), so this only catches a
@@ -386,6 +415,33 @@ const TEXT: Record<Locale, UiText> = {
       mcp_tool_schema: "查看 MCP 工具参数",
       mcp_call_tool: "调用 MCP 工具",
       archive_subagents: "归档子智能体",
+      // profile 自带插件注册的工具，DSH 没有给它们 `tool.title.*`：缺表项时行头会印
+      // wire name 加兜底扳手（用户手机截图就是 `memory_search`）。来源：
+      // `dsh-prime-memory` 注册 19 个 `memory_*` 与 `conversation_search`
+      //（`dist/tools/index.js`）、DSH 的 `dsh-tool-working-directory` 注册
+      // `working_directory`；这些名字也都出现在本机真实的 `request/header` 工具表里
+      //（采集与缺口清单见 `docs/research/table-labels.md`）。
+      memory_search: "搜索记忆",
+      memory_search_graph: "搜索记忆图谱",
+      memory_expand_graph_node: "展开图谱节点",
+      memory_add: "添加记忆",
+      memory_import: "导入记忆",
+      memory_delete: "删除记忆",
+      memory_conflicts: "列出记忆冲突",
+      memory_conflicts_rejected: "列出被丢弃的冲突决策",
+      memory_resolve_conflict: "裁决记忆冲突",
+      memory_receipts: "查看记忆决策凭证",
+      memory_read_scene: "读取记忆场景",
+      memory_room_admin: "管理记忆分类",
+      memory_room_review: "复查孤立记忆",
+      memory_ruminate: "触发记忆反刍",
+      memory_ruminate_cancel: "取消记忆反刍",
+      memory_ruminate_status: "查看反刍状态",
+      memory_slot_list: "列出记忆槽位",
+      memory_slot_write: "写入记忆槽位",
+      memory_slot_close: "关闭记忆槽位",
+      conversation_search: "搜索对话记录",
+      working_directory: "查看或切换工作目录",
       // 工具行在 wire 上没拿到名字时的占位名。服务端已不再造这种行
       //（`server/timeline.ts` 跳过无名调用、丢弃没有调用的结果），这里只为
       // 旧版本/其它生产者发来的行兜底：可读标签胜过把字面量 `tool` 摆在扳手旁。
