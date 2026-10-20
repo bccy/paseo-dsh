@@ -217,6 +217,12 @@ const TEXT: Record<Locale, UiText> = {
       // our tool, but it arrives as an `unknown` detail, so without a label the
       // row printed the wire name next to a wrench.
       archive_subagents: "Archive subagents",
+      // The placeholder a tool row carries when the wire never named its tool.
+      // The server no longer invents such a row (`server/timeline.ts` skips a
+      // name-less call and drops a result with no call), so this only catches a
+      // row from an older build or another producer — where a readable label
+      // beats printing the literal `tool` next to a wrench.
+      tool: "Tool call",
     },
     paseoMcpLabels: {
       speak: "Speak",
@@ -380,6 +386,10 @@ const TEXT: Record<Locale, UiText> = {
       mcp_tool_schema: "查看 MCP 工具参数",
       mcp_call_tool: "调用 MCP 工具",
       archive_subagents: "归档子智能体",
+      // 工具行在 wire 上没拿到名字时的占位名。服务端已不再造这种行
+      //（`server/timeline.ts` 跳过无名调用、丢弃没有调用的结果），这里只为
+      // 旧版本/其它生产者发来的行兜底：可读标签胜过把字面量 `tool` 摆在扳手旁。
+      tool: "工具调用",
     },
     paseoMcpLabels: {
       speak: "朗读",

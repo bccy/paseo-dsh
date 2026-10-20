@@ -58,7 +58,7 @@ const {
   resolveLocale,
   setLocale,
 } = require("./client/locale.js");
-const { TOOL_ICON_NAMES, toolCallData, toolIcon, toolLabel } = require("./client/tool-call-data.js");
+const { TOOL_ICON_NAMES, UNNAMED_TOOL, toolCallData, toolIcon, toolLabel } = require("./client/tool-call-data.js");
 
 let passed = 0;
 let failed = 0;
@@ -491,6 +491,17 @@ console.log("row copy follows the locale, not the import");
   equal("an unknown tool still keeps its wire name", toolLabel("frobnicate"), "frobnicate");
   setLocale("en");
   equal("in English too", toolLabel("frobnicate"), "frobnicate");
+
+  // The literal placeholder a tool row carries when the wire never named its
+  // tool. The server stopped inventing those rows (`server/timeline.ts`), so this
+  // is the readable fallback for a row from an older build: a label and Paseo's
+  // neutral glyph instead of the bare `tool` next to a wrench.
+  setLocale("zh-CN");
+  equal("the unnamed-tool placeholder is readable", toolLabel(UNNAMED_TOOL), "工具调用");
+  equal("and gets the neutral glyph", toolIcon(UNNAMED_TOOL, undefined), "Wrench");
+  setLocale("en");
+  equal("in English too", toolLabel(UNNAMED_TOOL), "Tool call");
+  equal("with the same neutral glyph", toolIcon(UNNAMED_TOOL, { type: "unknown" }), "Wrench");
   setLocale(undefined);
 }
 

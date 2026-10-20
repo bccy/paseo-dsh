@@ -230,6 +230,19 @@ function stringField(source: Record<string, unknown>, key: string): string | und
   return typeof value === "string" && value !== "" ? value : undefined;
 }
 
+/**
+ * `turn`/`step` of one event, for a warning that has to be locatable.
+ *
+ * DSH carries both on the events that name a tool, and `?` is honest about an
+ * event that does not: a warning with a wrong position is worse than one with a
+ * missing position.
+ */
+function positionOf(data: Record<string, unknown>): string {
+  const turn = typeof data.turn === "number" ? data.turn : "?";
+  const step = typeof data.step === "number" ? data.step : "?";
+  return `turn ${turn}, step ${step}`;
+}
+
 /** Cap for a question-derived row title; longer prompts are cut with an ellipsis. */
 const QUESTION_TITLE_LIMIT = 80;
 
@@ -910,7 +923,20 @@ export class TimelineBuilder {
     for (const block of content) {
       if (!isRecord(block) || block.type !== "tool-call") continue;
       const callId = stringField(block, "id") ?? `tool:${turn}:${step}`;
-      const name = stringField(block, "name") ?? "tool";
+      const name = stringField(block, "name") ?? this.#toolNames.get(callId);
+      if (name === undefined) {
+        // A durable content block that names no tool cannot be drawn: the row
+        // would print the literal wire placeholder `tool` next to a wrench,
+        // which looks like a working row and is worse than no row at all. It is
+        // also the path that used to *overwrite* a real name with that
+        // placeholder, so nothing is written here; a later `tool/call` with the
+        // name draws the row. Reported because this should not happen at all.
+        this.#warn(
+          `assistant/message tool-call block ${callId} carries no name (${positionOf(data)}); ` +
+            `skipping the row rather than inventing one`,
+        );
+        continue;
+      }
       const input = parseArguments(block.arguments);
       this.#toolNames.set(callId, name);
       this.#toolInputs.set(callId, input);
@@ -950,7 +976,18 @@ export class TimelineBuilder {
   #toolCall(data: Record<string, unknown>): ProviderTimelineItem[] {
     const callId = stringField(data, "callId");
     if (callId === undefined) return [];
-    const name = stringField(data, "name") ?? "tool";
+    // Only a real name is remembered. Falling back to `#toolNames` first keeps a
+    // repeated event from erasing a name an earlier event (or the durable
+    // assistant message) already taught us; a placeholder is never written, so a
+    // name-less event cannot clobber a known one either.
+    const name = stringField(data, "name") ?? this.#toolNames.get(callId);
+    if (name === undefined) {
+      this.#warn(
+        `tool/call ${callId} carries no name (${positionOf(data)}); skipping the row ` +
+          `until an event that names the tool arrives`,
+      );
+      return [];
+    }
     const input = parseArguments(data.arguments);
     this.#toolNames.set(callId, name);
     this.#toolInputs.set(callId, input);
@@ -964,7 +1001,40 @@ export class TimelineBuilder {
     const message = isRecord(data.message) ? data.message : undefined;
     const callId = stringField(data, "toolCallId") ?? (message === undefined ? undefined : stringField(message, "toolCallId"));
     if (callId === undefined) return [];
-    const name = this.#toolNames.get(callId) ?? "tool";
+    const out: ProviderTimelineItem[] = [];
+    // A picture is not a tool row: Paseo's detail union has no image field, and
+    // its markdown renderer is the one surface that can draw bytes fetched over
+    // file RPC. So each stamped image block becomes its own assistant message.
+    // It is emitted *before* the tool row and independently of it: a result whose
+    // tool row cannot be drawn still carries an image the model was given, and
+    // dropping that would lose evidence for no reason.
+    for (const row of imageRows(callId, message?.content)) {
+      out.push(...this.#put({ type: "assistant_message", id: row.id, messageId: row.id, text: row.text }));
+    }
+    // Where a result learns its tool's name, in order:
+    // 1. the `tool/call` of this turn (`#toolNames`), or
+    // 2. the row already in the timeline.
+    // (2) is what DSH's compaction/prune replacements need. A replacement
+    // rewrites a durable `tool/result` node outside its original call, and this
+    // builder clears `#toolNames` at `turn/end` — but the row it belongs to is
+    // still here, so recovering the name lets the replacement update that row
+    // (its output/text) exactly as it did before names became turn-scoped,
+    // instead of warning about a phantom orphan and dropping the update.
+    const existing = this.#items.get(`tool:${callId}`);
+    const name = this.#toolNames.get(callId) ?? (existing?.type === "tool_call" ? existing.name : undefined);
+    if (name === undefined) {
+      // Truly orphan: no call this turn *and* no row to complete — a replay
+      // window that starts after the call, a compaction/prune replacement whose
+      // row is gone, or a producer that never announced one. Creating a row here
+      // is what printed the literal `tool` next to a wrench, so the tool row is
+      // dropped. The warning is the only way to see it (`paseo plugin logs`);
+      // the image rows emitted above still go out.
+      this.#warn(
+        `tool/result for ${callId} has no matching tool/call and no existing row (${positionOf(data)}); ` +
+          `dropping the tool row (replay window, compaction/prune replacement, or no call at all)`,
+      );
+      return out;
+    }
     const input = this.#toolInputs.get(callId) ?? {};
     const output = message === undefined ? "" : textOf(message.content);
     const failed = message?.isError === true;
@@ -980,7 +1050,6 @@ export class TimelineBuilder {
       this.#warn,
     );
 
-    const out: ProviderTimelineItem[] = [];
     if (name === "todo_write" && !failed) {
       const items = todoItems(input);
       if (items !== null) {
@@ -1000,13 +1069,6 @@ export class TimelineBuilder {
           : { status: "completed" as const, error: null }),
       }),
     );
-    // A picture is not a tool row: Paseo's detail union has no image field, and
-    // its markdown renderer is the one surface that can draw bytes fetched over
-    // file RPC. So each stamped image block becomes its own assistant message,
-    // right after the row that produced it.
-    for (const row of imageRows(callId, message?.content)) {
-      out.push(...this.#put({ type: "assistant_message", id: row.id, messageId: row.id, text: row.text }));
-    }
     return out;
   }
 
@@ -1202,6 +1264,18 @@ export class TimelineBuilder {
     // `reason.kind === "aborted"`, which used to fall through here and leave the
     // row `running` forever — the client pulses a running row unconditionally.
     const out = this.#cancelRunningTools();
+    // Names belong to the turn that taught them, so they cannot leak into a
+    // later turn whose own `tool/call` is outside a replay window. Rows stay:
+    // `#items` is what replays and de-duplicates them.
+    //
+    // Inputs deliberately stay too. They are only ever read together with a
+    // name, and a result that gets its name from its existing row (a
+    // compaction/prune replacement) needs that row's *original* arguments to
+    // rebuild its detail — otherwise the replacement would update the output but
+    // blank the command/path in the row's head. A `tool/call` always overwrites
+    // its own input before its own result, so a stale entry can never be used
+    // for a call this turn announced.
+    this.#toolNames.clear();
     const reason = isRecord(data.reason) ? data.reason : undefined;
     // `"error"` is the one failure reason that carries a message to show; the
     // other failure kinds (`max-tokens`, `blocked`, `interrupted`) have none and

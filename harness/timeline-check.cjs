@@ -156,6 +156,214 @@ console.log("a repeated tool/call must not undo a finished row");
   check("a different call still starts", reread[0]?.status === "running");
 }
 
+console.log("an unnamed tool never becomes a bare `tool` row");
+{
+  // DSH reuses a real callId in later turns, and a `tool/result` can arrive with
+  // no recorded call at all (a replay window). Inventing a row for it printed the
+  // literal wire placeholder `tool` next to a wrench: a row that looks like a
+  // working tool, cannot be acted on, and tells the user nothing.
+  const warned = [];
+  const builder = new TimelineBuilder({ warn: (line) => warned.push(line) });
+  const orphan = builder.consume({
+    type: "tool/result",
+    seq: 1,
+    data: {
+      turn: 7,
+      step: 3,
+      toolCallId: "call_orphan",
+      message: { content: [{ type: "text", text: "orphan output" }] },
+    },
+  });
+  check("a result with no recorded call emits no row", orphan.length === 0, JSON.stringify(orphan));
+  check(
+    "and warns with the callId and the event position",
+    warned.some((line) => line.includes("call_orphan") && line.includes("turn 7") && line.includes("step 3")),
+    JSON.stringify(warned),
+  );
+
+  const unnamed = builder.consume({
+    type: "tool/call",
+    seq: 2,
+    data: { turn: 7, step: 4, callId: "call_late", arguments: { command: "ls" } },
+  });
+  check("a name-less call emits no row either", unnamed.length === 0, JSON.stringify(unnamed));
+  check(
+    "and is reported too",
+    warned.some((line) => line.includes("call_late") && line.includes("no name")),
+    JSON.stringify(warned),
+  );
+  const named = builder.consume({
+    type: "tool/call",
+    seq: 3,
+    data: { turn: 7, step: 4, callId: "call_late", name: "bash", arguments: { command: "ls" } },
+  });
+  check(
+    "the named event that follows draws the row",
+    named[0]?.name === "bash" && named[0]?.status === "running",
+    JSON.stringify(named[0]),
+  );
+}
+
+console.log("a name-less durable block cannot overwrite a known name");
+{
+  // `assistant/message` carries the same tool-call blocks as the call events, and
+  // a block without `name` used to write the `tool` placeholder into the shared
+  // table — so the real row, and its result, came out named `tool`.
+  const builder = new TimelineBuilder({ warn: () => {} });
+  call(builder, "c-keep");
+  const block = builder.consume({
+    type: "assistant/message",
+    seq: 3,
+    data: {
+      turn: 2,
+      step: 1,
+      message: { content: [{ type: "tool-call", id: "c-keep", arguments: { command: "ls" } }] },
+    },
+  });
+  check(
+    "the block reuses the known name instead of the placeholder",
+    block.length === 0 || block.every((item) => item.name === "bash"),
+    JSON.stringify(block),
+  );
+  check(
+    "and nothing it emits is named `tool`",
+    block.every((item) => item.name !== "tool"),
+    JSON.stringify(block),
+  );
+  const finished = result(builder, "c-keep", "kept");
+  check("the completed row keeps the real name", finished[0]?.name === "bash", JSON.stringify(finished[0]));
+  check("and is not the placeholder", finished[0]?.name !== "tool");
+
+  // A block whose callId nobody knows has no name to borrow: it must not invent
+  // one (that is exactly the row that showed the bare `tool`).
+  const warned = [];
+  const unknown = new TimelineBuilder({ warn: (line) => warned.push(line) });
+  const skipped = unknown.consume({
+    type: "assistant/message",
+    seq: 1,
+    data: {
+      turn: 1,
+      step: 1,
+      message: { content: [{ type: "tool-call", id: "c-unknown", arguments: { command: "ls" } }] },
+    },
+  });
+  check("a block with no name and no recorded call emits nothing", skipped.length === 0, JSON.stringify(skipped));
+  check(
+    "and is reported",
+    warned.some((line) => line.includes("c-unknown") && line.includes("no name")),
+    JSON.stringify(warned),
+  );
+}
+
+console.log("a call-less result recovers the name from its existing row");
+{
+  // This is the compaction/prune replacement shape: DSH rewrites a durable
+  // `tool/result` node outside its original call, and this builder clears the
+  // turn-scoped name table at `turn/end`. The row itself is still in the
+  // timeline, so the replacement must recover its name from there and update
+  // that row — not warn about a phantom orphan and leave the row's text stale.
+  const warned = [];
+  const builder = new TimelineBuilder({ warn: (line) => warned.push(line) });
+  call(builder, "call_reused");
+  const first = result(builder, "call_reused", "first turn output");
+  check("the first result builds the row", first[0]?.name === "bash", JSON.stringify(first[0]));
+  turnEnd(builder, { kind: "completed" });
+
+  const replacement = builder.consume({
+    type: "tool/result",
+    seq: 4,
+    data: {
+      turn: 2,
+      step: 1,
+      toolCallId: "call_reused",
+      message: { content: [{ type: "text", text: "second turn output" }] },
+    },
+  });
+  check(
+    "the replacement still emits the row, under the row's own name",
+    replacement.length === 1 && replacement[0]?.name === "bash",
+    JSON.stringify(replacement),
+  );
+  check(
+    "and updates the row's text",
+    replacement[0]?.detail?.output === "second turn output",
+    JSON.stringify(replacement[0]?.detail),
+  );
+  check(
+    "recovering the name from the row is not a warning",
+    warned.length === 0,
+    JSON.stringify(warned),
+  );
+  check(
+    "the recovered row keeps the command it was built with",
+    replacement[0]?.detail?.command === "ls",
+    JSON.stringify(replacement[0]?.detail),
+  );
+
+  // A named call in the new turn still supplies the new turn's name.
+  builder.consume({
+    type: "tool/call",
+    seq: 5,
+    data: { turn: 2, step: 1, callId: "call_reused", name: "grep", arguments: { pattern: "x" } },
+  });
+  const fresh = builder.consume({
+    type: "tool/result",
+    seq: 6,
+    data: { turn: 2, toolCallId: "call_reused", message: { content: [{ type: "text", text: "fresh" }] } },
+  });
+  check("a named call in the new turn names its row", fresh[0]?.name === "grep", JSON.stringify(fresh[0]));
+}
+
+console.log("a truly orphan result drops the tool row but keeps its pictures");
+{
+  // No call this turn and no row to recover a name from. The tool row must not be
+  // invented (that is the bare `tool` row), but an image the model was given is
+  // not a tool row and must still reach the timeline.
+  const warned = [];
+  const builder = new TimelineBuilder({ warn: (line) => warned.push(line) });
+  const orphan = builder.consume({
+    type: "tool/result",
+    seq: 1,
+    data: {
+      turn: 9,
+      step: 2,
+      toolCallId: "call_orphan_image",
+      message: {
+        content: [
+          { type: "text", text: "image/png 100x100" },
+          {
+            type: "image",
+            attachment: { attachmentId: "sha256:0f1e", mediaType: "image/png", bytes: 12, name: "shot.png" },
+            hostPath: "/tmp/orphan dir/shot.png",
+          },
+        ],
+      },
+    },
+  });
+  check(
+    "only the picture row goes out",
+    orphan.length === 1 && orphan[0]?.type === "assistant_message",
+    JSON.stringify(orphan.map((item) => item.type)),
+  );
+  check(
+    "with the host path as its markdown source",
+    orphan[0]?.text === "![shot.png](file:///tmp/orphan%20dir/shot.png)",
+    JSON.stringify(orphan[0]?.text),
+  );
+  check(
+    "and no tool row is invented",
+    !orphan.some((item) => item.type === "tool_call"),
+    JSON.stringify(orphan),
+  );
+  check(
+    "the orphan is still reported, with its position",
+    warned.some(
+      (line) => line.includes("call_orphan_image") && line.includes("turn 9") && line.includes("step 2"),
+    ),
+    JSON.stringify(warned),
+  );
+}
+
 console.log("a repeated tool/call while running");
 {
   const builder = new TimelineBuilder();
@@ -1092,8 +1300,8 @@ console.log("\nan image block the bridge stamped becomes its own markdown row");
   ]);
   const image = out.find((item) => item.type === "assistant_message");
   check(
-    "the tool row is still there, and the picture follows it",
-    out.length === 2 && out[0]?.type === "tool_call" && out[1]?.type === "assistant_message",
+    "the picture row and the tool row are both there, picture first",
+    out.length === 2 && out[0]?.type === "assistant_message" && out[1]?.type === "tool_call",
     JSON.stringify(out.map((item) => item.type)),
   );
   check(
@@ -1188,8 +1396,8 @@ console.log("\nan image block the bridge stamped becomes its own markdown row");
     true,
   );
   check(
-    "a failed result with a stamped image still gets its row",
-    failedOut.length === 2 && failedOut[1]?.text === "![kept.png](file:///tmp/kept.png)",
+    "a failed result with a stamped image still gets its picture row",
+    failedOut.length === 2 && failedOut[0]?.text === "![kept.png](file:///tmp/kept.png)",
     JSON.stringify(failedOut.map((item) => item.type)),
   );
 

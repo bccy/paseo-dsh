@@ -956,9 +956,22 @@ const WEB_ROW_ICONS: Record<string, string> = {
   web_fetch: "Eye",
 };
 
+/**
+ * The wire name a tool row carries when the daemon never learned its tool.
+ *
+ * The server stopped inventing these rows (`server/timeline.ts` skips a
+ * name-less call and drops a result with no call), so this only reaches the
+ * client from an older build or another producer. Such a row still deserves a
+ * readable label and Paseo's neutral glyph — the wrench `unknown`/`plain_text`
+ * details already use — instead of the bare wire name, which reads like a tool
+ * actually called `tool`.
+ */
+export const UNNAMED_TOOL = "tool";
+
 /** Choose the same icon Paseo's stock row would. */
 export function toolIcon(name: string, detail: ToolDetail | undefined): string {
   const normalized = name.trim().toLowerCase();
+  if (normalized === UNNAMED_TOOL) return "Wrench";
   if (detail !== undefined && detail.type === "plain_text" && typeof detail.icon === "string") {
     return PLAIN_ICONS[detail.icon] ?? "Wrench";
   }
