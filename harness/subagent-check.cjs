@@ -856,6 +856,66 @@ async function openSession(conn, sessionId, history) {
   );
   await connFail.close();
 
+  // ---- a plugin reload must not duplicate the subagent list --------------
+  // Paseo keys provider subagents by `parentAgentId + subagentId`
+  // (`provider-subagents/store.js` `storeKey`) and only clears them on an
+  // *agent* reload (`agent-manager.js` `deleteParent` callers), while a plugin
+  // reload mints a new root provider session id for the same agent. Scoping the
+  // child id by the root provider id therefore replayed every child under a
+  // fresh id after each reload and showed the whole subagent list twice.
+  const openReplayWithAgent = async (root, agentId, sink) => {
+    const replayConn = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+    replayConn.onEvent((e) => sink.push(e));
+    process.env.DSH_FAKE_MODE = "replay";
+    await replayConn.send({
+      type: "session.open",
+      sessionId: root,
+      config: {
+        cwd: process.cwd(),
+        mode: "build",
+        ...(agentId === undefined ? {} : { env: { PASEO_AGENT_ID: agentId } }),
+      },
+      persistence: { version: 1, data: { sessionId: root } },
+      history: "replay",
+    });
+    await untilIn(sink, (e) => e.type === "session.ready" && e.sessionId === root, `ready ${root}`, 30000);
+    await sleep(400);
+    await replayConn.close();
+    return sink.find((e) => e.type === "session.opened" && e.parentSessionId === root)?.sessionId;
+  };
+  const reloadRoot1 = `subR1-${Date.now()}`;
+  const reloadRoot2 = `subR2-${Date.now()}`;
+  const reloadRoot3 = `subR3-${Date.now()}`;
+  const reloadRoot4 = `subR4-${Date.now()}`;
+  const reloadChild1 = await openReplayWithAgent(reloadRoot1, "paseo-agent-A", []);
+  const reloadChild2 = await openReplayWithAgent(reloadRoot2, "paseo-agent-A", []);
+  const reloadChild3 = await openReplayWithAgent(reloadRoot3, "paseo-agent-B", []);
+  const reloadChild4 = await openReplayWithAgent(reloadRoot4, undefined, []);
+  const reloadParts1 = String(reloadChild1 ?? "").split(":sub:");
+  const reloadParts2 = String(reloadChild2 ?? "").split(":sub:");
+  const reloadParts3 = String(reloadChild3 ?? "").split(":sub:");
+  const reloadParts4 = String(reloadChild4 ?? "").split(":sub:");
+  check(
+    "a reload re-announces the same child under the same provider id (agent-scoped, not root-scoped)",
+    reloadParts1.length === 2 &&
+      reloadParts1[0] === "paseo-agent-A" &&
+      reloadParts2.length === 2 &&
+      reloadParts2[0] === "paseo-agent-A" &&
+      reloadParts1[1] === reloadParts2[1],
+    `${String(reloadChild1)} vs ${String(reloadChild2)}`,
+  );
+  check(
+    "another Paseo agent replaying the same native child still gets a distinct id",
+    reloadParts3.length === 2 && reloadParts3[0] === "paseo-agent-B" && reloadParts3[1] === reloadParts1[1] &&
+      reloadChild3 !== reloadChild1,
+    `${String(reloadChild1)} vs ${String(reloadChild3)}`,
+  );
+  check(
+    "without a Paseo agent id the id stays root-scoped (probes, tests)",
+    reloadParts4.length === 2 && reloadParts4[0] === reloadRoot4,
+    `${String(reloadChild4)} vs ${scoped(reloadRoot4, String(reloadParts1[1]))}`,
+  );
+
   await conn.close();
   await conn2.close();
   await conn3.close();

@@ -893,6 +893,10 @@ class DshConnection implements ProviderConnection {
       dshSessionId,
       cwd: config.cwd,
       env: config.env ?? {},
+      // Stable across the provider-session re-mints a reload performs; native
+      // child ids are scoped by it so a reload upserts the same Paseo rows
+      // instead of adding a duplicate set (see `DshSessionOptions.agentId`).
+      ...(agentId === "" ? {} : { agentId }),
       // Paseo injects its own `paseo` MCP server here for every provider that
       // declares `supportsMcpServers` (plugin providers always do, and cannot
       // take the native-tools path opencode uses). Dropping this map is what

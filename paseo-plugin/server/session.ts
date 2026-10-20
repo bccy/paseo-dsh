@@ -91,6 +91,19 @@ export interface DshSessionOptions {
   cwd: string;
   env: Record<string, string>;
   /**
+   * Paseo's stable agent id for this session (from `config.env.PASEO_AGENT_ID`).
+   *
+   * Native child provider ids are scoped by it. A plugin reload mints a new
+   * root provider session id for the *same* agent, while Paseo's
+   * provider-subagent store keys rows by `parentAgentId + subagentId` and only
+   * clears them on an agent reload — so scoping children by the root provider
+   * id made every plugin reload replay the same children under fresh ids and
+   * show each one twice. Scoping by the agent id keeps ids stable across
+   * reloads, and two agents resuming the same native child still get distinct
+   * ids (they also get distinct `parentAgentId`s, so neither row collides).
+   */
+  agentId?: string;
+  /**
    * MCP servers Paseo attached to this session. Forwarded verbatim: the process
    * turns them into the `--patch` overlay DSH reads at boot, which is the only
    * point DSH accepts them.
@@ -1432,9 +1445,14 @@ export class DshSession {
     const parentScoped = this.#parentScopedId(payload.parentSessionId);
     if (parentScoped === undefined) return undefined;
     const child = new DshChildSession({
-      // Root-scoped: two Paseo sessions resuming the same native child must not
-      // collide in Paseo's per-provider session namespace.
-      id: `${this.id}:sub:${payload.sessionId}`,
+      // Scoped by Paseo's stable agent id, not by the root provider session id:
+      // a plugin reload re-mints the latter for the same agent, and Paseo keys
+      // its provider-subagent rows by `parentAgentId + subagentId` without
+      // clearing them on a plugin reload — a root-id scope therefore replayed
+      // every child under a fresh id and duplicated the whole subagent list.
+      // Sessions opened without a Paseo agent id (probes, tests) keep the old
+      // root-scoped id; only a reload of such a session can duplicate a child.
+      id: `${this.#options.agentId ?? this.id}:sub:${payload.sessionId}`,
       nativeId: payload.sessionId,
       subsession: this.#subsession,
       cwd: payload.cwd ?? this.#options.cwd,
