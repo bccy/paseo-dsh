@@ -299,6 +299,72 @@ async function openSession(conn, sessionId, history) {
   );
   check("strict parent-cap gate still holds across both roots", parentCapViolations(events).length === 0, parentCapViolations(events)[0]);
 
+  // ---- a reopen must not mint a second id for the same native child -------
+  // A plugin reload (or the rewind refresh) closes the provider session and
+  // reopens the same DSH session under a *fresh* provider session id. Paseo keys
+  // its provider-subagent rows by `parentAgentId + subagentId` and clears them
+  // only on an agent reload, so a scope that changes per open replays the same
+  // child under a new id and the list doubles (13 children listed as 26 on this
+  // machine, one set per generation). The scope must therefore be the durable
+  // identity — the Paseo agent id when the host injects one, else the DSH
+  // session id, which a reopen keeps. The provider session id never survives.
+  const nativeRoot = `native-${Date.now()}`;
+  const persistence = { version: 1, data: { sessionId: nativeRoot } };
+  const openGeneration = async (sessionId) => {
+    const generation = await registration.connect({
+      capabilities: ["prompt.message", "session.subsession", "session.persistence"],
+    });
+    const generationEvents = [];
+    generation.onEvent((event) => generationEvents.push(event));
+    await generation.send({
+      type: "session.open",
+      sessionId,
+      config: { cwd: process.cwd(), mode: "build" },
+      persistence,
+      history: "skip",
+    });
+    await untilIn(
+      generationEvents,
+      (event) => event.type === "session.ready" && event.sessionId === sessionId,
+      `ready ${sessionId}`,
+      30000,
+    );
+    await generation.send({
+      type: "session.prompt",
+      sessionId,
+      prompt: { clientMessageId: `p-${sessionId}`, input: { type: "message", content: [{ type: "text", text: "go" }] } },
+    });
+    // Filtered by the child's *parent* (this generation's provider session id):
+    // the child's own id is deliberately the same across generations, so
+    // matching on it would accept the previous generation's event.
+    const child = await untilIn(
+      generationEvents,
+      (event) =>
+        event.type === "session.opened" &&
+        event.parentSessionId === sessionId &&
+        event.sessionId.endsWith(":sub:child-A"),
+      `child of ${sessionId}`,
+      30000,
+    );
+    await generation.close();
+    return child;
+  };
+  process.env.DSH_FAKE_MODE = "live";
+  const genOneId = `gen1-${Date.now()}`;
+  const genTwoId = `gen2-${Date.now()}`;
+  const genOneChild = await openGeneration(genOneId);
+  const genTwoChild = await openGeneration(genTwoId);
+  check(
+    "the same native child keeps one provider id across a provider-session re-mint",
+    genOneChild.sessionId === genTwoChild.sessionId && genOneChild.sessionId === `${nativeRoot}:sub:child-A`,
+    `${genOneChild.sessionId} vs ${genTwoChild.sessionId} (want ${nativeRoot}:sub:child-A)`,
+  );
+  check(
+    "while its parent link still names the provider session of its own generation",
+    genOneChild.parentSessionId === genOneId && genTwoChild.parentSessionId === genTwoId,
+    `${genOneChild.parentSessionId} / ${genTwoChild.parentSessionId}`,
+  );
+
   // ---- host without session.subsession: stay root-only, never fail -------
   const conn2 = await registration.connect({ capabilities: ["prompt.message", "session.persistence"] });
   const conn2Events = [];

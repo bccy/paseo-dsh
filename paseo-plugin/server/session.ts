@@ -1450,9 +1450,13 @@ export class DshSession {
       // its provider-subagent rows by `parentAgentId + subagentId` without
       // clearing them on a plugin reload — a root-id scope therefore replayed
       // every child under a fresh id and duplicated the whole subagent list.
-      // Sessions opened without a Paseo agent id (probes, tests) keep the old
-      // root-scoped id; only a reload of such a session can duplicate a child.
-      id: `${this.#options.agentId ?? this.id}:sub:${payload.sessionId}`,
+      //
+      // Without a Paseo agent id (probes, tests) the scope comes from the DSH
+      // session id: that is the durable identity a reopen keeps, while the
+      // provider session id is minted fresh on every open. Scoping a reopen by
+      // the provider session id minted a second full set of rows — the same
+      // child then appears twice in Paseo, once per generation.
+      id: `${this.#options.agentId ?? this.#dshSessionId}:sub:${payload.sessionId}`,
       nativeId: payload.sessionId,
       subsession: this.#subsession,
       cwd: payload.cwd ?? this.#options.cwd,
