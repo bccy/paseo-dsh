@@ -1117,41 +1117,72 @@ class DshConnection implements ProviderConnection {
         `cannot ${archived ? "archive" : "unarchive"}: the persistence handle names no DSH session`,
       );
     }
+    const verb = archived ? "archive" : "unarchive";
     // DSH's registry is process-global, so a session that is already open can
     // carry the request — which is what lets a native child, with no process of
     // its own, be archived through its root. But the archive *record* and the
-    // act of stopping live work are different things: the record lands on disk,
-    // while stopping happens in the process that owns the session. So the root
-    // actually holding this id goes first, and every other root is only a
-    // fallback. When nothing is open (the state after Paseo archived the last
-    // session), fall back to a throwaway runtime: the archive set lives in DSH's
-    // home, not in this process.
+    // process that reads it back are different things: the record lands on disk,
+    // while `archivedSessionIds` is answered from the memory of the process that
+    // ran the call. So the process that owns this session goes first, and every
+    // other root is only a fallback. When nothing is open (the state after Paseo
+    // archived the last session), fall back to a throwaway runtime: the archive
+    // set lives in DSH's home, not in this process.
     const ordered = [...this.#sessions.values()].sort(
       (a, b) => Number(b.holdsDshSession(dshSessionId)) - Number(a.holdsDshSession(dshSessionId)),
     );
+    const holder = ordered.find((session) => session.holdsDshSession(dshSessionId));
     const reasons: string[] = [];
-    for (const session of ordered) {
+    const note = (dshId: string, error: unknown): void => {
+      reasons.push(messageOf(error));
+      process.stderr.write(`[${PROVIDER_ID}] ${verb} via ${dshId} failed: ${messageOf(error)}\n`);
+    };
+    const dropStaleParked = (): void => {
+      this.#parked.discard(dshSessionId, `${verb} was carried by another process`);
+    };
+    if (holder !== undefined) {
       try {
-        await session.archiveDshSession(dshSessionId, archived);
+        await holder.archiveDshSession(dshSessionId, archived);
+        // A parked entry for the same id cannot coexist with a live holder (the
+        // parked process still holds the session log's write lock), so this is a
+        // no-op today — it keeps that invariant from depending on park/take
+        // staying exactly as they are.
+        dropStaleParked();
         return;
       } catch (error) {
         // A rescued failure still means this process did not do it, so it is
         // reported rather than swallowed; the reasons are also what the caller
         // sees if every attempt fails.
-        reasons.push(messageOf(error));
-        process.stderr.write(
-          `[${PROVIDER_ID}] ${archived ? "archive" : "unarchive"} via ${session.dshId} failed: ${messageOf(error)}\n`,
-        );
+        note(holder.dshId, error);
+      }
+    }
+    // Paseo closes a session before it archives or unarchives it, so by the time
+    // the request arrives the holder is usually a *parked* process, not an open
+    // one. That parked process must not write the change, though: DSH's registry
+    // serializes its whole archive set, and a parked process only holds the set
+    // it read at its own start, so letting it write would silently drop another
+    // session's archive change. The carriers below are therefore unchanged — a
+    // throwaway runtime reads the current set. What the parked process cannot do
+    // is survive: it is the process the reopen adopts, and DSH's archived-session
+    // gate answers from process memory, so a stale set leaves it rejecting every
+    // turn of that session with no model request at all ("the turn ended with
+    // blocked").
+    for (const session of ordered) {
+      if (session === holder) continue;
+      try {
+        await session.archiveDshSession(dshSessionId, archived);
+        dropStaleParked();
+        return;
+      } catch (error) {
+        note(session.dshId, error);
       }
     }
     try {
       await applyArchivedStandalone(dshSessionId, archived);
     } catch (error) {
       reasons.push(messageOf(error));
-      throw new Error(
-        `cannot ${archived ? "archive" : "unarchive"} ${dshSessionId}: ${reasons.join("; ")}`,
-      );
+      throw new Error(`cannot ${verb} ${dshSessionId}: ${reasons.join("; ")}`);
     }
+    dropStaleParked();
   }
 
   /**

@@ -65,6 +65,10 @@ function fakeProcess(name) {
       this.killed = true;
       this.running = false;
     },
+    async waitForExit() {
+      this.running = false;
+      return true;
+    },
   };
 }
 
@@ -161,6 +165,25 @@ console.log("forget on a parked process exit");
   pool.park(entry(child));
   child.handlers.onExit(1, null);
   check("an exited parked process is forgotten", pool.size === 0);
+}
+
+console.log("discard (archive routing)");
+{
+  const pool = makePool();
+  const child = fakeProcess("o");
+  pool.park(entry(child));
+  // A parked process that did not carry an archive change must not serve the next
+  // open: its in-memory archive set is stale and the gate would end every turn as
+  // `blocked`. It must not be made the writer either — DSH serializes the whole
+  // set, so a snapshot from its own start would drop another session's change.
+  check("discard drops the entry", pool.discard("dsh-1", "unarchive was carried by another process") === true);
+  check("and kills the process", child.killed === true && pool.size === 0 && pool.has("dsh-1") === false);
+  check("discard on an unknown id is a miss, not an error", pool.discard("dsh-1", "again") === false);
+  check("discard is logged with its reason", logs.some((line) => line.includes("parked:discard dsh-1") && line.includes("another process")));
+  // The killed owner still holds the session log's write lock for a moment, so
+  // the next open has to be able to wait for it (otherwise the cold start fails
+  // with "already owned by an active write handle").
+  check("quiesce waits for the discarded owner", (await pool.quiesce("dsh-1", { cwd: "/work", routeKey: "p/m/max" })) === true);
 }
 
 console.log("stop kills everything");

@@ -2048,6 +2048,80 @@ guard exists`（105 passed, 1 failed）；把条件改成无条件 skip → 同�
 
 ---
 
+### 65. 取消归档后每条消息都 `blocked`：归档集只写进了磁盘，没写进那个还活着的进程
+
+**症状**（2026-10-22 真机）：在 App 里归档一个会话，再点「取消归档」，之后给它发消息，回合
+**约 160ms 就失败**，界面提示 `the turn ended with blocked`。看着像模型或上下文问题，其实
+连模型请求都没发出去。
+
+**取证链**（每一环都有据，纯读码推断不算）：
+
+1. `~/.paseo/daemon.log`：`handleStreamEvent: turn_failed`，`error: "the turn ended with blocked"`。
+2. 会话日志（多帧 zstd，`zstd -dc`）末尾只有三帧：`turn/start {turn:25}` →
+   `agent/inbox/spliced {removedCount:1}` → `turn/end {reason:{kind:"blocked"}}`，
+   **没有 `step/start`**——说明根本没发起模型请求。
+3. DSH 里 `blocked` 只有一个来源：`preStep` 返回 `{kind:"reject"}`（`@deepseek-ai/dsh-agent-loop/lib/index.js:959-961`）。
+   注册 pre-step 且会 reject 的只有两处：**archived-session-gate**（`dsh-api-session-controller/lib/types/archived-session-gate.js:20-24`）
+   与 goal 轮次驱动。该会话日志里没有任何 goal 事件，goal 一路排除。
+4. 归档门禁读的是**进程内存**：`ctx.workspaceRegistry.archivedSessionIds`（同一文件第 36 行）。
+   它没有任何跨进程失效机制——谁执行了归档调用，谁的这份数组才变。
+5. 时序（对得上到毫秒）：处理这条消息的 dsh 进程启动于 `06:08:17`（`/tmp/dsh-paseo-mcp-*/` 创建时间），
+   而 `~/.dsh/storages/workspace.json` 的写入时间是 `06:08:21.893`；插件日志同一秒是
+   `parked:park`(.891) → 落盘(.893) → `parked:take`(.910)。**进程比取消归档落盘早约 5 秒**，
+   它启动时读到的归档集里还有这条会话，之后没人告诉它"已经取消了"。
+
+**根因**（在插件侧，不在 Paseo）：Paseo 归档/取消归档前会**先关掉该会话**，于是请求到达时
+`#sessions` 里没有持有它的打开会话，旧代码就退回一次性 probe 进程去改——**只改了磁盘**。
+紧接着 App 重开，插件从停放池**取回原来那个进程**（`parked:take`），它的内存归档集还是旧的，
+门禁于是否掉这个会话的每一个回合。`#setArchived()` 的注释当时只写了"记录落盘"和"停活由持有进程做"，
+漏了第三种后果：**读这份记录的也是进程内存**。
+
+**修法**（第一版改错了，独立复核把它拦下来）：
+
+- `ParkedSessions.discard(dshSessionId, reason)`：把停放进程移出池并 kill、记入 dying 名单——
+  于是下一次 open 的 `quiesce()` 会等它释放会话日志的写锁，不会撞上 "already owned by an
+  active write handle"。miss 不是错误（未停放时是 no-op）。
+- `#setArchived()` 的候选顺序**保持不变**（已打开且持有该 id 的会话 → 其他已打开会话 → 一次性
+  probe），但**任何非持有者的成功承载之后，都要把该会话的停放进程 `discard` 掉**：它就是重开
+  时会收养的那个进程，门禁读的是它的内存，留着它就会继续拒绝这个会话的每一个回合。
+
+**为什么不是"让停放进程自己承载"**（第一版的做法，已废弃）：`registry.archiveSession` 会把
+**整份** `archivedSessionIds` 写回磁盘，而停放进程手里的那份是它**启动时**读到的快照——跨进程
+没有任何失效机制（storage 层无 `fs.watch`，`dsh-storage-json` 明确"内存权威、只在 open 时读一次"）。
+于是"归档 A 之后再由 B 的停放进程归档 B"会把 A 的归档从盘上抹掉，而且**事后补一次 probe 也救不
+回来**（probe 读到的已经是被覆盖的盘）。独立复核用两个 storage 实例做了机制级实证。代价是这种
+情况下重开会冷启动一次（1.5–2.7s），但归档/取消归档是低频动作，宁可慢一次也不丢归档状态。
+
+**验证**：`harness/subagent-check.cjs` **78/78**（新增 5 条：停放进程有自己的 pid、停放期间
+unarchive 有回执、**停放进程绝不承载这次写入**、**陈旧停放进程确实被作废**（直接抓插件自己的
+`parked:discard <id>` 日志行，避免负向断言空过）、**重开冷启动而不是收养那个陈旧进程**）；
+`harness/parked-sessions-check.cjs` **32/32**（discard 语义 + discard 后 quiesce 会等）；
+`harness/steer-check.cjs` **25/25**、`harness/bridge-assets-check.mjs` **2/2**、`tsc --noEmit` 干净。
+假桥的 `DSH_FAKE_LOG` 每行现在带 `pid`（区分"哪个进程服务的请求"是这条回归的关键）。
+**变异验证**：把 `discard` 换成空函数 → **76/78**，红的正是上面第 4、5 条（`(no parked: line)`、
+`pids 719155 vs dropped owner 719155`）；还原后 78/78。另：第一版测试把 unarchive 发在
+**第二条连接**上，因此永远走不到停放池——那是脚手架形状问题（假桥脚本每个 connection 一个
+provider 实例），真实 daemon 是**每个 provider id 一个连接**（`PluginAgentClient` 缓存
+`ProviderRuntime` 的单一 connection）。
+
+**独立复核（两轮，只读、产物在 /tmp）**：第一轮拦下了"让停放进程自己承载"的第一版修法
+（会用陈旧快照覆盖其他会话的归档，机制级实证），并确认根因链每一环与 `discard`/`quiesce`
+的写锁时序；第二轮确认 clobber 已消除、剩余陈旧写者与改前同集合、`#dying` 64 条挤出与
+"承载期间被重开抢先"两条窄缝属既有残余（后者在生产上被 Paseo 的
+`unarchiveSnapshotUnlocked` 先 await 回执再重开闭合）。
+
+**遗留（本次未修，与既有代码同源）**：`#setArchived()` 的"持有者优先"路径同样会让一个**长期
+运行的打开会话**用它的内存快照写回整份归档集，多会话交替归档时同样可能覆盖。要根治得让
+"写归档集"只由**读盘最新**的进程承担（或桥侧先与磁盘对齐），那会动到"停活在持有进程里做"的
+既有语义，留待单独评估。
+
+**真机注意**：daemon 的 `PluginAgentClient` 每个 provider id 只缓存**一个**连接
+（`@getpaseo/server/dist/server/server/agent/plugin-provider.js:225-245`），所以每个 agent 的
+归档请求都会到达停放它的那个进程——这条修复依赖这个事实；假桥脚本里"每个 connection 一个
+provider 实例"是测试脚手架的形状，不是 daemon 的形状。
+
+---
+
 ## 已知限制（未修，有意为之）
 
 | 项 | 说明 |

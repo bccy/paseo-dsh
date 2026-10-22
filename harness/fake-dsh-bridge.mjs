@@ -97,10 +97,16 @@ if (ARGV_PATH !== undefined && ARGV_PATH !== "") {
   writeFileSync(ARGV_PATH, JSON.stringify({ argv, patchPath, patch }, null, 2));
 }
 
-/** Append one received request to `DSH_FAKE_LOG`, when the test asked for it. */
+/**
+ * Append one received request to `DSH_FAKE_LOG`, when the test asked for it.
+ *
+ * The pid is part of the record so a test can tell *which* process served a
+ * request: a change routed to an already-running (parked) child must not be
+ * confused with one a throwaway runtime carried.
+ */
 function logFrame(method, params) {
   if (LOG_PATH === undefined || LOG_PATH === "") return;
-  appendFileSync(LOG_PATH, `${JSON.stringify({ method, params })}\n`);
+  appendFileSync(LOG_PATH, `${JSON.stringify({ pid: process.pid, method, params })}\n`);
 }
 
 let rootId = null;

@@ -283,6 +283,36 @@ export class ParkedSessions {
     return this.#pool.has(dshSessionId);
   }
 
+  /**
+   * Kill and forget one parked process whose in-memory archive set is stale.
+   *
+   * DSH's `archived-session-gate` decides from `workspaceRegistry
+   * .archivedSessionIds`, and that list only changes in the process that ran the
+   * archive call — there is no cross-process invalidation. A parked process that
+   * did not carry the change therefore keeps rejecting every turn of the session
+   * it is about to be adopted for: the turn ends as `blocked` with no model
+   * request, which reads in Paseo as "the turn ended with blocked". It also must
+   * not be *made* the writer: DSH serializes the whole set, so a process holding
+   * a snapshot from its own start would drop another session's archive change.
+   * The pool drops such an entry instead of handing it to the next open; the next
+   * open cold-starts and reads the archive set from DSH's storage instead. The
+   * killed process is remembered as dying, so the next open's {@link quiesce}
+   * waits for the session log's write lock to be released.
+   *
+   * @param dshSessionId - DSH native session id.
+   * @param reason - why it is being dropped (goes to the log).
+   * @returns whether an entry was dropped (a miss is not an error).
+   */
+  discard(dshSessionId: string, reason: string): boolean {
+    const entry = this.#pool.get(dshSessionId);
+    if (entry === undefined) return false;
+    this.#pool.delete(dshSessionId);
+    entry.process.kill();
+    this.#markDying(dshSessionId, entry.process);
+    this.#log(`parked:discard ${dshSessionId} (${reason})`);
+    return true;
+  }
+
   /** Whether `take()` would adopt this entry instead of killing it. */
   #reusable(entry: ParkedEntry, expected: ParkedExpectation): boolean {
     return entry.process.running && entry.cwd === expected.cwd && entry.routeKey === expected.routeKey;

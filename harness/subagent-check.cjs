@@ -506,6 +506,100 @@ async function openSession(conn, sessionId, history) {
   );
   await connArchive.close();
 
+  // ---- an archive change arrives while the holder is parked --------------
+  // Paseo closes a session before archiving or unarchiving it, so the request
+  // usually arrives when the holder is a *parked* process rather than an open
+  // one. Two things have to hold for that process:
+  //
+  // - it must NOT write the change. DSH's registry serializes its whole archive
+  //   set and a parked process only holds the set it read at its own start, so a
+  //   stale writer would silently drop another session's archive change. The
+  //   throwaway runtime reads the current set instead.
+  // - it must not survive the change either. It is the process the reopen adopts,
+  //   and DSH's archived-session gate answers from process memory, so a stale set
+  //   left it rejecting every turn of that session: `turn/end {kind:"blocked"}`
+  //   with no model request at all, which Paseo shows as "the turn ended with
+  //   blocked". The pool drops it and the reopen cold-starts on a fresh read.
+  //
+  // The request is sent on the same connection that parked the process, because
+  // that is what the daemon does: `PluginAgentClient` caches ONE provider
+  // connection per provider id, so every agent's archive request reaches the
+  // process that parked the session.
+  const parkedLog = path.join(os.tmpdir(), `dsh-fake-log-parked-${Date.now()}.jsonl`);
+  process.env.DSH_FAKE_LOG = parkedLog;
+  process.env.DSH_FAKE_MODE = "live";
+  const parkedFrames = () => (fs.existsSync(parkedLog)
+    ? fs.readFileSync(parkedLog, "utf8").split("\n").filter((line) => line.trim() !== "").map((line) => JSON.parse(line))
+    : []);
+  const rootQ = `subQ-${Date.now()}`;
+  const parkedHandle = { version: 1, data: { sessionId: rootQ } };
+  await conn.send({
+    type: "session.open",
+    requestId: "parked-open",
+    sessionId: rootQ,
+    config: { cwd: process.cwd(), mode: "build" },
+    history: "skip",
+  });
+  await until((e) => e.type === "session.ready" && e.sessionId === rootQ, "rootQ ready", 30000);
+  // Only processes spawned after the log was armed write to it, so every frame
+  // carrying this session id belongs to rootQ's own process.
+  const ownerPid = parkedFrames().find((frame) => frame.params?.sessionId === rootQ)?.pid;
+  check("the parked case owns a process of its own", typeof ownerPid === "number", `pid ${ownerPid}`);
+  // The daemon closes the old provider session right before it archives.
+  await conn.send({ type: "session.close", sessionId: rootQ });
+  await sleep(300);
+  const parkedMark = parkedFrames().length;
+  // The plugin runs in this process, so its own `parked:discard` line can be
+  // captured: the negative "never writes" check below cannot fail an
+  // implementation that simply does nothing, this one can.
+  const pluginLog = [];
+  const realStderrWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk, ...rest) => {
+    pluginLog.push(String(chunk));
+    return realStderrWrite(chunk, ...rest);
+  };
+  let parkedReply;
+  try {
+    await conn.send({ type: "session.unarchive", requestId: "parked-unarchive", persistence: parkedHandle });
+    parkedReply = await until(isReply("parked-unarchive"), "unarchive while parked", 30000);
+  } finally {
+    process.stderr.write = realStderrWrite;
+  }
+  check(
+    "unarchive answers while the session is parked",
+    parkedReply.type === "request.completed",
+    JSON.stringify(parkedReply.error ?? parkedReply.type),
+  );
+  const carried = parkedFrames().slice(parkedMark);
+  check(
+    "the parked process never writes the change (its snapshot would be written back whole)",
+    carried.every((frame) => frame.pid !== ownerPid),
+    JSON.stringify(carried.map((frame) => `${frame.method}@${frame.pid}`)) + ` owner ${ownerPid}`,
+  );
+  check(
+    "and the stale parked process is dropped, not handed to the reopen",
+    pluginLog.some((line) => line.includes(`parked:discard ${rootQ}`)),
+    pluginLog.filter((line) => line.includes("parked:")).join(" | ") || "(no parked: line)",
+  );
+  const reopenMark = events.length;
+  await conn.send({
+    type: "session.open",
+    requestId: "parked-reopen",
+    sessionId: rootQ,
+    config: { cwd: process.cwd(), mode: "build" },
+    persistence: parkedHandle,
+    history: "skip",
+  });
+  await untilSince(reopenMark, (e) => e.type === "session.ready" && e.sessionId === rootQ, "rootQ reopened", 30000);
+  await sleep(300);
+  const reopenedPids = [...new Set(parkedFrames().slice(parkedMark + carried.length).map((frame) => frame.pid))];
+  check(
+    "and the reopen cold-starts instead of adopting the stale process",
+    reopenedPids.length === 1 && reopenedPids[0] !== ownerPid,
+    `pids ${reopenedPids.join(", ")} vs dropped owner ${ownerPid}`,
+  );
+  delete process.env.DSH_FAKE_LOG;
+
   // ---- a child whose label arrives after its notice ----------------------
   // Paseo shows a child whose title never arrived as "加载中…" forever, and a
   // child has no configuration channel, so the title it opens with is the only
