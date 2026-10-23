@@ -13,6 +13,13 @@
  * `--patch` overlay, now as this plugin's config, so the address and credentials
  * keep flowing without hardcoding anything.
  *
+ * Two transports, one meta-tool surface. Paseo's own server is streamable HTTP,
+ * but a plugin's browser bridge is a stdio child process, and its 25 tool
+ * schemas cost ~20 KB of every request — exactly the cost this gateway exists to
+ * remove. So the same three meta-tools proxy both: `clientFor` reads the
+ * transport off the config shape (`url` vs `command`) and rejects an entry that
+ * names neither or both, instead of mounting a connection that cannot work.
+ *
  * Failure policy: a failed server, unknown tool or MCP-side error throws with the
  * server/tool named, so the turn records a failed tool instead of a fake success.
  *
@@ -24,6 +31,7 @@ import { join } from 'node:path';
 import Schema from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { DEFAULT_MCP_TIMEOUT_MS, McpHttpClient, browserHostGapOf, unavailableBrowserTools } from './mcp-http.js';
+import { McpStdioClient } from './mcp-stdio.js';
 import { registerSubagentArchiveTool } from './subagent-archive.js';
 
 /** Stable Cordis plugin name. */
@@ -32,26 +40,84 @@ export const name = 'paseo-mcp-gateway';
 /** The tool registry this plugin contributes to. */
 export const inject = ['tools'];
 
+/**
+ * One server connection, addressed by transport.
+ *
+ * `Schema.union` picks a branch by *matching* it, not by excluding the other:
+ * an entry carrying both `url` and `command` validates against the HTTP branch
+ * and keeps the stray `command` as an extra property, and the stdio branch does
+ * the same in reverse. That is fine for parsing but ambiguous for connecting, so
+ * `transportOf` below is the authority on which client gets built and refuses
+ * both-at-once instead of silently preferring one.
+ */
+const HttpServer = Schema.object({
+  url: Schema.string().required(),
+  headers: Schema.dict(Schema.string()).default({}),
+});
+
+const StdioServer = Schema.object({
+  command: Schema.string().required(),
+  args: Schema.array(Schema.string()).default([]),
+  env: Schema.dict(Schema.string()).default({}),
+  cwd: Schema.string(),
+});
+
 export const Config = Schema.object({
   /**
    * Servers to expose, keyed by the name the model will use.
    *
-   * Paseo injects exactly one (its agent MCP server); the map shape keeps the
-   * gateway usable for any additional MCP server a profile may compose later.
+   * Paseo injects its HTTP agent server and, from a plugin, a stdio browser
+   * bridge; the map shape keeps the gateway usable for any additional MCP
+   * server a profile may compose later.
    */
-  servers: Schema.dict(Schema.object({
-    url: Schema.string().required(),
-    headers: Schema.dict(Schema.string()).default({}),
-  })).default({}),
+  servers: Schema.dict(Schema.union([HttpServer, StdioServer])).default({}),
   /** Per-round-trip budget. */
   timeoutMs: Schema.natural().default(DEFAULT_MCP_TIMEOUT_MS),
 });
+
+/**
+ * Decide which transport a server entry describes.
+ *
+ * Strict on purpose: a shape that names no transport, or both, throws with the
+ * server name instead of falling back to one of them. The failure this prevents
+ * is the quiet kind — a typo'd `command` key would otherwise mount an HTTP
+ * client against `undefined` and only fail much later, inside a model turn,
+ * with a message that names the transport instead of the config.
+ *
+ * @param server - Configured server name, used in the error.
+ * @param entry - The validated config entry.
+ * @returns `'http'` or `'stdio'`.
+ */
+export function transportOf(server, entry) {
+  if (entry === null || typeof entry !== 'object') {
+    throw new Error(`mcp: server "${server}" must be an object with either { url } or { command }`);
+  }
+  const hasUrl = typeof entry.url === 'string' && entry.url !== '';
+  const hasCommand = typeof entry.command === 'string' && entry.command !== '';
+  if (hasUrl && hasCommand) {
+    throw new Error(`mcp: server "${server}" configures both "url" and "command"; pick one transport`);
+  }
+  if (!hasUrl && !hasCommand) {
+    throw new Error(`mcp: server "${server}" configures neither "url" nor "command"; cannot pick a transport`);
+  }
+  return hasUrl ? 'http' : 'stdio';
+}
 
 /** Extension for the image media types MCP servers return. */
 const IMAGE_EXTENSIONS = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' };
 
 /** Bound on one tool description in the discovery listing. */
 const DESCRIPTION_LIMIT = 160;
+
+/**
+ * Tool names that answer "is a browser host attached?", in probe order.
+ *
+ * Two servers expose the same capability under different names: Paseo's own agent
+ * server calls it `browser_list_tabs`, the Server Browser bridge calls it
+ * `browser_tabs`. The first name present in a server's listing is the one probed,
+ * so neither server needs a special case here.
+ */
+const BROWSER_HOST_PROBES = ['browser_list_tabs', 'browser_tabs'];
 
 /**
  * Process-wide sequence for image file names.
@@ -132,16 +198,45 @@ export function apply(ctx, config = {}) {
     return requested;
   };
 
-  /** One lazily created client per server; a failed handshake is retried next call. */
+  /**
+   * One lazily created client per server; a failed handshake is retried next call.
+   *
+   * The transport comes from the config shape, so a server that names neither
+   * fails here — at the first call, with the server named — rather than mounting
+   * a client that cannot connect.
+   */
   const clientFor = (server) => {
     let client = clients.get(server);
     if (client === undefined) {
-      const { url, headers } = servers[server];
-      client = new McpHttpClient({ url, headers: headers ?? {}, timeoutMs, clientInfo: { name: 'paseo-mcp-gateway', version: '0.1.0' } });
+      const entry = servers[server];
+      const clientInfo = { name: 'paseo-mcp-gateway', version: '0.1.0' };
+      client = transportOf(server, entry) === 'stdio'
+        ? new McpStdioClient({
+          command: entry.command,
+          args: entry.args ?? [],
+          env: entry.env ?? {},
+          cwd: entry.cwd,
+          timeoutMs,
+          clientInfo,
+        })
+        : new McpHttpClient({ url: entry.url, headers: entry.headers ?? {}, timeoutMs, clientInfo });
       clients.set(server, client);
     }
     return client;
   };
+
+  /**
+   * Reap stdio children when the plugin unloads.
+   *
+   * A stdio client owns a child process, and a bridge runtime is torn down by
+   * disposing its fiber (`dsh-bridge/lib/index.js:121` already relies on that
+   * effect ordering). Registering the effect up front — rather than once a
+   * client exists — keeps the disposer registration in one place: it iterates
+   * whatever `clients` holds at unload time, so a server first called late is
+   * still reaped. `dispose()` is a no-op on the HTTP client, which has no
+   * resource to release beyond its `AbortController` per request.
+   */
+  ctx.effect(() => () => Promise.allSettled([...clients.values()].map((client) => client.dispose?.())));
 
   ctx.tools.register(defineTool({
     name: 'mcp_list_tools',
@@ -195,10 +290,18 @@ export function apply(ctx, config = {}) {
       // here and expensive to discover as a failed model turn. Paseo answers the
       // probe as an ordinary result (`browser_no_host`) rather than a JSON-RPC
       // error, so both shapes go through `browserHostGapOf`.
+      //
+      // The probe tool differs by server, so it is picked from the listing rather
+      // than hard-coded: Paseo's own HTTP server names it `browser_list_tabs`, the
+      // Server Browser bridge names the same capability `browser_tabs`. Probing
+      // with a name the server does not expose would fail on every listing and
+      // leave `unavailable` permanently empty — a dead probe that looks alive.
       let hostGap;
-      if (all.some((tool) => typeof tool?.name === 'string' && tool.name.startsWith('browser_'))) {
+      const names = new Set((Array.isArray(all) ? all : []).map((tool) => tool?.name));
+      const probe = BROWSER_HOST_PROBES.find((name) => names.has(name));
+      if (probe !== undefined) {
         try {
-          hostGap = browserHostGapOf(await client.callTool('browser_list_tabs', {}));
+          hostGap = browserHostGapOf(await client.callTool(probe, {}));
         } catch (error) {
           hostGap = browserHostGapOf(error);
         }

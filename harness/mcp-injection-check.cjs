@@ -200,6 +200,54 @@ const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-mcp-check-"));
     stdioEntry ? JSON.stringify(stdioEntry.config) : "(no patch content)",
   );
 
+  // ---- a whitelisted stdio server is proxied by the gateway --------------
+  // Proxying is a capability trade (the tools become reachable only through the
+  // three meta-tools), so it is opt-in by name rather than applied to every
+  // stdio server. `server_browser` is the only entry today: its bridge is wide
+  // (25 tools, ~20 KB of schema in every request) and rarely called.
+  //
+  // `cwd` is deliberately not asserted: Paseo's provider contract gives a stdio
+  // server only `command`/`args`/`env`, so the patch side has no `cwd` to carry
+  // (the gateway's schema accepts one, for servers a profile composes itself).
+  const browserProbe = path.join(scratch, "browser.json");
+  const browserSession = `mcp-browser-${Date.now()}`;
+  await conn.send({
+    type: "session.open",
+    requestId: "open-browser",
+    sessionId: browserSession,
+    config: {
+      cwd: process.cwd(),
+      mode: "build",
+      env: { DSH_FAKE_ARGV: browserProbe },
+      mcpServers: {
+        server_browser: {
+          type: "stdio",
+          command: process.execPath,
+          args: ["/x/mcp-bridge.mjs", "/x/session.json"],
+          env: { PASEO_SERVER_BROWSER_RUNTIME: "/x/runtime" },
+        },
+      },
+    },
+  });
+  await until((e) => e.type === "session.ready" && e.sessionId === browserSession, "browser session ready");
+  const browserEntries = allEntries(await readRecord(browserProbe));
+  const browserGateway = browserEntries.find((entry) => entry?.id === "paseo-mcp-gateway");
+  const browserServer = browserGateway?.config?.servers?.server_browser;
+  check(
+    "a whitelisted stdio server is proxied by the gateway, not mounted natively",
+    browserEntries.length === 1 &&
+      browserEntries[0]?.id === "paseo-mcp-gateway" &&
+      browserEntries.every((entry) => entry?.config?.transport !== "stdio") &&
+      browserServer?.command === process.execPath &&
+      JSON.stringify(browserServer?.args) === JSON.stringify(["/x/mcp-bridge.mjs", "/x/session.json"]),
+    `entries=${JSON.stringify(browserEntries.map((entry) => entry?.id ?? entry?.config?.serverName))}`,
+  );
+  check(
+    "a proxied stdio server keeps its env",
+    browserServer?.env?.PASEO_SERVER_BROWSER_RUNTIME === "/x/runtime",
+    `env=${JSON.stringify(browserServer?.env)}`,
+  );
+
   // ---- a mixed session keeps stdio native and coalesces HTTP into one row ----
   const mixedProbe = path.join(scratch, "mixed.json");
   const mixedSession = `mcp-mixed-${Date.now()}`;
@@ -228,6 +276,44 @@ const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-mcp-check-"));
       mixedStdio?.config?.command === "npx" &&
       mixedGateway?.config?.servers?.github === undefined,
     `entries=${JSON.stringify(mixedEntries.map((entry) => entry?.id ?? entry?.config?.serverName))}`,
+  );
+
+  // ---- all three at once: HTTP + whitelisted stdio + user stdio ----------
+  // The three-way case is where a whitelist regression hides: a change that
+  // proxies every stdio server still passes the single-server cases above (the
+  // whitelisted one looks right) and still passes the mixed two-way case (no
+  // user stdio next to a proxy candidate). Here both must hold simultaneously.
+  const tripleProbe = path.join(scratch, "triple.json");
+  const tripleSession = `mcp-triple-${Date.now()}`;
+  await conn.send({
+    type: "session.open",
+    requestId: "open-triple",
+    sessionId: tripleSession,
+    config: {
+      cwd: process.cwd(),
+      mode: "build",
+      env: { DSH_FAKE_ARGV: tripleProbe },
+      mcpServers: {
+        paseo: { type: "http", url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=triple" },
+        server_browser: { type: "stdio", command: "node", args: ["/x/mcp-bridge.mjs", "/x/session.json"] },
+        github: { type: "stdio", command: "npx", args: ["-y", "server-github"], env: { GITHUB_TOKEN: "t" } },
+      },
+    },
+  });
+  await until((e) => e.type === "session.ready" && e.sessionId === tripleSession, "triple session ready");
+  const tripleEntries = allEntries(await readRecord(tripleProbe));
+  const tripleGateway = tripleEntries.find((entry) => entry?.id === "paseo-mcp-gateway");
+  const tripleProxied = Object.keys(tripleGateway?.config?.servers ?? {});
+  const tripleNative = tripleEntries.filter((entry) => entry?.config?.transport === "stdio");
+  check(
+    "http and whitelisted stdio share one gateway row while user stdio stays native",
+    tripleEntries.length === 2 &&
+      tripleProxied.sort().join(",") === "paseo,server_browser" &&
+      tripleNative.length === 1 &&
+      tripleNative[0]?.config?.serverName === "github" &&
+      tripleNative[0]?.config?.command === "npx",
+    `entries=${JSON.stringify(tripleEntries.map((entry) => entry?.id ?? entry?.config?.serverName))}`
+      + ` proxied=[${tripleProxied.join(",")}]`,
   );
 
   // ---- no servers means no overlay --------------------------------------

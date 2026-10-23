@@ -2122,6 +2122,59 @@ provider 实例"是测试脚手架的形状，不是 daemon 的形状。
 
 ---
 
+## 第十五轮：MCP gateway 的传输面
+
+### 66. Server Browser 的 25 个工具全量进每一轮请求：gateway 只认 HTTP，stdio 只能原生挂载
+
+**症状**：无。没有报错，没有失败，浏览器工具该用的时候都在——只是**每一轮请求都带着
+20072 字节的工具声明**。这是"静默降级"的近亲：静默降级是"能力悄悄消失"，这个是"能力
+齐全、成本悄悄常驻"。两者都不报警，都只能靠算账发现。
+
+**事实**：Server Browser 插件把它的浏览器能力以 **stdio** MCP server（`server_browser`）
+注入，bridge 是个 `mcp-bridge.mjs` 子进程，**25 个工具、schema 合计 20072 字节**
+（2026-10-24 实测）。而 gateway 只实现了 Streamable-HTTP 客户端（`mcp-http.js`），
+`mcpEntries()` 遇到 `type:"stdio"` 一律挂原生 `@deepseek-ai/dsh-mcp-client`——于是这
+25 个 schema 进**每一次**请求的 header，和 Paseo 自己那 61 个工具当年一模一样的问题，
+只是换了个 server 名字。而一个会话里真正会调浏览器工具的次数，通常是个位数。
+
+**根因不是"忘了优化"，是传输面缺一半**：gateway 的三件套（`mcp_list_tools` /
+`mcp_tool_schema` / `mcp_call_tool`）只依赖 client 的三个方法，本来就与传输无关；缺的是
+一个 stdio 客户端。补上它之后，同一个 gateway 行同时容纳两种传输。
+
+**修法**：
+
+- `dsh-bridge/lib/mcp-stdio.js`：手写的最小 stdio JSON-RPC 客户端，与 `mcp-http.js` 对称。
+  **不引 `@modelcontextprotocol/client`**——桥整个被打成 base64 嵌进
+  `server/bridge-assets.ts` 随插件分发，装不了包；而且 gateway 只需要
+  `ensureInitialized` / `listTools` / `callTool` 三个方法。协议要点都是踩过的：一行一个
+  JSON-RPC 消息、**stdout 的非 JSON 行必须忽略而不是抛错**（Playwright MCP 会往 stdout
+  打日志）、子进程退出时所有 pending 必须 reject 而不是悬挂、超时逐请求计时。
+- `dsh-bridge/lib/mcp-gateway.js`：`servers` 每项从 `{url, headers}` 放宽成联合
+  （HTTP 或 `{command, args, env, cwd}`），`clientFor()` 按字段选客户端。三个元工具一行没改。
+- `paseo-plugin/server/dsh-process.ts`：加白名单 `GATEWAY_STDIO_SERVERS`，当前只含
+  `server_browser`。**白名单不是优化开关，是正确性要求**，理由见下面教训。
+
+**为什么不是"所有 stdio 都走 gateway"**：用户自己配的 stdio MCP（`github` 这类）需要
+**完整 schema 直接可见**才可用——模型得先看到工具名和参数才能决定用哪个。被代理之后，
+每次调用前要先 `mcp_list_tools` 查一遍、再 `mcp_tool_schema` 查一遍，三轮换一轮，这
+不是省钱，是把"能直接用"退化成"要先摸索"。所以只有**工具多、调用少、能力窄**的 server
+（浏览器：25 个工具，一个会话点几次）值得代理；通用工具集不在此列。
+
+**验证**：`harness/mcp-stdio-check.mjs`（新增，纯离线，假 server 驱动：握手顺序、
+`tools/list` 缓存与 `refresh`、`tools/call` 参数、JSON-RPC error 变 reject、stdout 混入
+非 JSON 行、超时、子进程退出不悬挂、`dispose`）；`harness/mcp-injection-check.cjs` 补了
+白名单断言（白名单 stdio 进 gateway 的 `config.servers` 且不产生原生条目、非白名单 stdio
+仍原生、三者混装时条目数与归属）。**改了 `dsh-bridge/` 之后照旧先跑
+`harness/bridge-assets-check.mjs`**——内嵌桥不同步的话，上面两条都会在旧桥"假绿"。
+
+**教训**：**「工具全量注入」的成本只会在账单和上下文占用里出现，不会在日志里出现。**
+判断一个 MCP server 该不该代理，看的是三个比值而不是传输类型：工具数 / 每会话调用次数、
+schema 字节数 / 它省下的探索轮数。另一个教训是**能力面要按"最小可用"设计**——手写 80 行
+stdio 客户端换掉一个 20 KB 的常驻成本，比重写整个 MCP 层划算得多；反过来说，任何"这个
+传输我们还不支持"的分支都该在注释里写清代价，否则下一个人只会看到"它能用"。
+
+---
+
 ## 已知限制（未修，有意为之）
 
 | 项 | 说明 |

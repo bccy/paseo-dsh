@@ -47,7 +47,7 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon 进程里）
 
 ### 改之前先读
 
-- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 六十余条真实缺陷（编号到 64，含 `b`/`c`
+- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 六十余条真实缺陷（编号到 66，含 `b`/`c`
   补记与 DSH 0.2.1 升版教训）。里面有整整一类错误叫
   **静默降级**（把不知道的东西当成成功、把不支持的能力悄悄丢掉）。改动前先看一遍，
   避免重新发明这些 bug。
@@ -66,6 +66,26 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon 进程里）
 | **不要硬编码某个人的 provider/model** | 这个仓库是给别人用的。路由从 profile 读，读不到就带说明失败 |
 | **能复用的代码或逻辑，不要自己写** | 上游已经有的实现（DSH 的 `session.append` 表面替换、compaction 折叠、`dsh-rewind` 的 git 快照；Paseo 适配器已经验证过的形状）比我们现编的可靠，也免得下次上游一改就跟不上。复用前先核目标版本的 API 与语义（版本范围满足≠可运行），复用时把边界写进注释；确实没有可复用的，再自己写并在 `docs/` 留痕。 |
 | **改了 `dsh-bridge/` 必须重生成内嵌桥** | `paseo-plugin/server/bridge-assets.ts` 是桥的 base64 内嵌副本，供插件自举 profile（Paseo 安装插件不跑脚本）。跑 `node paseo-plugin/scripts/generate-bridge-assets.mjs`（`npm publish` 的 `prepack` 也会跑），并提交生成结果 |
+
+### MCP 注入与 gateway
+
+Paseo 把它的 MCP server 通过 `config.mcpServers` 交给 provider，插件把它翻成 DSH 启动时的
+`--patch` 覆盖层（`server/dsh-process.ts` 的 `mcpEntries()`）。**gateway 现在支持两种传输**：
+
+| 传输 | 谁走 | 挂载方式 |
+|---|---|---|
+| Streamable HTTP | Paseo 自己的 server（61 个工具约 33 KB） | gateway，三个元工具 `mcp_list_tools` / `mcp_tool_schema` / `mcp_call_tool` |
+| stdio，**在白名单里** | 当前只有 `server_browser`（Server Browser 插件的 bridge，25 个工具、20072 字节 schema） | 同上，gateway 起子进程说 stdio JSON-RPC |
+| stdio，不在白名单 | 用户自己配的 stdio MCP | 原生 `@deepseek-ai/dsh-mcp-client`，全量 schema |
+
+- **白名单是硬要求，不是优化**：`GATEWAY_STDIO_SERVERS`（`server/dsh-process.ts`）只放
+  `server_browser`。用户自配的 stdio MCP 一旦被代理，就从"工具直接可用"退化成"每用一次
+  要先查两次 schema"，这是能力回归——只有**工具多、调用少、能力窄**的 server 才值得代理。
+- **stdio 客户端是手写的**（`dsh-bridge/lib/mcp-stdio.js`），不是引
+  `@modelcontextprotocol/client`：桥整个被打成 base64 嵌进 `server/bridge-assets.ts` 随插件
+  分发，装不了依赖，所以只实现了 gateway 需要的三个方法（`ensureInitialized` /
+  `listTools` / `callTool`）。
+- **legacy SSE 仍然按名字拒绝**，不要为它猜一个传输。
 
 ### 改完怎么验证
 
@@ -94,7 +114,8 @@ token），并且加载插件会把内嵌桥重写进 `~/.dsh/profiles/<name>/no
 
 同一条编译流程还带几个假 `dsh` 驱动的回归脚本，动到对应区域时一并跑：
 `harness/subagent-check.cjs`（子会话可见性）、`harness/steer-check.cjs`（插话回执）、
-`harness/mcp-injection-check.cjs`（Paseo 注入的 MCP server 是否真的落到 `--patch`）、
+`harness/mcp-injection-check.cjs`（Paseo 注入的 MCP server 是否真的落到 `--patch`：HTTP 与
+白名单 stdio 走 gateway、非白名单 stdio 仍原生、sse 按名字拒绝）、
 `harness/assistant-stream-check.cjs`（助手文本流式：同 id 增长快照、`id === messageId`、
 经 Paseo 规则投影后合并成一行）、`harness/image-check.cjs`（图片工具结果：带 `hostPath` 的
 图片块**恰好**多出一条 markdown `assistant_message`、路径逐段编码、无 `hostPath` 不出行、
@@ -159,6 +180,19 @@ token），并且加载插件会把内嵌桥重写进 `~/.dsh/profiles/<name>/no
   `dsh-bridge/lib/paseo-system-envelope.js` 必跑。**
 - `harness/mcp-http-check.mjs` — 桥的 MCP streamable-HTTP 客户端（SSE/JSON、session id 有无、
   JSON-RPC 错误），本地 loopback，不需要外部服务。**动了 `dsh-bridge/lib/mcp-http.js` 必跑。**
+- `harness/mcp-stdio-check.mjs` — 桥的 MCP stdio 客户端（`dsh-bridge/lib/mcp-stdio.js`）：
+  握手顺序（`initialize` 先于 `tools/list`、`notifications/initialized` 发出）、`tools/list`
+  缓存与 `refresh`、`tools/call` 的参数、JSON-RPC error 变 reject、**stdout 混入非 JSON 行
+  不能炸**（Playwright MCP 会往 stdout 打日志）、超时生效、子进程退出时在途请求被 reject
+  且**后续调用立即失败**（不悬挂、不重启死进程）、`dispose` 收得掉子进程。用一个临时 .mjs
+  假 server 驱动，纯离线。**动了
+  `dsh-bridge/lib/mcp-stdio.js` 或 gateway 的 stdio 分支必跑。**
+- `harness/mcp-gateway-transport-check.mjs` — gateway 的传输判定（`transportOf`）与配置
+  校验：`url` → HTTP、`command` → stdio，而**两者都给、都不给、给空串、拼错键名都必须
+  报错点名**。`Schema.union` 是合并式匹配、**不排他**（同时给 `url` 和 `command` 会通过
+  校验并保留多余键），所以排他判据只能在 `transportOf` 里，这个脚本钉住它。纯离线，
+  依赖从 DSH 安装目录按绝对路径加载（`DSH_PACKAGES_DIR` 可覆盖）。**动了 `transportOf`、
+  gateway 的 `Config` 或 `clientFor` 的传输分派必跑。**
 - `harness/bridge-assets-check.mjs` — `server/bridge-assets.ts` 必须与 `dsh-bridge/` 和
   `templates/` 逐字节一致（只读，不起进程）。**改桥后先跑它、再跑任何插件级脚本。**
 - `harness/doctor-check.mjs` — `paseo-plugin/lib/doctor.mjs` 的判定：空 provider/model、缺

@@ -8,9 +8,9 @@
  * @module dsh-paseo/server/dsh-process
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { profileName } from "./bootstrap";
 
 /** JSON-compatible value tree. */
@@ -249,8 +249,188 @@ const MCP_CLIENT_PLUGIN = "@deepseek-ai/dsh-mcp-client";
  */
 const MCP_GATEWAY_PLUGIN = "dsh-paseo-bridge/mcp-gateway";
 
+/**
+ * The stdio servers allowed to ride the gateway instead of the stock client.
+ *
+ * Proxying is a **capability trade**, not an optimisation: a proxied server's
+ * tools stop being callable directly and become reachable only through
+ * `mcp_list_tools` / `mcp_tool_schema` / `mcp_call_tool`, so each use costs two
+ * extra round trips and the model has to know a tool exists before calling it.
+ * That is the right trade only for a server that is wide, rarely used and narrow
+ * in purpose — Paseo's Server Browser bridge (25 tools, ~20 KB of schema in every
+ * request, called in a minority of sessions).
+ *
+ * It is the wrong trade for anything a user configured themselves: their stdio
+ * MCP was mounted with its full schema on purpose, and silently demoting it to
+ * three-step discovery is a regression they never asked for. Hence a whitelist by
+ * name rather than "all stdio".
+ */
+const GATEWAY_STDIO_SERVERS: ReadonlySet<string> = new Set(["server_browser"]);
+
+/**
+ * One entry of the gateway's `config.servers` map.
+ *
+ * The gateway picks the transport from the shape (`url` → Streamable HTTP,
+ * `command` → stdio) and refuses an entry that names both or neither, so this
+ * union is also the contract for what may be proxied.
+ */
+type GatewayServerConfig =
+  | { url: string; headers?: Record<string, string> }
+  | { command: string; args?: string[]; env?: Record<string, string> };
+
 /** DSH's `serverName` contract: a tool-name namespace, not a free-form label. */
 const MCP_SERVER_NAME = /^[A-Za-z0-9_-]{1,32}$/;
+
+/**
+ * Name of the browser bridge entry this plugin injects itself.
+ *
+ * It is also the gateway whitelist entry above: the bridge is stdio-only and
+ * declares 25 tools, so mounting it natively would put ~20 KB of schema in every
+ * request of every session that merely *has* a browser.
+ */
+const BROWSER_MCP_SERVER = "server_browser";
+
+/** Expand a leading `~` the way Paseo's own home resolver does. */
+function expandHome(value: string): string {
+  if (value === "~") return homedir();
+  if (value.startsWith("~/") || value.startsWith("~\\")) return join(homedir(), value.slice(2));
+  return value;
+}
+
+/** A path from the environment, treating empty/whitespace as unset. */
+function envPath(env: Readonly<Record<string, string | undefined>>, name: string): string | undefined {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === "") return undefined;
+  return resolve(expandHome(raw));
+}
+
+/**
+ * Paseo's own home directory, resolved like `@getpaseo/server` does.
+ *
+ * `PASEO_HOME` is set on the daemon's environment and inherited by the plugin
+ * process, so a non-default install still finds its workspace registry. Reading
+ * `~/.paseo` unconditionally would silently point at the wrong tree there.
+ */
+function paseoHome(env: Readonly<Record<string, string | undefined>>): string {
+  return envPath(env, "PASEO_HOME") ?? join(homedir(), ".paseo");
+}
+
+/**
+ * The Server Browser plugin's per-workspace data directory.
+ *
+ * Mirrors the plugin's own resolution (`server/runtime.ts` and
+ * `server/browser-manager.ts`): the runtime root defaults to
+ * `~/.local/share/paseo-server-browser`, and the data root is `<runtime>/visual`
+ * unless `PASEO_SERVER_BROWSER_DATA` names it outright. Both variables exist so a
+ * deployment can move the runtime off the home directory, and the bridge path is
+ * only ever `join(dataRoot, 'mcp-bridge.mjs')`.
+ */
+function browserDataRoot(env: Readonly<Record<string, string | undefined>>): string {
+  const configured = envPath(env, "PASEO_SERVER_BROWSER_DATA");
+  if (configured !== undefined) return configured;
+  const runtime = envPath(env, "PASEO_SERVER_BROWSER_RUNTIME")
+    ?? join(homedir(), ".local", "share", "paseo-server-browser");
+  return join(runtime, "visual");
+}
+
+/**
+ * Map a session's working directory to the Paseo workspace that owns it.
+ *
+ * Paseo keeps its registry in `$PASEO_HOME/projects/workspaces.json`, and the
+ * browser plugin names each workspace's data directory after `workspaceId`. Only
+ * an unarchived workspace whose `cwd` resolves to the same directory counts:
+ * archived records keep their `cwd`, and two live records can share one directory
+ * (a reopened workspace leaves the old one behind), so an ambiguous match is
+ * reported as "no workspace" rather than picking one.
+ *
+ * @returns the workspace id, or `undefined` when the mapping is missing or unclear.
+ */
+function browserWorkspaceId(
+  cwd: string,
+  home: string,
+  env: Readonly<Record<string, string | undefined>>,
+): string | undefined {
+  const raw = readFileSync(join(home, "projects", "workspaces.json"), "utf8");
+  const parsed: unknown = JSON.parse(raw);
+  if (!Array.isArray(parsed)) return undefined;
+  const target = resolve(cwd);
+  const matches: string[] = [];
+  for (const entry of parsed) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const record = entry as { workspaceId?: unknown; cwd?: unknown; archivedAt?: unknown };
+    if (record.archivedAt !== null && record.archivedAt !== undefined) continue;
+    if (typeof record.cwd !== "string" || typeof record.workspaceId !== "string") continue;
+    if (resolve(record.cwd) !== target) continue;
+    // The id becomes a path segment, so a record that is not a plain id is not usable.
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(record.workspaceId)) continue;
+    matches.push(record.workspaceId);
+  }
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+/**
+ * The Server Browser bridge as an MCP server for one session, or `undefined`.
+ *
+ * The bridge is a stdio MCP server shipped by Paseo's Server Browser plugin
+ * (`<dataRoot>/mcp-bridge.mjs`); it takes the workspace's `session.json` path as
+ * its only argument and reads the CDP endpoint and token from that file itself.
+ * This function therefore only computes the path — it never reads the metadata,
+ * which carries a credential that has no business passing through here.
+ *
+ * **Fail-open on purpose.** Every failure returns `undefined` and nothing throws:
+ * the result is merged into the same `--patch` that mounts Paseo's own 61-tool
+ * server, so a throw here would take the agent's whole tool surface down with it.
+ * Losing the browser is a degraded feature; losing Paseo's tools is a broken
+ * session. A missing `session.json` is *not* checked: it only exists while the
+ * browser runs, and the bridge reports that state itself with a clear message,
+ * while a patch built at boot must keep working after the user starts the browser.
+ *
+ * @param cwd - the session's working directory, as passed to `dsh`.
+ * @returns a stdio MCP server entry, or `undefined` when the bridge cannot be located.
+ */
+export function browserMcpServer(cwd: string): DshMcpServer | undefined {
+  try {
+    const env = process.env;
+    const dataRoot = browserDataRoot(env);
+    const bridge = join(dataRoot, "mcp-bridge.mjs");
+    // A profile without the browser plugin would otherwise mount a server whose
+    // command fails at spawn time; DSH reports that as "did not activate", which
+    // reads like a plugin bug rather than an absent feature.
+    //
+    // Every early return below says why on stderr, because fail-open must not turn
+    // into fail-silent: when a session has no browser tools, this function is the
+    // only place that knows the reason, and "the feature quietly is not there" is
+    // precisely the silent-degradation class this repo keeps re-learning (see
+    // docs/FIELD-NOTES.md). The provider forwards stderr to the daemon log.
+    if (!existsSync(bridge)) {
+      logBrowserGap(`bridge not found at ${bridge}`);
+      return undefined;
+    }
+    const workspaceId = browserWorkspaceId(cwd, paseoHome(env), env);
+    if (workspaceId === undefined) {
+      logBrowserGap(`cwd ${cwd} maps to no single live Paseo workspace`);
+      return undefined;
+    }
+    return {
+      type: "stdio",
+      command: process.execPath,
+      args: [bridge, join(dataRoot, workspaceId, "session.json")],
+    };
+  } catch (error) {
+    // Deliberately swallowed: see the fail-open note above. Logged so an
+    // unreadable registry or a malformed file is diagnosable instead of looking
+    // like a feature this build simply does not have.
+    logBrowserGap(error instanceof Error ? error.message : String(error));
+    return undefined;
+  }
+}
+
+/** One stderr line explaining why a session got no browser MCP server. */
+function logBrowserGap(reason: string): void {
+  // The provider tags every line it writes with its own id; repeating the literal
+  // here keeps this module free of a cycle through `provider.ts`.
+  process.stderr.write(`[deepseek-harness-native] no browser MCP server: ${reason}\n`);
+}
 
 /** One prepared `--patch` overlay and the private directory holding it. */
 interface McpPatch {
@@ -261,15 +441,16 @@ interface McpPatch {
 /**
  * Translate Paseo's MCP servers into patch entries.
  *
- * Streamable-HTTP servers ride the gateway (one row, three tools); stdio servers
- * keep the stock client because the gateway only speaks HTTP, and dropping them
- * would silently remove tools a user configured. Legacy SSE stays refused.
+ * Streamable-HTTP servers and the whitelisted stdio servers ride the gateway
+ * (one row, three tools). Every other stdio server keeps the stock client: it was
+ * configured by the user, and dropping it — or quietly demoting it to discovery
+ * calls — would remove capability they asked for. Legacy SSE stays refused.
  */
 function mcpEntries(
   servers: Readonly<Record<string, DshMcpServer>>,
 ): Record<string, unknown>[] {
   const entries: Record<string, unknown>[] = [];
-  const proxied: Record<string, { url: string; headers?: Record<string, string> }> = {};
+  const proxied: Record<string, GatewayServerConfig> = {};
   for (const [name, server] of Object.entries(servers)) {
     if (!MCP_SERVER_NAME.test(name)) {
       throw new Error(
@@ -277,6 +458,18 @@ function mcpEntries(
       );
     }
     if (server.type === "stdio") {
+      if (GATEWAY_STDIO_SERVERS.has(name)) {
+        // Whitelisted: the gateway spawns it and speaks JSON-RPC over its stdio,
+        // so the tools cost three meta-schemas instead of one schema each. `env`
+        // and `args` pass through untouched — the browser bridge needs both the
+        // session-file path and the daemon's environment to find its Chromium.
+        proxied[name] = {
+          command: server.command,
+          ...(server.args === undefined ? {} : { args: server.args }),
+          ...(server.env === undefined ? {} : { env: server.env }),
+        };
+        continue;
+      }
       // `failOnStartupError` is what keeps a broken connection loud: DSH still boots
       // and the entry is reported as "did not activate" on stderr, which this
       // process forwards to the log, instead of the model silently getting no tools.
@@ -321,22 +514,37 @@ function mcpEntries(
 
 /**
  * Write the `--patch` overlay that mounts Paseo's MCP servers into this DSH
- * process, or `undefined` when the session was handed none.
+ * process, or `undefined` when there is nothing to mount.
  *
  * The overlay cannot live in the shared profile: the server Paseo injects
  * carries this agent's id in its URL, so it differs per session. The file also
  * carries the MCP auth token, so it is written 0600 inside a fresh 0700
  * directory and removed together with the process.
+ *
+ * The browser bridge is merged in here rather than by Paseo: the Server Browser
+ * plugin hands providers no MCP server at all (its bridge is started by the
+ * browser panel, not by the agent contract), so without this the agent can only
+ * reach the shared browser through the `shared-browser` skill's shell path.
+ * Paseo's own entry wins on a name collision — a deployment that starts
+ * injecting `server_browser` itself knows better than this heuristic.
+ *
+ * @param servers - the MCP servers Paseo attached to this session, if any.
+ * @param cwd - the session's working directory; identifies the browser workspace.
+ * @returns the written overlay, or `undefined` when no server could be mounted.
  */
 function prepareMcpPatch(
   servers: Readonly<Record<string, DshMcpServer>> | undefined,
+  cwd: string,
 ): McpPatch | undefined {
-  const list = servers ?? {};
-  const names = Object.keys(list);
-  if (names.length === 0) return undefined;
+  const merged: Record<string, DshMcpServer> = { ...(servers ?? {}) };
+  if (!Object.hasOwn(merged, BROWSER_MCP_SERVER)) {
+    const browser = browserMcpServer(cwd);
+    if (browser !== undefined) merged[BROWSER_MCP_SERVER] = browser;
+  }
+  if (Object.keys(merged).length === 0) return undefined;
   // Translate and validate everything before touching the filesystem, so a
   // rejected server leaves no directory behind.
-  const entries = mcpEntries(list);
+  const entries = mcpEntries(merged);
   const dir = mkdtempSync(join(tmpdir(), "dsh-paseo-mcp-"));
   const path = join(dir, "mcp-patch.json");
   // JSON is a YAML subset and DSH parses the patch as YAML, so emitting JSON is
@@ -417,7 +625,7 @@ export class DshProcess {
   async #start(): Promise<void> {
     // A rejected MCP server throws here, before any process exists: `start()`
     // rejects, the provider reports it, and nothing is left on disk.
-    this.#patch = prepareMcpPatch(this.#options.mcpServers);
+    this.#patch = prepareMcpPatch(this.#options.mcpServers, this.#options.cwd);
     // The profile is resolved from the environment the child will actually get,
     // not the daemon's: a session may override `DSH_PASEO_PROFILE`, and asking DSH
     // for a profile the session did not provision is a failure with no local
