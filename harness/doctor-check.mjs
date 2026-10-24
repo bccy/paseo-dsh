@@ -17,16 +17,58 @@
  *   4. a credential with no value is a failure
  *   5. a credential outside `refs:` is a failure
  *   6. a complete configuration is still accepted (the negative control)
+ *   7. a bridge missing a lazy module is a failure, not `ok`
+ *   8. a complete bridge is still accepted (the control for 7)
+ *
+ * The bridge cases (7/8) exist because the check used to look for `lib/index.js`
+ * alone: a bridge with the entry but without `lib/child-anchors.js`,
+ * `lib/revert.js` or `lib/mcp-gateway.js` printed `[ok] bridge bundle
+ * provisioned` and doctor exited 0 — the same verdict a working install gets,
+ * for one where DSH prints `ERR_MODULE_NOT_FOUND` and never answers
+ * `initialize`. The positive control is what keeps 7 from being satisfied by a
+ * check that can only ever fail.
  *
  * The CLI and plugin rows are not asserted: they describe the host, not the
- * sandbox. Only the route and credential verdicts are read.
+ * sandbox. Only the route, credential and bridge verdicts are read.
  *
  * Usage: node harness/doctor-check.mjs
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 import { runDoctor } from "../paseo-plugin/lib/doctor.mjs";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * The bridge package's file list, walked from `dsh-bridge/` — the directory the
+ * asset generator reads — instead of from `bridge-assets.ts`, which is what the
+ * doctor itself reads. Taking it from the same place would let a truncated key
+ * list in the doctor pass this check by agreeing with itself.
+ *
+ * The filter mirrors `paseo-plugin/scripts/generate-bridge-assets.mjs`; that the
+ * two lists agree is `harness/bridge-assets-check.mjs`'s job.
+ */
+function bridgeSourceFiles() {
+  const root = join(HERE, "..", "dsh-bridge");
+  const found = [];
+  const walk = (dir) => {
+    for (const name of readdirSync(dir).sort()) {
+      if (name === "node_modules" || name === ".git") continue;
+      const full = join(dir, name);
+      if (statSync(full).isDirectory()) walk(full);
+      else found.push(relative(root, full).split("\\").join("/"));
+    }
+  };
+  walk(root);
+  return found.filter((path) => {
+    const leaf = path.split("/").pop();
+    return leaf === "package.json" || leaf === "cordis.patch.yml" || path.endsWith(".js");
+  });
+}
+
+const BRIDGE_FILES = bridgeSourceFiles();
 
 const WORK = mkdtempSync(join(tmpdir(), "doctor-check-"));
 const PROFILE = "doctor-check";
@@ -49,11 +91,18 @@ const VALID_ROUTE = [
 const VALID_CREDENTIALS = ["refs:", "  MY_GATEWAY_KEY: a-secret-value", ""].join("\n");
 
 /** Write one sandboxed install and point the doctor at it. */
-function install({ patch, credentials }) {
+function install({ patch, credentials, bridge = BRIDGE_FILES }) {
   const home = mkdtempSync(join(WORK, "home-"));
   const profileDir = join(home, "profiles", PROFILE);
-  mkdirSync(join(profileDir, "node_modules", "dsh-paseo-bridge", "lib"), { recursive: true });
-  writeFileSync(join(profileDir, "node_modules", "dsh-paseo-bridge", "lib", "index.js"), "");
+  const bridgeDir = join(profileDir, "node_modules", "dsh-paseo-bridge");
+  mkdirSync(join(bridgeDir, "lib"), { recursive: true });
+  // A complete bridge by default: the entry alone is what the old check accepted,
+  // and an install shaped like that must be a failure now (case 7).
+  for (const relativePath of bridge) {
+    const target = join(bridgeDir, relativePath);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, "");
+  }
   writeFileSync(join(profileDir, "cordis.patch.yml"), patch);
   if (credentials !== undefined) writeFileSync(join(home, ".credentials.yaml"), credentials);
   process.env.DSH_HOME = home;
@@ -152,6 +201,42 @@ const check = (name, pass, detail) => {
     run.out.includes("credential MY_GATEWAY_KEY found"),
   );
   check("with nothing blocking", !run.out.includes("blocking issue"), `exit ${run.code}`);
+}
+
+// ---- 7. a bridge missing a lazy module is a failure ----------------------
+{
+  // The three files the old check looked for, and nothing else: this is the
+  // bridge an interrupted provision leaves behind, and the one doctor called
+  // `ok` while DSH died on `ERR_MODULE_NOT_FOUND`.
+  const truncated = ["cordis.patch.yml", "lib/index.js", "package.json"];
+  const dropped = BRIDGE_FILES.filter((path) => !truncated.includes(path));
+  install({ patch: VALID_ROUTE, credentials: VALID_CREDENTIALS, bridge: truncated });
+  const run = doctor();
+  check(
+    "a bridge without its lazy modules is a failure, not `ok`",
+    run.out.includes("bridge bundle incomplete") && !run.out.includes("bridge bundle provisioned"),
+    run.out.trim().split("\n").filter((l) => l.includes("bridge")).join(" | ") || "(no bridge line)",
+  );
+  check(
+    "and it names a missing module so the user can act",
+    run.out.includes("lib/child-anchors.js"),
+    `dropped ${dropped.length}: ${dropped.slice(0, 3).join(", ")}…`,
+  );
+  check("and the install exits non-zero", run.code === 1, `exit ${run.code}`);
+  check("and it does not claim everything passed", !run.out.includes("All checks passed"));
+}
+
+// ---- 8. a complete bridge is still accepted (the control for 7) ----------
+{
+  install({ patch: VALID_ROUTE, credentials: VALID_CREDENTIALS });
+  const run = doctor();
+  check(
+    `a complete ${BRIDGE_FILES.length}-file bridge still reports provisioned`,
+    run.out.includes(`bridge bundle provisioned (${BRIDGE_FILES.length} files)`),
+    run.out.trim().split("\n").find((l) => l.includes("bridge bundle")) ?? "(no bridge line)",
+  );
+  check("and it is not reported incomplete", !run.out.includes("bridge bundle incomplete"));
+  check("and it is not reported missing", !run.out.includes("bridge bundle missing"));
 }
 
 rmSync(WORK, { recursive: true, force: true });

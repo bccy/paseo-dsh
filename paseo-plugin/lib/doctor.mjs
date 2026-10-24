@@ -157,6 +157,49 @@ function activeLines(text) {
     .join("\n");
 }
 
+/**
+ * Every file the bridge package must contain, taken from the generated
+ * `server/bridge-assets.ts`.
+ *
+ * `ensurePaseoProfile()` (bootstrap.ts) writes *all* of `BRIDGE_FILES`, and only
+ * that whole set is a bridge DSH can load: `lib/index.js` imports
+ * `./transport.js` and `./server.js` when it loads, and those import the rest
+ * (`child-anchors`, `revert`, `mcp-gateway`, …). Looking for the entry alone is
+ * how a half-written bridge used to report `ok` while DSH printed
+ * `ERR_MODULE_NOT_FOUND` without exiting and the plugin sat waiting for
+ * `initialize` to time out.
+ *
+ * The generated module is TypeScript and `runDoctor()` is synchronous — the CLI
+ * calls it without awaiting — so `import()` is out. Node 22.18+ can `require()`
+ * a `.ts` file; older lines throw, and the keys are read out of the generated
+ * source instead. That fallback is not a guess at the format: the generator
+ * emits exactly one JSON-string key per entry (scripts/generate-bridge-assets.mjs)
+ * and `harness/bridge-assets-check.mjs` parses the same block the same way. If
+ * neither path yields a key, the caller says so rather than assuming the bridge
+ * is complete.
+ */
+function loadBridgeFileList() {
+  const assetsPath = join(HERE, "..", "server", "bridge-assets.ts");
+  try {
+    const assets = require(assetsPath);
+    const files = assets?.BRIDGE_FILES;
+    if (files !== null && typeof files === "object" && Object.keys(files).length > 0) {
+      return { keys: Object.keys(files) };
+    }
+  } catch {
+    // Older Node cannot require TypeScript; the source scan below covers it.
+  }
+  const read = readText(assetsPath);
+  if (read.error !== undefined) return { error: `${assetsPath} is unreadable (${read.error})` };
+  const block = /export const BRIDGE_FILES[^{]*\{([\s\S]*?)\n\};/.exec(read.text)?.[1];
+  if (block === undefined) return { error: `BRIDGE_FILES not found in ${assetsPath}` };
+  // A key line is a JSON string followed by `:`; the base64 values that follow
+  // are bare string literals joined with `+`, so they cannot match this.
+  const keys = [...block.matchAll(/^[ \t]*("(?:[^"\\]|\\.)*"):/gm)].map((match) => JSON.parse(match[1]));
+  if (keys.length === 0) return { error: `BRIDGE_FILES has no entries in ${assetsPath}` };
+  return { keys };
+}
+
 /** Whatever YAML parser this install happens to carry, or `undefined`. */
 function loadYaml() {
   for (const name of ["yaml", "js-yaml"]) {
@@ -260,13 +303,36 @@ export function runDoctor() {
   report("ok", `DSH profile at ${profileDir}`);
 
   const bridgeDir = join(profileDir, "node_modules", "dsh-paseo-bridge");
-  // The package entry, not `server.js`: `main`/`exports` point at `lib/index.js`,
-  // so that is what breaks first if the bundle is half-written.
-  const bridgeEntry = join(bridgeDir, "lib", "index.js");
-  if (existsSync(bridgeEntry)) {
-    report("ok", "bridge bundle provisioned", bridgeDir);
+  // Every file the plugin writes, not just the entry. `lib/index.js` exists in a
+  // bridge missing `lib/child-anchors.js` and still fails to load, and that is
+  // exactly the case this check used to call `ok` (see loadBridgeFileList).
+  const bridgeFiles = loadBridgeFileList();
+  if (bridgeFiles.error !== undefined) {
+    report(
+      "warn",
+      "bridge contents not verified",
+      `${bridgeFiles.error}; only the entry below was checked`,
+    );
+    const entryOnly = join(bridgeDir, "lib", "index.js");
+    if (existsSync(entryOnly)) report("ok", "bridge entry present", bridgeDir);
+    else report("fail", "bridge bundle missing", `expected ${entryOnly}; restart the daemon to let the plugin re-provision`);
   } else {
-    report("fail", "bridge bundle missing", `expected ${bridgeEntry}; restart the daemon to let the plugin re-provision`);
+    const missing = bridgeFiles.keys.filter((relativePath) => !existsSync(join(bridgeDir, relativePath)));
+    if (missing.length === 0) {
+      report("ok", `bridge bundle provisioned (${bridgeFiles.keys.length} files)`, bridgeDir);
+    } else {
+      // Name the files: "the bridge is incomplete" leaves the user guessing which
+      // half-written file to look at, and there is no partial repair to offer —
+      // the plugin rewrites the whole package or nothing.
+      const shown = missing.slice(0, 5).join(", ");
+      const more = missing.length > 5 ? ` and ${missing.length - 5} more` : "";
+      report(
+        "fail",
+        `bridge bundle incomplete — ${missing.length} of ${bridgeFiles.keys.length} files missing`,
+        `missing: ${shown}${more}. Restart the Paseo daemon so the plugin re-provisions ${bridgeDir}; ` +
+          `if it persists, delete that directory and restart`,
+      );
+    }
   }
 
   // 3. model route
