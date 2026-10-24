@@ -24,7 +24,7 @@ import {
 } from "@getpaseo/plugin/server/provider";
 import { DshProcess, type DshCatalog, type DshRevertResult, type DshRoute } from "./dsh-process";
 import { DshChildSession, DshSession, modes, parseRoute } from "./session";
-import { ParkedSessions } from "./parked-sessions";
+import { ParkedSessions, RELEASE_TIMEOUT_MS } from "./parked-sessions";
 import { effortLabel } from "./locale";
 
 const CAPABILITIES = [
@@ -363,6 +363,29 @@ class DshConnection implements ProviderConnection {
   /** In-flight spawn, so concurrent acquires share one child instead of racing. */
   #poolSpawn: Promise<DshProcess> | undefined;
   /**
+   * In-flight pool shutdown, so an acquire cannot spawn beside a child that is
+   * still being retired.
+   *
+   * `close()` and the idle grace timer can both shut the pool down, and the
+   * shutdown itself is slow (a `shutdown` frame, then SIGTERM, then up to
+   * {@link RELEASE_TIMEOUT_MS} for the OS to reap the child). Without this
+   * marker the field `#pooled` is cleared at the *start* of that window, so an
+   * open arriving inside it spawns a second child: two DSH processes with two
+   * `archivedSessionIds` snapshots, racing each other for the session logs'
+   * write locks. Kept as a promise (not a boolean) so an acquire can wait for
+   * the retirement it collided with instead of failing its open.
+   */
+  #poolShutdown: Promise<void> | undefined;
+  /**
+   * The env the current child was spawned with.
+   *
+   * The environment is process-wide (`DshProcessOptions.env` is applied at
+   * spawn) and a later session's `config.env` has no channel to it, so this is
+   * only kept to *report* a divergence loudly instead of dropping it in silence
+   * (see {@link #warnEnvDiffers}).
+   */
+  #poolEnv: Record<string, string> | undefined;
+  /**
    * Outstanding claims, counted **per child instance**.
    *
    * This has to be keyed by the child, not a single number, because a child can
@@ -462,7 +485,8 @@ class DshConnection implements ProviderConnection {
     // session through `#exitAll`), so keeping the counts would only make a future
     // child inherit a debt it never took on.
     this.#pooled = undefined;
-    this.#poolClaims.delete(pooled);
+    this.#poolEnv = undefined;
+    this.#dropPoolClaims(pooled);
     return undefined;
   }
 
@@ -484,9 +508,12 @@ class DshConnection implements ProviderConnection {
    * resurrecting a dead child or cancelling a live one.
    *
    * The spawn uses the **first caller's** cwd/route/env as the process defaults.
-   * That is deliberate and harmless: every session sends its own cwd and route
-   * in `initialize` (`attachSession`), so these defaults only cover a request
-   * that names no session.
+   * That is deliberate and mostly harmless: every session sends its own cwd and
+   * route in `initialize` (`attachSession`), so those defaults only cover a
+   * request that names no session. **The environment is the exception**: it is
+   * applied once at spawn and DSH exposes no channel to change it per session,
+   * so a later session's `config.env` cannot be honoured. That divergence is
+   * not swallowed — {@link #warnEnvDiffers} reports every key that differs.
    *
    * @param options - what to spawn with, when a spawn is needed.
    * @returns the live shared child and whether it was already serving sessions.
@@ -496,17 +523,30 @@ class DshConnection implements ProviderConnection {
     route: DshRoute;
     env: Record<string, string>;
   }): Promise<{ process: DshProcess; reused: boolean }> {
+    // `send()` guards only at its entry; an open that is already past it when
+    // the connection is torn down must not spawn a child nobody owns.
+    if (this.#closed) throw new Error("the provider connection is closed");
+    // A shutdown still owns the child it is retiring. Wait for it (the shutdown
+    // in turn waits for the child to exit) before deciding to spawn.
+    await this.#awaitPoolShutdown();
+    if (this.#closed) throw new Error("the provider connection is closed");
     const existing = this.#livePoolProcess();
     if (existing !== undefined) {
       this.#addPoolClaim(existing);
       this.#cancelPoolRelease();
+      this.#warnEnvDiffers(options.env);
       return { process: existing, reused: true };
     }
     const inFlight = this.#poolSpawn;
     if (inFlight !== undefined) {
       const shared = await inFlight;
+      // The connection can be closed while this join awaits somebody else's
+      // spawn. The claim is taken only after this check, so a close in that
+      // window leaves nothing outstanding.
+      if (this.#closed) throw new Error("the provider connection is closed");
       this.#addPoolClaim(shared);
       this.#cancelPoolRelease();
+      this.#warnEnvDiffers(options.env);
       // Somebody else's spawn: by the time this returns the child has another
       // session attached to it (or is about to), so this caller is joining.
       return { process: shared, reused: true };
@@ -548,7 +588,18 @@ class DshConnection implements ProviderConnection {
     this.#poolSpawn = spawnTask;
     try {
       const started = await spawnTask;
+      // Re-checked **after** the spawn: a `close()` that ran while `start()`
+      // was in flight has already shut the pool down (there was no child to
+      // wait for yet), so publishing this one would resurrect a process on a
+      // dead connection. Its claim would never be released, no grace timer
+      // would be armed, and the orphan would keep holding the session logs'
+      // write locks. Kill it here — teardown no longer knows it exists.
+      if (this.#closed) {
+        started.kill();
+        throw new Error("the provider connection is closed");
+      }
       this.#pooled = started;
+      this.#poolEnv = { ...options.env };
       this.#addPoolClaim(started);
       // Freshly spawned by this very call: the caller is not joining anything.
       return { process: started, reused: false };
@@ -570,6 +621,63 @@ class DshConnection implements ProviderConnection {
    */
   #addPoolClaim(process: DshProcess): void {
     this.#poolClaims.set(process, (this.#poolClaims.get(process) ?? 0) + 1);
+    // **One hold per claim, no exceptions.** The claim is the provider's own
+    // accounting; the hold is what `ParkedSessions` consults before it kills or
+    // drops the shared child (park / sweep / discard / evict). It is released in
+    // exactly two places — `#releasePoolProcess` for a returned claim and
+    // `#dropPoolClaims` when the child itself is gone — so the two counters can
+    // never drift apart. (Before this wiring `#holds` stayed 0, which made every
+    // one of those guards a dead branch.)
+    this.#parked.hold();
+  }
+
+  /**
+   * Forget every claim on one child and release the matching holds.
+   *
+   * Used only where the child itself is going away (it exited on its own, or
+   * `#shutdownPoolNow` is retiring it): the sessions that held those claims are
+   * dead with it, and `DshProcess` has already reported that to each of them
+   * (`#exitAll` / `onExit`). Their later `close()` returns early (the session is
+   * already marked closed) and would never return the claim itself, so keeping
+   * the numbers would leave `#holds` above zero forever — the guards would go
+   * dead again, now permanently. Each dropped claim releases exactly the one
+   * hold {@link #addPoolClaim} took.
+   *
+   * @param process - the child whose claims become void.
+   */
+  #dropPoolClaims(process: DshProcess): void {
+    const held = this.#poolClaims.get(process) ?? 0;
+    if (held <= 0) return;
+    this.#poolClaims.delete(process);
+    for (let index = 0; index < held; index += 1) this.#parked.release();
+  }
+
+  /**
+   * Report a per-session `config.env` the shared child cannot apply.
+   *
+   * The environment is handed to `DshProcess` at spawn only; `attachSession`
+   * carries cwd/route/MCP servers and has no env channel (adding one is a
+   * `dsh-process.ts` change, out of this file's scope). So when a session joins
+   * a child spawned with a different environment, its values are silently inert
+   * unless this says so. `PASEO_AGENT_ID` is excluded because the daemon sets it
+   * per open by design and the provider reads it into `#agentIds` — it is not
+   * addressed to DSH.
+   *
+   * @param env - the joining session's `config.env`.
+   */
+  #warnEnvDiffers(env: Record<string, string>): void {
+    const spawned = this.#poolEnv;
+    if (spawned === undefined) return;
+    const differing: string[] = [];
+    for (const key of new Set([...Object.keys(spawned), ...Object.keys(env)])) {
+      if (key === "PASEO_AGENT_ID") continue;
+      if (spawned[key] !== env[key]) differing.push(key);
+    }
+    if (differing.length === 0) return;
+    process.stderr.write(
+      `[${PROVIDER_ID}] session env differs from the shared process's spawn env (${differing.join(", ")}): `
+        + "the environment is process-wide, so the values the first session opened with stay in effect — these are NOT applied\n",
+    );
   }
 
   /**
@@ -594,6 +702,10 @@ class DshConnection implements ProviderConnection {
   #releasePoolProcess(process: DshProcess): void {
     const held = this.#poolClaims.get(process) ?? 0;
     if (held <= 0) return;
+    // The pair of the hold `#addPoolClaim` took; see the comment there for the
+    // full contract (exactly one release per returned claim, and none for a
+    // claim `#dropPoolClaims` already voided).
+    this.#parked.release();
     if (held === 1) this.#poolClaims.delete(process);
     else this.#poolClaims.set(process, held - 1);
     // A child that is no longer the pooled one has nothing left to schedule: its
@@ -629,22 +741,91 @@ class DshConnection implements ProviderConnection {
   /**
    * Shut the shared child down for real and forget it.
    *
-   * Called on provider teardown and by the idle grace timer. Detaching every
-   * session first keeps the bridge's per-session tables from being read after
-   * the child is gone; the shutdown frame then disposes the runtime.
+   * Called on provider teardown and by the idle grace timer. Serialized because
+   * both can fire for the same child (a `close()` landing inside the grace
+   * timer's shutdown): a second run would otherwise see `#pooled === undefined`
+   * and report teardown as complete while the first is still sending SIGTERM,
+   * letting the next acquire spawn a second child beside the dying one.
+   *
+   * @returns when this shutdown — including any earlier one it waited for — and
+   *   the child's actual exit have completed.
    */
-  async #shutdownPool(): Promise<void> {
+  #shutdownPool(): Promise<void> {
+    const previous = this.#poolShutdown;
+    const task = (async (): Promise<void> => {
+      await previous?.catch(() => undefined);
+      await this.#shutdownPoolNow();
+    })();
+    this.#poolShutdown = task;
+    // Cleared after completion (settled either way) so `#awaitPoolShutdown`
+    // cannot spin on a promise that will never change, and a later shutdown
+    // starts from a clean slate.
+    const clear = (): void => {
+      if (this.#poolShutdown === task) this.#poolShutdown = undefined;
+    };
+    void task.then(clear, clear);
+    return task;
+  }
+
+  /**
+   * Wait until no pool shutdown is in flight.
+   *
+   * The loop re-reads the field because one wait can end just as another
+   * shutdown begins (a teardown racing the grace timer); exiting on the first
+   * resolution would let the caller spawn beside the new retirement.
+   */
+  async #awaitPoolShutdown(): Promise<void> {
+    while (true) {
+      const shutdown = this.#poolShutdown;
+      if (shutdown === undefined) return;
+      await shutdown.catch(() => undefined);
+    }
+  }
+
+  /** One shutdown pass; see {@link #shutdownPool}. */
+  async #shutdownPoolNow(): Promise<void> {
     this.#cancelPoolRelease();
+    // An in-flight spawn is part of the pool. Clearing only the field (the old
+    // behaviour) let `start()` finish afterwards and publish a child on a
+    // connection that was already gone: nothing held its claim, no grace timer
+    // was armed, and the orphan kept the session logs' write locks. Wait for the
+    // spawn, then make sure its child is dead — the acquire path may have
+    // already killed it (it re-checks `#closed` after its own await), in which
+    // case `kill()` is idempotent.
+    const spawn = this.#poolSpawn;
+    this.#poolSpawn = undefined;
+    if (spawn !== undefined) {
+      try {
+        const spawned = await spawn;
+        // The acquire path publishes the child itself. Anything not published
+        // is an orphan of this teardown and has no owner left to kill it.
+        if (this.#pooled !== spawned) spawned.kill();
+      } catch {
+        // The spawn failed and killed its own child; nothing to retire.
+      }
+    }
     const pooled = this.#pooled;
     this.#pooled = undefined;
-    this.#poolSpawn = undefined;
+    this.#poolEnv = undefined;
     if (pooled === undefined) return;
     // Only this child's claims are dropped. Other children can still have
     // outstanding claims (a session that opened onto a child which was later
     // replaced); clearing the whole map would make those claims unreleasable and
     // is exactly the "reset the accounting" shortcut that hid the leak before.
-    this.#poolClaims.delete(pooled);
+    this.#dropPoolClaims(pooled);
     await pooled.shutdown();
+    // `shutdown()` returns after the frame reply and SIGTERM, but the session
+    // logs' kernel write locks are released only once the OS reaps the child. A
+    // spawn into that window fails every session-scoped request with "already
+    // owned by an active write handle" — the same bound `ParkedSessions.quiesce`
+    // exists for. A timeout is reported, not thrown: the open that follows will
+    // surface the lock conflict itself if there is one.
+    const exited = await pooled.waitForExit(RELEASE_TIMEOUT_MS);
+    if (!exited) {
+      process.stderr.write(
+        `[${PROVIDER_ID}] the shared DeepSeek Harness process did not exit within ${String(RELEASE_TIMEOUT_MS)}ms of its shutdown; the next open may race its session log lock\n`,
+      );
+    }
   }
 
   /**
@@ -664,10 +845,11 @@ class DshConnection implements ProviderConnection {
     );
     this.#pooled = undefined;
     this.#poolSpawn = undefined;
+    this.#poolEnv = undefined;
     // The child is gone, so every claim on it is void: the sessions that held
     // them are dead too (each was told through `#exitAll`). Dropping only this
     // child's entry keeps any older child's claims intact for their own release.
-    this.#poolClaims.delete(child);
+    this.#dropPoolClaims(child);
     this.#cancelPoolRelease();
   }
 
@@ -799,7 +981,10 @@ class DshConnection implements ProviderConnection {
         this.#sessions.delete(input.sessionId);
         this.#agentIds.delete(input.sessionId);
         // Park an idle child: the daemon closes this session right before a
-        // rewind refresh reopens it with the same persistence.
+        // rewind refresh reopens it with the same persistence. `park` has **no
+        // effect** under one shared process (`DshSession.close` never parks a
+        // child it does not own); the flag is kept for the session API and must
+        // not be read as "this child survives the close".
         await session?.close({ park: true });
         this.#emit({ type: "session.closed", sessionId: input.sessionId });
         this.#emit({ type: "request.completed", requestId: input.requestId });
@@ -1070,6 +1255,12 @@ class DshConnection implements ProviderConnection {
 
   async #open(input: Extract<ProviderInput, { type: "session.open" }>): Promise<void> {
     const { sessionId, config } = input;
+    // `send()` guards only at its entry. An open still running when the
+    // connection is torn down would otherwise go on to spawn/attach and emit
+    // `session.opened` / `session.ready` on a connection the daemon has already
+    // dropped. The second check inside the transaction covers a teardown that
+    // lands while the open is in flight.
+    this.#assertConnected();
     const display = this.#display ?? (await loadCatalog(config.cwd));
     this.#display = display;
 
@@ -1126,6 +1317,7 @@ class DshConnection implements ProviderConnection {
         // Close first, forget after: if the close throws, the session stays tracked
         // (its own `close()` is idempotent, so a retry takes the same path) instead
         // of leaving an untracked live process that still owns the session log.
+        // `park: true` is a no-op under one shared process (see `session.close`).
         await holder.close({ park: true });
       } catch (error) {
         throw new Error(
@@ -1354,6 +1546,12 @@ class DshConnection implements ProviderConnection {
       // start (it would see this session as the holder and take it over), so the
       // in-flight marker must not outlive it.
       this.#opening.delete(dshSessionId);
+      // The connection can be torn down while this open runs (`close()` does not
+      // wait for opens in flight). Everything from here to the `session.opened`
+      // emit is synchronous, so one check covers the whole publish step: a dead
+      // connection must not announce a session it cannot serve, and the claim
+      // this session holds has to be returned (the catch below closes it).
+      this.#assertConnected();
     } catch (error) {
       // The gate is keyed by DSH session id: the host mints a fresh provider
       // session id for every open, so the id that was gated is not the one this
@@ -1511,10 +1709,13 @@ class DshConnection implements ProviderConnection {
     // Tier 3 — the shared pool process, even when no provider session is attached
     // to it right now (every session closed but the delayed shutdown has not run
     // yet). `DshProcess.setArchived` does not require the session to be attached:
-    // the bridge's `applyArchived` uses the process-wide `workspaceRegistry`
-    // (`dsh-bridge/lib/server.js:1213-1218`) and `paseo/archive` is not gated on
-    // `initialize` (only `prompt` is, `server.js:701`). Using the pool here is
-    // what keeps the write inside the one process that answers the gate.
+    // the bridge's `applyArchived` handler uses the process-wide
+    // `workspaceRegistry` (see `paseo/archive` in `dsh-bridge/lib/server.js`),
+    // and that request is not gated on `initialize` (only `prompt` is — same
+    // file, the `initialize` check in its request dispatcher). Using the pool
+    // here is what keeps the write inside the one process that answers the gate.
+    // (Symbol names, not line numbers: `server.js` changes far more often than
+    // this comment and the numbers had already drifted.)
     const pooled = this.#livePoolProcess();
     if (pooled !== undefined) {
       try {
@@ -1592,7 +1793,16 @@ class DshConnection implements ProviderConnection {
     throw new Error(`unknown session: ${sessionId}`);
   }
 
+  /** Throw when this connection was torn down; see `#open` and `#emit`. */
+  #assertConnected(): void {
+    if (this.#closed) throw new Error("the provider connection is closed");
+  }
+
   #emit(event: ProviderEvent): void {
+    // A torn-down connection has no listener left worth waking, and an open that
+    // raced `close()` must not publish `session.opened` / `session.ready` after
+    // the daemon dropped this connection (it would land as an unknown session).
+    if (this.#closed) return;
     for (const listener of [...this.#listeners]) {
       try {
         listener(event);

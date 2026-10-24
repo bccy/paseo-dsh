@@ -90,6 +90,16 @@ export interface DshSessionOptions {
    */
   dshSessionId?: string;
   cwd: string;
+  /**
+   * The spawning session's `config.env`.
+   *
+   * **Unused for anything a shared child can honour.** The environment is
+   * applied once at spawn (`DshProcessOptions.env`) and `attachSession` has no
+   * env channel, so a session joining an existing child cannot receive it. The
+   * provider reports that divergence loudly (`#warnEnvDiffers`) instead of
+   * pretending; the field is kept because external callers build this options
+   * object and it is the honest record of what the session asked for.
+   */
   env: Record<string, string>;
   /**
    * Paseo's stable agent id for this session (from `config.env.PASEO_AGENT_ID`).
@@ -264,6 +274,12 @@ export function parseRoute(model: string | undefined, fallback: DshRoute): DshRo
  * NOT take part in reuse: a reload reopens the session before that configure
  * runs, and including the effort here made every reload look like a route change
  * and kill a perfectly reusable child (measured +2.2s of cold start).
+ *
+ * **Currently has no callers** — the one-process-multi-session change made every
+ * session join one shared child, so nothing compares a parked entry's route any
+ * more (`ParkedSessions.take` logs a mismatch instead of enforcing it). Kept
+ * rather than deleted: it is the documented definition of that identity, and a
+ * future per-route pool would need exactly this function back.
  */
 function routeKeyOf(route: DshRoute): string {
   return `${route.provider}/${route.model}`;
@@ -442,6 +458,17 @@ export class DshSession {
       throw new Error(`session ${this.id} has no process to join`);
     }
     const { process, reused } = await this.#options.acquireProcess();
+    // A `close()` that ran while the acquire was in flight found `#process`
+    // undefined and returned without releasing anything — there was nothing to
+    // detach. The claim this acquire just took is therefore the only record of
+    // this session's reference, and no later `close()` can return it (the
+    // session is already marked closed). Give it back here, or it leaks forever:
+    // with a shared child that means the child is never retired and the parked
+    // pool keeps believing a live session holds it.
+    if (this.#closed) {
+      this.#options.releaseProcess?.(process);
+      throw new Error(`session ${this.id} was closed while it was opening`);
+    }
     this.#process = process;
     // `reused` is the replacement for the old "adopted a parked process" flag: a
     // child that was already serving conversations can be hosting a native
@@ -1358,7 +1385,14 @@ export class DshSession {
     clearTimeout(this.#usageRefreshTimer);
     const process = this.#process;
     this.#process = undefined;
-    if (process === undefined) return;
+    if (process === undefined) {
+      // Either the session never opened, or an `open()` whose acquire is still
+      // in flight lands here. In the latter case `open()` re-checks `#closed`
+      // after its acquire resolves and returns the claim itself (see there), so
+      // there is nothing to return from this call and nothing to detach — the
+      // session never attached to the child.
+      return;
+    }
     try {
       await process.closeSession(this.#dshSessionId);
     } catch (error) {

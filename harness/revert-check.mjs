@@ -537,7 +537,7 @@ console.log('shared-process lifecycle (behaviour, not source text)');
   /** A process transport that records what the session asked it to do. */
   const spawned = [];
   class FakeProcess {
-    constructor(options) {
+    constructor(options = {}) {
       this.options = options;
       this.running = true;
       this.started = false;
@@ -546,6 +546,16 @@ console.log('shared-process lifecycle (behaviour, not source text)');
       this.planWrites = [];
       this.detached = [];
       this.attached = new Map();
+      /**
+       * Serve a subagent whose stored log stops inside an open turn.
+       *
+       * That shape is what makes `reused` observable: `DshChildSession.replay`
+       * may only leave such a turn "running" on positive live evidence, and
+       * `#joinedLiveProcess` is one of the two sources of it. Without this the
+       * `reused` flag has no visible effect and could be asserted from the stub's
+       * own return value alone — which proves nothing.
+       */
+      this.childOpenTurn = options.childOpenTurn === true;
       spawned.push(this);
     }
     async start() {
@@ -554,6 +564,15 @@ console.log('shared-process lifecycle (behaviour, not source text)');
     async shutdown() {
       this.shutdownCalled = true;
       this.running = false;
+    }
+    /**
+     * The pool awaits the child's exit after shutting it down, so a session's
+     * claim is only returned once the process is really gone. The fake has no
+     * OS process behind it: `shutdown()` above already means "exited", so this
+     * resolves immediately instead of hanging the teardown path.
+     */
+    async waitForExit() {
+      return true;
     }
     kill() {
       this.killed = true;
@@ -588,7 +607,23 @@ console.log('shared-process lifecycle (behaviour, not source text)');
     async usage() {
       return { available: true, contextWindow: 1000, usedTokens: 0 };
     }
-    async history() {
+    async history(sessionId) {
+      if (this.childOpenTurn && sessionId === 'child-open') {
+        // A turn that starts and never closes: the shape a killed child and a
+        // still-running child share. Only live evidence may keep it running.
+        return {
+          available: true,
+          inheritedEventCount: 0,
+          events: [
+            { type: 'turn/start', seq: 1, data: { turn: 1 } },
+            {
+              type: 'assistant/message',
+              seq: 2,
+              data: { turn: 1, step: 1, message: { id: 'om1', content: [{ type: 'text', text: 'open turn answer' }] } },
+            },
+          ],
+        };
+      }
       return { events: [], hasMore: false };
     }
     async catalog() {
@@ -606,7 +641,13 @@ console.log('shared-process lifecycle (behaviour, not source text)');
     async sessions() {
       return { sessions: [] };
     }
-    async subagents() {
+    async subagents(sessionId) {
+      if (this.childOpenTurn) {
+        return {
+          available: true,
+          subagents: [{ sessionId: 'child-open', parentSessionId: sessionId, mode: 'one-shot' }],
+        };
+      }
       return { subagents: [] };
     }
     async getPlan() {
@@ -619,14 +660,52 @@ console.log('shared-process lifecycle (behaviour, not source text)');
   processModule.DshProcess = FakeProcess;
 
   /**
-   * Build a session wired to a shared child, the way the provider wires it.
+   * A stand-in for the provider's pool of shared children.
    *
-   * `acquireProcess` returns `{ process, reused }`; `reused` means the child was
-   * already serving conversations (which changes how a native child's open turn is
-   * interpreted). `releaseProcess` is the provider's claim hand-back.
+   * The previous version of the two-session case handed **both** sessions the same
+   * `FakeProcess` object (`{ sharedProcess: shared }`), so "two sessions attach to
+   * the one shared child" was true by construction: the test injected the premise
+   * it then asserted. It also never read `reused` — it counted `acquire` calls and
+   * called that a reuse, while `reused` is the value that actually decides
+   * behaviour (`DshSession` stores it as `#joinedLiveProcess`).
+   *
+   * This pool makes the decision itself, the way `#acquirePoolProcess` does
+   * (`paseo-plugin/server/provider.ts:494`): the first acquire spawns, later ones
+   * join the live child, and each acquire reports which happened. The assertions
+   * can then read the decision and its result instead of assuming them.
+   */
+  const makePool = (processOptions = {}) => {
+    const pool = { spawned: [], acquires: [], releases: [] };
+    /** Create the child ahead of time (so a later spawn can only be the session's). */
+    pool.prime = () => {
+      const process = new FakeProcess({ ...processOptions, pooled: true });
+      pool.spawned.push(process);
+      return process;
+    };
+    pool.acquire = async () => {
+      const live = pool.spawned.find((process) => process.running && !process.shutdownCalled);
+      const reused = live !== undefined;
+      const process = live ?? pool.prime();
+      pool.acquires.push({ reused, process });
+      return { process, reused };
+    };
+    pool.release = (process) => {
+      pool.releases.push(process);
+    };
+    return pool;
+  };
+
+  /**
+   * Build a session wired to a pool, the way the provider wires it.
+   *
+   * `acquireProcess`/`releaseProcess` are the provider's pool calls; `reused` is
+   * whatever the pool decided (see {@link makePool}). No process is injected here:
+   * a session that got one handed to it could not tell a shared child from a
+   * per-session one.
    */
   const makeSession = (id, route, extra = {}) => {
-    const claims = { acquired: 0, released: [] };
+    const pool = extra.pool ?? makePool();
+    const events = [];
     const session = new DshSession({
       sessionId: id,
       cwd: '/work',
@@ -635,38 +714,35 @@ console.log('shared-process lifecycle (behaviour, not source text)');
       mode: 'build',
       models: [],
       thinkingOptions: [],
-      subsession: false,
-      emit: () => {},
+      subsession: extra.subsession === true,
+      emit: (event) => events.push(event),
       log: () => {},
-      acquireProcess: async () => {
-        claims.acquired += 1;
-        return { process: extra.sharedProcess, reused: claims.acquired > 1 };
-      },
-      releaseProcess: (process) => {
-        claims.released.push(process);
-      },
+      acquireProcess: () => pool.acquire(),
+      releaseProcess: (process) => pool.release(process),
       ...extra.options,
     });
-    return { session, claims };
+    return { session, pool, events };
   };
 
   // ---- 1. open acquires the shared child and attaches this session -------
   {
-    // The shared child is constructed here, by the test, not by the session; take
-    // the mark *after* it so the count only covers what `open()` does.
-    const shared = new FakeProcess({});
+    // A cold pool: the first acquire is what spawns. Taking the mark *after* the
+    // pool is built means any process constructed below can only be the pool's
+    // (i.e. the provider's), never one the session made for itself.
+    const pool = makePool();
     const spawnedBefore = spawned.length;
-    const { session, claims } = makeSession(
+    const { session } = makeSession(
       'revert-share-1',
       { provider: 'fixture', model: 'alpha' },
-      { sharedProcess: shared },
+      { pool },
     );
     await session.open();
-    const attached = shared.attached.get('revert-share-1');
+    const shared = pool.spawned[0];
+    const attached = shared?.attached.get('revert-share-1');
     check(
-      'open acquires the shared child once',
-      claims.acquired === 1 && claims.released.length === 0,
-      `acquired ${String(claims.acquired)}, released ${String(claims.released.length)}`,
+      'open acquires the shared child once, as a cold start',
+      pool.acquires.length === 1 && pool.acquires[0].reused === false && pool.releases.length === 0,
+      `${String(pool.acquires.length)} acquire(s), reused ${String(pool.acquires[0]?.reused)}, released ${String(pool.releases.length)}`,
     );
     check(
       'and attaches this session with its own cwd and route',
@@ -677,12 +753,15 @@ console.log('shared-process lifecycle (behaviour, not source text)');
       JSON.stringify(attached?.options ?? null),
     );
     // A session must not construct its own transport any more: the only
-    // `new DshProcess` left is the provider's shared-child spawn. Counted
-    // relative to the mark so earlier cases do not pollute it.
+    // `new DshProcess` left is the provider's shared-child spawn, which here is
+    // the pool's. Counted relative to the mark (so earlier cases do not pollute
+    // it) and excluding the pool's own child — a session that spawned a second
+    // process is exactly what this asserts cannot happen.
+    const sessionSpawns = spawned.slice(spawnedBefore).filter((process) => process !== shared);
     check(
       'and does not spawn a process of its own',
-      spawned.length === spawnedBefore,
-      `${String(spawned.length - spawnedBefore)} spawn(s) during open`,
+      sessionSpawns.length === 0 && pool.spawned.length === 1,
+      `${String(sessionSpawns.length)} session-made spawn(s); pool made ${String(pool.spawned.length)}`,
     );
 
     // ---- 2. close detaches and releases, never shutting the child down ----
@@ -694,27 +773,43 @@ console.log('shared-process lifecycle (behaviour, not source text)');
     );
     check(
       'and releases the claim instead of shutting the child down',
-      claims.released.length === 1 && shared.shutdownCalled === false && shared.running === true,
-      `released ${String(claims.released.length)}, shutdown ${String(shared.shutdownCalled)}`,
+      pool.releases.length === 1 && shared.shutdownCalled === false && shared.running === true,
+      `released ${String(pool.releases.length)}, shutdown ${String(shared.shutdownCalled)}`,
     );
   }
 
   // ---- 3. a second session attaches to the same child -------------------
   {
-    const shared = new FakeProcess({});
-    const first = makeSession('revert-share-2a', { provider: 'fixture', model: 'alpha' }, { sharedProcess: shared });
-    const second = makeSession('revert-share-2b', { provider: 'fixture', model: 'alpha' }, { sharedProcess: shared });
+    // Both sessions talk to **one pool**; neither is handed a process. The pool
+    // decides (spawn on the first acquire, join afterwards) and reports `reused`,
+    // so "they share one child" is a property of the code path under test rather
+    // than of the test's own wiring. `acquire` calls are recorded with their
+    // `reused` value, which is the flag `DshSession` stores as `#joinedLiveProcess`
+    // and which the child-replay rule consumes.
+    const pool = makePool();
+    const first = makeSession('revert-share-2a', { provider: 'fixture', model: 'alpha' }, { pool });
+    const second = makeSession('revert-share-2b', { provider: 'fixture', model: 'alpha' }, { pool });
     await first.session.open();
     await second.session.open();
+    const shared = pool.spawned[0];
     check(
-      'two sessions attach to the one shared child',
-      shared.attached.has('revert-share-2a') && shared.attached.has('revert-share-2b'),
-      `attached [${[...shared.attached.keys()].join(',')}]`,
+      'the pool spawned exactly one child for two sessions',
+      pool.spawned.length === 1 && pool.acquires.every((acquire) => acquire.process === shared),
+      `${String(pool.spawned.length)} spawn(s), acquires -> pids [${pool.acquires.map((a) => spawned.indexOf(a.process)).join(',')}]`,
     );
     check(
-      'the second acquire is reported as a reuse, not a cold start',
-      second.claims.acquired === 1,
-      `acquired ${String(second.claims.acquired)}`,
+      'two sessions attach to the one shared child',
+      shared !== undefined &&
+        shared.attached.has('revert-share-2a') &&
+        shared.attached.has('revert-share-2b'),
+      `attached [${[...(shared?.attached.keys() ?? [])].join(',')}]`,
+    );
+    check(
+      'the first acquire is a cold start and the second is a reuse',
+      pool.acquires.length === 2 &&
+        pool.acquires[0].reused === false &&
+        pool.acquires[1].reused === true,
+      `reused flags [${pool.acquires.map((acquire) => String(acquire.reused)).join(',')}]`,
     );
     // Closing one must not disturb the other: this is the failure a per-session
     // shutdown would produce, and it is the reason the provider owns the count.
@@ -732,6 +827,58 @@ console.log('shared-process lifecycle (behaviour, not source text)');
     );
   }
 
+  // ---- 3b. `reused` reaches the behaviour it exists for -------------------
+  {
+    // The value of `reused` is `#joinedLiveProcess` (`session.ts:450`), and its
+    // only consumer is the child-replay rule: a child whose stored log stops
+    // inside a turn is closed as canceled unless the process it lives in never
+    // stopped. So the flag is asserted by **its effect**, not by reading it back
+    // out of the stub that returned it:
+    //
+    //   cold start (reused: false) => no live evidence => turn closed canceled
+    //   reuse      (reused: true)  => the process never stopped => turn kept
+    //
+    // Both halves run, so a `reused` that is returned but ignored cannot pass.
+    const replayChildTurn = async (label, primed) => {
+      const pool = makePool({ childOpenTurn: true });
+      // `primed` is the whole difference between the two shapes: a primed pool
+      // already has a live child, so the session's acquire joins it and is
+      // reported as a reuse; an unprimed one spawns on that acquire.
+      if (primed) pool.prime();
+      const { session, events } = makeSession(
+        label,
+        { provider: 'fixture', model: 'alpha' },
+        { pool, subsession: true },
+      );
+      await session.open();
+      await session.replaySubagents();
+      await sleep(50);
+      const childScoped = `${label}:sub:child-open`;
+      const turns = events.filter((e) => e.type === 'session.turn' && e.sessionId === childScoped);
+      const opened = events.filter((e) => e.type === 'session.opened' && e.sessionId === childScoped);
+      return { pool, events, turns, opened };
+    };
+
+    const cold = await replayChildTurn('revert-reused-cold', false);
+    check(
+      'a cold start closes a child whose stored turn never ended',
+      cold.pool.acquires[0]?.reused === false &&
+        cold.opened.length === 1 &&
+        cold.turns.some((e) => e.state === 'canceled') &&
+        !cold.turns.some((e) => e.state === 'started'),
+      `reused ${String(cold.pool.acquires[0]?.reused)}, opened ${String(cold.opened.length)}, turns [${cold.turns.map((e) => String(e.state)).join(',')}]`,
+    );
+
+    const warm = await replayChildTurn('revert-reused-warm', true);
+    check(
+      'a reuse keeps that same turn running (the process never stopped)',
+      warm.pool.acquires[0]?.reused === true &&
+        warm.opened.length === 1 &&
+        !warm.turns.some((e) => e.state === 'canceled'),
+      `reused ${String(warm.pool.acquires[0]?.reused)}, opened ${String(warm.opened.length)}, turns [${warm.turns.map((e) => String(e.state)).join(',')}]`,
+    );
+  }
+
   // ---- 4. the reuse key is provider/model, never the thinking effort ----
   {
     // The measured regression: including `reasoningEffort` in a reuse identity
@@ -740,15 +887,19 @@ console.log('shared-process lifecycle (behaviour, not source text)');
     // the property it protected is not: a session with a different thinking
     // effort must still attach to the same shared child, and its route must be
     // pinned per session.
-    const shared = new FakeProcess({});
-    const high = makeSession('revert-key-high', { provider: 'fixture', model: 'alpha', reasoningEffort: 'high' }, { sharedProcess: shared });
-    const low = makeSession('revert-key-low', { provider: 'fixture', model: 'alpha', reasoningEffort: 'low' }, { sharedProcess: shared });
+    const pool = makePool();
+    const high = makeSession('revert-key-high', { provider: 'fixture', model: 'alpha', reasoningEffort: 'high' }, { pool });
+    const low = makeSession('revert-key-low', { provider: 'fixture', model: 'alpha', reasoningEffort: 'low' }, { pool });
     await high.session.open();
     await low.session.open();
+    const shared = pool.spawned[0];
     check(
       'a different thinking effort still shares the one child',
-      shared.attached.has('revert-key-high') && shared.attached.has('revert-key-low'),
-      `attached [${[...shared.attached.keys()].join(',')}]`,
+      pool.spawned.length === 1 &&
+        shared?.attached.has('revert-key-high') &&
+        shared?.attached.has('revert-key-low') &&
+        pool.acquires[1]?.reused === true,
+      `${String(pool.spawned.length)} spawn(s), reused flags [${pool.acquires.map((a) => String(a.reused)).join(',')}], attached [${[...(shared?.attached.keys() ?? [])].join(',')}]`,
     );
     check(
       'and each session pins its own effort, not the process default',

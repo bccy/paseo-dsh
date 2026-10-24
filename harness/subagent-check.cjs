@@ -575,8 +575,41 @@ async function openSession(conn, sessionId, history) {
       history: "skip",
     });
   }
-  await untilIn(pairEvents, (e) => e.type === "session.ready" && e.sessionId === victimRoot, "victim ready", 30000);
-  check("two sessions are open on the archive pair", true, `${survivorRoot}, ${victimRoot}`);
+  // Both sessions must be *ready*, not merely sent. The opens are fired without
+  // awaiting their replies, and the rest of this case reads the survivor's event
+  // stream — an assertion that only says "we sent two opens"
+  // (`check(..., true, ...)`) passes even when one never materialized, which is
+  // exactly the state that makes "archiving one does not disturb the other"
+  // vacuous.
+  //
+  // Bounded poll, not `untilIn`: a session that never becomes ready must leave a
+  // **FAIL title** naming the missing ready, not throw out of the whole suite. A
+  // thrown timeout aborts every later case and hides which assertion was violated
+  // — measured: with only one of the two opens sent, `untilIn` on the survivor
+  // threw and the run reported "threw: timed out", not the archive-pair failure.
+  const pairReadyDeadline = Date.now() + 30000;
+  while (
+    Date.now() < pairReadyDeadline
+    && [survivorRoot, victimRoot].some(
+      (id) => !pairEvents.some((e) => e.type === "session.ready" && e.sessionId === id),
+    )
+  ) {
+    await sleep(50);
+  }
+  const pairReady = [survivorRoot, victimRoot].map((id) =>
+    pairEvents.find((e) => e.type === "session.ready" && e.sessionId === id),
+  );
+  const pairOpenFailures = pairEvents.filter(
+    (e) => e.type === "request.failed" || e.type === "session.runtime_failed",
+  );
+  check(
+    "both sessions on the archive pair reached ready",
+    pairReady.every((event) => event !== undefined) && pairOpenFailures.length === 0,
+    `${String(pairReady.filter((event) => event !== undefined).length)}/2 ready`
+      + (pairOpenFailures.length === 0
+        ? ""
+        : `; failures: ${pairOpenFailures.map((e) => `${e.type}: ${e.error?.message}`).join(" | ")}`),
+  );
 
   // Prompt the survivor first, so it has a live turn to lose.
   const survivorMark = pairEvents.length;
@@ -1014,8 +1047,10 @@ async function openSession(conn, sessionId, history) {
   // and cap the wait so a regression that never retires fails fast with a reason
   // rather than hanging the suite.
   // The grace is 5 s; measured in isolation the child sends `shutdown` at ~10 s.
-  // 12 s is the margin. (In this script it does *not* retire — see the SKIP note
-  // below and the note in the reopen assertion.)
+  // 12 s is the margin. Note that whether it retired no longer changes what is
+  // asserted: both reopen shapes rebuild the child tree exactly once (see the
+  // reopen block), so the rebuild assertions run either way instead of being
+  // gated on which shape this run happened to take.
   await sleep(12_000);
 
   // ---------------------------------------------------------------------
@@ -1093,51 +1128,51 @@ async function openSession(conn, sessionId, history) {
     (e) => e.type === "session.opened" && e.sessionId === childAScoped,
   ).length;
 
-  // The two shapes must agree with each other, and the assertion says so:
-  //   - reused child  => the child view survived, nothing to rebuild => 0
-  //   - cold start    => fresh child, tree rebuilt from history       => 1
-  // A count of 2 would mean a duplicate row for one child (the bug
-  // `announcedLive` exists to prevent), and 0 on a cold start would mean the
-  // tree silently came back empty. So the check is on the *set* {0, 1} plus the
-  // consistency of the rest of the block with whichever happened.
+  // A replay reopen must rebuild the child tree **exactly once**, whichever shape
+  // it takes.
+  //
+  // Measured, and it corrects the earlier assumption here: the reuse shape does
+  // *not* announce 0. `announcedLive` is `#children.has(...)`, which is false on a
+  // fresh `DshSession` even when the process was reused, so a reuse reopen
+  // re-announces the child under the same durable provider id (an upsert by id,
+  // not a duplicate row). Both shapes therefore announce exactly 1.
+  //
+  // That makes 0 unambiguous, and it is not the benign "reused the child" case the
+  // previous version skipped: it means `replaySubagents()` returned without
+  // rebuilding anything. Probed directly (fake bridge in `error` mode, which is
+  // exactly what an unavailable `paseo/subagents` looks like): the reopen emits
+  // `session.opened` for the root and **no child at all**, no notice, and no child
+  // timeline rows — a reopened session whose subagent tree silently came back
+  // empty. 2 would mean a duplicate row for one child.
+  //
+  // So the set is a single value, not {0, 1}, and the tree assertions below run
+  // unconditionally: gating them on `reannounced === 1` is what let a broken
+  // rebuild report a green suite.
   check(
-    "the reopen announces each child at most once (no duplicate rows)",
-    reannounced <= 1,
-    `${String(reannounced)} announcement(s)`,
+    "the reopen rebuilds each child exactly once (no empty tree, no duplicate rows)",
+    reannounced === 1,
+    `${String(reannounced)} announcement(s)`
+      + (reannounced === 0
+        ? " — the tree came back empty; `replaySubagents()` produced no child (an unavailable "
+          + "`paseo/subagents` listing is one measured cause)"
+        : ""),
   );
-  if (reannounced === 0) {
-    // The pooled child survived the wait, so this run cannot exercise the
-    // rebuild. That is a property of the pool's release timing, not of the replay
-    // code; the reuse shape is already asserted above. Reported as a skip so the
-    // gap is visible instead of silently passing.
-    console.log(
-      "  SKIP  replay tree rebuild — the shared child did not retire, so this reopen reused it",
-    );
-    console.log(
-      "        (measured: in isolation a 6-session run retires at ~10 s and the next open spawns"
-        + " pid+1; inside this script every root session is closed and none is reported open,"
-        + " yet the child survives 12 s. That points at the provider's reference count leaking"
-        + " across many connections, not at the replay code — reported to the Lead as a T4 item.)",
-    );
-  }
-  if (reannounced === 1) {
-    check(
-      "reopen replay rebuilds the tree (restoration parent)",
-      replayed.some((e) => e.type === "session.opened" && e.sessionId === childAScoped && e.parentSessionId === rootA) &&
-        replayed.some((e) => e.type === "session.opened" && e.sessionId === scoped(rootA, "child-B") && e.parentSessionId === childAScoped),
-    );
-  }
-  if (reannounced === 1) {
-    check(
-      "replay restores the child's terminal status (not stuck running)",
-      replayed.some((e) => e.type === "session.turn" && e.sessionId === childAScoped && e.state === "failed"),
-    );
-    check(
-      "fork-inherited history is not replayed as the child's own messages",
-      replayed.some((e) => e.type === "timeline.item" && e.sessionId === childAScoped && e.item?.text === "child A answer") &&
-        !replayed.some((e) => e.type === "timeline.item" && e.sessionId === childAScoped && /INHERITED-PARENT/.test(timelineText(e))),
-    );
-  }
+  check(
+    "reopen replay rebuilds the tree (restoration parent)",
+    replayed.some((e) => e.type === "session.opened" && e.sessionId === childAScoped && e.parentSessionId === rootA) &&
+      replayed.some((e) => e.type === "session.opened" && e.sessionId === scoped(rootA, "child-B") && e.parentSessionId === childAScoped),
+    `${String(replayed.filter((e) => e.type === "session.opened" && String(e.sessionId).includes(":sub:")).length)} child announcement(s)`,
+  );
+  check(
+    "replay restores the child's terminal status (not stuck running)",
+    replayed.some((e) => e.type === "session.turn" && e.sessionId === childAScoped && e.state === "failed"),
+    JSON.stringify(replayed.filter((e) => e.type === "session.turn" && e.sessionId === childAScoped).map((e) => e.state)),
+  );
+  check(
+    "fork-inherited history is not replayed as the child's own messages",
+    replayed.some((e) => e.type === "timeline.item" && e.sessionId === childAScoped && e.item?.text === "child A answer") &&
+      !replayed.some((e) => e.type === "timeline.item" && e.sessionId === childAScoped && /INHERITED-PARENT/.test(timelineText(e))),
+  );
   const archivedAnnouncements = replayed.filter(
     (e) => e.type === "session.opened" && e.sessionId.endsWith(":sub:child-Z"),
   );
@@ -1192,14 +1227,15 @@ async function openSession(conn, sessionId, history) {
   // replay reads the durable catalog of a process that has just booted, where
   // nothing is live. Without that, Paseo's default on attach is "running" and
   // the row pulses forever.
-  // Everything below until the `history: "skip"` case reads the **cold-start**
-  // rebuild. When the pooled child survived (see the SKIP above) there is no
-  // rebuild to read, so the whole group is gated on it rather than reporting five
-  // failures for one cause.
-  // Declared outside the gate: a later contrast assertion (also gated on the cold
-  // start) refers to it.
+  //
+  // **Not gated.** An earlier version wrapped this whole group in
+  // `if (reannounced === 1)`, so the moment the rebuild produced no child (the
+  // exact bug the block exists to catch) these five assertions were silently
+  // skipped and the suite still reported green. The rebuild is asserted
+  // unconditionally above; if it did not happen, the assertions below must fail
+  // loudly — that is the point of them.
   const killedScoped = scoped(rootA, "child-K");
-  if (reannounced === 1) {
+  {
   const killedTurns = replayed.filter((e) => e.type === "session.turn" && e.sessionId === killedScoped);
   check(
     "a replayed child whose log stops inside a turn is closed, not announced as running",
@@ -1238,22 +1274,23 @@ async function openSession(conn, sessionId, history) {
     JSON.stringify(liveItems.map((e) => `${e.item?.type}/${e.item?.callId ?? "-"}=${e.item?.status ?? "-"}`)),
   );
 
-  } // end of the cold-start-only group
+  } // end of the ungated child-replay group
 
   const skipMark = events.length;
   await conn.send({ type: "session.open", requestId: "reopen-skip", sessionId: rootA, config: { cwd: process.cwd(), mode: "build" }, persistence: { version: 1, data: { sessionId: rootA } }, history: "skip" });
   await untilSince(skipMark, (e) => e.type === "session.ready" && e.sessionId === rootA, "skip ready", 30000);
   await sleep(600);
-  if (reannounced === 1) {
-    await untilSince(skipMark, (e) => e.type === "session.opened" && e.sessionId === childAScoped, "skip-reopened child-A", 30000);
-    check("reopen with history:skip also rebuilds the tree", since(skipMark).some((e) => e.type === "session.opened" && e.sessionId === childAScoped && e.parentSessionId === rootA));
-  } else {
-    check(
-      "a reuse reopen announces no child twice (history:skip)",
-      since(skipMark).filter((e) => e.type === "session.opened" && e.sessionId === childAScoped).length <= 1,
-      `${String(since(skipMark).filter((e) => e.type === "session.opened" && e.sessionId === childAScoped).length)} announcement(s)`,
-    );
-  }
+  // Same claim for `history: "skip"`: the provider rebuilds the subagent tree on
+  // *every* open, not only on `replay` (`provider.ts` calls `replaySubagents()`
+  // unconditionally after the root is ready), so a `skip` reopen must rebuild it
+  // too — and exactly once. The old `else` branch asserted `<= 1`, which a
+  // rebuild that produced nothing passes.
+  check(
+    "reopen with history:skip also rebuilds the tree, exactly once",
+    since(skipMark).filter((e) => e.type === "session.opened" && e.sessionId === childAScoped).length === 1
+      && since(skipMark).some((e) => e.type === "session.opened" && e.sessionId === childAScoped && e.parentSessionId === rootA),
+    `${String(since(skipMark).filter((e) => e.type === "session.opened" && e.sessionId === childAScoped).length)} announcement(s)`,
+  );
   // `rootA` has been reopened three times on this connection and closed only once
   // (before the first reopen). Each successful open takes a pool claim, so leaving
   // two outstanding keeps the shared child alive forever — which is what made the
@@ -1625,8 +1662,16 @@ async function openSession(conn, sessionId, history) {
   await conn4.close();
   await connFail.close();
 
+  // There is no skip path any more: the one that existed (the replay rebuild) is a
+  // hard assertion, and every unproven case must be written as a failing `check`.
+  // A bare `console.log("SKIP ...")` used to leave the exit code at 0, so a suite
+  // that proved nothing looked green; `grep -n 'SKIP'` on this file must stay
+  // empty. This single count is therefore the whole verdict.
   const failed = results.filter((r) => !r.pass).length;
   console.log(`\n  ${results.length - failed}/${results.length} passed`);
+  if (failed > 0) {
+    console.log(`  ${String(failed)} FAILED`);
+  }
   process.exit(failed === 0 ? 0 : 1);
 })().catch((error) => {
   console.error(`\n  threw: ${error.message}`);

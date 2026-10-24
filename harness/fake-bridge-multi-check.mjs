@@ -40,8 +40,14 @@ function check(label, condition, detail) {
   }
 }
 
-/** Run one bridge process and collect every frame it emits. */
-function runBridge({ mode, sessionIds }) {
+/**
+ * Run one bridge process and collect every frame it emits.
+ *
+ * `promptsPerSession` sends that many prompts to **each** session, which is what
+ * makes "one answer per prompt" distinguishable from "one answer per process":
+ * with a single prompt both look identical.
+ */
+function runBridge({ mode, sessionIds, promptsPerSession = 1 }) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [BRIDGE], {
       stdio: ["pipe", "pipe", "pipe"],
@@ -85,9 +91,11 @@ function runBridge({ mode, sessionIds }) {
         await settle(10);
       }
       for (const sessionId of sessionIds) {
-        send("session/prompt", { sessionId, contentBlocks: [{ type: "text", text: `hi ${sessionId}` }] });
+        for (let attempt = 0; attempt < promptsPerSession; attempt += 1) {
+          send("session/prompt", { sessionId, contentBlocks: [{ type: "text", text: `hi ${sessionId} #${attempt}` }] });
+        }
       }
-      await settle(200);
+      await settle(200 * promptsPerSession);
       child.kill("SIGKILL");
       resolve({ frames, sessionIds });
     })();
@@ -148,14 +156,49 @@ console.log("multi: one bridge process drives several sessions");
   check("no status is attributed to an unknown session", unknownStatus.length === 0, `${unknownStatus.length}`);
 }
 
-console.log("\nmulti: a second prompt does not re-run the first scenario");
+console.log("\nmulti: the scenario runs once per process, not once per prompt");
 {
-  const { frames } = await runBridge({ mode: "multi", sessionIds: ["multi-A"] });
-  // The harness sends one prompt per session, so a single-session run is also the
-  // control for "the scenario emits once per process, not once per prompt".
+  // The claim needs a *control group that differs from the experiment*: one
+  // session, but **two** prompts. A single prompt cannot tell "one answer per
+  // process" from "one answer per prompt" apart — both produce exactly one
+  // answer — so the earlier version of this block asserted nothing about the
+  // property it names.
+  //
+  // The `multi` scenario answers the session that prompted (see
+  // `emitMultiTurn`), so two prompts legitimately produce two answers for the
+  // same session: what must NOT happen is a *re-run of the whole scenario* per
+  // prompt. Both halves are pinned below.
+  const { frames } = await runBridge({ mode: "multi", sessionIds: ["multi-A"], promptsPerSession: 2 });
   const events = sessionEvents(frames);
   const answers = events.filter((entry) => entry.event?.type === "assistant/message");
-  check("one session, one prompt, one answer", answers.length === 1, `${answers.length}`);
+  check(
+    "two prompts to one session produce two answers, not one (the scenario is per prompt, not per process)",
+    answers.length === 2,
+    `${answers.length}`,
+  );
+  check(
+    "…and each answer is a fresh turn of that same session",
+    answers.map((entry) => entry.event?.data?.turn).join(",") === "1,2",
+    answers.map((entry) => entry.event?.data?.turn).join(","),
+  );
+  // The per-process half: the scenario must not *also* emit its process-wide set
+  // (every session, every child, the ghost frame). A duplicate of the first
+  // prompt's output on the second prompt would show up as a repeated turn number
+  // or an answer attributed to a session that never prompted.
+  const otherSessions = events.filter(
+    (entry) => entry.sessionId !== "multi-A" && entry.event?.type === "assistant/message",
+  );
+  check(
+    "a second prompt emits no event for any other session",
+    otherSessions.length === 0,
+    `${otherSessions.length}: ${otherSessions.map((entry) => entry.sessionId).join(",")}`,
+  );
+  const turns = events.filter((entry) => entry.event?.type === "turn/end").map((entry) => entry.event?.data?.turn);
+  check(
+    "the two prompts are two distinct turns, never a replayed first one",
+    turns.join(",") === "1,2",
+    turns.join(","),
+  );
 }
 
 console.log("\nmulti: initialize does not bind a session");

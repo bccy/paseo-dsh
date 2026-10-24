@@ -334,6 +334,25 @@ function gatewayServers(entries) {
   );
 
   // ---- an SSE server is refused by name, not silently dropped -----------
+  //
+  // The assertion that used to live here was `mcpFramesFor(sseSession).length === 0`:
+  // a session refused at open can never emit `paseo/mcp/set`, so it was true by
+  // construction and could not fail. The real risk is the **process**: `open()`
+  // calls `acquireProcess()` (`paseo-plugin/server/session.ts:444`) before
+  // `attachSession` validates the MCP entries (`paseo-plugin/server/dsh-process.ts:786`),
+  // so a refused server can spawn a `dsh` child and only then be rejected. The
+  // observable is therefore the frame log's **pid**, and its `initialize` frame —
+  // the only proof that a new child process ran.
+  //
+  // Measured (and it is why this block is written the way it is): with a *cold*
+  // pool the refused open does spawn a child (`initialize` from a new pid) and the
+  // provider retires it ~4 s later; with the **warm** pool this script has by now
+  // (six sessions already opened on this connection), no new pid appears at all.
+  // Both facts are pinned below: no new child, and — as the guard that keeps the
+  // first assertion honest — the child that serves every other session is still
+  // exactly the one pid that was already there.
+  const pidsBeforeSse = new Set(frames().map((frame) => frame.pid));
+  const initializesBeforeSse = frames().filter((frame) => frame.method === "initialize").length;
   const sseSession = `mcp-sse-${Date.now()}`;
   await conn.send({
     type: "session.open",
@@ -354,11 +373,57 @@ function gatewayServers(entries) {
     /legacy/.test(sseFailure.error?.message ?? "") && /sse/i.test(sseFailure.error?.message ?? ""),
     sseFailure.error?.message,
   );
-  await sleep(300);
+  await sleep(800);
+  const framesAfterSse = frames();
+  const newPids = [...new Set(framesAfterSse.map((frame) => frame.pid))]
+    .filter((pid) => !pidsBeforeSse.has(pid));
+  const newInitializes = framesAfterSse.filter(
+    (frame) => frame.method === "initialize" && !pidsBeforeSse.has(frame.pid),
+  );
   check(
-    "a refused server never spawns a DSH process",
+    "a refused server spawns no DSH child process",
+    newPids.length === 0 && newInitializes.length === 0,
+    newPids.length === 0
+      ? `no new pid (${String(pidsBeforeSse.size)} child process(es) unchanged, ${String(framesAfterSse.filter((f) => f.method === "initialize").length - initializesBeforeSse)} new initialize frame(s))`
+      : `new pids [${newPids.join(",")}] — ${newInitializes.map((frame) => `initialize#${frame.pid}`).join(",") || "no initialize"}`,
+  );
+  // The positive half: the warm child this script has been using must still be
+  // the only session carrier. A refused open that silently replaced or retired it
+  // would be invisible to the assertion above.
+  const carriersAfterSse = [...new Set(
+    framesAfterSse
+      .filter((frame) => frame.method === "initialize" || frame.method === "session/prompt")
+      .map((frame) => frame.pid),
+  )];
+  check(
+    "…and every session still runs on the one child it started with",
+    carriersAfterSse.length === 1 && pidsBeforeSse.has(carriersAfterSse[0]),
+    `carrier pids [${carriersAfterSse.join(",")}], before [${[...pidsBeforeSse].join(",")}]`,
+  );
+  check(
+    "…and the refused session emitted no mcp frame of its own",
     mcpFramesFor(sseSession).length === 0,
     `${String(mcpFramesFor(sseSession).length)} frame(s) for the refused session`,
+  );
+  // The pool-state-independent half of the claim. The pid assertion above only
+  // fires while the pool is cold; this one fires in either state, because it asks
+  // whether the child was ever made to *serve* the refused session. `attachSession`
+  // performs the MCP validation after `start()` and before
+  // `#ensureSessionReady` (`dsh-process.ts:779-790`), so a reordering that
+  // initialized the session before rejecting it would show up as an `initialize`
+  // (or any session-scoped frame) naming the refused id.
+  const framesForRefusedSession = frames().filter(
+    (frame) => frame.params?.sessionId === sseSession,
+  );
+  const servingFrames = framesForRefusedSession.filter(
+    (frame) => frame.method === "initialize" || frame.method === "paseo/mcp/set" || frame.method === "session/prompt",
+  );
+  check(
+    "…and no child was ever initialized for the refused session",
+    servingFrames.length === 0,
+    servingFrames.length === 0
+      ? `0 serving frame(s) (frames naming the session: ${String(framesForRefusedSession.length)} — ${framesForRefusedSession.map((frame) => frame.method).join(",") || "none"})`
+      : servingFrames.map((frame) => `${frame.method}#${frame.pid}`).join(","),
   );
 
   // ---- the frame is per-session state, so a reopen re-sends it ----------

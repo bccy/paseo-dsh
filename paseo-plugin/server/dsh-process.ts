@@ -228,18 +228,51 @@ type OrphanFrame =
   | { kind: "status"; params: Record<string, unknown> }
   | { kind: "child-opened"; params: Record<string, unknown> };
 
-/** How many orphan frames one producing session may accumulate. */
-const ORPHAN_FRAME_LIMIT = 256;
+/**
+ * How many orphan frames one producing session may accumulate.
+ *
+ * The bound is set from the **producer**, not from what feels generous. While a
+ * child session is unopened the bridge holds its frames itself, up to
+ * `CHILD_BUFFER_CAP = 500` (`dsh-bridge/lib/server.js:135`), and only then opens
+ * the child and flushes them (`server.js:429-437`). A single flush can therefore
+ * deliver ~500 frames of ONE child in one burst, and they arrive here *before*
+ * the ancestor notice that would make them routable. A bucket smaller than that
+ * overflowed in the middle of the very burst it exists to survive, and the
+ * eviction it then performed dropped the child's earliest output and usually its
+ * first `turn/end` — the exact loss this buffer is here to prevent. 1024 leaves
+ * room for two bridge buffers plus live traffic in flight.
+ *
+ * Overflow is no longer solved by dropping the oldest frame: an oldest-first
+ * eviction tears a turn apart (a `turn/end` survives while its `turn/start` is
+ * gone, or the reverse), which is worse than an empty bucket because the session
+ * is then stuck in a state nothing will close. A bucket that reaches this bound
+ * has a lineage that will never resolve in practice, so it is discarded whole
+ * and reported loudly.
+ */
+const ORPHAN_FRAME_LIMIT = 1024;
 /**
  * How long a frame may wait for its lineage.
  *
  * A child's parent notice normally arrives within the same burst, so this only
  * bounds a lineage that will never resolve (a child of a session this process
- * does not serve). The frame is then reported and dropped, exactly as it was
- * before buffering existed — the difference is that a transient reorder now
- * survives instead of losing the child's first output.
+ * does not serve). Expiry re-checks the lineage once before giving up: a
+ * resolvable chain that simply arrived late must be replayed rather than
+ * dropped, because the two things that create an edge — `session.child-opened`
+ * and `subagents()` — are both asynchronous relative to `session.open`, and a
+ * bucket can outlive the notice by a few milliseconds.
  */
 const ORPHAN_FRAME_TTL_MS = 5_000;
+/**
+ * How long `session/close` waits for its receipt before giving up.
+ *
+ * The bridge's close disposes the session's agent and has no deadline of its own,
+ * so at the request default (120 s) one unresponsive close would hold the caller
+ * for two minutes and every other session on the process queued behind it. The
+ * local half of the close (detaching this session's handlers) has already
+ * happened by then, and the failure is logged, so a timeout degrades to "the
+ * bridge's tables may shrink later" rather than to a hang.
+ */
+const SESSION_CLOSE_TIMEOUT_MS = 10_000;
 
 /** What one attached session contributes besides its handlers. */
 export interface DshSessionOptions {
@@ -255,13 +288,20 @@ export interface DshProcessOptions extends DshProcessHandlers {
   cwd: string;
   route: DshRoute;
   /**
-   * The session this process was built for.
+   * The id this process is constructed under.
    *
-   * It is attached at construction, so a single-session construction (the
-   * one-shot probes, and every provider session until the process pool lands)
-   * keeps behaving exactly as before. A pooled process serves more sessions
-   * through {@link DshProcess.attachSession}; this id stays the default that
-   * the session-scoped methods fall back to when a caller names none.
+   * Three roles, and the third is what makes its meaning precise:
+   *
+   * 1. A real conversation attached at construction (the single-session
+   *    construction, and every one-shot probe that names a real id).
+   * 2. The fallback key for `#sessionOptions` when a session names none.
+   * 3. **Possibly not a session at all.** The shared process is constructed
+   *    with a sentinel (`POOL_PLACEHOLDER_SESSION_ID` in `provider.ts`), which
+   *    serves sessions through {@link DshProcess.attachSession} and has no
+   *    conversation of its own. That sentinel must never reach a session-scoped
+   *    bridge frame, so the process-level `initialize` is sent WITHOUT it: see
+   *    {@link DshProcess.#initializeSession} for where and why the two kinds of
+   *    initialization diverge.
    */
   sessionId: string;
   /** Extra environment for the child; merged over the daemon's environment. */
@@ -681,6 +721,12 @@ export class DshProcess {
    * session, and replayed as soon as an edge makes them routable. Bounded in both
    * size and age: a frame whose lineage never arrives is reported and dropped
    * rather than buffered for the life of the process.
+   *
+   * `since` is DIAGNOSTIC ONLY and is deliberately never read: the deadline is
+   * `#orphanTimers`, one timer per bucket, because a timestamp would have to be
+   * polled to have any effect and a poll loop is a timer that fires for every
+   * bucket anyway. It is kept on the record so a future log line can say how long
+   * a bucket lived without adding a field to the hot path.
    */
   readonly #orphanFrames = new Map<string, { frames: OrphanFrame[]; since: number }>();
   /** Timers that report and drop one orphan bucket that never became routable. */
@@ -774,6 +820,22 @@ export class DshProcess {
     options: DshSessionOptions = {},
   ): Promise<void> {
     if (sessionId === "") throw new Error("attachSession requires a session id");
+    // A second attach for the same id is a bug in the caller, and it used to be
+    // silent: `set` replaced the first owner's handlers without a word, and then
+    // that first owner's `closeSession` deleted the SECOND owner's handlers — the
+    // conversation that was still running lost its frames, and the one that had
+    // just opened went on holding a bridge session nobody would ever close.
+    // Frames are delivered by id, so there is no way to serve two owners at once;
+    // the second attach must fail loudly instead of quietly stealing the slot.
+    // Re-attaching after `detachSession` is the supported path and has no entry
+    // here, which is what keeps a rewind's close-then-open working.
+    const existing = this.#sessionHandlers.get(sessionId);
+    if (existing !== undefined) {
+      throw new Error(
+        `session ${sessionId} is already attached to this process; `
+          + "detach it before attaching it again",
+      );
+    }
     this.#sessionHandlers.set(sessionId, handlers);
     const merged: DshSessionOptions = { ...(this.#sessionOptions.get(sessionId) ?? {}) };
     if (options.cwd !== undefined) merged.cwd = options.cwd;
@@ -834,7 +896,16 @@ export class DshProcess {
     this.detachSession(sessionId);
     if (this.#closed || this.#child === undefined) return;
     try {
-      const result = (await this.#request("session/close", { sessionId })) as
+      // A **bounded** wait, deliberately short. This runs on the teardown path
+      // (a Paseo close, a rewind's reload), and the bridge's `session/close`
+      // disposes the session's agent — which can take as long as the agent's own
+      // shutdown does, and has no deadline of its own. At the default 120 s a
+      // child that stopped answering held the caller for two minutes, and every
+      // session on this shared process waited behind it. The session's handlers
+      // are already detached above, so the local half of the close has happened;
+      // giving up on the receipt only means the bridge's tables shrink later or
+      // not at all, and that is reported rather than hidden.
+      const result = (await this.#request("session/close", { sessionId }, SESSION_CLOSE_TIMEOUT_MS)) as
         | { closed?: unknown }
         | undefined;
       // `{ closed: false }` means the bridge never knew the session, which is a
@@ -896,15 +967,61 @@ export class DshProcess {
 
     if (this.#options.initializeRoute === false) return;
 
-    await this.#ensureSessionReady(this.#options.sessionId);
+    // The **process** is initialized here, never the construction id as a
+    // session. See {@link #prepareProcess}: the shared process is built under a
+    // sentinel that is not a conversation, and the session half of `initialize`
+    // must not be sent for it.
+    await this.#prepareProcess();
   }
 
   /**
-   * Pin one session's cwd and route in the bridge.
+   * Compose this child's LLM adapter and validate its route — the process-level
+   * half of `initialize`, sent with **no session id**.
    *
-   * The id always travels: it is what makes the bridge store the values against
-   * that session instead of as this process's defaults, and what admits the
-   * session to `prompt` at all. Idempotent.
+   * The bridge's `initialize` does two separable things, and this method exists
+   * because only the first one belongs to a process:
+   *
+   * - **Process-level** (before its table writes, `dsh-bridge/lib/server.js:732-757`):
+   *   resolve the adapter for `provider`, `ctx.plugin()` it into `llmFibers`, and
+   *   `resolveCallConfig()` the route. This is per child — an adapter fiber lives
+   *   for the life of the process — and it is what makes every session's first
+   *   prompt cheap instead of re-validating a route per conversation.
+   * - **Session-level** (`server.js:762-772`): write `sessionCwd`,
+   *   `sessionRoutes` and `initializedSessions` for the id on the frame, which is
+   *   also what admits that id to `prompt` (`server.js:817`).
+   *
+   * Omitting the id selects the bridge's process-wide form (`server.js:762-768`),
+   * which does the same adapter work and the same route validation while writing
+   * only the process defaults `routeFor`/`sessionDirectoryFor` already use as a
+   * last-resort fallback. Sending the sentinel instead would create four
+   * session-keyed bridge entries for a session nothing ever closes
+   * (`sessionCwd`, `sessionRoutes`, `initializedSessions`, and — through
+   * `paseo/mcp/set` — `pendingMcpServers`), because `closeSession` is only ever
+   * called for an id some provider session attached.
+   *
+   * A construction id that IS a real conversation is not harmed by this: every
+   * session-scoped method goes through {@link #ensureSessionReady}, and
+   * {@link attachSession} does so explicitly, so that id initializes itself with
+   * its own id on first use.
+   */
+  async #prepareProcess(): Promise<void> {
+    const route = this.#options.route;
+    await this.#request("initialize", {
+      cwd: this.#options.cwd,
+      provider: route.provider,
+      model: route.model,
+      ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
+    });
+  }
+
+  /**
+   * Pin one **session's** cwd and route in the bridge.
+   *
+   * The id always travels here: it is what makes the bridge store the values
+   * against that session instead of as this process's defaults, and what admits
+   * the session to `prompt` at all. Only sessions that a provider actually
+   * attached reach this, so every id written this way has a `closeSession`
+   * counterpart. Idempotent.
    */
   async #initializeSession(sessionId: string): Promise<void> {
     if (this.#initializedSessions.has(sessionId)) return;
@@ -1060,7 +1177,7 @@ export class DshProcess {
   /**
    * List the session's registered commands and user-invocable skills.
    *
-   * @param sessionId - which session; defaults to the one this process was built for.
+   * @param sessionId - which session; required — there is no default.
    */
   async commands(sessionId: string): Promise<DshCommand[]> {
     await this.#ensureSessionReady(sessionId);
@@ -1075,7 +1192,7 @@ export class DshProcess {
   /**
    * Execute one registered slash command (skills are sent as text instead).
    *
-   * @param sessionId - which session; defaults to the one this process was built for.
+   * @param sessionId - which session; required — there is no default.
    */
   async runCommand(
     sessionId: string,
@@ -1098,7 +1215,7 @@ export class DshProcess {
    * another language — sees its label rather than the raw key. `value` stays the
    * key `/permission` accepts.
    *
-   * @param sessionId - which session; defaults to the one this process was built for.
+   * @param sessionId - which session; required — there is no default.
    */
   async permission(sessionId: string): Promise<{
     available: boolean;
@@ -1116,7 +1233,7 @@ export class DshProcess {
    * meter. Absent fields mean the runtime does not know them yet; they are
    * never defaulted here.
    *
-   * @param sessionId - which session; defaults to the one this process was built for.
+   * @param sessionId - which session; required — there is no default.
    */
   async usage(sessionId: string): Promise<DshUsage> {
     await this.#ensureSessionReady(sessionId);
@@ -1139,7 +1256,7 @@ export class DshProcess {
    * @param text - prompt text, used when `contentBlocks` is omitted.
    * @param contentBlocks - pre-built content blocks (text and/or attachments).
    * @param delivery - `steer` injects into the running turn, `auto` opens the next one.
-   * @param sessionId - which session; defaults to the one this process was built for.
+   * @param sessionId - which session; required — there is no default.
    * @returns the message id and the message's DSH source kind when reported.
    */
   async prompt(
@@ -1174,7 +1291,7 @@ export class DshProcess {
    * user never typed; the command path remains only for DSH's own `/permission`
    * slash usage.
    *
-   * @param sessionId - which session; defaults to the one this process was built for.
+   * @param sessionId - which session; required — there is no default.
    */
   async setPermission(sessionId: string, name: string): Promise<{ current: string | null }> {
     await this.#ensureSessionReady(sessionId);
@@ -1194,7 +1311,7 @@ export class DshProcess {
    * the agent's editing tools touched since that message, and reports the outcome
    * so the provider can surface a partial failure instead of pretending.
    *
-   * @param sessionId - which session; defaults to the one this process was built for.
+   * @param sessionId - which session; required — there is no default.
    */
   async revert(
     sessionId: string,
@@ -1212,7 +1329,7 @@ export class DshProcess {
   /**
    * Cancel the running turn while keeping the session usable afterwards.
    *
-   * @param sessionId - which session; defaults to the one this process was built for.
+   * @param sessionId - which session; required — there is no default.
    */
   async cancel(sessionId: string): Promise<void> {
     await this.#ensureSessionReady(sessionId);
@@ -1222,7 +1339,7 @@ export class DshProcess {
   /**
    * Select plan mode and return the committed state.
    *
-   * @param sessionId - which session; defaults to the one this process was built for.
+   * @param sessionId - which session; required — there is no default.
    */
   async setPlan(
     sessionId: string,
@@ -1238,7 +1355,7 @@ export class DshProcess {
   /**
    * Read the committed plan state.
    *
-   * @param sessionId - which session; defaults to the one this process was built for.
+   * @param sessionId - which session; required — there is no default.
    */
   async getPlan(sessionId: string): Promise<{ active: boolean; pending: boolean; available: boolean }> {
     await this.#ensureSessionReady(sessionId);
@@ -1250,7 +1367,7 @@ export class DshProcess {
   /**
    * Switch model and/or reasoning effort on the live agent.
    *
-   * @param sessionId - which session; defaults to the one this process was built for.
+   * @param sessionId - which session; required — there is no default.
    */
   async setConfig(sessionId: string, changes: {
     model?: string;
@@ -1268,7 +1385,7 @@ export class DshProcess {
   /**
    * List the profile's agent presets and the one this session runs.
    *
-   * @param sessionId - which session; defaults to the one this process was built for.
+   * @param sessionId - which session; required — there is no default.
    */
   async presets(sessionId: string): Promise<{
     available: boolean;
@@ -1399,7 +1516,7 @@ export class DshProcess {
    * runtime composes no subagent service; a failed read carries `error`, and an
    * unreadable branch is reported in `diagnostics` — never a silent empty list.
    *
-   * @param sessionId - which session; defaults to the one this process was built for.
+   * @param sessionId - which session; required — there is no default.
    */
   async subagents(sessionId: string): Promise<{
     available: boolean;
@@ -1439,7 +1556,15 @@ export class DshProcess {
     }
     // Run after the edges exist, so held frames for these children become
     // routable now instead of waiting out the orphan TTL.
-    if (subagents.length > 0) this.#replayOrphans();
+    //
+    // Called **unconditionally**, including when the listing is empty. Guarding it
+    // with `subagents.length > 0` assumed "no edges recorded here means no edges
+    // exist", but `#childParent` can already hold edges from
+    // `session.child-opened` notices and from earlier listings — and this call is
+    // one of only two replay trigger points. A root whose own listing is empty can
+    // still have held frames for a descendant announced under it, and the guard
+    // would leave them to expire.
+    this.#replayOrphans();
     return {
       available: result.available === true,
       subagents,
@@ -1557,7 +1682,14 @@ export class DshProcess {
         this.#processHandlers.onLog(line);
         continue;
       }
-      void this.#dispatch(frame);
+      // `#dispatch` is async and nothing awaits it here. A rejection must not
+      // escape as an unhandled one: this process is shared, so its default fate
+      // (terminate) would end every conversation it serves over one frame.
+      void this.#dispatch(frame).catch((error: unknown) => {
+        this.#processHandlers.onLog(
+          `dispatching a bridge frame failed: ${toError(error, "dispatch failed").message}`,
+        );
+      });
     }
   }
 
@@ -1587,8 +1719,40 @@ export class DshProcess {
     if (method === "session.child-opened") {
       // Registered before anything else: the parent edge is what makes the
       // child's own frames routable.
+      //
+      // This writer **overwrites**, deliberately, and that is the opposite of what
+      // `subagents()` does to the same map. The asymmetry is not an oversight; the
+      // two record different things:
+      //
+      // - `subagents()` records DSH's durable topology: `child -> parent` from the
+      //   stored headers, which does not change.
+      // - This notice records a **live delivery route**: which conversation the
+      //   child's frames must currently be shown in.
+      //
+      // They diverge for a native child observed under two Paseo agents. The bridge
+      // announces the same native id under whichever root is prompting — it sends
+      // `{ sessionId: "child-A", parentSessionId: <current root> }`
+      // (`harness/fake-dsh-bridge.mjs:367`, one notice per root) — because one DSH
+      // child session can be reached from more than one conversation. Keeping the
+      // first edge would route the second root's frames into the first root's
+      // timeline, and its own `child-opened` would never open a child view: a
+      // measured regression, not a hypothetical one (`harness/subagent-check.cjs`
+      // asserts distinct root-scoped ids for this exact case). Durable topology
+      // losing to a live route is the correct precedence: the live notice is what
+      // knows where output belongs *now*.
+      //
+      // A real re-target is still worth a line, because it is the one case where a
+      // frame can move between conversations, and "why did this child's output
+      // appear over there" should be answerable from the log.
       const parent = typeof params.parentSessionId === "string" ? params.parentSessionId : undefined;
       if (producer !== undefined && parent !== undefined && producer !== "") {
+        const known = this.#childParent.get(producer);
+        if (known !== undefined && known !== parent) {
+          this.#processHandlers.onLog(
+            `session.child-opened re-targets ${producer} from ${known} to ${parent}`
+              + " (a native child reached from another conversation)",
+          );
+        }
         this.#childParent.set(producer, parent);
       }
     }
@@ -1636,7 +1800,7 @@ export class DshProcess {
         this.#holdOrphan(producer, method, { kind: "event", params: params as Record<string, unknown> });
         return;
       }
-      handlers.onEvent(frame.params as DshSessionEvent);
+      this.#deliverLive(producer, "event", () => handlers.onEvent(frame.params as DshSessionEvent));
       return;
     }
     if (method === "session.status") {
@@ -1646,7 +1810,8 @@ export class DshProcess {
         this.#holdOrphan(producer, method, { kind: "status", params: params as Record<string, unknown> });
         return;
       }
-      handlers.onStatus(typeof params.status === "string" ? params.status : "unknown", producer ?? "");
+      this.#deliverLive(producer, "status", () =>
+        handlers.onStatus(typeof params.status === "string" ? params.status : "unknown", producer ?? ""));
       return;
     }
     if (method === "session.child-opened") {
@@ -1664,7 +1829,8 @@ export class DshProcess {
         });
         return;
       }
-      handlers.onChildOpened?.(params as unknown as DshChildOpened);
+      this.#deliverLive(producer, "child-opened", () =>
+        handlers.onChildOpened?.(params as unknown as DshChildOpened));
       // This edge may have made a grandchild's held frames routable: a deeper
       // descendant can be announced before the child that parents it, and its
       // frames wait in `#orphanFrames` until the chain reaches an attached
@@ -1732,6 +1898,13 @@ export class DshProcess {
       // buffer forever, and the frame is still reported when it gives up.
       const timer = setTimeout(() => {
         this.#orphanTimers.delete(producer);
+        // Re-check the lineage before giving up. Both things that create a parent
+        // edge arrive asynchronously relative to `session.open` — a
+        // `session.child-opened` notice, and `subagents()` which runs *after* the
+        // open — so a bucket can become routable a few milliseconds after its TTL
+        // fired. Dropping it there would lose exactly the output this buffer
+        // exists to keep, while a replay costs one `#rootOf` walk.
+        this.#replayOrphans();
         const held = this.#orphanFrames.get(producer);
         if (held === undefined) return;
         this.#orphanFrames.delete(producer);
@@ -1744,12 +1917,23 @@ export class DshProcess {
       this.#orphanTimers.set(producer, timer);
     }
     if (bucket.frames.length >= ORPHAN_FRAME_LIMIT) {
-      // Keep the newest: the earliest frames of a child that never resolves are
-      // the least likely to matter, and an unbounded bucket is a leak.
-      bucket.frames.shift();
+      // Discard the bucket WHOLE rather than evicting its oldest frames. An
+      // oldest-first eviction tears one turn's frames apart — a `turn/end`
+      // survives while its `turn/start` is gone, or the reverse — which leaves
+      // the session in a state nothing will ever close, and that is worse than
+      // having no frames at all. A bucket this deep has a lineage that will not
+      // resolve in practice, so it is reported loudly and dropped.
+      this.#orphanFrames.delete(producer);
+      const timer = this.#orphanTimers.get(producer);
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        this.#orphanTimers.delete(producer);
+      }
       this.#processHandlers.onLog(
-        `orphan buffer full for ${producer} (${ORPHAN_FRAME_LIMIT}); dropping its oldest held frame`,
+        `orphan buffer overflow for ${producer}: discarding all ${bucket.frames.length} held frame(s) `
+          + `at the ${ORPHAN_FRAME_LIMIT}-frame bound instead of losing only the oldest`,
       );
+      return;
     }
     bucket.frames.push(frame);
   }
@@ -1809,6 +1993,48 @@ export class DshProcess {
           }
         }
       }
+    }
+  }
+
+  /**
+   * Deliver one live frame to a session's handler without letting it take the
+   * process down.
+   *
+   * The replay path has always wrapped its handler calls, but the live path did
+   * not — and the live path is the dangerous one. `#consume` calls `#dispatch`
+   * with `void`, `#dispatch` is `async`, and a synchronous throw from a handler
+   * becomes an **unhandled rejection**, whose Node default is to terminate the
+   * process. One conversation's bad frame would then kill every other
+   * conversation sharing this child, which is exactly the failure mode the
+   * one-process-many-sessions design must not have.
+   *
+   * The exception is not swallowed: it is logged with the producing session, so a
+   * session whose handler keeps failing is diagnosable instead of looking like a
+   * bridge that stopped sending.
+   *
+   * @param producer - the producing session, for the log line.
+   * @param kind - which delivery path threw, for the log line.
+   * @param deliver - the call to make; its throw is contained.
+   */
+  #deliverLive(producer: string | undefined, kind: string, deliver: () => unknown): void {
+    try {
+      const result = deliver();
+      // The declared handler shapes are synchronous, but a handler is free to be
+      // an `async` function assigned to a `void`-returning slot — and a rejection
+      // from that promise is unhandled too. Contain it on the same path.
+      if (typeof (result as { then?: unknown } | undefined)?.then === "function") {
+        void (result as Promise<unknown>).catch((error: unknown) => {
+          this.#processHandlers.onLog(
+            `delivering a live ${kind} for ${producer ?? "(none)"} rejected: `
+              + `${toError(error, "handler rejected").message}`,
+          );
+        });
+      }
+    } catch (error) {
+      this.#processHandlers.onLog(
+        `delivering a live ${kind} for ${producer ?? "(none)"} failed: `
+          + `${toError(error, "handler failed").message}`,
+      );
     }
   }
 

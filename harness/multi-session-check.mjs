@@ -391,7 +391,35 @@ console.log("\nclosing one session leaves the other working");
     afterPrompt.filter((event) => event.type === "session.runtime_failed").map((event) => event.error?.message).join(" | ") || "(none)",
   );
 
-  // And a prompt for the closed session must not silently succeed against B.
+  // And a prompt for the closed session must not silently succeed, and must not
+  // be answered under any other session.
+  //
+  // The row the plugin emits is `timeline.item`, with the text at
+  // `event.item.text` — the same shape `answersOf` reads earlier in this file (see
+  // the comment there for the dumped payload). The previous version of this check
+  // read `event.event?.type`, a field that **never exists** on a provider event
+  // (`event.event` is a DSH frame field, not a `ProviderEvent` one), so
+  // `answeredAsB` was always false and the assertion could not fail.
+  const answerRows = (list) =>
+    list.filter((event) => event.type === "timeline.item" && event.item?.type === "assistant_message");
+
+  // Positive control first. Without it, a renamed field (exactly the bug above)
+  // would make "no answer for the closed session" pass forever. A live prompt must
+  // produce a row this filter can see.
+  const controlMark = pluginEvents.length;
+  await conn.send({
+    type: "session.prompt",
+    sessionId: rootB,
+    prompt: { clientMessageId: "prompt-B-control", input: { type: "message", content: [{ type: "text", text: "control" }] } },
+  });
+  await sleep(800);
+  const control = answerRows(pluginEvents.slice(controlMark));
+  check(
+    "the answer filter sees a live answer (positive control)",
+    control.length === 1 && control[0].sessionId === rootB && control[0].item?.text === `answer for ${rootB}`,
+    `${control.length} row(s): ${control.map((event) => `${String(event.sessionId)}:${String(event.item?.text)}`).join(" | ") || "(none)"}`,
+  );
+
   const beforeClosed = pluginEvents.length;
   await conn.send({
     type: "session.prompt",
@@ -400,12 +428,27 @@ console.log("\nclosing one session leaves the other working");
   });
   await sleep(600);
   const afterClosed = pluginEvents.slice(beforeClosed);
-  const answeredAsB = afterClosed.some(
-    (event) => event.sessionId === rootB && event.event?.type === "assistant/message",
+  const answeredAfterClose = answerRows(afterClosed);
+  check(
+    "a prompt for the closed session is answered nowhere",
+    answeredAfterClose.length === 0,
+    answeredAfterClose.map((event) => `${String(event.sessionId)}:${String(event.item?.text)}`).join(" | ") || "(no answer row)",
   );
   check(
-    "a prompt for the closed session never lands on B",
-    !answeredAsB,
+    "…and specifically never lands on B",
+    answeredAfterClose.every((event) => event.sessionId !== rootB),
+    answeredAfterClose.filter((event) => event.sessionId === rootB).map((event) => String(event.item?.text)).join(" | ") || "(nothing under B)",
+  );
+  // The other half of "never silently succeeds": the prompt has to fail visibly
+  // for the session it was sent to. Either shape counts — the point is that the
+  // user sees a failure instead of a prompt that vanished.
+  check(
+    "…and the closed session's prompt fails loudly instead of vanishing",
+    afterClosed.some(
+      (event) =>
+        (event.type === "session.runtime_failed" && event.sessionId === rootA)
+        || (event.type === "session.prompt_result" && event.sessionId === rootA && event.result?.type === "failed"),
+    ),
     afterClosed.map((event) => `${event.type}@${String(event.sessionId)}`).join(", ") || "(no events)",
   );
 }

@@ -191,12 +191,27 @@ export class ParkedSessions {
     return this.#holds > 0;
   }
 
-  /** Record that one more live session is using the pooled process. */
+  /**
+   * Record that one more live session is using the pooled process.
+   *
+   * **The provider owns the pairing contract**: it calls this exactly once per
+   * shared-child claim in `#addPoolClaim`, and releases exactly once per returned
+   * claim (`#releasePoolProcess`) or per claim that became void with its child
+   * (`#dropPoolClaims`). Every guard below assumes that invariant; a hold
+   * without a release turns the pool permanently busy, a release without a hold
+   * silently reopens the "kill a live session's process" hole.
+   */
   hold(): void {
     this.#holds += 1;
   }
 
-  /** Record that one session stopped using the pooled process. */
+  /**
+   * Record that one session stopped using the pooled process.
+   *
+   * Tolerates an unmatched call (`#holds` never goes negative) so shutdown paths
+   * cannot corrupt the count, but the provider is expected to pair it with
+   * {@link hold} — see the contract there.
+   */
   release(): void {
     if (this.#holds > 0) this.#holds -= 1;
   }
@@ -398,7 +413,13 @@ export class ParkedSessions {
     return expired;
   }
 
-  /** Whether a process is currently parked (tests/diagnostics). */
+  /**
+   * Whether a process is currently parked (tests/diagnostics).
+   *
+   * The `_dshSessionId` parameter is ignored: the pool holds one slot keyed by
+   * {@link POOL_KEY}, so "is anything parked" is the only question it can
+   * answer. Kept for callers that still pass a session id.
+   */
   has(_dshSessionId?: string): boolean {
     return this.#pool.has(POOL_KEY);
   }
@@ -488,4 +509,4 @@ export class ParkedSessions {
   }
 }
 
-export { DEFAULT_MAX, DEFAULT_TTL_MS, SWEEP_INTERVAL_MS };
+export { DEFAULT_MAX, DEFAULT_TTL_MS, RELEASE_TIMEOUT_MS, SWEEP_INTERVAL_MS };
