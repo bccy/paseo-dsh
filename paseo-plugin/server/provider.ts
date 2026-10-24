@@ -1175,8 +1175,11 @@ class DshConnection implements ProviderConnection {
    * (the daemon holds a pending run until it is answered, and the refresh cancels
    * in-flight runs). It is kept short on purpose — spawning the CLI itself costs
    * ~500ms of node boot before the request even leaves, which comfortably covers
-   * the daemon's rewind settle (measured: rewind start → complete ≈ 52ms), so a
-   * long timer only adds latency to the user-visible refresh.
+   * the daemon's rewind settle. Measured on the live daemon (agent 10c14347,
+   * 8302-event session): rewind start → complete **2035ms**, not the ~52ms this
+   * comment used to claim — that window spans the bridge's own `revert()` plus
+   * the daemon's forced full-timeline rebuild (`hydrateTimelineFromProvider` with
+   * `force: true`), so a long timer only adds latency to the user-visible refresh.
    *
    * Failures are reported to the user via a notice and the plugin log; the
    * rewind itself has already succeeded.

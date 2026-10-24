@@ -273,9 +273,85 @@ export function withoutAssistantStream(event) {
 }
 
 /**
- * Project a stored session log onto the `paseo/history` wire shape, with every
- * image attachment stamped (see {@link withImageHostPaths}) and the assistant
- * typing record dropped (see {@link withoutAssistantStream}).
+ * The event types the plugin actually reads out of a `paseo/history` replay.
+ *
+ * Every other type in a stored log is dropped before it reaches the wire, and
+ * that is the single largest remaining reduction in the replay payload after
+ * `stream` was removed: on a real 9803-event session the `paseo/history` response
+ * goes **19.73 MiB -> 15.19 MiB (-23.0%)** and 9803 -> 5753 events, because the
+ * dropped events are 4.54 MiB of it — led by `request/header` (71 events,
+ * 3.59 MiB, 18.2% of the whole response: one full tool schema list per step) and
+ * `agent/inbox/spliced` (527 events, 0.61 MiB), plus the `step/*` bracket pair
+ * that fires around every assistant step (3286 events, 0.26 MiB).
+ *
+ * **Derived from the consumers, not guessed.** Both replay paths take this same
+ * response, so the set is the union of what the two of them read:
+ *
+ * - `TimelineBuilder.consume` (`paseo-plugin/server/timeline.ts`) switches on
+ *   `assistant/message`, `tool/call`, `tool/result`, `command/run`,
+ *   `command/done`, `compaction/start`, `compaction/summary`, `compaction/end`
+ *   and `turn/end`; everything else in its `default:` branch yields zero rows.
+ * - `DshSession.replayHistory` reads `user/message` itself (for the human's
+ *   turns) before delegating the rest to the builder.
+ * - `DshSession.replaySubagents` replays each native child's log from this same
+ *   response, and there `DshChildSession.replay` also reads `turn/start` (to
+ *   know a turn is still open, so a child killed mid-turn closes as `canceled`
+ *   rather than pulsing forever) and `subagent/descriptor` (through
+ *   `labelFromHistory`, the child's only durable title — without it a replayed
+ *   child opens as "加载中…" forever).
+ *
+ * `command/*` and `compaction/*` look exotic but are each only a handful of
+ * events in a whole session: they are kept because the plugin renders them, not
+ * because they matter for size. `turn/end` is load-bearing — it is what closes
+ * the replayed turn and cancels tools a killed process left running.
+ *
+ * **`system/message` is deliberately absent.** It is a surface node (it can
+ * carry a `surfaceOp`), so the fold needs it, but no consumer above reads it
+ * back; it is dropped only because the fold already ran (see
+ * {@link historyEvents}). The same holds for `developer/message` and the
+ * `assistant/attempt`, `step/*`, `goal/change`, `request/*` family.
+ *
+ * A whitelist rather than a blacklist is the point: a type this list has never
+ * heard of is dropped, so a future DSH event type that starts mattering shows up
+ * as a missing row rather than as an invisible payload regression. The bridge
+ * and the plugin ship as one unit (`bridge-assets.ts` embeds this file), so the
+ * list can only drift from the consumers in a build that ships both halves
+ * together.
+ */
+export const REPLAYED_EVENT_TYPES = new Set([
+  'assistant/message',
+  'tool/call',
+  'tool/result',
+  'command/run',
+  'command/done',
+  'compaction/start',
+  'compaction/summary',
+  'compaction/end',
+  'turn/end',
+  'turn/start',
+  'user/message',
+  'subagent/descriptor',
+]);
+
+/**
+ * Whether the plugin reads this stored event back after a replay.
+ *
+ * Separate from {@link REPLAYED_EVENT_TYPES} so the predicate can be asserted on
+ * its own, and so an event with no `type` (a corrupt line) is dropped rather
+ * than crashing the filter.
+ *
+ * @param {{type?: unknown}} event - one stored event.
+ * @returns {boolean}
+ */
+export function isReplayedEventType(event) {
+  return event !== null && typeof event === 'object' && REPLAYED_EVENT_TYPES.has(event.type);
+}
+
+/**
+ * Project a stored session log onto the `paseo/history` wire shape, keeping only
+ * the events the plugin reads (see {@link REPLAYED_EVENT_TYPES}), stamping every
+ * image attachment (see {@link withImageHostPaths}) and dropping the assistant
+ * typing record (see {@link withoutAssistantStream}).
  *
  * Reopening a session replays through here, and that is the path an image
  * matters most on: `data.meta.path` is the *source* file, which is typically
@@ -286,23 +362,34 @@ export function withoutAssistantStream(event) {
  *
  * `ignorable` rides along even though nothing here reads it: DSH's contract is
  * that an event *without* the marker MUST make a reader refuse to reconstruct
- * the session rather than drop it silently, so stripping the marker removes the
- * only thing that tells a future event type apart from a skippable one.
+ * the session rather than drop it silently (see the surface node note below).
+ * Only *consumed* types are projected, so the marker stays on every frame that
+ * survives — this is a renderer's projection, not a session reconstruction.
  *
- * The trimming happens **after** the caller's surface fold, which is a
- * requirement rather than an ordering accident: `visibleEvents()` resolves a
- * rewind's shadowed range against the log's surface node list, and it needs the
- * events' own `seq`/`surfaceOp` fields — not this wire shape. `history()` already
- * nests it as `historyEvents(ctx, visibleEvents(...))`, so the fold still sees
- * every event exactly once and a rewind range still collapses.
+ * ### Ordering: the filter runs after the surface fold, never before
+ *
+ * `history()` nests this as `historyEvents(ctx, visibleEvents(...))`, and both
+ * halves depend on it:
+ *
+ * - the fold resolves a rewind's shadowed range against the log's surface node
+ *   list, and it needs the events' own `seq`/`surfaceOp` fields — not this wire
+ *   shape;
+ * - `system/message` is a surface node but is not in {@link REPLAYED_EVENT_TYPES}.
+ *   Filtering first would delete it from the fold's node list, and a rewind
+ *   range anchored on one would stop resolving — silently, leaving the withdrawn
+ *   turns in the replayed transcript.
+ *
+ * Running the filter here also keeps `seq` untouched, so `user:history:<seq>`
+ * item ids and `child.replay`'s `seq < inheritedEventCount` prefix check are
+ * exactly what they were before the events were dropped.
  *
  * @param {{get(name: string): unknown}} ctx - the DSH profile context.
- * @param {unknown} events - the stored events read from session persistence.
+ * @param {unknown} events - the stored events, already folded to the surface.
  * @returns {Array<object>} wire frames, image blocks stamped where resolvable.
  */
 export function historyEvents(ctx, events) {
   if (!Array.isArray(events)) return [];
-  return events.map((event) =>
+  return events.filter(isReplayedEventType).map((event) =>
     withImageHostPaths(ctx, {
       type: event.type,
       ...(event.seq === undefined ? {} : { seq: event.seq }),
