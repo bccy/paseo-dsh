@@ -134,7 +134,10 @@ token），并且加载插件会把内嵌桥重写进 `~/.dsh/profiles/<name>/no
 - `harness/tool-call-check.cjs` — `client/tool-call-data.ts` 的工具行映射（图标、命令、diff、
   截断）。**动了工具行渲染必跑。**
 - `harness/thinking-check.cjs` — 思考行折叠预览：结束后取**第一行**、运行中取最后一个首行已终结
-  的段落、标签恒为 `思考`（都是 DSH 的行为，逐字移植在 `client/thinking-text.ts`）。
+  的段落（都是 DSH 的行为，逐字移植在 `client/thinking-text.ts`），以及折叠行在流式中的宽度
+  接线（行测自己的宽度、标签测自己要减掉的那段、行宽由两者相减得出，`useRevealedText` 不许
+  再接管文本节奏）。**它不断言行标题**：标题恒为 `思考` 是 `client/locale.ts` 标签表里的一个键，
+  由 `harness/locale-check.cjs` 的整表遍历覆盖——改坏了标题，这个脚本不会红。
   **动了思考行显示必跑。**
 - `harness/subagent-check.cjs` 里另有归档用例：假桥的 replay 列表带一条 `archived: true` 的
   子会话，断言它**不被重放播报**（归档重启后必须仍然成立）；还断言归档往返本身——有打开的
@@ -195,9 +198,13 @@ token），并且加载插件会把内嵌桥重写进 `~/.dsh/profiles/<name>/no
   gateway 的 `Config` 或 `clientFor` 的传输分派必跑。**
 - `harness/bridge-assets-check.mjs` — `server/bridge-assets.ts` 必须与 `dsh-bridge/` 和
   `templates/` 逐字节一致（只读，不起进程）。**改桥后先跑它、再跑任何插件级脚本。**
-- `harness/doctor-check.mjs` — `paseo-plugin/lib/doctor.mjs` 的判定：空 provider/model、缺
-  default-model、YAML 错、无值/refs 外凭据都必须 fail，完整配置仍通过（沙箱 `DSH_HOME`）。
-  **动了 doctor 必跑。**
+- `harness/doctor-check.mjs` — `paseo-plugin/lib/doctor.mjs` 的判定，驱动真实的 `runDoctor()`
+  跑在沙箱 `DSH_HOME` 上：空 provider/model、缺 default-model、YAML 错、无值凭据、`refs:` 外
+  凭据都必须 fail，完整配置仍通过（负向用例的对照）；桥缺 lazy 加载模块必须 fail 并**点名缺的
+  那个模块**（以前只查 `lib/index.js` 一个入口，残缺桥照样报 provisioned、exit 0），完整桥仍
+  报 provisioned（这一条是前一条的对照，防止"只会 fail"的检查也算通过）；`bridge-assets.ts`
+  取不出键清单时必须 **fail 而不是 warn**——"没能检查"和"检查通过"是两个答案，只有一个可以
+  exit 0（同样带可读清单的对照，免得被"什么都 fail"的 doctor 满足）。**动了 doctor 必跑。**
 - `harness/probe-check.mjs` — `paseo-plugin/lib/probe-provider.mjs` 的退出码与泄密防护
   （200+error/HTML 判失败、4xx 回显 Authorization 不得泄 key、全 429 报 unknown、什么都没
   探测到必须非零）。**动了 probe 必跑。**
@@ -206,6 +213,71 @@ token），并且加载插件会把内嵌桥重写进 `~/.dsh/profiles/<name>/no
   （成功 `request.completed` +「正在回退」通知、找不到 agent 的刷新告警、被拒必须
   `request.failed`、被拒后门禁释放）。假桥 + 一次性 `DSH_HOME`。**动了 provider 的
   `session.revert`/`sessions` 分支、`dsh-process.ts` 的这两个请求、或假桥对应分支必跑。**
+- `harness/plugin-build.cjs` — **不是检查，是需要编译产物的 harness 共用的构建基础设施**
+  （当前调用方见 `grep -l plugin-build harness/*`；`plugin-check.cjs` 与
+  `parked-sessions-check.cjs` 仍走各自头部注释里的手工 `tsc` 步骤，不在其中）。
+  它决定已有的编译树能否复用（源码集合 + 构建戳），判错不会让产物看起来有任何异常，只会让
+  **其它检查在陈旧或残缺的产物上假绿**——这是这里最危险的失效形态。`resolvePluginBuild()`
+  自动编译到 `paseo-plugin/.dbg-*`（产物必须在仓库内，`/tmp` 下 node 向上找不到
+  `paseo-plugin/node_modules`），每个调用方传自己的目录名以免并行任务共用一棵树。
+  **动了它的源码集合推导、新鲜度判据或构建戳格式必跑 `harness/plugin-build-check.mjs`。**
+- `harness/plugin-build-check.mjs` — `plugin-build.cjs` 新鲜度判据的回归，纯元数据（不 require
+  产物、不写仓库：构造状态全在临时目录的私有副本里）。每个场景**双向断言**——构造状态断言判据、
+  还原后再断言回到 fresh，所以卡在任一答案都会红，不只是判据太松会红。钉住：刚构建的树是 fresh
+  且源码集合覆盖根级入口（`index.server.ts` 注册 provider、`index.client.tsx`，这正是它存在的
+  原因）；源码比构建新时 stale 且报错**点名那个文件**；缺编译产物、源码已删而 `.js` 还在、缺
+  `package.json`、缺构建戳、构建后新增了源码、空源码集合，全部 stale（fail closed，绝不信没有
+  构建戳的树）；`PASEO_PLUGIN_BUILD` 绕行每次都要喊、外部树与源码不一致时仍告警；判据确实接在
+  复用决策上（`buildPlugin()` 会重建缺产物的树、复用 fresh 的树）。**动了 `plugin-build.cjs`
+  的判据必跑。** 之所以不能省：`plugin-build.cjs` 是这条链的地基，判据一松，它下游每个
+  harness 都会在陈旧或残缺的产物上变绿，而红绿本身看不出区别——这个脚本是唯一能把"判据退化了"
+  和"判据正常"区分开的东西。
+- `harness/frame-reader-check.mjs` — 插件的 stdout 分帧器（`paseo-plugin/server/frame-reader.ts`，
+  共享 `dsh` 子进程的每一帧都过它）：20 MB 帧跨数千个 16 KB chunk 逐字节还原、一个 chunk 里的多帧按序到达、
+  被 chunk 边界切断的帧能重组、空行被**跳过**而不是报成解析错（两者是 `#consume` 里不同的日志
+  行）、`\r\n` 解析通过且保留 `\r`、尾部残行滞留不发、chunk 正好停在换行时不留残留、畸形行报错
+  后后续行仍到达，并用**旧实现的随机分块对照**证明增量扫描不是 O(n²)（旧写法每个 chunk 重切整个
+  缓冲，回放大会话时慢到 7–12 s）。纯模块：只把这一个文件编到 `paseo-plugin/` 下的临时目录，
+  用完删掉。**动了 `server/frame-reader.ts` 或 `#consume` 的分帧/报错分支必跑。**
+- `harness/fake-bridge-multi-check.mjs` — 假桥的 `multi` 场景，**纯协议层**（只 spawn 假桥说
+  JSON-RPC，不经过插件）：一个桥进程带多个 Paseo 会话时各拿自己的答案、没有事件被路由到别的
+  会话、每个会话恰好一次 `turn/end` 且回合号是自己的、`initialize` 不带 session id 也不打乱
+  绑定、同一会话第二次提问不重放第一个会话的场景。它是插件层 `multi-session-check.mjs` 的
+  前置——桥这一层先按会话隔离了，插件里再串台才可能是插件自己的问题。
+  **动了 `fake-dsh-bridge.mjs` 的 `multi` 场景或桥的会话绑定必跑。**
+- `harness/multi-session-check.mjs` — 两个 Paseo 会话共用**一个** `dsh` 子进程时在**插件层**
+  不串台（桥的协议层由 `fake-bridge-multi-check.mjs` 覆盖，这里走插件自己的 `#sessions`、
+  子进程 id 与停放池，只有过一遍插件才能证明这一对是干净的）：两会话各自提问并各自拿到自己的
+  答案、每个时间线只含自己的消息（任何事件类型下都看不到对方的文本）、各自一次 `session.turn`
+  起止、关掉一个另一个仍能提问并作答。假 `dsh` + 一次性 `DSH_HOME`，自己编译到私有目录。
+  **动了多会话路由、`#deliverLive`、或 `session.ts` 的会话归属逻辑必跑。**
+- `harness/concurrent-open-check.mjs` — 同一个 DSH 会话的两次并发 `session.open` 不能毁掉成功的
+  那次：只有一次到达 `session.ready`；另一次**响亮失败**（`request.failed`，不是沉默）；失败方
+  被 in-flight 守卫拒掉（"another open … is already in flight"），**不是** `attachSession` 的
+  "already attached"——走到 attach 就是失败方的 catch 拿着胜者状态的成因；胜者仍能提问并作答
+  （没有 "unknown session"，这是用户可见的那一半）；失败事务释放了守卫，之后重新 open（新
+  provider session id + persistence handle，跟 reload 一样）仍然成功。冷连接复现不出这个窗口，
+  需要 `replaced` 分支那几个 await 的交错，所以脚本先开一次到 ready、再并发发两次。假 `dsh` +
+  一次性 `DSH_HOME`，自己编译到私有目录。**动了 `provider.ts` 的 open/close 事务或 `#opening`
+  守卫必跑。**
+- `harness/mcp-gateway-guard-check.mjs` — gateway 的 `tool` 参数守卫（`resolveTargetTool`，模块
+  私有，所以驱动真实的 `apply()` + `defineTool` 注册路径，用 loopback 假 server 接住本该成功的
+  调用）：空串与纯空白、把网关自己的元工具名当目标（含大小写变体、零宽字符、CJK 键盘打出的全角
+  写法）或把 `archive_subagents` 当目标、把整个 `mcp_call_tool` 折进另一调的 `arguments`，都必须
+  **在请求发出前**被点名拒绝并说出期望形状（被拒的用例不能到达 server）；正常名放行并拿到真
+  schema，padding 被 trim 后才转发（trim 是便利不是绕过）；未知但合法的名字保留自己的错误、不与
+  守卫的错混成一条（两种失败不能塌成同一句话）；schema 路径与 call 路径共用守卫所以都要守，非
+  字符串目标由 schema 拒绝、报错措辞要断言在 schema 上（只断言"抛了且没回显"在守卫被删后仍成立，
+  等于覆盖不到那个缺陷）。纯离线，只走 loopback；`@deepseek-ai/schemastery` 与 `dsh-tools` 按
+  绝对路径从 DSH 安装目录加载（`DSH_PACKAGES_DIR` 可覆盖）。**动了 gateway 的
+  `resolveTargetTool` 守卫或元工具注册必跑。**
+- `harness/source-shape.cjs` — **不是独立检查**，是几个必须读 `.tsx` 源码的检查共用的
+  **TSX 结构读取器**：解析 JSX 开标签及其属性，让"这个元素自己测布局""图标按状态与可编辑性
+  取色"这类只存在于 JSX 里的接线也能断言。它取代的是按格式匹配的正则——换行、属性顺序、单行
+  写法都能让组件仍然正确却让正则变红，误报一次就会把后来的真回归放过去。故意不是通用解析器
+  （无嵌套树、标签内注释、属性表达式里的模板字面量），读不出来就**跳过而不猜**（fail closed）。
+  **动了它的 JSX/调用读取规则必跑所有 `require` 它的检查**（`grep -l source-shape harness/*`
+  看当前集合，别按记忆列名单）。
 
 ### 撤回（rewind）
 

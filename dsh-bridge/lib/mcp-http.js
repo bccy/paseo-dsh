@@ -12,7 +12,9 @@
  * Protocol facts this implements (verified against Paseo's own server):
  *   - one JSON-RPC message per POST; the server answers with `text/event-stream`
  *     frames or plain JSON, so both are parsed;
- *   - `Mcp-Session-Id` is echoed back only by stateful servers — tracked when present;
+ *   - `Mcp-Session-Id` is echoed back only by stateful servers — tracked when present,
+ *     and dropped when the server says it no longer knows the session (HTTP 404),
+ *     so a restarted server costs one handshake instead of wedging the client;
  *   - `initialize` + `notifications/initialized` must precede `tools/*`;
  *   - `accept` must list both media types or the server rejects the request.
  *
@@ -116,7 +118,13 @@ export async function mcpRequest({
     const contentType = response.headers?.get?.('content-type') ?? '';
     const text = await response.text();
     if (!response.ok) {
-      throw new Error(`mcp: ${method} failed with HTTP ${response.status}${text === '' ? '' : `: ${text.slice(0, 200)}`}`);
+      const error = new Error(`mcp: ${method} failed with HTTP ${response.status}${text === '' ? '' : `: ${text.slice(0, 200)}`}`);
+      // The status and body are kept on the error so a caller can tell "the server
+      // no longer knows my session" from every other transport failure without
+      // parsing the human-readable message back apart.
+      error.httpStatus = response.status;
+      error.httpBody = text.slice(0, 512);
+      throw error;
     }
     // Notifications are acknowledged without a JSON-RPC message.
     if (id === undefined || text.trim() === '') return { result: undefined, sessionId: issuedSession, contentType, text };
@@ -130,6 +138,31 @@ export async function mcpRequest({
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Whether a failure means "the server no longer honours my session".
+ *
+ * A stateful MCP server answers a request that carries a dead `Mcp-Session-Id`
+ * with HTTP 404 (streamable-HTTP spec), and that is the only signal it gives:
+ * the JSON-RPC body never arrives, so the client has to read the transport.
+ * The status is the primary discriminator, but a 404 also covers "no such
+ * resource", so the body is inspected too — a 404 that names a session problem
+ * (`session not found`, `session expired`, …) is a session loss, and a 404 that
+ * talks about anything else is not. A 404 with no body is read as the spec shape
+ * (a bare rejection of the session-bearing request) because there is no other
+ * reading available; the caller still requires that a session id was actually
+ * sent, so a stateless server can never take this path.
+ *
+ * @param error - A rejection from `mcpRequest`.
+ * @returns Whether the session should be dropped and re-established.
+ */
+export function isSessionGoneError(error) {
+  if (!(error instanceof Error) || error.httpStatus !== 404) return false;
+  const body = typeof error.httpBody === 'string' ? error.httpBody : '';
+  if (body.trim() === '') return true;
+  return /session/i.test(body)
+    && /(not\s+found|expired|terminated|unknown|invalid|no\s+longer|closed|missing)/i.test(body);
 }
 
 /**
@@ -182,17 +215,29 @@ export function unavailableBrowserTools(tools, hostGap) {
 /**
  * One MCP server connection: initialize once, then list and call tools.
  *
- * `tools/list` is fetched per call unless `cacheTools` is set, because a server
- * can change what it exposes between calls and a stale catalog would make the
- * gateway report tools that no longer exist (and hide new ones).
+ * `tools/list` is fetched once and reused by default (`cacheTools: true`): the
+ * catalog is what the gateway exists to keep out of the context — Paseo's server
+ * is 61 tools / ~33 KB — so paying a round trip for it on every `mcp_list_tools`
+ * would undo the saving this client was written for. A long-lived connection can
+ * still ask for a fresh read with `listTools({ refresh: true })`, and a caller
+ * that knows its server rewrites the catalog on every request can opt out with
+ * `cacheTools: false`.
  */
 export class McpHttpClient {
   #id = 0;
   #sessionId;
   #initialized;
   #tools;
+  /**
+   * Bumped every time the session is disowned.
+   *
+   * A request that was already in flight when the session died still carries the
+   * old id, and its answer — a 404, or worse a success that echoes the id — must
+   * not be written back over the state of the session that replaced it.
+   */
+  #epoch = 0;
 
-  constructor({ url, headers = {}, timeoutMs = DEFAULT_MCP_TIMEOUT_MS, fetchImpl = fetch, clientInfo = { name: 'paseo-mcp-gateway', version: '0.1.0' }, cacheTools = false }) {
+  constructor({ url, headers = {}, timeoutMs = DEFAULT_MCP_TIMEOUT_MS, fetchImpl = fetch, clientInfo = { name: 'paseo-mcp-gateway', version: '0.1.0' }, cacheTools = true }) {
     if (typeof url !== 'string' || url === '') throw new Error('mcp: server url is required');
     this.url = url;
     this.headers = headers;
@@ -207,42 +252,74 @@ export class McpHttpClient {
     return this.#id;
   }
 
+  /**
+   * Drop connection state the server has disowned.
+   *
+   * A stateful server forgets its sessions when it restarts. It then answers
+   * every request carrying the old id with 404, and because this client sent
+   * `initialize` exactly once, that 404 repeats forever — nothing on the request
+   * path would ever handshake again. Clearing the id and the handshake latch
+   * makes the next call open a fresh session instead, which is the same recovery
+   * a human performs by reloading.
+   *
+   * The cached catalog goes with it, and that is what keeps a known-dead
+   * connection from answering at all: the cache describes a session that no
+   * longer exists, so there is no such thing as a valid cache hit until the
+   * handshake succeeds again. The next `listTools()` therefore either re-reads
+   * from the new session or fails loudly — it can never hand back the catalog of
+   * a connection the server has already disowned.
+   */
+  #forgetSession() {
+    this.#sessionId = undefined;
+    this.#initialized = undefined;
+    this.#tools = undefined;
+    this.#epoch += 1;
+  }
+
+  /**
+   * One JSON-RPC round trip that keeps the session bookkeeping honest.
+   *
+   * Session loss is only detectable on the response — the server answers 404 and
+   * never gets as far as a JSON-RPC frame — so every request this class sends
+   * goes through here rather than through `mcpRequest` directly. The guard reads
+   * the id that was actually *sent*: a request without one cannot have lost a
+   * session, so a 404 on a stateless server (Paseo's own never issues an id) is
+   * left to propagate untouched.
+   */
+  async #request(method, { params, sessionId = this.#sessionId } = {}) {
+    const epoch = this.#epoch;
+    try {
+      const response = await mcpRequest({
+        url: this.url,
+        headers: this.headers,
+        method,
+        params,
+        id: this.#nextId(),
+        sessionId,
+        timeoutMs: this.timeoutMs,
+        fetchImpl: this.fetchImpl,
+      });
+      if (response.sessionId !== undefined && this.#epoch === epoch) this.#sessionId = response.sessionId;
+      return response;
+    } catch (error) {
+      if (sessionId !== undefined && this.#epoch === epoch && isSessionGoneError(error)) this.#forgetSession();
+      throw error;
+    }
+  }
+
   async #call(method, params) {
-    const response = await mcpRequest({
-      url: this.url,
-      headers: this.headers,
-      method,
-      params,
-      id: this.#nextId(),
-      sessionId: this.#sessionId,
-      timeoutMs: this.timeoutMs,
-      fetchImpl: this.fetchImpl,
-    });
-    if (response.sessionId !== undefined) this.#sessionId = response.sessionId;
+    const response = await this.#request(method, { params });
     return response.result;
   }
 
   /** Handshake once; a failed handshake is retried on the next call. */
   async ensureInitialized() {
     this.#initialized ??= (async () => {
-      const response = await mcpRequest({
-        url: this.url,
-        headers: this.headers,
-        method: 'initialize',
+      await this.#request('initialize', {
         params: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: this.clientInfo },
-        id: this.#nextId(),
-        timeoutMs: this.timeoutMs,
-        fetchImpl: this.fetchImpl,
       });
-      if (response.sessionId !== undefined) this.#sessionId = response.sessionId;
-      await mcpRequest({
-        url: this.url,
-        headers: this.headers,
-        method: 'notifications/initialized',
-        sessionId: this.#sessionId,
-        timeoutMs: this.timeoutMs,
-        fetchImpl: this.fetchImpl,
-      });
+      // The id this handshake just opened — `#request` adopted it above.
+      await this.#request('notifications/initialized', { sessionId: this.#sessionId });
     })().catch((error) => {
       this.#initialized = undefined;
       throw error;
@@ -253,14 +330,23 @@ export class McpHttpClient {
   /**
    * Every tool the server currently exposes.
    *
-   * Re-read per call by default: a long-lived session must not answer
-   * `mcp_tool_schema` from a catalog the server has since changed. Construct the
-   * client with `cacheTools: true` when the catalog is known to be fixed.
+   * Cached across calls by default: the catalog is the payload the gateway was
+   * built to stop re-sending, and re-reading it on every listing turns three
+   * meta-tools into a per-call round trip for a catalog that changes only when
+   * the server is restarted. Pass `{ refresh: true }` to re-read on demand, or
+   * construct the client with `cacheTools: false` for a server whose catalog is
+   * expected to change between calls.
    */
   async listTools({ refresh = false } = {}) {
     await this.ensureInitialized();
     if (this.#tools === undefined || refresh || this.cacheTools !== true) {
+      const epoch = this.#epoch;
       const result = await this.#call('tools/list', {});
+      // The session can be disowned while this read is in flight (a parallel
+      // call is the one that sees the 404). A catalog read from the connection
+      // the server has just forgotten must not become the next cache hit, so the
+      // read is repeated against the session that replaced it.
+      if (this.#epoch !== epoch) return this.listTools({ refresh });
       this.#tools = Array.isArray(result?.tools) ? result.tools : [];
     }
     return this.#tools;

@@ -1374,99 +1374,117 @@ class DshConnection implements ProviderConnection {
 
     // The concurrent counterpart of the holder check above: two opens for one DSH
     // session must not interleave (both would pass the check and spawn a process,
-    // and only one can own the log's write lock). There is no await between this
-    // check and the insert, so it is atomic; the entry is released when the open
-    // transaction ends, not when the session closes.
+    // and only one can own the log's write lock). The claim is taken in the same
+    // **synchronous turn** as the check, and that is the entire point: every step
+    // below awaits (the replaced instance's `close()`, `open()` itself), so a
+    // claim taken after them left a window where a third open passed this same
+    // check. That third open then finished normally, and the earlier one — waking
+    // up — overwrote its `#sessions` entry, failed `attachSession` with "already
+    // attached", and in its catch deleted the *winner's* entry and bridge session
+    // (`closeSession` detaches the winner's handlers and disposes its agent).
+    // Paseo had been told the winner was ready, yet every prompt on it failed with
+    // "unknown session".
+    //
+    // Claiming first turns the loser into a loud refusal instead, which is the
+    // honest answer: Paseo mints a fresh provider session id per open, so two
+    // concurrent opens for one DSH session are a caller bug, not a reload. The
+    // entry is released when the open transaction ends (success or failure), not
+    // when the session closes.
     if (this.#opening.has(dshSessionId)) {
       throw new Error(
         `cannot open ${sessionId}: another open for DSH session ${dshSessionId} is already in flight`,
       );
     }
+    this.#opening.add(dshSessionId);
 
-    // A provider session id is supposed to be minted fresh for every open, and
-    // Paseo does that on the reload path. The provider must not leak when it is
-    // not: `#sessions` is a map, so a second `session.open` for an id it already
-    // tracks would **overwrite** the entry, and the replaced `DshSession` would
-    // keep its claim on the shared child with nothing left to release it — the
-    // pool would never reach zero and never retire its child.
-    //
-    // `#sessionHolding` above cannot catch this: it looks for the same *DSH*
-    // session id under a **different** provider session id, and here both ids are
-    // the same. Measured before this close was added: a fake-bridge run opened
-    // one root four times under a single provider session id, left three orphaned
-    // `DshSession` claims behind, and the shared child never retired.
-    //
-    // Closing the stale instance first makes a repeated open idempotent instead of
-    // a leak. `close()` is idempotent on its own, returns the claim, and never
-    // shuts the shared child down — so a sibling conversation running in it is
-    // unaffected.
-    const replaced = this.#sessions.get(sessionId);
-    if (replaced !== undefined) {
-      process.stderr.write(
-        `[${PROVIDER_ID}] session ${sessionId} is being opened again; closing the previous instance first `
-          + "so its claim on the shared process is returned\n",
-      );
-      this.#sessions.delete(sessionId);
-      try {
-        await replaced.close({ park: false });
-      } catch (error) {
-        // Not fatal: the stale instance is gone from the map either way and the
-        // new open is what the caller asked for. Say so rather than swallowing it
-        // — a failed close is exactly where a claim would leak.
-        process.stderr.write(
-          `[${PROVIDER_ID}] closing the replaced session ${sessionId}: ${messageOf(error)}\n`,
-        );
-      }
-    }
-
-    const session = new DshSession({
-      sessionId,
-      dshSessionId,
-      cwd: config.cwd,
-      env: config.env ?? {},
-      // Stable across the provider-session re-mints a reload performs; native
-      // child ids are scoped by it so a reload upserts the same Paseo rows
-      // instead of adding a duplicate set (see `DshSessionOptions.agentId`).
-      ...(agentId === "" ? {} : { agentId }),
-      // Paseo injects its own `paseo` MCP server here for every provider that
-      // declares `supportsMcpServers` (plugin providers always do, and cannot
-      // take the native-tools path opencode uses). Dropping this map is what
-      // left the model with no `mcp__paseo__*` tools while nothing errored.
-      //
-      // `config.toolPolicy.preapproved` is intentionally not forwarded: it asks
-      // the runtime to pre-approve named MCP tools, and DSH has no such concept
-      // — its own permission preset decides. Inventing an equivalent here would
-      // be exactly the self-invented protocol shape this repo forbids.
-      mcpServers: config.mcpServers,
-      route,
-      mode: config.mode ?? "build",
-      models: display.models,
-      thinkingOptions: display.thinkingOptions,
-      // Only offer child subsessions when Paseo negotiated the capability; when
-      // it did not, the host cannot accept a child and the session must stay
-      // root-only rather than fail the whole connection.
-      subsession: this.capabilities.includes("session.subsession"),
-      emit: (event) => this.#emit(event),
-      log: (line) => {
-        process.stderr.write(`[${PROVIDER_ID}] ${line}\n`);
-      },
-      // Every session joins the one shared child; the pool owns its lifetime and
-      // its reference count. A session never spawns, parks or shuts a process
-      // down — with one child serving every conversation, any of those by a
-      // single session would take the others with it.
-      acquireProcess: () => this.#acquirePoolProcess({ cwd: config.cwd, route, env: config.env ?? {} }),
-      releaseProcess: (process) => {
-        this.#releasePoolProcess(process);
-      },
-    });
-    this.#sessions.set(sessionId, session);
+    // Declared outside the transaction because the catch has to close it: the
+    // claim above is taken before the instance exists, so a throw in between (an
+    // option the constructor rejects) must still release the claim — otherwise
+    // every later open of this DSH session is refused for the connection's life.
+    let session: DshSession | undefined;
 
     try {
-      // Registered inside the try so no throw can leave the marker behind: an
-      // entry that outlives its open would block every later open of this DSH
-      // session. There is no await between the guard above and this insert, so the
-      // check-and-set is still atomic.
-      this.#opening.add(dshSessionId);
+      // A provider session id is supposed to be minted fresh for every open, and
+      // Paseo does that on the reload path. The provider must not leak when it is
+      // not: `#sessions` is a map, so a second `session.open` for an id it already
+      // tracks would **overwrite** the entry, and the replaced `DshSession` would
+      // keep its claim on the shared child with nothing left to release it — the
+      // pool would never reach zero and never retire its child.
+      //
+      // `#sessionHolding` above cannot catch this: it looks for the same *DSH*
+      // session id under a **different** provider session id, and here both ids are
+      // the same. Measured before this close was added: a fake-bridge run opened
+      // one root four times under a single provider session id, left three orphaned
+      // `DshSession` claims behind, and the shared child never retired.
+      //
+      // Closing the stale instance first makes a repeated open idempotent instead of
+      // a leak. `close()` is idempotent on its own, returns the claim, and never
+      // shuts the shared child down — so a sibling conversation running in it is
+      // unaffected.
+      const replaced = this.#sessions.get(sessionId);
+      if (replaced !== undefined) {
+        process.stderr.write(
+          `[${PROVIDER_ID}] session ${sessionId} is being opened again; closing the previous instance first `
+            + "so its claim on the shared process is returned\n",
+        );
+        this.#sessions.delete(sessionId);
+        try {
+          await replaced.close({ park: false });
+        } catch (error) {
+          // Not fatal: the stale instance is gone from the map either way and the
+          // new open is what the caller asked for. Say so rather than swallowing it
+          // — a failed close is exactly where a claim would leak.
+          process.stderr.write(
+            `[${PROVIDER_ID}] closing the replaced session ${sessionId}: ${messageOf(error)}\n`,
+          );
+        }
+      }
+
+      session = new DshSession({
+        sessionId,
+        dshSessionId,
+        cwd: config.cwd,
+        env: config.env ?? {},
+        // Stable across the provider-session re-mints a reload performs; native
+        // child ids are scoped by it so a reload upserts the same Paseo rows
+        // instead of adding a duplicate set (see `DshSessionOptions.agentId`).
+        ...(agentId === "" ? {} : { agentId }),
+        // Paseo injects its own `paseo` MCP server here for every provider that
+        // declares `supportsMcpServers` (plugin providers always do, and cannot
+        // take the native-tools path opencode uses). Dropping this map is what
+        // left the model with no `mcp__paseo__*` tools while nothing errored.
+        //
+        // `config.toolPolicy.preapproved` is intentionally not forwarded: it asks
+        // the runtime to pre-approve named MCP tools, and DSH has no such concept
+        // — its own permission preset decides. Inventing an equivalent here would
+        // be exactly the self-invented protocol shape this repo forbids.
+        mcpServers: config.mcpServers,
+        route,
+        mode: config.mode ?? "build",
+        models: display.models,
+        thinkingOptions: display.thinkingOptions,
+        // Only offer child subsessions when Paseo negotiated the capability; when
+        // it did not, the host cannot accept a child and the session must stay
+        // root-only rather than fail the whole connection.
+        subsession: this.capabilities.includes("session.subsession"),
+        emit: (event) => this.#emit(event),
+        log: (line) => {
+          process.stderr.write(`[${PROVIDER_ID}] ${line}\n`);
+        },
+        // Every session joins the one shared child; the pool owns its lifetime and
+        // its reference count. A session never spawns, parks or shuts a process
+        // down — with one child serving every conversation, any of those by a
+        // single session would take the others with it.
+        acquireProcess: () => this.#acquirePoolProcess({ cwd: config.cwd, route, env: config.env ?? {} }),
+        releaseProcess: (process) => {
+          this.#releasePoolProcess(process);
+        },
+      });
+      this.#sessions.set(sessionId, session);
+
+      // The claim was taken before this `try` (see above) — deliberately, because
+      // the awaits in between made "check then claim" non-atomic. Nothing here
+      // re-claims it.
       await session.open();
       // Post-open initialisation is part of the open transaction: the daemon
       // drops its maps on a failed open (`PluginProvider.openSession`'s catch
@@ -1566,8 +1584,18 @@ class DshConnection implements ProviderConnection {
       // this entry — and the `dsh` process `open()` has already spawned — would
       // otherwise live as long as the connection does. Every retry arrives under
       // a fresh session id, so they accumulate rather than replace each other.
-      this.#sessions.delete(sessionId);
+      //
+      // Both deletions are guarded by identity, not by key alone. The claim taken
+      // synchronously above already makes a concurrent open for this DSH session
+      // impossible, so these guards are belt-and-braces against a future reorder:
+      // unguarded, a catch that lands after a later open replaced the entry would
+      // delete *that* session's record — the very "one open destroys another
+      // session" failure this change removes.
+      if (session !== undefined && this.#sessions.get(sessionId) === session) {
+        this.#sessions.delete(sessionId);
+      }
       this.#agentIds.delete(sessionId);
+      if (session === undefined) throw error;
       try {
         // A failed open is not a reload: shut the child down rather than park it.
         await session.close({ park: false });

@@ -308,14 +308,24 @@ export function runDoctor() {
   // exactly the case this check used to call `ok` (see loadBridgeFileList).
   const bridgeFiles = loadBridgeFileList();
   if (bridgeFiles.error !== undefined) {
+    // `fail`, not `warn`: the file list is generated from the plugin's own
+    // `server/bridge-assets.ts`, so a run that cannot read it is a run that
+    // cannot tell a complete bridge from a half-written one. Warning here and
+    // then reporting the entry alone put "1 warning(s) — nothing blocking" and
+    // exit 0 on a bridge missing 15 of 18 files, which is the same verdict a
+    // working install gets for one DSH cannot load. "We could not check this"
+    // and "this is fine" are different answers; the YAML row above already
+    // refuses to conflate them.
     report(
-      "warn",
+      "fail",
       "bridge contents not verified",
-      `${bridgeFiles.error}; only the entry below was checked`,
+      `${bridgeFiles.error}. The complete file list is required to judge the bridge, so this install ` +
+        `cannot be called healthy; reinstall the plugin from a complete checkout, then restart the daemon.`,
     );
     const entryOnly = join(bridgeDir, "lib", "index.js");
-    if (existsSync(entryOnly)) report("ok", "bridge entry present", bridgeDir);
-    else report("fail", "bridge bundle missing", `expected ${entryOnly}; restart the daemon to let the plugin re-provision`);
+    if (!existsSync(entryOnly)) {
+      report("fail", "bridge bundle missing", `expected ${entryOnly}; restart the daemon to let the plugin re-provision`);
+    }
   } else {
     const missing = bridgeFiles.keys.filter((relativePath) => !existsSync(join(bridgeDir, relativePath)));
     if (missing.length === 0) {

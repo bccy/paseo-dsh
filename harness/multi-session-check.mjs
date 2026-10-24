@@ -160,6 +160,147 @@ if (registration === undefined) {
 const rootA = `multi-root-A-${Date.now()}`;
 const rootB = `multi-root-B-${Date.now()}`;
 
+// ---------------------------------------------------------------------------
+// The routing decision itself, pinned where it is made.
+//
+// Every assertion below this section reads what the *plugin emits*, and a
+// provider event carries a `sessionId` the plugin itself stamped on it. That
+// makes those checks blind to the one failure this whole change exists to
+// prevent: a frame handed to the wrong session's handler. The mis-delivery is
+// invisible from the outside because `DshSession.#onSessionEvent`
+// (`paseo-plugin/server/session.ts:1772`) drops any payload whose id is not its
+// own — so "no cross-talk" and "cross-talk silently discarded" produce exactly
+// the same event stream, and dropping both guards still left the plugin-level
+// checks green (verified by mutation, see below).
+//
+// So `DshProcess` is driven directly here: two sessions attached to one process,
+// a turn produced by B alone, and A's handler must never be called. The positive
+// control matters as much as the negative one — a handler set that was never
+// wired up would also report zero calls.
+//
+// Mutation check (run in a throwaway copy, never in this repo): making
+// `dsh-process.ts:2044` broadcast the frame to every attached handler leaves
+// every other assertion in this file green and turns only this section red.
+//
+// This runs *before* `DSH_FAKE_LOG` is armed below: the plugin-level
+// single-process assertion counts every pid that received an `initialize`, and a
+// second fake bridge spawned for this section would be counted as a second
+// session carrier.
+console.log("frames are routed by session id, never broadcast");
+{
+  const { DshProcess } = require(join(buildDir, "server", "dsh-process.js"));
+  const eventsA = [];
+  const eventsB = [];
+  const statusesA = [];
+  const statusesB = [];
+  const sessionHandlers = (events, statuses) => ({
+    onEvent: (payload) => events.push(payload),
+    onStatus: (status, sessionId) => statuses.push({ status, sessionId }),
+    onQuestion: async () => ({ answers: [] }),
+    onExit: () => {},
+  });
+  const routed = new DshProcess({
+    // The shared process is constructed under a sentinel that is not a
+    // conversation (`POOL_PLACEHOLDER_SESSION_ID` in `provider.ts`). Using a
+    // third id here is deliberate: if delivery ever falls back to "every handler
+    // set in the map", the sentinel is one more place a frame can land, and the
+    // assertions below would see it.
+    sessionId: "placeholder-not-a-session",
+    cwd: process.cwd(),
+    route: { provider: "fake", model: "fake" },
+    onEvent: () => {},
+    onStatus: () => {},
+    onQuestion: async () => ({ answers: [] }),
+    onLog: () => {},
+    onExit: () => {},
+    onProtocolError: () => {},
+  });
+  try {
+    await routed.attachSession(rootA, sessionHandlers(eventsA, statusesA));
+    await routed.attachSession(rootB, sessionHandlers(eventsB, statusesB));
+    await routed.prompt(rootB, "hello B");
+    // The `multi` scenario answers a prompt with that session's own turn: one
+    // `assistant/message`, one `turn/end`, and the running/idle status pair.
+    const deadline = Date.now() + 15000;
+    while ((eventsB.length < 2 || statusesB.length < 2) && Date.now() < deadline) {
+      await sleep(20);
+    }
+    const typesB = eventsB.map((payload) => payload.event?.type);
+    check(
+      "the frame's own session receives it (positive control)",
+      typesB.includes("assistant/message") && typesB.includes("turn/end"),
+      typesB.join(", ") || "(nothing)",
+    );
+    check(
+      "…and it names that session",
+      eventsB.length > 0 && eventsB.every((payload) => payload.sessionId === rootB),
+      eventsB.map((payload) => String(payload.sessionId)).join(", ") || "(nothing)",
+    );
+    // The negative control. This is the assertion the old version of this file
+    // could not make: a broadcast delivery reaches A's handler here even though
+    // it never reaches A's *timeline*.
+    check(
+      "the other session's event handler is never called",
+      eventsA.length === 0,
+      eventsA.length === 0
+        ? "(never called)"
+        : `${eventsA.length} call(s): ${eventsA
+            .map((payload) => `${String(payload.sessionId)}:${String(payload.event?.type)}`)
+            .join(" | ")}`,
+    );
+    check(
+      "…and neither is its status sink",
+      statusesA.length === 0,
+      statusesA.length === 0
+        ? "(never called)"
+        : `${statusesA.length} call(s): ${statusesA.map((item) => `${item.sessionId}:${item.status}`).join(" | ")}`,
+    );
+    check(
+      "B's statuses are B's own",
+      statusesB.length === 2 && statusesB.every((item) => item.sessionId === rootB),
+      statusesB.map((item) => `${item.sessionId}:${item.status}`).join(", ") || "(nothing)",
+    );
+  } catch (error) {
+    failed += 1;
+    console.log(`  FAIL  the routing section could not run  — ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    try {
+      await routed.shutdown();
+      await routed.waitForExit(3000);
+    } catch {
+      /* the fake bridge exits on `shutdown`; a failure here must not mask the assertions */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The provider half of the reference count.
+//
+// `ParkedSessions.hold()` / `release()` are what stop the pool from killing a
+// process other sessions are running in, but they are *called* from
+// `provider.ts` (`#addPoolClaim` at :631, `#dropPoolClaims` at :652 and
+// `#releasePoolProcess` at :708). `harness/parked-sessions-check.cjs` drives the
+// pool directly, so it can prove the guards work but not that the provider ever
+// takes a hold — deleting `provider.ts:631` left that whole file green (verified
+// by mutation).
+//
+// So the methods are counted here, across the plugin-level run below: two
+// sessions open onto one shared child, therefore exactly two claims, therefore
+// exactly two holds. Counting is used instead of "was it called at all" because
+// a hold per *request* would still pass the weaker form while drifting away from
+// one-hold-per-claim.
+const holdCalls = { hold: 0, release: 0 };
+{
+  const { ParkedSessions } = require(join(buildDir, "server", "parked-sessions.js"));
+  for (const name of ["hold", "release"]) {
+    const original = ParkedSessions.prototype[name];
+    ParkedSessions.prototype[name] = function counted(...args) {
+      holdCalls[name] += 1;
+      return original.apply(this, args);
+    };
+  }
+}
+
 // The fake bridge records every frame it receives (with its own pid) when
 // `DSH_FAKE_LOG` names a file. Arming it *before* the first open is what makes
 // the single-process assertion possible: the log then contains the spawn frames
@@ -360,6 +501,27 @@ console.log("\nclosing one session leaves the other working");
     "closing A emits no event for B",
     afterClose.every((event) => event.sessionId !== rootB),
     afterClose.map((event) => `${event.type}@${String(event.sessionId)}`).join(", ") || "(no events)",
+  );
+
+  // The provider's side of the reference count, checked at the point where both
+  // halves must have happened: two sessions opened (two claims, two holds) and A
+  // has been closed (its claim returned, one hold released). `#dropPoolClaims`
+  // would also release, but it only runs when the child dies, and the child is
+  // alive here — so an extra release would mean a claim was returned twice.
+  check(
+    "the provider takes one hold per opened session",
+    holdCalls.hold === 2,
+    `${holdCalls.hold} hold(s) for 2 opened session(s)`,
+  );
+  check(
+    "…and returns one when a session closes",
+    holdCalls.release === 1,
+    `${holdCalls.release} release(s) after closing 1 of 2 session(s)`,
+  );
+  check(
+    "…so the shared child is still held, not free to kill",
+    holdCalls.hold - holdCalls.release === 1,
+    `net ${holdCalls.hold - holdCalls.release} hold(s)`,
   );
 
   // B keeps working. The `multi` scenario is process-wide and only runs once, so

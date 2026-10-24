@@ -19,6 +19,7 @@
  *   6. a complete configuration is still accepted (the negative control)
  *   7. a bridge missing a lazy module is a failure, not `ok`
  *   8. a complete bridge is still accepted (the control for 7)
+ *   9. an unreadable file list is a failure, not a warning with exit 0
  *
  * The bridge cases (7/8) exist because the check used to look for `lib/index.js`
  * alone: a bridge with the entry but without `lib/child-anchors.js`,
@@ -33,10 +34,10 @@
  *
  * Usage: node harness/doctor-check.mjs
  */
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { runDoctor } from "../paseo-plugin/lib/doctor.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -74,6 +75,26 @@ const WORK = mkdtempSync(join(tmpdir(), "doctor-check-"));
 const PROFILE = "doctor-check";
 process.env.DSH_PASEO_PROFILE = PROFILE;
 
+/**
+ * A doctor whose `server/bridge-assets.ts` cannot yield a key list — case 9.
+ *
+ * Built by copying the real module and package.json into a sandbox with a
+ * deliberately unusable assets file, then importing that copy. Stubbing
+ * `loadBridgeFileList` would test the stub; copying the module tests the real
+ * degraded path, including its exit code.
+ */
+const DEGRADED_PLUGIN = join(WORK, "degraded-plugin");
+mkdirSync(join(DEGRADED_PLUGIN, "lib"), { recursive: true });
+mkdirSync(join(DEGRADED_PLUGIN, "server"), { recursive: true });
+copyFileSync(join(HERE, "..", "paseo-plugin", "lib", "doctor.mjs"), join(DEGRADED_PLUGIN, "lib", "doctor.mjs"));
+copyFileSync(join(HERE, "..", "paseo-plugin", "package.json"), join(DEGRADED_PLUGIN, "package.json"));
+// Valid TypeScript that simply does not export `BRIDGE_FILES`: what a truncated
+// or half-written generated asset looks like to the doctor.
+writeFileSync(join(DEGRADED_PLUGIN, "server", "bridge-assets.ts"), "export const NOT_BRIDGE_FILES = 1;\n");
+const { runDoctor: runDegradedDoctor } = await import(
+  pathToFileURL(join(DEGRADED_PLUGIN, "lib", "doctor.mjs")).href
+);
+
 /** A patch shaped like the one the plugin writes: the route is a list item's id. */
 const VALID_ROUTE = [
   "# profile patch",
@@ -108,14 +129,28 @@ function install({ patch, credentials, bridge = BRIDGE_FILES }) {
   process.env.DSH_HOME = home;
 }
 
-/** Run the doctor with stdout captured; returns what it said and the exit it set. */
-function doctor() {
+/**
+ * The doctor paints its level tags (`[\u001b[33mwarn\u001b[0m]`), so an assertion
+ * written against the literal `[warn]` never matches — the first version of case 9
+ * did exactly that and stayed green while the row was still a warning. Levels are
+ * asserted on the stripped text.
+ */
+const stripAnsi = (text) => text.replace(/\u001b\[[0-9;]*m/g, "");
+
+/**
+ * Run the doctor with stdout captured; returns what it said and the exit it set.
+ *
+ * `entry` defaults to the real module and is overridden by case 9, which needs a
+ * doctor whose `server/bridge-assets.ts` is unusable — the only way to reach the
+ * degraded branch without breaking this repository's own assets file.
+ */
+function doctor(entry = runDoctor) {
   const chunks = [];
   const realOut = process.stdout.write;
   process.stdout.write = (chunk) => (chunks.push(String(chunk)), true);
   process.exitCode = 0;
   try {
-    runDoctor();
+    entry();
   } finally {
     process.stdout.write = realOut;
   }
@@ -237,6 +272,41 @@ const check = (name, pass, detail) => {
   );
   check("and it is not reported incomplete", !run.out.includes("bridge bundle incomplete"));
   check("and it is not reported missing", !run.out.includes("bridge bundle missing"));
+}
+
+// ---- 9. an unreadable file list is a failure, not a warning --------------
+{
+  // The case that used to print `[warn] bridge contents not verified`,
+  // `[ok] bridge entry present` and "1 warning(s) — nothing blocking" with
+  // exit 0 — on a bridge missing 15 of its 18 files. "We could not check this"
+  // and "this is fine" are different answers, and only one of them may exit 0.
+  install({ patch: VALID_ROUTE, credentials: VALID_CREDENTIALS, bridge: ["cordis.patch.yml", "lib/index.js", "package.json"] });
+  const run = doctor(runDegradedDoctor);
+  const plain = stripAnsi(run.out);
+  check(
+    "an unreadable file list is reported as a failure, not a warning",
+    /\[fail\] bridge contents not verified/.test(plain) && !/\[warn\] bridge contents not verified/.test(plain),
+    plain.trim().split("\n").filter((l) => l.includes("bridge contents")).join(" | ") || "(no line)",
+  );
+  check("and the install exits non-zero", run.code === 1, `exit ${run.code}`);
+  check(
+    "and it does not claim nothing is blocking",
+    !run.out.includes("nothing blocking") && !run.out.includes("All checks passed"),
+    run.out.trim().split("\n").at(-1),
+  );
+  check(
+    "and it does not claim the entry alone makes the bridge fine",
+    !run.out.includes("bridge entry present"),
+    run.out.trim().split("\n").filter((l) => l.includes("bridge entry")).join(" | ") || "(no such line)",
+  );
+  // The control: the same incomplete bridge with a readable list is also a
+  // failure, so case 9 cannot be satisfied by a doctor that fails everything.
+  const control = doctor();
+  check(
+    "the readable-list control still names the missing files",
+    control.out.includes("bridge bundle incomplete") && control.code === 1,
+    control.out.trim().split("\n").filter((l) => l.includes("bridge bundle")).join(" | ") || "(no bridge line)",
+  );
 }
 
 rmSync(WORK, { recursive: true, force: true });

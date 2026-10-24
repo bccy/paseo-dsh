@@ -72,8 +72,11 @@ function settledWithin(promise, ms) {
  * stays failed: respawning on every tool call would turn one broken binary into
  * a restart loop, and the gateway already reports the error to the model.
  *
- * `tools/list` is fetched per call unless cached, for the same reason as the HTTP
- * client: what a server exposes can change between calls.
+ * `tools/list` is fetched once and reused by default, for the same reason as the
+ * HTTP client: what a server exposes is the payload the gateway exists to keep
+ * out of the context, and the Server Browser bridge's 25 schemas are not worth a
+ * round trip per listing. `listTools({ refresh: true })` re-reads on demand, and
+ * `cacheTools: false` opts a server that rewrites its catalog out of the cache.
  */
 export class McpStdioClient {
   #child;
@@ -95,6 +98,7 @@ export class McpStdioClient {
     cwd,
     timeoutMs = DEFAULT_MCP_TIMEOUT_MS,
     clientInfo = { name: 'paseo-mcp-gateway', version: '0.1.0' },
+    cacheTools = true,
   }) {
     if (typeof command !== 'string' || command === '') throw new Error('mcp: stdio server command is required');
     this.command = command;
@@ -103,6 +107,10 @@ export class McpStdioClient {
     this.cwd = cwd;
     this.timeoutMs = timeoutMs;
     this.clientInfo = clientInfo;
+    // Same option and same default as `mcp-http.js`: the two transports serve one
+    // gateway config, so a server must not behave differently depending on which
+    // one it happens to speak.
+    this.cacheTools = cacheTools;
     // Errors have to name the server: the gateway talks to several, and a bare
     // "tools/call failed" would not say which one broke.
     this.#label = [this.command, ...this.args].join(' ').slice(0, 120);
@@ -149,6 +157,22 @@ export class McpStdioClient {
       this.#resolveExit?.();
     });
     return child;
+  }
+
+  /**
+   * Refuse to answer from state that a dead connection makes untrustworthy.
+   *
+   * `#start()` is the only place that inspects `#failure`, and it runs on the
+   * request path — which a cache hit never takes. So without this gate a server
+   * that exited, or a client that was disposed, still hands back the catalog it
+   * read while alive, and "the connection is gone" is reported as "the catalog
+   * did not change". The gateway would list tools that cannot be called, and the
+   * model would learn the server died only when the call it planned fails — the
+   * silent degradation this repository bans. Caching is untouched: the catalog
+   * is still reused, but only while the premise that produced it holds.
+   */
+  #assertUsable() {
+    if (this.#failure !== undefined) throw new Error(`mcp: ${this.#label}: ${this.#failure}`);
   }
 
   /**
@@ -237,12 +261,17 @@ export class McpStdioClient {
     return this.#initialized;
   }
 
-  /** Every tool the server currently exposes. */
+  /** Every tool the server currently exposes; cached unless `cacheTools: false`. */
   async listTools({ refresh = false } = {}) {
     await this.ensureInitialized();
-    if (refresh || this.#tools === undefined) {
+    if (this.#tools === undefined || refresh || this.cacheTools !== true) {
       const result = await this.#request('tools/list', {});
       this.#tools = Array.isArray(result?.tools) ? result.tools : [];
+    } else {
+      // A cache hit sends nothing, so nothing else on this path would ever
+      // notice that the server has since exited (or that the client was
+      // disposed) — the catalog would be served from a connection that is gone.
+      this.#assertUsable();
     }
     return this.#tools;
   }

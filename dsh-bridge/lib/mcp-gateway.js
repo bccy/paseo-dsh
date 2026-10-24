@@ -106,8 +106,34 @@ export function transportOf(server, entry) {
 /** Extension for the image media types MCP servers return. */
 const IMAGE_EXTENSIONS = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' };
 
-/** This gateway's own tool names. None of them is ever a valid call target. */
-const META_TOOL_NAMES = ['mcp_list_tools', 'mcp_tool_schema', 'mcp_call_tool'];
+/**
+ * This gateway's own tool names. None of them is ever a valid call target.
+ *
+ * `archive_subagents` is registered by the same plugin (`registerSubagentArchiveTool`
+ * below) and therefore also lives in this process, not on any MCP server: asking a
+ * server for it gets "Tool archive_subagents not found", the same
+ * names-neither-the-mistake-nor-the-fix answer as the three meta-tools. It is
+ * listed here for that reason, not because it is one of the discovery meta-tools —
+ * the guard's message says "this gateway's own tool", which is the accurate claim.
+ */
+const GATEWAY_TOOL_NAMES = ['mcp_list_tools', 'mcp_tool_schema', 'mcp_call_tool', 'archive_subagents'];
+
+/**
+ * Strip the characters that make a name look different without being different.
+ *
+ * `String.prototype.toLowerCase` handles the realistic case (a model echoing a tool
+ * name back in the case it saw in a prompt); zero-width characters are removed
+ * because they survive `.trim()` and would otherwise let `mcp_call_tool` with a
+ * U+200B in it reach the server, which then answers "not found" — the failure mode
+ * this guard exists to replace. NFKC folds the full-width spellings a CJK keyboard
+ * produces for the same reason.
+ */
+function normalizeToolName(value) {
+  return value.normalize('NFKC').replace(/[\u200b-\u200d\ufeff]/g, '').trim().toLowerCase();
+}
+
+/** Normalized gateway tool names, computed once. */
+const GATEWAY_TOOL_KEYS = new Set(GATEWAY_TOOL_NAMES.map((name) => normalizeToolName(name)));
 
 /**
  * Validate the `tool` argument before it reaches an MCP server.
@@ -121,6 +147,10 @@ const META_TOOL_NAMES = ['mcp_list_tools', 'mcp_tool_schema', 'mcp_call_tool'];
  * nor the fix, so the model repeated the same call. An empty `tool` failed the
  * same way. Reject both here, with the target and the expected shape named.
  *
+ * The comparison is on a normalized spelling (case-folded, zero-width stripped):
+ * `MCP_CALL_TOOL` is the same mistake as `mcp_call_tool`, and a guard that only
+ * matched the exact lowercase spelling let it through to the server.
+ *
  * @param requested - The `tool` argument as the model sent it.
  * @param nested - The sibling `arguments` value, only to recognise a folded call.
  * @returns The trimmed target tool name, ready to forward.
@@ -130,12 +160,12 @@ function resolveTargetTool(requested, nested) {
   if (target === '') {
     throw new Error('mcp: "tool" must name the MCP tool to call (as listed by mcp_list_tools), e.g. "list_providers"');
   }
-  if (!META_TOOL_NAMES.includes(target)) return target;
+  if (!GATEWAY_TOOL_KEYS.has(normalizeToolName(target))) return target;
   const folded = nested !== null && typeof nested === 'object' && typeof nested.tool === 'string' && nested.tool.trim() !== ''
     ? ` This call folded another call into "arguments" (nested tool "${nested.tool}"): pass the target's own arguments object directly, not a {tool, arguments} envelope.`
     : '';
   throw new Error(
-    `mcp: "${target}" is one of this gateway's own meta-tools, not an MCP tool: put the target tool's name in "tool" `
+    `mcp: "${target}" is one of this gateway's own tools (${GATEWAY_TOOL_NAMES.join(', ')}), not an MCP tool: put the target tool's name in "tool" `
     + `(e.g. "list_providers") and that tool's arguments object in "arguments".${folded}`,
   );
 }
@@ -203,10 +233,13 @@ function projectContent(server, tool, content) {
 }
 
 /**
- * Register the three meta-tools over the configured servers.
+ * Register the gateway over the configured servers.
  *
- * The plugin is a no-op without servers, so composing it in a profile without
- * Paseo's overlay costs nothing.
+ * Four tools in total, and the guard above treats all four as untouchable call
+ * targets: the three discovery/call meta-tools, plus `archive_subagents` from
+ * `registerSubagentArchiveTool`. The plugin is a no-op for the meta-tools without
+ * servers, so composing it in a profile without Paseo's overlay costs nothing
+ * beyond that one archive tool.
  */
 export function apply(ctx, config = {}) {
   // Registered before the server check: archiving subagents is independent of

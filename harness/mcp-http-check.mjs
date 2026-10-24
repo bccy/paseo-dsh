@@ -19,7 +19,7 @@
  * Usage: node harness/mcp-http-check.mjs
  */
 import { createServer } from 'node:http';
-import { McpHttpClient, browserHostGapOf, isEventStream, mcpRequest, parseSseFrames, pickResult, unavailableBrowserTools } from '../dsh-bridge/lib/mcp-http.js';
+import { McpHttpClient, browserHostGapOf, isEventStream, isSessionGoneError, mcpRequest, parseSseFrames, pickResult, unavailableBrowserTools } from '../dsh-bridge/lib/mcp-http.js';
 
 const results = [];
 const check = (name, pass, detail) => results.push({ name, pass, detail });
@@ -29,6 +29,40 @@ const seen = [];
 let initializeCount = 0;
 /** `tools/list` requests, counted so `cacheTools` can be asserted exactly. */
 let listCount = 0;
+/** Session ids the `/sessions` server still honours; emptying it is a restart. */
+const liveSessions = new Set();
+let nextSession = 0;
+/** Forget every issued session, the way a restarted stateful server does. */
+const dropSessions = () => liveSessions.clear();
+/** Ids issued per path, in order, so assertions name the real id rather than guess. */
+const issuedByPath = new Map();
+/** Make `/sessions-down` fail `tools/list` — a server that stayed broken. */
+let sessionDownOnList = false;
+
+/**
+ * The paths that model session loss, keyed by URL.
+ *
+ * `stateful` servers issue an id per handshake and 404 anything carrying a dead
+ * one. `callStatus`/`callBody` make `tools/call` fail with a chosen status, so
+ * the check can drive a 404 that is *not* about the session through the same
+ * client while `tools/list` keeps working.
+ */
+const sessionPaths = {
+  // A restarted stateful server: `session not found` on a forgotten id.
+  '/sessions': { stateful: true, goneBody: 'session not found' },
+  // The same server, but it stays broken after the restart: `tools/list` fails
+  // once `sessionDownOnList` is set, so "recovered" and "served a stale catalog"
+  // are distinguishable.
+  '/sessions-down': { stateful: true, goneBody: 'session not found', failsWhenDown: true },
+  // A stateful server that answers a dead id with a bare 404 and no explanation.
+  '/sessions-bare': { stateful: true, goneBody: '' },
+  // A stateful server whose 404 is about something else entirely — the client
+  // must not read it as a lost session and throw the session away.
+  '/sessions-other-404': { stateful: true, goneBody: '', callStatus: 404, callBody: 'no such widget' },
+  // A stateless server (Paseo's own shape) that 404s with session-sounding text:
+  // no id was ever issued, so there is no session to lose and nothing to reset.
+  '/stateless-404': { stateful: false, goneBody: '', listStatus: 404, listBody: 'session not found' },
+};
 
 /** Answer one JSON-RPC POST the way a streamable-HTTP MCP server does. */
 function respond(res, message, { sse = true, sessionId, delayMs = 0 } = {}) {
@@ -53,6 +87,74 @@ const server = createServer((req, res) => {
     }
     if (req.url === '/slow') {
       setTimeout(() => respond(res, { jsonrpc: '2.0', id: 1, result: {} }, { sse: false }), 5_000);
+      return;
+    }
+    // ── servers that can lose a session, or 404 for another reason ────────────
+    // A stateful server forgets every session when it restarts, and then answers
+    // any request still carrying the old id with the spec's HTTP 404. `dropSessions()`
+    // is that restart. The other paths exist so the check can prove the client
+    // tells a lost session apart from a 404 about some other resource, and that a
+    // stateless server (which never gets an id) is not touched at all.
+    const sessionPath = sessionPaths[req.url];
+    if (sessionPath !== undefined) {
+      const message = JSON.parse(raw);
+      seen.push({ message, headers: req.headers, url: req.url });
+      const carried = req.headers['mcp-session-id'];
+      if (carried !== undefined && !liveSessions.has(carried)) {
+        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.end(sessionPath.goneBody);
+        return;
+      }
+      if (message.method === 'initialize') {
+        initializeCount += 1;
+        const issued = sessionPath.stateful ? `sess-${nextSession++}` : undefined;
+        if (issued !== undefined) {
+          liveSessions.add(issued);
+          const list = issuedByPath.get(req.url) ?? [];
+          list.push(issued);
+          issuedByPath.set(req.url, list);
+        }
+        respond(res, {
+          jsonrpc: '2.0',
+          id: message.id,
+          result: { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'fake-session', version: '1' } },
+        }, { sessionId: issued });
+        return;
+      }
+      if (message.method === 'notifications/initialized') {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      if (message.method === 'tools/list') {
+        if (sessionPath.listStatus !== undefined) {
+          res.writeHead(sessionPath.listStatus, { 'content-type': 'text/plain' });
+          res.end(sessionPath.listBody);
+          return;
+        }
+        if (sessionPath.failsWhenDown === true && sessionDownOnList) {
+          res.writeHead(503, { 'content-type': 'text/plain' });
+          res.end('server restarting');
+          return;
+        }
+        listCount += 1;
+        respond(res, {
+          jsonrpc: '2.0',
+          id: message.id,
+          result: { tools: [{ name: 'echo', description: 'Echo the text', inputSchema: { type: 'object' } }] },
+        });
+        return;
+      }
+      if (message.method === 'tools/call') {
+        if (sessionPath.callStatus !== undefined) {
+          res.writeHead(sessionPath.callStatus, { 'content-type': 'text/plain' });
+          res.end(sessionPath.callBody);
+          return;
+        }
+        respond(res, { jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: 'ok' }] } }, { sse: false });
+        return;
+      }
+      respond(res, { jsonrpc: '2.0', id: message.id, error: { code: -32601, message: `unknown method ${message.method}` } }, { sse: false });
       return;
     }
     const message = JSON.parse(raw);
@@ -217,47 +319,53 @@ try {
   check('a stateless server needs no session header', statelessList.headers['mcp-session-id'] === undefined, String(statelessList.headers['mcp-session-id']));
 
   // ── tools/list caching ─────────────────────────────────────────────────────
-  // The class doc promises "`tools/list` is fetched per call unless `cacheTools`
-  // is set". Both halves are asserted: a server can add or drop tools between
-  // calls, so an unconditional cache would make `mcp_tool_schema` answer from a
-  // catalog the server has since changed, and an unconditional fetch would pay
-  // a round trip for a catalog known to be fixed.
+  // The default is the contract that matters: `clientFor` in `mcp-gateway.js`
+  // passes no `cacheTools`, so whatever the constructor defaults to is what every
+  // gateway listing pays. Caching is the whole point of the gateway (61 schemas,
+  // ~33 KB kept out of every request), so an uncached default would turn each
+  // `mcp_list_tools` into a round trip for a catalog that changes only on restart.
+  // Both directions are asserted, plus the escape hatches.
 
-  // Default (no `cacheTools`): every call re-reads the catalog.
-  const uncachedBefore = listCount;
-  const uncached = new McpHttpClient({ url: `${base}/rpc` });
-  await uncached.listTools();
-  await uncached.listTools();
-  await uncached.listTools();
+  // Default (no `cacheTools`): the catalog is read once and reused.
+  const defaultBefore = listCount;
+  const byDefault = new McpHttpClient({ url: `${base}/rpc` });
+  const defaultFirst = await byDefault.listTools();
+  const defaultSecond = await byDefault.listTools();
+  const defaultThird = await byDefault.listTools();
   check(
-    'without cacheTools, tools/list is fetched on every call',
-    listCount - uncachedBefore === 3,
-    `${listCount - uncachedBefore} tools/list request(s) for 3 calls`,
-  );
-
-  // `cacheTools: true`: the catalog is read once and reused.
-  const cachedBefore = listCount;
-  const cached = new McpHttpClient({ url: `${base}/rpc`, cacheTools: true });
-  const first = await cached.listTools();
-  const second = await cached.listTools();
-  const third = await cached.listTools();
-  check(
-    'with cacheTools, tools/list is fetched only on the first call',
-    listCount - cachedBefore === 1,
-    `${listCount - cachedBefore} tools/list request(s) for 3 calls`,
+    'by default tools/list is fetched only on the first call',
+    listCount - defaultBefore === 1,
+    `${listCount - defaultBefore} tools/list request(s) for 3 calls`,
   );
   check(
     'a cached catalog is the same catalog, not a refetch',
-    first === second && second === third && second.length === 2,
-    JSON.stringify(second.map((tool) => tool.name)),
+    defaultFirst === defaultSecond && defaultSecond === defaultThird && defaultSecond.length === 2,
+    JSON.stringify(defaultSecond.map((tool) => tool.name)),
+  );
+  check(
+    'the cache is on by default, spelled out rather than inferred from counts',
+    byDefault.cacheTools === true,
+    `cacheTools = ${JSON.stringify(byDefault.cacheTools)}`,
+  );
+
+  // `cacheTools: false` opts a server that rewrites its catalog out of the cache.
+  const uncachedBefore = listCount;
+  const uncached = new McpHttpClient({ url: `${base}/rpc`, cacheTools: false });
+  await uncached.listTools();
+  await uncached.listTools();
+  await uncached.listTools();
+  check(
+    'with cacheTools: false, tools/list is fetched on every call',
+    listCount - uncachedBefore === 3,
+    `${listCount - uncachedBefore} tools/list request(s) for 3 calls`,
   );
 
   // `refresh` still overrides the cache: the escape hatch has to work, or a
   // server that did change its catalog could never be re-read.
   const refreshBefore = listCount;
-  const refreshed = await cached.listTools({ refresh: true });
+  const refreshed = await byDefault.listTools({ refresh: true });
   check(
-    'refresh: true re-reads even with cacheTools set',
+    'refresh: true re-reads even with the cache on',
     listCount - refreshBefore === 1 && refreshed.length === 2,
     `${listCount - refreshBefore} tools/list request(s)`,
   );
@@ -265,7 +373,7 @@ try {
   // The cache is per client, not module-wide: a second client must not inherit
   // the first one's catalog (it may point at a different server).
   const otherBefore = listCount;
-  const other = new McpHttpClient({ url: `${base}/rpc`, cacheTools: true });
+  const other = new McpHttpClient({ url: `${base}/rpc` });
   await other.listTools();
   check(
     'the cache does not leak between clients',
@@ -276,7 +384,7 @@ try {
   // `callTool` must not be affected by the flag — the cache is about the
   // catalog only, and a cached call would be a wrong answer, not a saving.
   const callBefore = listCount;
-  const called = await cached.callTool('echo', { text: 'cached' });
+  const called = await byDefault.callTool('echo', { text: 'cached' });
   check(
     'a cached client still calls tools for real',
     called.content?.[0]?.text === 'echo:cached' && listCount === callBefore,
@@ -291,6 +399,148 @@ try {
     'each client sends initialized exactly once, after its handshake',
     seen.filter((entry) => entry.message.method === 'notifications/initialized').length === 5,
     'one notification per client handshake (5 clients built above)',
+  );
+
+  // ── a lost session heals, and a known-dead connection never answers ────────
+  // A stateful MCP server drops every session when it restarts and answers any
+  // request still carrying the old id with HTTP 404. `initialize` is sent once
+  // per client, so without recovery that 404 is permanent: every later call
+  // fails, and a cached catalog keeps answering for a connection the server has
+  // already forgotten — the silent degradation this repository bans. Both halves
+  // are asserted below: the client must re-handshake (self-heal), and it must not
+  // serve a cache hit from a session it knows is gone (no silent degradation).
+
+  const sessionClient = new McpHttpClient({ url: `${base}/sessions` });
+  const sessionFirst = await sessionClient.listTools();
+  const firstIssued = (issuedByPath.get('/sessions') ?? [])[0];
+  check(
+    'a stateful server issues a session id that is echoed afterwards',
+    sessionFirst.length === 1 &&
+      firstIssued !== undefined &&
+      seen.findLast((entry) => entry.url === '/sessions' && entry.message.method === 'tools/list')?.headers['mcp-session-id'] === firstIssued,
+    'tools/list must carry the id issued by initialize',
+  );
+
+  // The restart. The next call is rejected with 404 `session not found`, which is
+  // the only signal the server gives — there is no JSON-RPC frame to inspect.
+  dropSessions();
+  const goneCall = await (async () => { try { await sessionClient.callTool('echo'); return null; } catch (error) { return error; } })();
+  check(
+    'a call on a forgotten session is rejected and named',
+    /HTTP 404/.test(goneCall?.message ?? '') && /session not found/.test(goneCall?.message ?? ''),
+    goneCall?.message,
+  );
+
+  // Self-healing: the next listing must succeed by re-handshaking, not repeat the
+  // 404 forever. The 404 is thrown for the call that hit it; recovery is the next
+  // call's job, which is what a model retrying its tool does.
+  const healed = await sessionClient.listTools();
+  const healedList = seen.findLast((entry) => entry.url === '/sessions' && entry.message.method === 'tools/list');
+  const healedId = (issuedByPath.get('/sessions') ?? [])[1];
+  check(
+    'the next call after a lost session re-handshakes and succeeds',
+    healed.length === 1 && healedId !== undefined && healedList?.headers['mcp-session-id'] === healedId && healedId !== firstIssued,
+    `catalog=${JSON.stringify(healed.map((tool) => tool.name))} carried=${String(healedList?.headers['mcp-session-id'])} expected=${String(healedId)}`,
+  );
+  const sessionHandshakes = seen.filter((entry) => entry.url === '/sessions' && entry.message.method === 'initialize').length;
+  check(
+    'recovery re-runs initialize exactly once, not once per call',
+    sessionHandshakes === 2,
+    `${sessionHandshakes} initialize request(s) on /sessions (initial + one recovery)`,
+  );
+  const recoveredEcho = await (async () => { try { return await sessionClient.callTool('echo'); } catch (error) { return error; } })();
+  check(
+    'the recovered session id is the one echoed from then on',
+    !(recoveredEcho instanceof Error) &&
+      seen.findLast((entry) => entry.url === '/sessions' && entry.message.method === 'tools/call')?.headers['mcp-session-id'] === healedId,
+    `later calls must carry the id issued by the recovery handshake — got ${recoveredEcho instanceof Error ? recoveredEcho.message : 'ok'}`,
+  );
+
+  // No silent degradation. The cache must not survive the session it describes:
+  // a catalog read from a connection the server has forgotten may not answer the
+  // next `listTools()`. The server here stays down after the restart, so a correct
+  // client has nothing to serve and must fail loudly — returning the cached catalog
+  // is the only way this call could "succeed", which is exactly the bug.
+  const downClient = new McpHttpClient({ url: `${base}/sessions-down` });
+  const downFirst = await downClient.listTools();   // cache established while alive
+  sessionDownOnList = true;
+  dropSessions();
+  const downCall = await (async () => { try { await downClient.callTool('echo'); return null; } catch (error) { return error; } })();
+  const staleAfterLoss = await (async () => { try { return await downClient.listTools(); } catch (error) { return error; } })();
+  check(
+    'a cached catalog cannot answer after the session is known to be gone',
+    downFirst.length === 1
+      && /HTTP 404/.test(downCall?.message ?? '')
+      && staleAfterLoss instanceof Error,
+    `after the 404, listTools() must fail loudly instead of serving the stale catalog — got ${staleAfterLoss instanceof Error ? staleAfterLoss.message : `the cached catalog (${JSON.stringify(staleAfterLoss.map((tool) => tool.name))}), silently`}`,
+  );
+  sessionDownOnList = false;
+
+  // A bare 404 — the spec's minimum, no explanation in the body — is still a lost
+  // session: the request carried an id the server no longer honours.
+  const bareClient = new McpHttpClient({ url: `${base}/sessions-bare` });
+  await bareClient.listTools();
+  dropSessions();
+  const bareGone = await (async () => { try { await bareClient.callTool('echo'); return null; } catch (error) { return error; } })();
+  const bareHealed = await bareClient.listTools();
+  check(
+    'a bare 404 with no body is still read as a lost session',
+    /HTTP 404/.test(bareGone?.message ?? '')
+      && bareHealed.length === 1
+      && (issuedByPath.get('/sessions-bare') ?? []).length === 2,
+    `rejected=${bareGone?.message} recovered=${JSON.stringify(bareHealed.map((tool) => tool.name))} handshakes=${(issuedByPath.get('/sessions-bare') ?? []).length}`,
+  );
+
+  // Precision: a 404 that is *not* about the session must not throw the session
+  // away. The server here keeps honouring `sess-*`; only `tools/call` 404s, and
+  // the body says what is actually missing.
+  const otherClient = new McpHttpClient({ url: `${base}/sessions-other-404` });
+  await otherClient.listTools();
+  const otherGone = await (async () => { try { await otherClient.callTool('echo'); return null; } catch (error) { return error; } })();
+  const otherAfter = await otherClient.listTools();
+  const otherCalls = seen.filter((entry) => entry.url === '/sessions-other-404' && entry.message.method === 'tools/call');
+  check(
+    'a 404 about something other than the session does not discard the session',
+    /no such widget/.test(otherGone?.message ?? '') &&
+      otherAfter.length === 1 &&
+      otherCalls.length === 1 &&
+      seen.filter((entry) => entry.url === '/sessions-other-404' && entry.message.method === 'initialize').length === 1,
+    `initialize count stayed 1 (no needless re-handshake), calls=${otherCalls.length}`,
+  );
+
+  // Stateless servers are untouched: Paseo's own never issues an id, so there is
+  // no session state to lose. A 404 whose body even says "session not found"
+  // must still propagate as-is and must not trigger a re-handshake, because this
+  // client never had a session to reset.
+  const statelessClient = new McpHttpClient({ url: `${base}/stateless-404` });
+  const statelessGone = await (async () => { try { await statelessClient.listTools(); return null; } catch (error) { return error; } })();
+  const statelessRetry = await (async () => { try { await statelessClient.listTools(); return null; } catch (error) { return error; } })();
+  const statelessHandshakes = seen.filter((entry) => entry.url === '/stateless-404' && entry.message.method === 'initialize').length;
+  const statelessCarried = seen.filter((entry) => entry.url === '/stateless-404' && entry.headers['mcp-session-id'] !== undefined).length;
+  check(
+    'a stateless server never takes the session-recovery path',
+    /HTTP 404/.test(statelessGone?.message ?? '') &&
+      /HTTP 404/.test(statelessRetry?.message ?? '') &&
+      statelessHandshakes === 1 &&
+      statelessCarried === 0,
+    `initialize=${statelessHandshakes} (no recovery), requests carrying an id=${statelessCarried} (must be 0)`,
+  );
+
+  // The detector itself, on the shapes that decide whether recovery happens.
+  check(
+    'isSessionGoneError accepts only session-shaped 404s',
+    (() => {
+      const make = (status, body) => Object.assign(new Error('mcp: x failed'), { httpStatus: status, httpBody: body });
+      return isSessionGoneError(make(404, 'session not found')) === true
+        && isSessionGoneError(make(404, '')) === true
+        && isSessionGoneError(make(404, 'session expired')) === true
+        && isSessionGoneError(make(404, 'no such widget')) === false
+        && isSessionGoneError(make(404, '{"error":"Not Found"}')) === false
+        && isSessionGoneError(make(500, 'session not found')) === false
+        && isSessionGoneError(make(400, 'session not found')) === false
+        && isSessionGoneError(new Error('mcp: timed out after 10ms')) === false;
+    })(),
+    'session-shaped 404s recover; other statuses and unrelated 404 bodies do not',
   );
 } finally {
   server.close();

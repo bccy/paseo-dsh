@@ -180,6 +180,174 @@ console.log("TTL and cap bound the pool");
   );
 }
 
+/**
+ * The reference count (`#holds`) is the *only* thing that stops one session's
+ * cleanup from killing the process every other session is running in.
+ *
+ * Under one-process-multi-session the pooled child is shared, so `sweep`,
+ * `park` and `discard` must all refuse to touch it while any session still holds
+ * it. Before this section existed, `grep -c "hold()"` over this file returned
+ * **0**: nothing ever drove `hold()` / `release()`, so making both a no-op, or
+ * deleting the `#holds` guard in `sweep` / `park` / `discard`, left every check
+ * green. That is the definition of a false green this repo cares about — the
+ * guard existed, was never exercised, and could not fail.
+ *
+ * The two directions are asserted separately and on purpose:
+ *
+ * - **held** — a sweep over an expired entry must leave the process running,
+ *   report zero expired, and say so (`parked:keep`). This is the shape a live
+ *   conversation depends on: the child is expired by TTL but somebody is using
+ *   it.
+ * - **released** — after the last `release()`, the same sweep must kill it. This
+ *   half is what makes the first half meaningful: a guard that refuses forever
+ *   (a `#holds` that never returns to zero) would pass "held" alone.
+ *
+ * The `parked:keep` line is asserted because it is the guard's *only* observable
+ * trace. A silent refusal would be indistinguishable from a sweep that did
+ * nothing because the entry was not expired.
+ */
+console.log("the reference count protects a process other sessions are using");
+{
+  const pool = makePool({ ttlMs: 100 });
+  const child = fakeProcess("holds-a");
+  check("park is accepted while nothing holds the process", pool.park(entry(child)) === true);
+  pool.hold();
+  check("one hold makes the pool busy", pool.busy === true);
+  pool.hold();
+  check("a second hold is counted, not collapsed", pool.busy === true);
+
+  // Expire it, then sweep while held: the process must survive.
+  now += 101;
+  const heldSweep = pool.sweep();
+  check(
+    "a sweep over an expired entry kills nothing while a session holds it",
+    heldSweep === 0 && child.killed === false && child.running === true,
+    `expired ${String(heldSweep)}, killed ${String(child.killed)}, running ${String(child.running)}`,
+  );
+  check(
+    "…and the entry stays parked",
+    pool.size === 1 && pool.has("dsh-1") === true,
+    `size ${String(pool.size)}`,
+  );
+  check(
+    "…and the keep is observable in the log, naming the session and the count",
+    logs.some(
+      (line) =>
+        line.includes("parked:keep")
+        && line.includes("dsh-1")
+        && line.includes("2 session(s)"),
+    ),
+    logs.filter((line) => line.includes("parked:keep")).join(" | ") || "(no parked:keep line)",
+  );
+
+  // One release is not enough: the count has to actually be a count.
+  pool.release();
+  now += 101;
+  const halfSweep = pool.sweep();
+  check(
+    "releasing one of two holds is not enough to expire the entry",
+    halfSweep === 0 && child.killed === false && child.running === true,
+    `expired ${String(halfSweep)}, killed ${String(child.killed)}`,
+  );
+
+  // The last release opens the door.
+  pool.release();
+  check("the last release leaves the pool idle", pool.busy === false);
+  now += 101;
+  const releasedSweep = pool.sweep();
+  check(
+    "once every session has released, the expired entry is killed",
+    releasedSweep === 1 && child.killed === true && child.running === false,
+    `expired ${String(releasedSweep)}, killed ${String(child.killed)}, running ${String(child.running)}`,
+  );
+  check("…and the pool is empty again", pool.size === 0, `size ${String(pool.size)}`);
+
+  // An unmatched release must not drive the count negative: a shutdown path that
+  // releases twice would otherwise make the next hold look like a no-hold, which
+  // is exactly the "kill a live session's process" hole this count exists to
+  // close.
+  const tolerant = makePool();
+  tolerant.release();
+  tolerant.release();
+  tolerant.release();
+  check(
+    "an unmatched release never makes the pool negative",
+    tolerant.busy === false,
+    `busy ${String(tolerant.busy)}`,
+  );
+  const stillHeld = fakeProcess("holds-b");
+  tolerant.park(entry(stillHeld));
+  tolerant.hold();
+  now += 101;
+  check(
+    "…so one hold after stray releases still protects the process",
+    tolerant.sweep() === 0 && stillHeld.killed === false && tolerant.size === 1,
+    `killed ${String(stillHeld.killed)}, size ${String(tolerant.size)}`,
+  );
+}
+
+/**
+ * `park` and `discard` consult the same count, and each must refuse *and say
+ * why*: a silent refusal reads exactly like "there was nothing to do", which is
+ * the failure mode that made the old parked pool look healthy while it was
+ * killing live conversations.
+ */
+console.log("park and discard refuse while the process is held");
+{
+  const pool = makePool();
+  const child = fakeProcess("holds-c");
+  pool.hold();
+  const parked = pool.park(entry(child));
+  check("park is refused while a session holds the process", parked === false);
+  check("…and nothing was parked", pool.size === 0, `size ${String(pool.size)}`);
+  check(
+    "…and the refusal is logged, naming the session and the count",
+    logs.some(
+      (line) =>
+        line.includes("parked:refuse dsh-1")
+        && line.includes("1 session(s) still hold"),
+    ),
+    logs.filter((line) => line.includes("parked:refuse")).join(" | ") || "(no parked:refuse line)",
+  );
+
+  // `discard` needs an entry to refuse over, and `park` refuses while held — so
+  // the entry has to be parked *before* the hold. That is the real ordering: the
+  // provider parks an idle child and later sessions claim (hold) it.
+  const discardPool = makePool();
+  const victim = fakeProcess("holds-d");
+  check("the entry is parked before anyone holds it", discardPool.park(entry(victim)) === true);
+  discardPool.hold();
+  const discarded = discardPool.discard("dsh-1", "archive carried elsewhere");
+  check("discard is refused while a session holds the process", discarded === false);
+  check(
+    "…and the process is still alive",
+    victim.killed === false && victim.running === true && discardPool.size === 1,
+    `killed ${String(victim.killed)}, size ${String(discardPool.size)}`,
+  );
+  check(
+    "…and the refusal is logged with both the reason and the count",
+    logs.some(
+      (line) =>
+        line.includes("parked:discard refused")
+        && line.includes("archive carried elsewhere")
+        && line.includes("1 session(s) still hold"),
+    ),
+    logs.filter((line) => line.includes("parked:discard refused")).join(" | ")
+      || "(no parked:discard refused line)",
+  );
+
+  // And the same discard succeeds once the hold is returned — without this half,
+  // a `discard` that refused unconditionally would satisfy the assertions above.
+  discardPool.release();
+  check(
+    "the same discard succeeds after the release",
+    discardPool.discard("dsh-1", "archive carried elsewhere") === true
+      && victim.killed === true
+      && discardPool.size === 0,
+    `killed ${String(victim.killed)}, size ${String(discardPool.size)}`,
+  );
+}
+
 console.log("a refused park fails loudly, never silently");
 {
   // `park()` installs silent handlers on the child so a parked process cannot

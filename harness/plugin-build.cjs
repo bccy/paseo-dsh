@@ -18,8 +18,11 @@
  *   - type errors are expected and ignored: `--moduleResolution node` cannot
  *     resolve the protocol package's ESM declarations. The emitted JS is what
  *     runs, exactly as in the documented manual steps.
- *   - the result is reused while it is newer than every source file, so a check
- *     run twice in a row pays the ~3s compile once.
+ *   - the result is reused only while it is **provably** a build of the current
+ *     sources. A build that is older, partial, or was produced from a different
+ *     source set is rebuilt. The judgement lives in `freshness()` below and is
+ *     deliberately strict: a harness that tests stale bytes passes for the wrong
+ *     reason, and every check in this directory rides on this one module.
  *
  * Callers pass the directory *name* (relative to `paseo-plugin`) so parallel
  * work never shares a build tree; the contract's rule is one private dir per
@@ -29,30 +32,201 @@
 "use strict";
 
 const { existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } = require("node:fs");
-const { join, resolve } = require("node:path");
+const { join, relative, resolve, sep } = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 const PLUGIN_DIR = resolve(__dirname, "..", "paseo-plugin");
 
-/** Every source file whose change should invalidate a build. */
-function sourceFiles() {
-  const files = [];
-  for (const dir of ["server", "client"]) {
-    const abs = join(PLUGIN_DIR, dir);
-    if (!existsSync(abs)) continue;
-    for (const name of readdirSync(abs)) {
-      if (/\.tsx?$/.test(name)) files.push(join(abs, name));
-    }
-  }
-  return files;
+/**
+ * Written into the build directory after a successful compile; records exactly
+ * which sources (and which compiler) produced the tree.
+ */
+const STAMP_NAME = ".build-stamp.json";
+const STAMP_VERSION = 1;
+
+/** posix path of `abs` relative to `paseo-plugin` — the stamp's key form. */
+function relSource(abs) {
+  return relative(PLUGIN_DIR, abs).split(sep).join("/");
 }
 
-/** Whether `outDir` already holds a build newer than every source file. */
+/** Where tsc emits the compiled form of a source file. */
+function compiledPath(rel) {
+  return rel.replace(/\.tsx?$/, ".js");
+}
+
+/** Fallback walker: every `.ts`/`.tsx` under `paseo-plugin`, minus dot dirs. */
+function walkSources(dir, out) {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const entry of entries) {
+    if (entry.name === "node_modules" || entry.name.startsWith(".")) continue;
+    const abs = join(dir, entry.name);
+    if (entry.isDirectory()) walkSources(abs, out);
+    else if (/\.tsx?$/.test(entry.name) && !/\.d\.ts$/.test(entry.name)) out.push(abs);
+  }
+  return out;
+}
+
+/**
+ * The exact file list tsc compiles: `include` from `paseo-plugin/tsconfig.json`.
+ *
+ * Reading the config instead of hard-coding directories is the point: the old
+ * walk covered `["server", "client"]` only, so the two root-level entry points
+ * (`index.server.ts`, which registers the provider, and `index.client.tsx`) could
+ * change without invalidating anything. A new directory, or a new root file, is
+ * picked up here with no edit.
+ *
+ * @returns {string[] | undefined} absolute paths, or `undefined` when the set
+ *   cannot be trusted (no tsconfig, no typescript, empty result).
+ */
+function tsconfigSources() {
+  const configPath = join(PLUGIN_DIR, "tsconfig.json");
+  if (!existsSync(configPath)) return undefined;
+  let ts;
+  try {
+    ts = require(join(PLUGIN_DIR, "node_modules", "typescript"));
+  } catch {
+    return undefined;
+  }
+  try {
+    const read = ts.readConfigFile(configPath, ts.sys.readFile);
+    if (read.error !== undefined) return undefined;
+    const parsed = ts.parseJsonConfigFileContent(read.config, ts.sys, PLUGIN_DIR);
+    const files = parsed.fileNames.filter(
+      (file) => /\.tsx?$/.test(file) && !/\.d\.ts$/.test(file),
+    );
+    // An empty set would make every freshness predicate vacuously true.
+    return files.length === 0 ? undefined : files.sort();
+  } catch {
+    return undefined;
+  }
+}
+
+/** Every source file whose change must invalidate a build. */
+function sourceFiles() {
+  return tsconfigSources() ?? walkSources(PLUGIN_DIR, []).sort();
+}
+
+/** The compiler version the build was made with, when it can be read. */
+function installedTscVersion() {
+  try {
+    const pkg = JSON.parse(
+      readFileSync(join(PLUGIN_DIR, "node_modules", "typescript", "package.json"), "utf8"),
+    );
+    return typeof pkg.version === "string" ? pkg.version : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readStamp(outDir) {
+  try {
+    const parsed = JSON.parse(readFileSync(join(outDir, STAMP_NAME), "utf8"));
+    return parsed !== null && typeof parsed === "object" ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Compiled `.js` files present under `outDir` (posix, relative, sorted). */
+function compiledOutputs(outDir) {
+  const found = [];
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name === "node_modules" || entry.name.startsWith(".")) continue;
+      const abs = join(dir, entry.name);
+      if (entry.isDirectory()) walk(abs);
+      else if (/\.jsx?$/.test(entry.name)) found.push(relative(outDir, abs).split(sep).join("/"));
+    }
+  };
+  walk(outDir);
+  return found.sort();
+}
+
+/**
+ * Why `outDir` is — or is not — a usable build of the current sources.
+ *
+ * Four things must hold, and each one is a way the previous single-marker check
+ * went green on bytes that were not the sources:
+ *
+ *   1. a stamp exists and matches this module's format;
+ *   2. the source **set** is unchanged (added/removed files invalidate);
+ *   3. every source file's mtime is the one recorded at build time (so a touched
+ *      or reverted file invalidates even when its size did not change);
+ *   4. every source still has its compiled `.js`, the `package.json` marker is
+ *      there, and no `.js` is left over from a source that no longer exists.
+ *
+ * `fresh === false` always carries at least one reason, so a rebuild can say
+ * what changed instead of silently reusing (or silently recompiling).
+ *
+ * @param {string} outDir
+ * @param {string[]} [sources] - pre-computed `sourceFiles()` result.
+ * @returns {{ fresh: boolean, reasons: string[] }}
+ */
+function freshness(outDir, sources = sourceFiles()) {
+  if (sources.length === 0) {
+    // Fail closed: an empty set would make every check below pass for free.
+    return { fresh: false, reasons: [`no TypeScript sources found under ${PLUGIN_DIR}`] };
+  }
+
+  const reasons = [];
+  const stamp = readStamp(outDir);
+  if (stamp === undefined) {
+    reasons.push(`no ${STAMP_NAME} (build predates the stamp, or the compile was interrupted)`);
+  } else if (stamp.version !== STAMP_VERSION) {
+    reasons.push(`${STAMP_NAME} version ${String(stamp.version)} != ${STAMP_VERSION}`);
+  } else {
+    const recorded = stamp.sources !== null && typeof stamp.sources === "object" ? stamp.sources : {};
+    const current = new Map();
+    for (const file of sources) {
+      try {
+        current.set(relSource(file), statSync(file).mtimeMs);
+      } catch {
+        // Deleted between the listing and the stat: treat as "removed", which the
+        // set comparison below already reports.
+      }
+    }
+    const added = [...current.keys()].filter((rel) => !(rel in recorded));
+    const removed = Object.keys(recorded).filter((rel) => !current.has(rel));
+    const modified = [...current]
+      .filter(([rel, mtime]) => rel in recorded && recorded[rel] !== mtime)
+      .map(([rel]) => rel);
+    if (added.length > 0) reasons.push(`source added since build: ${added.join(", ")}`);
+    if (removed.length > 0) reasons.push(`source removed since build: ${removed.join(", ")}`);
+    if (modified.length > 0) reasons.push(`source modified since build: ${modified.join(", ")}`);
+    const tsc = installedTscVersion();
+    if (stamp.tsc !== undefined && tsc !== undefined && stamp.tsc !== tsc) {
+      reasons.push(`typescript changed since build: ${stamp.tsc} -> ${tsc}`);
+    }
+  }
+
+  const expected = new Map(sources.map((file) => [compiledPath(relSource(file)), relSource(file)]));
+  const missing = [...expected.keys()].filter((rel) => !existsSync(join(outDir, rel)));
+  if (missing.length > 0) reasons.push(`missing compiled output: ${missing.join(", ")}`);
+  if (!existsSync(join(outDir, "package.json"))) {
+    reasons.push("missing package.json marker (node would load the tree as ESM)");
+  }
+  const stray = compiledOutputs(outDir).filter((rel) => !expected.has(rel));
+  if (stray.length > 0) {
+    reasons.push(`compiled output with no source (left over from an older build): ${stray.join(", ")}`);
+  }
+
+  return { fresh: reasons.length === 0, reasons };
+}
+
+/** Whether `outDir` already holds a complete, up-to-date build. */
 function isFresh(outDir) {
-  const marker = join(outDir, "server", "session.js");
-  if (!existsSync(marker)) return false;
-  const builtAt = statSync(marker).mtimeMs;
-  return sourceFiles().every((file) => statSync(file).mtimeMs <= builtAt);
+  return freshness(outDir).fresh;
 }
 
 /**
@@ -69,13 +243,23 @@ function isFresh(outDir) {
 function buildPlugin(options = {}) {
   const dir = options.dir ?? ".dbg-harness";
   const outDir = join(PLUGIN_DIR, dir);
-  if (options.force !== true && isFresh(outDir)) {
-    if (options.quiet !== true) {
-      process.stderr.write(`[harness] reusing plugin build at paseo-plugin/${dir}\n`);
+  const quiet = options.quiet === true;
+
+  if (options.force !== true) {
+    const sources = sourceFiles();
+    const state = freshness(outDir, sources);
+    if (state.fresh) {
+      if (!quiet) {
+        process.stderr.write(`[harness] reusing plugin build at paseo-plugin/${dir}\n`);
+      }
+      return outDir;
     }
-    return outDir;
+    if (!quiet) {
+      process.stderr.write(
+        `[harness] rebuilding plugin build at paseo-plugin/${dir}: ${state.reasons.join("; ")}\n`,
+      );
+    }
   }
-  rmSync(outDir, { recursive: true, force: true });
 
   const tsc = join(PLUGIN_DIR, "node_modules", "typescript", "bin", "tsc");
   if (!existsSync(tsc)) {
@@ -83,7 +267,13 @@ function buildPlugin(options = {}) {
       `typescript is not installed at ${tsc}; run \`npm install\` in paseo-plugin first`,
     );
   }
-  if (options.quiet !== true) {
+
+  // Snapshot before compiling. If a source changes mid-build the stamp keeps the
+  // old mtime, so the next run rebuilds instead of trusting a mixed tree.
+  const snapshot = new Map(sourceFiles().map((file) => [relSource(file), statSync(file).mtimeMs]));
+
+  rmSync(outDir, { recursive: true, force: true });
+  if (!quiet) {
     process.stderr.write(`[harness] compiling plugin to paseo-plugin/${dir} (type errors are expected)\n`);
   }
   const result = spawnSync(
@@ -98,15 +288,39 @@ function buildPlugin(options = {}) {
     ],
     { cwd: PLUGIN_DIR, encoding: "utf8", timeout: 300_000 },
   );
-  if (result.status !== 0 && !existsSync(join(outDir, "server", "session.js"))) {
+
+  const missing = [...snapshot.keys()]
+    .map((rel) => compiledPath(rel))
+    .filter((rel) => !existsSync(join(outDir, rel)));
+  if (result.status !== 0 && missing.length > 0) {
     throw new Error(
-      `plugin compile produced no output (exit ${String(result.status)}):\n`
+      `plugin compile produced no usable output (exit ${String(result.status)}); `
+        + `missing ${missing.join(", ")}:\n`
         + `${(result.stderr ?? "").split("\n").slice(-15).join("\n")}`,
     );
   }
+  if (!quiet && missing.length > 0) {
+    process.stderr.write(
+      `[harness] warning: tsc exited ${String(result.status)} but emitted no output for ${missing.join(", ")}\n`,
+    );
+  }
+
   // The compiled tree is CommonJS even though `paseo-plugin/package.json` may
   // not say so; without this marker `node` treats the `.js` files as ESM.
   writeFileSync(join(outDir, "package.json"), '{"type":"commonjs"}\n');
+  writeFileSync(
+    join(outDir, STAMP_NAME),
+    `${JSON.stringify(
+      {
+        version: STAMP_VERSION,
+        builtAt: new Date().toISOString(),
+        tsc: installedTscVersion(),
+        sources: Object.fromEntries(snapshot),
+      },
+      null,
+      2,
+    )}\n`,
+  );
   return outDir;
 }
 
@@ -116,10 +330,27 @@ function buildPlugin(options = {}) {
  * `PASEO_PLUGIN_BUILD` lets a caller (or the Lead) point every check at one
  * build instead of paying for a private copy each time; it must be a path
  * inside `paseo-plugin` for the same `node_modules` reason.
+ *
+ * This is the one path where freshness is **not enforced**: the tree belongs to
+ * the caller, and a harness must not delete a build another agent is using.
+ * That also makes it the quietest way to end up testing old bytes, so the skip
+ * is announced on every run and a stamp that disagrees with the sources is
+ * called out (the tree is still used — only the silence is removed).
  */
 function buildDirFromEnv() {
   const configured = process.env.PASEO_PLUGIN_BUILD;
-  return configured === undefined || configured === "" ? undefined : resolve(configured);
+  if (configured === undefined || configured === "") return undefined;
+  const outDir = resolve(configured);
+  const state = freshness(outDir);
+  process.stderr.write(
+    `[harness] PASEO_PLUGIN_BUILD=${outDir}: trusting external build, freshness not enforced\n`,
+  );
+  if (!state.fresh) {
+    process.stderr.write(
+      `[harness] warning: external build may not match the sources (${state.reasons.join("; ")})\n`,
+    );
+  }
+  return outDir;
 }
 
 /**
@@ -133,10 +364,25 @@ function buildDirFromEnv() {
  * @returns {string}
  */
 function resolvePluginBuild(explicit, dir) {
-  if (explicit !== undefined && explicit !== "") return resolve(explicit);
+  if (explicit !== undefined && explicit !== "") {
+    const outDir = resolve(explicit);
+    process.stderr.write(
+      `[harness] using build at ${outDir} from the command line, freshness not enforced\n`,
+    );
+    return outDir;
+  }
   const fromEnv = buildDirFromEnv();
   if (fromEnv !== undefined) return fromEnv;
   return buildPlugin({ dir });
 }
 
-module.exports = { buildDirFromEnv, buildPlugin, isFresh, resolvePluginBuild, sourceFiles, PLUGIN_DIR };
+module.exports = {
+  buildDirFromEnv,
+  buildPlugin,
+  freshness,
+  isFresh,
+  resolvePluginBuild,
+  sourceFiles,
+  PLUGIN_DIR,
+  STAMP_NAME,
+};

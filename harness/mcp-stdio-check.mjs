@@ -167,14 +167,38 @@ try {
     JSON.stringify(tools).slice(0, 160),
   );
 
+  // The default is the contract: `clientFor` in `mcp-gateway.js` passes no
+  // `cacheTools` to either transport, so the stdio default has to match the HTTP
+  // one — a server must not behave differently depending on which transport it
+  // happens to speak. (This half was missing when only the HTTP side was fixed.)
   await client.listTools();
   const afterCached = countOf('tools/list');
   await client.listTools({ refresh: true });
   const afterRefresh = countOf('tools/list');
   check(
-    'listTools caches until refresh: true',
+    'by default listTools caches until refresh: true',
     afterCached === 1 && afterRefresh === 2,
     `tools/list sent ${afterCached}× on the cached call, ${afterRefresh}× after refresh`,
+  );
+  check(
+    'the stdio cache is on by default, spelled out rather than inferred from counts',
+    client.cacheTools === true,
+    `cacheTools = ${JSON.stringify(client.cacheTools)}`,
+  );
+
+  // `cacheTools: false` is the opt-out, and it has to actually reach the wire:
+  // a server whose catalog changes between calls would otherwise be served a
+  // stale one for the life of the session.
+  const uncachedClient = makeClient({ cacheTools: false });
+  const uncachedBefore = countOf('tools/list');
+  await uncachedClient.listTools();
+  await uncachedClient.listTools();
+  await uncachedClient.listTools();
+  const uncachedAfter = countOf('tools/list');
+  check(
+    'with cacheTools: false, every listTools re-reads the catalog',
+    uncachedAfter - uncachedBefore === 3,
+    `${uncachedAfter - uncachedBefore} tools/list request(s) for 3 calls`,
   );
 
   const echo = await client.callTool('echo', { text: 'hi' });
@@ -231,6 +255,36 @@ try {
     `first: ${diedMessage} | next: ${afterDeathMessage}`,
   );
 
+  // ── a catalog cached while the server was alive ───────────────────────────
+  // Caching is the default and the reason the gateway exists, but a cache hit
+  // sends no request — so nothing on that path would notice the server is gone.
+  // `listTools()` would answer from the catalog read before the exit and report
+  // "the catalog did not change" for "the connection died", after which the
+  // gateway offers tools that cannot be called and the model learns the truth
+  // only when its call fails. The health gate has to sit in front of the cache.
+  //
+  // The cache itself is not this assertion's business: the "caches until
+  // refresh: true" case above already fails if the gate is implemented as a
+  // refetch, so `tools/list` is only counted for the diagnostic line.
+  const staleClient = makeClient();
+  const catalogWhileAlive = await staleClient.listTools();
+  const listsBeforeDeath = countOf('tools/list');
+  await outcomeOf(staleClient.callTool('die'));
+  const staleAfterDeath = await outcomeOf(staleClient.listTools());
+  const staleMessage = staleAfterDeath.status === 'hung'
+    ? 'the call never settled'
+    : staleAfterDeath.status === 'resolved'
+      ? `stale catalog returned from a dead server: ${JSON.stringify((staleAfterDeath.value ?? []).map((tool) => tool?.name))}`
+      : staleAfterDeath.error?.message ?? '';
+  check(
+    'a cached catalog is not served once the server is dead',
+    staleAfterDeath.status === 'rejected'
+      && /exited/.test(staleMessage)
+      && /fake-server\.mjs/.test(staleMessage)
+      && Array.isArray(catalogWhileAlive) && catalogWhileAlive.length === 1,
+    `${staleMessage} | tools/list ${listsBeforeDeath} → ${countOf('tools/list')}`,
+  );
+
   // ── teardown ──────────────────────────────────────────────────────────────
   const disposeClient = makeClient();
   await disposeClient.listTools();
@@ -242,6 +296,20 @@ try {
     'dispose stops the child process',
     aliveBefore && !aliveAfter,
     `pid ${pid}: alive before=${aliveBefore}, alive after=${aliveAfter}`,
+  );
+  // The same gate covers teardown: `dispose()` marks the client disposed and
+  // rejects whatever is in flight, so a cache hit afterwards must not answer
+  // either — the catalog belongs to a connection that no longer exists.
+  const afterDispose = await outcomeOf(disposeClient.listTools());
+  const afterDisposeMessage = afterDispose.status === 'hung'
+    ? 'the call never settled'
+    : afterDispose.status === 'resolved'
+      ? `stale catalog returned after dispose: ${JSON.stringify((afterDispose.value ?? []).map((tool) => tool?.name))}`
+      : afterDispose.error?.message ?? '';
+  check(
+    'a disposed client does not answer from the cached catalog',
+    afterDispose.status === 'rejected' && /client disposed/.test(afterDisposeMessage),
+    afterDisposeMessage,
   );
 } catch (error) {
   check('the check itself did not crash', false, error instanceof Error ? error.message : String(error));

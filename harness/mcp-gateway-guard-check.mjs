@@ -143,8 +143,17 @@ try {
     ['mcp_list_tools', 'mcp_tool_schema', 'mcp_call_tool'].every((name) => tools.has(name)),
     [...tools.keys()].join(', '),
   );
+  // `archive_subagents` comes from `registerSubagentArchiveTool`, called by the
+  // same `apply()`. It lives in this process too, so it is just as invalid a call
+  // target as the discovery meta-tools — asserting it here is what keeps the
+  // guard's name list honest.
+  check(
+    'and archive_subagents, which the same plugin registers',
+    tools.has('archive_subagents'),
+    [...tools.keys()].join(', '),
+  );
 
-  // ── the four guard outcomes ────────────────────────────────────────────────
+  // ── the guard outcomes ─────────────────────────────────────────────────────
 
   // 1. An empty target. `.required()` only checks presence, so `''` reaches the
   //    guard — this is the shape that would otherwise ask the server for "".
@@ -169,18 +178,40 @@ try {
     JSON.stringify(blank),
   );
 
-  // 2. A meta-tool name as the target: the server has no such tool, so the
+  // 2. A gateway tool name as the target: the server has no such tool, so the
   //    answer it gives ("Tool mcp_call_tool not found") misdescribes the fix.
-  for (const meta of ['mcp_list_tools', 'mcp_tool_schema', 'mcp_call_tool']) {
+  //    Every spelling a model realistically produces is covered: the exact name,
+  //    upper case, mixed case, a zero-width character inside it (survives
+  //    `.trim()`), and the full-width spelling a CJK keyboard emits.
+  const REFUSED_SPELLINGS = [
+    'mcp_list_tools',
+    'mcp_tool_schema',
+    'mcp_call_tool',
+    'archive_subagents',
+    'MCP_CALL_TOOL',
+    'Mcp_Call_Tool',
+    'ARCHIVE_SUBAGENTS',
+    '\u200bmcp_call_tool',
+    'mcp_call_tool\u200b',
+    '\ufeffmcp_list_tools',
+    // Full-width capitals, what an IME can produce for the same name (NFKC folds
+    // them back to ASCII, so this is the normalization, not a special case).
+    'ＭＣＰ＿ＣＡＬＬ＿ＴＯＯＬ',
+  ];
+  for (const spelling of REFUSED_SPELLINGS) {
     const before = listCalls();
-    const refused = await run(tools, 'mcp_tool_schema', { tool: meta });
+    const refused = await run(tools, 'mcp_tool_schema', { tool: spelling });
+    // The message quotes the *trimmed* target — `trim()` already removes U+FEFF,
+    // so a BOM-prefixed spelling is quoted without it. Asserting the raw spelling
+    // would fail on the one case where the guard's own trimming is correct.
     check(
-      `the meta-tool name "${meta}" is refused as a target`,
-      /is one of this gateway's own meta-tools/.test(refused.error ?? '') && refused.error.includes(meta),
+      `the gateway tool name ${JSON.stringify(spelling)} is refused as a target`,
+      /is one of this gateway's own tools/.test(refused.error ?? '')
+        && refused.error.includes(`"${spelling.trim()}"`),
       JSON.stringify(refused),
     );
     check(
-      `"${meta}" as a target never reaches the server`,
+      `${JSON.stringify(spelling)} as a target never reaches the server`,
       listCalls() === before,
       `tools/list went from ${before} to ${listCalls()}`,
     );
@@ -207,7 +238,7 @@ try {
   const unknown = await run(tools, 'mcp_tool_schema', { tool: 'nope' });
   check(
     'an unknown tool name reports the missing tool, not the guard',
-    /exposes no tool "nope"/.test(unknown.error ?? '') && !/meta-tool/.test(unknown.error ?? ''),
+    /exposes no tool "nope"/.test(unknown.error ?? '') && !/gateway's own tool/.test(unknown.error ?? ''),
     JSON.stringify(unknown),
   );
 
@@ -221,7 +252,7 @@ try {
   });
   check(
     'a call folded into "arguments" is refused and the nested tool is named',
-    /is one of this gateway's own meta-tools/.test(folded.error ?? '')
+    /is one of this gateway's own tools/.test(folded.error ?? '')
       && /folded another call into "arguments"/.test(folded.error ?? '')
       && /list_providers/.test(folded.error ?? ''),
     JSON.stringify(folded),
@@ -232,14 +263,24 @@ try {
     `tools/call went from ${foldedBefore} to ${callCalls()}`,
   );
 
-  // The same meta-tool name *without* a nested envelope gets the plain message:
-  // the "folded" clause is evidence, so it must not appear when there is none.
+  // The same name *without* a nested envelope gets the plain message: the
+  // "folded" clause is evidence, so it must not appear when there is none.
   const unfolded = await run(tools, 'mcp_call_tool', { tool: 'mcp_call_tool', arguments: { query: 'x' } });
   check(
-    'a meta-tool target without a nested envelope omits the folded clause',
-    /is one of this gateway's own meta-tools/.test(unfolded.error ?? '')
+    'a gateway-tool target without a nested envelope omits the folded clause',
+    /is one of this gateway's own tools/.test(unfolded.error ?? '')
       && !/folded another call/.test(unfolded.error ?? ''),
     JSON.stringify(unfolded),
+  );
+
+  // The same guard covers the fourth gateway tool, on the call path: it is not a
+  // meta-tool, but asking a server for it is the same mistake with the same fix.
+  const archivedAsCall = await run(tools, 'mcp_call_tool', { tool: 'archive_subagents', arguments: { scope: 'all' } });
+  check(
+    'archive_subagents is refused as a call target too',
+    /is one of this gateway's own tools/.test(archivedAsCall.error ?? '')
+      && /archive_subagents/.test(archivedAsCall.error ?? ''),
+    JSON.stringify(archivedAsCall),
   );
 
   // A normal call still goes through, and the guard's trim is what gets
@@ -260,14 +301,26 @@ try {
     JSON.stringify(emptyCall),
   );
 
-  // A non-string target cannot reach the guard through `defineTool`'s schema,
-  // but the guard still refuses it if a caller bypasses validation.
-  const nonString = await run(tools, 'mcp_call_tool', { tool: 42, arguments: {} });
-  check(
-    'a non-string "tool" is refused rather than coerced',
-    nonString.error !== undefined && !/echo/.test(JSON.stringify(nonString)),
-    JSON.stringify(nonString),
-  );
+  // A non-string target never reaches the guard: `defineTool` validates the
+  // arguments before `execute` runs, so the rejection comes from the schema, not
+  // from `resolveTargetTool`. Asserting the *schema's* wording is what makes this
+  // a real assertion — the old form only checked "something threw and no echo
+  // came back", which stayed true even if the guard were deleted (the schema
+  // still throws), i.e. it could not fail for the defect it claimed to cover.
+  for (const bad of [42, null, ['mcp_call_tool'], { name: 'mcp_call_tool' }]) {
+    const before = callCalls();
+    const nonString = await run(tools, 'mcp_call_tool', { tool: bad, arguments: {} });
+    check(
+      `a non-string "tool" (${JSON.stringify(bad)}) is rejected by the argument schema`,
+      /invalid arguments/.test(nonString.error ?? '') && /"tool" must be a string/.test(nonString.error ?? ''),
+      JSON.stringify(nonString),
+    );
+    check(
+      `a non-string "tool" (${JSON.stringify(bad)}) never reaches the server`,
+      callCalls() === before,
+      `tools/call went from ${before} to ${callCalls()}`,
+    );
+  }
 } finally {
   server.close();
 }
