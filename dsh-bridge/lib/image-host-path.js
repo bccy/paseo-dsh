@@ -236,8 +236,46 @@ export function withImageHostPaths(ctx, event) {
 }
 
 /**
+ * One event's `data`, without the streaming-typing record DSH keeps on an
+ * assistant message.
+ *
+ * `data.stream` is DSH's own transcript of how the message arrived: one entry
+ * per streamed frame (`{type: "chunk" | "reasoning-chunks" | "text" |
+ * "tool-call", dt: [...]}`), which the typing animation replays. Nothing on the
+ * Paseo side reads it — the plugin's `#assistantMessage` builds its row from
+ * `data.message.content`, `data.turn` and `data.step` only — and it is not small:
+ * on a real 9802-event session it is 22.7 MB of a 43.4 MB `paseo/history`
+ * response, 52.3% of the whole replay. A rewind re-reads that response in full
+ * (Paseo's adapter is append-only, so a rewind is a close + reopen), which is
+ * most of why a rewind took seconds.
+ *
+ * **Only the replay projection drops it, never the log.** The event handed here
+ * is a throwaway projection of one stored event; DSH's own persisted record
+ * keeps `stream` intact, because it is DSH's data and other readers (the live
+ * typing stream, a future exporter) are entitled to it. The original object is
+ * never mutated: a new `data` is built by rest-spread, and an event without
+ * `stream` is returned as-is rather than gaining a `stream: undefined` key.
+ *
+ * @param {{type?: string, data?: unknown}} event - one stored event.
+ * @returns {unknown} the same `data` reference, or a copy without `stream`.
+ */
+export function withoutAssistantStream(event) {
+  if (event === null || typeof event !== 'object') return event;
+  if (event.type !== 'assistant/message') return event.data;
+  const data = event.data;
+  if (data === null || typeof data !== 'object') return data;
+  // `in` rather than `!== undefined`: a present-but-undefined key would still be
+  // a key this projection invented, and a log written by another producer may
+  // legitimately carry `stream: null`. Both are "has no stream chunks".
+  if (!('stream' in data)) return data;
+  const { stream: _stream, ...rest } = data;
+  return rest;
+}
+
+/**
  * Project a stored session log onto the `paseo/history` wire shape, with every
- * image attachment stamped (see {@link withImageHostPaths}).
+ * image attachment stamped (see {@link withImageHostPaths}) and the assistant
+ * typing record dropped (see {@link withoutAssistantStream}).
  *
  * Reopening a session replays through here, and that is the path an image
  * matters most on: `data.meta.path` is the *source* file, which is typically
@@ -251,6 +289,13 @@ export function withImageHostPaths(ctx, event) {
  * the session rather than drop it silently, so stripping the marker removes the
  * only thing that tells a future event type apart from a skippable one.
  *
+ * The trimming happens **after** the caller's surface fold, which is a
+ * requirement rather than an ordering accident: `visibleEvents()` resolves a
+ * rewind's shadowed range against the log's surface node list, and it needs the
+ * events' own `seq`/`surfaceOp` fields — not this wire shape. `history()` already
+ * nests it as `historyEvents(ctx, visibleEvents(...))`, so the fold still sees
+ * every event exactly once and a rewind range still collapses.
+ *
  * @param {{get(name: string): unknown}} ctx - the DSH profile context.
  * @param {unknown} events - the stored events read from session persistence.
  * @returns {Array<object>} wire frames, image blocks stamped where resolvable.
@@ -263,7 +308,7 @@ export function historyEvents(ctx, events) {
       ...(event.seq === undefined ? {} : { seq: event.seq }),
       ...(event.time === undefined ? {} : { time: event.time }),
       ...(event.ignorable === undefined ? {} : { ignorable: event.ignorable }),
-      data: event.data,
+      data: withoutAssistantStream(event),
     }),
   );
 }
