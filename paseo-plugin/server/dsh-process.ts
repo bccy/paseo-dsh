@@ -1,15 +1,24 @@
 /**
  * One `dsh --profile paseo` child process, speaking the bridge's stdio JSON-RPC.
  *
- * A process owns exactly one agent session. DSH pins the working directory,
- * provider, model and reasoning effort at `initialize`, so a session per
- * process is what lets Paseo run several workspaces against one provider.
+ * A process serves **many** agent sessions. DSH pins the working directory,
+ * provider, model and reasoning effort per session at `initialize`, so one
+ * process can host several Paseo sessions at once — each with its own cwd,
+ * route and MCP servers — instead of paying a full profile load per session.
+ *
+ * The split is deliberate:
+ *
+ * - **Session-scoped** (keyed by DSH session id in {@link DshProcess.attachSession}):
+ *   events, status, questions, child notices, exit, and every request that names
+ *   a session (prompt, cancel, revert, plan, usage, …).
+ * - **Process-scoped**: stderr lines, JSON-RPC protocol failures, and the child's
+ *   own lifecycle. Those belong to the child, not to any one session.
  *
  * @module dsh-paseo/server/dsh-process
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { profileName } from "./bootstrap";
 
@@ -187,16 +196,84 @@ export interface DshProcessHandlers {
   onProtocolError(message: string): void;
 }
 
+/**
+ * The handlers one attached session reports to.
+ *
+ * `onLog` and `onProtocolError` are deliberately absent. A stderr line or a
+ * malformed frame belongs to the child, not to any one conversation, so a
+ * session must not be able to silence diagnostics for the sessions sharing its
+ * process — which is exactly what the parked pool's silent handler set used to
+ * do to a whole process.
+ */
+export type DshSessionHandlers = Omit<DshProcessHandlers, "onLog" | "onProtocolError">;
+
+/**
+ * One frame held until its producing session's lineage becomes resolvable.
+ *
+ * Only the frame kinds addressed by a producing session can be orphaned this
+ * way: a JSON-RPC *response* is matched by request id and never routed by
+ * session.
+ *
+ * `child-opened` is included, and that is the subtle part. It looks like it
+ * should never need holding — it is the notice that *creates* a parent edge — but
+ * its own `parentSessionId` can name a session nothing has announced yet (a
+ * grandchild reported before the child that parents it). Recording the edge and
+ * *delivering* the notice are separate: the edge is recorded unconditionally,
+ * while delivery needs an owner, so an unresolvable notice was dropped and the
+ * child never appeared in the session at all. Holding it is what lets a whole
+ * chain surface once its top-level ancestor is announced.
+ */
+type OrphanFrame =
+  | { kind: "event"; params: Record<string, unknown> }
+  | { kind: "status"; params: Record<string, unknown> }
+  | { kind: "child-opened"; params: Record<string, unknown> };
+
+/** How many orphan frames one producing session may accumulate. */
+const ORPHAN_FRAME_LIMIT = 256;
+/**
+ * How long a frame may wait for its lineage.
+ *
+ * A child's parent notice normally arrives within the same burst, so this only
+ * bounds a lineage that will never resolve (a child of a session this process
+ * does not serve). The frame is then reported and dropped, exactly as it was
+ * before buffering existed — the difference is that a transient reorder now
+ * survives instead of losing the child's first output.
+ */
+const ORPHAN_FRAME_TTL_MS = 5_000;
+
+/** What one attached session contributes besides its handlers. */
+export interface DshSessionOptions {
+  /** Working directory this session runs in; defaults to the process's. */
+  cwd?: string;
+  /** Route this session is pinned to; defaults to the process's. */
+  route?: DshRoute;
+  /** MCP servers Paseo handed this session. */
+  mcpServers?: Readonly<Record<string, DshMcpServer>>;
+}
+
 export interface DshProcessOptions extends DshProcessHandlers {
   cwd: string;
   route: DshRoute;
+  /**
+   * The session this process was built for.
+   *
+   * It is attached at construction, so a single-session construction (the
+   * one-shot probes, and every provider session until the process pool lands)
+   * keeps behaving exactly as before. A pooled process serves more sessions
+   * through {@link DshProcess.attachSession}; this id stays the default that
+   * the session-scoped methods fall back to when a caller names none.
+   */
   sessionId: string;
   /** Extra environment for the child; merged over the daemon's environment. */
   env?: Record<string, string>;
   /**
-   * MCP servers Paseo handed this session. DSH resolves MCP servers only at
-   * boot, so `start()` turns them into a per-process `--patch` overlay; a
-   * session with none spawns exactly as before.
+   * MCP servers Paseo handed this session — the process-level default.
+   *
+   * DSH mounts MCP servers per agent, so they are no longer a boot-time
+   * `--patch` overlay: {@link DshProcess.attachSession} takes each session's own
+   * map, and the process sends it to the bridge as a `paseo/mcp/set` frame
+   * before that session's first request. This field covers the single-session
+   * construction where there is nothing to override it with.
    */
   mcpServers?: Readonly<Record<string, DshMcpServer>>;
   /**
@@ -244,10 +321,17 @@ const MCP_CLIENT_PLUGIN = "@deepseek-ai/dsh-mcp-client";
  * Streamable-HTTP servers are proxied rather than mounted directly because a
  * server with dozens of tools costs that many schemas in every request — Paseo's
  * own server is 61 tools (~33 KB). The gateway keeps the same endpoint and token
- * flowing (they arrive through this overlay either way) while the model pays for
- * only the tools it actually discovers.
+ * flowing while the model pays for only the tools it actually discovers.
+ *
+ * The specifier is **relative to the bridge bundle**, not a package name: the
+ * gateway ships inside `dsh-paseo-bridge`, and this plugin cannot name a package
+ * it does not depend on. The bridge resolves each entry's `name` with a plain
+ * `import()`, so a relative path loads the gateway module from its own lib
+ * directory while a bare specifier still loads a profile-installed plugin. That
+ * keeps the choice of *which* plugin mounts which server here, where the
+ * translation lives, instead of hardcoding a plugin name in the bridge.
  */
-const MCP_GATEWAY_PLUGIN = "dsh-paseo-bridge/mcp-gateway";
+const MCP_GATEWAY_PLUGIN = "./mcp-gateway.js";
 
 /**
  * The stdio servers allowed to ride the gateway instead of the stock client.
@@ -432,24 +516,34 @@ function logBrowserGap(reason: string): void {
   process.stderr.write(`[deepseek-harness-native] no browser MCP server: ${reason}\n`);
 }
 
-/** One prepared `--patch` overlay and the private directory holding it. */
-interface McpPatch {
-  path: string;
-  dir: string;
+/** One plugin mount the bridge is asked to perform in a session's agent scope. */
+export interface DshMcpEntry {
+  /**
+   * Module specifier the bridge resolves with `import()`: a bare package name
+   * for a profile-installed plugin, or a path relative to the bridge bundle.
+   */
+  name: string;
+  config: Record<string, unknown>;
 }
 
 /**
- * Translate Paseo's MCP servers into patch entries.
+ * Translate Paseo's MCP servers into the entries the bridge mounts.
  *
  * Streamable-HTTP servers and the whitelisted stdio servers ride the gateway
  * (one row, three tools). Every other stdio server keeps the stock client: it was
  * configured by the user, and dropping it — or quietly demoting it to discovery
  * calls — would remove capability they asked for. Legacy SSE stays refused.
+ *
+ * These are DSH patch entries in shape (`{ name, config }`), which is what the
+ * bridge's `paseo/mcp/set` consumes. Keeping that shape means the bridge only
+ * has to call `ctx.plugin(await import(entry.name), entry.config)` and never
+ * learns which plugin is the gateway — the whitelist and the native/refused
+ * decision stay here, in the layer that owns the translation.
  */
 function mcpEntries(
   servers: Readonly<Record<string, DshMcpServer>>,
-): Record<string, unknown>[] {
-  const entries: Record<string, unknown>[] = [];
+): DshMcpEntry[] {
+  const entries: DshMcpEntry[] = [];
   const proxied: Record<string, GatewayServerConfig> = {};
   for (const [name, server] of Object.entries(servers)) {
     if (!MCP_SERVER_NAME.test(name)) {
@@ -470,11 +564,11 @@ function mcpEntries(
         };
         continue;
       }
-      // `failOnStartupError` is what keeps a broken connection loud: DSH still boots
-      // and the entry is reported as "did not activate" on stderr, which this
-      // process forwards to the log, instead of the model silently getting no tools.
+      // `failOnStartupError` is what keeps a broken connection loud: the mount
+      // still succeeds and the entry is reported as "did not activate" on stderr,
+      // which this process forwards to the log, instead of the model silently
+      // getting no tools.
       entries.push({
-        id: `mcp-${name}`,
         name: MCP_CLIENT_PLUGIN,
         config: {
           serverName: name,
@@ -502,24 +596,13 @@ function mcpEntries(
     };
   }
   if (Object.keys(proxied).length > 0) {
-    entries.push({
-      id: "paseo-mcp-gateway",
-      name: MCP_GATEWAY_PLUGIN,
-      inject: ["tools"],
-      config: { servers: proxied },
-    });
+    entries.push({ name: MCP_GATEWAY_PLUGIN, config: { servers: proxied } });
   }
   return entries;
 }
 
 /**
- * Write the `--patch` overlay that mounts Paseo's MCP servers into this DSH
- * process, or `undefined` when there is nothing to mount.
- *
- * The overlay cannot live in the shared profile: the server Paseo injects
- * carries this agent's id in its URL, so it differs per session. The file also
- * carries the MCP auth token, so it is written 0600 inside a fresh 0700
- * directory and removed together with the process.
+ * Translate one session's MCP servers into bridge entries, merging the browser.
  *
  * The browser bridge is merged in here rather than by Paseo: the Server Browser
  * plugin hands providers no MCP server at all (its bridge is started by the
@@ -530,62 +613,110 @@ function mcpEntries(
  *
  * @param servers - the MCP servers Paseo attached to this session, if any.
  * @param cwd - the session's working directory; identifies the browser workspace.
- * @returns the written overlay, or `undefined` when no server could be mounted.
+ * @returns the entries to mount, empty when this session has none.
+ * @throws when a server cannot be represented in DSH (see {@link mcpEntries}).
  */
-function prepareMcpPatch(
+function sessionMcpEntries(
   servers: Readonly<Record<string, DshMcpServer>> | undefined,
   cwd: string,
-): McpPatch | undefined {
+): DshMcpEntry[] {
   const merged: Record<string, DshMcpServer> = { ...(servers ?? {}) };
   if (!Object.hasOwn(merged, BROWSER_MCP_SERVER)) {
     const browser = browserMcpServer(cwd);
     if (browser !== undefined) merged[BROWSER_MCP_SERVER] = browser;
   }
-  if (Object.keys(merged).length === 0) return undefined;
-  // Translate and validate everything before touching the filesystem, so a
-  // rejected server leaves no directory behind.
-  const entries = mcpEntries(merged);
-  const dir = mkdtempSync(join(tmpdir(), "dsh-paseo-mcp-"));
-  const path = join(dir, "mcp-patch.json");
-  // JSON is a YAML subset and DSH parses the patch as YAML, so emitting JSON is
-  // how a URL or token containing YAML-significant characters survives intact.
-  writeFileSync(path, `${JSON.stringify([{ insert: entries }], null, 2)}\n`, { mode: 0o600 });
-  return { path, dir };
+  if (Object.keys(merged).length === 0) return [];
+  return mcpEntries(merged);
 }
 
 export class DshProcess {
   readonly #options: DshProcessOptions;
   /**
-   * The handlers this process reports to. Mutable on purpose: a rewind's reload
-   * parks the idle process and a fresh provider session adopts it, so the same
-   * child must start reporting to a new session without being killed and
-   * respawned (that spawn is the 1.5–2.7 s half of the refresh latency).
+   * The handlers that belong to the child itself rather than to any one session:
+   * stderr lines and JSON-RPC protocol failures. They stay process-wide so a
+   * session cannot silence diagnostics for the sessions sharing its process.
+   * Mutable on purpose: {@link setHandlers} re-points a parked process.
    */
-  #handlers: DshProcessHandlers;
+  #processHandlers: { onLog(line: string): void; onProtocolError(message: string): void };
+  /**
+   * One handler set per attached session, keyed by DSH's own session id.
+   *
+   * A map rather than a single object because one child serves many Paseo
+   * sessions: each session's events, questions and exit must reach its own
+   * provider session and no other.
+   */
+  readonly #sessionHandlers = new Map<string, DshSessionHandlers>();
+  /** Per-session cwd/route/MCP overrides; absent fields fall back to the process. */
+  readonly #sessionOptions = new Map<string, DshSessionOptions>();
+  /** Sessions that have completed their own `initialize` in this child. */
+  readonly #initializedSessions = new Set<string>();
+  /** Sessions whose MCP entries have been handed to the bridge. */
+  readonly #mcpSent = new Set<string>();
+  /** The entries each session mounts, translated once (translation may throw). */
+  readonly #sessionMcp = new Map<string, DshMcpEntry[]>();
+  /** Memoized per-session preparation, so concurrent callers share one attempt. */
+  readonly #readyTasks = new Map<string, Promise<void>>();
+  /**
+   * Child session id -> its direct parent, learned from `session.child-opened`.
+   *
+   * The bridge reports a subagent's frames under the *child's* own session id,
+   * so routing them to the session that owns the conversation needs this edge.
+   * A parent may itself be a child (a grandchild), which is why resolution walks
+   * the chain instead of reading one hop.
+   */
+  readonly #childParent = new Map<string, string>();
+  /**
+   * Frames whose producing session has no resolvable owner *yet*.
+   *
+   * The bridge does not guarantee that an ancestor's `session.child-opened`
+   * arrives before a descendant's own frames: `observeChildSession`
+   * (`dsh-bridge/lib/server.js:363`) only registers a child once its durable
+   * header is materialized, and an unregistered child's frames take the
+   * pass-through branch (`server.js:320`) instead of being held. A grandchild can
+   * therefore reach this process before its parent has been announced, and
+   * `#rootOf` walks `child -> parent` to a dead end.
+   *
+   * Dropping those frames loses the child's earliest output and its terminal
+   * `turn/end` (the turn then never closes). They are held instead, per producing
+   * session, and replayed as soon as an edge makes them routable. Bounded in both
+   * size and age: a frame whose lineage never arrives is reported and dropped
+   * rather than buffered for the life of the process.
+   */
+  readonly #orphanFrames = new Map<string, { frames: OrphanFrame[]; since: number }>();
+  /** Timers that report and drop one orphan bucket that never became routable. */
+  readonly #orphanTimers = new Map<string, ReturnType<typeof setTimeout>>();
   #child: ChildProcessWithoutNullStreams | undefined;
   #buffer = "";
   #pending = new Map<number, Pending>();
   #nextId = 1;
   #closed = false;
   #initializeTask: Promise<void> | undefined;
-  #patch: McpPatch | undefined;
   /** Resolved once the child is gone; created lazily by {@link waitForExit}. */
   #exited: Promise<void> | undefined;
   #resolveExited: (() => void) | undefined;
 
   constructor(options: DshProcessOptions) {
     this.#options = options;
-    this.#handlers = {
+    this.#processHandlers = {
+      onLog: (line) => options.onLog(line),
+      onProtocolError: (message) => options.onProtocolError(message),
+    };
+    // The session this process was built for is attached immediately, so a
+    // single-session construction behaves exactly as it did before the split.
+    this.#sessionOptions.set(options.sessionId, {
+      cwd: options.cwd,
+      route: options.route,
+      ...(options.mcpServers === undefined ? {} : { mcpServers: options.mcpServers }),
+    });
+    this.#sessionHandlers.set(options.sessionId, {
       onEvent: (payload) => options.onEvent(payload),
       onStatus: (status, sessionId) => options.onStatus(status, sessionId),
       onQuestion: (request, sessionId) => options.onQuestion(request, sessionId),
       ...(options.onChildOpened === undefined
         ? {}
         : { onChildOpened: (payload: DshChildOpened) => options.onChildOpened?.(payload) }),
-      onLog: (line) => options.onLog(line),
       onExit: (code, signal) => options.onExit(code, signal),
-      onProtocolError: (message) => options.onProtocolError(message),
-    };
+    });
   }
 
   /** Whether the child is still alive and usable. */
@@ -596,24 +727,128 @@ export class DshProcess {
   /**
    * Point this process at a different set of handlers.
    *
-   * Used when an idle process is parked and later adopted by a new provider
-   * session: the child keeps running, but its events/questions/exit now belong
-   * to the new session (or to a silent set while nobody owns it).
+   * Kept for the warm pool: an idle process is parked and a fresh provider
+   * session adopts it, so the same child must start reporting to a new session
+   * without being killed and respawned (that spawn is the 1.5–2.7 s half of the
+   * refresh latency). It re-points the session this process was built for, and
+   * the process-level log/protocol sinks, which is the whole of its old meaning
+   * when a process serves one session.
+   *
+   * A pooled process must use {@link attachSession} / {@link detachSession}
+   * instead: re-pointing here would move the wrong conversation's events.
    *
    * @param handlers - the new handler set.
    */
   setHandlers(handlers: DshProcessHandlers): void {
-    this.#handlers = {
+    this.#processHandlers = {
+      onLog: (line) => handlers.onLog(line),
+      onProtocolError: (message) => handlers.onProtocolError(message),
+    };
+    this.#sessionHandlers.set(this.#options.sessionId, {
       onEvent: (payload) => handlers.onEvent(payload),
       onStatus: (status, sessionId) => handlers.onStatus(status, sessionId),
       onQuestion: (request, sessionId) => handlers.onQuestion(request, sessionId),
       ...(handlers.onChildOpened === undefined
         ? {}
         : { onChildOpened: (payload: DshChildOpened) => handlers.onChildOpened?.(payload) }),
-      onLog: (line) => handlers.onLog(line),
       onExit: (code, signal) => handlers.onExit(code, signal),
-      onProtocolError: (message) => handlers.onProtocolError(message),
-    };
+    });
+  }
+
+  /**
+   * Attach one more session to this process.
+   *
+   * The session gets its own handlers and, optionally, its own working
+   * directory, route and MCP servers; anything omitted falls back to what this
+   * process was constructed with. The session is initialized under its own id
+   * before this resolves, so the caller can prompt immediately afterwards.
+   *
+   * @param sessionId - DSH's own session id; the key every request and frame uses.
+   * @param handlers - where this session's events, questions and exit go.
+   * @param options - this session's cwd/route/MCP servers, if they differ.
+   * @throws when one of the session's MCP servers cannot be mounted in DSH.
+   */
+  async attachSession(
+    sessionId: string,
+    handlers: DshSessionHandlers,
+    options: DshSessionOptions = {},
+  ): Promise<void> {
+    if (sessionId === "") throw new Error("attachSession requires a session id");
+    this.#sessionHandlers.set(sessionId, handlers);
+    const merged: DshSessionOptions = { ...(this.#sessionOptions.get(sessionId) ?? {}) };
+    if (options.cwd !== undefined) merged.cwd = options.cwd;
+    if (options.route !== undefined) merged.route = options.route;
+    if (options.mcpServers !== undefined) merged.mcpServers = options.mcpServers;
+    this.#sessionOptions.set(sessionId, merged);
+    // Translate this session's MCP servers now, so a server DSH cannot mount
+    // fails at attach — where the caller reports it — instead of at the first
+    // prompt of a conversation the user already opened.
+    this.#mcpEntriesFor(sessionId);
+    // Attaching implies the session is usable, so the child must exist first.
+    // `start()` is idempotent, so an already-running process pays nothing here.
+    await this.start();
+    await this.#ensureSessionReady(sessionId);
+  }
+
+  /**
+   * Stop routing this session's frames to its handlers and forget its state.
+   *
+   * The child keeps running for every other session it serves. Everything about
+   * the session is dropped, including the "already initialized" flag: a later
+   * {@link attachSession} for the same id re-initializes it, which is the only
+   * way to be sure the bridge still holds that session's route.
+   *
+   * @param sessionId - the session to detach; unknown ids are ignored.
+   */
+  detachSession(sessionId: string): void {
+    if (!this.#sessionHandlers.delete(sessionId)) return;
+    this.#sessionOptions.delete(sessionId);
+    this.#sessionMcp.delete(sessionId);
+    this.#initializedSessions.delete(sessionId);
+    this.#mcpSent.delete(sessionId);
+    this.#readyTasks.delete(sessionId);
+    this.#forgetChildrenOf(sessionId);
+  }
+
+  /**
+   * Detach a session and tell the bridge to drop its state too.
+   *
+   * The bridge keeps ten tables keyed by session id (`sessions`, `controls`,
+   * `assistantStreams`, `pendingPresets`, `pendingPlanMode`, `pendingMcpServers`,
+   * `children`, `childAnchors`, `revertInflight`, `snapshotOwners`); they only
+   * shrink when it is told. It deliberately keeps `sessionCwd`, `sessionRoutes`
+   * and `initializedSessions`: a closed session's agent can be resumed inside
+   * this same process, and clearing its route while leaving it "initialized"
+   * would make that resume silently compose another session's defaults. Those
+   * three are the bridge's to keep, so nothing here tries to clear them.
+   *
+   * A failure is logged rather than thrown: this runs on the teardown path,
+   * where the process may already be dying, and losing a cleanup frame must not
+   * turn a normal close into an error the user sees. The log line is what makes
+   * it diagnosable instead of silent.
+   *
+   * @param sessionId - the session to close; unknown ids are ignored.
+   */
+  async closeSession(sessionId: string): Promise<void> {
+    if (!this.#sessionHandlers.has(sessionId)) return;
+    this.detachSession(sessionId);
+    if (this.#closed || this.#child === undefined) return;
+    try {
+      const result = (await this.#request("session/close", { sessionId })) as
+        | { closed?: unknown }
+        | undefined;
+      // `{ closed: false }` means the bridge never knew the session, which is a
+      // legitimate outcome of closing something that was attached but never
+      // prompted. Anything else is worth a line, because a table that failed to
+      // shrink is how a long-lived process slowly leaks sessions.
+      if (result?.closed !== true) {
+        this.#processHandlers.onLog(`session/close for ${sessionId} reported nothing closed`);
+      }
+    } catch (error) {
+      this.#processHandlers.onLog(
+        `session/close failed for ${sessionId}: ${toError(error, "close failed").message}`,
+      );
+    }
   }
 
   /** Spawn the child and complete `initialize`. Idempotent. */
@@ -623,15 +858,15 @@ export class DshProcess {
   }
 
   async #start(): Promise<void> {
-    // A rejected MCP server throws here, before any process exists: `start()`
-    // rejects, the provider reports it, and nothing is left on disk.
-    this.#patch = prepareMcpPatch(this.#options.mcpServers, this.#options.cwd);
+    // Translate the construction session's MCP servers before spawning: a server
+    // DSH cannot mount must fail the start — and be reported by the provider —
+    // rather than surface later at this session's first prompt.
+    this.#mcpEntriesFor(this.#options.sessionId);
     // The profile is resolved from the environment the child will actually get,
     // not the daemon's: a session may override `DSH_PASEO_PROFILE`, and asking DSH
     // for a profile the session did not provision is a failure with no local
     // explanation. `profileName` is the single definition of that lookup.
     const args = ["--profile", profileName({ ...process.env, ...this.#options.env })];
-    if (this.#patch !== undefined) args.push("--patch", this.#patch.path);
     const child = spawn(resolveBinary(), args, {
       cwd: this.#options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
@@ -644,33 +879,177 @@ export class DshProcess {
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
       for (const line of chunk.split("\n")) {
-        if (line.trim() !== "") this.#handlers.onLog(line);
+        if (line.trim() !== "") this.#processHandlers.onLog(line);
       }
     });
     child.on("error", (error) => {
-      this.#cleanupPatch();
       this.#failAll(error);
-      this.#handlers.onProtocolError(error.message);
+      this.#processHandlers.onProtocolError(error.message);
       this.#markExited();
     });
     child.on("exit", (code, signal) => {
-      this.#cleanupPatch();
       this.#closed = true;
       this.#failAll(new Error("DeepSeek Harness process ended"));
-      this.#handlers.onExit(code, signal);
+      this.#exitAll(code, signal);
       this.#markExited();
     });
 
     if (this.#options.initializeRoute === false) return;
 
+    await this.#ensureSessionReady(this.#options.sessionId);
+  }
+
+  /**
+   * Pin one session's cwd and route in the bridge.
+   *
+   * The id always travels: it is what makes the bridge store the values against
+   * that session instead of as this process's defaults, and what admits the
+   * session to `prompt` at all. Idempotent.
+   */
+  async #initializeSession(sessionId: string): Promise<void> {
+    if (this.#initializedSessions.has(sessionId)) return;
+    const options = this.#sessionOptions.get(sessionId) ?? {};
+    const cwd = options.cwd ?? this.#options.cwd;
+    const route = options.route ?? this.#options.route;
     await this.#request("initialize", {
-      cwd: this.#options.cwd,
-      provider: this.#options.route.provider,
-      model: this.#options.route.model,
-      ...(this.#options.route.reasoningEffort === undefined
-        ? {}
-        : { reasoningEffort: this.#options.route.reasoningEffort }),
+      cwd,
+      provider: route.provider,
+      model: route.model,
+      ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
+      sessionId,
     });
+    this.#initializedSessions.add(sessionId);
+  }
+  /**
+   * Make one session ready to be used: initialized, with its MCP servers queued.
+   *
+   * Callers reach this through {@link #ensureSessionReady} rather than by
+   * remembering the two frames themselves. The bridge rejects a prompt from a
+   * session it has never initialized, so "every session initialized itself" is
+   * an invariant this class maintains for its callers instead of trusting every
+   * path to do it — a missed path would otherwise surface as a protocol error
+   * that reads like a bridge bug.
+   */
+  #ensureSessionReady(sessionId: string): Promise<void> {
+    // A process built with `initializeRoute: false` exists to read the catalog or
+    // list stored sessions, never to run a turn. Pinning a route there would make
+    // a bad route hide the model list the read is meant to produce, which is the
+    // whole reason that flag exists.
+    if (this.#options.initializeRoute === false) return Promise.resolve();
+    const existing = this.#readyTasks.get(sessionId);
+    if (existing !== undefined) return existing;
+    const task = this.#prepareSession(sessionId);
+    this.#readyTasks.set(sessionId, task);
+    // A failed preparation must not be memoized: the next request retries
+    // instead of inheriting a rejection nobody awaited.
+    task.catch(() => {
+      if (this.#readyTasks.get(sessionId) === task) this.#readyTasks.delete(sessionId);
+    });
+    return task;
+  }
+
+  async #prepareSession(sessionId: string): Promise<void> {
+    await this.#initializeSession(sessionId);
+    await this.#sendSessionMcp(sessionId);
+  }
+
+  /**
+   * Hand this session's MCP entries to the bridge, once.
+   *
+   * DSH mounts MCP servers per agent, so they cannot ride a boot-time `--patch`
+   * overlay any more: the bridge queues them and mounts them in that session's
+   * agent scope. The frame must arrive **after** the session's `initialize` and
+   * **before** its first prompt — that window is the only one where the agent
+   * does not exist yet, and entries that arrive later are deferred to the next
+   * resume, which for a fresh session may never come.
+   *
+   * An empty list is still sent: it is the bridge's way of being told "this
+   * session has none", so a re-attach that dropped servers cannot inherit the
+   * previous ones.
+   */
+  async #sendSessionMcp(sessionId: string): Promise<void> {
+    if (this.#mcpSent.has(sessionId)) return;
+    const entries = this.#mcpEntriesFor(sessionId);
+    const result = (await this.#request("paseo/mcp/set", { sessionId, entries })) as
+      | { accepted?: unknown; entries?: unknown; mounted?: unknown }
+      | undefined;
+    this.#mcpSent.add(sessionId);
+    // `mounted: false` is a legal reply, not an error: the bridge is saying the
+    // session's agent already exists, so these entries will only take effect on
+    // its next resume. On the documented order (initialize -> set -> prompt) that
+    // cannot happen, so it is reported — a silently deferred MCP mount would show
+    // up as "the model has no Paseo tools" with nothing in the log to explain it.
+    if (result?.mounted === false) {
+      this.#processHandlers.onLog(
+        `paseo/mcp/set for ${sessionId} arrived after its agent was created; `
+          + `${entries.length} entr(y/ies) will be mounted on the next resume`,
+      );
+    }
+  }
+
+  /** This session's translated MCP entries, computed once. */
+  #mcpEntriesFor(sessionId: string): DshMcpEntry[] {
+    const cached = this.#sessionMcp.get(sessionId);
+    if (cached !== undefined) return cached;
+    const options = this.#sessionOptions.get(sessionId) ?? {};
+    const entries = sessionMcpEntries(options.mcpServers, options.cwd ?? this.#options.cwd);
+    this.#sessionMcp.set(sessionId, entries);
+    return entries;
+  }
+
+  /**
+   * The attached session that owns a frame's session id.
+   *
+   * A frame's id is the session that *produced* it, which for a native subagent
+   * is the child, not the conversation the user is looking at. Resolution walks
+   * the child -> parent chain until it reaches an attached session; the `seen`
+   * guard bounds a malformed or cyclic chain instead of looping forever.
+   *
+   * @returns the owning session's id, or `undefined` when nothing owns it.
+   */
+  #rootOf(sessionId: string): string | undefined {
+    if (sessionId === "") return undefined;
+    let current: string | undefined = sessionId;
+    const seen = new Set<string>();
+    while (current !== undefined && current !== "" && !seen.has(current)) {
+      if (this.#sessionHandlers.has(current)) return current;
+      seen.add(current);
+      current = this.#childParent.get(current);
+    }
+    return undefined;
+  }
+
+  /** Drop every child->parent edge that pointed into a detached session. */
+  #forgetChildrenOf(root: string): void {
+    const removed = new Set<string>([root]);
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const [child, parent] of this.#childParent) {
+        if (removed.has(parent) && !removed.has(child)) {
+          removed.add(child);
+          grew = true;
+        }
+      }
+    }
+    for (const id of removed) {
+      if (id !== root) this.#childParent.delete(id);
+    }
+  }
+
+  /** Tell every attached session the child is gone. */
+  #exitAll(code: number | null, signal: string | null): void {
+    // The child dying ends every conversation it served, so all of them hear it
+    // — not just whichever handler happened to be assigned last.
+    for (const [sessionId, handlers] of [...this.#sessionHandlers]) {
+      try {
+        handlers.onExit(code, signal);
+      } catch (error) {
+        this.#processHandlers.onLog(
+          `session ${sessionId} exit handler failed: ${toError(error, "exit handler failed").message}`,
+        );
+      }
+    }
   }
 
   /** Read the runtime's provider/model catalog without creating an agent. */
@@ -678,20 +1057,34 @@ export class DshProcess {
     return (await this.#request("paseo/catalog", {}, 60000)) as DshCatalog;
   }
 
-  /** List the session's registered commands and user-invocable skills. */
-  async commands(): Promise<DshCommand[]> {
+  /**
+   * List the session's registered commands and user-invocable skills.
+   *
+   * @param sessionId - which session; defaults to the one this process was built for.
+   */
+  async commands(sessionId: string): Promise<DshCommand[]> {
+    await this.#ensureSessionReady(sessionId);
     const result = (await this.#request(
       "paseo/commands",
-      { sessionId: this.#options.sessionId },
+      { sessionId },
       60000,
     )) as { commands?: DshCommand[] };
     return result.commands ?? [];
   }
 
-  /** Execute one registered slash command (skills are sent as text instead). */
-  async runCommand(name: string, args: string): Promise<{ kind: "success" | "error"; text?: string }> {
+  /**
+   * Execute one registered slash command (skills are sent as text instead).
+   *
+   * @param sessionId - which session; defaults to the one this process was built for.
+   */
+  async runCommand(
+    sessionId: string,
+    name: string,
+    args: string,
+  ): Promise<{ kind: "success" | "error"; text?: string }> {
+    await this.#ensureSessionReady(sessionId);
     return (await this.#request("paseo/command/run", {
-      sessionId: this.#options.sessionId,
+      sessionId,
       name,
       arguments: args,
     })) as { kind: "success" | "error"; text?: string };
@@ -704,14 +1097,17 @@ export class DshProcess {
    * the key in DSH), so a deployment that renames its presets — including into
    * another language — sees its label rather than the raw key. `value` stays the
    * key `/permission` accepts.
+   *
+   * @param sessionId - which session; defaults to the one this process was built for.
    */
-  async permission(): Promise<{
+  async permission(sessionId: string): Promise<{
     available: boolean;
     current: string | null;
     presets: DshPermissionPreset[];
   }> {
+    await this.#ensureSessionReady(sessionId);
     return (await this.#request("paseo/permission", {
-      sessionId: this.#options.sessionId,
+      sessionId,
     })) as { available: boolean; current: string | null; presets: DshPermissionPreset[] };
   }
 
@@ -719,10 +1115,13 @@ export class DshProcess {
    * Read the session's current context occupancy from the runtime's own token
    * meter. Absent fields mean the runtime does not know them yet; they are
    * never defaulted here.
+   *
+   * @param sessionId - which session; defaults to the one this process was built for.
    */
-  async usage(): Promise<DshUsage> {
+  async usage(sessionId: string): Promise<DshUsage> {
+    await this.#ensureSessionReady(sessionId);
     return (await this.#request("paseo/usage", {
-      sessionId: this.#options.sessionId,
+      sessionId,
     })) as DshUsage;
   }
 
@@ -740,15 +1139,24 @@ export class DshProcess {
    * @param text - prompt text, used when `contentBlocks` is omitted.
    * @param contentBlocks - pre-built content blocks (text and/or attachments).
    * @param delivery - `steer` injects into the running turn, `auto` opens the next one.
+   * @param sessionId - which session; defaults to the one this process was built for.
    * @returns the message id and the message's DSH source kind when reported.
    */
   async prompt(
+    sessionId: string,
     text: string,
     contentBlocks?: unknown[],
     delivery?: "auto" | "steer",
   ): Promise<{ messageId?: string; sourceKind?: string }> {
+    // Every session must have initialized the bridge under its own id before it
+    // can prompt: `initialize` is what pins that session's cwd and route, and the
+    // bridge admits a prompt only from a session it has seen. A path that opened
+    // a session without going through `attachSession` would otherwise fail at the
+    // first prompt with an error that reads like a protocol bug, so the invariant
+    // is maintained here rather than trusted to every caller.
+    await this.#ensureSessionReady(sessionId);
     const result = (await this.#request("session/prompt", {
-      sessionId: this.#options.sessionId,
+      sessionId,
       contentBlocks: contentBlocks ?? [{ type: "text", text }],
       ...(delivery === undefined ? {} : { delivery }),
     })) as { messageId?: unknown; sourceKind?: unknown } | undefined;
@@ -765,10 +1173,13 @@ export class DshProcess {
    * this non-command write keeps the timeline free of a `/permission` row the
    * user never typed; the command path remains only for DSH's own `/permission`
    * slash usage.
+   *
+   * @param sessionId - which session; defaults to the one this process was built for.
    */
-  async setPermission(name: string): Promise<{ current: string | null }> {
+  async setPermission(sessionId: string, name: string): Promise<{ current: string | null }> {
+    await this.#ensureSessionReady(sessionId);
     return (await this.#request("paseo/permission/set", {
-      sessionId: this.#options.sessionId,
+      sessionId,
       preset: name,
     })) as { current: string | null };
   }
@@ -782,57 +1193,92 @@ export class DshProcess {
    * (already rewound, or compacted away). With `both` it also restores the files
    * the agent's editing tools touched since that message, and reports the outcome
    * so the provider can surface a partial failure instead of pretending.
+   *
+   * @param sessionId - which session; defaults to the one this process was built for.
    */
-  async revert(token: unknown, scope: "conversation" | "files" | "both"): Promise<DshRevertResult | undefined> {
+  async revert(
+    sessionId: string,
+    token: unknown,
+    scope: "conversation" | "files" | "both",
+  ): Promise<DshRevertResult | undefined> {
+    await this.#ensureSessionReady(sessionId);
     return (await this.#request(
       "paseo/revert",
-      { sessionId: this.#options.sessionId, token, scope },
+      { sessionId, token, scope },
       120000,
     )) as DshRevertResult | undefined;
   }
 
-  /** Cancel the running turn while keeping the session usable afterwards. */
-  async cancel(): Promise<void> {
-    await this.#request("session/cancel", { sessionId: this.#options.sessionId });
+  /**
+   * Cancel the running turn while keeping the session usable afterwards.
+   *
+   * @param sessionId - which session; defaults to the one this process was built for.
+   */
+  async cancel(sessionId: string): Promise<void> {
+    await this.#ensureSessionReady(sessionId);
+    await this.#request("session/cancel", { sessionId });
   }
 
-  /** Select plan mode and return the committed state. */
-  async setPlan(active: boolean): Promise<{ active: boolean; pending: boolean; outcome?: string }> {
+  /**
+   * Select plan mode and return the committed state.
+   *
+   * @param sessionId - which session; defaults to the one this process was built for.
+   */
+  async setPlan(
+    sessionId: string,
+    active: boolean,
+  ): Promise<{ active: boolean; pending: boolean; outcome?: string }> {
+    await this.#ensureSessionReady(sessionId);
     return (await this.#request("paseo/plan/set", {
-      sessionId: this.#options.sessionId,
+      sessionId,
       active,
     })) as { active: boolean; pending: boolean; outcome?: string };
   }
 
-  /** Read the committed plan state. */
-  async getPlan(): Promise<{ active: boolean; pending: boolean; available: boolean }> {
+  /**
+   * Read the committed plan state.
+   *
+   * @param sessionId - which session; defaults to the one this process was built for.
+   */
+  async getPlan(sessionId: string): Promise<{ active: boolean; pending: boolean; available: boolean }> {
+    await this.#ensureSessionReady(sessionId);
     return (await this.#request("paseo/plan/get", {
-      sessionId: this.#options.sessionId,
+      sessionId,
     })) as { active: boolean; pending: boolean; available: boolean };
   }
 
-  /** Switch model and/or reasoning effort on the live agent. */
-  async setConfig(changes: {
+  /**
+   * Switch model and/or reasoning effort on the live agent.
+   *
+   * @param sessionId - which session; defaults to the one this process was built for.
+   */
+  async setConfig(sessionId: string, changes: {
     model?: string;
     provider?: string;
     reasoningEffort?: string | null;
     preset?: string;
   }): Promise<{ provider: string; model: string; reasoningEffort: string | null; preset?: string | null }> {
+    await this.#ensureSessionReady(sessionId);
     return (await this.#request("paseo/config/set", {
-      sessionId: this.#options.sessionId,
+      sessionId,
       ...changes,
     })) as { provider: string; model: string; reasoningEffort: string | null; preset?: string | null };
   }
 
-  /** List the profile's agent presets and the one this session runs. */
-  async presets(): Promise<{
+  /**
+   * List the profile's agent presets and the one this session runs.
+   *
+   * @param sessionId - which session; defaults to the one this process was built for.
+   */
+  async presets(sessionId: string): Promise<{
     available: boolean;
     presets: Array<{ id: string; name?: string; description?: string; broken?: string }>;
     current: string | null;
     default: string | null;
   }> {
+    await this.#ensureSessionReady(sessionId);
     return (await this.#request("paseo/presets", {
-      sessionId: this.#options.sessionId,
+      sessionId,
     })) as {
       available: boolean;
       presets: Array<{ id: string; name?: string; description?: string; broken?: string }>;
@@ -893,7 +1339,7 @@ export class DshProcess {
    * a reopen whose replay failed rendered a blank conversation with no error,
    * which reads to the user as "my history is gone".
    */
-  async history(sessionId = this.#options.sessionId): Promise<{
+  async history(sessionId: string): Promise<{
     events: Array<{ type: string; seq?: number; time?: number; data: unknown }>;
     /** Leading events inherited from a fork parent; own history starts here. */
     inheritedEventCount: number;
@@ -952,16 +1398,19 @@ export class DshProcess {
    * without loading or resuming any child agent. `available: false` means the
    * runtime composes no subagent service; a failed read carries `error`, and an
    * unreadable branch is reported in `diagnostics` — never a silent empty list.
+   *
+   * @param sessionId - which session; defaults to the one this process was built for.
    */
-  async subagents(): Promise<{
+  async subagents(sessionId: string): Promise<{
     available: boolean;
     subagents: Array<{ sessionId: string; parentSessionId: string; mode?: string; label?: string; archived?: boolean }>;
     diagnostics?: unknown[];
     error?: { message: string };
   }> {
+    await this.#ensureSessionReady(sessionId);
     const result = (await this.#request(
       "paseo/subagents",
-      { sessionId: this.#options.sessionId },
+      { sessionId },
       60000,
     )) as {
       available?: boolean;
@@ -969,9 +1418,31 @@ export class DshProcess {
       diagnostics?: unknown[];
       error?: { message?: string };
     };
+    const subagents = result.subagents ?? [];
+    // The listing is read from DSH's own durable headers, so it names every
+    // child's direct parent — including children whose `session.child-opened` this
+    // process never received (a reopen, or a child announced to a previous
+    // provider session). Recording those edges here is what lets their frames be
+    // routed at all: without an edge `#rootOf` walks `child -> parent` to a dead
+    // end, and only a `child-opened` would ever add one. A frame that arrived
+    // before this call resolving is already held by `#holdOrphan`, so the listing
+    // is followed by a replay — the hold and the catalog are two halves of the
+    // same recovery.
+    //
+    // An existing edge is never overwritten: a notice names the parent DSH has
+    // materialized, which stays authoritative for a re-parented child.
+    for (const child of subagents) {
+      if (typeof child.parentSessionId !== "string" || child.parentSessionId === "") continue;
+      if (!this.#childParent.has(child.sessionId)) {
+        this.#childParent.set(child.sessionId, child.parentSessionId);
+      }
+    }
+    // Run after the edges exist, so held frames for these children become
+    // routable now instead of waiting out the orphan TTL.
+    if (subagents.length > 0) this.#replayOrphans();
     return {
       available: result.available === true,
-      subagents: result.subagents ?? [],
+      subagents,
       ...(result.diagnostics === undefined ? {} : { diagnostics: result.diagnostics }),
       ...(result.error === undefined ? {} : { error: { message: result.error.message ?? "subagent listing failed" } }),
     };
@@ -991,7 +1462,6 @@ export class DshProcess {
   /** Terminate the child without a protocol shutdown. */
   kill(): void {
     this.#closed = true;
-    this.#cleanupPatch();
     this.#child?.kill("SIGTERM");
     const child = this.#child;
     setTimeout(() => {
@@ -1070,7 +1540,7 @@ export class DshProcess {
     try {
       this.#child?.stdin.write(`${JSON.stringify(frame)}\n`);
     } catch (error) {
-      this.#handlers.onProtocolError(toError(error, "failed to write to the bridge").message);
+      this.#processHandlers.onProtocolError(toError(error, "failed to write to the bridge").message);
     }
   }
 
@@ -1084,28 +1554,69 @@ export class DshProcess {
       try {
         frame = JSON.parse(line) as Record<string, unknown>;
       } catch {
-        this.#handlers.onLog(line);
+        this.#processHandlers.onLog(line);
         continue;
       }
       void this.#dispatch(frame);
     }
   }
 
+  /**
+   * Route one bridge frame to the session that owns it.
+   *
+   * The bridge names a producing session on every notification that has one, and
+   * that id is the *child's* for a subagent — {@link #rootOf} walks up to the
+   * conversation the user is looking at. A frame whose owner cannot be found is
+   * reported and dropped: it belongs to a session this process does not serve
+   * (a stale child, or one whose close raced the frame), and guessing an owner
+   * would put one conversation's events on another's timeline.
+   *
+   * Frames without a session id are process-level: an `initialize` reply, or any
+   * other JSON-RPC response, is matched to its pending request by id.
+   */
   async #dispatch(frame: Record<string, unknown>): Promise<void> {
     const method = typeof frame.method === "string" ? frame.method : undefined;
     const id = frame.id;
+    const params = (frame.params ?? {}) as {
+      sessionId?: unknown;
+      status?: unknown;
+      [key: string]: unknown;
+    };
+    const producer = typeof params.sessionId === "string" ? params.sessionId : undefined;
+
+    if (method === "session.child-opened") {
+      // Registered before anything else: the parent edge is what makes the
+      // child's own frames routable.
+      const parent = typeof params.parentSessionId === "string" ? params.parentSessionId : undefined;
+      if (producer !== undefined && parent !== undefined && producer !== "") {
+        this.#childParent.set(producer, parent);
+      }
+    }
 
     if (method === "paseo/question" && id !== undefined) {
+      const owner = producer === undefined ? undefined : this.#rootOf(producer);
+      if (owner === undefined) {
+        this.#reportUnroutable(method, producer);
+        // The bridge is blocked awaiting this answer. Failing the request is what
+        // lets the model's question tool finish; silence would hang the turn.
+        this.#send({
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32000, message: `no attached session for ${producer ?? "an unidentified session"}` },
+        });
+        return;
+      }
       try {
-        const params = (frame.params ?? {}) as DshQuestionRequest;
-        const answer = await this.#handlers.onQuestion(
+        const handlers = this.#sessionHandlers.get(owner);
+        const request = params as unknown as DshQuestionRequest;
+        const answer = await handlers?.onQuestion(
           {
-            callId: params.callId ?? null,
-            timed: params.timed === true,
-            questions: params.questions ?? [],
-            ...(typeof params.sessionId === "string" ? { sessionId: params.sessionId } : {}),
+            callId: request.callId ?? null,
+            timed: request.timed === true,
+            questions: request.questions ?? [],
+            ...(typeof request.sessionId === "string" ? { sessionId: request.sessionId } : {}),
           },
-          typeof params.sessionId === "string" ? params.sessionId : "",
+          typeof request.sessionId === "string" ? request.sessionId : "",
         );
         this.#send({ jsonrpc: "2.0", id, result: answer });
       } catch (error) {
@@ -1119,19 +1630,46 @@ export class DshProcess {
     }
 
     if (method === "session.event") {
-      this.#handlers.onEvent(frame.params as DshSessionEvent);
+      const owner = producer === undefined ? undefined : this.#rootOf(producer);
+      const handlers = owner === undefined ? undefined : this.#sessionHandlers.get(owner);
+      if (handlers === undefined) {
+        this.#holdOrphan(producer, method, { kind: "event", params: params as Record<string, unknown> });
+        return;
+      }
+      handlers.onEvent(frame.params as DshSessionEvent);
       return;
     }
     if (method === "session.status") {
-      const params = frame.params as { status?: string; sessionId?: string } | undefined;
-      this.#handlers.onStatus(params?.status ?? "unknown", params?.sessionId ?? "");
+      const owner = producer === undefined ? undefined : this.#rootOf(producer);
+      const handlers = owner === undefined ? undefined : this.#sessionHandlers.get(owner);
+      if (handlers === undefined) {
+        this.#holdOrphan(producer, method, { kind: "status", params: params as Record<string, unknown> });
+        return;
+      }
+      handlers.onStatus(typeof params.status === "string" ? params.status : "unknown", producer ?? "");
       return;
     }
     if (method === "session.child-opened") {
-      const params = frame.params as DshChildOpened | undefined;
-      if (params !== undefined && typeof params.sessionId === "string" && params.sessionId !== "") {
-        this.#handlers.onChildOpened?.(params);
+      const owner = producer === undefined ? undefined : this.#rootOf(producer);
+      const handlers = owner === undefined ? undefined : this.#sessionHandlers.get(owner);
+      // The notice is held, not dropped, when its own parent chain does not reach
+      // an attached session yet: a grandchild can be announced before the child
+      // that parents it, and the session cannot open a view for a notice it never
+      // receives. The edge above is already recorded, so this only delays delivery
+      // — it never loses it, and it resolves as soon as an ancestor is announced.
+      if (handlers === undefined || producer === undefined) {
+        this.#holdOrphan(producer, method, {
+          kind: "child-opened",
+          params: params as Record<string, unknown>,
+        });
+        return;
       }
+      handlers.onChildOpened?.(params as unknown as DshChildOpened);
+      // This edge may have made a grandchild's held frames routable: a deeper
+      // descendant can be announced before the child that parents it, and its
+      // frames wait in `#orphanFrames` until the chain reaches an attached
+      // session. Replayed after the notice, so the child view exists first.
+      this.#replayOrphans();
       return;
     }
     if (method !== undefined) {
@@ -1152,18 +1690,125 @@ export class DshProcess {
   }
 
   /**
-   * Remove the per-process MCP overlay. The child reads it once at boot, so it
-   * is deleted as soon as the process is gone: the auth token it carries must
-   * not outlive the session. Idempotent.
+   * Report one frame that arrived for a session nothing here serves.
+   *
+   * Dropped, never guessed: attaching it to whichever session happens to be
+   * around would show one conversation's output inside another. Logged because a
+   * silent drop is the failure mode this repo keeps re-learning — the user sees
+   * "the agent went quiet" with nothing to explain it.
    */
-  #cleanupPatch(): void {
-    const patch = this.#patch;
-    if (patch === undefined) return;
-    this.#patch = undefined;
-    try {
-      rmSync(patch.dir, { recursive: true, force: true });
-    } catch {
-      /* the OS reaps the temp directory; never mask the real exit reason */
+  #reportUnroutable(method: string, sessionId: string | undefined): void {
+    this.#processHandlers.onLog(
+      `dropped ${method} for unknown session ${sessionId ?? "(none)"}; it belongs to no attached session`,
+    );
+  }
+
+  /**
+   * Hold one frame whose producing session has no resolvable owner yet.
+   *
+   * The bridge does not order an ancestor's `session.child-opened` before a
+   * descendant's frames (see {@link OrphanFrame}), so "no owner" here is often
+   * "not yet" rather than "never". Holding is what keeps a grandchild's earliest
+   * message and its terminal `turn/end` from being lost to a reorder.
+   *
+   * A frame with no producing session id, or a producing session that is
+   * genuinely not this process's, has nothing to wait for: it is reported and
+   * dropped on the spot, exactly as before.
+   *
+   * @param producer - the session that produced the frame, from `params.sessionId`.
+   * @param method - the frame method, for the log line.
+   * @param frame - the held payload.
+   */
+  #holdOrphan(producer: string | undefined, method: string, frame: OrphanFrame): void {
+    if (producer === undefined || producer === "") {
+      this.#reportUnroutable(method, producer);
+      return;
+    }
+    let bucket = this.#orphanFrames.get(producer);
+    if (bucket === undefined) {
+      bucket = { frames: [], since: Date.now() };
+      this.#orphanFrames.set(producer, bucket);
+      // One timer per producing session: a lineage that never resolves must not
+      // buffer forever, and the frame is still reported when it gives up.
+      const timer = setTimeout(() => {
+        this.#orphanTimers.delete(producer);
+        const held = this.#orphanFrames.get(producer);
+        if (held === undefined) return;
+        this.#orphanFrames.delete(producer);
+        this.#processHandlers.onLog(
+          `dropped ${held.frames.length} frame(s) for unknown session ${producer}; `
+            + "no ancestor announced it within the hold window",
+        );
+      }, ORPHAN_FRAME_TTL_MS);
+      timer.unref?.();
+      this.#orphanTimers.set(producer, timer);
+    }
+    if (bucket.frames.length >= ORPHAN_FRAME_LIMIT) {
+      // Keep the newest: the earliest frames of a child that never resolves are
+      // the least likely to matter, and an unbounded bucket is a leak.
+      bucket.frames.shift();
+      this.#processHandlers.onLog(
+        `orphan buffer full for ${producer} (${ORPHAN_FRAME_LIMIT}); dropping its oldest held frame`,
+      );
+    }
+    bucket.frames.push(frame);
+  }
+
+  /**
+   * Deliver every held frame whose lineage now resolves.
+   *
+   * Called after each `session.child-opened`, because that is the only frame that
+   * creates a parent edge — and a single notice can resolve a whole chain of held
+   * descendants at once. Resolution is re-evaluated per frame, so a chain that
+   * only becomes complete after several notices drains progressively.
+   *
+   * Order is preserved per producing session: frames are replayed in arrival
+   * order, which is what the child view's timeline needs. A held `child-opened`
+   * is replayed through the same path as a live one, which is what makes its
+   * parent edge and its delivery consistent — and can itself unblock the next
+   * level, so the loop repeats until nothing more resolves.
+   */
+  #replayOrphans(): void {
+    if (this.#orphanFrames.size === 0) return;
+    // A notice resolved at one level can make a deeper one resolvable, so keep
+    // sweeping until a pass delivers nothing. Bounded by the buffer's own size:
+    // every pass that makes progress removes at least one bucket.
+    let delivered = true;
+    while (delivered && this.#orphanFrames.size > 0) {
+      delivered = false;
+      for (const [producer, bucket] of [...this.#orphanFrames]) {
+        const owner = this.#rootOf(producer);
+        const handlers = owner === undefined ? undefined : this.#sessionHandlers.get(owner);
+        if (handlers === undefined) continue;
+        const timer = this.#orphanTimers.get(producer);
+        if (timer !== undefined) {
+          clearTimeout(timer);
+          this.#orphanTimers.delete(producer);
+        }
+        this.#orphanFrames.delete(producer);
+        delivered = true;
+        this.#processHandlers.onLog(
+          `replaying ${bucket.frames.length} held frame(s) for ${producer} after its lineage resolved`,
+        );
+        for (const held of bucket.frames) {
+          try {
+            if (held.kind === "event") {
+              handlers.onEvent(held.params as unknown as DshSessionEvent);
+            } else if (held.kind === "status") {
+              handlers.onStatus(
+                typeof held.params["status"] === "string" ? held.params["status"] : "unknown",
+                producer,
+              );
+            } else {
+              handlers.onChildOpened?.(held.params as unknown as DshChildOpened);
+            }
+          } catch (error) {
+            this.#processHandlers.onLog(
+              `replaying a held ${held.kind} for ${producer} failed: ${toError(error, "replay failed").message}`,
+            );
+          }
+        }
+      }
     }
   }
 

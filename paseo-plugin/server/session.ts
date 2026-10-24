@@ -28,6 +28,7 @@ import {
   type DshMcpServer,
   type DshPermissionPreset,
   type DshProcessHandlers,
+  type DshSessionHandlers,
   type DshQuestion,
   type DshQuestionRequest,
   type DshRevertResult,
@@ -124,20 +125,29 @@ export interface DshSessionOptions {
   emit(event: ProviderEvent): void;
   log(line: string): void;
   /**
-   * Adopt a parked, idle process for this native session id instead of spawning.
+   * Take the process this session runs in.
    *
-   * Used by the rewrite refresh path: the daemon's "reload agent" closes the
-   * provider session and reopens it with persistence, and a cold spawn is the
-   * slow half of that refresh. A miss (undefined) cold-starts as before.
+   * Every session of one connection shares a single long-lived `dsh` child (see
+   * `parked-sessions.ts`), so a session does not own a process and cannot spawn
+   * one: it joins the shared one. The provider resolves it, spawning on the
+   * first open and returning the same child afterwards; the returned process has
+   * already completed `start()`.
+   *
+   * `reused` is what keeps the rewind-reload path honest: `true` means this
+   * session joined a child that was already serving conversations, so a running
+   * native subagent in it is demonstrably alive even though the bridge announced
+   * it to a *previous* provider session and will not announce it again.
    */
-  takeParked?(dshSessionId: string, expected: { cwd: string; routeKey: string }): DshProcess | undefined;
+  acquireProcess?(): Promise<{ process: DshProcess; reused: boolean }>;
   /**
-   * Offer this session's idle process for reuse instead of shutting it down.
+   * Give the process back, releasing this session's claim on it.
    *
-   * @returns whether the caller accepted it; a false answer falls back to a
-   *   protocol shutdown.
+   * The provider owns the reference count and the shutdown: the shared child must
+   * never be shut down by one session leaving it, so a session never calls
+   * `process.shutdown()`. When the last claim is released the provider retires the
+   * child after a short grace period (a rewind's close-then-open lands inside it).
    */
-  parkProcess?(process: DshProcess, meta: { sessionId: string; dshSessionId: string; cwd: string; routeKey: string }): boolean;
+  releaseProcess?(process: DshProcess): void;
 }
 
 /**
@@ -286,17 +296,17 @@ export class DshSession {
   #turnEndState: { state: "completed" | "canceled" | "failed"; error?: string } | null = null;
   #replaySeq = 0;
   /**
-   * Whether this session adopted a parked `dsh` process (what the rewind
-   * refresh's close/reopen does) instead of cold-starting one.
+   * Whether this session joined a process that was already serving conversations
+   * (what the rewind refresh's close/reopen does) instead of spawning one.
    *
-   * An adopted process never stopped: its running child agents kept running
-   * while this provider session was closed, so a child's open turn is live
-   * evidence even though the bridge announced that child to the *previous*
-   * provider session and will not announce it again. A cold start keeps the old
-   * rule — a child log that stops inside a turn with no live channel is a killed
-   * child and closes as canceled (see `replaySubagents`).
+   * A joined process never stopped: its running child agents kept running while
+   * this provider session was closed, so a child's open turn is live evidence even
+   * though the bridge announced that child to the *previous* provider session and
+   * will not announce it again. A freshly spawned process keeps the old rule — a
+   * child log that stops inside a turn with no live channel is a killed child and
+   * closes as canceled (see `replaySubagents`).
    */
-  #adoptedParkedProcess = false;
+  #joinedLiveProcess = false;
   /**
    * Pending question cards keyed by permission id, remembering which session
    * (root or a native subagent child) asked so the resolution is attributed
@@ -305,6 +315,17 @@ export class DshSession {
   #pendingPermissions = new Map<string, { sessionId: string; resolve: (response: ProviderPermissionResponse) => void }>();
   /** Native subagent child sessions, keyed by DSH's own child session id. */
   #children = new Map<string, DshChildSession>();
+  /**
+   * Every native child's direct parent, as learned from its `child-opened`.
+   *
+   * Separate from {@link #children} because it must exist *before* a view does:
+   * a grandchild can be reported before the child that parents it, and resolving
+   * its lineage needs the edges of notices still held in {@link #pendingOpened}.
+   * Kept after a view is dropped, so a replayed frame for a known child still
+   * resolves; bounded by the number of children this session has ever been told
+   * about, which is what the bridge's own child table holds too.
+   */
+  readonly #childParents = new Map<string, string>();
   /** The same children, keyed by the root-scoped Paseo provider id they emit. */
   #childByProviderId = new Map<string, DshChildSession>();
   /** Whether Paseo negotiated `session.subsession`; gates every child emission. */
@@ -378,18 +399,22 @@ export class DshSession {
   }
 
   /**
-   * The callbacks a DSH process reports to. Extracted so a parked process can be
-   * re-pointed at a new session without respawning (see {@link DshSessionOptions}).
+   * The callbacks this session's frames report to.
    *
-   * @returns the handler set for one process.
+   * `DshSessionHandlers`, not `DshProcessHandlers`: one shared child serves every
+   * session of the connection, so a session must not be able to redirect the
+   * child's stderr or protocol diagnostics — those stay process-wide, owned by the
+   * provider. Handing this set to `attachSession` is what routes exactly this
+   * session's events here and no other's.
+   *
+   * @returns the handler set for this one session.
    */
-  #processHandlers(): DshProcessHandlers {
+  #sessionHandlers(): DshSessionHandlers {
     return {
       onEvent: (payload) => this.#onSessionEvent(payload),
       onStatus: (status, sessionId) => this.#onStatus(status, sessionId),
       onQuestion: (request, sessionId) => this.#onQuestion(request, sessionId),
       onChildOpened: (payload) => this.#onChildOpened(payload),
-      onLog: (line) => this.#options.log(line),
       onExit: (code, signal) => {
         if (this.#closed) return;
         this.#closed = true;
@@ -400,55 +425,51 @@ export class DshSession {
           error: { message: `DeepSeek Harness exited (code ${code ?? "null"}, signal ${signal ?? "none"})` },
         });
       },
-      onProtocolError: (message) => this.#options.log(`protocol: ${message}`),
     };
   }
 
-  /** Adopt a parked process or spawn one, pin the route, reconcile the mode. */
+  /**
+   * Join the shared process, pin this session's cwd/route/MCP servers, reconcile
+   * the mode.
+   *
+   * There is no adoption decision any more: every session of a connection runs in
+   * the same long-lived child, so opening is "attach this session to it". The
+   * child keeps serving the sessions that were already open, which is what makes a
+   * rewind's close-then-open cheap.
+   */
   async open(): Promise<void> {
-    const expected = { cwd: this.#options.cwd, routeKey: routeKeyOf(this.#route) };
-    const offered = this.#options.takeParked?.(this.#dshSessionId, expected);
-    // `take` checks `running`, but the child can exit between that check and the
-    // moment its handlers are re-pointed. A dead adoption would produce a session
-    // that never answers; cold-start instead (the pool entry is already gone).
-    const adopted = offered !== undefined && offered.running ? offered : undefined;
-    this.#adoptedParkedProcess = adopted !== undefined;
-    if (offered !== undefined && adopted === undefined) {
-      this.#options.log(`parked process for ${this.#dshSessionId} exited before adoption; cold-starting`);
-      offered.kill();
+    if (this.#options.acquireProcess === undefined) {
+      throw new Error(`session ${this.id} has no process to join`);
     }
-    let process: DshProcess;
-    if (adopted !== undefined) {
-      // The child kept running across the provider-session close; re-point its
-      // events at this session and skip the spawn + profile load entirely.
-      process = adopted;
-      process.setHandlers(this.#processHandlers());
-    } else {
-      process = new DshProcess({
-        cwd: this.#options.cwd,
-        route: this.#route,
-        sessionId: this.#dshSessionId,
-        env: this.#options.env,
-        mcpServers: this.#options.mcpServers,
-        ...this.#processHandlers(),
-      });
-    }
+    const { process, reused } = await this.#options.acquireProcess();
     this.#process = process;
-    await process.start();
-    // A parked child may still be in plan mode from its previous session; the
-    // reopen's mode is authoritative, so reconcile both directions. A freshly
-    // spawned child starts in build, so only a plan open needs the extra write.
+    // `reused` is the replacement for the old "adopted a parked process" flag: a
+    // child that was already serving conversations can be hosting a native
+    // subagent whose open turn is real, even though the bridge announced it to a
+    // previous provider session and will never announce it again.
+    this.#joinedLiveProcess = reused;
+    // Attaching is what gives this session its own handlers, cwd, route and MCP
+    // servers, and it initializes the session under its own id before resolving —
+    // so a prompt may follow immediately. `setHandlers` must not be used here: it
+    // re-points the session the process was constructed for, which on a shared
+    // child would move another conversation's events.
+    await process.attachSession(this.#dshSessionId, this.#sessionHandlers(), {
+      cwd: this.#options.cwd,
+      route: this.#route,
+      ...(this.#options.mcpServers === undefined ? {} : { mcpServers: this.#options.mcpServers }),
+    });
+    // The mode is per session, and the shared child's plan state may have been set
+    // by any other session that opened before this one — so the reopen's mode is
+    // authoritative and both directions must be reconciled, not only a plan open.
     // A profile that composes no plan-mode service must not fail the whole open
     // here: the conversation is usable in build mode and the log says why the
     // toggle could not be applied.
-    if (adopted !== undefined || this.#mode === "plan") {
-      try {
-        await process.setPlan(this.#mode === "plan");
-      } catch (error) {
-        this.#options.log(
-          `plan mode could not be reconciled on open (${this.#mode}): ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
+    try {
+      await process.setPlan(this.#dshSessionId, this.#mode === "plan");
+    } catch (error) {
+      this.#options.log(
+        `plan mode could not be reconciled on open (${this.#mode}): ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 
@@ -530,7 +551,7 @@ export class DshSession {
    * skill rides a `/name` user message.
    */
   async loadCommands(): Promise<void> {
-    const commands = await this.#require().commands();
+    const commands = await this.#require().commands(this.#dshSessionId);
     this.#commandKinds.clear();
     const advertised = commands.map((command) => {
       this.#commandKinds.set(command.name, command.kind);
@@ -557,7 +578,7 @@ export class DshSession {
 
   /** Read the current permission preset and the switchable ones, for the composer. */
   async loadPermission(): Promise<void> {
-    const permission = await this.#require().permission();
+    const permission = await this.#require().permission(this.#dshSessionId);
     if (!permission.available) return;
     this.#permission = permission.current;
     this.#permissionPresets = permission.presets;
@@ -574,7 +595,7 @@ export class DshSession {
     token: unknown,
     scope: "conversation" | "files" | "both",
   ): Promise<DshRevertResult | undefined> {
-    const result = await this.#require().revert(token, scope);
+    const result = await this.#require().revert(this.#dshSessionId, token, scope);
     // A rewind removes the turn that asked the question, so any card still waiting
     // belongs to a conversation that no longer exists. Left pending, the daemon
     // keeps showing it and a later click answers a question nobody is waiting for
@@ -588,7 +609,7 @@ export class DshSession {
    * profile that mounts no preset registry simply gets no Preset control.
    */
   async loadPresets(): Promise<void> {
-    const info = await this.#require().presets();
+    const info = await this.#require().presets(this.#dshSessionId);
     if (!info.available) return;
     this.#preset = info.current ?? info.default;
     this.#presetOptions = info.presets.map((preset) => ({
@@ -619,7 +640,7 @@ export class DshSession {
     const generation = ++this.#usageGeneration;
     let snapshot: DshUsage;
     try {
-      snapshot = await process.usage();
+      snapshot = await process.usage(this.#dshSessionId);
     } catch (error) {
       if (this.#closed || generation !== this.#usageGeneration) return;
       this.#options.log(`usage query failed: ${messageOf(error)}`);
@@ -661,7 +682,7 @@ export class DshSession {
    * approval notices) carries a different `source.kind` and is skipped.
    */
   async replayHistory(): Promise<void> {
-    const { events, available, error } = await this.#require().history();
+    const { events, available, error } = await this.#require().history(this.#dshSessionId);
     // A failed read is not an empty session. Returning silently here is what
     // made "the replay timed out" look exactly like "there was nothing to
     // replay": the user saw a blank conversation and no reason for it.
@@ -793,7 +814,7 @@ export class DshSession {
     // can be a terminal (see `#childReplayWindow`).
     this.#childReplayWindow = true;
     try {
-      listing = await process.subagents();
+      listing = await process.subagents(this.#dshSessionId);
     } catch (error) {
       this.#options.log(`subagent enumeration failed: ${messageOf(error)}`);
       return;
@@ -819,6 +840,21 @@ export class DshSession {
     this.#replayPending = new Set(
       listing.subagents.filter((subagent) => subagent.archived !== true).map((subagent) => subagent.sessionId),
     );
+    // The catalog is a second source of the parent edges, and a more reliable one
+    // than the notices: it is read from DSH's own durable headers, so it covers a
+    // child whose `child-opened` this session never received (a reopen, or a child
+    // announced to a previous provider session). Without it such a child's frames
+    // have no lineage to resolve — `rootOf` walks `child -> parent` to a dead end
+    // and the frame is dropped, which for a `turn/end` leaves the child running
+    // forever. The notice wins when both are present: it is the only source that
+    // can name a parent DSH has not materialized yet.
+    for (const row of listing.subagents) {
+      if (row.archived === true) continue;
+      if (typeof row.parentSessionId !== "string" || row.parentSessionId === "") continue;
+      if (!this.#childParents.has(row.sessionId)) {
+        this.#childParents.set(row.sessionId, row.parentSessionId);
+      }
+    }
     try {
       for (const row of listing.subagents) {
         if (this.#closed) return;
@@ -853,18 +889,19 @@ export class DshSession {
           this.#dropBufferedChild(row.sessionId);
           continue;
         }
-        // The proof that a child's open turn is still real is live evidence: the
-        // bridge announced that child, or streamed its frames, in this process —
-        // or this session adopted the SAME parked process that hosted the child
-        // (the rewind refresh's close/reopen). Adopting keeps a running child
-        // running, so its open turn is live even though the new provider session
-        // never saw the announcement. Cold starts keep the strict rule: nothing is
-        // live in a process that just booted, DSH's `listDescendants` never loads
-        // or resumes a child agent, and a stored log that simply stops inside a
-        // turn is exactly what a killed child leaves behind. Sampled here, after
-        // the history read, so no await can interleave between the check and the
-        // replay that consumes it.
-        const announcedLive = this.#children.has(row.sessionId) || this.#adoptedParkedProcess;
+        // The proof that a child's open turn is still real is live evidence
+        // *about that child*: the bridge announced it, or streamed its frames, in
+        // this process. Deliberately **not** `#joinedLiveProcess`: joining a
+        // process that was already serving conversations says the process never
+        // stopped, which is why a run left open in it is still running — but it
+        // says nothing about whether *this* child was ever started. Passing it
+        // here made a never-started child (a created-but-crashed row) look live
+        // and kept it "running" forever, the exact pre-rewind symptom. The adopt
+        // case is carried by `replay()`'s own `turnOpen` instead: an open turn in
+        // the child's log plus a process that never stopped is the proof.
+        // Sampled here, after the history read, so no await can interleave
+        // between the check and the replay that consumes it.
+        const announcedLive = this.#children.has(row.sessionId);
         // A one-shot child has no label in the durable catalog — DSH only requires
         // one for a continuable child — but the child's own `subagent/descriptor`
         // carries its creation label. Read it from the history *before* opening:
@@ -888,6 +925,7 @@ export class DshSession {
           history.inheritedEventCount,
           announcedLive,
           this.#hasBufferedTerminal(row.sessionId),
+          this.#joinedLiveProcess,
         );
         // The stored history is in: release the frames held during the round trip
         // (their child view now exists) and stop buffering for this child.
@@ -949,7 +987,7 @@ export class DshSession {
       const issuedTurn = this.#openTurnId(prompt.clientMessageId, prompt.delivery);
       let reply: { messageId?: string; sourceKind?: string };
       try {
-        reply = await process.prompt(line, [{ type: "text", text: line }], prompt.delivery);
+        reply = await process.prompt(this.#dshSessionId, line, [{ type: "text", text: line }], prompt.delivery);
       } catch (error) {
         if (issuedTurn) this.#turnId = null;
         this.#emitPromptFailed(prompt.clientMessageId, error);
@@ -1002,7 +1040,7 @@ export class DshSession {
     const issuedTurn = this.#openTurnId(prompt.clientMessageId, prompt.delivery);
     let reply: { messageId?: string; sourceKind?: string };
     try {
-      reply = await process.prompt(label, blocks.length === 0 ? undefined : blocks, prompt.delivery);
+      reply = await process.prompt(this.#dshSessionId, label, blocks.length === 0 ? undefined : blocks, prompt.delivery);
     } catch (error) {
       if (issuedTurn) this.#turnId = null;
       this.#emitPromptFailed(prompt.clientMessageId, error);
@@ -1040,7 +1078,7 @@ export class DshSession {
   async #runCommand(clientMessageId: string, name: string, args: string): Promise<void> {
     this.#emitUserMessage(clientMessageId, slashLine(name, args));
     try {
-      const result = await this.#require().runCommand(name, args);
+      const result = await this.#require().runCommand(this.#dshSessionId, name, args);
       if (result.kind === "error") throw new Error(result.text ?? `/${name} failed`);
     } catch (error) {
       this.#emitPromptFailed(clientMessageId, error);
@@ -1167,7 +1205,7 @@ export class DshSession {
 
     if (changes.model !== undefined && changes.model !== null) {
       const next = parseRoute(changes.model, this.#route);
-      const applied = await process.setConfig({
+      const applied = await process.setConfig(this.#dshSessionId, {
         provider: next.provider,
         model: next.model,
         reasoningEffort: next.reasoningEffort ?? null,
@@ -1193,7 +1231,7 @@ export class DshSession {
         );
       }
       this.#thinkingOption = effort;
-      const applied = await process.setConfig({
+      const applied = await process.setConfig(this.#dshSessionId, {
         provider: this.#route.provider,
         model: this.#route.model,
         reasoningEffort: effort ?? null,
@@ -1207,7 +1245,7 @@ export class DshSession {
 
     if (changes.mode !== undefined && changes.mode !== null) {
       this.#mode = changes.mode === "plan" ? "plan" : "build";
-      await process.setPlan(this.#mode === "plan");
+      await process.setPlan(this.#dshSessionId, this.#mode === "plan");
     }
 
     const requestedPermission = changes.settings?.["permission"];
@@ -1220,7 +1258,7 @@ export class DshSession {
       // `/permission` command: both own the sandbox mode and approval policy, but
       // only the command appends `command/run`/`command/done`, which Paseo would
       // show as a row the user never typed.
-      const applied = await process.setPermission(requestedPermission);
+      const applied = await process.setPermission(this.#dshSessionId, requestedPermission);
       this.#permission = applied.current ?? requestedPermission;
     }
 
@@ -1234,7 +1272,7 @@ export class DshSession {
       // session's first turn has started. On refusal keep the real value and log
       // it — the caller re-emits config, so the composer snaps back.
       try {
-        const applied = await process.setConfig({ preset: requestedPreset });
+        const applied = await process.setConfig(this.#dshSessionId, { preset: requestedPreset });
         this.#preset = applied.preset ?? requestedPreset;
       } catch (error) {
         this.#options.log(`preset change rejected: ${messageOf(error)}`);
@@ -1285,7 +1323,7 @@ export class DshSession {
    * conversation stays continuable — killing the process stranded it instead.
    */
   async interrupt(): Promise<void> {
-    await this.#require().cancel();
+    await this.#require().cancel(this.#dshSessionId);
     // A cancelled turn's pending question cards can never be answered: DSH aborts
     // the question with the turn, and the bridge drops its pending request without
     // telling this process, so a later click would answer nobody. Deny them here —
@@ -1296,14 +1334,23 @@ export class DshSession {
   }
 
   /**
-   * Release the process.
+   * Leave the shared process.
    *
-   * An idle process is offered to the caller's park callback first: a rewind's
-   * refresh closes and immediately reopens this session, and handing the running
-   * child to the reopened session removes the cold start from that path. A
-   * running turn, a missing callback, or a refusal falls back to shutdown.
+   * Two things happen, in this order, and neither is optional:
    *
-   * @param options - `park: false` forces a shutdown (provider teardown).
+   * 1. `closeSession` — detach this session's handlers *and* tell the bridge to
+   *    drop its ten session-keyed tables. Detaching alone would leave them to grow
+   *    for the life of a process that now outlives every conversation, and the
+   *    bridge deliberately keeps `sessionCwd`/`sessionRoutes`/`initializedSessions`
+   *    so a resume inside the same process still has its route.
+   * 2. `releaseProcess` — give the claim back. The provider owns the reference
+   *    count and retires the child only when the last session has left it. A
+   *    session must never shut the child down itself: that would end every other
+   *    conversation running in it.
+   *
+   * @param options - `park: false` marks a connection-level teardown. It no longer
+   *   changes the outcome (there is no per-session process to park), but it stays
+   *   in the signature because the provider's teardown passes it.
    */
   async close(options: { park?: boolean } = {}): Promise<void> {
     if (this.#closed) return;
@@ -1312,17 +1359,14 @@ export class DshSession {
     const process = this.#process;
     this.#process = undefined;
     if (process === undefined) return;
-    const park = options.park !== false
-      && this.#turnId === null
-      && process.running
-      && this.#options.parkProcess?.(process, {
-        sessionId: this.id,
-        dshSessionId: this.#dshSessionId,
-        cwd: this.#options.cwd,
-        routeKey: routeKeyOf(this.#route),
-      }) === true;
-    if (park) return;
-    await process.shutdown();
+    try {
+      await process.closeSession(this.#dshSessionId);
+    } catch (error) {
+      // Teardown must not turn into a user-visible failure: the child may already
+      // be dying. The log line is what keeps a leaked bridge table diagnosable.
+      this.#options.log(`closing ${this.#dshSessionId} in the bridge failed: ${messageOf(error)}`);
+    }
+    this.#options.releaseProcess?.(process);
   }
 
   #require(): DshProcess {
@@ -1388,10 +1432,50 @@ export class DshSession {
     }
   }
 
-  /** The Paseo provider id a child of `parentNativeId` is parented under. */
+  /**
+   * The Paseo provider id a child of `parentNativeId` is parented under, resolved
+   * through any number of intermediate child levels.
+   *
+   * One hop is not enough: a native subagent can dispatch its own subagent, so the
+   * chain is `root -> child-P -> grand-G -> great-H` and a frame's
+   * `parentSessionId` may name any level. Walking up until an *opened* child view
+   * is reached is what gives a grandchild the id of its actual parent view rather
+   * than the root's — Paseo renders the subtree from these edges, so a flattened
+   * one would show grandchildren as children.
+   *
+   * @param parentNativeId - DSH's own id of the frame's parent.
+   * @returns the Paseo provider id to parent under, or undefined when no level of
+   *   the chain has been opened yet (the caller holds the notice until it has).
+   */
   #parentScopedId(parentNativeId: string): string | undefined {
     if (parentNativeId === this.#dshSessionId) return this.id;
-    return this.#children.get(parentNativeId)?.id;
+    // The chain is walked from the frame's parent *upwards*, so a grandchild whose
+    // parent view exists resolves even while the root is still opening. `seen`
+    // bounds a malformed or cyclic chain (DSH writes `parentSession` into a
+    // durable header, which this process only reads).
+    let current: string | undefined = parentNativeId;
+    const seen = new Set<string>();
+    while (current !== undefined && current !== "" && !seen.has(current)) {
+      seen.add(current);
+      if (current === this.#dshSessionId) return this.id;
+      const child = this.#children.get(current);
+      if (child !== undefined) return child.id;
+      current = this.#parentOf(current);
+    }
+    return undefined;
+  }
+
+  /**
+   * The parent DSH id of one native child, as learned from its notice.
+   *
+   * Recorded for every child notice the session sees, *including* notices it is
+   * still holding because their own parent is unknown: that edge is what lets a
+   * grandchild reported before its parent be resolved once the parent arrives.
+   */
+  #parentOf(nativeId: string): string | undefined {
+    const held = this.#pendingOpened.find((payload) => payload.sessionId === nativeId);
+    if (held !== undefined) return held.parentSessionId;
+    return this.#childParents.get(nativeId);
   }
 
   /** The child view for one root-scoped Paseo provider id, if it is known. */
@@ -1486,6 +1570,11 @@ export class DshSession {
       this.#options.log(`ignoring child opened with no parent: ${payload.sessionId}`);
       return;
     }
+    // The edge is recorded before anything can be decided, and whether or not this
+    // child opens now: a grandchild announced first names a parent whose own
+    // notice may still be in flight, and that grandchild's frames can only be
+    // routed once this map can answer "who is its parent" for every level.
+    this.#childParents.set(payload.sessionId, payload.parentSessionId);
     if (this.#children.has(payload.sessionId)) return;
     // The parent edge may not exist yet: the root may still be opening, or a
     // nested child may precede its parent. Hold it (bounded) instead of dropping
@@ -2078,19 +2167,25 @@ export class DshChildSession {
    * default on attach is "running" and its host only consumes a *terminal*
    * `session.turn`.
    *
-   * @param live - positive live-channel evidence for this child, from the caller
-   *   that read the durable catalog.
+   * @param live - positive live-channel evidence for **this child**, from the
+   *   caller that read the durable catalog.
    * @param terminalBuffered - the child's `turn/end` already arrived and is held
    *   in the replay buffer (it landed during the history read). The replayed
    *   suffix still ends inside the turn, but closing it as canceled would emit a
    *   spurious terminal right before the real one; the buffered terminal is the
    *   live proof, exactly like `live`.
+   * @param processKeptRunning - this session joined a process that was already
+   *   serving conversations, so nothing it was running has been interrupted. It
+   *   proves an **open turn** in the child's own log is still running, and
+   *   nothing more: a child with no recorded turn may be one that was created and
+   *   never started, so this must not be read as per-child evidence.
    */
   replay(
     events: Array<{ type: string; seq?: number; time?: number; data: unknown }>,
     inheritedEventCount = 0,
     live = false,
     terminalBuffered = false,
+    processKeptRunning = false,
   ): void {
     if (this.#options.closed()) return;
     let fallbackSeq = 0;
@@ -2159,12 +2254,16 @@ export class DshChildSession {
     // default on attach; without it the child is closed as canceled rather than
     // announced as something still running.
     if (turnOpen || !sawTurn) {
-      // Adopting the parked process proves the OPEN TURN is still real: that
-      // process never stopped. It does not prove a child with no recorded turn
-      // was ever running — that shape is a child created but never started (or a
-      // dead one), so only the live channel may keep it running. A terminal that
-      // arrived during the replay window is equally positive evidence.
-      if (((live || terminalBuffered) && turnOpen) || this.#observedLive) return;
+      // Adopting the shared process proves the OPEN TURN is still real: that
+      // process never stopped, so a turn its log left open is still running. It
+      // does not prove a child with no recorded turn was ever running — that
+      // shape is a child created but never started (or a dead one), so only the
+      // live channel may keep it running. A terminal that arrived during the
+      // replay window is equally positive evidence, but only for a turn it can
+      // close: with no turn in the log it proves nothing about this child.
+      const adoptingProvesOpenTurn = (live || processKeptRunning) && turnOpen;
+      const bufferedTerminalClosesTurn = terminalBuffered && turnOpen;
+      if (adoptingProvesOpenTurn || bufferedTerminalClosesTurn || this.#observedLive) return;
       this.#options.log(
         `subagent ${this.nativeId}: stored history ends with no turn terminal ` +
           `(${turnOpen ? "the last turn was never closed" : "no turn was ever recorded"}); ` +

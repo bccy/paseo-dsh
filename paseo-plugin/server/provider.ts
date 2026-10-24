@@ -22,7 +22,7 @@ import {
   type ProviderRegistration,
   type ProviderThinkingOption,
 } from "@getpaseo/plugin/server/provider";
-import { DshProcess, type DshCatalog, type DshRevertResult } from "./dsh-process";
+import { DshProcess, type DshCatalog, type DshRevertResult, type DshRoute } from "./dsh-process";
 import { DshChildSession, DshSession, modes, parseRoute } from "./session";
 import { ParkedSessions } from "./parked-sessions";
 import { effortLabel } from "./locale";
@@ -109,6 +109,27 @@ const MAX_DSH_ID_MAPPINGS = 500;
  */
 const FALLBACK_ROUTE = { provider: "unset", model: "unset" };
 const CATALOG_TTL_MS = 5 * 60 * 1000;
+/**
+ * How long the shared child survives its last release.
+ *
+ * A rewind's reload closes the provider session and reopens it immediately; the
+ * grace period is what keeps that from becoming a cold CLI boot (measured
+ * 1.5–2.7 s). It matches the pool's session-lock release bound
+ * (`RELEASE_TIMEOUT_MS` in `parked-sessions.ts`) so the two agree about when a
+ * child is genuinely idle.
+ */
+const POOL_RELEASE_GRACE_MS = 5_000;
+/**
+ * The session id the shared child is constructed with.
+ *
+ * `DshProcess` attaches its constructor id and `start()` initializes it, which is
+ * what composes the LLM adapters and validates the route once per process. This
+ * id is never prompted: every real session initializes its own id through
+ * `attachSession`, and the bridge resolves cwd/route per session id
+ * (`dsh-bridge/lib/server.js:648-668`). It is deliberately not a valid session id
+ * shape so a leak into the bridge's tables is recognisable in a log.
+ */
+const POOL_PLACEHOLDER_SESSION_ID = "__paseo_shared_process__";
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -320,6 +341,53 @@ class DshConnection implements ProviderConnection {
   #paseoBinary: string | undefined;
   #closed = false;
   /**
+   * The one DeepSeek Harness process this connection shares between its sessions.
+   *
+   * Every session uses the same child. DSH itself takes the working directory and
+   * the route **per session** (`initialize` carries a `sessionId`, the bridge
+   * stores them per session, and `dsh-working-directory` resolves a session's cwd
+   * as a projection — the runtime never calls `process.chdir`), so a single child
+   * serves sessions in different workspaces exactly as DSH's own Web UI does
+   * (`dsh-api-session-controller/lib/index.js:511`'s `createAgent(sessionId, cwd, …)`
+   * takes the cwd as a per-session argument). MCP servers moved to a per-session
+   * frame (`paseo/mcp/set`), so nothing that used to be process-wide is left to
+   * justify one child per session.
+   *
+   * `#poolKey` is a **constant**: the key must be immutable for the process's
+   * whole life, and every candidate derived from a session (cwd, route, the
+   * per-agent `PASEO_AGENT_ID` in `config.env`) is either per-session or differs
+   * per open. Including one of those would make the pool spawn a fresh child per
+   * session while still being called a pool.
+   */
+  #pooled: DshProcess | undefined;
+  /** In-flight spawn, so concurrent acquires share one child instead of racing. */
+  #poolSpawn: Promise<DshProcess> | undefined;
+  /**
+   * Outstanding claims, counted **per child instance**.
+   *
+   * This has to be keyed by the child, not a single number, because a child can
+   * be retired and replaced while sessions still hold a claim on the old one.
+   * The first version of this pool kept one counter and released it like this:
+   *
+   *     if (this.#pooled !== process) return;   // stale child -> bail out
+   *     this.#poolRefs -= 1;
+   *
+   * That bail-out leaked a claim for every session holding the *old* child: the
+   * counter never reached zero, so the child was never retired, and the next open
+   * spawned yet another one. Measured on the fake bridge: 6 replacements and a
+   * stuck `refs=1` after every session had closed. A session's claim must be
+   * returnable no matter which child it was taken against.
+   *
+   * A child is retired when its own count reaches zero **and** the grace timer
+   * expires: a rewind's reload closes and immediately reopens the session, and
+   * killing the child on the close would turn that fast path back into a cold
+   * start (measured at 1.5–2.7 s of CLI boot). The timer matches the pool's
+   * session-lock release bound so the two never disagree about when a child is
+   * really gone.
+   */
+  readonly #poolClaims = new Map<DshProcess, number>();
+  #poolReleaseTimer: ReturnType<typeof setTimeout> | undefined;
+  /**
    * Idle DSH processes kept across a provider-session close. The rewind refresh
    * closes and immediately reopens the session; adopting the parked child turns
    * that cold start into a replay, which is what makes the timeline update in
@@ -369,6 +437,238 @@ class DshConnection implements ProviderConnection {
     // happen on this connection.
     await Promise.allSettled(sessions.map((session) => session.close({ park: false })));
     this.#parked.stop();
+    // Teardown owns the shared child: no grace period, no reuse. The sessions
+    // above released their references, but the process must not outlive the
+    // connection that spawned it (a daemon reload would otherwise leave an
+    // orphan holding every session log's write lock).
+    await this.#shutdownPool();
+  }
+
+  /**
+   * The shared child if it is alive, else undefined.
+   *
+   * "Alive" is checked rather than assumed: the child can exit on its own (a
+   * crash, an OOM kill, a `shutdown` frame) between two requests, and handing a
+   * dead process to a caller produces a session that never answers instead of a
+   * spawn.
+   */
+  #livePoolProcess(): DshProcess | undefined {
+    const pooled = this.#pooled;
+    if (pooled === undefined) return undefined;
+    if (pooled.running) return pooled;
+    // A child that died is not reusable, and leaving it in the field would make
+    // `#acquirePoolProcess` believe a spawn already happened. Its claims go with
+    // it: the sessions holding them are dead too (`DshProcess` reports that per
+    // session through `#exitAll`), so keeping the counts would only make a future
+    // child inherit a debt it never took on.
+    this.#pooled = undefined;
+    this.#poolClaims.delete(pooled);
+    return undefined;
+  }
+
+  /**
+   * Get the shared child, spawning it if this connection has none.
+   *
+   * The returned process is started (its `start()` completed), so the caller can
+   * attach a session to it immediately. Concurrent callers share one spawn: two
+   * sessions opening at the same instant must not each create a child, because
+   * the second one would then be an unreferenced process holding the same
+   * session logs' write locks — the exact "two owners" state `#sessionHolding`
+   * exists to prevent.
+   *
+   * `reused` tells the caller whether it **joined** a child that was already
+   * serving other sessions. That is not cosmetic: a session joining a live child
+   * shares its runtime, so a native subagent child that the previous provider
+   * session never saw announced can still be running there. Reporting `reused`
+   * lets the session tell "still live" apart from "killed", instead of either
+   * resurrecting a dead child or cancelling a live one.
+   *
+   * The spawn uses the **first caller's** cwd/route/env as the process defaults.
+   * That is deliberate and harmless: every session sends its own cwd and route
+   * in `initialize` (`attachSession`), so these defaults only cover a request
+   * that names no session.
+   *
+   * @param options - what to spawn with, when a spawn is needed.
+   * @returns the live shared child and whether it was already serving sessions.
+   */
+  async #acquirePoolProcess(options: {
+    cwd: string;
+    route: DshRoute;
+    env: Record<string, string>;
+  }): Promise<{ process: DshProcess; reused: boolean }> {
+    const existing = this.#livePoolProcess();
+    if (existing !== undefined) {
+      this.#addPoolClaim(existing);
+      this.#cancelPoolRelease();
+      return { process: existing, reused: true };
+    }
+    const inFlight = this.#poolSpawn;
+    if (inFlight !== undefined) {
+      const shared = await inFlight;
+      this.#addPoolClaim(shared);
+      this.#cancelPoolRelease();
+      // Somebody else's spawn: by the time this returns the child has another
+      // session attached to it (or is about to), so this caller is joining.
+      return { process: shared, reused: true };
+    }
+    const spawnTask = (async (): Promise<DshProcess> => {
+      // A placeholder id, not a real conversation: `DshProcess` attaches its
+      // constructor id at construction, and `start()` initializes that id. The
+      // point of that initialize is to compose the LLM adapters and validate the
+      // route once per process; each real session then initializes its own id
+      // through `attachSession`, and the bridge answers `routeFor` per session
+      // (`server.js:648-668`), so the placeholder never sees a prompt.
+      const child = new DshProcess({
+        cwd: options.cwd,
+        route: options.route,
+        sessionId: POOL_PLACEHOLDER_SESSION_ID,
+        env: options.env,
+        // MCP servers are per session now (`paseo/mcp/set`), so the process
+        // default stays empty; `attachSession` carries each session's own map.
+        onEvent: () => {},
+        onStatus: () => {},
+        onQuestion: async () => ({ answers: [] }),
+        onChildOpened: () => {},
+        onLog: (line) => process.stderr.write(`[${PROVIDER_ID}] ${line}\n`),
+        onExit: (code, signal) => this.#onPoolExit(child, code, signal),
+        onProtocolError: (message) => {
+          process.stderr.write(`[${PROVIDER_ID}] protocol: ${message}\n`);
+        },
+      });
+      try {
+        await child.start();
+      } catch (error) {
+        // A child that never came up must not be left in the field: the next
+        // acquire has to try again instead of reusing a corpse.
+        child.kill();
+        throw error;
+      }
+      return child;
+    })();
+    this.#poolSpawn = spawnTask;
+    try {
+      const started = await spawnTask;
+      this.#pooled = started;
+      this.#addPoolClaim(started);
+      // Freshly spawned by this very call: the caller is not joining anything.
+      return { process: started, reused: false };
+    } finally {
+      // Cleared on failure too, so a retry spawns again rather than awaiting a
+      // rejection nobody kept.
+      if (this.#poolSpawn === spawnTask) this.#poolSpawn = undefined;
+    }
+  }
+
+  /**
+   * Record one claim on a child.
+   *
+   * Kept separate from {@link #releasePoolProcess} so both the join path and the
+   * spawn path book the claim the same way; a claim taken by one and released by
+   * the other is exactly the asymmetry that leaked before.
+   *
+   * @param process - the child the claim is against.
+   */
+  #addPoolClaim(process: DshProcess): void {
+    this.#poolClaims.set(process, (this.#poolClaims.get(process) ?? 0) + 1);
+  }
+
+  /**
+   * Drop one reference to the shared child, shutting it down when the last one goes.
+   *
+   * The claim is returned **against the child it was taken on**, never against
+   * whatever `#pooled` happens to point at now. A session that opened onto a
+   * child which has since been retired and replaced still owes exactly one claim
+   * on the *old* child, and bailing out because `#pooled !== process` would leave
+   * that claim outstanding forever — the counter would never reach zero, no child
+   * would ever retire, and each open would spawn another one.
+   *
+   * The shutdown is **delayed** on purpose. A rewind's reload closes the provider
+   * session and reopens it a few milliseconds later; killing the child on the
+   * close would turn that into a cold CLI boot (1.5–2.7 s) and lose the parked
+   * fast path entirely. The delay is the same bound the pool uses for a session
+   * log's write lock, so a reopen inside the window reuses the child and one
+   * outside it starts clean.
+   *
+   * @param process - the child the caller was using; an unknown one is ignored.
+   */
+  #releasePoolProcess(process: DshProcess): void {
+    const held = this.#poolClaims.get(process) ?? 0;
+    if (held <= 0) return;
+    if (held === 1) this.#poolClaims.delete(process);
+    else this.#poolClaims.set(process, held - 1);
+    // A child that is no longer the pooled one has nothing left to schedule: its
+    // remaining claims (if any) are still outstanding, and the pool already moved
+    // on. Only the current child can be retired by this path.
+    if (this.#pooled !== process) return;
+    if (this.#claimsOf(process) > 0) return;
+    this.#cancelPoolRelease();
+    const timer = setTimeout(() => {
+      this.#poolReleaseTimer = undefined;
+      // Re-checked inside the timer: a session may have joined the same child in
+      // the meantime (the rewind's close-then-open does exactly that).
+      if (this.#pooled !== process) return;
+      if (this.#claimsOf(process) > 0) return;
+      void this.#shutdownPool();
+    }, POOL_RELEASE_GRACE_MS);
+    timer.unref?.();
+    this.#poolReleaseTimer = timer;
+  }
+
+  /** Outstanding claims on one child; zero for a child the pool never handed out. */
+  #claimsOf(process: DshProcess): number {
+    return this.#poolClaims.get(process) ?? 0;
+  }
+
+  /** Cancel a pending idle shutdown (a new session took the child again). */
+  #cancelPoolRelease(): void {
+    if (this.#poolReleaseTimer === undefined) return;
+    clearTimeout(this.#poolReleaseTimer);
+    this.#poolReleaseTimer = undefined;
+  }
+
+  /**
+   * Shut the shared child down for real and forget it.
+   *
+   * Called on provider teardown and by the idle grace timer. Detaching every
+   * session first keeps the bridge's per-session tables from being read after
+   * the child is gone; the shutdown frame then disposes the runtime.
+   */
+  async #shutdownPool(): Promise<void> {
+    this.#cancelPoolRelease();
+    const pooled = this.#pooled;
+    this.#pooled = undefined;
+    this.#poolSpawn = undefined;
+    if (pooled === undefined) return;
+    // Only this child's claims are dropped. Other children can still have
+    // outstanding claims (a session that opened onto a child which was later
+    // replaced); clearing the whole map would make those claims unreleasable and
+    // is exactly the "reset the accounting" shortcut that hid the leak before.
+    this.#poolClaims.delete(pooled);
+    await pooled.shutdown();
+  }
+
+  /**
+   * The shared child exited on its own.
+   *
+   * Every session that was attached to it is dead, and `DshProcess` already
+   * reports that per session (`#exitAll` → each session's `onExit`, which emits
+   * `session.runtime_failed`). What is left is the pool's own bookkeeping: drop
+   * the corpse so the next open spawns a fresh child instead of reusing a dead
+   * one, and clear the reference count so that spawn starts from zero.
+   */
+  #onPoolExit(child: DshProcess, code: number | null, signal: string | null): void {
+    if (this.#pooled !== child) return;
+    process.stderr.write(
+      `[${PROVIDER_ID}] the shared DeepSeek Harness process exited (code ${code ?? "null"}, signal ${signal ?? "none"}); `
+        + "the next session open will spawn a new one\n",
+    );
+    this.#pooled = undefined;
+    this.#poolSpawn = undefined;
+    // The child is gone, so every claim on it is void: the sessions that held
+    // them are dead too (each was told through `#exitAll`). Dropping only this
+    // child's entry keeps any older child's claims intact for their own release.
+    this.#poolClaims.delete(child);
+    this.#cancelPoolRelease();
   }
 
   async #dispatch(input: ProviderInput): Promise<void> {
@@ -888,6 +1188,42 @@ class DshConnection implements ProviderConnection {
       );
     }
 
+    // A provider session id is supposed to be minted fresh for every open, and
+    // Paseo does that on the reload path. The provider must not leak when it is
+    // not: `#sessions` is a map, so a second `session.open` for an id it already
+    // tracks would **overwrite** the entry, and the replaced `DshSession` would
+    // keep its claim on the shared child with nothing left to release it — the
+    // pool would never reach zero and never retire its child.
+    //
+    // `#sessionHolding` above cannot catch this: it looks for the same *DSH*
+    // session id under a **different** provider session id, and here both ids are
+    // the same. Measured before this close was added: a fake-bridge run opened
+    // one root four times under a single provider session id, left three orphaned
+    // `DshSession` claims behind, and the shared child never retired.
+    //
+    // Closing the stale instance first makes a repeated open idempotent instead of
+    // a leak. `close()` is idempotent on its own, returns the claim, and never
+    // shuts the shared child down — so a sibling conversation running in it is
+    // unaffected.
+    const replaced = this.#sessions.get(sessionId);
+    if (replaced !== undefined) {
+      process.stderr.write(
+        `[${PROVIDER_ID}] session ${sessionId} is being opened again; closing the previous instance first `
+          + "so its claim on the shared process is returned\n",
+      );
+      this.#sessions.delete(sessionId);
+      try {
+        await replaced.close({ park: false });
+      } catch (error) {
+        // Not fatal: the stale instance is gone from the map either way and the
+        // new open is what the caller asked for. Say so rather than swallowing it
+        // — a failed close is exactly where a claim would leak.
+        process.stderr.write(
+          `[${PROVIDER_ID}] closing the replaced session ${sessionId}: ${messageOf(error)}\n`,
+        );
+      }
+    }
+
     const session = new DshSession({
       sessionId,
       dshSessionId,
@@ -919,14 +1255,14 @@ class DshConnection implements ProviderConnection {
       log: (line) => {
         process.stderr.write(`[${PROVIDER_ID}] ${line}\n`);
       },
-      takeParked: (dshSessionId, expected) => this.#parked.take(dshSessionId, expected)?.process,
-      parkProcess: (process, meta) => this.#parked.park({
-        process,
-        sessionId: meta.sessionId,
-        dshSessionId: meta.dshSessionId,
-        cwd: meta.cwd,
-        routeKey: meta.routeKey,
-      }),
+      // Every session joins the one shared child; the pool owns its lifetime and
+      // its reference count. A session never spawns, parks or shuts a process
+      // down — with one child serving every conversation, any of those by a
+      // single session would take the others with it.
+      acquireProcess: () => this.#acquirePoolProcess({ cwd: config.cwd, route, env: config.env ?? {} }),
+      releaseProcess: (process) => {
+        this.#releasePoolProcess(process);
+      },
     });
     this.#sessions.set(sessionId, session);
 
@@ -1118,35 +1454,39 @@ class DshConnection implements ProviderConnection {
       );
     }
     const verb = archived ? "archive" : "unarchive";
-    // DSH's registry is process-global, so a session that is already open can
-    // carry the request — which is what lets a native child, with no process of
-    // its own, be archived through its root. But the archive *record* and the
-    // process that reads it back are different things: the record lands on disk,
-    // while `archivedSessionIds` is answered from the memory of the process that
-    // ran the call. So the process that owns this session goes first, and every
-    // other root is only a fallback. When nothing is open (the state after Paseo
-    // archived the last session), fall back to a throwaway runtime: the archive
-    // set lives in DSH's home, not in this process.
+    const reasons: string[] = [];
+    const note = (via: string, error: unknown): void => {
+      reasons.push(messageOf(error));
+      process.stderr.write(`[${PROVIDER_ID}] ${verb} via ${via} failed: ${messageOf(error)}\n`);
+    };
+    // **The write must land in the process that answers the gate.** DSH's
+    // `archived-session-gate` reads `workspaceRegistry.archivedSessionIds` from
+    // the memory of the process that runs the step (`archived-session-gate.js`
+    // `underArchivedSession`), while `setState` writes the medium *and* that same
+    // memory (`dsh-workspace/lib/index.js:938-941`). There is no cross-process
+    // invalidation — no reload hook, no `domain/changed` across processes (it is
+    // a local `ctx.emit`), and the set is written whole (`[...state.archivedSessionIds, id]`),
+    // so a process carrying a snapshot from its own start silently drops another
+    // process's change. Consequences:
+    //
+    // - Writing from a process that does NOT own the session leaves the owner
+    //   stale: every later turn of that session is rejected as `blocked` with no
+    //   model request, which Paseo shows as "the turn ended with blocked".
+    // - Therefore the owner carries the write, and **nothing is ever killed to
+    //   make that true.** Under one-process-multi-session every session shares one
+    //   child, so the old `#parked.discard` here would have killed every other
+    //   open conversation along with it. The `discard` calls are gone; the tiers
+    //   below only ever *add* a carrier.
+    //
+    // Tier 1 — the open session that holds this DSH session (the root itself, or
+    // its native child, which has no process of its own).
     const ordered = [...this.#sessions.values()].sort(
       (a, b) => Number(b.holdsDshSession(dshSessionId)) - Number(a.holdsDshSession(dshSessionId)),
     );
     const holder = ordered.find((session) => session.holdsDshSession(dshSessionId));
-    const reasons: string[] = [];
-    const note = (dshId: string, error: unknown): void => {
-      reasons.push(messageOf(error));
-      process.stderr.write(`[${PROVIDER_ID}] ${verb} via ${dshId} failed: ${messageOf(error)}\n`);
-    };
-    const dropStaleParked = (): void => {
-      this.#parked.discard(dshSessionId, `${verb} was carried by another process`);
-    };
     if (holder !== undefined) {
       try {
         await holder.archiveDshSession(dshSessionId, archived);
-        // A parked entry for the same id cannot coexist with a live holder (the
-        // parked process still holds the session log's write lock), so this is a
-        // no-op today — it keeps that invariant from depending on park/take
-        // staying exactly as they are.
-        dropStaleParked();
         return;
       } catch (error) {
         // A rescued failure still means this process did not do it, so it is
@@ -1155,26 +1495,48 @@ class DshConnection implements ProviderConnection {
         note(holder.dshId, error);
       }
     }
-    // Paseo closes a session before it archives or unarchives it, so by the time
-    // the request arrives the holder is usually a *parked* process, not an open
-    // one. That parked process must not write the change, though: DSH's registry
-    // serializes its whole archive set, and a parked process only holds the set
-    // it read at its own start, so letting it write would silently drop another
-    // session's archive change. The carriers below are therefore unchanged — a
-    // throwaway runtime reads the current set. What the parked process cannot do
-    // is survive: it is the process the reopen adopts, and DSH's archived-session
-    // gate answers from process memory, so a stale set leaves it rejecting every
-    // turn of that session with no model request at all ("the turn ended with
-    // blocked").
+    // Tier 2 — any other open root. DSH's registry is process-global, so a root
+    // that already has a process can carry the request for a session it does not
+    // hold. This is what lets a native child be archived through its root, and
+    // what honours the common "Paseo closed it, then archived it" order.
     for (const session of ordered) {
       if (session === holder) continue;
       try {
         await session.archiveDshSession(dshSessionId, archived);
-        dropStaleParked();
         return;
       } catch (error) {
         note(session.dshId, error);
       }
+    }
+    // Tier 3 — the shared pool process, even when no provider session is attached
+    // to it right now (every session closed but the delayed shutdown has not run
+    // yet). `DshProcess.setArchived` does not require the session to be attached:
+    // the bridge's `applyArchived` uses the process-wide `workspaceRegistry`
+    // (`dsh-bridge/lib/server.js:1213-1218`) and `paseo/archive` is not gated on
+    // `initialize` (only `prompt` is, `server.js:701`). Using the pool here is
+    // what keeps the write inside the one process that answers the gate.
+    const pooled = this.#livePoolProcess();
+    if (pooled !== undefined) {
+      try {
+        const result = await pooled.setArchived(dshSessionId, archived);
+        if (!result.available) throw new Error(result.error?.message ?? `${verb} failed`);
+        return;
+      } catch (error) {
+        note("the shared process", error);
+      }
+    }
+    // Tier 4 — a throwaway runtime, only when **no live process can carry it**.
+    // That is the only case where writing outside the pool is safe: the next
+    // spawn reads the archive set from DSH's storage (`dsh-workspace/lib/index.js:379-384`,
+    // `Service.init`), so it cannot inherit a stale snapshot. A live pool makes
+    // this tier unreachable on purpose — a probe write while the pool was alive
+    // would desync the very process that answers the gate, and the fallback for
+    // *that* used to be killing it (which is exactly what this rewrite forbids).
+    if (pooled !== undefined) {
+      throw new Error(
+        `cannot ${verb} ${dshSessionId}: the shared DeepSeek Harness process refused it (${reasons.join("; ")}); `
+          + "it was not retried in a throwaway runtime because that would leave the shared process on a stale archive set",
+      );
     }
     try {
       await applyArchivedStandalone(dshSessionId, archived);
@@ -1182,7 +1544,6 @@ class DshConnection implements ProviderConnection {
       reasons.push(messageOf(error));
       throw new Error(`cannot ${verb} ${dshSessionId}: ${reasons.join("; ")}`);
     }
-    dropStaleParked();
   }
 
   /**

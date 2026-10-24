@@ -171,11 +171,34 @@ export class PaseoHarnessServer {
     this.maxTokens = undefined;
 
     /**
+     * One process serves many Paseo sessions, so `cwd` and the route above are
+     * only the PROCESS DEFAULT: what a session gets when nobody told the bridge
+     * anything for it. Per-session values live in these two tables, written by
+     * `initialize` when it carries a `sessionId` (see `routeFor`).
+     *
+     * They outlive `session/close` on purpose. A closed session's DSH agent can
+     * be resumed in this same process (a parked process is taken back for the
+     * same Paseo session), and a route table that was emptied while
+     * `initializedSessions` still said "initialized" would make the resumed
+     * session silently compose ANOTHER session's process defaults — exactly the
+     * cross-talk this refactor removes. Clearing both or neither keeps the pair
+     * consistent; `session/close` clears neither.
+     */
+    this.sessionCwd = new Map();
+    /** sessionId -> { provider, model, reasoningEffort, maxTokens } (complete). */
+    this.sessionRoutes = new Map();
+
+    /**
      * Plan-mode intent recorded before a session's agent exists. Paseo opens a
      * session purely to read its composer features and never prompts it, so plan
      * and route changes must be queueable instead of requiring a live agent.
+     *
+     * sessionId -> boolean, and the key is DELETED once the intent is applied.
+     * A single boolean was the bug: nothing ever set it back to `false`, so one
+     * queued "plan on" forced plan mode onto every session this process created
+     * afterwards while the UI kept showing the real (build) state.
      */
-    this.pendingPlanMode = false;
+    this.pendingPlanMode = new Map();
 
     /**
      * sessionId -> preset id chosen before its agent existed. A preset is a
@@ -242,10 +265,40 @@ export class PaseoHarnessServer {
      */
     this.assistantStreams = new Map();
     this.disposers = [];
+    /**
+     * Whether this process has served ANY `initialize` — only used to tell
+     * "the client never talked to us" apart from "it initialized another
+     * session". Prompt admission uses {@link initializedSessions}, because a
+     * process-wide boolean lets a session that never initialized of its own
+     * accord run on whichever route some other session happened to pin.
+     */
     this.initialized = false;
+    /**
+     * sessionId -> the route table's key was filled by an `initialize` that
+     * named this session. A prompt from a session absent from this set would
+     * silently inherit the process defaults — the P0 this refactor removes —
+     * so it is refused instead. The Set is deliberately NOT emptied by
+     * `session/close`: a closed session's agent can be resumed in this process,
+     * and a resume that had to initialize again would be a protocol regression.
+     */
+    this.initializedSessions = new Set();
+    /**
+     * MCP entries Paseo attached to each session, in DSH's own patch-entry
+     * shape (`{ name, config }`), queued until the session's agent exists and
+     * consumed by `setup`. The bridge mounts them mechanically — it never
+     * hardcodes which plugins those are — so the plugin layer keeps owning the
+     * translation (gateway vs. native client vs. refusal).
+     */
+    this.pendingMcpServers = new Map();
     this.shuttingDown = false;
     this.shutdownTask = undefined;
-    this.llmFiber = undefined;
+    /**
+     * provider -> the adapter fiber this process loaded for it. One value meant
+     * a second `initialize` for a DIFFERENT provider overwrote the first, losing
+     * the only dispose handle for an adapter that stayed loaded for the life of
+     * the process.
+     */
+    this.llmFibers = new Map();
 
     this.disposers.push(
       ctx.on('session/event', (session, event) => {
@@ -334,7 +387,9 @@ export class PaseoHarnessServer {
     const parentId = String(session.id);
     let child = this.children.get(childId);
     if (child === undefined) {
-      child = { parentId, opened: false, buffered: [], cwd: this.cwd };
+      // The parent's own directory, not the process default: a child of the
+      // session running in project B must not be reported with project A's cwd.
+      child = { parentId, opened: false, buffered: [], cwd: this.sessionDirectoryFor(parentId) };
       this.children.set(childId, child);
     }
     if (child.label === undefined && data.label !== undefined) child.label = String(data.label);
@@ -508,20 +563,62 @@ export class PaseoHarnessServer {
     return undefined;
   }
 
-  /** Validate the route and record the defaults applied to every created agent. */
+  /**
+   * The route a session composes with: what `initialize` recorded for it, and
+   * the process defaults only as a fallback for the fields it did not pin.
+   *
+   * A complete object is always returned so `createSession` never has to merge
+   * two sources itself — the merge point is here, once.
+   *
+   * @param {string | undefined} sessionId
+   * @returns {{provider: string | undefined, model: string | undefined,
+   *   reasoningEffort: string | undefined, maxTokens: number | undefined}}
+   */
+  routeFor(sessionId) {
+    const pinned = sessionId === undefined ? undefined : this.sessionRoutes.get(sessionId);
+    return {
+      provider: pinned?.provider ?? this.provider,
+      model: pinned?.model ?? this.model,
+      reasoningEffort: pinned?.reasoningEffort ?? this.reasoningEffort,
+      maxTokens: pinned?.maxTokens ?? this.maxTokens,
+    };
+  }
+
+  /**
+   * Validate the route and record it — for one session when `params.sessionId`
+   * is present, as this process's defaults when it is not.
+   *
+   * The two forms are the same validation; only the destination differs. A
+   * session-scoped call resolves against that session's own previously pinned
+   * route (falling back to the process defaults), so re-initializing a session
+   * with just a `cwd` keeps its route instead of silently adopting whatever
+   * another session last pinned process-wide.
+   *
+   * No idempotence conflict: several sessions each send their own `initialize`
+   * with a different `sessionId`, which is how one process serves many Paseo
+   * sessions at once.
+   */
   async initialize(params) {
     if (params.cwd === undefined) throw new TypeError('initialize requires cwd');
     if (params.reasoningEffort !== undefined) effortOf(params.reasoningEffort);
     const cwd = resolve(params.cwd);
+    const sessionId = params.sessionId === undefined || params.sessionId === null
+      ? undefined
+      : String(params.sessionId);
     const fallback = this.profileDefault();
-    const provider = params.provider ?? this.provider ?? fallback?.provider;
-    const model = params.model ?? this.model ?? fallback?.model;
+    const pinned = sessionId === undefined ? undefined : this.sessionRoutes.get(sessionId);
+    // The session's own route outranks the process defaults: they are the
+    // values some OTHER session pinned, and inheriting them here is precisely
+    // the cross-talk this refactor removes.
+    const provider = params.provider ?? pinned?.provider ?? this.provider ?? fallback?.provider;
+    const model = params.model ?? pinned?.model ?? this.model ?? fallback?.model;
     if (provider === undefined || model === undefined) {
       throw new Error('no provider/model was given and this profile configures no default model');
     }
+    const inheritedEffort = pinned?.reasoningEffort ?? this.reasoningEffort;
     const reasoningEffort = params.reasoningEffort !== undefined
       ? effortOf(params.reasoningEffort)
-      : this.reasoningEffort
+      : inheritedEffort
         ?? (fallback?.reasoningEffort === undefined ? undefined : effortOf(fallback.reasoningEffort));
 
     if (!this.hasAdapterFor(provider)) {
@@ -532,23 +629,48 @@ export class PaseoHarnessServer {
           + 'or list it under the paseo-bridge `adapters` config',
         );
       }
-      const mod = await import(adapter);
-      this.llmFiber = await this.ctx.plugin(mod);
+      // Keyed by provider: two sessions on different providers each keep their
+      // own fiber, and neither loses the other's dispose handle.
+      if (!this.llmFibers.has(provider)) {
+        const mod = await import(adapter);
+        this.llmFibers.set(provider, await this.ctx.plugin(mod));
+      }
     }
 
+    const maxTokens = params.maxTokens ?? pinned?.maxTokens;
     await this.ctx.get('llm').resolveCallConfig({
       provider,
       model,
       ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
-      ...(params.maxTokens === undefined ? {} : { maxTokens: params.maxTokens }),
+      ...(maxTokens === undefined ? {} : { maxTokens }),
     });
 
-    this.cwd = cwd;
-    this.provider = provider;
-    this.model = model;
-    this.reasoningEffort = reasoningEffort;
-    this.maxTokens = params.maxTokens;
     this.initialized = true;
+    if (sessionId === undefined) {
+      this.cwd = cwd;
+      this.provider = provider;
+      this.model = model;
+      this.reasoningEffort = reasoningEffort;
+      this.maxTokens = params.maxTokens;
+    } else {
+      this.sessionCwd.set(sessionId, cwd);
+      this.sessionRoutes.set(sessionId, { provider, model, reasoningEffort, maxTokens });
+      this.initializedSessions.add(sessionId);
+      // A reconnect can re-initialize a session whose agent is already live. The
+      // route table is what `routeFor` answers with, so leaving the agent on its
+      // old selection would make the bridge's own state disagree with the agent
+      // it is describing — and `paseo/usage` prices against the selection.
+      // Mutating the existing ref (rather than replacing it) keeps the listeners
+      // `installModelSelection` installed pointing at the same object.
+      const control = this.controls.get(sessionId);
+      if (control !== undefined) {
+        control.selection.current = {
+          provider,
+          model,
+          ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+        };
+      }
+    }
     return {
       serverInfo: { name: 'deepseek-harness-paseo-bridge', version: '0.1.0' },
       route: { provider, model, reasoningEffort: reasoningEffort ?? null },
@@ -573,8 +695,16 @@ export class PaseoHarnessServer {
    * other producer that could have sent the prompt without the bridge seeing it.
    */
   async prompt(params) {
-    if (!this.initialized) throw new Error('paseo bridge is not initialized');
-    const rec = await this.getOrCreateSession(params.sessionId);
+    // Per session, not per process: a process-wide gate let a session that had
+    // never initialized run on another session's route without saying so.
+    const sessionId = String(params.sessionId);
+    if (!this.initializedSessions.has(sessionId)) {
+      throw new Error(
+        `paseo bridge is not initialized for session ${sessionId}; `
+        + 'send `initialize` with this sessionId before prompting',
+      );
+    }
+    const rec = await this.getOrCreateSession(sessionId);
     this.assertLiveAgent(rec, params.sessionId);
     const content = await durablePromptContent(this.ctx, params.contentBlocks ?? []);
     this.assertLiveAgent(rec, params.sessionId);
@@ -606,7 +736,13 @@ export class PaseoHarnessServer {
     if (planMode === undefined) return { available: false, active: false, pending: false };
     const rec = this.sessions.get(params.sessionId);
     if (rec === undefined) {
-      return { available: true, active: this.pendingPlanMode === true, pending: false };
+      // Per session: a single boolean answered "plan is on" for EVERY session
+      // in the process as soon as one of them queued it.
+      return {
+        available: true,
+        active: this.pendingPlanMode.get(params.sessionId) === true,
+        pending: false,
+      };
     }
     this.assertLiveAgent(rec, params.sessionId);
     const state = planMode.get(rec.handle.agent);
@@ -620,7 +756,7 @@ export class PaseoHarnessServer {
     const active = params.active === true;
     const rec = this.sessions.get(params.sessionId);
     if (rec === undefined) {
-      this.pendingPlanMode = active;
+      this.pendingPlanMode.set(params.sessionId, active);
       return { available: true, active, pending: false, outcome: 'queued' };
     }
     this.assertLiveAgent(rec, params.sessionId);
@@ -634,22 +770,35 @@ export class PaseoHarnessServer {
     };
   }
 
-  /** Mutate the per-agent route, or the default route while no agent exists yet. */
+  /**
+   * Mutate the per-agent route, or queue the change for a session whose agent
+   * does not exist yet.
+   *
+   * The queued form writes {@link sessionRoutes} for THAT session and never the
+   * process defaults: before the split, switching a model on a session that had
+   * not created its agent yet rewrote the defaults every later session would
+   * inherit, so a pick made in one composer silently re-routed the next one.
+   */
   async configSet(params) {
     if (typeof params.preset === 'string' && params.preset !== '') {
       await this.setPreset(params.sessionId, params.preset);
     }
     const rec = this.sessions.get(params.sessionId);
     if (rec === undefined) {
-      if (typeof params.provider === 'string') this.provider = params.provider;
-      if (typeof params.model === 'string') this.model = params.model;
-      if (params.reasoningEffort !== undefined) {
-        this.reasoningEffort = effortOf(params.reasoningEffort);
-      }
+      const current = this.routeFor(params.sessionId);
+      const next = {
+        provider: typeof params.provider === 'string' ? params.provider : current.provider,
+        model: typeof params.model === 'string' ? params.model : current.model,
+        reasoningEffort: params.reasoningEffort !== undefined
+          ? effortOf(params.reasoningEffort)
+          : current.reasoningEffort,
+        maxTokens: current.maxTokens,
+      };
+      this.sessionRoutes.set(params.sessionId, next);
       return {
-        provider: this.provider,
-        model: this.model,
-        reasoningEffort: this.reasoningEffort ?? null,
+        provider: next.provider,
+        model: next.model,
+        reasoningEffort: next.reasoningEffort ?? null,
         preset: this.currentPreset(params.sessionId),
       };
     }
@@ -1151,7 +1300,11 @@ export class PaseoHarnessServer {
     if (skills !== undefined) {
       let list;
       try {
-        list = await skills.list({ cwd: this.cwd, scope: agent });
+        // The composer's `/` menu is per project: this session's own directory,
+        // resolved the same way the tools resolve it. The process default is
+        // only the last resort — using it unconditionally listed the skills of
+        // whichever session initialized first in every other session's menu.
+        list = await skills.list({ cwd: this.sessionDirectoryFor(params.sessionId, agent), scope: agent });
       } catch {
         // A skill source that fails discovery must not take commands down with it.
         list = [];
@@ -1258,7 +1411,10 @@ export class PaseoHarnessServer {
       if (root === undefined) return;
       const anchorSeq = this.latestHumanAnchor(root);
       if (anchorSeq === undefined) return;
-      this.childAnchors.record(session.id, anchorSeq);
+      // The owning root is part of the anchor, not an afterthought: with several
+      // sessions in one process, `12` under root A and `12` under root B are
+      // different human messages, and a rewind in A must not touch B's children.
+      this.childAnchors.record(session.id, anchorSeq, root.id);
     } catch (error) {
       process.stderr.write(
         `[bridge] could not record a delegated turn anchor: ${error instanceof Error ? error.message : String(error)}\n`,
@@ -1345,7 +1501,43 @@ export class PaseoHarnessServer {
     } catch {
       /* fall back to the session's original project directory */
     }
-    return session?.header?.cwd ?? this.cwd;
+    // Fail open: no process-wide default here. In a one-process-many-sessions
+    // runtime `this.cwd` is the directory of whichever session initialized
+    // first, so falling back to it would resolve a tool's relative path inside
+    // ANOTHER project — and a snapshot recorded under the wrong path lets a
+    // rewind act on a file the tool never touched. A skipped snapshot is
+    // already reported through the rewind receipt.
+    return session?.header?.cwd;
+  }
+
+  /**
+   * The directory a session's project-scoped catalogs (skills) resolve against.
+   *
+   * Prefers the authoritative `workingDirectory` projection — the same one the
+   * tools use, so `cd`-style moves are honoured — then the session's own
+   * recorded cwd, then the process default. Only used for read-only discovery:
+   * anything that WRITES a path goes through {@link workingDirectoryFor}, which
+   * fails open instead of guessing.
+   *
+   * @param {string} sessionId
+   * @param {object} [agent]
+   * @returns {string}
+   */
+  sessionDirectoryFor(sessionId, agent) {
+    if (agent !== undefined) {
+      try {
+        const current = this.ctx.get('workingDirectory')?.get?.(agent.session);
+        if (typeof current === 'string' && current !== '') return current;
+      } catch {
+        /* the profile composes no working-directory service */
+      }
+    }
+    const pinned = this.sessionCwd.get(sessionId);
+    if (pinned !== undefined) return pinned;
+    const rec = this.sessions.get(sessionId);
+    const headerCwd = rec?.handle?.agent?.session?.header?.cwd;
+    if (typeof headerCwd === 'string' && headerCwd !== '') return headerCwd;
+    return this.cwd;
   }
 
   /**
@@ -1464,6 +1656,14 @@ export class PaseoHarnessServer {
    * `SubagentRuntime.interrupt` is fire-and-return: the child may still perform a
    * little work before observing the cancel signal.
    *
+   * The candidate set is scoped to the root being rewound. `child-anchors.js`
+   * keys anchors by (root, seq), and this call passes that root so a rewind in
+   * one session cannot interrupt a sibling session's children — with one process
+   * serving many sessions, an unscoped scan withdrew every child in the process
+   * whose dispatch seq merely fell in range. `delegated-cancel.js` takes an
+   * `{ withdrawnSince(seq) }` view, which is how the root binding stays here,
+   * where the root is known, instead of being threaded through the policy module.
+   *
    * @param {object} agent - the root agent (an exact live ancestor authority).
    * @param {number} targetSeq
    * @returns {string[]} child session ids the bridge signalled.
@@ -1471,8 +1671,12 @@ export class PaseoHarnessServer {
   cancelWithdrawnDelegations(agent, targetSeq) {
     const subagents = this.ctx.get('subagents');
     if (subagents === undefined) return [];
+    const rootSessionId = agent?.session?.id === undefined ? undefined : String(agent.session.id);
+    const scopedAnchors = {
+      withdrawnSince: (seq) => this.childAnchors.withdrawnSince(seq, rootSessionId),
+    };
     const result = cancelDelegatedWork(
-      this.childAnchors,
+      scopedAnchors,
       targetSeq,
       (childId) => {
         subagents.interrupt(childId, { kind: 'ancestor', agent });
@@ -1940,13 +2144,15 @@ export class PaseoHarnessServer {
       }
     }
     this.controls.clear();
+    // Every provider's adapter fiber, not just the last one: with a per-provider
+    // map a process that initialized two routes has two loaded adapters, and
+    // disposing only the newest leaked the other for the life of the process.
+    const adapters = [...this.llmFibers.values()];
+    this.llmFibers.clear();
     const teardown = await Promise.allSettled([
       ...records.map((rec) => Promise.resolve().then(() => rec.handle.dispose())),
-      ...(this.llmFiber === undefined
-        ? []
-        : [Promise.resolve().then(() => this.llmFiber?.dispose())]),
+      ...adapters.map((fiber) => Promise.resolve().then(() => fiber?.dispose())),
     ]);
-    this.llmFiber = undefined;
     failures.push(
       ...teardown.filter((result) => result.status === 'rejected').map((result) => result.reason),
     );
@@ -1996,11 +2202,226 @@ export class PaseoHarnessServer {
         return this.planSet(params);
       case 'paseo/config/set':
         return this.configSet(params);
+      case 'paseo/mcp/set':
+        return this.setMcpServers(params);
+      case 'session/close':
+        return this.closeSession(params);
       case 'shutdown':
         return this.shutdown();
       default:
         throw new Error(`unknown paseo bridge method: ${method}`);
     }
+  }
+
+  /**
+   * Queue the MCP entries Paseo attached to one session.
+   *
+   * The entries are DSH patch entries (`{ name, config }`): the plugin layer
+   * keeps owning the translation (gateway vs. native client vs. refusing a
+   * legacy transport) and this bridge only mounts what it is handed, at the
+   * agent scope, when the session's agent is created. Queued rather than applied
+   * because Paseo configures a session before it ever prompts it.
+   *
+   * @param {{sessionId?: unknown, entries?: unknown}} params
+   * @returns {{accepted: true, entries: number, mounted: boolean}}
+   */
+  async setMcpServers(params) {
+    const sessionId = String(params.sessionId);
+    const entries = params.entries;
+    if (!Array.isArray(entries)) {
+      throw new Error(`paseo/mcp/set for session ${sessionId} requires an "entries" array`);
+    }
+    for (const entry of entries) {
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw new Error(`paseo/mcp/set for session ${sessionId} carries an entry that is not an object`);
+      }
+      if (typeof entry.name !== 'string' || entry.name === '') {
+        throw new Error(`paseo/mcp/set for session ${sessionId} carries an entry without a plugin "name"`);
+      }
+    }
+    // An empty list is meaningful (this session gets no MCP servers) and must
+    // override a previously queued set, so it is stored like any other.
+    this.pendingMcpServers.set(sessionId, entries.map((entry) => ({
+      name: entry.name,
+      config: entry.config ?? {},
+    })));
+    // A session whose agent already exists has run its `setup`; the entries are
+    // kept for a later resume (a parked process is taken back for the same
+    // session, which re-runs `resumeSetup`) but cannot be mounted retroactively
+    // at the agent scope. Report it rather than pretend: silently reporting
+    // success here is exactly how "the model has no tools" would become a
+    // mystery. The protocol is `initialize` → `paseo/mcp/set` → prompt, so this
+    // only fires on a retry after the first turn.
+    const live = this.sessions.has(sessionId);
+    if (live) {
+      process.stderr.write(
+        `[bridge] paseo/mcp/set for ${sessionId} arrived after its agent was created; `
+        + `${entries.length} entr(y/ies) will be mounted when the session is next resumed\n`,
+      );
+    }
+    return { accepted: true, entries: entries.length, mounted: !live };
+  }
+
+  /**
+   * Forget everything this bridge tracks for one Paseo session, and dispose the
+   * agent it owns so the session can be opened again.
+   *
+   * One process serves many sessions, so every per-session table has to be
+   * emptied when a session goes away — otherwise `owns()` stays true forever and
+   * later `paseo/question` frames keep being routed to a session nobody is
+   * listening to. Idempotent: an unknown id answers `{ closed: false }` instead
+   * of throwing, because a close racing a process teardown is normal.
+   *
+   * The agent is disposed. This is NOT the plugin layer's park/shutdown decision
+   * — it is what makes "close then reopen the same session id" possible at all.
+   * The agent holds the session log's WRITE LEASE (`SessionWriteLease`, acquired
+   * by `persistence.open(id, 'write')`), and only its teardown closes that
+   * handle; keeping the agent alive across a close left the lease held, so the
+   * next `agents.create(sessionId)` failed with "already owned by an active
+   * write handle" — an error that does not match the "already exists" resume
+   * path, so it surfaced to the user and the session could never be reopened.
+   * In a long-lived shared process that is not a transient, it is permanent.
+   *
+   * Disposing here is safe for the parked-process reuse the plugin layer wants:
+   * what a parked process keeps is the DSH runtime (services, adapters), not the
+   * agent. Reopening resumes the same persisted session from its durable log,
+   * which is exactly what a park/reopen already did before this refactor.
+   *
+   * The route tables (`sessionCwd` / `sessionRoutes`) and `initializedSessions`
+   * are deliberately KEPT. A closed session's DSH agent can be resumed in this
+   * same process (a parked process is taken back for the same Paseo session), and
+   * a route table emptied while the session still counted as initialized would
+   * make that resume silently compose another session's process defaults — the
+   * very cross-talk this refactor removes. Clearing both or neither keeps the
+   * pair consistent; the contract lists neither, so neither is cleared.
+   *
+   * @param {{sessionId?: unknown}} params
+   * @returns {{closed: boolean}}
+   */
+  async closeSession(params) {
+    const sessionId = String(params.sessionId);
+    // Every descendant, not just direct children: `children` records the DIRECT
+    // parent, so a grandchild is only reachable by walking the chain. A leftover
+    // descendant would keep its frames routing to a closed session.
+    const descendants = [];
+    const pending = [sessionId];
+    const seen = new Set(pending);
+    while (pending.length > 0) {
+      const parent = pending.pop();
+      for (const [childId, child] of this.children) {
+        if (child.parentId !== parent || seen.has(childId)) continue;
+        seen.add(childId);
+        descendants.push(childId);
+        pending.push(childId);
+      }
+    }
+    const known = this.sessions.has(sessionId)
+      || this.sessionCreations.has(sessionId)
+      || this.controls.has(sessionId)
+      || this.assistantStreams.has(sessionId)
+      || this.pendingPresets.has(sessionId)
+      || this.pendingPlanMode.has(sessionId)
+      || this.pendingMcpServers.has(sessionId)
+      || this.children.has(sessionId)
+      || this.initializedSessions.has(sessionId)
+      || this.sessionCwd.has(sessionId)
+      || this.sessionRoutes.has(sessionId);
+    if (!known) return { closed: false };
+
+    // Capture the record before the tables are dropped, then dispose it AFTER
+    // they are empty: `handle.dispose()` cancels the running turn, waits for
+    // idle, unwinds the agent scope and closes the session's write handle, and
+    // its teardown may emit events that must no longer find this session in the
+    // bridge's tables (a closing session's late `turn/end` is not Paseo's to
+    // see). The write handle is the point of the exercise — see the doc comment.
+    const rec = this.sessions.get(sessionId);
+
+    // Dispose the model-selection listeners of a live record before dropping the
+    // only reference to their disposer: `installModelSelection` installed them on
+    // the agent's scope, and `handle.dispose()` tears that scope down, so this is
+    // belt-and-braces (and a no-op once the scope is gone) rather than the
+    // mechanism.
+    const control = this.controls.get(sessionId);
+    try {
+      control?.dispose?.();
+    } catch (error) {
+      process.stderr.write(
+        `[bridge] disposing the model selection of closed session ${sessionId} failed: `
+        + `${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
+    this.sessions.delete(sessionId);
+    this.controls.delete(sessionId);
+    this.assistantStreams.delete(sessionId);
+    this.pendingPresets.delete(sessionId);
+    this.pendingPlanMode.delete(sessionId);
+    this.pendingMcpServers.delete(sessionId);
+    this.children.delete(sessionId);
+    // A rewind in flight for this session will finish on its own; dropping the
+    // marker only stops a later rewind from being refused on behalf of a session
+    // that is already gone. (The `finally` in `revert` deletes it again, safely.)
+    this.revertInflight.delete(sessionId);
+    // Pending file-snapshot owners are keyed `<sessionId>:<callId>`. A tool that
+    // was mid-flight when the session closed would otherwise leave its entry
+    // here for the life of the process, and its `commit`/`discard` would act on
+    // a session nobody owns.
+    for (const key of [...this.snapshotOwners.keys()]) {
+      if (key.startsWith(`${sessionId}:`)) this.snapshotOwners.delete(key);
+    }
+    for (const childId of descendants) {
+      this.children.delete(childId);
+      this.assistantStreams.delete(childId);
+      // The anchor table is keyed by child, so a root's `delete` alone does not
+      // reach children that were recorded under another parent in the chain.
+      this.childAnchors.deleteChild(childId);
+      this.revertInflight.delete(childId);
+      for (const key of [...this.snapshotOwners.keys()]) {
+        if (key.startsWith(`${childId}:`)) this.snapshotOwners.delete(key);
+      }
+    }
+    // Root-scoped anchors of this session, plus any unscoped ones a caller
+    // recorded without naming a root (those can only belong to a single-session
+    // process, and that process is closing this session).
+    this.childAnchors.delete(sessionId);
+
+    // An in-flight creation is not in `sessions` yet, so the loop above could not
+    // dispose it. Await it here (settling either way) and dispose whatever it
+    // produced: a close racing a creation must not leave an unowned agent holding
+    // the write lease — that is the same permanent failure, just rarer.
+    const creating = this.sessionCreations.get(sessionId);
+    if (creating !== undefined) {
+      this.sessionCreations.delete(sessionId);
+      const raced = await creating.then(
+        (created) => created,
+        () => undefined,
+      );
+      if (raced !== undefined) {
+        try {
+          await raced.handle?.dispose?.();
+        } catch (error) {
+          process.stderr.write(
+            `[bridge] disposing a session created concurrently with close failed for ${sessionId}: `
+            + `${error instanceof Error ? error.message : String(error)}\n`,
+          );
+        }
+      }
+    }
+
+    if (rec !== undefined) {
+      // A close must not be defeated by a teardown that fails: the tables are
+      // already cleared, and throwing here would turn a successful close into an
+      // error the plugin reports to the user. Report it on stderr instead — a
+      // lease that outlived its agent is exactly the thing worth seeing.
+      try {
+        await rec.handle?.dispose?.();
+      } catch (error) {
+        process.stderr.write(
+          `[bridge] disposing the agent of closed session ${sessionId} failed; `
+          + `the session may not be reopenable: ${error instanceof Error ? error.message : String(error)}\n`,
+        );
+      }
+    }
+    return { closed: true };
   }
 
   requireSession(sessionId) {
@@ -2031,13 +2452,26 @@ export class PaseoHarnessServer {
     return creation;
   }
 
-  async createSession(sessionId) {
+  /**
+   * Create (or resume) the DSH agent behind one session.
+   *
+   * Everything that used to be read off the process — cwd, route, maxTokens —
+   * is read for THIS session, falling back to the process defaults only for
+   * fields the session never pinned. See {@link routeFor}.
+   *
+   * @param {string} sessionId
+   * @param {{cwd?: string, route?: object}} [options] - explicit overrides, used
+   *   by callers that already resolved the values (`initialize` does not, it
+   *   writes the tables; this is for tests and future entry points).
+   */
+  async createSession(sessionId, options = {}) {
+    const route = options.route === undefined ? this.routeFor(sessionId) : { ...this.routeFor(sessionId), ...options.route };
     // Mirrors the ACP adapter: the durable option carries the initial route and
     // a scoped mutable selection ref installed during setup owns later switches.
     const initial = {
-      provider: this.provider,
-      model: this.model,
-      ...(this.reasoningEffort === undefined ? {} : { reasoningEffort: this.reasoningEffort }),
+      provider: route.provider,
+      model: route.model,
+      ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
     };
     const control = { selection: { current: initial, assembled: undefined }, dispose: undefined };
     // Model-selection only. The delegation tools need no wrapper here: DSH
@@ -2053,13 +2487,35 @@ export class PaseoHarnessServer {
       control.dispose = installModelSelection(agentCtx, control.selection);
     };
 
+    // Paseo's MCP servers are mounted at the AGENT scope, not as a profile-wide
+    // patch: each Paseo session carries its own server URL and token (the URL
+    // names the caller agent id), so a process-wide mount would give every
+    // session whichever identity was injected first. The entries arrive in DSH's
+    // own patch-entry shape and are loaded mechanically — this bridge never
+    // hardcodes which plugins they are, so the plugin layer keeps owning the
+    // gateway-vs-native translation.
+    const mountMcp = async (agentCtx) => {
+      const entries = this.pendingMcpServers.get(sessionId);
+      if (entries === undefined) return;
+      for (const entry of entries) {
+        if (entry === null || typeof entry !== 'object') continue;
+        if (typeof entry.name !== 'string' || entry.name === '') {
+          throw new Error(`paseo/mcp/set for session ${sessionId} carries an entry without a plugin name`);
+        }
+        await agentCtx.plugin(await import(entry.name), entry.config ?? {});
+      }
+    };
+
     // A session that runs under an agent preset mounts it during setup, exactly
     // like api-session-controller's composeAgent. Without a preset registry in
     // the profile this is skipped and the session composes at the host plane as
     // before, so preset support stays opt-in.
     const presets = this.ctx.get('agentPresets');
     let agentPreset;
-    let setup = installSelection;
+    let setup = async (agentCtx, agent) => {
+      installSelection(agentCtx);
+      await mountMcp(agentCtx);
+    };
     if (presets !== undefined) {
       // `resolvePreset` validates before the session exists, so a stale queued id
       // fails here (readably) instead of poisoning every later attempt.
@@ -2068,14 +2524,16 @@ export class PaseoHarnessServer {
       setup = async (agentCtx, agent) => {
         installSelection(agentCtx);
         await presets.mount(agentCtx, resolvedId);
+        await mountMcp(agentCtx);
       };
     }
 
     const agentOptions = {
       ...initial,
-      ...(this.maxTokens === undefined ? {} : { maxTokens: this.maxTokens }),
+      ...(route.maxTokens === undefined ? {} : { maxTokens: route.maxTokens }),
     };
-    const meta = { cwd: this.cwd, ...(agentPreset === undefined ? {} : { agentPreset }) };
+    const cwd = options.cwd ?? this.sessionCwd.get(sessionId) ?? this.cwd;
+    const meta = { cwd, ...(agentPreset === undefined ? {} : { agentPreset }) };
     let handle;
     try {
       handle = await this.ctx.agents.create({
@@ -2115,7 +2573,10 @@ export class PaseoHarnessServer {
       // beats a conversation that can never be opened. This can happen after a
       // deployment renames a preset, or when a newer DSH renames the built-in
       // default that every existing session's header recorded.
-      let resumeSetup = installSelection;
+      let resumeSetup = async (agentCtx, agent) => {
+        installSelection(agentCtx);
+        await mountMcp(agentCtx);
+      };
       if (presets !== undefined) {
         const requested = this.pendingPresets.get(sessionId);
         let resolvedId;
@@ -2138,6 +2599,7 @@ export class PaseoHarnessServer {
         resumeSetup = async (agentCtx, agent) => {
           installSelection(agentCtx);
           await presets.mount(agentCtx, resolvedId);
+          await mountMcp(agentCtx);
           // Record the composition that actually ran, so `paseo/presets.current`
           // (which folds this event over the header) cannot keep naming the
           // preset the fallback replaced. Log-only, same shape as the official
@@ -2156,9 +2618,14 @@ export class PaseoHarnessServer {
     const rec = { handle, control };
     this.controls.set(sessionId, control);
     this.sessions.set(sessionId, rec);
-    if (this.pendingPlanMode) {
+    // Consume the queued plan intent and DELETE the key. Leaving it in place (or
+    // resetting a single process-wide boolean) is what forced plan mode onto
+    // every later session in the process after one session asked for it.
+    if (this.pendingPlanMode.has(sessionId)) {
+      const wanted = this.pendingPlanMode.get(sessionId) === true;
+      this.pendingPlanMode.delete(sessionId);
       const planMode = this.ctx.get('planMode');
-      if (planMode !== undefined) planMode.set(handle.agent, true);
+      if (wanted && planMode !== undefined) planMode.set(handle.agent, true);
     }
     return rec;
   }
