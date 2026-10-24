@@ -153,6 +153,24 @@ const CHILD_BUFFER_CAP = 500;
 const MAX_SESSION_ROUTE_ENTRIES = 500;
 
 /**
+ * How long a session's next creation waits for the previous close's teardown.
+ *
+ * The teardown — `handle.dispose()` waiting for idle and closing the session log's
+ * write handle — has no deadline of its own, and the CALLER of `session/close` has
+ * a short one (10 s in `dsh-process.ts`), so a slow dispose regularly outlives the
+ * receipt that reported it. A reopen that starts in that window fails with "already
+ * owned by an active write handle" and shows up as a session whose first prompt
+ * fails. Waiting here is the fix; this bound is what keeps a stuck dispose from
+ * turning into a session that can never open at all.
+ *
+ * Sized from the measurement rather than guessed at: `closeSession` costs ~0.4 ms
+ * of bridge bookkeeping plus however long the agent's own idle wait takes, so the
+ * only real question is how long a legitimately busy agent takes to go idle. 30 s
+ * is well past any interactive turn boundary and still finite.
+ */
+const TEARDOWN_WAIT_TIMEOUT_MS = 30_000;
+
+/**
  * Minimum spacing between live assistant snapshots forwarded to Paseo.
  *
  * DSH publishes one transient frame per streamed chunk, so forwarding every
@@ -187,6 +205,16 @@ export class PaseoHarnessServer {
     this.model = options.model;
     this.reasoningEffort = effortOf(options.reasoningEffort);
     this.maxTokens = undefined;
+    /**
+     * sessionId -> the teardown its last `session/close` started, while it runs.
+     *
+     * The dispose closes the session log's write handle, so a reopen that starts
+     * before it finishes cannot materialize the session. The receipt and the
+     * teardown used to be the same await, which broke as soon as the caller had a
+     * shorter timeout than the dispose: the caller reopened and lost its first
+     * turn. See `#trackTeardown` / `#awaitTeardown`.
+     */
+    this.teardowns = new Map();
 
     /**
      * One process serves many Paseo sessions, so `cwd` and the route above are
@@ -317,6 +345,21 @@ export class PaseoHarnessServer {
      * and a resume that had to initialize again would be a protocol regression.
      */
     this.initializedSessions = new Set();
+    /**
+     * Ids this bridge has seen `session/close` for, and which nothing has
+     * re-initialized since. The only eviction candidates for the three route
+     * tables (see `#trimSessionRouteTables`).
+     *
+     * This exists because "not live and not mid-creation" was **not** a safe
+     * eviction predicate: a session that has opened (so it initialized) but has
+     * not prompted yet owns no agent, so neither table contains it, and it is the
+     * oldest row exactly when the cap is hit. Dropping it there was permanent —
+     * the plugin's `#initializedSessions` cache meant `initialize` was never
+     * re-sent, and `prompt` refused the session forever. An entry is added here
+     * by `closeSession` and removed by `initialize` (and by the trim that drops
+     * its row), so the cap only ever recycles ids whose owner has walked away.
+     */
+    this.closedSessions = new Set();
     /**
      * MCP entries Paseo attached to each session, in DSH's own patch-entry
      * shape (`{ name, config }`), queued until the session's agent exists and
@@ -610,11 +653,27 @@ export class PaseoHarnessServer {
    * {@link MAX_SESSION_ROUTE_ENTRIES} are removed from all three at once — a
    * surviving `initializedSessions` entry whose route was evicted would let a
    * prompt run on another session's process defaults, the cross-talk this
-   * refactor removes. Sessions that are live or mid-creation are never evicted;
-   * those are bounded by the number of agents, not by reload churn. An evicted
-   * session behaves like one this process never saw: its next request
-   * re-initializes it, and `prompt` refuses it until then instead of guessing a
-   * route.
+   * refactor removes.
+   *
+   * **Only sessions this bridge has seen close are evicted, and that ordering is
+   * the whole point.** The old predicate was "not live and not mid-creation",
+   * which looks equivalent and is not: a session that was opened (so it
+   * initialized, in the documented order) but has not prompted yet is in neither
+   * `sessions` nor `sessionCreations` — its agent does not exist — and it is
+   * exactly the *oldest* row once a process has served a few hundred
+   * conversations. Evicting it was unrecoverable rather than "re-initialized on
+   * next use": the plugin caches "this session is initialized"
+   * (`dsh-process.ts` `#initializedSessions`), so it never re-sends `initialize`,
+   * `prompt` refused with "not initialized", and the session could not be
+   * prompted again until it was closed and reopened. {@link closedSessions} is
+   * the missing distinction: an id enters it in `closeSession`, leaves it when it
+   * initializes again, and only its members are eligible.
+   *
+   * The cap still holds unconditionally. When there are not enough closed rows
+   * to satisfy it (a client that opened more than the cap and closed none), the
+   * overflow is taken from the remaining rows oldest-first — the bound matters
+   * more than the preference — and every id dropped that way is named in the log,
+   * because those are the ones the plugin must re-initialize to use.
    *
    * @param {string} keep - id of the session just initialized.
    */
@@ -633,26 +692,67 @@ export class PaseoHarnessServer {
       this.initializedSessions.delete(keep);
       this.initializedSessions.add(keep);
     }
-    const excess = this.sessionRoutes.size - MAX_SESSION_ROUTE_ENTRIES;
+    // A session that just initialized is in use, so it is no longer a close
+    // candidate: leaving it here would let its own close order make it evictable
+    // while the caller that just initialized it is about to prompt.
+    this.closedSessions.delete(keep);
+    let excess = this.sessionRoutes.size - MAX_SESSION_ROUTE_ENTRIES;
     if (excess <= 0) return;
-    let dropped = 0;
-    for (const key of [...this.sessionRoutes.keys()]) {
-      if (dropped >= excess) break;
-      if (key === keep) continue;
-      // Never evict a session this process is currently using: a live agent's
-      // prompt is admitted through `initializedSessions`, and an in-flight
-      // creation already read its route. Those entries are bounded by the number
-      // of live agents anyway; the cap exists for the parked/closed tail.
-      if (this.sessions.has(key) || this.sessionCreations.has(key)) continue;
+
+    /** Forget one row from all three tables. @param {string} key */
+    const drop = (key) => {
       this.sessionRoutes.delete(key);
       this.sessionCwd.delete(key);
       this.initializedSessions.delete(key);
-      dropped += 1;
+      this.closedSessions.delete(key);
+    };
+
+    let droppedClosed = 0;
+    for (const key of [...this.closedSessions]) {
+      if (droppedClosed >= excess) break;
+      if (key === keep) continue;
+      // Closed and untouched by a resume since: this is the parked tail the cap
+      // exists for, and the plugin re-initializes it on its next attach.
+      if (this.sessions.has(key) || this.sessionCreations.has(key)) continue;
+      drop(key);
+      droppedClosed += 1;
     }
-    if (dropped > 0) {
+    if (droppedClosed > 0) {
       process.stderr.write(
-        `[bridge] dropped ${String(dropped)} oldest session route/cwd/initialized entr(y/ies) `
+        `[bridge] dropped ${String(droppedClosed)} closed session route/cwd/initialized entr(y/ies) `
         + `(cap ${String(MAX_SESSION_ROUTE_ENTRIES)})\n`,
+      );
+    }
+
+    excess = this.sessionRoutes.size - MAX_SESSION_ROUTE_ENTRIES;
+    if (excess <= 0) return;
+    // Hard bound, softer candidate set. Reaching here means more than the cap is
+    // open-but-unclosed, which no well-behaved client does; the alternative
+    // (growing without bound in a process that outlives every conversation) is
+    // worse. Naming the ids is what makes the consequence — each one must
+    // `initialize` again, which the plugin does on the next gate refusal —
+    // diagnosable instead of looking like a session that mysteriously will not
+    // prompt.
+    const overflow = [];
+    for (const key of [...this.sessionRoutes.keys()]) {
+      if (overflow.length >= excess) break;
+      if (key === keep) continue;
+      if (this.sessions.has(key) || this.sessionCreations.has(key)) continue;
+      overflow.push(key);
+    }
+    for (const key of overflow) drop(key);
+    // Prune close markers whose row is already gone (an id closed twice, or
+    // dropped by the pass above): without this the set would keep ids the three
+    // tables no longer hold and drift away from them.
+    for (const key of [...this.closedSessions]) {
+      if (!this.sessionRoutes.has(key)) this.closedSessions.delete(key);
+    }
+    if (overflow.length > 0) {
+      process.stderr.write(
+        `[bridge] dropped ${String(overflow.length)} OPEN (unclosed) session route/cwd/initialized entr(y/ies) `
+        + `to hold the ${String(MAX_SESSION_ROUTE_ENTRIES)} cap: ${overflow.join(", ")}\n`
+        + '[bridge] those sessions must `initialize` again before they can prompt; '
+        + 'the plugin re-initializes them when a prompt is refused\n',
       );
     }
   }
@@ -815,6 +915,13 @@ export class PaseoHarnessServer {
     // never initialized run on another session's route without saying so.
     const sessionId = String(params.sessionId);
     if (!this.initializedSessions.has(sessionId)) {
+      // The `initialize`-required marker is a stable protocol token, not prose:
+      // the route tables are bounded, so an id can legitimately lose its row (see
+      // `#trimSessionRouteTables`) while the plugin's own cache still says
+      // "initialized". The plugin keys its one-shot self-heal on this substring
+      // (`dsh-process.ts` `#isNotInitializedError`), which is what lets a prompt
+      // recover without the user closing and reopening the session. Keep the
+      // token and the explanation on one line so both readers agree.
       throw new Error(
         `paseo bridge is not initialized for session ${sessionId}; `
         + 'send `initialize` with this sessionId before prompting',
@@ -2537,6 +2644,17 @@ export class PaseoHarnessServer {
     // alive for a later rewind in the parent.
     this.childAnchors.deleteChild(sessionId);
 
+    // This id's owner has walked away, so its route rows become recyclable — the
+    // ONLY rows the cap is allowed to evict (see `#trimSessionRouteTables`). It is
+    // recorded here, before the dispose below, so a close the caller abandons at
+    // its own timeout still leaves the id recyclable: the tables are already
+    // dropped at this point, and a later trim must be able to reclaim them.
+    // Descendants go in too — their frames are no longer routed anywhere, and a
+    // subagent that is never closed individually would otherwise pin its row for
+    // the life of the process.
+    this.closedSessions.add(sessionId);
+    for (const childId of descendants) this.closedSessions.add(childId);
+
     // An in-flight creation is not in `sessions` yet, so the loop above could not
     // dispose it. Await it here (settling either way) and dispose whatever it
     // produced: a close racing a creation must not leave an unowned agent holding
@@ -2569,14 +2687,19 @@ export class PaseoHarnessServer {
         // while we awaited the race may have published a record of its own, which
         // is NOT ours to drop.
         if (this.sessions.get(sessionId) === raced) this.#forgetSessionState(sessionId);
-        try {
-          await raced.handle?.dispose?.();
-        } catch (error) {
-          process.stderr.write(
-            `[bridge] disposing a session created concurrently with close failed for ${sessionId}: `
-            + `${error instanceof Error ? error.message : String(error)}\n`,
-          );
-        }
+        // Same pending-teardown record as the ordinary close below: this dispose
+        // also closes a session log's write handle, and the reopen that follows an
+        // abandoned close must wait for it.
+        await this.#trackTeardown(sessionId, async () => {
+          try {
+            await raced.handle?.dispose?.();
+          } catch (error) {
+            process.stderr.write(
+              `[bridge] disposing a session created concurrently with close failed for ${sessionId}: `
+              + `${error instanceof Error ? error.message : String(error)}\n`,
+            );
+          }
+        });
       }
     }
 
@@ -2585,16 +2708,80 @@ export class PaseoHarnessServer {
       // already cleared, and throwing here would turn a successful close into an
       // error the plugin reports to the user. Report it on stderr instead — a
       // lease that outlived its agent is exactly the thing worth seeing.
-      try {
-        await rec.handle?.dispose?.();
-      } catch (error) {
-        process.stderr.write(
-          `[bridge] disposing the agent of closed session ${sessionId} failed; `
-          + `the session may not be reopenable: ${error instanceof Error ? error.message : String(error)}\n`,
-        );
-      }
+      //
+      // The dispose is **re-published as a pending teardown** for its whole
+      // duration, because the caller may give up waiting first (`DshProcess`
+      // bounds `session/close` at 10 s) and reopen the session immediately. The
+      // write handle this dispose closes is held until it finishes, and a
+      // `agents.create`/`resume` that starts before then fails with "already
+      // owned by an active write handle" — which surfaces as a session that
+      // opened fine and whose FIRST prompt fails. Recording the promise is what
+      // lets the next creation wait for it instead of racing it.
+      await this.#trackTeardown(sessionId, async () => {
+        try {
+          await rec.handle?.dispose?.();
+        } catch (error) {
+          process.stderr.write(
+            `[bridge] disposing the agent of closed session ${sessionId} failed; `
+            + `the session may not be reopenable: ${error instanceof Error ? error.message : String(error)}\n`,
+          );
+        }
+      });
     }
     return { closed: true };
+  }
+
+  /**
+   * Run one agent teardown while it is visible to the next creation of the same
+   * session id, and clear the record when it settles.
+   *
+   * The record outlives the `session/close` receipt on purpose: the caller can
+   * abandon the request (its own timeout) while `dispose()` is still closing the
+   * session log's write handle, and the reopen that follows must wait for that
+   * rather than fail its first turn.
+   *
+   * @param {string} sessionId
+   * @param {() => Promise<void>} teardown - never throws; it reports internally.
+   */
+  async #trackTeardown(sessionId, teardown) {
+    const task = teardown();
+    this.teardowns.set(sessionId, task);
+    try {
+      await task;
+    } finally {
+      // Only clear our own record: a newer close of the same id may already have
+      // replaced it, and that one's waiters must not be released early.
+      if (this.teardowns.get(sessionId) === task) this.teardowns.delete(sessionId);
+    }
+  }
+
+  /**
+   * Wait (bounded) for a previous close's teardown of this session id to finish.
+   *
+   * Called before the agent for that id is created or resumed. The bound matters
+   * as much as the wait: a dispose that is stuck forever must not turn into a
+   * session that can never open, so a timeout is reported and the creation is
+   * attempted anyway — racing the lock is bad, hanging forever is worse.
+   *
+   * @param {string} sessionId
+   */
+  async #awaitTeardown(sessionId) {
+    const pending = this.teardowns.get(sessionId);
+    if (pending === undefined) return;
+    let timer;
+    const bounded = new Promise((resolve) => {
+      timer = setTimeout(resolve, TEARDOWN_WAIT_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    await Promise.race([pending.catch(() => undefined), bounded]);
+    clearTimeout(timer);
+    if (this.teardowns.get(sessionId) === pending) {
+      process.stderr.write(
+        `[bridge] the previous close of session ${sessionId} is still disposing its agent after `
+        + `${String(TEARDOWN_WAIT_TIMEOUT_MS)}ms; opening anyway — the first turn may fail `
+        + 'with "already owned by an active write handle"\n',
+      );
+    }
   }
 
   /**
@@ -2657,6 +2844,19 @@ export class PaseoHarnessServer {
     if (existing !== undefined) return existing;
     const pending = this.sessionCreations.get(sessionId);
     if (pending !== undefined) return pending;
+    // A close of this same id may still be disposing its agent — see
+    // `#awaitTeardown`. This is the reopen path the plugin takes straight after an
+    // abandoned close (a rewind reload, a Paseo refresh), so it is exactly where
+    // the write-handle race used to land.
+    await this.#awaitTeardown(sessionId);
+    // Re-checked after the wait: a creation that started while we waited has
+    // already been registered, and spawning a second one for the same id would
+    // give the session two agents and two write handles.
+    if (this.shuttingDown) throw new Error('paseo bridge is shutting down');
+    const raced = this.sessions.get(sessionId);
+    if (raced !== undefined) return raced;
+    const started = this.sessionCreations.get(sessionId);
+    if (started !== undefined) return started;
     const creation = this.createSession(sessionId);
     this.sessionCreations.set(sessionId, creation);
     creation.then(

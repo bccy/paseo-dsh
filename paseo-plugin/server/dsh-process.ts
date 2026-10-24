@@ -21,6 +21,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { profileName } from "./bootstrap";
+import { createFrameReader, splitFrames, type FrameReader } from "./frame-reader";
 
 /** JSON-compatible value tree. */
 export type JsonValue = string | number | boolean | null | { [key: string]: JsonValue } | JsonValue[];
@@ -269,10 +270,26 @@ const ORPHAN_FRAME_TTL_MS = 5_000;
  * so at the request default (120 s) one unresponsive close would hold the caller
  * for two minutes and every other session on the process queued behind it. The
  * local half of the close (detaching this session's handlers) has already
- * happened by then, and the failure is logged, so a timeout degrades to "the
- * bridge's tables may shrink later" rather than to a hang.
+ * happened by then, and the failure is logged. Measured on the real bridge, the
+ * bridge's own bookkeeping costs ~0.4 ms and the rest is however long the agent
+ * takes to go idle, which for an interactive turn is seconds — 10 s covers it, and
+ * the case it does not cover is handled rather than left to chance: the timed-out
+ * request is remembered per session and the next attach waits for it
+ * ({@link DshProcess.#closeTasks}). That is the difference between "we stopped
+ * waiting" and "nobody is waiting any more".
  */
 const SESSION_CLOSE_TIMEOUT_MS = 10_000;
+/**
+ * How long the next attach waits for a close that outlived
+ * {@link SESSION_CLOSE_TIMEOUT_MS}.
+ *
+ * The bridge now waits for the same teardown on its side
+ * (`#awaitTeardown`, bounded at 30 s there), so this is the plugin's own bound on
+ * the same condition: after it, the attach proceeds and the session may lose its
+ * first prompt — reported, never hidden. It is deliberately longer than the
+ * bridge's bound so the bridge's diagnosis wins when both fire.
+ */
+const CLOSE_PENDING_TIMEOUT_MS = 35_000;
 
 /** What one attached session contributes besides its handlers. */
 export interface DshSessionOptions {
@@ -673,11 +690,29 @@ export class DshProcess {
   readonly #options: DshProcessOptions;
   /**
    * The handlers that belong to the child itself rather than to any one session:
-   * stderr lines and JSON-RPC protocol failures. They stay process-wide so a
-   * session cannot silence diagnostics for the sessions sharing its process.
+   * stderr lines, JSON-RPC protocol failures and **the child's own exit**. They
+   * stay process-wide so a session cannot silence diagnostics for the sessions
+   * sharing its process.
+   *
+   * `onExit` belongs here rather than only to the session that happens to share
+   * the child's construction id. It used to reach the owner *only* through that
+   * session's handler set (the constructor installs one for `options.sessionId`,
+   * and `#exitAll` calls it like any other), which made a process-level callback
+   * depend on that entry still being in the map: detaching the construction id
+   * would have silently stopped reporting the exit the provider's pool
+   * bookkeeping listens for. Both paths now converge on {@link #reportExit},
+   * which fires the callback **exactly once** per child. A parked process is the
+   * case that needs this: `setHandlers` re-points both the process-level sink and
+   * the construction session, and the pool's "forget the exited child" must run
+   * once, not twice.
+   *
    * Mutable on purpose: {@link setHandlers} re-points a parked process.
    */
-  #processHandlers: { onLog(line: string): void; onProtocolError(message: string): void };
+  #processHandlers: {
+    onLog(line: string): void;
+    onProtocolError(message: string): void;
+    onExit(code: number | null, signal: string | null): void;
+  };
   /**
    * One handler set per attached session, keyed by DSH's own session id.
    *
@@ -696,6 +731,18 @@ export class DshProcess {
   readonly #sessionMcp = new Map<string, DshMcpEntry[]>();
   /** Memoized per-session preparation, so concurrent callers share one attempt. */
   readonly #readyTasks = new Map<string, Promise<void>>();
+  /**
+   * sessionId -> the `session/close` it last sent, while that request is pending.
+   *
+   * Kept because the request outlives the caller's patience: {@link closeSession}
+   * gives up after {@link SESSION_CLOSE_TIMEOUT_MS}, and the bridge's dispose —
+   * the thing that actually closes the session log's write handle — keeps running.
+   * The reopen that follows must wait for it, which is what {@link #awaitClose}
+   * does. Deliberately NOT cleared by {@link detachSession}: the close is sent
+   * from there, so clearing it on detach would erase the very record the next
+   * attach needs.
+   */
+  readonly #closeTasks = new Map<string, Promise<void>>();
   /**
    * Child session id -> its direct parent, learned from `session.child-opened`.
    *
@@ -732,10 +779,19 @@ export class DshProcess {
   /** Timers that report and drop one orphan bucket that never became routable. */
   readonly #orphanTimers = new Map<string, ReturnType<typeof setTimeout>>();
   #child: ChildProcessWithoutNullStreams | undefined;
-  #buffer = "";
+  /**
+   * The stdout frame splitter for this child.
+   *
+   * Replaced on every spawn rather than reused: a `FrameReader` holds the
+   * partial line of the stream it was created for, and carrying that across a
+   * respawn would prepend a dead child's half-frame to the new child's first one.
+   */
+  #frames: FrameReader = createFrameReader();
   #pending = new Map<number, Pending>();
   #nextId = 1;
   #closed = false;
+  /** Whether the process-level exit callback has already fired for this child. */
+  #exitReported = false;
   #initializeTask: Promise<void> | undefined;
   /** Resolved once the child is gone; created lazily by {@link waitForExit}. */
   #exited: Promise<void> | undefined;
@@ -746,6 +802,7 @@ export class DshProcess {
     this.#processHandlers = {
       onLog: (line) => options.onLog(line),
       onProtocolError: (message) => options.onProtocolError(message),
+      onExit: (code, signal) => options.onExit(code, signal),
     };
     // The session this process was built for is attached immediately, so a
     // single-session construction behaves exactly as it did before the split.
@@ -789,6 +846,7 @@ export class DshProcess {
     this.#processHandlers = {
       onLog: (line) => handlers.onLog(line),
       onProtocolError: (message) => handlers.onProtocolError(message),
+      onExit: (code, signal) => handlers.onExit(code, signal),
     };
     this.#sessionHandlers.set(this.#options.sessionId, {
       onEvent: (payload) => handlers.onEvent(payload),
@@ -895,6 +953,28 @@ export class DshProcess {
     if (!this.#sessionHandlers.has(sessionId)) return;
     this.detachSession(sessionId);
     if (this.#closed || this.#child === undefined) return;
+    const task = this.#sendClose(sessionId);
+    this.#closeTasks.set(sessionId, task);
+    try {
+      await task;
+    } finally {
+      // Only clear our own record: a newer close of the same id may already have
+      // replaced it, and that one's waiters must not be released early.
+      if (this.#closeTasks.get(sessionId) === task) this.#closeTasks.delete(sessionId);
+    }
+  }
+
+  /**
+   * Send one `session/close` and log what came back; never throws.
+   *
+   * Separate from {@link closeSession} because the promise itself has to be
+   * retained: the public method awaits it with a bound that the *bridge's* dispose
+   * can outlive, and everything that reopens the same session needs to know the
+   * dispose is still running. See {@link #awaitClose}.
+   *
+   * @param sessionId - the session being closed.
+   */
+  async #sendClose(sessionId: string): Promise<void> {
     try {
       // A **bounded** wait, deliberately short. This runs on the teardown path
       // (a Paseo close, a rewind's reload), and the bridge's `session/close`
@@ -905,6 +985,14 @@ export class DshProcess {
       // are already detached above, so the local half of the close has happened;
       // giving up on the receipt only means the bridge's tables shrink later or
       // not at all, and that is reported rather than hidden.
+      //
+      // Giving up here does NOT mean nobody waits: the bridge records its own
+      // teardown (`server.js` `#trackTeardown`) and the next creation of this id
+      // waits for it, and this side records the promise so the next attach can
+      // wait too ({@link #awaitClose}). Without that pair, a slow dispose became
+      // "reopened before it finished", whose symptom is a session that opens and
+      // then fails its first prompt with "already owned by an active write
+      // handle".
       const result = (await this.#request("session/close", { sessionId }, SESSION_CLOSE_TIMEOUT_MS)) as
         | { closed?: unknown }
         | undefined;
@@ -920,6 +1008,45 @@ export class DshProcess {
         `session/close failed for ${sessionId}: ${toError(error, "close failed").message}`,
       );
     }
+  }
+
+  /**
+   * Wait (bounded) for a close of this id that the caller already abandoned.
+   *
+   * The bridge's dispose — which is what closes the session log's write handle —
+   * can outlive {@link SESSION_CLOSE_TIMEOUT_MS}, and the reopen that follows (a
+   * rewind reload, a Paseo refresh, a user reopening the same conversation)
+   * starts milliseconds later. Attaching into that window used to produce a
+   * session that reported itself ready and then failed its FIRST prompt with
+   * "already owned by an active write handle", because the previous agent still
+   * held the lease.
+   *
+   * Two-sided on purpose: the bridge waits for its own teardown before creating
+   * the agent (`server.js` `#awaitTeardown`), and this waits before sending the
+   * session's `initialize`/`paseo/mcp/set`. Waiting only on one side still leaves
+   * the other's frames queued behind an open write handle.
+   *
+   * A timeout is logged, not thrown: the attach must still be attempted, because
+   * a close that never finishes must not become a session that can never open.
+   *
+   * @param sessionId - the session about to be attached.
+   */
+  async #awaitClose(sessionId: string): Promise<void> {
+    const pending = this.#closeTasks.get(sessionId);
+    if (pending === undefined) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const bounded = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, CLOSE_PENDING_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    await Promise.race([pending, bounded]);
+    if (timer !== undefined) clearTimeout(timer);
+    if (this.#closeTasks.get(sessionId) !== pending) return;
+    this.#processHandlers.onLog(
+      `the previous close of ${sessionId} is still waiting for its receipt after `
+        + `${String(CLOSE_PENDING_TIMEOUT_MS)}ms; attaching anyway — the first turn may fail if the `
+        + "bridge is still disposing that agent",
+    );
   }
 
   /** Spawn the child and complete `initialize`. Idempotent. */
@@ -945,6 +1072,10 @@ export class DshProcess {
     });
     this.#child = child;
 
+    // A fresh splitter per spawn: see {@link #frames}. Created before the first
+    // `data` handler can run, which is guaranteed because nothing yields between
+    // here and the listener registration below.
+    this.#frames = createFrameReader();
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => this.#consume(chunk));
     child.stderr.setEncoding("utf8");
@@ -1066,6 +1197,13 @@ export class DshProcess {
   }
 
   async #prepareSession(sessionId: string): Promise<void> {
+    // A close of this same id may still be inside the bridge's dispose, and that
+    // dispose is what closes the session log's write handle. Sending this
+    // session's `initialize`/`paseo/mcp/set` into that window is harmless for the
+    // frames themselves, but the agent they prepare for is created by the prompt
+    // right after them — and THAT is what fails with "already owned by an active
+    // write handle". Waiting here is what closes the race; see {@link #awaitClose}.
+    await this.#awaitClose(sessionId);
     await this.#initializeSession(sessionId);
     await this.#sendSessionMcp(sessionId);
   }
@@ -1154,11 +1292,29 @@ export class DshProcess {
     }
   }
 
-  /** Tell every attached session the child is gone. */
+  /**
+   * Tell every attached session the child is gone, and fire the process-level
+   * exit callback **once**.
+   *
+   * Two audiences, and they are not the same thing: a session learns its
+   * conversation died (`session.runtime_failed`), and the process owner learns
+   * the child itself died (the provider's `#onPoolExit`, which drops the pooled
+   * reference and its claims). The process-level callback used to be reachable
+   * only as a side effect of the construction session still being attached — see
+   * {@link #processHandlers} — so it is called explicitly here, and
+   * {@link #reportExit} makes the "once" hold even when that session's own
+   * `onExit` is the very same function.
+   */
   #exitAll(code: number | null, signal: string | null): void {
     // The child dying ends every conversation it served, so all of them hear it
     // — not just whichever handler happened to be assigned last.
     for (const [sessionId, handlers] of [...this.#sessionHandlers]) {
+      // The construction session's `onExit` **is** `options.onExit` (the
+      // constructor and `setHandlers` both wire it that way). Skipping it here
+      // and firing the process-level sink below calls it exactly once; calling
+      // both would deliver the same callback twice, which the parked pool reads
+      // as two forgets and the provider logs as two exits.
+      if (sessionId === this.#options.sessionId) continue;
       try {
         handlers.onExit(code, signal);
       } catch (error) {
@@ -1166,6 +1322,33 @@ export class DshProcess {
           `session ${sessionId} exit handler failed: ${toError(error, "exit handler failed").message}`,
         );
       }
+    }
+    this.#reportExit(code, signal);
+  }
+
+  /**
+   * Fire the process-level exit callback exactly once per child.
+   *
+   * The provider's `#onPoolExit` is not idempotent in a harmless way: the first
+   * call drops the pooled reference and every claim, so a second call for the
+   * same child finds `#pooled !== child` and returns — the duplicate is therefore
+   * quiet, but the *log line* it writes when it does match would appear twice if
+   * the two paths ever both fired, which reads as "the child exited twice". The
+   * latch makes the contract explicit instead of relying on the consumer's guards.
+   *
+   * A throwing callback is logged, never propagated: this runs inside the child's
+   * own `exit` listener, and an exception there would escape into Node's event
+   * loop for a process that is already gone.
+   */
+  #reportExit(code: number | null, signal: string | null): void {
+    if (this.#exitReported) return;
+    this.#exitReported = true;
+    try {
+      this.#processHandlers.onExit(code, signal);
+    } catch (error) {
+      this.#processHandlers.onLog(
+        `process exit handler failed: ${toError(error, "exit handler failed").message}`,
+      );
     }
   }
 
@@ -1272,15 +1455,60 @@ export class DshProcess {
     // first prompt with an error that reads like a protocol bug, so the invariant
     // is maintained here rather than trusted to every caller.
     await this.#ensureSessionReady(sessionId);
-    const result = (await this.#request("session/prompt", {
+    const params = {
       sessionId,
       contentBlocks: contentBlocks ?? [{ type: "text", text }],
       ...(delivery === undefined ? {} : { delivery }),
-    })) as { messageId?: unknown; sourceKind?: unknown } | undefined;
+    };
+    let result: { messageId?: unknown; sourceKind?: unknown } | undefined;
+    try {
+      result = (await this.#request("session/prompt", params)) as typeof result;
+    } catch (error) {
+      // **Idempotent self-heal, once.** The bridge bounds its route tables, so a
+      // session whose row was recycled answers `prompt` with "is not initialized"
+      // even though this process still has it in `#initializedSessions` — which is
+      // precisely why the cached readiness cannot fix itself: `initialize` is the
+      // only frame that can, and nothing would ever re-send it. The user-visible
+      // symptom was a session that opened fine and whose every prompt failed until
+      // it was closed and reopened.
+      //
+      // One retry, only for that error: a second `initialize` + `prompt` is safe
+      // because the first prompt was refused outright (the bridge throws before it
+      // creates the agent or appends anything), and retrying any OTHER failure
+      // would risk duplicating a turn that actually ran.
+      if (!this.#isNotInitializedError(error)) throw error;
+      this.#initializedSessions.delete(sessionId);
+      this.#mcpSent.delete(sessionId);
+      // The memoized task is what held the stale "already initialized" belief, so
+      // it must go too or the retry would await the same fulfilled promise and
+      // send nothing.
+      this.#readyTasks.delete(sessionId);
+      this.#processHandlers.onLog(
+        `the bridge forgot session ${sessionId}'s initialize (its route table is bounded); re-initializing and retrying the prompt`,
+      );
+      await this.#ensureSessionReady(sessionId);
+      result = (await this.#request("session/prompt", params)) as typeof result;
+    }
     return {
       ...(typeof result?.messageId === "string" ? { messageId: result.messageId } : {}),
       ...(typeof result?.sourceKind === "string" ? { sourceKind: result.sourceKind } : {}),
     };
+  }
+
+  /**
+   * Whether a rejection is the bridge's "this session never initialized" gate.
+   *
+   * Matched on a substring the bridge emits verbatim (`server.js` `prompt`), not
+   * on any JSON-RPC shape: the transport hands the message through unchanged, and
+   * a structured code would have to be added to both sides of a protocol that
+   * only ever had messages. `null`/`undefined` rejections and unrelated text
+   * return false, so a genuine failure is never retried.
+   *
+   * @param error - the rejection from `#request`.
+   */
+  #isNotInitializedError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+    return message.includes("is not initialized for session");
   }
 
   /**
@@ -1669,28 +1897,41 @@ export class DshProcess {
     }
   }
 
+  /**
+   * Feed one stdout chunk through the incremental frame splitter and dispatch
+   * every frame it completed.
+   *
+   * The splitting itself lives in {@link createFrameReader} / {@link splitFrames}
+   * so it can be exercised offline (`harness/frame-reader-check.mjs`), and it is
+   * incremental rather than `buffer.split("\n")` because that reader was
+   * quadratic: a replayed conversation arrives as one ~39 MB frame in ~2400
+   * chunks and the old version scanned all ~47 GB of the growing buffer, which is
+   * where the multi-second rewind went. See the module comment in
+   * `frame-reader.ts` for the measurements.
+   *
+   * Everything this method still owns is the part that must not change:
+   *
+   * - A **blank** line is skipped silently (not reported as a parse failure). The
+   *   old code decided this with `line.trim() === ""`, and `trim()` is what makes
+   *   `\r\n` work, so the test is kept verbatim rather than replaced by "length
+   *   is zero" — a whitespace-only line is skipped the same as an empty one.
+   * - An **unparsable** line is handed to `onLog` as-is and the loop continues,
+   *   so one bad frame does not cost the frames queued behind it.
+   * - `#dispatch` is async and nothing awaits it. A rejection must not escape as
+   *   an unhandled one: this process is shared, so its default fate (terminate)
+   *   would end every conversation it serves over one frame.
+   */
   #consume(chunk: string): void {
-    this.#buffer += chunk;
-    const lines = this.#buffer.split("\n");
-    this.#buffer = lines.pop() ?? "";
-    for (const line of lines) {
-      if (line.trim() === "") continue;
-      let frame: Record<string, unknown>;
-      try {
-        frame = JSON.parse(line) as Record<string, unknown>;
-      } catch {
-        this.#processHandlers.onLog(line);
-        continue;
-      }
-      // `#dispatch` is async and nothing awaits it here. A rejection must not
-      // escape as an unhandled one: this process is shared, so its default fate
-      // (terminate) would end every conversation it serves over one frame.
-      void this.#dispatch(frame).catch((error: unknown) => {
-        this.#processHandlers.onLog(
-          `dispatching a bridge frame failed: ${toError(error, "dispatch failed").message}`,
-        );
-      });
-    }
+    splitFrames(this.#frames, chunk, {
+      onFrame: (frame) => {
+        void this.#dispatch(frame).catch((error: unknown) => {
+          this.#processHandlers.onLog(
+            `dispatching a bridge frame failed: ${toError(error, "dispatch failed").message}`,
+          );
+        });
+      },
+      onMalformed: (line) => this.#processHandlers.onLog(line),
+    });
   }
 
   /**
