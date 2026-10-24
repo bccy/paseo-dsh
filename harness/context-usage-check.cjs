@@ -1,24 +1,68 @@
 /**
  * 上下文上报边界回归：运行编译后的真实 DshSession，只替换进程传输。
- * 用法：node harness/context-usage-check.cjs <编译输出目录>
- * 不启动模型、不读取凭据、不操作正式会话。
+ * 用法：node harness/context-usage-check.cjs [编译输出目录]
+ *
+ * 不给目录时自动编译到 `paseo-plugin/.dbg-t5-context`（见
+ * `harness/plugin-build.cjs`：产物必须在仓库内，否则 node 从 /tmp 向上找不到
+ * `paseo-plugin/node_modules`）。不启动模型、不读取凭据、不操作正式会话。
  */
 const assert = require('node:assert/strict');
 const path = require('node:path');
 const { setTimeout: delay } = require('node:timers/promises');
+const { resolvePluginBuild } = require('./plugin-build.cjs');
 
-const compiled = path.resolve(process.argv[2]);
+const compiled = resolvePluginBuild(process.argv[2], '.dbg-t5-context');
 const processModule = require(path.join(compiled, 'server/dsh-process.js'));
 const instances = [];
+
+/**
+ * The transport stand-in.
+ *
+ * `DshSession` is driven through a module-level replacement of `DshProcess`
+ * (the constructor takes no process factory yet — that injection is the
+ * `DshSessionOptions.createProcess?` contract T3 owns). Because the whole class
+ * is replaced, **every method the session (or a caller of it) may reach has to
+ * exist here**, or the check dies with a TypeError that looks like a regression
+ * but is really an incomplete stub. The stubs below answer the shape each method
+ * returns without asserting anything about it — this file is about context
+ * usage, and the other surfaces have their own checks.
+ */
 class FakeProcess {
   constructor(options) {
     this.options = options;
     this.snapshot = { available: true, contextWindow: 64000, usedTokens: 1024 };
     this.reads = 0;
+    this.running = true;
+    this.planWrites = [];
     instances.push(this);
   }
   async start() {}
-  async shutdown() {}
+  async shutdown() {
+    this.running = false;
+  }
+  kill() {
+    this.running = false;
+  }
+  setHandlers(handlers) {
+    this.handlers = handlers;
+  }
+  /**
+   * Attach one session's handlers.
+   *
+   * `DshSession.open()` no longer spawns: it asks `acquireProcess()` for the
+   * shared child and attaches to it. The transport therefore has to accept an
+   * attach per session id — the session's handlers live in that map, not in a
+   * single field.
+   */
+  async attachSession(sessionId, handlers) {
+    this.attached ??= new Map();
+    this.attached.set(sessionId, handlers);
+    this.handlers = handlers;
+  }
+  /** Detach one session (the bridge drops its session-keyed tables). */
+  async closeSession(sessionId) {
+    this.attached?.delete(sessionId);
+  }
   async usage() {
     this.reads++;
     return this.readUsage ? this.readUsage() : this.snapshot;
@@ -26,29 +70,82 @@ class FakeProcess {
   async setConfig(config) {
     return { ...config, reasoningEffort: config.reasoningEffort ?? null };
   }
+  async setPlan(active) {
+    this.planWrites.push(active);
+    return { active, pending: false };
+  }
+  async getPlan() {
+    return { active: this.planWrites.at(-1) ?? false, pending: false, available: true };
+  }
+  async catalog() {
+    return { providers: [], models: [], presets: [] };
+  }
+  async commands() {
+    return [];
+  }
+  async permission() {
+    return { current: null, presets: [] };
+  }
+  async presets() {
+    return { presets: [], current: null };
+  }
+  async sessions() {
+    return { sessions: [] };
+  }
+  async subagents() {
+    return { subagents: [] };
+  }
+  async history() {
+    return { events: [], hasMore: false };
+  }
+  async prompt() {
+    return { turnId: 'fake-turn' };
+  }
+  async cancel() {}
+  async revert() {
+    return undefined;
+  }
+  async setArchived() {
+    return { available: true };
+  }
+  async runCommand() {
+    return { kind: 'success' };
+  }
+  async waitForExit() {
+    return true;
+  }
 }
 processModule.DshProcess = FakeProcess;
 const { DshSession } = require(path.join(compiled, 'server/session.js'));
 
 (async () => {
   const events = [];
+  // The session joins a shared child instead of spawning one, so the transport is
+  // supplied through `acquireProcess`. `releaseProcess` is the claim hand-back;
+  // this check never asserts on it, but `close()` calls it.
+  const sharedTransport = new FakeProcess({ sessionId: '__paseo_shared_process__' });
   const session = new DshSession({
     sessionId: 'context-check', cwd: process.cwd(), env: {},
     route: { provider: 'fixture', model: 'alpha' }, mode: 'build',
     models: [{ id: 'fixture/alpha' }, { id: 'fixture/beta' }],
     thinkingOptions: [], emit: e => events.push(e), log() {},
+    acquireProcess: async () => ({ process: sharedTransport, reused: false }),
+    releaseProcess: () => {},
   });
   await session.open();
-  const transport = instances.at(-1);
+  const transport = sharedTransport;
   const latest = () => events.filter(e => e.type === 'session.usage').at(-1)?.usage;
-  const emit = (type, data = {}) => transport.options.onEvent({ event: { type, data } });
+  // Handlers now come from `attachSession`, not from the constructor options, so
+  // the test drives them through the map the session registered.
+  const handlers = transport.attached.get('context-check');
+  const emit = (type, data = {}) => handlers.onEvent({ event: { type, data } });
 
   await session.refreshUsage();
   assert.equal(latest().contextWindowUsedTokens, 1024);
   assert.equal(latest().contextWindowMaxTokens, 64000);
   console.log('PASS 打开会话时上报已用量和容量');
 
-  transport.options.onStatus('running');
+  handlers.onStatus('running', 'context-check');
   const readsBeforeStep = transport.reads;
   transport.snapshot = { available: true, contextWindow: 64000, usedTokens: 2500 };
   emit('assistant/message', { usage: { inputTokens: 100, cacheReadTokens: 2300, outputTokens: 100 } });

@@ -79,6 +79,12 @@ async function tryRoute({ provider, model }) {
   let text = '';
   let failure = null;
   const { child, request } = bridge((event) => {
+    // Two shapes carry the answer, and a profile may publish only one of them:
+    // `assistant/attempt` (a streaming attempt with its chunk list) and the
+    // durable `assistant/message` (the settled message). This probe used to read
+    // only the first, so against a profile that emits the durable shape it
+    // reported every route as "FAILS … text=\"\"" with no error — a false red,
+    // reproduced here with the unmodified bridge as well.
     if (event.type === 'assistant/attempt') {
       for (const record of event.data.stream ?? []) {
         if (record.type !== 'chunk') continue;
@@ -88,14 +94,25 @@ async function tryRoute({ provider, model }) {
         }
       }
     }
+    if (event.type === 'assistant/message') {
+      for (const block of event.data?.message?.content ?? []) {
+        if (block?.type === 'text' && typeof block.text === 'string') text += block.text;
+      }
+    }
     if (event.type === 'turn/end' && event.data.reason?.kind === 'error') {
       failure = event.data.reason.error?.message ?? 'error';
     }
   });
   try {
-    await request('initialize', { cwd: process.cwd(), provider, model });
+    // One id for both frames. `initialize` pins cwd/route FOR THAT SESSION, and
+    // the bridge refuses a prompt from a session it has never initialized — so
+    // letting the two calls mint different ids (the pre-multi-session shape,
+    // where `initialize` was process-wide) would now fail every route with
+    // "paseo bridge is not initialized".
+    const sessionId = `route-${provider}-${model}-${Date.now()}`.replace(/[^A-Za-z0-9-]/g, '-');
+    await request('initialize', { cwd: process.cwd(), provider, model, sessionId });
     await request('session/prompt', {
-      sessionId: `route-${Date.now()}`,
+      sessionId,
       contentBlocks: [{ type: 'text', text: 'Reply with exactly: PONG' }],
     });
     await sleep(25000);

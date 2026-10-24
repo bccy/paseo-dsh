@@ -70,7 +70,37 @@
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
-const MODE = process.env.DSH_FAKE_MODE ?? "live";
+/**
+ * The scenario this process should replay, read fresh on every access.
+ *
+ * It used to be a module-level constant captured at start. That was correct
+ * while the plugin spawned one `dsh` child per session: every `session.open`
+ * started a new process, which read whatever `DSH_FAKE_MODE` the test had set
+ * by then. The plugin now keeps ONE shared child for the whole connection, so
+ * the child starts during the first scenario and would then replay that
+ * scenario's script forever — every later `DSH_FAKE_MODE` change in the test
+ * process is invisible to it, because a spawned child's environment is frozen
+ * at spawn time.
+ *
+ * `DSH_FAKE_MODE_FILE` is the escape hatch: when the test set it, the mode is
+ * re-read from that file on each access, so the parent can steer a long-lived
+ * child between scenarios. Without the file the environment is still honoured,
+ * which keeps every single-scenario check working unchanged.
+ */
+function currentMode() {
+  const file = process.env.DSH_FAKE_MODE_FILE;
+  if (file !== undefined && file !== "") {
+    try {
+      const value = readFileSync(file, "utf8").trim();
+      if (value !== "") return value;
+    } catch {
+      /* fall through to the environment */
+    }
+  }
+  return process.env.DSH_FAKE_MODE ?? "live";
+}
+/** Resolved per use — see {@link currentMode}. */
+const mode = () => currentMode();
 const LOG_PATH = process.env.DSH_FAKE_LOG;
 const out = (frame) => process.stdout.write(`${JSON.stringify(frame)}\n`);
 const notify = (method, params) => out({ jsonrpc: "2.0", method, params });
@@ -109,16 +139,44 @@ function logFrame(method, params) {
   appendFileSync(LOG_PATH, `${JSON.stringify({ pid: process.pid, method, params })}\n`);
 }
 
+/**
+ * Every root session this process has been asked to drive, in first-seen order.
+ *
+ * One process may now carry several Paseo sessions (the plugin used to spawn a
+ * `dsh` child per session; the one-process-multi-session work removes that). A
+ * scripted stand-in must therefore stop treating the first session id it sees as
+ * *the* root: `rootIds` records them all, and every scenario emits against the
+ * session that triggered it rather than against a module-level singleton.
+ *
+ * `rootId` stays as "the session the scenario currently in flight is driving".
+ * `handle()` sets it from the request's own `sessionId` before dispatching, so
+ * the scenario bodies keep reading a plain variable instead of threading a
+ * parameter through every `notify` call. It is no longer sticky across sessions:
+ * a request for session B never inherits session A's id.
+ */
+const rootIds = [];
 let rootId = null;
-let emitted = false;
-let liveChildEmitted = false;
-let rootTurnOpen = false;
-let promptAttempts = 0;
-/** The cancel scenario's live output timer, and how many steps it has emitted. */
+/**
+ * Per-session scenario bookkeeping.
+ *
+ * These used to be module-level flags. That was correct while a process served
+ * exactly one session, and silently wrong the moment two share one process: the
+ * second session's first prompt would find `emitted` already true and emit
+ * nothing at all, so a multi-session check would "pass" by observing silence.
+ * Keying them by session id keeps each session's scenario independent.
+ */
+const scenarioState = new Map();
+/** The state bag for `sessionId`, created on first use. */
+function stateOf(sessionId) {
+  let state = scenarioState.get(sessionId);
+  if (state === undefined) {
+    state = { emitted: false, liveChildEmitted: false, rootTurnOpen: false, promptAttempts: 0, cancelPrompts: 0, cancelSteps: 0 };
+    scenarioState.set(sessionId, state);
+  }
+  return state;
+}
+/** The cancel scenario's live output timer (one process-wide ticker is enough). */
 let cancelTicker = null;
-let cancelSteps = 0;
-/** Prompts seen in `cancel` mode: the first opens the turn, the rest follow it. */
-let cancelPrompts = 0;
 
 const childAEvents = () => [
   { type: "user/message", seq: 1, data: { source: { kind: "user" }, content: [{ type: "text", text: "child A prompt" }] } },
@@ -270,6 +328,40 @@ function question(id, sessionId, callId) {
   });
 }
 
+/**
+ * The `multi` scenario: drive every session this process serves, one turn each,
+ * interleaved.
+ *
+ * This is the only mode that exercises the property the one-process-multi-session
+ * change exists to create — one `dsh` child carrying several Paseo sessions at
+ * once. Every other mode drives a single root, so a regression that let one
+ * session's events leak into another would pass them all.
+ *
+ * Each session gets a distinguishable answer (`answer for <sessionId>`) and its
+ * own turn, emitted in a deliberately interleaved order: all the running
+ * statuses first, then each session's message, then each turn end. A plugin that
+ * routed by anything other than `sessionId` would cross the answers.
+ */
+async function emitMultiTurn(sessionId) {
+  const state = stateOf(sessionId);
+  state.multiTurn = (state.multiTurn ?? 0) + 1;
+  const turn = state.multiTurn;
+  notify("session.status", { sessionId, status: "running" });
+  notify("session.event", {
+    sessionId,
+    event: {
+      type: "assistant/message",
+      seq: 1,
+      data: { turn, step: 1, message: { id: `mm-${sessionId}-${turn}`, content: [{ type: "text", text: `answer for ${sessionId}` }] } },
+    },
+  });
+  notify("session.event", {
+    sessionId,
+    event: { type: "turn/end", seq: 2, data: { turn, reason: { kind: "completed" } } },
+  });
+  notify("session.status", { sessionId, status: "idle" });
+}
+
 async function emitScenario() {
   const childA = "child-A";
   notify("session.child-opened", { sessionId: childA, parentSessionId: rootId, mode: "continuable", label: "Research A", cwd: "/tmp" });
@@ -388,17 +480,18 @@ async function endRootTurn(text, reason = "completed") {
  * merely "exists" would let a no-op cancel pass the check.
  */
 async function openCancelTurn() {
-  rootTurnOpen = true;
+  const state = stateOf(rootId);
+  state.rootTurnOpen = true;
   notify("session.status", { sessionId: rootId, status: "running" });
   cancelTicker = setInterval(() => {
-    if (!rootTurnOpen) return;
-    cancelSteps += 1;
+    if (!state.rootTurnOpen) return;
+    state.cancelSteps += 1;
     notify("session.event", {
       sessionId: rootId,
       event: {
         type: "assistant/message",
-        seq: cancelSteps,
-        data: { turn: 1, step: cancelSteps, message: { id: `cm${cancelSteps}`, content: [{ type: "text", text: `counting ${cancelSteps}` }] } },
+        seq: state.cancelSteps,
+        data: { turn: 1, step: state.cancelSteps, message: { id: `cm${state.cancelSteps}`, content: [{ type: "text", text: `counting ${state.cancelSteps}` }] } },
       },
     });
   }, 40);
@@ -415,13 +508,14 @@ async function openCancelTurn() {
  * it" means on the wire.
  */
 function cancelTurn() {
-  if (!rootTurnOpen) return false;
-  rootTurnOpen = false;
+  const state = stateOf(rootId);
+  if (!state.rootTurnOpen) return false;
+  state.rootTurnOpen = false;
   if (cancelTicker !== null) {
     clearInterval(cancelTicker);
     cancelTicker = null;
   }
-  notify("session.event", { sessionId: rootId, event: { type: "turn/end", seq: cancelSteps + 1, data: { turn: 1, reason: { kind: "aborted", reason: { kind: "user" } } } } });
+  notify("session.event", { sessionId: rootId, event: { type: "turn/end", seq: state.cancelSteps + 1, data: { turn: 1, reason: { kind: "aborted", reason: { kind: "user" } } } } });
   notify("session.status", { sessionId: rootId, status: "idle" });
   return true;
 }
@@ -488,8 +582,14 @@ function reply(id, result) {
 }
 
 async function handle(method, params, id) {
-  if (params && typeof params.sessionId === "string" && params.sessionId !== "" && rootId === null) {
-    rootId = params.sessionId;
+  // Bind the scenario to the session this request names, instead of latching
+  // onto the first one forever. `initialize` carries no session id (it pins the
+  // process defaults), so it leaves the binding untouched — which is exactly how
+  // a shared process serves several sessions: one initialize, many session ids.
+  const requested = params && typeof params.sessionId === "string" && params.sessionId !== "" ? params.sessionId : null;
+  if (requested !== null) {
+    if (!rootIds.includes(requested)) rootIds.push(requested);
+    rootId = requested;
   }
   switch (method) {
     case "initialize":
@@ -497,7 +597,7 @@ async function handle(method, params, id) {
       // throws. The daemon then drops its own session without ever sending
       // `session.close` (`PluginProvider.openSession`'s catch), which is the path
       // that used to leave the plugin's map entry — and this process — behind.
-      if (MODE === "failopen") throw new Error("the runtime refused to initialize");
+      if (mode() === "failopen") throw new Error("the runtime refused to initialize");
       return { serverInfo: { name: "fake-dsh-bridge", version: "0" }, route: { provider: "fake", model: "fake", reasoningEffort: null } };
     case "paseo/catalog":
       // The real catalog also reports the profile's configured default route
@@ -518,25 +618,26 @@ async function handle(method, params, id) {
       // the replay runs). Its stored log has the same unterminated shape as the
       // killed child below, and it must stay running: only a turn no live
       // channel vouches for may be closed by the replay.
-      if (MODE === "replay" && !liveChildEmitted && rootId !== null) {
-        liveChildEmitted = true;
+      const state = stateOf(rootId);
+      if (mode() === "replay" && !state.liveChildEmitted && rootId !== null) {
+        state.liveChildEmitted = true;
         notify("session.child-opened", { sessionId: "child-M", parentSessionId: rootId, mode: "continuable", label: "Live M", cwd: "/tmp" });
       }
-      if (MODE === "early" && !emitted) {
-        emitted = true;
+      if (mode() === "early" && !state.emitted) {
+        state.emitted = true;
         setTimeout(() => { void emitEarly(); }, 0);
       }
-      if (MODE === "label-late" && !emitted) {
-        emitted = true;
+      if (mode() === "label-late" && !state.emitted) {
+        state.emitted = true;
         setTimeout(() => { void emitLateLabel(); }, 0);
       }
-      if (MODE === "label-never" && !emitted) {
-        emitted = true;
+      if (mode() === "label-never" && !state.emitted) {
+        state.emitted = true;
         setTimeout(() => { void emitLabelNever(); }, 0);
       }
       // The steer scenario advertises one registered command so the command
       // branch (a `completed` result, never a turn) stays covered.
-      if (MODE === "steer") return { commands: [{ name: "goal", description: "read the goal state", kind: "command" }] };
+      if (mode() === "steer") return { commands: [{ name: "goal", description: "read the goal state", kind: "command" }] };
       return { commands: [] };
     }
     case "paseo/command/run":
@@ -603,26 +704,31 @@ async function handle(method, params, id) {
       return { kind: "success", text: "Withdrawn seq 3 and everything after it" };
     }
     case "paseo/subagents":
-      if (MODE === "error") return { available: false, subagents: [], error: { message: "subagent catalog exploded" } };
-      if (MODE === "replay-no-turn") {
+      if (mode() === "error") return { available: false, subagents: [], error: { message: "subagent catalog exploded" } };
+      if (mode() === "replay-no-turn") {
+        // A distinct id from `label-never`'s `child-N`: the two scenarios assert
+        // opposite things about "a child with no turn" (one has 40 frames of
+        // output and must open; the other has none and must close as canceled).
+        // Reusing one id let the earlier scenario's frames be buffered and
+        // replayed into the later one, so the "never started" child looked live.
         return {
           available: true,
-          subagents: [{ sessionId: "child-N", parentSessionId: String(params?.sessionId ?? ""), mode: "continuable", label: "No turn" }],
+          subagents: [{ sessionId: "child-T", parentSessionId: String(params?.sessionId ?? ""), mode: "continuable", label: "No turn" }],
         };
       }
-      if (MODE === "replay-history-unavailable") {
+      if (mode() === "replay-history-unavailable") {
         return {
           available: true,
           subagents: [{ sessionId: "child-U", parentSessionId: String(params?.sessionId ?? ""), mode: "continuable", label: "Unreadable U" }],
         };
       }
-      if (MODE === "replay-race") {
+      if (mode() === "replay-race") {
         return {
           available: true,
           subagents: [{ sessionId: "child-R", parentSessionId: String(params?.sessionId ?? ""), mode: "continuable", label: "Racing R" }],
         };
       }
-      if (MODE !== "replay") return { available: true, subagents: [] };
+      if (mode() !== "replay") return { available: true, subagents: [] };
       return {
         available: true,
         subagents: [
@@ -687,7 +793,7 @@ async function handle(method, params, id) {
       // Both end inside an open turn; only child-M has live evidence.
       if (sid === "child-M") return { available: true, inheritedEventCount: 0, events: withHistoryTimes(liveChildEvents()) };
       if (sid === "child-K") return { available: true, inheritedEventCount: 0, events: withHistoryTimes(killedChildEvents()) };
-      if (sid === "child-N") return { available: true, inheritedEventCount: 0, events: withHistoryTimes(neverStartedChildEvents()) };
+      if (sid === "child-T") return { available: true, inheritedEventCount: 0, events: withHistoryTimes(neverStartedChildEvents()) };
       if (sid === "child-U") {
         // Same shape as the real bridge's `unavailableHistory()`: a failed read
         // is still a history object, so callers can rely on `events` being a
@@ -710,44 +816,62 @@ async function handle(method, params, id) {
       }
       // The image scenario replays the same log, so a reopen proves the picture
       // row is rebuilt from history and not only from the live turn.
-      if (MODE === "image") return { available: true, inheritedEventCount: 0, events: withHistoryTimes(imageRootEvents()) };
+      if (mode() === "image") return { available: true, inheritedEventCount: 0, events: withHistoryTimes(imageRootEvents()) };
       return { available: true, inheritedEventCount: 0, events: withHistoryTimes(rootEvents()) };
     }
-    case "session/prompt":
-      if (MODE === "live" && !emitted) {
-        emitted = true;
+    case "session/prompt": {
+      const state = stateOf(rootId);
+      if (mode() === "multi") {
+        // The `multi` scenario is process-wide in what it asserts (no cross-talk
+        // between sessions sharing a process) but per-session in what it emits.
+        //
+        // It must NOT emit the whole set on the first prompt: the plugin opens
+        // sessions one at a time and prompts each as it becomes ready, so at the
+        // first prompt `rootIds` holds only the sessions opened so far. Emitting
+        // then would answer the first session and silently skip the rest, and a
+        // check would see "B never answered" — a fake-bridge artifact, not a
+        // plugin bug. Each prompt therefore answers its own session, after a
+        // short delay so the two sessions' frames interleave rather than arrive
+        // in prompt order.
+        state.promptCount = (state.promptCount ?? 0) + 1;
+        const sessionId = rootId;
+        setTimeout(() => { void emitMultiTurn(sessionId); }, 30);
+        return { messageId: `m-${rootId}-${state.promptCount}` };
+      }
+      if (mode() === "live" && !state.emitted) {
+        state.emitted = true;
         setTimeout(() => { void emitScenario(); }, 30);
       }
-      if (MODE === "nested" && !emitted) {
-        emitted = true;
+      if (mode() === "nested" && !state.emitted) {
+        state.emitted = true;
         setTimeout(() => { void emitNested(); }, 30);
       }
-      if (MODE === "stream" && !emitted) {
-        emitted = true;
+      if (mode() === "stream" && !state.emitted) {
+        state.emitted = true;
         setTimeout(() => { void emitStream(); }, 20);
       }
-      if (MODE === "failturn" && !emitted) {
-        emitted = true;
+      if (mode() === "failturn" && !state.emitted) {
+        state.emitted = true;
         // DSH can end a turn for reasons that are not a clean finish. The root's
         // terminal `session.turn` is emitted later, from the remembered reason,
         // so this is the only place that can say the turn failed.
         setTimeout(() => { void endRootTurn("partial answer", "error"); }, 20);
       }
-      if (MODE === "image" && !emitted) {
-        emitted = true;
+      if (mode() === "image" && !state.emitted) {
+        state.emitted = true;
         setTimeout(() => { void emitImage(); }, 30);
       }
-      if (MODE === "steer") {
+      if (mode() === "steer") {
         if (params?.delivery === "steer") {
           // A steer belongs inside the turn already running: it ends that turn
           // rather than opening another one.
-          if (rootTurnOpen) {
-            rootTurnOpen = false;
+          if (state.rootTurnOpen) {
+            state.rootTurnOpen = false;
             setTimeout(() => { void finishSteerTurn(); }, 20);
           }
-        } else if (!emitted) {
-          emitted = true;
-          rootTurnOpen = true;
+        } else if (!state.emitted) {
+          state.emitted = true;
+          state.rootTurnOpen = true;
           // Real DSH opens the turn synchronously inside `followup()`, so this
           // status is written before the reply below: the plugin has the turn id
           // in hand when it answers, which is what the daemon later steers by.
@@ -755,8 +879,8 @@ async function handle(method, params, id) {
           setTimeout(() => { void openSteerChild(); }, 20);
         }
       }
-      if (MODE === "late" && params?.delivery !== "steer" && !emitted) {
-        emitted = true;
+      if (mode() === "late" && params?.delivery !== "steer" && !state.emitted) {
+        state.emitted = true;
         // Synthetic order, *not* what DSH does: real DSH enters the running phase
         // synchronously inside `followup()` and the bridge writes the status
         // notification before the prompt reply (that is the `steer` mode's
@@ -766,33 +890,66 @@ async function handle(method, params, id) {
         setTimeout(() => { notify("session.status", { sessionId: rootId, status: "running" }); }, 20);
         setTimeout(() => { void endRootTurn("late answer"); }, 40);
       }
-      if (MODE === "failonce") {
-        promptAttempts += 1;
+      if (mode() === "failonce") {
+        state.promptAttempts += 1;
         // The first prompt is refused outright, so the plugin must drop the turn
         // id it issued for it instead of leaving a ghost behind.
-        if (promptAttempts === 1) throw new Error("the runtime refused the prompt");
-        if (params?.delivery !== "steer" && !emitted) {
-          emitted = true;
+        if (state.promptAttempts === 1) throw new Error("the runtime refused the prompt");
+        if (params?.delivery !== "steer" && !state.emitted) {
+          state.emitted = true;
           setTimeout(() => { notify("session.status", { sessionId: rootId, status: "running" }); }, 20);
           setTimeout(() => { void endRootTurn("recovered answer"); }, 40);
         }
       }
-      if (MODE === "cancel" && params?.delivery !== "steer") {
-        cancelPrompts += 1;
-        if (cancelPrompts === 1) setTimeout(() => { void openCancelTurn(); }, 20);
+      if (mode() === "cancel" && params?.delivery !== "steer") {
+        state.cancelPrompts += 1;
+        if (state.cancelPrompts === 1) setTimeout(() => { void openCancelTurn(); }, 20);
         else setTimeout(() => { void runAfterCancelTurn(); }, 20);
       }
       return { messageId: "m-1" };
+    }
     case "session/cancel": {
       // The one thing this scenario exists to observe: the plugin really asked
       // the runtime to stop the turn it thinks is running.
-      if (MODE === "cancel") cancelTurn();
+      if (mode() === "cancel") cancelTurn();
       return { canceled: true };
     }
     case "paseo/plan/get":
       return { available: false, active: false, pending: false };
     case "paseo/plan/set":
       return { available: false, active: false, pending: false, outcome: "queued" };
+    /**
+     * Per-session MCP mount.
+     *
+     * The real bridge records the entries and mounts them on the agent's own
+     * scope when `createSession` runs, so one process can serve several sessions
+     * that each talk to a different Paseo caller. A scripted stand-in has no
+     * agents, so it only has to answer — but it must answer, and it must answer
+     * *before* the prompt: the plugin sends `initialize` → `paseo/mcp/set` →
+     * `session/prompt`, and a bridge that threw on the middle frame would look
+     * exactly like a broken plugin.
+     *
+     * `mounted` mirrors the real bridge's honesty: it is false when the agent
+     * already existed at set time (the real one defers to the next resume and
+     * says so on stderr). Here nothing is ever mounted, so false is the truthful
+     * answer and the plugin's `mounted:false` logging path stays exercised.
+     */
+    case "paseo/mcp/set":
+      return { accepted: true, entries: Array.isArray(params?.entries) ? params.entries.length : 0, mounted: false };
+    /**
+     * Close one session's bridge-side state.
+     *
+     * The real bridge drops ten maps and returns `{closed:false}` for an unknown
+     * id (idempotent, never throws), so a caller may call it unconditionally.
+     * The stand-in keeps no per-session state beyond `scenarioState`; forgetting
+     * that entry here would leak across a reopen in `multi`, so it is dropped.
+     */
+    case "session/close": {
+      const id = typeof params?.sessionId === "string" ? params.sessionId : "";
+      if (id === "") return { closed: false };
+      const had = scenarioState.delete(id);
+      return { closed: had };
+    }
     case "paseo/config/set":
       return { provider: "fake", model: "fake", reasoningEffort: null, preset: null };
     case "shutdown":

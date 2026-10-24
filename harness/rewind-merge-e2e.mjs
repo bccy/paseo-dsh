@@ -104,7 +104,9 @@ const check = (name, pass, detail) => {
 
 let evidence = {};
 try {
-  await request('initialize', { cwd: root });
+  // `sessionId` is required: `initialize` pins cwd/route FOR ONE session, and the
+  // shared-process bridge refuses a prompt from a session it never initialized.
+  await request('initialize', { cwd: root, sessionId });
   await request('session/prompt', {
     sessionId,
     contentBlocks: [{ type: 'text', text: '记住一个暗号：ALPHA。只回复“记住了”。' }],

@@ -4,20 +4,41 @@
  * Paseo's plugin-provider contract hands the provider `config.mcpServers` —
  * including its own `paseo` HTTP server, whose URL carries this agent's id —
  * because a plugin provider can never take the native-tools path opencode uses
- * (`supportsNativePaseoTools` is hard-coded `false` for plugins). DSH accepts
- * MCP servers only at boot, through a `--patch` overlay, so the plugin has to
- * turn that map into one. Dropping it — which is what used to happen — left the
- * model with no `mcp__paseo__*` tools and produced no error anywhere.
+ * (`supportsNativePaseoTools` is hard-coded `false` for plugins). Dropping it
+ * leaves the model with no `mcp__paseo__*` tools and produces no error anywhere.
  *
- * Streamable-HTTP servers are proxied by the bridge's own MCP gateway
- * (`dsh-paseo-bridge/mcp-gateway`): one row for the whole server map, three
- * meta-tools instead of one schema per tool. stdio servers still mount the
- * stock client, and an unsupported transport is still refused by name.
+ * **The channel changed with one-process-multi-session.** It used to be a
+ * process-wide `--patch` file written at spawn (`prepareMcpPatch`), because DSH
+ * accepted MCP servers only at boot. Now several sessions share one `dsh` child,
+ * so a process-wide overlay cannot express "this session's servers": the plugin
+ * sends a **per-session `paseo/mcp/set { sessionId, entries }`** frame instead,
+ * and the bridge mounts them at that session's agent scope
+ * (`docs/IMPL-CONTRACT.md` §1.5).
  *
- * This drives the real plugin against a scripted fake `dsh`
- * (`harness/fake-dsh-bridge.mjs`), which records its own launcher arguments and
- * the patch file it was pointed at (`DSH_FAKE_ARGV`). That is the only place the
- * injection is observable: no bridge frame mentions MCP.
+ * So the observable is no longer argv. It is the frame the fake `dsh` records in
+ * `DSH_FAKE_LOG`. The shapes below were **dumped from a real run**, not guessed:
+ *
+ *   entries: [
+ *     { name: "@deepseek-ai/dsh-mcp-client",         // a native stdio mount
+ *       config: { serverName, transport: "stdio", command, args, env,
+ *                 failOnStartupError: true } },
+ *     { name: "./mcp-gateway.js",                    // the gateway row
+ *       config: { servers: { <name>: { url, headers } | { command, args, env } } } },
+ *   ]
+ *
+ * Note `name` (a module specifier), **not** `id`/`inject` — the patch form had
+ * those, the frame form does not. An assertion on `id === "paseo-mcp-gateway"` or
+ * `inject === ["tools"]` would be asserting a shape that no longer exists. The
+ * gateway module registers its three meta-tools when it activates, so the
+ * registry is implied by the row's presence rather than by a field.
+ *
+ * One environmental hazard: `browserMcpServer()` adds `server_browser` by
+ * reading `~/.local/share/paseo-server-browser` — this machine's real browser
+ * plugin. Left alone it injects a server the test never asked for, which would
+ * make every assertion depend on the developer's machine (and did: an unisolated
+ * run showed `server_browser` in a session that configured nothing).
+ * `PASEO_SERVER_BROWSER_DATA` points at a throwaway directory so that row is
+ * absent, and the whitelist cases supply their own entry explicitly.
  *
  * Compile the plugin first (tsc type errors under `--moduleResolution node` are
  * expected; the emitted JS is what runs):
@@ -44,11 +65,26 @@ process.env.DSH_FAKE_MODE = "live";
 // node_modules/dsh-paseo-bridge` from the bridge embedded in the plugin. The
 // fake `dsh` needs no profile, so point DSH_HOME at a throwaway tree.
 process.env.DSH_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-mcp-check-"));
+
+// Keep this machine's Server Browser plugin out of the picture: the provider adds
+// `server_browser` whenever it can find the browser plugin's data directory, and
+// a machine-dependent extra entry would make every count below unstable.
+const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-mcp-check-"));
+process.env.PASEO_SERVER_BROWSER_DATA = path.join(scratch, "no-browser-plugin");
+
+// The fake bridge appends every frame it receives (method + params + pid) to
+// `DSH_FAKE_LOG`. That is now the only place the injection is observable: no argv
+// carries it, and the bridge answers the frame without echoing it back.
+const frameLog = path.join(scratch, "frames.jsonl");
+process.env.DSH_FAKE_LOG = frameLog;
+
 process.on("exit", () => {
-  try {
-    fs.rmSync(process.env.DSH_HOME, { recursive: true, force: true });
-  } catch {
-    /* best-effort cleanup */
+  for (const dir of [process.env.DSH_HOME, scratch]) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* best-effort cleanup */
+    }
   }
 });
 
@@ -84,43 +120,47 @@ const check = (name, pass, detail) => {
   console.log(`  ${pass ? "PASS" : "FAIL"}  ${name}${detail ? `  — ${detail}` : ""}`);
 };
 
-/** Read a fake-bridge argv record, waiting briefly for the child to write it. */
-async function readRecord(file, ms = 5000) {
-  const started = Date.now();
-  while (Date.now() - started < ms) {
-    if (fs.existsSync(file)) {
-      try {
-        return JSON.parse(fs.readFileSync(file, "utf8"));
-      } catch {
-        /* still being written */
-      }
-    }
-    await sleep(50);
-  }
-  return undefined;
+/** Every frame the fake bridge has recorded so far. */
+function frames() {
+  if (!fs.existsSync(frameLog)) return [];
+  return fs
+    .readFileSync(frameLog, "utf8")
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .map((line) => JSON.parse(line));
 }
 
-/** Parse every mounted entry out of a recorded patch file, in patch order. */
-function allEntries(record) {
-  if (record === undefined || typeof record.patch !== "string") return [];
-  try {
-    return (JSON.parse(record.patch)?.[0]?.insert ?? []);
-  } catch {
-    return [];
-  }
+/**
+ * The `paseo/mcp/set` frames recorded for one session, in arrival order.
+ *
+ * A session may get more than one (a reopen re-sends it), so callers read the
+ * last one — that is the one the bridge will mount.
+ */
+function mcpFramesFor(sessionId) {
+  return frames().filter(
+    (frame) => frame.method === "paseo/mcp/set" && frame.params?.sessionId === sessionId,
+  );
 }
 
-/** Parse the first mounted entry out of a recorded patch file. */
-function firstEntry(record) {
-  if (record === undefined || typeof record.patch !== "string") return undefined;
-  try {
-    return JSON.parse(record.patch)?.[0]?.insert?.[0];
-  } catch {
-    return undefined;
-  }
+/** The entries of the last `paseo/mcp/set` sent for a session. */
+function entriesFor(sessionId) {
+  return mcpFramesFor(sessionId).at(-1)?.params?.entries ?? [];
 }
 
-const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-mcp-check-"));
+const GATEWAY_MODULE = "./mcp-gateway.js";
+const NATIVE_MODULE = "@deepseek-ai/dsh-mcp-client";
+/** The gateway row among some entries (the module specifier is the discriminator). */
+function gatewayEntry(entries) {
+  return entries.find((entry) => entry?.name === GATEWAY_MODULE);
+}
+/** The native stdio rows among some entries. */
+function nativeEntries(entries) {
+  return entries.filter((entry) => entry?.name === NATIVE_MODULE);
+}
+/** The servers map the gateway row carries. */
+function gatewayServers(entries) {
+  return gatewayEntry(entries)?.config?.servers ?? {};
+}
 
 (async () => {
   const conn = await registration.connect({
@@ -128,76 +168,80 @@ const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-mcp-check-"));
   });
   conn.onEvent((event) => events.push(event));
 
-  // ---- an HTTP server becomes a --patch overlay --------------------------
-  const httpProbe = path.join(scratch, "http.json");
-  const httpSession = `mcp-http-${Date.now()}`;
-  await conn.send({
-    type: "session.open",
-    requestId: "open-http",
-    sessionId: httpSession,
-    config: {
-      cwd: process.cwd(),
-      mode: "build",
-      env: { DSH_FAKE_ARGV: httpProbe },
-      mcpServers: {
-        paseo: {
-          type: "http",
-          url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=check",
-          headers: { Authorization: "Bearer check-token" },
-        },
+  /** Open a session with these MCP servers and resolve with its frame's entries. */
+  async function open(sessionId, mcpServers) {
+    await conn.send({
+      type: "session.open",
+      requestId: `open-${sessionId}`,
+      sessionId,
+      config: {
+        cwd: process.cwd(),
+        mode: "build",
+        ...(mcpServers === undefined ? {} : { mcpServers }),
       },
+    });
+    await until((e) => e.type === "session.ready" && e.sessionId === sessionId, `${sessionId} ready`);
+    // The frame is sent during the open, but the fake bridge appends it
+    // asynchronously; give the write a moment before reading the log.
+    await sleep(150);
+    return entriesFor(sessionId);
+  }
+
+  // ---- an HTTP server becomes a gateway row ------------------------------
+  const httpSession = `mcp-http-${Date.now()}`;
+  const httpEntries = await open(httpSession, {
+    paseo: {
+      type: "http",
+      url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=check",
+      headers: { Authorization: "Bearer check-token" },
     },
   });
-  await until((e) => e.type === "session.ready" && e.sessionId === httpSession, "http session ready");
-
-  const httpRecord = await readRecord(httpProbe);
   check(
-    "an injected MCP server reaches DSH as --patch",
-    httpRecord !== undefined && httpRecord.argv.includes("--patch"),
-    httpRecord ? `argv=[${httpRecord.argv.join(" ")}]` : "(fake bridge recorded no argv)",
+    "an injected MCP server reaches DSH as a per-session paseo/mcp/set frame",
+    mcpFramesFor(httpSession).length >= 1,
+    `${String(mcpFramesFor(httpSession).length)} frame(s) for ${httpSession}`,
   );
-
-  const httpEntry = firstEntry(httpRecord);
-  const gatewayServer = httpEntry?.config?.servers?.paseo;
+  const httpGateway = gatewayEntry(httpEntries);
+  const httpServer = gatewayServers(httpEntries).paseo;
   check(
     "the http server is proxied by the bridge gateway with its URL and headers",
-    httpEntry?.id === "paseo-mcp-gateway" &&
-      httpEntry?.name === "dsh-paseo-bridge/mcp-gateway" &&
-      gatewayServer?.url === "http://127.0.0.1:6767/mcp/agents?callerAgentId=check" &&
-      gatewayServer?.headers?.Authorization === "Bearer check-token",
-    httpEntry ? JSON.stringify(httpEntry) : "(no patch content)",
+    httpGateway !== undefined &&
+      httpServer?.url === "http://127.0.0.1:6767/mcp/agents?callerAgentId=check" &&
+      httpServer?.headers?.Authorization === "Bearer check-token",
+    JSON.stringify(httpGateway ?? null),
   );
   check(
-    "the gateway row declares the tool registry it registers into",
-    JSON.stringify(httpEntry?.inject) === JSON.stringify(["tools"]),
-    `inject=${JSON.stringify(httpEntry?.inject)}`,
+    "and the http server is not also mounted natively",
+    nativeEntries(httpEntries).length === 0 &&
+      !httpEntries.some((entry) => entry?.config?.transport === "stdio"),
+    JSON.stringify(httpEntries.map((entry) => entry?.name)),
   );
 
   // ---- a stdio server keeps its command, args and env --------------------
-  const stdioProbe = path.join(scratch, "stdio.json");
   const stdioSession = `mcp-stdio-${Date.now()}`;
-  await conn.send({
-    type: "session.open",
-    requestId: "open-stdio",
-    sessionId: stdioSession,
-    config: {
-      cwd: process.cwd(),
-      mode: "build",
-      env: { DSH_FAKE_ARGV: stdioProbe },
-      mcpServers: {
-        github: { type: "stdio", command: "npx", args: ["-y", "server-github"], env: { GITHUB_TOKEN: "t" } },
-      },
+  const stdioEntries = await open(stdioSession, {
+    github: {
+      type: "stdio",
+      command: "npx",
+      args: ["-y", "server-github"],
+      env: { GITHUB_TOKEN: "t" },
     },
   });
-  await until((e) => e.type === "session.ready" && e.sessionId === stdioSession, "stdio session ready");
-  const stdioEntry = firstEntry(await readRecord(stdioProbe));
+  const stdioNative = nativeEntries(stdioEntries);
   check(
     "a stdio server keeps its command, args and env",
-    stdioEntry?.config?.transport === "stdio" &&
-      stdioEntry?.config?.command === "npx" &&
-      JSON.stringify(stdioEntry?.config?.args) === JSON.stringify(["-y", "server-github"]) &&
-      stdioEntry?.config?.env?.GITHUB_TOKEN === "t",
-    stdioEntry ? JSON.stringify(stdioEntry.config) : "(no patch content)",
+    stdioNative.length === 1 &&
+      stdioNative[0]?.config?.transport === "stdio" &&
+      stdioNative[0]?.config?.serverName === "github" &&
+      stdioNative[0]?.config?.command === "npx" &&
+      JSON.stringify(stdioNative[0]?.config?.args) === JSON.stringify(["-y", "server-github"]) &&
+      stdioNative[0]?.config?.env?.GITHUB_TOKEN === "t",
+    JSON.stringify(stdioNative[0]?.config ?? null),
+  );
+  check(
+    "and a non-whitelisted stdio server gets no gateway row",
+    gatewayEntry(stdioEntries) === undefined,
+    JSON.stringify(stdioEntries.map((entry) => entry?.name)),
   );
 
   // ---- a whitelisted stdio server is proxied by the gateway --------------
@@ -205,42 +249,24 @@ const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-mcp-check-"));
   // three meta-tools), so it is opt-in by name rather than applied to every
   // stdio server. `server_browser` is the only entry today: its bridge is wide
   // (25 tools, ~20 KB of schema in every request) and rarely called.
-  //
-  // `cwd` is deliberately not asserted: Paseo's provider contract gives a stdio
-  // server only `command`/`args`/`env`, so the patch side has no `cwd` to carry
-  // (the gateway's schema accepts one, for servers a profile composes itself).
-  const browserProbe = path.join(scratch, "browser.json");
   const browserSession = `mcp-browser-${Date.now()}`;
-  await conn.send({
-    type: "session.open",
-    requestId: "open-browser",
-    sessionId: browserSession,
-    config: {
-      cwd: process.cwd(),
-      mode: "build",
-      env: { DSH_FAKE_ARGV: browserProbe },
-      mcpServers: {
-        server_browser: {
-          type: "stdio",
-          command: process.execPath,
-          args: ["/x/mcp-bridge.mjs", "/x/session.json"],
-          env: { PASEO_SERVER_BROWSER_RUNTIME: "/x/runtime" },
-        },
-      },
+  const browserEntries = await open(browserSession, {
+    server_browser: {
+      type: "stdio",
+      command: process.execPath,
+      args: ["/x/mcp-bridge.mjs", "/x/session.json"],
+      env: { PASEO_SERVER_BROWSER_RUNTIME: "/x/runtime" },
     },
   });
-  await until((e) => e.type === "session.ready" && e.sessionId === browserSession, "browser session ready");
-  const browserEntries = allEntries(await readRecord(browserProbe));
-  const browserGateway = browserEntries.find((entry) => entry?.id === "paseo-mcp-gateway");
-  const browserServer = browserGateway?.config?.servers?.server_browser;
+  const browserServers = gatewayServers(browserEntries);
+  const browserServer = browserServers.server_browser;
   check(
     "a whitelisted stdio server is proxied by the gateway, not mounted natively",
-    browserEntries.length === 1 &&
-      browserEntries[0]?.id === "paseo-mcp-gateway" &&
-      browserEntries.every((entry) => entry?.config?.transport !== "stdio") &&
+    Object.keys(browserServers).join(",") === "server_browser" &&
+      nativeEntries(browserEntries).length === 0 &&
       browserServer?.command === process.execPath &&
       JSON.stringify(browserServer?.args) === JSON.stringify(["/x/mcp-bridge.mjs", "/x/session.json"]),
-    `entries=${JSON.stringify(browserEntries.map((entry) => entry?.id ?? entry?.config?.serverName))}`,
+    `gateway servers=[${Object.keys(browserServers).join(",")}] native=${String(nativeEntries(browserEntries).length)}`,
   );
   check(
     "a proxied stdio server keeps its env",
@@ -249,106 +275,78 @@ const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-mcp-check-"));
   );
 
   // ---- a mixed session keeps stdio native and coalesces HTTP into one row ----
-  const mixedProbe = path.join(scratch, "mixed.json");
   const mixedSession = `mcp-mixed-${Date.now()}`;
-  await conn.send({
-    type: "session.open",
-    requestId: "open-mixed",
-    sessionId: mixedSession,
-    config: {
-      cwd: process.cwd(),
-      mode: "build",
-      env: { DSH_FAKE_ARGV: mixedProbe },
-      mcpServers: {
-        paseo: { type: "http", url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=mixed" },
-        github: { type: "stdio", command: "npx", args: ["-y", "server-github"] },
-      },
-    },
+  const mixedEntries = await open(mixedSession, {
+    paseo: { type: "http", url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=mixed" },
+    github: { type: "stdio", command: "npx", args: ["-y", "server-github"] },
   });
-  await until((e) => e.type === "session.ready" && e.sessionId === mixedSession, "mixed session ready");
-  const mixedEntries = allEntries(await readRecord(mixedProbe));
-  const mixedGateway = mixedEntries.find((entry) => entry?.id === "paseo-mcp-gateway");
-  const mixedStdio = mixedEntries.find((entry) => entry?.config?.transport === "stdio");
+  const mixedServers = gatewayServers(mixedEntries);
+  const mixedNative = nativeEntries(mixedEntries);
   check(
     "a mixed session mounts stdio natively and proxies HTTP through one gateway row",
-    mixedEntries.length === 2 &&
-      Object.keys(mixedGateway?.config?.servers ?? {}).join(",") === "paseo" &&
-      mixedStdio?.config?.command === "npx" &&
-      mixedGateway?.config?.servers?.github === undefined,
-    `entries=${JSON.stringify(mixedEntries.map((entry) => entry?.id ?? entry?.config?.serverName))}`,
+    Object.keys(mixedServers).join(",") === "paseo" &&
+      mixedNative.length === 1 &&
+      mixedNative[0]?.config?.serverName === "github" &&
+      mixedServers.github === undefined,
+    `gateway=[${Object.keys(mixedServers).join(",")}] native=[${mixedNative.map((entry) => entry?.config?.serverName).join(",")}]`,
   );
 
   // ---- all three at once: HTTP + whitelisted stdio + user stdio ----------
   // The three-way case is where a whitelist regression hides: a change that
   // proxies every stdio server still passes the single-server cases above (the
   // whitelisted one looks right) and still passes the mixed two-way case (no
-  // user stdio next to a proxy candidate). Here both must hold simultaneously.
-  const tripleProbe = path.join(scratch, "triple.json");
+  // user stdio next to a proxy candidate). Here both must hold simultaneously —
+  // the **bidirectional** whitelist assertion `docs/` asks for: the named server
+  // is proxied *and* the unnamed one is not.
   const tripleSession = `mcp-triple-${Date.now()}`;
-  await conn.send({
-    type: "session.open",
-    requestId: "open-triple",
-    sessionId: tripleSession,
-    config: {
-      cwd: process.cwd(),
-      mode: "build",
-      env: { DSH_FAKE_ARGV: tripleProbe },
-      mcpServers: {
-        paseo: { type: "http", url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=triple" },
-        server_browser: { type: "stdio", command: "node", args: ["/x/mcp-bridge.mjs", "/x/session.json"] },
-        github: { type: "stdio", command: "npx", args: ["-y", "server-github"], env: { GITHUB_TOKEN: "t" } },
-      },
+  const tripleEntries = await open(tripleSession, {
+    paseo: { type: "http", url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=triple" },
+    server_browser: { type: "stdio", command: "node", args: ["/x/mcp-bridge.mjs", "/x/session.json"] },
+    github: {
+      type: "stdio",
+      command: "npx",
+      args: ["-y", "server-github"],
+      env: { GITHUB_TOKEN: "t" },
     },
   });
-  await until((e) => e.type === "session.ready" && e.sessionId === tripleSession, "triple session ready");
-  const tripleEntries = allEntries(await readRecord(tripleProbe));
-  const tripleGateway = tripleEntries.find((entry) => entry?.id === "paseo-mcp-gateway");
-  const tripleProxied = Object.keys(tripleGateway?.config?.servers ?? {});
-  const tripleNative = tripleEntries.filter((entry) => entry?.config?.transport === "stdio");
+  const tripleServers = Object.keys(gatewayServers(tripleEntries));
+  const tripleNative = nativeEntries(tripleEntries);
   check(
     "http and whitelisted stdio share one gateway row while user stdio stays native",
-    tripleEntries.length === 2 &&
-      tripleProxied.sort().join(",") === "paseo,server_browser" &&
+    tripleServers.sort().join(",") === "paseo,server_browser" &&
       tripleNative.length === 1 &&
       tripleNative[0]?.config?.serverName === "github" &&
       tripleNative[0]?.config?.command === "npx",
-    `entries=${JSON.stringify(tripleEntries.map((entry) => entry?.id ?? entry?.config?.serverName))}`
-      + ` proxied=[${tripleProxied.join(",")}]`,
+    `proxied=[${tripleServers.join(",")}] native=[${tripleNative.map((entry) => entry?.config?.serverName).join(",")}]`,
   );
 
-  // ---- no servers means no overlay --------------------------------------
-  const noneProbe = path.join(scratch, "none.json");
+  // ---- no servers still sends an empty list -----------------------------
+  // An empty `entries` is not "nothing to do": it is how the bridge is told this
+  // session has none, so a re-attach that dropped servers cannot inherit the
+  // previous ones. The old `--patch` form expressed this by writing no file; the
+  // frame form must send the frame.
   const noneSession = `mcp-none-${Date.now()}`;
-  await conn.send({
-    type: "session.open",
-    requestId: "open-none",
-    sessionId: noneSession,
-    config: { cwd: process.cwd(), mode: "build", env: { DSH_FAKE_ARGV: noneProbe } },
-  });
-  await until((e) => e.type === "session.ready" && e.sessionId === noneSession, "no-mcp session ready");
-  const noneRecord = await readRecord(noneProbe);
+  const noneEntries = await open(noneSession, undefined);
   check(
-    "a session without MCP servers spawns without --patch",
-    noneRecord !== undefined && !noneRecord.argv.includes("--patch"),
-    noneRecord ? `argv=[${noneRecord.argv.join(" ")}]` : "(fake bridge recorded no argv)",
+    "a session without MCP servers still sends paseo/mcp/set with an empty list",
+    mcpFramesFor(noneSession).length >= 1 && noneEntries.length === 0,
+    `${String(mcpFramesFor(noneSession).length)} frame(s), entries=${JSON.stringify(noneEntries)}`,
   );
 
   // ---- an SSE server is refused by name, not silently dropped -----------
-  const sseProbe = path.join(scratch, "sse.json");
   const sseSession = `mcp-sse-${Date.now()}`;
   await conn.send({
     type: "session.open",
-    requestId: "open-sse",
+    requestId: `open-${sseSession}`,
     sessionId: sseSession,
     config: {
       cwd: process.cwd(),
       mode: "build",
-      env: { DSH_FAKE_ARGV: sseProbe },
       mcpServers: { legacy: { type: "sse", url: "http://127.0.0.1:9999/sse" } },
     },
   });
   const sseFailure = await until(
-    (e) => e.type === "request.failed" && e.requestId === "open-sse",
+    (e) => e.type === "request.failed" && e.requestId === `open-${sseSession}`,
     "sse request.failed",
   );
   check(
@@ -359,39 +357,67 @@ const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-mcp-check-"));
   await sleep(300);
   check(
     "a refused server never spawns a DSH process",
-    !fs.existsSync(sseProbe),
-    fs.existsSync(sseProbe) ? "a process was spawned anyway" : "no process spawned",
+    mcpFramesFor(sseSession).length === 0,
+    `${String(mcpFramesFor(sseSession).length)} frame(s) for the refused session`,
   );
 
-  // ---- the overlay lives exactly as long as the process ------------------
-  // An idle session is *parked* on close (the rewind refresh reuses the child),
-  // so `session.close` alone must not remove the overlay: the process is still
-  // alive. Provider teardown shuts the parked child down for real, and only then
-  // may the patch file disappear.
-  await conn.send({ type: "session.close", sessionId: httpSession, requestId: "close-http" });
-  await until((e) => e.type === "session.closed" && e.sessionId === httpSession, "http session closed");
+  // ---- the frame is per-session state, so a reopen re-sends it ----------
+  // The bridge consumes the queue when the session's agent is created, and a
+  // reopen creates a new agent. The old `--patch` equivalent was "the patch file
+  // outlives the close"; there is no file now, so the claim is that the frame is
+  // re-sent for the reopened session.
+  const reopenSession = httpSession;
+  const beforeClose = mcpFramesFor(reopenSession).length;
+  await conn.send({ type: "session.close", sessionId: reopenSession, requestId: "close-http" });
+  await until((e) => e.type === "session.closed" && e.sessionId === reopenSession, "http session closed");
   await sleep(300);
   check(
-    "an idle session keeps its process (and its overlay) after session.close",
-    httpRecord?.patchPath !== undefined && fs.existsSync(httpRecord.patchPath),
-    httpRecord?.patchPath ?? "(no patch path recorded)",
+    "closing an idle session sends no extra frame (a close is not a re-attach)",
+    mcpFramesFor(reopenSession).length === beforeClose,
+    `${String(beforeClose)} -> ${String(mcpFramesFor(reopenSession).length)}`,
+  );
+  await conn.send({
+    type: "session.open",
+    requestId: "reopen-http",
+    sessionId: reopenSession,
+    config: {
+      cwd: process.cwd(),
+      mode: "build",
+      mcpServers: {
+        paseo: { type: "http", url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=check" },
+      },
+    },
+    persistence: { version: 1, data: { sessionId: reopenSession } },
+    history: "skip",
+  });
+  await until((e) => e.type === "session.ready" && e.sessionId === reopenSession, "http session reopened");
+  await sleep(250);
+  const reopenedEntries = entriesFor(reopenSession);
+  check(
+    "a reopen re-sends paseo/mcp/set for that session",
+    mcpFramesFor(reopenSession).length > beforeClose &&
+      gatewayServers(reopenedEntries).paseo?.url === "http://127.0.0.1:6767/mcp/agents?callerAgentId=check",
+    `${String(beforeClose)} -> ${String(mcpFramesFor(reopenSession).length)} frame(s)`,
+  );
+
+  // ---- every session's frame went to the one shared child ----------------
+  // This is what makes the per-session frame necessary in the first place, and it
+  // replaces the old "teardown removes the patch file": there is no file, and the
+  // child is the only footprint. Two pids here would mean the plugin still spawns
+  // a process per session, in which case a process-wide overlay would have been
+  // sufficient and this whole path would be pointless.
+  const injectedPids = new Set(
+    frames()
+      .filter((frame) => frame.method === "paseo/mcp/set")
+      .map((frame) => frame.pid),
+  );
+  check(
+    "every session's MCP frame went to one shared child",
+    injectedPids.size === 1,
+    `pids ${[...injectedPids].join(", ") || "(none)"}`,
   );
 
   await conn.close();
-  let patchRemoved = false;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (httpRecord?.patchPath === undefined || !fs.existsSync(httpRecord.patchPath)) {
-      patchRemoved = true;
-      break;
-    }
-    await sleep(50);
-  }
-  check(
-    "provider teardown removes the patch file with its process",
-    httpRecord?.patchPath !== undefined && patchRemoved,
-    httpRecord?.patchPath ?? "(no patch path recorded)",
-  );
-  fs.rmSync(scratch, { recursive: true, force: true });
 
   const failed = results.filter((r) => !r.pass).length;
   console.log(`\n  ${results.length - failed}/${results.length} passed`);
@@ -399,5 +425,5 @@ const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-mcp-check-"));
 })().catch((error) => {
   console.error(`\n  threw: ${error.message}`);
   console.error("  event types seen:", [...new Set(events.map((e) => e.type))].join(", ") || "(none)");
-  process.exit(1);
+  process.exit(2);
 });

@@ -171,7 +171,9 @@ function projectLikePaseo(deltas, turnId) {
 
 try {
   console.log(`  ${at()}s  initialize`);
-  await request("initialize", { cwd: process.cwd() });
+  // `sessionId` is required: `initialize` pins cwd/route FOR ONE session, and the
+  // shared-process bridge refuses a prompt from a session it never initialized.
+  await request("initialize", { cwd: process.cwd(), sessionId });
   console.log(`  ${at()}s  prompt (${JSON.stringify(PROMPT.slice(0, 60))}...)`);
   await request("session/prompt", {
     sessionId,

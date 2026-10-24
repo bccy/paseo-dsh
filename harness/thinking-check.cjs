@@ -28,6 +28,30 @@ const {
 } = require("./client/thinking-text.js");
 
 /**
+ * Load a sibling harness module from wherever this check runs.
+ *
+ * The documented compile step copies this file into `paseo-plugin/.dbg`, so a
+ * plain `require("./source-shape.cjs")` would not resolve there — the module
+ * lives in `harness/`, which is a different directory. Walking up from
+ * `__dirname` finds the repo's `harness/` directory in both cases (run in place
+ * from `harness/`, or copied into a build dir under `paseo-plugin/`).
+ */
+function requireHarnessModule(name) {
+  let dir = __dirname;
+  for (let i = 0; i < 6; i += 1) {
+    const candidate = join(dir, "harness", name);
+    if (existsSync(candidate)) return require(candidate);
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  throw new Error(`could not find harness/${name} above ${__dirname}`);
+}
+
+const { attributeOf, callArguments, elementWithAttributes, elementsWithAttributes, mentions, splitArguments } =
+  requireHarnessModule("source-shape.cjs");
+
+/**
  * Locate a repo source file from wherever this check runs. The documented
  * compile step copies the check into `paseo-plugin/.dbg` (one level below
  * `paseo-plugin`), but a scratch build dir such as `.tmp-test/<name>` sits one
@@ -142,8 +166,11 @@ console.log("the preview is computed from the text as it arrives");
   // looked fast, collapsing trailed. dsh web runs the preview rule over the live
   // text, which is what this asserts.
   //
-  // Asserted at the source because it is a wiring property, and this repo asserts
-  // pure modules and constant tables rather than React components.
+  // Asserted from the source because it is a wiring property inside a React
+  // component, which plain `node` cannot `require`. The claim is "some call in
+  // this module passes `text`", read through a real argument scan rather than a
+  // whitespace-sensitive regex: `reasoningPreview(\n  text,\n  growing,\n)` is
+  // the same wiring as the one-line form and used to fail here.
   const source = readFileSync(INLINE_THINKING_SOURCE, "utf8");
   // Comment lines are dropped first: the module header explains the hook by name.
   const code = source
@@ -155,15 +182,18 @@ console.log("the preview is computed from the text as it arrives");
     !/^\s*import[^\n]*useRevealedText/m.test(code) && !/\buseRevealedText\s*\(/.test(code),
     `${(code.match(/useRevealedText/g) ?? []).length} reference(s) in the code`,
   );
+  const callArgs = (name) => callArguments(code, name);
+  const previewArgs = callArgs("reasoningPreview");
   check(
     "and the collapsed line previews the item's own text",
-    /reasoningPreview\(\s*text\s*,/.test(code),
-    (code.match(/reasoningPreview\([^)]*\)/g) ?? []).join(" | ") || "(no call found)",
+    previewArgs.some((args) => mentions(args, "text")),
+    previewArgs.map((args) => `reasoningPreview(${args.trim()})`).join(" | ") || "(no call found)",
   );
+  const growingArgs = callArgs("useGrowing");
   check(
     "and `growing` is derived from that same text",
-    /useGrowing\(\s*text\s*,/.test(code),
-    (code.match(/useGrowing\([^)]*\)/g) ?? []).join(" | ") || "(no call found)",
+    growingArgs.some((args) => mentions(args, "text")),
+    growingArgs.map((args) => `useGrowing(${args.trim()})`).join(" | ") || "(no call found)",
   );
 }
 
@@ -224,34 +254,79 @@ console.log("the row wires the window in");
   // content-sized, so a `flex: 1` child inside it reports its own content width
   // and the window collapses — the desktop client showed two characters. It has
   // to come from the row and the label, which are definite on every platform.
-  const code = readFileSync(INLINE_THINKING_SOURCE, "utf8")
+  //
+  // These claims are about **which element carries which attributes**, not about
+  // how the element is formatted. They used to be whitespace regexes
+  // (`/style=\{styles\.row\}\s*\n\s*onLayout=\{/`), which failed on a reordered
+  // prop list or a wrapped line while the component was still correct. The JSX
+  // reader in `harness/source-shape.cjs` parses the opening element, so order
+  // and line breaks no longer matter.
+  const source = readFileSync(INLINE_THINKING_SOURCE, "utf8");
+  const code = source
     .split("\n")
     .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
     .join("\n");
+
+  // The measured row: it carries the row style *and* an onLayout handler.
+  const row = elementWithAttributes(code, ["style", "onLayout"]);
+  const rowStyle = row === undefined ? "" : attributeOf(row, "style").value;
+  const rowLayout = row === undefined ? "" : attributeOf(row, "onLayout").value;
   check(
     "the row measures itself, not the line inside the content-sized sweep",
-    /style=\{styles\.row\}\s*\n\s*onLayout=\{/.test(code),
-    "row measurement is missing",
+    row !== undefined && mentions(rowStyle, "row") && rowLayout.includes("setRowWidth"),
+    row === undefined ? "row measurement is missing" : `tag ${row.tag}, style ${rowStyle.trim()}`,
+  );
+
+  // The label is the second measured element: it subtracts its own width.
+  const label = elementsWithAttributes(code, ["style", "onLayout"]).find((element) =>
+    mentions(attributeOf(element, "onLayout").value, "setLabelWidth"),
   );
   check(
     "and measures the label it has to subtract",
-    /style=\{\[styles\.label[^\n]*\]\}\s*\n\s*onLayout=\{/.test(code),
-    "label measurement is missing",
+    label !== undefined && mentions(attributeOf(label, "style").value, "label"),
+    label === undefined ? "label measurement is missing" : `tag ${label.tag}`,
   );
+
+  // The derivation subtracts the icon and both head gaps from the row width.
+  const lineWidth = callArguments(code, "Math.max");
   check(
     "and derives the line width from both",
-    /const lineWidth = Math\.max\(/.test(code) && /rowWidth - THINK_ICON_SIZE - ROW_HEAD_GAP - labelWidth/.test(code),
-    "lineWidth derivation is missing",
+    lineWidth.some((args) => {
+      const parts = splitArguments(args);
+      const expression = parts.join(",");
+      return mentions(expression, "rowWidth")
+        && mentions(expression, "labelWidth")
+        && mentions(expression, "THINK_ICON_SIZE")
+        && mentions(expression, "ROW_HEAD_GAP");
+    }),
+    lineWidth.map((args) => `Math.max(${args.trim()})`).join(" | ") || "lineWidth derivation is missing",
   );
+
+  // While growing, the tail window wins over dsh's settled rule. Asserted as a
+  // conditional expression that calls both, rather than as its exact spelling.
+  const tailCalls = callArguments(code, "streamingTail");
+  const previewCalls = callArguments(code, "reasoningPreview");
   check(
     "and shows the tail while growing, dsh's rule otherwise",
-    /growing && lineWidth > 0\s*\?\s*streamingTail\(\s*text\s*,\s*lineWidth\s*,/.test(code),
-    (code.match(/streamingTail\([^)]*\)/g) ?? []).join(" | ") || "(no call found)",
+    tailCalls.some((args) => {
+      const parts = splitArguments(args).map((part) => part.trim());
+      return parts.length >= 2 && mentions(parts[0], "text") && mentions(parts[1], "lineWidth");
+    }) && previewCalls.some((args) => {
+      const parts = splitArguments(args).map((part) => part.trim());
+      return parts.length >= 2 && mentions(parts[0], "text") && mentions(parts[1], "growing");
+    }),
+    tailCalls.map((args) => `streamingTail(${args.trim()})`).join(" | ") || "(no call found)",
   );
+
+  // The preview line must never measure itself: a measured line would feed its
+  // own content width back into the window. Asserted over the parsed elements,
+  // so `numberOfLines={1}` and `onLayout` on the same element fail regardless of
+  // the order they appear in.
+  const selfMeasured = elementsWithAttributes(code, ["numberOfLines", "onLayout"]);
   check(
     "the preview line never measures itself",
-    !/numberOfLines=\{1\}[\s\S]{0,80}onLayout=\{/.test(code),
-    "the line still measures itself",
+    selfMeasured.length === 0,
+    selfMeasured.length === 0 ? "" : `measured line at ${selfMeasured.map((element) => element.tag).join(", ")}`,
   );
 }
 

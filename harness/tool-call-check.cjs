@@ -72,6 +72,28 @@ const {
 const { diffStat } = require("./client/tokens.js");
 const { setLocale } = require("./client/locale.js");
 
+/**
+ * Load a sibling harness module from wherever this check runs.
+ *
+ * The documented compile step copies this file into `paseo-plugin/.dbg`, where
+ * `require("./source-shape.cjs")` would not resolve — the module lives in
+ * `harness/`. Walking up finds it whether the check runs in place or from a
+ * build dir under `paseo-plugin/`.
+ */
+function requireHarnessModule(name) {
+  let dir = __dirname;
+  for (let i = 0; i < 6; i += 1) {
+    const candidate = path.join(dir, "harness", name);
+    if (fs.existsSync(candidate)) return require(candidate);
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  throw new Error(`could not find harness/${name} above ${__dirname}`);
+}
+
+const { callArguments, mentions } = requireHarnessModule("source-shape.cjs");
+
 let passed = 0;
 let failed = 0;
 
@@ -1364,14 +1386,55 @@ console.log("the tool transformer adopts the item's locale before it maps");
   check("index.client.tsx is readable", sourcePath !== undefined, path.join(__dirname, "index.client.tsx"));
   const source = sourcePath === undefined ? "" : fs.readFileSync(sourcePath, "utf8");
 
-  const relay = source.search(/setLocale\(localeFromMetadata\(item\.metadata\)\)/);
+  // The relay is "setLocale receives localeFromMetadata(item.metadata)", read as
+  // a call graph rather than as its spelling: the old regex pinned the exact
+  // nesting `setLocale(localeFromMetadata(item.metadata))`, so binding the inner
+  // call to a local first (an equivalent refactor) failed while the locale still
+  // reached setLocale. What matters is that both calls happen, in that order,
+  // and that the inner one reads `item.metadata`.
+  const setLocaleArgs = callArguments(source, "setLocale");
+  const localeFromMetadataArgs = callArguments(source, "localeFromMetadata");
+  // `setLocale(localeFromMetadata(item.metadata))` may also be written by hoisting
+  // the inner call into a local (`const relayed = localeFromMetadata(...);
+  // setLocale(relayed)`) — same wiring, different shape. So the claim is: some
+  // `setLocale` argument is fed by `localeFromMetadata`, either directly or
+  // through an identifier assigned from it.
+  const hoisted = [];
+  for (const args of localeFromMetadataArgs) {
+    // `const relayed = localeFromMetadata(...)` — capture the binding name.
+    const at = source.indexOf(`localeFromMetadata(${args}`);
+    if (at < 0) continue;
+    const before = source.slice(Math.max(0, at - 120), at);
+    const binding = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*$/.exec(before);
+    if (binding !== null) hoisted.push(binding[1]);
+  }
+  const relayArgs = setLocaleArgs.filter(
+    (args) => mentions(args, "localeFromMetadata") || hoisted.some((name) => mentions(args, name)),
+  );
   check(
     "the transformer relays metadata.locale with setLocale(localeFromMetadata(...))",
-    relay >= 0,
+    relayArgs.length > 0,
+    `${setLocaleArgs.map((args) => `setLocale(${args.trim()})`).join(" | ") || "(no setLocale call)"}`
+      + (hoisted.length === 0 ? "" : ` (hoisted via ${hoisted.join(", ")})`),
   );
+  check(
+    "…and that relay reads the item's own metadata",
+    localeFromMetadataArgs.some((args) => mentions(args, "metadata")),
+    localeFromMetadataArgs.map((args) => `localeFromMetadata(${args.trim()})`).join(" | ") || "(no call)",
+  );
+
+  // Position claims are about the *order of the calls in the source*, so they are
+  // read from the parsed call sites rather than from `String.indexOf` over a
+  // possibly-reflowed literal.
   const toolTransformer = source.indexOf('id: "dsh-inline-tool"');
   const thinkingTransformer = source.indexOf('id: "dsh-inline-thinking"');
-  const mapping = source.indexOf("toolCallData(item, phase)", relay < 0 ? 0 : relay);
+  const callSite = (name) => {
+    const pattern = new RegExp(`(^|[^\\w$])${name}\\s*\\(`, "g");
+    const match = pattern.exec(source);
+    return match === null ? -1 : match.index;
+  };
+  const relay = relayArgs.length > 0 ? callSite("setLocale") : -1;
+  const mapping = callSite("toolCallData");
   check(
     "and it sits inside the tool transformer",
     toolTransformer >= 0 && relay > toolTransformer,

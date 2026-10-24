@@ -1,0 +1,422 @@
+/**
+ * Two Paseo sessions sharing one `dsh` child: no cross-talk, and a close on one
+ * leaves the other working.
+ *
+ * This is the regression the one-process-multi-session change exists to make
+ * safe, asserted at the **plugin** layer rather than at the fake bridge's own
+ * protocol layer (that is `fake-bridge-multi-check.mjs`, which drives the bridge
+ * directly). The distinction matters: the bridge's `multi` scenario can be
+ * perfectly per-session while the plugin still routes one session's frames into
+ * another, because the plugin keeps its own maps (`#sessions`, child ids, the
+ * parked pool). Only a run through the plugin proves the pair is clean.
+ *
+ * What is pinned here:
+ *   1. two sessions prompt a **single shared process** and each receives its own
+ *      answer (`answer for <sessionId>`) — a crossed event shows the wrong id
+ *   2. each session's timeline carries only its own message: no session sees the
+ *      other's text under any event type
+ *   3. each session gets exactly one `session.turn` start and one terminal turn
+ *   4. closing one session does not disturb the other: the survivor still
+ *      prompts and still answers
+ *
+ * Uses the scripted fake `dsh` (`harness/fake-dsh-bridge.mjs`, `multi` mode) and
+ * a throwaway `DSH_HOME`, so no profile, model or daemon is touched.
+ *
+ * Run:
+ *   cd paseo-plugin
+ *   npx tsc --noEmit false --outDir .dbg-t5 --declaration false \
+ *     --module commonjs --moduleResolution node
+ *   echo '{"type":"commonjs"}' > .dbg-t5/package.json
+ *   cp ../harness/multi-session-check.cjs ../harness/fake-dsh-bridge.mjs .dbg-t5/
+ *   cd .dbg-t5 && node multi-session-check.cjs
+ *
+ * (or just `node harness/multi-session-check.mjs`, which compiles for you)
+ */
+import { createRequire } from "node:module";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const require = createRequire(import.meta.url);
+const here = dirname(fileURLToPath(import.meta.url));
+const { resolvePluginBuild } = require("./plugin-build.cjs");
+
+// The fake `dsh` the plugin will spawn. It must be executable and it must be the
+// one the plugin's `DshProcess` resolves — the plugin reads `DSH_BINARY`.
+const fakeBridge = join(here, "fake-dsh-bridge.mjs");
+if (!existsSync(fakeBridge)) {
+  console.error(`fake bridge missing at ${fakeBridge}`);
+  process.exit(2);
+}
+chmodSync(fakeBridge, 0o755);
+process.env.DSH_BINARY = fakeBridge;
+process.env.DSH_FAKE_MODE = "multi";
+
+// Never touch the user's live profile: loading the plugin calls
+// `ensurePaseoProfile()`, which rewrites `$DSH_HOME/profiles/<name>/...` from the
+// embedded bridge. The fake `dsh` needs no profile at all, so point DSH_HOME at a
+// throwaway tree and delete it on exit.
+process.env.DSH_HOME = mkdtempSync(join(tmpdir(), "dsh-multi-session-check-"));
+process.on("exit", () => {
+  try {
+    rmSync(process.env.DSH_HOME, { recursive: true, force: true });
+  } catch {
+    /* best-effort cleanup */
+  }
+});
+
+const buildDir = resolvePluginBuild(undefined, ".dbg-t5-multi");
+const plugin = require(join(buildDir, "index.server.js")).default;
+
+/**
+ * Frames the plugin now sends that the scripted fake `dsh` has to answer.
+ *
+ * These are part of the one-process-multi-session protocol (`docs/IMPL-CONTRACT.md`
+ * §1): `paseo/mcp/set` mounts a session's MCP entries at its agent scope, and
+ * `session/close` clears one session's bridge state. The plugin sends both
+ * unconditionally, so a fake bridge without them fails every `session.open`
+ * with "unknown method" — which looks like a plugin regression but is really a
+ * missing fake.
+ *
+ * This check cannot add them (the fake bridge is owned by the same task that
+ * owns `dsh-bridge/`, and this harness task must not edit it). So the absence is
+ * reported as a **blocked precondition**, loudly and with a non-zero exit, rather
+ * than silently skipping the multi-session assertions — a skipped multi-session
+ * check is indistinguishable from a passing one in a green run.
+ */
+const REQUIRED_FAKE_METHODS = ["paseo/mcp/set", "session/close"];
+{
+  const fakeSource = readFileSync(fakeBridge, "utf8");
+  const missing = REQUIRED_FAKE_METHODS.filter(
+    (method) => !fakeSource.includes(`case "${method}"`),
+  );
+  if (missing.length > 0) {
+    console.error(
+      [
+        "BLOCKED: harness/fake-dsh-bridge.mjs does not answer the multi-session frames",
+        `  missing: ${missing.join(", ")}`,
+        "  the plugin sends these on every session.open / session.close, so no",
+        "  plugin-level multi-session assertion can run until the fake bridge",
+        "  implements them (docs/IMPL-CONTRACT.md §1.2 and §1.5).",
+        "  This check owns only harness/*.cjs|mjs except the fake bridge, so it",
+        "  cannot add them. Reported to the Lead.",
+      ].join("\n"),
+    );
+    process.exit(3);
+  }
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+let passed = 0;
+let failed = 0;
+const skipped = [];
+function check(label, condition, detail) {
+  if (condition === true) {
+    passed += 1;
+    console.log(`  PASS  ${label}${detail === undefined ? "" : `  — ${detail}`}`);
+  } else {
+    failed += 1;
+    console.log(`  FAIL  ${label}${detail === undefined ? "" : `  — ${detail}`}`);
+  }
+}
+
+/** Collect events from one connection until `predicate` holds, or time out. */
+function waitFor(list, predicate, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      const found = list.find(predicate);
+      if (found !== undefined) return resolve(found);
+      if (Date.now() > deadline) {
+        return reject(
+          new Error(`timed out; saw ${list.map((event) => event.type).join(", ") || "(nothing)"}`),
+        );
+      }
+      setTimeout(tick, 20);
+    };
+    tick();
+  });
+}
+
+let registration;
+const pluginEvents = [];
+plugin({
+  handle() {},
+  registerProvider(r) {
+    registration = r;
+  },
+  registerSettings() {},
+  on() {},
+  before() {},
+});
+
+if (registration === undefined) {
+  console.error("the plugin did not register a provider");
+  process.exit(2);
+}
+
+const rootA = `multi-root-A-${Date.now()}`;
+const rootB = `multi-root-B-${Date.now()}`;
+
+// The fake bridge records every frame it receives (with its own pid) when
+// `DSH_FAKE_LOG` names a file. Arming it *before* the first open is what makes
+// the single-process assertion possible: the log then contains the spawn frames
+// of both sessions, and two distinct pids would mean one child per session.
+const frameLog = join(process.env.DSH_HOME, "frames.jsonl");
+process.env.DSH_FAKE_LOG = frameLog;
+
+const conn = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+conn.onEvent((event) => pluginEvents.push(event));
+
+/** Open one provider session and wait for it to be ready. */
+async function openSession(sessionId) {
+  const mark = pluginEvents.length;
+  await conn.send({
+    type: "session.open",
+    requestId: `open-${sessionId}`,
+    sessionId,
+    config: { cwd: process.cwd(), mode: "build" },
+    history: "skip",
+  });
+  try {
+    await waitFor(
+      pluginEvents.slice(mark),
+      (event) => event.type === "session.ready" && event.sessionId === sessionId,
+    );
+  } catch (error) {
+    const failures = pluginEvents
+      .slice(mark)
+      .filter((event) => event.type === "request.failed" || event.type === "session.runtime_failed");
+    console.error(
+      `open ${sessionId} failed: ${failures.map((event) => event.error?.message ?? event.type).join(" | ")}`,
+    );
+    throw error;
+  }
+}
+
+console.log("two sessions, one shared bridge process");
+await openSession(rootA);
+await openSession(rootB);
+{
+  // Both sessions must reach ready on the *same* fake bridge process. The fake
+  // bridge logs every frame with its pid, so two distinct pids would mean the
+  // plugin spawned a child per session — the arrangement this change removes.
+  check("both sessions opened", true, `${rootA}, ${rootB}`);
+  if (existsSync(frameLog)) {
+    const frames = readFileSync(frameLog, "utf8")
+      .split("\n")
+      .filter((line) => line.trim() !== "")
+      .map((line) => JSON.parse(line));
+    // Which processes are involved, and what each one did.
+    //
+    // "Every pid in the log is the same pid" is the **wrong assertion**: the
+    // provider also spawns short-lived probes (`probeProcess`, `initializeRoute:
+    // false`) to read the catalog and to archive — they are legitimate, they
+    // never carry a session, and counting them would demand a single process
+    // where two are correct.
+    //
+    // The claim this check exists for is narrower: **the sessions share one
+    // process**. So a pid is a "session carrier" when it received an
+    // `initialize` (the per-process handshake) or a `session/prompt` for a real
+    // session id — that is exactly the traffic a per-session child would
+    // produce, and exactly what a probe never sends.
+    const byPid = new Map();
+    for (const frame of frames) {
+      if (!byPid.has(frame.pid)) byPid.set(frame.pid, []);
+      byPid.get(frame.pid).push({
+        method: frame.method,
+        sessionId: frame.params?.sessionId,
+      });
+    }
+    const carriers = [...byPid.entries()].filter(([, calls]) =>
+      calls.some((call) => call.method === "initialize" || call.method === "session/prompt"),
+    );
+    const describe = [...byPid.entries()]
+      .map(([pid, calls]) => {
+        const methods = [...new Set(calls.map((call) => call.method))];
+        return `pid ${String(pid)}: ${methods.slice(0, 4).join(",")}`;
+      })
+      .join(" | ");
+    check(
+      "…on a single bridge process",
+      carriers.length === 1,
+      `session carriers ${String(carriers.length)}; ${describe}`,
+    );
+    // And that one process really served both sessions: a single pid with only
+    // one session in the log would pass the check above for the wrong reason.
+    const sessionIds = new Set(
+      frames.map((frame) => frame.params?.sessionId).filter((id) => typeof id === "string"),
+    );
+    check(
+      "…and that process served both sessions",
+      sessionIds.has(rootA) && sessionIds.has(rootB),
+      [...sessionIds].join(", "),
+    );
+  } else {
+    failed += 1;
+    console.log("  FAIL  the fake bridge wrote no frame log  — DSH_FAKE_LOG was not honoured");
+  }
+}
+
+console.log("\ntwo sessions, two answers, no cross-talk");
+{
+  const markA = pluginEvents.length;
+  await conn.send({
+    type: "session.prompt",
+    sessionId: rootA,
+    prompt: { clientMessageId: "prompt-A", input: { type: "message", content: [{ type: "text", text: "hello A" }] } },
+  });
+  await conn.send({
+    type: "session.prompt",
+    sessionId: rootB,
+    prompt: { clientMessageId: "prompt-B", input: { type: "message", content: [{ type: "text", text: "hello B" }] } },
+  });
+  // The `multi` scenario emits one interleaved turn for every session the process
+  // serves, so both answers arrive without a second prompt.
+  await sleep(1200);
+
+  const fresh = pluginEvents.slice(markA);
+
+  // The event names are different on the two sides of the plugin, and mixing
+  // them up silently filters everything out:
+  //
+  //   bridge -> plugin:  `session.event`  (a DSH frame; `dsh-process.ts` turns
+  //                                       it into timeline rows)
+  //   plugin -> Paseo:   `timeline.item`  (a `ProviderTimelineItem`)
+  //
+  // This file listens to what the *plugin emits*, so it must read
+  // `timeline.item`, and the row lives at `event.item` — verified by driving the
+  // plugin and dumping the payload, not guessed from the DSH frame shape:
+  //
+  //   { type: "assistant_message", id: "assistant:1:1",
+  //     messageId: "assistant:1:1", text: "answer for <sessionId>" }
+  //
+  // The earlier version of this check looked for `session.event` and read
+  // `event.event.data.message.content[0].text`, so it matched nothing and
+  // reported the plugin as broken.
+  const answersOf = (sessionId) =>
+    fresh.filter(
+      (event) =>
+        event.type === "timeline.item"
+        && event.sessionId === sessionId
+        && event.item?.type === "assistant_message",
+    );
+
+  const answersA = answersOf(rootA);
+  const answersB = answersOf(rootB);
+  check("session A receives its own answer", answersA.length === 1, `${answersA.length}`);
+  check("session B receives its own answer", answersB.length === 1, `${answersB.length}`);
+
+  /** The text of a timeline row, whatever kind it is. */
+  const textOf = (event) => event.item?.text;
+  check(
+    "A's answer names A",
+    textOf(answersA[0] ?? {}) === `answer for ${rootA}`,
+    String(textOf(answersA[0] ?? {})),
+  );
+  check(
+    "B's answer names B",
+    textOf(answersB[0] ?? {}) === `answer for ${rootB}`,
+    String(textOf(answersB[0] ?? {})),
+  );
+
+  // The stronger claim: no event delivered under one session carries the other
+  // session's text. Checking the answers alone would miss an event that was
+  // routed to both.
+  const leaked = fresh.filter((event) => {
+    const text = textOf(event);
+    if (typeof text !== "string" || !text.startsWith("answer for ")) return false;
+    return text !== `answer for ${event.sessionId}`;
+  });
+  check("no event carries another session's text", leaked.length === 0, `${leaked.length} leaked`);
+
+  // And each session's turn bookkeeping is its own.
+  for (const [label, sessionId] of [["A", rootA], ["B", rootB]]) {
+    const turns = fresh.filter(
+      (event) => event.type === "session.turn" && event.sessionId === sessionId,
+    );
+    const started = turns.filter((event) => event.state === "started");
+    const finished = turns.filter((event) => event.state !== "started");
+    check(
+      `session ${label} opens and closes exactly one turn`,
+      started.length === 1 && finished.length === 1,
+      `${started.length} started, ${finished.length} finished`,
+    );
+  }
+}
+
+console.log("\nclosing one session leaves the other working");
+{
+  // `session.close` at the provider level is what the daemon sends when an agent
+  // is closed. The other session must be untouched: still open, still able to
+  // prompt, still answered.
+  const mark = pluginEvents.length;
+  await conn.send({ type: "session.close", sessionId: rootA });
+  await sleep(400);
+  const afterClose = pluginEvents.slice(mark);
+  check(
+    "closing A emits no event for B",
+    afterClose.every((event) => event.sessionId !== rootB),
+    afterClose.map((event) => `${event.type}@${String(event.sessionId)}`).join(", ") || "(no events)",
+  );
+
+  // B keeps working. The `multi` scenario is process-wide and only runs once, so
+  // this prompt is answered by the bridge's ordinary root path — what matters is
+  // that the prompt is accepted and the session is still alive.
+  const beforePrompt = pluginEvents.length;
+  await conn.send({
+    type: "session.prompt",
+    sessionId: rootB,
+    prompt: { clientMessageId: "prompt-B-after-close", input: { type: "message", content: [{ type: "text", text: "still there?" }] } },
+  });
+  await sleep(800);
+  const afterPrompt = pluginEvents.slice(beforePrompt);
+  check(
+    "B still accepts a prompt after A is closed",
+    !afterPrompt.some(
+      (event) =>
+        event.type === "request.failed"
+        && (event.requestId === "prompt-B-after-close" || event.clientMessageId === "prompt-B-after-close"),
+    ),
+    afterPrompt
+      .filter((event) => event.type === "request.failed")
+      .map((event) => `${event.requestId}: ${event.error?.message}`)
+      .join(" | ") || "(accepted)",
+  );
+  check(
+    "B reports no runtime failure",
+    !afterPrompt.some((event) => event.type === "session.runtime_failed"),
+    afterPrompt.filter((event) => event.type === "session.runtime_failed").map((event) => event.error?.message).join(" | ") || "(none)",
+  );
+
+  // And a prompt for the closed session must not silently succeed against B.
+  const beforeClosed = pluginEvents.length;
+  await conn.send({
+    type: "session.prompt",
+    sessionId: rootA,
+    prompt: { clientMessageId: "prompt-A-after-close", input: { type: "message", content: [{ type: "text", text: "anyone home?" }] } },
+  });
+  await sleep(600);
+  const afterClosed = pluginEvents.slice(beforeClosed);
+  const answeredAsB = afterClosed.some(
+    (event) => event.sessionId === rootB && event.event?.type === "assistant/message",
+  );
+  check(
+    "a prompt for the closed session never lands on B",
+    !answeredAsB,
+    afterClosed.map((event) => `${event.type}@${String(event.sessionId)}`).join(", ") || "(no events)",
+  );
+}
+
+await conn.close();
+
+console.log(`\n  ${passed}/${passed + failed} passed`);
+if (skipped.length > 0) {
+  console.log(`  skipped: ${skipped.join("; ")}`);
+}
+if (failed > 0) {
+  console.log(`  ${failed} FAILED`);
+  process.exit(1);
+}

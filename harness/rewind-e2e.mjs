@@ -99,7 +99,12 @@ const file = join(root, "rewind-probe.txt");
 try {
   // No explicit route: the bridge must fall back to the profile's own default
   // (a hard-coded provider/model here would not run in someone else's profile).
-  await request("initialize", { cwd: root });
+  //
+  // `sessionId` is required: `initialize` pins cwd/route FOR ONE session, and the
+  // bridge refuses a prompt from a session it has never initialized. This used to
+  // omit it — the pre-multi-session shape, where `initialize` configured the whole
+  // process — and the shared-process bridge rejects that outright.
+  await request("initialize", { cwd: root, sessionId });
   const first = await request("session/prompt", {
     sessionId,
     contentBlocks: [{ type: "text", text: "记住一个暗号：ALPHA。只回复“记住了”。" }],

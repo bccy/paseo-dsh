@@ -95,19 +95,38 @@ console.log("park and take");
   check("a second take misses", pool.take("dsh-1", { cwd: "/work", routeKey: "p/m/max" }) === undefined);
 }
 
-console.log("configuration mismatch kills instead of reusing");
+console.log("a different cwd or route still reuses the one process");
 {
+  // This used to be "configuration mismatch kills instead of reusing", and that
+  // was correct while a process carried one session's cwd and route at boot.
+  // Under one-process-multi-session the process is shared by sessions in
+  // different projects on different routes: DSH keeps cwd and route **per
+  // session** (`dsh-working-directory`, and the route is pinned per session by
+  // `DshProcess.attachSession`), so reusing the child across a mismatch is the
+  // whole point — pooling by cwd would spawn one child per project, which is the
+  // cost this change exists to remove.
+  //
+  // So the assertion is inverted on purpose, and the thing that must stay true
+  // is that the child is handed over **alive** (killing it here would disconnect
+  // every other session on it) and that the divergence is still *reported* — a
+  // silent mismatch would hide a session that opened in the wrong project.
   const pool = makePool();
   const child = fakeProcess("b");
   pool.park(entry(child));
   const taken = pool.take("dsh-1", { cwd: "/other", routeKey: "p/m/max" });
-  check("a different cwd is refused", taken === undefined);
-  check("and the stale process is killed", child.killed === true);
+  check("a different cwd still reuses the process", taken?.process === child, String(taken === undefined));
+  check("and does not kill it", child.killed === false && child.running === true);
+  check(
+    "but the divergence is logged, not silent",
+    logs.some((line) => line.includes("parked:take") && line.includes("/other")),
+    logs.filter((line) => line.includes("parked:take")).join(" | ") || "(no parked:take line)",
+  );
+
   const routeChild = fakeProcess("c");
   pool.park(entry(routeChild));
   const routeTaken = pool.take("dsh-1", { cwd: "/work", routeKey: "p/m/high" });
-  check("a different route is refused", routeTaken === undefined);
-  check("and that process is killed too", routeChild.killed === true);
+  check("a different route still reuses the process too", routeTaken?.process === routeChild, String(routeTaken === undefined));
+  check("and does not kill that one either", routeChild.killed === false && routeChild.running === true);
 }
 
 console.log("a dead process is not parked or handed out");
@@ -135,16 +154,63 @@ console.log("TTL and cap bound the pool");
   check("an expired entry is swept", pool.sweep() === 1 && pool.size === 0);
   check("and its process is killed", child.killed === true);
 
-  const capped = makePool({ max: 2 });
+  // The cap used to bound a map of many parked children, one per DSH session.
+  // With a single pool key there is at most one entry, so the cap can never be
+  // exceeded and eviction is unreachable *by construction* — parking a second
+  // process replaces the first (see the re-park case below), it does not grow the
+  // pool. The invariant worth pinning is therefore "the pool never holds more
+  // than one", asserted over a sequence of parks for different sessions rather
+  // than through a cap that no longer has anything to bound.
+  const single = makePool({ max: 2 });
   const processes = ["g", "h", "i"].map((name) => fakeProcess(name));
-  capped.park(entry(processes[0], { dshSessionId: "d1" }));
-  now += 1;
-  capped.park(entry(processes[1], { dshSessionId: "d2" }));
-  now += 1;
-  capped.park(entry(processes[2], { dshSessionId: "d3" }));
-  check("the cap evicts the oldest", capped.size === 2 && processes[0].killed === true);
-  check("the newest are kept", processes[1].killed === false && processes[2].killed === false);
-  check("eviction is logged", logs.some((line) => line.includes("parked:evict")));
+  for (const [index, process] of processes.entries()) {
+    single.park(entry(process, { dshSessionId: `d${String(index)}` }));
+    now += 1;
+    check(`parking session d${String(index)} keeps the pool at one entry`, single.size === 1, `size ${String(single.size)}`);
+  }
+  check(
+    "each park replaced the previous process instead of accumulating",
+    processes[0].killed === true && processes[1].killed === true && processes[2].killed === false,
+    `killed ${processes.map((process) => String(process.killed)).join(",")}`,
+  );
+  check(
+    "replacing a parked process is logged",
+    logs.some((line) => line.includes("parked:replace")),
+    logs.filter((line) => line.includes("parked:")).slice(-4).join(" | "),
+  );
+}
+
+console.log("a refused park fails loudly, never silently");
+{
+  // `park()` installs silent handlers on the child so a parked process cannot
+  // spray frames at a closed session. If that install throws, the pool must not
+  // pretend it parked: an earlier version swallowed the error into a log line and
+  // returned success, which meant the child kept its live handlers while the
+  // caller believed it was parked — and it surfaced only as "the reopen behaved
+  // like a cold start" much later.
+  //
+  // Three things have to hold together, and the assertion requires all three:
+  // the caller is told (`false`), the reason is observable (a `parked:handlers`
+  // line naming the session), and the child is not leaked (killed + tracked as
+  // dying so the next open waits for the log lock).
+  const pool = makePool();
+  const broken = fakeProcess("p");
+  broken.setHandlers = () => {
+    throw new Error("handlers refused");
+  };
+  const parked = pool.park(entry(broken));
+  check("a park whose handler install throws is refused", parked === false);
+  check(
+    "and the refusal is observable in the log, naming the session",
+    logs.some((line) => line.includes("parked:handlers dsh-1") && line.includes("handlers refused")),
+    logs.filter((line) => line.includes("parked:handlers")).join(" | ") || "(no parked:handlers line)",
+  );
+  check(
+    "and the child is killed rather than leaked",
+    broken.killed === true && broken.running === false,
+    `killed ${String(broken.killed)}, running ${String(broken.running)}`,
+  );
+  check("and nothing was stored in the pool", pool.size === 0 && pool.has("dsh-1") === false, `size ${String(pool.size)}`);
 }
 
 console.log("re-parking the same native session replaces the old child");
@@ -184,6 +250,37 @@ console.log("discard (archive routing)");
   // the next open has to be able to wait for it (otherwise the cold start fails
   // with "already owned by an active write handle").
   check("quiesce waits for the discarded owner", (await pool.quiesce("dsh-1", { cwd: "/work", routeKey: "p/m/max" })) === true);
+
+  // `quiesce` must not be a kill in disguise.
+  //
+  // The one-process rewrite turns the pool into a guard rather than an owner: a
+  // shared child serves several sessions, so a `quiesce` that killed it would
+  // disconnect every other session on that process. The two shapes are
+  // deliberately distinguished here, because the assertion above passes either
+  // way — it only claims the call resolves `true` after a discard:
+  //
+  //   - on a **reusable** entry (same cwd/route, still running) quiesce must
+  //     leave the process alive, whatever else it does;
+  //   - on an entry it *cannot* reuse, killing it is legal (nobody else holds
+  //     it), which is why this case is not asserted as "never kills".
+  //
+  // This is the shape the Lead asked to pin after T3's change: "quiesce returns
+  // with the pooled process still running".
+  const reusable = makePool();
+  const survivor = fakeProcess("q");
+  reusable.park(entry(survivor));
+  check(
+    "quiesce leaves a reusable parked process running",
+    (await reusable.quiesce("dsh-1", { cwd: "/work", routeKey: "p/m/max" })) === true
+      && survivor.killed === false
+      && survivor.running === true,
+    `killed ${String(survivor.killed)}, running ${String(survivor.running)}`,
+  );
+  check(
+    "…and keeps the entry so the open can still adopt it",
+    reusable.has("dsh-1") === true && reusable.size === 1,
+    `size ${String(reusable.size)}`,
+  );
 }
 
 console.log("stop kills everything");

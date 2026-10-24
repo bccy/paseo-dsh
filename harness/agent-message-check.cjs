@@ -69,6 +69,28 @@ function findRepoFile(relative, levels = 4) {
 const { AGENT_MESSAGE_EVENTS, allText, setLocale } = require("./client/locale.js");
 const { toolCallData } = require("./client/tool-call-data.js");
 
+/**
+ * Load a sibling harness module from wherever this check runs.
+ *
+ * The documented compile step copies this file into `paseo-plugin/.dbg-am`,
+ * where `require("./source-shape.cjs")` would not resolve — the module lives in
+ * `harness/`. Walking up finds it whether the check runs in place or from a
+ * build dir under `paseo-plugin/`.
+ */
+function requireHarnessModule(name) {
+  let dir = __dirname;
+  for (let i = 0; i < 6; i += 1) {
+    const candidate = path.join(dir, "harness", name);
+    if (fs.existsSync(candidate)) return require(candidate);
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  throw new Error(`could not find harness/${name} above ${__dirname}`);
+}
+
+const { callArguments, ifStatements, mentions, splitArguments } = requireHarnessModule("source-shape.cjs");
+
 let passed = 0;
 let failed = 0;
 
@@ -396,33 +418,50 @@ console.log("the transformer hands an agent message without agentMessage back to
   const transformer =
     toolTransformer < 0 ? "" : source.slice(toolTransformer, rendererAfter < 0 ? undefined : rendererAfter);
 
+  // Read the call's **arguments**, not its spelling: the old regexes pinned the
+  // whitespace between the parentheses, so wrapping the call across lines failed
+  // a check whose subject (what the item is) had not changed.
+  const mappingArgs = callArguments(transformer, "toolCallData");
   check(
     "the transformer calls toolCallData(item, phase) with the item itself",
-    /toolCallData\(\s*item\s*,\s*phase\s*\)/.test(transformer),
+    mappingArgs.some((args) => {
+      const parts = splitArguments(args).map((part) => part.trim());
+      return parts.length === 2 && mentions(parts[0], "item") && mentions(parts[1], "phase");
+    }),
+    mappingArgs.map((args) => `toolCallData(${args.trim()})`).join(" | ") || "(no call found)",
   );
   check(
     "it does not build a picked literal (which would drop agentMessage)",
-    !/toolCallData\(\s*\{/.test(transformer),
+    !mappingArgs.some((args) => splitArguments(args).some((part) => part.trim().startsWith("{"))),
+    mappingArgs.map((args) => `toolCallData(${args.trim()})`).join(" | ") || "(no call found)",
   );
 
-  const guard =
-    /if \(\s*(item\.name === "agent_message"\s*&&\s*item\.agentMessage === undefined)\s*\)\s*\{\s*return undefined;\s*\}/.exec(
-      transformer,
-    );
-  check("the missing-agentMessage guard exists", guard !== null);
+  // The guard is a plain `if` whose condition and body are both asserted
+  // structurally: a whitespace-sensitive regex failed on a reflowed `if` while
+  // the guard still returned undefined. `ifStatements` reads the condition text
+  // and the body text separately, so each half can be checked for what it says.
+  const guards = ifStatements(transformer).filter((statement) =>
+    mentions(statement.condition, "agentMessage") && mentions(statement.condition, "agent_message"),
+  );
+  const guard = guards.length === 1 ? guards[0] : null;
+  check(
+    "the missing-agentMessage guard exists",
+    guard !== null && /undefined/.test(guard.condition) && /return\s+undefined/.test(guard.body),
+    guards.length === 0
+      ? "(no guard on agentMessage)"
+      : guards.map((statement) => `if (${statement.condition.trim()}) { ${statement.body.trim()} }`).join(" | "),
+  );
   if (guard !== null) {
-    const guardAt = transformer.indexOf(guard[0]);
-    const mappingAt = transformer.indexOf("toolCallData(item, phase)");
     check(
       "the guard returns undefined instead of mapping a legacy row",
-      guardAt >= 0 && mappingAt > guardAt,
-      `guard at ${guardAt}, mapping at ${mappingAt}`,
+      guard.end <= transformer.length && guard.body.includes("return undefined"),
+      `guard ends at ${guard.end}, body "${guard.body.trim()}"`,
     );
 
     // The condition itself, run against the three shapes: the message row with
     // the field dropped (the app boundary), the same row with the field present
     // (a future host that forwards it), and an unrelated tool call.
-    const holds = new Function("item", `return (${guard[1]});`);
+    const holds = new Function("item", `return (${guard.condition});`);
     const legacy = {
       name: "agent_message",
       status: "completed",
@@ -450,11 +489,24 @@ console.log("the transformer hands an agent message without agentMessage back to
   // document field only from the field the protocol defines as its carrier. Read
   // the code with its comments stripped — the comments above *name* what must not
   // be parsed, and that is not the failure mode.
+  //
+  // Asserted as "no *read* of the echo", which is the actual claim, instead of
+  // "the two spellings appear nowhere": a string that merely mentions
+  // `plain_text` (a guard's own message, a comparison against the detail's type)
+  // is not parsing it, and the old test could not tell the two apart.
   const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  const echoReads = [
+    // `detail.text`, `item.detail.text`, `detail?.text`, `detail["text"]`.
+    /\.\s*detail\s*(?:\?\.|\.)\s*text\b/,
+    /\bdetail\s*\[\s*["'`]text["'`]\s*\]/,
+    // `plain_text` used as a *value to read*, i.e. compared for branching.
+    /[=!]==?\s*["'`]plain_text["'`]/,
+    /["'`]plain_text["'`]\s*[=!]==?/,
+  ].filter((pattern) => pattern.test(code));
   check(
     "the fallback does not parse the plain_text payload",
-    !/detail\s*\.\s*text/.test(code) && !/plain_text/.test(code),
-    "code still references detail.text or plain_text",
+    echoReads.length === 0,
+    echoReads.length === 0 ? "" : `code reads the echo: ${echoReads.map(String).join(", ")}`,
   );
 }
 

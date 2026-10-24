@@ -165,6 +165,29 @@ const { readFileSync, existsSync } = require("node:fs");
 const { dirname, join } = require("node:path");
 
 /**
+ * Load a sibling harness module from wherever this check runs.
+ *
+ * The documented compile step copies this file into `paseo-plugin/.dbg`, where a
+ * plain `require("./source-shape.cjs")` would not resolve — the module lives in
+ * `harness/`. Walking up finds it whether the check runs in place or from a
+ * build dir under `paseo-plugin/`.
+ */
+function requireHarnessModule(name) {
+  let dir = __dirname;
+  for (let i = 0; i < 6; i += 1) {
+    const candidate = join(dir, "harness", name);
+    if (existsSync(candidate)) return require(candidate);
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  throw new Error(`could not find harness/${name} above ${__dirname}`);
+}
+
+const { attributeOf, callArguments, elementsWithAttributes, mentions, splitArguments } =
+  requireHarnessModule("source-shape.cjs");
+
+/**
  * Locate a repo source file from wherever this check runs. The documented
  * compile step copies the check into `paseo-plugin/.dbg` (one level below
  * `paseo-plugin`), but a scratch build dir such as `.tmp-test/<name>` sits one
@@ -283,11 +306,18 @@ console.log("the diff stat suffix");
   // Semantic colours, not the row's tone: the counts describe the diff.
   equal("the added count is green", added.color, COLORS.statusSuccess);
   equal("the removed count is red", removed.color, COLORS.statusDanger);
-  // One run cannot hold two colours, so the row has to draw two.
+  // One run cannot hold two colours, so the row has to draw two. Asserted as
+  // "two distinct elements, each styled from its own token": the old regex only
+  // proved the two names appear *somewhere* in the file, which a comment or a
+  // single merged run would also satisfy.
   const row = readFileSync(TOOL_CALL_SOURCE, "utf8");
+  const styled = elementsWithAttributes(row, ["style"]);
+  const addedRuns = styled.filter((element) => mentions(attributeOf(element, "style").value, "statAdded"));
+  const removedRuns = styled.filter((element) => mentions(attributeOf(element, "style").value, "statRemoved"));
   check(
     "the row draws the two counts as separate runs",
-    /styles\.statAdded/.test(row) && /styles\.statRemoved/.test(row),
+    addedRuns.length === 1 && removedRuns.length === 1 && addedRuns[0].start !== removedRuns[0].start,
+    `statAdded ${String(addedRuns.length)}, statRemoved ${String(removedRuns.length)}`,
   );
 }
 
@@ -678,15 +708,52 @@ console.log("state colours");
   // The bug this replaced was a wiring one — the state colour reached a different
   // run than intended — and asserting the helpers alone cannot catch that, so the
   // row's own wiring is read.
+  //
+  // Read as **calls with arguments**, not as literal text: the old regexes
+  // `/rowIconColor\(colors, data\.status, data\.diff\)/` and `/color=\{iconColor\}/`
+  // went red when the call was wrapped across lines or the prop was reordered,
+  // neither of which changes what the row does. What matters is the argument
+  // triple (status and edit-ness), and that the resulting value reaches the icon.
   const row = readFileSync(TOOL_CALL_SOURCE, "utf8");
+  const iconColourArgs = callArguments(row, "rowIconColor");
   check(
     "the row colours the icon from status and edit-ness",
-    /rowIconColor\(colors, data\.status, data\.diff\)/.test(row),
+    iconColourArgs.some((args) => {
+      const parts = splitArguments(args).map((part) => part.trim());
+      return parts.length >= 3
+        && mentions(parts[0], "colors")
+        && mentions(parts[1], "status")
+        && mentions(parts[2], "diff");
+    }),
+    iconColourArgs.map((args) => `rowIconColor(${args.trim()})`).join(" | ") || "(no call found)",
   );
-  check("and hands that colour to the icon", /color=\{iconColor\}/.test(row));
+  // `iconColor` has to reach **every** glyph the head draws, not just one: the
+  // head has two branches (a Paseo-owned tool draws Paseo's mark tinted, the rest
+  // draw the per-tool icon), and the state colour is the row's only state signal.
+  // Asserting "some element mentions iconColor" would pass while one branch was
+  // left on the muted colour — the state would silently disappear for half the
+  // rows. So: every colour-bearing attribute in the head must read `iconColor`,
+  // and there must be at least two of them (one per branch).
+  //
+  // `tintColor` and `color` are both legitimate (the mark is tinted, the icon is
+  // coloured); prop order does not matter.
+  const glyphColours = elementsWithAttributes(row, []).flatMap((element) =>
+    element.attributes
+      .filter((attribute) => attribute.name === "color" || attribute.name === "tintColor")
+      .map((attribute) => ({ tag: element.tag, name: attribute.name, value: attribute.value.trim() })),
+  );
+  const fromIconColor = glyphColours.filter((entry) => mentions(entry.value, "iconColor"));
+  check(
+    "and hands that colour to every glyph in the head",
+    glyphColours.length >= 2 && fromIconColor.length === glyphColours.length,
+    glyphColours.map((entry) => `${entry.tag}.${entry.name}=${entry.value}`).join(", ") || "no colour-bearing element",
+  );
+  const labelArgs = callArguments(row, "rowLabelTextStyle");
+  const summaryArgs = callArguments(row, "summaryTextStyle");
   check(
     "while the label and the summary take the plain colours",
-    /rowLabelTextStyle\(colors\)/.test(row) && /summaryTextStyle\(colors\)/.test(row),
+    labelArgs.some((args) => mentions(args, "colors")) && summaryArgs.some((args) => mentions(args, "colors")),
+    `label ${String(labelArgs.length)} call(s), summary ${String(summaryArgs.length)} call(s)`,
   );
 }
 
