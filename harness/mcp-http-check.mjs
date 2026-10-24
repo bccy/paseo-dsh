@@ -27,6 +27,8 @@ const check = (name, pass, detail) => results.push({ name, pass, detail });
 /** Requests the fake server observed, so the check can assert what went out. */
 const seen = [];
 let initializeCount = 0;
+/** `tools/list` requests, counted so `cacheTools` can be asserted exactly. */
+let listCount = 0;
 
 /** Answer one JSON-RPC POST the way a streamable-HTTP MCP server does. */
 function respond(res, message, { sse = true, sessionId, delayMs = 0 } = {}) {
@@ -72,6 +74,7 @@ const server = createServer((req, res) => {
       return;
     }
     if (message.method === 'tools/list') {
+      listCount += 1;
       respond(res, {
         jsonrpc: '2.0',
         id: message.id,
@@ -213,14 +216,81 @@ try {
   const statelessList = seen.findLast((entry) => entry.message.method === 'tools/list');
   check('a stateless server needs no session header', statelessList.headers['mcp-session-id'] === undefined, String(statelessList.headers['mcp-session-id']));
 
+  // ── tools/list caching ─────────────────────────────────────────────────────
+  // The class doc promises "`tools/list` is fetched per call unless `cacheTools`
+  // is set". Both halves are asserted: a server can add or drop tools between
+  // calls, so an unconditional cache would make `mcp_tool_schema` answer from a
+  // catalog the server has since changed, and an unconditional fetch would pay
+  // a round trip for a catalog known to be fixed.
+
+  // Default (no `cacheTools`): every call re-reads the catalog.
+  const uncachedBefore = listCount;
+  const uncached = new McpHttpClient({ url: `${base}/rpc` });
+  await uncached.listTools();
+  await uncached.listTools();
+  await uncached.listTools();
+  check(
+    'without cacheTools, tools/list is fetched on every call',
+    listCount - uncachedBefore === 3,
+    `${listCount - uncachedBefore} tools/list request(s) for 3 calls`,
+  );
+
+  // `cacheTools: true`: the catalog is read once and reused.
+  const cachedBefore = listCount;
+  const cached = new McpHttpClient({ url: `${base}/rpc`, cacheTools: true });
+  const first = await cached.listTools();
+  const second = await cached.listTools();
+  const third = await cached.listTools();
+  check(
+    'with cacheTools, tools/list is fetched only on the first call',
+    listCount - cachedBefore === 1,
+    `${listCount - cachedBefore} tools/list request(s) for 3 calls`,
+  );
+  check(
+    'a cached catalog is the same catalog, not a refetch',
+    first === second && second === third && second.length === 2,
+    JSON.stringify(second.map((tool) => tool.name)),
+  );
+
+  // `refresh` still overrides the cache: the escape hatch has to work, or a
+  // server that did change its catalog could never be re-read.
+  const refreshBefore = listCount;
+  const refreshed = await cached.listTools({ refresh: true });
+  check(
+    'refresh: true re-reads even with cacheTools set',
+    listCount - refreshBefore === 1 && refreshed.length === 2,
+    `${listCount - refreshBefore} tools/list request(s)`,
+  );
+
+  // The cache is per client, not module-wide: a second client must not inherit
+  // the first one's catalog (it may point at a different server).
+  const otherBefore = listCount;
+  const other = new McpHttpClient({ url: `${base}/rpc`, cacheTools: true });
+  await other.listTools();
+  check(
+    'the cache does not leak between clients',
+    listCount - otherBefore === 1,
+    `${listCount - otherBefore} tools/list request(s) for a fresh client`,
+  );
+
+  // `callTool` must not be affected by the flag — the cache is about the
+  // catalog only, and a cached call would be a wrong answer, not a saving.
+  const callBefore = listCount;
+  const called = await cached.callTool('echo', { text: 'cached' });
+  check(
+    'a cached client still calls tools for real',
+    called.content?.[0]?.text === 'echo:cached' && listCount === callBefore,
+    JSON.stringify(called).slice(0, 120),
+  );
+
   const stateful = new McpHttpClient({ url: `${base}/stateful` });
   await stateful.listTools();
   const statefulList = seen.findLast((entry) => entry.message.method === 'tools/list' && entry.headers['mcp-session-id'] === 'sess-a');
   check('an issued session id is echoed on later requests', statefulList !== undefined, 'tools/list must carry mcp-session-id: sess-a');
   check(
     'each client sends initialized exactly once, after its handshake',
-    seen.filter((entry) => entry.message.method === 'notifications/initialized').length === 2,
-    'one notification per client handshake',
+    seen.filter((entry) => entry.message.method === 'notifications/initialized').length === 5,
+    'one notification per client handshake (5 clients built above)',
   );
 } finally {
   server.close();

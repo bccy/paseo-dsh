@@ -182,9 +182,9 @@ export function unavailableBrowserTools(tools, hostGap) {
 /**
  * One MCP server connection: initialize once, then list and call tools.
  *
- * `tools/list` is fetched per call unless `cacheTools` is set, because a browser
- * tab or agent registry can change what a server exposes between calls and a
- * stale catalog would make the gateway report tools that no longer exist.
+ * `tools/list` is fetched per call unless `cacheTools` is set, because a server
+ * can change what it exposes between calls and a stale catalog would make the
+ * gateway report tools that no longer exist (and hide new ones).
  */
 export class McpHttpClient {
   #id = 0;
@@ -192,13 +192,14 @@ export class McpHttpClient {
   #initialized;
   #tools;
 
-  constructor({ url, headers = {}, timeoutMs = DEFAULT_MCP_TIMEOUT_MS, fetchImpl = fetch, clientInfo = { name: 'paseo-mcp-gateway', version: '0.1.0' } }) {
+  constructor({ url, headers = {}, timeoutMs = DEFAULT_MCP_TIMEOUT_MS, fetchImpl = fetch, clientInfo = { name: 'paseo-mcp-gateway', version: '0.1.0' }, cacheTools = false }) {
     if (typeof url !== 'string' || url === '') throw new Error('mcp: server url is required');
     this.url = url;
     this.headers = headers;
     this.timeoutMs = timeoutMs;
     this.fetchImpl = fetchImpl;
     this.clientInfo = clientInfo;
+    this.cacheTools = cacheTools;
   }
 
   #nextId() {
@@ -249,10 +250,16 @@ export class McpHttpClient {
     return this.#initialized;
   }
 
-  /** Every tool the server currently exposes. */
+  /**
+   * Every tool the server currently exposes.
+   *
+   * Re-read per call by default: a long-lived session must not answer
+   * `mcp_tool_schema` from a catalog the server has since changed. Construct the
+   * client with `cacheTools: true` when the catalog is known to be fixed.
+   */
   async listTools({ refresh = false } = {}) {
     await this.ensureInitialized();
-    if (refresh || this.#tools === undefined) {
+    if (this.#tools === undefined || refresh || this.cacheTools !== true) {
       const result = await this.#call('tools/list', {});
       this.#tools = Array.isArray(result?.tools) ? result.tools : [];
     }

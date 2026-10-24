@@ -106,6 +106,40 @@ export function transportOf(server, entry) {
 /** Extension for the image media types MCP servers return. */
 const IMAGE_EXTENSIONS = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' };
 
+/** This gateway's own tool names. None of them is ever a valid call target. */
+const META_TOOL_NAMES = ['mcp_list_tools', 'mcp_tool_schema', 'mcp_call_tool'];
+
+/**
+ * Validate the `tool` argument before it reaches an MCP server.
+ *
+ * Recorded from a live session (2026-10-20): the model folded a whole
+ * `mcp_call_tool` call into the arguments of another one —
+ * `{"tool":"mcp_call_tool","arguments":{"server":"paseo","tool":"list_providers","arguments":{}}}`
+ * — and separately passed a meta-tool name as the target. Forwarding that
+ * verbatim asks the server for a tool it does not have, and the server's answer
+ * ("MCP error -32602: Tool mcp_call_tool not found") names neither the mistake
+ * nor the fix, so the model repeated the same call. An empty `tool` failed the
+ * same way. Reject both here, with the target and the expected shape named.
+ *
+ * @param requested - The `tool` argument as the model sent it.
+ * @param nested - The sibling `arguments` value, only to recognise a folded call.
+ * @returns The trimmed target tool name, ready to forward.
+ */
+function resolveTargetTool(requested, nested) {
+  const target = typeof requested === 'string' ? requested.trim() : '';
+  if (target === '') {
+    throw new Error('mcp: "tool" must name the MCP tool to call (as listed by mcp_list_tools), e.g. "list_providers"');
+  }
+  if (!META_TOOL_NAMES.includes(target)) return target;
+  const folded = nested !== null && typeof nested === 'object' && typeof nested.tool === 'string' && nested.tool.trim() !== ''
+    ? ` This call folded another call into "arguments" (nested tool "${nested.tool}"): pass the target's own arguments object directly, not a {tool, arguments} envelope.`
+    : '';
+  throw new Error(
+    `mcp: "${target}" is one of this gateway's own meta-tools, not an MCP tool: put the target tool's name in "tool" `
+    + `(e.g. "list_providers") and that tool's arguments object in "arguments".${folded}`,
+  );
+}
+
 /** Bound on one tool description in the discovery listing. */
 const DESCRIPTION_LIMIT = 160;
 
@@ -348,10 +382,11 @@ export function apply(ctx, config = {}) {
     },
     async execute(args) {
       const server = serverFor(args.server);
+      const wanted = resolveTargetTool(args.tool);
       const tools = await clientFor(server).listTools();
-      const found = tools.find((tool) => tool.name === args.tool);
+      const found = tools.find((tool) => tool.name === wanted);
       if (found === undefined) {
-        throw new Error(`mcp: server "${server}" exposes no tool "${args.tool}"; start from mcp_list_tools`);
+        throw new Error(`mcp: server "${server}" exposes no tool "${wanted}"; start from mcp_list_tools`);
       }
       return {
         server,
@@ -403,12 +438,13 @@ export function apply(ctx, config = {}) {
     },
     async execute(args) {
       const server = serverFor(args.server);
-      const result = await clientFor(server).callTool(args.tool, args.arguments ?? {});
-      const { text, images } = projectContent(server, args.tool, result?.content);
+      const target = resolveTargetTool(args.tool, args.arguments);
+      const result = await clientFor(server).callTool(target, args.arguments ?? {});
+      const { text, images } = projectContent(server, target, result?.content);
       if (result?.isError === true) {
-        throw new Error(`mcp: ${server}/${args.tool} reported an error: ${text === '' ? '(no message)' : text}`);
+        throw new Error(`mcp: ${server}/${target} reported an error: ${text === '' ? '(no message)' : text}`);
       }
-      return { server, tool: args.tool, content: text, images };
+      return { server, tool: target, content: text, images };
     },
   }));
 }
