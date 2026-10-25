@@ -266,25 +266,6 @@ export function parseRoute(model: string | undefined, fallback: DshRoute): DshRo
   return { provider: model.slice(0, slash), model: model.slice(slash + 1) };
 }
 
-/**
- * The identity a parked process is reused under.
- *
- * Only provider+model are pinned at process boot (`initialize`); the thinking
- * effort is applied by `session.configure` after the session opens, so it must
- * NOT take part in reuse: a reload reopens the session before that configure
- * runs, and including the effort here made every reload look like a route change
- * and kill a perfectly reusable child (measured +2.2s of cold start).
- *
- * **Currently has no callers** — the one-process-multi-session change made every
- * session join one shared child, so nothing compares a parked entry's route any
- * more (`ParkedSessions.take` logs a mismatch instead of enforcing it). Kept
- * rather than deleted: it is the documented definition of that identity, and a
- * future per-route pool would need exactly this function back.
- */
-function routeKeyOf(route: DshRoute): string {
-  return `${route.provider}/${route.model}`;
-}
-
 export class DshSession {
   readonly id: string;
   /** DSH's session id (see {@link DshSessionOptions.dshSessionId}). */

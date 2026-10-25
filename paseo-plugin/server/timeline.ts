@@ -14,22 +14,6 @@ import type {
 import type { JsonValue } from "./dsh-process";
 import { LOCALE, UI } from "./locale";
 
-/**
- * Command names this provider used to run on the user's behalf, kept only so old
- * logs replay cleanly.
- *
- * The current code produces none of these command events: the rewind is a
- * surface replacement appended without a command (`/rewind` is gone), and the
- * permission preset is written through DSH's projection API instead of its
- * `/permission` command. Sessions recorded before the change still contain those
- * `command/run`/`command/done` pairs, and replaying them as rows would show an
- * implementation detail the user never typed. This list is therefore a legacy
- * cleanup, not a policy: it can be deleted once no replayable session predates
- * the change.
- */
-const LEGACY_INTERNAL_COMMANDS = new Set(["rewind", "undo", "permission"]);
-
-
 interface DshEvent {
   type: string;
   seq?: number;
@@ -1116,12 +1100,6 @@ export class TimelineBuilder {
     // A failed one is *not* dropped: Paseo's marker has no failure state, so the
     // failed row is the only place the error can be read. Fail loud.
     if (!failed && this.#compactionCommands.has(commandId)) return [];
-    // Historical logs from the retired `/rewind`-command implementation contain
-    // command rows for internal commands the user never typed; drop the
-    // successful ones on replay. (The current implementation appends a surface
-    // replacement directly, so it never produces these rows.) A failed command
-    // keeps its row because Paseo's marker has no failure state.
-    if (!failed && LEGACY_INTERNAL_COMMANDS.has(name)) return [];
     const line = `/${name}`;
     return this.#put({
       type: "tool_call",

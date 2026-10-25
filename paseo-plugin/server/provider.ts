@@ -8,10 +8,8 @@
  *
  * @module dsh-paseo/server/provider
  */
-import { readdirSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import {
   negotiateProviderCapabilities,
   type ProviderCatalog,
@@ -312,13 +310,6 @@ class DshConnection implements ProviderConnection {
   readonly #listeners = new Set<(event: ProviderEvent) => void>();
   readonly #sessions = new Map<string, DshSession>();
   /**
-   * provider session id -> Paseo agent id. The daemon hands the provider the
-   * agent id in `config.env.PASEO_AGENT_ID` (documented lifecycle order: it is
-   * set after the session_open hooks and before the provider session opens), and
-   * the post-rewind refresh needs the *agent* id, which no plugin API maps.
-   */
-  readonly #agentIds = new Map<string, string>();
-  /**
    * provider session id -> DSH native session id. Kept across `session.close`
    * on purpose: the rewind reload closes this provider session and reopens a
    * new one for the same DSH session, and notices produced in that window must
@@ -327,8 +318,6 @@ class DshConnection implements ProviderConnection {
   readonly #dshIds = new Map<string, string>();
   /** Notices waiting for their DSH session to be reopened, keyed by DSH session id. */
   readonly #deferredNotices = new Map<string, DeferredNotice[]>();
-  /** Provider sessions whose rewind is in flight: prompts are refused until the reload. */
-  readonly #reverting = new Set<string>();
   /**
    * DSH session ids with an `#open` transaction in flight.
    *
@@ -338,7 +327,6 @@ class DshConnection implements ProviderConnection {
    */
   readonly #opening = new Set<string>();
   #display: DisplayCatalog | undefined;
-  #paseoBinary: string | undefined;
   #closed = false;
   /**
    * The one DeepSeek Harness process this connection shares between its sessions.
@@ -450,10 +438,8 @@ class DshConnection implements ProviderConnection {
     this.#closed = true;
     const sessions = [...this.#sessions.values()];
     this.#sessions.clear();
-    this.#agentIds.clear();
     this.#dshIds.clear();
     this.#deferredNotices.clear();
-    this.#reverting.clear();
     this.#opening.clear();
     // Provider teardown is not a reload: shut the sessions down and kill the
     // parked children instead of keeping them alive for a reopen that will not
@@ -660,8 +646,7 @@ class DshConnection implements ProviderConnection {
    * `dsh-process.ts` change, out of this file's scope). So when a session joins
    * a child spawned with a different environment, its values are silently inert
    * unless this says so. `PASEO_AGENT_ID` is excluded because the daemon sets it
-   * per open by design and the provider reads it into `#agentIds` — it is not
-   * addressed to DSH.
+   * per open by design — it is not addressed to DSH.
    *
    * @param env - the joining session's `config.env`.
    */
@@ -873,20 +858,6 @@ class DshConnection implements ProviderConnection {
         return;
       }
       case "session.prompt": {
-        // The rewind's automatic reload runs after `session.revert` answered and
-        // closes this provider session. A prompt accepted in that window races
-        // the close: it can be cancelled by the reload, interleave with the
-        // surface replacement, or append after the frozen replacement range.
-        // Refuse it with a readable reason instead of losing it silently.
-        if (this.#reverting.has(input.sessionId)) {
-          this.#emit({
-            type: "session.prompt_result",
-            sessionId: input.sessionId,
-            clientMessageId: input.prompt.clientMessageId,
-            result: { type: "failed", error: { message: "正在回退，请稍候" } },
-          });
-          return;
-        }
         return this.#require(input.sessionId).prompt(input.prompt);
       }
       case "session.permission":
@@ -900,70 +871,35 @@ class DshConnection implements ProviderConnection {
         return;
       }
       case "session.revert": {
-        // A second rewind while the first one is refreshing would fail inside the
-        // bridge, and its catch would clear the FIRST rewind's prompt gate while
-        // the rebuild is still running. Refuse it without touching the gate.
-        if (this.#reverting.has(input.sessionId)) {
-          this.#emit({
-            type: "request.failed",
-            requestId: input.requestId,
-            error: { message: "该会话已有撤回正在进行，请稍候" },
-          });
-          return;
-        }
         const session = this.#require(input.sessionId);
-        // From here until `session.close` the timeline is being rebuilt: prompts
-        // are refused (see the `session.prompt` gate) so none is lost or left
-        // outside the replacement range. A refused rewind must release the flag
-        // immediately — nothing changes in that case.
-        this.#reverting.add(input.sessionId);
-        let result: DshRevertResult | undefined;
-        try {
-          // Child sessions throw before returning; the root session returns the bridge receipt.
-          result = (await session.revert(input.token, input.scope)) as DshRevertResult | undefined;
-        } catch (error) {
-          this.#reverting.delete(input.sessionId);
-          throw error;
-        }
+        // Child sessions throw before returning; the root session returns the bridge receipt.
+        // Concurrency is the bridge's job: it already refuses a second rewind on the
+        // same session with "该会话已有撤回正在进行" (`dsh-bridge/lib/server.js` revertInflight).
+        const result = (await session.revert(input.token, input.scope)) as DshRevertResult | undefined;
         // Answer first, refresh second, and never await the refresh: the daemon's
         // rewind holds a pending run until this request resolves, while the
         // refresh it would trigger closes this very provider session
         // (`reloadAgentSession` cancels in-flight runs) — awaiting it here
         // deadlocks the two. The 50 ms timer plus the CLI's own boot time keeps
         // the reply ahead of the restart.
+        // Nothing to refresh any more: the daemon rebuilds the timeline from
+        // `PluginProviderSession.streamHistory()` right after this reply, and the
+        // LOCAL PATCH in `@getpaseo/server` truncates that buffer at the rewound
+        // row before the reply goes out. No reload, no closed provider session,
+        // no new session id.
         this.#emit({ type: "request.completed", requestId: input.requestId });
-        // The daemon only rebuilds the timeline after the reload below, and the
-        // click itself gives no feedback while that takes a second or so. A
-        // notice is the one channel this provider has for a transient "working"
-        // row: it lands after the revert succeeded (a refused or failed revert
-        // never reaches here), and the rebuild that follows drops it with the
-        // rest of the old timeline epoch. If the reload fails it stays next to
-        // the "timeline was not refreshed" warning, which is honest.
-        this.#notice(input.sessionId, "info", "正在回退，请稍候");
         const failedFiles = result?.files?.failed ?? [];
         if (failedFiles.length > 0) {
-          // The conversation rewind succeeded; only some files did not. Defer
-          // the notice until the reload opens the new session: emitted now, the
-          // epoch rebuild would discard it and the user would never learn the
-          // file side failed.
-          this.#deferNotice(input.sessionId, {
-            severity: "error",
-            title: "文件回退未完成",
-            // The rescue copy is the content the restore was about to replace
-            // (already including the agent's edits), NOT the pre-edit state. The
-            // pre-edit backups stay in the journal because the bridge skips
-            // prune/trim/GC after a failure, so a second rewind retries them.
-            description: `${failedFiles.map((entry) => entry.path).join("、")} 恢复失败；撤回前备份已保留（可重试撤回），被替换的当前内容已另存到 ${result?.files?.rescueDir ?? "(未知目录)"}。`,
-          });
+          // The conversation rewind succeeded; only some files did not. A notice
+          // emitted now stays in this epoch (the timeline is no longer rebuilt
+          // from scratch), so the user learns about the file side immediately.
+          this.#notice(
+            input.sessionId,
+            "error",
+            "文件回退未完成",
+            `${failedFiles.map((entry) => entry.path).join("、")} 恢复失败；撤回前备份已保留（可重试撤回），被替换的当前内容已另存到 ${result?.files?.rescueDir ?? "(未知目录)"}。`,
+          );
         }
-        // Replaying `PluginProviderSession.streamHistory` cannot drop rows (the
-        // buffer only grows and the plugin contract has no removal event), so the
-        // timeline keeps the withdrawn messages until Paseo refreshes the agent.
-        // Paseo's own docs define that refresh as "close the provider session and
-        // open it again" — which replays the bridge's surface-folded history — and
-        // the provider cannot trigger it through the SDK, so ask the daemon for it
-        // below.
-        this.#refreshAgent(input.sessionId);
         return;
       }
       case "session.interrupt": {
@@ -979,7 +915,6 @@ class DshConnection implements ProviderConnection {
         // The gate is released when `#open` reports the new session ready, by a
         // refresh-failure path, or by the 15s safety timer.
         this.#sessions.delete(input.sessionId);
-        this.#agentIds.delete(input.sessionId);
         // Park an idle child: the daemon closes this session right before a
         // rewind refresh reopens it with the same persistence. `park` has **no
         // effect** under one shared process (`DshSession.close` never parks a
@@ -1132,130 +1067,6 @@ class DshConnection implements ProviderConnection {
     }
   }
 
-  /**
-   * Resolve the `paseo` executable once: an explicit `PASEO_BIN` wins, else
-   * `which` (a daemon may not carry the npm-global bin directory on PATH), else
-   * the bare name so the failure is reported by spawn's error event.
-   *
-   * @returns the binary to spawn.
-   */
-  #resolvePaseoBinary(): string {
-    if (this.#paseoBinary !== undefined) return this.#paseoBinary;
-    const configured = process.env["PASEO_BIN"]?.trim();
-    if (configured !== undefined && configured !== "") {
-      this.#paseoBinary = configured;
-      return configured;
-    }
-    try {
-      const found = execFileSync("which", ["paseo"], { encoding: "utf8" }).trim();
-      if (found !== "") {
-        this.#paseoBinary = found;
-        return found;
-      }
-    } catch {
-      /* fall through to the bare name */
-    }
-    this.#paseoBinary = "paseo";
-    return "paseo";
-  }
-
-  /**
-   * Ask Paseo to refresh one agent, the way `paseo agent reload <id>` does.
-   *
-   * Why this exists at all: Paseo's plugin-provider adapter keeps an
-   * append-only translated history and `revert()` cannot truncate it, while the
-   * daemon rehydrates the timeline from exactly that history after a rewind
-   * (upstream issue #4667, still open). The documented refresh semantics —
-   * "close the current provider session and open it again with persistence" —
-   * is the only way to make the timeline reflect the rewind, and the plugin SDK
-   * exposes no call for it. Spawning the shipped CLI hits the daemon's own
-   * `refresh_agent_request` path.
-   *
-   * The small delay is deliberate: the caller answers `session.revert` first
-   * (the daemon holds a pending run until it is answered, and the refresh cancels
-   * in-flight runs). It is kept short on purpose — spawning the CLI itself costs
-   * ~500ms of node boot before the request even leaves, which comfortably covers
-   * the daemon's rewind settle. Measured on the live daemon (agent 10c14347,
-   * 8302-event session): rewind start → complete **2035ms**, not the ~52ms this
-   * comment used to claim — that window spans the bridge's own `revert()` plus
-   * the daemon's forced full-timeline rebuild (`hydrateTimelineFromProvider` with
-   * `force: true`), so a long timer only adds latency to the user-visible refresh.
-   *
-   * Failures are reported to the user via a notice and the plugin log; the
-   * rewind itself has already succeeded.
-   *
-   * @param sessionId - provider session whose agent should be reloaded.
-   */
-  #refreshAgent(sessionId: string): void {
-    const timer = setTimeout(() => {
-      // The provider can be torn down between the rewind and this timer; do not
-      // spawn a CLI reload for a connection that no longer exists.
-      if (this.#closed) return;
-      const agentId = this.#agentIds.get(sessionId) ?? findPaseoAgentId(sessionId);
-      if (agentId === undefined) {
-        process.stderr.write(
-          `[${PROVIDER_ID}] agent reload skipped: no agent record carries session ${sessionId}\n`,
-        );
-        this.#reverting.delete(sessionId);
-        this.#notice(sessionId, "warning", "时间线未自动刷新", "撤回已完成，但未找到该会话对应的 agent；请手动执行 Reload agent。");
-        return;
-      }
-      const binary = this.#resolvePaseoBinary();
-      try {
-        const child = spawn(binary, ["agent", "reload", agentId], {
-          detached: true,
-          stdio: ["ignore", "ignore", "pipe"],
-        });
-        // `spawn` reports a missing binary as an event, not a throw: without this
-        // listener the refresh failed silently and the rewind looked applied only
-        // to the conversation (that cost a whole debug round).
-        child.on("error", (error) => {
-          process.stderr.write(`[${PROVIDER_ID}] agent reload spawn failed (${binary}): ${messageOf(error)}\n`);
-          // No reload will close the session: the conversation is usable again,
-          // so stop refusing prompts and report through whatever channel exists.
-          this.#reverting.delete(sessionId);
-          this.#notice(sessionId, "warning", "时间线未自动刷新", "自动 Reload agent 启动失败；撤回已完成，请手动执行 Reload agent。");
-        });
-        let stderrText = "";
-        child.stderr?.setEncoding("utf8");
-        child.stderr?.on("data", (chunk: string) => {
-          stderrText += chunk;
-        });
-        child.on("exit", (code) => {
-          const trimmed = stderrText.trim();
-          process.stderr.write(
-            `[${PROVIDER_ID}] agent reload ${agentId} exited ${String(code)}${trimmed === "" ? "" : `: ${trimmed.slice(0, 400)}`}\n`,
-          );
-          if (code !== 0) {
-            this.#reverting.delete(sessionId);
-            // If the old session is already closed this is queued and delivered
-            // by the next session opened for the same DSH session.
-            this.#notice(sessionId, "warning", "时间线未自动刷新", "自动 Reload agent 未成功；撤回已完成，请手动执行 Reload agent。");
-          }
-        });
-        child.unref();
-      } catch (error) {
-        process.stderr.write(`[${PROVIDER_ID}] refreshing the agent after a rewind: ${messageOf(error)}\n`);
-        this.#reverting.delete(sessionId);
-        this.#notice(sessionId, "warning", "时间线未自动刷新", "自动 Reload agent 失败；撤回已完成，请手动执行 Reload agent。");
-      }
-      // Safety net: a reload that never reaches the reopen must not leave the
-      // session permanently prompt-blocked. The reload's reopen clears the flag
-      // (`#releaseRevertingFor`, keyed by DSH session id); this only fires when the
-      // refresh path died silently, so the wording says that instead of claiming a
-      // close that did happen.
-      const safety = setTimeout(() => {
-        if (this.#reverting.delete(sessionId)) {
-          process.stderr.write(
-            `[${PROVIDER_ID}] rewind reload did not reopen session ${sessionId} in 15s; prompts allowed again\n`,
-          );
-        }
-      }, 15_000);
-      safety.unref();
-    }, 50);
-    timer.unref();
-  }
-
   async #open(input: Extract<ProviderInput, { type: "session.open" }>): Promise<void> {
     const { sessionId, config } = input;
     // `send()` guards only at its entry. An open still running when the
@@ -1289,13 +1100,12 @@ class DshConnection implements ProviderConnection {
       );
     }
 
-    // The daemon injects the Paseo agent id into the provider session env; the
-    // post-rewind refresh needs it because `paseo agent reload` takes the agent
-    // id, and no plugin API maps a provider session to one.
+    // The daemon injects the Paseo agent id into the provider session env. It
+    // scopes native child ids so a reload upserts the same Paseo rows instead of
+    // duplicating the subagent tree (see `DshSessionOptions.agentId`).
     const agentId = typeof config.env?.["PASEO_AGENT_ID"] === "string"
       ? config.env["PASEO_AGENT_ID"].trim()
       : "";
-    if (agentId !== "") this.#agentIds.set(sessionId, agentId);
 
     const route = parseRoute(config.model, display.fallbackRoute);
 
@@ -1329,7 +1139,6 @@ class DshConnection implements ProviderConnection {
         );
       }
       this.#sessions.delete(holder.id);
-      this.#agentIds.delete(holder.id);
       // Tell the daemon the session it still believes is open is gone: silence
       // would leave prompts routed at a provider session this connection no longer
       // owns, surfacing later as an unexplained `runtime_failed`.
@@ -1574,10 +1383,6 @@ class DshConnection implements ProviderConnection {
       // this session holds has to be returned (the catch below closes it).
       this.#assertConnected();
     } catch (error) {
-      // The gate is keyed by DSH session id: the host mints a fresh provider
-      // session id for every open, so the id that was gated is not the one this
-      // call is opening.
-      this.#releaseRevertingFor(dshSessionId);
       this.#opening.delete(dshSessionId);
       // The daemon drops its own maps and rethrows on a failed open
       // (`PluginProvider.openSession`'s catch never sends `session.close`), so
@@ -1594,7 +1399,6 @@ class DshConnection implements ProviderConnection {
       if (session !== undefined && this.#sessions.get(sessionId) === session) {
         this.#sessions.delete(sessionId);
       }
-      this.#agentIds.delete(sessionId);
       if (session === undefined) throw error;
       try {
         // A failed open is not a reload: shut the child down rather than park it.
@@ -1624,19 +1428,10 @@ class DshConnection implements ProviderConnection {
     });
     this.#emit({ type: "session.config", sessionId, config: session.configState() });
     this.#emit({ type: "session.ready", requestId: input.requestId, sessionId });
-    // The reload's reopen is complete: prompts are safe again. (A prompt sent
-    // during close→reopen was refused by the `session.prompt` gate; the gate
-    // must stay armed until here, not until `session.close`.) Release by DSH
-    // session id: the host reopened this DSH session under a **new** provider
-    // session id, so releasing only `sessionId` left the old id gated until the
-    // 15 s safety timer and printed a misleading "reload did not close" warning
-    // after every successful rewind.
-    this.#releaseRevertingFor(dshSessionId);
-    // Deliver what the previous session could not: a deferred file-restore
-    // failure, or "the timeline was not refreshed". Emitted here — after the
-    // session is usable and while the daemon is still collecting this session's
-    // history — the notice is part of the rebuilt timeline instead of a row of
-    // the old epoch that the reload discards.
+    // Deliver notices queued while no provider session was open for this DSH
+    // session (a partial outcome reported between close and reopen). Emitted here
+    // — after the session is usable and while the daemon is still collecting this
+    // session's history — so the notice becomes a row of the new timeline.
     this.#flushDeferredNotices(sessionId, dshSessionId);
     // Report what this open degraded: a system prompt this provider cannot carry,
     // a command catalog that failed to load, or a permission preset that was not
@@ -1796,22 +1591,6 @@ class DshConnection implements ProviderConnection {
     return undefined;
   }
 
-  /**
-   * Release the rewind prompt gate for every provider session of one DSH session.
-   *
-   * A provider session id is minted by the host on **every** open (`resumeSession`
-   * included), so after the reload's reopen the gate sits under the previous id.
-   * Releasing by DSH session id is what lets the reopen clear it; the 15 s safety
-   * timer in `#refreshAgent` stays as a backstop for a refresh that never reports.
-   *
-   * @param dshSessionId - DSH session id the gate was armed for.
-   */
-  #releaseRevertingFor(dshSessionId: string): void {
-    for (const [providerId, mapped] of this.#dshIds) {
-      if (mapped === dshSessionId) this.#reverting.delete(providerId);
-    }
-  }
-
   #require(sessionId: string): DshSession | DshChildSession {
     const session = this.#sessions.get(sessionId);
     if (session !== undefined) return session;
@@ -1855,109 +1634,4 @@ export function createDshProvider(): ProviderRegistration {
       return new DshConnection(capabilities);
     },
   };
-}
-
-/**
- * Resolve the Paseo agent id that owns one provider session.
- *
- * Paseo hands the provider a session id, but `paseo agent reload` takes the
- * *agent* id, and the plugin API exposes no mapping — `PaseoApi.agents` is
- * list/ref/create/subscribe and the list payload has no session id.
- *
- * The authoritative mapping is `config.env.PASEO_AGENT_ID`, which the daemon sets
- * on every open (`#agentIds`). This scan of `~/.paseo/agents/<workspace>/<agentId>.json`
- * is only a fallback, and a deliberately limited one: the record stores the plugin
- * persistence handle, whose `data.sessionId` is the **DSH** session id — equal to
- * the provider session id only for a session that was never reopened (a reload
- * mints a new provider session id). So it can rescue a fresh session, not a
- * reopened one; there is no honest way to map the latter from the records. A
- * missing or unreadable store is not an error: it means "cannot refresh", and the
- * caller reports that rather than failing the rewind that already happened.
- *
- * @param sessionId - the provider session id Paseo opened this session with.
- * @returns the owning agent id, or undefined when no record claims that session.
- */
-function findPaseoAgentId(sessionId: string): string | undefined {
-  const root = join(homedir(), ".paseo", "agents");
-  let workspaces: string[];
-  try {
-    workspaces = readdirSync(root);
-  } catch {
-    return undefined;
-  }
-  const matches: string[] = [];
-  for (const workspace of workspaces) {
-    const dir = join(root, workspace);
-    let files: string[];
-    try {
-      files = readdirSync(dir);
-    } catch {
-      continue;
-    }
-    for (const file of files) {
-      if (!file.endsWith(".json")) continue;
-      let raw: string;
-      try {
-        raw = readFileSync(join(dir, file), "utf8");
-      } catch {
-        continue;
-      }
-      // Cheap pre-filter before parsing: most records do not mention this session.
-      if (!raw.includes(sessionId)) continue;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(raw);
-      } catch {
-        continue;
-      }
-      if (!isRecord(parsed) || typeof parsed["id"] !== "string" || parsed["id"] === "") continue;
-      // Exact claim only: a substring match could pick an agent whose record
-      // merely mentions this session id (a child, an archive copy). Reloading the
-      // wrong agent is worse than not reloading at all.
-      const claimed = claimedSessionIds(parsed);
-      if (!claimed.includes(sessionId)) continue;
-      if (!matches.includes(parsed["id"])) matches.push(parsed["id"]);
-    }
-  }
-  if (matches.length > 1) {
-    process.stderr.write(
-      `[${PROVIDER_ID}] cannot map session ${sessionId} to one agent (${matches.length} records claim it); skipping automatic reload\n`,
-    );
-    return undefined;
-  }
-  return matches[0];
-}
-
-/**
- * Session ids one stored agent record claims through its persistence handle.
- *
- * The daemon's registry stores the provider handle as a JSON string
- * (`plugin:{"version":1,"data":{"sessionId":"…"}}`); runtimeInfo carries the
- * same handle. Parsing it is the exact match the substring scan was missing.
- *
- * @param record - parsed agent record.
- * @returns every DSH session id the record claims.
- */
-function claimedSessionIds(record: Record<string, unknown>): string[] {
-  const ids: string[] = [];
-  const values: unknown[] = [];
-  const persistence = record["persistence"];
-  if (typeof persistence === "string") values.push(persistence);
-  else if (isRecord(persistence)) values.push(persistence["sessionId"]);
-  const runtime = record["runtimeInfo"];
-  if (isRecord(runtime)) values.push(runtime["sessionId"]);
-  for (const value of values) {
-    if (typeof value !== "string" || value === "") continue;
-    if (value.startsWith("plugin:")) {
-      try {
-        const parsed = JSON.parse(value.slice("plugin:".length)) as { data?: { sessionId?: unknown } };
-        if (typeof parsed.data?.sessionId === "string") ids.push(parsed.data.sessionId);
-      } catch {
-        // Not a plugin persistence handle; ignore instead of guessing.
-      }
-    } else {
-      ids.push(value);
-    }
-  }
-  return ids;
 }
