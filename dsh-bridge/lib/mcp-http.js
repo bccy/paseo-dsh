@@ -277,14 +277,25 @@ export class McpHttpClient {
   }
 
   /**
-   * One JSON-RPC round trip that keeps the session bookkeeping honest.
+   * One JSON-RPC *request* round trip that keeps the session bookkeeping honest.
    *
    * Session loss is only detectable on the response — the server answers 404 and
    * never gets as far as a JSON-RPC frame — so every request this class sends
    * goes through here rather than through `mcpRequest` directly. The guard reads
-   * the id that was actually *sent*: a request without one cannot have lost a
-   * session, so a 404 on a stateless server (Paseo's own never issues an id) is
-   * left to propagate untouched.
+   * the session id that was actually *sent*: a request without one cannot have
+   * lost a session, so a 404 on a stateless server (Paseo's own never issues an
+   * id) is left to propagate untouched.
+   *
+   * Requests only, never notifications. The `id` below is unconditional because a
+   * JSON-RPC request always carries one — and that is exactly why a notification
+   * must not come through here: with an `id` it stops being a notification and
+   * becomes a request for a method the server does not have. Paseo's server
+   * answers `-32601 Method not found` to `notifications/initialized` that carries
+   * an id, which fails the handshake and takes all 61 of its tools with it.
+   * Notifications therefore call `mcpRequest` directly (see `ensureInitialized`),
+   * which also keeps them out of the 404 recovery below: only a message carrying
+   * a session id can be disowned, and a fire-and-forget notification is not a
+   * place to re-handshake from.
    */
   async #request(method, { params, sessionId = this.#sessionId } = {}) {
     const epoch = this.#epoch;
@@ -318,8 +329,22 @@ export class McpHttpClient {
       await this.#request('initialize', {
         params: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: this.clientInfo },
       });
-      // The id this handshake just opened — `#request` adopted it above.
-      await this.#request('notifications/initialized', { sessionId: this.#sessionId });
+      // A JSON-RPC *notification*, so it goes to `mcpRequest` directly instead of
+      // through `#request` — that helper always attaches an id, and an
+      // `id`-bearing notification is not a notification any more: Paseo's server
+      // answers `-32601 Method not found` and the handshake fails, which is what
+      // makes every gateway tool unreachable. No id, no `#request`, no session
+      // recovery: this message carries the id the handshake just opened (adopted
+      // by `#request` above), and a fire-and-forget acknowledgement is not where
+      // a lost session gets noticed or re-established.
+      await mcpRequest({
+        url: this.url,
+        headers: this.headers,
+        method: 'notifications/initialized',
+        sessionId: this.#sessionId,
+        timeoutMs: this.timeoutMs,
+        fetchImpl: this.fetchImpl,
+      });
     })().catch((error) => {
       this.#initialized = undefined;
       throw error;

@@ -38,6 +38,15 @@ const dropSessions = () => liveSessions.clear();
 const issuedByPath = new Map();
 /** Make `/sessions-down` fail `tools/list` — a server that stayed broken. */
 let sessionDownOnList = false;
+/**
+ * Notifications that arrived carrying an `id`, counted so the check can assert
+ * the handshake never made the server answer `-32601`.
+ *
+ * This is the counter that would have caught the regression that shipped: a
+ * `notifications/initialized` sent as a request is not a cosmetic difference,
+ * it is the handshake failing on Paseo's own server.
+ */
+let notificationRejections = 0;
 
 /**
  * The paths that model session loss, keyed by URL.
@@ -74,6 +83,30 @@ function respond(res, message, { sse = true, sessionId, delayMs = 0 } = {}) {
     });
     res.end(body);
   }, delayMs);
+}
+
+/**
+ * Answer a JSON-RPC *notification* the way the real Paseo server does.
+ *
+ * A notification has no `id` by definition (JSON-RPC 2.0 §4), and the server
+ * acknowledges it with a bare `202` and no body. What the real endpoint does
+ * with a notification that *does* carry an id — verified by hand against
+ * `http://127.0.0.1:6767/mcp/agents` — is treat it as a request for a method it
+ * does not have: `200` plus `-32601 Method not found`. Answering `202`
+ * unconditionally, as this fake used to, hides that difference completely: the
+ * client can send the wrong shape and still see a clean handshake, which is
+ * exactly how a handshake-breaking regression passed 43/43 here while Paseo
+ * refused every gateway call in the live environment.
+ */
+function respondNotification(res, message) {
+  if (message.id !== undefined) {
+    notificationRejections += 1;
+    // Same framing as the real endpoint: a `200` SSE frame carrying `-32601`.
+    respond(res, { jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'Method not found' } });
+    return;
+  }
+  res.writeHead(202);
+  res.end();
 }
 
 const server = createServer((req, res) => {
@@ -122,8 +155,7 @@ const server = createServer((req, res) => {
         return;
       }
       if (message.method === 'notifications/initialized') {
-        res.writeHead(202);
-        res.end();
+        respondNotification(res, message);
         return;
       }
       if (message.method === 'tools/list') {
@@ -158,7 +190,7 @@ const server = createServer((req, res) => {
       return;
     }
     const message = JSON.parse(raw);
-    seen.push({ message, headers: req.headers });
+    seen.push({ message, headers: req.headers, url: req.url });
     if (message.method === 'initialize') {
       initializeCount += 1;
       // Paseo's own server is stateless (`/rpc`); a stateful server issues a
@@ -171,8 +203,7 @@ const server = createServer((req, res) => {
       return;
     }
     if (message.method === 'notifications/initialized') {
-      res.writeHead(202);
-      res.end();
+      respondNotification(res, message);
       return;
     }
     if (message.method === 'tools/list') {
@@ -302,21 +333,102 @@ try {
   const timedOut = await (async () => { try { await mcpRequest({ url: `${base}/slow`, method: 'tools/list', id: 3, timeoutMs: 120 }); return null; } catch (error) { return error; } })();
   check('a slow server times out with the budget named', /timed out after 120ms/.test(timedOut?.message ?? ''), timedOut?.message);
 
+  // ── a notification must not be sent as a request ───────────────────────────
+  // JSON-RPC 2.0 draws one line the handshake depends on: a *request* carries an
+  // `id`, a *notification* does not. Sending `notifications/initialized` with an
+  // id is therefore not a cosmetic difference — it asks the server for a method
+  // it does not have. Paseo's own endpoint answers such a message with
+  // `-32601 Method not found` (verified by hand against
+  // `http://127.0.0.1:6767/mcp/agents`: an id-bearing notification gets `200` +
+  // `-32601`, the id-less one gets `202` with an empty body), which fails
+  // `ensureInitialized()` and makes all 61 gateway tools unreachable.
+  //
+  // This shipped once, because this fake server answered `202` to every
+  // `notifications/initialized` regardless of its shape — 43/43 green on a
+  // handshake the real server was rejecting. `respondNotification` above now
+  // mirrors the real endpoint, so the assertions below are the ones that would
+  // have gone red: the wire shape of the notification, and the handshake
+  // actually completing against a server that refuses the wrong shape.
+
+  // (a) The transport itself: `id === undefined` must mean "no `id` field at
+  // all", not `"id": null` and not a generated one.
+  const directNotification = await (async () => {
+    try {
+      return await mcpRequest({ url: `${base}/notify-shape`, method: 'notifications/initialized', sessionId: 'sess-x' });
+    } catch (error) { return error; }
+  })();
+  const directSent = seen.findLast((entry) => entry.url === '/notify-shape' && entry.message.method === 'notifications/initialized');
+  check(
+    'mcpRequest omits the id field entirely for a notification',
+    !(directNotification instanceof Error)
+      && directSent !== undefined
+      && !Object.prototype.hasOwnProperty.call(directSent.message, 'id')
+      && directSent.message.jsonrpc === '2.0'
+      && directSent.message.method === 'notifications/initialized'
+      && directSent.headers['mcp-session-id'] === 'sess-x',
+    directNotification instanceof Error
+      ? `mcpRequest rejected the notification: ${directNotification.message}`
+      : `payload: ${JSON.stringify(directSent?.message)}`,
+  );
+
+  // (b) The client's own handshake, asserted before anything else can throw: on
+  // the regression these two halves fail together, because the id makes the
+  // server answer `-32601` and `ensureInitialized()` rejects. Catching that
+  // rejection here (rather than letting it abort the run) is what keeps the
+  // failure a named FAIL with the server's own words in it.
+  const shapeClient = new McpHttpClient({ url: `${base}/rpc` });
+  const shapeHandshake = await (async () => {
+    try { await shapeClient.ensureInitialized(); return null; } catch (error) { return error; }
+  })();
+  const clientNotification = seen.findLast((entry) => entry.url === '/rpc' && entry.message.method === 'notifications/initialized');
+  check(
+    'the client sends notifications/initialized without an id',
+    shapeHandshake === null
+      && clientNotification !== undefined
+      && !Object.prototype.hasOwnProperty.call(clientNotification.message, 'id'),
+    shapeHandshake !== null
+      ? `ensureInitialized() threw: ${shapeHandshake.message}; payload: ${JSON.stringify(clientNotification?.message)}`
+      : `payload: ${JSON.stringify(clientNotification?.message)}`,
+  );
+  check(
+    'the handshake is accepted by a server that refuses id-bearing notifications',
+    shapeHandshake === null && notificationRejections === 0,
+    shapeHandshake !== null
+      ? `ensureInitialized() threw: ${shapeHandshake.message} (${notificationRejections} notification(s) answered -32601)`
+      : `${notificationRejections} notification(s) answered -32601, handshake completed`,
+  );
+
   // ── client lifecycle ───────────────────────────────────────────────────────
   const client = new McpHttpClient({ url: `${base}/rpc` });
-  const tools = await client.listTools();
-  check('listTools returns the server catalog', tools.length === 2 && tools[0].name === 'echo', JSON.stringify(tools.map((tool) => tool.name)));
+  // A handshake the server refuses must be reported, not thrown: an aborting
+  // check prints nothing and therefore names nothing.
+  const firstList = await (async () => {
+    try { return await client.listTools(); } catch (error) { return error; }
+  })();
+  const tools = Array.isArray(firstList) ? firstList : [];
+  check(
+    'listTools returns the server catalog',
+    !(firstList instanceof Error) && tools.length === 2 && tools[0].name === 'echo',
+    firstList instanceof Error ? firstList.message : JSON.stringify(tools.map((tool) => tool.name)),
+  );
 
-  const echo = await client.callTool('echo', { text: 'hi' });
-  check('callTool returns MCP content', echo.content?.[0]?.text === 'echo:hi', JSON.stringify(echo).slice(0, 120));
+  const echo = await (async () => {
+    try { return await client.callTool('echo', { text: 'hi' }); } catch (error) { return error; }
+  })();
+  check(
+    'callTool returns MCP content',
+    echo?.content?.[0]?.text === 'echo:hi',
+    echo instanceof Error ? echo.message : JSON.stringify(echo).slice(0, 120),
+  );
 
   const boom = await (async () => { try { await client.callTool('boom'); return null; } catch (error) { return error; } })();
   check('an MCP tool error becomes a thrown error', /tool exploded/.test(boom?.message ?? ''), boom?.message);
 
   await client.listTools();
-  check('the handshake runs once per client', initializeCount === 2, `initialize count: ${initializeCount} (1 direct + 1 client)`);
+  check('the handshake runs once per client', initializeCount === 3, `initialize count: ${initializeCount} (1 direct + 1 shape client + 1 client)`);
   const statelessList = seen.findLast((entry) => entry.message.method === 'tools/list');
   check('a stateless server needs no session header', statelessList.headers['mcp-session-id'] === undefined, String(statelessList.headers['mcp-session-id']));
+
 
   // ── tools/list caching ─────────────────────────────────────────────────────
   // The default is the contract that matters: `clientFor` in `mcp-gateway.js`
@@ -395,10 +507,20 @@ try {
   await stateful.listTools();
   const statefulList = seen.findLast((entry) => entry.message.method === 'tools/list' && entry.headers['mcp-session-id'] === 'sess-a');
   check('an issued session id is echoed on later requests', statefulList !== undefined, 'tools/list must carry mcp-session-id: sess-a');
+  // Counted per path so the transport-level notification asserted earlier
+  // (`/notify-shape`, one direct `mcpRequest`) cannot be mistaken for a client
+  // handshake: `/rpc` has four clients, `/stateful` one, and each must have sent
+  // its notification exactly once.
+  const notificationsByPath = new Map();
+  for (const entry of seen.filter((item) => item.message.method === 'notifications/initialized')) {
+    notificationsByPath.set(entry.url, (notificationsByPath.get(entry.url) ?? 0) + 1);
+  }
   check(
     'each client sends initialized exactly once, after its handshake',
-    seen.filter((entry) => entry.message.method === 'notifications/initialized').length === 5,
-    'one notification per client handshake (5 clients built above)',
+    notificationsByPath.get('/rpc') === 5
+      && notificationsByPath.get('/stateful') === 1
+      && notificationsByPath.get('/notify-shape') === 1,
+    `per path: ${JSON.stringify([...notificationsByPath])} (5 /rpc clients, 1 /stateful client, 1 direct)`,
   );
 
   // ── a lost session heals, and a known-dead connection never answers ────────
@@ -434,13 +556,22 @@ try {
   // Self-healing: the next listing must succeed by re-handshaking, not repeat the
   // 404 forever. The 404 is thrown for the call that hit it; recovery is the next
   // call's job, which is what a model retrying its tool does.
-  const healed = await sessionClient.listTools();
+  const healedAttempt = await (async () => {
+    try { return await sessionClient.listTools(); } catch (error) { return error; }
+  })();
+  const healed = Array.isArray(healedAttempt) ? healedAttempt : [];
   const healedList = seen.findLast((entry) => entry.url === '/sessions' && entry.message.method === 'tools/list');
   const healedId = (issuedByPath.get('/sessions') ?? [])[1];
   check(
     'the next call after a lost session re-handshakes and succeeds',
-    healed.length === 1 && healedId !== undefined && healedList?.headers['mcp-session-id'] === healedId && healedId !== firstIssued,
-    `catalog=${JSON.stringify(healed.map((tool) => tool.name))} carried=${String(healedList?.headers['mcp-session-id'])} expected=${String(healedId)}`,
+    !(healedAttempt instanceof Error)
+      && healed.length === 1
+      && healedId !== undefined
+      && healedList?.headers['mcp-session-id'] === healedId
+      && healedId !== firstIssued,
+    healedAttempt instanceof Error
+      ? `recovery threw: ${healedAttempt.message}`
+      : `catalog=${JSON.stringify(healed.map((tool) => tool.name))} carried=${String(healedList?.headers['mcp-session-id'])} expected=${String(healedId)}`,
   );
   const sessionHandshakes = seen.filter((entry) => entry.url === '/sessions' && entry.message.method === 'initialize').length;
   check(
@@ -482,13 +613,19 @@ try {
   await bareClient.listTools();
   dropSessions();
   const bareGone = await (async () => { try { await bareClient.callTool('echo'); return null; } catch (error) { return error; } })();
-  const bareHealed = await bareClient.listTools();
+  const bareHealedAttempt = await (async () => {
+    try { return await bareClient.listTools(); } catch (error) { return error; }
+  })();
+  const bareHealed = Array.isArray(bareHealedAttempt) ? bareHealedAttempt : [];
   check(
     'a bare 404 with no body is still read as a lost session',
     /HTTP 404/.test(bareGone?.message ?? '')
+      && !(bareHealedAttempt instanceof Error)
       && bareHealed.length === 1
       && (issuedByPath.get('/sessions-bare') ?? []).length === 2,
-    `rejected=${bareGone?.message} recovered=${JSON.stringify(bareHealed.map((tool) => tool.name))} handshakes=${(issuedByPath.get('/sessions-bare') ?? []).length}`,
+    bareHealedAttempt instanceof Error
+      ? `recovery threw: ${bareHealedAttempt.message}`
+      : `rejected=${bareGone?.message} recovered=${JSON.stringify(bareHealed.map((tool) => tool.name))} handshakes=${(issuedByPath.get('/sessions-bare') ?? []).length}`,
   );
 
   // Precision: a 404 that is *not* about the session must not throw the session
@@ -542,6 +679,14 @@ try {
     })(),
     'session-shaped 404s recover; other statuses and unrelated 404 bodies do not',
   );
+} catch (error) {
+  // Anything the checks above did not anticipate still has to be *reported*.
+  // An uncaught rejection prints a stack trace and exits before the results
+  // loop, so every assertion above it vanishes — the run looks like a crash
+  // rather than a named failure, and a regression is indistinguishable from a
+  // typo in the check itself. Naming it here keeps the exit code meaningful and
+  // the failing assertion visible.
+  check('the check ran to completion without an uncaught error', false, error instanceof Error ? `${error.message}` : String(error));
 } finally {
   server.close();
 }
