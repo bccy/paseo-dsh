@@ -5,7 +5,7 @@ OpenCode / Codex provider 有这个按钮，DSH provider 原本没有——本�
 为什么这么接、以及哪些前提不能破。
 
 **实现路线：自研（不安装任何 DSH 撤回插件）。** 对话回退是一条约 30 行的表面替换事件；
-文件回退是编辑工具级的写前备份；界面刷新走「Reload agent」旁路 + 停放会话优化。
+文件回退是编辑工具级的写前备份；时间线刷新走 daemon 侧 LOCAL PATCH 截断 history（native rewind）。
 历史上曾复用 `dsh-rewind-plugin`（方案 A），已废止，仓库不再依赖它。
 
 ## 契约（来自 Paseo，不是我们编的）
@@ -31,7 +31,7 @@ Paseo 撤回按钮
   → 可选：file-snapshots.js 恢复该消息之后被编辑工具改过的文件
   → session.append('user/message', marker, { surfaceOp:{op:'replace',startSeq,endSeq}, sourceEventSeqs })
   → await sessions.flush(session)（保证回执前落盘）
-  → 回执成功；插件先回 request.completed，再延迟 spawn `paseo agent reload <agentId>`
+  → 回执成功；daemon 在回执前已把 `this.history` 截断到被撤行（LOCAL PATCH），无需 reload
 ```
 
 ### 对话回退：一条表面替换
@@ -126,39 +126,36 @@ Paseo 撤回按钮
   文件。子代理编辑属于归并而不是跳过；只有上溯失败（父会话不 live、header 缺
   `parentSession`、血缘成环）时才退化为不跟踪，stderr 记一行跳过日志。
 
-### 刷新：Reload 旁路 + 停放会话
+### 刷新：daemon 侧 history 截断（LOCAL PATCH）
 
-Paseo 的插件 provider 适配层把翻译后的时间线事件放进一个**只追加**的内存数组，撤回只把
-请求转给插件、不动该数组；宿主撤回后强制从它重建时间线，于是旧行复活。这是上游已知缺陷
-（getpaseo/paseo issue #4667，open，p2；修复 PR #4668 关闭未合并；0.11.2/0.11.4/0.12 beta
-均未修）。插件协议也没有"删除/替换时间线"事件。
+Paseo 的插件 provider 适配层把翻译后的时间线事件放进一个**只追加**的内存数组
+（`PluginAgentSession.history`），撤回只把请求转给插件、不动该数组；宿主撤回后
+`rewind()` 会 `hydrateTimelineFromProvider({force:true})` 强制从它重建时间线，于是旧行复活。
+这是上游已知缺陷（getpaseo/paseo issue #4667，open，p2；修复 PR #4668 关闭未合并；
+0.11.2/0.11.4/0.12 beta 均未修）。插件协议也没有"删除/替换时间线"事件。
 
-唯一干净旁路是走宿主自己的刷新语义：
+现在的做法是给 daemon 打一个**本地补丁**，在 `revert()` 里把 `this.history` 截断到被撤行：
 
 ```
-撤回成功 → 先回 request.completed
-→ 延迟 50ms spawn `paseo agent reload <agentId>`（CLI 自身启动约 0.5s，天然覆盖 daemon settle 窗口）
-→ daemon reloadAgentSession({rehydrateFromDisk:true})：关旧 provider 会话、带 persistence 重开
-→ 关闭时把空闲 dsh 进程放进停放池；重开时按 DSH 原生 session id 接管（省掉冷启动）
-→ 桥重放折叠后的 history → 新 epoch → 客户端重建时间线（旧行消失）
+撤回成功 → daemon 在 revert() 内先 truncateHistoryFrom(messageId)，再回 request.completed
+→ 宿主 await 的正是这条回执，随后的 force-hydrate 读到的是已经变短的 history
+→ 客户端重建时间线（旧行消失），无 reload、无新 provider session id、不取消子代理
 ```
 
-实测耗时（2026-10-18）：`agent.rewind.start → complete` 52ms；插件延迟 50ms；CLI 启动+连接约 0.5–0.8s；
-命中停放时 daemon `refresh_agent_request` 约 0.2–0.4s，未命中（冷启动）约 2.8s。修复前用户实测
-「点击→消失」约 4.2s，两个根因：① 刷新延迟固定 500ms；② 停放路由键把 thinking effort 也算进去，
-reload 重开时 effort 由 `session.configure` 后才生效 → 每次都被判成 route mismatch、杀掉可复用进程走冷启动。
-现在路由键只含 provider/model，effort 在 open 后单独配置；延迟降到 50ms。
-
-- **不能 await 刷新**：daemon 撤回持有 pending run，reload 会 cancel 在飞回合，二者互相等待。
-- agent id 取 daemon 注入的 `config.env.PASEO_AGENT_ID`；`paseo` 二进制按 `PASEO_BIN` →
-  `which` → PATH 解析，spawn 的 `error`/`exit` 都必须写日志。
-- 刷新失败/文件恢复失败用 provider `session.notice` 显示到时间线，不静默；这类结果发生在
-  reload 之前，而旧时间线会在 reload 时整段重建，所以插件把它们**延迟到重开的新会话**再发
-  （见下文“跨刷新通知”）。
-- **停放会话**：`session.close` 时若会话空闲，把 dsh 子进程放进池（TTL 30s、上限 3、
-  cwd/route 一致才复用）；reload 重开时按 DSH 原生 session id 接管同一进程，省掉 1.5–2.7s
-  的冷启动。池里进程用静默处理器，退出自动出池；provider 整体关闭时清池。
-- 上游修复 #4667 后可删掉 Reload 旁路与停放会话。
+- **补丁路径**：`~/.paseo/local-patches/apply-rewind-history-truncation.mjs`，目标是 daemon 实际加载的
+  `@getpaseo/server/dist/server/server/agent/plugin-provider.js`（不是仓库 checkout——那里没有构建产物，
+  打上去看着成功却什么也没改）。
+- **md5 守卫**：基线 `BASE_MD5 = 408f99fcaa8cf8a760a3646d788be774`（npm `@getpaseo/server@0.13.0`，
+  已与 registry tarball 逐字节核对）。基线不符时**退出 1 而不是猜**；已打过则按 marker
+  `LOCAL PATCH (paseo-dsh)` 判定为幂等成功。`--revert` 按备份还原并复核 md5。
+- **截断键是 `messageId`**：`mapTimelineItem()` 把它同时写进翻译后的 `user_message` 行和
+  `revertTokens`，而 `history` 存的是投影前的行，所以 id 逐字可用。找不到锚点或有歧义即 exit 1
+  （fail closed，不做"看起来成功"的截断）。
+- **幂等 + `ExecStartPre`**：补丁在每次 daemon 启动前重打，所以 daemon 升级或重装 `@getpaseo/cli`
+  都不会把补丁悄悄带走。上游修了 #4667 之后可删掉补丁与 `ExecStartPre` 行。
+- **不再有 reload 旁路，也不再有停放会话池**：一次撤回是同步的，没有"关会话再带 persistence
+  重开"这一步，因此不需要 `paseo agent reload`、不需要 50ms 延迟、不需要按 DSH 原生 session id
+  接管旧进程。共享子进程仍只有一个（`parked-sessions.ts`），但它服务的是**所有会话**，与撤回无关。
 
 ### 权限预设：非命令写入
 
@@ -177,17 +174,10 @@ this.ctx.get('permissionPresets').set(session, name);
 - 能力位只声明 `session.revert.both` 与 `session.revert.conversation`；**不声明 `files`**
   （没有"只回文件"语义；该模式 daemon 也不重建时间线）。
 - 撤回**不可撤销**：不实现 `/unrewind`（Paseo 菜单本身就这么写）。
-- 非首条消息撤回成功后、时间线重建完成前，会显示一条临时通知**「正在回退，请稍候」**
-  （约 1 秒）：点击本身没有反馈，而 daemon 重开 provider 会话需要约 1 秒。重建完成后该通知
-  随旧时间线一起消失；首条被拒绝时不会出现。
-- 撤回成功后到新会话 `session.ready`（时间线重建完成）前，新消息会被拒绝并提示「正在回退，
-  请稍候」：这个窗口里 prompt 会与 reload 关闭会话竞争，静默丢失比明确拒绝更糟。门按
-  provider 会话 id 保持到重开就绪（不是 close 就放行），所以 close→reopen 间隙也拒绝；
-  第一次刷新期间的重复撤回直接 `request.failed`，不会误清第一次的门；15s 安全超时仍会
-  放行并记日志。
-- 自动 reload 失败（找不到 agent / 启动失败 / 退出非 0）会发「时间线未自动刷新」提示：
-  旧会话还活着时直接显示；旧会话已被关闭时延迟到该 DSH 会话下一次打开时显示，不再被旧
-  epoch 的重建吞掉。
+- 撤回是**同步**的：`session.revert` 在桥里完成（截断 history + 落盘）后回执，宿主随即重建
+  时间线。没有 reload 窗口，因此**没有**「正在回退，请稍候」通知、没有 prompt 门禁、没有
+  15s 安全超时、也没有「时间线未自动刷新」告警——这些机制随 reload 旁路一起删除了。
+  并发的第二次撤回由桥的 `revertInflight` 守卫拒绝（`request.failed`，不是静默）。
 - **当前可见对话的第一条消息不支持撤回**：撤掉它等于清空整个对话，而 Paseo 客户端对"重建后
   空对话"的 live 刷新不可靠（旧行会留在屏幕上，再点旧行报 `No provider revert token`）。
   桥在动手前就拒绝并返回可读原因（「首条消息禁止撤回」），**不改日志、不打断运行中的回合、
@@ -196,8 +186,8 @@ this.ctx.get('permissionPresets').set(session, name);
   按行隐藏需要上游新增"该行可撤回"的契约。
 - 子会话（DSH 原生 child）不支持撤回：只读投影，没有自己的进程。
 - 文件回退失败时对话仍然已经撤回：回执带 `files.failed`；**撤回前备份保留**（journal 不
-  清理，重试撤回会再次恢复）。提示行会在刷新重建完成后的新时间线里出现（跨 reload 延迟
-  通知），不会随旧 epoch 一起消失。注意 rescue 目录里是**被替换前的当前内容**（已含智能体
+  清理，重试撤回会再次恢复）。提示行即时以 `session.notice` 出现在**当前**时间线里
+  （没有 epoch 重建，不会被吞掉）。注意 rescue 目录里是**被替换前的当前内容**（已含智能体
   改动），不是撤回前状态，别拿它当预编辑恢复材料。
 - 时间线折叠后仍会保留压缩前的完整对话（撤回只影响它自己那段）。
 - 记忆插件可能仍召回被撤内容（模型"记得"）——已知缺口，不在本次范围。
@@ -226,9 +216,6 @@ this.ctx.get('permissionPresets').set(session, name);
   锚点，之后撤回更早消息时这部分文件不再恢复（已知限制，不是静默）。撤回后按 journal 的
   引用集清理未引用的 `objects/`；带 pending 的捕获与 5 分钟内的新对象不回收（防止与仍在跑
   的子代理竞态）。rescue 副本按次独立（不会互相覆盖）。
-- `PASEO_BIN` 如需覆盖，必须是官方 `paseo` CLI（或启动耗时相当的客户端）：自动刷新在撤回
-  回执后约 50ms spawn 它，CLI 自身的启动时间是 daemon 完成撤回收尾的缓冲，指向立即返回的
-  wrapper 会引入竞争。
 - **重建后的首轮工作时长不含 provider/DSH 冷启动**：live 首轮从用户提交起算（含进程启动），
   但 DSH 日志里的 `user/message` 是进程启动完成后才写入的；重放只能用日志时间，所以首轮
   时长会少掉启动段（例如 live 5s → 重建后 2s）。后续回合不受影响，也没有可靠的持久化
@@ -252,7 +239,6 @@ node harness/rewind-e2e.mjs
 node harness/rewind-merge-e2e.mjs    # 父写 + 子代理写 → both 撤回 → 两个文件都删除、子会话无 journal
 
 # 插件层（先按 plugin-check.cjs 头部步骤编译到 .dbg）
-node harness/parked-sessions-check.cjs paseo-plugin/.dbg
 # 复制进 .dbg 后运行：子会话生命周期（adopted 只认中途 turn、重放窗口缓冲、历史不可读）
 cd paseo-plugin/.dbg && node subagent-check.cjs
 ```

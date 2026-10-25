@@ -886,7 +886,8 @@ export class DshProcess {
     // Frames are delivered by id, so there is no way to serve two owners at once;
     // the second attach must fail loudly instead of quietly stealing the slot.
     // Re-attaching after `detachSession` is the supported path and has no entry
-    // here, which is what keeps a rewind's close-then-open working.
+    // here, which is what keeps Paseo's refresh (close, then reopen with the same
+    // persistence) working.
     const existing = this.#sessionHandlers.get(sessionId);
     if (existing !== undefined) {
       throw new Error(
@@ -977,7 +978,7 @@ export class DshProcess {
   async #sendClose(sessionId: string): Promise<void> {
     try {
       // A **bounded** wait, deliberately short. This runs on the teardown path
-      // (a Paseo close, a rewind's reload), and the bridge's `session/close`
+      // (a Paseo close or refresh), and the bridge's `session/close`
       // disposes the session's agent — which can take as long as the agent's own
       // shutdown does, and has no deadline of its own. At the default 120 s a
       // child that stopped answering held the caller for two minutes, and every
@@ -1015,7 +1016,7 @@ export class DshProcess {
    *
    * The bridge's dispose — which is what closes the session log's write handle —
    * can outlive {@link SESSION_CLOSE_TIMEOUT_MS}, and the reopen that follows (a
-   * rewind reload, a Paseo refresh, a user reopening the same conversation)
+   * Paseo refresh, a daemon restart, a user reopening the same conversation)
    * starts milliseconds later. Attaching into that window used to produce a
    * session that reported itself ready and then failed its FIRST prompt with
    * "already owned by an active write handle", because the previous agent still

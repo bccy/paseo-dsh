@@ -1584,7 +1584,8 @@ Paseo 的按钮是**按 agent 能力位**显示的，不按行过滤：两次发
 `harness/revert-shape-probe.mjs`（真实 DSH Session）、
 `harness/replay-fidelity-probe.mjs <log>`（真实日志）、
 `harness/rewind-e2e.mjs`（真 profile 3 回合端到端：回执/文件/history 折叠/无 command 行/
-暗号测试）、`harness/parked-sessions-check.cjs`（编译后的插件）。
+暗号测试）、`harness/parked-sessions-check.cjs`（编译后的插件，**已删**——停放池已随
+reload 旁路移除，共享子进程的 hold/release 改由 `multi-session-check.mjs` 计数断言）。
 真机验收要用**新会话**（能力位只对新会话生效）。
 
 ---
@@ -2095,7 +2096,8 @@ guard exists`（105 passed, 1 failed）；把条件改成无条件 skip → 同�
 **验证**：`harness/subagent-check.cjs` **78/78**（新增 5 条：停放进程有自己的 pid、停放期间
 unarchive 有回执、**停放进程绝不承载这次写入**、**陈旧停放进程确实被作废**（直接抓插件自己的
 `parked:discard <id>` 日志行，避免负向断言空过）、**重开冷启动而不是收养那个陈旧进程**）；
-`harness/parked-sessions-check.cjs` **32/32**（discard 语义 + discard 后 quiesce 会等）；
+`harness/parked-sessions-check.cjs` **32/32**（discard 语义 + discard 后 quiesce 会等，
+**该脚本已删**：discard 与整个停放池随 reload 旁路移除，见本条开头的历史记录）；
 `harness/steer-check.cjs` **25/25**、`harness/bridge-assets-check.mjs` **2/2**、`tsc --noEmit` 干净。
 假桥的 `DSH_FAKE_LOG` 每行现在带 `pid`（区分"哪个进程服务的请求"是这条回归的关键）。
 **变异验证**：把 `discard` 换成空函数 → **76/78**，红的正是上面第 4、5 条（`(no parked: line)`、

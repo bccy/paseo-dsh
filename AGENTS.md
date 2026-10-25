@@ -210,12 +210,13 @@ token），并且加载插件会把内嵌桥重写进 `~/.dsh/profiles/<name>/no
   探测到必须非零）。**动了 probe 必跑。**
 - `harness/session-request-check.cjs` — 两段非回合请求：`paseo/sessions` 导入列表
   （persistence handle/cwd/title/preview→description/updatedAt）与 `paseo/revert` 撤回回执
-  （成功 `request.completed` +「正在回退」通知、找不到 agent 的刷新告警、被拒必须
-  `request.failed`、被拒后门禁释放）。假桥 + 一次性 `DSH_HOME`。**动了 provider 的
+  （成功 `request.completed`、被拒必须 `request.failed`、无「正在回退」/「时间线未自动刷新」
+  通知——撤回已是同步的 native rewind，没有 reload 窗口需要填）。假桥 + 一次性 `DSH_HOME`。
+  **动了 provider 的
   `session.revert`/`sessions` 分支、`dsh-process.ts` 的这两个请求、或假桥对应分支必跑。**
 - `harness/plugin-build.cjs` — **不是检查，是需要编译产物的 harness 共用的构建基础设施**
-  （当前调用方见 `grep -l plugin-build harness/*`；`plugin-check.cjs` 与
-  `parked-sessions-check.cjs` 仍走各自头部注释里的手工 `tsc` 步骤，不在其中）。
+  （当前调用方见 `grep -l plugin-build harness/*`；`plugin-check.cjs` 仍走自己头部注释里的
+  手工 `tsc` 步骤，不在其中）。
   它决定已有的编译树能否复用（源码集合 + 构建戳），判错不会让产物看起来有任何异常，只会让
   **其它检查在陈旧或残缺的产物上假绿**——这是这里最危险的失效形态。`resolvePluginBuild()`
   自动编译到 `paseo-plugin/.dbg-*`（产物必须在仓库内，`/tmp` 下 node 向上找不到
@@ -293,9 +294,6 @@ node harness/revert-shape-probe.mjs    # 纯内存离线（用本机已装 @deep
 node harness/replay-fidelity-probe.mjs <session.v4.jsonl.zstd>  # 真实日志重放保真
 node harness/rewind-e2e.mjs            # 真 dsh --profile paseo，3 回合端到端（耗 token）
 node harness/rewind-merge-e2e.mjs      # 真机父子归并：父写+子代理写 → both 撤回 → 两文件都删（耗 token）
-
-# 停放会话（先按 plugin-check.cjs 头部步骤把插件编译到 .dbg）
-node harness/parked-sessions-check.cjs paseo-plugin/.dbg
 ```
 
 **三条不能破的约束**（都是真机踩出来的）：

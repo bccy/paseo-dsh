@@ -47,9 +47,17 @@
 | 四个 import | `readdirSync`/`readFileSync`/`homedir`/`execFileSync` |
 | 文件回退失败通知 | 从 `#deferNotice`（等重开）改为 `#notice` 即时发出 |
 
-**未删**（有意保留）：`parked-sessions.ts` 全部（`quiesce`/`hold`/`release` 服务共享进程退役，
-被「一进程多会话」复用）、`#notice`/`#deferNotice`/`#flushDeferredNotices`（服务 open warning）、
-`#dshIds`、文件回退层、派发锚/中断、`folded` Map（子代理重放通用优化）。
+**未删**（有意保留）：`parked-sessions.ts` 的 `quiesce`/`hold`/`release`（服务共享进程退役，
+被「一进程多会话」复用）、`#notice`（open warning 与文件回退失败通知都要发）、文件回退层、
+派发锚/中断、`folded` Map（子代理重放通用优化）。
+
+> **补记（2026-10-26 07:4x，本轮清理）**：上表原本把 `#deferNotice`/`#flushDeferredNotices`
+> 和 `#dshIds` 也列为「有意保留，理由是服务 open warning」。该理由**不成立**：`#notice` 的三个
+> 调用点（revert 文件失败、两处 open warning）全部发生在 session 已注册之后，于是永远走
+> `#sessions.has` 的 emit 分支、永不进 defer —— `#deferredNotices` 恒空、
+> `#flushDeferredNotices` 恒早退，`#dshIds` 只被这条死链读取。三者已在本轮连同
+> `MAX_DEFERRED_NOTICES`/`MAX_DSH_ID_MAPPINGS` 一并删除；`DeferredNotice` 改名为 `OpenWarning`
+> 保留（`openWarnings` 生产在用）。
 
 ## 断言同步更新
 
@@ -98,7 +106,7 @@
 
 用户批准后清理三处零调用代码。
 
-### 1. `paseo-plugin/server/parked-sessions.ts`：512 → 266 行（**-246**）
+### 1. `paseo-plugin/server/parked-sessions.ts`：512 → 216 行（**-296**）
 
 | 删除 | 行数 | 依据 |
 |---|---|---|
@@ -150,5 +158,5 @@ tsc --noEmit              0 错误
 | 阶段 | 变化 |
 |---|---|
 | P2 删 reload 旁路 | `provider.ts` 1963 → 1637（**-326**） |
-| 死代码清理 | `parked-sessions.ts` 512 → 266（**-246**）、`parked-sessions-check.cjs` **-476**、`timeline.ts` -12、`session.ts` -8 |
+| 死代码清理 | `parked-sessions.ts` 512 → 216（**-296**）、`parked-sessions-check.cjs` **-476**、`timeline.ts` -12、`session.ts` -8 |
 | **合计净减** | **约 1068 行** |

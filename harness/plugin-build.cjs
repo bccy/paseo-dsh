@@ -8,8 +8,8 @@
  * call site failed the check while the code was still correct.
  *
  * Compiling to CommonJS is the same flow the plugin-level harness scripts have
- * always documented by hand (see the headers of `plugin-check.cjs` /
- * `parked-sessions-check.cjs`), so this module just automates it:
+ * always documented by hand (see the header of `plugin-check.cjs`), so this
+ * module just automates it:
  *
  *   - the output **must** live inside the repo (`paseo-plugin/<dir>`), because
  *     `node` resolves `@getpaseo/plugin` and friends by walking up to

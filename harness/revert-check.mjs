@@ -255,22 +255,33 @@ console.log('a rewind no longer reloads the agent (native rewind via the daemon 
   );
 }
 
-console.log('post-reload notices and the rewind prompt gate');
+console.log('no deferred-notice chain (the rewind no longer closes the provider session)');
 {
   const provider = readFileSync(join(import.meta.dirname, '..', 'paseo-plugin/server/provider.ts'), 'utf8');
+  // The deferral chain existed only because the rewind closed the provider
+  // session and rebuilt the timeline epoch: a notice emitted in that window was
+  // discarded, so it was queued under the DSH session id and replayed on the
+  // next open. The chain was **already unreachable** before it was removed —
+  // all three `#notice` call sites run after the session is registered, so they
+  // always took the emit branch and `#deferredNotices` stayed empty forever.
+  // Asserted as absent so it cannot come back without its reason coming back.
   check(
-    'the provider keeps a provider-session -> DSH-session key after the session closes',
-    /readonly #dshIds = new Map<string, string>\("\)?;?/.test(provider.replace(/\s+/g, ' ')) || /#dshIds = new Map<string, string>/.test(provider),
+    'the deferred-notice chain is gone (#deferredNotices / #deferNotice / #flushDeferredNotices)',
+    !/#deferredNotices|#deferNotice\(|#flushDeferredNotices/.test(provider),
   );
-  // Without a reload the timeline is no longer rebuilt from scratch, so a file
-  // restore failure can be reported immediately instead of being deferred.
+  check(
+    'and the provider-session -> DSH-session id map went with it (#dshIds had no other reader)',
+    !/#dshIds/.test(provider) && !/MAX_DSH_ID_MAPPINGS/.test(provider),
+  );
+  // The remaining notice channel must still exist: open warnings and the file
+  // restore failure are reported through it, into the *current* epoch.
   check(
     'a file restore failure is reported immediately (no epoch rebuild discards it)',
     /this\.#notice\(\s*input\.sessionId,\s*"error",\s*"文件回退未完成"/.test(provider),
   );
   check(
-    'deferred notices are flushed right after session.ready of the reopened session',
-    provider.indexOf('this.#flushDeferredNotices(sessionId, dshSessionId);') > provider.indexOf('type: "session.ready"'),
+    'and the open warnings still go through #notice after session.ready',
+    provider.indexOf('this.#notice(sessionId, warning.severity') > provider.indexOf('type: "session.ready"'),
   );
   // The prompt gate existed only to cover the reload window. With no reload there
   // is no window: the rewind is synchronous inside `session.revert`, so a prompt
@@ -335,12 +346,20 @@ console.log('wiring (the pure module is useless if nothing calls it)');
     'provider still reads the daemon-injected agent id (it scopes native child ids)',
     /PASEO_AGENT_ID/.test(provider) && /agentId === "" \? \{\} : \{ agentId \}/.test(provider),
   );
+  // Sliced to the branch, not "somewhere after `case \"session.revert\":`".
+  // The unscoped form matched the `request.completed` of the *interrupt* branch
+  // below it, so deleting the revert branch's own reply left this check green
+  // (verified by mutation: removing `provider.ts`'s revert reply kept it PASS
+  // while the sibling check below went FAIL).
   check(
-    'provider answers the rewind and does not schedule a refresh',
+    'the revert branch itself answers request.completed (no refresh scheduled)',
     (() => {
       const caseStart = provider.indexOf('case "session.revert":');
-      const completed = provider.indexOf('this.#emit({ type: "request.completed", requestId: input.requestId });', caseStart);
-      return caseStart !== -1 && completed !== -1 && !/refreshAgent/.test(provider);
+      const nextCase = provider.indexOf('case "', caseStart + 1);
+      if (caseStart === -1 || nextCase === -1) return false;
+      const branch = provider.slice(caseStart, nextCase);
+      return /this\.#emit\(\{ type: "request\.completed", requestId: input\.requestId \}\)/.test(branch)
+        && !/refreshAgent|agent reload/.test(provider);
     })(),
   );
   check(
@@ -372,11 +391,14 @@ console.log('wiring (the pure module is useless if nothing calls it)');
     labelRows.length === 1 && carriesReplyToken(labelRows[0]),
     `${labelRows.length} emission(s)`,
   );
-  check(
-    'no token-less live row is emitted before the prompt',
-    emitUserMessageCalls.every((body) => !body.startsWith('prompt.clientMessageId,') || carriesReplyToken(body)),
-    emitUserMessageCalls.filter((body) => body.startsWith('prompt.clientMessageId,') && !carriesReplyToken(body)).join(' | '),
-  );
+  // A second check here ("no token-less live row is emitted before the prompt",
+  // `emitUserMessageCalls.every(...)`) was deleted rather than repaired: it
+  // quantified over a set the same file's regex produces, so when `#emitUserMessage`
+  // was renamed the set became empty and `[].every()` returned true — a green that
+  // asserts nothing (verified by mutation: renaming the helper gave 0 emissions
+  // and that check stayed PASS while the `labelRows.length === 1` check above went
+  // FAIL). The token-less-emission hole it was meant to cover is already closed by
+  // that `labelRows.length === 1` check, which is exact rather than quantified.
   check(
     'the replayed row carries the same token',
     /revertToken: \{ messageId: data\.id \}/.test(session),

@@ -276,19 +276,21 @@ console.log("frames are routed by session id, never broadcast");
 // ---------------------------------------------------------------------------
 // The provider half of the reference count.
 //
-// `ParkedSessions.hold()` / `release()` are what stop the pool from killing a
-// process other sessions are running in, but they are *called* from
-// `provider.ts` (`#addPoolClaim` at :631, `#dropPoolClaims` at :652 and
-// `#releasePoolProcess` at :708). `harness/parked-sessions-check.cjs` drives the
-// pool directly, so it can prove the guards work but not that the provider ever
-// takes a hold — deleting `provider.ts:631` left that whole file green (verified
-// by mutation).
+// `ParkedSessions.hold()` / `release()` are the pair the provider books around
+// every claim on the shared child, and they are *called* from `provider.ts`
+// (`#addPoolClaim`, `#dropPoolClaims` and `#releasePoolProcess`). The retired
+// `harness/parked-sessions-check.cjs` used to drive the pool directly, so it
+// could prove the pool's own guards worked but not that the provider ever took a
+// hold — deleting the `#addPoolClaim` call left that whole file green (verified
+// by mutation at the time).
 //
 // So the methods are counted here, across the plugin-level run below: two
 // sessions open onto one shared child, therefore exactly two claims, therefore
 // exactly two holds. Counting is used instead of "was it called at all" because
 // a hold per *request* would still pass the weaker form while drifting away from
-// one-hold-per-claim.
+// one-hold-per-claim. This is now the **only** place that pins the pairing:
+// `hold()`/`release()` are empty method shells, so the counting instrumentation
+// below is what gives them observable behaviour at all.
 const holdCalls = { hold: 0, release: 0 };
 {
   const { ParkedSessions } = require(join(buildDir, "server", "parked-sessions.js"));

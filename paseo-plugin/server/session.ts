@@ -143,10 +143,10 @@ export interface DshSessionOptions {
    * first open and returning the same child afterwards; the returned process has
    * already completed `start()`.
    *
-   * `reused` is what keeps the rewind-reload path honest: `true` means this
-   * session joined a child that was already serving conversations, so a running
-   * native subagent in it is demonstrably alive even though the bridge announced
-   * it to a *previous* provider session and will not announce it again.
+   * `reused` is what keeps subagent visibility honest across a reopen: `true`
+   * means this session joined a child that was already serving conversations, so
+   * a running native subagent in it is demonstrably alive even though the bridge
+   * announced it to a *previous* provider session and will not announce it again.
    */
   acquireProcess?(): Promise<{ process: DshProcess; reused: boolean }>;
   /**
@@ -155,7 +155,7 @@ export interface DshSessionOptions {
    * The provider owns the reference count and the shutdown: the shared child must
    * never be shut down by one session leaving it, so a session never calls
    * `process.shutdown()`. When the last claim is released the provider retires the
-   * child after a short grace period (a rewind's close-then-open lands inside it).
+   * child after a short grace period (Paseo's close-then-open lands inside it).
    */
   releaseProcess?(process: DshProcess): void;
 }
@@ -294,7 +294,8 @@ export class DshSession {
   #replaySeq = 0;
   /**
    * Whether this session joined a process that was already serving conversations
-   * (what the rewind refresh's close/reopen does) instead of spawning one.
+   * (what Paseo's refresh — close, then reopen with the same persistence — does)
+   * instead of spawning one.
    *
    * A joined process never stopped: its running child agents kept running while
    * this provider session was closed, so a child's open turn is live evidence even
@@ -349,11 +350,11 @@ export class DshSession {
    * True while {@link replaySubagents} awaits the child listing.
    *
    * `#replayPending` cannot be filled before that RPC returns (the ids are its
-   * payload), and a child already running in an adopted parked process is never
+   * payload), and a child already running in an adopted shared process is never
    * announced again by the bridge — so a frame arriving inside that one await
    * window has no child view, no held notice and no replay entry, and would be
    * classified as a ghost and dropped. A `turn/end` lost there leaves the child
-   * row running after a rewind reload (the failure FIELD-NOTES 61/62 fixed on the
+   * row running after a reopen (the failure FIELD-NOTES 61/62 fixed on the
    * other side of the same window). Frames are therefore held for the length of
    * the RPC and routed by the ordinary flush once the listing is in.
    */
@@ -431,8 +432,8 @@ export class DshSession {
    *
    * There is no adoption decision any more: every session of a connection runs in
    * the same long-lived child, so opening is "attach this session to it". The
-   * child keeps serving the sessions that were already open, which is what makes a
-   * rewind's close-then-open cheap.
+   * child keeps serving the sessions that were already open, which is what makes
+   * Paseo's close-then-reopen cheap.
    */
   async open(): Promise<void> {
     if (this.#options.acquireProcess === undefined) {
@@ -1313,7 +1314,7 @@ export class DshSession {
    * answer that follows. The daemon sends the flag on every steer; ignoring it
    * left the request in the daemon's `pendingPermissions` map forever — the card
    * stays pending in the UI and in `getPendingPermissions()`, which is also what
-   * an agent reload restores — while the promise held here never settled, so a
+   * a reopen restores — while the promise held here never settled, so a
    * later click answered a question nobody was waiting for.
    */
   #clearPendingPermissions(message: string): void {

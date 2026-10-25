@@ -78,27 +78,15 @@ const CAPABILITIES = [
 /** Provider id registered with Paseo; distinct from the ACP `deepseek-harness` entry. */
 export const PROVIDER_ID = "deepseek-harness-native";
 
-/** A notice kept until the provider session it belongs to is reopened. */
-interface DeferredNotice {
+/**
+ * One warning collected during an open and reported on the timeline once the
+ * session is ready.
+ */
+interface OpenWarning {
   severity: "info" | "warning" | "error";
   title: string;
   description?: string;
 }
-
-/** Cap on queued notices per DSH session, so a failing refresh cannot grow forever. */
-const MAX_DEFERRED_NOTICES = 20;
-
-/**
- * Cap on retained provider-session → DSH-session id mappings.
- *
- * `session.close` keeps the mapping on purpose (a notice deferred for the closed
- * session still has to reach the reopened timeline), and every reload mints a new
- * provider session id for the same DSH session, so a long-lived daemon would
- * otherwise accumulate one entry per reload forever. Old entries only serve
- * notices for long-closed sessions; past the cap the oldest is dropped and the
- * drop is logged rather than growing without bound.
- */
-const MAX_DSH_ID_MAPPINGS = 500;
 
 /**
  * Last-resort route. The DSH profile's `agent-default-model` is the real source
@@ -110,11 +98,11 @@ const CATALOG_TTL_MS = 5 * 60 * 1000;
 /**
  * How long the shared child survives its last release.
  *
- * A rewind's reload closes the provider session and reopens it immediately; the
- * grace period is what keeps that from becoming a cold CLI boot (measured
- * 1.5–2.7 s). It matches the pool's session-lock release bound
- * (`RELEASE_TIMEOUT_MS` in `parked-sessions.ts`) so the two agree about when a
- * child is genuinely idle.
+ * Paseo closes a provider session and reopens it with the same persistence on a
+ * refresh (and a daemon restart does the same); the grace period is what keeps
+ * that from becoming a cold CLI boot (measured 1.5–2.7 s). It matches the pool's
+ * session-lock release bound (`RELEASE_TIMEOUT_MS` in `parked-sessions.ts`) so
+ * the two agree about when a child is genuinely idle.
  */
 const POOL_RELEASE_GRACE_MS = 5_000;
 /**
@@ -310,15 +298,6 @@ class DshConnection implements ProviderConnection {
   readonly #listeners = new Set<(event: ProviderEvent) => void>();
   readonly #sessions = new Map<string, DshSession>();
   /**
-   * provider session id -> DSH native session id. Kept across `session.close`
-   * on purpose: the rewind reload closes this provider session and reopens a
-   * new one for the same DSH session, and notices produced in that window must
-   * find their way to the reopened timeline.
-   */
-  readonly #dshIds = new Map<string, string>();
-  /** Notices waiting for their DSH session to be reopened, keyed by DSH session id. */
-  readonly #deferredNotices = new Map<string, DeferredNotice[]>();
-  /**
    * DSH session ids with an `#open` transaction in flight.
    *
    * Two concurrent opens for one DSH session would both pass the holder check and
@@ -390,7 +369,7 @@ class DshConnection implements ProviderConnection {
    * returnable no matter which child it was taken against.
    *
    * A child is retired when its own count reaches zero **and** the grace timer
-   * expires: a rewind's reload closes and immediately reopens the session, and
+   * expires: Paseo's refresh closes and immediately reopens the session, and
    * killing the child on the close would turn that fast path back into a cold
    * start (measured at 1.5–2.7 s of CLI boot). The timer matches the pool's
    * session-lock release bound so the two never disagree about when a child is
@@ -399,7 +378,7 @@ class DshConnection implements ProviderConnection {
   readonly #poolClaims = new Map<DshProcess, number>();
   #poolReleaseTimer: ReturnType<typeof setTimeout> | undefined;
   /**
-   * Idle DSH processes kept across a provider-session close. The rewind refresh
+   * Idle DSH processes kept across a provider-session close. Paseo's refresh
    * closes and immediately reopens the session; adopting the parked child turns
    * that cold start into a replay, which is what makes the timeline update in
    * about a second instead of three to four.
@@ -438,8 +417,6 @@ class DshConnection implements ProviderConnection {
     this.#closed = true;
     const sessions = [...this.#sessions.values()];
     this.#sessions.clear();
-    this.#dshIds.clear();
-    this.#deferredNotices.clear();
     this.#opening.clear();
     // Provider teardown is not a reload: shut the sessions down and kill the
     // parked children instead of keeping them alive for a reopen that will not
@@ -608,12 +585,10 @@ class DshConnection implements ProviderConnection {
   #addPoolClaim(process: DshProcess): void {
     this.#poolClaims.set(process, (this.#poolClaims.get(process) ?? 0) + 1);
     // **One hold per claim, no exceptions.** The claim is the provider's own
-    // accounting; the hold is what `ParkedSessions` consults before it kills or
-    // drops the shared child (park / sweep / discard / evict). It is released in
-    // exactly two places — `#releasePoolProcess` for a returned claim and
-    // `#dropPoolClaims` when the child itself is gone — so the two counters can
-    // never drift apart. (Before this wiring `#holds` stayed 0, which made every
-    // one of those guards a dead branch.)
+    // accounting; the hold is the matching pair `ParkedSessions` records for it.
+    // It is released in exactly two places — `#releasePoolProcess` for a returned
+    // claim and `#dropPoolClaims` when the child itself is gone — so the two
+    // counters can never drift apart.
     this.#parked.hold();
   }
 
@@ -625,9 +600,8 @@ class DshConnection implements ProviderConnection {
    * dead with it, and `DshProcess` has already reported that to each of them
    * (`#exitAll` / `onExit`). Their later `close()` returns early (the session is
    * already marked closed) and would never return the claim itself, so keeping
-   * the numbers would leave `#holds` above zero forever — the guards would go
-   * dead again, now permanently. Each dropped claim releases exactly the one
-   * hold {@link #addPoolClaim} took.
+   * the numbers would leave the hold count above zero forever. Each dropped claim
+   * releases exactly the one hold {@link #addPoolClaim} took.
    *
    * @param process - the child whose claims become void.
    */
@@ -675,7 +649,7 @@ class DshConnection implements ProviderConnection {
    * that claim outstanding forever — the counter would never reach zero, no child
    * would ever retire, and each open would spawn another one.
    *
-   * The shutdown is **delayed** on purpose. A rewind's reload closes the provider
+   * The shutdown is **delayed** on purpose. Paseo's refresh closes the provider
    * session and reopens it a few milliseconds later; killing the child on the
    * close would turn that into a cold CLI boot (1.5–2.7 s) and lose the parked
    * fast path entirely. The delay is the same bound the pool uses for a session
@@ -702,7 +676,7 @@ class DshConnection implements ProviderConnection {
     const timer = setTimeout(() => {
       this.#poolReleaseTimer = undefined;
       // Re-checked inside the timer: a session may have joined the same child in
-      // the meantime (the rewind's close-then-open does exactly that).
+      // the meantime (Paseo's close-then-reopen does exactly that).
       if (this.#pooled !== process) return;
       if (this.#claimsOf(process) > 0) return;
       void this.#shutdownPool();
@@ -876,12 +850,6 @@ class DshConnection implements ProviderConnection {
         // Concurrency is the bridge's job: it already refuses a second rewind on the
         // same session with "该会话已有撤回正在进行" (`dsh-bridge/lib/server.js` revertInflight).
         const result = (await session.revert(input.token, input.scope)) as DshRevertResult | undefined;
-        // Answer first, refresh second, and never await the refresh: the daemon's
-        // rewind holds a pending run until this request resolves, while the
-        // refresh it would trigger closes this very provider session
-        // (`reloadAgentSession` cancels in-flight runs) — awaiting it here
-        // deadlocks the two. The 50 ms timer plus the CLI's own boot time keeps
-        // the reply ahead of the restart.
         // Nothing to refresh any more: the daemon rebuilds the timeline from
         // `PluginProviderSession.streamHistory()` right after this reply, and the
         // LOCAL PATCH in `@getpaseo/server` truncates that buffer at the rewound
@@ -909,14 +877,12 @@ class DshConnection implements ProviderConnection {
       }
       case "session.close": {
         const session = this.#sessions.get(input.sessionId);
-        // Keep the rewind gate: the daemon closes this session right before the
-        // reload reopens it, and a prompt sent in that window must still get a
-        // readable refusal (it would otherwise surface as `runtime_failed`).
-        // The gate is released when `#open` reports the new session ready, by a
-        // refresh-failure path, or by the 15s safety timer.
+        // The daemon can close this session and immediately reopen it on the same
+        // persistence handle, so a prompt landing in that window must still get a
+        // readable refusal — otherwise it surfaces as `runtime_failed`.
         this.#sessions.delete(input.sessionId);
         // Park an idle child: the daemon closes this session right before a
-        // rewind refresh reopens it with the same persistence. `park` has **no
+        // refresh reopens it with the same persistence. `park` has **no
         // effect** under one shared process (`DshSession.close` never parks a
         // child it does not own); the flag is kept for the session API and must
         // not be read as "this child survives the close".
@@ -979,11 +945,13 @@ class DshConnection implements ProviderConnection {
    *
    * Notices are the only channel a provider has for telling the user about a
    * partial outcome (e.g. the conversation was rewound but one file restore
-   * failed). A notice for a provider session that has already been closed is
-   * **deferred** to the next session opened for the same DSH session, because
-   * the rewind reload closes this provider session and the old timeline epoch
-   * (including any notice in it) is discarded when it comes back. Dropping it
-   * silently is what made a failed file restore invisible.
+   * failed). A notice is emitted into the **current** epoch: since the rewind
+   * became synchronous (the daemon truncates its own `history`, no reload), the
+   * timeline is never rebuilt from scratch, so nothing discards it.
+   *
+   * A notice for a session this connection no longer tracks has nowhere to go:
+   * it is logged rather than queued, because there is no reopen to deliver it to
+   * (the daemon mints a fresh provider session id per open).
    *
    * @param sessionId - provider session the notice belongs to.
    * @param severity - provider notice severity.
@@ -991,80 +959,20 @@ class DshConnection implements ProviderConnection {
    * @param description - optional detail.
    */
   #notice(sessionId: string, severity: "info" | "warning" | "error", title: string, description?: string): void {
-    if (this.#sessions.has(sessionId)) {
-      this.#emit({
-        type: "session.notice",
-        sessionId,
-        notice: {
-          id: `rewind-${String(Date.now())}-${String(Math.trunc(Math.random() * 1e6))}`,
-          severity,
-          title,
-          ...(description === undefined ? {} : { description }),
-        },
-      });
+    if (!this.#sessions.has(sessionId)) {
+      process.stderr.write(`[${PROVIDER_ID}] dropping notice "${title}": ${sessionId} is not an open session\n`);
       return;
     }
-    this.#deferNotice(sessionId, { severity, title, ...(description === undefined ? {} : { description }) });
-  }
-
-  /**
-   * Queue a notice for the next session opened on the same DSH session.
-   *
-   * Used by the rewind path for outcomes that only become true after the
-   * reload: a file restore failure, or a refresh failure. Queueing (rather than
-   * emitting into the current epoch) is required because `reloadAgentSession`
-   * discards the committed timeline and rebuilds it from the reopened
-   * provider session's replay — anything emitted before that is gone.
-   *
-   * @param sessionId - provider session id the caller knows (may already be closed).
-   * @param notice - notice payload.
-   */
-  #deferNotice(sessionId: string, notice: DeferredNotice): void {
-    const dshSessionId = this.#dshIds.get(sessionId);
-    if (dshSessionId === undefined) {
-      process.stderr.write(
-        `[${PROVIDER_ID}] dropping notice "${notice.title}": no DSH session is known for ${sessionId}\n`,
-      );
-      return;
-    }
-    const queue = this.#deferredNotices.get(dshSessionId) ?? [];
-    queue.push(notice);
-    if (queue.length > MAX_DEFERRED_NOTICES) {
-      const dropped = queue.splice(0, queue.length - MAX_DEFERRED_NOTICES);
-      process.stderr.write(
-        `[${PROVIDER_ID}] dropping ${String(dropped.length)} old deferred notice(s) for ${dshSessionId}\n`,
-      );
-    }
-    this.#deferredNotices.set(dshSessionId, queue);
-    process.stderr.write(
-      `[${PROVIDER_ID}] deferred notice "${notice.title}" until session ${dshSessionId} reopens\n`,
-    );
-  }
-
-  /**
-   * Deliver notices queued while the provider session was closed.
-   *
-   * Called from `#open` after `session.ready` — before the daemon builds the new
-   * timeline from this session's replayed history — so the notice becomes a row
-   * of the rebuilt epoch and survives on screen.
-   *
-   * @param sessionId - provider session that just opened.
-   * @param dshSessionId - its DSH session id (the reload key).
-   */
-  #flushDeferredNotices(sessionId: string, dshSessionId: string): void {
-    const queue = this.#deferredNotices.get(dshSessionId);
-    if (queue === undefined || queue.length === 0) return;
-    this.#deferredNotices.delete(dshSessionId);
-    for (const notice of queue) {
-      this.#emit({
-        type: "session.notice",
-        sessionId,
-        notice: {
-          id: `rewind-${String(Date.now())}-${String(Math.trunc(Math.random() * 1e6))}`,
-          ...notice,
-        },
-      });
-    }
+    this.#emit({
+      type: "session.notice",
+      sessionId,
+      notice: {
+        id: `rewind-${String(Date.now())}-${String(Math.trunc(Math.random() * 1e6))}`,
+        severity,
+        title,
+        ...(description === undefined ? {} : { description }),
+      },
+    });
   }
 
   async #open(input: Extract<ProviderInput, { type: "session.open" }>): Promise<void> {
@@ -1083,22 +991,6 @@ class DshConnection implements ProviderConnection {
     const nativeId = input.persistence?.data;
     const dshSessionId =
       isRecord(nativeId) && typeof nativeId["sessionId"] === "string" ? nativeId["sessionId"] : sessionId;
-    // Remember the reload key for this provider session: notices produced by the
-    // rewind path after this session closes are queued under the DSH id and
-    // delivered when the reload opens the next provider session for it.
-    this.#dshIds.set(sessionId, dshSessionId);
-    if (this.#dshIds.size > MAX_DSH_ID_MAPPINGS) {
-      const excess = this.#dshIds.size - MAX_DSH_ID_MAPPINGS;
-      let dropped = 0;
-      for (const key of this.#dshIds.keys()) {
-        if (dropped >= excess) break;
-        this.#dshIds.delete(key);
-        dropped += 1;
-      }
-      process.stderr.write(
-        `[${PROVIDER_ID}] dropped ${String(dropped)} oldest provider→DSH session id mapping(s) (cap ${String(MAX_DSH_ID_MAPPINGS)})\n`,
-      );
-    }
 
     // The daemon injects the Paseo agent id into the provider session env. It
     // scopes native child ids so a reload upserts the same Paseo rows instead of
@@ -1114,11 +1006,11 @@ class DshConnection implements ProviderConnection {
     // `@deepseek-ai/dsh-session-persistence-jsonl`), so a second live owner fails
     // every session-scoped request with "already owned by an active write handle".
     // Paseo normally closes the previous provider session before opening the next
-    // one (that is what the rewind's reload does), so a holder here is an anomaly;
+    // one (that is what its refresh does), so a holder here is an anomaly;
     // leaving both alive makes both unusable, and this provider used to report the
-    // new one ready with an empty `/` menu. Resolve it the way the reload does:
-    // close the session that already holds this DSH session first — an idle child
-    // is parked and adopted by the open below, so nothing is killed unnecessarily.
+    // new one ready with an empty `/` menu. Resolve it the same way: close the
+    // session that already holds this DSH session first — an idle child is parked
+    // and adopted by the open below, so nothing is killed unnecessarily.
     // If that close fails the open fails loudly: guessing would leave an unknown
     // number of owners.
     const holder = this.#sessionHolding(dshSessionId, sessionId);
@@ -1145,15 +1037,14 @@ class DshConnection implements ProviderConnection {
       this.#emit({ type: "session.closed", sessionId: holder.id });
     }
 
-    // A parked child that cannot be reused may still be dying: TTL expiry, capacity
-    // eviction or a route change killed it, and the session log's write lock is
-    // released only when the OS reaps the process. Spawning the next process into
-    // that window makes every session-scoped request fail with "already owned by an
-    // active write handle". Wait (bounded) for the old owner before spawning; a
-    // timeout is logged by the pool and the open proceeds, which is no worse than
-    // the previous behavior. `routeKey` is the same identity `DshSession.open()`
-    // uses to reuse a parked child (`routeKeyOf` in session.ts): provider + model,
-    // never the effort.
+    // The shared child can be retired and respawned while a session is opening,
+    // and the old child's session-log write lock is released only when the OS
+    // reaps the process. Spawning the next process into that window makes every
+    // session-scoped request fail with "already owned by an active write handle".
+    // Wait (bounded) for the old owner before spawning; a timeout is logged and
+    // the open proceeds, which is no worse than the previous behavior. `routeKey`
+    // is only reported in that log line (the process-reuse key in session.ts):
+    // provider + model, never the effort.
     await this.#parked.quiesce(dshSessionId, {
       cwd: config.cwd,
       routeKey: `${route.provider}/${route.model}`,
@@ -1179,7 +1070,7 @@ class DshConnection implements ProviderConnection {
     }
 
     /** Warnings collected during the open, emitted after `session.ready` so Paseo has the session. */
-    const openWarnings: DeferredNotice[] = [];
+    const openWarnings: OpenWarning[] = [];
 
     // The concurrent counterpart of the holder check above: two opens for one DSH
     // session must not interleave (both would pass the check and spawn a process,
@@ -1428,11 +1319,6 @@ class DshConnection implements ProviderConnection {
     });
     this.#emit({ type: "session.config", sessionId, config: session.configState() });
     this.#emit({ type: "session.ready", requestId: input.requestId, sessionId });
-    // Deliver notices queued while no provider session was open for this DSH
-    // session (a partial outcome reported between close and reopen). Emitted here
-    // — after the session is usable and while the daemon is still collecting this
-    // session's history — so the notice becomes a row of the new timeline.
-    this.#flushDeferredNotices(sessionId, dshSessionId);
     // Report what this open degraded: a system prompt this provider cannot carry,
     // a command catalog that failed to load, or a permission preset that was not
     // applied. All three were previously either stderr-only or silent.
