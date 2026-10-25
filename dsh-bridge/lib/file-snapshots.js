@@ -711,5 +711,3 @@ export class FileSnapshots {
     });
   }
 }
-
-export { DEFAULT_MAX_FILE_BYTES, GC_GRACE_MS, MAX_ANCHORS, TRACKED_TOOLS };

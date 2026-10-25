@@ -72,16 +72,6 @@ export class ChildAnchors {
   }
 
   /**
-   * The root a recorded child was dispatched by, if known.
-   *
-   * @param {unknown} childId
-   * @returns {string | undefined}
-   */
-  rootFor(childId) {
-    return this.#byChild.get(String(childId))?.rootSessionId;
-  }
-
-  /**
    * Child sessions whose current turn was dispatched at or after `targetSeq` —
    * i.e. every child whose dispatch message a rewind to `targetSeq` withdraws.
    * Unknown anchors are deliberately excluded.
@@ -138,10 +128,5 @@ export class ChildAnchors {
    */
   deleteChild(childId) {
     return this.#byChild.delete(String(childId));
-  }
-
-  /** Number of recorded children (diagnostics/tests). */
-  get size() {
-    return this.#byChild.size;
   }
 }

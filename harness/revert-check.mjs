@@ -204,7 +204,12 @@ console.log('replacement marker shape (durable v4 log constraints)');
     'the replay fold identifies the marker by its durable source kind',
     /REWIND_MARKER_SOURCE_KIND = 'paseo-rewind'/.test(surfaceModule) && /isRewindMarker\(event\)/.test(surfaceModule),
   );
-  check('no system-message marker is left in the bridge', /createSystemMessage\(''\)/.test(bridge) === false);
+  // The "no system-message marker is left" assertion that used to sit here was
+  // deleted rather than repaired: it tested for `createSystemMessage('')`, which
+  // has not existed in the bridge since 7eeba97 — the whole call is gone, so the
+  // regex could never match and the check could never fail (a green that asserts
+  // nothing). The claim it was meant to protect — the marker is a `user/message`
+  // whose source kind is `paseo-rewind` — is asserted directly above, twice.
 }
 
 console.log('replay timestamps (per-turn "worked for" durations survive a reopen)');
@@ -446,9 +451,22 @@ console.log('wiring (the pure module is useless if nothing calls it)');
     'the bridge refuses unknown scopes instead of widening them',
     /不支持的回退范围/.test(bridge),
   );
+  // The old placeholder was `session.append('assistant/message', …, { surfaceOp … })`:
+  // an assistant message carrying the replacement, which DSH's v4 log refuses to
+  // append outside an open turn+step. The regex this replaced allowed only 120
+  // characters between the event name and `surfaceOp`, so a longer or reformatted
+  // call — a second option key, a comment, a wrapped object literal — slipped
+  // through while the bug was back. Assert on the parsed call instead: for every
+  // `append(...)` in the bridge, an `assistant/message` event name in the first
+  // argument is a failure, regardless of what follows it or how far away.
+  const placeholderAppends = callArguments(bridge, 'append').filter((args) => {
+    const [eventName] = splitArguments(args).map((part) => part.trim());
+    return /^(['"`])assistant\/message\1$/.test(eventName ?? '');
+  });
   check(
     'the old assistant/message placeholder is gone',
-    /append\(\s*'assistant\/message'[\s\S]{0,120}surfaceOp/.test(bridge) === false,
+    placeholderAppends.length === 0,
+    placeholderAppends.map((args) => `append(${args.trim().replace(/\s+/g, ' ')})`).join(' | ') || 'no assistant/message append',
   );
 
   // File layer: editing-tool write-ahead snapshots wired around the rewind.
@@ -488,9 +506,27 @@ console.log('wiring (the pure module is useless if nothing calls it)');
     'provider teardown shuts sessions down instead of parking',
     /session\.close\(\{ park: false \}\)/.test(provider),
   );
+  // The reload path owned a `setTimeout(…, 50)` whose only job was to let the
+  // reply go out ahead of the reload; it died with the reload. The assertion this
+  // replaces tested `!/timer\.unref\(\)/` over the WHOLE file, which had two
+  // problems: the surviving timer at `#releasePoolProcess` is written
+  // `timer.unref?.()` (so it slipped the pattern entirely) and the reload timer
+  // was the only one the claim was ever about. Slice the `session.revert` case
+  // block instead — same technique as the reload block above — and require that
+  // it schedules nothing at all. Red if the branch regains a `setTimeout`/
+  // `setInterval`, or if the case block itself disappears (the `!== -1` half).
+  const revertCaseStart = provider.indexOf('case "session.revert"');
+  const revertCaseEnd = provider.indexOf('case "session.interrupt"', revertCaseStart);
+  const revertCaseBody = revertCaseStart === -1 || revertCaseEnd === -1
+    ? ''
+    : provider.slice(revertCaseStart, revertCaseEnd);
+  const revertCaseTimers = revertCaseBody.match(/set(?:Timeout|Interval)\s*\(/g) ?? [];
   check(
-    'no refresh timer is left behind (the reload path owned the only one)',
-    !/timer\.unref\(\)/.test(provider),
+    'the revert branch schedules no timer (the reload path owned the only one)',
+    revertCaseStart !== -1 && revertCaseEnd !== -1 && revertCaseTimers.length === 0,
+    revertCaseStart === -1
+      ? 'case "session.revert" not found'
+      : revertCaseTimers.join(', ') || 'no timers in the case block',
   );
 
   const timeline = read('paseo-plugin/server/timeline.ts');

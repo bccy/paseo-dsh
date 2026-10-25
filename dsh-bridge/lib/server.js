@@ -143,8 +143,10 @@ const CHILD_BUFFER_CAP = 500;
  * hold inside this bridge, though: the key is the DSH session id, and a
  * long-lived shared process is asked to open every Paseo conversation and every
  * imported DSH session it ever serves — an entry per distinct session, and
- * nothing here removes one. (Rewind reloads do NOT add keys: they reuse the
- * stable DSH session id and only re-`initialize` it.) The plugin bounds its own
+ * nothing here removes one. (A rewind adds no keys: it no longer reloads at all,
+ * and on the reconnect paths that do re-`initialize` a session — a parked resume,
+ * a Paseo refresh — the key is the same stable DSH session id, so re-initializing
+ * refreshes a row rather than adding one.) The plugin bounds its own
  * provider→DSH id map with `MAX_DSH_ID_MAPPINGS` (500); this is the same bound
  * on the bridge side, least-recently-initialized first. Live and mid-creation
  * sessions are never evicted, so eviction only trims the parked tail (which the
@@ -1062,7 +1064,8 @@ export class PaseoHarnessServer {
     selection.current = next;
     // Mirror the selection into the pinned route. `routeFor` and a reconnect's
     // `initialize` answer from that row, so leaving it behind would undo a live
-    // clear (and any other switch) on the next rewind reload. `maxTokens` is not
+    // clear (and any other switch) the next time the session is re-initialized —
+    // after a close, a parked resume, or a daemon restart. `maxTokens` is not
     // part of the live selection and is carried over unchanged.
     const pinned = this.sessionRoutes.get(params.sessionId);
     if (pinned !== undefined) {
@@ -2080,12 +2083,15 @@ export class PaseoHarnessServer {
           sourceEventSeqs: [...shadowed],
         },
       );
-      // Make the replacement durable before answering. The daemon rehydrates the
-      // timeline by reading this log right after the reply, and Paseo's reload
-      // replays it too; a buffered append would let both read a log that still
-      // contains the withdrawn turn. A failure here must be loud: reporting
-      // success would let the reload restore the withdrawn conversation while
-      // the file layer has already been rolled back.
+      // Make the replacement durable before answering. The daemon does not reload
+      // the session any more: right after this reply it calls
+      // `hydrateTimelineFromProvider({ force: true })`, which rebuilds the Paseo
+      // timeline from the history it can read — `PluginProviderSession.streamHistory()`
+      // / `paseo/history` → this log. A buffered append would let that rebuild read
+      // a log that still contains the withdrawn turn, so the reply must not go out
+      // before the append is on disk. A failure here must be loud: reporting
+      // success would let the force-hydrate restore the withdrawn conversation
+      // while the file layer has already been rolled back.
       //
       // `SessionStore.flush` resolves to whether at least ONE durability listener
       // participated, not merely "no error": `false` means nothing actually
@@ -2846,8 +2852,9 @@ export class PaseoHarnessServer {
     if (pending !== undefined) return pending;
     // A close of this same id may still be disposing its agent — see
     // `#awaitTeardown`. This is the reopen path the plugin takes straight after an
-    // abandoned close (a rewind reload, a Paseo refresh), so it is exactly where
-    // the write-handle race used to land.
+    // abandoned close (a Paseo close or refresh, or an open that replaced a stale
+    // session instance), so it is exactly where the write-handle race used to land.
+    // A rewind no longer comes through here: it reloads nothing.
     await this.#awaitTeardown(sessionId);
     // Re-checked after the wait: a creation that started while we waited has
     // already been registered, and spawning a second one for the same id would
