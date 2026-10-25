@@ -160,3 +160,94 @@ tsc --noEmit              0 错误
 | P2 删 reload 旁路 | `provider.ts` 1963 → 1637（**-326**） |
 | 死代码清理 | `parked-sessions.ts` 512 → 216（**-296**）、`parked-sessions-check.cjs` **-476**、`timeline.ts` -12、`session.ts` -8 |
 | **合计净减** | **约 1068 行** |
+
+---
+
+## 第二轮清理（2026-10-26 07:00–08:00）
+
+用户要求「多成员同步审查关于撤回的所有提交、拆分成员细化任务、清理历史提交里无用代码并跑回归」。
+本轮按代码层分三条只读 lane 并行审查（桥层 / 插件层 / 基线），Lead 判定后分两条写 lane 实现。
+
+### 删前基线（HEAD `4dfa03a`，37 个可跑脚本）
+
+`2047` 断言、`0` failed、`tsc --noEmit` 0 错误。连跑两次数字一致，非 flaky。
+
+### 桥层（提交 `5dc0ca9`）
+
+桥**不是** reload 时代的死代码重灾区：6 模块 21 个导出里 17 个生产可达（`server.js`
+直接 import 调用），撤回原生化后桥仍是实现主体。真零调用只有 3 项 14 行：
+
+| 项 | 依据 |
+|---|---|
+| `file-snapshots.js` 的 export 语句 | 四个常量全仓无外部 import，文件内仍活（只删 export） |
+| `child-anchors.js` `get size()` | 全仓 0 命中 |
+| `child-anchors.js` `rootFor()` | 全仓仅定义行。**无连带**：`rootSessionId` 字段仍被 `withdrawnSince`/`delete` 读 |
+
+另修 4 处「rewind reload」过期注释（`server.js` 仅注释，剥离注释后与改前逐字相同）。
+
+### 插件层（提交 `cc8f7c4`）
+
+| 项 | 变化 |
+|---|---|
+| `provider.ts` 延迟通知链 | **-114 行** |
+| `parked-sessions.ts` 死状态 | 216 → 135（**-81**） |
+| `session.ts` / `dsh-process.ts` | 仅注释（剥离后与改前逐字相同） |
+| 文档 | AGENTS.md 3 处、REWIND.md 整节重写、PROGRESS 数字修正、FIELD-NOTES 加标注 |
+
+**`#deferNotice` 保留理由被推翻**：上一轮记录「有意保留（服务 open warning）」，实测
+`#notice` 三个调用点（revert 文件失败 + 两处 open warning）全在 session 已注册后——
+revert 路径上 `#require` 可能返回 `DshChildSession`，但 `DshChildSession.revert` 直接抛
+「子会话不支持撤回」，所以走到该分支的必是 root session、必在 `#sessions` 里 → 必走
+emit 分支。defer 分支永不进入，`#deferredNotices` 恒空。
+
+### 失效断言（变异实测取证，不是静态推断）
+
+| 断言 | 原写法为什么是假绿 |
+|---|---|
+| `revert-check:207` `createSystemMessage` | 符号 7eeba97 已移除；加回两种写法后**仍绿** |
+| `revert-check:493` `timer.unref()` | 实际写法是 `timer.unref?.()`，`?.` 让正则永不匹配 |
+| `revert-check:334` 「answers the rewind」 | 删掉 revert 分支回执后**仍绿**（匹配到 interrupt 分支的回执） |
+| `revert-check:371` 「no token-less live row」 | `[].every()` 在 calls 为 0 时恒真 |
+| `revert-check:451` 「old assistant/message placeholder」 | 120 字符窗口，间隔 481 字符即漏报 |
+
+全部改写/删除，并逐条做「同一变异下旧断言仍绿、新断言变红」的双向验证。
+
+**一条被实测推翻的论断**：`quiesce` 的 `async` 并非 concurrent-open 复现竞态的**唯一**
+微任务让出点——改成同步、或删掉 `await` 后该 harness 仍 8/8（`await replaced.close()` 与
+`await session.open()` 也足以复现窗口）。仍保留 async 与签名（零成本），javadoc 写实测结论。
+
+### 删后回归（同套 37 脚本，逐条比对）
+
+```
+36/37 完全一致，唯一变化 revert-check 112 → 111（删除恒绿断言所致）
+断言总数 2047 → 2046      0 failed      tsc --noEmit 0 错误
+```
+
+### 真机验收（重启后）
+
+自唤醒链路（`--on-active=10s`，transient unit 落独立 cgroup）：
+
+```
+cgroup(self)=.../app.slice/selfwake-rewind-cleanup-*.service
+daemon     =.../app.slice/paseo.service          ← 不同 cgroup，重启杀不到
+READY 用时 1.3s → send 成功
+```
+
+新鲜度三点比对：daemon 新实例 `07:56:02` **晚于**源码 mtime `07:52:12`；live 桥
+`07:56:07` 被重写且与仓库**逐字节一致**；`rootFor` 已从 live 桥消失；补丁 md5 不变
+（`already patched` 幂等跳过）。
+
+| 检查 | 结果 |
+|---|---|
+| `harness/rewind-native-check.mjs` | **9/9**（回执 27ms、session id 不变、无 loading、模型看不到被撤内容） |
+| `harness/plugin-check.cjs` | **32/32**（事件形状无回归——这是上一轮的最大验证缺口） |
+
+### 累计代码量
+
+| 阶段 | 变化 |
+|---|---|
+| P2 删 reload 旁路 | `provider.ts` 1963 → 1637（-326） |
+| 第一轮死代码清理 | `parked-sessions.ts` 512 → 216（-296）、`parked-sessions-check.cjs` -476、`timeline.ts` -12、`session.ts` -8 |
+| 第二轮桥层 | -14 行死码 + 4 处注释 |
+| 第二轮插件层 | `provider.ts` 1637 → 1523（**-114**）、`parked-sessions.ts` 216 → 135（**-81**） |
+| **合计净减** | **约 1345 行** |
