@@ -106,6 +106,11 @@ async function maybeSince(start, predicate, ms = 10000) {
   return undefined;
 }
 
+/** Synchronous counterpart: everything already recorded since `sinceIndex`. */
+function eventsSince(sinceIndex) {
+  return events.slice(sinceIndex);
+}
+
 const results = [];
 const check = (name, pass, detail) => {
   results.push({ name, pass });
@@ -194,36 +199,27 @@ const check = (name, pass, detail) => {
     revertReply.type === "request.completed",
     revertReply.type === "request.failed" ? JSON.stringify(revertReply.error) : "completed",
   );
-  // The provider answers first and refreshes second; the notice is emitted right
-  // after the reply, because the delay before the daemon rebuilds the timeline
-  // is otherwise an unexplained pause.
-  const workingNotice = await maybeSince(
-    beforeRevert,
+  // A rewind no longer reloads the agent, so the click needs no "working" notice:
+  // the reply is immediate and the daemon rebuilds the timeline from the
+  // truncated history. Asserting the *absence* keeps this honest — if someone
+  // reintroduces the reload path, the notice (and this check) come back together.
+  const rewindNotices = eventsSince(beforeRevert).filter(
     (e) => e.type === "session.notice" && e.sessionId === sessionId,
   );
   check(
-    "the click gets a visible working notice",
-    workingNotice?.notice?.title === "正在回退，请稍候",
-    JSON.stringify(workingNotice?.notice ?? null),
+    "no working notice is needed (the rewind answers immediately)",
+    rewindNotices.every((e) => e.notice?.title !== "正在回退，请稍候"),
+    JSON.stringify(rewindNotices.map((e) => e.notice?.title ?? null)),
   );
-
-  // No Paseo agent record carries this throwaway provider session, so the
-  // automatic refresh cannot run. That is a real failure of the refresh, and it
-  // must surface as a warning instead of leaving the old timeline in place
-  // silently.
-  const refreshFallback = await maybeSince(
-    beforeRevert,
-    (e) =>
-      e.type === "session.notice" &&
-      e.sessionId === sessionId &&
-      typeof e.notice?.title === "string" &&
-      e.notice.title.includes("未自动刷新"),
-    5000,
-  );
+  // Likewise there is no automatic refresh left to fail, so no "未自动刷新"
+  // warning can appear. Silence here means "nothing to report", not "failure
+  // swallowed": the reply above already proved the rewind succeeded.
   check(
-    "a refresh that cannot find its agent is a visible warning",
-    refreshFallback !== undefined,
-    JSON.stringify(refreshFallback?.notice ?? null),
+    "no refresh-failure warning exists (the reload path is gone)",
+    rewindNotices.every(
+      (e) => !String(e.notice?.title ?? "").includes("未自动刷新"),
+    ),
+    JSON.stringify(rewindNotices.map((e) => e.notice?.title ?? null)),
   );
 
   // ---- 3. a rewind the bridge refuses ------------------------------------

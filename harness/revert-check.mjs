@@ -226,21 +226,27 @@ console.log('replay timestamps (per-turn "worked for" durations survive a reopen
   );
 }
 
-console.log('a successful rewind shows a transient "working" notice');
+console.log('a rewind no longer reloads the agent (native rewind via the daemon patch)');
 {
   const provider = readFileSync(join(import.meta.dirname, '..', 'paseo-plugin/server/provider.ts'), 'utf8');
   const caseStart = provider.indexOf('case "session.revert"');
-  const noticeIndex = provider.indexOf('"正在回退，请稍候"', caseStart);
-  const completedIndex = provider.indexOf('request.completed', caseStart);
-  const refreshIndex = provider.indexOf('this.#refreshAgent(input.sessionId)', caseStart);
+  const caseEnd = provider.indexOf('case "session.interrupt"', caseStart);
+  const body = caseStart === -1 ? '' : provider.slice(caseStart, caseEnd);
+  // The daemon rebuilds the timeline from `streamHistory()` right after the reply
+  // and the LOCAL PATCH in @getpaseo/server truncates that buffer at the rewound
+  // row. A reload is therefore both unnecessary and harmful (new session id,
+  // loading state, cancelled provider subagents), so it must be gone.
   check(
-    'the notice is emitted after the revert succeeded and before the reload',
-    caseStart !== -1 && completedIndex !== -1 && noticeIndex !== -1 && refreshIndex !== -1
-      && completedIndex < noticeIndex && noticeIndex < refreshIndex,
+    'the revert branch spawns no `paseo agent reload`',
+    caseStart !== -1 && caseEnd !== -1 && !/refreshAgent|agent reload/.test(body),
   );
   check(
-    'and it is an info notice with the short working text',
-    /this\.#notice\(input\.sessionId, "info", "正在回退，请稍候"\)/.test(provider),
+    'and it no longer needs a transient "working" notice (the reply is immediate)',
+    !/正在回退，请稍候/.test(provider),
+  );
+  check(
+    'the revert branch still answers request.completed',
+    /request\.completed/.test(body),
   );
 }
 
@@ -251,22 +257,27 @@ console.log('post-reload notices and the rewind prompt gate');
     'the provider keeps a provider-session -> DSH-session key after the session closes',
     /readonly #dshIds = new Map<string, string>\("\)?;?/.test(provider.replace(/\s+/g, ' ')) || /#dshIds = new Map<string, string>/.test(provider),
   );
+  // Without a reload the timeline is no longer rebuilt from scratch, so a file
+  // restore failure can be reported immediately instead of being deferred.
   check(
-    'a file restore failure is deferred until the reopened session (not lost in the old epoch)',
-    /this\.#deferNotice\(input\.sessionId, \{\s*severity: "error",\s*title: "文件回退未完成"/.test(provider),
+    'a file restore failure is reported immediately (no epoch rebuild discards it)',
+    /this\.#notice\(\s*input\.sessionId,\s*"error",\s*"文件回退未完成"/.test(provider),
   );
   check(
     'deferred notices are flushed right after session.ready of the reopened session',
     provider.indexOf('this.#flushDeferredNotices(sessionId, dshSessionId);') > provider.indexOf('type: "session.ready"'),
   );
+  // The prompt gate existed only to cover the reload window. With no reload there
+  // is no window: the rewind is synchronous inside `session.revert`, so a prompt
+  // either arrives before it or after it, and the bridge's own `revertInflight`
+  // guard rejects a concurrent second rewind.
   check(
-    'a prompt arriving during the rewind is refused with a readable reason',
-    /if \(this\.#reverting\.has\(input\.sessionId\)\)/.test(provider)
-      && /正在回退，请稍候/.test(provider),
+    'the reload-window prompt gate is gone',
+    !/#reverting/.test(provider),
   );
   check(
-    'the rewind flag is released on a refused rewind, on close, and on every refresh failure',
-    (provider.match(/this\.#reverting\.delete\(input\.sessionId\)|this\.#reverting\.delete\(sessionId\)/g) ?? []).length >= 5,
+    'concurrent rewinds are left to the bridge guard, which the plugin relies on',
+    /revertInflight/.test(readFileSync(join(import.meta.dirname, '..', 'dsh-bridge/lib/server.js'), 'utf8')),
   );
   const bridge = readFileSync(join(import.meta.dirname, '..', 'dsh-bridge/lib/server.js'), 'utf8');
   check(
@@ -316,29 +327,28 @@ console.log('wiring (the pure module is useless if nothing calls it)');
     /case "session\.revert":/.test(provider) && /\.revert\(input\.token,\s*input\.scope\)/.test(provider),
   );
   check(
-    'provider records the daemon-injected agent id',
-    /PASEO_AGENT_ID/.test(provider) && /#agentIds\.set\(sessionId, agentId\)/.test(provider),
+    'provider still reads the daemon-injected agent id (it scopes native child ids)',
+    /PASEO_AGENT_ID/.test(provider) && /agentId === "" \? \{\} : \{ agentId \}/.test(provider),
   );
   check(
-    'provider answers the rewind before scheduling the refresh',
+    'provider answers the rewind and does not schedule a refresh',
     (() => {
       const caseStart = provider.indexOf('case "session.revert":');
       const completed = provider.indexOf('this.#emit({ type: "request.completed", requestId: input.requestId });', caseStart);
-      const refresh = provider.indexOf('this.#refreshAgent(input.sessionId);', caseStart);
-      return caseStart !== -1 && completed !== -1 && refresh !== -1 && completed < refresh;
+      return caseStart !== -1 && completed !== -1 && !/refreshAgent/.test(provider);
     })(),
   );
   check(
-    'provider resolves the paseo binary explicitly',
-    /#resolvePaseoBinary\(\)/.test(provider) && /PASEO_BIN/.test(provider),
+    'the paseo-binary resolver is gone with the reload path',
+    !/#resolvePaseoBinary|PASEO_BIN/.test(provider),
   );
   check(
-    'provider surfaces a failed file restore as a (deferred) timeline notice',
-    /#deferNotice\(input\.sessionId, \{\s*severity: "error",\s*title: "文件回退未完成"/.test(provider),
+    'provider surfaces a failed file restore as an immediate timeline notice',
+    /#notice\(\s*input\.sessionId,\s*"error",\s*"文件回退未完成"/.test(provider),
   );
   check(
-    'provider warns when the auto-refresh did not run',
-    /时间线未自动刷新/.test(provider),
+    'no "timeline was not refreshed" warning is left (there is no refresh to fail)',
+    !/时间线未自动刷新/.test(provider),
   );
 
   const session = read('paseo-plugin/server/session.ts');
@@ -478,18 +488,21 @@ console.log('wiring (the pure module is useless if nothing calls it)');
     'provider teardown shuts sessions down instead of parking',
     /session\.close\(\{ park: false \}\)/.test(provider),
   );
-  const refreshDelay = Number((provider.match(/\}, (\d+)\);\s*timer\.unref\(\)/) ?? [])[1]);
   check(
-    'the refresh trigger is short (the CLI spawn itself covers the settle window)',
-    Number.isFinite(refreshDelay) && refreshDelay <= 200,
-    `${refreshDelay}ms`,
+    'no refresh timer is left behind (the reload path owned the only one)',
+    !/timer\.unref\(\)/.test(provider),
   );
 
   const timeline = read('paseo-plugin/server/timeline.ts');
   const timelineRaw = readFileSync(join(import.meta.dirname, '..', 'paseo-plugin/server/timeline.ts'), 'utf8');
+  // The `/rewind` command implementation is gone and so is the filter that hid
+  // its replay rows: 928 session logs on this machine contain no `rewind`/`undo`/
+  // `permission` command row, so the legacy set was dead. Assert its absence —
+  // if a future change reintroduces command rows, this fails and whoever brings
+  // them back has to decide the filter again.
   check(
-    'internal command rows are filtered only as legacy cleanup',
-    /LEGACY_INTERNAL_COMMANDS/.test(timeline) && /legacy/.test(timelineRaw),
+    'the legacy internal-command filter is gone with the retired /rewind command',
+    !/LEGACY_INTERNAL_COMMANDS/.test(timelineRaw),
   );
 
   const snapshotsModule = read('dsh-bridge/lib/file-snapshots.js');
