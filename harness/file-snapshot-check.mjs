@@ -347,7 +347,52 @@ console.log('rescue copies from separate rewinds are not overwritten');
   await snapshots.restore(session, second.actions);
   const rescues = await readdir(join(root, encodeURIComponent(session), 'rescue'));
   check('two rewinds produce two rescue copies', rescues.length === 2, JSON.stringify(rescues));
-  check('and both contain real pre-restore content', rescues.length === 2);
+  const rescueBodies = await Promise.all(
+    rescues.map((name) => readFile(join(root, encodeURIComponent(session), 'rescue', name), 'utf8')),
+  );
+  check(
+    'and both contain real pre-restore content',
+    rescueBodies.includes('B') && rescueBodies.includes('C'),
+    JSON.stringify(rescueBodies),
+  );
+}
+
+console.log('rescue copies are unique even inside one millisecond');
+{
+  const session = 'rescue-same-ms';
+  const file = join(root, 'rescue-same-ms.txt');
+  await writeFile(file, 'A', 'utf8');
+  await snapshots.capture({ sessionId: session, anchorSeq: 5, callId: 'ms1', path: file });
+  await snapshots.commit({ sessionId: session, callId: 'ms1' }, { isError: false });
+  await writeFile(file, 'B', 'utf8');
+  // Pin the clock so both rewinds provably land in the same millisecond: that is
+  // the window the old name format collided in, and leaving it to chance made this
+  // a 1-in-10 flake instead of a test. Restored in `finally` so the checks below
+  // still see the real clock.
+  //
+  // This is the assertion that catches the original defect: with a counter local to
+  // `restore()` the second copy is named `<ts>-1-…` again and overwrites the first,
+  // leaving one file holding 'C' and 'B' gone forever.
+  const realNow = Date.now;
+  Date.now = () => 1700000000000;
+  try {
+    const firstMs = await snapshots.planRestore(session, 5);
+    await snapshots.restore(session, firstMs.actions);
+    await writeFile(file, 'C', 'utf8');
+    const secondMs = await snapshots.planRestore(session, 5);
+    await snapshots.restore(session, secondMs.actions);
+  } finally {
+    Date.now = realNow;
+  }
+  const msDir = join(root, encodeURIComponent(session), 'rescue');
+  const msFiles = (await readdir(msDir)).sort();
+  check('same-millisecond rewinds produce two rescue copies', msFiles.length === 2, JSON.stringify(msFiles));
+  const msBodies = await Promise.all(msFiles.map((name) => readFile(join(msDir, name), 'utf8')));
+  check(
+    'both same-millisecond copies keep their own pre-restore content',
+    msBodies.includes('B') && msBodies.includes('C'),
+    JSON.stringify(msBodies),
+  );
 }
 
 console.log('journal writes are serialised under parallel tool commits');

@@ -102,6 +102,37 @@ const MAX_ANCHORS = 1000;
 const GC_GRACE_MS = 5 * 60 * 1000;
 
 /**
+ * Process-wide monotonic counter that keeps rescue copy names unique.
+ *
+ * A rescue copy is the *manual-recovery material*: it holds the content the rewind
+ * is about to replace, and nothing else on disk keeps it. A later rewind that
+ * overwrote it would destroy the only copy of what the user had — silently, since
+ * the receipt only reports the directory. The name therefore has to be unique per
+ * copy, and `Date.now()` alone is not enough: two rewinds of one path inside the
+ * same millisecond get the same stamp. A counter *inside* `restore` does not fix
+ * it either — it restarts at 1 on every call, so the two names come out identical
+ * (this is what the old code did while its comment claimed the opposite).
+ *
+ * This counter is module-level, so it is strictly increasing for the whole
+ * process and the second field differs even when the stamp repeats. The stamp
+ * stays in the name so a human can still tell *when* the copy was taken; the
+ * sequence tells the copies of one millisecond apart.
+ *
+ * Why not `copyFile` with `COPYFILE_EXCL` + retry: that replaces a naming
+ * invariant with an extra failure path inside the one copy whose purpose is not
+ * to lose data — a rescue that throws is reported as a failed restore. A counter
+ * that cannot repeat is the simpler contract, and it leaves the `COPYFILE_FICLONE`
+ * fast path untouched.
+ *
+ * Known boundary (accepted): uniqueness *across processes* still rests on the
+ * timestamp, because a restarted bridge starts this counter at 1 again. Reusing a
+ * name that way needs a restart **and** a backwards clock step landing in the same
+ * millisecond, and a rescue directory belongs to one session, which one bridge
+ * process owns at a time.
+ */
+let rescueSeq = 0;
+
+/**
  * The path a tracked tool is about to mutate.
  *
  * DSH's `write`/`edit` take `file_path`; `str_replace_editor` takes `path` and
@@ -483,7 +514,6 @@ export class FileSnapshots {
   async restore(sessionId, actions) {
     const rescueDir = this.rescueDir(sessionId);
     const outcome = { restored: [], deleted: [], skipped: [], failed: [], rescue: [], rescueDir };
-    let rescueCounter = 0;
     for (const action of actions) {
       try {
         let info;
@@ -505,14 +535,14 @@ export class FileSnapshots {
             outcome.skipped.push(action.path);
             continue;
           }
-          outcome.rescue.push(await this.#rescue(rescueDir, action.path, rescueCounter += 1));
+          outcome.rescue.push(await this.#rescue(rescueDir, action.path));
           await unlink(action.path);
           outcome.deleted.push(action.path);
           continue;
         }
         const objectPath = join(this.objectsDir(sessionId), action.backup);
         const bytes = await readFile(objectPath);
-        if (exists) outcome.rescue.push(await this.#rescue(rescueDir, action.path, rescueCounter += 1));
+        if (exists) outcome.rescue.push(await this.#rescue(rescueDir, action.path));
         await mkdir(dirname(action.path), { recursive: true });
         await writeFile(action.path, bytes);
         if (action.mode !== null) {
@@ -552,16 +582,18 @@ export class FileSnapshots {
    *
    * @param {string} rescueDir
    * @param {string} path
-   * @param {number} counter
    * @returns {Promise<string>} the rescue file's path.
    */
-  async #rescue(rescueDir, path, counter) {
+  async #rescue(rescueDir, path) {
     await mkdir(rescueDir, { recursive: true });
-    // Timestamp + counter: two rewinds restoring the same path must not
-    // overwrite the earlier rescue copy (it is the manual-recovery material).
+    // Timestamp + process-wide sequence: two rewinds restoring the same path must
+    // not overwrite the earlier rescue copy (it is the manual-recovery material).
+    // The sequence is module-level on purpose — a counter local to `restore()`
+    // restarts at 1 per call, so two rewinds in the same millisecond produced the
+    // same name and the second `copyFile` silently replaced the first copy.
     const digest = createHash('sha256').update(path).digest('hex').slice(0, 16);
     const readable = basename(path).replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 64) || 'file';
-    const name = `${Date.now()}-${counter}-${digest}-${readable}`;
+    const name = `${Date.now()}-${++rescueSeq}-${digest}-${readable}`;
     const target = join(rescueDir, name);
     await copyFile(path, target, fsConstants.COPYFILE_FICLONE ?? 0);
     return target;
