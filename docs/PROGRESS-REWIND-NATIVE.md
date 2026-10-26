@@ -251,3 +251,65 @@ READY 用时 1.3s → send 成功
 | 第二轮桥层 | -14 行死码 + 4 处注释 |
 | 第二轮插件层 | `provider.ts` 1637 → 1523（**-114**）、`parked-sessions.ts` 216 → 135（**-81**） |
 | **合计净减** | **约 1345 行** |
+
+---
+
+## 回归中发现的既有 flaky（提交 `f758ba1`）
+
+最终验收时 `file-snapshot-check` 出现 `52 passed, 2 failed`，查清后是**既有真 bug，非本轮引入**。
+
+### 根因
+
+`file-snapshots.js` 的 `#rescue()` 用 `${Date.now()}-${counter}-${digest}-${readable}` 命名，
+而 `counter` 是 `restore()` 内的局部计数器（每次调用重置为 1）。两次撤回落在**同一毫秒**
+时文件名完全相同，第二次 `copyFile` 静默覆盖第一次的 rescue 副本。
+
+rescue 是用户手动恢复材料，被覆盖 = **撤回前的原始内容永久丢失**。
+代码注释本就声称「two rewinds restoring the same path must not overwrite the earlier
+rescue copy」，但实现没做到——注释不是行为证据。
+
+### 为什么基线没抓到
+
+基线固定时恰好全绿。实测复现率约 **9.3%**（改动前 `4dfa03a` 纯净副本 150 次连跑红 14 次），
+单次跑绿不能证明没有 flaky。
+
+### 修法
+
+局部计数器 → 模块级 `let rescueSeq = 0`，文件名 `${Date.now()}-${++rescueSeq}-${digest}-${readable}`。
+时间戳仍在首位所以可读。不用 `COPYFILE_EXCL`：那会给 rescue 增加一条抛错路径，
+而 rescue 的职责恰恰是不丢数据。
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| 改动前纯净副本 150 次 | **红 14 次（9.3%）** |
+| 改动后 30 次 | **30/30 全绿** |
+| 变异：旧实现 + 新确定性断言 | **6/6 必红** |
+| 变异：修复版注入回旧缺陷 | **5/5 必红**，还原后 5/5 绿 |
+
+断言同步：原「and both contain real pre-restore content」只重复了上一条的
+`rescues.length === 2`、从未读内容（恒绿）→ 改为真读文件内容；新增「同毫秒内
+rescue 必须唯一」（钉住 `Date.now` 为定值）。
+
+### 同类问题扫描
+
+全仓其余 `Date.now()` 拼接均非「持久文件名 + 同毫秒可重入」：notice id 带随机数、
+`turnId` 会话内串行、图片路径已用模块级序号。**无第二处**。
+
+### 最终全量回归
+
+```
+37/37 脚本全绿，0 failed，tsc --noEmit 0 错误
+断言总数 2047 → 2048
+  file-snapshot  54 → 56（新增 2 条确定性断言）
+  revert-check  112 → 111（删 1 条恒绿断言）
+```
+
+### 第二次重启后真机验收
+
+自唤醒再次生效（`--on-active=10s` → `READY 1.3s` → `send 成功`，cgroup 仍独立）。
+daemon 新实例 `08:12:43` 晚于源码 mtime `08:05:00`；live 桥与仓库**逐字节一致**。
+
+`harness/rewind-native-check.mjs` → **9/9**（回执 34ms、session id 不变、无 loading、
+模型看不到被撤内容）。
