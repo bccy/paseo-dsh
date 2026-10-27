@@ -32,6 +32,7 @@
     "bin/",
     "icon.svg",
     "README.md",
+    "OVERVIEW.md",
     "LICENSE"
   ],
   "scripts": {

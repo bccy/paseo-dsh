@@ -2363,7 +2363,9 @@ export class DshChildSession {
  *
  * A block with no DSH counterpart and no Paseo rendering fails loudly rather
  * than being dropped: the model would otherwise receive a prompt silently
- * missing its evidence.
+ * missing its evidence. {@link DshSession.prompt} catches that throw as a failed
+ * *prompt* — one untranslatable block must never be reported as a session-level
+ * error, which the daemon treats as terminal for the whole conversation.
  */
 export function toDshContent(block: ProviderContent): Record<string, unknown> {
   if (block.type === "text") return { type: "text", text: block.text };

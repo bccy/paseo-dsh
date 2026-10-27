@@ -1970,6 +1970,11 @@ journal；stderr 出现 `interrupted 1 delegated agent(s)`）、`rewind-e2e` 12/
 
 ### 63. iOS 上传 zip 报 `[System Error] unsupported prompt content type "uploaded_file"`
 
+**症状**：把任意非图片文件拖进 Paseo 输入框发送，回合失败（iOS 上传 zip 直接报 `[System Error]`，
+见下）；之后再发消息报 `Provider session … is stale after its plugin reloaded`，重试变成
+`has no pending run`。每次重试都会新开一个 `dsh` 进程，会话却立刻又被判死——看着像"会话挂了"，
+其实是第一次失败把会话标成了 terminal。桌面端与手机端一样：都走同一个 `uploaded_file` 内容块。
+
 **背景**：Paseo 0.12 手机端把附件（zip 等）以 `uploaded_file` 内容块下发：文件已由 daemon 落盘到
 `~/.paseo/uploads/<id>/<fileName>`，块里带 `fileName/mimeType/size/path`（绝对路径）。
 插件 `paseo-plugin/server/session.ts` 的 `toDshContent` 只认 `text`/`image`，其余一律抛
@@ -1980,6 +1985,11 @@ journal；stderr 出现 `interrupted 1 delegated agent(s)`）、`rewind-e2e` 12/
 `renderPromptAttachmentAsText()` 渲染成**文本**再交给底层 agent，官方从不复制文件、只给绝对路径
 （`@getpaseo/server@0.12.0` `dist/server/server/agent/prompt-attachments.js:30-110`；Claude 侧
 `providers/claude/agent.js:2922`、Codex 侧 `providers/codex-app-server-agent.js:2437`）。
+
+**为什么会升级成会话级失败**：修复前 `toDshContent` 的抛出发生在 `try` **外面**。异常一路冒到
+`provider.send()` 的兜底 catch，被当成 `session.runtime_failed` 上报；Paseo 收到它就把这个
+provider 会话标记为 terminal。空闲会话再发消息只能"从 persistence 重开"，于是出现一串新
+session id 和连续的 stale——一次附件格式不认，代价是整段对话报废。
 
 **修复**（`paseo-plugin/server/session.ts`）：`toDshContent` 改为 text/image 原样、其余交给逐字移植的
 `renderPromptAttachmentAsText`：
@@ -1992,6 +2002,11 @@ journal；stderr 出现 `interrupted 1 delegated agent(s)`）、`rewind-e2e` 12/
   未知 forge 走 neutral）；表是**照抄的数据**，@getpaseo/server 不是插件运行时依赖。
 - `text` 块 / 文本附件块 / `image` 块行为逐字不变；**真正未知的类型仍抛错**（带 wire type），不静默丢。
 
+同时把内容块转换包进 `try`（`session.ts` 的 `DshSession.prompt`）：翻译失败只发一条
+`session.prompt_result{type:"failed"}`（`emitPromptFailed`）就返回，不再向上抛；`process.prompt`
+本身也包在自己的 `try` 里，失败同样降为 prompt 级。这样即使遇到真正未知的块，失败范围也止于
+这一条消息，不会升级成会话级错误。
+
 **验证**：新增 `harness/uploaded-file-check.cjs`（17/17，编译到仓库内 `.dbg-attach`，
 详见文件头运行步骤）；11 个 fixture 与官方 `renderPromptAttachmentAsText` 的输出**逐字节比对一致**
 （含无 forge 的 neutral 怪癖 `undefined PR #3: …`，有意保留上游行为）；两条变异验证
@@ -2002,7 +2017,9 @@ journal；stderr 出现 `interrupted 1 delegated agent(s)`）、`rewind-e2e` 12/
 
 **教训**：**「协议比我认识的宽」时先看上游适配器怎么翻译，而不是抛错**——抛错看起来"响亮"，
 其实用户看到的是整个提问不可用；同时**对齐要连边角一起照抄**（neutral 兜底、diff 行前缀、字段顺序），
-否则"差不多"的格式会在下一次上游改动时静默漂移。
+否则"差不多"的格式会在下一次上游改动时静默漂移。另一条更重的教训：**单条 prompt 的校验错误
+绝不能用会话级错误上报**——`session.runtime_failed` 会让 Paseo 永久放弃这个会话，代价和「这条
+消息发不出去」完全不对等。
 
 ### 64. `agent_message` 行在真机退回原文：0.12 App 的插件边界重建 item 时丢了 `agentMessage`
 
