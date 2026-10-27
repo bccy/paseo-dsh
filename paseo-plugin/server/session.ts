@@ -323,18 +323,19 @@ export class DshSession {
       return;
     }
 
-    // Paseo and the bridge already agree on the text/image block shape, so the
-    // blocks ride through untouched. They used to be collapsed to a text label,
-    // which silently discarded every non-text attachment.
-    const blocks = prompt.input.content.map(toDshContent);
-    const label = blocks
-      .map((block) => (block.type === "text" ? (block.text as string) : ""))
-      .filter((text) => text !== "")
-      .join("\n");
-
-    this.#emitUserMessage(prompt.clientMessageId, label);
-
+    // Paseo and the bridge already agree on the text/image block shape, so those
+    // blocks ride through untouched. Every other attachment becomes a text
+    // reference: a block with no DSH counterpart used to throw *outside* this
+    // try, which turned one unsupported file into `session.runtime_failed` and
+    // killed the whole session ("stale after its plugin reloaded" on retry).
     try {
+      const blocks = prompt.input.content.map(toDshContent);
+      const label = blocks
+        .map((block) => (block.type === "text" ? (block.text as string) : ""))
+        .filter((text) => text !== "")
+        .join("\n");
+
+      this.#emitUserMessage(prompt.clientMessageId, label);
       await process.prompt(label, blocks.length === 0 ? undefined : blocks, prompt.delivery);
     } catch (error) {
       this.#emitPromptFailed(prompt.clientMessageId, error);
@@ -628,13 +629,37 @@ export class DshSession {
 /**
  * Translate one Paseo content block into the shape the bridge hands DSH.
  *
- * A block with no DSH counterpart fails loudly rather than being dropped: the
- * model would otherwise receive a prompt silently missing its evidence.
+ * Text and images have a native DSH counterpart. The rest (uploaded files and
+ * forge/GitHub/review attachments) become a text reference that names the file
+ * or link and carries the body, so the model keeps the evidence instead of
+ * losing the prompt. Nothing is dropped silently, and nothing throws: an
+ * exception here escapes `prompt()` and kills the session.
  */
 function toDshContent(block: ProviderContent): Record<string, unknown> {
   if (block.type === "text") return { type: "text", text: block.text };
   if (block.type === "image") return { type: "image", data: block.data, mimeType: block.mimeType };
-  throw new Error(`unsupported prompt content type "${block.type}"`);
+  if (block.type === "uploaded_file") {
+    return {
+      type: "text",
+      text: `Attached file: ${block.fileName} (${block.mimeType}, ${block.size} bytes)\n${block.path}`,
+    };
+  }
+  if (block.type === "review") {
+    const comments = block.comments
+      .map((comment) => `${comment.filePath}:${comment.lineNumber} (${comment.side})\n${comment.body}`)
+      .join("\n\n");
+    return { type: "text", text: `Attached review comments (${block.mode}):\n\n${comments}` };
+  }
+  // Forge, GitHub and text attachments share title, url and body.
+  const reference = block as unknown as { title?: string; url?: string; body?: string | null };
+  const heading = reference.title ?? block.type;
+  const url = reference.url === undefined ? "" : `\n${reference.url}`;
+  const body =
+    typeof reference.body === "string" && reference.body.trim() !== "" ? `\n\n${reference.body}` : "";
+  return {
+    type: "text",
+    text: `Attached ${block.type.replace(/_/g, " ")}: ${heading}${url}${body}`,
+  };
 }
 
 /**
