@@ -167,6 +167,15 @@ token），并且加载插件会把内嵌桥重写进 `~/.dsh/profiles/<name>/no
 - `harness/locale-check.cjs` — 客户端显示 locale 的纯函数解析链（`DSH_PASEO_LANG` 与
   `LANG`/`LC_ALL` 的优先级）和标签表覆盖：每个工具名在**两种语言**下都要有值，英文列是
   中文列的复制也要抓出来。**动了 `client/locale.ts` 或标签表必跑。**
+- `harness/replay-turn-check.cjs` — 重放历史的回合标识：`replayHistory()` 必须把 DSH 日志里的
+  `turn/start`…`turn/end` 括号翻译成成对的 `session.turn`（started 在前、行在中间、终态在后），
+  否则 Paseo 的 `currentTurnId` 在重放期间恒为 null，重开出来的每一行都没有 `turnId`，
+  客户端退回「每条 user_message 起一个回合」，被拆块的提问就永远折不起来。断言：两个回合
+  各被 started…终态闭合、4 条行全部落在区间内、两回合 turnId 不同、同一回合的 user 与
+  assistant 行归属同一个 turnId、turnId 稳定派生自 DSH 回合号（重开可复现）。用假桥驱动
+  编译后的真实 `DshSession.replayHistory()`，并逐字复刻 Paseo 的 `translateTurn`/
+  `translateTimeline` 规则，所以断言打在协议层而不是界面。**动了 `server/session.ts` 的
+  重放路径或 `session.turn` 的发出时机必跑。**
 - `harness/context-usage-check.cjs` — 用编译后的真实 `DshSession`、只替换进程传输，断言
   上下文占用的上报边界（打开会话上报已用量与容量、回合内合并更新、压缩后下降、未知容量
   清除旧值、无效计数拒绝、切模型时迟到的旧响应不能覆盖、关闭后不再发）。参数是编译输出

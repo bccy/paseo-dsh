@@ -53,6 +53,28 @@ function replayTimestamp(event: { time?: unknown }): string | undefined {
     ? new Date(event.time).toISOString()
     : undefined;
 }
+
+/**
+ * The Paseo turn id a replayed DSH turn is announced under.
+ *
+ * Paseo derives each row's grouping from the turn id its provider stamped while
+ * the row was emitted, so a replay has to announce the stored `turn/start` /
+ * `turn/end` bracket as `session.turn` — otherwise every restored row comes back
+ * with no turn at all and the client falls back to "each user message starts a
+ * turn", which cannot recover a prompt DSH split across several rows.
+ *
+ * The id is namespaced `turn:history:` and derived only from DSH's own turn
+ * number, so it is stable across reopens (the same log always produces the same
+ * ids) and can never collide with a live turn id (`turn:${clientMessageId}` /
+ * `turn:${Date.now()}`). The seed covers a log whose `turn` field is missing or
+ * malformed — an unreadable turn number must not collapse two turns into one id.
+ */
+function historyTurnId(turn: unknown, seed: number): string {
+  if (typeof turn === "number" && Number.isSafeInteger(turn) && turn >= 0) {
+    return `turn:history:${turn}`;
+  }
+  return `turn:history:seq:${seed}`;
+}
 import { UI, commandCopy, presetLabel, skillDescription } from "./locale";
 
 /**
@@ -715,11 +737,33 @@ export class DshSession {
     if (events.length === 0) return;
     const builder = new TimelineBuilder({ warn: (line) => this.#options.log(line) });
     let lastTimestamp: string | undefined;
+    // The DSH turn currently being replayed, and whether its `turn/end` is in yet.
+    //
+    // Paseo stamps every timeline row with the `currentTurnId` its provider set
+    // last (`translateTimeline` in the host's plugin-provider), and it only ever
+    // sets that from `session.turn`. Replaying without these events left every
+    // restored row without a turn id, so the host fell back to treating each
+    // `user_message` as a turn start: one prompt became several turn-shaped runs
+    // with no reply, and those are exactly the turns that never collapse.
+    let replayTurnOpen = false;
+    let replayTurnId: string | undefined;
     for (const event of events) {
       const data = isRecord(event.data) ? event.data : {};
       const seq = typeof event.seq === "number" ? event.seq : this.#replaySeq++;
       const timestamp = replayTimestamp(event);
       if (timestamp !== undefined) lastTimestamp = timestamp;
+      if (event.type === "turn/start") {
+        // Two open turns in a row cannot come from a healthy log, but a truncated
+        // one can end up shaped that way. Close the earlier turn rather than leave
+        // a `started` that nothing will ever end.
+        if (replayTurnOpen && replayTurnId !== undefined) {
+          this.#emitReplayTurn(replayTurnId, "canceled");
+        }
+        replayTurnId = historyTurnId(data.turn, seq);
+        replayTurnOpen = true;
+        this.#emitReplayTurn(replayTurnId, "started");
+        continue;
+      }
       if (event.type === "user/message") {
         const source = isRecord(data.source) ? data.source : {};
         if (source.kind !== "user") continue;
@@ -755,6 +799,22 @@ export class DshSession {
           item,
         });
       }
+      // Close the replayed turn *after* its rows, so the rows DSH's own
+      // `turn/end` produces (the error row of a failed turn) stay inside the
+      // bracket that carries their turn id.
+      if (event.type === "turn/end") {
+        if (replayTurnOpen && replayTurnId !== undefined) {
+          this.#emitReplayTurn(replayTurnId, childTurnState(data.reason));
+        } else {
+          // A terminal whose start was never replayed cannot be attributed, and
+          // emitting a lone terminal would announce a turn nothing opened.
+          this.#options.log(
+            `replay: ignoring a turn/end with no replayed turn/start (turn ${String(data.turn)})`,
+          );
+        }
+        replayTurnOpen = false;
+        replayTurnId = undefined;
+      }
     }
     // A tool whose `tool/result` never arrived needs the same treatment for the
     // same reason, and the root replay used to skip it while the child replay
@@ -786,6 +846,31 @@ export class DshSession {
         item,
       });
     }
+    // The log's last turn never reached its `turn/end` (the process was killed,
+    // or the read was cut). Its `started` above would otherwise dangle: Paseo's
+    // daemon keeps every turn id it saw started in `activeTurnIds`, and a turn
+    // nothing will ever close makes the session look busy for the rest of its
+    // life — `connectionClosed` then reports a runtime failure for a session that
+    // is merely idle. It is closed as canceled, the same status the child replay
+    // gives an interrupted turn, and the same one the settle loops above already
+    // assume when they cancel the rows of a turn that will never finish.
+    //
+    // Deliberately not gated on `#joinedLiveProcess`: that proves the shared child
+    // never stopped, not that *this* conversation's turn is still running, and a
+    // reopened session gets no second `session.turn started` to close a turn it
+    // was left holding.
+    if (replayTurnOpen && replayTurnId !== undefined) {
+      this.#options.log(
+        `replay: the stored log ends inside turn ${String(replayTurnId)} with no turn/end; ` +
+          "closing it as canceled so no turn is left open",
+      );
+      this.#emitReplayTurn(replayTurnId, "canceled");
+    }
+  }
+
+  /** Emit one replayed root turn boundary (started or a terminal state). */
+  #emitReplayTurn(turnId: string, state: "started" | "completed" | "canceled" | "failed"): void {
+    this.#options.emit({ type: "session.turn", sessionId: this.id, turnId, state });
   }
 
   /**
