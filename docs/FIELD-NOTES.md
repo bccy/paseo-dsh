@@ -274,6 +274,25 @@ cwd 提示）。
 > 提示词变量、插件 schema、服务名、异步就绪时机这类"软契约"让功能静默失效。升版后必须重跑
 > `plugin-check`，而不是只看 `doctor`（`doctor` 只查安装完整性，查不出回合层失败和空目录）。
 
+### 21. 往对话框拖一个文件，整个会话就"挂"了
+
+**症状**：把任意非图片文件拖进 Paseo 输入框发送后，回合失败；再发消息报
+`Provider session … is stale after its plugin reloaded`，重试变成
+`has no pending run`。每次重试都会新开一个 `dsh` 进程，但会话立刻又被判死。
+
+**根因**：Paseo 把文件作为 `uploaded_file` 内容块送进来，`toDshContent` 只认 text/image，
+直接抛 `unsupported prompt content type "uploaded_file"`——而且抛在 `try` **外面**。异常一路
+冒到 `provider.send()` 的兜底 catch，被当成 `session.runtime_failed` 上报；Paseo 于是把这个
+provider 会话标记为 terminal。空闲会话再发消息就只会走"从 persistence 重开"，于是出现一串
+新 session id 和连续的 stale。
+
+**修法**：`uploaded_file`、forge/GitHub/review 附件都降级成文本引用（文件名、类型、大小、
+绝对路径，或 title/url/body），模型可以直接 `read`/`read_image`；同时把内容块转换挪进 `try`，
+以后单条消息失败不再升级成会话失败。
+
+> **教训**：**单条 prompt 的校验错误绝不能用会话级错误上报**。`session.runtime_failed`
+> 会让 Paseo 永久放弃这个会话，代价和"这条消息发不出去"完全不对等。
+
 ---
 
 ## 已知限制（未修，有意为之）
