@@ -1069,6 +1069,7 @@ function stringifyValue(value: unknown, pretty = false): string {
 const PASEO_MCP_ICONS: Record<string, string> = {
   speak: "Volume2",
   create_workspace: "FolderInput",
+  list_hosts: "Server",
   list_workspaces: "FolderOpen",
   archive_workspace: "FolderOpen",
   rename_workspace: "FolderOpen",

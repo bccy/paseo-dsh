@@ -256,6 +256,7 @@ const TEXT: Record<Locale, UiText> = {
     paseoMcpLabels: {
       speak: "Speak",
       create_workspace: "Create workspace",
+      list_hosts: "List hosts",
       list_workspaces: "List workspaces",
       archive_workspace: "Archive workspace",
       rename_workspace: "Rename workspace",
@@ -450,6 +451,7 @@ const TEXT: Record<Locale, UiText> = {
     paseoMcpLabels: {
       speak: "朗读",
       create_workspace: "创建工作区",
+      list_hosts: "列出主机",
       list_workspaces: "列出工作区",
       archive_workspace: "归档工作区",
       rename_workspace: "重命名工作区",
