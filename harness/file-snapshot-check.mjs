@@ -20,7 +20,7 @@
  *
  * Usage: node harness/file-snapshot-check.mjs
  */
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -423,6 +423,18 @@ console.log('unreferenced objects are collected');
   await gc.commit({ sessionId: session, callId: 'g1' }, { isError: false });
   const objectsDir = join(root, encodeURIComponent(session), 'objects');
   await writeFile(join(objectsDir, 'deadbeefdeadbeef'), 'orphan', 'utf8');
+  // Age the orphan explicitly rather than assuming a just-written file has
+  // `mtime <= Date.now()`. The GC keeps any object whose mtime is inside the
+  // grace window (`Date.now() - mtimeMs < gcGraceMs`), which is the safe
+  // direction — but a CI runner whose clock steps back (NTP correction) or a
+  // filesystem whose timestamps run slightly ahead makes a fresh file compare
+  // as recent even with `gcGraceMs: 0`, so this case failed over collection it
+  // never exercised: 2026-10-27 Sync upstream gate, 54/56,
+  // `{"removed":0,"keptRecent":1}` and `["c1a66b9d…","deadbeefdeadbeef"]`.
+  // The case is "an unreferenced object *verified old* is removed", so make it
+  // old. (The grace-period case below still covers the fresh-file guard.)
+  const old = new Date(Date.now() - 60_000);
+  await utimes(join(objectsDir, 'deadbeefdeadbeef'), old, old);
   const collected = await gc.collectGarbage(session);
   const left = await readdir(objectsDir);
   check('one unreferenced object is removed', collected.removed === 1, JSON.stringify(collected));
