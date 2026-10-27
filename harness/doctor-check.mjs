@@ -30,13 +30,28 @@
  * check that can only ever fail.
  *
  * The CLI and plugin rows are not asserted: they describe the host, not the
- * sandbox. Only the route, credential and bridge verdicts are read.
+ * sandbox. They are still driven to `ok` by stub executables at the front of
+ * PATH (see `stubHostClis`), because doctor fails a bare host before it reads
+ * anything about the sandbox — and case 6, the negative control for the sandbox
+ * checks, has to be green on a machine that never installed the tools, such as
+ * a CI runner. That holds where doctor resolves the CLIs through PATH; on macOS
+ * with Paseo.app installed the bundled CLI is preferred (see `stubHostClis`).
+ * Only the route, credential and bridge verdicts are read.
  *
  * Usage: node harness/doctor-check.mjs
  */
-import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { delimiter, dirname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { runDoctor } from "../paseo-plugin/lib/doctor.mjs";
 
@@ -74,6 +89,74 @@ const BRIDGE_FILES = bridgeSourceFiles();
 const WORK = mkdtempSync(join(tmpdir(), "doctor-check-"));
 const PROFILE = "doctor-check";
 process.env.DSH_PASEO_PROFILE = PROFILE;
+
+/**
+ * Put stub `dsh` and `paseo` executables at the front of PATH before any doctor
+ * run.
+ *
+ * `runDoctor()` starts with the host, not the sandbox: a `dsh` that is not on
+ * PATH is a `fail`, and so is a `paseo` that is neither on PATH nor in
+ * /Applications. Case 6 is the negative control for the sandbox checks, so it
+ * can only be green when nothing blocks — but a CI runner has installed neither
+ * tool, so the control went red over rows it does not govern. That is exactly
+ * what happened on 2026-10-27 in the Sync upstream gate: 20/21,
+ * `FAIL with nothing blocking` — a complete sandboxed install was called
+ * blocked because the runner was bare, and the merged `main` was never pushed.
+ * A complete install is still complete when the host is bare, so the stubs make
+ * the control judge the sandbox instead of the machine — on any host where
+ * doctor resolves the CLIs through PATH.
+ *
+ * The exception is macOS with Paseo.app installed: `findPaseo()` (doctor.mjs)
+ * tries `/Applications/Paseo.app/Contents/Resources/bin/paseo` before PATH, so
+ * the stub `paseo` is never consulted there and the plugin row — hence case 6 —
+ * still reflects that machine's real Paseo state. Linux, GitHub's
+ * ubuntu-latest, and a bare mac are all covered by the stub.
+ *
+ * They answer only the probes doctor makes: `dsh --version`, `paseo --version`
+ * and `paseo plugin ls`. Any other argv exits 1 with no output, so a future
+ * doctor that asks a new question fails loudly instead of reading a stale stub
+ * answer. Their own verdicts are not asserted — they describe the host, not the
+ * sandbox, and doctor's rows for them are not read by this check.
+ *
+ * Keep the versions in step with doctor's constants: `dsh` reports the build
+ * this repository was verified against, on the plugin's 0.2.x line and >=
+ * MINIMUM_DSH (0.2.1); `paseo` is >= MINIMUM_PASEO (0.9.2). If doctor raises a
+ * minimum past these, raise the stubs with it or case 6 turns red wherever the
+ * stub is consulted.
+ */
+function stubHostClis() {
+  const bin = join(WORK, "bin");
+  mkdirSync(bin, { recursive: true });
+  const executable = (name, script) => {
+    const path = join(bin, name);
+    writeFileSync(path, script);
+    chmodSync(path, 0o755);
+  };
+  executable(
+    "dsh",
+    ["#!/bin/sh", 'if [ "$1" = "--version" ]; then', '  echo "0.2.1-rc.2"', "else", "  exit 1", "fi", ""].join("\n"),
+  );
+  executable(
+    "paseo",
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "--version" ]; then',
+      '  echo "0.12.0"',
+      'elif [ "$1" = "plugin" ] && [ "$2" = "ls" ]; then',
+      // The row doctor looks for: a line starting with `dsh-paseo` whose text
+      // carries the word `running`.
+      '  printf "dsh-paseo  0.2.10  running\\n"',
+      "else",
+      "  exit 1",
+      "fi",
+      "",
+    ].join("\n"),
+  );
+  // `delimiter` is `;` on win32: the scripts cannot run there at all (Windows is
+  // not a supported host), but prepending must not corrupt PATH on the way in.
+  process.env.PATH = [bin, process.env.PATH ?? ""].filter((entry) => entry !== "").join(delimiter);
+}
+stubHostClis();
 
 /**
  * A doctor whose `server/bridge-assets.ts` cannot yield a key list — case 9.
