@@ -302,6 +302,17 @@ const check = (name, pass, detail) => {
     stats.length > 0 ? JSON.stringify(stats[0].item.data) : "no dsh-stream-stats item",
   );
 
+  const lastStats = stats[stats.length - 1];
+  check(
+    "stats row carries route, tokens and context",
+    lastStats !== undefined &&
+      typeof lastStats.item.data?.provider === "string" &&
+      typeof lastStats.item.data?.model === "string" &&
+      typeof lastStats.item.data?.inputTokens === "number" &&
+      typeof lastStats.item.data?.contextUsed === "number",
+    lastStats === undefined ? "no stats row" : JSON.stringify(lastStats.item.data),
+  );
+
   // 2. the image block reached the model layer
   //
   // A text-only route makes DSH replace the image with a note saying so, and

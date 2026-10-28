@@ -107,6 +107,11 @@ export class DshSession {
    * durable log only carries one complete message per step, so this is what
    * makes the answer appear while the model is still writing it.
    */
+  /** Tool call start times and the current turn's tool total. */
+  #toolStarts = new Map<string, number>();
+  #turnTool = { count: 0, ms: 0 };
+  /** Most recent stats row, so context and tool totals can update it in place. */
+  #lastStats: { id: string; data: Record<string, unknown> } | undefined;
   /** Per-step timing for the streamed-stats row. */
   #streamStats:
     | { turn: number; step: number; startedAt: number; firstTokenAt?: number; endedAt?: number }
@@ -336,6 +341,11 @@ export class DshSession {
     // A complete context snapshot: absence clears a formerly known value instead
     // of keeping another model's capacity or a stale numerator.
     this.#emitUsage(patch, true);
+    const row = this.#lastStats;
+    if (row !== undefined) {
+      row.data = { ...row.data, ...this.#contextFields() };
+      this.#emitStatsRow();
+    }
   }
 
   /** Coalesce step/tool updates so occupancy is not measured per streamed token. */
@@ -610,6 +620,12 @@ export class DshSession {
 
   #onStatus(status: string): void {
     if (status === "running") {
+      if (this.#turnId === null) {
+        this.#toolStarts.clear();
+        this.#turnTool = { count: 0, ms: 0 };
+        // A later usage refresh must not rewrite the previous turn's row.
+        this.#lastStats = undefined;
+      }
       const turnId = this.#turnId ?? `turn:${Date.now()}`;
       this.#turnId = turnId;
       this.#options.emit({ type: "session.turn", sessionId: this.id, turnId, state: "started" });
@@ -666,11 +682,20 @@ export class DshSession {
     // Refresh here so the readout drops without waiting for a turn.
     if (event.type === "compaction/end") void this.refreshUsage();
 
+    if (event.type === "tool/call" || event.type === "tool/result") this.#trackToolEvent(event);
     // The live text already reached the same row; the durable message is the
     // authoritative final snapshot and simply replaces it.
     if (event.type === "assistant/message") this.#flushLive();
     for (const item of this.#timeline.consume(event)) this.#emitItem(item);
     if (event.type === "assistant/message") this.#emitStreamStats(isRecord(event.data) ? event.data : {});
+    if (event.type === "turn/end" && this.#lastStats !== undefined) {
+      this.#lastStats.data = {
+        ...this.#lastStats.data,
+        toolCalls: this.#turnTool.count,
+        ...(this.#turnTool.ms > 0 ? { toolMs: this.#turnTool.ms } : {}),
+      };
+      this.#emitStatsRow();
+    }
   }
 
   /**
@@ -695,18 +720,70 @@ export class DshSession {
       outputTokens !== undefined && span > 0 ? outputTokens / (span / 1000) : undefined;
     const turn = typeof data.turn === "number" ? data.turn : stats.turn;
     const step = typeof data.step === "number" ? data.step : stats.step;
+    const statsData: Record<string, unknown> = {
+      firstTokenMs,
+      ...(tokensPerSecond === undefined ? {} : { tokensPerSecond }),
+      ...(outputTokens === undefined ? {} : { outputTokens }),
+      ...(typeof usage?.inputTokens === "number" ? { inputTokens: usage.inputTokens } : {}),
+      ...(typeof usage?.cacheReadTokens === "number" ? { cachedInputTokens: usage.cacheReadTokens } : {}),
+      ...this.#contextFields(),
+      provider: this.#route.provider,
+      model: this.#route.model,
+      ...(this.#thinkingOption === undefined ? {} : { thinkingOption: this.#thinkingOption }),
+      toolCalls: this.#turnTool.count,
+      ...(this.#turnTool.ms > 0 ? { toolMs: this.#turnTool.ms } : {}),
+    };
+    this.#lastStats = { id: `stream-stats:${turn}:${step}`, data: statsData };
+    this.#emitStatsRow();
+  }
+
+  /** Context occupancy from the last usage snapshot, when known. */
+  #contextFields(): Record<string, number> {
+    const usage = this.#lastUsage;
+    return {
+      ...(typeof usage?.contextWindowUsedTokens === "number"
+        ? { contextUsed: usage.contextWindowUsedTokens }
+        : {}),
+      ...(typeof usage?.contextWindowMaxTokens === "number"
+        ? { contextMax: usage.contextWindowMaxTokens }
+        : {}),
+    };
+  }
+
+  /** Publish (or re-publish) the current stats row under the answer. */
+  #emitStatsRow(): void {
+    const row = this.#lastStats;
+    if (row === undefined) return;
     this.#emitItem({
       type: "plugin",
-      id: `stream-stats:${turn}:${step}`,
+      id: row.id,
       pluginId: "dsh-paseo",
       kind: "dsh-stream-stats",
       version: 1,
-      data: {
-        firstTokenMs,
-        ...(tokensPerSecond === undefined ? {} : { tokensPerSecond }),
-        ...(outputTokens === undefined ? {} : { outputTokens }),
-      },
+      data: row.data as JsonValue,
     });
+  }
+
+  #trackToolEvent(event: { type: string; data?: unknown }): void {
+    const data = isRecord(event.data) ? event.data : {};
+    if (event.type === "tool/call") {
+      const callId = typeof data.callId === "string" ? data.callId : undefined;
+      if (callId !== undefined) this.#toolStarts.set(callId, Date.now());
+      return;
+    }
+    const message = isRecord(data.message) ? data.message : undefined;
+    const callId =
+      typeof data.toolCallId === "string"
+        ? data.toolCallId
+        : typeof message?.toolCallId === "string"
+          ? message.toolCallId
+          : undefined;
+    if (callId === undefined) return;
+    const startedAt = this.#toolStarts.get(callId);
+    if (startedAt === undefined) return;
+    this.#toolStarts.delete(callId);
+    this.#turnTool.count += 1;
+    this.#turnTool.ms += Math.max(0, Date.now() - startedAt);
   }
 
   #emitItem(item: ProviderTimelineItem): void {
