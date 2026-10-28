@@ -11,7 +11,7 @@ import type {
   ProviderTimelineItem,
   ProviderToolCallDetail,
 } from "@getpaseo/plugin/server/provider";
-import type { JsonValue } from "./dsh-process";
+import type { JsonValue } from "./json-value";
 import { LOCALE, UI } from "./locale";
 
 interface DshEvent {

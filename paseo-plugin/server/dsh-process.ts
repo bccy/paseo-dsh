@@ -23,8 +23,8 @@ import { join, resolve } from "node:path";
 import { profileName } from "./bootstrap";
 import { createFrameReader, splitFrames, type FrameReader } from "./frame-reader";
 
-/** JSON-compatible value tree. */
-export type JsonValue = string | number | boolean | null | { [key: string]: JsonValue } | JsonValue[];
+/** JSON-compatible value tree; declared in {@link ./json-value}. */
+export type { JsonValue } from "./json-value";
 
 /** Provider/model/thinking route pinned for the life of one process. */
 export interface DshRoute {
@@ -161,9 +161,9 @@ export interface DshRevertResult {
 }
 
 /**
- * The session's current context occupancy, measured by DSH's own token meter.
- * Fields are absent when the runtime does not know them; a caller must never
- * substitute a default, because a fabricated window is worse than none.
+ * The session's current context occupancy, measured by DSH's own replay-aware
+ * token meter. Fields are absent when the runtime does not know them; a caller
+ * must never substitute a default, because a fabricated window is worse than none.
  */
 export interface DshUsage {
   available: boolean;

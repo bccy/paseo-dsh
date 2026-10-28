@@ -2222,8 +2222,14 @@ export class PaseoHarnessServer {
   }
 
   async usage(params) {
-    const rec = this.sessions.get(params.sessionId);
-    if (rec === undefined) return { available: false };
+    // Measuring a resumed session needs its agent, and an agent otherwise only
+    // exists after the first prompt. Create it here so a reopened composer shows
+    // its stored occupancy before the next turn, like `commands` and
+    // `permission` already do. A session this process has never opened resumes
+    // from its persistence handle instead of answering "unavailable": the
+    // occupancy is stored, so the reopened composer can show it before the next
+    // turn.
+    const rec = await this.getOrCreateSession(params.sessionId);
     this.assertLiveAgent(rec, params.sessionId);
     const session = rec.handle.agent.session;
     const loggedRoute = session.requestContext?.();

@@ -2253,6 +2253,44 @@ schema 字节数 / 它省下的探索轮数。另一个教训是**能力面要�
 stdio 客户端换掉一个 20 KB 的常驻成本，比重写整个 MCP 层划算得多；反过来说，任何"这个
 传输我们还不支持"的分支都该在注释里写清代价，否则下一个人只会看到"它能用"。
 
+### 22. 上下文用量一直是"暂无上下文数据"
+
+**症状**：Paseo 输入框旁的上下文环永远空着，`session.usage` 只有 `inputTokens` /
+`cachedInputTokens` / `outputTokens`，没有 `contextWindowUsedTokens` 与
+`contextWindowMaxTokens`。
+
+**根因**：Paseo 用这两个字段画上下文条，而插件只转发了 DSH `assistant/message` 里的计费
+用量。DSH 的"当前上下文占用"不在消息里，它由 `tokenMeter` 在需要时**重放会话日志**算出，
+窗口容量要从 `llm.resolveModelInfo()` 取；两者都没人调。
+
+**修法**：bridge 新增 `paseo/usage`，用 `sessionProjections` 的 `contextPressure`（有采样时）
+或 `tokenMeter.measure()`（没有采样时）取占用，用当前路由的 `resolveModelInfo()` 取容量；
+`session.usage` 改成**合并发布**（Paseo 每次整体替换 usage，分开发会把另一半擦掉）。在会话
+打开/恢复、回合结束、切模型、压缩后刷新；同一时刻只允许最新一次查询落地。
+
+> **注意**：`contextPressure` 在 DSH 0.2.1 里没有 `projectedTokens` 字段（只有
+> `pressureTokens`/`surfaceTokens`），代码对两者都做了兜底。恢复会话时 `paseo/usage` 必须
+> `getOrCreateSession`，否则 agent 还没建出来，占用永远是空的。
+
+### 23. `paseo plugin add npm:paseo-dsh` 在 Paseo 0.11 及更早装不上
+
+**症状**：安装直接失败：
+```
+Could not resolve type dependency "@getpaseo/protocol/agent-types"
+imported by .../paseo-dsh/server/session.ts
+```
+
+**根因**：插件里有一句 `import type { JsonValue } from "@getpaseo/protocol/agent-types"`。
+`@getpaseo/protocol` 只是 optional peer，永远不会被装进插件目录；而 Paseo **0.12.0 之前**的
+插件编译器会解析所有 type-only import，解析不到就报错。0.12.0 才加了"跳过
+`@getpaseo/protocol/` 类型导入"的豁免，所以 0.12+ 一直正常，0.9–0.11 全坏。
+
+**修法**：`JsonValue` 是结构性类型，改成插件内本地声明（`server/json-value.ts`），并删掉这个
+peer/dev 依赖。这样 `requirements.paseo: ">=0.9.2"` 才名副其实。
+
+> **教训**：声明的最低兼容版本必须真的装得上。类型导入"反正会被擦除"的直觉只在编译器眼里
+> 成立，安装器会把它当成需要解析的依赖。
+
 ---
 
 ## 已知限制（未修，有意为之）

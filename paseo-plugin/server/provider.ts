@@ -908,9 +908,21 @@ class DshConnection implements ProviderConnection {
   }
 
   async #catalog(requestId: string, cwd: string | undefined): Promise<void> {
-    const display = await loadCatalog(cwd ?? process.cwd());
-    this.#display = display;
-    this.#emit({ type: "catalog", requestId, catalog: display.defaults });
+    try {
+      const display = await loadCatalog(cwd ?? process.cwd());
+      this.#display = display;
+      this.#emit({ type: "catalog", requestId, catalog: display.defaults });
+    } catch (error) {
+      // A failed probe must still answer the request. Leaving it unanswered
+      // made Paseo wait out its 60s timeout and report "did not answer
+      // paseo/catalog" instead of the real cause — typically `dsh` missing
+      // from PATH after a node version switch.
+      this.#emit({
+        type: "request.failed",
+        requestId,
+        error: { message: messageOf(error) },
+      });
+    }
   }
 
   /** List DSH's stored sessions so Paseo can offer to import them. */

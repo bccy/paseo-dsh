@@ -18,6 +18,7 @@ import type {
   ProviderPrompt,
   ProviderSetting,
   ProviderThinkingOption,
+  ProviderTimelineItem,
   ProviderUsage,
 } from "@getpaseo/plugin/server/provider";
 import type { JsonValue } from "./dsh-process";
@@ -655,12 +656,11 @@ export class DshSession {
    * Refresh the context-occupancy half of the usage readout from the runtime.
    *
    * DSH measures occupancy on demand by replaying the session log through its
-   * token meter, so it is polled where it can change: a session open or resume,
-   * the end of a turn, a model switch, and a compaction. Only the newest
-   * in-flight poll may publish, so a slow answer from a previous model — or one
-   * arriving after the session closed — can never overwrite fresher numbers.
-   * Unknown fields are omitted: the composer shows what the runtime actually
-   * knows rather than a fabricated window.
+   * token meter, so it is polled where it can change: when a session opens or
+   * resumes, at the end of a turn, on a model switch, and after a compaction.
+   * Only the newest in-flight poll may publish, so a slow answer from a previous
+   * model, or one arriving after the session closed, cannot overwrite fresher
+   * numbers. Unknown fields are omitted rather than defaulted.
    */
   async refreshUsage(): Promise<void> {
     if (this.#closed) return;
@@ -679,19 +679,25 @@ export class DshSession {
     }
     if (this.#closed || generation !== this.#usageGeneration) return;
     const patch: ProviderUsage = {
-      ...(snapshot.available && typeof snapshot.contextWindow === "number" && Number.isSafeInteger(snapshot.contextWindow) && snapshot.contextWindow > 0
+      ...(snapshot.available &&
+      typeof snapshot.contextWindow === "number" &&
+      Number.isSafeInteger(snapshot.contextWindow) &&
+      snapshot.contextWindow > 0
         ? { contextWindowMaxTokens: snapshot.contextWindow }
         : {}),
-      ...(snapshot.available && typeof snapshot.usedTokens === "number" && Number.isSafeInteger(snapshot.usedTokens) && snapshot.usedTokens >= 0
+      ...(snapshot.available &&
+      typeof snapshot.usedTokens === "number" &&
+      Number.isSafeInteger(snapshot.usedTokens) &&
+      snapshot.usedTokens >= 0
         ? { contextWindowUsedTokens: snapshot.usedTokens }
         : {}),
     };
-    // This is a complete context snapshot: absence clears a formerly known
-    // value instead of retaining another model's capacity or a stale numerator.
+    // A complete context snapshot: absence clears a formerly known value instead
+    // of keeping another model's capacity or a stale numerator.
     this.#emitUsage(patch, true);
   }
 
-  /** Coalesce step/tool updates without measuring on every streamed token. */
+  /** Coalesce step/tool updates so occupancy is not measured per streamed token. */
   #queueUsageRefresh(): void {
     if (this.#closed) return;
     this.#usageGeneration += 1;
@@ -1373,8 +1379,8 @@ export class DshSession {
       }
     }
 
-    // A model switch changes the capacity and a mode switch does not, but both
-    // end with the composer asking for a current readout; one refresh covers it.
+    // A model switch changes capacity; a mode switch does not, but both end
+    // with the composer asking for a current readout, so one refresh covers it.
     void this.refreshUsage();
   }
 
@@ -1935,8 +1941,8 @@ export class DshSession {
     }
     // DSH reports token accounting on the assistant message and nowhere else, so
     // without this the composer's usage readout never had anything to show.
-    // `#emitUsage` merges it with the context occupancy already known, because
-    // Paseo replaces its whole usage record per event.
+    // `#emitUsage` merges it with the known context occupancy because Paseo
+    // replaces its whole usage record per event.
     if (event.type === "assistant/message") {
       const data = isRecord(event.data) ? event.data : {};
       if (isRecord(data.usage)) this.#emitUsage(providerUsage(data.usage));
