@@ -566,6 +566,88 @@ export class PaseoHarnessServer {
     };
   }
 
+  /**
+   * Report the session's current context occupancy for the composer's usage
+   * readout.
+   *
+   * The figure is DSH's own replay-aware token meter, never a sum of the log:
+   * `contextPressure` pairs the newest provider-reported prompt pressure with
+   * the newest known route capacity, which is what DSH's own meter shows.
+   * Summing `tokenUsage` would report cumulative billing: it overstates a
+   * compacted session and counts cache reads twice. Capacity is resolved for
+   * the session's *current* route, so a model switch cannot pair the previous
+   * model's window with the new model's pressure. Unknown fields are omitted
+   * rather than defaulted; a fabricated occupancy is worse than none.
+   */
+  async usage(params) {
+    // Measuring a resumed session needs its agent, and an agent otherwise only
+    // exists after the first prompt. Create it here so a reopened composer shows
+    // its stored occupancy before the next turn, like `commands` and
+    // `permission` already do.
+    const rec = await this.getOrCreateSession(params.sessionId);
+    this.assertLiveAgent(rec, params.sessionId);
+    const session = rec.handle.agent.session;
+    const loggedRoute = session.requestContext?.();
+    const selection = this.controls.get(params.sessionId)?.selection?.current;
+    const route = selection ?? loggedRoute;
+    const sameRoute = route?.provider === loggedRoute?.provider && route?.model === loggedRoute?.model;
+    const pressure = this.#contextPressure(session);
+    // A prior model's pressure/limit must not be presented as a measurement of
+    // the newly selected model. Reprice via DSH when the route changed.
+    const usedTokens = sameRoute
+      ? pressure?.projectedTokens ?? pressure?.pressureTokens ?? this.#measuredTokens(session)
+      : this.#measuredTokens(session, route);
+    const contextWindow = await this.#routeContextWindow(route);
+    return {
+      available: true,
+      ...(Number.isSafeInteger(usedTokens) && usedTokens >= 0 ? { usedTokens } : {}),
+      ...(Number.isSafeInteger(contextWindow) && contextWindow > 0 ? { contextWindow } : {}),
+    };
+  }
+
+  /** DSH's `contextPressure` projection: newest pressure sample and route capacity. */
+  #contextPressure(session) {
+    try {
+      return this.ctx.get('sessionProjections')?.snapshot(session, ['contextPressure'])?.values
+        ?.contextPressure;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Current request pressure straight from the token meter, before any sample exists. */
+  #measuredTokens(session, route) {
+    try {
+      const header = session.requestHeader?.();
+      const requestHeader = route?.provider !== undefined && route?.model !== undefined
+        ? {
+          ...(header?.tools === undefined ? {} : { tools: header.tools }),
+          config: {
+            ...(header?.config ?? {}),
+            provider: route.provider,
+            model: route.model,
+          },
+        }
+        : undefined;
+      const measured = this.ctx.get('tokenMeter')?.measure(session, requestHeader);
+      return typeof measured?.totalTokens === 'number' ? measured.totalTokens : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The live route's resolved context capacity, preferring the current selection. */
+  async #routeContextWindow(route) {
+    if (route?.provider === undefined || route?.model === undefined) return undefined;
+    try {
+      const info = await this.ctx.get('llm')?.resolveModelInfo(route.provider, route.model);
+      const contextWindow = info?.context?.contextWindow;
+      return typeof contextWindow === 'number' && contextWindow > 0 ? contextWindow : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   /** Report the routes and models the runtime can serve, for the Paseo catalog. */
   async catalog() {
     const llm = this.ctx.get('llm');
@@ -714,6 +796,8 @@ export class PaseoHarnessServer {
         return this.runCommand(params);
       case 'paseo/permission':
         return this.permission(params);
+      case 'paseo/usage':
+        return this.usage(params);
       case 'paseo/presets':
         return this.presets(params);
       case 'paseo/sessions':

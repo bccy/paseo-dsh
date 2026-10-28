@@ -69,6 +69,19 @@ export interface DshCatalog {
 }
 
 /**
+ * The session's current context occupancy, measured by DSH's own replay-aware
+ * token meter. Fields are absent when the runtime does not know them; a caller
+ * must never substitute a default, because a fabricated window is worse than none.
+ */
+export interface DshUsage {
+  available: boolean;
+  /** Current context capacity of the live route, in tokens. */
+  contextWindow?: number;
+  /** Tokens the next request's prompt is expected to occupy. */
+  usedTokens?: number;
+}
+
+/**
  * One entry of the composer's `/` menu. `kind` decides how running it works:
  * a registered `command` executes in the runtime, a `skill` rides a `/name`
  * user message that DSH's skill tool turns into an injected instruction set.
@@ -216,6 +229,17 @@ export class DshProcess {
     return (await this.#request("paseo/permission", {
       sessionId: this.#options.sessionId,
     })) as { available: boolean; current: string | null; presets: string[] };
+  }
+
+  /**
+   * Read the session's current context occupancy from the runtime's own token
+   * meter. Absent fields mean the runtime does not know them yet; they are
+   * never defaulted here.
+   */
+  async usage(): Promise<DshUsage> {
+    return (await this.#request("paseo/usage", {
+      sessionId: this.#options.sessionId,
+    })) as DshUsage;
   }
 
   /** Send one text prompt. Resolves when the bridge accepts it, not when the turn ends. */
