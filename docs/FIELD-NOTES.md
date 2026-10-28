@@ -344,16 +344,77 @@ provider 显示名同步简化为 `DeepSeek Harness`，保留 Provider ID。
   逐层先于其父通知，且孙级最早消息/状态先到）；`harness/subagent-check.cjs` 断言父先 opened、
   孙/曾孙按序 opened、最早输出各保留且只一次、宿主父能力门控通过、ghost 仍被丢弃。
 
-**宿主限制（Paseo 0.11.2，未改核心，不伪造）**：
+**宿主限制（Paseo 0.11.2 起，至 0.14.0-beta.1 仍成立；已由本机补丁兜底）**：
 `agent/plugin-provider.js` 的 `acceptChildEvent` 只消费子会话的 `timeline.item`、终态
 `session.turn`、`session.runtime_failed`/`session.closed`；**忽略** `session.turn started`、
 `session.usage`、`session.permission`。因此：
-- 子卡首次打开即 `running`，可续接子代理**二次运行**的 `started` 不会把卡片状态恢复成运行中
-  （终态仍会更新）；这不是插件能修的，需要 Paseo 核心补丁。
+- 子卡首次打开即 `running`（`attachChild()` 里唯一的 `status: "running"`），可续接子代理
+  **二次运行**的 `started` 不会把卡片状态恢复成运行中（终态仍会更新）。这不是插件能修的，
+  需要 Paseo 核心补丁——见下面「本机补丁 childRunning」。
 - 给子会话发 `session.permission` 并不能让 Paseo 出现审批 UI。桥的 `owns()` 仍只覆盖根会话，
   子会话的问题**不转发**给 Paseo（避免挂起或误归属父会话），保持 DSH 自身的子代理审批语义。
 - 插件仍以正确的子 `sessionId` 发出 started/usage/permission 事件（不丢弃、不冒充父级），
   只是当前宿主会忽略它们。
+
+**本机补丁 childRunning（2026-10-28）**：`~/.paseo/local-patches/apply-rewind-history-truncation.mjs`
+的第三个 target 改掉宿主那两行——`:1262` 去掉 `&& event.state !== "started"`、`:1266` 的
+status 改成 `event.state === "started" ? "running" : event.state`。子卡 status 在
+`agent/provider-subagents/store.js` 是 sticky 字段（`event.status ?? previous?.status ?? "running"`），
+一次 upsert 即恢复，title/description/toolCallId/cwd 全部保留，不需要动 usage/permission。
+DSH 团队成员（`spawn_teammate`）与普通子代理走**同一条** `child-opened` 通道（`dsh-subagent`
+写死 `origin: "subagent"`，桥只认这个字段），所以这个补丁一并修好团队成员。
+
+三条本机实现上的坑，都实测踩过：
+- **marker 不能与 rewind 共用前缀**：`countOccurrences` 是子串扫描，同一文件里若新 marker 以
+  `LOCAL PATCH (paseo-dsh)` 开头，会把 rewind 的 marker 数从 2 顶到 3+，当场判 half-patched
+  并拒绝。故用独立的 `PATCH(paseo-dsh): child running`。
+- **备份名不能落在 rewind 的候选集里**：rewind 的 `latestBackup()` 按 `plugin-provider.js.orig-`
+  筛；字母序里 `…orig-childrunning-…` 排在 `…orig-<时间戳>-…` 之后，会被当成最新 rewind 基线
+  选中（而它带着 rewind 补丁），revert 会以 `backup-is-patched` 拒绝，等于 rewind 再也回滚不了。
+  故改名 `plugin-provider.js.childrunning-orig-*`，让两个命名空间从构造上不相交。
+- **`--revert` 顺序必须与 apply 相反**：每个 target 的备份都是整文件快照，rewind 先回滚会连带
+  清掉 childRunning 补丁，使它误报 `revert-noop`（终态仍干净，但报告误导）。故 revert 时
+  childRunning 先跑。
+
+**已知残余风险**：子会话发 `started` 后进程崩溃且不发终态，子卡会停在假 `running`。但这并不比之前更糟——首次 `attachChild` 本来就给 `running`，父 agent 关闭时 `agent-manager.js`
+`cancelRunningProviderSubagents()` 会兜底改 `canceled`。另有一个**正向副作用**：
+`runtimeHasNoPendingWork()` 里 `!providerSubagents.list(agent.id).some(child => child.status === "running")`
+现在能正确看到二次运行的子代理，父 agent 的回收时机变得更准确（此前会误判为无工作）。
+
+### 23. 撤回一次之后，第二次撤回报 "No provider revert token for message …"
+
+**症状**：同一个会话里撤回第二次（或第一次撤回之后再撤回别的消息），报
+`No provider revert token for message user:msg_…`，撤回失败。会话重启后又能撤一次，然后同样复发。
+
+**根因：本机 rewind 补丁自己的回归**，不是上游问题。补丁的 `truncateHistoryFrom()` 为了清掉
+「被丢弃分支的翻译缓存」，把 `revertTokens` **整表清空**。但 `revertTokens` 不是纯翻译缓存：
+它是 `revert()` 下一次要读的**查找表**（`plugin-provider.js` 的 `revert()` 第一行就是
+`this.revertTokens.get(messageId)`）。而 `streamHistory()` 只是 `for (const event of this.history) yield event`，
+**从不重跑翻译**，所以清空的表永远不会被重新填充——第一次撤回把表清空，之后每次撤回都查不到 token。
+
+对照实验（`PluginAgentSession` 真类 + 假 bridge，4 条带 token 的 timeline 项）：
+
+| 版本 | 第 1 次 revert | 之后 tokens | 第 2 次 revert |
+|---|---|---|---|
+| 0.14.0 基线（无补丁） | ok | 4 | ok |
+| 旧补丁（`revertTokens.clear()`） | ok | **0** | **ERR No provider revert token** |
+| 修好后（只 delete 被丢弃分支的 id） | ok | 2 | ok |
+
+**修法**：截断前先收集被丢弃分支的 provider item id（`item.id` 与 `item.messageId`），
+只对这批 id 做 `revertTokens.delete(id)`；`timelineSnapshots` 仍可整表清空（它确实是纯翻译缓存）。
+
+**连带的第二个缺陷：幂等判据只看 marker 数，导致修好的补丁体永远上不去。** `applyRewindPatch()`
+原本 `markers === 2` 就报 `already-patched` 并 return——而注入的方法体是**这个脚本的一部分**，
+改好方法体后，存量安装的 marker 数仍然是 2，于是永远跳过，修好的 `delete` 版永远写不进磁盘。
+修法是新增 `rewindPatchStaleness()`：marker 数对时再比对**方法体的代码行**（丢注释、丢空行、
+逐行 trim，所以重排缩进或改注释不误报），不一致就视为 stale，从最新的无 marker 备份重建后重打。
+`--check` 也接了这条判据，否则它会对着旧补丁体报 `patched (2/2 markers)`——正是这个模式要防的假绿。
+
+两条实现上的坑（都是先踩后改）：
+- **不能用缩进定位方法体的闭合括号**：`truncateHistoryFrom` 自身的方法体里，`for` 循环的 `}`
+  和方法的 `}` 是同一缩进（4 空格），按缩进扫描会提前结束，把每个**正确**的补丁都判成 stale。
+  改成大括号配对计数（`matchClosingBrace`，跳过字符串/模板字面量/注释）。
+- **不能用 `lastIndexOf("/**")` 回找方法起始**：方法体内部有自己的注释，会截断比对范围。
 
 **判定标准**：`harness/subagent-check.cjs` 用脚本化假 `dsh` 断言能力位、父子归属、
 多子混排、未知子不误归属、子只读拒绝、恢复去重、**Paseo 父能力门控**、**无 subsession 保持
