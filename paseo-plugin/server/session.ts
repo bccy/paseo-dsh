@@ -18,12 +18,17 @@ import type {
   ProviderPrompt,
   ProviderSetting,
   ProviderThinkingOption,
+  ProviderTimelineItem,
   ProviderToolCallDetail,
   ProviderUsage,
 } from "@getpaseo/plugin/server/provider";
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import { DshProcess, type DshAnswer, type DshQuestion, type DshQuestionRequest, type DshRoute } from "./dsh-process";
+import { buildStreamFrames, type StreamFrame } from "./stream-replay";
 import { TimelineBuilder } from "./timeline";
+
+/** The timeline row a replayed model message updates in place. */
+type AssistantItem = Extract<ProviderTimelineItem, { type: "assistant_message" }>;
 
 /** Modes Paseo offers in the composer. `plan` drives DSH's plan-mode service. */
 export const MODES: ProviderMode[] = [
@@ -93,6 +98,19 @@ export class DshSession {
   #thinkingOption: string | undefined;
   #turnId: string | null = null;
   #replaySeq = 0;
+  /** In-flight reveal of a finished model message (see stream-replay.ts). */
+  #streamReplay:
+    | {
+        item: AssistantItem;
+        frames: StreamFrame[];
+        index: number;
+        lastText: string;
+        deferred: ProviderTimelineItem[];
+      }
+    | undefined;
+  #replayTimer: ReturnType<typeof setTimeout> | undefined;
+  /** A completed turn that must wait for the text reveal before Paseo sees it. */
+  #pendingIdle = false;
   #pendingPermissions = new Map<string, (response: ProviderPermissionResponse) => void>();
   /** Slash-menu entries by name, tagging why each exists. */
   #commandKinds = new Map<string, "command" | "skill">();
@@ -127,6 +145,9 @@ export class DshSession {
       onExit: (code, signal) => {
         if (this.#closed) return;
         this.#closed = true;
+        // A dead runtime must not keep revealing text or report a completed
+        // turn; the failure below is the last word on this session.
+        this.#abortStreamReplay();
         this.#options.emit({
           type: "session.runtime_failed",
           sessionId: this.id,
@@ -283,6 +304,9 @@ export class DshSession {
 
   /** Accept one prompt and start its turn. */
   async prompt(prompt: ProviderPrompt): Promise<void> {
+    // A user turn must not start while the previous answer is still being
+    // revealed; finish it so both the text and the turn state are settled.
+    this.#finishStreamReplay();
     const process = this.#require();
 
     // A slash-menu pick arrives as a command, not a message. DSH commands and
@@ -464,6 +488,12 @@ export class DshSession {
    * conversation stays continuable — killing the process stranded it instead.
    */
   async interrupt(): Promise<void> {
+    // The model already finished and only the text reveal is left. "Stop" then
+    // means "skip the animation", not "cancel a turn DSH has already closed" —
+    // cancelling there would either error or startle the runtime for nothing.
+    const finished = this.#streamReplay !== undefined && this.#pendingIdle;
+    this.#finishStreamReplay();
+    if (finished) return;
     await this.#require().cancel();
   }
 
@@ -471,6 +501,7 @@ export class DshSession {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    this.#finishStreamReplay();
     await this.#process?.shutdown();
   }
 
@@ -483,11 +514,25 @@ export class DshSession {
 
   #onStatus(status: string): void {
     if (status === "running") {
+      // A new turn began while the previous answer was still being revealed:
+      // land the full text first so the two turns cannot visually interleave.
+      this.#finishStreamReplay();
       const turnId = this.#turnId ?? `turn:${Date.now()}`;
       this.#turnId = turnId;
       this.#options.emit({ type: "session.turn", sessionId: this.id, turnId, state: "started" });
       return;
     }
+    if (this.#streamReplay !== undefined) {
+      // Hold the completed state until the reveal lands. Paseo closes the row
+      // on turn completion, which would freeze the text mid-sentence.
+      this.#pendingIdle = true;
+      return;
+    }
+    this.#completeTurn();
+  }
+
+  /** Mark the current turn completed once its text is fully visible. */
+  #completeTurn(): void {
     if (this.#turnId !== null) {
       const turnId = this.#turnId;
       this.#turnId = null;
@@ -522,9 +567,103 @@ export class DshSession {
         });
       }
     }
-    for (const item of this.#timeline.consume(event)) {
-      this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
+
+    const items = this.#timeline.consume(event);
+
+    if (this.#streamReplay !== undefined) {
+      if (event.type === "turn/end") {
+        // The turn is over but its text is still being revealed: keep the
+        // closing items for after the replay so they cannot close the row early.
+        this.#streamReplay.deferred.push(...items);
+        return;
+      }
+      // Only an event that follows the text in the transcript may cut the
+      // reveal short. Bookkeeping events such as `step/end` arrive right after
+      // the message and must not end it.
+      if (event.type === "assistant/message" || event.type === "tool/call" || event.type === "tool/result") {
+        this.#finishStreamReplay();
+      }
     }
+
+    // DSH sends one complete message per step and carries the pacing of every
+    // text chunk with it. Reveal it progressively so Paseo behaves like the DSH
+    // client instead of dropping the whole answer in at once.
+    if (event.type === "assistant/message") {
+      const assistant = items.find((item): item is AssistantItem => item.type === "assistant_message");
+      const frames = assistant === undefined ? undefined : buildStreamFrames(event.data);
+      if (assistant !== undefined && frames !== undefined) {
+        for (const item of items) {
+          if (item !== assistant) this.#emitItem(item);
+        }
+        this.#startStreamReplay(assistant, frames);
+        return;
+      }
+    }
+
+    for (const item of items) this.#emitItem(item);
+  }
+
+  #emitItem(item: ProviderTimelineItem): void {
+    this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
+  }
+
+  #startStreamReplay(item: AssistantItem, frames: StreamFrame[]): void {
+    const first = frames[0]?.text ?? item.text;
+    this.#streamReplay = { item, frames, index: 1, lastText: first, deferred: [] };
+    this.#emitItem({ ...item, text: first });
+    this.#scheduleStreamReplay();
+  }
+
+  #scheduleStreamReplay(): void {
+    const replay = this.#streamReplay;
+    if (replay === undefined) return;
+    const next = replay.frames[replay.index];
+    if (next === undefined) {
+      this.#finishStreamReplay();
+      return;
+    }
+    const previousAt = replay.frames[replay.index - 1]?.at ?? 0;
+    this.#replayTimer = setTimeout(() => {
+      const current = this.#streamReplay;
+      if (current === undefined) return;
+      const frame = current.frames[current.index];
+      if (frame === undefined) {
+        this.#finishStreamReplay();
+        return;
+      }
+      current.lastText = frame.text;
+      this.#emitItem({ ...current.item, text: frame.text });
+      current.index += 1;
+      this.#scheduleStreamReplay();
+    }, Math.max(0, next.at - previousAt));
+    this.#replayTimer.unref?.();
+  }
+
+  /** Land the final text, flush held-back items and complete the turn. */
+  #finishStreamReplay(): void {
+    const replay = this.#streamReplay;
+    if (replay === undefined) return;
+    this.#streamReplay = undefined;
+    if (this.#replayTimer !== undefined) {
+      clearTimeout(this.#replayTimer);
+      this.#replayTimer = undefined;
+    }
+    if (replay.lastText !== replay.item.text) this.#emitItem(replay.item);
+    for (const item of replay.deferred) this.#emitItem(item);
+    if (this.#pendingIdle) {
+      this.#pendingIdle = false;
+      this.#completeTurn();
+    }
+  }
+
+  /** Drop an in-flight reveal without emitting anything further. */
+  #abortStreamReplay(): void {
+    if (this.#replayTimer !== undefined) {
+      clearTimeout(this.#replayTimer);
+      this.#replayTimer = undefined;
+    }
+    this.#streamReplay = undefined;
+    this.#pendingIdle = false;
   }
 
   /**
