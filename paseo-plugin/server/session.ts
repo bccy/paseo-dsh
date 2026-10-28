@@ -114,7 +114,14 @@ export class DshSession {
   #lastStats: { id: string; data: Record<string, unknown> } | undefined;
   /** Per-step timing for the streamed-stats row. */
   #streamStats:
-    | { turn: number; step: number; startedAt: number; firstTokenAt?: number; endedAt?: number }
+    | {
+        turn: number;
+        step: number;
+        startedAt: number;
+        firstTokenAt?: number;
+        lastTokenAt?: number;
+        endedAt?: number;
+      }
     | undefined;
   #live:
     | {
@@ -712,12 +719,16 @@ export class DshSession {
     const usage = isRecord(data.usage) ? data.usage : undefined;
     const outputTokens = typeof usage?.outputTokens === "number" ? usage.outputTokens : undefined;
     const firstTokenMs = stats.firstTokenAt - stats.startedAt;
-    // DSH commits the durable assistant message before it publishes the end
-    // frame, so `endedAt` is usually not known yet. The message itself is the
-    // step's end for timing purposes.
-    const span = (stats.endedAt ?? Date.now()) - stats.firstTokenAt;
-    const tokensPerSecond =
-      outputTokens !== undefined && span > 0 ? outputTokens / (span / 1000) : undefined;
+    // Throughput needs a measured window between the first and the last text
+    // delta. A route that delivers the whole answer in one burst (or one chunk)
+    // has no observable window, so it reports latency only instead of a
+    // meaningless thousands-of-tokens-per-second figure.
+    const span =
+      stats.lastTokenAt === undefined ? 0 : stats.lastTokenAt - stats.firstTokenAt;
+    const measured = outputTokens !== undefined && span >= 50 ? outputTokens / (span / 1000) : undefined;
+    // A burst delivery has no real generation window; a value this high is a
+    // measurement artifact, not a speed anyone can use.
+    const tokensPerSecond = measured !== undefined && measured <= 3000 ? measured : undefined;
     const turn = typeof data.turn === "number" ? data.turn : stats.turn;
     const step = typeof data.step === "number" ? data.step : stats.step;
     const statsData: Record<string, unknown> = {
@@ -829,8 +840,12 @@ export class DshSession {
     }
     if (typeof frame.text !== "string") return;
     const stats = this.#streamStats;
-    if (frame.kind === "text" && stats !== undefined && stats.firstTokenAt === undefined) {
-      stats.firstTokenAt = Date.now();
+    if (frame.kind === "text" && stats !== undefined) {
+      // Prefer DSH's own chunk timestamp (epoch ms, same clock) so IPC latency
+      // never stretches or compresses the measured generation window.
+      const at = typeof frame.time === "number" ? frame.time : Date.now();
+      if (stats.firstTokenAt === undefined) stats.firstTokenAt = at;
+      stats.lastTokenAt = at;
     }
     if (frame.kind === "reasoning") live.reasoning += frame.text;
     else live.text += frame.text;

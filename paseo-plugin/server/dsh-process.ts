@@ -101,6 +101,8 @@ export interface DshAssistantFrame {
   /** Present on `start`. */
   turn?: number;
   step?: number;
+  /** Present on a `chunk`: DSH's epoch-ms publication time. */
+  time?: number;
   /** Present on a `chunk`: which row the delta belongs to. */
   kind?: "text" | "reasoning";
   /** Present on a `chunk`. */
