@@ -341,10 +341,33 @@ DSH 的 agent preset 能把"人设 + 一套能力"打包成一个选项。插件
 插件的 `major.minor` **跟随它所适配的 DSH 线**：`0.2.x` 的插件对应 DSH `0.2.x`，
 patch 位是插件自己的发布计数。装的时候挑与 daemon 上 `dsh` 同一条线的版本即可。
 
+## 更新日志
+
+按 npm 发布顺序记录每个 patch 的**用户可见变化**。`0.2.x` 的 minor 跟随它所适配的 DSH 线，
+patch 是本插件自己的发布计数；完整提交记录见
+[commits](https://github.com/liuxing7954/paseo-dsh/commits/main)。
+
+| 版本 | 日期 | 更新内容 |
+| --- | --- | --- |
+| [0.2.11](https://www.npmjs.com/package/paseo-dsh/v/0.2.11) | 2026-10-28 | **上下文用量**：输入框旁显示 `已用 / 上限`。bridge 新增 `paseo/usage`，占用取 DSH 的 `contextPressure`（无采样时用 `tokenMeter.measure()`），容量取当前路由的 `resolveModelInfo()`；会话打开/恢复、回合结束、切模型、压缩后刷新，恢复旧会话不用新回合就有数。<br>**回答逐字出现**：按 DSH 的 `data.stream` 分片重放文本，不再整段蹦出；`turn/end` 等到重放结束，打断/新消息/进程退出立即落地。<br>**安装兼容 Paseo 0.9–0.11**：去掉 `@getpaseo/protocol` 的 type-only 导入（改成插件内 `JsonValue`），旧版安装器不再因解析不到类型而失败。 |
+| [0.2.10](https://www.npmjs.com/package/paseo-dsh/v/0.2.10) | 2026-10-27 | **附件不再拖垮会话**：`uploaded_file`、review、GitHub/forge 附件降级成文本引用（文件名 / 类型 / 大小 / 路径，或 title / url / body），模型仍能读到；内容块转换移进 `try`，单条消息失败不再升级成 `session.runtime_failed`。<br>**目录概览**：补 `OVERVIEW.md` 与包描述，paseo.sh 的插件页能正确介绍能力与限制。 |
+| [0.2.9](https://www.npmjs.com/package/paseo-dsh/v/0.2.9) | 2026-10-17 | **模型选择器不再为空**：DSH 0.2.1 的 catalog 异步物化，而 Paseo 的 catalog 探测不走 `initialize`；现在先预热默认路由，再短暂轮询（约 3s），等模型注册完再返回。 |
+| [0.2.8](https://www.npmjs.com/package/paseo-dsh/v/0.2.8) | 2026-10-17 | **修复 DSH 0.2.1 每回合失败**：0.2.1-rc 只注册 `provider` / `model` 两个提示词变量，persona 里的 `{{cwd}}` 会让整个回合报 `unknown prompt variable`；移除它，cwd 改由运行时上下文提供。 |
+| [0.2.7](https://www.npmjs.com/package/paseo-dsh/v/0.2.7) | 2026-10-14 | **导入列表可区分了**：每行显示会话标题和首条真实用户消息预览；并发读取日志前缀，40 个会话也能在 1 秒内列完。 |
+| [0.2.6](https://www.npmjs.com/package/paseo-dsh/v/0.2.6) | 2026-10-14 | **中文说明**：npm 包页与 paseo.cafe 插件页同时展示中英文描述。 |
+| [0.2.5](https://www.npmjs.com/package/paseo-dsh/v/0.2.5) | 2026-10-14 | **重开会话回放历史**：bridge 新增 `paseo/sessions` / `paseo/history`，按 DSH session id 读取日志并回放真实用户回合与工具项。<br>**导入 DSH 原生会话**：声明 `session.list`，从 `~/.dsh/sessions` 列举并导入。 |
+| [0.2.4](https://www.npmjs.com/package/paseo-dsh/v/0.2.4) | 2026-10-09 | **插件重载 / daemon 重启后可恢复会话**：补上 `session.persistence` handle（`plugin:` 前缀），并用 `ctx.get()` 访问未注入的 `sessions` 服务，修掉重开时的两个连续报错。 |
+| [0.2.3](https://www.npmjs.com/package/paseo-dsh/v/0.2.3) | 2026-10-09 | **Preset 下拉**：profile 挂了 `agent-preset-registry` 时，composer 里可选人设 + 能力包；建会话时选、首回合后锁定。<br>**profile 更耐升级**：`package.json` / `cordis.yml` / `pnpm-workspace.yaml` 已存在时不再覆盖。 |
+| [0.2.2](https://www.npmjs.com/package/paseo-dsh/v/0.2.2) | 2026-10-09 | **Permissions 下拉**：在 composer 里直接切 DSH 的沙箱预设（`read-only` / `workspace-write` / `danger-full-access`），等价于 `/permission <preset>`；bridge 新增 `paseo/permission`。 |
+| [0.2.1](https://www.npmjs.com/package/paseo-dsh/v/0.2.1) | 2026-10-09 | **自带 CLI**：`npx paseo-dsh doctor` 只读检查 CLI / profile / bridge / 路由 / key；`npx paseo-dsh probe` 探测端点真实能力。装完不用 clone 就能自检和探模型。<br>安装走查补上完整的模型路由示例。 |
+| [0.2.0](https://www.npmjs.com/package/paseo-dsh/v/0.2.0) | 2026-10-09 | **首个公开版本**：DSH 作为 Paseo 原生 provider（不是 ACP）；`ask_user_question` 原生提问卡片、Build / Plan 模式、按模型真实声明的思考档位、插话、图片端到端、`/` 命令与技能菜单；插件首载自举 DSH profile，`paseo plugin add npm:paseo-dsh` 一行安装。 |
+
+> `0.1.x` 只在本地开发，未发布 npm；`0.0.0-stage` 是首次发布前的占位版本。
+
 ## 相关文档
 
 - [docs/ADOPTION.md](docs/ADOPTION.md) — 改造指南：改动点、配置方法、踩坑清单
-- [docs/FIELD-NOTES.md](docs/FIELD-NOTES.md) — 20 个真实缺陷的症状 → 根因 → 修法
+- [docs/FIELD-NOTES.md](docs/FIELD-NOTES.md) — 23 个真实缺陷的症状 → 根因 → 修法
 - [AGENTS.md](AGENTS.md) — 给 AI Agent 的说明（Codex 等会自动读取）。不管你是被叫来
   装它、还是被叫来改它，先看这个
 
