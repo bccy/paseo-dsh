@@ -24,10 +24,6 @@ export const streamStatsSchema = z.object({
 
 type StreamStats = z.infer<typeof streamStatsSchema>;
 
-/** Readable on both themes; the theme exposes no semantic warning colours. */
-const WARNING = "#d97706";
-const DANGER = "#dc2626";
-
 function formatLatency(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
 }
@@ -43,22 +39,12 @@ function contextRatio(data: StreamStats): number | undefined {
   return Math.max(0, Math.min(1, data.contextUsed / data.contextMax));
 }
 
-function contextColor(ratio: number | undefined, muted: string): string {
-  if (ratio === undefined) return muted;
-  if (ratio >= 0.9) return DANGER;
-  if (ratio >= 0.7) return WARNING;
-  return muted;
-}
-
-function contextLine(data: StreamStats, muted: string): { text: string; color: string } | undefined {
+function contextLine(data: StreamStats): string | undefined {
   const ratio = contextRatio(data);
   if (ratio === undefined) return undefined;
   const filled = Math.round(ratio * 10);
   const bar = `${"█".repeat(filled)}${"░".repeat(10 - filled)}`;
-  return {
-    text: `上下文  ${formatNumber(data.contextUsed ?? 0)} / ${formatNumber(data.contextMax ?? 0)}  ${bar}  ${Math.round(ratio * 100)}%`,
-    color: contextColor(ratio, muted),
-  };
+  return `上下文  ${formatNumber(data.contextUsed ?? 0)} / ${formatNumber(data.contextMax ?? 0)}  ${bar}  ${Math.round(ratio * 100)}%`;
 }
 
 function tokensLine(data: StreamStats): string | undefined {
@@ -101,15 +87,14 @@ function StreamStatsRow({ item, theme, layout }: PluginTimelineItemProps<StreamS
     segments.push({ text: `${Math.round(data.tokensPerSecond)} tok/s`, color: muted });
   }
   if (ratio !== undefined) {
-    segments.push({ text: `上下文 ${Math.round(ratio * 100)}%`, color: contextColor(ratio, muted) });
+    segments.push({ text: `上下文 ${Math.round(ratio * 100)}%`, color: muted });
   }
   if (data.cacheHit !== undefined) {
     segments.push({ text: `缓存命中 ${Math.round(data.cacheHit * 100)}%`, color: muted });
   }
   if (segments.length === 0) return null;
 
-  const context = contextLine(data, muted);
-  const details = [context?.text, tokensLine(data), routeLine(data), toolsLine(data)].filter(
+  const details = [contextLine(data), tokensLine(data), routeLine(data), toolsLine(data)].filter(
     (line): line is string => line !== undefined,
   );
 
@@ -118,7 +103,7 @@ function StreamStatsRow({ item, theme, layout }: PluginTimelineItemProps<StreamS
       accessibilityRole="button"
       accessibilityLabel={open ? "收起回答统计" : "展开回答统计"}
       onPress={() => setOpen((value) => !value)}
-      style={{ alignSelf: "flex-start", marginTop: -6, marginBottom: 0, paddingLeft: 2 }}
+      style={{ alignSelf: "flex-start", marginTop: 0, marginBottom: 0, paddingLeft: 2 }}
     >
       <View style={{ flexDirection: "row", alignItems: "center", flexWrap: "wrap" }}>
         {segments.map((segment, index) => (
@@ -131,11 +116,8 @@ function StreamStatsRow({ item, theme, layout }: PluginTimelineItemProps<StreamS
       </View>
       {open ? (
         <View style={{ marginTop: 2, gap: 1 }}>
-          {details.map((line, index) => (
-            <Text
-              key={line}
-              style={{ ...base, ...(index === 0 ? { color: contextColor(ratio, muted) } : {}) }}
-            >
+          {details.map((line) => (
+            <Text key={line} style={base}>
               {line}
             </Text>
           ))}
