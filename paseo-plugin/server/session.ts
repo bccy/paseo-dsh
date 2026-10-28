@@ -107,6 +107,10 @@ export class DshSession {
    * durable log only carries one complete message per step, so this is what
    * makes the answer appear while the model is still writing it.
    */
+  /** Session totals shown in the collapsed stats line. */
+  #totals = { input: 0, cache: 0, output: 0 };
+  #seenTurns = new Set<number>();
+  #seenSteps = new Set<string>();
   /** Tool call start times and the current turn's tool total. */
   #toolStarts = new Map<string, number>();
   #turnTool = { count: 0, ms: 0 };
@@ -383,6 +387,8 @@ export class DshSession {
     for (const event of events) {
       const data = isRecord(event.data) ? event.data : {};
       const seq = typeof event.seq === "number" ? event.seq : this.#replaySeq++;
+      // Seed the session totals so a resumed agent keeps its 轮/步/token line.
+      if (event.type === "assistant/message") this.#accumulateTotals(data);
       if (event.type === "user/message") {
         const source = isRecord(data.source) ? data.source : {};
         if (source.kind !== "user") continue;
@@ -694,7 +700,10 @@ export class DshSession {
     // authoritative final snapshot and simply replaces it.
     if (event.type === "assistant/message") this.#flushLive();
     for (const item of this.#timeline.consume(event)) this.#emitItem(item);
-    if (event.type === "assistant/message") this.#emitStreamStats(isRecord(event.data) ? event.data : {});
+    if (event.type === "assistant/message") {
+      this.#accumulateTotals(isRecord(event.data) ? event.data : {});
+      this.#emitStreamStats(isRecord(event.data) ? event.data : {});
+    }
     if (event.type === "turn/end" && this.#lastStats !== undefined) {
       this.#lastStats.data = {
         ...this.#lastStats.data,
@@ -743,9 +752,35 @@ export class DshSession {
       ...(this.#thinkingOption === undefined ? {} : { thinkingOption: this.#thinkingOption }),
       toolCalls: this.#turnTool.count,
       ...(this.#turnTool.ms > 0 ? { toolMs: this.#turnTool.ms } : {}),
+      ...this.#sessionFields(),
     };
     this.#lastStats = { id: `stream-stats:${turn}:${step}`, data: statsData };
     this.#emitStatsRow();
+  }
+
+  /** Fold one assistant message's turn, step and usage into the session totals. */
+  #accumulateTotals(data: Record<string, unknown>): void {
+    const turn = typeof data.turn === "number" ? data.turn : undefined;
+    const step = typeof data.step === "number" ? data.step : undefined;
+    if (turn !== undefined) this.#seenTurns.add(turn);
+    if (turn !== undefined && step !== undefined) this.#seenSteps.add(`${turn}:${step}`);
+    const usage = isRecord(data.usage) ? data.usage : undefined;
+    if (usage === undefined) return;
+    if (typeof usage.inputTokens === "number") this.#totals.input += usage.inputTokens;
+    if (typeof usage.cacheReadTokens === "number") this.#totals.cache += usage.cacheReadTokens;
+    if (typeof usage.outputTokens === "number") this.#totals.output += usage.outputTokens;
+  }
+
+  /** Turns, steps, total tokens and cache-hit rate for the collapsed line. */
+  #sessionFields(): Record<string, number> {
+    const tokens = this.#totals.input + this.#totals.cache + this.#totals.output;
+    const promptTokens = this.#totals.input + this.#totals.cache;
+    return {
+      turns: this.#seenTurns.size,
+      steps: this.#seenSteps.size,
+      ...(tokens > 0 ? { sessionTokens: tokens } : {}),
+      ...(promptTokens > 0 ? { cacheHit: this.#totals.cache / promptTokens } : {}),
+    };
   }
 
   /** Context occupancy from the last usage snapshot, when known. */

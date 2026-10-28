@@ -16,6 +16,10 @@ export const streamStatsSchema = z.object({
   thinkingOption: z.string().optional(),
   toolCalls: z.number().optional(),
   toolMs: z.number().optional(),
+  turns: z.number().optional(),
+  steps: z.number().optional(),
+  sessionTokens: z.number().optional(),
+  cacheHit: z.number().optional(),
 });
 
 type StreamStats = z.infer<typeof streamStatsSchema>;
@@ -26,6 +30,13 @@ function formatLatency(ms: number): string {
 
 function formatNumber(value: number): string {
   return String(Math.round(value)).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+function formatCompact(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 10_000) return `${Math.round(value / 1000)}K`;
+  if (value >= 1000) return `${(value / 1000).toFixed(1)}K`;
+  return String(Math.round(value));
 }
 
 function contextLine(data: StreamStats): string | undefined {
@@ -63,11 +74,20 @@ function StreamStatsRow({ item, theme, layout }: PluginTimelineItemProps<StreamS
   const [open, setOpen] = useState(false);
   const data = item.data;
   const summary: string[] = [];
-  if (data.firstTokenMs !== undefined) summary.push(`首字 ${formatLatency(data.firstTokenMs)}`);
-  if (data.tokensPerSecond !== undefined) summary.push(`${data.tokensPerSecond.toFixed(1)} tok/s`);
+  if (data.turns !== undefined && data.steps !== undefined) {
+    summary.push(`${data.turns} 轮 ${data.steps} 步`);
+  }
+  if (data.tokensPerSecond !== undefined) summary.push(`${Math.round(data.tokensPerSecond)} tok/s`);
+  if (data.sessionTokens !== undefined) summary.push(`${formatCompact(data.sessionTokens)} tok`);
+  if (data.cacheHit !== undefined) summary.push(`缓存命中 ${Math.round(data.cacheHit * 100)}%`);
+  if (summary.length === 0 && data.firstTokenMs !== undefined) {
+    summary.push(`首字 ${formatLatency(data.firstTokenMs)}`);
+  }
   if (summary.length === 0) return null;
 
-  const details = [contextLine(data), tokensLine(data), routeLine(data), toolsLine(data)].filter(
+  const latencyLine =
+    data.firstTokenMs === undefined ? undefined : `首字  ${formatLatency(data.firstTokenMs)}`;
+  const details = [latencyLine, contextLine(data), tokensLine(data), routeLine(data), toolsLine(data)].filter(
     (line): line is string => line !== undefined,
   );
   const fontSize = layout.compact ? 10 : 11;
