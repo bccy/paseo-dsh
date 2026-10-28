@@ -2305,6 +2305,102 @@ peer/dev 依赖。这样 `requirements.paseo: ">=0.9.2"` 才名副其实。
 | provider 子代理（DSH 原生 child）的「归档」只写 App 内存，重启必复活 | 实测：App 的 `createArchiveFinishedSubagents` 把行分两类 —— `kind:"paseo"` 走 `archiveAgent`（→ provider 原生归档，落到 DSH registry），`kind:"provider"` 走 `useProviderSubagentStore.hideFromTrack`，**只写客户端内存 `Set`，不发任何请求、不持久化**（`hideFromTrack` 的实现就是 `new Set(t.hiddenFromTrack)`，还只藏非 running 的）；provider 行在 `SubagentsTrack` 里**连归档按钮都不渲染**（`"paseo"===kind ? <RowActions onArchivePress/> : null`），归档资格判定 `Boolean(t && !t.archivedAt && parentAgentId===n && (idle|error))` 也带 `archivedAt` —— 那是 Paseo agent 才有的字段。宿主 server 同样接不住：`plugin-provider.js:564` 把 `restoration:"parent"`（provider 子会话）的 persistence handle 丢成 `null`，`agent-manager.js:3773` 的 `syncNativeArchiveState` 于是 `if (!persistence) return` 静默跳过（catch 也只 `best-effort` warn），`provider-subagents/store.js` 的 descriptor 里根本没有 persistence/archived 字段。**证据（本机 0.11.2 bundle + daemon 日志 + registry 文件）**：23:29 归档 3 个 Paseo agent 时 `archive_agent_request` 有 3 次、registry mtime=23:29:52、3 个 DSH id 都在 `archivedSessionIds` 里；而 00:00–00:35 用户归档子代理期间 **0 次 `archive_agent_request`**、registry 未被写、插件日志无输出；00:12/00:17 App 重启后各有 13/12 次 `agent.provider_subagents.list.request` 把它们全拉回来。**本仓库侧已就绪**（真 profile：对真子代理发 `paseo/archive` → registry 94→95、`paseo/subagents` 该行 `archived:true`、`replaySubagents()` 跳过、unarchive 复原，5/5；假桥：插件把 child handle 解析成 **child 自己的** DSH id，4/4）。**需 Paseo 核心补丁**：① App 的 provider 分支改发服务端归档、失败要在 UI 提示；② `plugin-provider.js:564` 为 `restoration:"parent"` 保留 persistence（插件 `DshChildSession.open()` 已经带了 `{version:1,data:{sessionId:<nativeId>}}`）；③ `syncNativeArchiveState` 不再静默跳过、失败冒泡；④ `provider-subagents/store.js` 增加 archived/persistence。最小改法：App 发一条新请求，server 用 childId 构造 `{version:1,data:{sessionId:<childId>}}` 调 `runtime.archive` —— 插件已能解析。 |
 | 子代理列表固定"旧→新"，要滚到底才看得到最新的 | 顺序由**宿主 App** 决定，不是在插件侧：宿主按自己盖的 `createdAt` **升序**排（最旧在上）。服务端 `@getpaseo/server/dist/server/server/agent/provider-subagents/store.js` 的 `list()` 是 `.sort((l, r) => l.createdAt.localeCompare(r.createdAt))`，`createdAt` 只在首次 upsert 时写入（`apply()`：`previous?.createdAt ?? timestamp`）；而**决定性的那一遍在 App 里** —— web bundle 模块 4997 有三处 `sort((e,t) => e.createdAt.getTime() - t.createdAt.getTime())`（`useSubagentsForParent` / `selectProviderSubagentsForParent` / `selectSubagentsForParent`），客户端不理会服务端返回顺序、自己从 Map 取出重排，所以**只改服务端 `list()` 界面上不会有任何变化**。渲染器（模块 5004 `SubagentsTrack`）是 `c.map(t)` 直接铺，没有 `column-reverse`。公开插件契约 `ProviderEvent.session.opened` **没有时间戳字段**，宿主是在 `attachChild()` 收到 upsert 那刻自己盖的章，所以插件既改不了方向也改不了时间；方向是升序，真正最新的必然在最后，唯一能挪到顶上的办法是**伪造 `createdAt`**（不做）。顺序之所以"每次加载都一样"是确定性的：`descriptors` 是**纯内存 Map**（`constructor(){ this.descriptors = new Map() }`，不持久化），daemon 重启后重新盖章的时刻顺序 = 插件播报顺序 = DSH 的创建顺序，所以重盖出来仍按创建顺序递增；同毫秒并列时由 `Array.sort` 的稳定性（ES2019）兜底。**需 Paseo 核心补丁**：把 App 侧那个 selector 的排序反向（最小改法是在 `useSubagentsForParent` 的 `useMemo` 末尾 `reverse()`，一处覆盖两类行与嵌套分支；别只改渲染器，否则面板的 segments/「已完成 N 个」统计会与行序不一致）。实测 0.11.2：某父会话返回 55 条，`createdAt` 严格升序，最新的（就是那次调查本身）在最后一条。 |
 
+---
+
+## 第十六轮：撤回为什么慢——按层实测，以及为什么插件侧救不了
+
+**症状**：撤回（rewind）一次要等 6~7 秒才响应，且是**远程连接**（TLS 过公网）时才有明显体感。
+期间子代理面板会闪一下"运行中"再恢复。
+
+**结论**：慢的主因是**公网传输**，不是服务端计算。服务端只花 1.65 秒，剩下的全在传数据。
+而数据量来自 Paseo 宿主的一个设计：撤回时把**所有**子代理的完整历史重推一遍。
+
+### 先分层实测，再谈方案
+
+| 层 | 实测 | 占 6~7 秒 |
+|---|---|---|
+| 桥读子代理日志（12 个串行） | 403 ms | ~6% |
+| 插件 emit + 宿主 dispatch（3,488 帧） | 1,650 ms | ~25% |
+| **公网传输（约 10 MB）** | **~4,000 ms** | **~60%** |
+
+桥侧 403 ms 的明细：本会话 12 个子代理日志合计约 9 MB 磁盘、30 MB 解压后，串行
+`process.history()` 每次一个 stdio 往返。单个最大 58 ms。**并行化最多省 340 ms，不值得。**
+
+### 帧数与字节（真实撤回，探针实测）
+
+在 `session.js` 的 `forwardProviderSubagentUpdate` 里临时埋点，用户真机撤回一次：
+
+```
+[probe] kind timeline = 3474
+[probe] kind upsert = 14
+[probe] sub <parent>:sub:25d28a8c-... = 1310
+[probe] sub <parent>:sub:518ca862-... = 1106
+[probe] sub <parent>:sub:74ba00a6-... = 708
+[probe] sub <parent>:sub:f1f1f384-... = 364
+```
+
+**3,488 帧全部来自 4 个「已结束、未受撤回影响」的子代理。** 它们的内存数据与重放完全一致，
+本可一帧不发。按 10 Mbps 上行算，10 MB ≈ 8 秒；20 Mbps ≈ 4 秒，与体感吻合。
+
+> **教训**：`bufferedAmount.max` 是**发送缓冲峰值**，不等于实际传输量，不能直接拿它算时间；
+> 要按「帧数 × 平均帧大小 ÷ 上行带宽」估，并和实测体感对齐。
+
+### 插件侧三条路，实测全部无效
+
+| 方案 | 实测 | 为什么无效 |
+|---|---|---|
+| folded（同 id 折叠） | **降 0%** | 我们的重放本来就没有重复 emit。`tool/call` 与 `tool/result` 产出的是**两次不同状态**的行（running→completed），都必须发；Paseo 侧 `TimelineProjection` 本来就按 `callId` 折过了 |
+| 分帧（每 32 条 `setImmediate`） | 不减总量 | 只把 1.58 秒的事件循环阻塞切碎，体感变好，WS 字节不变 |
+| 桥并行读取 | 最多省 340 ms | 桥本来就不是瓶颈 |
+
+**`folded` 的关键取证**：`@getpaseo/protocol/dist/timeline-identity.js` 的 `timelineItemIdentity` 只对
+`tool_call`（返回 `callId`）和 `plugin`（返回 `pluginId/id`）给身份，**其他类型一律返回 `null` 不参与折叠**；
+`assistant_message` / `reasoning` 走的是 `mergeAssistantChunks` / `mergeReasoningChunks`，规则是
+**「相邻 + seq 连续 + 同 turnId」才合并**，不是按 id 全局折叠。所以「插件侧按 id 提前折叠、末态相同」
+这个推断是**错的**——对 assistant 行按 id 折会破坏相邻性判断，末态会变。
+
+### 唯一有效的方案：宿主侧「跳过未变化的子代理」
+
+**根因在宿主**：`agent-manager.js` 的 `forceHydrateTimelineFromLegacyProviderHistory` 无条件
+`providerSubagents.deleteParent(agent.id)` 删掉所有子代理，再逐个 `apply` 重建，**每一步都 dispatch 一帧**。
+
+改法：先算差异，只对「重放里与内存里不一致」的子代理走删+重建+播，未变化的一帧不发。
+实测方向有效：**852 行 → 0 帧**（原版 860 帧）。
+
+**但这条路最终被放弃**，原因有三：
+
+1. **判据极难写对**。第一版用「重放 timeline 数 == 内存行数」，独立审查构造出反例并被亲复现：
+   - 内存 2 行「原始回答」+ 重放 2 行「改写后内容」→ 判据通过 → **保留已撤回的旧内容**（撤回后重发同样轮数必然触发）
+   - 内存 status=`running` + 重放 `completed` + timeline 0 行 → 判据通过 → **客户端永远显示 running**
+2. **修复成本高**。要引入 `TimelineProjection` 在重放侧重建一遍再逐行比对（实测 1310 行投影 1.9 ms，
+   成本可接受），但这段代码从「替换 11 行」变成「新增 56 行 + 逐行投影比对」，是 4 个 target 里最脆的一个。
+3. **上游 [PR #6635](https://github.com/getpaseo/paseo/pull/6635)（OPEN）恰好重写这段**，合并后必然锚点失配。
+
+**已全部回滚**（`agent-manager.js` → `0e6a493c`、`provider-subagents/store.js` → `e2babe96`、
+`session.js` → `7a94370d`，逐字节核对）。
+
+### 上游为什么没解决
+
+5 家内置 provider（claude / codex / omp / opencode / pi）**全部是全量重推**，说明这是 Paseo 的设计惯例、
+不是我们的实现错。但它们有三处节流我们当初没有：claude/omp 每 32 条 `await setImmediate()`、
+pi 有 2 MB 硬预算、opencode v2 用签名比对去重。
+
+**真正的零损失解需要上游加能力**：`ProviderInputSchema` 只有 12 类输入（无子代理历史请求），
+`ProviderEventSchema` 19 类事件也无。客户端侧按需分页（`direction:"before"` / `hasOlder` / `cursor`）
+**全链路已就绪**，缺的只是服务端「内存空了能否回源」这一点——`ProviderSubagentStore.fetchTimeline`
+只读内存，空态直接抛 `Unknown agent`。已提 [issue #8077](https://github.com/getpaseo/paseo/issues/8077)
+（那是 childRunning 的问题，不是这条；这条若要提需另开）。
+
+### 可复用的判据
+
+- **归因先分层，再算传输**：服务端耗时 ≠ 用户体感耗时。远程连接时，先按「帧数 × 帧大小 ÷ 上行带宽」
+  估算传输时间，和实测体感对齐，再判断瓶颈在哪一层。
+- **`bufferedAmount` 峰值不是传输量**，别拿它算时间。
+- **「同 id 多次更新」不等于「重复可折叠」**：running→completed 是两次必要的状态更新，
+  折掉会让客户端看不到过程。判断能否折叠要先读宿主的 identity 规则。
+- **判据「指标相等」必须能证伪**：行数相等 ≠ 内容未变 ≠ descriptor 未变。
+  任何「跳过重建」类优化，判据必须与「不跳过」的末态逐行等价，否则会静默保留旧内容。
+
 ## 关于"哪条路由能用"
 
 这份记录里刻意不提任何具体的 provider、模型或端点——**你的路由和模型完全由你的
