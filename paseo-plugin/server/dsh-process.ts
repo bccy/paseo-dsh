@@ -93,8 +93,25 @@ export interface DshCommand {
   kind: "command" | "skill";
 }
 
+/** One live assistant-stream frame, already reduced by the bridge. */
+export interface DshAssistantFrame {
+  type: "start" | "chunk" | "end";
+  attemptId: string;
+  revision: number;
+  /** Present on `start`. */
+  turn?: number;
+  step?: number;
+  /** Present on a `chunk`: which row the delta belongs to. */
+  kind?: "text" | "reasoning";
+  /** Present on a `chunk`. */
+  text?: string;
+  /** Present on `end`. */
+  outcome?: { kind: "committed" | "abandoned" };
+}
+
 export interface DshProcessHandlers {
   onEvent(payload: DshSessionEvent): void;
+  onAssistantStream?(frame: DshAssistantFrame): void;
   onStatus(status: string): void;
   onQuestion(request: DshQuestionRequest): Promise<DshAnswer>;
   onLog(line: string): void;
@@ -433,6 +450,11 @@ export class DshProcess {
     if (method === "session.status") {
       const params = frame.params as { status?: string } | undefined;
       this.#options.onStatus(params?.status ?? "unknown");
+      return;
+    }
+    if (method === "assistant.stream") {
+      const params = frame.params as { frame?: DshAssistantFrame } | undefined;
+      if (params?.frame !== undefined) this.#options.onAssistantStream?.(params.frame);
       return;
     }
     if (method !== undefined) {

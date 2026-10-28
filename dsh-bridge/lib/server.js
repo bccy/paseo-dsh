@@ -92,6 +92,54 @@ function withTimeout(promise, ms, label) {
   ]).finally(() => clearTimeout(timer));
 }
 
+/**
+ * Reduce one DSH live assistant-stream frame to the part Paseo can render.
+ *
+ * Only visible text deltas are forwarded. Reasoning and tool-call deltas keep
+ * their existing end-of-step presentation, so forwarding them would duplicate
+ * work the durable timeline already does. Start and end frames still travel so
+ * the plugin can reset its accumulator on a retry or abandonment.
+ */
+function liveAssistantFrame(frame) {
+  if (frame.type === 'chunk') {
+    // Text and reasoning both become live rows. A forwarded chunk names which
+    // row it belongs to; tool-call deltas keep their end-of-step presentation.
+    const kind = frame.chunk?.type === 'text-delta'
+      ? 'text'
+      : frame.chunk?.type === 'reasoning-delta'
+        ? 'reasoning'
+        : undefined;
+    if (kind === undefined) return undefined;
+    return {
+      type: 'chunk',
+      attemptId: String(frame.attemptId),
+      revision: frame.revision,
+      index: frame.index,
+      time: frame.time,
+      kind,
+      text: frame.chunk.text,
+    };
+  }
+  if (frame.type === 'start') {
+    return {
+      type: 'start',
+      attemptId: String(frame.attemptId),
+      revision: frame.revision,
+      turn: frame.turn,
+      step: frame.step,
+    };
+  }
+  if (frame.type === 'end') {
+    return {
+      type: 'end',
+      attemptId: String(frame.attemptId),
+      revision: frame.revision,
+      outcome: frame.outcome,
+    };
+  }
+  return undefined;
+}
+
 export class PaseoHarnessServer {
   constructor(ctx, transport, options = {}) {
     this.ctx = ctx;
@@ -141,6 +189,17 @@ export class PaseoHarnessServer {
     this.disposers.push(
       ctx.on('agent/status', ({ agent, status }) => {
         this.transport.notify('session.status', { sessionId: String(agent.session.id), status });
+      }),
+    );
+    // Live token deltas. The durable log only carries one complete message per
+    // step, so without this the answer can only be replayed after the model has
+    // finished writing it. Only sessions this bridge drives are forwarded.
+    this.disposers.push(
+      ctx.on('agent/assistant-stream', ({ agent, frame }) => {
+        const sessionId = String(agent.session.id);
+        if (!this.sessions.has(sessionId)) return;
+        const live = liveAssistantFrame(frame);
+        if (live !== undefined) this.transport.notify('assistant.stream', { sessionId, frame: live });
       }),
     );
   }

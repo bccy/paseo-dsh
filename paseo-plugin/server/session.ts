@@ -28,14 +28,11 @@ import {
   type DshAnswer,
   type DshQuestion,
   type DshQuestionRequest,
+  type DshAssistantFrame,
   type DshRoute,
   type DshUsage,
 } from "./dsh-process";
-import { buildStreamFrames, type StreamFrame } from "./stream-replay";
 import { TimelineBuilder } from "./timeline";
-
-/** The timeline row a replayed model message updates in place. */
-type AssistantItem = Extract<ProviderTimelineItem, { type: "assistant_message" }>;
 
 /** Modes Paseo offers in the composer. `plan` drives DSH's plan-mode service. */
 export const MODES: ProviderMode[] = [
@@ -105,19 +102,23 @@ export class DshSession {
   #thinkingOption: string | undefined;
   #turnId: string | null = null;
   #replaySeq = 0;
-  /** In-flight reveal of a finished model message (see stream-replay.ts). */
-  #streamReplay:
+  /**
+   * Live text accumulated from DSH's transient assistant-stream frames. The
+   * durable log only carries one complete message per step, so this is what
+   * makes the answer appear while the model is still writing it.
+   */
+  #live:
     | {
-        item: AssistantItem;
-        frames: StreamFrame[];
-        index: number;
-        lastText: string;
-        deferred: ProviderTimelineItem[];
+        attemptId: string;
+        turn: number;
+        step: number;
+        text: string;
+        emitted: string;
+        reasoning: string;
+        emittedReasoning: string;
+        timer: ReturnType<typeof setTimeout> | undefined;
       }
     | undefined;
-  #replayTimer: ReturnType<typeof setTimeout> | undefined;
-  /** A completed turn that must wait for the text reveal before Paseo sees it. */
-  #pendingIdle = false;
   #pendingPermissions = new Map<string, (response: ProviderPermissionResponse) => void>();
   /** Slash-menu entries by name, tagging why each exists. */
   #commandKinds = new Map<string, "command" | "skill">();
@@ -155,6 +156,7 @@ export class DshSession {
       sessionId: this.#dshSessionId,
       env: this.#options.env,
       onEvent: (payload) => this.#onSessionEvent(payload),
+      onAssistantStream: (frame) => this.#onAssistantStream(frame),
       onStatus: (status) => this.#onStatus(status),
       onQuestion: (request) => this.#onQuestion(request),
       onLog: (line) => this.#options.log(line),
@@ -162,9 +164,9 @@ export class DshSession {
         if (this.#closed) return;
         this.#closed = true;
         clearTimeout(this.#usageRefreshTimer);
-        // A dead runtime must not keep revealing text or report a completed
-        // turn; the failure below is the last word on this session.
-        this.#abortStreamReplay();
+        // A dead runtime must not keep writing more of the answer; the failure
+        // below is the last word on this session.
+        this.#clearLive();
         this.#options.emit({
           type: "session.runtime_failed",
           sessionId: this.id,
@@ -380,9 +382,10 @@ export class DshSession {
 
   /** Accept one prompt and start its turn. */
   async prompt(prompt: ProviderPrompt): Promise<void> {
-    // A user turn must not start while the previous answer is still being
-    // revealed; finish it so both the text and the turn state are settled.
-    this.#finishStreamReplay();
+    // A user turn must not start with the previous answer's live buffer still
+    // attached; flush it so the two turns cannot interleave.
+    this.#flushLive();
+    this.#clearLive();
     const process = this.#require();
 
     // A slash-menu pick arrives as a command, not a message. DSH commands and
@@ -579,12 +582,8 @@ export class DshSession {
    * conversation stays continuable — killing the process stranded it instead.
    */
   async interrupt(): Promise<void> {
-    // The model already finished and only the text reveal is left. "Stop" then
-    // means "skip the animation", not "cancel a turn DSH has already closed" —
-    // cancelling there would either error or startle the runtime for nothing.
-    const finished = this.#streamReplay !== undefined && this.#pendingIdle;
-    this.#finishStreamReplay();
-    if (finished) return;
+    this.#flushLive();
+    this.#clearLive();
     await this.#require().cancel();
   }
 
@@ -593,7 +592,8 @@ export class DshSession {
     if (this.#closed) return;
     this.#closed = true;
     clearTimeout(this.#usageRefreshTimer);
-    this.#finishStreamReplay();
+    this.#flushLive();
+    this.#clearLive();
     await this.#process?.shutdown();
   }
 
@@ -606,18 +606,9 @@ export class DshSession {
 
   #onStatus(status: string): void {
     if (status === "running") {
-      // A new turn began while the previous answer was still being revealed:
-      // land the full text first so the two turns cannot visually interleave.
-      this.#finishStreamReplay();
       const turnId = this.#turnId ?? `turn:${Date.now()}`;
       this.#turnId = turnId;
       this.#options.emit({ type: "session.turn", sessionId: this.id, turnId, state: "started" });
-      return;
-    }
-    if (this.#streamReplay !== undefined) {
-      // Hold the completed state until the reveal lands. Paseo closes the row
-      // on turn completion, which would freeze the text mid-sentence.
-      this.#pendingIdle = true;
       return;
     }
     this.#completeTurn();
@@ -671,102 +662,94 @@ export class DshSession {
     // Refresh here so the readout drops without waiting for a turn.
     if (event.type === "compaction/end") void this.refreshUsage();
 
-    const items = this.#timeline.consume(event);
-
-    if (this.#streamReplay !== undefined) {
-      if (event.type === "turn/end") {
-        // The turn is over but its text is still being revealed: keep the
-        // closing items for after the replay so they cannot close the row early.
-        this.#streamReplay.deferred.push(...items);
-        return;
-      }
-      // Only an event that follows the text in the transcript may cut the
-      // reveal short. Bookkeeping events such as `step/end` arrive right after
-      // the message and must not end it.
-      if (event.type === "assistant/message" || event.type === "tool/call" || event.type === "tool/result") {
-        this.#finishStreamReplay();
-      }
-    }
-
-    // DSH sends one complete message per step and carries the pacing of every
-    // text chunk with it. Reveal it progressively so Paseo behaves like the DSH
-    // client instead of dropping the whole answer in at once.
-    if (event.type === "assistant/message") {
-      const assistant = items.find((item): item is AssistantItem => item.type === "assistant_message");
-      const frames = assistant === undefined ? undefined : buildStreamFrames(event.data);
-      if (assistant !== undefined && frames !== undefined) {
-        for (const item of items) {
-          if (item !== assistant) this.#emitItem(item);
-        }
-        this.#startStreamReplay(assistant, frames);
-        return;
-      }
-    }
-
-    for (const item of items) this.#emitItem(item);
+    // The live text already reached the same row; the durable message is the
+    // authoritative final snapshot and simply replaces it.
+    if (event.type === "assistant/message") this.#flushLive();
+    for (const item of this.#timeline.consume(event)) this.#emitItem(item);
   }
 
   #emitItem(item: ProviderTimelineItem): void {
     this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
   }
 
-  #startStreamReplay(item: AssistantItem, frames: StreamFrame[]): void {
-    const first = frames[0]?.text ?? item.text;
-    this.#streamReplay = { item, frames, index: 1, lastText: first, deferred: [] };
-    this.#emitItem({ ...item, text: first });
-    this.#scheduleStreamReplay();
-  }
-
-  #scheduleStreamReplay(): void {
-    const replay = this.#streamReplay;
-    if (replay === undefined) return;
-    const next = replay.frames[replay.index];
-    if (next === undefined) {
-      this.#finishStreamReplay();
+  /**
+   * Fold one live assistant-stream frame into the answer row.
+   *
+   * DSH publishes token-level deltas while the model writes. Emitting a text
+   * snapshot under the same timeline id the durable message will use lets
+   * Paseo append the delta live; the step's `assistant/message` then arrives as
+   * the authoritative final snapshot and replaces the row in place.
+   */
+  #onAssistantStream(frame: DshAssistantFrame): void {
+    if (this.#closed) return;
+    if (frame.type === "start") {
+      this.#clearLive();
+      this.#live = {
+        attemptId: frame.attemptId,
+        turn: frame.turn ?? 0,
+        step: frame.step ?? 0,
+        text: "",
+        emitted: "",
+        reasoning: "",
+        emittedReasoning: "",
+        timer: undefined,
+      };
       return;
     }
-    const previousAt = replay.frames[replay.index - 1]?.at ?? 0;
-    this.#replayTimer = setTimeout(() => {
-      const current = this.#streamReplay;
+    const live = this.#live;
+    if (live === undefined || live.attemptId !== frame.attemptId) return;
+    if (frame.type === "end") {
+      this.#flushLive();
+      this.#clearLive();
+      return;
+    }
+    if (typeof frame.text !== "string") return;
+    if (frame.kind === "reasoning") live.reasoning += frame.text;
+    else live.text += frame.text;
+    if (live.timer !== undefined) return;
+    // Coalesce token deltas so a long answer does not republish the whole row
+    // hundreds of times; 40ms still reads as continuous typing.
+    live.timer = setTimeout(() => {
+      const current = this.#live;
       if (current === undefined) return;
-      const frame = current.frames[current.index];
-      if (frame === undefined) {
-        this.#finishStreamReplay();
-        return;
-      }
-      current.lastText = frame.text;
-      this.#emitItem({ ...current.item, text: frame.text });
-      current.index += 1;
-      this.#scheduleStreamReplay();
-    }, Math.max(0, next.at - previousAt));
-    this.#replayTimer.unref?.();
+      current.timer = undefined;
+      this.#flushLive();
+    }, 40);
+    live.timer.unref?.();
   }
 
-  /** Land the final text, flush held-back items and complete the turn. */
-  #finishStreamReplay(): void {
-    const replay = this.#streamReplay;
-    if (replay === undefined) return;
-    this.#streamReplay = undefined;
-    if (this.#replayTimer !== undefined) {
-      clearTimeout(this.#replayTimer);
-      this.#replayTimer = undefined;
+  /** Publish the accumulated live text as the message row's current snapshot. */
+  #flushLive(): void {
+    const live = this.#live;
+    if (live === undefined) return;
+    if (live.timer !== undefined) {
+      clearTimeout(live.timer);
+      live.timer = undefined;
     }
-    if (replay.lastText !== replay.item.text) this.#emitItem(replay.item);
-    for (const item of replay.deferred) this.#emitItem(item);
-    if (this.#pendingIdle) {
-      this.#pendingIdle = false;
-      this.#completeTurn();
+    // The thinking row must exist before the answer row, matching the durable
+    // order; otherwise the late reasoning item would land below the answer.
+    if (live.reasoning !== "" && live.reasoning !== live.emittedReasoning) {
+      live.emittedReasoning = live.reasoning;
+      this.#emitItem({
+        type: "reasoning",
+        id: `reasoning:${live.turn}:${live.step}`,
+        text: live.reasoning,
+      });
     }
+    if (live.text === "" || live.text === live.emitted) return;
+    live.emitted = live.text;
+    this.#emitItem({
+      type: "assistant_message",
+      id: `assistant:${live.turn}:${live.step}`,
+      text: live.text,
+    });
   }
 
-  /** Drop an in-flight reveal without emitting anything further. */
-  #abortStreamReplay(): void {
-    if (this.#replayTimer !== undefined) {
-      clearTimeout(this.#replayTimer);
-      this.#replayTimer = undefined;
-    }
-    this.#streamReplay = undefined;
-    this.#pendingIdle = false;
+  /** Forget the live buffer without flushing it (interrupt, exit, close). */
+  #clearLive(): void {
+    const live = this.#live;
+    if (live?.timer !== undefined) clearTimeout(live.timer);
+    this.#live = undefined;
   }
 
   /**
