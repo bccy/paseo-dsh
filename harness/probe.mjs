@@ -120,7 +120,14 @@ async function main() {
   log('--- initialize ---');
   // No provider/model: the bridge falls back to the profile's own default, so
   // this probe stays valid on any machine.
-  const init = await request('initialize', { cwd: process.cwd() });
+  //
+  // `sessionId` is required, not optional convenience: one `dsh` child serves
+  // every Paseo session, and `initialize` is what pins cwd/route FOR ONE
+  // session. Without it the bridge has no route for `SESSION_ID`, so the very
+  // next `session/prompt` is refused with "not initialized for session …".
+  // That refusal is the cross-talk guard working, so the fix belongs here —
+  // every other request in this file already carries the id.
+  const init = await request('initialize', { cwd: process.cwd(), sessionId: SESSION_ID });
   log('initialize ->', JSON.stringify(init));
 
   log('\n--- session/prompt ---');
