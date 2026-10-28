@@ -349,6 +349,7 @@ patch 是本插件自己的发布计数；完整提交记录见
 
 | 版本 | 日期 | 更新内容 |
 | --- | --- | --- |
+| [0.2.13](https://www.npmjs.com/package/paseo-dsh/v/0.2.13) | 2026-10-28 | **统计行信息升级**：收起时常驻 `N 轮 N 步 · 首字 · tok/s · 总 tokens · 缓存命中`，口径与 DSH Web 一致（总量 = 未缓存输入 + 缓存读取 + 缓存写入 + 输出；命中 = 缓存读取 ÷ 输入侧总量）；恢复会话时会从历史日志重新累计轮/步/tokens。点开仍是上下文、Tokens、路由、工具详情。 |
 | [0.2.12](https://www.npmjs.com/package/paseo-dsh/v/0.2.12) | 2026-10-28 | **回答真流式**：改订阅 DSH 的 `agent/assistant-stream` 瞬时帧（文本 + 推理），边生成边显示，不再等整段生成完再回放；首字出现的时刻就是模型吐出第一个字的时刻。<br>**回答统计行**：回答下方显示 `首字 xxx · xx tok/s`，点开可看上下文占用、输入/缓存/输出 tokens、路由与思考档位、工具次数与耗时；速度用 DSH 自己的 chunk 时间戳计算，整段突发的异常值直接丢弃。 |
 | [0.2.11](https://www.npmjs.com/package/paseo-dsh/v/0.2.11) | 2026-10-28 | **上下文用量**：输入框旁显示 `已用 / 上限`。bridge 新增 `paseo/usage`，占用取 DSH 的 `contextPressure`（无采样时用 `tokenMeter.measure()`），容量取当前路由的 `resolveModelInfo()`；会话打开/恢复、回合结束、切模型、压缩后刷新，恢复旧会话不用新回合就有数。<br>**回答逐字出现**：按 DSH 的 `data.stream` 分片重放文本，不再整段蹦出；`turn/end` 等到重放结束，打断/新消息/进程退出立即落地。<br>**安装兼容 Paseo 0.9–0.11**：去掉 `@getpaseo/protocol` 的 type-only 导入（改成插件内 `JsonValue`），旧版安装器不再因解析不到类型而失败。 |
 | [0.2.10](https://www.npmjs.com/package/paseo-dsh/v/0.2.10) | 2026-10-27 | **附件不再拖垮会话**：`uploaded_file`、review、GitHub/forge 附件降级成文本引用（文件名 / 类型 / 大小 / 路径，或 title / url / body），模型仍能读到；内容块转换移进 `try`，单条消息失败不再升级成 `session.runtime_failed`。<br>**目录概览**：补 `OVERVIEW.md` 与包描述，paseo.sh 的插件页能正确介绍能力与限制。 |
