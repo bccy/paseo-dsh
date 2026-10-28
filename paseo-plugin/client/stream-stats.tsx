@@ -77,6 +77,7 @@ function StreamStatsRow({ item, theme, layout }: PluginTimelineItemProps<StreamS
   if (data.turns !== undefined && data.steps !== undefined) {
     summary.push(`${data.turns} 轮 ${data.steps} 步`);
   }
+  if (data.firstTokenMs !== undefined) summary.push(`首字 ${formatLatency(data.firstTokenMs)}`);
   if (data.tokensPerSecond !== undefined) summary.push(`${Math.round(data.tokensPerSecond)} tok/s`);
   if (data.sessionTokens !== undefined) summary.push(`${formatCompact(data.sessionTokens)} tok`);
   if (data.cacheHit !== undefined) summary.push(`缓存命中 ${Math.round(data.cacheHit * 100)}%`);
@@ -85,9 +86,7 @@ function StreamStatsRow({ item, theme, layout }: PluginTimelineItemProps<StreamS
   }
   if (summary.length === 0) return null;
 
-  const latencyLine =
-    data.firstTokenMs === undefined ? undefined : `首字  ${formatLatency(data.firstTokenMs)}`;
-  const details = [latencyLine, contextLine(data), tokensLine(data), routeLine(data), toolsLine(data)].filter(
+  const details = [contextLine(data), tokensLine(data), routeLine(data), toolsLine(data)].filter(
     (line): line is string => line !== undefined,
   );
   const fontSize = layout.compact ? 10 : 11;

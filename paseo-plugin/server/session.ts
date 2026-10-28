@@ -108,7 +108,7 @@ export class DshSession {
    * makes the answer appear while the model is still writing it.
    */
   /** Session totals shown in the collapsed stats line. */
-  #totals = { input: 0, cache: 0, output: 0 };
+  #totals = { input: 0, cache: 0, cacheWrite: 0, output: 0 };
   #seenTurns = new Set<number>();
   #seenSteps = new Set<string>();
   /** Tool call start times and the current turn's tool total. */
@@ -768,13 +768,20 @@ export class DshSession {
     if (usage === undefined) return;
     if (typeof usage.inputTokens === "number") this.#totals.input += usage.inputTokens;
     if (typeof usage.cacheReadTokens === "number") this.#totals.cache += usage.cacheReadTokens;
+    if (typeof usage.cacheWriteTokens === "number") this.#totals.cacheWrite += usage.cacheWriteTokens;
     if (typeof usage.outputTokens === "number") this.#totals.output += usage.outputTokens;
   }
 
-  /** Turns, steps, total tokens and cache-hit rate for the collapsed line. */
+  /**
+   * Turns, steps, total tokens and cache-hit rate for the collapsed line.
+   *
+   * Mirrors DSH's own UsagePill: the total is the three prompt-side billing
+   * buckets plus output, and the cache rate divides cache reads by that same
+   * prompt-side total.
+   */
   #sessionFields(): Record<string, number> {
-    const tokens = this.#totals.input + this.#totals.cache + this.#totals.output;
-    const promptTokens = this.#totals.input + this.#totals.cache;
+    const promptTokens = this.#totals.input + this.#totals.cache + this.#totals.cacheWrite;
+    const tokens = promptTokens + this.#totals.output;
     return {
       turns: this.#seenTurns.size,
       steps: this.#seenSteps.size,
