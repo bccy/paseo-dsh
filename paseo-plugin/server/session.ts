@@ -687,7 +687,10 @@ export class DshSession {
     const usage = isRecord(data.usage) ? data.usage : undefined;
     const outputTokens = typeof usage?.outputTokens === "number" ? usage.outputTokens : undefined;
     const firstTokenMs = stats.firstTokenAt - stats.startedAt;
-    const span = (stats.endedAt ?? stats.firstTokenAt) - stats.firstTokenAt;
+    // DSH commits the durable assistant message before it publishes the end
+    // frame, so `endedAt` is usually not known yet. The message itself is the
+    // step's end for timing purposes.
+    const span = (stats.endedAt ?? Date.now()) - stats.firstTokenAt;
     const tokensPerSecond =
       outputTokens !== undefined && span > 0 ? outputTokens / (span / 1000) : undefined;
     const turn = typeof data.turn === "number" ? data.turn : stats.turn;

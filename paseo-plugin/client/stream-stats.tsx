@@ -21,7 +21,7 @@ function StreamStatsRow({ item, theme, layout }: PluginTimelineItemProps<StreamS
   if (item.data.tokensPerSecond !== undefined) parts.push(`${item.data.tokensPerSecond.toFixed(1)} tok/s`);
   if (parts.length === 0) return null;
   return (
-    <View style={{ flexDirection: "row", alignItems: "center", marginTop: 2, marginBottom: layout.compact ? 6 : 10 }}>
+    <View style={{ flexDirection: "row", alignItems: "center", marginTop: 0, marginBottom: 0, paddingLeft: 2 }}>
       <Text style={{ color: theme.colors.foregroundMuted, fontSize: layout.compact ? 10 : 11 }}>
         {parts.join(" · ")}
       </Text>
