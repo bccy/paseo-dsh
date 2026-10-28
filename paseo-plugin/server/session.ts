@@ -107,6 +107,10 @@ export class DshSession {
    * durable log only carries one complete message per step, so this is what
    * makes the answer appear while the model is still writing it.
    */
+  /** Per-step timing for the streamed-stats row. */
+  #streamStats:
+    | { turn: number; step: number; startedAt: number; firstTokenAt?: number; endedAt?: number }
+    | undefined;
   #live:
     | {
         attemptId: string;
@@ -666,6 +670,40 @@ export class DshSession {
     // authoritative final snapshot and simply replaces it.
     if (event.type === "assistant/message") this.#flushLive();
     for (const item of this.#timeline.consume(event)) this.#emitItem(item);
+    if (event.type === "assistant/message") this.#emitStreamStats(isRecord(event.data) ? event.data : {});
+  }
+
+  /**
+   * Publish the per-step latency and throughput row beneath the answer.
+   *
+   * The numbers are measured from DSH's live frames, so a route that does not
+   * stream (no frames) simply gets no row instead of a fabricated duration.
+   * Output tokens come from the step's own usage record.
+   */
+  #emitStreamStats(data: Record<string, unknown>): void {
+    const stats = this.#streamStats;
+    this.#streamStats = undefined;
+    if (stats === undefined || stats.firstTokenAt === undefined) return;
+    const usage = isRecord(data.usage) ? data.usage : undefined;
+    const outputTokens = typeof usage?.outputTokens === "number" ? usage.outputTokens : undefined;
+    const firstTokenMs = stats.firstTokenAt - stats.startedAt;
+    const span = (stats.endedAt ?? stats.firstTokenAt) - stats.firstTokenAt;
+    const tokensPerSecond =
+      outputTokens !== undefined && span > 0 ? outputTokens / (span / 1000) : undefined;
+    const turn = typeof data.turn === "number" ? data.turn : stats.turn;
+    const step = typeof data.step === "number" ? data.step : stats.step;
+    this.#emitItem({
+      type: "plugin",
+      id: `stream-stats:${turn}:${step}`,
+      pluginId: "dsh-paseo",
+      kind: "dsh-stream-stats",
+      version: 1,
+      data: {
+        firstTokenMs,
+        ...(tokensPerSecond === undefined ? {} : { tokensPerSecond }),
+        ...(outputTokens === undefined ? {} : { outputTokens }),
+      },
+    });
   }
 
   #emitItem(item: ProviderTimelineItem): void {
@@ -684,6 +722,11 @@ export class DshSession {
     if (this.#closed) return;
     if (frame.type === "start") {
       this.#clearLive();
+      this.#streamStats = {
+        turn: frame.turn ?? 0,
+        step: frame.step ?? 0,
+        startedAt: Date.now(),
+      };
       this.#live = {
         attemptId: frame.attemptId,
         turn: frame.turn ?? 0,
@@ -701,9 +744,14 @@ export class DshSession {
     if (frame.type === "end") {
       this.#flushLive();
       this.#clearLive();
+      if (this.#streamStats !== undefined) this.#streamStats.endedAt = Date.now();
       return;
     }
     if (typeof frame.text !== "string") return;
+    const stats = this.#streamStats;
+    if (frame.kind === "text" && stats !== undefined && stats.firstTokenAt === undefined) {
+      stats.firstTokenAt = Date.now();
+    }
     if (frame.kind === "reasoning") live.reasoning += frame.text;
     else live.text += frame.text;
     if (live.timer !== undefined) return;

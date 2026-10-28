@@ -291,6 +291,17 @@ const check = (name, pass, detail) => {
     );
   }
 
+  // 1c. streamed stats: the row under an answer reports first-token latency and
+  // throughput measured from live frames, not from the finished step.
+  const stats = events.filter(
+    (e) => e.type === "timeline.item" && e.item?.type === "plugin" && e.item.kind === "dsh-stream-stats",
+  );
+  check(
+    "live frames produce a stream-stats row",
+    stats.length > 0 && typeof stats[0].item.data?.firstTokenMs === "number",
+    stats.length > 0 ? JSON.stringify(stats[0].item.data) : "no dsh-stream-stats item",
+  );
+
   // 2. the image block reached the model layer
   //
   // A text-only route makes DSH replace the image with a note saying so, and

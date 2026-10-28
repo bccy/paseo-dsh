@@ -1,0 +1,9 @@
+/**
+ * Minimal local declarations for the React Native primitives this plugin's
+ * client entry uses. Paseo supplies the real runtime modules; installing
+ * react-native here would only bloat the typecheck.
+ */
+declare module "react-native" {
+  export const View: any;
+  export const Text: any;
+}
