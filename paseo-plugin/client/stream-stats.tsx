@@ -32,13 +32,6 @@ function formatNumber(value: number): string {
   return String(Math.round(value)).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 
-function formatCompact(value: number): string {
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
-  if (value >= 10_000) return `${Math.round(value / 1000)}K`;
-  if (value >= 1000) return `${(value / 1000).toFixed(1)}K`;
-  return String(Math.round(value));
-}
-
 function contextLine(data: StreamStats): string | undefined {
   if (data.contextUsed === undefined || data.contextMax === undefined || data.contextMax <= 0) {
     return undefined;
@@ -79,7 +72,9 @@ function StreamStatsRow({ item, theme, layout }: PluginTimelineItemProps<StreamS
   }
   if (data.firstTokenMs !== undefined) summary.push(`首字 ${formatLatency(data.firstTokenMs)}`);
   if (data.tokensPerSecond !== undefined) summary.push(`${Math.round(data.tokensPerSecond)} tok/s`);
-  if (data.sessionTokens !== undefined) summary.push(`${formatCompact(data.sessionTokens)} tok`);
+  if (data.contextUsed !== undefined && data.contextMax !== undefined && data.contextMax > 0) {
+    summary.push(`上下文 ${Math.round(Math.min(1, data.contextUsed / data.contextMax) * 100)}%`);
+  }
   if (data.cacheHit !== undefined) summary.push(`缓存命中 ${Math.round(data.cacheHit * 100)}%`);
   if (summary.length === 0 && data.firstTokenMs !== undefined) {
     summary.push(`首字 ${formatLatency(data.firstTokenMs)}`);
