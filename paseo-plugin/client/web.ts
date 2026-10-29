@@ -88,9 +88,16 @@ export function measureFooterLift(
   if (node === null) return null;
   const anchor = locate(node);
   if (anchor === null) return null;
+  // Paseo appends the completed-turn footer at the end of the turn, so the
+  // stats row is sometimes *above* it rather than below. Only the footer
+  // carries the copy affordance; if the sibling above is the answer instead,
+  // there is nothing to tuck under and moving the row would overlap the text.
+  if (!/复制|copy/i.test(anchor.above.textContent ?? "")) return null;
   const footerBottom = lastTextBottom(anchor.above);
   if (footerBottom === null) return null;
   const naturalTop = anchor.frame.getBoundingClientRect().top - options.appliedLift;
+  // A row already above the footer has a negative gap here; leave it alone.
+  if (naturalTop < footerBottom) return null;
   const lift = options.gap - (naturalTop - footerBottom);
   return Math.max(options.maxLift, Math.min(0, Math.round(lift)));
 }
