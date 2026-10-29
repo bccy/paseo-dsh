@@ -30,13 +30,16 @@ const plugin = require("./index.server.js").default;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const events = [];
 let registration;
+let settingsRegistration;
 
 plugin({
   handle() {},
   registerProvider(r) {
     registration = r;
   },
-  registerSettings() {},
+  registerSettings(definition) {
+    settingsRegistration = definition;
+  },
   on() {},
   before() {},
 });
@@ -320,6 +323,30 @@ const check = (name, pass, detail) => {
     "turn-final stats row is flagged final",
     lastStats !== undefined && lastStats.item.data?.final === true,
     lastStats === undefined ? "no stats row" : JSON.stringify(lastStats.item.data),
+  );
+
+  // 1e. the row's geometry is settings, not constants: the settings screen
+  // writes them and the row reads them. The defaults have to stay the ones the
+  // row was drawn against (Paseo's footer: 6px above, 13px text), or a plugin
+  // with no stored settings would render a row that does not line up.
+  const settingsDefaults = (() => {
+    try {
+      return settingsRegistration?.schema?.parse({}) ?? null;
+    } catch {
+      return null;
+    }
+  })();
+  check(
+    "stats row geometry is registered as settings",
+    settingsRegistration?.id === "stream-stats" &&
+      settingsRegistration?.scope === "host" &&
+      settingsDefaults?.gapPx === 6 &&
+      settingsDefaults?.fontSize === 13,
+    JSON.stringify({
+      id: settingsRegistration?.id,
+      scope: settingsRegistration?.scope,
+      defaults: settingsDefaults,
+    }),
   );
 
   // 2. the image block reached the model layer
