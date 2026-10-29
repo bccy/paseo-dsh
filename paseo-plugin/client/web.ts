@@ -109,5 +109,9 @@ export function watchFooter(row: unknown, onResize: () => void): (() => void) | 
   if (Observer === undefined) return null;
   const observer = new Observer(onResize);
   observer.observe(anchor.above);
+  // The 12px between "latest turn" and "pushed down by a newer turn" can come
+  // from the container around this item rather than from the footer's own box.
+  // Watching the parent catches both without polling.
+  if (anchor.frame.parentElement !== null) observer.observe(anchor.frame.parentElement);
   return () => observer.disconnect();
 }

@@ -45,8 +45,13 @@ type StreamStats = z.infer<typeof streamStatsSchema>;
  */
 /** Paseo's `SPACING[8]` (`TURN_FOOTER_BOTTOM_SPACING`): the footer's bottom padding. */
 const TURN_FOOTER_BOTTOM_PADDING = 32;
-/** The furthest the row may pull up: the footer's own reserved padding. */
-const MAX_ROW_LIFT = -TURN_FOOTER_BOTTOM_PADDING;
+/**
+ * The furthest the row may pull up. Measured gaps can exceed Paseo's own 32px
+ * footer padding once a theme restyles the footer, so the cap is twice that:
+ * generous enough for themed footers, still bounded so a mis-measure cannot
+ * drag the row across the answer.
+ */
+const MAX_ROW_LIFT = -2 * TURN_FOOTER_BOTTOM_PADDING;
 /** Paseo's footer sets its text in a 18px line box at 13px. */
 const LINE_HEIGHT_RATIO = 18 / 13;
 
@@ -105,9 +110,16 @@ function StreamStatsRow({ item, theme, layout }: PluginTimelineItemProps<StreamS
   const fontSize = settings.status === "ready" ? settings.values.fontSize : DEFAULT_STREAM_STATS.fontSize;
   const data = item.data;
 
+  // The ref must describe the margin the DOM actually carries, not the one a
+  // pending render is about to apply: a ResizeObserver callback between
+  // `setLift` and its commit would otherwise discount a lift the frame has not
+  // moved by yet and measure against the wrong origin.
+  useLayoutEffect(() => {
+    appliedLift.current = lift;
+  }, [lift]);
+
   const applyLift = (next: number) => {
     if (appliedLift.current === next) return;
-    appliedLift.current = next;
     setLift(next);
   };
 
