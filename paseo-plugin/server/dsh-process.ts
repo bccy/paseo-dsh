@@ -419,8 +419,37 @@ type GatewayServerConfig =
   | { url: string; headers?: Record<string, string> }
   | { command: string; args?: string[]; env?: Record<string, string> };
 
-/** DSH's `serverName` contract: a tool-name namespace, not a free-form label. */
+/**
+ * DSH's `serverName` contract: a tool-name namespace, not a free-form label.
+ *
+ * It applies to **one** path only — a server mounted through the native
+ * `dsh-mcp-client`, where DSH builds tool names as `mcp__<serverName>__<tool>`,
+ * so the name has to be usable as an identifier fragment. A server that rides the
+ * gateway never becomes a tool namespace (its tools are reached through
+ * `mcp_call_tool` and addressed by string), and the gateway's own `Config` is a
+ * plain dict that accepts any key — measured: `foo.bar`, `com.acme.tools`,
+ * `my server` and even a CJK name all validate there.
+ *
+ * Applying it to every server was a defect with an outsized symptom: Paseo does
+ * not restrict server names either (`z.record(z.string(), McpServerConfigSchema)`
+ * plus a duplicate check), so a user or plugin that configured `com.acme.tools`
+ * as an HTTP server could not open the session **at all** — not even with Paseo's
+ * own tools, because this throws during `attachSession`.
+ */
 const MCP_SERVER_NAME = /^[A-Za-z0-9_-]{1,32}$/;
+
+/**
+ * Keys that must not be used as a gateway server name.
+ *
+ * `__proto__` is the only one that matters and it is not a style preference: the
+ * gateway's `config.servers` is a dictionary built from this object, and a
+ * `__proto__` key does not behave like a key in a JavaScript object — it either
+ * mutates the prototype or silently vanishes from `Object.keys`, which is the
+ * "server quietly disappeared" failure this whole translation layer is supposed
+ * to prevent. Refusing it by name is the loud half of that choice; the silent
+ * half (a `proxied` map with a prototype) is fixed by `Object.create(null)`.
+ */
+const RESERVED_MCP_SERVER_NAMES: ReadonlySet<string> = new Set(["__proto__"]);
 
 /**
  * Name of the browser bridge entry this plugin injects itself.
@@ -530,39 +559,125 @@ function browserWorkspaceId(
  * @returns a stdio MCP server entry, or `undefined` when the bridge cannot be located.
  */
 export function browserMcpServer(cwd: string): DshMcpServer | undefined {
+  return resolveBrowserMcpServer(cwd).server;
+}
+
+/**
+ * Validate a session's MCP servers **before** anything is spawned for it.
+ *
+ * `attachSession` already translates the entries, and that translation is what
+ * rejects an unmountable server — but `attachSession` runs *after*
+ * `acquireProcess()` (`session.ts` `open()`), so on a cold pool a refused open has
+ * already spawned a `dsh` child and validated its route before the rejection is
+ * even reached. The child is retired ~4 s later, so nothing leaks, but the work is
+ * pointless and — worse — the assertion that used to guard it was written against
+ * the warm pool, where no spawn happens anyway, so it could not fail.
+ *
+ * This runs the same translation early and discards the result. Same function, so
+ * the two answers cannot disagree: a pre-check that disagreed with the real one
+ * would be a new class of bug (an open rejected for a server that would have
+ * mounted, or accepted for one that then fails).
+ *
+ * No browser injection here on purpose: `browserMcpServer()` is this plugin's own
+ * construction and cannot be unmountable, and calling it would emit a second
+ * stderr line for every session that has no browser. An entry Paseo itself
+ * supplies under the same name takes precedence anyway (see
+ * {@link sessionMcpEntries}), so the name is validated as a plain entry — which is
+ * exactly what `attachSession` will do with it.
+ *
+ * @param servers - the MCP servers Paseo attached to this session, if any.
+ * @throws when a server cannot be represented in DSH (same message as the mount).
+ */
+export function validateMcpServers(
+  servers: Readonly<Record<string, DshMcpServer>> | undefined,
+): void {
+  if (servers === undefined) return;
+  mcpEntries(servers, new Set());
+}
+
+/**
+ * Why this session has no browser MCP server **although one should be there**.
+ *
+ * The distinction this function exists to draw:
+ *
+ * - **The browser plugin is not installed.** `mcp-bridge.mjs` is absent, so there
+ *   is no browser capability to be missing. This returns `undefined`: a timeline
+ *   warning on every open of every session would be noise, and worse than noise —
+ *   it would tell a user who never installed Server Browser that something is
+ *   broken. The stderr line stays (it is what a developer diagnosing a profile
+ *   needs), but the timeline stays quiet.
+ * - **The plugin is installed and this session still cannot use it.** The bridge
+ *   file is there, and the failure is per-session: the cwd maps to no single live
+ *   Paseo workspace, or the registry cannot be read. That is a real, actionable
+ *   difference — the user has the feature, expects it, and this session silently
+ *   lacks it. The provider turns this into an open warning.
+ *
+ * Recomputing rather than widening `browserMcpServer`'s return type is deliberate:
+ * the fail-open contract is "undefined, never throws", and a richer return value
+ * would invite callers to branch on the reason and eventually to throw. The
+ * resolution is one `existsSync` plus one registry read, and the provider only
+ * calls it when it is about to emit warnings anyway.
+ *
+ * @param cwd - the session's working directory, as passed to `dsh`.
+ * @returns the reason when the bridge exists but cannot be mounted here, else
+ *   `undefined` — including when the browser plugin is simply not installed.
+ */
+export function browserMcpGap(cwd: string): string | undefined {
+  return resolveBrowserMcpServer(cwd).gap;
+}
+
+/**
+ * Locate the browser bridge once, keeping the reason when it cannot be used here.
+ *
+ * One implementation for both public views above, so "there is no bridge" and
+ * "here is why there is no bridge" can never disagree — which they would if the
+ * reason were re-derived by a second copy of these checks.
+ *
+ * `gap` is set **only** when the bridge exists and this session cannot mount it;
+ * an absent bridge is reported to stderr and yields no gap, because "you never
+ * installed the browser plugin" is not a per-session failure. See
+ * {@link browserMcpGap}.
+ *
+ * @param cwd - the session's working directory.
+ * @returns the entry, or the reason a present bridge could not be used.
+ */
+function resolveBrowserMcpServer(cwd: string): { server?: DshMcpServer; gap?: string } {
+  const env = process.env;
+  const dataRoot = browserDataRoot(env);
+  const bridge = join(dataRoot, "mcp-bridge.mjs");
+  // A profile without the browser plugin would otherwise mount a server whose
+  // command fails at spawn time; DSH reports that as "did not activate", which
+  // reads like a plugin bug rather than an absent feature. Logged and NOT turned
+  // into a gap: see this function's doc comment.
+  if (!existsSync(bridge)) {
+    logBrowserGap(`bridge not found at ${bridge}`);
+    return {};
+  }
   try {
-    const env = process.env;
-    const dataRoot = browserDataRoot(env);
-    const bridge = join(dataRoot, "mcp-bridge.mjs");
-    // A profile without the browser plugin would otherwise mount a server whose
-    // command fails at spawn time; DSH reports that as "did not activate", which
-    // reads like a plugin bug rather than an absent feature.
-    //
-    // Every early return below says why on stderr, because fail-open must not turn
-    // into fail-silent: when a session has no browser tools, this function is the
-    // only place that knows the reason, and "the feature quietly is not there" is
-    // precisely the silent-degradation class this repo keeps re-learning (see
-    // docs/FIELD-NOTES.md). The provider forwards stderr to the daemon log.
-    if (!existsSync(bridge)) {
-      logBrowserGap(`bridge not found at ${bridge}`);
-      return undefined;
-    }
     const workspaceId = browserWorkspaceId(cwd, paseoHome(env), env);
     if (workspaceId === undefined) {
-      logBrowserGap(`cwd ${cwd} maps to no single live Paseo workspace`);
-      return undefined;
+      const reason = `cwd ${cwd} maps to no single live Paseo workspace`;
+      logBrowserGap(reason);
+      return {
+        gap: `工作目录 ${cwd} 没有唯一对应的活动 Paseo 工作区`
+          + `（${join(paseoHome(env), "projects", "workspaces.json")}）`,
+      };
     }
     return {
-      type: "stdio",
-      command: process.execPath,
-      args: [bridge, join(dataRoot, workspaceId, "session.json")],
+      server: {
+        type: "stdio",
+        command: process.execPath,
+        args: [bridge, join(dataRoot, workspaceId, "session.json")],
+      },
     };
   } catch (error) {
     // Deliberately swallowed: see the fail-open note above. Logged so an
     // unreadable registry or a malformed file is diagnosable instead of looking
-    // like a feature this build simply does not have.
-    logBrowserGap(error instanceof Error ? error.message : String(error));
-    return undefined;
+    // like a feature this build simply does not have. This one IS a gap: the
+    // bridge is installed, so the capability was expected here.
+    const message = error instanceof Error ? error.message : String(error);
+    logBrowserGap(message);
+    return { gap: `读取 Paseo 工作区注册表失败：${message}` };
   }
 }
 
@@ -584,9 +699,23 @@ export interface DshMcpEntry {
 }
 
 /**
+ * The transport string one entry names, verbatim, for the refusal message.
+ *
+ * Reading the raw value rather than a narrowed union is the point: the whole
+ * class of defect here is a `type` that is not one of the three known strings, and
+ * a helper that returned a union would have to collapse that case into a default.
+ * `DshMcpServer` declares the type as required, so the cast is only to keep a
+ * malformed frame from being a type error at the call site — the runtime value is
+ * whatever Paseo (or a contributing plugin) actually sent.
+ */
+function rawTransportType(server: DshMcpServer): unknown {
+  return (server as { type?: unknown }).type;
+}
+
+/**
  * Translate Paseo's MCP servers into the entries the bridge mounts.
  *
- * Streamable-HTTP servers and the whitelisted stdio servers ride the gateway
+ * Streamable-HTTP servers and the self-injected browser bridge ride the gateway
  * (one row, three tools). Every other stdio server keeps the stock client: it was
  * configured by the user, and dropping it — or quietly demoting it to discovery
  * calls — would remove capability they asked for. Legacy SSE stays refused.
@@ -596,24 +725,51 @@ export interface DshMcpEntry {
  * has to call `ctx.plugin(await import(entry.name), entry.config)` and never
  * learns which plugin is the gateway — the whitelist and the native/refused
  * decision stay here, in the layer that owns the translation.
+ *
+ * @param servers - the session's MCP servers, browser bridge already merged in.
+ * @param selfInjected - names this plugin produced itself (see
+ *   {@link sessionMcpEntries}); only those may be proxied as whitelisted stdio.
+ * @throws when a server cannot be represented in DSH, or names an unknown
+ *   transport. Every message names the server and none of them quotes `env`,
+ *   `args` or `headers`, because those carry credentials.
  */
 function mcpEntries(
   servers: Readonly<Record<string, DshMcpServer>>,
+  selfInjected: ReadonlySet<string>,
 ): DshMcpEntry[] {
   const entries: DshMcpEntry[] = [];
-  const proxied: Record<string, GatewayServerConfig> = {};
+  // Null-prototype on purpose: a server literally named `__proto__` must either be
+  // a normal key here or be refused loudly — it must never silently vanish from
+  // `Object.keys` because it hit a setter on `Object.prototype`. It is refused
+  // below (RESERVED_MCP_SERVER_NAMES) AND this map cannot be poisoned; both halves
+  // are kept because either one alone leaves a way for a server to disappear.
+  const proxied: Record<string, GatewayServerConfig> = Object.create(null) as Record<
+    string,
+    GatewayServerConfig
+  >;
   for (const [name, server] of Object.entries(servers)) {
-    if (!MCP_SERVER_NAME.test(name)) {
+    if (RESERVED_MCP_SERVER_NAMES.has(name)) {
       throw new Error(
-        `MCP server "${name}" cannot be mounted in DSH: a serverName must match ${MCP_SERVER_NAME.source}`,
+        `MCP server name "${name}" cannot be used: it is reserved by JavaScript's object model `
+          + 'and would not survive the gateway\'s configuration map',
       );
     }
     if (server.type === "stdio") {
-      if (GATEWAY_STDIO_SERVERS.has(name)) {
-        // Whitelisted: the gateway spawns it and speaks JSON-RPC over its stdio,
-        // so the tools cost three meta-schemas instead of one schema each. `env`
-        // and `args` pass through untouched — the browser bridge needs both the
-        // session-file path and the daemon's environment to find its Chromium.
+      // Only this branch needs the identifier-shaped name: it becomes a DSH tool
+      // namespace (`mcp__<serverName>__<tool>`). See {@link MCP_SERVER_NAME}.
+      if (!MCP_SERVER_NAME.test(name)) {
+        throw new Error(
+          `MCP server "${name}" cannot be mounted in DSH: a serverName must match ${MCP_SERVER_NAME.source}`,
+        );
+      }
+      // Whitelisted **and** self-injected. The name alone was not enough: a user
+      // who configures their own stdio server called `server_browser` was proxied
+      // too, silently demoting their full tool surface to three-step discovery.
+      // The whitelist is about *this plugin's* wide, rarely-called bridge, not
+      // about a string.
+      if (GATEWAY_STDIO_SERVERS.has(name) && selfInjected.has(name)) {
+        // `env` and `args` pass through untouched — the browser bridge needs both
+        // the session-file path and the daemon's environment to find its Chromium.
         proxied[name] = {
           command: server.command,
           ...(server.args === undefined ? {} : { args: server.args }),
@@ -647,10 +803,26 @@ function mcpEntries(
           + ' (only "stdio" and Streamable HTTP)',
       );
     }
-    proxied[name] = {
-      url: server.url,
-      ...(server.headers === undefined ? {} : { headers: server.headers }),
-    };
+    if (server.type === "http") {
+      proxied[name] = {
+        url: server.url,
+        ...(server.headers === undefined ? {} : { headers: server.headers }),
+      };
+      continue;
+    }
+    // Unknown or missing `type` — the last branch, and a refusal rather than a
+    // guess. The previous behavior proxied it as Streamable HTTP, which opened the
+    // session successfully and deferred the failure to the first tool call, where
+    // the gateway's config error echoed the whole entry — including any
+    // `Authorization` header — into text the model can read. Neither the value nor
+    // the entry is quoted: the message names the server and the offending type,
+    // nothing else.
+    const named = rawTransportType(server);
+    throw new Error(
+      `MCP server "${name}" has an unsupported transport type `
+        + `${typeof named === "string" ? `"${named}"` : "(none)"}; expected "stdio" or "http" `
+        + '(legacy "sse" is not supported either)',
+    );
   }
   if (Object.keys(proxied).length > 0) {
     entries.push({ name: MCP_GATEWAY_PLUGIN, config: { servers: proxied } });
@@ -668,6 +840,13 @@ function mcpEntries(
  * Paseo's own entry wins on a name collision — a deployment that starts
  * injecting `server_browser` itself knows better than this heuristic.
  *
+ * The set of names this function injected is handed to {@link mcpEntries} as
+ * `selfInjected`, and that is what the gateway whitelist is checked against: a
+ * whitelist keyed on the name alone would also proxy a *user's* stdio server that
+ * happens to be called `server_browser`, which is the capability regression the
+ * whitelist exists to avoid. The provenance is only knowable here, so it is
+ * recorded here.
+ *
  * @param servers - the MCP servers Paseo attached to this session, if any.
  * @param cwd - the session's working directory; identifies the browser workspace.
  * @returns the entries to mount, empty when this session has none.
@@ -678,12 +857,16 @@ function sessionMcpEntries(
   cwd: string,
 ): DshMcpEntry[] {
   const merged: Record<string, DshMcpServer> = { ...(servers ?? {}) };
+  const selfInjected = new Set<string>();
   if (!Object.hasOwn(merged, BROWSER_MCP_SERVER)) {
     const browser = browserMcpServer(cwd);
-    if (browser !== undefined) merged[BROWSER_MCP_SERVER] = browser;
+    if (browser !== undefined) {
+      merged[BROWSER_MCP_SERVER] = browser;
+      selfInjected.add(BROWSER_MCP_SERVER);
+    }
   }
   if (Object.keys(merged).length === 0) return [];
-  return mcpEntries(merged);
+  return mcpEntries(merged, selfInjected);
 }
 
 export class DshProcess {

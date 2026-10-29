@@ -78,6 +78,29 @@ process.env.PASEO_SERVER_BROWSER_DATA = path.join(scratch, "no-browser-plugin");
 const frameLog = path.join(scratch, "frames.jsonl");
 process.env.DSH_FAKE_LOG = frameLog;
 
+// The scenario has to be switchable **after** the child is spawned, and a spawned
+// child's environment is frozen. That is not a detail of this script: the plugin
+// keeps ONE shared `dsh` child for the whole connection, so by the time the
+// `mcp-late` case below runs, the child has been alive for a dozen opens and
+// `process.env.DSH_FAKE_MODE = ...` cannot reach it. Measured: setting the env var
+// alone left the child in `live`, the `mcp/set` frame was accepted, and the session
+// reported ready — the assertion failed for a reason that had nothing to do with
+// the plugin.
+//
+// `DSH_FAKE_MODE_FILE` is the fake bridge's escape hatch: it re-reads the mode from
+// this file on every access, so writing it retargets the running child. The env var
+// stays set for the case where a *new* child is spawned (a fresh connection), and
+// both channels are kept in agreement by `setMode` below.
+const MODE_FILE = path.join(scratch, "fake-dsh-mode");
+process.env.DSH_FAKE_MODE_FILE = MODE_FILE;
+fs.writeFileSync(MODE_FILE, "live\n");
+
+/** Point the long-lived fake child at a new scenario, on both channels. */
+function setMode(value) {
+  process.env.DSH_FAKE_MODE = value;
+  fs.writeFileSync(MODE_FILE, `${value}\n`);
+}
+
 process.on("exit", () => {
   for (const dir of [process.env.DSH_HOME, scratch]) {
     try {
@@ -168,6 +191,75 @@ function gatewayServers(entries) {
   });
   conn.onEvent((event) => events.push(event));
 
+  // ---- COLD POOL: a refused open must not spawn a child first -------------
+  //
+  // This has to run **first**, before any session opens: the claim is that a
+  // refused open never spawns, and once one session has been opened the pool is
+  // warm and `acquireProcess()` reuses the existing child — so no spawn happens
+  // for *any* reason and the assertion passes without testing anything. That is
+  // exactly how the previous version of this block was written (it sat after six
+  // opens and pinned `newPids.length === 0` on a warm pool), which is why it could
+  // never fail.
+  //
+  // The observable is `initialize`: `DshProcess.start()` sends it, and nothing
+  // else does — the catalog/list probes are built with `initializeRoute: false`
+  // precisely so they never pin a route, so their pids appear in the frame log
+  // without an `initialize`. A zero count here therefore means no session-carrying
+  // child was ever started.
+  {
+    const pidsBefore = new Set(frames().map((frame) => frame.pid));
+    const coldSession = `mcp-cold-${Date.now()}`;
+    await conn.send({
+      type: "session.open",
+      requestId: `open-${coldSession}`,
+      sessionId: coldSession,
+      config: {
+        cwd: process.cwd(),
+        mode: "build",
+        mcpServers: { legacy: { type: "sse", url: "http://127.0.0.1:9999/sse" } },
+      },
+    });
+    const coldFailure = await until(
+      (e) => e.type === "request.failed" && e.requestId === `open-${coldSession}`,
+      "cold-pool sse request.failed",
+    );
+    await sleep(600);
+    const after = frames();
+    const coldInitializes = after.filter((frame) => frame.method === "initialize");
+    const coldCarriers = [...new Set(
+      after
+        .filter((frame) => frame.method === "initialize" || frame.method === "session/prompt")
+        .map((frame) => frame.pid),
+    )];
+    check(
+      "a refused open on a COLD pool fails loudly and names the server",
+      /legacy/.test(coldFailure.error?.message ?? "") && /sse/i.test(coldFailure.error?.message ?? ""),
+      coldFailure.error?.message,
+    );
+    check(
+      "…without spawning a DSH child first (cold pool)",
+      coldInitializes.length === 0 && coldCarriers.length === 0,
+      `${String(coldInitializes.length)} initialize frame(s), carrier pids [${coldCarriers.join(",")}], `
+        + `${String([...new Set(after.map((frame) => frame.pid))].filter((pid) => !pidsBefore.has(pid)).length)} new pid(s) (probes only)`,
+    );
+    check(
+      "…and the refused session emitted no mcp frame of its own",
+      mcpFramesFor(coldSession).length === 0,
+      `${String(mcpFramesFor(coldSession).length)} frame(s)`,
+    );
+    // The positive control for the observation itself: the next open *does* start a
+    // child, so "zero initialize frames" above cannot be "this script never sees
+    // initialize frames at all".
+    const controlSession = `mcp-cold-control-${Date.now()}`;
+    await open(controlSession, { github: { type: "stdio", command: "npx", args: ["-y", "server-github"] } });
+    const warmInitializes = frames().filter((frame) => frame.method === "initialize");
+    check(
+      "…while the next accepted open does start one (positive control)",
+      warmInitializes.length > 0 && coldInitializes.length === 0,
+      `${String(warmInitializes.length)} initialize frame(s) after the accepted open`,
+    );
+  }
+
   /** Open a session with these MCP servers and resolve with its frame's entries. */
   async function open(sessionId, mcpServers) {
     await conn.send({
@@ -244,34 +336,88 @@ function gatewayServers(entries) {
     JSON.stringify(stdioEntries.map((entry) => entry?.name)),
   );
 
-  // ---- a whitelisted stdio server is proxied by the gateway --------------
-  // Proxying is a capability trade (the tools become reachable only through the
-  // three meta-tools), so it is opt-in by name rather than applied to every
-  // stdio server. `server_browser` is the only entry today: its bridge is wide
-  // (25 tools, ~20 KB of schema in every request) and rarely called.
-  const browserSession = `mcp-browser-${Date.now()}`;
-  const browserEntries = await open(browserSession, {
+  // ---- a USER's stdio server named `server_browser` stays native ----------
+  //
+  // This is the reverse of what this block used to assert, and the reversal is
+  // the fix. The whitelist exists for **this plugin's own** browser bridge: it is
+  // wide (25 tools, ~20 KB of schema in every request) and rarely called, so
+  // proxying it trades a capability nobody misses for a schema nobody wants. None
+  // of that reasoning applies to a server a user configured, and the old check
+  // keyed on the name alone — so a user's own `server_browser` (a real case:
+  // `command: npx, args: ["-y", "@playwright/mcp@latest"]`) was silently proxied,
+  // demoting its full tool surface to three-step discovery. The provenance is the
+  // discriminator now, and this is the assertion that pins it.
+  const userBrowserSession = `mcp-user-browser-${Date.now()}`;
+  const userBrowserEntries = await open(userBrowserSession, {
     server_browser: {
       type: "stdio",
-      command: process.execPath,
-      args: ["/x/mcp-bridge.mjs", "/x/session.json"],
+      command: "npx",
+      args: ["-y", "@playwright/mcp@latest"],
       env: { PASEO_SERVER_BROWSER_RUNTIME: "/x/runtime" },
     },
   });
-  const browserServers = gatewayServers(browserEntries);
-  const browserServer = browserServers.server_browser;
+  const userBrowserNative = nativeEntries(userBrowserEntries);
   check(
-    "a whitelisted stdio server is proxied by the gateway, not mounted natively",
-    Object.keys(browserServers).join(",") === "server_browser" &&
-      nativeEntries(browserEntries).length === 0 &&
-      browserServer?.command === process.execPath &&
-      JSON.stringify(browserServer?.args) === JSON.stringify(["/x/mcp-bridge.mjs", "/x/session.json"]),
-    `gateway servers=[${Object.keys(browserServers).join(",")}] native=${String(nativeEntries(browserEntries).length)}`,
+    "a USER's stdio server named server_browser is mounted natively, not proxied",
+    gatewayEntry(userBrowserEntries) === undefined &&
+      userBrowserNative.length === 1 &&
+      userBrowserNative[0]?.config?.serverName === "server_browser" &&
+      userBrowserNative[0]?.config?.command === "npx" &&
+      JSON.stringify(userBrowserNative[0]?.config?.args) === JSON.stringify(["-y", "@playwright/mcp@latest"]),
+    `gateway=${JSON.stringify(Object.keys(gatewayServers(userBrowserEntries)))} `
+      + `native=${JSON.stringify(userBrowserNative.map((entry) => entry?.config?.serverName))}`,
   );
   check(
-    "a proxied stdio server keeps its env",
-    browserServer?.env?.PASEO_SERVER_BROWSER_RUNTIME === "/x/runtime",
-    `env=${JSON.stringify(browserServer?.env)}`,
+    "…and it keeps its env",
+    userBrowserNative[0]?.config?.env?.PASEO_SERVER_BROWSER_RUNTIME === "/x/runtime",
+    `env=${JSON.stringify(userBrowserNative[0]?.config?.env)}`,
+  );
+
+  // ---- the plugin's OWN browser bridge is still proxied ------------------
+  //
+  // The positive half, and the one that keeps the fix from over-shooting: with a
+  // real bridge on disk, `browserMcpServer()` injects `server_browser` itself and
+  // that entry must go to the gateway exactly as before. Built by materializing
+  // the three things it looks for — the bridge script, a Paseo workspace registry
+  // that maps this cwd to one live workspace, and the workspace's data directory —
+  // so this exercises the real resolution rather than a stubbed answer.
+  const browserTree = path.join(scratch, "browser-plugin");
+  const browserHome = path.join(scratch, "browser-paseo-home");
+  const workspaceId = "ws-check-1";
+  fs.mkdirSync(path.join(browserTree, workspaceId), { recursive: true });
+  fs.writeFileSync(path.join(browserTree, "mcp-bridge.mjs"), "// stand-in bridge\n");
+  fs.mkdirSync(path.join(browserHome, "projects"), { recursive: true });
+  fs.writeFileSync(
+    path.join(browserHome, "projects", "workspaces.json"),
+    JSON.stringify([{ workspaceId, cwd: process.cwd(), archivedAt: null }]),
+  );
+  const savedBrowserEnv = {
+    data: process.env.PASEO_SERVER_BROWSER_DATA,
+    home: process.env.PASEO_HOME,
+  };
+  process.env.PASEO_SERVER_BROWSER_DATA = browserTree;
+  process.env.PASEO_HOME = browserHome;
+  let ownBrowserEntries;
+  try {
+    ownBrowserEntries = await open(`mcp-own-browser-${Date.now()}`, undefined);
+  } finally {
+    if (savedBrowserEnv.data === undefined) delete process.env.PASEO_SERVER_BROWSER_DATA;
+    else process.env.PASEO_SERVER_BROWSER_DATA = savedBrowserEnv.data;
+    if (savedBrowserEnv.home === undefined) delete process.env.PASEO_HOME;
+    else process.env.PASEO_HOME = savedBrowserEnv.home;
+  }
+  const ownBrowserServers = gatewayServers(ownBrowserEntries);
+  const ownBrowserServer = ownBrowserServers.server_browser;
+  check(
+    "the plugin's own injected browser bridge is still proxied by the gateway",
+    Object.keys(ownBrowserServers).join(",") === "server_browser" &&
+      nativeEntries(ownBrowserEntries).length === 0 &&
+      ownBrowserServer?.command === process.execPath &&
+      Array.isArray(ownBrowserServer?.args) &&
+      String(ownBrowserServer.args[0]).endsWith("mcp-bridge.mjs"),
+    `gateway=[${Object.keys(ownBrowserServers).join(",")}] `
+      + `native=${String(nativeEntries(ownBrowserEntries).length)} `
+      + `args=${JSON.stringify(ownBrowserServer?.args ?? null)}`,
   );
 
   // ---- a mixed session keeps stdio native and coalesces HTTP into one row ----
@@ -311,13 +457,18 @@ function gatewayServers(entries) {
   });
   const tripleServers = Object.keys(gatewayServers(tripleEntries));
   const tripleNative = nativeEntries(tripleEntries);
+  const tripleNativeNames = tripleNative.map((entry) => entry?.config?.serverName).sort();
+  // Both user stdio servers stay native — including the one whose name happens to
+  // be on the whitelist, because it did not come from `browserMcpServer()`. Only
+  // the HTTP server is proxied. This is the bidirectional form: "the named one is
+  // proxied *because it is ours*" and "an identically named one that is not ours
+  // is not" have to hold at the same time, which neither single-server case can
+  // show.
   check(
-    "http and whitelisted stdio share one gateway row while user stdio stays native",
-    tripleServers.sort().join(",") === "paseo,server_browser" &&
-      tripleNative.length === 1 &&
-      tripleNative[0]?.config?.serverName === "github" &&
-      tripleNative[0]?.config?.command === "npx",
-    `proxied=[${tripleServers.join(",")}] native=[${tripleNative.map((entry) => entry?.config?.serverName).join(",")}]`,
+    "HTTP is proxied while BOTH user stdio servers — including the whitelisted name — stay native",
+    tripleServers.sort().join(",") === "paseo" &&
+      tripleNativeNames.join(",") === "github,server_browser",
+    `proxied=[${tripleServers.join(",")}] native=[${tripleNativeNames.join(",")}]`,
   );
 
   // ---- no servers still sends an empty list -----------------------------
@@ -337,20 +488,23 @@ function gatewayServers(entries) {
   //
   // The assertion that used to live here was `mcpFramesFor(sseSession).length === 0`:
   // a session refused at open can never emit `paseo/mcp/set`, so it was true by
-  // construction and could not fail. The real risk is the **process**: `open()`
-  // calls `acquireProcess()` (`paseo-plugin/server/session.ts:444`) before
-  // `attachSession` validates the MCP entries (`paseo-plugin/server/dsh-process.ts:786`),
-  // so a refused server can spawn a `dsh` child and only then be rejected. The
-  // observable is therefore the frame log's **pid**, and its `initialize` frame —
-  // the only proof that a new child process ran.
+  // construction and could not fail.
   //
-  // Measured (and it is why this block is written the way it is): with a *cold*
-  // pool the refused open does spawn a child (`initialize` from a new pid) and the
-  // provider retires it ~4 s later; with the **warm** pool this script has by now
-  // (six sessions already opened on this connection), no new pid appears at all.
-  // Both facts are pinned below: no new child, and — as the guard that keeps the
-  // first assertion honest — the child that serves every other session is still
-  // exactly the one pid that was already there.
+  // The **spawn** half of this claim now lives in the cold-pool block at the top of
+  // this file, and that is the only place it can live: `open()` calls
+  // `acquireProcess()` (`paseo-plugin/server/session.ts`) before `attachSession`
+  // validates the MCP entries, so a refused open *used to* spawn a `dsh` child and
+  // reject it afterwards. Measured before the fix: cold pool → `initialize` from a
+  // new pid, child retired ~4 s later; warm pool (six sessions already open) → no
+  // new pid, because `acquireProcess()` reuses the existing child. The old
+  // assertion here was written against the warm pool, so it held for *any*
+  // implementation — including the one it claimed to guard against. The provider
+  // now validates the entries before acquiring, which is what the cold-pool case
+  // pins.
+  //
+  // What remains here is the half that holds in either pool state: the refused
+  // session never reached the child, and the child serving every other session is
+  // still exactly the one pid that was already there.
   const pidsBeforeSse = new Set(frames().map((frame) => frame.pid));
   const initializesBeforeSse = frames().filter((frame) => frame.method === "initialize").length;
   const sseSession = `mcp-sse-${Date.now()}`;
@@ -464,6 +618,306 @@ function gatewayServers(entries) {
       gatewayServers(reopenedEntries).paseo?.url === "http://127.0.0.1:6767/mcp/agents?callerAgentId=check",
     `${String(beforeClose)} -> ${String(mcpFramesFor(reopenSession).length)} frame(s)`,
   );
+
+  // ---- a dotted name is fine for the gateway, refused for a native mount ---
+  //
+  // `MCP_SERVER_NAME` (`^[A-Za-z0-9_-]{1,32}$`) is DSH's tool-name namespace rule,
+  // and it only applies where DSH actually builds a tool namespace — the native
+  // `dsh-mcp-client` path, whose tools are `mcp__<serverName>__<tool>`. A server on
+  // the gateway never becomes a namespace (its tools are addressed by string
+  // through `mcp_call_tool`), and the gateway's own `Config` is a dict that accepts
+  // any key. Applying the rule to everything meant a user with `com.acme.tools`
+  // configured as HTTP could not open the session **at all** — the throw happens
+  // during `attachSession`, so Paseo's own 61 tools were lost too.
+  const dotHttpSession = `mcp-dot-http-${Date.now()}`;
+  const dotHttpEntries = await open(dotHttpSession, {
+    "com.acme.tools": { type: "http", url: "http://127.0.0.1:6767/mcp" },
+  });
+  check(
+    "a dotted name is accepted for an HTTP server and reaches the gateway",
+    gatewayServers(dotHttpEntries)["com.acme.tools"]?.url === "http://127.0.0.1:6767/mcp",
+    JSON.stringify(gatewayServers(dotHttpEntries)),
+  );
+  // The other half, and the reason the rule was not simply deleted: a dotted name
+  // still cannot be a native tool namespace. Refused by name, at open.
+  const dotStdioSession = `mcp-dot-stdio-${Date.now()}`;
+  await conn.send({
+    type: "session.open",
+    requestId: `open-${dotStdioSession}`,
+    sessionId: dotStdioSession,
+    config: {
+      cwd: process.cwd(),
+      mode: "build",
+      mcpServers: { "com.acme.tools": { type: "stdio", command: "npx", args: ["-y", "server-github"] } },
+    },
+  });
+  const dotStdioFailure = await until(
+    (e) => e.type === "request.failed" && e.requestId === `open-${dotStdioSession}`,
+    "dotted stdio request.failed",
+  );
+  check(
+    "…but the same dotted name is still refused for a native stdio mount, by name",
+    /com\.acme\.tools/.test(dotStdioFailure.error?.message ?? "")
+      && /serverName/i.test(dotStdioFailure.error?.message ?? ""),
+    dotStdioFailure.error?.message,
+  );
+
+  // ---- an unknown transport type is refused, and never echoes credentials ---
+  //
+  // `type` used to be the fall-through default: anything that was not `stdio` or
+  // `sse` was proxied as Streamable HTTP. So `type: "htpp"` opened the session
+  // successfully and the failure surfaced at the first tool call, where the
+  // gateway's own `Config` error quoted the entry — `headers` and all. These three
+  // cases pin the refusal, the naming, and the absence of a leak.
+  for (const [label, server] of [
+    ["a misspelled type", { type: "htpp", url: "http://127.0.0.1:7000/mcp" }],
+    ["a missing type", { url: "http://127.0.0.1:7000/mcp" }],
+    [
+      "a stdio-shaped entry with an unknown type",
+      { type: "websocket", command: "npx", args: ["-y", "server-github"], env: { SECRET: "s3cr3t" } },
+    ],
+  ]) {
+    const sessionId = `mcp-badtype-${label.replace(/\W+/g, "-")}-${Date.now()}`;
+    await conn.send({
+      type: "session.open",
+      requestId: `open-${sessionId}`,
+      sessionId,
+      config: {
+        cwd: process.cwd(),
+        mode: "build",
+        mcpServers: { weird: { ...server, headers: { Authorization: "Bearer SECRET-TOKEN-ABCDEF" } } },
+      },
+    });
+    const failure = await until(
+      (e) => e.type === "request.failed" && e.requestId === `open-${sessionId}`,
+      `${label} request.failed`,
+    );
+    const message = failure.error?.message ?? "";
+    check(
+      `${label} is refused loudly and names the server`,
+      /weird/.test(message) && /transport/i.test(message),
+      message,
+    );
+    check(
+      `…and the message leaks no credential (${label})`,
+      !message.includes("SECRET-TOKEN") && !message.includes("s3cr3t"),
+      message,
+    );
+    check(
+      `…and no mcp frame was sent for it (${label})`,
+      mcpFramesFor(sessionId).length === 0,
+      `${String(mcpFramesFor(sessionId).length)} frame(s)`,
+    );
+  }
+
+  // ---- `__proto__` cannot make a server vanish ---------------------------
+  //
+  // `proxied[name] = …` with `name === "__proto__"` used to hit the prototype
+  // setter instead of creating an own property, so the server disappeared from
+  // `Object.keys` — no stderr, no failure, nothing to debug. The choice made here
+  // is to refuse it by name: silently dropping a configured server is exactly the
+  // failure mode this translation layer exists to prevent, and a server called
+  // `__proto__` is not a case worth supporting. Both halves are pinned: the
+  // refusal is loud, and the map cannot be poisoned even if the guard were removed
+  // (it is `Object.create(null)`).
+  const protoSession = `mcp-proto-${Date.now()}`;
+  await conn.send({
+    type: "session.open",
+    requestId: `open-${protoSession}`,
+    sessionId: protoSession,
+    config: {
+      cwd: process.cwd(),
+      mode: "build",
+      mcpServers: JSON.parse('{"__proto__": {"type": "http", "url": "http://127.0.0.1:7000/mcp"}}'),
+    },
+  });
+  const protoFailure = await until(
+    (e) => e.type === "request.failed" && e.requestId === `open-${protoSession}`,
+    "__proto__ request.failed",
+  );
+  check(
+    "a server named __proto__ is refused by name instead of vanishing",
+    /__proto__/.test(protoFailure.error?.message ?? ""),
+    protoFailure.error?.message,
+  );
+
+  // ---- the browser fail-open says so on the timeline ---------------------
+  //
+  // `browserMcpServer()` returns `undefined` rather than throwing when the browser
+  // bridge cannot be mounted (a throw would take Paseo's own tools down with it),
+  // and the reason only ever reached stderr — the daemon's log, which the user
+  // never reads. The provider now turns the same answer into an open warning.
+  //
+  // **But only when the browser plugin is actually installed.** "The bridge file is
+  // not there" means this deployment has no Server Browser plugin at all, and
+  // warning about it on every session would be noise: the user is not missing a
+  // broken capability, they never had it, and there is nothing for them to act on.
+  // The three cases below are exactly that distinction, and the first one is the
+  // regression this section exists for: the first version returned a gap for every
+  // failure, so a machine without the plugin warned on every single open.
+  const browserNoticeOf = (list) => list.filter((event) => /浏览器/.test(event.notice?.title ?? ""));
+  {
+    // (1) No plugin at all → stderr only, no timeline warning.
+    const gapData = path.join(scratch, "definitely-not-a-browser-plugin");
+    const saved = process.env.PASEO_SERVER_BROWSER_DATA;
+    process.env.PASEO_SERVER_BROWSER_DATA = gapData;
+    let gapNotices;
+    try {
+      const gapSession = `mcp-browser-gap-${Date.now()}`;
+      const mark = events.length;
+      await open(gapSession, undefined);
+      await sleep(300);
+      gapNotices = events
+        .slice(mark)
+        .filter((event) => event.type === "session.notice" && event.sessionId === gapSession);
+    } finally {
+      if (saved === undefined) delete process.env.PASEO_SERVER_BROWSER_DATA;
+      else process.env.PASEO_SERVER_BROWSER_DATA = saved;
+    }
+    check(
+      "no browser plugin at all produces NO timeline warning (it would be noise on every open)",
+      browserNoticeOf(gapNotices).length === 0,
+      browserNoticeOf(gapNotices).map((event) => `${event.notice?.title} — ${event.notice?.description}`).join(" | ")
+        || "(no browser notice)",
+    );
+
+    // (2) The plugin IS installed but this session cannot use it → warn, with the
+    // reason. The tree below has a real `mcp-bridge.mjs`, and a workspace registry
+    // that maps a *different* directory, so the bridge exists and the mapping
+    // fails. This is the case the warning is for: the capability should be there
+    // and is not.
+    const unmappedTree = path.join(scratch, "browser-unmapped");
+    const unmappedHome = path.join(scratch, "browser-unmapped-home");
+    fs.mkdirSync(path.join(unmappedTree, "ws-other"), { recursive: true });
+    fs.writeFileSync(path.join(unmappedTree, "mcp-bridge.mjs"), "// stand-in bridge\n");
+    fs.mkdirSync(path.join(unmappedHome, "projects"), { recursive: true });
+    fs.writeFileSync(
+      path.join(unmappedHome, "projects", "workspaces.json"),
+      JSON.stringify([{ workspaceId: "ws-other", cwd: path.join(scratch, "somewhere-else"), archivedAt: null }]),
+    );
+    const savedUnmapped = { data: process.env.PASEO_SERVER_BROWSER_DATA, home: process.env.PASEO_HOME };
+    process.env.PASEO_SERVER_BROWSER_DATA = unmappedTree;
+    process.env.PASEO_HOME = unmappedHome;
+    let unmappedNotices;
+    try {
+      const unmappedSession = `mcp-browser-unmapped-${Date.now()}`;
+      const mark = events.length;
+      await open(unmappedSession, undefined);
+      await sleep(300);
+      unmappedNotices = events
+        .slice(mark)
+        .filter((event) => event.type === "session.notice" && event.sessionId === unmappedSession);
+    } finally {
+      if (savedUnmapped.data === undefined) delete process.env.PASEO_SERVER_BROWSER_DATA;
+      else process.env.PASEO_SERVER_BROWSER_DATA = savedUnmapped.data;
+      if (savedUnmapped.home === undefined) delete process.env.PASEO_HOME;
+      else process.env.PASEO_HOME = savedUnmapped.home;
+    }
+    const unmappedNotice = browserNoticeOf(unmappedNotices)[0];
+    check(
+      "an installed-but-unusable browser bridge DOES warn, and names the reason",
+      unmappedNotice !== undefined
+        && unmappedNotice.notice?.severity === "warning"
+        && /工作区/.test(unmappedNotice.notice?.description ?? ""),
+      unmappedNotice === undefined
+        ? `notices: ${JSON.stringify(unmappedNotices.map((event) => event.notice?.title))}`
+        : `${unmappedNotice.notice?.title} — ${unmappedNotice.notice?.description}`,
+    );
+
+    // The control: with a working bridge the warning must be absent. Without this,
+    // an unconditional warning would satisfy the assertion above.
+    const workingTree = path.join(scratch, "browser-working");
+    const workingHome = path.join(scratch, "browser-working-home");
+    const workingId = "ws-working-1";
+    fs.mkdirSync(path.join(workingTree, workingId), { recursive: true });
+    fs.writeFileSync(path.join(workingTree, "mcp-bridge.mjs"), "// stand-in bridge\n");
+    fs.mkdirSync(path.join(workingHome, "projects"), { recursive: true });
+    fs.writeFileSync(
+      path.join(workingHome, "projects", "workspaces.json"),
+      JSON.stringify([{ workspaceId: workingId, cwd: process.cwd(), archivedAt: null }]),
+    );
+    const savedEnv = {
+      data: process.env.PASEO_SERVER_BROWSER_DATA,
+      home: process.env.PASEO_HOME,
+    };
+    process.env.PASEO_SERVER_BROWSER_DATA = workingTree;
+    process.env.PASEO_HOME = workingHome;
+    let workingNotices;
+    try {
+      const workingSession = `mcp-browser-ok-${Date.now()}`;
+      const mark = events.length;
+      await open(workingSession, undefined);
+      await sleep(300);
+      workingNotices = events
+        .slice(mark)
+        .filter((event) => event.type === "session.notice" && event.sessionId === workingSession);
+    } finally {
+      if (savedEnv.data === undefined) delete process.env.PASEO_SERVER_BROWSER_DATA;
+      else process.env.PASEO_SERVER_BROWSER_DATA = savedEnv.data;
+      if (savedEnv.home === undefined) delete process.env.PASEO_HOME;
+      else process.env.PASEO_HOME = savedEnv.home;
+    }
+    check(
+      "…and a fully working browser bridge produces no warning either (control)",
+      browserNoticeOf(workingNotices).length === 0,
+      `notices: ${JSON.stringify(workingNotices.map((event) => event.notice?.title))}`,
+    );
+  }
+
+  // ---- a late `paseo/mcp/set` is a failed session preparation ------------
+  //
+  // The real bridge throws when `paseo/mcp/set` arrives after the session's agent
+  // exists: the entries cannot be mounted into a live agent scope, and answering
+  // `mounted: false` instead would be a promise it cannot keep. The plugin used to
+  // turn that answer into one stderr line, which meant "this session has no MCP
+  // tools for its whole life" was a log entry the user never sees. A throw now
+  // fails the session preparation — the open reports `request.failed` instead of
+  // reporting ready with a broken tool surface.
+  //
+  // `mcp-late` mode is the caller's assertion that the agent already exists; the
+  // stand-in has no agents, so it cannot observe that itself. See the fake bridge's
+  // mode comment.
+  {
+    setMode("mcp-late");
+    let lateEvents;
+    const lateSession = `mcp-late-${Date.now()}`;
+    try {
+      const mark = events.length;
+      await conn.send({
+        type: "session.open",
+        requestId: `open-${lateSession}`,
+        sessionId: lateSession,
+        config: {
+          cwd: process.cwd(),
+          mode: "build",
+          mcpServers: { github: { type: "stdio", command: "npx", args: ["-y", "server-github"] } },
+        },
+      });
+      // Either shape is loud; silence is what must not happen.
+      await sleep(1500);
+      lateEvents = events.slice(mark);
+    } finally {
+      setMode("live");
+    }
+    const ready = lateEvents.find(
+      (event) => event.type === "session.ready" && event.sessionId === lateSession,
+    );
+    const failed = lateEvents.find(
+      (event) => event.type === "request.failed" && event.requestId === `open-${lateSession}`,
+    );
+    check(
+      "a late paseo/mcp/set fails the session preparation loudly",
+      ready === undefined && failed !== undefined,
+      failed === undefined
+        ? `no request.failed (session.ready=${String(ready !== undefined)})`
+        : `request.failed: ${failed.error?.message}`,
+    );
+    check(
+      "…and the failure names the bridge's reason, not a generic error",
+      /agent was created/i.test(failed?.error?.message ?? ""),
+      failed?.error?.message ?? "(no message)",
+    );
+  }
 
   // ---- every session's frame went to the one shared child ----------------
   // This is what makes the per-session frame necessary in the first place, and it

@@ -63,6 +63,9 @@
  *   orphan   answer a prompt with a frame for the prompted session and one for a
  *            child of it, so a session detached in that window leaves held
  *            orphan frames behind. Drives `detachSession`'s cleanup (L1-6)
+ *   mcp-late refuse `paseo/mcp/set` the way the real bridge does when the
+ *            session's agent already exists (it throws; it does not answer
+ *            `mounted: false`). Drives the plugin's loud-failure path (L6-6)
  *
  * `DSH_FAKE_LOG` (a file path) records every request frame, so a test can assert
  * at the protocol boundary how many times a prompt was actually delivered.
@@ -1081,6 +1084,25 @@ async function handle(method, params, id) {
      * answer and the plugin's `mounted:false` logging path stays exercised.
      */
     case "paseo/mcp/set":
+      // `mcp-late` reproduces the real bridge's *refusal*, not its reply: a set
+      // that arrives after the session's agent exists cannot be mounted into a
+      // live agent scope, and `dsh-bridge/lib/server.js` throws there rather than
+      // answering `mounted: false`. The plugin used to only log that, which made
+      // "this session has no MCP tools for its whole life" a stderr line the user
+      // never sees. Its own handling of a throw is the thing under test
+      // (`harness/mcp-injection-check.cjs`).
+      //
+      // The stand-in has no agents, so it cannot observe "the agent exists". The
+      // mode is the caller's assertion that it does — which is the only way to
+      // reach this path offline, and keeps the default mode's behavior unchanged.
+      if (mode() === "mcp-late") {
+        throw new Error(
+          `paseo/mcp/set for session ${String(params?.sessionId)} arrived after its agent was created; `
+            + "its MCP servers cannot be mounted into a live agent scope. Close and reopen the session "
+            + `to mount ${Array.isArray(params?.entries) ? params.entries.length : 0} entr(y/ies) `
+            + "(they are queued for the next resume).",
+        );
+      }
       return { accepted: true, entries: Array.isArray(params?.entries) ? params.entries.length : 0, mounted: false };
     /**
      * Close one session's bridge-side state.

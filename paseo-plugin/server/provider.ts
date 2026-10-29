@@ -20,7 +20,14 @@ import {
   type ProviderRegistration,
   type ProviderThinkingOption,
 } from "@getpaseo/plugin/server/provider";
-import { DshProcess, type DshCatalog, type DshRevertResult, type DshRoute } from "./dsh-process";
+import {
+  browserMcpGap,
+  DshProcess,
+  validateMcpServers,
+  type DshCatalog,
+  type DshRevertResult,
+  type DshRoute,
+} from "./dsh-process";
 import { DshChildSession, DshSession, modes, parseRoute } from "./session";
 import { ParkedSessions, RELEASE_TIMEOUT_MS } from "./parked-sessions";
 import { effortLabel } from "./locale";
@@ -1049,6 +1056,18 @@ class DshConnection implements ProviderConnection {
       this.#emit({ type: "session.closed", sessionId: holder.id });
     }
 
+    // Validate this session's MCP servers **before** anything is spawned for it.
+    //
+    // `attachSession` is where a server DSH cannot mount is rejected, and it runs
+    // after `acquireProcess()` — so on a cold pool a refused open had already
+    // spawned a `dsh` child and validated its route before being rejected, then
+    // retired it ~4 s later. The child is not leaked, but the work is pointless
+    // and the guard that was supposed to prove "no spawn happens" was written
+    // against the warm pool, where no spawn happens for any reason, so it could
+    // never fail. Same translation function as the mount, so the two verdicts
+    // cannot disagree.
+    validateMcpServers(config.mcpServers);
+
     // The shared child can be retired and respawned while a session is opening,
     // and the old child's session-log write lock is released only when the OS
     // reaps the process. Spawning the next process into that window makes every
@@ -1242,6 +1261,24 @@ class DshConnection implements ProviderConnection {
           severity: "warning",
           title: "命令目录加载失败",
           description: `DSH 未返回命令/权限目录：${message}。斜杠菜单与权限选择器可能不可用。`,
+        });
+      }
+
+      // The browser MCP server is fail-open: `browserMcpServer()` returns
+      // `undefined` rather than throwing when it cannot locate the bridge, because
+      // a throw there would take Paseo's own 61 tools down with it. The cost of
+      // that choice is a session that quietly has no browser tools — the log line
+      // is on the daemon's stderr, which the user never sees. Say it on the
+      // timeline instead, with the reason, so "the agent can't drive the browser"
+      // is an explained state rather than a mystery. Checked *after* the agent
+      // exists: this warning is emitted with the other `openWarnings`, all of
+      // which need a live session to attach to.
+      const browserGap = browserMcpGap(config.cwd);
+      if (browserGap !== undefined) {
+        openWarnings.push({
+          severity: "warning",
+          title: "本会话没有浏览器工具",
+          description: `${browserGap}。浏览器 MCP 服务器未挂载，本次会话无法直接操作共享浏览器；其余工具不受影响。`,
         });
       }
 
