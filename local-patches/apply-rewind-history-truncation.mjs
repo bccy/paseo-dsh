@@ -336,80 +336,6 @@ const TURNID_CALL_RE =
 const TURNID_CONTEXTS = ["if (broadcastTimeline) {", "if (deferredBroadcast) {"];
 
 /**
- * The *third* target — and the second patch in the **same file** as the rewind
- * one.
- *
- * Paseo's `acceptChildEvent()` consumes a child session's `timeline.item`, its
- * **terminal** `session.turn`, and `runtime_failed` / `session.closed`.  It
- * explicitly drops `session.turn` with `state === "started"` (the `!==
- * "started"` guard on the branch), and the method has no `else`, so `started`
- * is discarded silently.
- *
- * A subagent card's `status` is therefore only ever set to `"running"` once —
- * by `attachChild()` on the first `session.opened`.  A second dispatch to the
- * same durable subagent (a DSH `spawn_teammate` member, or any resumed
- * subagent) emits a perfectly good `started` that the host throws away, so the
- * card stays on its previous terminal state and never shows "running" again.
- *
- * The plugin side is not at fault: `paseo-plugin/server/session.ts` emits
- * `session.turn started` unconditionally on every child turn, carrying the
- * child's own session id.  The drop is host-side and silent — the same class of
- * defect `docs/FIELD-NOTES.md` records under "宿主限制".
- *
- * The fix is two lines inside that branch: stop excluding `started`, and map it
- * to `"running"`.  `ProviderSubagentStore.apply()` treats `status` as sticky
- * (`status: event.status ?? previous?.status ?? "running"`), so a single upsert
- * restores the card without resending title / description / cwd.
- *
- * MARKER PREFIX — why this is *not* `LOCAL PATCH (paseo-dsh)`:
- * this patch and the rewind patch live in the **same file**, and
- * `countOccurrences()` is a plain substring scan.  A marker sharing the rewind
- * prefix would push the rewind marker count from 2 to 3+, so `applyRewindPatch()`
- * would immediately report `partially-patched` and refuse — on a file that is in
- * fact perfectly patched.  This marker therefore shares no prefix with `MARKER`.
- */
-const CHILDRUNNING_MARKER = "PATCH(paseo-dsh): child running";
-
-/**
- * Same file as the rewind target by default.  The env override exists only for
- * the self-test, and it *follows* `TARGET` rather than repeating the literal
- * path: a test that redirects the rewind target must not be able to leave this
- * one pointed at the live install.
- */
-const CHILDRUNNING_TARGET = process.env.REWIND_PATCH_CHILDRUNNING_TARGET ?? TARGET;
-
-/**
- * Anchor: the whole `acceptChildEvent()` method, from its signature to the
- * first closing brace at the method's own indentation.
- *
- * The body is matched **whole** (lazily, up to a same-indent `}`) rather than
- * by the two lines being edited.  Those two lines are short enough that another
- * method could plausibly contain an identical pair later, and a wrong-site patch
- * here would silently rewrite some other event branch — the failure mode this
- * whole script exists to avoid.  Nothing inside the body sits at the method's
- * own indentation, so the first same-indent `}` is its end.
- */
-const CHILDRUNNING_ANCHOR_RE =
-  /^([ \t]*)acceptChildEvent\(childId, event, snapshots\)[ \t]*\{[ \t]*\r?\n[\s\S]*?^\1\}[ \t]*\r?$/gm;
-
-/**
- * The guard line in its **pristine** form (what upstream ships).
- */
-const CHILDRUNNING_GUARD = 'if (event.type === "session.turn" && event.state !== "started") {';
-
-/**
- * The guard line in its **patched** form.  Accepted on input so a rebuild is
- * idempotent: the stale-body path removes the marker comments and re-runs the
- * apply, which sees this form rather than the pristine one.  Matching only the
- * pristine form would make "rebuild a stale patch" impossible — the very thing
- * the staleness check exists to enable.
- */
-const CHILDRUNNING_GUARD_PATCHED = 'if (event.type === "session.turn") {';
-
-/** The upsert that writes the card's status. Must appear exactly once. */
-const CHILDRUNNING_UPSERT = 'event: { type: "upsert", id: childId, status: event.state },';
-
-/**
  * Build the patched call.
  *
  * The timestamp ternary is kept verbatim (just moved into the object literal) so
@@ -708,10 +634,35 @@ function backupFromStatus() {
   } catch {
     return null;
   }
-  if (!["patched", "patched-on-new-upstream"].includes(status?.reason)) return null;
-  const backup = status?.backup;
-  if (typeof backup !== "string" || !existsSync(backup)) return null;
-  return backup;
+  // All three reasons mean "this file was built from that backup".  The third,
+  // `already-patched`, is the idempotent steady state: every daemon start
+  // rewrites the status file through it, so excluding it made this lookup return
+  // null almost always (see the comment on the already-patched branch).
+  const usable = ["patched", "patched-on-new-upstream", "already-patched"];
+  // The rewind verdict can live at the top level (the historical layout) or under
+  // `patches.rewind` (the combined layout, when a sibling target failed and the
+  // top-level reason came from it).  Either location counts.
+  const reason = usable.includes(status?.reason)
+    ? status.reason
+    : (usable.includes(status?.patches?.rewind?.reason) ? status.patches.rewind.reason : null);
+  if (reason === null) return null;
+  // Likewise the value itself: top-level `backup` first, `patches.rewind.backup`
+  // as the fallback.
+  for (const candidate of [status?.backup, status?.patches?.rewind?.backup]) {
+    if (typeof candidate === "string" && existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Best known "backup this build came from", preferring the recorded one.
+ *
+ * Used by the idempotent branch so it can carry the value forward instead of
+ * erasing it.  `latestBackup()` is only a fallback for the very first run after
+ * the recorded one was deleted.
+ */
+function recordedBackup() {
+  return backupFromStatus() ?? latestBackup();
 }
 
 /**
@@ -1074,18 +1025,94 @@ function rewindPatchStaleness(source) {
   const actual = source.slice(signature.index, close + 1);
   const actualLines = codeLines(actual);
 
-  if (actualLines.join("\n") === expectedLines.join("\n")) {
-    return { current: true, detail: "body matches METHOD" };
+  if (actualLines.join("\n") !== expectedLines.join("\n")) {
+    // Name the difference so a human can see it in the log without a diff.
+    const actualHasClear = /this\.revertTokens\.clear\(\)/u.test(actual);
+    const expectedHasClear = /this\.revertTokens\.clear\(\)/u.test(METHOD);
+    let detail = "body differs from METHOD";
+    if (actualHasClear && !expectedHasClear) {
+      detail = "on-disk body clears revertTokens wholesale (breaks the 2nd rewind); METHOD deletes only the withdrawn branch";
+    }
+    return { current: false, detail };
   }
 
-  // Name the difference so a human can see it in the log without a diff.
-  const actualHasClear = /this\.revertTokens\.clear\(\)/u.test(actual);
-  const expectedHasClear = /this\.revertTokens\.clear\(\)/u.test(METHOD);
-  let detail = "body differs from METHOD";
-  if (actualHasClear && !expectedHasClear) {
-    detail = "on-disk body clears revertTokens wholesale (breaks the 2nd rewind); METHOD deletes only the withdrawn branch";
+  // The method body is only HALF of this patch: `revert()` also has to call it.
+  //
+  // Comparing METHOD alone was a real defect, not a theoretical one.  A file
+  // whose `CALL` had been downgraded to an older form (say, one that truncates
+  // on a `files` scope too, or drops the `no history row carries this id`
+  // warning) still has exactly 2 markers and an unchanged METHOD — so every
+  // staleness check said "current", `apply` reported `already-patched`, and the
+  // corrected CALL could never reach an existing install.  That is the same
+  // failure the METHOD comparison exists to prevent, one level down: the script's
+  // own README already states the rule ("幂等不能只看 marker 数 … 修好的体永远进不去"),
+  // and the CALL was simply left out of it.
+  //
+  // Worse, deleting the CALL entirely (leaving only the two marker comments)
+  // produced a file that still parsed, still had 2 markers, and still reported
+  // "patched / body current" — while `revert()` no longer called anything, i.e.
+  // the patch was inert and both checkers were green.
+  const callStale = rewindCallStaleness(source);
+  if (!callStale.current) return { current: false, detail: callStale.detail };
+
+  return { current: true, detail: "body matches METHOD and CALL is present in revert()" };
+}
+
+/**
+ * Is the call this patch inserts into `revert()` still there, in its current form?
+ *
+ * Located from ANCHOR_B's *shape* — the `await this.bridge.revert({...});` block
+ * plus the method's closing brace — because that is the only stable thing left
+ * in a patched file (the pristine anchor no longer matches once the call has been
+ * inserted between the `});` and the `}`).
+ *
+ * The check is deliberately "the expected code lines are a subsequence of the
+ * actual ones" rather than an exact match:
+ *   - the injected block sits inside `revert()`, whose other statements are
+ *     upstream's and may legitimately change;
+ *   - comments and indentation are already normalised away by `codeLines()`.
+ * An exact match would report stale on every unrelated upstream edit inside
+ * `revert()` and trigger a pointless rebuild on every start.
+ *
+ * A missing or downgraded call is what actually breaks the feature, and both
+ * show up as "one of these lines is gone".
+ *
+ * @param {string} source - file on disk (markers already counted 2).
+ * @returns {{current: boolean, detail: string}}
+ */
+function rewindCallStaleness(source) {
+  const tail = /^([ \t]*)await this\.bridge\.revert\(\{[\s\S]*?^\1\}[ \t]*\r?$/mu.exec(source);
+  if (tail === null) {
+    return {
+      current: false,
+      detail: "the `await this.bridge.revert({…});` tail of revert() was not found, so the inserted CALL cannot be located",
+    };
   }
-  return { current: false, detail };
+  // Everything from the `await` back to the start of `revert()`'s body, so the
+  // search covers the whole method and not just its last two statements.
+  const signature = /^([ \t]*)async revert\(messageId, scope\)[ \t]*\{[ \t]*\r?$/mu.exec(source);
+  const from = signature === null ? tail.index : Math.min(signature.index, tail.index);
+  const region = codeLines(source.slice(from, tail.index + tail[0].length));
+
+  // The lines that make the patch do something.  `truncateHistoryFrom(messageId)`
+  // alone is not enough: the method definition above `revert()` contains that
+  // same substring, so a file with only the method and no call would pass.
+  const required = [
+    'if (scope !== "files" && !this.truncateHistoryFrom(messageId)) {',
+    "process.stderr.write(`[plugin-provider] rewind ${messageId}: no history row carries this id; `",
+  ];
+  const missing = required.filter((line) => !region.includes(line));
+  if (missing.length === 0) return { current: true, detail: "CALL present in revert()" };
+
+  // Distinguish "deleted" from "downgraded", because the fix differs: a deleted
+  // call is rebuilt by re-applying, a downgraded one needs the anchors re-checked.
+  const hasAnyCall = region.some((line) => line.includes("this.truncateHistoryFrom(messageId)"));
+  return {
+    current: false,
+    detail: hasAnyCall
+      ? "revert() calls truncateHistoryFrom() in an older/edited form (missing the scope guard or the warning)"
+      : "revert() never calls truncateHistoryFrom() — the patch body is present but inert",
+  };
 }
 
 /**
@@ -1162,16 +1189,16 @@ function matchClosingBrace(text, openIndex) {
  *
  * What has to change is exactly two things: the `truncateHistoryFrom()` method
  * (doc comment + body) and the call the patch inserts inside `revert()`.  Both
- * are located by their own anchors, so this works on a file that also carries the
- * childRunning patch, an upstream edit, or any other local change — none of it is
- * read, compared or rewritten.
+ * are located by their own anchors, so this works on a file that also carries an
+ * upstream edit or any other local change — none of it is read, compared or
+ * rewritten.
  *
  * This replaces the earlier "restore a clean backup, then re-apply" design, which
  * needed a "is this backup the same upstream version?" judgement for a whole-file
  * replacement.  Every version of that judgement had a blind spot (the first one
- * stripped the rewind patch and compared, which is wrong whenever childRunning is
- * also present — i.e. the normal state), and getting it wrong replaces a module
- * with a different version.  Editing in place removes the question.
+ * stripped the rewind patch and compared, which is wrong whenever any other local
+ * change is also present — i.e. the normal state), and getting it wrong replaces
+ * a module with a different version.  Editing in place removes the question.
  *
  * Whole-operation-in-memory: the caller writes only after this returns a string,
  * so a failure leaves the file byte-identical.
@@ -1247,7 +1274,27 @@ function rebuildRewindInPlace(source) {
   const crlf = source.includes("\r\n");
   const methodText = normaliseEol(reindent(METHOD, METHOD_BASE_INDENT, indent, unit), crlf);
 
-  const patched = source.slice(0, blockStart) + methodText + source.slice(close + 1);
+  // The patch is **two** blocks: this method and the call to it inside
+  // `revert()`.  Rebuilding only the method left the call at whatever older
+  // form it had, reported `patched-from-stale`, and the next `--check` went red
+  // again — an endless rebuild loop that never converged.  Measured before this
+  // fix: downgrade the call, run apply, and the guard is still missing.
+  //
+  // Both edits are computed against the *original* text and applied from the
+  // back, so the second one's offset stays valid.
+  const callEdit = rebuildRewindCall(source, unit, crlf);
+  if (callEdit === null) return null; // it already recorded why
+
+  const edits = [
+    { index: blockStart, length: close + 1 - blockStart, text: methodText },
+    callEdit,
+  ].sort((left, right) => right.index - left.index);
+
+  let patched = source;
+  for (const edit of edits) {
+    patched = patched.slice(0, edit.index) + edit.text + patched.slice(edit.index + edit.length);
+  }
+
   const patchedMarkers = countOccurrences(patched, MARKER);
   if (patchedMarkers !== 2) {
     process.stderr.write(
@@ -1264,6 +1311,86 @@ function rebuildRewindInPlace(source) {
     return null;
   }
   return patched;
+}
+
+/**
+ * Locate the region `revert()` occupies between its `bridge.revert({…})` call and
+ * its closing brace — i.e. exactly where the patch's `CALL` lives.
+ *
+ * Why this shape: once patched, `ANCHOR_B_RE` deliberately no longer matches (the
+ * inserted call sits between the `});` and the method's `}`), so a rebuild cannot
+ * use it.  The anchor's *pieces* are still there, though: the `await
+ * this.bridge.revert({` line, its terminating `});` line, and the method's final
+ * `}` — found by brace matching, not by regex, so a string inside them cannot
+ * throw it off.
+ *
+ * @param {string} source - file on disk.
+ * @returns {{start: number, end: number, indent: string} | null} the region to
+ *   overwrite (from just after the `});` line to the start of the closing `}`
+ *   line), its indentation, or null when the shape is not there.
+ */
+function locateRewindCallRegion(source) {
+  const signature = /^([ \t]*)async revert\(messageId, scope\)[ \t]*\{[ \t]*\r?$/mu.exec(source);
+  if (signature === null) return null;
+  const openBrace = signature.index + signature[0].indexOf("{");
+  const close = matchClosingBrace(source, openBrace);
+  if (close === -1) return null;
+
+  const awaitLine = /^([ \t]*)await this\.bridge\.revert\(\{/mu.exec(source.slice(openBrace, close));
+  if (awaitLine === null) return null;
+  const awaitAt = openBrace + awaitLine.index;
+  const indent = awaitLine[1];
+
+  // The bridge call's own terminator: the first `});` line after the `await`.
+  // Nothing inside the object literal closes a brace at that indent with `);`,
+  // so the first match is the call's end.
+  const callEnd = /\r?\n([ \t]*)\}\);\r?\n/u.exec(source.slice(awaitAt, close));
+  if (callEnd === null) return null;
+  const start = awaitAt + callEnd.index + callEnd[0].length;
+
+  // Everything up to the line that holds the method's closing brace.
+  const end = source.lastIndexOf("\n", close) + 1;
+  if (end < start) return null;
+  return { start, end, indent };
+}
+
+/**
+ * Rebuild the `CALL` inside `revert()` in place.
+ *
+ * Called from the stale-rebuild path, where the method body has already been
+ * decided to be older than this script — but the call is a *separate* block and
+ * can be stale on its own (downgraded, or deleted down to its comments).  If the
+ * method is stale and the call is current this overwrites the call with identical
+ * bytes; if the call is stale it is what makes the rebuild actually land.
+ *
+ * @param {string} source - file on disk.
+ * @param {string} unit - the file's indentation unit (from `detectIndentUnit`).
+ * @param {boolean} crlf - whether the file uses CRLF.
+ * @returns {{index: number, length: number, text: string} | null} the edit, or
+ *   null after recording why it could not be built.
+ */
+function rebuildRewindCall(source, unit, crlf) {
+  const region = locateRewindCallRegion(source);
+  if (region === null) {
+    process.stderr.write(
+      "[rewind-patch] WARNING: cannot locate the body of revert() to rebuild the truncateHistoryFrom() call.\n"
+      + "  Nothing was written. Reinstall @getpaseo/cli to get a clean file.\n",
+    );
+    succeed({
+      reason: "stale-patch-call-unlocatable",
+      targetMd5: md5(readFileSync(TARGET, "utf8")),
+      message: "撤回补丁体是旧版，但找不到 revert() 里插入调用的位置，已保持原文件不动。"
+        + "重装 @getpaseo/cli 后重跑本脚本即可修复。",
+      extra: { patchBody: "stale", staleDetail: "revert() body not locatable" },
+    });
+    process.stdout.write("[rewind-patch] rewind: stale-patch-call-unlocatable (file untouched)\n");
+    return null;
+  }
+  return {
+    index: region.start,
+    length: region.end - region.start,
+    text: normaliseEol(reindent(CALL, CALL_BASE_INDENT, region.indent, unit), crlf),
+  };
 }
 
 /**
@@ -1318,6 +1445,93 @@ function turnIdStaleness(source) {
   return { current: true, detail: "both turnId regions match turnIdCall()" };
 }
 
+/**
+ * Upstream shape #7675 would replace `this.history` — the array this whole patch
+ * truncates — with something else.
+ *
+ * #7675 is the proposal to give `PluginAgentSession` a real history object
+ * (`new PluginSessionHistory(...)`, `this.history.read(...)`) instead of a plain
+ * array.  If that lands, `truncateHistoryFrom()` becomes a **runtime no-op**: the
+ * injected method still parses, both markers are still there, `this.history.length
+ * = cut` silently does nothing useful, and every rewind appears to succeed while
+ * the timeline keeps the withdrawn turns — the exact silent degradation this
+ * patch exists to remove.
+ *
+ * So it is checked **before** the anchors and on **both** paths (clean file and
+ * already-patched file), and it fails closed: exit 1, nothing written, reason in
+ * the status file.  The systemd `ExecStartPre` has a `-` prefix, so the daemon
+ * still boots — only the patch stops pretending to work.
+ *
+ * Deliberately a substring test rather than a parse: the point is "this file no
+ * longer looks like the shape I was written against", and a false positive here
+ * only means a human looks at it.
+ */
+const UPSTREAM_HISTORY_OBJECT_SHAPES = ["new PluginSessionHistory(", "this.history.read("];
+
+/**
+ * @param {string} source - file to test.
+ * @returns {string | null} the offending shape, or null when the file still uses
+ *   a plain array.
+ */
+function upstreamHistoryObjectShape(source) {
+  for (const shape of UPSTREAM_HISTORY_OBJECT_SHAPES) {
+    if (source.includes(shape)) return shape;
+  }
+  return null;
+}
+
+/**
+ * The private fields the injected `truncateHistoryFrom()` reads, and the call
+ * shapes it relies on.
+ *
+ * The anchors prove the *insertion points* are still there.  They say nothing
+ * about these three fields, which the injected body dereferences directly:
+ *
+ *   - `this.history`          — the array being truncated (`this.history.length = cut`);
+ *   - `this.timelineSnapshots`— cleared after a truncation;
+ *   - `this.revertTokens`     — pruned per id for the withdrawn branch.
+ *
+ * Upstream renaming or restructuring any of them leaves both anchors matching,
+ * the patch applying, markers at 2/2, ESM syntax valid, `--check` reporting
+ * "body current" — and then **every** rewind throws
+ * `TypeError: Cannot read properties of undefined (reading 'length')`, because
+ * `agent-manager.rewind()` rethrows what `revert()` throws.  A loud failure at
+ * patch time is strictly better than a loud failure on every rewind.
+ *
+ * Only checked on a **clean** file (before the patch is written).  On an
+ * already-patched file the injected body contains these very strings, so the
+ * check would always pass and prove nothing.
+ */
+const HOST_FIELD_SHAPES = [
+  // The array itself: assigned as an array literal, and pushed to.  (The patch
+  // sets `.length`; an array is the only shape where that means "truncate".)
+  { name: "this.history", shapes: ["this.history = []", "this.history.push("] },
+  // A Map used as the translation cache, and passed to `mapTimelineItem()`
+  // together with `revertTokens` — the two maps the injected body prunes.  The
+  // patch calls `.clear()` on it, which is a Map method, so being a Map is the
+  // property that matters; `this.timelineSnapshots.clear()` itself does *not*
+  // appear in a clean file (the patch adds the only call).
+  {
+    name: "this.timelineSnapshots",
+    shapes: ["this.timelineSnapshots = new Map()", "this.timelineSnapshots, this.revertTokens"],
+  },
+  // Read for a token in `revert()`, and deleted per id by the patch.  Same
+  // reasoning: `.delete()`'s presence is the patch's, not the host's.
+  { name: "this.revertTokens", shapes: ["this.revertTokens = new Map()", "this.revertTokens.get("] },
+];
+
+/**
+ * @param {string} source - a marker-free (clean) file.
+ * @returns {{ok: true} | {ok: false, field: string, missing: string[]}}
+ */
+function hostFieldShapes(source) {
+  for (const field of HOST_FIELD_SHAPES) {
+    const missing = field.shapes.filter((shape) => !source.includes(shape));
+    if (missing.length > 0) return { ok: false, field: field.name, missing };
+  }
+  return { ok: true };
+}
+
 function applyRewindPatch() {
   if (!existsSync(TARGET)) {
     die("target-missing", `target not found: ${TARGET}`);
@@ -1326,6 +1540,27 @@ function applyRewindPatch() {
   const source = readFileSync(TARGET, "utf8");
   const current = md5(source);
   const markers = countOccurrences(source, MARKER);
+
+  // ── #7675 guard — runs on BOTH paths, before anything else ──────────────
+  // If `this.history` is no longer a plain array, the injected body becomes a
+  // runtime no-op: it parses, the markers stay at 2, `--check` says "body
+  // current", and every rewind silently fails to shorten the timeline.  Fail
+  // closed instead of pretending. See `UPSTREAM_HISTORY_OBJECT_SHAPES`.
+  const historyShape = upstreamHistoryObjectShape(source);
+  if (historyShape !== null) {
+    die(
+      "upstream-history-shape-changed",
+      `PluginAgentSession.history is no longer an array (found \`${historyShape}\`): this is the #7675\n`
+      + "  shape, where truncateHistoryFrom() would be a runtime no-op — it would still parse, still\n"
+      + '  report "patched", and every rewind would silently keep the withdrawn turns on the timeline.\n'
+      + "  Retire or rewrite this target before upgrading: see NOPATCH-PLAN.md section 6 / UPGRADE.md.\n"
+      + "  Nothing was written.",
+      {
+        targetMd5: current,
+        extra: { upstreamHistoryShape: historyShape, markers, patchBody: "unknown" },
+      },
+    );
+  }
 
   // Idempotent success, checked before the anchors: once patched, anchor B is
   // deliberately no longer present (the call was inserted inside it).
@@ -1348,7 +1583,15 @@ function applyRewindPatch() {
         reason: "already-patched",
         targetMd5: current,
         message: "补丁已在位（幂等命中），无需动作。撤回功能正常。",
-        extra: { markers, patchBody: "current" },
+        // `backup` is carried on this path too, and that is not cosmetic: every
+        // daemon start takes exactly this branch, so a status file written here
+        // without it replaced the one the last real apply had written (which did
+        // carry it).  `backupFromStatus()` then returned null in steady state, and
+        // its anti-downgrade guard — "restore the baseline *this* build came
+        // from, not whatever backup happens to sort last" — never fired at all.
+        // The guard is what keeps `--revert` from reinstating a *previous*
+        // upstream version after an upgrade.
+        extra: { markers, patchBody: "current", backup: recordedBackup() ?? undefined },
       });
       process.stdout.write(`[rewind-patch] already patched (md5 ${current}), nothing to do\n`);
       return;
@@ -1380,8 +1623,8 @@ function applyRewindPatch() {
     // the target would turn a recoverable state into a hard one, and the hard
     // one cannot be undone from inside this script: with no clean baseline the
     // body cannot be rebuilt at all, so the operator would have to reinstall
-    // @getpaseo/cli.  Meanwhile the sibling targets (childRunning, turnId) have
-    // nothing to do with this and must keep running.  So: warn loudly, name the
+    // @getpaseo/cli.  Meanwhile the sibling target (turnId) has nothing to do
+    // with this and must keep running.  So: warn loudly, name the
     // exact consequence, leave the file alone, and report success-with-caveat.
     const staleWarn = (reason, detail) => {
       process.stderr.write(
@@ -1410,13 +1653,13 @@ function applyRewindPatch() {
     //     "nothing to revert" — the patch could not be restored at all;
     //   - choosing *which* backup to restore needs a "same upstream version?"
     //     judgement, and every heuristic for it has a blind spot (the first one
-    //     compared the file with the patch stripped, which is wrong whenever the
-    //     sibling childRunning patch is also present — i.e. the normal state).
+    //     compared the file with the patch stripped, which is wrong whenever
+    //     another local change is also present — i.e. the normal state).
     //
     // Neither is necessary.  The stale part is exactly one method plus the call
     // inside `revert()`; both are located by their own anchors and can be
-    // replaced in place.  Whatever else the file contains — childRunning, turnId
-    // of another target, unrelated upstream edits — is untouched by construction.
+    // replaced in place.  Whatever else the file contains — the turnId patch in
+    // another file, unrelated upstream edits — is untouched by construction.
     const rebuilt = rebuildRewindInPlace(source);
     if (rebuilt === null) {
       return; // `rebuildRewindInPlace()` already recorded the reason
@@ -1492,6 +1735,27 @@ function applyRewindPatch() {
       + '  "[plugin-provider] rewind ...: no history row carries this id" warning.\n'
       + "  See UPGRADE.md section 5 for the removal steps. Nothing was written.",
       { targetMd5: current, extra: { upstreamFixHits: upstreamFix.hits, upstreamFixSites: upstreamFix.sites } },
+    );
+  }
+
+  // ── Host-field precondition — fail closed BEFORE writing anything ────────
+  // The anchors below only prove the insertion *points* exist.  The injected
+  // body also dereferences `this.history` / `this.timelineSnapshots` /
+  // `this.revertTokens`; if upstream renamed or restructured one of them, the
+  // patch would apply cleanly and then throw a TypeError on every rewind.  Only
+  // meaningful on a clean file (on a patched one the injected body itself
+  // contains these strings).
+  const hostFields = hostFieldShapes(source);
+  if (!hostFields.ok) {
+    die(
+      "host-fields-changed",
+      `the fields this patch edits are not the ones upstream now uses: ${hostFields.field} is missing\n`
+      + `  ${hostFields.missing.map((shape) => `\`${shape}\``).join(", ")}\n`
+      + "  The injected truncateHistoryFrom() reads this.history / this.timelineSnapshots /\n"
+      + "  this.revertTokens directly, so applying the patch would make every rewind throw a TypeError.\n"
+      + "  Upstream restructured the translation cache — rewrite METHOD (and this check) against the new\n"
+      + "  shape. Nothing was written; rewind stays in its current state.",
+      { targetMd5: current, extra: { hostField: hostFields.field, hostFieldMissing: hostFields.missing } },
     );
   }
 
@@ -1655,35 +1919,47 @@ function applyRewindPatch() {
 // ───────────────────────────────────────────────────────────────────────────
 
 /**
- * Backups for the turnId target live next to *that* file, under a name this
- * script alone uses.
+ * Backups for the turnId target go in `BACKUP_DIR` (`REWIND_PATCH_HOME`), next to
+ * the rewind backups, under a name this script alone uses.
  *
- * Why not `BACKUP_DIR` (where the rewind backups go): `--revert` restores "the
- * backup the current patch was built from", and the rewind backup is a
- * `plugin-provider.js` — restoring it over `agent-manager.js` would replace one
- * whole module with another. Keeping them apart means a cross-target restore is
- * impossible by construction, not by a check someone can forget.
+ * This used to be `dirname(TURNID_TARGET)` — the globally installed package's
+ * dist directory — and that was a real defect, not a preference: `npm i -g
+ * @getpaseo/cli@<new>` replaces `@getpaseo/server/dist` wholesale, so the backup
+ * is deleted at exactly the moment it is needed (a fresh upgrade whose patch
+ * broke). `--revert` then reported `turnid-no-backup` with no clean copy
+ * anywhere, and the only recovery was reinstalling — which lands you back at
+ * "patch missing". Two such files were sitting in the live install when this was
+ * found.
+ *
+ * Why keeping them in the *same directory* as the rewind backups is safe: the
+ * two namespaces do not intersect (`plugin-provider.js.orig-` vs
+ * `agent-manager.js.orig-turnid-`), and `latestBackup()` / `latestTurnIdBackup()`
+ * each filter by their own prefix, so neither lookup can see the other's files.
+ * The old comment justified the separate directory with "cross-target restore is
+ * impossible by construction" — that property comes from the **filename prefix**
+ * (plus `revertTurnIdPatch()` refusing a backup that carries its own marker), and
+ * the prefix is kept verbatim.  Directory separation was never what provided it.
  */
 function turnIdBackupPath(sourceMd5) {
   const timestamp = new Date()
     .toISOString()
     .replace(/[-:T]/g, "")
     .slice(0, 14);
-  return join(dirname(TURNID_TARGET), `${basename(TURNID_TARGET)}.orig-turnid-${timestamp}-${sourceMd5.slice(0, 8)}`);
+  return join(BACKUP_DIR, `${basename(TURNID_TARGET)}.orig-turnid-${timestamp}-${sourceMd5.slice(0, 8)}`);
 }
 
 /** Newest turnId backup, or null. Sorted by name — the name carries the timestamp. */
 function latestTurnIdBackup() {
   let candidates;
   try {
-    candidates = readdirSync(dirname(TURNID_TARGET)).filter((name) =>
+    candidates = readdirSync(BACKUP_DIR).filter((name) =>
       name.startsWith(`${basename(TURNID_TARGET)}.orig-turnid-`),
     );
   } catch {
     return null;
   }
   candidates.sort();
-  return candidates.length > 0 ? join(dirname(TURNID_TARGET), candidates[candidates.length - 1]) : null;
+  return candidates.length > 0 ? join(BACKUP_DIR, candidates[candidates.length - 1]) : null;
 }
 
 /**
@@ -1762,8 +2038,11 @@ function applyTurnIdPatch() {
         { targetMd5: current, extra: { patch: "turnid", patchBody: "stale" } },
       );
     }
+    // Also under `BACKUP_DIR`: a prestale snapshot is rollback material for the
+    // same upgrade that deletes the dist tree, so leaving it there had the same
+    // defect as the main backup (see `turnIdBackupPath()`).
     const rebuiltBackup = join(
-      dirname(TURNID_TARGET),
+      BACKUP_DIR,
       `${basename(TURNID_TARGET)}.prestale-turnid-${new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14)}-${current.slice(0, 8)}`,
     );
     copyFileSync(TURNID_TARGET, rebuiltBackup);
@@ -2107,677 +2386,6 @@ function revertTurnIdPatch() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Patch 3 — apply / revert the child-running patch on plugin-provider.js
-// ───────────────────────────────────────────────────────────────────────────
-
-/**
- * Backups for the childRunning target.
- *
- * The name is `${basename}.childrunning-orig-*` — deliberately **not**
- * `${basename}.orig-childrunning-*`.
- *
- * Note the *default* deployment does not actually collide: rewind's
- * `latestBackup()` scans `BACKUP_DIR` (`~/.paseo/local-patches/`), while these
- * backups are written next to the target (`dirname(CHILDRUNNING_TARGET)`, the
- * dist dir).  Two different directories, so under the default layout either name
- * works.
- *
- * The rename is defensive, not a fix for a live bug.  It matters the moment the
- * two directories can coincide — someone setting `REWIND_PATCH_CHILDRUNNING_TARGET`
- * to a scratch copy, or `REWIND_PATCH_HOME`/`BACKUP_DIR` later moving to the dist
- * dir.  In that world `…orig-childrunning-…` sorts *after* `…orig-<timestamp>-…`
- * (digits before letters) and gets picked as the newest "rewind baseline" — a
- * file that already carries the rewind patch, which `revertRewindPatch()` would
- * then refuse (`backup-is-patched`), i.e. rewind revert becomes impossible.
- *
- * Keeping `childrunning-orig` *before* the timestamp makes the two namespaces
- * disjoint by construction, so neither lookup can ever see the other's backups
- * regardless of how the paths are configured.
- */
-function childRunningBackupPath(sourceMd5) {
-  const timestamp = new Date()
-    .toISOString()
-    .replace(/[-:T]/g, "")
-    .slice(0, 14);
-  return join(
-    dirname(CHILDRUNNING_TARGET),
-    `${basename(CHILDRUNNING_TARGET)}.childrunning-orig-${timestamp}-${sourceMd5.slice(0, 8)}`,
-  );
-}
-
-/** Newest childRunning backup, or null. Sorted by name — the name carries the timestamp. */
-function latestChildRunningBackup() {
-  let candidates;
-  try {
-    candidates = readdirSync(dirname(CHILDRUNNING_TARGET)).filter((name) =>
-      name.startsWith(`${basename(CHILDRUNNING_TARGET)}.childrunning-orig-`),
-    );
-  } catch {
-    return null;
-  }
-  candidates.sort();
-  return candidates.length > 0
-    ? join(dirname(CHILDRUNNING_TARGET), candidates[candidates.length - 1])
-    : null;
-}
-
-/**
- * Build the patched `acceptChildEvent()` body.
- *
- * Only the two offending lines change; every other byte of the matched body —
- * including its indentation and any surrounding code — is copied through
- * verbatim.  Both replacements are asserted to hit exactly once inside the body
- * before the result is returned, so a future upstream edit that renames or
- * duplicates either line fails loudly instead of half-patching.
- *
- * Indentation is taken from the matched line itself (not from a constant): the
- * two edited lines sit two levels deep in the dist, but a reformat can change
- * that, and inserting unindented code into a JS file parses fine yet reads as
- * broken.
- *
- * @param {string} body - the anchor match, from signature to closing brace, LF-only.
- * @returns {string} the replacement body, without a trailing newline.
- */
-function childRunningBody(body) {
-  // Either form is acceptable input: pristine (fresh upstream file) or already
-  // patched (rebuild after a stale body was detected).  Exactly one of them must
-  // be present exactly once — zero means upstream rewrote the branch, two means
-  // we are looking at the wrong place.
-  const pristineHits = countOccurrences(body, CHILDRUNNING_GUARD);
-  const patchedGuardHits = countOccurrences(body, CHILDRUNNING_GUARD_PATCHED);
-  const guardForm = pristineHits === 1 && patchedGuardHits === 0
-    ? CHILDRUNNING_GUARD
-    : patchedGuardHits === 1 && pristineHits === 0
-      ? CHILDRUNNING_GUARD_PATCHED
-      : null;
-  if (guardForm === null) {
-    die(
-      "childrunning-guard-mismatch",
-      `inside acceptChildEvent() the \`session.turn\` guard matched `
-      + `${String(pristineHits)} pristine + ${String(patchedGuardHits)} patched form(s); expected exactly one total.\n`
-      + "  Upstream changed the branch this patch edits. Re-check CHILDRUNNING_GUARD / CHILDRUNNING_GUARD_PATCHED\n"
-      + "  in this script. Until then a re-dispatched subagent keeps showing its previous status (no data loss).",
-      { extra: { patch: "childRunning", guardHits: pristineHits, patchedGuardHits } },
-    );
-  }
-  const upsertHits = countOccurrences(body, CHILDRUNNING_UPSERT);
-  const upsertPatchedHits = countOccurrences(
-    body,
-    'status: event.state === "started" ? "running" : event.state',
-  );
-  if (upsertHits !== 1 || upsertPatchedHits !== 0) {
-    die(
-      "childrunning-upsert-mismatch",
-      `inside acceptChildEvent() the status upsert matched ${String(upsertHits)} pristine `
-      + `+ ${String(upsertPatchedHits)} already-patched form(s), expected exactly 1 pristine and 0 patched.\n`
-      + "  Upstream changed the branch this patch edits. Re-check CHILDRUNNING_UPSERT in this script.",
-      { extra: { patch: "childRunning", upsertHits, upsertPatchedHits } },
-    );
-  }
-
-  // Locate each line and take the indentation it actually has in this file.
-  const lineIndent = (needle) => {
-    const at = body.indexOf(needle);
-    const lineStart = body.lastIndexOf("\n", at) + 1;
-    return body.slice(lineStart, at);
-  };
-  const guardIndent = lineIndent(guardForm);
-  const upsertIndent = lineIndent(CHILDRUNNING_UPSERT);
-
-  const guardReplacement = [
-    `${guardIndent}// ${CHILDRUNNING_MARKER} — a re-dispatched child must show as running again;`,
-    `${guardIndent}// ${CHILDRUNNING_MARKER} — the host dropped \`started\` here, so the card kept its old terminal status.`,
-    `${guardIndent}${CHILDRUNNING_GUARD_PATCHED}`,
-  ].join("\n");
-
-  let patched = body;
-  patched = patched.replace(`${guardIndent}${guardForm}`, guardReplacement);
-  patched = patched.replace(
-    `${upsertIndent}${CHILDRUNNING_UPSERT}`,
-    `${upsertIndent}event: { type: "upsert", id: childId, status: event.state === "started" ? "running" : event.state },`,
-  );
-
-  // Both edits must have landed.  `String.replace` with a string pattern
-  // replaces the first occurrence and reports nothing, so verify the result
-  // instead of trusting the call.
-  if (!patched.includes(`${guardIndent}${CHILDRUNNING_GUARD_PATCHED}`)) {
-    die("childrunning-guard-not-replaced", "the `session.turn` guard was not rewritten; refusing to write.", {
-      extra: { patch: "childRunning" },
-    });
-  }
-  if (!patched.includes('status: event.state === "started" ? "running" : event.state')) {
-    die("childrunning-upsert-not-replaced", "the status upsert was not rewritten; refusing to write.", {
-      extra: { patch: "childRunning" },
-    });
-  }
-
-  // The marker must appear exactly twice in the result: the two comment lines
-  // above are the only place it is introduced, and the count is what later runs
-  // (and `--check`) use to tell clean from patched.
-  const patchedMarkers = countOccurrences(patched, CHILDRUNNING_MARKER);
-  if (patchedMarkers !== 2) {
-    die(
-      "childrunning-marker-count-wrong",
-      `expected 2 "${CHILDRUNNING_MARKER}" markers after patching acceptChildEvent(), found ${String(patchedMarkers)}`,
-      { extra: { patch: "childRunning", childRunningMarkers: patchedMarkers } },
-    );
-  }
-  return patched;
-}
-
-/**
- * Apply the childRunning patch to `CHILDRUNNING_TARGET`. Idempotent; throws
- * `PatchFailure` (via `die()`) on any failure so the sibling targets still run.
- *
- * Three states, same as the other targets: 0 markers = clean, 2 = patched,
- * anything else means someone wrote half of it — refused rather than guessed at.
- *
- * Note the ordering constraint this target shares with the rewind patch: both
- * write the same file.  Each handler re-reads the file from disk immediately
- * before editing and writes it back atomically, and the runner calls them
- * sequentially, so the second one always sees the first one's result.  They edit
- * disjoint regions (a method near `publish()` vs. `acceptChildEvent()`), so the
- * two patches compose.
- */
-/**
- * Is the childRunning patch body currently on disk the one this script would
- * write today?
- *
- * Same reasoning as `rewindPatchStaleness()`: the two rewritten lines are part of
- * this script, so a marker count of 2 only proves *presence*, not *currency*.  A
- * file carrying an older/broken form of the ternary still has 2 markers.
- *
- * Comparison is on the *code* of the patched region only — comments, blank lines
- * and indentation are normalised away, so a reformat or a comment edit does not
- * read as stale while a real change to the logic does.
- *
- * @param {string} source - file on disk (markers already counted 2).
- * @returns {{current: boolean, detail: string}}
- */
-function childRunningStaleness(source) {
-  const match = matchAll(CHILDRUNNING_ANCHOR_RE, source)[0];
-  if (match === undefined) {
-    return { current: false, detail: "acceptChildEvent() was not found" };
-  }
-  const actual = codeLines(match[0]);
-
-  // The two lines this patch is responsible for, in their current form.
-  const wantedGuard = 'if (event.type === "session.turn") {';
-  const wantedUpsert = 'event: { type: "upsert", id: childId, status: event.state === "started" ? "running" : event.state },';
-  const hasGuard = actual.includes(wantedGuard);
-  const hasUpsert = actual.includes(wantedUpsert);
-  if (hasGuard && hasUpsert) return { current: true, detail: "body matches this script" };
-
-  const missing = [!hasGuard && "session.turn guard", !hasUpsert && "started→running upsert"].filter(Boolean);
-  return { current: false, detail: `missing ${missing.join(" + ")}` };
-}
-
-function applyChildRunningPatch() {
-  if (!existsSync(CHILDRUNNING_TARGET)) {
-    die("childrunning-target-missing", `target not found: ${CHILDRUNNING_TARGET}`, {
-      extra: { patch: "childRunning", childRunningTarget: CHILDRUNNING_TARGET },
-    });
-  }
-
-  const source = readFileSync(CHILDRUNNING_TARGET, "utf8");
-  const current = md5(source);
-  const markers = countOccurrences(source, CHILDRUNNING_MARKER);
-
-  if (markers === 2) {
-    // Marker count says "present"; it does not say "current".  The injected lines
-    // are part of THIS SCRIPT, so fixing them (as the rewind target's body had to
-    // be fixed) leaves every already-patched install carrying the old semantics
-    // with the same 2 markers — and a marker-only check would report
-    // "already patched" forever, so the corrected body never lands.
-    //
-    // Unlike rewind, no clean baseline is needed to rebuild: the anchor covers
-    // the whole `acceptChildEvent()` method, so re-applying is idempotent by
-    // construction — `childRunningBody()` replaces two exact lines and asserts
-    // both hit exactly once.
-    const stale = childRunningStaleness(source);
-    if (stale.current) {
-      succeed({
-        reason: "childrunning-already-patched",
-        targetMd5: current,
-        message: "childRunning 补丁已在位（幂等命中），无需动作。子代理二次派发会正常显示运行中。",
-        extra: {
-          patch: "childRunning",
-          childRunningTarget: CHILDRUNNING_TARGET,
-          childRunningMarkers: markers,
-          patchBody: "current",
-        },
-      });
-      process.stdout.write(`[rewind-patch] childRunning: already patched (md5 ${current}), nothing to do\n`);
-      return;
-    }
-    process.stdout.write(
-      `[rewind-patch] childRunning: patch body is STALE (${stale.detail}) — re-applying\n`,
-    );
-    // Rebuild the body **in memory** and write exactly once.
-    //
-    // The obvious approach — strip the marker lines to disk, then recurse into
-    // the normal apply path — is wrong, and was measured to be wrong: if the
-    // rebuild then fails (upstream changed the branch into a third shape), the
-    // file is left with 0 markers and the old broken body.  That state is worse
-    // than the stale body it started from, because `revertChildRunningPatch()`
-    // keys on the marker count and reports "nothing to revert" — the backup
-    // sitting right next to the file is never consulted.  So: build the
-    // replacement, validate it, and only then write.  A failure leaves the
-    // target byte-identical to what it was.
-    // Drop the marker comment lines only.  Filtering by "line contains the
-    // marker" alone would also delete a *code* line that happens to carry the
-    // marker in a trailing comment — the guard would then disappear, the rebuild
-    // would fail with a confusing `guard-mismatch`, and every start would log a
-    // FATAL for a file that is actually fine.  (Measured: fail-closed, nothing
-    // written, but the diagnosis was wrong.)  So require each marker line to be a
-    // pure comment; anything else is refused with an explicit reason.
-    const markerLines = source.split("\n").filter((line) => line.includes(CHILDRUNNING_MARKER));
-    const nonCommentMarkerLine = markerLines.find((line) => !line.trim().startsWith("//"));
-    if (nonCommentMarkerLine !== undefined) {
-      die(
-        "childrunning-marker-in-code-line",
-        `the childRunning marker appears inside a code line, not a comment of its own:\n`
-        + `    ${nonCommentMarkerLine.trim()}\n`
-        + "  This file was edited by hand or by another tool. Nothing was written.\n"
-        + `  Restore ${basename(CHILDRUNNING_TARGET)}.childrunning-orig-* over it, or reinstall @getpaseo/cli.`,
-        {
-          targetMd5: current,
-          extra: { patch: "childRunning", childRunningTarget: CHILDRUNNING_TARGET, patchBody: "stale" },
-        },
-      );
-    }
-    const stripped = source
-      .split("\n")
-      .filter((line) => !line.includes(CHILDRUNNING_MARKER))
-      .join("\n");
-    const staleMatch = matchAll(CHILDRUNNING_ANCHOR_RE, stripped)[0];
-    if (staleMatch === undefined) {
-      die(
-        "childrunning-stale-rebuild-anchor-mismatch",
-        `the childRunning patch body is stale but acceptChildEvent() no longer matches after dropping\n`
-        + "  the marker comments, so it cannot be rebuilt in place. Nothing was written.\n"
-        + `  Restore ${basename(CHILDRUNNING_TARGET)}.childrunning-orig-* over the file, or reinstall @getpaseo/cli.`,
-        {
-          targetMd5: current,
-          extra: { patch: "childRunning", childRunningTarget: CHILDRUNNING_TARGET, patchBody: "stale" },
-        },
-      );
-    }
-    let rebuilt;
-    try {
-      rebuilt = childRunningBody(normaliseEol(staleMatch[0], false));
-    } catch {
-      // `childRunningBody()` already recorded the precise failure via `die()`;
-      // the point here is only that nothing has been written.
-      process.stderr.write(
-        "[rewind-patch] WARNING: stale childRunning body could NOT be rebuilt in place; "
-        + "the target is untouched. Reinstall @getpaseo/cli to get a clean file.\n",
-      );
-      return; // `die()` inside threw PatchFailure -> runTarget records the failure
-    }
-    const rebuiltCrlf = source.includes("\r\n");
-    const rebuiltBody = normaliseEol(rebuilt, rebuiltCrlf);
-    const rebuiltSource =
-      stripped.slice(0, staleMatch.index)
-      + rebuiltBody
-      + stripped.slice(staleMatch.index + staleMatch[0].length);
-    if (countOccurrences(rebuiltSource, CHILDRUNNING_MARKER) !== 2) {
-      die(
-        "childrunning-stale-rebuild-marker-wrong",
-        `rebuilding the stale childRunning body produced `
-        + `${String(countOccurrences(rebuiltSource, CHILDRUNNING_MARKER))} marker(s), expected 2. Nothing was written.`,
-        { targetMd5: current, extra: { patch: "childRunning", patchBody: "stale" } },
-      );
-    }
-    // Only now touch the disk — single atomic write, no intermediate state.
-    const staleBackup = childRunningBackupPath(current);
-    copyFileSync(CHILDRUNNING_TARGET, staleBackup);
-    try {
-      atomicWrite(CHILDRUNNING_TARGET, rebuiltSource);
-    } catch (error) {
-      const intact =
-        existsSync(CHILDRUNNING_TARGET) && md5(readFileSync(CHILDRUNNING_TARGET, "utf8")) === current;
-      die(
-        "childrunning-stale-rebuild-write-failed",
-        `could not write the rebuilt childRunning body (${error.code ?? "error"}: ${error.message}).\n`
-        + (intact
-          ? `  The file is untouched (md5 still ${current}).`
-          : `  The file DIFFERS from before (expected ${current}); restore it from ${staleBackup}.`),
-        { targetMd5: current, extra: { patch: "childRunning", backup: staleBackup, patchBody: "stale" } },
-      );
-    }
-    try {
-      syntaxCheck(CHILDRUNNING_TARGET);
-    } catch (error) {
-      let restored = null;
-      try {
-        atomicWrite(CHILDRUNNING_TARGET, source);
-        restored = md5(readFileSync(CHILDRUNNING_TARGET, "utf8"));
-      } catch {
-        /* reported below */
-      }
-      die(
-        "childrunning-stale-rebuild-unparsable",
-        `rebuilt childRunning body does not parse (${error.message}); `
-        + `${restored === current ? "restored the previous content" : `RESTORE FAILED — restore from ${staleBackup}`}.`,
-        { targetMd5: restored, extra: { patch: "childRunning", backup: staleBackup, patchBody: "stale" } },
-      );
-    }
-    const rebuiltMd5 = md5(rebuiltSource);
-    succeed({
-      reason: "childrunning-patched-from-stale",
-      targetMd5: rebuiltMd5,
-      message: "childRunning 补丁体是旧版，已在原地重建为当前版本。子代理二次派发会正常显示运行中。",
-      extra: {
-        patch: "childRunning",
-        childRunningTarget: CHILDRUNNING_TARGET,
-        upstreamMd5: current,
-        patchedMd5: rebuiltMd5,
-        backup: staleBackup,
-        patchBody: "rebuilt-from-stale",
-        markers: 2,
-      },
-    });
-    process.stdout.write(
-      `[rewind-patch] childRunning: stale body rebuilt in place, md5 ${current} -> ${rebuiltMd5}\n`
-      + `[rewind-patch] childRunning: backup: ${staleBackup}\n`
-      + "[rewind-patch] childRunning: ESM syntax ok\n",
-    );
-    return;
-  }
-
-  if (markers !== 0) {
-    die(
-      "childrunning-partially-patched",
-      `found ${String(markers)} "${CHILDRUNNING_MARKER}" marker(s) in ${CHILDRUNNING_TARGET}, expected 0 (clean) or 2 (patched).\n`
-      + "  The file is in an unknown half-patched state. Restore it (reinstall @getpaseo/cli, or copy\n"
-      + `  the ${basename(CHILDRUNNING_TARGET)}.childrunning-orig-* backup over it), then run this script again.`,
-      { targetMd5: current, extra: { patch: "childRunning", childRunningTarget: CHILDRUNNING_TARGET, childRunningMarkers: markers } },
-    );
-  }
-
-  const matches = matchAll(CHILDRUNNING_ANCHOR_RE, source);
-  if (matches.length !== 1) {
-    die(
-      "childrunning-anchor-mismatch",
-      `unexpected upstream shape in ${CHILDRUNNING_TARGET}: acceptChildEvent() matched `
-      + `${String(matches.length)} time(s), expected exactly 1.\n`
-      + "  Re-check CHILDRUNNING_ANCHOR_RE against the current file. Until then a re-dispatched subagent\n"
-      + "  keeps showing its previous status instead of \"running\" (no data loss).",
-      {
-        targetMd5: current,
-        extra: { patch: "childRunning", childRunningTarget: CHILDRUNNING_TARGET, childRunningMatches: matches.length },
-      },
-    );
-  }
-
-  const match = matches[0];
-  const crlf = source.includes("\r\n");
-  const patchedBody = normaliseEol(childRunningBody(normaliseEol(match[0], false)), crlf);
-
-  const patched =
-    source.slice(0, match.index) + patchedBody + source.slice(match.index + match[0].length);
-
-  const patchedMarkers = countOccurrences(patched, CHILDRUNNING_MARKER);
-  if (patchedMarkers !== 2) {
-    die(
-      "childrunning-marker-count-wrong",
-      `expected 2 "${CHILDRUNNING_MARKER}" markers after patching ${CHILDRUNNING_TARGET}, found ${String(patchedMarkers)}`,
-      { targetMd5: current, extra: { patch: "childRunning", childRunningMarkers: patchedMarkers } },
-    );
-  }
-
-  // The rewind patch must still be exactly where it was: this target rewrites a
-  // different method, and a marker count that moved means the anchor reached
-  // into the wrong region.
-  const rewindMarkersAfter = countOccurrences(patched, MARKER);
-  if (rewindMarkersAfter !== countOccurrences(source, MARKER)) {
-    die(
-      "childrunning-clobbered-rewind",
-      `applying the childRunning patch changed the "${MARKER}" marker count from `
-      + `${String(countOccurrences(source, MARKER))} to ${String(rewindMarkersAfter)}.\n`
-      + "  The two patches must edit disjoint regions. Refusing to write; the file is untouched.",
-      { targetMd5: current, extra: { patch: "childRunning", rewindMarkersAfter } },
-    );
-  }
-
-  const backup = childRunningBackupPath(current);
-  copyFileSync(CHILDRUNNING_TARGET, backup);
-
-  try {
-    atomicWrite(CHILDRUNNING_TARGET, patched);
-  } catch (error) {
-    const stillIntact =
-      existsSync(CHILDRUNNING_TARGET) && md5(readFileSync(CHILDRUNNING_TARGET, "utf8")) === current;
-    die(
-      "childrunning-write-failed",
-      `could not write the patched ${CHILDRUNNING_TARGET} (${error.code ?? "error"}: ${error.message}).\n`
-      + (stillIntact
-        ? `  It is untouched (md5 still ${current}); the backup at ${backup} was not needed.`
-        : `  It DOES NOT match the pre-patch content (expected ${current}) — restore it from ${backup}.`),
-      {
-        targetMd5: stillIntact ? current : null,
-        extra: { patch: "childRunning", childRunningTarget: CHILDRUNNING_TARGET, backup, prePatchMd5: current, targetIntact: stillIntact },
-      },
-    );
-  }
-
-  try {
-    syntaxCheck(CHILDRUNNING_TARGET);
-  } catch (error) {
-    const checkUnavailable = error.code === "SYNTAX_CHECK_UNAVAILABLE";
-    let rolledBack = null;
-    let rollbackError = null;
-    try {
-      atomicWrite(CHILDRUNNING_TARGET, source);
-      rolledBack = md5(readFileSync(CHILDRUNNING_TARGET, "utf8"));
-    } catch (rollbackFailure) {
-      rollbackError = `${rollbackFailure.code ?? "error"}: ${rollbackFailure.message}`;
-    }
-    const restoredCleanly = rolledBack !== null && rolledBack === current;
-    die(
-      checkUnavailable ? "childrunning-syntax-check-unavailable" : "childrunning-syntax-check-failed",
-      (checkUnavailable
-        ? `could not verify the patched ${CHILDRUNNING_TARGET}: ${error.message}`
-        : `patched ${CHILDRUNNING_TARGET} does not parse; `
-          + `${restoredCleanly ? "restored the pre-patch content" : "RESTORE FAILED"}.\n  ${error.message}`)
-      + (rollbackError === null
-        ? `\n  Target md5 ${rolledBack}${restoredCleanly ? " (identical to pre-patch)" : ` (DIFFERS from pre-patch ${current})`}.`
-        : `\n  COULD NOT restore the pre-patch content (${rollbackError}).`
-          + `\n  ${CHILDRUNNING_TARGET} may hold unverified patched content. Expected md5 ${current}; backup is ${backup}.`),
-      {
-        targetMd5: rolledBack,
-        extra: {
-          patch: "childRunning",
-          childRunningTarget: CHILDRUNNING_TARGET,
-          backup,
-          prePatchMd5: current,
-          restoredCleanly,
-          rollbackSucceeded: rollbackError === null,
-          patchedCandidateMd5: md5(patched),
-        },
-      },
-    );
-  }
-
-  const patchedMd5 = md5(patched);
-  succeed({
-    reason: "childrunning-patched",
-    targetMd5: patchedMd5,
-    message: "childRunning 补丁已打上：宿主不再丢弃子会话的 session.turn started，"
-      + "子代理二次派发会重新显示运行中。",
-    extra: {
-      patch: "childRunning",
-      childRunningTarget: CHILDRUNNING_TARGET,
-      upstreamMd5: current,
-      patchedMd5,
-      backup,
-      childRunningMarkers: 2,
-    },
-  });
-  process.stdout.write(
-    "[rewind-patch] childRunning: applied 2 lines in acceptChildEvent()\n"
-    + `[rewind-patch] childRunning: backup: ${backup}\n`
-    + `[rewind-patch] childRunning: md5 ${current} -> ${patchedMd5}\n`
-    + "[rewind-patch] childRunning: ESM syntax ok\n",
-  );
-}
-
-/**
- * Revert the childRunning patch from its own backup.
- *
- * Refuses a backup that itself carries this patch's marker or does not parse —
- * the same rules the other reverts apply, for the same reasons: a bad backup
- * must not be allowed to destroy a working install.
- */
-function revertChildRunningPatch() {
-  if (!existsSync(CHILDRUNNING_TARGET)) {
-    die("childrunning-target-missing", `target not found: ${CHILDRUNNING_TARGET}`, {
-      extra: { patch: "childRunning", childRunningTarget: CHILDRUNNING_TARGET },
-    });
-  }
-
-  const original = readFileSync(CHILDRUNNING_TARGET, "utf8");
-  const current = md5(original);
-  const markers = countOccurrences(original, CHILDRUNNING_MARKER);
-
-  // Safe right after an upgrade: a freshly installed file carries no marker, and
-  // restoring an older backup over it would silently downgrade the module.
-  if (markers === 0) {
-    succeed({
-      reason: "childrunning-revert-noop",
-      targetMd5: current,
-      message: "childRunning 目标文件本来就没有补丁标记，无需回滚（已幂等跳过，未覆盖任何备份）。",
-      extra: { patch: "childRunning", childRunningTarget: CHILDRUNNING_TARGET, childRunningMarkers: markers },
-    });
-    process.stdout.write(
-      `[rewind-patch] childRunning: nothing to revert: ${CHILDRUNNING_TARGET} carries no patch marker (md5 ${current})\n`,
-    );
-    return;
-  }
-
-  if (markers !== 2) {
-    die(
-      "childrunning-partially-patched",
-      `found ${String(markers)} "${CHILDRUNNING_MARKER}" marker(s) in ${CHILDRUNNING_TARGET}, expected 0 (clean) or 2 (patched); `
-      + "refusing to guess.",
-      { targetMd5: current, extra: { patch: "childRunning", childRunningTarget: CHILDRUNNING_TARGET, childRunningMarkers: markers } },
-    );
-  }
-
-  const backup = latestChildRunningBackup();
-  if (backup === null) {
-    die(
-      "childrunning-no-backup",
-      `no timestamped backup to restore (looked for ${basename(CHILDRUNNING_TARGET)}.childrunning-orig-* next to it)`,
-      { targetMd5: current, extra: { patch: "childRunning", childRunningTarget: CHILDRUNNING_TARGET } },
-    );
-  }
-
-  const backupSource = readFileSync(backup, "utf8");
-  const backupMarkers = countOccurrences(backupSource, CHILDRUNNING_MARKER);
-  if (backupMarkers !== 0) {
-    die(
-      "childrunning-backup-is-patched",
-      `backup ${backup} itself carries ${String(backupMarkers)} patch marker(s); it is not a clean baseline. Refusing to restore.`,
-      { targetMd5: current, extra: { patch: "childRunning", childRunningTarget: CHILDRUNNING_TARGET, backup } },
-    );
-  }
-
-  // Validate the backup BEFORE touching the live file.
-  try {
-    syntaxCheck(backup);
-  } catch (error) {
-    if (error.code === "SYNTAX_CHECK_UNAVAILABLE") {
-      die("childrunning-syntax-check-unavailable", `cannot verify backup ${backup}: ${error.message}`, {
-        targetMd5: current,
-        extra: { patch: "childRunning", childRunningTarget: CHILDRUNNING_TARGET, backup },
-      });
-    }
-    die("childrunning-backup-unparsable", `backup ${backup} does not parse: ${error.message}`, {
-      targetMd5: current,
-      extra: { patch: "childRunning", childRunningTarget: CHILDRUNNING_TARGET, backup },
-    });
-  }
-
-  const undo = (reason, message, extra = {}) => {
-    let rolledBack = null;
-    let rollbackError = null;
-    try {
-      atomicWrite(CHILDRUNNING_TARGET, original);
-      rolledBack = md5(readFileSync(CHILDRUNNING_TARGET, "utf8"));
-    } catch (error) {
-      rollbackError = `${error.code ?? "error"}: ${error.message}`;
-    }
-    const restoredCleanly = rolledBack !== null && rolledBack === current;
-    die(
-      reason,
-      `${message}\n`
-      + (rollbackError === null
-        ? `  Restored the pre-revert content (md5 back to ${rolledBack}${restoredCleanly ? "" : `, DIFFERS from ${current}`}).`
-        : `  COULD NOT restore the pre-revert content (${rollbackError}).\n`
-          + `  ${CHILDRUNNING_TARGET} may now hold the backup instead of the patched content. Expected md5 ${current}.`),
-      {
-        targetMd5: rolledBack,
-        extra: {
-          patch: "childRunning",
-          childRunningTarget: CHILDRUNNING_TARGET,
-          backup,
-          rollbackSucceeded: rollbackError === null,
-          restoredCleanly,
-          ...extra,
-        },
-      },
-    );
-  };
-
-  try {
-    atomicWrite(CHILDRUNNING_TARGET, backupSource);
-  } catch (error) {
-    undo(
-      "childrunning-revert-write-failed",
-      `could not restore ${backup} over the target (${error.code ?? "error"}: ${error.message}).`,
-      { phase: "copy" },
-    );
-  }
-
-  const restoredSource = readFileSync(CHILDRUNNING_TARGET, "utf8");
-  const restored = md5(restoredSource);
-  const restoredMarkers = countOccurrences(restoredSource, CHILDRUNNING_MARKER);
-
-  if (restoredMarkers !== 0) {
-    undo(
-      "childrunning-revert-verify-failed",
-      `after restoring ${backup} the target still carries ${String(restoredMarkers)} marker(s)`,
-      { restoredMarkers },
-    );
-  }
-  try {
-    syntaxCheck(CHILDRUNNING_TARGET);
-  } catch (error) {
-    undo("childrunning-revert-verify-failed", `restored target does not parse: ${error.message}`);
-  }
-
-  succeed({
-    reason: "childrunning-reverted",
-    targetMd5: restored,
-    message: `已从备份 ${basename(backup)} 回滚 childRunning 补丁。子代理二次派发将不再显示运行中（不影响数据）。`,
-    extra: {
-      patch: "childRunning",
-      childRunningTarget: CHILDRUNNING_TARGET,
-      backup,
-      restoredMd5: restored,
-      preRevertMd5: current,
-    },
-  });
-  process.stdout.write(
-    `[rewind-patch] childRunning: reverted from ${backup}\n`
-    + `[rewind-patch] childRunning: md5 ${current} -> ${restored}\n`
-    + "[rewind-patch] childRunning: restored tree is unpatched (0 markers), ESM syntax ok\n",
-  );
-}
-
-// ───────────────────────────────────────────────────────────────────────────
 // Runner — one target's failure must not stop the other (soft, per file)
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -2864,7 +2472,6 @@ function runTarget(label, handler) {
 function writeCombinedStatus(results) {
   const rewind = results.find((result) => result.label === "rewind");
   const turnId = results.find((result) => result.label === "turnId");
-  const childRunning = results.find((result) => result.label === "childRunning");
   // `allOk` answers "is the install fully healthy".  A degraded target (patch
   // present but its body could not be brought up to date) is not healthy, even
   // though the target itself did not fail — otherwise the status file would say
@@ -2885,14 +2492,6 @@ function writeCombinedStatus(results) {
       return null;
     }
   })();
-  const childRunningTargetMd5 = (() => {
-    try {
-      return existsSync(CHILDRUNNING_TARGET) ? md5(readFileSync(CHILDRUNNING_TARGET, "utf8")) : null;
-    } catch {
-      return null;
-    }
-  })();
-
   const rewindBlock = {
     ok: rewind?.ok ?? false,
     reason: rewind?.reason ?? "rewind-missing",
@@ -2911,15 +2510,6 @@ function writeCombinedStatus(results) {
     message: turnId?.message ?? "turnId 补丁目标未执行。",
   };
 
-  const childRunningBlock = {
-    ok: childRunning?.ok ?? false,
-    reason: childRunning?.reason ?? "childrunning-missing",
-    target: CHILDRUNNING_TARGET,
-    targetMd5: childRunningTargetMd5,
-    marker: CHILDRUNNING_MARKER,
-    message: childRunning?.message ?? "childRunning 补丁目标未执行。",
-  };
-
   // `backup` / `upstreamMd5` / `markers` / `patchedMd5` must reach the status
   // file: `backupFromStatus()` prefers `status.backup` over the newest backup on
   // disk, precisely because after an upgrade the newest one can belong to a
@@ -2928,7 +2518,23 @@ function writeCombinedStatus(results) {
   const rewindExtra = rewind?.extra ?? {};
   const carry = (block, extra) => {
     const out = { ...block };
-    for (const key of ["backup", "upstreamMd5", "patchedMd5", "markers", "patchBody", "staleDetail"]) {
+    // `upstreamHistoryShape` / `hostField` / `hostFieldMissing` are here because
+    // the task requires the *reason* to be readable from the status file, not
+    // only from stderr: the startup hook logs one line and the daemon keeps
+    // booting, so the status file is what a later `check-rewind-patch.mjs` run
+    // (and a human) actually sees.  They were dropped by this whitelist at first
+    // and the status file said `host-fields-changed` with no field name.
+    for (const key of [
+      "backup",
+      "upstreamMd5",
+      "patchedMd5",
+      "markers",
+      "patchBody",
+      "staleDetail",
+      "upstreamHistoryShape",
+      "hostField",
+      "hostFieldMissing",
+    ]) {
       if (extra[key] !== undefined) out[key] = extra[key];
     }
     return out;
@@ -2951,15 +2557,13 @@ function writeCombinedStatus(results) {
     ...(rewindExtra.upstreamMd5 === undefined ? {} : { upstreamMd5: rewindExtra.upstreamMd5 }),
     ...(rewindExtra.patchedMd5 === undefined ? {} : { patchedMd5: rewindExtra.patchedMd5 }),
     ...(rewindExtra.markers === undefined ? {} : { markers: rewindExtra.markers }),
-    // ── new: the second and third targets, plus the combined answer ─────────
+    // ── new: the second target, plus the combined answer ────────────────────
     allOk,
     patches: {
       rewind: rewindWithExtra,
       turnId: carry(turnIdBlock, turnId?.extra ?? {}),
-      childRunning: carry(childRunningBlock, childRunning?.extra ?? {}),
     },
     turnId: turnIdBlock,
-    childRunning: childRunningBlock,
   });
 }
 
@@ -3030,37 +2634,20 @@ function main() {
     return;
   }
 
-  // Order matters for the two targets that share plugin-provider.js.
+  // The two targets live in **different files** (`plugin-provider.js` for rewind,
+  // `agent-manager.js` for turnId), so their order does not matter for
+  // correctness or for the report — each one only ever touches its own file.
   //
-  // Apply: `rewind` first, then `childRunning`.  Each apply re-reads the file
-  // from disk and writes it back atomically, so the second one always sees the
-  // first one's result; they edit disjoint regions (a method near `publish()`
-  // vs. `acceptChildEvent()`), so both patches coexist.
-  //
-  // Revert: `childRunning` first, then `rewind` — the reverse of apply.  Each
-  // revert restores that target's own "pre-patch" backup, and each backup is a
-  // *whole-file* snapshot, so restoring an earlier one also discards anything
-  // patched in afterwards.  In the normal flow the childRunning backup is the
-  // already-rewind-patched file: reverting childRunning first puts back exactly
-  // the state rewind expects, and both report their real verdict.
-  //
-  // This ordering is about **diagnostic accuracy, not correctness**.  Measured
-  // both ways: the final file is byte-identical (clean upstream content) either
-  // way, and the patches really are gone either way.  What differs is only the
-  // report — with rewind first, its whole-file restore wipes childRunning before
-  // childRunning gets its turn, so childRunning prints "0 markers, nothing to
-  // revert" instead of its own revert verdict.  Harmless, but a lie in the log,
-  // and the next person reading it would think childRunning had never been
-  // applied.
+  // (The third target used to be `childRunning`, which shared
+  // `plugin-provider.js` with rewind and forced a specific order in both
+  // directions. It is retired: upstream getpaseo/paseo#8080 fixed the defect.)
   const results = reverting
     ? [
-        runTarget("childRunning", revertChildRunningPatch),
         runTarget("rewind", revertRewindPatch),
         runTarget("turnId", revertTurnIdPatch),
       ]
     : [
         runTarget("rewind", applyRewindPatch),
-        runTarget("childRunning", applyChildRunningPatch),
         runTarget("turnId", applyTurnIdPatch),
       ];
 
@@ -3098,7 +2685,7 @@ function checkBothTargets() {
 
   // Every target that can have a stale body gets the same second question.
   // Checking markers alone reports "patched" for a file whose body is older than
-  // this script — the exact false green this mode exists to prevent.  The three
+  // this script — the exact false green this mode exists to prevent.  Both
   // targets are structurally identical here, so they are handled identically;
   // leaving one of them on marker-count-only was an asymmetry that made
   // `--check` and `check-rewind-patch.mjs` disagree about the same file.
@@ -3108,7 +2695,7 @@ function checkBothTargets() {
     const stale = staleness(readFileSync(file, "utf8"));
     if (stale.current === true) return { ...base, detail: `${base.detail}, body current` };
     // `current: null` would mean "this target has no body check". No target is in
-    // that state any more (all three now compare their injected body), but the
+    // that state any more (both now compare their injected body), but the
     // branch is kept honest rather than removed: if it ever comes back it must
     // report NOT verified and must NOT count as healthy, because a corrupted body
     // was measured to pass as `body current` while `apply` also reported
@@ -3131,7 +2718,6 @@ function checkBothTargets() {
   const results = [
     withBodyCheck("rewind", TARGET, MARKER, rewindPatchStaleness),
     withBodyCheck("turnId", TURNID_TARGET, TURNID_MARKER, turnIdStaleness),
-    withBodyCheck("childRunning", CHILDRUNNING_TARGET, CHILDRUNNING_MARKER, childRunningStaleness),
   ];
   for (const result of results) {
     process.stdout.write(`[rewind-patch] ${result.label}: ${result.ok ? "OK" : "FAILED"} — ${result.detail}\n`);
@@ -3150,21 +2736,19 @@ export {
   ANCHOR_A_RE,
   ANCHOR_B_RE,
   BASE_MD5,
-  CHILDRUNNING_MARKER,
-  CHILDRUNNING_TARGET,
   MARKER,
   STATUS_FILE,
   TARGET,
   TURNID_CALL_RE,
   TURNID_MARKER,
   TURNID_TARGET,
-  childRunningStaleness,
   countOccurrences,
   detectIndentUnit,
   detectUpstreamSelfFix,
   matchAll,
   md5,
   rewindPatchStaleness,
+  turnIdStaleness,
 };
 
 // Only run when invoked as a script — `check-rewind-patch.mjs` imports the

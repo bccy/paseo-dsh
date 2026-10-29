@@ -8,7 +8,7 @@
 
 ---
 
-## 0. 先理解三个东西
+## 0. 先理解这三样东西
 
 | 文件 | 作用 |
 |---|---|
@@ -82,15 +82,20 @@ node ~/.paseo/local-patches/check-rewind-patch.mjs
 
 | exit | 含义 | 该做什么 |
 |---|---|---|
-| `0` | 三个 target 全部到位（`rewind` / `turnId` / `childRunning`） | 无需动作 |
+| `0` | 两个 target 全部到位（`rewind` / `turnId`） | 无需动作 |
 | `1` | 至少一个 target **失败**（锚点失配、半打、写失败等） | 看 stderr 里点名的 target，按第 3 节处理 |
 | `3` | **DEGRADED**：补丁在、也能用，但实现体是旧版且**无法自动重建**（缺该上游版本的干净基线） | 已知后果只有一条：**同一会话里的第二次撤回**会报 `No provider revert token`。修法：重装 `@getpaseo/cli`（恢复干净文件）后重跑本脚本。启动钩子会单独记一行 `DEGRADED (exit 3)`，不会写成 FAILED |
 
 ⚠️ 上表 `3` 与 `check` 的 `3` **是两回事**：`check` 的 3 是"文件不存在"，`apply` 的 3 是"DEGRADED"。
 
-⚠️ `check-rewind-patch.mjs` 的 exit code **只反映 rewind 一个 target**。`childRunning` 与 `turnId`
-的结果在输出的「同文件姊妹补丁」一节 / `--json` 的 `siblings` + `siblingsAllOk` 里。
-**不要只看 exit code 判断整机健康**——姊妹补丁缺失不会改变 exit code。
+⚠️ `check-rewind-patch.mjs` 的 `code` 只反映 rewind 一个 target，但**进程退出码是合并后的**：
+姊妹补丁（`turnId`）缺失会把 exit code 从 0 抬高（未打/体旧 → 1，半打 → 2，文件不存在 → 3），
+而 rewind 自己的非零判定（尤其 `4` = 该退休）优先返回、不被覆盖。详细结果在输出的
+「姊妹补丁」一节 / `--json` 的 `siblings` + `siblingsAllOk`，合并后的退出码在 `--json` 的
+`exitCode`（`code` 仍是 rewind 自己的判定，保留给老调用方）。
+
+之所以把姊妹纳入退出码：这个脚本是本套补丁唯一的体检工具，而 `turnId` 被抹掉时它以前照样
+`exit 0`——一个「不会变红的检查」，正是本项目反复要消灭的假绿。
 
 `--json` 给机器读：
 
@@ -148,11 +153,22 @@ grep -n 'LOCAL PATCH (paseo-dsh)' "$T"     # 应为 0（干净）或 2（已打�
 1. 把 `~/.paseo/local-patches/apply-rewind-history-truncation.mjs` 里的 `ANCHOR_A_RE` /
    `ANCHOR_B_RE` 按新形状改正则。要求不变：**保留完整的函数体作为判据**（否则会误命中文件里
    另一个同名 `publish(event)`），**保留缩进捕获组**（插入时要复用它）。
-2. 用临时副本验证，别直接打真文件：
+2. 用临时副本验证，别直接打真文件。
+
+   ⚠️ **必须同时给出三个目标变量。** `TURNID_TARGET` 只由 `REWIND_PATCH_TURNID_TARGET` 或
+   `PASEO_CLI_ROOT` 决定，**不跟随** `REWIND_PATCH_TARGET`。所以只设 `REWIND_PATCH_TARGET`
+   的老命令会把 `rewind` 打到副本上、同时把 `turnId` **真的打到本机 `agent-manager.js`** 并在
+   那里写备份——一次「安全验证」就把半成品推到了真机。
+
    ```bash
+   T=~/.npm-global/lib/node_modules/@getpaseo/cli/node_modules/@getpaseo/server/dist/server/server/agent/plugin-provider.js
    cp "$T" /tmp/pp.js
-   REWIND_PATCH_TARGET=/tmp/pp.js node ~/.paseo/local-patches/apply-rewind-history-truncation.mjs
-   # 期望 exit 0 + ESM syntax ok
+   cp "$(dirname "$T")/agent-manager.js" /tmp/am.js
+   REWIND_PATCH_HOME=/tmp/patch-test \
+   REWIND_PATCH_TARGET=/tmp/pp.js \
+   REWIND_PATCH_TURNID_TARGET=/tmp/am.js \
+     node ~/.paseo/local-patches/apply-rewind-history-truncation.mjs
+   # 期望 exit 0 + ESM syntax ok，且真机的 agent-manager.js md5 不变
    ```
 3. 验证通过再打真的：
    ```bash
@@ -240,6 +256,10 @@ node ~/.paseo/local-patches/apply-rewind-history-truncation.mjs --revert
 行为：
 - 从**最近一次成功打补丁时记录的备份**还原（优先用 `rewind-patch.status.json` 里记的 `backup`，
   回退到最新的 `plugin-provider.js.orig-*`）；
+- 两个 target 的备份都在 `~/.paseo/local-patches/`（`REWIND_PATCH_HOME`）里，**不在** npm 全局
+  包目录。早先 `turnId` 的备份写在 `dist` 里，`npm i -g` 会把它连树删掉，恰好是升级后需要回滚
+  的那一刻；现在不会了。旧版本留下的 `agent-manager.js.orig-turnid-*` 仍可用（按文件名前缀
+  扫的就是它），但新备份不会再写进 `dist`；
 - **原子写**：先写同目录临时文件再 `renameSync` 覆盖。所以还原失败时目标文件要么是完整的旧
   （已打补丁）内容、要么是完整的干净内容，**不会**出现半截文件；
 - 还原后校验 **MARKER 计数 == 0**（确实是干净未打补丁状态）+ **ESM 语法检查通过**；
@@ -250,6 +270,15 @@ node ~/.paseo/local-patches/apply-rewind-history-truncation.mjs --revert
 
 **幂等**：如果目标文件本来就没有补丁标记（比如刚升级完、还没打过），`--revert` 会直接
 跳过（`reason: revert-noop`），**不会**用旧备份覆盖新上游文件。
+
+> `--revert` 只回滚 `rewind` 和 `turnId` 两个 target。**`childRunning` 补丁已退役，新版脚本
+> 既不认识它的 marker、也不会主动清它**：`rewind` 的 `--revert` 是从「rewind 打补丁前」的整文件
+> 备份还原，那份备份里可能已经带着 childRunning 的两行注释（取决于旧版当年的 apply 顺序与备份
+> 代次），所以**结果不确定，别指望 `--revert` 顺手清掉它**。
+>
+> 要彻底清掉旧版留下的 childRunning 补丁，用**旧版脚本**跑一次 `--revert`（它认识那个 target），
+> 或者直接重装 `npm i -g @getpaseo/cli` 拿回干净文件再跑新版 apply。留着它也不影响 `rewind` /
+> `turnId` 的正确性——上游 #8080 发版后它自然多余，届时随重装一起消失。
 
 > 注意 `--revert` 只是撤销补丁，**不会**改 drop-in。所以下次启动 daemon 时
 > `ExecStartPre` 又会把补丁打上。要真正保持官方行为，得同时把 drop-in 里的那行注释掉。

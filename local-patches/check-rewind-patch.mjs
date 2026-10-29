@@ -26,8 +26,8 @@
  *    `state: patchable` vs `state: stale-body`。
  *    `--json` 里同样有 `state` 字段。
  *
- * ⚠️ 本脚本只判 rewind 一个 target 的 exit code；`childRunning` 的结果在
- *    `siblings` / `siblingsAllOk`（human 报告里是"同文件姊妹补丁"一节）。
+ * ⚠️ 本脚本只判 rewind 一个 target 的 exit code；`turnId` 的结果在
+ *    `siblings` / `siblingsAllOk`（human 报告里是"姊妹补丁"一节）。
  *    姊妹补丁缺失不会改变 exit code，所以**不要只看 exit code 判断整机健康**。
  *
  * 注：md5 只作为「与已知基线差多远」的参考信息打印，**不参与判定**。
@@ -43,15 +43,15 @@ import {
   ANCHOR_A_RE,
   ANCHOR_B_RE,
   BASE_MD5,
-  CHILDRUNNING_MARKER,
-  CHILDRUNNING_TARGET,
   MARKER,
   TARGET,
-  childRunningStaleness,
+  TURNID_MARKER,
+  TURNID_TARGET,
   countOccurrences,
   detectUpstreamSelfFix,
   matchAll,
   rewindPatchStaleness,
+  turnIdStaleness,
 } from "./apply-rewind-history-truncation.mjs";
 
 const HOME_DIR = process.env.REWIND_PATCH_HOME ?? dirname(fileURLToPath(import.meta.url));
@@ -63,11 +63,16 @@ const JSON_OUTPUT = process.argv.includes("--json");
 const md5 = (text) => createHash("md5").update(text).digest("hex");
 
 /**
- * The sibling targets that live in the same file / same install as the rewind
- * patch.  Reported here because this script is the human-facing health check:
- * reporting only rewind made the whole install look healthy while
- * `childRunning` was missing, which is precisely the silent degradation this
- * project keeps having to dig out of logs.
+ * The sibling targets that live in the same install as the rewind patch.
+ * Reported here because this script is the human-facing health check: reporting
+ * only rewind made the whole install look healthy while the other target was
+ * missing, which is precisely the silent degradation this project keeps having
+ * to dig out of logs.
+ *
+ * `turnId` is the only sibling left. It used to be `childRunning` too, but that
+ * patch was retired once upstream getpaseo/paseo#8080 fixed the defect; a
+ * checker that kept listing it would report a missing target on every healthy
+ * install.
  *
  * These never change the exit code — rewind's verdict owns that, and callers
  * (UPGRADE.md, the startup hook notes) branch on it.  They are printed and
@@ -107,7 +112,7 @@ function siblingTargets() {
 
   return [
     describeSibling("rewind", TARGET, MARKER, rewindPatchStaleness),
-    describeSibling("childRunning", CHILDRUNNING_TARGET, CHILDRUNNING_MARKER, childRunningStaleness),
+    describeSibling("turnId", TURNID_TARGET, TURNID_MARKER, turnIdStaleness),
   ];
 }
 
@@ -257,7 +262,7 @@ function inspect() {
   };
 }
 
-function humanReport(result) {
+function humanReport(result, exitCode) {
   const lines = [];
   lines.push(`[rewind-patch] target: ${result.target}`);
   if (result.targetMd5 !== null) {
@@ -278,7 +283,7 @@ function humanReport(result) {
   // Siblings are printed unconditionally: this is the "is the install healthy"
   // view, and a reader must not conclude "all good" from rewind alone.
   lines.push("");
-  lines.push("[rewind-patch] 同文件姊妹补丁（不影响上面的 exit code）:");
+  lines.push("[rewind-patch] 姊妹补丁（缺失会把 exit code 拉高，见下）:");
   for (const sibling of result.siblings) {
     lines.push(`  ${sibling.ok ? "OK  " : "FAIL"} ${sibling.label}: ${sibling.detail}`);
   }
@@ -286,7 +291,7 @@ function humanReport(result) {
   if (brokenSiblings.length > 0) {
     lines.push(
       `  ↑ ${brokenSiblings.map((s) => s.label).join(", ")} 不在位：跑 node ${APPLY_SCRIPT} 可自动补上。`
-      + "（childRunning 缺失只影响「子代理第二次派发是否显示运行中」，不影响撤回。）",
+      + "（turnId 缺失只影响「重开会话后长对话是否折叠轮次」，不影响撤回。）",
     );
   }
 
@@ -305,11 +310,53 @@ function humanReport(result) {
     if (raw.message) lines.push(`  message=${raw.message}`);
   }
   lines.push("");
-  lines.push(`[rewind-patch] exit ${result.code}`);
+  // The printed exit code must be the one the process actually returns, or the
+  // human view and the machine view disagree about the same run.
+  lines.push(
+    exitCode === result.code
+      ? `[rewind-patch] exit ${exitCode}`
+      : `[rewind-patch] exit ${exitCode} (rewind 自身 exit ${result.code}；被姊妹补丁拉高)`,
+  );
   return lines.join("\n");
 }
 
 const result = { ...inspect(), siblings: siblingTargets() };
+
+/**
+ * Exit code for the whole install, not just rewind.
+ *
+ * This used to be rewind's verdict alone, with the siblings printed but
+ * deliberately kept out of the exit code.  That made the one machine-readable
+ * answer ("is this install healthy") say `0` for an install whose `turnId`
+ * patch had been wiped — and `UPGRADE.md` tells the reader to branch on the
+ * exit code, so the manual's own judgement was wrong.  A checker that cannot
+ * go red for a missing patch is the false green this file exists to prevent.
+ *
+ * Precedence, so the existing meanings stay intact where they matter:
+ *   1. rewind's own verdict wins whenever it is non-zero.  In particular `4`
+ *      ("upstream fixed it, retire the patch") must keep reaching the caller
+ *      unchanged — it is an instruction, not a failure.
+ *   2. otherwise a broken sibling contributes its own severity, mapped onto the
+ *      same scale: not-patched / stale-body => 1 (apply fixes it),
+ *      half-patched => 2 (needs a human), target-missing => 3.
+ *   3. all healthy => 0.
+ *
+ * `code` in `--json` stays rewind's verdict; the combined answer is
+ * `exitCode` (+ `siblingsAllOk`), so an existing consumer that branches on
+ * `code` keeps its old behaviour and can opt into the wider one.
+ */
+function combinedExitCode(rewindCode, siblings) {
+  if (rewindCode !== 0) return rewindCode;
+  const severity = { "not-patched": 1, "stale-body": 1, "half-patched": 2, "target-missing": 3 };
+  let worst = 0;
+  for (const sibling of siblings) {
+    if (sibling.ok) continue;
+    worst = Math.max(worst, severity[sibling.state] ?? 2);
+  }
+  return worst;
+}
+
+const exitCode = combinedExitCode(result.code, result.siblings);
 
 if (JSON_OUTPUT) {
   // Keep the shape stable: callers should branch on `code` / `state`, not prose.
@@ -341,9 +388,13 @@ if (JSON_OUTPUT) {
       detail,
     })),
     siblingsAllOk: result.siblings.every((sibling) => sibling.ok),
+    // The combined answer. `code` above is rewind's verdict only, kept for
+    // backwards compatibility; this is what the process actually exits with.
+    exitCode,
+    exitCodeFrom: exitCode === result.code ? "rewind" : "sibling",
   }, null, 2)}\n`);
 } else {
-  process.stdout.write(`${humanReport(result)}\n`);
+  process.stdout.write(`${humanReport(result, exitCode)}\n`);
 }
 
-process.exit(result.code);
+process.exit(exitCode);

@@ -63,11 +63,49 @@
  * `PASEO_DSH_PATCH_HOOK_ACTIVE=1` is still honoured as an explicit opt-out for
  * a caller that knows it must not patch (tests, one-off scripts), but the hook
  * never sets it itself.
+ *
+ * ENTRY ALLOWLIST — why the hook does NOT run in every node process
+ * ----------------------------------------------------------------
+ * `NODE_OPTIONS` is inherited by *every* node child the daemon spawns, so the
+ * hook used to spawn a full apply on each one: the plugin process, terminal
+ * workers, the DSH bridge, git helpers.  Two measured consequences:
+ *
+ *   1. A read-only query stopped being read-only.  `check-rewind-patch.mjs` and
+ *      `apply … --check` are documented as "只读" and `UPGRADE.md` branches on
+ *      their exit codes — but running either of them in a shell that inherited
+ *      `NODE_OPTIONS` preloaded this hook, which patched the file first.  The
+ *      checker then reported "patched / exit 0" on a file that had been clean
+ *      one moment earlier.  Same command, same file: `env -u NODE_OPTIONS`
+ *      said `NOT patched / exit 1`, the inherited environment said
+ *      `patched / exit 0`.  Every upgrade-decision branch in `UPGRADE.md` rests
+ *      on that answer.
+ *   2. Cost.  Measured `node -e '0'`: 29 ms without the hook, 91/97/187 ms with
+ *      it (+60…160 ms per node process), and the log grew to 1584 lines / 1082
+ *      pids in two days with no rotation.
+ *
+ * So the hook now runs **only** where it is needed: the Paseo daemon process
+ * chain.  `process.argv[1]` is already set when a preload runs, and it is the
+ * absolute path of the entry module, which makes the allowlist exact:
+ *
+ *   - supervisor:  `…/@getpaseo/server/dist/scripts/supervisor-entrypoint.js`
+ *                  (spawned by `paseo daemon run` via
+ *                  `startDaemonInstance({ command: process.execPath, args: [entry] })`)
+ *   - worker:      `…/@getpaseo/server/dist/server/server/daemon-worker.js`
+ *                  (`supervisor.js` `fork(workerEntry, workerArgs)`), and the
+ *                  packaged-Electron variant `dist/daemon/node-entrypoint-runner.js`
+ *                  whose argv carries the same worker path.
+ *
+ * The worker case is the one the hook exists for: the app's "upgrade server"
+ * button makes the supervisor fork a **new worker inside the running process
+ * tree**, systemd never sees a restart, and `ExecStartPre` never runs.  A hook
+ * that only matched the supervisor would miss exactly that path.
+ *
+ * Everything else returns immediately, before spawning anything.
  */
 "use strict";
 
 const { spawnSync } = require("node:child_process");
-const { appendFileSync, existsSync } = require("node:fs");
+const { appendFileSync, existsSync, readFileSync, writeFileSync } = require("node:fs");
 const { dirname, join, resolve: pathResolve } = require("node:path");
 
 const ACTIVE_ENV = "PASEO_DSH_PATCH_HOOK_ACTIVE";
@@ -124,12 +162,112 @@ function stripHookFromNodeOptions(nodeOptions, hookPath) {
   return kept.join(" ").trim();
 }
 
+/**
+ * How many lines the hook log may reach before it is truncated.
+ *
+ * The log had no bound at all: 1584 lines / 1082 distinct pids in two days on
+ * this machine, and it only grows.  Nothing prunes it, and it is written by a
+ * preload that runs before any application code — so "grow forever" is not a
+ * theoretical concern here.
+ *
+ * Truncation keeps the **newest** lines (they are the ones that explain the
+ * current install) and rewrites the file in one go.  A failed rewrite is not
+ * fatal: logging must never keep the daemon from starting.
+ */
+const LOG_MAX_LINES = 500;
+
 function log(line) {
   try {
     appendFileSync(logPath, `${new Date().toISOString()} [${process.pid}] ${line}\n`);
+    trimLog();
   } catch {
     // Logging must never be the reason a daemon fails to start.
   }
+}
+
+/**
+ * Keep at most `LOG_MAX_LINES` lines, dropping the oldest.
+ *
+ * Reads the whole file only when it has plausibly grown past the limit, so the
+ * steady-state cost stays a single `appendFileSync`.  The file is small (a few
+ * hundred KB at most), and the rewrite is not atomic — a concurrent append from
+ * another process during the rewrite can lose a line.  That is acceptable for a
+ * diagnostic log; the alternative (locking) would put a lock in the daemon's
+ * startup path for a log file.
+ */
+function trimLog() {
+  let existing;
+  try {
+    existing = readFileSync(logPath, "utf8");
+  } catch {
+    return;
+  }
+  // Cheap pre-check: a line is at least ~30 bytes, so fewer bytes than
+  // `LOG_MAX_LINES * 30` cannot be over the limit.
+  if (existing.length < LOG_MAX_LINES * 30) return;
+  const lines = existing.split("\n");
+  // A trailing newline produces one empty element; keep it out of the count.
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  if (lines.length <= LOG_MAX_LINES) return;
+  const kept = lines.slice(lines.length - LOG_MAX_LINES);
+  try {
+    writeFileSync(logPath, `${kept.join("\n")}\n`);
+  } catch {
+    // Same rule as `log()`: never fatal.
+  }
+}
+
+/**
+ * The only entry modules the hook patches.
+ *
+ * Read from `@getpaseo/server@0.14.0-beta.2`, not guessed:
+ *   - `dist/scripts/supervisor-entrypoint.js` — what `paseo daemon run` spawns
+ *     (`commands/daemon/local-daemon.js` → `startDaemonInstance({command:
+ *     process.execPath, args: [entry]})`);
+ *   - `dist/server/server/daemon-worker.js` — what `supervisor.js` forks
+ *     (`child = fork(workerEntry, workerArgs, …)`), i.e. the in-app-upgrade path;
+ *   - `dist/daemon/node-entrypoint-runner.js` — the packaged-Electron variant,
+ *     spawned as `node-entrypoint-runner.js node-script <worker>`, so its argv
+ *     carries the worker path but argv[1] is the runner.
+ *
+ * @type {Set<string>}
+ */
+const DAEMON_ENTRY_BASENAMES = new Set([
+  "supervisor-entrypoint.js",
+  "daemon-worker.js",
+  "node-entrypoint-runner.js",
+]);
+
+/**
+ * Is this process one the hook must patch?
+ *
+ * `argv[1]` is the entry module's absolute path (verified on this machine for
+ * both `spawn(execPath, [entry])` and `fork(entry, args)`): a `--require` preload
+ * runs after Node has resolved the entry point.  `node -e` leaves it undefined,
+ * which correctly reads as "not a daemon".
+ *
+ * Matching is by **basename**, not by full path: the install root differs
+ * between a global npm prefix, a pnpm store and a packaged Electron app, and a
+ * path prefix would silently stop matching after such a move — the hook would
+ * then do nothing and the patch would quietly disappear on the next in-app
+ * upgrade, which is the exact failure this file exists to prevent.  The three
+ * basenames are specific enough (`daemon-worker.js` is not a name a random tool
+ * ships).
+ *
+ * @param {string | undefined} entry - `process.argv[1]`
+ * @returns {boolean}
+ */
+function isDaemonEntry(entry) {
+  if (typeof entry !== "string" || entry === "") return false;
+  const base = entry.replace(/\\/gu, "/").split("/").pop() ?? "";
+  return DAEMON_ENTRY_BASENAMES.has(base);
+}
+
+if (!isDaemonEntry(process.argv[1])) {
+  // Not the Paseo daemon chain: leave this process completely alone.  This is
+  // what keeps `check-rewind-patch.mjs` / `--check` genuinely read-only, and
+  // what keeps the hook off every unrelated node process the daemon spawns.
+  return;
 }
 
 if (!existsSync(patchScript)) {
