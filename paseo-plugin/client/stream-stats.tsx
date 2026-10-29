@@ -1,7 +1,8 @@
 import type { PluginClientContext, PluginTimelineItemProps } from "@getpaseo/plugin/client";
-import { Fragment, useState } from "react";
+import { Fragment, useLayoutEffect, useRef, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import { z } from "zod";
+import { measureFooterGap, watchFooter } from "./web";
 
 export const streamStatsSchema = z.object({
   firstTokenMs: z.number().optional(),
@@ -23,6 +24,12 @@ export const streamStatsSchema = z.object({
 });
 
 type StreamStats = z.infer<typeof streamStatsSchema>;
+
+/** Space to keep between the stats row and the footer's copy line. */
+const DESIRED_GAP = 6;
+/** Bounds on how far the row may move, so a bad measure cannot drag it away. */
+const MAX_SHIFT = 24;
+const MIN_SHIFT = -40;
 
 function formatLatency(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
@@ -70,7 +77,36 @@ function toolsLine(data: StreamStats): string | undefined {
 /** One compact line under an answer; tap to expand the full picture. */
 function StreamStatsRow({ item, theme, layout }: PluginTimelineItemProps<StreamStats>) {
   const [open, setOpen] = useState(false);
+  const [shift, setShift] = useState({ top: 0, bottom: 0 });
+  const rowRef = useRef<unknown>(null);
+  const applied = useRef({ top: 0, bottom: 0 });
   const data = item.data;
+
+  // The ref must match what the DOM carries, not what the next render will
+  // apply: an observer callback before the commit would otherwise measure
+  // against an origin the frame has not moved to yet.
+  useLayoutEffect(() => {
+    applied.current = shift;
+  }, [shift]);
+
+  // Paseo appends the completed-turn footer at the end of a turn, so the stats
+  // row can be above it or below it. Measure whichever side the copy line is
+  // actually on and move toward it; no assumption about ordering.
+  useLayoutEffect(() => {
+    const measure = () => {
+      const found = measureFooterGap(rowRef.current, applied.current);
+      if (found === null) {
+        setShift((current) => (current.top === 0 && current.bottom === 0 ? current : { top: 0, bottom: 0 }));
+        return;
+      }
+      const next = Math.max(MIN_SHIFT, Math.min(MAX_SHIFT, Math.round(DESIRED_GAP - found.gap)));
+      const target = found.side === "above" ? { top: next, bottom: 0 } : { top: 0, bottom: next };
+      setShift((current) => (current.top === target.top && current.bottom === target.bottom ? current : target));
+    };
+    measure();
+    const stop = watchFooter(rowRef.current, measure);
+    return stop ?? undefined;
+  }, [open]);
   const fontSize = layout.compact ? 10 : 11;
   const muted = theme.colors.foregroundMuted;
   const base = { color: muted, fontSize, fontVariant: ["tabular-nums"] as const };
@@ -100,10 +136,11 @@ function StreamStatsRow({ item, theme, layout }: PluginTimelineItemProps<StreamS
 
   return (
     <Pressable
+      ref={rowRef}
       accessibilityRole="button"
       accessibilityLabel={open ? "收起回答统计" : "展开回答统计"}
       onPress={() => setOpen((value) => !value)}
-      style={{ alignSelf: "flex-start", marginTop: 0, marginBottom: 0, paddingLeft: 2 }}
+      style={{ alignSelf: "flex-start", marginTop: shift.top, marginBottom: shift.bottom, paddingLeft: 2 }}
     >
       <View style={{ flexDirection: "row", alignItems: "center", flexWrap: "wrap" }}>
         {segments.map((segment, index) => (
