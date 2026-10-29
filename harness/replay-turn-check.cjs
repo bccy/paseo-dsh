@@ -397,6 +397,123 @@ function applyPaseoTurnRule(events) {
     );
     console.log("PASS 被撤回的回合（可见日志里只剩 turn/start）不发任何 session.turn");
   }
+
+  // ---- Paseo 自己的信封消息必须重放成行 --------------------------------
+  //
+  // 其它代理（`kind="agent-message"` / `kind="agent-notification"`）、schedule、
+  // notify-on-finish 发给会话的指令都被 Paseo 包进 `<paseo-system …>` 信封，桥把它
+  // 记成 `source.kind === "paseo"`（`dsh-bridge/lib/paseo-system-envelope.js` 的
+  // `promptSource`）。live 时插件不发 user 行 —— 宿主把这条 prompt 自己投影成
+  // `agent_message` / `heartbeat` 工具行。重开时宿主只对 provider 重放出来的
+  // `user_message` 跑**同一个**投影（`@getpaseo/server` 的
+  // `agent/agent-messages/envelope.js`：`projectAgentMessages` → `parseAgentMessage`），
+  // 所以重放里少了这一行，宿主就永远拿不回那条工具行：真机现象是每个回合开头的
+  // 指令消失、只剩模型的回答（reload 前有 `tool_call name=agent_message`，reload 后没有）。
+  //
+  // 断言打在协议层：行原文必须**完整**（宿主靠信封属性认出 kind 与发送方，剥掉信封就
+  // 退化成一条普通用户消息），不能带 `revertToken`（live 的 `agent_message` 行没有撤回
+  // 入口），并且它作为该回合的首行要落在自己的 turnId 区间内。
+  console.log("\nPaseo 信封消息重放成 user_message 行（宿主再把它投影成 agent_message）");
+  {
+    // 与宿主 `formatAgentMessage` 逐字同形：属性在开标签上，body 前后各一个换行。
+    const envelope = [
+      '<paseo-system version="1" kind="agent-message" source-agent-id="agent-a"'
+        + ' source-agent-title="上游代理" message-id="m-1">',
+      "把结果整理成三行。",
+      "</paseo-system>",
+    ].join("\n");
+    const skillCatalog = "技能目录：可用技能若干";
+    const at = (seq) => Date.UTC(2026, 0, 2, 4, 0, 0) + seq * 1000;
+    // 技能目录（`source.kind === "skill"`）先注入、信封消息后到：注入的不是指令，
+    // 它不出行，于是信封消息就是这一回合的第一行。
+    const envelopeHistory = [
+      { type: "turn/start", seq: 1, time: at(1), data: { turn: 10 } },
+      {
+        type: "user/message",
+        seq: 2,
+        time: at(2),
+        data: { id: "skill-1", source: { kind: "skill" }, content: [{ type: "text", text: skillCatalog }] },
+      },
+      {
+        type: "user/message",
+        seq: 3,
+        time: at(3),
+        data: { id: "env-1", source: { kind: "paseo" }, content: [{ type: "text", text: envelope }] },
+      },
+      {
+        type: "assistant/message",
+        seq: 4,
+        time: at(4),
+        data: { turn: 10, step: 1, message: { id: "assistant-10", content: [{ type: "text", text: "整理好了" }] } },
+      },
+      { type: "turn/end", seq: 5, time: at(5), data: { turn: 10, reason: { kind: "completed" } } },
+    ];
+
+    const envelopeEvents = [];
+    const envelopeTransport = new FakeProcess({ sessionId: "__paseo_shared_process__" });
+    envelopeTransport.historyResponse = { available: true, events: envelopeHistory };
+    const envelopeSession = new DshSession({
+      sessionId: "replay-turn-envelope",
+      cwd: process.cwd(),
+      env: {},
+      route: { provider: "fixture", model: "alpha" },
+      mode: "build",
+      models: [{ id: "fixture/alpha" }],
+      thinkingOptions: [],
+      emit: (e) => envelopeEvents.push(e),
+      log() {},
+      acquireProcess: async () => ({ process: envelopeTransport, reused: false }),
+      releaseProcess: () => {},
+    });
+    await envelopeSession.open();
+    await envelopeSession.replayHistory();
+
+    const rows = envelopeEvents.filter((event) => event.type === "timeline.item");
+    const rowSummary = JSON.stringify(rows.map((event) => [event.item.type, event.item.text]));
+    const envelopeRow = rows.find((event) => event.item.type === "user_message" && event.item.text === envelope);
+    assert.ok(
+      envelopeRow !== undefined,
+      `source.kind="paseo" 的信封消息没有重放成 user_message 行（重开后宿主就没有 agent_message 行了）：${rowSummary}`,
+    );
+    // 原文，不是解出来的 body：宿主必须能重新解析出 kind 与发送方。
+    assert.equal(envelopeRow.item.text, envelope, "信封消息的行必须带完整信封原文");
+    assert.equal(
+      envelopeRow.item.revertToken,
+      undefined,
+      "信封消息重放出的行不该带 revertToken：live 的 agent_message 行没有撤回入口",
+    );
+    assert.equal(envelopeRow.item.id, "user:history:3", `行的 id 命名应与现有 user 行一致，实际 ${String(envelopeRow.item.id)}`);
+    assert.equal(
+      envelopeRow.item.clientMessageId,
+      "history:3",
+      `行的 clientMessageId 命名应与现有 user 行一致，实际 ${String(envelopeRow.item.clientMessageId)}`,
+    );
+    assert.ok(
+      !rows.some((event) => event.item.text === skillCatalog),
+      `source.kind="skill" 的注入消息不该出 user 行，实际行：${rowSummary}`,
+    );
+    console.log("PASS source.kind=paseo 的信封消息重放出原文行、无 revertToken；source.kind=skill 仍不出行");
+
+    // 归属与位置：它就是该回合的首行，所以 `started` 必须紧贴在它前面 —— 这条同时
+    // 钉住「turn 的 started 延迟到首行」规则对信封行也成立（否则客户端拿不到 turnId，
+    // 重开后的指令会退化成一条伪回合的起点）。
+    const { items } = applyPaseoTurnRule(envelopeEvents);
+    const entry = items.find((candidate) => candidate.item === envelopeRow.item);
+    assert.ok(entry !== undefined, "信封行没有出现在 Paseo 的行序列里");
+    assert.equal(
+      entry.turnId,
+      "turn:history:10",
+      `信封行应落在它自己的回合区间内，实际 turnId=${String(entry.turnId)}`,
+    );
+    const rowIndex = envelopeEvents.indexOf(envelopeRow);
+    const before = envelopeEvents[rowIndex - 1];
+    assert.ok(
+      before !== undefined && before.type === "session.turn" && before.state === "started",
+      `信封行是首行，它前面应紧邻 session.turn started，实际 ${JSON.stringify(before)}`,
+    );
+    assert.equal(before.turnId, "turn:history:10", `started 的 turnId 应与行一致，实际 ${String(before.turnId)}`);
+    console.log("PASS 信封行是该回合首行、落在自己的 turnId 区间内（started 紧贴其前）");
+  }
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;

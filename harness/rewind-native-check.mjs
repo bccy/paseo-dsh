@@ -17,6 +17,13 @@
  *
  * Usage: node harness/rewind-native-check.mjs [--keep]
  * Costs a few model turns. Requires the patched daemon to be running.
+ *
+ * The provider and its model are **read from the daemon**, never hard-coded:
+ * `REWIND_PROVIDER` / `REWIND_MODEL` override, otherwise the single ready
+ * `source: "custom"` provider (that is what a plugin registration is) and the
+ * model it flags `isDefault` are used. When the daemon cannot name them
+ * unambiguously the probe prints the candidates and exits **2** — "could not
+ * resolve a route" is not a test result and must not look like a rewind failure.
  */
 
 import { createRequire } from "node:module";
@@ -98,17 +105,26 @@ const statusWatcher = (async () => {
 })();
 
 let agentId;
+/** Exit code override: 2 means "the daemon could not name a route", not a failure. */
+let exitCode;
 
 try {
   await client.connect();
 
   process.stdout.write(`\n[1] 创建 agent（cwd=${root}）\n`);
   // `provider` is a provider **id**, not `provider/model`; the model is a
-  // separate override (agent-manager rejects the combined form as "not configured").
+  // separate override (agent-manager rejects the combined form as "not
+  // configured"). Neither is hard-coded: this repo is installed on other
+  // machines, where both names differ. The provider and its default model are
+  // read off the daemon, and a daemon that cannot name them is reported rather
+  // than guessed at — a guessed route here fails deep inside a model turn, long
+  // after the probe looked like it started.
+  const route = await resolveRoute(client);
+  process.stdout.write(`    provider=${route.provider}  model=${route.model}\n`);
   const created = await client.createAgent({
     cwd: root,
-    provider: process.env.REWIND_PROVIDER ?? "deepseek-harness-native",
-    model: process.env.REWIND_MODEL ?? "cpa/deepseek-flash",
+    provider: route.provider,
+    model: route.model,
     initialPrompt: "记住暗号是 ALPHA。只回复“好”。",
   });
   agentId = created.agentId ?? created.id;
@@ -216,8 +232,14 @@ try {
   check("撤回后仍能继续对话", typeof answer === "string" && answer.length > 0);
   check("模型回答 ALPHA（看不到被撤的 BETA）", /ALPHA/i.test(answer), String(answer).slice(0, 60));
 } catch (error) {
-  fail += 1;
-  process.stdout.write(`  ✗ 探针异常: ${error instanceof Error ? error.message : String(error)}\n`);
+  if (error instanceof RouteUnresolvedError) {
+    // Not a test result: no route means nothing was measured.
+    process.stdout.write(`  ✗ 无法确定要测的 provider/model：${error.message}\n`);
+    exitCode = 2;
+  } else {
+    fail += 1;
+    process.stdout.write(`  ✗ 探针异常: ${error instanceof Error ? error.message : String(error)}\n`);
+  }
 } finally {
   watching = false;
   try {
@@ -232,7 +254,7 @@ try {
   }
   if (!keep) rmSync(root, { recursive: true, force: true });
   process.stdout.write(`\n结果：${pass} 通过, ${fail} 失败\n`);
-  process.exit(fail === 0 ? 0 : 1);
+  process.exit(exitCode ?? (fail === 0 ? 0 : 1));
 }
 
 /**
@@ -327,4 +349,114 @@ function unwrapSessionId(raw) {
 async function readProviderSessionId(client, agentId) {
   const me = await findAgent(client, agentId);
   return unwrapSessionId(me?.runtimeInfo?.sessionId);
+}
+
+/**
+ * Raised when the daemon cannot name a provider/model for this probe.
+ *
+ * Distinct from a failed assertion: nothing was measured, so the script must not
+ * report "0 passed, 1 failed" as if the rewind had been tested and broken.
+ */
+class RouteUnresolvedError extends Error {}
+
+/** Abort with the "cannot resolve the route" exit code (2) and a reason. */
+function unresolved(message) {
+  throw new RouteUnresolvedError(message);
+}
+
+/**
+ * The provider/model this probe creates its agent on.
+ *
+ * Neither name may be hard-coded: this repository is installed on other machines,
+ * where both differ, and the DSH provider id is a plugin identity rather than a
+ * protocol constant. The daemon already knows both — a plugin-registered provider
+ * is the `source: "custom"` entry in its providers snapshot (the host's
+ * `provider-snapshot-manager.js` marks every `pluginProviders` id that way), and
+ * that provider's default model is the one `listProviderModels` flags
+ * `isDefault` — the same entry the daemon's own `resolveDefaultModelId` would
+ * pick for a create request that named no model.
+ *
+ * Anything ambiguous ends the run with exit 2 and the candidates instead of a
+ * guess: a wrong route fails deep inside the first model turn, long after the
+ * probe looked like it had started, and reads as a rewind failure.
+ */
+async function resolveRoute(client) {
+  const provider = await resolveProvider(client);
+  const model = await resolveModel(client, provider);
+  return { provider, model };
+}
+
+/** The plugin provider to probe: `REWIND_PROVIDER`, else the only ready one. */
+async function resolveProvider(client) {
+  const configured = process.env.REWIND_PROVIDER;
+  if (configured !== undefined && configured !== "") return configured;
+
+  // Bounded wait, not a guess: the snapshot is warmed asynchronously at daemon
+  // start, and a plugin provider that is still `loading` has not been ruled out.
+  const deadline = Date.now() + 20_000;
+  let entries = [];
+  for (;;) {
+    let snapshot;
+    try {
+      snapshot = await client.getProvidersSnapshot();
+    } catch (error) {
+      unresolved(
+        `读取 daemon 的 provider 快照失败：${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    entries = snapshot?.entries ?? [];
+    const ready = entries.filter(
+      (entry) => entry.source === "custom" && entry.status === "ready" && entry.enabled !== false,
+    );
+    if (ready.length === 1) return ready[0].provider;
+    if (ready.length > 1) {
+      unresolved(
+        `daemon 报告 ${String(ready.length)} 个可用的自定义 provider（${ready
+          .map((entry) => entry.provider)
+          .join(", ")}），无法确定要测哪一个；设 REWIND_PROVIDER 指定`,
+      );
+    }
+    if (Date.now() > deadline) {
+      const custom = entries.filter((entry) => entry.source === "custom");
+      const described = (custom.length > 0 ? custom : entries).map(
+        (entry) => `${entry.provider}=${String(entry.status)}${entry.enabled === false ? "(disabled)" : ""}`,
+      );
+      unresolved(
+        custom.length > 0
+          ? `daemon 的自定义 provider 都不 ready（${described.join(", ")}）；设 REWIND_PROVIDER 指定`
+          : `daemon 没有报告任何自定义 provider（provider 快照：${described.join(", ") || "空"}）；`
+            + "paseo-dsh 插件没装或没启用？可设 REWIND_PROVIDER 指定",
+      );
+    }
+    await sleep(500);
+  }
+}
+
+/** The provider's default model: `REWIND_MODEL`, else the one marked default. */
+async function resolveModel(client, provider) {
+  const configured = process.env.REWIND_MODEL;
+  if (configured !== undefined && configured !== "") return configured;
+
+  let payload;
+  try {
+    payload = await client.listProviderModels(provider, { cwd: root });
+  } catch (error) {
+    unresolved(
+      `读取 provider '${provider}' 的模型列表失败：${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (typeof payload?.error === "string" && payload.error !== "") {
+    unresolved(`daemon 拒绝列出 provider '${provider}' 的模型：${payload.error}`);
+  }
+  const models = payload?.models ?? [];
+  const defaults = models.filter((model) => model.isDefault === true);
+  if (defaults.length === 1) return defaults[0].id;
+  const ids = models.map((model) => model.id).join(", ") || "空";
+  unresolved(
+    defaults.length === 0
+      ? `provider '${provider}' 没有标出默认模型（可选：${ids}）；设 REWIND_MODEL 指定`
+      : `provider '${provider}' 标了 ${String(defaults.length)} 个默认模型（${defaults
+          .map((model) => model.id)
+          .join(", ")}）；设 REWIND_MODEL 指定`,
+  );
 }

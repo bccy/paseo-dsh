@@ -269,8 +269,10 @@ function messageRowText(content: unknown): string {
  * own behalf — a schedule fire, a notify-on-finish notice — in a
  * `<paseo-system>` envelope, and the bridge records those prompts under a
  * non-`user` kind so the transcript does not attribute the host's own notice to
- * the human (see `dsh-bridge/lib/paseo-system-envelope.js`). Live rows and the
- * replay filter must agree, so a non-`user` kind gets no user row.
+ * the human (see `dsh-bridge/lib/paseo-system-envelope.js`). A live prompt of
+ * such a kind therefore gets no user row: the host projects the prompt into an
+ * `agent_message` / `heartbeat` row of its own. The replay answers a different
+ * question and does emit the row — see {@link DshSession.replayHistory}.
  *
  * A missing kind (an older bridge) keeps the previous behaviour: treat the
  * prompt as the human's own and emit the row, rather than silently drop a real
@@ -278,6 +280,38 @@ function messageRowText(content: unknown): string {
  */
 function isUserSource(sourceKind: string | undefined): boolean {
   return sourceKind === undefined || sourceKind === "user";
+}
+
+/**
+ * Whether a replayed `user/message` becomes a timeline row, and whether that row
+ * is the human's own.
+ *
+ * The replay and the live path answer different questions, so they cannot share
+ * one predicate. Live, Paseo's own prompts get no row at all — the host projects
+ * the envelope into an `agent_message` / `heartbeat` row of its own, and a
+ * provider row as well would show the same prompt twice. Replay, the host runs
+ * the identical projection over whatever `user_message` rows the provider
+ * produces (`projectAgentMessages` in the host's `agent-messages/envelope.js`),
+ * so emitting the row is exactly how a reopened session gets its
+ * `agent_message` row back. Skipping it here dropped the instruction at the head
+ * of every turn and left only the model's answer: the live timeline had
+ * `tool_call name=agent_message` before a reload and none after it.
+ *
+ * `paseo` is therefore replayed as a row, and everything else DSH injects — a
+ * skill catalog (`skill`), a runtime snapshot, a rewind marker (`paseo-rewind`,
+ * whose surface replacement already withdrew the rows it names) — still is not.
+ *
+ * @returns `"user"` for the human's own turn, `"paseo"` for a host envelope
+ *   (both become rows; only the first carries a revert token — a live
+ *   `agent_message` row has no rewind entry either), or `undefined` to skip.
+ */
+function replayRowSource(source: Record<string, unknown>): "user" | "paseo" | undefined {
+  const kind = source.kind;
+  // An absent kind is an older bridge that recorded no source: treat the prompt
+  // as the human's own, the same rule {@link isUserSource} keeps for live rows.
+  if (kind === undefined) return "user";
+  if (kind === "user" || kind === "paseo") return kind;
+  return undefined;
 }
 
 /** Resolve Paseo's catalog id (`provider/model`) back into a DSH route. */
@@ -729,9 +763,12 @@ export class DshSession {
    * Paseo asks for this (`history: "replay"`) when it reopens a session — after
    * a restart, or when importing a native DSH session. DSH's resume restores the
    * model's context but never re-emits the events, so without this the reopened
-   * session would show an empty conversation. Only real user turns are replayed
-   * as user messages; DSH's injected context (skill catalogs, runtime snapshots,
-   * approval notices) carries a different `source.kind` and is skipped.
+   * session would show an empty conversation. Real user turns and Paseo's own
+   * envelope prompts are replayed as user messages — the host projects the
+   * latter into its `agent_message` / `heartbeat` row, see
+   * {@link replayRowSource}. DSH's injected context (skill catalogs, runtime
+   * snapshots, approval notices) carries a different `source.kind` and is
+   * skipped.
    */
   async replayHistory(): Promise<void> {
     const { events, available, error } = await this.#require().history(this.#dshSessionId);
@@ -806,7 +843,8 @@ export class DshSession {
       }
       if (event.type === "user/message") {
         const source = isRecord(data.source) ? data.source : {};
-        if (source.kind !== "user") continue;
+        const rowSource = replayRowSource(source);
+        if (rowSource === undefined) continue;
         // `messageRowText`, not `textBlocks`: a prompt that carried only an
         // image has no text block, and skipping it made the user's turn (and its
         // revert token) disappear on every reopen. A genuinely empty message —
@@ -825,8 +863,12 @@ export class DshSession {
             clientMessageId: `history:${seq}`,
             // The DSH event carries the message id the bridge returned, which is
             // exactly the token a live row would carry — so a replayed
-            // conversation is rewindable to the same places.
-            ...(typeof data.id === "string" ? { revertToken: { messageId: data.id } } : {}),
+            // conversation is rewindable to the same places. A host envelope has
+            // no rewind entry of its own: live it is an `agent_message` row,
+            // which the daemon never offers to withdraw.
+            ...(rowSource === "user" && typeof data.id === "string"
+              ? { revertToken: { messageId: data.id } }
+              : {}),
           },
         });
         continue;
@@ -1154,8 +1196,9 @@ export class DshSession {
       // "shown now, token later" left a window where the rewind button appeared
       // on a row the daemon could not map to a provider token.
       //
-      // Emitted only for the human's own source kind, the same rule the replay
-      // filter applies — see {@link isUserSource}.
+      // Emitted only for the human's own source kind — see {@link isUserSource}
+      // for why a host envelope gets its row from the daemon's projection here
+      // but from the replay on reopen.
       if (isUserSource(reply.sourceKind)) {
         this.#emitUserMessage(
           prompt.clientMessageId,
@@ -1207,12 +1250,14 @@ export class DshSession {
     // "shown now, token later" left a window where the rewind button appeared on
     // a row the daemon could not map to a provider token.
     //
-    // Paseo's own prompts — a schedule fire, a notify-on-finish notice — arrive
-    // wrapped in a `<paseo-system>` envelope and the bridge records them under a
-    // non-`user` source kind, because they are the host talking to the agent, not
-    // the human. Emitting the row anyway printed the envelope XML as if the user
-    // had typed it, and the replay filter then dropped the same message on the
-    // next reopen (see `replayHistory`). The rule is the same on both sides now.
+    // Paseo's own prompts — a schedule fire, a notify-on-finish notice, another
+    // agent's message — arrive wrapped in a `<paseo-system>` envelope and the
+    // bridge records them under a non-`user` source kind, because they are the
+    // host talking to the agent, not the human. Emitting the row anyway printed
+    // the envelope XML as if the user had typed it, and the daemon already
+    // projects that same prompt into an `agent_message` / `heartbeat` row of its
+    // own — so the row would also be duplicated. On reopen the provider *is* the
+    // only source of that row, so the replay emits it (see `replayRowSource`).
     if (isUserSource(reply.sourceKind)) {
       this.#emitUserMessage(
         prompt.clientMessageId,
@@ -2409,7 +2454,11 @@ export class DshChildSession {
       }
       if (event.type === "user/message") {
         const source = isRecord(data.source) ? data.source : {};
-        if (source.kind !== "user") continue;
+        // The same rule the root replay applies — see {@link replayRowSource}:
+        // a host envelope is replayed as a row too, so a child that was ever
+        // messaged through Paseo keeps the instruction on reopen.
+        const rowSource = replayRowSource(source);
+        if (rowSource === undefined) continue;
         // `messageRowText`, not `textBlocks`: a prompt that carried only an
         // image has no text block, and skipping it made the user's turn (and its
         // revert token) disappear on every reopen. A genuinely empty message —
@@ -2427,8 +2476,11 @@ export class DshChildSession {
             clientMessageId: `history:${seq}`,
             // The DSH event carries the message id the bridge returned, which is
             // exactly the token a live row would carry — so a replayed
-            // conversation is rewindable to the same places.
-            ...(typeof data.id === "string" ? { revertToken: { messageId: data.id } } : {}),
+            // conversation is rewindable to the same places. A host envelope has
+            // no rewind entry of its own.
+            ...(rowSource === "user" && typeof data.id === "string"
+              ? { revertToken: { messageId: data.id } }
+              : {}),
           },
         });
         continue;
