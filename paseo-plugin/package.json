@@ -26,7 +26,6 @@
     "paseo-plugin.json",
     "index.server.ts",
     "server/",
-    "shared/",
     "lib/",
     "bin/",
     "icon.svg",

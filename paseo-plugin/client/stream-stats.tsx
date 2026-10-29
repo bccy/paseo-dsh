@@ -1,10 +1,7 @@
 import type { PluginClientContext, PluginTimelineItemProps } from "@getpaseo/plugin/client";
-import { useSettings } from "@getpaseo/plugin/client";
-import { Fragment, useLayoutEffect, useRef, useState } from "react";
+import { Fragment, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import { z } from "zod";
-import { DEFAULT_STREAM_STATS, streamStatsSettings } from "../shared/settings";
-import { measureFooterLift, watchFooter } from "./web";
 
 export const streamStatsSchema = z.object({
   firstTokenMs: z.number().optional(),
@@ -23,37 +20,9 @@ export const streamStatsSchema = z.object({
   steps: z.number().optional(),
   sessionTokens: z.number().optional(),
   cacheHit: z.number().optional(),
-  /** Last stats row of a turn: Paseo puts its completed-turn footer above it. */
-  final: z.boolean().optional(),
 });
 
 type StreamStats = z.infer<typeof streamStatsSchema>;
-
-/**
- * Paseo draws the completed-turn footer — copy / model / time — directly under
- * the answer and keeps its own bottom padding free under it, while this row is
- * an ordinary timeline item spaced by the host's item gap. Neither number is
- * ours to rely on: a theme plugin restyles that footer, and the same footer is
- * also drawn under turns that are no longer the newest, where the host's
- * margins differ (the row sits 35px under the footer while its turn is latest,
- * 23px once a newer turn arrives).
- *
- * On web the row measures the footer actually painted above it (in `./web`,
- * the only client file allowed to touch the DOM) and lifts itself to the gap
- * the user chose in Settings → Plugins. Native has no DOM to measure; it keeps
- * the geometry the host's footer was tuned for.
- */
-/** Paseo's `SPACING[8]` (`TURN_FOOTER_BOTTOM_SPACING`): the footer's bottom padding. */
-const TURN_FOOTER_BOTTOM_PADDING = 32;
-/**
- * The furthest the row may pull up. Measured gaps can exceed Paseo's own 32px
- * footer padding once a theme restyles the footer, so the cap is twice that:
- * generous enough for themed footers, still bounded so a mis-measure cannot
- * drag the row across the answer.
- */
-const MAX_ROW_LIFT = -2 * TURN_FOOTER_BOTTOM_PADDING;
-/** Paseo's footer sets its text in a 18px line box at 13px. */
-const LINE_HEIGHT_RATIO = 18 / 13;
 
 function formatLatency(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
@@ -101,60 +70,10 @@ function toolsLine(data: StreamStats): string | undefined {
 /** One compact line under an answer; tap to expand the full picture. */
 function StreamStatsRow({ item, theme, layout }: PluginTimelineItemProps<StreamStats>) {
   const [open, setOpen] = useState(false);
-  const [lift, setLift] = useState(0);
-  const rowRef = useRef<unknown>(null);
-  /** The lift currently in the DOM, which the next measurement has to discount. */
-  const appliedLift = useRef(0);
-  const settings = useSettings(streamStatsSettings);
-  const gap = settings.status === "ready" ? settings.values.gapPx : DEFAULT_STREAM_STATS.gapPx;
-  const fontSize = settings.status === "ready" ? settings.values.fontSize : DEFAULT_STREAM_STATS.fontSize;
   const data = item.data;
-
-  // The ref must describe the margin the DOM actually carries, not the one a
-  // pending render is about to apply: a ResizeObserver callback between
-  // `setLift` and its commit would otherwise discount a lift the frame has not
-  // moved by yet and measure against the wrong origin.
-  useLayoutEffect(() => {
-    appliedLift.current = lift;
-  }, [lift]);
-
-  const applyLift = (next: number) => {
-    if (appliedLift.current === next) return;
-    setLift(next);
-  };
-
-  // The footer above this row is the host's markup and, with a theme plugin
-  // installed, that plugin's restyling of it — so its height and padding are
-  // measured instead of assumed. Everything DOM lives in `./web`; off web it
-  // reports nothing, the row keeps the host's own gap, and native falls back to
-  // the constant `nativeLift` below.
-  useLayoutEffect(() => {
-    if (data.final !== true) {
-      applyLift(0);
-      return;
-    }
-    const measure = () => {
-      const next = measureFooterLift(rowRef.current, {
-        appliedLift: appliedLift.current,
-        gap,
-        maxLift: MAX_ROW_LIFT,
-      });
-      applyLift(next ?? 0);
-    };
-    measure();
-    const stop = watchFooter(rowRef.current, measure);
-    return stop ?? undefined;
-    // `applyLift` only reads refs and a state setter, so the values that can
-    // change what is measured are the only dependencies.
-  }, [data.final, gap]);
-
+  const fontSize = layout.compact ? 10 : 11;
   const muted = theme.colors.foregroundMuted;
-  const base = {
-    color: muted,
-    fontSize,
-    lineHeight: Math.round(fontSize * LINE_HEIGHT_RATIO),
-    fontVariant: ["tabular-nums"] as const,
-  };
+  const base = { color: muted, fontSize, fontVariant: ["tabular-nums"] as const };
 
   const ratio = contextRatio(data);
   const segments: Array<{ text: string; color: string }> = [];
@@ -178,20 +97,13 @@ function StreamStatsRow({ item, theme, layout }: PluginTimelineItemProps<StreamS
   const details = [contextLine(data), tokensLine(data), routeLine(data), toolsLine(data)].filter(
     (line): line is string => line !== undefined,
   );
-  const nativeLift = gap - TURN_FOOTER_BOTTOM_PADDING;
 
   return (
     <Pressable
-      ref={rowRef}
       accessibilityRole="button"
       accessibilityLabel={open ? "收起回答统计" : "展开回答统计"}
       onPress={() => setOpen((value) => !value)}
-      style={{
-        alignSelf: "flex-start",
-        marginTop: data.final === true ? (layout.platform === "web" ? lift : nativeLift) : 0,
-        marginBottom: 0,
-        paddingLeft: 2,
-      }}
+      style={{ alignSelf: "flex-start", marginTop: 0, marginBottom: 0, paddingLeft: 2 }}
     >
       <View style={{ flexDirection: "row", alignItems: "center", flexWrap: "wrap" }}>
         {segments.map((segment, index) => (

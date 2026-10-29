@@ -1,7 +1,6 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { ensurePaseoProfile } from "./server/bootstrap";
 import { createDshProvider } from "./server/provider";
-import { streamStatsSettings } from "./shared/settings";
 
 /**
  * Register the DeepSeek Harness provider, provisioning the DSH profile it needs.
@@ -25,7 +24,6 @@ export default function contribute(server: PluginServerContext) {
     );
   }
 
-  server.registerSettings(streamStatsSettings);
   server.registerProvider(createDshProvider());
   return () => {};
 }
