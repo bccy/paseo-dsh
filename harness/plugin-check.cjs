@@ -313,6 +313,15 @@ const check = (name, pass, detail) => {
     lastStats === undefined ? "no stats row" : JSON.stringify(lastStats.item.data),
   );
 
+  // 1d. the last row of a completed turn is flagged so the client can tuck it
+  // under Paseo's turn footer. Without the flag the gap stays at the footer's
+  // full bottom padding, which is the bug this guards.
+  check(
+    "turn-final stats row is flagged final",
+    lastStats !== undefined && lastStats.item.data?.final === true,
+    lastStats === undefined ? "no stats row" : JSON.stringify(lastStats.item.data),
+  );
+
   // 2. the image block reached the model layer
   //
   // A text-only route makes DSH replace the image with a note saying so, and

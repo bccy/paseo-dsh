@@ -114,6 +114,18 @@ export class DshSession {
   /** Tool call start times and the current turn's tool total. */
   #toolStarts = new Map<string, number>();
   #turnTool = { count: 0, ms: 0 };
+  /**
+   * Whether the running turn was stopped by the user. A cancelled turn may not
+   * get the completed-turn footer that the stats row is pulled into, so it
+   * keeps the default spacing instead of risking an overlap.
+   */
+  #turnInterrupted = false;
+  /**
+   * Whether the stats row is the newest timeline item. If tools arrive after
+   * it, the completed-turn footer belongs to the end of the turn rather than
+   * directly above this row, so the row must keep the default spacing.
+   */
+  #statsIsTail = false;
   /** Most recent stats row, so context and tool totals can update it in place. */
   #lastStats: { id: string; data: Record<string, unknown> } | undefined;
   /** Per-step timing for the streamed-stats row. */
@@ -609,6 +621,7 @@ export class DshSession {
    * conversation stays continuable — killing the process stranded it instead.
    */
   async interrupt(): Promise<void> {
+    this.#turnInterrupted = true;
     this.#flushLive();
     this.#clearLive();
     await this.#require().cancel();
@@ -636,6 +649,7 @@ export class DshSession {
       if (this.#turnId === null) {
         this.#toolStarts.clear();
         this.#turnTool = { count: 0, ms: 0 };
+        this.#turnInterrupted = false;
         // A later usage refresh must not rewrite the previous turn's row.
         this.#lastStats = undefined;
       }
@@ -653,6 +667,14 @@ export class DshSession {
       const turnId = this.#turnId;
       this.#turnId = null;
       this.#options.emit({ type: "session.turn", sessionId: this.id, turnId, state: "completed" });
+      // Paseo renders the completed-turn footer (copy / model / time) beneath
+      // the answer only after this event, and reserves its own padding under
+      // that footer. Flag the last stats row in the same tick so the client can
+      // close the gap without first flashing the row in the wrong position.
+      if (this.#lastStats !== undefined && !this.#turnInterrupted && this.#statsIsTail) {
+        this.#lastStats.data = { ...this.#lastStats.data, final: true };
+        this.#emitStatsRow();
+      }
       // The turn's request reported fresh provider usage; refresh occupancy now
       // so the readout is current even when no further turn arrives.
       void this.refreshUsage();
@@ -840,6 +862,7 @@ export class DshSession {
   }
 
   #emitItem(item: ProviderTimelineItem): void {
+    this.#statsIsTail = item.type === "plugin" && item.kind === "dsh-stream-stats";
     this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
   }
 
