@@ -313,6 +313,14 @@ const check = (name, pass, detail) => {
     lastStats === undefined ? "no stats row" : JSON.stringify(lastStats.item.data),
   );
 
+  // 1d. the row the client tucks under the footer is flagged by the daemon, so
+  // the renderer never has to guess from neighbouring items.
+  check(
+    "the last stats row of a completed turn is flagged final",
+    lastStats !== undefined && lastStats.item.data?.final === true,
+    lastStats === undefined ? "no stats row" : JSON.stringify({ final: lastStats.item.data?.final }),
+  );
+
   // 2. the image block reached the model layer
   //
   // A text-only route makes DSH replace the image with a note saying so, and
