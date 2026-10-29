@@ -35,7 +35,35 @@ export class PaseoTransport {
   #input;
   #output;
   #decoder = new StringDecoder('utf8');
-  #buffer = '';
+  /**
+   * The chunks of the one inbound line currently being received, in order.
+   *
+   * Invariant: their concatenation contains no `\n`, so a new chunk is the only
+   * place a terminator can be hiding. The line is joined exactly once, when it
+   * completes.
+   *
+   * Two mechanics, and both are needed — this is the same defect
+   * `paseo-plugin/server/frame-reader.ts` fixes on the plugin's side of the
+   * same pipe, where it cost 56 s for one 39 MB frame:
+   *
+   * 1. **Scan only the new chunk.** The old reader re-`split('\n')` the whole
+   *    accumulated buffer on every `data` event, so a frame that arrived in
+   *    thousands of 16 KB chunks scanned its own length thousands of times. An
+   *    inbound `session/prompt` carrying a phone photo is ~13 MiB of base64, and
+   *    this process serves every session: 2.2 s of blocked event loop stalled
+   *    all of them.
+   * 2. **Accumulate into an array, never a growing string.** `buffer += chunk`
+   *    plus `indexOf` on the result looks linear and is not: `+=` builds a V8
+   *    rope and every `indexOf` starts by flattening the whole thing back into a
+   *    string, which is the same O(n²) with a smaller constant.
+   *
+   * Behavior is unchanged, including the details that are easy to "improve"
+   * into a regression: a blank line is skipped, a `\r` before the `\n` is kept
+   * in the line (the caller's `trim()` is what removes it, exactly as before),
+   * a trailing line without a newline stays pending forever, and an unparsable
+   * line is reported on stderr instead of being swallowed.
+   */
+  #partial = [];
   #started = false;
   #closed = false;
   #requestHandler;
@@ -148,26 +176,49 @@ export class PaseoTransport {
   }
 
   #onData = (chunk) => {
-    this.#buffer += typeof chunk === 'string' ? chunk : this.#decoder.write(chunk);
-    const lines = this.#buffer.split('\n');
-    this.#buffer = lines.pop() ?? '';
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed === '') continue;
-      let frame;
-      try {
-        frame = JSON.parse(trimmed);
-      } catch {
-        // A frame the peer means us to act on is JSON by contract (one
-        // JSON-RPC message per line). A torn or non-JSON line is therefore a
-        // protocol bug, and dropping it silently turns a bug into a timeout on
-        // the other side. Say so; never guess at a repair.
-        process.stderr.write(`[bridge] dropped an unparseable JSON-RPC frame: ${trimmed.slice(0, 120)}\n`);
-        continue;
+    const text = typeof chunk === 'string' ? chunk : this.#decoder.write(chunk);
+    // `start` is the offset just past the last terminator found in THIS chunk;
+    // the loop only ever looks forward, so no byte is scanned twice.
+    let start = 0;
+    for (;;) {
+      const newline = text.indexOf('\n', start);
+      if (newline === -1) break;
+      const piece = text.slice(start, newline);
+      let line;
+      if (this.#partial.length === 0) {
+        // The common case: the whole frame was inside this one chunk.
+        line = piece;
+      } else {
+        this.#partial.push(piece);
+        line = this.#partial.join('');
+        this.#partial = [];
       }
-      void this.#handleFrame(frame);
+      start = newline + 1;
+      this.#dispatchLine(line);
     }
+    // Whatever follows the last newline starts the next frame. Deliberately no
+    // trailing-`\r` strip: `trim()` in `#dispatchLine` covers it, and stripping
+    // here would change the text logged for a malformed line.
+    if (start < text.length) this.#partial.push(text.slice(start));
   };
+
+  /** Route one complete, terminator-free line to the frame handlers. */
+  #dispatchLine(line) {
+    const trimmed = line.trim();
+    if (trimmed === '') return;
+    let frame;
+    try {
+      frame = JSON.parse(trimmed);
+    } catch {
+      // A frame the peer means us to act on is JSON by contract (one
+      // JSON-RPC message per line). A torn or non-JSON line is therefore a
+      // protocol bug, and dropping it silently turns a bug into a timeout on
+      // the other side. Say so; never guess at a repair.
+      process.stderr.write(`[bridge] dropped an unparseable JSON-RPC frame: ${trimmed.slice(0, 120)}\n`);
+      return;
+    }
+    void this.#handleFrame(frame);
+  }
 
   #onError = (error) => {
     this.#failPending(error);

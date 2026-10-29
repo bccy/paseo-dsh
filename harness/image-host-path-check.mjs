@@ -38,7 +38,12 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { historyEvents, withImageHostPaths } from '../dsh-bridge/lib/image-host-path.js';
+import {
+  historyEvents,
+  isReplayedEventType,
+  REPLAYED_EVENT_TYPES,
+  withImageHostPaths,
+} from '../dsh-bridge/lib/image-host-path.js';
 
 const results = [];
 const check = (name, pass, detail) => {
@@ -303,6 +308,137 @@ const copyHolds = (extension) => {
     historyEvents(ctxWith(undefined), log)[1].data.message.content[1].hostPath === undefined,
   );
   check('a non-array history is an empty list', historyEvents(ctxWith(resolvingStore('/x.png')), undefined).length === 0);
+}
+
+// ---- the replay whitelist is a contract, not an implementation detail -----
+// The list is "derived from the consumers": each entry exists because the
+// plugin reads it back after a reopen. A missing entry is a row that silently
+// disappears from a replayed session — `turn/start` is how a killed child's open
+// turn is known to be open (without it the child replays as `completed`),
+// `subagent/descriptor` is the child's only durable title (without it the child
+// sits on "加载中…" forever). An extra entry is a payload regression that costs
+// size and hides the day a new type starts mattering.
+//
+// Before this block existed, deleting any single member left the whole file
+// green: the only fixture types were `user/message`, `tool/result` and
+// `turn/end`, so nothing but emptying the list outright changed an outcome. The
+// list is written out here as the EXPECTED value, so changing it now requires
+// changing this line too — which is exactly the question "why does the plugin
+// read this type back?" being asked.
+{
+  const expected = [
+    'assistant/message',
+    'command/done',
+    'command/run',
+    'compaction/end',
+    'compaction/start',
+    'compaction/summary',
+    'subagent/descriptor',
+    'tool/call',
+    'tool/result',
+    'turn/end',
+    'turn/start',
+    'user/message',
+  ].sort();
+  const actual = [...REPLAYED_EVENT_TYPES].sort();
+  check(
+    'the replay whitelist is exactly the set of types the plugin reads back',
+    JSON.stringify(actual) === JSON.stringify(expected),
+    JSON.stringify(actual),
+  );
+
+  // The predicate is what the filter actually calls, so it is asserted on its
+  // own: an event with no `type` (a corrupt line) must be dropped rather than
+  // crash the filter, and membership must be the only criterion.
+  check(
+    'isReplayedEventType answers membership, and drops a type-less event',
+    isReplayedEventType({ type: 'turn/start' }) === true &&
+      isReplayedEventType({ type: 'request/header' }) === false &&
+      isReplayedEventType({}) === false &&
+      isReplayedEventType(null) === false,
+  );
+
+  // Dropping is the behaviour that matters: a whitelist that lets everything
+  // through would pass every size claim in the module docs above while shipping
+  // the 4.54 MiB the filter exists to remove. These are the biggest real
+  // offenders plus the two the fold itself needs but no consumer reads back.
+  const keep = [
+    { type: 'user/message', seq: 1, data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'hi' }] } },
+    { type: 'turn/start', seq: 2, data: { turn: 1 } },
+    { type: 'turn/end', seq: 3, data: { turn: 1, reason: { kind: 'completed' } } },
+  ];
+  const mixed = [
+    ...keep,
+    { type: 'request/header', seq: 9, data: { header: { tools: [] } } },
+    { type: 'agent/inbox/spliced', seq: 10, data: { inserted: [] } },
+    { type: 'step/start', seq: 11, data: {} },
+    { type: 'system/message', seq: 12, data: { message: { role: 'system', content: [] } } },
+  ];
+  const filtered = historyEvents(ctxWith(resolvingStore('/history/object.png')), mixed);
+  check(
+    'events the plugin never reads back are dropped, not projected',
+    filtered.length === keep.length &&
+      filtered.every((event, i) => event.type === keep[i].type && event.seq === keep[i].seq),
+    `${filtered.length} of ${mixed.length} kept: ${filtered.map((event) => event.type).join(', ')}`,
+  );
+}
+
+// ---- withoutAssistantStream: strip one key, keep every other field --------
+// `data.stream` is DSH's own typing record (22.7 MB of a 43.4 MB replay on a
+// real session), and nothing on the Paseo side reads it. Two ways to break this
+// were unasserted before: returning `event` instead of `event.data` (the whole
+// timeline goes blank) and over-stripping (the row loses its content). Both are
+// pinned here, on a projection and on the original object.
+{
+  const typing = [{ type: 'text', text: 'x', dt: [1, 2] }];
+  const withStream = [
+    {
+      type: 'assistant/message',
+      seq: 3,
+      time: 1700000000000,
+      data: {
+        turn: 1,
+        step: 2,
+        message: { id: 'm1', role: 'assistant', content: [{ type: 'text', text: 'the answer' }] },
+        usage: { inputTokens: 10 },
+        stream: typing,
+      },
+    },
+  ];
+  const original = JSON.stringify(withStream);
+  const projected = historyEvents(ctxWith(undefined), withStream);
+  check(
+    'the assistant typing record is dropped',
+    projected.length === 1 && !('stream' in projected[0].data),
+    JSON.stringify(Object.keys(projected[0]?.data ?? {})),
+  );
+  check(
+    'stripping the typing record leaves every other field untouched',
+    projected[0].data.turn === 1 &&
+      projected[0].data.step === 2 &&
+      projected[0].data.message.role === 'assistant' &&
+      projected[0].data.message.content[0].text === 'the answer' &&
+      projected[0].data.usage.inputTokens === 10,
+    JSON.stringify(projected[0]?.data),
+  );
+  check('the projection returns data, not the event envelope', projected[0].type === 'assistant/message' && projected[0].seq === 3);
+  check('the stored event keeps its typing record (only the projection drops it)', JSON.stringify(withStream) === original);
+  // A present-but-undefined key and an explicit null are both "has no chunks";
+  // neither may be re-invented as a key by the projection.
+  check(
+    'an event without a stream is projected unchanged',
+    JSON.stringify(historyEvents(ctxWith(undefined), [{ type: 'turn/end', seq: 4, data: { turn: 1 } }])[0].data)
+      === JSON.stringify({ turn: 1 }),
+  );
+  check(
+    'a null stream is dropped like a missing one',
+    (() => {
+      const out = historyEvents(ctxWith(undefined), [
+        { type: 'assistant/message', seq: 5, data: { turn: 1, message: { content: [] }, stream: null } },
+      ]);
+      return !('stream' in out[0].data) && out[0].data.turn === 1;
+    })(),
+  );
 }
 
 // The copies are a cache the module reuses, so clear only what this run wrote.

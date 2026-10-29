@@ -44,6 +44,13 @@
  *            transient assistant snapshot) followed by the durable
  *            `assistant/message` for the same turn/step, so the plugin's
  *            folding into one stable item id can be asserted without a model
+ *   retry    as `stream`, then a second attempt of the SAME turn/step that
+ *            starts over from an empty snapshot and settles durably. DSH does
+ *            this when a request fails after text has already streamed, and it
+ *            is the case that used to glue both attempts' text into one row.
+ *            Each attempt carries its own `attempt` value, exactly as the real
+ *            bridge forwards DSH's `attemptId`; the durable copy carries none
+ *            (it is a DSH event, not a stream frame)
  *   image    replay two `read_image`-shaped `tool/result`s whose messages carry
  *            `{type:"image", attachment}` content blocks: one block the bridge
  *            stamped with `hostPath`, one it could not resolve. The plugin must
@@ -566,6 +573,56 @@ async function emitStream() {
 }
 
 /**
+ * Emit the `retry` scenario: one turn/step attempted twice.
+ *
+ * DSH retries a request inside the same turn/step when the provider fails after
+ * text has already streamed (`agent-loop` settles `assistant/attempt`, then
+ * loops). Each attempt opens its own frame series and its own snapshot
+ * accumulator, so attempt 2's first snapshot is a *restart* (`"The repo"`) and
+ * not a prefix of attempt 1's last one (`"我先看一下仓库结构"`).
+ *
+ * The two attempts carry distinct `attempt` values, which is what the real
+ * bridge forwards from DSH's `attemptId`. The durable `assistant/message` is a
+ * DSH event and carries none — it settles the attempt that just ended, and the
+ * plugin is the side that knows which id that is.
+ *
+ * What must come out: the attempt-1 row keeps attempt 1's text (append-only, it
+ * cannot be withdrawn), the durable answer lands on the attempt-2 row, and
+ * Paseo's fold shows the final answer exactly once.
+ */
+async function emitRetry() {
+  notify("session.status", { sessionId: rootId, status: "running" });
+  const attempt1 = [
+    { text: "我先看一下" },
+    { text: "我先看一下仓库结构" },
+  ];
+  for (const data of attempt1) {
+    notify("session.event", {
+      sessionId: rootId,
+      event: { type: "paseo/assistant-delta", data: { turn: 1, step: 1, attempt: "fake-attempt-1", ...data } },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  // Attempt 2 restarts from empty — the frame series a real retry produces.
+  const attempt2 = [
+    { text: "The repo has" },
+    { text: "The repo has three packages" },
+    { text: "The repo has three packages and a bridge" },
+  ];
+  for (const data of attempt2) {
+    notify("session.event", {
+      sessionId: rootId,
+      event: { type: "paseo/assistant-delta", data: { turn: 1, step: 1, attempt: "fake-attempt-2", ...data } },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  // The durable settlement of the step: attempt 2's full text, no attempt field.
+  notify("session.event", { sessionId: rootId, event: { type: "assistant/message", seq: 1, data: { turn: 1, step: 1, message: { id: "sr1", content: [{ type: "text", text: "The repo has three packages and a bridge" }] } } } });
+  notify("session.event", { sessionId: rootId, event: { type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "completed" } } } });
+  notify("session.status", { sessionId: rootId, status: "idle" });
+}
+
+/**
  * Emit the `image` scenario as one root turn: a running status, the two
  * `read_image` calls and their results, then the terminal status.
  */
@@ -849,6 +906,10 @@ async function handle(method, params, id) {
       if (mode() === "stream" && !state.emitted) {
         state.emitted = true;
         setTimeout(() => { void emitStream(); }, 20);
+      }
+      if (mode() === "retry" && !state.emitted) {
+        state.emitted = true;
+        setTimeout(() => { void emitRetry(); }, 20);
       }
       if (mode() === "failturn" && !state.emitted) {
         state.emitted = true;

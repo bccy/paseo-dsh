@@ -724,6 +724,16 @@ export class TimelineBuilder {
   #items = new Map<string, ProviderTimelineItem>();
   #toolNames = new Map<string, string>();
   #toolInputs = new Map<string, Record<string, unknown>>();
+  /**
+   * `turn:step` -> the attempt identities this step has streamed, in order.
+   *
+   * A step can be attempted more than once (DSH retries a failed request inside
+   * the same turn/step), and each attempt restarts the snapshot from empty. The
+   * position in this list is what suffixes the item id so attempt 2's text does
+   * not get appended to attempt 1's row — see {@link #assistantDelta}. Bounded
+   * by the retry policy of one step and dropped with the builder.
+   */
+  #attempts = new Map<string, string[]>();
   /** commandId -> the command that ran, so `command/done` can title its own row. */
   #commands = new Map<string, { name: string; args: string }>();
   /**
@@ -878,6 +888,12 @@ export class TimelineBuilder {
     if (!Array.isArray(content)) return [];
     const turn = typeof data.turn === "number" ? data.turn : 0;
     const step = typeof data.step === "number" ? data.step : 0;
+    // The durable copy belongs to the attempt that settled, which is the newest
+    // one this step has streamed (a settled attempt ends its frame series, so
+    // nothing later can arrive for the same step). It therefore reuses that
+    // attempt's id and extends the row the live snapshots already grew instead
+    // of starting a second copy of the answer.
+    const suffix = this.#settledAttemptSuffix(turn, step);
     const out: ProviderTimelineItem[] = [];
 
     const reasoning = content
@@ -889,7 +905,7 @@ export class TimelineBuilder {
       out.push(
         ...this.#put({
           type: "reasoning",
-          id: `reasoning:${turn}:${step}`,
+          id: `reasoning:${turn}:${step}${suffix}`,
           text: reasoning,
         }),
       );
@@ -900,7 +916,7 @@ export class TimelineBuilder {
       // `messageId` is the item id, never DSH's per-message uuid: Paseo folds
       // the live snapshots and this durable copy into one growing row only
       // while `messageId` is identical across them.
-      const id = `assistant:${turn}:${step}`;
+      const id = `assistant:${turn}:${step}${suffix}`;
       out.push(...this.#put({ type: "assistant_message", id, messageId: id, text }));
     }
 
@@ -938,23 +954,77 @@ export class TimelineBuilder {
    * Paseo turns a same-id snapshot into the prefix delta of one growing row
    * only while those agree — a differing `messageId` would start a second row
    * and duplicate the text once the durable copy arrives.
+   *
+   * ### Retries inside one step
+   *
+   * DSH retries a failed request inside the same turn/step, and each attempt
+   * restarts the snapshot from an empty string (the bridge resets its
+   * assembler, so attempt 2's first snapshot is `"The repo"` while attempt 1's
+   * last was `"我先看一下仓库结构"`). Paseo's rule for a snapshot that is *not* a
+   * prefix of the previous one is to append the whole thing, so keeping one id
+   * per turn/step would glue attempt 1's text in front of attempt 2's and the
+   * final answer would read as two answers spliced together.
+   *
+   * So the id carries the attempt: the first attempt keeps the historical id
+   * (`assistant:${turn}:${step}`), and later ones get `:2`, `:3`, … from the
+   * order in which this builder first saw them. Order rather than the wire
+   * attempt id, because that id is opaque (DSH's is `sessionId:counter`) and an
+   * item id is user-visible in logs and dedup keys. A payload with no `attempt`
+   * — an older bridge, or a frame that never carried one — is the first
+   * attempt, so its behaviour is exactly what it was before.
    */
   #assistantDelta(data: Record<string, unknown>): ProviderTimelineItem[] {
     const turn = typeof data.turn === "number" ? data.turn : undefined;
     const step = typeof data.step === "number" ? data.step : undefined;
     if (turn === undefined || step === undefined) return [];
 
+    const suffix = this.#attemptSuffix(turn, step, typeof data.attempt === "string" ? data.attempt : undefined);
     const out: ProviderTimelineItem[] = [];
     const reasoning = typeof data.reasoning === "string" ? data.reasoning : "";
     if (reasoning !== "") {
-      out.push(...this.#put({ type: "reasoning", id: `reasoning:${turn}:${step}`, text: reasoning }));
+      out.push(...this.#put({ type: "reasoning", id: `reasoning:${turn}:${step}${suffix}`, text: reasoning }));
     }
     const text = typeof data.text === "string" ? data.text : "";
     if (text !== "") {
-      const id = `assistant:${turn}:${step}`;
+      const id = `assistant:${turn}:${step}${suffix}`;
       out.push(...this.#put({ type: "assistant_message", id, messageId: id, text }));
     }
     return out;
+  }
+
+  /**
+   * The id suffix for the attempt behind one live snapshot.
+   *
+   * Records the attempt the first time this turn/step streams it and returns
+   * `""` for the first, `:2`, `:3`, … for the rest. An absent attempt id is the
+   * first attempt: that is what a bridge which never sends the field means, and
+   * it keeps the ids of every existing session byte-identical.
+   */
+  #attemptSuffix(turn: number, step: number, attempt: string | undefined): string {
+    const key = `${turn}:${step}`;
+    const seen = this.#attempts.get(key) ?? [];
+    const identity = attempt ?? "";
+    let index = seen.indexOf(identity);
+    if (index === -1) {
+      seen.push(identity);
+      this.#attempts.set(key, seen);
+      index = seen.length - 1;
+    }
+    return index === 0 ? "" : `:${index + 1}`;
+  }
+
+  /**
+   * The suffix of the attempt a durable `assistant/message` settles.
+   *
+   * That is the newest attempt seen for this turn/step: a settled attempt ends
+   * its frame series, so nothing later can arrive for the same step, and using
+   * its id is what makes the durable copy extend the row the live snapshots
+   * already grew instead of printing the answer a second time.
+   */
+  #settledAttemptSuffix(turn: number, step: number): string {
+    const seen = this.#attempts.get(`${turn}:${step}`);
+    if (seen === undefined || seen.length <= 1) return "";
+    return `:${seen.length}`;
   }
 
   #toolCall(data: Record<string, unknown>): ProviderTimelineItem[] {
