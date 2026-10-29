@@ -48,11 +48,13 @@
  *   cp ../harness/locale-check.cjs .dbg/
  *   cd .dbg && node locale-check.cjs
  *
- * `--module node16` is required, not cosmetic: `client/tool-call-data.ts` reads
- * the 0.12 `AgentMessage` type from the protocol package's ESM declarations, and
- * node16 is the resolution mode that honours its `exports` map while still
- * emitting CommonJS for this harness to `require`. The source carries the
- * matching `resolution-mode` attribute.
+ * `--module node16` is kept because this harness still `require`s the protocol
+ * package at run time (`PASEO_TOOL_CATALOG`), and node16 is the resolution mode
+ * that honours its `exports` map while emitting CommonJS. The `AgentMessage`
+ * type is no longer read from that package — it is declared locally in
+ * `client/agent-message.ts`, because Paseo 0.11 and earlier resolve type-only
+ * imports at install time and that module does not exist there
+ * (`requirements.paseo` is `>=0.9.2`).
  *
  * Only pure modules are compiled: the React renderers import the host runtime,
  * which plain `node` resolution cannot see.

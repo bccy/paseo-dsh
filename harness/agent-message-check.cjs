@@ -33,10 +33,14 @@
  *   cp ../harness/agent-message-check.cjs .dbg-am/
  *   cd .dbg-am && node agent-message-check.cjs
  *
- * `--module node16` is load-bearing, not cosmetic: the item type comes from the
- * protocol package's ESM declaration file, and node16 is the resolution mode
- * that both honours its `exports` map and still emits CommonJS for this harness
- * to `require`. The source carries the matching `resolution-mode` attribute.
+ * `--module node16` is kept because this harness still `require`s the protocol
+ * package at run time (`@getpaseo/protocol/paseo-tool-presentation/index`, for
+ * the official display model below), and node16 is the resolution mode that
+ * honours its `exports` map while emitting CommonJS for this harness. The
+ * `AgentMessage` *type*, however, is no longer read from that package: it is
+ * declared locally in `client/agent-message.ts`, because Paseo 0.11 and earlier
+ * resolve every type-only import at install time and that module does not exist
+ * in the protocol package they ship (`requirements.paseo` is `>=0.9.2`).
  *
  * Only pure modules are compiled: the React renderer imports the host runtime,
  * which plain `node` resolution cannot see. `index.client.tsx` is therefore read

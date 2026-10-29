@@ -14,22 +14,8 @@
  *
  * @module dsh-paseo/client/tool-call-data
  */
+import type { AgentMessage } from "./agent-message";
 import { agentMessageLabel, currentLocale, localeText } from "./locale";
-
-/**
- * The protocol's semantic half of a 0.12 agent-to-agent message row.
- *
- * Type-only, from the protocol package's own schema
- * (`@getpaseo/protocol`'s `agent-message.ts`): the plugin bundle imports nothing
- * at run time from it. The inline `resolution-mode` attribute is what lets that
- * package's ESM types be read from this CommonJS module under the offline
- * harness's `--module node16` compile (see `harness/agent-message-check.cjs`);
- * Paseo's own compiler resolves it through `tsconfig.json`'s `bundler`
- * resolution and erases it before the bundle is built.
- */
-type AgentMessage = import("@getpaseo/protocol/agent-message", {
-  with: { "resolution-mode": "import" },
-}).AgentMessage;
 
 /**
  * Which of DSH's expanded blocks a row draws.

@@ -18,7 +18,6 @@ import type {
   ProviderPrompt,
   ProviderSetting,
   ProviderThinkingOption,
-  ProviderTimelineItem,
   ProviderUsage,
 } from "@getpaseo/plugin/server/provider";
 import type { JsonValue } from "./dsh-process";
@@ -438,12 +437,28 @@ export class DshSession {
       onChildOpened: (payload) => this.#onChildOpened(payload),
       onExit: (code, signal) => {
         if (this.#closed) return;
+        const message = `DeepSeek Harness exited (code ${code ?? "null"}, signal ${signal ?? "none"})`;
+        // Children first, then the root. The daemon treats `session.runtime_failed`
+        // as terminal for the session it names and rejects whatever that session
+        // has pending — so a child announced after the root's own failure would be
+        // dropped as an event for a dead conversation. The child views live only
+        // in this map (the shared `DshProcess` never sees them), which is exactly
+        // why the process-level exit fan-out cannot reach them: without this loop
+        // a subagent mid-turn keeps its `#turnId` forever, its row pulses in
+        // Paseo, and a question card it is holding never settles.
+        for (const child of [...this.#children.values()]) {
+          try {
+            child.fail(message);
+          } catch (error) {
+            this.#options.log(`failing subagent ${child.nativeId} failed: ${messageOf(error)}`);
+          }
+        }
         this.#closed = true;
         clearTimeout(this.#usageRefreshTimer);
         this.#options.emit({
           type: "session.runtime_failed",
           sessionId: this.id,
-          error: { message: `DeepSeek Harness exited (code ${code ?? "null"}, signal ${signal ?? "none"})` },
+          error: { message },
         });
       },
     };
@@ -753,6 +768,24 @@ export class DshSession {
     // with no reply, and those are exactly the turns that never collapse.
     let replayTurnOpen = false;
     let replayTurnId: string | undefined;
+    // Whether this turn's `started` has gone out yet.
+    //
+    // `turn/start` alone is not evidence that a turn happened: DSH logs it as a
+    // log-only bracket, and a rewind's surface replacement deletes the withdrawn
+    // turn's *surface* nodes without touching that bracket (`dsh-bridge/lib/
+    // surface.js` does not list `turn/start`). Replaying the bracket eagerly
+    // therefore announced a turn whose every row had been withdrawn, and the
+    // trailing "log ends inside a turn" fallback then closed it as canceled: one
+    // phantom empty turn per rewind, on every reopen. The bracket is only
+    // announced once the turn actually produces a row, and a turn that never
+    // does emits no `session.turn` at all.
+    let replayTurnStarted = false;
+    /** Announce the open turn's `started` if its first row is about to go out. */
+    const startReplayTurn = (): void => {
+      if (!replayTurnOpen || replayTurnStarted || replayTurnId === undefined) return;
+      replayTurnStarted = true;
+      this.#emitReplayTurn(replayTurnId, "started");
+    };
     for (const event of events) {
       const data = isRecord(event.data) ? event.data : {};
       const seq = typeof event.seq === "number" ? event.seq : this.#replaySeq++;
@@ -761,13 +794,14 @@ export class DshSession {
       if (event.type === "turn/start") {
         // Two open turns in a row cannot come from a healthy log, but a truncated
         // one can end up shaped that way. Close the earlier turn rather than leave
-        // a `started` that nothing will ever end.
-        if (replayTurnOpen && replayTurnId !== undefined) {
+        // a `started` that nothing will ever end — but only a turn that was
+        // actually announced, or the "close" would itself announce a phantom.
+        if (replayTurnOpen && replayTurnStarted && replayTurnId !== undefined) {
           this.#emitReplayTurn(replayTurnId, "canceled");
         }
         replayTurnId = historyTurnId(data.turn, seq);
         replayTurnOpen = true;
-        this.#emitReplayTurn(replayTurnId, "started");
+        replayTurnStarted = false;
         continue;
       }
       if (event.type === "user/message") {
@@ -779,6 +813,7 @@ export class DshSession {
         // no blocks at all — still has no row.
         const text = messageRowText(data.content);
         if (text === "") continue;
+        startReplayTurn();
         this.#options.emit({
           type: "timeline.item",
           sessionId: this.id,
@@ -797,7 +832,12 @@ export class DshSession {
         continue;
       }
       const itemTimestamp = timestamp ?? lastTimestamp;
-      for (const item of builder.consume({ type: event.type, seq, data })) {
+      // Consumed before the bracket is announced: an event that produces no row
+      // (`step/end`, `turn/end` of a clean turn) must not be the reason a turn
+      // appears on screen.
+      const items = builder.consume({ type: event.type, seq, data });
+      if (items.length > 0) startReplayTurn();
+      for (const item of items) {
         this.#options.emit({
           type: "timeline.item",
           sessionId: this.id,
@@ -809,8 +849,15 @@ export class DshSession {
       // `turn/end` produces (the error row of a failed turn) stay inside the
       // bracket that carries their turn id.
       if (event.type === "turn/end") {
-        if (replayTurnOpen && replayTurnId !== undefined) {
+        if (replayTurnOpen && replayTurnStarted && replayTurnId !== undefined) {
           this.#emitReplayTurn(replayTurnId, childTurnState(data.reason));
+        } else if (replayTurnOpen) {
+          // A turn whose rows were all withdrawn (a rewind) still has its
+          // log-only `turn/end` in the visible log. There is nothing to bracket,
+          // and an unpaired terminal would announce a turn nothing opened.
+          this.#options.log(
+            `replay: turn ${String(replayTurnId)} produced no rows; emitting no session.turn for it`,
+          );
         } else {
           // A terminal whose start was never replayed cannot be attributed, and
           // emitting a lone terminal would announce a turn nothing opened.
@@ -819,6 +866,7 @@ export class DshSession {
           );
         }
         replayTurnOpen = false;
+        replayTurnStarted = false;
         replayTurnId = undefined;
       }
     }
@@ -861,16 +909,25 @@ export class DshSession {
     // gives an interrupted turn, and the same one the settle loops above already
     // assume when they cancel the rows of a turn that will never finish.
     //
+    // Only an *announced* turn needs closing: with the `started` deferred to the
+    // turn's first row, a trailing bracket that produced no rows was never
+    // announced and nothing holds it.
+    //
     // Deliberately not gated on `#joinedLiveProcess`: that proves the shared child
     // never stopped, not that *this* conversation's turn is still running, and a
     // reopened session gets no second `session.turn started` to close a turn it
     // was left holding.
-    if (replayTurnOpen && replayTurnId !== undefined) {
+    if (replayTurnOpen && replayTurnStarted && replayTurnId !== undefined) {
       this.#options.log(
         `replay: the stored log ends inside turn ${String(replayTurnId)} with no turn/end; ` +
           "closing it as canceled so no turn is left open",
       );
       this.#emitReplayTurn(replayTurnId, "canceled");
+    } else if (replayTurnOpen) {
+      this.#options.log(
+        `replay: the stored log ends inside turn ${String(replayTurnId)} that produced no rows; ` +
+          "emitting no session.turn for it",
+      );
     }
   }
 
@@ -2252,6 +2309,42 @@ export class DshChildSession {
     this.#turnId = null;
     this.#turnEnded = true;
     this.#options.emit({ type: "session.turn", sessionId: this.id, turnId, state });
+  }
+
+  /**
+   * Fail this child loudly because the process serving it is gone.
+   *
+   * Paseo's child channel consumes exactly two terminal signals for a subagent
+   * (`session.runtime_failed` / `session.closed`); a child that gets neither keeps
+   * the status its row was created with, and Paseo's default on attach is
+   * "running". A shared `dsh` child dying mid-subagent therefore left the row
+   * pulsing for the life of the daemon, with any question card the child held
+   * still pending — and nothing was even logged, because the child views are
+   * owned by `DshSession` while the process-level exit fan-out only knows the
+   * sessions that attached to `DshProcess`.
+   *
+   * One signal, not three: the terminal `session.turn` is deliberately not
+   * emitted. `runtime_failed` already settles the row (the host maps it to
+   * `status: "failed"` and rejects the pending permissions), and a `turn` row
+   * would additionally have to invent a turn id for a turn DSH never closed.
+   *
+   * The turn state is cleared so a frame that still races in cannot reopen it:
+   * with `#turnId === null` a late idle status has nothing to close, and
+   * `#turnEnded` keeps it from being closed again. The root's `#closed` latch
+   * then blocks every later child frame, so this runs once per child — its one
+   * caller is `DshSession`'s `onExit`.
+   *
+   * @param message - why the runtime went away, shown to the user.
+   */
+  fail(message: string): void {
+    if (this.#options.closed()) return;
+    this.#turnId = null;
+    this.#turnEnded = true;
+    this.#options.emit({
+      type: "session.runtime_failed",
+      sessionId: this.id,
+      error: { message },
+    });
   }
 
   /**

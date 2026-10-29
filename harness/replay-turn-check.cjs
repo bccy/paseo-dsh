@@ -26,10 +26,29 @@
 
 const assert = require("node:assert/strict");
 const path = require("node:path");
+const { existsSync } = require("node:fs");
 const { resolvePluginBuild } = require("./plugin-build.cjs");
 
 const compiled = resolvePluginBuild(process.argv[2], ".dbg-replay-turn");
 const processModule = require(path.join(compiled, "server/dsh-process.js"));
+
+/**
+ * 从编译目录往上找到仓库里的一个模块，按绝对路径 require。
+ *
+ * 撤回折叠必须用**桥的真实实现**（`dsh-bridge/lib/surface.js`），否则这条断言
+ * 就只是在验证自己写的折叠函数。编译目录在 `paseo-plugin/<dir>` 下，往上走到
+ * 仓库根就能拿到它；`node` 对 ESM 文件的 `require` 在 Node 22 上可用（桥的
+ * `package.json` 是 `"type": "module"`，同步 require ESM 需要 22+）。
+ */
+function findRepoModule(relative) {
+  let dir = compiled;
+  for (let i = 0; i < 4; i += 1) {
+    const candidate = path.join(dir, relative);
+    if (existsSync(candidate)) return candidate;
+    dir = path.dirname(dir);
+  }
+  throw new Error(`could not find ${relative} above ${compiled}`);
+}
 
 const instances = [];
 
@@ -268,6 +287,116 @@ function applyPaseoTurnRule(events) {
     `turnId 应稳定派生自 DSH 回合号，实际 ${JSON.stringify(turnIds)}`,
   );
   console.log("PASS turnId 稳定派生自 DSH 回合号（重开可复现）");
+
+  // ---- 一个「行全被撤回」的回合不得发出任何 session.turn ------------------
+  //
+  // `turn/start` 是 log-only 括号，DSH 从不把它写成 surface 节点，所以桥的
+  // 撤回折叠（`dsh-bridge/lib/surface.js` 的 `visibleEvents`，`SURFACE_EVENT_TYPES`
+  // 里没有 `turn/start`）删不掉它。以前重放看到它就立刻发 `started`，日志又正好
+  // 在这里结束，收口逻辑再补一条 `canceled` —— 每撤回一次就多一个「空回合」，
+  // 而且每次重开都重来一遍。宿主把它翻译成 `turn_started`/`turn_canceled` 一对，
+  // 终态走 `applyActiveTurnTerminal` 落到 `"untracked"`，还会把 agent 的
+  // `lifecycle` 压回 idle、清掉 `lastError`（`agent-manager.js`）。
+  //
+  // 输入不是手写的理想序列：一段真实的两回合日志 + 一条真实撤回标记，交给真实的
+  // `visibleEvents` 折叠。
+  console.log("\n一个被撤回的回合（可见日志里只剩 turn/start）不发任何 session.turn");
+  {
+    const { visibleEvents } = require(findRepoModule("dsh-bridge/lib/surface.js"));
+    const at = (seq) => Date.UTC(2026, 0, 2, 3, 0, 0) + seq * 1000;
+    const raw = [
+      { seq: 1, type: "turn/start", time: at(1), data: { turn: 1 } },
+      { seq: 2, type: "user/message", time: at(2), surfaceOp: "append", data: { id: "m1", source: { kind: "user" }, content: [{ type: "text", text: "第一个问题" }] } },
+      { seq: 3, type: "assistant/message", time: at(3), surfaceOp: "append", data: { turn: 1, step: 1, message: { id: "a1", content: [{ type: "text", text: "第一个回答" }] } } },
+      { seq: 4, type: "turn/end", time: at(4), data: { turn: 1, reason: { kind: "completed" } } },
+      { seq: 5, type: "turn/start", time: at(5), data: { turn: 2 } },
+      { seq: 6, type: "user/message", time: at(6), surfaceOp: "append", data: { id: "m2", source: { kind: "user" }, content: [{ type: "text", text: "第二个问题（被撤回）" }] } },
+      { seq: 7, type: "assistant/message", time: at(7), surfaceOp: "append", data: { turn: 2, step: 1, message: { id: "a2", content: [{ type: "text", text: "第二个回答（被撤回）" }] } } },
+      { seq: 8, type: "turn/end", time: at(8), data: { turn: 2, reason: { kind: "completed" } } },
+      {
+        seq: 9,
+        type: "user/message",
+        time: at(9),
+        surfaceOp: { op: "replace", startSeq: 6, endSeq: 7 },
+        data: { id: "marker", source: { kind: "paseo-rewind" }, content: [{ type: "text", text: "(empty message)" }] },
+      },
+    ];
+    const folded = visibleEvents(raw);
+    const foldedTypes = folded.map((event) => `${String(event.seq)}:${event.type}`);
+    // 前提：折叠确实把第二回合的行删掉了，只留下它的 turn/start（这条不成立就
+    // 说明输入或折叠变了，后面的断言也就测不到那个缺陷）。
+    assert.ok(
+      foldedTypes.includes("5:turn/start") &&
+        !foldedTypes.includes("6:user/message") &&
+        !foldedTypes.includes("7:assistant/message"),
+      `撤回折叠的输入不成立，可见日志是 ${JSON.stringify(foldedTypes)}`,
+    );
+
+    const phantomEvents = [];
+    const phantomTransport = new FakeProcess({ sessionId: "__paseo_shared_process__" });
+    phantomTransport.historyResponse = { available: true, events: folded };
+    const phantomSession = new DshSession({
+      sessionId: "replay-turn-phantom",
+      cwd: process.cwd(),
+      env: {},
+      route: { provider: "fixture", model: "alpha" },
+      mode: "build",
+      models: [{ id: "fixture/alpha" }],
+      thinkingOptions: [],
+      emit: (e) => phantomEvents.push(e),
+      log() {},
+      acquireProcess: async () => ({ process: phantomTransport, reused: false }),
+      releaseProcess: () => {},
+    });
+    await phantomSession.open();
+    await phantomSession.replayHistory();
+
+    // 回合号 -> 它名下有几行（按 Paseo 的 currentTurnId 规则归属）。
+    const rowsPerTurn = new Map();
+    let current;
+    for (const event of phantomEvents) {
+      if (event.type === "session.turn") {
+        current = event.state === "started" ? event.turnId : undefined;
+        continue;
+      }
+      if (event.type === "timeline.item" && current !== undefined) {
+        rowsPerTurn.set(current, (rowsPerTurn.get(current) ?? 0) + 1);
+      }
+    }
+    const startedIds = phantomEvents
+      .filter((event) => event.type === "session.turn" && event.state === "started")
+      .map((event) => event.turnId);
+    assert.deepEqual(
+      [...rowsPerTurn.keys()].sort(),
+      ["turn:history:1"],
+      `可见日志里只有第一个回合还有行，实际有行的回合是 ${JSON.stringify([...rowsPerTurn.keys()])}`,
+    );
+    assert.deepEqual(
+      startedIds,
+      ["turn:history:1"],
+      `只有有行的回合才该发 started，实际 ${JSON.stringify(startedIds)}（被撤回的回合留下了 turn/start）`,
+    );
+    assert.ok(
+      !phantomEvents.some((event) => event.type === "session.turn" && event.turnId === "turn:history:2"),
+      `被撤回的回合发了 session.turn：${JSON.stringify(
+        phantomEvents.filter((event) => event.type === "session.turn").map((event) => [event.turnId, event.state]),
+      )}`,
+    );
+    // 终态也只在发过 started 时才有：一对不配对的 canceled 同样是空回合。
+    const phantomTerminals = phantomEvents
+      .filter((event) => event.type === "session.turn" && event.state !== "started")
+      .map((event) => [event.turnId, event.state]);
+    assert.deepEqual(phantomTerminals, [["turn:history:1", "completed"]], `终态应只有第一回合，实际 ${JSON.stringify(phantomTerminals)}`);
+    // Paseo 的折叠规则跑一遍：没有悬挂的 started，没有落在区间外的行。
+    const phantomRule = applyPaseoTurnRule(phantomEvents);
+    assert.equal(phantomRule.unclosed, undefined, "重放结束后 Paseo 的 currentTurnId 必须被清空");
+    assert.equal(
+      phantomRule.items.filter((entry) => entry.turnId === undefined).length,
+      0,
+      "有行落在任何 session.turn 区间之外",
+    );
+    console.log("PASS 被撤回的回合（可见日志里只剩 turn/start）不发任何 session.turn");
+  }
 })().catch((error) => {
   console.error(error);
   process.exitCode = 1;
