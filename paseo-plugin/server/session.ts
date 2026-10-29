@@ -37,6 +37,7 @@ import {
   type DshUsage,
 } from "./dsh-process";
 import { ASSISTANT_DELTA_EVENT, TimelineBuilder } from "./timeline";
+import { assistantStreamFirstTokenTime } from "./first-token";
 
 /**
  * The durable event time as the provider timestamp for a replayed row.
@@ -442,7 +443,6 @@ export class DshSession {
         step: number;
         startedAt: number;
         firstTokenAt?: number;
-        lastTokenAt?: number;
       }
     | undefined;
 
@@ -2119,7 +2119,11 @@ export class DshSession {
     if (event.type === "assistant/message") {
       const data = isRecord(event.data) ? event.data : {};
       this.#accumulateTotals(data);
-      this.#emitStreamStats(data);
+      // DSH's own settlement timestamp closes the decode window. It rides the
+      // event envelope (`{type, seq, time, data}`), which the bridge forwards
+      // verbatim on the live channel, so no extra field has to be plumbed through
+      // the transient delta payload.
+      this.#emitStreamStats(data, typeof event.time === "number" ? event.time : undefined);
     }
     if (event.type === "turn/end" && this.#lastStats !== undefined) {
       this.#lastStats.data = {
@@ -2139,26 +2143,41 @@ export class DshSession {
    * of a fabricated duration. Output tokens come from the step's own usage
    * record.
    */
-  #emitStreamStats(data: Record<string, unknown>): void {
+  #emitStreamStats(data: Record<string, unknown>, completedAt?: number): void {
     const stats = this.#streamStats;
     this.#streamStats = undefined;
-    if (stats === undefined || stats.firstTokenAt === undefined) return;
     const usage = isRecord(data.usage) ? data.usage : undefined;
     const outputTokens = typeof usage?.outputTokens === "number" ? usage.outputTokens : undefined;
-    const firstTokenMs = Math.max(0, stats.firstTokenAt - stats.startedAt);
-    // Throughput needs a measured window between the first and the last text
-    // delta. A route that delivers the whole answer in one burst (or one chunk)
-    // has no observable window, so it reports latency only instead of a
-    // meaningless thousands-of-tokens-per-second figure.
-    const span = stats.lastTokenAt === undefined ? 0 : stats.lastTokenAt - stats.firstTokenAt;
+    // The first token's time, read straight out of this event's own durable stream.
+    // `assistant/message` carries the whole timed chunk list, so both ends of the
+    // decode window arrive in one event and nothing has to be correlated across
+    // frames. `assistantStreamFirstTokenTime` is DSH's own reader (text, reasoning
+    // and tool-call deltas all count), the same one `dsh-session-stats` uses.
+    const firstTokenAt = assistantStreamFirstTokenTime(data.stream) ?? stats?.firstTokenAt;
+    if (firstTokenAt === undefined) return;
+    const firstTokenMs = stats === undefined ? undefined : Math.max(0, firstTokenAt - stats.startedAt);
+    // Decode window, copied from DSH's own session-stats:
+    //   decodeMs = assistant/message event time - first token time
+    // Both ends describe the same tokens. `outputTokens` counts everything the
+    // model produced — reasoning, answer text *and* tool-call arguments — and this
+    // window runs from the first generated token until the assembled message is
+    // committed, so it covers exactly that set.
+    //
+    // The previous version measured "first to last visible *text* chunk" instead.
+    // That window is a fraction of the real decode time on a reasoning-heavy step,
+    // so dividing the all-inclusive `outputTokens` by it reported thousands of
+    // tok/s (measured on this machine's logs: up to 2651 tok/s, median inflation
+    // ~8x), and on steps that stream no visible text at all it was empty, so the
+    // row showed no speed at all — 141 of 203 sampled steps are pure tool calls.
+    const span = completedAt === undefined ? 0 : Math.max(0, completedAt - firstTokenAt);
     const measured = outputTokens !== undefined && span >= 50 ? outputTokens / (span / 1000) : undefined;
     // A burst delivery has no real generation window; a value this high is a
     // measurement artifact, not a speed anyone can use.
     const tokensPerSecond = measured !== undefined && measured <= 3000 ? measured : undefined;
-    const turn = typeof data.turn === "number" ? data.turn : stats.turn;
-    const step = typeof data.step === "number" ? data.step : stats.step;
+    const turn = typeof data.turn === "number" ? data.turn : stats?.turn;
+    const step = typeof data.step === "number" ? data.step : stats?.step;
     const statsData: Record<string, unknown> = {
-      firstTokenMs,
+      ...(firstTokenMs === undefined ? {} : { firstTokenMs }),
       ...(tokensPerSecond === undefined ? {} : { tokensPerSecond }),
       ...(outputTokens === undefined ? {} : { outputTokens }),
       ...(typeof usage?.inputTokens === "number" ? { inputTokens: usage.inputTokens } : {}),
@@ -2262,13 +2281,20 @@ export class DshSession {
   }
 
   /**
-   * Record the step's generation window from one live snapshot.
+   * Record the step's first token from one live snapshot.
    *
-   * The bridge forwards DSH's own chunk timestamps, so the measured window is
-   * the model's, not this process's IPC latency. A snapshot without timings
-   * (a bridge that predates them, or a route that never streamed) leaves the
-   * window unset, and {@link #emitStreamStats} then reports no row rather than
-   * inventing one.
+   * The bridge forwards DSH's own chunk timestamps, so the measured latency is
+   * the model's, not this process's IPC latency. The timestamp is the first
+   * *generated* token — text or reasoning — which is what DSH's own
+   * `firstTokenTime` (`isTokenDelta`) means and what its TTFT is measured from.
+   *
+   * The rate itself is NOT measured from here: it uses DSH's exact decode window
+   * (`assistant/message` event time minus this first token), because the last
+   * streamed chunk is not the end of decoding — the message settles after it.
+   *
+   * A snapshot without timings (a bridge that predates them, or a route that
+   * never streamed) leaves the window unset, and {@link #emitStreamStats} then
+   * reports no row rather than inventing one.
    */
   #observeStreamSnapshot(data: Record<string, unknown>): void {
     const turn = typeof data.turn === "number" ? data.turn : undefined;
@@ -2278,11 +2304,10 @@ export class DshSession {
     if (turn === undefined || step === undefined || startedAt === undefined || firstTokenAt === undefined) {
       return;
     }
-    const lastTokenAt = typeof data.lastTextAt === "number" ? data.lastTextAt : firstTokenAt;
     // A retry inside one step starts a fresh frame series for the same
     // turn/step; the row must describe the attempt that actually settled, so
     // the newest window wins.
-    this.#streamStats = { turn, step, startedAt, firstTokenAt, lastTokenAt };
+    this.#streamStats = { turn, step, startedAt, firstTokenAt };
   }
 
   /**

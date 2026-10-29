@@ -614,7 +614,11 @@ async function emitStream() {
   let firstTextAt;
   let lastTextAt;
   for (const data of frames) {
-    if (data.text !== undefined) {
+    // Every *generated* chunk moves the window: reasoning as well as text. DSH's
+    // own `firstTokenTime` (`isTokenDelta`) counts both, and the row's numerator
+    // (`usage.outputTokens`) counts reasoning tokens too — timing text only is the
+    // defect this scenario now pins.
+    if (data.text !== undefined || data.reasoning !== undefined) {
       const at = Date.now();
       if (firstTextAt === undefined) firstTextAt = at;
       lastTextAt = at;
@@ -638,7 +642,17 @@ async function emitStream() {
   // Paseo drops it, so it must not add a second row.
   // DSH reports token accounting on the assistant message and nowhere else, so
   // the stats row's token figures come from here. The durable copy carries it.
-  notify("session.event", { sessionId: rootId, event: { type: "assistant/message", seq: 1, data: { turn: 1, step: 1, message: { id: "sm1", content: [{ type: "reasoning", text: "thinking" }, { type: "text", text: "Hello world" }] }, usage: { inputTokens: 1200, cacheReadTokens: 800, cacheWriteTokens: 0, outputTokens: 100 } } } });
+  // DSH stamps every durable event with its own `time` on the envelope and carries
+  // the step's whole timed chunk list as `data.stream`. The stats row's rate is
+  // measured from exactly those two (`assistant/message` time minus the first
+  // token — DSH's own session-stats formula). The real bridge forwards the event
+  // verbatim, so a fake bridge missing either field would let a plugin that dropped
+  // the timings look green while the live row lost its tok/s entirely.
+  const stream = [
+    { type: "reasoning-chunks", time0: startedAt + 20, dt: [20], texts: ["think", "ing"], index: 0 },
+    { type: "text-chunks", time0: startedAt + 80, dt: [20, 20], texts: ["Hel", "lo", " world"], index: 1 },
+  ];
+  notify("session.event", { sessionId: rootId, event: { type: "assistant/message", seq: 1, time: Date.now(), data: { turn: 1, step: 1, message: { id: "sm1", content: [{ type: "reasoning", text: "thinking" }, { type: "text", text: "Hello world" }] }, usage: { inputTokens: 1200, cacheReadTokens: 800, cacheWriteTokens: 0, outputTokens: 100 }, stream } } });
   notify("session.event", { sessionId: rootId, event: { type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "completed" } } } });
   notify("session.status", { sessionId: rootId, status: "idle" });
 }
