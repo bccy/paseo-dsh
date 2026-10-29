@@ -13,7 +13,7 @@
  * installation with a module resolve hook, then drives the real class with a
  * recording context. No profile, no daemon, no model, no child process.
  *
- * What is pinned (both were reported as audit findings):
+ * What is pinned (each was reported as an audit finding):
  *
  *   1. **`usage()` must not resurrect a closed session.** It is refreshed by a
  *      timer and by turn events, not by the user, so a request can still be in
@@ -33,6 +33,15 @@
  *      and a profile without the web bundle legitimately composes no
  *      `workspaceRegistry`, so repeating the line per call is noise. A failure
  *      (a throwing lookup or read) is still reported on every occurrence.
+ *   3. **`paseo/permission/set` must reach a real method.** 3047948 deleted
+ *      `setPermission` while moving a JSDoc block and left its `case` in
+ *      `handleRequest`, so applying Paseo's chosen preset on open threw
+ *      `TypeError: this.setPermission is not a function`, became an open
+ *      warning, and the session silently ran on the profile default — a
+ *      read-only request still ran with write access. The method and its
+ *      dispatch are pinned, and the whole switch is scanned for a `case` that
+ *      names a method the prototype does not have: that is the exact shape the
+ *      regression took, and it is what no behavioural check would have noticed.
  *
  * Usage:
  *
@@ -345,6 +354,73 @@ const present = () => ({
     'a fully composed profile reports nothing at all',
     lines.length === 0 && value?.available === true,
     `${lines.length} line(s): ${JSON.stringify(lines)}`,
+  );
+}
+
+// ===== 3. `paseo/permission/set` reaches a real implementation ===========
+// The plugin applies Paseo's chosen preset on open (`session.configure` →
+// `setPermission`), so a request that exists only as a `case` in the switch is a
+// silent capability loss: the TypeError became an open warning and the user ran
+// on the profile default even after picking "read-only". Both the method and its
+// dispatch are pinned here, plus a scan that no future `case` points at a method
+// that is not on the prototype — that is the shape the regression took.
+{
+  const calls = [];
+  const service = {
+    set: (session, name) => calls.push({ session, name }),
+    current: () => 'restricted',
+  };
+  const { server, created } = makeServer({ permissionPresets: service });
+  check(
+    'the server implements setPermission',
+    typeof PaseoHarnessServer.prototype.setPermission === 'function',
+    typeof PaseoHarnessServer.prototype.setPermission,
+  );
+  // The dispatch throw is captured rather than allowed to abort the run: on the
+  // regressed tree this request throws `this.setPermission is not a function`,
+  // and an uncaught throw would end the script before the dispatch scan below
+  // gets to report the same defect by name.
+  let out;
+  let thrown;
+  try {
+    out = await server.handleRequest('paseo/permission/set', { sessionId: 'perm-1', preset: 'restricted' });
+  } catch (error) {
+    thrown = error;
+  }
+  check(
+    'paseo/permission/set dispatches without throwing',
+    thrown === undefined,
+    thrown === undefined ? 'no throw' : `threw: ${thrown instanceof Error ? thrown.message : String(thrown)}`,
+  );
+  check(
+    'paseo/permission/set writes the preset through DSH and answers the result',
+    calls.length === 1 && calls[0].name === 'restricted' && out?.current === 'restricted',
+    `${JSON.stringify(calls.map((call) => call.name))}, ${JSON.stringify(out)}`,
+  );
+  check(
+    'paseo/permission/set materializes the session it is given',
+    created.length === 1 && created[0] === 'perm-1' && calls[0]?.session?.id === 'perm-1',
+    `created=${JSON.stringify(created)}`,
+  );
+}
+
+// Every `case '…': return this.X(...)` in `handleRequest` must name a method that
+// exists. This is the anti-regression net for the whole dispatch table: the
+// regression that removed `setPermission` left its case standing, and nothing
+// caught it because no check ever sent that request.
+{
+  const dispatch = PaseoHarnessServer.prototype.handleRequest.toString();
+  const cases = [...dispatch.matchAll(/case '([^']+)':\s*return this\.([A-Za-z_$][\w$]*)\(/g)];
+  const missing = cases.filter(([, , method]) => typeof PaseoHarnessServer.prototype[method] !== 'function');
+  check(
+    'the dispatch scan found the switch cases',
+    cases.length >= 15,
+    `${cases.length} case(s) parsed`,
+  );
+  check(
+    'every method the request switch calls exists on the prototype',
+    cases.length > 0 && missing.length === 0,
+    missing.length === 0 ? `${cases.length} method(s) present` : `missing: ${missing.map(([, , method]) => method).join(', ')}`,
   );
 }
 

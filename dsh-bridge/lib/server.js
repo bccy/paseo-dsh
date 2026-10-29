@@ -2299,6 +2299,31 @@ export class PaseoHarnessServer {
   }
 
   /**
+   * Switch one session's permission preset through DSH's own projection API.
+   *
+   * The slash command `/permission` is a user-visible action: it appends
+   * `command/run` and `command/done` events, which then replay as a command row
+   * in Paseo's timeline even though the user never typed it. `permissionPresets.set`
+   * writes the same durable events (`permission/preset`, `sandbox/mode`,
+   * `approval/policy`) without the command lifecycle. The one behavioural
+   * difference is that the command path also injects an "approval policy
+   * changed" chat notice; the composer shows the current preset itself, so the
+   * quieter write is the one this provider uses.
+   *
+   * @param {{sessionId: string, preset?: unknown}} params
+   */
+  async setPermission(params) {
+    const service = this.ctx.get('permissionPresets');
+    if (service === undefined) throw new Error('this DSH profile composes no permission presets');
+    const rec = await this.getOrCreateSession(params.sessionId);
+    this.assertLiveAgent(rec, params.sessionId);
+    const name = typeof params.preset === 'string' ? params.preset : '';
+    if (name === '') throw new Error('a permission preset name is required');
+    service.set(rec.handle.agent.session, name);
+    return { current: service.current(rec.handle.agent.session) };
+  }
+
+  /**
    * Report the session's current context occupancy for the composer's usage
    * readout.
    *
