@@ -28,10 +28,14 @@
 三个关键事实：
 
 1. **Paseo 侧走的是"direct provider plugin"，不是 ACP。** Paseo 的 `@getpaseo/plugin`
-   暴露 `registerProvider()`，插件在 daemon 进程里直接提供模型目录、会话、时间线、
-   权限卡片。这就是 Codex / Claude Code 那种"原生接入"的机制。
-2. **一个会话 = 你的运行时一个进程。** 插件为每个 Paseo 会话起一个子进程，用
-   stdio 上的换行分隔 JSON-RPC 通话。进程隔离意味着会话崩了不会拖垮 daemon。
+   暴露 `registerProvider()`，插件（跑在 daemon fork 出的 `plugin-process` 子进程里，
+   不在 daemon 进程内）直接提供模型目录、会话、时间线、权限卡片。这就是 Codex / Claude Code
+   那种"原生接入"的机制。
+2. **一个连接 = 你的运行时一个进程。** 插件为**一个 provider 连接**起一个子进程，该连接上的
+   所有 Paseo 会话共用它，用 stdio 上的换行分隔 JSON-RPC 通话。工作目录、模型路由、MCP server
+   都按会话下发（DSH 按 session 维护这些，运行时不需要 `chdir`），所以省掉了每次新建会话的
+   CLI 冷启动。**环境变量是唯一的进程级东西**：只有首个会话打开时的环境生效，后续会话要求不同
+   值时差异会以 warning 上时间线（只列键名）——这是有意选的能力上限，不是遗漏。
 3. **中间那层协议是你自己定的。** Paseo 的 provider 契约要遵守（这是硬约束），
    但插件和 bridge 之间怎么说话完全自由。**这既是自由度，也是最大的坑源**——见第 4 节。
 
@@ -267,6 +271,30 @@ if (provider === undefined || model === undefined) {
 同理，"按 provider 名字猜要不要动态加载适配器"也应该变成显式配置（一个
 `provider -> adapter 模块` 的映射），而不是 `if (provider !== 'some-name')`。
 
+### 4.6 教训六：宿主侧缺口不能靠"默认有人打了补丁"掩盖（不装 local-patches 时的行为）
+
+有些缺陷不在你的代码里，而在宿主（Paseo）里。本仓库有 `local-patches/` 去补它，但那**不是
+发布产物**：它改写**已安装的** `@getpaseo/server` 的 `dist`，`npm publish` 出去的包里没有，
+装不装都不影响插件本体。所以"装了补丁的行为"和"没装补丁的行为"必须都是**可解释**的，而且
+没装时必须**看得见**——否则就是本书反复讲的那类静默降级。
+
+| 能力 | 装了补丁 | 不装补丁 |
+|---|---|---|
+| **撤回**（对话 + 文件） | 界面立刻刷新，底部那条「撤回已生效」提示一闪而过 | 撤回**已经生效**：对话、智能体改过的文件都回退了，模型在上下文里的记忆也回退了（下一次请求看不到被撤内容，见下方关于记忆插件的说明）；只是界面不会自动刷新——底部出现「撤回已生效」提示，执行 **Reload agent** 或重开会话即可看到结果 |
+| **子代理第二次派发时的「运行中」** | 同右（该补丁已退役，现在没有任何补丁覆盖它） | 卡片停在上一回合的终态。上游 [#8080](https://github.com/getpaseo/paseo/pull/8080) 已修复并合入 main，**等 Paseo 发版** |
+| **重开会话后的回合折叠** | 折叠正确 | 部分失效：系统触发的回合会并入上一回合、插话回合被拆开。等上游 [#8053](https://github.com/getpaseo/paseo/issues/8053) / PR [#8054](https://github.com/getpaseo/paseo/pull/8054) |
+
+关键在于第一行那个「撤回已生效」提示**同时是自证机制**：它必须在 `request.completed` **之前**
+发出，因为宿主的时间线只能追加、协议里没有"删行"事件。打过截断补丁（或将来上游修好）的宿主会
+在回执里把 history 截到撤回点，这条通知随被撤行一起消失；原版宿主会留下它，告诉用户刷新。
+**顺序就是机制本身**——放到回执之后，补丁宿主上它也会留下来，变成「时间线没刷新」的误报。
+`harness/host-contract-sim.mjs` 直接在宿主真实代码上双向断言这件事（补丁版被截、原版存活）。
+
+为什么补丁不默认装：它改的是 Paseo 自己的 dist，macOS 桌面版自带签名 CLI 打不了补丁；命令行
+全局安装又会被每次 `npm i -g @getpaseo/cli` 整树覆盖，只能靠 `ExecStartPre` 每次启动重打。
+它只作为给维护者的**可选加速项**存在，装法与升级处置见
+[local-patches/README.md](../local-patches/README.md)。
+
 ---
 
 ## 5. 验证方法论：怎么自己把问题找出来
@@ -375,5 +403,6 @@ dsh-bridge/           ← 应交付：bridge bundle（你的运行时那一侧�
 paseo-plugin/         ← 应交付：Paseo provider 插件
 tools/probe-provider.mjs  ← 应交付：能力探测（帮别人填 C）
 harness/              ← 可选：验证脚本，展示第 5 节的方法
+local-patches/        ← 不交付：改写已安装的宿主 dist，只给维护者（见 4.6）
 docs/FIELD-NOTES.md   ← 不交付：作者本机的具体缺陷记录（历史，只读）
 ```

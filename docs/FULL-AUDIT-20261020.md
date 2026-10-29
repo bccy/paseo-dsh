@@ -1,5 +1,7 @@
 # 2026-10-20 全量审查记录
 
+> **历史文档，内容保持当时原样。** 文中提到的 `paseo-plugin/server/parked-sessions.ts`（含 `harness/parked-sessions-check.cjs`）已在 `bf093a7` 删除——它的 `hold`/`release`/`quiesce`全是空壳，共享进程的引用计数已收回 `provider.ts` 的 `#poolClaims`。
+
 > 分支 `audit/full-review-20261020`（基线 `main` = `2496f0b`）。
 > 版本基线（本机实测，npm dist-tag `latest`）：**Paseo 0.12.0**、**DSH 0.2.1-rc.2**。
 > 本文只记本轮发现与修复；安装/自举流程仍见 [ADOPTION.md](./ADOPTION.md)、

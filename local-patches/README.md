@@ -63,13 +63,59 @@ worker、plugin process、DSH 桥、git helper）**直接 return**。原因有�
 日志现在有上限：超过 500 行时截断重写，只保留最新的（`startup-patch-hook.log` 原来没有任何
 上限）。
 
+### 部署：仓库是唯一事实源
+
+本目录（仓库里的 `local-patches/`）是**唯一事实源**，daemon 实际加载的是部署副本
+`$HOME/.paseo/local-patches/`。改完脚本必须**同步过去**，否则下次 daemon 启动跑的仍是旧脚本：
+
+```bash
+# 1. 先用仓库里的新脚本只读检查一遍（--check 只读，不改真机文件）
+env -u NODE_OPTIONS node local-patches/apply-rewind-history-truncation.mjs --check
+
+# 2. 同步到部署位置（~ 展开成你的 home，别写死用户名）
+mkdir -p ~/.paseo/local-patches
+cp local-patches/*.mjs local-patches/*.cjs ~/.paseo/local-patches/
+
+# 3. 体检部署副本，确认状态
+env -u NODE_OPTIONS node ~/.paseo/local-patches/check-rewind-patch.mjs
+```
+
+第 2 步**只拷脚本，不拷备份与状态文件**（`plugin-provider.js.orig-*`、
+`rewind-patch.status.json` 属于本机状态，部署副本自己会写）。systemd 的 `ExecStartPre` 与
+`NODE_OPTIONS` 钩子都指向部署副本，所以同步完还要重启 daemon 才会真正生效。
+
+### 从旧版本升级（含已退役的 `childRunning`）
+
+顺序不能换：**先用旧脚本回滚 → 再同步新脚本 → 再 apply → 再重启 daemon**。第 1 步不能省，
+原因是新版 `--revert` **清不干净**旧 `childRunning` 的 marker（见上文「已退役」那段）。
+
+```bash
+# 1. 用【旧】脚本回滚全部 target（此时部署副本还是旧脚本）
+env -u NODE_OPTIONS node ~/.paseo/local-patches/apply-rewind-history-truncation.mjs --revert
+
+# 2. 同步【新】脚本（上节第 2 步）
+cp local-patches/*.mjs local-patches/*.cjs ~/.paseo/local-patches/
+
+# 3. 用新脚本重新打（现在只剩 rewind + turnId 两个 target）
+env -u NODE_OPTIONS node ~/.paseo/local-patches/apply-rewind-history-truncation.mjs
+
+# 4. 重启 daemon，让 ExecStartPre / 钩子走新脚本
+systemctl --user restart paseo.service
+env -u NODE_OPTIONS node ~/.paseo/local-patches/check-rewind-patch.mjs   # 应 exit 0
+```
+
+跳过第 1 步的后果是**残留**：旧 `childRunning` 的两行注释留在 `plugin-provider.js` 里。它
+不影响 `rewind` / `turnId` 的正确性（上游 #8080 发版后也自然多余），但会让人误以为补丁还在
+维护。彻底清掉的办法是用**旧版脚本** `--revert` 一次，或重装 `npm i -g @getpaseo/cli` 拿回
+干净文件再跑新 apply。
+
 ## 用法
 
 ```bash
 node check-rewind-patch.mjs          # 只读体检
 node check-rewind-patch.mjs --json   # 机器读
 node apply-rewind-history-truncation.mjs            # 打补丁（幂等）
-node apply-rewind-history-truncation.mjs --check    # 只读：三个 target 是否都在位
+node apply-rewind-history-truncation.mjs --check    # 只读：两个 target 是否都在位
 node apply-rewind-history-truncation.mjs --revert   # 全部回滚
 ```
 

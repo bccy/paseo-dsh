@@ -1,7 +1,17 @@
 # Issue 草稿：plugin provider 子代理第二次运行时，Subagents 卡片不恢复 running
 
+> **已作废：上游 [getpaseo/paseo#8080](https://github.com/getpaseo/paseo/pull/8080) 已修复
+> 这个缺陷（合入 main，待发版），本草稿不要再提交。**
+>
+> 上游的修法与草稿里「Suggested fix」两行改法完全一致（`acceptChildEvent` 不再丢弃
+> `started`、并把它映射成 `running`）。在含它的 Paseo 发版之前，二次派发的子代理仍然不会
+> 显示 running——那段时间接受这个降级，本仓库对应的 `childRunning` 宿主补丁已退役
+> （见 [local-patches/README.md](../local-patches/README.md)）。
+>
+> 下面保留原文，作为该缺陷的现象、根因与复现步骤的记录。
+
 > 目标仓库：https://github.com/getpaseo/paseo
-> 状态：**草稿，等你审阅后才提交**（我不会自己发）
+> 状态：**已作废（上游 #8080 修复，未发版）**
 > 证据等级：源码确认 + 真机实测
 
 ---
@@ -123,6 +133,8 @@ Why this is safe:
 ---
 
 ## 提交前需要你确认的 3 件事
+
+> **以下问题已不再需要回答：本草稿作废（上游 #8080 已按同样的两行改法修复）。**
 
 1. **要不要点名 `paseo-dsh`？** 草稿里写了。若你不想关联自己的仓库，我改成「a third-party
    plugin provider」匿名表述。

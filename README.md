@@ -236,7 +236,7 @@ paseo-dsh/
 │   ├── server/
 │   │   ├── provider.ts  #   连接、catalog、会话生命周期、权限卡片
 │   │   ├── session.ts   #   单会话：提问→卡片、计划、思考档位、用量
-│   │   ├── dsh-process.ts # 一个会话一个 dsh 子进程
+│   │   ├── dsh-process.ts # 一个连接共用的 dsh 子进程（cwd/路由/MCP 按会话下发）
 │   │   ├── timeline.ts  #   DSH 会话事件 → Paseo 时间线
 │   │   ├── bootstrap.ts #   自举：写 profile 文件 + 把内嵌 bridge 落盘
 │   │   └── bridge-assets.ts # 生成物：bridge 的 base64 内嵌副本
@@ -266,8 +266,32 @@ paseo-dsh/
 承载 elicitation，SDK 协议里传输层支持但服务端从不发送。所以桥接自带了传输层，
 把这个能力补上。
 
-每个 Paseo 会话对应一个独立的 `dsh --profile <name>` 子进程，通过 stdio 上的换行分隔
-JSON-RPC 通信。会话之间进程隔离，一个崩了不会拖垮 daemon。
+一个 provider 连接的所有 Paseo 会话共用**一个** `dsh --profile <name>` 子进程，通过 stdio
+上的换行分隔 JSON-RPC 通信。工作目录、模型路由、MCP server 都是**按会话**下发给这个进程的
+（DSH 按 session 维护它们，运行时不需要 `chdir`），所以多个会话可以同时开在不同工作区；
+省掉的是每次新建会话 1.5–2.7 s 的 CLI 冷启动。**环境变量是例外**——它是进程级的，只有首个
+会话打开时的环境生效；后续会话要求不同的值时，差异以 warning 出现在时间线上（只列键名、
+不列值），不静默忽略。
+
+## 不装 local-patches 时的行为
+
+`local-patches/` 里的宿主补丁**不是发布产物**：它们改写已安装的 `@getpaseo/server` 的
+`dist`（上游没有对应扩展点），`npm publish` 出去的包里没有。装不装都不影响插件本体，
+但有三处会降级：
+
+| 能力 | 装了补丁 | 不装补丁 |
+|---|---|---|
+| **撤回**（对话 + 文件） | 界面立刻刷新，底部那条「撤回已生效」提示一闪而过 | 撤回**已经生效**：对话、智能体改过的文件都回退了，模型在上下文里的记忆也回退了（下一次请求看不到被撤内容，见下方关于记忆插件的说明）；只是界面不会自动刷新——底部出现「撤回已生效」提示，执行 **Reload agent** 或重开会话即可看到结果 |
+| **子代理第二次派发时的「运行中」** | 同右（该补丁已退役，现在没有任何补丁覆盖它） | 卡片停在上一回合的终态。Paseo 上游 [#8080](https://github.com/getpaseo/paseo/pull/8080) 已修复并合入 main，**等 Paseo 发版** |
+| **重开会话后的回合折叠** | 折叠正确 | 部分失效：系统触发的回合会并入上一回合、插话回合被拆开。等上游 [#8053](https://github.com/getpaseo/paseo/issues/8053) / PR [#8054](https://github.com/getpaseo/paseo/pull/8054) |
+
+> 有两件事与补丁无关：记忆插件此前采集过的内容可能仍被召回（模型"记得"）；撤回本身不可
+> 撤销。
+
+为什么补丁不默认安装：它改的是 **Paseo 自己的 dist**，而 macOS 桌面版自带的是签名 CLI，
+打不了补丁；命令行的全局安装也会被每次 `npm i -g @getpaseo/cli` 整树覆盖，所以得靠
+`ExecStartPre` 每次启动重打。它只作为给维护者的**可选加速项**存在，装法与升级处置见
+[local-patches/README.md](local-patches/README.md)。
 
 ## 自测 / 本地验证（不需要 Paseo）
 

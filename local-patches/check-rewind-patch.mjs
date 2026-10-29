@@ -26,9 +26,9 @@
  *    `state: patchable` vs `state: stale-body`。
  *    `--json` 里同样有 `state` 字段。
  *
- * ⚠️ 本脚本只判 rewind 一个 target 的 exit code；`turnId` 的结果在
- *    `siblings` / `siblingsAllOk`（human 报告里是"姊妹补丁"一节）。
- *    姊妹补丁缺失不会改变 exit code，所以**不要只看 exit code 判断整机健康**。
+ * ⚠️ exit code 是 rewind 与姊妹补丁（`turnId`）合并后的结论（`combinedExitCode`）：
+ *    rewind 非 0 时就是 rewind 的码；rewind 健康而 `turnId` 缺失/陈旧/半打时取它的严重度。
+ *    `--json` 的 `code` 仍只代表 rewind，`exitCode` + `siblingsAllOk` 才是整机结论。
  *
  * 注：md5 只作为「与已知基线差多远」的参考信息打印，**不参与判定**。
  *     上游改一个无关字节不该被当成故障 —— 那是 apply 的锚点自适配要处理的事。

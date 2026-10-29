@@ -1,5 +1,7 @@
 # 一进程多会话改造 · 实施契约（冻结）
 
+> **历史文档，内容保持当时原样。** 文中提到的 `paseo-plugin/server/parked-sessions.ts`（含 `harness/parked-sessions-check.cjs`）已在 `bf093a7` 删除——它的 `hold`/`release`/`quiesce`全是空壳，共享进程的引用计数已收回 `provider.ts` 的 `#poolClaims`。
+
 基线：`main @ cdb4022`，分支 `feat/one-process-multi-session`。
 本文是并行实现的**唯一契约源**。各任务只改自己写域内的文件，跨域只按本文约定调用。
 

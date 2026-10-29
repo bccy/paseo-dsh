@@ -1,5 +1,7 @@
 # 撤回原生化（方案 A）实施计划
 
+> **历史文档，内容保持当时原样。** 文中提到的 `paseo-plugin/server/parked-sessions.ts`（含 `harness/parked-sessions-check.cjs`）已在 `bf093a7` 删除——它的 `hold`/`release`/`quiesce`全是空壳，共享进程的引用计数已收回 `provider.ts` 的 `#poolClaims`。
+
 > 状态：待用户确认后开工。本文件只做设计，未改任何源码。
 > 行号基准：`<repo>` HEAD `9dfe7b5` + 2 个未提交改动（`harness/subagent-check.cjs`、`paseo-plugin/server/session.ts`）；Paseo dist 为 0.13.0 全局包当前内容。
 > 取证时间：2026-10-26。行号会漂移，开工前每条落点须重新 grep 确认。

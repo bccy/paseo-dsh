@@ -1,5 +1,7 @@
 # 撤回原生化（A2）实施进度
 
+> **历史文档，内容保持当时原样。** 文中提到的 `paseo-plugin/server/parked-sessions.ts`（含 `harness/parked-sessions-check.cjs`）已在 `bf093a7` 删除——它的 `hold`/`release`/`quiesce`全是空壳，共享进程的引用计数已收回 `provider.ts` 的 `#poolClaims`。
+
 > 计划：`docs/PLAN-REWIND-NATIVE.md`
 > 最后更新：2026-10-26 05:35（P0/P1/P2/P3 全部完成并验收）
 

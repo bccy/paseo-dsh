@@ -1,5 +1,7 @@
 # 一进程多会话改造方案（2026-10-24）
 
+> **历史文档，内容保持当时原样。** 文中提到的 `paseo-plugin/server/parked-sessions.ts`（含 `harness/parked-sessions-check.cjs`）已在 `bf093a7` 删除——它的 `hold`/`release`/`quiesce`全是空壳，共享进程的引用计数已收回 `provider.ts` 的 `#poolClaims`。
+
 基线：`main @ cdb4022`。目标：把「一个 Paseo 会话 = 一个 `dsh` 子进程」改成
 「一个 `dsh` 子进程承载多个会话」，消除每次新建会话的 3.5 s 冷启动。
 
