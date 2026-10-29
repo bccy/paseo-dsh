@@ -20,6 +20,19 @@
  *   7. a bridge missing a lazy module is a failure, not `ok`
  *   8. a complete bridge is still accepted (the control for 7)
  *   9. an unreadable file list is a failure, not a warning with exit 0
+ *  10. a YAML syntax error is a failure even when the *plugin* ships no parser,
+ *      as long as the DSH install has one — the shape of every published install
+ *
+ * Case 10 exists because case 3 only ever passes in a development checkout. The
+ * plugin declares no `dependencies` and does not ship `node_modules`, so a real
+ * `paseo plugin add npm:paseo-dsh` install resolves neither `yaml` nor
+ * `js-yaml` from the plugin directory. `loadYaml()` used to look there alone,
+ * which meant every published install took the `[warn] YAML syntax not
+ * validated` branch and then reported `nothing blocking` with exit 0 for a
+ * `cordis.patch.yml` that is not YAML at all. The check now falls back to the
+ * parser DSH itself carries, so the case is built as the two-directory split it
+ * describes: a plugin copy with no reachable parser, and a `dsh` on PATH whose
+ * package directory does have one.
  *
  * The bridge cases (7/8) exist because the check used to look for `lib/index.js`
  * alone: a bridge with the entry but without `lib/child-anchors.js`,
@@ -48,8 +61,10 @@ import {
   readdirSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -389,6 +404,129 @@ const check = (name, pass, detail) => {
     "the readable-list control still names the missing files",
     control.out.includes("bridge bundle incomplete") && control.code === 1,
     control.out.trim().split("\n").filter((l) => l.includes("bridge bundle")).join(" | ") || "(no bridge line)",
+  );
+}
+
+// ---- 10. a published install: no plugin parser, DSH has one --------------
+// The shape `paseo plugin add npm:paseo-dsh` produces. Case 3 passes in a
+// development checkout because `paseo-plugin/node_modules` is there; a published
+// install ships no `node_modules` at all, so `loadYaml()` found nothing and every
+// such install reported `[warn] YAML syntax not validated` + `nothing blocking`
+// + exit 0 for a file that is not YAML. Built as the two-directory split: the
+// plugin copy has no reachable parser, the `dsh` on PATH does.
+{
+  const NO_PARSER_PLUGIN = join(WORK, "no-parser-plugin");
+  mkdirSync(join(NO_PARSER_PLUGIN, "lib"), { recursive: true });
+  mkdirSync(join(NO_PARSER_PLUGIN, "server"), { recursive: true });
+  copyFileSync(join(HERE, "..", "paseo-plugin", "lib", "doctor.mjs"), join(NO_PARSER_PLUGIN, "lib", "doctor.mjs"));
+  copyFileSync(join(HERE, "..", "paseo-plugin", "package.json"), join(NO_PARSER_PLUGIN, "package.json"));
+  // The real asset file, so the bridge row is green and cannot be the reason a
+  // verdict below differs between the two runs.
+  copyFileSync(
+    join(HERE, "..", "paseo-plugin", "server", "bridge-assets.ts"),
+    join(NO_PARSER_PLUGIN, "server", "bridge-assets.ts"),
+  );
+
+  // The parser `dsh` carries. Symlinked rather than copied: it is the same
+  // implementation the real install would judge the file with.
+  const FAKE_DSH = join(WORK, "fake-dsh");
+  const fakeBin = join(FAKE_DSH, "lib", "bin.js");
+  mkdirSync(join(FAKE_DSH, "lib"), { recursive: true });
+  mkdirSync(join(FAKE_DSH, "node_modules"), { recursive: true });
+  writeFileSync(join(FAKE_DSH, "package.json"), '{"name":"@deepseek-ai/dsh","version":"0.2.1"}\n');
+  writeFileSync(fakeBin, '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "0.2.1-rc.2"; else exit 1; fi\n');
+  chmodSync(fakeBin, 0o755);
+  symlinkSync(join(HERE, "..", "paseo-plugin", "node_modules", "yaml"), join(FAKE_DSH, "node_modules", "yaml"), "dir");
+  // `dsh` on PATH is a symlink into the install, exactly like a global bin dir.
+  const fakeDshBin = join(WORK, "fake-dsh-bin");
+  mkdirSync(fakeDshBin, { recursive: true });
+  symlinkSync(fakeBin, join(fakeDshBin, "dsh"));
+
+  // Preconditions, asserted rather than assumed: a sandbox that can reach a
+  // parser from the plugin copy, or cannot reach one from the DSH copy, would
+  // make the two runs below agree for a reason unrelated to the fallback.
+  const pluginRequire = createRequire(join(NO_PARSER_PLUGIN, "lib", "doctor.mjs"));
+  const resolvesFrom = (anchor) => {
+    for (const name of ["yaml", "js-yaml"]) {
+      try {
+        anchor(name);
+        return name;
+      } catch {
+        // Try the next spelling.
+      }
+    }
+    return undefined;
+  };
+  check(
+    "the plugin copy resolves no YAML parser (the published-install shape)",
+    resolvesFrom(pluginRequire) === undefined,
+    resolvesFrom(pluginRequire) ?? "no parser reachable",
+  );
+  const dshRequire = createRequire(join(FAKE_DSH, "package.json"));
+  check(
+    "the stand-in DSH install does resolve one",
+    resolvesFrom(dshRequire) !== undefined,
+    resolvesFrom(dshRequire) ?? "none",
+  );
+
+  const { runDoctor: runNoParserDoctor } = await import(
+    pathToFileURL(join(NO_PARSER_PLUGIN, "lib", "doctor.mjs")).href
+  );
+
+  const previousPath = process.env.PATH;
+  try {
+    process.env.PATH = [fakeDshBin, previousPath ?? ""].filter((entry) => entry !== "").join(delimiter);
+
+    install({ patch: `${VALID_ROUTE}this is: [not, valid yaml\n`, credentials: VALID_CREDENTIALS });
+    const bad = doctor(runNoParserDoctor);
+    const badPlain = stripAnsi(bad.out);
+    check(
+      "a syntax error is a failure even when the plugin ships no parser",
+      badPlain.includes("[fail] cordis.patch.yml is not valid YAML") && bad.code === 1,
+      badPlain.trim().split("\n").find((l) => l.includes("YAML")) ?? `exit ${bad.code}`,
+    );
+    check(
+      "and it does not fall back to `nothing blocking`",
+      !bad.out.includes("nothing blocking") && !bad.out.includes("All checks passed"),
+      bad.out.trim().split("\n").at(-1),
+    );
+
+    // The positive control: the same no-parser plugin copy must still accept a
+    // valid patch, so the case cannot be satisfied by a doctor that fails on the
+    // fallback alone.
+    install({ patch: VALID_ROUTE, credentials: VALID_CREDENTIALS });
+    const good = doctor(runNoParserDoctor);
+    const goodPlain = stripAnsi(good.out);
+    check(
+      "a valid patch still passes with the DSH parser",
+      good.code === 0 && goodPlain.includes("[ok  ] model route configured"),
+      goodPlain.trim().split("\n").filter((l) => l.includes("model route")).join(" | ") || `exit ${good.code}`,
+    );
+    check(
+      "and the syntax was actually checked, not skipped",
+      !good.out.includes("YAML syntax not validated"),
+      goodPlain.trim().split("\n").find((l) => l.includes("YAML")) ?? "(no YAML row)",
+    );
+  } finally {
+    process.env.PATH = previousPath;
+  }
+
+  // Neither place has a parser: still a warning, never a failure. The published
+  // install is the case the fallback was added for, but a host without a usable
+  // `dsh` must not be turned into a blocking issue over a check that could not
+  // run — the route and credential rows below it are still real answers.
+  install({ patch: `${VALID_ROUTE}this is: [not, valid yaml\n`, credentials: VALID_CREDENTIALS });
+  const noParserAtAll = doctor(runNoParserDoctor);
+  const noParserPlain = stripAnsi(noParserAtAll.out);
+  check(
+    "with no parser anywhere the row is still a warning, not a failure",
+    noParserPlain.includes("[warn] YAML syntax not validated") && !noParserPlain.includes("[fail] cordis.patch.yml is not valid YAML"),
+    noParserPlain.trim().split("\n").filter((l) => l.includes("YAML")).join(" | ") || "(no YAML row)",
+  );
+  check(
+    "and that install still exits 0 when nothing else blocks",
+    noParserAtAll.code === 0,
+    `exit ${noParserAtAll.code}`,
   );
 }
 

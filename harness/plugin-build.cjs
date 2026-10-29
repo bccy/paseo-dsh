@@ -40,9 +40,13 @@ const PLUGIN_DIR = resolve(__dirname, "..", "paseo-plugin");
 /**
  * Written into the build directory after a successful compile; records exactly
  * which sources (and which compiler) produced the tree.
+ *
+ * Bumped to 2 when `config` (tsconfig.json/package.json mtimes) joined the
+ * stamp: a version-1 stamp cannot say anything about the compiler inputs, so it
+ * must not be trusted for them.
  */
 const STAMP_NAME = ".build-stamp.json";
-const STAMP_VERSION = 1;
+const STAMP_VERSION = 2;
 
 /** posix path of `abs` relative to `paseo-plugin` — the stamp's key form. */
 function relSource(abs) {
@@ -111,6 +115,33 @@ function sourceFiles() {
   return tsconfigSources() ?? walkSources(PLUGIN_DIR, []).sort();
 }
 
+/**
+ * Files that change what the compiler emits without being sources themselves.
+ *
+ * `sourceFiles()` is derived from `tsconfig.json`, so the config decides the
+ * source set — but it was not part of the set. Editing `compilerOptions`
+ * (`target`, `jsx`, `strict`, …) or bumping a `devDependencies` entry in
+ * `paseo-plugin/package.json` (which changes the `@getpaseo/*` declarations the
+ * emitted JS is typed against) therefore left an existing `.dbg-*` tree looking
+ * fresh, and every harness downstream of it ran green on bytes compiled with the
+ * old settings. Only `include` changes were ever noticed, because those change
+ * the source set itself.
+ *
+ * The two files are compared with the same mtime logic as the sources and
+ * recorded in the same stamp; `freshness()` keeps them out of the
+ * expected-output list, because there is no `tsconfig.js` to emit.
+ */
+function configInputs() {
+  return [join(PLUGIN_DIR, "tsconfig.json"), join(PLUGIN_DIR, "package.json")].filter((file) =>
+    existsSync(file),
+  );
+}
+
+/** Everything the stamp records: the sources plus the config that produced them. */
+function buildInputs() {
+  return [...sourceFiles(), ...configInputs()];
+}
+
 /** The compiler version the build was made with, when it can be read. */
 function installedTscVersion() {
   try {
@@ -165,6 +196,9 @@ function compiledOutputs(outDir) {
  *      or reverted file invalidates even when its size did not change);
  *   4. every source still has its compiled `.js`, the `package.json` marker is
  *      there, and no `.js` is left over from a source that no longer exists.
+ *   5. the files that decide *how* the sources compile (`tsconfig.json`,
+ *      `package.json`) are the ones the build was made with, compared the same
+ *      way — see `configInputs()`.
  *
  * `fresh === false` always carries at least one reason, so a rebuild can say
  * what changed instead of silently reusing (or silently recompiling).
@@ -204,6 +238,31 @@ function freshness(outDir, sources = sourceFiles()) {
     if (added.length > 0) reasons.push(`source added since build: ${added.join(", ")}`);
     if (removed.length > 0) reasons.push(`source removed since build: ${removed.join(", ")}`);
     if (modified.length > 0) reasons.push(`source modified since build: ${modified.join(", ")}`);
+
+    // The compiler inputs. A stamp without them predates this check and cannot
+    // prove anything about them, so it is stale rather than assumed equal.
+    const recordedConfig = stamp.config !== null && typeof stamp.config === "object" ? stamp.config : undefined;
+    if (recordedConfig === undefined) {
+      reasons.push(`no compiler inputs recorded in ${STAMP_NAME} (build predates config tracking)`);
+    } else {
+      const changedConfig = configInputs()
+        .map((file) => {
+          const rel = relSource(file);
+          let mtime;
+          try {
+            mtime = statSync(file).mtimeMs;
+          } catch {
+            return `${rel} (now unreadable)`;
+          }
+          if (!(rel in recordedConfig)) return `${rel} (not in the stamp)`;
+          return recordedConfig[rel] === mtime ? undefined : rel;
+        })
+        .filter((rel) => rel !== undefined);
+      if (changedConfig.length > 0) {
+        reasons.push(`compiler input changed since build: ${changedConfig.join(", ")}`);
+      }
+    }
+
     const tsc = installedTscVersion();
     if (stamp.tsc !== undefined && tsc !== undefined && stamp.tsc !== tsc) {
       reasons.push(`typescript changed since build: ${stamp.tsc} -> ${tsc}`);
@@ -269,8 +328,13 @@ function buildPlugin(options = {}) {
   }
 
   // Snapshot before compiling. If a source changes mid-build the stamp keeps the
-  // old mtime, so the next run rebuilds instead of trusting a mixed tree.
+  // old mtime, so the next run rebuilds instead of trusting a mixed tree. The
+  // compiler inputs are snapshotted here too, for the same reason: a `tsconfig`
+  // edited while `tsc` runs must leave a stamp that disagrees with it.
   const snapshot = new Map(sourceFiles().map((file) => [relSource(file), statSync(file).mtimeMs]));
+  const configSnapshot = new Map(
+    configInputs().map((file) => [relSource(file), statSync(file).mtimeMs]),
+  );
 
   rmSync(outDir, { recursive: true, force: true });
   if (!quiet) {
@@ -316,6 +380,7 @@ function buildPlugin(options = {}) {
         builtAt: new Date().toISOString(),
         tsc: installedTscVersion(),
         sources: Object.fromEntries(snapshot),
+        config: Object.fromEntries(configSnapshot),
       },
       null,
       2,
@@ -379,10 +444,13 @@ function resolvePluginBuild(explicit, dir) {
 module.exports = {
   buildDirFromEnv,
   buildPlugin,
+  buildInputs,
+  configInputs,
   freshness,
   isFresh,
   resolvePluginBuild,
   sourceFiles,
   PLUGIN_DIR,
   STAMP_NAME,
+  STAMP_VERSION,
 };

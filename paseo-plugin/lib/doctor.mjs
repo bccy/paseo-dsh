@@ -17,18 +17,22 @@
  * "All checks passed". A route now has to name a provider and a model, and the
  * credential has to carry a value under `refs:`, or it is a failure.
  *
- * YAML syntax is parsed for real when a parser resolves from here (`yaml` or
- * `js-yaml`, whichever the install brought in). When neither does, that is
- * **said out loud** rather than assumed away, because "we could not check this"
- * and "this is fine" are different answers and only one of them is honest.
+ * YAML syntax is parsed for real when a parser resolves — from the plugin's own
+ * `node_modules` in a development checkout, or from the DSH install in a
+ * published one (`loadYaml`). The second place is what makes this check real for
+ * an install from npm: the plugin ships no `node_modules`, so the plugin-local
+ * lookup alone found nothing and every such install got `[warn]` + exit 0 for a
+ * patch file that was not YAML. When neither place resolves, that is **said out
+ * loud** rather than assumed away, because "we could not check this" and "this
+ * is fine" are different answers and only one of them is honest.
  *
  * @module paseo-dsh/lib/doctor
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -200,13 +204,79 @@ function loadBridgeFileList() {
   return { keys };
 }
 
-/** Whatever YAML parser this install happens to carry, or `undefined`. */
+/**
+ * Absolute path of `dsh` on PATH, or `undefined`.
+ *
+ * `which` is not used: it is a separate process, absent on some minimal hosts,
+ * and `run("dsh", …)` has already proved the CLI is startable by the time this
+ * matters.
+ */
+function whichDsh() {
+  for (const entry of (process.env.PATH ?? "").split(delimiter)) {
+    if (entry === "") continue;
+    const candidate = join(entry, "dsh");
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+/**
+ * A `require` anchored at the DSH install, or `undefined`.
+ *
+ * This module cannot resolve `yaml` in a real install: `paseo-plugin/package.json`
+ * declares no `dependencies`, and `files` does not ship `node_modules`, so both
+ * `yaml` and `js-yaml` are dev-only and absent from what
+ * `paseo plugin add npm:paseo-dsh` unpacks. DSH, on the other hand, carries a
+ * YAML parser for its own config — and that is the parser `cordis.patch.yml` is
+ * actually read by, so judging the file with the same implementation is the more
+ * faithful answer than a repo-local dev copy.
+ *
+ * `dsh` on PATH is a symlink into the global install, so its realpath is walked
+ * up to the package root that owns it. `undefined` when `dsh` is missing or the
+ * layout does not match, and the caller then says the syntax was not validated.
+ */
+function dshPackageRequire() {
+  const dsh = whichDsh();
+  if (dsh === undefined) return undefined;
+  try {
+    let dir = dirname(realpathSync(dsh));
+    // `/…/@deepseek-ai/dsh/lib/bin.js` -> the package root; the loop tolerates a
+    // differently-shaped `bin` entry or a symlink into another directory.
+    while (dir !== dirname(dir)) {
+      if (existsSync(join(dir, "package.json"))) return createRequire(join(dir, "package.json"));
+      dir = dirname(dir);
+    }
+  } catch {
+    // Unresolvable `dsh` is not an error here: the dsh row above already reports
+    // the CLI, and the YAML row reports that the syntax went unchecked.
+  }
+  return undefined;
+}
+
+/**
+ * Whatever YAML parser this install happens to carry, or `undefined`.
+ *
+ * Two places, in this order: this module's own resolution chain (what a
+ * development checkout has) and then the DSH install (what a published install
+ * has). Only when neither resolves is the syntax reported as unvalidated — a
+ * published install used to land there every time, which turned "this patch is
+ * not YAML at all" into a `[warn]` and exit 0.
+ */
 function loadYaml() {
   for (const name of ["yaml", "js-yaml"]) {
     try {
       return { name, module: require(name) };
     } catch {
       // Try the next spelling; the caller reports when none resolves.
+    }
+  }
+  const fromDsh = dshPackageRequire();
+  if (fromDsh === undefined) return undefined;
+  for (const name of ["yaml", "js-yaml"]) {
+    try {
+      return { name, module: fromDsh(name), viaDsh: true };
+    } catch {
+      // DSH may carry only one of the two.
     }
   }
   return undefined;

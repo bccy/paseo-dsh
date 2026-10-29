@@ -175,12 +175,19 @@ try {
    * would have written. This is how a touched source is "restored" without paying
    * for another `tsc` run; `version` and `tsc` are carried over so this helper
    * cannot paper over a format change.
+   *
+   * Both halves are re-recorded: the sources and the compiler inputs. A helper
+   * that restored only the sources would leave a scenario that edits
+   * `tsconfig.json` stuck on stale, and the "restore -> fresh" half of that
+   * assertion would pass for the wrong reason.
    */
   function restamp() {
     const stamp = JSON.parse(readFileSync(stampPath, 'utf8'));
     const sources = {};
     for (const file of build.sourceFiles()) sources[relSource(file)] = statSync(file).mtimeMs;
-    writeFileSync(stampPath, `${JSON.stringify({ ...stamp, sources }, null, 2)}\n`);
+    const config = {};
+    for (const file of build.configInputs()) config[relSource(file)] = statSync(file).mtimeMs;
+    writeFileSync(stampPath, `${JSON.stringify({ ...stamp, sources, config }, null, 2)}\n`);
   }
 
   /** Push a file's mtime into the future so it is provably newer than the build. */
@@ -411,6 +418,172 @@ try {
       if (previous === undefined) delete process.env.PASEO_PLUGIN_BUILD;
       else process.env.PASEO_PLUGIN_BUILD = previous;
     }
+  }
+
+  // ------------------------------------------ 12. a source removed since the build
+  // Scenario 5 covers a stray `.js` (an output whose source is gone). This is the
+  // other half, and the one that was uncovered: the source *and* its output both
+  // gone. Without the `removed` predicate `freshness()` returned
+  // `{fresh: true, reasons: []}` here, so every harness downstream ran green on a
+  // tree missing a module. Mutation M1 in the review report is this predicate
+  // deleted, and it stayed green before this scenario existed.
+  group('12. source removed since the build');
+  {
+    const rel = 'server/timeline.ts';
+    const abs = join(pluginDir, rel);
+    const source = readFileSync(abs);
+
+    const compiledAbs = join(outDir, rel.replace(/\.ts$/, '.js'));
+    const compiled = readFileSync(compiledAbs);
+    rmSync(abs);
+    rmSync(compiledAbs);
+    const stale = build.freshness(outDir);
+    check('a removed source invalidates the build', stale.fresh === false);
+    check('the reason says a source was removed', reasonMentions(stale, 'source removed since build'), stale.reasons.join(' | '));
+    check('the reason names the removed file', reasonMentions(stale, `source removed since build: ${rel}`), stale.reasons.join(' | '));
+    // The output being gone must not be the thing that made it stale: that is
+    // scenario 4, and it would hide a deleted `removed` predicate.
+    check('and the verdict does not rest on the missing output alone', reasonMentions(stale, 'source removed since build'));
+
+    // Restore the bytes, then re-record the stamp. `utimesSync` cannot put an
+    // mtime back bit-exactly (`mtimeMs` is a float, `Date` holds milliseconds), and
+    // an off-by-a-fraction restore made this assertion flaky — it passed and failed
+    // on consecutive runs of the same tree. The other scenarios restore the same
+    // way (2b, 3, 15); what this scenario asserts is the *removal* verdict, and
+    // "back to fresh" only guards against a verdict stuck on stale.
+    writeFileSync(abs, source);
+    writeFileSync(compiledAbs, compiled);
+    restamp();
+    check('restoring the source returns to fresh', build.freshness(outDir).fresh === true, JSON.stringify(build.freshness(outDir).reasons));
+  }
+
+  // --------------------------------------- 13. the stamp's own format version
+  // `STAMP_VERSION` exists so a stamp written by an older layout cannot be read as
+  // a current one. Nothing pinned that comparison: setting it to never trigger
+  // left every check green (mutation M8), so raising the version in the future
+  // would silently keep trusting old stamps.
+  group('13. stamp format version');
+  {
+    const originalText = readFileSync(stampPath, 'utf8');
+    const stamp = JSON.parse(originalText);
+    stamp.version = build.STAMP_VERSION - 1;
+    writeFileSync(stampPath, `${JSON.stringify(stamp, null, 2)}\n`);
+    const stale = build.freshness(outDir);
+    check('a stamp from an older format is stale', stale.fresh === false);
+    check(
+      'the reason names both versions',
+      reasonMentions(stale, `!= ${build.STAMP_VERSION}`) && reasonMentions(stale, String(build.STAMP_VERSION - 1)),
+      stale.reasons.join(' | '),
+    );
+
+    writeFileSync(stampPath, originalText);
+    check('restoring the stamp returns to fresh', build.freshness(outDir).fresh === true);
+  }
+
+  // ------------------------- 13b. a current-version stamp with no `config` field
+  // The upgrade path, and the one a version bump alone does not cover: a stamp
+  // written by the previous layout can claim the current version (if someone
+  // bumps `STAMP_VERSION` without the version gate noticing, or hand-edits a
+  // stamp) and still say nothing about the compiler inputs. Assuming equality
+  // there is exactly the silent-trust failure this module exists to prevent, so
+  // it must be stale with a reason of its own.
+  group('13b. stamp without compiler inputs (fail closed)');
+  {
+    const originalText = readFileSync(stampPath, 'utf8');
+    const stamp = JSON.parse(originalText);
+    check('the real stamp carries a config block', stamp.config !== null && typeof stamp.config === 'object');
+    delete stamp.config;
+    writeFileSync(stampPath, `${JSON.stringify(stamp, null, 2)}\n`);
+    const stale = build.freshness(outDir);
+    check('a stamp with no compiler inputs is stale, never trusted', stale.fresh === false);
+    check(
+      'the reason says the compiler inputs are not recorded',
+      reasonMentions(stale, 'no compiler inputs recorded'),
+      stale.reasons.join(' | '),
+    );
+
+    writeFileSync(stampPath, originalText);
+    check('restoring the stamp returns to fresh', build.freshness(outDir).fresh === true);
+  }
+  // A newer `tsc` can emit different bytes from the same sources. The comparison
+  // was there but unpinned (mutation M7 deleted it and everything stayed green).
+  group('14. TypeScript version changed since the build');
+  {
+    const originalText = readFileSync(stampPath, 'utf8');
+    const stamp = JSON.parse(originalText);
+    const installed = JSON.parse(
+      readFileSync(join(pluginDir, 'node_modules', 'typescript', 'package.json'), 'utf8'),
+    ).version;
+    // The control: the stamp the build really wrote must agree with the installed
+    // compiler, or the stale verdict below could come from a pre-existing mismatch.
+    check('the build stamped the installed compiler version', stamp.tsc === installed, `${stamp.tsc} vs ${installed}`);
+
+    stamp.tsc = '0.0.0';
+    writeFileSync(stampPath, `${JSON.stringify(stamp, null, 2)}\n`);
+    const stale = build.freshness(outDir);
+    check('a different compiler version is stale', stale.fresh === false);
+    check(
+      'the reason says typescript changed',
+      reasonMentions(stale, 'typescript changed since build') && reasonMentions(stale, '0.0.0'),
+      stale.reasons.join(' | '),
+    );
+
+    writeFileSync(stampPath, originalText);
+    check('restoring the stamp returns to fresh', build.freshness(outDir).fresh === true);
+  }
+
+  // -------------------------------- 15. the files that decide how sources compile
+  // `sourceFiles()` comes from `tsconfig.json`, but the config itself was not an
+  // input: changing `target` (or a `@getpaseo/*` devDependency) left the existing
+  // tree fresh and every harness ran on bytes compiled with the old settings.
+  group('15. compiler inputs (tsconfig.json, package.json)');
+  {
+    const tsconfigPath = join(pluginDir, 'tsconfig.json');
+    const packagePath = join(pluginDir, 'package.json');
+    const configRels = build.configInputs().map(relSource);
+    check(
+      'both compiler inputs are tracked',
+      configRels.includes('tsconfig.json') && configRels.includes('package.json'),
+      configRels.join(', '),
+    );
+    check(
+      'the stamp records them',
+      (() => {
+        const recorded = JSON.parse(readFileSync(stampPath, 'utf8')).config ?? {};
+        return configRels.every((rel) => rel in recorded);
+      })(),
+      JSON.stringify(Object.keys(JSON.parse(readFileSync(stampPath, 'utf8')).config ?? {})),
+    );
+
+    // 15a: a real `compilerOptions` edit, restored byte-exactly.
+    const tsconfigText = readFileSync(tsconfigPath, 'utf8');
+    const before = /"target"\s*:\s*"([^"]+)"/.exec(tsconfigText)?.[1];
+    check('tsconfig.json states a target to edit', before !== undefined, before ?? '(no target)');
+    const edited = tsconfigText.replace(/"target"\s*:\s*"[^"]+"/, '"target": "ES5"');
+    check('the edit actually changes the file', edited !== tsconfigText);
+    writeFileSync(tsconfigPath, edited);
+    touchFuture(tsconfigPath);
+    const stale = build.freshness(outDir);
+    check('a changed tsconfig.json invalidates the build', stale.fresh === false, JSON.stringify(stale.reasons));
+    check('the reason names tsconfig.json', reasonMentions(stale, 'tsconfig.json'), stale.reasons.join(' | '));
+    check('and says a compiler input changed', reasonMentions(stale, 'compiler input changed since build'), stale.reasons.join(' | '));
+
+    writeFileSync(tsconfigPath, tsconfigText);
+    restamp();
+    check('restoring tsconfig.json returns to fresh', build.freshness(outDir).fresh === true, JSON.stringify(build.freshness(outDir).reasons));
+
+    // 15b: the dependency declaration, which changes the types the emitted JS was
+    // checked against without changing any source byte.
+    const packageText = readFileSync(packagePath, 'utf8');
+    writeFileSync(packagePath, packageText.replace(/"typescript":\s*"[^"]+"/, '"typescript": "0.0.0"'));
+    touchFuture(packagePath);
+    const staleDeps = build.freshness(outDir);
+    check('a changed package.json invalidates the build', staleDeps.fresh === false, JSON.stringify(staleDeps.reasons));
+    check('the reason names package.json', reasonMentions(staleDeps, 'package.json'), staleDeps.reasons.join(' | '));
+
+    writeFileSync(packagePath, packageText);
+    restamp();
+    check('restoring package.json returns to fresh', build.freshness(outDir).fresh === true, JSON.stringify(build.freshness(outDir).reasons));
   }
 
   // ----------------------------- 11. the verdict is wired to the reuse decision

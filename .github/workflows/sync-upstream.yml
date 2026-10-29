@@ -75,6 +75,14 @@ jobs:
             node harness/mcp-http-check.mjs
             node harness/doctor-check.mjs
             node harness/probe-check.mjs
+            # 构建地基与分帧/重放：都不需要 profile、daemon 或 token。
+            # plugin-build-check 自己用临时目录编译（node_modules 走符号链接），
+            # 是整条链的地基——它退化会让下游每个 harness 在陈旧产物上假绿。
+            node harness/plugin-build-check.mjs
+            node harness/frame-reader-check.mjs
+            node harness/replay-turn-check.cjs
+            # 不在这里：mcp-gateway-transport-check / mcp-gateway-guard-check 从本机 DSH 安装目录
+            # 加载 schemastery 与 dsh-tools，runner 上没有 DSH，跑了只会 ERR_MODULE_NOT_FOUND。
 
             git push origin main
             echo "Merged upstream ${upstream_sha} into main."
@@ -97,9 +105,11 @@ jobs:
                 "node harness/bridge-assets-check.mjs" \
                 "# 其余离线回归与 CI 的门保持一致：" \
                 "for s in archived-lineage-check image-host-path-check paseo-system-envelope-check revert-check \\" \
-                "         surface-check file-snapshot-check rewind-merge-check mcp-http-check doctor-check probe-check; do" \
+                "         surface-check file-snapshot-check rewind-merge-check mcp-http-check doctor-check probe-check \\" \
+                "         plugin-build-check frame-reader-check; do" \
                 "  node \"harness/\$s.mjs\" || exit 1" \
                 "done" \
+                "node harness/replay-turn-check.cjs" \
                 "git push origin main" \
                 '```' \
                 "" \
