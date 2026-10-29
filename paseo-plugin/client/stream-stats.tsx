@@ -121,12 +121,15 @@ function StreamStatsRow({ item, theme, layout }: PluginTimelineItemProps<StreamS
       setFontSize(found.fontSize);
     };
     measure();
-    // The footer can mount one frame after `final` lands, so measure again once
-    // the browser has painted and keep watching the item's container.
-    const retry = setTimeout(measure, 120);
+    // The footer is not necessarily in its final place when the row mounts: it
+    // can arrive a frame later, and the host may move it after the turn is
+    // marked complete. Re-measure a few times while that settles, and keep
+    // watching the containers in case it moves again (a new turn pushing this
+    // one down, a theme swap, a font load).
+    const retries = [80, 240, 700, 1500].map((ms) => setTimeout(measure, ms));
     const stop = watchRow(rowRef.current, measure);
     return () => {
-      clearTimeout(retry);
+      for (const timer of retries) clearTimeout(timer);
       stop?.();
     };
   }, [data.final, layout.platform]);

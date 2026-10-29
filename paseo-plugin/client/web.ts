@@ -28,7 +28,6 @@ interface MeasuredNode {
   textContent: string | null;
   getBoundingClientRect(): { top: number; bottom: number; height: number };
   querySelectorAll(selector: string): ArrayLike<MeasuredNode>;
-  querySelector(selector: string): MeasuredNode | null;
   ownerDocument: TextDocument | null;
 }
 
@@ -62,12 +61,12 @@ type ResizeObserverConstructor = new (callback: () => void) => {
  * is exactly how the row ends up on top of the text.
  */
 const MAX_FOOTER_TEXT = 120;
-/** The footer leads with its copy control; prose that mentions the word does not. */
+/** The footer's first line is its copy control; prose that mentions the word is not. */
 const FOOTER_PREFIX = /^(复制|copy)/i;
-/** Same affordance found through its accessible name, for icon-only layouts. */
-const COPY_LABEL = '[aria-label*="复制"], [aria-label*="Copy"], [aria-label*="copy"]';
 /** Wrapper levels to step over before giving up: item frame, list cell, row. */
 const MAX_WRAPPER_DEPTH = 6;
+/** Ancestors watched for layout changes; the turn block is four levels up. */
+const WATCH_DEPTH = 4;
 /**
  * Largest plausible distance, in footer line heights, between the footer's last
  * line and the row the host laid out under it. A wrong anchor lands far outside
@@ -148,14 +147,59 @@ function footerFontSize(node: MeasuredNode, fallback: number): number {
 }
 
 /**
- * A short block that leads with the copy control. Answers can mention "copy"
- * too, so containing the word is not enough.
+ * A short block whose visible text starts with the copy control. Answers can
+ * mention "copy" too, and a message block can contain a copy button of its own,
+ * so neither containing the word nor owning a copy control is enough: the text
+ * itself has to start with it.
  */
 function looksLikeFooter(node: MeasuredNode): boolean {
   const text = node.textContent?.trim() ?? "";
-  if (text === "" || text.length > MAX_FOOTER_TEXT) return false;
-  if (FOOTER_PREFIX.test(text)) return true;
-  return node.querySelector(COPY_LABEL) !== null;
+  return text !== "" && text.length <= MAX_FOOTER_TEXT && FOOTER_PREFIX.test(text);
+}
+
+/** Elements that paint text, used to find the copy line without scanning every box. */
+function textBearing(node: MeasuredNode): MeasuredNode[] {
+  const out: MeasuredNode[] = [];
+  const all = node.querySelectorAll("*");
+  for (let index = 0; index < all.length; index += 1) {
+    const element = all[index];
+    if (element === undefined || element.children.length > 0) continue;
+    const text = element.textContent?.trim() ?? "";
+    if (text !== "" && element.getBoundingClientRect().height > 0) out.push(element);
+  }
+  return out;
+}
+
+/**
+ * The footer inside `block`, if one is painted there.
+ *
+ * Paseo does not always put the footer in a sibling row: for a completed turn it
+ * is drawn at the end of the answer block, so the row's previous sibling is the
+ * whole answer. Look at the sibling first and then inside it, and take the last
+ * copy line found — the footer is the last thing in that block, never the first
+ * line of the answer.
+ */
+function findFooter(block: MeasuredNode): MeasuredNode | null {
+  if (looksLikeFooter(block)) return block;
+  let found: MeasuredNode | null = null;
+  let lowest = Number.NEGATIVE_INFINITY;
+  for (const element of textBearing(block)) {
+    if (!FOOTER_PREFIX.test(element.textContent?.trim() ?? "")) continue;
+    // A message block can carry copy affordances of its own (the hover
+    // toolbar). The footer is the one painted lowest, right above this row.
+    const bottom = element.getBoundingClientRect().bottom;
+    if (bottom > lowest) {
+      lowest = bottom;
+      found = element;
+    }
+  }
+  if (found === null) return null;
+  // And it has to be the last text in the block: a copy control floating in
+  // the middle of an answer is not the footer, and measuring it would tuck the
+  // row under the wrong line.
+  const lowestText = lastTextBottom(block);
+  if (lowestText !== null && lowest < lowestText - 2) return null;
+  return found;
 }
 
 /**
@@ -163,16 +207,16 @@ function looksLikeFooter(node: MeasuredNode): boolean {
  *
  * The row is rendered inside one or more wrappers that hold nothing but it, so
  * empty predecessors are stepped over until a sibling with height appears. That
- * sibling has to look like the footer; anything else means this row is not
- * tucked under one, and moving it would land on the answer.
+ * sibling has to contain the footer; anything else means this row is not tucked
+ * under one, and moving it would land on the answer.
  */
 function locateFooter(row: MeasuredNode): { frame: MeasuredNode; footer: MeasuredNode } | null {
   let frame: MeasuredNode | null = row;
   for (let depth = 0; depth < MAX_WRAPPER_DEPTH && frame !== null; depth += 1) {
     const above = frame.previousElementSibling;
     if (above !== null && above.getBoundingClientRect().height > 0) {
-      if (!looksLikeFooter(above)) return null;
-      return { frame, footer: above };
+      const footer = findFooter(above);
+      return footer === null ? null : { frame, footer };
     }
     frame = frame.parentElement;
   }
@@ -214,7 +258,10 @@ export function measureFooterGeometry(
   if (footerBottom === null) return null;
 
   const fontSize = footerFontSize(anchor.footer, options.fallbackFontSize);
-  const naturalTop = anchor.frame.getBoundingClientRect().top - options.appliedLift;
+  // The margin is applied to the row itself, not to the wrapper the sibling is
+  // found through: the wrapper keeps its top while the row is pulled up inside
+  // it. Take the lift back out of the row's own box.
+  const naturalTop = node.getBoundingClientRect().top - options.appliedLift;
   const gapNow = naturalTop - footerBottom;
   // Level with or above the footer text already: this layout is not the one the
   // lift is for, and moving further up would cover the answer.
@@ -243,12 +290,14 @@ export function watchRow(row: unknown, onResize: () => void): (() => void) | nul
   const Observer = (globalThis as { ResizeObserver?: ResizeObserverConstructor }).ResizeObserver;
   if (Observer === undefined) return null;
   const observer = new Observer(onResize);
+  // Every wrapper up to the turn block is watched, including the zero-height
+  // `display: contents` frames React Native Web leaves in the chain: the box
+  // that actually grows when the footer is inserted or moved is often three or
+  // four levels above the row, and a stale lift survives if that box is missed.
   let frame: MeasuredNode | null = node;
-  for (let depth = 0; depth < MAX_WRAPPER_DEPTH && frame !== null; depth += 1) {
-    if (frame.getBoundingClientRect().height > 0) observer.observe(frame);
-    if (frame.parentElement !== null) observer.observe(frame.parentElement);
+  for (let depth = 0; depth < WATCH_DEPTH && frame !== null; depth += 1) {
+    observer.observe(frame);
     frame = frame.parentElement;
-    if (depth >= 2) break;
   }
   return () => observer.disconnect();
 }
