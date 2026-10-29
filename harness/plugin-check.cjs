@@ -419,6 +419,28 @@ function projectTimelineLikePaseo(items, turnId) {
     );
   }
 
+  // 1c. streamed stats: the row under an answer reports first-token latency and
+  // throughput measured from live frames, not from the finished step.
+  const stats = events.filter(
+    (e) => e.type === "timeline.item" && e.item?.type === "plugin" && e.item.kind === "dsh-stream-stats",
+  );
+  check(
+    "live frames produce a stream-stats row",
+    stats.length > 0 && typeof stats[0].item.data?.firstTokenMs === "number",
+    stats.length > 0 ? JSON.stringify(stats[0].item.data) : "no dsh-stream-stats item",
+  );
+
+  const lastStats = stats[stats.length - 1];
+  check(
+    "stats row carries route, tokens and context",
+    lastStats !== undefined &&
+      typeof lastStats.item.data?.provider === "string" &&
+      typeof lastStats.item.data?.model === "string" &&
+      typeof lastStats.item.data?.inputTokens === "number" &&
+      typeof lastStats.item.data?.contextUsed === "number",
+    lastStats === undefined ? "no stats row" : JSON.stringify(lastStats.item.data),
+  );
+
   // 2. the image block reached the model layer
   //
   // A text-only route makes DSH replace the image with a note saying so, and

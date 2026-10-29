@@ -587,6 +587,13 @@ export class PaseoHarnessServer {
         lastSentAt: 0,
         reasoning: '',
         text: '',
+        // First/last publication times of a *text* chunk, on DSH's own clock.
+        // The stats row needs the generation window, and only these frames
+        // carry the moment each token was produced; measuring at the plugin
+        // instead would stretch it by IPC and throttle latency.
+        startedAt: Date.now(),
+        firstTextAt: undefined,
+        lastTextAt: undefined,
       });
       return;
     }
@@ -598,6 +605,14 @@ export class PaseoHarnessServer {
 
     if (frame.type === 'chunk') {
       if (frame.chunk === undefined) return;
+      // Only text chunks define the generation window. Reasoning and tool-call
+      // deltas have no bearing on output throughput, and counting them would
+      // report a speed for tokens that never became the answer.
+      if (frame.chunk.type === 'text-delta') {
+        const at = typeof frame.time === 'number' ? frame.time : Date.now();
+        if (state.firstTextAt === undefined) state.firstTextAt = at;
+        state.lastTextAt = at;
+      }
       state.assembler.push(frame.chunk);
       this.flushAssistantStream(sessionId, state, false);
       return;
@@ -671,6 +686,11 @@ export class PaseoHarnessServer {
           ...(state.attempt === undefined ? {} : { attempt: state.attempt }),
           ...(reasoningChanged ? { reasoning } : {}),
           ...(textChanged ? { text } : {}),
+          // The step's generation window, measured from DSH's own chunk
+          // timestamps. Absent when the route never streamed text, which is how
+          // the plugin tells "no measurable window" from "instant".
+          ...(state.firstTextAt === undefined ? {} : { startedAt: state.startedAt, firstTextAt: state.firstTextAt }),
+          ...(state.lastTextAt === undefined ? {} : { lastTextAt: state.lastTextAt }),
         },
       },
     });

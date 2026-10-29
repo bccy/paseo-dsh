@@ -185,8 +185,43 @@ export interface DshCommand {
   kind: "command" | "skill";
 }
 
+/** One live assistant-stream frame, already reduced by the bridge. */
+export interface DshAssistantFrame {
+  type: "start" | "chunk" | "end";
+  attemptId: string;
+  revision: number;
+  /** Present on `start`. */
+  turn?: number;
+  step?: number;
+  /** Present on a `chunk`: DSH's epoch-ms publication time. */
+  time?: number;
+  /** Present on a `chunk`: which row the delta belongs to. */
+  kind?: "text" | "reasoning";
+  /** Present on a `chunk`. */
+  text?: string;
+  /** Present on `end`. */
+  outcome?: { kind: "committed" | "abandoned" };
+}
+
 export interface DshProcessHandlers {
   onEvent(payload: DshSessionEvent): void;
+  /**
+   * A live assistant-stream frame reduced by the bridge.
+   *
+   * **This fork does not use the `assistant.stream` channel, and no handler
+   * provides this method.** Upstream 0.2.12+ introduced it as its live-stream
+   * path, but this fork's bridge already subscribes to DSH's
+   * `agent/assistant-stream` frames itself, assembles them with DSH's own
+   * `BlockAssembler` and forwards throttled snapshots as `paseo/assistant-delta`
+   * session events. Running both would render every token twice.
+   *
+   * It stays on the contract so the two channels are *documented* rather than
+   * confused: a bridge that sends `assistant.stream` while no handler is
+   * installed is a mismatch this process reports (see the dispatch below),
+   * never a frame it silently drops. The plugin's own bridge is the other
+   * channel, so this only fires against a mismatched bridge build.
+   */
+  onAssistantStream?(frame: DshAssistantFrame): void;
   /** `sessionId` is DSH's own id, so the caller can route by session. */
   onStatus(status: string, sessionId: string): void;
   onQuestion(request: DshQuestionRequest, sessionId: string): Promise<DshAnswer>;
@@ -979,6 +1014,15 @@ export class DshProcess {
   #pending = new Map<number, Pending>();
   #nextId = 1;
   #closed = false;
+  /**
+   * Whether the mismatched-`assistant.stream` bridge has been reported.
+   *
+   * Latched because the bridge sends one frame per streamed chunk: an unlatched
+   * warning would be thousands of identical stderr lines per answer, which is
+   * how a warning that matters gets ignored (same reasoning as the bridge's own
+   * `REPORTED_MISSING_SERVICES`).
+   */
+  #warnedAssistantStream = false;
   /** Whether the process-level exit callback has already fired for this child. */
   #exitReported = false;
   #initializeTask: Promise<void> | undefined;
@@ -2360,6 +2404,28 @@ export class DshProcess {
       // frames wait in `#orphanFrames` until the chain reaches an attached
       // session. Replayed after the notice, so the child view exists first.
       this.#replayOrphans();
+      return;
+    }
+    if (method === "assistant.stream") {
+      // The upstream live-stream channel. This fork's bridge sends
+      // `paseo/assistant-delta` on `session.event` instead (see
+      // `DshProcessHandlers.onAssistantStream`), so a frame arriving here means
+      // the bridge and the plugin disagree about which channel is live. Say so
+      // once per process rather than dropping it: silently discarding the whole
+      // answer stream is exactly the failure mode this repo keeps re-finding.
+      const params = frame.params as { frame?: DshAssistantFrame } | undefined;
+      if (this.#options.onAssistantStream !== undefined) {
+        if (params?.frame !== undefined) this.#options.onAssistantStream(params.frame);
+        return;
+      }
+      if (!this.#warnedAssistantStream) {
+        this.#warnedAssistantStream = true;
+        this.#options.onLog(
+          "bridge sent `assistant.stream` but this plugin reads live text from " +
+            "`paseo/assistant-delta`; the live stream from this bridge will not render " +
+            "(mismatched bridge/plugin builds)",
+        );
+      }
       return;
     }
     if (method !== undefined) {

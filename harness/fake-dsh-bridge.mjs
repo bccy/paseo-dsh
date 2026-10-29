@@ -606,16 +606,39 @@ async function emitStream() {
     { text: "Hello" },
     { text: "Hello world" },
   ];
+  // The real bridge measures this window from DSH's own chunk timestamps and
+  // forwards it on every snapshot, which is what the stats row's first-token
+  // latency and throughput are computed from. Without it here, a plugin that
+  // silently dropped the timings would still look green.
+  const startedAt = Date.now();
+  let firstTextAt;
+  let lastTextAt;
   for (const data of frames) {
+    if (data.text !== undefined) {
+      const at = Date.now();
+      if (firstTextAt === undefined) firstTextAt = at;
+      lastTextAt = at;
+    }
     notify("session.event", {
       sessionId: rootId,
-      event: { type: "paseo/assistant-delta", data: { turn: 1, step: 1, ...data } },
+      event: {
+        type: "paseo/assistant-delta",
+        data: {
+          turn: 1,
+          step: 1,
+          ...data,
+          ...(firstTextAt === undefined ? {} : { startedAt, firstTextAt }),
+          ...(lastTextAt === undefined ? {} : { lastTextAt }),
+        },
+      },
     });
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   // The durable settlement repeats the whole step; its deltas are empty and
   // Paseo drops it, so it must not add a second row.
-  notify("session.event", { sessionId: rootId, event: { type: "assistant/message", seq: 1, data: { turn: 1, step: 1, message: { id: "sm1", content: [{ type: "reasoning", text: "thinking" }, { type: "text", text: "Hello world" }] } } } });
+  // DSH reports token accounting on the assistant message and nowhere else, so
+  // the stats row's token figures come from here. The durable copy carries it.
+  notify("session.event", { sessionId: rootId, event: { type: "assistant/message", seq: 1, data: { turn: 1, step: 1, message: { id: "sm1", content: [{ type: "reasoning", text: "thinking" }, { type: "text", text: "Hello world" }] }, usage: { inputTokens: 1200, cacheReadTokens: 800, cacheWriteTokens: 0, outputTokens: 100 } } } });
   notify("session.event", { sessionId: rootId, event: { type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "completed" } } } });
   notify("session.status", { sessionId: rootId, status: "idle" });
 }

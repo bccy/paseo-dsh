@@ -29,7 +29,7 @@ interface DshEvent {
  * `session.event` envelope. It is a middle-layer frame: never appended to a
  * session log, never seen by history replay.
  */
-const ASSISTANT_DELTA_EVENT = "paseo/assistant-delta";
+export const ASSISTANT_DELTA_EVENT = "paseo/assistant-delta";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;

@@ -18,6 +18,7 @@ import type {
   ProviderPrompt,
   ProviderSetting,
   ProviderThinkingOption,
+  ProviderTimelineItem,
   ProviderUsage,
 } from "@getpaseo/plugin/server/provider";
 import type { JsonValue } from "./dsh-process";
@@ -35,7 +36,7 @@ import {
   type DshRoute,
   type DshUsage,
 } from "./dsh-process";
-import { TimelineBuilder } from "./timeline";
+import { ASSISTANT_DELTA_EVENT, TimelineBuilder } from "./timeline";
 
 /**
  * The durable event time as the provider timestamp for a replayed row.
@@ -418,6 +419,33 @@ export class DshSession {
   #childBufferWarned = false;
   /** Guards {@link #flushPendingChildren} against re-entrant invocation. */
   #flushing = false;
+  /** Session totals shown in the collapsed stats line. */
+  #totals = { input: 0, cache: 0, cacheWrite: 0, output: 0 };
+  #seenTurns = new Set<number>();
+  #seenSteps = new Set<string>();
+  /** Tool call start times and the current turn's tool total. */
+  #toolStarts = new Map<string, number>();
+  #turnTool = { count: 0, ms: 0 };
+  /** Most recent stats row, so context and tool totals can update it in place. */
+  #lastStats: { id: string; data: Record<string, unknown> } | undefined;
+  /**
+   * Per-step timing for the streamed-stats row.
+   *
+   * Fed from the bridge's transient `paseo/assistant-delta` snapshots rather
+   * than from the durable `assistant/message`: only the live frames carry the
+   * moment each token was produced, and a route that never streams gets no row
+   * at all instead of a fabricated duration.
+   */
+  #streamStats:
+    | {
+        turn: number;
+        step: number;
+        startedAt: number;
+        firstTokenAt?: number;
+        lastTokenAt?: number;
+      }
+    | undefined;
+
   /**
    * Slash-menu entries by name, tagging why each exists.
    *
@@ -744,6 +772,11 @@ export class DshSession {
     // A complete context snapshot: absence clears a formerly known value instead
     // of keeping another model's capacity or a stale numerator.
     this.#emitUsage(patch, true);
+    const row = this.#lastStats;
+    if (row !== undefined) {
+      row.data = { ...row.data, ...this.#contextFields() };
+      this.#emitStatsRow();
+    }
   }
 
   /** Coalesce step/tool updates so occupancy is not measured per streamed token. */
@@ -828,6 +861,8 @@ export class DshSession {
       const seq = typeof event.seq === "number" ? event.seq : this.#replaySeq++;
       const timestamp = replayTimestamp(event);
       if (timestamp !== undefined) lastTimestamp = timestamp;
+      // Seed the session totals so a resumed agent keeps its 轮/步/token line.
+      if (event.type === "assistant/message") this.#accumulateTotals(data);
       if (event.type === "turn/start") {
         // Two open turns in a row cannot come from a healthy log, but a truncated
         // one can end up shaped that way. Close the earlier turn rather than leave
@@ -1614,6 +1649,12 @@ export class DshSession {
       return;
     }
     if (status === "running") {
+      if (this.#turnId === null) {
+        this.#toolStarts.clear();
+        this.#turnTool = { count: 0, ms: 0 };
+        // A later usage refresh must not rewrite the previous turn's row.
+        this.#lastStats = undefined;
+      }
       const turnId = this.#turnId ?? `turn:${Date.now()}`;
       this.#turnId = turnId;
       // A new turn has no `turn/end` yet; a stale state from the previous one
@@ -1622,6 +1663,17 @@ export class DshSession {
       this.#options.emit({ type: "session.turn", sessionId: this.id, turnId, state: "started" });
       return;
     }
+    this.#completeTurn();
+  }
+
+  /**
+   * Close the running turn.
+   *
+   * Extracted so the status-only ending and the explicit path share one
+   * implementation: the state machine here (turn/end reason, usage refresh) is
+   * this fork's.
+   */
+  #completeTurn(): void {
     if (this.#turnId !== null) {
       const turnId = this.#turnId;
       const ended = this.#turnEndState;
@@ -2055,9 +2107,182 @@ export class DshSession {
     // A compaction rewrites the surface, so the next request's prompt shrinks.
     // Refresh here so the occupancy readout drops without waiting for a turn.
     if (event.type === "compaction/end") void this.refreshUsage();
-    for (const item of this.#timeline.consume(event)) {
-      this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
+    // The live text already reached the same row through the timeline builder's
+    // `paseo/assistant-delta` path; the durable message is the authoritative
+    // final snapshot and simply replaces it.
+    if (event.type === "tool/call" || event.type === "tool/result") this.#trackToolEvent(event);
+    // The bridge's transient live snapshot carries the step's generation window;
+    // the timeline builder folds the same frame into the growing answer row, so
+    // one arrival feeds both halves of the feature.
+    if (event.type === ASSISTANT_DELTA_EVENT) this.#observeStreamSnapshot(isRecord(event.data) ? event.data : {});
+    for (const item of this.#timeline.consume(event)) this.#emitItem(item);
+    if (event.type === "assistant/message") {
+      const data = isRecord(event.data) ? event.data : {};
+      this.#accumulateTotals(data);
+      this.#emitStreamStats(data);
     }
+    if (event.type === "turn/end" && this.#lastStats !== undefined) {
+      this.#lastStats.data = {
+        ...this.#lastStats.data,
+        toolCalls: this.#turnTool.count,
+        ...(this.#turnTool.ms > 0 ? { toolMs: this.#turnTool.ms } : {}),
+      };
+      this.#emitStatsRow();
+    }
+  }
+
+  /**
+   * Publish the per-step latency and throughput row beneath the answer.
+   *
+   * The numbers are measured from the bridge's live snapshots, so a route that
+   * does not stream (no snapshots, hence no timings) simply gets no row instead
+   * of a fabricated duration. Output tokens come from the step's own usage
+   * record.
+   */
+  #emitStreamStats(data: Record<string, unknown>): void {
+    const stats = this.#streamStats;
+    this.#streamStats = undefined;
+    if (stats === undefined || stats.firstTokenAt === undefined) return;
+    const usage = isRecord(data.usage) ? data.usage : undefined;
+    const outputTokens = typeof usage?.outputTokens === "number" ? usage.outputTokens : undefined;
+    const firstTokenMs = Math.max(0, stats.firstTokenAt - stats.startedAt);
+    // Throughput needs a measured window between the first and the last text
+    // delta. A route that delivers the whole answer in one burst (or one chunk)
+    // has no observable window, so it reports latency only instead of a
+    // meaningless thousands-of-tokens-per-second figure.
+    const span = stats.lastTokenAt === undefined ? 0 : stats.lastTokenAt - stats.firstTokenAt;
+    const measured = outputTokens !== undefined && span >= 50 ? outputTokens / (span / 1000) : undefined;
+    // A burst delivery has no real generation window; a value this high is a
+    // measurement artifact, not a speed anyone can use.
+    const tokensPerSecond = measured !== undefined && measured <= 3000 ? measured : undefined;
+    const turn = typeof data.turn === "number" ? data.turn : stats.turn;
+    const step = typeof data.step === "number" ? data.step : stats.step;
+    const statsData: Record<string, unknown> = {
+      firstTokenMs,
+      ...(tokensPerSecond === undefined ? {} : { tokensPerSecond }),
+      ...(outputTokens === undefined ? {} : { outputTokens }),
+      ...(typeof usage?.inputTokens === "number" ? { inputTokens: usage.inputTokens } : {}),
+      ...(typeof usage?.cacheReadTokens === "number" ? { cachedInputTokens: usage.cacheReadTokens } : {}),
+      ...this.#contextFields(),
+      provider: this.#route.provider,
+      model: this.#route.model,
+      ...(this.#thinkingOption === undefined ? {} : { thinkingOption: this.#thinkingOption }),
+      toolCalls: this.#turnTool.count,
+      ...(this.#turnTool.ms > 0 ? { toolMs: this.#turnTool.ms } : {}),
+      ...this.#sessionFields(),
+    };
+    this.#lastStats = { id: `stream-stats:${turn}:${step}`, data: statsData };
+    this.#emitStatsRow();
+  }
+
+  /** Fold one assistant message's turn, step and usage into the session totals. */
+  #accumulateTotals(data: Record<string, unknown>): void {
+    const turn = typeof data.turn === "number" ? data.turn : undefined;
+    const step = typeof data.step === "number" ? data.step : undefined;
+    if (turn !== undefined) this.#seenTurns.add(turn);
+    if (turn !== undefined && step !== undefined) this.#seenSteps.add(`${turn}:${step}`);
+    const usage = isRecord(data.usage) ? data.usage : undefined;
+    if (usage === undefined) return;
+    if (typeof usage.inputTokens === "number") this.#totals.input += usage.inputTokens;
+    if (typeof usage.cacheReadTokens === "number") this.#totals.cache += usage.cacheReadTokens;
+    if (typeof usage.cacheWriteTokens === "number") this.#totals.cacheWrite += usage.cacheWriteTokens;
+    if (typeof usage.outputTokens === "number") this.#totals.output += usage.outputTokens;
+  }
+
+  /**
+   * Turns, steps, total tokens and cache-hit rate for the collapsed line.
+   *
+   * Mirrors DSH's own UsagePill: the total is the three prompt-side billing
+   * buckets plus output, and the cache rate divides cache reads by that same
+   * prompt-side total.
+   */
+  #sessionFields(): Record<string, number> {
+    const promptTokens = this.#totals.input + this.#totals.cache + this.#totals.cacheWrite;
+    const tokens = promptTokens + this.#totals.output;
+    return {
+      turns: this.#seenTurns.size,
+      steps: this.#seenSteps.size,
+      ...(tokens > 0 ? { sessionTokens: tokens } : {}),
+      ...(promptTokens > 0 ? { cacheHit: this.#totals.cache / promptTokens } : {}),
+    };
+  }
+
+  /** Context occupancy from the last usage snapshot, when known. */
+  #contextFields(): Record<string, number> {
+    const usage = this.#lastUsage;
+    return {
+      ...(typeof usage?.contextWindowUsedTokens === "number"
+        ? { contextUsed: usage.contextWindowUsedTokens }
+        : {}),
+      ...(typeof usage?.contextWindowMaxTokens === "number"
+        ? { contextMax: usage.contextWindowMaxTokens }
+        : {}),
+    };
+  }
+
+  /** Publish (or re-publish) the current stats row under the answer. */
+  #emitStatsRow(): void {
+    const row = this.#lastStats;
+    if (row === undefined) return;
+    this.#emitItem({
+      type: "plugin",
+      id: row.id,
+      pluginId: "dsh-paseo",
+      kind: "dsh-stream-stats",
+      version: 1,
+      data: row.data as JsonValue,
+    });
+  }
+
+  #trackToolEvent(event: { type: string; data?: unknown }): void {
+    const data = isRecord(event.data) ? event.data : {};
+    if (event.type === "tool/call") {
+      const callId = typeof data.callId === "string" ? data.callId : undefined;
+      if (callId !== undefined) this.#toolStarts.set(callId, Date.now());
+      return;
+    }
+    const message = isRecord(data.message) ? data.message : undefined;
+    const callId =
+      typeof data.toolCallId === "string"
+        ? data.toolCallId
+        : typeof message?.toolCallId === "string"
+          ? message.toolCallId
+          : undefined;
+    if (callId === undefined) return;
+    const startedAt = this.#toolStarts.get(callId);
+    if (startedAt === undefined) return;
+    this.#toolStarts.delete(callId);
+    this.#turnTool.count += 1;
+    this.#turnTool.ms += Math.max(0, Date.now() - startedAt);
+  }
+
+  /** Publish one timeline item for this session. */
+  #emitItem(item: ProviderTimelineItem): void {
+    this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
+  }
+
+  /**
+   * Record the step's generation window from one live snapshot.
+   *
+   * The bridge forwards DSH's own chunk timestamps, so the measured window is
+   * the model's, not this process's IPC latency. A snapshot without timings
+   * (a bridge that predates them, or a route that never streamed) leaves the
+   * window unset, and {@link #emitStreamStats} then reports no row rather than
+   * inventing one.
+   */
+  #observeStreamSnapshot(data: Record<string, unknown>): void {
+    const turn = typeof data.turn === "number" ? data.turn : undefined;
+    const step = typeof data.step === "number" ? data.step : undefined;
+    const startedAt = typeof data.startedAt === "number" ? data.startedAt : undefined;
+    const firstTokenAt = typeof data.firstTextAt === "number" ? data.firstTextAt : undefined;
+    if (turn === undefined || step === undefined || startedAt === undefined || firstTokenAt === undefined) {
+      return;
+    }
+    const lastTokenAt = typeof data.lastTextAt === "number" ? data.lastTextAt : firstTokenAt;
+    // A retry inside one step starts a fresh frame series for the same
+    // turn/step; the row must describe the attempt that actually settled, so
+    // the newest window wins.
+    this.#streamStats = { turn, step, startedAt, firstTokenAt, lastTokenAt };
   }
 
   /**

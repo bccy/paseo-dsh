@@ -1,5 +1,7 @@
 # DeepSeek Harness × Paseo（原生接入）
 
+[中文](README.md) · [English](README.en.md)
+
 把 [DSH](https://www.npmjs.com/package/@deepseek-ai/dsh) 作为 Paseo 的**一等公民 provider**
 接进来。不 fork Paseo、不 fork DSH，全部走公开扩展点：Paseo 侧是 direct provider 插件，
 DSH 侧是一个 profile bundle。
@@ -458,6 +460,11 @@ patch 是本插件自己的发布计数；完整提交记录见
 
 | 版本 | 日期 | 更新内容 |
 | --- | --- | --- |
+| [0.2.16](https://www.npmjs.com/package/paseo-dsh/v/0.2.16) | 2026-10-28 | **统计行回到默认位置**：移除 0.2.15 里的自动贴靠、DOM 测量与设置页，只保留内容显示（轮/步、首字、tok/s、上下文、缓存命中，点开展开明细）。位置交还给 Paseo 和主题，不再随展开/收起或换主题移动。`0.2.15` 已标记 deprecated。 |
+| [0.2.15](https://www.npmjs.com/package/paseo-dsh/v/0.2.15) | 2026-10-28 | **统计行贴合回合页脚**：统计行与「复制 / 模型 / 时间 / 耗时」页脚的间距在默认主题和主题插件下保持一致；回合完成时给最后一行打 `final`，web 端实测页脚的实际位置再贴齐，native 用常量回退。<br>**可配置**：Settings → Plugins →「回答统计行」可调间距（0–24px，默认 6）与字号（10–16px，默认 13）；未保存设置时行为与之前完全一致。<br>**字号与数字**：默认对齐页脚的 13px，数字等宽不跳动。 |
+| [0.2.14](https://www.npmjs.com/package/paseo-dsh/v/0.2.14) | 2026-10-28 | **统计行更直观**：收起行里的会话总 tokens 换成上下文占用百分比（如 `上下文 77%`），精确的 `已用 / 上限` 仍在展开详情里；其余计数与缓存命中口径不变。 |
+| [0.2.13](https://www.npmjs.com/package/paseo-dsh/v/0.2.13) | 2026-10-28 | **统计行信息升级**：收起时常驻 `N 轮 N 步 · 首字 · tok/s · 总 tokens · 缓存命中`，口径与 DSH Web 一致（总量 = 未缓存输入 + 缓存读取 + 缓存写入 + 输出；命中 = 缓存读取 ÷ 输入侧总量）；恢复会话时会从历史日志重新累计轮/步/tokens。点开仍是上下文、Tokens、路由、工具详情。 |
+| [0.2.12](https://www.npmjs.com/package/paseo-dsh/v/0.2.12) | 2026-10-28 | **回答真流式**：改订阅 DSH 的 `agent/assistant-stream` 瞬时帧（文本 + 推理），边生成边显示，不再等整段生成完再回放；首字出现的时刻就是模型吐出第一个字的时刻。<br>**回答统计行**：回答下方显示 `首字 xxx · xx tok/s`，点开可看上下文占用、输入/缓存/输出 tokens、路由与思考档位、工具次数与耗时；速度用 DSH 自己的 chunk 时间戳计算，整段突发的异常值直接丢弃。 |
 | [0.2.11](https://www.npmjs.com/package/paseo-dsh/v/0.2.11) | 2026-10-28 | **上下文用量**：输入框旁显示 `已用 / 上限`。bridge 新增 `paseo/usage`，占用取 DSH 的 `contextPressure`（无采样时用 `tokenMeter.measure()`），容量取当前路由的 `resolveModelInfo()`；会话打开/恢复、回合结束、切模型、压缩后刷新，恢复旧会话不用新回合就有数。本 fork 按会话上报（`usage(sessionId)`），一个 `dsh` 进程服务多个 Paseo 会话时各算各的。<br>**安装兼容 Paseo 0.9–0.11**：去掉 `@getpaseo/protocol` 的 type-only 导入（改成插件内 `json-value.ts`），旧版安装器不再因解析不到类型而失败。<br>**回答逐字出现**：上游用 `server/stream-replay.ts` 在 `assistant/message` 到达后按 `data.stream` 定时器重放；**本 fork 不采用**——桥直接订阅 DSH 的瞬时帧发 `paseo/assistant-delta`，本来就是真流式，两者叠加会双重流式，故该文件已删除。 |
 | [0.2.10](https://www.npmjs.com/package/paseo-dsh/v/0.2.10) | 2026-10-27 | **附件不再拖垮会话**：`uploaded_file`、review、GitHub/forge 附件降级成文本引用（文件名 / 类型 / 大小 / 路径，或 title / url / body），模型仍能读到；内容块转换移进 `try`，单条消息失败不再升级成 `session.runtime_failed`。<br>**目录概览**：补 `OVERVIEW.md` 与包描述，paseo.sh 的插件页能正确介绍能力与限制。 |
 | [0.2.9](https://www.npmjs.com/package/paseo-dsh/v/0.2.9) | 2026-10-17 | **模型选择器不再为空**：DSH 0.2.1 的 catalog 异步物化，而 Paseo 的 catalog 探测不走 `initialize`；现在先预热默认路由，再短暂轮询（约 3s），等模型注册完再返回。 |

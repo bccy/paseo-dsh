@@ -18,6 +18,7 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { z } from "zod";
 import { InlineThinking } from "./client/inline-thinking";
+import { contributeStreamStats } from "./client/stream-stats";
 import { localeFromMetadata, setLocale } from "./client/locale";
 import { InlineToolCall } from "./client/tool-call";
 import { toolCallData } from "./client/tool-call-data";
@@ -187,5 +188,8 @@ export default function contribute(client: PluginClientContext) {
     Component: InlineToolCall,
   });
 
-  return () => {};
+  // The stats row under an answer. Upstream's own contribution, kept whole: it
+  // only registers a renderer, so it composes with the renderers above instead
+  // of competing with them.
+  return contributeStreamStats(client);
 }
