@@ -1,5 +1,7 @@
 # DeepSeek Harness × Paseo（原生接入）
 
+[中文](README.md) · [English](README.en.md)
+
 把 [DSH](https://www.npmjs.com/package/@deepseek-ai/dsh) 作为 Paseo 的**一等公民 provider**
 接进来。不 fork Paseo、不 fork DSH，全部走公开扩展点：Paseo 侧是 direct provider 插件，
 DSH 侧是一个 profile bundle。
