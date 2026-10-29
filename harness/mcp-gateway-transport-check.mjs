@@ -31,16 +31,21 @@ const DEFAULT_DSH_PACKAGES =
 const dshPackages = process.env.DSH_PACKAGES_DIR ?? DEFAULT_DSH_PACKAGES;
 const schemasterPath = process.env.DSH_SCHEMASTER_MJS ?? `${dshPackages}/schemastery/lib/index.mjs`;
 const toolsPath = `${dshPackages}/dsh-tools/lib/index.js`;
+// The gateway's stdio client imports the harness's child-environment policy from
+// the DSH install (`@deepseek-ai/dsh-subprocess`); the profile's resolution table
+// provides it at runtime, so offline it has to be mapped like the other two.
+const subprocessPath = `${dshPackages}/dsh-subprocess/lib/index.js`;
 const { default: Schema } = await import(pathToFileURL(schemasterPath).href);
 
-// The gateway imports its two DSH dependencies by bare specifier, so those names
-// must resolve to the same modules this script loaded. Register a hook before
-// importing the gateway; anything else falls through to Node's normal resolution.
+// The gateway imports its DSH dependencies by bare specifier, so those names must
+// resolve to the same modules this script loaded. Register a hook before importing
+// the gateway; anything else falls through to Node's normal resolution.
 const { register } = await import('node:module');
 register(`data:text/javascript,${encodeURIComponent(
   `const map = {
      '@deepseek-ai/schemastery': ${JSON.stringify(pathToFileURL(schemasterPath).href)},
      '@deepseek-ai/dsh-tools': ${JSON.stringify(pathToFileURL(toolsPath).href)},
+     '@deepseek-ai/dsh-subprocess': ${JSON.stringify(pathToFileURL(subprocessPath).href)},
    };
    export async function resolve(specifier, context, next) {
      const hit = map[specifier];

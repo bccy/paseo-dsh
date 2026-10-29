@@ -119,17 +119,34 @@ const IMAGE_EXTENSIONS = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp'
 const GATEWAY_TOOL_NAMES = ['mcp_list_tools', 'mcp_tool_schema', 'mcp_call_tool', 'archive_subagents'];
 
 /**
- * Strip the characters that make a name look different without being different.
+ * Strip everything that makes a name look different without being different.
  *
- * `String.prototype.toLowerCase` handles the realistic case (a model echoing a tool
- * name back in the case it saw in a prompt); zero-width characters are removed
- * because they survive `.trim()` and would otherwise let `mcp_call_tool` with a
- * U+200B in it reach the server, which then answers "not found" — the failure mode
- * this guard exists to replace. NFKC folds the full-width spellings a CJK keyboard
- * produces for the same reason.
+ * Only ever used for **comparison**; the value that gets forwarded is the trimmed
+ * original (`resolveTargetTool` already keeps them apart). The realistic case is a
+ * model echoing a name in the case it saw it, which `toLowerCase` covers. The rest
+ * is a whitelist rather than a list of known-bad characters, because the bad set
+ * is open-ended: zero-width characters, LRM/RLM/LRO, the soft hyphen, NBSP and
+ * combining accents all survive `.trim()`, and a blacklist that named only the
+ * zero-width ones let the others reach the server — which answered "Tool … not
+ * found", the exact failure this guard exists to replace. NFKC folds the
+ * full-width spellings a CJK keyboard produces for the same reason.
  */
 function normalizeToolName(value) {
-  return value.normalize('NFKC').replace(/[\u200b-\u200d\ufeff]/g, '').trim().toLowerCase();
+  // The order of the three steps is what makes this correct:
+  //   NFKC folds full-width spellings and other compatibility forms;
+  //   NFD *decomposes* the result, so a composed accent becomes a base letter plus
+  //       a mark and the mark can be removed while the letter survives;
+  //   `\p{M}` stripping then removes the marks.
+  // Running the whitelist before the decomposition deleted the whole letter
+  // instead: a combining acute inside the name turned `...tool` into `...tol`,
+  // which matches neither the gateway tool nor anything else, so the guard let it
+  // through to the server.
+  return value
+    .normalize('NFKC')
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '')
+    .replace(/[^A-Za-z0-9_-]/g, '')
+    .toLowerCase();
 }
 
 /** Normalized gateway tool names, computed once. */
@@ -147,9 +164,11 @@ const GATEWAY_TOOL_KEYS = new Set(GATEWAY_TOOL_NAMES.map((name) => normalizeTool
  * nor the fix, so the model repeated the same call. An empty `tool` failed the
  * same way. Reject both here, with the target and the expected shape named.
  *
- * The comparison is on a normalized spelling (case-folded, zero-width stripped):
- * `MCP_CALL_TOOL` is the same mistake as `mcp_call_tool`, and a guard that only
- * matched the exact lowercase spelling let it through to the server.
+ * The comparison is on a normalized spelling (NFKC, then only `[A-Za-z0-9_-]`
+ * survives, then case-folded): `MCP_CALL_TOOL` is the same mistake as
+ * `mcp_call_tool`, and so is every spelling padded with an invisible character —
+ * a guard that matched only the exact lowercase spelling let those through to the
+ * server.
  *
  * @param requested - The `tool` argument as the model sent it.
  * @param nested - The sibling `arguments` value, only to recognise a folded call.
@@ -174,14 +193,29 @@ function resolveTargetTool(requested, nested) {
 const DESCRIPTION_LIMIT = 160;
 
 /**
- * Tool names that answer "is a browser host attached?", in probe order.
+ * Tools that answer "is a browser host attached?", with the arguments to probe
+ * them with.
  *
  * Two servers expose the same capability under different names: Paseo's own agent
  * server calls it `browser_list_tabs`, the Server Browser bridge calls it
  * `browser_tabs`. The first name present in a server's listing is the one probed,
  * so neither server needs a special case here.
+ *
+ * The arguments are part of the entry, not a detail, because the probe is not
+ * free. The Server Browser bridge decides read-versus-write from
+ * `action === 'list'` (`mcp-bridge.mjs`: `write = !readonlyTools.has(name) &&
+ * !(name === 'browser_tabs' && args.action === 'list')`), and `browser_tabs` is not
+ * in its read-only set. Probing it with `{}` therefore took a **write lease** on
+ * every `mcp_list_tools`: the manager drops the panel's live input stream, bumps
+ * the input epoch and invalidates the view (and answers 409 while the user is
+ * operating the panel) — and the call itself failed anyway, because an undefined
+ * `action` is not `'list'`. So the model disturbed the shared browser panel every
+ * time it looked at the tool list.
  */
-const BROWSER_HOST_PROBES = ['browser_list_tabs', 'browser_tabs'];
+const BROWSER_HOST_PROBES = [
+  { name: 'browser_list_tabs', args: {} },
+  { name: 'browser_tabs', args: { action: 'list' } },
+];
 
 /**
  * Process-wide sequence for image file names.
@@ -206,8 +240,41 @@ function imageDirectory() {
   return imageDirectory.directory;
 }
 
-/** Translate one MCP `content` array into model-facing text plus image paths. */
-function projectContent(server, tool, content) {
+/**
+ * Sanitize a name for use as a path segment.
+ *
+ * The file name used to be `${server}-${tool}-…` verbatim, and `tool` is
+ * **model-supplied** — `resolveTargetTool` forwards any name that is not one of
+ * this gateway's own. `path.join` then normalized the `..` segments away, so a
+ * tool named `../../../../tmp/x/evil` wrote the server's base64 into a directory
+ * of the model's choosing: arbitrary write, in the very permission profile where
+ * the model is supposed to be read-only. `server` is not safe either once a
+ * profile can name a server freely (`serverName` is only constrained on the
+ * native-mount path).
+ *
+ * Only `[A-Za-z0-9_-]` survives and the result is capped, so the worst a name can
+ * do is pick a dull file name inside the image directory. An empty result falls
+ * back to a fixed word rather than producing `--123.png`.
+ *
+ * @param value - The untrusted name.
+ * @param fallback - Used when nothing survives the filter.
+ * @returns A path-safe segment.
+ */
+function pathSegment(value, fallback) {
+  const cleaned = String(value ?? '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64);
+  return cleaned === '' ? fallback : cleaned;
+}
+
+/**
+ * Translate one MCP `content` array into model-facing text plus image paths.
+ *
+ * @param server - Server name, only used to name the written file safely.
+ * @param tool - Target tool name, only used to name the written file safely.
+ * @param content - The MCP `content` array.
+ * @param options.textOnly - Collect text and skip images entirely. Used for a
+ *   failing call, whose images must not reach the disk.
+ */
+function projectContent(server, tool, content, { textOnly = false } = {}) {
   const texts = [];
   const images = [];
   for (const block of Array.isArray(content) ? content : []) {
@@ -217,10 +284,16 @@ function projectContent(server, tool, content) {
       continue;
     }
     if (block.type === 'image' && typeof block.data === 'string') {
+      // A failing call is not a result to project: nothing is written for it. The
+      // write used to happen first, so a screenshot that succeeded followed by a
+      // step that failed left a file behind that the model could not have avoided
+      // — it learned about the failure only after the disk had been touched.
+      if (textOnly) continue;
       const mimeType = typeof block.mimeType === 'string' ? block.mimeType : 'image/png';
       const extension = IMAGE_EXTENSIONS[mimeType] ?? 'bin';
       imageSequence += 1;
-      const path = join(imageDirectory(), `${server}-${tool}-${process.pid}-${imageSequence}.${extension}`);
+      const name = `${pathSegment(server, 'server')}-${pathSegment(tool, 'tool')}-${process.pid}-${imageSequence}.${extension}`;
+      const path = join(imageDirectory(), name);
       writeFileSync(path, Buffer.from(block.data, 'base64'));
       images.push({ path, mimeType });
       continue;
@@ -365,10 +438,12 @@ export function apply(ctx, config = {}) {
       // leave `unavailable` permanently empty — a dead probe that looks alive.
       let hostGap;
       const names = new Set((Array.isArray(all) ? all : []).map((tool) => tool?.name));
-      const probe = BROWSER_HOST_PROBES.find((name) => names.has(name));
+      const probe = BROWSER_HOST_PROBES.find((entry) => names.has(entry.name));
       if (probe !== undefined) {
         try {
-          hostGap = browserHostGapOf(await client.callTool(probe, {}));
+          // The entry's own arguments, so a probe never becomes a write: see
+          // `BROWSER_HOST_PROBES` for what `{}` did to the shared browser panel.
+          hostGap = browserHostGapOf(await client.callTool(probe.name, probe.args));
         } catch (error) {
           hostGap = browserHostGapOf(error);
         }
@@ -473,10 +548,23 @@ export function apply(ctx, config = {}) {
       const server = serverFor(args.server);
       const target = resolveTargetTool(args.tool, args.arguments);
       const result = await clientFor(server).callTool(target, args.arguments ?? {});
-      const { text, images } = projectContent(server, target, result?.content);
-      if (result?.isError === true) {
+      // A response frame that carried neither `result` nor `error` is a protocol
+      // violation, and the transport used to surface it as `undefined` — which
+      // projected to empty content and, with `isError` unset, *succeeded*. The
+      // model then saw a successful call with nothing in it. A tool call that
+      // produced no result is a failure and has to say so.
+      if (result === null || typeof result !== 'object') {
+        throw new Error(`mcp: ${server}/${target} returned no result object; the call produced no content`);
+      }
+      // The error check comes *before* projection: `projectContent` writes image
+      // blocks to disk, and doing that first meant a failing call still left files
+      // behind (a screenshot that worked, then a step that did not). Reading the
+      // error could not undo a write that had already happened.
+      if (result.isError === true) {
+        const { text } = projectContent(server, target, result.content, { textOnly: true });
         throw new Error(`mcp: ${server}/${target} reported an error: ${text === '' ? '(no message)' : text}`);
       }
+      const { text, images } = projectContent(server, target, result.content);
       return { server, tool: target, content: text, images };
     },
   }));

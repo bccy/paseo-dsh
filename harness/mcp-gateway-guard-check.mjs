@@ -27,8 +27,10 @@
  *
  * Usage: node harness/mcp-gateway-guard-check.mjs
  */
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const DEFAULT_DSH_PACKAGES =
@@ -36,6 +38,10 @@ const DEFAULT_DSH_PACKAGES =
 const dshPackages = process.env.DSH_PACKAGES_DIR ?? DEFAULT_DSH_PACKAGES;
 const schemasterPath = process.env.DSH_SCHEMASTER_MJS ?? `${dshPackages}/schemastery/lib/index.mjs`;
 const toolsPath = `${dshPackages}/dsh-tools/lib/index.js`;
+// `mcp-stdio.js` imports the harness's child-environment policy from the DSH
+// install (`@deepseek-ai/dsh-subprocess`); at runtime the profile's resolution
+// table supplies it, offline it has to be mapped like the other two.
+const subprocessPath = `${dshPackages}/dsh-subprocess/lib/index.js`;
 await import(pathToFileURL(schemasterPath).href);
 
 const { register } = await import('node:module');
@@ -43,6 +49,7 @@ register(`data:text/javascript,${encodeURIComponent(
   `const map = {
      '@deepseek-ai/schemastery': ${JSON.stringify(pathToFileURL(schemasterPath).href)},
      '@deepseek-ai/dsh-tools': ${JSON.stringify(pathToFileURL(toolsPath).href)},
+     '@deepseek-ai/dsh-subprocess': ${JSON.stringify(pathToFileURL(subprocessPath).href)},
    };
    export async function resolve(specifier, context, next) {
      const hit = map[specifier];
@@ -52,12 +59,23 @@ register(`data:text/javascript,${encodeURIComponent(
 )}`);
 
 const { apply } = await import('../dsh-bridge/lib/mcp-gateway.js');
+const { browserHostGapOf } = await import('../dsh-bridge/lib/mcp-http.js');
 
 const results = [];
 const check = (name, pass, detail) => results.push({ name, pass, detail });
 
 /** Every method the fake server was asked to run, in order. */
 const seen = [];
+/** Every `tools/call` the fake server received, so arguments can be asserted. */
+const calls = [];
+/** Whether the `browser_tabs` probe answers as if a host were attached. */
+let probeSucceeds = false;
+
+/**
+ * A one-pixel PNG, base64. Real image content, so the write path runs exactly as
+ * it does for a screenshot rather than being short-circuited by a fake.
+ */
+const PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AAAwAB/wD/AL0AAAAASUVORK5CYII=';
 
 /** Answer one JSON-RPC POST the way a streamable-HTTP MCP server does. */
 function respond(res, message) {
@@ -91,12 +109,69 @@ const server = createServer((req, res) => {
         result: {
           tools: [
             { name: 'echo', description: 'Echo the text', inputSchema: { type: 'object', properties: { text: { type: 'string' } } } },
+            { name: 'shot', description: 'Return a screenshot', inputSchema: { type: 'object' } },
+            { name: 'shot_error', description: 'Screenshot then fail', inputSchema: { type: 'object' } },
+            // The Server Browser bridge's own listing: the browser tools are
+            // registered unconditionally, so the listing cannot say whether a host
+            // is attached. `browser_tabs` is the name it answers the probe under.
+            { name: 'no_result', description: 'Answer with no result', inputSchema: { type: 'object' } },
+            { name: 'browser_tabs', description: 'List browser tabs', inputSchema: { type: 'object' } },
+            { name: 'browser_click', description: 'Click', inputSchema: { type: 'object' } },
+            { name: 'browser_screenshot', description: 'Screenshot', inputSchema: { type: 'object' } },
           ],
         },
       });
       return;
     }
     if (message.method === 'tools/call') {
+      calls.push(message);
+      const name = message.params?.name;
+      // A screenshot-shaped result: real image content, so the gateway's write path
+      // runs for real. Used to prove that a model-supplied tool name never becomes
+      // part of the file path, and that a failing call writes nothing at all.
+      // `{jsonrpc, id}` with neither `result` nor `error`: legal JSON, illegal
+      // JSON-RPC. The transport used to hand back `undefined`, which projected to
+      // empty content and, with `isError` unset, *succeeded* — a tool call that
+      // reported success and produced nothing.
+      if (name === 'no_result') {
+        respond(res, { jsonrpc: '2.0', id: message.id });
+        return;
+      }
+      if (name === 'browser_tabs') {
+        if (probeSucceeds) {
+          respond(res, { jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: 'Found 1 Paseo browser tab.' }] } });
+          return;
+        }
+        // Verbatim from the installed bridge's `refusal(notRunning)` — the message
+        // the gateway has to recognise. `isError` is the protocol-level signal; the
+        // sentence is localized and must not be depended on.
+        respond(res, {
+          jsonrpc: '2.0',
+          id: message.id,
+          result: {
+            isError: true,
+            content: [{ type: 'text', text: '服务器浏览器尚未启动或正在恢复，请在 Paseo「服务器浏览器」面板查看状态后重试。' }],
+          },
+        });
+        return;
+      }
+      // Any tool the listing advertises as image-returning, plus whatever the
+      // traversal case names: the point there is that a *model-chosen* name still
+      // gets an image, so the write path runs with that name in hand.
+      if (name === 'shot' || name === 'shot_error' || (typeof name === 'string' && name.includes('pwned'))) {
+        respond(res, {
+          jsonrpc: '2.0',
+          id: message.id,
+          result: {
+            ...(name === 'shot_error' ? { isError: true } : {}),
+            content: [
+              ...(name === 'shot_error' ? [{ type: 'text', text: 'screenshot taken, then the click failed' }] : []),
+              { type: 'image', data: PNG_B64, mimeType: 'image/png' },
+            ],
+          },
+        });
+        return;
+      }
       respond(res, {
         jsonrpc: '2.0',
         id: message.id,
@@ -197,6 +272,20 @@ try {
     // Full-width capitals, what an IME can produce for the same name (NFKC folds
     // them back to ASCII, so this is the normalization, not a special case).
     'ＭＣＰ＿ＣＡＬＬ＿ＴＯＯＬ',
+    // Invisible characters that survive `.trim()` and are not zero-width, so a
+    // blacklist of zero-width spellings let every one of them through: the guard
+    // compared the normalized spelling to `mcp_call_tool`, they differed, and the
+    // name went to the server, which answered "Tool … not found" — the exact
+    // failure the guard exists to replace. LRM/RLM/LRO are the realistic ones
+    // (copying a name out of RTL text or a web page brings them along); NBSP and
+    // the soft hyphen come from rich-text copy; U+0301 is a combining accent.
+    '\u200emcp_call_tool',
+    'mcp_call_tool\u200f',
+    '\u202dmcp_call_tool',
+    'mcp\u00ad_call_tool',
+    '\u2060mcp_call_tool',
+    'mcp_call_tool\u00a0',
+    'mcp_call_too\u0301l',
   ];
   for (const spelling of REFUSED_SPELLINGS) {
     const before = listCalls();
@@ -321,6 +410,163 @@ try {
       `tools/call went from ${before} to ${callCalls()}`,
     );
   }
+  // ── the image write path ───────────────────────────────────────────────────
+  // `mcp_call_tool` writes image content to a file and hands the model a path.
+  // The file name used to be built from the *model-supplied* tool name, so
+  // `tool: "../../../../tmp/x/evil"` made `path.join` normalize the `..` segments
+  // away and the server's base64 landed in a directory of the model's choosing —
+  // arbitrary write, in the permission profile where the model is supposed to be
+  // read-only. Two independent things have to hold: the name is not part of the
+  // path, and the write is confined to the image directory.
+  //
+  // The second half is `isError`: the write used to happen *before* the error was
+  // detected, so a call that reported failure (a screenshot succeeded, the next
+  // step failed) still wrote the file — the model could not avoid it by reading
+  // the error, because the write had already happened.
+
+  // Where the image directory is, without reaching into the gateway's internals:
+  // run one honest call and take the directory it writes to.
+  const honest = await run(tools, 'mcp_call_tool', { tool: 'shot', arguments: {} });
+  const honestPath = honest.value?.images?.[0]?.path;
+  const imageDir = honestPath === undefined ? undefined : dirname(honestPath);
+  check(
+    'an image result is written to a file and reported by path',
+    typeof honestPath === 'string' && existsSync(honestPath) && honest.value.images[0].mimeType === 'image/png',
+    JSON.stringify(honest).slice(0, 240),
+  );
+
+  /** Every file under `dir`, recursively. */
+  const filesUnder = (dir) => {
+    if (dir === undefined) return [];
+    const out = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) out.push(...filesUnder(full));
+      else out.push(full);
+    }
+    return out;
+  };
+
+  // A traversing tool name. The escape target is a directory this check owns, so
+  // "did it escape" is answerable without touching anything outside it.
+  const escapeRoot = mkdtempSync(join(tmpdir(), 'mcp-guard-escape-'));
+  const before = new Set(filesUnder(escapeRoot));
+  const traversing = `../../../../../../..${escapeRoot}/pwned`;
+  const traversed = await run(tools, 'mcp_call_tool', { tool: traversing, arguments: {} });
+  const escaped = filesUnder(escapeRoot).filter((file) => !before.has(file));
+  check(
+    'a tool name containing ".." cannot choose where the image is written',
+    escaped.length === 0,
+    escaped.length === 0
+      ? 'nothing was written outside the image directory'
+      : `the server-controlled name escaped the image directory: ${escaped.join(', ')}`,
+  );
+  // And the call still works: the fix must not turn a legal call into an error.
+  check(
+    'and the same call still returns the image',
+    typeof traversed.value?.images?.[0]?.path === 'string' && existsSync(traversed.value.images[0].path),
+    JSON.stringify(traversed).slice(0, 240),
+  );
+  // The path it did write must be inside the image directory — that is the
+  // property, not "no file at the escape target".
+  check(
+    'the written file is inside the gateway image directory',
+    typeof traversed.value?.images?.[0]?.path === 'string'
+      && imageDir !== undefined
+      && dirname(traversed.value.images[0].path) === imageDir
+      && !traversed.value.images[0].path.includes('..'),
+    `wrote ${JSON.stringify(traversed.value?.images?.[0]?.path)} (image directory ${JSON.stringify(imageDir)})`,
+  );
+  rmSync(escapeRoot, { recursive: true, force: true });
+
+  // A failing call that carries an image: the file must not be written at all.
+  const imagesBefore = filesUnder(imageDir).length;
+  const failedShot = await run(tools, 'mcp_call_tool', { tool: 'shot_error', arguments: {} });
+  const imagesAfter = filesUnder(imageDir).length;
+  check(
+    'a failing call reports the error and names the server text',
+    /reported an error/.test(failedShot.error ?? '') && /screenshot taken, then the click failed/.test(failedShot.error ?? ''),
+    JSON.stringify(failedShot).slice(0, 240),
+  );
+  check(
+    'a failing call writes no image to disk',
+    imagesAfter === imagesBefore,
+    `${imagesAfter - imagesBefore} new file(s) in the image directory for a call that reported an error`,
+  );
+
+  // A response frame carrying neither `result` nor `error` is a protocol
+  // violation. It must not become "the call succeeded with no content": the model
+  // would read that as a completed action.
+  const noResult = await run(tools, 'mcp_call_tool', { tool: 'no_result', arguments: {} });
+  check(
+    'a tool call answered with no result is a failure, not empty success',
+    noResult.error !== undefined && /no result object/.test(noResult.error),
+    noResult.error === undefined
+      ? `returned ${JSON.stringify(noResult.value)} — a call that produced nothing reported success`
+      : noResult.error,
+  );
+
+  // ── the browser host probe ─────────────────────────────────────────────────
+  // The probe exists to label browser tools that cannot run, and it got both
+  // halves wrong for the stdio bridge: it recognised only two English shapes,
+  // while the bridge answers `isError: true` with a localized sentence — so
+  // `unavailable` was permanently empty ("a dead probe that looks alive"). And it
+  // called `browser_tabs` with `{}`, which the bridge classifies as a *write*
+  // (`action !== 'list'`): every `mcp_list_tools` grabbed a write lease, dropped
+  // the panel's live input and invalidated its view, then failed anyway because
+  // the action was undefined.
+  //
+  // The probe table is `{name, args}` for exactly that reason, and the fake server
+  // records what it received so the read-only shape is asserted on the wire.
+  const probeCalls = () => calls.filter((message) => message.params?.name === 'browser_tabs');
+  const probeBefore = probeCalls().length;
+  const listing = await run(tools, 'mcp_list_tools', {});
+  const probes = probeCalls().slice(probeBefore);
+  check(
+    'the browser probe is sent with the read-only arguments the bridge recognises',
+    probes.length === 1
+      && JSON.stringify(probes[0].params?.arguments) === JSON.stringify({ action: 'list' }),
+    probes.length === 0
+      ? 'the probe was never sent, so nothing here proves it is read-only'
+      : `arguments=${JSON.stringify(probes.map((message) => message.params?.arguments))} (the bridge treats anything but {action:'list'} as a write)`,
+  );
+  check(
+    'an isError browser probe marks every browser tool unavailable',
+    JSON.stringify(listing.value?.unavailable) === JSON.stringify(['browser_tabs', 'browser_click', 'browser_screenshot']),
+    listing.error !== undefined
+      ? listing.error
+      : `unavailable=${JSON.stringify(listing.value?.unavailable)} (a localized isError refusal is still a refusal)`,
+  );
+  // `unavailable` is a list of tool *names*; the reason lives in the probe result
+  // the gateway consumed, so the assertion is on the tool that recognised it —
+  // `browserHostGapOf` is the function under test and it is exported.
+  check(
+    'the localized refusal is recognised as a host gap, not just the English text',
+    typeof browserHostGapOf({
+      isError: true,
+      content: [{ type: 'text', text: '服务器浏览器尚未启动或正在恢复，请在 Paseo「服务器浏览器」面板查看状态后重试。' }],
+    }) === 'string',
+    'a localized isError refusal must produce a reason; matching only /browser automation host/i left it undefined',
+  );
+  check(
+    'and a successful browser result is still not a host gap (the control)',
+    browserHostGapOf({ content: [{ type: 'text', text: 'Found 1 Paseo browser tab.' }] }) === undefined,
+    'a working host must not be reported as missing',
+  );
+
+  // The control: the same listing with a *successful* probe must label nothing.
+  // Without it, a probe that marked everything unavailable unconditionally would
+  // pass the assertions above.
+  probeSucceeds = true;
+  const healthyListing = await run(tools, 'mcp_list_tools', {});
+  check(
+    'a successful browser probe marks nothing unavailable (the control)',
+    JSON.stringify(healthyListing.value?.unavailable) === JSON.stringify([]),
+    healthyListing.error !== undefined
+      ? healthyListing.error
+      : `unavailable=${JSON.stringify(healthyListing.value?.unavailable)} — a probe that never clears is as wrong as one that never fires`,
+  );
+  probeSucceeds = false;
 } finally {
   server.close();
 }

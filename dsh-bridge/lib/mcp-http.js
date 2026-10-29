@@ -29,6 +29,16 @@ export const DEFAULT_MCP_TIMEOUT_MS = 60_000;
 const PROTOCOL_VERSION = '2025-06-18';
 
 /**
+ * Ceiling on `tools/list` pages walked in one read.
+ *
+ * A paginated server is supposed to end with a page that carries no `nextCursor`,
+ * but a buggy one can hand back a cursor that names itself forever. Without a
+ * bound that is an infinite loop inside a model turn, which is strictly worse than
+ * a named failure; with one, the catalog is refused rather than half-cached.
+ */
+const MAX_TOOL_PAGES = 100;
+
+/**
  * Parse one `text/event-stream` body into its JSON frames.
  *
  * MCP servers answer a POST with the frame that resolves that request, and may
@@ -61,10 +71,42 @@ export function isEventStream(contentType) {
  *
  * A plain JSON body may be the message or an array of messages (batch-shaped
  * servers); an SSE body carries one frame per message.
+ *
+ * **A frame with a `method` is a request from the server, never an answer.**
+ * JSON-RPC 2.0 §5 lets the server send requests of its own (`ping`, `roots/list`,
+ * `sampling/createMessage`, `elicitation/create`) at any point in the stream, and
+ * MCP servers do. Matching on `id` alone looked right because responses and
+ * requests both carry one — but both sides number from 1, so a server request's
+ * id collides with an in-flight request of ours as the *ordinary* case. The
+ * collision resolved the call with `undefined`: an empty catalog cached for the
+ * session, or a tool call reporting success with no content while the real answer
+ * arrived one frame later and was dropped.
+ *
+ * This transport has no server-to-client write channel (one POST per message, the
+ * response body is the only thing the server can read), so such a request cannot
+ * be answered here. Ignoring it in silence is the one option that is wrong: a
+ * server handler awaiting the reply hangs to its own timeout with nothing
+ * anywhere saying why. It is therefore reported on stderr and the answer is still
+ * the answer.
+ *
+ * @param body - The parsed response body.
+ * @param id - The request id being awaited.
+ * @returns The JSON-RPC `result` of the frame answering `id`.
  */
 export function pickResult(body, id) {
   const frames = Array.isArray(body) ? body : [body];
-  const match = frames.find((frame) => frame !== null && typeof frame === 'object' && frame.id === id);
+  for (const frame of frames) {
+    if (frame === null || typeof frame !== 'object') continue;
+    if (frame.method === undefined) continue;
+    // A server-initiated request or notification. Neither is our answer; a request
+    // additionally expects a reply this transport cannot carry.
+    if (frame.id === undefined || frame.id === null) continue;
+    process.stderr.write(
+      `mcp: server sent a "${frame.method}" request (id ${JSON.stringify(frame.id)}) over streamable HTTP; `
+      + 'this transport has no server-to-client channel, so it cannot be answered\n',
+    );
+  }
+  const match = frames.find((frame) => frame !== null && typeof frame === 'object' && frame.method === undefined && frame.id === id);
   if (match === undefined) throw new Error(`mcp: no JSON-RPC response for request ${id}`);
   if (match.error !== undefined && match.error !== null) {
     const message = typeof match.error.message === 'string' ? match.error.message : JSON.stringify(match.error);
@@ -126,8 +168,21 @@ export async function mcpRequest({
       error.httpBody = text.slice(0, 512);
       throw error;
     }
-    // Notifications are acknowledged without a JSON-RPC message.
-    if (id === undefined || text.trim() === '') return { result: undefined, sessionId: issuedSession, contentType, text };
+    // Notifications are acknowledged without a JSON-RPC message. A *request* is
+    // not: `202` with no body acknowledges a notification, and a server that
+    // answers a request that way has violated the protocol. Reading the empty body
+    // as success turned "the server said nothing" into "the server has no tools" —
+    // and because the catalog is cached, the emptiness outlived the glitch.
+    if (id === undefined) return { result: undefined, sessionId: issuedSession, contentType, text };
+    if (text.trim() === '') {
+      const error = new Error(
+        `mcp: ${method} answered with an empty body (HTTP ${response.status}); `
+        + 'a JSON-RPC request must be answered with a message — only a notification may be acknowledged this way',
+      );
+      error.httpStatus = response.status;
+      error.httpBody = '';
+      throw error;
+    }
     const body = isEventStream(contentType) ? parseSseFrames(text) : JSON.parse(text);
     return { result: pickResult(body, id), sessionId: issuedSession, contentType, text };
   } catch (error) {
@@ -166,15 +221,27 @@ export function isSessionGoneError(error) {
 }
 
 /**
- * Whether a probe of Paseo's browser tools reported that no desktop browser host
- * is attached.
+ * Whether a probe of the browser tools reported that no desktop browser host is
+ * attached.
  *
- * Paseo answers the probe as an ordinary tool result, not a JSON-RPC error, and
- * marks it in two places: `structuredContent.error.code === "browser_no_host"`
- * and the one-line text "No browser automation host is connected.". Both are
- * accepted (the code is authoritative; the text survives older hosts), and a
- * probe that failed for any other reason — timeout, transport — returns
- * undefined so a transient failure never hides a capability.
+ * The two servers answer this differently, and only one of them was recognised:
+ *
+ *   - Paseo's own HTTP server returns an ordinary tool result carrying
+ *     `structuredContent.error.code === "browser_no_host"` and the English
+ *     sentence "No browser automation host is connected.";
+ *   - the Server Browser bridge (stdio) returns `{ isError: true, content: [{
+ *     type: 'text', text: <localized sentence> }] }` — `grep -c "browser automation
+ *     host"` in its source is 0, and its message is Chinese when the host is not
+ *     running.
+ *
+ * Matching only the English text left `unavailable` permanently empty against the
+ * stdio bridge: all 25 browser tools were presented as usable, which is the "dead
+ * probe that looks alive" the gateway's own comment set out to avoid. `isError` is
+ * the protocol-level signal and does not depend on any wording, so it is checked
+ * first and its first text block becomes the reason.
+ *
+ * A probe that failed for a *transport* reason (timeout, process exit) returns
+ * undefined: a transient failure must not be reported as "no browser host".
  *
  * @param outcome - The probe's tool result, or the error it rejected with.
  * @returns The host-gap message when the probe says no host is attached.
@@ -190,6 +257,14 @@ export function browserHostGapOf(outcome) {
     return typeof structured.error.message === 'string' ? structured.error.message : 'no browser automation host';
   }
   const content = Array.isArray(result?.content) ? result.content : [];
+  // Protocol-level first: an `isError` result is a refusal whatever language it is
+  // written in, and the first text block is the server's own explanation of why.
+  if (result?.isError === true) {
+    for (const block of content) {
+      if (block?.type === 'text' && typeof block.text === 'string' && block.text.trim() !== '') return block.text;
+    }
+    return 'the browser probe reported an error with no message';
+  }
   for (const block of content) {
     if (block?.type === 'text' && typeof block.text === 'string' && /browser automation host/i.test(block.text)) return block.text;
   }
@@ -361,18 +436,46 @@ export class McpHttpClient {
    * the server is restarted. Pass `{ refresh: true }` to re-read on demand, or
    * construct the client with `cacheTools: false` for a server whose catalog is
    * expected to change between calls.
+   *
+   * `tools/list` is the one MCP method with standard cursor pagination, so the
+   * whole catalog means every page. Reading page one alone reported it as the
+   * catalog, and the symptom was not "there is more" but "the page-two tool does
+   * not exist" — `mcp_tool_schema` answered `exposes no tool`, naming the missing
+   * tool instead of the fetch that never happened. The loop stops on a non-string
+   * or empty `nextCursor` (nothing more to ask for), and is bounded in case a
+   * server hands back a cursor that keeps naming itself.
    */
   async listTools({ refresh = false } = {}) {
     await this.ensureInitialized();
     if (this.#tools === undefined || refresh || this.cacheTools !== true) {
       const epoch = this.#epoch;
-      const result = await this.#call('tools/list', {});
+      const tools = [];
+      let cursor;
+      for (let page = 0; ; page += 1) {
+        if (page >= MAX_TOOL_PAGES) {
+          throw new Error(`mcp: tools/list still paginating after ${MAX_TOOL_PAGES} pages; refusing to cache a partial catalog`);
+        }
+        const result = await this.#call('tools/list', cursor === undefined ? {} : { cursor });
+        // "We could not read the catalog" is not "the server has no tools". The
+        // two used to be the same value (`[]`), and the emptiness was cached, so a
+        // server that recovered was still reported as empty for the rest of the
+        // session with no way for the model to tell.
+        if (result === null || typeof result !== 'object' || !Array.isArray(result.tools)) {
+          throw new Error('mcp: tools/list returned no tool array; the catalog is unknown, not empty');
+        }
+        tools.push(...result.tools);
+        const next = result.nextCursor;
+        if (typeof next !== 'string' || next === '') break;
+        cursor = next;
+      }
       // The session can be disowned while this read is in flight (a parallel
       // call is the one that sees the 404). A catalog read from the connection
       // the server has just forgotten must not become the next cache hit, so the
-      // read is repeated against the session that replaced it.
+      // read is repeated against the session that replaced it. The check sits
+      // after the whole loop: checking per page would cache the pages read before
+      // the loss.
       if (this.#epoch !== epoch) return this.listTools({ refresh });
-      this.#tools = Array.isArray(result?.tools) ? result.tools : [];
+      this.#tools = tools;
     }
     return this.#tools;
   }

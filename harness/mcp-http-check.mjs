@@ -47,6 +47,43 @@ let sessionDownOnList = false;
  * it is the handshake failing on Paseo's own server.
  */
 let notificationRejections = 0;
+/** `/malformed` answers its first `tools/list` with a protocol-illegal frame. */
+let malformedServed = false;
+
+/** One page of the three-page `/paged` catalog, keyed by the cursor that names it. */
+const PAGED_TOOLS = {
+  '': [{ name: 'p1', description: 'page 1', inputSchema: { type: 'object' } }],
+  p2: [{ name: 'p2', description: 'page 2', inputSchema: { type: 'object' } }],
+  p3: [{ name: 'p3', description: 'page 3', inputSchema: { type: 'object' } }],
+};
+/** The cursor each page advertises as `nextCursor`; the last page has none. */
+const PAGED_NEXT = { '': 'p2', p2: 'p3' };
+
+/** Settle a promise into its value or its error, so a failure stays assertable. */
+const attempt = async (fn) => {
+  try {
+    return await fn();
+  } catch (error) {
+    return error;
+  }
+};
+
+/**
+ * Lines the client wrote to stderr during this run.
+ *
+ * The streamable-HTTP transport has no server-to-client write channel — one POST
+ * carries one message, and the response body is the only thing the server can say
+ * — so a server request that arrives here cannot be *answered*. Dropping it in
+ * silence is the one option that is wrong: a server handler awaiting the reply
+ * hangs to its own timeout, and nothing anywhere says why. The client therefore
+ * reports it, and that report is what this check can assert.
+ */
+const serverRequestNotices = [];
+const writeStderr = process.stderr.write.bind(process.stderr);
+process.stderr.write = (chunk, ...rest) => {
+  serverRequestNotices.push(String(chunk).trimEnd());
+  return writeStderr(chunk, ...rest);
+};
 
 /**
  * The paths that model session loss, keyed by URL.
@@ -71,6 +108,32 @@ const sessionPaths = {
   // A stateless server (Paseo's own shape) that 404s with session-sounding text:
   // no id was ever issued, so there is no session to lose and nothing to reset.
   '/stateless-404': { stateful: false, goneBody: '', listStatus: 404, listBody: 'session not found' },
+  // A server-initiated request (`ping`) that carries the same id as the listing in
+  // flight. JSON-RPC allows a server to send requests at any time, and both sides
+  // number from 1, so the collision is the expected case rather than an exotic
+  // one. Treating it as the answer resolved `tools/list` with `undefined` → an
+  // empty catalog cached for the life of the session, with the real answer
+  // arriving one frame later and dropped.
+  '/server-request': { stateful: false, serverRequest: 'collide' },
+  // The same request with an id nobody is waiting on: nothing may resolve, and the
+  // request must still be answered — a server handler awaiting `ping()` hangs to
+  // its own timeout if the client silently drops it. This endpoint has no write
+  // channel back (one POST per message, no GET stream), so "answered" here means
+  // the client says so on stderr rather than pretending it replied.
+  '/server-request-foreign': { stateful: false, serverRequest: 'foreign' },
+  // A three-page catalog. `tools/list` is the one MCP method with standard
+  // pagination; a client that ignores `nextCursor` reports page one as the whole
+  // catalog, so `mcp_tool_schema` for a page-two tool answers "exposes no tool" —
+  // a missing fetch reported as a missing tool.
+  '/paged': { stateful: false, paged: true },
+  // A server that answers its first `tools/list` with `{jsonrpc, id}` and neither
+  // `result` nor `error` (protocol-illegal), then behaves. The empty catalog must
+  // not be cached: "we could not read it" is not "it has no tools".
+  '/malformed': { stateful: false, malformedOnce: true },
+  // A request answered `202` with an empty body. `202` acknowledges a
+  // *notification*; for a request it means the server violated the spec, and
+  // reading the empty body as success cached an empty catalog.
+  '/empty-body': { stateful: false, emptyBody: true },
 };
 
 /** Answer one JSON-RPC POST the way a streamable-HTTP MCP server does. */
@@ -83,6 +146,20 @@ function respond(res, message, { sse = true, sessionId, delayMs = 0 } = {}) {
     });
     res.end(body);
   }, delayMs);
+}
+
+/**
+ * Answer with several messages on one SSE response.
+ *
+ * A streamable-HTTP server may put a server-initiated request and the response to
+ * our own request in the same POST answer — the SDK writes one `data:` frame per
+ * message. Sending them as one array instead would be a different (batch-shaped)
+ * body and would not reproduce the id collision this check is about.
+ */
+function respondFrames(res, messages) {
+  const body = messages.map((message) => `event: message\ndata: ${JSON.stringify(message)}\n\n`).join('');
+  res.writeHead(200, { 'content-type': 'text/event-stream' });
+  res.end(body);
 }
 
 /**
@@ -170,6 +247,45 @@ const server = createServer((req, res) => {
           return;
         }
         listCount += 1;
+        if (sessionPath.paged === true) {
+          const cursor = message.params?.cursor ?? '';
+          const next = PAGED_NEXT[cursor];
+          respond(res, {
+            jsonrpc: '2.0',
+            id: message.id,
+            result: { tools: PAGED_TOOLS[cursor] ?? [], ...(next === undefined ? {} : { nextCursor: next }) },
+          });
+          return;
+        }
+        if (sessionPath.malformedOnce === true && !malformedServed) {
+          // `{jsonrpc, id}` with neither `result` nor `error`: legal JSON, illegal
+          // JSON-RPC. The client must say so and must not cache the emptiness.
+          malformedServed = true;
+          respond(res, { jsonrpc: '2.0', id: message.id });
+          return;
+        }
+        if (sessionPath.emptyBody === true) {
+          // `202` with no body acknowledges a notification. Answering a *request*
+          // this way is a server bug, and treating it as success turned "the
+          // server said nothing" into "the server has no tools".
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (sessionPath.serverRequest !== undefined) {
+          // A server-initiated request, framed exactly as the MCP SDK sends `ping`
+          // (both sides number from 1, so the colliding id is the ordinary case).
+          const requestId = sessionPath.serverRequest === 'collide' ? message.id : 999;
+          respondFrames(res, [
+            { jsonrpc: '2.0', id: requestId, method: 'ping' },
+            {
+              jsonrpc: '2.0',
+              id: message.id,
+              result: { tools: [{ name: 'echo', description: 'Echo the text', inputSchema: { type: 'object' } }] },
+            },
+          ]);
+          return;
+        }
         respond(res, {
           jsonrpc: '2.0',
           id: message.id,
@@ -661,6 +777,107 @@ try {
       statelessHandshakes === 1 &&
       statelessCarried === 0,
     `initialize=${statelessHandshakes} (no recovery), requests carrying an id=${statelessCarried} (must be 0)`,
+  );
+
+  // ── server-initiated requests ──────────────────────────────────────────────
+  // JSON-RPC 2.0 §5 lets a server send requests of its own (`ping`, `roots/list`,
+  // `sampling/createMessage`, `elicitation/create`) at any point in the stream,
+  // and MCP servers do. Two things go wrong if a response and a request are
+  // matched by `id` alone:
+  //
+  //   (a) both sides number from 1, so a server request's id collides with an
+  //       in-flight request of ours. Reading it as the answer resolved the call
+  //       with `undefined` — an empty catalog, or a tool call reporting success
+  //       with no content while the real answer arrived one frame later;
+  //   (b) an id nobody is waiting on was dropped, so a server handler awaiting
+  //       that reply hangs to its own timeout.
+  //
+  // The streamable-HTTP transport here is one POST per message with no server
+  // write channel, so (b) can only be *said* on stderr, not replied to. The
+  // assertion is therefore on the client's diagnostic and on the answer still
+  // being the answer — not on a response frame that cannot exist.
+  const collideClient = new McpHttpClient({ url: `${base}/server-request` });
+  const collided = await attempt(() => collideClient.listTools());
+  check(
+    'a server request that collides with an in-flight id is not read as the answer',
+    Array.isArray(collided) && collided.length === 1 && collided[0].name === 'echo',
+    collided instanceof Error ? collided.message : `catalog=${JSON.stringify(collided.map((tool) => tool.name))} (the server sent {id:<same>,method:"ping"} first)`,
+  );
+
+  const foreignClient = new McpHttpClient({ url: `${base}/server-request-foreign` });
+  const foreign = await attempt(() => foreignClient.listTools());
+  check(
+    'a server request with a foreign id leaves the real answer intact',
+    Array.isArray(foreign) && foreign.length === 1,
+    foreign instanceof Error ? foreign.message : `catalog=${JSON.stringify(foreign.map((tool) => tool.name))}`,
+  );
+  check(
+    'and the dropped server request is reported rather than silently discarded',
+    serverRequestNotices.some((line) => /ping/.test(line)) && serverRequestNotices.some((line) => /999/.test(line)),
+    serverRequestNotices.length === 0
+      ? 'nothing was written to stderr: a server awaiting this reply hangs to its own timeout'
+      : serverRequestNotices.join(' | '),
+  );
+
+  // ── tools/list pagination ──────────────────────────────────────────────────
+  // `tools/list` is the one MCP method with standard cursor pagination. A client
+  // that reads only the first page reports it as the whole catalog, so a page-two
+  // tool "does not exist" as far as `mcp_tool_schema` is concerned — a fetch that
+  // never happened reported as a missing tool.
+  const pagedBefore = listCount;
+  const pagedClient = new McpHttpClient({ url: `${base}/paged` });
+  const paged = await attempt(() => pagedClient.listTools());
+  const pagedNames = Array.isArray(paged) ? paged.map((tool) => tool.name) : [];
+  check(
+    'every page of a paginated tools/list is collected',
+    JSON.stringify(pagedNames) === JSON.stringify(['p1', 'p2', 'p3']),
+    paged instanceof Error ? paged.message : `catalog=${JSON.stringify(pagedNames)}`,
+  );
+  check(
+    'and it takes exactly one request per page, no more',
+    listCount - pagedBefore === 3,
+    `${listCount - pagedBefore} tools/list request(s) for a 3-page catalog`,
+  );
+  // The pages must be stitched into one cache entry: a second call is still a
+  // cache hit, and `refresh` re-walks all three pages rather than fetching one.
+  const pagedCachedBefore = listCount;
+  const pagedAgain = await attempt(() => pagedClient.listTools());
+  const pagedRefreshBefore = listCount;
+  const pagedRefreshed = await attempt(() => pagedClient.listTools({ refresh: true }));
+  check(
+    'the stitched catalog is cached, and refresh walks every page again',
+    listCount - pagedCachedBefore === 3
+      && listCount - pagedRefreshBefore === 3
+      && Array.isArray(pagedAgain) && pagedAgain.length === 3
+      && Array.isArray(pagedRefreshed) && pagedRefreshed.length === 3,
+    `cached call: ${listCount - pagedCachedBefore} request(s) (expected 0), refresh: ${listCount - pagedRefreshBefore} (expected 3)`,
+  );
+
+  // ── an untrustworthy tools/list must not be cached ─────────────────────────
+  // Two shapes of "the server said nothing usable": a frame with neither `result`
+  // nor `error`, and a `202` with an empty body. Both used to be read as an empty
+  // catalog, cached, and never retried — so a server that recovered was still
+  // reported as having no tools, and the model had no way to tell.
+  const malformedClient = new McpHttpClient({ url: `${base}/malformed` });
+  const malformed = await attempt(() => malformedClient.listTools());
+  check(
+    'a tools/list frame with neither result nor error fails loudly',
+    malformed instanceof Error && /tools\/list/.test(malformed.message),
+    malformed instanceof Error ? malformed.message : `returned ${JSON.stringify(malformed)} instead of throwing`,
+  );
+  const recovered = await attempt(() => malformedClient.listTools());
+  check(
+    'and the empty read is not cached: the next call gets the real catalog',
+    Array.isArray(recovered) && recovered.length === 1 && recovered[0].name === 'echo',
+    recovered instanceof Error ? recovered.message : `catalog=${JSON.stringify(recovered.map((tool) => tool.name))}`,
+  );
+
+  const emptyBodyClient = new McpHttpClient({ url: `${base}/empty-body` });
+  const emptyBody = await attempt(() => emptyBodyClient.listTools());
+  check(
+    'a request answered with an empty body is a failure, not an empty catalog',
+    emptyBody instanceof Error && /empty body/.test(emptyBody.message) && /tools\/list/.test(emptyBody.message),
+    emptyBody instanceof Error ? emptyBody.message : `returned ${JSON.stringify(emptyBody)} instead of throwing`,
   );
 
   // The detector itself, on the shapes that decide whether recovery happens.

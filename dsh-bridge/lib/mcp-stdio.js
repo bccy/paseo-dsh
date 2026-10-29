@@ -28,6 +28,7 @@
  */
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess';
 
 /**
  * Default per-request budget for one JSON-RPC round trip.
@@ -40,6 +41,16 @@ export const DEFAULT_MCP_TIMEOUT_MS = 60_000;
 
 /** Protocol revision this client speaks; the server may answer with its own. */
 const PROTOCOL_VERSION = '2025-06-18';
+
+/**
+ * Ceiling on `tools/list` pages walked in one read.
+ *
+ * A paginated server is supposed to end with a page that carries no `nextCursor`,
+ * but a buggy one can hand back a cursor that names itself forever. Without a
+ * bound that is an infinite loop inside a model turn, which is strictly worse than
+ * a named failure; with one, the catalog is refused rather than half-cached.
+ */
+const MAX_TOOL_PAGES = 100;
 
 /**
  * How long the server gets to exit after its stdin is closed.
@@ -124,16 +135,23 @@ export class McpStdioClient {
   /**
    * Launch the server on first use.
    *
-   * The inherited environment is kept underneath the configured one: MCP's stdio
-   * config is additive by convention, and dropping PATH would make `node` itself
-   * unresolvable.
+   * The environment is the harness's own child-environment policy, not the
+   * daemon's ambient one: `scrubbedParentEnv()` is the single definition every
+   * harness spawner uses (it drops credential-shaped names and all `DSH_*` facts,
+   * keeping `PATH`, `HOME`, locale and proxy routing). Importing it rather than
+   * copying it is deliberate — a second copy of that regex would drift, and the
+   * official `@deepseek-ai/dsh-mcp-client` already routes its MCP children
+   * through the same function. This client spawns the Server Browser bridge
+   * itself, so handing that child the daemon's credentials is this repository's
+   * decision to make and to get wrong; the configured `env` layers on top, which
+   * is what keeps a deliberately supplied value working.
    */
   #start() {
     if (this.#failure !== undefined) throw new Error(`mcp: ${this.#label}: ${this.#failure}`);
     if (this.#child !== undefined) return this.#child;
     const child = spawn(this.command, this.args, {
       cwd: this.cwd,
-      env: { ...process.env, ...this.env },
+      env: { ...scrubbedParentEnv(), ...this.env },
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     });
@@ -205,8 +223,26 @@ export class McpStdioClient {
       return;
     }
     if (frame === null || typeof frame !== 'object') return;
-    // Server-initiated notifications and requests have no consumer on this side;
-    // only an answer to something we sent resolves a promise.
+    // A frame with a `method` is something the *server* is saying, never an answer
+    // to what we asked. Two shapes arrive here:
+    //
+    //   - a notification (no `id`): nothing to reply to, nothing to resolve;
+    //   - a request (with `id`): JSON-RPC 2.0 §5 **requires** a reply, and MCP
+    //     servers send `ping`, `roots/list`, `sampling/createMessage` and
+    //     `elicitation/create` this way. Matching on `id` alone resolved our own
+    //     in-flight call with `undefined` instead — an empty catalog, or a tool
+    //     call reporting success with no content — because both sides number from
+    //     1 and the collision is the ordinary case. Dropping the frame instead
+    //     leaves the server's handler waiting to its own timeout.
+    //
+    // This client implements none of those methods, so the reply is `-32601`
+    // naming the method. A fabricated answer would be worse than a refusal: the
+    // server would act on a result nobody produced.
+    if (frame.method !== undefined) {
+      if (frame.id === undefined || frame.id === null) return;
+      this.#respondUnsupported(frame.id, frame.method);
+      return;
+    }
     if (frame.id === undefined || frame.id === null) return;
     const entry = this.#pending.get(frame.id);
     // A late answer to a request that already timed out: the caller is gone.
@@ -220,6 +256,25 @@ export class McpStdioClient {
       return;
     }
     entry.resolve(frame.result);
+  }
+
+  /**
+   * Answer a server-initiated request with "method not found".
+   *
+   * Writing is best-effort: the child may already be gone, and a failed write here
+   * must not become an unhandled rejection on the stdout path (which would take
+   * the whole bridge down over a courtesy reply).
+   */
+  #respondUnsupported(id, method) {
+    try {
+      this.#child?.stdin?.write(`${JSON.stringify({
+        jsonrpc: '2.0',
+        id,
+        error: { code: -32601, message: `unsupported ${method}` },
+      })}\n`);
+    } catch (error) {
+      process.stderr.write(`mcp: ${this.#label}: could not answer server request "${method}": ${error.message}\n`);
+    }
   }
 
   /** One JSON-RPC request; `params` is omitted when undefined, like the HTTP client. */
@@ -261,12 +316,37 @@ export class McpStdioClient {
     return this.#initialized;
   }
 
-  /** Every tool the server currently exposes; cached unless `cacheTools: false`. */
+  /**
+   * Every tool the server currently exposes; cached unless `cacheTools: false`.
+   *
+   * `tools/list` is the one MCP method with standard cursor pagination, so the
+   * whole catalog means every page. Reading page one alone reported it as the
+   * catalog, and the symptom was not "there is more" but "the page-two tool does
+   * not exist" — `mcp_tool_schema` answered `exposes no tool`, naming a missing
+   * tool instead of a fetch that never happened.
+   */
   async listTools({ refresh = false } = {}) {
     await this.ensureInitialized();
     if (this.#tools === undefined || refresh || this.cacheTools !== true) {
-      const result = await this.#request('tools/list', {});
-      this.#tools = Array.isArray(result?.tools) ? result.tools : [];
+      const tools = [];
+      let cursor;
+      for (let page = 0; ; page += 1) {
+        if (page >= MAX_TOOL_PAGES) {
+          throw new Error(`mcp: ${this.#label}: tools/list still paginating after ${MAX_TOOL_PAGES} pages; refusing to cache a partial catalog`);
+        }
+        const result = await this.#request('tools/list', cursor === undefined ? {} : { cursor });
+        // "We could not read the catalog" is not "the server has no tools". Both
+        // used to be `[]`, and the emptiness was cached, so a server that recovered
+        // stayed empty for the rest of the session with no way to tell.
+        if (result === null || typeof result !== 'object' || !Array.isArray(result.tools)) {
+          throw new Error(`mcp: ${this.#label}: tools/list returned no tool array; the catalog is unknown, not empty`);
+        }
+        tools.push(...result.tools);
+        const next = result.nextCursor;
+        if (typeof next !== 'string' || next === '') break;
+        cursor = next;
+      }
+      this.#tools = tools;
     } else {
       // A cache hit sends nothing, so nothing else on this path would ever
       // notice that the server has since exited (or that the client was
