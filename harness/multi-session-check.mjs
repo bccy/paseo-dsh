@@ -18,19 +18,20 @@
  *   3. each session gets exactly one `session.turn` start and one terminal turn
  *   4. closing one session does not disturb the other: the survivor still
  *      prompts and still answers
+ *   5. a session's held orphan frames die with it: closing the session drops its
+ *      bucket and its timer, so no misleading "no ancestor announced" log appears
+ *      — while another session's held bucket still reports normally (the
+ *      positive control that the log path and the wait are real)
  *
  * Uses the scripted fake `dsh` (`harness/fake-dsh-bridge.mjs`, `multi` mode) and
  * a throwaway `DSH_HOME`, so no profile, model or daemon is touched.
  *
  * Run:
- *   cd paseo-plugin
- *   npx tsc --noEmit false --outDir .dbg-t5 --declaration false \
- *     --module commonjs --moduleResolution node
- *   echo '{"type":"commonjs"}' > .dbg-t5/package.json
- *   cp ../harness/multi-session-check.cjs ../harness/fake-dsh-bridge.mjs .dbg-t5/
- *   cd .dbg-t5 && node multi-session-check.cjs
+ *   node harness/multi-session-check.mjs [compiled-plugin-dir]
  *
- * (or just `node harness/multi-session-check.mjs`, which compiles for you)
+ * (it compiles the plugin into `paseo-plugin/.dbg-t5-multi` itself unless a build
+ * directory is passed, and uses the scripted fake `dsh` with a throwaway
+ * `DSH_HOME`, so no profile, model or daemon is touched)
  */
 import { createRequire } from "node:module";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -66,7 +67,7 @@ process.on("exit", () => {
   }
 });
 
-const buildDir = resolvePluginBuild(undefined, ".dbg-t5-multi");
+const buildDir = resolvePluginBuild(process.argv[2], ".dbg-t5-multi");
 const plugin = require(join(buildDir, "index.server.js")).default;
 
 /**
@@ -267,6 +268,106 @@ console.log("frames are routed by session id, never broadcast");
     try {
       await routed.shutdown();
       await routed.waitForExit(3000);
+    } catch {
+      /* the fake bridge exits on `shutdown`; a failure here must not mask the assertions */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Held orphan frames die with the session that produced them.
+//
+// `#orphanFrames` holds a frame whose producing session has no resolvable owner
+// *yet*, and a per-bucket timer reports it after 5 s if the lineage never
+// arrives. A session that is **closed** in the meantime will never resolve
+// anything, so its bucket is a promise nobody can keep — and when the timer
+// finally fires it reports "no ancestor announced it within the hold window",
+// which is both the wrong cause (the conversation was closed) and a reference to
+// a session that no longer exists. `detachSession` drops those buckets and their
+// timers; this section is what proves it, because the only observable difference
+// is a log line that must NOT appear.
+//
+// The positive control matters as much as the absence: an orphan bucket that
+// belongs to a *different*, still-open session must still report at its TTL.
+// Without it, "no log line" would also pass if the timers never fired at all.
+console.log("\nheld orphan frames are dropped when their session closes");
+{
+  const { DshProcess } = require(join(buildDir, "server", "dsh-process.js"));
+  const logs = [];
+  // The `orphan` scenario answers a prompt with one frame for the prompted
+  // session and one for a child of it — two buckets, one lineage.
+  process.env.DSH_FAKE_MODE = "orphan";
+  const closing = "orphan-closing-root";
+  const keeping = "orphan-keeping-root";
+  const orphans = new DshProcess({
+    sessionId: "placeholder-not-a-session",
+    cwd: process.cwd(),
+    route: { provider: "fake", model: "fake" },
+    onEvent: () => {},
+    onStatus: () => {},
+    onQuestion: async () => ({ answers: [] }),
+    onLog: (line) => logs.push(line),
+    onExit: () => {},
+    onProtocolError: () => {},
+  });
+  try {
+    // Start the child first: `prompt` needs a running process, and the frames the
+    // scenario emits must be held by the *orphan* path rather than rejected for
+    // having no bridge.
+    await orphans.start();
+    // Neither session is attached yet, so every frame the scenario emits is held:
+    // that is the exact state `detachSession` has to clean up.
+    await orphans.prompt(closing, "hold these");
+    await orphans.prompt(keeping, "hold these too");
+    await sleep(200);
+    check(
+      "the scenario produced held frames for both sessions",
+      logs.every((line) => !line.includes("dropped")),
+      `${logs.length} log line(s) before any TTL: ${logs.slice(0, 2).join(" | ") || "(none)"}`,
+    );
+
+    // Attach then detach the first one: `detachSession` is the path under test,
+    // and it only runs for an attached session (unknown ids are ignored).
+    await orphans.attachSession(closing, {
+      onEvent: () => {},
+      onStatus: () => {},
+      onQuestion: async () => ({ answers: [] }),
+      onExit: () => {},
+    });
+    orphans.detachSession(closing);
+
+    // The TTL is 5 s in `dsh-process.ts`; wait past it plus margin.
+    await sleep(5500);
+    const reportsFor = (sessionId) =>
+      logs.filter(
+        (line) => line.includes("no ancestor announced it") && line.includes(`for unknown session ${sessionId};`),
+      );
+    check(
+      "a detached session's held frames are dropped without a misleading report",
+      reportsFor(closing).length === 0,
+      reportsFor(closing).join(" | ") || "(no report)",
+    );
+    check(
+      "…including the frames of its known descendants",
+      reportsFor(`orphan-child-of-${closing}`).length === 0,
+      reportsFor(`orphan-child-of-${closing}`).join(" | ") || "(no report)",
+    );
+    // The positive control: the untouched session's bucket still expires loudly,
+    // so the absence above cannot be "the timer never ran".
+    check(
+      "an untouched session's held frames still report at the TTL (positive control)",
+      reportsFor(keeping).length === 1,
+      `${reportsFor(keeping).length} report(s): ${reportsFor(keeping).join(" | ") || "(none)"}`,
+    );
+  } catch (error) {
+    failed += 1;
+    console.log(`  FAIL  the orphan section could not run  — ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    // Back to the plugin-level scenario before anything else spawns a child.
+    process.env.DSH_FAKE_MODE = "multi";
+    try {
+      await orphans.shutdown();
+      await orphans.waitForExit(3000);
     } catch {
       /* the fake bridge exits on `shutdown`; a failure here must not mask the assertions */
     }

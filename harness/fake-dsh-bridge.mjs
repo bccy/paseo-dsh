@@ -56,6 +56,13 @@
  *            stamped with `hostPath`, one it could not resolve. The plugin must
  *            emit exactly one markdown-image `assistant_message` for the first
  *            and none for the second
+ *   crash    exit(1) the instant a `session/prompt` arrives, without replying and
+ *            without reading the rest of the frame in flight. Drives the
+ *            asynchronous EPIPE on the plugin's `stdin.write` — the uncaught
+ *            error that used to kill the whole daemon. `harness/process-crash-check.mjs`
+ *   orphan   answer a prompt with a frame for the prompted session and one for a
+ *            child of it, so a session detached in that window leaves held
+ *            orphan frames behind. Drives `detachSession`'s cleanup (L1-6)
  *
  * `DSH_FAKE_LOG` (a file path) records every request frame, so a test can assert
  * at the protocol boundary how many times a prompt was actually delivered.
@@ -71,6 +78,19 @@
  * (`{kind:"success", text}`), where a `token.messageId` of `revert-unknown`
  * fails the way the real bridge fails an unresolvable target (a JSON-RPC error
  * the plugin surfaces as `request.failed`).
+ *
+ * ## The per-session `initialize` gate
+ *
+ * `session/prompt` refuses a session this process never saw an `initialize` for,
+ * with the real bridge's wording (`server.js` `prompt()`), **by default**.
+ * Without it the stand-in was more permissive than the thing it stands in for: a
+ * plugin that forgot to send `initialize` with the session's own id — the bug
+ * `f084c33` fixed, where every session opened and then failed its first prompt —
+ * left `multi-session-check` and `concurrent-open-check` green, because the fake
+ * never checked. Strict is the honest default; a script that is deliberately
+ * testing the protocol layer *below* `initialize` (only
+ * `fake-bridge-multi-check.mjs` today) opts out with
+ * `DSH_FAKE_ALLOW_UNINITIALIZED=1`, and says so at its own call site.
  *
  * @module paseo-dsh/harness/fake-dsh-bridge
  */
@@ -111,6 +131,31 @@ const mode = () => currentMode();
 const LOG_PATH = process.env.DSH_FAKE_LOG;
 const out = (frame) => process.stdout.write(`${JSON.stringify(frame)}\n`);
 const notify = (method, params) => out({ jsonrpc: "2.0", method, params });
+
+/**
+ * Sessions this process has been initialized for, mirroring the real bridge's
+ * `initializedSessions` (`dsh-bridge/lib/server.js:381`).
+ *
+ * Process-wide set, session ids as keys — exactly the real shape, and exactly
+ * why it matters: `initialize` without a session id pins the process defaults
+ * and admits nobody, so a plugin that sends only that form gets its first prompt
+ * refused here just as it would in production.
+ */
+const initializedSessions = new Set();
+
+/**
+ * Whether `session/prompt` still requires a per-session `initialize`.
+ *
+ * Strict by default (see the module comment). The opt-out exists for one class of
+ * caller: a script that drives this stand-in at the raw protocol layer and
+ * deliberately sends no `initialize` at all, because the property under test
+ * lives below it. It is read per call, like the mode, so a long-lived child can
+ * be steered.
+ */
+function requiresInitialize() {
+  const allow = process.env.DSH_FAKE_ALLOW_UNINITIALIZED;
+  return !(allow === "1" || allow === "true");
+}
 
 /**
  * `DSH_FAKE_ARGV` (a file path) records this process's own launcher arguments
@@ -655,6 +700,11 @@ async function handle(method, params, id) {
       // `session.close` (`PluginProvider.openSession`'s catch), which is the path
       // that used to leave the plugin's map entry — and this process — behind.
       if (mode() === "failopen") throw new Error("the runtime refused to initialize");
+      // The real bridge writes three tables when the frame names a session
+      // (`server.js:918-924`) and only the process defaults when it does not.
+      // Recording the id here is what makes `prompt`'s gate real; the *absence*
+      // of one is the plugin bug this stand-in exists to catch.
+      if (requested !== null) initializedSessions.add(requested);
       return { serverInfo: { name: "fake-dsh-bridge", version: "0" }, route: { provider: "fake", model: "fake", reasoningEffort: null } };
     case "paseo/catalog":
       // The real catalog also reports the profile's configured default route
@@ -877,6 +927,41 @@ async function handle(method, params, id) {
       return { available: true, inheritedEventCount: 0, events: withHistoryTimes(rootEvents()) };
     }
     case "session/prompt": {
+      // The per-session gate the real bridge applies before doing any work
+      // (`server.js:920-931`). Wording and the `initialize`-required substring are
+      // kept verbatim: the plugin's one-shot self-heal keys on that substring
+      // (`dsh-process.ts` `#isNotInitializedError`), so a stand-in that phrased it
+      // differently would make a real defect look unrecoverable — and, worse, a
+      // stand-in with no gate at all made a real defect invisible.
+      if (requiresInitialize() && !initializedSessions.has(String(rootId ?? ""))) {
+        throw new Error(
+          `paseo bridge is not initialized for session ${String(rootId)}; `
+            + "send `initialize` with this sessionId before prompting",
+        );
+      }
+      // `crash` dies the moment a prompt arrives, with no reply and no output:
+      // the shape a real child produces when it is OOM-killed or throws inside
+      // its own bootstrap. The exit is **synchronous** on purpose — the caller
+      // writes a second, large frame in the same tick, so the child is gone with
+      // most of that frame still unread in the pipe. That is what makes the
+      // parent's `stdin.write` fail **asynchronously** with EPIPE, which used to
+      // be an uncaught exception that took the whole plugin down.
+      // See `harness/process-crash-check.mjs`.
+      if (mode() === "crash") {
+        process.exit(1);
+      }
+      // `orphan` answers a prompt with frames the *plugin* cannot route: one for
+      // the prompted session itself, and one for a child of it. When the session
+      // is detached at that moment both are held in the orphan buffer, which is
+      // the state `detachSession` has to clean up (L1-6). Harmless when the
+      // session is attached — they route and the check sees normal output.
+      if (mode() === "orphan") {
+        const child = `orphan-child-of-${String(rootId)}`;
+        notify("session.child-opened", { sessionId: child, parentSessionId: String(rootId), mode: "one-shot", cwd: "/tmp" });
+        notify("session.event", { sessionId: child, event: { type: "assistant/message", seq: 1, data: { turn: 1, step: 1, message: { id: "oc1", content: [{ type: "text", text: "held child answer" }] } } } });
+        notify("session.event", { sessionId: String(rootId), event: { type: "assistant/message", seq: 2, data: { turn: 1, step: 1, message: { id: "or1", content: [{ type: "text", text: "held root answer" }] } } } });
+        return { messageId: "m-orphan" };
+      }
       const state = stateOf(rootId);
       if (mode() === "multi") {
         // The `multi` scenario is process-wide in what it asserts (no cross-talk

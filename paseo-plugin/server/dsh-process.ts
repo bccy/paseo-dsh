@@ -785,8 +785,14 @@ export class DshProcess {
    * Replaced on every spawn rather than reused: a `FrameReader` holds the
    * partial line of the stream it was created for, and carrying that across a
    * respawn would prepend a dead child's half-frame to the new child's first one.
+   *
+   * Assigned in the constructor rather than by a field initializer: the reader's
+   * overflow callback reports through {@link #processHandlers}, which is itself
+   * only assigned there. Field initializers run before the constructor body, so
+   * the sink would not exist yet — a latent ordering hazard that costs nothing to
+   * avoid.
    */
-  #frames: FrameReader = createFrameReader();
+  #frames: FrameReader;
   #pending = new Map<number, Pending>();
   #nextId = 1;
   #closed = false;
@@ -820,6 +826,8 @@ export class DshProcess {
         : { onChildOpened: (payload: DshChildOpened) => options.onChildOpened?.(payload) }),
       onExit: (code, signal) => options.onExit(code, signal),
     });
+    // After the sinks, because the reader's overflow report goes through them.
+    this.#frames = this.#createFrames();
   }
 
   /** Whether the child is still alive and usable. */
@@ -919,6 +927,15 @@ export class DshProcess {
    * {@link attachSession} for the same id re-initializes it, which is the only
    * way to be sure the bridge still holds that session's route.
    *
+   * Held orphan frames are part of "everything". They are keyed by the session
+   * that *produced* them, which for a detached conversation means its own id or
+   * one of its descendants' — and a bucket that outlives its owner is a lie with
+   * a deadline: its timer fires a few seconds later and reports "no ancestor
+   * announced it within the hold window", which is the wrong cause (the
+   * conversation was closed) and the wrong owner (a session that no longer
+   * exists). They are dropped here instead, with their timers, so the log says
+   * nothing rather than something false.
+   *
    * @param sessionId - the session to detach; unknown ids are ignored.
    */
   detachSession(sessionId: string): void {
@@ -928,7 +945,10 @@ export class DshProcess {
     this.#initializedSessions.delete(sessionId);
     this.#mcpSent.delete(sessionId);
     this.#readyTasks.delete(sessionId);
-    this.#forgetChildrenOf(sessionId);
+    // Order matters: the descendant set comes from `#childParent`, and forgetting
+    // the edges first would leave every held grandchild bucket behind.
+    const forgotten = this.#forgetChildrenOf(sessionId);
+    this.#dropOrphansOf(forgotten);
   }
 
   /**
@@ -1076,7 +1096,7 @@ export class DshProcess {
     // A fresh splitter per spawn: see {@link #frames}. Created before the first
     // `data` handler can run, which is guaranteed because nothing yields between
     // here and the listener registration below.
-    this.#frames = createFrameReader();
+    this.#frames = this.#createFrames();
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => this.#consume(chunk));
     child.stderr.setEncoding("utf8");
@@ -1084,6 +1104,31 @@ export class DshProcess {
       for (const line of chunk.split("\n")) {
         if (line.trim() !== "") this.#processHandlers.onLog(line);
       }
+    });
+    // Writing to a dead child's stdin fails **asynchronously**, and an 'error'
+    // event with no listener is an uncaught exception: the default action is to
+    // terminate the process. That is the whole reason this listener exists. The
+    // sync try/catch in `#send` cannot see it — the write returns before the pipe
+    // reports the broken end — and it is reachable in normal use: a frame larger
+    // than the pipe buffer (a screenshot in a prompt, a big tool argument, a
+    // `paseo/history` request; Linux's default buffer is 64 KB) sits in the pipe
+    // waiting for the child to read it, so a child that dies at that moment
+    // leaves unread bytes behind and the stream emits EPIPE.
+    //
+    // The consequence used to be out of proportion to the cause: this process is
+    // shared, so its death ends **every** conversation it serves, not just the
+    // one whose frame was in flight. Reported and failed here instead, the same
+    // way the child's own 'error' event is — and deliberately not with a
+    // `process.on("uncaughtException")`, which would take the plugin's problem
+    // and hand it to the host daemon.
+    //
+    // No `#markExited()`: the child may still be running, and its 'exit' event is
+    // what owns that bookkeeping. Failing the pending requests is the point — they
+    // reject now instead of waiting out their timeouts.
+    child.stdin.on("error", (error) => {
+      const failure = toError(error, "failed to write to the bridge");
+      this.#processHandlers.onProtocolError(failure.message);
+      this.#failAll(failure);
     });
     child.on("error", (error) => {
       this.#failAll(error);
@@ -1275,8 +1320,13 @@ export class DshProcess {
     return undefined;
   }
 
-  /** Drop every child->parent edge that pointed into a detached session. */
-  #forgetChildrenOf(root: string): void {
+  /**
+   * Drop every child->parent edge that pointed into a detached session.
+   *
+   * @returns every id whose edge was removed, **including** the root: the caller
+   *   needs the descendant set to drop the orphan buckets those ids produced.
+   */
+  #forgetChildrenOf(root: string): ReadonlySet<string> {
     const removed = new Set<string>([root]);
     let grew = true;
     while (grew) {
@@ -1290,6 +1340,28 @@ export class DshProcess {
     }
     for (const id of removed) {
       if (id !== root) this.#childParent.delete(id);
+    }
+    return removed;
+  }
+
+  /**
+   * Drop the held orphan frames a detached session (and its descendants) produced.
+   *
+   * See {@link detachSession}: an orphan bucket is a promise to replay a frame
+   * once its lineage resolves, and a closed conversation will never resolve it.
+   * The timer is cleared with the bucket because it exists only to report the
+   * bucket's expiry — leaving it armed would log a misleading cause 5 s later.
+   *
+   * @param producers - the detached session id plus every known descendant.
+   */
+  #dropOrphansOf(producers: ReadonlySet<string>): void {
+    for (const producer of producers) {
+      const timer = this.#orphanTimers.get(producer);
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        this.#orphanTimers.delete(producer);
+      }
+      this.#orphanFrames.delete(producer);
     }
   }
 
@@ -1896,6 +1968,33 @@ export class DshProcess {
     } catch (error) {
       this.#processHandlers.onProtocolError(toError(error, "failed to write to the bridge").message);
     }
+  }
+
+  /**
+   * Build the splitter for one child, with the unterminated-frame bound wired to
+   * this process's log sink.
+   *
+   * The bound itself lives in `frame-reader.ts` (`DEFAULT_MAX_PENDING_BYTES`);
+   * what belongs here is only where the report goes. It goes to `onLog`, the same
+   * sink malformed lines use, because the two are the same user-visible event:
+   * bytes arrived that cannot become a frame. Dropping them silently would leave
+   * "the agent went quiet" with nothing to explain it.
+   *
+   * A factory rather than two inline `createFrameReader()` calls because the
+   * reader is created twice (once for the field initializer, once per spawn) and
+   * both have to be wired identically — a second call site without the callback
+   * would be a silently unbounded reader.
+   */
+  #createFrames(): FrameReader {
+    return createFrameReader({
+      onOverflow: ({ dropped, limit }) => {
+        this.#processHandlers.onLog(
+          `discarded a ${String(dropped)}-character bridge frame: it had no newline before the `
+            + `${String(limit)}-character bound (the line is malformed or the child stopped mid-frame); `
+            + "skipping to the next newline",
+        );
+      },
+    });
   }
 
   /**

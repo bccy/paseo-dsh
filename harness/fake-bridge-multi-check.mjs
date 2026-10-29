@@ -46,12 +46,29 @@ function check(label, condition, detail) {
  * `promptsPerSession` sends that many prompts to **each** session, which is what
  * makes "one answer per prompt" distinguishable from "one answer per process":
  * with a single prompt both look identical.
+ *
+ * ## Why this script opts out of the per-session `initialize` gate
+ *
+ * The stand-in enforces the real bridge's "send `initialize` with this sessionId
+ * before prompting" by default (see its module comment) — which is right for
+ * every check that drives the *plugin*, because the plugin is the side that owes
+ * that frame. This script is the exception: it speaks the raw protocol to the
+ * bridge, one level **below** the plugin, and what it pins is the bridge's
+ * routing (per-session answers, per-session turn numbers, one initialize per
+ * process). It deliberately sends the process-wide `initialize` only, because
+ * assertion 3 is about a shared process serving sessions after *one* process-level
+ * handshake — the exact frame sequence the plugin used to send before `f084c33`.
+ * Keeping the gate on here would refuse every prompt and the routing assertions
+ * would never run.
+ *
+ * The opt-out is one environment variable, set below and named in the report, so
+ * it cannot spread silently: `DSH_FAKE_ALLOW_UNINITIALIZED=1`.
  */
 function runBridge({ mode, sessionIds, promptsPerSession = 1 }) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [BRIDGE], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, DSH_FAKE_MODE: mode },
+      env: { ...process.env, DSH_FAKE_MODE: mode, DSH_FAKE_ALLOW_UNINITIALIZED: "1" },
     });
     const frames = [];
     let buffer = "";

@@ -56,11 +56,11 @@
  *      for the connection's life.
  *
  * Run:
- *   node harness/concurrent-open-check.mjs
+ *   node harness/concurrent-open-check.mjs [compiled-plugin-dir]
  *
- * (it compiles the plugin into `paseo-plugin/.dbg-t6` itself, and uses the
- * scripted fake `dsh` with a throwaway `DSH_HOME`, so no profile, model or
- * daemon is touched)
+ * (it compiles the plugin into `paseo-plugin/.dbg-t6` itself unless a build
+ * directory is passed, and uses the scripted fake `dsh` with a throwaway
+ * `DSH_HOME`, so no profile, model or daemon is touched)
  */
 import { createRequire } from "node:module";
 import { chmodSync, existsSync, mkdtempSync, rmSync } from "node:fs";
@@ -96,7 +96,7 @@ process.on("exit", () => {
   }
 });
 
-const buildDir = resolvePluginBuild(undefined, ".dbg-t6");
+const buildDir = resolvePluginBuild(process.argv[2], ".dbg-t6");
 const plugin = require(join(buildDir, "index.server.js")).default;
 
 let passed = 0;

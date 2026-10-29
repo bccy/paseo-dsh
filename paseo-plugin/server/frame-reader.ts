@@ -45,11 +45,58 @@
  * - **A trailing line without a newline stays pending forever.** Exactly as
  *   before — the old reader's final `lines.pop()` never reached `#dispatch`
  *   either, and flushing on exit would be a new behavior, not a preserved one.
+ * - **How long "forever" is has a bound.** A line that never terminates keeps
+ *   `parts` growing for as long as the child keeps writing (malformed output, or
+ *   a child killed mid-frame that leaves the stream open). Past
+ *   {@link DEFAULT_MAX_PENDING_BYTES} the frame is discarded whole — up to and
+ *   including its terminator, so the tail cannot be glued onto the next frame —
+ *   reported once through `onOverflow`, and parsing resumes at the next newline.
+ *   Without the bound that growth is an OOM for a process every session shares;
+ *   with it, the failure is a bounded memory cost plus one log line.
  * - **An unparsable line is handed back**, never swallowed: one malformed line
  *   must not cost the frames behind it.
  *
  * @module dsh-paseo/server/frame-reader
  */
+
+/**
+ * Default cap on one unterminated frame: 256 MiB.
+ *
+ * The largest real frame this bridge produces is a ~39 MB `paseo/history` replay
+ * (see the module comment), so this is ~6x headroom: a legitimate frame is never
+ * near it, and the retained text has a bound instead of growing with the stream.
+ *
+ * Counted with `String#length` — the unit the retained chunks are stored in.
+ * V8 keeps ASCII text at one byte per code unit and everything else at two, so
+ * the real footprint is within a factor of two of this number; the point is that
+ * it is a bound, not an exact byte count.
+ */
+export const DEFAULT_MAX_PENDING_BYTES = 256 * 1024 * 1024;
+
+/** Construction options for {@link createFrameReader}. */
+export interface FrameReaderOptions {
+  /**
+   * Cap on the bytes an unterminated frame may accumulate before it is dropped.
+   *
+   * Exposed so a check can drive the overflow path with a tiny value instead of
+   * allocating 256 MB. Production uses the default.
+   */
+  maxPendingBytes?: number;
+
+  /**
+   * Called **once** for each frame discarded for exceeding {@link maxPendingBytes}.
+   *
+   * A callback rather than a returned line on purpose: the discarded text is by
+   * definition too large to hand on (it is the thing the bound exists to refuse),
+   * and a malformed-line report has to say what happened instead of quoting it.
+   * The caller reports this through the same sink it reports malformed lines to
+   * (`DshProcess#consume` wires both to `onLog`), so a dropped frame is loud, not
+   * silent.
+   *
+   * @param info - how much was discarded and under which limit.
+   */
+  onOverflow?(info: { dropped: number; limit: number }): void;
+}
 
 /**
  * The frame splitter: one instance per stream.
@@ -64,7 +111,7 @@ export interface FrameReader {
    * Returned lines are complete — the `\n` is stripped — and may include blank
    * ones; filtering belongs to the caller because blank and unparsable are
    * different outcomes. An empty array means the chunk only extended a partial
-   * line.
+   * line, or the frame in flight was discarded for exceeding the limit.
    *
    * @param chunk - a UTF-8-decoded chunk (`setEncoding("utf8")` is already set on
    *   the stream), so a multibyte character split across chunks has been rejoined
@@ -76,12 +123,20 @@ export interface FrameReader {
    * Bytes received after the last newline: a frame still in flight.
    *
    * For diagnostics only. Nothing in production reads it — flushing it on child
-   * exit would change behavior (the old reader dropped it too).
+   * exit would change behavior (the old reader dropped it too). Empty while a
+   * discarded frame is being skipped to its terminator.
    */
   readonly pending: string;
 
   /** Complete lines returned so far. Used by the timing probes and log lines. */
   readonly lines: number;
+
+  /**
+   * The cap this reader enforces, for diagnostics and for the offline check.
+   *
+   * `-1` means unbounded, which the constructor can still request explicitly.
+   */
+  readonly maxPendingBytes: number;
 }
 
 /** The minimum shape of one frame. */
@@ -89,8 +144,11 @@ type Frame = Record<string, unknown>;
 
 /**
  * Create an incremental newline tracker for one stream.
+ *
+ * @param options - the unterminated-frame bound and its report callback.
  */
-export function createFrameReader(): FrameReader {
+export function createFrameReader(options: FrameReaderOptions = {}): FrameReader {
+  const maxPendingBytes = options.maxPendingBytes ?? DEFAULT_MAX_PENDING_BYTES;
   /**
    * The chunks of the one line currently being received, in order.
    *
@@ -98,6 +156,17 @@ export function createFrameReader(): FrameReader {
    * place a terminator can be hiding. Joined once, when that line completes.
    */
   const parts: string[] = [];
+  /** Bytes retained in {@link parts}, maintained incrementally. */
+  let pendingBytes = 0;
+  /**
+   * Set when the frame in flight was discarded for exceeding the limit.
+   *
+   * While set, bytes are dropped until the next newline — that newline ends the
+   * *discarded* frame, so it is not a line of its own and the frames after it
+   * parse normally. Without this the tail of a 256 MB line would become the
+   * beginning of the next frame and cost it.
+   */
+  let discarding = false;
   let lineCount = 0;
 
   return {
@@ -107,28 +176,52 @@ export function createFrameReader(): FrameReader {
       for (;;) {
         const newline = chunk.indexOf("\n", start);
         if (newline === -1) break;
+        if (discarding) {
+          // The terminator of the dropped frame. Consume it, resume after it, and
+          // do not count it: it was the end of a frame that never became a line.
+          discarding = false;
+          start = newline + 1;
+          continue;
+        }
         const piece = chunk.slice(start, newline);
         if (parts.length === 0) {
           // The common case: the whole frame was inside this one chunk.
           lines.push(piece);
         } else {
           parts.push(piece);
+          pendingBytes += piece.length;
           lines.push(parts.join(""));
           parts.length = 0;
+          pendingBytes = 0;
         }
         lineCount += 1;
         start = newline + 1;
       }
       // Whatever follows the last newline is the start of the next frame. Note
       // the deliberate absence of a trailing-`\r` strip: see the module comment.
-      if (start < chunk.length) parts.push(chunk.slice(start));
+      if (!discarding && start < chunk.length) {
+        const tail = chunk.slice(start);
+        parts.push(tail);
+        pendingBytes += tail.length;
+        if (maxPendingBytes >= 0 && pendingBytes > maxPendingBytes) {
+          const dropped = pendingBytes;
+          parts.length = 0;
+          pendingBytes = 0;
+          discarding = true;
+          options.onOverflow?.({ dropped, limit: maxPendingBytes });
+        }
+      }
       return lines;
     },
     get pending(): string {
+      if (discarding) return "";
       return parts.length === 1 ? (parts[0] ?? "") : parts.join("");
     },
     get lines(): number {
       return lineCount;
+    },
+    get maxPendingBytes(): number {
+      return maxPendingBytes;
     },
   };
 }

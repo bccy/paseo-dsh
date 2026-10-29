@@ -31,6 +31,8 @@
  *      not "close enough"), including multi-byte text split anywhere
  *  11. the incremental scan is not quadratic: same 20 MB input, same 16 KB
  *      chunks, measured against the old algorithm
+ *  12. an unterminated frame is bounded: past the limit it is discarded whole,
+ *      reported exactly once, and parsing resumes at the next newline
  *
  * Pure module: no `dsh`, no profile, no daemon, no bridge. It compiles just
  * `server/frame-reader.ts` (which imports nothing) to CommonJS in a scratch
@@ -434,6 +436,75 @@ console.log('frame-reader: incremental NDJSON splitting\n');
     'the incremental scan stays under a second for 20 MB',
     newMs < 1000,
     `${newMs.toFixed(0)} ms`,
+  );
+}
+
+// --- 12. an unterminated frame is bounded --------------------------------
+{
+  // A frame that never ends must not grow the retained buffer forever: the
+  // bridge writes one line per frame, so a line that never terminates is either
+  // malformed output or a child that was killed mid-write. Both leave `parts`
+  // accumulating, and `pending` re-joins it on every read.
+  //
+  // The limit is a constructor parameter so this check can use a small one
+  // instead of allocating 256 MB. What is asserted is the whole contract of the
+  // overflow path: one report (not one per chunk), the buffer is gone, and the
+  // *next* line still parses — the frames behind a bad line must not be lost.
+  const reports = [];
+  const limited = createFrameReader({
+    maxPendingBytes: 1024,
+    onOverflow: (info) => reports.push(info),
+  });
+  const chunk = "z".repeat(300);
+  let seenBefore = 0;
+  for (let i = 0; i < 10; i += 1) {
+    seenBefore += limited.push(chunk).length;
+  }
+  check(
+    'an unterminated frame past the limit is reported exactly once',
+    reports.length === 1,
+    `${reports.length} report(s)`,
+  );
+  check(
+    '…the overflow report says how much was discarded and under which limit',
+    typeof reports[0]?.dropped === 'number' && reports[0].dropped >= 1024 && reports[0]?.limit === 1024,
+    JSON.stringify(reports[0] ?? null),
+  );
+  check(
+    '…and the pending buffer is cleared instead of growing',
+    limited.pending === '',
+    `${limited.pending.length} byte(s) still pending`,
+  );
+  check('no line was emitted for the discarded frame', seenBefore === 0, `${seenBefore} line(s)`);
+  // The rest of the stream must still be readable: the reader discards the
+  // overflowing frame *up to its terminator*, and resumes at the newline. So the
+  // tail of the bad frame emits nothing and the next complete line arrives —
+  // asserted on the emitted lines themselves, because "it parsed" would also be
+  // true for an implementation that glued the tail onto the next frame.
+  const after = [];
+  after.push(...limited.push("tail-of-the-bad-line\n"));
+  after.push(...limited.push('{"ok":1}\n'));
+  check(
+    'parsing resumes at the newline after the discarded frame',
+    after.length === 1 && after[0] === '{"ok":1}',
+    `${after.length} line(s): ${JSON.stringify(after.map((line) => line.slice(0, 24)))}`,
+  );
+  check(
+    'the discarded frame is not reported a second time',
+    reports.length === 1,
+    `${reports.length} report(s)`,
+  );
+
+  // The default limit must exist and be far above any real frame: the biggest
+  // one this bridge produces is a ~39 MB `paseo/history` replay (see the module
+  // comment), so 256 MB is ~6x headroom. Pinned as a value because a missing
+  // default is the same bug as no limit at all, and a small default would start
+  // dropping real replays.
+  const unbounded = createFrameReader();
+  check(
+    'the default limit is the documented 256 MiB',
+    unbounded.maxPendingBytes === 256 * 1024 * 1024,
+    String(unbounded.maxPendingBytes),
   );
 }
 
