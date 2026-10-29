@@ -29,7 +29,7 @@ type StreamStats = z.infer<typeof streamStatsSchema>;
 const DESIRED_GAP = 12;
 /** Bounds on how far the row may move, so a bad measure cannot drag it away. */
 const MAX_SHIFT = 24;
-const MIN_SHIFT = -40;
+const MIN_SHIFT = -160;
 
 function formatLatency(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
@@ -111,11 +111,12 @@ function StreamStatsRow({ item, theme, layout }: PluginTimelineItemProps<StreamS
       setShift((current) => (current.top === target.top && current.bottom === target.bottom ? current : target));
     };
     measure();
-    // The details can change the row's height after the first layout pass.
-    const settle = setTimeout(measure, 0);
+    // The footer may mount a frame late (and the details change the row's
+    // height after the first layout pass), so check again shortly after.
+    const retries = [setTimeout(measure, 60), setTimeout(measure, 200), setTimeout(measure, 500)];
     const stop = watchFooter(rowRef.current, measure);
     return () => {
-      clearTimeout(settle);
+      for (const timer of retries) clearTimeout(timer);
       stop?.();
     };
   }, [open]);
