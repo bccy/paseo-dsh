@@ -395,6 +395,7 @@ history is on
 
 | Version | Date | Changes |
 | --- | --- | --- |
+| [0.2.15](https://www.npmjs.com/package/paseo-dsh/v/0.2.15) | 2026-10-28 | **The stats row sits with the turn footer**: the gap to the copy / model / time footer stays the same under the default theme and theme plugins. A completed turn flags its last row `final`; on web the row measures where the footer actually painted and tucks under it, native keeps a constant fallback.<br>**Configurable**: Settings → Plugins → "回答统计行" adjusts the gap (0–24px, default 6) and font size (10–16px, default 13); with no saved settings nothing changes.<br>**Type**: defaults to the footer's 13px with tabular numbers. |
 | [0.2.14](https://www.npmjs.com/package/paseo-dsh/v/0.2.14) | 2026-10-28 | **Clearer stats line**: the session token total in the collapsed line became a context percentage (for example `上下文 77%`); the exact `used / limit` stays in the expanded details. Counts and cache-hit semantics are unchanged. |
 | [0.2.13](https://www.npmjs.com/package/paseo-dsh/v/0.2.13) | 2026-10-28 | **Richer stats line**: the collapsed line always shows `N turns N steps · first token · tok/s · total tokens · cache hit`, matching DSH Web's accounting (total = uncached input + cache read + cache write + output; hit = cache read ÷ prompt-side total). Turns, steps and tokens are rebuilt from the session log on resume. Expanding still shows context, token buckets, route and tool details. |
 | [0.2.12](https://www.npmjs.com/package/paseo-dsh/v/0.2.12) | 2026-10-28 | **Real streaming**: subscribes to DSH's live `agent/assistant-stream` frames (text and reasoning) and renders while the model writes instead of replaying after the step; the first character appears when the model emits it.<br>**Answer stats row**: `first token · tok/s` under each answer, expandable to context, input/cache/output tokens, route and thinking level, tool count and time; speed uses DSH's own chunk timestamps and drops burst artifacts. |
@@ -416,7 +417,7 @@ history is on
 ## Documentation
 
 - [docs/ADOPTION.md](docs/ADOPTION.md) — adoption guide: what changes, how to configure it, the pitfall list
-- [docs/FIELD-NOTES.md](docs/FIELD-NOTES.md) — 24 real defects: symptom → root cause → fix
+- [docs/FIELD-NOTES.md](docs/FIELD-NOTES.md) — 25 real defects: symptom → root cause → fix
 - [AGENTS.md](AGENTS.md) — notes for AI agents (Codex and others read it automatically). Read it first whether you were asked to install or to change this repository (written in Chinese)
 
 ## Contact
