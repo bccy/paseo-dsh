@@ -128,6 +128,32 @@ function unavailableHistory(error) {
 }
 
 /**
+ * Services whose absence has already been reported, so a profile that does not
+ * compose one says so once per process instead of once per read.
+ *
+ * The two readers that use this run on every session listing and on every
+ * session open that replays subagents, and a profile without the web bundle
+ * legitimately composes no `workspaceRegistry`. Repeating the same line on every
+ * call turns stderr into noise, which is how a warning that matters gets ignored.
+ *
+ * A *failure* is a different fact: it can be intermittent, and it names a
+ * different cause each time, so failures are still reported on every occurrence.
+ */
+const REPORTED_MISSING_SERVICES = new Set();
+
+/**
+ * Report an optional service this profile does not compose, once per process.
+ *
+ * @param {string} service - the ctx service name; also the latch key.
+ * @param {string} line - the complete message, newline included.
+ */
+function reportMissingService(service, line) {
+  if (REPORTED_MISSING_SERVICES.has(service)) return;
+  REPORTED_MISSING_SERVICES.add(service);
+  process.stderr.write(line);
+}
+
+/**
  * Bound on a child's held frames before it is opened without a label. A child's
  * `subagent/descriptor` normally arrives within its first turn; the cap only
  * guards an anomalous provider so its earliest output is never dropped.
@@ -190,6 +216,12 @@ const ASSISTANT_STREAM_INTERVAL_MS = 100;
  * it is produced. This type rides the existing `session.event` envelope so the
  * plugin's session routing (root, child, held-child buffer) applies unchanged.
  * It is never appended to a session log and never seen by history replay.
+ *
+ * Payload: `{turn, step, attempt?, reasoning?, text?}`. `attempt` is DSH's
+ * attempt identity for the step, forwarded so the plugin can keep a retried
+ * attempt's text off the row the previous attempt already grew; it is omitted
+ * when DSH names no attempt, and a plugin that predates it simply ignores the
+ * field (the payload only ever gains keys).
  */
 const ASSISTANT_DELTA_EVENT = 'paseo/assistant-delta';
 
@@ -537,10 +569,21 @@ export class PaseoHarnessServer {
 
     if (frame.type === 'start') {
       if (typeof frame.turn !== 'number' || typeof frame.step !== 'number') return;
+      // One turn/step can be attempted more than once: DSH retries a failed
+      // request inside the same step, and each attempt starts a fresh frame
+      // series with its own `attemptId`. The assembler is reset here (correctly
+      // — the plugin must not see attempt 1's text prepended to attempt 2's),
+      // but the *item id* the plugin derives from turn/step alone cannot tell
+      // the two apart, so a growing snapshot of attempt 2 would be appended to
+      // attempt 1's row by Paseo's prefix rule and the answer would read as
+      // gibberish. Passing the attempt through is what lets the plugin suffix
+      // it; `frame.attemptId` is DSH's own identity for the attempt
+      // (`LlmAttemptId`, unique within the agent's lifecycle).
       this.assistantStreams.set(sessionId, {
         assembler: new BlockAssembler(),
         turn: frame.turn,
         step: frame.step,
+        ...(typeof frame.attemptId === 'string' ? { attempt: frame.attemptId } : {}),
         lastSentAt: 0,
         reasoning: '',
         text: '',
@@ -621,6 +664,11 @@ export class PaseoHarnessServer {
         data: {
           turn: state.turn,
           step: state.step,
+          // Present only when DSH named the attempt. A bridge that cannot name
+          // it must not invent one: the plugin treats an absent field as "the
+          // first and only attempt" and keeps its old id, which is what an older
+          // bridge means by sending this frame at all.
+          ...(state.attempt === undefined ? {} : { attempt: state.attempt }),
           ...(reasoningChanged ? { reasoning } : {}),
           ...(textChanged ? { text } : {}),
         },
@@ -1239,15 +1287,46 @@ export class PaseoHarnessServer {
    * DSH's registry-global archive set, as strings. An unreadable registry
    * yields an empty set: callers then filter nothing, which is the honest
    * answer when the state cannot be read.
+   *
+   * "Honest" is not "silent". An empty set means every session is treated as
+   * unarchived, so `paseo/subagents` re-announces archived children, the plugin
+   * replays them, and the user sees a subagent they archived come back — with
+   * nothing on stderr to explain it. The three ways to get here are different
+   * facts and each says so; the *strategy* stays put, because the alternative
+   * (treating everything as archived) would empty the session list, a worse
+   * failure in the same place. "This profile composes no such service" is a
+   * standing property, so it is reported once per process (see
+   * {@link reportMissingService}); the two failure paths are events and are
+   * reported every time.
    */
   #archivedSessionIds() {
+    let registry;
     try {
-      const registry = this.ctx.get('workspaceRegistry');
-      if (registry !== undefined) return new Set([...registry.archivedSessionIds].map(String));
-    } catch {
-      // fall through to the empty set
+      registry = this.ctx.get('workspaceRegistry');
+    } catch (error) {
+      process.stderr.write(
+        `[bridge] looking up DSH's workspace registry failed; treating every session as unarchived `
+        + `(archived subagents may be re-announced): ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return new Set();
     }
-    return new Set();
+    if (registry === undefined) {
+      reportMissingService(
+        'workspaceRegistry',
+        '[bridge] this DSH profile composes no workspace registry; treating every session as unarchived '
+        + '(archived subagents may be re-announced)\n',
+      );
+      return new Set();
+    }
+    try {
+      return new Set([...registry.archivedSessionIds].map(String));
+    } catch (error) {
+      process.stderr.write(
+        `[bridge] reading DSH's archived-session set failed; treating every session as unarchived `
+        + `(archived subagents may be re-announced): ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return new Set();
+    }
   }
 
   /**
@@ -1257,30 +1336,68 @@ export class PaseoHarnessServer {
    * through headers, and a descendant's ancestors are usually NOT live (they
    * settled), so stored snapshots are what make the walk reach the root. Live
    * headers are layered on top because DSH's own gate reads the live object.
+   *
+   * Both sources are optional peers and a missing one only narrows the walk.
+   * Missing and unreadable are still reported apart, for the same reason as
+   * {@link #archivedSessionIds}: a narrower walk answers "not archived" for
+   * sessions whose stored header it never saw, which is indistinguishable from
+   * the truth unless someone says otherwise. The standing "not composed" facts
+   * go through {@link reportMissingService} (once per process); a throwing
+   * lookup or read is reported every time.
    */
   async #sessionHeaders() {
     const headers = new Map();
-    const persistence = this.ctx.get('sessionPersistence');
-    if (persistence !== undefined) {
+    let persistence;
+    try {
+      persistence = this.ctx.get('sessionPersistence');
+    } catch (error) {
+      process.stderr.write(
+        `[bridge] looking up DSH's session persistence failed; the archived-session walk sees only live `
+        + `sessions: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      persistence = undefined;
+    }
+    if (persistence === undefined) {
+      reportMissingService(
+        'sessionPersistence',
+        '[bridge] this DSH profile composes no session persistence; the archived-session walk sees only '
+        + 'live sessions (archived subagents may be re-announced)\n',
+      );
+    } else {
       try {
         for (const snapshot of await persistence.list()) {
           const header = snapshot?.header;
           if (header?.id !== undefined) headers.set(String(header.id), header);
         }
-      } catch {
-        // A storage fault leaves the walk to whatever it already has.
+      } catch (error) {
+        process.stderr.write(
+          `[bridge] listing stored session headers failed; the archived-session walk keeps only what it `
+          + `already has (archived subagents may be re-announced): ${error instanceof Error ? error.message : String(error)}\n`,
+        );
       }
     }
+    let sessions;
     try {
-      const sessions = this.ctx.get('sessions');
-      if (sessions !== undefined) {
+      sessions = this.ctx.get('sessions');
+    } catch (error) {
+      process.stderr.write(
+        `[bridge] looking up DSH's live session service failed; the archived-session walk keeps only stored `
+        + `headers: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      sessions = undefined;
+    }
+    if (sessions !== undefined) {
+      try {
         for (const session of sessions.list()) {
           const header = session?.header;
           if (header?.id !== undefined) headers.set(String(header.id), header);
         }
+      } catch (error) {
+        process.stderr.write(
+          `[bridge] listing live session headers failed; the archived-session walk keeps only stored headers: `
+          + `${error instanceof Error ? error.message : String(error)}\n`,
+        );
       }
-    } catch {
-      // Optional peer: its absence only narrows the walk.
     }
     return headers;
   }
@@ -2195,45 +2312,41 @@ export class PaseoHarnessServer {
    * the previous model's window paired with the new model's pressure. Every
    * unknown field is omitted rather than defaulted, because a fabricated
    * occupancy is worse than none.
-   */
-  /**
-   * Switch one session's permission preset through DSH's own projection API.
    *
-   * The slash command `/permission` is a user-visible action: it appends
-   * `command/run` and `command/done` events, which then replay as a command row
-   * in Paseo's timeline even though the user never typed it. `permissionPresets.set`
-   * writes the same durable events (`permission/preset`, `sandbox/mode`,
-   * `approval/policy`) without the command lifecycle. The one behavioural
-   * difference is that the command path also injects an "approval policy
-   * changed" chat notice; the composer shows the current preset itself, so the
-   * quieter write is the one this provider uses.
+   * ### Why this reads a session instead of just reading a number
    *
-   * @param {{sessionId: string, preset?: unknown}} params
+   * Measuring a resumed session needs its agent, and an agent otherwise only
+   * exists after the first prompt. So a session this process has *initialized*
+   * but not prompted gets one created here, and the reopened composer shows its
+   * stored occupancy before the next turn, like `commands` and `permission`
+   * already do. A session this process has never opened resumes from its
+   * persistence handle instead of answering "unavailable": the occupancy is
+   * stored, so it can be shown before the next turn.
+   *
+   * ### The one session this must NOT resurrect
+   *
+   * `usage` is not user-driven: `configure()`, a 75 ms merge timer and
+   * `compaction/end` all refresh it, so a request can still be in flight when
+   * the user closes the session. Landing after `session/close` had already
+   * disposed the agent, `getOrCreateSession` would happily `resume` it — an
+   * agent with no owner, re-taking the session log's write lease and keeping its
+   * model-selection listeners for the life of the process. That is the resource
+   * `closeSession` exists to release. So an id in {@link closedSessions} answers
+   * `available: false` and creates nothing; the plugin clears its readout on that
+   * answer, and a closed session has no composer to show one in.
+   *
+   * @param {{sessionId: string}} params
    */
-  async setPermission(params) {
-    const service = this.ctx.get('permissionPresets');
-    if (service === undefined) throw new Error('this DSH profile composes no permission presets');
-    const rec = await this.getOrCreateSession(params.sessionId);
-    this.assertLiveAgent(rec, params.sessionId);
-    const name = typeof params.preset === 'string' ? params.preset : '';
-    if (name === '') throw new Error('a permission preset name is required');
-    service.set(rec.handle.agent.session, name);
-    return { current: service.current(rec.handle.agent.session) };
-  }
-
   async usage(params) {
-    // Measuring a resumed session needs its agent, and an agent otherwise only
-    // exists after the first prompt. Create it here so a reopened composer shows
-    // its stored occupancy before the next turn, like `commands` and
-    // `permission` already do. A session this process has never opened resumes
-    // from its persistence handle instead of answering "unavailable": the
-    // occupancy is stored, so the reopened composer can show it before the next
-    // turn.
-    const rec = await this.getOrCreateSession(params.sessionId);
+    const sessionId = String(params.sessionId);
+    if (this.sessions.get(sessionId) === undefined && this.closedSessions.has(sessionId)) {
+      return { available: false };
+    }
+    const rec = await this.getOrCreateSession(sessionId);
     this.assertLiveAgent(rec, params.sessionId);
     const session = rec.handle.agent.session;
     const loggedRoute = session.requestContext?.();
-    const selection = this.controls.get(params.sessionId)?.selection?.current;
+    const selection = this.controls.get(sessionId)?.selection?.current;
     const route = selection ?? loggedRoute;
     const sameRoute = route?.provider === loggedRoute?.provider && route?.model === loggedRoute?.model;
     const pressure = this.#contextPressure(session);
