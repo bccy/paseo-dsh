@@ -160,7 +160,7 @@ export interface DshSessionOptions {
    * Take the process this session runs in.
    *
    * Every session of one connection shares a single long-lived `dsh` child (see
-   * `parked-sessions.ts`), so a session does not own a process and cannot spawn
+   * `#acquirePoolProcess` in `provider.ts`), so a session does not own a process and cannot spawn
    * one: it joins the shared one. The provider resolves it, spawning on the
    * first open and returning the same child afterwards; the returned process has
    * already completed `start()`.

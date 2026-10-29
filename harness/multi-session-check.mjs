@@ -22,6 +22,11 @@
  *      bucket and its timer, so no misleading "no ancestor announced" log appears
  *      — while another session's held bucket still reports normally (the
  *      positive control that the log path and the wait are real)
+ *   6. a per-session env the shared process cannot apply is reported on the
+ *      timeline by **key name**, and the two keys the daemon injects per agent
+ *      (`PASEO_AGENT_ID`, `PASEO_AGENT_CWD`) do not count as a difference — every
+ *      second session of a connection has different values for both, so counting
+ *      them would make the warning fire always and mean nothing
  *
  * Uses the scripted fake `dsh` (`harness/fake-dsh-bridge.mjs`, `multi` mode) and
  * a throwaway `DSH_HOME`, so no profile, model or daemon is touched.
@@ -377,32 +382,23 @@ console.log("\nheld orphan frames are dropped when their session closes");
 // ---------------------------------------------------------------------------
 // The provider half of the reference count.
 //
-// `ParkedSessions.hold()` / `release()` are the pair the provider books around
-// every claim on the shared child, and they are *called* from `provider.ts`
-// (`#addPoolClaim`, `#dropPoolClaims` and `#releasePoolProcess`). The retired
-// `harness/parked-sessions-check.cjs` used to drive the pool directly, so it
-// could prove the pool's own guards worked but not that the provider ever took a
-// hold — deleting the `#addPoolClaim` call left that whole file green (verified
-// by mutation at the time).
+// `#poolClaims` is the provider's own accounting: one claim per session open,
+// returned on that session's close. It is what keeps the shared child alive while
+// any conversation uses it and retires it when the last one leaves, so a claim
+// that is taken twice or returned twice shows up as a child that never retires
+// (or is killed under a live session).
 //
-// So the methods are counted here, across the plugin-level run below: two
-// sessions open onto one shared child, therefore exactly two claims, therefore
-// exactly two holds. Counting is used instead of "was it called at all" because
-// a hold per *request* would still pass the weaker form while drifting away from
-// one-hold-per-claim. This is now the **only** place that pins the pairing:
-// `hold()`/`release()` are empty method shells, so the counting instrumentation
-// below is what gives them observable behaviour at all.
-const holdCalls = { hold: 0, release: 0 };
-{
-  const { ParkedSessions } = require(join(buildDir, "server", "parked-sessions.js"));
-  for (const name of ["hold", "release"]) {
-    const original = ParkedSessions.prototype[name];
-    ParkedSessions.prototype[name] = function counted(...args) {
-      holdCalls[name] += 1;
-      return original.apply(this, args);
-    };
-  }
-}
+// This used to be asserted by patching `ParkedSessions.prototype.hold/release`
+// and counting the calls. Those were empty method shells kept alive by the
+// counting itself: the check proved the shell was called, not that the provider's
+// claims balanced — and deleting `#addPoolClaim` would still have been caught only
+// because the shells happened to be called from the same place. The provider now
+// exposes the count it actually retires on (`poolClaimCount`, a read-only
+// getter), so the assertion reads the number the shutdown decision reads.
+//
+// The connection is created below; this is where its counts get recorded.
+/** The live provider connection, so the claim assertions can read its count. */
+let conn;
 
 // The fake bridge records every frame it receives (with its own pid) when
 // `DSH_FAKE_LOG` names a file. Arming it *before* the first open is what makes
@@ -411,7 +407,7 @@ const holdCalls = { hold: 0, release: 0 };
 const frameLog = join(process.env.DSH_HOME, "frames.jsonl");
 process.env.DSH_FAKE_LOG = frameLog;
 
-const conn = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+conn = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
 conn.onEvent((event) => pluginEvents.push(event));
 
 /** Open one provider session and wait for it to be ready. */
@@ -443,6 +439,10 @@ async function openSession(sessionId) {
 console.log("two sessions, one shared bridge process");
 await openSession(rootA);
 await openSession(rootB);
+// Snapshot the claim count while both are open. Read here rather than later
+// because the assertions below run after A has been closed, when the number has
+// already changed — and "2 then 1" is the pairing, not "1 at some point".
+const claimCounts = { afterTwoOpens: conn.poolClaimCount };
 {
   // Both sessions must reach ready on the *same* fake bridge process. The fake
   // bridge logs every frame with its pid, so two distinct pids would mean the
@@ -607,24 +607,24 @@ console.log("\nclosing one session leaves the other working");
   );
 
   // The provider's side of the reference count, checked at the point where both
-  // halves must have happened: two sessions opened (two claims, two holds) and A
-  // has been closed (its claim returned, one hold released). `#dropPoolClaims`
-  // would also release, but it only runs when the child dies, and the child is
-  // alive here — so an extra release would mean a claim was returned twice.
+  // halves must have happened: two sessions opened (two claims) and A has been
+  // closed (its claim returned). `#dropPoolClaims` would also clear them, but it
+  // only runs when the child dies, and the child is alive here — so a count of 1
+  // proves one claim was returned rather than all of them being forgotten.
   check(
-    "the provider takes one hold per opened session",
-    holdCalls.hold === 2,
-    `${holdCalls.hold} hold(s) for 2 opened session(s)`,
+    "the provider takes one claim per opened session",
+    claimCounts.afterTwoOpens === 2,
+    `${String(claimCounts.afterTwoOpens)} claim(s) for 2 opened session(s)`,
   );
   check(
     "…and returns one when a session closes",
-    holdCalls.release === 1,
-    `${holdCalls.release} release(s) after closing 1 of 2 session(s)`,
+    conn.poolClaimCount === 1,
+    `${String(conn.poolClaimCount)} claim(s) after closing 1 of 2 session(s)`,
   );
   check(
-    "…so the shared child is still held, not free to kill",
-    holdCalls.hold - holdCalls.release === 1,
-    `net ${holdCalls.hold - holdCalls.release} hold(s)`,
+    "…so the shared child is still claimed, not free to kill",
+    claimCounts.afterTwoOpens - conn.poolClaimCount === 1,
+    `net ${String(claimCounts.afterTwoOpens - conn.poolClaimCount)} claim(s)`,
   );
 
   // B keeps working. The `multi` scenario is process-wide and only runs once, so
@@ -716,6 +716,125 @@ console.log("\nclosing one session leaves the other working");
     ),
     afterClosed.map((event) => `${event.type}@${String(event.sessionId)}`).join(", ") || "(no events)",
   );
+}
+
+// ---------------------------------------------------------------------------
+// A per-session env the shared child cannot apply, reported where it is visible.
+//
+// The environment is handed to `dsh` at spawn and there is no per-session channel
+// for it, so the second session of a connection always runs with the first one's
+// env. That divergence used to be stderr-only — a channel the user never reads —
+// which made "my FOO=bar did nothing" have no symptom at all.
+//
+// Two things have to be true at once, and the second is the one that is easy to
+// get wrong. The warning must fire for a key the caller really set, and it must
+// **not** fire for the keys the daemon injects per agent: `PASEO_AGENT_ID` and
+// `PASEO_AGENT_CWD` are written into every open's env with values that differ per
+// agent by design (`agent-manager.js`), and `PASEO_AGENT_CWD` is the session's own
+// cwd — so **two sessions in different projects always differ on it**. Counting it
+// would make the warning fire on every second session of every connection and bury
+// the key the user actually set, which is why it is exempted rather than reported.
+//
+// A fresh connection is used so the pool's spawn env is this section's to choose:
+// the difference is computed against the env the child was **spawned** with, and
+// the connection above already spawned one with the harness's own env.
+console.log("\na per-session env the shared process cannot apply");
+{
+  const envConn = await registration.connect({ capabilities: ["prompt.message"] });
+  const envEvents = [];
+  envConn.onEvent((event) => envEvents.push(event));
+  const openWith = async (sessionId, cwd, env) => {
+    const mark = envEvents.length;
+    await envConn.send({
+      type: "session.open",
+      requestId: `env-open-${sessionId}`,
+      sessionId,
+      config: { cwd, mode: "build", env },
+      history: "skip",
+    });
+    await waitFor(
+      envEvents.slice(mark),
+      (event) => event.type === "session.ready" && event.sessionId === sessionId,
+    );
+    // The open warnings are emitted right after `session.ready`, in the same
+    // synchronous publish step — but they go through `#notice`, which emits one
+    // event per warning, so give the event loop a turn before reading them.
+    await sleep(150);
+    return envEvents
+      .slice(mark)
+      .filter((event) => event.type === "session.notice" && event.sessionId === sessionId);
+  };
+
+  // Both directories must exist: the provider spawns a probe process with the
+  // session's cwd, and a missing directory fails the open for a reason unrelated
+  // to what is being asserted here.
+  const cwdA = process.cwd();
+  const cwdB = process.env.DSH_HOME;
+
+  // The first open of this connection defines the spawn env, exactly as the first
+  // session of a real connection does.
+  const first = await openWith("env-first", cwdA, {
+    PASEO_AGENT_ID: "agent-first",
+    PASEO_AGENT_CWD: cwdA,
+  });
+  check(
+    "the first session of a connection gets no env warning",
+    first.every((event) => event.notice?.title !== "会话环境变量未生效"),
+    first.map((event) => String(event.notice?.title)).join(" | ") || "(no notice)",
+  );
+
+  // **The red case this entry exists for**: a second session in a different cwd.
+  // The daemon gives it its own `PASEO_AGENT_CWD`, so before the exemption it was
+  // reported as a broken environment on every multi-project connection.
+  const second = await openWith("env-second-other-cwd", cwdB, {
+    PASEO_AGENT_ID: "agent-second",
+    PASEO_AGENT_CWD: cwdB,
+  });
+  check(
+    "a session in a different cwd gets no env warning",
+    second.every((event) => event.notice?.title !== "会话环境变量未生效"),
+    second.map((event) => `${String(event.notice?.title)}: ${String(event.notice?.description)}`).join(" | ")
+      || "(no notice)",
+  );
+
+  // The positive control for the warning itself. The value is a sentinel so the
+  // "no value on the timeline" assertion has something specific to look for: a
+  // check for "no long string" would pass on a truncated value, and one for a
+  // common word would pass on a title that happened to contain it.
+  const envKey = "DSH_MULTI_SESSION_PROBE_KEY";
+  const envValue = "probe-value-must-not-be-echoed-9f2c";
+  const third = await openWith("env-third-custom", cwdB, {
+    PASEO_AGENT_ID: "agent-third",
+    PASEO_AGENT_CWD: cwdB,
+    [envKey]: envValue,
+  });
+  const warnings = third.filter((event) => event.notice?.title === "会话环境变量未生效");
+  check(
+    "a session with a custom env key gets the warning",
+    warnings.length === 1,
+    `${String(warnings.length)} warning(s): ${third.map((event) => String(event.notice?.title)).join(" | ") || "(none)"}`,
+  );
+  const text = warnings.map((event) => String(event.notice?.description ?? "")).join(" ");
+  check(
+    "…naming the key that did not take effect",
+    text.includes(envKey),
+    JSON.stringify(warnings[0]?.notice?.description ?? ""),
+  );
+  check(
+    "…and never the value it would have had",
+    text !== "" && !text.includes(envValue),
+    JSON.stringify(warnings[0]?.notice?.description ?? ""),
+  );
+  // From the other direction: this open's per-agent keys differ from the spawn
+  // env's, so a warning that listed them would be listing exactly the noise the
+  // exemption removes.
+  check(
+    "…and not the keys the daemon injects per agent",
+    text !== "" && !text.includes("PASEO_AGENT_ID") && !text.includes("PASEO_AGENT_CWD"),
+    JSON.stringify(warnings[0]?.notice?.description ?? ""),
+  );
+
+  await envConn.close();
 }
 
 await conn.close();

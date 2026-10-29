@@ -15,13 +15,33 @@
  *      cwd/title/updatedAt pass through, and the first-message preview becomes
  *      Paseo's `description` — the daemon reopens an imported session by that
  *      handle, so a raw id is an "Invalid plugin provider persistence handle";
- *   2. a rewind the bridge accepts answers `request.completed` and emits the
- *      transient "正在回退，请稍候" notice, the click's only feedback while the
- *      daemon rebuilds the timeline;
- *   3. with no agent record for the session the automatic refresh cannot run, and
- *      that must be a visible warning notice, not silence;
+ *   2. an accepted rewind answers `request.completed` **and** leaves exactly one
+ *      `撤回已生效` notice in front of that receipt. The notice is the rewind's
+ *      canary: whether it survives is how the user (and a later phase) can tell
+ *      a host that refreshes the timeline from one that does not, and it only
+ *      works because of the order — a host that truncates its history buffer at
+ *      the rewound row drops everything already in it, so a notice sent after the
+ *      receipt would survive on that host too and lie. `harness/host-contract-sim.mjs`
+ *      drives the real host code to prove both halves;
+ *   3. the retired reload path stays gone: no "正在回退，请稍候" working notice and
+ *      no "未自动刷新" warning, because nothing refreshes and nothing can fail;
  *   4. a rewind the bridge refuses becomes `request.failed`, never a silent
- *      success.
+ *      success, and leaves no canary behind (nothing was rewound);
+ *   5. a second accepted rewind's canary text differs from the first (`#2`), so a
+ *      later phase can find *this* rewind's notice on a host that keeps them all;
+ *   6. the canary is scoped to rewinds that touched the conversation. A
+ *      `files`-only rewind restores the working tree and deliberately leaves the
+ *      conversation alone (`dsh-bridge/lib/server.js` skips the replacement for
+ *      that scope), so there is no timeline to refresh and the canary's "reload to
+ *      see the result" advice would be a warning about a problem the user does not
+ *      have. A `both` rewind does change the conversation, so it does get one — and
+ *      its text names the files too, because that is the half the user cannot see
+ *      from the timeline.
+ *
+ * The scope cases are the ones that are easy to lose: the provider decides with
+ * `input.scope !== "files"` and `files: input.scope === "both"`, and with only
+ * `conversation` rewinds exercised, dropping either condition left every other
+ * check green (verified by mutation — see the report).
  *
  * Compile the plugin first (tsc type errors under `--moduleResolution node` are
  * expected; the emitted JS is what runs):
@@ -199,13 +219,47 @@ const check = (name, pass, detail) => {
     revertReply.type === "request.completed",
     revertReply.type === "request.failed" ? JSON.stringify(revertReply.error) : "completed",
   );
+
+  // The canary. It has to be a `撤回已生效` notice **in front of** the receipt, and
+  // the index comparison is the assertion — not "a notice exists". A host that
+  // truncates its history buffer at the rewound row cuts everything already in it
+  // when the receipt resolves, which is what makes the canary vanish on a
+  // refreshed timeline; a notice emitted after the receipt is outside that window
+  // and survives on that host too, turning the canary into a false "your timeline
+  // is stale" warning. Both directions are driven against the real host code in
+  // `harness/host-contract-sim.mjs`.
+  const rewindNotices = eventsSince(beforeRevert).filter(
+    (e) => e.type === "session.notice" && e.sessionId === sessionId,
+  );
+  const canaries = rewindNotices.filter((e) => e.notice?.title === "撤回已生效");
+  check(
+    "an accepted rewind leaves exactly one canary notice",
+    canaries.length === 1,
+    `${canaries.length} canary notice(s): ${JSON.stringify(rewindNotices.map((e) => e.notice?.title ?? null))}`,
+  );
+  // Index comparison over the whole event array, not "canary index < reply index
+  // within the notice list": the two are different lists, and comparing inside one
+  // of them would compare a notice against itself.
+  const canaryIndex = canaries.length === 1 ? events.indexOf(canaries[0]) : -1;
+  const replyIndex = events.indexOf(revertReply);
+  check(
+    "…emitted before request.completed (the order is the whole mechanism)",
+    canaryIndex !== -1 && replyIndex !== -1 && canaryIndex < replyIndex,
+    `canary at ${canaryIndex}, request.completed at ${replyIndex}`,
+  );
+  // And the canary's text is the one the module defines: the timestamp and the
+  // sequence number, which is what makes it findable when several rewinds have
+  // each left one behind.
+  const canaryDescription = String(canaries[0]?.notice?.description ?? "");
+  check(
+    "…whose text carries the time and this rewind's sequence number",
+    /^\d{2}:\d{2}:\d{2} · #1。/u.test(canaryDescription),
+    JSON.stringify(canaryDescription),
+  );
   // A rewind no longer reloads the agent, so the click needs no "working" notice:
   // the reply is immediate and the daemon rebuilds the timeline from the
   // truncated history. Asserting the *absence* keeps this honest — if someone
   // reintroduces the reload path, the notice (and this check) come back together.
-  const rewindNotices = eventsSince(beforeRevert).filter(
-    (e) => e.type === "session.notice" && e.sessionId === sessionId,
-  );
   check(
     "no working notice is needed (the rewind answers immediately)",
     rewindNotices.every((e) => e.notice?.title !== "正在回退，请稍候"),
@@ -241,6 +295,18 @@ const check = (name, pass, detail) => {
     failedRevert.type === "request.failed" && /无法解析/.test(failedRevert.error?.message ?? ""),
     JSON.stringify(failedRevert.error ?? failedRevert),
   );
+  // A refusal rewinds nothing, so there is nothing for a canary to announce. A
+  // canary here would tell the user their timeline is stale after an action that
+  // did not happen — and it would be the loudest possible signal for a click that
+  // failed, which is worse than no signal at all.
+  const refusedCanaries = eventsSince(beforeFailedRevert).filter(
+    (e) => e.type === "session.notice" && e.notice?.title === "撤回已生效",
+  );
+  check(
+    "a refused rewind leaves no canary behind",
+    refusedCanaries.length === 0,
+    `${refusedCanaries.length} canary notice(s)`,
+  );
   // The refusal must release the in-flight gate the provider set before asking
   // the bridge. A gate left behind would refuse every later rewind (and every
   // prompt) on this session with "该会话已有撤回正在进行", so the next accepted
@@ -262,6 +328,111 @@ const check = (name, pass, detail) => {
     "a refused rewind leaves the gate open for the next one",
     secondRevert.type === "request.completed",
     JSON.stringify(secondRevert.error ?? "completed"),
+  );
+  // The second canary must be distinguishable from the first. On a host that keeps
+  // the withdrawn rows the first one is still on screen, so "a notice exists" would
+  // match the stale one; the sequence number is what names *this* rewind. It is
+  // also what a later phase would search for to find the notice it just emitted.
+  const secondCanaries = eventsSince(beforeSecondRevert).filter(
+    (e) => e.type === "session.notice" && e.notice?.title === "撤回已生效",
+  );
+  const firstCanaryDescription = String(canaries[0]?.notice?.description ?? "");
+  const secondCanaryDescription = String(secondCanaries[0]?.notice?.description ?? "");
+  check(
+    "the second rewind's canary is a different notice (#2)",
+    secondCanaries.length === 1
+      && /· #2。/u.test(secondCanaryDescription)
+      && secondCanaryDescription !== firstCanaryDescription,
+    `${secondCanaries.length} notice(s); second=${JSON.stringify(secondCanaryDescription)} first=${JSON.stringify(firstCanaryDescription)}`,
+  );
+
+  // ---- 4. the scope decides whether there is a canary at all -------------
+  //
+  // A `files`-only rewind restores the working tree and deliberately leaves the
+  // conversation alone, so the timeline the canary talks about was not touched.
+  // Telling the user to "Reload agent 或重开会话" after one would be advice for a
+  // problem they do not have — and the notice would sit at the bottom of a
+  // timeline that is already correct.
+  //
+  // This is the case that used to be uncovered: every rewind above is
+  // `conversation`, so the provider's `if (input.scope !== "files")` guard could be
+  // removed (or defeated with a `if (true)` beside it) with every check still
+  // green. The bridge answers a `files` rewind exactly like any other, so the only
+  // observable difference is the missing notice.
+  const beforeFilesRevert = events.length;
+  await conn.send({
+    type: "session.revert",
+    requestId: "revert-files",
+    sessionId,
+    token: { messageId: "m-3" },
+    scope: "files",
+  });
+  const filesRevert = await untilSince(
+    beforeFilesRevert,
+    (e) => e.requestId === "revert-files" && (e.type === "request.completed" || e.type === "request.failed"),
+    "files revert reply",
+  );
+  // Positive control for the case: a `files` rewind that *failed* would also
+  // produce no canary, so the absence below only means something if this one
+  // succeeded. (The fake bridge accepts any resolvable token, like the real one
+  // does for a files-scoped rewind.)
+  check(
+    "a files-scoped rewind is accepted (so the absence below is meaningful)",
+    filesRevert.type === "request.completed",
+    JSON.stringify(filesRevert.error ?? "completed"),
+  );
+  const filesCanaries = eventsSince(beforeFilesRevert).filter(
+    (e) => e.type === "session.notice" && e.notice?.title === "撤回已生效",
+  );
+  check(
+    "a files-only rewind leaves no canary (the conversation was not touched)",
+    filesCanaries.length === 0,
+    `${filesCanaries.length} canary notice(s): ${JSON.stringify(filesCanaries.map((e) => e.notice?.description ?? null))}`,
+  );
+
+  // ---- 5. a `both` rewind does get one, and its text names the files ------
+  //
+  // The other half of the same condition: `files: input.scope === "both"` picks the
+  // wording. A `both` rewind restored the working tree *and* rewound the
+  // conversation, so the notice must say so — the file half is exactly what the
+  // user cannot see from the timeline, and a canary that only mentioned the
+  // conversation would leave a restored tree unexplained.
+  const beforeBothRevert = events.length;
+  await conn.send({
+    type: "session.revert",
+    requestId: "revert-both",
+    sessionId,
+    token: { messageId: "m-4" },
+    scope: "both",
+  });
+  const bothRevert = await untilSince(
+    beforeBothRevert,
+    (e) => e.requestId === "revert-both" && (e.type === "request.completed" || e.type === "request.failed"),
+    "both revert reply",
+  );
+  check(
+    "a both-scoped rewind is accepted",
+    bothRevert.type === "request.completed",
+    JSON.stringify(bothRevert.error ?? "completed"),
+  );
+  const bothCanaries = eventsSince(beforeBothRevert).filter(
+    (e) => e.type === "session.notice" && e.notice?.title === "撤回已生效",
+  );
+  const bothCanaryDescription = String(bothCanaries[0]?.notice?.description ?? "");
+  check(
+    "a both-scoped rewind does leave a canary",
+    bothCanaries.length === 1,
+    `${bothCanaries.length} canary notice(s)`,
+  );
+  // The wording must name the file half. Not the sequence number: that is
+  // bookkeeping, and pinning it here would fail a harmless reorder (spending a
+  // number for a `files` rewind that emits nothing) while the user-visible text
+  // was still right. `#3` is only asserted through "differs from the previous
+  // one", which is what a later phase needs.
+  check(
+    "…whose text names the files it restored",
+    bothCanaryDescription.includes("文件") && bothCanaryDescription !== secondCanaryDescription,
+    JSON.stringify(bothCanaryDescription),
   );
 
   await conn.close();

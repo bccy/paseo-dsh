@@ -29,7 +29,7 @@ import {
   type DshRoute,
 } from "./dsh-process";
 import { DshChildSession, DshSession, modes, parseRoute } from "./session";
-import { ParkedSessions, RELEASE_TIMEOUT_MS } from "./parked-sessions";
+import { rewindCanaryNotice } from "./rewind-canary";
 import { effortLabel } from "./locale";
 
 const CAPABILITIES = [
@@ -107,11 +107,26 @@ const CATALOG_TTL_MS = 5 * 60 * 1000;
  *
  * Paseo closes a provider session and reopens it with the same persistence on a
  * refresh (and a daemon restart does the same); the grace period is what keeps
- * that from becoming a cold CLI boot (measured 1.5–2.7 s). It matches the pool's
- * session-lock release bound (`RELEASE_TIMEOUT_MS` in `parked-sessions.ts`) so
- * the two agree about when a child is genuinely idle.
+ * that from becoming a cold CLI boot (measured 1.5–2.7 s). It deliberately
+ * equals {@link RELEASE_TIMEOUT_MS}, the bound teardown waits for the child to
+ * exit: both answer "when is a child really gone", and two different numbers
+ * would let a reopen land while the old child still holds the log's write lock.
  */
 const POOL_RELEASE_GRACE_MS = 5_000;
+/**
+ * Upper bound on waiting for a retired child to release a session log.
+ *
+ * A DSH session log carries a kernel write lock (`SessionWriteLease` in
+ * `@deepseek-ai/dsh-session-persistence-jsonl`) that outlives SIGTERM until the
+ * OS reaps the process. A successor spawned before that fails to materialize the
+ * session with "already owned by an active write handle", so this is the bound
+ * teardown waits before letting the next open proceed.
+ *
+ * A timeout is reported rather than thrown: the open that follows surfaces the
+ * lock conflict itself if there is one, and failing the teardown over a slow
+ * reap would be a worse answer than a logged warning.
+ */
+const RELEASE_TIMEOUT_MS = 5_000;
 /**
  * The session id the shared child is constructed with.
  *
@@ -385,18 +400,40 @@ class DshConnection implements ProviderConnection {
   readonly #poolClaims = new Map<DshProcess, number>();
   #poolReleaseTimer: ReturnType<typeof setTimeout> | undefined;
   /**
-   * Idle DSH processes kept across a provider-session close. Paseo's refresh
-   * closes and immediately reopens the session; adopting the parked child turns
-   * that cold start into a replay, which is what makes the timeline update in
-   * about a second instead of three to four.
+   * This connection's rewind counter, used to keep canary notices distinct.
+   *
+   * Two rewinds in one session each leave a notice behind on a host that cannot
+   * truncate the rebuilt timeline, and a timestamp alone is not unique (two
+   * clicks can land in the same second), so the counter is what makes the text
+   * identifiable — see {@link rewindCanaryNotice}.
    */
-  readonly #parked = new ParkedSessions({
-    log: (line) => process.stderr.write(`[${PROVIDER_ID}] ${line}\n`),
-  });
+  #rewindSeq = 0;
 
   constructor(capabilities: readonly string[]) {
     this.capabilities = capabilities;
-    this.#parked.start();
+  }
+
+  /**
+   * Outstanding claims on the shared child, as a read-only total.
+   *
+   * The claim count is the provider's own accounting, and the only way to prove
+   * the pairing holds (one claim taken per open, returned per close) without
+   * reaching into the provider's private state from a test. A harness used to
+   * count `ParkedSessions.hold()` calls instead, but those were empty method
+   * shells whose only observable behaviour *was* the instrumentation — which
+   * proved the shell was called, not that a claim was balanced.
+   *
+   * Summed into a plain number, so a caller cannot mutate the accounting: there
+   * is no map to hand out and no reference back into this provider. The sum
+   * covers every child because a child can be retired and replaced while sessions
+   * still hold claims on the old one (see {@link #poolClaims}).
+   *
+   * @returns the total number of claims this connection currently holds.
+   */
+  get poolClaimCount(): number {
+    let total = 0;
+    for (const count of this.#poolClaims.values()) total += count;
+    return total;
   }
 
   onEvent(listener: (event: ProviderEvent) => void): () => void {
@@ -425,11 +462,10 @@ class DshConnection implements ProviderConnection {
     const sessions = [...this.#sessions.values()];
     this.#sessions.clear();
     this.#opening.clear();
-    // Provider teardown is not a reload: shut the sessions down and kill the
-    // parked children instead of keeping them alive for a reopen that will not
-    // happen on this connection.
+    // Provider teardown is not a reload: shut the sessions down and retire the
+    // shared child instead of keeping it alive for a reopen that will not happen
+    // on this connection.
     await Promise.allSettled(sessions.map((session) => session.close({ park: false })));
-    this.#parked.stop();
     // Teardown owns the shared child: no grace period, no reuse. The sessions
     // above released their references, but the process must not outlive the
     // connection that spawned it (a daemon reload would otherwise leave an
@@ -483,16 +519,18 @@ class DshConnection implements ProviderConnection {
    * request that names no session. **The environment is the exception**: it is
    * applied once at spawn and DSH exposes no channel to change it per session,
    * so a later session's `config.env` cannot be honoured. That divergence is
-   * not swallowed — {@link #warnEnvDiffers} reports every key that differs.
+   * not swallowed — {@link #warnEnvDiffers} reports every key that differs, and
+   * the keys are handed back so the open can also put them on the timeline.
    *
    * @param options - what to spawn with, when a spawn is needed.
-   * @returns the live shared child and whether it was already serving sessions.
+   * @returns the live shared child, whether it was already serving sessions, and
+   *   the env keys this session asked for that the child will not apply.
    */
   async #acquirePoolProcess(options: {
     cwd: string;
     route: DshRoute;
     env: Record<string, string>;
-  }): Promise<{ process: DshProcess; reused: boolean }> {
+  }): Promise<{ process: DshProcess; reused: boolean; envDiffering: string[] }> {
     // `send()` guards only at its entry; an open that is already past it when
     // the connection is torn down must not spawn a child nobody owns.
     if (this.#closed) throw new Error("the provider connection is closed");
@@ -504,8 +542,7 @@ class DshConnection implements ProviderConnection {
     if (existing !== undefined) {
       this.#addPoolClaim(existing);
       this.#cancelPoolRelease();
-      this.#warnEnvDiffers(options.env);
-      return { process: existing, reused: true };
+      return { process: existing, reused: true, envDiffering: this.#warnEnvDiffers(options.env) };
     }
     const inFlight = this.#poolSpawn;
     if (inFlight !== undefined) {
@@ -516,10 +553,9 @@ class DshConnection implements ProviderConnection {
       if (this.#closed) throw new Error("the provider connection is closed");
       this.#addPoolClaim(shared);
       this.#cancelPoolRelease();
-      this.#warnEnvDiffers(options.env);
       // Somebody else's spawn: by the time this returns the child has another
       // session attached to it (or is about to), so this caller is joining.
-      return { process: shared, reused: true };
+      return { process: shared, reused: true, envDiffering: this.#warnEnvDiffers(options.env) };
     }
     const spawnTask = (async (): Promise<DshProcess> => {
       // A placeholder id, not a real conversation: `DshProcess` attaches its
@@ -571,8 +607,9 @@ class DshConnection implements ProviderConnection {
       this.#pooled = started;
       this.#poolEnv = { ...options.env };
       this.#addPoolClaim(started);
-      // Freshly spawned by this very call: the caller is not joining anything.
-      return { process: started, reused: false };
+      // Freshly spawned by this very call: the caller is not joining anything, so
+      // its env is the one the child was born with and nothing can differ.
+      return { process: started, reused: false, envDiffering: [] };
     } finally {
       // Cleared on failure too, so a retry spawns again rather than awaiting a
       // rejection nobody kept.
@@ -591,32 +628,22 @@ class DshConnection implements ProviderConnection {
    */
   #addPoolClaim(process: DshProcess): void {
     this.#poolClaims.set(process, (this.#poolClaims.get(process) ?? 0) + 1);
-    // **One hold per claim, no exceptions.** The claim is the provider's own
-    // accounting; the hold is the matching pair `ParkedSessions` records for it.
-    // It is released in exactly two places — `#releasePoolProcess` for a returned
-    // claim and `#dropPoolClaims` when the child itself is gone — so the two
-    // counters can never drift apart.
-    this.#parked.hold();
   }
 
   /**
-   * Forget every claim on one child and release the matching holds.
+   * Forget every claim on one child.
    *
    * Used only where the child itself is going away (it exited on its own, or
    * `#shutdownPoolNow` is retiring it): the sessions that held those claims are
    * dead with it, and `DshProcess` has already reported that to each of them
    * (`#exitAll` / `onExit`). Their later `close()` returns early (the session is
    * already marked closed) and would never return the claim itself, so keeping
-   * the numbers would leave the hold count above zero forever. Each dropped claim
-   * releases exactly the one hold {@link #addPoolClaim} took.
+   * the numbers would leave the count above zero forever.
    *
    * @param process - the child whose claims become void.
    */
   #dropPoolClaims(process: DshProcess): void {
-    const held = this.#poolClaims.get(process) ?? 0;
-    if (held <= 0) return;
     this.#poolClaims.delete(process);
-    for (let index = 0; index < held; index += 1) this.#parked.release();
   }
 
   /**
@@ -626,24 +653,34 @@ class DshConnection implements ProviderConnection {
    * carries cwd/route/MCP servers and has no env channel (adding one is a
    * `dsh-process.ts` change, out of this file's scope). So when a session joins
    * a child spawned with a different environment, its values are silently inert
-   * unless this says so. `PASEO_AGENT_ID` is excluded because the daemon sets it
-   * per open by design — it is not addressed to DSH.
+   * unless this says so.
+   *
+   * Two keys are excluded because the daemon injects them **per agent**, not per
+   * DSH process: `PASEO_AGENT_ID` and `PASEO_AGENT_CWD` (`agent-manager.js`
+   * writes both into every open's env). They always differ between two agents,
+   * so counting them would make every second session of a connection look like a
+   * broken environment and bury the keys the user actually configured.
+   *
+   * The keys are reported, never the values: an env can hold a token, and the
+   * stderr line is the one thing a user pastes into an issue.
    *
    * @param env - the joining session's `config.env`.
+   * @returns the differing key names, in a stable order, or an empty array.
    */
-  #warnEnvDiffers(env: Record<string, string>): void {
+  #warnEnvDiffers(env: Record<string, string>): string[] {
     const spawned = this.#poolEnv;
-    if (spawned === undefined) return;
+    if (spawned === undefined) return [];
     const differing: string[] = [];
     for (const key of new Set([...Object.keys(spawned), ...Object.keys(env)])) {
-      if (key === "PASEO_AGENT_ID") continue;
+      if (key === "PASEO_AGENT_ID" || key === "PASEO_AGENT_CWD") continue;
       if (spawned[key] !== env[key]) differing.push(key);
     }
-    if (differing.length === 0) return;
+    if (differing.length === 0) return [];
     process.stderr.write(
       `[${PROVIDER_ID}] session env differs from the shared process's spawn env (${differing.join(", ")}): `
         + "the environment is process-wide, so the values the first session opened with stay in effect — these are NOT applied\n",
     );
+    return differing;
   }
 
   /**
@@ -658,8 +695,8 @@ class DshConnection implements ProviderConnection {
    *
    * The shutdown is **delayed** on purpose. Paseo's refresh closes the provider
    * session and reopens it a few milliseconds later; killing the child on the
-   * close would turn that into a cold CLI boot (1.5–2.7 s) and lose the parked
-   * fast path entirely. The delay is the same bound the pool uses for a session
+   * close would turn that into a cold CLI boot (1.5–2.7 s) and lose the reuse
+   * fast path entirely. The delay is the same bound teardown uses for a session
    * log's write lock, so a reopen inside the window reuses the child and one
    * outside it starts clean.
    *
@@ -668,10 +705,6 @@ class DshConnection implements ProviderConnection {
   #releasePoolProcess(process: DshProcess): void {
     const held = this.#poolClaims.get(process) ?? 0;
     if (held <= 0) return;
-    // The pair of the hold `#addPoolClaim` took; see the comment there for the
-    // full contract (exactly one release per returned claim, and none for a
-    // claim `#dropPoolClaims` already voided).
-    this.#parked.release();
     if (held === 1) this.#poolClaims.delete(process);
     else this.#poolClaims.set(process, held - 1);
     // A child that is no longer the pooled one has nothing left to schedule: its
@@ -783,9 +816,9 @@ class DshConnection implements ProviderConnection {
     // `shutdown()` returns after the frame reply and SIGTERM, but the session
     // logs' kernel write locks are released only once the OS reaps the child. A
     // spawn into that window fails every session-scoped request with "already
-    // owned by an active write handle" — the same bound `ParkedSessions.quiesce`
-    // exists for. A timeout is reported, not thrown: the open that follows will
-    // surface the lock conflict itself if there is one.
+    // owned by an active write handle" — which is why this waits, bounded, for the
+    // reap. A timeout is reported, not thrown: the open that follows will surface
+    // the lock conflict itself if there is one.
     const exited = await pooled.waitForExit(RELEASE_TIMEOUT_MS);
     if (!exited) {
       process.stderr.write(
@@ -857,17 +890,47 @@ class DshConnection implements ProviderConnection {
         // Concurrency is the bridge's job: it already refuses a second rewind on the
         // same session with "该会话已有撤回正在进行" (`dsh-bridge/lib/server.js` revertInflight).
         const result = (await session.revert(input.token, input.scope)) as DshRevertResult | undefined;
-        // Nothing to refresh any more: the daemon rebuilds the timeline from
-        // `PluginProviderSession.streamHistory()` right after this reply, and the
-        // LOCAL PATCH in `@getpaseo/server` truncates that buffer at the rewound
-        // row before the reply goes out. No reload, no closed provider session,
-        // no new session id.
+        // The rewind itself needs no refresh: the daemon rebuilds the timeline from
+        // `PluginProviderSession.streamHistory()` right after this reply. Whether the
+        // withdrawn rows actually disappear depends on the host, though, and the
+        // provider cannot tell which host it is talking to (it runs in its own
+        // process; there is no capability bit for "truncates history").
+        //
+        // So the canary goes out **before** the receipt, and the order is the whole
+        // mechanism:
+        //
+        // - A host that truncates (the local patch, or upstream once it does) cuts
+        //   the buffer at the rewound row inside the microtask that resolves the
+        //   receipt. Events share one ordered IPC channel, so a notice sent first is
+        //   already in that buffer and gets cut with the withdrawn rows — it flashes
+        //   past and is gone, which is correct: there is nothing to warn about.
+        // - A host that does not truncate keeps the withdrawn rows, so the notice
+        //   survives, sits at the bottom of the timeline, and tells the user the
+        //   screen is stale and how to refresh.
+        //
+        // Emitting it *after* the receipt inverts that: the truncation has already
+        // happened, so the notice survives on the patched host too — the exact false
+        // "your timeline is stale" warning this is meant to avoid (reproduced on the
+        // real host code, `harness/host-contract-sim.mjs`).
+        //
+        // A `files`-only rewind leaves the conversation alone, so there is nothing
+        // for the user to reload and no canary.
+        if (input.scope !== "files") {
+          this.#rewindSeq += 1;
+          const canary = rewindCanaryNotice({
+            at: new Date(),
+            seq: this.#rewindSeq,
+            files: input.scope === "both",
+          });
+          this.#notice(input.sessionId, "info", canary.title, canary.description);
+        }
         this.#emit({ type: "request.completed", requestId: input.requestId });
         const failedFiles = result?.files?.failed ?? [];
         if (failedFiles.length > 0) {
-          // The conversation rewind succeeded; only some files did not. A notice
-          // emitted now stays in this epoch (the timeline is no longer rebuilt
-          // from scratch), so the user learns about the file side immediately.
+          // The conversation rewind succeeded; only some files did not. Emitted after
+          // the receipt on purpose: this one has to survive on **every** host (it
+          // reports a real failure), so it must not be inside the window the patched
+          // host truncates.
           this.#notice(
             input.sessionId,
             "error",
@@ -964,9 +1027,15 @@ class DshConnection implements ProviderConnection {
    *
    * Notices are the only channel a provider has for telling the user about a
    * partial outcome (e.g. the conversation was rewound but one file restore
-   * failed). A notice is emitted into the **current** epoch: since the rewind
-   * became synchronous (the daemon truncates its own `history`, no reload), the
-   * timeline is never rebuilt from scratch, so nothing discards it.
+   * failed) or a divergence it cannot fix (a per-session env the shared process
+   * cannot apply).
+   *
+   * Whether a notice **survives** depends on where it is emitted, and the rewind
+   * branch depends on exactly that: a host that truncates its history buffer at
+   * the rewound row drops everything in it before the receipt resolves, which is
+   * what makes the rewind canary disappear on a refreshed timeline (see the
+   * `session.revert` branch). A notice emitted after the receipt is not inside
+   * that window and survives on every host.
    *
    * A notice for a session this connection no longer tracks has nowhere to go:
    * it is logged rather than queued, because there is no reopen to deliver it to
@@ -1028,8 +1097,9 @@ class DshConnection implements ProviderConnection {
     // one (that is what its refresh does), so a holder here is an anomaly;
     // leaving both alive makes both unusable, and this provider used to report the
     // new one ready with an empty `/` menu. Resolve it the same way: close the
-    // session that already holds this DSH session first — an idle child is parked
-    // and adopted by the open below, so nothing is killed unnecessarily.
+    // session that already holds this DSH session first — its claim on the shared
+    // child is returned and the open below re-takes one, so nothing is killed
+    // unnecessarily.
     // If that close fails the open fails loudly: guessing would leave an unknown
     // number of owners.
     const holder = this.#sessionHolding(dshSessionId, sessionId);
@@ -1067,19 +1137,6 @@ class DshConnection implements ProviderConnection {
     // never fail. Same translation function as the mount, so the two verdicts
     // cannot disagree.
     validateMcpServers(config.mcpServers);
-
-    // The shared child can be retired and respawned while a session is opening,
-    // and the old child's session-log write lock is released only when the OS
-    // reaps the process. Spawning the next process into that window makes every
-    // session-scoped request fail with "already owned by an active write handle".
-    // Wait (bounded) for the old owner before spawning; a timeout is logged and
-    // the open proceeds, which is no worse than the previous behavior. `routeKey`
-    // is only reported in that log line (the process-reuse key in session.ts):
-    // provider + model, never the effort.
-    await this.#parked.quiesce(dshSessionId, {
-      cwd: config.cwd,
-      routeKey: `${route.provider}/${route.model}`,
-    });
 
     // Paseo fills `config.systemPrompt` from the agent's own system prompt and the
     // daemon's `appendSystemPrompt` (`mapSessionConfig` in `@getpaseo/server`'s
@@ -1206,7 +1263,38 @@ class DshConnection implements ProviderConnection {
         // its reference count. A session never spawns, parks or shuts a process
         // down — with one child serving every conversation, any of those by a
         // single session would take the others with it.
-        acquireProcess: () => this.#acquirePoolProcess({ cwd: config.cwd, route, env: config.env ?? {} }),
+        acquireProcess: async () => {
+          const acquired = await this.#acquirePoolProcess({
+            cwd: config.cwd,
+            route,
+            env: config.env ?? {},
+          });
+          // The env keys this session asked for that the shared child cannot
+          // apply. Reported on stderr by `#warnEnvDiffers` and collected here for
+          // the timeline, because stderr is a channel the user never sees and
+          // "my FOO=bar was ignored" otherwise has no symptom at all.
+          if (acquired.envDiffering.length > 0) {
+            openWarnings.push({
+              severity: "warning",
+              title: "会话环境变量未生效",
+              // Key names only. An env value can be a token, and a timeline notice
+              // is both rendered in the UI and persisted in the client's store.
+              //
+              // The wording covers **both** directions of the difference, because
+              // `#warnEnvDiffers` scans the union of the two key sets: a key this
+              // session set that the child was not spawned with (its value is not
+              // in effect), and a key the child was spawned with that this session
+              // does not set (the first session's value is still in effect — the
+              // opposite surprise). Saying only "沿用首个会话打开时的值" describes
+              // the second case and is wrong for the first.
+              description:
+                `${acquired.envDiffering.join("、")} 与共享 DSH 进程启动时的环境不同；`
+                + "环境是进程级的，本会话请求的值没有生效——该进程仍按首个会话打开时的环境运行"
+                + "（本会话设置的键未生效，本会话未设置的键沿用首个会话的值）。",
+            });
+          }
+          return acquired;
+        },
         releaseProcess: (process) => {
           this.#releasePoolProcess(process);
         },
@@ -1433,9 +1521,9 @@ class DshConnection implements ProviderConnection {
     //   model request, which Paseo shows as "the turn ended with blocked".
     // - Therefore the owner carries the write, and **nothing is ever killed to
     //   make that true.** Under one-process-multi-session every session shares one
-    //   child, so the old `#parked.discard` here would have killed every other
-    //   open conversation along with it. The `discard` calls are gone; the tiers
-    //   below only ever *add* a carrier.
+    //   child, so the old "discard the parked process" step here would have killed
+    //   every other open conversation along with it. The discard calls are gone;
+    //   the tiers below only ever *add* a carrier.
     //
     // Tier 1 — the open session that holds this DSH session (the root itself, or
     // its native child, which has no process of its own).

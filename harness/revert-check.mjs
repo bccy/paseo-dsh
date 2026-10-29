@@ -255,6 +255,47 @@ console.log('a rewind no longer reloads the agent (native rewind via the daemon 
   );
 }
 
+console.log('the rewind canary is emitted before the receipt (order is the mechanism)');
+{
+  const provider = readFileSync(join(import.meta.dirname, '..', 'paseo-plugin/server/provider.ts'), 'utf8');
+  const caseStart = provider.indexOf('case "session.revert"');
+  const caseEnd = provider.indexOf('case "session.interrupt"', caseStart);
+  const body = caseStart === -1 ? '' : provider.slice(caseStart, caseEnd);
+  // The order is not style, it is the whole mechanism: a host that truncates its
+  // history buffer at the rewound row does so while resolving the receipt, and
+  // every event already in that buffer goes with it. So a canary sent *before* the
+  // receipt disappears on a host that refreshes the timeline (correct: nothing to
+  // warn about) and survives on one that does not (correct: the withdrawn rows are
+  // still on screen). Emitted after the receipt it survives on both, which is a
+  // false "your timeline is stale" warning on the patched host — reproduced on the
+  // real host code, both directions, by `harness/host-contract-sim.mjs`.
+  const canaryAt = body.search(/rewindCanaryNotice\(/);
+  const receiptAt = body.search(/type: "request\.completed"/);
+  check(
+    'the revert branch builds a canary notice',
+    canaryAt !== -1,
+    canaryAt === -1 ? 'no rewindCanaryNotice( call in the branch' : `at offset ${String(canaryAt)}`,
+  );
+  check(
+    '…and emits it before request.completed, never after',
+    canaryAt !== -1 && receiptAt !== -1 && canaryAt < receiptAt,
+    `canary at ${String(canaryAt)}, request.completed at ${String(receiptAt)}`,
+  );
+  // The canary is conversation-scoped on purpose: a `files`-only rewind leaves the
+  // timeline alone, so there is nothing to reload and a "reload to refresh" hint
+  // would be advice for a problem the user does not have.
+  check(
+    '…only for a rewind that touched the conversation',
+    /if \(input\.scope !== "files"\)/.test(body),
+  );
+  // And the wording lives in one place. A second copy of the text in `provider.ts`
+  // would drift from the module the harness asserts on.
+  check(
+    'the canary text comes from rewind-canary.ts, not a copy in the provider',
+    /from "\.\/rewind-canary"/.test(provider) && !/撤回已生效/.test(body),
+  );
+}
+
 console.log('no deferred-notice chain (the rewind no longer closes the provider session)');
 {
   const provider = readFileSync(join(import.meta.dirname, '..', 'paseo-plugin/server/provider.ts'), 'utf8');

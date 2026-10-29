@@ -22,15 +22,16 @@
  * A **cold** connection cannot reproduce it: with no `#sessions` entry there is
  * no `replaced` instance, so the only awaits before the claim are already-
  * resolved microtasks and the two opens never interleave. The window needs the
- * `replaced` block, which is exactly where the third await sits:
+ * `replaced` block, which is where the awaits before the claim sit:
  *
  *   1. open the session once and let it reach `session.ready` (`#sessions[id]`
  *      now holds a live instance, and `#opening` is empty again — the success
  *      path releases the claim before `session.ready`)
  *   2. issue **two** concurrent opens for that same provider session id; both
- *      pass the `#opening` check while it is empty, then both park on
- *      `ParkedSessions.quiesce` (an `await` on a resolved promise still yields a
- *      microtask, which is enough to order them)
+ *      pass the `#opening` check while it is empty, then both park on the first
+ *      await inside `#acquirePoolProcess` — `await this.#awaitPoolShutdown()`,
+ *      which resolves immediately but still yields a microtask, which is enough
+ *      to order them
  *   3. the first wakes, finds the `replaced` instance, deletes its `#sessions`
  *      entry, and parks on `await replaced.close({park:false})` — a cross-process
  *      `session/close` round trip, so it stays parked for whole macrotasks
@@ -39,6 +40,17 @@
  *   5. the first wakes again, claims `#opening` (a `Set.add` is idempotent),
  *      overwrites `#sessions`, and fails `attachSession`; its catch deletes the
  *      winner's entry and disposes the winner's agent
+ *
+ * **The yield points changed when the parked pool was deleted.** Step 2 used to
+ * name `ParkedSessions.quiesce` (`await this.#parked.quiesce(...)` in `#open`);
+ * that class and its `quiesce` are gone, so the first yield is now
+ * `#acquirePoolProcess`'s own `await this.#awaitPoolShutdown()`. The window is
+ * still real and still reproduced by this script — the two awaits that make it
+ * are `await replaced.close({ park: false })` (step 3) and `await session.open()`
+ * (inside step 4/5), both of which cross the child process. Measured when the
+ * pool was deleted: this check stayed 8/8, i.e. no assertion depended on
+ * `quiesce` being the yield, which is why deleting it did not need a harness
+ * change here.
  *
  * ## What is pinned (behaviour, read off the provider's own event stream)
  *
