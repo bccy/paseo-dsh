@@ -29,12 +29,21 @@
 ### 架构是三段，别搞混
 
 ```
-Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon 进程里）
-              ⇄  dsh-bridge/（stdio JSON-RPC，每个会话一个子进程）
+Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon fork 出的 plugin-process 子进程里）
+              ⇄  dsh-bridge/（stdio JSON-RPC，一个连接的所有会话共用一个子进程）
                  ⇄  DSH profile
 ```
 
 - **Paseo 源码不需要改，DSH 也不需要 fork。** 两边都走公开扩展点。
+- **插件不在 daemon 进程里**：宿主用 `fork()` 把它起成独立的 `plugin-process` 子进程，它只能
+  经 provider 连接与插件 API 和 daemon 交互（`paseo` 句柄只在 hook / RPC handler 的回调上下文
+  里拿得到，`connect()` 里没有）。所以**看不到 daemon 内存**，任何"宿主到底做了什么"的断言
+  只能在宿主自己的代码上做（见 `harness/host-contract-sim.mjs`）。
+- **唯一的例外是 `local-patches/`**：它改写**已安装的** `@getpaseo/server` dist，因为上游
+  没有对应的扩展点（撤回后截断宿主 history、重放时补 `turnId`）。它**不是发布产物**——`npm
+  publish` 出去的包里没有它，装不装都不影响插件本体；不装时各项行为如何降级见 README 与
+  [docs/REWIND.md](./docs/REWIND.md)。它是给维护者的可选加速项，macOS 桌面版自带签名 CLI
+  根本打不了补丁。
 - `paseo-plugin/server/*.ts` 是 Paseo 那一侧的契约实现；`dsh-bridge/lib/*.js` 是
   运行时的桥接。**中间那层协议是这个仓库自己定的**，改它要同时改两边。
 - 桥的 profile 是 `dsh-base` + `dsh-paseo-bridge`（见 `server/bootstrap.ts`）。`@deepseek-ai/dsh-web-app`
@@ -47,13 +56,16 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon 进程里）
 
 ### 改之前先读
 
-- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 六十余条真实缺陷（编号到 66，含 `b`/`c`
-  补记与 DSH 0.2.1 升版教训）。里面有整整一类错误叫
+- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 七十余条真实缺陷（编号到 71，含 `b`/`c`
+  补记与 DSH 升版教训）。里面有整整一类错误叫
   **静默降级**（把不知道的东西当成成功、把不支持的能力悄悄丢掉）。改动前先看一遍，
   避免重新发明这些 bug。
 - [docs/ADOPTION.md](./docs/ADOPTION.md) 第 4 节 — 教训按主题归纳。
 - [docs/FULL-AUDIT-20261020.md](./docs/FULL-AUDIT-20261020.md) — 2026-10-20 全量审查：
   8 个 P1 的成因与修法、有意偏差清单、未修项与待用户决定项。改动前先看有没有踩在同一处。
+- [docs/FULL-AUDIT-20261029.md](./docs/FULL-AUDIT-20261029.md) — 2026-10-29 全量审查：
+  6 路只读审查的逐条裁决（成立 / 改修法 / 驳回 / 暂缓）、对应修复提交、有意偏差与未做的
+  真机项。**这次的教训之一是审查流程本身**：主编排漏审一处删除，把 `setPermission` 弄丢了。
 
 ### 硬性约束
 
@@ -65,6 +77,7 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon 进程里）
 | **取消是取消回合，不是杀进程** | 杀进程会连会话一起报废 |
 | **不要硬编码某个人的 provider/model** | 这个仓库是给别人用的。路由从 profile 读，读不到就带说明失败 |
 | **能复用的代码或逻辑，不要自己写** | 上游已经有的实现（DSH 的 `session.append` 表面替换、compaction 折叠、`dsh-rewind` 的 git 快照；Paseo 适配器已经验证过的形状）比我们现编的可靠，也免得下次上游一改就跟不上。复用前先核目标版本的 API 与语义（版本范围满足≠可运行），复用时把边界写进注释；确实没有可复用的，再自己写并在 `docs/` 留痕。 |
+| **不要注册 `before("agent.session_open")`** | 宿主对带这个 hook 的插件，每次起停都会 `invalidatePluginSessions()`，于是**所有 agent（任何 provider）下一次提问前都会被 reload**。想拿 `paseo` 句柄就用 `on("agent.turn_started")` / `on("agent.turn_ended")` 或一条 RPC 在回调上下文里取 |
 | **改了 `dsh-bridge/` 必须重生成内嵌桥** | `paseo-plugin/server/bridge-assets.ts` 是桥的 base64 内嵌副本，供插件自举 profile（Paseo 安装插件不跑脚本）。跑 `node paseo-plugin/scripts/generate-bridge-assets.mjs`（`npm publish` 的 `prepack` 也会跑），并提交生成结果 |
 
 ### MCP 注入与 gateway
@@ -74,8 +87,8 @@ Paseo 把它的 MCP server 通过 `config.mcpServers` 交给 provider，插件�
 
 | 传输 | 谁走 | 挂载方式 |
 |---|---|---|
-| Streamable HTTP | Paseo 自己的 server（61 个工具约 33 KB） | gateway，三个元工具 `mcp_list_tools` / `mcp_tool_schema` / `mcp_call_tool` |
-| stdio，**在白名单里** | 当前只有 `server_browser`（Server Browser 插件的 bridge，25 个工具、20072 字节 schema） | 同上，gateway 起子进程说 stdio JSON-RPC |
+| Streamable HTTP | Paseo 自己的 server（工具数十个、schema 数十 KB） | gateway，三个元工具 `mcp_list_tools` / `mcp_tool_schema` / `mcp_call_tool` |
+| stdio，**在白名单里** | 当前只有 `server_browser`（Server Browser 插件的 bridge，工具二十余个、schema 约 20 KB） | 同上，gateway 起子进程说 stdio JSON-RPC |
 | stdio，不在白名单 | 用户自己配的 stdio MCP | 原生 `@deepseek-ai/dsh-mcp-client`，全量 schema |
 
 - **白名单是硬要求，不是优化**：`GATEWAY_STDIO_SERVERS`（`server/dsh-process.ts`）只放
@@ -218,11 +231,14 @@ token），并且加载插件会把内嵌桥重写进 `~/.dsh/profiles/<name>/no
   （200+error/HTML 判失败、4xx 回显 Authorization 不得泄 key、全 429 报 unknown、什么都没
   探测到必须非零）。**动了 probe 必跑。**
 - `harness/session-request-check.cjs` — 两段非回合请求：`paseo/sessions` 导入列表
-  （persistence handle/cwd/title/preview→description/updatedAt）与 `paseo/revert` 撤回回执
-  （成功 `request.completed`、被拒必须 `request.failed`、无「正在回退」/「时间线未自动刷新」
-  通知——撤回已是同步的 native rewind，没有 reload 窗口需要填）。假桥 + 一次性 `DSH_HOME`。
-  **动了 provider 的
-  `session.revert`/`sessions` 分支、`dsh-process.ts` 的这两个请求、或假桥对应分支必跑。**
+  （persistence handle/cwd/title/preview→description/updatedAt）与 `paseo/revert` 撤回回执。
+  撤回那一半钉住：成功发 `request.completed`、被拒必须 `request.failed`、**canary 恰好一条且
+  出现在回执之前**（顺序即机制，见「撤回」一节）、被拒之后没有 canary、连续两次撤回的文案不同
+  （序号递增）、`scope: "files"` 的撤回**不**发 canary（对话没被动过）、`scope: "both"` 的
+  文案要点出文件那一半；仍然没有「正在回退，请稍候」这类刷新窗口通知。假桥 + 一次性
+  `DSH_HOME`。**动了 provider 的
+  `session.revert`/`sessions` 分支、canary 的发出位置、`dsh-process.ts` 的这两个请求、或假桥
+  对应分支必跑。**
 - `harness/plugin-build.cjs` — **不是检查，是需要编译产物的 harness 共用的构建基础设施**
   （当前调用方见 `grep -l plugin-build harness/*`；`plugin-check.cjs` 仍走自己头部注释里的
   手工 `tsc` 步骤，不在其中）。
@@ -257,10 +273,14 @@ token），并且加载插件会把内嵌桥重写进 `~/.dsh/profiles/<name>/no
   **动了 `fake-dsh-bridge.mjs` 的 `multi` 场景或桥的会话绑定必跑。**
 - `harness/multi-session-check.mjs` — 两个 Paseo 会话共用**一个** `dsh` 子进程时在**插件层**
   不串台（桥的协议层由 `fake-bridge-multi-check.mjs` 覆盖，这里走插件自己的 `#sessions`、
-  子进程 id 与停放池，只有过一遍插件才能证明这一对是干净的）：两会话各自提问并各自拿到自己的
+  子进程 id 与引用计数，只有过一遍插件才能证明这一对是干净的）：两会话各自提问并各自拿到自己的
   答案、每个时间线只含自己的消息（任何事件类型下都看不到对方的文本）、各自一次 `session.turn`
-  起止、关掉一个另一个仍能提问并作答。假 `dsh` + 一次性 `DSH_HOME`，自己编译到私有目录。
-  **动了多会话路由、`#deliverLive`、或 `session.ts` 的会话归属逻辑必跑。**
+  起止、关掉一个另一个仍能提问并作答；另外还钉住**共享子进程的引用计数**（每开一个会话加一个
+  claim、关一个还一个，另一个仍在跑所以进程不被回收）与**孤儿帧的清理**（一个会话关闭时它的
+  帧桶与计时器一起消失，不会 5 s 后打一条误导的「no ancestor announced」，而另一个会话的桶
+  仍然照常上报——正对照，免得"清理过头"也通过）。假 `dsh` + 一次性 `DSH_HOME`，自己编译到私有
+  目录。**动了多会话路由、`#deliverLive`、`provider.ts` 的引用计数或 `session.ts` 的会话归属
+  逻辑必跑。**
 - `harness/concurrent-open-check.mjs` — 同一个 DSH 会话的两次并发 `session.open` 不能毁掉成功的
   那次：只有一次到达 `session.ready`；另一次**响亮失败**（`request.failed`，不是沉默）；失败方
   被 in-flight 守卫拒掉（"another open … is already in flight"），**不是** `attachSession` 的
@@ -281,6 +301,54 @@ token），并且加载插件会把内嵌桥重写进 `~/.dsh/profiles/<name>/no
   等于覆盖不到那个缺陷）。纯离线，只走 loopback；`@deepseek-ai/schemastery` 与 `dsh-tools` 按
   绝对路径从 DSH 安装目录加载（`DSH_PACKAGES_DIR` 可覆盖）。**动了 gateway 的
   `resolveTargetTool` 守卫或元工具注册必跑。**
+- `harness/transport-frame-check.mjs` — 桥的**入站**分帧器（`dsh-bridge/lib/transport.js` 的
+  `#onData`）：一个桥进程服务所有会话，所以这里一次 O(n²) 扫描会卡住全部会话（13 MiB 图片帧
+  曾阻塞事件循环 2.2 s）。20 MiB 帧跨数千个 16 KB chunk 逐字节还原、一个 chunk 里的多帧按序
+  到达、被 chunk 边界切断的帧重组、空行跳过、`\r\n` 保留 `\r`、尾部残行滞留、畸形行报错后
+  后续行仍到达，并用**旧实现当 oracle** 跑随机分块（相等，不是"差不多"）+ 耗时对照。纯模块：
+  `transport.js` 只 import `node:string_decoder`，所以直接 require 真实文件而不是抄一份。
+  **动了 `#onData` / `#dispatchLine` 或 `#partial` 的分帧机制必跑。**
+- `harness/bridge-server-check.mjs` — 桥 server 本体（`dsh-bridge/lib/server.js`）的只读路径，
+  用模块解析钩子把 `@deepseek-ai/*` 映到 DSH 安装目录后**驱动真实类**（假桥只能证明协议形状，
+  证明不了 server 自己的副作用）：`usage()` 不得复活已关闭的会话（`closedSessions` 闸门；
+  重新 initialize 过的与恢复会话的首次查询仍必须创建）、两处归档状态读取失败要**点名原因**
+  （服务缺失每进程一行、读取抛错每次一行，策略不变）、`paseo/permission/set` 必须真的到达一个
+  方法上（3047948 删了 `setPermission` 却留下 `case`，权限预设从此静默不生效），以及
+  **`handleRequest` 的每个 `case` 调用的方法都必须在原型上**——那正是该回归的形状，任何行为
+  断言都看不出来。**依赖本机 DSH 安装，所以不进 CI**（`DSH_PACKAGES_DIR` / `DSH_INSTALL_DIR`
+  可覆盖，解析失败 exit 2 并打印实际目录）。**动了 `server.js` 的请求分派或这些只读路径必跑。**
+- `harness/assistant-retry-check.cjs` — 同一 `turn/step` 内**重试**的助手文本：DSH 在已经流出
+  文本后失败重试，第二个 attempt 从空快照重新增长，而 Paseo 对"不是前缀的快照"的规则是整段
+  追加——旧行为把两次 attempt 的文本粘成一行，读起来像模型语无伦次。断言两次 attempt 拿到不同
+  item id（首个保持历史的 `assistant:1:1`，第二个 `assistant:1:1:2`）、durable `assistant/message`
+  落在**第二个** id 上（答案只出现一次）、逐字复刻宿主折叠规则后最终答案恰好一行、第一个 attempt
+  的行仍独立存在、reasoning 同样带后缀。假桥 `DSH_FAKE_MODE=retry` 驱动，下面全是真实插件。
+  **动了 `server/timeline.ts` 的 attempt 后缀或桥的 `paseo/assistant-delta` 载荷必跑。**
+- `harness/process-crash-check.mjs` — 大帧写向一个**已经死掉**的共享子进程：`stdin.write` 的
+  EPIPE 是异步 `'error'` 事件，`#send` 的 try/catch 看不到，没有监听就是 uncaught exception →
+  整个插件进程退出 → 该连接上**所有**会话一起断。断言：>256 KB 的帧打给死子进程时测试进程
+  没有 uncaughtException、请求**立刻**失败（远早于 120 s RPC 超时）而不是悬挂、失败可见（经
+  `onProtocolError` 或 reject，绝不静默丢），并带"子进程活着时同一路径正常"的正对照。
+  **动了 `dsh-process.ts` 的 `#start` / stdin 写入或 `#failAll` 必跑。**
+- `harness/child-crash-check.mjs` — 共享子进程在**子代理回合中途**死掉：`#exitAll` 只覆盖
+  attach 过的根会话，原生子代理不在那张表里（视图在 `DshSession.#children`），而
+  `DshChildSession` 原本没有任何失败通道——子代理行会永远脉冲"运行中"、它持有的提问卡永不
+  结算。断言：子会话确实在回合中（正对照）、子视图收到点名**子会话 id** 的
+  `session.runtime_failed`、根也收到自己的、**子先于根**（宿主把 `runtime_failed` 当该会话的
+  终态，后发的会被丢）、子会话不补编一个 `session.turn` 终态。崩溃由脚本自己 `SIGKILL` 假桥
+  记录的 pid 制造（不给假桥加场景）。**动了 `session.ts` 的子会话终态或 `dsh-process.ts` 的
+  进程退出扇出必跑。**
+- `harness/host-contract-sim.mjs` — 见「撤回」一节的 canary 说明：唯一直接断言**宿主**行为的
+  脚本（canary 在补丁版被截、原版存活；回执后发的在两种宿主上都存活）。只 import 宿主文件，
+  从不修改。**动了 canary 的文案/顺序或 `rewind-canary.ts` 必跑。**
+- `harness/fake-dsh-bridge.mjs` 的**默认行为变严**：`session/prompt` 现在按会话校验
+  `initialize`（文案与真桥一致），漏发 `initialize` 的插件 bug 不再在假桥上一路全绿——`f084c33`
+  那个「每个会话都能打开、第一次提问必失败」的缺陷当初就是这么漏过去的。**严格是诚实默认**；
+  只有刻意测 `initialize` **之下**协议层的脚本（目前仅 `fake-bridge-multi-check.mjs`）显式
+  `DSH_FAKE_ALLOW_UNINITIALIZED=1` opt-out，并在自己的调用点写明理由。另有 `mcp-late` 场景：
+  `paseo/mcp/set` 像真桥那样**抛错**（不是回 `mounted: false`），钉住插件把"会话已建好之后
+  再设 MCP"失败成 `request.failed` 而不是静默成功。长驻子进程的场景切换用
+  `DSH_FAKE_MODE_FILE`（spawn 时的环境已冻结，改 `DSH_FAKE_MODE` 对已在跑的 child 不可见）。
 - `harness/source-shape.cjs` — **不是独立检查**，是几个必须读 `.tsx` 源码的检查共用的
   **TSX 结构读取器**：解析 JSX 开标签及其属性，让"这个元素自己测布局""图标按状态与可编辑性
   取色"这类只存在于 JSX 里的接线也能断言。它取代的是按格式匹配的正则——换行、属性顺序、单行
@@ -295,14 +363,16 @@ token），并且加载插件会把内嵌桥重写进 `~/.dsh/profiles/<name>/no
 "mock 通过、真实 append 必挂"）。改到撤回或 `dsh-bridge/` 时按顺序跑：
 
 ```bash
-node harness/revert-check.mjs          # 令牌/区间/前置/回执/文件层/停放接线
+node harness/revert-check.mjs          # 令牌/区间/前置/回执/文件层/canary 顺序/共享进程接线
 node harness/surface-check.mjs         # 只折撤回缝、compaction 保留、尾随日志事件
 node harness/file-snapshot-check.mjs   # 编辑工具级写前备份（真实临时目录）
 node harness/rewind-merge-check.mjs    # 父子归并：子/孙编辑落根会话 journal、断链 fail-open
 node harness/revert-shape-probe.mjs    # 纯内存离线（用本机已装 @deepseek-ai/dsh-session，DSH_SESSION_MODULE 可覆盖路径）：旧写法必抛、新写法通过
 node harness/replay-fidelity-probe.mjs <session.v4.jsonl.zstd>  # 真实日志重放保真
+node harness/host-contract-sim.mjs     # 宿主契约：canary 在补丁版被截掉、原版存活（见下）
 node harness/rewind-e2e.mjs            # 真 dsh --profile paseo，3 回合端到端（耗 token）
 node harness/rewind-merge-e2e.mjs      # 真机父子归并：父写+子代理写 → both 撤回 → 两文件都删（耗 token）
+node harness/rewind-native-check.mjs   # 经真实 daemon 的撤回（耗 token；见下）
 ```
 
 **三条不能破的约束**（都是真机踩出来的）：
@@ -311,6 +381,26 @@ node harness/rewind-merge-e2e.mjs      # 真机父子归并：父写+子代理�
    `system/developer/assistant` 消息处于打开的 turn/step 内，空闲时追加会让整份日志被判 corrupt。
 2. append 之后必须 `await sessions.flush(session)`：宿主回执后立刻读日志重建时间线。
 3. 重放折叠只折本桥撤回缝；compaction 的 replace 不折，否则重开会话丢压缩前对话。
+
+**第四条：撤回提示（canary）必须在 `request.completed` 之前发出。** 宿主的时间线只能追加、
+协议里没有"删行"事件，所以插件用一条通知自证这次撤回到底刷没刷新：打过截断补丁（或将来上游
+修好）的宿主会在回执里把 history 截到撤回点，那条通知随被撤行一起消失；原版宿主会留下它，
+告诉用户执行 Reload agent 或重开会话。**顺序就是机制本身**——放到回执之后，补丁宿主上它也会
+留下来，变成「时间线没刷新」的误报。文件作用域（`scope: "files"`）的撤回不动对话，不发。
+
+**`harness/host-contract-sim.mjs`** 是这条规则的唯一直接证据：它直接 import 宿主真实的
+`plugin-provider.js`（只读），驱动一次撤回，再断言 canary 在**补丁版被截掉、原版存活**；
+判据取自宿主文件里有没有 `truncateHistoryFrom`，所以宿主改了行为却没改文件时也会红。
+用法 `node harness/host-contract-sim.mjs [host-agent-dir] [compiled-plugin-dir]`，宿主目录默认
+从已装 CLI 推（`PASEO_CLI_ROOT` 可覆盖）。**要跑原版那一半，解包出来的 `package/dist` 必须
+再套一层带 `node_modules` 软链的包装目录**，否则 `zod` 之类的 bare specifier 解析不到；做法写在
+该文件头部注释里。**动了 canary 文案、发出顺序或 `rewind-canary.ts` 必跑。**
+
+**`harness/rewind-native-check.mjs`** 走的是 `agent-manager.rewind()`，所以**它需要打过
+`rewind` 补丁、并且正在运行的 daemon**——清单里前面那些离线脚本走的是桥的 `paseo/revert`，
+**根本到不了宿主的 `revert()`**，只有这条路径能覆盖宿主侧那一半。**耗 token**：创建 agent、
+两个回合、撤回、再问一次。改撤回的宿主侧行为后跑它，跑完人工核对
+「被撤消息消失、无 loading、session id 不变、模型看不到被撤内容」。
 
 真机验收要用**新会话**（能力位只对新会话生效）：发两条消息 → 撤回第二条 → 消息消失、
 无 `/rewind` 行/回合页脚、编辑工具改的文件恢复、模型不知道被撤内容、重开会话仍正确。

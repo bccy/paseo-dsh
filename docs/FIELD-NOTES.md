@@ -504,7 +504,8 @@ HTTP bridge；此时 Paseo 用 `resolveProviderLaunchConfig → stripInternalPas
 - patch 文件含 MCP auth token，写进 `mkdtempSync` 的 0700 目录、文件 0600，进程
   `exit` / `error` / `kill` 时整目录删除。
 
-**判定标准**：`harness/mcp-injection-check.cjs`（8 项）用脚本化假 `dsh` 断言：`http` server 变成
+**判定标准**：`harness/mcp-injection-check.cjs`（当时 8 项，后来随审查不断加用例——**不写死
+数量，跑一次看它自己报的数**）用脚本化假 `dsh` 断言：`http` server 变成
 `--patch` 且映射为 `streamable-http`（url/headers 原样）、`failOnStartupError` 为真、`stdio`
 server 保留 command/args/env、无 `mcpServers` 时**不**加 `--patch`、`sse` 回 `request.failed`
 并点名 server 且不 spawn 进程、patch 文件随进程一起消失。假桥新增 `DSH_FAKE_ARGV`（记录自身
@@ -1201,8 +1202,8 @@ cannot unarchive 6d0a20ce-...: no DSH session is open   # 取消归档：我们�
 `archive -> {available:true}`，此时导入列表不含该会话；`unarchive -> {available:true}`，列表
 恢复。从无关 cwd（`/tmp`）起进程同样成立。`harness/subagent-check.cjs` **48/48**（新增 6 条：
 句柄可寻址、有会话时归档/取消归档都有回执、无会话时经 probe 仍能往返、未知 id 必须响亮失败）；
-`mcp-injection-check` 8/8、`steer-check` 17/17、`assistant-stream-check` 7/7；`tsc --noEmit`
-干净；内嵌桥已重生成。
+`mcp-injection-check`（当时 8/8，现在用例更多）、`steer-check`（当时 17/17）、
+`assistant-stream-check` 7/7；`tsc --noEmit` 干净；内嵌桥已重生成。
 
 #### 39b. 同一个症状的第三个洞：桥只在 `initialize` 上等 profile 装载
 
@@ -1645,8 +1646,11 @@ Paseo 的按钮是**按 agent 能力位**显示的，不按行过滤：两次发
 `harness/revert-shape-probe.mjs`（真实 DSH Session）、
 `harness/replay-fidelity-probe.mjs <log>`（真实日志）、
 `harness/rewind-e2e.mjs`（真 profile 3 回合端到端：回执/文件/history 折叠/无 command 行/
-暗号测试）、`harness/parked-sessions-check.cjs`（编译后的插件，**已删**——停放池已随
-reload 旁路移除，共享子进程的 hold/release 改由 `multi-session-check.mjs` 计数断言）。
+暗号测试）。**停放池这条路后来被整条删掉**：reload 旁路移除后 `hold`/`release` 只是空壳，
+`harness/parked-sessions-check.cjs` 先删，`paseo-plugin/server/parked-sessions.ts` 本体随后也删
+（提交 bf093a7，`RELEASE_TIMEOUT_MS` 移入 `provider.ts`）；共享子进程的引用计数改由
+`multi-session-check.mjs` 的 `poolClaimCount` 断言覆盖。下面第 51 条与第 65 条里的停放细节是
+**历史记录**，代码里已不存在。
 真机验收要用**新会话**（能力位只对新会话生效）。
 
 ---
@@ -2175,7 +2179,8 @@ guard exists`（105 passed, 1 failed）；把条件改成无条件 skip → 同�
 unarchive 有回执、**停放进程绝不承载这次写入**、**陈旧停放进程确实被作废**（直接抓插件自己的
 `parked:discard <id>` 日志行，避免负向断言空过）、**重开冷启动而不是收养那个陈旧进程**）；
 `harness/parked-sessions-check.cjs` **32/32**（discard 语义 + discard 后 quiesce 会等，
-**该脚本已删**：discard 与整个停放池随 reload 旁路移除，见本条开头的历史记录）；
+**该脚本已删**：discard 与整个停放池随 reload 旁路移除，见本条开头的历史记录；`ParkedSessions`
+类本身后来也在 bf093a7 删除，本条描述的是当时的状态）；
 `harness/steer-check.cjs` **25/25**、`harness/bridge-assets-check.mjs` **2/2**、`tsc --noEmit` 干净。
 假桥的 `DSH_FAKE_LOG` 每行现在带 `pid`（区分"哪个进程服务的请求"是这条回归的关键）。
 **变异验证**：把 `discard` 换成空函数 → **76/78**，红的正是上面第 4、5 条（`(no parked: line)`、
@@ -2400,6 +2405,200 @@ pi 有 2 MB 硬预算、opencode v2 用签名比对去重。
   折掉会让客户端看不到过程。判断能否折叠要先读宿主的 identity 规则。
 - **判据「指标相等」必须能证伪**：行数相等 ≠ 内容未变 ≠ descriptor 未变。
   任何「跳过重建」类优化，判据必须与「不跳过」的末态逐行等价，否则会静默保留旧内容。
+
+## 第十七轮：全量审查之后——无补丁替代、锚点匹配的假象、以及共享进程的失败面
+
+**背景**：2026-10-29 又做了一轮全量审查（6 路只读：插件多会话 / 桥 / 会话层 / MCP / 宿主补丁 /
+harness），逐条裁决后开了 8 个修复包 + 1 个补救包 + 2 个文档包，落地为 12 个提交。
+逐条裁决、修法改动、有意偏差与未做的真机项见 [FULL-AUDIT-20261029.md](./FULL-AUDIT-20261029.md)。
+下面只记这一轮里**值得留下来当判据**的五类。
+
+### 67. 不装宿主补丁能走多远：一条能自证、一条等上游、一条不可解
+
+**背景**：撤回（rewind）的界面刷新一直依赖 `local-patches/` 改写已安装的 `@getpaseo/server`。
+补丁能用，但它是**维护者的本机加速项**：`npm i -g` 会整树覆盖 dist、macOS 桌面版自带签名 CLI
+根本改不了、而且新装的人拿不到。于是先问了一个更基本的问题：**不打补丁能不能达到同样效果。**
+
+**先确定一件事：插件检测不了宿主打没打补丁。** 插件不在 daemon 进程里（宿主用 `fork()` 把它起成
+独立的 `plugin-process`），看不到宿主内存；读磁盘文件判"改没改过"也不可靠（文件 ≠ 已加载代码，
+升级、回滚、多份安装都能让它说谎）。所以三条能力只能按「插件侧有没有等价路径」分别判：
+
+| 能力 | 插件侧等价路径 | 结论 |
+|---|---|---|
+| 撤回后时间线刷新 | 协议里**没有删行事件**（`timeline-identity.js` 只给 `tool_call` / `plugin` 身份；宿主 `forceHydrate` 只读只增的 history 数组）；唯一办法是重开 provider 会话，代价是换 session id、一次 loading、取消运行中的子代理 | **半可行**：canary 自证 + 用户手动 Reload |
+| 子代理二次派发显示「运行中」 | 插件侧重宣告（`session.closed` + 同形 `session.opened`）在原版宿主上有效、在已修宿主上无害 | **可行，但上游已修**（#8080 合入 main、未发版）→ 补丁退役 |
+| 重开会话后的回合折叠（`turnId`） | 宿主**有意**不给历史行 turnId（`agent-manager.js` 注释：provider history deliberately keeps absent IDs because it has no daemon turn identity；重放的两处 `recordTimeline` 都不传）。把历史当实时重放会打出自主回合、running/attention 等副作用 | **不可解**：等上游 #8053 / PR #8054 |
+
+**canary：把「刷新没刷新」变成用户能看见的事实。** 撤回成功后、**回执之前**发一条通知。
+打过截断补丁（或将来上游修好）的宿主会在回执里把 history 截到撤回点，那条通知随被撤行一起
+消失；原版宿主会留下它，告诉用户执行 Reload agent 或重开会话。在宿主**真代码**上复现过：
+
+| 宿主 | canary 在回执**前** | canary 在回执**后** |
+|---|---|---|
+| 原版 | 存活（正确：提示用户） | 存活（同样正确） |
+| 补丁版 | 被截掉（正确：一闪而过） | **存活 → 误报「时间线没刷新」** |
+
+**顺序就是机制本身**，不是风格问题。这也是为什么 `harness/host-contract-sim.mjs` 存在：它直接
+import 宿主真实的 `plugin-provider.js`（只读）、驱动一次撤回、按宿主文件里有没有
+`truncateHistoryFrom` 翻转断言。只有宿主代码能裁决这件事，假桥和插件层都做不到。
+
+**一个必须记住的陷阱：不要注册 `before("agent.session_open")`。** 它看起来是"拿 `paseo` 句柄"
+最方便的地方，但宿主对带这个 hook 的插件**每次起停**都会 `invalidatePluginSessions()`，于是
+**所有 agent（任何 provider）下一次提问前都会被 reload**。想拿句柄就用 `on("agent.turn_started")`
+/ `on("agent.turn_ended")`，或一条 RPC 在回调上下文里取。
+
+**教训**：能不能不打补丁，取决于**插件侧有没有一条与宿主等价的行为路径**，而不是"能不能检测到
+补丁"。检测这条路本身就不成立（进程隔离 + 文件≠代码）。剩下的三种结局要分开写清楚：能自证的就
+用一条用户可见的证据替代检测；能等上游的就退役自己的补丁并接受降级；确实不可解的（宿主有意不
+给的数据）要**明写不可解**，别用一个看起来在工作、实际靠猜的实现去填。
+
+### 68. 锚点匹配 ≠ 运行时生效：上游改数据结构时，注入型补丁会静默失效
+
+**症状**：无。补丁脚本 `apply` exit 0、`--check` 报 "patched (2/2 markers), body current"，
+补丁文件里的代码确实在——**撤回后时间线就是不刷新**，也没有任何报错。
+
+**根因**：上游 main 的一个提交（#7675，当时不在已发布版本里）把 `PluginAgentSession.history`
+从**数组**换成了 `PluginSessionHistory` 类（没有 `length`、不能用下标）。而补丁的两个文本锚点
+`publish(){…history.push…; emit…}` 与 `revert()` 尾部**一字未变**——于是锚点照样匹配、注入照样
+成功。注入的 `truncateHistoryFrom` 里 `this.history.length - 1` 是 `NaN`，循环一次都不进，函数
+返回 `false`，只打一行 stderr。上游自愈检测也认不出（`revert()` 体里没有 history 赋值）。
+
+**修法**（`local-patches/apply-rewind-history-truncation.mjs`）：
+
+1. **前置形状断言**：`HOST_FIELD_SHAPES` 检查补丁要改的每个宿主私有字段的真实形状
+   （`this.history = []` + `this.history.push(`、`this.timelineSnapshots = new Map()` + 它作为
+   Map 被传给 `mapTimelineItem`、`this.revertTokens = new Map()` + `.get(`），跑在锚点校验**之前**，
+   缺一个就 `host-fields-changed` 退出、不写文件。
+2. **#7675 守卫**：命中 `new PluginSessionHistory(` 或 `this.history.read(` 就
+   `upstream-history-shape-changed`、exit 1、不写文件、状态文件写明原因。检查放在读完源码之后、
+   幂等分支**之前**，所以"没打过补丁"和"已经打过补丁"两条路径都覆盖。
+3. **状态文件要写得出原因**：`carry()` 的 extra 白名单原来只有备份/md5 几个键，新加的原因字段
+   到不了状态文件（第一次测时 `hostField=None`），补进白名单。
+
+**验证**：把夹具里 `this.history = [];` 改成 `new PluginSessionHistory();` → `apply` exit 1、
+副本 md5 不变、状态文件 `reason=upstream-history-shape-changed`；原版夹具照常打上（对照组）。
+把 `timelineSnapshots` 全部改名 → `host-fields-changed` 且点名缺的那个形状。**两条守卫各做一次
+隔离变异**：夹具用 `new PluginSessionHistory()` 但保留 `this.history.push(` 形状，只有 #7675 守卫
+能拦——删掉守卫的变异版 `apply` exit 0、markers=2，证明守卫确实在拦而不是靠别的断言顺带通过。
+
+> 顺带踩到一个反向的坑：第一版私有字段判据用了 `this.timelineSnapshots.clear()` /
+> `this.revertTokens.delete(`，而这两个调用**在干净上游里根本不存在**（它们正是补丁注入的方法
+> 才会调），于是原版夹具也被判 `host-fields-changed`、一个补丁都打不上。**判据要取宿主本来就有的
+> 形状，不能取补丁自己引入的调用。**
+
+**教训**：**文本锚点只能证明"那几行还在"，证明不了它们操作的数据结构还是同一个。** 任何"往别人
+文件里注入代码"的机制，锚点之外都必须再断言**被注入代码依赖的宿主形状**（字段类型、方法签名、
+构造函数），而且这个断言要 fail closed（不写文件、非零退出、写明原因），不能"打上了再喊一声"。
+这类失效最坏的地方是它看起来全绿：`--check` 说在位、代码确实在文件里，只有运行时行为是空的——
+而 canary 这类行为自证恰好能把它暴露出来，这也是为什么第 67 条和本条是同一件事的两面。
+
+### 69. 挪注释时误删了一个方法：被截断的 diff 放过去的静默回归
+
+**症状**：打开会话时 Paseo 选的权限预设**永远不生效**，会话按 profile 默认权限跑。不静默
+（provider 会把失败变成一条「权限预设未应用」warning），但会话按 profile 默认权限运行，**可能比用户选的预设更宽**——安全相关。
+桥侧报 `TypeError: this.setPermission is not a function`。
+
+**根因**：一个提交在把 `usage()` 的 JSDoc 挪到正确位置时，把紧邻的 `async setPermission(params)`
+**连同它的 JSDoc 一起删掉了**（两段注释相邻，移动时多选了 24 行）。`handleRequest` 里的
+`case 'paseo/permission/set': return this.setPermission(params);` 还在，于是调用点完好、被调用的
+方法不存在。
+
+**为什么会漏**：审核时 diff 被截断——那一大块在 diff 里是连续的 `-` 行，跳读时看到的印象是
+"注释挪了个位置"，没有逐行看删除内容。同轮的独立审查也没报这条：它审的是**新增/修改**的逻辑，
+"删除"在它的视野之外。
+
+**修法**：
+
+1. 从被删提交的父提交**逐字恢复**（`git diff -U0 | grep '^-' | grep -v '^---'` = 0 行删除），
+   插在 `usage()` 自己的 JSDoc 之前，两段注释不再相邻。
+2. `harness/bridge-server-check.mjs` 加一节，把这条回归的形状钉住：原型上有 `setPermission`、
+   经 `handleRequest` 发 `paseo/permission/set` 真的调用到 service 并返回 `{current}`、以及
+   **扫 `handleRequest` 里每个 `case '…': return this.X(`，X 必须在原型上**。
+
+**验证**：`bridge-server-check` 在出问题的那个提交的 `server.js` 上 **20/25（5 红）**，修复后
+**25/25**；`revert-check` 从 114/1 变 115/0——那条红本来就是它（一条"桥必须提供非 command 的
+权限写入"的正则），当时被当成"既有回归"记进报告、没修。三条定向变异各自精确红：删方法（5 红）、
+有方法但不调 `service.set`（2 红）、扫描正则失效（2 红，哨兵断言保证不会因为正则坏了而恒绿）。
+
+**教训**：**删除比新增更容易被放过。** diff 审核要按"删除块"再走一遍，尤其是那些看起来"只是挪
+注释/挪位置"的提交——移动 = 删除 + 新增，漏看删除就漏掉了全部风险。第二条教训更硬：这类回归
+**任何行为断言都抓不到**（除了那条 dispatch 之外没有任何代码路径会走到它），只有"分派完整性"
+这种结构性断言能抓。所以新增 dispatch 分支时，值得同时加一条"每个 case 的方法都在原型上"的
+遍历断言——它便宜、不依赖具体业务、而且正好覆盖这个形状。
+
+### 70. 一进程多会话把单会话故障放大成全体故障
+
+**症状**：三类，症状各不相同，根因是同一个：改成一进程多会话之后，任何**进程级**资源出问题都不再
+只影响一个会话。
+
+1. **大帧写向已死的子进程 → 插件进程退出 → 该连接所有会话一起断。** `stdin.write` 的 EPIPE 是
+   **异步** `'error'` 事件，`write()` 早就返回了，`#send` 的 try/catch 看不到；一个没有监听器的
+   stream `'error'` 就是 uncaught exception，Node 的默认动作是结束进程。触发条件是"子进程恰好死在
+   还有字节排在管道里的时候"，而图片 base64 直接把帧撑到几百 KB～几十 MB。
+2. **桥入站分帧是 O(n²) → 一个 13 MiB 图片帧卡住所有会话。** `transport.js` 的 `#onData` 对每个
+   stdin chunk 重新 `split("\n")` 整个累积缓冲，一个跨几千个 chunk 的帧就扫了自己的长度几千次；
+   实测事件循环被阻塞 2.2 s，期间所有会话的事件与 stdin 读取都停着。
+3. **`usage()` 会复活已关闭的会话。** 它由定时器和回合事件触发，不是用户操作，所以请求可能在
+   `session/close` 之后才落地；旧代码的 `getOrCreateSession` 于是 `resume` 了一个刚被 dispose 的
+   agent——重新持有会话日志的写租约、保留模型选择监听器直到进程结束。
+
+   同类的第四个洞：共享子进程退出时，`#exitAll` 只覆盖**attach 过**的根会话；原生子代理不在那张
+   表里（视图在 `DshSession.#children`），`DshChildSession` 又没有任何失败通道——子代理行会永远
+   脉冲「运行中」，它持有的提问卡永不结算。
+
+**修法**：`#start()` 里给 `child.stdin` 加 `'error'` 监听 → `onProtocolError` + `#failAll`（刻意
+不调 `markExited`：子进程可能还活着，exit 事件才该记账）；`#onData` 照搬插件 `frame-reader.ts` 的
+两条机制（只扫新增区间、残行用数组累积），**行为逐字保持**；`usage()` 加 `closedSessions` 闸门
+（返回 `{available:false}` 且不创建，但保留"恢复会话首次查询仍会创建"这个原有意图）；子会话加
+`fail(message)`，`onExit` 里**先子后根**发 `session.runtime_failed`（宿主把它当该会话终态，后发的
+会被丢）。
+
+**验证**：`process-crash-check`（>256 KB 帧打给死子进程 → 无 uncaughtException、请求 14 ms 内
+reject，带"子进程活着时同一路径正常"的正对照）、`transport-frame-check`（20 MiB 帧 5311 ms →
+22 ms，并用**旧实现当 oracle** 跑 200 轮随机分块要求逐字节等价）、`bridge-server-check`
+（`usage()` 对已关会话不创建、对重新 initialize 过的仍创建）、`child-crash-check`（子先于根、
+子会话不补编 turn 终态）。
+
+**教训**：**共享进程的失败面是乘出来的，不是加出来的。** 改成一进程多会话之后，每一个"每进程
+一次"的资源（监听器、写租约、缓冲、计时器、缓存）都要重新问一遍："这里失败，会不会把别人带走？"
+两条可直接照抄的判据：**写往共享资源的每一次异步失败都必须有监听器**（同步 try/catch 覆盖不到
+异步 `'error'`）；**任何"按帧大小线性以上"的扫描都必须有上限、且增量处理**——否则一条大消息就
+是一次全服务停顿。
+
+### 71. MCP 的两处「失败当成功」
+
+MCP 这层最危险的失效形态不是报错，是**把一个失败包装成成功返回**——调用方拿到空结果，会当成
+"那边就是没有东西"。
+
+1. **server→client 请求按 id 撞上在途请求。** MCP 允许 server 主动发请求（`ping`、`roots/list`），
+   它们**带 id**。旧实现按 id 匹配响应，于是 server 发来的请求被当成我方某个在途请求的响应：
+   `tools/call` 报"成功但内容为空"、`tools/list` 把空目录**缓存**下来不再重试；不撞则永远不回复，
+   对端一直等。修法：HTTP 的 `pickResult` 与 stdio 的 `#onLine` **只接受 `method === undefined`
+   的帧当响应**；stdio 对带 id 的 server 请求回 `-32601`（写失败只记 stderr，不让一次礼貌回复把
+   桥带崩）；gateway 对 `tools/call` 的 `undefined` result 抛错而不是返回空内容。HTTP 是
+   一个 POST 一条消息、没有 server→client 通道，所以那边只能记一行 stderr——**这一点写进了
+   `pickResult` 的 JSDoc，免得后来人以为是漏做**。
+2. **浏览器探测用 `{}` 调 `browser_tabs` 等于申请写锁。** 共享浏览器桥的读写判定是
+   `write = !readonlyTools.has(name) && !(name === 'browser_tabs' && args.action === 'list')`，
+   所以 `{}` 被当成**写操作**：每次 `mcp_list_tools` 都向共享浏览器申请一次写租约（使面板视图
+   失效、可能 409），而且因为缺 `action` 必然失败——于是"宿主不可用"的探测结果恒为空，**死探测**。
+   修法：探测表从字符串数组改成 `{name, args}`，`browser_tabs` 用 `{action:'list'}`；同时
+   `browserHostGapOf` 增加 `isError === true` → 不可用，原因取第一个 text 块（桥回的是中文
+   `notRunning`，按英文关键字匹配认不出来），并保留"探测成功 → unavailable 为空"的对照。
+
+**验证**：`mcp-http-check` / `mcp-stdio-check` 各有"id 撞车不当答案"与"每个 server 请求都被回复"
+两条；`mcp-gateway-guard-check` 加 `no_result` 用例（undefined result 是失败不是空成功）；
+探测那两条用"探测帧必须带 `{action:'list'}`"与"isError 中文拒绝被识别"钉住，配一条
+`probeSucceeds → unavailable === []` 的反向对照（防止"无条件全标不可用"也能通过）。全部做了
+单点变异验证，逐个确认能精确红。
+
+**教训**：**"只读探测"要在对端确认只读，不能凭"我只传了空参数"假设。** 凡是拿 `{}` 当"最小
+参数"的地方，都该先读一遍对端怎么判读写——一个空对象在有的实现里是"什么也不做"，在有的实现里
+是"默认动作"，而"默认"经常是写。另一条：**按 id 匹配异步响应的实现必须先判"这帧是不是响应"**。
+协议允许双向请求时，不判方向的匹配会把响应语义偷走，而它偷走之后的症状是"成功但没有内容"——
+比抛错难查一个数量级。
+
+---
 
 ## 关于"哪条路由能用"
 
