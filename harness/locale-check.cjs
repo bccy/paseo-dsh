@@ -70,6 +70,8 @@ const {
   setLocale,
 } = require("./client/locale.js");
 const { TOOL_ICON_NAMES, UNNAMED_TOOL, toolCallData, toolIcon, toolLabel } = require("./client/tool-call-data.js");
+const fs = require("node:fs");
+const path = require("node:path");
 
 let passed = 0;
 let failed = 0;
@@ -190,6 +192,88 @@ console.log("the two tables carry the same keys");
       typeof zh[key] === "string" && zh[key] !== "" && en[key] !== "",
       JSON.stringify([en[key], zh[key]]),
     );
+  }
+}
+
+console.log("the jobs pill's copy is covered in both languages");
+{
+  // The `jobs` table is an **object**, so the `scalarKeys` loop above skips it and
+  // it is not in the list of string tables either: before this block existed, the
+  // whole table was unasserted. A missing `statuses` key renders as the wire name
+  // (`text.statuses[job.status] ?? job.status` in `client/jobs-pill.tsx`), which is
+  // exactly the silent downgrade the tables exist to prevent.
+  const en = allText().en.jobs;
+  const zh = allText()["zh-CN"].jobs;
+  check("both languages ship a jobs table", en !== undefined && zh !== undefined);
+
+  // Every key the interface declares must be present in both, and the two key
+  // sets must match — a key added to one language only is the drift this catches.
+  equal("jobs keys match", Object.keys(en).sort(), Object.keys(zh).sort());
+  for (const key of ["label", "title", "statuses", "allSettled", "unavailable"]) {
+    check(`jobs.${key} exists in both languages`, en[key] !== undefined && zh[key] !== undefined);
+  }
+
+  // The three functions take a count and return a sentence; each is called once
+  // per language. A function that returned "" would render an empty pill.
+  for (const locale of LOCALES) {
+    const table = allText()[locale].jobs;
+    for (const name of ["label"]) {
+      const rendered = table[name](2);
+      check(
+        `jobs.${name}(2) is a non-empty string in ${locale}`,
+        typeof rendered === "string" && rendered.trim() !== "",
+        JSON.stringify(rendered),
+      );
+    }
+  }
+
+  // The plain strings.
+  for (const locale of LOCALES) {
+    const table = allText()[locale].jobs;
+    for (const key of ["title", "allSettled", "unavailable"]) {
+      check(
+        `jobs.${key} is a non-empty string in ${locale}`,
+        typeof table[key] === "string" && table[key].trim() !== "",
+        JSON.stringify(table[key]),
+      );
+    }
+  }
+
+  // The English column must not be a copy of the Chinese one: a translated table
+  // and a duplicated one look identical until someone switches language.
+  const copied = ["title", "allSettled", "unavailable"].filter((key) => en[key] === zh[key]);
+  equal("the English jobs copy is not the Chinese copy", copied, []);
+
+  // **`statuses` must cover exactly the statuses `shared/jobs.ts` declares.**
+  // Read out of that file with a regex, not required: it imports zod and the
+  // plugin package. A key missing here falls back to the wire name on screen.
+  const sharedJobsPath =
+    process.env.SHARED_JOBS ?? path.resolve(__dirname, "..", "..", "paseo-plugin", "shared", "jobs.ts");
+  check("shared/jobs.ts is readable", fs.existsSync(sharedJobsPath), sharedJobsPath);
+  const declaration = fs.existsSync(sharedJobsPath)
+    ? /export const JOB_STATUSES = \[([^\]]*)\] as const;/.exec(fs.readFileSync(sharedJobsPath, "utf8"))
+    : null;
+  const statuses =
+    declaration === null ? undefined : [...declaration[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+  check(
+    "JOB_STATUSES is readable out of shared/jobs.ts",
+    statuses !== undefined && statuses.length > 0,
+    `no array literal in ${sharedJobsPath}`,
+  );
+  if (statuses !== undefined) {
+    equal("jobs.statuses keys are exactly JOB_STATUSES (en)", Object.keys(en.statuses).sort(), [...statuses].sort());
+    equal("jobs.statuses keys are exactly JOB_STATUSES (zh-CN)", Object.keys(zh.statuses).sort(), [...statuses].sort());
+    for (const locale of LOCALES) {
+      const table = allText()[locale].jobs.statuses;
+      const empty = Object.entries(table).filter(
+        ([, value]) => typeof value !== "string" || value.trim() === "",
+      );
+      equal(`jobs.statuses has a value for every key in ${locale}`, empty.length, 0);
+    }
+    // And the status words must actually differ between the languages, for the
+    // same reason as the copy check above.
+    const same = statuses.filter((status) => en.statuses[status] === zh.statuses[status]);
+    equal("the English status words are not the Chinese ones", same, []);
   }
 }
 

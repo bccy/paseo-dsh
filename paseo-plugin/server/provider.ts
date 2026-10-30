@@ -25,12 +25,14 @@ import {
   DshProcess,
   validateMcpServers,
   type DshCatalog,
+  type DshJob,
   type DshRevertResult,
   type DshRoute,
 } from "./dsh-process";
 import { DshChildSession, DshSession, modes, parseRoute } from "./session";
 import { rewindCanaryNotice } from "./rewind-canary";
 import { effortLabel } from "./locale";
+import { PROVIDER_ID } from "../shared/provider";
 
 const CAPABILITIES = [
   "prompt.message",
@@ -83,7 +85,7 @@ const CAPABILITIES = [
 ] as const;
 
 /** Provider id registered with Paseo; distinct from the ACP `deepseek-harness` entry. */
-export const PROVIDER_ID = "deepseek-harness-native";
+export { PROVIDER_ID };
 
 /**
  * One warning collected during an open and reported on the timeline once the
@@ -443,6 +445,24 @@ class DshConnection implements ProviderConnection {
     };
   }
 
+  /**
+   * The open session serving one Paseo agent, if this connection has it.
+   *
+   * The pill asks by agent id while a provider session id is minted per open, so
+   * the mapping has to be looked up. A child session is not a candidate: its jobs
+   * belong to its own DSH session, and the pill is drawn for the composer's agent.
+   *
+   * @param agentId - Paseo's agent id (`config.env.PASEO_AGENT_ID`).
+   * @returns the root session for that agent, or undefined when none is open.
+   */
+  sessionForAgent(agentId: string): DshSession | undefined {
+    if (agentId === "") return undefined;
+    for (const session of this.#sessions.values()) {
+      if (session.paseoAgentId === agentId) return session;
+    }
+    return undefined;
+  }
+
   async send(input: ProviderInput): Promise<void> {
     if (this.#closed) return;
     try {
@@ -459,6 +479,10 @@ class DshConnection implements ProviderConnection {
 
   async close(): Promise<void> {
     this.#closed = true;
+    // Deregister before the awaits below: `readAgentJobs` must never walk a
+    // connection that is tearing down, and a close that throws partway through
+    // would otherwise leave it registered for the life of the process.
+    CONNECTIONS.delete(this);
     const sessions = [...this.#sessions.values()];
     this.#sessions.clear();
     this.#opening.clear();
@@ -1646,6 +1670,62 @@ class DshConnection implements ProviderConnection {
   }
 }
 
+/**
+ * The provider connections this process has open, so a plugin RPC can reach one.
+ *
+ * A handler is registered once at plugin load, but the connection a session
+ * belongs to is created later by `provider.connect`, and there is no channel from
+ * the handler's context to it — so the connection registers itself here.
+ *
+ * A `Set` rather than a single field: nothing in the SDK promises one connection
+ * at a time, and overwriting a single field would answer from the wrong daemon
+ * with a count that looks plausible.
+ */
+const CONNECTIONS = new Set<DshConnection>();
+
+/**
+ * Read one agent's background jobs through whichever connection serves it.
+ *
+ * "No connection / no session" is not an error — see the note on the final
+ * `return`. A session that *is* open reports its own read failure instead of an
+ * empty list, which is what keeps an unreadable registry from being drawn as "no
+ * background jobs".
+ *
+ * @param agentId - Paseo's agent id, as the pill knows it.
+ */
+export async function readAgentJobs(agentId: string): Promise<{
+  available: boolean;
+  jobs: DshJob[];
+  error?: { message: string };
+}> {
+  for (const connection of CONNECTIONS) {
+    const session = connection.sessionForAgent(agentId);
+    if (session === undefined) continue;
+    const result = await session.jobs();
+    if (!result.available) {
+      return {
+        available: false,
+        jobs: [],
+        error: { message: result.error?.message ?? "the DSH runtime could not list this session's jobs" },
+      };
+    }
+    return { available: true, jobs: result.jobs ?? [] };
+  }
+  // No connection serves this agent — i.e. this process holds no DSH session for
+  // it, so the agent has no DSH-side job to report. **This is an accurate empty
+  // answer, not a failed read**, which is why it is `available: true`.
+  //
+  // Do not "fix" this to `available: false` by reading `shared/jobs.ts`'s
+  // contract literally: there, `available: false` means "the registry could not
+  // be read", and the pill renders that as a visible error. Reporting it here
+  // would leave an error pill sitting on every agent whose session has not been
+  // opened yet — the common state before the first prompt — which is noise about
+  // a condition the user cannot act on. The distinction the contract draws is
+  // between "we looked and found none" and "we could not look"; this branch is
+  // the former.
+  return { available: true, jobs: [] };
+}
+
 /** The provider registration Paseo installs for `dsh --profile paseo`. */
 export function createDshProvider(): ProviderRegistration {
   return {
@@ -1654,7 +1734,13 @@ export function createDshProvider(): ProviderRegistration {
     icon: "icon.svg",
     async connect(request) {
       const capabilities = negotiateProviderCapabilities(request.capabilities, CAPABILITIES);
-      return new DshConnection(capabilities);
+      const connection = new DshConnection(capabilities);
+      // Registered here rather than in the constructor so a connection that is
+      // never handed to the daemon cannot be observed; `close()` deregisters it,
+      // which is what keeps a reload from leaving dead connections behind for
+      // `readAgentJobs` to walk on every pill poll.
+      CONNECTIONS.add(connection);
+      return connection;
     },
   };
 }

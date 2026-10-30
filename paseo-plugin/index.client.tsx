@@ -18,6 +18,7 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { z } from "zod";
 import { InlineThinking } from "./client/inline-thinking";
+import { contributeJobsPill } from "./client/jobs-pill";
 import { contributeStreamStats } from "./client/stream-stats";
 import { localeFromMetadata, setLocale } from "./client/locale";
 import { InlineToolCall } from "./client/tool-call";
@@ -191,5 +192,18 @@ export default function contribute(client: PluginClientContext) {
   // The stats row under an answer. Upstream's own contribution, kept whole: it
   // only registers a renderer, so it composes with the renderers above instead
   // of competing with them.
-  return contributeStreamStats(client);
+  //
+  // Both contributions return a cleanup, and **both are kept**. `stream-stats`
+  // returns an empty one today, which made discarding it look harmless — but
+  // that is an assumption about another module's internals, and the day it grows
+  // a real teardown (a timer, a subscription) this line would drop it silently.
+  // Composing them costs a line and turns the assumption into code.
+  const cleanups = [contributeStreamStats(client), contributeJobsPill(client)];
+
+  // The jobs pill registers one pill and one poll timer per agent, so its
+  // cleanup is the one that actually does work today; running them in order
+  // keeps the renderer teardown ahead of it if that ever starts to matter.
+  return () => {
+    for (const cleanup of cleanups) cleanup();
+  };
 }

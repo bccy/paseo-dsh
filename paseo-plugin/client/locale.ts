@@ -126,6 +126,27 @@ export interface UiText {
   planTitle: string;
   /** Appended to a body cut at the client's size limit. */
   truncated: string;
+  /** Copy for the composer's background-jobs pill and its popover. */
+  jobs: JobsText;
+}
+
+/**
+ * The composer's background-jobs pill.
+ *
+ * `label` takes the count because the number is part of the sentence ("2 个后台"),
+ * and it counts only live jobs: the pill hides once nothing is working.
+ */
+export interface JobsText {
+  /** Pill label; `count` is the number of running/stopping jobs, always >= 1. */
+  label: (count: number) => string;
+  /** The pill's label when the count is unknown, and the button's title. */
+  title: string;
+  /** One row's status word, per DSH job status. */
+  statuses: Record<string, string>;
+  /** Popover line when every job it lists has already settled. */
+  allSettled: string;
+  /** Popover line when the runtime could not read the registry — never "none". */
+  unavailable: string;
 }
 
 const TEXT: Record<Locale, UiText> = {
@@ -342,6 +363,22 @@ const TEXT: Record<Locale, UiText> = {
     collapseThinking: "Collapse thinking",
     planTitle: "Plan",
     truncated: "\n… (truncated)",
+    jobs: {
+      // "1 background" rather than "1 background task": the pill's label shares its
+      // line with the spinner, and the noun added nothing the ring and the popover
+      // title did not already say.
+      label: (count) => `${String(count)} background`,
+      title: "Background tasks",
+      statuses: {
+        running: "Running",
+        stopping: "Stopping",
+        completed: "Done",
+        killed: "Canceled",
+        failed: "Failed",
+      },
+      allSettled: "All background tasks have finished.",
+      unavailable: "Could not read this session's background tasks.",
+    },
   },
   "zh-CN": {
     toolLabels: {
@@ -537,6 +574,21 @@ const TEXT: Record<Locale, UiText> = {
     collapseThinking: "收起思考",
     planTitle: "计划",
     truncated: "\n…（已截断）",
+    jobs: {
+      // 数量直接在句子里：`2 个后台`。中文没有复数变化，所以单复数同形。
+      // 省略"任务"是刻意的：pill 这一行还要放转环，名词与 popover 标题重复。
+      label: (count) => `${String(count)} 个后台`,
+      title: "后台任务",
+      statuses: {
+        running: "运行中",
+        stopping: "正在停止",
+        completed: "已完成",
+        killed: "已取消",
+        failed: "失败",
+      },
+      allSettled: "后台任务都已结束。",
+      unavailable: "读不到本会话的后台任务。",
+    },
   },
 };
 

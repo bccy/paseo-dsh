@@ -2455,6 +2455,68 @@ export class PaseoHarnessServer {
     }
   }
 
+  /**
+   * The background jobs one session owns, for the composer's jobs pill.
+   *
+   * **`caller` is an owner-equality filter, not an authorization check.** DSH's
+   * registry `list(caller)` selects "unowned jobs plus the ones whose owner is
+   * exactly this id", so passing someone else's session id returns *their* jobs.
+   * This method is safe only because its one caller (`DshSession.jobs()`) passes
+   * its own `#dshSessionId`; a future caller must not forward an id taken from the
+   * wire.
+   *
+   * **It must not materialize the session.** The registry is process-wide and a
+   * job's owner is a session id, so reading needs no live agent — and the pill
+   * polls this for agents whose session the bridge has not opened. A
+   * `getOrCreateSession` here would resume every one of them just to draw a count.
+   *
+   * A session with no jobs is an empty list, matching DSH's own `job_list`. A
+   * missing registry and a registry that throws stay apart from it: both go to
+   * stderr and answer `available: false`, never a quiet "no jobs".
+   *
+   * @param {{sessionId: string}} params - must be the caller's own session id.
+   */
+  async jobs(params) {
+    const sessionId = typeof params?.sessionId === 'string' ? params.sessionId : '';
+    if (sessionId === '') {
+      return { available: false, jobs: [], error: { message: 'paseo/jobs requires a sessionId' } };
+    }
+    let jobs;
+    try {
+      jobs = this.ctx.get('jobs');
+    } catch (error) {
+      const message = `looking up DSH's job registry failed: ${error instanceof Error ? error.message : String(error)}`;
+      process.stderr.write(`[bridge] ${message}\n`);
+      return { available: false, jobs: [], error: { message } };
+    }
+    if (jobs === undefined) {
+      reportMissingService(
+        'jobs',
+        '[bridge] this DSH profile composes no job registry; the composer jobs pill stays hidden\n',
+      );
+      return { available: false, jobs: [], error: { message: 'this DSH runtime composes no job registry' } };
+    }
+    try {
+      return {
+        available: true,
+        jobs: jobs.list(sessionId).map((job) => ({
+          id: String(job.id),
+          kind: String(job.kind),
+          label: String(job.label),
+          status: String(job.status),
+          startedAt: job.startedAt,
+          ...(job.progress === undefined ? {} : { progress: String(job.progress) }),
+          ...(job.detail === undefined ? {} : { detail: String(job.detail) }),
+          ...(job.finishedAt === undefined ? {} : { finishedAt: job.finishedAt }),
+        })),
+      };
+    } catch (error) {
+      const message = `listing DSH's background jobs failed: ${error instanceof Error ? error.message : String(error)}`;
+      process.stderr.write(`[bridge] ${message}\n`);
+      return { available: false, jobs: [], error: { message } };
+    }
+  }
+
   /** Report the routes and models the runtime can serve, for the Paseo catalog. */
   async catalog() {
     const llm = this.ctx.get('llm');
@@ -2611,6 +2673,8 @@ export class PaseoHarnessServer {
         return this.setPermission(params);
       case 'paseo/usage':
         return this.usage(params);
+      case 'paseo/jobs':
+        return this.jobs(params);
       case 'paseo/presets':
         return this.presets(params);
       case 'paseo/sessions':

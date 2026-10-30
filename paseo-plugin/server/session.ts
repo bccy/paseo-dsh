@@ -26,6 +26,7 @@ import {
   DshProcess,
   type DshAnswer,
   type DshChildOpened,
+  type DshJobs,
   type DshMcpServer,
   type DshPermissionPreset,
   type DshProcessHandlers,
@@ -788,6 +789,32 @@ export class DshSession {
       this.#usageRefreshTimer = undefined;
       void this.refreshUsage();
     }, 75);
+  }
+
+  /**
+   * The background jobs this session owns, for the composer's jobs pill.
+   *
+   * Not cached or coalesced, unlike `refreshUsage`: a poll wants a point-in-time
+   * projection, and DSH rebuilds it per call.
+   *
+   * **A closed session answers `false`, not `true` + `[]`.** An agent with no
+   * session at all is `true` with an empty list — an accurate "it has no job".
+   * A *closed* session is different: it is not "no jobs", it is "the thing that
+   * would have told us is gone". Reaching this branch needs a caller that already
+   * holds the reference and calls `jobs()` in the same tick as the close, because
+   * all three close paths delete the session before awaiting it. It returns
+   * rather than throws: a throw would surface as a failed request for something
+   * the user already closed.
+   */
+  async jobs(): Promise<DshJobs> {
+    if (this.#closed) return { available: false };
+    const process = this.#process;
+    if (process === undefined) return { available: false };
+    try {
+      return await process.jobs(this.#dshSessionId);
+    } catch (error) {
+      return { available: false, error: { message: messageOf(error) } };
+    }
   }
 
   /**
@@ -1747,6 +1774,17 @@ export class DshSession {
   /** This session's own DSH id, which is what DSH's registry knows it by. */
   get dshId(): string {
     return this.#dshSessionId;
+  }
+
+  /**
+   * Paseo's agent id this session belongs to, when the daemon supplied one.
+   *
+   * The jobs pill is registered per **agent**, and a plugin reload mints a new
+   * provider session id for the same agent, so the server half's
+   * agentId -> session table is keyed by this value rather than by `id`.
+   */
+  get paseoAgentId(): string | undefined {
+    return this.#options.agentId;
   }
 
   /**

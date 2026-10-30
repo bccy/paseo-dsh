@@ -174,6 +174,39 @@ export interface DshUsage {
 }
 
 /**
+ * One background job of the composer's jobs pill, as the bridge projects it.
+ *
+ * The fields are DSH's own `JobView` vocabulary reduced to what a pill row
+ * draws: identity, lifecycle, and the optional human-readable lines. `progress`
+ * is cleared at settlement by DSH itself, so a settled row carries `detail`
+ * (the terminal reason) instead — nothing is fabricated for either here.
+ */
+export interface DshJob {
+  id: string;
+  kind: string;
+  label: string;
+  status: "running" | "stopping" | "completed" | "killed" | "failed";
+  /** Epoch ms when the job was registered. */
+  startedAt: number;
+  progress?: string;
+  detail?: string;
+  finishedAt?: number;
+}
+
+/**
+ * One session's background jobs.
+ *
+ * `available: false` means the registry could not be read — not "no jobs". An
+ * empty list is a real answer the pill hides on; an unreadable one must not be
+ * shown as one.
+ */
+export interface DshJobs {
+  available: boolean;
+  jobs?: DshJob[];
+  error?: { message?: string };
+}
+
+/**
  * One entry of the composer's `/` menu. `kind` decides how running it works:
  * a registered `command` executes in the runtime, a `skill` rides a `/name`
  * user message that DSH's skill tool turns into an injected instruction set.
@@ -325,6 +358,32 @@ const SESSION_CLOSE_TIMEOUT_MS = 10_000;
  * bridge's bound so the bridge's diagnosis wins when both fire.
  */
 const CLOSE_PENDING_TIMEOUT_MS = 35_000;
+
+/**
+ * How long one `paseo/jobs` read may take.
+ *
+ * Much shorter than the other bounds here: the composer pill polls this on a timer
+ * (`POLL_MS` in `client/jobs-pill.tsx`), so a slow answer is worth less than the
+ * next poll. Named because the client's interval is chosen against it — changing
+ * either without the other is what this constant makes visible.
+ */
+const JOBS_READ_TIMEOUT_MS = 15_000;
+
+/**
+ * The bridge's reply when it does not implement a method at all — the verbatim
+ * prefix its `handleRequest` `default:` branch throws. Matched as a substring for
+ * the same reason as {@link DshProcess.#isNotInitializedError}: the transport
+ * passes messages through unchanged.
+ *
+ * A bridge predating `paseo/jobs` is the real case, and it is **not** "the registry
+ * could not be read" — the user's next step differs, so the two must not collapse
+ * into one message.
+ */
+const UNKNOWN_BRIDGE_METHOD_PREFIX = "unknown paseo bridge method:";
+
+/** What the pill shows when the profile's bridge has no `paseo/jobs`. */
+const BRIDGE_TOO_OLD_MESSAGE =
+  "this profile's bridge has no jobs support (it predates paseo/jobs); reload the plugin so the embedded bridge is rewritten";
 
 /** What one attached session contributes besides its handlers. */
 export interface DshSessionOptions {
@@ -1023,6 +1082,14 @@ export class DshProcess {
    * `REPORTED_MISSING_SERVICES`).
    */
   #warnedAssistantStream = false;
+  /**
+   * Whether the "this bridge has no paseo/jobs" line has been logged.
+   *
+   * Latched for the same reason as {@link #warnedAssistantStream}: the pill polls
+   * every four seconds, so an unlatched line would be a steady stderr stream that
+   * buries everything else.
+   */
+  #warnedJobsUnsupported = false;
   /** Whether the process-level exit callback has already fired for this child. */
   #exitReported = false;
   #initializeTask: Promise<void> | undefined;
@@ -1723,6 +1790,53 @@ export class DshProcess {
     return (await this.#request("paseo/usage", {
       sessionId,
     })) as DshUsage;
+  }
+
+  /**
+   * Read the background jobs this session owns.
+   *
+   * A short timeout, unlike the catalog and history reads: the composer pill
+   * polls this on a timer, and a slow answer is worth less than the next poll —
+   * a 120 s bound would let one stalled frame wedge the pill for two minutes.
+   * The answer is never defaulted to an empty list here; `available: false`
+   * travels through so the caller can say "could not read" instead of "none".
+   *
+   * @param sessionId - which session; required — there is no default.
+   */
+  async jobs(sessionId: string): Promise<DshJobs> {
+    await this.#ensureSessionReady(sessionId);
+    try {
+      return (await this.#request("paseo/jobs", { sessionId }, JOBS_READ_TIMEOUT_MS)) as DshJobs;
+    } catch (error) {
+      // A bridge without this method is not "the registry could not be read": the
+      // user's next step is to get a newer bridge, not to wait. Reported through
+      // `available: false` because the pill has no other way to say "I could not
+      // look" — but with a message that says what to do.
+      if (!this.#isUnknownBridgeMethodError(error)) throw error;
+      if (!this.#warnedJobsUnsupported) {
+        this.#warnedJobsUnsupported = true;
+        // Once per process: the pill polls every four seconds, so an unlatched
+        // line would bury the log (same reasoning as `#warnedAssistantStream`).
+        this.#processHandlers.onLog(
+          `the bridge does not implement paseo/jobs (it predates jobs support); ` +
+            `the jobs pill will stay on "${BRIDGE_TOO_OLD_MESSAGE}" until the embedded bridge is rewritten`,
+        );
+      }
+      return { available: false, error: { message: BRIDGE_TOO_OLD_MESSAGE } };
+    }
+  }
+
+  /**
+   * Whether a rejection is the bridge's "I do not implement that method" reply.
+   *
+   * Unrelated text returns false, so a genuine read failure keeps its own message
+   * instead of being reported as an outdated bridge.
+   *
+   * @param error - the rejection from `#request`.
+   */
+  #isUnknownBridgeMethodError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+    return message.includes(UNKNOWN_BRIDGE_METHOD_PREFIX);
   }
 
   /**
