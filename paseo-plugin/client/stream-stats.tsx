@@ -1,7 +1,8 @@
 import type { PluginClientContext, PluginTimelineItemProps } from "@getpaseo/plugin/client";
-import { Fragment, useState } from "react";
+import { Fragment, useLayoutEffect, useRef, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import { z } from "zod";
+import { measureFooterGeometry, rowIsLaidOut, watchRow } from "./web";
 
 export const streamStatsSchema = z.object({
   firstTokenMs: z.number().optional(),
@@ -20,9 +21,23 @@ export const streamStatsSchema = z.object({
   steps: z.number().optional(),
   sessionTokens: z.number().optional(),
   cacheHit: z.number().optional(),
+  /** Set by the daemon on the last row of a completed turn: the copy footer is above it. */
+  final: z.boolean().optional(),
 });
 
 type StreamStats = z.infer<typeof streamStatsSchema>;
+
+/**
+ * Paseo paints the completed-turn footer at `STREAM_METADATA_FONT_SIZE` (13px).
+ * Until the page can be measured that is also what this row draws at, so the
+ * two lines read as one block instead of two sizes.
+ */
+const FOOTER_FONT_SIZE = 13;
+/** Space under the footer's last line, as a fraction of this row's text size. */
+const GAP_EM = 0.46;
+/** The row's own small offsets, also fractions of its text size (~2px / ~1px at 13). */
+const INSET_EM = 0.15;
+const DETAIL_GAP_EM = 0.1;
 
 function formatLatency(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
@@ -70,10 +85,66 @@ function toolsLine(data: StreamStats): string | undefined {
 /** One compact line under an answer; tap to expand the full picture. */
 function StreamStatsRow({ item, theme, layout }: PluginTimelineItemProps<StreamStats>) {
   const [open, setOpen] = useState(false);
+  const [fontSize, setFontSize] = useState(FOOTER_FONT_SIZE);
+  const [lift, setLift] = useState(0);
+  const rowRef = useRef<unknown>(null);
+  /** The lift the DOM currently carries; the next measurement discounts it. */
+  const appliedLift = useRef(0);
   const data = item.data;
-  const fontSize = layout.compact ? 10 : 11;
+
+  // The ref must describe the margin the DOM actually carries, not the one a
+  // pending render is about to apply.
+  useLayoutEffect(() => {
+    appliedLift.current = lift;
+  }, [lift]);
+
+  // Only the last row of a completed turn has the footer directly above it, and
+  // only the web build can see where that footer was painted. Everything else
+  // keeps the host's spacing: a guessed offset is what used to ride up over the
+  // answer once a second turn pushed the first one down.
+  useLayoutEffect(() => {
+    if (data.final !== true || layout.platform !== "web") {
+      setLift(0);
+      return;
+    }
+    const measure = () => {
+      const found = measureFooterGeometry(rowRef.current, {
+        appliedLift: appliedLift.current,
+        gapEm: GAP_EM,
+        fallbackFontSize: FOOTER_FONT_SIZE,
+      });
+      if (found === null) {
+        // A hidden tab (zero-height row) says nothing about the layout: keep
+        // the last margin so switching back does not un-tuck the row.
+        if (rowIsLaidOut(rowRef.current)) setLift(0);
+        return;
+      }
+      setLift(found.lift);
+      setFontSize(found.fontSize);
+    };
+    measure();
+    // The footer is not necessarily in its final place when the row mounts: it
+    // can arrive a frame later, and the host may move it after the turn is
+    // marked complete. Re-measure a few times while that settles, and keep
+    // watching the containers in case it moves again (a new turn pushing this
+    // one down, a theme swap, a font load).
+    const retries = [80, 240, 700, 1500].map((ms) => setTimeout(measure, ms));
+    const stop = watchRow(rowRef.current, measure);
+    return () => {
+      for (const timer of retries) clearTimeout(timer);
+      stop?.();
+    };
+  }, [data.final, layout.platform]);
+
   const muted = theme.colors.foregroundMuted;
-  const base = { color: muted, fontSize, fontVariant: ["tabular-nums"] as const };
+  const lineHeight = Math.round(fontSize * (18 / 13));
+  const inset = Math.max(1, Math.round(fontSize * INSET_EM));
+  const base = {
+    color: muted,
+    fontSize,
+    lineHeight,
+    fontVariant: ["tabular-nums"] as const,
+  };
 
   const ratio = contextRatio(data);
   const segments: Array<{ text: string; color: string }> = [];
@@ -100,10 +171,11 @@ function StreamStatsRow({ item, theme, layout }: PluginTimelineItemProps<StreamS
 
   return (
     <Pressable
+      ref={rowRef}
       accessibilityRole="button"
       accessibilityLabel={open ? "收起回答统计" : "展开回答统计"}
       onPress={() => setOpen((value) => !value)}
-      style={{ alignSelf: "flex-start", marginTop: 0, marginBottom: 0, paddingLeft: 2 }}
+      style={{ alignSelf: "flex-start", marginTop: lift, marginBottom: 0, paddingLeft: inset }}
     >
       <View style={{ flexDirection: "row", alignItems: "center", flexWrap: "wrap" }}>
         {segments.map((segment, index) => (
@@ -115,7 +187,7 @@ function StreamStatsRow({ item, theme, layout }: PluginTimelineItemProps<StreamS
         <Text style={base}>{open ? " ▴" : " ▾"}</Text>
       </View>
       {open ? (
-        <View style={{ marginTop: 2, gap: 1 }}>
+        <View style={{ marginTop: inset, gap: Math.max(1, Math.round(fontSize * DETAIL_GAP_EM)) }}>
           {details.map((line) => (
             <Text key={line} style={base}>
               {line}
