@@ -2,7 +2,7 @@ import type { PluginClientContext, PluginTimelineItemProps } from "@getpaseo/plu
 import { Fragment, useLayoutEffect, useRef, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import { z } from "zod";
-import { measureFooterGeometry, watchRow } from "./web";
+import { measureFooterGeometry, rowIsLaidOut, watchRow } from "./web";
 
 export const streamStatsSchema = z.object({
   firstTokenMs: z.number().optional(),
@@ -114,7 +114,9 @@ function StreamStatsRow({ item, theme, layout }: PluginTimelineItemProps<StreamS
         fallbackFontSize: FOOTER_FONT_SIZE,
       });
       if (found === null) {
-        setLift(0);
+        // A hidden tab (zero-height row) says nothing about the layout: keep
+        // the last margin so switching back does not un-tuck the row.
+        if (rowIsLaidOut(rowRef.current)) setLift(0);
         return;
       }
       setLift(found.lift);

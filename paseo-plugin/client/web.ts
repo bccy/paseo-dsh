@@ -55,6 +55,11 @@ type ResizeObserverConstructor = new (callback: () => void) => {
   disconnect(): void;
 };
 
+type MutationObserverConstructor = new (callback: () => void) => {
+  observe(target: unknown, options: { childList: boolean; subtree: boolean }): void;
+  disconnect(): void;
+};
+
 /**
  * The footer is one short metadata line (copy, model, time, elapsed). An answer
  * or a whole pushed-down turn is much longer; using one of those as the anchor
@@ -65,14 +70,21 @@ const MAX_FOOTER_TEXT = 120;
 const FOOTER_PREFIX = /^(复制|copy)/i;
 /** Wrapper levels to step over before giving up: item frame, list cell, row. */
 const MAX_WRAPPER_DEPTH = 6;
-/** Ancestors watched for layout changes; the turn block is four levels up. */
-const WATCH_DEPTH = 4;
+/** Ancestors watched for layout changes: row, wrappers, turn block, list. */
+const WATCH_DEPTH = 6;
 /**
  * Largest plausible distance, in footer line heights, between the footer's last
  * line and the row the host laid out under it. A wrong anchor lands far outside
  * this; a themed footer that adds padding still lands inside it.
  */
 const MAX_GAP_LINES = 4;
+
+/** Whether the row is actually laid out (an inactive tab renders zero-height). */
+export function rowIsLaidOut(row: unknown): boolean {
+  const node = webRow(row);
+  if (node === null) return false;
+  return node.getBoundingClientRect().height > 0;
+}
 
 export interface FooterGeometry {
   /** Margin that puts the row's top `gapEm` under the footer's last line. */
@@ -275,29 +287,65 @@ export function measureFooterGeometry(
 }
 
 /**
- * Calls `onResize` when the row's neighbourhood changes size — a theme
- * switching, a font loading, the footer mounting a frame after `final` arrives,
- * or the turn being pushed down by a newer one.
+ * Calls `onResize` when the row's neighbourhood changes — a theme switching, a
+ * font loading, the footer mounting a frame late, or the turn being pushed down
+ * by a newer one.
  *
- * The footer itself is not required: it may not exist yet when the row first
- * renders, and observing only it would then never wake up. The container around
- * this item is watched too, which covers the footer being inserted or removed.
+ * Resizing is only half of it: when a new turn is appended the row's own box and
+ * its ancestors keep their size and only move, so a ResizeObserver never fires.
+ * A MutationObserver on the same ancestors catches the insertion, and the two
+ * are coalesced so a burst of changes costs one measurement, taken after the
+ * layout has settled.
+ *
  * Returns a cleanup, or null off web.
  */
 export function watchRow(row: unknown, onResize: () => void): (() => void) | null {
   const node = webRow(row);
   if (node === null) return null;
-  const Observer = (globalThis as { ResizeObserver?: ResizeObserverConstructor }).ResizeObserver;
-  if (Observer === undefined) return null;
-  const observer = new Observer(onResize);
-  // Every wrapper up to the turn block is watched, including the zero-height
-  // `display: contents` frames React Native Web leaves in the chain: the box
-  // that actually grows when the footer is inserted or moved is often three or
-  // four levels above the row, and a stale lift survives if that box is missed.
-  let frame: MeasuredNode | null = node;
-  for (let depth = 0; depth < WATCH_DEPTH && frame !== null; depth += 1) {
-    observer.observe(frame);
-    frame = frame.parentElement;
+  const Resize = (globalThis as { ResizeObserver?: ResizeObserverConstructor }).ResizeObserver;
+  const Mutation = (globalThis as { MutationObserver?: MutationObserverConstructor })
+    .MutationObserver;
+  if (Resize === undefined && Mutation === undefined) return null;
+
+  let pending: ReturnType<typeof setTimeout> | null = null;
+  const schedule = () => {
+    if (pending !== null) clearTimeout(pending);
+    pending = setTimeout(() => {
+      pending = null;
+      onResize();
+    }, 60);
+  };
+
+  const stop: Array<() => void> = [];
+  if (Resize !== undefined) {
+    const observer = new Resize(schedule);
+    if (Mutation !== undefined) {
+      const mutations = new Mutation(schedule);
+      let frame: MeasuredNode | null = node;
+      for (let depth = 0; depth < WATCH_DEPTH && frame !== null; depth += 1) {
+        observer.observe(frame);
+        // Child insertions are where a new turn shows up; character data
+        // (streaming text) is deliberately not watched.
+        mutations.observe(frame, { childList: true, subtree: true });
+        frame = frame.parentElement;
+      }
+      stop.push(() => mutations.disconnect());
+    } else {
+      let frame: MeasuredNode | null = node;
+      for (let depth = 0; depth < WATCH_DEPTH && frame !== null; depth += 1) {
+        observer.observe(frame);
+        frame = frame.parentElement;
+      }
+    }
+    stop.push(() => observer.disconnect());
+  } else if (Mutation !== undefined) {
+    const mutations = new Mutation(schedule);
+    mutations.observe(node.parentElement ?? node, { childList: true, subtree: true });
+    stop.push(() => mutations.disconnect());
   }
-  return () => observer.disconnect();
+
+  return () => {
+    if (pending !== null) clearTimeout(pending);
+    for (const dispose of stop) dispose();
+  };
 }
