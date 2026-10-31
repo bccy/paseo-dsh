@@ -327,6 +327,8 @@ const copyHolds = (extension) => {
 // read this type back?" being asked.
 {
   const expected = [
+    'tool-workflow/run-start', 'tool-workflow/agent-start',
+    'tool-workflow/agent-end', 'tool-workflow/run-end', 'goal/change',
     'assistant/message',
     'command/done',
     'command/run',

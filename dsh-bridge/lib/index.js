@@ -12,6 +12,7 @@ import Schema from '@deepseek-ai/schemastery';
 import { exitOnStdinEnd, parseCmdline } from '@deepseek-ai/dsh-cmdline';
 import { PaseoTransport } from './transport.js';
 import { PaseoHarnessServer } from './server.js';
+import { registerApprovalAnswerer } from './approval.js';
 
 /** Stable Cordis plugin name. */
 export const name = 'paseo-bridge';
@@ -120,6 +121,7 @@ function startBridge(ctx, config = {}) {
 
   ctx.effect(() => {
     transport.start();
+    const offApproval = registerApprovalAnswerer(ctx, server, transport);
 
     // DSH -> Paseo. Root-context registration matches how the shipped ACP
     // adapter claims `approval/request`; each listener answers only for the
@@ -145,6 +147,7 @@ function startBridge(ctx, config = {}) {
 
     return async () => {
       offQuestions();
+      offApproval();
       await server.shutdown();
       transport.close();
     };

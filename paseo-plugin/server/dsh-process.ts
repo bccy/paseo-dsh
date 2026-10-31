@@ -89,6 +89,17 @@ export interface DshQuestionRequest {
   sessionId?: string;
 }
 
+export interface DshApprovalRequest {
+  requestId: string;
+  toolName: string;
+  callId?: string;
+  reason?: string;
+}
+export interface DshApprovalAnswer {
+  outcome: "allowed-once" | "rejected" | "cancelled" | "unavailable";
+}
+export type DshApprovalSignal = AbortSignal & { approvalTimedOut?: boolean };
+
 /**
  * A server -> client notice that a native subagent child session exists. The
  * ids are DSH's own: `sessionId` is the child's native session id, and
@@ -258,6 +269,7 @@ export interface DshProcessHandlers {
   /** `sessionId` is DSH's own id, so the caller can route by session. */
   onStatus(status: string, sessionId: string): void;
   onQuestion(request: DshQuestionRequest, sessionId: string): Promise<DshAnswer>;
+  onPermission?(request: DshApprovalRequest, sessionId: string, signal: AbortSignal): Promise<DshApprovalAnswer>;
   /** A native subagent child session was observed; Paseo may show it. */
   onChildOpened?(payload: DshChildOpened): void;
   onLog(line: string): void;
@@ -387,6 +399,7 @@ const BRIDGE_TOO_OLD_MESSAGE =
 
 /** What one attached session contributes besides its handlers. */
 export interface DshSessionOptions {
+  systemPrompt?: string;
   /** Working directory this session runs in; defaults to the process's. */
   cwd?: string;
   /** Route this session is pinned to; defaults to the process's. */
@@ -1000,6 +1013,7 @@ export class DshProcess {
   readonly #sessionHandlers = new Map<string, DshSessionHandlers>();
   /** Per-session cwd/route/MCP overrides; absent fields fall back to the process. */
   readonly #sessionOptions = new Map<string, DshSessionOptions>();
+  readonly #approvalRequests = new Map<string, { sessionId: string; controller: AbortController }>();
   /** Sessions that have completed their own `initialize` in this child. */
   readonly #initializedSessions = new Set<string>();
   /** Sessions whose MCP entries have been handed to the bridge. */
@@ -1115,6 +1129,7 @@ export class DshProcess {
       onEvent: (payload) => options.onEvent(payload),
       onStatus: (status, sessionId) => options.onStatus(status, sessionId),
       onQuestion: (request, sessionId) => options.onQuestion(request, sessionId),
+      onPermission: options.onPermission,
       ...(options.onChildOpened === undefined
         ? {}
         : { onChildOpened: (payload: DshChildOpened) => options.onChildOpened?.(payload) }),
@@ -1154,6 +1169,7 @@ export class DshProcess {
       onEvent: (payload) => handlers.onEvent(payload),
       onStatus: (status, sessionId) => handlers.onStatus(status, sessionId),
       onQuestion: (request, sessionId) => handlers.onQuestion(request, sessionId),
+      onPermission: handlers.onPermission,
       ...(handlers.onChildOpened === undefined
         ? {}
         : { onChildOpened: (payload: DshChildOpened) => handlers.onChildOpened?.(payload) }),
@@ -1202,6 +1218,7 @@ export class DshProcess {
     if (options.cwd !== undefined) merged.cwd = options.cwd;
     if (options.route !== undefined) merged.route = options.route;
     if (options.mcpServers !== undefined) merged.mcpServers = options.mcpServers;
+    merged.systemPrompt = options.systemPrompt;
     this.#sessionOptions.set(sessionId, merged);
     // Translate this session's MCP servers now, so a server DSH cannot mount
     // fails at attach — where the caller reports it — instead of at the first
@@ -1233,6 +1250,9 @@ export class DshProcess {
    * @param sessionId - the session to detach; unknown ids are ignored.
    */
   detachSession(sessionId: string): void {
+    for (const pending of this.#approvalRequests.values()) {
+      if (pending.sessionId === sessionId) pending.controller.abort();
+    }
     if (!this.#sessionHandlers.delete(sessionId)) return;
     this.#sessionOptions.delete(sessionId);
     this.#sessionMcp.delete(sessionId);
@@ -1505,6 +1525,7 @@ export class DshProcess {
       model: route.model,
       ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
       sessionId,
+      systemPrompt: options.systemPrompt ?? "",
     });
     this.#initializedSessions.add(sessionId);
   }
@@ -1673,6 +1694,7 @@ export class DshProcess {
    * `onExit` is the very same function.
    */
   #exitAll(code: number | null, signal: string | null): void {
+    for (const pending of this.#approvalRequests.values()) pending.controller.abort();
     // The child dying ends every conversation it served, so all of them hear it
     // — not just whichever handler happened to be assigned last.
     for (const [sessionId, handlers] of [...this.#sessionHandlers]) {
@@ -2397,6 +2419,40 @@ export class DshProcess {
       [key: string]: unknown;
     };
     const producer = typeof params.sessionId === "string" ? params.sessionId : undefined;
+
+    if (method === "paseo/permission-cancelled") {
+      const pending = this.#approvalRequests.get(String(params.requestId));
+      if (pending && pending.sessionId === producer) {
+        (pending.controller.signal as DshApprovalSignal).approvalTimedOut = params.timedOut === true;
+        pending.controller.abort();
+      }
+      return;
+    }
+    if (method === "paseo/permission" && id !== undefined) {
+      const requestId = params.requestId;
+      const handlers = producer === undefined ? undefined : this.#sessionHandlers.get(producer);
+      // Root only: the host's child permission channel cannot display a card.
+      if (!handlers?.onPermission || typeof requestId !== "string" || !requestId
+        || typeof params.toolName !== "string" || !params.toolName
+        || this.#approvalRequests.has(requestId)) {
+        this.#send({ jsonrpc: "2.0", id, error: { code: -32000, message: "invalid or unowned tool approval request" } });
+        return;
+      }
+      const controller = new AbortController();
+      this.#approvalRequests.set(requestId, { sessionId: producer as string, controller });
+      try {
+        const answer = await handlers.onPermission(params as unknown as DshApprovalRequest, producer as string, controller.signal);
+        if (controller.signal.aborted) throw new Error(
+          (controller.signal as DshApprovalSignal).approvalTimedOut ? "Tool approval timed out" : "Tool approval cancelled",
+        );
+        this.#send({ jsonrpc: "2.0", id, result: answer });
+      } catch (error) {
+        this.#send({ jsonrpc: "2.0", id, error: { code: -32000, message: toError(error, "tool approval failed").message } });
+      } finally {
+        this.#approvalRequests.delete(requestId);
+      }
+      return;
+    }
 
     if (method === "session.child-opened") {
       // Registered before anything else: the parent edge is what makes the

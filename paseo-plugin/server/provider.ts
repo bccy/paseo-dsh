@@ -1162,25 +1162,6 @@ class DshConnection implements ProviderConnection {
     // cannot disagree.
     validateMcpServers(config.mcpServers);
 
-    // Paseo fills `config.systemPrompt` from the agent's own system prompt and the
-    // daemon's `appendSystemPrompt` (`mapSessionConfig` in `@getpaseo/server`'s
-    // `plugin-provider.js`). This provider has **no channel** for it: the bridge's
-    // `initialize` carries cwd/route/effort only, and the profile's `system-prompt`
-    // row is static. Silently ignoring it would let a user believe their
-    // instructions reached the model, so it is reported loudly (stderr now, plus a
-    // timeline notice once the session is ready) and never faked. The complete fix
-    // needs a bridge-level per-session prompt section; until that exists this stays
-    // explicitly unsupported.
-    const unsupportedSystemPrompt =
-      typeof config.systemPrompt === "string" && config.systemPrompt.trim() !== ""
-        ? config.systemPrompt
-        : undefined;
-    if (unsupportedSystemPrompt !== undefined) {
-      process.stderr.write(
-        `[${PROVIDER_ID}] session ${sessionId}: Paseo supplied a ${String(unsupportedSystemPrompt.length)}-character system prompt, but this provider has no channel for it — it will NOT be applied\n`,
-      );
-    }
-
     /** Warnings collected during the open, emitted after `session.ready` so Paseo has the session. */
     const openWarnings: OpenWarning[] = [];
 
@@ -1253,6 +1234,8 @@ class DshConnection implements ProviderConnection {
       }
 
       session = new DshSession({
+        systemPrompt: config.systemPrompt,
+        permission: this.capabilities.includes("permission"),
         sessionId,
         dshSessionId,
         cwd: config.cwd,
@@ -1480,17 +1463,6 @@ class DshConnection implements ProviderConnection {
     });
     this.#emit({ type: "session.config", sessionId, config: session.configState() });
     this.#emit({ type: "session.ready", requestId: input.requestId, sessionId });
-    // Report what this open degraded: a system prompt this provider cannot carry,
-    // a command catalog that failed to load, or a permission preset that was not
-    // applied. All three were previously either stderr-only or silent.
-    if (unsupportedSystemPrompt !== undefined) {
-      this.#notice(
-        sessionId,
-        "warning",
-        "自定义 system prompt 未生效",
-        "Paseo 为该会话配置了 system prompt，但本插件目前没有把它交给 DSH 的通道（需要桥提供会话级 prompt section）。该指令未生效；请改用 AGENTS.md 或 profile 配置。",
-      );
-    }
     for (const warning of openWarnings) {
       this.#notice(sessionId, warning.severity, warning.title, warning.description);
     }

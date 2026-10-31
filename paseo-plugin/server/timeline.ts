@@ -13,6 +13,7 @@ import type {
 } from "@getpaseo/plugin/server/provider";
 import type { JsonValue } from "./json-value";
 import { LOCALE, UI } from "./locale";
+import { ActivityTimeline } from "./activity-timeline";
 
 interface DshEvent {
   type: string;
@@ -721,6 +722,7 @@ function todoItems(input: Record<string, unknown>): Array<{ text: string; comple
 }
 
 export class TimelineBuilder {
+  #activity = new ActivityTimeline();
   #items = new Map<string, ProviderTimelineItem>();
   #toolNames = new Map<string, string>();
   #toolInputs = new Map<string, Record<string, unknown>>();
@@ -803,6 +805,14 @@ export class TimelineBuilder {
     // snapshot of the step in flight, carrying the same turn/step the durable
     // `assistant/message` will, so both fold into the same item id.
     if (event.type === ASSISTANT_DELTA_EVENT) return this.#assistantDelta(data);
+    try {
+      const activity = this.#activity.consume(event.type, data);
+      if (activity) return this.#put(activity);
+    } catch (error) {
+      const message = `${event.type}: ${error instanceof Error ? error.message : String(error)}`;
+      this.#warn(message);
+      return this.#put({ type: "error", id: `activity-error:${event.type}:${event.seq ?? this.#items.size}`, message });
+    }
     switch (event.type) {
       case "assistant/message":
         return this.#assistantMessage(data);
@@ -843,7 +853,10 @@ export class TimelineBuilder {
    * closed row leaves the running set.
    */
   settleRunningTools(): ProviderTimelineItem[] {
-    return this.#cancelRunningTools();
+    return [
+      ...this.#cancelRunningTools(),
+      ...this.#activity.settle().flatMap((item) => this.#put(item)),
+    ];
   }
 
   /**
@@ -874,7 +887,10 @@ export class TimelineBuilder {
   }
 
   #put(item: ProviderTimelineItem): ProviderTimelineItem[] {
-    if (item.type === "tool_call") {
+    // Workflow activity rows are owned by workflow/run-end, not by the tool
+    // invocation's turn: a background workflow can outlive that turn. The
+    // reserved callId prefix belongs only to ActivityTimeline's synthetic rows.
+    if (item.type === "tool_call" && !item.callId.startsWith("workflow:")) {
       if (item.status === "running") this.#runningTools.add(item.callId);
       else this.#runningTools.delete(item.callId);
     }

@@ -16,6 +16,7 @@
  *
  * @module dsh-paseo-bridge/server
  */
+import { readSessionProjections } from './session-projections.js';
 import { resolve } from 'node:path';
 import { brandString } from '@deepseek-ai/dsh-brand';
 import { BlockAssembler, createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
@@ -281,6 +282,8 @@ export class PaseoHarnessServer {
      * writes it.
      */
     this.sessionRoutes = new Map();
+    this.sessionSystemPrompts = new Map();
+    this.systemPromptDisposers = new Map();
 
     /**
      * Plan-mode intent recorded before a session's agent exists. Paseo opens a
@@ -874,6 +877,10 @@ export class PaseoHarnessServer {
    */
   async initialize(params) {
     if (params.cwd === undefined) throw new TypeError('initialize requires cwd');
+    if (params.systemPrompt !== undefined && typeof params.systemPrompt !== 'string') {
+      throw new TypeError('initialize systemPrompt must be a string');
+    }
+    if (params.systemPrompt && !params.sessionId) throw new Error('systemPrompt requires sessionId');
     if (params.reasoningEffort !== undefined) effortOf(params.reasoningEffort);
     const cwd = resolve(params.cwd);
     const sessionId = params.sessionId === undefined || params.sessionId === null
@@ -936,6 +943,15 @@ export class PaseoHarnessServer {
       this.reasoningEffort = reasoningEffort;
       this.maxTokens = params.maxTokens;
     } else {
+      // Unlike route defaults, an omitted prompt clears the previous owner's
+      // customization. Never inherit another session's or a prior open's text.
+      const prompt = params.systemPrompt ?? '';
+      if (prompt && this.ctx.get('systemPrompt') === undefined) {
+        throw new Error('systemPrompt service is not mounted in this profile');
+      }
+      this.sessionSystemPrompts.set(sessionId, prompt);
+      const live = this.sessions.get(sessionId);
+      if (live) this.installSystemPrompt(sessionId, live.handle.agent.ctx);
       this.sessionCwd.set(sessionId, cwd);
       // `null` (not `undefined`) records "resolved to no thinking level", so a
       // later `configSet` clear and a merely-unpinned row stay distinguishable.
@@ -2408,6 +2424,26 @@ export class PaseoHarnessServer {
     };
   }
 
+  /** Non-activating upstream read. Keep its sequenced/migration-required/null
+   * distinction; cached migration hints are not exact values. No usage cache. */
+  async projections(params) {
+    if (typeof params.sessionId !== 'string' || !params.sessionId.trim()) {
+      throw new TypeError('paseo/projections requires sessionId');
+    }
+    if (params.keys !== undefined && (!Array.isArray(params.keys)
+      || params.keys.some((key) => typeof key !== 'string' || !key.trim()))) {
+      throw new TypeError('paseo/projections keys must be nonempty strings');
+    }
+    const snapshot = await readSessionProjections(this.ctx, params.sessionId, AbortSignal.timeout(30_000));
+    if (snapshot === null || params.keys === undefined) return snapshot;
+    const values = {};
+    for (const key of params.keys) {
+      if (!Object.hasOwn(snapshot.values, key)) throw new Error(`unknown or unavailable projection key: ${key}`);
+      Object.defineProperty(values, key, { value: snapshot.values[key], enumerable: true });
+    }
+    return { ...snapshot, values };
+  }
+
   /**
    * DSH's `contextPressure` projection — the newest pressure sample and route
    * capacity, read through the unit's client view so `projectedTokens` (which
@@ -2617,6 +2653,9 @@ export class PaseoHarnessServer {
     this.sessionCreations.clear();
     const records = [...this.sessions.values()];
     this.sessions.clear();
+    for (const dispose of this.systemPromptDisposers.values()) dispose();
+    this.systemPromptDisposers.clear();
+    this.sessionSystemPrompts.clear();
     const failures = [];
     while (this.disposers.length > 0) {
       try {
@@ -2695,6 +2734,8 @@ export class PaseoHarnessServer {
         return this.configSet(params);
       case 'paseo/mcp/set':
         return this.setMcpServers(params);
+      case 'paseo/projections':
+        return this.projections(params);
       case 'session/close':
         return this.closeSession(params);
       case 'shutdown':
@@ -3031,6 +3072,9 @@ export class PaseoHarnessServer {
    * @param {string} sessionId
    */
   #forgetSessionState(sessionId) {
+    this.systemPromptDisposers.get(sessionId)?.();
+    this.systemPromptDisposers.delete(sessionId);
+    this.sessionSystemPrompts.delete(sessionId);
     this.sessions.delete(sessionId);
     this.controls.delete(sessionId);
     this.assistantStreams.delete(sessionId);
@@ -3096,7 +3140,11 @@ export class PaseoHarnessServer {
     this.sessionCreations.set(sessionId, creation);
     creation.then(
       () => this.sessionCreations.delete(sessionId),
-      () => this.sessionCreations.delete(sessionId),
+      () => {
+        this.sessionCreations.delete(sessionId);
+        this.systemPromptDisposers.get(sessionId)?.();
+        this.systemPromptDisposers.delete(sessionId);
+      },
     );
     return creation;
   }
@@ -3134,6 +3182,7 @@ export class PaseoHarnessServer {
     // tool with an identical definition.
     const installSelection = (agentCtx) => {
       control.dispose = installModelSelection(agentCtx, control.selection);
+      this.installSystemPrompt(sessionId, agentCtx);
     };
 
     // Paseo's MCP servers are mounted at the AGENT scope, not as a profile-wide
@@ -3288,5 +3337,20 @@ export class PaseoHarnessServer {
 
   hasAdapterFor(provider) {
     return this.ctx.get('llm')?.listProviders().some((entry) => entry.id === provider) ?? false;
+  }
+
+  /** Register through the agent's scope (DSH SystemPrompt.section contract).
+   * A unique suffix preserves the preset's persona; interpolate:false means
+   * user-provided {{literal}} text cannot become an unknown prompt variable. */
+  installSystemPrompt(sessionId, agentCtx) {
+    this.systemPromptDisposers.get(sessionId)?.();
+    this.systemPromptDisposers.delete(sessionId);
+    const text = this.sessionSystemPrompts.get(sessionId);
+    if (!text) return;
+    const service = agentCtx.get('systemPrompt');
+    if (!service) throw new Error('systemPrompt service is not mounted in this agent');
+    const dispose = service.section({ name: 'paseo:session-system-prompt',
+      order: service.getSectionOrder('DEPLOYMENT_PERSONA_SUFFIX') + 1, text, interpolate: false });
+    this.systemPromptDisposers.set(sessionId, dispose);
   }
 }

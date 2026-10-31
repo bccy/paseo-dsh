@@ -33,6 +33,9 @@ import {
   type DshSessionHandlers,
   type DshQuestion,
   type DshQuestionRequest,
+  type DshApprovalRequest,
+  type DshApprovalAnswer,
+  type DshApprovalSignal,
   type DshRevertResult,
   type DshRoute,
   type DshUsage,
@@ -107,6 +110,9 @@ const CHILD_BUFFER_LIMIT = 2000;
 const CHILD_LABEL_WAIT_EVENTS = 40;
 
 export interface DshSessionOptions {
+  systemPrompt?: string;
+  /** False when the host cannot display/respond to tool approval cards. */
+  permission?: boolean;
   sessionId: string;
   /**
    * DSH's own session id. Equal to {@link sessionId} for a Paseo-created
@@ -497,6 +503,7 @@ export class DshSession {
       onEvent: (payload) => this.#onSessionEvent(payload),
       onStatus: (status, sessionId) => this.#onStatus(status, sessionId),
       onQuestion: (request, sessionId) => this.#onQuestion(request, sessionId),
+      onPermission: (request, sessionId, signal) => this.#onPermission(request, sessionId, signal),
       onChildOpened: (payload) => this.#onChildOpened(payload),
       onExit: (code, signal) => {
         if (this.#closed) return;
@@ -564,6 +571,7 @@ export class DshSession {
     // re-points the session the process was constructed for, which on a shared
     // child would move another conversation's events.
     await process.attachSession(this.#dshSessionId, this.#sessionHandlers(), {
+      systemPrompt: this.#options.systemPrompt,
       cwd: this.#options.cwd,
       route: this.#route,
       ...(this.#options.mcpServers === undefined ? {} : { mcpServers: this.#options.mcpServers }),
@@ -2489,6 +2497,31 @@ export class DshSession {
     };
 
     return this.#openCard(sessionId, permission);
+  }
+
+  async #onPermission(request: DshApprovalRequest, sessionId: string, signal: DshApprovalSignal): Promise<DshApprovalAnswer> {
+    if (sessionId !== this.#dshSessionId || this.#closed) throw new Error("tool approval has no live owning session");
+    if (this.#options.permission === false) throw new Error("tool approval requires the negotiated permission capability");
+    const permissionId = `${this.id}:approval:${request.requestId}`;
+    const cancel = () => {
+      this.resolvePermission(permissionId, { behavior: "deny" });
+      if (signal.approvalTimedOut) this.#options.emit({ type: "session.notice", sessionId: this.id,
+        notice: { id: `${permissionId}:timeout`, severity: "warning", title: "Tool approval timed out", description: "The operation was not approved." } });
+    };
+    if (signal.aborted) return { outcome: "cancelled" };
+    signal.addEventListener("abort", cancel, { once: true });
+    try {
+      const response = await this.#openCard(this.id, {
+        id: permissionId, name: request.toolName, kind: "tool", title: request.toolName,
+        ...(request.reason ? { description: request.reason } : {}),
+        input: { ...(request.callId ? { callId: request.callId } : {}), ...(request.reason ? { reason: request.reason } : {}) },
+        actions: [
+          { id: "reject", label: "Reject", behavior: "deny", variant: "danger" },
+          { id: "allow-once", label: "Allow once", behavior: "allow", variant: "primary" },
+        ],
+      });
+      return { outcome: signal.aborted ? "cancelled" : response.behavior === "allow" ? "allowed-once" : "rejected" };
+    } finally { signal.removeEventListener("abort", cancel); }
   }
 
   #openCard(sessionId: string, permission: ProviderPermissionRequest): Promise<ProviderPermissionResponse> {

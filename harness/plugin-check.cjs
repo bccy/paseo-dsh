@@ -346,6 +346,7 @@ function projectTimelineLikePaseo(items, turnId) {
   // (`turn:${clientMessageId}`), so the assertion below can name the exact id
   // the daemon would have bound. Both fields are required by `ProviderPrompt`.
   const imageMsgId = "check-image-1";
+  const imageStart = events.length;
   await conn.send({
     type: "session.prompt",
     sessionId,
@@ -421,13 +422,18 @@ function projectTimelineLikePaseo(items, turnId) {
 
   // 1c. streamed stats: the row under an answer reports first-token latency and
   // throughput measured from live frames, not from the finished step.
-  const stats = events.filter(
-    (e) => e.type === "timeline.item" && e.item?.type === "plugin" && e.item.kind === "dsh-stream-stats",
+  const stats = events.slice(imageStart).filter(
+    (e) => e.sessionId === sessionId && e.type === "timeline.item" && e.item?.type === "plugin" && e.item.kind === "dsh-stream-stats",
   );
+  // A tool-only step can have durable token timing without any transient text
+  // frame, so its stats legitimately omit firstTokenMs. Require an actual timed
+  // row from this prompt instead of assuming the first step produced text.
+  const timedStats = stats.find((e) => typeof e.item.data?.firstTokenMs === "number"
+    && Number.isFinite(e.item.data.firstTokenMs) && e.item.data.firstTokenMs >= 0);
   check(
     "live frames produce a stream-stats row",
-    stats.length > 0 && typeof stats[0].item.data?.firstTokenMs === "number",
-    stats.length > 0 ? JSON.stringify(stats[0].item.data) : "no dsh-stream-stats item",
+    timedStats !== undefined,
+    timedStats ? JSON.stringify(timedStats.item.data) : "no timed dsh-stream-stats item from this prompt",
   );
 
   const lastStats = stats[stats.length - 1];

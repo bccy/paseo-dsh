@@ -309,7 +309,7 @@ export function withoutAssistantStream(event) {
  * carry a `surfaceOp`), so the fold needs it, but no consumer above reads it
  * back; it is dropped only because the fold already ran (see
  * {@link historyEvents}). The same holds for `developer/message` and the
- * `assistant/attempt`, `step/*`, `goal/change`, `request/*` family.
+ * `assistant/attempt`, `step/*`, `request/*` family.
  *
  * A whitelist rather than a blacklist is the point: a type this list has never
  * heard of is dropped, so a future DSH event type that starts mattering shows up
@@ -319,6 +319,11 @@ export function withoutAssistantStream(event) {
  * together.
  */
 export const REPLAYED_EVENT_TYPES = new Set([
+  'tool-workflow/run-start',
+  'tool-workflow/agent-start',
+  'tool-workflow/agent-end',
+  'tool-workflow/run-end',
+  'goal/change',
   'assistant/message',
   'tool/call',
   'tool/result',

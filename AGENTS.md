@@ -80,6 +80,72 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon fork 出的 p
 | **不要注册 `before("agent.session_open")`** | 宿主对带这个 hook 的插件，每次起停都会 `invalidatePluginSessions()`，于是**所有 agent（任何 provider）下一次提问前都会被 reload**。想拿 `paseo` 句柄就用 `on("agent.turn_started")` / `on("agent.turn_ended")` 或一条 RPC 在回调上下文里取 |
 | **改了 `dsh-bridge/` 必须重生成内嵌桥** | `paseo-plugin/server/bridge-assets.ts` 是桥的 base64 内嵌副本，供插件自举 profile（Paseo 安装插件不跑脚本）。跑 `node paseo-plugin/scripts/generate-bridge-assets.mjs`（`npm publish` 的 `prepack` 也会跑），并提交生成结果 |
 
+### 跟 DSH 升版
+
+**这个仓库没有官方支持，跟版是长期成本。** 桥直接依赖 DSH 的内部组装包（见「改完怎么验证」
+里的 `dsh-api-contract-check.mjs`），这些包**没有 API 稳定性承诺**；上游改一个提示词变量、
+一个 schema 字段或一个异步就绪时机，功能就会**静默失效**——不报错、不崩，只是没了。所以：
+
+**只跟稳定线。** `rc` 是某个版本的收尾，`alpha` 是下一个版本的开头，两者差的是成百上千个提交
+（实测 `0.2.1-rc.5` → `0.2.2-alpha.2` 相差 2161 个提交）。alpha 里那些「插件需迁移」的条目
+（异步 session projection、`tools.resolve/executable`、Cordis Timer 返回值、official-bundles
+import）等它走完 rc 再跟，那时改动才定型。
+
+**先读 release notes，再决定跑多少检查。** GitHub `deepseek-ai/deepseek-harness` 有逐版
+changelog（`npm view` 看不到）。关键判据是**上游改动落在哪一层**：UI / Web / 桌面壳层对桥零
+影响；提示词变量、插件 schema、异步就绪时机、工具 API 形状则影响高。用 `npm pack` 比对桥依赖
+的那几个包的 `lib/` 逐文件差异，比读 changelog 更能定性——实测 `0.2.1-rc.2` → `rc.5` 五个硬依赖
+包**逐文件 0 差异**，那就不必做全量验证。
+
+**升级顺序固定，前一步红就不要往下走：**
+
+```bash
+# 0. 备份当前状态，记录基线
+dsh --version && npm ls -g --depth=0 | grep dsh
+node paseo-plugin/bin/paseo-dsh.mjs doctor        # 升级前基线，留档对比
+
+# 1. 装新版
+npm install -g @deepseek-ai/dsh@<version>
+
+# 2. 契约级：桥依赖的内部 API 还在不在（秒级、纯离线）
+node harness/dsh-api-contract-check.mjs
+
+# 3. 资产新鲜度：内嵌桥与源码一致（必须在 plugin-check 之前）
+node harness/bridge-assets-check.mjs
+
+# 4. 安装完整性
+node paseo-plugin/bin/paseo-dsh.mjs doctor
+
+# 5. 真实回合：这一步 doctor 替代不了
+node harness/plugin-check.cjs                     # 34 项，含真实模型回合
+
+# 6. 离线回归（动到对应区域时）
+node harness/plugin-build-check.mjs
+node harness/frame-reader-check.mjs
+node harness/transport-frame-check.mjs
+node harness/mcp-http-check.mjs
+node harness/mcp-stdio-check.mjs
+
+# 7. 重启进程让新版生效
+paseo daemon restart
+```
+
+**为什么 `doctor` 全绿不算数。** 它只查安装完整性（CLI/版本/profile/桥文件/路由/key），查不出
+回合层失败和空模型目录——`docs/FIELD-NOTES.md` 第 58 条就是这么漏过去的。而且
+`paseo-plugin/lib/doctor.mjs` 的 `compareCore` **只比 `major.minor.patch`、忽略预发布后缀**，
+所以 `0.2.2-alpha.2` 甚至 `0.3.0-alpha.1` 都会被判通过。**doctor 永远不会拦住你升到一个破坏性
+版本**，唯一的判据是 `plugin-check.cjs` 跑通。
+
+**为什么 `bridge-assets-check` 必须在 `plugin-check` 之前。** 后者加载插件时会把内嵌桥重写进
+`~/.dsh/profiles/<name>/node_modules/dsh-paseo-bridge`。内嵌桥若是旧的，就等于把旧桥装进 live
+profile，之后的真机检查都在旧代码上"假绿"。
+
+**重启前确认生效路径。** 磁盘上换版本不会影响已运行的进程（Node 已经把旧模块读进内存）。
+`dsh --version` 看的是磁盘，`ps -o lstart= -p <pid>` 看的是进程启动时间——两者对不上就是还没生效。
+`paseo daemon restart` 会重启 worker 并保留 supervisor 的启动方式，不必手工杀进程。**注意它也会
+换掉 Web 端口**，重启后以新端口为准。如果当前会话就跑在那个 `dsh` 子进程里，重启会终止它——
+先确认会话历史在 `~/.dsh/sessions`（不丢），再决定是否接受中断。
+
 ### MCP 注入与 gateway
 
 Paseo 把它的 MCP server 通过 `config.mcpServers` 交给 provider，插件把它翻成 DSH 启动时的
@@ -105,6 +171,7 @@ Paseo 把它的 MCP server 通过 `config.mcpServers` 交给 provider，插件�
 界面不可信，断言要打在协议层：
 
 ```bash
+node harness/dsh-api-contract-check.mjs      # 桥依赖的 DSH 内部 API 还在不在（秒级、纯离线）
 node paseo-plugin/bin/paseo-dsh.mjs doctor   # 一眼看安装是否完整：CLI/版本/profile/bridge/路由/key
 node harness/catalog.mjs      # provider / 模型 / 每个模型的真实思考档位
 node harness/probe.mjs        # 端到端提问往返
@@ -218,6 +285,17 @@ token），并且加载插件会把内嵌桥重写进 `~/.dsh/profiles/<name>/no
   校验并保留多余键），所以排他判据只能在 `transportOf` 里，这个脚本钉住它。纯离线，
   依赖从 DSH 安装目录按绝对路径加载（`DSH_PACKAGES_DIR` 可覆盖）。**动了 `transportOf`、
   gateway 的 `Config` 或 `clientFor` 的传输分派必跑。**
+- `harness/dsh-api-contract-check.mjs` — 桥依赖的 **DSH 内部 API** 还在不在（纯离线、秒级，
+  不起进程、不耗 token）。桥不是 ACP 适配器，它直接 import 八个 DSH 内部组装包
+  （`dsh-llm` / `dsh-agent` / `dsh-attachment` / `dsh-brand` / `dsh-cmdline` / `dsh-tools` /
+  `dsh-subprocess` / `schemastery`），这些包**没有 API 稳定性承诺**。脚本断言两件事：
+  **覆盖率**（桥源码里每个 `@deepseek-ai/*` import 都必须在 `EXPECTED` 清单里，且清单里没有
+  桥已不用的条目——**双向**，所以新增依赖漏登记、删了 import 留下死清单都会红）和**存在性**
+  （13 个符号仍被导出、类型没变）。它查的是 FIELD-NOTES #58 那种失效：`{{cwd}}` 变量被上游
+  删掉，每个回合都在提示词装配阶段抛错，界面只有一条空的 `[error]`，而 **doctor 全程是绿的**
+  （doctor 只查安装完整性，查不出软契约）。**它不查行为**——签名变了但符号还在，这里不会红，
+  那由 `plugin-check.cjs` 的真实回合覆盖。两个都跑才算数。**DSH 升版后必跑、优先于其它一切**：
+  它最快、且失败信息直接点名哪个包的哪个符号没了。`DSH_PACKAGES_DIR` 可覆盖安装目录。
 - `harness/bridge-assets-check.mjs` — `server/bridge-assets.ts` 必须与 `dsh-bridge/` 和
   `templates/` 逐字节一致（只读，不起进程）。**改桥后先跑它、再跑任何插件级脚本。**
 - `harness/doctor-check.mjs` — `paseo-plugin/lib/doctor.mjs` 的判定，驱动真实的 `runDoctor()`
