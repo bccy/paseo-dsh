@@ -1,0 +1,157 @@
+[
+  {
+    "package": "dsh-brand",
+    "changed_lib_files": 0,
+    "examples": [],
+    "tarball": "https://registry.npmjs.org/@deepseek-ai/dsh-brand/-/dsh-brand-0.2.2-alpha.2.tgz",
+    "integrity": "sha512-VFHjxHZbfQRjaQHC9fO6oSeCZcHQeA54nThij/WB2Q6Qv8VBdJkitbVzYNLr54gmVDxQXfdK/yYJzHAQade6lg=="
+  },
+  {
+    "package": "dsh-llm",
+    "changed_lib_files": 4,
+    "examples": [
+      "lib/typert.host.js",
+      "lib/index.js",
+      "lib/types/types.d.ts",
+      "lib/types/index.js"
+    ],
+    "tarball": "https://registry.npmjs.org/@deepseek-ai/dsh-llm/-/dsh-llm-0.2.2-alpha.2.tgz",
+    "integrity": "sha512-AwlZx8DW4e0xg/xB/YzvORSHKKQWMyhJgFXT4J9+5QV3x3BI2M35kHxRD4LoBQ2wRO1tImgaCgA4tH1haMw6IQ=="
+  },
+  {
+    "package": "dsh-attachment",
+    "changed_lib_files": 4,
+    "examples": [
+      "lib/index.js",
+      "lib/types/types.d.ts",
+      "lib/types/index.d.ts",
+      "lib/types/index.js"
+    ],
+    "tarball": "https://registry.npmjs.org/@deepseek-ai/dsh-attachment/-/dsh-attachment-0.2.2-alpha.2.tgz",
+    "integrity": "sha512-fl0hnNBtHHYpxN+X0WnR/+aGFq0tOWDQMImyDhJX4CA60OIlgReSPAn+VPrHtKkqK3h5t/4g2yMcsukX/0kehg=="
+  },
+  {
+    "package": "dsh-agent",
+    "changed_lib_files": 9,
+    "examples": [
+      "lib/index.js",
+      "lib/types/types.d.ts",
+      "lib/types/runtime-types.d.ts",
+      "lib/types/projection.d.ts",
+      "lib/types/model-selection.d.ts",
+      "lib/types/index.d.ts",
+      "lib/types/projection.js",
+      "lib/types/model-selection.js"
+    ],
+    "tarball": "https://registry.npmjs.org/@deepseek-ai/dsh-agent/-/dsh-agent-0.2.2-alpha.2.tgz",
+    "integrity": "sha512-e1seyUG26WYUAFX7tJJzhtg1aBwqIR7sFijt8S9DujS9alXwEdOZAYpJG531qqRGZSlM+XNT6z5AeH5KSjqdsA=="
+  },
+  {
+    "package": "dsh-cmdline",
+    "changed_lib_files": 0,
+    "examples": [],
+    "tarball": "https://registry.npmjs.org/@deepseek-ai/dsh-cmdline/-/dsh-cmdline-0.2.2-alpha.2.tgz",
+    "integrity": "sha512-BulK36y1b0x9SzoOTvxNkf+KAtXcpBem72HF9oAIijF4leoXwnx3Tfg366Q/oRzhby34aoNdX+gmyiL5a3Lghw=="
+  },
+  {
+    "package": "dsh-tools",
+    "changed_lib_files": 17,
+    "examples": [
+      "lib/shared-DTdn5dXO.js",
+      "lib/pipeline.js",
+      "lib/index.js",
+      "lib/types/schema.d.ts",
+      "lib/types/pipeline.d.ts",
+      "lib/types/index.d.ts",
+      "lib/types/executor.d.ts",
+      "lib/types/events.d.ts"
+    ],
+    "tarball": "https://registry.npmjs.org/@deepseek-ai/dsh-tools/-/dsh-tools-0.2.2-alpha.2.tgz",
+    "integrity": "sha512-2KXvznBB1R8rUpfdOmmmufeo65t3hqXDBjq7qSLCfM4RHibQz8WL692WBcTWznGnoMVWifIPXDfUas3SjJdNSw=="
+  },
+  {
+    "package": "dsh-subprocess",
+    "changed_lib_files": 0,
+    "examples": [],
+    "tarball": "https://registry.npmjs.org/@deepseek-ai/dsh-subprocess/-/dsh-subprocess-0.2.2-alpha.2.tgz",
+    "integrity": "sha512-rZHXZaeZWwKz6mFPVeuBL3vDgNrWrVppyBHdFR+CeOSmPvLi0tbjXZctuhWPCSLfn2kLZGFGPnRFimMdsjVWBQ=="
+  },
+  {
+    "package": "dsh-session-projection",
+    "changed_lib_files": 4,
+    "examples": [
+      "lib/index.js",
+      "lib/types/types.d.ts",
+      "lib/types/index.d.ts",
+      "lib/types/index.js"
+    ],
+    "tarball": "https://registry.npmjs.org/@deepseek-ai/dsh-session-projection/-/dsh-session-projection-0.2.2-alpha.2.tgz",
+    "integrity": "sha512-RdVHzNU+UtS+pLc/PIF99/Eu34Epr2kKv1GhO2ir1Btqlk0FV2/8ZCeVhZIpiEug2e4AoaZwX1Cnuq4Liy86YQ=="
+  },
+  {
+    "package": "dsh-session-query",
+    "changed_lib_files": 0,
+    "examples": [],
+    "tarball": "https://registry.npmjs.org/@deepseek-ai/dsh-session-query/-/dsh-session-query-0.2.2-alpha.2.tgz",
+    "integrity": "sha512-TgwkXBuKQ05N2nr+k09wjMdptwLQqKg0pM9DTQbXjC1qmt5OICsvQCHXkxjd6yCb1IFgD4+Z3tUqt6rj4AKjJA=="
+  },
+  {
+    "package": "dsh-sdk-protocol",
+    "changed_lib_files": 4,
+    "examples": [
+      "lib/index.js",
+      "lib/types/types.d.ts",
+      "lib/types/transport.d.ts",
+      "lib/types/index.d.ts"
+    ],
+    "tarball": "https://registry.npmjs.org/@deepseek-ai/dsh-sdk-protocol/-/dsh-sdk-protocol-0.2.2-alpha.2.tgz",
+    "integrity": "sha512-O773s4t1eBO88Dv68yWoTfd9h0OHbMsX3aa9cz0OimR+RuovQsNmQBntZCWiuaXxUD9C+NUrVOCF1SMCZCm2Nw=="
+  },
+  {
+    "package": "dsh-sdk-jsonrpc-server",
+    "changed_lib_files": 3,
+    "examples": [
+      "lib/index.js",
+      "lib/types/user-questions.d.ts",
+      "lib/types/server.d.ts"
+    ],
+    "tarball": "https://registry.npmjs.org/@deepseek-ai/dsh-sdk-jsonrpc-server/-/dsh-sdk-jsonrpc-server-0.2.2-alpha.2.tgz",
+    "integrity": "sha512-aD/a9fJH+qRA+GbppO5vi9+y/bVjG9ZEn2srOKivWRKbPXdRxXw8YoEPvWtFPC28/rz5XLRT9/YF0H8TmmFTBQ=="
+  },
+  {
+    "package": "dsh-acp",
+    "changed_lib_files": 4,
+    "examples": [
+      "lib/index.js",
+      "lib/types/session.d.ts",
+      "lib/types/model-control.d.ts",
+      "lib/types/content.d.ts"
+    ],
+    "tarball": "https://registry.npmjs.org/@deepseek-ai/dsh-acp/-/dsh-acp-0.2.2-alpha.2.tgz",
+    "integrity": "sha512-4g7Q1cssOd2k8OBQoQdeHeNjk7RpvMO/Ho3/QnYNdrQXUxOEJiA7gimE1DToImHyLIMT1XcgF7KKB7Yj6oY6PQ=="
+  },
+  {
+    "package": "dsh-api-session-controller",
+    "changed_lib_files": 42,
+    "examples": [
+      "lib/typert.remote-client.d.ts",
+      "lib/typert.remote-client.js",
+      "lib/typert.host.js",
+      "lib/index.js",
+      "lib/client.js",
+      "lib/types/types.d.ts",
+      "lib/types/media-references.d.ts",
+      "lib/types/list.d.ts"
+    ],
+    "tarball": "https://registry.npmjs.org/@deepseek-ai/dsh-api-session-controller/-/dsh-api-session-controller-0.2.2-alpha.2.tgz",
+    "integrity": "sha512-6mQ+oaQNnB/DrM+EtS7/sZVF8lA4o0ej8aaXKzBXHpOHj1BFVdeuasfNg+0Cu/bHiiu1yGJjptJXSvBFh+bOIg=="
+  },
+  {
+    "package": "schemastery",
+    "version": "3.18.6-alpha.1",
+    "changed_lib_files": 0,
+    "examples": [],
+    "tarball": "https://registry.npmjs.org/@deepseek-ai/schemastery/-/schemastery-3.18.6-alpha.1.tgz",
+    "integrity": "sha512-ID5DKpWa0BnrcNdZ3ofWkhOoRLQ3MsFr1FdRVHBiALeE9egaCm4QatuCvQK0Cd/haRBcEvefacz2JEYYMFAEnw=="
+  }
+]

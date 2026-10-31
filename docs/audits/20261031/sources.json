@@ -1,0 +1,159 @@
+{
+  "as_of": "2026-10-31 Asia/Shanghai",
+  "paseo_docs_fallback": "paseo.sh/llms.txt returned 403; official GitHub public-docs and source were fetched instead",
+  "paseo_main": "186c132151ff99889db0572534bd400acdf2cc5b",
+  "dsh_master": "ce7073d51254c26cd63b22a60835b8f948deb447",
+  "sources": [
+    {
+      "name": "Paseo npm metadata",
+      "url": "https://registry.npmjs.org/@getpaseo%2fcli",
+      "retrieved_sha256": "ea07edbc652dee43e5a2c66f4835bf40941b414eba524efc9e07097b8c7e7cfe"
+    },
+    {
+      "name": "DSH npm metadata",
+      "url": "https://registry.npmjs.org/@deepseek-ai%2fdsh",
+      "retrieved_sha256": "143ab809af2dfd73c5033eb94faf80342b7499a4375615b068c4a31c89e84974"
+    },
+    {
+      "name": "Paseo releases",
+      "url": "https://api.github.com/repos/getpaseo/paseo/releases?per_page=15",
+      "retrieved_sha256": "3dc48095cb8cb73cc79b49c23c40f16f3672d9c2e33692412aa50381a6df0b81"
+    },
+    {
+      "name": "DSH releases",
+      "url": "https://api.github.com/repos/deepseek-ai/deepseek-harness/releases?per_page=12",
+      "retrieved_sha256": "3549119d9b64a3f971cab8d5381910404a4cf305c3ad539522632c2e21cd5d8e"
+    },
+    {
+      "name": "Paseo provider documentation",
+      "url": "https://github.com/getpaseo/paseo/blob/186c132151ff99889db0572534bd400acdf2cc5b/public-docs/plugins/providers.md",
+      "retrieved_sha256": "b54cfc5400afdcea918b87611e114207cbcc02e8f96acf833d52d5a29a48f322"
+    },
+    {
+      "name": "Paseo plugin reference",
+      "url": "https://github.com/getpaseo/paseo/blob/186c132151ff99889db0572534bd400acdf2cc5b/public-docs/plugins/reference.md",
+      "retrieved_sha256": "52252f815740e69bc4373b217f8a138a8fee390cda0cf79848ce9d4842070da0"
+    },
+    {
+      "name": "Paseo 0.14.0 adapter",
+      "url": "https://github.com/getpaseo/paseo/blob/v0.14.0/packages/server/src/server/agent/plugin-provider.ts",
+      "retrieved_sha256": "c976c45c43b428315837838924ea05f41e2412fbe8adcab5c88883b356670a49"
+    },
+    {
+      "name": "Paseo main adapter",
+      "url": "https://github.com/getpaseo/paseo/blob/186c132151ff99889db0572534bd400acdf2cc5b/packages/server/src/server/agent/plugin-provider.ts",
+      "retrieved_sha256": "b43f0952eea7e9a9fb0c23fc4046463fd397a6c0d8cb8f8532dc13b757746c76"
+    },
+    {
+      "name": "DSH ACP contract at rc.5",
+      "url": "https://github.com/deepseek-ai/deepseek-harness/blob/b830ec950faba0a46dda564be3e2d854afed94f1/packages/acp/acp/README.md"
+    },
+    {
+      "name": "DSH alpha SDK protocol",
+      "url": "https://github.com/deepseek-ai/deepseek-harness/blob/f3803c96974ad4a94195fb97e5c637e9c2a3afe3/packages/sdk/protocol/src/types.ts",
+      "retrieved_sha256": "9e96d1c4a07d1be4bb21b071b9ebb947136e8d48123602738edadfe678dfa191"
+    },
+    {
+      "name": "DSH alpha SDK server",
+      "url": "https://github.com/deepseek-ai/deepseek-harness/blob/f3803c96974ad4a94195fb97e5c637e9c2a3afe3/packages/sdk/server/README.md",
+      "retrieved_sha256": "d8c469ec81199823a98cef05b5d9cc4faa4bad228b8a0169086eac418ce6bdb0"
+    },
+    {
+      "name": "DSH alpha SessionController",
+      "url": "https://github.com/deepseek-ai/deepseek-harness/blob/f3803c96974ad4a94195fb97e5c637e9c2a3afe3/packages/api/session-controller/README.md",
+      "retrieved_sha256": "4fc4efc7a319fddb8a20520f2a9bd81637480b1f3c465eeb9abf14426c0393bc"
+    },
+    {
+      "name": "DSH alpha model-selection implementation",
+      "url": "https://github.com/deepseek-ai/deepseek-harness/blob/f3803c96974ad4a94195fb97e5c637e9c2a3afe3/packages/core/agent/src/model-selection.ts",
+      "npm_package": "@deepseek-ai/dsh-agent@0.2.2-alpha.2"
+    },
+    {
+      "name": "Paseo #8080",
+      "url": "https://github.com/getpaseo/paseo/pull/8080",
+      "state": "closed",
+      "merged_at": "2026-10-28T04:55:11Z",
+      "retrieved_sha256": "17be82d6107277adf95f4e32f0a14f228473945c2d79a7d3deae7ba4cee7dde7"
+    },
+    {
+      "name": "Paseo #7675",
+      "url": "https://github.com/getpaseo/paseo/pull/7675",
+      "state": "closed",
+      "merged_at": "2026-10-28T13:14:13Z",
+      "retrieved_sha256": "729e71caab42120885603d7c92176cff0e5119d9712a86ed3a104e7355eb1ee8"
+    },
+    {
+      "name": "Paseo #8053",
+      "url": "https://github.com/getpaseo/paseo/issues/8053",
+      "state": "open",
+      "merged_at": null,
+      "retrieved_sha256": "b752a4686bb36d30578db5464130b743142ab43fdf3d42dca53efe7748acc081"
+    },
+    {
+      "name": "Paseo #8054",
+      "url": "https://github.com/getpaseo/paseo/pull/8054",
+      "state": "closed",
+      "merged_at": null,
+      "retrieved_sha256": "50b3732caf8cb94fe5495866a94bc04ad9cc0d0c230223c61b1469eeab7a9113"
+    },
+    {
+      "name": "Paseo #6635",
+      "url": "https://github.com/getpaseo/paseo/pull/6635",
+      "state": "open",
+      "merged_at": null,
+      "retrieved_sha256": "ae8860d685b4ad63ef2a9e7dbbe087e6730c0e165996d228fb224fb92d0baad9"
+    },
+    {
+      "name": "paseo-dsh npm metadata",
+      "url": "https://registry.npmjs.org/paseo-dsh",
+      "dist_tags": {
+        "latest": "0.2.17"
+      },
+      "published_latest_at": "2026-10-30T08:52:50.517Z"
+    },
+    {
+      "name": "dsh-api-session-controller official API follow-up",
+      "version": "0.2.1-rc.5",
+      "url": "https://github.com/deepseek-ai/deepseek-harness/blob/b830ec950faba0a46dda564be3e2d854afed94f1/packages/api/session-controller/README.md",
+      "evidence": "read installed official npm package; no API invocation",
+      "files_sha256": {
+        "README.md": "d8fdb1e206b0e4edb2e3939a9b85e4f7770fdee037c47475a7ab0e70aad7b73b",
+        "lib/types/index.d.ts": "add6ff54e3060811e94c79bb6a82e7d16b3e14cad98c658ea811fb025aaadde4",
+        "lib/index.js": "a9801acb577b03053c5d5a3191ff555c5f1d791d0acddec113bea4511e33b386"
+      }
+    },
+    {
+      "name": "dsh-api-job-controller official API follow-up",
+      "version": "0.2.1-rc.5",
+      "url": "https://github.com/deepseek-ai/deepseek-harness/blob/b830ec950faba0a46dda564be3e2d854afed94f1/packages/api/job-controller/README.md",
+      "evidence": "read installed official npm package; no API invocation",
+      "files_sha256": {
+        "README.md": "9e0fe7145e6fb050aae26460516956961d774941e4584ff8bf9b09d60475a1a0",
+        "lib/types/index.d.ts": "158be198bdb5bb72128d309495680ca7541aa20825913cca22a451c79248ef90",
+        "lib/index.js": "e1c9bbfd55f375a3c7e2d8d7b2578a48c6fcda1be5e332d8456238a51b9f33b1"
+      }
+    },
+    {
+      "name": "dsh-api-workspace-controller official API follow-up",
+      "version": "0.2.1-rc.5",
+      "url": "https://github.com/deepseek-ai/deepseek-harness/blob/b830ec950faba0a46dda564be3e2d854afed94f1/packages/api/workspace-controller/README.md",
+      "evidence": "read installed official npm package; no API invocation",
+      "files_sha256": {
+        "README.md": "d094f0c4782bcdad62f7fef5d2c92548d7fa691e45e8298a89be86427e90a7cc",
+        "lib/types/index.d.ts": "e08ce6184fc6d1d43c4d476f2f75f502d93e8f607d3230abef2470eab6816cf1",
+        "lib/index.js": "257848af0e4bacb15265660a3750c7909bb4002ab02a1c2a3188045f882ee39e"
+      }
+    },
+    {
+      "name": "dsh-api-gateway official API follow-up",
+      "version": "0.2.1-rc.5",
+      "url": "https://github.com/deepseek-ai/deepseek-harness/blob/b830ec950faba0a46dda564be3e2d854afed94f1/packages/api/gateway/README.md",
+      "evidence": "read installed official npm package; no API invocation",
+      "files_sha256": {
+        "README.md": "3cd3977248900fc1f79359e19722a7d2a71502c33276d1a1e0a600adffed72fd",
+        "lib/types/index.d.ts": "bff10c36bf9e677bac16a33e6cf86eb4df4ce46aa416ecc4670bbc3a5c5b61e9",
+        "lib/index.js": "4fbe460fec585ebc2cf2887261f6c33f024081a539d9fb5d6557a9002324b23f"
+      }
+    }
+  ]
+}

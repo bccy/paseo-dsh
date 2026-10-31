@@ -1,0 +1,194 @@
+path,category,review_evidence
+.gitattributes,repository metadata/license,inventory and delivery boundary review
+.github/workflows/sync-upstream.yml,client/delivery,client-delivery.md
+.gitignore,repository metadata/license,inventory and delivery boundary review
+.tmp-deskpet-mobile-390x844.png,static non-runtime artifact,scope/inventory review; no native-device visual acceptance
+AGENTS.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+LICENSE,repository metadata/license,inventory and delivery boundary review
+README.en.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+README.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/0.12-ADOPTION.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/ADOPTION.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/DRAFT-ISSUE-child-subagent-running.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/FIELD-NOTES.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/FULL-AUDIT-20261020.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/FULL-AUDIT-20261029.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/IMPL-CONTRACT.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/ONE-PROCESS-MULTI-SESSION-PLAN.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/PLAN-REWIND-NATIVE.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/PROGRESS-REWIND-NATIVE.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/RENDER-PLAN.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/REWIND.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/README.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/baseline/README.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/plans/001-session-visibility/README.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/plans/001-session-visibility/history-evidence.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/plans/001-session-visibility/history-findings.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/plans/001-session-visibility/history/implementation-status-20261015.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/plans/001-session-visibility/review.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/plans/001-session-visibility/roadmap.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/plans/001-session-visibility/subagent-design.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/plans/001-session-visibility/subagent-evidence.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/plans/001-session-visibility/verification.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/plans/002-steer-turn-identity/README.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/plans/002-steer-turn-identity/design.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/plans/002-steer-turn-identity/evidence.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/plans/002-steer-turn-identity/roadmap.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/plans/003-capability-gap/README.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/plans/003-capability-gap/design.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/plans/003-capability-gap/evidence.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/plans/003-capability-gap/excluded.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/plans/003-capability-gap/review.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/plans/003-capability-gap/roadmap.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/plantree/plans/003-capability-gap/screenshots/approval-mobile.png,static non-runtime artifact,scope/inventory review; no native-device visual acceptance
+docs/plantree/plans/003-capability-gap/screenshots/workflow-goal-desktop.png,static non-runtime artifact,scope/inventory review; no native-device visual acceptance
+docs/plantree/plans/003-capability-gap/screenshots/workflow-goal-mobile.png,static non-runtime artifact,scope/inventory review; no native-device visual acceptance
+docs/plantree/plans/003-capability-gap/upstream-issues.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+docs/preview/render-compare.html,static non-runtime artifact,scope/inventory review; no native-device visual acceptance
+docs/preview/tool-row-style-proposal.png,static non-runtime artifact,scope/inventory review; no native-device visual acceptance
+docs/preview/tool-rows-dsh-vs-proposed.html,static non-runtime artifact,scope/inventory review; no native-device visual acceptance
+docs/preview/tool-rows-dsh-vs-proposed.png,static non-runtime artifact,scope/inventory review; no native-device visual acceptance
+docs/research/table-labels.md,documentation,architecture/history cross-check; no claim of every historical statement revalidated
+dsh-bridge/cordis.patch.yml,bridge,bridge.md
+dsh-bridge/lib/approval.js,bridge,bridge.md
+dsh-bridge/lib/archived-lineage.js,bridge,bridge.md
+dsh-bridge/lib/child-anchors.js,bridge,bridge.md
+dsh-bridge/lib/delegated-cancel.js,bridge,bridge.md
+dsh-bridge/lib/file-snapshots.js,bridge,bridge.md
+dsh-bridge/lib/image-host-path.js,bridge,bridge.md
+dsh-bridge/lib/index.js,bridge,bridge.md
+dsh-bridge/lib/mcp-gateway.js,bridge,bridge.md
+dsh-bridge/lib/mcp-http.js,bridge,bridge.md
+dsh-bridge/lib/mcp-stdio.js,bridge,bridge.md
+dsh-bridge/lib/paseo-system-envelope.js,bridge,bridge.md
+dsh-bridge/lib/revert.js,bridge,bridge.md
+dsh-bridge/lib/server.js,bridge,bridge.md
+dsh-bridge/lib/session-projections.js,bridge,bridge.md
+dsh-bridge/lib/snapshot-owners.js,bridge,bridge.md
+dsh-bridge/lib/subagent-archive.js,bridge,bridge.md
+dsh-bridge/lib/surface.js,bridge,bridge.md
+dsh-bridge/lib/transport.js,bridge,bridge.md
+dsh-bridge/package.json,bridge,bridge.md
+harness/agent-message-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/archive-registry-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/archived-lineage-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/assistant-retry-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/assistant-stream-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/bridge-assets-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/bridge-server-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/catalog.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/child-crash-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/concurrent-open-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/context-usage-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/doctor-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/dsh-api-contract-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/fake-bridge-multi-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/fake-dsh-bridge.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/file-snapshot-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/frame-reader-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/host-contract-sim.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/image-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/image-host-path-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/jobs-poll-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/jobs-popover-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/locale-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/mcp-gateway-guard-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/mcp-gateway-transport-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/mcp-http-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/mcp-injection-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/mcp-stdio-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/multi-session-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/newest-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/p003-approval-preflight.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/p003-bridge-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/p003-live-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/p003-live-support.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/p003-permission-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/p003-timeline-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/paseo-system-envelope-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/plugin-build-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/plugin-build.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/plugin-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/probe-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/probe.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/process-crash-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/replay-fidelity-probe.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/replay-turn-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/revert-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/revert-shape-probe.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/rewind-e2e.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/rewind-merge-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/rewind-merge-e2e.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/rewind-native-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/route-test.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/session-calls.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/session-request-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/source-shape.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/steer-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/stream-probe.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/style-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/subagent-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/subagent-live.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/surface-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/sweep-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/thinking-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/timeline-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/tool-call-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/tools.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/transport-frame-check.mjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+harness/uploaded-file-check.cjs,test/diagnostic/helper,harness-inventory.csv; harness.md
+install.sh,client/delivery,client-delivery.md
+local-patches/README.md,client/delivery,client-delivery.md
+local-patches/UPGRADE.md,client/delivery,client-delivery.md
+local-patches/apply-rewind-history-truncation.mjs,client/delivery,client-delivery.md
+local-patches/check-rewind-patch.mjs,client/delivery,client-delivery.md
+local-patches/startup-patch-hook.cjs,client/delivery,client-delivery.md
+paseo-plugin/LICENSE,client/delivery,client-delivery.md
+paseo-plugin/OVERVIEW.md,client/delivery,client-delivery.md
+paseo-plugin/README.md,client/delivery,client-delivery.md
+paseo-plugin/bin/paseo-dsh.mjs,client/delivery,client-delivery.md
+paseo-plugin/client/agent-message.ts,client/delivery,client-delivery.md
+paseo-plugin/client/inline-thinking.tsx,client/delivery,client-delivery.md
+paseo-plugin/client/jobs-pill.tsx,client/delivery,client-delivery.md
+paseo-plugin/client/jobs-popover-layout.ts,client/delivery,client-delivery.md
+paseo-plugin/client/jobs-spinner.tsx,client/delivery,client-delivery.md
+paseo-plugin/client/locale.ts,client/delivery,client-delivery.md
+paseo-plugin/client/newest.ts,client/delivery,client-delivery.md
+paseo-plugin/client/paseo-mark.ts,client/delivery,client-delivery.md
+paseo-plugin/client/poll-sequence.ts,client/delivery,client-delivery.md
+paseo-plugin/client/shimmer-css.ts,client/delivery,client-delivery.md
+paseo-plugin/client/stream-stats.tsx,client/delivery,client-delivery.md
+paseo-plugin/client/sweep-geometry.ts,client/delivery,client-delivery.md
+paseo-plugin/client/sweep-native.tsx,client/delivery,client-delivery.md
+paseo-plugin/client/text-shimmer.tsx,client/delivery,client-delivery.md
+paseo-plugin/client/thinking-text.ts,client/delivery,client-delivery.md
+paseo-plugin/client/tokens.ts,client/delivery,client-delivery.md
+paseo-plugin/client/tool-call-data.ts,client/delivery,client-delivery.md
+paseo-plugin/client/tool-call.tsx,client/delivery,client-delivery.md
+paseo-plugin/icon.svg,client/delivery,client-delivery.md
+paseo-plugin/index.client.tsx,client/delivery,client-delivery.md
+paseo-plugin/index.server.ts,server,server.md
+paseo-plugin/lib/doctor.mjs,client/delivery,client-delivery.md
+paseo-plugin/lib/probe-provider.mjs,client/delivery,client-delivery.md
+paseo-plugin/package-lock.json,client/delivery,client-delivery.md
+paseo-plugin/package.json,client/delivery,client-delivery.md
+paseo-plugin/paseo-plugin.json,client/delivery,client-delivery.md
+paseo-plugin/scripts/generate-bridge-assets.mjs,client/delivery,client-delivery.md
+paseo-plugin/server/activity-timeline.ts,server,server.md
+paseo-plugin/server/bootstrap.ts,server,server.md
+paseo-plugin/server/bridge-assets.ts,generated asset,byte-for-byte bridge-assets-check; server.md
+paseo-plugin/server/dsh-process.ts,server,server.md
+paseo-plugin/server/first-token.ts,server,server.md
+paseo-plugin/server/frame-reader.ts,server,server.md
+paseo-plugin/server/json-value.ts,server,server.md
+paseo-plugin/server/locale.ts,server,server.md
+paseo-plugin/server/provider.ts,server,server.md
+paseo-plugin/server/rewind-canary.ts,server,server.md
+paseo-plugin/server/session.ts,server,server.md
+paseo-plugin/server/timeline.ts,server,server.md
+paseo-plugin/shared/jobs.ts,server,server.md
+paseo-plugin/shared/provider.ts,server,server.md
+paseo-plugin/tsconfig.json,client/delivery,client-delivery.md
+pelican-bicycle.html,static non-runtime artifact,scope/inventory review; no native-device visual acceptance
+templates/cordis.patch.yml,client/delivery,client-delivery.md
+tools/probe-provider.mjs,client/delivery,client-delivery.md

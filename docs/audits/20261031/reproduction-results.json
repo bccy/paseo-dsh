@@ -1,0 +1,178 @@
+{
+  "baseline_commit": "9298c28",
+  "paseo_plugin": "0.14.0",
+  "dsh_libraries": "0.2.1-rc.5",
+  "real_model_calls": 0,
+  "results": [
+    {
+      "case": "bridge",
+      "exit_code": 0,
+      "log": "bridge.log",
+      "observations": [
+        "snapshot-capture-order-resets {\"captureSeq\":[2,1],\"expected\":\"ORIGINAL\",\"actual\":\"AFTER_FIRST_EDIT\",\"reportedRestored\":1}",
+        "[bridge] interrupted 1 delegated agent(s) whose dispatch turn was withdrawn",
+        "rewind-misses-inflight-child-edit {\"expectedChildFile\":\"deleted\",\"actualChildFile\":\"CHILD_LATE_WRITE\",\"receipt\":\"success\",\"restoredCount\":1,\"deletedCount\":0,\"remainingJournalEntries\":0,\"interrupted\":[\"child\"]}",
+        "grandchild-misattributed-to-later-root-message {\"parentDispatchAnchor\":10,\"latestRootHumanMessage\":20,\"grandchildDispatchAnchor\":20,\"withdrawnAt20\":[\"grandchild\"]}",
+        "restore-follows-symlink-ancestor {\"outsideExpected\":\"UNRELATED_OUTSIDE_FILE\",\"outsideActual\":\"WORKSPACE_ORIGINAL\",\"restoredCount\":1,\"skippedCount\":0}",
+        "queued-plan-off-dropped {\"receipt\":{\"available\":true,\"active\":false,\"pending\":false,\"outcome\":\"queued\"},\"activeAfterResume\":true,\"setCalls\":[]}",
+        "mcp-structured-content-dropped {\"serverResult\":{\"content\":[],\"structuredContent\":{\"answer\":42}},\"gatewayResult\":{\"server\":\"fake\",\"tool\":\"structured\",\"content\":\"\",\"images\":[]}}",
+        "mcp-caller-abort-ignored {\"signalAborted\":true,\"requestAborted\":false,\"completedAfterAbort\":true,\"result\":{\"server\":\"fake\",\"tool\":\"delayed\",\"content\":\"SIDE_EFFECT_COMPLETED\",\"images\":[]}}",
+        "image-staging-follows-symlink {\"victim\":\"ATTACHMENT_BYTES\",\"outputEndsInJpg\":true}"
+      ],
+      "meaning": "historical counterexample confirmed"
+    },
+    {
+      "case": "harness",
+      "exit_code": 0,
+      "log": "harness.log",
+      "observations": [
+        "T01 {\"partialTextPlusFailure\":{\"lines\":[\"WORKS  fixture/probe  text=\\\"partial answer\\\"  err=fatal turn error\"],\"exitCode\":0},\"allRoutesFailed\":{\"lines\":[\"FAILS  fixture/probe  text=\\\"\\\"  err=fatal turn error\"],\"exitCode\":0}}",
+        "T02 {\"initializeParams\":{\"cwd\":\"/tmp\"},\"promptRejection\":\"paseo bridge is not initialized for session tools-synthetic-session; send `initialize` with this sessionId before prompting\"}",
+        "T03 {\"realSequence\":[\"assistant_message\",\"reasoning\",\"assistant_message\"],\"fullSequenceAssistantRows\":2,\"assistantOnlyPrefilterRows\":1,\"harnessPredicatePasses\":true}",
+        "T04 {\"imageBlocksSent\":0,\"syntheticAssistantReply\":\"IMAGE-SEEN\",\"imageEvidencePredicatePasses\":true}"
+      ],
+      "meaning": "historical counterexample confirmed"
+    },
+    {
+      "case": "doctor",
+      "exit_code": 0,
+      "log": "doctor.log",
+      "observations": [
+        "{\"label\":\"positive-control\",\"exitCode\":0,\"allPassed\":true,\"verdicts\":[\"  [ok  ] model route configured\",\"         default: route / example\",\"  [ok  ] credential EXAMPLE_KEY found\"]}",
+        "{\"label\":\"quoted-empty-route\",\"exitCode\":0,\"allPassed\":true,\"verdicts\":[\"  [ok  ] DSH profile at $REPRO_OUTPUT/doctor-extra-iJnyDo/quoted-empty-route/profiles/audit\",\"         $REPRO_OUTPUT/doctor-extra-iJnyDo/quoted-empty-route/profiles/audit/node_modules/dsh-paseo-bridge\",\"  [ok  ] model route configured\",\"  [ok  ] credential EXAMPLE_KEY found\"]}",
+        "{\"label\":\"route-from-later-block\",\"exitCode\":0,\"allPassed\":true,\"verdicts\":[\"  [ok  ] DSH profile at $REPRO_OUTPUT/doctor-extra-iJnyDo/route-from-later-block/profiles/audit\",\"         $REPRO_OUTPUT/doctor-extra-iJnyDo/route-from-later-block/profiles/audit/node_modules/dsh-paseo-bridge\",\"  [ok  ] model route configured\",\"         default: route / example\",\"  [ok  ] credential EXAMPLE_KEY found\"]}",
+        "{\"label\":\"quoted-empty-credential\",\"exitCode\":0,\"allPassed\":true,\"verdicts\":[\"  [ok  ] DSH profile at $REPRO_OUTPUT/doctor-extra-iJnyDo/quoted-empty-credential/profiles/audit\",\"         $REPRO_OUTPUT/doctor-extra-iJnyDo/quoted-empty-credential/profiles/audit/node_modules/dsh-paseo-bridge\",\"  [ok  ] model route configured\",\"         default: route / example\",\"  [ok  ] credential EXAMPLE_KEY found\"]}",
+        "{\"label\":\"comment-only-credential\",\"exitCode\":0,\"allPassed\":true,\"verdicts\":[\"  [ok  ] DSH profile at $REPRO_OUTPUT/doctor-extra-iJnyDo/comment-only-credential/profiles/audit\",\"         $REPRO_OUTPUT/doctor-extra-iJnyDo/comment-only-credential/profiles/audit/node_modules/dsh-paseo-bridge\",\"  [ok  ] model route configured\",\"         default: route / example\",\"  [ok  ] credential EXAMPLE_KEY found\"]}",
+        "{\"label\":\"credential-after-refs-block\",\"exitCode\":0,\"allPassed\":true,\"verdicts\":[\"  [ok  ] DSH profile at $REPRO_OUTPUT/doctor-extra-iJnyDo/credential-after-refs-block/profiles/audit\",\"         $REPRO_OUTPUT/doctor-extra-iJnyDo/credential-after-refs-block/profiles/audit/node_modules/dsh-paseo-bridge\",\"  [ok  ] model route configured\",\"         default: route / example\",\"  [ok  ] credential EXAMPLE_KEY found\"]}",
+        "{\"label\":\"disabled-route\",\"exitCode\":0,\"allPassed\":true,\"verdicts\":[\"  [ok  ] DSH profile at $REPRO_OUTPUT/doctor-extra-iJnyDo/disabled-route/profiles/audit\",\"         $REPRO_OUTPUT/doctor-extra-iJnyDo/disabled-route/profiles/audit/node_modules/dsh-paseo-bridge\",\"  [ok  ] model route configured\",\"         default: route / example\",\"  [ok  ] credential EXAMPLE_KEY found\"]}"
+      ],
+      "meaning": "historical counterexample confirmed"
+    },
+    {
+      "case": "thinking",
+      "exit_code": 0,
+      "log": "thinking.log",
+      "observations": [
+        "{\"text\":\"a\",\"phase\":\"streaming\",\"shimmerActive\":true,\"renders\":1}",
+        "{\"text\":\"ab\",\"phase\":\"complete\",\"shimmerActive\":true,\"renders\":1}",
+        "{\"text\":\"ab\",\"phase\":\"complete\",\"shimmerActive\":true,\"renders\":1}",
+        "{\"text\":\"ab\",\"phase\":\"streaming\",\"shimmerActive\":true,\"renders\":1}",
+        "{\"text\":\"ab\",\"phase\":\"complete\",\"shimmerActive\":false,\"renders\":2}"
+      ],
+      "meaning": "historical counterexample confirmed"
+    },
+    {
+      "case": "tool-errors",
+      "exit_code": 0,
+      "log": "tool-errors.log",
+      "observations": [
+        "{\"name\":\"write\",\"serverStatus\":\"failed\",\"serverError\":{\"message\":\"AUDIT_ERROR_PERMISSION_DENIED\"},\"mappedStatus\":\"failed\",\"mappedBody\":\"requested contents\",\"errorSurvives\":false}",
+        "{\"name\":\"edit\",\"serverStatus\":\"failed\",\"serverError\":{\"message\":\"AUDIT_ERROR_PERMISSION_DENIED\"},\"mappedStatus\":\"failed\",\"mappedBody\":\"- before\\n+ after\",\"errorSurvives\":false}",
+        "{\"name\":\"bash\",\"serverStatus\":\"failed\",\"serverError\":{\"message\":\"AUDIT_ERROR_PERMISSION_DENIED\"},\"mappedStatus\":\"failed\",\"mappedBody\":\"AUDIT_ERROR_PERMISSION_DENIED\",\"errorSurvives\":true}"
+      ],
+      "meaning": "historical counterexample confirmed"
+    },
+    {
+      "case": "probe-auth",
+      "exit_code": 0,
+      "log": "probe-auth.log",
+      "observations": [
+        "{\"status\":401,\"requests\":8,\"exitCode\":0,\"advisesDisableReasoning\":true,\"developerRejected\":true,\"unknownReasoning\":false}",
+        "{\"status\":402,\"requests\":8,\"exitCode\":0,\"advisesDisableReasoning\":true,\"developerRejected\":true,\"unknownReasoning\":false}",
+        "{\"status\":403,\"requests\":8,\"exitCode\":0,\"advisesDisableReasoning\":true,\"developerRejected\":true,\"unknownReasoning\":false}",
+        "{\"status\":429,\"requests\":8,\"exitCode\":1,\"advisesDisableReasoning\":false,\"developerRejected\":false,\"unknownReasoning\":true}"
+      ],
+      "meaning": "historical counterexample confirmed"
+    },
+    {
+      "case": "patch-tail",
+      "exit_code": 0,
+      "log": "patch-tail.log",
+      "observations": [
+        "{\"unrelatedTailPresentBefore\":true,\"unrelatedTailPresentAfter\":false,\"changedSourceParses\":true,\"transformationOnly\":true}"
+      ],
+      "meaning": "historical counterexample confirmed"
+    },
+    {
+      "case": "server-config",
+      "exit_code": 0,
+      "log": "server-config.log",
+      "observations": [
+        "CONTROL: normal mode changes agree with successful backend receipts",
+        "CONTROL: supported effort change agrees",
+        "STALE_EFFORT {\"backend\":null,\"advertised\":\"high\",\"options\":[]}",
+        "REJECTED_PLAN {\"backend\":false,\"advertised\":\"plan\"}"
+      ],
+      "meaning": "historical counterexample confirmed"
+    },
+    {
+      "case": "server-lifecycle",
+      "exit_code": 0,
+      "log": "server-lifecycle.log",
+      "observations": [
+        "SECOND_TURN_TOOL_COUNT 2",
+        "UNRELATED_CHILD_RELEASES_UNTITLED {\"type\":\"session.opened\",\"sessionId\":\"root:sub:without-title\",\"parentSessionId\":\"root\",\"capabilities\":[\"session.subsession\"],\"restoration\":\"parent\",\"cwd\":\"$REPRO_OUTPUT/checkout\",\"persistence\":{\"version\":1,\"data\":{\"sessionId\":\"without-title\"}}}",
+        "COMPLETED_CHILD_AFTER_PROCESS_EXIT [{\"type\":\"session.turn\",\"sessionId\":\"root:sub:has-title\",\"turnId\":\"turn:1793410268421\",\"state\":\"started\"},{\"type\":\"session.turn\",\"sessionId\":\"root:sub:has-title\",\"turnId\":\"turn:1793410268421\",\"state\":\"completed\"},{\"type\":\"session.runtime_failed\",\"sessionId\":\"root:sub:has-title\",\"error\":{\"message\":\"DeepSeek Harness exited (code 1, signal none)\"}}]",
+        "ALL_LIFECYCLE_CANDIDATES_REPRODUCED"
+      ],
+      "meaning": "historical counterexample confirmed"
+    },
+    {
+      "case": "server-open",
+      "exit_code": 0,
+      "log": "server-open.log",
+      "observations": [
+        "CONTROL: distinct healthy session can complete a turn",
+        "RACE_WIRE [",
+        "  {",
+        "    \"type\": \"session.closed\",",
+        "    \"sessionId\": \"first-provider\"",
+        "  },",
+        "  {",
+        "    \"type\": \"request.failed\",",
+        "    \"requestId\": \"second-open\",",
+        "    \"error\": {",
+        "      \"message\": \"cannot open second-provider: another open for DSH session race-native is already in flight\"",
+        "    }",
+        "  },",
+        "  {",
+        "    \"type\": \"session.commands\",",
+        "    \"sessionId\": \"first-provider\"",
+        "  },",
+        "  {",
+        "    \"type\": \"session.opened\",",
+        "    \"sessionId\": \"first-provider\",",
+        "    \"requestId\": \"first-open\"",
+        "  },",
+        "  {",
+        "    \"type\": \"session.config\",",
+        "    \"sessionId\": \"first-provider\"",
+        "  },",
+        "  {",
+        "    \"type\": \"session.ready\",",
+        "    \"sessionId\": \"first-provider\",",
+        "    \"requestId\": \"first-open\"",
+        "  },",
+        "  {",
+        "    \"type\": \"session.runtime_failed\",",
+        "    \"sessionId\": \"first-provider\",",
+        "    \"error\": {",
+        "      \"message\": \"unknown session: first-provider\"",
+        "    }",
+        "  }",
+        "]",
+        "CONTROL: sibling still completes a second turn"
+      ],
+      "meaning": "historical counterexample confirmed"
+    }
+  ],
+  "S02_original_protocol_observation": {
+    "catalogModes": [
+      "build"
+    ],
+    "sessionModes": [
+      "build",
+      "plan"
+    ]
+  }
+}

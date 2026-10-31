@@ -1,0 +1,997 @@
+{
+  "baseline_commit": "9298c281f28a32e74e3460d6cc6b55423d50d124",
+  "baseline_checks": [
+    {
+      "name": "dsh-api-contract",
+      "code": 0,
+      "seconds": 0.09
+    },
+    {
+      "name": "bridge-assets",
+      "code": 0,
+      "seconds": 0.05
+    },
+    {
+      "name": "typecheck",
+      "code": 0,
+      "seconds": 3.83
+    },
+    {
+      "name": "compile",
+      "code": 0,
+      "seconds": 2.99
+    }
+  ],
+  "existing_checks": [
+    {
+      "name": "agent-message-check",
+      "exit_code": 0,
+      "seconds": 0.066,
+      "command": [
+        "node",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite/agent-message-check.cjs"
+      ],
+      "tail": [
+        "  ok   with agentMessage: the guard does not fire (the semantic row is built)",
+        "  ok   another tool call is unaffected",
+        "  ok   the fallback does not parse the plain_text payload",
+        "",
+        "111 passed, 0 failed"
+      ]
+    },
+    {
+      "name": "assistant-retry-check",
+      "exit_code": 0,
+      "seconds": 0.801,
+      "command": [
+        "node",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite/assistant-retry-check.cjs"
+      ],
+      "tail": [
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace",
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace",
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace",
+        "[deepseek-harness-native] paseo/mcp/set for retry-1793408874695 arrived after its agent was created; 0 entr(y/ies) will be mounted on the next resume",
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace"
+      ],
+      "invocation_repaired": "scripted bridge fixture copied alongside compiled harness"
+    },
+    {
+      "name": "assistant-stream-check",
+      "exit_code": 0,
+      "seconds": 0.804,
+      "command": [
+        "node",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite/assistant-stream-check.cjs"
+      ],
+      "tail": [
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace",
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace",
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace",
+        "[deepseek-harness-native] paseo/mcp/set for stream-1793408875498 arrived after its agent was created; 0 entr(y/ies) will be mounted on the next resume",
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace"
+      ],
+      "invocation_repaired": "scripted bridge fixture copied alongside compiled harness"
+    },
+    {
+      "name": "image-check",
+      "exit_code": 0,
+      "seconds": 1.019,
+      "command": [
+        "node",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite/image-check.cjs"
+      ],
+      "tail": [
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace",
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace",
+        "[deepseek-harness-native] paseo/mcp/set for image-1793408876292 arrived after its agent was created; 0 entr(y/ies) will be mounted on the next resume",
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace",
+        "[deepseek-harness-native] replay: ignoring a turn/end with no replayed turn/start (turn 1)"
+      ],
+      "invocation_repaired": "scripted bridge fixture copied alongside compiled harness"
+    },
+    {
+      "name": "jobs-poll-check",
+      "exit_code": 0,
+      "seconds": 0.033,
+      "command": [
+        "node",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite/jobs-poll-check.cjs"
+      ],
+      "tail": [
+        "",
+        "the old algorithm must fail the same scenarios",
+        "",
+        "18/18 checks passed",
+        "OK"
+      ]
+    },
+    {
+      "name": "jobs-popover-check",
+      "exit_code": 0,
+      "seconds": 0.365,
+      "command": [
+        "node",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite/jobs-popover-check.cjs"
+      ],
+      "tail": [
+        "",
+        "host constants from /home/yywl/apps/paseo",
+        "",
+        "119/119 checks passed",
+        "OK"
+      ]
+    },
+    {
+      "name": "locale-check",
+      "exit_code": 0,
+      "seconds": 0.064,
+      "command": [
+        "node",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite/locale-check.cjs"
+      ],
+      "tail": [
+        "  ok   and gets the neutral glyph",
+        "  ok   in English too",
+        "  ok   with the same neutral glyph",
+        "",
+        "258 passed, 0 failed"
+      ]
+    },
+    {
+      "name": "mcp-injection-check",
+      "exit_code": 0,
+      "seconds": 6.661,
+      "command": [
+        "node",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite/mcp-injection-check.cjs"
+      ],
+      "tail": [
+        "[deepseek-harness-native] paseo/mcp/set for mcp-browser-unmapped-1793408881293 arrived after its agent was created; 0 entr(y/ies) will be mounted on the next resume",
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace",
+        "[deepseek-harness-native] paseo/mcp/set for mcp-browser-ok-1793408881756 arrived after its agent was created; 1 entr(y/ies) will be mounted on the next resume",
+        "[deepseek-harness-native] no browser MCP server: bridge not found at /tmp/dsh-mcp-check-Pfzf6V/no-browser-plugin/mcp-bridge.mjs",
+        "[deepseek-harness-native] session/close for mcp-late-1793408882218 reported nothing closed"
+      ],
+      "invocation_repaired": "scripted bridge fixture copied alongside compiled harness"
+    },
+    {
+      "name": "newest-check",
+      "exit_code": 0,
+      "seconds": 0.115,
+      "command": [
+        "node",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite/newest-check.cjs"
+      ],
+      "tail": [
+        "  ok   and stays zero afterwards",
+        "  ok   an expired window is exactly what isPulsing refuses",
+        "  ok   and it is still pulsing one millisecond earlier",
+        "",
+        "36 passed, 0 failed"
+      ]
+    },
+    {
+      "name": "session-request-check",
+      "exit_code": 0,
+      "seconds": 0.358,
+      "command": [
+        "node",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite/session-request-check.cjs"
+      ],
+      "tail": [
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace",
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace",
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace",
+        "[deepseek-harness-native] paseo/mcp/set for request-check-1793408884026 arrived after its agent was created; 0 entr(y/ies) will be mounted on the next resume",
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace"
+      ],
+      "invocation_repaired": "scripted bridge fixture copied alongside compiled harness"
+    },
+    {
+      "name": "steer-check",
+      "exit_code": 0,
+      "seconds": 1.823,
+      "command": [
+        "node",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite/steer-check.cjs"
+      ],
+      "tail": [
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace",
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace",
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace",
+        "[deepseek-harness-native] paseo/mcp/set for cancel-1793408885091 arrived after its agent was created; 0 entr(y/ies) will be mounted on the next resume",
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace"
+      ],
+      "invocation_repaired": "scripted bridge fixture copied alongside compiled harness"
+    },
+    {
+      "name": "style-check",
+      "exit_code": 0,
+      "seconds": 0.065,
+      "command": [
+        "node",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite/style-check.cjs"
+      ],
+      "tail": [
+        "  ok   search folds head 4 + tail 4",
+        "  ok   terminal never folds",
+        "  ok   the code card caps at 260px",
+        "",
+        "253 passed, 0 failed"
+      ]
+    },
+    {
+      "name": "subagent-check",
+      "exit_code": 0,
+      "seconds": 25.683,
+      "command": [
+        "node",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite/subagent-check.cjs"
+      ],
+      "tail": [
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace",
+        "[deepseek-harness-native] paseo/mcp/set for subR4-1793408909659 arrived after its agent was created; 0 entr(y/ies) will be mounted on the next resume",
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite maps to no single live Paseo workspace",
+        "[deepseek-harness-native] replay: ignoring a turn/end with no replayed turn/start (turn 1)",
+        "[deepseek-harness-native] subagent child-K: stored history ends with no turn terminal (the last turn was never closed); closing it as canceled"
+      ],
+      "invocation_repaired": "scripted bridge fixture copied alongside compiled harness"
+    },
+    {
+      "name": "sweep-check",
+      "exit_code": 0,
+      "seconds": 0.064,
+      "command": [
+        "node",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite/sweep-check.cjs"
+      ],
+      "tail": [
+        "  ok   the end is exact",
+        "  ok   values snap to a step",
+        "  ok   stepping is finer than the slice staircase",
+        "",
+        "25 passed, 0 failed"
+      ]
+    },
+    {
+      "name": "thinking-check",
+      "exit_code": 0,
+      "seconds": 0.064,
+      "command": [
+        "node",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite/thinking-check.cjs"
+      ],
+      "tail": [
+        "  ok   and derives the line width from both",
+        "  ok   and shows the tail while growing, dsh's rule otherwise",
+        "  ok   the preview line never measures itself",
+        "",
+        "37 passed, 0 failed"
+      ]
+    },
+    {
+      "name": "timeline-check",
+      "exit_code": 0,
+      "seconds": 0.165,
+      "command": [
+        "node",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite/timeline-check.cjs"
+      ],
+      "tail": [
+        "  ok   the description and locale keys are not clobbered by it",
+        "  ok   the detail arrives without a meta field",
+        "  ok   a detail-level meta is still stripped (why it lives on metadata)",
+        "",
+        "208 passed, 0 failed"
+      ]
+    },
+    {
+      "name": "tool-call-check",
+      "exit_code": 0,
+      "seconds": 0.065,
+      "command": [
+        "node",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite/tool-call-check.cjs"
+      ],
+      "tail": [
+        "  ok   fork label",
+        "  ok   fork icon",
+        "  ok   and it is not the same row as a plain subagent",
+        "",
+        "336 passed, 0 failed"
+      ]
+    },
+    {
+      "name": "uploaded-file-check",
+      "exit_code": 0,
+      "seconds": 0.064,
+      "command": [
+        "node",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite/uploaded-file-check.cjs"
+      ],
+      "tail": [
+        "  PASS  an image block is passed through with exactly its three fields",
+        "  PASS  an unknown content type throws, naming the wire type",
+        "  PASS  an unknown type is never downgraded to an empty text block",
+        "",
+        "  17/17 passed"
+      ]
+    },
+    {
+      "name": "context-usage-check",
+      "exit_code": 0,
+      "seconds": 0.215,
+      "command": [
+        "node",
+        "harness/context-usage-check.cjs",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite"
+      ],
+      "tail": [
+        "PASS 未知容量与不可用状态清除旧上下文值",
+        "PASS 新步骤缺少缓存字段时不沿用旧缓存计数",
+        "PASS 拒绝无效的上下文计数",
+        "PASS 切模型后迟到的旧响应不能覆盖新值",
+        "PASS 关闭后不再发出用量事件"
+      ]
+    },
+    {
+      "name": "p003-permission-check",
+      "exit_code": 0,
+      "seconds": 0.315,
+      "command": [
+        "node",
+        "harness/p003-permission-check.cjs",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite"
+      ],
+      "tail": [
+        "[deepseek-harness-native] no browser MCP server: cwd /tmp/p003-permission-Z3EASO maps to no single live Paseo workspace",
+        "PASS unnegotiated, foreign and malformed requests fail without an undisplayable card",
+        "PASS closing one session cancels its pending approval and leaves its sibling usable",
+        "PASS process exit releases the pending card",
+        "6 P003 permission checks passed"
+      ]
+    },
+    {
+      "name": "replay-turn-check",
+      "exit_code": 0,
+      "seconds": 0.115,
+      "command": [
+        "node",
+        "harness/replay-turn-check.cjs",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite"
+      ],
+      "tail": [
+        "PASS 被撤回的回合（可见日志里只剩 turn/start）不发任何 session.turn",
+        "",
+        "Paseo 信封消息重放成 user_message 行（宿主再把它投影成 agent_message）",
+        "PASS source.kind=paseo 的信封消息重放出原文行、无 revertToken；source.kind=skill 仍不出行",
+        "PASS 信封行是该回合首行、落在自己的 turnId 区间内（started 紧贴其前）"
+      ]
+    },
+    {
+      "name": "p003-timeline-check",
+      "exit_code": 0,
+      "seconds": 0.367,
+      "command": [
+        "node",
+        "harness/p003-timeline-check.cjs"
+      ],
+      "tail": [
+        "PASS goal full snapshots replace stale objective/reason; clear and new create share one row",
+        "PASS malformed known events are visible errors rather than silent omissions",
+        "PASS independent session builders never inherit each other's workflow or goal state",
+        "PASS real bridge history preserves workflow/goal and replay builds the identical snapshots",
+        "8 P003 timeline checks passed"
+      ]
+    },
+    {
+      "name": "archived-lineage-check",
+      "exit_code": 0,
+      "seconds": 0.065,
+      "command": [
+        "node",
+        "harness/archived-lineage-check.mjs"
+      ],
+      "tail": [
+        "  PASS  a Set and a plain array are both accepted",
+        "  PASS  an empty archive set leaves every session runnable",
+        "  PASS  an empty or absent session id is never archived",
+        "",
+        "  12/12 passed"
+      ]
+    },
+    {
+      "name": "bridge-server-check",
+      "exit_code": 0,
+      "seconds": 0.165,
+      "command": [
+        "node",
+        "harness/bridge-server-check.mjs"
+      ],
+      "tail": [
+        "  PASS  paseo/permission/set materializes the session it is given  — created=[\"perm-1\"]",
+        "  PASS  the dispatch scan found the switch cases  — 24 case(s) parsed",
+        "  PASS  every method the request switch calls exists on the prototype  — 24 method(s) present",
+        "",
+        "  25/25 passed"
+      ]
+    },
+    {
+      "name": "child-crash-check",
+      "exit_code": 0,
+      "seconds": 0.366,
+      "command": [
+        "node",
+        "harness/child-crash-check.mjs",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite"
+      ],
+      "tail": [
+        "  PASS  the child's failure is emitted before the root's  — child@12, root@13",
+        "  PASS  no invented turn terminal is sent to the child  — []",
+        "  PASS  the failure is not attributed to the wrong session  — crash-root-1793408796128:sub:child-S, crash-root-1793408796128",
+        "",
+        "  8/8 passed"
+      ]
+    },
+    {
+      "name": "concurrent-open-check",
+      "exit_code": 0,
+      "seconds": 0.918,
+      "command": [
+        "node",
+        "harness/concurrent-open-check.mjs",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite"
+      ],
+      "tail": [
+        "[deepseek-harness-native] paseo/mcp/set for concurrent-open-1793408796257 arrived after its agent was created; 0 entr(y/ies) will be mounted on the next resume",
+        "[deepseek-harness-native] no browser MCP server: cwd $AUDIT_SCRATCH/checkout maps to no single live Paseo workspace",
+        "  PASS  a later open of the same DSH session still succeeds (the claim was released)  — (opened)",
+        "",
+        "  8/8 passed"
+      ]
+    },
+    {
+      "name": "fake-bridge-multi-check",
+      "exit_code": 0,
+      "seconds": 1.019,
+      "command": [
+        "node",
+        "harness/fake-bridge-multi-check.mjs"
+      ],
+      "tail": [
+        "multi: initialize does not bind a session",
+        "  PASS  a session opened after initialize still runs  — multi-only",
+        "  PASS  its event is attributed to that session  — multi-only",
+        "",
+        "  23/23 passed"
+      ]
+    },
+    {
+      "name": "file-snapshot-check",
+      "exit_code": 0,
+      "seconds": 0.867,
+      "command": [
+        "node",
+        "harness/file-snapshot-check.mjs"
+      ],
+      "tail": [
+        "  PASS  the referenced object is kept  — [\"c1a66b9d085b43601135241826537b5d5e215143065c41c300a5aa9cb56980ab\"]",
+        "  PASS  an uncommitted capture protects its object  — 6c1d584dbe49df174120846b351d421bbc144af09566e2f247633b58fa2d23de",
+        "  PASS  a freshly written unreferenced object is kept (race guard)  — {\"removed\":0,\"keptRecent\":2}",
+        "",
+        "56 passed, 0 failed"
+      ]
+    },
+    {
+      "name": "image-host-path-check",
+      "exit_code": 0,
+      "seconds": 0.064,
+      "command": [
+        "node",
+        "harness/image-host-path-check.mjs"
+      ],
+      "tail": [
+        "  PASS  the stored event keeps its typing record (only the projection drops it)",
+        "  PASS  an event without a stream is projected unchanged",
+        "  PASS  a null stream is dropped like a missing one",
+        "",
+        "  42/42 passed"
+      ]
+    },
+    {
+      "name": "mcp-gateway-guard-check",
+      "exit_code": 0,
+      "seconds": 0.265,
+      "command": [
+        "node",
+        "harness/mcp-gateway-guard-check.mjs"
+      ],
+      "tail": [
+        "ok   the localized refusal is recognised as a host gap, not just the English text",
+        "ok   and a successful browser result is still not a host gap (the control)",
+        "ok   a successful browser probe marks nothing unavailable (the control)",
+        "",
+        "70/70 passed"
+      ]
+    },
+    {
+      "name": "mcp-gateway-transport-check",
+      "exit_code": 0,
+      "seconds": 0.165,
+      "command": [
+        "node",
+        "harness/mcp-gateway-transport-check.mjs"
+      ],
+      "tail": [
+        "ok   a typo in the command key does not resolve to a transport",
+        "ok   a non-string url is refused at the schema layer",
+        "ok   a non-object entry is refused by transportOf",
+        "",
+        "10/10 passed"
+      ]
+    },
+    {
+      "name": "mcp-http-check",
+      "exit_code": 0,
+      "seconds": 5.137,
+      "command": [
+        "node",
+        "harness/mcp-http-check.mjs"
+      ],
+      "tail": [
+        "ok   and the empty read is not cached: the next call gets the real catalog",
+        "ok   a request answered with an empty body is a failure, not an empty catalog",
+        "ok   isSessionGoneError accepts only session-shaped 404s",
+        "",
+        "55/55 passed"
+      ]
+    },
+    {
+      "name": "mcp-stdio-check",
+      "exit_code": 0,
+      "seconds": 0.817,
+      "command": [
+        "node",
+        "harness/mcp-stdio-check.mjs"
+      ],
+      "tail": [
+        "ok   and a value configured for the server survives the scrub",
+        "ok   dispose stops the child process",
+        "ok   a disposed client does not answer from the cached catalog",
+        "",
+        "22/22 passed"
+      ]
+    },
+    {
+      "name": "multi-session-check",
+      "exit_code": 0,
+      "seconds": 10.574,
+      "command": [
+        "node",
+        "harness/multi-session-check.mjs",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite"
+      ],
+      "tail": [
+        "  PASS  …naming the key that did not take effect  — \"DSH_MULTI_SESSION_PROBE_KEY 与共享 DSH 进程启动时的环境不同；环境是进程级的，本会话请求的值没有生效——该进程仍按首个会话打开时的环境运行（本会话设置的键未生效，本会话未设置的键沿用首个会话的值）。\"",
+        "  PASS  …and never the value it would have had  — \"DSH_MULTI_SESSION_PROBE_KEY 与共享 DSH 进程启动时的环境不同；环境是进程级的，本会话请求的值没有生效——该进程仍按首个会话打开时的环境运行（本会话设置的键未生效，本会话未设置的键沿用首个会话的值）。\"",
+        "  PASS  …and not the keys the daemon injects per agent  — \"DSH_MULTI_SESSION_PROBE_KEY 与共享 DSH 进程启动时的环境不同；环境是进程级的，本会话请求的值没有生效——该进程仍按首个会话打开时的环境运行（本会话设置的键未生效，本会话未设置的键沿用首个会话的值）。\"",
+        "",
+        "  35/35 passed"
+      ]
+    },
+    {
+      "name": "p003-bridge-check",
+      "exit_code": 0,
+      "seconds": 0.218,
+      "command": [
+        "node",
+        "harness/p003-bridge-check.mjs"
+      ],
+      "tail": [
+        "[bridge] tool approval 3c602598-d838-479d-bcd9-8305620db5e7 failed: Tool approval timed out",
+        "[bridge] tool approval 4be27adb-15eb-454a-b0c8-b42f668a4ab1 failed: malformed tool approval answer",
+        "PASS timeout is unavailable, withdrawal is correlated, malformed replies never allow",
+        "PASS turn cancellation reaches reverse request and returns cancelled, no implicit approval",
+        "10 P003 bridge checks passed"
+      ]
+    },
+    {
+      "name": "paseo-system-envelope-check",
+      "exit_code": 0,
+      "seconds": 0.065,
+      "command": [
+        "node",
+        "harness/paseo-system-envelope-check.mjs"
+      ],
+      "tail": [
+        "ok   a versioned envelope with raw markup in the body is not an envelope",
+        "ok   a versioned user-message carrying a sender id is not an envelope",
+        "ok   isPaseoSystemEnvelope rejects non-strings",
+        "",
+        "33/33 passed"
+      ]
+    },
+    {
+      "name": "plugin-build-check",
+      "exit_code": 0,
+      "seconds": 6.811,
+      "command": [
+        "node",
+        "harness/plugin-build-check.mjs"
+      ],
+      "tail": [
+        "cleanup",
+        "  PASS  the scratch directory was removed  — /tmp/paseo-plugin-build-check-RKMgEe",
+        "  PASS  the repo's dependency tree was not touched",
+        "",
+        "86 passed, 0 failed"
+      ]
+    },
+    {
+      "name": "probe-check",
+      "exit_code": 0,
+      "seconds": 0.221,
+      "command": [
+        "node",
+        "harness/probe-check.mjs"
+      ],
+      "tail": [
+        "  PASS  and the fragment is printed for pasting",
+        "  PASS  exit 0  — exit 0",
+        "  PASS  the key never appears anywhere",
+        "",
+        "  21/21 passed"
+      ]
+    },
+    {
+      "name": "process-crash-check",
+      "exit_code": 0,
+      "seconds": 0.216,
+      "command": [
+        "node",
+        "harness/process-crash-check.mjs",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite"
+      ],
+      "tail": [
+        "  PASS  …promptly, not at the 120 s RPC timeout  — 16 ms",
+        "  PASS  …and the process did not die of an uncaught exception  — (none)",
+        "  PASS  the failure is reported, not swallowed  — write EPIPE",
+        "",
+        "  7/7 passed"
+      ]
+    },
+    {
+      "name": "revert-check",
+      "exit_code": 0,
+      "seconds": 0.88,
+      "command": [
+        "node",
+        "harness/revert-check.mjs"
+      ],
+      "tail": [
+        "  PASS  a provider session attaches to the one shared child  — spawned [undefined, undefined, undefined, undefined, undefined, catalog-probe, __paseo_shared_process__] (1 probe spawn(s))",
+        "  PASS  an idle provider-session close detaches but keeps the child alive  — shutdown false, killed false",
+        "  PASS  provider teardown retires the shared child  — killed false, shutdown true",
+        "",
+        "115 passed, 0 failed"
+      ]
+    },
+    {
+      "name": "revert-shape-probe",
+      "exit_code": 0,
+      "seconds": 0.065,
+      "command": [
+        "node",
+        "harness/revert-shape-probe.mjs"
+      ],
+      "tail": [
+        "a second rewind over the new surface is valid",
+        "  PASS  a second rewind appends and shrinks further  — [0,8]",
+        "  PASS  only the system prompt and the last marker remain  — [\"system:SYS\",\"user:(empty message)\"]",
+        "",
+        "10 passed, 0 failed"
+      ]
+    },
+    {
+      "name": "rewind-merge-check",
+      "exit_code": 0,
+      "seconds": 0.115,
+      "command": [
+        "node",
+        "harness/rewind-merge-check.mjs"
+      ],
+      "tail": [
+        "  PASS  restore writes the pre-edit content back",
+        "  PASS  restore writes the state before the parent write back",
+        "  PASS  the restore receipt reports no failure  — []",
+        "",
+        "49/49 passed"
+      ]
+    },
+    {
+      "name": "surface-check",
+      "exit_code": 0,
+      "seconds": 0.065,
+      "command": [
+        "node",
+        "harness/surface-check.mjs"
+      ],
+      "tail": [
+        "  PASS  legacy markers do not fold the transcript  — 4/4",
+        "an empty system replacement is not a rewind seam any more",
+        "  PASS  the empty system replacement folds nothing  — 4/4",
+        "",
+        "18 passed, 0 failed"
+      ]
+    },
+    {
+      "name": "transport-frame-check",
+      "exit_code": 0,
+      "seconds": 5.9,
+      "command": [
+        "node",
+        "harness/transport-frame-check.mjs"
+      ],
+      "tail": [
+        "  PASS  random chunkings match the old reader exactly (200 rounds, 1-64 char chunks)  — 0 mismatch(es)",
+        "  PASS  the incremental scan beats the old split by a wide margin  — old 5532 ms vs new 22 ms on 20 MB / 1281 chunks (248x)",
+        "  PASS  the incremental scan stays under a second for 20 MB  — 22 ms",
+        "",
+        "20 passed, 0 failed"
+      ]
+    },
+    {
+      "name": "frame-reader-check",
+      "exit_code": 0,
+      "seconds": 7.458,
+      "command": [
+        "node",
+        "harness/frame-reader-check.mjs"
+      ],
+      "tail": [
+        "  PASS  parsing resumes at the newline after the discarded frame  — 1 line(s): [\"{\\\"ok\\\":1}\"]",
+        "  PASS  the discarded frame is not reported a second time  — 1 report(s)",
+        "  PASS  the default limit is the documented 256 MiB  — 268435456",
+        "",
+        "32 passed, 0 failed"
+      ]
+    },
+    {
+      "name": "doctor-check",
+      "exit_code": 0,
+      "seconds": 0.365,
+      "command": [
+        "node",
+        "harness/doctor-check.mjs"
+      ],
+      "tail": [
+        "  PASS  and the syntax was actually checked, not skipped  — (no YAML row)",
+        "  PASS  with no parser anywhere the row is still a warning, not a failure  —   [warn] YAML syntax not validated |          no YAML parser resolves from here; only the route and credential fields below were checked",
+        "  PASS  and that install still exits 0 when nothing else blocks  — exit 0",
+        "",
+        "  29/29 passed"
+      ]
+    },
+    {
+      "name": "host-contract-sim-installed",
+      "exit_code": 0,
+      "seconds": 0.215,
+      "command": [
+        "node",
+        "harness/host-contract-sim.mjs",
+        "/home/yywl/.npm-global/lib/node_modules/@getpaseo/cli/node_modules/@getpaseo/server/dist/server/server/agent",
+        "$AUDIT_SCRATCH/checkout/paseo-plugin/.dbg-suite"
+      ],
+      "tail": [
+        "  PASS  the late canary is still in the history  — notification:撤回已生效 | 03:04:05 · #1。对话已退回到所选消息之前。若此提示一直停留、被撤回的消息仍显示在上方，说明当前 Paseo 不会自动刷新时间线：执行 Reload agent 或重开会话即可看到结果。",
+        "  PASS  …while the withdrawn reply is already gone  — notification:撤回已生效 | 03:04:05 · #1。对话已退回到所选消息之前。若此提示一直停留、被撤回的消息仍显示在上方，说明当前 Paseo 不会自动刷新时间线：执行 Reload agent 或重开会话即可看到结果。",
+        "  PASS  …so on this patched host a late canary would be a false \"timeline is stale\" warning  — the withdrawn rows are gone and the canary is not — exactly the state the canary must not describe",
+        "",
+        "  7/7 passed"
+      ]
+    }
+  ],
+  "reproduction_runs": [
+    {
+      "name": "bridge-extra",
+      "exit_code": 0,
+      "log": "bridge-extra.log"
+    },
+    {
+      "name": "doctor-extra",
+      "exit_code": 0,
+      "log": "doctor-extra.log"
+    },
+    {
+      "name": "thinking-settle",
+      "exit_code": 0,
+      "log": "thinking-settle.log"
+    },
+    {
+      "name": "server-config",
+      "exit_code": 0,
+      "log": "server-config.log"
+    },
+    {
+      "name": "server-lifecycle",
+      "exit_code": 0,
+      "log": "server-lifecycle.log"
+    },
+    {
+      "name": "server-race-wire",
+      "exit_code": 0,
+      "log": "server-race-wire.log"
+    },
+    {
+      "name": "probe-doctor-extra",
+      "exit_code": 0,
+      "log": "probe-doctor-extra.log"
+    },
+    {
+      "name": "probe-capability-auth",
+      "exit_code": 0,
+      "log": "probe-capability-auth.log"
+    },
+    {
+      "name": "probe-failed-tool-render",
+      "exit_code": 0,
+      "log": "probe-failed-tool-render.log"
+    },
+    {
+      "name": "probe-patch-tail",
+      "exit_code": 0,
+      "log": "probe-patch-tail.log"
+    },
+    {
+      "name": "config",
+      "exit_code": 0,
+      "log": "config.log"
+    }
+  ],
+  "bridge_counterexamples": [
+    {
+      "name": "snapshot-capture-order-resets",
+      "evidence": {
+        "captureSeq": [
+          2,
+          1
+        ],
+        "expected": "ORIGINAL",
+        "actual": "AFTER_FIRST_EDIT",
+        "reportedRestored": 1
+      }
+    },
+    {
+      "name": "rewind-misses-inflight-child-edit",
+      "evidence": {
+        "expectedChildFile": "deleted",
+        "actualChildFile": "CHILD_LATE_WRITE",
+        "receipt": "success",
+        "restoredCount": 1,
+        "deletedCount": 0,
+        "remainingJournalEntries": 0,
+        "interrupted": [
+          "child"
+        ]
+      }
+    },
+    {
+      "name": "grandchild-misattributed-to-later-root-message",
+      "evidence": {
+        "parentDispatchAnchor": 10,
+        "latestRootHumanMessage": 20,
+        "grandchildDispatchAnchor": 20,
+        "withdrawnAt20": [
+          "grandchild"
+        ]
+      }
+    },
+    {
+      "name": "restore-follows-symlink-ancestor",
+      "evidence": {
+        "outsideExpected": "UNRELATED_OUTSIDE_FILE",
+        "outsideActual": "WORKSPACE_ORIGINAL",
+        "restoredCount": 1,
+        "skippedCount": 0
+      }
+    },
+    {
+      "name": "queued-plan-off-dropped",
+      "evidence": {
+        "receipt": {
+          "available": true,
+          "active": false,
+          "pending": false,
+          "outcome": "queued"
+        },
+        "activeAfterResume": true,
+        "setCalls": []
+      }
+    },
+    {
+      "name": "mcp-structured-content-dropped",
+      "evidence": {
+        "serverResult": {
+          "content": [],
+          "structuredContent": {
+            "answer": 42
+          }
+        },
+        "gatewayResult": {
+          "server": "fake",
+          "tool": "structured",
+          "content": "",
+          "images": []
+        }
+      }
+    },
+    {
+      "name": "mcp-caller-abort-ignored",
+      "evidence": {
+        "signalAborted": true,
+        "requestAborted": false,
+        "completedAfterAbort": true,
+        "result": {
+          "server": "fake",
+          "tool": "delayed",
+          "content": "SIDE_EFFECT_COMPLETED",
+          "images": []
+        }
+      }
+    },
+    {
+      "name": "image-staging-follows-symlink",
+      "evidence": {
+        "victim": "ATTACHMENT_BYTES",
+        "outputEndsInJpg": true
+      }
+    }
+  ],
+  "harness_counterexamples": [
+    {
+      "id": "T01",
+      "partialTextPlusFailure": {
+        "lines": [
+          "WORKS  fixture/probe  text=\"partial answer\"  err=fatal turn error"
+        ],
+        "exitCode": 0
+      },
+      "allRoutesFailed": {
+        "lines": [
+          "FAILS  fixture/probe  text=\"\"  err=fatal turn error"
+        ],
+        "exitCode": 0
+      }
+    },
+    {
+      "id": "T02",
+      "initializeParams": {
+        "cwd": "/tmp"
+      },
+      "promptRejection": "paseo bridge is not initialized for session tools-synthetic-session; send `initialize` with this sessionId before prompting"
+    },
+    {
+      "id": "T03",
+      "realSequence": [
+        "assistant_message",
+        "reasoning",
+        "assistant_message"
+      ],
+      "fullSequenceAssistantRows": 2,
+      "assistantOnlyPrefilterRows": 1,
+      "harnessPredicatePasses": true
+    },
+    {
+      "id": "T04",
+      "imageBlocksSent": 0,
+      "syntheticAssistantReply": "IMAGE-SEEN",
+      "imageEvidencePredicatePasses": true
+    }
+  ],
+  "notes": [
+    "Existing checks use isolated checkout/profile state.",
+    "A reproduction exit 0 confirms the current defect, not a fix.",
+    "Real model, daemon operation, alpha runtime and native device acceptance were not executed."
+  ]
+}

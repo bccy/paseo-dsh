@@ -1,0 +1,4 @@
+{
+  "anchor": "    case \"paseo/commands\": {",
+  "insert": "\n      if (requested === \"race-native\") {\n        (await import(\"node:fs\")).writeFileSync(process.env.AUDIT_COMMAND_READY, \"ready\");\n        await new Promise(resolve => setTimeout(resolve, 300));\n      }"
+}
