@@ -78,15 +78,42 @@ function startBridge(ctx, config = {}) {
   // policies do.
   ctx.inject(['fs'], (scope) => {
     scope.on('tools/execute', async (exec, next) => {
-      await server.captureFileBeforeTool(exec);
-      return next();
+      // The ticket is taken BEFORE the snapshot so a rewind that starts in this
+      // window either waits for this write or refuses to plan without it. Every
+      // exit from here must release it: the success path through `post-execute`
+      // / `result`, and both failure paths below.
+      await server.beginFileMutation(exec);
+      try {
+        // A freeze that landed while `enter` was waiting leaves this execution
+        // cancelled rather than admitted; honour that before touching the file.
+        exec.signal?.throwIfAborted();
+        await server.captureFileBeforeTool(exec);
+        return await next();
+      } catch (error) {
+        if (server.ownsFileMutation(exec)) server.dropFileTool(exec);
+        server.finishFileMutation(exec);
+        throw error;
+      }
     });
     scope.on('tools/post-execute', async (exec, result, next) => {
-      await server.commitFileTool(exec, result);
+      // An execution that was never admitted has no snapshot to commit; it must
+      // not run the commit path, which would look for a pending entry nobody made.
+      if (!server.ownsFileMutation(exec)) return next();
+      try {
+        await server.commitFileTool(exec, result);
+      } finally {
+        // `finally`, not after the await: a throwing commit must not leave the
+        // ticket held, or every later rewind on this root would block.
+        server.finishFileMutation(exec);
+      }
       return next();
     });
     scope.on('tools/result', (exec) => {
-      server.dropFileTool(exec);
+      // Fires for failures and cancellations too, and may arrive after
+      // `post-execute` already released the ticket — `finishFileMutation` is
+      // identity-guarded and idempotent, so calling it unconditionally is right.
+      if (server.ownsFileMutation(exec)) server.dropFileTool(exec);
+      server.finishFileMutation(exec);
     });
   });
   // The bash call's own `description` titles the jobs pill row. It has to be

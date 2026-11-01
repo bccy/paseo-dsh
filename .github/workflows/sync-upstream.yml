@@ -71,6 +71,8 @@ jobs:
             node harness/revert-check.mjs
             node harness/surface-check.mjs
             node harness/file-snapshot-check.mjs
+            node harness/snapshot-lifecycle-check.mjs
+            node harness/file-mutation-gate-check.mjs
             node harness/rewind-merge-check.mjs
             node harness/mcp-http-check.mjs
             node harness/doctor-check.mjs
@@ -108,7 +110,7 @@ jobs:
                 "node harness/bridge-assets-check.mjs" \
                 "# 其余离线回归与 CI 的门保持一致：" \
                 "for s in archived-lineage-check image-host-path-check paseo-system-envelope-check revert-check \\" \
-                "         surface-check file-snapshot-check rewind-merge-check mcp-http-check doctor-check probe-check \\" \
+                "         surface-check file-snapshot-check snapshot-lifecycle-check file-mutation-gate-check \\" \
                 "         plugin-build-check frame-reader-check; do" \
                 "  node \"harness/\$s.mjs\" || exit 1" \
                 "done" \

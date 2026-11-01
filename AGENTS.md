@@ -457,6 +457,10 @@ token），并且加载插件会把内嵌桥重写进 `~/.dsh/profiles/<name>/no
 node harness/revert-check.mjs          # 令牌/区间/前置/回执/文件层/canary 顺序/共享进程接线
 node harness/surface-check.mjs         # 只折撤回缝、compaction 保留、尾随日志事件
 node harness/file-snapshot-check.mjs   # 编辑工具级写前备份（真实临时目录）
+node harness/snapshot-lifecycle-check.mjs  # 捕获序号跨重启续数、旧 journal 歧义拒绝（纯离线，见下）
+node harness/factory-ownership-order-check.mjs  # beginOwner 真的接在 setup 上且在发布之前（依赖本机 DSH，不进 CI）
+node harness/file-mutation-gate-check.mjs      # 文件写入闸门：freeze 排空在飞写入、超时重开准入（纯离线，进 CI）
+node harness/rewind-transaction-check.mjs      # 撤回事务：flush 期间子代理写入必须被纳入恢复（依赖本机 DSH，不进 CI）
 node harness/rewind-merge-check.mjs    # 父子归并：子/孙编辑落根会话 journal、断链 fail-open
 node harness/revert-shape-probe.mjs    # 纯内存离线（用本机已装 @deepseek-ai/dsh-session，DSH_SESSION_MODULE 可覆盖路径）：旧写法必抛、新写法通过
 node harness/replay-fidelity-probe.mjs <session.v4.jsonl.zstd>  # 真实日志重放保真

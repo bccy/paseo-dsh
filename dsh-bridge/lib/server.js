@@ -24,6 +24,7 @@ import { admitEncodedImages } from '@deepseek-ai/dsh-attachment';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
 import { underArchivedSession } from './archived-lineage.js';
 import { FileSnapshots, isTrackedTool, mutationPathOf, resolveMutationPath } from './file-snapshots.js';
+import { FileMutationGate } from './file-mutation-gate.js';
 import { isDelegatedSession, rootSessionFor as resolveRootSession, snapshotOwnerKey } from './snapshot-owners.js';
 import { ChildAnchors } from './child-anchors.js';
 import { cancelWithdrawnDelegations as cancelDelegatedWork } from './delegated-cancel.js';
@@ -335,6 +336,25 @@ export class PaseoHarnessServer {
      * DSH `fs` service.
      */
     this.fileSnapshots = new FileSnapshots();
+    /**
+     * Admission for tracked file mutations, keyed by ROOT session.
+     *
+     * `Agent.runMaintenance` (which a rewind calls) excludes the root agent's own
+     * tools but not its independently running descendants, so a native subagent
+     * can commit a journal line after the rewind planned its restore. This gate
+     * closes only that seam — see `file-mutation-gate.js` for its drop condition.
+     */
+    this.fileMutationGate = new FileMutationGate();
+    /**
+     * `sessionId:callId` -> the ticket one tracked execution holds.
+     *
+     * All three tool hooks (`execute` / `post-execute` / `result`) plus the
+     * failure path must agree on which execution they are releasing, and DSH
+     * gives no other shared handle. The `identity` field is the execution's own
+     * `token` (every real execution has one) so a reused call id cannot release
+     * somebody else's ticket.
+     */
+    this.fileMutationTickets = new Map();
     /**
      * Pending file-snapshot key (`sessionId:callId`) -> the session id its
      * snapshot is journaled under.
@@ -2047,6 +2067,83 @@ export class PaseoHarnessServer {
   }
 
   /**
+   * Admit one tracked execution and hold its ticket until its own cleanup.
+   *
+   * Called from `tools/execute` before the snapshot is taken. A non-tracked tool,
+   * an execution without a call id, or a session with no root is a no-op: only
+   * the tools `FileSnapshots` journals can possibly make a restore wrong.
+   *
+   * @param {{name?: string, callId?: unknown, arguments?: unknown, token?: unknown, signal?: AbortSignal, agent?: {session?: object}}} exec
+   * @returns {Promise<void>}
+   */
+  async beginFileMutation(exec) {
+    const session = exec?.agent?.session;
+    if (session === undefined || exec.callId === undefined) return;
+    if (!isTrackedTool(exec) || mutationPathOf(exec) === undefined) return;
+    const root = this.rootSessionFor(session);
+    if (root === undefined) return;
+    const key = snapshotOwnerKey(session, String(exec.callId));
+    if (this.fileMutationTickets.has(key)) throw new Error('duplicate file mutation call identity');
+    // `exec.token` is the execution's own identity and is what all three hooks
+    // share. It is required rather than defaulted to `exec`: a fallback object
+    // comparison would only exist to make synthetic fixtures work, and a fixture
+    // should carry the token instead of production carrying a branch for it.
+    const ticket = { identity: exec.token, release: undefined };
+    this.fileMutationTickets.set(key, ticket);
+    try {
+      ticket.release = await this.fileMutationGate.enter(String(root.id), exec.signal);
+      // A `tools/result` (or a cancel) can retire the ticket while `enter` was
+      // waiting for a freeze to lift. Releasing here is the only way out: the
+      // execution must not start writing behind a recovery that has since begun.
+      if (this.fileMutationTickets.get(key) !== ticket) {
+        ticket.release();
+        throw new Error('file mutation was retired before admission');
+      }
+    } catch (error) {
+      if (this.fileMutationTickets.get(key) === ticket) this.fileMutationTickets.delete(key);
+      throw error;
+    }
+  }
+
+  /**
+   * Release the ticket one tracked execution holds.
+   *
+   * Identity-guarded, and safe to call twice / for an execution that never took
+   * one, because the three hooks can all fire for the same execution (a failed
+   * tool reaches both `post-execute` and `result`).
+   *
+   * @param {{callId?: unknown, token?: unknown, agent?: {session?: object}}} exec
+   * @returns {boolean} whether a ticket was actually released.
+   */
+  finishFileMutation(exec) {
+    const session = exec?.agent?.session;
+    if (session === undefined || exec.callId === undefined) return false;
+    const key = snapshotOwnerKey(session, String(exec.callId));
+    const ticket = this.fileMutationTickets.get(key);
+    if (ticket === undefined || ticket.identity !== exec.token) return false;
+    this.fileMutationTickets.delete(key);
+    ticket.release?.();
+    return true;
+  }
+
+  /**
+   * Whether this execution currently holds a ticket.
+   *
+   * `tools/post-execute` and `tools/result` use it to stay out of the way of an
+   * execution that was never admitted (an untracked tool, or a fixture that
+   * never ran `tools/execute`).
+   *
+   * @param {{callId?: unknown, token?: unknown, agent?: {session?: object}}} exec
+   * @returns {boolean}
+   */
+  ownsFileMutation(exec) {
+    const session = exec?.agent?.session;
+    if (session === undefined || exec.callId === undefined) return false;
+    const ticket = this.fileMutationTickets.get(snapshotOwnerKey(session, String(exec.callId)));
+    return ticket !== undefined && ticket.identity === exec.token;
+  }
+
+  /**
    * Snapshot one file before a tracked editing tool mutates it.
    *
    * Called from `tools/execute`; never throws, because a snapshot problem must
@@ -2289,6 +2386,16 @@ export class PaseoHarnessServer {
       const preliminary = planRewind(session.surface.nodes, (seq) => session.eventAt(seq), params.token);
       if (!preliminary.ok) throw new Error(preliminary.reason);
       await this.settleAgentForRevert(agent);
+      // `runMaintenance` is DSH's own exclusive scope for one agent: while it runs,
+      // that agent's tools are held out. It does **not** cover the agent's
+      // independently running descendants, so the file gate is taken inside it —
+      // together they cover "the root and its children stop mutating files".
+      if (typeof agent.runMaintenance !== 'function') {
+        throw new Error('DSH agent has no runMaintenance contract for file recovery');
+      }
+      return await agent.runMaintenance(async (signal) => {
+      const releaseFiles = await this.fileMutationGate.freeze(sessionKey, signal);
+      try {
       const resolved = planRewind(session.surface.nodes, (seq) => session.eventAt(seq), params.token);
       if (!resolved.ok) throw new Error(resolved.reason);
       // Plan the file restore before touching the log: an unreadable journal or
@@ -2365,9 +2472,36 @@ export class PaseoHarnessServer {
       // give the children a bounded moment to observe it before touching files.
       this.cancelWithdrawnDelegations(agent, resolved.targetSeq);
       await this.settleDelegatedWork(agent);
+      if (filePlan !== undefined) {
+        try {
+          // Re-plan after durability and cancellation. The first plan was taken
+          // before the log write and before the children were told to stop, so a
+          // tracked write that committed in between (the gate now holds new ones
+          // out, but a ticket taken earlier still had to drain) would be missing
+          // from it — that file would be left modified and its journal line pruned
+          // as if it had been handled.
+          filePlan = (await this.fileSnapshots.planRestore(sessionKey, resolved.targetSeq)).actions;
+        } catch (error) {
+          // The conversation rewind already happened, so this cannot be a failure
+          // of the whole request; it is a file-layer failure and is reported as
+          // one, with the journal named because that is the retry material.
+          return {
+            kind: 'success',
+            text: successText(resolved.targetSeq),
+            files: {
+              restored: [],
+              deleted: [],
+              skipped: [],
+              rescue: [],
+              rescueDir: this.fileSnapshots.rescueDir(sessionKey),
+              failed: [{ path: this.fileSnapshots.journalPath(sessionKey), error: String(error) }],
+            },
+          };
+        }
+      }
       if (filePlan !== undefined && filePlan.length > 0) {
         files = await this.fileSnapshots.restore(sessionKey, filePlan);
-        if (files.failed.length > 0) {
+        if (files.failed.length > 0 || files.skipped.length > 0) {
           // Do not prune/trim/GC after a partial failure: the failed paths' backup
           // objects and journal lines are the only retry material, and dropping
           // them would make a second rewind silently no-op.
@@ -2396,6 +2530,12 @@ export class PaseoHarnessServer {
         text: successText(resolved.targetSeq),
         ...(files === undefined ? {} : { files }),
       };
+      } finally {
+        // Release the exclusive side even when the rewind threw part-way: leaving
+        // it held would refuse every later tracked edit in this conversation.
+        releaseFiles();
+      }
+      });
     } finally {
       this.revertInflight.delete(sessionKey);
     }
@@ -3331,9 +3471,25 @@ export class PaseoHarnessServer {
     // before, so preset support stays opt-in.
     const presets = this.ctx.get('agentPresets');
     let agentPreset;
+    // `beginOwner` belongs at the END of setup, and setup is the right hook:
+    // DSH awaits it while this process already holds the session's write lease
+    // and BEFORE the agent/session are published
+    // (`dsh-agent-loop/lib/index.js` `setupAndPublish` — `setup?.(...)` then
+    // `prepared.publish(...)`), so no capture can have run for this session yet
+    // and no other process can be allocating for its journal. That is exactly the
+    // guarantee `FileSnapshots.beginOwner` needs to re-read the durable high
+    // water, so no extra factory contract is required.
+    //
+    // `AgentSetupCommit.commit()` would also work, but it is a narrower internal
+    // contract and its position relative to publication is not the same across
+    // DSH versions: on 0.2.1-rc.5 it runs immediately before publication
+    // (`setupAndPublish`), while 0.2.2-alpha moved the call after the announce
+    // path. Setup itself is awaited before publication in both, so this is the
+    // placement that stays true on either line.
     let setup = async (agentCtx, agent) => {
       installSelection(agentCtx);
       await mountMcp(agentCtx);
+      this.fileSnapshots.beginOwner(sessionId);
     };
     if (presets !== undefined) {
       // `resolvePreset` validates before the session exists, so a stale queued id
@@ -3344,6 +3500,9 @@ export class PaseoHarnessServer {
         installSelection(agentCtx);
         await presets.mount(agentCtx, resolvedId);
         await mountMcp(agentCtx);
+        // Same reason as the default `setup` above: last, so a failed mount
+        // cannot claim ownership it never reached.
+        this.fileSnapshots.beginOwner(sessionId);
       };
     }
 
@@ -3395,6 +3554,11 @@ export class PaseoHarnessServer {
       let resumeSetup = async (agentCtx, agent) => {
         installSelection(agentCtx);
         await mountMcp(agentCtx);
+        // A resume is a new writer epoch on the same journal (this process may
+        // have been a previous owner, or may be taking over from another one),
+        // so the cached high water has to be re-read before the first capture.
+        // See the default `setup` above for why setup is the correct hook.
+        this.fileSnapshots.beginOwner(sessionId);
       };
       if (presets !== undefined) {
         const requested = this.pendingPresets.get(sessionId);
@@ -3419,6 +3583,8 @@ export class PaseoHarnessServer {
           installSelection(agentCtx);
           await presets.mount(agentCtx, resolvedId);
           await mountMcp(agentCtx);
+          // Same reason as the default `resumeSetup` above.
+          this.fileSnapshots.beginOwner(sessionId);
           // Record the composition that actually ran, so `paseo/presets.current`
           // (which folds this event over the header) cannot keep naming the
           // preset the fallback replaced. Log-only, same shape as the official

@@ -15,11 +15,22 @@
  *   read and stored by content hash under the session's `objects/` directory. A
  *   missing file is recorded as `backup: null` (the rewind deletes it).
  * - After the tool succeeds, one line is appended to the session journal:
- *   `{anchorSeq, captureSeq, callId, path, backup, mode}`. `anchorSeq` is the
- *   delegated turn's dispatch anchor or, for the root session, the newest human
- *   user message seq at execution time. `captureSeq` is the process-local
- *   capture order, so concurrent parent/child edits of one path restore the
- *   state before the *first* touch, not the first *commit*.
+ *   `{anchorSeq, captureSeq, captureOrderVersion, callId, path, backup, mode}`.
+ *   `anchorSeq` is the delegated turn's dispatch anchor or, for the root
+ *   session, the newest human user message seq at execution time. `captureSeq`
+ *   resumes the retained journal's high-water mark, so concurrent parent/child
+ *   edits of one path restore the state before the *first* touch, not the first
+ *   *commit*, and the order survives a restart.
+ *
+ *   The order is only provable **per path**: a line written before this build
+ *   carries no `captureOrderVersion`, and a process-local counter that restarted
+ *   from zero is indistinguishable from a valid reverse commit within one path.
+ *   `planRestore` therefore refuses a journal whose old lines cannot be ordered
+ *   *for that path*, and keeps the journal and its backups as evidence. Two
+ *   different paths that disagree are not evidence of a reset — their relative
+ *   order was never recorded and no restore decision depends on it — so they are
+ *   not refused. That boundary is what the code proves, not "no old journal can
+ *   ever be ambiguous".
  * - A rewind marks restore actions: for each path, the earliest capture after T
  *   decides — restore that `before` content, or delete the file if it did not
  *   exist yet. A file touched several times after T is still restored once.
@@ -79,6 +90,25 @@ const STR_REPLACE_EDITOR_WRITES = new Set(['create', 'str_replace', 'insert']);
 
 /** Default cap for one snapshot; larger files are skipped and reported. */
 const DEFAULT_MAX_FILE_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Marker written on every journal line whose `captureSeq` was allocated above
+ * the durable high water.
+ *
+ * A line without it was written by a build whose counter started at 0 in every
+ * process, so its number cannot be compared with this build's numbers — see
+ * `planRestore`, which refuses to guess between different pre-images.
+ */
+const CAPTURE_ORDER_VERSION = 1;
+
+/**
+ * Bound on journals whose high water this process has already folded in.
+ *
+ * The counter never decreases, so an evicted journal only costs one re-read; the
+ * bound exists so a long-lived process serving hundreds of sessions does not
+ * keep a growing set of ids.
+ */
+const SEQUENCE_ROOTS_MAX = 512;
 
 /**
  * Hard cap on distinct journal anchors.
@@ -232,6 +262,15 @@ export class FileSnapshots {
   #captureSequence = 0;
 
   /**
+   * Journals already folded into {@link #captureSequence} in this process.
+   *
+   * Bounded: the high water only ever moves forward, so a journal folded once
+   * never needs folding again until a new writer epoch begins
+   * ({@link beginOwner}). Evicting the oldest entry only costs a re-read.
+   */
+  #sequenceRoots = new Set();
+
+  /**
    * @param {object} [options]
    * @param {string} [options.rootDir] - override for tests.
    * @param {number} [options.maxFileBytes] - override for tests.
@@ -269,6 +308,78 @@ export class FileSnapshots {
     return run;
   }
 
+  /**
+   * Allocate the next capture order, resuming the durable high water first.
+   *
+   * `captureSeq` used to be a plain process-local counter starting at 0, so a
+   * restart rewound it: the second process's captures looked *earlier* than the
+   * first process's, `planRestore` picked the wrong pre-image for a path touched
+   * in both, and a rewind could restore an intermediate version while reporting
+   * success.
+   *
+   * The retained journal is the only durable record of what was already handed
+   * out, so it is read once per session per writer epoch and its highest
+   * `captureSeq` becomes the floor. Two things make that sound:
+   *
+   * - DSH's session write lease admits one bridge writer per session at a time,
+   *   so no other process is allocating for this journal while this one reads it.
+   * - The read happens **inside** the journal-write queue, so it cannot interleave
+   *   with this process's own appends, and it counts pending captures too
+   *   (their numbers are already allocated, only not yet written).
+   *
+   * @param {string} sessionId
+   * @returns {Promise<number>}
+   */
+  #nextCaptureSequence(sessionId) {
+    return this.#enqueue(async () => {
+      if (!this.#sequenceRoots.has(sessionId)) {
+        const { entries, skippedLines } = await this.readJournal(sessionId);
+        if (skippedLines > 0) {
+          this.warn(`capture order read skipped ${skippedLines} damaged journal line(s) for ${sessionId}`);
+        }
+        for (const entry of entries) {
+          if (entry.captureSeq !== undefined) {
+            this.#captureSequence = Math.max(this.#captureSequence, entry.captureSeq);
+          }
+        }
+        if (this.#sequenceRoots.size >= SEQUENCE_ROOTS_MAX) {
+          this.#sequenceRoots.delete(this.#sequenceRoots.values().next().value);
+        }
+        this.#sequenceRoots.add(sessionId);
+      }
+      if (!Number.isSafeInteger(this.#captureSequence + 1)) {
+        throw new Error('file snapshot capture order exhausted');
+      }
+      return ++this.#captureSequence;
+    });
+  }
+
+  /**
+   * Await journal writes already submitted by tools that have settled.
+   *
+   * A restore plan must see the lines of every tool that has finished. Without
+   * this, a commit still queued behind a slow append would be missing from the
+   * plan — the file it names would not be restored, and its entry would then be
+   * pruned as if it had been.
+   */
+  async settle() {
+    await this.#writeQueue;
+  }
+
+  /**
+   * Forget this session's cached high water because a new writer epoch began.
+   *
+   * The next capture re-reads the journal, which is what lets a process that
+   * lost and regained ownership follow another process's allocations. Called
+   * from the agent factory's setup hook: at that point this process holds the
+   * session's write lease and no capture can have run for it yet.
+   *
+   * @param {string} sessionId
+   */
+  beginOwner(sessionId) {
+    this.#sequenceRoots.delete(sessionId);
+  }
+
   /** @param {string} sessionId */
   sessionDir(sessionId) {
     return join(this.rootDir, encodeURIComponent(sessionId));
@@ -301,8 +412,11 @@ export class FileSnapshots {
    */
   async capture(input) {
     const key = pendingKeyOf(input);
-    const captureSeq = (this.#captureSequence += 1);
     try {
+      // Allocated first: the order has to be decided before the file is read,
+      // because two captures of one path must rank by when they *looked*, not
+      // when they managed to commit.
+      const captureSeq = await this.#nextCaptureSequence(input.sessionId);
       let info;
       try {
         info = await stat(input.path);
@@ -382,6 +496,7 @@ export class FileSnapshots {
         const line = `${JSON.stringify({
           anchorSeq: pending.anchorSeq,
           ...(typeof pending.captureSeq === 'number' ? { captureSeq: pending.captureSeq } : {}),
+          captureOrderVersion: CAPTURE_ORDER_VERSION,
           callId: pending.callId,
           path: pending.path,
           backup: pending.backup,
@@ -441,15 +556,21 @@ export class FileSnapshots {
       const backupValid = parsed?.backup === null
         || (typeof parsed?.backup === 'string' && /^[0-9a-f]{64}$/.test(parsed.backup));
       if (typeof parsed?.anchorSeq !== 'number'
+        || !Number.isSafeInteger(parsed.anchorSeq) || parsed.anchorSeq < 0
         || typeof parsed?.path !== 'string'
         || !isAbsolute(parsed.path)
-        || !backupValid) {
+        || !backupValid
+        || (parsed.captureSeq !== undefined
+          && (!Number.isSafeInteger(parsed.captureSeq) || parsed.captureSeq <= 0))) {
         skippedLines += 1;
         continue;
       }
       entries.push({
         anchorSeq: parsed.anchorSeq,
         captureSeq: typeof parsed.captureSeq === 'number' ? parsed.captureSeq : undefined,
+        captureOrderVersion: parsed.captureOrderVersion === CAPTURE_ORDER_VERSION
+          ? CAPTURE_ORDER_VERSION
+          : undefined,
         callId: typeof parsed.callId === 'string' ? parsed.callId : undefined,
         path: parsed.path,
         backup: parsed.backup,
@@ -474,11 +595,45 @@ export class FileSnapshots {
    * @returns {Promise<{actions: Array<{path: string, backup: string | null, mode: number | null}>, skippedLines: number}>}
    */
   async planRestore(sessionId, targetSeq) {
+    // A tool that has settled may still have its journal line queued behind a
+    // slow append. Planning without it would silently drop that path from the
+    // restore and then prune its entry as if it had been handled.
+    await this.settle();
     const { entries, skippedLines } = await this.readJournal(sessionId);
     /** @type {Map<string, {path: string, backup: string | null, mode: number | null, rank: number}>} */
     const byPath = new Map();
+    /** Per path, the distinct pre-images recorded by numbered (post-migration) lines. */
+    const orderedPreimages = new Map();
+    /** Per path, the single pre-image recorded by pre-migration lines. */
+    const legacyPreimages = new Map();
     for (const entry of entries) {
       if (entry.anchorSeq < targetSeq) continue;
+      const identity = `${String(entry.backup)}:${String(entry.mode)}`;
+      if (entry.captureOrderVersion === CAPTURE_ORDER_VERSION) {
+        const images = orderedPreimages.get(entry.path) ?? new Set();
+        images.add(identity);
+        orderedPreimages.set(entry.path, images);
+      }
+      if (entry.captureOrderVersion === undefined) {
+        // A pre-migration line carries a number from a counter that started at 0
+        // in every process, so within one path it is indistinguishable from a
+        // valid reverse commit. Refuse to guess between different pre-images and
+        // keep the journal plus its backups so the operator can recover them.
+        //
+        // The judgement is per path on purpose: only one path's restore decision
+        // depends on one path's order, so two paths whose numbers disagree are
+        // not evidence of a reset. A single old pre-image for a path stays
+        // usable — there is nothing to choose between.
+        const numberedAfter = orderedPreimages.get(entry.path);
+        const followsNewWriter = numberedAfter !== undefined && [...numberedAfter].some((image) => image !== identity);
+        const previous = legacyPreimages.get(entry.path);
+        if (followsNewWriter || (previous !== undefined && previous !== identity)) {
+          throw new Error(
+            `cannot prove file snapshot capture order for ${entry.path}; journal and backups retained`,
+          );
+        }
+        legacyPreimages.set(entry.path, identity);
+      }
       // Legacy lines have no capture order; they are older than any numbered
       // capture written by this build, so they rank first.
       const rank = typeof entry.captureSeq === 'number' ? entry.captureSeq : Number.NEGATIVE_INFINITY;
@@ -622,6 +777,7 @@ export class FileSnapshots {
       const lines = kept.map((entry) => `${JSON.stringify({
         anchorSeq: entry.anchorSeq,
         ...(entry.captureSeq === undefined ? {} : { captureSeq: entry.captureSeq }),
+        ...(entry.captureOrderVersion === undefined ? {} : { captureOrderVersion: entry.captureOrderVersion }),
         ...(entry.callId === undefined ? {} : { callId: entry.callId }),
         path: entry.path,
         backup: entry.backup,
@@ -679,6 +835,7 @@ export class FileSnapshots {
       const lines = kept.map((entry) => `${JSON.stringify({
         anchorSeq: entry.anchorSeq,
         ...(entry.captureSeq === undefined ? {} : { captureSeq: entry.captureSeq }),
+        ...(entry.captureOrderVersion === undefined ? {} : { captureOrderVersion: entry.captureOrderVersion }),
         ...(entry.callId === undefined ? {} : { callId: entry.callId }),
         path: entry.path,
         backup: entry.backup,
