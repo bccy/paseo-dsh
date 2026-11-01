@@ -2,7 +2,7 @@
 
 代码基线：`9298c28`，分支 `main`；开始时工作区干净。本次交付审查、证据与实施方案，未修产品、未合并上游、未升级或部署。
 
-配套文档：[架构选择与优化路线](ARCHITECTURE-ROADMAP-20261031.md)。分区详查及复现材料位于 [audits/20261031](audits/20261031/README.md)。
+分区详查及复现材料位于 [audits/20261031](audits/20261031/README.md)。
 
 ## 1. 结论
 
@@ -18,7 +18,7 @@
 
 上游方面：Paseo npm `latest` 与 `beta` 都为 `0.14.0`；DSH `latest/next` 为 `0.2.1-rc.5`，`alpha` 为 `0.2.2-alpha.2`。alpha 确定改变了 `installModelSelection` 的参数与职责，并要求 Node 24.9+。建议继续使用当前已适配的 rc.5，另建 alpha 验证环境。插件上游 0.2.17 的 Web 页脚布局不应排在这些问题之前。
 
-**长期演进补充**：官方 SDK 的限制不能推广成所有 DSH API 的限制。补查确认 rc.5 的官方 SessionController/JobController/WorkspaceController 已有取消、历史/实时事件、任务订阅和归档等能力。方案已明确调整为：P1 修复与第一批只读 API 迁移验证并行，逐项删掉被官方能力接替的桥代码。具体替换清单、接口副作用、单写入者原则和退出标准见 [路线图第 9 节](ARCHITECTURE-ROADMAP-20261031.md#9-长期主线逐项用官方-api-替换自有桥)。
+**迁移方向已撤回**：本轮曾提出“用官方 API 渐进替换桥”的路线，后续评估认为它把依赖挪到了无稳定承诺的 DSH 内部服务、净收益很小，已停止。替换已在跑的实现以 `AGENTS.md`「替换已在跑的实现，要能删掉一整块代码」为准。
 
 ## 2. 范围、方法与证据边界
 
@@ -33,7 +33,7 @@
 | client、入口、安装/doctor/probe、manifest/lock、CI、local-patches | 全模块读审；真实 mapper/组件、mock HTTP、纯字符串补丁变换 | [client-delivery.md](audits/20261031/client-delivery.md) |
 | `harness/` | 全入口与副作用分类，关键判据专项复现；47 个现有检查执行 | [harness.md](audits/20261031/harness.md)、[测试清单](audits/20261031/harness-inventory.csv) |
 | 文档、生成资产、静态附件 | 阅读当前架构/设计/历史审查，核对说明漂移；资产逐字节校验，非运行附件做范围归类 | [coverage.csv](audits/20261031/coverage.csv) |
-| DSH / Paseo 上游 | release、npm tags、相关原包 lib、官方公开文档及关键源码/PR 状态 | [路线图第 4 节](ARCHITECTURE-ROADMAP-20261031.md#4-上游版本趋势与升级判断)、[来源清单](audits/20261031/sources.json) |
+| DSH / Paseo 上游 | release、npm tags、相关原包 lib、官方公开文档及关键源码/PR 状态 | [来源清单](audits/20261031/sources.json) |
 
 主代理负责上游研究、现有回归、分区结果裁决和新增复现的独立复跑。三路子代理分别读审桥、服务端、客户端/交付，随后补审测试体系。没有委派产品修改，也没有把子代理的候选项未经核对直接当结论。
 
@@ -149,6 +149,4 @@ T01–T04 的原判据和请求形状由离线 VM/真实 bridge 的无模型服�
 
 ## 7. 下一步
 
-执行顺序为：**会话/恢复正确性与可信门禁 → 配置/生命周期/工具结果 → 交付与兼容矩阵 → 有测量依据的性能和移动端优化 → 下一代 DSH 接口旁路试验**。
-
-每个工作包的范围、依赖、回归条件、发布和回退要求已写入 [架构选择与优化路线](ARCHITECTURE-ROADMAP-20261031.md#6-实施路线与验收条件)。这轮到此只交付方案与证据；产品修复、上游 issue 提交、升级、部署和发布均未执行。
+三个 P1 各自单独修复，每个都把对应反例转成“修复前失败、修复后通过”的回归；其余发现按需处理，不打包成迁移计划。本轮只交付审查与证据；产品修复、上游 issue 提交、升级、部署和发布均未执行。

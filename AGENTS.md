@@ -77,6 +77,7 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon fork 出的 p
 | **取消是取消回合，不是杀进程** | 杀进程会连会话一起报废 |
 | **不要硬编码某个人的 provider/model** | 这个仓库是给别人用的。路由从 profile 读，读不到就带说明失败 |
 | **能复用的代码或逻辑，不要自己写** | 上游已经有的实现（DSH 的 `session.append` 表面替换、compaction 折叠、`dsh-rewind` 的 git 快照；Paseo 适配器已经验证过的形状）比我们现编的可靠，也免得下次上游一改就跟不上。复用前先核目标版本的 API 与语义（版本范围满足≠可运行），复用时把边界写进注释；确实没有可复用的，再自己写并在 `docs/` 留痕。 |
+| **替换已在跑的实现，要能删掉一整块代码** | 上一条管"新写的东西先找上游"；已经在跑的自有实现，只有上游提供了**稳定的等价能力**（公开 API 或宿主原生行为，例如 Paseo 0.15 自己刷新撤回后的时间线，于是 `local-patches` 的撤回补丁可以删）、换完能**删掉一整块代码**时才换，并在同一个提交里删旧实现。把自己的代码换成对 DSH **内部服务**的调用不算减负：依赖从"自己能控制的代码"挪到"上游没有稳定承诺的内部 API"，升级时会静默失效，而且 `dsh-api-contract-check` 只看 import、看不见服务调用。不做成批的"总体迁移"；修 bug 就单独修，不要借迁移的名义一起做。教训：2026-10-31 的迁移分支运行时代码只净减 55 行，换来 13 个没有检查兜底的内部符号和一次 CI 变红，DSH alpha 已经改掉其中两处语义。 |
 | **不要注册 `before("agent.session_open")`** | 宿主对带这个 hook 的插件，每次起停都会 `invalidatePluginSessions()`，于是**所有 agent（任何 provider）下一次提问前都会被 reload**。想拿 `paseo` 句柄就用 `on("agent.turn_started")` / `on("agent.turn_ended")` 或一条 RPC 在回调上下文里取 |
 | **改了 `dsh-bridge/` 必须重生成内嵌桥** | `paseo-plugin/server/bridge-assets.ts` 是桥的 base64 内嵌副本，供插件自举 profile（Paseo 安装插件不跑脚本）。跑 `node paseo-plugin/scripts/generate-bridge-assets.mjs`（`npm publish` 的 `prepack` 也会跑），并提交生成结果 |
 
