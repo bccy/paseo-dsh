@@ -25,19 +25,28 @@ import type {
   PluginButtonRegistration,
   PluginClientContext,
 } from "@getpaseo/plugin/client";
+import { Icon } from "@getpaseo/plugin/client/ui";
 import { useEffect, useState } from "react";
-import { Pressable, Text, View } from "react-native";
+import { Platform, Pressable, Text, View, type PressableStateCallbackType } from "react-native";
 import { isLiveStatus, jobsList, splitJobs, type Job } from "../shared/jobs";
 import { PROVIDER_ID } from "../shared/provider";
 import {
+  CHEVRON_BOX,
   FACTS_FONT_SIZE,
   MARK_BOX,
   MARK_DOT_SIZE,
+  SECTION_SEPARATOR_COLOR,
+  SECTION_SEPARATOR_HEIGHT,
+  SECTION_SEPARATOR_MARGIN_VERTICAL,
   TITLE_FONT_SIZE,
+  chevronColorToken,
+  chevronRotation,
   isPermissionDeniedError,
   popoverRootBox,
+  rowActiveFill,
   rowBox,
   rowTextColumn,
+  sectionDivided,
   statusMark,
   type JobStatus,
 } from "./jobs-popover-layout";
@@ -240,15 +249,50 @@ function NoteLine({
 }
 
 /**
- * The collapsed header over the finished rows: one line, "3 个已完成".
+ * The disclosure row's style callback state.
  *
- * It is a plain `View`, not a `Pressable`, for the same reason a job row is: a
- * host track panel has no pressable rows, and the popover's rows stay read-only.
- * Tapping it is handled by the parent's `onPress`, which is the only interactive
- * thing in this popover.
+ * `PressableStateCallbackType` carries only `pressed` in both the plugin's and
+ * the host's React Native typings, while RN Web does hand `hovered` to the
+ * callback — so the host crosses the two everywhere it reads hover
+ * (`packages/app/src/components/settings/row-header.tsx`'s `type HoverState`,
+ * `packages/app/src/components/ui/menu/menu-item.tsx`). Same here.
+ */
+type HoverState = PressableStateCallbackType & { hovered?: boolean };
+
+/**
+ * The disclosure row over the finished rows: a label, the count in the trailing
+ * muted slot, and a chevron that turns down when the section opens.
  *
- * The chevron is a text glyph rather than an icon because the client bundle may
- * not import the host's icon set — the same constraint `JobMark` works under.
+ * **The geometry is the host's expandable row.** The host's `docs/design.md`
+ * §12: "An expandable row uses a trailing right chevron that rotates down when
+ * expanded (`SettingsCollapsibleRow`); pressing the row reveals its child rows in
+ * place."
+ * `packages/app/src/components/settings/row-header.tsx` is that implementation —
+ * a trailing `ChevronRight` at `ICON_SIZE.sm` that rotates `90deg`, its colour
+ * lifting from `foregroundMuted` to `foreground` while the row is hovered. The
+ * label/count split follows the host's own panel rows instead of the settings
+ * title: the count is a `rowTrailing` value
+ * (`packages/app/src/subagents/track.tsx`) — `fontSize.sm`, `foregroundMuted`,
+ * `flexShrink: 2` — so the words stay `fontSize.base` and `foreground` while the
+ * number reads as secondary.
+ *
+ * **The box is still a track row.** `rowBox` is applied unchanged, because a
+ * popover body that stopped using it would fall off the rail the subagent panel
+ * shares (the composition is asserted in `harness/jobs-popover-check.cjs`). The
+ * fill is `surface2` for hover *and* press, which is what the host's own
+ * `ComposerTrackRow` paints for both (`rowActive`); the settings page's separate
+ * `surface3` press state has no token in the plugin theme, and a menu surface
+ * uses one fill anyway.
+ *
+ * **`aria-expanded` is set by hand on web.** React Native Web does not map
+ * `accessibilityState.expanded` to `aria-expanded`, so the host passes it
+ * explicitly on web and keeps `accessibilityState` for native
+ * (`packages/app/src/composer/tracks.tsx`'s `ariaExpandedProps`) — the same split
+ * here, because a disclosure whose state a screen reader cannot read is a button
+ * that says nothing about what it does.
+ *
+ * It is the only pressable in the popover: a job row stays read-only, and the
+ * rule is "no `Pressable` inside a row", not "no `Pressable`".
  */
 function SettledHeader({
   count,
@@ -265,16 +309,64 @@ function SettledHeader({
   onToggle: () => void;
   text: JobsText;
 }) {
+  // A `Pressable` that styles itself from its own hover is the form the host's
+  // `docs/hover.md` calls preferred, and this row has no nested `Pressable` for
+  // hover to fight over.
+  const rowStyle = ({ hovered = false, pressed }: HoverState) => {
+    const active = rowActiveFill(hovered, pressed);
+    return [rowBox({ compact }), active === undefined ? undefined : { backgroundColor: theme.colors[active] }];
+  };
+  const chevronBox = {
+    width: CHEVRON_BOX,
+    height: CHEVRON_BOX,
+    alignItems: "center",
+    justifyContent: "center",
+    transform: chevronRotation(expanded),
+  } as const;
   return (
     <Pressable
       onPress={onToggle}
       accessibilityRole="button"
+      // The words, then the count — the host's `label, summary` order
+      // (`packages/app/src/components/settings/row-header.tsx`), minus its
+      // `summary ? … : label` branch: this header is only rendered when
+      // `settled.length > 0`, so the count is always at least 1 and there is no
+      // empty case to fall back from.
+      accessibilityLabel={`${text.settledLabel}, ${String(count)}`}
       accessibilityState={{ expanded }}
-      style={rowBox({ compact })}
+      // Web only, and via a spread so the prop does not exist at all on native
+      // (the host's `isWeb ? { "aria-expanded": open } : null`).
+      {...(Platform.OS === "web" ? { "aria-expanded": expanded } : null)}
+      style={rowStyle}
     >
-      <Text style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}>
-        {`${expanded ? "▾" : "▸"} ${expanded ? text.settledSectionOpen(count) : text.settledSection(count)}`}
-      </Text>
+      {({ hovered = false, pressed }: HoverState) => (
+        <>
+          <Text
+            numberOfLines={1}
+            style={{ ...rowTextColumn(), fontSize: TITLE_FONT_SIZE, color: theme.colors.foreground }}
+          >
+            {text.settledLabel}
+          </Text>
+          <Text
+            numberOfLines={1}
+            style={{
+              flexShrink: 2,
+              minWidth: 0,
+              fontSize: FACTS_FONT_SIZE,
+              color: theme.colors.foregroundMuted,
+            }}
+          >
+            {String(count)}
+          </Text>
+          <View style={chevronBox}>
+            <Icon
+              name="ChevronRight"
+              size={CHEVRON_BOX}
+              color={theme.colors[chevronColorToken(hovered, pressed)]}
+            />
+          </View>
+        </>
+      )}
     </Pressable>
   );
 }
@@ -304,6 +396,18 @@ function SettledHeader({
  * **No inner ScrollView.** The surface is already scrollable at the host's own
  * `maxHeight`; a second one capped the list shorter and gave the panel two scroll
  * regions.
+ *
+ * **The rule between the two groups.** The host separates one kind of content
+ * from the list with a `MenuSeparator` rather than with chrome
+ * (`ComposerTrackActions`: "The divider is what separates them from the list, not
+ * their chrome"), so the folded section gets the same 1px rule above it — but
+ * only when there is something above it. With nothing running the section is the
+ * whole body, and a rule there would just be a line under the panel's top edge.
+ *
+ * It is a plain `View`, not a `Pressable`, and it takes **no horizontal margin**:
+ * `packages/app/src/components/ui/menu/menu-item.tsx`'s separator comment says the
+ * rule "still runs the full width of the surface", and the root already cancels
+ * the host's 12 on both sides.
  */
 function makeJobsPopover(store: JobStore, agentId: string) {
   function JobsPopover({ theme, layout }: PluginButtonContentProps) {
@@ -357,6 +461,14 @@ function makeJobsPopover(store: JobStore, agentId: string) {
     // status outside `JOB_STATUSES` never reaches here — the wire schema rejects
     // the whole answer — so both groups empty is unreachable, not a fallback.
     const expanded = settledOpen ?? live.length === 0;
+    // Same condition the host uses to decide a divider has two things to separate
+    // (`ComposerTrackActions` draws none when what follows it is empty).
+    const divided = sectionDivided(live.length, settled.length);
+    const separator = {
+      height: SECTION_SEPARATOR_HEIGHT,
+      marginVertical: SECTION_SEPARATOR_MARGIN_VERTICAL,
+      backgroundColor: theme.colors[SECTION_SEPARATOR_COLOR],
+    } as const;
 
     return (
       <View style={root}>
@@ -370,6 +482,7 @@ function makeJobsPopover(store: JobStore, agentId: string) {
             compact={layout.compact}
           />
         ))}
+        {divided ? <View style={separator} /> : null}
         {settled.length > 0 ? (
           <SettledHeader
             count={settled.length}

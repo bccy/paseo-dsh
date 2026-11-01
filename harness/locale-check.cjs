@@ -209,28 +209,37 @@ console.log("the jobs pill's copy is covered in both languages");
   // Every key the interface declares must be present in both, and the two key
   // sets must match — a key added to one language only is the drift this catches.
   equal("jobs keys match", Object.keys(en).sort(), Object.keys(zh).sort());
-  for (const key of ["label", "title", "statuses", "allSettled", "settledSection", "settledSectionOpen", "unavailable"]) {
+  for (const key of ["label", "title", "statuses", "allSettled", "settledLabel", "unavailable"]) {
     check(`jobs.${key} exists in both languages`, en[key] !== undefined && zh[key] !== undefined);
   }
 
-  // The three functions take a count and return a sentence; each is called once
-  // per language. A function that returned "" would render an empty pill.
+  // `label` is the only function left: it takes a count and returns the pill's
+  // sentence, and a version returning "" would render an empty pill. The folded
+  // section's header is a plain string now — the count sits in the row's trailing
+  // muted slot rather than in the sentence, which is how the host's own rows put a
+  // number next to a label.
   for (const locale of LOCALES) {
     const table = allText()[locale].jobs;
-    for (const name of ["label", "settledSection", "settledSectionOpen"]) {
-      const rendered = table[name](2);
-      check(
-        `jobs.${name}(2) is a non-empty string in ${locale}`,
-        typeof rendered === "string" && rendered.trim() !== "",
-        JSON.stringify(rendered),
-      );
-    }
+    const rendered = table.label(2);
+    check(
+      `jobs.label(2) is a non-empty string in ${locale}`,
+      typeof rendered === "string" && rendered.trim() !== "",
+      JSON.stringify(rendered),
+    );
+  }
+  for (const locale of LOCALES) {
+    const table = allText()[locale].jobs;
+    check(
+      `jobs.settledLabel is a plain string, not a count-taking function (${locale})`,
+      typeof table.settledLabel === "string" && table.settledLabel.trim() !== "",
+      JSON.stringify(table.settledLabel),
+    );
   }
 
   // The plain strings.
   for (const locale of LOCALES) {
     const table = allText()[locale].jobs;
-    for (const key of ["title", "allSettled", "unavailable"]) {
+    for (const key of ["title", "allSettled", "settledLabel", "unavailable"]) {
       check(
         `jobs.${key} is a non-empty string in ${locale}`,
         typeof table[key] === "string" && table[key].trim() !== "",
@@ -240,12 +249,8 @@ console.log("the jobs pill's copy is covered in both languages");
   }
 
   // The English column must not be a copy of the Chinese one: a translated table
-  // and a duplicated one look identical until someone switches language. The two
-  // `settledSection*` functions are compared by their output, not identity.
-  const copied = ["title", "allSettled", "unavailable"].filter((key) => en[key] === zh[key]);
-  for (const name of ["settledSection", "settledSectionOpen"]) {
-    if (en[name](3) === zh[name](3)) copied.push(name);
-  }
+  // and a duplicated one look identical until someone switches language.
+  const copied = ["title", "allSettled", "settledLabel", "unavailable"].filter((key) => en[key] === zh[key]);
   equal("the English jobs copy is not the Chinese copy", copied, []);
 
   // **`statuses` must cover exactly the statuses `shared/jobs.ts` declares.**

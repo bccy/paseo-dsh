@@ -58,8 +58,20 @@ const EXPECTED = {
   POPOVER_HOST_PADDING: 12,
   POPOVER_CANCEL_MARGIN: -12,
   POPOVER_PAGE_PADDING_VERTICAL: 0,
+  // The folded section's disclosure row, and the rule above it.
+  CHEVRON_BOX: 14,
+  CHEVRON_ROTATION_EXPANDED: "90deg",
+  ROW_ACTIVE_FILL: "surface2",
+  SECTION_SEPARATOR_HEIGHT: 1,
+  SECTION_SEPARATOR_MARGIN_VERTICAL: 4,
+  SECTION_SEPARATOR_COLOR: "border",
 };
 for (const [name, expected] of Object.entries(EXPECTED)) check(name, layout[name], expected);
+
+// The chevron's box is the same slot a row's mark uses — one rail, one number.
+// Asserted as an equality rather than two literals, so a future edit that moves
+// only one of them is red here.
+check("the chevron box is the row mark's box", layout.CHEVRON_BOX, layout.MARK_BOX);
 
 const wide = layout.rowBox({ compact: false });
 check("rowBox(wide).gap", wide.gap, 8);
@@ -102,7 +114,6 @@ assert(
 );
 
 console.log("\nstatus → mark");
-
 const sharedJobsPath =
   process.env.SHARED_JOBS ?? path.resolve(__dirname, "..", "..", "paseo-plugin", "shared", "jobs.ts");
 
@@ -146,6 +157,40 @@ check("failed fills its dot with statusDanger", layout.statusMark("failed")?.col
 check("completed fills its dot with border", layout.statusMark("completed")?.color, "border");
 check("killed fills its dot with border, not danger", layout.statusMark("killed")?.color, "border");
 
+console.log("\nthe folded section's disclosure row");
+
+// The interaction rules are pure functions in the layout module, so they are
+// asserted by calling them rather than by reading the component's JSX. A
+// pattern-match on the ternary would pass for the wrong reasons; a call with each
+// of the four hover/pressed combinations pins the rule itself.
+check("at rest the row paints no fill", layout.rowActiveFill(false, false), undefined);
+check("hover fills the row with surface2", layout.rowActiveFill(true, false), "surface2");
+check("press fills the row with surface2", layout.rowActiveFill(false, true), "surface2");
+check("hover and press together still fill once", layout.rowActiveFill(true, true), "surface2");
+check("the fill token is the one the theme carries", layout.ROW_ACTIVE_FILL, "surface2");
+check("at rest the chevron is muted", layout.chevronColorToken(false, false), "foregroundMuted");
+check("hover lifts the chevron to foreground", layout.chevronColorToken(true, false), "foreground");
+check("press lifts the chevron to foreground", layout.chevronColorToken(false, true), "foreground");
+
+// The rotation is a value, so "it follows `expanded` and nothing else" is checkable:
+// collapsed is no transform at all, expanded is exactly the host's 90deg.
+check("a collapsed section does not rotate the chevron", layout.chevronRotation(false), undefined);
+const expandedRotation = layout.chevronRotation(true);
+assert(
+  "an expanded section rotates the chevron 90deg, once",
+  Array.isArray(expandedRotation) && expandedRotation.length === 1 &&
+    expandedRotation[0].rotate === "90deg",
+  JSON.stringify(expandedRotation),
+);
+check("the rotation is the host's", expandedRotation?.[0]?.rotate, layout.CHEVRON_ROTATION_EXPANDED);
+
+// The rule above the folded section: both groups must have something in them.
+check("no rule with nothing running", layout.sectionDivided(0, 3), false);
+check("no rule with nothing settled", layout.sectionDivided(2, 0), false);
+check("no rule with neither", layout.sectionDivided(0, 0), false);
+check("a rule when both groups have rows", layout.sectionDivided(1, 1), true);
+check("a rule with several on each side", layout.sectionDivided(4, 9), true);
+
 // Check the JSX consumers, not just the helpers they are meant to use.
 console.log("\nUI wiring");
 const pillSource = readSource("paseo-plugin/client/jobs-pill.tsx");
@@ -172,15 +217,213 @@ assert("rows and notes take host compact density", rows.length === 4 && rows.eve
 // section's header IS pressable — DSH's own list renders it as a `button` with
 // `aria-expanded` — so the rule is "no Pressable inside a row", not "no Pressable".
 assert("no inner scroll view", !pillElements.some((element) => element.tag === "ScrollView"));
-check("exactly one pressable element (the finished-section header)",
-  pillElements.filter((element) => element.tag === "Pressable").length, 1);
-assert("the pressable is the settled header, not a job row",
-  shape.functionBody(pillSource, "SettledHeader") !== undefined
-    && /accessibilityState=\{\{\s*expanded\s*\}\}/.test(pillSource));
+const pressables = pillElements.filter((element) => element.tag === "Pressable");
+check("exactly one pressable element (the finished-section header)", pressables.length, 1);
+const pressable = pressables[0];
+
+// **The only `Pressable` is the folded section's header.** This used to be asserted
+// with a regex over the whole file, which a `Pressable` anywhere else would also
+// satisfy. There is one element now, so its own attributes are the evidence: the
+// disclosure contract lives on it, and a job row still cannot reach a `Pressable`.
+assert("the only pressable is the settled header",
+  pressable !== undefined && shape.hasAttribute(pressable, "onPress")
+    && attr(pressable, "accessibilityRole").trim() === "button",
+  pressable === undefined ? "no Pressable" : JSON.stringify(pressable.attributes.map((a) => a.name)));
 assert("job rows stay read-only", (() => {
   const body = shape.functionBody(pillSource, "JobRow");
   return body !== undefined && !body.includes("Pressable");
 })());
+
+// **The reader itself.** `shape.functionBody` used to return the *parameter
+// object* for a destructuring signature — the first `{` after the header is the
+// params, not the body — so every assertion built on it was checking
+// `"{ job, theme, text, compact }"` instead of the function. That made
+// "job rows stay read-only" above unfalsifiable: injecting a `Pressable` into
+// `JobRow` left it green. These two pin the reader's contract directly, so a
+// regression in it is a red check here rather than a silent hole in another one.
+const settledBody = shape.functionBody(pillSource, "SettledHeader");
+assert(
+  "the body reader returns a function body, not its parameter list",
+  settledBody !== undefined && settledBody.includes("<Pressable"),
+  settledBody === undefined ? "undefined" : JSON.stringify(settledBody.slice(0, 60)),
+);
+assert(
+  "the body reader stops at the right function when names share a prefix",
+  (() => {
+    // `SettledHeader` is a prefix-free name, so the collision case needs a pair
+    // that exists: `JobRow` and `JobRows` would be it, but this file has none —
+    // so assert the reader's own name boundary on a synthetic source instead.
+    const probe = "function rows() {\n  return 1;\n}\nfunction rowsExtra() {\n  return 2;\n}";
+    const body = shape.functionBody(probe, "rows");
+    return body !== undefined && body.includes("return 1") && !body.includes("return 2");
+  })(),
+);
+
+// **The disclosure row's own wiring**, all read off that one element.
+assert("the header reads the section's state for its accessibility",
+  shape.mentions(attr(pressable, "accessibilityState"), "expanded"));
+assert("the header labels itself with the words and the count",
+  shape.mentions(attr(pressable, "accessibilityLabel"), "settledLabel")
+    && shape.mentions(attr(pressable, "accessibilityLabel"), "count"),
+  attr(pressable, "accessibilityLabel"));
+// `aria-expanded` is web-only and spread in, which is how the host writes it
+// (`isWeb ? { "aria-expanded": open } : null`). React Native Web ignores
+// `accessibilityState.expanded`, so without this the button's state is unreadable
+// on the only platform this popover renders on.
+const webProps = attr(pressable, "{...spread}");
+assert("the header sets aria-expanded on web only",
+  webProps.includes("aria-expanded") && webProps.includes('Platform.OS === "web"'),
+  webProps);
+assert("the header styles itself from its own pressable state",
+  attr(pressable, "style").trim() === "rowStyle",
+  attr(pressable, "style"));
+// The fill rule itself is asserted as a function above; this is the wiring that
+// makes it reach the screen — the callback has to read both flags, and the colour
+// has to come out of the theme rather than a literal.
+const fillCalls = calls(pillSource, "rowActiveFill");
+assert("the row's style callback reads hover and press",
+  fillCalls.length === 1
+    && shape.mentions(fillCalls[0], "hovered")
+    && shape.mentions(fillCalls[0], "pressed"),
+  JSON.stringify(fillCalls));
+assert("the row's fill is taken from the theme by token",
+  /theme\.colors\[\s*active\s*\]/.test(pillSource));
+assert("the disclosure row keeps the track row's box",
+  calls(pillSource, "rowBox").some((args) => shape.mentions(args, "compact")));
+
+// **The chevron is the host's icon, not a text glyph.** A glyph would look
+// plausible and break the moment the host's icon font or size changes.
+assert("the folded section no longer draws a text chevron",
+  !pillSource.includes("▾") && !pillSource.includes("▸"));
+const chevrons = pillElements.filter((element) => element.tag === "Icon");
+check("exactly one host icon in the popover", chevrons.length, 1);
+const chevron = chevrons[0];
+assert("the chevron is the host's ChevronRight",
+  chevron !== undefined && attr(chevron, "name").trim() === "ChevronRight",
+  chevron === undefined ? "no Icon" : attr(chevron, "name"));
+assert("the chevron is sized by the shared icon slot",
+  chevron !== undefined && shape.mentions(attr(chevron, "size"), "CHEVRON_BOX"),
+  chevron === undefined ? "no Icon" : attr(chevron, "size"));
+assert("the chevron's colour follows the row's active state",
+  chevron !== undefined && shape.mentions(attr(chevron, "color"), "chevronColorToken"),
+  chevron === undefined ? "no Icon" : attr(chevron, "color"));
+// The rotation rule is asserted as a value above; here it is the wiring: the
+// transform has to come from that function and take `expanded`.
+const rotations = calls(pillSource, "chevronRotation");
+assert("the chevron's rotation is driven by `expanded` alone",
+  rotations.length === 1 && shape.mentions(rotations[0], "expanded"),
+  JSON.stringify(rotations));
+assert("the rotation is wired into the chevron's box",
+  /\btransform:\s*chevronRotation\(/.test(pillSource));
+
+// **The label/count split.** The words are the row's title (14 / foreground); the
+// number sits in the host's trailing muted slot (12 / foregroundMuted), which is
+// what `rowTrailing` and `SettingsRowHeader`'s `summary` do — not "3 finished"
+// spelled into one sentence.
+const textsAfterHeader = pressable === undefined
+  ? []
+  : pillElements.filter((element) => element.tag === "Text" && element.start > pressable.start);
+assert("the header draws a label and a count", textsAfterHeader.length >= 2,
+  String(textsAfterHeader.length));
+const [labelText, countText] = textsAfterHeader;
+assert("the label is the row's title type, in foreground",
+  labelText !== undefined
+    && shape.mentions(attr(labelText, "style"), "TITLE_FONT_SIZE")
+    && shape.mentions(attr(labelText, "style"), "foreground")
+    && !shape.mentions(attr(labelText, "style"), "foregroundMuted"),
+  labelText === undefined ? "no label Text" : attr(labelText, "style"));
+assert("the count is the muted trailing type",
+  countText !== undefined
+    && shape.mentions(attr(countText, "style"), "FACTS_FONT_SIZE")
+    && shape.mentions(attr(countText, "style"), "foregroundMuted"),
+  countText === undefined ? "no count Text" : attr(countText, "style"));
+// **The split itself: two elements, in that order, with different children.** The
+// claim the design makes is "the number is not part of the sentence", and the only
+// thing that can falsify it is the *shape*: a single `Text` rendering both would
+// have the count inside the label's children. Reading the label's children and
+// requiring the count to be absent from them is the direct check; requiring the
+// two `Text`s to be distinct elements is what stops a refactor from collapsing
+// them back into one line of copy.
+assert("the label and the count are two different elements",
+  labelText !== undefined && countText !== undefined && labelText.start !== countText.start);
+assert("the count sits after the label in the row",
+  labelText !== undefined && countText !== undefined && countText.start > labelText.start);
+// The label's own children render `settledLabel` and never `count`; the count's
+// children render `count`. `jsxElements` reports where an opening tag *ends*, so
+// each span runs from its own tag to the next element's — the children in between.
+// That is what "the number is not part of the sentence" means structurally, and it
+// fails if the two are ever merged back into one `Text`.
+const spanFrom = (element, limit) =>
+  element === undefined ? "" : pillSource.slice(element.end, Math.min(limit, pillSource.length));
+const labelSpan = spanFrom(labelText, countText?.start ?? pillSource.length);
+const countSpan = spanFrom(countText, chevron?.start ?? pillSource.length);
+assert("the label's own children render the words and not the number",
+  /settledLabel/.test(labelSpan) && !/\bcount\b/.test(labelSpan),
+  JSON.stringify(labelSpan.slice(0, 140)));
+assert("the count's own children render the number",
+  /\bcount\b/.test(countSpan),
+  JSON.stringify(countSpan.slice(0, 140)));
+
+// **The rule above the folded section.** A `View`, drawn from the shared
+// constants, and only when `sectionDivided` says both groups have rows.
+const separatorViews = pillElements.filter((element) =>
+  element.tag === "View" && attr(element, "style").trim() === "separator");
+check("the divider is a View, not a pressable", separatorViews.length, 1);
+const dividedCalls = calls(pillSource, "sectionDivided");
+assert("the divider's condition is the both-groups rule",
+  dividedCalls.length === 1
+    && shape.mentions(dividedCalls[0], "live")
+    && shape.mentions(dividedCalls[0], "settled"),
+  JSON.stringify(dividedCalls));
+// **`divided` has to actually gate the divider.** The assertion above only proves
+// `sectionDivided(...)` is *called*; it stays green when the JSX renders the
+// separator unconditionally (`<View style={separator} />`) or behind `{true ? …}`
+// — both were measured at 205/205 before this pair was added. So the gate is read
+// structurally: walk back from the separator element to the `{` that wraps it, and
+// require the expression inside to start with `divided` followed by `?` or `&&`.
+// Formatting-independent: the search is over braces, so line breaks and wrapping
+// cannot change the answer.
+const enclosingBrace = (source, index) => {
+  let depth = 0;
+  for (let i = index - 1; i >= 0; i -= 1) {
+    if (source[i] === "}") depth += 1;
+    else if (source[i] === "{") {
+      if (depth === 0) return i;
+      depth -= 1;
+    }
+  }
+  return -1;
+};
+const separatorElement = separatorViews[0];
+const gateBrace = separatorElement === undefined ? -1 : enclosingBrace(pillSource, separatorElement.start);
+const gateExpression = gateBrace < 0 ? "" : pillSource.slice(gateBrace + 1, separatorElement.start).trim();
+assert("the divider is rendered behind the `divided` gate",
+  /^divided\s*[?&]/.test(gateExpression),
+  JSON.stringify(gateExpression));
+// And `divided` has to be that call's result, not merely a name that happens to be
+// truthy — a `const divided = true;` would satisfy the gate above.
+const popoverSourceForGate = shape.functionBody(pillSource, "makeJobsPopover") ?? "";
+assert("the gate is the both-groups call's result",
+  /const\s+divided\s*=\s*sectionDivided\(\s*live\.length\s*,\s*settled\.length\s*\)/.test(popoverSourceForGate),
+  JSON.stringify((/const\s+divided[^;]*;/.exec(popoverSourceForGate) ?? [""])[0]));
+assert("the divider takes the host separator's geometry",
+  /\bheight:\s*SECTION_SEPARATOR_HEIGHT\b/.test(pillSource)
+    && /\bmarginVertical:\s*SECTION_SEPARATOR_MARGIN_VERTICAL\b/.test(pillSource)
+    && /theme\.colors\[\s*SECTION_SEPARATOR_COLOR\s*\]/.test(pillSource));
+// The host's separator comment: "No horizontal margin … the rule still runs the
+// full width of the surface". An inset rule would read as a tick between chips.
+assert("the divider is not inset horizontally",
+  !/marginHorizontal/.test((/const separator = \{[\s\S]*?\};/.exec(pillSource) ?? [""])[0]));
+// And it has to sit *above* the header it introduces. Read inside `makeJobsPopover`,
+// because that is where the order exists: `SettledHeader` is *defined* earlier in the
+// file, so a file-position comparison would say nothing about the rendered order.
+const popoverBody = shape.functionBody(pillSource, "makeJobsPopover") ?? "";
+const separatorAt = popoverBody.indexOf("style={separator}");
+const headerAt = popoverBody.indexOf("<SettledHeader");
+assert("the divider precedes the folded section",
+  separatorAt >= 0 && headerAt >= 0 && separatorAt < headerAt,
+  `separator@${String(separatorAt)} header@${String(headerAt)}`);
+
 assert("the job mark passes its theme to JobsSpinner", pillElements.some((element) =>
   element.tag === "JobsSpinner" && attr(element, "theme").trim() === "theme"));
 assert("spinner colour comes from the theme surface", calls(spinnerSource, "ringColorFor").some((args) =>
@@ -308,6 +551,93 @@ if (hostApp === undefined || hostApp === "") {
     /page: \{\s*\n\s*paddingVertical: theme\.spacing\[1\],/.test(menuItem),
   );
   assert("the menu's page gap is still 0", /const MENU_ROW_GAP = 0;/.test(menuItem));
+
+  // The disclosure row's geometry, against the host component it was copied from.
+  // Each of these is a number the plugin now carries as a constant, so a host that
+  // moves it is a red check here rather than a row that silently drifts.
+  const rowHeader = read("packages/app/src/components/settings/row-header.tsx");
+  check("the chevron box matches host ICON_SIZE.sm", layout.CHEVRON_BOX, host.ICON_SIZE?.sm);
+  assert(
+    "the host's disclosure chevron rotates 90deg",
+    new RegExp(`transform:\\s*\\[\\{\\s*rotate:\\s*"${layout.CHEVRON_ROTATION_EXPANDED}"\\s*\\}\\]`).test(rowHeader),
+  );
+  assert(
+    "the host's disclosure row lifts its chevron to foreground while hovered",
+    /hoveredIconColorMapping[\s\S]{0,120}color:\s*theme\.colors\.foreground/.test(rowHeader),
+  );
+  assert(
+    "the host's disclosure row fills with surface2 on hover",
+    /hovered:\s*\{\s*\n\s*backgroundColor:\s*theme\.colors\.surface2,/.test(rowHeader),
+  );
+  // The plugin's single fill for hover *and* press is the host's menu-surface rule,
+  // and it is a *degradation* only because the plugin theme cannot carry `surface3`.
+  // Both halves are asserted: the host has the token, the plugin's theme contract
+  // does not expose it. Asserting only the first half would pass even if the plugin
+  // theme later gained `surface3` (making the comment wrong), so the second half is
+  // what makes the claim falsifiable.
+  assert(
+    "the host's menu rows use surface2 for both hover and press",
+    /itemHovered[\s\S]{0,400}?surface2/.test(menuItem) && /itemPressed[\s\S]{0,400}?surface2/.test(menuItem),
+  );
+  assert("the host theme carries a surface3 the settings page paints pressed rows with",
+    typeof host.lightTheme?.colors.surface3 === "string");
+  assert("the plugin theme contract exposes no surface3, which is why the pressed fill degrades",
+    !/surface3/.test(read("packages/plugin/src/contracts.ts")));
+
+  // The rule between the groups: a `MenuSeparator` is a bare View with these numbers.
+  assert(
+    "the host's separator is 1px tall",
+    new RegExp(`separator:\\s*\\{\\s*\\n\\s*height:\\s*${layout.SECTION_SEPARATOR_HEIGHT},`).test(menuItem),
+  );
+  assert(
+    "the host's separator margins vertically by spacing[1]",
+    /separator:\s*\{[\s\S]{0,200}?marginVertical:\s*theme\.spacing\[1\],/.test(menuItem),
+  );
+  check(
+    "the plugin's separator margin is that spacing[1] value",
+    layout.SECTION_SEPARATOR_MARGIN_VERTICAL,
+    host.SPACING?.[1],
+  );
+  assert(
+    "the host's separator sets no horizontal margin",
+    !/separator:\s*\{[^}]*marginHorizontal/.test(menuItem),
+  );
+  assert(
+    "the host's separator paints borderAccent",
+    /separator:\s*\{[\s\S]{0,220}?backgroundColor:\s*theme\.colors\.borderAccent,/.test(menuItem),
+  );
+  // The other half of the same degradation claim: the plugin theme has `border` and
+  // not `borderAccent`, which is what makes `border` the nearest key rather than a
+  // substitution nobody verified. Both halves asserted for the same reason as above.
+  assert(
+    "the plugin theme contract exposes no borderAccent, which is why the rule uses border",
+    !/borderAccent/.test(read("packages/plugin/src/contracts.ts")),
+  );
+  assert(
+    "the plugin's separator token is a key the theme actually carries",
+    layout.SECTION_SEPARATOR_COLOR === "border" && typeof host.lightTheme?.colors.border === "string",
+  );
+
+  // The label/count split is the host's `rowTrailing` / `summary` shape.
+  const subagentsTrack = read("packages/app/src/subagents/track.tsx");
+  assert(
+    "the host's trailing slot shrinks before the label and is muted",
+    /rowTrailing:\s*\{[\s\S]{0,200}?flexShrink:\s*2,[\s\S]{0,120}?fontSize:\s*theme\.fontSize\.sm,[\s\S]{0,80}?color:\s*theme\.colors\.foregroundMuted,/.test(subagentsTrack),
+  );
+  assert(
+    "the host's row label is the title type in foreground",
+    /rowLabel:\s*\{[\s\S]{0,200}?fontSize:\s*theme\.fontSize\.base,[\s\S]{0,80}?color:\s*theme\.colors\.foreground,/.test(subagentsTrack),
+  );
+  check("the plugin's trailing count uses host FONT_SIZE.sm", layout.FACTS_FONT_SIZE, host.FONT_SIZE?.sm);
+  check("the plugin's label uses host FONT_SIZE.base", layout.TITLE_FONT_SIZE, host.FONT_SIZE?.base);
+  assert(
+    "the host's settings row names itself `label, summary`",
+    /accessibilityLabel=\{[^}]*summary\s*\?\s*`\$\{label\},\s*\$\{summary\}`/.test(rowHeader),
+  );
+  assert(
+    "the host sets aria-expanded by hand on web, because RN Web ignores accessibilityState",
+    /aria-expanded[\s\S]{0,80}:[\s\S]{0,40}null/.test(read("packages/app/src/composer/tracks.tsx")),
+  );
 
   const popover = read("packages/app/src/plugins/popover.tsx");
   assert(

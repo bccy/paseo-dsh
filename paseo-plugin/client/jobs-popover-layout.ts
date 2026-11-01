@@ -59,6 +59,105 @@ export const MARK_BOX = 14;
 export const MARK_DOT_SIZE = 6;
 
 /* -------------------------------------------------------------------------- */
+/* The folded section's disclosure row                                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The box the trailing chevron sits in. = the host's 14px icon slot
+ * (`ICON_SIZE.sm`), and the same number as {@link MARK_BOX} so a header's chevron
+ * and a row's mark share one rail.
+ */
+export const CHEVRON_BOX = 14;
+
+/**
+ * How far the chevron turns when the section is open. = host
+ * `packages/app/src/components/settings/row-header.tsx`'s `chevronExpanded:
+ * { transform: [{ rotate: "90deg" }] }`, which is the host's `docs/design.md`
+ * §12 rule: "An expandable row uses a trailing right chevron that rotates down
+ * when expanded".
+ */
+export const CHEVRON_ROTATION_EXPANDED = "90deg" as const;
+
+/**
+ * The chevron's transform for one state, or `undefined` while collapsed.
+ *
+ * A function rather than an inline ternary so the rule is assertable as a value:
+ * "the rotation follows `expanded` and nothing else" is the whole claim, and the
+ * only way to check it is to call it with both states and compare.
+ */
+export function chevronRotation(expanded: boolean): readonly { readonly rotate: string }[] | undefined {
+  return expanded ? [{ rotate: CHEVRON_ROTATION_EXPANDED }] : undefined;
+}
+
+/**
+ * The fill a pressable row takes while hovered **or** pressed. = host `surface2`,
+ * which is what `packages/app/src/composer/tracks.tsx`'s `rowActive` paints for
+ * both — the settings page's separate `surface3` press state has no counterpart in
+ * the plugin theme, and the popover lives in the menu surface, where one fill is
+ * the host's own rule.
+ */
+export const ROW_ACTIVE_FILL = "surface2" as const;
+
+/**
+ * The theme colour key a pressable row paints, or `undefined` when it is at rest.
+ *
+ * The host's own form is `!disabled && hovered && styles.hovered` /
+ * `!disabled && pressed && styles.pressed`; this row is never disabled and takes
+ * one fill for both, so the rule collapses to "hovered or pressed". Written as a
+ * function returning the *token* so the harness can call it with all four
+ * combinations instead of pattern-matching the ternary, and so the call site
+ * still reads the colour out of the theme rather than hard-coding a hex.
+ */
+export function rowActiveFill(hovered: boolean, pressed: boolean): "surface2" | undefined {
+  return hovered || pressed ? ROW_ACTIVE_FILL : undefined;
+}
+
+/**
+ * The theme colour key the chevron draws in.
+ *
+ * The host lifts its disclosure chevron from `foregroundMuted` to `foreground`
+ * while the row is active (`packages/app/src/components/settings/row-header.tsx`'s
+ * `hoveredIconColorMapping`, and `packages/app/src/subagents/track.tsx`'s archive
+ * icon does the same) — the arrow is what says "this row is live" once the fill
+ * alone is too quiet to notice.
+ */
+export function chevronColorToken(hovered: boolean, pressed: boolean): "foreground" | "foregroundMuted" {
+  return hovered || pressed ? "foreground" : "foregroundMuted";
+}
+
+/* -------------------------------------------------------------------------- */
+/* The rule between the running rows and the folded section                    */
+/* -------------------------------------------------------------------------- */
+
+/** = host `MenuSeparator`'s `height: 1`. */
+export const SECTION_SEPARATOR_HEIGHT = 1;
+
+/** The rule's breathing room above and below. = host `spacing[1]`. */
+export const SECTION_SEPARATOR_MARGIN_VERTICAL = 4;
+
+/**
+ * The rule's colour token: `border` standing in for the host's `borderAccent`.
+ *
+ * The plugin theme carries 11 colour keys and `borderAccent` is not one of them;
+ * `border` is the nearest it has, one shade stronger on a menu surface. Accepted
+ * as a known deviation rather than invented, and worth a look on a real screen.
+ */
+export const SECTION_SEPARATOR_COLOR = "border" as const;
+
+/**
+ * Whether the rule between the running rows and the folded section is drawn.
+ *
+ * Two things are needed for a rule to separate anything: content above it and
+ * content below it. The host says the same thing structurally — `ComposerTrackActions`
+ * draws no `MenuSeparator` when what follows it is empty — and with nothing
+ * running the folded section *is* the body, so a rule there would just be a line
+ * under the panel's top edge.
+ */
+export function sectionDivided(liveCount: number, settledCount: number): boolean {
+  return liveCount > 0 && settledCount > 0;
+}
+
+/* -------------------------------------------------------------------------- */
 /* The row's text                                                             */
 /* -------------------------------------------------------------------------- */
 

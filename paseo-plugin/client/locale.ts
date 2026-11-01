@@ -146,15 +146,22 @@ export interface JobsText {
   /** Popover line when every job it lists has already settled. */
   allSettled: string;
   /**
-   * The collapsed section header that hides finished rows, `count` of them.
+   * The folded section's header that hides finished rows.
    *
    * DSH's own job list does the same thing (`settledExpanded = settledOpen ??
    * liveRows.length === 0`): while something is still running, the finished rows
    * fold into one line and the list stays about what is happening now.
+   *
+   * **No count, and one string for both states.** The count is a row-trailing
+   * value, not part of the sentence — the host's own panel rows put it in the
+   * muted slot at the end of the row
+   * (`packages/app/src/subagents/track.tsx`'s `rowTrailing`,
+   * `packages/app/src/components/settings/row-header.tsx`'s `summary`) rather than
+   * spelling "3 finished". And the wording must not change when the section
+   * opens: only the chevron rotates (the host's `docs/design.md` §12), so a
+   * second string for the open state would read as a different group.
    */
-  settledSection: (count: number) => string;
-  /** The same header once expanded — the same words, so only the chevron changes. */
-  settledSectionOpen: (count: number) => string;
+  settledLabel: string;
   /** Popover line when the runtime could not read the registry — never "none". */
   unavailable: string;
 }
@@ -387,8 +394,7 @@ const TEXT: Record<Locale, UiText> = {
         failed: "Failed",
       },
       allSettled: "All background tasks have finished.",
-      settledSection: (count) => `${String(count)} finished`,
-      settledSectionOpen: (count) => `${String(count)} finished`,
+      settledLabel: "Finished",
       unavailable: "Could not read this session's background tasks.",
     },
   },
@@ -599,9 +605,9 @@ const TEXT: Record<Locale, UiText> = {
         failed: "失败",
       },
       allSettled: "后台任务都已结束。",
-      // 收起/展开用同一句话：变的只有箭头，改文案会让「展开」看起来像换了分组。
-      settledSection: (count) => `${String(count)} 个已完成`,
-      settledSectionOpen: (count) => `${String(count)} 个已完成`,
+      // 只有一句：收起/展开变的只有箭头，改文案会让「展开」看起来像换了分组。
+      // 数量不放这里 —— 它挂在行尾那个弱化槽里（宿主 rowTrailing 的位置）。
+      settledLabel: "已完成",
       unavailable: "读不到本会话的后台任务。",
     },
   },

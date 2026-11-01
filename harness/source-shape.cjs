@@ -238,22 +238,230 @@ function hasElementAttributeMentioning(source, required, attribute, identifier) 
  * Used where a check needs the *body* of one function (to assert a value does
  * not take part in a computation) rather than the whole file, which would also
  * match an unrelated mention elsewhere.
+ *
+ * **The parameter list has to be skipped, not searched for a `{`.** An earlier
+ * version took "the first `{` after the matched prefix" as the body, which is
+ * right only for a plain identifier parameter. For the destructuring signature
+ * every React component in this repo uses —
+ *
+ *     function SettledHeader({ count, expanded }: { count: number }) {
+ *
+ * — that first `{` is the *parameter object*, so the reader returned
+ * `"{ count, expanded }"` and every assertion made against it was about the
+ * parameter list instead of the body. Those assertions could not fail: a check
+ * like "`JobRow` does not contain `Pressable`" stayed green with a `Pressable`
+ * injected straight into `JobRow`, because the returned text never reached the
+ * body. So the parameter parens are matched and skipped first (`matchParen`
+ * skips nested `()`, `{}` and string literals inside them), and only then is the
+ * body's `{` looked for.
+ *
+ * **What it walks through**, all of it before the body's `{`:
+ * a generic list (`<T extends { x: number }>`), a return type annotation
+ * (`: void`, `: { ok: boolean } | null`, `: Promise<T>`), and `=>` for arrows.
+ * Each is skipped by matching brackets, not by scanning for the next `{` — the
+ * braces inside a type are why "next `{`" cannot work.
+ *
+ * **Fails closed.** A function with no block body (`const f = () => value`), a
+ * signature whose brackets cannot be matched, and a name that is not declared as
+ * a function or arrow all return `undefined` rather than a guess. A caller that
+ * needs a body must be told there is none — returning the wrong text silently is
+ * the exact failure this reader exists to prevent.
+ *
+ * **The name needs a right boundary.** `function\s+<name>\s*\(` without a
+ * `(?![\w$])` also matches a longer name that starts with it: looking up
+ * `diffStat` in `client/tokens.ts` found `diffStatTextStyle` first and returned
+ * *its* text. Every pattern below carries the boundary for that reason.
  */
 function functionBody(source, name) {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const patterns = [
-    new RegExp(`(?:^|\\n)\\s*(?:export\\s+)?function\\s+${escaped}\\s*\\(`, "g"),
-    new RegExp(`(?:^|\\n)\\s*(?:export\\s+)?(?:const|let)\\s+${escaped}\\s*=\\s*(?:async\\s*)?(?:\\([^)]*\\)|[A-Za-z_$][\\w$]*)\\s*=>\\s*\\{`, "g"),
-  ];
-  for (const pattern of patterns) {
-    const match = pattern.exec(source);
-    if (match === null) continue;
-    const braceAt = source.indexOf("{", match.index + match[0].length - 1);
-    if (braceAt < 0) continue;
+
+  /** Skip whitespace from `index`; returns the next index. */
+  const skipSpace = (index) => {
+    let i = index;
+    while (i < source.length && /\s/.test(source[i])) i += 1;
+    return i;
+  };
+
+  /** Index just past the `>` matching the `<` at `open`, or -1. */
+  const matchAngle = (open) => {
+    if (source[open] !== "<") return -1;
+    let depth = 0;
+    for (let i = open; i < source.length; i += 1) {
+      const ch = source[i];
+      if (ch === '"' || ch === "'" || ch === "`") {
+        const quote = ch;
+        i += 1;
+        while (i < source.length) {
+          if (source[i] === "\\") {
+            i += 2;
+            continue;
+          }
+          if (source[i] === quote) break;
+          i += 1;
+        }
+        continue;
+      }
+      if (ch === "<") depth += 1;
+      else if (ch === ">") {
+        depth -= 1;
+        if (depth === 0) return i + 1;
+      }
+    }
+    return -1;
+  };
+
+  /**
+   * Skip a type expression starting at `index`, stopping at the `{` that opens a
+   * block body. Returns the index of that `{`, or -1.
+   *
+   * A type is a sequence of identifiers, brackets and separators; the one thing
+   * it never contains at this position is a *block*. So the walk is: skip balanced
+   * `{}`/`()`/`[]`/`<>` groups (they are part of the type), and stop at the first
+   * `{` that is not inside one of those and is not the start of an object type —
+   * which is distinguished by what follows its matching `}`: a type continues with
+   * `|`, `&`, `[`, `.`, `<`, `(`, `,`, `;`, `)` or `=>`, while a body does not.
+   *
+   * `stopAtArrow` is for the arrow form, where `=>` terminates the type: without
+   * it a `:` return type would swallow the arrow and report "no body".
+   */
+  const skipTypeToBody = (index, stopAtArrow) => {
+    let i = index;
+    while (i < source.length) {
+      const ch = source[i];
+      if (ch === ";") return -1;
+      if (ch === "=") {
+        // `=>` ends an arrow's return type; any other `=` means no body here.
+        if (stopAtArrow === true && source[i + 1] === ">") return i;
+        return -1;
+      }
+      if (ch === "\n") {
+        // A declaration starting here means this signature had no body.
+        if (/^\s*(?:export\s+)?(?:function|const|let|class|interface|type)\s/.test(source.slice(i))) return -1;
+        i += 1;
+        continue;
+      }
+      if (ch === "(" || ch === "[") {
+        const end = ch === "(" ? matchParen(source, i) : matchSquare(source, i);
+        if (end < 0) return -1;
+        i = end;
+        continue;
+      }
+      if (ch === "<") {
+        const end = matchAngle(i);
+        if (end < 0) return -1;
+        i = end;
+        continue;
+      }
+      if (ch === "{") {
+        const end = matchBrace(source, i);
+        if (end < 0) return -1;
+        const after = skipSpace(end);
+        const next = source[after];
+        // Still the type: an object type followed by a type continuation.
+        const continuesType = next !== undefined && /[|&[.<(,;)]/.test(next);
+        const arrowType = next === "=" && source[after + 1] === ">";
+        // A `{` right after this one is the *body*: `): { a: string } {` is an
+        // object return type followed by a block. Without this, an object return
+        // type was returned as if it were the body — `diffStatTextStyle` in
+        // `client/tokens.ts` was read as its own return type.
+        const bodyFollows = next === "{";
+        if (!continuesType && !arrowType && !bodyFollows) return i;
+        if (bodyFollows) return after;
+        i = end;
+        continue;
+      }
+      i += 1;
+    }
+    return -1;
+  };
+
+  /** The body starting at `braceAt`, or `undefined` when it is unreadable. */
+  const bodyAt = (braceAt) => {
+    if (braceAt < 0 || source[braceAt] !== "{") return undefined;
     const end = matchBrace(source, braceAt);
-    if (end < 0) continue;
-    return source.slice(braceAt, end);
+    return end < 0 ? undefined : source.slice(braceAt, end);
+  };
+
+  /** The block body of a signature whose parameter list ends at `parenEnd`. */
+  const bodyAfterParams = (parenEnd) => {
+    let cursor = skipSpace(parenEnd);
+    // A generic list can follow the params in a call signature; skip it too.
+    if (source[cursor] === "<") {
+      const end = matchAngle(cursor);
+      if (end < 0) return undefined;
+      cursor = skipSpace(end);
+    }
+    if (source[cursor] === ":") return bodyAt(skipTypeToBody(cursor));
+    return bodyAt(cursor);
+  };
+
+  // `function name(...)` — and `export function`, `async function`.
+  const declaration = new RegExp(
+    // The `(?![\\w$])` is load-bearing: without it `diffStat` matched
+    // `diffStatTextStyle` (same prefix) and returned the wrong function.
+    `(?:^|\\n)\\s*(?:export\\s+)?(?:async\\s+)?function\\s+${escaped}(?![\\w$])\\s*(<)?`,
+    "g",
+  ).exec(source);
+  if (declaration !== null) {
+    let cursor;
+    if (declaration[1] === "<") {
+      // `function f<T>(...)`: skip the generic list, then the parameter list.
+      const angleEnd = matchAngle(declaration.index + declaration[0].length - 1);
+      if (angleEnd >= 0) {
+        cursor = skipSpace(angleEnd);
+        if (source[cursor] === "(") {
+          const parenEnd = matchParen(source, cursor);
+          if (parenEnd >= 0) {
+            const body = bodyAfterParams(parenEnd);
+            if (body !== undefined) return body;
+          }
+        }
+      }
+    } else {
+      cursor = skipSpace(declaration.index + declaration[0].length);
+      if (source[cursor] === "(") {
+        const parenEnd = matchParen(source, cursor);
+        if (parenEnd >= 0) {
+          const body = bodyAfterParams(parenEnd);
+          if (body !== undefined) return body;
+        }
+      }
+    }
   }
+
+  // `const name = (...) => {` / `const name = x => {` / with a return type.
+  const arrowHead = new RegExp(
+    `(?:^|\\n)\\s*(?:export\\s+)?(?:const|let)\\s+${escaped}(?![\\w$])\\s*=\\s*(?:async\\s*)?`,
+    "g",
+  ).exec(source);
+  if (arrowHead !== null) {
+    let cursor = skipSpace(arrowHead.index + arrowHead[0].length);
+    if (source[cursor] === "<") {
+      const angleEnd = matchAngle(cursor);
+      if (angleEnd >= 0) cursor = skipSpace(angleEnd);
+    }
+    if (source[cursor] === "(") {
+      const parenEnd = matchParen(source, cursor);
+      if (parenEnd < 0) return undefined;
+      cursor = skipSpace(parenEnd);
+    } else {
+      // A bare identifier parameter.
+      const bare = /^[A-Za-z_$][\w$]*/.exec(source.slice(cursor));
+      if (bare === null) return undefined;
+      cursor = skipSpace(cursor + bare[0].length);
+    }
+    // An optional return type sits between the params and the `=>`. It stops at
+    // the arrow, so `: { ok: true } => {` is a type followed by an arrow and not
+    // a body — `stopAtArrow` is what tells `skipTypeToBody` that.
+    if (source[cursor] === ":") {
+      const arrowAt = skipTypeToBody(cursor, true);
+      if (arrowAt < 0) return undefined;
+      return bodyAt(skipSpace(arrowAt + 2));
+    }
+    if (source[cursor] !== "=" || source[cursor + 1] !== ">") return undefined;
+    return bodyAt(skipSpace(cursor + 2));
+  }
+
   return undefined;
 }
 
@@ -344,7 +552,30 @@ function splitArguments(args) {
 
 /** Index just past the `)` that closes the `(` at `open`, or -1. */
 function matchParen(source, open) {
-  if (source[open] !== "(") return -1;
+  return matchPaired(source, open, "(", ")");
+}
+
+/**
+ * Index just past the `]` that closes the `[` at `open`, or -1.
+ *
+ * Needed by {@link functionBody} for a return type like
+ * `: readonly { rotate: string }[] | undefined` — the tuple/array suffix is part
+ * of the type, so the `[` has to be stepped over rather than walked into.
+ */
+function matchSquare(source, open) {
+  return matchPaired(source, open, "[", "]");
+}
+
+/**
+ * The shared bracket matcher: index just past the `close` that balances `open`,
+ * or -1.
+ *
+ * String literals are skipped wholesale so a bracket inside one is data, not
+ * nesting. Only the two characters in question are counted, so this is safe for
+ * the kinds of text the readers here see (it is not a general TS parser).
+ */
+function matchPaired(source, open, openChar, closeChar) {
+  if (source[open] !== openChar) return -1;
   let depth = 0;
   for (let i = open; i < source.length; i += 1) {
     const ch = source[i];
@@ -361,8 +592,8 @@ function matchParen(source, open) {
       }
       continue;
     }
-    if (ch === "(") depth += 1;
-    else if (ch === ")") {
+    if (ch === openChar) depth += 1;
+    else if (ch === closeChar) {
       depth -= 1;
       if (depth === 0) return i + 1;
     }
