@@ -109,6 +109,35 @@ const CHILD_BUFFER_LIMIT = 2000;
  */
 const CHILD_LABEL_WAIT_EVENTS = 40;
 
+/**
+ * When to re-publish the occupancy snapshot polled during `open()`.
+ *
+ * The host subscribes to a provider session's events only at the end of its own
+ * registration, so the first publish can land before there is anyone listening.
+ * These delays straddle that chain instead of guessing a single moment. Each is a
+ * cached re-emit, not a re-poll — see `DshSession.publishUsageAfterOpen`.
+ *
+ * - **0 ms** lands after this open's own emit. In practice it is almost always
+ *   too early to be received; it is here so the replay path itself is exercised
+ *   on every open rather than only when a later delay happens to fire.
+ * - **250 ms** covers the ordinary case: the host's registration RPC round trips
+ *   (usage read measured at 127 ms cold / 1-2 ms warm locally).
+ * - **1000 ms** covers a loaded machine.
+ * - **3000 ms** covers the case the user actually hits — a daemon cold start
+ *   resuming several agents at once, where the host's registration chain carries
+ *   two `persistSnapshot` disk writes plus a registry cold scan. That chain
+ *   exceeding 1 s is real, not hypothetical.
+ *
+ * **This is a probabilistic mitigation, not a fix for the race.** Nothing in the
+ * provider contract tells a plugin when the host has subscribed, so a
+ * registration that takes longer than the last delay still drops every publish —
+ * the readout then stays empty until the next turn re-publishes usage. Widening
+ * the window buys reliability, it does not close the window. A real fix needs an
+ * upstream contract (the host replaying `usage_updated`, or a subscription
+ * signal); see `docs/FIELD-NOTES.md` on not pretending a mitigation is a cure.
+ */
+const USAGE_REPLAY_DELAYS_MS = [0, 250, 1000, 3000] as const;
+
 export interface DshSessionOptions {
   systemPrompt?: string;
   /** False when the host cannot display/respond to tool approval cards. */
@@ -475,6 +504,13 @@ export class DshSession {
   /** Newest issued occupancy poll; a slower older response must not win. */
   #usageGeneration = 0;
   #usageRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * Pending post-open occupancy replays (see {@link publishUsageAfterOpen}).
+   *
+   * Tracked so `close()` and a runtime failure can cancel them: a timer that
+   * outlives its session would publish into a dead one.
+   */
+  #usageReplayTimers = new Set<ReturnType<typeof setTimeout>>();
   #closed = false;
 
   constructor(options: DshSessionOptions) {
@@ -525,6 +561,7 @@ export class DshSession {
         }
         this.#closed = true;
         clearTimeout(this.#usageRefreshTimer);
+        this.#clearUsageReplays();
         this.#options.emit({
           type: "session.runtime_failed",
           sessionId: this.id,
@@ -764,15 +801,22 @@ export class DshSession {
       snapshot = { available: false };
     }
     if (this.#closed || generation !== this.#usageGeneration) return;
+    // An unavailable read is not a measurement. Reporting it as a complete
+    // snapshot would `delete` the context fields off Paseo's record and show an
+    // empty readout for a session whose occupancy is merely unknown to us — the
+    // silent-degradation shape `docs/FIELD-NOTES.md` documents. Say it in the log
+    // and publish nothing; a later poll (or the next turn) replaces the value.
+    if (!snapshot.available) {
+      this.#options.log(`usage unavailable for ${this.#dshSessionId}; keeping the last known occupancy`);
+      return;
+    }
     const patch: ProviderUsage = {
-      ...(snapshot.available &&
-      typeof snapshot.contextWindow === "number" &&
+      ...(typeof snapshot.contextWindow === "number" &&
       Number.isSafeInteger(snapshot.contextWindow) &&
       snapshot.contextWindow > 0
         ? { contextWindowMaxTokens: snapshot.contextWindow }
         : {}),
-      ...(snapshot.available &&
-      typeof snapshot.usedTokens === "number" &&
+      ...(typeof snapshot.usedTokens === "number" &&
       Number.isSafeInteger(snapshot.usedTokens) &&
       snapshot.usedTokens >= 0
         ? { contextWindowUsedTokens: snapshot.usedTokens }
@@ -786,6 +830,73 @@ export class DshSession {
       row.data = { ...row.data, ...this.#contextFields() };
       this.#emitStatsRow();
     }
+  }
+
+  /**
+   * Publish the just-polled occupancy again, a few times, without re-reading it.
+   *
+   * `open()` polls occupancy (`refreshUsage`) and the host subscribes to this
+   * session's events only at the *end* of its own `registerSession`
+   * (`agent-manager.js:2704`, after `persistSnapshot`/`refreshSessionState`/
+   * `refreshRuntimeInfo`), so a `session.usage` emitted in between reaches an
+   * empty listener set and is dropped. It is not recoverable afterwards either:
+   * the host keeps every pre-subscription event in `PluginAgentSession.history`
+   * (`plugin-provider.js:1148`) but its replay only projects `timeline` and
+   * `provider_subagent` (`agent-manager.js:3066`), so a dropped `usage_updated`
+   * never comes back.
+   *
+   * That drop is invisible until the next turn, because a reopen is exactly when
+   * the host has no cached usage to fall back on: `resumeAgentFromPersistence`
+   * passes no `lastUsage` into `registerSession` (`agent-manager.js:840-846`), so
+   * `buildManagedAgentForRegister` starts from `undefined` (`:2796`). The composer
+   * then shows an empty readout on a reopened conversation until the user types.
+   *
+   * **Re-publishing the cached snapshot is the fix, not re-polling.** A second
+   * `refreshUsage()` would `++this.#usageGeneration` and invalidate the first
+   * poll's answer, which is the opposite of a retry. Re-emitting is also free: the
+   * snapshot is already in `#lastUsage`, and the payload is idempotent.
+   *
+   * The delays (see {@link USAGE_REPLAY_DELAYS_MS}) straddle the host's
+   * registration chain rather than guess one moment, and they buy reliability
+   * without closing the race — a registration slower than the last delay still
+   * loses every publish. Each re-emit is guarded: a running turn means the
+   * occupancy has moved on and the stale snapshot must not overwrite it, and a
+   * snapshot with no occupancy at all has nothing worth re-sending.
+   */
+  publishUsageAfterOpen(): void {
+    this.#clearUsageReplays();
+    for (const delay of USAGE_REPLAY_DELAYS_MS) {
+      const timer = setTimeout(() => {
+        this.#usageReplayTimers.delete(timer);
+        if (this.#closed || this.#turnId !== null) return;
+        const cached = this.#lastUsage;
+        if (cached === undefined) return;
+        if (
+          cached.contextWindowUsedTokens === undefined &&
+          cached.contextWindowMaxTokens === undefined
+        ) {
+          return;
+        }
+        // Re-publish the cached record verbatim. Not `#emitUsage({}, true)`: that
+        // form is the *clear* path (`replaceContext` deletes the fields first), so
+        // replaying through it would erase the very numbers this exists to keep.
+        // No `turnId` either — the guard above already rejected a running turn, so
+        // an occupancy-only record belongs to no turn.
+        this.#options.emit({
+          type: "session.usage",
+          sessionId: this.id,
+          usage: { ...cached },
+        });
+      }, delay);
+      timer.unref?.();
+      this.#usageReplayTimers.add(timer);
+    }
+  }
+
+  /** Drop every pending occupancy replay; a closed session has no readout to fix. */
+  #clearUsageReplays(): void {
+    for (const timer of this.#usageReplayTimers) clearTimeout(timer);
+    this.#usageReplayTimers.clear();
   }
 
   /** Coalesce step/tool updates so occupancy is not measured per streamed token. */
@@ -1628,6 +1739,7 @@ export class DshSession {
     if (this.#closed) return;
     this.#closed = true;
     clearTimeout(this.#usageRefreshTimer);
+    this.#clearUsageReplays();
     const process = this.#process;
     this.#process = undefined;
     if (process === undefined) {

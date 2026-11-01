@@ -1472,7 +1472,15 @@ class DshConnection implements ProviderConnection {
     // A reopened session resumes DSH's stored context without a turn, so ask the
     // runtime for its occupancy now; otherwise the readout stays empty until the
     // next prompt even though the runtime already knows the numbers.
-    void session.refreshUsage();
+    //
+    // The poll alone is not enough. The host subscribes to this session's events
+    // at the *end* of its own registration (`agent-manager.js:2704`), so a
+    // `session.usage` emitted before that reaches an empty listener set, and its
+    // replay only projects `timeline`/`provider_subagent` (`:3066`) — a dropped
+    // `usage_updated` never comes back. A reopen is exactly when that hurts:
+    // `resumeAgentFromPersistence` starts the agent with no cached usage. So
+    // re-publish the polled answer across the subscription window.
+    void session.refreshUsage().then(() => session.publishUsageAfterOpen());
     // Rebuild the native subagent tree on every open (a fresh `skip` or a reopen
     // `replay`). It reads DSH's durable catalog and child logs; it never creates
     // an agent, and a fresh session simply has none.
