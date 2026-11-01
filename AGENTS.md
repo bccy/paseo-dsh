@@ -369,6 +369,18 @@ token），并且加载插件会把内嵌桥重写进 `~/.dsh/profiles/<name>/no
   需要 `replaced` 分支那几个 await 的交错，所以脚本先开一次到 ready、再并发发两次。假 `dsh` +
   一次性 `DSH_HOME`，自己编译到私有目录。**动了 `provider.ts` 的 open/close 事务或 `#opening`
   守卫必跑。**
+
+  脚本第二部分钉住 `#opening` 单独一个守卫盖不住的另外两个窗口，都是把**第二条请求放进第一条的
+  await 里**（假桥的 `DSH_FAKE_HOLD_METHOD` 让它在指定方法上停住，直到测试写释放文件——不靠
+  睡等时序）：**(a)** 开事务在旧 holder 的 `close()` 里停住时，一个 `session.close` 落在同一
+  provider id 上，该 open 必须**响亮失败**且**不发布** `session.opened`/`session.config`/
+  `session.ready`（修复前这三条照发，界面显示已就绪而 daemon 已关掉它）；**(b)** 同一 provider
+  id 在第一次 open 还没结束时被重新绑定到**另一个** native 会话（Paseo 用新 agent id 重开导入
+  会话就是这形状），第二次必须被拒（"another open for this provider session is already in
+  flight"），且该 provider id 只发布一次 readiness。**(a) 的 hold 在 `session/close`、(b) 的在
+  `paseo/commands`**，所以它们同时覆盖"close 使进行中的 open 失效"与"provider 身份也是排他的"。
+  **动了 `provider.ts` 的 `#openTransaction` / `#assertOpening` / `#openingProviders`，或假桥的
+  `DSH_FAKE_HOLD_*` 必跑。**
 - `harness/mcp-gateway-guard-check.mjs` — gateway 的 `tool` 参数守卫（`resolveTargetTool`，模块
   私有，所以驱动真实的 `apply()` + `defineTool` 注册路径，用 loopback 假 server 接住本该成功的
   调用）：空串与纯空白、把网关自己的元工具名当目标（含大小写变体、零宽字符、CJK 键盘打出的全角

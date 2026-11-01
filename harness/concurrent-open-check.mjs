@@ -75,7 +75,7 @@
  * `DSH_HOME`, so no profile, model or daemon is touched)
  */
 import { createRequire } from "node:module";
-import { chmodSync, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -337,6 +337,195 @@ check(
 );
 
 await conn.close();
+
+// ===========================================================================
+// Part 2: the three windows the `#opening` claim alone does not close.
+//
+// Part 1 above pins the window that exists *between the two opens themselves*
+// (two opens for one provider id, both past the check). The open transaction
+// has three more, and each needs a second request placed **inside** an await of
+// the first one:
+//
+//   a. the previous holder's `close()` — the claim used to be taken after it, so
+//      a close landing in that window was invisible to the open, which then
+//      published readiness for a session the daemon had just closed;
+//   b. the `#sessions` re-registration — a close during the open must invalidate
+//      publication, not merely race it;
+//   c. provider-id rebinding — the same provider id opened against a *different*
+//      native session while the first open is still running. The `#opening` set
+//      is keyed by the native id only, so this pair was not exclusive at all.
+//
+// Each scenario needs its own child process: `DSH_FAKE_HOLD_*` is read by the
+// bridge child, and a child's environment is frozen at spawn. Closing the
+// connection retires the child, so a fresh `connect()` spawns one that sees the
+// new values.
+// ===========================================================================
+
+
+/** A throwaway directory for one scenario's hold markers. */
+function holdDir() {
+  return mkdtempSync(join(tmpdir(), "dsh-open-hold-"));
+}
+
+/**
+ * Run one scenario against a connection whose bridge parks `holdMethod` until
+ * `release()` is called.
+ *
+ * `body` receives the helpers it needs and must drive the open itself, so each
+ * scenario states its own interleaving instead of sharing a scripted one.
+ */
+async function withHeldBridge(holdMethod, holdSession, body) {
+  const dir = holdDir();
+  const ready = join(dir, "ready");
+  const release = join(dir, "release");
+  process.env.DSH_FAKE_HOLD_METHOD = holdMethod;
+  process.env.DSH_FAKE_HOLD_SESSION = holdSession;
+  process.env.DSH_FAKE_HOLD_READY = ready;
+  process.env.DSH_FAKE_HOLD_RELEASE = release;
+  const connection = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+  const heldEvents = [];
+  connection.onEvent((event) => heldEvents.push(event));
+  try {
+    return await body({
+      conn: connection,
+      events: heldEvents,
+      /** Release the parked request. Idempotent. */
+      release: () => writeFileSync(release, "release"),
+      /** Wait until the bridge has actually parked on the held method. */
+      held: () => waitUntil(() => existsSync(ready), 20000),
+    });
+  } finally {
+    writeFileSync(release, "release");
+    await connection.close();
+    for (const key of ["DSH_FAKE_HOLD_METHOD", "DSH_FAKE_HOLD_SESSION", "DSH_FAKE_HOLD_READY", "DSH_FAKE_HOLD_RELEASE"]) {
+      delete process.env[key];
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// (a) A close landing while the open is still inside its awaits must invalidate
+//     it: no `session.opened` / `session.ready` for a session the daemon closed,
+//     and the open itself has to fail loudly rather than publish.
+//
+// The hold is on `session/close` — the *previous holder's* teardown, which is the
+// first await inside the transaction once a holder exists. Without a claim taken
+// before it, the reentrant close below sees an open with no claim and cannot
+// invalidate it.
+// ---------------------------------------------------------------------------
+console.log("\na close during the open's own awaits invalidates publication");
+{
+  // Open once so the next open has a holder to close, then hold that close.
+  const setup = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+  const setupEvents = [];
+  setup.onEvent((event) => setupEvents.push(event));
+  const nativeId = `held-native-${String(Date.now())}`;
+  await setup.send(openInput("holder-open", "holder-provider", { version: 1, data: { sessionId: nativeId } }));
+  await waitUntil(
+    () => setupEvents.some((event) => event.type === "session.ready" && event.sessionId === "holder-provider"),
+    20000,
+  );
+  await setup.close();
+
+  await withHeldBridge("session/close", "", async ({ conn: heldConn, events: heldEvents, release, held }) => {
+    // Re-establish a holder under this connection, then take the held close.
+    await heldConn.send(openInput("holder-2", "holder-2", { version: 1, data: { sessionId: nativeId } }));
+    await waitUntil(
+      () => heldEvents.some((event) => event.type === "session.ready" && event.sessionId === "holder-2"),
+      20000,
+    );
+
+    // This open will park on the holder's `session/close` — the hold is armed.
+    const victim = heldConn.send(
+      openInput("victim", "victim", { version: 1, data: { sessionId: nativeId } }),
+    );
+    const parked = await held();
+    check(
+      "(a) the open parks on the previous holder's close (the window exists)",
+      parked === true,
+      String(parked),
+    );
+
+    // Close the session the open is still opening, *from inside that window*.
+    const mark = heldEvents.length;
+    await heldConn.send({ type: "session.close", requestId: "close-mid-open", sessionId: "victim" });
+    release();
+    await victim;
+    await sleep(300);
+
+    const after = heldEvents.slice(mark);
+    check(
+      "(a) a close mid-open makes the open fail loudly",
+      after.some((event) => event.type === "request.failed" && event.requestId === "victim"),
+      after
+        .filter((event) => event.type === "request.failed")
+        .map((event) => `${String(event.requestId)}: ${String(event.error?.message)}`)
+        .join(" | ") || "(no failure)",
+    );
+    check(
+      "(a) …and it publishes no readiness for the closed session",
+      !after.some(
+        (event) =>
+          (event.type === "session.ready" || event.type === "session.opened")
+          && event.sessionId === "victim",
+      ),
+      after
+        .filter((event) => event.sessionId === "victim")
+        .map((event) => event.type)
+        .join(", ") || "(nothing)",
+    );
+  });
+}
+
+// ---------------------------------------------------------------------------
+// (b) One provider id cannot be rebound to a *different* native session while an
+//     open for it is in flight.
+//
+// The `#opening` set is keyed by the native id, so before the provider-id claim
+// existed these two opens were not exclusive at all: the second one saw a
+// different native id, passed the check, and both went on to publish for the
+// same provider id. The hold is on `paseo/commands` — late in the open, after
+// the native claim but before publication — so the rebinding open arrives while
+// the first one is unmistakably mid-transaction.
+// ---------------------------------------------------------------------------
+console.log("\na provider id cannot be rebound to another native session mid-open");
+await withHeldBridge("paseo/commands", "", async ({ conn: rebindConn, events: rebindEvents, release, held }) => {
+  const first = rebindConn.send(
+    openInput("first", "shared-provider", { version: 1, data: { sessionId: "native-one" } }),
+  );
+  const parked = await held();
+  check(
+    "(b) the first open parks late in the transaction (the window exists)",
+    parked === true,
+    String(parked),
+  );
+
+  // Same provider id, different native id — the reload-under-a-fresh-agent-id
+  // shape, but arriving while the first open still owns the id.
+  const rebindMark = rebindEvents.length;
+  await rebindConn.send(
+    openInput("second", "shared-provider", { version: 1, data: { sessionId: "native-two" } }),
+  );
+  release();
+  await first;
+  await sleep(300);
+
+  const rebindAfter = rebindEvents.slice(rebindMark);
+  check(
+    "(b) the rebinding open is refused loudly",
+    rebindAfter.some((event) => event.type === "request.failed" && event.requestId === "second"),
+    rebindAfter
+      .filter((event) => event.type === "request.failed")
+      .map((event) => `${String(event.requestId)}: ${String(event.error?.message)}`)
+      .join(" | ") || "(no failure)",
+  );
+  check(
+    "(b) …and exactly one open publishes readiness for that provider id",
+    rebindEvents.filter((event) => event.type === "session.ready" && event.sessionId === "shared-provider").length === 1,
+    String(rebindEvents.filter((event) => event.type === "session.ready" && event.sessionId === "shared-provider").length),
+  );
+});
 
 console.log(`\n  ${passed}/${passed + failed} passed`);
 if (failed > 0) {

@@ -81,6 +81,9 @@ jobs:
             node harness/plugin-build-check.mjs
             node harness/frame-reader-check.mjs
             node harness/replay-turn-check.cjs
+            # 开/关事务：假 dsh + 一次性 DSH_HOME，不碰 profile/daemon/token。
+            # 它把插件编译到 paseo-plugin/.dbg-t6，驱动真实 provider 的 open 事务。
+            node harness/concurrent-open-check.mjs
             # 不在这里：mcp-gateway-transport-check / mcp-gateway-guard-check 从本机 DSH 安装目录
             # 加载 schemastery 与 dsh-tools，runner 上没有 DSH，跑了只会 ERR_MODULE_NOT_FOUND。
 
@@ -110,6 +113,7 @@ jobs:
                 "  node \"harness/\$s.mjs\" || exit 1" \
                 "done" \
                 "node harness/replay-turn-check.cjs" \
+                "node harness/concurrent-open-check.mjs" \
                 "git push origin main" \
                 '```' \
                 "" \

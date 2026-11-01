@@ -97,7 +97,7 @@
  *
  * @module paseo-dsh/harness/fake-dsh-bridge
  */
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 /**
@@ -732,6 +732,31 @@ async function handle(method, params, id) {
   if (requested !== null) {
     if (!rootIds.includes(requested)) rootIds.push(requested);
     rootId = requested;
+  }
+  // `hold`: park one named method until the test releases it.
+  //
+  // A provider open has several awaits, and the ones that matter for the open
+  // transaction cross this process (`session/close` of the previous holder,
+  // `initialize`, `paseo/commands`). A check can only place a second request
+  // inside such a window if the bridge holds the first one there, so the hold is
+  // part of the stand-in rather than a timer the test hopes lands right.
+  //
+  // `DSH_FAKE_HOLD_METHOD` is the method to park (empty/absent: park nothing),
+  // and `DSH_FAKE_HOLD_SESSION` narrows it to one session id (absent: any). The
+  // marker file named by `DSH_FAKE_HOLD_READY` is written when the hold is
+  // entered — the test waits for *that*, not for a duration — and the hold is
+  // released when `DSH_FAKE_HOLD_RELEASE` exists.
+  const holdMethod = process.env.DSH_FAKE_HOLD_METHOD ?? "";
+  const holdSession = process.env.DSH_FAKE_HOLD_SESSION ?? "";
+  if (holdMethod !== "" && holdMethod === method
+    && (holdSession === "" || holdSession === (requested ?? ""))) {
+    const ready = process.env.DSH_FAKE_HOLD_READY ?? "";
+    const release = process.env.DSH_FAKE_HOLD_RELEASE ?? "";
+    if (ready !== "") writeFileSync(ready, "ready");
+    const deadline = Date.now() + 30000;
+    while (release !== "" && !existsSync(release) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
   }
   switch (method) {
     case "initialize":

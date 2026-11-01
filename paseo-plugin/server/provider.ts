@@ -329,6 +329,17 @@ class DshConnection implements ProviderConnection {
    * is released when the open transaction ends (not when the session closes).
    */
   readonly #opening = new Set<string>();
+  /**
+   * Provider session ids with an open in flight, and whether that open was
+   * invalidated by a close.
+   *
+   * A provider id is an identity too, not just a lookup key: Paseo reopens an
+   * imported session under a fresh agent id, so the same provider id can be
+   * rebound to a different native session. The claim has to cover both, and it
+   * has to be taken in the same synchronous turn as the check — see
+   * {@link #openTransaction}.
+   */
+  readonly #openingProviders = new Map<string, { nativeId: string; closed: boolean }>();
   #display: DisplayCatalog | undefined;
   #closed = false;
   /**
@@ -883,7 +894,7 @@ class DshConnection implements ProviderConnection {
       case "sessions":
         return this.#listSessions(input);
       case "session.open":
-        return this.#open(input);
+        return this.#openTransaction(input);
       case "session.archive":
       case "session.unarchive": {
         const archived = input.type === "session.archive";
@@ -970,6 +981,11 @@ class DshConnection implements ProviderConnection {
         return;
       }
       case "session.close": {
+        // Invalidate an open still in flight for this provider id: the daemon
+        // asked for the session to be gone, so the open must not go on to
+        // publish readiness for it (or re-create it) after this point.
+        const opening = this.#openingProviders.get(input.sessionId);
+        if (opening !== undefined) opening.closed = true;
         const session = this.#sessions.get(input.sessionId);
         // The daemon can close this session and immediately reopen it on the same
         // persistence handle, so a prompt landing in that window must still get a
@@ -1087,7 +1103,93 @@ class DshConnection implements ProviderConnection {
     });
   }
 
-  async #open(input: Extract<ProviderInput, { type: "session.open" }>): Promise<void> {
+  /**
+   * Claim both identities an open transaction owns, before its first await.
+   *
+   * The `#opening` guard alone was not enough, for two reasons that are both
+   * about *when* the claim is taken relative to the work it protects:
+   *
+   * 1. It was taken after `loadCatalog()` and after the holder teardown below,
+   *    and both await. A second open for the same DSH session could pass the
+   *    check in that window, finish first, and then the first one — waking up —
+   *    overwrote its `#sessions` entry, failed `attachSession` with "already
+   *    attached", and its catch deleted the *winner's* entry and bridge session.
+   *    Paseo had been told the winner was ready, yet every prompt on it failed
+   *    with "unknown session".
+   * 2. It only covered the native DSH id. Paseo reopens an imported session
+   *    under a fresh agent id, so the same **provider** id can be rebound to a
+   *    different native session while an open for it is still running; the
+   *    rebinding open then owns an id whose first open is about to publish.
+   *
+   * Claiming both ids in the same synchronous turn as the checks turns the loser
+   * into a loud refusal, which is the honest answer: Paseo mints a fresh
+   * provider session id per open, so two concurrent opens are a caller bug, not
+   * a reload. The claims are released when the transaction ends (success or
+   * failure), not when the session closes.
+   */
+  async #openTransaction(input: Extract<ProviderInput, { type: "session.open" }>): Promise<void> {
+    const data = input.persistence?.data;
+    const nativeId = isRecord(data) && typeof data["sessionId"] === "string"
+      ? data["sessionId"] : input.sessionId;
+    if (this.#opening.has(nativeId)) {
+      throw new Error(
+        `cannot open ${input.sessionId}: another open for DSH session ${nativeId} is already in flight`,
+      );
+    }
+    if (this.#openingProviders.has(input.sessionId)) {
+      throw new Error(
+        `cannot open ${input.sessionId}: another open for this provider session is already in flight`,
+      );
+    }
+    const opening = { nativeId, closed: false };
+    this.#opening.add(nativeId);
+    this.#openingProviders.set(input.sessionId, opening);
+    try {
+      await this.#open(input, opening);
+    } finally {
+      // Retain both claims through failure cleanup: a closing old instance must
+      // never dispose a new instance that reused the same native identity.
+      this.#opening.delete(nativeId);
+      if (this.#openingProviders.get(input.sessionId) === opening) {
+        this.#openingProviders.delete(input.sessionId);
+      }
+    }
+  }
+
+  /**
+   * Throw when the open transaction that is about to publish no longer owns what
+   * it is publishing for.
+   *
+   * Three things can invalidate it, and all three are silent without this check:
+   * the connection was torn down, the provider session was closed while the open
+   * was running, or a later open took over the same provider id.
+   *
+   * `session` is passed only once the instance exists. Its test is the
+   * `#sessions` identity, not a closed flag on the instance: `session.close`
+   * deletes the map entry **before** it awaits the instance's own teardown, so
+   * "no longer the tracked instance" is already true for the whole close, and
+   * it also covers a later open having replaced the entry.
+   *
+   * @param sessionId - provider session this open is publishing for.
+   * @param opening - the claim `#openTransaction` took.
+   * @param session - the instance, once constructed.
+   */
+  #assertOpening(
+    sessionId: string,
+    opening: { nativeId: string; closed: boolean },
+    session?: DshSession,
+  ): void {
+    this.#assertConnected();
+    if (opening.closed || this.#openingProviders.get(sessionId) !== opening
+      || (session !== undefined && this.#sessions.get(sessionId) !== session)) {
+      throw new Error(`session ${sessionId} was closed while it was opening`);
+    }
+  }
+
+  async #open(
+    input: Extract<ProviderInput, { type: "session.open" }>,
+    opening: { nativeId: string; closed: boolean },
+  ): Promise<void> {
     const { sessionId, config } = input;
     // `send()` guards only at its entry. An open still running when the
     // connection is torn down would otherwise go on to spawn/attach and emit
@@ -1097,12 +1199,14 @@ class DshConnection implements ProviderConnection {
     this.#assertConnected();
     const display = this.#display ?? (await loadCatalog(config.cwd));
     this.#display = display;
+    // The catalog load awaits, so the claim taken by `#openTransaction` is
+    // re-checked before anything is torn down or spawned on its behalf.
+    this.#assertOpening(sessionId, opening);
 
     // DSH's session id: the Paseo-minted one normally, but the native id when
-    // Paseo reopens an imported session under a fresh agent id.
-    const nativeId = input.persistence?.data;
-    const dshSessionId =
-      isRecord(nativeId) && typeof nativeId["sessionId"] === "string" ? nativeId["sessionId"] : sessionId;
+    // Paseo reopens an imported session under a fresh agent id. Resolved by
+    // `#openTransaction` because the claim is keyed by it.
+    const dshSessionId = opening.nativeId;
 
     // The daemon injects the Paseo agent id into the provider session env. It
     // scopes native child ids so a reload upserts the same Paseo rows instead of
@@ -1143,12 +1247,23 @@ class DshConnection implements ProviderConnection {
             + `closing it failed (${messageOf(error)})`,
         );
       }
-      this.#sessions.delete(holder.id);
-      // Tell the daemon the session it still believes is open is gone: silence
-      // would leave prompts routed at a provider session this connection no longer
-      // owns, surfacing later as an unexplained `runtime_failed`.
-      this.#emit({ type: "session.closed", sessionId: holder.id });
+      // Forget after the close, and only if the entry is still this holder. The
+      // close awaits, so a later open can have replaced `#sessions[holder.id]`
+      // in the meantime; deleting by key alone would then drop *that* session's
+      // entry — the "one open destroys another" shape this transaction exists to
+      // remove. The claim taken by `#openTransaction` is what makes the window
+      // unreachable today; the guard keeps it that way if the order changes.
+      if (this.#sessions.get(holder.id) === holder) {
+        this.#sessions.delete(holder.id);
+        // Tell the daemon the session it still believes is open is gone: silence
+        // would leave prompts routed at a provider session this connection no
+        // longer owns, surfacing later as an unexplained `runtime_failed`.
+        this.#emit({ type: "session.closed", sessionId: holder.id });
+      }
     }
+    // The holder teardown awaits, so the transaction must still own both ids
+    // before it goes on to spawn and publish for them.
+    this.#assertOpening(sessionId, opening);
 
     // Validate this session's MCP servers **before** anything is spawned for it.
     //
@@ -1165,35 +1280,16 @@ class DshConnection implements ProviderConnection {
     /** Warnings collected during the open, emitted after `session.ready` so Paseo has the session. */
     const openWarnings: OpenWarning[] = [];
 
-    // The concurrent counterpart of the holder check above: two opens for one DSH
-    // session must not interleave (both would pass the check and spawn a process,
-    // and only one can own the log's write lock). The claim is taken in the same
-    // **synchronous turn** as the check, and that is the entire point: every step
-    // below awaits (the replaced instance's `close()`, `open()` itself), so a
-    // claim taken after them left a window where a third open passed this same
-    // check. That third open then finished normally, and the earlier one — waking
-    // up — overwrote its `#sessions` entry, failed `attachSession` with "already
-    // attached", and in its catch deleted the *winner's* entry and bridge session
-    // (`closeSession` detaches the winner's handlers and disposes its agent).
-    // Paseo had been told the winner was ready, yet every prompt on it failed with
-    // "unknown session".
-    //
-    // Claiming first turns the loser into a loud refusal instead, which is the
-    // honest answer: Paseo mints a fresh provider session id per open, so two
-    // concurrent opens for one DSH session are a caller bug, not a reload. The
-    // entry is released when the open transaction ends (success or failure), not
-    // when the session closes.
-    if (this.#opening.has(dshSessionId)) {
-      throw new Error(
-        `cannot open ${sessionId}: another open for DSH session ${dshSessionId} is already in flight`,
-      );
-    }
-    this.#opening.add(dshSessionId);
+    // The concurrent counterpart of the holder check above, and the reason both
+    // ids are claimed in `#openTransaction` before this method's first await:
+    // two opens for one DSH session must not interleave, and neither may one
+    // provider id be rebound to a second native session mid-open. Nothing here
+    // re-claims either identity.
 
     // Declared outside the transaction because the catch has to close it: the
-    // claim above is taken before the instance exists, so a throw in between (an
-    // option the constructor rejects) must still release the claim — otherwise
-    // every later open of this DSH session is refused for the connection's life.
+    // claim is taken before the instance exists, so a throw in between (an
+    // option the constructor rejects) must still release it — otherwise every
+    // later open of this DSH session is refused for the connection's life.
     let session: DshSession | undefined;
 
     try {
@@ -1233,6 +1329,9 @@ class DshConnection implements ProviderConnection {
         }
       }
 
+      // The replaced instance's close awaits, so re-check the transaction's
+      // claim before constructing and registering a new instance under it.
+      this.#assertOpening(sessionId, opening);
       session = new DshSession({
         systemPrompt: config.systemPrompt,
         permission: this.capabilities.includes("permission"),
@@ -1407,27 +1506,23 @@ class DshConnection implements ProviderConnection {
           process.stderr.write(`[${PROVIDER_ID}] history replay failed: ${messageOf(error)}\n`);
         }
       }
-      // The materialization window is over: another open for this DSH session may
-      // start (it would see this session as the holder and take it over), so the
-      // in-flight marker must not outlive it.
-      this.#opening.delete(dshSessionId);
-      // The connection can be torn down while this open runs (`close()` does not
-      // wait for opens in flight). Everything from here to the `session.opened`
-      // emit is synchronous, so one check covers the whole publish step: a dead
-      // connection must not announce a session it cannot serve, and the claim
-      // this session holds has to be returned (the catch below closes it).
-      this.#assertConnected();
+      // Everything from here to `session.ready` is synchronous, so this one
+      // check covers the whole publish step. It replaces the old "release
+      // `#opening` then `#assertConnected`" pair for two reasons: the claims must
+      // be held through publication (a close that lands during the open has to
+      // invalidate it, not merely race it), and a torn-down connection must not
+      // announce a session it cannot serve. The catch below closes the instance.
+      this.#assertOpening(sessionId, opening, session);
     } catch (error) {
-      this.#opening.delete(dshSessionId);
       // The daemon drops its own maps and rethrows on a failed open
       // (`PluginProvider.openSession`'s catch never sends `session.close`), so
       // this entry — and the `dsh` process `open()` has already spawned — would
       // otherwise live as long as the connection does. Every retry arrives under
       // a fresh session id, so they accumulate rather than replace each other.
       //
-      // Both deletions are guarded by identity, not by key alone. The claim taken
-      // synchronously above already makes a concurrent open for this DSH session
-      // impossible, so these guards are belt-and-braces against a future reorder:
+      // The deletion is guarded by identity, not by key alone. The claim taken by
+      // `#openTransaction` already makes a concurrent open for this provider id
+      // impossible, so this guard is belt-and-braces against a future reorder:
       // unguarded, a catch that lands after a later open replaced the entry would
       // delete *that* session's record — the very "one open destroys another
       // session" failure this change removes.
@@ -1461,8 +1556,21 @@ class DshConnection implements ProviderConnection {
       persistence: { version: 1, data: { sessionId: dshSessionId } },
       ...(config.title === undefined ? {} : { title: config.title }),
     });
+    // `#emit` calls the listeners synchronously, and the daemon's `session.opened`
+    // handler can reenter this connection (`session.close` is the one that does).
+    // A close submitted from that handler has already marked the claim closed, so
+    // re-check before publishing readiness: the host must not be told a session is
+    // ready after it asked for it to be gone.
+    this.#assertOpening(sessionId, opening, session);
     this.#emit({ type: "session.config", sessionId, config: session.configState() });
+    this.#assertOpening(sessionId, opening, session);
     this.#emit({ type: "session.ready", requestId: input.requestId, sessionId });
+    // Same reentrancy window as above, but this one must **not** throw: readiness
+    // was already published, so a close that came from that very emit has to end
+    // the open quietly instead of turning into a `request.failed` after the host
+    // was told the session is ready. Nothing is left running: `session.close`
+    // removed the entry and tore the instance down before it awaited.
+    if (this.#sessions.get(sessionId) !== session) return;
     for (const warning of openWarnings) {
       this.#notice(sessionId, warning.severity, warning.title, warning.description);
     }
