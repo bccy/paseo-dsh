@@ -158,13 +158,29 @@ check("job and note rows apply rowBox(compact)", pillElements.filter((element) =
 assert("the text column applies rowTextColumn", pillElements.some((element) =>
   element.tag === "View" && calls(attr(element, "style"), "rowTextColumn").length === 1));
 assert("popover root is built with popoverRootBox", /const\s+root\s*=\s*popoverRootBox\(\s*\)/.test(pillSource));
+// Three branches: unreadable registry, nothing to show, and the grouped list.
+// Each wraps its body in the same root box.
 check("all three popover branches apply the root box", pillElements.filter((element) =>
   element.tag === "View" && attr(element, "style").trim() === "root").length, 3);
 const rows = pillElements.filter((element) => ["JobRow", "NoteLine"].includes(element.tag));
-assert("rows and notes take host compact density", rows.length === 3 && rows.every((element) =>
+// JobRow appears once for the live group and once for the expanded settled group,
+// plus the two NoteLine branches — four call sites, all taking host density.
+assert("rows and notes take host compact density", rows.length === 4 && rows.every((element) =>
   attr(element, "compact").replace(/\s/g, "") === "layout.compact"));
-assert("rows stay read-only with no inner scroll view", !pillElements.some((element) =>
-  ["Pressable", "ScrollView"].includes(element.tag)));
+// Read-only rows, one pressable exception. A job row is never pressable (killing a
+// job is the model's `job_kill` tool), and nothing here scrolls. The finished
+// section's header IS pressable — DSH's own list renders it as a `button` with
+// `aria-expanded` — so the rule is "no Pressable inside a row", not "no Pressable".
+assert("no inner scroll view", !pillElements.some((element) => element.tag === "ScrollView"));
+check("exactly one pressable element (the finished-section header)",
+  pillElements.filter((element) => element.tag === "Pressable").length, 1);
+assert("the pressable is the settled header, not a job row",
+  shape.functionBody(pillSource, "SettledHeader") !== undefined
+    && /accessibilityState=\{\{\s*expanded\s*\}\}/.test(pillSource));
+assert("job rows stay read-only", (() => {
+  const body = shape.functionBody(pillSource, "JobRow");
+  return body !== undefined && !body.includes("Pressable");
+})());
 assert("the job mark passes its theme to JobsSpinner", pillElements.some((element) =>
   element.tag === "JobsSpinner" && attr(element, "theme").trim() === "theme"));
 assert("spinner colour comes from the theme surface", calls(spinnerSource, "ringColorFor").some((args) =>
@@ -188,8 +204,26 @@ assert("the title line renders the resolved title, not the raw label",
 // order: a settled row above a running one is exactly the bug. The pure rule is
 // asserted in `jobs-poll-check.cjs`; this is the wiring that makes it reach the
 // screen, read as source because the module imports the host runtime.
-assert("the popover draws rows through orderJobs", /\{orderJobs\(entry\.jobs\)\.map\(/.test(pillSource));
+assert("the popover splits rows through splitJobs", /const\s+\{\s*live,\s*settled\s*\}\s*=\s*splitJobs\(/.test(pillSource));
 assert("the raw jobs array is not mapped directly", !/\{entry\.jobs\.map\(/.test(pillSource));
+
+// The finished section: while anything is live it folds to one header, and the
+// header has to be the only pressable thing in a popover whose rows are read-only.
+assert("the finished section starts folded while anything runs",
+  /const\s+expanded\s*=\s*settledOpen\s*\?\?\s*live\.length\s*===\s*0/.test(pillSource));
+assert("a tap toggles the section from the resolved state, not a stale value",
+  /setSettledOpen\(!expanded\)/.test(pillSource));
+assert("the header is only drawn when there are finished rows",
+  /\{settled\.length > 0 \? \(/.test(pillSource));
+assert("the finished rows are drawn only when expanded",
+  /\{expanded\s*\n?\s*\? settled\.map\(/.test(pillSource) || /\{expanded\s*\?\s*settled\.map\(/.test(pillSource));
+assert("the live rows are drawn outside the fold", /\{live\.map\(\(job\) =>/.test(pillSource));
+// No fallback branch: `jobSchema` parses `status` as `z.enum(JOB_STATUSES)`, so a
+// status outside the list fails the whole RPC answer instead of reaching here, and
+// `splitJobs` partitions exactly the statuses `isLiveStatus` classifies. An
+// unreachable "both groups empty" branch would be dead code dressed as safety.
+assert("no dead fallback for an unreachable empty split",
+  !/live\.length === 0 && settled\.length === 0/.test(pillSource));
 
 console.log("\npermission refusal");
 

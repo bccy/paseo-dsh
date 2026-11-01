@@ -26,8 +26,8 @@ import type {
   PluginClientContext,
 } from "@getpaseo/plugin/client";
 import { useEffect, useState } from "react";
-import { Text, View } from "react-native";
-import { isLiveStatus, jobsList, orderJobs, type Job } from "../shared/jobs";
+import { Pressable, Text, View } from "react-native";
+import { isLiveStatus, jobsList, splitJobs, type Job } from "../shared/jobs";
 import { PROVIDER_ID } from "../shared/provider";
 import {
   FACTS_FONT_SIZE,
@@ -240,12 +240,59 @@ function NoteLine({
 }
 
 /**
+ * The collapsed header over the finished rows: one line, "3 个已完成".
+ *
+ * It is a plain `View`, not a `Pressable`, for the same reason a job row is: a
+ * host track panel has no pressable rows, and the popover's rows stay read-only.
+ * Tapping it is handled by the parent's `onPress`, which is the only interactive
+ * thing in this popover.
+ *
+ * The chevron is a text glyph rather than an icon because the client bundle may
+ * not import the host's icon set — the same constraint `JobMark` works under.
+ */
+function SettledHeader({
+  count,
+  expanded,
+  theme,
+  compact,
+  onToggle,
+  text,
+}: {
+  count: number;
+  expanded: boolean;
+  theme: PopoverTheme;
+  compact: boolean;
+  onToggle: () => void;
+  text: JobsText;
+}) {
+  return (
+    <Pressable
+      onPress={onToggle}
+      accessibilityRole="button"
+      accessibilityState={{ expanded }}
+      style={rowBox({ compact })}
+    >
+      <Text style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}>
+        {`${expanded ? "▾" : "▸"} ${expanded ? text.settledSectionOpen(count) : text.settledSection(count)}`}
+      </Text>
+    </Pressable>
+  );
+}
+
+/**
  * The popover body: one row per job, live while it is open.
  *
  * It reads the shared store rather than issuing its own RPC, so opening the
- * popover does not double the request rate. No heading, no separator, no group
- * split: the host's track panels have none of the three, and the mark's shape
- * already says which rows are live.
+ * popover does not double the request rate.
+ *
+ * **Two groups, and the second one folds.** A session that runs a dozen commands
+ * leaves a dozen finished rows behind — the registry keeps a settled record until
+ * its owner is disposed — so a flat list becomes a wall of history to scroll past
+ * before reaching the one row that is still running. `splitJobs` divides them,
+ * and while anything is live the finished half collapses to a single header.
+ * This mirrors DSH's own job list (`settledExpanded = settledOpen ?? liveRows.length === 0`);
+ * it is not a local invention. With nothing running there is no reason to hide
+ * history, so the section starts open — and then it is the only content anyway.
  *
  * **Why the root has a negative margin.** A plugin popover body is wrapped in
  * `PluginPopoverContent` (12pt on every side) while a host track panel's rows go
@@ -261,6 +308,11 @@ function NoteLine({
 function makeJobsPopover(store: JobStore, agentId: string) {
   function JobsPopover({ theme, layout }: PluginButtonContentProps) {
     const [entry, setEntry] = useState<AgentJobs | undefined>(store.get(agentId));
+    // `undefined` means "not chosen yet": the section follows the live count
+    // until the user taps it, and a tap wins from then on. DSH's own list uses
+    // exactly this shape (`settledOpen ?? liveRows.length === 0`), so a session
+    // that goes idle does not keep a section the user collapsed.
+    const [settledOpen, setSettledOpen] = useState<boolean | undefined>(undefined);
 
     useEffect(() => {
       const current = store.get(agentId);
@@ -298,12 +350,18 @@ function makeJobsPopover(store: JobStore, agentId: string) {
       );
     }
 
+    const { live, settled } = splitJobs(entry.jobs);
+    // While anything runs, the finished half starts folded; with nothing running
+    // there is nothing to protect the live rows from, so it starts open.
+    // `splitJobs` partitions the same statuses `isLiveStatus` classifies, and a
+    // status outside `JOB_STATUSES` never reaches here — the wire schema rejects
+    // the whole answer — so both groups empty is unreachable, not a fallback.
+    const expanded = settledOpen ?? live.length === 0;
+
     return (
       <View style={root}>
-        {/* Running jobs first, then settled ones newest-first — DSH's own order
-            (`orderJobs`), not the registry's registration order. A settled row
-            still listed above a live one is the thing this fixes. */}
-        {orderJobs(entry.jobs).map((job) => (
+        {/* Live rows first in start order — the thing the user opened this for. */}
+        {live.map((job) => (
           <JobRow
             key={job.id}
             job={job}
@@ -312,6 +370,31 @@ function makeJobsPopover(store: JobStore, agentId: string) {
             compact={layout.compact}
           />
         ))}
+        {settled.length > 0 ? (
+          <SettledHeader
+            count={settled.length}
+            expanded={expanded}
+            theme={theme}
+            compact={layout.compact}
+            onToggle={() => {
+              setSettledOpen(!expanded);
+            }}
+            text={text}
+          />
+        ) : null}
+        {/* Settled rows stay newest-first, so an expanded section reads as a
+            history log rather than in the order the commands happened to run. */}
+        {expanded
+          ? settled.map((job) => (
+              <JobRow
+                key={job.id}
+                job={job}
+                theme={theme}
+                text={text}
+                compact={layout.compact}
+              />
+            ))
+          : null}
       </View>
     );
   }

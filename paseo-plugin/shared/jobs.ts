@@ -79,6 +79,31 @@ export function orderJobs<T extends Pick<Job, "status" | "startedAt" | "finished
 }
 
 /**
+ * The popover's two groups: what is running, and what already finished.
+ *
+ * Split after {@link orderJobs}, so each half keeps that order (live by start
+ * time, settled newest-first) without a second sort.
+ *
+ * **Why split at all.** A session that runs a dozen commands leaves a dozen
+ * finished rows behind — the registry keeps a settled record until its owner is
+ * disposed — and a flat list turns into a wall of history the user has to scroll
+ * past to see the one row that matters. DSH's own job list splits the same way
+ * (`settledExpanded = settledOpen ?? liveRows.length === 0`), so this is its
+ * behaviour rather than an invention.
+ *
+ * Pure and dependency-free so the offline harness can drive it directly.
+ */
+export function splitJobs<T extends Pick<Job, "status" | "startedAt" | "finishedAt">>(
+  jobs: readonly T[],
+): { live: T[]; settled: T[] } {
+  const ordered = orderJobs(jobs);
+  return {
+    live: ordered.filter((job) => isLiveStatus(job.status)),
+    settled: ordered.filter((job) => !isLiveStatus(job.status)),
+  };
+}
+
+/**
  * One job as the pill draws it.
  *
  * `.strip()` is deliberate: Paseo parses both sides, so an undeclared key would be

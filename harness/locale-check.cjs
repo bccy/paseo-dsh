@@ -209,7 +209,7 @@ console.log("the jobs pill's copy is covered in both languages");
   // Every key the interface declares must be present in both, and the two key
   // sets must match — a key added to one language only is the drift this catches.
   equal("jobs keys match", Object.keys(en).sort(), Object.keys(zh).sort());
-  for (const key of ["label", "title", "statuses", "allSettled", "unavailable"]) {
+  for (const key of ["label", "title", "statuses", "allSettled", "settledSection", "settledSectionOpen", "unavailable"]) {
     check(`jobs.${key} exists in both languages`, en[key] !== undefined && zh[key] !== undefined);
   }
 
@@ -217,7 +217,7 @@ console.log("the jobs pill's copy is covered in both languages");
   // per language. A function that returned "" would render an empty pill.
   for (const locale of LOCALES) {
     const table = allText()[locale].jobs;
-    for (const name of ["label"]) {
+    for (const name of ["label", "settledSection", "settledSectionOpen"]) {
       const rendered = table[name](2);
       check(
         `jobs.${name}(2) is a non-empty string in ${locale}`,
@@ -240,8 +240,12 @@ console.log("the jobs pill's copy is covered in both languages");
   }
 
   // The English column must not be a copy of the Chinese one: a translated table
-  // and a duplicated one look identical until someone switches language.
+  // and a duplicated one look identical until someone switches language. The two
+  // `settledSection*` functions are compared by their output, not identity.
   const copied = ["title", "allSettled", "unavailable"].filter((key) => en[key] === zh[key]);
+  for (const name of ["settledSection", "settledSectionOpen"]) {
+    if (en[name](3) === zh[name](3)) copied.push(name);
+  }
   equal("the English jobs copy is not the Chinese copy", copied, []);
 
   // **`statuses` must cover exactly the statuses `shared/jobs.ts` declares.**

@@ -28,7 +28,7 @@
 "use strict";
 
 const { createPollSequence } = require("./client/poll-sequence.js");
-const { orderJobs } = require("./shared/jobs.js");
+const { orderJobs, splitJobs } = require("./shared/jobs.js");
 
 let failures = 0;
 let checks = 0;
@@ -229,6 +229,51 @@ console.log("\nrow order (running first, then settled newest-first)");
     settledFirst.map((entry) => entry.id),
     ["a-settled-old", "b-settled-new", "c-live"],
   );
+}
+
+/* ---------------------------------------------------------------------------- */
+
+// The popover splits the list so the finished half can fold away. The split runs
+// AFTER the sort, so each half keeps its order without a second sort — and the
+// counts decide the panel's shape: a live row plus a folded header, or (idle) the
+// settled rows in full.
+console.log("\npopover groups (live rows vs the foldable finished section)");
+{
+  const job = (id, status, startedAt, finishedAt) => ({ id, status, startedAt, finishedAt });
+
+  const mixed = [
+    job("done-old", "completed", 100, 200),
+    job("live-late", "running", 300),
+    job("done-new", "failed", 150, 400),
+    job("live-early", "stopping", 50),
+  ];
+  const { live, settled } = splitJobs(mixed);
+  equal("the live group holds only live jobs", live.map((entry) => entry.id), ["live-early", "live-late"]);
+  equal("the settled group holds the rest, newest-first", settled.map((entry) => entry.id), ["done-new", "done-old"]);
+
+  // The counts are what the header prints and what decides whether the section
+  // starts folded; a split that dropped or duplicated a row would show up here.
+  equal("every job lands in exactly one group", live.length + settled.length, mixed.length);
+
+  // A `stopping` job is still live work — it must not fall into the finished
+  // section, or a stuck stop would read as done.
+  equal("a stopping job counts as live", splitJobs([job("s", "stopping", 1)]).settled.length, 0);
+
+  // With nothing running the caller opens the section (nothing to protect), so
+  // the split must still report the settled rows rather than swallowing them.
+  const idle = splitJobs([job("a", "completed", 1, 2), job("b", "killed", 3, 4)]);
+  equal("an idle session has no live group", idle.live.length, 0);
+  equal("an idle session keeps its settled rows", idle.settled.map((entry) => entry.id), ["b", "a"]);
+
+  // Same input-immutability rule as `orderJobs`: the store hands one array to
+  // every listener, so sorting it in place would reorder another render's data.
+  const before = mixed.map((entry) => entry.id);
+  splitJobs(mixed);
+  equal("splitJobs does not mutate its input", mixed.map((entry) => entry.id), before);
+
+  // The OLD behaviour — one flat list — must fail the split's first assertion.
+  equal("OLD: a flat list keeps the finished rows mixed in", mixed.map((entry) => entry.id),
+    ["done-old", "live-late", "done-new", "live-early"]);
 }
 
 /* ---------------------------------------------------------------------------- */

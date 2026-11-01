@@ -145,6 +145,16 @@ export interface JobsText {
   statuses: Record<string, string>;
   /** Popover line when every job it lists has already settled. */
   allSettled: string;
+  /**
+   * The collapsed section header that hides finished rows, `count` of them.
+   *
+   * DSH's own job list does the same thing (`settledExpanded = settledOpen ??
+   * liveRows.length === 0`): while something is still running, the finished rows
+   * fold into one line and the list stays about what is happening now.
+   */
+  settledSection: (count: number) => string;
+  /** The same header once expanded — the same words, so only the chevron changes. */
+  settledSectionOpen: (count: number) => string;
   /** Popover line when the runtime could not read the registry — never "none". */
   unavailable: string;
 }
@@ -377,6 +387,8 @@ const TEXT: Record<Locale, UiText> = {
         failed: "Failed",
       },
       allSettled: "All background tasks have finished.",
+      settledSection: (count) => `${String(count)} finished`,
+      settledSectionOpen: (count) => `${String(count)} finished`,
       unavailable: "Could not read this session's background tasks.",
     },
   },
@@ -587,6 +599,9 @@ const TEXT: Record<Locale, UiText> = {
         failed: "失败",
       },
       allSettled: "后台任务都已结束。",
+      // 收起/展开用同一句话：变的只有箭头，改文案会让「展开」看起来像换了分组。
+      settledSection: (count) => `${String(count)} 个已完成`,
+      settledSectionOpen: (count) => `${String(count)} 个已完成`,
       unavailable: "读不到本会话的后台任务。",
     },
   },
