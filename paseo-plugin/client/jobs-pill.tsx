@@ -27,7 +27,7 @@ import type {
 } from "@getpaseo/plugin/client";
 import { useEffect, useState } from "react";
 import { Text, View } from "react-native";
-import { isLiveStatus, jobsList, type Job } from "../shared/jobs";
+import { isLiveStatus, jobsList, orderJobs, type Job } from "../shared/jobs";
 import { PROVIDER_ID } from "../shared/provider";
 import {
   FACTS_FONT_SIZE,
@@ -154,9 +154,17 @@ function JobMark({ status, theme }: { status: JobStatus; theme: PopoverTheme }) 
  * One job, laid out as the host lays out a subagent row: a mark, then a two-line
  * column.
  *
- * The title is routinely a whole shell command, so it is ellipsised on one line
- * rather than wrapped — wrapping pushed every following row out of the popover.
- * The facts line joins the status word to any progress with the host's own `·`.
+ * **The title prefers the model's own words.** A bash job registers with the raw
+ * command as its `label`, so the pill printed shell source while the tool row
+ * above it already read in Chinese — DSH requires a one-line `description` on
+ * every bash call and titles its own row with it. When that sentence reached us
+ * (`job.description`), it becomes the title and the command drops to the facts
+ * line, where it stays visible for anyone checking which command this actually
+ * is. Without it the row is exactly what it was: the command, ellipsised.
+ *
+ * The title is ellipsised on one line rather than wrapped — wrapping pushed
+ * every following row out of the popover. The facts line joins its parts with
+ * the host's own `·`.
  *
  * **Read-only, no hover fill.** There is nothing to press (killing a job is the
  * model's `job_kill` tool), and the host's rule for that case is a
@@ -177,14 +185,22 @@ function JobRow({
 }) {
   const statusWord = text.statuses[job.status] ?? job.status;
   const progress = job.progress ?? job.detail;
-  const facts =
-    progress === undefined || progress === "" ? statusWord : `${statusWord} · ${progress}`;
+  const description = job.description;
+  // With a description the title is prose and the command moves down; without
+  // one the row is unchanged, so a job whose call this session never saw (or a
+  // non-bash producer) still reads correctly instead of showing an empty title.
+  const titled = description !== undefined && description !== "";
+  const title = titled ? description : job.label;
+  // The command is only worth repeating when it is not already the title.
+  const facts = [statusWord, titled ? job.label : undefined, progress]
+    .filter((part): part is string => part !== undefined && part !== "")
+    .join(" · ");
   return (
     <View style={rowBox({ compact })}>
       <JobMark status={job.status} theme={theme} />
       <View style={rowTextColumn()}>
         <Text numberOfLines={1} style={{ fontSize: TITLE_FONT_SIZE, color: theme.colors.foreground }}>
-          {job.label}
+          {title}
         </Text>
         <Text
           numberOfLines={1}
@@ -284,7 +300,10 @@ function makeJobsPopover(store: JobStore, agentId: string) {
 
     return (
       <View style={root}>
-        {entry.jobs.map((job) => (
+        {/* Running jobs first, then settled ones newest-first — DSH's own order
+            (`orderJobs`), not the registry's registration order. A settled row
+            still listed above a live one is the thing this fixes. */}
+        {orderJobs(entry.jobs).map((job) => (
           <JobRow
             key={job.id}
             job={job}

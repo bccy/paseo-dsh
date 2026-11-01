@@ -53,6 +53,32 @@ export function isLiveStatus(status: JobStatus): status is (typeof LIVE_JOB_STAT
 }
 
 /**
+ * The order the pill draws jobs in.
+ *
+ * **Copied from DSH's own job list** (`dsh-client-ui-jobs/lib/client.js`'s
+ * `ordered()`), not invented here: a running job is what the user opened the
+ * popover to look at, so live rows come first in start order, then the settled
+ * ones newest-first. Two rows that settled in the same millisecond fall back to
+ * start order, which is what keeps the result independent of the registry's map
+ * iteration — the registry only promises *registration* order, and a settled
+ * row's position in that order says nothing about when it finished.
+ *
+ * Pure and dependency-free so the offline harness can drive it directly.
+ */
+export function orderJobs<T extends Pick<Job, "status" | "startedAt" | "finishedAt">>(
+  jobs: readonly T[],
+): T[] {
+  return [...jobs].sort((left, right) => {
+    const liveLeft = isLiveStatus(left.status);
+    if (liveLeft !== isLiveStatus(right.status)) return liveLeft ? -1 : 1;
+    if (liveLeft) return left.startedAt - right.startedAt;
+    const finished =
+      (right.finishedAt ?? right.startedAt) - (left.finishedAt ?? left.startedAt);
+    return finished !== 0 ? finished : left.startedAt - right.startedAt;
+  });
+}
+
+/**
  * One job as the pill draws it.
  *
  * `.strip()` is deliberate: Paseo parses both sides, so an undeclared key would be
@@ -64,6 +90,16 @@ export const jobSchema = z.object({
   label: z.string(),
   status: z.enum(JOB_STATUSES),
   startedAt: z.number(),
+  /**
+   * The model's own one-line summary of what this job's command does.
+   *
+   * A bash job's `label` is the raw command, so the pill printed shell source
+   * while the tool row above it already read in Chinese. DSH requires a
+   * `description` on every bash call and titles its own row with it; the bridge
+   * carries that same sentence here. **Absent means "no better title than the
+   * command"** — never a placeholder, so the row can fall back without guessing.
+   */
+  description: z.string().optional(),
   progress: z.string().optional(),
   detail: z.string().optional(),
   finishedAt: z.number().optional(),

@@ -89,6 +89,17 @@ function startBridge(ctx, config = {}) {
       server.dropFileTool(exec);
     });
   });
+  // The bash call's own `description` titles the jobs pill row. It has to be
+  // read here: `exec.arguments` is the only place the pair (command,
+  // description) is visible at once, and `JobView` carries no call id to join
+  // them later. Scoped to the tool runtime rather than `fs`, because this has
+  // nothing to do with file snapshots.
+  ctx.inject(['tools'], (scope) => {
+    scope.on('tools/execute', async (exec, next) => {
+      server.rememberToolDescription(exec);
+      return next();
+    });
+  });
   let exitTask;
 
   const disposeAndExit = (code) => {

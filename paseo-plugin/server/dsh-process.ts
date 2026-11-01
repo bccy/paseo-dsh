@@ -199,6 +199,16 @@ export interface DshJob {
   status: "running" | "stopping" | "completed" | "killed" | "failed";
   /** Epoch ms when the job was registered. */
   startedAt: number;
+  /**
+   * The model's own one-line summary of what the command does, when the bridge
+   * still remembers it for this session.
+   *
+   * `label` is the raw command, because that is what `dsh-tool-bash` registers.
+   * This is the sentence DSH requires on every bash call and titles its own row
+   * with, so it is what a reader can actually understand. Absent means "no
+   * better title than the command" — never a placeholder.
+   */
+  description?: string;
   progress?: string;
   detail?: string;
   finishedAt?: number;

@@ -28,6 +28,7 @@
 "use strict";
 
 const { createPollSequence } = require("./client/poll-sequence.js");
+const { orderJobs } = require("./shared/jobs.js");
 
 let failures = 0;
 let checks = 0;
@@ -37,6 +38,15 @@ function check(what, actual, expected) {
   failures += 1;
   console.error(`  FAIL ${what}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
 }
+function equal(what, actual, expected) {
+  checks += 1;
+  const a = JSON.stringify(actual);
+  const e = JSON.stringify(expected);
+  if (a === e) return;
+  failures += 1;
+  console.error(`  FAIL ${what}: expected ${e}, got ${a}`);
+}
+
 function assert(what, condition, detail) {
   checks += 1;
   if (condition) return;
@@ -143,6 +153,82 @@ function createOldSequence() {
   const beforeRemove = old2.issue("y");
   old2.remove();
   check("OLD: the removed agent's answer still publishes", old2.isCurrent("y", beforeRemove), true);
+}
+
+/* ---------------------------------------------------------------------------- */
+
+// The pill draws `orderJobs(entry.jobs)`, not the registry's own order: a running
+// job is what the user opened the popover for, so it must not sit under rows that
+// already finished. The registry only promises *registration* order, and a
+// settled row's registration position says nothing about when it finished.
+console.log("\nrow order (running first, then settled newest-first)");
+{
+  const job = (id, status, startedAt, finishedAt) => ({ id, status, startedAt, finishedAt });
+
+  // The reported shape: a live job registered FIRST, then settled ones — the
+  // registry hands them back in registration order, so the live row would come
+  // first by luck here. The real bug needs the live one registered later.
+  const settledFirst = [
+    job("a-settled-old", "completed", 100, 200),
+    job("b-settled-new", "completed", 150, 400),
+    job("c-live", "running", 300),
+  ];
+  equal(
+    "a running job sorts above settled ones regardless of registration order",
+    orderJobs(settledFirst).map((entry) => entry.id),
+    ["c-live", "b-settled-new", "a-settled-old"],
+  );
+
+  // Two live jobs keep start order, so a long-running command stays at the top
+  // instead of jumping around as the poll re-reads.
+  const twoLive = [job("later", "running", 500), job("earlier", "running", 100)];
+  equal(
+    "live jobs keep start order",
+    orderJobs(twoLive).map((entry) => entry.id),
+    ["earlier", "later"],
+  );
+
+  // `stopping` is still live: it is work that has not settled, and hiding it
+  // among the finished rows would make a stuck stop look done.
+  const stopping = [job("done", "completed", 100, 200), job("stopping", "stopping", 150)];
+  equal(
+    "a stopping job still sorts with the live ones",
+    orderJobs(stopping).map((entry) => entry.id),
+    ["stopping", "done"],
+  );
+
+  // Same-millisecond settlements fall back to start order — the registry's map
+  // iteration must not decide the result.
+  const tie = [job("tie-late", "failed", 200, 500), job("tie-early", "completed", 100, 500)];
+  equal(
+    "rows settled in the same millisecond fall back to start order",
+    orderJobs(tie).map((entry) => entry.id),
+    ["tie-early", "tie-late"],
+  );
+
+  // A settled row with no `finishedAt` (a projection that dropped it) must not
+  // sort as if it finished at the epoch.
+  const noFinished = [job("no-finish", "killed", 300), job("has-finish", "completed", 100, 900)];
+  equal(
+    "a settled row without finishedAt falls back to its start time",
+    orderJobs(noFinished).map((entry) => entry.id),
+    ["has-finish", "no-finish"],
+  );
+
+  // The input must not be mutated: the store hands the same array to every
+  // listener, and an in-place sort would reorder another render's data.
+  const original = [job("x", "completed", 100, 200), job("y", "running", 150)];
+  const snapshot = original.map((entry) => entry.id);
+  orderJobs(original);
+  equal("orderJobs does not mutate its input", original.map((entry) => entry.id), snapshot);
+
+  // The OLD behaviour — registration order — must fail the first scenario, or
+  // this block proves nothing.
+  equal(
+    "OLD: registration order puts a settled row above a live one",
+    settledFirst.map((entry) => entry.id),
+    ["a-settled-old", "b-settled-new", "c-live"],
+  );
 }
 
 /* ---------------------------------------------------------------------------- */

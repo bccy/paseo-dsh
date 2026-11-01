@@ -182,6 +182,17 @@ const CHILD_BUFFER_CAP = 500;
 const MAX_SESSION_ROUTE_ENTRIES = 500;
 
 /**
+ * How many bash `description`s one session may keep for the jobs pill.
+ *
+ * A description exists to title a *live* background job. A turn that runs more
+ * than this many commands has long since settled the earliest ones, so trimming
+ * the oldest entry costs nothing the pill could still draw. The cap exists
+ * because the table is otherwise only emptied at `turn/end`, and a single long
+ * turn is exactly when it would grow without bound.
+ */
+const MAX_TOOL_DESCRIPTIONS = 200;
+
+/**
  * How long a session's next creation waits for the previous close's teardown.
  *
  * The teardown — `handle.dispose()` waiting for idle and closing the session log's
@@ -354,6 +365,28 @@ export class PaseoHarnessServer {
      * bridge never creates, resumes, or prompts a child to learn this.
      */
     this.children = new Map();
+    /**
+     * sessionId -> command text -> the model-written `description` of the bash
+     * call that ran it.
+     *
+     * A background job's `label` is the raw command (`args.command`, set by
+     * `dsh-tool-bash`'s `startJob`), so the composer pill printed shell source
+     * while the tool row right above it already read in Chinese — the same call
+     * carries a mandatory one-line `description` that DSH's own UI titles the
+     * row with.
+     *
+     * **Keyed by the command text, not the call id.** The job's registration
+     * record does carry `toolCall.callId`, but `JobView` — the projection
+     * `registry.list` returns — drops it, so the call id is not reachable from
+     * here. `label` *is* the command string, so that is what both sides can
+     * agree on. A command run twice in one session resolves to its latest
+     * description, which is the right answer for a row that only ever shows one.
+     *
+     * Dropped at `turn/end` and capped per session: a description is only
+     * useful while its job is listed, and a session that runs thousands of
+     * commands must not grow this table for the life of the process.
+     */
+    this.toolDescriptions = new Map();
     /**
      * sessionId -> live assistant assembly for the attempt in flight. Reset by
      * each attempt's `start`, so the bridge never merges two attempts into one
@@ -1954,6 +1987,66 @@ export class PaseoHarnessServer {
   }
 
   /**
+   * Remember the model-written `description` of one bash call, keyed by the
+   * command it ran, so `jobs()` can title a background job in words instead of
+   * shell source.
+   *
+   * Called from `tools/execute`; never throws. A missing description is not an
+   * error — every other tool has none, and an older DSH may drop the field — it
+   * only means the pill keeps showing the command.
+   *
+   * Only `bash` is recorded: it is the producer whose jobs carry a raw command
+   * as `label`. Another producer's label is already its own words.
+   *
+   * @param {{name?: string, arguments?: unknown, agent?: {session?: object}}} exec
+   */
+  rememberToolDescription(exec) {
+    try {
+      if (exec?.name !== 'bash') return;
+      const session = exec?.agent?.session;
+      if (session === undefined) return;
+      const args = exec?.arguments;
+      if (typeof args !== 'object' || args === null) return;
+      const description = /** @type {{description?: unknown, command?: unknown}} */ (args).description;
+      const command = /** @type {{description?: unknown, command?: unknown}} */ (args).command;
+      if (typeof description !== 'string' || typeof command !== 'string') return;
+      const text = description.trim();
+      // `command` is copied verbatim into the job's `label`; keeping the key
+      // untrimmed is what makes the lookup in `jobs()` an exact match.
+      if (text === '' || command === '') return;
+      const sessionId = String(session.id);
+      let byCommand = this.toolDescriptions.get(sessionId);
+      if (byCommand === undefined) {
+        byCommand = new Map();
+        this.toolDescriptions.set(sessionId, byCommand);
+      }
+      // Re-inserting an existing command moves it to the end of the insertion
+      // order, so the eviction below drops the least recently *run* command
+      // rather than the first one this turn happened to use.
+      byCommand.delete(command);
+      byCommand.set(command, text);
+      if (byCommand.size > MAX_TOOL_DESCRIPTIONS) {
+        const oldest = byCommand.keys().next();
+        if (oldest.done !== true) byCommand.delete(oldest.value);
+      }
+    } catch {
+      /* a description is a nicety; it must never break the tool call */
+    }
+  }
+
+  /**
+   * The model-written description of one bash command, if this session still
+   * has it. `undefined` means "no better title than the command itself".
+   *
+   * @param {string} sessionId
+   * @param {string} command - the job's `label`, which is `args.command` verbatim
+   * @returns {string | undefined}
+   */
+  toolDescriptionFor(sessionId, command) {
+    return this.toolDescriptions.get(sessionId)?.get(command);
+  }
+
+  /**
    * Snapshot one file before a tracked editing tool mutates it.
    *
    * Called from `tools/execute`; never throws, because a snapshot problem must
@@ -2510,6 +2603,16 @@ export class PaseoHarnessServer {
    * missing registry and a registry that throws stay apart from it: both go to
    * stderr and answer `available: false`, never a quiet "no jobs".
    *
+   * **`label` prefers the model's own words.** A bash job registers with
+   * `label: args.command`, so the pill printed shell source while the tool row
+   * above it already read in Chinese. The call's mandatory `description` is what
+   * DSH's own UI titles that row with, and {@link rememberToolDescription}
+   * captured it at `tools/execute`. The job's registration record carries the
+   * call id, but `JobView` does not, so the only bridge between them is a
+   * timeline read — done here, best-effort, and only for jobs whose label still
+   * looks like a command. Anything that fails leaves the command in place: a
+   * worse title is not a reason to drop the job.
+   *
    * @param {{sessionId: string}} params - must be the caller's own session id.
    */
   async jobs(params) {
@@ -2535,16 +2638,24 @@ export class PaseoHarnessServer {
     try {
       return {
         available: true,
-        jobs: jobs.list(sessionId).map((job) => ({
-          id: String(job.id),
-          kind: String(job.kind),
-          label: String(job.label),
-          status: String(job.status),
-          startedAt: job.startedAt,
-          ...(job.progress === undefined ? {} : { progress: String(job.progress) }),
-          ...(job.detail === undefined ? {} : { detail: String(job.detail) }),
-          ...(job.finishedAt === undefined ? {} : { finishedAt: job.finishedAt }),
-        })),
+        jobs: jobs.list(sessionId).map((job) => {
+          const label = String(job.label);
+          // The model's own one-line summary of what the command does, when
+          // this session still remembers it. Absent means the row keeps the
+          // command — never a made-up title.
+          const description = this.toolDescriptionFor(sessionId, label);
+          return {
+            id: String(job.id),
+            kind: String(job.kind),
+            label,
+            status: String(job.status),
+            startedAt: job.startedAt,
+            ...(description === undefined ? {} : { description }),
+            ...(job.progress === undefined ? {} : { progress: String(job.progress) }),
+            ...(job.detail === undefined ? {} : { detail: String(job.detail) }),
+            ...(job.finishedAt === undefined ? {} : { finishedAt: job.finishedAt }),
+          };
+        }),
       };
     } catch (error) {
       const message = `listing DSH's background jobs failed: ${error instanceof Error ? error.message : String(error)}`;
@@ -3082,6 +3193,9 @@ export class PaseoHarnessServer {
     this.pendingPlanMode.delete(sessionId);
     this.pendingMcpServers.delete(sessionId);
     this.children.delete(sessionId);
+    // Bash descriptions only exist to title a listed job; a closed session has
+    // no jobs left to list, and the table is per session.
+    this.toolDescriptions.delete(sessionId);
     // A rewind in flight for this session will finish on its own; dropping the
     // marker only stops a later rewind from being refused on behalf of a session
     // that is already gone. (The `finally` in `revert` deletes it again, safely.)

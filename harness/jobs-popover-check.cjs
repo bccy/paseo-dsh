@@ -172,6 +172,25 @@ assert("spinner colour comes from the theme surface", calls(spinnerSource, "ring
 assert("spinner arc receives that colour", shape.jsxElements(spinnerSource).some((element) =>
   element.tag === "RotatingArc" && attr(element, "color").trim() === "color"));
 
+// The title must be able to be the model's own words instead of the command.
+// A row that silently fell back to the command would look fine — it is what the
+// pill did before — so the wiring is asserted rather than eyeballed: the title
+// has to come from `description` (with the command as the fallback), and the
+// command has to stay visible on the facts line when it is no longer the title.
+// Read as source because `jobs-pill.tsx` imports the host runtime.
+assert("the row title prefers the captured description", /const\s+title\s*=\s*titled\s*\?\s*description\s*:\s*job\.label/.test(pillSource));
+assert("a missing description keeps the command as the title", /const\s+titled\s*=\s*description\s*!==\s*undefined/.test(pillSource));
+assert("the command stays visible when the description becomes the title", /titled\s*\?\s*job\.label\s*:\s*undefined/.test(pillSource));
+assert("the title line renders the resolved title, not the raw label",
+  /fontSize:\s*TITLE_FONT_SIZE[\s\S]{0,160}?\{\s*title\s*\}/.test(pillSource));
+
+// The rows must be drawn in `orderJobs`' order, not the registry's registration
+// order: a settled row above a running one is exactly the bug. The pure rule is
+// asserted in `jobs-poll-check.cjs`; this is the wiring that makes it reach the
+// screen, read as source because the module imports the host runtime.
+assert("the popover draws rows through orderJobs", /\{orderJobs\(entry\.jobs\)\.map\(/.test(pillSource));
+assert("the raw jobs array is not mapped directly", !/\{entry\.jobs\.map\(/.test(pillSource));
+
 console.log("\npermission refusal");
 
 const refusal = Object.assign(new Error("Session is not authorized for plugin.rpc.invoke.request code=access_denied"), {

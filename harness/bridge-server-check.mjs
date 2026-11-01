@@ -424,6 +424,109 @@ const present = () => ({
   );
 }
 
+// ===== 4. a bash job is titled by the model's own description ===========
+// The pill printed shell source because `dsh-tool-bash` registers a job with
+// `label: args.command`. Every bash call also carries a mandatory `description`
+// that DSH's own row is titled with; the bridge captures it at `tools/execute`
+// and joins it to the job through the command text, because `JobView` drops the
+// `toolCall.callId` that would be the obvious key.
+{
+  const COMMAND = "grep -rn 'jobs' paseo-plugin/client";
+  const DESCRIPTION = "查 jobs 行如何渲染";
+  const jobsService = {
+    list: () => [
+      { id: 'bash-1', kind: 'bash', label: COMMAND, status: 'running', startedAt: 1 },
+      { id: 'bash-2', kind: 'bash', label: 'make -j8', status: 'running', startedAt: 2 },
+    ],
+  };
+  const { server } = makeServer({ jobs: jobsService });
+  const session = { id: 'jobs-1' };
+
+  // Nothing captured yet: the row must still answer, with the command as its
+  // label and NO description key — an absent key is what tells the client to
+  // keep the old rendering, so inventing an empty string would be a silent
+  // downgrade dressed as a migration.
+  const before = await server.jobs({ sessionId: 'jobs-1' });
+  check(
+    'a job with no captured description carries no description field',
+    before?.available === true
+      && before.jobs.length === 2
+      && !('description' in before.jobs[0]),
+    JSON.stringify(before.jobs[0]),
+  );
+
+  server.rememberToolDescription({ name: 'bash', arguments: { command: COMMAND, description: DESCRIPTION }, agent: { session } });
+  const after = await server.jobs({ sessionId: 'jobs-1' });
+  check(
+    'a captured description is attached to the job that ran that command',
+    after.jobs[0]?.description === DESCRIPTION,
+    JSON.stringify(after.jobs[0]),
+  );
+  check(
+    'the raw command is still on the row',
+    after.jobs[0]?.label === COMMAND,
+    JSON.stringify(after.jobs[0]),
+  );
+  check(
+    "another job's row is untouched",
+    !('description' in after.jobs[1]),
+    JSON.stringify(after.jobs[1]),
+  );
+
+  // A description is per session: another session's identical command must not
+  // inherit this one's words, or two conversations would title each other's
+  // jobs.
+  const other = await server.jobs({ sessionId: 'jobs-2' });
+  check(
+    "one session's description does not leak into another session",
+    !('description' in (other.jobs[0] ?? {})),
+    JSON.stringify(other.jobs[0]),
+  );
+
+  // Only bash is captured. The probe deliberately carries BOTH `command` and
+  // `description`, because that is what makes it discriminating: a `read` call
+  // has no `command` either, so a probe without one would pass on the argument
+  // shape alone and never exercise the name check at all.
+  server.rememberToolDescription({ name: 'bash', arguments: { command: 'make -j8', description: '编译全部目标' }, agent: { session } });
+  server.rememberToolDescription({
+    name: 'read',
+    arguments: { command: 'make -j8', description: '一个 read 调用不该覆盖它' },
+    agent: { session },
+  });
+  check(
+    'a non-bash call records nothing, even when it carries command+description',
+    server.toolDescriptionFor('jobs-1', 'make -j8') === '编译全部目标',
+    String(server.toolDescriptionFor('jobs-1', 'make -j8')),
+  );
+  const mixed = await server.jobs({ sessionId: 'jobs-1' });
+  check(
+    'the job row keeps the bash description after a non-bash call',
+    mixed.jobs[1]?.description === '编译全部目标',
+    JSON.stringify(mixed.jobs[1]),
+  );
+
+  // A blank or missing description must not produce an empty title.
+  server.rememberToolDescription({ name: 'bash', arguments: { command: 'echo hi', description: '   ' }, agent: { session } });
+  server.rememberToolDescription({ name: 'bash', arguments: { command: 'echo hi' }, agent: { session } });
+  check(
+    'a blank description is not recorded',
+    server.toolDescriptionFor('jobs-1', 'echo hi') === undefined,
+    String(server.toolDescriptionFor('jobs-1', 'echo hi')),
+  );
+
+  // Closing the session drops the table, the same way the other per-session
+  // tables are dropped — a closed session has no jobs left to title. Driven
+  // through the public `closeSession` request rather than the private helper,
+  // because that is the path a real provider takes.
+  server.initializedSessions.add('jobs-1');
+  await server.closeSession({ sessionId: 'jobs-1' });
+  check(
+    'closing a session drops its captured descriptions',
+    server.toolDescriptionFor('jobs-1', COMMAND) === undefined,
+    String(server.toolDescriptionFor('jobs-1', COMMAND)),
+  );
+}
+
 const failedCount = results.filter((result) => !result.pass).length;
 console.log(`\n  ${results.length - failedCount}/${results.length} passed`);
 process.exit(failedCount === 0 ? 0 : 1);
