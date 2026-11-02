@@ -24,7 +24,10 @@
   `client/rewind-notice-live.ts` 的实时监视器（live 事件弹一次、重复投递/重挂载不弹、回放/重拉
   不弹、交接窗口、目录观察的 provider/新鲜度/数量上限、失败上报、dispose 释放），以及
   `index.client.tsx` / `index.server.ts` 的接线（renderer 用 shared kind、启动监视器并调用 arm
-  RPC、只注册允许的 hook、不注册 `before("agent.session.open")`）。**动了撤回文案、
+  RPC、只注册允许的 hook、不注册 `before("agent.session.open")`）。本轮补的：兜底 notice 的
+  **降级标记**（server/client 两份常量逐字相等的漂移守卫、双 locale 的「带标记可见 / 无标记仍删」）
+  与 NC-03 的句柄迟到单元场景（`beginRewindReport` 后、`deliver` 前才捕获句柄 → 先建 replacement
+  订阅再 append，超时后 append 有界）。**动了撤回文案、
   `shared/rewind-notice.ts`、`client/rewind-notice*.ts(x)` 或 `index.client.tsx` 的注册必跑。**
   运行：`node harness/rewind-notice-check.cjs`（自己编译到 `paseo-plugin/.dbg-p17-client`）。
 - `harness/rewind-notice-delivery-check.mjs` — 撤回完成提示**能不能确定地到达时间线**：一个进程里
@@ -35,15 +38,22 @@
   `agent.timeline.replacement` **之后**才落（重建会删掉之前的行）；2s 快照写入 + 5s 时间线重建的
   慢宿主下同样成立；行不进 provider history，下一次撤回不会把它复活；拿不到 paseo 句柄时报告
   排队、捕获后补发；canary 仍先于回执；机制半：回执同回合发出的 `session.notice` 被宿主丢弃、
-  而追加的行存活。降级路径（replacement 一直不来）在子进程里用
-  `DSH_PASEO_REWIND_REPLACEMENT_TIMEOUT_MS` 缩短超时驱动。**动了 provider 的 `session.revert`
-  分支、`server/rewind-notice-append.ts`、`index.server.ts` 的句柄捕获/arm RPC，或宿主
-  `agent-manager.js` 的 rewind/hydrate/staging 逻辑必跑。** 运行：
+  而追加的行存活。降级路径在子进程里用
+  `DSH_PASEO_REWIND_REPLACEMENT_TIMEOUT_MS` 缩短超时驱动，本轮固化成两个场景：`--degraded`
+  （超时后等 4 次有界复核跑完，断言最终一行且 stderr 有 `could not be confirmed` 放弃日志）与
+  `--degraded-late`（rebuild 晚于 timeout 到达 → 行被抹 → 补发、两次 append 同一 `noticeId`、
+  最终恰好一行）；另有真实宿主 race 场景（begin 之后、deliver 之前才捕获句柄 → 先建订阅再
+  append，绝不裸 append）。**动了 provider 的 `session.revert`
+  分支、`server/rewind-notice-append.ts`、`index.server.ts` 的句柄捕获/arm RPC、降级复核/补发，
+  或宿主 `agent-manager.js` 的 rewind/hydrate/staging 逻辑必跑**（运行约 40s）。运行：
   `node harness/rewind-notice-delivery-check.mjs`（自己编译到
   `paseo-plugin/.dbg-p17-delivery`；不需要 daemon、不需要模型）。
 - `harness/tool-call-check.cjs` — `client/tool-call-data.ts` 的工具行映射（图标、命令、diff、
-  截断、失败原因、终端卡）。**动了工具行渲染必跑（含失败原因与终端卡：错误只认顶层
-  `item.error.message`，终端正文全量 + 224px 纵向滚动 + 复制）。**
+  失败原因、终端卡）与正文截断口径：**generic 卡（MCP unknown、read/fetch 无 meta、plan、
+  `/command` 输出、agent message）与结构化 diff 卡的 body 不再截断**，改由视图滚动 + 复制全量
+  body（260px，`CODE_MAX_HEIGHT` 的唯一消费者）；仍会截断的只有 legacy 纯文本 diff 回落
+  （6000 + 本地化标记）与 `headline`/`summary`。**动了工具行渲染必跑（含失败原因：错误只认
+  顶层 `item.error.message`；终端正文全量 + 224px 纵向滚动 + 复制）。**
 - `harness/thinking-check.cjs` — 思考行折叠预览：结束后取**第一行**、运行中取最后一个首行已终结
   的段落（都是 DSH 的行为，逐字移植在 `client/thinking-text.ts`），以及折叠行在流式中的宽度
   接线（行测自己的宽度、标签测自己要减掉的那段、行宽由两者相减得出，`useRevealedText` 不许
@@ -82,7 +92,9 @@
 - `harness/jobs-poll-check.cjs` — jobs 轮询状态机（从 JSX 抽到 `client/jobs-polling.ts`，假时钟 +
   假 RPC + 假目录页，不 import React/host）：可见性（有 live 显示 live 数、无 live 隐藏；图标恒为
   转环，仅 `available:false` 保留基线静态 mark）、间隔（可见/隐藏同为 4s、失败指数退避
-  8→16→30s）与抖动、首屏 `pageInfo` 分页与过期页丢弃、终态错误码停轮询。**动了
+  8→16→30s）与抖动、首屏 `pageInfo` 分页与过期页丢弃、终态错误码停轮询，以及**发布去重**：
+  答案签名（`available`/`error`/`code`/`jobs`）未变时不 publish、首答与 `drop` 后重注册必发布、
+  任一真实变化（含 available 回真、错误文案/code 变化）仍发布。**动了
   `client/jobs-pill.tsx` / `client/jobs-polling.ts` / `client/locale.ts` 的 jobs 表 /
   `shared/jobs.ts` 必跑；`jobs-poll.tsconfig.json` 是它的编译配置。**
 - `harness/jobs-popover-check.cjs` — jobs popover 的几何、状态标记、JSX 接线与宿主主题数据；
@@ -159,7 +171,13 @@
   那个模块**（以前只查 `lib/index.js` 一个入口，残缺桥照样报 provisioned、exit 0），完整桥仍
   报 provisioned（这一条是前一条的对照，防止"只会 fail"的检查也算通过）；`bridge-assets.ts`
   取不出键清单时必须 **fail 而不是 warn**——"没能检查"和"检查通过"是两个答案，只有一个可以
-  exit 0（同样带可读清单的对照，免得被"什么都 fail"的 doctor 满足）。**动了 doctor 必跑。**
+  exit 0（同样带可读清单的对照，免得被"什么都 fail"的 doctor 满足）。本轮补的三组契约层判据
+  （用例 11/12/13）：**凭据文档契约**（缺 `version: 1`、0644、非法 `refs` 键名都必须 fail，
+  旧扁平格式仍 ok 并说明会被 DSH 迁移）、**补丁能否被 DSH 应用**（补丁 `name` 写错时 dump
+  告警必须让 doctor fail，干净时 ok）、**profile 就绪**（缺 `package.json`、`bundles` 不含
+  `dsh-paseo-bridge` 都必须 fail，完整 profile ok）。stub `dsh` 的 `--dump-config` 用补丁里的
+  marker 注释模拟 DSH 的判定，**真实组合语义由 `harness/doctor-live-check.mjs` 覆盖**。
+  **动了 doctor 必跑。**
 - `harness/probe-check.mjs` — `paseo-plugin/lib/probe-provider.mjs` 的退出码与泄密防护
   （200+error/HTML 判失败、4xx 回显 Authorization 不得泄 key、全 429 报 unknown、什么都没
   探测到必须非零）。**动了 probe 必跑。**
@@ -337,8 +355,14 @@
 - `harness/local-patches-check.mjs` — `local-patches/` 的纯离线检查（spawn 真实 apply/check
   脚本，`REWIND_PATCH_TARGET` / `REWIND_PATCH_TURNID_TARGET` / `REWIND_PATCH_HOME` 全指向临时
   fixture，不读写已安装宿主）：stale 重建边界（`CALL` 区域之外有语句必须 fail closed、文件
-  不变）与 checker / `apply --check` 的 `host-fields-changed` / `upstream-history-shape-changed`
-  门禁。**动了 `local-patches/apply-rewind-history-truncation.mjs` 或
+  不变）、checker / `apply --check` 的 `host-fields-changed` / `upstream-history-shape-changed`
+  门禁，以及本轮补的两组：**LP-01**（`revert()` 参数名耦合门——apply / `apply --check` /
+  checker 三处同源判 `revert-signature-changed`、apply 拒绝且文件 byte-identical、不注入引用
+  未定义变量的 CALL；带 `ProviderRuntimeSession.revert(token)` decoy 的 fixture 要求诊断指向
+  被打补丁的那个方法）与 **LP-02 残余**（stale 体不可重建时 checker 给
+  `stale-body-unrebuildable`/code 2/`autoPatchable:false`、`apply --check` 不再承诺重建、apply
+  fail closed 文件不动；可重建仍 `stale-body`/code 1 且 `apply --check` 提供原地重建）。
+  **动了 `local-patches/apply-rewind-history-truncation.mjs` 或
   `local-patches/check-rewind-patch.mjs` 必跑。**
 - `harness/fake-dsh-bridge.mjs` 的**默认行为变严**：`session/prompt` 现在按会话校验
   `initialize`（文案与真桥一致），漏发 `initialize` 的插件 bug 不再在假桥上一路全绿——`f084c33`
@@ -355,6 +379,149 @@
   （无嵌套树、标签内注释、属性表达式里的模板字面量），读不出来就**跳过而不猜**（fail closed）。
   **动了它的 JSX/调用读取规则必跑所有 `require` 它的检查**（`grep -l source-shape harness/*`
   看当前集合，别按记忆列名单）。
+
+## 2026-11-03 补齐的登记
+
+下面这些脚本此前没有条目（撤回链的 12 个与 4 个假桥脚本只在 `AGENTS.md` 有一行命令，5 个
+`p003-*` 两处都没有索引，`plugin-check.cjs` 与 `route-test.mjs` 只按 basename 被提及），本轮按
+各自文件头注释补齐。撤回链的执行顺序另见 `AGENTS.md`「撤回（rewind）」一节；这里只写断言与
+触发条件。
+
+### 撤回链（离线）
+
+- `harness/revert-check.mjs` — 桥的撤回规划与接线：只有 `user/message` + `source.kind="user"`
+  才是撤回目标（注入的 user-role 消息永不解析）、区间取自 `session.surface.nodes`（compacted
+  或已撤回的消息拒绝）、令牌解析与前置条件、回执形状、文件层、**canary 先于
+  `request.completed`**、共享子进程接线；接线部分编译插件后用真实 `DshSession` + 假进程传输
+  做行为断言，不是源码正则。**动了 `dsh-bridge/lib/revert.js`、`provider.ts`/`session.ts` 的
+  撤回分支或 `server.js` 的 revert 事务必跑。**
+- `harness/surface-check.mjs` — 重放折叠（`dsh-bridge/lib/surface.js`）：只折本桥撤回缝
+  （空 `system/message` 替换，含被撤回合的尾随日志事件）、compaction 的 `user/message` 替换
+  不折（折了会丢用户已读的对话）、DSH 系统提示维护不折、无法对当前 surface 解析的替换不改变
+  任何东西（绝不猜）。**动了 `surface.js` 或 `replayHistory` 的折叠必跑。**
+- `harness/file-snapshot-check.mjs` — 撤回的文件层（`dsh-bridge/lib/file-snapshots.js`）：写前
+  状态按工具调用捕获、成功才提交；目标之后新建的文件被删、改过的恢复最早 post-target 内容、
+  没动过的不碰；bash 与用户自己的改动永不记录；`str_replace_editor` 只认写命令；恢复前 rescue；
+  一条路径失败不打断其余；同一路径两次捕获按读到的字节顺序排序（含第一次读被扣住时）。**本轮
+  补的失败面**：读后捕获失败（objects 建不了 / 对象写失败 / 父身份 realpath 失败）与 journal
+  写不进都落 skip/unrecoverable 并进回执（不再报「这条消息之后没有改动文件」）；损坏对象
+  （截断或同长度哈希不符）不写回用户文件、不产生 rescue；写已原子落盘后被判 `isError` 仍落
+  journal 行（会话关闭路径在 dispose 之后结算）；并发 `planRestore` 等得到另一个调用者正在
+  结算的关闭快照（R4）；`isError` 变更判定先比长度、长度相同才读哈希（R1）。**动了
+  `file-snapshots.js` 的 capture/commit/restore/journal/GC 或 `server.js` 的关闭与回执接线必跑。**
+- `harness/snapshot-lifecycle-check.mjs` — 捕获序号必须跨进程重启续数：第二个实例接着第一个
+  的编号、跨该边界的撤回仍恢复原始 pre-image；并行父子捕获顺序反转仍取最早捕获；失去又拿回
+  写者身份的进程重读 `beginOwner` 高水位；旧 journal（无 `captureOrderVersion`）有歧义时
+  `planRestore` 拒绝而不是猜，并保留 journal 与备份作为证据。**动了 `FileSnapshots` 的序号/
+  所有权或 `planRestore` 的 journal 版本判定必跑。**
+- `harness/file-mutation-gate-check.mjs` — 根作用域文件写入闸门：`freeze` 排空在飞写入并挡住
+  新写入、释放后按序准入且 map 归零；排队写入被 abort 后不泄漏 waiter；超时的 `freeze` 重开
+  准入（否则一次慢写入会永久拒绝该会话后续编辑）；根之间互不影响；同根第二次 `freeze` 被拒
+  而不是排队。**动了 `file-mutation-gate.js` 或撤回的 freeze/drain 接线必跑。**
+- `harness/factory-ownership-order-check.mjs` — `beginOwner` 的接线：真实
+  `PaseoHarnessServer.createSession` 必须在 factory 的 `setup` 里、第一笔捕获之前为会话续读
+  journal 高水位，且序号尊重别的进程已推进的高水位（`snapshot-lifecycle-check` 只证明机制、
+  证明不了桥用了它）。**依赖本机 DSH 安装，不进 CI；动了 `server.js` 的 createSession 接线或
+  `FileSnapshots.beginOwner` 必跑。**
+- `harness/rewind-merge-check.mjs` — 父子文件归并（`snapshot-owners.js` / `child-anchors.js` /
+  journal 归属）：子与孙都解析到根、断链 fail-open、子编辑落根 journal 且子无自己的 journal、
+  独立会话树不交叉、孙锚定在直接父正在跑的回合而不是根最新消息。**动了 `rootSessionFor` /
+  `recordDelegatedTurn` / `observeDelegatedTurn` / `snapshotAnchorFor` 必跑。**
+- `harness/revert-shape-probe.mjs` — 撤回写本身的真实 DSH 形状（纯内存离线，用本机已装
+  `@deepseek-ai/dsh-session`，`DSH_SESSION_MODULE` 可覆盖路径）：空 `assistant/message` 替换
+  必被拒（曾导致每次真实 append 抛错）、`system/message` + 空内容 + `sourceEventSeqs` 被接受、
+  被撤回合离开 `surface.nodes`/`deriveMessages()`、marker 不进上下文、原始日志只增不删。
+  **改了替换事件形状必跑。**
+- `harness/replay-fidelity-probe.mjs <session.v4.jsonl.zstd>` — 用真实多帧 zstd 会话日志跑同一
+  折叠：人类转写必须全部重放，本桥撤回缝只丢自己那一段；日志只读，解不开要报错、不静默当空。
+  **动了 `surface.js` 的折叠或 DSH 日志形状必跑。**
+- `harness/rewind-e2e.mjs` — 真 `dsh --profile paseo` 的 3 回合端到端（耗 token，默认一次性
+  `DSH_HOME`）：替换写入、重放折叠、文件回退、原始日志无 `command/run`、模型只记得 ALPHA 不
+  记得 BETA。**动了撤回任一层、要出包前必跑。**
+- `harness/rewind-merge-e2e.mjs` — 真机父子归并（耗 token）：父写 + 子代理写 → `both` 撤回 →
+  两个文件都删、根 journal 两行、子会话无 journal。**动了父子归并必跑。**
+- `harness/rewind-native-check.mjs` — 经真实 daemon 的撤回（`agent.rewind.request`，耗 token，
+  必须 `--allow-real-daemon`）：被撤消息消失、provider session id 不变、撤回期间无 loading、
+  后续回合看不到被撤内容。它走宿主 `agent-manager.rewind()`，桥的离线脚本到不了那一层。
+  **改了宿主侧撤回行为后跑，跑完人工核对真机六步。**
+
+### 假桥驱动的插件层回归
+
+- `harness/steer-check.cjs` — 插话回执（假桥 `DSH_FAKE_MODE=steer`）：running 状态先于 prompt
+  回执（真 DSH 的顺序）；只有 prompt 结果是 `steer` 且 `turnId` 等于宿主绑定的回合才算送达，
+  否则回退取消+替换（复刻宿主 `steerOrReplaceActiveTurn`）；每帧进 `DSH_FAKE_LOG`，断言打在
+  协议边界。**动了 `session.ts` 的 steer 分支或 `provider.ts` 的插话转发必跑。**
+- `harness/mcp-injection-check.cjs` — Paseo 注入的 MCP server 必须真的到 DSH：per-session
+  `paseo/mcp/set { sessionId, entries }` 帧、HTTP 与白名单 stdio 走 gateway、非白名单 stdio
+  仍原生、legacy SSE 按名字拒绝。**动了 `mcpEntries()` / gateway 分派 / `paseo/mcp/set` 必跑。**
+- `harness/assistant-stream-check.cjs` — 助手文本流式（假桥 `DSH_FAKE_MODE=stream`）：一步内
+  多个增长快照、同 id 且 `messageId` 相同、durable `assistant/message` 落在同一 id、
+  reasoning 同样；按 Paseo 自己的两条折叠规则投影后每类恰好一行。**动了流式
+  （`agent/assistant-stream` / `paseo/assistant-delta`）必跑；真实端到端另跑 `stream-probe.mjs`。**
+- `harness/image-check.cjs` — 图片工具结果（假桥 `DSH_FAKE_MODE=image`）：带 `hostPath` 的图片
+  块恰好多出一条 markdown `assistant_message`、路径逐段编码、无 `hostPath` 不出行、过
+  `ProviderEventSchema`、`history: "replay"` 重建同一条。**动了图片块翻译必跑。**
+
+### 真实 profile / 诊断工具
+
+- `harness/plugin-check.cjs` — 插件层总检（驱动真实插件，无 daemon）：`session.usage` 真实
+  计数与 turn id、非文本内容块到达 DSH、不支持的输入类型 `request.failed`（不是
+  `request.completed`）。默认一次性 `DSH_HOME`（克隆源 profile），`--allow-real-profile` 才用
+  live home；`--self-test` 只验证编译产物加载与图片块翻译。**动了插件层必跑（含真实模型回合，
+  耗 token）；改判据后先跑 `--self-test`。**
+- `harness/route-test.mjs` — 逐条路由跑真实回合，按终态分类 WORKS/FAILS/TIMEOUT/CANCELED/
+  EMPTY（不按"有没有文本"判），全部 WORKS 才 exit 0；默认一次性 `DSH_HOME`。**动了 catalog/
+  路由，或要选模型前跑（耗 token）。**
+- `harness/catalog.mjs` — 用 `dsh --profile` 自己报的 catalog 列出 provider / 模型 / 每个模型
+  的真实思考档位（诊断工具，读真实 profile，不起回合）。**怀疑「模型列表为空 / 档位不对」时
+  先跑它。**
+- `harness/probe.mjs` — 不经 Paseo、直接驱动 `dsh --profile paseo` 的 JSON-RPC 端到端：initialize
+  → 提问 → 提问卡（`paseo/question`）→ `paseo/plan/get|set` → `paseo/config/set`，帧落
+  `frames-probe.jsonl`。**桥单独排障、改提问卡/plan/思考档位必跑（耗 token）。**
+- `harness/stream-probe.mjs` — 真实 `dsh --profile paseo` 的流式端到端：多个
+  `paseo/assistant-delta` 早于 durable `assistant/message`、快照单调增长、最后一个覆盖全文、
+  首帧远早于 durable；默认一次性 `DSH_HOME`。**动了流式必跑（耗 token）。**
+
+### p003 组（真实 DSH 的 approval / projection 契约）
+
+- `harness/p003-live-support.mjs` — **不是独立检查**：p003 组共用的一次性 `base+bridge` profile
+  构造器（用你已有的 route/凭据，不写 live profile、不改已装 DSH）。
+- `harness/p003-bridge-check.mjs` — 真实桥模块 + 记录型 transport：controller/live projection
+  语义（结果与 `AbortSignal` 原样透传、真实 snapshot 语义、不创建 agent/不缓存）、cold read
+  关闭观察、projection 失败与取消要响亮、`bridge dispatch` 的键选择与畸形/未知键拒绝、prompt
+  注册与 scope、审批 waterfall（外来请求下传、自己的请求回 DSH 词表）、超时/撤回/畸形应答、
+  回合取消穿透到反向请求。无 profile/模型调用。**动了 `approval.js` /
+  `session-projections.js` / prompt 注册或 projection 读取必跑。**
+- `harness/p003-permission-check.cjs` — 真实 `DshProcess` + `DshSession`、只把 stdio 对端换成
+  脚本：权限卡的请求-回执生命周期（deny/allow 行为、resolved 计数、超时/取消的响亮失败与
+  notice、重复应答、会话关闭时在飞权限卡的结算）；不起模型/daemon。**动了权限卡翻译或
+  `respondToPermission` 的接线必跑。**
+- `harness/p003-approval-preflight.mjs` — 真 DSH + 无害模型调用：断言 `approval/asked` →
+  `approval/decided` 的真实配对与拒绝路径，且 `never` 策略绕过 answerer。**耗 token；动了审批
+  接线后跑。**
+- `harness/p003-live-check.mjs` — 真实插件 + 真实 DSH + 配置的模型：per-session systemPrompt
+  到达模型且 A/B 隔离、取消撤回真实审批后会话仍可用、真实 workflow/goal 行快照、后台工作流
+  跨回合、重开后重放同一终态、冷 projection 读取（含未知键拒绝）、所有事件过
+  `ProviderEventSchema`（一次性 profile/session 状态）。**耗 token；改了 activity 投影/
+  持久化/事件形状必跑。**
+
+### 本轮新增（2026-11-03）
+
+- `harness/doctor-live-check.mjs` — 真 `dsh` 的 doctor 契约回归（DLV-01/02/03）：一次合规安装
+  + 每个缺陷（凭据缺 `version: 1` / 0644 / 非法 ref 名、补丁 `name` 写错被 DSH 跳过、profile
+  缺 `package.json`、`bundles` 不含桥）都断言 doctor 的判定与退出码，并用
+  `dsh --profile <p> --dump-config` 与 DSH 自己的 `parseCredentialsDocument()` 交叉验证夹具就是
+  它声称的形状。**真 DSH、不耗 token、不碰 daemon、不写真实 `~/.dsh`；不进 CI**（CI 没有 DSH
+  安装）。动了 doctor 的 profile/补丁/凭据检查或 DSH 升版后必跑。
+- `harness/dsh-binary-check.mjs` — 显式 `DSH_BINARY` 不可用时不得静默回退到 PATH 上的 `dsh`：
+  不存在的路径、不可执行的文件、目录都让 `start()` 点名失败且**不 spawn**；未设置时保持历史
+  行为（`spawn("dsh")`）；有效路径逐字使用（阳性对照）。编译插件后把 `child_process.spawn`
+  换成记录器，红态（回退）也不会真起 `dsh`。**动了 `resolveBinary()` 或 `DSH_BINARY` 语义必跑。**
+- `harness/subagent-history-check.cjs` — 子代理 `paseo/history` **抛错**必须与
+  `available:false` 对称：发「子代理历史读取失败」notice、丢掉回放窗口内为该子会话缓冲的帧
+  （判据是第二次成功回放后那帧不出现；同一帧正常回放的行 `REPLAYED-H` 必须出现，否则"没出现"
+  可能只是回放没跑）。真实 `DshSession` + 假 `DshProcess`，不 spawn、不连 daemon、一次性
+  `DSH_HOME`。**动了 `session.ts` 的 `replaySubagents` 失败分支必跑。**
 
 上面清单之外还有四个容易被当成同类、其实不是的：`harness/tools.mjs`（真 `dsh` 的工具目录
 转储）、`harness/subagent-live.mjs`（实机子会话可见性）、`harness/fake-dsh-bridge.mjs`

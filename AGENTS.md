@@ -56,7 +56,7 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon fork 出的 p
 
 ### 改之前先读
 
-- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 七十余条真实缺陷（编号到 77，含 `b`/`c`
+- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 八十余条真实缺陷（编号到 84，含 `b`/`c`
   补记与 DSH 升版教训；历史段落里 22–25、46–47 有重号，引用旧条目时带标题）。里面有整整一类错误叫
   **静默降级**（把不知道的东西当成成功、把不支持的能力悄悄丢掉）。改动前先看一遍，
   避免重新发明这些 bug。
@@ -235,6 +235,8 @@ DSH 会话，超过 64 KiB 的工作区指令预算时 DSH 会丢掉用户的 `~
 
 ```bash
 node harness/revert-check.mjs          # 令牌/区间/前置/回执/文件层/canary 顺序/共享进程接线
+node harness/rewind-notice-check.cjs   # 完成提示的客户端半（文案/计数/旧 notice 过滤/live 监视器）；动了撤回文案或客户端监视器必跑
+node harness/rewind-notice-delivery-check.mjs  # 完成报告能否确定到达时间线、降级窗口（--degraded/--degraded-late）；动了 report 落行逻辑或宿主 rewind 时序必跑
 node harness/surface-check.mjs         # 只折撤回缝、compaction 保留、尾随日志事件
 node harness/file-snapshot-check.mjs   # 写前备份；动了 capture 读/序号绑定、skip 载入、planRestore 的 unrecoverable、restore 目录身份复核必跑
 node harness/snapshot-lifecycle-check.mjs  # 捕获序号跨重启续数、旧 journal 歧义拒绝（纯离线）
@@ -259,10 +261,15 @@ node harness/rewind-native-check.mjs   # 经真实 daemon 的撤回（耗 token�
 3. 重放折叠只折本桥撤回缝；compaction 的 replace 不折，否则重开会话丢压缩前对话。
 
 **第四条：撤回提示（canary）必须在 `request.completed` 之前发出。** 宿主的时间线只能追加、
-协议里没有"删行"事件，所以插件用一条通知自证这次撤回到底刷没刷新：打过截断补丁（或将来上游
-修好）的宿主会在回执里把 history 截到撤回点，那条通知随被撤行一起消失；原版宿主会留下它，
-告诉用户执行 Reload agent 或重开会话。**顺序就是机制本身**——放到回执之后，补丁宿主上它也会
-留下来，变成「时间线没刷新」的误报。文件作用域（`scope: "files"`）的撤回不动对话，不发。
+协议里没有"删行"事件，所以插件用一条通知自证这次撤回到底刷没刷新。可见性分三层：**live 投递
+看不到**（撤回期间宿主持有 run lock，`enqueueSessionEvent` 把通知压进 `stagedEvents`，run
+settle 时一起丢弃）；**原版宿主**在 `revert()` 返回后的 force-hydrate 里从 provider history
+重放（`accept()` 先入 history、`streamHistory()` 重放），于是它出现在重建后的时间线，告诉用户
+执行 Reload agent 或重开会话；**打过截断补丁的宿主**在 `revert()` 内被 `truncateHistoryFrom`
+截掉（预期行为，看不到）。**顺序就是机制本身**——放到回执之后，补丁宿主上它也会留下来，变成
+「时间线没刷新」的误报。文件作用域（`scope: "files"`）的撤回不动对话，不发。依据是已装宿主
+0.14.0 的 `plugin-provider.js` / `agent-manager.js`；**未在「未打补丁宿主 + 真实 daemon」上
+复验**，复验前别删改 canary。
 
 **`harness/host-contract-sim.mjs`** 是这条规则的唯一直接证据：它直接 import 宿主真实的
 `plugin-provider.js`（只读），驱动一次撤回，再断言 canary 在**补丁版被截掉、原版存活**；

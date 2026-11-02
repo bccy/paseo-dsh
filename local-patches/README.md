@@ -84,6 +84,13 @@ env -u NODE_OPTIONS node ~/.paseo/local-patches/check-rewind-patch.mjs
 `rewind-patch.status.json` 属于本机状态，部署副本自己会写）。systemd 的 `ExecStartPre` 与
 `NODE_OPTIONS` 钩子都指向部署副本，所以同步完还要重启 daemon 才会真正生效。
 
+⚠️ **`apply` 与 `check` 必须一起同步。** 新版 `check-rewind-patch.mjs` 直接 import
+`apply-rewind-history-truncation.mjs` 导出的 `planRewindRebuild` / `revertSignature` /
+`describeRevertSignature`（stale 重建可行性、`revert()` 签名门与诊断文案三处共用同一判定）。
+只换其中一个会让 checker 在 `import` 阶段就失败；而 `ExecStartPre` 带 `-` 前缀是软失败，
+体检工具坏掉时 daemon 仍会启动，补丁却可能停在半态。`cp local-patches/*.mjs
+local-patches/*.cjs ~/.paseo/local-patches/` 一次拷全即满足。
+
 ### 从旧版本升级（含已退役的 `childRunning`）
 
 顺序不能换：**先用旧脚本回滚 → 再同步新脚本 → 再 apply → 再重启 daemon**。第 1 步不能省，
@@ -120,7 +127,9 @@ node apply-rewind-history-truncation.mjs --revert   # 全部回滚
 ```
 
 退出码见 `UPGRADE.md`。要点：`check` 与 `apply` 各有一套 exit code，数字含义不同；
-`apply` 的 `3` 是 DEGRADED（补丁在、体是旧的、重建失败），`check` 的 `3` 是目标文件不存在。
+`apply` 的 `3` 是 DEGRADED（补丁在、体是旧的、重建失败），`check` 的 `3` 是目标文件不存在；
+`check` 的 `2` 现在也覆盖 `revert-signature-changed` 与 `stale-body-unrebuildable`——两者都表示
+**apply 会拒绝且不写文件**，不要靠「再跑一次 apply」去修。
 
 ## 环境变量
 

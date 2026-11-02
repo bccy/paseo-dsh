@@ -2786,6 +2786,130 @@ history，重建时不会像旧 notice 那样复活、越积越多。顺序改�
 
 ---
 
+## 第十九轮：2026-11-03 全量审查修复轮
+
+**背景**：2026-11-03 的 24 路只读全量审查（[FULL-AUDIT-20261103.md](./FULL-AUDIT-20261103.md)）
+给出 22 条 P2，修复分成 6 个包（A bridge / B notice / C session+process / D client / E doctor /
+F local-patches）+ 一个文档包。逐条结果见主报告 §12。这里只记五条能直接当判据的。
+
+### 80. 文件恢复失败被吞：撤回把「没恢复」报成「没改动」（BF-01/02/03）
+
+**症状**：工具成功、文件已改，但撤回报告「这条消息之后没有改动文件」，文件仍是改后状态；
+或损坏的 pre-image 被写回用户文件并报 `restored`。
+
+**根因**：三条都在文件恢复路径上。① `capture()` 在读**完**字节之后的失败（objects 建不了、
+对象写失败 ENOSPC/EACCES、父目录 realpath 失败）只写 stderr，不产生 skip 行，
+`planRestore` 返回空动作；`commit()` 的 journal append 失败同样只进 stderr——更糟的是对象已
+写成功但 journal 行失败，该对象失去引用，GC 之后唯一的重试材料没了。② 写已原子落盘
+（rename 完成）之后结果才被判 `isError`：撤回自己的 settle 取消在飞编辑的竞态、或会话关闭
+先清桥表再 dispose，`commit` 丢弃 pending、journal 漏行。③ content-addressed 对象只 `stat`
+存在性，截断/损坏对象被当有效 pre-image 写回。
+
+**修法**：`cc30244`。capture 读后失败与读前失败走同一条 `#recordSkippedCapture`；journal 写
+不进时记内存台账（`#noteUnrecorded`），`planRestore` 并进 `unrecoverable`，GC 保护台账对象
+（进程重启后丢失是显式边界，不冒充已修）；`commit` 在 `isError` 时按内容判断是否真的变了
+（先比长度、长度相同才读哈希），变了才落行；会话关闭改 `abandonSession` + dispose **之后**
+结算；restore 前校验对象长度与 sha256，不符进 `failed`、不写用户文件、不产生 rescue。
+
+**检查**：`file-snapshot-check`（95 条，含读后失败 / 损坏对象 / `isError` 已落盘 / 并发结算）、
+`rewind-transaction-check` 22 条。变异：撤掉 restore 的哈希校验 → 92/3 红；把关闭路径换回旧
+`discard` → 关闭时已落盘的那条 journal 行消失。
+
+**教训**：**「捕获失败」和「没有改动」在回执里必须是两个答案**；失败通道本身也可能失败
+（journal 写不进），此时内存台账是唯一还能让回执诚实的通道，但必须写清它不持久。另外，
+**「失败」不能只看 `isError`**——判断写没写进去要看磁盘事实，不是看调用结果。
+
+### 81. 并发结算漏行：`settle()` 看不到「已被另一个调用者认领、仍在飞」的关闭快照（R4）
+
+**症状**：撤回计划漏掉一个已落盘路径、`unrecoverable` 为空 → 回执声称成功，文件仍被改；
+随后的 prune 还可能删掉该行，第二次撤回再无材料。
+
+**根因**：teardown 侧的 `settleAbandoned()` 先把 entry 从 `#abandoned` 删除、再 await
+`#pendingChanged`/append；此时 `planRestore` 的 `settle()` 看到 map 已空立即返回，在 journal
+行落盘前读 journal。根撤回与子会话 close 的 teardown 可以并发，窗口 = 一次 readFile+append。
+
+**修法**：`cc30244`（round2）。新增 `#settling`（key → 认领任务 promise），
+`settleAbandoned()` 先把未认领条目登记进 `#settling` 再异步处理，随后 await 所有在飞认领并
+循环补认领；并发调用者从 `#settling` 等到结果。
+
+**检查**：`file-snapshot-check` 新增「a plan waits for a closing snapshot another caller is
+settling (R4)」；变异（`settleAbandoned` 换回一次认领 + `Promise.all`）→ 94/1 红，恰为该用例。
+
+**教训**：**「先删后 await」在并发下等于把在飞工作从可见集合里摘掉**；任何「清空表 → 异步
+处理」的模式都要有一个 in-flight 集合让后来者能等。
+
+### 82. 降级分支零覆盖仍全绿（HB-01）
+
+**症状**：`rewind-notice-delivery-check` 在删掉超时后的复核调用之后**仍然 4/4 通过**——它要防
+的「重建抹行、静默丢提示」这条路径从未被任何断言执行过。
+
+**根因**：降级场景用 300 ms 超时驱动，但夹具里的重建远快于超时，「补发」分支从未触发；检查
+只覆盖了正常路径。**这和检查是否全绿无关**：它绿的是「正常路径没回归」，不是「降级路径正确」。
+
+**修法**：`460bd11`。delivery-check 新增两个子进程场景：`--degraded`（超时后等 4 次有界复核
+跑完，断言最终一行且 stderr 有放弃日志 `could not be confirmed`）与 `--degraded-late`（rebuild
+晚于 timeout 到达 → 行被抹 → 补发、两次 append 同一 `noticeId`、最终恰好一行），父进程再断言
+子进程 stderr 的补发/放弃日志。
+
+**检查**：删掉 `if (!replaced) await verifyReportSurvived(...)` 一行 → 43 条里 39 通过 / 4 红
+（`--degraded-late` 4/8）；恢复后 43/43。
+
+**教训**：**新增检查必须用变异证明会红，尤其「降级 / 超时 / 补发」这类分支**——它们的触发
+条件比正常路径苛刻，夹具很容易只跑到正常路径。反过来，一个从未在日志里出现过的分支，等于
+没有断言。
+
+### 83. doctor 的契约层假绿：用 DSH 自己的解析器和 dump 判定（DLV-01/02/03）
+
+**症状**：doctor 全绿 + exit 0，但真实 DSH 启动/装载失败：① `.credentials.yaml` 缺
+`version: 1`、0644、非 POSIX `refs` 键（三种都让 DSH credentials 服务激活失败）；② 补丁条目
+`name` 写错，DSH 打印 name mismatch 后静默跳过，dump 仍是 base 路由；③ profile 缺
+`package.json` 时 DSH 报 profile 不存在，`bundles` 不含 `dsh-paseo-bridge` 时桥根本不装载。
+而且 doctor 自己的修复建议与 README 推荐流程恰好产出①那种文件。
+
+**根因**：doctor 只查「东西在不在」，不查「DSH 会不会接受」。凭据契约、补丁可应用性、profile
+组合语义都是 DSH 的判定，第三方复刻必然漂移。
+
+**修法**：`a686c4b`。凭据按 DSH `parseCredentialsDocument()` / `assertOwnerOnly()` /
+`credentialRef()` 同口径判（旧扁平格式仍判 ok，因为 DSH 会就地迁移）；补丁与 profile 组合改用
+`dsh --profile <p> --dump-config` 的真实告警判定（本 profile 的 patch 跳过 = fail、桥 bundle
+被跳过 = fail、其它层只 warn，避免误红用户的跨 profile home 补丁）；profile 就绪校验
+`package.json` 与 `dsh.profile.bundles`。README 两处凭据写法同步改为合规。新增
+`harness/doctor-live-check.mjs`（真 DSH、不耗 token、不进 CI）用真实 dump 与真实解析器交叉验证；
+`doctor-check` 用 stub dump 保留离线红绿。
+
+**检查**：`doctor-check` 37→53；`doctor-live-check` 18/18；变异（缺桥分支改成 `ok`）→ 52/53 红，
+且自建场景 G 同时假绿。
+
+**教训**：**契约层的「通过」只能由契约的所有者判定**——能调公开 CLI（`--dump-config`）或同一
+解析器就不要自己复刻；复刻出来的第二套判定，绿的时候最危险。另外，**诊断工具的修复建议也是
+产物**：它建议的写法必须自己先过一遍真实校验。
+
+### 84. canary 可见性分三层：live 丢弃、stock 重放、补丁截断（DC-01）
+
+**症状**：四份文档三种口径（「一闪而过」/「留在底部」/「根本看不到」），跨 lane 结论相反；
+维护者可能据此认为 canary 无效而删改它。
+
+**根因**：只看了其中一层。live 投递确实被宿主 rewind 的 run lock 吞掉（`enqueueSessionEvent`
+压进 `stagedEvents`，`clearRun` 时丢弃）；但 `accept()` 在 emit 之前先把它推进
+`PluginAgentSession.history`，conversation/both 撤回的 force-hydrate 走 `streamHistory()` 重放，
+于是 canary 出现在重建后的时间线；打过截断补丁的宿主则在 `revert()` 内被
+`truncateHistoryFrom` 截掉，看不到是**预期**行为。
+
+**修法**：只改文档口径、不动 canary 行为（`docs/REWIND.md`、`AGENTS.md`、`README.md` /
+`README.en.md`、`docs/ADOPTION.md` 统一为三层表述；依据已装宿主 0.14.0 的
+`plugin-provider.js` 与 `agent-manager.js`）。**对应提交**：无代码提交，文档改动属
+2026-11-03 修复轮的 G-docs 包（见主报告 §12）。**未在「未打补丁宿主 + 真实 daemon」上复验**，
+复验前不要删改 canary。
+
+**检查**：`host-contract-sim.mjs` 断言的是 provider history 缓冲区（补丁版被截、原版存活），
+不是 daemon 时间线；live 那一层的证据是 `rewind-notice-delivery-check.mjs` 的 `info` 行与宿主
+`stagedEvents` 源码。
+
+**教训**：**「用户看得到」要拆成「事件发出去了」「宿主收下了」「时间线重放时还在不在」三层
+分别取证**；任何一层缺失都会让结论反过来，而文档口径错误会直接导致「删掉一个其实有效的机制」。
+
+---
+
 ## 关于"哪条路由能用"
 
 这份记录里刻意不提任何具体的 provider、模型或端点——**你的路由和模型完全由你的

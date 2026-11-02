@@ -73,10 +73,16 @@ node ~/.paseo/local-patches/check-rewind-patch.mjs
 | exit | 含义 | 该做什么 |
 |---|---|---|
 | `0` | 补丁在位且实现体是最新的 | 无需动作，直接重启 |
-| `1` | 需要跑一次 apply。两种情形：① 补丁不在位但锚点各命中 1 次（可自动打）；② 标记齐全但**实现体是旧版**（`state: stale-body`，需重建）。**要区分请看 `state`，不要只看 exit code** | 也无需动作：下次启动 daemon 时 `ExecStartPre` 会自动打上。想立刻确认就手动跑一次 `node ~/.paseo/local-patches/apply-rewind-history-truncation.mjs` |
-| `2` | 锚点失配 / 半打补丁 → **需人工** | 见下面第 3 节 |
+| `1` | 需要跑一次 apply。两种情形：① 补丁不在位但锚点各命中 1 次（可自动打）；② 标记齐全但**实现体是旧版**（`state: stale-body`）且**可原地重建**。**要区分请看 `state`，不要只看 exit code** | 也无需动作：下次启动 daemon 时 `ExecStartPre` 会自动打上。想立刻确认就手动跑一次 `node ~/.paseo/local-patches/apply-rewind-history-truncation.mjs` |
+| `2` | **需人工**，apply 会拒绝且不写文件。三类：① 锚点失配 / 半打补丁；② `state: revert-signature-changed`（上游改了 `revert()` 签名，门禁不通过）；③ `state: stale-body-unrebuildable`（实现体是旧版且**无法原地重建**） | 见下面第 3 节。②③ 都**不要**再跑 apply——先重装 `@getpaseo/cli` 拿回干净文件，再按新上游形状改锚点/签名 |
 | `3` | 目标文件不存在 | paseo 可能没装好，或安装路径变了。先 `which paseo` / 确认 `@getpaseo/server` 是否在预期位置 |
 | `4` | **上游已自行修好撤回** → 补丁该退休 | 按第 5 节删掉补丁。别让它继续滞留（否则每次撤回都刷一条假告警） |
+
+> 上表 `1` 的 `stale-body` 只指**可重建**的情形；不可重建现在是 `2` 的
+> `stale-body-unrebuildable`，不再承诺「跑一次 apply 就好」。`--json` 里对应的机器字段：
+> `revertSignatureFound`（门禁看到的 `revert()` 签名）、`rebuildBlockedReason` /
+> `rebuildBlockedDetail`（stale 体为什么不能重建）；`rebuildBlockedReason` 与 apply 实际写进
+> `rewind-patch.status.json` 的 reason 是**同一个值**（三处共用 `planRewindRebuild`），不是猜的。
 
 `apply-rewind-history-truncation.mjs`（会写文件，`ExecStartPre` 与启动钩子跑的就是它）：
 

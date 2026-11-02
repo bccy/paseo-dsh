@@ -345,13 +345,19 @@ degrade:
 
 | Capability | With the patch | Without the patch |
 |---|---|---|
-| **Rewind** (conversation + files) | the UI refreshes immediately and the "rewind applied" notice at the bottom flashes past | the rewind **has already taken effect**: the conversation, the files the agent changed and the model's memory of them in context are all rolled back (the next request cannot see the rewound content, see the note about memory plugins below); the UI just does not refresh itself — the "rewind applied" notice appears at the bottom, and **Reload agent** or reopening the session shows the result |
+| **Rewind** (conversation + files) | the UI refreshes immediately; the "rewind applied" canary is cut off by `truncateHistoryFrom` and is not visible (expected) | the rewind **has already taken effect**: the conversation, the files the agent changed and the model's memory of them in context are all rolled back (the next request cannot see the rewound content, see the note about memory plugins below); the UI just does not refresh itself — the canary does not reach the live timeline (the host's rewind run lock drops it), but it is replayed from provider history when the timeline is rebuilt, telling the user to run **Reload agent** or reopen the session to see the result |
 | **"Running" on a second subagent dispatch** | same as the right column (that patch is retired; no patch covers this now) | the card stays on the previous turn's terminal state. Paseo upstream [#8080](https://github.com/getpaseo/paseo/pull/8080) has fixed it and merged to main; **wait for a Paseo release** |
 | **Turn folding after reopening a session** | folding is correct | partly broken: system-triggered turns merge into the previous turn, and steered turns get split apart. Waiting on upstream [#8053](https://github.com/getpaseo/paseo/issues/8053) / PR [#8054](https://github.com/getpaseo/paseo/pull/8054) |
 
 > Two things are unrelated to the patches: content a memory plugin has already
 > collected may still be recalled (the model "remembers"); and a rewind itself
 > cannot be undone.
+>
+> The three visibility layers of the rewind notice (invisible live / replayed from
+> history on a stock host / cut off on a patched host) come from the installed
+> 0.14.0 host code and the offline harness; they are **not yet verified on an
+> unpatched host against a real daemon**, so do not remove or change the canary
+> before that check.
 
 Why the patches are not installed by default: they modify **Paseo's own dist**,
 and the macOS desktop app ships a signed CLI that cannot be patched; a global CLI

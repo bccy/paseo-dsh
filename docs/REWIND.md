@@ -188,19 +188,27 @@ Paseo 的插件 provider 适配层把翻译后的时间线事件放进一个**�
          → 插件再发 request.completed
 ```
 
-- **打过补丁的宿主**：这条通知在回执之前就已进入那个只追加的数组，所以随被撤行一起被截掉——
-  用户最多看到它一闪而过（小会话 14–30 ms 不可见，大会话约 8k 事件时最多约 2 s，恰好充当
-  进度提示）。它不进 DSH 日志，重开会话后不存在。
-- **原版宿主**：通知留在时间线底部，明确告诉用户界面是旧的、该怎么刷新。
+这条通知的**可见性分三层，别混**（依据已装宿主 Paseo 0.14.0 的 `plugin-provider.js` 与
+`agent-manager.js`；**未在「未打补丁宿主 + 真实 daemon」上复验**）：
 
-> **实测修正（2026-11-02，未改 canary）**：canary 的**交付层**在真实 daemon 上并不成立。它和
-> 完成提示一样是在宿主 rewind 的 foreground run lock 期间发出的（`AgentManager.rewind` 的
-> `createPendingRun` … `finally settleForegroundRun`），这段窗口里 `enqueueSessionEvent` 把 provider
-> 事件压进 `pendingRun.stagedEvents`，settle 时随 run 一起丢弃。所以时间线里根本看不到它——
-> 补丁宿主上"一闪而过"、原版宿主上"留在底部"这两种表现都观察不到。`harness/host-contract-sim.mjs`
-> 断言的是宿主 `PluginAgentSession.history`（provider 缓冲区）的行为，**不是** daemon 时间线；
-> 两层之间还有这个会丢事件的窗口。canary 自己的顺序约束没动（改它要先问用户），结论与证据见
-> FIELD-NOTES 第 78 条、`harness/rewind-notice-delivery-check.mjs` 的 `info` 行。
+- **live 投递看不到（两种宿主都一样）**：撤回期间宿主持有 foreground run lock
+  （`AgentManager.rewind` 的 `createPendingRun` … `finally settleForegroundRun`），
+  `enqueueSessionEvent` 把 provider 事件压进 `pendingRun.stagedEvents`，run settle 时随
+  `clearRun` 一起丢弃。所以它不会实时出现在时间线上。
+- **原版宿主：重建时间线时可见**。宿主 `accept(event, live)` 在 emit 之前先把它推进
+  `PluginAgentSession.history`，`translateNotice()` 把 `session.notice` 译成 timeline 通知；
+  conversation / `both` 撤回在 `revert()` 返回后 `hydrateTimelineFromProvider({force:true})`，
+  `streamHistory()` 原样重放这段 history，于是它出现在重建后的时间线里，告诉用户执行
+  Reload agent 或重开会话。history 只增不减，后续每次重建都会把历史里所有 canary 一起带出来
+  （会看到多条）。
+- **打过补丁的宿主：看不到（预期行为）**。补丁在 `revert()` 内先
+  `truncateHistoryFrom(messageId)` 再回 `request.completed`；canary 落在截断点之后，随被撤行
+  一起被截掉，随后的 force-hydrate 读不到它。它不进 DSH 日志，重开会话后不存在。
+
+`harness/host-contract-sim.mjs` 断言的是 `PluginAgentSession.history`（provider 缓冲区）的行为，
+**不是** daemon 时间线；live 那一层的证据是 `harness/rewind-notice-delivery-check.mjs` 的
+`info` 行与宿主 `stagedEvents` 源码。canary 自己的顺序约束没动（改它要先问用户），结论与证据
+见 FIELD-NOTES 第 78 条；**复验前别删改 canary**。
 
 **顺序就是机制本身。** 放到 `request.completed` 之后，补丁宿主上也会留下来，变成
 「时间线没刷新」的**误报**（在宿主真实代码上双向复现过，见
@@ -314,10 +322,10 @@ this.ctx.get('permissionPresets').set(session, name);
 - 撤回是**同步**的：`session.revert` 在桥里完成（截断 history + 落盘）后回执，宿主随即重建
   时间线。没有 reload 窗口，因此**没有**「正在回退，请稍候」通知、没有 prompt 门禁、没有
   15s 安全超时——这些机制随 reload 旁路一起删除了。
-  **提示有两条，含义不同**：回执前的「撤回已生效」canary 是自证机制——设计上在补丁宿主上随被撤行
-  一起被截掉（一闪而过）、在原版宿主上留下来告诉用户执行 Reload agent 或重开会话（见上一节），
-  所以必须在 `request.completed` 之前发出，顺序不能换；但它的交付在真实 daemon 上被 rewind run
-  lock 吞掉（见上一节的实测修正）。回执后的 completion 报告是**插件时间线行**
+  **提示有两条，含义不同**：回执前的「撤回已生效」canary 是自证机制——live 投递在 rewind run
+  lock 内被 `stagedEvents` 丢弃；原版宿主经 provider history 重放后可见（告诉用户执行 Reload
+  agent 或重开会话）；补丁宿主被 `truncateHistoryFrom` 截掉（预期行为，见上一节），所以必须在
+  `request.completed` 之前发出，顺序不能换。回执后的 completion 报告是**插件时间线行**
   （`timeline.append`，见「完成提示」一节），报告这次撤回了什么（scope 与文件计数），绕过
   run lock、在任何宿主上都能留下；它在 conversation / `both` 的**时间线重建之后**才落行。
   并发的第二次撤回由桥的 `revertInflight` 守卫拒绝（`request.failed`，不是静默）。
@@ -373,9 +381,11 @@ this.ctx.get('permissionPresets').set(session, name);
 ```bash
 # 纯函数 + 接线（不需要 daemon）
 node harness/revert-check.mjs        # 令牌/区间/前置/回执/文件层/canary 顺序/共享进程接线
+node harness/rewind-notice-check.cjs # 完成提示的客户端半：文案/计数回退、旧 notice 过滤、live 监视器与接线
+node harness/rewind-notice-delivery-check.mjs # 完成报告能否确定到达时间线；降级窗口（--degraded / --degraded-late）；canary 机制半
 node harness/rewind-transaction-check.mjs # 撤销事务：files-only 不 append/flush/prune、重复幂等、files-only 后 both 的 pre-image 仍正确
 node harness/surface-check.mjs       # 只折撤回缝、compaction 保留、尾随事件
-node harness/file-snapshot-check.mjs # 写前备份/新建删除/多工具/救援/上限
+node harness/file-snapshot-check.mjs # 写前备份/新建删除/多工具/救援/上限；读后失败与 journal 失败进回执、损坏对象不写回、isError 已落盘仍记录
 node harness/rewind-merge-check.mjs  # 父子归并：子/孙编辑落根会话 journal、断链 fail-open、取消策略
 node harness/revert-shape-probe.mjs  # 真实 DSH Session：旧写法必抛、新写法通过、marker 不进上下文
 node harness/replay-fidelity-probe.mjs <session.v4.jsonl.zstd>  # 真实日志重放保真
@@ -397,8 +407,9 @@ cd paseo-plugin/.dbg && node subagent-check.cjs
 
 真机验收（新会话，能力位只对新会话生效）：发两条消息 → 撤回第二条 → 消息行消失、无
 `/rewind` 行/回合页脚、文件回到消息前、模型不知道被撤内容；重开会话后仍正确。
-**补丁在位时**那条「撤回已生效」提示最多一闪而过；**补丁不在位时**它必须留在底部并说明怎么
-刷新，执行 Reload agent 后被撤消息与提示一起消失——这两种宿主都要各验一次。
+canary 的可见性按上一节分三层验：**live 一律看不到**；**补丁在位时**被 `truncateHistoryFrom`
+截掉（看不到是预期）；**补丁不在位时**它必须随重建后的时间线出现并说明怎么刷新，执行
+Reload agent 后被撤消息与提示一起消失。这两种宿主都要各验一次。
 父会话派子代理改的文件同样随 `both` 撤回回退（归并到根会话，见 FIELD-NOTES 第 59/60/61/62 条）；
 撤回覆盖派发回合时该子代理被中断，锚更早的子代理继续运行且重开后保持 running；
 `interrupt` 的 fire-and-return 边界见上文「已知限制」。

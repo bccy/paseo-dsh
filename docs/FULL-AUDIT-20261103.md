@@ -295,3 +295,115 @@ macOS 签名 bundle。生成桥用字节一致性检查；大块内嵌资产不�
 - §1「当前 HEAD 可发布」与 DC-02 冲突，已改为「代码层无阻断缺陷，发布线未定，不可直接发布」。
 - canary 裁决经 Lead 对已装宿主 0.14.0 复核成立：`plugin-provider.js` 的 `translateNotice` 把 notice 译成 timeline 通知、`accept()` 先进 `history` 再 emit、`streamHistory()` 原样重放；补丁宿主由 `truncateHistoryFrom` 截掉；live 路径经 `agent-manager.js` 的 `stagedEvents` 丢弃。
 - 修复轮计划见 `docs/audits/20261103/FIX-PLAN.md`。
+
+## 12. 修复轮结果（2026-11-03）
+
+### 12.1 范围与提交
+
+基线 `de65abc`；修复提交 6 个（`de65abc..HEAD`）：`3aea4dc`（D-client）、`a686c4b`（E-doctor）、
+`7c5410b`（F-patches）、`30bb8c2`（C-process）、`460bd11`（B-notice）、`cc30244`（A-bridge，
+含独立验证后的 round2）。文档包 G-docs 的改动（`docs/`、`AGENTS.md`、`README*`、
+`paseo-plugin/OVERVIEW.md`）在本报告写作时尚未提交。
+
+方式：6 个执行包 + 1 个文档包，**执行与验证分离**（A 包两轮：round1 验证 fail → 执行者修复 →
+同一验证代理 round2 pass）；每包新增/加强的检查都用变异证明会红。各修复包未做：push、
+`npm publish`、打 tag、重启 daemon、写真实 `~/.dsh`、跑真实模型回合（按共同约束）——
+合并后的 `plugin-check.cjs` 全量（真实模型回合）由 FINAL-verify 单独执行，见 §12.3。
+
+### 12.2 逐条结果（22 条 P2）
+
+| ID | 结果 | 提交 | 说明 |
+|---|---|---|---|
+| **BF-01 / HC-01 / N2** | fixed | `cc30244` | 读后捕获失败与 journal 写不进都落 skip/unrecoverable 并进回执，内存台账 + GC 保护重试材料。**边界**：HC-01 位置 5（`capture()` 之前的 return 分支，无绝对路径/锚点，回执无法命名）仍只有 stderr；台账进程重启后丢失（journal 行本来就没写进去）。`file-snapshot-check` 69→95、`rewind-transaction-check` 17→22 |
+| **BF-02** | fixed | `cc30244` | `isError` 时按内容判「文件是否真的变了」，变了才落 journal 行；会话关闭改 `abandonSession` 并在 dispose **之后**结算。**边界**：dispose 返回后仍继续落盘的实现差异未验证（真机禁用） |
+| **BF-03** | fixed | `cc30244` | restore 前校验对象长度 + sha256，不符进 `failed`、不写回用户文件、不产生 rescue；旧 journal 无 `size` 向后兼容。**边界**：capture 端仍信任已存在的同名对象（未自愈重写） |
+| **NC-01 / RN-02** | fixed | `460bd11` | 超时降级改为「保留订阅等迟到 replacement + 有界 4×1.5s 复核 + 补发复用同一 payload」，放弃时留 `could not be confirmed` 日志 |
+| **NC-03 / RN-01** | fixed | `460bd11` | `deliver` 时补建 replacement 订阅；建不起来则降级为 append+复核，绝不裸 append |
+| **BSR-01** | fixed | `cc30244` | `planRewind` 增第 4 参 `rewindsConversation`；files-only 可撤首条，conversation/both 仍拒 |
+| **PP-02 / PP-03** | 文档 fixed / 行为待用户决定 | G-docs（未提交） | 四份文档统一为「live 投递被 run lock 丢弃 / stock 宿主经 provider history 重放可见 / 补丁宿主被 `truncateHistoryFrom` 截掉」；canary 行为未改，真机复验前不删改 |
+| **NC-02** | fixed（改修法） | `460bd11` | 兜底 notice 的 title 保持报告原文、description 加本地化降级标记，客户端按标记放行；server/client 两份标记的漂移由 harness 钉住 |
+| **PS-01** | fixed | `30bb8c2` | 子代理 history 抛错与 `available:false` 对称：发 notice 并丢弃回放窗口内的缓冲帧 |
+| **PPR-01** | fixed | `30bb8c2` | destroyed/ended 流立即失败、`child.on("error")` 置关闭、补 `stdin` close 监听；正常关闭 6 形状 0 误报 |
+| **CT-01** | fixed | `3aea4dc` | generic 卡与结构化 diff 卡的 body 不再截断（260px 滚动 + 复制全量 body）；**legacy 纯文本 diff 回落仍 6000 + 标记**（一行一 View、无滚动无复制，刻意保留） |
+| **CJ-01** | fixed（发布去重一半） | `3aea4dc` | 答案签名未变不 publish / 不 `registration.update`；隐藏态 4s 与 RPC 载荷保留（用户既定语义 / 桥侧写域外） |
+| **DLV-01** | fixed | `a686c4b` | 凭据按 DSH `parseCredentialsDocument` / `assertOwnerOnly` / `credentialRef` 同口径判；README 两处凭据写法改为合规。**遗留**：`records:` 段未校验 |
+| **DLV-02** | fixed（有代价） | `a686c4b` | 补丁可应用性复用 `dsh --profile <p> --dump-config` 的真实告警判定。代价：doctor 不再纯只读（DSH 重写生成文件 `cordis.yml`），每次多一次 DSH 启动（实测 118–121 ms，20 s 上限） |
+| **DLV-03** | fixed | `a686c4b` | profile 就绪校验 `package.json` 与 `dsh.profile.bundles`（含 `dsh-paseo-bridge`） |
+| **LP-01** | fixed | `7c5410b` | `revert()` 签名门收敛为单一来源 `REVERT_SIGNATURE_RE`，apply / `apply --check` / checker 三处同源；改名文件 fail closed 且 byte-identical；诊断按「方法体含 `await this.bridge.revert({`」定位目标方法（F1） |
+| **LP-02 残余** | fixed | `7c5410b` | `planRewindRebuild` 三处共用；新 state `stale-body-unrebuildable`（code 2、`autoPatchable:false`）；`apply --check` 不再承诺重建 |
+| **HB-01** | fixed | `460bd11` | delivery-check 固化 `--degraded` / `--degraded-late` 两个子进程场景；删掉复核调用 → 43 条里 4 红 |
+| **HP-06** | **暂缓** | — | 编译基建共享 `.dbg` 无新鲜度校验；改动面大且影响全部 harness，单独排期 |
+| **DC-01** | fixed（文档） | G-docs（未提交） | 见 PP-02/PP-03；另加「未在未打补丁宿主 + 真实 daemon 上复验」的显式声明 |
+| **DC-02** | **待用户决定** | — | 版本/发布线：npm 0.2.16/0.2.17 与 HEAD 不同源，直接发布会撞号且装不到本仓库特性 |
+| **DC-03** | fixed | G-docs（未提交） | `paseo-plugin/OVERVIEW.md` 的 jobs 改为 live-only，与 README 中英一致 |
+
+计数：**fixed 19 / 暂缓 1（HP-06）/ 待用户决定 1（DC-02）/ 部分（PP-02 文档 fixed、行为待决定）1**。
+另：环境事故暴露的 `resolveBinary` 静默回退（P3）已随 `30bb8c2` fixed。
+
+### 12.3 独立验证结论（不采信执行者自报）
+
+- **A-bridge**：round1 **fail**（指定变异未变红、R4 并发结算漏行、R1 全量重读）→ round2 **pass**。
+  17 项必跑 exit 0、断言 434；独立探针 7 个脚本 75 条断言；变异三次均按预期变红
+  （BF-03 哈希分支 92/3、R4 94/1、R1 94/1），恢复后 95/0。
+- **B-notice**：**pass 7/7**。`rewind-notice-check` 85/85、`rewind-notice-delivery-check` 43/43
+  （`--degraded` 4/4、`--degraded-late` 8/8）、`revert-check` 120/0、`host-contract-sim` 7/7、
+  `session-request-check` 52/52、`harness-gates-check` 41/41；变异删复核调用 → 39/43（4 红）。
+- **C-process**：**pass 13/13** + EPIPE 复验。`process-crash-check` 24/24、新增
+  `subagent-history-check` 7/7、`dsh-binary-check` 11/11；M1–M4 变异红绿；正常关闭 6 形状 0 误报；
+  EPIPE 重复上报（P3）由 Lead 2 行修正后复验 `protocolErrorCount=1`。
+- **D-client**：**pass 6/6**。`tool-call-check` 385/0、`style-check` 254/0、`locale-check` 269/0、
+  `jobs-poll-check` 116/116、`jobs-popover-check` 218/218；变异 publish 去重 → 110/116（6 红），
+  恢复 116/116；未改动三文件的 blob 与基线相同。
+- **E-doctor**：**pass 6/6**。`doctor-check` 53/53、新增 `doctor-live-check` 18/18；变异 → 52/53 红；
+  真实 dump 118–121 ms、假 dsh 超时路径 20.175 s 不挂住；一次性 home 25 文件前后对比只有
+  `cordis.yml` 被 DSH 重写。
+- **F-patches**：**pass 5/5**。`local-patches-check` 31/31（F1 修复后 35/35）、`host-contract-sim` 7/7；
+  变异 A（apply 前置门）28/31 红、变异 B（`--check` gate）30/31 红、F1 变异 30/35 红，恢复 35/35；
+  对已安装宿主只读复核 `state=patched`/code 0，宿主文件 md5 不变。
+- **F1**（验证新引入的诊断缺陷：`describeRevertSignature` 取错类的 `revert`）已修，
+  Lead 读 diff 认可、执行者变异 30/35 红、恢复 35/35；**未再派独立复验**（属诊断文案级小改，如实记录）。
+- **合并后**：Lead 在 main 上跑 `bridge-assets-check` 2/2；全量离线门 + `plugin-check.cjs` 全量
+  （一次性 `DSH_HOME`，耗 token）由独立的 FINAL-verify 另行执行——本报告写作时该轮仍在运行，
+  未把它的结论计入本文。
+
+### 12.4 遗留项（明确列出，未冒充已修）
+
+1. **HC-01 位置 5**：`captureFileBeforeTool` 在调 `capture()` 之前的 return 分支仍只有 stderr
+   （无 session / 无 callId / 认不出路径 / 无锚点 / cwd 解析失败）——没有可记录的绝对路径或锚点，
+   回执无法命名；注释已如实说明。
+2. **BF-01 台账不持久**：journal 写失败的那次改动，进程重启后不再可报（journal 行本来就没写进去）。
+3. **BF-02 关闭窗口**：判定放在 dispose 之后；若某实现让写入在 dispose 返回后继续落盘，该窗口仍会漏。
+4. **BF-03 capture 端**仍信任已存在的同名对象（未自愈重写）；restore 端已 fail-closed。
+5. **撤回提示队列路径**（`flushPending`：deliver 时完全没有句柄）仍 append 不复核；迟到 replacement
+   仍有等待上限（有 `could not be confirmed` 日志，不静默）；RN-03 重复胶囊未消除（写域外）。
+6. **records 段未校验**（DLV-01 同类残余）；**O-01**（凭据 0644 时仍打 `credential found`，信息不一致，
+   退出码仍是 1）；**DLV-08**（`DSH_HOME=~/alt` 两处解析不同源）未处理。
+7. **F2**（`apply --check` 缺 `detectUpstreamSelfFix` 门禁）与 **F4**（stale 重建多一个空行）为基线已有，未修。
+8. **HP-06** 编译基建统一新鲜度校验、**CI 补 push/PR 离线门**：改动面大，单独排期。
+9. **DC-02** 版本/发布线、**S08/PP-02**（共享子进程 per-agent env）待用户决定。
+10. **canary 真机复验**（未打补丁宿主 + 真实 daemon）、**`rewind-native-check`** 与**真机 UI**
+    需用户本机环境与授权，本轮未做。
+11. **CJ-01 剩余**：0 live 仍 4s/agent、RPC 载荷仍含全部 settled job、多客户端相乘未收敛；
+    **CT-01 剩余**：legacy 纯文本 diff 回落仍 6000 且无复制，`headline` 截断（CT-10）与 CT-02 未动。
+12. **A 包越界的最小必要改动**：`harness/rewind-merge-check.mjs` 一条旧断言与新契约冲突，验证判为
+    「契约正当取代、非削弱」（断言数量未动）。
+13. **部署副本落后**：`~/.paseo/local-patches/` 仍是旧版；落地时 **apply 与 checker 必须一起同步**
+    （checker import apply 导出的判定），再重启 daemon——属用户侧落地动作。
+14. **真机未验证**：RN Web 手势/内存（generic 卡新增 260px 内层滚动）、`compilePlugin` 全量打包、
+    macOS/Windows 分支、DSH 0.2.2+ 的 dump/credentials 行为。
+
+### 12.5 文档包（G-docs）
+
+- `docs/HARNESS.md` 的登记缺口（§5.2）已收口：**87 个 `harness/*.mjs|*.cjs` 全部有条目**——
+  新增本轮 3 个（`doctor-live-check` / `dsh-binary-check` / `subagent-history-check`），补齐此前
+  无条目的 26 个（撤回链 12、假桥插件层 4、真实 profile/诊断工具 5、`p003-*` 5），并按文件头注释
+  写「断言什么、动了哪里必跑」；本轮加强的 7 个检查（file-snapshot、rewind-notice、
+  rewind-notice-delivery、local-patches、doctor、jobs-poll、tool-call）同步更新描述与触发条件。
+- DC-01/PP-02/PP-03、DC-03、D15 的文档口径已统一（`docs/REWIND.md`、`AGENTS.md`、`README.md`、
+  `README.en.md`、`docs/ADOPTION.md`、`paseo-plugin/OVERVIEW.md`）；`AGENTS.md` 撤回必跑清单补
+  `rewind-notice-check.cjs` 与 `rewind-notice-delivery-check.mjs` 两条指针。
+- `local-patches/UPGRADE.md` 的 exit code 表补 `revert-signature-changed` / `stale-body-unrebuildable`
+  （exit 2）与 `--json` 新字段；`local-patches/README.md` 强调 **apply 与 checker 必须一起同步**。
+- `docs/FIELD-NOTES.md` 新增第 80–84 条（文件恢复失败被吞、并发结算漏行、降级分支零覆盖、
+  doctor 契约层假绿、canary 可见性三层）；`AGENTS.md` 的编号引用改为实际最大编号 84。
+- 本次文档改动未提交（G-docs 交付由 Lead 审核后提交）；改动的 markdown 相对链接经脚本校验可解析。
