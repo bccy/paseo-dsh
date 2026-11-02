@@ -33,6 +33,12 @@
  *   6. the in-flight request table has a bound too: past it, the next request
  *      fails loudly and its frame never reaches the bridge, while the ones
  *      already in flight stay there (a cap is not a flush)
+ *   7. a failed spawn marks the process dead: `start()` rejects, `running`
+ *      becomes false, and a later request fails immediately instead of queueing
+ *      into a pipe that no longer exists
+ *   8. a stdin destroyed without an `'error'` (only `'close'`) fails the
+ *      in-flight and queued requests at once, with the reason, instead of a pump
+ *      parked forever on a `drain` that can never fire
  *
  * The fake bridge's `crash` mode exits the instant a `session/prompt` arrives and
  * never replies, which is the shape of an OOM kill or a bootstrap throw: no
@@ -260,6 +266,7 @@ function fakeChild(highWaterMark) {
     on: events.on.bind(events),
     once: events.once.bind(events),
     off: events.off.bind(events),
+    emit: events.emit.bind(events),
     kill(signal) {
       if (child.exitCode !== null || child.signalCode !== null) return;
       if (signal === undefined) child.exitCode = 0;
@@ -439,6 +446,153 @@ console.log("\nthe in-flight request table is bounded");
     } catch {
       /* the stand-in is gone; a failure here must not mask the assertions */
     }
+  }
+}
+
+// --- a failed spawn is a dead process, not a usable one --------------------
+//
+// `spawn` EACCES/ENOENT emits `'error'` and **never** `'exit'`. The handler only
+// failed the pending requests, so `#closed` stayed false: `running` reported a
+// usable child, and the next request was queued into a destroyed stdin whose
+// `write()` returns false without ever emitting `drain` — the queue froze and
+// the request waited out its 120 s timeout.
+console.log("\na failed spawn marks the process dead and fails later requests");
+{
+  const originalSpawn = childProcess.spawn;
+  const child = fakeChild(1024);
+  const protocolErrors = [];
+  // Node's order for a spawn failure: `'error'` first (the child object already
+  // carries the negative exit code), then stdin is destroyed; there is no
+  // `'exit'` for a child that was never created.
+  childProcess.spawn = () => {
+    setImmediate(() => {
+      child.exitCode = -13;
+      child.stdin.destroy();
+      child.emit("error", Object.assign(new Error("spawn /nonexistent/dsh EACCES"), { code: "EACCES" }));
+    });
+    return child;
+  };
+  const proc = new DshProcess({
+    sessionId: "spawn-failure-root",
+    cwd: process.cwd(),
+    route: { provider: "fake", model: "fake" },
+    onEvent: () => {},
+    onStatus: () => {},
+    onQuestion: async () => ({ answers: [] }),
+    onLog: () => {},
+    onExit: () => {},
+    onProtocolError: (message) => protocolErrors.push(message),
+  });
+  try {
+    const started = await proc.start().then(
+      () => "resolved",
+      (error) => `rejected: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    check("start() rejects when the spawn fails", /^rejected/.test(started) && /EACCES/.test(started), started);
+    check(
+      "…the failure is reported, not swallowed",
+      protocolErrors.some((line) => /EACCES/.test(line)),
+      protocolErrors.join(" | ") || "(none)",
+    );
+    check(
+      "…and the process no longer reports itself as running",
+      proc.running === false,
+      `running=${String(proc.running)}`,
+    );
+    const startedAt = Date.now();
+    const later = await Promise.race([
+      proc.catalog().then(
+        () => "resolved",
+        (error) => `rejected: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+      sleep(2000).then(() => "timeout"),
+    ]);
+    const elapsedMs = Date.now() - startedAt;
+    check("a request after the failed spawn fails immediately", later.startsWith("rejected"), later);
+    check("…promptly, not at the 120 s RPC timeout", elapsedMs < 2000, `${String(elapsedMs)} ms`);
+  } catch (error) {
+    failed += 1;
+    console.log(`  FAIL  the spawn-failure section could not run  — ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    childProcess.spawn = originalSpawn;
+    proc.kill();
+  }
+}
+
+// --- a destroyed stdin fails the queue instead of freezing it --------------
+//
+// A stream can be destroyed without emitting `'error'` (only `'close'`), and
+// `write()` on it returns false without ever emitting `drain`. A pump parked on
+// `drain` then stays parked forever, and every request behind it waits out its
+// own timeout instead of failing — the same freeze as the spawn-failure shape,
+// reached without any child lifecycle event.
+console.log("\na stream destroyed while waiting for drain fails the queue");
+{
+  const originalSpawn = childProcess.spawn;
+  const child = fakeChild(64); // tiny: the first frame already fills the pipe
+  childProcess.spawn = () => child;
+  const protocolErrors = [];
+  const proc = new DshProcess({
+    sessionId: "destroyed-stdin-root",
+    cwd: process.cwd(),
+    route: { provider: "fake", model: "fake" },
+    initializeRoute: false,
+    maxOutboundQueueBytes: 1024 * 1024,
+    onEvent: () => {},
+    onStatus: () => {},
+    onQuestion: async () => ({ answers: [] }),
+    onLog: () => {},
+    onExit: () => {},
+    onProtocolError: (message) => protocolErrors.push(message),
+  });
+  try {
+    await proc.start();
+    // Nothing reads stdin, so the first write returns false and parks the pump;
+    // the second request is queued behind it.
+    const settle = (promise) =>
+      promise.then(
+        () => "resolved",
+        (error) => `rejected: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    const inFlight = settle(proc.prompt("destroyed-stdin-root", "x".repeat(400)));
+    const queued = settle(proc.prompt("destroyed-stdin-root", "y".repeat(400)));
+    await sleep(50);
+    const startedAt = Date.now();
+    child.stdin.destroy();
+    const settled = await Promise.race([
+      Promise.all([inFlight, queued]),
+      sleep(2000).then(() => "timeout"),
+    ]);
+    const elapsedMs = Date.now() - startedAt;
+    check(
+      "a destroyed stdin fails the in-flight and queued requests",
+      settled !== "timeout" && settled.every((entry) => entry.startsWith("rejected")),
+      Array.isArray(settled) ? settled.join(" | ") : settled,
+    );
+    check("…promptly, not at the 120 s RPC timeout", elapsedMs < 2000, `${String(elapsedMs)} ms`);
+    check(
+      "…with the broken pipe reported",
+      protocolErrors.some((line) => /input stream/.test(line)),
+      protocolErrors.join(" | ") || "(none)",
+    );
+    const startedAt2 = Date.now();
+    const later = await Promise.race([
+      settle(proc.prompt("destroyed-stdin-root", "z".repeat(400))),
+      sleep(2000).then(() => "timeout"),
+    ]);
+    check("a later request fails immediately instead of queueing", later.startsWith("rejected"), later);
+    check(
+      "…naming the broken stream",
+      /input stream/.test(later),
+      later,
+    );
+    check("…and still promptly", Date.now() - startedAt2 < 2000, `${String(Date.now() - startedAt2)} ms`);
+  } catch (error) {
+    failed += 1;
+    console.log(`  FAIL  the destroyed-stdin section could not run  — ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    childProcess.spawn = originalSpawn;
+    proc.kill();
   }
 }
 

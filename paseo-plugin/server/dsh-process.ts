@@ -17,7 +17,7 @@
  * @module dsh-paseo/server/dsh-process
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { JobErrorCode } from "../shared/jobs";
@@ -540,18 +540,58 @@ export interface DshProcessOptions extends DshProcessHandlers {
   maxOutboundQueueBytes?: number;
 }
 
-const BINARY_CANDIDATES = [
-  process.env.DSH_BINARY,
-  "dsh",
-  `${process.env.HOME ?? ""}/.local/bin/dsh`,
-].filter((value): value is string => typeof value === "string" && value.length > 0);
-
+/**
+ * The `dsh` executable to spawn.
+ *
+ * `DSH_BINARY` is an explicit operator setting, so a path that cannot be
+ * executed is a configuration error and is reported as one. The old fallback —
+ * silently using the `dsh` on `PATH` — ran a *different* binary than the one
+ * asked for (another version, another profile, another bridge) and turned a
+ * mistyped path into a normal-looking start; a review probe aimed at a
+ * nonexistent path briefly launched the real `dsh` this way.
+ *
+ * Unset keeps the historical search unchanged: `dsh` from `PATH`, then the
+ * per-user install. A bare name in `DSH_BINARY` is left to `spawn`'s own PATH
+ * lookup, which reports ENOENT loudly through the child's `error` event.
+ *
+ * @throws when `DSH_BINARY` names a path that is missing or not executable.
+ */
 function resolveBinary(): string {
-  for (const candidate of BINARY_CANDIDATES) {
+  const configured = process.env.DSH_BINARY;
+  if (configured !== undefined && configured !== "") {
+    if (!configured.includes("/")) return configured;
+    assertExecutable(configured);
+    return configured;
+  }
+  const candidates = [
+    "dsh",
+    `${process.env.HOME ?? ""}/.local/bin/dsh`,
+  ].filter((value): value is string => value.length > 0);
+  for (const candidate of candidates) {
     if (candidate.includes("/") && existsSync(candidate)) return candidate;
     if (!candidate.includes("/")) return candidate;
   }
   return "dsh";
+}
+
+/** Throw with the reason when `path` cannot be spawned as an executable. */
+function assertExecutable(path: string): void {
+  let reason: string | undefined;
+  try {
+    if (!statSync(path).isFile()) {
+      reason = "it is not a regular file";
+    } else {
+      accessSync(path, constants.X_OK);
+    }
+  } catch (error) {
+    reason = toError(error, "it cannot be executed").message;
+  }
+  if (reason !== undefined) {
+    throw new Error(
+      `DSH_BINARY is set to "${path}", but it is not executable (${reason}); `
+        + "refusing to fall back to the dsh on PATH — fix DSH_BINARY or unset it",
+    );
+  }
 }
 
 function toError(value: unknown, fallback: string): Error {
@@ -1202,6 +1242,13 @@ export class DshProcess {
    * bound.
    */
   #awaitingDrain = false;
+  /**
+   * Whether the dead-pipe failure has already been reported.
+   *
+   * Latched so the stream's `'close'` listener and the pump cannot report the
+   * same broken pipe twice; the requests themselves are failed either way.
+   */
+  #pipeReported = false;
   #closed = false;
   /**
    * Whether the mismatched-`assistant.stream` bridge has been reported.
@@ -1559,10 +1606,27 @@ export class DshProcess {
     // reject now instead of waiting out their timeouts.
     child.stdin.on("error", (error) => {
       const failure = toError(error, "failed to write to the bridge");
+      // The stream's `'close'` follows; this is already the report for that pipe.
+      this.#pipeReported = true;
       this.#processHandlers.onProtocolError(failure.message);
       this.#failAll(failure);
     });
+    // A stream destroyed without an error emits only `'close'`; `write()` on it
+    // returns `false` and never emits `drain`, so a pump waiting for one — and
+    // every request queued behind it — would wait out its 120 s timeout instead
+    // of failing. Skipped once the process has exited or been killed: those
+    // paths already failed everything and own the bookkeeping, and reporting a
+    // normal shutdown as a protocol failure would bury the real ones.
+    child.stdin.on("close", () => {
+      if (this.#closed || child.exitCode !== null || child.signalCode !== null) return;
+      this.#failPipe("the bridge's input stream closed while the process was still running");
+    });
     child.on("error", (error) => {
+      // A spawn failure (EACCES/ENOENT) emits `'error'` and then **never**
+      // `'exit'`, so this is the only event that can mark the process dead.
+      // Without it `running` stayed `true` after a failed `start()` and every
+      // later request queued behind a pipe that no longer exists.
+      this.#closed = true;
       this.#failAll(error);
       this.#processHandlers.onProtocolError(error.message);
       this.#markExited();
@@ -2532,6 +2596,11 @@ export class DshProcess {
   #writeFrame(frame: unknown): void {
     const child = this.#child;
     if (this.#closed || child === undefined) throw new Error("DeepSeek Harness process is not running");
+    // A destroyed stream accepts `write()` with a `false` return and never emits
+    // `drain`. Queueing behind it would leave this request waiting out its 120 s
+    // timeout instead of failing now with the real reason.
+    const unusable = this.#stdinFailure();
+    if (unusable !== undefined) throw new Error(`cannot send to the bridge: ${unusable}`);
     const text = `${JSON.stringify(frame)}\n`;
     const queued = this.#writeQueueBytes + child.stdin.writableLength;
     if (queued + text.length > this.#maxOutboundQueueBytes) {
@@ -2544,6 +2613,22 @@ export class DshProcess {
     this.#writeQueue.push(text);
     this.#writeQueueBytes += text.length;
     this.#pumpWrites();
+  }
+
+  /**
+   * Why the child's input stream can no longer take a frame, if it cannot.
+   *
+   * The stream is the one surface whose failure is silent: `write()` on a
+   * destroyed stream returns `false` without throwing and never emits `drain`,
+   * so the backpressure path would wait forever. Sampled instead of trusted.
+   */
+  #stdinFailure(): string | undefined {
+    const stdin = this.#child?.stdin;
+    if (stdin === undefined) return undefined;
+    if (stdin.destroyed) return "the bridge's input stream was destroyed";
+    if (stdin.writableEnded) return "the bridge's input stream has ended";
+    if (!stdin.writable) return "the bridge's input stream is not writable";
+    return undefined;
   }
 
   /**
@@ -2560,6 +2645,11 @@ export class DshProcess {
     const child = this.#child;
     if (this.#closed || child === undefined) {
       this.#clearOutbound();
+      return;
+    }
+    const unusable = this.#stdinFailure();
+    if (unusable !== undefined) {
+      this.#failPipe(unusable);
       return;
     }
     while (this.#writeQueue.length > 0) {
@@ -2579,11 +2669,34 @@ export class DshProcess {
         return;
       }
       if (!writable) {
+        // `false` is also what a dead stream returns: only wait for `drain`
+        // when the stream can still produce one.
+        const failure = this.#stdinFailure();
+        if (failure !== undefined) {
+          this.#failPipe(failure);
+          return;
+        }
         this.#awaitingDrain = true;
         child.stdin.once("drain", this.#onDrain);
         return;
       }
     }
+  }
+
+  /**
+   * The pipe can no longer carry frames: fail every in-flight and queued
+   * request now, with the reason, instead of leaving each one to its own timeout.
+   *
+   * A queued frame always has a pending request behind it (only requests and
+   * responses use {@link #writeFrame}; a response has no promise, so it is just
+   * dropped), which is why {@link #failAll} is the right fan-out here.
+   */
+  #failPipe(reason: string): void {
+    this.#clearOutbound();
+    this.#failAll(new Error(reason));
+    if (this.#pipeReported) return;
+    this.#pipeReported = true;
+    this.#processHandlers.onProtocolError(reason);
   }
 
   /** Resume {@link #pumpWrites} when the child has consumed enough to accept more. */

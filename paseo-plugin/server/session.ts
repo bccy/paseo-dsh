@@ -1350,8 +1350,19 @@ export class DshSession {
         try {
           history = await process.history(row.sessionId);
         } catch (error) {
-          this.#options.log(`subagent history failed for ${row.sessionId}: ${messageOf(error)}`);
+          // The same user-visible failure class as the `available:false` branch
+          // below, and it used to be the one shape that stayed stderr-only: the
+          // child's row is skipped, so a reopened conversation shows no subagent
+          // and no reason. The frames held for that child are dropped too — with
+          // no view to open they would wait in the replay buffer forever, and
+          // every later frame for the same child would be discarded as "unknown
+          // subagent session".
+          const reason = messageOf(error);
+          this.#options.log(`subagent history failed for ${row.sessionId}: ${reason}`);
+          if (this.#closed) return;
+          this.#noticeChildHistoryUnavailable(row.sessionId, reason);
           this.#replayPending.delete(row.sessionId);
+          this.#dropBufferedChild(row.sessionId);
           continue;
         }
         if (this.#closed) return;
