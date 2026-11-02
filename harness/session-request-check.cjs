@@ -169,17 +169,20 @@ function eventsSince(sinceIndex) {
 }
 
 /**
- * Wait for the rewind notice the provider sends **after** the receipt.
+ * Wait for the rewind completion report the provider emits **after** the receipt.
  *
- * The provider queues that notice until the daemon's rewind run lock is
- * released (`server/rewind-delivery.ts`): the daemon stages and then discards
- * every provider event sent while that lock is held, which is why the report
- * cannot go out with the receipt (`harness/rewind-notice-delivery-check.mjs`
- * drives the real host code to prove both halves). Reading `events` right after
- * the reply would therefore see no notice at all — this wait is part of the
- * contract now, not a race workaround.
+ * This script drives the provider connection directly, so the open carries no
+ * `PASEO_AGENT_ID` (the daemon injects it in production). Without an agent id
+ * there is no timeline to append a plugin row to, so the provider takes its
+ * loud fallback and emits the report as a `session.notice` — the copy, order and
+ * counts this file pins. The normal delivery path (`timeline.append`, after the
+ * host's `agent.timeline.replacement`) is covered by
+ * `harness/rewind-notice-delivery-check.mjs`, which drives the real host code.
+ * Reading `events` right after the reply would still miss the notice (the
+ * fallback is emitted after `request.completed`), so this wait is part of the
+ * contract, not a race workaround.
  *
- * Every accepted rewind gets one notice: the completion sentence, or the
+ * Every accepted rewind gets one report: the completion sentence, or the
  * partial-file failure. A refused rewind gets none, so it is not waited for.
  */
 async function waitForRewindNotice(sinceIndex, sessionId) {

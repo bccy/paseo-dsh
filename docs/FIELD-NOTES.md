@@ -2750,6 +2750,40 @@ push 进 `pendingRun.stagedEvents` 而不派发；只有正常 prompt 路径会�
 宿主代码里、不在协议里。断言要么打到最后的状态（timeline store），要么就只是断言了自己。另外
 provider 缓冲区与 daemon 时间线是两层，中间还有一个会丢事件的窗口，别把其中一层的绿当成整条链的绿。
 
+### 79. 撤回提示改走 `timeline.append`：把"猜时间"换成"等信号"
+
+**症状**：第 78 条的 300 ms 延迟在真机 daemon 日志里被证伪——conversation 撤回 start→complete
+出现过 1128 ms（n=15，中位 75 ms），超过延迟，报告又被静默吞掉。客户端侧还有第二个问题：
+conversation/both 撤回会重建时间线，行时间戳刷新、短时间内大量提交，`client/newest.ts` 的
+bulk 规则（400 ms 内 ≥5 次提交）把 live 的 notice 判成批量，胶囊不弹（离线复现）；旧的
+6 s 时间窗同样只是第二道猜测。
+
+**修法**：报告不再走 `session.notice`，改成插件时间线行
+`paseo.agents.ref(agentId).timeline.append(...)`——daemon 的 `appendTimelineItem` 直接
+recordTimeline + dispatchStream，不经 `enqueueSessionEvent`，run lock 吞不掉；行不进 provider
+history，重建时不会像旧 notice 那样复活、越积越多。顺序改成等宿主的 `agent.timeline.replacement`
+事件（conversation/both 重建之后、锁释放之前派发）：provider 在发撤回请求**之前**订阅 live
+时间线并等 `ready`，收到 replacement 再 append；files 不重建，回执后直接 append。两个等待都有
+上限，超时就先 append 并在短延迟后 refetch 复核、必要时补发一次（降级显式且有界）。
+
+**两个坑**（都是这次踩出来的）：
+1. **provider 连接拿不到 `paseo` 句柄**。`connect()` 只收到 launch/版本/能力位；句柄只在
+   hook / RPC 回调的 `PluginHandlerContext` 里。所以 `index.server.ts` 从允许的 `on` hook 和
+   `jobs.list` RPC 里捕获，并新增 `rewind.notice.arm` RPC 供客户端 bundle 加载时主动送一次——
+   daemon 重启后、第一次 hook 之前就可能撤回，不覆盖这个窗口就只能排队等下一次捕获。
+   **不能**用 `before("agent.session.open")`（宿主会因此 invalidate 所有 agent 会话）。
+2. **胶囊不能靠渲染节奏猜**。插件客户端无法知道 app 打开了哪个 agent；改成每个 agent 一条
+   `timeline.subscribe`（目录里本 provider 最近活跃的 agent + 挂载过报告行的 agent），收到本插件
+   行的 live `agent_stream` 事件时按 `noticeId` 记一笔，行组件挂载时消费一次。回放/重拉/重开
+   会话不经过订阅，天然不弹；`newest.ts` 的 bulk/fresh 与 6 s 窗从胶囊路径删掉（仍服务工具行
+   脉冲）。
+
+**教训**：**"猜一个足够大的延迟"不是确定性**——它把失败从"必然丢"改成"偶尔丢"，而真机日志
+里已经出现过反例。宿主要么给出可观测信号（这里是 `timeline.replacement`），要么换一条不受该
+限制约束的通道（这里是绕过 run lock 的 `timeline.append`）。另外：**插件进程里拿不到的句柄，
+要靠宿主给的每一个回调去捕获**，并且要覆盖"重启后、首个回调之前"的窗口——否则修复只在
+"用户先发过一条消息"的情况下生效。
+
 ---
 
 ## 关于"哪条路由能用"

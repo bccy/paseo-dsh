@@ -31,9 +31,9 @@ import {
 } from "./dsh-process";
 import { DshChildSession, DshSession, modes, parseRoute } from "./session";
 import { rewindCanaryNotice } from "./rewind-canary";
-import { RewindNoticeTimers } from "./rewind-delivery";
+import { beginRewindReport, type RewindReportFallback } from "./rewind-notice-append";
 import { effortLabel, UI } from "./locale";
-import { rewindSuccessText } from "../shared/rewind-notice";
+import { rewindSuccessText, type RewindTone } from "../shared/rewind-notice";
 import type { JobErrorCode } from "../shared/jobs";
 import { PROVIDER_ID } from "../shared/provider";
 
@@ -505,15 +505,6 @@ class DshConnection implements ProviderConnection {
    * identifiable — see {@link rewindCanaryNotice}.
    */
   #rewindSeq = 0;
-  /**
-   * Rewind reports waiting for the host to release its rewind run lock.
-   *
-   * The host drops every provider event sent while that lock is held, so these
-   * cannot go out with the receipt — see {@link RewindNoticeTimers} and the
-   * module doc in `./rewind-delivery` for the host code path and the delay's
-   * justification.
-   */
-  readonly #rewindNotices = new RewindNoticeTimers();
 
   constructor(capabilities: readonly string[]) {
     this.capabilities = capabilities;
@@ -587,9 +578,6 @@ class DshConnection implements ProviderConnection {
     // connection that is tearing down, and a close that throws partway through
     // would otherwise leave it registered for the life of the process.
     CONNECTIONS.delete(this);
-    // Queued rewind reports are addressed to sessions this connection owns; with
-    // the connection gone there is no timeline to deliver them to.
-    this.#rewindNotices.cancelAll();
     const sessions = [...this.#sessions.values()];
     this.#sessions.clear();
     this.#opening.clear();
@@ -1030,10 +1018,53 @@ class DshConnection implements ProviderConnection {
       }
       case "session.revert": {
         const session = this.#require(input.sessionId);
+        // The report row is addressed by Paseo's **agent** id: a plugin reload
+        // mints a new provider session id for the same agent, and the daemon's
+        // timeline is keyed by agent. A root session always carries it; a child
+        // session throws inside `revert()` before returning. A missing id is a
+        // shape this provider does not expect, so it is reported loudly and the
+        // report takes the provider-notice path instead of being guessed at.
+        const agentId = session instanceof DshSession ? session.paseoAgentId ?? "" : "";
+        if (agentId === "") {
+          process.stderr.write(
+            `[${PROVIDER_ID}] rewind of provider session ${input.sessionId} carries no PASEO_AGENT_ID; `
+              + "the completion report cannot be appended to the timeline and will be sent as a provider "
+              + "notice, which the rewind run lock may drop\n",
+          );
+        }
+        // Arm the report **before** the revert. Conversation and `both` rewinds
+        // rebuild the timeline inside the host and dispatch
+        // `agent.timeline.replacement` after the receipt; a subscription
+        // established after that event would miss it and the appended row would
+        // be wiped by the rebuild (see server/rewind-notice-append).
+        const delivery = agentId === ""
+          ? null
+          : beginRewindReport(agentId, input.scope, this.#reportFallback(input.sessionId));
+        /** Deliver one report through the append path, or the notice fallback. */
+        const deliver = (message: string, tone: RewindTone): void => {
+          if (delivery === null) {
+            this.#reportFallback(input.sessionId)({ agentId, scope: input.scope, tone, message });
+            return;
+          }
+          delivery.deliver({ message, tone });
+        };
+        // The subscription is acknowledged before the revert is sent, so the
+        // replacement event cannot be dispatched into the gap. Bounded: a host
+        // that never acknowledges must not hold the rewind hostage (the report
+        // then waits out its own timeout and appends anyway).
+        if (delivery !== null) await delivery.ready;
         // Child sessions throw before returning; the root session returns the bridge receipt.
         // Concurrency is the bridge's job: it already refuses a second rewind on the
         // same session with "该会话已有撤回正在进行" (`dsh-bridge/lib/server.js` revertInflight).
-        const result = (await session.revert(input.token, input.scope)) as DshRevertResult | undefined;
+        let result: DshRevertResult | undefined;
+        try {
+          result = (await session.revert(input.token, input.scope)) as DshRevertResult | undefined;
+        } catch (error) {
+          // Nothing to report: release the timeline subscription the delivery
+          // opened before the revert.
+          delivery?.cancel();
+          throw error;
+        }
         // The rewind itself needs no refresh: the daemon rebuilds the timeline from
         // `PluginProviderSession.streamHistory()` right after this reply. Whether the
         // withdrawn rows actually disappear depends on the host, though, and the
@@ -1085,12 +1116,10 @@ class DshConnection implements ProviderConnection {
           || skippedFiles.length > 0
           || unrecoverable.length > 0
         ) {
-          // The conversation rewind succeeded; only some files did not. Sent after
-          // the receipt on purpose: this one has to survive on **every** host (it
-          // reports a real failure), so it must not be inside the window the patched
-          // host truncates. The receipt is not enough either: the host's rewind run
-          // lock is still held for the whole rewind and drops provider events, so
-          // this is queued behind that lock (`#noticeAfterRewind`).
+          // The conversation rewind succeeded; only some files did not. This is a
+          // real failure report, so it is appended as a warning row on the
+          // timeline — the one channel the rewind's run lock cannot swallow (see
+          // `server/rewind-notice-append`).
           //
           // `skipped` must be part of this condition. It used to be invisible: a
           // path the restore refused to touch (now a symlink/directory, or whose
@@ -1131,36 +1160,31 @@ class DshConnection implements ProviderConnection {
                 ? `被替换的当前内容已另存到 ${rescueDir}。`
                 : `journal 与 rescue 目录：${rescueDir}。`
             }`;
-          this.#noticeAfterRewind(
-            input.sessionId,
-            "error",
-            "文件回退未完成",
-            tail === "" ? parts.join("；") : `${parts.join("；")}。${tail}`,
+          deliver(
+            tail === "" ? `文件回退未完成\n${parts.join("；")}` : `文件回退未完成\n${parts.join("；")}。${tail}`,
+            "warning",
           );
-          // A partial rewind gets exactly one notice: the failure above. A
+          // A partial rewind gets exactly one report: the failure above. A
           // success line next to it would read as "the conversation is fine and
           // the files are fine", which is the one thing this outcome is not.
           return;
         }
-        // The success notice goes out **after** `request.completed`, and not in
-        // the same turn as it. The canary above is a probe that must be cut with
-        // the withdrawn rows on a truncating host; this notice is the opposite —
-        // a real completion report that must survive on every host, so it has to
-        // sit outside the window the patched host truncates. The receipt alone
-        // does not get it there: the host holds a foreground run lock for the
-        // whole rewind and drops every provider event sent while it is pending,
-        // so the report is queued until the lock is released
-        // (`#noticeAfterRewind`). The two are also different copy: the canary
-        // explains why the timeline may be stale ("if this notice stays,
-        // reload"), this one says what just happened. Mixing them would break
-        // the canary's meaning (see docs/REWIND.md).
+        // The success report is appended as a plugin timeline row, never as a
+        // provider notice: the host holds a foreground run lock for the whole
+        // rewind and drops every provider event sent while it is pending, which
+        // is why the old notice was queued behind a guessed delay and was lost
+        // on a real 1128 ms rewind. `timeline.append` bypasses that lock, and
+        // the row is not part of the provider history a rebuild replays, so it
+        // cannot reappear as a stale line on a later rewind. The canary above is
+        // different copy with a different job (it says the timeline may be stale
+        // and how to refresh); mixing the two would break its meaning.
         //
         // Counts come from the bridge receipt's own `files.restored` /
         // `files.deleted` arrays (`RevertFilesReceipt`). When the receipt has no
         // file half, the copy says nothing changed; when it has one but the
         // arrays cannot be read, `rewindSuccessText` falls back to a sentence
         // without a number rather than inventing one.
-        this.#noticeAfterRewind(input.sessionId, "info", rewindSuccessText(UI.rewind, input.scope, files));
+        deliver(rewindSuccessText(UI.rewind, input.scope, files), "success");
         return;
       }
       case "session.interrupt": {
@@ -1179,9 +1203,6 @@ class DshConnection implements ProviderConnection {
         // persistence handle, so a prompt landing in that window must still get a
         // readable refusal — otherwise it surfaces as `runtime_failed`.
         this.#sessions.delete(input.sessionId);
-        // A report still waiting out the rewind delay belongs to a session that
-        // is going away; sending it would only log a dropped notice.
-        this.#rewindNotices.cancel(input.sessionId);
         // Park an idle child: the daemon closes this session right before a
         // refresh reopens it with the same persistence. `park` has **no
         // effect** under one shared process (`DshSession.close` never parks a
@@ -1272,9 +1293,11 @@ class DshConnection implements ProviderConnection {
    * what makes the rewind canary disappear on a refreshed timeline (see the
    * `session.revert` branch). That is only the first of two windows a rewind
    * opens: the host also holds a foreground run lock until the whole rewind
-   * settles and drops every provider event sent while it is pending, so a notice
-   * that must outlive the rewind cannot simply be emitted after the receipt
-   * either — it goes through {@link #noticeAfterRewind}.
+   * settles and drops every provider event sent while it is pending, so a
+   * rewind's completion report is **not** a notice at all — it is appended as a
+   * plugin timeline row (see `./rewind-notice-append`). A notice from this
+   * module is either the canary (sent before the receipt on purpose) or the
+   * best-effort fallback used when an append fails.
    *
    * A notice for a session this connection no longer tracks has nowhere to go:
    * it is logged rather than queued, because there is no reopen to deliver it to
@@ -1303,33 +1326,18 @@ class DshConnection implements ProviderConnection {
   }
 
   /**
-   * Emit a rewind report after the host has released the rewind's run lock.
+   * The fallback used when a report cannot be appended to the timeline.
    *
-   * The receipt is not the end of the rewind: the host keeps a pending
-   * foreground run until its own post-receipt work is done, and
-   * `enqueueSessionEvent` stages (then discards) every provider event that
-   * arrives meanwhile. So a report meant to survive the rewind is queued here
-   * and sent after {@link REWIND_NOTICE_DELAY_MS}. See `./rewind-delivery` for
-   * the host code path, why there is no signal to wait for instead, and why the
-   * wait is a heuristic with a measured margin.
-   *
-   * A session that closes first drops its queued reports: there is nothing left
-   * to tell the user about.
-   *
-   * @param sessionId - provider session the report belongs to.
-   * @param severity - provider notice severity.
-   * @param title - one-line headline.
-   * @param description - optional detail.
+   * A provider notice sent from the rewind branch is dropped while the host
+   * holds the rewind's run lock (see the `session.revert` branch), so this is a
+   * best-effort second path, not a second guarantee: the append is what makes
+   * the report deterministic. It exists so an append failure is never silent.
    */
-  #noticeAfterRewind(
-    sessionId: string,
-    severity: "info" | "warning" | "error",
-    title: string,
-    description?: string,
-  ): void {
-    this.#rewindNotices.schedule(sessionId, () => {
-      this.#notice(sessionId, severity, title, description);
-    });
+  #reportFallback(sessionId: string): RewindReportFallback {
+    return (report) => {
+      const [title = "", ...detail] = report.message.split("\n");
+      this.#notice(sessionId, report.tone === "warning" ? "warning" : "info", title, detail.join("\n") || undefined);
+    };
   }
 
   /**

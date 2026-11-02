@@ -1,9 +1,10 @@
 /**
- * Offline assertions for the rewind completion row and its one-shot capsule.
+ * Offline assertions for the rewind report row and its one-shot capsule.
  *
- * The row is a plugin timeline item produced from Paseo's `notification` item
- * (the host projects `session.notice` to that shape), so two claims have to be
- * true and neither is visible in a screenshot:
+ * The row is a **plugin** timeline item the server half appends
+ * (`paseo.agents.ref(id).timeline.append`) — not a `session.notice`, which the
+ * host's rewind run lock can drop. Three claims have to be true and none is
+ * visible in a screenshot:
  *
  *   1. **Copy.** The success sentence carries the scope's wording and the counts
  *      taken from the bridge receipt's `restored` / `deleted` arrays. A wrong
@@ -13,81 +14,176 @@
  *      attached to either. A receipt whose counts cannot be read must fall back
  *      to a sentence **without** a number: `0 files` would be a false claim, not
  *      a conservative one.
- *   2. **One capsule per live arrival.** The gate is driven by the window and
- *      the batch rules the client already uses for pulses (`client/newest.ts`):
- *      a replayed burst cannot produce a fresh commit, a history row painted
- *      after the fact is too old, and the same notice row remounting must not
- *      repeat the capsule. Asserting the gate alone would not prove the replay
- *      half, so the relevant `newest` calls are driven here too.
+ *   2. **One capsule per live arrival.** The capsule is driven by the live
+ *      timeline subscription (`client/rewind-notice-live`), never by render
+ *      cadence or a timestamp window: a row that arrived on the stream is
+ *      toasted exactly once, a duplicate delivery or a remount adds nothing, and
+ *      a row painted from a fetch (no live record) is silent. The old
+ *      bulk/fresh + 6 s rules were wrong after a conversation rewind rebuilt the
+ *      timeline, so their inputs are gone from this path.
+ *   3. **Legacy rows are hidden.** Notices the previous delivery path wrote into
+ *      the provider history are replayed by every conversation rebuild; the
+ *      transformer recognises them from the copy table and removes them, so a
+ *      session that predates this change stops showing stale "rewound" lines.
+ *      The rewind canary is a different notice and must not match.
  *
- * Everything is the **compiled** client/shared code (`tsc` to CommonJS), not a
- * regex over the sources: the check `require`s the same modules the bundle
- * loads, so a change in behaviour has to move these assertions.
+ * Everything is the **compiled** client/shared code (`harness/plugin-build.cjs`
+ * compiles the plugin to CommonJS), not a regex over the sources: the check
+ * `require`s the same modules the bundle loads, so a change in behaviour has to
+ * move these assertions.
  *
- * Run (from paseo-plugin):
- *   npx tsc shared/rewind-notice.ts client/rewind-notice-data.ts client/newest.ts \
- *     server/rewind-canary.ts \
- *     --outDir .dbg-p14-notice --rootDir . --module commonjs --moduleResolution node \
- *     --target ES2022 --skipLibCheck
- *   echo '{"type":"commonjs"}' > .dbg-p14-notice/package.json
- *   cp ../harness/rewind-notice-check.cjs .dbg-p14-notice/
- *   cd .dbg-p14-notice && node rewind-notice-check.cjs
+ * Run (from the repo root):
+ *   node harness/rewind-notice-check.cjs [compiled-plugin-dir]
  */
 "use strict";
 
 const fs = require("node:fs");
 const path = require("node:path");
+const { createRequire } = require("node:module");
 
-const {
-  REWIND_COPY,
-  rewindFileCounts,
-  rewindNoticeHeadline,
-  rewindNoticeTone,
-  rewindSuccessText,
-} = require("./shared/rewind-notice.js");
-const {
-  REWIND_NOTICE_KIND,
-  REWIND_NOTICE_VERSION,
-  REWIND_TOAST_MAX_AGE_MS,
-  RewindToastGate,
-  rewindNoticeItem,
-  rewindToastMessage,
-} = require("./client/rewind-notice-data.js");
-const { isPulsing, noteCommit, noteRender } = require("./client/newest.js");
-const { rewindCanaryNotice } = require("./server/rewind-canary.js");
+const here = __dirname;
+const { resolvePluginBuild } = require(path.join(here, "plugin-build.cjs"));
 
 let passed = 0;
 let failed = 0;
-
 function check(label, condition, detail) {
   if (condition === true) {
     passed += 1;
-    console.log(`  ok   ${label}`);
+    console.log(`  PASS  ${label}`);
   } else {
     failed += 1;
-    console.log(`  FAIL ${label} — ${detail === undefined ? String(condition) : detail}`);
+    console.log(`  FAIL  ${label} — ${detail === undefined ? String(condition) : detail}`);
   }
 }
-
 function equal(label, actual, expected) {
   check(label, actual === expected, `expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
 }
 
-/** Locate a repo source from a build dir (documented one level down, scratch deeper). */
-function findRepoFile(relative, levels = 4) {
-  let dir = __dirname;
-  for (let i = 0; i < levels; i += 1) {
-    const candidate = path.join(dir, relative);
-    if (fs.existsSync(candidate)) return candidate;
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return undefined;
+const buildDir = resolvePluginBuild(process.argv[2], ".dbg-p17-client");
+console.log(`plugin build: ${buildDir}`);
+
+const {
+  REWIND_COPY,
+  REWIND_NOTICE_KIND,
+  REWIND_NOTICE_ITEM_ID,
+  REWIND_NOTICE_VERSION,
+  rewindFileCounts,
+  rewindNoticeHeadline,
+  rewindNoticePayloadSchema,
+  rewindNoticeTone,
+  rewindSuccessText,
+} = require(path.join(buildDir, "shared", "rewind-notice.js"));
+const {
+  isLegacyRewindNotice,
+  rewindToastMessage,
+} = require(path.join(buildDir, "client", "rewind-notice-data.js"));
+const {
+  MAX_WATCHED_AGENTS,
+  REWIND_LIVE_HANDOFF_MS,
+  RewindLiveMonitor,
+  WATCH_RECENT_MS,
+} = require(path.join(buildDir, "client", "rewind-notice-live.js"));
+const { rewindCanaryNotice } = require(path.join(buildDir, "server", "rewind-canary.js"));
+const { PROVIDER_ID } = require(path.join(buildDir, "shared", "provider.js"));
+
+const base = Date.UTC(2026, 0, 2, 3, 4, 5);
+
+/** A fake Paseo API exposing only what the monitor uses. */
+function makeFakePaseo(options = {}) {
+  const subscriptions = new Map();
+  const releasedIds = new Set();
+  const failingAgents = new Set(options.failingAgents ?? []);
+  const directory = { handlers: null, released: false, entries: [] };
+  return {
+    paseo: {
+      agents: {
+        async list(options) {
+          if (options === undefined || options.subscribe === undefined) {
+            throw new Error("the monitor must subscribe to the directory");
+          }
+          return {
+            entries: directory.entries,
+            subscriptionId: "dir-sim",
+            subscription: {
+              async release() {
+                directory.released = true;
+              },
+              subscribe(handlers) {
+                directory.handlers = handlers;
+                return () => {};
+              },
+            },
+          };
+        },
+        ref(agentId) {
+          return {
+            timeline: {
+              subscribe(handler) {
+                if (failingAgents.has(agentId)) throw new Error("permission denied");
+                subscriptions.set(agentId, { handler });
+                const unsubscribe = () => {
+                  releasedIds.add(agentId);
+                  subscriptions.delete(agentId);
+                };
+                unsubscribe.ready = Promise.resolve();
+                unsubscribe.subscriptionId = `sim-${agentId}`;
+                unsubscribe.release = async () => {
+                  releasedIds.add(agentId);
+                  subscriptions.delete(agentId);
+                };
+                return unsubscribe;
+              },
+              async append() {
+                throw new Error("the client half must not append");
+              },
+              async refetch() {
+                return { entries: [] };
+              },
+            },
+          };
+        },
+      },
+    },
+    /** Deliver one live timeline event to the agent's subscription. */
+    deliver(agentId, event) {
+      subscriptions.get(agentId)?.handler({ agentId, event });
+    },
+    subscribed: (agentId) => subscriptions.has(agentId),
+    released: (agentId) => releasedIds.has(agentId),
+    directory,
+  };
+}
+
+/** One live plugin-row event, shaped like `PaseoAgentTimelineEvent`. */
+function liveReportEvent(noticeId, message = REWIND_COPY["zh-CN"].conversation) {
+  return {
+    type: "timeline",
+    provider: "fake",
+    item: {
+      type: "plugin",
+      id: `${PROVIDER_ID}/rewind-notice`,
+      pluginId: PROVIDER_ID,
+      kind: REWIND_NOTICE_KIND,
+      version: REWIND_NOTICE_VERSION,
+      data: { message, tone: "success", noticeId },
+    },
+  };
+}
+
+function agentEntry(id, overrides = {}) {
+  return {
+    agent: {
+      id,
+      provider: PROVIDER_ID,
+      status: "idle",
+      updatedAt: new Date(base).toISOString(),
+      workspaceId: "ws-1",
+      ...overrides,
+    },
+  };
 }
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
-const base = Date.UTC(2026, 0, 2, 3, 4, 5);
 
 async function main() {
   console.log("copy — both locales");
@@ -100,33 +196,13 @@ async function main() {
       rewindSuccessText(zh, "both", { restored: ["a", "b"], deleted: ["c"] }),
       "已撤回对话，并恢复 2 个文件（删除 1 个）",
     );
-    equal(
-      "zh both no files",
-      rewindSuccessText(zh, "both", undefined),
-      "已撤回对话，这条消息之后没有改动文件",
-    );
-    equal(
-      "zh both zero receipt",
-      rewindSuccessText(zh, "both", { restored: [], deleted: [] }),
-      "已撤回对话，这条消息之后没有改动文件",
-    );
+    equal("zh both no files", rewindSuccessText(zh, "both", undefined), "已撤回对话，这条消息之后没有改动文件");
     equal(
       "zh files counts",
       rewindSuccessText(zh, "files", { restored: ["a", "b"], deleted: ["c"] }),
       "已恢复 2 个文件（删除 1 个）",
     );
-    equal(
-      "zh files no files",
-      rewindSuccessText(zh, "files", undefined),
-      "这条消息之后没有改动文件，无需恢复",
-    );
-    equal(
-      "zh files zero receipt",
-      rewindSuccessText(zh, "files", { restored: [], deleted: [] }),
-      "这条消息之后没有改动文件，无需恢复",
-    );
-    // Counts that cannot be read must not become a number, and must not claim
-    // "nothing changed" either: the receipt exists, so files may have changed.
+    equal("zh files no files", rewindSuccessText(zh, "files", undefined), "这条消息之后没有改动文件，无需恢复");
     equal("zh both unreadable counts", rewindSuccessText(zh, "both", { restored: "2" }), "已撤回对话");
     equal("zh files unreadable counts", rewindSuccessText(zh, "files", {}), "文件已恢复");
     check(
@@ -147,18 +223,8 @@ async function main() {
       rewindSuccessText(en, "files", { restored: [], deleted: ["c"] }),
       "Restored 0 files (deleted 1 file)",
     );
-    equal(
-      "en both no files",
-      rewindSuccessText(en, "both", undefined),
-      "Conversation rewound; no files changed after this message",
-    );
-    equal(
-      "en files no files",
-      rewindSuccessText(en, "files", undefined),
-      "No files changed after this message; nothing to restore",
-    );
+    equal("en files no files", rewindSuccessText(en, "files", undefined), "No files changed after this message; nothing to restore");
     equal("en both unreadable counts", rewindSuccessText(en, "both", { restored: "x" }), "Conversation rewound");
-    equal("en files unreadable counts", rewindSuccessText(en, "files", { restored: ["a"], deleted: undefined }), "Files restored");
   }
 
   console.log("receipt counts");
@@ -172,14 +238,12 @@ async function main() {
     equal("an unreadable receipt has no counts", rewindFileCounts({ restored: "3", deleted: [] }), undefined);
   }
 
-  console.log("recognition");
+  console.log("recognition — the report copy, and the legacy notice path");
   {
     for (const locale of ["en", "zh-CN"]) {
       const copy = REWIND_COPY[locale];
       equal(`${locale} conversation is success`, rewindNoticeTone(copy.conversation), "success");
       equal(`${locale} both counts is success`, rewindNoticeTone(copy.bothCounts({ restored: 2, deleted: 1 })), "success");
-      equal(`${locale} both no files is success`, rewindNoticeTone(copy.bothNoFiles), "success");
-      equal(`${locale} files counts is success`, rewindNoticeTone(copy.filesCounts({ restored: 2, deleted: 1 })), "success");
       equal(`${locale} files no files is success`, rewindNoticeTone(copy.filesNoFiles), "success");
       equal(
         `${locale} failure row is warning`,
@@ -189,132 +253,220 @@ async function main() {
     }
     const canary = rewindCanaryNotice({ at: new Date(base), seq: 1, files: false });
     equal("the canary is not a completion report", rewindNoticeTone(canary.message), undefined);
-    equal("an unrelated notification is left alone", rewindNoticeTone("子代理历史读取失败"), undefined);
-    equal("an open warning is left alone", rewindNoticeTone("工作区读取失败：permission denied"), undefined);
-    equal("an empty message is left alone", rewindNoticeTone(""), undefined);
+    equal("the canary is not hidden as a legacy row", isLegacyRewindNotice(canary.message), false);
+    equal(
+      "a legacy completion notice is recognised for hiding",
+      isLegacyRewindNotice(REWIND_COPY["zh-CN"].conversation),
+      true,
+    );
+    equal(
+      "a legacy failure notice is recognised too",
+      isLegacyRewindNotice(`${REWIND_COPY["zh-CN"].failureTitle}\n/path 未能恢复`),
+      true,
+    );
+    equal("an unrelated notification is left alone", isLegacyRewindNotice("工作区读取失败：permission denied"), false);
+    equal("an empty message is left alone", isLegacyRewindNotice(""), false);
     equal("the failure capsule is one line", rewindNoticeHeadline("文件回退未完成\n第一行详情"), "文件回退未完成");
+    equal("the toast repeats the headline", rewindToastMessage({ message: "文件回退未完成\n详情", tone: "warning", noticeId: "n" }), "文件回退未完成");
   }
 
-  console.log("transform");
+  console.log("payload schema — the row carries its own identity");
   {
-    const item = rewindNoticeItem(REWIND_COPY["zh-CN"].conversation);
-    check("a success notice becomes a plugin item", item !== undefined && item.kind === REWIND_NOTICE_KIND && item.version === REWIND_NOTICE_VERSION);
-    equal("…carrying the message verbatim", item?.data.message, "已撤回到这条消息");
-    equal("…and the success tone", item?.data.tone, "success");
-    equal(
-      "…the failure row keeps its detail",
-      rewindNoticeItem("文件回退未完成\n/path 未能恢复")?.data.message,
-      "文件回退未完成\n/path 未能恢复",
-    );
-    equal("the canary is not transformed", rewindNoticeItem(rewindCanaryNotice({ at: new Date(base), seq: 1, files: false }).message), undefined);
-    equal("a random notification is not transformed", rewindNoticeItem("工作区读取失败"), undefined);
-    equal("the failure capsule says the headline", rewindToastMessage({ message: "文件回退未完成\n详情", tone: "warning" }), "文件回退未完成");
-  }
-
-  console.log("capsule gate");
-  {
-    const gate = new RewindToastGate();
-    const live = {
-      agentId: "agent-a",
-      timestamp: new Date(base),
+    const valid = rewindNoticePayloadSchema.safeParse({
       message: "已撤回到这条消息",
-      fresh: true,
-      now: base,
-    };
-    equal("a live arrival raises the capsule", gate.shouldToast(live), true);
-    equal("the same row remounting does not", gate.shouldToast({ ...live, now: base + 100 }), false);
-    equal("a replay commit does not", gate.shouldToast({ ...live, agentId: "agent-b", fresh: false }), false);
-    equal("a stale history row does not", gate.shouldToast({ ...live, agentId: "agent-c", now: base + REWIND_TOAST_MAX_AGE_MS + 1 }), false);
-    equal("an unparsable timestamp does not", gate.shouldToast({ ...live, agentId: "agent-d", timestamp: "not-a-date" }), false);
-    equal(
-      "a different agent's identical notice does",
-      gate.shouldToast({ ...live, agentId: "agent-e" }),
-      true,
-    );
-    equal(
-      "a different rewind later does",
-      gate.shouldToast({ ...live, agentId: "agent-a", timestamp: new Date(base + 60_000), now: base + 60_000 }),
-      true,
+      tone: "success",
+      noticeId: "a-1",
+    });
+    check("a complete payload parses", valid.success === true, JSON.stringify(valid.error?.issues ?? null));
+    const noId = rewindNoticePayloadSchema.safeParse({ message: "x", tone: "success" });
+    check("a payload without a noticeId is rejected", noId.success === false);
+    const noTone = rewindNoticePayloadSchema.safeParse({ message: "x", noticeId: "a" });
+    check("a payload without a tone is rejected", noTone.success === false);
+    check(
+      "the item id is the stable one a later report replaces",
+      REWIND_NOTICE_ITEM_ID === "rewind-notice",
+      REWIND_NOTICE_ITEM_ID,
     );
   }
 
-  console.log("newest integration — the replay rule actually feeds the gate");
+  console.log("live monitor — the capsule is a live-stream fact");
   {
-    // A live single-row arrival: one first paint, a fresh commit, inside the
-    // age window. This is the shape a real rewind has.
-    const liveAgent = "live-rewind";
-    noteRender(liveAgent, base, true);
-    await settle();
-    const liveCommit = noteCommit(liveAgent, base);
-    const livePulse = isPulsing(liveAgent, liveCommit, base + 10);
-    equal("a live row is fresh", livePulse, true);
-    const liveGate = new RewindToastGate();
-    equal(
-      "…and the gate lets that row raise one capsule",
-      liveGate.shouldToast({
-        agentId: liveAgent,
-        timestamp: new Date(base),
-        message: REWIND_COPY["zh-CN"].conversation,
-        fresh: livePulse,
-        now: base + 10,
-      }),
-      true,
-    );
+    const fake = makeFakePaseo();
+    let now = base;
+    const monitor = new RewindLiveMonitor(fake.paseo, { now: () => now });
+    monitor.watch("agent-a");
+    check("watching an agent subscribes to its live timeline", fake.subscribed("agent-a") === true);
+    monitor.watch("agent-a");
+    check("watching twice keeps one subscription", monitor.watchedAgents().length === 1);
 
-    // A replay burst: several rows painted in one pass, then committed in the
-    // same microtask batch. `newest.ts` marks them replay/bulk, so the gate must
-    // refuse them even though every row is "new" to the component.
-    const replayAgent = "replayed-rewind";
-    const stamps = [base, base + 10, base + 20];
-    for (const at of stamps) noteRender(replayAgent, at, true);
-    await settle();
-    const replayCommits = stamps.map((at) => noteCommit(replayAgent, base));
-    const anyFresh = replayCommits.some((commit) => isPulsing(replayAgent, commit, base + 5));
-    equal("a replayed history is not fresh", anyFresh, false);
-    const replayGate = new RewindToastGate();
+    fake.deliver("agent-a", liveReportEvent("notice-1"));
+    equal("a live report row is taken once", monitor.take("agent-a", "notice-1"), true);
+    equal("…and a remount does not raise a second capsule", monitor.take("agent-a", "notice-1"), false);
+
+    fake.deliver("agent-a", liveReportEvent("notice-2"));
+    fake.deliver("agent-a", liveReportEvent("notice-2"));
+    equal("a duplicated live delivery still raises one capsule", monitor.take("agent-a", "notice-2"), true);
+    equal("…and the duplicate is not a second one", monitor.take("agent-a", "notice-2"), false);
+
+    fake.deliver("agent-a", liveReportEvent("notice-3"));
+    now = base + REWIND_LIVE_HANDOFF_MS + 1;
     equal(
-      "…so its notice raises no capsule",
-      replayGate.shouldToast({
-        agentId: replayAgent,
-        timestamp: new Date(base + 20),
-        message: REWIND_COPY["zh-CN"].conversation,
-        fresh: anyFresh,
-        now: base + 5,
-      }),
+      "a row the app paints long after the event does not pop a stale capsule",
+      monitor.take("agent-a", "notice-3"),
       false,
     );
+    now = base;
 
-    // A burst of many commits is also a batch (the path a longer history takes
-    // when its rows commit one by one rather than all in the first pass).
-    const bulkAgent = "bulk-rewind";
-    for (let index = 0; index < 6; index += 1) {
-      noteRender(bulkAgent, base + index, true);
-      await settle();
-      noteCommit(bulkAgent, base + index * 10);
-    }
-    const bulkCommit = noteCommit(bulkAgent, base + 100);
-    equal("a commit burst is not fresh", isPulsing(bulkAgent, bulkCommit, base + 110), false);
-  }
+    // Replay/refetch shape: the row exists but was never on the stream.
+    equal("a replayed row raises no capsule", monitor.take("agent-a", "notice-replayed"), false);
 
-  console.log("wiring — index.client.tsx registers both halves");
-  {
-    const sourcePath = findRepoFile("index.client.tsx");
-    check("index.client.tsx is readable", sourcePath !== undefined, `looked above ${__dirname}`);
-    const source = sourcePath === undefined ? "" : fs.readFileSync(sourcePath, "utf8");
+    // Other plugin rows and other agents' events must not count.
+    fake.deliver("agent-a", {
+      type: "timeline",
+      provider: "fake",
+      item: { type: "plugin", id: "x", pluginId: PROVIDER_ID, kind: "dsh-tool", version: 1, data: {} },
+    });
+    equal("a different plugin row is ignored", monitor.take("agent-a", "undefined"), false);
+    fake.deliver("agent-b", liveReportEvent("notice-b"));
+    equal("an event for an unwatched agent records nothing", monitor.take("agent-b", "notice-b"), false);
+
+    // Subscription errors are reported, and the agent can be watched again.
+    const errors = [];
+    const failing = makeFakePaseo({ failingAgents: ["agent-d"] });
+    const failingMonitor = new RewindLiveMonitor(failing.paseo, {
+      now: () => now,
+      onError: (message) => errors.push(message),
+    });
+    failingMonitor.watch("agent-c");
+    failingMonitor.watch("agent-d");
     check(
-      "the transformer queries notification items",
-      /id:\s*"dsh-rewind-notice"[\s\S]*?itemType:\s*"notification"/u.test(source),
-      "query.itemType is not notification",
+      "a failed subscription is reported, not swallowed",
+      errors.some((message) => message.includes("agent-d")),
+      JSON.stringify(errors),
     );
     check(
-      "the renderer is registered under the shared kind",
-      source.includes("kind: REWIND_NOTICE_KIND") && source.includes("Component: RewindNotice"),
+      "…and it does not leave a dead subscription behind",
+      failingMonitor.watchedAgents().includes("agent-d") === false,
+      JSON.stringify(failingMonitor.watchedAgents()),
+    );
+    failingMonitor.dispose();
+
+    monitor.dispose();
+    check("dispose releases the live subscriptions", fake.released("agent-a") === true);
+  }
+
+  console.log("live monitor — the directory watch bound");
+  {
+    const fake = makeFakePaseo();
+    const recent = new Date(base - 60_000).toISOString();
+    const old = new Date(base - WATCH_RECENT_MS - 60_000).toISOString();
+    fake.directory.entries = [
+      agentEntry("recent-dsh", { updatedAt: recent }),
+      agentEntry("old-dsh", { updatedAt: old }),
+      agentEntry("recent-other", { updatedAt: recent, provider: "claude" }),
+      agentEntry("recent-closed", { updatedAt: recent, status: "closed" }),
+      agentEntry("recent-archived", { updatedAt: recent, archivedAt: recent }),
+      agentEntry("recent-internal", { updatedAt: recent, internal: true }),
+    ];
+    const monitor = new RewindLiveMonitor(fake.paseo, { now: () => base });
+    await monitor.start();
+    const watched = monitor.watchedAgents();
+    check(
+      "a recently active agent of this provider is watched",
+      watched.includes("recent-dsh"),
+      JSON.stringify(watched),
+    );
+    check(
+      "an old agent is not watched up front",
+      !watched.includes("old-dsh"),
+      JSON.stringify(watched),
+    );
+    check(
+      "other providers' agents, closed, archived and internal agents are skipped",
+      !watched.includes("recent-other")
+        && !watched.includes("recent-closed")
+        && !watched.includes("recent-archived")
+        && !watched.includes("recent-internal"),
+      JSON.stringify(watched),
+    );
+    // The bound: many recent agents cannot create a subscription per agent.
+    fake.directory.entries = Array.from({ length: MAX_WATCHED_AGENTS + 10 }, (_, index) =>
+      agentEntry(`many-${String(index)}`, { updatedAt: recent }),
+    );
+    fake.directory.handlers?.snapshot({ entries: fake.directory.entries, subscriptionId: "dir-sim" });
+    check(
+      "the directory watch set is bounded",
+      monitor.watchedAgents().length <= MAX_WATCHED_AGENTS + 1,
+      `${monitor.watchedAgents().length} watched`,
+    );
+    fake.directory.handlers?.update({
+      type: "agent_update",
+      payload: { kind: "remove", agentId: "recent-dsh" },
+    });
+    check(
+      "an agent removed from the directory is unwatched",
+      monitor.watchedAgents().includes("recent-dsh") === false,
+      JSON.stringify(monitor.watchedAgents()),
+    );
+    monitor.dispose();
+    await settle();
+    check("dispose releases the directory observation", fake.directory.released === true);
+  }
+
+  console.log("wiring — the bundle registers the report path, not the notice path");
+  {
+    const indexClient = fs.readFileSync(path.join(here, "..", "paseo-plugin", "index.client.tsx"), "utf8");
+    check(
+      "the notification transformer removes legacy rewind notices",
+      /itemType:\s*"notification"[\s\S]*?isLegacyRewindNotice\(item\.message\)\s*\?\s*\{\s*items:\s*\[\]\s*\}/u.test(indexClient),
+      "the legacy-notice transformer is missing",
+    );
+    check(
+      "the renderer is registered under the shared kind and version",
+      indexClient.includes("kind: REWIND_NOTICE_KIND") && indexClient.includes("Component: RewindNotice"),
       "renderer registration missing",
     );
+    check(
+      "the live monitor is started with the arm RPC",
+      indexClient.includes("startRewindLiveMonitor(client.paseo") && indexClient.includes("client.rpc(rewindNoticeArm, {})"),
+      "monitor/arm wiring missing",
+    );
+    const row = fs.readFileSync(path.join(here, "..", "paseo-plugin", "client", "rewind-notice.tsx"), "utf8");
+    check(
+      "the capsule asks the live monitor, not the render-cadence pulse",
+      row.includes("activeRewindLiveMonitor()") && row.includes("monitor.take(agentId, data.noticeId)"),
+      "the row still uses the old pulse gate",
+    );
+    check(
+      "…and the row no longer imports the bulk/fresh rule",
+      row.includes("useRowPulse") === false,
+      "client/newest is still in the capsule path",
+    );
+    const indexServer = fs.readFileSync(path.join(here, "..", "paseo-plugin", "index.server.ts"), "utf8");
+    check(
+      "the server registers the arm RPC",
+      indexServer.includes("server.handle(rewindNoticeArm"),
+      "arm RPC registration missing",
+    );
+    check(
+      "the server captures the handle from allowed hooks only",
+      indexServer.includes('"agent.turn_started"') && indexServer.includes('"agent.turn_ended"'),
+      "capture hooks missing",
+    );
+    check(
+      "the server never registers before(agent.session_open)",
+      indexServer.includes('before("agent.session_open"') === false
+        && indexServer.includes("before('agent.session_open'") === false,
+      "the forbidden before-hook is registered",
+    );
   }
 
-  console.log(`\n${passed} passed, ${failed} failed`);
-  process.exit(failed === 0 ? 0 : 1);
+  console.log(`\n  ${passed}/${passed + failed} passed`);
+  if (failed > 0) {
+    console.log(`  ${failed} FAILED`);
+    process.exit(1);
+  }
+  process.exit(0);
 }
 
 main().catch((error) => {

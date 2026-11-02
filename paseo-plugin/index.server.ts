@@ -1,11 +1,38 @@
-import type { PluginServerContext } from "@getpaseo/plugin/server";
+import type { PluginHandlerContext, PluginServerContext } from "@getpaseo/plugin/server";
 import { jobsList } from "./shared/jobs";
+import { rewindNoticeArm } from "./shared/rewind-notice";
 import { ensurePaseoProfile } from "./server/bootstrap";
+import { capturePaseo } from "./server/rewind-notice-append";
 import { createDshProvider, readAgentJobs } from "./server/provider";
 
 /**
+ * The lifecycle events the server half listens on **only** to capture the Paseo
+ * API handle.
+ *
+ * A provider connection is not handed that handle: `connect()` receives the
+ * launch configuration, protocol versions and capabilities, nothing else, and
+ * the plugin process's single `PaseoApi` instance is passed to hook, RPC and
+ * tool callbacks instead. The rewind report needs it (its timeline append is
+ * the one delivery channel the host's rewind run lock cannot swallow — see
+ * `server/rewind-notice-append`), so it is captured from every callback the
+ * host offers.
+ *
+ * These are `on` hooks, never `before("agent.session_open")`: the host
+ * invalidates plugin sessions for a plugin that registers that before-hook on
+ * every start and stop, which reloads every agent before its next prompt.
+ */
+const CAPTURE_HOOKS = [
+  "agent.created",
+  "agent.turn_started",
+  "agent.turn_ended",
+  "agent.permission_requested",
+  "agent.permission_resolved",
+  "agent.archived",
+] as const;
+
+/**
  * Register the DeepSeek Harness provider, provisioning the DSH profile it needs,
- * and the one RPC the composer's jobs pill asks through.
+ * and the two RPCs the client half asks through.
  *
  * Paseo's plugin installer runs no install scripts, so this plugin is
  * self-sufficient: on load it writes `$DSH_HOME/profiles/<name>` and the bridge
@@ -23,6 +50,12 @@ import { createDshProvider, readAgentJobs } from "./server/provider";
  * (that would be a Paseo protocol extension, not something a plugin may invent).
  * A plugin RPC is the supported channel for exactly this: daemon-side work the
  * client asks for.
+ *
+ * The rewind-notice arm RPC carries no answer at all. It exists because the
+ * handle can only be captured from a callback, and after a daemon restart the
+ * user may rewind before any turn hook fires; the client bundle calls it once
+ * when it loads, so a connected app always has a captured handle. It is the
+ * same capture the hooks above perform — see {@link CAPTURE_HOOKS}.
  */
 export default function contribute(server: PluginServerContext) {
   try {
@@ -40,9 +73,17 @@ export default function contribute(server: PluginServerContext) {
     );
   }
 
+  // Every callback the host hands us carries the same plugin-scoped Paseo API
+  // instance; keeping it is what lets a rewind report reach the timeline.
+  const capture = (context: PluginHandlerContext): void => {
+    capturePaseo(context.paseo);
+  };
+  const cleanups = CAPTURE_HOOKS.map((name) => server.on(name, (_event, context) => capture(context)));
+
   server.registerProvider(createDshProvider());
 
-  server.handle(jobsList, async ({ agentId }) => {
+  server.handle(jobsList, async ({ agentId }, context) => {
+    capture(context);
     // The two ordinary "nothing to show" cases answer an empty list, which is the
     // truth from this process's point of view. A real read failure comes back as
     // `available: false` so the pill can say "could not read".
@@ -54,5 +95,12 @@ export default function contribute(server: PluginServerContext) {
     };
   });
 
-  return () => {};
+  server.handle(rewindNoticeArm, (_input, context) => {
+    capture(context);
+    return {};
+  });
+
+  return () => {
+    for (const cleanup of cleanups) cleanup();
+  };
 }

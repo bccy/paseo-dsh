@@ -23,13 +23,17 @@ import { contributeStreamStats } from "./client/stream-stats";
 import { localeFromMetadata, setLocale } from "./client/locale";
 import { RewindNotice } from "./client/rewind-notice";
 import {
-  REWIND_NOTICE_KIND,
-  REWIND_NOTICE_VERSION,
-  rewindNoticeItem,
+  isLegacyRewindNotice,
   rewindNoticeSchema,
 } from "./client/rewind-notice-data";
+import { startRewindLiveMonitor } from "./client/rewind-notice-live";
 import { InlineToolCall } from "./client/tool-call";
 import { toolCallData } from "./client/tool-call-data";
+import {
+  REWIND_NOTICE_KIND,
+  REWIND_NOTICE_VERSION,
+  rewindNoticeArm,
+} from "./shared/rewind-notice";
 
 export default function contribute(client: PluginClientContext) {
   client.addTimelineTransformer({
@@ -198,24 +202,19 @@ export default function contribute(client: PluginClientContext) {
     Component: InlineToolCall,
   });
 
-  // A finished rewind leaves a `session.notice` behind. Paseo projects it as a
-  // `notification` timeline item (`translateNotice` in the host's
-  // `plugin-provider.js`), and the app runs that item through the plugin
-  // transforms just like a reasoning or tool row. Taking the report over here is
-  // what gives the client a component to mount, which is the only way a plugin
-  // can call the `useToast()` hook; the row itself draws the same text with the
-  // provider's own success/warning tone. The transformer returns `undefined`
-  // for every other notification (the `撤回已生效` canary, open warnings, other
-  // providers' notices), keeping the host's renderer for them.
+  // The rewind report is a plugin timeline row appended by the server half (see
+  // `server/rewind-notice-append`), so it needs no transform — only a renderer.
+  //
+  // This transformer exists for the **old** delivery path: notices the previous
+  // implementation wrote into the provider history are rebuilt into the
+  // timeline by every conversation rewind and used to stack up there. The
+  // report is recognised from the shared copy table and removed; every other
+  // notification (the `撤回已生效` canary, open warnings, other providers'
+  // notices) is left to the host's own renderer.
   client.addTimelineTransformer({
     id: "dsh-rewind-notice",
     query: { itemType: "notification" },
-    transform: ({ item }) => {
-      const transformed = rewindNoticeItem(item.message);
-      return transformed === undefined
-        ? undefined
-        : { items: [{ type: "plugin", ...transformed }] };
-    },
+    transform: ({ item }) => (isLegacyRewindNotice(item.message) ? { items: [] } : undefined),
   });
 
   client.addTimelineRenderer({
@@ -235,6 +234,22 @@ export default function contribute(client: PluginClientContext) {
   // a real teardown (a timer, a subscription) this line would drop it silently.
   // Composing them costs a line and turns the assumption into code.
   const cleanups = [contributeStreamStats(client), contributeJobsPill(client)];
+
+  // The live witness behind the capsule: a per-agent timeline subscription
+  // records which report rows arrived live, so a replayed or refetched row is
+  // never toasted (see `client/rewind-notice-live`). The arm RPC is sent now so
+  // the server half captures the Paseo API handle before the first rewind — a
+  // daemon restart leaves it without one until a hook or RPC fires.
+  cleanups.push(
+    startRewindLiveMonitor(client.paseo, {
+      arm: () => client.rpc(rewindNoticeArm, {}),
+      onError: (message, error) => {
+        console.error(
+          `[dsh-paseo] ${message}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      },
+    }),
+  );
 
   // The jobs pill registers one pill and one poll timer per agent, so its
   // cleanup is the one that actually does work today; running them in order

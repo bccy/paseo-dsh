@@ -19,24 +19,28 @@
 - `harness/newest-check.cjs` — `client/newest.ts` 的"哪一行是最新、该不该脉冲"：位置判定、
   提交批次（回放历史不闪）、窗口、交接、时钟。**动了客户端脉冲条件必跑。**
 - `harness/rewind-notice-check.cjs` — 撤回完成提示的客户端半：`shared/rewind-notice.ts` 的两种
-  locale 文案与计数回退（读不出计数时不得编数字）、`client/rewind-notice-data.ts` 的 notice→插件行
-  变换与 `RewindToastGate`（实时到达弹一次、同 id 重挂载/回放/过期时间戳不弹），并驱动真实
-  `client/newest.ts` 验证回放批次真的把 `fresh` 压成 false；`index.client.tsx` 的 transformer
-  query 与 renderer 注册按源码检查。**动了撤回文案、`shared/rewind-notice.ts`、
-  `client/rewind-notice*.ts(x)`、`client/newest.ts` 或 `index.client.tsx` 的注册必跑。**
-- `harness/rewind-notice-delivery-check.mjs` — 撤回提示**能不能真的到达时间线**：一个进程里接上
-  真实宿主（`PluginAgentClientRegistry` + `AgentManager` + `agent-run-state`）与编译后的插件，
-  下面垫 `fake-dsh-bridge.mjs`，驱动一次真实 `rewind()`。断言：完成提示在 `rewind()` 返回
-  （宿主释放 rewind run lock）时还不在时间线、延迟后**在**且到达时间晚于锁释放；插件在回执后
-  等满 `REWIND_NOTICE_DELAY_MS` 才发，该延迟相对实测的宿主尾段（`hydrateTimelineFromProvider`
-  + `refreshSessionState` + `persistSnapshot` + `emitState` + settle）留有余量；机制半：经同一条
-  provider 连接在回执时刻注入的 notice 被宿主丢弃、锁释放后注入的同一条留下；conversation 撤回
-  的完成提示在更长尾段下同样存活、被撤行消失。canary 只打印观察不断言（它回执前发出，同样被
-  run lock 丢弃，见 FIELD-NOTES 第 78 条）。**动了 provider 的 `session.revert` 分支、
-  `server/rewind-delivery.ts`、撤回提示的发出位置，或宿主 `agent-manager.js` /
-  `agent-run-state.js` 的 rewind/staging 逻辑必跑。** 运行：
-  `node harness/rewind-notice-delivery-check.mjs`（自己编译到 `paseo-plugin/.dbg-p15-delivery`；
-  不需要 daemon、不需要模型）。
+  locale 文案与计数回退（读不出计数时不得编数字）、`client/rewind-notice-data.ts` 对**旧**
+  session.notice 撤回行的识别（transformer 要删掉它们，canary 不得误伤）、
+  `client/rewind-notice-live.ts` 的实时监视器（live 事件弹一次、重复投递/重挂载不弹、回放/重拉
+  不弹、交接窗口、目录观察的 provider/新鲜度/数量上限、失败上报、dispose 释放），以及
+  `index.client.tsx` / `index.server.ts` 的接线（renderer 用 shared kind、启动监视器并调用 arm
+  RPC、只注册允许的 hook、不注册 `before("agent.session.open")`）。**动了撤回文案、
+  `shared/rewind-notice.ts`、`client/rewind-notice*.ts(x)` 或 `index.client.tsx` 的注册必跑。**
+  运行：`node harness/rewind-notice-check.cjs`（自己编译到 `paseo-plugin/.dbg-p17-client`）。
+- `harness/rewind-notice-delivery-check.mjs` — 撤回完成提示**能不能确定地到达时间线**：一个进程里
+  接上真实宿主（`PluginAgentClientRegistry` + `AgentManager` + `agent-run-state`）与编译后的插件，
+  下面垫 `fake-dsh-bridge.mjs`，并用一个**假 Paseo API** 把 `timeline.append` /
+  `timeline.subscribe` / `timeline.refetch` 接到宿主自己的方法上。断言：报告作为插件行落在
+  daemon 的时间线里恰好一条；conversation/`both` 的行在宿主派发
+  `agent.timeline.replacement` **之后**才落（重建会删掉之前的行）；2s 快照写入 + 5s 时间线重建的
+  慢宿主下同样成立；行不进 provider history，下一次撤回不会把它复活；拿不到 paseo 句柄时报告
+  排队、捕获后补发；canary 仍先于回执；机制半：回执同回合发出的 `session.notice` 被宿主丢弃、
+  而追加的行存活。降级路径（replacement 一直不来）在子进程里用
+  `DSH_PASEO_REWIND_REPLACEMENT_TIMEOUT_MS` 缩短超时驱动。**动了 provider 的 `session.revert`
+  分支、`server/rewind-notice-append.ts`、`index.server.ts` 的句柄捕获/arm RPC，或宿主
+  `agent-manager.js` 的 rewind/hydrate/staging 逻辑必跑。** 运行：
+  `node harness/rewind-notice-delivery-check.mjs`（自己编译到
+  `paseo-plugin/.dbg-p17-delivery`；不需要 daemon、不需要模型）。
 - `harness/tool-call-check.cjs` — `client/tool-call-data.ts` 的工具行映射（图标、命令、diff、
   截断、失败原因、终端卡）。**动了工具行渲染必跑（含失败原因与终端卡：错误只认顶层
   `item.error.message`，终端正文全量 + 224px 纵向滚动 + 复制）。**
@@ -168,10 +172,12 @@
   文案要点出文件那一半；仍然没有「正在回退，请稍候」这类刷新窗口通知。每条成功撤回还要有**恰好
   一条 completion notice**，文案按 scope 与回执 `restored`/`deleted` 数组计数，且必须在
   `request.completed` **之后**（与 canary 相反，补丁宿主会截断回执前的内容）；部分失败只发
-  `文件回退未完成`，不得再发成功提示。回执后的这条提示是**延迟**发出的（宿主 rewind run lock
-  期间的事件会被 staging 丢弃，见 `harness/rewind-notice-delivery-check.mjs`），所以每条被接受的
-  撤回在断言前都要等它出现——那是契约的一部分，不是等待竞态。假桥 + 一次性 `DSH_HOME`。**动了 provider 的
-  `session.revert`/`sessions` 分支、能力位声明、canary/完成提示的发出位置与文案、`dsh-process.ts`
+  `文件回退未完成`，不得再发成功提示。这个脚本**直接驱动 provider 连接**、不发
+  `PASEO_AGENT_ID`，所以完成报告走的是 provider 的**响亮降级**：没有 agent id 就没有可追加的
+  时间线行，provider 打日志并退回 provider notice——本脚本钉的正是这条降级路径的文案/顺序/计数。
+  正常路径（`timeline.append`、在 `agent.timeline.replacement` 之后落行）由
+  `harness/rewind-notice-delivery-check.mjs` 覆盖。假桥 + 一次性 `DSH_HOME`。**动了 provider 的
+  `session.revert`/`sessions` 分支、能力位声明、canary/完成报告的发出位置与文案、`dsh-process.ts`
   的这两个请求、或假桥对应分支必跑**；**`listDshSessions`/`#listSessions` 或 `DshProcess.sessions()`
   的 cwd 透传也算（断言出站帧 `params.cwd`）。**
 - `harness/rewind-transaction-check.mjs` — 撤回事务（真实 `PaseoHarnessServer` + 真实

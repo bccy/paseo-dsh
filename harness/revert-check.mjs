@@ -318,12 +318,18 @@ console.log('no deferred-notice chain (the rewind no longer closes the provider 
   // The remaining notice channel must still exist. Open warnings go through
   // `#notice` directly; the file restore failure cannot — the daemon holds a
   // foreground run lock for the whole rewind and drops provider events sent
-  // while it is pending (`harness/rewind-notice-delivery-check.mjs`), so it is
-  // queued behind that lock instead. Asserted as the queued form so reverting to
-  // the immediate send (which never reached the timeline) is caught.
+  // while it is pending (`harness/rewind-notice-delivery-check.mjs`), so the
+  // failure is delivered as an appended warning row through the same path as the
+  // success report. Asserted as that form so reverting to a provider notice
+  // (which never reached the timeline) is caught.
   check(
-    'a file restore failure is queued for after the rewind lock (no epoch rebuild discards it)',
-    /this\.#noticeAfterRewind\(\s*input\.sessionId,\s*"error",\s*"文件回退未完成"/.test(provider),
+    'a file restore failure is delivered as a warning report row, not a provider notice',
+    /文件回退未完成[\s\S]{0,400}?"warning",?\s*\)/.test(provider)
+      && !/#noticeAfterRewind/.test(provider),
+  );
+  check(
+    'the guessed 300 ms delivery delay is gone with its module',
+    !/REWIND_NOTICE_DELAY_MS|rewind-delivery/.test(provider),
   );
   check(
     'and the open warnings still go through #notice after session.ready',
@@ -421,8 +427,8 @@ console.log('wiring (the pure module is useless if nothing calls it)');
     !/#resolvePaseoBinary|PASEO_BIN/.test(provider),
   );
   check(
-    'provider surfaces a failed file restore as a post-rewind timeline notice',
-    /#noticeAfterRewind\(\s*input\.sessionId,\s*"error",\s*"文件回退未完成"/.test(provider),
+    'provider surfaces a failed file restore as a post-rewind warning row',
+    /文件回退未完成[\s\S]{0,400}?"warning",?\s*\)/.test(provider),
   );
   check(
     'no "timeline was not refreshed" warning is left (there is no refresh to fail)',

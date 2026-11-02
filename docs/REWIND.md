@@ -209,10 +209,35 @@ Paseo 的插件 provider 适配层把翻译后的时间线事件放进一个**�
 
 ### 完成提示：成功与部分失败
 
-canary 只回答"时间线刷没刷新"，不回答"这次撤回了什么"。所以每次**成功**的撤回在
-`request.completed` **之后**再发一条 completion notice——位置与 canary 相反，因为它必须在
-每一种宿主上都留下来（补丁宿主会在回执解析时截断之前进入缓冲区的行）。两条通知的文案不能
-混用：canary 是自证机制，completion 是结果报告。
+canary 只回答"时间线刷没刷新"，不回答"这次撤回了什么"。所以每次**成功**的撤回都要再给出一条
+completion 报告。它**不是** provider notice：宿主在整段撤回期间持有 foreground run lock
+（`AgentManager.rewind` 的 `createPendingRun` … `finally settleForegroundRun`），锁在时
+`enqueueSessionEvent` 把 provider 事件压进 `pendingRun.stagedEvents`，settle 时随 run 一起丢弃。
+旧实现把报告排到猜测的 300 ms 之后发出，daemon 日志里已经出现过一次 1128 ms 的撤回——那次报告
+被静默吞掉。**锁内发、锁外延迟发都到不了时间线，且都靠猜。**
+
+现在的报告是**插件时间线行**：`paseo.agents.ref(agentId).timeline.append(...)`。daemon 的
+`appendTimelineItem` 直接 `recordTimeline` + `dispatchStream`，不经 `enqueueSessionEvent`，
+所以 run lock 吞不掉它；它也不进 provider history（`PluginAgentSession.history`），因此下一次
+conversation 撤回重建时间线时不会像旧 notice 那样被重新带出来、越积越多。实现在
+`server/rewind-notice-append.ts`。
+
+**什么时候落行**：conversation / `both` 撤回会在宿主里重建时间线（`hydrateTimelineFromProvider`
+→ `forceHydrateTimelineFromLegacyProviderHistory`：先 `timelineStore.delete` 再按 provider history
+重录），重建**之前**追加的行会被抹掉。宿主在重建之后、释放 run lock 之前派发
+`agent.timeline.replacement`，所以 provider 在**发撤回请求之前**就订阅该 agent 的 live 时间线，
+收到 replacement 之后再 append；`files` 不重建对话，回执后直接 append。订阅的 `ready` 在发撤回
+请求前等待（有上限），replacement 的等待也有上限：超时就先 append 并在短延迟后
+`timeline.refetch` 复核，行被更晚的重建吃掉时补发一次并记日志——降级是显式且有界的，不猜。
+
+**插件进程怎么拿到 `paseo` 句柄**：provider 连接的 `connect()` 拿不到它（只有 launch 配置、
+协议版本与能力位），句柄只出现在 hook / RPC 回调的 `PluginHandlerContext` 里。所以
+`index.server.ts` 从 `agent.created` / `agent.turn_started` / `agent.turn_ended` /
+`agent.permission_*` / `agent.archived` 这些 **`on` hook** 以及 `jobs.list` RPC 里捕获它
+（**绝不注册 `before("agent.session.open")`**，那会让宿主在插件起停时 invalidate 所有 agent 会话）。
+daemon 重启后、第一次 hook 之前就可能发生撤回，所以客户端 bundle 加载时会调一次
+`rewind.notice.arm` RPC 把句柄送进服务端；真拿不到句柄时报告会排队，等下一次捕获后补发
+（排队与补发都写日志），并退回 provider notice 作为响亮兜底。
 
 文案在 `shared/rewind-notice.ts` 的两种 locale 表里，服务端按 `server/locale.ts` 的 `UI.rewind`
 选取；计数取桥回执 `files.restored` / `files.deleted` 的数组长度（不是猜的 `count` 字段）：
@@ -222,26 +247,25 @@ canary 只回答"时间线刷没刷新"，不回答"这次撤回了什么"。所
   「已撤回对话，这条消息之后没有改动文件」
 - `files`：已恢复 N 个文件（删除 M 个）；没有文件可恢复时为
   「这条消息之后没有改动文件，无需恢复」
-- 部分失败（`files.failed` / `skipped` / `unrecoverable` / `error` 非空）：只保留现有的
-  「文件回退未完成」提示行，不再发成功提示。计数读不出来时退回不带数字的句子，绝不编数字。
+- 部分失败（`files.failed` / `skipped` / `unrecoverable` / `error` 非空）：只保留
+  「文件回退未完成」这一条 warning 行，不再发成功行。计数读不出来时退回不带数字的句子，绝不编数字。
 
-**什么时候发**：不是回执之后立刻发，也不是回执之前。宿主在整段撤回期间持有 foreground run
-lock，锁在时 provider 事件只会被 staging、settle 时丢弃，所以回执前后发都到不了时间线（真机症状：
-撤回成功、文件恢复正确，但既没有提示行也没有胶囊）。宿主在锁释放前不会再回头调用 provider
-（`refreshSessionState` / `streamHistory` 对插件 provider 都是宿主侧本地方法），插件观察不到
-settle，因此报告由 `server/rewind-delivery.ts` 的 `RewindNoticeTimers` 排到
-`REWIND_NOTICE_DELAY_MS`（300 ms）之后发出。**这个延迟是启发式**：依据是宿主回执后的尾段——
-conversation/both 的 `hydrateTimelineFromProvider` 重建、`refreshSessionState`、一次 snapshot
-落盘、`emitState`，最后 `settleForegroundRun`——真实宿主代码上实测 4 ms（files）/ 38 ms
-（conversation），300 ms 留了一个数量级余量。会话在延迟内关闭则丢弃（不发，也不留"会话不存在"
-的错日志）。`harness/rewind-notice-delivery-check.mjs` 在真实宿主代码上断言：回执时刻发出的被
-丢弃、延迟后的到达时间线且晚于锁释放、延迟相对实测尾段留有余量。
+**行 id 是固定的**（`rewind-notice`）：Paseo 按 `pluginId/id` 折叠插件行，所以同一会话里后一次
+报告会**替换**前一条，而不是堆行；conversation / `both` 的重建还会把它整个清掉。
 
-客户端把这条 notice 的 `notification` 行接管成 `dsh-rewind-notice` 插件行——这是让插件拿到
-组件挂载点的唯一途径（`useToast()` 是 hook，插件没有别的常驻挂载面）。胶囊只在**实时到达**时
-弹一次：回放历史、重开会话、滚动重挂载都不弹。判断复用 `client/newest.ts` 的提交批次规则，
-再加时间戳年龄与合成行 id 去重（`RewindToastGate`；宿主 `translateNotice` 会丢掉 `notice.id`，
-所以 id 是 agentId+记录时间+文案）。
+**旧的 session.notice 撤回行**（过去 300 ms 方案留下的）在 provider history 里，会被每次重建
+带出来。客户端 transformer 用同一张文案表识别它们并返回空数组删掉，只对本插件文案生效；
+canary（「撤回已生效」）不在表里，不会被误伤。
+
+**胶囊（顶部 toast）**：客户端插件订阅该 agent 的 live 时间线
+（`client/rewind-notice-live.ts`），收到本插件行（kind `dsh-rewind-notice`，带唯一
+`noticeId`）时记一笔，行组件挂载时消费一次——live 到达弹一次，回放/重拉/重开会话不经过订阅，
+天然不弹。旧实现靠 `client/newest.ts` 的 bulk/fresh 规则 + 6 s 时间窗猜"是否实时"，conversation
+撤回重建时间线后行时间戳刷新、提交成批，胶囊被判 bulk 而不弹（离线复现）；这套判定已从胶囊
+路径移除（`newest.ts` 仍服务于工具行脉冲）。监视器的订阅集合：目录里本 provider 且最近活跃的
+agent（有上限），加上任何挂载过报告行的 agent（后者保证同一会话后续撤回一定有胶囊）。只有
+「会话里还没有任何本插件行、且该 agent 不在最近活跃集合」的第一次撤回可能没有胶囊——行本身
+照常显示。
 
 - **补丁路径**：`~/.paseo/local-patches/apply-rewind-history-truncation.mjs`，目标是 daemon 实际加载的
   `@getpaseo/server/dist/server/server/agent/plugin-provider.js`（不是仓库 checkout——那里没有构建产物，
@@ -293,8 +317,9 @@ this.ctx.get('permissionPresets').set(session, name);
   **提示有两条，含义不同**：回执前的「撤回已生效」canary 是自证机制——设计上在补丁宿主上随被撤行
   一起被截掉（一闪而过）、在原版宿主上留下来告诉用户执行 Reload agent 或重开会话（见上一节），
   所以必须在 `request.completed` 之前发出，顺序不能换；但它的交付在真实 daemon 上被 rewind run
-  lock 吞掉（见上一节的实测修正）。回执后的 completion notice 报告这次撤回了什么（scope 与文件
-  计数），在任何宿主上都要留下，因此**延迟到宿主释放 run lock 之后**才发（见「完成提示」一节）。
+  lock 吞掉（见上一节的实测修正）。回执后的 completion 报告是**插件时间线行**
+  （`timeline.append`，见「完成提示」一节），报告这次撤回了什么（scope 与文件计数），绕过
+  run lock、在任何宿主上都能留下；它在 conversation / `both` 的**时间线重建之后**才落行。
   并发的第二次撤回由桥的 `revertInflight` 守卫拒绝（`request.failed`，不是静默）。
 - **当前可见对话的第一条消息不支持撤回**：撤掉它等于清空整个对话，而 Paseo 客户端对"重建后
   空对话"的 live 刷新不可靠（旧行会留在屏幕上，再点旧行报 `No provider revert token`）。
@@ -305,8 +330,8 @@ this.ctx.get('permissionPresets').set(session, name);
 - 子会话（DSH 原生 child）不支持撤回：只读投影，没有自己的进程。
 - 文件回退失败时：`both` 的对话仍然已经撤回，`files` 本来就没有对话变更；回执按 `files.failed` /
   `files.skipped` / `files.unrecoverable` 分类，**撤回前备份保留**（journal 不清理，重试撤回会再次
-  恢复）；恢复计划本身失败则带 `files.error`。提示行以 `session.notice` 出现在**当前**时间线里
-  （没有 epoch 重建），但要等宿主释放 rewind run lock 之后才送达（见「完成提示」一节）。注意 rescue 目录里是**被替换前的当前内容**（已含智能体
+  恢复）；恢复计划本身失败则带 `files.error`。失败提示行以**插件时间线行**出现在**当前**时间线里
+  （files 不重建对话，回执后直接追加，见「完成提示」一节）。注意 rescue 目录里是**被替换前的当前内容**（已含智能体
   改动），不是撤回前状态，别拿它当预编辑恢复材料。
 - **对话作用域（conversation）不走文件层**：不拿文件闸门、不要求 `agent.runMaintenance`；
   它仍会发 canary（对话被刷新了，需要自证），`both` 与 `files` 才做文件恢复，其中只有 `both`
