@@ -377,18 +377,29 @@ console.log("status and size");
     agentRow({ event: "message", sender: { id: "a" }, text: "y".repeat(7000) }),
     "complete",
   );
+  // CT-01 removed the 6000-char cap from every body a card renders whole inside
+  // its own scroll region and copies in full. An `agent_message` row is
+  // `kind: "generic"`, and the generic code surface is one of those cards
+  // (`.bodyScroll`, 260px), so the message must arrive whole and carry no
+  // truncation marker in either locale.
   check(
-    "a huge message is truncated with the localized marker",
-    huge.body.endsWith(allText()["zh-CN"].truncated) && huge.body.length < 7000,
+    "a huge message is kept whole (CT-01: generic card scrolls and copies)",
+    huge.body.length === 7000 &&
+      !huge.body.endsWith(allText()["zh-CN"].truncated) &&
+      !huge.body.endsWith(allText().en.truncated),
     `${huge.body.length} chars`,
   );
   setLocale("en");
-  equal(
-    "and the English marker after a locale relay",
-    toolCallData(agentRow({ event: "message", sender: { id: "a" }, text: "y".repeat(7000) }), "complete").body.endsWith(
-      allText().en.truncated,
-    ),
-    true,
+  const relayed = toolCallData(
+    agentRow({ event: "message", sender: { id: "a" }, text: "y".repeat(7000) }),
+    "complete",
+  );
+  check(
+    "and it stays whole after a locale relay (CT-01: generic card scrolls and copies)",
+    relayed.body.length === 7000 &&
+      !relayed.body.endsWith(allText().en.truncated) &&
+      !relayed.body.endsWith(allText()["zh-CN"].truncated),
+    `${relayed.body.length} chars`,
   );
   setLocale(undefined);
 }
