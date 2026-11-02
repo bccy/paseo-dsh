@@ -302,9 +302,14 @@ const sharedLines = ((await journal('root-1')) ?? []).filter((line) => line.path
 check('parent and child writes to the same path leave two journal lines', sharedLines.length === 2, JSON.stringify(sharedLines.map((line) => line.callId)));
 
 const beforeIgnored = (await journal('root-1'))?.length ?? 0;
-await trackEdit(child, 'call-child-failed', join(workspace, 'failed.txt'), { isError: true, content: 'X\n' });
+// A failed tool call is dropped only when the file it names did not change: DSH
+// can report a completed atomic write as ABORTED, and that pre-image is
+// journaled instead of lost (BF-02). This one fails without touching the file,
+// so nothing is recorded; the landed-write shape is asserted in
+// `file-snapshot-check`.
+await trackEdit(child, 'call-child-failed', join(workspace, 'failed.txt'), { isError: true });
 await trackEdit(child, 'call-bash-untouched', join(workspace, 'bash.txt'), { name: 'bash' });
-check('a failed tool call records nothing', ((await journal('root-1'))?.length ?? 0) === beforeIgnored);
+check('a failed tool call that changed nothing records nothing', ((await journal('root-1'))?.length ?? 0) === beforeIgnored);
 check('an untracked tool records nothing', ((await journal('root-1'))?.length ?? 0) === beforeIgnored);
 check('the pending map is empty after commit', snapshots.pending.size === 0);
 

@@ -21,7 +21,16 @@
  *   next rewind instead of becoming a silent success (BF-03);
  * - a restore refuses a path whose parent directory was moved or replaced by a
  *   symlink since capture — including the creation case, whose delete must not
- *   follow the link (BR-04 / H-02).
+ *   follow the link (BR-04 / H-02);
+ * - a capture that fails **after** the bytes were read (object store unwritable,
+ *   identity resolution failed) is journaled as a `skip` too, and a journal
+ *   append failure still reaches `planRestore` through the in-memory ledger —
+ *   the rewind must never answer "no files changed" for a path it cannot
+ *   restore (BF-01);
+ * - a write that provably landed before its result was judged `isError` keeps
+ *   its pre-image line (BF-02);
+ * - a corrupt/truncated content object is reported as a failed restore instead
+ *   of being written back over the user's file (BF-03).
  *
  * Uses a real temp directory, so the journal/objects/rescue layout is exercised
  * as written, not mocked.
@@ -31,7 +40,7 @@
  * **动了 `file-snapshots.js` 的 `capture` 读/序号绑定、`skip` 载入、`planRestore`
  * 的 `unrecoverable`、`restore` 的目录身份复核，或 `server.js` 的撤回回执字段必跑。**
  */
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
@@ -689,6 +698,380 @@ console.log('unreferenced objects are collected');
     swept.keptRecent >= 1 && existsSync(join(objectsDir, 'feedfacefeedface')),
     JSON.stringify(swept),
   );
+}
+
+console.log('a capture that fails after the read still reaches the rewind (BF-01)');
+{
+  // The tool has already read the bytes when the object store fails, but it is
+  // still going to run and change the file. The old catch-all returned
+  // `ok:false`, dropped the pending entry and wrote only stderr: no journal
+  // line, so a rewind planned nothing and told the user "no files changed".
+  // Each case below fails at a different post-read step.
+  const cases = [
+    {
+      label: 'the object directory cannot be created',
+      session: 'post-read-mkdir',
+      prepare: async (stateRoot, sessionDir) => {
+        await mkdir(sessionDir, { recursive: true });
+        await writeFile(join(sessionDir, 'objects'), 'occupied by a file', 'utf8');
+      },
+      reason: /capture failed.*EEXIST/,
+    },
+    {
+      label: 'the object cannot be written (read-only store)',
+      session: 'post-read-write',
+      prepare: async (stateRoot, sessionDir) => {
+        await mkdir(join(sessionDir, 'objects'), { recursive: true });
+        await chmod(join(sessionDir, 'objects'), 0o500);
+      },
+      cleanup: async (stateRoot, sessionDir) => {
+        await chmod(join(sessionDir, 'objects'), 0o700);
+      },
+      reason: /capture failed.*EACCES/,
+    },
+  ];
+  for (const testCase of cases) {
+    const stateRoot = join(root, `post-read-${testCase.session}`);
+    const file = join(root, `post-read-${testCase.session}.txt`);
+    await writeFile(file, 'ORIGINAL', 'utf8');
+    const failing = new FileSnapshots({ rootDir: stateRoot, warn: (line) => warnings.push(line) });
+    const sessionDir = join(stateRoot, encodeURIComponent(testCase.session));
+    await testCase.prepare(stateRoot, sessionDir);
+    let captured;
+    try {
+      captured = await failing.capture({ sessionId: testCase.session, anchorSeq: 5, callId: 'c1', path: file });
+    } finally {
+      await testCase.cleanup?.(stateRoot, sessionDir);
+    }
+    check(
+      `a capture where ${testCase.label} reports a skip`,
+      captured.ok === true && testCase.reason.test(captured.skipped ?? ''),
+      JSON.stringify(captured),
+    );
+    // The tool succeeded anyway and the file really changed.
+    await writeFile(file, 'CHANGED', 'utf8');
+    await failing.commit({ sessionId: testCase.session, callId: 'c1' }, { isError: false });
+    const journal = await failing.readJournal(testCase.session);
+    check(
+      `…and the skip is durable in the journal (${testCase.label})`,
+      journal.entries.length === 1 && typeof journal.entries[0]?.skip === 'string',
+      JSON.stringify(journal.entries),
+    );
+    const plan = await failing.planRestore(testCase.session, 5);
+    check(
+      `…and the rewind reports it unrecoverable instead of "no files changed" (${testCase.label})`,
+      plan.actions.length === 0
+        && plan.unrecoverable.some((entry) => entry.path === file && testCase.reason.test(entry.reason)),
+      JSON.stringify(plan),
+    );
+  }
+
+  // The third post-read step: the parent identity cannot be resolved. Its
+  // failure is injected at `realpath` (used only by `#captureIdentity`).
+  {
+    const session = 'post-read-identity';
+    const stateRoot = join(root, 'post-read-identity');
+    const dir = join(root, 'post-read-identity-dir');
+    await mkdir(dir, { recursive: true });
+    const file = join(dir, 'file.txt');
+    await writeFile(file, 'ORIGINAL', 'utf8');
+    const failing = new FileSnapshots({ rootDir: stateRoot, warn: (line) => warnings.push(line) });
+    const realRealpath = fs.promises.realpath;
+    fs.promises.realpath = async (path, ...args) => {
+      if (String(path) === dir) {
+        const error = new Error('injected realpath failure');
+        error.code = 'EIO';
+        throw error;
+      }
+      return realRealpath.call(fs.promises, path, ...args);
+    };
+    syncBuiltinESMExports();
+    let captured;
+    try {
+      captured = await failing.capture({ sessionId: session, anchorSeq: 5, callId: 'identity', path: file });
+    } finally {
+      fs.promises.realpath = realRealpath;
+      syncBuiltinESMExports();
+    }
+    check(
+      'a capture whose parent identity cannot be resolved reports a skip',
+      captured.ok === true && /capture failed.*injected realpath failure/.test(captured.skipped ?? ''),
+      JSON.stringify(captured),
+    );
+    await writeFile(file, 'CHANGED', 'utf8');
+    await failing.commit({ sessionId: session, callId: 'identity' }, { isError: false });
+    const plan = await failing.planRestore(session, 5);
+    check(
+      'and the rewind reports the path unrecoverable',
+      plan.actions.length === 0 && plan.unrecoverable.some((entry) => entry.path === file),
+      JSON.stringify(plan),
+    );
+  }
+
+  // A journal append that fails has nowhere durable to put the line. The
+  // in-memory ledger is the last resort, and it must also protect the object:
+  // that object is the only retry material left while the process lives.
+  {
+    const session = 'journal-append-failure';
+    const stateRoot = join(root, 'journal-append-failure-state');
+    const file = join(root, 'journal-append-failure.txt');
+    await writeFile(file, 'ORIGINAL', 'utf8');
+    const failing = new FileSnapshots({ rootDir: stateRoot, warn: (line) => warnings.push(line) });
+    const realAppendFile = fs.promises.appendFile;
+    fs.promises.appendFile = async (path, ...args) => {
+      if (String(path).endsWith('journal.jsonl')) {
+        const error = new Error('injected ENOSPC');
+        error.code = 'ENOSPC';
+        throw error;
+      }
+      return realAppendFile.call(fs.promises, path, ...args);
+    };
+    syncBuiltinESMExports();
+    try {
+      await failing.capture({ sessionId: session, anchorSeq: 5, callId: 'append-fail', path: file });
+      await writeFile(file, 'CHANGED', 'utf8');
+      await failing.commit({ sessionId: session, callId: 'append-fail' }, { isError: false });
+    } finally {
+      fs.promises.appendFile = realAppendFile;
+      syncBuiltinESMExports();
+    }
+    const journal = await failing.readJournal(session);
+    check('a journal append failure leaves no durable line', journal.entries.length === 0, JSON.stringify(journal.entries));
+    check(
+      '…but it is reported on stderr',
+      warnings.some((line) => /could not record a file snapshot/.test(line)),
+      JSON.stringify(warnings.slice(-2)),
+    );
+    const plan = await failing.planRestore(session, 5);
+    check(
+      '…and the rewind still reports the path unrecoverable (in-memory ledger)',
+      plan.actions.length === 0
+        && plan.unrecoverable.some((entry) => entry.path === file && /not recorded/.test(entry.reason)),
+      JSON.stringify(plan),
+    );
+    const objectsDir = join(stateRoot, encodeURIComponent(session), 'objects');
+    const objectName = (await readdir(objectsDir))[0];
+    const old = new Date(Date.now() - 10 * 60_000);
+    await utimes(join(objectsDir, objectName), old, old);
+    const collected = await failing.collectGarbage(session);
+    check(
+      '…and the unrecorded object is kept as retry material',
+      collected.removed === 0 && existsSync(join(objectsDir, objectName)),
+      JSON.stringify(collected),
+    );
+  }
+}
+
+console.log('a write that landed before its result was an error keeps its pre-image (BF-02)');
+{
+  // DSH's editing tools publish atomically, then the caller's cancellation can
+  // rewrite the completed body to ABORTED. `commit` used to drop every pending
+  // entry on `isError`, so that pre-image was lost and a later rewind silently
+  // left the file modified.
+  const session = 'is-error-after-write';
+  const file = join(root, 'is-error-after-write.txt');
+  await writeFile(file, 'ORIGINAL', 'utf8');
+  const snap = new FileSnapshots({ rootDir: join(root, 'is-error-after-write-state'), warn: (line) => warnings.push(line) });
+  await snap.capture({ sessionId: session, anchorSeq: 5, callId: 'late-error', path: file });
+  await writeFile(file, 'CHANGED', 'utf8');
+  await snap.commit({ sessionId: session, callId: 'late-error' }, { isError: true });
+  const journal = await snap.readJournal(session);
+  check(
+    'a write that landed before the error result is still journaled',
+    journal.entries.length === 1 && journal.entries[0].backup !== null,
+    JSON.stringify(journal.entries),
+  );
+  const plan = await snap.planRestore(session, 5);
+  const outcome = await snap.restore(session, plan.actions);
+  check(
+    '…and the rewind restores the pre-write content',
+    outcome.failed.length === 0 && (await readFile(file, 'utf8')) === 'ORIGINAL',
+    JSON.stringify(outcome),
+  );
+
+  // The creation shape: the capture recorded "absent", the file appeared anyway.
+  const createSession = 'is-error-after-create';
+  const created = join(root, 'is-error-after-create.txt');
+  const creator = new FileSnapshots({ rootDir: join(root, 'is-error-after-create-state'), warn: (line) => warnings.push(line) });
+  await creator.capture({ sessionId: createSession, anchorSeq: 5, callId: 'late-create', path: created });
+  await writeFile(created, 'CREATED', 'utf8');
+  await creator.commit({ sessionId: createSession, callId: 'late-create' }, { isError: true });
+  const createJournal = await creator.readJournal(createSession);
+  check(
+    'a creation that landed before the error result is journaled as absent',
+    createJournal.entries.length === 1 && createJournal.entries[0].backup === null,
+    JSON.stringify(createJournal.entries),
+  );
+  const createPlan = await creator.planRestore(createSession, 5);
+  await creator.restore(createSession, createPlan.actions);
+  check('…and the rewind deletes it', existsSync(created) === false);
+}
+
+console.log('a corrupt content object is never written back (BF-03)');
+{
+  const session = 'corrupt-object';
+  const stateRoot = join(root, 'corrupt-object-state');
+  const file = join(root, 'corrupt-object.txt');
+  await writeFile(file, 'ORIGINAL-CONTENT', 'utf8');
+  const snap = new FileSnapshots({ rootDir: stateRoot, warn: (line) => warnings.push(line) });
+  await snap.capture({ sessionId: session, anchorSeq: 5, callId: 'corrupt', path: file });
+  await snap.commit({ sessionId: session, callId: 'corrupt' }, { isError: false });
+  await writeFile(file, 'AGENT-WROTE-THIS', 'utf8');
+  const journal = await snap.readJournal(session);
+  const backup = journal.entries[0]?.backup;
+  // A half-written object from an ENOSPC/crash (or external corruption): it
+  // exists under the right name but its bytes are not the captured content.
+  await writeFile(join(stateRoot, encodeURIComponent(session), 'objects', backup), 'ORIG', 'utf8');
+  const plan = await snap.planRestore(session, 5);
+  const outcome = await snap.restore(session, plan.actions);
+  check(
+    'a truncated snapshot object is reported as a failed restore',
+    outcome.failed.length === 1 && outcome.failed[0].path === file && /corrupt/.test(outcome.failed[0].error),
+    JSON.stringify(outcome),
+  );
+  check(
+    'and the user file keeps its current content',
+    (await readFile(file, 'utf8')) === 'AGENT-WROTE-THIS',
+    await readFile(file, 'utf8'),
+  );
+  check(
+    'and no rescue copy is claimed for a restore that never wrote',
+    outcome.rescue.length === 0,
+    JSON.stringify(outcome.rescue),
+  );
+
+  // The length check above only covers the truncated shape. A same-length object
+  // with different bytes passes it and can only be caught by the content hash —
+  // the branch this case exists to pin (the mutation that disables the hash check
+  // must turn this red, which the truncated fixture alone did not do).
+  const hashSession = 'corrupt-object-same-size';
+  const hashStateRoot = join(root, 'corrupt-object-same-size-state');
+  const hashFile = join(root, 'corrupt-object-same-size.txt');
+  await writeFile(hashFile, 'ORIGINAL-CONTENT', 'utf8');
+  const hashSnap = new FileSnapshots({ rootDir: hashStateRoot, warn: (line) => warnings.push(line) });
+  await hashSnap.capture({ sessionId: hashSession, anchorSeq: 5, callId: 'corrupt-hash', path: hashFile });
+  await hashSnap.commit({ sessionId: hashSession, callId: 'corrupt-hash' }, { isError: false });
+  await writeFile(hashFile, 'AGENT-WROTE-THIS', 'utf8');
+  const hashJournal = await hashSnap.readJournal(hashSession);
+  const hashBackup = hashJournal.entries[0]?.backup;
+  const hashObject = join(hashStateRoot, encodeURIComponent(hashSession), 'objects', hashBackup);
+  // Same byte length (16), different bytes: the truncated fixture above cannot
+  // reach the hash branch.
+  await writeFile(hashObject, 'XXXXXXXXXXXXXXXX', 'utf8');
+  const hashPlan = await hashSnap.planRestore(hashSession, 5);
+  const hashOutcome = await hashSnap.restore(hashSession, hashPlan.actions);
+  check(
+    'a same-length tampered object is reported as a failed restore (content hash)',
+    hashOutcome.failed.length === 1
+      && hashOutcome.failed[0].path === hashFile
+      && /corrupt \(content hash/.test(hashOutcome.failed[0].error),
+    JSON.stringify(hashOutcome.failed),
+  );
+  check(
+    'and the user file is not overwritten with the tampered bytes',
+    (await readFile(hashFile, 'utf8')) === 'AGENT-WROTE-THIS',
+    await readFile(hashFile, 'utf8'),
+  );
+  check(
+    'and no rescue copy is claimed for the tampered object',
+    hashOutcome.rescue.length === 0 && hashOutcome.restored.length === 0,
+    JSON.stringify({ rescue: hashOutcome.rescue, restored: hashOutcome.restored }),
+  );
+}
+
+console.log('a size change is detected without re-reading the file (R1)');
+{
+  // `#pendingChanged` used to read and hash the *current* file for every isError
+  // result. The captured pre-image is capped at `maxFileBytes`, but the tool may
+  // have replaced it with a much larger file, so that read is unbounded. A length
+  // difference already proves the content changed; the full read is only needed
+  // when the lengths match. Assert the cheap path is actually taken.
+  const session = 'is-error-size-change';
+  const file = join(root, 'is-error-size-change.txt');
+  await writeFile(file, 'SMALL', 'utf8');
+  const snap = new FileSnapshots({ rootDir: join(root, 'is-error-size-change-state'), warn: (line) => warnings.push(line) });
+  await snap.capture({ sessionId: session, anchorSeq: 5, callId: 'size-change', path: file });
+  await writeFile(file, 'MUCH-LARGER-CONTENT-THAN-BEFORE', 'utf8');
+  const realReadFile = fs.promises.readFile;
+  let reads = 0;
+  fs.promises.readFile = async (path, ...args) => {
+    if (String(path) === file) reads += 1;
+    return realReadFile.call(fs.promises, path, ...args);
+  };
+  syncBuiltinESMExports();
+  try {
+    await snap.commit({ sessionId: session, callId: 'size-change' }, { isError: true });
+  } finally {
+    fs.promises.readFile = realReadFile;
+    syncBuiltinESMExports();
+  }
+  check('a different byte length is detected without reading the file', reads === 0, `${reads} read(s)`);
+  const journal = await snap.readJournal(session);
+  check(
+    '…and the landed write is still journaled',
+    journal.entries.length === 1 && journal.entries[0].backup !== null,
+    JSON.stringify(journal.entries),
+  );
+}
+
+console.log('a plan waits for a closing snapshot another caller is settling (R4)');
+{
+  // The teardown path claims a parked snapshot and journals it asynchronously. A
+  // rewind planning at that moment must not read the journal before that line
+  // lands: the old `settleAbandoned` deleted the entry from the parked map before
+  // awaiting, so a concurrent `settle()` saw an empty map and returned early —
+  // `planRestore` then produced an empty plan while the line landed just after.
+  const session = 'abandon-race';
+  const file = join(root, 'abandon-race.txt');
+  // Same length on purpose: a length difference is now decided by the cheap stat
+  // path (R1), and this case needs the change check to reach its `readFile` so the
+  // in-flight window is deterministic.
+  await writeFile(file, 'BEFORE', 'utf8');
+  const racing = new FileSnapshots({ rootDir: join(root, 'abandon-race-state'), warn: (line) => warnings.push(line) });
+  await racing.capture({ sessionId: session, anchorSeq: 5, callId: 'race', path: file });
+  await writeFile(file, 'AFTERX', 'utf8');
+  racing.abandonSession(session);
+  const realReadFile = fs.promises.readFile;
+  let releaseRead;
+  let markReadStarted;
+  const readStarted = new Promise((resolve) => {
+    markReadStarted = resolve;
+  });
+  const readRelease = new Promise((resolve) => {
+    releaseRead = resolve;
+  });
+  fs.promises.readFile = async (path, ...args) => {
+    if (String(path) === file) {
+      markReadStarted();
+      await readRelease;
+    }
+    return realReadFile.call(fs.promises, path, ...args);
+  };
+  syncBuiltinESMExports();
+  let planDuring;
+  try {
+    // Teardown side claims the parked entry and blocks inside the change check.
+    const settling = racing.settleAbandoned();
+    await readStarted;
+    // A rewind plans while that claim is in flight.
+    const planning = racing.planRestore(session, 5);
+    // Give the unfixed implementation time to return early (it would see an
+    // empty parked map); the fixed one must stay blocked on the in-flight claim.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    releaseRead();
+    planDuring = await planning;
+    await settling;
+  } finally {
+    fs.promises.readFile = realReadFile;
+    syncBuiltinESMExports();
+  }
+  check(
+    'a plan made while a closing snapshot is settling still sees the path',
+    planDuring.actions.length === 1 && planDuring.unrecoverable.length === 0,
+    JSON.stringify(planDuring),
+  );
+  const journal = await racing.readJournal(session);
+  check('and the line is durable afterwards', journal.entries.length === 1, JSON.stringify(journal.entries));
 }
 
 await rm(root, { recursive: true, force: true });

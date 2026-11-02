@@ -2175,7 +2175,9 @@ export class PaseoHarnessServer {
    *
    * Fail-open: when resolution fails, the caller skips the snapshot rather than
    * journaling a guessed path — a wrong path is the one thing a rewind must never
-   * act on, and a missing restore is already reported through the receipt.
+   * act on. A snapshot that never starts has no path to record, so this failure
+   * is only logged; the receipt can report the paths `capture` did see (including
+   * its own failures), not a path the bridge never resolved.
    *
    * @param {{agent?: object, signal?: AbortSignal}} exec - the tool dispatch execution.
    * @returns {Promise<string | undefined>}
@@ -2202,8 +2204,9 @@ export class PaseoHarnessServer {
     // runtime `this.cwd` is the directory of whichever session initialized
     // first, so falling back to it would resolve a tool's relative path inside
     // ANOTHER project — and a snapshot recorded under the wrong path lets a
-    // rewind act on a file the tool never touched. A skipped snapshot is
-    // already reported through the rewind receipt.
+    // rewind act on a file the tool never touched. Like the failure above, the
+    // skip is logged only: without a resolved path there is nothing the receipt
+    // could name.
     return session?.header?.cwd;
   }
 
@@ -2378,7 +2381,12 @@ export class PaseoHarnessServer {
    * Snapshot one file before a tracked editing tool mutates it.
    *
    * Called from `tools/execute`; never throws, because a snapshot problem must
-   * not stop the agent's turn (the rewind reports a missing snapshot instead).
+   * not stop the agent's turn. Once `capture` runs, its failures become durable
+   * `skip` lines (or the in-memory ledger when even the journal write fails), so
+   * the rewind can report the path instead of "no files changed". A call that
+   * returns **before** `capture` — no session, no call id, no resolvable path, no
+   * anchor — has nothing to record and is only logged; that residual is the part
+   * of HC-01 this fix does not cover.
    *
    * The snapshot is keyed under the ROOT session: a rewind restores files by
    * reading that session's journal, so an edit made by a delegated subagent is
@@ -2658,8 +2666,15 @@ export class PaseoHarnessServer {
       // Plan once before cancelling anything: a request that cannot be honoured
       // (the first human message, a stale or injected row) must not interrupt a
       // running turn. The range may move while the agent settles, so plan again
-      // after it is idle and use that.
-      const preliminary = planRewind(session.surface.nodes, (seq) => session.eventAt(seq), params.token);
+      // after it is idle and use that. A `files` rewind withdraws no message, so
+      // the first-message rule (which protects the conversation from being
+      // emptied) is not passed to it (BSR-01).
+      const preliminary = planRewind(
+        session.surface.nodes,
+        (seq) => session.eventAt(seq),
+        params.token,
+        { rewindsConversation },
+      );
       if (!preliminary.ok) throw new Error(preliminary.reason);
       // `runMaintenance` is DSH's own exclusive scope for one agent: while it
       // runs, that agent's tools are held out. It does **not** cover the agent's
@@ -2677,7 +2692,12 @@ export class PaseoHarnessServer {
       const applyRewind = async (signal) => {
       const releaseFiles = restores ? await this.fileMutationGate.freeze(sessionKey, signal) : undefined;
       try {
-      const resolved = planRewind(session.surface.nodes, (seq) => session.eventAt(seq), params.token);
+      const resolved = planRewind(
+        session.surface.nodes,
+        (seq) => session.eventAt(seq),
+        params.token,
+        { rewindsConversation },
+      );
       if (!resolved.ok) throw new Error(resolved.reason);
       // Plan the file restore before touching the log: an unreadable journal or
       // a target outside the session must fail while the conversation is still
@@ -3551,6 +3571,11 @@ export class PaseoHarnessServer {
               + `${error instanceof Error ? error.message : String(error)}\n`,
             );
           }
+          // The dispose cancels and drains the in-flight tracked edits; only now
+          // is it settled whether their atomic writes landed. Journal those that
+          // did, so the pre-image is not lost (BF-02). Inside the teardown record
+          // so a reopen cannot plan a rewind before these lines are written.
+          await this.fileSnapshots.settleAbandoned();
         });
       }
     }
@@ -3578,6 +3603,11 @@ export class PaseoHarnessServer {
             + `the session may not be reopenable: ${error instanceof Error ? error.message : String(error)}\n`,
           );
         }
+        // The dispose cancels and drains the in-flight tracked edits; only now is
+        // it settled whether their atomic writes landed. Journal those that did,
+        // so the pre-image is not lost (BF-02). Inside the teardown record so a
+        // reopen cannot plan a rewind before these lines are written.
+        await this.fileSnapshots.settleAbandoned();
       });
     }
     return { closed: true };
@@ -3669,9 +3699,9 @@ export class PaseoHarnessServer {
     this.revertInflight.delete(sessionId);
     // Pending file snapshots are keyed `<executing session>:<callId>` (see
     // `captureFileBeforeTool`), so both the owner map and the snapshot's own
-    // `pending` entry have to go. Clearing only `snapshotOwners` left `pending`
-    // holding a mid-flight edit's file contents for the life of the process:
-    // `pending` only shrinks in capture/commit/discard, never on close.
+    // `pending` entry have to be dealt with. Clearing only `snapshotOwners` left
+    // `pending` holding a mid-flight edit's file contents for the life of the
+    // process: `pending` only shrinks in capture/commit/discard, never on close.
     const prefix = `${sessionId}:`;
     // File-mutation tickets are keyed the same way. Dropping the map entry
     // without releasing it would leave the gate's active count raised forever,
@@ -3690,12 +3720,13 @@ export class PaseoHarnessServer {
     for (const key of [...this.snapshotOwners.keys()]) {
       if (key.startsWith(prefix)) this.snapshotOwners.delete(key);
     }
-    for (const key of [...this.fileSnapshots.pending.keys()]) {
-      if (!key.startsWith(prefix)) continue;
-      // `pendingKey` is the whole identity here; the journal owner (which may be
-      // this session's root) is not needed to drop the in-memory entry.
-      this.fileSnapshots.discard({ sessionId, callId: key.slice(prefix.length), pendingKey: key });
-    }
+    // A close must not assume an in-flight write did not land. `handle.dispose()`
+    // (which cancels the running turn) happens **after** this clear, so the
+    // pending entry's `tools/post-execute` commit will never find its owner — but
+    // DSH's editing tools publish atomically and the rename may already be on
+    // disk. Park the entries; the session teardown settles them once the agent is
+    // quiescent (BF-02). `discard` would throw the only pre-image away.
+    this.fileSnapshots.abandonSession(sessionId);
   }
 
   requireSession(sessionId) {

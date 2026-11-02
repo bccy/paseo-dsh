@@ -27,7 +27,13 @@
  * - A capture that cannot be taken (non-regular file, over the cap, an I/O
  *   failure) commits a line carrying `skip` instead of `backup`. A rewind that
  *   selects it cannot restore that path, so it reports the path as
- *   `unrecoverable` instead of silently claiming the tree came back.
+ *   `unrecoverable` instead of silently claiming the tree came back. That also
+ *   covers a failure **after** the bytes were read (the object store could not
+ *   be created or written, the parent identity could not be resolved): the tool
+ *   still runs, so the path must be journaled as a skip even though there is no
+ *   object. A journal append that fails cannot be journaled at all; that fact is
+ *   kept in an in-memory ledger which `planRestore` folds into `unrecoverable`
+ *   and which keeps the object out of the garbage collector (BF-01).
  *
  *   The order is only provable **per path**: a line written before this build
  *   carries no `captureOrderVersion`, and a process-local counter that restarted
@@ -143,6 +149,17 @@ const MAX_ANCHORS = 1000;
  * window; five minutes is far longer than any capture-to-commit gap.
  */
 const GC_GRACE_MS = 5 * 60 * 1000;
+
+/**
+ * Cap on the in-memory "unrecorded change" ledger, per session.
+ *
+ * An entry is only created when the journal append itself failed, which is a
+ * broken-disk condition rather than a normal path. The bound exists so a
+ * permanently unwritable session cannot grow the process's memory without limit;
+ * dropping the oldest entry costs one path's report, the same boundary the
+ * journal's own `MAX_ANCHORS` accepts.
+ */
+const MAX_UNRECORDED = 1000;
 
 /**
  * Process-wide monotonic counter that keeps rescue copy names unique.
@@ -271,11 +288,37 @@ function journalLine(entry) {
       ? {
           backup: entry.backup,
           mode: entry.mode,
+          // The captured byte length, so a restore can reject a truncated
+          // content object before writing it back (BF-03). Optional: lines
+          // written before this field existed restore with the hash check only.
+          ...(entry.size === undefined ? {} : { size: entry.size }),
           ...(entry.dirPath === undefined ? {} : { dirPath: entry.dirPath, dirReal: entry.dirReal }),
         }
       : { skip: entry.skip }),
     time: new Date().toISOString(),
   })}\n`;
+}
+
+/**
+ * The file state a failed capture keeps for the later "did the write land" check.
+ *
+ * A capture that fails after `stat` has no captured bytes to compare against, so
+ * `commit` on an `isError` result compares this fingerprint instead. `contentHash`
+ * is added when the bytes *were* read (the object store failed afterwards), which
+ * makes the comparison exact; without it the stat fields are the best evidence
+ * available (BF-02).
+ *
+ * @param {import('node:fs').Stats} info
+ * @returns {{exists: boolean, size: number, mtimeMs: number, ino: number, mode: number}}
+ */
+function fingerprintOf(info) {
+  return {
+    exists: true,
+    size: info.size,
+    mtimeMs: info.mtimeMs,
+    ino: info.ino,
+    mode: info.mode,
+  };
 }
 
 /**
@@ -320,6 +363,44 @@ export class FileSnapshots {
    * ({@link beginOwner}). Evicting the oldest entry only costs a re-read.
    */
   #sequenceRoots = new Set();
+
+  /**
+   * Session id -> path -> the earliest change whose journal line could not be
+   * written.
+   *
+   * The journal is the only durable input to `planRestore`, so a failed append
+   * leaves nothing to plan from. Without this ledger the rewind would find an
+   * empty plan and report "this message changed no files" while a tracked tool
+   * really did modify the path. Entries are kept for the life of the process and
+   * folded into `unrecoverable` (BF-01); they are deliberately not durable —
+   * the failure is a full/unwritable disk, which is exactly what would break a
+   * sidecar file too, and the journal line was never durable to begin with.
+   */
+  #unrecorded = new Map();
+
+  /**
+   * Pending snapshots of sessions that are closing, keyed like {@link pending}.
+   *
+   * A close clears the bridge's tables before disposing the agent, so an edit
+   * still in flight loses its owner entry and its `post-execute` commit never
+   * journals anything. The entries are parked here and settled **after** the
+   * dispose ({@link settleAbandoned}): DSH's editing tools publish atomically, so
+   * the rename may already be on disk and dropping the entry would lose the only
+   * pre-image (BF-02).
+   */
+  #abandoned = new Map();
+
+  /**
+   * Key -> promise of a parked snapshot whose change check is in flight.
+   *
+   * {@link settleAbandoned} removes an entry from {@link #abandoned} before its
+   * first `await`, so two callers cannot settle the same entry twice. That means
+   * a concurrent caller (a rewind planning while a session teardown is
+   * journalling) may find the parked map empty and must still wait for these
+   * claims — otherwise it reads the journal before their lines land and plans an
+   * empty restore (R4).
+   */
+  #settling = new Map();
 
   /**
    * @param {object} [options]
@@ -426,9 +507,13 @@ export class FileSnapshots {
    * this, a commit still queued behind a slow append would be missing from the
    * plan — the file it names would not be restored, and its entry would then be
    * pruned as if it had been.
+   *
+   * Closing sessions are included: their pending snapshots are settled after the
+   * agent is disposed, which may happen while a rewind is already planning.
    */
   async settle() {
     await this.#writeQueue;
+    await this.settleAbandoned();
   }
 
   /**
@@ -468,9 +553,13 @@ export class FileSnapshots {
   /**
    * Snapshot one file before the tool mutates it.
    *
-   * Never throws: a rewind must not break the agent's turn. Failures and skips
-   * are returned so the caller can log them; a skipped file simply will not be
-   * restored (and the bridge says so in the receipt).
+   * Never throws: a rewind must not break the agent's turn. A capture that could
+   * not be taken returns `ok: true` with a `skipped` reason, so `commit` can turn
+   * it into a durable `skip` line when the tool succeeds — including failures
+   * **after** the bytes were read (object store, parent identity), which used to
+   * be a bare stderr line and let a rewind report "no files changed" (BF-01).
+   * Only a failure to even register the pending entry returns `ok: false`; that
+   * path is folded into the in-memory ledger so the rewind still reports it.
    *
    * @param {{sessionId: string, anchorSeq: number, callId: string, path: string, pendingKey?: string}} input
    * @returns {Promise<{ok: true, skipped?: string} | {ok: false, error: string}>}
@@ -484,66 +573,103 @@ export class FileSnapshots {
       // number, so `planRestore` picked a pre-image that was newer than the one
       // it claimed to restore (BF-02).
       return await this.#serializeOnPath(input.path, async () => {
-        let info;
+        // A capture that fails once the bytes were read still has to leave a
+        // trace: the tool is going to run anyway. The order allocated before the
+        // failure travels with the skip so the ranking stays honest, and the
+        // bytes' hash (when they were read) becomes the "did the write land"
+        // evidence `commit` uses for an `isError` result (BF-02).
+        let captureSeq;
+        let fingerprint;
         try {
-          info = await stat(input.path);
-        } catch (error) {
-          if (error?.code === 'ENOENT') {
-            // The tool is about to create the file: the rewind deletes it. The
-            // parent identity is recorded too, so the delete cannot be
-            // redirected through an ancestor symlink.
-            const captureSeq = await this.#nextCaptureSequence(input.sessionId);
-            this.pending.set(key, {
-              anchorSeq: input.anchorSeq,
-              captureSeq,
-              callId: input.callId,
-              path: input.path,
-              backup: null,
-              mode: null,
-              ...(await this.#captureIdentity(input.path)),
-            });
-            return { ok: true };
+          let info;
+          try {
+            info = await stat(input.path);
+          } catch (error) {
+            if (error?.code === 'ENOENT') {
+              // The tool is about to create the file: the rewind deletes it. The
+              // parent identity is recorded too, so the delete cannot be
+              // redirected through an ancestor symlink.
+              fingerprint = { exists: false };
+              captureSeq = await this.#nextCaptureSequence(input.sessionId);
+              this.pending.set(key, {
+                ownerSessionId: input.sessionId,
+                anchorSeq: input.anchorSeq,
+                captureSeq,
+                callId: input.callId,
+                path: input.path,
+                backup: null,
+                mode: null,
+                ...(await this.#captureIdentity(input.path)),
+              });
+              return { ok: true };
+            }
+            return await this.#recordSkippedCapture(key, input, `stat failed: ${errorMessage(error)}`);
           }
-          return await this.#recordSkippedCapture(key, input, `stat failed: ${errorMessage(error)}`);
-        }
-        if (!info.isFile()) {
-          return await this.#recordSkippedCapture(key, input, 'not-a-regular-file');
-        }
-        if (info.size > this.maxFileBytes) {
-          return await this.#recordSkippedCapture(key, input, `larger than ${this.maxFileBytes} bytes`);
-        }
-        let bytes;
-        try {
-          bytes = await readFile(input.path);
-        } catch (error) {
-          return await this.#recordSkippedCapture(key, input, `read failed: ${errorMessage(error)}`);
-        }
-        const captureSeq = await this.#nextCaptureSequence(input.sessionId);
-        const backup = objectKey(bytes);
-        const objects = this.objectsDir(input.sessionId);
-        await mkdir(objects, { recursive: true });
-        const target = join(objects, backup);
-        try {
-          await stat(target);
-        } catch {
-          await writeFile(target, bytes, { flag: 'wx' }).catch(async (error) => {
-            // A concurrent capture of identical content may have won the race.
-            if (error?.code !== 'EEXIST') throw error;
+          fingerprint = fingerprintOf(info);
+          if (!info.isFile()) {
+            return await this.#recordSkippedCapture(key, input, 'not-a-regular-file', undefined, fingerprint);
+          }
+          if (info.size > this.maxFileBytes) {
+            return await this.#recordSkippedCapture(
+              key,
+              input,
+              `larger than ${this.maxFileBytes} bytes`,
+              undefined,
+              fingerprint,
+            );
+          }
+          let bytes;
+          try {
+            bytes = await readFile(input.path);
+          } catch (error) {
+            return await this.#recordSkippedCapture(key, input, `read failed: ${errorMessage(error)}`, undefined, fingerprint);
+          }
+          const backup = objectKey(bytes);
+          fingerprint = { ...fingerprint, contentHash: backup };
+          captureSeq = await this.#nextCaptureSequence(input.sessionId);
+          const objects = this.objectsDir(input.sessionId);
+          await mkdir(objects, { recursive: true });
+          const target = join(objects, backup);
+          try {
+            await stat(target);
+          } catch {
+            await writeFile(target, bytes, { flag: 'wx' }).catch(async (error) => {
+              // A concurrent capture of identical content may have won the race.
+              if (error?.code !== 'EEXIST') throw error;
+            });
+          }
+          this.pending.set(key, {
+            ownerSessionId: input.sessionId,
+            anchorSeq: input.anchorSeq,
+            captureSeq,
+            callId: input.callId,
+            path: input.path,
+            backup,
+            size: bytes.length,
+            mode: info.mode & 0o777,
+            ...(await this.#captureIdentity(input.path)),
           });
+          return { ok: true };
+        } catch (error) {
+          // The read may have succeeded before the object store or the identity
+          // check failed. Record the skip here (inside the per-path chain) so the
+          // capture order stays honest even when the journal queue is what failed.
+          return await this.#recordSkippedCapture(
+            key,
+            input,
+            `capture failed: ${errorMessage(error)}`,
+            captureSeq,
+            fingerprint,
+          );
         }
-        this.pending.set(key, {
-          anchorSeq: input.anchorSeq,
-          captureSeq,
-          callId: input.callId,
-          path: input.path,
-          backup,
-          mode: info.mode & 0o777,
-          ...(await this.#captureIdentity(input.path)),
-        });
-        return { ok: true };
       });
     } catch (error) {
+      // Last resort: even the pending entry could not be registered (an internal
+      // failure, e.g. the journal read behind the sequence allocation). Keep the
+      // fact in the ledger so a rewind still reports the path instead of
+      // claiming nothing changed.
       this.pending.delete(key);
+      this.#noteUnrecorded(input.sessionId, input.anchorSeq, input.path, `capture failed: ${errorMessage(error)}`);
       return { ok: false, error: errorMessage(error) };
     }
   }
@@ -554,21 +680,42 @@ export class FileSnapshots {
    * The tool may still succeed and change the file; without a line in the
    * journal the rewind would plan nothing for that path and report a clean
    * success while the file stays modified (BF-03). `commit` turns this pending
-   * entry into a `skip` line only when the tool actually succeeded.
+   * entry into a `skip` line only when the tool actually succeeded (or provably
+   * changed the file despite reporting an error).
+   *
+   * A capture order is optional: when even allocating one fails (the journal
+   * could not be read), the entry is still kept and `commit` writes a line
+   * without it. `planRestore` cannot rank a `skip` line without a number, so it
+   * treats it as the earliest post-target capture — the loud direction, since
+   * restoring a later pre-image over an uncaptured change would be wrong.
    *
    * @param {string} key
    * @param {{sessionId: string, anchorSeq: number, callId: string, path: string}} input
    * @param {string} reason
+   * @param {number} [captureSeq] - an order already allocated by the failed attempt.
+   * @param {{exists: boolean, size?: number, mtimeMs?: number, ino?: number, mode?: number, contentHash?: string}} [fingerprint]
    * @returns {Promise<{ok: true, skipped: string}>}
    */
-  async #recordSkippedCapture(key, input, reason) {
-    const captureSeq = await this.#nextCaptureSequence(input.sessionId);
+  async #recordSkippedCapture(key, input, reason, captureSeq, fingerprint) {
+    let sequence = captureSeq;
+    if (sequence === undefined) {
+      try {
+        sequence = await this.#nextCaptureSequence(input.sessionId);
+      } catch (error) {
+        this.warn(
+          `could not allocate a capture order for the skipped snapshot of ${input.path}: ${errorMessage(error)}`,
+        );
+        sequence = undefined;
+      }
+    }
     this.pending.set(key, {
+      ownerSessionId: input.sessionId,
       anchorSeq: input.anchorSeq,
-      captureSeq,
+      ...(sequence === undefined ? {} : { captureSeq: sequence }),
       callId: input.callId,
       path: input.path,
       skip: reason,
+      ...(fingerprint === undefined ? {} : { fingerprint }),
     });
     return { ok: true, skipped: reason };
   }
@@ -666,9 +813,16 @@ export class FileSnapshots {
   }
 
   /**
-   * Turn a successful tool call's pending snapshot into a durable journal line.
+   * Turn a tool call's pending snapshot into a durable journal line.
    *
-   * Failures are logged and dropped: a failed write did not change the file.
+   * A successful tool commits unconditionally. A failed one commits only when
+   * the file provably changed: DSH can report a completed atomic write as
+   * ABORTED (the caller's cancellation is applied after the body finished), and
+   * that pre-image is the only retry material a later rewind has (BF-02).
+   *
+   * A failure to *write* the line is logged and folded into the in-memory
+   * ledger, so a rewind still reports the path as unrecoverable instead of "no
+   * files changed" (BF-01).
    *
    * @param {{sessionId: string, callId: string, pendingKey?: string}} input
    * @param {{isError?: boolean}} [result]
@@ -679,29 +833,302 @@ export class FileSnapshots {
     const pending = this.pending.get(key);
     this.pending.delete(key);
     if (pending === undefined) return;
-    if (result?.isError === true) return;
+    if (result?.isError === true) {
+      let changed;
+      try {
+        changed = await this.#pendingChanged(pending);
+      } catch (error) {
+        // Cannot prove the file is unchanged: keep the pre-image rather than
+        // losing the only copy of what it held before the call.
+        this.warn(`could not verify whether ${String(pending.path ?? '')} changed: ${errorMessage(error)}`);
+        changed = true;
+      }
+      if (!changed) return;
+    }
     if (pending.skip !== undefined) {
-      // The tool still succeeded, so the file may have changed. Keep the reason
-      // in the durable journal: a later rewind has to be able to report that it
-      // cannot restore this path (BF-03), and an in-memory log line would be
-      // gone by then.
+      // The tool still succeeded (or provably wrote), so the file may have
+      // changed. Keep the reason in the durable journal: a later rewind has to
+      // be able to report that it cannot restore this path (BF-03), and an
+      // in-memory log line would be gone by then.
       this.warn(`file snapshot skipped for ${String(pending.path ?? '')}: ${pending.skip}`);
     }
     try {
-      await this.#enqueue(async () => {
-        await mkdir(this.sessionDir(input.sessionId), { recursive: true });
-        // Every line this build writes carries the version marker, also when it
-        // is a `skip`: the capture order in it is comparable with this build's.
-        const line = journalLine({ ...pending, captureOrderVersion: CAPTURE_ORDER_VERSION });
-        await appendFile(this.journalPath(input.sessionId), line, 'utf8');
-      });
+      await this.#appendJournalLine(input.sessionId, pending);
     } catch (error) {
       this.warn(`could not record a file snapshot for ${input.sessionId}: ${errorMessage(error)}`);
+      // The journal is the durable record, so a failed append must not vanish:
+      // fold the path into the in-memory ledger `planRestore` reports. The object
+      // (when one was written) stays protected by the same entry.
+      this.#noteUnrecorded(
+        input.sessionId,
+        pending.anchorSeq,
+        pending.path,
+        `snapshot not recorded: ${errorMessage(error)}`,
+        pending.backup,
+      );
+    }
+  }
+
+  /**
+   * Append one pending snapshot as a durable journal line.
+   *
+   * Serialised on the journal queue, and version-marked like every other line
+   * this build writes — also when it is a `skip`, whose capture order is
+   * comparable with this build's numbers.
+   *
+   * @param {string} sessionId
+   * @param {object} pending
+   * @returns {Promise<void>}
+   */
+  async #appendJournalLine(sessionId, pending) {
+    await this.#enqueue(async () => {
+      await mkdir(this.sessionDir(sessionId), { recursive: true });
+      const line = journalLine({ ...pending, captureOrderVersion: CAPTURE_ORDER_VERSION });
+      await appendFile(this.journalPath(sessionId), line, 'utf8');
+    });
+  }
+
+  /**
+   * Whether the file this pending snapshot describes actually changed.
+   *
+   * `commit` used to drop every pending entry when the tool reported an error, on
+   * the assumption that "a failed write did not change the file". DSH's editing
+   * tools publish atomically and only then let the caller's cancellation rewrite
+   * the completed body to ABORTED, so the rename can be on disk while the result
+   * says `isError` (BF-02). The comparison below keeps the entry exactly when the
+   * bytes (or the file's existence) differ from what was captured.
+   *
+   * A capture that failed has no backup to compare against. When it got as far as
+   * reading the bytes their hash was kept for this check; when it did not, the
+   * recorded stat fingerprint is the best available evidence, and an inconclusive
+   * answer keeps the record (loud beats silent).
+   *
+   * **Cost (R1).** Comparing content needs the bytes, so this reads the file *as
+   * it is now* — not the captured pre-image, whose size `capture` capped at
+   * `maxFileBytes`. The tool may have replaced a small file with a huge one (that
+   * is exactly the isError-after-rename shape this method exists for), so an
+   * unconditional read would let one cancelled write block the whole bridge
+   * process on a multi-hundred-MB read + hash. A different byte length already
+   * proves the content changed, so the full read only happens when the lengths
+   * match — i.e. it is bounded by the captured size. A size *cap* instead would
+   * have to answer "cannot prove unchanged" as changed and journal a phantom line
+   * for a file that never changed; the length comparison keeps the answer exact.
+   *
+   * @param {object} pending
+   * @returns {Promise<boolean>}
+   */
+  async #pendingChanged(pending) {
+    if (pending.skip !== undefined) {
+      const fingerprint = pending.fingerprint;
+      if (fingerprint === undefined) return true;
+      if (fingerprint.contentHash !== undefined) {
+        // Same cheap length pre-check as the backup branch below (R1).
+        const now = await this.#statFingerprint(pending.path);
+        if (!now.exists) return true;
+        if (fingerprint.size !== undefined && now.size !== fingerprint.size) return true;
+        let bytes;
+        try {
+          bytes = await readFile(pending.path);
+        } catch (error) {
+          if (error?.code === 'ENOENT') return true;
+          throw error;
+        }
+        return objectKey(bytes) !== fingerprint.contentHash;
+      }
+      const now = await this.#statFingerprint(pending.path);
+      if (now === undefined || fingerprint.exists !== now.exists) return true;
+      if (!fingerprint.exists) return false;
+      if (fingerprint.size !== now.size) return true;
+      if (fingerprint.ino !== undefined && now.ino !== undefined && fingerprint.ino !== now.ino) return true;
+      return fingerprint.mtimeMs !== now.mtimeMs;
+    }
+    if (pending.backup === null) {
+      // Captured as absent: it changed iff the file exists now.
+      try {
+        await lstat(pending.path);
+        return true;
+      } catch (error) {
+        if (error?.code === 'ENOENT') return false;
+        throw error;
+      }
+    }
+    let info;
+    try {
+      info = await stat(pending.path);
+    } catch (error) {
+      if (error?.code === 'ENOENT') return true; // deleted after the capture
+      throw error;
+    }
+    // Cheap and decisive: a different length cannot be the captured content, so
+    // the hash (and its full read) is only needed when the lengths match.
+    if (typeof pending.size === 'number' && info.size !== pending.size) return true;
+    const bytes = await readFile(pending.path);
+    return objectKey(bytes) !== pending.backup;
+  }
+
+  /**
+   * The current stat fingerprint of `path`, or `{exists:false}` when it is gone.
+   *
+   * @param {string} path
+   * @returns {Promise<{exists: boolean, size?: number, mtimeMs?: number, ino?: number, mode?: number}>}
+   */
+  async #statFingerprint(path) {
+    try {
+      return fingerprintOf(await stat(path));
+    } catch (error) {
+      if (error?.code === 'ENOENT') return { exists: false };
+      throw error;
+    }
+  }
+
+  /**
+   * Remember a path whose snapshot could not be written to the journal.
+   *
+   * The journal is the only durable input to `planRestore`, so a failed append
+   * leaves nothing to plan from. This ledger keeps the fact (and the object name,
+   * so `collectGarbage` does not delete the last retry material) for the life of
+   * the process, and `planRestore` folds it into `unrecoverable` so the receipt
+   * says the path could not be restored instead of "no files changed" (BF-01).
+   *
+   * Deliberately in memory: the failure is usually a full or unwritable disk,
+   * which is exactly the condition that would break a sidecar file too, and the
+   * journal line was never durable to begin with. A process restart loses it —
+   * the rewind cannot claim what it cannot read. Bounded per session by
+   * {@link MAX_UNRECORDED}, and the earliest anchor for one path wins because it
+   * covers every later rewind too.
+   *
+   * @param {string} sessionId
+   * @param {number} anchorSeq
+   * @param {string} path
+   * @param {string} reason
+   * @param {string | null} [backup]
+   */
+  #noteUnrecorded(sessionId, anchorSeq, path, reason, backup) {
+    let byPath = this.#unrecorded.get(sessionId);
+    if (byPath === undefined) {
+      byPath = new Map();
+      if (this.#unrecorded.size >= SEQUENCE_ROOTS_MAX) {
+        this.#unrecorded.delete(this.#unrecorded.keys().next().value);
+      }
+      this.#unrecorded.set(sessionId, byPath);
+    }
+    const previous = byPath.get(path);
+    if (previous !== undefined && previous.anchorSeq <= anchorSeq) return;
+    byPath.set(path, {
+      anchorSeq,
+      reason,
+      ...(typeof backup === 'string' ? { backup } : {}),
+    });
+    if (byPath.size > MAX_UNRECORDED) byPath.delete(byPath.keys().next().value);
+  }
+
+  /**
+   * Park a closing session's pending snapshots for a last change check.
+   *
+   * A close clears the bridge's tables before disposing the agent, so a tracked
+   * edit still in flight loses its owner entry and its `tools/post-execute`
+   * commit never journals anything. But DSH's editing tools publish atomically:
+   * the rename may already be on disk, and dropping the entry unconditionally is
+   * what loses the pre-image (BF-02). The entries are parked here and settled by
+   * {@link settleAbandoned} **after** the dispose, so a write that lands while
+   * the agent is being torn down is still seen.
+   *
+   * @param {string} sessionId - the executing session whose entries are closing.
+   */
+  abandonSession(sessionId) {
+    const prefix = `${sessionId}:`;
+    for (const [key, pending] of [...this.pending]) {
+      if (!key.startsWith(prefix)) continue;
+      this.pending.delete(key);
+      this.#abandoned.set(key, { sessionId, pending });
+    }
+  }
+
+  /**
+   * Settle every parked closing snapshot: journal the ones whose file changed.
+   *
+   * Awaited from the session teardown (so a reopen cannot plan before these lines
+   * land) and from {@link settle} (so a plan never races one).
+   *
+   * The parked map can look empty to a second caller because the first one has
+   * already claimed the entries and is awaiting their change checks / journal
+   * appends. Those claims are tracked in {@link #settling} and awaited here too:
+   * removing the entry before its await (which is what keeps two callers from
+   * settling it twice) must not make a concurrent planner think there is nothing
+   * left to wait for (R4).
+   *
+   * @returns {Promise<void>}
+   */
+  async settleAbandoned() {
+    for (;;) {
+      for (const [key, entry] of [...this.#abandoned]) {
+        if (this.#settling.has(key)) continue;
+        const task = this.#settleOneAbandoned(key, entry);
+        this.#settling.set(key, task);
+        task.then(
+          () => this.#forgetSettling(key, task),
+          () => this.#forgetSettling(key, task),
+        );
+      }
+      if (this.#settling.size === 0 && this.#abandoned.size === 0) return;
+      await Promise.allSettled([...this.#settling.values()]);
+      // Loop again: an entry may have been parked while the claims above ran.
+    }
+  }
+
+  /**
+   * Drop one finished claim from {@link #settling}.
+   *
+   * Identity-guarded: a later close of the same key (a reused call id) may have
+   * registered its own task by the time this one finishes.
+   *
+   * @param {string} key
+   * @param {Promise<void>} task
+   */
+  #forgetSettling(key, task) {
+    if (this.#settling.get(key) === task) this.#settling.delete(key);
+  }
+
+  /**
+   * Journal one parked snapshot when its file provably changed, then forget it.
+   *
+   * @param {string} key
+   * @param {{sessionId: string, pending: object}} entry
+   * @returns {Promise<void>}
+   */
+  async #settleOneAbandoned(key, entry) {
+    this.#abandoned.delete(key);
+    const { sessionId, pending } = entry;
+    const owner = typeof pending.ownerSessionId === 'string' ? pending.ownerSessionId : sessionId;
+    let changed;
+    try {
+      changed = await this.#pendingChanged(pending);
+    } catch (error) {
+      this.warn(
+        `could not verify whether ${String(pending.path ?? '')} changed before its session closed: ${errorMessage(error)}`,
+      );
+      changed = true;
+    }
+    if (!changed) return;
+    try {
+      await this.#appendJournalLine(owner, pending);
+    } catch (error) {
+      this.warn(`could not record a file snapshot for ${owner}: ${errorMessage(error)}`);
+      this.#noteUnrecorded(
+        owner,
+        pending.anchorSeq,
+        pending.path,
+        `snapshot not recorded: ${errorMessage(error)}`,
+        pending.backup,
+      );
     }
   }
 
   /**
    * Drop a pending snapshot (tool failed, was cancelled, or never committed).
+   *
+   * Only for a caller that has proven the file did not change; a close must use
+   * {@link abandonSession} instead, because it cannot prove that (BF-02).
    *
    * @param {{sessionId: string, callId: string, pendingKey?: string}} input
    */
@@ -757,12 +1184,17 @@ export class FileSnapshots {
         && (!hasDirPath
           || (typeof parsed.dirPath === 'string' && isAbsolute(parsed.dirPath)
             && typeof parsed.dirReal === 'string' && isAbsolute(parsed.dirReal)));
+      // The captured byte length is optional (lines written before it existed
+      // have none), but a malformed one is a corrupt line, not a guess.
+      const sizeValid = parsed?.size === undefined
+        || (Number.isSafeInteger(parsed.size) && parsed.size >= 0);
       if (typeof parsed?.anchorSeq !== 'number'
         || !Number.isSafeInteger(parsed.anchorSeq) || parsed.anchorSeq < 0
         || typeof parsed?.path !== 'string'
         || !isAbsolute(parsed.path)
         || !kindValid
         || !dirValid
+        || !sizeValid
         || (parsed.captureSeq !== undefined
           && (!Number.isSafeInteger(parsed.captureSeq) || parsed.captureSeq <= 0))) {
         skippedLines += 1;
@@ -778,7 +1210,11 @@ export class FileSnapshots {
         path: parsed.path,
         ...(skipValid
           ? { skip: parsed.skip }
-          : { backup: parsed.backup, mode: typeof parsed.mode === 'number' ? parsed.mode : null }),
+          : {
+              backup: parsed.backup,
+              mode: typeof parsed.mode === 'number' ? parsed.mode : null,
+              ...(typeof parsed.size === 'number' ? { size: parsed.size } : {}),
+            }),
         ...(hasDirPath ? { dirPath: parsed.dirPath, dirReal: parsed.dirReal } : {}),
       });
     }
@@ -798,11 +1234,14 @@ export class FileSnapshots {
    * A path whose earliest post-target capture is a `skip` line cannot be
    * restored to its true pre-target state; it is returned in `unrecoverable`
    * (with the recorded reason) instead of `actions`, so the caller can tell the
-   * user rather than prune the only evidence away.
+   * user rather than prune the only evidence away. The same applies to a path
+   * whose journal line could not be written at all: it is read from the
+   * in-memory ledger, so a rewind still reports it instead of "no files changed"
+   * (BF-01).
    *
    * @param {string} sessionId
    * @param {number} targetSeq
-   * @returns {Promise<{actions: Array<{path: string, backup: string | null, mode: number | null, dirPath?: string, dirReal?: string}>, unrecoverable: Array<{path: string, reason: string}>, skippedLines: number}>}
+   * @returns {Promise<{actions: Array<{path: string, backup: string | null, mode: number | null, size?: number, dirPath?: string, dirReal?: string}>, unrecoverable: Array<{path: string, reason: string}>, skippedLines: number}>}
    */
   async planRestore(sessionId, targetSeq) {
     // A tool that has settled may still have its journal line queued behind a
@@ -854,29 +1293,45 @@ export class FileSnapshots {
       byPath.set(entry.path, {
         path: entry.path,
         ...(entry.skip === undefined
-          ? { backup: entry.backup, mode: entry.mode ?? null }
+          ? {
+              backup: entry.backup,
+              mode: entry.mode ?? null,
+              ...(entry.size === undefined ? {} : { size: entry.size }),
+            }
           : { skip: entry.skip }),
         ...(entry.dirPath === undefined ? {} : { dirPath: entry.dirPath, dirReal: entry.dirReal }),
         rank,
       });
     }
+    // A change whose journal line could not be written has no entry above at
+    // all. Fold the in-memory ledger in: the path cannot be restored to the
+    // target state even when a *later* journal line exists, because that line's
+    // pre-image already includes the unrecorded change (BF-01).
+    const unrecorded = this.#unrecorded.get(sessionId);
+    /** @type {Map<string, string>} path -> reason it cannot be restored. */
+    const unrecoverableByPath = new Map();
+    for (const [path, entry] of unrecorded ?? []) {
+      if (entry.anchorSeq >= targetSeq) unrecoverableByPath.set(path, entry.reason);
+    }
     const actions = [];
-    const unrecoverable = [];
     for (const entry of byPath.values()) {
+      if (unrecoverableByPath.has(entry.path)) continue; // ledger reason already recorded
       if (entry.skip !== undefined) {
         // The earliest capture after the target could not be taken, so there is
         // no pre-image that would be correct to write. Report it instead of
         // restoring a later (wrong) one or silently succeeding (BF-03).
-        unrecoverable.push({ path: entry.path, reason: entry.skip });
+        unrecoverableByPath.set(entry.path, entry.skip);
         continue;
       }
       actions.push({
         path: entry.path,
         backup: entry.backup,
         mode: entry.mode,
+        ...(entry.size === undefined ? {} : { size: entry.size }),
         ...(entry.dirPath === undefined ? {} : { dirPath: entry.dirPath, dirReal: entry.dirReal }),
       });
     }
+    const unrecoverable = [...unrecoverableByPath].map(([path, reason]) => ({ path, reason }));
     return { actions, unrecoverable, skippedLines };
   }
 
@@ -891,10 +1346,13 @@ export class FileSnapshots {
    * cannot make the restore write through a link into something else. When the
    * journal recorded the parent's canonical identity, it is re-checked first: a
    * parent that was moved and replaced by a symlink points at a different
-   * directory now, and the path is skipped instead of writing into it.
+   * directory now, and the path is skipped instead of writing into it. The
+   * content object itself is verified against its name (length and hash) before
+   * it is written back, so a corrupt object fails the path instead of corrupting
+   * the file (BF-03).
    *
    * @param {string} sessionId
-   * @param {Array<{path: string, backup: string | null, mode: number | null, dirPath?: string, dirReal?: string}>} actions
+   * @param {Array<{path: string, backup: string | null, mode: number | null, size?: number, dirPath?: string, dirReal?: string}>} actions
    * @returns {Promise<{restored: string[], deleted: string[], skipped: string[], alreadyAbsent: string[], failed: Array<{path: string, error: string}>, rescue: string[], rescueDir: string}>}
    */
   async restore(sessionId, actions) {
@@ -935,6 +1393,24 @@ export class FileSnapshots {
         }
         const objectPath = join(this.objectsDir(sessionId), action.backup);
         const bytes = await readFile(objectPath);
+        // A content-addressed object is only ever written once, so a half-written
+        // one (ENOSPC/crash) or an externally corrupted file would be trusted
+        // forever unless verified here. Recompute the hash the object name came
+        // from — and the captured length when the line recorded one — before
+        // writing it over the user's file (BF-03). A mismatch is a failed
+        // restore, never a truncated file on disk; the rescue copy is taken only
+        // when the write is actually about to happen.
+        if (action.size !== undefined && bytes.length !== action.size) {
+          throw new Error(
+            `snapshot object ${action.backup} is corrupt (${String(bytes.length)} bytes, expected ${String(action.size)}); refusing to write it back`,
+          );
+        }
+        const actual = objectKey(bytes);
+        if (actual !== action.backup) {
+          throw new Error(
+            `snapshot object ${action.backup} is corrupt (content hash ${actual}); refusing to write it back`,
+          );
+        }
         if (exists) outcome.rescue.push(await this.#rescue(rescueDir, action.path));
         await mkdir(dirname(action.path), { recursive: true });
         await writeFile(action.path, bytes);
@@ -1077,7 +1553,10 @@ export class FileSnapshots {
    * Two guards keep a concurrent capture alive: an object whose hash is in the
    * in-memory pending map is never removed (its journal line may still be on its
    * way), and objects younger than `GC_GRACE_MS` are kept (covers the window
-   * between writing the object and registering the pending entry).
+   * between writing the object and registering the pending entry). A third
+   * source keeps the retry material of a failed journal append: the in-memory
+   * ledger names its object, so it must not be swept while that report can still
+   * be made (BF-01).
    *
    * @param {string} sessionId
    * @returns {Promise<{removed: number, keptRecent: number}>}
@@ -1091,6 +1570,13 @@ export class FileSnapshots {
       // otherwise delete a backup the tool is about to reference.
       for (const pending of this.pending.values()) {
         if (typeof pending?.backup === 'string') referenced.add(pending.backup);
+      }
+      // Paths whose journal line could not be written: their object is the only
+      // retry material left while the process can still report the path.
+      for (const byPath of this.#unrecorded.values()) {
+        for (const entry of byPath.values()) {
+          if (typeof entry.backup === 'string') referenced.add(entry.backup);
+        }
       }
       let names;
       try {

@@ -50,6 +50,13 @@
  *  12. after a files-only rewind the journal still yields the target message's
  *      own pre-image for a later `both` (repeated files-only is idempotent, and
  *      prune is still confined to the conversation scopes)
+ *  13. a files-only rewind may target the first human message (it withdraws no
+ *      conversation), while conversation/both still refuse it (BSR-01)
+ *  14. a pending snapshot whose write landed before the session closed is
+ *      journaled from the close path instead of dropped, and an unchanged one
+ *      is not journaled (BF-02)
+ *  15. a capture that fails after the read reaches the rewind receipt as
+ *      `skipped`/`unrecoverable`, never as "no files changed" (BF-01)
  *
  * ## The fixture's `token` (a deliberate difference from the branch)
  *
@@ -71,7 +78,7 @@
  * `finishFileMutation` / `ownsFileMutation`，或 `file-mutation-gate.js` 必跑。**
  */
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createRequire, register } from 'node:module';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -261,7 +268,11 @@ async function fixture(onFlush, options = {}) {
     get flushCalls() {
       return flushCalls;
     },
-    revert: () => server.revert({ sessionId: id, scope: options.scope ?? 'both', token: { messageId: 'm-10' } }),
+    revert: () => server.revert({
+      sessionId: id,
+      scope: options.scope ?? 'both',
+      token: options.token ?? { messageId: 'm-10' },
+    }),
   };
   return state.fixture;
 }
@@ -786,6 +797,137 @@ try {
   // (`minRewindableAnchor` is Infinity). The restore itself already used e1.
   assert.equal(await seqJournal(), 0, 'trim drops entries once no visible message can anchor a future rewind');
   pass('files-only leaves the journal intact; a later both still restores the target message\'s pre-image');
+
+  // -------------------------------------------------------------------------
+  // 15. Files-only under the first human message: no conversation is withdrawn,
+  //     so the "first message" rule must not apply (BSR-01).
+  // -------------------------------------------------------------------------
+  const firstFiles = await fixture(undefined, { scope: 'files', token: { messageId: 'm-0' } });
+  await writeFile(firstFiles.childFile, 'CHILD');
+  await firstFiles.snapshots.commit({ sessionId: firstFiles.id, callId: 'child-edit' }, {});
+  const firstFilesResult = await firstFiles.revert();
+  assert.equal(
+    firstFilesResult.kind,
+    'success',
+    `a files-only rewind under the first message must succeed: ${JSON.stringify(firstFilesResult)}`,
+  );
+  assert.equal(await readFile(firstFiles.file, 'utf8'), 'ORIGINAL', 'it restores the file like any other files-only rewind');
+  await assert.rejects(
+    readFile(firstFiles.childFile),
+    { code: 'ENOENT' },
+    'and deletes the file created after the first message',
+  );
+  assert.equal(firstFiles.appended, false, 'it still appends no conversation replacement');
+  pass('a files-only rewind under the first human message restores files instead of being refused');
+
+  for (const scope of ['conversation', 'both']) {
+    const firstConversation = await fixture(undefined, { scope, token: { messageId: 'm-0' } });
+    await assert.rejects(
+      firstConversation.revert(),
+      /首条消息禁止撤回/,
+      `a ${scope} rewind must keep refusing the first human message`,
+    );
+    assert.equal(firstConversation.appended, false, `a refused ${scope} rewind must not append`);
+  }
+  pass('conversation and both rewinds still refuse the first human message');
+
+  // -------------------------------------------------------------------------
+  // 16. A close must not drop a pending snapshot whose write already landed.
+  //     The bridge clears its tables before disposing the agent, so the
+  //     post-execute commit never arrives; the pre-image has to be journaled
+  //     from the close path instead (BF-02).
+  // -------------------------------------------------------------------------
+  const closingWrite = await fixture();
+  const lateFile = join(root, `${closingWrite.id}-late-close.txt`);
+  await writeFile(lateFile, 'BEFORE', 'utf8');
+  await closingWrite.snapshots.capture({
+    sessionId: closingWrite.id,
+    pendingKey: `${closingWrite.id}:closing-edit`,
+    anchorSeq: 20,
+    callId: 'closing-edit',
+    path: lateFile,
+  });
+  // The atomic write lands, then the session closes before the result is seen.
+  await writeFile(lateFile, 'AFTER', 'utf8');
+  await closingWrite.server.closeSession({ sessionId: closingWrite.id });
+  await closingWrite.snapshots.settle();
+  const closingJournal = await closingWrite.snapshots.readJournal(closingWrite.id);
+  const closingEntry = closingJournal.entries.find((entry) => entry.path === lateFile);
+  assert.ok(
+    closingEntry !== undefined && closingEntry.backup !== null,
+    `a landed write must be journaled on close: ${JSON.stringify(closingJournal.entries)}`,
+  );
+  const closingPlan = await closingWrite.snapshots.planRestore(closingWrite.id, 20);
+  const closingAction = closingPlan.actions.find((action) => action.path === lateFile);
+  assert.ok(closingAction !== undefined, 'the journaled entry is restorable');
+  await closingWrite.snapshots.restore(closingWrite.id, [closingAction]);
+  assert.equal(await readFile(lateFile, 'utf8'), 'BEFORE', 'the pre-write content comes back');
+  pass('a pending snapshot whose write landed before close is journaled, not dropped');
+
+  // The other direction: a pending snapshot whose file did not change must not
+  // invent a journal line (that would make every rewind report a phantom path).
+  const quietClose = await fixture();
+  const quietFile = join(root, `${quietClose.id}-quiet-close.txt`);
+  await writeFile(quietFile, 'SAME', 'utf8');
+  await quietClose.snapshots.capture({
+    sessionId: quietClose.id,
+    pendingKey: `${quietClose.id}:quiet-edit`,
+    anchorSeq: 20,
+    callId: 'quiet-edit',
+    path: quietFile,
+  });
+  await quietClose.server.closeSession({ sessionId: quietClose.id });
+  await quietClose.snapshots.settle();
+  const quietJournal = await quietClose.snapshots.readJournal(quietClose.id);
+  assert.ok(
+    quietJournal.entries.every((entry) => entry.path !== quietFile),
+    'an unchanged file must not be journaled on close',
+  );
+  pass('a pending snapshot whose file did not change is dropped on close');
+
+  // -------------------------------------------------------------------------
+  // 17. A capture that fails after reading the bytes must reach the receipt:
+  //     the tool still writes the file, so "no files changed" would be a lie
+  //     (BF-01).
+  // -------------------------------------------------------------------------
+  const failedCapture = await fixture(undefined, { scope: 'files' });
+  failedCapture.agent.session.header.cwd = root;
+  const extraFile = join(root, `${failedCapture.id}-extra.txt`);
+  // Deliberately not the fixture file's content: identical bytes would already
+  // have an object on disk, and capture would skip the object write it is meant
+  // to fail.
+  await writeFile(extraFile, 'EXTRA-BEFORE', 'utf8');
+  const objectsDir = join(root, failedCapture.id, encodeURIComponent(failedCapture.id), 'objects');
+  const extraExec = {
+    name: 'write',
+    callId: 'extra-edit',
+    arguments: { file_path: extraFile },
+    token: { id: 'exec-token-extra' },
+    agent: failedCapture.agent,
+  };
+  // The bytes are read, then the object store refuses the write: the shape the
+  // old catch-all turned into a bare stderr line.
+  await chmod(objectsDir, 0o500);
+  try {
+    await failedCapture.server.captureFileBeforeTool(extraExec);
+  } finally {
+    await chmod(objectsDir, 0o700);
+  }
+  await failedCapture.server.commitFileTool(extraExec, { isError: false });
+  await writeFile(extraFile, 'EXTRA-AFTER', 'utf8');
+  const failedCaptureResult = await failedCapture.revert();
+  assert.equal(failedCaptureResult.kind, 'success', JSON.stringify(failedCaptureResult));
+  assert.ok(
+    failedCaptureResult.files.skipped.includes(extraFile),
+    `the unrestorable path must be in the receipt: ${JSON.stringify(failedCaptureResult.files)}`,
+  );
+  assert.ok(
+    (failedCaptureResult.files.unrecoverable ?? []).some(
+      (entry) => entry.path === extraFile && /capture failed/.test(entry.reason),
+    ),
+    `the receipt must carry the capture failure reason: ${JSON.stringify(failedCaptureResult.files.unrecoverable)}`,
+  );
+  pass('a capture that fails after the read reaches the rewind receipt instead of "no files changed"');
 } finally {
   await rm(root, { recursive: true, force: true });
 }

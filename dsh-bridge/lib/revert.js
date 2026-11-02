@@ -82,10 +82,15 @@ export function isHumanUserMessage(event) {
  * @param {readonly number[]} nodes - `session.surface.nodes`, oldest first.
  * @param {(seq: number) => unknown} eventAt - `session.eventAt(seq)`.
  * @param {unknown} token - the `revertToken` Paseo handed back.
+ * @param {object} [options]
+ * @param {boolean} [options.rewindsConversation] - false when the scope restores
+ *   files only. Such a rewind appends no replacement and never empties the
+ *   conversation, so the first-message rule below does not apply to it (BSR-01).
+ *   Defaults to true, i.e. the conversation rule.
  * @returns {{ok: true, messageId: string, targetSeq: number, targetIndex: number, shadowed: number[]}
  *   | {ok: false, reason: string}}
  */
-export function planRewind(nodes, eventAt, token) {
+export function planRewind(nodes, eventAt, token, options = {}) {
   const messageId = tokenMessageId(token);
   if (messageId === undefined) return { ok: false, reason: '撤回令牌无效（缺少消息 id）' };
   const targetIndex = nodes.findIndex((seq) => {
@@ -106,8 +111,15 @@ export function planRewind(nodes, eventAt, token) {
   // then fails with "No provider revert token"). The rewind menu is offered per
   // provider capability, not per row, so the bridge refuses here with a readable
   // reason instead of emptying the session.
+  //
+  // A `files`-only rewind withdraws no message at all (it appends no replacement
+  // and keeps every row), so the rule does not apply: restoring the working tree
+  // to its state under the first message is a well-defined operation (BSR-01).
+  const rewindsConversation = options.rewindsConversation !== false;
   const firstHumanIndex = nodes.findIndex((seq) => isHumanUserMessage(eventAt(seq)));
-  if (targetIndex === firstHumanIndex) return { ok: false, reason: FIRST_MESSAGE_REFUSAL };
+  if (rewindsConversation && targetIndex === firstHumanIndex) {
+    return { ok: false, reason: FIRST_MESSAGE_REFUSAL };
+  }
   const shadowed = nodes.slice(targetIndex);
   return { ok: true, messageId, targetSeq: nodes[targetIndex], targetIndex, shadowed };
 }

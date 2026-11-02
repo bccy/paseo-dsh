@@ -143,6 +143,39 @@ console.log('the first message refusal is about position, not token shape');
   check('the second message is still rewindable', second.ok === true && JSON.stringify(second.shadowed) === JSON.stringify([5]), JSON.stringify(second));
 }
 
+console.log('the first-message refusal applies only when the conversation is withdrawn (BSR-01)');
+{
+  // `files` restores the working tree and appends nothing, so the rule that
+  // protects against emptying the conversation does not apply to it. The scope
+  // is the only thing that decides: the same token is refused for
+  // conversation/both and resolved for files.
+  const events = { 1: user('u1'), 2: assistant(), 3: user('u2') };
+  const nodes = [1, 2, 3];
+  const filesOnly = planRewind(nodes, (seq) => events[seq], { messageId: 'u1' }, { rewindsConversation: false });
+  check(
+    'a files-only rewind may target the first human message',
+    filesOnly.ok === true && filesOnly.targetSeq === 1,
+    JSON.stringify(filesOnly),
+  );
+  check(
+    'and its range still covers that message and the tail',
+    filesOnly.ok === true && JSON.stringify(filesOnly.shadowed) === JSON.stringify([1, 2, 3]),
+    filesOnly.ok === true ? JSON.stringify(filesOnly.shadowed) : filesOnly.reason,
+  );
+  const conversation = planRewind(nodes, (seq) => events[seq], { messageId: 'u1' }, { rewindsConversation: true });
+  check(
+    'a conversation rewind still refuses it',
+    conversation.ok === false && conversation.reason === FIRST_MESSAGE_REFUSAL,
+    conversation.ok === false ? conversation.reason : 'resolved',
+  );
+  const defaulted = planRewind(nodes, (seq) => events[seq], { messageId: 'u1' });
+  check(
+    'the default keeps the conversation rule',
+    defaulted.ok === false && defaulted.reason === FIRST_MESSAGE_REFUSAL,
+    defaulted.ok === false ? defaulted.reason : 'resolved',
+  );
+}
+
 console.log('injected user-role messages are never targets');
 {
   const events = { 1: user('u1'), 2: envelope(), 3: checkpoint(), 4: assistant() };
@@ -514,7 +547,7 @@ console.log('wiring (the pure module is useless if nothing calls it)');
   const bridge = read('dsh-bridge/lib/server.js');
   check('the bridge serves paseo/revert', /case 'paseo\/revert':/.test(bridge) && /return this\.revert\(params\)/.test(bridge));
   check('the bridge serves the non-command permission write', /case 'paseo\/permission\/set':/.test(bridge) && /service\.set\(/.test(bridge));
-  check('the bridge resolves the token against the visible surface', /planRewind\(session\.surface\.nodes/.test(bridge));
+  check('the bridge resolves the token against the visible surface', /planRewind\(\s*session\.surface\.nodes/.test(bridge));
   check(
     'the bridge appends the durable user/message replacement marker',
     /session\.append\(\s*'user\/message',\s*marker/.test(bridge),
