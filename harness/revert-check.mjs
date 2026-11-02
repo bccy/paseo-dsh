@@ -315,11 +315,15 @@ console.log('no deferred-notice chain (the rewind no longer closes the provider 
     'and the provider-session -> DSH-session id map went with it (#dshIds had no other reader)',
     !/#dshIds/.test(provider) && !/MAX_DSH_ID_MAPPINGS/.test(provider),
   );
-  // The remaining notice channel must still exist: open warnings and the file
-  // restore failure are reported through it, into the *current* epoch.
+  // The remaining notice channel must still exist. Open warnings go through
+  // `#notice` directly; the file restore failure cannot — the daemon holds a
+  // foreground run lock for the whole rewind and drops provider events sent
+  // while it is pending (`harness/rewind-notice-delivery-check.mjs`), so it is
+  // queued behind that lock instead. Asserted as the queued form so reverting to
+  // the immediate send (which never reached the timeline) is caught.
   check(
-    'a file restore failure is reported immediately (no epoch rebuild discards it)',
-    /this\.#notice\(\s*input\.sessionId,\s*"error",\s*"文件回退未完成"/.test(provider),
+    'a file restore failure is queued for after the rewind lock (no epoch rebuild discards it)',
+    /this\.#noticeAfterRewind\(\s*input\.sessionId,\s*"error",\s*"文件回退未完成"/.test(provider),
   );
   check(
     'and the open warnings still go through #notice after session.ready',
@@ -417,8 +421,8 @@ console.log('wiring (the pure module is useless if nothing calls it)');
     !/#resolvePaseoBinary|PASEO_BIN/.test(provider),
   );
   check(
-    'provider surfaces a failed file restore as an immediate timeline notice',
-    /#notice\(\s*input\.sessionId,\s*"error",\s*"文件回退未完成"/.test(provider),
+    'provider surfaces a failed file restore as a post-rewind timeline notice',
+    /#noticeAfterRewind\(\s*input\.sessionId,\s*"error",\s*"文件回退未完成"/.test(provider),
   );
   check(
     'no "timeline was not refreshed" warning is left (there is no refresh to fail)',

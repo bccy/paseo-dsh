@@ -2723,6 +2723,33 @@ FULL-AUDIT-20261102 的「待用户决定」；需要 DSH 上游扩展开关或�
 **教训**：**AGENTS.md 是运行时输入，不只是文档**——它的体积挤占的是用户自己的指令。审文档 diff 时要看
 字节数；长清单放 `docs/`，AGENTS.md 只放规则和指针。
 
+
+### 78. 撤回完成提示发得出去，却到不了时间线（宿主 rewind run lock 的 staging 丢弃）
+
+**症状**：真机"只撤回文件"：撤回成功（daemon.log 里 `agent.rewind.start` → `complete` 32 ms，
+`mode=files`），文件正确恢复，但界面上既没有提示行也没有胶囊。
+
+**根因**：宿主在整段撤回期间持有一个 foreground run lock（`AgentManager.rewind` 的
+`createPendingRun` … `finally settleForegroundRun`）。锁在时 `enqueueSessionEvent` 把 provider 事件
+push 进 `pendingRun.stagedEvents` 而不派发；只有正常 prompt 路径会回放 staged 事件，rewind 走
+`clearRun` 直接删 run，staged 事件随之丢弃。所以 `request.completed` 前后发的 `session.notice`
+都进不了 daemon 的 timeline store——p14 的完成提示从未显示过，canary 也一样（它一直只在 provider
+缓冲区里存在）。`host-contract-sim.mjs` 断言的是后者，不是时间线，所以这层从未被覆盖。
+
+**修法**：`server/rewind-delivery.ts` 把回执后的报告（成功与部分失败）排到 300 ms 后发出；宿主
+回执后的尾段 = `hydrateTimelineFromProvider`（仅 conversation/both）+ `refreshSessionState` +
+`persistSnapshot` + `emitState` + settle，真实宿主代码上实测 4 ms（files）/ 38 ms（conversation），
+留一个数量级余量。会话在延迟内关闭则丢弃。**这是启发式**：宿主没有 settle 之后面向 provider 的
+调用（`refreshSessionState`/`streamHistory` 对插件 provider 都是宿主侧本地方法），插件观察不到锁
+释放；确定性只能等上游（staged 事件在 settle 时回放，或新增 provider 可观测的 settle 信号）。
+`harness/rewind-notice-delivery-check.mjs` 在真实宿主代码上双向断言：回执时刻发出的被丢弃、延迟后
+的到达时间线且晚于锁释放；并把"延迟必须压过实测尾段"写成不变量。canary 未改（动它要先问用户），
+结论见 `docs/REWIND.md` 的实测修正。
+
+**教训**：**"provider 发出去了"不等于"宿主收下了"**——宿主可能有一层事件 staging，它的存在写在
+宿主代码里、不在协议里。断言要么打到最后的状态（timeline store），要么就只是断言了自己。另外
+provider 缓冲区与 daemon 时间线是两层，中间还有一个会丢事件的窗口，别把其中一层的绿当成整条链的绿。
+
 ---
 
 ## 关于"哪条路由能用"

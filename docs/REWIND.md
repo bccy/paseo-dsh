@@ -193,6 +193,15 @@ Paseo 的插件 provider 适配层把翻译后的时间线事件放进一个**�
   进度提示）。它不进 DSH 日志，重开会话后不存在。
 - **原版宿主**：通知留在时间线底部，明确告诉用户界面是旧的、该怎么刷新。
 
+> **实测修正（2026-11-02，未改 canary）**：canary 的**交付层**在真实 daemon 上并不成立。它和
+> 完成提示一样是在宿主 rewind 的 foreground run lock 期间发出的（`AgentManager.rewind` 的
+> `createPendingRun` … `finally settleForegroundRun`），这段窗口里 `enqueueSessionEvent` 把 provider
+> 事件压进 `pendingRun.stagedEvents`，settle 时随 run 一起丢弃。所以时间线里根本看不到它——
+> 补丁宿主上"一闪而过"、原版宿主上"留在底部"这两种表现都观察不到。`harness/host-contract-sim.mjs`
+> 断言的是宿主 `PluginAgentSession.history`（provider 缓冲区）的行为，**不是** daemon 时间线；
+> 两层之间还有这个会丢事件的窗口。canary 自己的顺序约束没动（改它要先问用户），结论与证据见
+> FIELD-NOTES 第 78 条、`harness/rewind-notice-delivery-check.mjs` 的 `info` 行。
+
 **顺序就是机制本身。** 放到 `request.completed` 之后，补丁宿主上也会留下来，变成
 「时间线没刷新」的**误报**（在宿主真实代码上双向复现过，见
 `harness/host-contract-sim.mjs`）。所以 `provider.ts` 的 `session.revert` 分支里，通知必须
@@ -215,6 +224,18 @@ canary 只回答"时间线刷没刷新"，不回答"这次撤回了什么"。所
   「这条消息之后没有改动文件，无需恢复」
 - 部分失败（`files.failed` / `skipped` / `unrecoverable` / `error` 非空）：只保留现有的
   「文件回退未完成」提示行，不再发成功提示。计数读不出来时退回不带数字的句子，绝不编数字。
+
+**什么时候发**：不是回执之后立刻发，也不是回执之前。宿主在整段撤回期间持有 foreground run
+lock，锁在时 provider 事件只会被 staging、settle 时丢弃，所以回执前后发都到不了时间线（真机症状：
+撤回成功、文件恢复正确，但既没有提示行也没有胶囊）。宿主在锁释放前不会再回头调用 provider
+（`refreshSessionState` / `streamHistory` 对插件 provider 都是宿主侧本地方法），插件观察不到
+settle，因此报告由 `server/rewind-delivery.ts` 的 `RewindNoticeTimers` 排到
+`REWIND_NOTICE_DELAY_MS`（300 ms）之后发出。**这个延迟是启发式**：依据是宿主回执后的尾段——
+conversation/both 的 `hydrateTimelineFromProvider` 重建、`refreshSessionState`、一次 snapshot
+落盘、`emitState`，最后 `settleForegroundRun`——真实宿主代码上实测 4 ms（files）/ 38 ms
+（conversation），300 ms 留了一个数量级余量。会话在延迟内关闭则丢弃（不发，也不留"会话不存在"
+的错日志）。`harness/rewind-notice-delivery-check.mjs` 在真实宿主代码上断言：回执时刻发出的被
+丢弃、延迟后的到达时间线且晚于锁释放、延迟相对实测尾段留有余量。
 
 客户端把这条 notice 的 `notification` 行接管成 `dsh-rewind-notice` 插件行——这是让插件拿到
 组件挂载点的唯一途径（`useToast()` 是 hook，插件没有别的常驻挂载面）。胶囊只在**实时到达**时
@@ -269,10 +290,11 @@ this.ctx.get('permissionPresets').set(session, name);
 - 撤回是**同步**的：`session.revert` 在桥里完成（截断 history + 落盘）后回执，宿主随即重建
   时间线。没有 reload 窗口，因此**没有**「正在回退，请稍候」通知、没有 prompt 门禁、没有
   15s 安全超时——这些机制随 reload 旁路一起删除了。
-  **提示有两条，含义不同**：回执前的「撤回已生效」canary 是自证机制——在补丁宿主上它随被撤行
-  一起被截掉（一闪而过），在原版宿主上它留下来并告诉用户执行 Reload agent 或重开会话（见上
-  一节），所以必须在 `request.completed` 之前发出，顺序不能换；回执后的 completion notice
-  报告这次撤回了什么（scope 与文件计数），在任何宿主上都要留下（见「完成提示」一节）。
+  **提示有两条，含义不同**：回执前的「撤回已生效」canary 是自证机制——设计上在补丁宿主上随被撤行
+  一起被截掉（一闪而过）、在原版宿主上留下来告诉用户执行 Reload agent 或重开会话（见上一节），
+  所以必须在 `request.completed` 之前发出，顺序不能换；但它的交付在真实 daemon 上被 rewind run
+  lock 吞掉（见上一节的实测修正）。回执后的 completion notice 报告这次撤回了什么（scope 与文件
+  计数），在任何宿主上都要留下，因此**延迟到宿主释放 run lock 之后**才发（见「完成提示」一节）。
   并发的第二次撤回由桥的 `revertInflight` 守卫拒绝（`request.failed`，不是静默）。
 - **当前可见对话的第一条消息不支持撤回**：撤掉它等于清空整个对话，而 Paseo 客户端对"重建后
   空对话"的 live 刷新不可靠（旧行会留在屏幕上，再点旧行报 `No provider revert token`）。
@@ -283,8 +305,8 @@ this.ctx.get('permissionPresets').set(session, name);
 - 子会话（DSH 原生 child）不支持撤回：只读投影，没有自己的进程。
 - 文件回退失败时：`both` 的对话仍然已经撤回，`files` 本来就没有对话变更；回执按 `files.failed` /
   `files.skipped` / `files.unrecoverable` 分类，**撤回前备份保留**（journal 不清理，重试撤回会再次
-  恢复）；恢复计划本身失败则带 `files.error`。提示行即时以 `session.notice` 出现在**当前**时间线里
-  （没有 epoch 重建，不会被吞掉）。注意 rescue 目录里是**被替换前的当前内容**（已含智能体
+  恢复）；恢复计划本身失败则带 `files.error`。提示行以 `session.notice` 出现在**当前**时间线里
+  （没有 epoch 重建），但要等宿主释放 rewind run lock 之后才送达（见「完成提示」一节）。注意 rescue 目录里是**被替换前的当前内容**（已含智能体
   改动），不是撤回前状态，别拿它当预编辑恢复材料。
 - **对话作用域（conversation）不走文件层**：不拿文件闸门、不要求 `agent.runMaintenance`；
   它仍会发 canary（对话被刷新了，需要自证），`both` 与 `files` 才做文件恢复，其中只有 `both`

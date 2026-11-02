@@ -169,6 +169,30 @@ function eventsSince(sinceIndex) {
 }
 
 /**
+ * Wait for the rewind notice the provider sends **after** the receipt.
+ *
+ * The provider queues that notice until the daemon's rewind run lock is
+ * released (`server/rewind-delivery.ts`): the daemon stages and then discards
+ * every provider event sent while that lock is held, which is why the report
+ * cannot go out with the receipt (`harness/rewind-notice-delivery-check.mjs`
+ * drives the real host code to prove both halves). Reading `events` right after
+ * the reply would therefore see no notice at all — this wait is part of the
+ * contract now, not a race workaround.
+ *
+ * Every accepted rewind gets one notice: the completion sentence, or the
+ * partial-file failure. A refused rewind gets none, so it is not waited for.
+ */
+async function waitForRewindNotice(sinceIndex, sessionId) {
+  return await untilSince(
+    sinceIndex,
+    (e) => e.type === "session.notice"
+      && e.sessionId === sessionId
+      && (isRewindSuccessTitle(String(e.notice?.title ?? "")) || e.notice?.title === "文件回退未完成"),
+    "rewind notice",
+  );
+}
+
+/**
  * Whether a notice title is one of the completion sentences this check pins.
  *
  * Spelled out here rather than imported from `shared/rewind-notice.ts`: this
@@ -355,6 +379,10 @@ const check = (name, pass, detail) => {
     revertReply.type === "request.failed" ? JSON.stringify(revertReply.error) : "completed",
   );
 
+  // The report is queued behind the host's rewind run lock; wait for it before
+  // asserting on the notices this rewind left behind.
+  await waitForRewindNotice(beforeRevert, sessionId);
+
   // The completion report. It is a second, different notice: the canary above
   // proves whether the timeline refreshed, this one says what the rewind did.
   // It must come **after** the receipt — the opposite side of the canary's
@@ -486,6 +514,7 @@ const check = (name, pass, detail) => {
     secondRevert.type === "request.completed",
     JSON.stringify(secondRevert.error ?? "completed"),
   );
+  await waitForRewindNotice(beforeSecondRevert, sessionId);
   // The second canary must be distinguishable from the first. On a host that keeps
   // the withdrawn rows the first one is still on screen, so "a notice exists" would
   // match the stale one; the sequence number is what names *this* rewind. It is
@@ -538,6 +567,7 @@ const check = (name, pass, detail) => {
     filesRevert.type === "request.completed",
     JSON.stringify(filesRevert.error ?? "completed"),
   );
+  await waitForRewindNotice(beforeFilesRevert, sessionId);
   const filesCanaries = eventsSince(beforeFilesRevert).filter(
     (e) => e.type === "session.notice" && e.notice?.title === "撤回已生效",
   );
@@ -584,6 +614,7 @@ const check = (name, pass, detail) => {
     bothRevert.type === "request.completed",
     JSON.stringify(bothRevert.error ?? "completed"),
   );
+  await waitForRewindNotice(beforeBothRevert, sessionId);
   const bothCanaries = eventsSince(beforeBothRevert).filter(
     (e) => e.type === "session.notice" && e.notice?.title === "撤回已生效",
   );
@@ -641,6 +672,7 @@ const check = (name, pass, detail) => {
     bothCountsReply.type === "request.completed",
     JSON.stringify(bothCountsReply.error ?? "completed"),
   );
+  await waitForRewindNotice(beforeBothCounts, sessionId);
   const bothCountsSuccess = successNoticesSince(beforeBothCounts);
   check(
     "…and its completion notice counts the receipt's arrays",
@@ -667,6 +699,7 @@ const check = (name, pass, detail) => {
     filesCountsReply.type === "request.completed",
     JSON.stringify(filesCountsReply.error ?? "completed"),
   );
+  await waitForRewindNotice(beforeFilesCounts, sessionId);
   const filesCountsSuccess = successNoticesSince(beforeFilesCounts);
   check(
     "…and its completion notice counts the receipt's arrays",
@@ -710,6 +743,7 @@ const check = (name, pass, detail) => {
     planFailedRevert.type === "request.completed",
     JSON.stringify(planFailedRevert.error ?? "completed"),
   );
+  await waitForRewindNotice(beforePlanFailedRevert, sessionId);
   const planFailedNotices = eventsSince(beforePlanFailedRevert).filter(
     (e) => e.type === "session.notice" && e.notice?.title === "文件回退未完成",
   );
@@ -759,6 +793,7 @@ const check = (name, pass, detail) => {
     skippedRevert.type === "request.completed",
     JSON.stringify(skippedRevert.error ?? "completed"),
   );
+  await waitForRewindNotice(beforeSkippedRevert, sessionId);
   const skippedNotices = eventsSince(beforeSkippedRevert).filter(
     (e) => e.type === "session.notice" && e.notice?.title === "文件回退未完成",
   );
@@ -804,6 +839,7 @@ const check = (name, pass, detail) => {
     unrecoverableRevert.type === "request.completed",
     JSON.stringify(unrecoverableRevert.error ?? "completed"),
   );
+  await waitForRewindNotice(beforeUnrecoverableRevert, sessionId);
   const unrecoverableNotices = eventsSince(beforeUnrecoverableRevert).filter(
     (e) => e.type === "session.notice" && e.notice?.title === "文件回退未完成",
   );
@@ -856,6 +892,7 @@ const check = (name, pass, detail) => {
     alreadyAbsentRevert.type === "request.completed",
     JSON.stringify(alreadyAbsentRevert.error ?? "completed"),
   );
+  await waitForRewindNotice(beforeAlreadyAbsentRevert, sessionId);
   const alreadyAbsentNotices = eventsSince(beforeAlreadyAbsentRevert).filter(
     (e) => e.type === "session.notice" && e.notice?.title === "文件回退未完成",
   );
