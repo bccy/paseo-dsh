@@ -12,7 +12,7 @@
 动手前必须先完整读 [docs/ADOPTION.md](./docs/ADOPTION.md)——它解释了架构和已知的坑，
 跳过它几乎必然踩到配置里的两个陷阱。
 
-三条最容易犯的错，先记住：
+四条最容易犯的错，先记住：
 
 1. **不要自己编模型配置。** 用 `npx paseo-dsh probe` 探测出结果（仓库里的
    `tools/probe-provider.mjs` 是同一个实现的瘦启动器），原样采用。
@@ -85,7 +85,7 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon fork 出的 p
 
 ### 跟 DSH 升版
 
-**这个仓库没有官方支持，跟版是长期成本。** 桥直接依赖 DSH 的内部组装包（见「改完怎么验证」
+**这个仓库没有官方支持，跟版是长期成本。** 桥直接依赖 DSH 的内部组装包（见 [docs/HARNESS.md](./docs/HARNESS.md)
 里的 `dsh-api-contract-check.mjs`），这些包**没有 API 稳定性承诺**；上游改一个提示词变量、
 一个 schema 字段或一个异步就绪时机，功能就会**静默失效**——不报错、不崩，只是没了。所以：
 
@@ -97,8 +97,8 @@ import）等它走完 rc 再跟，那时改动才定型。
 **先读 release notes，再决定跑多少检查。** GitHub `deepseek-ai/deepseek-harness` 有逐版
 changelog（`npm view` 看不到）。关键判据是**上游改动落在哪一层**：UI / Web / 桌面壳层对桥零
 影响；提示词变量、插件 schema、异步就绪时机、工具 API 形状则影响高。用 `npm pack` 比对桥依赖
-的那几个包的 `lib/` 逐文件差异，比读 changelog 更能定性——实测 `0.2.1-rc.2` → `rc.5` 五个硬依赖
-包**逐文件 0 差异**，那就不必做全量验证。
+的那几个包的 `lib/` 逐文件差异，比读 changelog 更能定性——实测 `0.2.1-rc.2` → `rc.5` 当时的五个硬依赖
+包**逐文件 0 差异**（现在是八个，以契约检查的清单为准），那就不必做全量验证。
 
 **升级顺序固定，前一步红就不要往下走：**
 
@@ -120,7 +120,7 @@ node harness/bridge-assets-check.mjs
 node paseo-plugin/bin/paseo-dsh.mjs doctor
 
 # 5. 真实回合：这一步 doctor 替代不了
-node harness/plugin-check.cjs                     # 34 项，含真实模型回合
+node harness/plugin-check.cjs                     # 含真实模型回合（默认一次性 DSH_HOME）
 
 # 6. 离线回归（动到对应区域时）
 node harness/plugin-build-check.mjs
@@ -139,9 +139,7 @@ paseo daemon restart
 所以 `0.2.2-alpha.2` 甚至 `0.3.0-alpha.1` 都会被判通过。**doctor 永远不会拦住你升到一个破坏性
 版本**，唯一的判据是 `plugin-check.cjs` 跑通。
 
-**为什么 `bridge-assets-check` 必须在 `plugin-check` 之前。** 后者加载插件时会把内嵌桥重写进
-`~/.dsh/profiles/<name>/node_modules/dsh-paseo-bridge`。内嵌桥若是旧的，就等于把旧桥装进 live
-profile，之后的真机检查都在旧代码上"假绿"。
+**为什么 `bridge-assets-check` 必须在 `plugin-check` 之前**，见「改完怎么验证」。
 
 **重启前确认生效路径。** 磁盘上换版本不会影响已运行的进程（Node 已经把旧模块读进内存）。
 `dsh --version` 看的是磁盘，`ps -o lstart= -p <pid>` 看的是进程启动时间——两者对不上就是还没生效。
@@ -176,9 +174,10 @@ Paseo 把它的 MCP server 通过 `config.mcpServers` 交给 provider，插件�
 ```bash
 node harness/dsh-api-contract-check.mjs      # 桥依赖的 DSH 内部 API 还在不在（秒级、纯离线）
 node paseo-plugin/bin/paseo-dsh.mjs doctor   # 一眼看安装是否完整：CLI/版本/profile/bridge/路由/key
+# 下面三条起真实 dsh：route-test 默认一次性 DSH_HOME；catalog / probe 仍读写真实 profile
 node harness/catalog.mjs      # provider / 模型 / 每个模型的真实思考档位
-node harness/probe.mjs        # 端到端提问往返
-node harness/route-test.mjs   # 逐条路由跑真实回合
+node harness/probe.mjs        # 端到端提问往返（耗 token）
+node harness/route-test.mjs   # 逐条路由跑真实回合（耗 token）
 cd paseo-plugin && npx tsc --noEmit
 ```
 
@@ -191,10 +190,10 @@ doctor/probe；`npx paseo-dsh` 解析的是**已发布到 npm 的包**，可能�
 的头部注释里（插件是 TS，要先编成 CJS 才能 require）。
 
 注意它**不是纯离线**：不设 `DSH_BINARY` 时会起真实 `dsh --profile` 跑真实模型回合（耗
-token），并且加载插件会把内嵌桥重写进 `~/.dsh/profiles/<name>/node_modules/dsh-paseo-bridge`。
-所以**跑它之前先跑 `node harness/bridge-assets-check.mjs`**：内嵌桥是新的才跑，否则会把旧桥
-装进 live profile，让之后的真机检查在旧代码上"假绿"。
-先跑 `node harness/plugin-check.cjs --self-test`：它只验证编译产物加载与图片块翻译，不碰
+token），并且加载插件会把内嵌桥写进所用 `DSH_HOME` 的 profile（默认是一次性克隆；
+`--allow-real-profile` 时是 live profile）。所以**跑它之前先跑 `node harness/bridge-assets-check.mjs`**：
+内嵌桥若是旧的，真机检查就跑在旧桥上"假绿"，用真实 home 时还会把旧桥装进 live profile。
+再跑 `node harness/plugin-check.cjs --self-test`：它只验证编译产物加载与图片块翻译，不碰
 profile/模型；改过 `plugin-check` 的判据后这一步能最快抓到编译或导入错误（T03/T04 的判据回归
 在 `harness/harness-gates-check.mjs`）。
 
@@ -206,8 +205,9 @@ profile/模型；改过 `plugin-check` 的判据后这一步能最快抓到编�
 经 Paseo 规则投影后合并成一行）、`harness/image-check.cjs`（图片工具结果：带 `hostPath` 的
 图片块**恰好**多出一条 markdown `assistant_message`、路径逐段编码、无 `hostPath` 不出行、
 过 `ProviderEventSchema`、`history: "replay"` 重建同一条）。
-这批假桥脚本各自用**一次性 `DSH_HOME`**，不会改写你 `~/.dsh` 里正在用的 profile。
-**真实 profile/模型脚本默认使用一次性 `DSH_HOME`（`harness/isolated-dsh-home.cjs`：克隆源
+这批假桥脚本各自用**一次性 `DSH_HOME`**，不会改写你 `~/.dsh` 里正在用的 profile；
+**真实 profile/模型脚本（`plugin-check`、`route-test`、`tools`、`stream-probe`、`rewind-e2e` 系列）
+也默认使用一次性 `DSH_HOME`（`harness/isolated-dsh-home.cjs`：克隆源
 profile、凭据只做 symlink、退出清理），`--allow-real-profile` 才会读写真实 home；
 `rewind-native-check` 面对运行中的 daemon 无法隔离，必须显式 `--allow-real-daemon`。**
 完整判定在 `harness/harness-gates-check.mjs` 的 HP-05 段。
@@ -216,6 +216,17 @@ profile、凭据只做 symlink、退出清理），`--allow-real-profile` 才会
 改了代码先在那里按改动区域查必跑项；新增检查也登记到那里，不要加回本文件——本文件会整份注入
 DSH 会话，超过 64 KiB 的工作区指令预算时 DSH 会丢掉用户的 `~/.dsh/AGENTS.md`（FIELD-NOTES 第 77 条）。
 
+客户端脉冲这条链最容易"看着对但静默失效"（`Animated` 在 RN Web 上只跑一段就停、`setValue`
+推不到原生 view、客户端不折叠只改 `metadata` 的 item），所以断言要打在数据层。
+
+**动了流式（`agent/assistant-stream` / `paseo/assistant-delta`）还要跑真实端到端**
+`node harness/stream-probe.mjs`：它用真实 `dsh --profile paseo` 断言一步内出现多个
+增长快照、且首个 delta 远早于 durable `assistant/message`。插件层的假桥检查只能证明
+折叠，证明不了桥真的订阅到了 DSH 的瞬时帧。
+
+**注意一个反直觉的坑**：`waitFor` 式的等待会匹配到上一条陈旧事件。换阶段时清空事件数组，
+或按 `turnId` 过滤——有一次就是因为匹配到了被取消那一回合的事件，误判成"取消后对话
+无法继续"，差点去改一段本来正确的代码。
 
 ### 撤回（rewind）
 
@@ -226,7 +237,7 @@ DSH 会话，超过 64 KiB 的工作区指令预算时 DSH 会丢掉用户的 `~
 node harness/revert-check.mjs          # 令牌/区间/前置/回执/文件层/canary 顺序/共享进程接线
 node harness/surface-check.mjs         # 只折撤回缝、compaction 保留、尾随日志事件
 node harness/file-snapshot-check.mjs   # 写前备份；动了 capture 读/序号绑定、skip 载入、planRestore 的 unrecoverable、restore 目录身份复核必跑
-node harness/snapshot-lifecycle-check.mjs  # 捕获序号跨重启续数、旧 journal 歧义拒绝（纯离线，见下）
+node harness/snapshot-lifecycle-check.mjs  # 捕获序号跨重启续数、旧 journal 歧义拒绝（纯离线）
 node harness/factory-ownership-order-check.mjs  # beginOwner 接线、live agent 的 runMaintenance 存在性（依赖本机 DSH，不进 CI）
 node harness/file-mutation-gate-check.mjs      # 文件写入闸门：freeze 排空在飞写入、超时重开准入（纯离线，进 CI）
 node harness/rewind-transaction-check.mjs      # 撤回事务；动了 settleDelegatedWork/cancelWithdrawnDelegations 的返回形状、票据清理、scope 条件化或 files.error 回执必跑（依赖本机 DSH，不进 CI）
@@ -270,38 +281,16 @@ node harness/rewind-native-check.mjs   # 经真实 daemon 的撤回（耗 token�
 真机验收要用**新会话**（能力位只对新会话生效）：发两条消息 → 撤回第二条 → 消息消失、
 无 `/rewind` 行/回合页脚、编辑工具改的文件恢复、模型不知道被撤内容、重开会话仍正确。
 
-离线清单之外还有四个容易被当成同类、其实不是的：`harness/tools.mjs`（真 `dsh` 的工具目录
-转储）、`harness/subagent-live.mjs`（实机子会话可见性）、`harness/fake-dsh-bridge.mjs`
-（上面几个假桥脚本共用的 scripted 替身，不是独立检查脚本），以及
-`harness/session-calls.mjs`——**诊断工具，不是回归**：它读 `$DSH_HOME/sessions` 下的会话
-日志，把每个 `tool/call` 的参数**键**与同一会话里 `request/header` 真正下发给模型的 schema
-做 diff，报出未声明的键并以 `exit 1` 结束。用来回答"我到底发出去了什么"：界面和模型读到的
-转写都是渲染，不能当证据。它刻意绕开两个坑——会话日志是**多帧** zstd
-（`zlib.zstdDecompressSync` 只解第一帧，会把 1.6 MB 的会话读成 172 字节的头部），以及
-**绝不静默跳过**解不开的文件。用法：`node harness/session-calls.mjs --list` /
-`--latest` / `--session <id>`，可再加 `--tool <name>`、`--raw`。
-
-客户端脉冲这条链最容易"看着对但静默失效"（`Animated` 在 RN Web 上只跑一段就停、`setValue`
-推不到原生 view、客户端不折叠只改 `metadata` 的 item），所以断言要打在数据层。
-
-**动了流式（`agent/assistant-stream` / `paseo/assistant-delta`）还要跑真实端到端**
-`node harness/stream-probe.mjs`：它用真实 `dsh --profile paseo` 断言一步内出现多个
-增长快照、且首个 delta 远早于 durable `assistant/message`。插件层的假桥检查只能证明
-折叠，证明不了桥真的订阅到了 DSH 的瞬时帧。
-
-**注意一个反直觉的坑**：`waitFor` 式的等待会匹配到上一条陈旧事件。换阶段时清空事件数组，
-或按 `turnId` 过滤——有一次就是因为匹配到了被取消那一回合的事件，误判成"取消后对话
-无法继续"，差点去改一段本来正确的代码。
-
 ### 提交前
 
 - 跑一遍 `node --check` / `tsc --noEmit`
 - 确认没有引入任何具体的 provider 名、模型 id、base URL、密钥
-- 用户本机路径（`/Users/...`）不要出现在任何文件里
+- 用户本机的真实路径（如 `/Users/<你>`、`/home/<你>`）不要出现在任何文件里；测试夹具里的虚构路径不算
+- 本文件只放规则和指针，长清单放 `docs/`：它会整份注入 DSH 会话，体积超预算会挤掉用户自己的 `~/.dsh/AGENTS.md`
 
 ## 三、发布流程（硬性）
 
-**产物推送必须等用户本机测试通过并明确确认。** 本地改完可以先 commit / push 代码到仓库，
+**产物推送必须等用户本机测试通过并明确确认。** 本地改完可以先 commit 代码（push 是否要先问，按用户自己的规则），
 但 `npm publish`、`npm deprecate`、目录收录（paseo.cafe 等）、打 tag、发 Release 一律
 等用户说"测试通过"之后再动。
 

@@ -142,7 +142,7 @@
 - `harness/session-request-check.cjs` — 两段非回合请求：`paseo/sessions` 导入列表
   （persistence handle/cwd/title/preview→description/updatedAt）与 `paseo/revert` 撤回回执。
   撤回那一半钉住：成功发 `request.completed`、被拒必须 `request.failed`、**canary 恰好一条且
-  出现在回执之前**（顺序即机制，见「撤回」一节）、被拒之后没有 canary、连续两次撤回的文案不同
+  出现在回执之前**（顺序即机制，见 AGENTS.md「撤回」一节）、被拒之后没有 canary、连续两次撤回的文案不同
   （序号递增）、`scope: "files"` 的撤回**不**发 canary（对话没被动过）、`scope: "both"` 的
   文案要点出文件那一半；仍然没有「正在回退，请稍候」这类刷新窗口通知。假桥 + 一次性
   `DSH_HOME`。**动了 provider 的
@@ -292,7 +292,7 @@
   终态，后发的会被丢）、子会话不补编一个 `session.turn` 终态。崩溃由脚本自己 `SIGKILL` 假桥
   记录的 pid 制造（不给假桥加场景）。**动了 `session.ts` 的子会话终态或 `dsh-process.ts` 的
   进程退出扇出必跑；回归同时钉住「已完成子会话不被进程退出改写为 failed」。**
-- `harness/host-contract-sim.mjs` — 见「撤回」一节的 canary 说明：唯一直接断言**宿主**行为的
+- `harness/host-contract-sim.mjs` — 见 AGENTS.md「撤回」一节的 canary 说明：唯一直接断言**宿主**行为的
   脚本（canary 在补丁版被截、原版存活；回执后发的在两种宿主上都存活）。只 import 宿主文件，
   从不修改。**动了 canary 的文案/顺序或 `rewind-canary.ts` 必跑。**
 - `harness/local-patches-check.mjs` — `local-patches/` 的纯离线检查（spawn 真实 apply/check
@@ -316,3 +316,15 @@
   （无嵌套树、标签内注释、属性表达式里的模板字面量），读不出来就**跳过而不猜**（fail closed）。
   **动了它的 JSX/调用读取规则必跑所有 `require` 它的检查**（`grep -l source-shape harness/*`
   看当前集合，别按记忆列名单）。
+
+上面清单之外还有四个容易被当成同类、其实不是的：`harness/tools.mjs`（真 `dsh` 的工具目录
+转储）、`harness/subagent-live.mjs`（实机子会话可见性）、`harness/fake-dsh-bridge.mjs`
+（上面几个假桥脚本共用的 scripted 替身，不是独立检查脚本），以及
+`harness/session-calls.mjs`——**诊断工具，不是回归**：它读 `$DSH_HOME/sessions` 下的会话
+日志，把每个 `tool/call` 的参数**键**与同一会话里 `request/header` 真正下发给模型的 schema
+做 diff，报出未声明的键并以 `exit 1` 结束；有调用查不到 schema（或参数不是 JSON）时
+`exit 2`，不把"没检查"当干净。用来回答"我到底发出去了什么"：界面和模型读到的
+转写都是渲染，不能当证据。它刻意绕开两个坑——会话日志是**多帧** zstd
+（`zlib.zstdDecompressSync` 只解第一帧，会把 1.6 MB 的会话读成 172 字节的头部），以及
+**绝不静默跳过**解不开的文件。用法：`node harness/session-calls.mjs --list` /
+`--latest` / `--session <id>`，可再加 `--tool <name>`、`--raw`。
