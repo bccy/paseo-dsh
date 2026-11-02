@@ -37,15 +37,25 @@
  *      injected in the same turn as the receipt is dropped by the host, while
  *      the appended row survives — the pair that explains why the row is not a
  *      notice.
+ *   8. a handle captured **between** arming the report and delivering it still
+ *      builds the replacement subscription: no report row is appended before the
+ *      replacement (the probe that used to append blind, `race-capture`);
+ *   9. a host whose rebuild finishes **after** the replacement timeout gets its
+ *      appended row wiped and the verification appends it again — the repair
+ *      branch used to be unexercised (`degrade-wipe`);
+ *  10. when the append itself fails, the fallback notice carries the degraded
+ *      marker in its description, so the client's legacy-row filter cannot hide
+ *      it (the fallback's title is still the report copy).
  *
  * Run (from the repo root):
  *   node harness/rewind-notice-delivery-check.mjs [compiled-plugin-dir]
  *
  * Without an argument the plugin is compiled into `paseo-plugin/.dbg-p17-delivery`
  * by `harness/plugin-build.cjs`; `PASEO_CLI_ROOT` overrides the host location.
- * The file re-executes itself once with
- * `DSH_PASEO_REWIND_REPLACEMENT_TIMEOUT_MS` set short, to drive the degraded
- * "replacement never arrives" path without waiting out the real bound.
+ * The file re-executes itself twice with
+ * `DSH_PASEO_REWIND_REPLACEMENT_TIMEOUT_MS` set short: `--degraded` drives the
+ * "replacement never arrives" path and `--degraded-late` the "rebuild finishes
+ * after the timeout" path, without waiting out the real bound.
  */
 import fs from "node:fs";
 import os from "node:os";
@@ -74,10 +84,13 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ---------------------------------------------------------------------------
 // CLI: `[compiled-plugin-dir]` for the normal run, `--degraded` for the child
-// process that models a host which never dispatches a replacement.
+// process that models a host which never dispatches a replacement, and
+// `--degraded-late` for a host whose rebuild finishes after the replacement
+// timeout (the row is appended first and then wiped — the repair path).
 // ---------------------------------------------------------------------------
 const args = process.argv.slice(2);
-const degraded = args.includes("--degraded");
+const lateReplacement = args.includes("--degraded-late");
+const degraded = args.includes("--degraded") || lateReplacement;
 const buildArg = args.find((value) => !value.startsWith("--"));
 
 // ---------------------------------------------------------------------------
@@ -168,12 +181,17 @@ try {
 }
 const { rewindSuccessText, rewindNoticeTone, REWIND_NOTICE_KIND, REWIND_NOTICE_ITEM_ID } =
   require(join(buildDir, "shared", "rewind-notice.js"));
+const { isLegacyRewindNotice } = require(join(buildDir, "client", "rewind-notice-data.js"));
 const { UI } = require(join(buildDir, "server", "locale.js"));
 const FILES_REPORT = rewindSuccessText(UI.rewind, "files", undefined);
 const CONVERSATION_REPORT = rewindSuccessText(UI.rewind, "conversation", undefined);
 const BOTH_REPORT = rewindSuccessText(UI.rewind, "both", undefined);
 const CANARY_PREFIX = "撤回已生效";
 const PLUGIN_ID = "dsh-paseo";
+/** How the host joins a notice's title and description into the timeline item. */
+function joinedNotice(title, description) {
+  return [title, description].filter((part) => typeof part === "string" && part !== "").join("\n");
+}
 
 // ---------------------------------------------------------------------------
 // The plugin, registered into the host's own registry. The fake server object
@@ -217,12 +235,16 @@ const emitted = [];
 const appends = [];
 const replacements = [];
 const subscriptions = new Set();
+let refetches = 0;
+let subscribes = 0;
+/** Number of timeline appends the fake Paseo refuses (drives the fallback path). */
+let failAppends = 0;
 /** Set by the mechanism scenario: inject a notice in the receipt's own turn. */
 let probeMode = false;
 let connectionListener;
 
 /** False in the degraded child: the host dispatches, the subscription never sees it. */
-const deliverReplacements = !degraded;
+const deliverReplacements = !degraded || lateReplacement;
 
 function makePaseo(manager) {
   const managerUnsubscribe = manager.subscribe((event) => {
@@ -260,12 +282,17 @@ function makePaseo(manager) {
         return {
           timeline: {
             async append(item) {
+              if (failAppends > 0) {
+                failAppends -= 1;
+                throw new Error("p17: the timeline append failed on purpose");
+              }
               const at = Date.now();
               const result = await manager.appendTimelineItem(agentId, { ...item, pluginId: PLUGIN_ID });
               appends.push({ agentId, item, at, result });
               return result;
             },
             async refetch(options) {
+              refetches += 1;
               const page = manager.fetchTimeline(agentId, {
                 direction: options?.direction ?? "tail",
                 limit: options?.limit ?? 20,
@@ -273,6 +300,7 @@ function makePaseo(manager) {
               return { ...page, entries: page.rows };
             },
             subscribe(handler) {
+              subscribes += 1;
               const subscription = { agentId, handler };
               subscriptions.add(subscription);
               const unsubscribe = () => subscriptions.delete(subscription);
@@ -633,38 +661,203 @@ if (!degraded) {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Degraded host: no replacement ever arrives. The delivery must append after
-//    its timeout and verify the row survived (the rebuild may still be running).
+// 7. Append failure: the fallback notice keeps the report copy (so the existing
+//    copy assertions stay valid) but carries the degraded marker in its
+//    description, which is what keeps the client's legacy-row filter from hiding
+//    the failure report.
+// ---------------------------------------------------------------------------
+if (!degraded) {
+  console.log("\nappend failure: the fallback notice is marked, not legacy");
+  const before = emitted.length;
+  failAppends = 1;
+  try {
+    const fallbackMessageId = freshRevertToken();
+    await manager.rewind(agent.id, fallbackMessageId, "files");
+  } finally {
+    failAppends = 0;
+  }
+  const fallbackNotice = await waitFor(() =>
+    emitted.slice(before).find(
+      (entry) => entry.event.type === "session.notice" && entry.event.notice?.title === FILES_REPORT,
+    ),
+  );
+  check(
+    "an append failure still emits the report as a provider notice",
+    fallbackNotice !== undefined,
+    JSON.stringify(emitted.slice(before).map((entry) => entry.event.notice?.title ?? entry.event.type)),
+  );
+  const fallbackDescription = String(fallbackNotice?.event.notice?.description ?? "");
+  check(
+    "…whose description carries the degraded marker",
+    Object.values(appendModule.REWIND_FALLBACK_MARKERS).some((marker) => fallbackDescription.startsWith(marker)),
+    JSON.stringify(fallbackDescription),
+  );
+  check(
+    "…so the client's legacy filter leaves it visible",
+    isLegacyRewindNotice(
+      joinedNotice(String(fallbackNotice?.event.notice?.title ?? ""), fallbackDescription),
+    ) === false,
+  );
+  check(
+    "…while the same copy without the marker is still treated as a legacy row",
+    isLegacyRewindNotice(FILES_REPORT) === true,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 8. A Paseo handle captured **between** arming the report and delivering it.
+//    The delivery must subscribe and wait for the replacement instead of
+//    appending blind — the old code appended 300 ms into a 3 s rebuild, so the
+//    rebuild wiped the row with no log (the `race-capture` probe).
+// ---------------------------------------------------------------------------
+if (!degraded) {
+  console.log("\nhandle captured mid-rewind: the report does not append blind");
+  const appendPath = join(buildDir, "server", "rewind-notice-append.js");
+  delete require.cache[appendPath];
+  const freshAppend = require(appendPath);
+  check("a fresh report module has no Paseo API handle", freshAppend.hasPaseoHandle() === false);
+  const raceDelivery = freshAppend.beginRewindReport(agent.id, "conversation");
+  freshAppend.capturePaseo(paseo);
+  const appendsBefore = appends.length;
+  const replacementsBefore = replacements.length;
+  const raceMessageId = freshRevertToken();
+  const originalStreamHistory = session.streamHistory.bind(session);
+  session.streamHistory = async function* slowRaceHistory() {
+    await sleep(3000);
+    yield* originalStreamHistory();
+  };
+  try {
+    const rewindPromise = manager.rewind(agent.id, raceMessageId, "conversation");
+    // Deliver while the host's rebuild is still running: this is the window the
+    // old code appended into. Count subscriptions around the deliver call itself:
+    // the provider's own delivery subscribes during the rewind, so the delta must
+    // be taken here to attribute it to the late-armed delivery.
+    await sleep(300);
+    const subscribesBeforeDeliver = subscribes;
+    raceDelivery.deliver({ message: CONVERSATION_REPORT, tone: "success" });
+    await sleep(20);
+    check(
+      "the mid-rewind capture subscribed to the timeline before appending",
+      subscribes > subscribesBeforeDeliver,
+      `${String(subscribes - subscribesBeforeDeliver)} subscription(s) at deliver time`,
+    );
+    await rewindPromise;
+    const raceAppends = await waitFor(() =>
+      appends.length > appendsBefore ? appends.slice(appendsBefore) : undefined,
+    );
+    const replacement = replacements[replacementsBefore];
+    check("the host dispatched the replacement for the race rewind", replacement !== undefined);
+    check(
+      "…no report row was appended before it (the old blind append)",
+      raceAppends !== undefined
+        && raceAppends.length > 0
+        && raceAppends.every((entry) => entry.at >= (replacement?.at ?? 0)),
+      raceAppends === undefined
+        ? "no appends"
+        : raceAppends.map((entry) => `${String(entry.at - (replacement?.at ?? 0))}ms`).join(", "),
+    );
+    await sleep(100);
+    check("…the report row is on the timeline", reportRows(agent.id).length === 1, describeRows(agent.id));
+  } finally {
+    session.streamHistory = originalStreamHistory;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 9. Degraded host: no replacement ever arrives (or it arrives only after the
+//    timeout). The delivery must append after its timeout and verify the row
+//    survived; a rebuild that finishes late has to be repaired, not dropped.
 // ---------------------------------------------------------------------------
 if (degraded) {
-  console.log("\ntimeline replacement never dispatched");
+  console.log(
+    lateReplacement
+      ? "\ntimeline replacement arrives after the timeout (slow rebuild)"
+      : "\ntimeline replacement never dispatched",
+  );
   // The host dispatches the replacement; the fake subscription is what never
-  // receives it (`deliverReplacements` is false in this mode). The handle is
-  // captured through the arm RPC — the path a freshly loaded client bundle uses.
+  // receives it in `--degraded` (`deliverReplacements` is false there). The handle
+  // is captured through the arm RPC — the path a freshly loaded client bundle uses.
   const arm = rpcHandlers.get("rewind.notice.arm");
   if (typeof arm === "function") arm({}, { paseo });
   check("the arm RPC captured the handle before the rewind", appendModule.hasPaseoHandle() === true);
-  const before = appends.length;
-  const started = Date.now();
-  const degradedMessageId = freshRevertToken();
-  await manager.rewind(agent.id, degradedMessageId, "conversation");
-  const appended = await waitFor(() => (appends.length > before ? appends[appends.length - 1] : undefined), 6000);
-  check(
-    "the report is appended after the replacement timeout",
-    appended !== undefined,
-    `appended after ${String(appended === undefined ? -1 : appended.at - started)}ms`,
-  );
-  check(
-    "…the timeout path is bounded by the documented override",
-    appendModule.REWIND_REPLACEMENT_TIMEOUT_MS > 0 && appendModule.REWIND_REPLACEMENT_TIMEOUT_MS < 10_000,
-    `timeout ${String(appendModule.REWIND_REPLACEMENT_TIMEOUT_MS)}ms`,
-  );
-  await sleep(2000);
-  check(
-    "…and exactly one report row remains after the verification pass",
-    reportRows(agent.id).length === 1,
-    describeRows(agent.id),
-  );
+  // `--degraded-late` models a host whose rebuild finishes after the timeout: the
+  // row is appended before the rebuild wipes it, so the verification has to
+  // re-append it.
+  const originalStreamHistory = session.streamHistory.bind(session);
+  if (lateReplacement) {
+    session.streamHistory = async function* slowLateHistory() {
+      await sleep(3000);
+      yield* originalStreamHistory();
+    };
+  }
+  try {
+    const before = appends.length;
+    const replacementsBefore = replacements.length;
+    const refetchesBefore = refetches;
+    const started = Date.now();
+    const degradedMessageId = freshRevertToken();
+    await manager.rewind(agent.id, degradedMessageId, "conversation");
+    const appended = await waitFor(() => (appends.length > before ? appends[before] : undefined), 6000);
+    check(
+      "the report is appended after the replacement timeout",
+      appended !== undefined,
+      `appended after ${String(appended === undefined ? -1 : appended.at - started)}ms`,
+    );
+    check(
+      "…the timeout path is bounded by the documented override",
+      appendModule.REWIND_REPLACEMENT_TIMEOUT_MS > 0 && appendModule.REWIND_REPLACEMENT_TIMEOUT_MS < 10_000,
+      `timeout ${String(appendModule.REWIND_REPLACEMENT_TIMEOUT_MS)}ms`,
+    );
+    if (lateReplacement) {
+      const replacement = replacements[replacementsBefore];
+      check(
+        "the slow rebuild dispatched its replacement after the append",
+        appended !== undefined && replacement !== undefined && replacement.at > appended.at,
+        `append +${String((appended?.at ?? 0) - started)}ms, `
+          + `replacement +${String(replacement === undefined ? -1 : replacement.at - started)}ms`,
+      );
+      const repaired = await waitFor(() => (appends.length > before + 1 ? appends[before + 1] : undefined), 8000);
+      check(
+        "the rebuild wiped the appended row and the verification appended it again",
+        repaired !== undefined,
+        `${String(appends.length - before)} append(s)`,
+      );
+      check(
+        "…the repair keeps the row identity (same noticeId, one report)",
+        repaired !== undefined
+          && appended !== undefined
+          && repaired.item.data.noticeId === appended.item.data.noticeId,
+        `${String(appended?.item.data.noticeId)} -> ${String(repaired?.item.data.noticeId)}`,
+      );
+      await waitFor(() => (refetches >= refetchesBefore + 3 ? true : undefined), 8000);
+      await sleep(300);
+      check(
+        "…and exactly one report row remains after the verification pass",
+        reportRows(agent.id).length === 1,
+        describeRows(agent.id),
+      );
+      check(
+        "…it is the repaired report",
+        reportRows(agent.id)[0]?.item.data?.noticeId === appended?.item.data?.noticeId,
+        describeRows(agent.id),
+      );
+    } else {
+      // Wait for the bounded checks to run out, so the "could not be confirmed"
+      // log is emitted before the process exits (the parent asserts that log).
+      await waitFor(
+        () => (refetches >= refetchesBefore + appendModule.REWIND_REPLACEMENT_VERIFY_ATTEMPTS ? true : undefined),
+        12_000,
+      );
+      await sleep(600);
+      check(
+        "…and exactly one report row remains after the verification pass",
+        reportRows(agent.id).length === 1,
+        describeRows(agent.id),
+      );
+    }
+  } finally {
+    session.streamHistory = originalStreamHistory;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -696,16 +889,54 @@ if (!degraded) {
     probeMode = false;
   }
 
-  // 9. The degraded path runs in a child process: the replacement timeout is read
-  //    when the plugin build loads, so a second process is how the check drives a
-  //    host that never dispatches a replacement without waiting out the real
-  //    bound.
-  console.log("\ndegraded scenario (child process, replacement timeout overridden)");
-  const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url), "--degraded"], {
-    env: { ...process.env, DSH_PASEO_REWIND_REPLACEMENT_TIMEOUT_MS: "300" },
-    stdio: "inherit",
-  });
-  check("the degraded child run passed", child.status === 0, `exit ${String(child.status)}`);
+  // 10. The degraded paths run in child processes: the replacement timeout is
+  //     read when the plugin build loads, so a second process is how the check
+  //     drives a host that never dispatches a replacement, and one whose rebuild
+  //     finishes after the timeout, without waiting out the real bound. The
+  //     child's stderr is asserted too: a repair or a give-up that is not logged
+  //     is a silent degradation.
+  console.log("\ndegraded scenarios (child processes, replacement timeout overridden)");
+  const degradedRuns = [
+    {
+      mode: "--degraded",
+      expectations: [
+        [
+          "…the bounded checks end with an explicit give-up log",
+          "could not be confirmed",
+        ],
+      ],
+    },
+    {
+      mode: "--degraded-late",
+      expectations: [
+        [
+          "…the wiped row is re-appended with a log line",
+          "was wiped by a timeline rebuild; appending it again",
+        ],
+        [
+          "…and the repaired row is confirmed after the replacement",
+          "survived the timeline replacement",
+        ],
+      ],
+    },
+  ];
+  for (const run of degradedRuns) {
+    const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url), run.mode], {
+      env: { ...process.env, DSH_PASEO_REWIND_REPLACEMENT_TIMEOUT_MS: "300" },
+      encoding: "utf8",
+    });
+    console.log(child.stdout ?? "");
+    const childStderr = child.stderr ?? "";
+    if (child.status !== 0) console.log(childStderr);
+    check(`the ${run.mode} child run passed`, child.status === 0, `exit ${String(child.status)}`);
+    for (const [label, phrase] of run.expectations) {
+      check(
+        label,
+        childStderr.includes(phrase),
+        childStderr.includes(phrase) ? phrase : `missing "${phrase}" in the child's stderr`,
+      );
+    }
+  }
 }
 
 console.log(`\n  ${passed}/${passed + failed} passed`);

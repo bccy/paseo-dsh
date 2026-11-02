@@ -26,6 +26,14 @@
  *      transformer recognises them from the copy table and removes them, so a
  *      session that predates this change stops showing stale "rewound" lines.
  *      The rewind canary is a different notice and must not match.
+ *   4. **A degraded fallback notice stays visible.** When the row cannot be
+ *      appended, the provider falls back to a notice with the report's own copy
+ *      — the text the legacy filter removes. The marker line in its description
+ *      is what keeps it out of that filter; the client and server copies of the
+ *      marker are asserted identical here.
+ *   5. **The report never appends blind.** A Paseo handle captured *after* the
+ *      report was armed still builds the replacement subscription: the append
+ *      waits for the host's rebuild instead of landing in front of it.
  *
  * Everything is the **compiled** client/shared code (`harness/plugin-build.cjs`
  * compiles the plugin to CommonJS), not a regex over the sources: the check
@@ -61,6 +69,11 @@ function equal(label, actual, expected) {
 
 const buildDir = resolvePluginBuild(process.argv[2], ".dbg-p17-client");
 console.log(`plugin build: ${buildDir}`);
+
+// The report module reads its replacement timeout at load; a short one lets the
+// race and timeout assertions below run without waiting out the production bound.
+process.env.DSH_PASEO_REWIND_REPLACEMENT_TIMEOUT_MS = "50";
+const appendModule = require(path.join(buildDir, "server", "rewind-notice-append.js"));
 
 const {
   REWIND_COPY,
@@ -184,6 +197,8 @@ function agentEntry(id, overrides = {}) {
 }
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+/** Let a delivery's async chain (await replacement → append) finish. */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function main() {
   console.log("copy — both locales");
@@ -268,6 +283,168 @@ async function main() {
     equal("an empty message is left alone", isLegacyRewindNotice(""), false);
     equal("the failure capsule is one line", rewindNoticeHeadline("文件回退未完成\n第一行详情"), "文件回退未完成");
     equal("the toast repeats the headline", rewindToastMessage({ message: "文件回退未完成\n详情", tone: "warning", noticeId: "n" }), "文件回退未完成");
+  }
+
+  console.log("degraded fallback — visible, and still not a legacy row");
+  {
+    const clientData = require(path.join(buildDir, "client", "rewind-notice-data.js"));
+    // The client keeps its own copy of the marker strings (it cannot import a
+    // server module: `process` is read at load there). A drift would silently
+    // hide the fallback failure report again.
+    equal(
+      "the client and server agree on the fallback markers",
+      JSON.stringify(clientData.REWIND_FALLBACK_MARKERS),
+      JSON.stringify(appendModule.REWIND_FALLBACK_MARKERS),
+    );
+    for (const locale of ["en", "zh-CN"]) {
+      const copy = REWIND_COPY[locale];
+      const marker = appendModule.REWIND_FALLBACK_MARKERS[locale];
+      equal(
+        `${locale} the fallback description starts with the marker`,
+        appendModule.fallbackNoticeDescription(locale, ""),
+        marker,
+      );
+      equal(
+        `${locale} the fallback keeps the report's detail after the marker`,
+        appendModule.fallbackNoticeDescription(locale, "detail line"),
+        `${marker}\ndetail line`,
+      );
+      // What the host joins for a notice: title + "\n" + description.
+      equal(
+        `${locale} a degraded success report is not hidden as a legacy row`,
+        clientData.isLegacyRewindNotice(
+          `${copy.conversation}\n${appendModule.fallbackNoticeDescription(locale, "")}`,
+        ),
+        false,
+      );
+      equal(
+        `${locale} a degraded failure report is not hidden as a legacy row`,
+        clientData.isLegacyRewindNotice(
+          `${copy.failureTitle}\n${appendModule.fallbackNoticeDescription(locale, "/work/a.txt 恢复失败")}`,
+        ),
+        false,
+      );
+      // …and the old rows are still removed, marker or not.
+      equal(
+        `${locale} a legacy success row is still hidden`,
+        clientData.isLegacyRewindNotice(copy.conversation),
+        true,
+      );
+      equal(
+        `${locale} a legacy failure row is still hidden`,
+        clientData.isLegacyRewindNotice(`${copy.failureTitle}\n/work/a.txt 恢复失败`),
+        true,
+      );
+    }
+    check(
+      "the timeout path re-checks the row more than once, after a delay",
+      appendModule.REWIND_REPLACEMENT_VERIFY_ATTEMPTS > 1 && appendModule.REWIND_REPLACEMENT_VERIFY_DELAY_MS > 0,
+      `${String(appendModule.REWIND_REPLACEMENT_VERIFY_ATTEMPTS)} attempt(s), `
+        + `${String(appendModule.REWIND_REPLACEMENT_VERIFY_DELAY_MS)}ms apart`,
+    );
+  }
+
+  console.log("handle captured mid-rewind — the report never appends blind");
+  {
+    const appended = [];
+    const subscriptions = [];
+    const fakePaseo = {
+      agents: {
+        ref(agentId) {
+          return {
+            timeline: {
+              async append(item) {
+                appended.push({ agentId, item, at: Date.now() });
+                return { seq: appended.length };
+              },
+              async refetch() {
+                return { entries: [] };
+              },
+              subscribe(handler) {
+                const subscription = { agentId, handler };
+                subscriptions.push(subscription);
+                const release = () => {
+                  const index = subscriptions.indexOf(subscription);
+                  if (index >= 0) subscriptions.splice(index, 1);
+                };
+                release.ready = Promise.resolve();
+                release.subscriptionId = "sim";
+                release.release = async () => release();
+                return release;
+              },
+            },
+          };
+        },
+      },
+    };
+    check("the report module starts without a Paseo API handle", appendModule.hasPaseoHandle() === false);
+    const delivery = appendModule.beginRewindReport("agent-race", "conversation");
+    check("…so arming the report creates no timeline subscription yet", subscriptions.length === 0);
+    appendModule.capturePaseo(fakePaseo);
+    check("the handle capture is what arms the report", appendModule.hasPaseoHandle() === true);
+    delivery.deliver({ message: REWIND_COPY["zh-CN"].conversation, tone: "success" });
+    await sleep(20);
+    check(
+      "the report does not append before the replacement arrives",
+      appended.length === 0,
+      JSON.stringify(appended.map((entry) => entry.item.data)),
+    );
+    check(
+      "…it subscribed to the agent's timeline first",
+      subscriptions.length === 1,
+      `${subscriptions.length} subscription(s)`,
+    );
+    subscriptions[0].handler({ agentId: "agent-race", event: { type: "replacement", epoch: "e1" } });
+    await sleep(20);
+    check(
+      "the report appends once the replacement arrives",
+      appended.length === 1 && appended[0].agentId === "agent-race",
+      JSON.stringify(appended.map((entry) => entry.item.data)),
+    );
+  }
+
+  console.log("replacement timeout — the report is appended, never dropped");
+  {
+    const appended = [];
+    const fakePaseo = {
+      agents: {
+        ref(agentId) {
+          return {
+            timeline: {
+              async append(item) {
+                appended.push({ agentId, item, at: Date.now() });
+                return { seq: appended.length };
+              },
+              async refetch() {
+                return { entries: [] };
+              },
+              subscribe() {
+                const release = () => {};
+                release.ready = Promise.resolve();
+                release.subscriptionId = "sim";
+                release.release = async () => {};
+                return release;
+              },
+            },
+          };
+        },
+      },
+    };
+    appendModule.capturePaseo(fakePaseo);
+    const delivery = appendModule.beginRewindReport("agent-timeout", "conversation");
+    delivery.deliver({ message: REWIND_COPY["zh-CN"].conversation, tone: "success" });
+    await sleep(20);
+    check(
+      "the report waits for the replacement instead of appending immediately",
+      appended.length === 0,
+      JSON.stringify(appended.map((entry) => entry.item.data)),
+    );
+    await sleep(120);
+    check(
+      "…and appends after the bounded replacement timeout",
+      appended.length === 1,
+      JSON.stringify(appended.map((entry) => entry.item.data)),
+    );
   }
 
   console.log("payload schema — the row carries its own identity");

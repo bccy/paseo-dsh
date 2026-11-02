@@ -31,8 +31,8 @@ import {
 } from "./dsh-process";
 import { DshChildSession, DshSession, modes, parseRoute } from "./session";
 import { rewindCanaryNotice } from "./rewind-canary";
-import { beginRewindReport, type RewindReportFallback } from "./rewind-notice-append";
-import { effortLabel, UI } from "./locale";
+import { beginRewindReport, fallbackNoticeDescription, type RewindReportFallback } from "./rewind-notice-append";
+import { effortLabel, LOCALE, UI } from "./locale";
 import { rewindSuccessText, type RewindTone } from "../shared/rewind-notice";
 import type { JobErrorCode } from "../shared/jobs";
 import { PROVIDER_ID } from "../shared/provider";
@@ -1332,11 +1332,22 @@ class DshConnection implements ProviderConnection {
    * holds the rewind's run lock (see the `session.revert` branch), so this is a
    * best-effort second path, not a second guarantee: the append is what makes
    * the report deterministic. It exists so an append failure is never silent.
+   *
+   * The notice's title is the report's own copy — the same text the client's
+   * legacy-row filter removes from a rebuilt timeline — so the description
+   * carries the degraded-delivery marker (`fallbackNoticeDescription`). Without
+   * it the client would hide this fallback too and the failure would be
+   * invisible again.
    */
   #reportFallback(sessionId: string): RewindReportFallback {
     return (report) => {
       const [title = "", ...detail] = report.message.split("\n");
-      this.#notice(sessionId, report.tone === "warning" ? "warning" : "info", title, detail.join("\n") || undefined);
+      this.#notice(
+        sessionId,
+        report.tone === "warning" ? "warning" : "info",
+        title,
+        fallbackNoticeDescription(LOCALE, detail.join("\n")),
+      );
     };
   }
 

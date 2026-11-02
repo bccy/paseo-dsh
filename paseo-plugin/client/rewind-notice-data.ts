@@ -14,6 +14,11 @@
  * table the server emits and removed by the transformer — see
  * `isLegacyRewindNotice`.
  *
+ * A **live** fallback notice reports the same outcome and therefore carries the
+ * same title, so it would match that filter as well. The server marks its
+ * description with {@link REWIND_FALLBACK_MARKERS}; a notice carrying the marker
+ * is a degraded delivery that must stay visible, not a replayed legacy row.
+ *
  * Kept free of React and of the host runtime: the offline check compiles it to
  * CommonJS and drives it directly.
  *
@@ -40,6 +45,21 @@ export type RewindNoticeData = RewindNoticePayload;
 export const rewindNoticeSchema = rewindNoticePayloadSchema;
 
 /**
+ * Marker lines the server puts on a degraded fallback notice's description.
+ *
+ * The fallback reports the same outcome as a legacy row, so the copy alone
+ * cannot tell them apart; the marker is what keeps a live fallback visible. The
+ * canonical strings live in `server/rewind-notice-append` (a server module the
+ * client bundle cannot import), and `harness/rewind-notice-check.cjs` asserts
+ * the two copies are identical — a drift here would silently hide the failure
+ * report again.
+ */
+export const REWIND_FALLBACK_MARKERS: Readonly<Record<"en" | "zh-CN", string>> = Object.freeze({
+  en: "Degraded delivery: the report row could not be written to the timeline; this notice may not persist",
+  "zh-CN": "降级送达：报告行未能写入时间线，这条提示可能不会保留",
+});
+
+/**
  * Whether a host `notification` item is a rewind report from the **old**
  * delivery path.
  *
@@ -51,11 +71,15 @@ export const rewindNoticeSchema = rewindNoticePayloadSchema;
  * builds the text from — lets the transformer remove them, so a session that
  * predates this change stops showing stale "rewound" lines.
  *
- * The rewind **canary** must not match: it is a different notice with a
- * different job (it warns that the timeline may be stale), and the copy table
- * deliberately does not contain its wording.
+ * A notice carrying one of {@link REWIND_FALLBACK_MARKERS} is **not** legacy:
+ * it is the live degraded fallback for a report that could not be appended, and
+ * removing it would hide a real (if degraded) report. The canary must not match
+ * either: it is a different notice with a different job (it warns that the
+ * timeline may be stale), and the copy table deliberately does not contain its
+ * wording.
  */
 export function isLegacyRewindNotice(message: string): boolean {
+  if (Object.values(REWIND_FALLBACK_MARKERS).some((marker) => message.includes(marker))) return false;
   return rewindNoticeTone(message) !== undefined;
 }
 

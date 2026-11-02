@@ -29,7 +29,10 @@
  *   the run lock, so the delivery subscribes to the agent's live timeline
  *   **before** the revert is sent and appends only after that replacement
  *   arrives. `files` never rebuilds the conversation, so it appends straight
- *   after the receipt.
+ *   after the receipt. A rebuild can still be slower than the wait: then the row
+ *   is appended anyway and the delivery keeps verifying it (see
+ *   {@link verifyReportSurvived}), so a late rebuild is repaired instead of
+ *   silently eating the report.
  * - **The provider connection has no Paseo API handle.** `connect()` is handed
  *   `{ launch, versions, capabilities }` only; the handle lives in the plugin
  *   process and is passed to hook/RPC/tool callbacks (`PluginHandlerContext`).
@@ -38,12 +41,16 @@
  *   calls `rewind.notice.arm` on load to cover a daemon restart with no turn
  *   since. If a rewind lands before any capture, the report is queued and
  *   appended on the next capture instead of being dropped; the wait is logged.
+ *   A handle captured *between* arming the report and delivering it builds the
+ *   same replacement subscription late — the report never appends blind.
  *
  * Failure is loud, never silent: an append that throws is reported on stderr
  * (the plugin's log surface) and falls back to the provider notice channel as a
  * best-effort second path — that one can still be dropped by the run lock, which
  * is exactly why the append exists, but a user with a broken host at least sees
- * a log line naming the report that did not land.
+ * a log line naming the report that did not land. The fallback notice also
+ * carries a marker line ({@link REWIND_FALLBACK_MARKERS}) so the client's
+ * legacy-row filter cannot mistake it for an old replayed report and hide it.
  *
  * @module dsh-paseo/server/rewind-notice-append
  */
@@ -67,8 +74,8 @@ import { PROVIDER_ID } from "../shared/provider";
  * wait is what makes the append land *after* the rebuild. It is bounded only so
  * a host that stops dispatching (or a subscription that never established)
  * cannot lose the report forever; a rebuild slower than this bound is possible
- * on a very long session, so the timeout path verifies the row afterwards and
- * re-appends once when the rebuild ate it.
+ * on a very long session, so the timeout path keeps its subscription and
+ * verifies the row afterwards, re-appending it when the rebuild ate it.
  *
  * Ten seconds is far above the measured rewind tail (the daemon log's slowest
  * rewind is 1128 ms; a 5 s hydrate is modelled by the harness) and short enough
@@ -83,8 +90,48 @@ function replacementTimeoutMs(): number {
 
 export const REWIND_REPLACEMENT_TIMEOUT_MS = replacementTimeoutMs();
 
-/** How long the timeout path waits before checking whether the row survived. */
+/** How long the timeout path waits before each check of whether the row survived. */
 export const REWIND_REPLACEMENT_VERIFY_DELAY_MS = 1500;
+
+/**
+ * How many delayed checks the timeout path makes before it stops.
+ *
+ * The checks are the fallback for a subscription that never announces a
+ * replacement (a host that does not dispatch one, or one whose subscription
+ * failed): they cannot run forever, so the last one is followed by an explicit
+ * "could not be confirmed" log rather than silence.
+ */
+export const REWIND_REPLACEMENT_VERIFY_ATTEMPTS = 4;
+
+/**
+ * The line a fallback notice's description carries.
+ *
+ * A fallback notice reports the **same outcome** as the old delivery path's
+ * notices, so its title is one of the copy-table sentences — the exact text the
+ * client's legacy-row filter removes from a rebuilt timeline. Without a marker
+ * the client cannot tell a live degraded report from an old replayed row and
+ * would delete it too, making an append failure invisible in the UI. The marker
+ * line both makes the fallback recognisable and tells the user the delivery is
+ * degraded.
+ *
+ * The client half keeps its own copy of these strings (`client/rewind-notice-data`):
+ * the shared module is the natural home, but the client bundle cannot import a
+ * server module (`process` is read at load here). `harness/rewind-notice-check.cjs`
+ * asserts the two copies are identical.
+ */
+export const REWIND_FALLBACK_MARKERS: Readonly<Record<"en" | "zh-CN", string>> = Object.freeze({
+  en: "Degraded delivery: the report row could not be written to the timeline; this notice may not persist",
+  "zh-CN": "降级送达：报告行未能写入时间线，这条提示可能不会保留",
+});
+
+/**
+ * The description a fallback notice carries: the marker line, then the report's
+ * detail lines (when the report has any).
+ */
+export function fallbackNoticeDescription(locale: "en" | "zh-CN", detail: string): string {
+  const marker = REWIND_FALLBACK_MARKERS[locale];
+  return detail === "" ? marker : `${marker}\n${detail}`;
+}
 
 /** One finished rewind, in the form the row is appended with. */
 export interface RewindReport {
@@ -104,7 +151,8 @@ export interface RewindReport {
  * Kept a callback so this module does not have to know the provider session id
  * or the notice shape. The provider's notice can still be dropped by the run
  * lock (see the module doc) — it is the second-best path, not a second
- * guarantee.
+ * guarantee. The provider marks its description with
+ * {@link REWIND_FALLBACK_MARKERS} so the client keeps it visible.
  */
 export type RewindReportFallback = (report: RewindReport) => void;
 
@@ -171,23 +219,28 @@ function fail(report: RewindReport, fallback: RewindReportFallback | undefined, 
   }
 }
 
-/**
- * Append one report row.
- *
- * The row id is fixed ({@link REWIND_NOTICE_ITEM_ID}) so a second report from
- * the same plugin replaces the first instead of stacking; `noticeId` in the
- * payload is what makes each append individually recognisable to the client's
- * live monitor.
- */
-async function appendReport(report: RewindReport): Promise<string> {
-  const api = paseo;
-  if (api === null) throw new Error("the plugin API handle is not available yet");
+/** The row payload for one report; `noticeId` makes each append individually recognisable. */
+function noticePayload(report: RewindReport): RewindNoticePayload {
   appendSeq += 1;
-  const payload: RewindNoticePayload = {
+  return {
     message: report.message,
     tone: report.tone,
     noticeId: `${report.agentId}-${Date.now().toString(36)}-${appendSeq.toString(36)}`,
   };
+}
+
+/**
+ * Append one report row with an already-built payload.
+ *
+ * The row id is fixed ({@link REWIND_NOTICE_ITEM_ID}) so a second report from
+ * the same plugin replaces the first instead of stacking; the payload is built
+ * once per rewind and reused by a re-append, so a repair keeps the row's
+ * identity (a new `noticeId` would read as a new live arrival to the client's
+ * one-shot capsule).
+ */
+async function appendPayload(report: RewindReport, payload: RewindNoticePayload): Promise<void> {
+  const api = paseo;
+  if (api === null) throw new Error("the plugin API handle is not available yet");
   await api.agents.ref(report.agentId).timeline.append({
     type: "plugin",
     id: REWIND_NOTICE_ITEM_ID,
@@ -195,7 +248,13 @@ async function appendReport(report: RewindReport): Promise<string> {
     version: REWIND_NOTICE_VERSION,
     data: payload,
   });
-  return payload.noticeId;
+}
+
+/** Append one report row, generating its payload. */
+async function appendReport(report: RewindReport): Promise<RewindNoticePayload> {
+  const payload = noticePayload(report);
+  await appendPayload(report, payload);
+  return payload;
 }
 
 /** Whether one fetched timeline page still holds the report row we appended. */
@@ -214,61 +273,174 @@ function pageHasNotice(page: unknown, noticeId: string): boolean {
   return false;
 }
 
-/**
- * Check that a report appended after the timeout survived the host's rebuild.
- *
- * The timeout path appends without having seen the replacement, so the rebuild
- * may still be running and wipe the row. One bounded re-check after a short
- * delay re-appends it when that happened; a fetch failure is logged, not
- * guessed at.
- */
-async function verifyAfterTimeout(agentId: string, noticeId: string, report: RewindReport): Promise<void> {
-  await new Promise((resolve) => {
-    const timer = setTimeout(resolve, REWIND_REPLACEMENT_VERIFY_DELAY_MS);
+/** Whether a report with this notice id is still on the agent's timeline tail. */
+async function rowSurvived(api: PaseoApi, agentId: string, noticeId: string): Promise<boolean> {
+  const page = await api.agents.ref(agentId).timeline.refetch({ direction: "tail", limit: 20 });
+  return pageHasNotice(page, noticeId);
+}
+
+/** One delayed step, unref'd so it cannot hold the plugin process open. */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
     (timer as { unref?: () => void }).unref?.();
   });
+}
+
+/**
+ * Keep checking that a row appended before the rebuild finished survived it.
+ *
+ * The timeout path appends without having seen the replacement, so the rebuild
+ * may still be running and delete the row afterwards. Two mechanisms cover that:
+ *
+ * - the subscription is **kept alive after its timeout**, because a replacement
+ *   that arrives late is the moment the rebuild finished; the row is checked
+ *   (and re-appended) when that event finally comes;
+ * - a bounded number of delayed checks re-append the row whenever they find it
+ *   gone, which covers a subscription that never announces anything.
+ *
+ * The bound is a trade-off, not a silent drop: every re-append and the final
+ * "could not be confirmed" are logged on stderr. A fetch failure is logged too
+ * and retried on the next check instead of being read as "the row is gone".
+ */
+async function verifyReportSurvived(
+  report: RewindReport,
+  payload: RewindNoticePayload,
+  watch: ReplacementWatch | null,
+): Promise<void> {
   const api = paseo;
   if (api === null) return;
-  try {
-    const page = await api.agents.ref(agentId).timeline.refetch({ direction: "tail", limit: 20 });
-    if (pageHasNotice(page, noticeId)) return;
-    process.stderr.write(
-      `[${PROVIDER_ID}] the rewind report for agent ${agentId} was wiped by a rebuild that arrived after the `
-        + `${String(REWIND_REPLACEMENT_TIMEOUT_MS)}ms replacement timeout; appending it again\n`,
-    );
-    await appendReport(report);
-  } catch (error) {
-    process.stderr.write(
-      `[${PROVIDER_ID}] could not verify the rewind report for agent ${agentId}: `
-        + `${error instanceof Error ? error.message : String(error)}\n`,
-    );
+  const attempts = String(REWIND_REPLACEMENT_VERIFY_ATTEMPTS);
+  let presentAtLastCheck: boolean | undefined;
+  for (let attempt = 1; attempt <= REWIND_REPLACEMENT_VERIFY_ATTEMPTS; attempt += 1) {
+    await delay(REWIND_REPLACEMENT_VERIFY_DELAY_MS);
+    try {
+      presentAtLastCheck = await rowSurvived(api, report.agentId, payload.noticeId);
+    } catch (error) {
+      process.stderr.write(
+        `[${PROVIDER_ID}] could not verify the rewind report for agent ${report.agentId}: `
+          + `${error instanceof Error ? error.message : String(error)} (check ${String(attempt)}/${attempts})\n`,
+      );
+      continue;
+    }
+    if (!presentAtLastCheck) {
+      process.stderr.write(
+        `[${PROVIDER_ID}] the rewind report for agent ${report.agentId} was wiped by a timeline rebuild; `
+          + `appending it again (check ${String(attempt)}/${attempts})\n`,
+      );
+      await appendPayload(report, payload);
+      presentAtLastCheck = true;
+      continue;
+    }
+    if (watch?.sawReplacement() === true) {
+      process.stderr.write(
+        `[${PROVIDER_ID}] the rewind report for agent ${report.agentId} survived the timeline replacement `
+          + `(confirmed ${String(attempt)} check(s) after the timeout)\n`,
+      );
+      return;
+    }
   }
+  // The subscription is still live and can announce the rebuild after the checks
+  // ran out; that event is the moment the row can be wiped, so wait for it
+  // (bounded) instead of declaring the report safe.
+  if (watch !== null && watch.sawReplacement() === false) {
+    const late = await Promise.race([
+      watch.lateReplaced,
+      delay(REWIND_REPLACEMENT_TIMEOUT_MS).then(() => false),
+    ]);
+    if (late) {
+      await delay(REWIND_REPLACEMENT_VERIFY_DELAY_MS);
+      try {
+        presentAtLastCheck = await rowSurvived(api, report.agentId, payload.noticeId);
+      } catch (error) {
+        process.stderr.write(
+          `[${PROVIDER_ID}] could not verify the rewind report for agent ${report.agentId} after the late `
+            + `timeline replacement: ${error instanceof Error ? error.message : String(error)}\n`,
+        );
+        presentAtLastCheck = undefined;
+      }
+      if (presentAtLastCheck === false) {
+        process.stderr.write(
+          `[${PROVIDER_ID}] the rewind report for agent ${report.agentId} was wiped by a rebuild that finished `
+            + "after the replacement timeout; appending it again\n",
+        );
+        await appendPayload(report, payload);
+        return;
+      }
+      if (presentAtLastCheck === true) {
+        process.stderr.write(
+          `[${PROVIDER_ID}] the rewind report for agent ${report.agentId} survived the late timeline replacement\n`,
+        );
+        return;
+      }
+    }
+  }
+  process.stderr.write(
+    `[${PROVIDER_ID}] the rewind report for agent ${report.agentId} could not be confirmed: `
+      + `${
+        presentAtLastCheck === true
+          ? "the row was present at the last check"
+          : "the row could not be read at the last check"
+      }, but no timeline replacement arrived within the checks; a rebuild that finishes later can still remove it\n`,
+  );
 }
 
 /** How long the rewind waits for the timeline subscription to be acknowledged. */
 export const REWIND_SUBSCRIBE_READY_TIMEOUT_MS = 1000;
 
+/** Whether a rewind of this scope needs to wait for the host's timeline rebuild. */
+function needsReplacementWatch(agentId: string, scope: RewindScope): boolean {
+  return scope !== "files" && agentId !== "";
+}
+
+/**
+ * One live-timeline observation, as the report delivery uses it.
+ *
+ * `ready` settles when the subscription is acknowledged (or after
+ * {@link REWIND_SUBSCRIBE_READY_TIMEOUT_MS}), `replaced` when a replacement is
+ * dispatched or the timeout elapses, and `lateReplaced` when a replacement
+ * arrives *after* the timeout (the rebuild finished late). `release` ends the
+ * observation and settles anything still pending.
+ */
+interface ReplacementWatch {
+  ready: Promise<void>;
+  replaced: Promise<boolean>;
+  lateReplaced: Promise<boolean>;
+  /** Whether a replacement arrived at any point, including after the timeout. */
+  sawReplacement(): boolean;
+  release: () => void;
+}
+
 /**
  * Subscribe to one agent's live timeline and resolve when the replacement is
  * dispatched (or the wait times out).
  *
- * `ready` settles when the subscription is acknowledged (or after
- * {@link REWIND_SUBSCRIBE_READY_TIMEOUT_MS}): the caller awaits it **before**
- * sending the revert, so the subscription is in place before the host can
- * dispatch the replacement it is waiting for.
+ * The subscription is established synchronously, so the caller awaits `ready`
+ * **before** sending the revert: the replacement event cannot be dispatched
+ * before the subscription exists.
  */
-function replacementWatch(api: PaseoApi, agentId: string): {
-  ready: Promise<void>;
-  replaced: Promise<boolean>;
-  release: () => void;
-} {
+function replacementWatch(api: PaseoApi, agentId: string): ReplacementWatch {
   let resolveReplaced: (replaced: boolean) => void = () => {};
   const replaced = new Promise<boolean>((done) => {
     resolveReplaced = done;
   });
+  let resolveLate: (replaced: boolean) => void = () => {};
+  const lateReplaced = new Promise<boolean>((done) => {
+    resolveLate = done;
+  });
   let settled = false;
+  let lateSettled = false;
+  let sawReplacement = false;
   const settle = (value: boolean): void => {
-    if (settled) return;
+    if (settled) {
+      // A replacement that arrives after the timeout still matters: the rebuild
+      // it announces can wipe a row appended in the meantime.
+      if (value && !lateSettled) {
+        lateSettled = true;
+        resolveLate(true);
+      }
+      return;
+    }
     settled = true;
     resolveReplaced(value);
   };
@@ -285,8 +457,12 @@ function replacementWatch(api: PaseoApi, agentId: string): {
   const readyTimer = setTimeout(markReady, REWIND_SUBSCRIBE_READY_TIMEOUT_MS);
   (readyTimer as { unref?: () => void }).unref?.();
   const subscription = api.agents.ref(agentId).timeline.subscribe((message) => {
-    if (message.event.type === "replacement") settle(true);
-    else if (message.event.type === "error") settle(false);
+    if (message.event.type === "replacement") {
+      sawReplacement = true;
+      settle(true);
+    } else if (message.event.type === "error") {
+      settle(false);
+    }
   });
   subscription.ready.then(
     () => {
@@ -308,9 +484,18 @@ function replacementWatch(api: PaseoApi, agentId: string): {
   return {
     ready,
     replaced,
+    lateReplaced,
+    sawReplacement: () => sawReplacement,
     release: () => {
       clearTimeout(readyTimer);
       clearTimeout(timer);
+      // Settle anything still pending so a concurrent `deliver` cannot await a
+      // released watch forever.
+      settle(false);
+      if (!lateSettled) {
+        lateSettled = true;
+        resolveLate(false);
+      }
       void subscription.release().catch(() => undefined);
     },
   };
@@ -327,7 +512,7 @@ function replacementWatch(api: PaseoApi, agentId: string): {
 export class RewindReportDelivery {
   readonly #report: Omit<RewindReport, "message" | "tone">;
   readonly #fallback: RewindReportFallback | undefined;
-  readonly #watch: { ready: Promise<void>; replaced: Promise<boolean>; release: () => void } | null;
+  #watch: ReplacementWatch | null;
   #cancelled = false;
 
   constructor(
@@ -341,7 +526,7 @@ export class RewindReportDelivery {
     // `files` does not touch the conversation, so there is no replacement to
     // wait for; a session with no Paseo handle cannot subscribe at all and is
     // queued by `deliver` instead.
-    this.#watch = api !== null && scope !== "files" && agentId !== ""
+    this.#watch = api !== null && needsReplacementWatch(agentId, scope)
       ? replacementWatch(api, agentId)
       : null;
   }
@@ -378,10 +563,31 @@ export class RewindReportDelivery {
       );
       return;
     }
+    let watch = this.#watch;
+    if (watch === null && needsReplacementWatch(full.agentId, full.scope)) {
+      // The handle was captured **after** this delivery was created — an arm RPC
+      // or a jobs.list reply landed while the rewind was in flight — so the
+      // constructor could not subscribe. Subscribe now: appending without a
+      // watch can land before the host's rebuild and be wiped silently.
+      try {
+        watch = replacementWatch(paseo, full.agentId);
+        this.#watch = watch;
+        process.stderr.write(
+          `[${PROVIDER_ID}] agent ${full.agentId}: the plugin API handle arrived after the rewind report was `
+            + "armed; subscribing to the timeline now so the report waits for (or is verified after) the rebuild\n",
+        );
+      } catch (error) {
+        process.stderr.write(
+          `[${PROVIDER_ID}] could not subscribe to agent ${full.agentId}'s timeline for the rewind report: `
+            + `${error instanceof Error ? error.message : String(error)}; the report is appended and verified `
+            + "afterwards\n",
+        );
+      }
+    }
+    const payload = noticePayload(full);
     let replaced = true;
-    if (this.#watch !== null) {
-      replaced = await this.#watch.replaced;
-      this.#watch.release();
+    if (watch !== null) {
+      replaced = await watch.replaced;
       if (!replaced) {
         process.stderr.write(
           `[${PROVIDER_ID}] agent ${full.agentId} sent no timeline replacement within `
@@ -389,9 +595,21 @@ export class RewindReportDelivery {
             + "verifying it afterwards\n",
         );
       }
+    } else if (needsReplacementWatch(full.agentId, full.scope)) {
+      // No subscription could be established at all: append and verify, never
+      // append blind.
+      replaced = false;
     }
-    const noticeId = await appendReport(full);
-    if (!replaced) await verifyAfterTimeout(full.agentId, noticeId, full);
+    if (this.#cancelled) return;
+    try {
+      await appendPayload(full, payload);
+      if (!replaced) await verifyReportSurvived(full, payload, watch);
+    } finally {
+      // Release even when the append threw: the fallback notice is handled by
+      // `deliver`'s catch, and a thrown append must not leave the subscription
+      // (and its timers) behind.
+      watch?.release();
+    }
   }
 
   /** Drop the delivery (the revert failed, so there is nothing to report). */
