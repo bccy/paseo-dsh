@@ -209,24 +209,42 @@ console.log("the jobs pill's copy is covered in both languages");
   // Every key the interface declares must be present in both, and the two key
   // sets must match — a key added to one language only is the drift this catches.
   equal("jobs keys match", Object.keys(en).sort(), Object.keys(zh).sort());
-  for (const key of ["label", "title", "statuses", "allSettled", "settledLabel", "unavailable"]) {
+  for (const key of ["liveLabel", "idleLabel", "title", "statuses", "allSettled", "settledLabel", "unavailable"]) {
     check(`jobs.${key} exists in both languages`, en[key] !== undefined && zh[key] !== undefined);
   }
 
-  // `label` is the only function left: it takes a count and returns the pill's
-  // sentence, and a version returning "" would render an empty pill. The folded
-  // section's header is a plain string now — the count sits in the row's trailing
-  // muted slot rather than in the sentence, which is how the host's own rows put a
-  // number next to a label.
+  // The two count labels are the only functions left: `liveLabel` is the pill
+  // while jobs run, `idleLabel` is the total once they all settle (the route-1
+  // fix for CJ-01, matching DSH's `count.live.*` / `count.idle.*`). A function
+  // returning "" would render an empty pill, so both are called in both
+  // languages. The folded section's header is a plain string — the count sits in
+  // the row's trailing muted slot rather than in the sentence, which is how the
+  // host's own rows put a number next to a label.
   for (const locale of LOCALES) {
     const table = allText()[locale].jobs;
-    const rendered = table.label(2);
+    const live = table.liveLabel(2);
+    const idle = table.idleLabel(2);
     check(
-      `jobs.label(2) is a non-empty string in ${locale}`,
-      typeof rendered === "string" && rendered.trim() !== "",
-      JSON.stringify(rendered),
+      `jobs.liveLabel(2) is a non-empty string in ${locale}`,
+      typeof live === "string" && live.trim() !== "",
+      JSON.stringify(live),
+    );
+    check(
+      `jobs.idleLabel(1) is a non-empty string in ${locale}`,
+      typeof table.idleLabel(1) === "string" && table.idleLabel(1).trim() !== "",
+      JSON.stringify(table.idleLabel(1)),
+    );
+    check(
+      `jobs.idleLabel(2) is a non-empty string in ${locale}`,
+      typeof idle === "string" && idle.trim() !== "",
+      JSON.stringify(idle),
     );
   }
+  // The two count labels must say different things: a `liveLabel` copied into
+  // `idleLabel` would lose exactly the "there is history but nothing running"
+  // distinction the route-1 visibility change exists to expose.
+  check("the live and idle counts are not the same sentence (en)", en.liveLabel(2) !== en.idleLabel(2));
+  check("the live and idle counts are not the same sentence (zh-CN)", zh.liveLabel(2) !== zh.idleLabel(2));
   for (const locale of LOCALES) {
     const table = allText()[locale].jobs;
     check(
@@ -736,7 +754,10 @@ console.log("row copy follows the locale, not the import");
   equal("with no repeated summary", toolCallData(plan, "complete").summary, "");
   equal("the Paseo MCP row follows", toolCallData(mcp, "complete").label, "Delete heartbeat");
 
-  const huge = { name: "bash", status: "completed", detail: { type: "shell", command: "x", output: "y".repeat(7000) } };
+  // A non-terminal body, because terminal (`shell`) bodies are deliberately not
+  // capped any more — the terminal card scrolls and copies the whole output
+  // (CT-02). This case is about the marker's locale, not about which kinds cap.
+  const huge = { name: "bash", status: "completed", detail: { type: "unknown", command: "x", output: "y".repeat(7000) } };
   check(
     "the truncation marker is localized",
     toolCallData(huge, "complete").body.endsWith(allText().en.truncated),

@@ -15,8 +15,13 @@
  *   R4  wall-clock latency of `rewindAgent`
  *   R5  a follow-up turn still works and does not see the withdrawn content
  *
- * Usage: node harness/rewind-native-check.mjs [--keep]
+ * Usage: node harness/rewind-native-check.mjs --allow-real-daemon [--keep]
  * Costs a few model turns. Requires the patched daemon to be running.
+ *
+ * This probe talks to a **live daemon**, so it cannot use a throwaway DSH_HOME:
+ * the sessions it creates belong to the daemon's own home and are deleted with
+ * the agent afterwards. It therefore refuses to run unless `--allow-real-daemon`
+ * (or `PASEO_ALLOW_REAL_DAEMON=1`) acknowledges that this is a real-daemon run.
  *
  * The provider and its model are **read from the daemon**, never hard-coded:
  * `REWIND_PROVIDER` / `REWIND_MODEL` override, otherwise the single ready
@@ -78,6 +83,15 @@ async function waitFor(probe, { timeoutMs = 120_000, intervalMs = 500, label = "
 
 const root = mkdtempSync(join(tmpdir(), "rewind-native-"));
 const keep = process.argv.includes("--keep");
+const allowRealDaemon = process.argv.includes("--allow-real-daemon") || process.env.PASEO_ALLOW_REAL_DAEMON === "1";
+if (!allowRealDaemon) {
+  console.error(
+    "rewind-native-check: refusing to run against a live daemon without --allow-real-daemon " +
+      "(this creates real sessions/turns; a throwaway DSH_HOME cannot isolate the daemon's home)",
+  );
+  process.exit(2);
+}
+console.log(`Daemon: REAL localhost:${process.env.PASEO_PORT ?? "6767"} (--allow-real-daemon)`);
 
 const client = createHostClient(`localhost:${PORT}`, {
   clientId: `rewind-native-check-${Date.now()}`,

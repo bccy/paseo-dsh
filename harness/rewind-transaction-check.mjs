@@ -35,6 +35,15 @@
  *      (the gate is held), so it cannot land between plan and restore
  *   6. the gate is always released: after a successful rewind, after a failed
  *      one, and the ticket table is empty
+ *   7. closing a session drops its tickets AND releases the gate lease — a
+ *      leaked ticket made that root's next freeze wait out its 15s budget
+ *   8. a conversation-only rewind neither requires `agent.runMaintenance` nor
+ *      takes the file gate; a `both` rewind without that method still fails
+ *      loudly before changing the conversation
+ *   9. a kept child blocked by our own gate does not turn the delegated settle
+ *      into a 3s mutual wait (and does not print the misleading timeout line)
+ *  10. a second-plan failure is reported as a plan failure (`files.error`), not
+ *      as a per-file restore failure with rescue copies that do not exist
  *
  * ## The fixture's `token` (a deliberate difference from the branch)
  *
@@ -110,12 +119,42 @@ const root = await mkdtemp(join(tmpdir(), 'dsh-rewind-transaction-'));
 let serial = 0;
 
 /**
+ * Run one async call with stderr captured; returns its value plus the lines.
+ *
+ * The delegated-settle timeout is only ever reported on stderr today, so a
+ * regression that reintroduces the 3s mutual wait would still "pass" on the
+ * duration alone if the misleading line went unchecked.
+ */
+async function captureStderr(fn) {
+  const lines = [];
+  const original = process.stderr.write;
+  process.stderr.write = (text) => {
+    lines.push(String(text));
+    return true;
+  };
+  try {
+    return { value: await fn(), lines };
+  } finally {
+    process.stderr.write = original;
+  }
+}
+
+/**
  * Build one rewind scenario.
  *
  * `onFlush` runs **inside** `sessions.flush`, i.e. exactly in the window the bug
  * lived in: after the plan was frozen, before the restore.
+ *
+ * `options` keeps the fixture honest for the edge cases pinned below:
+ *  - `scope`: Paseo's revert scope (`conversation` must not touch the file layer)
+ *  - `runMaintenance`: set false to model a DSH that does not expose the internal
+ *    method at all
+ *  - `services`: extra ctx services (the `agents` registry used to join one
+ *    interrupted child by identity)
+ *  - `waitForChildren`: the subagent service's join, so the old all-children
+ *    wait can be modelled against a child that is blocked by our own gate
  */
-async function fixture(onFlush) {
+async function fixture(onFlush, options = {}) {
   const id = `root-${String(++serial)}`;
   const file = join(root, `${id}-file`);
   const childFile = join(root, `${id}-child`);
@@ -148,11 +187,13 @@ async function fixture(onFlush) {
     session,
     status: 'idle',
     inbox: { nextStep: [], nextTurn: [] },
-    runMaintenance: async (task) => {
+  };
+  if (options.runMaintenance !== false) {
+    agent.runMaintenance = async (task) => {
       maintenance += 1;
       return task(new AbortController().signal);
-    },
-  };
+    };
+  }
   const interrupted = [];
   const state = { fixture: undefined };
   const ctx = {
@@ -164,11 +205,13 @@ async function fixture(onFlush) {
           if (onFlush !== undefined) await onFlush(state.fixture);
           return true;
         },
+        get: (sessionId) => (sessionId === id ? session : undefined),
       },
       subagents: {
         interrupt: (child) => interrupted.push(child),
-        waitForChildren: async () => {},
+        waitForChildren: options.waitForChildren ?? (async () => {}),
       },
+      ...options.services,
     })[name],
   };
   const server = new PaseoHarnessServer(ctx, { notify() {}, request() { throw new Error('unexpected request'); } });
@@ -189,7 +232,7 @@ async function fixture(onFlush) {
     get appended() {
       return appended;
     },
-    revert: () => server.revert({ sessionId: id, scope: 'both', token: { messageId: 'm-10' } }),
+    revert: () => server.revert({ sessionId: id, scope: options.scope ?? 'both', token: { messageId: 'm-10' } }),
   };
   return state.fixture;
 }
@@ -254,15 +297,18 @@ try {
   const partial = await unreadable.revert();
   assert.equal(unreadable.appended, true, 'the conversation rewind did happen');
   assert.equal(partial.kind, 'success', 'the conversation half succeeded');
-  assert.equal(partial.files.failed.length, 1, 'the file half must be reported as failed');
-  assert.ok(
-    String(partial.files.failed[0].path).endsWith('journal.jsonl'),
-    `the failure must name the journal as retry material: ${String(partial.files.failed[0].path)}`,
-  );
+  // A plan failure is not a per-file restore failure: nothing was restored and
+  // no rescue copy exists, so it must not be packed into `files.failed` (the
+  // provider renders that field as "these files failed; the overwritten content
+  // was rescued to <rescueDir>"). It gets its own `error` and names the journal
+  // as the retry material instead.
+  assert.equal(partial.files.failed.length, 0, 'a plan failure must not masquerade as failed file restores');
+  assert.match(String(partial.files.error), /文件恢复计划/, `the failure must be attributed to the plan: ${String(partial.files.error)}`);
+  assert.match(String(partial.files.error), /journal\.jsonl/, 'the failure must name the journal as retry material');
   assert.equal(await readFile(unreadable.file, 'utf8'), 'CHANGED', 'no file may be touched');
   assert.equal((await unreadable.snapshots.readJournal(unreadable.id)).entries.length, 1, 'the journal is retained');
   assert.equal(unreadable.server.fileMutationGate.size, 0);
-  pass('a journal read failing after the log commit reports a partial outcome and retains the journal');
+  pass('a journal read failing after the log commit reports a plan failure (not a file restore failure) and retains the journal');
 
   // -------------------------------------------------------------------------
   // 5/6. A tracked write starting mid-rewind waits for the transaction.
@@ -329,6 +375,201 @@ try {
   assert.equal(duplicate.server.fileMutationGate.size, 0);
   assert.equal(duplicate.server.fileMutationTickets.size, 0);
   pass('duplicate mutation identities neither leak a lease nor retire the admitted execution');
+
+  // -------------------------------------------------------------------------
+  // 8. A close must drop and release every ticket it still owns.
+  // -------------------------------------------------------------------------
+  const closing = await fixture();
+  const heldExec = {
+    name: 'write',
+    arguments: { file_path: closing.file },
+    callId: 'held-across-close',
+    token: { id: 'exec-token-held' },
+    agent: closing.agent,
+  };
+  await closing.server.beginFileMutation(heldExec);
+  assert.equal(closing.server.fileMutationTickets.size, 1, 'the held execution owns one ticket');
+  assert.equal(closing.server.fileMutationGate.size, 1, 'the ticket keeps the root leased in the gate');
+  await closing.server.closeSession({ sessionId: closing.id });
+  assert.equal(closing.server.fileMutationTickets.size, 0, 'close must drop the session\'s tickets');
+  assert.equal(closing.server.fileMutationGate.size, 0, 'close must release the gate lease, not only forget the ticket');
+  const freezeStarted = Date.now();
+  const releaseClosed = await closing.server.fileMutationGate.freeze(closing.id, undefined, 500);
+  releaseClosed();
+  assert.ok(
+    Date.now() - freezeStarted < 400,
+    `a closed session's root must not poison the next freeze (${String(Date.now() - freezeStarted)}ms)`,
+  );
+
+  // A descendant can run a tracked tool before the bridge has recorded it in
+  // `children` (the child's first event has not been observed yet). Its ticket
+  // is keyed by the CHILD id, but the lease belongs to the root being closed.
+  const lagging = await fixture();
+  const laggingChildId = 'lagging-child';
+  const laggingChild = {
+    id: laggingChildId,
+    session: { id: laggingChildId, header: { origin: 'subagent', parentSession: lagging.id } },
+  };
+  await lagging.server.beginFileMutation({
+    name: 'write',
+    arguments: { file_path: lagging.file },
+    callId: 'lagging-write',
+    token: { id: 'exec-token-lagging' },
+    agent: laggingChild,
+  });
+  assert.equal(lagging.server.fileMutationTickets.size, 1, 'the descendant holds one ticket');
+  assert.equal(lagging.server.children.has(laggingChildId), false, 'the descendant was never recorded in children');
+  await lagging.server.closeSession({ sessionId: lagging.id });
+  assert.equal(lagging.server.fileMutationTickets.size, 0, 'a root close must release a descendant ticket keyed by the child id');
+  assert.equal(lagging.server.fileMutationGate.size, 0, '…and the root lease it kept active');
+  pass('closing a session drops its file-mutation tickets and releases the gate lease');
+
+  // -------------------------------------------------------------------------
+  // 9. Conversation-only must not require the internal maintenance scope.
+  // -------------------------------------------------------------------------
+  const legacyConversation = await fixture(undefined, { runMaintenance: false, scope: 'conversation' });
+  const legacyResult = await legacyConversation.revert();
+  assert.equal(legacyResult.kind, 'success', `a conversation-only rewind must succeed without runMaintenance: ${JSON.stringify(legacyResult)}`);
+  assert.equal(legacyConversation.maintenance, 0, 'the conversation path must not call runMaintenance');
+  assert.equal(legacyConversation.appended, true, 'the conversation rewind still happened');
+  assert.equal(await readFile(legacyConversation.file, 'utf8'), 'CHANGED', 'a conversation-only rewind must not touch files');
+  pass('a conversation-only rewind succeeds without agent.runMaintenance and leaves files alone');
+
+  // The other half: a file-restoring rewind still requires the exclusive scope
+  // and must fail loudly (before touching the log) when the runtime lacks it.
+  const legacyBoth = await fixture(undefined, { runMaintenance: false });
+  await assert.rejects(legacyBoth.revert(), /runMaintenance contract/);
+  assert.equal(legacyBoth.appended, false, 'a missing maintenance scope must fail before the conversation is changed');
+  pass('a file-restoring rewind without agent.runMaintenance fails loudly before any write');
+
+  // -------------------------------------------------------------------------
+  // 10. Conversation-only must not take the file gate either.
+  // -------------------------------------------------------------------------
+  let convExec;
+  let convAdmission;
+  let convAdmittedDuringFlush = false;
+  let convAdmittedAtFlush;
+  const conversation = await fixture(async (f) => {
+    convExec = {
+      name: 'write',
+      arguments: { file_path: f.file },
+      callId: 'conversation-write',
+      token: { id: 'exec-token-conversation' },
+      agent: f.agent,
+      signal: new AbortController().signal,
+    };
+    // Start it during the flush. It must be admitted immediately: a
+    // conversation-only rewind has no file plan, so blocking tracked writes
+    // would be pure latency (and a slow writer could fail the rewind at 15s).
+    convAdmission = f.server.beginFileMutation(convExec).then(() => {
+      convAdmittedDuringFlush = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    convAdmittedAtFlush = convAdmittedDuringFlush;
+  }, { scope: 'conversation' });
+  const conversationResult = await conversation.revert();
+  assert.equal(conversationResult.kind, 'success');
+  assert.equal(convAdmittedAtFlush, true, 'a tracked write must not be blocked by a conversation-only rewind');
+  await convAdmission;
+  conversation.server.finishFileMutation(convExec);
+  assert.equal(conversation.server.fileMutationGate.size, 0);
+  pass('a conversation-only rewind does not freeze the file gate');
+
+  // -------------------------------------------------------------------------
+  // 11. A kept (not withdrawn) child blocked by our own gate must not stretch
+  //     the settle wait to its 3s cap — that is the gate × waitForChildren
+  //     deadlock, and the log line it prints would be misleading.
+  // -------------------------------------------------------------------------
+  const keptChildId = 'kept-child';
+  let keptIdleResolve;
+  const keptIdle = new Promise((resolve) => {
+    keptIdleResolve = resolve;
+  });
+  const keptChild = {
+    id: keptChildId,
+    session: { id: keptChildId, header: { origin: 'subagent', parentSession: '' } },
+    status: 'running',
+    whenIdle: () => keptIdle,
+  };
+  let keptExec;
+  let keptAdmission;
+  let keptAdmittedDuringFlush = false;
+  let keptAdmittedAtFlush;
+  const kept = await fixture(async (f) => {
+    keptChild.session.header.parentSession = f.id;
+    keptExec = {
+      name: 'write',
+      arguments: { file_path: f.childFile },
+      callId: 'kept-write',
+      token: { id: 'exec-token-kept' },
+      agent: keptChild,
+      signal: new AbortController().signal,
+    };
+    keptAdmission = f.server.beginFileMutation(keptExec).then(() => {
+      keptAdmittedDuringFlush = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    keptAdmittedAtFlush = keptAdmittedDuringFlush;
+  }, {
+    services: { agents: { get: (childId) => (childId === keptChildId ? keptChild : undefined) } },
+    // Model the old all-children join: it cannot resolve while the child's
+    // tracked write sits in `gate.enter` waiting for this very rewind.
+    waitForChildren: async () => {
+      await keptIdle;
+    },
+  });
+  // Anchor before the target: this child belongs to a conversation that stays,
+  // so the rewind must neither cancel it nor wait for it.
+  kept.server.childAnchors.record(keptChildId, 0, kept.id);
+  const keptStarted = Date.now();
+  const keptResult = await captureStderr(() => kept.revert());
+  const keptElapsed = Date.now() - keptStarted;
+  assert.equal(keptResult.value.kind, 'success', JSON.stringify(keptResult.value));
+  assert.equal(keptAdmittedAtFlush, false, 'the gate must still hold a tracked write that started mid-rewind');
+  assert.ok(keptElapsed < 1000, `the kept child must not stretch the rewind to the 3s settle cap (${String(keptElapsed)}ms)`);
+  assert.ok(
+    keptResult.lines.every((line) => !line.includes('did not settle after the rewind interrupt')),
+    `a gate-blocked kept child is not an unsettled interrupt: ${JSON.stringify(keptResult.lines)}`,
+  );
+  keptIdleResolve();
+  await keptAdmission;
+  kept.server.finishFileMutation(keptExec);
+  pass('a kept child blocked by the gate does not turn the settle wait into a 3s mutual wait');
+
+  // -------------------------------------------------------------------------
+  // 12. The withdrawn children are STILL joined — narrowing the wait must not
+  //     drop the original promise (interrupted work gets its bounded moment).
+  // -------------------------------------------------------------------------
+  let withdrawnIdleResolve;
+  const withdrawnIdle = new Promise((resolve) => {
+    withdrawnIdleResolve = resolve;
+  });
+  const withdrawnChild = {
+    id: 'withdrawn-child',
+    session: { id: 'withdrawn-child', header: { origin: 'subagent', parentSession: '' } },
+    status: 'running',
+    whenIdle: () => withdrawnIdle,
+  };
+  let waitForChildrenCalls = 0;
+  const joined = await fixture(undefined, {
+    services: { agents: { get: (childId) => (childId === 'withdrawn-child' ? withdrawnChild : undefined) } },
+    waitForChildren: async () => {
+      waitForChildrenCalls += 1;
+    },
+  });
+  // Anchor at/after the target: this child was dispatched by the withdrawn turn
+  // and is exactly the work the interrupt + bounded join exists for.
+  joined.server.childAnchors.record('withdrawn-child', 20, joined.id);
+  setTimeout(() => withdrawnIdleResolve(), 100);
+  const joinedStarted = Date.now();
+  const joinedResult = await joined.revert();
+  const joinedElapsed = Date.now() - joinedStarted;
+  assert.equal(joinedResult.kind, 'success', JSON.stringify(joinedResult));
+  assert.ok(joinedElapsed >= 50, `the rewind must wait for the withdrawn child it signalled (${String(joinedElapsed)}ms)`);
+  assert.ok(joinedElapsed < 1000, `and stop as soon as that child is idle (${String(joinedElapsed)}ms)`);
+  assert.equal(waitForChildrenCalls, 0, 'the join is by child identity, not the all-children wait');
+  assert.ok(joined.interrupted.includes('withdrawn-child'), 'the withdrawn child must be interrupted');
+  pass('a withdrawn child is still joined by identity, and the all-children wait is not used');
 } finally {
   await rm(root, { recursive: true, force: true });
 }

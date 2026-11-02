@@ -32,7 +32,27 @@ import {
 import { DshChildSession, DshSession, modes, parseRoute } from "./session";
 import { rewindCanaryNotice } from "./rewind-canary";
 import { effortLabel } from "./locale";
+import type { JobErrorCode } from "../shared/jobs";
 import { PROVIDER_ID } from "../shared/provider";
+
+/**
+ * The bridge's rewind receipt also carries fields the host-neutral wire type
+ * predates:
+ *
+ * - `unrecoverable`: paths that changed after the target but whose pre-image
+ *   could not be captured (too large, not a regular file, read failure);
+ * - `error`: the file restore never ran because the post-durability re-plan
+ *   failed, so there is no per-path outcome to report (and no rescue directory
+ *   to point at).
+ *
+ * `DshRevertResult` is the stable wire shape other consumers share, so the extra
+ * (optional) fields are narrowed here, at their single consumer. A bridge that
+ * predates them omits both, which this reads as "no such condition".
+ */
+type RevertFilesReceipt = NonNullable<DshRevertResult["files"]> & {
+  unrecoverable?: Array<{ path: string; reason: string }>;
+  error?: string;
+};
 
 const CAPABILITIES = [
   "prompt.message",
@@ -149,7 +169,58 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-let catalogCache: { at: number; cwd: string; value: DisplayCatalog } | undefined;
+/**
+ * How many per-cwd catalogs the cache keeps.
+ *
+ * A single slot keyed by cwd meant two workspaces used alternately missed on
+ * every request: each miss boots a whole `dsh` probe (1.5–2.7 s measured), so
+ * the model picker paid a cold start every time the user switched projects. A
+ * small LRU keeps the handful of workspaces a session actually alternates
+ * between warm while staying bounded (a desktop user rarely has more than a few
+ * open at once).
+ */
+const CATALOG_CACHE_LIMIT = 4;
+/** One cached catalog, tagged with the cwd it belongs to and when it was read. */
+interface CatalogCacheEntry {
+  at: number;
+  value: DisplayCatalog;
+}
+const catalogCache = new Map<string, CatalogCacheEntry>();
+
+/**
+ * Read a still-fresh catalog for `cwd` and mark it most recently used.
+ *
+ * @param cwd - workspace the catalog describes; the cache is keyed by it.
+ * @returns the cached catalog, or undefined when missing/expired.
+ */
+function cachedCatalog(cwd: string): DisplayCatalog | undefined {
+  const entry = catalogCache.get(cwd);
+  if (entry === undefined) return undefined;
+  if (Date.now() - entry.at >= CATALOG_TTL_MS) {
+    catalogCache.delete(cwd);
+    return undefined;
+  }
+  // Re-inserting keeps the eviction order honest: LRU, not FIFO.
+  catalogCache.delete(cwd);
+  catalogCache.set(cwd, entry);
+  return entry.value;
+}
+
+/**
+ * Publish one freshly probed catalog and evict the least recently used entry.
+ *
+ * @param cwd - workspace the catalog was read for.
+ * @param value - the display catalog to cache.
+ */
+function cacheCatalog(cwd: string, value: DisplayCatalog): void {
+  catalogCache.delete(cwd);
+  catalogCache.set(cwd, { at: Date.now(), value });
+  while (catalogCache.size > CATALOG_CACHE_LIMIT) {
+    const oldest = catalogCache.keys().next().value;
+    if (oldest === undefined) return;
+    catalogCache.delete(oldest);
+  }
+}
 
 interface DisplayCatalog {
   models: ProviderModel[];
@@ -182,32 +253,44 @@ function probeProcess(cwd: string, sessionId: string): DshProcess {
   });
 }
 
-/** Read the runtime catalog through a short-lived process and cache it. */
+/** Read the runtime catalog through a short-lived process and cache it by cwd. */
 async function loadCatalog(cwd: string): Promise<DisplayCatalog> {
-  if (catalogCache !== undefined && catalogCache.cwd === cwd && Date.now() - catalogCache.at < CATALOG_TTL_MS) {
-    return catalogCache.value;
-  }
+  const cached = cachedCatalog(cwd);
+  if (cached !== undefined) return cached;
   const probe = probeProcess(cwd, "catalog-probe");
   try {
     await probe.start();
     const raw: DshCatalog = await probe.catalog();
     const value = toDisplayCatalog(raw);
-    catalogCache = { at: Date.now(), cwd, value };
+    cacheCatalog(cwd, value);
     return value;
   } finally {
     probe.kill();
   }
 }
 
-/** List DSH's importable sessions through a short-lived process. */
+/**
+ * List DSH's importable sessions through a short-lived process.
+ *
+ * `probeCwd` only decides where the probe boots. The filter is separate and
+ * optional: the bridge applies `cwd` as a realpath-aware superset filter
+ * **before** it truncates to the limit, so forwarding the host's workspace is
+ * what keeps another workspace's sessions from pushing this one's rows out of
+ * the import list. Omitting it (the host sent no cwd) means "no filter", which
+ * is why the field is only added when present.
+ *
+ * @param probeCwd - working directory for the throwaway probe process.
+ * @param options - `cwd` filter plus the host's query/limit.
+ */
 async function listDshSessions(
-  cwd: string,
-  options: { query?: string; limit?: number },
+  probeCwd: string,
+  options: { cwd?: string; query?: string; limit?: number },
 ): Promise<Array<{ sessionId: string; cwd?: string; title?: string; createdAt?: number }>> {
-  const probe = probeProcess(cwd, "sessions-probe");
+  const probe = probeProcess(probeCwd, "sessions-probe");
   try {
     await probe.start();
     return await probe.sessions({
+      ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
       ...(options.query === undefined ? {} : { query: options.query }),
       ...(options.limit === undefined ? {} : { limit: options.limit }),
     });
@@ -914,7 +997,20 @@ class DshConnection implements ProviderConnection {
         return;
       case "session.configure": {
         const session = this.#require(input.sessionId);
-        await session.configure(input.changes);
+        try {
+          await session.configure(input.changes);
+        } catch (error) {
+          // A configure carries several fields and can be refused part-way (the
+          // model switch applied, then a locked preset was rejected). The session
+          // commits each field only after the runtime confirms it, so by the time
+          // the request fails the committed state may already differ from the
+          // composer's optimistic view. Publish that state before reporting the
+          // failure: otherwise the last `session.config` the host saw describes
+          // values the runtime never accepted, and nothing corrects it until the
+          // next successful configure or reopen.
+          this.#emit({ type: "session.config", sessionId: input.sessionId, config: session.configState() });
+          throw error;
+        }
         this.#emit({ type: "session.config", sessionId: input.sessionId, config: session.configState() });
         this.#emit({ type: "request.completed", requestId: input.requestId });
         return;
@@ -960,17 +1056,71 @@ class DshConnection implements ProviderConnection {
           this.#notice(input.sessionId, "info", canary.title, canary.description);
         }
         this.#emit({ type: "request.completed", requestId: input.requestId });
-        const failedFiles = result?.files?.failed ?? [];
-        if (failedFiles.length > 0) {
+        const files = result?.files as RevertFilesReceipt | undefined;
+        const failedFiles = files?.failed ?? [];
+        const skippedFiles = files?.skipped ?? [];
+        const unrecoverable = files?.unrecoverable ?? [];
+        // The bridge sends `error` instead of per-path outcomes when the file
+        // restore was aborted before it could run (the post-durability re-plan
+        // failed). Treat a non-empty one as its own failure kind: the paths above
+        // are empty in that shape, and the receipt's `rescueDir` is empty too, so
+        // the failed-path wording must not be reused.
+        const planError = typeof files?.error === "string" && files.error !== "" ? files.error : undefined;
+        if (
+          planError !== undefined
+          || failedFiles.length > 0
+          || skippedFiles.length > 0
+          || unrecoverable.length > 0
+        ) {
           // The conversation rewind succeeded; only some files did not. Emitted after
           // the receipt on purpose: this one has to survive on **every** host (it
           // reports a real failure), so it must not be inside the window the patched
           // host truncates.
+          //
+          // `skipped` must be part of this condition. It used to be invisible: a
+          // path the restore refused to touch (now a symlink/directory, or whose
+          // parent was replaced) still produced the plain success notice while
+          // the file stayed modified. A capture that could never be taken (too
+          // large, not a regular file, read error) is just as unrestored and now
+          // reaches the same list through `unrecoverable`; there is no backup to
+          // retry with, so the wording must not promise one for it.
+          const parts: string[] = [];
+          // Verbatim, as its own part: the bridge's text names both the cause and
+          // where the journal is, and rewriting it here would drift from the half
+          // that actually knows what failed.
+          if (planError !== undefined) parts.push(planError);
+          if (failedFiles.length > 0) {
+            parts.push(`${failedFiles.map((entry) => entry.path).join("、")} 恢复失败（撤回前备份已保留，可重试撤回）`);
+          }
+          // The bridge folds `unrecoverable` paths into `skipped` for consumers
+          // that only know the older field; they are reported once here, with the
+          // reason, rather than again as generic skipped paths.
+          const unrecoverablePaths = new Set(unrecoverable.map((entry) => entry.path));
+          const skippedOnly = skippedFiles.filter((file) => !unrecoverablePaths.has(file));
+          if (skippedOnly.length > 0) {
+            parts.push(`${skippedOnly.join("、")} 未能恢复（路径已变化，撤回前备份已保留）`);
+          }
+          if (unrecoverable.length > 0) {
+            parts.push(
+              `${unrecoverable.map((entry) => `${entry.path}（${entry.reason}）`).join("、")} 未能快照，无法恢复`,
+            );
+          }
+          // No rescue directory is claimed when the restore never ran: there is
+          // nothing in it, and the `error` shape deliberately sends `rescueDir`
+          // empty. The bridge's own text already names the journal.
+          const rescueDir = files?.rescueDir ?? "(未知目录)";
+          const tail = planError !== undefined
+            ? ""
+            : `${
+              failedFiles.length > 0
+                ? `被替换的当前内容已另存到 ${rescueDir}。`
+                : `journal 与 rescue 目录：${rescueDir}。`
+            }`;
           this.#notice(
             input.sessionId,
             "error",
             "文件回退未完成",
-            `${failedFiles.map((entry) => entry.path).join("、")} 恢复失败；撤回前备份已保留（可重试撤回），被替换的当前内容已另存到 ${result?.files?.rescueDir ?? "(未知目录)"}。`,
+            tail === "" ? parts.join("；") : `${parts.join("；")}。${tail}`,
           );
         }
         return;
@@ -1041,6 +1191,11 @@ class DshConnection implements ProviderConnection {
     let sessions: Array<{ sessionId: string; cwd?: string; title?: string; preview?: string; updatedAt?: string }>;
     try {
       sessions = await listDshSessions(cwd, {
+        // The host's cwd is both where the probe boots and what the bridge must
+        // filter by. Only the first half used to be wired, so the import list
+        // was unfiltered: with 20-odd stored sessions the current workspace's
+        // rows were pushed out by other workspaces' rows.
+        ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
         ...(input.query === undefined ? {} : { query: input.query }),
         ...(input.limit === undefined ? {} : { limit: input.limit }),
       });
@@ -1355,6 +1510,12 @@ class DshConnection implements ProviderConnection {
         mcpServers: config.mcpServers,
         route,
         mode: config.mode ?? "build",
+        // The catalog's mode list is the single capability source: it was already
+        // filtered by the bridge's `planMode` (see `toDisplayCatalog`), and the
+        // session republishes it verbatim in `session.config`. Deriving the list
+        // again inside the session made a hidden Plan reappear as an available
+        // mode as soon as the session opened.
+        modes: display.defaults.modes,
         models: display.models,
         thinkingOptions: display.thinkingOptions,
         // Only offer child subsessions when Paseo negotiated the capability; when
@@ -1427,12 +1588,14 @@ class DshConnection implements ProviderConnection {
       // preset. DSH locks the preset after the session's first turn, so applying it
       // after `session.ready` would already be too late — the pick would snap back
       // to the profile default.
-      const preset = settings["preset"];
-      if (typeof preset === "string" && preset !== "") {
+      const presetSetting = settings["preset"];
+      const requestedPreset =
+        typeof presetSetting === "string" && presetSetting !== "" ? presetSetting : undefined;
+      if (requestedPreset !== undefined) {
         try {
-          await session.configure({ settings: { preset } });
+          await session.configure({ settings: { preset: requestedPreset } });
         } catch (error) {
-          process.stderr.write(`[${PROVIDER_ID}] preset "${preset}" rejected: ${messageOf(error)}\n`);
+          process.stderr.write(`[${PROVIDER_ID}] preset "${requestedPreset}" rejected: ${messageOf(error)}\n`);
         }
       }
 
@@ -1448,6 +1611,26 @@ class DshConnection implements ProviderConnection {
         await session.loadCommands();
         await session.loadPermission();
         await session.loadPresets();
+        // `session.configure()` intentionally keeps the real value when DSH
+        // refuses a preset (the composer re-emits config and snaps back), so the
+        // only reliable way to tell "applied" from "silently refused" is to read
+        // the value `loadPresets()` just fetched from the runtime. Without this
+        // warning the user got a different persona than the one they picked and
+        // no explanation anywhere in the UI.
+        if (requestedPreset !== undefined) {
+          const appliedPreset = session
+            .configState()
+            .settings.find((setting) => setting.id === "preset")?.value;
+          if (appliedPreset !== requestedPreset) {
+            openWarnings.push({
+              severity: "warning",
+              title: "预设未应用",
+              description: appliedPreset === undefined
+                ? `Paseo 选择的预设「${requestedPreset}」未生效，且当前 profile 没有可读的预设目录，无法确认实际预设；本会话按 profile 的默认设置运行。`
+                : `Paseo 选择的预设「${requestedPreset}」未生效（当前实际预设为「${appliedPreset}」）；本会话按实际预设运行。`,
+            });
+          }
+        }
       } catch (error) {
         const message = messageOf(error);
         process.stderr.write(`[${PROVIDER_ID}] command catalog failed: ${message}\n`);
@@ -1503,7 +1686,16 @@ class DshConnection implements ProviderConnection {
         try {
           await session.replayHistory();
         } catch (error) {
-          process.stderr.write(`[${PROVIDER_ID}] history replay failed: ${messageOf(error)}\n`);
+          const message = messageOf(error);
+          process.stderr.write(`[${PROVIDER_ID}] history replay failed: ${message}\n`);
+          // `replayHistory` reports its own known failures as notices; this is
+          // the last-resort channel for an unexpected throw, and it must still
+          // be user-visible rather than leaving a blank reopened conversation.
+          openWarnings.push({
+            severity: "warning",
+            title: "会话历史重放失败",
+            description: `重放会话历史时出错（${message}）；当前对话可能是空白或不完整的。`,
+          });
         }
       }
       // Everything from here to `session.ready` is synchronous, so this one
@@ -1784,7 +1976,7 @@ const CONNECTIONS = new Set<DshConnection>();
 export async function readAgentJobs(agentId: string): Promise<{
   available: boolean;
   jobs: DshJob[];
-  error?: { message: string };
+  error?: { message: string; code?: JobErrorCode };
 }> {
   for (const connection of CONNECTIONS) {
     const session = connection.sessionForAgent(agentId);
@@ -1794,7 +1986,10 @@ export async function readAgentJobs(agentId: string): Promise<{
       return {
         available: false,
         jobs: [],
-        error: { message: result.error?.message ?? "the DSH runtime could not list this session's jobs" },
+        error: {
+          message: result.error?.message ?? "the DSH runtime could not list this session's jobs",
+          ...(result.error?.code === undefined ? {} : { code: result.error.code }),
+        },
       };
     }
     return { available: true, jobs: result.jobs ?? [] };

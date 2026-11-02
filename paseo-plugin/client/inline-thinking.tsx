@@ -11,7 +11,7 @@
  * it flips back and forth as chunks settle and would make this row open and
  * close repeatedly. Instead the row watches the text itself grow: while it grows
  * the row stays in its scrolling state, and it settles once the text has stopped
- * arriving and the host reports `complete`.
+ * arriving and `complete` has held for a short window (`useGrowing`).
  *
  * The text is used **as it arrives**, never through the host's paced reveal
  * (`useRevealedText`). That hook re-plays the reasoning at a rate it owns — its
@@ -48,10 +48,26 @@ export interface InlineThinkingData {
 
 
 /**
+ * How long `complete` has to hold before the row stops scrolling.
+ *
+ * `phase` is derived from a per-item status that flips between loading and
+ * ready as chunks settle (`docs/FIELD-NOTES.md` #26), so a **single** complete
+ * frame is not proof the thought is over: settling on it makes the sweep stop
+ * and restart while the model is still thinking. A short stable window is the
+ * middle ground — a further frame clears it, and once the text really has
+ * stopped the timer itself settles the row, without needing one more host
+ * update (which is the defect this replaced: the effect deps only change when
+ * text or phase changes, so a `grew && complete` last frame latched the row on
+ * forever).
+ */
+const SETTLE_WINDOW_MS = 300;
+
+/**
  * Track "still producing text" without trusting the flickering `phase`.
  *
- * Any growth latches the row on; it turns off only when the text stopped
- * growing *and* the host says the item is complete.
+ * Any growth latches the row on. It settles when the text stopped growing and
+ * `complete` has held for {@link SETTLE_WINDOW_MS}; every new frame re-runs the
+ * effect, which cancels the pending settle and demands the window again.
  */
 function useGrowing(text: string, phase: "streaming" | "complete"): boolean {
   const [growing, setGrowing] = useState(phase === "streaming");
@@ -59,11 +75,12 @@ function useGrowing(text: string, phase: "streaming" | "complete"): boolean {
   useEffect(() => {
     const grew = text.length > lastLength.current;
     lastLength.current = text.length;
-    if (grew) {
-      setGrowing(true);
-      return;
-    }
-    if (phase === "complete") setGrowing(false);
+    if (grew) setGrowing(true);
+    if (phase !== "complete") return;
+    const timer = setTimeout(() => setGrowing(false), SETTLE_WINDOW_MS);
+    // Runs on unmount and before the next frame's effect, so a timer never
+    // outlives the row and a stream that continues never settles.
+    return () => clearTimeout(timer);
   }, [text, phase]);
   return growing;
 }

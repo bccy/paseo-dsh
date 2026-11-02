@@ -161,6 +161,19 @@ export interface ToolCallData {
   code: boolean;
   failed: boolean;
   /**
+   * Why the call failed, from the item's own `error` field, or "" on a row that
+   * did not fail.
+   *
+   * This is the one thing a failed row cannot derive from `detail`: a failed
+   * `write`/`edit` still carries what was *requested* in its detail, and a tool
+   * whose output was empty leaves no text at all. The daemon already sends
+   * `error: { message }` on every failed tool_call (`server/timeline.ts`), so
+   * dropping it here is what turned a failure into a red icon with nothing to
+   * read. The renderer shows it as the row's summary line and in the expanded
+   * block.
+   */
+  error: string;
+  /**
    * Whether the row's title is a description rather than the tool's own subject.
    *
    * When it is not, the title *is* the subject, and the expanded block carries
@@ -759,6 +772,16 @@ function blockKind(type: string, toolName: string): ToolBlockKind {
   }
 }
 
+/**
+ * Upper bound for the plain-text body of a block that has no scroll region of
+ * its own.
+ *
+ * The terminal card is the exception and is **not** capped (see the return
+ * statement below): DSH's `TerminalBlock` renders the whole output inside a
+ * 224px vertical scroll and copies the whole of it, so a cap here would both
+ * hide the tail — usually the failure summary — and shorten what "copy" gives
+ * the user.
+ */
 const BODY_LIMIT = 6000;
 
 /**
@@ -1014,8 +1037,37 @@ function str(source: ToolDetail, key: string): string {
   return typeof value === "string" ? value : "";
 }
 
+/**
+ * The failure reason carried by a tool_call item's `error`, or "".
+ *
+ * The protocol shape is `{ message }` on a failed item and `null` on every
+ * other one (`server/timeline.ts` fills `message` with the failed tool's own
+ * output, else `"tool failed"`). Read defensively — history replayed from an
+ * older daemon, or a payload from a newer one, can carry anything — but an
+ * unreadable value yields "" rather than a made-up reason.
+ */
+function errorTextOf(value: unknown): string {
+  if (!isRecord(value)) return "";
+  const message = value.message;
+  return typeof message === "string" ? message : "";
+}
+
+/**
+ * Cut a body to {@link BODY_LIMIT} **without splitting a surrogate pair**.
+ *
+ * `slice` counts UTF-16 code units, so an astral character (an emoji, a rare
+ * CJK glyph) straddling the cut leaves a lone high surrogate at the end, which
+ * renders as `�` — corruption the reader cannot tell apart from the tool's own
+ * output. Stepping back one unit costs at most one character and keeps the
+ * text valid.
+ */
 function truncate(text: string): string {
-  return text.length > BODY_LIMIT ? `${text.slice(0, BODY_LIMIT)}${localeText().truncated}` : text;
+  if (text.length <= BODY_LIMIT) return text;
+  let end = BODY_LIMIT;
+  const last = text.charCodeAt(end - 1);
+  // A high surrogate at the cut is half of a pair whose low half was dropped.
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return `${text.slice(0, end)}${localeText().truncated}`;
 }
 
 /**
@@ -1257,6 +1309,10 @@ export function toolCallData(
   const metadata = (item.metadata ?? {}) as ToolDetail;
   const type = str(detail, "type");
   const failed = item.status === "failed";
+  // Only a failed row can have a reason. A successful item carries
+  // `error: null`, and a dirty payload that carries one anyway must not make a
+  // success look like a failure in the block below.
+  const error = failed ? errorTextOf(item.error) : "";
   // Copy is read here, once per call, rather than at module load: a locale the
   // host relays later must reach the next row, not only the ones after a reload.
   const copy = localeText();
@@ -1480,17 +1536,24 @@ export function toolCallData(
     // back to the compact one-line form. Otherwise the block leads with the
     // subject only when the head is showing something else — the description.
     headline,
-    body: diffBlock !== null ? body : truncate(body),
+    // The terminal card renders the whole output inside its own scroll region
+    // and copies that same string (DSH's `TerminalBlock`), so this is the one
+    // body that must not be capped — truncating it is what hid the tail of a
+    // build log. A real diff likewise replaces the raw body with rows it built
+    // itself, so the cap does not apply to it either.
+    body: diffBlock !== null || kind === "terminal" ? body : truncate(body),
     bodyLabel,
     diff,
     code,
     failed,
+    error,
     // Whether the expanded block has anything to show. A row whose only content
     // is its title still expands — the title wraps to its full width — but must
     // not draw an empty code surface. A structured card counts even when the
-    // plain text is empty: the card is the content.
+    // plain text is empty: the card is the content. A failure reason counts
+    // too: that is the only content a failed tool with an empty output has.
     titled: agentMessage !== undefined || description !== "",
-    hasDetail: headline !== "" || body !== "" || structured,
+    hasDetail: headline !== "" || body !== "" || structured || error !== "",
     kind,
     search,
     read,

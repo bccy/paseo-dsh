@@ -8,12 +8,20 @@
  * a pure module (`client/thinking-text.ts`) and is asserted here.
  *
  * Run (from paseo-plugin):
- *   npx tsc client/thinking-text.ts \
+ *   npx tsc client/thinking-text.ts client/inline-thinking.tsx \
  *     --outDir .dbg --rootDir . --module commonjs --moduleResolution node \
- *     --target ES2022 --skipLibCheck
+ *     --target ES2022 --jsx react-jsx --skipLibCheck --noCheck
  *   echo '{"type":"commonjs"}' > .dbg/package.json
  *   cp ../harness/thinking-check.cjs .dbg/
  *   cd .dbg && node thinking-check.cjs
+ *
+ * `inline-thinking.tsx` comes along for the state-transition check at the end:
+ * it executes the real component with a minimal hooks dispatcher (the artifact
+ * is what runs, not a copy of the logic). `--noCheck` is required for the
+ * emit, not to skip this repo's type gate: that component's
+ * `@getpaseo/plugin/client` type import only resolves under the project's own
+ * `moduleResolution: Bundler` (`paseo-plugin/tsconfig.json`), so the plain
+ * `tsc --noEmit` is the type check and this command only needs to emit JS.
  */
 "use strict";
 
@@ -328,6 +336,235 @@ console.log("the row wires the window in");
     selfMeasured.length === 0,
     selfMeasured.length === 0 ? "" : `measured line at ${selfMeasured.map((element) => element.tag).join(", ")}`,
   );
+}
+
+console.log("the row settles when the last frame both grows and completes");
+{
+  // Two opposite failures live here:
+  //
+  //  * The host usually delivers a thought's last chunk and `complete` in the
+  //    same update. The row latches on growth — that is how it keeps scrolling
+  //    while chunks arrive — and the old order returned on growth before
+  //    reading `phase`, so that frame left the latch on. Nothing re-ran the
+  //    effect afterwards (the next render carries the same `[text, phase]`), so
+  //    the sweep and the tail preview kept running until an unrelated phase
+  //    flip or unmount.
+  //  * `phase` is not a reliable terminal signal: the host derives it from a
+  //    status that flips loading/ready as chunks settle
+  //    (`docs/FIELD-NOTES.md` #26), so settling on a single complete frame
+  //    makes the sweep stop and restart mid-thought. The fix settles only
+  //    after `complete` has held for a short window, and any further frame
+  //    cancels that window.
+  //
+  // The claims are state transitions across renders and a timer, which neither
+  // a pure function nor a source scan can see, so this executes the **real
+  // compiled component** with a minimal hooks dispatcher and a fake clock.
+  // Offline and deterministic; it is not a native UI test.
+  const componentPath = join(__dirname, "client", "inline-thinking.js");
+  if (!existsSync(componentPath)) {
+    console.error(
+      `missing ${componentPath} — compile client/inline-thinking.tsx too (see the run step at the top of this file)`,
+    );
+    process.exit(1);
+  }
+  const Module = require("node:module");
+
+  // Fake clock: the settle window is the only timer the component schedules,
+  // and the defect was that nothing ever fired to clear the latch.
+  let timers = new Map();
+  let nextTimerId = 0;
+  const realSetTimeout = global.setTimeout;
+  const realClearTimeout = global.clearTimeout;
+  global.setTimeout = (callback) => {
+    nextTimerId += 1;
+    timers.set(nextTimerId, callback);
+    return nextTimerId;
+  };
+  global.clearTimeout = (id) => {
+    timers.delete(id);
+  };
+
+  // The hook slots live across passes, so `useState` holds its value the way
+  // React would; `cursor` restarts every pass because the hook order is fixed.
+  let slots = [];
+  let cursor = 0;
+  let effects = [];
+  let changed = false;
+  let lastText = "";
+  let lastPhase = "complete";
+  const sameDeps = (a, b) =>
+    Array.isArray(a) &&
+    Array.isArray(b) &&
+    a.length === b.length &&
+    a.every((value, index) => Object.is(value, b[index]));
+  const hooks = {
+    useState(initial) {
+      const index = cursor++;
+      if (!(index in slots)) slots[index] = typeof initial === "function" ? initial() : initial;
+      return [
+        slots[index],
+        (next) => {
+          const value = typeof next === "function" ? next(slots[index]) : next;
+          if (!Object.is(value, slots[index])) {
+            slots[index] = value;
+            changed = true;
+          }
+        },
+      ];
+    },
+    useRef(initial) {
+      const index = cursor++;
+      if (!(index in slots)) slots[index] = { current: initial };
+      return slots[index];
+    },
+    useEffect(effect, deps) {
+      const index = cursor++;
+      const slot = slots[index];
+      if (slot !== undefined && sameDeps(slot.deps, deps)) return;
+      // The previous cleanup runs before the new effect, as React does.
+      slots[index] = { deps, cleanup: slot === undefined ? undefined : slot.cleanup };
+      effects.push({ index, effect });
+    },
+    useMemo(factory, deps) {
+      const index = cursor++;
+      if (!(index in slots) || !sameDeps(slots[index].deps, deps)) {
+        slots[index] = { deps, value: factory() };
+      }
+      return slots[index].value;
+    },
+  };
+
+  // Stand-ins for the host modules only; `./thinking-text`, `./tokens` and
+  // `./locale` are the real compiled modules.
+  const stubs = {
+    react: () => hooks,
+    "react/jsx-runtime": () => ({
+      jsx: (type, props) => ({ type, props }),
+      jsxs: (type, props) => ({ type, props }),
+      Fragment: "Fragment",
+    }),
+    "react-native": () => ({ Image: "Image", Pressable: "Pressable", Text: "Text", View: "View" }),
+    "./text-shimmer": () => ({ TextShimmer: "TextShimmer" }),
+  };
+  const originalLoad = Module._load;
+  Module._load = function load(request, parent, isMain) {
+    const stub = stubs[request];
+    if (stub !== undefined) return stub();
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  let InlineThinking;
+  try {
+    ({ InlineThinking } = require(componentPath));
+  } finally {
+    // Scoped to the load: the component resolves its module graph at require
+    // time, so nothing below needs the stubs.
+    Module._load = originalLoad;
+  }
+
+  /** The sweep's `active` prop, found through the rendered tree. */
+  function findShimmerActive(node) {
+    if (node === null || typeof node !== "object") return null;
+    if (node.type === "TextShimmer") return node.props.active;
+    const children = node.props === undefined ? undefined : node.props.children;
+    for (const child of Array.isArray(children) ? children : [children]) {
+      const answer = findShimmerActive(child);
+      if (answer !== null) return answer;
+    }
+    return null;
+  }
+
+  /** One render pass, plus every effect whose deps changed after it. */
+  function renderOnce(text, phase) {
+    changed = false;
+    effects = [];
+    cursor = 0;
+    const tree = InlineThinking({
+      theme: {
+        colors: { foreground: "#ffffff", foregroundMuted: "#888888", surface0: "#000000" },
+      },
+      layout: { compact: false },
+      item: { data: { text, phase } },
+    });
+    for (const { index, effect } of effects) {
+      const slot = slots[index];
+      if (typeof slot.cleanup === "function") slot.cleanup();
+      const cleanup = effect();
+      slot.cleanup = typeof cleanup === "function" ? cleanup : undefined;
+    }
+    return tree;
+  }
+
+  function renderToStable(text, phase) {
+    let tree = renderOnce(text, phase);
+    let passes = 0;
+    while (changed && ++passes < 10) tree = renderOnce(text, phase);
+    return tree;
+  }
+
+  /** What the sweep does after one host frame, without advancing the clock. */
+  function update(text, phase) {
+    lastText = text;
+    lastPhase = phase;
+    return findShimmerActive(renderToStable(text, phase));
+  }
+
+  /** Advance past the settle window — no host frame is involved. */
+  function settle() {
+    const pending = [...timers.values()];
+    timers.clear();
+    for (const callback of pending) callback();
+    return findShimmerActive(renderToStable(lastText, lastPhase));
+  }
+
+  /** What React does on unmount: run every effect's cleanup. */
+  function unmount() {
+    for (const slot of slots) {
+      if (slot !== null && typeof slot === "object" && typeof slot.cleanup === "function") {
+        slot.cleanup();
+        slot.cleanup = undefined;
+      }
+    }
+    return timers.size;
+  }
+
+  // One component instance throughout: each `update` is the next frame of the
+  // same row, exactly how a thought arrives.
+  check("a thought that is still arriving scrolls", update("a", "streaming") === true);
+  check("growth while streaming keeps it scrolling", update("ab", "streaming") === true);
+
+  // A single complete frame — the shape a flickering status produces — must
+  // not stop the sweep; it only starts the window.
+  check("a single complete frame does not settle a growing row", update("ab", "complete") === true);
+  check("…it only starts the settle window", timers.size === 1, `${timers.size} timer(s)`);
+
+  // The next chunk cancels the window — the anti-shudder half.
+  check("a following chunk keeps it scrolling", update("abc", "streaming") === true);
+  check("…and cancels the pending settle", timers.size === 0, `${timers.size} timer(s)`);
+
+  // The defect: the final frame carries both the last chunk and `complete`.
+  check(
+    "the frame that both grows and completes starts the window",
+    update("abcd", "complete") === true,
+  );
+  check("…and then settles without another host frame", settle() === false);
+  check("a settled thought stays settled", update("abcd", "complete") === false);
+
+  // Positive control for the no-growth shape: `complete` with the text
+  // unchanged settles through the same window.
+  check("growth latches it on again", update("abcde", "streaming") === true);
+  check("a complete phase with no new text holds the window", update("abcde", "complete") === true);
+  check("…then settles", settle() === false);
+
+  // Cleanup: the window must not outlive its row.
+  check(
+    "a pending settle window is armed",
+    update("abcdef", "complete") === true && timers.size === 1,
+    `${timers.size} timer(s)`,
+  );
+  check("unmount clears the pending window", unmount() === 0, `${timers.size} timer(s)`);
+
+  global.setTimeout = realSetTimeout;
+  global.clearTimeout = realClearTimeout;
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

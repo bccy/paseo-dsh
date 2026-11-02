@@ -12,6 +12,13 @@
  *   2. a non-text content block reaches DSH instead of being collapsed away
  *   3. an unsupported input type reports `request.failed`, not `request.completed`
  *
+ * Profile isolation: `ensurePaseoProfile()` rewrites the profile's embedded
+ * bridge whenever this script loads the plugin. The script therefore clones the
+ * profile named by DSH_PASEO_PROFILE (default `paseo`) into a throwaway DSH_HOME
+ * by default, so the live `~/.dsh` is never written. Pass `--allow-real-profile`
+ * to use the live home instead; an explicit `DSH_HOME=<dir>` is used as-is. The
+ * first output line names the mode.
+ *
  * The plugin is TypeScript, so it has to be compiled before it can be required:
  *
  *   cd paseo-plugin
@@ -24,8 +31,71 @@
  *
  * The type errors tsc prints under `--moduleResolution node` are expected; the
  * emitted JavaScript is what runs.
+ *
+ * `--self-test` runs only the offline half (compiled module loads + the
+ * image-block translation the real-model checks below assert on), so the
+ * translation can be pinned without a profile or a model turn.
  */
+const path = require("node:path");
+const { announceDshHome, prepareDshHome } = require(path.join(__dirname, "..", "..", "harness", "isolated-dsh-home.cjs"));
+const gates = require(path.join(__dirname, "..", "..", "harness", "harness-gates.cjs"));
+
+if (process.argv.includes("--self-test")) {
+  const failures = [];
+  const selfCheck = (name, pass, detail) => {
+    console.log(`  ${pass ? "PASS" : "FAIL"}  ${name}${detail === undefined ? "" : `  — ${detail}`}`);
+    if (!pass) failures.push(name);
+  };
+  const pluginModule = require("./index.server.js");
+  const { toDshContent: translate } = require("./server/session.js");
+  selfCheck("compiled plugin module loads", typeof pluginModule?.default === "function");
+  const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+  const imageBlock = translate({ type: "image", data: png, mimeType: "image/png" });
+  selfCheck(
+    "image content translates to a DSH image block",
+    imageBlock?.type === "image" && imageBlock.data === png && imageBlock.mimeType === "image/png",
+    JSON.stringify(imageBlock),
+  );
+  selfCheck(
+    "the structural predicate accepts the translated image block",
+    gates.contentBlocksIncludeImage([imageBlock], png, "image/png"),
+  );
+  selfCheck(
+    "a text placeholder never satisfies the structural predicate",
+    gates.contentBlocksIncludeImage([translate({ type: "text", text: "IMAGE-SEEN" })], png, "image/png") === false,
+  );
+  const failed = failures.length;
+  console.log(`\n  ${failed === 0 ? "self-test passed" : `${failed} self-test failure(s)`}`);
+  process.exit(failed === 0 ? 0 : 1);
+}
+
+let runMode;
+try {
+  runMode = prepareDshHome({ script: "plugin-check", profile: process.env.DSH_PASEO_PROFILE ?? "paseo" });
+} catch (error) {
+  console.error(`plugin-check: ${error.message}`);
+  process.exit(2);
+}
+announceDshHome(runMode);
+
 const plugin = require("./index.server.js").default;
+const { DshProcess } = require("./server/dsh-process.js");
+const { toDshContent } = require("./server/session.js");
+
+// Record the prompt frames the plugin hands to its DSH process. This is the
+// protocol boundary the "non-text block reached DSH" check asserts on: a
+// placeholder the model was told to repeat can never satisfy it, and a text
+// label produced by collapsing the block is visible as a missing image block.
+const promptFrames = [];
+const originalPrompt = DshProcess.prototype.prompt;
+DshProcess.prototype.prompt = async function prompt(sessionId, text, contentBlocks, delivery) {
+  promptFrames.push({
+    sessionId,
+    text,
+    contentBlocks: contentBlocks === undefined ? undefined : JSON.parse(JSON.stringify(contentBlocks)),
+  });
+  return originalPrompt.call(this, sessionId, text, contentBlocks, delivery);
+};
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const events = [];
@@ -78,42 +148,6 @@ const check = (name, pass, detail) => {
   results.push({ name, pass, detail });
   console.log(`  ${pass ? "PASS" : "FAIL"}  ${name}${detail ? `  — ${detail}` : ""}`);
 };
-
-/**
- * Replay Paseo's own two fold rules over the emitted timeline items, exactly as
- * `@getpaseo/server` does: `plugin-provider.js` turns a same-id snapshot into
- * the prefix delta (dropping an empty one), and `timeline-projection.js`
- * concatenates only adjacent same-type rows of one turn — refusing to merge two
- * assistant rows with different `messageId`s. A live step must therefore
- * project to exactly one row per item id; more means the answer was fragmented.
- */
-function projectTimelineLikePaseo(items, turnId) {
-  const snapshots = new Map();
-  const rows = [];
-  for (const item of items) {
-    const previous = snapshots.get(item.id);
-    snapshots.set(item.id, item);
-    const previousText = previous && previous.type === item.type ? previous.text : "";
-    const delta = item.text.startsWith(previousText) ? item.text.slice(previousText.length) : item.text;
-    if (delta.length === 0) continue;
-    const last = rows[rows.length - 1];
-    const sameType = last && last.type === item.type && last.turnId === turnId;
-    const sameId =
-      item.type !== "assistant_message" || item.messageId === undefined || last?.messageId === item.messageId;
-    if (sameType && sameId) {
-      last.text += delta;
-      if (last.messageId === undefined && item.type === "assistant_message") last.messageId = item.messageId;
-    } else {
-      rows.push({
-        type: item.type,
-        text: delta,
-        turnId,
-        ...(item.type === "assistant_message" ? { messageId: item.messageId } : {}),
-      });
-    }
-  }
-  return rows;
-}
 
 (async () => {
   // Offer every capability the plugin could support. `prompt.image` is asserted
@@ -356,14 +390,17 @@ function projectTimelineLikePaseo(items, turnId) {
       input: {
         type: "message",
         content: [
-          { type: "text", text: "Describe what you can see, then reply with exactly: IMAGE-SEEN" },
+          { type: "text", text: "Describe what you can see in the attached image." },
           { type: "image", data: png, mimeType: "image/png" },
         ],
       },
     },
   });
 
-  await until((e) => e.type === "session.turn" && e.state === "completed", "turn completed");
+  await until(
+    (e) => e.type === "session.turn" && e.state === "completed" && e.turnId === `turn:${imageMsgId}`,
+    "image turn completed",
+  );
   await sleep(1500);
 
   // 1. usage
@@ -447,12 +484,14 @@ function projectTimelineLikePaseo(items, turnId) {
     lastStats === undefined ? "no stats row" : JSON.stringify(lastStats.item.data),
   );
 
-  // 2. the image block reached the model layer
+  // 2. the image block reached the DSH boundary
   //
-  // A text-only route makes DSH replace the image with a note saying so, and
-  // that note is the proof the block arrived: had the plugin still been
-  // collapsing content into a text label, nothing downstream would know an
-  // attachment was ever there.
+  // The old predicate matched `/image|…/i` in the model's answer after asking it
+  // to reply with `IMAGE-SEEN`: the prompt supplied the very word the assertion
+  // looked for, so zero image blocks could pass. The evidence is now structural —
+  // the prompt frame the plugin hands to `DshProcess` must carry the exact image
+  // bytes and media type, and the product's own translator must produce an image
+  // block. Model output is no longer part of this check.
   console.log("\n  timeline:");
   for (const e of events.filter((x) => x.type === "timeline.item")) {
     const item = e.item;
@@ -463,17 +502,15 @@ function projectTimelineLikePaseo(items, turnId) {
 
   // 2a. live streaming must not fragment the answer. A step streams as several
   // same-id snapshots; Paseo folds them into one row only while they stay
-  // adjacent and share a `messageId`. Reasoning emitted between assistant
-  // snapshots would split the answer into two bubbles, which is exactly the
-  // regression a "looks fine in the log" check misses.
-  const streamedAssistant = events
-    .filter((e) => e.type === "timeline.item" && e.item?.type === "assistant_message")
-    .map((e) => e.item);
-  const projectedAssistant = projectTimelineLikePaseo(streamedAssistant, "turn:any");
-  const assistantIds = [...new Set(streamedAssistant.map((i) => i.messageId).filter((id) => id !== undefined))];
-  const fragmented = assistantIds.filter(
-    (id) => projectedAssistant.filter((r) => r.type === "assistant_message" && r.messageId === id).length !== 1,
-  );
+  // adjacent and share a `messageId`. Reasoning, a tool row or stream stats
+  // emitted between assistant snapshots would split the answer into two bubbles,
+  // which is exactly the regression a "looks fine in the log" check misses. The
+  // **complete** item sequence is folded — pre-filtering to assistant rows (the
+  // old bug) deletes the interruption before the check can see it.
+  const imageTurnItems = gates
+    .timelineItemsWithTurns(events.filter((e) => e.sessionId === sessionId))
+    .filter((item) => item.turnId === `turn:${imageMsgId}`);
+  const { assistantIds, fragmented } = gates.assistantFragmentation(imageTurnItems);
   check(
     "live streaming does not fragment an assistant step across rows",
     assistantIds.length > 0 && fragmented.length === 0,
@@ -484,27 +521,32 @@ function projectTimelineLikePaseo(items, turnId) {
         : `fragmented: ${fragmented.join(", ")}`,
   );
 
-  const allText = events
-    .filter((e) => e.type === "timeline.item")
-    // The plugin echoes the prompt back as a `user_message`, so including it made
-    // this assertion match its own input: the prompt ends in `… reply with
-    // exactly: IMAGE-SEEN`, and `/image/i` hit that `IMAGE`. It is the model's
-    // own answer that has to show the attachment arrived.
-    .filter((e) => e.item?.type !== "user_message")
-    .map((e) => {
-      const item = e.item;
-      return (
-        (item.text ?? "") +
-        (item.content ?? []).map((b) => b.text ?? "").join("") +
-        JSON.stringify(item.detail ?? {})
-      );
-    })
-    .join("\n");
-
+  const translatedImage = toDshContent({ type: "image", data: png, mimeType: "image/png" });
   check(
-    "non-text block reached DSH (downstream knows an attachment existed)",
-    /image|图片|图像|视觉|visual|text only|text-only|attachment/i.test(allText),
-    allText.trim() ? allText.replace(/\s+/g, " ").trim().slice(0, 140) : "(no timeline text at all)",
+    "image content translates to a DSH image block (not a collapsed text label)",
+    translatedImage?.type === "image" &&
+      translatedImage.data === png &&
+      translatedImage.mimeType === "image/png",
+    JSON.stringify({
+      type: translatedImage?.type,
+      dataLength: translatedImage?.data?.length,
+      mimeType: translatedImage?.mimeType,
+    }),
+  );
+
+  const imageFrames = gates.countPromptFramesWithImage(promptFrames, { data: png, mimeType: "image/png" });
+  check(
+    "the image block is present in the prompt frame handed to DSH",
+    imageFrames > 0,
+    `${imageFrames} matching prompt frame(s) of ${promptFrames.length} recorded`,
+  );
+  // Negative control: a payload that was never sent must not match. Without it a
+  // recorder bug that marks every frame as carrying the image would pass.
+  const differentBytes = `${png.slice(0, -4)}AAAA`;
+  check(
+    "control: a different image payload does not match the recorded frames",
+    gates.countPromptFramesWithImage(promptFrames, { data: differentBytes, mimeType: "image/png" }) === 0,
+    `${promptFrames.length} prompt frame(s) recorded`,
   );
 
   const failed = events.filter((e) => e.type === "request.failed" || e.type === "session.runtime_failed");

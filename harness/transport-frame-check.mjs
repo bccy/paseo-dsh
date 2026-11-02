@@ -35,6 +35,11 @@
  *   8. randomized chunkings produce exactly the old algorithm's outcomes
  *   9. the incremental scan is not quadratic: same 20 MiB input, same 16 KB
  *      chunks, measured against the old algorithm
+ *  10. an unterminated frame is bounded: past the limit it is discarded whole,
+ *      reported exactly once, and parsing resumes at the next newline — the
+ *      same contract the plugin's `frame-reader.ts` enforces on its side of the
+ *      pipe, because a bridge shared by every session cannot let one malformed
+ *      frame grow until it OOMs them all
  *
  * Pure module: no `dsh`, no profile, no daemon, no child process. `transport.js`
  * imports nothing but `node:string_decoder`, so it is required as-is rather than
@@ -45,6 +50,7 @@
  */
 import { EventEmitter } from 'node:events';
 import { PaseoTransport } from '../dsh-bridge/lib/transport.js';
+import * as transportModule from '../dsh-bridge/lib/transport.js';
 
 let passed = 0;
 let failed = 0;
@@ -401,6 +407,88 @@ console.log('transport: incremental NDJSON splitting\n');
     `old ${oldMs.toFixed(0)} ms vs new ${newMs.toFixed(0)} ms on 20 MB / ${chunks.length} chunks (${ratio.toFixed(0)}x)`,
   );
   check('the incremental scan stays under a second for 20 MB', newMs < 1000, `${newMs.toFixed(0)} ms`);
+}
+
+// --- 10. an unterminated frame is bounded --------------------------------
+{
+  // The plugin's side of this pipe has had this bound since the frame reader
+  // was split out; the bridge did not, and it is the process every session
+  // shares. A frame with no newline — malformed output, or a peer killed
+  // mid-write — accumulated in `#partial` forever, so one bad writer could OOM
+  // every conversation this bridge serves. The bound has to match the plugin's
+  // (256 MiB) or the two ends disagree about what a legitimate frame is.
+  check(
+    'the default limit is the documented 256 MiB, same as the plugin side',
+    transportModule.DEFAULT_MAX_PENDING_BYTES === 256 * 1024 * 1024,
+    String(transportModule.DEFAULT_MAX_PENDING_BYTES),
+  );
+
+  // The limit is an option so the check can drive the path with 1 KB instead of
+  // allocating 256 MB. What is asserted is the whole contract: one report (not
+  // one per chunk), the buffer is gone, the tail of the dropped frame cannot
+  // become the next frame, and the line behind it still parses. All chunks go
+  // through ONE transport: creating a new one per chunk would reset `#partial`
+  // and make the resumption assertion meaningless.
+  const reports = [];
+  const requests = [];
+  const stderr = [];
+  const input = new EventEmitter();
+  input.setEncoding = () => {};
+  const transport = new PaseoTransport(input, fakeOutput(), {
+    maxPendingBytes: 1024,
+    onOverflow: (info) => reports.push(info),
+  });
+  transport.onRequest((method) => {
+    requests.push(method);
+    return { ok: true };
+  });
+  transport.start();
+  const originalWrite = process.stderr.write;
+  process.stderr.write = (text) => {
+    stderr.push(String(text));
+    return true;
+  };
+  const chunk = 'z'.repeat(300);
+  let emittedBeforeOverflow = 0;
+  try {
+    for (let i = 0; i < 10; i += 1) {
+      const before = requests.length + stderr.length;
+      input.emit('data', chunk);
+      emittedBeforeOverflow += requests.length + stderr.length - before;
+    }
+    check(
+      'an unterminated frame past the limit is reported exactly once',
+      reports.length === 1,
+      `${reports.length} report(s)`,
+    );
+    check(
+      '…the report says how much was discarded and under which limit',
+      typeof reports[0]?.dropped === 'number' && reports[0].dropped >= 1024 && reports[0]?.limit === 1024,
+      JSON.stringify(reports[0] ?? null),
+    );
+    check('no line was emitted for the discarded frame', emittedBeforeOverflow === 0, `${emittedBeforeOverflow} line(s)`);
+    // The rest of the stream must still be readable: the reader discards the
+    // overflowing frame *up to its terminator*, and resumes at the newline. The
+    // tail of the bad frame emits nothing and the next complete frame arrives —
+    // asserted on the frame itself, because "it did not throw" would also be
+    // true for an implementation that glued the tail onto the next frame (which
+    // would then be malformed instead of lost).
+    input.emit('data', 'tail-of-the-bad-line\n');
+    input.emit('data', '{"jsonrpc":"2.0","id":2,"method":"after"}\n');
+  } finally {
+    process.stderr.write = originalWrite;
+    transport.close();
+  }
+  check(
+    'parsing resumes at the newline after the discarded frame',
+    requests.length === 1 && requests[0] === 'after' && stderr.length === 0,
+    `requests ${JSON.stringify(requests)}, stderr ${JSON.stringify(stderr)}`,
+  );
+  check(
+    'the discarded frame is not reported a second time',
+    reports.length === 1,
+    `${reports.length} report(s)`,
+  );
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

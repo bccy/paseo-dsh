@@ -28,6 +28,11 @@
  *      conversation that is already gone
  *   5. the child gets no `session.turn` terminal: the failure is the terminal,
  *      and inventing a turn id for a turn DSH never closed would be a guess
+ *   6. the mirror case: a child that **already settled** (every turn ended) is
+ *      not rewritten to failed when the process dies later. Paseo's
+ *      `acceptChildEvent` upserts `session.runtime_failed` as `status: "failed"`
+ *      unconditionally, so the old fan-out overwrote the real history of a
+ *      finished subagent whenever the daemon's shared `dsh` child exited.
  *
  * The crash is produced by the check itself (`SIGKILL` on the pid the fake bridge
  * logs), not by a new fake-bridge scenario: the fake bridge is owned by another
@@ -41,7 +46,7 @@
  * daemon is touched)
  */
 import { createRequire } from "node:module";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -67,6 +72,12 @@ process.env.DSH_FAKE_MODE = "steer";
 // throwaway tree.
 const scratch = mkdtempSync(join(tmpdir(), "dsh-child-crash-check-"));
 process.env.DSH_HOME = scratch;
+// The scenario file is re-read on every mode access, so the second scenario can
+// retarget the child spawned after the first crash. (The first child's env is
+// frozen at spawn; this file does not exist until the second scenario writes it,
+// so the initial `steer` comes from `DSH_FAKE_MODE`.)
+const modeFile = join(scratch, "fake-mode.txt");
+process.env.DSH_FAKE_MODE_FILE = modeFile;
 // Every request frame the fake bridge receives is appended here, with the pid
 // that served it — that is how this check finds the child to kill.
 const frameLog = join(scratch, "frames.jsonl");
@@ -281,6 +292,111 @@ const events = [];
       .filter((e) => e.type === "session.runtime_failed")
       .map((e) => e.sessionId)
       .join(", "),
+  );
+
+  // -------------------------------------------------------------------------
+  // Second scenario: an already-settled child keeps its terminal status.
+  //
+  // The first scenario covers a child that was mid-turn. The mirror case is a
+  // child that already finished: `acceptChildEvent` upserts `runtime_failed` as
+  // `status: "failed"` unconditionally, so the process-exit fan-out rewrote the
+  // real, user-visible outcome of a completed/cancelled subagent row. The
+  // `nested` fixture settles every child it reports and leaves the root's own
+  // turn open, so the kill still has live work to report. `DSH_FAKE_MODE_FILE`
+  // retargets the child spawned after the first crash (a new process, but a mode
+  // read per access for the same reason the long-lived child needs it).
+  // -------------------------------------------------------------------------
+  console.log("\na child that already settled keeps its status when the process dies");
+  writeFileSync(modeFile, "nested");
+  const settledRoot = `crash-root-${Date.now()}-nested`;
+  await conn.send({
+    type: "session.open",
+    sessionId: settledRoot,
+    config: { cwd: process.cwd(), mode: "build" },
+    history: "skip",
+  });
+  await until(events, (e) => e.type === "session.ready" && e.sessionId === settledRoot, "the nested root ready");
+  const settledMark = events.length;
+  await conn.send({
+    type: "session.prompt",
+    sessionId: settledRoot,
+    prompt: {
+      clientMessageId: "nested-p1",
+      input: { type: "message", content: [{ type: "text", text: "go" }] },
+    },
+  });
+
+  // Three children, deepest first, each ending a completed turn. Wait for both
+  // facts before the kill: an opened child and a recorded `completed` terminal.
+  // Without the positive control, "no failures afterwards" would also be true of
+  // a scenario that never started.
+  const settledChildren = [];
+  const settledDeadline = Date.now() + 30000;
+  while (Date.now() < settledDeadline) {
+    for (const opened of events
+      .slice(settledMark)
+      .filter((e) => e.type === "session.opened" && typeof e.parentSessionId === "string")) {
+      if (!settledChildren.includes(opened.sessionId)) settledChildren.push(opened.sessionId);
+    }
+    const allSettled = settledChildren.length >= 3 && settledChildren.every((childId) =>
+      events.some((e) => e.type === "session.turn" && e.sessionId === childId && e.state === "completed"));
+    if (allSettled) break;
+    await sleep(20);
+  }
+  check(
+    "every fixture child is opened and has a completed turn before the kill (positive control)",
+    settledChildren.length === 3,
+    `children=${JSON.stringify(settledChildren)}`,
+  );
+
+  const settledPids = servedPids();
+  check("the replacement child is identified", settledPids.length > 1, `pids=${JSON.stringify(settledPids)}`);
+  const settledPid = settledPids[settledPids.length - 1];
+  const beforeSettledKill = events.length;
+  let settledKilled = false;
+  try {
+    process.kill(settledPid, "SIGKILL");
+    settledKilled = true;
+  } catch (error) {
+    console.log(`  FAIL  could not kill the replacement child  — ${String(error?.message ?? error)}`);
+    failed += 1;
+  }
+  check("the replacement child was killed (SIGKILL)", settledKilled, `pid=${String(settledPid)}`);
+
+  const settledRootFailure = await untilAfter(
+    events,
+    beforeSettledKill,
+    (e) => e.type === "session.runtime_failed" && e.sessionId === settledRoot,
+    "the nested root's session.runtime_failed",
+  );
+  // A wrongly failed child lands through the same ordered channel as the root's
+  // failure; a short settle wait makes "none arrived" mean "none was sent".
+  await sleep(300);
+  const settledChildFailures = events
+    .slice(beforeSettledKill)
+    .filter((e) => e.type === "session.runtime_failed" && settledChildren.includes(e.sessionId));
+  check(
+    "a settled subagent is not rewritten as failed by the process exit",
+    settledChildFailures.length === 0,
+    settledChildFailures.map((e) => e.sessionId).join(", ") || "(none)",
+  );
+  check(
+    "the settled children keep their completed turn in the final event stream",
+    settledChildren.every((childId) => {
+      // A child that ran may have announced a `started` turn; what must survive
+      // the process exit is the *last* state, which is the completed terminal.
+      const turns = events.filter((e) => e.type === "session.turn" && e.sessionId === childId);
+      return turns.length >= 1 && turns[turns.length - 1].state === "completed";
+    }),
+    JSON.stringify(settledChildren.map((childId) => ({
+      child: childId,
+      turns: events.filter((e) => e.type === "session.turn" && e.sessionId === childId).map((e) => e.state),
+    }))),
+  );
+  check(
+    "the nested root is still told the process it used is gone",
+    settledRootFailure.sessionId === settledRoot && /exited/i.test(settledRootFailure.error?.message ?? ""),
+    JSON.stringify({ sessionId: settledRootFailure.sessionId, error: settledRootFailure.error?.message }),
   );
 
   try {

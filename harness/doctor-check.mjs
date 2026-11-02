@@ -11,12 +11,18 @@
  * This drives the real `runDoctor()` against sandboxed `DSH_HOME` trees and
  * asserts the verdicts, so the next `ok` on a broken file is a test failure:
  *
- *   1. an empty `provider:`/`model:` is a failure, not `ok`
- *   2. a missing `agent-default-model` is a failure
+ *   1. an empty (and a quoted-empty) `provider:`/`model:` is a failure, not `ok`
+ *   2. a missing `agent-default-model` is a failure; an empty `config` cannot
+ *      borrow a later entry's `provider:`/`model:`
  *   3. a YAML syntax error is a failure
- *   4. a credential with no value is a failure
- *   5. a credential outside `refs:` is a failure
- *   6. a complete configuration is still accepted (the negative control)
+ *   4. a credential with no value — plain, quoted-empty or comment-only — is a
+ *      failure
+ *   5. a credential outside `refs:` is a failure, including one in a block after
+ *      `refs:` has ended
+ *   5b. a `disabled: true` agent-default-model and a route naming an undefined
+ *       `llm-pi-ai` provider are failures
+ *   6. a complete configuration in the real template shape (separate
+ *      `llm-pi-ai` + `agent-default-model` entries) is still accepted
  *   7. a bridge missing a lazy module is a failure, not `ok`
  *   8. a complete bridge is still accepted (the control for 7)
  *   9. an unreadable file list is a failure, not a warning with exit 0
@@ -193,17 +199,35 @@ const { runDoctor: runDegradedDoctor } = await import(
   pathToFileURL(join(DEGRADED_PLUGIN, "lib", "doctor.mjs")).href
 );
 
-/** A patch shaped like the one the plugin writes: the route is a list item's id. */
+/**
+ * A patch shaped like the one the plugin writes, and like the schema DSH
+ * actually loads: `providers` belongs to the `llm-pi-ai` entry
+ * (`config.providers`, a dict keyed by route), and `agent-default-model` only
+ * names the route/model it defaults to. The old control nested `providers`
+ * under `agent-default-model.config`, a shape the real template never writes —
+ * which is how the regex checks below stayed green on invalid files.
+ */
 const VALID_ROUTE = [
   "# profile patch",
+  "- id: llm-pi-ai",
+  '  name: "@deepseek-ai/dsh-llm-pi-ai"',
+  "  config:",
+  "    providers:",
+  "      my-gateway:",
+  "        displayName: My Gateway",
+  "        apiKeyEnv: MY_GATEWAY_KEY",
+  "        api: openai-completions",
+  "        baseURL: https://example.invalid/v1",
+  "        models:",
+  "          - id: my-model",
+  "            name: my-model",
+  "            reasoningEfforts: false",
   "- id: agent-default-model",
+  '  name: "@deepseek-ai/dsh-agent-default-model"',
   "  config:",
   "    provider: my-gateway",
   "    model: my-model",
   "    reasoningEffort: high",
-  "    providers:",
-  "      - id: my-gateway",
-  "        apiKeyEnv: MY_GATEWAY_KEY",
   "",
 ].join("\n");
 
@@ -276,15 +300,60 @@ const check = (name, pass, detail) => {
   check("and the install exits non-zero", run.code === 1, `exit ${run.code}`);
 }
 
+// ---- 1b. quoted-empty strings are still empty ----------------------------
+{
+  // YAML parses `""` to an empty string. A regex looking for non-space
+  // characters saw the two quote characters and called the route configured.
+  const patch = VALID_ROUTE.replace("provider: my-gateway", 'provider: ""').replace("model: my-model", 'model: ""');
+  install({ patch, credentials: VALID_CREDENTIALS });
+  const run = doctor();
+  check(
+    "a quoted-empty provider:/model: is a failure, not `ok`",
+    run.out.includes("model route is incomplete") && run.code === 1,
+    run.out.trim().split("\n").filter((l) => l.includes("model route")).join(" | ") || "(no route line)",
+  );
+}
+
 // ---- 2. a missing agent-default-model is a failure -----------------------
 {
-  install({ patch: "# nothing but comments\n", credentials: VALID_CREDENTIALS });
+  install({ patch: "[]\n", credentials: VALID_CREDENTIALS });
   const run = doctor();
   check(
     "a patch with no agent-default-model is a failure",
     run.out.includes("no agent-default-model") && run.code === 1,
     `exit ${run.code}`,
   );
+}
+
+// ---- 2b. an empty config cannot borrow a later entry's provider/model ----
+{
+  // The old `active.slice(routeAt)` scan ran to EOF, so an unrelated entry
+  // below the disabled/empty route supplied both values and the doctor printed
+  // them as the default route.
+  const patch = [
+    "- id: agent-default-model",
+    '  name: "@deepseek-ai/dsh-agent-default-model"',
+    "  config: {}",
+    "- id: llm-pi-ai",
+    "  config:",
+    "    providers:",
+    "      other-gateway:",
+    "        apiKeyEnv: MY_GATEWAY_KEY",
+    "- id: some-other-route",
+    "  config:",
+    "    provider: other-gateway",
+    "    model: other-model",
+    "",
+  ].join("\n");
+  install({ patch, credentials: VALID_CREDENTIALS });
+  const run = doctor();
+  check(
+    "an empty agent-default-model config is a failure even when a later entry has provider:/model:",
+    run.out.includes("model route is incomplete") && !run.out.includes("default: other-gateway"),
+    run.out.trim().split("\n").filter((l) => l.includes("model route") || l.includes("default:")).join(" | ") ||
+      "(no route line)",
+  );
+  check("and the unrelated values are not reported as the default", run.code === 1, `exit ${run.code}`);
 }
 
 // ---- 3. a YAML syntax error is a failure ---------------------------------
@@ -309,6 +378,22 @@ const check = (name, pass, detail) => {
   );
 }
 
+// ---- 4b. quoted-empty and comment-only credentials are empty ------------
+{
+  for (const [name, value] of [
+    ["a quoted-empty credential", '  MY_GATEWAY_KEY: ""'],
+    ["a comment-only credential", "  MY_GATEWAY_KEY: # no value"],
+  ]) {
+    install({ patch: VALID_ROUTE, credentials: ["refs:", value, ""].join("\n") });
+    const run = doctor();
+    check(
+      `${name} is a failure, not a found credential`,
+      run.out.includes("credential MY_GATEWAY_KEY missing") && run.code === 1,
+      run.out.trim().split("\n").filter((l) => l.includes("credential")).join(" | "),
+    );
+  }
+}
+
 // ---- 5. a same-named key outside refs: is not a credential ---------------
 {
   install({ patch: VALID_ROUTE, credentials: ["something_else:", "  MY_GATEWAY_KEY: a-secret-value", ""].join("\n") });
@@ -317,6 +402,49 @@ const check = (name, pass, detail) => {
     "a key outside refs: does not satisfy the credential check",
     run.out.includes("credential MY_GATEWAY_KEY missing") && run.code === 1,
     run.out.trim().split("\n").filter((l) => l.includes("credential")).join(" | "),
+  );
+}
+
+// ---- 5b. a credential in a block after refs: ended is not in refs: -------
+{
+  // The old `credentialText.slice(refsAt)` read to EOF, so a same-named key in
+  // the next top-level block counted. Parsed as an object, only `refs.*`.
+  const credentials = ["refs:", "  OTHER_KEY: other-value", "other_section:", "  MY_GATEWAY_KEY: a-secret-value", ""].join(
+    "\n",
+  );
+  install({ patch: VALID_ROUTE, credentials });
+  const run = doctor();
+  check(
+    "a key after refs: ended does not satisfy the credential check",
+    run.out.includes("credential MY_GATEWAY_KEY missing") && run.code === 1,
+    run.out.trim().split("\n").filter((l) => l.includes("credential")).join(" | "),
+  );
+}
+
+// ---- 5c. a disabled default-model is not an active route ----------------
+{
+  const patch = VALID_ROUTE.replace(
+    '  name: "@deepseek-ai/dsh-agent-default-model"\n  config:',
+    '  name: "@deepseek-ai/dsh-agent-default-model"\n  disabled: true\n  config:',
+  );
+  install({ patch, credentials: VALID_CREDENTIALS });
+  const run = doctor();
+  check(
+    "a disabled agent-default-model is a failure, not `All checks passed`",
+    run.out.includes("agent-default-model is disabled") && !run.out.includes("All checks passed") && run.code === 1,
+    run.out.trim().split("\n").find((l) => l.includes("agent-default-model")) ?? `exit ${run.code}`,
+  );
+}
+
+// ---- 5d. the route must name a provider defined by llm-pi-ai ------------
+{
+  const patch = VALID_ROUTE.replace("provider: my-gateway", "provider: not-configured");
+  install({ patch, credentials: VALID_CREDENTIALS });
+  const run = doctor();
+  check(
+    "a route pointing at an undefined provider is a failure",
+    run.out.includes('references unknown provider "not-configured"') && run.code === 1,
+    run.out.trim().split("\n").filter((l) => l.includes("provider")).join(" | ") || "(no provider line)",
   );
 }
 

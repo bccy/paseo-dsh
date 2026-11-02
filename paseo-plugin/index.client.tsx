@@ -123,6 +123,8 @@ export default function contribute(client: PluginClientContext) {
       diff: z.boolean(),
       code: z.boolean(),
       failed: z.boolean(),
+      // Why the call failed; empty on a successful row (see `ToolCallData`).
+      error: z.string(),
       titled: z.boolean(),
       hasDetail: z.boolean(),
       // DSH's block dispatch: terminal/diff/read/image/search/web/details. The

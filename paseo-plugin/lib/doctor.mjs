@@ -14,8 +14,11 @@
  * appear. A file with `provider:` present and *empty* satisfied that, and so did
  * a file with a YAML syntax error on the next line — both reported `ok` with no
  * detail, and a fresh install that could not possibly run printed
- * "All checks passed". A route now has to name a provider and a model, and the
- * credential has to carry a value under `refs:`, or it is a failure.
+ * "All checks passed". The route and credential checks now read the *parsed*
+ * document: the route has to name a non-empty provider/model in
+ * `agent-default-model.config`, that provider has to be a key of the composed
+ * `llm-pi-ai.config.providers`, and every referenced `apiKeyEnv` needs a
+ * non-empty string under `.credentials.yaml`'s `refs:`.
  *
  * YAML syntax is parsed for real when a parser resolves — from the plugin's own
  * `node_modules` in a development checkout, or from the DSH install in a
@@ -153,12 +156,55 @@ function compareCore(a, b) {
   return 0;
 }
 
-/** Strip full-line comments so "route configured?" isn't fooled by the template. */
-function activeLines(text) {
-  return text
-    .split("\n")
-    .filter((l) => !l.trimStart().startsWith("#"))
-    .join("\n");
+/** Parse one YAML document with whichever parser resolved (`yaml` or `js-yaml`). */
+function parseYaml(yaml, text) {
+  return yaml.name === "js-yaml" ? yaml.module.load(text) : yaml.module.parse(text);
+}
+
+/**
+ * The loader patch entries of `cordis.patch.yml`, or an error.
+ *
+ * DSH parses this file as a *top-level YAML array* of loader patch entries and
+ * fails the whole profile when it is anything else, so "parsed as YAML" alone is
+ * not enough: a mapping with the right words in it is still not a patch list.
+ */
+function patchEntries(document) {
+  if (!Array.isArray(document)) return { error: "it is not a top-level YAML array of loader patch entries" };
+  const entries = [];
+  for (const [index, entry] of document.entries()) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      return { error: `entry ${index + 1} is not a mapping (a loader patch entry)` };
+    }
+    entries.push(entry);
+  }
+  return { entries };
+}
+
+/**
+ * The patch entry with this `id`, with later same-id entries folded in.
+ *
+ * The profile patch is a loader patch list: each entry targets a *composed*
+ * entry by id and sets fields on it. Two entries with the same id are not two
+ * routes, they are two overrides — the later value wins, and `config` replaces
+ * the whole config object (`applyEntryPatches()`). Folding them here means the
+ * doctor judges the same route DSH will compose instead of the first fragment.
+ */
+function entryById(entries, id) {
+  let found;
+  for (const entry of entries) {
+    if (entry.id !== id) continue;
+    found = found === undefined ? { ...entry } : { ...found, ...entry };
+  }
+  return found;
+}
+
+/** The `config.providers` dict of an `llm-pi-ai` entry, or undefined. */
+function providerProfiles(entry) {
+  const config = entry?.config;
+  if (config === null || typeof config !== "object" || Array.isArray(config)) return undefined;
+  const providers = config.providers;
+  if (providers === null || typeof providers !== "object" || Array.isArray(providers)) return undefined;
+  return providers;
 }
 
 /**
@@ -429,52 +475,90 @@ export function runDoctor() {
     return;
   }
   const patch = patchRead.text;
-  const active = activeLines(patch);
 
   const yaml = loadYaml();
   if (yaml === undefined) {
+    // Semantics are judged on the parsed document now, so without a parser
+    // there is nothing honest to say about the route or the credentials. Say
+    // that out loud instead of falling back to the text scan that produced the
+    // false greens this check exists to prevent.
     report(
       "warn",
       "YAML syntax not validated",
-      "no YAML parser resolves from here; only the route and credential fields below were checked",
+      "no YAML parser resolves from here; the route and credential semantics are not inspected either",
     );
-  } else {
-    try {
-      if (yaml.name === "js-yaml") yaml.module.load(patch);
-      else yaml.module.parse(patch);
-    } catch (error) {
-      report("fail", "cordis.patch.yml is not valid YAML", String(error.message).split("\n")[0]);
-      finish();
-      return;
-    }
+    report("warn", "model route not verified", "no YAML parser resolves from here, so the parsed route cannot be judged");
+    report("warn", "credentials not verified", "no YAML parser resolves from here, so refs: cannot be judged");
+    finish();
+    return;
+  }
+  let patchDocument;
+  try {
+    patchDocument = parseYaml(yaml, patch);
+  } catch (error) {
+    report("fail", "cordis.patch.yml is not valid YAML", String(error.message).split("\n")[0]);
+    finish();
+    return;
   }
 
-  // The template writes this as a list item's id (`- id: agent-default-model`)
-  // with the route indented beneath it, not as a `key: value` pair — which is
-  // what `search(/agent-default-model:/)` assumed, and so never found.
-  const routeAt = active.search(/^\s*(?:-\s*)?id:\s*agent-default-model\s*$/m);
-  if (routeAt === -1) {
+  const patchList = patchEntries(patchDocument);
+  if (patchList.error !== undefined) {
+    report("fail", "cordis.patch.yml is not a loader patch list", patchList.error);
+    finish();
+    return;
+  }
+  const entries = patchList.entries;
+  const defaultEntry = entryById(entries, "agent-default-model");
+  const providers = providerProfiles(entryById(entries, "llm-pi-ai"));
+
+  if (defaultEntry === undefined) {
     report(
       "fail",
       "no agent-default-model in the profile patch",
       `edit ${patchPath} (see the README install walkthrough) then restart the daemon`,
     );
+  } else if (defaultEntry.disabled === true) {
+    // DSH composes the patch by id: `disabled: true` turns the default-model
+    // service off, so the route is not merely invalid — it is not active at all.
+    report(
+      "fail",
+      "agent-default-model is disabled",
+      `remove \`disabled: true\` from the agent-default-model entry in ${patchPath}`,
+    );
   } else {
-    const block = active.slice(routeAt);
-    // `[ \t]` and not `\s`: `\s` matches newlines, so on an empty `provider:` it
-    // consumed the line break and read the *next* line's key as the value.
-    const provider = block.match(/^[ \t]*provider:[ \t]*(\S+)/m)?.[1];
-    const model = block.match(/^[ \t]*model:[ \t]*(\S+)/m)?.[1];
-    if (provider === undefined || model === undefined) {
+    const routeConfig = defaultEntry.config;
+    const provider =
+      routeConfig !== null && typeof routeConfig === "object" && !Array.isArray(routeConfig)
+        ? routeConfig.provider
+        : undefined;
+    const model =
+      routeConfig !== null && typeof routeConfig === "object" && !Array.isArray(routeConfig)
+        ? routeConfig.model
+        : undefined;
+    // Non-empty *strings* after trimming: `provider: ""` and `provider:` both
+    // used to satisfy the old regex, and a number is not a route id either.
+    const providerName = typeof provider === "string" ? provider.trim() : "";
+    const modelName = typeof model === "string" ? model.trim() : "";
+    if (providerName === "" || modelName === "") {
       report(
         "fail",
         "model route is incomplete",
         `set both provider: and model: under agent-default-model in ${patchPath}`,
       );
-    } else if (!/^[ \t]*providers:[ \t]*$/m.test(active)) {
-      report("fail", "no providers: section in the profile patch", `add one under agent-default-model in ${patchPath}`);
+    } else if (providers === undefined || Object.keys(providers).length === 0) {
+      report(
+        "fail",
+        `model route references provider "${providerName}" but no providers are configured`,
+        `add it under the llm-pi-ai entry's config.providers in ${patchPath}`,
+      );
+    } else if (!Object.prototype.hasOwnProperty.call(providers, providerName)) {
+      report(
+        "fail",
+        `model route references unknown provider "${providerName}"`,
+        `providers defined in ${patchPath}: ${Object.keys(providers).join(", ")}`,
+      );
     } else {
-      report("ok", "model route configured", `default: ${provider} / ${model}`);
+      report("ok", "model route configured", `default: ${providerName} / ${modelName}`);
     }
   }
 
@@ -486,20 +570,38 @@ export function runDoctor() {
     finish();
     return;
   }
-  const credentialText = credentialRead.text;
-  // Scope to `refs:`: a key of the same name anywhere else is not a credential.
-  const refsAt = credentialText.search(/^[ \t]*refs:[ \t]*$/m);
-  const refsBlock = refsAt === -1 ? "" : credentialText.slice(refsAt);
-  const referenced = [...active.matchAll(/apiKeyEnv:[ \t]*([A-Za-z0-9_]+)/g)].map((m) => m[1]);
+  let credentialDocument;
+  try {
+    credentialDocument = parseYaml(yaml, credentialRead.text);
+  } catch {
+    // Never echo the parser's message: it can quote the offending source line,
+    // and this file is where the raw credentials live.
+    report("fail", `${credentialPath} is not valid YAML`);
+    finish();
+    return;
+  }
+  // `refs:` is the only place a credential may live: a key of the same name in
+  // another top-level section (or after `refs:` has ended) is not one. Parsed
+  // as an object, so YAML's own scoping decides that instead of a line window.
+  const refs =
+    credentialDocument !== null && typeof credentialDocument === "object" && !Array.isArray(credentialDocument)
+      ? credentialDocument.refs
+      : undefined;
+  const refsObject = refs !== null && typeof refs === "object" && !Array.isArray(refs) ? refs : {};
+  const referenced = [];
+  for (const profile of Object.values(providers ?? {})) {
+    if (profile === null || typeof profile !== "object" || Array.isArray(profile)) continue;
+    if (typeof profile.apiKeyEnv === "string" && profile.apiKeyEnv.trim() !== "") referenced.push(profile.apiKeyEnv.trim());
+  }
   const unique = [...new Set(referenced)];
   if (unique.length === 0) {
     report("fail", "no apiKeyEnv referenced", "the route above should name the credential to use");
   } else {
     for (const name of unique) {
-      // The value has to be non-empty: `NAME:` with nothing after it satisfied
-      // the old "is the name in the file" test and then 401'd on every turn.
-      const value = refsBlock.match(new RegExp(`^[ \\t]*${name}:[ \\t]*(\\S.*)$`, "m"))?.[1];
-      if (value !== undefined) report("ok", `credential ${name} found`);
+      // The value has to be a non-empty string: `NAME:` with nothing after it
+      // parses as null and then 401'd on every turn.
+      const value = refsObject[name];
+      if (typeof value === "string" && value.trim() !== "") report("ok", `credential ${name} found`);
       else
         report(
           "fail",

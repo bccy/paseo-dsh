@@ -273,8 +273,10 @@ function pathSegment(value, fallback) {
  * @param content - The MCP `content` array.
  * @param options.textOnly - Collect text and skip images entirely. Used for a
  *   failing call, whose images must not reach the disk.
+ * @param options.signal - The calling turn's cancellation signal; checked before
+ *   each image write so a cancelled call never leaves new files behind.
  */
-function projectContent(server, tool, content, { textOnly = false } = {}) {
+function projectContent(server, tool, content, { textOnly = false, signal } = {}) {
   const texts = [];
   const images = [];
   for (const block of Array.isArray(content) ? content : []) {
@@ -289,6 +291,10 @@ function projectContent(server, tool, content, { textOnly = false } = {}) {
       // step that failed left a file behind that the model could not have avoided
       // — it learned about the failure only after the disk had been touched.
       if (textOnly) continue;
+      // A cancelled turn must not keep writing pictures after the caller stopped
+      // owning the result: check immediately before every write, not once at the
+      // top, so a cancellation during a multi-image result stops the rest too.
+      if (signal?.aborted) throw new Error(`mcp: ${server}/${tool} canceled before the result could be written`);
       const mimeType = typeof block.mimeType === 'string' ? block.mimeType : 'image/png';
       const extension = IMAGE_EXTENSIONS[mimeType] ?? 'bin';
       imageSequence += 1;
@@ -303,6 +309,67 @@ function projectContent(server, tool, content, { textOnly = false } = {}) {
     texts.push(JSON.stringify(block));
   }
   return { text: texts.join('\n').trim(), images };
+}
+
+/**
+ * Validate an MCP `CallToolResult` before anything is projected or written.
+ *
+ * A result object that passes tests for "not null" and "isError !== true" used to
+ * be treated as success even when it violated the MCP schema:
+ *
+ *   - `{content: "hello"}` — content is defined as an array;
+ *   - `{content: [], isError: "true"}` — isError is defined as a boolean, and a
+ *     string silently took the success branch;
+ *   - `{task: {...}}` — a task-based result, which this gateway does not
+ *     implement, was read as "no content" and reported as success.
+ *
+ * All three left the model with a successful call and nothing in it, the exact
+ * silent degradation this repository bans. The native DSH client validates the
+ * same shape against `specTypeSchemas.CallToolResult`, so the gateway — the only
+ * layer that can enforce this for the proxied server — does the equivalent.
+ *
+ * @param server - Server name, for the failure message.
+ * @param target - Tool name, for the failure message.
+ * @param result - The raw JSON-RPC result.
+ * @returns The validated fields this gateway projects.
+ */
+function validateCallToolResult(server, target, result) {
+  const where = `mcp: ${server}/${target}`;
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) {
+    throw new Error(`${where} returned no result object; the call produced no content`);
+  }
+  if (Object.hasOwn(result, 'task')) {
+    throw new Error(`${where} returned a task-based result; task-based execution is not supported by this gateway`);
+  }
+  if (result.isError !== undefined && typeof result.isError !== 'boolean') {
+    throw new Error(`${where} returned an invalid CallToolResult: "isError" must be a boolean, got ${typeof result.isError}`);
+  }
+  if (result.content !== undefined && !Array.isArray(result.content)) {
+    throw new Error(`${where} returned an invalid CallToolResult: "content" must be an array, got ${typeof result.content}`);
+  }
+  const content = result.content ?? [];
+  for (const [index, block] of content.entries()) {
+    if (block === null || typeof block !== 'object' || Array.isArray(block)) {
+      throw new Error(`${where} returned an invalid CallToolResult: content[${index}] must be an object`);
+    }
+    if (typeof block.type !== 'string' || block.type === '') {
+      throw new Error(`${where} returned an invalid CallToolResult: content[${index}] must declare a string "type"`);
+    }
+    // Only the block types this gateway projects are validated: resource and
+    // newer blocks are forwarded verbatim (their nested schema is the server's).
+    if (block.type === 'text' && typeof block.text !== 'string') {
+      throw new Error(`${where} returned an invalid CallToolResult: content[${index}] is a text block without a string "text"`);
+    }
+    if (block.type === 'image' && typeof block.data !== 'string') {
+      throw new Error(`${where} returned an invalid CallToolResult: content[${index}] is an image block without string "data"`);
+    }
+  }
+  const structuredContent = result.structuredContent;
+  if (structuredContent !== undefined
+    && (structuredContent === null || typeof structuredContent !== 'object' || Array.isArray(structuredContent))) {
+    throw new Error(`${where} returned an invalid CallToolResult: "structuredContent" must be an object`);
+  }
+  return { content, isError: result.isError === true, structuredContent };
 }
 
 /**
@@ -421,10 +488,12 @@ export function apply(ctx, config = {}) {
             : `\n\n[unavailable] ${value.unavailable.length} browser tool(s) need a connected desktop browser host: ${value.unavailable.join(', ')}`),
       }],
     },
-    async execute(args) {
+    async execute(args, exec) {
+      const signal = exec?.signal;
+      if (signal?.aborted) throw new Error('mcp: mcp_list_tools canceled');
       const server = serverFor(args.server);
       const client = clientFor(server);
-      const all = await client.listTools();
+      const all = await client.listTools({ signal });
       // Browser tools are registered whether or not a host is attached, so prove
       // the host before promising them: an unreachable listing is cheap to learn
       // here and expensive to discover as a failed model turn. Paseo answers the
@@ -443,11 +512,16 @@ export function apply(ctx, config = {}) {
         try {
           // The entry's own arguments, so a probe never becomes a write: see
           // `BROWSER_HOST_PROBES` for what `{}` did to the shared browser panel.
-          hostGap = browserHostGapOf(await client.callTool(probe.name, probe.args));
+          hostGap = browserHostGapOf(await client.callTool(probe.name, probe.args, { signal }));
         } catch (error) {
+          // A cancelled turn is not a missing browser host: let the cancellation
+          // settle the tool call instead of turning it into a successful listing
+          // with an "unavailable" label.
+          if (signal?.aborted) throw error;
           hostGap = browserHostGapOf(error);
         }
       }
+      if (signal?.aborted) throw new Error('mcp: mcp_list_tools canceled');
       const unavailable = unavailableBrowserTools(all, hostGap);
       const query = String(args.query ?? '').trim().toLowerCase();
       const matched = query === ''
@@ -488,10 +562,13 @@ export function apply(ctx, config = {}) {
         text: `${value.server}/${value.name}\n${value.description}\nparameters: ${JSON.stringify(value.parameters)}`,
       }],
     },
-    async execute(args) {
+    async execute(args, exec) {
+      const signal = exec?.signal;
+      if (signal?.aborted) throw new Error('mcp: mcp_tool_schema canceled');
       const server = serverFor(args.server);
       const wanted = resolveTargetTool(args.tool);
-      const tools = await clientFor(server).listTools();
+      const tools = await clientFor(server).listTools({ signal });
+      if (signal?.aborted) throw new Error(`mcp: ${server}/${wanted} canceled`);
       const found = tools.find((tool) => tool.name === wanted);
       if (found === undefined) {
         throw new Error(`mcp: server "${server}" exposes no tool "${wanted}"; start from mcp_list_tools`);
@@ -522,6 +599,15 @@ export function apply(ctx, config = {}) {
           server: { type: 'string', required: true },
           tool: { type: 'string', required: true },
           content: { type: 'string', required: true },
+          // MCP's `structuredContent` is part of the result, not metadata: a
+          // structured-only tool (or an error payload such as `browser_no_host`)
+          // has its whole answer here. `additionalProperties: true` keeps this
+          // projection lossless for any server's own structure.
+          structuredContent: {
+            type: 'object',
+            additionalProperties: true,
+            description: 'The result\'s structured payload, when the server returned one.',
+          },
           images: {
             type: 'array',
             required: true,
@@ -536,36 +622,61 @@ export function apply(ctx, config = {}) {
           },
         },
       },
-      render: (_args, value) => [{
-        type: 'text',
-        text: value.content
-          + (value.images.length === 0
-            ? ''
-            : `\n[images]\n${value.images.map((image) => `- ${image.path} (${image.mimeType})`).join('\n')}`),
-      }],
+      render: (_args, value) => {
+        // Text is the primary projection; when a server returns only structured
+        // content there is no text to show, and the JSON is the only readable
+        // answer the model can get. With text present the structured value stays
+        // canonical data (as in the native client) rather than being duplicated.
+        const text = value.content !== ''
+          ? value.content
+          : value.structuredContent === undefined ? '' : JSON.stringify(value.structuredContent);
+        return [{
+          type: 'text',
+          text: text
+            + (value.images.length === 0
+              ? ''
+              : `\n[images]\n${value.images.map((image) => `- ${image.path} (${image.mimeType})`).join('\n')}`),
+        }];
+      },
     },
-    async execute(args) {
+    async execute(args, exec) {
+      const signal = exec?.signal;
+      if (signal?.aborted) throw new Error('mcp: mcp_call_tool canceled');
       const server = serverFor(args.server);
       const target = resolveTargetTool(args.tool, args.arguments);
-      const result = await clientFor(server).callTool(target, args.arguments ?? {});
+      const result = await clientFor(server).callTool(target, args.arguments ?? {}, { signal });
+      // A result that arrives after the turn was cancelled is not a result this
+      // caller may project: the image writes below would otherwise continue for
+      // a call the user already withdrew. Check before validation and projection.
+      if (signal?.aborted) throw new Error(`mcp: ${server}/${target} canceled`);
       // A response frame that carried neither `result` nor `error` is a protocol
       // violation, and the transport used to surface it as `undefined` — which
       // projected to empty content and, with `isError` unset, *succeeded*. The
       // model then saw a successful call with nothing in it. A tool call that
       // produced no result is a failure and has to say so.
-      if (result === null || typeof result !== 'object') {
-        throw new Error(`mcp: ${server}/${target} returned no result object; the call produced no content`);
-      }
+      const validated = validateCallToolResult(server, target, result);
       // The error check comes *before* projection: `projectContent` writes image
       // blocks to disk, and doing that first meant a failing call still left files
       // behind (a screenshot that worked, then a step that did not). Reading the
       // error could not undo a write that had already happened.
-      if (result.isError === true) {
-        const { text } = projectContent(server, target, result.content, { textOnly: true });
-        throw new Error(`mcp: ${server}/${target} reported an error: ${text === '' ? '(no message)' : text}`);
+      if (validated.isError) {
+        const { text } = projectContent(server, target, validated.content, { textOnly: true });
+        // A structured-only failure (the `browser_no_host` family) has its reason
+        // in `structuredContent`; dropping it would reduce every such error to
+        // "(no message)" — the same loss this fix closes on the success path.
+        const detail = text !== ''
+          ? text
+          : validated.structuredContent === undefined ? '(no message)' : JSON.stringify(validated.structuredContent);
+        throw new Error(`mcp: ${server}/${target} reported an error: ${detail}`);
       }
-      const { text, images } = projectContent(server, target, result.content);
-      return { server, tool: target, content: text, images };
+      const { text, images } = projectContent(server, target, validated.content, { signal });
+      return {
+        server,
+        tool: target,
+        content: text,
+        images,
+        ...(validated.structuredContent === undefined ? {} : { structuredContent: validated.structuredContent }),
+      };
     },
   }));
 }

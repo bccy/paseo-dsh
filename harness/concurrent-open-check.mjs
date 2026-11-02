@@ -66,6 +66,11 @@
  *      same DSH session (fresh provider session id + persistence handle, as a
  *      reload does) still succeeds. A leaked claim would refuse every later open
  *      for the connection's life.
+ *   6. the `session.config` published by the open advertises exactly the modes
+ *      the catalog advertised — one capability source, not a second local list.
+ *      The fake `dsh` reports `planMode: false`, so before this was one source a
+ *      profile without plan-mode hid Plan in the draft and re-advertised it as
+ *      `availableModes` after the session opened.
  *
  * Run:
  *   node harness/concurrent-open-check.mjs [compiled-plugin-dir]
@@ -187,6 +192,38 @@ if (firstReady !== true) {
   await conn.close();
   process.exit(1);
 }
+
+// ---------------------------------------------------------------------------
+// Step 1b: the advertised modes have a single source.
+//
+// `session.config.modes` is what the host publishes as `availableModes`
+// (`@getpaseo/server@0.14.0` `plugin-provider.js:1197-1204`). The catalog is
+// where the bridge's `planMode` filter is applied, so the session must report
+// that same list back; deriving a second, unconditional list inside the session
+// made a profile without plan-mode hide Plan in the draft and offer it again as
+// soon as the session opened — a toggle the user could pick but never apply.
+// The policy order is checked by appending here rather than in its own step: the
+// open transaction is the only place `session.config` is published, so this is
+// where a regression in it would land.
+const catalogMark = events.length;
+await conn.send({ type: "catalog", requestId: "catalog-modes", cwd: process.cwd() });
+const catalogDeadline = Date.now() + 15000;
+let catalogEvent;
+while (catalogEvent === undefined && Date.now() < catalogDeadline) {
+  catalogEvent = events
+    .slice(catalogMark)
+    .find((event) => event.type === "catalog" && event.requestId === "catalog-modes");
+  if (catalogEvent === undefined) await sleep(20);
+}
+const configEvent = events.find((event) => event.type === "session.config" && event.sessionId === sessionId);
+const catalogModes = (catalogEvent?.catalog?.modes ?? []).map((mode) => mode.id);
+const configModes = (configEvent?.config?.modes ?? []).map((mode) => mode.id);
+check(
+  "session.config advertises exactly the catalog's modes (one capability source)",
+  catalogEvent !== undefined && configEvent !== undefined
+    && JSON.stringify(configModes) === JSON.stringify(catalogModes),
+  `catalog=${JSON.stringify(catalogModes)}, config=${JSON.stringify(configModes)}`,
+);
 
 // ---------------------------------------------------------------------------
 // Step 2: two concurrent opens for the same provider session id.

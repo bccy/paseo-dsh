@@ -53,7 +53,8 @@
  * @module dsh-paseo-bridge/image-host-path
  */
 
-import { copyFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { chmodSync, copyFileSync, constants, lstatSync, mkdirSync, renameSync, statSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, extname, join } from 'node:path';
 
@@ -76,16 +77,83 @@ const EXTENSION_BY_MEDIA_TYPE = new Map([
  * attachment store is content addressed and read-only to us, and a copy beside
  * it would be collected by nothing.
  *
- * Named per uid because `tmpdir()` is world-writable on Linux: a fixed name
- * there is a directory another local user can create first, then read (the
- * digests enumerate every picture this user has looked at) and write into. The
- * atomic rename below already stops a pre-placed symlink from being written
- * through; owning the directory stops the rest.
+ * The name carries the uid, but a uid-bearing name is only a hint, not
+ * ownership: `tmpdir()` is world-writable on Linux, so another local user can
+ * create this exact path first and then read (the digests enumerate every
+ * picture this user has looked at) and write into it. `ensureCopyDirectory()`
+ * below therefore verifies the object itself — real directory, owned by this
+ * uid, no group/other permissions — before anything is staged there.
  */
 const COPY_DIRECTORY = join(
   tmpdir(),
   `paseo-dsh-attachments-${typeof process.getuid === 'function' ? process.getuid() : 'user'}`,
 );
+
+/**
+ * Make sure the compatibility copy directory is a private directory this
+ * process owns.
+ *
+ * `mkdirSync({ recursive: true, mode: 0o700 })` is not a check: it silently
+ * accepts an existing directory (whatever its mode and owner) and a symlink to
+ * one. The three properties that make a copy cache safe are therefore asserted
+ * explicitly on every use:
+ *
+ *   - `lstatSync`, so a symlink is not mistaken for a directory;
+ *   - the owner is this uid (when the platform has one);
+ *   - no group/other permission bits. A directory we already own that is merely
+ *     too open is repaired to 0700; one we do not own is refused outright.
+ *
+ * A false answer means "do not use this cache"; the caller falls back to the
+ * store's own path, which is the module's contract for every failure.
+ *
+ * @returns {boolean} Whether staging into `COPY_DIRECTORY` is safe.
+ */
+function ensureCopyDirectory() {
+  let stats;
+  try {
+    try {
+      mkdirSync(COPY_DIRECTORY, { mode: 0o700 });
+    } catch (error) {
+      if (error.code !== 'EEXIST') return false;
+    }
+    stats = lstatSync(COPY_DIRECTORY);
+  } catch {
+    return false;
+  }
+  if (!stats.isDirectory()) return false;
+  if (typeof process.getuid === 'function' && stats.uid !== process.getuid()) return false;
+  if ((stats.mode & 0o077) !== 0) {
+    try {
+      chmodSync(COPY_DIRECTORY, 0o700);
+      stats = lstatSync(COPY_DIRECTORY);
+    } catch {
+      return false;
+    }
+    if ((stats.mode & 0o077) !== 0) return false;
+  }
+  return true;
+}
+
+/**
+ * Whether the existing target may be reused: a real regular file of the same
+ * size. `lstatSync` is the point — `statSync` followed a pre-placed symlink and
+ * served bytes from whatever it pointed at, including a same-size substitution.
+ * A non-regular target is not an answer; the caller replaces it via `rename`.
+ *
+ * @param {string} target - the deterministic copy path.
+ * @param {number} sourceSize - the store file's size.
+ * @returns {boolean}
+ */
+function reusableCopy(target, sourceSize) {
+  let existing;
+  try {
+    existing = lstatSync(target);
+  } catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  }
+  return existing.isFile() && existing.size === sourceSize;
+}
 
 /**
  * The extension one media type needs, or `undefined` when the host has no image
@@ -107,6 +175,11 @@ function extensionFor(mediaType) {
  * full disk is retried on the next event instead of being served truncated
  * forever.
  *
+ * The staging file must not be predictable: the old name (`<target>.<pid>.tmp`)
+ * let another local user pre-place a symlink there and `copyFileSync` followed
+ * it, overwriting an arbitrary same-permission file. A random name created with
+ * `COPYFILE_EXCL` fails instead of following anything already at that path.
+ *
  * Every failure is a `undefined` answer rather than a throw: this runs on the
  * event path, and the caller's contract is that a picture which cannot be made
  * renderable still delivers its tool result. The alternative — throwing — would
@@ -119,17 +192,17 @@ function extensionFor(mediaType) {
 function copyBeside(source, extension) {
   const name = basename(source);
   if (name === '') return undefined;
+  if (!ensureCopyDirectory()) return undefined;
   const target = join(COPY_DIRECTORY, `${name}${extension}`);
-  const staging = `${target}.${process.pid}.tmp`;
+  let staging;
   try {
-    // Reuse only a copy that is the same size as the source: a truncated one
-    // left by an interrupted write is not an answer, and neither is a foreign
-    // file that happens to sit at this name. (A same-size substitution would
-    // still pass; that is the residual, and hashing every hit would cost a full
-    // read on the hot path.)
+    // Reuse only a real regular file of the same size: a truncated copy left by
+    // an interrupted write is not an answer, and neither is a symlink or any
+    // other non-file placed at this name. (A same-size *regular* substitution by
+    // the same uid is outside the boundary; another user cannot reach a 0700
+    // directory owned by us.)
     const sourceSize = statSync(source).size;
-    if (sourceSize > 0 && existsSync(target) && statSync(target).size === sourceSize) return target;
-    mkdirSync(COPY_DIRECTORY, { recursive: true, mode: 0o700 });
+    if (sourceSize > 0 && reusableCopy(target, sourceSize)) return target;
     // Stage beside the target, then rename into place. `rename` is atomic within
     // one filesystem, and that is what makes the cache safe on both counts:
     //   - the daemon runs several sessions, and two of them can replay the same
@@ -138,16 +211,19 @@ function copyBeside(source, extension) {
     //   - a copy interrupted by a kill or a full disk would leave a *partial*
     //     file at `target`, and the size guard above would then serve that
     //     truncated image forever instead of retrying.
-    copyFileSync(source, staging);
+    staging = join(COPY_DIRECTORY, `.${name}${extension}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`);
+    copyFileSync(source, staging, constants.COPYFILE_EXCL);
     renameSync(staging, target);
     return target;
   } catch {
     // A leftover `.tmp` is untidy, never wrong — and the caller's answer below
     // is the store's own path either way.
-    try {
-      unlinkSync(staging);
-    } catch {
-      // Nothing staged, or nothing we can do about it.
+    if (staging !== undefined) {
+      try {
+        unlinkSync(staging);
+      } catch {
+        // Nothing staged, or nothing we can do about it.
+      }
     }
     return undefined;
   }

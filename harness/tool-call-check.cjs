@@ -70,7 +70,7 @@ const {
   toolLabel,
 } = require("./client/tool-call-data.js");
 const { diffStat } = require("./client/tokens.js");
-const { setLocale } = require("./client/locale.js");
+const { localeText, setLocale } = require("./client/locale.js");
 
 /**
  * Load a sibling harness module from wherever this check runs.
@@ -92,7 +92,14 @@ function requireHarnessModule(name) {
   throw new Error(`could not find harness/${name} above ${__dirname}`);
 }
 
-const { callArguments, mentions } = requireHarnessModule("source-shape.cjs");
+const {
+  attributeOf,
+  callArguments,
+  codeOnly,
+  elementsWithAttributes,
+  functionBody,
+  mentions,
+} = requireHarnessModule("source-shape.cjs");
 
 let passed = 0;
 let failed = 0;
@@ -257,13 +264,171 @@ console.log("status");
   equal("unknown status falls back to completed", weird.status, "completed");
 }
 
-console.log("limits");
+console.log("a failure carries its reason");
 {
-  const huge = toolCallData(
-    { name: "bash", status: "completed", detail: { type: "shell", command: "x", output: "y".repeat(7000) } },
+  // The daemon puts `error: { message }` on a failed tool_call
+  // (`server/timeline.ts`). It is the *only* copy of the reason for a tool whose
+  // detail carries what was requested instead of what went wrong (write/edit),
+  // and for a tool whose output was empty. The mapper used to accept `error`
+  // and never read it, so every failure was just a red icon: the block below
+  // showed the planned write, or nothing at all.
+  const reason = "AUDIT_ERROR_PERMISSION_DENIED";
+  const failedWrite = toolCallData(
+    {
+      name: "write",
+      status: "failed",
+      detail: { type: "write", filePath: "/x.txt", content: "REQUESTED" },
+      error: { message: reason },
+    },
     "complete",
   );
-  check("huge output is truncated", huge.body.includes("已截断") && huge.body.length < 7000);
+  equal("a failed write keeps its reason", failedWrite.error, reason);
+  equal("…while the block still shows what was requested", failedWrite.body, "REQUESTED");
+  check("…and the row now has something to expand", failedWrite.hasDetail === true);
+
+  const failedEdit = toolCallData(
+    {
+      name: "edit",
+      status: "failed",
+      detail: { type: "edit", filePath: "/x.ts", oldString: "a", newString: "b" },
+      error: { message: reason },
+    },
+    "complete",
+  );
+  equal("a failed edit keeps its reason", failedEdit.error, reason);
+
+  const refused = "connect ECONNREFUSED 127.0.0.1:9";
+  const failedMcp = toolCallData(
+    {
+      name: "mcp__paseo__list_hosts",
+      status: "failed",
+      detail: { type: "unknown", input: {} },
+      error: { message: refused },
+    },
+    "complete",
+  );
+  equal("a failed MCP call keeps its reason", failedMcp.error, refused);
+  equal("…even with no output half of its own", failedMcp.body, "");
+  check(
+    "…so the reason is the only content the expansion has",
+    failedMcp.hasDetail === true,
+  );
+
+  const failedShell = toolCallData(
+    {
+      name: "bash",
+      status: "failed",
+      detail: { type: "shell", command: "false", output: "line one\nline two" },
+      error: { message: "line one\nline two" },
+    },
+    "complete",
+  );
+  equal("a failed shell's reason is its output", failedShell.error, "line one\nline two");
+  check(
+    "multi-line reasons are kept whole",
+    // `?? ""` keeps the check reporting a missing field instead of throwing
+    // one: a crashed harness hides every assertion after it.
+    (failedShell.error ?? "").split("\n").length === 2,
+    JSON.stringify(failedShell.error),
+  );
+
+  const success = toolCallData(
+    { name: "mcp__paseo__list_hosts", status: "completed", detail: { type: "unknown", input: {} }, error: null },
+    "complete",
+  );
+  equal("a successful row has no reason", success.error, "");
+  check("…and gains no expansion for one", success.hasDetail === false);
+
+  const dirty = toolCallData(
+    {
+      name: "bash",
+      status: "completed",
+      detail: { type: "shell", command: "x", output: "" },
+      error: { message: "SHOULD_NOT_BE_READ" },
+    },
+    "complete",
+  );
+  equal("an error on a non-failed row is ignored", dirty.error, "");
+
+  // The reason lives on the top-level item, never in `detail`: reading it out of
+  // the payload would invent a carrier the protocol does not define.
+  const detailCarrier = toolCallData(
+    {
+      name: "write",
+      status: "completed",
+      detail: { type: "write", filePath: "/x.txt", content: "REQUESTED", error: { message: "WRONG_CARRIER" } },
+    },
+    "complete",
+  );
+  equal("the detail is not an error carrier", detailCarrier.error, "");
+
+  // Unreadable shapes fail closed — no made-up reason, no crash.
+  const malformed = [
+    ["a plain string", "just a message"],
+    ["a message that is not a string", { message: 42 }],
+    ["an empty object", {}],
+    ["null", null],
+  ];
+  for (const [shape, error] of malformed) {
+    const row = toolCallData(
+      { name: "bash", status: "failed", detail: { type: "shell", command: "x" }, error },
+      "complete",
+    );
+    equal(`an unreadable error (${shape}) yields no reason`, row.error, "");
+  }
+}
+
+console.log("limits");
+{
+  // DSH's TerminalBlock renders the whole output inside a 224px scroll window
+  // and copies the whole of it, so the terminal body must not be cut: the tail
+  // of a build log is usually where the failure is, and a cap would also
+  // shorten what the copy control hands the user.
+  const output = "y".repeat(7000);
+  const huge = toolCallData(
+    { name: "bash", status: "completed", detail: { type: "shell", command: "x", output } },
+    "complete",
+  );
+  equal("the terminal body is the whole output", huge.body, output);
+  check(
+    "…without a truncation marker",
+    !huge.body.includes(localeText().truncated),
+    huge.body.slice(-20),
+  );
+
+  // Every other block still renders into a code surface that has no scroll
+  // region of its own, so the cap stays — and it must not split an astral
+  // character in half (a lone high surrogate renders as `�`).
+  const marker = localeText().truncated;
+  const capped = toolCallData(
+    { name: "mcp__x__y", status: "completed", detail: { type: "unknown", input: {}, output: "z".repeat(7000) } },
+    "complete",
+  );
+  equal("other bodies are still capped", capped.body, `${"z".repeat(6000)}${marker}`);
+
+  const straddled = `${"a".repeat(5999)}\u{1F600}tail`;
+  const cut = toolCallData(
+    { name: "mcp__x__y", status: "completed", detail: { type: "unknown", input: {}, output: straddled } },
+    "complete",
+  );
+  equal(
+    "a cut inside a surrogate pair steps back to the pair boundary",
+    cut.body,
+    `${"a".repeat(5999)}${marker}`,
+  );
+  check("…so no lone surrogate is left in the body", !/[\uD800-\uDBFF]/.test(cut.body));
+
+  // The control: a pair that ends exactly at the cut is kept whole.
+  const aligned = `${"a".repeat(5998)}\u{1F600}tail`;
+  const kept = toolCallData(
+    { name: "mcp__x__y", status: "completed", detail: { type: "unknown", input: {}, output: aligned } },
+    "complete",
+  );
+  equal(
+    "a pair that lands on the boundary is kept",
+    kept.body,
+    `${"a".repeat(5998)}\u{1F600}${marker}`,
+  );
 }
 
 console.log("labels");
@@ -1479,6 +1644,65 @@ console.log("the renderer's schema and ToolCallData cannot drift apart");
     "the schema's field set matches ToolCallData exactly",
     [...schemaKeys].sort(),
     [...dataKeys].sort(),
+  );
+}
+
+console.log("the renderer reads the state the data layer now carries");
+{
+  // Two fixes end at the component, and a component that never reads its input
+  // is indistinguishable from a data layer that never produced it. This file
+  // imports React Native, so plain `node` cannot `require` it; the wiring is
+  // read out of the source while the data-layer sections above assert what the
+  // mapper produces. Comments are stripped first — a doc comment that names the
+  // field must not satisfy the check.
+  const sourcePath = findRepoFile("client/tool-call.tsx");
+  check("tool-call.tsx is readable", sourcePath !== undefined, `looked above ${__dirname}`);
+  const rendered = sourcePath === undefined ? "" : fs.readFileSync(sourcePath, "utf8");
+  // Comments are stripped **before** the body is located: the JSX reader's
+  // brace matcher does not skip comments, and a prose comment inside this
+  // component contains an apostrophe (`row's`), which it would take for the
+  // start of a string and run past the body. Stripping first removes the
+  // apostrophes and keeps the claim about code, not commentary.
+  const component = functionBody(codeOnly(rendered), "InlineToolCall") ?? "";
+  check("the row component was found", component.length > 0, "InlineToolCall body is missing");
+
+  // C1: the head shows why the call failed, in the summary slot DSH uses
+  // (`.errorSummary`), and the expansion carries the whole reason.
+  check("the row reads the failure reason", mentions(component, "error"), "no `error` read in the component");
+  const summaryElements = elementsWithAttributes(component, ["style", "numberOfLines"]);
+  check(
+    "the head's summary slot turns red for a failure",
+    summaryElements.some((element) => {
+      const style = attributeOf(element, "style").value;
+      return mentions(style, "summary") && mentions(style, "summaryError");
+    }),
+    summaryElements.map((element) => attributeOf(element, "style").value.trim()).join(" | "),
+  );
+  check(
+    "and the expansion draws the reason as its own text",
+    elementsWithAttributes(component, ["style"]).some((element) =>
+      mentions(attributeOf(element, "style").value, "errorText"),
+    ),
+    "no element styled with errorText",
+  );
+
+  // CT-02: the terminal card scrolls its output in DSH's capped window and
+  // hands the copy control the whole string rather than the visible part.
+  const terminalScroll = elementsWithAttributes(component, ["style", "contentContainerStyle"]).filter(
+    (element) => element.tag === "ScrollView" && mentions(attributeOf(element, "style").value, "terminalOutput"),
+  );
+  check(
+    "the terminal output sits in a capped scroll region",
+    terminalScroll.length === 1,
+    `${terminalScroll.length} matching ScrollView element(s)`,
+  );
+  const terminalCopy = elementsWithAttributes(component, ["text"]).filter(
+    (element) => element.tag === "CopyControl" && mentions(attributeOf(element, "text").value, "body"),
+  );
+  check(
+    "…and its copy control gets the whole output",
+    terminalCopy.length === 1,
+    `${terminalCopy.length} matching CopyControl element(s)`,
   );
 }
 

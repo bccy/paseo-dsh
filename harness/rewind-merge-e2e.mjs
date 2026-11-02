@@ -20,11 +20,22 @@
  * Usage: node harness/rewind-merge-e2e.mjs [--keep]
  * Requires a working `dsh` on PATH and the `paseo` profile. The session runs in
  * a temp directory that is removed afterwards unless `--keep` is given.
+ *
+ * Profile isolation: by default the probe clones the profile named by
+ * DSH_PASEO_PROFILE (default `paseo`) into a throwaway DSH_HOME, so the live
+ * `~/.dsh` is never written (sessions, journals and the merged snapshot journal
+ * all land in the copy). Pass `--allow-real-profile` to use the live home
+ * instead; an explicit `DSH_HOME=<dir>` is used as-is. The first output line
+ * names the mode.
  */
 import { spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+const require = createRequire(import.meta.url);
+const { announceDshHome, prepareDshHome } = require('./isolated-dsh-home.cjs');
 
 const keep = process.argv.includes('--keep');
 const root = mkdtempSync(join(tmpdir(), 'rewind-merge-e2e-'));
@@ -32,6 +43,15 @@ const PROFILE = process.env.DSH_PASEO_PROFILE ?? 'paseo';
 const sessionId = `rewind-merge-${Date.now()}`;
 const parentFile = join(root, 'parent-control.txt');
 const childFile = join(root, 'subagent-test.txt');
+
+let runMode;
+try {
+  runMode = prepareDshHome({ script: 'rewind-merge-e2e', profile: PROFILE });
+} catch (error) {
+  console.error(`rewind-merge-e2e: ${error.message}`);
+  process.exit(2);
+}
+announceDshHome(runMode);
 
 const child = spawn('dsh', ['--profile', PROFILE], {
   cwd: root,

@@ -15,12 +15,19 @@
  *   read and stored by content hash under the session's `objects/` directory. A
  *   missing file is recorded as `backup: null` (the rewind deletes it).
  * - After the tool succeeds, one line is appended to the session journal:
- *   `{anchorSeq, captureSeq, captureOrderVersion, callId, path, backup, mode}`.
- *   `anchorSeq` is the delegated turn's dispatch anchor or, for the root
- *   session, the newest human user message seq at execution time. `captureSeq`
- *   resumes the retained journal's high-water mark, so concurrent parent/child
- *   edits of one path restore the state before the *first* touch, not the first
- *   *commit*, and the order survives a restart.
+ *   `{anchorSeq, captureSeq, captureOrderVersion, callId, path, backup, mode,
+ *   dirPath, dirReal}`. `anchorSeq` is the delegated turn's dispatch anchor or,
+ *   for the root session, the newest human user message seq at execution time.
+ *   `captureSeq` resumes the retained journal's high-water mark, so concurrent
+ *   parent/child edits of one path restore the state before the *first* touch,
+ *   not the first *commit*, and the order survives a restart. Allocation is
+ *   serialized per path and happens after the bytes are read: the number ranks
+ *   the state that was actually observed, so a capture whose read is delayed
+ *   cannot outrank a later one that read the file first (BF-02).
+ * - A capture that cannot be taken (non-regular file, over the cap, an I/O
+ *   failure) commits a line carrying `skip` instead of `backup`. A rewind that
+ *   selects it cannot restore that path, so it reports the path as
+ *   `unrecoverable` instead of silently claiming the tree came back.
  *
  *   The order is only provable **per path**: a line written before this build
  *   carries no `captureOrderVersion`, and a process-local counter that restarted
@@ -44,7 +51,13 @@
  * Trust boundaries: the journal is local state, but a rewind writes and deletes
  * paths it names, so `readJournal` only accepts absolute paths and content
  * hashes, and `restore` refuses symlinks and non-regular files instead of
- * following them out of the workspace.
+ * following them out of the workspace. It also records the canonical identity
+ * (`dirPath`/`dirReal`) of the deepest directory that existed when the file was
+ * captured and re-checks it before writing: a parent directory that was moved
+ * and replaced by a symlink no longer matches, so the path is skipped instead
+ * of writing through the link into another tree. Journals written before that
+ * field existed carry no identity and keep the old leaf-only check — the
+ * recorded path is all they have to go on.
  *
  * Deliberately out of scope (documented): bash/pwsh side effects, edits made by
  * the user or another process, symlinked targets, and files above the size cap.
@@ -54,9 +67,9 @@
 
 import { createHash } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
-import { appendFile, chmod, copyFile, lstat, mkdir, readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, copyFile, lstat, mkdir, readdir, readFile, realpath, stat, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { basename, dirname, isAbsolute, join, resolve as resolvePath } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath, sep } from 'node:path';
 
 /**
  * Tools whose file mutations are checkpointed.
@@ -241,6 +254,30 @@ function objectKey(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
+/** One-line text for a caught value, without repeating the ternary everywhere. */
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** Serialise one journal entry, preserving every field the reader understands. */
+function journalLine(entry) {
+  return `${JSON.stringify({
+    anchorSeq: entry.anchorSeq,
+    ...(entry.captureSeq === undefined ? {} : { captureSeq: entry.captureSeq }),
+    ...(entry.captureOrderVersion === undefined ? {} : { captureOrderVersion: entry.captureOrderVersion }),
+    ...(entry.callId === undefined ? {} : { callId: entry.callId }),
+    path: entry.path,
+    ...(entry.skip === undefined
+      ? {
+          backup: entry.backup,
+          mode: entry.mode,
+          ...(entry.dirPath === undefined ? {} : { dirPath: entry.dirPath, dirReal: entry.dirReal }),
+        }
+      : { skip: entry.skip }),
+    time: new Date().toISOString(),
+  })}\n`;
+}
+
 /**
  * Write-ahead backups for one bridge process.
  *
@@ -250,6 +287,20 @@ function objectKey(bytes) {
 export class FileSnapshots {
   /** Tail of the serialised journal-write chain. */
   #writeQueue;
+
+  /**
+   * Path -> tail of the chain that serialises captures of that one path.
+   *
+   * Capture order has to rank the state each capture *observed*, and reading a
+   * file is asynchronous: two captures of one path must not interleave
+   * stat/read with sequence allocation, or an early number can carry a later
+   * read (the parent/child race behind BF-02). Serialising per path closes that
+   * window without serialising unrelated files or journal commits.
+   *
+   * Entries are deleted when the chain drains, so the map stays bounded by the
+   * captures currently in flight rather than by every path ever edited.
+   */
+  #pathQueues = new Map();
 
   /**
    * Monotonic capture order for journal entries.
@@ -306,6 +357,20 @@ export class FileSnapshots {
       () => undefined,
     );
     return run;
+  }
+
+  /** Run one capture of `path` after the previous capture of the same path. */
+  #serializeOnPath(path, task) {
+    const previous = this.#pathQueues.get(path) ?? Promise.resolve();
+    const run = previous.then(task, task);
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#pathQueues.set(path, tail);
+    return run.finally(() => {
+      if (this.#pathQueues.get(path) === tail) this.#pathQueues.delete(path);
+    });
   }
 
   /**
@@ -413,62 +478,191 @@ export class FileSnapshots {
   async capture(input) {
     const key = pendingKeyOf(input);
     try {
-      // Allocated first: the order has to be decided before the file is read,
-      // because two captures of one path must rank by when they *looked*, not
-      // when they managed to commit.
-      const captureSeq = await this.#nextCaptureSequence(input.sessionId);
-      let info;
-      try {
-        info = await stat(input.path);
-      } catch (error) {
-        if (error?.code === 'ENOENT') {
-          // The tool is about to create the file: the rewind deletes it.
-          this.pending.set(key, {
-            anchorSeq: input.anchorSeq,
-            captureSeq,
-            callId: input.callId,
-            path: input.path,
-            backup: null,
-            mode: null,
-          });
-          return { ok: true };
+      // Serialised per path, and the number is allocated *after* the bytes were
+      // read: two captures of one path must rank the state each actually
+      // observed. Allocating before the read let a delayed read carry an early
+      // number, so `planRestore` picked a pre-image that was newer than the one
+      // it claimed to restore (BF-02).
+      return await this.#serializeOnPath(input.path, async () => {
+        let info;
+        try {
+          info = await stat(input.path);
+        } catch (error) {
+          if (error?.code === 'ENOENT') {
+            // The tool is about to create the file: the rewind deletes it. The
+            // parent identity is recorded too, so the delete cannot be
+            // redirected through an ancestor symlink.
+            const captureSeq = await this.#nextCaptureSequence(input.sessionId);
+            this.pending.set(key, {
+              anchorSeq: input.anchorSeq,
+              captureSeq,
+              callId: input.callId,
+              path: input.path,
+              backup: null,
+              mode: null,
+              ...(await this.#captureIdentity(input.path)),
+            });
+            return { ok: true };
+          }
+          return await this.#recordSkippedCapture(key, input, `stat failed: ${errorMessage(error)}`);
         }
-        throw error;
-      }
-      if (!info.isFile()) {
-        this.pending.set(key, { skip: 'not-a-regular-file', path: input.path, captureSeq });
-        return { ok: true, skipped: 'not-a-regular-file' };
-      }
-      if (info.size > this.maxFileBytes) {
-        this.pending.set(key, { skip: `larger than ${this.maxFileBytes} bytes`, path: input.path, captureSeq });
-        return { ok: true, skipped: `larger than ${this.maxFileBytes} bytes` };
-      }
-      const bytes = await readFile(input.path);
-      const backup = objectKey(bytes);
-      const objects = this.objectsDir(input.sessionId);
-      await mkdir(objects, { recursive: true });
-      const target = join(objects, backup);
-      try {
-        await stat(target);
-      } catch {
-        await writeFile(target, bytes, { flag: 'wx' }).catch(async (error) => {
-          // A concurrent capture of identical content may have won the race.
-          if (error?.code !== 'EEXIST') throw error;
+        if (!info.isFile()) {
+          return await this.#recordSkippedCapture(key, input, 'not-a-regular-file');
+        }
+        if (info.size > this.maxFileBytes) {
+          return await this.#recordSkippedCapture(key, input, `larger than ${this.maxFileBytes} bytes`);
+        }
+        let bytes;
+        try {
+          bytes = await readFile(input.path);
+        } catch (error) {
+          return await this.#recordSkippedCapture(key, input, `read failed: ${errorMessage(error)}`);
+        }
+        const captureSeq = await this.#nextCaptureSequence(input.sessionId);
+        const backup = objectKey(bytes);
+        const objects = this.objectsDir(input.sessionId);
+        await mkdir(objects, { recursive: true });
+        const target = join(objects, backup);
+        try {
+          await stat(target);
+        } catch {
+          await writeFile(target, bytes, { flag: 'wx' }).catch(async (error) => {
+            // A concurrent capture of identical content may have won the race.
+            if (error?.code !== 'EEXIST') throw error;
+          });
+        }
+        this.pending.set(key, {
+          anchorSeq: input.anchorSeq,
+          captureSeq,
+          callId: input.callId,
+          path: input.path,
+          backup,
+          mode: info.mode & 0o777,
+          ...(await this.#captureIdentity(input.path)),
         });
-      }
-      this.pending.set(key, {
-        anchorSeq: input.anchorSeq,
-        captureSeq,
-        callId: input.callId,
-        path: input.path,
-        backup,
-        mode: info.mode & 0o777,
+        return { ok: true };
       });
-      return { ok: true };
     } catch (error) {
       this.pending.delete(key);
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      return { ok: false, error: errorMessage(error) };
     }
+  }
+
+  /**
+   * Remember a capture that could not be taken, so a later rewind can say so.
+   *
+   * The tool may still succeed and change the file; without a line in the
+   * journal the rewind would plan nothing for that path and report a clean
+   * success while the file stays modified (BF-03). `commit` turns this pending
+   * entry into a `skip` line only when the tool actually succeeded.
+   *
+   * @param {string} key
+   * @param {{sessionId: string, anchorSeq: number, callId: string, path: string}} input
+   * @param {string} reason
+   * @returns {Promise<{ok: true, skipped: string}>}
+   */
+  async #recordSkippedCapture(key, input, reason) {
+    const captureSeq = await this.#nextCaptureSequence(input.sessionId);
+    this.pending.set(key, {
+      anchorSeq: input.anchorSeq,
+      captureSeq,
+      callId: input.callId,
+      path: input.path,
+      skip: reason,
+    });
+    return { ok: true, skipped: reason };
+  }
+
+  /**
+   * The canonical identity of the deepest directory that exists above `path`.
+   *
+   * `path` itself may not exist yet (a creation), so the nearest existing
+   * ancestor is recorded. `dirPath` is the lexical path at capture time and
+   * `dirReal` its resolved canonical path; re-running this at restore and
+   * comparing both detects an ancestor that was moved or replaced by a symlink.
+   * Two different lexical paths can resolve to the same directory, which is why
+   * both halves are recorded.
+   *
+   * @param {string} path
+   * @returns {Promise<{dirPath: string, dirReal: string} | undefined>}
+   */
+  async #captureIdentity(path) {
+    let dir = dirname(path);
+    for (;;) {
+      try {
+        const real = await realpath(dir);
+        const info = await stat(dir);
+        if (!info.isDirectory()) return undefined;
+        return { dirPath: dir, dirReal: real };
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+        const parent = dirname(dir);
+        if (parent === dir) return undefined;
+        dir = parent;
+      }
+    }
+  }
+
+  /**
+   * Whether the path's directory identity no longer matches the captured one.
+   *
+   * The recorded anchor is the deepest directory that existed at capture time.
+   * It must still resolve to the same canonical path (`realpath(anchor) ===
+   * dirReal`), and no component that was created below it since then may be a
+   * symlink: the normal case is directories the tool created laying out a new
+   * file, which are real directories. A parent that was moved and replaced by a
+   * symlink fails the canonical comparison; a symlink inserted halfway down
+   * fails the component walk.
+   *
+   * Legacy lines carry no identity and return `false` (the leaf `lstat` check
+   * is all they support). A failure to resolve the identity counts as a
+   * mismatch: the restore cannot prove it would write the object it captured.
+   *
+   * @param {{path: string, dirPath?: string, dirReal?: string}} action
+   * @returns {Promise<boolean>}
+   */
+  async #pathIdentityChanged(action) {
+    if (action.dirPath === undefined || action.dirReal === undefined) return false;
+    try {
+      const real = await realpath(action.dirPath);
+      if (real !== action.dirReal) {
+        this.warn(
+          `file restore skipped: the parent directory of ${action.path} was moved or replaced since the file was captured`,
+        );
+        return true;
+      }
+      const info = await stat(action.dirPath);
+      if (!info.isDirectory()) {
+        this.warn(`file restore skipped: the captured parent of ${action.path} is no longer a directory`);
+        return true;
+      }
+      const parent = dirname(action.path);
+      const below = relative(action.dirPath, parent);
+      if (below !== '' && below !== '.' && !below.startsWith('..') && !isAbsolute(below)) {
+        let cursor = action.dirPath;
+        for (const part of below.split(sep)) {
+          if (part === '') continue;
+          cursor = join(cursor, part);
+          let entry;
+          try {
+            entry = await lstat(cursor);
+          } catch (error) {
+            if (error?.code === 'ENOENT') break; // the tool may create it later; mkdir does the rest
+            throw error;
+          }
+          if (!entry.isDirectory() || entry.isSymbolicLink()) {
+            this.warn(
+              `file restore skipped: a component below the captured parent of ${action.path} is not a real directory`,
+            );
+            return true;
+          }
+        }
+      }
+    } catch (error) {
+      this.warn(`file restore skipped: cannot verify the parent directory of ${action.path}: ${errorMessage(error)}`);
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -487,26 +681,22 @@ export class FileSnapshots {
     if (pending === undefined) return;
     if (result?.isError === true) return;
     if (pending.skip !== undefined) {
+      // The tool still succeeded, so the file may have changed. Keep the reason
+      // in the durable journal: a later rewind has to be able to report that it
+      // cannot restore this path (BF-03), and an in-memory log line would be
+      // gone by then.
       this.warn(`file snapshot skipped for ${String(pending.path ?? '')}: ${pending.skip}`);
-      return;
     }
     try {
       await this.#enqueue(async () => {
         await mkdir(this.sessionDir(input.sessionId), { recursive: true });
-        const line = `${JSON.stringify({
-          anchorSeq: pending.anchorSeq,
-          ...(typeof pending.captureSeq === 'number' ? { captureSeq: pending.captureSeq } : {}),
-          captureOrderVersion: CAPTURE_ORDER_VERSION,
-          callId: pending.callId,
-          path: pending.path,
-          backup: pending.backup,
-          mode: pending.mode,
-          time: new Date().toISOString(),
-        })}\n`;
+        // Every line this build writes carries the version marker, also when it
+        // is a `skip`: the capture order in it is comparable with this build's.
+        const line = journalLine({ ...pending, captureOrderVersion: CAPTURE_ORDER_VERSION });
         await appendFile(this.journalPath(input.sessionId), line, 'utf8');
       });
     } catch (error) {
-      this.warn(`could not record a file snapshot for ${input.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+      this.warn(`could not record a file snapshot for ${input.sessionId}: ${errorMessage(error)}`);
     }
   }
 
@@ -526,13 +716,14 @@ export class FileSnapshots {
    * Read one session's journal, skipping (and reporting) unusable lines.
    *
    * The journal is local state, but a rewind writes and deletes every path it
-   * names, so a line is only accepted when it is an absolute path and carries a
-   * content hash (or an explicit `null` for "did not exist"). Anything else — a
+   * names, so a line is only accepted when it is an absolute path and carries
+   * either a content hash (or an explicit `null` for "did not exist") or a
+   * `skip` reason recorded when no backup could be taken. Anything else — a
    * relative path, a traversal-prone `backup`, a truncated tail — is skipped and
    * counted, never acted on.
    *
    * @param {string} sessionId
-   * @returns {Promise<{entries: Array<{anchorSeq: number, captureSeq?: number, callId?: string, path: string, backup: string | null, mode?: number | null}>, skippedLines: number}>}
+   * @returns {Promise<{entries: Array<{anchorSeq: number, captureSeq?: number, callId?: string, path: string, backup?: string | null, mode?: number | null, skip?: string, dirPath?: string, dirReal?: string}>, skippedLines: number}>}
    */
   async readJournal(sessionId) {
     let text;
@@ -555,11 +746,23 @@ export class FileSnapshots {
       }
       const backupValid = parsed?.backup === null
         || (typeof parsed?.backup === 'string' && /^[0-9a-f]{64}$/.test(parsed.backup));
+      const skipValid = typeof parsed?.skip === 'string' && parsed.skip !== '';
+      // Exactly one of the two: a line is either a backup to restore or a
+      // recorded reason it could not be taken. A made-up shape is skipped, not
+      // guessed at.
+      const kindValid = backupValid !== skipValid;
+      const hasDirPath = parsed?.dirPath !== undefined;
+      const hasDirReal = parsed?.dirReal !== undefined;
+      const dirValid = hasDirPath === hasDirReal
+        && (!hasDirPath
+          || (typeof parsed.dirPath === 'string' && isAbsolute(parsed.dirPath)
+            && typeof parsed.dirReal === 'string' && isAbsolute(parsed.dirReal)));
       if (typeof parsed?.anchorSeq !== 'number'
         || !Number.isSafeInteger(parsed.anchorSeq) || parsed.anchorSeq < 0
         || typeof parsed?.path !== 'string'
         || !isAbsolute(parsed.path)
-        || !backupValid
+        || !kindValid
+        || !dirValid
         || (parsed.captureSeq !== undefined
           && (!Number.isSafeInteger(parsed.captureSeq) || parsed.captureSeq <= 0))) {
         skippedLines += 1;
@@ -573,8 +776,10 @@ export class FileSnapshots {
           : undefined,
         callId: typeof parsed.callId === 'string' ? parsed.callId : undefined,
         path: parsed.path,
-        backup: parsed.backup,
-        mode: typeof parsed.mode === 'number' ? parsed.mode : null,
+        ...(skipValid
+          ? { skip: parsed.skip }
+          : { backup: parsed.backup, mode: typeof parsed.mode === 'number' ? parsed.mode : null }),
+        ...(hasDirPath ? { dirPath: parsed.dirPath, dirReal: parsed.dirReal } : {}),
       });
     }
     return { entries, skippedLines };
@@ -590,9 +795,14 @@ export class FileSnapshots {
    * first-in-file behavior (they predate the sequence and are effectively
    * earlier than any numbered capture).
    *
+   * A path whose earliest post-target capture is a `skip` line cannot be
+   * restored to its true pre-target state; it is returned in `unrecoverable`
+   * (with the recorded reason) instead of `actions`, so the caller can tell the
+   * user rather than prune the only evidence away.
+   *
    * @param {string} sessionId
    * @param {number} targetSeq
-   * @returns {Promise<{actions: Array<{path: string, backup: string | null, mode: number | null}>, skippedLines: number}>}
+   * @returns {Promise<{actions: Array<{path: string, backup: string | null, mode: number | null, dirPath?: string, dirReal?: string}>, unrecoverable: Array<{path: string, reason: string}>, skippedLines: number}>}
    */
   async planRestore(sessionId, targetSeq) {
     // A tool that has settled may still have its journal line queued behind a
@@ -600,7 +810,7 @@ export class FileSnapshots {
     // restore and then prune its entry as if it had been handled.
     await this.settle();
     const { entries, skippedLines } = await this.readJournal(sessionId);
-    /** @type {Map<string, {path: string, backup: string | null, mode: number | null, rank: number}>} */
+    /** @type {Map<string, {path: string, backup?: string | null, mode?: number | null, skip?: string, dirPath?: string, dirReal?: string, rank: number}>} */
     const byPath = new Map();
     /** Per path, the distinct pre-images recorded by numbered (post-migration) lines. */
     const orderedPreimages = new Map();
@@ -609,12 +819,14 @@ export class FileSnapshots {
     for (const entry of entries) {
       if (entry.anchorSeq < targetSeq) continue;
       const identity = `${String(entry.backup)}:${String(entry.mode)}`;
-      if (entry.captureOrderVersion === CAPTURE_ORDER_VERSION) {
+      // `skip` lines carry no pre-image, so they cannot make an old journal's
+      // ordering ambiguous; only real backups participate in that judgement.
+      if (entry.captureOrderVersion === CAPTURE_ORDER_VERSION && entry.skip === undefined) {
         const images = orderedPreimages.get(entry.path) ?? new Set();
         images.add(identity);
         orderedPreimages.set(entry.path, images);
       }
-      if (entry.captureOrderVersion === undefined) {
+      if (entry.captureOrderVersion === undefined && entry.skip === undefined) {
         // A pre-migration line carries a number from a counter that started at 0
         // in every process, so within one path it is indistinguishable from a
         // valid reverse commit. Refuse to guess between different pre-images and
@@ -641,15 +853,31 @@ export class FileSnapshots {
       if (current !== undefined && current.rank <= rank) continue;
       byPath.set(entry.path, {
         path: entry.path,
-        backup: entry.backup,
-        mode: entry.mode ?? null,
+        ...(entry.skip === undefined
+          ? { backup: entry.backup, mode: entry.mode ?? null }
+          : { skip: entry.skip }),
+        ...(entry.dirPath === undefined ? {} : { dirPath: entry.dirPath, dirReal: entry.dirReal }),
         rank,
       });
     }
-    return {
-      actions: [...byPath.values()].map(({ path, backup, mode }) => ({ path, backup, mode })),
-      skippedLines,
-    };
+    const actions = [];
+    const unrecoverable = [];
+    for (const entry of byPath.values()) {
+      if (entry.skip !== undefined) {
+        // The earliest capture after the target could not be taken, so there is
+        // no pre-image that would be correct to write. Report it instead of
+        // restoring a later (wrong) one or silently succeeding (BF-03).
+        unrecoverable.push({ path: entry.path, reason: entry.skip });
+        continue;
+      }
+      actions.push({
+        path: entry.path,
+        backup: entry.backup,
+        mode: entry.mode,
+        ...(entry.dirPath === undefined ? {} : { dirPath: entry.dirPath, dirReal: entry.dirReal }),
+      });
+    }
+    return { actions, unrecoverable, skippedLines };
   }
 
   /**
@@ -660,17 +888,24 @@ export class FileSnapshots {
    *
    * A rewind must not be a way around the sandbox: a symlink or special file is
    * skipped, never followed, so a journal entry (or the tool path it recorded)
-   * cannot make the restore write through a link into something else.
+   * cannot make the restore write through a link into something else. When the
+   * journal recorded the parent's canonical identity, it is re-checked first: a
+   * parent that was moved and replaced by a symlink points at a different
+   * directory now, and the path is skipped instead of writing into it.
    *
    * @param {string} sessionId
-   * @param {Array<{path: string, backup: string | null, mode: number | null}>} actions
-   * @returns {Promise<{restored: string[], deleted: string[], skipped: string[], failed: Array<{path: string, error: string}>, rescue: string[], rescueDir: string}>}
+   * @param {Array<{path: string, backup: string | null, mode: number | null, dirPath?: string, dirReal?: string}>} actions
+   * @returns {Promise<{restored: string[], deleted: string[], skipped: string[], alreadyAbsent: string[], failed: Array<{path: string, error: string}>, rescue: string[], rescueDir: string}>}
    */
   async restore(sessionId, actions) {
     const rescueDir = this.rescueDir(sessionId);
-    const outcome = { restored: [], deleted: [], skipped: [], failed: [], rescue: [], rescueDir };
+    const outcome = { restored: [], deleted: [], skipped: [], alreadyAbsent: [], failed: [], rescue: [], rescueDir };
     for (const action of actions) {
       try {
+        if (await this.#pathIdentityChanged(action)) {
+          outcome.skipped.push(action.path);
+          continue;
+        }
         let info;
         try {
           info = await lstat(action.path);
@@ -687,7 +922,10 @@ export class FileSnapshots {
         const exists = info !== undefined;
         if (action.backup === null) {
           if (!exists) {
-            outcome.skipped.push(action.path);
+            // Nothing to delete: the file the tool was about to create never
+            // appeared, or was already removed. This is not a partial restore
+            // and must not be reported as one.
+            outcome.alreadyAbsent.push(action.path);
             continue;
           }
           outcome.rescue.push(await this.#rescue(rescueDir, action.path));
@@ -774,16 +1012,7 @@ export class FileSnapshots {
       const kept = entries.filter((entry) => entry.anchorSeq <= targetSeq);
       const dropped = entries.length - kept.length;
       if (dropped === 0) return { kept: kept.length, dropped: 0 };
-      const lines = kept.map((entry) => `${JSON.stringify({
-        anchorSeq: entry.anchorSeq,
-        ...(entry.captureSeq === undefined ? {} : { captureSeq: entry.captureSeq }),
-        ...(entry.captureOrderVersion === undefined ? {} : { captureOrderVersion: entry.captureOrderVersion }),
-        ...(entry.callId === undefined ? {} : { callId: entry.callId }),
-        path: entry.path,
-        backup: entry.backup,
-        mode: entry.mode,
-        time: new Date().toISOString(),
-      })}\n`).join('');
+      const lines = kept.map(journalLine).join('');
       await mkdir(this.sessionDir(sessionId), { recursive: true });
       await writeFile(this.journalPath(sessionId), lines, 'utf8');
       return { kept: kept.length, dropped };
@@ -832,16 +1061,7 @@ export class FileSnapshots {
       }
       const dropped = entries.length - kept.length;
       if (dropped === 0) return { dropped: 0, capped: false };
-      const lines = kept.map((entry) => `${JSON.stringify({
-        anchorSeq: entry.anchorSeq,
-        ...(entry.captureSeq === undefined ? {} : { captureSeq: entry.captureSeq }),
-        ...(entry.captureOrderVersion === undefined ? {} : { captureOrderVersion: entry.captureOrderVersion }),
-        ...(entry.callId === undefined ? {} : { callId: entry.callId }),
-        path: entry.path,
-        backup: entry.backup,
-        mode: entry.mode,
-        time: new Date().toISOString(),
-      })}\n`).join('');
+      const lines = kept.map(journalLine).join('');
       await mkdir(this.sessionDir(sessionId), { recursive: true });
       await writeFile(this.journalPath(sessionId), lines, 'utf8');
       return { dropped, capped };

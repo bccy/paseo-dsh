@@ -47,6 +47,10 @@ import { TextShimmer } from "./text-shimmer";
 import {
   BODY_INDENT,
   type TokenColors,
+  CARD_HEAD_GAP,
+  ROW_FONT_SIZE,
+  ROW_GAP,
+  ROW_LINE_HEIGHT,
   WEB_META_GAP,
   WEB_TRUNCATED_MARGIN_TOP,
   cardHeadActionsStyle,
@@ -102,6 +106,7 @@ import {
   searchSummaryTextStyle,
   separatorStyle,
   summaryTextStyle,
+  terminalOutputScrollStyle,
   webCardBodyStyle,
   webFetchStyle,
   webMetaTextStyle,
@@ -687,17 +692,35 @@ function buildStyles(colors: TokenColors, hairline: number) {
     label: rowLabelTextStyle(colors),
     sep: separatorStyle(colors),
     summary: summaryTextStyle(colors),
+    // A failed row puts its reason where the summary sits (DSH's
+    // `.errorSummary` does the same), so the reason reads before expanding.
+    summaryError: { color: colors.statusDanger },
     statAdded: diffStatTextStyle(colors, "added"),
     statRemoved: diffStatTextStyle(colors, "removed"),
-    body: { marginLeft: BODY_INDENT },
+    body: { marginLeft: BODY_INDENT, gap: ROW_GAP },
+    // The whole failure reason inside the expansion, selectable and red.
+    errorText: {
+      color: colors.statusDanger,
+      fontSize: ROW_FONT_SIZE,
+      lineHeight: ROW_LINE_HEIGHT,
+    },
     // RN has no hairline in a plain object; `StyleSheet.hairlineWidth` is the
     // device's own (0.5 at 1x/2x), which is what DSH's `.5px` means here.
     card: cardStyle(colors, hairline),
     divider: dividerStyle(colors, hairline),
     command: commandRegionStyle(),
-    commandText: commandTextStyle(colors),
+    // The command and its copy control share the banner line; the command
+    // takes the remaining width so the control never wraps off the card.
+    commandRow: {
+      flexDirection: "row" as const,
+      alignItems: "flex-start" as const,
+      gap: CARD_HEAD_GAP,
+    },
+    commandText: { ...commandTextStyle(colors), flex: 1, minWidth: 0 },
     output: outputRegionStyle(),
     outputText: outputTextStyle(colors),
+    // DSH's TerminalBlock output window (`.output` inside `.terminalBody`).
+    terminalOutput: terminalOutputScrollStyle(),
     code: codeRegionStyle(),
     codeText: codeTextStyle(colors),
     diffLine: diffRowStyle(),
@@ -790,9 +813,17 @@ export function InlineToolCall({
   // The row is a Pressable, so promising an expansion that never renders left a
   // button which did nothing when pressed.
   const canExpand = data.hasDetail;
+  // A failure's reason, in the head's second half: DSH shows it there
+  // (`.errorSummary`) instead of the normal summary, because the block below
+  // may carry what was *requested* (a write's content, an edit's diff) rather
+  // than what went wrong. The head is one line, so only the first line of the
+  // reason fits; the expansion carries the whole text.
+  const errorLine = data.error === "" ? "" : data.error.split("\n")[0];
+  const errorHeadline = data.failed && errorLine !== "";
+  const headSummary = errorHeadline ? errorLine : data.summary;
   // Once expanded the block carries the subject in full, so a row whose title
   // *is* that subject does not repeat a compact copy of it above.
-  const showSummary = data.summary !== "" && !(expanded && !data.titled && data.headline !== "");
+  const showSummary = headSummary !== "" && !(expanded && !data.titled && data.headline !== "");
   const compact = layout.compact;
   // Icon size is Paseo's own (and was settled in an earlier round); everything
   // else in the row now comes from the shared token table.
@@ -809,6 +840,10 @@ export function InlineToolCall({
   // the data layer computes from the detail's own type — the old guess (no diff
   // and no code flag and an "output" caption) only worked by accident.
   const terminal = data.kind === "terminal";
+  // The expanded reason, unless the body already says it: a failed shell's body
+  // *is* the failing output (`error.message` is built from the same string), so
+  // repeating it in the card would read as two separate failures.
+  const errorBlock = data.error !== "" && !data.body.includes(data.error) ? data.error : "";
   const colors = theme.colors;
   // The leading icon is the row's only state signal: red when the call failed,
   // green when an edit completed, muted otherwise. The label and the summary stay
@@ -820,7 +855,7 @@ export function InlineToolCall({
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={`${data.label} ${data.summary}`}
+      accessibilityLabel={`${data.label} ${headSummary}`}
       onPress={() => {
         if (canExpand) setExpanded((value) => !value);
       }}
@@ -864,10 +899,14 @@ export function InlineToolCall({
                       between the title and its summary. */}
                   <View style={styles.sep} />
                   <Text
-                    style={[styles.summary, color === null ? null : { color }]}
+                    style={[
+                      styles.summary,
+                      errorHeadline ? styles.summaryError : null,
+                      color === null ? null : { color },
+                    ]}
                     numberOfLines={1}
                   >
-                    {data.summary}
+                    {headSummary}
                   </Text>
                 </>
               ) : null}
@@ -892,6 +931,15 @@ export function InlineToolCall({
       </View>
       {expanded && canExpand ? (
         <View style={styles.body}>
+          {/* The whole failure reason first, selectable: a failed `write` or
+              `edit` keeps only what it *would* have written in its block, so
+              this is where the error text itself is readable. It is skipped
+              when the block already prints the same text (see `errorBlock`). */}
+          {errorBlock !== "" ? (
+            <Text style={styles.errorText} selectable>
+              {errorBlock}
+            </Text>
+          ) : null}
           {/* One card per expanded block, the way DSH's TerminalBlock, DiffBlock
               and ReadBlock all are: same radius, same hairline, same surface.
               `data.kind` picks it; a block whose meta did not parse has no
@@ -904,17 +952,34 @@ export function InlineToolCall({
                   command that has printed nothing yet draws no divider, the
                   same as DSH's banner-only terminal card. */}
               <View style={styles.command}>
-                <Text style={styles.commandText} selectable>
-                  {data.headline}
-                </Text>
+                <View style={styles.commandRow}>
+                  <Text style={styles.commandText} selectable>
+                    {data.headline}
+                  </Text>
+                  {/* DSH's TerminalBlock copies the whole output — not the
+                      visible window — and hides the control while the command
+                      is still printing or has produced nothing but blank lines
+                      (`!running && !empty`). */}
+                  {hasBody && data.status !== "running" && data.body.trim() !== "" ? (
+                    <CopyControl text={data.body} style={styles.cardHeadAction} />
+                  ) : null}
+                </View>
               </View>
               {hasBody ? <View style={styles.divider} /> : null}
               {hasBody ? (
-                <View style={styles.output}>
+                // DSH renders every line inside a capped scroll region
+                // (`.output` with `max-height: var(--dsl-terminal-output-max-height)`
+                // and `overflow-y: auto`), so a long log scrolls in place
+                // instead of being cut off or pushing the timeline down.
+                <ScrollView
+                  style={styles.terminalOutput}
+                  contentContainerStyle={styles.output}
+                  nestedScrollEnabled
+                >
                   <Text style={styles.outputText} selectable>
                     {data.body}
                   </Text>
-                </View>
+                </ScrollView>
               ) : null}
             </View>
           ) : data.search !== null ? (

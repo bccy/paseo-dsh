@@ -39,7 +39,7 @@
  * `DSH_HOME`, so no profile, model or daemon is touched)
  */
 import { createRequire } from "node:module";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -275,6 +275,136 @@ console.log("frames are routed by session id, never broadcast");
       await routed.waitForExit(3000);
     } catch {
       /* the fake bridge exits on `shutdown`; a failure here must not mask the assertions */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// A close that lands while a prompt is waiting for its session must not turn
+// into close -> prompt on the wire.
+//
+// `prompt()` waits for `#ensureSessionReady()` before it writes `session/prompt`,
+// while `closeSession()` detaches the session synchronously and then sends
+// `session/close`. When the close falls inside that wait (a slow initialize, or
+// the prompt self-heal re-initializing a route the bridge recycled), the old
+// order was close -> prompt. The bridge deliberately keeps `initializedSessions`
+// for a closed id so a resumed session can use it, so the prompt passes its gate
+// and `getOrCreateSession` rebuilds the agent — a ghost turn with no owner left
+// to close it. The guard belongs immediately before the send, where nothing
+// yields: after that point a later close can only produce prompt -> close,
+// which is the safe order.
+//
+// The window is made with the fake bridge's `initialize` hold, not a sleep: the
+// check waits for the hold's marker file, then issues the prompt and the close
+// while `attachSession` is still inside that one await.
+console.log("\na close during the prompt's preparation cannot send a prompt after it");
+{
+  const { DshProcess } = require(join(buildDir, "server", "dsh-process.js"));
+  const raceSession = `close-race-${Date.now()}`;
+  const controlSession = `close-race-control-${Date.now()}`;
+  const holdReady = join(process.env.DSH_HOME, "close-race.ready");
+  const holdRelease = join(process.env.DSH_HOME, "close-race.release");
+  const raceLog = join(process.env.DSH_HOME, "close-race.frames.jsonl");
+  process.env.DSH_FAKE_MODE = "live";
+  process.env.DSH_FAKE_HOLD_METHOD = "initialize";
+  process.env.DSH_FAKE_HOLD_SESSION = raceSession;
+  process.env.DSH_FAKE_HOLD_READY = holdReady;
+  process.env.DSH_FAKE_HOLD_RELEASE = holdRelease;
+  process.env.DSH_FAKE_LOG = raceLog;
+  const logs = [];
+  const race = new DshProcess({
+    sessionId: "placeholder-not-a-session",
+    cwd: process.cwd(),
+    route: { provider: "fake", model: "fake" },
+    onEvent: () => {},
+    onStatus: () => {},
+    onQuestion: async () => ({ answers: [] }),
+    onLog: (line) => logs.push(line),
+    onExit: () => {},
+    onProtocolError: () => {},
+  });
+  try {
+    // Start first: the process-level initialize is not the one held (it carries
+    // no session id), so only the one gate this check needs is slowed down.
+    await race.start();
+    const handlers = () => ({
+      onEvent: () => {},
+      onStatus: () => {},
+      onQuestion: async () => ({ answers: [] }),
+      onExit: () => {},
+    });
+    const attach = race.attachSession(raceSession, handlers());
+    const deadline = Date.now() + 10000;
+    while (!existsSync(holdReady) && Date.now() < deadline) await sleep(20);
+    check(
+      "the prompt preparation window was entered (positive control)",
+      existsSync(holdReady),
+      existsSync(holdReady) ? "initialize is held" : `logs: ${logs.slice(0, 3).join(" | ") || "(none)"}`,
+    );
+
+    // These two are issued in this order while attachSession is still awaiting
+    // the held initialize. `prompt` must share that same `#readyTasks` promise.
+    const promptOutcome = race.prompt(raceSession, "hello").then(
+      (value) => ({ status: "resolved", value }),
+      (error) => ({ status: "rejected", message: error instanceof Error ? error.message : String(error) }),
+    );
+    const closeOutcome = race.closeSession(raceSession).then(
+      (value) => ({ status: "resolved", value }),
+      (error) => ({ status: "rejected", message: error instanceof Error ? error.message : String(error) }),
+    );
+    writeFileSync(holdRelease, "go");
+    const [, promptResult] = await Promise.allSettled([attach, promptOutcome, closeOutcome]);
+
+    const frames = existsSync(raceLog)
+      ? readFileSync(raceLog, "utf8")
+        .split("\n")
+        .filter((line) => line.trim() !== "")
+        .map((line) => JSON.parse(line))
+      : [];
+    const raceFrames = frames.filter((frame) => frame.params?.sessionId === raceSession);
+    const methods = raceFrames.map((frame) => frame.method);
+    check(
+      "the close reaches the bridge before any prompt for the closed session",
+      methods.includes("session/close"),
+      methods.join(", ") || "(no frames)",
+    );
+    check(
+      "…and no session/prompt for that session is sent after it was closed",
+      !methods.includes("session/prompt"),
+      methods.join(", ") || "(no frames)",
+    );
+    check(
+      "…the prompt fails loudly instead of recreating the closed session",
+      promptResult.status === "fulfilled"
+        && promptResult.value.status === "rejected"
+        && /closed/i.test(promptResult.value.message),
+      JSON.stringify(promptResult),
+    );
+
+    // The positive control: the same process still serves a session that was
+    // not closed, so the guard cannot be "reject every prompt".
+    await race.attachSession(controlSession, handlers());
+    const control = await race.prompt(controlSession, "still there?");
+    check(
+      "a prompt for a session that was not closed still works",
+      typeof control.messageId === "string",
+      JSON.stringify(control),
+    );
+  } catch (error) {
+    failed += 1;
+    console.log(`  FAIL  the close/prompt race section could not run  — ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    delete process.env.DSH_FAKE_HOLD_METHOD;
+    delete process.env.DSH_FAKE_HOLD_SESSION;
+    delete process.env.DSH_FAKE_HOLD_READY;
+    delete process.env.DSH_FAKE_HOLD_RELEASE;
+    delete process.env.DSH_FAKE_LOG;
+    process.env.DSH_FAKE_MODE = "multi";
+    try {
+      race.kill();
+      await race.waitForExit(3000);
+    } catch {
+      /* the fake bridge may already be gone; a failure here must not mask the assertions */
     }
   }
 }

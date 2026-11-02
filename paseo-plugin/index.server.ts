@@ -12,6 +12,10 @@ import { createDshProvider, readAgentJobs } from "./server/provider";
  * bundle it carries (see server/bootstrap.ts). Provisioning is best-effort —
  * a filesystem failure is logged and the provider still registers, so the
  * failure surfaces as an honest error when a session tries to start `dsh`.
+ * The log must say the profile is **not** ready in that case: a provisioning
+ * failure is a different state from "profile ready", and a message that does
+ * not name it leaves a half-written or stale bridge looking like a working
+ * install.
  *
  * The jobs RPC exists because the pill lives in the app's client bundle and the
  * jobs live in a DSH child process: the client cannot reach `ctx.jobs`, and the
@@ -29,7 +33,10 @@ export default function contribute(server: PluginServerContext) {
     );
   } catch (error) {
     process.stderr.write(
-      `[dsh-paseo] could not provision the DSH profile: ${error instanceof Error ? error.message : String(error)}\n`,
+      `[dsh-paseo] DSH profile is NOT ready: provisioning failed: `
+        + `${error instanceof Error ? error.message : String(error)}. `
+        + "The provider is still registered; the previous bridge generation (if any) stays in place, "
+        + "and sessions fail if it cannot serve this plugin build\n",
     );
   }
 

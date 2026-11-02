@@ -1325,9 +1325,10 @@ function rebuildRewindInPlace(source) {
  * throw it off.
  *
  * @param {string} source - file on disk.
- * @returns {{start: number, end: number, indent: string} | null} the region to
- *   overwrite (from just after the `});` line to the start of the closing `}`
- *   line), its indentation, or null when the shape is not there.
+ * @returns {{start: number, end: number, indent: string, foreign: string | null} | null}
+ *   the region to overwrite (from just after the `});` line to the start of the
+ *   closing `}` line), its indentation, and the first line outside this patch's
+ *   own inserted block (`foreign`), or null when the shape is not there.
  */
 function locateRewindCallRegion(source) {
   const signature = /^([ \t]*)async revert\(messageId, scope\)[ \t]*\{[ \t]*\r?$/mu.exec(source);
@@ -1351,7 +1352,62 @@ function locateRewindCallRegion(source) {
   // Everything up to the line that holds the method's closing brace.
   const end = source.lastIndexOf("\n", close) + 1;
   if (end < start) return null;
-  return { start, end, indent };
+  return { start, end, indent, foreign: foreignTextAroundPatchCall(source.slice(start, end), indent) };
+}
+
+/**
+ * The first line of a `revert()` tail region that this patch does not own.
+ *
+ * The stale-rebuild path replaces everything between the `bridge.revert({…});`
+ * line and `revert()`'s closing brace with a fresh CALL. If an upstream release
+ * or another local patch left statements in that span, that replacement would
+ * delete them — silently, and the result would still parse. The old boundary
+ * was exactly this whole span, which is how L1 (2026-10-31) was found.
+ *
+ * The only content this patch may own there is its own inserted block: the
+ * marker comment, any further comment lines, and one `if (…) { … }` statement
+ * whose closing brace is the last non-blank line. An older CALL body may word
+ * itself differently, so ownership is established by the marker and the block
+ * shape, not by exact text. An empty (or comment-only) region is also ours —
+ * a CALL that was deleted is exactly what the stale rebuild exists to restore.
+ *
+ * @param {string} region - bytes between the `});` line and the method's `}` line.
+ * @param {string} indent - the `await` line's indentation, i.e. the CALL's own.
+ * @returns {string | null} a short excerpt of the first foreign line, or null
+ *   when the region is exactly the patch-owned block.
+ */
+function foreignTextAroundPatchCall(region, indent) {
+  const lines = region.replace(/\r\n/gu, "\n").split("\n");
+  let index = 0;
+  while (index < lines.length && lines[index].trim() === "") index += 1;
+  if (index >= lines.length) return null; // empty region: a deleted CALL is rebuildable
+
+  const first = lines[index].trim();
+  if (!first.startsWith("//") || !lines[index].includes(MARKER)) {
+    return truncateForLog(lines[index]);
+  }
+
+  // Comments are ours; anything else before the `if` is not.
+  while (index < lines.length && lines[index].trim().startsWith("//")) index += 1;
+  while (index < lines.length && lines[index].trim() === "") index += 1;
+  if (index >= lines.length) return null; // only the marker comments remain
+
+  if (!lines[index].startsWith(`${indent}if (`)) return truncateForLog(lines[index]);
+
+  const offset = lines.slice(0, index).reduce((total, line) => total + line.length + 1, 0);
+  const brace = lines[index].indexOf("{");
+  if (brace === -1) return truncateForLog(lines[index]);
+  const close = matchClosingBrace(lines.join("\n"), offset + brace);
+  if (close === -1) return truncateForLog(lines[index]);
+  const rest = lines.join("\n").slice(close + 1);
+  const after = rest.split("\n").find((line) => line.trim() !== "");
+  return after === undefined ? null : truncateForLog(after);
+}
+
+/** One line, trimmed and bounded, for a warning that names what would be lost. */
+function truncateForLog(line) {
+  const text = String(line ?? "").trim();
+  return text.length > 120 ? `${text.slice(0, 117)}...` : text;
 }
 
 /**
@@ -1384,6 +1440,26 @@ function rebuildRewindCall(source, unit, crlf) {
       extra: { patchBody: "stale", staleDetail: "revert() body not locatable" },
     });
     process.stdout.write("[rewind-patch] rewind: stale-patch-call-unlocatable (file untouched)\n");
+    return null;
+  }
+  if (region.foreign !== null) {
+    // Fail closed: replacing the whole span would delete whatever else lives
+    // there. The old body still works (only the second rewind is affected), so
+    // leaving the file byte-identical is strictly better than a silent delete.
+    process.stderr.write(
+      "[rewind-patch] WARNING: the stale rewind patch cannot be rebuilt safely — revert() contains\n"
+      + `  content outside this patch's own inserted block: ${region.foreign}\n`
+      + "  Replacing that span would delete it, so nothing was written.\n"
+      + "  Reinstall @getpaseo/cli (to get a clean file) and re-run this script.\n",
+    );
+    succeed({
+      reason: "stale-patch-call-region-foreign",
+      targetMd5: md5(readFileSync(TARGET, "utf8")),
+      message: "撤回补丁体是旧版，但 revert() 里本补丁插入块之外还有其它语句，已保持原文件不动（避免误删）。"
+        + "重装 @getpaseo/cli 后重跑本脚本即可修复。",
+      extra: { patchBody: "stale", staleDetail: `foreign content in revert() tail: ${region.foreign}` },
+    });
+    process.stdout.write("[rewind-patch] rewind: stale-patch-call-region-foreign (file untouched)\n");
     return null;
   }
   return {
@@ -2664,35 +2740,54 @@ function main() {
  * replaces "run apply and see".
  */
 function checkBothTargets() {
-  const describe = (label, file, marker, expected) => {
-    if (!existsSync(file)) {
-      return { label, ok: false, detail: `target missing: ${file}` };
+  // The same two runtime gates `applyRewindPatch()` runs before it writes
+  // anything. `--check` used to answer from marker counts alone, so on an
+  // upstream that renamed `this.timelineSnapshots` (or adopted the #7675
+  // history object) it printed "NOT patched" — i.e. "run apply to fix it" — for
+  // a file apply is guaranteed to refuse. That is the silent degradation this
+  // mode exists to expose: a check that cannot say "this will not apply".
+  const rewindGate = (source) => {
+    const historyShape = upstreamHistoryObjectShape(source);
+    if (historyShape !== null) {
+      return `upstream-history-shape-changed — found \`${historyShape}\`; apply will refuse (nothing was written)`;
     }
-    const source = readFileSync(file, "utf8");
-    const markers = countOccurrences(source, marker);
-    if (markers === expected) {
-      return { label, ok: true, detail: `patched (${String(markers)}/${String(expected)} markers, md5 ${md5(source)})` };
+    const hostFields = hostFieldShapes(source);
+    if (!hostFields.ok) {
+      return `host-fields-changed — ${hostFields.field} is missing ${hostFields.missing.map((shape) => `\`${shape}\``).join(", ")}; apply will refuse (nothing was written)`;
     }
-    if (markers === 0) {
-      return { label, ok: false, detail: `NOT patched (0/${String(expected)} markers, md5 ${md5(source)})` };
-    }
-    return {
-      label,
-      ok: false,
-      detail: `HALF-PATCHED (${String(markers)}/${String(expected)} markers, md5 ${md5(source)}) — restore from backup`,
-    };
+    return null;
   };
 
-  // Every target that can have a stale body gets the same second question.
-  // Checking markers alone reports "patched" for a file whose body is older than
-  // this script — the exact false green this mode exists to prevent.  Both
-  // targets are structurally identical here, so they are handled identically;
-  // leaving one of them on marker-count-only was an asymmetry that made
-  // `--check` and `check-rewind-patch.mjs` disagree about the same file.
-  const withBodyCheck = (label, file, marker, staleness) => {
-    const base = describe(label, file, marker, 2);
-    if (!base.ok) return base;
-    const stale = staleness(readFileSync(file, "utf8"));
+  /**
+   * One target's verdict. `sourceGate` is only meaningful on a clean file (on a
+   * patched one the injected body itself contains the shapes the gate looks for,
+   * exactly as in `applyRewindPatch()`).
+   */
+  const checkTarget = (label, file, marker, staleness, sourceGate) => {
+    if (!existsSync(file)) return { label, ok: false, detail: `target missing: ${file}` };
+    const source = readFileSync(file, "utf8");
+    const markers = countOccurrences(source, marker);
+    // #7675 is about `PluginAgentSession.history` in plugin-provider.js, so it
+    // runs on both rewind paths — and only for that target, never agent-manager.
+    if (label === "rewind") {
+      const historyShape = upstreamHistoryObjectShape(source);
+      if (historyShape !== null) {
+        return { label, ok: false, detail: `upstream-history-shape-changed — found \`${historyShape}\`; apply will refuse (nothing was written)` };
+      }
+    }
+    if (markers === 0) {
+      const gate = sourceGate?.(source);
+      return { label, ok: false, detail: gate ?? `NOT patched (0/2 markers, md5 ${md5(source)})` };
+    }
+    if (markers !== 2) {
+      return {
+        label,
+        ok: false,
+        detail: `HALF-PATCHED (${String(markers)}/2 markers, md5 ${md5(source)}) — restore from backup`,
+      };
+    }
+    const stale = staleness(source);
+    const base = { label, ok: true, detail: `patched (2/2 markers, md5 ${md5(source)})` };
     if (stale.current === true) return { ...base, detail: `${base.detail}, body current` };
     // `current: null` would mean "this target has no body check". No target is in
     // that state any more (both now compare their injected body), but the
@@ -2711,13 +2806,13 @@ function checkBothTargets() {
     return {
       label,
       ok: false,
-      detail: `STALE PATCH BODY (${stale.detail}; md5 ${md5(readFileSync(file, "utf8"))}) — re-run without --check to rebuild`,
+      detail: `STALE PATCH BODY (${stale.detail}; md5 ${md5(source)}) — re-run without --check to rebuild`,
     };
   };
 
   const results = [
-    withBodyCheck("rewind", TARGET, MARKER, rewindPatchStaleness),
-    withBodyCheck("turnId", TURNID_TARGET, TURNID_MARKER, turnIdStaleness),
+    checkTarget("rewind", TARGET, MARKER, rewindPatchStaleness, rewindGate),
+    checkTarget("turnId", TURNID_TARGET, TURNID_MARKER, turnIdStaleness, undefined),
   ];
   for (const result of results) {
     process.stdout.write(`[rewind-patch] ${result.label}: ${result.ok ? "OK" : "FAILED"} — ${result.detail}\n`);
@@ -2745,10 +2840,12 @@ export {
   countOccurrences,
   detectIndentUnit,
   detectUpstreamSelfFix,
+  hostFieldShapes,
   matchAll,
   md5,
   rewindPatchStaleness,
   turnIdStaleness,
+  upstreamHistoryObjectShape,
 };
 
 // Only run when invoked as a script — `check-rewind-patch.mjs` imports the

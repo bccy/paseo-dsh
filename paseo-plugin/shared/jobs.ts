@@ -26,6 +26,28 @@ export const JOB_STATUSES = ["running", "stopping", "completed", "killed", "fail
 export type JobStatus = (typeof JOB_STATUSES)[number];
 
 /**
+ * The machine-readable codes a `jobs.list` error may carry.
+ *
+ * Added for the 2026-11-02 audit's CJ-04: the old contract's `error` had only a
+ * message, so the client could not tell "the read failed, ask again" from "this
+ * profile's bridge predates the method, retrying cannot help". `bridge_too_old`
+ * and `registry_missing` are **terminal** — the user's next step is to rewrite
+ * the embedded bridge or fix the profile — while `rpc_failed` is transient and
+ * keeps its backoff. The list is the single source both halves read, so a code
+ * the client treats as terminal cannot drift from the code the server sends.
+ */
+export const JOB_ERROR_CODES = ["bridge_too_old", "registry_missing", "rpc_failed"] as const;
+
+/** One machine-readable `jobs.list` error code. */
+export type JobErrorCode = (typeof JOB_ERROR_CODES)[number];
+
+/** The subset of error codes that retrying cannot fix. */
+export const TERMINAL_JOB_ERROR_CODES = [
+  "bridge_too_old",
+  "registry_missing",
+] as const satisfies readonly JobErrorCode[];
+
+/**
  * The statuses that mean "this job is still doing work".
  *
  * Typed as the literal tuple rather than `readonly string[]`: with the wider
@@ -146,6 +168,10 @@ export type Job = z.infer<typeof jobSchema>;
  * - **`false`** is reserved for "we could not read the registry", and always
  *   carries a message. The pill stays visible and prints it; collapsing the two
  *   would present an unreadable registry as a quiet "no background jobs".
+ *
+ * When `available` is false, `error.code` tells the client whether another poll
+ * can help. It is optional so an older server half keeps working: a missing
+ * code is treated as transient, never as terminal.
  */
 export const jobsList = defineRpc({
   name: "jobs.list",
@@ -153,6 +179,11 @@ export const jobsList = defineRpc({
   output: z.object({
     available: z.boolean(),
     jobs: z.array(jobSchema),
-    error: z.object({ message: z.string() }).optional(),
+    error: z
+      .object({
+        message: z.string(),
+        code: z.enum(JOB_ERROR_CODES).optional(),
+      })
+      .optional(),
   }),
 });

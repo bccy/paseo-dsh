@@ -49,6 +49,14 @@ let sessionDownOnList = false;
 let notificationRejections = 0;
 /** `/malformed` answers its first `tools/list` with a protocol-illegal frame. */
 let malformedServed = false;
+/**
+ * Whether a `/delayed` request socket closed before its response was written:
+ * the observable proof that cancelling a call actually aborts the HTTP request
+ * rather than merely abandoning the promise.
+ */
+let delayedClosedEarly = false;
+/** Handshakes `/slow-init` served, so a cancelled caller is not buying a redo. */
+let slowInitHandshakes = 0;
 
 /** One page of the three-page `/paged` catalog, keyed by the cursor that names it. */
 const PAGED_TOOLS = {
@@ -199,6 +207,54 @@ const server = createServer((req, res) => {
       setTimeout(() => respond(res, { jsonrpc: '2.0', id: 1, result: {} }, { sse: false }), 5_000);
       return;
     }
+    // A request that answers late enough for the caller to cancel while it is in
+    // flight. `res.on('close')` before the timer fires is the wire-level proof
+    // that the request was aborted rather than abandoned.
+    if (req.url === '/delayed') {
+      const message = JSON.parse(raw);
+      let replied = false;
+      const timer = setTimeout(() => {
+        replied = true;
+        respond(res, { jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: 'delayed' }] } }, { sse: false });
+      }, 600);
+      res.on('close', () => {
+        if (!replied) {
+          delayedClosedEarly = true;
+          clearTimeout(timer);
+        }
+      });
+      return;
+    }
+    // A handshake slow enough that one caller can cancel while it is in flight.
+    // The handshake is per-client shared state: the cancelled caller must reject
+    // without cancelling the shared work other callers depend on.
+    if (req.url === '/slow-init') {
+      const message = JSON.parse(raw);
+      seen.push({ message, headers: req.headers, url: req.url });
+      if (message.method === 'initialize') {
+        slowInitHandshakes += 1;
+        setTimeout(() => respond(res, {
+          jsonrpc: '2.0',
+          id: message.id,
+          result: { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'slow', version: '1' } },
+        }), 300);
+        return;
+      }
+      if (message.method === 'notifications/initialized') {
+        respondNotification(res, message);
+        return;
+      }
+      if (message.method === 'tools/list') {
+        respond(res, {
+          jsonrpc: '2.0',
+          id: message.id,
+          result: { tools: [{ name: 'echo', description: 'Echo the text', inputSchema: { type: 'object' } }] },
+        });
+        return;
+      }
+      respond(res, { jsonrpc: '2.0', id: message.id, error: { code: -32601, message: `unknown method ${message.method}` } }, { sse: false });
+      return;
+    }
     // ── servers that can lose a session, or 404 for another reason ────────────
     // A stateful server forgets every session when it restarts, and then answers
     // any request still carrying the old id with the spec's HTTP 404. `dropSessions()`
@@ -342,6 +398,14 @@ const server = createServer((req, res) => {
         respond(res, { jsonrpc: '2.0', id: message.id, error: { code: -32000, message: 'tool exploded' } }, { sse: false });
         return;
       }
+      if (message.params?.name === 'delayed') {
+        setTimeout(() => respond(res, {
+          jsonrpc: '2.0',
+          id: message.id,
+          result: { content: [{ type: 'text', text: 'delayed' }] },
+        }, { sse: false }), 600);
+        return;
+      }
       respond(res, {
         jsonrpc: '2.0',
         id: message.id,
@@ -449,6 +513,76 @@ try {
   const timedOut = await (async () => { try { await mcpRequest({ url: `${base}/slow`, method: 'tools/list', id: 3, timeoutMs: 120 }); return null; } catch (error) { return error; } })();
   check('a slow server times out with the budget named', /timed out after 120ms/.test(timedOut?.message ?? ''), timedOut?.message);
 
+  // ── caller cancellation must reach the wire ────────────────────────────────
+  // DSH's tool contract requires every asynchronous tool to observe or forward
+  // `exec.signal`. The transport used to own only its internal timeout, so a
+  // cancelled turn left the MCP call running and even delivered a late success.
+  // Cancellation and timeout are different outcomes and must stay distinguishable
+  // in the message — a caller has to be able to tell "I gave up" from "the server
+  // was too slow".
+  const preAborted = new AbortController();
+  preAborted.abort();
+  const preCancelled = await attempt(() => mcpRequest({ url: `${base}/rpc`, method: 'tools/call', id: 90, signal: preAborted.signal }));
+  check(
+    'an already-cancelled request is refused as a cancellation and never sent',
+    preCancelled instanceof Error
+      && /canceled before the request was sent/.test(preCancelled.message)
+      && !seen.some((entry) => entry.message.id === 90),
+    preCancelled instanceof Error ? preCancelled.message : JSON.stringify(preCancelled),
+  );
+
+  const inFlight = new AbortController();
+  const inFlightOutcomePromise = attempt(() => mcpRequest({ url: `${base}/delayed`, method: 'tools/call', id: 91, signal: inFlight.signal, timeoutMs: 5_000 }));
+  setTimeout(() => inFlight.abort(), 40);
+  const inFlightOutcome = await inFlightOutcomePromise;
+  // The server observes the reset on its own event loop; give the close event a
+  // moment to arrive before asserting on it.
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  check(
+    'cancelling an in-flight request rejects as a cancellation, not a timeout',
+    inFlightOutcome instanceof Error && /canceled/.test(inFlightOutcome.message) && !/timed out/.test(inFlightOutcome.message),
+    inFlightOutcome instanceof Error ? inFlightOutcome.message : JSON.stringify(inFlightOutcome),
+  );
+  check(
+    'and the HTTP request really is aborted (the server sees the socket close early)',
+    delayedClosedEarly === true,
+    `delayedClosedEarly=${delayedClosedEarly}`,
+  );
+
+  const cancelClient = new McpHttpClient({ url: `${base}/rpc` });
+  await cancelClient.listTools();
+  const callAbort = new AbortController();
+  const cancelledCall = attempt(() => cancelClient.callTool('delayed', {}, { signal: callAbort.signal }));
+  setTimeout(() => callAbort.abort(), 40);
+  const cancelledCallOutcome = await cancelledCall;
+  const afterCancelledCall = await attempt(() => cancelClient.callTool('echo', { text: 'after-cancel' }));
+  check(
+    'a cancelled tools/call rejects as a cancellation and the client stays usable',
+    cancelledCallOutcome instanceof Error
+      && /canceled/.test(cancelledCallOutcome.message)
+      && afterCancelledCall?.content?.[0]?.text === 'echo:after-cancel',
+    `cancelled=${cancelledCallOutcome instanceof Error ? cancelledCallOutcome.message : JSON.stringify(cancelledCallOutcome)} after=${JSON.stringify(afterCancelledCall).slice(0, 120)}`,
+  );
+
+  // The handshake is per-client shared state. One caller giving up while it is in
+  // flight must not cancel the handshake every other caller (and every later call)
+  // depends on; the shared work has to finish, only this caller's wait rejects.
+  const slowClient = new McpHttpClient({ url: `${base}/slow-init` });
+  const handshakeAbort = new AbortController();
+  const cancelledHandshake = attempt(() => slowClient.listTools({ signal: handshakeAbort.signal }));
+  setTimeout(() => handshakeAbort.abort(), 40);
+  const cancelledHandshakeOutcome = await cancelledHandshake;
+  const recoveredHandshake = await attempt(() => slowClient.listTools());
+  check(
+    'cancelling one caller during the handshake does not poison the shared handshake',
+    cancelledHandshakeOutcome instanceof Error
+      && /canceled/.test(cancelledHandshakeOutcome.message)
+      && Array.isArray(recoveredHandshake) && recoveredHandshake.length === 1
+      && slowInitHandshakes === 1,
+    `cancelled=${cancelledHandshakeOutcome instanceof Error ? cancelledHandshakeOutcome.message : JSON.stringify(cancelledHandshakeOutcome)} `
+      + `recovered=${JSON.stringify(recoveredHandshake).slice(0, 120)} handshakes=${slowInitHandshakes}`,
+  );
+
   // ── a notification must not be sent as a request ───────────────────────────
   // JSON-RPC 2.0 draws one line the handshake depends on: a *request* carries an
   // `id`, a *notification* does not. Sending `notifications/initialized` with an
@@ -541,8 +675,8 @@ try {
   check('an MCP tool error becomes a thrown error', /tool exploded/.test(boom?.message ?? ''), boom?.message);
 
   await client.listTools();
-  check('the handshake runs once per client', initializeCount === 3, `initialize count: ${initializeCount} (1 direct + 1 shape client + 1 client)`);
-  const statelessList = seen.findLast((entry) => entry.message.method === 'tools/list');
+  check('the handshake runs once per client', initializeCount === 4, `initialize count: ${initializeCount} (1 direct + 3 /rpc clients)`);
+  const statelessList = seen.findLast((entry) => entry.url === '/rpc' && entry.message.method === 'tools/list');
   check('a stateless server needs no session header', statelessList.headers['mcp-session-id'] === undefined, String(statelessList.headers['mcp-session-id']));
 
 
@@ -633,10 +767,10 @@ try {
   }
   check(
     'each client sends initialized exactly once, after its handshake',
-    notificationsByPath.get('/rpc') === 5
+    notificationsByPath.get('/rpc') === 6
       && notificationsByPath.get('/stateful') === 1
       && notificationsByPath.get('/notify-shape') === 1,
-    `per path: ${JSON.stringify([...notificationsByPath])} (5 /rpc clients, 1 /stateful client, 1 direct)`,
+    `per path: ${JSON.stringify([...notificationsByPath])} (6 /rpc clients, 1 /stateful client, 1 direct)`,
   );
 
   // ── a lost session heals, and a known-dead connection never answers ────────

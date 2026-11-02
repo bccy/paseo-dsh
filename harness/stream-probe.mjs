@@ -10,17 +10,37 @@
  *
  * Usage: node harness/stream-probe.mjs ["prompt text"]
  *
+ * Profile isolation: by default the probe clones the profile named by
+ * DSH_PASEO_PROFILE (default `paseo`) into a throwaway DSH_HOME, so the live
+ * `~/.dsh` is never written. Pass `--allow-real-profile` to use the live home
+ * instead; an explicit `DSH_HOME=<dir>` is used as-is. The first output line
+ * names the mode.
+ *
  * It asserts:
  *   1. several `paseo/assistant-delta` frames arrive before the durable message
  *   2. the snapshots grow monotonically and the last one covers the durable text
  *   3. the first snapshot arrives well before the durable one (not one lump)
  */
 import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const { announceDshHome, prepareDshHome } = require("./isolated-dsh-home.cjs");
 
 const PROFILE = process.env.DSH_PASEO_PROFILE ?? "paseo";
+const positional = process.argv.slice(2).filter((arg) => !arg.startsWith("--"));
 const PROMPT =
-  process.argv[2] ??
+  positional[0] ??
   "Explain how a hash table handles collisions, in about 150 words. Do not use any tools.";
+
+let runMode;
+try {
+  runMode = prepareDshHome({ script: "stream-probe", profile: PROFILE });
+} catch (error) {
+  console.error(`stream-probe: ${error.message}`);
+  process.exit(2);
+}
+announceDshHome(runMode);
 
 const child = spawn("dsh", ["--profile", PROFILE], {
   cwd: process.cwd(),

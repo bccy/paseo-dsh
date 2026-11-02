@@ -86,8 +86,25 @@ jobs:
             # 开/关事务：假 dsh + 一次性 DSH_HOME，不碰 profile/daemon/token。
             # 它把插件编译到 paseo-plugin/.dbg-t6，驱动真实 provider 的 open 事务。
             node harness/concurrent-open-check.mjs
-            # 不在这里：mcp-gateway-transport-check / mcp-gateway-guard-check 从本机 DSH 安装目录
-            # 加载 schemastery 与 dsh-tools，runner 上没有 DSH，跑了只会 ERR_MODULE_NOT_FOUND。
+            # 2026-11-02 轮新增：都只用假 dsh / 一次性 DSH_HOME / 临时夹具，
+            # 不依赖本机 DSH 安装，也不需要 profile、daemon 或 token。
+            node harness/bootstrap-check.mjs
+            node harness/bridge-entry-check.mjs
+            node harness/catalog-cache-check.mjs
+            node harness/open-degrade-check.mjs
+            node harness/session-state-check.cjs
+            node harness/harness-gates-check.mjs
+            node harness/local-patches-check.mjs
+            # jobs 状态机自带 tsconfig（@getpaseo/plugin 的 paths 映射），先单独
+            # 编译到 .dbg-poll，再把检查脚本放进去跑（它 require 相对路径的产物）。
+            ( cd paseo-plugin && npx tsc -p ../harness/jobs-poll.tsconfig.json )
+            echo '{"type":"commonjs"}' > paseo-plugin/.dbg-poll/package.json
+            cp harness/jobs-poll-check.cjs paseo-plugin/.dbg-poll/
+            ( cd paseo-plugin/.dbg-poll && node jobs-poll-check.cjs )
+            # 不在这里：mcp-gateway-transport-check / mcp-gateway-guard-check /
+            # mcp-gateway-call-check 从本机 DSH 安装目录加载 schemastery 与
+            # dsh-tools，runner 上没有 DSH，跑了只会 ERR_MODULE_NOT_FOUND；
+            # jobs-popover-check 需要把 HOST_APP 指向一份 Paseo 检出。
 
             git push origin main
             echo "Merged upstream ${upstream_sha} into main."
@@ -111,11 +128,24 @@ jobs:
                 "# 其余离线回归与 CI 的门保持一致：" \
                 "for s in archived-lineage-check image-host-path-check paseo-system-envelope-check revert-check \\" \
                 "         surface-check file-snapshot-check snapshot-lifecycle-check file-mutation-gate-check \\" \
+                "         rewind-merge-check mcp-http-check doctor-check probe-check \\" \
                 "         plugin-build-check frame-reader-check; do" \
                 "  node \"harness/\$s.mjs\" || exit 1" \
                 "done" \
                 "node harness/replay-turn-check.cjs" \
                 "node harness/concurrent-open-check.mjs" \
+                "# 2026-11-02 轮新增的纯离线门：" \
+                "node harness/bootstrap-check.mjs" \
+                "node harness/bridge-entry-check.mjs" \
+                "node harness/catalog-cache-check.mjs" \
+                "node harness/open-degrade-check.mjs" \
+                "node harness/session-state-check.cjs" \
+                "node harness/harness-gates-check.mjs" \
+                "node harness/local-patches-check.mjs" \
+                "( cd paseo-plugin && npx tsc -p ../harness/jobs-poll.tsconfig.json )" \
+                "echo '{\"type\":\"commonjs\"}' > paseo-plugin/.dbg-poll/package.json" \
+                "cp harness/jobs-poll-check.cjs paseo-plugin/.dbg-poll/" \
+                "( cd paseo-plugin/.dbg-poll && node jobs-poll-check.cjs )" \
                 "git push origin main" \
                 '```' \
                 "" \

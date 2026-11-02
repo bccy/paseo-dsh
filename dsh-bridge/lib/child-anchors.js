@@ -7,14 +7,19 @@
  * anchor to an older message, becoming impossible to revert. A subagent started
  * by an earlier, still-visible message must keep running.
  *
- * The anchor is the root session's newest human-message seq at the moment the
- * child's own turn starts:
+ * The anchor is the root human message that dispatched the child's current
+ * turn. It is not always "the root's newest message at this instant": a
+ * grandchild starts while its own parent (a child) is still running a turn that
+ * was dispatched by an older root message, and the root may have received
+ * unrelated messages since. The anchor is therefore inherited from the direct
+ * dispatcher's recorded turn:
  *
- * - a fresh delegation: that message is the turn whose `subagent` tool call
- *   created the child;
- * - a continuable child resumed with `send_message`: that message is the turn
- *   whose instruction the child is now running (the anchor is refreshed on every
- *   `turn/start`).
+ * - a fresh delegation: the dispatcher is the root, and the root's newest human
+ *   message is the turn whose `subagent` tool call created the child;
+ * - a continuable child resumed with `send_message`: the message that resumed it
+ *   starts a new turn and refreshes the child's own anchor;
+ * - a grandchild: it inherits exactly the anchor its direct parent is running
+ *   under, never the root's latest unrelated message.
  *
  * Anchors are scoped by ROOT session. One bridge process serves many Paseo
  * sessions, so a child's anchor seq is only meaningful against the root that
@@ -69,6 +74,44 @@ export class ChildAnchors {
    */
   anchorFor(childId) {
     return this.#byChild.get(String(childId))?.anchorSeq;
+  }
+
+  /**
+   * Record a delegated session's new turn from its direct dispatcher.
+   *
+   * The root is consulted only when the direct parent **is** the root: that is
+   * the turn currently running the delegation, so its newest human message is
+   * the dispatch source. A grandchild inherits its parent child's recorded
+   * anchor, which is the only value that names the turn the parent is executing;
+   * falling back to the root's latest message here is exactly the bug that let a
+   * rewind cancel a grandchild belonging to an older instruction (BR-03).
+   *
+   * Fail-open: an unresolved lineage or an unobserved dispatcher anchor records
+   * nothing and returns the reason. A guessed anchor kills work the user kept.
+   *
+   * @param {unknown} childId
+   * @param {{parentId?: unknown, rootId?: unknown, latestRootAnchor?: number}} input
+   * @returns {{anchorSeq: number} | {reason: string}}
+   */
+  recordDelegatedTurn(childId, input) {
+    const { parentId, rootId, latestRootAnchor } = input ?? {};
+    if (parentId === undefined || parentId === null || rootId === undefined || rootId === null) {
+      return { reason: 'lineage-unresolved' };
+    }
+    const parent = String(parentId);
+    const root = String(rootId);
+    let anchorSeq;
+    if (parent === root) {
+      if (!Number.isSafeInteger(latestRootAnchor) || latestRootAnchor < 0) {
+        return { reason: 'no-root-human-message' };
+      }
+      anchorSeq = latestRootAnchor;
+    } else {
+      anchorSeq = this.anchorFor(parent);
+      if (anchorSeq === undefined) return { reason: 'dispatcher-anchor-unknown' };
+    }
+    this.record(childId, anchorSeq, root);
+    return { anchorSeq };
   }
 
   /**

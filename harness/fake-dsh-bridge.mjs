@@ -21,6 +21,15 @@
  *            terminal, and a live child with the same shape that the bridge
  *            announces during the open, so the two can be told apart
  *   error    answer `paseo/subagents` with `available: false` and an error
+ *   history-error
+ *            reject `paseo/history` (transport failure, not `available:false`)
+ *            so an unreadable replay must become a user-visible notice
+ *   preset-reject
+ *            advertise presets but have `paseo/config/set` keep the old one,
+ *            the silent refusal shape the plugin must report
+ *   plan-error
+ *            reject `paseo/plan/set` so the open-time mode reconciliation
+ *            failure has a visible path
  *   steer    hold one root turn open while a foreground child runs, so a steer
  *            sent into that turn can be judged against the turn id the daemon
  *            bound at prompt time; the running status is emitted *before* the
@@ -80,7 +89,13 @@
  * handles for Paseo's "Import session"; `paseo/revert` — the rewind receipt
  * (`{kind:"success", text}`), where a `token.messageId` of `revert-unknown`
  * fails the way the real bridge fails an unresolvable target (a JSON-RPC error
- * the plugin surfaces as `request.failed`).
+ * the plugin surfaces as `request.failed`). Other tokens answer the file-half
+ * shapes the real bridge sends on a partial rewind: `revert-plan-failed` (the
+ * restore plan failed; `files.error`, empty `rescueDir`), `revert-skipped-only`
+ * (`files.skipped` names the only unrestored path), `revert-unrecoverable-only`
+ * (a capture could not be taken; the path appears in `skipped` and its reason in
+ * `unrecoverable`) and `revert-already-absent` (the only planned delete was
+ * already gone — a complete rewind with nothing to report).
  *
  * ## The per-session `initialize` gate
  *
@@ -782,7 +797,12 @@ async function handle(method, params, id) {
         defaultProvider: "fake",
         defaultModel: "fake",
         defaultReasoningEffort: null,
-        planMode: false,
+        // The `plan-error` scenario models a profile that *advertises* Plan and
+        // then fails to apply it. It has to advertise it: the session only
+        // reconciles a mode the catalog offers, so with `planMode: false` the
+        // plan/set rejection would be unreachable and the notice this scenario
+        // exists to assert could never be emitted.
+        planMode: mode() === "plan-error",
       };
     case "paseo/commands": {
       // A child this bridge is *hosting* right now is announced during the open
@@ -826,6 +846,21 @@ async function handle(method, params, id) {
     case "paseo/permission/set":
       return { current: typeof params?.preset === "string" ? params.preset : null };
     case "paseo/presets":
+      // `preset-reject` advertises real preset choices but `paseo/config/set`
+      // answers with a different current preset, which is what DSH does when it
+      // refuses a stale/disabled preset id: the request does not throw, the
+      // applied value simply stays the old one.
+      if (mode() === "preset-reject") {
+        return {
+          available: true,
+          presets: [
+            { id: "default-pet", name: "Default preset" },
+            { id: "chosen-pet", name: "Chosen preset" },
+          ],
+          current: "default-pet",
+          default: "default-pet",
+        };
+      }
       return { available: false, presets: [], current: null, default: null };
     case "paseo/usage":
       return { available: false };
@@ -873,6 +908,83 @@ async function handle(method, params, id) {
       const token = params === undefined || params === null ? undefined : params.token;
       const messageId = token !== null && typeof token === "object" ? token.messageId : undefined;
       if (messageId === "revert-unknown") throw new Error("撤回目标无法解析：该消息不在会话表面上");
+      if (messageId === "revert-plan-failed") {
+        // The bridge's post-durability failure shape: no per-path outcome, no
+        // rescue copy, and a message that already names the cause and the
+        // journal. `session-request-check.cjs` asserts the provider shows it
+        // verbatim instead of the "content was copied to the rescue directory"
+        // sentence, which would be a lie for this shape.
+        return {
+          kind: "success",
+          text: "Withdrawn seq 3 and everything after it",
+          files: {
+            restored: [],
+            deleted: [],
+            skipped: [],
+            failed: [],
+            rescue: [],
+            rescueDir: "",
+            error: "PLAN-FAILED: journal unreadable (/fake/session/journal.jsonl)",
+          },
+        };
+      }
+      if (messageId === "revert-skipped-only") {
+        // A restore-phase skip: the response is a success receipt whose only
+        // unrestored path is in `skipped` (the target became a symlink/directory
+        // or its parent changed). Without the provider's widened condition this
+        // produced the plain success notice.
+        return {
+          kind: "success",
+          text: "Withdrawn seq 3 and everything after it",
+          files: {
+            restored: [],
+            deleted: [],
+            skipped: ["/work/link.txt"],
+            unrecoverable: [],
+            failed: [],
+            rescue: [],
+            rescueDir: "/work/rescue",
+          },
+        };
+      }
+      if (messageId === "revert-unrecoverable-only") {
+        // A capture that could not be taken: the bridge folds the path into
+        // `skipped` for older consumers AND reports the reason in
+        // `unrecoverable`. The provider must name the reason once, not repeat the
+        // path as a generic skip.
+        return {
+          kind: "success",
+          text: "Withdrawn seq 3 and everything after it",
+          files: {
+            restored: [],
+            deleted: [],
+            skipped: ["/work/big.bin"],
+            unrecoverable: [{ path: "/work/big.bin", reason: "larger than 8388608 bytes" }],
+            failed: [],
+            rescue: [],
+            rescueDir: "/work/rescue",
+          },
+        };
+      }
+      if (messageId === "revert-already-absent") {
+        // The benign shape: the only planned action was deleting a file that was
+        // already gone, so the rewind is complete and nothing should be reported
+        // as unrestored.
+        return {
+          kind: "success",
+          text: "Withdrawn seq 3 and everything after it",
+          files: {
+            restored: [],
+            deleted: [],
+            skipped: [],
+            unrecoverable: [],
+            alreadyAbsent: ["/work/gone.txt"],
+            failed: [],
+            rescue: [],
+            rescueDir: "/work/rescue",
+          },
+        };
+      }
       return { kind: "success", text: "Withdrawn seq 3 and everything after it" };
     }
     case "paseo/subagents":
@@ -923,6 +1035,10 @@ async function handle(method, params, id) {
       };
     case "paseo/history": {
       const sid = String(params?.sessionId ?? "");
+      // The transport failure shape of `paseo/history`: the request rejects
+      // instead of answering `{available:false}`. A reopened session must still
+      // say why its conversation is blank (`harness/open-degrade-check.mjs`).
+      if (mode() === "history-error") throw new Error("paseo/history transport failed: simulated timeout");
       if (sid.startsWith("killed-root-")) {
         // A root whose process was killed with a tool in flight: the log stops
         // after `tool/call`, with no `tool/result` and no `turn/end`. Those rows
@@ -1128,6 +1244,7 @@ async function handle(method, params, id) {
     case "paseo/plan/get":
       return { available: false, active: false, pending: false };
     case "paseo/plan/set":
+      if (mode() === "plan-error") throw new Error("paseo/plan/set exploded: simulated unavailable service");
       return { available: false, active: false, pending: false, outcome: "queued" };
     /**
      * Per-session MCP mount.
@@ -1181,6 +1298,12 @@ async function handle(method, params, id) {
       return { closed: had };
     }
     case "paseo/config/set":
+      if (mode() === "preset-reject") {
+        // The requested preset is refused without an error reply: the runtime
+        // keeps the old preset, exactly the silent shape the plugin must notice
+        // by reading `paseo/presets` afterwards.
+        return { provider: "fake", model: "fake", reasoningEffort: null, preset: "default-pet" };
+      }
       return { provider: "fake", model: "fake", reasoningEffort: null, preset: null };
     case "shutdown":
       if (cancelTicker !== null) clearInterval(cancelTicker);

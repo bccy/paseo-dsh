@@ -135,7 +135,7 @@ class FakeProcess {
   }
 }
 processModule.DshProcess = FakeProcess;
-const { DshSession } = require(path.join(compiled, "server/session.js"));
+const { DshSession, modes: advertisedModes } = require(path.join(compiled, "server/session.js"));
 
 /**
  * 一段两个回合的 DSH 历史。
@@ -224,6 +224,7 @@ function applyPaseoTurnRule(events) {
     env: {},
     route: { provider: "fixture", model: "alpha" },
     mode: "build",
+    modes: advertisedModes(),
     models: [{ id: "fixture/alpha" }],
     thinkingOptions: [],
     emit: (e) => events.push(e),
@@ -341,6 +342,7 @@ function applyPaseoTurnRule(events) {
       env: {},
       route: { provider: "fixture", model: "alpha" },
       mode: "build",
+      modes: advertisedModes(),
       models: [{ id: "fixture/alpha" }],
       thinkingOptions: [],
       emit: (e) => phantomEvents.push(e),
@@ -458,6 +460,7 @@ function applyPaseoTurnRule(events) {
       env: {},
       route: { provider: "fixture", model: "alpha" },
       mode: "build",
+      modes: advertisedModes(),
       models: [{ id: "fixture/alpha" }],
       thinkingOptions: [],
       emit: (e) => envelopeEvents.push(e),

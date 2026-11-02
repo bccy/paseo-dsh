@@ -37,7 +37,7 @@ createInterface({input:process.stdin}).on('line',line=>{
 `, { mode: 0o700 });
 const build = require('./plugin-build.cjs').resolvePluginBuild(process.argv[2], '.dbg-p003-permission');
 const { DshProcess } = require(join(build, 'server/dsh-process.js'));
-const { DshSession } = require(join(build, 'server/session.js'));
+const { DshSession, modes: advertisedModes } = require(join(build, 'server/session.js'));
 const { createRequire } = require('node:module');
 const { ProviderEventSchema } = createRequire(join(build, 'index.server.js'))('@getpaseo/plugin/server/provider');
 const events = [], sessions = [];
@@ -50,7 +50,7 @@ async function until(fn) {
   throw new Error('permission test timed out');
 }
 async function open(id,permission=true) {
-  const session = new DshSession({ sessionId:id,cwd:home,env:{},route,mode:'build',models:[],
+  const session = new DshSession({ sessionId:id,cwd:home,env:{},route,mode:'build',modes:advertisedModes(),models:[],
     thinkingOptions:[],subsession:false,permission,emit:e=>{ProviderEventSchema.parse(e);events.push(e);},log(){},
     acquireProcess:async()=>({process:transport,reused:true}),releaseProcess(){} });
   sessions.push(session);await session.open();return session;

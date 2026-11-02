@@ -20,6 +20,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import type { JobErrorCode } from "../shared/jobs";
 import { profileName } from "./bootstrap";
 import { createFrameReader, splitFrames, type FrameReader } from "./frame-reader";
 
@@ -224,7 +225,12 @@ export interface DshJob {
 export interface DshJobs {
   available: boolean;
   jobs?: DshJob[];
-  error?: { message?: string };
+  /**
+   * Why the registry could not be read. `code` is the machine-readable half the
+   * pill acts on: `bridge_too_old` / `registry_missing` stop its timer, while a
+   * missing code or `rpc_failed` keeps the normal retry with backoff.
+   */
+  error?: { message?: string; code?: JobErrorCode };
 }
 
 /**
@@ -382,6 +388,33 @@ const SESSION_CLOSE_TIMEOUT_MS = 10_000;
 const CLOSE_PENDING_TIMEOUT_MS = 35_000;
 
 /**
+ * How many requests one process may have in flight at once.
+ *
+ * Every request shares the default 120 s timeout, so a bridge that stops
+ * answering used to let callers pile up without bound: one `#pending` entry, one
+ * timer and one promise per call, all waiting out the same timeout. The cap is
+ * far above real concurrency (turns and session-scoped writes are serialized per
+ * conversation) and turns "the bridge is wedged" into a loud refusal of the next
+ * request instead of unbounded growth behind a stuck pipe.
+ */
+const DEFAULT_MAX_PENDING_REQUESTS = 256;
+
+/**
+ * How many characters may wait in the outbound write queue before new frames are refused.
+ *
+ * `stdin.write()` reports backpressure by returning `false`, and the previous
+ * code ignored that answer: Node buffered every frame a caller produced. A
+ * screenshot in a prompt or a `paseo/history` request is hundreds of KB to tens
+ * of MB, so a child that stops reading could hold an unbounded amount of the
+ * plugin's memory. Frames go through one FIFO pump (same order as the calls,
+ * which is the order the pipe would have had with synchronous writes) and this
+ * bounds what may accumulate behind a stream that has not drained. Counted in
+ * `String#length`, the unit the queued text is stored in; the real footprint is
+ * within a factor of two.
+ */
+const DEFAULT_MAX_OUTBOUND_QUEUE_BYTES = 64 * 1024 * 1024;
+
+/**
  * How long one `paseo/jobs` read may take.
  *
  * Much shorter than the other bounds here: the composer pill polls this on a timer
@@ -403,9 +436,41 @@ const JOBS_READ_TIMEOUT_MS = 15_000;
  */
 const UNKNOWN_BRIDGE_METHOD_PREFIX = "unknown paseo bridge method:";
 
-/** What the pill shows when the profile's bridge has no `paseo/jobs`. */
+/**
+ * What the client logs once when the profile's bridge has no `paseo/jobs`.
+ *
+ * The terminal `bridge_too_old` code makes the pill stop polling and hide; this
+ * sentence is the one explanation of why it went away and what to do.
+ */
 const BRIDGE_TOO_OLD_MESSAGE =
   "this profile's bridge has no jobs support (it predates paseo/jobs); reload the plugin so the embedded bridge is rewritten";
+
+/**
+ * The bridge's answer when the profile does not compose a job registry at all.
+ *
+ * The text is produced by the embedded bridge and travels unchanged; matching it
+ * here is how the plugin half turns a message-only answer into the terminal
+ * `registry_missing` code. Kept as one constant so a future bridge wording change
+ * is a single edit rather than two independent string literals.
+ */
+const REGISTRY_MISSING_MESSAGE = "this DSH runtime composes no job registry";
+
+/**
+ * Give every failed jobs answer a machine-readable code.
+ *
+ * The bridge predates the `code` field, so its failures arrive without one.
+ * `registry_missing` is the one terminal case it can express; everything else
+ * stays `rpc_failed` (transient, retried with backoff). A code that already
+ * travelled through is preserved — this only fills the gap.
+ */
+function withJobsErrorCode(result: DshJobs): DshJobs {
+  if (result.available) return result;
+  const message = result.error?.message ?? "the DSH runtime could not list this session's jobs";
+  const code =
+    result.error?.code ??
+    (message === REGISTRY_MISSING_MESSAGE ? "registry_missing" : "rpc_failed");
+  return { ...result, error: { message, code } };
+}
 
 /** What one attached session contributes besides its handlers. */
 export interface DshSessionOptions {
@@ -456,6 +521,23 @@ export interface DshProcessOptions extends DshProcessHandlers {
    * model list that would let the user pick a good one.
    */
   initializeRoute?: boolean;
+  /**
+   * Cap on in-flight requests; production uses {@link DEFAULT_MAX_PENDING_REQUESTS}.
+   *
+   * Exposed so a check can drive the refusal path with a small value instead of
+   * opening hundreds of requests against a child that never answers — the same
+   * reason `FrameReaderOptions.maxPendingBytes` exists.
+   */
+  maxPendingRequests?: number;
+  /**
+   * Cap on queued outbound characters; production uses
+   * {@link DEFAULT_MAX_OUTBOUND_QUEUE_BYTES}.
+   *
+   * A check seam for the same reason as {@link maxPendingRequests}: the real
+   * bound is 64 MiB, and driving it by actually queueing 64 MiB would make the
+   * regression slower and less deterministic than the mechanism it tests.
+   */
+  maxOutboundQueueBytes?: number;
 }
 
 const BINARY_CANDIDATES = [
@@ -1096,6 +1178,30 @@ export class DshProcess {
   #frames: FrameReader;
   #pending = new Map<number, Pending>();
   #nextId = 1;
+  /** Bound on in-flight requests; see {@link DEFAULT_MAX_PENDING_REQUESTS}. */
+  readonly #maxPendingRequests: number;
+  /** Bound on queued outbound characters; see {@link DEFAULT_MAX_OUTBOUND_QUEUE_BYTES}. */
+  readonly #maxOutboundQueueBytes: number;
+  /**
+   * Frames accepted for writing but not yet handed to the stream, in call order.
+   *
+   * One FIFO for the whole process rather than one per session: the pipe is
+   * shared, so call order already is the wire order every session had with the
+   * old synchronous writes. Keeping it global also means a large frame from one
+   * session cannot jump ahead of — or be reordered around — another's.
+   */
+  #writeQueue: string[] = [];
+  /** Characters retained in {@link #writeQueue}, maintained incrementally. */
+  #writeQueueBytes = 0;
+  /**
+   * Whether the outbound pump is waiting for the stream's `drain` event.
+   *
+   * A `write()` that returned `false` took the frame but the pipe is full; the
+   * next write must wait for the child to consume enough. Without this flag the
+   * pump would keep handing the stream frames that Node then buffers without
+   * bound.
+   */
+  #awaitingDrain = false;
   #closed = false;
   /**
    * Whether the mismatched-`assistant.stream` bridge has been reported.
@@ -1123,6 +1229,8 @@ export class DshProcess {
 
   constructor(options: DshProcessOptions) {
     this.#options = options;
+    this.#maxPendingRequests = options.maxPendingRequests ?? DEFAULT_MAX_PENDING_REQUESTS;
+    this.#maxOutboundQueueBytes = options.maxOutboundQueueBytes ?? DEFAULT_MAX_OUTBOUND_QUEUE_BYTES;
     this.#processHandlers = {
       onLog: (line) => options.onLog(line),
       onProtocolError: (message) => options.onProtocolError(message),
@@ -1838,23 +1946,25 @@ export class DshProcess {
   async jobs(sessionId: string): Promise<DshJobs> {
     await this.#ensureSessionReady(sessionId);
     try {
-      return (await this.#request("paseo/jobs", { sessionId }, JOBS_READ_TIMEOUT_MS)) as DshJobs;
+      return withJobsErrorCode((await this.#request("paseo/jobs", { sessionId }, JOBS_READ_TIMEOUT_MS)) as DshJobs);
     } catch (error) {
       // A bridge without this method is not "the registry could not be read": the
       // user's next step is to get a newer bridge, not to wait. Reported through
       // `available: false` because the pill has no other way to say "I could not
-      // look" — but with a message that says what to do.
+      // look" — but with a message that says what to do. `bridge_too_old` is
+      // terminal: the client stops polling instead of retrying an answer that
+      // cannot change until the plugin is reloaded.
       if (!this.#isUnknownBridgeMethodError(error)) throw error;
       if (!this.#warnedJobsUnsupported) {
         this.#warnedJobsUnsupported = true;
-        // Once per process: the pill polls every four seconds, so an unlatched
-        // line would bury the log (same reasoning as `#warnedAssistantStream`).
+        // Once per process: an unlatched line would bury the log (same reasoning
+        // as `#warnedAssistantStream`).
         this.#processHandlers.onLog(
           `the bridge does not implement paseo/jobs (it predates jobs support); ` +
-            `the jobs pill will stay on "${BRIDGE_TOO_OLD_MESSAGE}" until the embedded bridge is rewritten`,
+            `the jobs pill is disabled until the embedded bridge is rewritten: ${BRIDGE_TOO_OLD_MESSAGE}`,
         );
       }
-      return { available: false, error: { message: BRIDGE_TOO_OLD_MESSAGE } };
+      return { available: false, error: { message: BRIDGE_TOO_OLD_MESSAGE, code: "bridge_too_old" } };
     }
   }
 
@@ -1900,7 +2010,12 @@ export class DshProcess {
     // a session without going through `attachSession` would otherwise fail at the
     // first prompt with an error that reads like a protocol bug, so the invariant
     // is maintained here rather than trusted to every caller.
+    //
+    // Whether the session is attached is captured BEFORE the wait, because the
+    // wait is where a close can land. See {@link #assertStillAttached}.
+    const attachedAtEntry = this.#sessionHandlers.has(sessionId);
     await this.#ensureSessionReady(sessionId);
+    this.#assertStillAttached(sessionId, attachedAtEntry, "prompt");
     const params = {
       sessionId,
       contentBlocks: contentBlocks ?? [{ type: "text", text }],
@@ -1923,6 +2038,11 @@ export class DshProcess {
       // creates the agent or appends anything), and retrying any OTHER failure
       // would risk duplicating a turn that actually ran.
       if (!this.#isNotInitializedError(error)) throw error;
+      // The retry re-sends `initialize` + `paseo/mcp/set` + `prompt` for this
+      // id. If the session was closed while the first attempt was in flight,
+      // that is exactly the ghost turn the guard is for: the initialize would
+      // reopen bridge tables for a session nobody owns again.
+      this.#assertStillAttached(sessionId, attachedAtEntry, "prompt");
       this.#initializedSessions.delete(sessionId);
       this.#mcpSent.delete(sessionId);
       // The memoized task is what held the stale "already initialized" belief, so
@@ -1933,12 +2053,43 @@ export class DshProcess {
         `the bridge forgot session ${sessionId}'s initialize (its route table is bounded); re-initializing and retrying the prompt`,
       );
       await this.#ensureSessionReady(sessionId);
+      this.#assertStillAttached(sessionId, attachedAtEntry, "prompt");
       result = (await this.#request("session/prompt", params)) as typeof result;
     }
     return {
       ...(typeof result?.messageId === "string" ? { messageId: result.messageId } : {}),
       ...(typeof result?.sourceKind === "string" ? { sourceKind: result.sourceKind } : {}),
     };
+  }
+
+  /**
+   * Refuse to send a session-scoped frame after the session was detached.
+   *
+   * `prompt()` is the case that costs something: it waits for
+   * `#ensureSessionReady()` and then writes `session/prompt`, while
+   * `closeSession()` detaches the session synchronously and then writes
+   * `session/close`. If the close lands inside that wait, the wire order used to
+   * be close -> prompt. The bridge deliberately keeps `initializedSessions` for
+   * a closed id (so a resume can reuse it), so the prompt passed its gate and
+   * `getOrCreateSession` rebuilt the agent — a ghost turn no owner would ever
+   * close. The check is synchronous and immediately before the send: after it, a
+   * close can only produce prompt -> close, which is the safe order.
+   *
+   * `attachedAtEntry` separates the two meanings of "not attached here": a
+   * session that was attached and is gone was closed under us, while an id that
+   * was never attached keeps the legacy path (some checks drive frames for a
+   * synthetic id, and the ghost hazard needs an attach to begin with).
+   *
+   * @param sessionId - the session the frame names.
+   * @param attachedAtEntry - whether it was attached when the operation started.
+   * @param action - the request being prepared, for the message.
+   */
+  #assertStillAttached(sessionId: string, attachedAtEntry: boolean, action: string): void {
+    if (!attachedAtEntry || this.#sessionHandlers.has(sessionId)) return;
+    throw new Error(
+      `session ${sessionId} was closed while its ${action} was being prepared; `
+        + `refusing to send a ${action} for a closed session`,
+    );
   }
 
   /**
@@ -2261,6 +2412,9 @@ export class DshProcess {
   /** Terminate the child without a protocol shutdown. */
   kill(): void {
     this.#closed = true;
+    // Nothing queued can be delivered once the child is gone; the exit event
+    // fails the pending requests, this only releases the buffered frames now.
+    this.#clearOutbound();
     this.#child?.kill("SIGTERM");
     const child = this.#child;
     setTimeout(() => {
@@ -2315,13 +2469,27 @@ export class DshProcess {
     if (this.#closed || this.#child === undefined) {
       return Promise.reject(new Error("DeepSeek Harness process is not running"));
     }
+    // A bridge that stops answering used to let callers pile up without bound:
+    // every request shares the same default timeout, so each one costs a pending
+    // entry, a timer and a promise for the full 120 s. Refuse the next one
+    // loudly instead of growing behind a wedged pipe — the caller can retry, and
+    // the log/UI says why it failed.
+    if (this.#pending.size >= this.#maxPendingRequests) {
+      return Promise.reject(
+        new Error(
+          `too many requests in flight to the DeepSeek Harness process `
+            + `(${String(this.#pending.size)} pending, bound ${String(this.#maxPendingRequests)}); `
+            + `refusing to send ${method}`,
+        ),
+      );
+    }
     const id = this.#nextId++;
     return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
         if (this.#pending.delete(id)) reject(new Error(`DeepSeek Harness did not answer ${method}`));
       }, timeoutMs);
       timer.unref?.();
-      this.#pending.set(id, {
+      const entry: Pending = {
         resolve: (value) => {
           clearTimeout(timer);
           resolve(value);
@@ -2330,14 +2498,119 @@ export class DshProcess {
           clearTimeout(timer);
           reject(error);
         },
-      });
-      this.#send({ jsonrpc: "2.0", id, method, params });
+      };
+      this.#pending.set(id, entry);
+      try {
+        this.#writeFrame({ jsonrpc: "2.0", id, method, params });
+      } catch (error) {
+        // The frame never entered the pipe, so no answer can ever match this id:
+        // drop the pending entry (its timeout would otherwise fire for a request
+        // the bridge never saw) and fail the caller with the real reason.
+        if (this.#pending.delete(id)) entry.reject(toError(error, "failed to send to the bridge"));
+      }
     });
+  }
+
+  /**
+   * Hand one frame to the outbound queue, throwing when the process cannot take it.
+   *
+   * Frames go through one FIFO pump rather than straight to `stdin.write` so a
+   * `false` return (the pipe is full) is honoured: the next frame waits for
+   * `drain` instead of being buffered by Node without bound. Order is the call
+   * order, which is also the order the old synchronous writes produced, so a
+   * shared process still sees one interleaved stream and no session is favoured.
+   *
+   * The budget counts what the stream itself is still holding
+   * (`stdin.writableLength`) as well as this queue: judging only our own queue
+   * would let one more frame into a pipe that is already at its bound.
+   *
+   * @param frame - the JSON-RPC frame to serialize and queue.
+   * @throws when the process is gone, the frame cannot be serialized, or the
+   *   outbound budget is exhausted. Callers turn that into a rejection/report;
+   *   nothing is dropped silently.
+   */
+  #writeFrame(frame: unknown): void {
+    const child = this.#child;
+    if (this.#closed || child === undefined) throw new Error("DeepSeek Harness process is not running");
+    const text = `${JSON.stringify(frame)}\n`;
+    const queued = this.#writeQueueBytes + child.stdin.writableLength;
+    if (queued + text.length > this.#maxOutboundQueueBytes) {
+      throw new Error(
+        `the outbound queue for the DeepSeek Harness process is full `
+          + `(${String(queued)} characters waiting, ${String(text.length)} more requested, `
+          + `bound ${String(this.#maxOutboundQueueBytes)}); refusing to send`,
+      );
+    }
+    this.#writeQueue.push(text);
+    this.#writeQueueBytes += text.length;
+    this.#pumpWrites();
+  }
+
+  /**
+   * Write queued frames until the stream reports backpressure or nothing is left.
+   *
+   * At most one `drain` listener exists at a time (the pump returns while
+   * {@link #awaitingDrain}), so a burst of frames cannot stack listeners on the
+   * shared child's stdin. Every frame that was handed to the stream is already
+   * accounted for in the pipe; only frames still in the queue are counted in
+   * {@link #writeQueueBytes}.
+   */
+  #pumpWrites(): void {
+    if (this.#awaitingDrain) return;
+    const child = this.#child;
+    if (this.#closed || child === undefined) {
+      this.#clearOutbound();
+      return;
+    }
+    while (this.#writeQueue.length > 0) {
+      const text = this.#writeQueue.shift() as string;
+      this.#writeQueueBytes -= text.length;
+      let writable: boolean;
+      try {
+        writable = child.stdin.write(text);
+      } catch (error) {
+        // A synchronous write failure means the surface is unusable; the frames
+        // queued behind it cannot be delivered either. Reported loudly, and the
+        // queue is dropped rather than retried forever. Pending requests are
+        // failed by the caller's own path (`#send`) or their timeouts, exactly
+        // as before this queue existed.
+        this.#clearOutbound();
+        this.#processHandlers.onProtocolError(toError(error, "failed to write to the bridge").message);
+        return;
+      }
+      if (!writable) {
+        this.#awaitingDrain = true;
+        child.stdin.once("drain", this.#onDrain);
+        return;
+      }
+    }
+  }
+
+  /** Resume {@link #pumpWrites} when the child has consumed enough to accept more. */
+  #onDrain = (): void => {
+    this.#awaitingDrain = false;
+    this.#pumpWrites();
+  };
+
+  /**
+   * Drop queued frames and stop waiting for a drain.
+   *
+   * Used when the pipe is gone or unusable. Pending requests are failed
+   * separately by {@link #failAll}; this only stops the queue from holding frames
+   * nobody will ever receive.
+   */
+  #clearOutbound(): void {
+    this.#writeQueue.length = 0;
+    this.#writeQueueBytes = 0;
+    if (this.#awaitingDrain) {
+      this.#awaitingDrain = false;
+      this.#child?.stdin.off("drain", this.#onDrain);
+    }
   }
 
   #send(frame: unknown): void {
     try {
-      this.#child?.stdin.write(`${JSON.stringify(frame)}\n`);
+      this.#writeFrame(frame);
     } catch (error) {
       this.#processHandlers.onProtocolError(toError(error, "failed to write to the bridge").message);
     }
@@ -2809,6 +3082,10 @@ export class DshProcess {
   }
 
   #failAll(error: Error): void {
+    // The write surface is gone with the requests that would have used it: a
+    // queued frame has nobody left to deliver it to, and holding the queue would
+    // keep its bytes alive for the life of the object.
+    this.#clearOutbound();
     const entries = [...this.#pending.values()];
     this.#pending.clear();
     for (const entry of entries) entry.reject(error);

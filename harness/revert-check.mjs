@@ -644,7 +644,7 @@ console.log('shared-process lifecycle (behaviour, not source text)');
 {
   const buildDir = resolvePluginBuild(undefined, '.dbg-t5-revert');
   const processModule = require(join(buildDir, 'server', 'dsh-process.js'));
-  const { DshSession } = require(join(buildDir, 'server', 'session.js'));
+  const { DshSession, modes: advertisedModes } = require(join(buildDir, 'server', 'session.js'));
 
   /** A process transport that records what the session asked it to do. */
   const spawned = [];
@@ -824,6 +824,7 @@ console.log('shared-process lifecycle (behaviour, not source text)');
       env: {},
       route,
       mode: 'build',
+      modes: advertisedModes(),
       models: [],
       thinkingOptions: [],
       subsession: extra.subsession === true,

@@ -13,17 +13,30 @@
  *   file with `path` and only its writing commands (`create`/`str_replace`/
  *   `insert`) count — `view`, an unknown command or a missing path are not edits;
  * - the current content is rescued before restore overwrites it, and one failed
- *   path does not abort the rest.
+ *   path does not abort the rest;
+ * - the order of two captures of one path is the order their reads observed the
+ *   bytes, including while the first read is held open (BF-02);
+ * - a capture that could not be taken (too large, not a regular file, read
+ *   failure) is journaled as a `skip` and reported as `unrecoverable` by the
+ *   next rewind instead of becoming a silent success (BF-03);
+ * - a restore refuses a path whose parent directory was moved or replaced by a
+ *   symlink since capture — including the creation case, whose delete must not
+ *   follow the link (BR-04 / H-02).
  *
  * Uses a real temp directory, so the journal/objects/rescue layout is exercised
  * as written, not mocked.
  *
  * Usage: node harness/file-snapshot-check.mjs
+ *
+ * **动了 `file-snapshots.js` 的 `capture` 读/序号绑定、`skip` 载入、`planRestore`
+ * 的 `unrecoverable`、`restore` 的目录身份复核，或 `server.js` 的撤回回执字段必跑。**
  */
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
   FileSnapshots,
   isTrackedTool,
@@ -180,12 +193,30 @@ console.log('size cap, directories and corrupt journal lines');
   check('an oversized file is skipped', captured.ok === true && captured.skipped !== undefined, JSON.stringify(captured));
   await tight.commit({ sessionId: SESSION, callId: 'big' }, { isError: false });
   const tightJournal = await tight.readJournal(SESSION);
-  check('and never reaches the journal', tightJournal.entries.length === 0);
+  check(
+    'a skipped capture still reaches the journal (with its reason)',
+    tightJournal.entries.length === 1 && typeof tightJournal.entries[0]?.skip === 'string',
+    JSON.stringify(tightJournal.entries),
+  );
+  const tightPlan = await tight.planRestore(SESSION, 1);
+  check(
+    'and a rewind reports it as unrecoverable instead of restoring a wrong pre-image',
+    tightPlan.actions.length === 0
+      && (tightPlan.unrecoverable ?? []).some((entry) => entry.path === big && /larger than/.test(entry.reason)),
+    JSON.stringify(tightPlan),
+  );
 
   const dir = join(root, 'a-directory');
   await mkdir(dir, { recursive: true });
   const dirCapture = await tight.capture({ sessionId: SESSION, anchorSeq: 1, callId: 'dir', path: dir });
   check('a directory is skipped', dirCapture.ok === true && dirCapture.skipped !== undefined);
+  await tight.commit({ sessionId: SESSION, callId: 'dir' }, { isError: false });
+  const dirPlan = await tight.planRestore(SESSION, 1);
+  check(
+    'and it too is reported as unrecoverable, not as a clean success',
+    (dirPlan.unrecoverable ?? []).some((entry) => entry.path === dir && entry.reason === 'not-a-regular-file'),
+    JSON.stringify(dirPlan.unrecoverable ?? null),
+  );
 
   const journalPath = join(root, encodeURIComponent(SESSION), 'journal.jsonl');
   const existing = await readFile(journalPath, 'utf8');
@@ -312,6 +343,202 @@ console.log('a hostile journal cannot make the rewind escape the session');
     'a symlinked target is skipped, never deleted',
     outcome.skipped.includes(link) && existsSync(link) && (await readFile(outside, 'utf8')) === 'SAFE',
     JSON.stringify(outcome.skipped),
+  );
+}
+
+console.log('an ancestor directory that changed cannot redirect a restore (BR-04/H-02)');
+{
+  const session = 'ancestor-guard';
+  const outside = join(root, 'ancestor-outside');
+  const work = join(root, 'ancestor-work');
+  await mkdir(outside, { recursive: true });
+  await mkdir(work, { recursive: true });
+  const target = join(work, 'a.txt');
+  await writeFile(target, 'ORIGINAL', 'utf8');
+  const guard = new FileSnapshots({ rootDir: join(root, 'ancestor-state'), warn: (line) => warnings.push(line) });
+  await guard.capture({ sessionId: session, anchorSeq: 5, callId: 'ancestor-edit', path: target });
+  await guard.commit({ sessionId: session, callId: 'ancestor-edit' }, { isError: false });
+  await writeFile(target, 'CHANGED', 'utf8');
+  // The BR-04 shape: move the captured file's parent away, then put a symlink to
+  // another directory in its place. Only the final component was ever checked,
+  // so the old restore wrote the backup through the link and reported success.
+  const moved = join(root, 'ancestor-work-moved');
+  await rename(work, moved);
+  await symlink(outside, work);
+  await writeFile(join(outside, 'a.txt'), 'UNRELATED', 'utf8');
+  const plan = await guard.planRestore(session, 5);
+  const outcome = await guard.restore(session, plan.actions);
+  check(
+    'a restore whose parent was replaced by a symlink is skipped, not reported restored',
+    outcome.skipped.includes(target) && outcome.restored.length === 0,
+    JSON.stringify(outcome),
+  );
+  check(
+    'the symlink target is untouched',
+    (await readFile(join(outside, 'a.txt'), 'utf8')) === 'UNRELATED',
+    await readFile(join(outside, 'a.txt'), 'utf8'),
+  );
+  check(
+    'and the moved original keeps the agent-written content',
+    (await readFile(join(moved, 'a.txt'), 'utf8')) === 'CHANGED',
+    await readFile(join(moved, 'a.txt'), 'utf8'),
+  );
+
+  // The same shape for a file that did not exist when the tool ran: the restore
+  // would delete through the replaced parent, which must be refused too.
+  const newWork = join(root, 'ancestor-new-work');
+  const newOutside = join(root, 'ancestor-new-outside');
+  await mkdir(newWork, { recursive: true });
+  await mkdir(newOutside, { recursive: true });
+  const created = join(newWork, 'created.txt');
+  const createSession = 'ancestor-new';
+  await guard.capture({ sessionId: createSession, anchorSeq: 5, callId: 'ancestor-create', path: created });
+  await guard.commit({ sessionId: createSession, callId: 'ancestor-create' }, { isError: false });
+  await writeFile(created, 'AGENT_CREATED', 'utf8');
+  const newMoved = join(root, 'ancestor-new-work-moved');
+  await rename(newWork, newMoved);
+  await symlink(newOutside, newWork);
+  await writeFile(join(newOutside, 'created.txt'), 'SOMEONE_ELSE', 'utf8');
+  const newPlan = await guard.planRestore(createSession, 5);
+  const newOutcome = await guard.restore(createSession, newPlan.actions);
+  check(
+    'a delete through a replaced parent is skipped',
+    newOutcome.skipped.includes(created) && newOutcome.deleted.length === 0,
+    JSON.stringify(newOutcome),
+  );
+  const otherBody = await readFile(join(newOutside, 'created.txt'), 'utf8').catch((error) =>
+    error?.code === 'ENOENT' ? 'MISSING' : Promise.reject(error),
+  );
+  check('and the other directory keeps its file', otherBody === 'SOMEONE_ELSE', otherBody);
+}
+
+console.log('directories the tool created below the captured anchor are not a change');
+{
+  // Positive control for the identity check above: a file created in a brand-new
+  // subdirectory has its capture anchored one level up, and the restore must
+  // still delete it — refusing every deeper directory would be a regression.
+  const session = 'new-directory';
+  const base = join(root, 'new-directory-base');
+  await mkdir(base, { recursive: true });
+  const created = join(base, 'sub', 'file.txt');
+  const manager = new FileSnapshots({ rootDir: join(root, 'new-directory-state'), warn: (line) => warnings.push(line) });
+  await manager.capture({ sessionId: session, anchorSeq: 5, callId: 'created-under-new-dir', path: created });
+  await manager.commit({ sessionId: session, callId: 'created-under-new-dir' }, { isError: false });
+  await mkdir(dirname(created), { recursive: true });
+  await writeFile(created, 'AGENT_CREATED', 'utf8');
+  const plan = await manager.planRestore(session, 5);
+  const outcome = await manager.restore(session, plan.actions);
+  check(
+    'a file created under a new directory is still deleted',
+    !existsSync(created) && outcome.deleted.includes(created) && outcome.skipped.length === 0,
+    JSON.stringify(outcome),
+  );
+}
+
+console.log('a capture that could not be read is journaled as a skip (BF-03)');
+{
+  const session = 'capture-failure';
+  const file = join(root, 'capture-failure.txt');
+  await writeFile(file, 'BASE', 'utf8');
+  const failing = new FileSnapshots({ rootDir: join(root, 'capture-failure-state'), warn: (line) => warnings.push(line) });
+  const realReadFile = fs.promises.readFile;
+  fs.promises.readFile = async (path, ...args) => {
+    if (String(path) === file) {
+      const error = new Error('injected read failure');
+      error.code = 'EIO';
+      throw error;
+    }
+    return realReadFile.call(fs.promises, path, ...args);
+  };
+  syncBuiltinESMExports();
+  let captured;
+  try {
+    captured = await failing.capture({ sessionId: session, anchorSeq: 5, callId: 'read-fail', path: file });
+  } finally {
+    fs.promises.readFile = realReadFile;
+    syncBuiltinESMExports();
+  }
+  check(
+    'the capture reports the failure instead of claiming a backup',
+    captured.ok === true && /read failed/.test(captured.skipped ?? ''),
+    JSON.stringify(captured),
+  );
+  await failing.commit({ sessionId: session, callId: 'read-fail' }, { isError: false });
+  const plan = await failing.planRestore(session, 5);
+  check(
+    'and a rewind reports the path unrecoverable with that reason',
+    plan.actions.length === 0
+      && (plan.unrecoverable ?? []).some((entry) => entry.path === file && /read failed/.test(entry.reason)),
+    JSON.stringify(plan),
+  );
+}
+
+console.log('capture order is bound to the bytes that were read (BF-02)');
+{
+  const session = 'read-order';
+  const file = join(root, 'read-order.txt');
+  await writeFile(file, 'BASE', 'utf8');
+  const ordered = new FileSnapshots({ rootDir: join(root, 'read-order-state'), warn: (line) => warnings.push(line) });
+  const realReadFile = fs.promises.readFile;
+  let reads = 0;
+  let markStarted;
+  const started = new Promise((resolve) => {
+    markStarted = resolve;
+  });
+  let releaseFirst;
+  const release = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  fs.promises.readFile = async (path, ...args) => {
+    if (String(path) === file) {
+      reads += 1;
+      if (reads === 1) {
+        markStarted();
+        await release;
+      }
+    }
+    return realReadFile.call(fs.promises, path, ...args);
+  };
+  syncBuiltinESMExports();
+  try {
+    // The first capture's read is held open, like a slow read in the real race.
+    const first = ordered
+      .capture({ sessionId: session, pendingKey: 'p1', anchorSeq: 5, callId: 'c1', path: file })
+      .then(async () => {
+        await writeFile(file, 'AFTER_FIRST', 'utf8');
+      });
+    await started;
+    const second = ordered
+      .capture({ sessionId: session, pendingKey: 'p2', anchorSeq: 5, callId: 'c2', path: file })
+      .then(async () => {
+        await writeFile(file, 'AFTER_SECOND', 'utf8');
+      });
+    // A real delay, not a microtask: without per-path serialisation the second
+    // capture reads the file immediately even though the first number is in
+    // flight — the shape that made `planRestore` pick a newer pre-image (BF-02).
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    check('a second capture of one path does not read while the first read is in flight', reads === 1, `${reads} read(s)`);
+    releaseFirst();
+    await Promise.all([first, second]);
+  } finally {
+    fs.promises.readFile = realReadFile;
+    syncBuiltinESMExports();
+  }
+  await ordered.commit({ sessionId: session, pendingKey: 'p1', callId: 'c1' }, { isError: false });
+  await ordered.commit({ sessionId: session, pendingKey: 'p2', callId: 'c2' }, { isError: false });
+  const plan = await ordered.planRestore(session, 5);
+  await ordered.restore(session, plan.actions);
+  check('the earliest capture (the one that read first) wins', (await readFile(file, 'utf8')) === 'BASE', await readFile(file, 'utf8'));
+}
+
+console.log('a delete of a file that never appeared is not a partial restore');
+{
+  const session = 'already-absent';
+  const outcome = await snapshots.restore(session, [{ path: join(root, 'never-created.txt'), backup: null, mode: null }]);
+  check(
+    'an already-absent delete is a no-op, not a skipped restore',
+    outcome.skipped.length === 0 && (outcome.alreadyAbsent ?? []).length === 1 && outcome.failed.length === 0,
+    JSON.stringify(outcome),
   );
 }
 

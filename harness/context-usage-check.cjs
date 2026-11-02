@@ -116,7 +116,7 @@ class FakeProcess {
   }
 }
 processModule.DshProcess = FakeProcess;
-const { DshSession } = require(path.join(compiled, 'server/session.js'));
+const { DshSession, modes: advertisedModes } = require(path.join(compiled, 'server/session.js'));
 
 /**
  * Extra event sinks and transports for the post-open re-publish cases below.
@@ -168,7 +168,7 @@ global.clearTimeout = function instrumentedClearTimeout(handle, ...rest) {
   const sharedTransport = new FakeProcess({ sessionId: '__paseo_shared_process__' });
   const session = new DshSession({
     sessionId: 'context-check', cwd: process.cwd(), env: {},
-    route: { provider: 'fixture', model: 'alpha' }, mode: 'build',
+    route: { provider: 'fixture', model: 'alpha' }, mode: 'build', modes: advertisedModes(),
     models: [{ id: 'fixture/alpha' }, { id: 'fixture/beta' }],
     thinkingOptions: [], emit: e => events.push(e), log() {},
     acquireProcess: async () => ({ process: sharedTransport, reused: false }),
@@ -269,7 +269,7 @@ global.clearTimeout = function instrumentedClearTimeout(handle, ...rest) {
   {
     const replaySession = new DshSession({
       sessionId: 'replay-check', cwd: process.cwd(), env: {},
-      route: { provider: 'fixture', model: 'alpha' }, mode: 'build',
+      route: { provider: 'fixture', model: 'alpha' }, mode: 'build', modes: advertisedModes(),
       models: [{ id: 'fixture/alpha' }],
       thinkingOptions: [], emit: e => replayEvents.push(e), log() {},
       acquireProcess: async () => ({ process: replayTransport, reused: false }),
@@ -319,7 +319,7 @@ global.clearTimeout = function instrumentedClearTimeout(handle, ...rest) {
     // overwrite it. The guard is what keeps the retry from becoming a regression.
     const turnSession = new DshSession({
       sessionId: 'replay-guard', cwd: process.cwd(), env: {},
-      route: { provider: 'fixture', model: 'alpha' }, mode: 'build',
+      route: { provider: 'fixture', model: 'alpha' }, mode: 'build', modes: advertisedModes(),
       models: [{ id: 'fixture/alpha' }],
       thinkingOptions: [], emit: e => guardEvents.push(e), log() {},
       acquireProcess: async () => ({ process: guardTransport, reused: false }),
@@ -343,7 +343,7 @@ global.clearTimeout = function instrumentedClearTimeout(handle, ...rest) {
     // second one fails when `close()` forgets to clear the timers.
     const closeSession = new DshSession({
       sessionId: 'replay-close', cwd: process.cwd(), env: {},
-      route: { provider: 'fixture', model: 'alpha' }, mode: 'build',
+      route: { provider: 'fixture', model: 'alpha' }, mode: 'build', modes: advertisedModes(),
       models: [{ id: 'fixture/alpha' }],
       thinkingOptions: [], emit: e => closeEvents.push(e), log() {},
       acquireProcess: async () => ({ process: closeTransport, reused: false }),

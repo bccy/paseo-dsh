@@ -12,11 +12,19 @@
  *    child edit captured under the resolved root lands in the ROOT journal with
  *    the root's anchor, the child gets no journal of its own, a rewind plan from
  *    the root restores/deletes it, and independent session trees never cross.
+ * 3. Dispatcher inheritance (`dsh-bridge/lib/child-anchors.js`): a grandchild
+ *    anchors to the turn its direct parent is running under, not to the root's
+ *    latest message — the BR-03 shape where the root received an unrelated
+ *    later message while the old child kept working. An unobserved dispatcher
+ *    fails open instead of guessing the root's newest message.
  *
  * The bridge's `captureFileBeforeTool`/`commitFileTool` wiring is exactly these
  * two calls in sequence; the real-machine probe covers the wiring end to end.
  *
  * Usage: node harness/rewind-merge-check.mjs
+ *
+ * **动了 `child-anchors.js` 的 `recordDelegatedTurn`、`server.js` 的
+ * `observeDelegatedTurn`/`snapshotAnchorFor`，或 `snapshot-owners.js` 的血统解析必跑。**
  */
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
@@ -161,6 +169,69 @@ check(
 );
 check('a rewind to a later message leaves them running', anchors.withdrawnSince(13).length === 0);
 check('an invalid target withdraws nothing', anchors.withdrawnSince(Number.NaN).length === 0);
+
+console.log('== dispatcher inheritance (BR-03) ==');
+{
+  // The BR-03 shape: root message 10 dispatched child-under-10, which is still
+  // running when the root receives unrelated message 20; the child then spawns a
+  // grandchild. The grandchild belongs to message 10, not to the root's latest.
+  const inherited = new ChildAnchors();
+  inherited.record('child-under-10', 10, 'root-1');
+  const decide = (childId, input) => (typeof inherited.recordDelegatedTurn === 'function'
+    ? inherited.recordDelegatedTurn(childId, input)
+    : { reason: 'method-missing' });
+  const fromOldChild = decide('grand-of-10', {
+    parentId: 'child-under-10',
+    rootId: 'root-1',
+    latestRootAnchor: 20,
+  });
+  check(
+    'a grandchild inherits its dispatcher\'s anchor, not the root latest human message',
+    fromOldChild.anchorSeq === 10 && inherited.anchorFor('grand-of-10') === 10,
+    JSON.stringify(fromOldChild),
+  );
+  check(
+    'so withdrawing the unrelated root message does not select it',
+    !inherited.withdrawnSince(20, 'root-1').includes('grand-of-10'),
+    JSON.stringify(inherited.withdrawnSince(20, 'root-1')),
+  );
+
+  // A continuable child resumed by a newer root message refreshes its own turn
+  // anchor, and anything it spawns during that turn follows the refresh.
+  inherited.record('child-under-10', 40, 'root-1');
+  const resumed = decide('grand-of-40', {
+    parentId: 'child-under-10',
+    rootId: 'root-1',
+    latestRootAnchor: 50,
+  });
+  check(
+    'a resumed dispatcher refreshes what its grandchild inherits',
+    resumed.anchorSeq === 40 && inherited.anchorFor('grand-of-40') === 40,
+    JSON.stringify(resumed),
+  );
+
+  const direct = decide('child-of-root', {
+    parentId: 'root-1',
+    rootId: 'root-1',
+    latestRootAnchor: 20,
+  });
+  check(
+    'a direct child of the root still uses the root\'s newest human message',
+    direct.anchorSeq === 20 && inherited.anchorFor('child-of-root') === 20,
+    JSON.stringify(direct),
+  );
+
+  const unknown = decide('grand-unknown', {
+    parentId: 'never-observed',
+    rootId: 'root-1',
+    latestRootAnchor: 20,
+  });
+  check(
+    'an unobserved dispatcher records nothing (fail open), never the root latest',
+    unknown.reason === 'dispatcher-anchor-unknown' && inherited.anchorFor('grand-unknown') === undefined,
+    JSON.stringify(unknown),
+  );
+}
 
 console.log('== withdrawing delegated work ==');
 {

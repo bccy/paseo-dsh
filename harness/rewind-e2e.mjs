@@ -20,17 +20,36 @@
  * Usage: node harness/rewind-e2e.mjs [--cwd <dir>]
  * Requires a working `dsh` on PATH and the `paseo` profile (the same one
  * `paseo-dsh doctor` checks). The session runs in a temp directory.
+ *
+ * Profile isolation: by default the probe clones the profile named by
+ * DSH_PASEO_PROFILE (default `paseo`) into a throwaway DSH_HOME, so the live
+ * `~/.dsh` is never written (sessions, journals and rewind state all land in the
+ * copy). Pass `--allow-real-profile` to use the live home instead; an explicit
+ * `DSH_HOME=<dir>` is used as-is. The first output line names the mode.
  */
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+const require = createRequire(import.meta.url);
+const { announceDshHome, prepareDshHome } = require("./isolated-dsh-home.cjs");
 
 const argv = process.argv.slice(2);
 const cwdFlag = argv.indexOf("--cwd");
 const root = cwdFlag >= 0 && argv[cwdFlag + 1] !== undefined
   ? argv[cwdFlag + 1]
   : mkdtempSync(join(tmpdir(), "rewind-e2e-"));
+
+let runMode;
+try {
+  runMode = prepareDshHome({ script: "rewind-e2e", profile: process.env.DSH_PASEO_PROFILE ?? "paseo" });
+} catch (error) {
+  console.error(`rewind-e2e: ${error.message}`);
+  process.exit(2);
+}
+announceDshHome(runMode);
 
 const child = spawn("dsh", ["--profile", process.env.DSH_PASEO_PROFILE ?? "paseo"], {
   cwd: root,

@@ -133,12 +133,18 @@ export interface UiText {
 /**
  * The composer's background-jobs pill.
  *
- * `label` takes the count because the number is part of the sentence ("2 个后台"),
- * and it counts only live jobs: the pill hides once nothing is working.
+ * The pill is visible for **any** job, not only a live one: when the last job
+ * settles it keeps showing the retained history, which is the only way the
+ * popover's finished section can be opened. The two count labels mirror DSH's
+ * own `count.live.*` / `count.idle.*` pair: while something runs the number is
+ * the live count (the spinner already says "running"), and when nothing runs it
+ * is the total of settled rows, said as jobs rather than as work.
  */
 export interface JobsText {
-  /** Pill label; `count` is the number of running/stopping jobs, always >= 1. */
-  label: (count: number) => string;
+  /** Pill label while jobs are running; `count` is the live count, always >= 1. */
+  liveLabel: (count: number) => string;
+  /** Pill label when nothing is running; `count` is the settled total, always >= 1. */
+  idleLabel: (count: number) => string;
   /** The pill's label when the count is unknown, and the button's title. */
   title: string;
   /** One row's status word, per DSH job status. */
@@ -383,8 +389,10 @@ const TEXT: Record<Locale, UiText> = {
     jobs: {
       // "1 background" rather than "1 background task": the pill's label shares its
       // line with the spinner, and the noun added nothing the ring and the popover
-      // title did not already say.
-      label: (count) => `${String(count)} background`,
+      // title did not already say. The idle label keeps the noun because there is
+      // no spinner to say what the number counts.
+      liveLabel: (count) => `${String(count)} background`,
+      idleLabel: (count) => `${String(count)} background ${count === 1 ? "job" : "jobs"}`,
       title: "Background tasks",
       statuses: {
         running: "Running",
@@ -595,7 +603,9 @@ const TEXT: Record<Locale, UiText> = {
     jobs: {
       // 数量直接在句子里：`2 个后台`。中文没有复数变化，所以单复数同形。
       // 省略"任务"是刻意的：pill 这一行还要放转环，名词与 popover 标题重复。
-      label: (count) => `${String(count)} 个后台`,
+      liveLabel: (count) => `${String(count)} 个后台`,
+      // 空闲时没有转环兜底语义，所以这里补回"任务"：`2 个后台任务`。
+      idleLabel: (count) => `${String(count)} 个后台任务`,
       title: "后台任务",
       statuses: {
         running: "运行中",

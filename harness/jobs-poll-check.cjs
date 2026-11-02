@@ -1,12 +1,15 @@
 /**
- * Offline assertions for the poll sequence — the guard that decides which answer
- * may publish.
+ * Offline assertions for the jobs pill's state machine: the poll sequence, the
+ * visibility/count rule, the polling policy and the controller's terminal and
+ * pagination branches.
  *
  * `client/jobs-pill.tsx` imports the host runtime, so plain `node` cannot load it.
- * The rule lives in `client/poll-sequence.ts`, which has no imports at all; this
- * drives the real implementation.
+ * The rules live in `client/poll-sequence.ts` and `client/jobs-polling.ts`, which
+ * have no React or host imports; this drives the real implementations — the
+ * controller with a fake clock and a fake RPC, so its timers and terminal paths
+ * are behaviour, not source regexes.
  *
- * The two scenarios are the bugs review found in the first version:
+ * The two scenarios at the top are the bugs review found in the first version:
  *
  * 1. `removeAll` → `register`: the per-agent map was cleared, so the next poll
  *    took the same number again and a stale answer passed the "is it newest" test.
@@ -17,18 +20,40 @@
  * stale answers, so this file fails if someone reintroduces that shape.
  *
  * Run (from paseo-plugin):
- *   npx tsc client/poll-sequence.ts \
- *     --outDir .dbg-poll --rootDir . --module commonjs --moduleResolution node \
- *     --target ES2022 --skipLibCheck
+ *   npx tsc -p ../harness/jobs-poll.tsconfig.json
  *   echo '{"type":"commonjs"}' > .dbg-poll/package.json
  *   cp ../harness/jobs-poll-check.cjs .dbg-poll/
  *   cd .dbg-poll && node jobs-poll-check.cjs
+ *
+ * The tsconfig carries the `@getpaseo/plugin` paths mapping: that SDK is ESM-only
+ * with an exports map, which plain `--moduleResolution node` cannot read, and the
+ * emitted CommonJS is what this harness requires at run time.
  */
 
 "use strict";
 
 const { createPollSequence } = require("./client/poll-sequence.js");
-const { orderJobs, splitJobs } = require("./shared/jobs.js");
+const {
+  jobsPillPresentation,
+  nextPollDelayMs,
+  initialPollDelayMs,
+  isTerminalJobsErrorCode,
+  createJobsPoller,
+  LIVE_POLL_MS,
+  HIDDEN_POLL_MS,
+  MAX_POLL_MS,
+  INITIAL_POLL_JITTER_MS,
+  MAX_POLL_JITTER_MS,
+} = require("./client/jobs-polling.js");
+const fs = require("node:fs");
+const path = require("node:path");
+const {
+  orderJobs,
+  splitJobs,
+  jobsList,
+  JOB_ERROR_CODES,
+  TERMINAL_JOB_ERROR_CODES,
+} = require("./shared/jobs.js");
 
 let failures = 0;
 let checks = 0;
@@ -278,9 +303,447 @@ console.log("\npopover groups (live rows vs the foldable finished section)");
 
 /* ---------------------------------------------------------------------------- */
 
-console.log(`\n${checks - failures}/${checks} checks passed`);
-if (failures > 0) {
-  console.error(`${failures} FAILED`);
-  process.exit(1);
+// CJ-01: the pill is visible while the session still has any job, not only while
+// one is running. The old rule counted live rows and hid the pill the moment the
+// last job settled, which made the popover's finished section unreachable — the
+// exact path this asserts against.
+console.log("\nthe pill's presentation (finished history stays reachable)");
+{
+  const settledOnly = jobsPillPresentation({
+    available: true,
+    jobs: [{ status: "completed" }, { status: "failed" }],
+  });
+  check("a session with only settled jobs keeps the pill visible", settledOnly.visible, true);
+  check("a settled pill does not spin", settledOnly.spinning, false);
+  equal("a settled pill counts the total", settledOnly.label, { kind: "idle", count: 2 });
+
+  const liveAndSettled = jobsPillPresentation({
+    available: true,
+    jobs: [{ status: "running" }, { status: "completed" }, { status: "stopping" }],
+  });
+  check("a live job keeps the pill visible", liveAndSettled.visible, true);
+  check("a live pill spins", liveAndSettled.spinning, true);
+  equal("a live pill counts only the live rows", liveAndSettled.label, { kind: "live", count: 2 });
+
+  const empty = jobsPillPresentation({ available: true, jobs: [] });
+  check("a genuinely empty session hides the pill", empty.visible, false);
+  equal("an empty session has the neutral title", empty.label, { kind: "title" });
+
+  const unreadable = jobsPillPresentation({ available: false, jobs: [] });
+  check("an unreadable registry stays visible", unreadable.visible, true);
+  equal("an unreadable registry has the neutral title", unreadable.label, { kind: "title" });
+
+  // The old rule, as an oracle: it must disagree on the settled-only answer or
+  // this block would pass for the wrong reason.
+  const oldVisible = (jobs) =>
+    jobs.filter((job) => job.status === "running" || job.status === "stopping").length > 0;
+  check(
+    "OLD: counting only live jobs hides the finished history",
+    oldVisible([{ status: "completed" }]),
+    false,
+  );
 }
-console.log("OK");
+
+// CJ-02: one timer per agent must not become one burst per four seconds. The
+// policy is a pure function of the last answer, so both the base intervals and
+// the backoff are assertable without a clock; the controller tests below drive
+// the real timers.
+console.log("\npolling intervals (hidden backoff, failure backoff, jitter)");
+{
+  check("a visible pill polls at the base interval", nextPollDelayMs({ visible: true, failures: 0 }, () => 0), LIVE_POLL_MS);
+  check("a hidden pill does not run at full speed", nextPollDelayMs({ visible: false, failures: 0 }, () => 0), HIDDEN_POLL_MS);
+  assert("the hidden interval is materially slower", HIDDEN_POLL_MS >= LIVE_POLL_MS * 2, `${HIDDEN_POLL_MS} vs ${LIVE_POLL_MS}`);
+  check("the first failed read doubles the base", nextPollDelayMs({ visible: true, failures: 1 }, () => 0), LIVE_POLL_MS * 2);
+  check("the second failed read doubles again", nextPollDelayMs({ visible: true, failures: 2 }, () => 0), LIVE_POLL_MS * 4);
+  check("failure backoff is capped", nextPollDelayMs({ visible: true, failures: 8 }, () => 0), MAX_POLL_MS);
+
+  const jittered = nextPollDelayMs({ visible: true, failures: 0 }, () => 0.99);
+  assert("jitter is added, never subtracted", jittered > LIVE_POLL_MS, String(jittered));
+  assert("jitter is capped", jittered <= LIVE_POLL_MS + MAX_POLL_JITTER_MS, String(jittered));
+  assert(
+    "two agents with different random draws do not share an interval",
+    nextPollDelayMs({ visible: true, failures: 0 }, () => 0.1) !==
+      nextPollDelayMs({ visible: true, failures: 0 }, () => 0.9),
+  );
+
+  const firstInitial = initialPollDelayMs(() => 0);
+  const secondInitial = initialPollDelayMs(() => 0.999);
+  check("an initial poll can start immediately", firstInitial, 0);
+  assert(
+    "initial polls are spread instead of created on one tick",
+    secondInitial > firstInitial && secondInitial < INITIAL_POLL_JITTER_MS,
+    `${firstInitial} / ${secondInitial}`,
+  );
+}
+
+/* CJ-04: the contract's error code and the client's terminal rule ----------------- */
+
+console.log("\nthe jobs error contract (terminal vs transient)");
+{
+  equal("the contract lists exactly the error codes", [...JOB_ERROR_CODES], [
+    "bridge_too_old",
+    "registry_missing",
+    "rpc_failed",
+  ]);
+  equal("the terminal subset is the two unfixable codes", [...TERMINAL_JOB_ERROR_CODES], [
+    "bridge_too_old",
+    "registry_missing",
+  ]);
+  check("bridge_too_old is terminal", isTerminalJobsErrorCode("bridge_too_old"), true);
+  check("registry_missing is terminal", isTerminalJobsErrorCode("registry_missing"), true);
+  check("rpc_failed is not terminal", isTerminalJobsErrorCode("rpc_failed"), false);
+  check("an unknown code is not terminal", isTerminalJobsErrorCode("something_else"), false);
+  check("a missing code is not terminal", isTerminalJobsErrorCode(undefined), false);
+
+  const withTerminal = jobsList.output.safeParse({
+    available: false,
+    jobs: [],
+    error: { message: "old bridge", code: "bridge_too_old" },
+  });
+  check("jobs.list accepts a terminal code", withTerminal.success, true);
+  const withTransient = jobsList.output.safeParse({
+    available: false,
+    jobs: [],
+    error: { message: "flaky", code: "rpc_failed" },
+  });
+  check("jobs.list accepts a transient code", withTransient.success, true);
+  const unknownCode = jobsList.output.safeParse({
+    available: false,
+    jobs: [],
+    error: { message: "x", code: "not_a_code" },
+  });
+  check("jobs.list rejects an unknown code", unknownCode.success, false);
+  const legacy = jobsList.output.safeParse({ available: false, jobs: [], error: { message: "x" } });
+  check("a code-less error from an older server stays valid", legacy.success, true);
+
+  // The server half's wiring: the contract above only helps if the plugin
+  // actually sends the code. These three files are read as source because the
+  // behavior they pin runs inside the daemon's plugin process (a spawned `dsh`
+  // child, a Paseo connection) and cannot be driven offline; the client's half of
+  // the same contract is behaviour-tested below.
+  const repoRoot = path.resolve(__dirname, "..", "..");
+  const readRepo = (relative) => fs.readFileSync(path.join(repoRoot, relative), "utf8");
+  const dshProcessSource = readRepo("paseo-plugin/server/dsh-process.ts");
+  const providerSource = readRepo("paseo-plugin/server/provider.ts");
+  const serverEntrySource = readRepo("paseo-plugin/index.server.ts");
+  assert(
+    "an unknown bridge method answers bridge_too_old",
+    /code:\s*"bridge_too_old"/.test(dshProcessSource),
+  );
+  assert(
+    "a profile without a job registry is normalised to registry_missing",
+    /REGISTRY_MISSING_MESSAGE\s*\?\s*"registry_missing"\s*:\s*"rpc_failed"/.test(dshProcessSource),
+  );
+  assert(
+    "readAgentJobs forwards the error code",
+    /result\.error\?\.code\s*===\s*undefined\s*\?\s*\{\}\s*:\s*\{\s*code:\s*result\.error\.code\s*\}/.test(providerSource),
+  );
+  assert(
+    "the jobs.list RPC answers with the error object unchanged",
+    /\(result\.error === undefined \? \{\} : \{ error: result\.error \}\)/.test(serverEntrySource),
+  );
+}
+
+/* The controller, driven by a fake clock ----------------------------------------- */
+async function runControllerChecks() {
+
+  const { createFakeClock, createPollerHarness } = (() => {
+    function createFakeClock() {
+      let now = 0;
+      let nextId = 1;
+      const timers = new Map();
+      return {
+        setTimeout(fn, delay) {
+          const id = nextId;
+          nextId += 1;
+          timers.set(id, { at: now + delay, fn });
+          return id;
+        },
+        clearTimeout(id) {
+          timers.delete(id);
+        },
+        pendingDelays() {
+          return [...timers.values()].map((timer) => timer.at - now).sort((left, right) => left - right);
+        },
+        async advance(ms) {
+          const target = now + ms;
+          for (;;) {
+            let due = null;
+            for (const [id, timer] of timers) {
+              if (timer.at <= target && (due === null || timer.at < due.at)) due = { id, at: timer.at, fn: timer.fn };
+            }
+            if (due === null) break;
+            timers.delete(due.id);
+            now = due.at;
+            due.fn();
+            // Let the poll's promise chain and its next schedule land before the
+            // loop looks for the next due timer.
+            await new Promise((resolve) => setImmediate(resolve));
+            await new Promise((resolve) => setImmediate(resolve));
+          }
+          now = target;
+        },
+      };
+    }
+
+    function createPollerHarness(overrides = {}) {
+      const clock = createFakeClock();
+      const calls = { added: [], removed: [], states: [], errors: [], pages: [], reads: 0 };
+      const host = {
+        setTimeout: clock.setTimeout,
+        clearTimeout: clock.clearTimeout,
+        random: overrides.random ?? (() => 0),
+        readJobs:
+          overrides.readJobs ??
+          (async () => {
+            calls.reads += 1;
+            return { available: true, jobs: [] };
+          }),
+        listAgentPage:
+          overrides.listAgentPage ??
+          (async (cursor) => {
+            calls.pages.push(cursor);
+            return { entries: [], pageInfo: { hasMore: false, nextCursor: null } };
+          }),
+        addAgent(agent) {
+          calls.added.push(agent.id);
+        },
+        removeAgent(agentId, reason, error) {
+          calls.removed.push([agentId, reason, error === undefined ? undefined : error.code]);
+        },
+        publishState(agentId, state) {
+          calls.states.push([agentId, state]);
+        },
+        onError(message, error) {
+          calls.errors.push([message, error instanceof Error ? error.message : error]);
+        },
+      };
+      const poller = createJobsPoller(host);
+      return { clock, calls, poller };
+    }
+
+    return { createFakeClock, createPollerHarness };
+  })();
+
+  // CJ-03: the subscription snapshot is one page (the daemon caps it at 200
+  // entries). The controller must walk pageInfo.nextCursor, or agents after the
+  // first page never get a pill until an unrelated agent_update happens to name
+  // them.
+  console.log("\nagent-directory snapshot pagination");
+  {
+    const pages = [];
+    const harness = createPollerHarness({
+      listAgentPage: async (cursor) => {
+        pages.push(cursor);
+        return { entries: [{ agent: { id: "agent-2", workspaceId: "ws" } }], pageInfo: { hasMore: false, nextCursor: null } };
+      },
+    });
+    await harness.poller.applySnapshot({
+      entries: [{ agent: { id: "agent-1", workspaceId: "ws" } }],
+      pageInfo: { hasMore: true, nextCursor: "cursor-1" },
+    });
+    equal("both pages are registered", harness.calls.added, ["agent-1", "agent-2"]);
+    equal("the second page is fetched with the snapshot's cursor", pages, ["cursor-1"]);
+    equal("a terminating directory raises no pagination error", harness.calls.errors, []);
+    harness.poller.dispose();
+
+    // The reverse control: a one-page snapshot must not fetch a page at all. A
+    // controller that always paginates would pass the first half alone.
+    const single = createPollerHarness();
+    await single.poller.applySnapshot({
+      entries: [{ agent: { id: "only", workspaceId: "ws" } }],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    equal("a one-page snapshot makes no extra request", single.calls.pages, []);
+    single.poller.dispose();
+  }
+
+  // A reconnect can deliver a fresh snapshot while an older snapshot's next page
+  // is still in flight. The stale page must not resurrect its agents.
+  {
+    let release;
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const harness = createPollerHarness({
+      listAgentPage: async () => {
+        await gate;
+        return { entries: [{ agent: { id: "stale-agent", workspaceId: "ws" } }], pageInfo: { hasMore: false, nextCursor: null } };
+      },
+    });
+    const first = harness.poller.applySnapshot({
+      entries: [{ agent: { id: "fresh-1", workspaceId: "ws" } }],
+      pageInfo: { hasMore: true, nextCursor: "cursor-1" },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    await harness.poller.applySnapshot({
+      entries: [{ agent: { id: "fresh-2", workspaceId: "ws" } }],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    release();
+    await first;
+    assert("the stale page is discarded after a newer snapshot", !harness.calls.added.includes("stale-agent"));
+    equal("only the newest snapshot's agents are registered", harness.calls.added.filter((id) => id !== "fresh-1"), ["fresh-2"]);
+    harness.poller.dispose();
+  }
+
+  // CJ-02 (behaviour): the controller's own timers. A settled answer keeps the
+  // pill visible and polls at 4 s; once the session is empty the next interval
+  // backs off; failures grow 8 s → 16 s → the cap.
+  console.log("\npoll controller cadence");
+  {
+    let answer = { available: true, jobs: [{ status: "completed" }] };
+    const harness = createPollerHarness({
+      readJobs: async () => {
+        harness.calls.reads += 1;
+        return answer;
+      },
+      random: () => 0,
+    });
+    await harness.poller.applySnapshot({
+      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    equal("the first poll is scheduled immediately (random 0)", harness.clock.pendingDelays(), [0]);
+    await harness.clock.advance(0);
+    equal("the first readable answer publishes", harness.calls.states.length, 1);
+    check("the settled answer keeps the pill's state available", harness.calls.states[0][1].available, true);
+    equal("a visible pill schedules the base interval", harness.clock.pendingDelays(), [LIVE_POLL_MS]);
+
+    answer = { available: true, jobs: [] };
+    await harness.clock.advance(LIVE_POLL_MS);
+    equal("the empty answer publishes", harness.calls.states.length, 2);
+    equal("a hidden pill backs off", harness.clock.pendingDelays(), [HIDDEN_POLL_MS]);
+    harness.poller.dispose();
+  }
+  {
+    const harness = createPollerHarness({
+      readJobs: async () => {
+        harness.calls.reads += 1;
+        throw new Error("registry exploded");
+      },
+      random: () => 0,
+    });
+    await harness.poller.applySnapshot({
+      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    await harness.clock.advance(0);
+    check("a failed read publishes an unavailable state", harness.calls.states[0][1].available, false);
+    equal("the first failure backs off to 8 s", harness.clock.pendingDelays(), [LIVE_POLL_MS * 2]);
+    await harness.clock.advance(LIVE_POLL_MS * 2);
+    equal("the second failure backs off to 16 s", harness.clock.pendingDelays(), [LIVE_POLL_MS * 4]);
+    await harness.clock.advance(LIVE_POLL_MS * 4);
+    equal("the third failure is capped", harness.clock.pendingDelays(), [MAX_POLL_MS]);
+    harness.poller.dispose();
+  }
+
+  // CJ-04 (behaviour): a terminal code removes the pill and stops the timer; a
+  // transient code keeps retrying. The pair is the positive control — a
+  // controller that stopped on every error would pass the first half alone.
+  console.log("\npoll controller terminal errors");
+  {
+    const harness = createPollerHarness({
+      readJobs: async () => {
+        harness.calls.reads += 1;
+        return { available: false, jobs: [], error: { message: "reload the plugin", code: "bridge_too_old" } };
+      },
+    });
+    await harness.poller.applySnapshot({
+      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    await harness.clock.advance(0);
+    equal("a terminal error removes the pill", harness.calls.removed, [["a", "terminal", "bridge_too_old"]]);
+    equal("a terminal error leaves no timer behind", harness.clock.pendingDelays(), []);
+    await harness.clock.advance(60_000);
+    equal("a terminal error is never retried", harness.calls.reads, 1);
+    // A terminal code is not a permission refusal: an upsert for the same agent
+    // must not bring the retry loop back (a plugin reload is what resets it).
+    harness.poller.upsert({ id: "a", workspaceId: "ws" });
+    equal("an upsert does not re-register a terminal agent", harness.calls.added, ["a"]);
+    equal("an upsert does not restart a terminal agent", harness.clock.pendingDelays(), []);
+    harness.poller.dispose();
+  }
+  {
+    const harness = createPollerHarness({
+      readJobs: async () => {
+        harness.calls.reads += 1;
+        return { available: false, jobs: [], error: { message: "flaky", code: "rpc_failed" } };
+      },
+    });
+    await harness.poller.applySnapshot({
+      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    await harness.clock.advance(0);
+    equal("a transient error keeps the pill", harness.calls.removed, []);
+    assert("a transient error keeps a retry timer", harness.clock.pendingDelays().length === 1);
+    harness.poller.dispose();
+  }
+  {
+    const refusal = Object.assign(new Error("Session is not authorized for plugin.rpc.invoke.request"), {
+      code: "access_denied",
+    });
+    const harness = createPollerHarness({
+      readJobs: async () => {
+        throw refusal;
+      },
+    });
+    await harness.poller.applySnapshot({
+      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    await harness.clock.advance(0);
+    equal("a permission refusal stops the pill", harness.calls.removed, [["a", "unauthorized", undefined]]);
+    equal("a permission refusal leaves no timer", harness.clock.pendingDelays(), []);
+    // A reconnect can widen permissions, so the agent is not terminal: a later
+    // upsert must build a fresh registration and poll again. Without this half, a
+    // controller that simply stopped forever would pass the assertions above.
+    harness.poller.upsert({ id: "a", workspaceId: "ws" });
+    equal("a later upsert re-registers the agent", harness.calls.added, ["a", "a"]);
+    assert("a later upsert schedules a new poll", harness.clock.pendingDelays().length === 1);
+    harness.poller.dispose();
+  }
+
+  // Two agents from one snapshot must not share a first tick: the initial delay is
+  // jittered per agent by the injected random source.
+  {
+    const draws = [0, 0.5];
+    const harness = createPollerHarness({
+      random: () => draws.shift() ?? 0,
+      readJobs: async () => ({ available: true, jobs: [] }),
+    });
+    await harness.poller.applySnapshot({
+      entries: [
+        { agent: { id: "a", workspaceId: "ws" } },
+        { agent: { id: "b", workspaceId: "ws" } },
+      ],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    const initialDelays = harness.clock.pendingDelays();
+    assert(
+      "two agents do not receive the same first delay",
+      initialDelays.length === 2 && initialDelays[0] !== initialDelays[1],
+      JSON.stringify(initialDelays),
+    );
+    harness.poller.dispose();
+  }
+
+
+  /* ---------------------------------------------------------------------------- */
+}
+
+runControllerChecks()
+  .then(() => {
+    console.log(`\n${checks - failures}/${checks} checks passed`);
+    if (failures > 0) {
+      console.error(`${failures} FAILED`);
+      process.exit(1);
+    }
+    console.log("OK");
+  })
+  .catch((error) => {
+    console.error("controller checks crashed:", error);
+    process.exit(1);
+  });

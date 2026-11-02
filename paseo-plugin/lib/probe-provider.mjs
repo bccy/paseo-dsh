@@ -38,8 +38,11 @@
  * ### A failure to answer is not a refusal
  *
  * `400`/`404`/`422` on one `reasoning_effort` spelling is evidence about that
- * spelling. A `429`, a `5xx` or a transport error is evidence about nothing —
- * eight consecutive calls make rate limiting likely — so those are reported as
+ * spelling only when the error body names the parameter under test. A `401`,
+ * `402` or `403` is auth/quota/policy, a `429`, a `5xx` or a transport error
+ * says the route never answered, and a generic 4xx does not point at the
+ * parameter at all — eight consecutive calls make rate limiting likely, and a
+ * revoked key answers like a capability rejection. All of those are reported as
  * *unknown* rather than folded into "no spelling was accepted", which used to
  * end in advice to declare a reasoning route as non-reasoning.
  *
@@ -137,14 +140,29 @@ function reasoningChars(message) {
 /**
  * Whether a failed attempt is evidence about *capability*.
  *
- * Only a 4xx that is not a throttle says "this route refused this request".
- * `429`, `408`, a `5xx` or a transport failure says the route never answered,
- * which must not be read as a refusal.
+ * Only a 4xx whose body names the dimension this probe changed says "the route
+ * refused this request". Everything else is evidence about the environment, not
+ * the capability:
+ *
+ *   - `401`/`402`/`403` are auth, quota and policy failures. A revoked key or an
+ *     exhausted quota answers exactly like a gateway that rejects a parameter,
+ *     and folding that into "this route does not reason" turns a temporary
+ *     outage into a permanent profile downgrade.
+ *   - `408`, `429`, a `5xx` or a transport failure says the route never answered.
+ *   - a generic `400`/`404`/`422` ("bad request", "model not found") does not
+ *     point at the parameter under test either.
+ *
+ * `dimension` is the one request field that differs from the baseline call:
+ * `"developerRole"` or `"reasoningEffort"`.
  */
-function isVerdict(result) {
+function isVerdict(result, dimension) {
   if (result.ok) return true;
+  if (result.status === 401 || result.status === 402 || result.status === 403) return false;
   if (result.status < 400 || result.status >= 500) return false;
-  return result.status !== 429 && result.status !== 408;
+  if (result.status === 408 || result.status === 429) return false;
+  const detail = typeof result.detail === "string" ? result.detail : "";
+  if (dimension === "developerRole") return /\bdeveloper\b/i.test(detail);
+  return /reasoning/i.test(detail);
 }
 
 /** One chat completion, reporting whether the endpoint accepted the request. */
@@ -207,7 +225,7 @@ async function probeModel(endpoint, apiKey, model) {
   });
   // `undefined` means "could not tell", which must not print as REJECTED: the
   // advice attached to that verdict changes the user's profile.
-  findings.developerRole = developer.ok ? true : isVerdict(developer) ? false : undefined;
+  findings.developerRole = developer.ok ? true : isVerdict(developer, "developerRole") ? false : undefined;
   findings.developerDetail = developer.ok ? undefined : developer.detail;
 
   for (const level of CANDIDATE_LEVELS) {
@@ -222,7 +240,7 @@ async function probeModel(endpoint, apiKey, model) {
       ok: result.ok,
       status: result.status,
       detail: result.detail,
-      verdict: isVerdict(result),
+      verdict: isVerdict(result, "reasoningEffort"),
     });
   }
   return findings;
@@ -338,7 +356,7 @@ export async function runProbe(argv, program = "paseo-dsh probe") {
       // reasoning route got declared as a non-reasoning one.
       process.stdout.write(
         `\n  ${unknown.length} of ${findings.levels.length} spellings never got an answer `
-        + "(throttling or a transport error), so this is not a result.\n"
+        + "(an auth/quota refusal, throttling, or a transport error), so this is not a result.\n"
         + "  Re-run before declaring anything about this route's reasoning support.\n",
       );
     } else if (accepted.length === 0) {

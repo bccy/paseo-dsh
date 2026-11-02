@@ -35,7 +35,8 @@
  *
  * Usage: node harness/image-host-path-check.mjs
  */
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -443,8 +444,146 @@ const copyHolds = (extension) => {
   );
 }
 
+// ---- BR-08: the compatibility cache is private, and every reuse is checked ----
+// The copy directory lives in the OS temp dir, which is world-writable. A name
+// that only contains the uid is not ownership: another local user can create it
+// first, and a recursive `mkdir` silently accepts both that directory and a
+// symlink to one. The staging name used to be predictable (`<target>.<pid>.tmp`),
+// so a pre-placed symlink there was followed by `copyFileSync`; and a target
+// symlink of the same size was reused instead of the real copy.
+//
+// These cases need a module instance whose `tmpdir()` is the scenario root, and
+// `COPY_DIRECTORY` is computed at import time, so each scenario runs in a fresh
+// child process with its own `TMPDIR`. The assertion is on the bytes a host
+// would fetch and on the victim file staying untouched — not on internal
+// function names.
+const BR08_SCENARIO = `
+import { chmodSync, lstatSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { hostImagePath } from ${JSON.stringify(new URL('../dsh-bridge/lib/image-host-path.js', import.meta.url).href)};
+
+const root = process.env.SCENARIO_ROOT;
+const scenario = process.argv[2];
+const uid = typeof process.getuid === 'function' ? process.getuid() : 'user';
+const cache = join(root, 'paseo-dsh-attachments-' + uid);
+const storeDir = join(root, 'store');
+mkdirSync(storeDir, { recursive: true });
+const digest = 'f'.repeat(64);
+const source = join(storeDir, digest);
+writeFileSync(source, 'SOURCE_BYTES');
+const victim = join(root, 'victim');
+let victimDir;
+if (scenario === 'dir-symlink') {
+  victimDir = join(root, 'victim-dir');
+  mkdirSync(victimDir);
+  symlinkSync(victimDir, cache);
+} else if (scenario === 'dir-wide') {
+  mkdirSync(cache, { mode: 0o777 });
+  chmodSync(cache, 0o777);
+} else if (scenario === 'target-symlink') {
+  mkdirSync(cache, { mode: 0o700 });
+  writeFileSync(victim, 'VICTIM_BYTES');
+  symlinkSync(victim, join(cache, digest + '.png'));
+} else if (scenario === 'staging-symlink') {
+  mkdirSync(cache, { mode: 0o700 });
+  writeFileSync(victim, 'VICTIM_BYTES');
+  symlinkSync(victim, join(cache, digest + '.png.' + process.pid + '.tmp'));
+}
+const returned = hostImagePath(source, 'image/png');
+let copyBytes;
+try { copyBytes = readFileSync(returned, 'utf8'); } catch { copyBytes = undefined; }
+let victimBytes;
+try { victimBytes = readFileSync(victim, 'utf8'); } catch { victimBytes = undefined; }
+let cacheMode;
+try { cacheMode = (lstatSync(cache).mode & 0o777).toString(8); } catch { cacheMode = undefined; }
+let victimDirFiles = [];
+try { victimDirFiles = readdirSync(victimDir); } catch { victimDirFiles = []; }
+process.stdout.write(JSON.stringify({ returned, copyBytes, victimBytes, cacheMode, victimDirFiles }));
+`;
+
+const BR08_ROOT = mkdtempSync(join(tmpdir(), 'image-host-path-br08-'));
+const BR08_SCRIPT = join(BR08_ROOT, 'scenario.mjs');
+writeFileSync(BR08_SCRIPT, BR08_SCENARIO);
+/** Run one BR-08 scenario in its own process, with a private TMPDIR. */
+const runBr08 = (scenario) => {
+  const root = join(BR08_ROOT, scenario);
+  mkdirSync(root, { recursive: true });
+  const child = spawnSync(process.execPath, [BR08_SCRIPT, scenario], {
+    env: { ...process.env, TMPDIR: root, SCENARIO_ROOT: root },
+    encoding: 'utf8',
+    timeout: 10_000,
+  });
+  if (child.status !== 0) return { error: child.stderr || `exit ${child.status}` };
+  try {
+    return JSON.parse(child.stdout);
+  } catch (error) {
+    return { error: `unparseable scenario output: ${child.stdout} (${error.message})` };
+  }
+};
+const br08Cache = (scenario, suffix = '') =>
+  join(BR08_ROOT, scenario, `paseo-dsh-attachments-${typeof process.getuid === 'function' ? process.getuid() : 'user'}`, `ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff${suffix}`);
+const SOURCE_BYTES = 'SOURCE_BYTES';
+{
+  // A symlinked cache directory: using it would write inside somebody else's
+  // directory. The contract of this module is that a picture that cannot be
+  // copied still delivers the store's own path.
+  const scenario = 'dir-symlink';
+  const out = runBr08(scenario);
+  check(
+    'a cache directory that is a symlink is refused and the store path is returned',
+    out.error === undefined
+      && out.returned === join(BR08_ROOT, scenario, 'store', 'f'.repeat(64))
+      && Array.isArray(out.victimDirFiles) && out.victimDirFiles.length === 0,
+    out.error ?? `returned=${out.returned} victimDirFiles=${JSON.stringify(out.victimDirFiles)}`,
+  );
+}
+{
+  // A pre-existing directory owned by this user but left world-writable: the
+  // mode must be repaired before anything is written into it.
+  const scenario = 'dir-wide';
+  const out = runBr08(scenario);
+  check(
+    'an existing cache directory with group/other permissions is tightened to 0700',
+    out.error === undefined
+      && out.returned === br08Cache(scenario, '.png')
+      && out.copyBytes === SOURCE_BYTES
+      && out.cacheMode === '700',
+    out.error ?? `returned=${out.returned} mode=${out.cacheMode} bytes=${JSON.stringify(out.copyBytes)}`,
+  );
+}
+{
+  // A same-size symlink at the deterministic target: the old size-only guard
+  // reused it and the host fetched the victim's bytes. Reuse must require a real
+  // regular file; the atomic rename then replaces the link itself.
+  const scenario = 'target-symlink';
+  const out = runBr08(scenario);
+  check(
+    'a same-size symlink at the target is never reused; the real copy replaces it',
+    out.error === undefined
+      && out.returned === br08Cache(scenario, '.png')
+      && out.copyBytes === SOURCE_BYTES
+      && out.victimBytes === 'VICTIM_BYTES',
+    out.error ?? `returned=${out.returned} copy=${JSON.stringify(out.copyBytes)} victim=${JSON.stringify(out.victimBytes)}`,
+  );
+}
+{
+  // The old, predictable staging name with a pre-placed symlink. The random
+  // exclusive staging file must leave the victim alone.
+  const scenario = 'staging-symlink';
+  const out = runBr08(scenario);
+  check(
+    'a symlink at the old predictable staging path is not followed',
+    out.error === undefined
+      && out.returned === br08Cache(scenario, '.png')
+      && out.copyBytes === SOURCE_BYTES
+      && out.victimBytes === 'VICTIM_BYTES',
+    out.error ?? `returned=${out.returned} copy=${JSON.stringify(out.copyBytes)} victim=${JSON.stringify(out.victimBytes)}`,
+  );
+}
+
 // The copies are a cache the module reuses, so clear only what this run wrote.
 rmSync(WORK, { recursive: true, force: true });
+rmSync(BR08_ROOT, { recursive: true, force: true });
 for (const extension of ['.png', '.jpg']) rmSync(copyFor(extension), { force: true });
 
 const failed = results.filter((result) => !result.pass).length;

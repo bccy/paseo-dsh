@@ -78,6 +78,7 @@ const {
   SEP_RADIUS,
   SEP_SIZE,
   TERMINAL_MAX_LINES,
+  TERMINAL_OUTPUT_MAX_HEIGHT,
   WEB_GAP,
   WEB_META_GAP,
   WEB_PADDING_HORIZONTAL,
@@ -765,6 +766,10 @@ console.log("folding and caps for the next phase");
   equal("a diff fold is head 5 + tail 4", FOLD_LINES.diff, 5 + 4);
   equal("search folds head 4 + tail 4", FOLD_LINES.search, 4 + 4);
   equal("terminal never folds", TERMINAL_MAX_LINES, Number.POSITIVE_INFINITY);
+  // DSH binds this to `--dsl-terminal-output-max-height` on `.terminalBody` and
+  // `.output` uses it as `max-height`; the whole output is rendered and this is
+  // the only thing keeping a long log from pushing the timeline down.
+  equal("the terminal output scrolls in 224px", TERMINAL_OUTPUT_MAX_HEIGHT, 224);
   equal("the code card caps at 260px", CODE_MAX_HEIGHT, 260);
 }
 

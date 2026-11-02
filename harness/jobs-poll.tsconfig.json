@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "baseUrl": "../paseo-plugin",
+    "paths": {
+      "@getpaseo/plugin": ["node_modules/@getpaseo/plugin/dist/index.d.ts"]
+    },
+    "rootDir": "../paseo-plugin",
+    "outDir": "../paseo-plugin/.dbg-poll"
+  },
+  "files": [
+    "../paseo-plugin/client/poll-sequence.ts",
+    "../paseo-plugin/client/jobs-polling.ts",
+    "../paseo-plugin/shared/jobs.ts"
+  ]
+}

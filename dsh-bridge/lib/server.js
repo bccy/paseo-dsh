@@ -17,6 +17,7 @@
  * @module dsh-paseo-bridge/server
  */
 import { readSessionProjections } from './session-projections.js';
+import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { brandString } from '@deepseek-ai/dsh-brand';
 import { BlockAssembler, createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
@@ -106,9 +107,111 @@ function withTimeout(promise, ms, label) {
   ]).finally(() => clearTimeout(timer));
 }
 
+/**
+ * Await one persistence operation under a deadline the backend can observe.
+ *
+ * `SessionPersistence.open` and `SessionHandle.read` both accept an optional
+ * `signal`, but the open contract only promises cancellation "observed before
+ * backend work starts" (`dsh-session-persistence` types). A backend may ignore
+ * it, or finish between its last abort check and its return, so a bare
+ * `Promise.race` has two failure modes: the work keeps running after the caller
+ * gave up, and a handle returned by a late `open` has no owner — the caller's
+ * `finally` still sees `undefined` — so it stays open for the life of the
+ * shared process.
+ *
+ * `onLate` disposes a value the deadline made unreachable (only `open` produces
+ * one). The rejection keeps the `timed out …` marker so callers can still tell
+ * a deadline apart from a store that threw.
+ *
+ * @param {(signal: AbortSignal) => Promise<any>} start
+ * @param {number} ms
+ * @param {string} label
+ * @param {(value: any) => Promise<void>} [onLate]
+ */
+async function withDeadline(start, ms, label, onLate) {
+  const controller = new AbortController();
+  let timedOut = false;
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      reject(new Error(`timed out ${label}`));
+    }, ms);
+  });
+  let guarded;
+  try {
+    guarded = start(controller.signal).then(
+      async (value) => {
+        if (!timedOut) return value;
+        if (onLate !== undefined) {
+          try {
+            await onLate(value);
+          } catch {
+            /* the value is already unreachable; closing it is best-effort */
+          }
+        }
+        throw new Error(`timed out ${label}`);
+      },
+      (error) => {
+        if (timedOut) throw new Error(`timed out ${label}`);
+        throw error;
+      },
+    );
+  } catch (error) {
+    clearTimeout(timer);
+    throw error;
+  }
+  try {
+    return await Promise.race([guarded, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** A `withTimeout` rejection, as opposed to a lookup that simply found nothing. */
 function isTimeout(error) {
   return error instanceof Error && error.message.startsWith('timed out ');
+}
+
+/**
+ * Canonical form of one path for the importable-session cwd filter.
+ *
+ * `realpathSync` folds symlinks and separator spelling. When the path cannot be
+ * resolved (deleted workspace, a filter for a workspace that no longer exists,
+ * or a permissions error), fall back to `resolve`'s lexical normalization. The
+ * fallback errs toward matching on purpose: the host filters the returned rows
+ * again with its own realpath matcher, so a false positive costs one row the
+ * host drops, while a false negative hides a session the user can never find.
+ */
+function canonicalCwd(value) {
+  try {
+    return realpathSync(value);
+  } catch {
+    return resolve(value);
+  }
+}
+
+/**
+ * Whether one stored session's cwd belongs to the requested workspace.
+ *
+ * A superset of the host's `createRealpathAwarePathMatcher`, not a reproduction:
+ * direct string equality first (the common case, no syscall), then both sides
+ * canonicalized so a symlinked workspace or trailing separator still matches.
+ * The result is filtered again by the host, so matching too much is safe while
+ * dropping a row here is irreversible. The per-call cache keeps a large
+ * `persistence.list()` from paying one `realpath` syscall per snapshot when most
+ * sessions share a workspace.
+ */
+function matchesCwdFilter(candidate, filter, canonicalFilter, cache) {
+  if (typeof candidate !== 'string') return false;
+  if (candidate === filter) return true;
+  let canonical = cache.get(candidate);
+  if (canonical === undefined) {
+    canonical = canonicalCwd(candidate);
+    cache.set(candidate, canonical);
+  }
+  return canonical === canonicalFilter;
 }
 
 /**
@@ -188,8 +291,8 @@ const MAX_SESSION_ROUTE_ENTRIES = 500;
  * A description exists to title a *live* background job. A turn that runs more
  * than this many commands has long since settled the earliest ones, so trimming
  * the oldest entry costs nothing the pill could still draw. The cap exists
- * because the table is otherwise only emptied at `turn/end`, and a single long
- * turn is exactly when it would grow without bound.
+ * because the table is otherwise only emptied when the session closes, and a
+ * single long turn is exactly when it would grow without bound.
  */
 const MAX_TOOL_DESCRIPTIONS = 200;
 
@@ -323,6 +426,19 @@ export class PaseoHarnessServer {
     this.sessions = new Map();
     this.sessionCreations = new Map();
     /**
+     * sessionId -> the prompt deliveries currently between admission and their
+     * `followup`/`steer`, as `{ canceled }` records.
+     *
+     * A cold session's first prompt creates its agent asynchronously, so a
+     * `session/cancel` can arrive before there is any agent on which to call
+     * `cancel`. The old code answered "unknown or not-yet-created session" and
+     * the prompt's own followup then opened the very turn the user stopped.
+     * `cancel` marks these records instead; `prompt` applies the mark right
+     * after the delivery that opens its turn, because DSH's cancel is a no-op
+     * while idle and does not arm later work.
+     */
+    this.promptDeliveries = new Map();
+    /**
      * DSH session ids with a rewind currently running. A second rewind would
      * compute its range from the same surface that the first is about to
      * replace, so it is refused instead of serialised — by the time it ran, the
@@ -352,7 +468,9 @@ export class PaseoHarnessServer {
      * failure path must agree on which execution they are releasing, and DSH
      * gives no other shared handle. The `identity` field is the execution's own
      * `token` (every real execution has one) so a reused call id cannot release
-     * somebody else's ticket.
+     * somebody else's ticket. `root` is the gate root whose lease the ticket
+     * holds, so a close can release tickets of descendants it never recorded in
+     * `children` (a child that has not emitted yet).
      */
     this.fileMutationTickets = new Map();
     /**
@@ -402,9 +520,10 @@ export class PaseoHarnessServer {
      * agree on. A command run twice in one session resolves to its latest
      * description, which is the right answer for a row that only ever shows one.
      *
-     * Dropped at `turn/end` and capped per session: a description is only
-     * useful while its job is listed, and a session that runs thousands of
-     * commands must not grow this table for the life of the process.
+     * Dropped when the session closes (`#forgetSessionState`) and capped per
+     * session: a description is only useful while its job is listed, and a
+     * session that runs thousands of commands must not grow this table for the
+     * life of the process.
      */
     this.toolDescriptions = new Map();
     /**
@@ -1066,20 +1185,55 @@ export class PaseoHarnessServer {
         + 'send `initialize` with this sessionId before prompting',
       );
     }
-    const rec = await this.getOrCreateSession(sessionId);
-    this.assertLiveAgent(rec, params.sessionId);
-    const content = await durablePromptContent(this.ctx, params.contentBlocks ?? []);
-    this.assertLiveAgent(rec, params.sessionId);
-    // The exact value `append('user/message', …)` will record as its
-    // `source.kind` — computed once so the receipt cannot disagree with the log.
-    const source = promptSource(content);
-    const message = createUserMessage({ content, source });
-    // A steer belongs inside the turn already running; a plain prompt starts the
-    // next one. Without this distinction an interjection queues behind the very
-    // turn it was meant to correct.
-    if (params.delivery === 'steer') rec.handle.agent.steer(message);
-    else rec.handle.agent.followup(message);
-    return { messageId: String(message.id), sourceKind: String(source.kind) };
+    // Track the delivery before the first await: this is the window in which a
+    // `session/cancel` has no agent to aim at yet (cold session) or no turn to
+    // cancel yet (attachment admission on a live one). See `cancel`.
+    const delivery = this.#beginPromptDelivery(sessionId);
+    try {
+      const rec = await this.getOrCreateSession(sessionId);
+      this.assertLiveAgent(rec, params.sessionId);
+      const content = await durablePromptContent(this.ctx, params.contentBlocks ?? []);
+      this.assertLiveAgent(rec, params.sessionId);
+      // The exact value `append('user/message', …)` will record as its
+      // `source.kind` — computed once so the receipt cannot disagree with the log.
+      const source = promptSource(content);
+      const message = createUserMessage({ content, source });
+      // A steer belongs inside the turn already running; a plain prompt starts the
+      // next one. Without this distinction an interjection queues behind the very
+      // turn it was meant to correct.
+      if (params.delivery === 'steer') rec.handle.agent.steer(message);
+      else rec.handle.agent.followup(message);
+      if (delivery.canceled) {
+        // A stop arrived while this delivery was in flight. It could not be
+        // applied there: DSH cancels only active work and does not arm later
+        // work, so cancelling before this delivery would let the followup open
+        // the very turn the user stopped. Apply it after the turn is open.
+        rec.handle.agent.cancel({ kind: 'user' });
+      }
+      return { messageId: String(message.id), sourceKind: String(source.kind) };
+    } finally {
+      this.#endPromptDelivery(sessionId, delivery);
+    }
+  }
+
+  /** Track one prompt between admission and the delivery that opens its turn. */
+  #beginPromptDelivery(sessionId) {
+    let deliveries = this.promptDeliveries.get(sessionId);
+    if (deliveries === undefined) {
+      deliveries = new Set();
+      this.promptDeliveries.set(sessionId, deliveries);
+    }
+    const delivery = { canceled: false };
+    deliveries.add(delivery);
+    return delivery;
+  }
+
+  /** Drop one finished delivery; the map only holds in-flight deliveries. */
+  #endPromptDelivery(sessionId, delivery) {
+    const deliveries = this.promptDeliveries.get(sessionId);
+    if (deliveries === undefined) return;
+    deliveries.delete(delivery);
+    if (deliveries.size === 0) this.promptDeliveries.delete(sessionId);
   }
 
   /**
@@ -1087,7 +1241,27 @@ export class PaseoHarnessServer {
    * the conversation can continue afterwards.
    */
   async cancel(params) {
-    const rec = this.requireSession(params.sessionId);
+    const sessionId = String(params.sessionId);
+    // Mark every delivery that has not reached its followup/steer yet. This
+    // covers the cold-session window (agent creation in flight) and the shorter
+    // one where a live agent is still being prepared: both are "the user pressed
+    // stop before the turn opened".
+    const deliveries = this.promptDeliveries.get(sessionId);
+    if (deliveries !== undefined) {
+      for (const delivery of deliveries) delivery.canceled = true;
+    }
+    const rec = this.sessions.get(sessionId);
+    if (rec === undefined) {
+      if (deliveries === undefined) {
+        // No live agent and no prompt being delivered: there is nothing to
+        // stop. Keep the loud refusal instead of answering "canceled".
+        throw new Error(`unknown or not-yet-created session: ${sessionId}`);
+      }
+      // The prompt we just marked is creating the agent. Its delivery applies
+      // the stop as soon as the turn is opened, so this receipt is honest.
+      return { canceled: true };
+    }
+    this.assertLiveAgent(rec, sessionId);
     rec.handle.agent.cancel({ kind: 'user' });
     return { canceled: true };
   }
@@ -1513,8 +1687,21 @@ export class PaseoHarnessServer {
       process.stderr.write(`[bridge] listing stored sessions failed: ${message}\n`);
       return { available: false, sessions: [], error: { message } };
     }
-    const query = typeof params.query === 'string' && params.query !== '' ? params.query.toLowerCase() : undefined;
+    // `query` is deliberately NOT applied here: the host matches it against
+    // title / firstPromptPreview / lastPromptPreview / cwd basename after the
+    // provider answers (`agent-manager.listImportableSessions`), and those
+    // fields live in the log prefix, so any header-only filter would be narrower
+    // than the host's and could never be recovered.
+    //
+    // `cwd` must be applied — before truncation. Without a query the host asks
+    // for only `limit + importedCount` rows (`import-sessions.js:36-57`) and
+    // filters cwd itself only afterwards; answering with the newest rows from
+    // every workspace pushes the requested workspace out of the scan. The
+    // predicate is a superset of the host's realpath matcher (see
+    // {@link matchesCwdFilter}), so it can only admit rows the host may keep.
     const cwdFilter = typeof params.cwd === 'string' && params.cwd !== '' ? params.cwd : undefined;
+    const canonicalCwdFilter = cwdFilter === undefined ? undefined : canonicalCwd(cwdFilter);
+    const canonicalCwdCache = new Map();
     const candidates = [];
     // DSH's archive state is authoritative and Paseo's session summary has no
     // field for it (`ProviderSessionSummary` is persistence/cwd/title/description/
@@ -1532,8 +1719,12 @@ export class PaseoHarnessServer {
       const id = snapshot?.header?.id === undefined ? undefined : String(snapshot.header.id);
       if (id === undefined || id === '') continue;
       if (underArchivedSession(headers, archived, id)) continue;
-      if (cwdFilter !== undefined && snapshot.header.cwd !== cwdFilter) continue;
-      if (query !== undefined && !id.toLowerCase().includes(query)) continue;
+      if (
+        cwdFilter !== undefined
+        && !matchesCwdFilter(snapshot.header.cwd, cwdFilter, canonicalCwdFilter, canonicalCwdCache)
+      ) {
+        continue;
+      }
       candidates.push(snapshot);
     }
     candidates.sort((a, b) => (b.header.createdAt ?? 0) - (a.header.createdAt ?? 0));
@@ -1557,8 +1748,17 @@ export class PaseoHarnessServer {
     };
     let handle;
     try {
-      handle = await withTimeout(persistence.open(id, 'read'), 10000, 'opening session summary');
-      const result = await withTimeout(handle.read(0, 200), 10000, 'reading session summary');
+      handle = await withDeadline(
+        (signal) => persistence.open(id, 'read', { signal }),
+        10000,
+        'opening session summary',
+        (late) => late?.close?.(),
+      );
+      const result = await withDeadline(
+        (signal) => handle.read(0, 200, { signal }),
+        10000,
+        'reading session summary',
+      );
       let title;
       let preview;
       for (const event of result.events ?? []) {
@@ -1600,7 +1800,12 @@ export class PaseoHarnessServer {
     try {
       // A session mid-write can stall a read; bound it so a stuck read never
       // stalls the session open that asked for the replay.
-      handle = await withTimeout(persistence.open(params.sessionId, 'read'), 15000, 'opening session history');
+      handle = await withDeadline(
+        (signal) => persistence.open(params.sessionId, 'read', { signal }),
+        15000,
+        'opening session history',
+        (late) => late?.close?.(),
+      );
     } catch (error) {
       // A session that was never materialized has no history, and an empty list
       // is the honest answer for it. A stalled open is a different fact.
@@ -1618,7 +1823,11 @@ export class PaseoHarnessServer {
       return unavailableHistory(error);
     }
     try {
-      const result = await withTimeout(handle.read(), 15000, 'reading session history');
+      const result = await withDeadline(
+        (signal) => handle.read(0, undefined, { signal }),
+        15000,
+        'reading session history',
+      );
       // `inheritedEventCount` is the fork-inherited prefix length: a caller
       // replaying a child must start after it, or a forked child re-shows its
       // parent's conversation as its own.
@@ -1860,11 +2069,17 @@ export class PaseoHarnessServer {
    * Remember which root human message dispatched a delegated session's current
    * turn.
    *
-   * Called for every session event; only a child's own `turn/start` matters. A
-   * fresh delegation starts its turn inside the dispatching turn, and a resumed
-   * continuable child starts it while the parent's new turn is running — in both
-   * cases the root's newest human message at that moment is the instruction the
-   * child is executing. See `child-anchors.js`.
+   * Called for every session event; only a child's own `turn/start` matters. The
+   * anchor comes from the **direct dispatcher**: a child of the root uses the
+   * root's newest human message (the turn that is running the delegation), while
+   * a grandchild inherits the anchor its parent child is executing under. The
+   * root's latest message is deliberately not consulted for a grandchild — it
+   * may belong to an unrelated later turn, and attributing the work to it made a
+   * rewind cancel a grandchild the user had kept (BR-03).
+   *
+   * Fail-open: a dispatcher that is not live in this process, or whose own
+   * anchor was never observed, records nothing and leaves a diagnostic — a
+   * guessed anchor kills work the user kept.
    *
    * @param {object} session
    * @param {{type?: string}} event
@@ -1875,12 +2090,24 @@ export class PaseoHarnessServer {
     try {
       const root = this.rootSessionFor(session);
       if (root === undefined) return;
-      const anchorSeq = this.latestHumanAnchor(root);
-      if (anchorSeq === undefined) return;
-      // The owning root is part of the anchor, not an afterthought: with several
-      // sessions in one process, `12` under root A and `12` under root B are
-      // different human messages, and a rewind in A must not touch B's children.
-      this.childAnchors.record(session.id, anchorSeq, root.id);
+      const parentId = session?.header?.parentSession;
+      const parent = parentId === undefined ? undefined : this.ctx.get('sessions')?.get(parentId);
+      if (parent === undefined) {
+        process.stderr.write(
+          `[bridge] delegated turn anchor not recorded for ${session.id}: its dispatcher is not a live session\n`,
+        );
+        return;
+      }
+      const decision = this.childAnchors.recordDelegatedTurn(session.id, {
+        parentId: parent.id,
+        rootId: root.id,
+        latestRootAnchor: String(parent.id) === String(root.id) ? this.latestHumanAnchor(root) : undefined,
+      });
+      if (decision.reason !== undefined) {
+        process.stderr.write(
+          `[bridge] delegated turn anchor not recorded for ${session.id}: ${decision.reason}\n`,
+        );
+      }
     } catch (error) {
       process.stderr.write(
         `[bridge] could not record a delegated turn anchor: ${error instanceof Error ? error.message : String(error)}\n`,
@@ -1891,18 +2118,21 @@ export class PaseoHarnessServer {
   /**
    * The journal anchor for one editing tool call.
    *
-   * A delegated session anchors to the turn that dispatched its current run; a
-   * root session (or a child whose turn start this process never saw) anchors to
-   * the root's newest human message, which is the pre-existing behavior.
+   * A root session anchors to its own newest human message at execution time. A
+   * delegated session anchors to the turn that dispatched its current run; when
+   * this process never observed that turn (a child already running before the
+   * bridge started), there is no provable anchor and the caller skips the
+   * snapshot. Guessing the root's latest message would file the edit under a
+   * turn that did not cause it.
    *
    * @param {object} session - the session that ran the tool.
    * @param {object} root - the root session whose journal receives the snapshot.
    * @returns {number | undefined}
    */
   snapshotAnchorFor(session, root) {
-    const recorded = this.childAnchors.anchorFor(session.id);
-    if (recorded !== undefined) return recorded;
-    return this.latestHumanAnchor(root);
+    if (session?.id === undefined || root?.id === undefined) return undefined;
+    if (String(session.id) === String(root.id)) return this.latestHumanAnchor(root);
+    return this.childAnchors.anchorFor(session.id);
   }
 
   /**
@@ -1911,8 +2141,9 @@ export class PaseoHarnessServer {
    *
    * A native subagent edits files from its own session, whose log a parent
    * rewind cannot address; the human rewinds the root session. Recording the
-   * edit under the root — anchored to the root's newest human message at
-   * execution time — is what lets the parent's `both` rewind undo it.
+   * edit under the root — anchored to the turn that dispatched the delegated
+   * run (see `child-anchors.js`) — is what lets the parent's `both` rewind undo
+   * it.
    *
    * Fails open: when the chain cannot be resolved (a parent session is not
    * live, a header lacks `parentSession`, or the chain loops) the edit is not
@@ -2088,7 +2319,7 @@ export class PaseoHarnessServer {
     // share. It is required rather than defaulted to `exec`: a fallback object
     // comparison would only exist to make synthetic fixtures work, and a fixture
     // should carry the token instead of production carrying a branch for it.
-    const ticket = { identity: exec.token, release: undefined };
+    const ticket = { identity: exec.token, release: undefined, root: String(root.id) };
     this.fileMutationTickets.set(key, ticket);
     try {
       ticket.release = await this.fileMutationGate.enter(String(root.id), exec.signal);
@@ -2151,8 +2382,8 @@ export class PaseoHarnessServer {
    *
    * The snapshot is keyed under the ROOT session: a rewind restores files by
    * reading that session's journal, so an edit made by a delegated subagent is
-   * recorded against the newest human message of the conversation the user
-   * actually rewinds.
+   * recorded against the dispatch turn of the run that made it (root edits use
+   * the newest human message at execution time).
    *
    * @param {{name?: string, callId?: unknown, arguments?: unknown, agent?: {session?: object}}} exec
    */
@@ -2170,7 +2401,14 @@ export class PaseoHarnessServer {
         return;
       }
       const anchorSeq = this.snapshotAnchorFor(session, owner);
-      if (anchorSeq === undefined) return;
+      if (anchorSeq === undefined) {
+        if (isDelegatedSession(session)) {
+          process.stderr.write(
+            `[bridge] file snapshot skipped: no observed dispatch turn for delegated session ${session.id}\n`,
+          );
+        }
+        return;
+      }
       // Resolve exactly like the editing tool does: `workingDirectory.ensure`
       // (validation + recovery), not the recorded value and not the header.
       const cwd = await this.workingDirectoryFor(exec);
@@ -2269,7 +2507,9 @@ export class PaseoHarnessServer {
    *
    * @param {object} agent - the root agent (an exact live ancestor authority).
    * @param {number} targetSeq
-   * @returns {string[]} child session ids the bridge signalled.
+   * @returns {string[]} child session ids to join afterwards: every signalled id,
+   *   plus the ones whose interrupt was refused (those keep running, so the join
+   *   is the only remaining bounded chance to see them stop).
    */
   cancelWithdrawnDelegations(agent, targetSeq) {
     const subagents = this.ctx.get('subagents');
@@ -2295,32 +2535,54 @@ export class PaseoHarnessServer {
         `[bridge] interrupted ${result.signalled.length} delegated agent(s) whose dispatch turn was withdrawn\n`,
       );
     }
-    return result.signalled;
+    return [...result.signalled, ...result.failed.map((entry) => entry.childId)];
   }
 
   /**
    * Give interrupted delegated work a bounded moment to observe the cancel.
    *
    * `SubagentRuntime.interrupt` is fire-and-return, and the file restore runs
-   * right after it. `waitForChildren` joins progressing descendants (it never
-   * cancels anything); the three-second cap bounds the rewind's latency. A
-   * timeout is reported because files restored after it could still be written
-   * by a child that had not noticed the cancel.
+   * right after it. Only the children this rewind withdrew are joined (including
+   * the ones whose interrupt was refused): a child anchored before the target
+   * keeps running by design, and if it is waiting for the file gate this rewind
+   * holds, joining it would deadlock until the three-second cap
+   * (`waitForChildren` is based on `whenIdle`). Its writes are anchored before
+   * the target, so they are not part of this restore and must not delay it.
+   *
+   * A signalled id that is not live has nothing left to observe: `interrupt`
+   * already accepted it as a no-op. The three-second cap bounds the rewind's
+   * latency; a timeout is reported because files restored after it could still
+   * be written by a child that had not noticed the cancel.
    *
    * @param {object} agent - the root agent whose descendants were interrupted.
+   * @param {string[]} childIds - the ids `cancelWithdrawnDelegations` returned.
    */
-  async settleDelegatedWork(agent) {
-    const subagents = this.ctx.get('subagents');
-    if (subagents === undefined || typeof subagents.waitForChildren !== 'function') return;
+  async settleDelegatedWork(agent, childIds) {
+    if (childIds.length === 0) return;
     try {
+      const agents = this.ctx.get('agents');
+      const subagents = this.ctx.get('subagents');
+      let waits;
+      if (agents !== undefined && typeof agents.get === 'function') {
+        waits = [];
+        for (const childId of childIds) {
+          const child = agents.get(childId);
+          if (child === undefined || child.status === 'idle') continue;
+          if (typeof child.whenIdle === 'function') waits.push(child.whenIdle());
+        }
+        if (waits.length === 0) return;
+      } else {
+        if (subagents === undefined || typeof subagents.waitForChildren !== 'function') return;
+        waits = [subagents.waitForChildren(agent)];
+      }
       await withTimeout(
-        subagents.waitForChildren(agent),
+        Promise.all(waits),
         3000,
         'waiting for delegated work to observe the rewind interrupt',
       );
     } catch (error) {
       process.stderr.write(
-        `[bridge] delegated work did not settle after the rewind interrupt: ${error instanceof Error ? error.message : String(error)}\n`,
+        `[bridge] delegated work withdrawn by the rewind did not settle after the interrupt: ${error instanceof Error ? error.message : String(error)}\n`,
       );
     }
   }
@@ -2373,6 +2635,7 @@ export class PaseoHarnessServer {
       // destructive interpretation of a request we do not understand.
       throw new Error(`不支持的回退范围：${String(params.scope)}`);
     }
+    const restores = restoresFiles(scope);
     const sessionKey = String(session.id);
     if (this.revertInflight.has(sessionKey)) {
       throw new Error('该会话已有撤回正在进行，请稍候再试');
@@ -2385,16 +2648,21 @@ export class PaseoHarnessServer {
       // after it is idle and use that.
       const preliminary = planRewind(session.surface.nodes, (seq) => session.eventAt(seq), params.token);
       if (!preliminary.ok) throw new Error(preliminary.reason);
-      await this.settleAgentForRevert(agent);
-      // `runMaintenance` is DSH's own exclusive scope for one agent: while it runs,
-      // that agent's tools are held out. It does **not** cover the agent's
+      // `runMaintenance` is DSH's own exclusive scope for one agent: while it
+      // runs, that agent's tools are held out. It does **not** cover the agent's
       // independently running descendants, so the file gate is taken inside it —
       // together they cover "the root and its children stop mutating files".
-      if (typeof agent.runMaintenance !== 'function') {
+      //
+      // Only a file restore needs either. A conversation-only rewind changes no
+      // file, so making it depend on this internal method (no stability promise
+      // from upstream) would turn a DSH rename into "every rewind fails" for no
+      // safety gain. Refuse before cancelling the user's turn, not after.
+      if (restores && typeof agent.runMaintenance !== 'function') {
         throw new Error('DSH agent has no runMaintenance contract for file recovery');
       }
-      return await agent.runMaintenance(async (signal) => {
-      const releaseFiles = await this.fileMutationGate.freeze(sessionKey, signal);
+      await this.settleAgentForRevert(agent);
+      const applyRewind = async (signal) => {
+      const releaseFiles = restores ? await this.fileMutationGate.freeze(sessionKey, signal) : undefined;
       try {
       const resolved = planRewind(session.surface.nodes, (seq) => session.eventAt(seq), params.token);
       if (!resolved.ok) throw new Error(resolved.reason);
@@ -2403,7 +2671,10 @@ export class PaseoHarnessServer {
       // untouched. An empty plan is not an error — the agent may not have edited
       // any file since that message.
       let filePlan;
-      if (restoresFiles(scope)) {
+      // Paths that changed after the target but whose snapshot could not be
+      // taken. They cannot be restored; the receipt must say so (BF-03).
+      let unrecoverable = [];
+      if (restores) {
         const planned = await this.fileSnapshots.planRestore(sessionKey, resolved.targetSeq);
         if (planned.skippedLines > 0) {
           process.stderr.write(`[bridge] ${planned.skippedLines} unreadable file-snapshot journal line(s) were ignored\n`);
@@ -2470,8 +2741,8 @@ export class PaseoHarnessServer {
       // writing behind the restore (and anchor those writes to an older message,
       // leaving them impossible to revert). `interrupt` is fire-and-return, so
       // give the children a bounded moment to observe it before touching files.
-      this.cancelWithdrawnDelegations(agent, resolved.targetSeq);
-      await this.settleDelegatedWork(agent);
+      const interruptedChildren = this.cancelWithdrawnDelegations(agent, resolved.targetSeq);
+      await this.settleDelegatedWork(agent, interruptedChildren);
       if (filePlan !== undefined) {
         try {
           // Re-plan after durability and cancellation. The first plan was taken
@@ -2480,11 +2751,17 @@ export class PaseoHarnessServer {
           // out, but a ticket taken earlier still had to drain) would be missing
           // from it — that file would be left modified and its journal line pruned
           // as if it had been handled.
-          filePlan = (await this.fileSnapshots.planRestore(sessionKey, resolved.targetSeq)).actions;
+          const finalPlanned = await this.fileSnapshots.planRestore(sessionKey, resolved.targetSeq);
+          filePlan = finalPlanned.actions;
+          unrecoverable = finalPlanned.unrecoverable;
         } catch (error) {
           // The conversation rewind already happened, so this cannot be a failure
-          // of the whole request; it is a file-layer failure and is reported as
-          // one, with the journal named because that is the retry material.
+          // of the whole request. It is not a per-file restore failure either:
+          // nothing was planned, so nothing was restored and no rescue copy can
+          // exist. Reporting it through `failed` would make the provider say the
+          // journal "failed to restore" and that its content "was rescued" —
+          // both false. `error` is the plan-failure channel; the journal stays
+          // named because it is the retry material.
           return {
             kind: 'success',
             text: successText(resolved.targetSeq),
@@ -2493,20 +2770,36 @@ export class PaseoHarnessServer {
               deleted: [],
               skipped: [],
               rescue: [],
-              rescueDir: this.fileSnapshots.rescueDir(sessionKey),
-              failed: [{ path: this.fileSnapshots.journalPath(sessionKey), error: String(error) }],
+              rescueDir: '',
+              failed: [],
+              error: `文件恢复计划失败，未执行任何恢复：${error instanceof Error ? error.message : String(error)}；journal 保留为重试材料：${this.fileSnapshots.journalPath(sessionKey)}`,
             },
           };
         }
       }
       if (filePlan !== undefined && filePlan.length > 0) {
         files = await this.fileSnapshots.restore(sessionKey, filePlan);
+        // A path that changed after the target but whose pre-image could not be
+        // captured is just as unrestored as one the restore skipped; Paseo has one
+        // user-visible "skipped" list for that outcome. The detailed reason stays
+        // on `unrecoverable` so the notice can say why no backup exists for it.
+        files.unrecoverable = unrecoverable;
+        if (unrecoverable.length > 0) {
+          files.skipped = [...new Set([
+            ...files.skipped,
+            ...unrecoverable.map((entry) => entry.path),
+          ])];
+        }
         if (files.failed.length > 0 || files.skipped.length > 0) {
           // Do not prune/trim/GC after a partial failure: the failed paths' backup
           // objects and journal lines are the only retry material, and dropping
-          // them would make a second rewind silently no-op.
+          // them would make a second rewind silently no-op. The same applies to
+          // paths whose snapshot was never taken — their journal line is the
+          // only record that they changed and cannot be restored.
           process.stderr.write(
-            `[bridge] file restore failed for ${files.failed.map((entry) => entry.path).join(', ')}; `
+            `[bridge] file restore incomplete (failed: ${files.failed.map((entry) => entry.path).join(', ') || 'none'}; `
+            + `skipped: ${files.skipped.join(', ') || 'none'}; `
+            + `not captured: ${unrecoverable.map((entry) => entry.path).join(', ') || 'none'}); `
             + `journal kept for retry, rescue copies in ${files.rescueDir}\n`,
           );
         } else {
@@ -2523,7 +2816,15 @@ export class PaseoHarnessServer {
           });
         }
       } else if (filePlan !== undefined) {
-        files = { restored: [], deleted: [], skipped: [], failed: [], rescue: [], rescueDir: this.fileSnapshots.rescueDir(sessionKey) };
+        files = {
+          restored: [],
+          deleted: [],
+          skipped: unrecoverable.map((entry) => entry.path),
+          unrecoverable,
+          failed: [],
+          rescue: [],
+          rescueDir: this.fileSnapshots.rescueDir(sessionKey),
+        };
       }
       return {
         kind: 'success',
@@ -2533,9 +2834,11 @@ export class PaseoHarnessServer {
       } finally {
         // Release the exclusive side even when the rewind threw part-way: leaving
         // it held would refuse every later tracked edit in this conversation.
-        releaseFiles();
+        releaseFiles?.();
       }
-      });
+      };
+      if (!restores) return await applyRewind(undefined);
+      return await agent.runMaintenance(async (signal) => applyRewind(signal));
     } finally {
       this.revertInflight.delete(sessionKey);
     }
@@ -2748,10 +3051,10 @@ export class PaseoHarnessServer {
    * above it already read in Chinese. The call's mandatory `description` is what
    * DSH's own UI titles that row with, and {@link rememberToolDescription}
    * captured it at `tools/execute`. The job's registration record carries the
-   * call id, but `JobView` does not, so the only bridge between them is a
-   * timeline read — done here, best-effort, and only for jobs whose label still
-   * looks like a command. Anything that fails leaves the command in place: a
-   * worse title is not a reason to drop the job.
+   * call id, but `JobView` does not, so the command text is the only shared key:
+   * {@link toolDescriptionFor} looks that command up in the per-session table.
+   * A missing entry leaves the command in place — a worse title is not a reason
+   * to drop the job.
    *
    * @param {{sessionId: string}} params - must be the caller's own session id.
    */
@@ -3332,6 +3635,7 @@ export class PaseoHarnessServer {
     this.pendingPresets.delete(sessionId);
     this.pendingPlanMode.delete(sessionId);
     this.pendingMcpServers.delete(sessionId);
+    this.promptDeliveries.delete(sessionId);
     this.children.delete(sessionId);
     // Bash descriptions only exist to title a listed job; a closed session has
     // no jobs left to list, and the table is per session.
@@ -3346,6 +3650,20 @@ export class PaseoHarnessServer {
     // holding a mid-flight edit's file contents for the life of the process:
     // `pending` only shrinks in capture/commit/discard, never on close.
     const prefix = `${sessionId}:`;
+    // File-mutation tickets are keyed the same way. Dropping the map entry
+    // without releasing it would leave the gate's active count raised forever,
+    // and the closed root's next freeze would wait out its 15s budget and fail
+    // the rewind. A ticket still waiting in `gate.enter` has no release yet;
+    // deleting it is enough — `beginFileMutation` re-checks identity when the
+    // entry resolves and releases/throws rather than admitting a retired write.
+    // `ticket.root` covers a descendant that ran a tracked tool before the bridge
+    // recorded it in `children`: its key is prefixed by the CHILD id, but the
+    // lease it holds belongs to the root being closed.
+    for (const [key, ticket] of [...this.fileMutationTickets]) {
+      if (!key.startsWith(prefix) && ticket.root !== sessionId) continue;
+      this.fileMutationTickets.delete(key);
+      ticket.release?.();
+    }
     for (const key of [...this.snapshotOwners.keys()]) {
       if (key.startsWith(prefix)) this.snapshotOwners.delete(key);
     }
@@ -3601,17 +3919,66 @@ export class PaseoHarnessServer {
       });
     }
     const rec = { handle, control };
-    this.controls.set(sessionId, control);
-    this.sessions.set(sessionId, rec);
     // Consume the queued plan intent and DELETE the key. Leaving it in place (or
     // resetting a single process-wide boolean) is what forced plan mode onto
     // every later session in the process after one session asked for it.
+    //
+    // Applied BEFORE the record is published, and in BOTH directions. Paseo's
+    // open selects build (plan=false) as well as plan; reading only the `true`
+    // case deleted a `false` intent without applying it, so a persisted
+    // plan=true session stayed in plan mode after the user chose build. And
+    // publication is the "ready" signal: if the application throws after it,
+    // the record claims a live session whose requested mode was dropped.
     if (this.pendingPlanMode.has(sessionId)) {
       const wanted = this.pendingPlanMode.get(sessionId) === true;
-      this.pendingPlanMode.delete(sessionId);
+      const disposeUnpublished = async () => {
+        // The agent exists but was never published. Dispose it, or the retry
+        // meets its write lease ("already owned by an active write handle").
+        // The intent stays queued for that retry.
+        try {
+          control.dispose?.();
+        } catch (error) {
+          process.stderr.write(
+            `[bridge] disposing the model selection of a session whose queued plan intent failed `
+            + `to apply failed for ${sessionId}: ${error instanceof Error ? error.message : String(error)}\n`,
+          );
+        }
+        try {
+          await handle.dispose?.();
+        } catch (error) {
+          process.stderr.write(
+            `[bridge] disposing a session created for a queued plan intent that failed to apply `
+            + `failed for ${sessionId}: ${error instanceof Error ? error.message : String(error)}\n`,
+          );
+        }
+      };
       const planMode = this.ctx.get('planMode');
-      if (wanted && planMode !== undefined) planMode.set(handle.agent, true);
+      if (planMode === undefined) {
+        await disposeUnpublished();
+        throw new Error(`plan mode is not mounted in this profile (session ${sessionId})`);
+      }
+      let outcome;
+      try {
+        outcome = planMode.set(handle.agent, wanted);
+      } catch (error) {
+        await disposeUnpublished();
+        throw error;
+      }
+      // DSH reports `committed` for an immediate log write, `noop` when the
+      // state already matches, and `cancelled` when an opposite pending selection
+      // was cleared — all leave the logged state equal to `wanted`. `queued`
+      // means an open turn held it back; a freshly created agent should not have
+      // one, so report it instead of silently pretending the mode changed.
+      if (outcome === 'queued') {
+        process.stderr.write(
+          `[bridge] the queued plan intent for session ${sessionId} is still pending in DSH `
+          + `(requested active=${String(wanted)}); it applies at the next accepted step\n`,
+        );
+      }
+      this.pendingPlanMode.delete(sessionId);
     }
+    this.controls.set(sessionId, control);
+    this.sessions.set(sessionId, rec);
     return rec;
   }
 

@@ -13,7 +13,8 @@
  *
  * @module dsh-paseo/server/bootstrap
  */
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { BRIDGE_FILES, BRIDGE_PACKAGE_NAME, PROFILE_PATCH_TEMPLATE_BASE64 } from "./bridge-assets";
@@ -100,6 +101,99 @@ function writeIfAbsent(path: string, content: string): boolean {
   return true;
 }
 
+/** A sibling directory name for one bridge generation; unique per call. */
+function bridgeGenerationPath(parent: string, prefix: string): string {
+  return join(
+    parent,
+    `${prefix}${String(process.pid)}-${String(Date.now())}-${Math.random().toString(36).slice(2, 8)}`,
+  );
+}
+
+/** SHA-256 of one buffer, used to verify what actually reached the disk. */
+function digest(data: Buffer): string {
+  return createHash("sha256").update(data).digest("hex");
+}
+
+/**
+ * Write the embedded bridge into a fresh directory and verify every file.
+ *
+ * The verification is not ceremony: `writeFileSync` returning normally is not a
+ * promise that the bytes on disk are complete (a full disk or a failing overlay
+ * can leave a short file), and a half bridge is only discovered when the first
+ * session fails to start. A generation that fails either the length or the hash
+ * check throws here, before anything is renamed into place.
+ *
+ * @param dir - the (not yet published) generation directory.
+ */
+function writeBridgeGeneration(dir: string): void {
+  mkdirSync(dir, { recursive: true });
+  for (const [relativePath, encoded] of Object.entries(BRIDGE_FILES)) {
+    const target = join(dir, relativePath);
+    mkdirSync(dirname(target), { recursive: true });
+    const expected = Buffer.from(encoded, "base64");
+    writeFileSync(target, expected);
+    const written = readFileSync(target);
+    if (written.length !== expected.length || digest(written) !== digest(expected)) {
+      throw new Error(
+        `bridge file "${relativePath}" did not survive its write `
+          + `(${String(written.length)} of ${String(expected.length)} bytes)`,
+      );
+    }
+  }
+}
+
+/**
+ * Replace the profile's bridge directory with the embedded copy, atomically.
+ *
+ * The new generation is staged and verified beside the target first; only then
+ * is the old directory moved aside and the staged one renamed into place. A
+ * failure at any point leaves the previous generation in place (or restores it),
+ * so a disk error cannot leave the profile with half a bridge until the next
+ * plugin load. `renameSync` within one directory is the atomic publish step.
+ *
+ * @param bridgeDir - `node_modules/dsh-paseo-bridge` in the profile.
+ */
+function replaceBridge(bridgeDir: string): void {
+  const parent = dirname(bridgeDir);
+  const staging = bridgeGenerationPath(parent, `.${BRIDGE_PACKAGE_NAME}.staging-`);
+  const previous = bridgeGenerationPath(parent, `.${BRIDGE_PACKAGE_NAME}.previous-`);
+  let previousHoldsOld = false;
+  try {
+    writeBridgeGeneration(staging);
+    if (existsSync(bridgeDir)) {
+      // `rename` cannot replace a non-empty directory, and clearing the old one
+      // first is exactly the window this function exists to remove. Move it
+      // aside only after the replacement is complete and verified.
+      renameSync(bridgeDir, previous);
+      previousHoldsOld = true;
+    }
+    renameSync(staging, bridgeDir);
+  } catch (error) {
+    rmSync(staging, { recursive: true, force: true });
+    if (!existsSync(bridgeDir) && previousHoldsOld) {
+      try {
+        renameSync(previous, bridgeDir);
+      } catch (restoreError) {
+        const cause = error instanceof Error ? error.message : String(error);
+        const restore = restoreError instanceof Error ? restoreError.message : String(restoreError);
+        throw new Error(
+          `could not replace the bridge (${cause}) and the previous generation could not be restored (${restore})`,
+        );
+      }
+    }
+    throw error;
+  }
+  if (previousHoldsOld) {
+    // The switch already succeeded; a leftover generation directory is harmless
+    // and must not turn a usable profile into a reported provisioning failure.
+    try {
+      rmSync(previous, { recursive: true, force: true });
+    } catch {
+      /* best-effort cleanup */
+    }
+  }
+}
+
 export interface ProvisionResult {
   profile: string;
   dir: string;
@@ -127,14 +221,10 @@ export function ensurePaseoProfile(): ProvisionResult {
 
   // Replace whatever bridge is present — an older copy, or the symlink the
   // repo's install.sh creates — so the profile always matches this plugin build.
+  // Generation staging + verification + rename keeps a failed copy from ever
+  // becoming the live bridge; see {@link replaceBridge}.
   const bridgeDir = join(dir, "node_modules", BRIDGE_PACKAGE_NAME);
-  if (existsSync(bridgeDir)) rmSync(bridgeDir, { recursive: true, force: true });
-  mkdirSync(bridgeDir, { recursive: true });
-  for (const [relativePath, encoded] of Object.entries(BRIDGE_FILES)) {
-    const target = join(bridgeDir, relativePath);
-    mkdirSync(dirname(target), { recursive: true });
-    writeFileSync(target, Buffer.from(encoded, "base64"));
-  }
+  replaceBridge(bridgeDir);
 
   // The one file the user owns: never overwrite an existing model route.
   const patch = join(dir, "cordis.patch.yml");

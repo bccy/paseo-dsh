@@ -468,6 +468,28 @@ assert("the live rows are drawn outside the fold", /\{live\.map\(\(job\) =>/.tes
 assert("no dead fallback for an unreachable empty split",
   !/live\.length === 0 && settled\.length === 0/.test(pillSource));
 
+// CJ-01: the pill is visible for any job, and the copy has two counts. The rule
+// itself is a pure function asserted in `jobs-poll-check.cjs`; these are the
+// wires that make it reach the composer instead of a live-only count computed in
+// the JSX. The old shape — `visible = next.available ? count > 0 : true` with
+// `count` = live rows — is asserted absent: it hid a settled-only session, which
+// is exactly why a default-expanded section could never be opened.
+assert("the pill's presentation comes from the shared rule",
+  /const\s+presentation\s*=\s*jobsPillPresentation\(next\)/.test(pillSource));
+assert("visibility is reported from that rule", /visible:\s*presentation\.visible/.test(pillSource));
+assert("the live count uses the live label",
+  /text\.liveLabel\(\s*presentation\.label\.count\s*\)/.test(pillSource));
+assert("the idle total uses the idle label",
+  /text\.idleLabel\(\s*presentation\.label\.count\s*\)/.test(pillSource));
+assert("the old live-only visibility rule is gone",
+  !/next\.available\s*\?\s*count\s*>\s*0/.test(pillSource));
+assert("the old live-only counter is gone", !/liveCount\(next\.jobs\)/.test(pillSource));
+// Polling policy moved out of the JSX module, so the interval constants and the
+// per-agent `setInterval` are not in this file any more; the controller owns
+// them (and `jobs-poll-check.cjs` drives it with a fake clock).
+assert("the pill delegates polling to the controller", /createJobsPoller<Job>\(/.test(pillSource));
+assert("the pill no longer creates its own intervals", !/setInterval\(/.test(pillSource));
+
 console.log("\npermission refusal");
 
 const refusal = Object.assign(new Error("Session is not authorized for plugin.rpc.invoke.request code=access_denied"), {

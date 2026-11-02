@@ -26,6 +26,9 @@
  *      i.e. the call is not merely made, it is made at a point where it can still
  *      see the journal
  *   4. `resume` (a reopen) repeats it for the new writer epoch
+ *   5. the live agent exposes `runMaintenance`, the internal method a
+ *      file-restoring rewind runs inside. It is an instance method of a class DSH
+ *      does not export, so only a real created agent can be checked (RW-02).
  *
  * ## The hook choice this pins
  *
@@ -295,6 +298,17 @@ try {
   pass('…and the first capture resumes the durable high water instead of restarting', `${String(firstCapture.captureSeq)} > ${String(high)}`);
 
   assert.equal(ctx.agents.get(sessionId), created.handle.agent);
+  // The bridge's file-restoring rewind calls `agent.runMaintenance` on this exact
+  // live object. The method lives on a class DSH does not export (`ReactLoopAgent`),
+  // so an import-level contract check cannot see it; a real created agent is the
+  // only honest place to assert it still exists. If upstream renames it, fail here
+  // instead of every `both` rewind failing on a real machine.
+  assert.equal(
+    typeof created.handle.agent.runMaintenance,
+    'function',
+    'the live DSH agent must expose runMaintenance (the exclusive scope a file-restoring rewind runs in)',
+  );
+  pass('the live agent exposes runMaintenance for the file-restoring rewind');
   await server.closeSession({ sessionId });
   assert.equal(persistence.writers.has(sessionId), false, 'the write lease must be released');
 

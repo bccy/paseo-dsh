@@ -10,8 +10,10 @@
  * `dsh` child process and the provider protocol has no request shape that would
  * carry those events to the app — inventing one is the self-invented protocol
  * this repo forbids. A plugin can define its own RPC, which is request/response,
- * so the pill asks on a timer. One timer per agent, not one for the composer: the
- * count has to be known before that composer is shown.
+ * so the pill asks on a timer. One timer per agent, not one for the composer:
+ * the count has to be known before that composer is shown. The polling policy
+ * itself (interval, jitter, backoff, terminal errors) lives in `./jobs-polling`
+ * so it can be driven by a fake clock instead of reviewed by eye.
  *
  * **What is never shown.** An unreadable registry is not "no jobs": the RPC
  * answers `available: false` with the runtime's own message and the popover says
@@ -28,8 +30,8 @@ import type {
 import { Icon } from "@getpaseo/plugin/client/ui";
 import { useEffect, useState } from "react";
 import { Platform, Pressable, Text, View, type PressableStateCallbackType } from "react-native";
-import { isLiveStatus, jobsList, splitJobs, type Job } from "../shared/jobs";
-import { PROVIDER_ID } from "../shared/provider";
+import { jobsList, splitJobs, type Job } from "../shared/jobs";
+import { createJobsPoller, jobsPillPresentation, type JobsViewState } from "./jobs-polling";
 import {
   CHEVRON_BOX,
   FACTS_FONT_SIZE,
@@ -41,7 +43,6 @@ import {
   TITLE_FONT_SIZE,
   chevronColorToken,
   chevronRotation,
-  isPermissionDeniedError,
   popoverRootBox,
   rowActiveFill,
   rowBox,
@@ -51,17 +52,7 @@ import {
   type JobStatus,
 } from "./jobs-popover-layout";
 import { JobsSpinner } from "./jobs-spinner";
-import { createPollSequence } from "./poll-sequence";
 import { localeText, type JobsText } from "./locale";
-
-/**
- * How often each agent's job list is re-read.
- *
- * Four seconds: fast enough that a job the user just started is on the pill,
- * slow enough that a screen full of agents is not a steady stream of IPC. Paired
- * with the server's `JOBS_READ_TIMEOUT_MS` (15 s) — see the in-flight skip below.
- */
-const POLL_MS = 4000;
 
 /** One agent's latest answer, plus the listeners the popover subscribes with. */
 interface AgentJobs {
@@ -76,12 +67,9 @@ interface AgentJobs {
 /** The live answer per agent, shared by the pill's label and its popover. */
 type JobStore = Map<string, AgentJobs>;
 
-/** One agent's registered pill and its poll state. */
-interface AgentEntry {
+/** One agent's registered pill. Polling state lives in `./jobs-polling`. */
+interface PillEntry {
   readonly registration: PluginButtonRegistration;
-  timer: ReturnType<typeof setInterval>;
-  /** A poll is already awaiting the daemon; this tick is skipped. */
-  inFlight: boolean;
   /**
    * Whether the last `update` left the spinner in the icon slot.
    *
@@ -94,17 +82,6 @@ interface AgentEntry {
    * actually changes, which is the one thing that guarantees the ring never stutters.
    */
   spinning: boolean;
-  /**
-   * Set when the daemon refused this RPC on **permission** grounds.
-   *
-   * A restricted client (a hub-routed connection, or one whose
-   * `sessionPermissions` ceiling omits `daemon.manage`) is refused
-   * `plugin.rpc.invoke` outright — see {@link isPermissionDenied}. That answer is
-   * not "the registry could not be read": retrying cannot change it, so the
-   * entry stops polling and its pill is hidden instead of showing an error every
-   * four seconds forever. See {@link POLL_MS} and the catch branch in `poll`.
-   */
-  unauthorized: boolean;
 }
 
 function publish(store: JobStore, agentId: string, next: Omit<AgentJobs, "listeners">): void {
@@ -118,11 +95,6 @@ function publish(store: JobStore, agentId: string, next: Omit<AgentJobs, "listen
       /* a popover that threw while re-rendering must not stop the others */
     }
   }
-}
-
-/** The number of jobs still doing work; what the pill counts. */
-function liveCount(jobs: readonly Job[]): number {
-  return jobs.filter((job) => isLiveStatus(job.status)).length;
 }
 
 /** The popover's body type, so the theme slot is not spelled out at every call. */
@@ -384,7 +356,11 @@ function SettledHeader({
  * and while anything is live the finished half collapses to a single header.
  * This mirrors DSH's own job list (`settledExpanded = settledOpen ?? liveRows.length === 0`);
  * it is not a local invention. With nothing running there is no reason to hide
- * history, so the section starts open — and then it is the only content anyway.
+ * history, so the section starts open — and the pill stays visible on that
+ * retained history (`jobsPillPresentation`), which is what makes this branch
+ * reachable at all. Counting only live rows hid the pill the moment the last job
+ * settled, so the finished section could only be opened while some *other* job
+ * was still running.
  *
  * **Why the root has a negative margin.** A plugin popover body is wrapped in
  * `PluginPopoverContent` (12pt on every side) while a host track panel's rows go
@@ -444,6 +420,12 @@ function makeJobsPopover(store: JobStore, agentId: string) {
       );
     }
 
+    // A transient guard rather than the idle path. With history visible the pill
+    // stays up for as long as the session has any job, so an idle session renders
+    // the finished section below instead of this line; the popover only lands
+    // here while it is still mounted and its store row is missing — before the
+    // first poll, or when a terminal read is about to hide the pill. The body
+    // must render something rather than throw.
     if (entry === undefined || entry.jobs.length === 0) {
       return (
         <View style={root}>
@@ -514,30 +496,23 @@ function makeJobsPopover(store: JobStore, agentId: string) {
   return JobsPopover;
 }
 
+/** The daemon's page limit for the agent directory; also the max its schema accepts. */
+const AGENT_DIRECTORY_PAGE_SIZE = 200;
+
 /**
  * Register one pill per agent of this provider and keep it current.
  *
  * Returns the contribution's cleanup, which Paseo calls when the plugin, the
  * client entrypoint or the host connection goes away: every timer, every pill
- * and the agent observation are released there.
+ * and the agent observation are released there. Polling itself is
+ * `createJobsPoller`; this function owns the host objects the controller cannot
+ * see — the React store the popover reads, the composer registration, and the
+ * locale.
  */
 export function contributeJobsPill(client: PluginClientContext) {
   const store: JobStore = new Map();
-  /**
-   * agentId -> the registration, its poll timer, and the in-flight flag.
-   *
-   * One entry per agent because the RPC is per agent. The sequence counter is
-   * deliberately **not** here — see {@link sequence}.
-   */
-  const agents = new Map<string, AgentEntry>();
-  /**
-   * Which poll answer is allowed to publish.
-   *
-   * A module of its own so the rule is testable without React. Numbers are
-   * globally monotonic and never reset, so a number issued before any teardown
-   * can never look newest again.
-   */
-  const sequence = createPollSequence();
+  /** agentId -> the composer registration and its last icon state. */
+  const pills = new Map<string, PillEntry>();
   const lifetime = new AbortController();
   // Captured here and handed to the popover rather than read through a React
   // context: a popover body is rendered by the host's own tree, and depending on
@@ -545,211 +520,117 @@ export function contributeJobsPill(client: PluginClientContext) {
   // surface".
   const rpc = (input: { agentId: string }) => client.rpc(jobsList, input);
 
-  const apply = (agentId: string, entry: AgentEntry, next: Omit<AgentJobs, "listeners">) => {
-    /**
-     * Publish only for the entry that is **currently registered**.
-     *
-     * The sequence guard is not enough on its own: `remove()` deletes the entry
-     * and the agent can be registered again in the same tick, and an answer
-     * already past its `await` must not write into the new entry's store row or
-     * call `update()` on the old registration. Comparing entry identity covers
-     * every teardown path without each one remembering to invalidate something.
-     */
-    if (agents.get(agentId) !== entry) return;
-    if (lifetime.signal.aborted) return;
-    publish(store, agentId, next);
+  /**
+   * Publish one poll answer: the popover store first (its listeners redraw from
+   * it), then the registration. The visibility/label rule is
+   * {@link jobsPillPresentation}; this function only turns its keys into copy and
+   * keeps the icon patch conditional.
+   */
+  const publishState = (agentId: string, next: JobsViewState<Job>) => {
+    const entry = pills.get(agentId);
+    if (entry === undefined) return;
+    publish(store, agentId, {
+      jobs: [...next.jobs],
+      available: next.available,
+      ...(next.error === undefined ? {} : { error: next.error }),
+    });
+    const presentation = jobsPillPresentation(next);
     const text = localeText().jobs;
-    const count = next.available ? liveCount(next.jobs) : 0;
-    // A runtime that could not be read is not "nothing running" — it keeps the
-    // pill visible so the popover can explain itself.
-    const visible = next.available ? count > 0 : true;
-    // Written on **every** update: `update()` merges, so omitting it would leave
-    // a stale count on screen after a failed read.
-    const label = !next.available ? text.title : count > 0 ? text.label(count) : text.title;
-    /**
-     * Spinner while jobs run, static mark otherwise — and sent **only when the
-     * boolean flips**. `update()` merges, so re-sending the same component every
-     * tick makes the host republish the button, and a republish that swaps the
-     * component identity restarts the animation from zero: the ring visibly
-     * stutters once per poll.
-     *
-     * The static mark only appears with `available: false`, where it must not
-     * spin — a turning ring is this UI's word for "working", so spinning on a
-     * failed read would claim progress that is not happening.
-     */
-    const spinning = count > 0;
-    const iconPatch = spinning === entry.spinning ? {} : { icon: spinning ? JobsSpinner : "ListChecks" };
-    entry.spinning = spinning;
+    const label =
+      presentation.label.kind === "live"
+        ? text.liveLabel(presentation.label.count)
+        : presentation.label.kind === "idle"
+          ? text.idleLabel(presentation.label.count)
+          : text.title;
+    // `update()` merges, so the icon is sent only when the boolean flips — see
+    // `PillEntry.spinning`.
+    const iconPatch =
+      presentation.spinning === entry.spinning
+        ? {}
+        : { icon: presentation.spinning ? JobsSpinner : "ListChecks" };
+    entry.spinning = presentation.spinning;
     /**
      * `title` is the neutral noun, **never the count**: on compact the popover is
      * a sheet and the sheet's header is drawn from the button's title, so a title
      * carrying the count would make this the one panel whose heading changes
      * while you look at it. The count belongs on the label.
      */
-    entry.registration.update({ visible, label, title: text.title, ...iconPatch });
+    entry.registration.update({ visible: presentation.visible, label, title: text.title, ...iconPatch });
   };
 
-  /**
-   * One poll, with the three guards that keep the count monotonic in time.
-   *
-   * **In-flight skip.** The server bounds a read at `JOBS_READ_TIMEOUT_MS` (15 s)
-   * while this fires every 4 s, so without it a slow daemon would stack four
-   * concurrent RPCs per agent.
-   *
-   * **Sequence guard.** A pill can be removed and re-registered while its
-   * previous poll is in flight, and without a guard the stale answer lands last
-   * and the count steps backwards. Only the newest issued poll may publish — see
-   * `./poll-sequence`.
-   *
-   * **Entry guard.** `apply()` refuses an answer whose entry is no longer
-   * registered, which covers the teardown paths the sequence cannot see.
-   */
-  const poll = async (agentId: string, entry: AgentEntry) => {
-    if (entry.inFlight) return;
-    if (lifetime.signal.aborted) return;
-    entry.inFlight = true;
-    const seq = sequence.issue(agentId);
-    /** Still the newest poll for this agent, and still alive. */
-    const current = () => !lifetime.signal.aborted && sequence.isCurrent(agentId, seq);
-    try {
-      const result = await rpc({ agentId });
-      if (!current()) return;
-      apply(agentId, entry, {
-        jobs: result.jobs,
-        available: result.available,
-        ...(result.error === undefined ? {} : { error: result.error.message }),
+  const poller = createJobsPoller<Job>({
+    readJobs: (agentId) => rpc({ agentId }),
+    /**
+     * The snapshot is only the directory's first page (the daemon defaults to
+     * 200 entries); the controller walks `pageInfo.nextCursor` through this.
+     */
+    listAgentPage: async (cursor) => {
+      const page = await client.paseo.agents.list({
+        page: { limit: AGENT_DIRECTORY_PAGE_SIZE, cursor },
+        signal: lifetime.signal,
       });
-    } catch (error) {
-      if (!current()) return;
-      /**
-       * A permission refusal is **terminal for this agent**, not a failed read:
-       * retrying cannot change it, and continuing would leave an undismissable
-       * error pill retrying every four seconds forever. Stop the timer, hide the
-       * pill.
-       *
-       * The entry stays in `agents` so a later `upsert` (a reconnect with wider
-       * permissions) can retry it — see `register`.
-       */
-      if (isPermissionDeniedError(error)) {
-        entry.unauthorized = true;
-        clearInterval(entry.timer);
-        entry.registration.update({ visible: false, label: localeText().jobs.title });
-        // Dropped rather than kept: the popover must not show a stale list for an
-        // agent whose jobs this client may not read.
-        store.delete(agentId);
+      return { entries: page.entries, pageInfo: page.pageInfo };
+    },
+    addAgent: (agent) => {
+      const registration = client.addComposerPill({
+        id: "dsh-jobs",
+        workspaceId: agent.workspaceId ?? "",
+        agentId: agent.id,
+        button: {
+          // The spinner from the start: registering the static mark first would
+          // flash it for one frame before the first `update` swapped it.
+          icon: JobsSpinner,
+          title: localeText().jobs.title,
+          // Hidden until the first poll proves otherwise: a pill that appears and
+          // then disappears is worse.
+          visible: false,
+          behavior: { kind: "popover", Content: makeJobsPopover(store, agent.id) },
+        },
+      });
+      pills.set(agent.id, { registration, spinning: true });
+      store.delete(agent.id);
+    },
+    removeAgent: (agentId, reason, error) => {
+      const entry = pills.get(agentId);
+      if (entry === undefined) return;
+      pills.delete(agentId);
+      entry.registration.remove();
+      // Dropped rather than kept: the popover must not show a stale list for an
+      // agent this client may not read, or whose runtime cannot serve jobs at all.
+      store.delete(agentId);
+      if (reason === "unauthorized") {
         console.error(
           "[dsh-paseo] jobs pill: this connection is not allowed to call plugin RPCs " +
             "(plugin.rpc.invoke needs daemon.manage); the jobs pill is disabled for this agent",
         );
-        return;
+      } else if (reason === "terminal") {
+        // A terminal contract error cannot be fixed by polling. Say what to do
+        // once in the log, then hide: a permanent error pill per agent is noise,
+        // and the four-second retry it used to carry never changed the answer.
+        console.error(
+          `[dsh-paseo] jobs pill disabled for ${agentId}: ${error?.message ?? "a terminal jobs error"}`,
+        );
       }
-      // Any other failure is the same answer as an unreadable registry.
-      apply(agentId, entry, {
-        jobs: store.get(agentId)?.jobs ?? [],
-        available: false,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    } finally {
-      // Only the newest poll may clear the flag, or two requests could be in
-      // flight again — exactly what the flag exists to stop.
-      if (sequence.isCurrent(agentId, seq)) entry.inFlight = false;
-    }
-  };
-
-  const register = (agent: { id: string; workspaceId?: string | null; provider?: string; status?: string }) => {
-    if (lifetime.signal.aborted) return;
-    // Only this provider's agents have DSH jobs. Registering for every agent
-    // would put a pill on Claude/Codex composers that can only ever be empty.
-    if (agent.provider !== undefined && agent.provider !== PROVIDER_ID) return;
-    const workspaceId = agent.workspaceId ?? "";
-    if (workspaceId === "") return;
-    const agentId = agent.id;
-    // A closed agent has no composer; polling it would keep asking about a
-    // session the daemon has already dropped.
-    if (agent.status === "closed") {
-      remove(agentId);
-      return;
-    }
-    const existing = agents.get(agentId);
-    if (existing !== undefined) {
-      /**
-       * An entry disabled by a permission refusal gets one more chance on the
-       * next `upsert` — the only way out of that state without a reload, since a
-       * reconnect may come back with a wider permission set.
-       */
-      if (existing.unauthorized) {
-        existing.unauthorized = false;
-        existing.registration.update({ visible: false, label: localeText().jobs.title });
-        existing.timer = setInterval(() => {
-          void poll(agentId, existing);
-        }, POLL_MS);
-        (existing.timer as unknown as { unref?: () => void }).unref?.();
-        void poll(agentId, existing);
-      }
-      return;
-    }
-
-    const registration = client.addComposerPill({
-      id: "dsh-jobs",
-      workspaceId,
-      agentId,
-      button: {
-        // The spinner from the start: registering the static mark first would
-        // flash it for one frame before the first `update` swapped it.
-        icon: JobsSpinner,
-        title: localeText().jobs.title,
-        // Hidden until the first poll proves otherwise: a pill that appears and
-        // then disappears is worse.
-        visible: false,
-        behavior: { kind: "popover", Content: makeJobsPopover(store, agentId) },
-      },
-    });
-    // Built before the timer so the callback and the first poll share one object:
-    // `inFlight` lives on the entry, and a detached copy would protect nothing.
-    const entry: AgentEntry = {
-      registration,
-      timer: undefined as unknown as ReturnType<typeof setInterval>,
-      inFlight: false,
-      // Matches the icon registered above, so the first poll need not re-send it.
-      spinning: true,
-      // Assumed allowed until a refusal proves otherwise.
-      unauthorized: false,
-    };
-    entry.timer = setInterval(() => {
-      void poll(agentId, entry);
-    }, POLL_MS);
-    // Node keeps the process alive for a pending interval; a plugin must not be
-    // the reason it never exits.
-    (entry.timer as unknown as { unref?: () => void }).unref?.();
-    agents.set(agentId, entry);
-    void poll(agentId, entry);
-  };
-
-  const remove = (agentId: string) => {
-    const entry = agents.get(agentId);
-    if (entry === undefined) return;
-    agents.delete(agentId);
-    clearInterval(entry.timer);
-    entry.registration.remove();
-    store.delete(agentId);
-    /**
-     * Invalidate the in-flight poll. Deleting the entry is not enough: an answer
-     * already past its `await` would still look newest and `apply()` would
-     * re-create the store row just deleted — a ghost pill carrying the previous
-     * session's jobs. `apply()`'s entry check is the second line of defence.
-     */
-    sequence.invalidate(agentId);
-  };
-
-  const removeAll = () => {
-    for (const agentId of [...agents.keys()]) remove(agentId);
-    /**
-     * Every agent is torn down, so every number can go — safe only because the
-     * counter is global and monotonic: the next `issue()` is larger than anything
-     * issued before, so an in-flight poll cannot collide with it.
-     */
-    sequence.invalidateAll();
-  };
+    },
+    publishState,
+    onError: (message, error) => {
+      if (lifetime.signal.aborted) return;
+      // `console`, not `process.stderr`: this module runs inside the app's client
+      // bundle, where there is no `process`.
+      console.error(`[dsh-paseo] ${message}: ${error instanceof Error ? error.message : String(error)}`);
+    },
+    setTimeout: (callback, delayMs) => {
+      const timer = setTimeout(callback, delayMs);
+      // Node keeps the process alive for a pending timer; a plugin must not be
+      // the reason it never exits.
+      (timer as unknown as { unref?: () => void }).unref?.();
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      clearTimeout(timer as ReturnType<typeof setTimeout>);
+    },
+    random: () => Math.random(),
+  });
 
   // An owned list subscription delivers the existing agents, then every update,
   // and a fresh snapshot after a reconnect — which is what keeps the pills
@@ -758,18 +639,17 @@ export function contributeJobsPill(client: PluginClientContext) {
     .list({ subscribe: {}, signal: lifetime.signal })
     .then(({ subscription }) => {
       subscription.subscribe({
-        snapshot: ({ entries }) => {
-          removeAll();
-          for (const { agent } of entries) register(agent);
+        snapshot: (page) => {
+          void poller.applySnapshot(page);
         },
         update: (message) => {
           if (message.type !== "agent_update") return;
           const update = message.payload;
           if (update.kind === "upsert") {
-            register(update.agent);
+            poller.upsert(update.agent);
             return;
           }
-          remove(update.agentId);
+          poller.drop(update.agentId);
         },
       });
       return undefined;
@@ -788,6 +668,6 @@ export function contributeJobsPill(client: PluginClientContext) {
 
   return () => {
     lifetime.abort();
-    removeAll();
+    poller.dispose();
   };
 }

@@ -75,6 +75,7 @@ import { appendFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
 const logPath = process.argv[2];
+const mode = process.argv[3];
 const log = (entry) => appendFileSync(logPath, JSON.stringify(entry) + '\\n');
 const write = (frame) => process.stdout.write(JSON.stringify(frame) + '\\n');
 const noise = () => {
@@ -106,7 +107,13 @@ lines.on('line', (line) => {
   log(message);
   noise();
   if (message.method === 'initialize') {
-    write({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'fake', version: '1' } } });
+    const answer = () => write({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'fake', version: '1' } } });
+    // A handshake slow enough for a caller to cancel while it is in flight.
+    if (mode === 'slow-init') {
+      setTimeout(answer, 300);
+      return;
+    }
+    answer();
     return;
   }
   if (message.method === 'notifications/initialized') return;
@@ -114,7 +121,6 @@ lines.on('line', (line) => {
     const args = message.params && message.params.arguments;
     // Per-behaviour selection comes from the command line so one script covers
     // every case and each client still gets a clean process of its own.
-    const mode = process.argv[3];
     if (mode === 'paged') {
       const cursor = (message.params && message.params.cursor) || '';
       const next = NEXT[cursor];
@@ -325,6 +331,103 @@ try {
     'an unanswered request times out with the budget named',
     hung.status === 'rejected' && /timed out after 200ms/.test(hung.error?.message ?? ''),
     hung.status === 'hung' ? 'the call never settled' : (hung.error?.message ?? ''),
+  );
+
+  // ── caller cancellation ───────────────────────────────────────────────────
+  // DSH requires asynchronous tool work to observe or forward `exec.signal`; the
+  // stdio transport used to own only its own timeout, so cancelling the turn left
+  // the request pending for up to 60 s while the server kept working. The child
+  // process is shared, so cancellation must remove only this caller's pending
+  // entry and tell the server (`notifications/cancelled`), never kill the child.
+  const cancelClient = makeClient();
+  await cancelClient.listTools();
+  const cancelLogStart = readLog().length;
+  const hangAbort = new AbortController();
+  const cancelPending = outcomeOf(cancelClient.callTool('hang', {}, { signal: hangAbort.signal }));
+  setTimeout(() => hangAbort.abort(), 30);
+  const cancelled = await cancelPending;
+  // The notification is written as the abort handler runs, but the fake server
+  // logs it only when it reads its stdin; wait for the entry instead of assuming
+  // the timing.
+  const cancelEntries = () => readLog().slice(cancelLogStart);
+  for (let waited = 0; waited < 2_000; waited += 20) {
+    if (cancelEntries().some((entry) => entry.method === 'notifications/cancelled')) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const added = cancelEntries();
+  const hangRequest = added.find((entry) => entry.method === 'tools/call' && entry.params?.name === 'hang');
+  const cancelNotice = added.find((entry) => entry.method === 'notifications/cancelled');
+  check(
+    'cancelling an in-flight stdio call rejects as a cancellation',
+    cancelled.status === 'rejected'
+      && /canceled/.test(cancelled.error?.message ?? '')
+      && !/timed out/.test(cancelled.error?.message ?? ''),
+    cancelled.status === 'hung' ? 'the call never settled' : (cancelled.error?.message ?? ''),
+  );
+  check(
+    'and the server is told with notifications/cancelled carrying the request id',
+    hangRequest !== undefined && cancelNotice !== undefined && cancelNotice.params?.requestId === hangRequest.id,
+    `request=${JSON.stringify(hangRequest?.id)} notice=${JSON.stringify(cancelNotice?.params)}`,
+  );
+  const afterCancelEcho = await outcomeOf(cancelClient.callTool('echo', { text: 'after-cancel' }));
+  check(
+    'a cancelled stdio call leaves the shared process usable for later calls',
+    afterCancelEcho.status === 'resolved' && afterCancelEcho.value?.content?.[0]?.text === 'echo:after-cancel',
+    afterCancelEcho.status === 'hung' ? 'the next call never settled' : (afterCancelEcho.error?.message ?? JSON.stringify(afterCancelEcho.value)),
+  );
+
+  // A signal already aborted before the call must stop it before anything is
+  // written to the child; a turn can be cancelled between tool dispatch and the
+  // request reaching the transport.
+  const beforePreCancelled = countOf('tools/call');
+  const preAbort = new AbortController();
+  preAbort.abort();
+  const preCancelled = await outcomeOf(cancelClient.callTool('echo', { text: 'never' }, { signal: preAbort.signal }));
+  check(
+    'an already-cancelled stdio call sends nothing to the server',
+    preCancelled.status === 'rejected'
+      && /canceled/.test(preCancelled.error?.message ?? '')
+      && countOf('tools/call') === beforePreCancelled,
+    preCancelled.status === 'hung' ? 'the call never settled' : (preCancelled.error?.message ?? 'resolved'),
+  );
+
+  // Two concurrent calls, only one cancelled: cancellation is caller-scoped.
+  const dualClient = makeClient();
+  const dualAbort = new AbortController();
+  const dualHang = outcomeOf(dualClient.callTool('hang', {}, { signal: dualAbort.signal }));
+  const dualEcho = outcomeOf(dualClient.callTool('echo', { text: 'pair' }));
+  setTimeout(() => dualAbort.abort(), 30);
+  const [dualHangOutcome, dualEchoOutcome] = await Promise.all([dualHang, dualEcho]);
+  check(
+    'cancelling one of two concurrent stdio calls leaves the other one unaffected',
+    dualHangOutcome.status === 'rejected'
+      && /canceled/.test(dualHangOutcome.error?.message ?? '')
+      && dualEchoOutcome.status === 'resolved'
+      && dualEchoOutcome.value?.content?.[0]?.text === 'echo:pair',
+    `hang=${dualHangOutcome.status === 'hung' ? 'hung' : (dualHangOutcome.error?.message ?? 'resolved')} `
+      + `echo=${dualEchoOutcome.status === 'hung' ? 'hung' : (dualEchoOutcome.error?.message ?? JSON.stringify(dualEchoOutcome.value))}`,
+  );
+
+  // The handshake is shared child state: one caller aborting during it must not
+  // cancel the handshake later calls depend on.
+  const slowClient = makeClient({}, 'slow-init');
+  const slowLogStart = readLog().length;
+  const slowAbort = new AbortController();
+  const slowHandshakePromise = outcomeOf(slowClient.listTools({ signal: slowAbort.signal }));
+  setTimeout(() => slowAbort.abort(), 30);
+  const slowHandshake = await slowHandshakePromise;
+  const recoveredHandshake = await outcomeOf(slowClient.listTools());
+  const slowInitializes = readLog().slice(slowLogStart).filter((entry) => entry.method === 'initialize').length;
+  check(
+    'cancelling one caller during the stdio handshake does not poison the shared handshake',
+    slowHandshake.status === 'rejected'
+      && /canceled/.test(slowHandshake.error?.message ?? '')
+      && recoveredHandshake.status === 'resolved'
+      && Array.isArray(recoveredHandshake.value) && recoveredHandshake.value.length === 1
+      && slowInitializes === 1,
+    `cancelled=${slowHandshake.status === 'hung' ? 'hung' : (slowHandshake.error?.message ?? 'resolved')} `
+      + `recovered=${recoveredHandshake.status === 'hung' ? 'hung' : (recoveredHandshake.error?.message ?? JSON.stringify(recoveredHandshake.value))} `
+      + `initialize=${slowInitializes}`,
   );
 
   // ── a server that dies mid-request ────────────────────────────────────────

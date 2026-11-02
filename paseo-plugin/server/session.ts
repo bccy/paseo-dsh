@@ -182,6 +182,17 @@ export interface DshSessionOptions {
   mcpServers?: Readonly<Record<string, DshMcpServer>>;
   route: DshRoute;
   mode: string;
+  /**
+   * The modes this connection advertises — the **single** capability source.
+   *
+   * `provider.ts` derives this list from the bridge's `planMode` and publishes
+   * the very same array as the catalog's `defaults.modes`. The session must
+   * report it back verbatim: building its own list from {@link modes} here was a
+   * second source, so a profile that composes no plan-mode service hid Plan in
+   * the composer and then advertised it again as `session.config.modes` after
+   * open — a toggle the user could pick but never apply.
+   */
+  modes: readonly ProviderMode[];
   /** Models Paseo can switch to for this session, from the cached catalog. */
   models: ProviderModel[];
   /** Thinking options the catalog advertises. */
@@ -368,9 +379,23 @@ export class DshSession {
   readonly #timeline = new TimelineBuilder({ warn: (line) => this.#options.log(line) });
   #process: DshProcess | undefined;
   #route: DshRoute;
+  /** Advertised modes, verbatim from the catalog (see {@link DshSessionOptions.modes}). */
+  readonly #modes: readonly ProviderMode[];
+  /** Whether the advertised modes include plan; a plan request without it is refused. */
+  readonly #planAdvertised: boolean;
   #mode: string;
   #thinkingOption: string | undefined;
   #turnId: string | null = null;
+  /**
+   * Whether `session.turn started` has been emitted for the issued {@link #turnId}.
+   *
+   * The id is issued by {@link prompt} *before* the bridge starts the turn, so
+   * "an id is set" and "the turn has started" are different facts. Per-turn
+   * counters must reset when the turn actually starts (not when its id was
+   * guessed), and a prompt that fails may only discard the id it issued when no
+   * started event went out for it — otherwise the turn loses its terminal.
+   */
+  #turnStarted = false;
   /**
    * How DSH ended the turn that is currently open, from its own `turn/end`.
    *
@@ -517,8 +542,20 @@ export class DshSession {
     this.id = options.sessionId;
     this.#dshSessionId = options.dshSessionId ?? options.sessionId;
     this.#options = options;
+    this.#modes = options.modes;
+    this.#planAdvertised = options.modes.some((mode) => mode.id === "plan");
     this.#route = options.route;
-    this.#mode = options.mode === "plan" ? "plan" : "build";
+    // The catalog is the authority on which modes exist. A mode Paseo persisted
+    // from before the profile lost plan-mode must not be re-advertised here: the
+    // bridge would refuse `plan/set` on open and the composer would show Plan
+    // active in a session that runs in build. Open in the supported state and say
+    // why instead of claiming the unavailable one.
+    if (options.mode === "plan" && !this.#planAdvertised) {
+      this.#options.log(
+        `plan mode is not advertised by this profile; opening ${this.id} in build mode instead`,
+      );
+    }
+    this.#mode = options.mode === "plan" && this.#planAdvertised ? "plan" : "build";
     this.#thinkingOption = options.route.reasoningEffort;
     this.#subsession = options.subsession === true;
   }
@@ -618,13 +655,43 @@ export class DshSession {
     // authoritative and both directions must be reconciled, not only a plan open.
     // A profile that composes no plan-mode service must not fail the whole open
     // here: the conversation is usable in build mode and the log says why the
-    // toggle could not be applied.
-    try {
-      await process.setPlan(this.#dshSessionId, this.#mode === "plan");
-    } catch (error) {
-      this.#options.log(
-        `plan mode could not be reconciled on open (${this.#mode}): ${error instanceof Error ? error.message : String(error)}`,
-      );
+    // toggle could not be applied. That profile also does not advertise Plan (the
+    // catalog filtered it), so there is nothing to reconcile in the first place;
+    // skipping the call keeps a capability the runtime cannot honour from sounding
+    // like a failure on every open.
+    if (this.#planAdvertised) {
+      const requested = this.#mode;
+      try {
+        await process.setPlan(this.#dshSessionId, requested === "plan");
+      } catch (error) {
+        const reason = messageOf(error);
+        // The mode reported back must be the one the runtime accepted. A profile
+        // whose plan-mode service went away after the catalog was cached lands
+        // here; reporting the requested plan mode anyway would re-create the very
+        // "offered but unappliable" toggle this session is fixing.
+        this.#mode = "build";
+        this.#options.log(
+          `plan mode could not be reconciled on open (${requested}): ${reason}`,
+        );
+        // Only a session that asked for plan mode has a degraded outcome to
+        // report: a build-mode open in a profile that composes no plan service is
+        // the supported composition (the catalog does not advertise plan there),
+        // and warning on every open would bury the real failures. When plan was
+        // requested and could not be applied, the composer still says plan while
+        // the runtime is in build — say why.
+        if (requested === "plan") {
+          this.#options.emit({
+            type: "session.notice",
+            sessionId: this.id,
+            notice: {
+              id: `plan-${String(Date.now())}`,
+              severity: "warning",
+              title: "Plan 模式未能同步",
+              description: `重开会话时无法把模式同步为「${requested}」（${reason}）；本会话仍按运行时当前模式运行。`,
+            },
+          });
+        }
+      }
     }
   }
 
@@ -672,7 +739,9 @@ export class DshSession {
       mode: this.#mode,
       ...(this.#thinkingOption === undefined ? {} : { thinkingOption: this.#thinkingOption }),
       models: this.#models(),
-      modes: modes(),
+      // Verbatim from the catalog — never a locally computed list. See
+      // {@link DshSessionOptions.modes} for why this has to be one source.
+      modes: this.#modes,
       thinkingOptions,
       settings,
     };
@@ -926,14 +995,45 @@ export class DshSession {
    * the user already closed.
    */
   async jobs(): Promise<DshJobs> {
-    if (this.#closed) return { available: false };
+    // Both "the holder is gone" branches are transient races, not a terminal
+    // bridge condition: the next poll after the close settles reads "no
+    // connection" and answers `true` + `[]`. `rpc_failed` says exactly that to
+    // the client, which keeps its normal retry with backoff.
+    if (this.#closed) return { available: false, error: { code: "rpc_failed" } };
     const process = this.#process;
-    if (process === undefined) return { available: false };
+    if (process === undefined) return { available: false, error: { code: "rpc_failed" } };
     try {
       return await process.jobs(this.#dshSessionId);
     } catch (error) {
-      return { available: false, error: { message: messageOf(error) } };
+      return { available: false, error: { message: messageOf(error), code: "rpc_failed" } };
     }
+  }
+
+  /**
+   * Surface an unreadable session history on the timeline.
+   *
+   * Both failure shapes must end here: the bridge answering
+   * `{available: false}` (the log exists but could not be read) and the
+   * `paseo/history` request itself rejecting (timeout, transport failure, a
+   * dead child). The second shape used to escape to the caller, whose only
+   * reaction was a stderr line — a reopened session then looked exactly like a
+   * genuinely empty conversation.
+   *
+   * @param reason - the runtime's message, shown verbatim so the user can tell
+   *   a timeout from a missing log.
+   */
+  #noticeHistoryUnavailable(reason: string): void {
+    this.#options.log(`paseo-dsh: session history could not be read: ${reason}`);
+    this.#options.emit({
+      type: "session.notice",
+      sessionId: this.id,
+      notice: {
+        id: `history-${String(Date.now())}`,
+        severity: "warning",
+        title: "会话历史读取失败",
+        description: `重放历史时读不到会话日志：${reason}`,
+      },
+    });
   }
 
   /**
@@ -950,25 +1050,23 @@ export class DshSession {
    * skipped.
    */
   async replayHistory(): Promise<void> {
-    const { events, available, error } = await this.#require().history(this.#dshSessionId);
+    let history: Awaited<ReturnType<DshProcess["history"]>>;
+    try {
+      history = await this.#require().history(this.#dshSessionId);
+    } catch (error) {
+      // The RPC itself failed (timeout, transport, child gone). That is the same
+      // user-visible situation as `available: false`: a reopened conversation
+      // with nothing in it. It used to be stderr-only at the call site, so the
+      // user saw a blank session and no reason.
+      this.#noticeHistoryUnavailable(messageOf(error));
+      return;
+    }
+    const { events, available, error } = history;
     // A failed read is not an empty session. Returning silently here is what
     // made "the replay timed out" look exactly like "there was nothing to
     // replay": the user saw a blank conversation and no reason for it.
     if (!available) {
-      const reason = error ?? "unknown error";
-      this.#options.log(`paseo-dsh: session history could not be read: ${reason}`);
-      // An empty replay would look exactly like an empty conversation. Surface
-      // the failure in the timeline of the session that just opened.
-      this.#options.emit({
-        type: "session.notice",
-        sessionId: this.id,
-        notice: {
-          id: `history-${String(Date.now())}`,
-          severity: "warning",
-          title: "会话历史读取失败",
-          description: `重放历史时读不到会话日志：${reason}`,
-        },
-      });
+      this.#noticeHistoryUnavailable(error ?? "unknown error");
       return;
     }
     if (events.length === 0) return;
@@ -1196,7 +1294,7 @@ export class DshSession {
     try {
       listing = await process.subagents(this.#dshSessionId);
     } catch (error) {
-      this.#options.log(`subagent enumeration failed: ${messageOf(error)}`);
+      this.#noticeSubagentEnumerationUnavailable(messageOf(error));
       return;
     } finally {
       // The gap between this and the `#replayPending` assignment below is
@@ -1207,7 +1305,7 @@ export class DshSession {
       // No subagent service composed: an honest empty tree, never a silent
       // "no children" claim. A mounted-but-failed read carries `error`.
       if (listing.error !== undefined) {
-        this.#options.log(`subagent enumeration unavailable: ${listing.error.message}`);
+        this.#noticeSubagentEnumerationUnavailable(listing.error.message);
       }
       return;
     }
@@ -1331,6 +1429,30 @@ export class DshSession {
     });
   }
 
+  /**
+   * Surface a failed subagent catalog read on the timeline.
+   *
+   * Without this, a reopen whose enumeration failed showed a root with no
+   * subagent rows and no explanation — indistinguishable from a session that
+   * never had any. Both shapes end here: the RPC rejecting and the bridge
+   * answering `available:false` with an error.
+   *
+   * @param reason - the runtime's message, shown verbatim.
+   */
+  #noticeSubagentEnumerationUnavailable(reason: string): void {
+    this.#options.log(`subagent enumeration failed: ${reason}`);
+    this.#options.emit({
+      type: "session.notice",
+      sessionId: this.id,
+      notice: {
+        id: `subagent-catalog-${String(Date.now())}`,
+        severity: "warning",
+        title: "子代理列表读取失败",
+        description: `重开会话时读不到子代理目录（${reason}）；本次没有重建子代理行，已有对话不受影响。`,
+      },
+    });
+  }
+
   /** Drop held frames of a child that will not be opened. */
   #dropBufferedChild(nativeId: string): void {
     this.#pendingOpened = this.#pendingOpened.filter((payload) => payload.sessionId !== nativeId);
@@ -1369,7 +1491,9 @@ export class DshSession {
       try {
         reply = await process.prompt(this.#dshSessionId, line, [{ type: "text", text: line }], prompt.delivery);
       } catch (error) {
-        if (issuedTurn) this.#turnId = null;
+        // Same rule as the message branch below: a turn that already started
+        // keeps its id so its terminal can still be emitted.
+        if (issuedTurn && !this.#turnStarted) this.#turnId = null;
         this.#emitPromptFailed(prompt.clientMessageId, error);
         return;
       }
@@ -1423,7 +1547,15 @@ export class DshSession {
     try {
       reply = await process.prompt(this.#dshSessionId, label, blocks.length === 0 ? undefined : blocks, prompt.delivery);
     } catch (error) {
-      if (issuedTurn) this.#turnId = null;
+      // Only the id this prompt issued may be discarded, and only while no
+      // `session.turn started` has been emitted for it. DSH enters the running
+      // phase synchronously inside `followup()`, so a prompt RPC can fail (a
+      // 120 s transport timeout, a torn channel) *after* the started event has
+      // already reached Paseo. Clearing the id then left an open turn with no
+      // terminal: the host keeps its turn id active forever and treats a
+      // finished conversation as interrupted. Keeping the id lets the idle
+      // status close the turn it already opened.
+      if (issuedTurn && !this.#turnStarted) this.#turnId = null;
       this.#emitPromptFailed(prompt.clientMessageId, error);
       return;
     }
@@ -1529,8 +1661,11 @@ export class DshSession {
     if (delivery === "steer" || this.#turnId !== null) return false;
     this.#turnId = `turn:${clientMessageId}`;
     // The id is issued before the bridge starts the turn, so no `turn/end` can
-    // belong to it yet; the previous turn's state must not leak into it.
+    // belong to it yet; the previous turn's state must not leak into it. The
+    // turn has not *started* either — the per-turn counters reset on the running
+    // status, which is the only event that proves a turn really opened.
     this.#turnEndState = null;
+    this.#turnStarted = false;
     return true;
   }
 
@@ -1578,13 +1713,6 @@ export class DshSession {
   /** Apply a composer change: model, mode, thinking option or settings. */
   async configure(changes: ProviderConfigChanges): Promise<void> {
     const process = this.#require();
-    // A route change invalidates any occupancy poll still in flight: its answer
-    // describes the previous model's capacity and must not overwrite the new
-    // one's. `refreshUsage` below issues the replacement poll.
-    if (changes.model !== undefined && changes.model !== null) {
-      this.#usageGeneration += 1;
-      this.#emitUsage({}, true);
-    }
 
     if (changes.model !== undefined && changes.model !== null) {
       const next = parseRoute(changes.model, this.#route);
@@ -1593,11 +1721,26 @@ export class DshSession {
         model: next.model,
         reasoningEffort: next.reasoningEffort ?? null,
       });
+      // Commit only after the runtime's receipt. The receipt is also the source
+      // for the effort the new route actually runs with: a bare model switch
+      // submits `reasoningEffort: null` (a route id carries no level), so the
+      // backend clears the old selection and the composer must stop advertising
+      // it. Leaving `#thinkingOption` untouched reported the previous model's
+      // level against a route that no longer has one.
       this.#route = {
         provider: applied.provider,
         model: applied.model,
         ...(applied.reasoningEffort === null ? {} : { reasoningEffort: applied.reasoningEffort }),
       };
+      this.#thinkingOption = applied.reasoningEffort === null ? undefined : applied.reasoningEffort;
+      // The route change invalidates any occupancy poll still in flight: its
+      // answer describes the previous model's capacity and must not overwrite
+      // the new one's. `refreshUsage` below issues the replacement poll. This
+      // runs after the await on purpose — a refused switch changed nothing, so
+      // there is no stale readout to clear and Paseo keeps showing the old,
+      // still-correct numbers instead of an empty composer.
+      this.#usageGeneration += 1;
+      this.#emitUsage({}, true);
     }
 
     if (changes.thinkingOption !== undefined) {
@@ -1613,7 +1756,6 @@ export class DshSession {
           `ignoring unsupported thinking option "${requested}" for ${this.#route.provider}/${this.#route.model}`,
         );
       }
-      this.#thinkingOption = effort;
       const applied = await process.setConfig(this.#dshSessionId, {
         provider: this.#route.provider,
         model: this.#route.model,
@@ -1624,11 +1766,32 @@ export class DshSession {
         model: applied.model,
         ...(applied.reasoningEffort === null ? {} : { reasoningEffort: applied.reasoningEffort }),
       };
+      // Read the effort back from the receipt rather than committing the request:
+      // the backend is the authority on what it applied (and on clearing it).
+      this.#thinkingOption = applied.reasoningEffort === null ? undefined : applied.reasoningEffort;
     }
 
     if (changes.mode !== undefined && changes.mode !== null) {
-      this.#mode = changes.mode === "plan" ? "plan" : "build";
-      await process.setPlan(this.#dshSessionId, this.#mode === "plan");
+      const wanted = changes.mode === "plan";
+      // A mode outside the catalog's list cannot be applied: the profile composes
+      // no service for it. Refuse loudly instead of reporting a mode the runtime
+      // never entered — Paseo would otherwise offer a Plan toggle on a session
+      // that can only run build.
+      if (wanted && !this.#planAdvertised) {
+        throw new Error(
+          `mode "plan" is not available in this profile; `
+            + `advertised modes: ${this.#modes.map((mode) => mode.id).join(", ") || "(none)"}`,
+        );
+      }
+      const applied = await process.setPlan(this.#dshSessionId, wanted);
+      // The mode is committed only once the runtime answered. `plan-mode.set`
+      // logs the switch immediately between turns, but inside an open turn it
+      // *queues* it: `active` still reports the logged state and `pending`
+      // carries the accepted selection. Both accept the user's pick, so prefer
+      // the runtime's own value when it agrees and the queued selection when it
+      // does not — a refusal throws and leaves the previous mode in place.
+      const accepted = applied.active === wanted ? wanted : applied.pending === wanted ? wanted : applied.active === true;
+      this.#mode = accepted ? "plan" : "build";
     }
 
     const requestedPermission = changes.settings?.["permission"];
@@ -1796,11 +1959,19 @@ export class DshSession {
       return;
     }
     if (status === "running") {
-      if (this.#turnId === null) {
+      // The turn actually started now. `#turnId` may already be set — `prompt()`
+      // issues the id before the bridge is asked to start the turn (Paseo binds
+      // the id named by the first prompt result) — so "id set" cannot be the
+      // signal that a new turn began. Without this reset every normal turn kept
+      // the previous turn's tool counters and stats row: the second turn's
+      // `toolCalls` accumulated both turns' tools, and a cancelled second turn
+      // rewrote the first turn's already-shown stats row in place.
+      if (!this.#turnStarted) {
         this.#toolStarts.clear();
         this.#turnTool = { count: 0, ms: 0 };
         // A later usage refresh must not rewrite the previous turn's row.
         this.#lastStats = undefined;
+        this.#turnStarted = true;
       }
       const turnId = this.#turnId ?? `turn:${Date.now()}`;
       this.#turnId = turnId;
@@ -1827,6 +1998,7 @@ export class DshSession {
       const state = ended?.state ?? "completed";
       this.#turnId = null;
       this.#turnEndState = null;
+      this.#turnStarted = false;
       this.#options.emit({
         type: "session.turn",
         sessionId: this.id,
@@ -2109,7 +2281,18 @@ export class DshSession {
           // before `session.ready`, which is the same promise `#onChildOpened`
           // makes. Without it a child whose descriptor arrived early could be
           // announced ahead of its own root.
-          if (!this.#rootReady || this.#parentScopedId(payload.parentSessionId) === undefined) {
+          //
+          // The label gate applies here as well, and for the same reason it exists
+          // in `#onChildOpened`: the single `session.opened` carries the only title
+          // a child can ever have, so a label-less notice waits for its own
+          // durable descriptor. Without this check any *other* flush — a sibling
+          // child opening, a root becoming ready — released it untitled, and the
+          // descriptor that arrived later could never correct the title.
+          if (
+            !this.#rootReady ||
+            this.#parentScopedId(payload.parentSessionId) === undefined ||
+            (payload.label === undefined && !this.#labelWaitExceeded(payload.sessionId))
+          ) {
             remaining.push(payload);
           } else {
             this.#openChildNow(payload);
@@ -2135,7 +2318,9 @@ export class DshSession {
         this.#pendingChildEvents = stillHeld;
       }
       if (this.#pendingOpened.length > 0) {
-        this.#options.log(`held ${this.#pendingOpened.length} child opened notice(s) with an unresolved parent`);
+        this.#options.log(
+          `held ${this.#pendingOpened.length} child opened notice(s) with an unresolved parent or no title yet`,
+        );
       }
     } finally {
       this.#flushing = false;
@@ -2816,6 +3001,13 @@ export class DshChildSession {
    */
   fail(message: string): void {
     if (this.#options.closed()) return;
+    // Only a child that has not settled yet can fail. A child whose last turn
+    // already ended — normally, cancelled, or by a replay's terminal — was shown
+    // to the user with that state; a shared-process exit later must not rewrite
+    // it to failed. Paseo's `acceptChildEvent` upserts `runtime_failed` as
+    // `status: "failed"` unconditionally, so an already-completed subagent row
+    // flipped to failed whenever the daemon's shared `dsh` child went away.
+    if (this.#turnEnded && this.#turnId === null) return;
     this.#turnId = null;
     this.#turnEnded = true;
     this.#options.emit({

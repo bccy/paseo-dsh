@@ -75,6 +75,41 @@ function settledWithin(promise, ms) {
 }
 
 /**
+ * Wait for one shared promise while observing a caller's cancellation.
+ *
+ * The handshake is shared child state: aborting it because one caller gave up
+ * would fail every other caller waiting on the same client. The shared work
+ * therefore keeps running; only the cancelling caller's wait is rejected.
+ *
+ * @param promise - The shared operation.
+ * @param signal - The caller's cancellation signal, when it has one.
+ * @param label - Server label used in the error.
+ * @param method - Method name used in the error.
+ * @returns The shared result, or a rejection for this caller alone.
+ */
+function waitForShared(promise, signal, label, method) {
+  if (signal === undefined) return promise;
+  if (signal.aborted) return Promise.reject(new Error(`mcp: ${label}: ${method} canceled before the request was sent`));
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener('abort', onAbort);
+      reject(new Error(`mcp: ${label}: ${method} canceled`));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+/**
  * One MCP server process: initialize once, then list and call tools.
  *
  * The process is spawned on first use rather than in the constructor, so a
@@ -204,7 +239,7 @@ export class McpStdioClient {
     const entries = [...this.#pending.values()];
     this.#pending.clear();
     for (const entry of entries) {
-      clearTimeout(entry.timer);
+      entry.cleanup();
       entry.reject(new Error(`mcp: ${this.#label}: ${entry.method} failed: ${reason}`));
     }
   }
@@ -248,7 +283,7 @@ export class McpStdioClient {
     // A late answer to a request that already timed out: the caller is gone.
     if (entry === undefined) return;
     this.#pending.delete(frame.id);
-    clearTimeout(entry.timer);
+    entry.cleanup();
     if (frame.error !== undefined && frame.error !== null) {
       const message = typeof frame.error.message === 'string' ? frame.error.message : JSON.stringify(frame.error);
       const code = typeof frame.error.code === 'number' ? ` (${frame.error.code})` : '';
@@ -277,22 +312,62 @@ export class McpStdioClient {
     }
   }
 
-  /** One JSON-RPC request; `params` is omitted when undefined, like the HTTP client. */
-  #request(method, params) {
+  /**
+   * Tell the server a request is no longer wanted.
+   *
+   * MCP's `notifications/cancelled` is the protocol-level way to withdraw one
+   * request without touching the shared process. Writing is best-effort: if the
+   * child is already gone, `#start()` has already failed every pending entry and
+   * a failed courtesy write must not become an unhandled rejection on the stdout
+   * path.
+   */
+  #notifyCancelled(requestId, method) {
+    try {
+      this.#notify('notifications/cancelled', { requestId, reason: `canceled ${method}` });
+    } catch (error) {
+      process.stderr.write(`mcp: ${this.#label}: could not send cancellation for "${method}": ${error.message}\n`);
+    }
+  }
+
+  /**
+   * One JSON-RPC request; `params` is omitted when undefined, like the HTTP client.
+   *
+   * A caller's `signal` removes only this request's pending entry (and tells the
+   * server); the child process and every other in-flight call keep running. The
+   * pending entry owns its timer and abort listener so all four exits — response,
+   * timeout, cancellation, process failure — clean up exactly once.
+   */
+  #request(method, params, { signal } = {}) {
     if (this.#disposed) return Promise.reject(new Error(`mcp: ${this.#label}: client disposed`));
+    if (signal?.aborted) return Promise.reject(new Error(`mcp: ${this.#label}: ${method} canceled before the request was sent`));
     const id = (this.#nextId += 1);
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const entry = { method, resolve, reject, timer: undefined, onAbort: undefined, cleanup: undefined };
+      entry.cleanup = () => {
+        clearTimeout(entry.timer);
+        if (entry.onAbort !== undefined) signal?.removeEventListener('abort', entry.onAbort);
+      };
+      entry.timer = setTimeout(() => {
+        if (this.#pending.get(id) !== entry) return;
         this.#pending.delete(id);
+        entry.cleanup();
         reject(new Error(`mcp: ${this.#label}: ${method} timed out after ${this.timeoutMs}ms`));
       }, this.timeoutMs);
-      this.#pending.set(id, { method, resolve, reject, timer });
+      entry.onAbort = () => {
+        if (this.#pending.get(id) !== entry) return;
+        this.#pending.delete(id);
+        entry.cleanup();
+        this.#notifyCancelled(id, method);
+        reject(new Error(`mcp: ${this.#label}: ${method} canceled`));
+      };
+      if (signal !== undefined) signal.addEventListener('abort', entry.onAbort, { once: true });
+      this.#pending.set(id, entry);
       try {
         const frame = { jsonrpc: '2.0', id, method, ...(params === undefined ? {} : { params }) };
         this.#start().stdin.write(`${JSON.stringify(frame)}\n`);
       } catch (error) {
-        this.#pending.delete(id);
-        clearTimeout(timer);
+        if (this.#pending.get(id) === entry) this.#pending.delete(id);
+        entry.cleanup();
         reject(error instanceof Error ? error : new Error(String(error)));
       }
     });
@@ -305,15 +380,17 @@ export class McpStdioClient {
   }
 
   /** Handshake once; a failed handshake is retried on the next call. */
-  async ensureInitialized() {
+  async ensureInitialized(signal) {
     this.#initialized ??= (async () => {
+      // The handshake itself is not passed the caller's signal: it is shared
+      // child state, and one cancelled caller must not tear it down for others.
       await this.#request('initialize', { protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: this.clientInfo });
       this.#notify('notifications/initialized');
     })().catch((error) => {
       this.#initialized = undefined;
       throw error;
     });
-    return this.#initialized;
+    return waitForShared(this.#initialized, signal, this.#label, 'initialize');
   }
 
   /**
@@ -325,8 +402,8 @@ export class McpStdioClient {
    * not exist" — `mcp_tool_schema` answered `exposes no tool`, naming a missing
    * tool instead of a fetch that never happened.
    */
-  async listTools({ refresh = false } = {}) {
-    await this.ensureInitialized();
+  async listTools({ refresh = false, signal } = {}) {
+    await this.ensureInitialized(signal);
     if (this.#tools === undefined || refresh || this.cacheTools !== true) {
       const tools = [];
       let cursor;
@@ -334,7 +411,7 @@ export class McpStdioClient {
         if (page >= MAX_TOOL_PAGES) {
           throw new Error(`mcp: ${this.#label}: tools/list still paginating after ${MAX_TOOL_PAGES} pages; refusing to cache a partial catalog`);
         }
-        const result = await this.#request('tools/list', cursor === undefined ? {} : { cursor });
+        const result = await this.#request('tools/list', cursor === undefined ? {} : { cursor }, { signal });
         // "We could not read the catalog" is not "the server has no tools". Both
         // used to be `[]`, and the emptiness was cached, so a server that recovered
         // stayed empty for the rest of the session with no way to tell.
@@ -357,9 +434,9 @@ export class McpStdioClient {
   }
 
   /** Invoke one tool by its server-side name. */
-  async callTool(name, args = {}) {
-    await this.ensureInitialized();
-    return this.#request('tools/call', { name, arguments: args ?? {} });
+  async callTool(name, args = {}, { signal } = {}) {
+    await this.ensureInitialized(signal);
+    return this.#request('tools/call', { name, arguments: args ?? {} }, { signal });
   }
 
   /**

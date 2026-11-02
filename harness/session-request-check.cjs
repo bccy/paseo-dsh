@@ -14,7 +14,11 @@
  *   1. a `sessions` input answers with persistence handles (not raw ids), the
  *      cwd/title/updatedAt pass through, and the first-message preview becomes
  *      Paseo's `description` — the daemon reopens an imported session by that
- *      handle, so a raw id is an "Invalid plugin provider persistence handle";
+ *      handle, so a raw id is an "Invalid plugin provider persistence handle".
+ *      The request frame must also carry the host's cwd as the bridge's filter
+ *      parameter (and must not invent one when the host sent none); without it
+ *      another workspace's sessions could push this workspace's rows out of the
+ *      truncated import list;
  *   2. an accepted rewind answers `request.completed` **and** leaves exactly one
  *      `撤回已生效` notice in front of that receipt. The notice is the rewind's
  *      canary: whether it survives is how the user (and a later phase) can tell
@@ -36,7 +40,20 @@
  *      see the result" advice would be a warning about a problem the user does not
  *      have. A `both` rewind does change the conversation, so it does get one — and
  *      its text names the files too, because that is the half the user cannot see
- *      from the timeline.
+ *      from the timeline;
+ *   7. a file-restore receipt with `files.error` (the bridge aborted before it
+ *      could run the restore: the post-durability re-plan failed) still produces
+ *      the failure notice, carrying the bridge's own error text verbatim and **not**
+ *      the failed-path sentence about a rescue directory — that shape has no
+ *      per-path outcomes and sends `rescueDir` empty. The token is
+ *      `revert-plan-failed` and the bridge's answer is scripted by the fake;
+ *   8. the other unrestored shapes are loud too (BF-03): a `skipped`-only receipt
+ *      names the skipped path, an `unrecoverable` receipt names the path **and its
+ *      reason** without repeating it as a generic skip, and an `alreadyAbsent`-only
+ *      receipt (the planned delete was already gone — a complete rewind) emits **no**
+ *      `文件回退未完成` notice. Before this the provider only looked at `failed`, so
+ *      every one of the first two shapes produced the plain success notice while
+ *      the file stayed modified.
  *
  * The scope cases are the ones that are easy to lose: the provider decides with
  * `input.scope !== "files"` and `files: input.scope === "both"`, and with only
@@ -70,6 +87,10 @@ process.env.DSH_FAKE_MODE = "live";
 // node_modules/dsh-paseo-bridge` from the bridge embedded in the plugin. The
 // fake `dsh` needs no profile, so point DSH_HOME at a throwaway tree.
 process.env.DSH_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-request-check-"));
+// Frames the fake `dsh` receives, so a check can assert what the plugin actually
+// *sent* (the sessions cwd filter below), not only what it answered.
+const FRAME_LOG = path.join(process.env.DSH_HOME, "frames.jsonl");
+process.env.DSH_FAKE_LOG = FRAME_LOG;
 process.on("exit", () => {
   try {
     fs.rmSync(process.env.DSH_HOME, { recursive: true, force: true });
@@ -131,6 +152,33 @@ function eventsSince(sinceIndex) {
   return events.slice(sinceIndex);
 }
 
+/** Every `paseo/sessions` frame the fake `dsh` has received so far. */
+function sessionsFrames() {
+  if (!fs.existsSync(FRAME_LOG)) return [];
+  return fs
+    .readFileSync(FRAME_LOG, "utf8")
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .map((line) => JSON.parse(line))
+    .filter((frame) => frame.method === "paseo/sessions");
+}
+
+/**
+ * Wait for one sessions frame matching `predicate`.
+ *
+ * The fake bridge writes the frame before it answers, but that write happens in
+ * the child process; polling the file avoids depending on that timing.
+ */
+async function waitForSessionsFrame(predicate, label, ms = 10000) {
+  const started = Date.now();
+  while (Date.now() - started < ms) {
+    const hit = sessionsFrames().find(predicate);
+    if (hit !== undefined) return hit;
+    await sleep(50);
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
+
 const results = [];
 const check = (name, pass, detail) => {
   results.push({ name, pass });
@@ -190,6 +238,39 @@ const check = (name, pass, detail) => {
     "the first-message preview becomes Paseo's description",
     storedA?.description === "first message of A",
     JSON.stringify(storedA?.description ?? null),
+  );
+
+  // ---- 1b. the host cwd reaches the bridge as a filter -------------------
+  // The provider used to pass the request cwd only as the probe process's
+  // working directory, never as `paseo/sessions`'s filter parameter. With ~20
+  // stored sessions and no query, another workspace's rows could push the
+  // current workspace's rows out of the import list before the bridge truncated
+  // to the limit. The distinction this block pins is **presence**, so the probe
+  // cwd must stay out of the filter when the host sent none.
+  const hostWorkspace = path.join(process.env.DSH_HOME, "host-workspace");
+  fs.mkdirSync(hostWorkspace, { recursive: true });
+  await conn.send({ type: "sessions", requestId: "imports-filtered", cwd: hostWorkspace, limit: 3 });
+  await until((e) => e.type === "sessions" && e.requestId === "imports-filtered", "filtered sessions list");
+  const filteredFrame = await waitForSessionsFrame(
+    (frame) => frame.params?.limit === 3,
+    "sessions frame with cwd",
+  );
+  check(
+    "a sessions request forwards the host cwd as the bridge filter",
+    filteredFrame.params?.cwd === hostWorkspace,
+    JSON.stringify(filteredFrame.params),
+  );
+
+  await conn.send({ type: "sessions", requestId: "imports-no-cwd", limit: 4 });
+  await until((e) => e.type === "sessions" && e.requestId === "imports-no-cwd", "unfiltered sessions list");
+  const plainFrame = await waitForSessionsFrame(
+    (frame) => frame.params?.limit === 4,
+    "sessions frame without cwd",
+  );
+  check(
+    "a sessions request with no host cwd sends no cwd filter",
+    !Object.prototype.hasOwnProperty.call(plainFrame.params ?? {}, "cwd"),
+    JSON.stringify(plainFrame.params),
   );
 
   // ---- 2. a rewind the bridge accepts ------------------------------------
@@ -433,6 +514,173 @@ const check = (name, pass, detail) => {
     "…whose text names the files it restored",
     bothCanaryDescription.includes("文件") && bothCanaryDescription !== secondCanaryDescription,
     JSON.stringify(bothCanaryDescription),
+  );
+
+  // ---- 7. a file-restore plan failure (files.error) is loud and verbatim ----
+  //
+  // The bridge answers the rewind with `files` carrying no per-path outcome and
+  // an `error` string: after the conversation half became durable, the re-plan
+  // of the file restore ran against an unreadable journal / vanished target and
+  // the restore was never attempted. There is no `failed` entry, so the old
+  // condition (and the old text) produced silence; treating it as `failed` would
+  // point the user at a rescue copy that does not exist.
+  const planFailedToken = "PLAN-FAILED: journal unreadable (/fake/session/journal.jsonl)";
+  const beforePlanFailedRevert = events.length;
+  await conn.send({
+    type: "session.revert",
+    requestId: "revert-plan-failed",
+    sessionId,
+    token: { messageId: "revert-plan-failed" },
+    scope: "both",
+  });
+  const planFailedRevert = await untilSince(
+    beforePlanFailedRevert,
+    (e) => e.requestId === "revert-plan-failed" && (e.type === "request.completed" || e.type === "request.failed"),
+    "plan-failed revert reply",
+  );
+  check(
+    "a rewind whose file restore never ran still answers request.completed",
+    planFailedRevert.type === "request.completed",
+    JSON.stringify(planFailedRevert.error ?? "completed"),
+  );
+  const planFailedNotices = eventsSince(beforePlanFailedRevert).filter(
+    (e) => e.type === "session.notice" && e.notice?.title === "文件回退未完成",
+  );
+  const planFailedDescription = String(planFailedNotices[0]?.notice?.description ?? "");
+  check(
+    "…emits the file-failure notice for files.error",
+    planFailedNotices.length === 1,
+    JSON.stringify(planFailedNotices.map((e) => e.notice?.description ?? null)),
+  );
+  check(
+    "…carrying the bridge's error text verbatim",
+    planFailedDescription.includes(planFailedToken),
+    JSON.stringify(planFailedDescription),
+  );
+  check(
+    "…and does not claim a rescue copy that was never made",
+    !planFailedDescription.includes("另存到") && !planFailedDescription.includes("rescue"),
+    JSON.stringify(planFailedDescription),
+  );
+
+  // ---- 8. a skipped-only file outcome is loud (BF-03) ----
+  //
+  // The rewind succeeded and `failed` is empty, but one path was deliberately not
+  // restored (it became a symlink/directory, or its parent changed after capture).
+  // The receipt used to produce only the success notice; the path is exactly the
+  // half the user cannot see from the timeline.
+  const beforeSkippedRevert = events.length;
+  await conn.send({
+    type: "session.revert",
+    requestId: "revert-skipped-only",
+    sessionId,
+    token: { messageId: "revert-skipped-only" },
+    scope: "both",
+  });
+  const skippedRevert = await untilSince(
+    beforeSkippedRevert,
+    (e) => e.requestId === "revert-skipped-only" && (e.type === "request.completed" || e.type === "request.failed"),
+    "skipped-only revert reply",
+  );
+  check(
+    "a rewind whose only unrestored file was skipped still answers request.completed",
+    skippedRevert.type === "request.completed",
+    JSON.stringify(skippedRevert.error ?? "completed"),
+  );
+  const skippedNotices = eventsSince(beforeSkippedRevert).filter(
+    (e) => e.type === "session.notice" && e.notice?.title === "文件回退未完成",
+  );
+  const skippedDescription = String(skippedNotices[0]?.notice?.description ?? "");
+  check(
+    "…emits the file-failure notice for a skipped path",
+    skippedNotices.length === 1,
+    JSON.stringify(skippedNotices.map((e) => e.notice?.description ?? null)),
+  );
+  check(
+    "…naming the skipped path",
+    skippedDescription.includes("/work/link.txt"),
+    JSON.stringify(skippedDescription),
+  );
+
+  // ---- 9. an unrecoverable capture names the reason (BF-03) ----
+  //
+  // The bridge folds the path into `skipped` for older consumers and carries the
+  // reason in `unrecoverable`. Both facts must reach the user, and the path must
+  // not be reported twice (once generically, once with the reason).
+  const beforeUnrecoverableRevert = events.length;
+  await conn.send({
+    type: "session.revert",
+    requestId: "revert-unrecoverable-only",
+    sessionId,
+    token: { messageId: "revert-unrecoverable-only" },
+    scope: "both",
+  });
+  const unrecoverableRevert = await untilSince(
+    beforeUnrecoverableRevert,
+    (e) =>
+      e.requestId === "revert-unrecoverable-only"
+      && (e.type === "request.completed" || e.type === "request.failed"),
+    "unrecoverable-only revert reply",
+  );
+  check(
+    "a rewind whose file could not be snapshotted still answers request.completed",
+    unrecoverableRevert.type === "request.completed",
+    JSON.stringify(unrecoverableRevert.error ?? "completed"),
+  );
+  const unrecoverableNotices = eventsSince(beforeUnrecoverableRevert).filter(
+    (e) => e.type === "session.notice" && e.notice?.title === "文件回退未完成",
+  );
+  const unrecoverableDescription = String(unrecoverableNotices[0]?.notice?.description ?? "");
+  check(
+    "…emits the file-failure notice for an unrecoverable capture",
+    unrecoverableNotices.length === 1,
+    JSON.stringify(unrecoverableNotices.map((e) => e.notice?.description ?? null)),
+  );
+  check(
+    "…naming the path and the capture's own reason",
+    unrecoverableDescription.includes("/work/big.bin")
+      && unrecoverableDescription.includes("larger than 8388608 bytes"),
+    JSON.stringify(unrecoverableDescription),
+  );
+  check(
+    "…and not repeating the path as a generic skipped entry",
+    (unrecoverableDescription.match(/\/work\/big\.bin/gu) ?? []).length === 1,
+    JSON.stringify(unrecoverableDescription),
+  );
+
+  // ---- 10. an already-absent delete is benign, not a failure (BF-03) ----
+  //
+  // The only planned action was deleting a file the agent had created, and it was
+  // already gone when the restore ran. Nothing is unrestored, so a failure notice
+  // here would be a false alarm. This is the guard against widening the condition
+  // into "any files receipt is a failure".
+  const beforeAlreadyAbsentRevert = events.length;
+  await conn.send({
+    type: "session.revert",
+    requestId: "revert-already-absent",
+    sessionId,
+    token: { messageId: "revert-already-absent" },
+    scope: "both",
+  });
+  const alreadyAbsentRevert = await untilSince(
+    beforeAlreadyAbsentRevert,
+    (e) =>
+      e.requestId === "revert-already-absent"
+      && (e.type === "request.completed" || e.type === "request.failed"),
+    "already-absent revert reply",
+  );
+  check(
+    "a rewind whose delete target was already gone still answers request.completed",
+    alreadyAbsentRevert.type === "request.completed",
+    JSON.stringify(alreadyAbsentRevert.error ?? "completed"),
+  );
+  const alreadyAbsentNotices = eventsSince(beforeAlreadyAbsentRevert).filter(
+    (e) => e.type === "session.notice" && e.notice?.title === "文件回退未完成",
+  );
+  check(
+    "…and emits no file-failure notice (a benign no-op is not a partial restore)",
+    alreadyAbsentNotices.length === 0,
+    JSON.stringify(alreadyAbsentNotices.map((e) => e.notice?.description ?? null)),
   );
 
   await conn.close();

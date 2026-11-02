@@ -16,8 +16,18 @@
  *      give you the key" will produce, must not echo the secret.
  *   5. All-429 is reported as **unknown**, and must not end in the advice to
  *      declare the route non-reasoning.
+ *   5b. baseline 200 then 401/402/403 (revoked key, exhausted quota, policy
+ *      denial) is also **unknown** — not "developer role rejected"/"all levels
+ *      rejected" with exit 0 and permanent-downgrade advice. A generic 400 that
+ *      never names the parameter is unknown too.
+ *   5b2. the same is true when the error body *does* name the dimension: a
+ *      developer 401/403 and an effort 402 must still read as unknown, because
+ *      the status, not the wording, decides that this is an environment
+ *      failure. This is the regression for `isVerdict`'s auth/quota branch.
  *   6. Nothing probed at all exits non-zero: `set -e` and `if ! npx … probe`
- *      read that code.
+ *      read that code. A 400 whose body names `reasoning_effort` (or the
+ *      `developer` role) is still a real refusal, and the compatibility advice
+ *      still appears.
  *   7. The happy path still prints the fragment and exits 0.
  *
  * No profile, no daemon, no model: the gateway is this file's own HTTP server.
@@ -163,6 +173,108 @@ const args = ["--base-url", baseUrl, "--api-key-env", ENV_NAME, "--model", "some
   );
 }
 
+// ---- 5b. auth/quota failures after a successful baseline are unknown -----
+{
+  // The route answered the baseline, then its key was revoked / quota ran out.
+  // Every later 401/402/403 is about the environment: it must not become
+  // "developer role rejected" + "all reasoning levels rejected" + exit 0 with
+  // advice to permanently downgrade the profile. Reproduced against a loopback
+  // gateway for all three status codes because they share the defect.
+  for (const status of [401, 402, 403]) {
+    respond = (body) => {
+      if (body?.messages?.some((message) => message.role === "developer")) {
+        return { status, body: { error: { message: "invalid api key or insufficient quota" } } };
+      }
+      if (body?.reasoning_effort !== undefined) {
+        return { status, body: { error: { message: "insufficient quota" } } };
+      }
+      return { status: 200, body: { choices: [{ message: { content: "391" } }] } };
+    };
+    const run = await probe(args);
+    check(
+      `baseline 200 then ${status}: the developer role is unknown, not REJECTED`,
+      run.out.includes("role=developer ......... unknown") && !run.out.includes("supportsDeveloperRole: false"),
+      run.out.trim().split("\n").find((line) => line.includes("role=developer")) ?? "(no developer line)",
+    );
+    check(
+      `baseline 200 then ${status}: no reasoning level is reported as rejected`,
+      run.out.includes(`unknown (${status})`) && !run.out.includes(`rejected (${status})`),
+      run.out.trim().split("\n").filter((line) => line.includes("reasoning_effort"))[0],
+    );
+    check(
+      `baseline 200 then ${status}: no permanent downgrade advice is printed`,
+      !run.out.includes("reasoningEfforts: false") && !run.out.includes("supportsDeveloperRole: false"),
+    );
+    check(`baseline 200 then ${status}: the run is inconclusive and exits 1`, run.code === 1, `exit ${run.code}`);
+  }
+}
+
+// ---- 5b2. the 401/402/403 early return must beat a dimension-naming body --
+{
+  // The sole regression for `isVerdict()`'s explicit auth/quota early return.
+  // The 5b fixture's error bodies name neither dimension, so deleting that
+  // branch still ends in "unknown" through the dimension regexes — it never
+  // exercises the branch. Here the bodies DO name the probed field, so only the
+  // early return keeps an auth/quota denial from becoming a capability verdict:
+  //   developer probe -> 401/403 "developer role ..."
+  //   effort probe    -> 402     "reasoning_effort ..."
+  for (const developerStatus of [401, 403]) {
+    respond = (body) => {
+      if (body?.messages?.some((message) => message.role === "developer")) {
+        return {
+          status: developerStatus,
+          body: { error: { message: "developer role not permitted for this key" } },
+        };
+      }
+      if (body?.reasoning_effort !== undefined) {
+        return { status: 402, body: { error: { message: "reasoning_effort quota exhausted" } } };
+      }
+      return { status: 200, body: { choices: [{ message: { content: "391" } }] } };
+    };
+    const run = await probe(args);
+    check(
+      `baseline 200 then developer ${developerStatus} naming "developer" is unknown, not REJECTED`,
+      run.out.includes("role=developer ......... unknown") && !run.out.includes("supportsDeveloperRole: false"),
+      run.out.trim().split("\n").find((line) => line.includes("role=developer")) ?? "(no developer line)",
+    );
+    check(
+      `baseline 200 then effort 402 naming "reasoning" is unknown, not rejected`,
+      run.out.includes("unknown (402)") && !run.out.includes("rejected (402)"),
+      run.out.trim().split("\n").filter((line) => line.includes("reasoning_effort"))[0],
+    );
+    check(
+      `developer ${developerStatus} / effort 402: no permanent downgrade advice`,
+      !run.out.includes("reasoningEfforts: false") && !run.out.includes("supportsDeveloperRole: false"),
+    );
+    check(
+      `developer ${developerStatus} / effort 402: the run is inconclusive and exits non-zero`,
+      run.code === 1,
+      `exit ${run.code}`,
+    );
+  }
+}
+
+// ---- 5c. a generic 4xx does not name the parameter, so it is unknown -----
+{
+  respond = (body) => {
+    if (body?.messages?.some((message) => message.role === "developer")) {
+      return { status: 400, body: { error: { message: "Bad Request" } } };
+    }
+    if (body?.reasoning_effort !== undefined) {
+      return { status: 400, body: { error: { message: "Bad Request" } } };
+    }
+    return { status: 200, body: { choices: [{ message: { content: "391" } }] } };
+  };
+  const run = await probe(args);
+  check(
+    "a generic 400 on the effort spellings reads as unknown, not rejected",
+    run.out.includes("unknown (400)") && !run.out.includes("rejected (400)"),
+    run.out.trim().split("\n").filter((line) => line.includes("reasoning_effort"))[0],
+  );
+  check("and it does not advise a permanent downgrade", !run.out.includes("reasoningEfforts: false"));
+  check("and it exits non-zero", run.code === 1, `exit ${run.code}`);
+}
+
 // ---- 6. a 4xx on the effort spellings *is* a refusal ---------------------
 {
   respond = (body) =>
@@ -184,6 +296,23 @@ const args = ["--base-url", baseUrl, "--api-key-env", ENV_NAME, "--model", "some
     run.out.includes("reasoningEfforts: false"),
   );
   check("exit 0: the route answered, it just does not reason", run.code === 0, `exit ${run.code}`);
+}
+
+// ---- 6b. a 4xx that names the developer role is a refusal ----------------
+{
+  respond = (body) => {
+    if (body?.messages?.some((message) => message.role === "developer")) {
+      return { status: 400, body: { error: { message: "role 'developer' is not supported by this model" } } };
+    }
+    return { status: 200, body: { choices: [{ message: { content: "391" } }] } };
+  };
+  const run = await probe(args);
+  check(
+    "a 400 that names the developer role still yields the compatibility advice",
+    run.out.includes("REJECTED -> needs compat.supportsDeveloperRole: false"),
+    run.out.trim().split("\n").find((line) => line.includes("role=developer")) ?? "(no developer line)",
+  );
+  check("and the reasoning levels still conclude normally", run.code === 0, `exit ${run.code}`);
 }
 
 // ---- 7. the happy path is unchanged --------------------------------------

@@ -1316,5 +1316,19 @@ export function foldWindow(total: number, maxLines: number, expanded: boolean): 
 export const FOLD_LINES = { diff: 9, read: 8, search: 8 } as const;
 /** DSH's TerminalBlock passes `maxLines: Infinity`. */
 export const TERMINAL_MAX_LINES = Number.POSITIVE_INFINITY;
+/**
+ * The terminal output's scroll window.
+ *
+ * DSH's tool-row stylesheet binds `--dsl-terminal-output-max-height: 224px` on
+ * the terminal body and the block's `.output` uses it as `max-height` with
+ * `overflow-y: auto`; `TERMINAL_MAX_LINES = Infinity` is the other half of the
+ * same decision — the whole output is rendered, and this is what keeps it from
+ * pushing the timeline down. Without it the card grew with the log.
+ */
+export const TERMINAL_OUTPUT_MAX_HEIGHT = 224;
+/** `.output { max-height: var(--dsl-terminal-output-max-height) }`. */
+export function terminalOutputScrollStyle(): { maxHeight: number } {
+  return { maxHeight: TERMINAL_OUTPUT_MAX_HEIGHT };
+}
 /** `.bodyScroll { max-height: 260px }` on the code-tool card. */
 export const CODE_MAX_HEIGHT = 260;

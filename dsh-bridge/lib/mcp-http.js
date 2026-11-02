@@ -126,6 +126,7 @@ export function pickResult(body, id) {
  * @param options.id - Request id; omit for a notification.
  * @param options.sessionId - `Mcp-Session-Id` to echo when the server issued one.
  * @param options.timeoutMs - Budget for the whole round trip.
+ * @param options.signal - The caller's cancellation signal, when it has one.
  * @param options.fetchImpl - Injection point for the offline check.
  * @returns The JSON-RPC `result`, the session id the server issued, and the raw response.
  */
@@ -137,10 +138,24 @@ export async function mcpRequest({
   id,
   sessionId,
   timeoutMs = DEFAULT_MCP_TIMEOUT_MS,
+  signal,
   fetchImpl = fetch,
 }) {
+  // A call dispatched after its turn was cancelled has no business opening a
+  // connection at all. Failure names the cancellation rather than the timeout,
+  // because the two are different answers to "why did my call stop".
+  if (signal?.aborted) throw new Error(`mcp: ${method} canceled before the request was sent`);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error(`mcp: ${method} timed out after ${timeoutMs}ms`)), timeoutMs);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new Error(`mcp: ${method} timed out after ${timeoutMs}ms`));
+  }, timeoutMs);
+  // Fuse the caller's signal with this round trip's own timeout instead of
+  // replacing either: an abort must reach `fetch` (abandoning the promise alone
+  // leaves the request running and the server working), while the timeout keeps
+  // its existing budget. `AbortSignal.any` preserves both reasons.
+  const requestSignal = signal === undefined ? controller.signal : AbortSignal.any([signal, controller.signal]);
   const message = id === undefined
     ? { jsonrpc: '2.0', method, ...(params === undefined ? {} : { params }) }
     : { jsonrpc: '2.0', id, method, ...(params === undefined ? {} : { params }) };
@@ -154,11 +169,14 @@ export async function mcpRequest({
         ...headers,
       },
       body: JSON.stringify(message),
-      signal: controller.signal,
+      signal: requestSignal,
     });
     const issuedSession = response.headers?.get?.('mcp-session-id') ?? undefined;
     const contentType = response.headers?.get?.('content-type') ?? '';
     const text = await response.text();
+    // A response that arrived while the caller was giving up is a cancellation,
+    // not a result: the caller no longer owns this turn's side effects.
+    if (signal?.aborted) throw new Error(`mcp: ${method} canceled`);
     if (!response.ok) {
       const error = new Error(`mcp: ${method} failed with HTTP ${response.status}${text === '' ? '' : `: ${text.slice(0, 200)}`}`);
       // The status and body are kept on the error so a caller can tell "the server
@@ -186,7 +204,12 @@ export async function mcpRequest({
     const body = isEventStream(contentType) ? parseSseFrames(text) : JSON.parse(text);
     return { result: pickResult(body, id), sessionId: issuedSession, contentType, text };
   } catch (error) {
-    if (error instanceof Error && error.name === 'AbortError') {
+    // Caller cancellation wins over the timer when both fired in the same turn:
+    // reporting "timed out" for a call the caller withdrew would name the wrong
+    // cause. A bare AbortError with no such flag can only have come from the
+    // timeout controller, so it keeps the timeout classification.
+    if (signal?.aborted) throw new Error(`mcp: ${method} canceled`);
+    if (timedOut || (error instanceof Error && error.name === 'AbortError')) {
       throw new Error(`mcp: ${method} timed out after ${timeoutMs}ms`);
     }
     throw error;
@@ -288,6 +311,41 @@ export function unavailableBrowserTools(tools, hostGap) {
 }
 
 /**
+ * Wait for one shared promise while observing a caller's cancellation.
+ *
+ * A handshake is connection state, not call state: aborting it because one
+ * caller gave up would fail every other caller waiting on the same client, and
+ * the next call would have to re-handshake for no reason. The shared work
+ * therefore keeps running; only the cancelling caller's wait is rejected.
+ *
+ * @param promise - The shared operation.
+ * @param signal - The caller's cancellation signal, when it has one.
+ * @param method - Method name used in the cancellation error.
+ * @returns The shared result, or a rejection for this caller alone.
+ */
+function waitForShared(promise, signal, method) {
+  if (signal === undefined) return promise;
+  if (signal.aborted) return Promise.reject(new Error(`mcp: ${method} canceled before the request was sent`));
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener('abort', onAbort);
+      reject(new Error(`mcp: ${method} canceled`));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+/**
  * One MCP server connection: initialize once, then list and call tools.
  *
  * `tools/list` is fetched once and reused by default (`cacheTools: true`): the
@@ -372,7 +430,7 @@ export class McpHttpClient {
    * a session id can be disowned, and a fire-and-forget notification is not a
    * place to re-handshake from.
    */
-  async #request(method, { params, sessionId = this.#sessionId } = {}) {
+  async #request(method, { params, sessionId = this.#sessionId, signal } = {}) {
     const epoch = this.#epoch;
     try {
       const response = await mcpRequest({
@@ -383,6 +441,7 @@ export class McpHttpClient {
         id: this.#nextId(),
         sessionId,
         timeoutMs: this.timeoutMs,
+        signal,
         fetchImpl: this.fetchImpl,
       });
       if (response.sessionId !== undefined && this.#epoch === epoch) this.#sessionId = response.sessionId;
@@ -393,14 +452,16 @@ export class McpHttpClient {
     }
   }
 
-  async #call(method, params) {
-    const response = await this.#request(method, { params });
+  async #call(method, params, { signal } = {}) {
+    const response = await this.#request(method, { params, signal });
     return response.result;
   }
 
   /** Handshake once; a failed handshake is retried on the next call. */
-  async ensureInitialized() {
+  async ensureInitialized(signal) {
     this.#initialized ??= (async () => {
+      // The handshake itself is not passed the caller's signal: it is shared
+      // state, and one cancelled caller must not tear it down for the others.
       await this.#request('initialize', {
         params: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: this.clientInfo },
       });
@@ -424,7 +485,7 @@ export class McpHttpClient {
       this.#initialized = undefined;
       throw error;
     });
-    return this.#initialized;
+    return waitForShared(this.#initialized, signal, 'initialize');
   }
 
   /**
@@ -445,8 +506,8 @@ export class McpHttpClient {
    * or empty `nextCursor` (nothing more to ask for), and is bounded in case a
    * server hands back a cursor that keeps naming itself.
    */
-  async listTools({ refresh = false } = {}) {
-    await this.ensureInitialized();
+  async listTools({ refresh = false, signal } = {}) {
+    await this.ensureInitialized(signal);
     if (this.#tools === undefined || refresh || this.cacheTools !== true) {
       const epoch = this.#epoch;
       const tools = [];
@@ -455,7 +516,7 @@ export class McpHttpClient {
         if (page >= MAX_TOOL_PAGES) {
           throw new Error(`mcp: tools/list still paginating after ${MAX_TOOL_PAGES} pages; refusing to cache a partial catalog`);
         }
-        const result = await this.#call('tools/list', cursor === undefined ? {} : { cursor });
+        const result = await this.#call('tools/list', cursor === undefined ? {} : { cursor }, { signal });
         // "We could not read the catalog" is not "the server has no tools". The
         // two used to be the same value (`[]`), and the emptiness was cached, so a
         // server that recovered was still reported as empty for the rest of the
@@ -474,15 +535,15 @@ export class McpHttpClient {
       // read is repeated against the session that replaced it. The check sits
       // after the whole loop: checking per page would cache the pages read before
       // the loss.
-      if (this.#epoch !== epoch) return this.listTools({ refresh });
+      if (this.#epoch !== epoch) return this.listTools({ refresh, signal });
       this.#tools = tools;
     }
     return this.#tools;
   }
 
   /** Invoke one tool by its server-side name. */
-  async callTool(name, args = {}) {
-    await this.ensureInitialized();
-    return this.#call('tools/call', { name, arguments: args ?? {} });
+  async callTool(name, args = {}, { signal } = {}) {
+    await this.ensureInitialized(signal);
+    return this.#call('tools/call', { name, arguments: args ?? {} }, { signal });
   }
 }

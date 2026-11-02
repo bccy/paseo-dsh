@@ -12,8 +12,12 @@
  *   node harness/session-calls.mjs --latest --tool ask_user_question
  *   node harness/session-calls.mjs --session b9a2b365 --raw
  *
- * Exit code is 1 when any call carried keys the schema never declared, so this
- * can gate a script.
+ * Exit codes:
+ *   0  every shown call was diffed against a schema and carried only declared keys
+ *   1  at least one call carried keys the schema never declared
+ *   2  the audit could not be completed for at least one call (no `request/header`
+ *      schema, or arguments that are not JSON) — "not checked" is not "clean", so
+ *      this fails closed instead of exiting 0 over an empty gate
  *
  * Why this exists
  * ---------------
@@ -237,6 +241,8 @@ if (selected.length === 0) {
 const toolFilter = valueOf("--tool", null);
 const showRaw = has("--raw");
 let invalidCalls = 0;
+/** Calls the audit could not judge: no schema, or arguments that are not JSON. */
+let uncheckedCalls = 0;
 
 for (const { file } of selected) {
   const { events } = parseEvents(await decode(file), file);
@@ -259,6 +265,8 @@ for (const { file } of selected) {
       parsed = JSON.parse(raw);
     } catch {
       warnings.push(`${labelOf(file)}: call ${index + 1} (${data.name}) arguments are not JSON`);
+      uncheckedCalls++;
+      console.log(`\n--- [UNCHECKED] ${data.name} (${String(raw).length} B) ---`);
       continue;
     }
 
@@ -268,6 +276,7 @@ for (const { file } of selected) {
 
     const clean = problems.unknown.length === 0 && problems.missing.length === 0;
     if (!clean) invalidCalls++;
+    if (schema === undefined) uncheckedCalls++;
     const verdict = schema === undefined ? "no schema" : clean ? "ok" : "INVALID";
 
     console.log(`\n--- [${verdict}] ${data.name} (${raw.length} B) ---`);
@@ -284,4 +293,11 @@ for (const warning of warnings) console.error(`warning: ${warning}`);
 if (invalidCalls > 0) {
   console.error(`\n${invalidCalls} call(s) carried keys their schema never declared`);
   process.exit(1);
+}
+if (uncheckedCalls > 0) {
+  console.error(
+    `\n${uncheckedCalls} call(s) could not be checked against a schema `
+      + `(missing request/header or unparsable arguments); the gate is incomplete, not clean`,
+  );
+  process.exit(2);
 }

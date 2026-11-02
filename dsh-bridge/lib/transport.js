@@ -15,6 +15,24 @@
 import { StringDecoder } from 'node:string_decoder';
 
 /**
+ * Default cap on one unterminated inbound frame: 256 MiB.
+ *
+ * The same bound the plugin's side of this pipe has enforced since its frame
+ * reader was split out (`DEFAULT_MAX_PENDING_BYTES` in
+ * `paseo-plugin/server/frame-reader.ts`). It matters more here: this process is
+ * shared by every session, so one frame that never terminates — malformed
+ * output, or a peer killed mid-write — growing the retained buffer without a
+ * limit is an OOM that ends all of them. Both defaults are pinned by their
+ * offline checks at 256 MiB so the two ends cannot drift apart again.
+ *
+ * Counted with `String#length` — the unit the retained chunks are stored in.
+ * V8 keeps ASCII text at one byte per code unit and everything else at two, so
+ * the real footprint is within a factor of two of this number; the point is that
+ * it is a bound, not an exact byte count.
+ */
+export const DEFAULT_MAX_PENDING_BYTES = 256 * 1024 * 1024;
+
+/**
  * A JSON-RPC error response, preserving the wire `code` and optional `data`.
  *
  * Internal on purpose: it is the rejection value for a failed server -> client
@@ -60,8 +78,15 @@ export class PaseoTransport {
    * Behavior is unchanged, including the details that are easy to "improve"
    * into a regression: a blank line is skipped, a `\r` before the `\n` is kept
    * in the line (the caller's `trim()` is what removes it, exactly as before),
-   * a trailing line without a newline stays pending forever, and an unparsable
-   * line is reported on stderr instead of being swallowed.
+   * a trailing line without a newline stays pending, and an unparsable line is
+   * reported on stderr instead of being swallowed.
+   *
+   * "Pending" is bounded, and that bound is the one thing added here: past
+   * {@link DEFAULT_MAX_PENDING_BYTES} the frame is discarded whole — up to and
+   * including its terminator, so its tail cannot be glued onto the next frame —
+   * reported once on stderr (or through `options.onOverflow`), and parsing
+   * resumes at the next newline. Without it, a single malformed frame was an
+   * unbounded buffer in the one process every session shares.
    */
   #partial = [];
   #started = false;
@@ -69,10 +94,29 @@ export class PaseoTransport {
   #requestHandler;
   #pending = new Map();
   #nextId = 1;
+  #maxPendingBytes;
+  #onOverflow;
+  /** Characters retained in {@link #partial}, maintained incrementally. */
+  #pendingBytes = 0;
+  /**
+   * Set when the frame in flight was discarded for exceeding the limit.
+   *
+   * While set, bytes are dropped until the next newline — that newline ends the
+   * *discarded* frame, so it is not a line of its own and the frames after it
+   * parse normally.
+   */
+  #discarding = false;
 
-  constructor(input, output) {
+  /**
+   * @param input - inbound byte stream (Paseo -> bridge).
+   * @param output - outbound byte stream (bridge -> Paseo).
+   * @param options - the unterminated-frame bound and its report callback.
+   */
+  constructor(input, output, options = {}) {
     this.#input = input;
     this.#output = output;
+    this.#maxPendingBytes = options.maxPendingBytes ?? DEFAULT_MAX_PENDING_BYTES;
+    this.#onOverflow = options.onOverflow;
   }
 
   /** Attach stream listeners and begin reading frames. Idempotent. */
@@ -183,6 +227,13 @@ export class PaseoTransport {
     for (;;) {
       const newline = text.indexOf('\n', start);
       if (newline === -1) break;
+      if (this.#discarding) {
+        // The terminator of the dropped frame. Consume it, resume after it, and
+        // do not count it: it was the end of a frame that never became a line.
+        this.#discarding = false;
+        start = newline + 1;
+        continue;
+      }
       const piece = text.slice(start, newline);
       let line;
       if (this.#partial.length === 0) {
@@ -190,8 +241,10 @@ export class PaseoTransport {
         line = piece;
       } else {
         this.#partial.push(piece);
+        this.#pendingBytes += piece.length;
         line = this.#partial.join('');
         this.#partial = [];
+        this.#pendingBytes = 0;
       }
       start = newline + 1;
       this.#dispatchLine(line);
@@ -199,8 +252,52 @@ export class PaseoTransport {
     // Whatever follows the last newline starts the next frame. Deliberately no
     // trailing-`\r` strip: `trim()` in `#dispatchLine` covers it, and stripping
     // here would change the text logged for a malformed line.
-    if (start < text.length) this.#partial.push(text.slice(start));
+    if (!this.#discarding && start < text.length) {
+      const tail = text.slice(start);
+      this.#partial.push(tail);
+      this.#pendingBytes += tail.length;
+      if (this.#maxPendingBytes >= 0 && this.#pendingBytes > this.#maxPendingBytes) {
+        // A frame that never terminates keeps growing for as long as the peer
+        // writes; in a process every session shares that is an OOM. Discard it
+        // whole — up to and including its terminator — so the tail cannot be
+        // glued onto the next frame, then report once and skip to the newline.
+        const dropped = this.#pendingBytes;
+        this.#partial = [];
+        this.#pendingBytes = 0;
+        this.#discarding = true;
+        this.#reportOverflow(dropped);
+      }
+    }
   };
+
+  /**
+   * Report one frame discarded for exceeding {@link #maxPendingBytes}.
+   *
+   * Default sink is stderr, the same place malformed lines go: the two are the
+   * same user-visible event (bytes that cannot become a frame). `onOverflow`
+   * exists for the offline check, which drives this path with a tiny limit
+   * instead of allocating 256 MB. A throwing reporter must not take down the
+   * process it is reporting for.
+   *
+   * @param dropped - characters discarded.
+   */
+  #reportOverflow(dropped) {
+    try {
+      if (this.#onOverflow !== undefined) {
+        this.#onOverflow({ dropped, limit: this.#maxPendingBytes });
+        return;
+      }
+      process.stderr.write(
+        `[bridge] dropped an oversized JSON-RPC frame: ${String(dropped)} characters with no `
+          + `newline before the ${String(this.#maxPendingBytes)}-character bound; `
+          + 'skipping to the next newline\n',
+      );
+    } catch (error) {
+      process.stderr.write(
+        `[bridge] reporting an oversized frame failed: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
+  }
 
   /** Route one complete, terminator-free line to the frame handlers. */
   #dispatchLine(line) {

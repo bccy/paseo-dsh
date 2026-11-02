@@ -42,6 +42,34 @@
  *      dispatch are pinned, and the whole switch is scanned for a `case` that
  *      names a method the prototype does not have: that is the exact shape the
  *      regression took, and it is what no behavioural check would have noticed.
+ *   4. **`paseo/sessions` must not pre-filter more narrowly than the host.**
+ *      The host matches a query against title/preview/cwd-basename after the
+ *      provider answers, so the bridge must not filter by session id. `cwd` is
+ *      different: the host passes it to the provider *before* its own
+ *      realpath-aware filter, and without a provider-side filter the newest rows
+ *      from every other workspace crowd the requested one out of the scan
+ *      limit. The bridge keeps a cwd pre-filter that is a superset of the host's
+ *      (string equality or realpath-equivalent, lexical fallback) and applies it
+ *      before truncation. The check pins a title-only query match, a
+ *      symlink-equivalent cwd match, exclusion of a different cwd, and an old
+ *      same-cwd session surviving a small limit among many newer other-cwd rows.
+ *   5. **A timed-out persistence read must cancel the backend and dispose a
+ *      late handle.** `SessionPersistence.open` accepts `signal` but only
+ *      promises to observe it before backend work starts; a handle that resolves
+ *      after the deadline is otherwise never closed (the owning `finally` still
+ *      sees `undefined`).
+ *   6. **A queued plan intent must be applied in both directions.** Paseo opens
+ *      a session to read its composer features and selects build (plan=false)
+ *      before the agent exists; applying only `true` left a persisted plan=true
+ *      session active after the user chose build. A failing application must
+ *      fail the creation loudly, keep the intent for a retry, and not publish a
+ *      ready record around an agent that still holds the write lease.
+ *   7. **A stop during a cold session's first prompt must stop the turn.** The
+ *      agent is created inside the prompt, so a cancel arriving then cannot use
+ *      `requireSession`; answering "unknown session" let the prompt's own
+ *      followup open the turn. The cancel must be recorded for that delivery and
+ *      applied after the followup that opens it (DSH's cancel is a no-op while
+ *      idle and does not arm later work).
  *
  * Usage:
  *
@@ -58,8 +86,9 @@
  * That is a **local** dependency: a machine without a DSH install cannot run this
  * check, which is why it is not part of a CI gate that runs on a bare runner.
  */
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -129,14 +158,16 @@ const SUBAGENTS = {
  * Build a server whose side effects are observable.
  *
  * `createSession` is the thing under test — it is what materialises an agent and
- * takes the session log's write lease — so it is stubbed (a profile-less ctx
- * would otherwise fail deeper in) and every call is recorded. The fake agents it
- * hands back land in `agents`, which is what `assertLiveAgent` checks.
+ * takes the session log's write lease — so it is stubbed by default (a
+ * profile-less ctx would otherwise fail deeper in) and every call is recorded.
+ * The fake agents it hands back land in `agents`, which is what
+ * `assertLiveAgent` checks. Pass `{ stubCreate: false }` to drive the real
+ * `createSession` with a ctx that answers `agents.create` itself.
  *
  * `services` maps a ctx service name to the value `ctx.get` should answer; an
  * `Error` value makes the lookup throw, which is the failure path under test.
  */
-function makeServer(services = {}) {
+function makeServer(services = {}, { stubCreate = true } = {}) {
   const created = [];
   const agents = new Map();
   const ctx = {
@@ -156,13 +187,33 @@ function makeServer(services = {}) {
     request: async () => ({}),
   };
   const server = new PaseoHarnessServer(ctx, transport, {});
-  server.createSession = async (sessionId) => {
-    created.push(sessionId);
-    const agent = { id: `agent-${sessionId}`, session: { id: sessionId } };
-    agents.set(agent.id, agent);
-    return { handle: { agent }, control: { dispose() {} } };
-  };
+  if (stubCreate) {
+    server.createSession = async (sessionId) => {
+      created.push(sessionId);
+      const agent = { id: `agent-${sessionId}`, session: { id: sessionId } };
+      agents.set(agent.id, agent);
+      return { handle: { agent }, control: { dispose() {} } };
+    };
+  }
   return { server, created };
+}
+
+/**
+ * Run one async call with every `setTimeout` shortened to 0 ms.
+ *
+ * The bridge's persistence deadlines are 10–15 s, which is fine in production
+ * and unusable in a check. Only the bridge's own timers exist in these blocks —
+ * the fake persistence resolves on demand — so shortening global timers cannot
+ * reorder any real work.
+ */
+async function withShortTimers(fn) {
+  const original = globalThis.setTimeout;
+  globalThis.setTimeout = (callback, _ms, ...args) => original(callback, 0, ...args);
+  try {
+    return await fn();
+  } finally {
+    globalThis.setTimeout = original;
+  }
 }
 
 console.log('bridge server: usage gate and archive-state reporting\n');
@@ -524,6 +575,437 @@ const present = () => ({
     'closing a session drops its captured descriptions',
     server.toolDescriptionFor('jobs-1', COMMAND) === undefined,
     String(server.toolDescriptionFor('jobs-1', COMMAND)),
+  );
+}
+
+// ===== 5. paseo/sessions: query is host-filtered, cwd is a superset filter ===
+// The host matches a query against title / firstPromptPreview /
+// lastPromptPreview / cwd basename after the provider answers
+// (`agent-manager.listImportableSessions`). `cwd` is different: with no query,
+// `import-sessions.js:36-57` asks the provider for only `limit + importedCount`
+// (about 20) rows and applies its realpath matcher afterwards, so a bridge that
+// answers with the newest rows from every workspace can push the requested
+// workspace's sessions out of the scan entirely. The bridge therefore filters
+// cwd before truncation, but as a superset of the host's match (string equality
+// or realpath-equivalent; unresolved paths fall back to `path.resolve`).
+{
+  const rows = new Map([
+    ['session-a', { title: 'Fix login bug', preview: 'the login form loops' }],
+    ['session-b', { title: 'Unrelated', preview: 'something else' }],
+  ]);
+  const persistence = {
+    list: async () => [...rows.keys()].map((id) => ({ header: { id, cwd: '/workspace', createdAt: 1 } })),
+    open: async (id) => ({
+      read: async () => ({
+        events: [
+          { type: 'session/title', data: { title: rows.get(id)?.title } },
+          {
+            type: 'user/message',
+            data: {
+              source: { kind: 'user' },
+              content: [{ type: 'text', text: rows.get(id)?.preview }],
+            },
+          },
+        ],
+      }),
+      close: async () => {},
+    }),
+  };
+  const { server } = makeServer({ sessionPersistence: persistence });
+  const byTitle = await server.listSessions({ query: 'login', limit: 10 });
+  check(
+    'a query that matches only the title is still answered (host does the query match)',
+    byTitle.available === true && byTitle.sessions.some((row) => row.sessionId === 'session-a'),
+    JSON.stringify(byTitle.sessions.map((row) => row.sessionId)),
+  );
+  const byPreview = await server.listSessions({ query: 'loops', limit: 10 });
+  check(
+    'a query that matches only the preview is still answered (host does the query match)',
+    byPreview.available === true && byPreview.sessions.some((row) => row.sessionId === 'session-a'),
+    JSON.stringify(byPreview.sessions.map((row) => row.sessionId)),
+  );
+}
+
+{
+  const root = mkdtempSync(join(tmpdir(), 'bridge-sessions-'));
+  const real = join(root, 'real');
+  const other = join(root, 'other');
+  const link = join(root, 'link');
+  mkdirSync(real);
+  mkdirSync(other);
+  symlinkSync(real, link);
+  const emptyHandle = () => ({ read: async () => ({ events: [] }), close: async () => {} });
+  try {
+    // Symlink equivalence and the negative control: only the requested
+    // workspace may survive, even though both rows live in the same store.
+    const cwdPersistence = {
+      list: async () => [
+        { header: { id: 'session-cwd', cwd: real, createdAt: 1 } },
+        { header: { id: 'session-other', cwd: other, createdAt: 2 } },
+      ],
+      open: async () => emptyHandle(),
+    };
+    const cwdServer = makeServer({ sessionPersistence: cwdPersistence }).server;
+    const byCwd = await cwdServer.listSessions({ cwd: link, limit: 10 });
+    const cwdIds = byCwd.sessions.map((row) => row.sessionId);
+    check(
+      'a symlink-equivalent cwd matches the session',
+      byCwd.available === true && cwdIds.includes('session-cwd'),
+      JSON.stringify(cwdIds),
+    );
+    check(
+      'a different cwd is excluded before the host sees the list',
+      cwdIds.includes('session-other') === false,
+      JSON.stringify(cwdIds),
+    );
+
+    // The filter has to run BEFORE truncation: with a small limit, many newer
+    // sessions in other workspaces must not crowd out the only row in this one.
+    const crowded = [
+      ...Array.from({ length: 30 }, (_, index) => ({
+        header: { id: `other-new-${String(index)}`, cwd: join(root, `elsewhere-${String(index)}`), createdAt: 1000 + index },
+      })),
+      { header: { id: 'session-old-cwd', cwd: real, createdAt: 1 } },
+    ];
+    const crowdedServer = makeServer({
+      sessionPersistence: { list: async () => crowded, open: async () => emptyHandle() },
+    }).server;
+    const crowdedOut = await crowdedServer.listSessions({ cwd: link, limit: 5 });
+    const crowdedIds = crowdedOut.sessions.map((row) => row.sessionId);
+    check(
+      'a small limit still returns the old session in this cwd among many newer other cwds',
+      crowdedIds.length === 1 && crowdedIds[0] === 'session-old-cwd',
+      JSON.stringify(crowdedIds),
+    );
+
+    // A path that cannot be realpath'd on either side still matches through the
+    // lexical fallback (`resolve` strips `./` and the trailing separator).
+    const lexicalServer = makeServer({
+      sessionPersistence: {
+        list: async () => [{ header: { id: 'session-lexical', cwd: '/nonexistent/workspace', createdAt: 1 } }],
+        open: async () => emptyHandle(),
+      },
+    }).server;
+    const lexical = await lexicalServer.listSessions({ cwd: '/nonexistent/./workspace/', limit: 5 });
+    check(
+      'a non-existent cwd still matches through the path.resolve fallback',
+      lexical.sessions.some((row) => row.sessionId === 'session-lexical'),
+      JSON.stringify(lexical.sessions.map((row) => row.sessionId)),
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// ===== 6. persistence reads carry a signal and dispose late handles ========
+// The installed DSH contract: `SessionPersistence.open(id, access, {signal})`
+// and `SessionHandle.read(..., {signal})` accept cancellation, but `open` only
+// promises to observe it "before backend work starts". A backend may therefore
+// still resolve a handle after the bridge's deadline; that handle has no owner
+// (`finally` still sees `undefined`) and must be closed by the deadline path.
+{
+  let summarySignal;
+  let releaseSummary;
+  const closes = [];
+  const persistence = {
+    list: async () => [{ header: { id: 'late-1', cwd: '/workspace', createdAt: 1 } }],
+    open: (_id, _access, options) => {
+      summarySignal = options?.signal;
+      return new Promise((resolve) => {
+        releaseSummary = () => resolve({
+          read: async () => ({ events: [] }),
+          close: async () => { closes.push('late-1'); },
+        });
+      });
+    },
+  };
+  const { server } = makeServer({ sessionPersistence: persistence });
+  const listing = await withShortTimers(() => server.listSessions({ limit: 1 }));
+  check(
+    'a summary open past its deadline still lists the session (row without summary)',
+    listing.available === true && listing.sessions.length === 1,
+    JSON.stringify(listing.sessions),
+  );
+  check(
+    'summary open passes an AbortSignal to DSH',
+    summarySignal instanceof AbortSignal,
+    String(summarySignal),
+  );
+  releaseSummary();
+  await new Promise((resolve) => setImmediate(resolve));
+  check(
+    'a summary handle that resolves after its deadline is closed',
+    closes.length === 1,
+    JSON.stringify(closes),
+  );
+}
+
+{
+  let historySignal;
+  let readSignal;
+  let releaseHistory;
+  const closes = [];
+  const persistence = {
+    open: (_id, _access, options) => {
+      historySignal = options?.signal;
+      return new Promise((resolve) => {
+        releaseHistory = () => resolve({
+          inheritedEventCount: 0,
+          read: async (_offset, _length, readOptions) => {
+            readSignal = readOptions?.signal;
+            return { events: [] };
+          },
+          close: async () => { closes.push('late-2'); },
+        });
+      });
+    },
+  };
+  const { server } = makeServer({ sessionPersistence: persistence });
+  const stalled = await withShortTimers(() => server.history({ sessionId: 'late-2' }));
+  check(
+    'a stalled history open is a loud unavailable, never a blank success',
+    stalled.available === false && /timed out opening session history/.test(stalled.error?.message ?? ''),
+    JSON.stringify(stalled),
+  );
+  check('history open passes an AbortSignal to DSH', historySignal instanceof AbortSignal, String(historySignal));
+  releaseHistory();
+  await new Promise((resolve) => setImmediate(resolve));
+  check(
+    'a history handle that resolves after its deadline is closed',
+    closes.length === 1,
+    JSON.stringify(closes),
+  );
+
+  const okPersistence = {
+    open: async (_id, _access, options) => ({
+      inheritedEventCount: 0,
+      read: async (_offset, _length, readOptions) => {
+        readSignal = readOptions?.signal;
+        return { events: [] };
+      },
+      close: async () => {},
+    }),
+  };
+  const okServer = makeServer({ sessionPersistence: okPersistence }).server;
+  const ok = await okServer.history({ sessionId: 'ok-1' });
+  check(
+    'history read passes an AbortSignal to the handle',
+    ok.available === true && readSignal instanceof AbortSignal,
+    String(readSignal),
+  );
+}
+
+// ===== 7. queued plan intents are applied in both directions ==============
+{
+  const planCalls = [];
+  const planMode = {
+    get: () => ({ active: false }),
+    set: (agent, active) => {
+      planCalls.push({ id: agent.id, active });
+      return 'committed';
+    },
+  };
+  const { server } = makeServer({ planMode }, { stubCreate: false });
+  const createdAgents = [];
+  server.ctx.agents = {
+    create: async (options) => {
+      const agent = { id: `agent-${String(options.sessionId)}`, session: { id: options.sessionId } };
+      createdAgents.push(agent);
+      return { agent };
+    },
+    get: (id) => createdAgents.find((agent) => agent.id === id),
+  };
+
+  server.pendingPlanMode.set('plan-off-1', false);
+  await server.createSession('plan-off-1');
+  check(
+    'a queued plan=false intent is applied when its agent is created',
+    planCalls.length === 1 && planCalls[0].active === false,
+    JSON.stringify(planCalls),
+  );
+  check(
+    'a queued plan=false intent is consumed after application',
+    server.pendingPlanMode.has('plan-off-1') === false,
+  );
+
+  const before = planCalls.length;
+  server.pendingPlanMode.set('plan-on-1', true);
+  await server.createSession('plan-on-1');
+  check(
+    'a queued plan=true intent is still applied',
+    planCalls.length === before + 1 && planCalls.at(-1).active === true,
+    JSON.stringify(planCalls.slice(before)),
+  );
+
+  // The intent is per session: a second session created in the same process
+  // must not inherit it.
+  await server.createSession('plan-neutral-1');
+  check(
+    "one session's queued plan intent does not leak into another session",
+    planCalls.length === before + 1,
+    JSON.stringify(planCalls.slice(before)),
+  );
+}
+
+{
+  const disposed = [];
+  const { server } = makeServer({}, { stubCreate: false });
+  const agent = { id: 'agent-plan-no-service', session: { id: 'plan-no-service' } };
+  server.ctx.agents = {
+    create: async () => ({ agent, dispose: async () => { disposed.push('agent'); } }),
+    get: () => agent,
+  };
+  server.pendingPlanMode.set('plan-no-service', false);
+  let failure;
+  try {
+    await server.createSession('plan-no-service');
+  } catch (error) {
+    failure = error;
+  }
+  check(
+    'a queued plan intent with no plan service fails the creation loudly',
+    failure instanceof Error && /plan mode is not mounted/.test(failure.message),
+    failure instanceof Error ? failure.message : String(failure),
+  );
+  check(
+    'a queued plan intent with no plan service disposes the agent it created',
+    disposed.length === 1,
+    JSON.stringify(disposed),
+  );
+  check(
+    'a queued plan intent with no plan service stays queued',
+    server.pendingPlanMode.get('plan-no-service') === false,
+    String(server.pendingPlanMode.get('plan-no-service')),
+  );
+}
+
+{
+  const disposed = [];
+  const planMode = {
+    get: () => ({ active: true }),
+    set: () => {
+      throw new Error('plan projection unavailable');
+    },
+  };
+  const { server } = makeServer({ planMode }, { stubCreate: false });
+  const agent = { id: 'agent-plan-fail', session: { id: 'plan-fail' } };
+  server.ctx.agents = {
+    create: async () => ({ agent, dispose: async () => { disposed.push('agent'); } }),
+    get: () => agent,
+  };
+  server.pendingPlanMode.set('plan-fail', false);
+  let failure;
+  try {
+    await server.createSession('plan-fail');
+  } catch (error) {
+    failure = error;
+  }
+  check(
+    'a failing queued plan application fails the creation loudly',
+    failure instanceof Error && /plan projection unavailable/.test(failure.message),
+    failure instanceof Error ? failure.message : String(failure),
+  );
+  check(
+    'a failed plan application publishes no ready record',
+    server.sessions.has('plan-fail') === false && server.controls.has('plan-fail') === false,
+    JSON.stringify([...server.sessions.keys()]),
+  );
+  check(
+    'a failed plan application disposes the agent it created',
+    disposed.length === 1,
+    JSON.stringify(disposed),
+  );
+  check(
+    'a failed plan application keeps the intent queued for the retry',
+    server.pendingPlanMode.get('plan-fail') === false,
+    String(server.pendingPlanMode.get('plan-fail')),
+  );
+}
+
+// ===== 8. a stop during a cold session's first prompt stops the turn ======
+{
+  const calls = [];
+  const coldAgent = {
+    id: 'agent-cold-1',
+    session: { id: 'cold-1' },
+    status: 'idle',
+    followup(message) { calls.push(`followup:${String(message.id)}`); },
+    steer() { calls.push('steer'); },
+    cancel(cause) { calls.push(`cancel:${String(cause?.kind)}`); },
+  };
+  const agents = new Map([[coldAgent.id, coldAgent]]);
+  const { server } = makeServer({}, { stubCreate: false });
+  server.ctx.agents = { get: (id) => agents.get(id) };
+  let releaseCreation;
+  server.createSession = () => new Promise((resolve) => {
+    releaseCreation = () => resolve({ handle: { agent: coldAgent }, control: { dispose() {} } });
+  });
+  server.initializedSessions.add('cold-1');
+
+  const prompting = server.prompt({
+    sessionId: 'cold-1',
+    contentBlocks: [{ type: 'text', text: 'hello' }],
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  check(
+    'the cold-session prompt reached the in-flight agent creation',
+    typeof releaseCreation === 'function',
+  );
+
+  let cancelError;
+  let cancelResult;
+  try {
+    cancelResult = await server.cancel({ sessionId: 'cold-1' });
+  } catch (error) {
+    cancelError = error;
+  }
+  check(
+    "cancel during a cold session's agent creation is accepted (not unknown-session)",
+    cancelError === undefined && cancelResult?.canceled === true,
+    cancelError instanceof Error ? `threw: ${cancelError.message}` : JSON.stringify(cancelResult),
+  );
+  check(
+    'nothing is delivered before the agent exists',
+    calls.length === 0,
+    JSON.stringify(calls),
+  );
+
+  releaseCreation();
+  await prompting;
+  check(
+    'the queued stop cancels the turn after the followup that opens it',
+    calls.length === 2 && calls[0].startsWith('followup:') && calls[1] === 'cancel:user',
+    JSON.stringify(calls),
+  );
+
+  let unknownError;
+  try {
+    await server.cancel({ sessionId: 'never-seen' });
+  } catch (error) {
+    unknownError = error;
+  }
+  check(
+    'a cancel with neither a live agent nor an in-flight prompt still fails loudly',
+    unknownError instanceof Error && /unknown or not-yet-created/.test(unknownError.message),
+    unknownError instanceof Error ? unknownError.message : String(unknownError),
+  );
+
+  const liveCalls = [];
+  const liveAgent = {
+    id: 'agent-live-1',
+    session: { id: 'live-1' },
+    status: 'running',
+    followup() {},
+    steer() {},
+    cancel(cause) { liveCalls.push(`cancel:${String(cause?.kind)}`); },
+  };
+  agents.set(liveAgent.id, liveAgent);
+  server.sessions.set('live-1', { handle: { agent: liveAgent } });
+  await server.cancel({ sessionId: 'live-1' });
+  check(
+    'a cancel on a live session reaches the agent immediately',
+    liveCalls.length === 1 && liveCalls[0] === 'cancel:user',
+    JSON.stringify(liveCalls),
   );
 }
 

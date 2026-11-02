@@ -16,7 +16,9 @@
  *   0  补丁在位（MARKER 计数 == 2 且实现体是最新的）→ 撤回功能正常，无需动作
  *   1  需要跑一次 apply：未打补丁但锚点各命中 1 次（可自动打），**或**标记齐全但
  *      实现体是旧版（`state: stale-body`，需重建）
- *   2  未打补丁，且锚点失配 / 文件处于半打补丁状态 → 需人工介入，撤回已降级
+ *   2  未打补丁，且锚点失配 / 文件处于半打补丁状态 / `host-fields-changed` /
+ *      `upstream-history-shape-changed` → 需人工介入，撤回已降级；后两者表示
+ *      apply 也会拒绝（不是“可自动打”）
  *   3  目标文件不存在 → paseo 可能没装，或安装路径变了
  *   4  上游已自行修好撤回（revert() 里自己截断 history）→ **补丁该退休了**，
  *      按 UPGRADE.md 第 5 节删掉，别让它继续滞留并刷假告警
@@ -49,9 +51,11 @@ import {
   TURNID_TARGET,
   countOccurrences,
   detectUpstreamSelfFix,
+  hostFieldShapes,
   matchAll,
   rewindPatchStaleness,
   turnIdStaleness,
+  upstreamHistoryObjectShape,
 } from "./apply-rewind-history-truncation.mjs";
 
 const HOME_DIR = process.env.REWIND_PATCH_HOME ?? dirname(fileURLToPath(import.meta.url));
@@ -165,6 +169,27 @@ function inspect() {
     status,
   };
 
+  // The same #7675 guard `applyRewindPatch()` runs on BOTH paths, before it
+  // looks at markers. Without it this checker calls the file "patched" /
+  // "patchable" while apply is guaranteed to refuse — the upgrade-time silent
+  // degradation LP-02 records. Checked here rather than in the `markers === 0`
+  // branch only, because apply checks it on an already-patched file too.
+  const historyShape = upstreamHistoryObjectShape(source);
+  if (historyShape !== null) {
+    return {
+      ...base,
+      code: 2,
+      state: "upstream-history-shape-changed",
+      ok: false,
+      autoPatchable: false,
+      upstreamHistoryShape: historyShape,
+      summary: `上游把 PluginAgentSession.history 换成了对象（命中 \`${historyShape}\`，即 #7675 形状）：`
+        + "注入的 truncateHistoryFrom() 会变成运行期 no-op（撤回看起来成功、时间线却保留被撤内容），"
+        + "apply 会以 upstream-history-shape-changed 拒绝。",
+      hint: "按 UPGRADE.md 第 5/6 节改写或退役这个补丁；不要直接跑 apply，它不会写文件。",
+    };
+  }
+
   if (markers === 2) {
     // Markers prove *presence*, not *currency*: the injected method is part of
     // the apply script, so a file can carry an older body with the same 2
@@ -231,6 +256,28 @@ function inspect() {
       hint: "按 UPGRADE.md 第 5 节「什么时候可以彻底删掉补丁」执行。"
         + "注意：此检测只覆盖「在 revert() 里截断 history」这一种修法；"
         + "若上游改成发新事件类型或改 streamHistory()，本项检测不到（会退回正常打补丁）。",
+    };
+  }
+
+  // The fields the injected body dereferences, checked only on a clean file —
+  // on a patched one the injected body itself contains these strings, so the
+  // gate would always pass (same reasoning as `applyRewindPatch()`). Apply runs
+  // it before it writes; without it here this branch says "patchable" for a
+  // file apply will reject with host-fields-changed.
+  const hostFields = hostFieldShapes(source);
+  if (!hostFields.ok) {
+    return {
+      ...base,
+      code: 2,
+      state: "host-fields-changed",
+      ok: false,
+      autoPatchable: false,
+      hostField: hostFields.field,
+      hostFieldMissing: hostFields.missing,
+      summary: `补丁不在位，但注入体依赖的字段已不是上游现在用的形状：${hostFields.field} 缺少 `
+        + `${hostFields.missing.map((shape) => `\`${shape}\``).join(", ")}。apply 会以 host-fields-changed 拒绝，`
+        + "强行打上会让每次撤回抛 TypeError，所以这里不能报“可自动打”。",
+      hint: "上游重构了 translation cache / token 字段：按新形状改写 METHOD 与 hostFieldShapes 检查后再跑 apply。",
     };
   }
 
@@ -375,6 +422,9 @@ if (JSON_OUTPUT) {
     autoPatchable: result.autoPatchable,
     upstreamFixHits: result.upstreamFixHits ?? null,
     upstreamFixSites: result.upstreamFixSites ?? null,
+    upstreamHistoryShape: result.upstreamHistoryShape ?? null,
+    hostField: result.hostField ?? null,
+    hostFieldMissing: result.hostFieldMissing ?? null,
     summary: result.summary,
     hint: result.hint,
     applyScript: APPLY_SCRIPT,
