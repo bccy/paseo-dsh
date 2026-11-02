@@ -26,6 +26,10 @@ below.
 | Permission modes (sandbox) | ❌ no shared switch | ✅ **Permissions** dropdown in the composer switches DSH's sandbox and approval presets |
 | Agent presets | ❌ | ✅ when the profile mounts the agent-preset registry, a **Preset** dropdown appears (chosen at session creation, locked after the first turn) |
 | Session resume / import | ❌ no history, no import | ✅ reopening replays history through Paseo's `history: replay`; **import** native DSH sessions (`session.list`, read from `~/.dsh/sessions`) |
+| Background jobs | — | ✅ a composer pill shows DSH background jobs: live count while running, total when idle, expandable to each job |
+| Goal / workflow timeline | — | ✅ `goal/change` and `tool-workflow/*` events render as tool rows; a background workflow keeps its running state across turns |
+| Tool approval cards | — | ✅ DSH's `approval/request` becomes a Paseo approval card (allow once / reject) |
+| Session-level system prompt | — | ✅ each session may carry its own system prompt (the profile must mount the `systemPrompt` service) |
 | Stop and keep chatting | — | ✅ cancels the current turn only; the session survives |
 
 ## 🤖 Copy this to your AI agent (recommended)
@@ -75,8 +79,9 @@ If the probe fails, paste the full error to me; do not invent a config.
 Translate Paseo's "Plugins are trusted, unsandboxed code..." security notice
 【verbatim】and ask me whether to continue. Install only after I agree:
   paseo plugin add npm:paseo-dsh
-If the daemon is Paseo 0.12: the latest npm release (0.2.9) does not carry the
-0.12 adaptation yet, so install from source instead:
+If the daemon is Paseo 0.12: install npm >= 0.2.10 (the current latest, 0.2.17,
+satisfies it; only the older 0.2.9 predates the 0.12 adapter, in which case use
+the source install):
   paseo plugin add github:liuxing7954/paseo-dsh:paseo-plugin
 (The plugin provisions the DSH profile on first load; no script is needed.)
 Restart the Paseo daemon afterwards.
@@ -114,11 +119,11 @@ paseo plugin add npm:paseo-dsh
 paseo plugin ls          # confirm dsh-paseo is installed
 ```
 
-> **npm version warning (2026-10-20)**: the latest published version on npm is
-> `0.2.9` (2026-10-17), which does **not** carry the Paseo 0.12 adaptation
-> (versioned `paseo-system` envelope, `agent_message` row semantics, official
-> label icons, attachment content blocks). On Paseo 0.12 install from source, or
-> wait for `0.2.10`:
+> **Version note (historical, 2026-10-20)**: at that time the newest npm release
+> was `0.2.9` (2026-10-17), which did not carry the Paseo 0.12 adaptation.
+> npm has since moved to `0.2.17`, so the wait-for-`0.2.10` condition was met
+> long ago — use `paseo plugin add npm:paseo-dsh` above. The source install
+> remains available:
 >
 > ```bash
 > paseo plugin add github:liuxing7954/paseo-dsh:paseo-plugin
@@ -228,9 +233,11 @@ directory <https://paseo.cafe/plugins/dsh-paseo> · discussion
 When changing this repository, use `install.sh` to attach the checkout as a
 **directory source**: it creates (or reuses) the DSH profile and registers the
 plugin. The `dsh-bridge` symlink only covers the window before the plugin has
-loaded: every load **deletes and rewrites the whole bridge** in the profile from
-the embedded copy in `paseo-plugin/server/bridge-assets.ts`, so what actually runs
-is always the embedded asset, never this checkout directory.
+loaded: every load **replaces the whole bridge** in the profile from the embedded
+copy in `paseo-plugin/server/bridge-assets.ts` — it writes a staging directory,
+verifies every file, then swaps atomically, keeping the old generation if the
+swap fails — so what actually runs is always the embedded asset, never this
+checkout directory.
 
 ```bash
 git clone https://github.com/liuxing7954/paseo-dsh && cd paseo-dsh
@@ -310,7 +317,12 @@ that saves is the 1.5–2.7 s CLI cold start on every new session. **Environment
 variables are the exception** — they are process-wide, so only the environment at
 the time the first session opened applies; when a later session asks for a
 different value, the difference shows up as a warning on the timeline (key names
-only, never values) instead of being silently ignored.
+only, never values) instead of being silently ignored. **`PASEO_AGENT_ID` /
+`PASEO_AGENT_CWD` live in that same process environment**: Paseo CLI calls made
+through bash tools from a later session (heartbeat, schedule, agent send) see the
+**first** session's identity — DSH has no per-session shell-env extension point
+today, so this is a documented limit (FIELD-NOTES #76 and the "pending user
+decision" section of the audit), not a silent fix.
 
 ## Behaviour without local-patches
 
@@ -380,21 +392,29 @@ a false diagnosis).
 ## Requirements
 
 - Paseo ≥ 0.9.2 (needs the direct-provider plugin API)
-- **DSH ≥ 0.2.1** (on the 0.2.x line): the bridge imports five DSH internal
+- **DSH ≥ 0.2.1** (on the 0.2.x line): the bridge imports eight DSH internal
   packages directly (`@deepseek-ai/dsh-cmdline` / `dsh-brand` / `dsh-llm` /
-  `dsh-attachment` / `dsh-agent`), and 0.2.1 changed both prompt-variable
-  registration and catalog materialisation timing. What has actually been tested
-  is `0.2.1-rc.2` (2026-10-20); **0.2.0 and earlier are unverified**, and
-  `doctor` reports anything below 0.2.1 as blocking.
-- Node ≥ 18 (`paseo-dsh probe/doctor` use the built-in `fetch`; tested here on
-  Node 22.23.1). The plugin itself runs on the Paseo daemon's Node, so the package
-  does **not** declare `engines` — a minimum that was never tested does not go
-  into a declaration.
+  `dsh-attachment` / `dsh-agent` / `dsh-tools` / `dsh-subprocess` /
+  `schemastery`), and 0.2.1 changed both prompt-variable registration and catalog
+  materialisation timing. What has actually been tested is `0.2.1-rc.2`
+  (2026-10-20); **0.2.0 and earlier are unverified**, and `doctor` reports
+  anything below 0.2.1 as blocking.
+- Node ≥ 20.4 (on the 20.x line): the bridge uses `AbortSignal.any` (available
+  since Node 20.3) and `Symbol.dispose` (since Node 20.4, in
+  `dsh-bridge/lib/session-projections.js`). Only Node 22.23.1 was actually
+  tested; 20.4 itself is unverified. The plugin itself runs on the Paseo daemon's
+  Node, so the package does **not** declare `engines` — a minimum that was never
+  tested does not go into a declaration.
 
 ## Interface language (Chinese / English)
 
 The mode, thinking levels and permission/preset dropdowns in the composer, plus
-the `/` slash menu, plan cards and tool cards, all follow the interface language.
+the `/` slash menu and plan cards, follow the **daemon environment's** language
+(`DSH_PASEO_LANG` / `LC_ALL` etc. — **not** the Paseo app's own language
+setting). Tool cards (including their row labels) default to Chinese: the server
+puts the resolved locale on every tool-call item's `metadata.locale`, and the
+client switches only after the first tool call; rows already rendered are not
+re-rendered — a known limit of the plugin protocol, which has no locale channel.
 **Display only — the values that get sent never change**: switching language
 changes no id sent to DSH.
 
@@ -432,7 +452,8 @@ changes no id sent to DSH.
   therefore live in the plugin's `SKILL_COPY` table (`server/locale.ts`); a skill
   with no entry keeps its own text.
 
-The language is decided in this order:
+The language is decided in this order (**this is the server-side copy; the
+client bundle cannot read the daemon environment and defaults to `zh-CN`**):
 
 1. the `DSH_PASEO_LANG` environment variable — starts with `zh` → Chinese,
    anything else → English, overriding everything explicitly;
@@ -527,10 +548,11 @@ The plugin's `major.minor` **follows the DSH line it targets**: a `0.2.x`
 plugin targets DSH `0.2.x`, and the patch number is the plugin's own release
 counter. Pick the version on the same line as `dsh` on your daemon.
 
-The repository currently tracks `0.2.11`: the published `0.2.11` plus this
-fork's multi-session rework (one `dsh` process serving several Paseo sessions)
-and the rewind capability, **not yet published**. Publishing waits for local
-verification.
+The repository's version number has a single source of truth:
+`paseo-plugin/package.json` (verified `0.2.16` in this round). The latest npm
+release is `0.2.17` (`npm view paseo-dsh version`, 2026-10-30). Publishing waits
+for local verification; pick the version on the same line as `dsh` on your
+daemon.
 
 ## Changelog
 
@@ -541,8 +563,9 @@ history is on
 
 | Version | Date | Changes |
 | --- | --- | --- |
-| [0.2.16](https://www.npmjs.com/package/paseo-dsh/v/0.2.16) | 2026-10-28 | **The stats row returns to its default position**: the automatic tucking, DOM measurement and settings page from 0.2.15 are gone. The row only carries content (turns/steps, first token, tok/s, context, cache hit; tap to expand details) and leaves placement to Paseo and the theme, so it no longer moves when expanded, collapsed or under a theme. `0.2.15` is deprecated. |
-| [0.2.15](https://www.npmjs.com/package/paseo-dsh/v/0.2.15) | 2026-10-28 | **The stats row sits with the turn footer**: the gap to the copy / model / time footer stays the same under the default theme and theme plugins. A completed turn flags its last row `final`; on web the row measures where the footer actually painted and tucks under it, native keeps a constant fallback.<br>**Configurable**: Settings → Plugins → "回答统计行" adjusts the gap (0–24px, default 6) and font size (10–16px, default 13); with no saved settings nothing changes.<br>**Type**: defaults to the footer's 13px with tabular numbers. |
+| [0.2.17](https://www.npmjs.com/package/paseo-dsh/v/0.2.17) | 2026-10-30 | **The stats row tucks under the footer again**: it measures where the footer was actually painted, so both the newest turn and a turn pushed down by a newer one settle at about a 4.5px gap under the default theme, and the row adopts the footer's 13px type. When the footer cannot be measured, found, or the gap is implausible, the row keeps the host spacing; native never compensates, and theme placement stays with the theme. |
+| [0.2.16](https://www.npmjs.com/package/paseo-dsh/v/0.2.16) | 2026-10-29 | **The stats row returns to its default position**: the automatic tucking, DOM measurement and settings page from 0.2.15 are gone. The row only carries content (turns/steps, first token, tok/s, context, cache hit; tap to expand details) and leaves placement to Paseo and the theme, so it no longer moves when expanded, collapsed or under a theme. `0.2.15` is deprecated. |
+| [0.2.15](https://www.npmjs.com/package/paseo-dsh/v/0.2.15) | 2026-10-29 | **The stats row sits with the turn footer**: the gap to the copy / model / time footer stays the same under the default theme and theme plugins. A completed turn flags its last row `final`; on web the row measures where the footer actually painted and tucks under it, native keeps a constant fallback.<br>**Configurable**: Settings → Plugins → "回答统计行" adjusts the gap (0–24px, default 6) and font size (10–16px, default 13); with no saved settings nothing changes.<br>**Type**: defaults to the footer's 13px with tabular numbers. |
 | [0.2.14](https://www.npmjs.com/package/paseo-dsh/v/0.2.14) | 2026-10-28 | **Clearer stats line**: the session token total in the collapsed line became a context percentage (for example `上下文 77%`); the exact `used / limit` stays in the expanded details. Counts and cache-hit semantics are unchanged. |
 | [0.2.13](https://www.npmjs.com/package/paseo-dsh/v/0.2.13) | 2026-10-28 | **Richer stats line**: the collapsed line always shows `N turns N steps · first token · tok/s · total tokens · cache hit`, matching DSH Web's accounting (total = uncached input + cache read + cache write + output; hit = cache read ÷ prompt-side total). Turns, steps and tokens are rebuilt from the session log on resume. Expanding still shows context, token buckets, route and tool details. |
 | [0.2.12](https://www.npmjs.com/package/paseo-dsh/v/0.2.12) | 2026-10-28 | **Real streaming**: subscribes to DSH's live `agent/assistant-stream` frames (text and reasoning) and renders while the model writes instead of replaying after the step; the first character appears when the model emits it.<br>**Answer stats row**: `first token · tok/s` under each answer, expandable to context, input/cache/output tokens, route and thinking level, tool count and time; speed uses DSH's own chunk timestamps and drops burst artifacts. |
@@ -564,7 +587,7 @@ history is on
 ## Documentation
 
 - [docs/ADOPTION.md](docs/ADOPTION.md) — adoption guide: what changes, how to configure it, the pitfall list
-- [docs/FIELD-NOTES.md](docs/FIELD-NOTES.md) — sixty-odd real defects: symptom → root cause → fix
+- [docs/FIELD-NOTES.md](docs/FIELD-NOTES.md) — seventy-odd real defects: symptom → root cause → fix
 - [AGENTS.md](AGENTS.md) — notes for AI agents (Codex and others read it automatically). Read it first whether you were asked to install or to change this repository (written in Chinese)
 
 ## Contact

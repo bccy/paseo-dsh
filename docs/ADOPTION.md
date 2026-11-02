@@ -72,7 +72,7 @@
 
 ### 第 2 步：写 bridge，把 Paseo 的语义翻译成你的运行时的语义
 
-bridge 要实现的方法不多，DSH 这边是这 8 个：
+bridge 要实现的方法不多，DSH 这边**最小集合**是这 8 个：
 
 ```
 initialize          route + cwd，校验模型可用性
@@ -84,6 +84,12 @@ paseo/plan/set      切换计划模式
 paseo/config/set    切模型 / 切思考档位
 shutdown            收尾
 ```
+
+当前实现已经扩到 24 个请求方法（`dsh-bridge/lib/server.js` 的 `handleRequest` 分派）：除上面
+8 个外，还有 `paseo/revert`、`paseo/permission` / `paseo/permission/set`、`paseo/usage`、
+`paseo/jobs`、`paseo/presets`、`paseo/sessions`、`paseo/history`、`paseo/subagents`、
+`paseo/archive` / `paseo/unarchive`、`paseo/commands`、`paseo/command/run`、`paseo/mcp/set`、
+`paseo/projections`、`session/close` 等；新增能力时按需扩。
 
 **最容易漏的一条：`session/cancel` 不是杀进程。** 见第 4.4 节。
 
@@ -168,8 +174,10 @@ providers:
           max: max        # max/xhigh 必须显式列出
 ```
 
-**`compat.supportsDeveloperRole: false` 和 `reasoningEfforts` 必须成对出现。**
-只加后者会让每个回合 422 —— 这是最容易卡住人的一个组合坑。
+**`compat.supportsDeveloperRole: false` 是条件性配置，不是 `reasoningEfforts` 的配对项。**
+只有网关**拒绝 `developer` 角色**时才需要加；网关支持 `developer` 角色时不要加——加了会把系统
+提示降成 `system` 角色。声明推理能力本身不会强制关闭 `developer` 角色；422 只发生在「网关拒绝
+`developer` 角色、又没关掉它」这个组合。拿不准就用 `probe` 探测（它会直接报 REJECTED）。
 
 **图片：`prompt.image` 开关 + 模型模态，两层都要开。** Paseo 插件侧必须在
 `CAPABILITIES` 里声明 `prompt.image`（否则 Paseo 直接拒绝发送带图的 prompt，附件根本到不了
@@ -379,9 +387,12 @@ rm -rf .dbg          # 记得清理
 
 ### 5.5 插件的加载时机
 
-**插件改动不会热重载。** 改完要么重启 daemon，要么重载插件。
-但 bridge 的子进程是**每个会话新起的**，所以 bridge 的改动会立即生效——
-分清楚你改的是哪一层，能省很多次重启。
+**插件改动不会热重载。** 改完要么重启 daemon，要么重载插件。**bridge 也不会热加载**：一个
+provider 连接上的所有 Paseo 会话共用**一个** `dsh --profile <name>` 子进程（`provider.ts` 的
+`DshConnection.#pooled` / `#poolClaims`），而插件每次加载都会把内嵌桥整体替换进
+`$DSH_HOME/profiles/<name>/node_modules/dsh-paseo-bridge`（先写暂存目录、校验后原子换上）。
+已经跑起来的子进程读的是旧模块，改桥后必须重载插件/重启 daemon，让子进程按新桥重建。
+分清楚你改的是插件、桥还是 profile 配置，能省很多次重启。
 
 ---
 

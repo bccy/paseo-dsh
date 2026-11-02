@@ -23,6 +23,10 @@ DSH 侧是一个 profile bundle。
 | 权限模式（沙箱） | ❌ 无统一开关 | ✅ composer 里的 **Permissions** 下拉，切换 DSH 的沙箱 + 审批预设 |
 | 人设预设（Preset） | ❌ | ✅ profile 挂了 agent-preset registry 时，composer 出现 **Preset** 下拉（建会话时选、首回合后锁定） |
 | 会话恢复 / 导入 | ❌ 无历史、无法导入 | ✅ 重开按 Paseo 的 `history: replay` 回放历史；**导入** DSH 原生会话（`session.list`，从 `~/.dsh/sessions` 列举） |
+| 后台任务（jobs） | — | ✅ composer 的 pill 显示 DSH 后台任务：有 live 时显示运行中数量，空闲时显示已完成总数，点开看每个任务的明细 |
+| 目标 / 工作流时间线 | — | ✅ `goal/change` 与 `tool-workflow/*` 事件按工具行渲染；后台工作流跨回合仍显示运行中 |
+| 工具审批卡 | — | ✅ DSH 的 `approval/request` 转成 Paseo 审批卡（允许一次 / 拒绝） |
+| 会话级系统提示 | — | ✅ 每个会话可带独立的 system prompt（profile 需挂 `systemPrompt` 服务） |
 | 终止后续聊 | — | ✅ 只取消当前回合，会话保留 |
 
 ## 🤖 复制这段给你的 AI Agent（推荐）
@@ -66,8 +70,9 @@ DSH 侧是一个 profile bundle。
 把 Paseo 会打印的那段「Plugins are trusted, unsandboxed code...」安全提示
 【原文转述给我】，并明确问我是否继续。得到我同意之后再装：
   paseo plugin add npm:paseo-dsh
-如果 daemon 是 Paseo 0.12：npm 上最新发布（0.2.9）还不含 0.12 适配，改用源码装：
-  paseo plugin add github:liuxing7954/paseo-dsh:paseo-plugin
+如果 daemon 是 Paseo 0.12：装 ≥0.2.10 的 npm 版本即可（当前 latest 0.2.17 已满足；
+  更旧的 0.2.9 不含 0.12 适配，那种情况才改用源码装：
+  paseo plugin add github:liuxing7954/paseo-dsh:paseo-plugin）
 （插件首次加载会自己准备好 DSH profile，不需要跑任何脚本。）
 装完重启 Paseo daemon。
 
@@ -101,9 +106,9 @@ paseo plugin add npm:paseo-dsh
 paseo plugin ls          # 确认 dsh-paseo 已装
 ```
 
-> **npm 版本提醒（2026-10-20）**：npm 上最新发布的是 `0.2.9`（2026-10-17），**不含**
-> Paseo 0.12 的适配（版本化 `paseo-system` 信封、`agent_message` 行语义、官方标签图标、
-> 附件内容块）。在 Paseo 0.12 上请从源码装，或等 `0.2.10` 发布：
+> **版本提示（历史注记，2026-10-20）**：当时 npm 最新是 `0.2.9`（2026-10-17），不含 Paseo 0.12
+> 的适配。现在 npm 最新已到 `0.2.17`，`0.2.10` 的等待条件早已满足，直接用上面的
+> `paseo plugin add npm:paseo-dsh` 即可。源码安装方式仍然可用：
 >
 > ```bash
 > paseo plugin add github:liuxing7954/paseo-dsh:paseo-plugin
@@ -200,8 +205,9 @@ npx paseo-dsh doctor
 
 改本仓库代码时，用 `install.sh` 把 checkout 作为**目录源**接入：它会建好（或沿用）DSH
 profile、注册插件。`dsh-bridge` 的符号链接只是给「插件还没加载」这段窗口用的：插件每次
-加载都会把 profile 里的桥**整个删除并重写**成 `paseo-plugin/server/bridge-assets.ts`
-里的内嵌副本，所以运行时生效的永远是内嵌资产，不是这个 checkout 目录。
+加载都会把 profile 里的桥**整体替换**（先写暂存目录、逐文件回读校验后原子换上；失败时保留
+旧代际）成 `paseo-plugin/server/bridge-assets.ts` 里的内嵌副本，所以运行时生效的永远是内嵌
+资产，不是这个 checkout 目录。
 
 ```bash
 git clone https://github.com/liuxing7954/paseo-dsh && cd paseo-dsh
@@ -273,7 +279,10 @@ paseo-dsh/
 （DSH 按 session 维护它们，运行时不需要 `chdir`），所以多个会话可以同时开在不同工作区；
 省掉的是每次新建会话 1.5–2.7 s 的 CLI 冷启动。**环境变量是例外**——它是进程级的，只有首个
 会话打开时的环境生效；后续会话要求不同的值时，差异以 warning 出现在时间线上（只列键名、
-不列值），不静默忽略。
+不列值），不静默忽略。**`PASEO_AGENT_ID` / `PASEO_AGENT_CWD` 也在这个进程级环境里**：后续
+会话经 bash 调 Paseo CLI 的 heartbeat / schedule / agent send 会拿到**首个会话**的身份——
+DSH 目前没有 per-session shell env 扩展点，这是已知限制（记在 FIELD-NOTES #76 与
+FULL-AUDIT 的「待用户决定」），不是静默修复。
 
 ## 不装 local-patches 时的行为
 
@@ -333,17 +342,23 @@ rm -rf ../.dbg
 ## 环境要求
 
 - Paseo ≥ 0.9.2（需要 direct provider 插件 API）
-- **DSH ≥ 0.2.1**（随 0.2.x 线）：桥直接 import 五个 DSH 内部包
-  （`@deepseek-ai/dsh-cmdline` / `dsh-brand` / `dsh-llm` / `dsh-attachment` / `dsh-agent`），
-  并且 0.2.1 改过 prompt 变量注册与 catalog 物化时机。实测通过的是 `0.2.1-rc.2`
-  （2026-10-20）；**0.2.0 及更早未验证**，`doctor` 会把低于 0.2.1 判为 blocking。
-- Node ≥ 18（`paseo-dsh probe/doctor` 用了内建 `fetch`；本机实测 Node 22.23.1）。插件本身跑在
-  Paseo daemon 的 Node 里，包**不**声明 `engines`——没有实测过的最小版本不写进声明
+- **DSH ≥ 0.2.1**（随 0.2.x 线）：桥直接 import 八个 DSH 内部包
+  （`@deepseek-ai/dsh-cmdline` / `dsh-brand` / `dsh-llm` / `dsh-attachment` / `dsh-agent` /
+  `dsh-tools` / `dsh-subprocess` / `schemastery`），并且 0.2.1 改过 prompt 变量注册与 catalog
+  物化时机。实测通过的是 `0.2.1-rc.2`（2026-10-20）；**0.2.0 及更早未验证**，`doctor` 会把
+  低于 0.2.1 判为 blocking。
+- Node ≥ 20.4（20.x 线）：桥用了 `AbortSignal.any`（Node 20.3 起提供）与 `Symbol.dispose`
+  （Node 20.4 起提供，`dsh-bridge/lib/session-projections.js`）。实际只在 Node 22.23.1 上验证过，
+  20.4 本身未实测。插件本身跑在 Paseo daemon 的 Node 里，包**不**声明 `engines`——没有实测过的
+  最小版本不写进声明。
 
 ## 界面语言（中文 / English）
 
-composer 里的模式、思考档位、权限/预设下拉，以及 `/` 斜杠菜单、计划卡片、工具卡片都会跟随
-界面语言显示。**显示归显示，调用值不变**——切语言不会改动任何发给 DSH 的 id：
+composer 里的模式、思考档位、权限/预设下拉，以及 `/` 斜杠菜单、计划卡片，按 **daemon 环境**
+的语言显示（`DSH_PASEO_LANG` / `LC_ALL` 等，**不是** Paseo App 自己的语言设置）。工具卡片
+（含行标签）默认中文：服务端在每个 tool-call item 的 `metadata.locale` 上携带解析结果，客户端
+收到第一个 tool-call 后才切换，且已渲染的行不会重绘——这是插件协议没有 locale 通道导致的
+已知限制。**显示归显示，调用值不变**——切语言不会改动任何发给 DSH 的 id：
 
 - 模式 `build` / `plan`、权限预设键（`read-only` / `workspace-write` / `danger-full-access`）、
   模型与思考档位 id、命令名字，全部原样传输。
@@ -370,7 +385,7 @@ composer 里的模式、思考档位、权限/预设下拉，以及 `/` 斜杠�
   手改会被回滚。所以中文说明放在插件的 `SKILL_COPY` 表里（`server/locale.ts`），
   表里没有的技能保持原文。
 
-语言按这个顺序决定：
+语言按这个顺序决定（**这是服务端文案的口径；客户端 bundle 读不到 daemon 环境，默认 `zh-CN`**）：
 
 1. 环境变量 `DSH_PASEO_LANG`——`zh` 开头 → 中文，其他 → English，显式覆盖一切；
 2. daemon 自己的 `LC_ALL` / `LC_MESSAGES` / `LANG`——`zh` 开头 → 中文；
@@ -449,8 +464,9 @@ DSH 的 agent preset 能把"人设 + 一套能力"打包成一个选项。插件
 插件的 `major.minor` **跟随它所适配的 DSH 线**：`0.2.x` 的插件对应 DSH `0.2.x`，
 patch 位是插件自己的发布计数。装的时候挑与 daemon 上 `dsh` 同一条线的版本即可。
 
-仓库里当前是 `0.2.11`：在 npm 已发布的 `0.2.11` 基础上合入本 fork 的多会话改造
-（一个 `dsh` 进程服务多个 Paseo 会话）与撤回能力，**尚未发布**。发布等本机实测确认后再做。
+仓库里的版本号以 `paseo-plugin/package.json` 为**唯一来源**（本轮核对为 `0.2.16`）；npm 上
+最新发布是 `0.2.17`（`npm view paseo-dsh version`，2026-10-30）。发布等本机实测确认后再做；
+安装时挑与 daemon 上 `dsh` 同一条线的版本即可。
 
 ## 更新日志
 
@@ -460,8 +476,9 @@ patch 是本插件自己的发布计数；完整提交记录见
 
 | 版本 | 日期 | 更新内容 |
 | --- | --- | --- |
-| [0.2.16](https://www.npmjs.com/package/paseo-dsh/v/0.2.16) | 2026-10-28 | **统计行回到默认位置**：移除 0.2.15 里的自动贴靠、DOM 测量与设置页，只保留内容显示（轮/步、首字、tok/s、上下文、缓存命中，点开展开明细）。位置交还给 Paseo 和主题，不再随展开/收起或换主题移动。`0.2.15` 已标记 deprecated。 |
-| [0.2.15](https://www.npmjs.com/package/paseo-dsh/v/0.2.15) | 2026-10-28 | **统计行贴合回合页脚**：统计行与「复制 / 模型 / 时间 / 耗时」页脚的间距在默认主题和主题插件下保持一致；回合完成时给最后一行打 `final`，web 端实测页脚的实际位置再贴齐，native 用常量回退。<br>**可配置**：Settings → Plugins →「回答统计行」可调间距（0–24px，默认 6）与字号（10–16px，默认 13）；未保存设置时行为与之前完全一致。<br>**字号与数字**：默认对齐页脚的 13px，数字等宽不跳动。 |
+| [0.2.17](https://www.npmjs.com/package/paseo-dsh/v/0.2.17) | 2026-10-30 | **统计行重新贴合页脚**：按页脚实际绘制的位置测量并贴齐，原生皮肤下「最新回合」和「被新回合顶下去」两种状态都稳定在约 4.5px 间距；字号统一为页脚同款 13px。量不到、找不到页脚或间距超出合理范围时退回宿主间距，native 不补偿；第三方主题的位置仍由主题自己控制。 |
+| [0.2.16](https://www.npmjs.com/package/paseo-dsh/v/0.2.16) | 2026-10-29 | **统计行回到默认位置**：移除 0.2.15 里的自动贴靠、DOM 测量与设置页，只保留内容显示（轮/步、首字、tok/s、上下文、缓存命中，点开展开明细）。位置交还给 Paseo 和主题，不再随展开/收起或换主题移动。`0.2.15` 已标记 deprecated。 |
+| [0.2.15](https://www.npmjs.com/package/paseo-dsh/v/0.2.15) | 2026-10-29 | **统计行贴合回合页脚**：统计行与「复制 / 模型 / 时间 / 耗时」页脚的间距在默认主题和主题插件下保持一致；回合完成时给最后一行打 `final`，web 端实测页脚的实际位置再贴齐，native 用常量回退。<br>**可配置**：Settings → Plugins →「回答统计行」可调间距（0–24px，默认 6）与字号（10–16px，默认 13）；未保存设置时行为与之前完全一致。<br>**字号与数字**：默认对齐页脚的 13px，数字等宽不跳动。 |
 | [0.2.14](https://www.npmjs.com/package/paseo-dsh/v/0.2.14) | 2026-10-28 | **统计行更直观**：收起行里的会话总 tokens 换成上下文占用百分比（如 `上下文 77%`），精确的 `已用 / 上限` 仍在展开详情里；其余计数与缓存命中口径不变。 |
 | [0.2.13](https://www.npmjs.com/package/paseo-dsh/v/0.2.13) | 2026-10-28 | **统计行信息升级**：收起时常驻 `N 轮 N 步 · 首字 · tok/s · 总 tokens · 缓存命中`，口径与 DSH Web 一致（总量 = 未缓存输入 + 缓存读取 + 缓存写入 + 输出；命中 = 缓存读取 ÷ 输入侧总量）；恢复会话时会从历史日志重新累计轮/步/tokens。点开仍是上下文、Tokens、路由、工具详情。 |
 | [0.2.12](https://www.npmjs.com/package/paseo-dsh/v/0.2.12) | 2026-10-28 | **回答真流式**：改订阅 DSH 的 `agent/assistant-stream` 瞬时帧（文本 + 推理），边生成边显示，不再等整段生成完再回放；首字出现的时刻就是模型吐出第一个字的时刻。<br>**回答统计行**：回答下方显示 `首字 xxx · xx tok/s`，点开可看上下文占用、输入/缓存/输出 tokens、路由与思考档位、工具次数与耗时；速度用 DSH 自己的 chunk 时间戳计算，整段突发的异常值直接丢弃。 |
@@ -483,7 +500,7 @@ patch 是本插件自己的发布计数；完整提交记录见
 ## 相关文档
 
 - [docs/ADOPTION.md](docs/ADOPTION.md) — 改造指南：改动点、配置方法、踩坑清单
-- [docs/FIELD-NOTES.md](docs/FIELD-NOTES.md) — 六十余条真实缺陷的症状 → 根因 → 修法
+- [docs/FIELD-NOTES.md](docs/FIELD-NOTES.md) — 七十余条真实缺陷的症状 → 根因 → 修法
 - [AGENTS.md](AGENTS.md) — 给 AI Agent 的说明（Codex 等会自动读取）。不管你是被叫来
   装它、还是被叫来改它，先看这个
 

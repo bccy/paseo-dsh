@@ -15,10 +15,11 @@ paseo plugin add npm:paseo-dsh
 paseo plugin add github:liuxing7954/paseo-dsh:paseo-plugin
 ```
 
-> **Version note (2026-10-20):** the newest npm release is `0.2.9`
-> (2026-10-17), which predates the Paseo 0.12 adapter. On Paseo 0.12 install
-> from the repository command above (or wait for `0.2.10`). The npm line stays
-> the simplest path for Paseo <= 0.11.
+> **Version note (historical, 2026-10-20):** at that time the newest npm release
+> was `0.2.9` (2026-10-17), which predated the Paseo 0.12 adapter. npm has since
+> moved on (latest `0.2.17`), so the `0.2.10` wait condition no longer applies —
+> the npm install above is the normal path for Paseo 0.12 too. The repository
+> command remains available for source installs.
 
 On load it provisions `$DSH_HOME/profiles/paseo` (the DSH profile it drives; set
 `DSH_PASEO_PROFILE` to use another name — the daemon must use the same value),
@@ -48,14 +49,22 @@ What you get that the ACP boundary can't carry:
   persona+capability bundles, chosen at session start and locked once it begins
 - Session **reopen and import**: a reopened session replays its conversation
   history, and native DSH sessions can be imported from Paseo
+- Background **jobs** pill (live / finished counts, expandable)
+- **Goal** and **workflow** rows in the timeline, including workflows that keep
+  running across turns
+- **Tool approval cards** for DSH's `approval/request`
+- A session-level **system prompt** when the profile mounts the `systemPrompt`
+  service
 
-Full documentation, the adoption guide, and 60+ real defects with their fixes
+Full documentation, the adoption guide, and 70+ real defects with their fixes
 live in the main repository: **https://github.com/liuxing7954/paseo-dsh**
 
-Requires Paseo ≥ 0.9.2, **DSH ≥ 0.2.1** and the official `dsh` on the daemon's
-`PATH`. The bridge imports five DSH-internal packages (`dsh-cmdline`,
-`dsh-brand`, `dsh-llm`, `dsh-attachment`, `dsh-agent`); `0.2.1-rc.2` is the
-verified build and 0.2.0 and older are unverified (doctor fails them).
+Requires Paseo ≥ 0.9.2, **DSH ≥ 0.2.1**, **Node.js ≥ 20.4** (the bridge uses
+`AbortSignal.any` and `Symbol.dispose`) and the official `dsh` on the daemon's
+`PATH`. The bridge imports eight DSH-internal packages (`dsh-cmdline`,
+`dsh-brand`, `dsh-llm`, `dsh-attachment`, `dsh-agent`, `dsh-tools`,
+`dsh-subprocess`, `schemastery`); `0.2.1-rc.2` is the verified build and 0.2.0
+and older are unverified (doctor fails them).
 
 ## Versioning
 
@@ -81,8 +90,9 @@ paseo plugin add npm:paseo-dsh
 paseo plugin add github:liuxing7954/paseo-dsh:paseo-plugin
 ```
 
-> **版本提醒（2026-10-20）**：npm 上最新是 `0.2.9`（2026-10-17），不含 Paseo 0.12
-> 适配。在 Paseo 0.12 上用上面的仓库命令装（或等 `0.2.10`）；Paseo ≤0.11 用 npm 最省事。
+> **版本提醒（历史注记，2026-10-20）**：当时 npm 最新是 `0.2.9`（2026-10-17），不含
+> Paseo 0.12 适配。npm 现在已到 `0.2.17`，`0.2.10` 的等待条件早已满足——Paseo 0.12 也直接
+> 用上面的 npm 安装；仓库命令留给源码安装。
 
 插件**首次加载会自己准备好** `$DSH_HOME/profiles/paseo`（它驱动的 DSH profile；可用
 `DSH_PASEO_PROFILE` 改名——daemon 必须用同一个值），并把内嵌的
@@ -110,13 +120,19 @@ ACP 承载不了、而这里都有：
 - profile 声明了 agent preset 时的 **Preset** 下拉——人设 + 能力包，
   建会话时选、首个回合后锁定
 - **会话恢复与导入**：重开会话会回放历史；并可从 Paseo 导入 DSH 原生会话
+- 后台任务 **jobs** pill（live / 已完成计数，点开展开）
+- 时间线里的 **Goal** 与 **workflow** 行，跨回合运行的工作流保持运行中
+- DSH `approval/request` 的**工具审批卡**
+- profile 挂了 `systemPrompt` 服务时，支持**会话级 system prompt**
 
-完整文档、改造指南、以及 60+ 个真实缺陷的修复记录都在主仓库：
+完整文档、改造指南、以及 70+ 个真实缺陷的修复记录都在主仓库：
 **https://github.com/liuxing7954/paseo-dsh**
 
-需要 Paseo ≥ 0.9.2、**DSH ≥ 0.2.1**，且 daemon 的 `PATH` 上有官方 `dsh`。桥直接 import
-五个 DSH 内部包（`dsh-cmdline` / `dsh-brand` / `dsh-llm` / `dsh-attachment` / `dsh-agent`）；
-`0.2.1-rc.2` 是实测通过的版本，0.2.0 及更早未验证（`doctor` 会判 blocking）。
+需要 Paseo ≥ 0.9.2、**DSH ≥ 0.2.1**、**Node.js ≥ 20.4**（桥用了 `AbortSignal.any` 与
+`Symbol.dispose`），且 daemon 的 `PATH` 上有官方 `dsh`。桥直接 import
+八个 DSH 内部包（`dsh-cmdline` / `dsh-brand` / `dsh-llm` / `dsh-attachment` / `dsh-agent` /
+`dsh-tools` / `dsh-subprocess` / `schemastery`）；`0.2.1-rc.2` 是实测通过的版本，0.2.0 及
+更早未验证（`doctor` 会判 blocking）。
 
 ### 版本策略
 

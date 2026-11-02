@@ -10,6 +10,9 @@
 专项审计 → 会话恢复 → … → 客户端渲染 → 协议边界与子代理生命周期）。编号里的
 `b`/`c`（29b、39b…）是同一症状的后续补记，不另起一个数字。
 
+> **历史编号有重号**：早期按主题回填时，22–25、46–47 出现重号（其中 23 出现三次，其余各两次），
+> 54 缺失。新增条目仍按末尾递增；引用旧条目请用「编号 + 标题」，不要只凭数字定位。
+
 ---
 
 ## 第一轮：基础契约
@@ -2330,7 +2333,7 @@ peer/dev 依赖。这样 `requirements.paseo: ">=0.9.2"` 才名副其实。
 | 项 | 说明 |
 |----|------|
 | `assistant/attempt` 被丢弃 | 该事件承载失败/重试/取消的尝试，所以**重试的持久记录在界面上不可见**。但流式上线后，一次"已经流出一部分才失败重试"的 attempt，其已发出的前缀会留在时间线上（Paseo 时间线 append-only，无法撤回，见第 25 条）。`AssistantStreamRecord` 没有错误变体，无法可靠区分"失败重试"和"用户主动取消"，所以持久记录仍不加，乱加会在每次取消时刷噪音。 |
-| 时间线只映射 13 种会话事件里的 4 种 | 其余多数是有意丢弃：`developer/message`、`system/message` 是系统提示，`request/header`、`request/context` 是内部记账。流式另走桥自有的瞬时类型 `paseo/assistant-delta`，不进会话日志。 |
+| 时间线映射的 durable 事件 | `TimelineBuilder.consume()` 映射 9 种 durable 事件：`assistant/message`、`tool/call`、`tool/result`、`command/run`、`command/done`、`compaction/start` / `compaction/summary` / `compaction/end`、`turn/end`；`activity-timeline` 另消费 `goal/change` 与 `tool-workflow/*` 的 4 个事件（合计 5 种）；流式另走桥自有的瞬时类型 `paseo/assistant-delta`，不进会话日志。其余事件多为有意丢弃：`developer/message`、`system/message` 是系统提示，`request/header`、`request/context` 是内部记账。 |
 | 可续接子代理二次运行的状态不回到 running | Paseo 0.11.2 的 provider 子通道忽略子会话的 `session.turn started`、`session.usage`、`session.permission`。子卡首次打开即为 running，终态（completed/failed）仍会更新，但再次运行的 started 不会恢复运行中状态。需 Paseo 核心补丁，本仓库不改全局包。 |
 | 子代理审批不在 Paseo 出现 | 同上：子会话的 permission 事件被宿主忽略。桥只把根会话的问题转发给 Paseo，子会话问题保留 DSH 自身的子代理审批语义，避免挂起或误归属父会话。 |
 | 子代理运行中状态/用量/审批需 Paseo 核心补丁 | 精确方案：`@getpaseo/server` 的 `agent/plugin-provider.js` `acceptChildEvent`（本机 0.11.2 行 1217-1248）需额外消费子 `session.turn started`（恢复 running）、`session.usage`（子用量）、`session.permission`（子审批卡），并把子 permission 经会话 id 路由到子代理视图。本仓库不改全局包；插件侧已按正确子身份发出这些事件，补丁落地即生效。 |
@@ -2624,6 +2627,85 @@ MCP 这层最危险的失效形态不是报错，是**把一个失败包装成�
 是"默认动作"，而"默认"经常是写。另一条：**按 id 匹配异步响应的实现必须先判"这帧是不是响应"**。
 协议允许双向请求时，不判方向的匹配会把响应语义偷走，而它偷走之后的症状是"成功但没有内容"——
 比抛错难查一个数量级。
+
+---
+
+## 第十八轮：2026-11-02 全量审查修复轮
+
+**背景**：2026-11-02 又做了一轮 21 路只读全量审查，修复分成 11 个包。逐条见
+[FULL-AUDIT-20261102.md](./FULL-AUDIT-20261102.md)。这里只记五条能直接当判据的。
+
+### 72. 桥的 cwd 预过滤 × 宿主 limit：过滤对了也会把会话挤掉
+
+**症状**：`paseo/sessions` 在部分工作区返回空列表或漏掉本工作区会话，尤其会话多、`limit` 小时。
+
+**根因**：桥用「cwd 字符串全等」在截断**之前**先过滤；而宿主在没有 query 时只按 `limit + 已导入数`
+（约 20）向 provider 要结果，拿到后才按 realpath 做 cwd 过滤。其它 cwd 的更新会话会把本 cwd 的
+旧会话挤出窗口。
+
+**修法**：query 不再按 session id 预过滤（标题/预览匹配交给宿主）；cwd 保留截断前预过滤，但判据是
+宿主 realpath matcher 的**超集**（字符串相等或两侧 `realpathSync` 相等，解析失败退回 `path.resolve`）。
+回归要覆盖「30 条其它 cwd 的更新会话 + `limit=5` 时本 cwd 的旧会话仍返回」和 symlink 等价 cwd。
+
+**教训**：在「provider 先过滤 → 宿主再过滤」的两段式链路里，**前一段的判据必须宽于后一段**；
+少过滤不会错，多过滤必丢数据。
+
+### 73. 「一直在跑」的过滤不等于「生效」：provider 从未把 cwd 传给桥
+
+**症状**：桥侧 `paseo/sessions` 的 cwd 过滤逻辑早就存在，但从未实际生效。
+
+**根因**：provider 的 `listDshSessions` 从来没把宿主的 cwd 放进请求帧，桥收到的是 `undefined`，
+过滤条件直接短路。代码路径存在、测试也绿，可线上从未走到。
+
+**修法**：`listDshSessions` 把宿主 cwd 作为过滤参数转发；没有 cwd 时帧里不带该键。回归断言
+**出站帧**的 `params.cwd`（假桥 `DSH_FAKE_LOG`），而不是只断言桥的函数返回。
+
+**教训**：断言要打在**线上帧**或协议边界，别只测被测函数的局部行为；一条「看起来在跑」的
+过滤链，两端参数没接上时静默无效。
+
+### 74. 测试判据自证式假绿：用被测对象自报的提示当证据
+
+**症状**：`plugin-check`、`route-test`、`tools.mjs` 在真实回合失败/图片没发出/协议必拒时仍然全绿。
+
+**根因**：判据用了被测 prompt 自带的 `IMAGE-SEEN` 文本当图像证据（模型复述即通过）、「有 partial
+文本即 WORKS」（失败被当成成功）、initialize 不带 sessionId 与 prompt 带（真桥必拒、假桥放行）、
+先过滤非 assistant 行再验邻接（自己不产生反例）。四类都是**判据自身的输入来自被测对象**。
+
+**修法**：判据抽到 `harness-gates.cjs`，改为结构化证据（插件交给 DSH 的 prompt frame 里图片块
+字节/mime、本会话 `turn/end` 终态分类、完整时间线 + `session.turn` 归属），并补负向对照与单点
+变异自证（`harness-gates-check.mjs`）。
+
+**教训**：**任何「模型说看到了」「有文本就算成功」的判据都是自证式假绿**。判据必须取协议数据，
+且要能用单点变异证明会红——否则它只是把被测对象的话抄了一遍。
+
+### 75. 单帧 complete 不是终态（再次印证）
+
+**症状**：思考行的末帧同时带 `complete` 和新增内容时，「看到 complete 就落定」会丢掉尾部，
+或让下一帧把已完成行重新改写。
+
+**根因**：FIELD-NOTES #26 已经记过一次「一个帧里的 `complete` 不等于后面没有更新」；本轮 C2 又
+在 DSH 的思考流上撞到同一形状——流式快照可以在一帧里既标记完成又带新增文本。
+
+**修法**：不在增长分支里直接判 `complete`；改为 `complete` 时开一个 300ms 稳定窗口，下一帧到来
+就清掉。回归用真实编译组件 + 假时钟驱动。
+
+**教训**：**终态标记只能用来「安排落定」，不能用来「立即落定」**。流式协议里先到的 complete
+必须当成提示而不是边界；窗口值可以经验取，但要在代码里写清它的作用与失效方向。
+
+### 76. 共享子进程的 per-agent 环境变量没有稳定注入点（S08）
+
+**症状**：多会话共用一个 `dsh` 子进程时，第二个会话经 bash 调 Paseo CLI 的 heartbeat / schedule /
+agent send，拿到的是**首个会话**的 `PASEO_AGENT_ID` / `PASEO_AGENT_CWD`。
+
+**根因**：DSH 的 per-execution env 通道 `ctx.shellEnv` **只接受 `DSH_` 前缀**，无法注入 `PASEO_*`；
+桥的 `initialize` 不接收 env；插件只有 spawn 级的进程 env。没有稳定扩展点，做 env 分池会每会话
+冷启动并引入归档状态跨进程不一致。
+
+**现状**：不造虚假修复。插件显式跳过这两个键的差异告警（不冒充已处理），限制与选项记在
+FULL-AUDIT-20261102 的「待用户决定」；需要 DSH 上游扩展开关或产品取舍。
+
+**教训**：**「每个会话都不同」的东西如果只能走进程级通道，那它就不是可选项而是能力上限**——
+要么上游给每会话通道，要么在文档里明写并在用户界面可见，不能靠静默串用。
 
 ---
 

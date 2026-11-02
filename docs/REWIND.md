@@ -51,7 +51,7 @@ Paseo 撤回按钮
   多一轮无内容用户消息（与 `dsh-rewind-plugin` 的做法一致，实测无副作用）。
 - `surfaceOp` 必须恰好 `op`/`startSeq`/`endSeq` 三键，两端必须是**当前 surface.nodes 里的
   seq**（不能用日志 seq）；`sourceEventSeqs` 必须覆盖全部被遮蔽节点，否则 `append` 抛错。
-- 追加前必须使 agent **空闲**（`settleAgentForRevert`，`dsh-bridge/lib/server.js:1205-1216`）：
+- 追加前必须使 agent **空闲**（`settleAgentForRevert`，`dsh-bridge/lib/server.js`）：
   `cancel` 当前回合 → **同步**丢弃两条收件箱队列 `nextStep` + `nextTurn` → `await
   whenIdle(15s)` → 会话级 inflight 互斥。清队列必须在第一个 `await` 之前：取消是异步收敛的，
   晚一步驱动就可能领走排队回合。**排队回合不在撤回范围内，但必须一起丢**——只清 steering
@@ -78,18 +78,23 @@ Paseo 撤回按钮
 
 - 桥通过 DSH 原生钩子 `ctx.inject(['fs'])` 监听 `tools/execute` / `tools/post-execute` /
   `tools/result`：`write`/`edit` 执行前读旧内容，成功后按锚点记一行 journal；失败/中断丢弃。
+  **工具成功但无法快照**（超过 8 MiB、非普通文件、`stat`/`readFile` 失败）时，journal 仍记一行
+  `skip`（带原因）；撤回时该路径进 `unrecoverable`，回执与提示会点名原因，而不是当成没改过。
 - **子代理编辑归并到根会话**：工具跑在原生子会话里时，沿 `header.parentSession` 上溯到
   根会话（`dsh-bridge/lib/snapshot-owners.js`），快照写进**根会话**的 journal/objects。
   pending 键用「执行会话 id + callId」而不是 owner 键：父/子可能撞同一个 provider 铸的
   callId，pending 是进程内的瞬时状态，键错了会静默覆盖掉一方、让它不进 journal。
 - **捕获顺序与提交顺序分开记**：父子并行编辑同一路径时，journal 行按 commit 顺序追加，
-  可能和 capture 顺序相反；每行记进程内单调的 `captureSeq`，恢复时按 `captureSeq` 取
-  「目标之后最早一次捕获前的状态」，不再被 commit 顺序误导（旧行没有该字段，按旧文件序）。
-- **锚点 = 派发/续接该子代理回合的根人类消息**：子会话每次 `turn/start` 时记录
-  「根会话当时最新人类消息 seq」（`dsh-bridge/lib/child-anchors.js`），文件快照优先用它；
-  根会话自己的编辑仍取执行时的最新人类消息。进程没观察到某个子代理的派发回合（如桥冷启动
-  前它已在跑）时，该子代理的编辑**不记 journal**（stderr 一行跳过）——这才是 fail-open 的
-  含义：宁可不恢复，也不把它错记到别的回合。这样后台子代理跨轮写文件不会被归到下一轮。
+  可能和 capture 顺序相反；每行记 `captureSeq`（从 journal 高水位续数、带 `captureOrderVersion`，
+  跨重启不归零），且**按路径串行、读完字节之后才分配序号**——否则先拿到小序号的一方可能后读到
+  文件，`planRestore` 会选错 pre-image。恢复时按 `captureSeq` 取「目标之后最早一次捕获前的
+  状态」，不再被 commit 顺序误导（旧行没有该字段，按旧文件序；旧行之间出现歧义时 fail-closed
+  拒绝恢复）。
+- **锚点 = 派发/续接该子代理回合的直接父级当前回合锚**：子会话每次 `turn/start` 时继承
+  **直接派发者**的当前回合锚（`dsh-bridge/lib/child-anchors.js`）；只有直接父就是根会话时，
+  才读根会话当时最新人类消息 seq。派发者不可观察（父会话不 live、header 缺 `parentSession`）
+  时 **fail open**：该子代理的编辑**不记 journal**（stderr 一行跳过），不拿根最新消息兜底——
+  否则后台子代理跨轮写文件会被归到下一轮。根会话自己的编辑仍取执行时的最新人类消息。
 - 相对路径按**工作目录服务**的当前目录解析（`ctx.get('workingDirectory').get(session)`；
   `cd` 与子代理的 `cwd` 参数都生效，服务不可用时才回退 `header.cwd`），与 `write`/`edit`
   的解析方式一致——`header.cwd` 只是会话最初的项目目录，不是工具执行时的目录。
@@ -97,16 +102,25 @@ Paseo 撤回按钮
   `rescue/`（恢复前当前内容的备份）。
 - 撤回 `both` 时：读 journal，取每个路径「目标消息及之后最早一次**捕获**前的状态」——新建的
   文件删除，被改的写回，未被编辑工具动过的不碰；覆盖前把当前内容存入 rescue。
-- **恢复失败不清理**：只要有一个路径恢复失败，就不做 prune/trim/GC——失败路径的撤回前备份
-  和 journal 行是唯一重试材料，删掉会让下一次撤回静默漏恢复。失败路径与 rescue 目录写
-  stderr / 回执，插件在新时间线里提示（提示文字明确 rescue 是当前内容、备份仍在 journal）。
+- **恢复失败不清理**：只要 `failed` / `skipped` / `unrecoverable` 任一非空，就不做 prune/trim/GC——
+  失败路径的撤回前备份和 journal 行是唯一重试材料，删掉会让下一次撤回静默漏恢复。回执区分
+  三类：`files.failed` 逐文件恢复失败、`files.skipped` 路径已变化而跳过、`files.unrecoverable`
+  捕获期就无法快照（带原因）；另有 `files.error` 表示**恢复计划本身**失败（与逐文件失败分开，
+  避免把「计划没生成」说成「内容已另存」）。`alreadyAbsent` 表示要删的文件本就不存在，是良性
+  no-op，不计入 skipped/failed。失败路径与 rescue 目录写 stderr / 回执，插件在新时间线里提示
+  （提示文字明确 rescue 是当前内容、备份仍在 journal）。
 - **journal 是本地状态，但恢复会按它写/删路径**：`readJournal` 只接受绝对路径与 64 位十六
-  进制内容哈希（或显式 `null`）；`restore` 用 `lstat`，符号链接、目录、socket 一律跳过、
-  绝不跟随。`backup` 不再能 `..` 穿越 objects 目录。
+  进制内容哈希（或显式 `null`）；`restore` 先复核捕获时记录的**父目录 canonical 身份**
+  （`dirPath` / `dirReal`：最深的已存在祖先目录，逐段 lstat 必须是真实目录），再对目标做
+  `lstat`——符号链接、目录、socket 一律跳过、绝不跟随。**旧 journal 没有目录身份，仍只查
+  末端组件**，这是升级前的边界（不破坏已有撤回数据），新写入的行才有完整校验。
+  `backup` 不再能 `..` 穿越 objects 目录。
 - **撤回范围内的子代理被中断**：`targetSeq` 及其之后被撤回，锚 `>= targetSeq` 的子代理
   （派发回合被撤）通过 DSH `subagents.interrupt(childId, {kind:'ancestor', agent})` 中止；
   锚更早的继续运行。`interrupt` 是 fire-and-return：调用后最多等 3s（`waitForChildren`，
   超时记 stderr）再动文件，减少「恢复后子代理又写几笔」的窗口；锚未知时不取消（保守）。
+  **`conversation` 作用域不拿文件闸门、也不依赖 `agent.runMaintenance`**：它不动文件，只做
+  对话表面替换；只有文件恢复才需要闸门，且只等**本次被撤回的**子代理，不等全部子孙。
 - **重开时活着的子代理保持 running**：撤回后的刷新会关 provider 会话再带 persistence 重开；
   会话 join 的仍是**同一个共享 dsh 进程**（进程按引用计数回收，关一个会话不会退掉它），插件
   重放子代理时把「历史停在 turn 中途」视为仍在运行，不再误标 canceled（冷启动仍按被杀处理）。
@@ -120,8 +134,9 @@ Paseo 撤回按钮
 - **追踪哪些工具**：`write`/`edit` 用 `file_path`；`str_replace_editor` 用 `path`，且只认
   `create`/`str_replace`/`insert` 三个写命令——`view` 是读，未知命令同样不算写（把一次读记成
   "宣告该文件最新状态的编辑"，撤回会去重写一个根本没被改过的文件）。名字级过滤是
-  `isTrackedTool`，参数级判断在 `mutationPathOf`（`dsh-bridge/lib/file-snapshots.js:69-78,
-  116-142`）；该工具由一等公民包 `@deepseek-ai/dsh-tool-str-replace-editor` 提供，base/web
+  `TRACKED_TOOLS` / `isTrackedTool`，参数级判断在 `mutationPathOf`
+  （`dsh-bridge/lib/file-snapshots.js`）；该工具由一等公民包
+  `@deepseek-ai/dsh-tool-str-replace-editor` 提供，base/web
   bundle 默认不挂载，部署挂上就生效。
 - 不跟踪：bash/pwsh 等命令产生的改动、用户或外部进程直接改的文件、符号链接目标、> 8 MiB
   文件。子代理编辑属于归并而不是跳过；只有上溯失败（父会话不 live、header 缺
@@ -221,10 +236,13 @@ this.ctx.get('permissionPresets').set(session, name);
   菜单仍会显示：Paseo 的撤回按钮按 provider 能力位渲染，不按行隐藏（token 缺失只在点击时报错），
   按行隐藏需要上游新增"该行可撤回"的契约。
 - 子会话（DSH 原生 child）不支持撤回：只读投影，没有自己的进程。
-- 文件回退失败时对话仍然已经撤回：回执带 `files.failed`；**撤回前备份保留**（journal 不
-  清理，重试撤回会再次恢复）。提示行即时以 `session.notice` 出现在**当前**时间线里
+- 文件回退失败时对话仍然已经撤回：回执按 `files.failed` / `files.skipped` /
+  `files.unrecoverable` 分类，**撤回前备份保留**（journal 不清理，重试撤回会再次恢复）；
+  恢复计划本身失败则带 `files.error`。提示行即时以 `session.notice` 出现在**当前**时间线里
   （没有 epoch 重建，不会被吞掉）。注意 rescue 目录里是**被替换前的当前内容**（已含智能体
   改动），不是撤回前状态，别拿它当预编辑恢复材料。
+- **对话作用域（conversation）不走文件层**：不拿文件闸门、不要求 `agent.runMaintenance`；
+  它仍会发 canary（对话被刷新了，需要自证），只有 `both` 才做文件恢复。
 - 时间线折叠后仍会保留压缩前的完整对话（撤回只影响它自己那段）。
 - 记忆插件可能仍召回被撤内容（模型"记得"）——已知缺口，不在本次范围。
 - 由于首条被拒绝，本实现不会再产生"空对话"；历史上已被旧版本撤空的会话，重开时就是一个
