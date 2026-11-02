@@ -18,9 +18,7 @@
 
 | 项 | 理由 |
 |---|---|
-| `session.revert.files` | 桥没有 files-only 撤回——文件回滚是 `both` 的一部分（`revert.js:126` 的 `revertScope()` 只接受 `conversation`/`both`）。声明一个后端兑现不了的能力，比菜单里少一项更糟。原文见 `provider.ts:79-81`。 |
-
-**如果将来要做**：拆 `both` 里的文件那一半成独立 scope，需要先证明「只回文件、不动对话」在 DSH 侧语义自洽。当前不做。
+| ~~`session.revert.files`~~ | **已于 2026-11-02 实现**（见 [docs/REWIND.md](../../../REWIND.md) 的 files-only 小节）：只恢复文件、不动对话、不 prune journal；与 `both` 一样先停回合、取消并等待被撤回的子代理再恢复。下面是当时不做的理由，留作历史。<br>原理由：桥没有 files-only 撤回，声明兑现不了的能力比菜单少一项更糟。 |
 
 ---
 

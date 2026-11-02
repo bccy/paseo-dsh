@@ -142,14 +142,23 @@
   探测到必须非零）。**动了 probe 必跑。**
 - `harness/session-request-check.cjs` — 两段非回合请求：`paseo/sessions` 导入列表
   （persistence handle/cwd/title/preview→description/updatedAt）与 `paseo/revert` 撤回回执。
-  撤回那一半钉住：成功发 `request.completed`、被拒必须 `request.failed`、**canary 恰好一条且
+  撤回那一半钉住：provider 声明三种撤回能力（`.both`/`.conversation`/`.files`，少一个 Paseo
+  就不显示对应菜单）、成功发 `request.completed`、被拒必须 `request.failed`、**canary 恰好一条且
   出现在回执之前**（顺序即机制，见 AGENTS.md「撤回」一节）、被拒之后没有 canary、连续两次撤回的文案不同
   （序号递增）、`scope: "files"` 的撤回**不**发 canary（对话没被动过）、`scope: "both"` 的
   文案要点出文件那一半；仍然没有「正在回退，请稍候」这类刷新窗口通知。假桥 + 一次性
   `DSH_HOME`。**动了 provider 的
-  `session.revert`/`sessions` 分支、canary 的发出位置、`dsh-process.ts` 的这两个请求、或假桥
+  `session.revert`/`sessions` 分支、能力位声明、canary 的发出位置、`dsh-process.ts` 的这两个请求、或假桥
   对应分支必跑**；**`listDshSessions`/`#listSessions` 或 `DshProcess.sessions()` 的 cwd 透传
   也算（断言出站帧 `params.cwd`）。**
+- `harness/rewind-transaction-check.mjs` — 撤回事务（真实 `PaseoHarnessServer` + 真实
+  `FileSnapshots` + 记录型 ctx，私临时目录，无 profile/daemon/模型）：计划在日志写入前后各算
+  一次、door 挡住中途的写入、durability 失败保留文件与 journal、`runMaintenance` 缺失时在
+  取消回合之前失败、闸门与票据清空；本轮补上 **files-only**：不 append 撤回标记、不 flush、
+  不 prune journal、不要求 session store，但同样取消/等待被撤回子代理；以及 files-only 后重复
+  幂等、对更早/更晚消息做 `both` 时 `planRestore` 仍取目标消息自己的 pre-image。
+  **动了 `server.js` 的 `revert` 事务、`beginFileMutation`/`finishFileMutation`/`ownsFileMutation`
+  或 `file-mutation-gate.js` 必跑。**
 - `harness/plugin-build.cjs` — **不是检查，是需要编译产物的 harness 共用的构建基础设施**
   （当前调用方见 `grep -l plugin-build harness/*`；`plugin-check.cjs` 仍走自己头部注释里的
   手工 `tsc` 步骤，不在其中）。

@@ -182,9 +182,10 @@ console.log('scope handling (only the advertised scopes)');
 {
   check('conversation is accepted', revertScope('conversation') === 'conversation');
   check('both is accepted', revertScope('both') === 'both');
-  check('files is refused (never advertised)', revertScope('files') === undefined);
+  check('files is accepted (declared as a provider capability)', revertScope('files') === 'files');
   check('an unknown scope is refused', revertScope('everything') === undefined);
   check('both restores files', restoresFiles('both') === true);
+  check('files restores files', restoresFiles('files') === true);
   check('conversation does not', restoresFiles('conversation') === false);
 }
 
@@ -362,6 +363,15 @@ console.log('the first-message refusal does not interrupt a running turn');
 console.log('receipt');
 {
   check('the receipt names the withdrawn seq', successText(42) === 'Withdrawn seq 42 and everything after it', successText(42));
+  // A files-only rewind still gets a receipt; it must not claim a message was
+  // withdrawn, because the conversation was deliberately left alone.
+  const filesText = successText(42, 'files');
+  check(
+    'a files-only receipt talks about the files, never a withdrawn message',
+    /files?/i.test(filesText) && !/withdrawn/i.test(filesText),
+    filesText,
+  );
+  check('a both receipt keeps the withdrawn wording', successText(42, 'both') === 'Withdrawn seq 42 and everything after it');
 }
 
 console.log('wiring (the pure module is useless if nothing calls it)');
@@ -375,10 +385,9 @@ console.log('wiring (the pure module is useless if nothing calls it)');
     .join('\n');
 
   const provider = read('paseo-plugin/server/provider.ts');
-  for (const capability of ['session.revert.both', 'session.revert.conversation']) {
+  for (const capability of ['session.revert.both', 'session.revert.conversation', 'session.revert.files']) {
     check(`provider declares ${capability}`, provider.includes(`"${capability}"`));
   }
-  check('provider does NOT declare session.revert.files', provider.includes('"session.revert.files"') === false);
   check(
     'provider dispatches session.revert to the session',
     /case "session\.revert":/.test(provider) && /\.revert\(input\.token,\s*input\.scope\)/.test(provider),
@@ -514,6 +523,14 @@ console.log('wiring (the pure module is useless if nothing calls it)');
     'the bridge refuses unknown scopes instead of widening them',
     /不支持的回退范围/.test(bridge),
   );
+  // A `files` rewind restores the working tree but must not touch the durable
+  // conversation: no replacement marker, no flush, no journal pruning. The
+  // behavioural half of that lives in `rewind-transaction-check`; this only pins
+  // that the source has the gate at all.
+  check(
+    'the bridge keeps the conversation half behind a scope gate',
+    /const rewindsConversation = scope !== 'files'/.test(bridge),
+  );
   // The old placeholder was `session.append('assistant/message', …, { surfaceOp … })`:
   // an assistant message carrying the replacement, which DSH's v4 log refuses to
   // append outside an open turn+step. The regex this replaced allowed only 120
@@ -534,8 +551,11 @@ console.log('wiring (the pure module is useless if nothing calls it)');
 
   // File layer: editing-tool write-ahead snapshots wired around the rewind.
   check('the bridge owns a FileSnapshots store', /new FileSnapshots\(/.test(bridge));
+  // Use the marker's construction, not its exact indentation: the conversation
+  // half is now inside an `if (rewindsConversation)` block, and pinning the
+  // whitespace would turn a correct re-indent into a red check.
   const planIndex = bridge.indexOf('planRestore(');
-  const appendIndex = bridge.indexOf("session.append(\n        'user/message',\n        marker,");
+  const appendIndex = bridge.indexOf('const marker = createUserMessage(');
   const restoreIndex = bridge.indexOf('fileSnapshots.restore(');
   check(
     'files are planned before the log write and restored after it',

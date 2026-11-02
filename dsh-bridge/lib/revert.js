@@ -115,27 +115,29 @@ export function planRewind(nodes, eventAt, token) {
 /**
  * Normalise the scope Paseo asked for.
  *
- * Only `conversation` and `both` are advertised as provider capabilities. The
- * bridge refuses everything else instead of silently widening a file-only
+ * The three scopes are the ones advertised as provider capabilities:
+ * `conversation` (rewind the conversation), `both` (conversation + files) and
+ * `files` (restore the working tree only, leaving the conversation untouched).
+ * The bridge refuses everything else instead of silently widening a file-only
  * request into a full conversation rewind (the destructive default an earlier
  * draft had).
  *
  * @param {unknown} scope
- * @returns {"conversation" | "both" | undefined}
+ * @returns {"conversation" | "both" | "files" | undefined}
  */
 export function revertScope(scope) {
-  if (scope === 'conversation' || scope === 'both') return scope;
+  if (scope === 'conversation' || scope === 'both' || scope === 'files') return scope;
   return undefined;
 }
 
 /**
  * Whether a scope also restores files.
  *
- * @param {"conversation" | "both"} scope
+ * @param {"conversation" | "both" | "files"} scope
  * @returns {boolean}
  */
 export function restoresFiles(scope) {
-  return scope === 'both';
+  return scope === 'both' || scope === 'files';
 }
 
 /**
@@ -143,10 +145,15 @@ export function restoresFiles(scope) {
  * reading logs) can tell "the bridge really replaced this range" from "the
  * request was accepted and nothing happened".
  *
+ * A `files` rewind never withdraws a message, so its receipt must not claim one
+ * was removed: it says what actually happened — the files were restored.
+ *
  * @param {number} targetSeq
+ * @param {"conversation" | "both" | "files"} [scope]
  * @returns {string}
  */
-export function successText(targetSeq) {
+export function successText(targetSeq, scope = 'conversation') {
+  if (scope === 'files') return `Restored files to seq ${targetSeq}`;
   return `Withdrawn seq ${targetSeq} and everything after it`;
 }
 

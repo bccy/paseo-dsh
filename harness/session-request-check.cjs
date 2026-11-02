@@ -193,6 +193,7 @@ const check = (name, pass, detail) => {
       "session.list",
       "session.revert.both",
       "session.revert.conversation",
+      "session.revert.files",
     ],
   });
   conn.onEvent((event) => events.push(event));
@@ -205,6 +206,14 @@ const check = (name, pass, detail) => {
   check(
     "provider declares session.revert.both",
     (conn.capabilities ?? []).includes("session.revert.both"),
+    `capabilities=[${(conn.capabilities ?? []).join(", ")}]`,
+  );
+  // The files-only menu entry is capability-gated exactly like the other two:
+  // without this bit Paseo never offers "restore files only", no matter how
+  // complete the bridge's handler is.
+  check(
+    "provider declares session.revert.files",
+    (conn.capabilities ?? []).includes("session.revert.files"),
     `capabilities=[${(conn.capabilities ?? []).join(", ")}]`,
   );
 

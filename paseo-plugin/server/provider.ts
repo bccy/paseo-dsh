@@ -93,14 +93,13 @@ const CAPABILITIES = [
   // The rewind button under each message is capability-gated: Paseo only shows it
   // when the provider declares which scopes it can revert, and it hands the
   // request back with the `revertToken` our timeline row carried. This bridge
-  // implements exactly two scopes: conversation only, and conversation + the
-  // files the agent's editing tools touched. Paseo's menu offers the intersection
-  // of these bits and its own UI.
+  // implements all three scopes: conversation only, conversation + the files the
+  // agent's editing tools touched, and files only (restores the working tree and
+  // deliberately leaves the conversation — and therefore the timeline — alone).
+  // Paseo's menu offers the intersection of these bits and its own UI.
   "session.revert.both",
   "session.revert.conversation",
-  // NOT `session.revert.files`: the bridge has no files-only rewind (the file
-  // rollback is part of `both`); advertising a capability the backend cannot
-  // honour is worse than a missing menu entry.
+  "session.revert.files",
   "permission",
 ] as const;
 

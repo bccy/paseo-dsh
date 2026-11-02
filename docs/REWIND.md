@@ -25,14 +25,15 @@ OpenCode / Codex provider 有这个按钮，DSH provider 原本没有——本�
 
 ```
 Paseo 撤回按钮
-  → provider.ts      声明 session.revert.both / .conversation；分发 session.revert
+  → provider.ts      声明 session.revert.both / .conversation / .files；分发 session.revert
   → DshSession.revert(token, scope) → DshProcess.revert
   → 桥 paseo/revert { sessionId, token, scope }
   → dsh-bridge/lib/revert.js：令牌 → 锚点 user/message 的 seq → 表面节点区间
-  → 可选：file-snapshots.js 恢复该消息之后被编辑工具改过的文件
-  → session.append('user/message', marker, { surfaceOp:{op:'replace',startSeq,endSeq}, sourceEventSeqs })
-  → await sessions.flush(session)（保证回执前落盘）
-  → 回执成功；daemon 在回执前已把 `this.history` 截断到被撤行（LOCAL PATCH），无需 reload
+  → 可选（both / files）：file-snapshots.js 恢复该消息之后被编辑工具改过的文件
+  → 仅 conversation / both：session.append('user/message', marker, { surfaceOp:{op:'replace',startSeq,endSeq}, sourceEventSeqs })
+  → 仅 conversation / both：await sessions.flush(session)（保证回执前落盘）
+  → 回执成功；conversation/both 时 daemon 在回执前已把 `this.history` 截断到被撤行（LOCAL PATCH）；
+    files 不动对话，宿主的 force-hydrate 与截断都跳过，无需 reload
 ```
 
 ### 对话回退：一条表面替换
@@ -100,8 +101,8 @@ Paseo 撤回按钮
   的解析方式一致——`header.cwd` 只是会话最初的项目目录，不是工具执行时的目录。
 - 根目录 `~/.dsh/paseo-rewind/<sessionId>/`：`journal.jsonl` + `objects/`（内容寻址）+
   `rescue/`（恢复前当前内容的备份）。
-- 撤回 `both` 时：读 journal，取每个路径「目标消息及之后最早一次**捕获**前的状态」——新建的
-  文件删除，被改的写回，未被编辑工具动过的不碰；覆盖前把当前内容存入 rescue。
+- 撤回 `both` 或 `files` 时：读 journal，取每个路径「目标消息及之后最早一次**捕获**前的状态」——
+  新建的文件删除，被改的写回，未被编辑工具动过的不碰；覆盖前把当前内容存入 rescue。
 - **恢复失败不清理**：只要 `failed` / `skipped` / `unrecoverable` 任一非空，就不做 prune/trim/GC——
   失败路径的撤回前备份和 journal 行是唯一重试材料，删掉会让下一次撤回静默漏恢复。回执区分
   三类：`files.failed` 逐文件恢复失败、`files.skipped` 路径已变化而跳过、`files.unrecoverable`
@@ -141,6 +142,25 @@ Paseo 撤回按钮
 - 不跟踪：bash/pwsh 等命令产生的改动、用户或外部进程直接改的文件、符号链接目标、> 8 MiB
   文件。子代理编辑属于归并而不是跳过；只有上溯失败（父会话不 live、header 缺
   `parentSession`、血缘成环）时才退化为不跟踪，stderr 记一行跳过日志。
+
+### 只回文件（files-only）
+
+`scope: "files"` 恢复工作区，**不动对话**：不追加撤回标记、不 flush、不折叠时间线、不发
+canary，会话日志里的消息与 `surface.nodes` 原样保留。宿主两侧也是按这个语义实现的：
+`agent-manager.rewind()` 对 `mode === "files"` 跳过 force-hydrate，`plugin-provider.js` 的
+history 截断只在 `scope !== "files"` 时执行。
+
+与 `both` 相同的部分：取消运行中的根回合（`settleAgentForRevert`）；取文件闸门
+（`fileMutationGate.freeze`）并在 `agent.runMaintenance` 里执行；恢复前取消并等待锚点
+>= 目标消息的子代理（`cancelWithdrawnDelegations` + `settleDelegatedWork`），避免恢复后
+又被子代理写回。缺 `agent.runMaintenance` 时和 `both` 一样在取消回合之前响亮失败。
+
+与 `both` 不同：**不 prune / trim / GC 文件 journal**。files-only 之后对话仍在，用户之后
+可能再撤回到更早或更晚的消息，那些 pre-image 是后续 `both` 的材料。重复 files-only 是幂等
+的（每次取同一个「目标之后最早一次捕获」的 pre-image）；files-only 后对更晚消息做 `both`
+时，`planRestore` 仍按既有规则取该目标消息自己的 pre-image（即目标消息当时的状态），不会被
+files-only 留在工作区的内容带偏。`files` 的成功回执只说文件（`Restored files to seq N`），
+不说"已撤回消息"。
 
 ### 刷新：宿主 history 截断（本地补丁）+ canary 自证
 
@@ -219,8 +239,8 @@ this.ctx.get('permissionPresets').set(session, name);
 
 ## 行为约定与边界
 
-- 能力位只声明 `session.revert.both` 与 `session.revert.conversation`；**不声明 `files`**
-  （没有"只回文件"语义；该模式 daemon 也不重建时间线）。
+- 能力位声明 `session.revert.both`、`session.revert.conversation`、`session.revert.files` 三种。
+  `files` 只恢复工作区、不动对话；daemon 对该模式不重建时间线，插件也不发 canary。
 - 撤回**不可撤销**：不实现 `/unrewind`（Paseo 菜单本身就这么写）。
 - 撤回是**同步**的：`session.revert` 在桥里完成（截断 history + 落盘）后回执，宿主随即重建
   时间线。没有 reload 窗口，因此**没有**「正在回退，请稍候」通知、没有 prompt 门禁、没有
@@ -236,13 +256,14 @@ this.ctx.get('permissionPresets').set(session, name);
   菜单仍会显示：Paseo 的撤回按钮按 provider 能力位渲染，不按行隐藏（token 缺失只在点击时报错），
   按行隐藏需要上游新增"该行可撤回"的契约。
 - 子会话（DSH 原生 child）不支持撤回：只读投影，没有自己的进程。
-- 文件回退失败时对话仍然已经撤回：回执按 `files.failed` / `files.skipped` /
-  `files.unrecoverable` 分类，**撤回前备份保留**（journal 不清理，重试撤回会再次恢复）；
-  恢复计划本身失败则带 `files.error`。提示行即时以 `session.notice` 出现在**当前**时间线里
+- 文件回退失败时：`both` 的对话仍然已经撤回，`files` 本来就没有对话变更；回执按 `files.failed` /
+  `files.skipped` / `files.unrecoverable` 分类，**撤回前备份保留**（journal 不清理，重试撤回会再次
+  恢复）；恢复计划本身失败则带 `files.error`。提示行即时以 `session.notice` 出现在**当前**时间线里
   （没有 epoch 重建，不会被吞掉）。注意 rescue 目录里是**被替换前的当前内容**（已含智能体
   改动），不是撤回前状态，别拿它当预编辑恢复材料。
 - **对话作用域（conversation）不走文件层**：不拿文件闸门、不要求 `agent.runMaintenance`；
-  它仍会发 canary（对话被刷新了，需要自证），只有 `both` 才做文件恢复。
+  它仍会发 canary（对话被刷新了，需要自证），`both` 与 `files` 才做文件恢复，其中只有 `both`
+  同时改对话。
 - 时间线折叠后仍会保留压缩前的完整对话（撤回只影响它自己那段）。
 - 记忆插件可能仍召回被撤内容（模型"记得"）——已知缺口，不在本次范围。
 - 由于首条被拒绝，本实现不会再产生"空对话"；历史上已被旧版本撤空的会话，重开时就是一个
@@ -280,6 +301,7 @@ this.ctx.get('permissionPresets').set(session, name);
 ```bash
 # 纯函数 + 接线（不需要 daemon）
 node harness/revert-check.mjs        # 令牌/区间/前置/回执/文件层/canary 顺序/共享进程接线
+node harness/rewind-transaction-check.mjs # 撤销事务：files-only 不 append/flush/prune、重复幂等、files-only 后 both 的 pre-image 仍正确
 node harness/surface-check.mjs       # 只折撤回缝、compaction 保留、尾随事件
 node harness/file-snapshot-check.mjs # 写前备份/新建删除/多工具/救援/上限
 node harness/rewind-merge-check.mjs  # 父子归并：子/孙编辑落根会话 journal、断链 fail-open、取消策略

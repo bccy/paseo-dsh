@@ -2624,6 +2624,14 @@ export class PaseoHarnessServer {
    * `deriveEventMessage` DOES surface it to the model as one `(empty message)`
    * user turn — `harness/revert-shape-probe.mjs` asserts exactly that, and it is
    * the accepted cost of a durable marker, not a claim that it is invisible).
+   *
+   * Three scopes exist. `conversation` replaces the surface only; `both` does
+   * that and restores the files the editing tools touched; `files` restores the
+   * same files but appends nothing, flushes nothing and keeps the file-snapshot
+   * journal, because the conversation (and every row that can anchor a later
+   * rewind) is still there. All file-restoring scopes take the same exclusive
+   * lane: settle the root turn, freeze tracked writes, cancel/join the delegated
+   * turns this rewind covers, then restore.
    */
   async revert(params) {
     const rec = this.requireSession(params.sessionId);
@@ -2636,6 +2644,11 @@ export class PaseoHarnessServer {
       throw new Error(`不支持的回退范围：${String(params.scope)}`);
     }
     const restores = restoresFiles(scope);
+    // `files` restores the working tree only: the conversation is deliberately
+    // left byte-for-byte alone, so there is no replacement marker, no flush and
+    // no journal pruning. The journal must survive because a later
+    // conversation rewind still needs its pre-images.
+    const rewindsConversation = scope !== 'files';
     const sessionKey = String(session.id);
     if (this.revertInflight.has(sessionKey)) {
       throw new Error('该会话已有撤回正在进行，请稍候再试');
@@ -2681,59 +2694,61 @@ export class PaseoHarnessServer {
         }
         filePlan = planned.actions;
       }
-      // The one write: a positional surface replacement, validated by DSH before
-      // it is appended. The range comes from the surface snapshot planRewind
-      // read, so it cannot move between planning and appending.
+      // A `files` rewind has no conversation half: it must not append the
+      // replacement marker, because that event *is* the conversation rewind
+      // (and the host asks the daemon to rebuild the timeline around it).
       const shadowed = resolved.shadowed;
-      // The marker is a `user/message` with a non-`user` source kind:
-      //  - the durable v4 log only admits `system`/`developer`/`assistant`
-      //    messages inside an open turn+step (a rewind runs while the agent is
-      //    idle, so those can never be appended here), while `user/message` has
-      //    no such constraint — the same reason dsh-rewind uses one;
-      //  - a non-`user` source keeps it out of every human-message path: it is
-      //    not a rewind anchor, Paseo's replay skips it, and the memory plugin
-      //    ignores it.
-      // `deriveEventMessage` does surface it to the model as one "(empty message)"
-      // turn among the kept conversation, which is the cost of a durable marker.
-      const marker = createUserMessage({
-        content: [{ type: 'text', text: '(empty message)' }],
-        source: { kind: 'paseo-rewind' },
-      });
-      session.append(
-        'user/message',
-        marker,
-        {
-          surfaceOp: { op: 'replace', startSeq: shadowed[0], endSeq: shadowed[shadowed.length - 1] },
-          sourceEventSeqs: [...shadowed],
-        },
-      );
-      // Make the replacement durable before answering. The daemon does not reload
-      // the session any more: right after this reply it calls
-      // `hydrateTimelineFromProvider({ force: true })`, which rebuilds the Paseo
-      // timeline from the history it can read — `PluginProviderSession.streamHistory()`
-      // / `paseo/history` → this log. A buffered append would let that rebuild read
-      // a log that still contains the withdrawn turn, so the reply must not go out
-      // before the append is on disk. A failure here must be loud: reporting
-      // success would let the force-hydrate restore the withdrawn conversation
-      // while the file layer has already been rolled back.
-      //
-      // `SessionStore.flush` resolves to whether at least ONE durability listener
-      // participated, not merely "no error": `false` means nothing actually
-      // persisted the append (a profile composing the session store without a
-      // persistence backend). Treat that as the same failure — otherwise the
-      // receipt claims durability the log does not have.
-      const sessions = this.ctx.get('sessions');
-      if (sessions === undefined) {
-        throw new Error('撤回标记无法持久化：该 profile 没有会话存储；已停止文件回退');
-      }
-      let durable;
-      try {
-        durable = await sessions.flush(session);
-      } catch (error) {
-        throw new Error(`撤回标记无法持久化，已停止文件回退：${error instanceof Error ? error.message : String(error)}`);
-      }
-      if (durable !== true) {
-        throw new Error('撤回标记未获得任何持久化参与者（该 profile 未组合会话持久化后端）；已停止文件回退');
+      if (rewindsConversation) {
+        // The marker is a `user/message` with a non-`user` source kind:
+        //  - the durable v4 log only admits `system`/`developer`/`assistant`
+        //    messages inside an open turn+step (a rewind runs while the agent is
+        //    idle, so those can never be appended here), while `user/message` has
+        //    no such constraint — the same reason dsh-rewind uses one;
+        //  - a non-`user` source keeps it out of every human-message path: it is
+        //    not a rewind anchor, Paseo's replay skips it, and the memory plugin
+        //    ignores it.
+        // `deriveEventMessage` does surface it to the model as one "(empty message)"
+        // turn among the kept conversation, which is the cost of a durable marker.
+        const marker = createUserMessage({
+          content: [{ type: 'text', text: '(empty message)' }],
+          source: { kind: 'paseo-rewind' },
+        });
+        session.append(
+          'user/message',
+          marker,
+          {
+            surfaceOp: { op: 'replace', startSeq: shadowed[0], endSeq: shadowed[shadowed.length - 1] },
+            sourceEventSeqs: [...shadowed],
+          },
+        );
+        // Make the replacement durable before answering. The daemon does not reload
+        // the session any more: right after this reply it calls
+        // `hydrateTimelineFromProvider({ force: true })`, which rebuilds the Paseo
+        // timeline from the history it can read — `PluginProviderSession.streamHistory()`
+        // / `paseo/history` → this log. A buffered append would let that rebuild read
+        // a log that still contains the withdrawn turn, so the reply must not go out
+        // before the append is on disk. A failure here must be loud: reporting
+        // success would let the force-hydrate restore the withdrawn conversation
+        // while the file layer has already been rolled back.
+        //
+        // `SessionStore.flush` resolves to whether at least ONE durability listener
+        // participated, not merely "no error": `false` means nothing actually
+        // persisted the append (a profile composing the session store without a
+        // persistence backend). Treat that as the same failure — otherwise the
+        // receipt claims durability the log does not have.
+        const sessions = this.ctx.get('sessions');
+        if (sessions === undefined) {
+          throw new Error('撤回标记无法持久化：该 profile 没有会话存储；已停止文件回退');
+        }
+        let durable;
+        try {
+          durable = await sessions.flush(session);
+        } catch (error) {
+          throw new Error(`撤回标记无法持久化，已停止文件回退：${error instanceof Error ? error.message : String(error)}`);
+        }
+        if (durable !== true) {
+          throw new Error('撤回标记未获得任何持久化参与者（该 profile 未组合会话持久化后端）；已停止文件回退');
+        }
       }
       let files;
       // Stop the delegated agents this rewind withdrew before restoring files:
@@ -2745,26 +2760,29 @@ export class PaseoHarnessServer {
       await this.settleDelegatedWork(agent, interruptedChildren);
       if (filePlan !== undefined) {
         try {
-          // Re-plan after durability and cancellation. The first plan was taken
-          // before the log write and before the children were told to stop, so a
-          // tracked write that committed in between (the gate now holds new ones
-          // out, but a ticket taken earlier still had to drain) would be missing
-          // from it — that file would be left modified and its journal line pruned
-          // as if it had been handled.
+          // Re-plan after the conversation half (if any) and the cancellation.
+          // The first plan was taken before the log write and before the
+          // children were told to stop, so a tracked write that committed in
+          // between (the gate now holds new ones out, but a ticket taken earlier
+          // still had to drain) would be missing from it — that file would be
+          // left modified and its journal line pruned as if it had been handled.
           const finalPlanned = await this.fileSnapshots.planRestore(sessionKey, resolved.targetSeq);
           filePlan = finalPlanned.actions;
           unrecoverable = finalPlanned.unrecoverable;
         } catch (error) {
-          // The conversation rewind already happened, so this cannot be a failure
-          // of the whole request. It is not a per-file restore failure either:
-          // nothing was planned, so nothing was restored and no rescue copy can
-          // exist. Reporting it through `failed` would make the provider say the
-          // journal "failed to restore" and that its content "was rescued" —
-          // both false. `error` is the plan-failure channel; the journal stays
-          // named because it is the retry material.
+          // For `both` the conversation rewind already happened, so this cannot
+          // be a failure of the whole request. For `files` there is no
+          // conversation half, but the same receipt channel keeps the failure
+          // user-visible instead of turning it into a generic request failure.
+          // It is not a per-file restore failure either: nothing was planned, so
+          // nothing was restored and no rescue copy can exist. Reporting it
+          // through `failed` would make the provider say the journal "failed to
+          // restore" and that its content "was rescued" — both false. `error` is
+          // the plan-failure channel; the journal stays named because it is the
+          // retry material.
           return {
             kind: 'success',
-            text: successText(resolved.targetSeq),
+            text: successText(resolved.targetSeq, scope),
             files: {
               restored: [],
               deleted: [],
@@ -2802,7 +2820,12 @@ export class PaseoHarnessServer {
             + `not captured: ${unrecoverable.map((entry) => entry.path).join(', ') || 'none'}); `
             + `journal kept for retry, rescue copies in ${files.rescueDir}\n`,
           );
-        } else {
+        } else if (rewindsConversation) {
+          // Only a conversation rewind may drop the journal lines it just
+          // applied. A files-only rewind leaves every message (and its edit
+          // anchors) in place, so a later rewind to an older or newer message
+          // still needs those pre-images; pruning here would make it restore a
+          // wrong (later) state or nothing at all.
           await this.fileSnapshots.prune(sessionKey, resolved.targetSeq).catch((error) => {
             process.stderr.write(`[bridge] pruning the file-snapshot journal failed: ${error instanceof Error ? error.message : String(error)}\n`);
           });
@@ -2828,7 +2851,7 @@ export class PaseoHarnessServer {
       }
       return {
         kind: 'success',
-        text: successText(resolved.targetSeq),
+        text: successText(resolved.targetSeq, scope),
         ...(files === undefined ? {} : { files }),
       };
       } finally {

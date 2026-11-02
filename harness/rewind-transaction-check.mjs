@@ -44,6 +44,12 @@
  *      into a 3s mutual wait (and does not print the misleading timeout line)
  *  10. a second-plan failure is reported as a plan failure (`files.error`), not
  *      as a per-file restore failure with rescue copies that do not exist
+ *  11. a files-only rewind restores files inside the same exclusive transaction
+ *      but appends no replacement, flushes nothing, needs no session store and
+ *      keeps the journal; it still cancels/joins withdrawn children first
+ *  12. after a files-only rewind the journal still yields the target message's
+ *      own pre-image for a later `both` (repeated files-only is idempotent, and
+ *      prune is still confined to the conversation scopes)
  *
  * ## The fixture's `token` (a deliberate difference from the branch)
  *
@@ -172,14 +178,18 @@ async function fixture(onFlush, options = {}) {
   );
   let maintenance = 0;
   let appended = false;
+  let flushCalls = 0;
   const session = {
     id,
     header: { id, origin: 'new' },
     surface: { nodes: [0, 10, 20] },
     eventAt: (seq) => events.get(seq),
-    append() {
+    append(_type, _data, options) {
       appended = true;
-      this.surface.nodes = [0, 30];
+      // DSH replaces the shadowed tail with the replacement node. Keep the rows
+      // before the target: a later rewind may target one of them.
+      const start = options?.surfaceOp?.startSeq ?? 30;
+      this.surface.nodes = [...this.surface.nodes.filter((seq) => seq < start), 30];
     },
   };
   const agent = {
@@ -196,23 +206,39 @@ async function fixture(onFlush, options = {}) {
   }
   const interrupted = [];
   const state = { fixture: undefined };
+  // `assertLiveAgent` reads `ctx.agents.get(rootId)`; the rewind itself reads the
+  // `agents` service for the children it joined. One object serves both: a test
+  // that supplies its own child lookup still has to be able to resolve the root.
+  const agents = {
+    get: (childId) => options.services?.agents?.get?.(childId) ?? (childId === id ? agent : undefined),
+  };
+  const services = { ...options.services, agents };
   const ctx = {
     on: () => () => {},
-    agents: { get: (child) => (child === id ? agent : undefined) },
-    get: (name) => ({
-      sessions: {
-        flush: async () => {
-          if (onFlush !== undefined) await onFlush(state.fixture);
-          return true;
-        },
-        get: (sessionId) => (sessionId === id ? session : undefined),
-      },
-      subagents: {
-        interrupt: (child) => interrupted.push(child),
-        waitForChildren: options.waitForChildren ?? (async () => {}),
-      },
-      ...options.services,
-    })[name],
+    agents,
+    get: (name) => {
+      if (name === 'sessions') {
+        // `sessions: false` models a profile with no session store. A
+        // conversation rewind needs one (its marker must be durable); a
+        // files-only rewind does not touch the log and must not need it.
+        if (options.sessions === false) return undefined;
+        return {
+          flush: async () => {
+            flushCalls += 1;
+            if (onFlush !== undefined) await onFlush(state.fixture);
+            return true;
+          },
+          get: (sessionId) => (sessionId === id ? session : undefined),
+        };
+      }
+      if (name === 'subagents') {
+        return {
+          interrupt: (child) => interrupted.push(child),
+          waitForChildren: options.waitForChildren ?? (async () => {}),
+        };
+      }
+      return services[name];
+    },
   };
   const server = new PaseoHarnessServer(ctx, { notify() {}, request() { throw new Error('unexpected request'); } });
   server.fileSnapshots = snapshots;
@@ -232,9 +258,92 @@ async function fixture(onFlush, options = {}) {
     get appended() {
       return appended;
     },
+    get flushCalls() {
+      return flushCalls;
+    },
     revert: () => server.revert({ sessionId: id, scope: options.scope ?? 'both', token: { messageId: 'm-10' } }),
   };
   return state.fixture;
+}
+
+/**
+ * A root session with one edit at each of several messages, for the journal
+ * semantics across a files-only rewind followed by conversation rewinds.
+ *
+ * Anchor 10 changes the file to v1, 20 to v2, 30 to v3 and 40 to v4, so the
+ * state at message 10/20/30/40 is v0/v1/v2/v3 (each capture's backup is the
+ * state immediately before that message's first edit).
+ */
+async function sequenceFixture() {
+  const id = `seq-${String(++serial)}`;
+  const file = join(root, `${id}-file`);
+  const snapshots = new FileSnapshots({ rootDir: join(root, id), warn() {} });
+  const anchors = [10, 20, 30, 40];
+  const events = new Map(
+    [0, ...anchors].map((seq) => [seq, { type: 'user/message', data: { id: `m-${String(seq)}`, source: { kind: 'user' } } }]),
+  );
+  await writeFile(file, 'v0');
+  for (const [index, anchor] of anchors.entries()) {
+    const callId = `e${String(index + 1)}`;
+    await snapshots.capture({ sessionId: id, anchorSeq: anchor, callId, path: file });
+    await writeFile(file, `v${String(index + 1)}`);
+    await snapshots.commit({ sessionId: id, callId }, {});
+  }
+  let appends = 0;
+  let flushes = 0;
+  const session = {
+    id,
+    header: { id, origin: 'new' },
+    surface: { nodes: [0, ...anchors] },
+    eventAt: (seq) => events.get(seq),
+    append(_type, _data, options) {
+      appends += 1;
+      const markerSeq = 100 + appends;
+      events.set(markerSeq, { type: 'user/message', data: { id: `mark-${String(appends)}`, source: { kind: 'paseo-rewind' } } });
+      const start = options?.surfaceOp?.startSeq ?? markerSeq;
+      this.surface.nodes = [...this.surface.nodes.filter((seq) => seq < start), markerSeq];
+    },
+  };
+  const agent = {
+    id,
+    session,
+    status: 'idle',
+    inbox: { nextStep: [], nextTurn: [] },
+    runMaintenance: async (task) => task(new AbortController().signal),
+  };
+  const ctx = {
+    on: () => () => {},
+    agents: { get: (childId) => (childId === id ? agent : undefined) },
+    get: (name) => {
+      if (name === 'sessions') {
+        return {
+          flush: async () => {
+            flushes += 1;
+            return true;
+          },
+          get: () => session,
+        };
+      }
+      if (name === 'subagents') return { interrupt() {}, waitForChildren: async () => {} };
+      return undefined;
+    },
+  };
+  const server = new PaseoHarnessServer(ctx, { notify() {}, request() { throw new Error('unexpected request'); } });
+  server.fileSnapshots = snapshots;
+  server.sessions.set(id, { handle: { agent }, control: {} });
+  return {
+    id,
+    file,
+    snapshots,
+    server,
+    get appends() {
+      return appends;
+    },
+    get flushes() {
+      return flushes;
+    },
+    revert: (scope, messageId) => server.revert({ sessionId: id, scope, token: { messageId } }),
+  };
 }
 
 try {
@@ -436,10 +545,15 @@ try {
   pass('a conversation-only rewind succeeds without agent.runMaintenance and leaves files alone');
 
   // The other half: a file-restoring rewind still requires the exclusive scope
-  // and must fail loudly (before touching the log) when the runtime lacks it.
+  // and must fail loudly (before touching the log or any file) when the runtime
+  // lacks it. `files` restores files just like `both`, so it must share this.
   const legacyBoth = await fixture(undefined, { runMaintenance: false });
   await assert.rejects(legacyBoth.revert(), /runMaintenance contract/);
   assert.equal(legacyBoth.appended, false, 'a missing maintenance scope must fail before the conversation is changed');
+  const legacyFiles = await fixture(undefined, { runMaintenance: false, scope: 'files' });
+  await assert.rejects(legacyFiles.revert(), /runMaintenance contract/);
+  assert.equal(await readFile(legacyFiles.file, 'utf8'), 'CHANGED', 'a refused files-only rewind must not touch files');
+  assert.equal(legacyFiles.interrupted.length, 0, 'a refused files-only rewind must not interrupt children');
   pass('a file-restoring rewind without agent.runMaintenance fails loudly before any write');
 
   // -------------------------------------------------------------------------
@@ -570,6 +684,108 @@ try {
   assert.equal(waitForChildrenCalls, 0, 'the join is by child identity, not the all-children wait');
   assert.ok(joined.interrupted.includes('withdrawn-child'), 'the withdrawn child must be interrupted');
   pass('a withdrawn child is still joined by identity, and the all-children wait is not used');
+
+  // -------------------------------------------------------------------------
+  // 13. Files-only: restore the files, leave the conversation byte-for-byte
+  //     alone, and keep the journal (a later conversation rewind needs it).
+  // -------------------------------------------------------------------------
+  const filesOnly = await fixture(undefined, { scope: 'files' });
+  await writeFile(filesOnly.childFile, 'CHILD');
+  await filesOnly.snapshots.commit({ sessionId: filesOnly.id, callId: 'child-edit' }, {});
+  const filesOnlyResult = await filesOnly.revert();
+  assert.equal(filesOnlyResult.kind, 'success', JSON.stringify(filesOnlyResult));
+  assert.equal(filesOnly.maintenance, 1, 'a files-only rewind still runs inside agent.runMaintenance');
+  assert.equal(filesOnly.appended, false, 'a files-only rewind must not append a conversation replacement');
+  assert.equal(filesOnly.flushCalls, 0, 'a files-only rewind must not flush the conversation log');
+  assert.equal(await readFile(filesOnly.file, 'utf8'), 'ORIGINAL', 'the edited file must be restored');
+  await assert.rejects(readFile(filesOnly.childFile), { code: 'ENOENT' }, 'the child-created file must be deleted');
+  assert.ok(filesOnlyResult.files !== undefined, 'the files-only receipt must carry the same `files` shape as both');
+  assert.deepEqual([...filesOnlyResult.files.restored, ...filesOnlyResult.files.deleted].sort(), [filesOnly.file, filesOnly.childFile].sort());
+  assert.equal((await filesOnly.snapshots.readJournal(filesOnly.id)).entries.length, 2, 'a files-only rewind must keep the journal for later rewinds');
+  assert.ok(
+    !String(filesOnlyResult.text ?? '').toLowerCase().includes('withdrawn'),
+    `a files-only receipt must not claim a message was withdrawn: ${String(filesOnlyResult.text)}`,
+  );
+  assert.equal(filesOnly.server.fileMutationGate.size, 0, 'the gate must be released after a files-only rewind');
+  pass('a files-only rewind restores files without touching the conversation or pruning the journal');
+
+  // It must not even require a session store: nothing is written to the log.
+  const filesNoStore = await fixture(undefined, { scope: 'files', sessions: false });
+  const filesNoStoreResult = await filesNoStore.revert();
+  assert.equal(filesNoStoreResult.kind, 'success', JSON.stringify(filesNoStoreResult));
+  assert.equal(await readFile(filesNoStore.file, 'utf8'), 'ORIGINAL');
+  pass('a files-only rewind works without a session store (it never touches the log)');
+
+  // The withdrawn child is still interrupted and joined before the restore: a
+  // child writing behind the restore would resurrect the file after it was fixed.
+  let filesChildIdleResolve;
+  const filesChildIdle = new Promise((resolve) => {
+    filesChildIdleResolve = resolve;
+  });
+  const filesChild = {
+    id: 'files-withdrawn-child',
+    session: { id: 'files-withdrawn-child', header: { origin: 'subagent', parentSession: '' } },
+    status: 'running',
+    whenIdle: () => filesChildIdle,
+  };
+  const filesJoined = await fixture(undefined, {
+    scope: 'files',
+    services: { agents: { get: (childId) => (childId === 'files-withdrawn-child' ? filesChild : undefined) } },
+  });
+  filesJoined.server.childAnchors.record('files-withdrawn-child', 20, filesJoined.id);
+  setTimeout(() => filesChildIdleResolve(), 100);
+  const realFilesRestore = filesJoined.snapshots.restore.bind(filesJoined.snapshots);
+  let filesRestoreAt;
+  filesJoined.snapshots.restore = async (...args) => {
+    filesRestoreAt = Date.now();
+    return realFilesRestore(...args);
+  };
+  const filesJoinedStarted = Date.now();
+  const filesJoinedResult = await filesJoined.revert();
+  assert.equal(filesJoinedResult.kind, 'success', JSON.stringify(filesJoinedResult));
+  assert.ok(filesJoined.interrupted.includes('files-withdrawn-child'), 'a files-only rewind must interrupt a child whose dispatch turn it covers');
+  assert.ok(
+    filesRestoreAt !== undefined && filesRestoreAt - filesJoinedStarted >= 50,
+    `the file restore must wait for the interrupted child (${String(filesRestoreAt === undefined ? 'never' : filesRestoreAt - filesJoinedStarted)}ms)`,
+  );
+  pass('a files-only rewind cancels and joins withdrawn children before restoring files');
+
+  // -------------------------------------------------------------------------
+  // 14. The journal after a files-only rewind: repeated files-only is
+  //     idempotent; a later `both` still selects the target's own pre-image.
+  // -------------------------------------------------------------------------
+  const sequence = await sequenceFixture();
+  const seqJournal = async () => (await sequence.snapshots.readJournal(sequence.id)).entries.length;
+  assert.equal(await seqJournal(), 4, 'the fixture writes one journal line per edit');
+  const seqFiles = await sequence.revert('files', 'm-20');
+  assert.equal(seqFiles.kind, 'success', JSON.stringify(seqFiles));
+  assert.equal(await readFile(sequence.file, 'utf8'), 'v1', 'files-only to m-20 restores the state at m-20');
+  assert.equal(sequence.appends, 0);
+  assert.equal(sequence.flushes, 0);
+  assert.equal(await seqJournal(), 4, 'files-only must not prune the journal');
+  const seqFilesAgain = await sequence.revert('files', 'm-20');
+  assert.equal(seqFilesAgain.kind, 'success', JSON.stringify(seqFilesAgain));
+  assert.equal(await readFile(sequence.file, 'utf8'), 'v1', 'repeating files-only is idempotent');
+  assert.equal(await seqJournal(), 4, 'repeating files-only still keeps the journal');
+  const seqBothLater = await sequence.revert('both', 'm-30');
+  assert.equal(seqBothLater.kind, 'success', JSON.stringify(seqBothLater));
+  assert.equal(
+    await readFile(sequence.file, 'utf8'),
+    'v2',
+    "both to a later message restores that message's own pre-image (v2), not whatever the earlier files-only left behind (v1)",
+  );
+  assert.match(String(seqBothLater.text), /Withdrawn/);
+  assert.equal(sequence.appends, 1, 'the both rewind appends its replacement marker');
+  assert.equal(sequence.flushes, 1);
+  assert.equal(await seqJournal(), 3, 'the both rewind prunes entries after its target only');
+  const seqBothEarlier = await sequence.revert('both', 'm-10');
+  assert.equal(seqBothEarlier.kind, 'success', JSON.stringify(seqBothEarlier));
+  assert.equal(await readFile(sequence.file, 'utf8'), 'v0', 'both to an earlier message restores the state at m-10');
+  // The replacement removed every later row, so no visible message is
+  // rewindable any more: the post-rewind trim drops the whole journal by design
+  // (`minRewindableAnchor` is Infinity). The restore itself already used e1.
+  assert.equal(await seqJournal(), 0, 'trim drops entries once no visible message can anchor a future rewind');
+  pass('files-only leaves the journal intact; a later both still restores the target message\'s pre-image');
 } finally {
   await rm(root, { recursive: true, force: true });
 }
