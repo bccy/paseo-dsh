@@ -18,6 +18,12 @@
   `client/tool-call-data.ts` 的 workflow/goal 映射必跑。**
 - `harness/newest-check.cjs` — `client/newest.ts` 的"哪一行是最新、该不该脉冲"：位置判定、
   提交批次（回放历史不闪）、窗口、交接、时钟。**动了客户端脉冲条件必跑。**
+- `harness/rewind-notice-check.cjs` — 撤回完成提示的客户端半：`shared/rewind-notice.ts` 的两种
+  locale 文案与计数回退（读不出计数时不得编数字）、`client/rewind-notice-data.ts` 的 notice→插件行
+  变换与 `RewindToastGate`（实时到达弹一次、同 id 重挂载/回放/过期时间戳不弹），并驱动真实
+  `client/newest.ts` 验证回放批次真的把 `fresh` 压成 false；`index.client.tsx` 的 transformer
+  query 与 renderer 注册按源码检查。**动了撤回文案、`shared/rewind-notice.ts`、
+  `client/rewind-notice*.ts(x)`、`client/newest.ts` 或 `index.client.tsx` 的注册必跑。**
 - `harness/tool-call-check.cjs` — `client/tool-call-data.ts` 的工具行映射（图标、命令、diff、
   截断、失败原因、终端卡）。**动了工具行渲染必跑（含失败原因与终端卡：错误只认顶层
   `item.error.message`，终端正文全量 + 224px 纵向滚动 + 复制）。**
@@ -146,11 +152,13 @@
   就不显示对应菜单）、成功发 `request.completed`、被拒必须 `request.failed`、**canary 恰好一条且
   出现在回执之前**（顺序即机制，见 AGENTS.md「撤回」一节）、被拒之后没有 canary、连续两次撤回的文案不同
   （序号递增）、`scope: "files"` 的撤回**不**发 canary（对话没被动过）、`scope: "both"` 的
-  文案要点出文件那一半；仍然没有「正在回退，请稍候」这类刷新窗口通知。假桥 + 一次性
-  `DSH_HOME`。**动了 provider 的
-  `session.revert`/`sessions` 分支、能力位声明、canary 的发出位置、`dsh-process.ts` 的这两个请求、或假桥
-  对应分支必跑**；**`listDshSessions`/`#listSessions` 或 `DshProcess.sessions()` 的 cwd 透传
-  也算（断言出站帧 `params.cwd`）。**
+  文案要点出文件那一半；仍然没有「正在回退，请稍候」这类刷新窗口通知。每条成功撤回还要有**恰好
+  一条 completion notice**，文案按 scope 与回执 `restored`/`deleted` 数组计数，且必须在
+  `request.completed` **之后**（与 canary 相反，补丁宿主会截断回执前的内容）；部分失败只发
+  `文件回退未完成`，不得再发成功提示。假桥 + 一次性 `DSH_HOME`。**动了 provider 的
+  `session.revert`/`sessions` 分支、能力位声明、canary/完成提示的发出位置与文案、`dsh-process.ts`
+  的这两个请求、或假桥对应分支必跑**；**`listDshSessions`/`#listSessions` 或 `DshProcess.sessions()`
+  的 cwd 透传也算（断言出站帧 `params.cwd`）。**
 - `harness/rewind-transaction-check.mjs` — 撤回事务（真实 `PaseoHarnessServer` + 真实
   `FileSnapshots` + 记录型 ctx，私临时目录，无 profile/daemon/模型）：计划在日志写入前后各算
   一次、door 挡住中途的写入、durability 失败保留文件与 journal、`runMaintenance` 缺失时在

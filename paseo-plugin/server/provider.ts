@@ -31,7 +31,8 @@ import {
 } from "./dsh-process";
 import { DshChildSession, DshSession, modes, parseRoute } from "./session";
 import { rewindCanaryNotice } from "./rewind-canary";
-import { effortLabel } from "./locale";
+import { effortLabel, UI } from "./locale";
+import { rewindSuccessText } from "../shared/rewind-notice";
 import type { JobErrorCode } from "../shared/jobs";
 import { PROVIDER_ID } from "../shared/provider";
 
@@ -1121,7 +1122,26 @@ class DshConnection implements ProviderConnection {
             "文件回退未完成",
             tail === "" ? parts.join("；") : `${parts.join("；")}。${tail}`,
           );
+          // A partial rewind gets exactly one notice: the failure above. A
+          // success line next to it would read as "the conversation is fine and
+          // the files are fine", which is the one thing this outcome is not.
+          return;
         }
+        // The success notice goes out **after** `request.completed` on purpose.
+        // The canary above is a probe that must be cut with the withdrawn rows
+        // on a truncating host; this notice is the opposite — a real completion
+        // report that must survive on every host, so it has to sit outside the
+        // window the patched host truncates. The two are also different copy:
+        // the canary explains why the timeline may be stale ("if this notice
+        // stays, reload"), this one says what just happened. Mixing them would
+        // break the canary's meaning (see docs/REWIND.md).
+        //
+        // Counts come from the bridge receipt's own `files.restored` /
+        // `files.deleted` arrays (`RevertFilesReceipt`). When the receipt has no
+        // file half, the copy says nothing changed; when it has one but the
+        // arrays cannot be read, `rewindSuccessText` falls back to a sentence
+        // without a number rather than inventing one.
+        this.#notice(input.sessionId, "info", rewindSuccessText(UI.rewind, input.scope, files));
         return;
       }
       case "session.interrupt": {

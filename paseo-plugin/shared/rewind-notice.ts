@@ -1,0 +1,184 @@
+/**
+ * The copy a finished rewind reports, shared by both halves of the plugin.
+ *
+ * The server half builds a `session.notice` from this table; the client half
+ * recognises its own notice in the timeline from the same table. Sharing is not
+ * cosmetic: Paseo's provider bridge (`translateNotice` in the host's
+ * `plugin-provider.js`) joins `title` and `description` into one string and
+ * drops the notice id, so a client that wants to take over the row — to draw it
+ * with the plugin's own row and raise the one-shot toast — has nothing but the
+ * text to recognise it by. Two hand-kept copies of that text would drift and
+ * the row would silently fall back to the host's renderer.
+ *
+ * The locale type is declared here instead of imported from `server/locale`:
+ * both halves import this module, and `server/locale` resolves the daemon's
+ * environment at load time (a client bundle must never pull that in).
+ *
+ * @module dsh-paseo/shared/rewind-notice
+ */
+
+/** The two locales the plugin ships copy for. */
+export type RewindLocale = "en" | "zh-CN";
+
+/** The three rewind scopes Paseo's menu can invoke. */
+export type RewindScope = "conversation" | "files" | "both";
+
+/** Which capsule the client raises for one notice. */
+export type RewindTone = "success" | "warning";
+
+/** File counts read from the bridge receipt (`files.restored` / `files.deleted`). */
+export interface RewindFileCounts {
+  restored: number;
+  deleted: number;
+}
+
+/** Everything the timeline says after a rewind. */
+export interface RewindCopy {
+  /** `conversation`: the conversation was rolled back to the chosen message. */
+  conversation: string;
+  /** `both`: conversation rolled back and N files restored, M deleted. */
+  bothCounts: (counts: RewindFileCounts) => string;
+  /** `both` with nothing to restore or delete. */
+  bothNoFiles: string;
+  /** `both` whose file half reported no readable counts — never a number. */
+  bothNoCounts: string;
+  /** `files`: N files restored, M deleted. */
+  filesCounts: (counts: RewindFileCounts) => string;
+  /** `files` with nothing to restore or delete. */
+  filesNoFiles: string;
+  /** `files` whose receipt carried no readable counts — never a number. */
+  filesNoCounts: string;
+  /** Title of the existing partial-failure notice row. */
+  failureTitle: string;
+}
+
+/** English counts read as a plural noun phrase; `1 file`, `0 files`, `2 files`. */
+function files(count: number): string {
+  return count === 1 ? "1 file" : `${String(count)} files`;
+}
+
+/**
+ * The copy tables, one per locale.
+ *
+ * The Chinese column follows the product wording verbatim; the English column
+ * is its translation and uses the same count shape (restored N, deleted M) so
+ * the two read as one template rather than two independently invented lines.
+ */
+export const REWIND_COPY: Readonly<Record<RewindLocale, RewindCopy>> = Object.freeze({
+  en: Object.freeze({
+    conversation: "Rewound to this message",
+    bothCounts: ({ restored, deleted }: RewindFileCounts) =>
+      `Conversation rewound; restored ${files(restored)} (deleted ${files(deleted)})`,
+    bothNoFiles: "Conversation rewound; no files changed after this message",
+    bothNoCounts: "Conversation rewound",
+    filesCounts: ({ restored, deleted }: RewindFileCounts) => `Restored ${files(restored)} (deleted ${files(deleted)})`,
+    filesNoFiles: "No files changed after this message; nothing to restore",
+    filesNoCounts: "Files restored",
+    failureTitle: "File rollback incomplete",
+  }),
+  "zh-CN": Object.freeze({
+    conversation: "已撤回到这条消息",
+    bothCounts: ({ restored, deleted }: RewindFileCounts) =>
+      `已撤回对话，并恢复 ${String(restored)} 个文件（删除 ${String(deleted)} 个）`,
+    bothNoFiles: "已撤回对话，这条消息之后没有改动文件",
+    bothNoCounts: "已撤回对话",
+    filesCounts: ({ restored, deleted }: RewindFileCounts) =>
+      `已恢复 ${String(restored)} 个文件（删除 ${String(deleted)} 个）`,
+    filesNoFiles: "这条消息之后没有改动文件，无需恢复",
+    filesNoCounts: "文件已恢复",
+    failureTitle: "文件回退未完成",
+  }),
+} satisfies Record<RewindLocale, RewindCopy>);
+
+/**
+ * Read the counts out of a bridge `files` receipt.
+ *
+ * `undefined` means the receipt could not be read as the documented shape: the
+ * caller must fall back to a copy without numbers instead of inventing `0`
+ * ("no files changed" would then be a false claim, not a conservative one).
+ */
+export function rewindFileCounts(files: unknown): RewindFileCounts | undefined {
+  if (files === null || typeof files !== "object") return undefined;
+  const restored = Reflect.get(files, "restored");
+  const deleted = Reflect.get(files, "deleted");
+  if (!Array.isArray(restored) || !Array.isArray(deleted)) return undefined;
+  return { restored: restored.length, deleted: deleted.length };
+}
+
+/**
+ * The success notice text for one scope.
+ *
+ * `files === undefined` means the bridge sent no file half at all — the rewind
+ * did not plan a restore, so "nothing changed after this message" is the honest
+ * report. A present-but-unreadable file half uses the numberless copy instead:
+ * a fabricated number is worse than a vaguer sentence.
+ *
+ * @param copy - the locale's copy table.
+ * @param scope - the scope Paseo asked for.
+ * @param files - the bridge receipt's `files` object, when present.
+ */
+export function rewindSuccessText(
+  copy: RewindCopy,
+  scope: RewindScope,
+  files?: unknown,
+): string {
+  if (scope === "conversation") return copy.conversation;
+  const counts = files === undefined ? undefined : rewindFileCounts(files);
+  if (files !== undefined && counts === undefined) {
+    return scope === "both" ? copy.bothNoCounts : copy.filesNoCounts;
+  }
+  if (counts === undefined || (counts.restored === 0 && counts.deleted === 0)) {
+    return scope === "both" ? copy.bothNoFiles : copy.filesNoFiles;
+  }
+  return scope === "both" ? copy.bothCounts(counts) : copy.filesCounts(counts);
+}
+
+/**
+ * The copy table's fixed strings plus the prefixes its dynamic count sentences
+ * start with. Kept derived from the same table: a locale that adds a sentence
+ * must add its prefix here or the client cannot recognise it.
+ */
+const SUCCESS_PREFIXES: Readonly<Record<RewindLocale, readonly string[]>> = {
+  en: Object.freeze(["Conversation rewound; restored ", "Restored "]),
+  "zh-CN": Object.freeze(["已撤回对话，并恢复 ", "已恢复 "]),
+};
+
+/**
+ * Decide whether a Paseo notification is a rewind report, and what it means.
+ *
+ * The host joins `title` and `description` with a newline before it becomes a
+ * timeline notification; the first line is therefore the notice's title. Both
+ * locales are accepted because the daemon's locale decides which one the
+ * server emitted, while the client may be attached to a session whose server
+ * half resolved differently (the client defaults to Chinese, a `DSH_PASEO_LANG`
+ * host may emit English).
+ *
+ * Returns `undefined` for every notification that is not ours — most importantly
+ * the rewind canary (`撤回已生效`), which must keep its own meaning and must
+ * not be confused with a completion report.
+ */
+export function rewindNoticeTone(message: string): RewindTone | undefined {
+  const title = message.split("\n", 1)[0] ?? "";
+  for (const locale of Object.keys(REWIND_COPY) as RewindLocale[]) {
+    const copy = REWIND_COPY[locale];
+    if (title === copy.failureTitle) return "warning";
+    if (title === copy.conversation) return "success";
+    if (title === copy.bothNoFiles || title === copy.filesNoFiles) return "success";
+    if (title === copy.bothNoCounts || title === copy.filesNoCounts) return "success";
+    for (const prefix of SUCCESS_PREFIXES[locale]) {
+      if (title.startsWith(prefix) && title.endsWith("）")) return "success";
+      if (title.startsWith(prefix) && title.endsWith(")")) return "success";
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The first line of a notice, for a capsule that has to stay one line.
+ *
+ * The timeline row keeps the full text (including the failure detail); the
+ * toast only repeats the headline.
+ */
+export function rewindNoticeHeadline(message: string): string {
+  return message.split("\n", 1)[0] ?? "";
+}

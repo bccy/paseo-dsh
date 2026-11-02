@@ -54,6 +54,17 @@
  *      `文件回退未完成` notice. Before this the provider only looked at `failed`, so
  *      every one of the first two shapes produced the plain success notice while
  *      the file stayed modified.
+ *   9. every successful rewind leaves **exactly one** completion notice, with the
+ *      copy for its scope and counts taken from the receipt's `restored` /
+ *      `deleted` arrays, emitted **after** `request.completed` (the opposite side
+ *      of the canary's ordering: a truncating host would cut anything sent before
+ *      the receipt, and this report has to survive). A partial file restore emits
+ *      only the failure notice, never a success line beside it.
+ *
+ * The completion copy is localized by `server/locale.ts`; this check pins the
+ * Chinese column by setting `DSH_PASEO_LANG` before the plugin is required, so
+ * an English CI host cannot turn the exact-copy assertions into a false red. The
+ * English column is asserted by `harness/rewind-notice-check.cjs`.
  *
  * The scope cases are the ones that are easy to lose: the provider decides with
  * `input.scope !== "files"` and `files: input.scope === "both"`, and with only
@@ -81,6 +92,11 @@ const fakeBridge = path.join(__dirname, "fake-dsh-bridge.mjs");
 fs.chmodSync(fakeBridge, 0o755);
 process.env.DSH_BINARY = fakeBridge;
 process.env.DSH_FAKE_MODE = "live";
+// Pin the server half's display locale: the completion copy assertions below
+// compare the Chinese column verbatim, while `server/locale.ts` resolves the
+// daemon's LANG at module load. The English column is covered separately by
+// `rewind-notice-check.cjs`, which drives the shared table directly.
+process.env.DSH_PASEO_LANG = "zh-CN";
 
 // Never touch the user's live profile: loading the plugin calls
 // `ensurePaseoProfile()`, which rewrites `$DSH_HOME/profiles/<name>/
@@ -150,6 +166,35 @@ async function maybeSince(start, predicate, ms = 10000) {
 /** Synchronous counterpart: everything already recorded since `sinceIndex`. */
 function eventsSince(sinceIndex) {
   return events.slice(sinceIndex);
+}
+
+/**
+ * Whether a notice title is one of the completion sentences this check pins.
+ *
+ * Spelled out here rather than imported from `shared/rewind-notice.ts`: this
+ * file asserts the *copy*, so deriving the expectation from the module under
+ * test would only prove the module equals itself. The two dynamic shapes carry
+ * a count; the fixed ones are exact.
+ */
+const REWIND_SUCCESS_TITLES = new Set([
+  "已撤回到这条消息",
+  "已撤回对话，这条消息之后没有改动文件",
+  "这条消息之后没有改动文件，无需恢复",
+]);
+const REWIND_SUCCESS_PATTERNS = [
+  /^已撤回对话，并恢复 \d+ 个文件（删除 \d+ 个）$/u,
+  /^已恢复 \d+ 个文件（删除 \d+ 个）$/u,
+];
+function isRewindSuccessTitle(title) {
+  return REWIND_SUCCESS_TITLES.has(title)
+    || REWIND_SUCCESS_PATTERNS.some((pattern) => pattern.test(title));
+}
+
+/** Every rewind completion notice since `sinceIndex` (not the canary, not a failure). */
+function successNoticesSince(sinceIndex) {
+  return eventsSince(sinceIndex).filter(
+    (event) => event.type === "session.notice" && isRewindSuccessTitle(String(event.notice?.title ?? "")),
+  );
 }
 
 /** Every `paseo/sessions` frame the fake `dsh` has received so far. */
@@ -308,6 +353,28 @@ const check = (name, pass, detail) => {
     "an accepted rewind answers request.completed",
     revertReply.type === "request.completed",
     revertReply.type === "request.failed" ? JSON.stringify(revertReply.error) : "completed",
+  );
+
+  // The completion report. It is a second, different notice: the canary above
+  // proves whether the timeline refreshed, this one says what the rewind did.
+  // It must come **after** the receipt — the opposite side of the canary's
+  // ordering — because a host that truncates history at the rewound row cuts
+  // everything already in that buffer, and a real completion report has to
+  // survive on every host.
+  const conversationSuccess = successNoticesSince(beforeRevert).filter(
+    (event) => event.sessionId === sessionId,
+  );
+  check(
+    "a conversation rewind leaves exactly one completion notice",
+    conversationSuccess.length === 1
+      && conversationSuccess[0]?.notice?.title === "已撤回到这条消息",
+    `${conversationSuccess.length} notice(s): ${JSON.stringify(conversationSuccess.map((event) => event.notice?.title ?? null))}`,
+  );
+  check(
+    "…emitted after request.completed (so a truncating host cannot cut it)",
+    conversationSuccess.length === 1
+      && events.indexOf(conversationSuccess[0]) > events.indexOf(revertReply),
+    `completion at ${events.indexOf(conversationSuccess[0])}, request.completed at ${events.indexOf(revertReply)}`,
   );
 
   // The canary. It has to be a `撤回已生效` notice **in front of** the receipt, and
@@ -479,6 +546,18 @@ const check = (name, pass, detail) => {
     filesCanaries.length === 0,
     `${filesCanaries.length} canary notice(s): ${JSON.stringify(filesCanaries.map((e) => e.notice?.description ?? null))}`,
   );
+  const filesSuccess = successNoticesSince(beforeFilesRevert);
+  check(
+    "a files-only rewind reports its own completion",
+    filesSuccess.length === 1
+      && filesSuccess[0]?.notice?.title === "这条消息之后没有改动文件，无需恢复",
+    `${filesSuccess.length} notice(s): ${JSON.stringify(filesSuccess.map((e) => e.notice?.title ?? null))}`,
+  );
+  check(
+    "…also after request.completed",
+    filesSuccess.length === 1 && events.indexOf(filesSuccess[0]) > events.indexOf(filesRevert),
+    `completion at ${events.indexOf(filesSuccess[0])}, request.completed at ${events.indexOf(filesRevert)}`,
+  );
 
   // ---- 5. a `both` rewind does get one, and its text names the files ------
   //
@@ -523,6 +602,85 @@ const check = (name, pass, detail) => {
     "…whose text names the files it restored",
     bothCanaryDescription.includes("文件") && bothCanaryDescription !== secondCanaryDescription,
     JSON.stringify(bothCanaryDescription),
+  );
+  const bothSuccess = successNoticesSince(beforeBothRevert);
+  check(
+    "a both-scoped rewind reports its own completion (no file half → no-file wording)",
+    bothSuccess.length === 1
+      && bothSuccess[0]?.notice?.title === "已撤回对话，这条消息之后没有改动文件",
+    `${bothSuccess.length} notice(s): ${JSON.stringify(bothSuccess.map((e) => e.notice?.title ?? null))}`,
+  );
+  check(
+    "…after request.completed",
+    bothSuccess.length === 1 && events.indexOf(bothSuccess[0]) > events.indexOf(bothRevert),
+    `completion at ${events.indexOf(bothSuccess[0])}, request.completed at ${events.indexOf(bothRevert)}`,
+  );
+
+  // ---- 6. the counts come from the receipt's arrays ------------------------
+  //
+  // `restored` and `deleted` are string arrays, not counts. A provider that
+  // reads a `count` field invents one; one that prints `files.restored` itself
+  // prints paths. This block is the positive assertion for both scopes, so the
+  // "no file half" wording above is not allowed to pass by accident for every
+  // rewind.
+  const beforeBothCounts = events.length;
+  await conn.send({
+    type: "session.revert",
+    requestId: "revert-both-counts",
+    sessionId,
+    token: { messageId: "revert-files-counts" },
+    scope: "both",
+  });
+  const bothCountsReply = await untilSince(
+    beforeBothCounts,
+    (e) => e.requestId === "revert-both-counts" && (e.type === "request.completed" || e.type === "request.failed"),
+    "both-counts revert reply",
+  );
+  check(
+    "a both rewind with a file receipt answers request.completed",
+    bothCountsReply.type === "request.completed",
+    JSON.stringify(bothCountsReply.error ?? "completed"),
+  );
+  const bothCountsSuccess = successNoticesSince(beforeBothCounts);
+  check(
+    "…and its completion notice counts the receipt's arrays",
+    bothCountsSuccess.length === 1
+      && bothCountsSuccess[0]?.notice?.title === "已撤回对话，并恢复 2 个文件（删除 1 个）",
+    `${bothCountsSuccess.length} notice(s): ${JSON.stringify(bothCountsSuccess.map((e) => e.notice?.title ?? null))}`,
+  );
+
+  const beforeFilesCounts = events.length;
+  await conn.send({
+    type: "session.revert",
+    requestId: "revert-files-counts",
+    sessionId,
+    token: { messageId: "revert-files-counts" },
+    scope: "files",
+  });
+  const filesCountsReply = await untilSince(
+    beforeFilesCounts,
+    (e) => e.requestId === "revert-files-counts" && (e.type === "request.completed" || e.type === "request.failed"),
+    "files-counts revert reply",
+  );
+  check(
+    "a files rewind with a file receipt answers request.completed",
+    filesCountsReply.type === "request.completed",
+    JSON.stringify(filesCountsReply.error ?? "completed"),
+  );
+  const filesCountsSuccess = successNoticesSince(beforeFilesCounts);
+  check(
+    "…and its completion notice counts the receipt's arrays",
+    filesCountsSuccess.length === 1
+      && filesCountsSuccess[0]?.notice?.title === "已恢复 2 个文件（删除 1 个）",
+    `${filesCountsSuccess.length} notice(s): ${JSON.stringify(filesCountsSuccess.map((e) => e.notice?.title ?? null))}`,
+  );
+  const filesCountsCanaries = eventsSince(beforeFilesCounts).filter(
+    (e) => e.type === "session.notice" && e.notice?.title === "撤回已生效",
+  );
+  check(
+    "…with no canary even when the file receipt has counts",
+    filesCountsCanaries.length === 0,
+    `${filesCountsCanaries.length} canary notice(s)`,
   );
 
   // ---- 7. a file-restore plan failure (files.error) is loud and verbatim ----
@@ -571,6 +729,11 @@ const check = (name, pass, detail) => {
     !planFailedDescription.includes("另存到") && !planFailedDescription.includes("rescue"),
     JSON.stringify(planFailedDescription),
   );
+  check(
+    "…and emits no success notice beside the failure",
+    successNoticesSince(beforePlanFailedRevert).length === 0,
+    JSON.stringify(successNoticesSince(beforePlanFailedRevert).map((e) => e.notice?.title ?? null)),
+  );
 
   // ---- 8. a skipped-only file outcome is loud (BF-03) ----
   //
@@ -609,6 +772,11 @@ const check = (name, pass, detail) => {
     "…naming the skipped path",
     skippedDescription.includes("/work/link.txt"),
     JSON.stringify(skippedDescription),
+  );
+  check(
+    "…and emits no success notice beside the failure",
+    successNoticesSince(beforeSkippedRevert).length === 0,
+    JSON.stringify(successNoticesSince(beforeSkippedRevert).map((e) => e.notice?.title ?? null)),
   );
 
   // ---- 9. an unrecoverable capture names the reason (BF-03) ----
@@ -656,6 +824,11 @@ const check = (name, pass, detail) => {
     (unrecoverableDescription.match(/\/work\/big\.bin/gu) ?? []).length === 1,
     JSON.stringify(unrecoverableDescription),
   );
+  check(
+    "…and emits no success notice beside the failure",
+    successNoticesSince(beforeUnrecoverableRevert).length === 0,
+    JSON.stringify(successNoticesSince(beforeUnrecoverableRevert).map((e) => e.notice?.title ?? null)),
+  );
 
   // ---- 10. an already-absent delete is benign, not a failure (BF-03) ----
   //
@@ -690,6 +863,13 @@ const check = (name, pass, detail) => {
     "…and emits no file-failure notice (a benign no-op is not a partial restore)",
     alreadyAbsentNotices.length === 0,
     JSON.stringify(alreadyAbsentNotices.map((e) => e.notice?.description ?? null)),
+  );
+  const alreadyAbsentSuccess = successNoticesSince(beforeAlreadyAbsentRevert);
+  check(
+    "…but still reports the rewind as complete (counts are zero, not missing)",
+    alreadyAbsentSuccess.length === 1
+      && alreadyAbsentSuccess[0]?.notice?.title === "已撤回对话，这条消息之后没有改动文件",
+    `${alreadyAbsentSuccess.length} notice(s): ${JSON.stringify(alreadyAbsentSuccess.map((e) => e.notice?.title ?? null))}`,
   );
 
   await conn.close();

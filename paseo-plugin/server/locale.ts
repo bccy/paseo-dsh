@@ -19,6 +19,8 @@
  * @module dsh-paseo/server/locale
  */
 
+import { REWIND_COPY, type RewindCopy } from "../shared/rewind-notice";
+
 export type Locale = "en" | "zh-CN";
 
 /**
@@ -78,6 +80,16 @@ export interface UiCopy {
     updateTasks: string;
     askedUser: string;
   };
+  /**
+   * Rewind completion copy.
+   *
+   * The table itself lives in `shared/rewind-notice.ts` because the client half
+   * has to recognise the notice by that same text: the host drops the notice id
+   * when it translates `session.notice` into a timeline item, so the copy is the
+   * only identity the client has. One table, read by both halves, is what keeps
+   * the row's wording and the recognition of that row from drifting.
+   */
+  rewind: RewindCopy;
 }
 
 const UI_COPY: Record<Locale, UiCopy> = {
@@ -111,6 +123,7 @@ const UI_COPY: Record<Locale, UiCopy> = {
       updateTasks: "Update to-do list",
       askedUser: "Ask question",
     },
+    rewind: REWIND_COPY.en,
   },
   "zh-CN": {
     modes: [
@@ -138,6 +151,7 @@ const UI_COPY: Record<Locale, UiCopy> = {
       updateTasks: "更新任务清单",
       askedUser: "提问",
     },
+    rewind: REWIND_COPY["zh-CN"],
   },
 };
 

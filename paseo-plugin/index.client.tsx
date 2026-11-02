@@ -21,6 +21,13 @@ import { InlineThinking } from "./client/inline-thinking";
 import { contributeJobsPill } from "./client/jobs-pill";
 import { contributeStreamStats } from "./client/stream-stats";
 import { localeFromMetadata, setLocale } from "./client/locale";
+import { RewindNotice } from "./client/rewind-notice";
+import {
+  REWIND_NOTICE_KIND,
+  REWIND_NOTICE_VERSION,
+  rewindNoticeItem,
+  rewindNoticeSchema,
+} from "./client/rewind-notice-data";
 import { InlineToolCall } from "./client/tool-call";
 import { toolCallData } from "./client/tool-call-data";
 
@@ -189,6 +196,33 @@ export default function contribute(client: PluginClientContext) {
         .nullable(),
     }),
     Component: InlineToolCall,
+  });
+
+  // A finished rewind leaves a `session.notice` behind. Paseo projects it as a
+  // `notification` timeline item (`translateNotice` in the host's
+  // `plugin-provider.js`), and the app runs that item through the plugin
+  // transforms just like a reasoning or tool row. Taking the report over here is
+  // what gives the client a component to mount, which is the only way a plugin
+  // can call the `useToast()` hook; the row itself draws the same text with the
+  // provider's own success/warning tone. The transformer returns `undefined`
+  // for every other notification (the `撤回已生效` canary, open warnings, other
+  // providers' notices), keeping the host's renderer for them.
+  client.addTimelineTransformer({
+    id: "dsh-rewind-notice",
+    query: { itemType: "notification" },
+    transform: ({ item }) => {
+      const transformed = rewindNoticeItem(item.message);
+      return transformed === undefined
+        ? undefined
+        : { items: [{ type: "plugin", ...transformed }] };
+    },
+  });
+
+  client.addTimelineRenderer({
+    kind: REWIND_NOTICE_KIND,
+    version: REWIND_NOTICE_VERSION,
+    schema: rewindNoticeSchema,
+    Component: RewindNotice,
   });
 
   // The stats row under an answer. Upstream's own contribution, kept whole: it

@@ -198,6 +198,30 @@ Paseo 的插件 provider 适配层把翻译后的时间线事件放进一个**�
 `harness/host-contract-sim.mjs`）。所以 `provider.ts` 的 `session.revert` 分支里，通知必须
 在回执之前发出；`scope: "files"` 的撤回不动对话，没有可刷新之物，不发通知。
 
+### 完成提示：成功与部分失败
+
+canary 只回答"时间线刷没刷新"，不回答"这次撤回了什么"。所以每次**成功**的撤回在
+`request.completed` **之后**再发一条 completion notice——位置与 canary 相反，因为它必须在
+每一种宿主上都留下来（补丁宿主会在回执解析时截断之前进入缓冲区的行）。两条通知的文案不能
+混用：canary 是自证机制，completion 是结果报告。
+
+文案在 `shared/rewind-notice.ts` 的两种 locale 表里，服务端按 `server/locale.ts` 的 `UI.rewind`
+选取；计数取桥回执 `files.restored` / `files.deleted` 的数组长度（不是猜的 `count` 字段）：
+
+- `conversation`：已撤回到这条消息
+- `both`：已撤回对话，并恢复 N 个文件（删除 M 个）；回执没有 files 时为
+  「已撤回对话，这条消息之后没有改动文件」
+- `files`：已恢复 N 个文件（删除 M 个）；没有文件可恢复时为
+  「这条消息之后没有改动文件，无需恢复」
+- 部分失败（`files.failed` / `skipped` / `unrecoverable` / `error` 非空）：只保留现有的
+  「文件回退未完成」提示行，不再发成功提示。计数读不出来时退回不带数字的句子，绝不编数字。
+
+客户端把这条 notice 的 `notification` 行接管成 `dsh-rewind-notice` 插件行——这是让插件拿到
+组件挂载点的唯一途径（`useToast()` 是 hook，插件没有别的常驻挂载面）。胶囊只在**实时到达**时
+弹一次：回放历史、重开会话、滚动重挂载都不弹。判断复用 `client/newest.ts` 的提交批次规则，
+再加时间戳年龄与合成行 id 去重（`RewindToastGate`；宿主 `translateNotice` 会丢掉 `notice.id`，
+所以 id 是 agentId+记录时间+文案）。
+
 - **补丁路径**：`~/.paseo/local-patches/apply-rewind-history-truncation.mjs`，目标是 daemon 实际加载的
   `@getpaseo/server/dist/server/server/agent/plugin-provider.js`（不是仓库 checkout——那里没有构建产物，
   打上去看着成功却什么也没改）。
@@ -245,9 +269,10 @@ this.ctx.get('permissionPresets').set(session, name);
 - 撤回是**同步**的：`session.revert` 在桥里完成（截断 history + 落盘）后回执，宿主随即重建
   时间线。没有 reload 窗口，因此**没有**「正在回退，请稍候」通知、没有 prompt 门禁、没有
   15s 安全超时——这些机制随 reload 旁路一起删除了。
-  **唯一的提示是那条「撤回已生效」canary**，它不是"未刷新告警"而是自证机制：在补丁宿主上它
-  随被撤行一起被截掉（一闪而过），在原版宿主上它留下来并告诉用户执行 Reload agent 或重开会话
-  （见上一节）。它必须在 `request.completed` 之前发出，顺序不能换。
+  **提示有两条，含义不同**：回执前的「撤回已生效」canary 是自证机制——在补丁宿主上它随被撤行
+  一起被截掉（一闪而过），在原版宿主上它留下来并告诉用户执行 Reload agent 或重开会话（见上
+  一节），所以必须在 `request.completed` 之前发出，顺序不能换；回执后的 completion notice
+  报告这次撤回了什么（scope 与文件计数），在任何宿主上都要留下（见「完成提示」一节）。
   并发的第二次撤回由桥的 `revertInflight` 守卫拒绝（`request.failed`，不是静默）。
 - **当前可见对话的第一条消息不支持撤回**：撤掉它等于清空整个对话，而 Paseo 客户端对"重建后
   空对话"的 live 刷新不可靠（旧行会留在屏幕上，再点旧行报 `No provider revert token`）。

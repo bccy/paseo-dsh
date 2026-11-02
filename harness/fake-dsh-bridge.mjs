@@ -95,7 +95,10 @@
  * (`files.skipped` names the only unrestored path), `revert-unrecoverable-only`
  * (a capture could not be taken; the path appears in `skipped` and its reason in
  * `unrecoverable`) and `revert-already-absent` (the only planned delete was
- * already gone — a complete rewind with nothing to report).
+ * already gone — a complete rewind with nothing to report). `revert-files-counts`
+ * is the ordinary complete restore: two paths in `restored` and one in
+ * `deleted`, so the success notice's counts are asserted from real arrays rather
+ * than from a number the fake also has to invent.
  *
  * ## The per-session `initialize` gate
  *
@@ -960,6 +963,25 @@ async function handle(method, params, id) {
             deleted: [],
             skipped: ["/work/big.bin"],
             unrecoverable: [{ path: "/work/big.bin", reason: "larger than 8388608 bytes" }],
+            failed: [],
+            rescue: [],
+            rescueDir: "/work/rescue",
+          },
+        };
+      }
+      if (messageId === "revert-files-counts") {
+        // A complete file restore: the receipt's `restored` and `deleted`
+        // arrays are the only source the provider may turn into the success
+        // notice's counts (the fields are string arrays — the provider must
+        // count them, not read a made-up `count` field).
+        return {
+          kind: "success",
+          text: "Withdrawn seq 3 and everything after it",
+          files: {
+            restored: ["/work/a.txt", "/work/b.txt"],
+            deleted: ["/work/old.txt"],
+            skipped: [],
+            unrecoverable: [],
             failed: [],
             rescue: [],
             rescueDir: "/work/rescue",
