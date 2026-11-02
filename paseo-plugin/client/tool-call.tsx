@@ -61,6 +61,7 @@ import {
   cardHeadStyle,
   cardHeadTitleTextStyle,
   cardStyle,
+  CODE_MAX_HEIGHT,
   codeRegionStyle,
   codeTextStyle,
   commandRegionStyle,
@@ -723,6 +724,11 @@ function buildStyles(colors: TokenColors, hairline: number) {
     terminalOutput: terminalOutputScrollStyle(),
     code: codeRegionStyle(),
     codeText: codeTextStyle(colors),
+    // DSH's `.bodyScroll { max-height: 260px; overflow-y: auto }` around the
+    // code-tool card's body: the generic surface renders the whole text and
+    // scrolls it in place instead of being cut at 6000 characters. This is the
+    // one consumer of `CODE_MAX_HEIGHT`.
+    codeScroll: { maxHeight: CODE_MAX_HEIGHT },
     diffLine: diffRowStyle(),
     diffBody: diffBodyStyle(),
     diffAdd: diffLineStyle(colors, "add", light),
@@ -1018,7 +1024,25 @@ export function InlineToolCall({
             </View>
           ) : data.headline !== "" || hasBody ? (
             <View style={styles.card}>
-              <View style={styles.code}>
+              {/* DSH's code-card toolbar, with the copy control as its only
+                  action: it hands over the whole body, not the part inside the
+                  scroll window. That is the recovery path for a body too long
+                  to read in place, and it is what makes the 260px window safe —
+                  nothing is dropped, only scrolled. No language tag: DSH
+                  hardcodes `typescript` there, a wart this repo deliberately
+                  does not copy. */}
+              {hasBody && data.body.trim() !== "" ? (
+                <CardHead lang="" title="" text={data.body} styles={styles} />
+              ) : null}
+              {/* DSH's `.bodyScroll { max-height: 260px; overflow-y: auto }`
+                  around the code surface: the whole body is rendered and this
+                  is the only thing keeping a long one from pushing the timeline
+                  down (the same shape as the terminal card's 224px window). */}
+              <ScrollView
+                style={styles.codeScroll}
+                contentContainerStyle={styles.code}
+                nestedScrollEnabled
+              >
                 {data.headline !== "" ? (
                   <Text style={styles.codeText} selectable>
                     {data.headline}
@@ -1029,7 +1053,7 @@ export function InlineToolCall({
                     {data.body}
                   </Text>
                 ) : null}
-              </View>
+              </ScrollView>
             </View>
           ) : null}
         </View>

@@ -776,11 +776,13 @@ function blockKind(type: string, toolName: string): ToolBlockKind {
  * Upper bound for the plain-text body of a block that has no scroll region of
  * its own.
  *
- * The terminal card is the exception and is **not** capped (see the return
- * statement below): DSH's `TerminalBlock` renders the whole output inside a
- * 224px vertical scroll and copies the whole of it, so a cap here would both
- * hide the tail — usually the failure summary — and shorten what "copy" gives
- * the user.
+ * Only the **legacy plain-text diff fallback** still uses it (see the return
+ * statement below): that card draws one row per line and has neither a scroll
+ * region nor a copy control, so an uncapped body would mount an unbounded row
+ * tree. Every other body is rendered by a card that shows it whole inside a
+ * capped window and copies the whole of it — DSH's `TerminalBlock` (224px) and
+ * the generic code surface (`.bodyScroll`, 260px) — so capping those would hide
+ * the tail and shorten what "copy" gives the user.
  */
 const BODY_LIMIT = 6000;
 
@@ -1536,12 +1538,16 @@ export function toolCallData(
     // back to the compact one-line form. Otherwise the block leads with the
     // subject only when the head is showing something else — the description.
     headline,
-    // The terminal card renders the whole output inside its own scroll region
-    // and copies that same string (DSH's `TerminalBlock`), so this is the one
-    // body that must not be capped — truncating it is what hid the tail of a
-    // build log. A real diff likewise replaces the raw body with rows it built
-    // itself, so the cap does not apply to it either.
-    body: diffBlock !== null || kind === "terminal" ? body : truncate(body),
+    // The card decides whether a body is capped, not the block kind: the
+    // terminal renders the whole output inside its own 224px scroll region and
+    // copies that same string (DSH's `TerminalBlock`), the generic code surface
+    // does the same in DSH's 260px `.bodyScroll`, and a real diff replaces the
+    // raw body with rows it built itself. Truncating any of those hid the tail
+    // of the output and shortened what "copy" handed the user. The one body
+    // still capped is the legacy plain-text diff fallback (`diff` with no
+    // `diffBlock`), whose card draws one row per line with no scroll region or
+    // copy control of its own.
+    body: diff && diffBlock === null ? truncate(body) : body,
     bodyLabel,
     diff,
     code,

@@ -396,19 +396,66 @@ console.log("limits");
     huge.body.slice(-20),
   );
 
-  // Every other block still renders into a code surface that has no scroll
-  // region of its own, so the cap stays — and it must not split an astral
-  // character in half (a lone high surrogate renders as `�`).
+  // CT-01: the generic code surface renders its body inside DSH's 260px
+  // `.bodyScroll` window and copies the whole of it, so it must not be capped
+  // either. These are the cases the audit measured — an MCP `unknown` call and
+  // the read/fetch/plan/plain_text/sub_agent rows whose `presentationMeta` did
+  // not parse — plus an agent message, which is the same surface.
   const marker = localeText().truncated;
-  const capped = toolCallData(
-    { name: "mcp__x__y", status: "completed", detail: { type: "unknown", input: {}, output: "z".repeat(7000) } },
+  const genericCases = [
+    [
+      "MCP unknown",
+      { name: "mcp__x__y", status: "completed", detail: { type: "unknown", input: {}, output: "z".repeat(7000) } },
+    ],
+    [
+      "read without meta",
+      { name: "read", status: "completed", detail: { type: "read", filePath: "/a.ts", content: "r".repeat(7000) } },
+    ],
+    [
+      "fetch without meta",
+      { name: "web_fetch", status: "completed", detail: { type: "fetch", url: "https://x", result: "f".repeat(7000) } },
+    ],
+    [
+      "plan",
+      { name: "update_plan", status: "completed", detail: { type: "plan", text: "p".repeat(7000) } },
+    ],
+    [
+      "plain_text",
+      { name: "x", status: "completed", detail: { type: "plain_text", label: "run", text: "t".repeat(7000) } },
+    ],
+    [
+      "sub_agent log",
+      { name: "subagent", status: "completed", detail: { type: "sub_agent", log: "s".repeat(7000) } },
+    ],
+    [
+      "agent message",
+      {
+        name: "agent_message",
+        status: "completed",
+        detail: { type: "plain_text", label: "", text: "" },
+        agentMessage: { event: "finished", sender: { id: "a" }, text: "m".repeat(7000) },
+      },
+    ],
+  ];
+  for (const [label, item] of genericCases) {
+    const row = toolCallData(item, "complete");
+    equal(`the generic body is whole (${label})`, row.body.length, 7000);
+    check(`…and carries no truncation marker (${label})`, !row.body.includes(marker));
+  }
+
+  // The one body still capped is the legacy plain-text diff fallback: that card
+  // draws one row per line with no scroll region and no copy control, so an
+  // uncapped body would mount an unbounded row tree. It must not split an
+  // astral character in half either (a lone high surrogate renders as `�`).
+  const legacy = toolCallData(
+    { name: "write", status: "completed", detail: { type: "write", filePath: "/x.ts", content: "z".repeat(7000) } },
     "complete",
   );
-  equal("other bodies are still capped", capped.body, `${"z".repeat(6000)}${marker}`);
+  equal("the legacy diff fallback is still capped", legacy.body, `${"z".repeat(6000)}${marker}`);
 
   const straddled = `${"a".repeat(5999)}\u{1F600}tail`;
   const cut = toolCallData(
-    { name: "mcp__x__y", status: "completed", detail: { type: "unknown", input: {}, output: straddled } },
+    { name: "write", status: "completed", detail: { type: "write", filePath: "/x.ts", content: straddled } },
     "complete",
   );
   equal(
@@ -421,7 +468,7 @@ console.log("limits");
   // The control: a pair that ends exactly at the cut is kept whole.
   const aligned = `${"a".repeat(5998)}\u{1F600}tail`;
   const kept = toolCallData(
-    { name: "mcp__x__y", status: "completed", detail: { type: "unknown", input: {}, output: aligned } },
+    { name: "write", status: "completed", detail: { type: "write", filePath: "/x.ts", content: aligned } },
     "complete",
   );
   equal(
@@ -1649,12 +1696,12 @@ console.log("the renderer's schema and ToolCallData cannot drift apart");
 
 console.log("the renderer reads the state the data layer now carries");
 {
-  // Two fixes end at the component, and a component that never reads its input
-  // is indistinguishable from a data layer that never produced it. This file
-  // imports React Native, so plain `node` cannot `require` it; the wiring is
-  // read out of the source while the data-layer sections above assert what the
-  // mapper produces. Comments are stripped first — a doc comment that names the
-  // field must not satisfy the check.
+  // Three fixes end at the component, and a component that never reads its
+  // input is indistinguishable from a data layer that never produced it. This
+  // file imports React Native, so plain `node` cannot `require` it; the wiring
+  // is read out of the source while the data-layer sections above assert what
+  // the mapper produces. Comments are stripped first — a doc comment that names
+  // the field must not satisfy the check.
   const sourcePath = findRepoFile("client/tool-call.tsx");
   check("tool-call.tsx is readable", sourcePath !== undefined, `looked above ${__dirname}`);
   const rendered = sourcePath === undefined ? "" : fs.readFileSync(sourcePath, "utf8");
@@ -1703,6 +1750,46 @@ console.log("the renderer reads the state the data layer now carries");
     "…and its copy control gets the whole output",
     terminalCopy.length === 1,
     `${terminalCopy.length} matching CopyControl element(s)`,
+  );
+
+  // CT-01: the generic code surface (any row without a structured card — MCP
+  // `unknown`, a plan, a `/command`'s output, a read/fetch whose meta did not
+  // parse) scrolls the whole body in DSH's 260px window and hands the whole of
+  // it to a copy control. The ScrollView names `codeScroll`; `buildStyles` is
+  // what binds that name to `CODE_MAX_HEIGHT`, the token that had no consumer.
+  const codeScroll = elementsWithAttributes(component, ["style", "contentContainerStyle"]).filter(
+    (element) => element.tag === "ScrollView" && mentions(attributeOf(element, "style").value, "codeScroll"),
+  );
+  check(
+    "the generic code surface sits in a capped scroll region",
+    codeScroll.length === 1,
+    `${codeScroll.length} matching ScrollView element(s)`,
+  );
+  check(
+    "…whose content keeps the code surface's padding",
+    codeScroll.length === 1 &&
+      mentions(attributeOf(codeScroll[0], "contentContainerStyle").value, "code"),
+  );
+  const genericCopy = elementsWithAttributes(component, ["text"]).filter(
+    (element) => element.tag === "CardHead" && mentions(attributeOf(element, "text").value, "body"),
+  );
+  check(
+    "…and the card head's copy control gets the whole body",
+    genericCopy.length === 1,
+    `${genericCopy.length} matching CardHead element(s)`,
+  );
+  check(
+    "…without inventing a language tag or title DSH's toolbar would carry",
+    genericCopy.length === 1 &&
+      attributeOf(genericCopy[0], "lang").value === "" &&
+      attributeOf(genericCopy[0], "title").value === "",
+  );
+  const stylesBody = functionBody(codeOnly(rendered), "buildStyles") ?? "";
+  check("buildStyles was found", stylesBody.length > 0, "buildStyles body is missing");
+  check(
+    "and the scroll window is DSH's 260px token, not a second literal",
+    mentions(stylesBody, "CODE_MAX_HEIGHT") && /maxHeight\s*:\s*CODE_MAX_HEIGHT/.test(stylesBody),
+    "buildStyles does not bind maxHeight to CODE_MAX_HEIGHT",
   );
 }
 

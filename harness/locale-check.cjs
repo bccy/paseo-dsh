@@ -743,10 +743,12 @@ console.log("row copy follows the locale, not the import");
   equal("with no repeated summary", toolCallData(plan, "complete").summary, "");
   equal("the Paseo MCP row follows", toolCallData(mcp, "complete").label, "Delete heartbeat");
 
-  // A non-terminal body, because terminal (`shell`) bodies are deliberately not
-  // capped any more — the terminal card scrolls and copies the whole output
-  // (CT-02). This case is about the marker's locale, not about which kinds cap.
-  const huge = { name: "bash", status: "completed", detail: { type: "unknown", command: "x", output: "y".repeat(7000) } };
+  // A body that is still capped: terminal (`shell`) and generic code-surface
+  // bodies are deliberately not capped any more — both cards scroll and copy the
+  // whole thing (CT-02/CT-01) — so the marker's locale is asserted on the legacy
+  // plain-text diff fallback, the one body that keeps the cap. This case is
+  // about the marker's locale, not about which kinds cap.
+  const huge = { name: "write", status: "completed", detail: { type: "write", filePath: "/x.ts", content: "y".repeat(7000) } };
   check(
     "the truncation marker is localized",
     toolCallData(huge, "complete").body.endsWith(allText().en.truncated),

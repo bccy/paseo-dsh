@@ -627,8 +627,128 @@ async function runControllerChecks() {
 
     answer = { available: true, jobs: [] };
     await harness.clock.advance(LIVE_POLL_MS);
-    equal("the empty answer publishes", harness.calls.states.length, 2);
+    equal("a changed answer publishes", harness.calls.states.length, 2);
     equal("an empty pill keeps the base interval, not a slow hidden one", harness.clock.pendingDelays(), [LIVE_POLL_MS]);
+    harness.poller.dispose();
+  }
+
+  // CJ-01 (behaviour): a poll that finds nothing new must not publish. Publishing
+  // is what rebuilds the popover's store row (waking its listeners) and calls
+  // `registration.update()`, which the host republishes unconditionally — and
+  // under live-only visibility "nothing running" is the normal answer, so the
+  // idle session was repainting the composer and any open popover every 4 s.
+  console.log("\npoll controller publish dedup");
+  {
+    // A readable answer that repeats publishes once; a changed one still goes
+    // through, and the cadence is untouched by the dedup.
+    let answer = { available: true, jobs: [] };
+    const harness = createPollerHarness({
+      readJobs: async () => {
+        harness.calls.reads += 1;
+        return answer;
+      },
+      random: () => 0,
+    });
+    await harness.poller.applySnapshot({
+      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    await harness.clock.advance(0);
+    equal("the first readable answer publishes", harness.calls.states.length, 1);
+    await harness.clock.advance(LIVE_POLL_MS);
+    await harness.clock.advance(LIVE_POLL_MS);
+    equal("two identical answers do not publish again", harness.calls.states.length, 1);
+    equal("the deduped polls still run at the base interval", harness.clock.pendingDelays(), [LIVE_POLL_MS]);
+    answer = { available: true, jobs: [{ status: "running" }] };
+    await harness.clock.advance(LIVE_POLL_MS);
+    equal("a job appearing publishes", harness.calls.states.length, 2);
+    equal("…with the live answer", harness.calls.states[1][1].jobs.length, 1);
+    harness.poller.dispose();
+  }
+  {
+    // The same failure repeated is also the same answer: it must publish once
+    // while the backoff still grows, and a different message must publish.
+    let message = "registry exploded";
+    const harness = createPollerHarness({
+      readJobs: async () => {
+        harness.calls.reads += 1;
+        throw new Error(message);
+      },
+      random: () => 0,
+    });
+    await harness.poller.applySnapshot({
+      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    await harness.clock.advance(0);
+    equal("a failure publishes once", harness.calls.states.length, 1);
+    await harness.clock.advance(LIVE_POLL_MS * 2);
+    equal("the same failure repeated does not publish again", harness.calls.states.length, 1);
+    equal("…and the backoff still grows", harness.clock.pendingDelays(), [LIVE_POLL_MS * 4]);
+    message = "registry exploded differently";
+    await harness.clock.advance(LIVE_POLL_MS * 4);
+    equal("a different failure message publishes", harness.calls.states.length, 2);
+    harness.poller.dispose();
+  }
+  {
+    // Recovery is a change even when the job list is empty: the unavailable
+    // answer must not stick.
+    let fail = true;
+    const harness = createPollerHarness({
+      readJobs: async () => {
+        harness.calls.reads += 1;
+        if (fail) throw new Error("registry exploded");
+        return { available: true, jobs: [] };
+      },
+      random: () => 0,
+    });
+    await harness.poller.applySnapshot({
+      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    await harness.clock.advance(0);
+    equal("a failure publishes once", harness.calls.states.length, 1);
+    fail = false;
+    await harness.clock.advance(LIVE_POLL_MS * 2);
+    equal("recovery publishes even with no jobs", harness.calls.states.length, 2);
+    check("…and the published answer is readable again", harness.calls.states[1][1].available, true);
+    harness.poller.dispose();
+  }
+  {
+    // The guard is per agent: two agents with identical answers each publish
+    // their own first answer, and then neither publishes again.
+    const harness = createPollerHarness({
+      readJobs: async () => ({ available: true, jobs: [] }),
+    });
+    await harness.poller.applySnapshot({
+      entries: [
+        { agent: { id: "a", workspaceId: "ws" } },
+        { agent: { id: "b", workspaceId: "ws" } },
+      ],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    await harness.clock.advance(0);
+    equal("each agent's first answer publishes", harness.calls.states.map(([agentId]) => agentId).sort(), ["a", "b"]);
+    await harness.clock.advance(LIVE_POLL_MS);
+    equal("…and identical answers publish nothing more", harness.calls.states.length, 2);
+    harness.poller.dispose();
+  }
+  {
+    // A re-registration is a new pill: its store row was dropped, so its first
+    // answer must publish even if it is identical to the one before the drop.
+    const harness = createPollerHarness({
+      readJobs: async () => ({ available: true, jobs: [] }),
+    });
+    await harness.poller.applySnapshot({
+      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    await harness.clock.advance(0);
+    equal("a fresh registration publishes its first answer", harness.calls.states.length, 1);
+    harness.poller.drop("a");
+    harness.poller.upsert({ id: "a", workspaceId: "ws" });
+    await harness.clock.advance(0);
+    equal("a re-registration publishes again", harness.calls.states.length, 2);
     harness.poller.dispose();
   }
   {

@@ -8,7 +8,7 @@
  * no React, no host types, every dependency injected. The JSX file keeps the
  * rendering, the registration and the store the popover subscribes to.
  *
- * **Three policies live here, one reason each.**
+ * **Three policies live here, one reason each, plus the publish guard.**
  *
  * - {@link jobsPillPresentation}: when the pill is visible, what it counts, and
  *   which mark sits in its icon slot. By the product rule (route 2 of CJ-01) it
@@ -28,6 +28,15 @@
  *   not grow the method while the process lives. Retrying is not a slow path to
  *   success, it is a permanent error pill; the codes come from the shared
  *   contract so server and client cannot disagree about which are terminal.
+ *
+ * **The publish guard.** A successful poll that returns the same answer as the
+ * previous one does not call `host.publishState`. That callback is what rebuilds
+ * the popover's store row and calls `registration.update()`, and the host
+ * republishes the button on every update. With the pill hidden whenever nothing
+ * is live, "nothing running" is the normal answer, so publishing it every four
+ * seconds was a periodic repaint of the composer and the open popover for no
+ * change at all. The comparison is a signature of the whole answer (see
+ * `answerSignature`), so any real change still reaches the host.
  *
  * **Why the timers are not `setInterval`s.** Every agent registered from one
  * snapshot used to create its interval in the same synchronous loop, so every
@@ -84,6 +93,21 @@ export interface JobsViewState<J extends JobLike = JobLike> {
   available: boolean;
   error?: string;
   code?: string;
+}
+
+/**
+ * A poll answer as one comparable string.
+ *
+ * The host's `publishState` is not free: it replaces the popover's store row
+ * (waking every listener, including an open popover) and calls
+ * `registration.update()`, which the host republishes unconditionally. Under
+ * the live-only rule the normal answer is "nothing is running", so an idle
+ * session would repaint the composer and an open popover every four seconds.
+ * `Job` is a flat, Zod-parsed object, so `JSON.stringify` is exact here: two
+ * answers that render the same stringify the same.
+ */
+function answerSignature(state: JobsViewState<JobLike>): string {
+  return JSON.stringify([state.available, state.error ?? "", state.code ?? "", state.jobs]);
 }
 
 /** The fields of an agent the pill cares about. */
@@ -230,6 +254,11 @@ interface Entry<J extends JobLike> {
   /** Consecutive failed reads, driving the backoff and reset by a success. */
   failures: number;
   lastJobs: readonly J[];
+  /**
+   * The last answer handed to the host, as {@link answerSignature}; `undefined`
+   * before the first answer, so a fresh registration always publishes once.
+   */
+  lastPublished: string | undefined;
   /** A terminal contract error; this agent is not polled again until re-registered. */
   terminal: boolean;
 }
@@ -300,6 +329,23 @@ export function createJobsPoller<J extends JobLike>(
   };
 
   /**
+   * Hand one answer to the host, unless it is the same answer it already has.
+   *
+   * A poll that found nothing new must not publish: `publishState` rebuilds the
+   * popover store row (waking its listeners) and updates the composer
+   * registration, which the host republishes unconditionally. The signature
+   * covers the whole answer, so any change — a job appearing or settling, a
+   * different error — still goes through. The first answer always publishes:
+   * there is no previous snapshot to compare against.
+   */
+  const publishIfChanged = (entry: Entry<J>, state: JobsViewState<J>): void => {
+    const signature = answerSignature(state);
+    if (entry.lastPublished === signature) return;
+    entry.lastPublished = signature;
+    host.publishState(entry.agentId, state);
+  };
+
+  /**
    * One poll. Every branch either schedules exactly one next poll or stops the
    * agent for good; there is no path that leaves an entry with no timer while
    * claiming to be active.
@@ -323,7 +369,7 @@ export function createJobsPoller<J extends JobLike>(
           return;
         }
         entry.failures += 1;
-        host.publishState(entry.agentId, {
+        publishIfChanged(entry, {
           jobs: entry.lastJobs,
           available: false,
           error: error.message,
@@ -335,7 +381,7 @@ export function createJobsPoller<J extends JobLike>(
       const jobs = result.jobs ?? [];
       entry.failures = 0;
       entry.lastJobs = jobs;
-      host.publishState(entry.agentId, { jobs, available: true });
+      publishIfChanged(entry, { jobs, available: true });
       schedule(entry, nextPollDelayMs(0, random));
     } catch (error) {
       if (!current()) return;
@@ -350,7 +396,7 @@ export function createJobsPoller<J extends JobLike>(
         return;
       }
       entry.failures += 1;
-      host.publishState(entry.agentId, {
+      publishIfChanged(entry, {
         jobs: entry.lastJobs,
         available: false,
         error: error instanceof Error ? error.message : String(error),
@@ -386,6 +432,7 @@ export function createJobsPoller<J extends JobLike>(
       inFlight: false,
       failures: 0,
       lastJobs: [],
+      lastPublished: undefined,
       terminal: false,
     };
     agents.set(agent.id, entry);
