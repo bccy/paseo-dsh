@@ -455,8 +455,8 @@ async function main() {
     );
     check(
       "the server never registers before(agent.session_open)",
-      indexServer.includes('before("agent.session_open"') === false
-        && indexServer.includes("before('agent.session_open'") === false,
+      // A call, not a mention: the file's own comment names the forbidden hook.
+      !/\.before\(\s*["']agent\.session_open["']/.test(indexServer),
       "the forbidden before-hook is registered",
     );
   }
