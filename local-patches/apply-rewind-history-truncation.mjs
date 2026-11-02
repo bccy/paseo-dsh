@@ -551,6 +551,119 @@ function atomicWrite(target, content) {
 }
 
 /**
+ * Every `async revert(…) {` method signature in the file, in order.
+ *
+ * Deliberately broad (any parameter list): the locator below has to *see* a
+ * renamed signature so it can report it, and the real host carries more than one
+ * `revert()` (see `locateRewindMethod()`).
+ */
+const REVERT_METHOD_RE = /^([ \t]*)async revert\(([^)]*)\)[ \t]*\{[ \t]*\r?$/gmu;
+
+/** The parameter names the injected `CALL` is written against. */
+const EXPECTED_REVERT_PARAMS = "messageId, scope";
+
+/**
+ * Locate the `revert()` method this patch edits — the one belonging to the
+ * session class whose history buffer is truncated — using the same structural
+ * discriminator `ANCHOR_B_RE` spells out: an `await this.bridge.revert({…})`
+ * call inside the method body.
+ *
+ * Why not "the first `async revert(` in the file": the real
+ * `plugin-provider.js` has **two**. `ProviderRuntimeSession.revert(token)`
+ * delegates to `this.runtime.complete()` and appears first; the patched
+ * `PluginAgentSession.revert(messageId, scope)` comes later. Taking the first
+ * match made the failure text and `--json.revertSignatureFound` name the wrong
+ * method (F1, 2026-11-03 independent verification): a consumer that rewrote
+ * `CALL` from that field would edit the wrong class. The bridge call is the
+ * property that actually identifies the patched method, and it is exactly what
+ * `ANCHOR_B_RE` requires.
+ *
+ * @param {string} source - file to inspect.
+ * @returns {{indent: string, params: string, index: number, text: string, body: string} | null}
+ *   the method's indentation, trimmed parameter list, match offset, full
+ *   signature line and body text (without the outer braces), or null when no
+ *   `async revert(…)` method calls `await this.bridge.revert({…})`.
+ */
+function locateRewindMethod(source) {
+  // A fresh regex per call: the shared `g` one would carry `lastIndex` between
+  // callers, and this runs once per file read.
+  const regex = new RegExp(REVERT_METHOD_RE.source, REVERT_METHOD_RE.flags);
+  let match;
+  while ((match = regex.exec(source)) !== null) {
+    const openBrace = match.index + match[0].indexOf("{");
+    const close = matchClosingBrace(source, openBrace);
+    if (close === -1) continue;
+    const body = source.slice(openBrace + 1, close);
+    if (!body.includes("await this.bridge.revert({")) continue;
+    return {
+      indent: match[1],
+      params: match[2].trim(),
+      index: match.index,
+      text: match[0],
+      body,
+    };
+  }
+  return null;
+}
+
+/**
+ * The `revert()` signature the injected `CALL` is written against.
+ *
+ * `CALL` references both parameters **by name** (`messageId`, `scope`), and there
+ * is no way to write that code without naming them: the host method's own
+ * parameter names are the only identifiers in scope at the insertion point. So the
+ * signature is a hard coupling, exactly like the three private fields
+ * `hostFieldShapes()` covers — and it needs its own gate for the same reason.
+ *
+ * Measured failure mode without this gate (LP-01, 2026-11-03 audit): upstream
+ * renames the first parameter (`async revert(id, scope)`), both anchors still
+ * match because `ANCHOR_B_RE` only spells out the *body* (`token,` / `scope,` in
+ * the bridge call object), `hostFieldShapes()` still passes, apply reports
+ * `patched-on-new-upstream` — and then **every** conversation/both rewind throws
+ * `ReferenceError: messageId is not defined` inside the host, after the bridge has
+ * already rewound. The session log is reverted but the timeline is not refreshed:
+ * the exact silent half-failure this patch exists to remove.
+ *
+ * One locator shared by `detectUpstreamSelfFix()` (which bounds the method body),
+ * the apply precondition, `apply --check` and `check-rewind-patch.mjs` — two
+ * copies of "which revert() is the patch's" would drift, and the tools would
+ * disagree about the same file (F1 is that drift in the diagnostics).
+ *
+ * @param {string} source - file to inspect.
+ * @returns {ReturnType<typeof locateRewindMethod>} the located method when its
+ *   parameters are exactly `messageId, scope`, else null.
+ */
+function revertSignature(source) {
+  const method = locateRewindMethod(source);
+  if (method === null) return null;
+  // Whitespace-normalise so a reformat (`messageId,scope`) is still the same
+  // parameter list; only a *renamed* parameter fails the gate.
+  return method.params.replace(/\s+/gu, " ") === EXPECTED_REVERT_PARAMS ? method : null;
+}
+
+/**
+ * Best-effort excerpt of the `revert()` signature this patch targets, for
+ * failure messages.
+ *
+ * Reports the method found by `locateRewindMethod()` — not the first
+ * `async revert(` in the file (F1: that was `ProviderRuntimeSession.revert(token)`
+ * on the real host). When no rewind-capable `revert()` exists at all it says so
+ * explicitly, so "not found" cannot read as an empty excerpt.
+ *
+ * Never throws and never returns an empty string.
+ *
+ * @param {string} source - file to inspect.
+ * @returns {string} one trimmed, bounded line or an explicit not-found sentence.
+ */
+function describeRevertSignature(source) {
+  const method = locateRewindMethod(source);
+  if (method === null) {
+    return "(no `async revert(...)` method whose body calls `await this.bridge.revert({...})` was found)";
+  }
+  return truncateForLog(`async revert(${method.params}) {`);
+}
+
+/**
  * Detect whether upstream has fixed #4667 by itself — i.e. `revert()` already
  * shortens `this.history` — so this patch is redundant and should be retired
  * rather than re-applied on every start.
@@ -578,19 +691,15 @@ function atomicWrite(target, content) {
 const HISTORY_MUTATION_RE = /this\.history\s*=|this\.history\.length\s*=|this\.history\.splice\(|this\.history\.pop\(/g;
 
 function detectUpstreamSelfFix(source) {
-  // Bound `revert()` by its own signature and the next method signature at the
-  // same-or-shallower indentation.  The dist writes methods at 4 spaces, but the
-  // anchor work above already accepts 2 spaces and tabs, so stay flexible.
-  const signature = /^([ \t]*)async revert\(messageId, scope\)[ \t]*\{[ \t]*\r?$/m.exec(source);
-  if (signature === null) return { fixed: false, hits: 0, sites: [] };
-
-  const indent = signature[1];
-  const bodyStart = signature.index + signature[0].length;
-  // Next sibling method: same indentation, `name(...) {`.
-  const siblingRe = new RegExp(`^${indent.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[A-Za-z_$#][\\w$]*\\(`, "gm");
-  siblingRe.lastIndex = bodyStart;
-  const sibling = siblingRe.exec(source);
-  const body = source.slice(bodyStart, sibling === null ? source.length : sibling.index);
+  // Bound `revert()` with the same locator the LP-01 gate uses: the method whose
+  // body calls `await this.bridge.revert({…})`.  That is the method this patch
+  // edits, so "upstream already truncates history inside it" is the only fix that
+  // makes the patch redundant.  Using the locator (rather than a parameter-name
+  // regex) means a renamed parameter no longer hides the method from this check;
+  // the gate still refuses to patch it afterwards (`revert-signature-changed`).
+  const method = locateRewindMethod(source);
+  if (method === null) return { fixed: false, hits: 0, sites: [] };
+  const body = method.body;
 
   HISTORY_MUTATION_RE.lastIndex = 0;
   const matches = [...body.matchAll(HISTORY_MUTATION_RE)];
@@ -1184,8 +1293,21 @@ function matchClosingBrace(text, openIndex) {
 }
 
 /**
- * Replace the stale rewind patch **in place**, without touching anything else in
- * the file.
+ * Read-only feasibility plan for rebuilding a stale rewind patch **in place**.
+ *
+ * Extracted from `rebuildRewindInPlace()` so the two read-only callers
+ * (`apply --check` and `check-rewind-patch.mjs`) answer "would apply rebuild this
+ * file, or refuse?" with the *same* code apply runs.  They used to answer it by
+ * pattern — `stale` => "re-run apply to rebuild" — which is wrong for exactly the
+ * L1 shape: a stale body plus a foreign statement in `revert()`'s tail.  There
+ * apply fails closed with `stale-patch-call-region-foreign`, while both checks
+ * promised a rebuild.  That is LP-02's residual (2026-11-03 audit): a health check
+ * that cannot say "apply will refuse".
+ *
+ * Pure: it computes the patched text but writes nothing, prints nothing and
+ * records no status.  `rebuildRewindInPlace()` is the wrapper that keeps the
+ * apply path's diagnostics/status contract; the two checks only need
+ * `ok` / `reason` / `detail`.
  *
  * What has to change is exactly two things: the `truncateHistoryFrom()` method
  * (doc comment + body) and the call the patch inserts inside `revert()`.  Both
@@ -1200,46 +1322,25 @@ function matchClosingBrace(text, openIndex) {
  * change is also present — i.e. the normal state), and getting it wrong replaces
  * a module with a different version.  Editing in place removes the question.
  *
- * Whole-operation-in-memory: the caller writes only after this returns a string,
- * so a failure leaves the file byte-identical.
- *
  * @param {string} source - the file currently on disk (markers present).
- * @returns {string | null} the rebuilt content, or null after recording why not.
+ * @returns {{ok: true, patched: string}
+ *   | {ok: false, reason: string, detail: string, foreign?: string, markers?: number}}
  */
-function rebuildRewindInPlace(source) {
+function planRewindRebuild(source) {
   const signature = /^([ \t]*)truncateHistoryFrom\(messageId\)[ \t]*\{[ \t]*\r?$/mu.exec(source);
   if (signature === null) {
-    process.stderr.write(
-      "[rewind-patch] WARNING: the stale rewind body has no truncateHistoryFrom() method to replace.\n"
-      + "  Nothing was written. Reinstall @getpaseo/cli to get a clean file.\n",
-    );
-    succeed({
-      reason: "stale-patch-method-missing",
-      targetMd5: md5(readFileSync(TARGET, "utf8")),
-      message: "撤回补丁体是旧版，但文件里找不到可替换的 truncateHistoryFrom()，已保持原文件不动。"
-        + "重装 @getpaseo/cli 后重跑本脚本即可修复。",
-      extra: { patchBody: "stale", staleDetail: "truncateHistoryFrom() not found" },
-    });
-    process.stdout.write("[rewind-patch] rewind: stale-patch-method-missing (file untouched)\n");
-    return null;
+    return { ok: false, reason: "stale-patch-method-missing", detail: "truncateHistoryFrom() not found" };
   }
 
   const indent = signature[1];
   const openBrace = signature.index + signature[0].indexOf("{");
   const close = matchClosingBrace(source, openBrace);
   if (close === -1) {
-    process.stderr.write(
-      "[rewind-patch] WARNING: cannot find the end of the stale truncateHistoryFrom() method.\n"
-      + "  Nothing was written. Reinstall @getpaseo/cli to get a clean file.\n",
-    );
-    succeed({
+    return {
+      ok: false,
       reason: "stale-patch-method-unterminated",
-      targetMd5: md5(readFileSync(TARGET, "utf8")),
-      message: "撤回补丁体是旧版，但方法体没有闭合，已保持原文件不动。重装 @getpaseo/cli 后重跑。",
-      extra: { patchBody: "stale", staleDetail: "truncateHistoryFrom() has no matching brace" },
-    });
-    process.stdout.write("[rewind-patch] rewind: stale-patch-method-unterminated (file untouched)\n");
-    return null;
+      detail: "truncateHistoryFrom() has no matching brace",
+    };
   }
 
   // The replacement starts at the method's own doc comment, if there is one
@@ -1282,12 +1383,12 @@ function rebuildRewindInPlace(source) {
   //
   // Both edits are computed against the *original* text and applied from the
   // back, so the second one's offset stays valid.
-  const callEdit = rebuildRewindCall(source, unit, crlf);
-  if (callEdit === null) return null; // it already recorded why
+  const callPlan = planRewindCallRebuild(source, unit, crlf);
+  if (!callPlan.ok) return callPlan;
 
   const edits = [
     { index: blockStart, length: close + 1 - blockStart, text: methodText },
-    callEdit,
+    callPlan.edit,
   ].sort((left, right) => right.index - left.index);
 
   let patched = source;
@@ -1297,20 +1398,97 @@ function rebuildRewindInPlace(source) {
 
   const patchedMarkers = countOccurrences(patched, MARKER);
   if (patchedMarkers !== 2) {
-    process.stderr.write(
-      `[rewind-patch] WARNING: replacing the stale method produced `
-      + `${String(patchedMarkers)} marker(s), expected 2. Nothing was written.\n`,
-    );
-    succeed({
+    return {
+      ok: false,
       reason: "stale-patch-rebuild-marker-wrong",
-      targetMd5: md5(readFileSync(TARGET, "utf8")),
-      message: "撤回补丁体是旧版，原地替换后标记数不对，已保持原文件不动。重装 @getpaseo/cli 后重跑。",
-      extra: { patchBody: "stale", staleDetail: `rebuilt markers ${String(patchedMarkers)}`, markers: patchedMarkers },
-    });
-    process.stdout.write("[rewind-patch] rewind: stale-patch-rebuild-marker-wrong (file untouched)\n");
-    return null;
+      detail: `rebuilt markers ${String(patchedMarkers)}`,
+      markers: patchedMarkers,
+    };
   }
-  return patched;
+  return { ok: true, patched };
+}
+
+/**
+ * Report and record the outcome of `planRewindRebuild()` for the apply path.
+ *
+ * The plan decides *whether* the stale body can be rebuilt; this wrapper keeps
+ * the original diagnostics and status-file contract (the startup hook logs one
+ * line, and `check-rewind-patch.mjs` reads `reason` / `patchBody`).
+ *
+ * Whole-operation-in-memory: the caller writes only after this returns a string,
+ * so a failure leaves the file byte-identical.
+ *
+ * @param {string} source - the file currently on disk (markers present).
+ * @returns {string | null} the rebuilt content, or null after recording why not.
+ */
+function rebuildRewindInPlace(source) {
+  const plan = planRewindRebuild(source);
+  if (plan.ok) return plan.patched;
+
+  const targetMd5 = md5(readFileSync(TARGET, "utf8"));
+  const record = (message) => {
+    succeed({
+      reason: plan.reason,
+      targetMd5,
+      message,
+      extra: {
+        patchBody: "stale",
+        staleDetail: plan.detail,
+        ...(plan.markers === undefined ? {} : { markers: plan.markers }),
+      },
+    });
+    process.stdout.write(`[rewind-patch] rewind: ${plan.reason} (file untouched)\n`);
+    return null;
+  };
+
+  if (plan.reason === "stale-patch-method-missing") {
+    process.stderr.write(
+      "[rewind-patch] WARNING: the stale rewind body has no truncateHistoryFrom() method to replace.\n"
+      + "  Nothing was written. Reinstall @getpaseo/cli to get a clean file.\n",
+    );
+    return record(
+      "撤回补丁体是旧版，但文件里找不到可替换的 truncateHistoryFrom()，已保持原文件不动。"
+      + "重装 @getpaseo/cli 后重跑本脚本即可修复。",
+    );
+  }
+  if (plan.reason === "stale-patch-method-unterminated") {
+    process.stderr.write(
+      "[rewind-patch] WARNING: cannot find the end of the stale truncateHistoryFrom() method.\n"
+      + "  Nothing was written. Reinstall @getpaseo/cli to get a clean file.\n",
+    );
+    return record("撤回补丁体是旧版，但方法体没有闭合，已保持原文件不动。重装 @getpaseo/cli 后重跑。");
+  }
+  if (plan.reason === "stale-patch-call-unlocatable") {
+    process.stderr.write(
+      "[rewind-patch] WARNING: cannot locate the body of revert() to rebuild the truncateHistoryFrom() call.\n"
+      + "  Nothing was written. Reinstall @getpaseo/cli to get a clean file.\n",
+    );
+    return record(
+      "撤回补丁体是旧版，但找不到 revert() 里插入调用的位置，已保持原文件不动。"
+      + "重装 @getpaseo/cli 后重跑本脚本即可修复。",
+    );
+  }
+  if (plan.reason === "stale-patch-call-region-foreign") {
+    // Fail closed: replacing the whole span would delete whatever else lives
+    // there. The old body still works (only the second rewind is affected), so
+    // leaving the file byte-identical is strictly better than a silent delete.
+    process.stderr.write(
+      "[rewind-patch] WARNING: the stale rewind patch cannot be rebuilt safely — revert() contains\n"
+      + `  content outside this patch's own inserted block: ${plan.foreign}\n`
+      + "  Replacing that span would delete it, so nothing was written.\n"
+      + "  Reinstall @getpaseo/cli (to get a clean file) and re-run this script.\n",
+    );
+    return record(
+      "撤回补丁体是旧版，但 revert() 里本补丁插入块之外还有其它语句，已保持原文件不动（避免误删）。"
+      + "重装 @getpaseo/cli 后重跑本脚本即可修复。",
+    );
+  }
+  // stale-patch-rebuild-marker-wrong — the only remaining plan failure.
+  process.stderr.write(
+    "[rewind-patch] WARNING: replacing the stale method produced "
+    + `${String(plan.markers)} marker(s), expected 2. Nothing was written.\n`,
+  );
+  return record("撤回补丁体是旧版，原地替换后标记数不对，已保持原文件不动。重装 @getpaseo/cli 后重跑。");
 }
 
 /**
@@ -1411,61 +1589,44 @@ function truncateForLog(line) {
 }
 
 /**
- * Rebuild the `CALL` inside `revert()` in place.
+ * Plan the `CALL` edit inside `revert()` for the stale-rebuild path.
  *
- * Called from the stale-rebuild path, where the method body has already been
- * decided to be older than this script — but the call is a *separate* block and
- * can be stale on its own (downgraded, or deleted down to its comments).  If the
- * method is stale and the call is current this overwrites the call with identical
- * bytes; if the call is stale it is what makes the rebuild actually land.
+ * Same ownership rule as `foreignTextAroundPatchCall()`: the only content this
+ * patch owns between the `bridge.revert({…});` line and the method's closing
+ * brace is its own marker-led block (or nothing at all, when the call was
+ * deleted).  Anything else there is foreign and makes the rebuild unsafe.
+ *
+ * The failure cases are **returned** instead of recorded so `planRewindRebuild()`
+ * stays pure and the two read-only checks can reuse the exact same judgement the
+ * writer uses (LP-02 residual).  `rebuildRewindInPlace()` is what turns these into
+ * warnings + a status file on the apply path.
  *
  * @param {string} source - file on disk.
  * @param {string} unit - the file's indentation unit (from `detectIndentUnit`).
  * @param {boolean} crlf - whether the file uses CRLF.
- * @returns {{index: number, length: number, text: string} | null} the edit, or
- *   null after recording why it could not be built.
+ * @returns {{ok: true, edit: {index: number, length: number, text: string}}
+ *   | {ok: false, reason: string, detail: string, foreign?: string}}
  */
-function rebuildRewindCall(source, unit, crlf) {
+function planRewindCallRebuild(source, unit, crlf) {
   const region = locateRewindCallRegion(source);
   if (region === null) {
-    process.stderr.write(
-      "[rewind-patch] WARNING: cannot locate the body of revert() to rebuild the truncateHistoryFrom() call.\n"
-      + "  Nothing was written. Reinstall @getpaseo/cli to get a clean file.\n",
-    );
-    succeed({
-      reason: "stale-patch-call-unlocatable",
-      targetMd5: md5(readFileSync(TARGET, "utf8")),
-      message: "撤回补丁体是旧版，但找不到 revert() 里插入调用的位置，已保持原文件不动。"
-        + "重装 @getpaseo/cli 后重跑本脚本即可修复。",
-      extra: { patchBody: "stale", staleDetail: "revert() body not locatable" },
-    });
-    process.stdout.write("[rewind-patch] rewind: stale-patch-call-unlocatable (file untouched)\n");
-    return null;
+    return { ok: false, reason: "stale-patch-call-unlocatable", detail: "revert() body not locatable" };
   }
   if (region.foreign !== null) {
-    // Fail closed: replacing the whole span would delete whatever else lives
-    // there. The old body still works (only the second rewind is affected), so
-    // leaving the file byte-identical is strictly better than a silent delete.
-    process.stderr.write(
-      "[rewind-patch] WARNING: the stale rewind patch cannot be rebuilt safely — revert() contains\n"
-      + `  content outside this patch's own inserted block: ${region.foreign}\n`
-      + "  Replacing that span would delete it, so nothing was written.\n"
-      + "  Reinstall @getpaseo/cli (to get a clean file) and re-run this script.\n",
-    );
-    succeed({
+    return {
+      ok: false,
       reason: "stale-patch-call-region-foreign",
-      targetMd5: md5(readFileSync(TARGET, "utf8")),
-      message: "撤回补丁体是旧版，但 revert() 里本补丁插入块之外还有其它语句，已保持原文件不动（避免误删）。"
-        + "重装 @getpaseo/cli 后重跑本脚本即可修复。",
-      extra: { patchBody: "stale", staleDetail: `foreign content in revert() tail: ${region.foreign}` },
-    });
-    process.stdout.write("[rewind-patch] rewind: stale-patch-call-region-foreign (file untouched)\n");
-    return null;
+      detail: `foreign content in revert() tail: ${region.foreign}`,
+      foreign: region.foreign,
+    };
   }
   return {
-    index: region.start,
-    length: region.end - region.start,
-    text: normaliseEol(reindent(CALL, CALL_BASE_INDENT, region.indent, unit), crlf),
+    ok: true,
+    edit: {
+      index: region.start,
+      length: region.end - region.start,
+      text: normaliseEol(reindent(CALL, CALL_BASE_INDENT, region.indent, unit), crlf),
+    },
   };
 }
 
@@ -1811,6 +1972,30 @@ function applyRewindPatch() {
       + '  "[plugin-provider] rewind ...: no history row carries this id" warning.\n'
       + "  See UPGRADE.md section 5 for the removal steps. Nothing was written.",
       { targetMd5: current, extra: { upstreamFixHits: upstreamFix.hits, upstreamFixSites: upstreamFix.sites } },
+    );
+  }
+
+  // ── revert() signature precondition — fail closed BEFORE writing anything ──
+  // The anchors below only prove the insertion *points* exist.  The injected CALL
+  // reads `messageId` and `scope` by name, so the host's parameter names are part
+  // of the contract too — and the anchors say nothing about them (`ANCHOR_B_RE`
+  // only spells out the bridge call body).  Without this gate, upstream renaming
+  // the first parameter still applies cleanly and then every conversation/both
+  // rewind throws `ReferenceError: messageId is not defined` inside the host,
+  // *after* the bridge has already rewound: session log reverted, timeline not
+  // refreshed.  See `locateRewindMethod()` / `revertSignature()` (LP-01).
+  if (revertSignature(source) === null) {
+    const found = describeRevertSignature(source);
+    die(
+      "revert-signature-changed",
+      "revert() no longer has the signature the injected CALL is written against:\n"
+      + "  expected: async revert(messageId, scope) {\n"
+      + `  found:    ${found}\n`
+      + "  The inserted code reads both parameter names, so applying it would make every\n"
+      + "  conversation/both rewind throw `ReferenceError: messageId is not defined` inside the\n"
+      + "  host — after the bridge has already rewound, so the timeline would not refresh.\n"
+      + "  Update CALL (and this gate) for the new parameter names, then re-run. Nothing was written.",
+      { targetMd5: current, extra: { revertSignature: found, markers } },
     );
   }
 
@@ -2610,6 +2795,11 @@ function writeCombinedStatus(results) {
       "upstreamHistoryShape",
       "hostField",
       "hostFieldMissing",
+      // The LP-01 gate's `extra.revertSignature` was written by `die()` but
+      // dropped here, so the status file could not answer "which signature did
+      // the gate see?".  Carry it (the excerpt is now the patched class's
+      // method, not the first `async revert(` in the file — see F1).
+      "revertSignature",
     ]) {
       if (extra[key] !== undefined) out[key] = extra[key];
     }
@@ -2740,16 +2930,21 @@ function main() {
  * replaces "run apply and see".
  */
 function checkBothTargets() {
-  // The same two runtime gates `applyRewindPatch()` runs before it writes
-  // anything. `--check` used to answer from marker counts alone, so on an
-  // upstream that renamed `this.timelineSnapshots` (or adopted the #7675
-  // history object) it printed "NOT patched" — i.e. "run apply to fix it" — for
-  // a file apply is guaranteed to refuse. That is the silent degradation this
-  // mode exists to expose: a check that cannot say "this will not apply".
+  // The same runtime gates `applyRewindPatch()` runs before it writes anything.
+  // `--check` used to answer from marker counts alone, so on an upstream that
+  // renamed `this.timelineSnapshots` (or adopted the #7675 history object) it
+  // printed "NOT patched" — i.e. "run apply to fix it" — for a file apply is
+  // guaranteed to refuse. That is the silent degradation this mode exists to
+  // expose: a check that cannot say "this will not apply". The `revert()`
+  // signature gate (LP-01) is the same class: a renamed parameter leaves both
+  // anchors matching, so without it this mode promises a patch apply must refuse.
   const rewindGate = (source) => {
     const historyShape = upstreamHistoryObjectShape(source);
     if (historyShape !== null) {
       return `upstream-history-shape-changed — found \`${historyShape}\`; apply will refuse (nothing was written)`;
+    }
+    if (revertSignature(source) === null) {
+      return `revert-signature-changed — revert() is not \`async revert(messageId, scope)\` (found: ${describeRevertSignature(source)}); apply will refuse (nothing was written)`;
     }
     const hostFields = hostFieldShapes(source);
     if (!hostFields.ok) {
@@ -2761,9 +2956,11 @@ function checkBothTargets() {
   /**
    * One target's verdict. `sourceGate` is only meaningful on a clean file (on a
    * patched one the injected body itself contains the shapes the gate looks for,
-   * exactly as in `applyRewindPatch()`).
+   * exactly as in `applyRewindPatch()`). `rebuildPlanner` is only meaningful for
+   * the rewind target: it answers the LP-02 residual question "would apply
+   * actually rebuild this stale body, or fail closed?".
    */
-  const checkTarget = (label, file, marker, staleness, sourceGate) => {
+  const checkTarget = (label, file, marker, staleness, sourceGate, rebuildPlanner) => {
     if (!existsSync(file)) return { label, ok: false, detail: `target missing: ${file}` };
     const source = readFileSync(file, "utf8");
     const markers = countOccurrences(source, marker);
@@ -2803,15 +3000,30 @@ function checkBothTargets() {
         detail: `${base.detail}, body NOT verified (${stale.detail}) — add a staleness check for this target`,
       };
     }
+    // Stale is not the same question as "apply can rebuild it".  The plan is the
+    // exact code apply runs, so this cannot promise a rebuild that apply will
+    // refuse (measured: stale body + a foreign statement in `revert()`'s tail =>
+    // apply exits 3 with `stale-patch-call-region-foreign`).  LP-02 residual.
+    if (rebuildPlanner !== undefined) {
+      const plan = rebuildPlanner(source);
+      if (!plan.ok) {
+        return {
+          label,
+          ok: false,
+          detail: `STALE PATCH BODY (${stale.detail}; md5 ${md5(source)}) — apply will refuse to rebuild it: `
+            + `${plan.reason} (${plan.detail}); reinstall @getpaseo/cli then re-run`,
+        };
+      }
+    }
     return {
       label,
       ok: false,
-      detail: `STALE PATCH BODY (${stale.detail}; md5 ${md5(source)}) — re-run without --check to rebuild`,
+      detail: `STALE PATCH BODY (${stale.detail}; md5 ${md5(source)}) — re-run without --check to rebuild in place`,
     };
   };
 
   const results = [
-    checkTarget("rewind", TARGET, MARKER, rewindPatchStaleness, rewindGate),
+    checkTarget("rewind", TARGET, MARKER, rewindPatchStaleness, rewindGate, planRewindRebuild),
     checkTarget("turnId", TURNID_TARGET, TURNID_MARKER, turnIdStaleness, undefined),
   ];
   for (const result of results) {
@@ -2838,11 +3050,14 @@ export {
   TURNID_MARKER,
   TURNID_TARGET,
   countOccurrences,
+  describeRevertSignature,
   detectIndentUnit,
   detectUpstreamSelfFix,
   hostFieldShapes,
   matchAll,
   md5,
+  planRewindRebuild,
+  revertSignature,
   rewindPatchStaleness,
   turnIdStaleness,
   upstreamHistoryObjectShape,

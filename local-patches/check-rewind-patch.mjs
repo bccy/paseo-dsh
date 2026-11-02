@@ -15,10 +15,10 @@
  * exit code:
  *   0  补丁在位（MARKER 计数 == 2 且实现体是最新的）→ 撤回功能正常，无需动作
  *   1  需要跑一次 apply：未打补丁但锚点各命中 1 次（可自动打），**或**标记齐全但
- *      实现体是旧版（`state: stale-body`，需重建）
- *   2  未打补丁，且锚点失配 / 文件处于半打补丁状态 / `host-fields-changed` /
- *      `upstream-history-shape-changed` → 需人工介入，撤回已降级；后两者表示
- *      apply 也会拒绝（不是“可自动打”）
+ *      实现体是旧版且**可原地重建**（`state: stale-body`）
+ *   2  需要人工介入：锚点失配 / 文件处于半打补丁状态 / `host-fields-changed` /
+ *      `upstream-history-shape-changed` / `revert-signature-changed` /
+ *      `stale-body-unrebuildable`（后四者表示 apply 也会拒绝，不是“可自动打”）
  *   3  目标文件不存在 → paseo 可能没装，或安装路径变了
  *   4  上游已自行修好撤回（revert() 里自己截断 history）→ **补丁该退休了**，
  *      按 UPGRADE.md 第 5 节删掉，别让它继续滞留并刷假告警
@@ -27,6 +27,11 @@
  *    但原因不同。**要区分请看 `state`，不要只看 exit code**：
  *    `state: patchable` vs `state: stale-body`。
  *    `--json` 里同样有 `state` 字段。
+ *
+ * ⚠️ `stale-body` 与 `stale-body-unrebuildable` 是**两个不同结论**：前者 apply 会原地
+ *    重建，后者 apply 会 fail closed（例如 revert() 尾部有本补丁块之外的语句，
+ *    `stale-patch-call-region-foreign`）。判定与 apply 共用同一个只读函数
+ *    （`planRewindRebuild`），不是按“stale 就该重跑 apply”猜的。
  *
  * ⚠️ exit code 是 rewind 与姊妹补丁（`turnId`）合并后的结论（`combinedExitCode`）：
  *    rewind 非 0 时就是 rewind 的码；rewind 健康而 `turnId` 缺失/陈旧/半打时取它的严重度。
@@ -50,9 +55,12 @@ import {
   TURNID_MARKER,
   TURNID_TARGET,
   countOccurrences,
+  describeRevertSignature,
   detectUpstreamSelfFix,
   hostFieldShapes,
   matchAll,
+  planRewindRebuild,
+  revertSignature,
   rewindPatchStaleness,
   turnIdStaleness,
   upstreamHistoryObjectShape,
@@ -83,7 +91,7 @@ const md5 = (text) => createHash("md5").update(text).digest("hex");
  * carried in `--json` so a reader cannot miss them.
  */
 function siblingTargets() {
-  const describeSibling = (label, file, marker, staleness) => {
+  const describeSibling = (label, file, marker, staleness, rebuildPlanner) => {
     if (!existsSync(file)) {
       return { label, ok: false, state: "target-missing", markerCount: null, detail: `target missing: ${file}` };
     }
@@ -103,6 +111,20 @@ function siblingTargets() {
     }
     const stale = staleness(source);
     if (!stale.current) {
+      // The sibling line must not promise "run apply to rebuild" for a body apply
+      // will refuse — same LP-02 residual as the main verdict, same plan function.
+      if (rebuildPlanner !== undefined) {
+        const plan = rebuildPlanner(source);
+        if (!plan.ok) {
+          return {
+            label,
+            ok: false,
+            state: "stale-body-unrebuildable",
+            markerCount: markers,
+            detail: `markers 2/2 but the body is old and apply cannot rebuild it (${plan.reason}) — reinstall @getpaseo/cli`,
+          };
+        }
+      }
       return {
         label,
         ok: false,
@@ -115,7 +137,7 @@ function siblingTargets() {
   };
 
   return [
-    describeSibling("rewind", TARGET, MARKER, rewindPatchStaleness),
+    describeSibling("rewind", TARGET, MARKER, rewindPatchStaleness, planRewindRebuild),
     describeSibling("turnId", TURNID_TARGET, TURNID_MARKER, turnIdStaleness),
   ];
 }
@@ -209,6 +231,31 @@ function inspect() {
         hint: "无需动作。",
       };
     }
+    // "stale" answers "is the body old"; it does **not** answer "would apply
+    // rebuild it".  LP-02 residual: for a body apply must refuse (measured: a
+    // foreign statement in `revert()`'s tail => `stale-patch-call-region-foreign`)
+    // this branch used to say `autoPatchable: true` + "run apply to rebuild", and
+    // the operator's next command exited 3 with nothing written.  The plan below
+    // is the exact read-only code apply runs, so the two cannot disagree.
+    const plan = planRewindRebuild(source);
+    if (!plan.ok) {
+      return {
+        ...base,
+        code: 2,
+        state: "stale-body-unrebuildable",
+        ok: false,
+        autoPatchable: false,
+        patchBody: "stale",
+        staleDetail: stale.detail,
+        rebuildBlockedReason: plan.reason,
+        rebuildBlockedDetail: plan.detail,
+        summary: `补丁标记齐全，但实现体是旧版且 apply 无法原地重建（${plan.reason}：${plan.detail}）。`
+          + "文件会保持原样（不会误删 revert() 里的其它语句），但旧体的已知缺陷仍在："
+          + '同一会话里的第二次撤回会报 "No provider revert token for message …"。',
+        hint: "重装 @getpaseo/cli（恢复干净文件）后重跑 apply。"
+          + "不要只跑 apply —— 它会 fail closed，什么都不写。",
+      };
+    }
     return {
       ...base,
       code: 1,
@@ -219,9 +266,7 @@ function inspect() {
       staleDetail: stale.detail,
       summary: `补丁标记齐全但实现体是旧版（${stale.detail}）。撤回仍能用，但同一会话里的第二次撤回会报 `
         + '"No provider revert token for message …"。',
-      hint: `跑 node ${APPLY_SCRIPT} 重建（会从最新的干净备份重打）。`
-        + "若它报 stale-patch-no-baseline，说明 ~/.paseo/local-patches/ 下的 plugin-provider.js.orig-* 已被清理，"
-        + "重装 @getpaseo/cli 后重跑即可。",
+      hint: `跑 node ${APPLY_SCRIPT} 原地重建（不需要干净基线：只替换本补丁自己的方法体与 CALL，其它内容不动）。`,
     };
   }
 
@@ -256,6 +301,28 @@ function inspect() {
       hint: "按 UPGRADE.md 第 5 节「什么时候可以彻底删掉补丁」执行。"
         + "注意：此检测只覆盖「在 revert() 里截断 history」这一种修法；"
         + "若上游改成发新事件类型或改 streamHistory()，本项检测不到（会退回正常打补丁）。",
+    };
+  }
+
+  // The `revert()` signature is part of the contract too (LP-01): the injected
+  // CALL reads `messageId` and `scope` by name.  Both anchors can still match
+  // after a rename (`ANCHOR_B_RE` only spells out the call body), so without this
+  // branch the checker says "patchable" for a file apply must refuse — and if
+  // apply did write it, every rewind would throw ReferenceError inside the host.
+  if (revertSignature(source) === null) {
+    return {
+      ...base,
+      code: 2,
+      state: "revert-signature-changed",
+      ok: false,
+      autoPatchable: false,
+      revertSignatureFound: describeRevertSignature(source),
+      summary: `补丁不在位，但 revert() 的签名已不是注入 CALL 依赖的形状：`
+        + `期望 \`async revert(messageId, scope)\`，实际 ${describeRevertSignature(source)}。`
+        + "CALL 按名字读这两个参数，apply 会以 revert-signature-changed 拒绝；"
+        + "强行打上会让每次 conversation/both 撤回在宿主里抛 "
+        + "`ReferenceError: messageId is not defined`（桥已撤回、时间线不刷新）。",
+      hint: "按上游新参数名改写 CALL 与 revertSignature() 门禁后再跑 apply；不要直接跑 apply，它不会写文件。",
     };
   }
 
@@ -385,7 +452,8 @@ const result = { ...inspect(), siblings: siblingTargets() };
  *      unchanged — it is an instruction, not a failure.
  *   2. otherwise a broken sibling contributes its own severity, mapped onto the
  *      same scale: not-patched / stale-body => 1 (apply fixes it),
- *      half-patched => 2 (needs a human), target-missing => 3.
+ *      stale-body-unrebuildable / half-patched => 2 (needs a human),
+ *      target-missing => 3.
  *   3. all healthy => 0.
  *
  * `code` in `--json` stays rewind's verdict; the combined answer is
@@ -394,7 +462,15 @@ const result = { ...inspect(), siblings: siblingTargets() };
  */
 function combinedExitCode(rewindCode, siblings) {
   if (rewindCode !== 0) return rewindCode;
-  const severity = { "not-patched": 1, "stale-body": 1, "half-patched": 2, "target-missing": 3 };
+  const severity = {
+    "not-patched": 1,
+    "stale-body": 1,
+    // A stale body apply cannot rebuild needs a reinstall, not another apply run:
+    // same severity as half-patched (human action), not 1 ("apply will fix it").
+    "stale-body-unrebuildable": 2,
+    "half-patched": 2,
+    "target-missing": 3,
+  };
   let worst = 0;
   for (const sibling of siblings) {
     if (sibling.ok) continue;
@@ -425,6 +501,11 @@ if (JSON_OUTPUT) {
     upstreamHistoryShape: result.upstreamHistoryShape ?? null,
     hostField: result.hostField ?? null,
     hostFieldMissing: result.hostFieldMissing ?? null,
+    // LP-01 / LP-02 residual: name the shape that blocked the patch, so a
+    // machine consumer can tell "apply will refuse" from "apply will rebuild".
+    revertSignatureFound: result.revertSignatureFound ?? null,
+    rebuildBlockedReason: result.rebuildBlockedReason ?? null,
+    rebuildBlockedDetail: result.rebuildBlockedDetail ?? null,
     summary: result.summary,
     hint: result.hint,
     applyScript: APPLY_SCRIPT,
