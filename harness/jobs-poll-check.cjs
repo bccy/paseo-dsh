@@ -40,7 +40,6 @@ const {
   isTerminalJobsErrorCode,
   createJobsPoller,
   LIVE_POLL_MS,
-  HIDDEN_POLL_MS,
   MAX_POLL_MS,
   INITIAL_POLL_JITTER_MS,
   MAX_POLL_JITTER_MS,
@@ -303,67 +302,82 @@ console.log("\npopover groups (live rows vs the foldable finished section)");
 
 /* ---------------------------------------------------------------------------- */
 
-// CJ-01: the pill is visible while the session still has any job, not only while
-// one is running. The old rule counted live rows and hid the pill the moment the
-// last job settled, which made the popover's finished section unreachable — the
-// exact path this asserts against.
-console.log("\nthe pill's presentation (finished history stays reachable)");
+// CJ-01, route 2: the pill is a **live indicator**. A session with no running /
+// stopping job hides it, however much settled history the registry retains; the
+// label is the live count, never an idle total. The static mark is reserved for
+// the one state baseline 2f71225 kept visible with it: an unreadable registry.
+console.log("\nthe pill's presentation (live-only, ring-only)");
 {
   const settledOnly = jobsPillPresentation({
     available: true,
     jobs: [{ status: "completed" }, { status: "failed" }],
   });
-  check("a session with only settled jobs keeps the pill visible", settledOnly.visible, true);
-  check("a settled pill does not spin", settledOnly.spinning, false);
-  equal("a settled pill counts the total", settledOnly.label, { kind: "idle", count: 2 });
+  check("a session with no live job hides the pill", settledOnly.visible, false);
+  check("a hidden idle pill keeps the turning ring, not the static mark", settledOnly.icon, "spinner");
+  equal("a hidden idle pill has the neutral title", settledOnly.label, { kind: "title" });
 
   const liveAndSettled = jobsPillPresentation({
     available: true,
     jobs: [{ status: "running" }, { status: "completed" }, { status: "stopping" }],
   });
   check("a live job keeps the pill visible", liveAndSettled.visible, true);
-  check("a live pill spins", liveAndSettled.spinning, true);
+  check("a live pill carries the turning ring", liveAndSettled.icon, "spinner");
   equal("a live pill counts only the live rows", liveAndSettled.label, { kind: "live", count: 2 });
 
   const empty = jobsPillPresentation({ available: true, jobs: [] });
   check("a genuinely empty session hides the pill", empty.visible, false);
+  check("an empty session keeps the ring in the icon slot", empty.icon, "spinner");
   equal("an empty session has the neutral title", empty.label, { kind: "title" });
 
   const unreadable = jobsPillPresentation({ available: false, jobs: [] });
   check("an unreadable registry stays visible", unreadable.visible, true);
+  // Baseline 2f71225 draws the static mark for `available: false`; that one
+  // exception is kept. A turning ring there would claim progress that is not
+  // happening, so the baseline mark is the correct one.
+  check("an unreadable registry keeps the baseline static mark", unreadable.icon, "static");
   equal("an unreadable registry has the neutral title", unreadable.label, { kind: "title" });
 
-  // The old rule, as an oracle: it must disagree on the settled-only answer or
-  // this block would pass for the wrong reason.
-  const oldVisible = (jobs) =>
-    jobs.filter((job) => job.status === "running" || job.status === "stopping").length > 0;
-  check(
-    "OLD: counting only live jobs hides the finished history",
-    oldVisible([{ status: "completed" }]),
-    false,
+  // The invariant in one place: no readable answer — live or idle, visible or
+  // hidden — may select the static mark. Route 1 made the settled-only pill
+  // visible *and* static; this catches that regression at the rule.
+  assert(
+    "no readable answer uses the static mark",
+    [settledOnly, liveAndSettled, empty].every((presentation) => presentation.icon === "spinner"),
+  );
+  assert(
+    "no answer keeps an idle label kind",
+    [settledOnly, liveAndSettled, empty].every((presentation) => presentation.label.kind !== "idle"),
+  );
+
+  // The old route-1 rule, as an oracle: it kept the settled-only pill visible,
+  // which is exactly the regression this block exists to catch.
+  const oldVisible = (jobs) => jobs.length > 0;
+  assert(
+    "OLD: history-visible keeps a settled-only pill visible, unlike route 2",
+    oldVisible([{ status: "completed" }]) !== settledOnly.visible,
   );
 }
 
 // CJ-02: one timer per agent must not become one burst per four seconds. The
-// policy is a pure function of the last answer, so both the base intervals and
-// the backoff are assertable without a clock; the controller tests below drive
-// the real timers.
-console.log("\npolling intervals (hidden backoff, failure backoff, jitter)");
+// policy is a pure function of the failure count, so the base interval, the
+// backoff and the jitter are assertable without a clock; the controller tests
+// below drive the real timers. Live-only visibility makes the pill hidden most
+// of the time, so the hidden interval must equal the visible one: the old 15 s
+// hidden probe would make a new job appear up to four times slower than the
+// baseline's 4 s.
+console.log("\npolling intervals (one base rate, failure backoff, jitter)");
 {
-  check("a visible pill polls at the base interval", nextPollDelayMs({ visible: true, failures: 0 }, () => 0), LIVE_POLL_MS);
-  check("a hidden pill does not run at full speed", nextPollDelayMs({ visible: false, failures: 0 }, () => 0), HIDDEN_POLL_MS);
-  assert("the hidden interval is materially slower", HIDDEN_POLL_MS >= LIVE_POLL_MS * 2, `${HIDDEN_POLL_MS} vs ${LIVE_POLL_MS}`);
-  check("the first failed read doubles the base", nextPollDelayMs({ visible: true, failures: 1 }, () => 0), LIVE_POLL_MS * 2);
-  check("the second failed read doubles again", nextPollDelayMs({ visible: true, failures: 2 }, () => 0), LIVE_POLL_MS * 4);
-  check("failure backoff is capped", nextPollDelayMs({ visible: true, failures: 8 }, () => 0), MAX_POLL_MS);
+  check("a readable answer polls at the base interval", nextPollDelayMs(0, () => 0), LIVE_POLL_MS);
+  check("the first failed read doubles the base", nextPollDelayMs(1, () => 0), LIVE_POLL_MS * 2);
+  check("the second failed read doubles again", nextPollDelayMs(2, () => 0), LIVE_POLL_MS * 4);
+  check("failure backoff is capped", nextPollDelayMs(8, () => 0), MAX_POLL_MS);
 
-  const jittered = nextPollDelayMs({ visible: true, failures: 0 }, () => 0.99);
+  const jittered = nextPollDelayMs(0, () => 0.99);
   assert("jitter is added, never subtracted", jittered > LIVE_POLL_MS, String(jittered));
   assert("jitter is capped", jittered <= LIVE_POLL_MS + MAX_POLL_JITTER_MS, String(jittered));
   assert(
     "two agents with different random draws do not share an interval",
-    nextPollDelayMs({ visible: true, failures: 0 }, () => 0.1) !==
-      nextPollDelayMs({ visible: true, failures: 0 }, () => 0.9),
+    nextPollDelayMs(0, () => 0.1) !== nextPollDelayMs(0, () => 0.9),
   );
 
   const firstInitial = initialPollDelayMs(() => 0);
@@ -587,9 +601,10 @@ async function runControllerChecks() {
     harness.poller.dispose();
   }
 
-  // CJ-02 (behaviour): the controller's own timers. A settled answer keeps the
-  // pill visible and polls at 4 s; once the session is empty the next interval
-  // backs off; failures grow 8 s → 16 s → the cap.
+  // CJ-02 (behaviour): the controller's own timers. Every readable answer polls
+  // at the base interval — a settled-only answer now hides the pill, but hidden
+  // is the normal state under live-only visibility, so it must not slow down to
+  // the old 15 s probe. Failures grow 8 s → 16 s → the cap.
   console.log("\npoll controller cadence");
   {
     let answer = { available: true, jobs: [{ status: "completed" }] };
@@ -608,12 +623,12 @@ async function runControllerChecks() {
     await harness.clock.advance(0);
     equal("the first readable answer publishes", harness.calls.states.length, 1);
     check("the settled answer keeps the pill's state available", harness.calls.states[0][1].available, true);
-    equal("a visible pill schedules the base interval", harness.clock.pendingDelays(), [LIVE_POLL_MS]);
+    equal("a settled (hidden) pill still polls at the base interval", harness.clock.pendingDelays(), [LIVE_POLL_MS]);
 
     answer = { available: true, jobs: [] };
     await harness.clock.advance(LIVE_POLL_MS);
     equal("the empty answer publishes", harness.calls.states.length, 2);
-    equal("a hidden pill backs off", harness.clock.pendingDelays(), [HIDDEN_POLL_MS]);
+    equal("an empty pill keeps the base interval, not a slow hidden one", harness.clock.pendingDelays(), [LIVE_POLL_MS]);
     harness.poller.dispose();
   }
   {

@@ -23,7 +23,7 @@ DSH 侧是一个 profile bundle。
 | 权限模式（沙箱） | ❌ 无统一开关 | ✅ composer 里的 **Permissions** 下拉，切换 DSH 的沙箱 + 审批预设 |
 | 人设预设（Preset） | ❌ | ✅ profile 挂了 agent-preset registry 时，composer 出现 **Preset** 下拉（建会话时选、首回合后锁定） |
 | 会话恢复 / 导入 | ❌ 无历史、无法导入 | ✅ 重开按 Paseo 的 `history: replay` 回放历史；**导入** DSH 原生会话（`session.list`，从 `~/.dsh/sessions` 列举） |
-| 后台任务（jobs） | — | ✅ composer 的 pill 显示 DSH 后台任务：有 live 时显示运行中数量，空闲时显示已完成总数，点开看每个任务的明细 |
+| 后台任务（jobs） | — | ✅ composer 的 pill 显示 DSH 后台任务：只在有运行中/停止中的任务时显示运行数量，全部结束即隐藏；点开看每个任务的明细 |
 | 目标 / 工作流时间线 | — | ✅ `goal/change` 与 `tool-workflow/*` 事件按工具行渲染；后台工作流跨回合仍显示运行中 |
 | 工具审批卡 | — | ✅ DSH 的 `approval/request` 转成 Paseo 审批卡（允许一次 / 拒绝） |
 | 会话级系统提示 | — | ✅ 每个会话可带独立的 system prompt（profile 需挂 `systemPrompt` 服务） |

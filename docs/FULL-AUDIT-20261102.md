@@ -230,7 +230,7 @@ replay-fidelity 选中的真实日志无撤回标记；手工编译组共用一�
    BR-03/BR-04/BR-05、BM-01/BM-02/BM-03。
 4. **修交付假绿**：D1（doctor 用解析后对象）、D2（401/402/403 不产生能力结论）、
    T01–T04（把假绿判据改成会红的反例）。
-5. **jobs 四个 P2**：可见性规则（先定产品语义：历史可见 or 纯 live）、轮询退避/聚合、分页、终态码。
+5. **jobs 四个 P2**：可见性规则（已定产品语义：仅 live 可见，见 §10.1 p6-jobs）、轮询退避/聚合、分页、终态码。
 6. **文档口径**：版本/进程模型/图片三处 P2 漂移；CI 补 push/PR 离线门。
 7. 每条修复都按上轮做法：先固化为「修复前失败、修复后通过」的回归，再动代码。
 
@@ -258,7 +258,7 @@ replay-fidelity 选中的真实日志无撤回标记；手工编译组共用一�
 | p4-plugin-session | S02 / S-07 / PP-01、S03、S04 / S-04、S05、S06、S07、S-02 |
 | p5a-plugin-process | PP-01、PP-02、HC-01 |
 | p5b-plugin-provider | PP-03、HC-02 / PP-07、HC-03、PP-05 |
-| p6-jobs | CJ-01（按已定路线 1：历史可见）、CJ-02、CJ-03、CJ-04 |
+| p6-jobs | CJ-01（按用户既定语义走路线 2：仅 live 可见、图标恒为转环、只保留 liveLabel）、CJ-02、CJ-03、CJ-04 |
 | p7-client | C1、C2、CT-02 |
 | p8-delivery | D1、D2 / DLV-02、L1、LP-02、DLV-12 |
 | p9-harness | T01、T02、T03、T04、HP-08、H-01；附加项 HP-05（真实脚本默认一次性 DSH_HOME） |

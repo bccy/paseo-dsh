@@ -468,20 +468,27 @@ assert("the live rows are drawn outside the fold", /\{live\.map\(\(job\) =>/.tes
 assert("no dead fallback for an unreachable empty split",
   !/live\.length === 0 && settled\.length === 0/.test(pillSource));
 
-// CJ-01: the pill is visible for any job, and the copy has two counts. The rule
-// itself is a pure function asserted in `jobs-poll-check.cjs`; these are the
-// wires that make it reach the composer instead of a live-only count computed in
-// the JSX. The old shape — `visible = next.available ? count > 0 : true` with
-// `count` = live rows — is asserted absent: it hid a settled-only session, which
-// is exactly why a default-expanded section could never be opened.
+// CJ-01 (route 2): the pill is a live indicator. Visibility, icon mark and label
+// key come from the pure rule in `jobs-polling.ts`; this block pins the wiring
+// that makes them reach the composer. The history-visible route — an idle total
+// in `idleLabel`, a visible settled-only pill with a static mark — is asserted
+// absent. `jobs-poll-check.cjs` asserts the rule's behaviour.
 assert("the pill's presentation comes from the shared rule",
   /const\s+presentation\s*=\s*jobsPillPresentation\(next\)/.test(pillSource));
 assert("visibility is reported from that rule", /visible:\s*presentation\.visible/.test(pillSource));
 assert("the live count uses the live label",
   /text\.liveLabel\(\s*presentation\.label\.count\s*\)/.test(pillSource));
-assert("the idle total uses the idle label",
-  /text\.idleLabel\(\s*presentation\.label\.count\s*\)/.test(pillSource));
-assert("the old live-only visibility rule is gone",
+assert("the idle label is gone", !/idleLabel/.test(pillSource));
+assert("the old idle-total branch is gone",
+  !/presentation\.label\.kind\s*===\s*"idle"/.test(pillSource));
+// The static mark exists only as the baseline branch for an unreadable registry:
+// one occurrence in the source, selected by the explicit `presentation.icon`
+// ternary. `jobs-poll-check.cjs` proves no readable answer selects it.
+assert("the static mark is the explicit baseline branch",
+  /presentation\.icon\s*===\s*"spinner"\s*\?\s*JobsSpinner\s*:\s*"ListChecks"/.test(pillSource));
+assert("ListChecks appears exactly once in the pill source",
+  (pillSource.match(/ListChecks/g) ?? []).length === 1);
+assert("the old live-only rule is not reimplemented in the JSX",
   !/next\.available\s*\?\s*count\s*>\s*0/.test(pillSource));
 assert("the old live-only counter is gone", !/liveCount\(next\.jobs\)/.test(pillSource));
 // Polling policy moved out of the JSX module, so the interval constants and the

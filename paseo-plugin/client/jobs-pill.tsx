@@ -31,7 +31,7 @@ import { Icon } from "@getpaseo/plugin/client/ui";
 import { useEffect, useState } from "react";
 import { Platform, Pressable, Text, View, type PressableStateCallbackType } from "react-native";
 import { jobsList, splitJobs, type Job } from "../shared/jobs";
-import { createJobsPoller, jobsPillPresentation, type JobsViewState } from "./jobs-polling";
+import { createJobsPoller, jobsPillPresentation, type JobsViewState, type PillIcon } from "./jobs-polling";
 import {
   CHEVRON_BOX,
   FACTS_FONT_SIZE,
@@ -71,7 +71,7 @@ type JobStore = Map<string, AgentJobs>;
 interface PillEntry {
   readonly registration: PluginButtonRegistration;
   /**
-   * Whether the last `update` left the spinner in the icon slot.
+   * The mark the last `update` left in the icon slot.
    *
    * `update()` merges, so re-sending `icon` on every poll would replace the
    * `JobsSpinner` component with an equal-but-new element on each tick. React
@@ -81,7 +81,7 @@ interface PillEntry {
    * Tracking the state here is what makes the icon part of `update` **only** when it
    * actually changes, which is the one thing that guarantees the ring never stutters.
    */
-  spinning: boolean;
+  icon: PillIcon;
 }
 
 function publish(store: JobStore, agentId: string, next: Omit<AgentJobs, "listeners">): void {
@@ -355,12 +355,9 @@ function SettledHeader({
  * before reaching the one row that is still running. `splitJobs` divides them,
  * and while anything is live the finished half collapses to a single header.
  * This mirrors DSH's own job list (`settledExpanded = settledOpen ?? liveRows.length === 0`);
- * it is not a local invention. With nothing running there is no reason to hide
- * history, so the section starts open — and the pill stays visible on that
- * retained history (`jobsPillPresentation`), which is what makes this branch
- * reachable at all. Counting only live rows hid the pill the moment the last job
- * settled, so the finished section could only be opened while some *other* job
- * was still running.
+ * it is not a local invention. The pill itself is a live indicator, so the
+ * finished half is a fold inside a live session; the `live.length === 0` default
+ * only resolves the section open while the last job's answer is being applied.
  *
  * **Why the root has a negative margin.** A plugin popover body is wrapped in
  * `PluginPopoverContent` (12pt on every side) while a host track panel's rows go
@@ -420,12 +417,11 @@ function makeJobsPopover(store: JobStore, agentId: string) {
       );
     }
 
-    // A transient guard rather than the idle path. With history visible the pill
-    // stays up for as long as the session has any job, so an idle session renders
-    // the finished section below instead of this line; the popover only lands
-    // here while it is still mounted and its store row is missing — before the
-    // first poll, or when a terminal read is about to hide the pill. The body
-    // must render something rather than throw.
+    // The transient guard for a popover whose store row is missing or empty:
+    // before the first poll lands, or while a terminal read is about to hide the
+    // pill. The pill hides as soon as nothing is live, so this is not an idle
+    // "session with history" path; the body must render something rather than
+    // throw.
     if (entry === undefined || entry.jobs.length === 0) {
       return (
         <View style={root}>
@@ -536,19 +532,15 @@ export function contributeJobsPill(client: PluginClientContext) {
     });
     const presentation = jobsPillPresentation(next);
     const text = localeText().jobs;
-    const label =
-      presentation.label.kind === "live"
-        ? text.liveLabel(presentation.label.count)
-        : presentation.label.kind === "idle"
-          ? text.idleLabel(presentation.label.count)
-          : text.title;
-    // `update()` merges, so the icon is sent only when the boolean flips — see
-    // `PillEntry.spinning`.
-    const iconPatch =
-      presentation.spinning === entry.spinning
-        ? {}
-        : { icon: presentation.spinning ? JobsSpinner : "ListChecks" };
-    entry.spinning = presentation.spinning;
+    // The only count phrase is the live one; anything else is the neutral title.
+    // There is no idle total: the pill hides when nothing is live.
+    const label = presentation.label.kind === "live" ? text.liveLabel(presentation.label.count) : text.title;
+    // `update()` merges, so the icon is sent only when the mark changes — see
+    // `PillEntry.icon`. Every readable answer selects the turning ring; the
+    // static mark is the baseline 2f71225 branch for an unreadable registry.
+    const icon = presentation.icon === "spinner" ? JobsSpinner : "ListChecks";
+    const iconPatch = presentation.icon === entry.icon ? {} : { icon };
+    entry.icon = presentation.icon;
     /**
      * `title` is the neutral noun, **never the count**: on compact the popover is
      * a sheet and the sheet's header is drawn from the button's title, so a title
@@ -587,7 +579,7 @@ export function contributeJobsPill(client: PluginClientContext) {
           behavior: { kind: "popover", Content: makeJobsPopover(store, agent.id) },
         },
       });
-      pills.set(agent.id, { registration, spinning: true });
+      pills.set(agent.id, { registration, icon: "spinner" });
       store.delete(agent.id);
     },
     removeAgent: (agentId, reason, error) => {

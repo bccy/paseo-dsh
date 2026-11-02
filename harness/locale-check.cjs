@@ -209,42 +209,31 @@ console.log("the jobs pill's copy is covered in both languages");
   // Every key the interface declares must be present in both, and the two key
   // sets must match — a key added to one language only is the drift this catches.
   equal("jobs keys match", Object.keys(en).sort(), Object.keys(zh).sort());
-  for (const key of ["liveLabel", "idleLabel", "title", "statuses", "allSettled", "settledLabel", "unavailable"]) {
+  for (const key of ["liveLabel", "title", "statuses", "allSettled", "settledLabel", "unavailable"]) {
     check(`jobs.${key} exists in both languages`, en[key] !== undefined && zh[key] !== undefined);
   }
-
-  // The two count labels are the only functions left: `liveLabel` is the pill
-  // while jobs run, `idleLabel` is the total once they all settle (the route-1
-  // fix for CJ-01, matching DSH's `count.live.*` / `count.idle.*`). A function
-  // returning "" would render an empty pill, so both are called in both
-  // languages. The folded section's header is a plain string — the count sits in
-  // the row's trailing muted slot rather than in the sentence, which is how the
-  // host's own rows put a number next to a label.
+  // CJ-01 route 2: the pill is a live indicator and `liveLabel` is its only
+  // count phrase. A stale `idleLabel` is exactly the second count shape the
+  // history-visible regression added, so its absence is asserted per language.
+  check("jobs has no idleLabel (en)", !("idleLabel" in en));
+  check("jobs has no idleLabel (zh-CN)", !("idleLabel" in zh));
+  // The count's wording is product copy: "N background" / "N 个后台", no noun.
+  // Asserted verbatim, including the singular, because a pluralised "jobs" or a
+  // restored "任务" would silently drift from the agreed label.
+  check("jobs.liveLabel(1) is `1 background` (en)", en.liveLabel(1) === "1 background", JSON.stringify(en.liveLabel(1)));
+  check("jobs.liveLabel(2) is `2 background` (en)", en.liveLabel(2) === "2 background", JSON.stringify(en.liveLabel(2)));
+  check("jobs.liveLabel(1) is `1 个后台` (zh-CN)", zh.liveLabel(1) === "1 个后台", JSON.stringify(zh.liveLabel(1)));
+  check("jobs.liveLabel(2) is `2 个后台` (zh-CN)", zh.liveLabel(2) === "2 个后台", JSON.stringify(zh.liveLabel(2)));
+  // A function returning "" would render an empty pill; call it in both languages.
   for (const locale of LOCALES) {
     const table = allText()[locale].jobs;
     const live = table.liveLabel(2);
-    const idle = table.idleLabel(2);
     check(
       `jobs.liveLabel(2) is a non-empty string in ${locale}`,
       typeof live === "string" && live.trim() !== "",
       JSON.stringify(live),
     );
-    check(
-      `jobs.idleLabel(1) is a non-empty string in ${locale}`,
-      typeof table.idleLabel(1) === "string" && table.idleLabel(1).trim() !== "",
-      JSON.stringify(table.idleLabel(1)),
-    );
-    check(
-      `jobs.idleLabel(2) is a non-empty string in ${locale}`,
-      typeof idle === "string" && idle.trim() !== "",
-      JSON.stringify(idle),
-    );
   }
-  // The two count labels must say different things: a `liveLabel` copied into
-  // `idleLabel` would lose exactly the "there is history but nothing running"
-  // distinction the route-1 visibility change exists to expose.
-  check("the live and idle counts are not the same sentence (en)", en.liveLabel(2) !== en.idleLabel(2));
-  check("the live and idle counts are not the same sentence (zh-CN)", zh.liveLabel(2) !== zh.idleLabel(2));
   for (const locale of LOCALES) {
     const table = allText()[locale].jobs;
     check(

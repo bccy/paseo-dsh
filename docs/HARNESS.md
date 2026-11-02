@@ -57,10 +57,11 @@
   `LANG`/`LC_ALL` 的优先级）和标签表覆盖：每个工具名在**两种语言**下都要有值，英文列是
   中文列的复制也要抓出来。**动了 `client/locale.ts` 或标签表必跑。**
 - `harness/jobs-poll-check.cjs` — jobs 轮询状态机（从 JSX 抽到 `client/jobs-polling.ts`，假时钟 +
-  假 RPC + 假目录页，不 import React/host）：可见性（有 live 显示 live 数、仅 settled 显示总数、
-  0 job 隐藏）、三个间隔（可见 4s / 隐藏 15s / 失败指数退避 8→16→30s）与抖动、首屏 `pageInfo`
-  分页与过期页丢弃、终态错误码停轮询。**动了 `client/jobs-pill.tsx` / `client/jobs-polling.ts` /
-  `client/locale.ts` 的 jobs 表 / `shared/jobs.ts` 必跑；`jobs-poll.tsconfig.json` 是它的编译配置。**
+  假 RPC + 假目录页，不 import React/host）：可见性（有 live 显示 live 数、无 live 隐藏；图标恒为
+  转环，仅 `available:false` 保留基线静态 mark）、间隔（可见/隐藏同为 4s、失败指数退避
+  8→16→30s）与抖动、首屏 `pageInfo` 分页与过期页丢弃、终态错误码停轮询。**动了
+  `client/jobs-pill.tsx` / `client/jobs-polling.ts` / `client/locale.ts` 的 jobs 表 /
+  `shared/jobs.ts` 必跑；`jobs-poll.tsconfig.json` 是它的编译配置。**
 - `harness/jobs-popover-check.cjs` — jobs popover 的几何、状态标记、JSX 接线与宿主主题数据；
   `HOST_APP` 指 Paseo checkout，没有就会跑完但 exit 2。**同上触发条件必跑（需 `HOST_APP`），
   跑法见文件头注释。**

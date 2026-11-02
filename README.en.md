@@ -26,7 +26,7 @@ below.
 | Permission modes (sandbox) | ❌ no shared switch | ✅ **Permissions** dropdown in the composer switches DSH's sandbox and approval presets |
 | Agent presets | ❌ | ✅ when the profile mounts the agent-preset registry, a **Preset** dropdown appears (chosen at session creation, locked after the first turn) |
 | Session resume / import | ❌ no history, no import | ✅ reopening replays history through Paseo's `history: replay`; **import** native DSH sessions (`session.list`, read from `~/.dsh/sessions`) |
-| Background jobs | — | ✅ a composer pill shows DSH background jobs: live count while running, total when idle, expandable to each job |
+| Background jobs | — | ✅ a composer pill shows DSH background jobs only while some are running/stopping: it shows the live count and hides once every job has finished; expandable to each job |
 | Goal / workflow timeline | — | ✅ `goal/change` and `tool-workflow/*` events render as tool rows; a background workflow keeps its running state across turns |
 | Tool approval cards | — | ✅ DSH's `approval/request` becomes a Paseo approval card (allow once / reject) |
 | Session-level system prompt | — | ✅ each session may carry its own system prompt (the profile must mount the `systemPrompt` service) |

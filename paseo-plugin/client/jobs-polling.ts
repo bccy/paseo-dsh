@@ -11,16 +11,19 @@
  * **Three policies live here, one reason each.**
  *
  * - {@link jobsPillPresentation}: when the pill is visible, what it counts, and
- *   whether the icon spins. It mirrors DSH's own job list — any job (live or
- *   settled) makes the trigger visible, a live job makes it count live rows,
- *   and an idle trigger counts the retained history (`count.idle.*` in
- *   `dsh-client-ui-jobs/lib/client.js`). Counting only live rows made the
- *   finished section unreachable: the last job settling hid the pill, so the
- *   group the popover draws history into could never be opened.
- * - {@link nextPollDelayMs}: one timer per agent is also one RPC per agent, so
- *   the interval follows what the answer is worth. A hidden pill polls slowly,
- *   a visible one at the base rate, and a failing read backs off so a broken
- *   runtime is not asked the same question every four seconds forever.
+ *   which mark sits in its icon slot. By the product rule (route 2 of CJ-01) it
+ *   is a **live indicator**: a running or stopping job makes the trigger
+ *   visible and counts live rows; the moment the last job settles the pill
+ *   hides. The registry keeps settled history for the popover, but the pill
+ *   itself never advertises an idle total. The icon is the turning ring for
+ *   every readable answer; the static mark is reserved for `available: false`,
+ *   matching baseline 2f71225.
+ * - {@link nextPollDelayMs}: one timer per agent is also one RPC per agent. A
+ *   readable answer polls at the base rate whether the pill is visible or
+ *   hidden — under live-only visibility, hidden is the normal state, so a
+ *   slower hidden probe would delay the next job's appearance by up to the old
+ *   hidden interval. A failing read backs off so a broken runtime is not asked
+ *   the same question every four seconds forever.
  * - {@link isTerminalJobsErrorCode}: a bridge that predates `paseo/jobs` will
  *   not grow the method while the process lives. Retrying is not a slow path to
  *   success, it is a permanent error pill; the codes come from the shared
@@ -41,18 +44,12 @@ import { isPermissionDeniedError } from "./jobs-popover-layout";
 import { createPollSequence } from "./poll-sequence";
 
 /**
- * Base interval while the pill is visible: fast enough that a job the user just
- * started appears on it, slow enough that a screen full of agents is not a
- * steady stream of IPC.
+ * Base interval for any readable answer, visible or hidden. The pill is hidden
+ * whenever no job is live, which is its normal state, so the hidden probe must
+ * stay at the same rate: the old fifteen-second hidden interval delayed a new
+ * job's appearance by up to four times the baseline's four seconds.
  */
 export const LIVE_POLL_MS = 4000;
-
-/**
- * Interval while the pill is hidden (no job at all). The pill has nothing to
- * show, so a slower probe is enough to notice the next job; fifteen seconds is
- * the low end of the range the 2026-10-31 audit suggested for `count === 0`.
- */
-export const HIDDEN_POLL_MS = 15_000;
 
 /** Ceiling for the exponential backoff after consecutive failed reads. */
 export const MAX_POLL_MS = 30_000;
@@ -112,39 +109,44 @@ export interface JobsAgentPage {
  */
 export type PillLabel =
   | { readonly kind: "title" }
-  | { readonly kind: "live"; readonly count: number }
-  | { readonly kind: "idle"; readonly count: number };
+  | { readonly kind: "live"; readonly count: number };
 
-/** The pill's visibility, icon state and label key for one answer. */
+/** The mark the pill's icon slot carries for one answer. */
+export type PillIcon = "spinner" | "static";
+
+/** The pill's visibility, icon mark and label key for one answer. */
 export interface PillPresentation {
   visible: boolean;
-  spinning: boolean;
+  icon: PillIcon;
   label: PillLabel;
 }
 
 /**
- * When the pill is visible and what it counts.
+ * When the pill is visible, what it counts, and which mark its icon carries.
  *
- * `available: false` keeps the pill visible: an unreadable registry is not
- * "nothing running", and a pill that silently disappears when the runtime is
- * broken is the failure this repo keeps finding. With a readable answer the
- * pill appears for **any** job — the finished ones included, which is what
- * makes the popover's finished section reachable after the last job settles.
+ * **The pill is a live indicator.** A running or stopping job makes it visible
+ * and the label counts those live rows. With no live job it is hidden, however
+ * many settled rows the registry still remembers — the finished history belongs
+ * to the popover, not to the composer's trigger. This is the product rule the
+ * user set for this surface; it is route 2 of CJ-01.
  *
- * The spinner means work is happening, so only live rows turn it; an idle pill
- * carries the static mark. The label still says the total, matching DSH's
- * `count.idle.*` phrases.
+ * **The icon is the turning ring on every readable answer**, visible or hidden.
+ * Tracking one constant for the whole readable half means `update()` never
+ * swaps a static mark into the slot; the ring is this UI's word for a job
+ * surface, and a static icon here would read as "nothing works". The one
+ * exception is `available: false`: the pill stays visible so the popover can
+ * explain the broken registry, and it keeps baseline 2f71225's static mark
+ * because a turning ring would claim progress that is not happening.
  */
 export function jobsPillPresentation(answer: {
   available: boolean;
   jobs?: readonly JobLike[];
 }): PillPresentation {
   const jobs = answer.jobs ?? [];
-  if (!answer.available) return { visible: true, spinning: false, label: { kind: "title" } };
+  if (!answer.available) return { visible: true, icon: "static", label: { kind: "title" } };
   const live = jobs.filter((job) => isLive(job.status)).length;
-  if (live > 0) return { visible: true, spinning: true, label: { kind: "live", count: live } };
-  if (jobs.length === 0) return { visible: false, spinning: false, label: { kind: "title" } };
-  return { visible: true, spinning: false, label: { kind: "idle", count: jobs.length } };
+  if (live > 0) return { visible: true, icon: "spinner", label: { kind: "live", count: live } };
+  return { visible: false, icon: "spinner", label: { kind: "title" } };
 }
 
 /**
@@ -161,24 +163,18 @@ function isLive(status: string): boolean {
 /**
  * How long to wait before the next poll.
  *
- * Failures back off exponentially from the base rate (4 s → 8 s → 16 s → 30 s)
- * and reset on the next readable answer. A visible pill polls at the base rate;
- * a hidden one at {@link HIDDEN_POLL_MS}. The jitter is added, never subtracted,
- * so the jittered interval is still at least the policy's floor — the point is
- * de-synchronisation, not a faster loop.
+ * Every readable answer polls at {@link LIVE_POLL_MS}, hidden or visible — the
+ * live-only rule makes hidden the normal state, and the old fifteen-second
+ * hidden probe would make a new job take up to 15 s to appear instead of the
+ * baseline's 4 s. Failures back off exponentially from the base rate (4 s → 8 s
+ * → 16 s → 30 s) and reset on the next readable answer. The jitter is added,
+ * never subtracted, so the jittered interval is still at least the policy's
+ * floor — the point is de-synchronisation, not a faster loop.
  *
  * `random` is injected so the rule is assertable without a clock.
  */
-export function nextPollDelayMs(
-  state: { visible: boolean; failures: number },
-  random: () => number = Math.random,
-): number {
-  const base =
-    state.failures > 0
-      ? Math.min(LIVE_POLL_MS * 2 ** state.failures, MAX_POLL_MS)
-      : state.visible
-        ? LIVE_POLL_MS
-        : HIDDEN_POLL_MS;
+export function nextPollDelayMs(failures: number, random: () => number = Math.random): number {
+  const base = failures > 0 ? Math.min(LIVE_POLL_MS * 2 ** failures, MAX_POLL_MS) : LIVE_POLL_MS;
   const jitter = Math.floor(random() * Math.min(base * POLL_JITTER_RATIO, MAX_POLL_JITTER_MS));
   return base + jitter;
 }
@@ -234,8 +230,6 @@ interface Entry<J extends JobLike> {
   /** Consecutive failed reads, driving the backoff and reset by a success. */
   failures: number;
   lastJobs: readonly J[];
-  /** Whether the last readable answer carried at least one job. */
-  lastVisible: boolean;
   /** A terminal contract error; this agent is not polled again until re-registered. */
   terminal: boolean;
 }
@@ -335,15 +329,14 @@ export function createJobsPoller<J extends JobLike>(
           error: error.message,
           ...(error.code === undefined ? {} : { code: error.code }),
         });
-        schedule(entry, nextPollDelayMs({ visible: entry.lastVisible, failures: entry.failures }, random));
+        schedule(entry, nextPollDelayMs(entry.failures, random));
         return;
       }
       const jobs = result.jobs ?? [];
       entry.failures = 0;
       entry.lastJobs = jobs;
-      entry.lastVisible = jobs.length > 0;
       host.publishState(entry.agentId, { jobs, available: true });
-      schedule(entry, nextPollDelayMs({ visible: entry.lastVisible, failures: 0 }, random));
+      schedule(entry, nextPollDelayMs(0, random));
     } catch (error) {
       if (!current()) return;
       if (isPermissionDeniedError(error)) {
@@ -362,7 +355,7 @@ export function createJobsPoller<J extends JobLike>(
         available: false,
         error: error instanceof Error ? error.message : String(error),
       });
-      schedule(entry, nextPollDelayMs({ visible: entry.lastVisible, failures: entry.failures }, random));
+      schedule(entry, nextPollDelayMs(entry.failures, random));
     } finally {
       // Only the newest poll may clear the flag, or a removal/re-registration
       // could let two requests overlap.
@@ -393,7 +386,6 @@ export function createJobsPoller<J extends JobLike>(
       inFlight: false,
       failures: 0,
       lastJobs: [],
-      lastVisible: false,
       terminal: false,
     };
     agents.set(agent.id, entry);
