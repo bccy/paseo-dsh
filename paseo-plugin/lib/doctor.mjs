@@ -5,8 +5,31 @@
  * It verifies the things that silently break a fresh install: the CLIs are
  * present, the plugin has provisioned the DSH profile (which only happens once
  * the daemon loads the plugin), the bridge is materialized, a model route is
- * actually configured, and every referenced `apiKeyEnv` has a credential. It
- * only reads; it never changes anything.
+ * actually configured, and every referenced `apiKeyEnv` has a credential.
+ *
+ * "The file is there" is not enough for any of them, and each gap used to end
+ * in `All checks passed` on an install DSH cannot run:
+ *
+ *   - a profile directory without `package.json` is a profile DSH says does not
+ *     exist (`loadProfile()` in `dsh-app-boot`), and a `package.json` whose
+ *     `dsh.profile.bundles` omits `dsh-paseo-bridge` boots a profile with no
+ *     bridge at all — the plugin only writes that file when it is absent
+ *     (`writeIfAbsent()` in bootstrap.ts), so an existing profile keeps a list
+ *     without the bridge;
+ *   - a loader patch entry is applied by *id* against the composed tree and
+ *     skipped with a warning when its `name` does not match that row's
+ *     (`applyEntryPatches()` in `dsh-app-boot`), so a typo leaves the base
+ *     default route in place while the profile patch looks configured;
+ *   - `dsh-credentials-local` refuses a credentials document that is not
+ *     `version: 1`, is readable beyond its owner, or names a ref outside
+ *     `/^[A-Za-z_][A-Za-z0-9_]*$/` — the plugin never sees those files, so a
+ *     hand-written one can stop DSH from activating at all.
+ *
+ * The composition check is the one place doctor does not only read: DSH's own
+ * `dsh --profile <p> --dump-config` rewrites the profile's generated
+ * `cordis.yml` root file (constant content, rewritten on every boot). Nothing
+ * else is written, and judging the patch with DSH's algorithm instead of a
+ * second implementation is what makes the verdict the one DSH will reach.
  *
  * ### What "configured" has to mean
  *
@@ -31,8 +54,8 @@
  *
  * @module paseo-dsh/lib/doctor
  */
-import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
@@ -60,6 +83,26 @@ const MINIMUM_PASEO = "0.9.2";
  * `major.minor`, which cannot tell `0.2.0` from `0.2.1`.
  */
 const MINIMUM_DSH = "0.2.1";
+
+/** The bundle package `bootstrap.ts` writes into `dsh.profile.bundles`. */
+const BRIDGE_PACKAGE = "dsh-paseo-bridge";
+
+/**
+ * The ref-name grammar `dsh-credentials` enforces (`REF_PATTERN` in its
+ * `lib/index.js`): `parseRefs()` runs every `refs:` key through it and rejects
+ * the whole document on a miss, so `MY.GATEWAY_KEY` never resolves.
+ */
+const CREDENTIAL_REF = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * Permission bits outside the owner. `dsh-credentials-local` refuses to load a
+ * credentials document carrying any of them (`assertOwnerOnly()`, before the
+ * file is even read); the provider writes and replaces the file at `0600`.
+ */
+const CREDENTIALS_GROUP_OTHER = 0o77;
+
+/** How long `dsh --dump-config` may take before the composition is called unjudged. */
+const DUMP_TIMEOUT_MS = 20_000;
 
 // `doctor | head -1` closes stdout early. Unhandled, that dies with an
 // `'error'` event and exit code 1 — which is exactly the code that means
@@ -95,6 +138,277 @@ function readText(path) {
   } catch (error) {
     return { error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+/** The POSIX mode of a path, or `undefined` when it cannot be read. */
+function statMode(path) {
+  try {
+    return statSync(path).mode;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether the profile directory is a DSH profile package that loads the bridge.
+ *
+ * DSH resolves a profile by its `package.json` (`loadProfile()` in
+ * `dsh-app-boot`): without one it either initializes a shipped template or
+ * throws `profile "<name>" does not exist`, and with one it composes exactly
+ * the bundles under `dsh.profile.bundles`. The bridge is a bundle package, not
+ * a plugin the profile picks up on its own, so a list without
+ * `dsh-paseo-bridge` boots a perfectly healthy DSH that never answers
+ * `initialize` — while this doctor used to report the directory alone as `ok`.
+ *
+ * `bootstrap.ts` writes the manifest with `writeIfAbsent()`, deliberately: the
+ * file belongs to the user. A profile that predates the plugin, or one the user
+ * edited, keeps its own list, so "the plugin creates it on load" does not
+ * repair this and the doctor has to name the exact missing entry.
+ *
+ * @param profileDir - absolute profile directory.
+ * @param profile - profile name, for the diagnostic.
+ * @returns {{ ok: true } | { ok: false, label: string, detail: string }}
+ */
+function profileBundleVerdict(profileDir, profile) {
+  const manifestPath = join(profileDir, "package.json");
+  const read = readText(manifestPath);
+  if (read.error !== undefined) {
+    if (!existsSync(manifestPath)) {
+      return {
+        ok: false,
+        label: `DSH profile "${profile}" has no package.json`,
+        detail:
+          `expected ${manifestPath}; without it DSH reports the profile does not exist. The plugin writes it when it ` +
+          `provisions the profile — reinstall the plugin and restart the daemon, or create the file with ` +
+          `"dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "${BRIDGE_PACKAGE}"] } }.`,
+      };
+    }
+    return {
+      ok: false,
+      label: `DSH profile package.json is unreadable`,
+      detail: `${manifestPath}: ${read.error}; DSH cannot load a profile it cannot read.`,
+    };
+  }
+  let manifest;
+  try {
+    manifest = JSON.parse(read.text);
+  } catch (error) {
+    return {
+      ok: false,
+      label: `DSH profile package.json is not valid JSON`,
+      detail: `${manifestPath}: ${error instanceof Error ? error.message : String(error)}; DSH fails to boot this profile.`,
+    };
+  }
+  if (manifest === null || typeof manifest !== "object" || Array.isArray(manifest)) {
+    return {
+      ok: false,
+      label: `DSH profile package.json does not hold an object`,
+      detail: `${manifestPath}; DSH refuses a profile manifest that is not a JSON object.`,
+    };
+  }
+  const bundles = manifest.dsh?.profile?.bundles;
+  if (!Array.isArray(bundles)) {
+    return {
+      ok: false,
+      label: `DSH profile declares no bundle list`,
+      detail:
+        `${manifestPath} has no "dsh.profile.bundles" array, so DSH boots this profile with no bundles at all and ` +
+        `the bridge is never loaded. Add "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "${BRIDGE_PACKAGE}"] } }.`,
+    };
+  }
+  if (!bundles.includes(BRIDGE_PACKAGE)) {
+    return {
+      ok: false,
+      label: `DSH profile does not load the bridge bundle`,
+      detail:
+        `"${BRIDGE_PACKAGE}" is missing from dsh.profile.bundles in ${manifestPath}; DSH boots without the bridge ` +
+        `and every session waits for initialize until it times out. Add "${BRIDGE_PACKAGE}" to that list (keep the ` +
+        `other entries) and restart the daemon.`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * Compose the profile through DSH's own patch algorithm and report what it skipped.
+ *
+ * `dsh --profile <p> --dump-config` is the launcher's offline composition
+ * (`runDumpConfig()` → `renderConfigDump()` in `dsh-app-boot`): it stacks the
+ * bundle layers and the profile's `cordis.patch.yml` with the same
+ * `applyEntryPatches()` the boot include uses. Every patch it cannot apply is a
+ * warning on stderr — a `name` that does not match the composed row, an `id`
+ * that matches nothing, an insert into a missing group, a bundle that failed to
+ * load — and the boot itself prints those once and carries on. That is why a
+ * route can look configured in the profile patch while the running profile is
+ * on the base default: the patch was skipped, and only this warning says so.
+ *
+ * The dump is not a pure read: DSH rewrites the profile's generated
+ * `cordis.yml` root file (constant content; the same write happens on every
+ * boot). Nothing else is touched.
+ *
+ * @param profile - profile name.
+ * @returns {{ status: number|null, stderr: string, error?: Error }}
+ */
+function dumpProfile(profile) {
+  const result = spawnSync("dsh", ["--profile", profile, "--dump-config"], {
+    encoding: "utf8",
+    stdio: ["ignore", "ignore", "pipe"],
+    timeout: DUMP_TIMEOUT_MS,
+  });
+  return {
+    status: result.status,
+    stderr: typeof result.stderr === "string" ? result.stderr : "",
+    error: result.error,
+  };
+}
+
+/**
+ * The composition diagnostics DSH printed, one per line.
+ *
+ * Everything the dump reports is either a skipped patch entry
+ * (`dsh: [<layer>] patch: …`) or a bundle that failed to load
+ * (`dsh: skipping profile bundle "…": …`); there is no benign `dsh:` line on
+ * this path. They are kept verbatim so the doctor can quote DSH instead of
+ * paraphrasing it.
+ */
+function dumpDiagnostics(stderr) {
+  return stderr
+    .split("\n")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.startsWith("dsh: "));
+}
+
+/** DSH's diagnostics for one detail line, quoting DSH and capping the list. */
+function quoteDiagnostics(entries) {
+  const shown = entries.slice(0, 3).map((entry) => entry.replace(/^dsh: /, ""));
+  const more = entries.length > shown.length ? ` (+${String(entries.length - shown.length)} more)` : "";
+  return `${shown.join("; ")}${more}.`;
+}
+
+/**
+ * The first line of a failed dump that names the failure, without the stack.
+ *
+ * A failed `--dump-config` prints an uncaught error, so stderr starts with a
+ * `file://…` frame and ends with `Node.js v…`; the one useful line is the
+ * `Error: dsh: …` message.
+ */
+function dumpFailure(dumped) {
+  if (dumped.error !== undefined) {
+    if (dumped.error.code === "ETIMEDOUT") return `dsh --dump-config did not finish within ${DUMP_TIMEOUT_MS / 1000}s`;
+    return `could not run dsh --dump-config (${dumped.error.message})`;
+  }
+  for (const entry of dumped.stderr.split("\n")) {
+    const text = entry.trim();
+    const wrapped = /^Error: (dsh: .*)$/.exec(text);
+    if (wrapped !== null) return wrapped[1];
+    if (text.startsWith("dsh: ")) return text;
+  }
+  return `dsh --dump-config exited ${String(dumped.status)} without a diagnostic`;
+}
+
+/**
+ * Whether a document is the pre-release flat credentials layout DSH migrates.
+ *
+ * `renderFlatLayoutMigration()` in `dsh-credentials-local` recognizes exactly a
+ * non-empty top-level mapping of ref names to non-empty string scalars, with no
+ * `version` key and no document directives; it then rewrites the file as
+ * `version: 1` + `refs:` and boots. Failing that layout here would be a false
+ * red on a file DSH is about to upgrade, so the doctor accepts it too — and
+ * says so, because the rewrite is about to happen.
+ *
+ * @param text - the document's text (directive lines are matched on it).
+ * @param root - the parsed document.
+ */
+function isFlatLayout(text, root) {
+  const keys = Object.keys(root);
+  if (keys.length === 0) return false;
+  if (/^(%|---|\.\.\.)/m.test(text)) return false;
+  for (const key of keys) {
+    if (key === "version") return false;
+    if (!CREDENTIAL_REF.test(key)) return false;
+    const value = root[key];
+    if (typeof value !== "string" || value.length === 0) return false;
+  }
+  return true;
+}
+
+/**
+ * Check a parsed credentials document against the contract DSH enforces.
+ *
+ * The reference implementation is `dsh-credentials-local/lib/index.js`:
+ * `parseCredentialsDocument()` requires a non-empty document to declare
+ * `version: 1` and validates `refs` with `parseRefs()` (the `credentialRef()`
+ * grammar from `dsh-credentials/lib/index.js`, non-empty string values);
+ * `renderFlatLayoutMigration()` is the one accepted legacy layout. A document
+ * that fails any of those is refused before a single credential is read, so
+ * the doctor must not report `credential … found` for one.
+ *
+ * The `records` section (machine-written by the Models page) is not inspected;
+ * see the delivery note on the audit item.
+ *
+ * @param document - the parsed YAML document.
+ * @param text - its text, for the flat-layout recognizer.
+ * @param path - absolute path, for the repair instructions.
+ * @returns {{ refs: Record<string, unknown>, problems: { label: string, detail: string }[], legacy: boolean }}
+ */
+function credentialContract(document, text, path) {
+  const problems = [];
+  const root = document === null ? {} : document;
+  if (typeof root !== "object" || Array.isArray(root)) {
+    return {
+      refs: {},
+      legacy: false,
+      problems: [
+        {
+          label: "credentials document is not a mapping",
+          detail: `${path} must hold a YAML mapping with "version: 1" and "refs:" at the top level.`,
+        },
+      ],
+    };
+  }
+  const keys = Object.keys(root);
+  if (keys.length === 0) return { refs: {}, problems, legacy: false };
+  let legacy = false;
+  if (!("version" in root)) {
+    if (isFlatLayout(text, root)) legacy = true;
+    else
+      problems.push({
+        label: "credentials document has no version: 1",
+        detail:
+          `${path} uses the pre-release flat layout, which DSH rejects: add "version: 1" as the first line and ` +
+          `nest the existing ${String(keys.length)} ${keys.length === 1 ? "entry" : "entries"} under "refs:" ` +
+          `(no value needs to change).`,
+      });
+  } else if (root.version !== 1) {
+    problems.push({
+      label: `credentials document declares version ${JSON.stringify(root.version)}`,
+      detail: `${path} must say "version: 1" (a number, unquoted); this DSH build reads version 1 only.`,
+    });
+  }
+  const section = legacy ? root : root.refs;
+  if (section !== undefined && section !== null && (typeof section !== "object" || Array.isArray(section))) {
+    problems.push({
+      label: "credentials refs is not a mapping",
+      detail: `"refs:" in ${path} must be a mapping of NAME: <key>; DSH rejects the whole document otherwise.`,
+    });
+    return { refs: {}, problems, legacy };
+  }
+  const refs = section ?? {};
+  for (const [name, value] of Object.entries(refs)) {
+    if (!CREDENTIAL_REF.test(name))
+      problems.push({
+        label: `credentials ref "${name}" is not a valid name`,
+        detail:
+          `DSH requires /^[A-Za-z_][A-Za-z0-9_]*$/ (no dots or dashes) for a ref name; rename it in ${path}. ` +
+          `The route's apiKeyEnv has to use the same name.`,
+      });
+    else if (typeof value !== "string" || value.length === 0)
+      problems.push({
+        label: `credentials ref "${name}" has no usable value`,
+        detail: `the value for "${name}" in ${path} must be a non-empty string; quote it, or remove the key.`,
+      });
+  }
+  return { refs, problems, legacy };
 }
 
 function findPaseo() {
@@ -418,7 +732,13 @@ export function runDoctor() {
   }
   report("ok", `DSH profile at ${profileDir}`);
 
-  const bridgeDir = join(profileDir, "node_modules", "dsh-paseo-bridge");
+  // The directory alone is not a profile DSH can load, and a profile whose
+  // bundle list omits the bridge boots without it. Both were `ok` before.
+  const profileBundle = profileBundleVerdict(profileDir, profile);
+  if (profileBundle.ok) report("ok", `profile loads the ${BRIDGE_PACKAGE} bundle`);
+  else report("fail", profileBundle.label, profileBundle.detail);
+
+  const bridgeDir = join(profileDir, "node_modules", BRIDGE_PACKAGE);
   // Every file the plugin writes, not just the entry. `lib/index.js` exists in a
   // bridge missing `lib/child-anchors.js` and still fails to load, and that is
   // exactly the case this check used to call `ok` (see loadBridgeFileList).
@@ -562,13 +882,87 @@ export function runDoctor() {
     }
   }
 
-  // 4. credentials for every referenced apiKeyEnv
+  // 3b. DSH must actually apply the patch, not skip it with a warning.
+  // The dump is only meaningful once the profile is a profile DSH can load
+  // (a missing package.json makes it print `profile does not exist`, which the
+  // row above already reports) and once the dsh CLI was found.
+  if (profileBundle.ok && dshVersion !== undefined) {
+    const dumped = dumpProfile(profile);
+    const diagnostics = dumpDiagnostics(dumped.stderr);
+    const profileSkips = diagnostics.filter((entry) => entry.includes(`[${patchPath}]`));
+    const skippedBundles = diagnostics.filter((entry) => /^dsh: skipping profile bundle "[^"]*":/.test(entry));
+    const skippedBridge = skippedBundles.filter((entry) => entry.includes(`"${BRIDGE_PACKAGE}"`));
+    const others = diagnostics.filter((entry) => !profileSkips.includes(entry) && !skippedBundles.includes(entry));
+    const otherBundles = skippedBundles.filter((entry) => !skippedBridge.includes(entry));
+    if (dumped.error !== undefined || dumped.status !== 0) {
+      report(
+        "fail",
+        `DSH cannot compose profile "${profile}"`,
+        `${dumpFailure(dumped)}. The bundle and patch layers were not composed, so DSH cannot boot this profile; ` +
+          `fix that error (run \`dsh --profile ${profile} --dump-config\` for the full output) before anything else.`,
+      );
+    } else {
+      if (profileSkips.length === 0 && skippedBridge.length === 0) {
+        report(
+          "ok",
+          "profile patch applied by DSH",
+          `dsh --profile ${profile} --dump-config composed it without skipping a patch entry`,
+        );
+      }
+      if (profileSkips.length > 0) {
+        // This is the silent failure the check exists for: `name` does not match
+        // the composed row (or `id` matches nothing), DSH warns once at boot and
+        // continues on the base route, and the patch file still looks right.
+        report(
+          "fail",
+          `DSH skipped ${profileSkips.length === 1 ? "a patch entry" : `${String(profileSkips.length)} patch entries`} from ${patchPath}`,
+          `${quoteDiagnostics(profileSkips)} Fix the entry's id/name so it matches the composed row, then restart ` +
+            `the daemon; \`dsh --profile ${profile} --dump-config\` prints the same warning and the composed result.`,
+        );
+      }
+      if (skippedBridge.length > 0) {
+        report(
+          "fail",
+          `DSH skipped the ${BRIDGE_PACKAGE} bundle`,
+          `${quoteDiagnostics(skippedBridge)} The bridge cannot answer a session unless DSH loads it; reinstall the ` +
+            `plugin, then restart the daemon.`,
+        );
+      }
+      if (others.length > 0 || otherBundles.length > 0) {
+        report(
+          "warn",
+          "other profile composition warnings",
+          `${quoteDiagnostics([...others, ...otherBundles])} These come from the bundle layers or the home-level ` +
+            `$DSH_HOME/cordis.patch.yml, not from this profile's cordis.patch.yml; the profile still boots, but ` +
+            `the affected rows are not applied.`,
+        );
+      }
+    }
+  }
+
+  // 4. credentials: DSH's document contract first, then every referenced apiKeyEnv
   const credentialPath = join(dshHome, ".credentials.yaml");
   const credentialRead = readText(credentialPath);
   if (credentialRead.error !== undefined) {
     report("fail", `cannot read ${credentialPath}`, credentialRead.error);
     finish();
     return;
+  }
+  // DSH refuses the document before reading a single value when other OS users
+  // can read it (`assertOwnerOnly()` in dsh-credentials-local), and a
+  // hand-written file carries the umask's 0644 — the whole credentials service
+  // then fails to activate and every turn waits on it.
+  const credentialMode = statMode(credentialPath);
+  if (
+    process.platform !== "win32" &&
+    credentialMode !== undefined &&
+    (credentialMode & CREDENTIALS_GROUP_OTHER) !== 0
+  ) {
+    report(
+      "fail",
+      `credentials file is readable beyond its owner (mode ${(credentialMode & 0o777).toString(8)})`,
+      `run "chmod 600 ${credentialPath}" — DSH refuses to start with a credentials document other users can read.`,
+    );
   }
   let credentialDocument;
   try {
@@ -580,20 +974,36 @@ export function runDoctor() {
     finish();
     return;
   }
+  // Judge the parsed document against the contract DSH enforces. A document
+  // DSH refuses cannot yield a "found" credential, so the per-ref rows are
+  // skipped rather than contradicting the blocking issue above them.
+  const contract = credentialContract(credentialDocument, credentialRead.text, credentialPath);
+  for (const problem of contract.problems) report("fail", problem.label, problem.detail);
+  if (contract.problems.length > 0) {
+    finish();
+    return;
+  }
+  if (contract.legacy) {
+    report(
+      "ok",
+      "credentials document uses the pre-release flat layout",
+      `DSH migrates ${credentialPath} to "version: 1" + "refs:" in place on its next start; no hand edit needed.`,
+    );
+  }
   // `refs:` is the only place a credential may live: a key of the same name in
   // another top-level section (or after `refs:` has ended) is not one. Parsed
   // as an object, so YAML's own scoping decides that instead of a line window.
-  const refs =
-    credentialDocument !== null && typeof credentialDocument === "object" && !Array.isArray(credentialDocument)
-      ? credentialDocument.refs
-      : undefined;
-  const refsObject = refs !== null && typeof refs === "object" && !Array.isArray(refs) ? refs : {};
+  const refsObject = contract.refs;
   const referenced = [];
   for (const profile of Object.values(providers ?? {})) {
     if (profile === null || typeof profile !== "object" || Array.isArray(profile)) continue;
     if (typeof profile.apiKeyEnv === "string" && profile.apiKeyEnv.trim() !== "") referenced.push(profile.apiKeyEnv.trim());
   }
   const unique = [...new Set(referenced)];
+  // A flat-layout document keeps its refs at the top level until DSH migrates
+  // it; naming `refs:` there would produce the document the contract row above
+  // rejects.
+  const refLocation = contract.legacy ? "at the top level" : 'under "refs:"';
   if (unique.length === 0) {
     report("fail", "no apiKeyEnv referenced", "the route above should name the credential to use");
   } else {
@@ -606,7 +1016,10 @@ export function runDoctor() {
         report(
           "fail",
           `credential ${name} missing`,
-          `add "${name}: <your-key>" under refs: in ${credentialPath}`,
+          // The repair has to produce a file DSH accepts: `refs:` without
+          // `version: 1`, or a 0644 file, is refused before the key is read.
+          `add "${name}: <your-key>" ${refLocation} in ${credentialPath}; the document needs "version: 1" at the ` +
+            `top and mode 0600 (chmod 600 ${credentialPath}).`,
         );
     }
   }

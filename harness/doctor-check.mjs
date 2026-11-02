@@ -28,6 +28,23 @@
  *   9. an unreadable file list is a failure, not a warning with exit 0
  *  10. a YAML syntax error is a failure even when the *plugin* ships no parser,
  *      as long as the DSH install has one — the shape of every published install
+ *  11. a profile without `package.json` is a failure (DSH says the profile does
+ *      not exist), and one whose `dsh.profile.bundles` omits
+ *      `dsh-paseo-bridge` is a failure (DSH boots without the bridge); a list
+ *      that names it is accepted
+ *  12. a patch entry DSH skipped (`dsh --dump-config` prints a warning and
+ *      carries on) is a failure, not `ok` on the profile patch; a dump that
+ *      cannot compose the profile is a failure too, and a clean dump is accepted
+ *  13. a credentials document DSH refuses — no `version: 1`, group/other
+ *      permission bits, or a ref name outside its grammar — is a failure, while
+ *      the pre-release flat layout it migrates in place is still accepted
+ *
+ * Cases 11-13 are the 2026-11-03 audit's DLV-01/02/03: the same false-green
+ * shape one layer further in. `doctor` read the profile directory, the patch
+ * file and `refs:` but never the contracts DSH applies to them. The `dsh`
+ * stand-in answers `--dump-config` from a marker comment in the patch (see
+ * `stubHostClis`) — this file is hermetic and cannot run the real composition;
+ * `harness/doctor-live-check.mjs` drives the same rows against a real DSH.
  *
  * Case 10 exists because case 3 only ever passes in a development checkout. The
  * plugin declares no `dependencies` and does not ship `node_modules`, so a real
@@ -153,9 +170,34 @@ function stubHostClis() {
     writeFileSync(path, script);
     chmodSync(path, 0o755);
   };
+  // `dsh --profile <name> --dump-config` is doctor's composition check (DLV-02).
+  // A real composition needs a real DSH install, so this stand-in answers from a
+  // marker comment in the profile patch: the case decides what DSH "reported",
+  // and the doctor's handling of that verdict is what this file pins. The real
+  // warning text and the real composition are asserted by
+  // `harness/doctor-live-check.mjs`.
   executable(
     "dsh",
-    ["#!/bin/sh", 'if [ "$1" = "--version" ]; then', '  echo "0.2.1-rc.2"', "else", "  exit 1", "fi", ""].join("\n"),
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "--version" ]; then',
+      '  echo "0.2.1-rc.2"',
+      "  exit 0",
+      "fi",
+      'if [ "$1" = "--profile" ] && [ "$3" = "--dump-config" ]; then',
+      '  patch="$DSH_HOME/profiles/$2/cordis.patch.yml"',
+      '  if grep -q "DOCTOR-CHECK-DUMP-FAIL" "$patch" 2>/dev/null; then',
+      '    echo "Error: dsh: failed to parse overlay $patch: unexpected end of the stream" >&2',
+      "    exit 1",
+      "  fi",
+      '  if grep -q "DOCTOR-CHECK-PATCH-SKIPPED" "$patch" 2>/dev/null; then',
+      '    echo "dsh: [$patch] patch: name mismatch for \\"agent-default-model\\" (expected \\"@deepseek-ai/dsh-agent-default-model\\", got \\"@deepseek-ai/dsh-agent-default-model-TYPO\\"), skipping" >&2',
+      "  fi",
+      "  exit 0",
+      "fi",
+      "exit 1",
+      "",
+    ].join("\n"),
   );
   executable(
     "paseo",
@@ -231,10 +273,34 @@ const VALID_ROUTE = [
   "",
 ].join("\n");
 
-const VALID_CREDENTIALS = ["refs:", "  MY_GATEWAY_KEY: a-secret-value", ""].join("\n");
+const VALID_CREDENTIALS = ["version: 1", "refs:", "  MY_GATEWAY_KEY: a-secret-value", ""].join("\n");
 
-/** Write one sandboxed install and point the doctor at it. */
-function install({ patch, credentials, bridge = BRIDGE_FILES }) {
+/**
+ * The profile manifest the plugin writes (`profilePackageJson()` in
+ * bootstrap.ts). Case 6 and every other "complete install" fixture carries it,
+ * because a profile directory alone is not a profile DSH can load.
+ */
+const VALID_PROFILE_MANIFEST = {
+  name: `dsh-profile-${PROFILE}`,
+  private: true,
+  dsh: { profile: { bundles: ["@deepseek-ai/dsh-base", "dsh-paseo-bridge"] } },
+};
+
+/**
+ * Write one sandboxed install and point the doctor at it.
+ *
+ * `manifest` defaults to the file the plugin writes; pass `null` to leave it
+ * out (the profile DSH reports as not existing) or another object to replace it.
+ * The credentials file is written `0600`, the mode the DSH provider creates it
+ * with; `credentialsMode` overrides it for the permission contract case.
+ */
+function install({
+  patch,
+  credentials,
+  bridge = BRIDGE_FILES,
+  manifest = VALID_PROFILE_MANIFEST,
+  credentialsMode = 0o600,
+}) {
   const home = mkdtempSync(join(WORK, "home-"));
   const profileDir = join(home, "profiles", PROFILE);
   const bridgeDir = join(profileDir, "node_modules", "dsh-paseo-bridge");
@@ -246,8 +312,13 @@ function install({ patch, credentials, bridge = BRIDGE_FILES }) {
     mkdirSync(dirname(target), { recursive: true });
     writeFileSync(target, "");
   }
+  if (manifest !== null) writeFileSync(join(profileDir, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
   writeFileSync(join(profileDir, "cordis.patch.yml"), patch);
-  if (credentials !== undefined) writeFileSync(join(home, ".credentials.yaml"), credentials);
+  if (credentials !== undefined) {
+    const credentialPath = join(home, ".credentials.yaml");
+    writeFileSync(credentialPath, credentials);
+    chmodSync(credentialPath, credentialsMode);
+  }
   process.env.DSH_HOME = home;
 }
 
@@ -369,12 +440,15 @@ const check = (name, pass, detail) => {
 
 // ---- 4. a credential with no value is not a credential -------------------
 {
-  install({ patch: VALID_ROUTE, credentials: ["refs:", "  MY_GATEWAY_KEY:", ""].join("\n") });
+  // DSH refuses the document (`parseRefs()`: "the value for X is empty"), so
+  // the verdict is the contract row, not a `found` credential. The per-ref row
+  // is covered by cases 5/5b for documents DSH would load.
+  install({ patch: VALID_ROUTE, credentials: ["version: 1", "refs:", "  MY_GATEWAY_KEY:", ""].join("\n") });
   const run = doctor();
   check(
     "a credential with an empty value is a failure",
-    run.out.includes("credential MY_GATEWAY_KEY missing") && run.code === 1,
-    run.out.trim().split("\n").filter((l) => l.includes("credential")).join(" | "),
+    run.out.includes('credentials ref "MY_GATEWAY_KEY" has no usable value') && run.code === 1,
+    run.out.trim().split("\n").filter((l) => l.includes("credentials ref")).join(" | "),
   );
 }
 
@@ -384,19 +458,20 @@ const check = (name, pass, detail) => {
     ["a quoted-empty credential", '  MY_GATEWAY_KEY: ""'],
     ["a comment-only credential", "  MY_GATEWAY_KEY: # no value"],
   ]) {
-    install({ patch: VALID_ROUTE, credentials: ["refs:", value, ""].join("\n") });
+    install({ patch: VALID_ROUTE, credentials: ["version: 1", "refs:", value, ""].join("\n") });
     const run = doctor();
     check(
       `${name} is a failure, not a found credential`,
-      run.out.includes("credential MY_GATEWAY_KEY missing") && run.code === 1,
-      run.out.trim().split("\n").filter((l) => l.includes("credential")).join(" | "),
+      run.out.includes('credentials ref "MY_GATEWAY_KEY" has no usable value') && run.code === 1,
+      run.out.trim().split("\n").filter((l) => l.includes("credentials ref")).join(" | "),
     );
   }
 }
 
 // ---- 5. a same-named key outside refs: is not a credential ---------------
 {
-  install({ patch: VALID_ROUTE, credentials: ["something_else:", "  MY_GATEWAY_KEY: a-secret-value", ""].join("\n") });
+  const credentials = ["version: 1", "something_else:", "  MY_GATEWAY_KEY: a-secret-value", ""].join("\n");
+  install({ patch: VALID_ROUTE, credentials });
   const run = doctor();
   check(
     "a key outside refs: does not satisfy the credential check",
@@ -409,9 +484,14 @@ const check = (name, pass, detail) => {
 {
   // The old `credentialText.slice(refsAt)` read to EOF, so a same-named key in
   // the next top-level block counted. Parsed as an object, only `refs.*`.
-  const credentials = ["refs:", "  OTHER_KEY: other-value", "other_section:", "  MY_GATEWAY_KEY: a-secret-value", ""].join(
-    "\n",
-  );
+  const credentials = [
+    "version: 1",
+    "refs:",
+    "  OTHER_KEY: other-value",
+    "other_section:",
+    "  MY_GATEWAY_KEY: a-secret-value",
+    "",
+  ].join("\n");
   install({ patch: VALID_ROUTE, credentials });
   const run = doctor();
   check(
@@ -460,6 +540,16 @@ const check = (name, pass, detail) => {
   check(
     "and its credential is found",
     run.out.includes("credential MY_GATEWAY_KEY found"),
+  );
+  check(
+    "and its profile bundle list names the bridge",
+    run.out.includes("profile loads the dsh-paseo-bridge bundle"),
+    run.out.trim().split("\n").find((l) => l.includes("profile loads")) ?? "(no profile line)",
+  );
+  check(
+    "and DSH's own composition applied the patch",
+    run.out.includes("profile patch applied by DSH"),
+    run.out.trim().split("\n").find((l) => l.includes("profile patch")) ?? "(no patch line)",
   );
   check("with nothing blocking", !run.out.includes("blocking issue"), `exit ${run.code}`);
 }
@@ -562,7 +652,18 @@ const check = (name, pass, detail) => {
   mkdirSync(join(FAKE_DSH, "lib"), { recursive: true });
   mkdirSync(join(FAKE_DSH, "node_modules"), { recursive: true });
   writeFileSync(join(FAKE_DSH, "package.json"), '{"name":"@deepseek-ai/dsh","version":"0.2.1"}\n');
-  writeFileSync(fakeBin, '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "0.2.1-rc.2"; else exit 1; fi\n');
+  writeFileSync(
+    fakeBin,
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "--version" ]; then echo "0.2.1-rc.2"; exit 0; fi',
+      // The composition check is not what this case is about; a clean dump keeps
+      // the run on the parser-fallback path it was built for.
+      'if [ "$1" = "--profile" ] && [ "$3" = "--dump-config" ]; then exit 0; fi',
+      "exit 1",
+      "",
+    ].join("\n"),
+  );
   chmodSync(fakeBin, 0o755);
   symlinkSync(join(HERE, "..", "paseo-plugin", "node_modules", "yaml"), join(FAKE_DSH, "node_modules", "yaml"), "dir");
   // `dsh` on PATH is a symlink into the install, exactly like a global bin dir.
@@ -655,6 +756,142 @@ const check = (name, pass, detail) => {
     "and that install still exits 0 when nothing else blocks",
     noParserAtAll.code === 0,
     `exit ${noParserAtAll.code}`,
+  );
+}
+
+// ---- 11. the profile must be a profile package that loads the bridge ------
+// DLV-03: doctor used to check only that the profile directory exists. DSH
+// resolves a profile through its `package.json` (none: "profile does not
+// exist") and composes exactly `dsh.profile.bundles` (no bridge: boots without
+// it), and the plugin's `writeIfAbsent()` never repairs an existing manifest.
+{
+  install({ patch: VALID_ROUTE, credentials: VALID_CREDENTIALS, manifest: null });
+  const missing = doctor();
+  check(
+    "a profile without package.json is a failure",
+    missing.out.includes("has no package.json") && missing.code === 1,
+    missing.out.trim().split("\n").find((l) => l.includes("package.json")) ?? `exit ${missing.code}`,
+  );
+  check("and it does not claim everything passed", !missing.out.includes("All checks passed"));
+
+  install({
+    patch: VALID_ROUTE,
+    credentials: VALID_CREDENTIALS,
+    manifest: {
+      name: "dsh-profile-doctor-check",
+      private: true,
+      dsh: { profile: { bundles: ["@deepseek-ai/dsh-base"] } },
+    },
+  });
+  const noBridge = doctor();
+  check(
+    "a profile whose bundle list omits the bridge is a failure",
+    noBridge.out.includes("does not load the bridge bundle") && noBridge.code === 1,
+    noBridge.out.trim().split("\n").find((l) => l.includes("bridge bundle")) ?? `exit ${noBridge.code}`,
+  );
+
+  install({ patch: VALID_ROUTE, credentials: VALID_CREDENTIALS });
+  const control = doctor();
+  check(
+    "the plugin's own bundle list is accepted",
+    control.out.includes("profile loads the dsh-paseo-bridge bundle") && control.code === 0,
+    control.out.trim().split("\n").find((l) => l.includes("profile loads")) ?? `exit ${control.code}`,
+  );
+}
+
+// ---- 12. DSH must actually apply the patch, not skip it -------------------
+// DLV-02: `applyEntryPatches()` matches a patch to the composed row by id and
+// skips it with a warning when its `name` does not match; the boot prints that
+// warning once and continues on the base default route. The stand-in `dsh`
+// answers `--dump-config` from the marker comment (see `stubHostClis`), so
+// these cases pin the doctor's handling of DSH's verdict, not the verdict.
+{
+  install({ patch: `${VALID_ROUTE}\n# DOCTOR-CHECK-PATCH-SKIPPED\n`, credentials: VALID_CREDENTIALS });
+  const skipped = doctor();
+  check(
+    "a patch entry DSH skipped is a failure, not `ok`",
+    skipped.out.includes("DSH skipped a patch entry") && skipped.code === 1,
+    skipped.out.trim().split("\n").find((l) => l.includes("DSH skipped")) ?? `exit ${skipped.code}`,
+  );
+  check(
+    "and the row quotes DSH's own warning",
+    skipped.out.includes('patch: name mismatch for "agent-default-model"'),
+    skipped.out.trim().split("\n").find((l) => l.includes("name mismatch")) ?? "(no warning)",
+  );
+
+  install({ patch: `${VALID_ROUTE}\n# DOCTOR-CHECK-DUMP-FAIL\n`, credentials: VALID_CREDENTIALS });
+  const uncomposable = doctor();
+  check(
+    "a dump that cannot compose the profile is a failure",
+    uncomposable.out.includes("DSH cannot compose profile") && uncomposable.code === 1,
+    uncomposable.out.trim().split("\n").find((l) => l.includes("cannot compose")) ?? `exit ${uncomposable.code}`,
+  );
+  check(
+    "and it quotes DSH's error instead of the stack",
+    uncomposable.out.includes("failed to parse overlay") && !uncomposable.out.includes("    at "),
+    uncomposable.out.trim().split("\n").find((l) => l.includes("failed to parse")) ?? "(no error line)",
+  );
+
+  install({ patch: VALID_ROUTE, credentials: VALID_CREDENTIALS });
+  const control = doctor();
+  check(
+    "a clean dump is accepted",
+    control.out.includes("profile patch applied by DSH") && control.code === 0,
+    control.out.trim().split("\n").find((l) => l.includes("profile patch")) ?? `exit ${control.code}`,
+  );
+}
+
+// ---- 13. credentials the DSH provider refuses are a failure --------------
+// DLV-01: `dsh-credentials-local` refuses a document that is not `version: 1`
+// (`parseCredentialsDocument`), is readable beyond its owner
+// (`assertOwnerOnly`, before the file is read), or names a ref outside
+// `/^[A-Za-z_][A-Za-z0-9_]*$/` (`credentialRef`). Doctor used to look only for
+// a non-empty `refs.<name>` value.
+{
+  for (const [name, credentials, label] of [
+    [
+      "no version: 1",
+      ["refs:", "  MY_GATEWAY_KEY: a-secret-value", ""].join("\n"),
+      "credentials document has no version: 1",
+    ],
+    [
+      "a ref name outside the DSH grammar",
+      ["version: 1", "refs:", "  MY.GATEWAY_KEY: a-secret-value", ""].join("\n"),
+      'credentials ref "MY.GATEWAY_KEY" is not a valid name',
+    ],
+    [
+      "a non-string ref value",
+      ["version: 1", "refs:", "  MY_GATEWAY_KEY: 12345", ""].join("\n"),
+      'credentials ref "MY_GATEWAY_KEY" has no usable value',
+    ],
+  ]) {
+    install({ patch: VALID_ROUTE, credentials });
+    const run = doctor();
+    check(
+      `credentials with ${name} is a failure`,
+      run.out.includes(label) && run.code === 1,
+      run.out.trim().split("\n").find((l) => l.includes("credentials")) ?? `exit ${run.code}`,
+    );
+  }
+
+  install({ patch: VALID_ROUTE, credentials: VALID_CREDENTIALS, credentialsMode: 0o644 });
+  const wide = doctor();
+  check(
+    "a credentials file readable beyond its owner is a failure",
+    wide.out.includes("readable beyond its owner (mode 644)") && wide.code === 1,
+    wide.out.trim().split("\n").find((l) => l.includes("readable beyond")) ?? `exit ${wide.code}`,
+  );
+
+  // The pre-release flat layout is not a violation: DSH rewrites it as
+  // `version: 1` + `refs:` in place and boots. Failing it would be a false red.
+  install({ patch: VALID_ROUTE, credentials: "MY_GATEWAY_KEY: a-secret-value\n" });
+  const flat = doctor();
+  check(
+    "the flat layout DSH migrates in place is still accepted",
+    flat.out.includes("pre-release flat layout") &&
+      flat.out.includes("credential MY_GATEWAY_KEY found") &&
+      flat.code === 0,
+    flat.out.trim().split("\n").find((l) => l.includes("flat layout")) ?? `exit ${flat.code}`,
   );
 }
 

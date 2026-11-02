@@ -55,7 +55,8 @@ DSH 侧是一个 profile bundle。
   1. LLM 端点 baseURL 是什么
   2. API key 放在哪个环境变量里（或者我直接给你 key）
   3. 要用哪些模型 id
-拿到 key 后写进 ~/.dsh/.credentials.yaml 的 refs 段。
+拿到 key 后写进 ~/.dsh/.credentials.yaml：文件顶部写 version: 1，键值放在 refs 段下，
+文件权限设成 600（DSH 拒绝别人可读的凭据文件）。
 不要把 key 写进任何会被提交的文件，也不要在终端回显它。
 
 ■ 第三步：探测模型能力（关键，不许跳过）
@@ -169,6 +170,14 @@ bridge——不用 clone、不用跑脚本。更新只走 Paseo 这一条链路�
 version: 1
 refs:
   MY_GATEWAY_API_KEY: sk-xxxxxxxx
+```
+
+`version: 1` 不能省（没有它 DSH 按旧版扁平格式拒绝激活凭据服务），键名只能是
+`[A-Za-z_][A-Za-z0-9_]*`。文件必须是仅属主可读——编辑器/`cat >` 新建的文件默认
+0644，DSH 启动时会拒绝：
+
+```bash
+chmod 600 ~/.dsh/.credentials.yaml
 ```
 
 ### c) 自检 + 重启

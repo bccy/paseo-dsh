@@ -63,7 +63,9 @@ Only if nothing exists, ask me these three things:
   1. the LLM endpoint baseURL
   2. which environment variable holds the API key (or let me give you the key)
   3. which model ids to use
-Store the key under `refs` in ~/.dsh/.credentials.yaml.
+Store the key in ~/.dsh/.credentials.yaml: `version: 1` at the top, the key
+under `refs:`, and the file mode 600 (DSH refuses a credentials file other
+users can read).
 Never put the key in a file that could be committed, and never echo it in the
 terminal.
 
@@ -192,6 +194,15 @@ committed):
 version: 1
 refs:
   MY_GATEWAY_API_KEY: sk-xxxxxxxx
+```
+
+`version: 1` is required — without it DSH rejects the file as the pre-release
+flat layout — and a ref name must match `[A-Za-z_][A-Za-z0-9_]*`. The file must
+also be owner-only: an editor or `cat >` creates it 0644, and DSH refuses to
+start with a credentials file other users can read:
+
+```bash
+chmod 600 ~/.dsh/.credentials.yaml
 ```
 
 ### c) Self-check and restart
