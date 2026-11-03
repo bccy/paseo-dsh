@@ -3094,3 +3094,44 @@ max_goal_rounds are valid only with action edit"。
 修法是 builder 暂存括号内的状态行、`command/done` 后放出，并在 `settleRunningTools` 兜底放出
 （日志停在括号中间时不能吞行）。`harness/goal-state-order-check.cjs` 钉实时 / 重放 / compaction
 认领 / 截断日志 / 括号内他行 / 失败命令六种情形。
+
+## 第二十三轮：共享 dsh 进程的 cwd（2026-11-04）
+
+### 91. 共享 `dsh` 子进程继承第一个会话的 cwd：工作区一删，所有会话的 bash 全挂（CW-01）
+
+**症状**：删掉一个 Paseo worktree（`goal-b-plugin`）之后，**所有** DeepSeek 会话的 bash 工具都失败，
+报 `Error: spawn systemd-run ENOENT`——连不在那个 worktree 里的会话也一样。
+`/proc/<dsh pid>/cwd` 读出来是 `…/goal-b-plugin (deleted)`；重启 daemon 后立刻恢复。
+
+**根因**：
+1. 插件把共享 `dsh` 进程按**第一个**打开会话的 cwd 启动（`paseo-plugin/server/provider.ts` 的
+   `#acquirePoolProcess` → `new DshProcess({ cwd: options.cwd })` → `dsh-process.ts` 里
+   `spawn(resolveBinary(), args, { cwd })`）。进程自己的 cwd 从此和那个工作区绑定。
+2. 会话级 cwd 本来是独立的：`attachSession` 把每个会话的 cwd 存进 `#sessionOptions`，
+   `#initializeSession` 用带 `sessionId` 的 `initialize` 帧逐会话发下去；桥按会话 id 存
+   `sessionCwd` 并用它建 agent（`dsh-bridge/lib/server.js`）。所以**对话没有跑错目录**，坏的是
+   进程自身的 cwd——这正是故障看起来与删掉的那个工作区无关的原因。
+3. DSH 的 Linux 进程隔离启动器 `@deepseek-ai/dsh-subprocess-local` 起 `systemd-run` 时用
+   `cwd: process.cwd()`（`lib/index.js:546,575`）。父进程 cwd 被删后，这个 spawn 的显式 cwd 指向
+   不存在的目录，内核直接 ENOENT（本机实测：显式 cwd 指向已删除目录 → `ENOENT`；不传 cwd 或传
+   有效目录 → 正常）。于是**每个会话**的每次 bash 调用都在启动器这一层失败，与会话自己的 cwd
+   无关。fallback 的直接 spawn 路径（`spawnSubprocess`，用 spec.cwd = 会话 cwd）不受影响。
+4. 逐一核过的同类兜底（都不受会话影响，未改）：`dsh-bash-local` 的
+   `request.workdir ?? config.cwd ?? process.cwd()` 只在 agent 缺失时兜底（`tool-bash` 总是传会话
+   workdir）；`dsh-working-directory` 的 `defaultDirectory = config.defaultDirectory ?? process.cwd()`
+   只在会话 header 没有 cwd 时兜底（桥总是传 `meta.cwd`）；`dsh-sandbox-policy` 的
+   `workspaceRoot: process.cwd()` 在会话策略里被 `session.header.cwd ?? workspaceRoot` 覆盖；桥
+   自己的 `this.cwd = process.cwd()` 也只是 process 默认值。file snapshot 与 MCP 注入都按会话 cwd 走。
+
+**修法**：共享进程改用 `stableProcessCwd()`（`dsh-process.ts`）启动——`os.homedir()`，不存在或不是
+目录时回落 `os.tmpdir()`；进程级 `initialize` 也随之带同一个目录，桥的 process 默认值不再是某个
+工作区。会话 cwd 仍由 `initialize` 逐会话传递，没有改动。选 home 的理由：它属于用户、不属于任何
+工作区，Paseo 清理工作区不会删它；DSH 的持久化都在 `DSH_HOME` 下，子进程不往 cwd 里写东西。
+选 tmpdir 作回落：它总是存在，只为坏部署兜底（真不存在时 spawn 会响亮失败）。
+
+**检查**：`harness/shared-process-cwd-check.mjs`（假 `dsh` + 一次性 `DSH_HOME`，自己编译到私有
+目录）。用一层 wrapper 记录插件**实际** spawn 出的 cwd（`pwd -P`）和 pid，断言：spawn cwd 是稳定
+目录、不是第一个/第二个会话的工作区；进程级 `initialize` 带同一目录；两个会话各自的 `initialize`
+仍带自己的工作区；删掉第一个会话的工作区后，记录的 spawn cwd 仍存在、同一个 pid 继续服务后续
+prompt。变异：把 `#acquirePoolProcess` 的 spawn cwd 改回 `options.cwd`，检查变红 4 条（退出码 1），
+复原后 13/13。

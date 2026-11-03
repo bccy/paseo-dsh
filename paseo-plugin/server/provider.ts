@@ -23,6 +23,7 @@ import {
 import {
   browserMcpGap,
   DshProcess,
+  stableProcessCwd,
   validateMcpServers,
   type DshCatalog,
   type DshGoalView,
@@ -634,21 +635,26 @@ class DshConnection implements ProviderConnection {
    * lets the session tell "still live" apart from "killed", instead of either
    * resurrecting a dead child or cancelling a live one.
    *
-   * The spawn uses the **first caller's** cwd/route/env as the process defaults.
+   * The spawn uses the **first caller's** route/env as the process defaults.
    * That is deliberate and mostly harmless: every session sends its own cwd and
    * route in `initialize` (`attachSession`), so those defaults only cover a
-   * request that names no session. **The environment is the exception**: it is
-   * applied once at spawn and DSH exposes no channel to change it per session,
-   * so a later session's `config.env` cannot be honoured. That divergence is
-   * not swallowed — {@link #warnEnvDiffers} reports every key that differs, and
-   * the keys are handed back so the open can also put them on the timeline.
+   * request that names no session. **The cwd is the exception, and it is not a
+   * session's**: the child is spawned in {@link stableProcessCwd}, a directory no
+   * workspace owns. Anchoring the process to the first caller's workspace turned
+   * `/proc/<pid>/cwd` into `(deleted)` as soon as that workspace was removed, and
+   * then every session's bash calls failed with `spawn systemd-run ENOENT`
+   * (FIELD-NOTES 91) — session cwd is unaffected because it travels per session.
+   * **The environment is the other exception**: it is applied once at spawn and
+   * DSH exposes no channel to change it per session, so a later session's
+   * `config.env` cannot be honoured. That divergence is not swallowed —
+   * {@link #warnEnvDiffers} reports every key that differs, and the keys are
+   * handed back so the open can also put them on the timeline.
    *
-   * @param options - what to spawn with, when a spawn is needed.
+   * @param options - the route/env to spawn with, when a spawn is needed.
    * @returns the live shared child, whether it was already serving sessions, and
    *   the env keys this session asked for that the child will not apply.
    */
   async #acquirePoolProcess(options: {
-    cwd: string;
     route: DshRoute;
     env: Record<string, string>;
   }): Promise<{ process: DshProcess; reused: boolean; envDiffering: string[] }> {
@@ -686,7 +692,11 @@ class DshConnection implements ProviderConnection {
       // through `attachSession`, and the bridge answers `routeFor` per session
       // (`server.js:648-668`), so the placeholder never sees a prompt.
       const child = new DshProcess({
-        cwd: options.cwd,
+        // Not a session's cwd: this child outlives the session that spawned it,
+        // and a workspace removed while it lives would leave the process cwd
+        // dangling (`(deleted)`), breaking every session's bash. See
+        // {@link stableProcessCwd}.
+        cwd: stableProcessCwd(),
         route: options.route,
         sessionId: POOL_PLACEHOLDER_SESSION_ID,
         env: options.env,
@@ -1627,7 +1637,6 @@ class DshConnection implements ProviderConnection {
         // single session would take the others with it.
         acquireProcess: async () => {
           const acquired = await this.#acquirePoolProcess({
-            cwd: config.cwd,
             route,
             env: config.env ?? {},
           });
