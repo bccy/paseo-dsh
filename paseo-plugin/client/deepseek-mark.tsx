@@ -23,7 +23,7 @@ import { DEEPSEEK_MARK_SVG } from "./deepseek-mark-svg";
  * The DeepSeek whale mark at one square size.
  *
  * @param size - edge length in points; the goal popover passes
- *   {@link GOAL_MARK_SIZE} (16) so the mark matches the first text line's box.
+ *   16 so the mark matches the host's 16px icon slot (`task-list-row.tsx:15-25`).
  */
 export function DeepSeekMark({ size }: { size: number }) {
   return <Icon icon={{ svg: DEEPSEEK_MARK_SVG }} size={size} />;

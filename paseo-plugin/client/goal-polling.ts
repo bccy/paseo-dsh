@@ -40,11 +40,7 @@ import {
   type PollRemoveReason,
   type PollViewState,
 } from "./agent-polling";
-import {
-  isTerminalGoalErrorCode,
-  type GoalAction,
-  type GoalState,
-} from "../shared/goal";
+import { isTerminalGoalErrorCode, type GoalState } from "../shared/goal";
 
 export {
   INITIAL_POLL_JITTER_MS,
@@ -103,8 +99,9 @@ export type GoalLabel =
  *
  * `normal` is the only tone that means "this is working"; a goal that is not
  * auto-continuing is a warning even while its phase is active, and a blocked
- * goal is an error. Mapped to theme tokens by {@link goalToneColorToken} (text)
- * and {@link goalIconColorToken} (the 14px trigger glyph).
+ * goal is an error. Mapped to theme tokens by {@link goalIconColorToken} (the
+ * 14px trigger glyph); the panel's facts line stays muted, like the host's row
+ * facts.
  */
 export type GoalTone = "normal" | "warning" | "error";
 
@@ -344,7 +341,13 @@ export function goalFactsLine(
   statuses: Readonly<Record<string, string>>,
   rounds: (started: number, max: number) => string,
 ): string {
-  return [statuses[goal.phase] ?? goal.phase, rounds(goal.roundsStarted, goal.maxGoalRounds)].join(" · ");
+  // `active + disarmed` is its own fact: the phase alone would say 「进行中」 while
+  // the same panel's pill says 「目标未在续跑」, and the design's disarmed state
+  // reads 「未在续跑 · 第 N 轮 · 预算 M」 (design v1 §98). The word lives in
+  // `statuses.disarmed`; it is not a phase, so it is looked up before the phase.
+  const disarmed = goal.phase === "active" && goal.activation === "disarmed";
+  const word = disarmed ? (statuses.disarmed ?? "disarmed") : (statuses[goal.phase] ?? goal.phase);
+  return [word, rounds(goal.roundsStarted, goal.maxGoalRounds)].join(" · ");
 }
 
 /** The "now" line's content: DSH's own `in_progress` todo text, or undefined. */

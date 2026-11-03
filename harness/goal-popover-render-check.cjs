@@ -149,10 +149,10 @@ const text = {
   notRunning: "目标未在续跑",
   paused: "目标已暂停",
   blocked: "目标受阻",
-  statuses: { active: "进行中", paused: "已暂停", blocked: "受阻", complete: "已完成" },
+  statuses: { active: "进行中", paused: "已暂停", blocked: "受阻", complete: "已完成", disarmed: "未在续跑" },
   rounds: (started, max) => `第 ${String(started)} 轮 · 预算 ${String(max)}`,
   currentTaskPrefix: "正在：",
-  disarmedHint: "重开会话或进程重启后，自动续跑会停止，点「继续」恢复。",
+  disarmedHint: "重开会话后自动续跑会停止",
   clearHint: "清除后目标不再续跑，无法撤销",
   actions: {
     pauseTarget: "暂停目标",
@@ -455,6 +455,9 @@ console.log("\nthe disarmed and blocked pages keep the design's rows");
 {
   const disarmed = render({ goal: { ...baseGoal, activation: "disarmed" } }).container;
   assert("a disarmed goal explains itself", disarmed.textContent.includes("自动续跑会停止"));
+  // The facts line must agree with the pill's 目标未在续跑, not say 进行中.
+  assert("a disarmed goal's facts say 未在续跑", disarmed.textContent.includes("未在续跑 · 第 3 轮 · 预算 10"));
+  assert("a disarmed goal's facts do not say 进行中", !disarmed.textContent.includes("进行中"));
   const blocked = render({
     goal: { ...baseGoal, phase: "blocked", blockedReason: { code: "round-limit", message: "需要确认能否删除 dist/legacy，模型不会自行决定" } },
   }).container;

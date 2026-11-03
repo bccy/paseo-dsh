@@ -35,7 +35,7 @@ import type { PluginButtonContentProps } from "@getpaseo/plugin/client";
 import { Icon, TextInput as UiTextInput } from "@getpaseo/plugin/client/ui";
 import { useState } from "react";
 import { Pressable, Text, View, type PressableStateCallbackType } from "react-native";
-import type { GoalAction, GoalState } from "../shared/goal";
+import type { GoalState } from "../shared/goal";
 import { DeepSeekMark } from "./deepseek-mark";
 import {
   GOAL_EDITOR_MIN_HEIGHT,

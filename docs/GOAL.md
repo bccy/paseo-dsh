@@ -75,66 +75,63 @@ Paseo 0.14.0。
 
 > **DSH 侧源码依据**：`/goal edit <objective>` 内联接收替换目标，`create` 在目标
 > active/paused/blocked 时会被拒绝（"A goal is already …"），命令结果只有 `success` / `error`
-> 两种（`@deepseek-ai/dsh-command-goal/lib/index.js:100-160`）。pill 的「编辑」必须走 `edit`
+> 两种（`@deepseek-ai/dsh-command-goal/lib/index.js:100-160`）。面板的编辑（点目标行）必须走 `edit`
 > 而不是 `create`。
 
 ## 状态、pill 与按钮
 
 目标 pill 注册在 composer（`client.addComposerPill`，独立 id **`dsh-goal`**，与 jobs pill 并列；
-**jobs pill 的语义一行不改**：只在运行中可见、只用转环、文案「N 个后台」）。图标是自绘的
-`Target`（按 tone 着色，见下），**不用转环**，避免和 jobs pill 混淆；`title` 固定为中性名词
+**jobs pill 的语义一行不改**：只在运行中可见、只用转环、文案「N 个后台」）。`title` 固定为中性名词
 「目标」/「Goal」——它同时是手机 sheet 的标题与无障碍名，完整 objective 只在 popover 正文出现
-一次（旧实现把截断 objective 当 title，手机上会「截断目标 + 完整目标」出现两遍）。
-注册时先 `visible:false`，第一次轮询证明有目标才显示。
+一次。注册时先 `visible:false`，第一次轮询证明有目标才显示。
 
 **可见性**：`available && goal !== null && phase !== "complete"`。无目标 / 已完成 / 已清除 →
 隐藏（与 DSH Web GoalBar 同语义：无目标、已完成与成功清除的目标一律不渲染，
 `@deepseek-ai/dsh-client-ui-goal/README.zh.md:38`；survey §D3）。终态错误（桥太旧、profile 没挂
 goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等价，不打扰用户；瞬时错误**保持
-上次状态**，不要把界面闪成「无目标」（`paseo-plugin/client/goal-polling.ts:257-306`）。
+上次状态**，不要把界面闪成「无目标」（`goalPillPresentation`，`paseo-plugin/client/goal-polling.ts`）。
 
-| 状态 | label（zh-CN / en） | 图标 / 圆点颜色 | 可用按钮 |
+| 状态 | label（zh-CN / en） | 图标 | 行尾操作 |
 |---|---|---|---|
-| active + armed | `目标进行中` / `Goal running` | `accent`（正常） | 暂停、编辑、清除 |
-| active + disarmed | `目标未在续跑` / `Goal not running` | `statusWarning` | 继续、编辑、清除 |
-| paused | `目标已暂停` / `Goal paused` | `statusWarning` | 继续、编辑、清除 |
-| blocked | `目标受阻` / `Goal blocked` | `statusDanger` | 继续、编辑、清除 |
+| active + armed | `目标进行中` / `Goal running` | 运行环（agent 在跑时）/ `Target`（`foregroundMuted`） | 暂停、清除；点行编辑 |
+| active + disarmed | `目标未在续跑` / `Goal not running` | `Target`（`statusWarning`） | 继续、清除；点行编辑 |
+| paused | `目标已暂停` / `Goal paused` | `Target`（`statusWarning`） | 继续、清除；点行编辑 |
+| blocked | `目标受阻` / `Goal blocked` | `Target`（`statusDanger`） | 继续、清除；点行编辑 |
 
 **label 不带轮数分数**：`目标 3/10` 在 160px 的按钮里会被读成完成度（上限默认 256），轮数是
-**预算不是完成度**，所以只进 popover 的「第 N 轮 · 预算 M」一行
-（`goalPillPresentation`，`paseo-plugin/client/goal-polling.ts:167-190`）。
+**预算不是完成度**，只进 popover 的 facts 行（`goalFactsLine`）。
 
-**颜色只落在图标与圆点上。** 宿主 `PluginButton.label` 是纯文本、没有颜色通道，pill 的 tone
-由自定义图标组件承载（`goalIconColorToken`：normal→`accent`、warning→`statusWarning`、
-error→`statusDanger`，`paseo-plugin/client/goal-polling.ts:133-144`）；popover 里由「进行中」
-前的 8px 圆点承载（`goalStatusDotColorToken`，`:496-506`）。**状态文字本身不着色**：暗色主题下
-`accent` 作文字只有 2.83:1，不到 AA，所以 active 的文字用 `foreground`（`goalToneColorToken`），
-颜色交给圆点。
+**运行环（v5）**：pill 图标在「目标真的在跑」时**替换**为运行环（`StatusRingMark`，与 jobs pill
+同一个环：12px、900ms、`ringColorFor` 取运行蓝），否则按 tone 着色的 `Target`
+（`goalIconColorToken`：normal→`foregroundMuted`、warning→`statusWarning`、error→`statusDanger`）。
+运行判定是纯函数 `goalRunningMark`：`active + armed` 且 agent `running` 才转；agent 转 `idle` 后
+保持 **1.5s**（`GOAL_RUNNING_HOLD_MS`）；disarmed/paused/blocked/complete、agent 非 running、或
+读不到 agent 状态都不转（不猜）。`useAgent(agentId, a => a.status)` 读宿主 session store，不轮询
+（`client/goal-running.tsx`）。面板里鲸鱼右下角叠同一个环（`-5`、14px 框、行底色镂空）。
 
-**popover 面板**（`paseo-plugin/client/goal-popover.tsx`）：
+**popover 面板**（`paseo-plugin/client/goal-popover.tsx`，v5 行式）：
 
-- 首行：16px DeepSeek 鲸鱼标志（内联 SVG，品牌蓝 `#4d6bfe`，经宿主 `Icon` 的 `{svg}` 形式
-  渲染，`paseo-plugin/client/deepseek-mark*.tsx`）+ 完整 objective（可选中复制；宿主表面自己
-  滚动，不套内层 ScrollView）。
-- 状态行：8px 圆点 + 阶段词（「进行中」/「已暂停」/「受阻」）。
-- 轮数行：「第 N 轮 · 预算 M」/「Round N · budget M」（`rounds`，**不写 `N/M`**）。
-- 「正在：<当前 todo>」/「Now: <content>」：只在 DSH 的 todo 列表有 `in_progress` 项时出现
-  （`goalCurrentTaskLine`，`paseo-plugin/client/goal-polling.ts:559-563`）；没有该项（DSH 每轮
-  重置）就不画这一行。
-- blocked 追加「受阻原因：code — message」；active+disarmed 追加「重开会话或进程重启后，
-  自动续跑会停止，点『继续』恢复。」；错误行。
-- 按钮行：**右对齐、三个按钮等宽**，顺序 `[清除][编辑][主操作]`（主操作最右、唯一 accent
-  填充）；桌面按宿主 sm 几何（高 32），手机按 md（高 44，满足触达下限）；三钮共用同一个
-  `goalButtonMinWidth` 钉宽，标签切换不会让行跳动（`goalActionRowStyle`/`goalButtonRow`/
-  `goalButtonGeometry`，`paseo-plugin/client/goal-polling.ts:223-250,465-530`）。
-- `清除` 二次确认：第一次点击把按钮变红（**红描边 + 红字，不是红底**——红底白字在暗色只有
-  2.80:1，低于 AA）并把文案换成「确认清除」/「Confirm」；宽度被钉住，切换不移动行。
-  任何其它操作复位（`goalActionLabel`/`goalButtonVariant`，`:288-320`）。
-- `编辑` 展开单行输入框（占位「新的目标内容」/「New objective」），回车提交，空文本不提交；
-  操作中按钮置忙（「处理中…」/「Working…」）；成功后立即触发一次 `pollNow` 刷新（不等 4s）；
-  失败原文显示在 popover 里、popover 不关闭。
-- 底部一行提示：「运行中发消息会插入当前轮，不打断目标；停止会暂停目标。」（en 同义，
-  `footnote`）。没有目标时显示「当前没有目标。」，读不到时显示「读不到本会话的目标。」。
+- **目标行**：16px DeepSeek 鲸鱼（内联 SVG，品牌蓝 `#4d6bfe`，经宿主 `Icon` 的 `{svg}` 形式
+  渲染，`paseo-plugin/client/deepseek-mark*.tsx`）+ 目标**单行**（`numberOfLines={1}` 截断；完整
+  文本在编辑字段里）+ facts 行「进行中 · 第 N 轮 · 预算 M」/「Round N · budget M」
+  （`goalFactsLine`：`active + disarmed` 时是「未在续跑」/「Not continuing」，与 pill 的
+  「目标未在续跑」一致）+ 行尾**两个图标按钮**（暂停/继续、清除；桌面 20×20 / 手机 32×32，
+  glyph 14/18，`goalIconButton`）。
+- **点整行进入编辑**（除两个图标按钮外；图标按钮 `stopPropagation`）：行是 `ComposerTrackRow`
+  形态（桌面 hover/按下填 `surface2`），a11y 名「编辑目标」。它是面板里唯一的编辑入口。
+- **编辑页（原位）**：多行字段（`MenuTextField` 同框：`surface2` 底、1px 边、圆角 6）替换目标行，
+  预填全文、自动聚焦、光标在开头；下方分隔线 + 「保存」「取消」两行（宿主 `MenuItem` 几何：
+  手机 40 / 桌面 28，`goalMenuItem`）。回车保存、Esc 取消、**失焦不提交**；空文本与「值未变」都
+  禁用保存（后者是对设计的增补，借 `rename-modal.tsx:111`）。编辑时隐藏「正在」与受阻行。
+- **正在行**：`CircleDot` + 「正在：<当前 todo>」（前缀 muted、内容 foreground，单行；
+  `goalCurrentTaskLine`）。
+- **blocked 行**：`CircleAlert` + DSH 的 blockedReason 原文（两行内）；**disarmed 提示**：
+  「重开会话后自动续跑会停止」（设计 v1 §99 的一行提示）。
+- **清除确认页（原位）**：点清除图标 → 提示「清除后目标不再续跑，无法撤销」→ 分隔线 →
+  红色「清除目标」行（`Trash2` + `statusDanger`）→「取消」行。红色只在此态出现（destructive 是
+  颜色，不是红按钮）。
+- 操作中置忙（「处理中…」/「Working…」）；成功后立即 `pollNow` 刷新（不等 4s）；失败原文显示在
+  popover 里、popover 不关闭。没有目标时显示「当前没有目标。」，读不到时显示「读不到本会话的目标。」。
 
 **为什么不做 todo 进度条**：todo 的产生侧不可靠——调查 38 个真实 DeepSeek 会话：20 个从不调
 `todo_write`，9 个只写 1 次（之后不再更新），8 个写 2 次（多在结束前一次性全标完成，其中 3 个
@@ -168,7 +165,7 @@ Paseo 的发送行为默认是 `sendBehavior: "steer"`（Paseo `packages/app/src
 回合总是排在下一轮 goal 之前。
 
 产品结论：**不阻止运行中发消息**，只需要把「停止会暂停目标」在 pill 上表达清楚（paused 状态 +
-「继续」按钮）。暂停之后用户不 resume，目标就一直停着。
+行尾「继续」图标按钮）。暂停之后用户不 resume，目标就一直停着。
 
 pill 的按钮走**命令注册表**而不是 steer：`paseo-plugin/server/session.ts:1067-1092` 的
 `controlGoal` → `dsh-process.runCommand` → 桥 `paseo/command/run` → DSH `commands.execute` →
@@ -188,7 +185,7 @@ pill 的按钮走**命令注册表**而不是 steer：`paseo-plugin/server/sessi
 
 这就是 pill 必须显示 activation 的原因：如果只看持久投影/时间线行，第二种情形会显示成
 「进行中」，用户以为还在自动跑，其实永远不会再起轮次——**静默降级**（见 FIELD-NOTES 第 86 条）。
-pill 的「继续」按钮与 `/goal resume` 等价；重开后 paused 或 active+disarmed 都应直接可用。
+面板行尾的「继续」图标按钮与 `/goal resume` 等价；重开后 paused 或 active+disarmed 都应直接可用。
 
 补充：重开时历史回合以 `turn:history:N` 重放，Paseo 宿主对 history 事件走 `fromHistory` 分支
 （survey §F5 补充）；UI 侧表现未实测。
@@ -308,7 +305,8 @@ pill 的「继续」按钮与 `/goal resume` 等价；重开后 paused 或 activ
 | 检查 | 断言 | 依赖 | 触发 |
 |---|---|---|---|
 | `harness/goal-bridge-check.mjs` | 15/15 | **本机 DSH 安装**（从全局安装解析 `@deepseek-ai/*`，`DSH_PACKAGES_DIR`/`DSH_INSTALL_DIR` 可覆盖；没有就 exit 2） | 动 `dsh-bridge/lib/server.js` 的 `paseo/goal` / dispatch |
-| `harness/goal-pill-check.cjs` | 254/254 | 纯模块（`tsc -p harness/goal-pill.tsconfig.json`） | 动 `client/goal-polling.ts`、`client/goal-popover.tsx`、`client/goal-pill.tsx`、`client/agent-polling.ts`、`shared/goal.ts` 或 locale goal 表 |
+| `harness/goal-pill-check.cjs` | 175/175 | 纯模块（`tsc -p harness/goal-pill.tsconfig.json`） | 动 `client/goal-polling.ts`、`client/goal-popover.tsx`、`client/goal-pill.tsx`、`client/goal-running.tsx`、`client/agent-polling.ts`、`shared/goal.ts` 或 locale goal 表 |
+| `harness/goal-popover-render-check.cjs` | 51/51 | `HOST_APP` 指向 Paseo 检出（react-native-web + jsdom 渲染真实面板）；未设置 exit 2 | 动 `client/goal-popover.tsx`、`client/deepseek-mark*.tsx` 或面板用到的 `goal-polling.ts` 规则 |
 | `harness/goal-server-check.cjs` | 39/39 | 真实插件 + 假桥（一次性 `DSH_HOME`） | 动 `server/provider.ts` / `server/session.ts` 的 goal 读写、`server/dsh-process.ts` 的 goal 分级与 `currentTask`、`index.server.ts` 的 handler、桥的缺失服务文案 |
 | `harness/goal-timeline-check.cjs` | 6 组 | 真实 `DshSession` + 假进程传输（`plugin-build.cjs` 自编译） | 动 `server/activity-timeline.ts` 的 goal 行、`server/session.ts` 的重放过滤、`server/locale.ts` 的 `goalRound` |
 
@@ -321,6 +319,7 @@ node harness/bridge-assets-check.mjs
 env -u DSH_HOME node harness/goal-bridge-check.mjs
 # goal-pill：cd paseo-plugin && npx tsc -p ../harness/goal-pill.tsconfig.json
 #            然后在 .dbg-goal 里 node goal-pill-check.cjs
+HOST_APP=/path/to/paseo node harness/goal-popover-render-check.cjs
 # goal-server：cd paseo-plugin && npx tsc --noEmit false --outDir .dbg --declaration false \
 #              --module commonjs --moduleResolution node（类型噪音预期），再在 .dbg 里跑
 node harness/goal-timeline-check.cjs

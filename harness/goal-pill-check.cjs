@@ -358,15 +358,31 @@ console.log("\nthe panel rows use the host's track geometry");
 
 console.log("\nthe facts line joins the phase and the round budget");
 {
-  const zh = { active: "进行中", paused: "已暂停", blocked: "受阻", complete: "已完成" };
+  const zh = { active: "进行中", paused: "已暂停", blocked: "受阻", complete: "已完成", disarmed: "未在续跑" };
   const zhRounds = (started, max) => `第 ${String(started)} 轮 · 预算 ${String(max)}`;
   equal("the facts line is one sentence", goalFactsLine(goal(), zh, zhRounds), "进行中 · 第 3 轮 · 预算 10");
+  // `active + disarmed` is not a phase: the facts line must say 未在续跑, matching
+  // the pill's 目标未在续跑 on the same screen (design v1 §98, *-disarmed.png).
+  equal(
+    "disarmed facts start with 未在续跑",
+    goalFactsLine(goal({ phase: "active", activation: "disarmed" }), zh, zhRounds),
+    "未在续跑 · 第 3 轮 · 预算 10",
+  );
+  assert(
+    "the disarmed word wins over the phase word",
+    goalFactsLine(goal({ phase: "active", activation: "disarmed" }), zh, zhRounds) !== goalFactsLine(goal(), zh, zhRounds),
+  );
   equal("an unknown phase falls back to the key", goalFactsLine(goal(), {}, () => "r"), "active · r");
-  const en = { active: "Active", paused: "Paused", blocked: "Blocked", complete: "Complete" };
+  const en = { active: "Active", paused: "Paused", blocked: "Blocked", complete: "Complete", disarmed: "Not continuing" };
   equal(
     "the English facts line",
     goalFactsLine(goal(), en, (started, max) => `Round ${String(started)} · budget ${String(max)}`),
     "Active · Round 3 · budget 10",
+  );
+  equal(
+    "the English disarmed facts line",
+    goalFactsLine(goal({ phase: "active", activation: "disarmed" }), en, (started, max) => `Round ${String(started)} · budget ${String(max)}`),
+    "Not continuing · Round 3 · budget 10",
   );
 }
 

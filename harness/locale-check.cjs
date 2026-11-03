@@ -343,6 +343,18 @@ console.log("the goal pill's copy is covered in both languages");
   check("goal.paused is `目标已暂停` (zh-CN)", zh.paused === "目标已暂停", JSON.stringify(zh.paused));
   check("goal.blocked is `Goal blocked` (en)", en.blocked === "Goal blocked", JSON.stringify(en.blocked));
   check("goal.blocked is `目标受阻` (zh-CN)", zh.blocked === "目标受阻", JSON.stringify(zh.blocked));
+  // `active + disarmed` is not a phase; its facts word must exist and match the
+  // design's disarmed state (v1 §98).
+  check("goal.statuses.disarmed is `Not continuing` (en)", en.statuses.disarmed === "Not continuing", JSON.stringify(en.statuses.disarmed));
+  check("goal.statuses.disarmed is `未在续跑` (zh-CN)", zh.statuses.disarmed === "未在续跑", JSON.stringify(zh.statuses.disarmed));
+  // The disarmed hint is the design's one-line sentence (v1 §99), not a longer
+  // explanation.
+  check("goal.disarmedHint is the design's sentence (zh-CN)", zh.disarmedHint === "重开会话后自动续跑会停止", JSON.stringify(zh.disarmedHint));
+  check(
+    "goal.disarmedHint says a reopen stops auto-continue (en)",
+    en.disarmedHint.toLowerCase().includes("reopen") && en.disarmedHint.toLowerCase().includes("stops"),
+    JSON.stringify(en.disarmedHint),
+  );
 
   // The clear page's hint is the design's sentence: clearing is final. Verbatim
   // in Chinese; English must say the same thing.
@@ -450,8 +462,10 @@ console.log("the goal pill's copy is covered in both languages");
     `no array literal in ${sharedGoalPath}`,
   );
   if (phases !== undefined) {
-    equal("goal.statuses keys are exactly GOAL_PHASES (en)", Object.keys(en.statuses).sort(), [...phases].sort());
-    equal("goal.statuses keys are exactly GOAL_PHASES (zh-CN)", Object.keys(zh.statuses).sort(), [...phases].sort());
+    // `statuses` is the facts word table: every phase plus the `disarmed` word,
+    // which is not a phase but must be selectable for `active + disarmed`.
+    equal("goal.statuses keys are GOAL_PHASES plus disarmed (en)", Object.keys(en.statuses).sort(), [...phases, "disarmed"].sort());
+    equal("goal.statuses keys are GOAL_PHASES plus disarmed (zh-CN)", Object.keys(zh.statuses).sort(), [...phases, "disarmed"].sort());
     const sameStatuses = phases.filter((phase) => en.statuses[phase] === zh.statuses[phase]);
     equal("the English status words are not the Chinese ones", sameStatuses, []);
   }

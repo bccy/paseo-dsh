@@ -180,9 +180,11 @@ export interface JobsText {
  * blocked. The last three are warnings: a goal the user believes is running but
  * is not is the silent degradation this surface exists to fix.
  *
- * `statuses` is keyed by DSH's durable `GoalPhase`, and `harness/locale-check.cjs`
- * asserts the table covers exactly the phases `shared/goal.ts` declares, so a
- * phase DSH adds later cannot fall through to a raw English word.
+ * `statuses` is keyed by DSH's durable `GoalPhase` plus one non-phase word,
+ * `disarmed` (the facts word for `active + disarmed`), and
+ * `harness/locale-check.cjs` asserts the table covers exactly the phases
+ * `shared/goal.ts` declares plus `disarmed`, so a phase DSH adds later cannot
+ * fall through to a raw English word.
  */
 export interface GoalText {
   /** The button's title and the popover's heading: the neutral noun. */
@@ -201,7 +203,7 @@ export interface GoalText {
   paused: string;
   /** Trigger label when the goal is blocked. */
   blocked: string;
-  /** The popover's status line, per durable phase. */
+  /** The facts line's first word, per durable phase, plus `disarmed`. */
   statuses: Record<string, string>;
   /**
    * The popover's round line: the round budget as a sentence.
@@ -518,11 +520,12 @@ const TEXT: Record<Locale, UiText> = {
         paused: "Paused",
         blocked: "Blocked",
         complete: "Complete",
+        /** The facts word for `active + disarmed`, which is not a phase. */
+        disarmed: "Not continuing",
       },
       rounds: (started, max) => `Round ${String(started)} · budget ${String(max)}`,
       currentTaskPrefix: "Now: ",
-      disarmedHint:
-        "Auto-continue stops after a reopen or a process restart. Press Continue to resume it.",
+      disarmedHint: "Auto-continue stops after you reopen the session.",
       clearHint: "Clearing stops the goal for good; this cannot be undone.",
       actions: {
         pauseTarget: "Pause goal",
@@ -768,12 +771,14 @@ const TEXT: Record<Locale, UiText> = {
         paused: "已暂停",
         blocked: "受阻",
         complete: "已完成",
+        /** `active + disarmed` 的 facts 词，不是 phase。 */
+        disarmed: "未在续跑",
       },
       // 预算不是完成度：不写 N/M 分数形态，避免被读成进度。
       rounds: (started, max) => `第 ${String(started)} 轮 · 预算 ${String(max)}`,
       currentTaskPrefix: "正在：",
-      // DESIGN §2 的原文：把「为什么没在续跑、怎么恢复」说清楚。
-      disarmedHint: "重开会话或进程重启后，自动续跑会停止，点「继续」恢复。",
+      // 设计 v1 §99 的一行提示原文。
+      disarmedHint: "重开会话后自动续跑会停止",
       clearHint: "清除后目标不再续跑，无法撤销",
       actions: {
         pauseTarget: "暂停目标",
