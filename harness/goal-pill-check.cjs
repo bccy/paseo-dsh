@@ -44,34 +44,36 @@ const {
   goalControl,
 } = require("./shared/goal.js");
 const {
-  GOAL_BODY_GAP,
-  GOAL_MARK_GAP,
-  GOAL_MARK_SIZE,
-  GOAL_OBJECTIVE_MAX_LINES,
+  GOAL_EDITOR_MIN_HEIGHT,
+  GOAL_EDITOR_WIDTH_WIDE,
+  GOAL_FACTS_LINE_HEIGHT,
+  GOAL_HINT_PADDING_HORIZONTAL,
+  GOAL_HINT_PADDING_VERTICAL,
+  GOAL_OBJECTIVE_LINE_HEIGHT,
+  GOAL_RING_FRAME_SIZE,
+  GOAL_RING_OFFSET,
+  GOAL_RUNNING_HOLD_MS,
+  GOAL_SEPARATOR_HEIGHT,
+  GOAL_SEPARATOR_MARGIN_VERTICAL,
+  GOAL_WHALE_SIZE,
   INITIAL_POLL_JITTER_MS,
   LIVE_POLL_MS,
   MAX_POLL_JITTER_MS,
   MAX_POLL_MS,
-  clearConfirmStep,
   createGoalPoller,
-  goalActionIcon,
-  goalActionLabel,
-  goalActionsFor,
   goalCurrentTaskLine,
   goalEditDraftValid,
+  goalEditSubmittable,
+  goalFactsLine,
+  goalIconButton,
   goalIconColorToken,
+  goalMenuItem,
   goalPillPresentation,
-  goalStatusDotColorToken,
-  goalStatusLine,
-  goalToneColorToken,
+  goalRunningMark,
+  goalTrackRow,
   initialPollDelayMs,
   nextPollDelayMs,
 } = require("./client/goal-polling.js");
-const {
-  DEEPSEEK_MARK_BRAND_BLUE,
-  DEEPSEEK_MARK_SVG,
-} = require("./client/deepseek-mark-svg.js");
-const { rowBox } = require("./client/jobs-popover-layout.js");
 
 let failures = 0;
 let checks = 0;
@@ -297,103 +299,163 @@ console.log("\nthe four states the trigger must tell apart");
 
   // The trigger's glyph: the label is plain text the host paints, so the tone
   // reaches the pill only through the icon component's colour.
-  equal("the running tone colours the glyph with accent", goalIconColorToken("normal"), "accent");
+  // The design's one-signal-one-token rule: a normal (non-running) glyph is the
+  // same muted mark every host rail uses; the running state is the ring, not a
+  // colour.
+  equal("the normal tone colours the glyph muted", goalIconColorToken("normal"), "foregroundMuted");
   equal("the warning tone colours the glyph with statusWarning", goalIconColorToken("warning"), "statusWarning");
   equal("the error tone colours the glyph with statusDanger", goalIconColorToken("error"), "statusDanger");
-  equal("the running tone colours the status line with foreground", goalToneColorToken("normal"), "foreground");
 }
 
-/* The row-style panel (plan C) ---------------------------------------------- */
+/* The panel's geometry (the host's numbers, value for value) ---------------- */
 
-console.log("\nthe action rows follow the host's menu-row grammar");
+console.log("\nthe panel rows use the host's track geometry");
 {
-  // The brief forbids filled/bordered buttons; the actions are the host's
-  // icon+title menu rows, sized by the same `rowBox` the jobs popover uses
-  // (32 on wide layouts / 40 on the phone sheet — its 40px touch floor).
-  const wide = rowBox({ compact: false });
-  const phone = rowBox({ compact: true });
-  equal("the wide action row is the host's 32px row", wide.minHeight, 32);
-  equal("the phone action row meets the 40px touch floor", phone.minHeight, 40);
-  equal("the action row has no border", "borderWidth" in phone, false);
-  equal("the action row is a row", phone.flexDirection, "row");
-  equal("the action row uses the host's 6px radius", phone.borderRadius, 6);
+  // composer/tracks.tsx:347-379 `trackRow`, value for value.
+  const wide = goalTrackRow(false);
+  const compact = goalTrackRow(true);
+  equal("the wide row is the host's 32px row", wide.minHeight, 32);
+  equal("the phone row meets the host's 40px row", compact.minHeight, 40);
+  equal("the row insets 4 from the surface", wide.marginHorizontal, 4);
+  equal("the row pads 8 horizontally", wide.paddingHorizontal, 8);
+  equal("the wide row pads 4 vertically", wide.paddingVertical, 4);
+  equal("the phone row pads 8 vertically", compact.paddingVertical, 8);
+  equal("the row radius is the host's 6", wide.borderRadius, 6);
+  equal("the row gap is the host's 8", wide.gap, 8);
+  equal("the row is a row", wide.flexDirection, "row");
+  equal("the phone row insets the same 4", compact.marginHorizontal, 4);
 
-  // One icon per action, from the host's Lucide set.
-  equal("pause draws Pause", goalActionIcon("pause"), "Pause");
-  equal("resume draws Play", goalActionIcon("resume"), "Play");
-  equal("edit draws Pencil", goalActionIcon("edit"), "Pencil");
-  equal("clear draws Trash2", goalActionIcon("clear"), "Trash2");
+  // menu-item.tsx:441 `item`: 28 wide / 40 compact, always a 1px border.
+  equal("the menu row is the host's 28px row", goalMenuItem(false).minHeight, 28);
+  equal("the phone menu row is 40", goalMenuItem(true).minHeight, 40);
+  equal("the menu row keeps a 1px border", goalMenuItem(false).borderWidth, 1);
+  equal("the menu row insets 4", goalMenuItem(false).marginHorizontal, 4);
+  equal("the menu row pads 8 horizontally", goalMenuItem(false).paddingHorizontal, 8);
 
-  // Titles and the semantic set per state.
-  const zh = { pause: "暂停", resume: "继续", edit: "编辑目标", clear: "清除目标", confirmClear: "确认清除" };
-  equal("active+armed offers pause, edit, clear", [...goalActionsFor(goal())], ["pause", "edit", "clear"]);
-  equal("clear reads 清除目标", goalActionLabel("clear", false, zh), "清除目标");
-  equal("armed clear reads 确认清除", goalActionLabel("clear", true, zh), "确认清除");
-  equal("edit reads 编辑目标", goalActionLabel("edit", false, zh), "编辑目标");
-  equal("pause reads 暂停", goalActionLabel("pause", false, zh), "暂停");
-  equal("resume reads 继续", goalActionLabel("resume", false, zh), "继续");
-  for (const [what, state] of [
-    ["active+disarmed", goal({ activation: "disarmed" })],
-    ["paused", goal({ phase: "paused" })],
-    ["blocked", goal({ phase: "blocked", blockedReason: { code: "round-limit", message: "x" } })],
-  ]) {
-    equal(`${what} offers resume, edit, clear`, [...goalActionsFor(state)], ["resume", "edit", "clear"]);
+  // icon-button-chrome.ts:11-14: 20x20 / 32x32, glyph 14 / 18.
+  equal("the wide icon button is 20", goalIconButton(false).size, 20);
+  equal("the phone icon button meets the touch floor", goalIconButton(true).size, 32);
+  equal("the wide glyph is 14", goalIconButton(false).glyph, 14);
+  equal("the phone glyph is 18", goalIconButton(true).glyph, 18);
+  equal("the icon button radius is the host's 6", goalIconButton(false).borderRadius, 6);
+
+  // The design's constants, as numbers so a silent change fails here.
+  equal("the whale is the host's 16px slot", GOAL_WHALE_SIZE, 16);
+  equal("the corner ring frame is 14", GOAL_RING_FRAME_SIZE, 14);
+  equal("the corner ring offset is the host's -5", GOAL_RING_OFFSET, -5);
+  equal("the objective line is 20", GOAL_OBJECTIVE_LINE_HEIGHT, 20);
+  equal("the facts line is 16", GOAL_FACTS_LINE_HEIGHT, 16);
+  equal("the edit field is four lines tall", GOAL_EDITOR_MIN_HEIGHT, 80);
+  equal("the edit page is the popover's content width", GOAL_EDITOR_WIDTH_WIDE, 396);
+  equal("the separator is 1px", GOAL_SEPARATOR_HEIGHT, 1);
+  equal("the separator breathes 4", GOAL_SEPARATOR_MARGIN_VERTICAL, 4);
+  equal("the hint pads 12 horizontally", GOAL_HINT_PADDING_HORIZONTAL, 12);
+  equal("the hint pads 8 vertically", GOAL_HINT_PADDING_VERTICAL, 8);
+  equal("the running hold is 1.5s", GOAL_RUNNING_HOLD_MS, 1500);
+}
+
+/* The facts line ------------------------------------------------------------ */
+
+console.log("\nthe facts line joins the phase and the round budget");
+{
+  const zh = { active: "进行中", paused: "已暂停", blocked: "受阻", complete: "已完成" };
+  const zhRounds = (started, max) => `第 ${String(started)} 轮 · 预算 ${String(max)}`;
+  equal("the facts line is one sentence", goalFactsLine(goal(), zh, zhRounds), "进行中 · 第 3 轮 · 预算 10");
+  equal("an unknown phase falls back to the key", goalFactsLine(goal(), {}, () => "r"), "active · r");
+  const en = { active: "Active", paused: "Paused", blocked: "Blocked", complete: "Complete" };
+  equal(
+    "the English facts line",
+    goalFactsLine(goal(), en, (started, max) => `Round ${String(started)} · budget ${String(max)}`),
+    "Active · Round 3 · budget 10",
+  );
+}
+
+/* The running mark (the design's A2 truth table) ---------------------------- */
+
+console.log("\nthe running mark follows the design's truth table");
+{
+  const running = { phase: "active", activation: "armed", agentStatus: "running", now: 1000 };
+  equal("a running agent turns the ring", goalRunningMark(running), true);
+  equal("an idle agent inside the hold turns", goalRunningMark({ ...running, agentStatus: "idle", holdUntil: 2500 }), true);
+  equal("an idle agent past the hold stops", goalRunningMark({ ...running, agentStatus: "idle", holdUntil: 900 }), false);
+  equal("an idle agent with no hold stops", goalRunningMark({ ...running, agentStatus: "idle" }), false);
+  equal("a disarmed goal never turns", goalRunningMark({ ...running, activation: "disarmed" }), false);
+  equal("a paused goal never turns", goalRunningMark({ ...running, phase: "paused" }), false);
+  equal("a blocked goal never turns", goalRunningMark({ ...running, phase: "blocked" }), false);
+  equal("a complete goal never turns", goalRunningMark({ ...running, phase: "complete" }), false);
+  for (const status of ["initializing", "error", "closed"]) {
+    equal(`${status} never turns`, goalRunningMark({ ...running, agentStatus: status }), false);
   }
-
-  // The header objective is one truncated line; the full text is the edit field.
-  equal("the objective is one line", GOAL_OBJECTIVE_MAX_LINES, 1);
-
-  // The status line is one line: phase · round budget.
-  equal(
-    "the status line joins the phase and the round budget",
-    goalStatusLine(goal(), { active: "进行中" }, (started, max) => `第 ${String(started)} 轮 · 预算 ${String(max)}`),
-    "进行中 · 第 3 轮 · 预算 10",
-  );
-  equal(
-    "the status line falls back to the phase key for an unknown phase word",
-    goalStatusLine(goal({ phase: "active" }), {}, () => "r"),
-    "active · r",
-  );
-
-  // Dot colours: the tone channel, not the text colour.
-  equal("the running tone draws an accent dot", goalStatusDotColorToken("normal"), "accent");
-  equal("the warning tone draws a warning dot", goalStatusDotColorToken("warning"), "statusWarning");
-  equal("the error tone draws a danger dot", goalStatusDotColorToken("error"), "statusDanger");
-  equal("status text keeps the AA-safe token", goalToneColorToken("normal"), "foreground");
-  equal("warning status text", goalToneColorToken("warning"), "statusWarning");
-  equal("error status text", goalToneColorToken("error"), "statusDanger");
+  equal("an unreadable agent status never turns", goalRunningMark({ ...running, agentStatus: null }), false);
+  equal("an undefined agent status never turns", goalRunningMark({ ...running, agentStatus: undefined }), false);
+  // The hold is a window, not a latch: the same idle status turns inside it and
+  // stops outside it.
+  const idle = { ...running, agentStatus: "idle", holdUntil: 2000 };
+  equal("inside the hold", goalRunningMark({ ...idle, now: 1999 }), true);
+  equal("at the hold boundary", goalRunningMark({ ...idle, now: 2000 }), false);
 }
 
-/* The destructive row and the edit row (pure rules) ------------------------- */
+/* The trigger glyph's colour ------------------------------------------------ */
 
-console.log("\nthe clear row takes two clicks; the edit row refuses empty text");
+console.log("\nthe trigger glyph is muted, warning or danger");
 {
-  equal("the first click arms", clearConfirmStep(false), "arm");
-  equal("the second click runs", clearConfirmStep(true), "run");
+  equal("a normal goal is muted", goalIconColorToken("normal"), "foregroundMuted");
+  equal("a warning goal is warning", goalIconColorToken("warning"), "statusWarning");
+  equal("an error goal is danger", goalIconColorToken("error"), "statusDanger");
+}
+
+/* The edit page's rules ----------------------------------------------------- */
+
+console.log("\nthe edit page refuses empty and unchanged drafts");
+{
   for (const value of ["", "   ", "\n\t"]) {
-    check(`${JSON.stringify(value)} is not submittable`, goalEditDraftValid(value), false);
+    check(`${JSON.stringify(value)} is not submittable`, goalEditSubmittable(value, "old"), false);
   }
-  for (const value of ["x", "  x  ", "把目标改短"]) {
-    check(`${JSON.stringify(value)} is submittable`, goalEditDraftValid(value), true);
-  }
+  equal("a changed draft is submittable", goalEditSubmittable("new", "old"), true);
+  equal("an unchanged draft is not submittable", goalEditSubmittable("old", "old"), false);
+  equal("the same text with spaces is a change", goalEditSubmittable(" old ", "old"), true);
+  equal("the empty-draft rule alone", goalEditDraftValid(""), false);
+  equal("a non-empty draft alone", goalEditDraftValid("x"), true);
 }
 
-/* The popover's content lines                                                 */
+/* The popover's wiring (source-level: it is JSX) ---------------------------- */
 
-/* The popover's "now" line ----------------------------------------------- */
-
-console.log("\nthe current-task line only exists when DSH has one in progress");
+console.log("\nthe trigger and popover wiring");
 {
-  // The task comes from DSH's `todos` projection; the popover trims it and
-  // draws nothing when it is absent or blank (DSH resets the list every turn).
-  equal("an in-progress task is shown verbatim", goalCurrentTaskLine(goal({ currentTask: "write the UI revision" })), "write the UI revision");
-  equal("the task is trimmed", goalCurrentTaskLine(goal({ currentTask: "  padded task  " })), "padded task");
-  equal("no task means no line", goalCurrentTaskLine(goal()), undefined);
-  equal("a blank task means no line", goalCurrentTaskLine(goal({ currentTask: "   " })), undefined);
-  equal("an empty task means no line", goalCurrentTaskLine(goal({ currentTask: "" })), undefined);
-}
+  // The values above are asserted directly; these pin the call sites. Only code
+  // forms are matched — never a bare identifier or a style literal (a literal in
+  // a doc comment once satisfied a check). The rendered DOM — row press opens
+  // the editor, exactly two icon buttons, no edit button, Escape/blur — is
+  // asserted by `harness/goal-popover-render-check.cjs`.
+  const repoRoot = path.resolve(__dirname, "..", "..");
+  const readRepo = (relative) => fs.readFileSync(path.join(repoRoot, relative), "utf8");
+  const pill = readRepo("paseo-plugin/client/goal-pill.tsx");
+  const popover = readRepo("paseo-plugin/client/goal-popover.tsx");
+  const mark = readRepo("paseo-plugin/client/deepseek-mark.tsx");
 
-/* The destructive confirmation ---------------------------------------------- */
+  assert("the trigger's title is the fixed noun", /title: text\.title/.test(pill));
+  assert("the trigger's title is not the objective", !/title:.*goal\.objective/.test(pill));
+  // The pill's icon slot: the running ring replaces the glyph, else a Target.
+  assert(
+    "the trigger's icon switches to the ring while running",
+    /if \(running\) \{[\s\S]{0,400}StatusRingMark/.test(pill),
+  );
+  assert("the static glyph is the Target", /name="Target"/.test(pill));
+  // The objective row is the host's track row and the edit entry.
+  assert("the objective row is a track row", /goalTrackRow\(compact\)/.test(popover));
+  assert("the objective is one truncated line", /numberOfLines=\{1\}[\s\S]{0,400}?\{goal\.objective\}/.test(popover));
+  assert("the facts line comes from the pure rule", /goalFactsLine\(goal, text\.statuses, text\.rounds\)/.test(popover));
+  // The edit and clear pages are the host's menu rows.
+  assert("the edit page uses the menu row", /goalMenuItem\(false\)/.test(popover));
+  assert("the clear page's row is destructive", /destructive/.test(popover));
+  // The old button component and the footnote are gone.
+  assert("no filled-button component remains", !/function ActionButton/.test(popover));
+  assert("the footnote is gone", !/text\.footnote/.test(popover));
+  // The panel cancels the host's popover content padding.
+  assert("the panel cancels the host content padding", /popoverRootBox\(\)/.test(popover));
+  // The whale draws through the host's svg seam.
+  assert("the mark renders through the host's svg icon", /icon=\{\{ svg: DEEPSEEK_MARK_SVG \}\}/.test(mark));
+}
 
 /* The poll cadence is the jobs pill's ---------------------------------------- */
 
@@ -410,43 +472,6 @@ console.log("\nthe poll cadence matches the jobs pill's");
   equal("the second failure backs off to 16s", nextPollDelayMs(2, () => 0), 16_000);
   equal("the third failure hits the cap", nextPollDelayMs(3, () => 0), MAX_POLL_MS);
   equal("the first poll is jittered", initialPollDelayMs(() => 0.5), Math.floor(0.5 * INITIAL_POLL_JITTER_MS));
-}
-
-/* The popover's wiring (source-level: it is JSX) ----------------------------- */
-
-console.log("\nthe trigger and popover wiring");
-{
-  // The values above are asserted directly; these pin the call sites. **Only
-  // code forms** are matched — never a bare identifier or a style literal (the
-  // previous version matched a literal its own doc comment contained). The
-  // rendered DOM — edit field, absence of button chrome — is asserted by
-  // `harness/goal-popover-render-check.cjs`, not here.
-  const repoRoot = path.resolve(__dirname, "..", "..");
-  const readRepo = (relative) => fs.readFileSync(path.join(repoRoot, relative), "utf8");
-  const pill = readRepo("paseo-plugin/client/goal-pill.tsx");
-  const popover = readRepo("paseo-plugin/client/goal-popover.tsx");
-  const mark = readRepo("paseo-plugin/client/deepseek-mark.tsx");
-
-  // The title is the fixed noun, never the objective.
-  assert("the trigger's title is the fixed noun", /title: text\.title/.test(pill));
-  assert("the trigger's title is not the objective", !/title:.*goal\.objective/.test(pill));
-  // The trigger's glyph is the tone-coloured component.
-  assert("the trigger's icon is the tone-coloured component", /icon: makeGoalIcon\(store, agent\.id\)/.test(pill));
-  assert("the glyph colours from the tone token", /theme\.colors\[goalIconColorToken\(tone\)\]/.test(pill));
-  // Opening the edit row pre-fills the full objective.
-  assert("the container pre-fills the draft from the objective", /setDraft\(goal\.objective\)/.test(pill));
-  // Rows use the host's row box; the edit field uses the host's sheet-aware input.
-  assert("the action rows use the host row box", /rowBox\(\{ compact \}\)/.test(popover));
-  assert("the edit field is the host's sheet-aware TextInput", /TextInput as UiTextInput/.test(popover));
-  // The old filled-button component and its min-width logic are gone.
-  assert("no filled-button component remains", !/function ActionButton/.test(popover));
-  assert("no min-width button logic remains", !/goalButtonMinWidth/.test(popover));
-  // The popover draws the DeepSeek mark and the mark uses the host svg channel.
-  assert("the popover draws the DeepSeek mark", /<DeepSeekMark size=\{GOAL_MARK_SIZE\}/.test(popover));
-  assert("the mark renders through the host's svg icon", /icon=\{\{ svg: DEEPSEEK_MARK_SVG \}\}/.test(mark));
-  // The status line and the now line are drawn from the pure rules.
-  assert("the status line uses the pure status rule", /goalStatusLine\(goal, text\.statuses, text\.rounds\)/.test(popover));
-  assert("the now line is drawn only when present", /goalCurrentTaskLine\(goal\)/.test(popover));
 }
 
 /* The controller, driven by a fake clock ------------------------------------- */

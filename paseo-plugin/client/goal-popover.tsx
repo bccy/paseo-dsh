@@ -1,70 +1,69 @@
 /**
- * The goal popover's body: a **Paseo row-style panel**, not a card of buttons.
+ * The goal popover's body: a **Paseo track panel**, not a card of buttons.
  *
- * The first revision drew the actions as three large rounded buttons. On a real
- * iOS device the user reported that (a) the buttons did not look like Paseo,
- * (b) tapping 编辑 showed no input, and (c) the objective wrapped to two lines.
- * This revision follows the survey's plan C: the host's own menu-row grammar —
- * an icon + title row per action, no fills, no borders — with the goal header
- * truncated to one line and the edit field in place of its row.
+ * The user's design (design-opus-v3) is the specification; this file implements
+ * it with the geometry of the host's own rows, value for value:
  *
- * **Why the old edit field was invisible on iOS.** It was a bare React Native
- * `TextInput` (`react-native`'s, imported in the previous version of this file)
- * placed inside the host's compact bottom sheet. The host's own text field is
- * `SheetAwareTextInput`, which renders `@gorhom/bottom-sheet`'s
- * `BottomSheetTextInput` when it is inside a sheet on native
- * (`packages/app/src/components/ui/text-input/sheet-aware.tsx:17-25`); that
- * component registers focus with the sheet. The host's sheet uses
- * `keyboardBehavior="interactive"` with a content-sized sheet precisely so the
- * keyboard moves the sheet up instead of covering the field
- * (`packages/app/src/components/ui/menu/menu-surface.tsx:420-424`). A bare RN
- * `TextInput` never registers, so the sheet does not move and the keyboard
- * covers the new field — on the device it looks like "no edit box appeared".
- * The fix is to use the plugin UI kit's `TextInput`, which is that same
- * sheet-aware component (`packages/app/src/plugins/react-native/ui.ts:25`).
+ * - **The objective row** is a `ComposerTrackRow` (`composer/tracks.tsx:347-379`:
+ *   32px / 40px compact, 4px inset, 8px padding, 6px radius) whose whole body is
+ *   the edit entry. It carries the whale, the objective on **one** truncated line
+ *   (`numberOfLines={1}`), a facts line (`进行中 · 第 3 轮 · 预算 10`) and two
+ *   row-end icon buttons — pause/continue and clear. There is no edit button: the
+ *   row itself is the edit affordance (hover/press fills `surface2`, the host's
+ *   `rowActive`), which is how the host's pressable track rows read.
+ * - **The "now" row** is a track row with a `CircleDot` and the current todo.
+ * - **Blocked / disarmed / error** are the design's one-line rows and hint.
+ * - **Edit** replaces the objective row **in place** with a multi-line field in
+ *   `MenuTextField`'s box (`menu-item.tsx:441` + `:457-478`: `surface2`, 1px
+ *   border, 6px radius), then a separator and two menu rows, 保存 and 取消. The
+ *   caret starts at offset 0 so a long goal is read from its start; Enter saves,
+ *   Escape cancels, and **blur never saves** — a long objective is too expensive
+ *   to change by accident.
+ * - **Clear** is an in-place confirmation page (hint, separator, red 清除目标
+ *   row, 取消 row). Red appears only after the user has said they want to clear.
+ * - **Running**: the whale carries the host's status ring in its bottom-right
+ *   corner (offset -5, 14px frame, row-colour knockout), exactly as the host's
+ *   `StatusIcon` overlays a provider icon.
  *
- * **The layout.** Top to bottom: the DeepSeek mark + the objective on one line
- * (truncated; the full text appears in the edit field when editing), the status
- * line (8px tone dot + phase word · round budget), the optional "now" line, the
- * blocker / disarmed hint / error lines, the action rows, and the one-line
- * footnote. The edit row replaces itself with an inline single-line field and
- * two text actions (save / cancel); the clear row switches to its confirmation
- * state (red "confirm clear" + cancel). Both rows keep the row grammar — no
- * button chrome.
+ * The panel root cancels `PluginPopoverContent`'s 12px padding with a -12 margin
+ * (`popoverRootBox`), which is what lets rows sit on the host's 4px rail; the
+ * old panel kept that padding and read as inset content rather than rows.
  *
  * @module dsh-paseo/client/goal-popover
  */
 import type { PluginButtonContentProps } from "@getpaseo/plugin/client";
 import { Icon, TextInput as UiTextInput } from "@getpaseo/plugin/client/ui";
+import { useState } from "react";
 import { Pressable, Text, View, type PressableStateCallbackType } from "react-native";
 import type { GoalAction, GoalState } from "../shared/goal";
 import { DeepSeekMark } from "./deepseek-mark";
 import {
-  GOAL_BODY_GAP,
-  GOAL_MARK_GAP,
-  GOAL_MARK_SIZE,
-  GOAL_OBJECTIVE_MAX_LINES,
-  goalActionIcon,
-  goalActionLabel,
-  goalActionsFor,
+  GOAL_EDITOR_MIN_HEIGHT,
+  GOAL_EDITOR_WIDTH_WIDE,
+  GOAL_FACTS_LINE_HEIGHT,
+  GOAL_HINT_PADDING_HORIZONTAL,
+  GOAL_HINT_PADDING_VERTICAL,
+  GOAL_OBJECTIVE_LINE_HEIGHT,
+  GOAL_RING_FRAME_SIZE,
+  GOAL_RING_OFFSET,
+  GOAL_SEPARATOR_HEIGHT,
+  GOAL_SEPARATOR_MARGIN_VERTICAL,
+  GOAL_WHALE_SIZE,
   goalCurrentTaskLine,
-  goalEditDraftValid,
-  goalPillPresentation,
-  goalStatusDotColorToken,
-  goalStatusLine,
-  goalToneColorToken,
+  goalEditSubmittable,
+  goalFactsLine,
+  goalIconButton,
+  goalMenuItem,
+  goalTrackRow,
 } from "./goal-polling";
 import {
   FACTS_FONT_SIZE,
-  POPOVER_HOST_PADDING,
-  ROW_GAP,
   TITLE_FONT_SIZE,
-  rowActiveFill,
-  rowBox,
-  rowTextColumn,
   popoverRootBox,
+  ringColorFor,
 } from "./jobs-popover-layout";
 import type { GoalText } from "./locale";
+import { StatusRingMark } from "./status-ring";
 
 /** The host's popover theme slot, so the type is not spelled at every call. */
 type PopoverTheme = PluginButtonContentProps["theme"];
@@ -72,102 +71,191 @@ type PopoverTheme = PluginButtonContentProps["theme"];
 /** The host's hover/press callback state, as `jobs-pill.tsx` reads it. */
 type HoverState = PressableStateCallbackType & { hovered?: boolean };
 
+/** The panel's three in-place pages. */
+export type GoalPanelMode = "view" | "edit" | "confirm";
+
 /** A disabled control's opacity, matching the host's disabled button. */
 const BUSY_OPACITY = 0.5;
 
 /**
- * One action row: icon + title, drawn with the same `rowBox` the jobs popover
- * uses (32px tall on wide layouts, 40px on the phone sheet — the touch floor).
+ * The whale with the running ring on its bottom-right corner.
  *
- * No background at rest and no border; hover/press paints the host's row fill
- * (`rowActiveFill`), exactly like the host's menu rows. The destructive label
- * turns red only in its confirmation state.
+ * The host's `StatusIcon` (`components/status-icon.tsx:59-70`) overlays a 14px
+ * ring frame at `getStatusRingOffset(-2, 8)` = -5 and fills the frame with the
+ * row's own background so the ring punches a hole in the icon instead of sitting
+ * on a square patch. `backdrop` is that fill: the row's surface at rest, or
+ * `surface2` while the row is hovered/pressed.
  */
-function ActionRow({
-  action,
+function Whale({
+  running,
+  theme,
+  backdrop,
   label,
-  compact,
-  danger,
+}: {
+  running: boolean;
+  theme: PopoverTheme;
+  backdrop: string;
+  label: string;
+}) {
+  return (
+    <View style={{ width: GOAL_WHALE_SIZE, height: GOAL_WHALE_SIZE, flexShrink: 0 }}>
+      <DeepSeekMark size={GOAL_WHALE_SIZE} />
+      {running ? (
+        <View
+          accessibilityRole="progressbar"
+          accessibilityLabel={label}
+          style={{
+            position: "absolute",
+            right: GOAL_RING_OFFSET,
+            bottom: GOAL_RING_OFFSET,
+            width: GOAL_RING_FRAME_SIZE,
+            height: GOAL_RING_FRAME_SIZE,
+            borderRadius: GOAL_RING_FRAME_SIZE / 2,
+            backgroundColor: backdrop,
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <StatusRingMark size={GOAL_RING_FRAME_SIZE} color={ringColorFor(theme.colors.surface0)} />
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+/**
+ * One row-end icon button: `ToolbarButton`'s box at the host's sizes (20×20 with
+ * a 14px glyph on pointer layouts, 32×32 with an 18px glyph under a finger),
+ * hover filled `surface2` because the plugin theme has no `interactionHighlight`.
+ *
+ * The press must **not** bubble into the row's own press (the row opens the
+ * editor): the host's rule for nested controls (`providers-section.tsx`'s
+ * `stopPropagation`) is applied here.
+ */
+function IconButton({
+  name,
+  glyph,
+  size,
+  color,
   disabled,
   theme,
+  label,
   onPress,
 }: {
-  action: GoalAction;
-  label: string;
-  compact: boolean;
-  danger: boolean;
+  name: "Pause" | "Play" | "Trash2";
+  glyph: number;
+  size: number;
+  color: string;
   disabled: boolean;
   theme: PopoverTheme;
+  label: string;
   onPress: () => void;
 }) {
-  const box = rowBox({ compact });
-  const style = ({ hovered = false, pressed }: HoverState) => {
-    const fill = rowActiveFill(hovered, pressed);
-    return {
-      ...box,
-      backgroundColor: fill === undefined ? "transparent" : theme.colors[fill],
-      opacity: disabled ? BUSY_OPACITY : 1,
-    } as const;
-  };
+  const style = ({ hovered = false, pressed }: HoverState) => ({
+    width: size,
+    height: size,
+    borderRadius: 6,
+    alignItems: "center" as const,
+    justifyContent: "center" as const,
+    backgroundColor: hovered || pressed ? theme.colors.surface2 : "transparent",
+    opacity: disabled ? BUSY_OPACITY : 1,
+  });
   return (
     <Pressable
-      onPress={onPress}
+      onPress={(event) => {
+        event.stopPropagation?.();
+        if (!disabled) onPress();
+      }}
       disabled={disabled}
       accessibilityRole="button"
       accessibilityLabel={label}
       accessibilityState={{ disabled }}
       style={style}
     >
-      <Icon
-        name={goalActionIcon(action)}
-        size={14}
-        color={danger ? theme.colors.statusDanger : theme.colors.foregroundMuted}
-      />
-      <Text
-        numberOfLines={1}
-        style={{
-          ...rowTextColumn(),
-          fontSize: TITLE_FONT_SIZE,
-          color: danger ? theme.colors.statusDanger : theme.colors.foreground,
-        }}
-      >
+      <Icon name={name} size={glyph} color={color} />
+    </Pressable>
+  );
+}
+
+/**
+ * One menu row: `menu-item.tsx:441`'s box, a 16px leading glyph when given, a
+ * 14px label, hover filled `surface2`. Destructive rows paint both the glyph and
+ * the label `statusDanger` — the host's `MenuItem destructive` (a colour, not a
+ * red button).
+ */
+function MenuRow({
+  icon,
+  label,
+  destructive,
+  disabled,
+  theme,
+  onPress,
+}: {
+  icon?: "Check" | "Trash2";
+  label: string;
+  destructive?: boolean;
+  disabled?: boolean;
+  theme: PopoverTheme;
+  onPress: () => void;
+}) {
+  const box = goalMenuItem(false);
+  const color = destructive === true ? theme.colors.statusDanger : theme.colors.foreground;
+  const glyphColor = destructive === true ? theme.colors.statusDanger : theme.colors.foregroundMuted;
+  const style = ({ hovered = false, pressed }: HoverState) => ({
+    ...box,
+    borderColor: "transparent",
+    backgroundColor: hovered || pressed ? theme.colors.surface2 : "transparent",
+    opacity: disabled === true ? BUSY_OPACITY : 1,
+  });
+  return (
+    <Pressable
+      onPress={() => {
+        if (disabled !== true) onPress();
+      }}
+      disabled={disabled}
+      accessibilityRole="button"
+      accessibilityLabel={label}
+      accessibilityState={{ disabled: disabled === true }}
+      style={style}
+    >
+      {icon === undefined ? null : (
+        <View style={{ width: 16, alignItems: "center" }}>
+          <Icon name={icon} size={16} color={glyphColor} />
+        </View>
+      )}
+      <Text numberOfLines={1} style={{ fontSize: TITLE_FONT_SIZE, lineHeight: 18, color }}>
         {label}
       </Text>
     </Pressable>
   );
 }
 
-/** One lightweight text action (save / cancel), with no button chrome. */
-function TextAction({
-  label,
-  tone,
-  disabled,
-  theme,
-  onPress,
-}: {
-  label: string;
-  tone: "accent" | "muted" | "danger";
-  disabled?: boolean;
-  theme: PopoverTheme;
-  onPress: () => void;
-}) {
-  const color =
-    tone === "accent"
-      ? theme.colors.accent
-      : tone === "danger"
-        ? theme.colors.statusDanger
-        : theme.colors.foregroundMuted;
+/** `MenuHint`: one muted line, 12px horizontal and 8px vertical padding. */
+function Hint({ theme, danger, children }: { theme: PopoverTheme; danger?: boolean; children: string }) {
   return (
-    <Pressable
-      onPress={disabled === true ? undefined : onPress}
-      disabled={disabled}
-      accessibilityRole="button"
-      accessibilityLabel={label}
-      accessibilityState={{ disabled: disabled === true }}
-      style={{ paddingHorizontal: 4, paddingVertical: 4, opacity: disabled === true ? BUSY_OPACITY : 1 }}
+    <View
+      style={{
+        paddingHorizontal: GOAL_HINT_PADDING_HORIZONTAL,
+        paddingVertical: GOAL_HINT_PADDING_VERTICAL,
+      }}
     >
-      <Text style={{ fontSize: FACTS_FONT_SIZE, color }}>{label}</Text>
-    </Pressable>
+      <Text style={{ fontSize: FACTS_FONT_SIZE, color: danger === true ? theme.colors.statusDanger : theme.colors.foregroundMuted }}>
+        {children}
+      </Text>
+    </View>
+  );
+}
+
+/** `MenuSeparator`: a 1px full-width rule, 4px above and below. */
+function Separator({ theme }: { theme: PopoverTheme }) {
+  return (
+    <View
+      style={{
+        height: GOAL_SEPARATOR_HEIGHT,
+        marginVertical: GOAL_SEPARATOR_MARGIN_VERTICAL,
+        backgroundColor: theme.colors.border,
+      }}
+    />
   );
 }
 
@@ -178,186 +266,259 @@ export interface GoalPopoverBodyProps {
   theme: PopoverTheme;
   /** The host's compact layout flag (phone sheet). */
   compact: boolean;
-  /** One control action is in flight; every row is disabled meanwhile. */
+  /** Whether the running ring turns (see `goalRunningMark`). */
+  running: boolean;
+  /** The in-place page. */
+  mode: GoalPanelMode;
+  /** One control action is in flight; the panel is read-only meanwhile. */
   busy: boolean;
   /** DSH's refusal sentence, shown in place and never auto-cleared. */
   error?: string;
-  /** The 清除 row has been clicked once and waits for confirmation. */
-  clearArmed: boolean;
-  /** The edit row is open. */
-  editing: boolean;
   /** The edit field's current text. */
   draft: string;
-  onAction: (action: GoalAction) => void;
-  onChangeDraft: (text: string) => void;
-  onSubmitEdit: () => void;
+  /** Pause (goal is auto-continuing) or continue. */
+  onToggleRunning: () => void;
+  /** Enter the edit page. */
+  onBeginEdit: () => void;
+  /** Enter the clear confirmation page. */
+  onBeginClear: () => void;
+  /** Submit the edit page. */
+  onSave: () => void;
+  /** Leave the edit page without saving. */
   onCancelEdit: () => void;
+  /** Execute the clear after the confirmation page. */
+  onConfirmClear: () => void;
+  /** Leave the clear confirmation page. */
   onCancelClear: () => void;
+  onChangeDraft: (text: string) => void;
 }
 
 /**
  * The popover body. Pure: the same props always render the same tree, which is
- * what lets the offline preview render the real component for the screenshots
- * and the render harness assert the edit/clear states as DOM, not regexes.
+ * what lets the offline render harness assert the pages and the screenshots
+ * render the real component.
  */
 export function GoalPopoverBody({
   goal,
   text,
   theme,
   compact,
+  running,
+  mode,
   busy,
   error,
-  clearArmed,
-  editing,
   draft,
-  onAction,
-  onChangeDraft,
-  onSubmitEdit,
+  onToggleRunning,
+  onBeginEdit,
+  onBeginClear,
+  onSave,
   onCancelEdit,
+  onConfirmClear,
   onCancelClear,
+  onChangeDraft,
 }: GoalPopoverBodyProps) {
-  const presentation = goalPillPresentation({ available: true, goal });
-  const tone = presentation.visible ? presentation.tone : "warning";
-  const statusColor = theme.colors[goalToneColorToken(tone)];
-  const statusDot = theme.colors[goalStatusDotColorToken(tone)];
-  const actions = goalActionsFor(goal);
+  // The row's own hover state, so the whale's ring can knock out of the row fill
+  // it is drawn on (the host's `backdrop`).
+  const [hot, setHot] = useState(false);
+  // The first selection pins the caret to offset 0 (the start of the goal); the
+  // first keystroke or selection change releases it to the platform.
+  const [selection, setSelection] = useState<{ start: number; end: number } | undefined>({
+    start: 0,
+    end: 0,
+  });
+  const iconButton = goalIconButton(compact);
+  const resumable = goal.phase !== "active" || goal.activation === "disarmed";
+  const facts = goalFactsLine(goal, text.statuses, text.rounds);
   const currentTask = goalCurrentTaskLine(goal);
-  const disarmed = goal.phase === "active" && goal.activation === "disarmed";
-  const box = rowBox({ compact });
-  const root = {
-    ...popoverRootBox(),
-    paddingHorizontal: POPOVER_HOST_PADDING,
-    paddingVertical: 4,
-    gap: GOAL_BODY_GAP,
-  } as const;
+  const root = { ...popoverRootBox() } as const;
 
-  return (
-    <View style={root}>
-      {/* The DeepSeek mark stays on the header line; the objective is one line
-          (truncated) — the full text is what the edit field pre-fills. */}
-      <View style={{ flexDirection: "row", alignItems: "center", gap: GOAL_MARK_GAP }}>
-        <DeepSeekMark size={GOAL_MARK_SIZE} />
-        <Text
-          numberOfLines={GOAL_OBJECTIVE_MAX_LINES}
-          style={{ flex: 1, minWidth: 0, fontSize: TITLE_FONT_SIZE, color: theme.colors.foreground }}
-        >
-          {goal.objective}
-        </Text>
-      </View>
-
-      {/* Status: dot + "phase · round budget" on one line. */}
-      <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+  if (mode === "edit") {
+    return (
+      <View style={{ ...root, margin: -12, ...(compact ? {} : { width: GOAL_EDITOR_WIDTH_WIDE }) }}>
         <View
           style={{
-            width: 8,
-            height: 8,
-            borderRadius: 4,
-            backgroundColor: statusDot,
+            marginHorizontal: 4,
+            paddingHorizontal: 8,
+            paddingVertical: 6,
+            borderWidth: 1,
+            borderColor: theme.colors.foregroundMuted,
+            borderRadius: 6,
+            backgroundColor: theme.colors.surface2,
           }}
+        >
+          <UiTextInput
+            value={draft}
+            onChangeText={(next) => {
+              setSelection(undefined);
+              onChangeDraft(next);
+            }}
+            onSelectionChange={() => setSelection(undefined)}
+            onFocus={() => setSelection({ start: 0, end: 0 })}
+            selection={selection}
+            multiline
+            numberOfLines={4}
+            autoFocus
+            submitBehavior="blurAndSubmit"
+            onSubmitEditing={onSave}
+            onKeyPress={(event) => {
+              const key = event.nativeEvent.key;
+              if (key === "Escape") {
+                event.preventDefault?.();
+                onCancelEdit();
+                return;
+              }
+              if (key === "Enter") {
+                event.preventDefault?.();
+                onSave();
+              }
+            }}
+            accessibilityLabel={text.editPlaceholder}
+            // `resize`/`outline` are web-only keys the RN style type does not
+            // carry; the host's own field strips them the same way.
+            style={{
+              fontSize: TITLE_FONT_SIZE,
+              lineHeight: GOAL_OBJECTIVE_LINE_HEIGHT,
+              minHeight: GOAL_EDITOR_MIN_HEIGHT,
+              color: theme.colors.foreground,
+              padding: 0,
+              borderWidth: 0,
+              outlineWidth: 0,
+              ...({ resize: "none" } as Record<string, unknown>),
+            } as never}
+          />
+        </View>
+        <Separator theme={theme} />
+        <MenuRow
+          label={text.actions.save}
+          disabled={busy || !goalEditSubmittable(draft, goal.objective)}
+          theme={theme}
+          onPress={onSave}
         />
-        <Text style={{ fontSize: FACTS_FONT_SIZE, color: statusColor }}>
-          {goalStatusLine(goal, text.statuses, text.rounds)}
-        </Text>
+        <MenuRow label={text.actions.cancel} theme={theme} onPress={onCancelEdit} />
+        {error === undefined ? null : <Hint theme={theme} danger>{error}</Hint>}
       </View>
-      {currentTask === undefined ? null : (
-        <Text numberOfLines={1} style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}>
-          {text.currentTask(currentTask)}
-        </Text>
-      )}
-      {goal.blockedReason === undefined ? null : (
-        <Text style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.statusDanger }}>
-          {text.blocker(goal.blockedReason.code, goal.blockedReason.message)}
-        </Text>
-      )}
-      {disarmed ? (
-        <Text style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.statusWarning }}>
-          {text.disarmedHint}
-        </Text>
-      ) : null}
-      {error === undefined ? null : (
-        <Text style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.statusDanger }}>{error}</Text>
-      )}
+    );
+  }
 
-      {/* One row per action, in semantic order: primary, edit, clear. The edit
-          row becomes the inline field in place; the clear row becomes its
-          confirmation in place. No fills, no borders. The rows sit tight
-          together (2px) like the host's menu list; the 8px body rhythm is kept
-          between the sections around them. */}
-      <View style={{ gap: 2 }}>
-      {actions.map((action) => {
-        if (action === "edit" && editing) {
-          return (
-            <View key={action} style={{ ...box, gap: ROW_GAP }}>
-              <UiTextInput
-                value={draft}
-                onChangeText={onChangeDraft}
-                onSubmitEditing={onSubmitEdit}
-                placeholder={text.editPlaceholder}
-                placeholderTextColor={theme.colors.foregroundMuted}
-                returnKeyType="done"
-                autoFocus
-                accessibilityLabel={text.editPlaceholder}
-                style={{
-                  flexGrow: 1,
-                  flexShrink: 1,
-                  flexBasis: "auto",
-                  minWidth: 0,
-                  fontSize: TITLE_FONT_SIZE,
-                  color: theme.colors.foreground,
-                  paddingVertical: 2,
-                }}
-              />
-              <TextAction
-                label={text.actions.save}
-                tone="accent"
-                disabled={busy || !goalEditDraftValid(draft)}
-                theme={theme}
-                onPress={onSubmitEdit}
-              />
-              <TextAction label={text.actions.cancel} tone="muted" theme={theme} onPress={onCancelEdit} />
-            </View>
-          );
-        }
-        if (action === "clear" && clearArmed) {
-          return (
-            <View key={action} style={{ ...box, gap: ROW_GAP }}>
-              <Icon name="Trash2" size={14} color={theme.colors.statusDanger} />
-              <Pressable
-                onPress={() => {
-                  onAction("clear");
-                }}
-                disabled={busy}
-                accessibilityRole="button"
-                accessibilityLabel={text.actions.confirmClear}
-                style={{ ...rowTextColumn(), paddingVertical: 2 }}
-              >
-                <Text numberOfLines={1} style={{ fontSize: TITLE_FONT_SIZE, color: theme.colors.statusDanger }}>
-                  {text.actions.confirmClear}
-                </Text>
-              </Pressable>
-              <TextAction label={text.actions.cancel} tone="muted" theme={theme} onPress={onCancelClear} />
-            </View>
-          );
-        }
-        return (
-          <ActionRow
-            key={action}
-            action={action}
-            label={goalActionLabel(action, clearArmed, text.actions)}
-            compact={compact}
-            danger={false}
+  if (mode === "confirm") {
+    return (
+      <View style={{ ...root, margin: -12 }}>
+        <Hint theme={theme}>{text.clearHint}</Hint>
+        <Separator theme={theme} />
+        <MenuRow
+          icon="Trash2"
+          label={text.actions.clearTarget}
+          destructive
+          disabled={busy}
+          theme={theme}
+          onPress={onConfirmClear}
+        />
+        <MenuRow label={text.actions.cancel} theme={theme} onPress={onCancelClear} />
+        {error === undefined ? null : <Hint theme={theme} danger>{error}</Hint>}
+      </View>
+    );
+  }
+
+  const row = goalTrackRow(compact);
+  return (
+    <View style={{ ...root, margin: -12 }}>
+      {/* The whole row is the edit target. The two buttons stop their own press. */}
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={text.actions.edit}
+        onPress={onBeginEdit}
+        onHoverIn={() => setHot(true)}
+        onHoverOut={() => setHot(false)}
+        style={({ hovered = false, pressed }: HoverState) => ({
+          ...row,
+          backgroundColor: hovered || pressed || hot ? theme.colors.surface2 : "transparent",
+        })}
+      >
+        <Whale
+          running={running}
+          theme={theme}
+          backdrop={hot ? theme.colors.surface2 : theme.colors.surface1}
+          label={text.runningA11y}
+        />
+        <View style={{ flexGrow: 1, flexShrink: 1, flexBasis: "auto", minWidth: 0 }}>
+          <Text
+            numberOfLines={1}
+            style={{
+              fontSize: TITLE_FONT_SIZE,
+              lineHeight: GOAL_OBJECTIVE_LINE_HEIGHT,
+              color: theme.colors.foreground,
+            }}
+          >
+            {goal.objective}
+          </Text>
+          <Text
+            numberOfLines={1}
+            style={{
+              fontSize: FACTS_FONT_SIZE,
+              lineHeight: GOAL_FACTS_LINE_HEIGHT,
+              color: theme.colors.foregroundMuted,
+            }}
+          >
+            {facts}
+          </Text>
+        </View>
+        <View style={{ flexDirection: "row", gap: 4 }}>
+          <IconButton
+            name={resumable ? "Play" : "Pause"}
+            glyph={iconButton.glyph}
+            size={iconButton.size}
+            color={theme.colors.foregroundMuted}
             disabled={busy}
             theme={theme}
-            onPress={() => {
-              onAction(action);
-            }}
+            label={resumable ? text.actions.resumeTarget : text.actions.pauseTarget}
+            onPress={onToggleRunning}
           />
-        );
-      })}
-      </View>
-      <Text style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}>
-        {text.footnote}
-      </Text>
+          <IconButton
+            name="Trash2"
+            glyph={iconButton.glyph}
+            size={iconButton.size}
+            color={theme.colors.foregroundMuted}
+            disabled={busy}
+            theme={theme}
+            label={text.actions.clearTarget}
+            onPress={onBeginClear}
+          />
+        </View>
+      </Pressable>
+      {currentTask === undefined ? null : (
+        <View style={row}>
+          <Icon name="CircleDot" size={16} color={theme.colors.foregroundMuted} />
+          <Text
+            numberOfLines={1}
+            style={{ flexShrink: 1, fontSize: TITLE_FONT_SIZE, color: theme.colors.foreground }}
+          >
+            <Text style={{ color: theme.colors.foregroundMuted }}>{text.currentTaskPrefix}</Text>
+            {currentTask}
+          </Text>
+        </View>
+      )}
+      {goal.phase === "blocked" && goal.blockedReason !== undefined ? (
+        <View style={[row, { alignItems: "flex-start" }]}>
+          <View style={{ marginTop: 2 }}>
+            <Icon name="CircleAlert" size={16} color={theme.colors.statusDanger} />
+          </View>
+          <Text
+            numberOfLines={2}
+            style={{
+              flexShrink: 1,
+              fontSize: TITLE_FONT_SIZE,
+              lineHeight: GOAL_OBJECTIVE_LINE_HEIGHT,
+              color: theme.colors.foregroundMuted,
+            }}
+          >
+            {goal.blockedReason.message}
+          </Text>
+        </View>
+      ) : null}
+      {goal.phase === "active" && goal.activation === "disarmed" ? (
+        <Hint theme={theme}>{text.disarmedHint}</Hint>
+      ) : null}
+      {error === undefined ? null : <Hint theme={theme} danger>{error}</Hint>}
     </View>
   );
 }

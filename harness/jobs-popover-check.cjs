@@ -195,6 +195,7 @@ check("a rule with several on each side", layout.sectionDivided(4, 9), true);
 console.log("\nUI wiring");
 const pillSource = readSource("paseo-plugin/client/jobs-pill.tsx");
 const spinnerSource = readSource("paseo-plugin/client/jobs-spinner.tsx");
+const ringSource = readSource("paseo-plugin/client/status-ring.tsx");
 const pillElements = shape.jsxElements(pillSource);
 const attr = (element, name) => shape.attributeOf(element, name)?.value ?? "";
 const calls = (expression, name) => shape.callArguments(expression, name);
@@ -428,7 +429,9 @@ assert("the job mark passes its theme to JobsSpinner", pillElements.some((elemen
   element.tag === "JobsSpinner" && attr(element, "theme").trim() === "theme"));
 assert("spinner colour comes from the theme surface", calls(spinnerSource, "ringColorFor").some((args) =>
   args.replace(/\s/g, "") === "theme?.colors.surface0"));
-assert("spinner arc receives that colour", shape.jsxElements(spinnerSource).some((element) =>
+assert("spinner passes that colour to the shared ring", shape.jsxElements(spinnerSource).some((element) =>
+  element.tag === "StatusRingMark" && attr(element, "color").trim() === "color"));
+assert("the shared ring passes the colour to its arc", shape.jsxElements(ringSource).some((element) =>
   element.tag === "RotatingArc" && attr(element, "color").trim() === "color"));
 
 // The title must be able to be the model's own words instead of the command.

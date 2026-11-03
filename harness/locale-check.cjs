@@ -296,9 +296,9 @@ console.log("the jobs pill's copy is covered in both languages");
 console.log("the goal pill's copy is covered in both languages");
 {
   // Same reason as the jobs table above: `goal` is an **object**, so the
-  // `scalarKeys` loop skips it and it is not one of the plain string tables. A
-  // missing entry here would render as an empty pill label or a raw phase name,
-  // which is exactly the silent downgrade the copy tables exist to prevent.
+  // `scalarKeys` loop skips it. A missing entry here would render as an empty
+  // pill label or a raw phase name, which is exactly the silent downgrade the
+  // copy tables exist to prevent.
   const en = allText().en.goal;
   const zh = allText()["zh-CN"].goal;
   check("both languages ship a goal table", en !== undefined && zh !== undefined);
@@ -312,32 +312,31 @@ console.log("the goal pill's copy is covered in both languages");
     "blocked",
     "statuses",
     "rounds",
-    "blocker",
+    "currentTaskPrefix",
     "disarmedHint",
+    "clearHint",
     "actions",
     "editPlaceholder",
+    "runningA11y",
     "busy",
     "controlFailed",
     "unavailable",
     "noGoal",
-    "footnote",
   ]) {
     check(`goal.${key} exists in both languages`, en[key] !== undefined && zh[key] !== undefined);
   }
 
-  // **DESIGN §2's four labels, verbatim.** The whole point of the pill is that
-  // these four states are told apart; a "nicer" wording that collapses
-  // `notRunning` into `active` would be the silent degradation the surface was
-  // built to expose, and a translation that says something else is a red check.
+  // **The four labels, verbatim.** The whole point of the pill is that these
+  // four states are told apart; a "nicer" wording that collapses `notRunning`
+  // into `active` would be the silent degradation the surface was built to
+  // expose.
   check("goal.running is `Goal running` (en)", en.running === "Goal running", JSON.stringify(en.running));
   check("goal.running is `目标进行中` (zh-CN)", zh.running === "目标进行中", JSON.stringify(zh.running));
-  // The round budget is a sentence, never a fraction: `3/10` in a trigger or a
-  // status line reads as completion, and the cap is a budget (default 256) DSH
-  // may raise while the goal runs.
+  // The round budget is a sentence, never a fraction.
   check("goal.rounds(3,10) is `Round 3 · budget 10` (en)", en.rounds(3, 10) === "Round 3 · budget 10", JSON.stringify(en.rounds(3, 10)));
   check("goal.rounds(3,10) is `第 3 轮 · 预算 10` (zh-CN)", zh.rounds(3, 10) === "第 3 轮 · 预算 10", JSON.stringify(zh.rounds(3, 10)));
-  check("goal.currentTask('x') is `Now: x` (en)", en.currentTask("x") === "Now: x", JSON.stringify(en.currentTask("x")));
-  check("goal.currentTask('x') is `正在：x` (zh-CN)", zh.currentTask("x") === "正在：x", JSON.stringify(zh.currentTask("x")));
+  check("goal.currentTaskPrefix is `Now: ` (en)", en.currentTaskPrefix === "Now: ", JSON.stringify(en.currentTaskPrefix));
+  check("goal.currentTaskPrefix is `正在：` (zh-CN)", zh.currentTaskPrefix === "正在：", JSON.stringify(zh.currentTaskPrefix));
   check("goal.notRunning is `Goal not running` (en)", en.notRunning === "Goal not running", JSON.stringify(en.notRunning));
   check("goal.notRunning is `目标未在续跑` (zh-CN)", zh.notRunning === "目标未在续跑", JSON.stringify(zh.notRunning));
   check("goal.paused is `Goal paused` (en)", en.paused === "Goal paused", JSON.stringify(en.paused));
@@ -345,16 +344,13 @@ console.log("the goal pill's copy is covered in both languages");
   check("goal.blocked is `Goal blocked` (en)", en.blocked === "Goal blocked", JSON.stringify(en.blocked));
   check("goal.blocked is `目标受阻` (zh-CN)", zh.blocked === "目标受阻", JSON.stringify(zh.blocked));
 
-  // The footer is product copy fixed by DESIGN §2: sending a message does not
-  // interrupt the goal, pressing stop pauses it. Asserted verbatim in Chinese
-  // (the design's own sentence); English must say the same thing without being
-  // a copy of the Chinese one.
-  const FOOTNOTE_ZH = "运行中发消息会插入当前轮，不打断目标；停止会暂停目标。";
-  check("goal.footnote is the DESIGN §2 sentence (zh-CN)", zh.footnote === FOOTNOTE_ZH, JSON.stringify(zh.footnote));
+  // The clear page's hint is the design's sentence: clearing is final. Verbatim
+  // in Chinese; English must say the same thing.
+  check("goal.clearHint is the design's sentence (zh-CN)", zh.clearHint === "清除后目标不再续跑，无法撤销", JSON.stringify(zh.clearHint));
   check(
-    "goal.footnote says messages do not interrupt and stop pauses (en)",
-    en.footnote.toLowerCase().includes("interrupt") && en.footnote.toLowerCase().includes("stop"),
-    JSON.stringify(en.footnote),
+    "goal.clearHint says clearing is final (en)",
+    en.clearHint.toLowerCase().includes("cannot be undone"),
+    JSON.stringify(en.clearHint),
   );
 
   // The plain strings.
@@ -366,12 +362,14 @@ console.log("the goal pill's copy is covered in both languages");
       "paused",
       "blocked",
       "disarmedHint",
+      "clearHint",
+      "currentTaskPrefix",
       "editPlaceholder",
+      "runningA11y",
       "busy",
       "controlFailed",
       "unavailable",
       "noGoal",
-      "footnote",
     ]) {
       check(
         `goal.${key} is a non-empty string in ${locale}`,
@@ -381,11 +379,13 @@ console.log("the goal pill's copy is covered in both languages");
     }
   }
 
-  // The row-style actions are screen copy the user reads (the confirmation and
-  // the inline edit actions), not just aria labels.
+  // The row-end icon buttons and the edit/clear pages' labels. The two icon
+  // buttons carry no visible text, so these strings are their accessibility
+  // names — the only way a screen reader can tell pause from clear.
+  equal("goal.actions keys match", Object.keys(en.actions).sort(), Object.keys(zh.actions).sort());
   for (const locale of LOCALES) {
     const actions = allText()[locale].goal.actions;
-    for (const key of ["pause", "resume", "edit", "clear", "confirmClear", "save", "cancel"]) {
+    for (const key of ["pauseTarget", "resumeTarget", "edit", "clearTarget", "save", "cancel"]) {
       check(
         `goal.actions.${key} is a non-empty string in ${locale}`,
         typeof actions[key] === "string" && actions[key].trim() !== "",
@@ -395,13 +395,15 @@ console.log("the goal pill's copy is covered in both languages");
   }
   check("the edit row names the goal (en)", en.actions.edit === "Edit goal", JSON.stringify(en.actions.edit));
   check("the edit row names the goal (zh-CN)", zh.actions.edit === "编辑目标", JSON.stringify(zh.actions.edit));
-  check("the clear row names the goal (en)", en.actions.clear === "Clear goal", JSON.stringify(en.actions.clear));
-  check("the clear row names the goal (zh-CN)", zh.actions.clear === "清除目标", JSON.stringify(zh.actions.clear));
-  check("the confirmation is not the rest label (en)", en.actions.confirmClear !== en.actions.clear, JSON.stringify(en.actions.confirmClear));
-  check("the confirmation is not the rest label (zh-CN)", zh.actions.confirmClear !== zh.actions.clear, JSON.stringify(zh.actions.confirmClear));
+  check("the clear row names the goal (en)", en.actions.clearTarget === "Clear goal", JSON.stringify(en.actions.clearTarget));
+  check("the clear row names the goal (zh-CN)", zh.actions.clearTarget === "清除目标", JSON.stringify(zh.actions.clearTarget));
+  check("the pause button names the goal (en)", en.actions.pauseTarget === "Pause goal", JSON.stringify(en.actions.pauseTarget));
+  check("the pause button names the goal (zh-CN)", zh.actions.pauseTarget === "暂停目标", JSON.stringify(zh.actions.pauseTarget));
+  check("the continue button names the goal (en)", en.actions.resumeTarget === "Continue goal", JSON.stringify(en.actions.resumeTarget));
+  check("the continue button names the goal (zh-CN)", zh.actions.resumeTarget === "继续目标", JSON.stringify(zh.actions.resumeTarget));
   equal(
     "the English actions are not the Chinese actions",
-    ["pause", "resume", "edit", "clear", "confirmClear", "save", "cancel"].filter((key) => en.actions[key] === zh.actions[key]),
+    ["pauseTarget", "resumeTarget", "edit", "clearTarget", "save", "cancel"].filter((key) => en.actions[key] === zh.actions[key]),
     [],
   );
 
@@ -413,62 +415,23 @@ console.log("the goal pill's copy is covered in both languages");
     "paused",
     "blocked",
     "disarmedHint",
+    "clearHint",
+    "currentTaskPrefix",
     "editPlaceholder",
+    "runningA11y",
     "busy",
     "controlFailed",
     "unavailable",
     "noGoal",
-    "footnote",
   ].filter((key) => en[key] === zh[key]);
   equal("the English goal copy is not the Chinese copy", copied, []);
 
-  // The function-valued entries must return real text in both languages.
+  // The one function-valued entry must return real text in both languages.
   for (const locale of LOCALES) {
-    const table = allText()[locale].goal;
-    const rounds = table.rounds(3, 10);
-    const currentTask = table.currentTask("write it");
-    const blocker = table.blocker("round-limit", "limit reached");
-    for (const [what, value] of [
-      ["rounds", rounds],
-      ["currentTask", currentTask],
-      ["blocker", blocker],
-    ]) {
-      check(
-        `goal.${what} is a non-empty string in ${locale}`,
-        typeof value === "string" && value.trim() !== "",
-        JSON.stringify(value),
-      );
-    }
+    const rounds = allText()[locale].goal.rounds(3, 10);
+    check(`goal.rounds is a non-empty string in ${locale}`, typeof rounds === "string" && rounds.trim() !== "", JSON.stringify(rounds));
     check(`goal.rounds carries the count in ${locale}`, rounds.includes("3") && rounds.includes("10"), JSON.stringify(rounds));
-    check(`goal.currentTask carries the task in ${locale}`, currentTask.includes("write it"), JSON.stringify(currentTask));
-    check(
-      `goal.blocker carries the code and the sentence in ${locale}`,
-      blocker.includes("round-limit") && blocker.includes("limit reached"),
-      JSON.stringify(blocker),
-    );
   }
-
-  // The control buttons. `confirmClear` must differ from `clear`: if it were the
-  // same string, the two-click confirmation would look like the same button
-  // pressed twice and the user could not tell the destructive click is armed.
-  equal("goal.actions keys match", Object.keys(en.actions).sort(), Object.keys(zh.actions).sort());
-  for (const locale of LOCALES) {
-    const table = allText()[locale].goal.actions;
-    for (const key of ["pause", "resume", "edit", "clear", "confirmClear"]) {
-      check(
-        `goal.actions.${key} is a non-empty string in ${locale}`,
-        typeof table[key] === "string" && table[key].trim() !== "",
-        JSON.stringify(table[key]),
-      );
-    }
-    check(
-      `goal.actions.confirmClear differs from clear in ${locale}`,
-      table.confirmClear !== table.clear,
-      JSON.stringify([table.clear, table.confirmClear]),
-    );
-  }
-  const copiedActions = Object.keys(en.actions).filter((key) => en.actions[key] === zh.actions[key]);
-  equal("the English button copy is not the Chinese copy", copiedActions, []);
 
   // **`statuses` must cover exactly the phases `shared/goal.ts` declares.** Read
   // out of that file with a regex, not required: it imports zod and the plugin

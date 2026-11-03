@@ -108,31 +108,23 @@ export type GoalLabel =
  */
 export type GoalTone = "normal" | "warning" | "error";
 
-/** The theme colour key one tone draws text with. */
-export function goalToneColorToken(tone: GoalTone): "foreground" | "statusWarning" | "statusDanger" {
-  switch (tone) {
-    case "normal":
-      return "foreground";
-    case "warning":
-      return "statusWarning";
-    case "error":
-      return "statusDanger";
-  }
-}
-
 /**
  * The theme colour key one tone draws the trigger's glyph with.
  *
- * The active goal is the one that is working, so its glyph is `accent` — the
- * same colour the host uses for its own live affordances — while the
- * not-continuing states reuse the warning/danger text colours. The host paints
- * a plugin pill's label itself (plain text, no colour channel), so the glyph is
- * the only place this tone can reach the trigger.
+ * `normal` is `foregroundMuted`, not `accent`: the design's rule is one signal
+ * one token, and on the composer rail every host mark is a single muted glyph.
+ * A running goal's glyph is not even this — it is the running ring (see
+ * `goalRunningMark`); this colour is what a *non-running* normal goal draws.
+ * The not-continuing states reuse the warning/danger text colours. The host
+ * paints a plugin pill's label itself (plain text, no colour channel), so the
+ * glyph is the only place this tone can reach the trigger.
  */
-export function goalIconColorToken(tone: GoalTone): "accent" | "statusWarning" | "statusDanger" {
+export function goalIconColorToken(
+  tone: GoalTone,
+): "foregroundMuted" | "statusWarning" | "statusDanger" {
   switch (tone) {
     case "normal":
-      return "accent";
+      return "foregroundMuted";
     case "warning":
       return "statusWarning";
     case "error":
@@ -184,179 +176,203 @@ export function goalPillPresentation(answer: {
 }
 
 /* -------------------------------------------------------------------------- */
-/* The action rows (Paseo row style, not buttons)                              */
+/* The panel's row geometry (the host's numbers, value for value)              */
 /* -------------------------------------------------------------------------- */
 
 /**
- * The label for one action row.
- *
- * The destructive row switches to its confirmation sentence when armed, so the
- * screen says "press again to clear" instead of relying on colour alone.
+ * The rail every panel row sits on: `composer/tracks.tsx:347-379`'s `trackRow`,
+ * value for value. The compact breakpoint is the phone sheet (40px row, 8px
+ * vertical padding), the wide one the desktop popover (32 / 4). The 4px
+ * horizontal margin is what makes a row a rounded block inside the surface
+ * instead of a full-width stripe — the single geometric reason the old panel
+ * read as "not Paseo".
  */
-export function goalActionLabel(
-  action: GoalAction,
-  clearArmed: boolean,
-  actions: { readonly pause: string; readonly resume: string; readonly edit: string; readonly clear: string; readonly confirmClear: string },
-): string {
-  switch (action) {
-    case "pause":
-      return actions.pause;
-    case "resume":
-      return actions.resume;
-    case "edit":
-      return actions.edit;
-    case "clear":
-      return clearArmed ? actions.confirmClear : actions.clear;
-  }
+export interface GoalTrackRow {
+  readonly flexDirection: "row";
+  readonly alignItems: "center";
+  readonly gap: number;
+  readonly minHeight: number;
+  readonly marginHorizontal: number;
+  readonly paddingHorizontal: number;
+  readonly paddingVertical: number;
+  readonly borderRadius: number;
+}
+
+/** `trackRow` at one density. */
+export function goalTrackRow(compact: boolean): GoalTrackRow {
+  return {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    minHeight: compact ? 40 : 32,
+    marginHorizontal: 4,
+    paddingHorizontal: 8,
+    paddingVertical: compact ? 8 : 4,
+    borderRadius: 6,
+  };
 }
 
 /**
- * The leading glyph for one action row.
- *
- * Lucide names the host can draw (`Icon` from `@getpaseo/plugin/client/ui`).
- * Rows carry an icon and a title like the host's own menu rows; there is no
- * button fill and no border — the brief explicitly forbids both.
+ * A menu row's box: `components/ui/menu/menu-item.tsx:441`'s `item`, value for
+ * value (`MENU_ITEM_HEIGHT` xs 40 / md 28). The 1px border is always present —
+ * transparent at rest — so a row that turns destructive cannot resize.
  */
-export function goalActionIcon(action: GoalAction): "Pause" | "Play" | "Pencil" | "Trash2" {
-  switch (action) {
-    case "pause":
-      return "Pause";
-    case "resume":
-      return "Play";
-    case "edit":
-      return "Pencil";
-    case "clear":
-      return "Trash2";
-  }
+export interface GoalMenuItem extends GoalTrackRow {
+  readonly borderWidth: number;
+}
+
+/** `item` at one density; the caller supplies the border colour. */
+export function goalMenuItem(compact: boolean): GoalMenuItem {
+  return {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    minHeight: compact ? 40 : 28,
+    marginHorizontal: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    borderWidth: 1,
+  };
 }
 
 /**
- * The status line's 8px dot colour token per tone.
- *
- * The user asked for the status colour to identify the four states; the label
- * text cannot carry it (the host draws the popover's text, and `accent` as text
- * fails AA on the dark surface at 2.83:1). The dot is the colour channel:
- * accent while auto-continuing, warning when not, danger when blocked.
+ * The row-end icon button: `components/ui/icon-button-chrome.ts:11-14` — 20×20
+ * with a 14px glyph on a pointer layout, 32×32 with an 18px glyph under a finger
+ * (the compact touch target).
  */
-export function goalStatusDotColorToken(tone: GoalTone): "accent" | "statusWarning" | "statusDanger" {
-  switch (tone) {
-    case "normal":
-      return "accent";
-    case "warning":
-      return "statusWarning";
-    case "error":
-      return "statusDanger";
-  }
+export interface GoalIconButton {
+  readonly size: number;
+  readonly glyph: number;
+  readonly borderRadius: number;
+}
+
+/** The icon button's box at one density. */
+export function goalIconButton(compact: boolean): GoalIconButton {
+  return { size: compact ? 32 : 20, glyph: compact ? 18 : 14, borderRadius: 6 };
+}
+
+/** The whale mark's edge: the host's 16px icon slot (`task-list-row.tsx:15-25`). */
+export const GOAL_WHALE_SIZE = 16;
+
+/** The corner ring's frame: the host's 14px `StatusRingFrame` (`status-ring/frame.tsx`). */
+export const GOAL_RING_FRAME_SIZE = 14;
+
+/** The corner ring's offset: the host's `getStatusRingOffset(-2, 8)` = -5. */
+export const GOAL_RING_OFFSET = -5;
+
+/** The objective's line height (`fontSize.base` 14 → 20). */
+export const GOAL_OBJECTIVE_LINE_HEIGHT = 20;
+
+/** The facts line's line height (`fontSize.sm` 12 → 16). */
+export const GOAL_FACTS_LINE_HEIGHT = 16;
+
+/** The edit field's floor: four lines of 20 (`menu-item.tsx:457-478`'s field). */
+export const GOAL_EDITOR_MIN_HEIGHT = 80;
+
+/**
+ * The edit page's width on wide layouts: the popover surface's own 420 minus
+ * the 12px content padding on each side, so replacing the objective row with
+ * the field does not shrink the surface under the pointer.
+ */
+export const GOAL_EDITOR_WIDTH_WIDE = 396;
+
+/** `MenuSeparator`: 1px, 4px above and below, full width (`menu-item.tsx:407`). */
+export const GOAL_SEPARATOR_HEIGHT = 1;
+export const GOAL_SEPARATOR_MARGIN_VERTICAL = 4;
+
+/** `MenuHint`'s box: 12px horizontal, 8px vertical (`menu-item.tsx` hint styles). */
+export const GOAL_HINT_PADDING_HORIZONTAL = 12;
+export const GOAL_HINT_PADDING_VERTICAL = 8;
+
+/**
+ * How long a just-idled agent still counts as running.
+ *
+ * The round driver only schedules the next round after the agent settles and the
+ * session flushes (`dsh-goal-round-driver`), so an armed goal really does go
+ * `running → idle → running` between rounds. Without a hold the ring would blink
+ * off and on every round; 1.5s covers the flush gap while still stopping within
+ * a breath when the goal is not actually working. The value is the design's
+ * 【推断】 — it should be re-measured on a device with a real goal.
+ */
+export const GOAL_RUNNING_HOLD_MS = 1500;
+
+/** The agent statuses the host exposes (`contracts.d.ts:38-42`). */
+export type GoalAgentStatus = "initializing" | "idle" | "running" | "error" | "closed";
+
+/** Everything {@link goalRunningMark} decides from. */
+export interface GoalRunningInput {
+  readonly phase: GoalState["phase"];
+  readonly activation: GoalState["activation"];
+  /** `useAgent(agentId, a => a.status)`; null when the host exposes none. */
+  readonly agentStatus: GoalAgentStatus | null | undefined;
+  /** ms epoch until which a just-idled agent still counts as running. */
+  readonly holdUntil?: number;
+  readonly now: number;
 }
 
 /**
- * The status line: the phase word and the round budget on **one** line.
+ * Whether the running ring turns.
  *
- * `进行中 · 第 3 轮 · 预算 10`. The 8px dot in front carries the tone colour;
- * the text stays `foreground` because `accent` as text fails AA on the dark
- * surface (2.83:1), which the verification round made explicit.
+ * The design's truth table (A2): the goal must be `active + armed` **and** the
+ * agent must really be running. An armed goal whose agent is idle only turns
+ * while the {@link GOAL_RUNNING_HOLD_MS} hold from its last running moment is
+ * still open. Everything else — disarmed, paused, blocked, complete, a missing
+ * agent status, or a non-running status — is a static mark.
+ *
+ * The alternative (A1: turn whenever `active + armed`) was rejected in the
+ * design: it spins while DSH is not working, which is the "silent degradation"
+ * class this project treats as a bug. When the host cannot answer the agent's
+ * status at all, the mark stays static rather than guessing.
  */
-export function goalStatusLine(
+export function goalRunningMark(input: GoalRunningInput): boolean {
+  if (input.phase !== "active" || input.activation !== "armed") return false;
+  if (input.agentStatus === "running") return true;
+  if (input.agentStatus !== "idle") return false;
+  return input.holdUntil !== undefined && input.holdUntil > input.now;
+}
+
+/**
+ * The facts line under the objective: `进行中 · 第 3 轮 · 预算 10`.
+ *
+ * One `sm` line in `foregroundMuted`, the way a subagent row carries its
+ * provider/model under the title (`subagents/track.tsx` row facts). The round
+ * budget is a sentence here, never a fraction beside the phase.
+ */
+export function goalFactsLine(
   goal: GoalState,
   statuses: Readonly<Record<string, string>>,
   rounds: (started: number, max: number) => string,
 ): string {
-  return `${statuses[goal.phase] ?? goal.phase} · ${rounds(goal.roundsStarted, goal.maxGoalRounds)}`;
+  return [statuses[goal.phase] ?? goal.phase, rounds(goal.roundsStarted, goal.maxGoalRounds)].join(" · ");
 }
 
-/** The objective's line count in the popover header: one, truncated. */
-export const GOAL_OBJECTIVE_MAX_LINES = 1;
-
-/* -------------------------------------------------------------------------- */
-/* The popover's content lines                                                 */
-/* -------------------------------------------------------------------------- */
-
-/** The target line's DeepSeek mark: the host's 16px icon slot (`ICON_SIZE.md`). */
-export const GOAL_MARK_SIZE = 16;
-
-/** Between the mark and the objective text. = `spacing[1.5]`. */
-export const GOAL_MARK_GAP = 6;
-
-/** The objective's line height at `fontSize.base` (host body text ≈ 1.43×). */
-export const GOAL_OBJECTIVE_LINE_HEIGHT = 20;
-
-/**
- * How far the mark drops below the objective's top edge.
- *
- * `(lineHeight - mark) / 2` = 2, so a 16px mark centres on the first line of a
- * 20px line box. A mark aligned to the box's top reads as superscript text.
- */
-export const GOAL_MARK_TOP_OFFSET = 2;
-
-/** The vertical rhythm between the popover's blocks. = `spacing[2]`. */
-export const GOAL_BODY_GAP = 8;
-
-/**
- * The task DSH's todo list marks `in_progress`, trimmed, or `undefined`.
- *
- * DSH resets the `todos` projection every turn, so an absent/empty value is the
- * normal state and means "do not draw the now line" — never an empty sentence.
- */
+/** The "now" line's content: DSH's own `in_progress` todo text, or undefined. */
 export function goalCurrentTaskLine(goal: GoalState): string | undefined {
-  const task = goal.currentTask?.trim();
-  return task === undefined || task === "" ? undefined : task;
+  const current = goal.currentTask;
+  if (current === undefined) return undefined;
+  const trimmed = current.trim();
+  return trimmed === "" ? undefined : trimmed;
 }
 
 /* -------------------------------------------------------------------------- */
-/* The destructive confirmation                                                */
+/* The edit page's rules                                                       */
 /* -------------------------------------------------------------------------- */
 
-/**
- * What the 清除 button does on one click.
- *
- * `arm` is the first click: it only turns the button red, so a mis-tap cannot
- * destroy the goal. `run` is the second click on the same button. Any other
- * action resets the arm — the state machine lives here rather than in the JSX so
- * the harness can assert that one click never executes.
- *
- * The button's **label does not change** between the two steps: swapping 清除
- * for a longer confirmation sentence would change the button's width and make
- * the row jump. The colour is the confirmation, and the accessibility label
- * carries the sentence.
- */
-export type ClearConfirmStep = "arm" | "run";
-
-/** The step a 清除 click takes, given whether the button is already armed. */
-export function clearConfirmStep(armed: boolean): ClearConfirmStep {
-  return armed ? "run" : "arm";
-}
-
-/**
- * Whether an edit draft may be submitted.
- *
- * Empty (or whitespace-only) text is not a replacement objective, and DSH's
- * `/goal edit` grammar rejects it; the popover must not submit it. The server
- * half refuses it again — this is the UI half, not the only guard.
- */
+/** Whether the draft can be submitted: non-blank **and** changed. */
 export function goalEditDraftValid(draft: string): boolean {
   return draft.trim() !== "";
 }
 
 /**
- * The control buttons the popover offers, in semantic order.
+ * Whether the save action is enabled.
  *
- * DESIGN §2's table, as data: a goal that is auto-continuing offers 暂停; one
- * that is not (disarmed, paused, blocked) offers 继续; every visible state
- * offers 编辑 and 清除. **Unavailable actions are not drawn, never disabled** —
- * a disabled button claims "you could do this but not now", which is wrong for a
- * state that has no such operation at all.
- *
- * `blocked` keeps 继续 even when the round cap is exhausted: DSH refuses that
- * resume with its own sentence ("not valid for the current state"), and the
- * popover shows it verbatim. Hiding the button instead would leave the user with
- * no way to discover why.
- *
- * The rendering is one row per action, in this order.
+ * Two rules from the design: an empty objective cannot be saved (DSH would
+ * reject it), and an unchanged draft cannot be saved either — the host disables
+ * a rename's submit when the value did not change (`rename-modal.tsx:111`).
  */
-export function goalActionsFor(goal: GoalState): readonly GoalAction[] {
-  const primary: GoalAction =
-    goal.phase === "active" && goal.activation === "armed" ? "pause" : "resume";
-  return [primary, "edit", "clear"];
+export function goalEditSubmittable(draft: string, original: string): boolean {
+  return goalEditDraftValid(draft) && draft !== original;
 }
 
 /* -------------------------------------------------------------------------- */

@@ -15,15 +15,15 @@
  * channel for daemon-side reads; the cadence is the jobs pill's, shared through
  * `client/agent-polling.ts`.
  *
- * **What the trigger can and cannot show (UI revision, 2026-11-03).** The host
- * draws a pill's label as plain text in a 160px-wide button and paints its icon
- * from `color`/`size` only, so the *label* says the state in words (「目标进行中」/
- * 「目标未在续跑」/「目标已暂停」/「目标受阻」) while the **icon is a custom component
- * that colours the Target glyph by tone** (`goalIconColorToken`: accent while
- * armed, warning when not continuing, danger when blocked). The `title` is the
- * fixed noun 「目标」/「Goal」 — it is the phone sheet's header and the
- * accessibility name, and the full objective lives once in the popover body
- * instead of twice.
+ * **What the trigger can and cannot show (design-opus-v3).** The host draws a
+ * pill's label as plain text in a 160px-wide button and paints its icon from
+ * `color`/`size` only, so the *label* says the state in words (「目标进行中」/
+ * 「目标未在续跑」/「目标已暂停」/「目标受阻」) while the **icon is a custom component**:
+ * the running ring while the goal is really running, otherwise a `Target` glyph
+ * coloured by tone (`goalIconColorToken`: muted while armed, warning when not
+ * continuing, danger when blocked). The `title` is the fixed noun 「目标」/「Goal」
+ * — it is the phone sheet's header and the accessibility name, and the full
+ * objective lives once in the popover body instead of twice.
  *
  * **What is never shown.** A goal the user cannot read is not "no goal": the
  * poller keeps the last state on a transient error, and a terminal error (a
@@ -44,9 +44,10 @@ import { useEffect, useState } from "react";
 import { Text, View } from "react-native";
 import { goalControl, goalCurrent, type GoalAction, type GoalState } from "../shared/goal";
 import { GoalPopoverBody } from "./goal-popover";
+import { useAgent, useGoalRunningMark } from "./goal-running";
 import {
-  clearConfirmStep,
   createGoalPoller,
+  goalEditSubmittable,
   goalIconColorToken,
   goalPillPresentation,
   type GoalLabel,
@@ -54,7 +55,8 @@ import {
   type GoalTone,
   type GoalViewState,
 } from "./goal-polling";
-import { FACTS_FONT_SIZE } from "./jobs-popover-layout";
+import { FACTS_FONT_SIZE, ringColorFor } from "./jobs-popover-layout";
+import { StatusRingMark } from "./status-ring";
 import { localeText, type GoalText } from "./locale";
 
 /** One agent's latest answer, plus the listeners the pill and popover subscribe with. */
@@ -68,7 +70,7 @@ interface AgentGoal {
 }
 
 /** The live answer per agent, shared by the pill, its glyph and its popover. */
-type GoalStore = Map<string, AgentGoal>;
+export type GoalStore = Map<string, AgentGoal>;
 
 /** The label copy for one semantic label key. */
 function goalLabelText(label: GoalLabel, text: GoalText): string {
@@ -118,20 +120,34 @@ function publish(store: GoalStore, agentId: string, next: Omit<AgentGoal, "liste
  * repaints the glyph without re-registering the button (a `registration.update`
  * per poll would republish the composer for nothing).
  */
-function makeGoalIcon(store: GoalStore, agentId: string) {
+export function makeGoalIcon(store: GoalStore, agentId: string) {
   function GoalPillIcon({ size, theme }: PluginButtonIconProps) {
     const [tone, setTone] = useState<GoalTone>(() => goalToneOf(store.get(agentId)));
+    const [goal, setGoal] = useState<GoalState | null>(() => store.get(agentId)?.goal ?? null);
     useEffect(() => {
       const current = store.get(agentId);
       if (current === undefined) return;
       const listener = () => {
         setTone(goalToneOf(store.get(agentId)));
+        setGoal(store.get(agentId)?.goal ?? null);
       };
       current.listeners.add(listener);
       return () => {
         current.listeners.delete(listener);
       };
     }, []);
+    const agentStatus = useAgent(agentId, (agent) => agent.status);
+    const running = useGoalRunningMark(
+      goal?.phase ?? "complete",
+      goal?.activation ?? "armed",
+      agentStatus,
+    );
+    if (running) {
+      // The ring **replaces** the glyph, the way the host's track marks do:
+      // the pill's 14px icon slot is too small for a ring over a Target, and on
+      // the rail a running mark is always the ring itself.
+      return <StatusRingMark size={size} color={ringColorFor(theme.colors.surface0)} />;
+    }
     return <Icon name="Target" size={size} color={theme.colors[goalIconColorToken(tone)]} />;
   }
   GoalPillIcon.displayName = "GoalPillIcon";
@@ -150,8 +166,8 @@ function makeGoalIcon(store: GoalStore, agentId: string) {
  *
  * **Failure keeps the panel open.** DSH's own sentence is shown in place — a
  * paused goal at its round cap refuses `resume`, and closing the popover would
- * leave the user with no explanation. `清除` takes two clicks
- * ({@link clearConfirmStep}); the arm resets on any other action.
+ * leave the user with no explanation. Clearing is an in-place confirmation page
+ * (`mode: "confirm"`): the red row appears only after the user has asked.
  */
 function makeGoalPopover(
   client: PluginClientContext,
@@ -163,8 +179,7 @@ function makeGoalPopover(
     const [entry, setEntry] = useState<AgentGoal | undefined>(store.get(agentId));
     const [busy, setBusy] = useState<GoalAction | null>(null);
     const [error, setError] = useState<string | undefined>(undefined);
-    const [clearArmed, setClearArmed] = useState(false);
-    const [editing, setEditing] = useState(false);
+    const [mode, setMode] = useState<"view" | "edit" | "confirm">("view");
     const [draft, setDraft] = useState("");
 
     useEffect(() => {
@@ -216,8 +231,7 @@ function makeGoalPopover(
           setError(result.error ?? text.controlFailed);
           return;
         }
-        setClearArmed(false);
-        setEditing(false);
+        setMode("view");
         setDraft("");
         // Immediate refresh: the user just pressed a button and the pill must
         // show the new phase now, not on the next scheduled poll.
@@ -229,42 +243,44 @@ function makeGoalPopover(
       }
     };
 
-    const onAction = (action: GoalAction): void => {
-      if (action === "clear") {
-        // The first click only arms; the row becomes its confirmation state.
-        if (clearConfirmStep(clearArmed) === "arm") {
-          setClearArmed(true);
-          return;
-        }
-        void run("clear");
-        return;
-      }
-      setClearArmed(false);
-      if (action === "edit") {
-        if (editing) {
-          setEditing(false);
-          return;
-        }
-        // Pre-fill with the full objective: the header shows only one truncated
-        // line, so this is where the whole text becomes visible/editable.
-        setDraft(goal.objective);
-        setEditing(true);
-        return;
-      }
-      void run(action);
+    // The pill's icon and the panel's whale share the running decision; the
+    // popover reads the agent's live status the same way the icon does.
+    const agentStatus = useAgent(agentId, (agent) => agent.status);
+    const running = useGoalRunningMark(goal.phase, goal.activation, agentStatus);
+    const resumable = goal.phase !== "active" || goal.activation === "disarmed";
+
+    const onToggleRunning = (): void => {
+      void run(resumable ? "resume" : "pause");
+    };
+
+    const onBeginEdit = (): void => {
+      // The header shows one truncated line, so this is where the full objective
+      // becomes visible and editable.
+      setDraft(goal.objective);
+      setMode("edit");
+    };
+
+    const onBeginClear = (): void => {
+      setMode("confirm");
+    };
+
+    const onSave = (): void => {
+      if (busyNow) return;
+      if (!goalEditSubmittable(draft, goal.objective)) return;
+      void run("edit", draft);
     };
 
     const onCancelEdit = (): void => {
-      setEditing(false);
+      setMode("view");
+      setDraft("");
+    };
+
+    const onConfirmClear = (): void => {
+      void run("clear");
     };
 
     const onCancelClear = (): void => {
-      setClearArmed(false);
-    };
-
-    const submitEdit = (): void => {
-      if (draft.trim() === "") return;
-      void run("edit", draft);
+      setMode("view");
     };
 
     return (
@@ -273,16 +289,19 @@ function makeGoalPopover(
         text={text}
         theme={theme}
         compact={layout.compact}
+        running={running}
+        mode={mode}
         busy={busyNow}
         error={error}
-        clearArmed={clearArmed}
-        editing={editing}
         draft={draft}
-        onAction={onAction}
-        onChangeDraft={setDraft}
-        onSubmitEdit={submitEdit}
+        onToggleRunning={onToggleRunning}
+        onBeginEdit={onBeginEdit}
+        onBeginClear={onBeginClear}
+        onSave={onSave}
         onCancelEdit={onCancelEdit}
+        onConfirmClear={onConfirmClear}
         onCancelClear={onCancelClear}
+        onChangeDraft={setDraft}
       />
     );
   }

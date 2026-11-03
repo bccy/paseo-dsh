@@ -212,14 +212,13 @@ export interface GoalText {
    */
   rounds: (started: number, max: number) => string;
   /**
-   * The popover's "now" line: the todo item DSH marks `in_progress`.
+   * The "now" line's prefix: `正在：` / `Now: `.
    *
-   * Absent when there is no such item (DSH resets its todo list every turn), in
-   * which case the line is not drawn at all.
+   * The prefix is drawn muted and the todo text in `foreground`, the way the
+   * host's task rows separate a label from its value; absent todo means the line
+   * is not drawn at all.
    */
-  currentTask: (content: string) => string;
-  /** The popover's blocker line: DSH's machine code and its sentence. */
-  blocker: (code: string, message: string) => string;
+  currentTaskPrefix: string;
   /**
    * The one-line explanation for `active + disarmed`.
    *
@@ -228,21 +227,39 @@ export interface GoalText {
    * the explanation of that state.
    */
   disarmedHint: string;
-  /** The popover's action rows and their inline text actions. */
+  /**
+   * The clear page's hint: what clearing means before the user confirms it.
+   *
+   * The design's rule is "destructive is a colour, not a click": the red row
+   * appears only after the user has asked to clear, and this line says what that
+   * asks for.
+   */
+  clearHint: string;
+  /**
+   * The row-end icon buttons and the edit/clear pages' labels.
+   *
+   * The icon buttons are unlabelled on screen (a pause glyph and a trash glyph),
+   * so these strings are their accessibility names — the only place a screen
+   * reader can tell the two buttons apart.
+   */
   actions: {
-    pause: string;
-    resume: string;
+    /** Accessibility name of the pause icon button (goal is auto-continuing). */
+    pauseTarget: string;
+    /** Accessibility name of the continue icon button (goal is not continuing). */
+    resumeTarget: string;
+    /** Accessibility name of the objective row, which opens the editor. */
     edit: string;
-    clear: string;
-    /** The 清除 row's label after its first click. */
-    confirmClear: string;
-    /** The edit row's save action. */
+    /** Accessibility name of the trash icon button and the clear page's red row. */
+    clearTarget: string;
+    /** The edit page's save row. */
     save: string;
-    /** The edit/clear row's cancel action. */
+    /** The edit and clear pages' cancel row. */
     cancel: string;
   };
-  /** Placeholder of the edit field the 编辑 button reveals. */
+  /** Placeholder of the in-place edit field. */
   editPlaceholder: string;
+  /** Accessibility name of the running ring on the whale. */
+  runningA11y: string;
   /** Shown while one control action is in flight. */
   busy: string;
   /** Fallback when a control action failed without the runtime's own sentence. */
@@ -251,14 +268,6 @@ export interface GoalText {
   unavailable: string;
   /** Popover line when the goal was cleared while the panel was open. */
   noGoal: string;
-  /**
-   * The fixed footer explaining how sending a message relates to a running goal.
-   *
-   * This is the product answer the user asked for (DESIGN §0/§2): a message sent
-   * while a goal round runs is inserted into that round and does not interrupt
-   * it, while pressing stop does pause the goal.
-   */
-  footnote: string;
 }
 
 const TEXT: Record<Locale, UiText> = {
@@ -511,26 +520,24 @@ const TEXT: Record<Locale, UiText> = {
         complete: "Complete",
       },
       rounds: (started, max) => `Round ${String(started)} · budget ${String(max)}`,
-      currentTask: (content) => `Now: ${content}`,
-      blocker: (code, message) => `Blocker: ${code} — ${message}`,
+      currentTaskPrefix: "Now: ",
       disarmedHint:
         "Auto-continue stops after a reopen or a process restart. Press Continue to resume it.",
+      clearHint: "Clearing stops the goal for good; this cannot be undone.",
       actions: {
-        pause: "Pause",
-        resume: "Continue",
+        pauseTarget: "Pause goal",
+        resumeTarget: "Continue goal",
         edit: "Edit goal",
-        clear: "Clear goal",
-        confirmClear: "Confirm clear",
+        clearTarget: "Clear goal",
         save: "Save",
         cancel: "Cancel",
       },
       editPlaceholder: "New objective",
+      runningA11y: "Goal running",
       busy: "Working…",
       controlFailed: "The goal command failed.",
       unavailable: "Could not read this session's goal.",
       noGoal: "No goal is set.",
-      footnote:
-        "Sending a message while the goal runs inserts it into the current round without interrupting the goal; pressing stop pauses it.",
     },
   },
   "zh-CN": {
@@ -764,26 +771,24 @@ const TEXT: Record<Locale, UiText> = {
       },
       // 预算不是完成度：不写 N/M 分数形态，避免被读成进度。
       rounds: (started, max) => `第 ${String(started)} 轮 · 预算 ${String(max)}`,
-      currentTask: (content) => `正在：${content}`,
-      blocker: (code, message) => `受阻原因：${code} — ${message}`,
+      currentTaskPrefix: "正在：",
       // DESIGN §2 的原文：把「为什么没在续跑、怎么恢复」说清楚。
       disarmedHint: "重开会话或进程重启后，自动续跑会停止，点「继续」恢复。",
+      clearHint: "清除后目标不再续跑，无法撤销",
       actions: {
-        pause: "暂停",
-        resume: "继续",
+        pauseTarget: "暂停目标",
+        resumeTarget: "继续目标",
         edit: "编辑目标",
-        clear: "清除目标",
-        confirmClear: "确认清除",
+        clearTarget: "清除目标",
         save: "保存",
         cancel: "取消",
       },
       editPlaceholder: "新的目标内容",
+      runningA11y: "目标运行中",
       busy: "处理中…",
       controlFailed: "目标命令执行失败。",
       unavailable: "读不到本会话的目标。",
       noGoal: "当前没有目标。",
-      // 一行（原两行，占 34px 高）。语义不变：插入当前轮、不打断；停止会暂停。
-      footnote: "运行中发消息会插入当前轮，不打断目标；停止会暂停目标。",
     },
   },
 };
