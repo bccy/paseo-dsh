@@ -283,6 +283,18 @@
   仍然照常上报——正对照，免得"清理过头"也通过）。假 `dsh` + 一次性 `DSH_HOME`，自己编译到私有
   目录。**动了多会话路由、`#deliverLive`、`provider.ts` 的引用计数或 `session.ts` 的会话归属
   逻辑必跑；或 `dsh-process.ts` 的 prompt/close 时序也必跑。**
+- `harness/shared-process-cwd-check.mjs` — 共享 `dsh` 子进程**自己的 cwd** 必须是不属于任何
+  会话的稳定目录（FIELD-NOTES 91）：插件曾按第一个打开会话的 cwd 启动共享进程，工作区（Paseo
+  worktree）被删后 `/proc/<pid>/cwd` 变 `(deleted)`，而 DSH 的 Linux scope 启动器用
+  `process.cwd()` 起 `systemd-run`（`@deepseek-ai/dsh-subprocess-local` `lib/index.js:546,575`），
+  于是**所有**会话的 bash 都报 `spawn systemd-run ENOENT`。假 `dsh` + 一次性 `DSH_HOME`，自己
+  编译到私有目录；用一层 wrapper 记录插件**实际** spawn 出的 cwd（`pwd -P`）与 pid。钉住：spawn
+  cwd 是 `stableProcessCwd()`（home，home 缺失时回落 tmp）、不是第一个/第二个会话的工作区；进程级
+  `initialize` 带同一目录；两个会话各自的 `initialize` 仍带自己的工作区（会话 cwd 没有被挪到
+  home）；删掉第一个会话的工作区后 spawn cwd 仍存在、同一个 pid 继续服务后续 prompt 并作答；
+  `stableProcessCwd` 的现有 home / 缺失 home / 空 home 三个分支。**动了 `provider.ts` 的
+  `#acquirePoolProcess` 或共享进程的 spawn cwd、或 `dsh-process.ts` 的 `stableProcessCwd` /
+  `#start` 必跑。**
 - `harness/concurrent-open-check.mjs` — 同一个 DSH 会话的两次并发 `session.open` 不能毁掉成功的
   那次：只有一次到达 `session.ready`；另一次**响亮失败**（`request.failed`，不是沉默）；失败方
   被 in-flight 守卫拒掉（"another open … is already in flight"），**不是** `attachSession` 的

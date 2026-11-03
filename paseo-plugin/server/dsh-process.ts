@@ -18,7 +18,7 @@
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { accessSync, constants, existsSync, readFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { GoalErrorCode } from "../shared/goal";
 import type { JobErrorCode } from "../shared/jobs";
@@ -763,6 +763,43 @@ function toError(value: unknown, fallback: string): Error {
     return new Error(String((value as { message: unknown }).message));
   }
   return new Error(fallback);
+}
+
+/**
+ * The working directory a **shared** `dsh` child is spawned in.
+ *
+ * The shared child outlives every session it serves, so its own cwd must not be
+ * any one session's workspace. It used to be the first session's cwd, and when
+ * that workspace was a disposable Paseo worktree the child's `/proc/<pid>/cwd`
+ * turned into `(deleted)` the moment the worktree was removed. From then on
+ * **every** session's bash calls failed with `spawn systemd-run ENOENT`: DSH's
+ * Linux scope launcher (`@deepseek-ai/dsh-subprocess-local`, `lib/index.js:546`
+ * and `:575`) starts `systemd-run` with `cwd: process.cwd()`, and a deleted
+ * directory cannot be a child's working directory. Session cwd is unaffected —
+ * it travels per session in `initialize` — which is why the failure looked
+ * unrelated to the workspace that was deleted.
+ *
+ * The home directory is the right anchor because it belongs to the user, not to
+ * a workspace: no Paseo workspace cleanup deletes it, and DSH persists
+ * everything under `DSH_HOME`, so the child never writes relative to its cwd. A
+ * home directory that does not exist (or is not a directory) falls back to the
+ * system temp directory, which always exists; that branch only covers a broken
+ * deployment, and a spawn in a missing directory would fail loudly anyway.
+ *
+ * @param home - candidate home directory; defaults to `os.homedir()`.
+ * @param fallback - candidate fallback; defaults to `os.tmpdir()`.
+ * @returns the first candidate that is an existing directory, else `fallback`.
+ */
+export function stableProcessCwd(home: string = homedir(), fallback: string = tmpdir()): string {
+  for (const candidate of [home, fallback]) {
+    if (candidate === "") continue;
+    try {
+      if (statSync(candidate).isDirectory()) return candidate;
+    } catch {
+      /* not an existing directory: try the next candidate */
+    }
+  }
+  return fallback;
 }
 
 interface Pending {
