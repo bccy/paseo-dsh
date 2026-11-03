@@ -638,16 +638,6 @@ function withGoalErrorCode(result: DshGoal): DshGoal {
 /** What one attached session contributes besides its handlers. */
 export interface DshSessionOptions {
   systemPrompt?: string;
-  /**
-   * Paseo's own name for this session's agent.
-   *
-   * Forwarded on the session's `initialize` frame; the bridge remembers it and
-   * writes it as the DSH session title once the session is live. Without it a
-   * session whose first message is a host envelope has no DSH title at all (the
-   * title service only titles human `user` messages), so DSH's session list
-   * shows it as untitled.
-   */
-  title?: string;
   /** Working directory this session runs in; defaults to the process's. */
   cwd?: string;
   /** Route this session is pinned to; defaults to the process's. */
@@ -1569,7 +1559,7 @@ export class DshProcess {
    *
    * @param sessionId - DSH's own session id; the key every request and frame uses.
    * @param handlers - where this session's events, questions and exit go.
-   * @param options - this session's cwd/route/MCP servers/title, if they differ.
+   * @param options - this session's cwd/route/MCP servers, if they differ.
    * @throws when one of the session's MCP servers cannot be mounted in DSH.
    */
   async attachSession(
@@ -1600,10 +1590,6 @@ export class DshProcess {
     if (options.cwd !== undefined) merged.cwd = options.cwd;
     if (options.route !== undefined) merged.route = options.route;
     if (options.mcpServers !== undefined) merged.mcpServers = options.mcpServers;
-    // An omitted title is "no update", not "clear": Paseo re-sends its stored
-    // agent name on every reopen, and a build that sends none must not erase the
-    // name a previous attach supplied.
-    if (options.title !== undefined) merged.title = options.title;
     merged.systemPrompt = options.systemPrompt;
     this.#sessionOptions.set(sessionId, merged);
     // Translate this session's MCP servers now, so a server DSH cannot mount
@@ -1929,10 +1915,6 @@ export class DshProcess {
       ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
       sessionId,
       systemPrompt: options.systemPrompt ?? "",
-      // Paseo's agent name, so the bridge can make it the DSH session title
-      // (see `DshSessionOptions.title`). Omitted rather than sent empty: the
-      // bridge treats a missing title as "no update".
-      ...(options.title === undefined ? {} : { title: options.title }),
     });
     this.#initializedSessions.add(sessionId);
   }

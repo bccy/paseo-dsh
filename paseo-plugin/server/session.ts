@@ -159,16 +159,6 @@ const USAGE_REPLAY_DELAYS_MS = [0, 250, 1000, 3000] as const;
 
 export interface DshSessionOptions {
   systemPrompt?: string;
-  /**
-   * Paseo's own name for this agent (`config.title` on the session open).
-   *
-   * DSH's title service titles sessions from human `user` messages only, and a
-   * Paseo agent is started by a host envelope — so without forwarding this name
-   * the DSH session list shows an unnamed conversation. It travels on the
-   * session's `initialize` (see `DshProcess.attachSession`) and the bridge
-   * writes it as the DSH session title.
-   */
-  title?: string;
   /** False when the host cannot display/respond to tool approval cards. */
   permission?: boolean;
   sessionId: string;
@@ -680,7 +670,6 @@ export class DshSession {
       systemPrompt: this.#options.systemPrompt,
       cwd: this.#options.cwd,
       route: this.#route,
-      ...(this.#options.title === undefined ? {} : { title: this.#options.title }),
       ...(this.#options.mcpServers === undefined ? {} : { mcpServers: this.#options.mcpServers }),
     });
     // The mode is per session, and the shared child's plan state may have been set

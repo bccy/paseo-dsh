@@ -358,18 +358,6 @@
   **另外，凡动了 `server.js` 的请求分派、会话生命周期（`prompt`/`cancel`/`createSession`/
   `closeSession`）、`listSessions` 或持久化读取区段也必跑**（新增断言覆盖 queued plan 双向
   应用、query/cwd 不做窄预过滤、persistence signal/迟到句柄、冷会话创建中 cancel）。
-- `harness/session-title-adoption-check.mjs` — Paseo 的 agent title 透传成 DSH session title
-  （桥这一半）：Paseo 给自己的 agent 起名（UI 显示的就是它），经 `config.title` → 插件 → 会话的
-  `initialize` 帧 → 桥记住并 `sessionTitle.rename()`。DSH 标题服务只从人类 `user` 消息派生标题，
-  而 Paseo agent 的首条消息是宿主信封，所以没有透传时 DSH 会话列表显示未命名。断言：`initialize`
-  带 title 后**新建分支**与 **resume 分支**都写到 live session（且是同一个 Session 对象）、重开时
-  标题相同不重复 append、无 title 不写、非字符串/空串/纯空白 title 忽略而不报错、已有不同标题被
-  Paseo 名字覆盖、title 按会话隔离且进程级 `initialize`（无 sessionId）不会命名任何会话、标题服务
-  缺失 / `rename` 拒绝只写 stderr 且会话照常打开。模块解析钩子驱动**真实** `server.js`
-  （同 `bridge-server-check`）。**依赖本机 DSH 安装，所以不进 CI**
-  （`DSH_PACKAGES_DIR` / `DSH_INSTALL_DIR` 可覆盖，解析失败 exit 2 并打印实际目录）。
-  **动了 `server.js` 的 `initialize`/`applySessionTitle`/`createSession`，或插件侧
-  `provider.ts`/`session.ts`/`dsh-process.ts` 的 title 透传必跑。**
 - `harness/bridge-entry-check.mjs` — 桥入口 `dsh-bridge/lib/index.js` 的 `startBridge` 工具
   生命周期接线（模块解析钩子把 `@deepseek-ai/*` 换成 stub，加载**真实**入口）：`tools/execute`
   → `beginFileMutation` → `captureFileBeforeTool` 的顺序、`post-execute` → commit/finish、
