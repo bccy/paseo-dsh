@@ -1,11 +1,12 @@
 /**
- * LOCAL PATCH (paseo-dsh) — startup hook: re-apply the rewind patch on every
+ * LOCAL PATCH (paseo-dsh) — startup hook: re-apply the turnId patch on every
  * worker start, including the ones systemd never sees.
  *
  * WHY THIS EXISTS
  * ---------------
- * The rewind patch (`apply-rewind-history-truncation.mjs`) rewrites
- * `@getpaseo/server/dist/server/server/agent/plugin-provider.js` inside the
+ * The turnId patch (`apply-rewind-history-truncation.mjs`, a historical file
+ * name — the rewind target was retired with Paseo 0.15.0) rewrites
+ * `@getpaseo/server/dist/server/server/agent/agent-manager.js` inside the
  * globally installed package, so every `npm install -g @getpaseo/cli@<new>`
  * overwrites it. Two different restart paths can follow that install:
  *
@@ -26,7 +27,8 @@
  *
  * FAILURE POLICY: soft.
  * A patch that cannot be applied must never keep the daemon from starting —
- * a missing rewind is degraded behaviour, a daemon that refuses to boot is an
+ * a missing turnId patch is degraded behaviour (long conversations stop folding
+ * turns after a reopen; nothing is lost), a daemon that refuses to boot is an
  * outage. Failures are appended to `startup-patch-hook.log` next to this file
  * so a silent skip is still visible after the fact. This mirrors the
  * `10-rewind-patch-soft-fail.conf` drop-in that already makes the systemd
@@ -301,24 +303,18 @@ if (!existsSync(patchScript)) {
   if (result.error !== undefined) {
     log(`failed to spawn patch script: ${result.error.message}`);
   } else if (code === 0) {
-    // The script prints "already patched" / "applied" / "patched-on-new-upstream";
+    // The script prints "already patched" / "applied" / "rebuilt" (turnId only);
     // record the line so the log shows which path was taken on each start.
     log(`ok: ${stdout.split("\n").pop() ?? "(no output)"}`);
-  } else if (code === 3) {
-    // Exit 3 = DEGRADED, and it is deliberately distinct from a failure: the
-    // patch is present and rewind still works, but its body is older than the
-    // apply script and could not be rebuilt (the clean baseline backup is gone).
-    // The known consequence is narrow — the SECOND rewind in a session fails
-    // with "No provider revert token" — so saying "rewind will not reset" here
-    // would be wrong, and saying nothing would be the silent degradation this
+  } else {
+    // Non-zero = the script could not apply the patch safely (moved anchors,
+    // half-patched file, missing target). Keep the daemon running and leave the
+    // reason here: the consequence is narrow (a reopened session stops folding
+    // turns; nothing is lost), but silently degrading is exactly what this
     // whole mechanism exists to avoid.
     log(
-      `DEGRADED (exit 3) — rewind works, but the SECOND rewind in a session will fail. `
-      + `Reinstall @getpaseo/cli, then restart. ${stdout.split("\n").pop() ?? ""}`,
+      `FAILED (exit ${code}) — turnId patch not in place; a reopened session will not fold turns. `
+      + `${stderr || stdout}`,
     );
-  } else {
-    // Exit 2 = the script could not apply the patch safely (moved anchors,
-    // half-patched file). Keep the daemon running and leave the reason here.
-    log(`FAILED (exit ${code}) — rewind will not reset until this is fixed. ${stderr || stdout}`);
   }
 }

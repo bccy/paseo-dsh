@@ -25,8 +25,9 @@
  *      a host that refreshes the timeline from one that does not, and it only
  *      works because of the order — a host that truncates its history buffer at
  *      the rewound row drops everything already in it, so a notice sent after the
- *      receipt would survive on that host too and lie. `harness/host-contract-sim.mjs`
- *      drives the real host code to prove both halves;
+ *      receipt would survive on that host too and lie. (That used to be proven on
+ *      the real host code by `harness/host-contract-sim.mjs`, retired with the 0.14
+ *      truncation patch; on 0.15 the replay clears the buffer.)
  *   3. the retired reload path stays gone: no "正在回退，请稍候" working notice and
  *      no "未自动刷新" warning, because nothing refreshes and nothing can fail;
  *   4. a rewind the bridge refuses becomes `request.failed`, never a silent
@@ -414,8 +415,9 @@ const check = (name, pass, detail) => {
   // when the receipt resolves, which is what makes the canary vanish on a
   // refreshed timeline; a notice emitted after the receipt is outside that window
   // and survives on that host too, turning the canary into a false "your timeline
-  // is stale" warning. Both directions are driven against the real host code in
-  // `harness/host-contract-sim.mjs`.
+  // is stale" warning. Both directions used to be driven against the real host
+  // code in `harness/host-contract-sim.mjs`, retired with the 0.14 truncation
+  // patch; on 0.15 the replay clears the buffer.
   const rewindNotices = eventsSince(beforeRevert).filter(
     (e) => e.type === "session.notice" && e.sessionId === sessionId,
   );

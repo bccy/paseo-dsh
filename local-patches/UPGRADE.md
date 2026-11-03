@@ -2,9 +2,14 @@
 
 面向「以后 `npm i -g @getpaseo/cli` 之后要做什么」的操作手册。
 
-**一句话结论：正常情况下什么都不用做。** 升级后第一次启动 daemon 时，`ExecStartPre`
-会自动把补丁重新打上（锚点自适配，不管上游改了什么无关字节、换了缩进还是换了行尾）。
-只有锚点真的失配时才需要人工介入，而且那时 daemon 仍然能起来，只是撤回功能降级。
+**一句话结论：正常情况下什么都不用做。** 升级后第一次启动 daemon 时，`ExecStartPre` 会自动把
+**turnId 补丁**重新打上（锚点自适配，不管上游改了什么无关字节、换了缩进还是换了行尾）。只有
+锚点真的失配时才需要人工介入，而且那时 daemon 仍然能起来，只是「重开会话后长对话折叠轮次」
+不可用（不丢数据）。
+
+**从 0.15.0 起，rewind（撤回后时间线刷新）补丁已退休**：上游 PR #8368 原生修好 #4667，
+0.15 的 `PluginSessionHistory` 也没有旧补丁依赖的数组语义。所以 `local-patches/` 现在只剩
+`turnId` 一个 target，`plugin-provider.js` 不再被触碰。
 
 ---
 
@@ -12,7 +17,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `~/.paseo/local-patches/apply-rewind-history-truncation.mjs` | 给 `plugin-provider.js` 打补丁（截断 `this.history`，让撤回后时间线立即刷新）。幂等，可反复跑 |
+| `~/.paseo/local-patches/apply-rewind-history-truncation.mjs` | 给 `agent-manager.js` 打 turnId 补丁（两条历史重放路径把 `event.turnId` 传给 `recordTimeline`）。幂等，可反复跑。文件名是历史名 |
 | `~/.config/systemd/user/paseo.service.d/10-rewind-patch-soft-fail.conf` | 让上面那个脚本作为 `ExecStartPre` 运行，且**失败不阻止 daemon 启动**（`-` 前缀） |
 | `~/.paseo/local-patches/check-rewind-patch.mjs` | 只读体检：补丁现在到底有没有生效 |
 
@@ -20,7 +25,7 @@
 
 ```
 ~/.npm-global/lib/node_modules/@getpaseo/cli/node_modules/@getpaseo/server/
-  dist/server/server/agent/plugin-provider.js
+  dist/server/server/agent/agent-manager.js
 ```
 
 `npm i -g @getpaseo/cli` 会整树替换这个目录 → **补丁消失**，这是唯一需要在意的点。
@@ -60,48 +65,37 @@ npm i -g @getpaseo/cli
 装完**先别急着重启**，跑一次体检：
 
 ```bash
-node ~/.paseo/local-patches/check-rewind-patch.mjs
+env -u NODE_OPTIONS node ~/.paseo/local-patches/check-rewind-patch.mjs
 ```
 
-### 按 exit code 分支
+### exit code 表
 
-**先说清楚：`check-rewind-patch.mjs` 和 `apply-rewind-history-truncation.mjs` 各有一套 exit code，
-数字含义不同，别混用。**
+**先说清楚：`check-rewind-patch.mjs` 与 `apply-rewind-history-truncation.mjs` 各有一套 exit code，
+数字含义不同，别混用。** 0.15 起 rewind target 已退休，旧的 `check 4`（上游已自修、该退休）与
+`apply 3`（DEGRADED）**不存在了**。
 
 `check-rewind-patch.mjs`（只读体检）：
 
 | exit | 含义 | 该做什么 |
 |---|---|---|
 | `0` | 补丁在位且实现体是最新的 | 无需动作，直接重启 |
-| `1` | 需要跑一次 apply。两种情形：① 补丁不在位但锚点各命中 1 次（可自动打）；② 标记齐全但**实现体是旧版**（`state: stale-body`）且**可原地重建**。**要区分请看 `state`，不要只看 exit code** | 也无需动作：下次启动 daemon 时 `ExecStartPre` 会自动打上。想立刻确认就手动跑一次 `node ~/.paseo/local-patches/apply-rewind-history-truncation.mjs` |
-| `2` | **需人工**，apply 会拒绝且不写文件。三类：① 锚点失配 / 半打补丁；② `state: revert-signature-changed`（上游改了 `revert()` 签名，门禁不通过）；③ `state: stale-body-unrebuildable`（实现体是旧版且**无法原地重建**） | 见下面第 3 节。②③ 都**不要**再跑 apply——先重装 `@getpaseo/cli` 拿回干净文件，再按新上游形状改锚点/签名 |
+| `1` | 需要跑一次 apply。两种情形：① 补丁不在位但两处重放调用都命中（`state: patchable`）；② 标记齐全但**实现体是旧版**且**可原地重建**（`state: stale-body`）。**要区分请看 `state`，不要只看 exit code** | 也无需动作：下次启动 daemon 时 `ExecStartPre` 会自动打上。想立刻确认就手动跑一次 `node ~/.paseo/local-patches/apply-rewind-history-truncation.mjs` |
+| `2` | **需人工**，apply 会拒绝且不写文件。四类：① 半打补丁（marker 既不是 0 也不是 2）；② `state: anchor-mismatch`（两处重放调用没有恰好命中 2 次）；③ `state: anchor-context-mismatch`（命中顺序/后续代码不对）；④ `state: stale-body-unrebuildable`（旧体无法原地重建） | 见第 3 节。都**不要**反复跑 apply——它会 fail closed。先重装 `@getpaseo/cli` 拿回干净文件；若是上游改了重放调用，按新形状改锚点 |
 | `3` | 目标文件不存在 | paseo 可能没装好，或安装路径变了。先 `which paseo` / 确认 `@getpaseo/server` 是否在预期位置 |
-| `4` | **上游已自行修好撤回** → 补丁该退休 | 按第 5 节删掉补丁。别让它继续滞留（否则每次撤回都刷一条假告警） |
-
-> 上表 `1` 的 `stale-body` 只指**可重建**的情形；不可重建现在是 `2` 的
-> `stale-body-unrebuildable`，不再承诺「跑一次 apply 就好」。`--json` 里对应的机器字段：
-> `revertSignatureFound`（门禁看到的 `revert()` 签名）、`rebuildBlockedReason` /
-> `rebuildBlockedDetail`（stale 体为什么不能重建）；`rebuildBlockedReason` 与 apply 实际写进
-> `rewind-patch.status.json` 的 reason 是**同一个值**（三处共用 `planRewindRebuild`），不是猜的。
 
 `apply-rewind-history-truncation.mjs`（会写文件，`ExecStartPre` 与启动钩子跑的就是它）：
 
 | exit | 含义 | 该做什么 |
 |---|---|---|
-| `0` | 两个 target 全部到位（`rewind` / `turnId`） | 无需动作 |
-| `1` | 至少一个 target **失败**（锚点失配、半打、写失败等） | 看 stderr 里点名的 target，按第 3 节处理 |
-| `3` | **DEGRADED**：补丁在、也能用，但实现体是旧版且**无法自动重建**（缺该上游版本的干净基线） | 已知后果只有一条：**同一会话里的第二次撤回**会报 `No provider revert token`。修法：重装 `@getpaseo/cli`（恢复干净文件）后重跑本脚本。启动钩子会单独记一行 `DEGRADED (exit 3)`，不会写成 FAILED |
+| `0` | turnId 补丁到位（新打 / 已在位 / 旧体已原地重建），或 `--revert` 成功/幂等跳过 | 无需动作 |
+| `1` | 失败（目标缺失、锚点失配、半打、写失败、语法校验失败等），**不会留下半写文件** | 看 stderr 与 `rewind-patch.status.json` 里的 `reason`，按第 3 节处理 |
 
-⚠️ 上表 `3` 与 `check` 的 `3` **是两回事**：`check` 的 3 是"文件不存在"，`apply` 的 3 是"DEGRADED"。
+`apply --check` 的 exit code 与上表第一张（checker）相同（`0/1/2/3`），它不写任何文件。
 
-⚠️ `check-rewind-patch.mjs` 的 `code` 只反映 rewind 一个 target，但**进程退出码是合并后的**：
-姊妹补丁（`turnId`）缺失会把 exit code 从 0 抬高（未打/体旧 → 1，半打 → 2，文件不存在 → 3），
-而 rewind 自己的非零判定（尤其 `4` = 该退休）优先返回、不被覆盖。详细结果在输出的
-「姊妹补丁」一节 / `--json` 的 `siblings` + `siblingsAllOk`，合并后的退出码在 `--json` 的
-`exitCode`（`code` 仍是 rewind 自己的判定，保留给老调用方）。
-
-之所以把姊妹纳入退出码：这个脚本是本套补丁唯一的体检工具，而 `turnId` 被抹掉时它以前照样
-`exit 0`——一个「不会变红的检查」，正是本项目反复要消灭的假绿。
+> `--json` 的机器字段：`code`/`state`/`ok`/`autoPatchable`/`patchBody`/`staleDetail`/
+> `turnIdMatches`/`turnIdContext`/`rebuildBlockedReason`/`rebuildBlockedDetail`/`lastRun`。
+> `rebuildBlockedReason` 与 apply 实际写进 `rewind-patch.status.json` 的 reason 是**同一个值**
+> （两处共用 `turnIdRebuildPlan`），不是猜的。
 
 `--json` 给机器读：
 
@@ -131,163 +125,162 @@ journalctl --user -u paseo.service -b --no-pager | grep rewind-patch | tail
 
 ## 3. exit 2：锚点真的失配了，怎么修
 
-补丁靠两个**结构锚点**定位插入点（不是靠 md5）。两个都必须**恰好命中 1 次**：
+补丁靠一个**结构锚点**定位两处重放调用（不是靠 md5）。这个调用必须**恰好命中 2 次**：
 
-- **ANCHOR_A**：`publish(event)` 方法（带 `this.history.push(event); this.emit(event);` 三行体）
-  —— 补丁把 `truncateHistoryFrom()` 方法插在它前面
-- **ANCHOR_B**：`revert()` 尾部那整个 `await this.bridge.revert({...});` 调用 + 收尾 `}`
-  —— 补丁把截断调用插在 `}` 前面
+- 干净文件里长这样（0.14.0 与 0.15.0 逐字相同）：
+  ```js
+  const row = this.recordTimeline(agent.id, event.item, event.timestamp ? { timestamp: event.timestamp } : undefined);
+  ```
+- 两处命中之后必须分别跟着 `if (broadcastTimeline) {`（`forceHydrate…`）和
+  `if (deferredBroadcast) {`（`primeTimeline…`），**顺序固定**——用来证明命中的是两条不同的
+  重放路径，而不是同一处的两份拷贝。
 
-两者都是**空白弹性正则**（`[ \t]*` + `\r?\n` 容错），所以上游改缩进（4→2 空格）、换 Tab、
-换 CRLF 都能自动适配。失配只有两种真原因：**插入点被删/被改写**，或**出现歧义（>1 次）**。
+调用是**空白弹性正则**（`[ \t]*` + `\r?\n` 容错），所以上游改缩进（4→2 空格）、换 Tab、
+换 CRLF 都能自动适配。失配只有三种真原因：**调用被改写/删除**、**出现歧义（>1 次）**、
+**上下文行变了**。
 
 ### 诊断
 
 ```bash
-# 看 check 报出的实际命中数
+# 看 check 报出的实际状态与命中数
 node ~/.paseo/local-patches/check-rewind-patch.mjs
 
 # 直接看上游现在长什么样
-T=~/.npm-global/lib/node_modules/@getpaseo/cli/node_modules/@getpaseo/server/dist/server/server/agent/plugin-provider.js
-grep -n 'publish(event) {' "$T"
-grep -n 'await this.bridge.revert({' "$T"
-grep -n 'LOCAL PATCH (paseo-dsh)' "$T"     # 应为 0（干净）或 2（已打）
+T=~/.npm-global/lib/node_modules/@getpaseo/cli/node_modules/@getpaseo/server/dist/server/server/agent/agent-manager.js
+grep -n 'this.recordTimeline(agent.id, event.item' "$T"
+grep -n 'LOCAL PATCH (paseo-dsh): keep the turn id on replay' "$T"   # 应为 0（干净）或 2（已打）
 ```
 
 ### 修法
 
-1. 把 `~/.paseo/local-patches/apply-rewind-history-truncation.mjs` 里的 `ANCHOR_A_RE` /
-   `ANCHOR_B_RE` 按新形状改正则。要求不变：**保留完整的函数体作为判据**（否则会误命中文件里
-   另一个同名 `publish(event)`），**保留缩进捕获组**（插入时要复用它）。
-2. 用临时副本验证，别直接打真文件。
-
-   ⚠️ **必须同时给出三个目标变量。** `TURNID_TARGET` 只由 `REWIND_PATCH_TURNID_TARGET` 或
-   `PASEO_CLI_ROOT` 决定，**不跟随** `REWIND_PATCH_TARGET`。所以只设 `REWIND_PATCH_TARGET`
-   的老命令会把 `rewind` 打到副本上、同时把 `turnId` **真的打到本机 `agent-manager.js`** 并在
-   那里写备份——一次「安全验证」就把半成品推到了真机。
+1. 把 `~/.paseo/local-patches/apply-rewind-history-truncation.mjs` 里的 `TURNID_CALL_RE` /
+   `TURNID_CONTEXTS` 按新形状改。要求不变：**调用整行写全**（否则会误命中别的
+   `recordTimeline`），**保留缩进捕获组**（插入时要复用它），**两处上下文按顺序断言**。
+2. 用临时副本验证，别直接打真文件（**注意：只有 `REWIND_PATCH_TURNID_TARGET` 一个目标变量**，
+   旧文档里的 `REWIND_PATCH_TARGET` 已随 rewind target 删除）：
 
    ```bash
-   T=~/.npm-global/lib/node_modules/@getpaseo/cli/node_modules/@getpaseo/server/dist/server/server/agent/plugin-provider.js
-   cp "$T" /tmp/pp.js
-   cp "$(dirname "$T")/agent-manager.js" /tmp/am.js
+   T=~/.npm-global/lib/node_modules/@getpaseo/cli/node_modules/@getpaseo/server/dist/server/server/agent/agent-manager.js
+   cp "$T" /tmp/am.js
    REWIND_PATCH_HOME=/tmp/patch-test \
-   REWIND_PATCH_TARGET=/tmp/pp.js \
    REWIND_PATCH_TURNID_TARGET=/tmp/am.js \
-     node ~/.paseo/local-patches/apply-rewind-history-truncation.mjs
+     env -u NODE_OPTIONS node ~/.paseo/local-patches/apply-rewind-history-truncation.mjs
    # 期望 exit 0 + ESM syntax ok，且真机的 agent-manager.js md5 不变
    ```
 3. 验证通过再打真的：
    ```bash
-   node ~/.paseo/local-patches/apply-rewind-history-truncation.mjs
+   env -u NODE_OPTIONS node ~/.paseo/local-patches/apply-rewind-history-truncation.mjs
    ```
-4. 如果上游**已经自己修好了**撤回（见第 5 节），那就别修锚点了，直接删补丁。
+4. 如果上游**已经自己修好了**（重放调用开始传 `turnId`），那就别修锚点了，直接删补丁
+   （见第 5 节）。
 
-> `BASE_MD5` 不再参与判定，只是记录「当前文件离基线多远」。上游改一个无关字节**不该**被当成故障，
-> 这正是这版脚本的设计意图。所以**不要**为了「让 md5 对上」去改 `BASE_MD5`。
+> 上游改一个无关字节**不该**被当成故障——判定靠锚点，不靠 md5。
 
 ---
 
 ## 4. 降级了是什么表现
 
-补丁没生效时（exit 2 / 3，或 `ExecStartPre` 失败），撤回功能退化为「旧行为」：
+turnId 补丁没生效时（exit 1/2，或 `ExecStartPre` 失败）：
 
-- 撤回**会成功**，消息数据**不会丢**；
-- 但**时间线不会自动刷新** —— 被撤回的消息在界面上**还看得见**；
-- **重开会话**（或 `paseo agent reload`）之后，被撤回的消息才消失。
+- **不丢数据**，撤回、文件恢复、模型上下文全部正常；
+- 唯一的影响：**重开会话后长对话的回合不折叠**（每一步单独成块，而不是按回合分组）；
+- 修好补丁后重开会话即可恢复，无需迁移任何数据。
 
-也就是说：功能降级，数据无损。这不是紧急故障，可以等有空再修。
+**rewind 不再是降级项**：Paseo 0.15.0+ 原生刷新时间线，不需要本地补丁。只有回滚到 0.14.0
+才会退化为「撤回后时间线不刷新」（见第 7 节）。
 
 ---
 
-## 5. 什么时候可以彻底删掉补丁
+## 5. 什么时候可以彻底删掉 turnId 补丁
 
-上游修好 [paseo#4667](https://github.com/getpaseo/paseo/issues/4667)（插件 provider 的
-`streamHistory()` 在撤回后不缩短）之后，这个补丁就该退休了。判断依据：**新版
-`plugin-provider.js` 里 `revert()` 自己就截断了 `this.history`**（而不是像现在这样只发
-`bridge.revert` 请求、然后指望 daemon 重建时间线时读到缩短后的数组）。
-
-> **别自己 grep 判断——用 exit code 4。** 手工 grep 在**补丁在位时必然误判**：补丁自己插入的
-> `truncateHistoryFrom` 调用就在 `revert()` 里，那几行也含 `this.history` 字样。所以判定必须
-> 由下面这条命令做（它只在 marker==0 的干净文件上判定，天然排除补丁自己的文本）：
+上游把两处历史重放路径改成把已有的 `turnId` 传给 `recordTimeline` 之后（即
+`const row = this.recordTimeline(agent.id, event.item, { … turnId: event.turnId … })` 这类写法），
+这个补丁就多余了。判断方式：
 
 ```bash
-# 1. 一条命令判定：exit 4 = 上游已自修，补丁该退休
 node ~/.paseo/local-patches/check-rewind-patch.mjs; echo "exit=$?"
 ```
 
-看到 `state: upstream-fixed-retire-patch` / `exit 4` 才继续往下走。
-若输出是 `exit 0`（补丁在位）或 `exit 2`（锚点失配），**上游还没修**，不要去删补丁。
-
-<details>
-<summary>为什么不能手工 grep（想看原理再展开）</summary>
-
-`revert()` 方法体在**已打补丁**的文件里长这样（补丁自己插了 3 行）：
-
-```
-        // LOCAL PATCH (paseo-dsh): the force-hydrate that follows this reply reads
-        // `streamHistory()`, i.e. `this.history`.  Shorten it now so the rebuilt
-        if (!this.truncateHistoryFrom(messageId)) {
-```
-
-拿这些行去 grep `this\.history` 会命中，于是把**自己写的补丁**判成「上游已自修」。
-检测函数用的是「只在 marker==0 时判定」+「bound 在 `revert()` 方法体内」，两条一起才不误判。
-
-</details>
-
-届时按这个顺序删（先验证再删，别反过来）：
+看到 `state: anchor-mismatch`（exit 2）且 grep 确认重放调用已经带 `turnId`，就说明上游自己修了
+——按下面顺序删（先验证再删，别反过来）：
 
 ```bash
-# 2. 真机验证：撤回一条消息 → 界面立即消失、无 /rewind 残留行、编辑工具改的文件恢复
-#    （用新会话，能力位只对新会话生效）
+# 1. 真机验证：新会话聊几轮 → 重开会话 → 长对话仍按回合折叠（不再需要补丁）
 
-# 3. 删 drop-in（此时先别删 paseo.service 本体里的 ExecStartPre，见下）
+# 2. 删 drop-in 与 unit 本体里的 ExecStartPre（若先删了 drop-in，本体那条就成了硬失败，别漏）
 rm ~/.config/systemd/user/paseo.service.d/10-rewind-patch-soft-fail.conf
+# 同时删掉 20-startup-patch-hook.conf 里的 NODE_OPTIONS 行（或整个 drop-in）
 systemctl --user daemon-reload
-systemctl --user show paseo.service -p ExecStartPre     # 应只剩 paseo.service 本体里那条
+
+# 3. 删脚本
+rm ~/.paseo/local-patches/apply-rewind-history-truncation.mjs
+rm ~/.paseo/local-patches/check-rewind-patch.mjs
+rm ~/.paseo/local-patches/startup-patch-hook.cjs
 ```
 
-第 3 步之后还要处理 `paseo.service` **本体**里的 `ExecStartPre` 行（那是更早写进去的）：
-把 `ExecStartPre=/usr/bin/node $HOME/.paseo/local-patches/apply-rewind-history-truncation.mjs`
-整行删掉，再 `daemon-reload`。删完 `rm ~/.paseo/local-patches/apply-rewind-history-truncation.mjs`
-（备份 `plugin-provider.js.orig-*` 建议留一份再删，它们是回滚材料）。
+`agent-manager.js.orig-turnid-*` 备份建议留一份再删（回滚材料）。
 
 ---
 
-## 6. 回滚补丁（想临时恢复官方行为）
+## 6. 回滚 turnId 补丁（想临时恢复官方行为）
 
 ```bash
-node ~/.paseo/local-patches/apply-rewind-history-truncation.mjs --revert
+env -u NODE_OPTIONS node ~/.paseo/local-patches/apply-rewind-history-truncation.mjs --revert
 ```
 
 行为：
-- 从**最近一次成功打补丁时记录的备份**还原（优先用 `rewind-patch.status.json` 里记的 `backup`，
-  回退到最新的 `plugin-provider.js.orig-*`）；
-- 两个 target 的备份都在 `~/.paseo/local-patches/`（`REWIND_PATCH_HOME`）里，**不在** npm 全局
-  包目录。早先 `turnId` 的备份写在 `dist` 里，`npm i -g` 会把它连树删掉，恰好是升级后需要回滚
-  的那一刻；现在不会了。旧版本留下的 `agent-manager.js.orig-turnid-*` 仍可用（按文件名前缀
-  扫的就是它），但新备份不会再写进 `dist`；
-- **原子写**：先写同目录临时文件再 `renameSync` 覆盖。所以还原失败时目标文件要么是完整的旧
+- 从**最近一次成功打补丁时记录的备份**还原（`agent-manager.js.orig-turnid-*`，写在
+  `~/.paseo/local-patches/`（`REWIND_PATCH_HOME`）里，**不在** npm 全局包目录——早先备份写在
+  `dist` 里，`npm i -g` 会把它连树删掉，恰好是升级后需要回滚的那一刻）；
+- **原子写**：先写同目录临时文件再 `renameSync` 覆盖。还原失败时目标文件要么是完整的旧
   （已打补丁）内容、要么是完整的干净内容，**不会**出现半截文件；
 - 还原后校验 **MARKER 计数 == 0**（确实是干净未打补丁状态）+ **ESM 语法检查通过**；
-- **不再**要求 md5 等于 `BASE_MD5` —— 上游升级后那条旧校验会让回滚永远失败；
-- 任何一步失败都会把**回滚前的已打补丁内容放回去**；连这个都写不进去时，
-  `status.json` 会记 `rollbackSucceeded: false` 并明说「目标文件可能已是备份内容、期望 md5 是 X」，
-  不会假装成功。
+- 任何一步失败都会把**回滚前的已打补丁内容放回去**；连这个都写不进去时，`status.json` 会记
+  `rollbackSucceeded: false` 并明说「目标文件可能已是备份内容、期望 md5 是 X」，不会假装成功。
 
 **幂等**：如果目标文件本来就没有补丁标记（比如刚升级完、还没打过），`--revert` 会直接
-跳过（`reason: revert-noop`），**不会**用旧备份覆盖新上游文件。
+跳过（`reason: turnid-revert-noop`），**不会**用旧备份覆盖新上游文件。
 
-> `--revert` 只回滚 `rewind` 和 `turnId` 两个 target。**`childRunning` 补丁已退役，新版脚本
-> 既不认识它的 marker、也不会主动清它**：`rewind` 的 `--revert` 是从「rewind 打补丁前」的整文件
-> 备份还原，那份备份里可能已经带着 childRunning 的两行注释（取决于旧版当年的 apply 顺序与备份
-> 代次），所以**结果不确定，别指望 `--revert` 顺手清掉它**。
+> `--revert` 只回滚 turnId 一个 target。它**不会**清 `plugin-provider.js` 上旧版留下的
+> rewind 补丁（新脚本不认识那个 marker）：升到 0.15 时整树替换会自然清掉；留在 0.14 上想清，
+> 用旧版脚本 `--revert` 或重装 CLI。
 >
-> 要彻底清掉旧版留下的 childRunning 补丁，用**旧版脚本**跑一次 `--revert`（它认识那个 target），
-> 或者直接重装 `npm i -g @getpaseo/cli` 拿回干净文件再跑新版 apply。留着它也不影响 `rewind` /
-> `turnId` 的正确性——上游 #8080 发版后它自然多余，届时随重装一起消失。
+> 注意 `--revert` 只是撤销补丁，**不会**改 drop-in。所以下次启动 daemon 时 `ExecStartPre`
+> 又会把补丁打上。要真正保持官方行为，得同时把 drop-in 里的那行注释掉。
 
-> 注意 `--revert` 只是撤销补丁，**不会**改 drop-in。所以下次启动 daemon 时
-> `ExecStartPre` 又会把补丁打上。要真正保持官方行为，得同时把 drop-in 里的那行注释掉。
+---
+
+## 7. 回滚 Paseo 0.15.0 → 0.14.0
+
+```bash
+# 1) 重启前先布自唤醒（同第 1 节）
+node ~/.paseo/local-patches/restart-with-wake.mjs --agent <agent id> --delay 10 --tag rollback-014
+
+# 2) 装回 0.14.0（精确版本；会把 server 0.14.0 一起装回）
+npm i -g @getpaseo/cli@0.14.0
+
+# 3) 重启（ExecStartPre/钩子会按 0.14 的 agent-manager.js 重打 turnId；turnId 锚点在 0.14 上同样命中）
+systemctl --user restart paseo.service
+env -u NODE_OPTIONS node ~/.paseo/local-patches/check-rewind-patch.mjs   # 期望 exit 0（turnId 在位）
+```
+
+**回滚后的行为退化（可接受，明确记录）：**
+
+- **撤回本身照常工作**（对话、文件、模型上下文都回退），但**时间线不再自动刷新**：被撤的
+  消息行会留在屏幕上，直到执行 Reload agent 或重开会话。
+- 此时插件发的 canary「撤回已生效」会随宿主重放出现在重建后的时间线里，告诉用户怎么刷新
+  ——这正是它存在的意义；在 0.15 上 replay 会把它清掉（预期，见 `docs/REWIND.md`）。
+- **不再往 0.14 上重打 rewind 截断补丁**：0.14 的 `plugin-provider.js` 结构（数组 history）
+  虽然还认旧补丁，但旧补丁已从仓库删除、不再维护；需要时用历史版本的脚本（git 历史里
+  `local-patches/apply-rewind-history-truncation.mjs` 的 0.15 之前版本）临时打，并自行承担
+  维护成本。日常回滚建议接受上面的降级。
+- `~/.dsh/paseo-rewind/`（文件 journal/objects/rescue）不需要清；0.14 的撤回文件层与 0.15 相同。
+
+**数据兼容风险【未验证】**：0.15 运行期间写入的 `~/.paseo`（agents/config/时间线）与
+`~/.dsh` 会话在 0.14 下是否可读，未实测。回滚前建议备份 `~/.paseo/config.json`、
+`~/.paseo/agents`、`~/.dsh/sessions`。0.15 原生 rewind 写入的 DSH 撤回缝仍是
+`user/message` 表面替换（格式未变），0.14 的桥按 `source.kind === "paseo-rewind"` 折叠，
+理论上可读。
 
 ---
 
@@ -300,19 +293,17 @@ node ~/.paseo/local-patches/apply-rewind-history-truncation.mjs --revert
 ```json
 {
   "ok": true,
-  "at": "2026-10-26T06:05:52.086Z",
-  "reason": "already-patched | patched | patched-on-new-upstream | reverted | revert-noop | upstream-fixed-retire-patch | anchor-mismatch | partially-patched | target-missing | write-failed | revert-write-failed | syntax-check-failed | syntax-check-unavailable | unhandled",
+  "at": "2026-11-03T06:05:52.086Z",
+  "reason": "turnid-patched | turnid-already-patched | turnid-patched-from-stale | turnid-reverted | turnid-revert-noop | turnid-anchor-mismatch | turnid-anchor-context-mismatch | turnid-partially-patched | turnid-target-missing | turnid-stale-anchor-mismatch | turnid-write-failed | turnid-syntax-check-failed | turnid-syntax-check-unavailable | unhandled",
   "target": "<被改的文件>",
   "targetMd5": "<改完之后的 md5>",
-  "baseMd5": "<已知基线，仅参考>",
   "paseoVersion": "<@getpaseo/cli 版本，读不到为 null>",
   "message": "<给人看的一句话>",
   "upstreamMd5": "<打补丁前上游的 md5>",
+  "patchedMd5": "<打补丁后的 md5>",
   "backup": "<这次用的备份路径>",
-  "anchorA": 1, "anchorB": 1,
-  "indentUnit": "4 | 2 | tab",
-  "restoredCleanly": true,
-  "rollbackSucceeded": true
+  "turnIdMarkers": 2,
+  "patchBody": "current | stale | rebuilt-from-stale"
 }
 ```
 
@@ -320,18 +311,18 @@ node ~/.paseo/local-patches/apply-rewind-history-truncation.mjs --revert
 
 | reason | ok | 含义 |
 |---|---|---|
-| `patched` / `patched-on-new-upstream` | ✅ | 补丁打上了（后者=上游变了但锚点自适配成功，**这是期望行为**） |
-| `already-patched` | ✅ | 幂等命中，无需动作 |
-| `reverted` / `revert-noop` | ✅ | 回滚成功 / 本来就没补丁所以跳过 |
-| `upstream-fixed-retire-patch` | ❌ | 上游自己修好了 → **该删补丁**（exit 4） |
-| `anchor-mismatch` / `partially-patched` | ❌ | 插入点变了 / 半打补丁 → 需人工 |
-| `target-missing` | ❌ | paseo 没装或路径变了 |
-| `write-failed` / `revert-write-failed` | ❌ | 磁盘满/权限问题，**目标文件未被破坏**（原子写保证） |
-| `syntax-check-failed` | ❌ | 补丁内容语法错，已还原干净内容 |
-| `syntax-check-unavailable` | ❌ | **校验器跑不起来**（tmpdir 权限/磁盘满），不是补丁语法问题 |
+| `turnid-patched` / `turnid-patched-from-stale` | ✅ | 补丁打上了（后者=旧体原地重建成功） |
+| `turnid-already-patched` | ✅ | 幂等命中，无需动作 |
+| `turnid-reverted` / `turnid-revert-noop` | ✅ | 回滚成功 / 本来就没补丁所以跳过 |
+| `turnid-anchor-mismatch` / `turnid-anchor-context-mismatch` / `turnid-partially-patched` | ❌ | 上游改了重放调用 / 上下文不对 / 半打补丁 → 需人工 |
+| `turnid-target-missing` | ❌ | paseo 没装或路径变了 |
+| `turnid-stale-anchor-mismatch` | ❌ | 旧体无法原地重建（区域里不是恰好一条重放调用，或缺 `});`） |
+| `turnid-write-failed` | ❌ | 磁盘满/权限问题，**目标文件未被破坏**（原子写保证） |
+| `turnid-syntax-check-failed` | ❌ | 补丁内容语法错，已还原干净内容 |
+| `turnid-syntax-check-unavailable` | ❌ | **校验器跑不起来**（tmpdir 权限/磁盘满），不是补丁语法问题 |
 | `unhandled` | ❌ | 未预期异常（代码 bug），状态未知需人工确认 |
 
-`write-failed` / `revert-write-failed` / `syntax-check-unavailable` 这几个是**环境问题**，
+`turnid-write-failed` / `turnid-syntax-check-unavailable` 这几个是**环境问题**，
 不是「补丁写错了」—— 排查方向不同，别混。
 
 ## 附：为什么 `ExecStartPre` 带 `-` 前缀

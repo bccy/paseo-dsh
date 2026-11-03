@@ -38,9 +38,9 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon fork 出的 p
 - **插件不在 daemon 进程里**：宿主用 `fork()` 把它起成独立的 `plugin-process` 子进程，它只能
   经 provider 连接与插件 API 和 daemon 交互（`paseo` 句柄只在 hook / RPC handler 的回调上下文
   里拿得到，`connect()` 里没有）。所以**看不到 daemon 内存**，任何"宿主到底做了什么"的断言
-  只能在宿主自己的代码上做（见 `harness/host-contract-sim.mjs`）。
+  只能在宿主自己的代码上做（`docs/REWIND.md` 的宿主行为断言都标了宿主版本与 file:line）。
 - **唯一的例外是 `local-patches/`**：它改写**已安装的** `@getpaseo/server` dist，因为上游
-  没有对应的扩展点（撤回后截断宿主 history、重放时补 `turnId`）。它**不是发布产物**——`npm
+  没有对应的扩展点（重放时补 `turnId`；撤回的 history 刷新已由 Paseo 0.15.0 原生修好）。它**不是发布产物**——`npm
   publish` 出去的包里没有它，装不装都不影响插件本体；不装时各项行为如何降级见 README 与
   [docs/REWIND.md](./docs/REWIND.md)。它是给维护者的可选加速项，macOS 桌面版自带签名 CLI
   根本打不了补丁。
@@ -82,7 +82,7 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon fork 出的 p
 | **取消是取消回合，不是杀进程** | 杀进程会连会话一起报废 |
 | **不要硬编码某个人的 provider/model** | 这个仓库是给别人用的。路由从 profile 读，读不到就带说明失败 |
 | **能复用的代码或逻辑，不要自己写** | 上游已经有的实现（DSH 的 `session.append` 表面替换、compaction 折叠、`dsh-rewind` 的 git 快照；Paseo 适配器已经验证过的形状）比我们现编的可靠，也免得下次上游一改就跟不上。复用前先核目标版本的 API 与语义（版本范围满足≠可运行），复用时把边界写进注释；确实没有可复用的，再自己写并在 `docs/` 留痕。 |
-| **替换已在跑的实现，要能删掉一整块代码** | 上一条管"新写的东西先找上游"；已经在跑的自有实现，只有上游提供了**稳定的等价能力**（公开 API 或宿主原生行为，例如上游真正修掉 #4667、宿主自己刷新撤回后的时间线之后，`local-patches` 的撤回补丁就可以删——当前 #4667 仍 open，补丁仍在用）、换完能**删掉一整块代码**时才换，并在同一个提交里删旧实现。把自己的代码换成对 DSH **内部服务**的调用不算减负：依赖从"自己能控制的代码"挪到"上游没有稳定承诺的内部 API"，升级时会静默失效，而且 `dsh-api-contract-check` 只看 import、看不见服务调用。不做成批的"总体迁移"；修 bug 就单独修，不要借迁移的名义一起做。教训：2026-10-31 的迁移分支运行时代码只净减 55 行，换来 13 个没有检查兜底的内部符号和一次 CI 变红，DSH alpha 已经改掉其中两处语义。 |
+| **替换已在跑的实现，要能删掉一整块代码** | 上一条管"新写的东西先找上游"；已经在跑的自有实现，只有上游提供了**稳定的等价能力**（公开 API 或宿主原生行为，例如上游 0.15.0 修掉 #4667（PR #8368）、宿主自己刷新撤回后的时间线之后，`local-patches` 的撤回补丁已经删掉；turnId 补丁仍保留，因为 0.15 没修）、换完能**删掉一整块代码**时才换，并在同一个提交里删旧实现。把自己的代码换成对 DSH **内部服务**的调用不算减负：依赖从"自己能控制的代码"挪到"上游没有稳定承诺的内部 API"，升级时会静默失效，而且 `dsh-api-contract-check` 只看 import、看不见服务调用。不做成批的"总体迁移"；修 bug 就单独修，不要借迁移的名义一起做。教训：2026-10-31 的迁移分支运行时代码只净减 55 行，换来 13 个没有检查兜底的内部符号和一次 CI 变红，DSH alpha 已经改掉其中两处语义。 |
 | **不要注册 `before("agent.session_open")`** | 宿主对带这个 hook 的插件，每次起停都会 `invalidatePluginSessions()`，于是**所有 agent（任何 provider）下一次提问前都会被 reload**。想拿 `paseo` 句柄就用 `on("agent.turn_started")` / `on("agent.turn_ended")` 或一条 RPC 在回调上下文里取 |
 | **改了 `dsh-bridge/` 必须重生成内嵌桥** | `paseo-plugin/server/bridge-assets.ts` 是桥的 base64 内嵌副本，供插件自举 profile（Paseo 安装插件不跑脚本）。跑 `node paseo-plugin/scripts/generate-bridge-assets.mjs`（`npm publish` 的 `prepack` 也会跑），并提交生成结果 |
 
@@ -249,8 +249,7 @@ node harness/rewind-transaction-check.mjs      # 撤回事务；动了 settleDel
 node harness/rewind-merge-check.mjs    # 父子归并；动了 child-anchors 的 recordDelegatedTurn 或 observeDelegatedTurn/snapshotAnchorFor 必跑
 node harness/revert-shape-probe.mjs    # 纯内存离线（用本机已装 @deepseek-ai/dsh-session，DSH_SESSION_MODULE 可覆盖路径）：旧写法必抛、新写法通过
 node harness/replay-fidelity-probe.mjs <session.v4.jsonl.zstd>  # 真实日志重放保真
-node harness/host-contract-sim.mjs     # 宿主契约：canary 在补丁版被截掉、原版存活（见下）
-node harness/local-patches-check.mjs   # 补丁脚本门禁：CALL 区域外的语句必须 fail closed、checker 与 apply --check 复用 host-fields/upstream-history 判定（纯离线 fixture）
+node harness/local-patches-check.mjs   # 补丁脚本门禁：turnId 锚点/上下文/stale 重建与 fail-closed，checker 与 apply --check 同源判定（纯离线 fixture）
 node harness/rewind-e2e.mjs            # 真 dsh --profile paseo，3 回合端到端（耗 token）
 node harness/rewind-merge-e2e.mjs      # 真机父子归并：父写+子代理写 → both 撤回 → 两文件都删（耗 token）
 node harness/rewind-native-check.mjs   # 经真实 daemon 的撤回（耗 token；见下）
@@ -266,24 +265,19 @@ node harness/rewind-native-check.mjs   # 经真实 daemon 的撤回（耗 token�
 **第四条：撤回提示（canary）必须在 `request.completed` 之前发出。** 宿主的时间线只能追加、
 协议里没有"删行"事件，所以插件用一条通知自证这次撤回到底刷没刷新。可见性分三层：**live 投递
 看不到**（撤回期间宿主持有 run lock，`enqueueSessionEvent` 把通知压进 `stagedEvents`，run
-settle 时一起丢弃）；**原版宿主**在 `revert()` 返回后的 force-hydrate 里从 provider history
-重放（`accept()` 先入 history、`streamHistory()` 重放），于是它出现在重建后的时间线，告诉用户
-执行 Reload agent 或重开会话；**打过截断补丁的宿主**在 `revert()` 内被 `truncateHistoryFrom`
-截掉（预期行为，看不到）。**顺序就是机制本身**——放到回执之后，补丁宿主上它也会留下来，变成
-「时间线没刷新」的误报。文件作用域（`scope: "files"`）的撤回不动对话，不发。依据是已装宿主
-0.14.0 的 `plugin-provider.js` / `agent-manager.js`；**未在「未打补丁宿主 + 真实 daemon」上
-复验**，复验前别删改 canary。
+settle 时一起丢弃）；**Paseo 0.14（无补丁）**在 `revert()` 返回后的 force-hydrate 里从 provider
+history 重放（`accept()` 先入 history、`streamHistory()` 重放），于是它出现在重建后的时间线，
+告诉用户执行 Reload agent 或重开会话；**Paseo 0.15.0+** 在 `revert()` 内关会话、带 persistence
+按 DSH 持久化会话重放（`plugin-provider.js` 的 `ensureReplay`/`replayBinding` 先
+`clearBinding()` 清空旧 history），回执前的 canary 随旧 history 一起消失（预期行为，看不到）。
+**顺序就是机制本身**——放到回执之后，0.15 上它也会留下来，变成「时间线没刷新」的误报。文件
+作用域（`scope: "files"`）的撤回不动对话，不发。依据是 0.15.0 的 `plugin-provider.js` 与
+`agent-manager.js`（`docs/REWIND.md` 有 file:line）；**真机「0.15 撤回」尚未复验，复验前别删改
+canary。** 旧 `harness/host-contract-sim.mjs` 断言的是 0.14 截断补丁的宿主行为，随补丁一起
+退休；顺序本身由 `harness/revert-check.mjs` 的源码位置门守着。
 
-**`harness/host-contract-sim.mjs`** 是这条规则的唯一直接证据：它直接 import 宿主真实的
-`plugin-provider.js`（只读），驱动一次撤回，再断言 canary 在**补丁版被截掉、原版存活**；
-判据取自宿主文件里有没有 `truncateHistoryFrom`，所以宿主改了行为却没改文件时也会红。
-用法 `node harness/host-contract-sim.mjs [host-agent-dir] [compiled-plugin-dir]`，宿主目录默认
-从已装 CLI 推（`PASEO_CLI_ROOT` 可覆盖）。**要跑原版那一半，解包出来的 `package/dist` 必须
-再套一层带 `node_modules` 软链的包装目录**，否则 `zod` 之类的 bare specifier 解析不到；做法写在
-该文件头部注释里。**动了 canary 文案、发出顺序或 `rewind-canary.ts` 必跑。**
-
-**`harness/rewind-native-check.mjs`** 走的是 `agent-manager.rewind()`，所以**它需要打过
-`rewind` 补丁、并且正在运行的 daemon**——清单里前面那些离线脚本走的是桥的 `paseo/revert`，
+**`harness/rewind-native-check.mjs`** 走的是 `agent-manager.rewind()`，所以**它需要正在运行、
+且已含 #8368 的 daemon（Paseo 0.15.0+）**——清单里前面那些离线脚本走的是桥的 `paseo/revert`，
 **根本到不了宿主的 `revert()`**，只有这条路径能覆盖宿主侧那一半。**耗 token**：创建 agent、
 两个回合、撤回、再问一次。改撤回的宿主侧行为后跑它，跑完人工核对
 「被撤消息消失、无 loading、session id 不变、模型看不到被撤内容」。

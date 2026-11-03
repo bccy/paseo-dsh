@@ -286,20 +286,21 @@ if (provider === undefined || model === undefined) {
 装不装都不影响插件本体。所以"装了补丁的行为"和"没装补丁的行为"必须都是**可解释**的，而且
 没装时必须**看得见**——否则就是本书反复讲的那类静默降级。
 
-| 能力 | 装了补丁 | 不装补丁 |
+| 能力 | 装了补丁（turnId） | 不装补丁 |
 |---|---|---|
-| **撤回**（对话 + 文件） | 界面立刻刷新；「撤回已生效」canary 被 `truncateHistoryFrom` 截掉，看不到（预期行为） | 撤回**已经生效**：对话、智能体改过的文件都回退了，模型在上下文里的记忆也回退了（下一次请求看不到被撤内容，见下方关于记忆插件的说明）；只是界面不会自动刷新——canary 不进 live 时间线（撤回期间宿主 run lock 会丢弃它），但会随重建后的时间线从 provider history 重放出来，告诉用户执行 **Reload agent** 或重开会话即可看到结果 |
-| **子代理第二次派发时的「运行中」** | 同右（该补丁已退役，现在没有任何补丁覆盖它） | 卡片停在上一回合的终态。上游 [#8080](https://github.com/getpaseo/paseo/pull/8080) 已修复并合入 main，**等 Paseo 发版** |
-| **重开会话后的回合折叠** | 折叠正确 | 部分失效：系统触发的回合会并入上一回合、插话回合被拆开。等上游 [#8053](https://github.com/getpaseo/paseo/issues/8053) / PR [#8054](https://github.com/getpaseo/paseo/pull/8054) |
+| **撤回**（对话 + 文件） | 同右——Paseo 0.15.0 起撤回后的时间线刷新是宿主原生行为（上游 PR #8368 修掉 #4667），不再需要本地补丁 | 撤回**已经生效**：对话、智能体改过的文件都回退了，模型在上下文里的记忆也回退了（下一次请求看不到被撤内容，见下方关于记忆插件的说明）；0.15 起界面**立刻刷新**，不需要 Reload。canary 仍在回执前发出，0.15 的 replay 会把它连同旧 history 清掉（看不到是预期） |
+| **重开会话后的回合折叠** | 折叠正确 | 部分失效：系统触发的回合会并入上一回合、插话回合被拆开（`turnId` 在重放时丢失）。等上游 [#8053](https://github.com/getpaseo/paseo/issues/8053) / PR [#8054](https://github.com/getpaseo/paseo/pull/8054) |
+| **子代理第二次派发时的「运行中」** | 同右（该补丁已退役，现在没有任何补丁覆盖它） | 卡片停在上一回合的终态。上游 [#8080](https://github.com/getpaseo/paseo/pull/8080) 已修复，Paseo 0.15.0 起生效 |
 
 关键在于第一行那个「撤回已生效」提示**同时是自证机制**：它必须在 `request.completed` **之前**
 发出，因为宿主的时间线只能追加、协议里没有"删行"事件。它的可见性分三层：live 投递在宿主 rewind
-的 run lock 内被 `stagedEvents` 丢弃，看不到；原版宿主把它留在 provider history 里，随重建后的
-时间线重放出来，告诉用户刷新；打过截断补丁的宿主在回执里把 history 截到撤回点，它随被撤行一起
-被截掉（预期行为）。**顺序就是机制本身**——放到回执之后，补丁宿主上它也会留下来，变成「时间线
-没刷新」的误报。`harness/host-contract-sim.mjs` 在宿主真实代码上双向断言补丁版被截、原版存活；
-live 那一层的依据是宿主 `agent-manager.js` 的 `stagedEvents`，**未在「未打补丁宿主 + 真实
-daemon」上复验**。
+的 run lock 内被 `stagedEvents` 丢弃，看不到；Paseo 0.14（无补丁）把它留在 provider history 里，
+随重建后的时间线重放出来，告诉用户执行 Reload/重开；Paseo 0.15.0+ 在 `revert()` 内先
+`clearBinding()` 清空旧 history 再按持久化会话重放，回执前的 canary 随旧 history 一起消失
+（预期行为）。**顺序就是机制本身**——放到回执之后，0.15 上它也会留下来，变成「时间线没刷新」
+的误报。顺序由 `harness/revert-check.mjs` 的源码位置门守着；断言宿主行为的
+`harness/host-contract-sim.mjs` 已随 0.14 截断补丁一起删除，**0.15 真机撤回未复验**，复验前
+别删改 canary。
 
 为什么补丁不默认装：它改的是 Paseo 自己的 dist，macOS 桌面版自带签名 CLI 打不了补丁；命令行
 全局安装又会被每次 `npm i -g @getpaseo/cli` 整树覆盖，只能靠 `ExecStartPre` 每次启动重打。

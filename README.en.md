@@ -338,33 +338,42 @@ decision" section of the audit), not a silent fix.
 
 ## Behaviour without local-patches
 
-The host patches in `local-patches/` are **not a release artifact**: they rewrite
+The host patch in `local-patches/` is **not a release artifact**: it rewrites
 the `dist` of the installed `@getpaseo/server` (upstream has no extension point
-for this), and the package published by `npm publish` does not contain them.
-Installing them or not does not affect the plugin itself, but three things
-degrade:
+for this), and the package published by `npm publish` does not contain it.
+Installing it or not does not affect the plugin itself.
 
-| Capability | With the patch | Without the patch |
+**Since Paseo 0.15.0 the timeline refresh after a rewind is host-native** (upstream
+PR #8368 fixes #4667: `revert()` closes the provider session, reopens it with the
+negotiated persistence handle and replays the persisted DSH session), so no local
+patch is needed for rewind. `local-patches/` now carries a single target,
+**turnId** (turn folding after reopening a session):
+
+| Capability | With the patch (turnId) | Without the patch |
 |---|---|---|
-| **Rewind** (conversation + files) | the UI refreshes immediately; the "rewind applied" canary is cut off by `truncateHistoryFrom` and is not visible (expected) | the rewind **has already taken effect**: the conversation, the files the agent changed and the model's memory of them in context are all rolled back (the next request cannot see the rewound content, see the note about memory plugins below); the UI just does not refresh itself — the canary does not reach the live timeline (the host's rewind run lock drops it), but it is replayed from provider history when the timeline is rebuilt, telling the user to run **Reload agent** or reopen the session to see the result |
-| **"Running" on a second subagent dispatch** | same as the right column (that patch is retired; no patch covers this now) | the card stays on the previous turn's terminal state. Paseo upstream [#8080](https://github.com/getpaseo/paseo/pull/8080) has fixed it and merged to main; **wait for a Paseo release** |
-| **Turn folding after reopening a session** | folding is correct | partly broken: system-triggered turns merge into the previous turn, and steered turns get split apart. Waiting on upstream [#8053](https://github.com/getpaseo/paseo/issues/8053) / PR [#8054](https://github.com/getpaseo/paseo/pull/8054) |
+| **Rewind** (conversation + files) | same as the right column — since 0.15 the refresh is the host's job, not the patch's | the rewind **has already taken effect**: the conversation, the files the agent changed and the model's memory of them in context are all rolled back; since 0.15 the UI refreshes **immediately**, no Reload needed. The "rewind applied" canary is still emitted before the receipt; the 0.15 replay clears it together with the old history (not seeing it is expected — judge by whether the message rows disappear) |
+| **Turn folding after reopening a session** | folding is correct | partly broken: system-triggered turns merge into the previous turn, and steered turns get split apart (the `turnId` is lost on replay). Waiting on upstream [#8053](https://github.com/getpaseo/paseo/issues/8053) / PR [#8054](https://github.com/getpaseo/paseo/pull/8054) |
+| **"Running" on a second subagent dispatch** | same as the right column (that patch is retired; no patch covers this now) | the card stays on the previous turn's terminal state. Upstream [#8080](https://github.com/getpaseo/paseo/pull/8080) is fixed and effective from Paseo 0.15.0 |
 
-> Two things are unrelated to the patches: content a memory plugin has already
+> **Rolling back to Paseo 0.14.0** degrades the rewind refresh: the rewind still
+> works, but the timeline no longer refreshes itself — the canary tells the user
+> to Reload/reopen. That is accepted; the rewind patch is not reapplied on 0.14.
+>
+> Two things are unrelated to the patch: content a memory plugin has already
 > collected may still be recalled (the model "remembers"); and a rewind itself
 > cannot be undone.
 >
-> The three visibility layers of the rewind notice (invisible live / replayed from
-> history on a stock host / cut off on a patched host) come from the installed
-> 0.14.0 host code and the offline harness; they are **not yet verified on an
-> unpatched host against a real daemon**, so do not remove or change the canary
-> before that check.
+> Canary visibility: never live; on 0.14 (no patch) it is replayed from the rebuilt
+> timeline and visible; the 0.15 replay clears it (expected). The evidence is the
+> 0.15.0 `plugin-provider.js` source (`ensureReplay` / `replayBinding` call
+> `clearBinding()` first); a real-daemon rewind on 0.15 is **not yet verified**,
+> so do not remove or change the canary before that check.
 
-Why the patches are not installed by default: they modify **Paseo's own dist**,
-and the macOS desktop app ships a signed CLI that cannot be patched; a global CLI
+Why the patch is not installed by default: it modifies **Paseo's own dist**, and
+the macOS desktop app ships a signed CLI that cannot be patched; a global CLI
 install is also overwritten wholesale by every `npm i -g @getpaseo/cli`, so it
-takes an `ExecStartPre` to reapply them on each start. They exist only as an
-**optional accelerator** for maintainers; how to install them and how to handle
+takes an `ExecStartPre` to reapply it on each start. It exists only as an
+**optional accelerator** for maintainers; how to install it and how to handle
 upgrades is in [local-patches/README.md](local-patches/README.md).
 
 ## Self-test / local verification (no Paseo needed)
