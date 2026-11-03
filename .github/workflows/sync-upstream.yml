@@ -101,6 +101,26 @@ jobs:
             echo '{"type":"commonjs"}' > paseo-plugin/.dbg-poll/package.json
             cp harness/jobs-poll-check.cjs paseo-plugin/.dbg-poll/
             ( cd paseo-plugin/.dbg-poll && node jobs-poll-check.cjs )
+            # goal 链的纯离线三段（2026-11-03）：pill 数据层、插件两个 RPC、时间线
+            # 续跑行。goal-bridge-check 不在这里：它按 bridge-server-check 的方式从
+            # 本机全局安装解析 @deepseek-ai/*，runner 上没有 DSH，跑了只会
+            # ERR_MODULE_NOT_FOUND（docs/HARNESS.md 已标"不进 CI"）。
+            ( cd paseo-plugin && npx tsc -p ../harness/goal-pill.tsconfig.json )
+            echo '{"type":"commonjs"}' > paseo-plugin/.dbg-goal/package.json
+            cp harness/goal-pill-check.cjs paseo-plugin/.dbg-goal/
+            ( cd paseo-plugin/.dbg-goal && node goal-pill-check.cjs )
+            # goal-server-check 跑的是编译后的整个插件（独立 .dbg 目录）：在
+            # --moduleResolution node 下 tsc 会报类型解析错误并 exit 2，那是预期噪音
+            # ——emit 产物才是运行物，所以容忍退出码，再用产物存在性兜底（裸
+            # `|| true` 会把真正的编译失败也吞掉）。
+            ( cd paseo-plugin && npx tsc --noEmit false --outDir .dbg --declaration false --module commonjs --moduleResolution node || true )
+            test -f paseo-plugin/.dbg/index.server.js
+            echo '{"type":"commonjs"}' > paseo-plugin/.dbg/package.json
+            cp harness/goal-server-check.cjs harness/fake-dsh-bridge.mjs paseo-plugin/.dbg/
+            ( cd paseo-plugin/.dbg && node goal-server-check.cjs )
+            # goal-timeline-check 用 plugin-build.cjs 自编译到 .dbg-goal-timeline，
+            # 与 concurrent-open-check 同一机制（真实 DshSession + 假进程传输）。
+            node harness/goal-timeline-check.cjs
             # 不在这里：mcp-gateway-transport-check / mcp-gateway-guard-check /
             # mcp-gateway-call-check 从本机 DSH 安装目录加载 schemastery 与
             # dsh-tools，runner 上没有 DSH，跑了只会 ERR_MODULE_NOT_FOUND；
@@ -146,6 +166,16 @@ jobs:
                 "echo '{\"type\":\"commonjs\"}' > paseo-plugin/.dbg-poll/package.json" \
                 "cp harness/jobs-poll-check.cjs paseo-plugin/.dbg-poll/" \
                 "( cd paseo-plugin/.dbg-poll && node jobs-poll-check.cjs )" \
+                "# goal 链纯离线三段（goal-bridge-check 需要本机 DSH，不在门里）：" \
+                "( cd paseo-plugin && npx tsc -p ../harness/goal-pill.tsconfig.json )" \
+                "echo '{\"type\":\"commonjs\"}' > paseo-plugin/.dbg-goal/package.json" \
+                "cp harness/goal-pill-check.cjs paseo-plugin/.dbg-goal/" \
+                "( cd paseo-plugin/.dbg-goal && node goal-pill-check.cjs )" \
+                "( cd paseo-plugin && npx tsc --noEmit false --outDir .dbg --declaration false --module commonjs --moduleResolution node || true )" \
+                "echo '{\"type\":\"commonjs\"}' > paseo-plugin/.dbg/package.json" \
+                "cp harness/goal-server-check.cjs harness/fake-dsh-bridge.mjs paseo-plugin/.dbg/" \
+                "( cd paseo-plugin/.dbg && node goal-server-check.cjs )" \
+                "node harness/goal-timeline-check.cjs" \
                 "git push origin main" \
                 '```' \
                 "" \
