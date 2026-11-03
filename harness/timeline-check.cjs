@@ -1417,6 +1417,129 @@ console.log("\nan image block the bridge stamped becomes its own markdown row");
   );
 }
 
+console.log("an automatic goal round is one compact row, never a user message");
+{
+  // DSH's round driver queues its continuation prompt as a `user/message`
+  // attributed to the goal (`GoalMessageSource`: kind/goalId/revision/round). It
+  // must not print as a question nobody asked, and Paseo must not offer to rewind
+  // from it: the builder draws one completed row per round instead, with the round
+  // in it and the `<goal_round>` prompt text nowhere.
+  //
+  // The round half of the head is the *server's* copy (`server/locale.ts`), so it
+  // is pinned per locale and read through `LOCALE` — the same rule the DSH tool
+  // titles above keep.
+  const ROUND = {
+    "zh-CN": (round) => `第 ${round} 轮`,
+    en: (round) => String(round),
+  }[LOCALE];
+  const prompt = '<goal_round>\nObjective: "SHIP-THE-RENDERER"\nRound: 2/3\n</goal_round>';
+  const goalRound = (round = 2, goalId = "goal-1") => ({
+    type: "user/message",
+    seq: 4,
+    data: {
+      id: `msg-round-${String(round)}`,
+      source: { kind: "goal", goalId, revision: 1, round },
+      content: [{ type: "text", text: prompt }],
+    },
+  });
+
+  const builder = new TimelineBuilder({ warn: (line) => warnings.push(line) });
+  const rows = builder.consume(goalRound());
+  check("a goal round draws exactly one row", rows.length === 1, JSON.stringify(rows));
+  const row = rows[0];
+  check(
+    "it is a completed tool_call",
+    row?.type === "tool_call" && row.status === "completed",
+    JSON.stringify(row),
+  );
+  check("named for the client's label table", row?.name === "goal_round", row?.name);
+  check("the id is per goal and round", row?.id === "tool:goal:round:goal-1:2", row?.id);
+  check("the callId is per round too", row?.callId === "goal:round:goal-1:2", row?.callId);
+  check("the head's summary half is the round", row?.detail?.label === ROUND(2), JSON.stringify(row?.detail));
+  // No `icon` key on purpose: the client draws a `plain_text` row that names no
+  // glyph with the tool's own (Target, same as `get_goal` and the goal pill).
+  // The rendered glyph is pinned by `harness/tool-call-check.cjs`.
+  check(
+    "it names no protocol icon key (the client draws the tool's own Target)",
+    row?.detail?.icon === undefined,
+    row?.detail?.icon,
+  );
+  check(
+    "no body: the <goal_round> prompt is not shown",
+    row?.detail?.text === undefined,
+    JSON.stringify(row?.detail),
+  );
+  check(
+    "the prompt's own text is nowhere in the row",
+    !JSON.stringify(row).includes("SHIP-THE-RENDERER") && !JSON.stringify(row).includes("<goal_round>"),
+    JSON.stringify(row),
+  );
+  check("it is not a user message", row?.type !== "user_message");
+  check("it carries the locale relay", row?.metadata?.locale === LOCALE, JSON.stringify(row?.metadata));
+  check("it has no revert token", row?.revertToken === undefined);
+
+  // The same round is the same row; a new round or a new goal is a new one. This
+  // is what lets a reopen rebuild the live rows instead of stacking copies.
+  const again = builder.consume(goalRound());
+  check(
+    "the same round rebuilds the identical row",
+    JSON.stringify(again[0]) === JSON.stringify(row),
+    JSON.stringify(again[0]),
+  );
+  const next = builder.consume(goalRound(3));
+  check("the next round is a different id", next[0]?.id === "tool:goal:round:goal-1:3", next[0]?.id);
+  const otherGoal = builder.consume(goalRound(2, "goal-2"));
+  check(
+    "a new goal's round 2 never collides with the old goal's",
+    otherGoal[0]?.id === "tool:goal:round:goal-2:2",
+    otherGoal[0]?.id,
+  );
+
+  // What must not become a row: a human prompt (the live path emits its own user
+  // row), a round-zero attribution, a missing round, and any other source kind.
+  const human = builder.consume({
+    type: "user/message",
+    seq: 5,
+    data: { id: "m-human", source: { kind: "user" }, content: [{ type: "text", text: "hi" }] },
+  });
+  check("a human message draws no tool row", human.length === 0, JSON.stringify(human));
+  for (const source of [
+    { kind: "goal", goalId: "goal-1", revision: 1, round: 0 },
+    { kind: "goal", goalId: "goal-1", revision: 1 },
+    { kind: "paseo" },
+    { kind: "skill" },
+  ]) {
+    const skipped = builder.consume({
+      type: "user/message",
+      seq: 6,
+      data: { id: "m-x", source, content: [{ type: "text", text: "x" }] },
+    });
+    check(`no row for source ${JSON.stringify(source)}`, skipped.length === 0, JSON.stringify(skipped));
+  }
+
+  // A malformed attribution is loud: the builder's own error row, never a silent
+  // drop — the round is real, so a row that cannot name it is a bug worth seeing.
+  const malformed = builder.consume({
+    type: "user/message",
+    seq: 7,
+    data: { id: "m-bad", source: { kind: "goal", revision: 1, round: 1 }, content: [] },
+  });
+  check(
+    "a goal round without a goal id is a visible error",
+    malformed[0]?.type === "error" && /goalId/.test(malformed[0].message),
+    JSON.stringify(malformed[0]),
+  );
+
+  // A goal phase is durable state, not an in-flight tool: ending the turn must
+  // not cancel the round row (the same rule the goal state row keeps).
+  const ended = turnEnd(builder, { kind: "aborted" });
+  check(
+    "turn/end leaves the completed round row alone",
+    ended.every((item) => item.id !== "tool:goal:round:goal-1:2"),
+    JSON.stringify(ended),
+  );
+}
+
 console.log("the meta survives the plugin's own event schema");
 {
   // The plugin subprocess parses every outgoing event with `ProviderEventSchema`

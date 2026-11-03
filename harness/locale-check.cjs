@@ -852,6 +852,29 @@ console.log("the DSH titles, verbatim (its English table is not regular)");
   setLocale(undefined);
 }
 
+console.log("the goal-round row is named in both languages");
+{
+  // The row the plugin draws for one automatic goal round is not a DSH tool: the
+  // name comes from `server/activity-timeline.ts` and is not in any DSH title
+  // table, so without a label it would render as the wire name `goal_round` next
+  // to a generic glyph. Only the label half lives here — the round half is the
+  // server's copy table (`server/locale.ts`, `UI.goalRound`), relayed on the item
+  // and asserted by `p003-timeline-check.cjs` / `goal-timeline-check.cjs`.
+  setLocale("zh-CN");
+  equal("goal round (zh)", toolLabel("goal_round"), "目标续跑");
+  setLocale("en");
+  equal("goal round (en)", toolLabel("goal_round"), "Goal round");
+  // The row carries no `plain_text` icon key, so the glyph comes from the tool
+  // name table — the same Target as the goal tools and the goal pill. (The
+  // rendered row is pinned end to end by `harness/tool-call-check.cjs`.)
+  equal(
+    "goal round borrows the goal tools' Target glyph",
+    toolIcon("goal_round", { type: "plain_text" }),
+    "Target",
+  );
+  setLocale(undefined);
+}
+
 console.log("a tool row adopts the locale its item carries");
 {
   // The transformer calls `setLocale(localeFromMetadata(item.metadata))` before

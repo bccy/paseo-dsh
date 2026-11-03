@@ -43,6 +43,7 @@ import {
   type DshUsage,
 } from "./dsh-process";
 import { ASSISTANT_DELTA_EVENT, TimelineBuilder } from "./timeline";
+import { isGoalRoundSource } from "./activity-timeline";
 import { assistantStreamFirstTokenTime } from "./first-token";
 
 /**
@@ -351,6 +352,9 @@ function isUserSource(sourceKind: string | undefined): boolean {
  * `paseo` is therefore replayed as a row, and everything else DSH injects — a
  * skill catalog (`skill`), a runtime snapshot, a rewind marker (`paseo-rewind`,
  * whose surface replacement already withdrew the rows it names) — still is not.
+ * A goal round (`goal`) is the one exception, and it is not a user row either:
+ * both replay paths route it to the timeline builder instead, which draws the
+ * same compact status row the live path emits (see `isGoalRoundSource`).
  *
  * @returns `"user"` for the human's own turn, `"paseo"` for a host envelope
  *   (both become rows; only the first carries a revert token — a live
@@ -1194,6 +1198,27 @@ export class DshSession {
       }
       if (event.type === "user/message") {
         const source = isRecord(data.source) ? data.source : {};
+        // A goal round's prompt is a `user/message` too, but it is DSH's own
+        // continuation instruction, not a human turn: it must never become a
+        // `user_message` row (there is nothing to rewind from, and it would read
+        // as a question nobody asked). The live path draws it through the timeline
+        // builder as a compact status row; replaying it through that same builder
+        // is what makes the reopened row identical to the live one. Every other
+        // non-human source kind is still skipped by `replayRowSource` below.
+        if (isGoalRoundSource(source)) {
+          const itemTimestamp = timestamp ?? lastTimestamp;
+          const items = builder.consume({ type: event.type, seq, data });
+          if (items.length > 0) startReplayTurn();
+          for (const item of items) {
+            this.#options.emit({
+              type: "timeline.item",
+              sessionId: this.id,
+              ...(itemTimestamp === undefined ? {} : { timestamp: itemTimestamp }),
+              item,
+            });
+          }
+          continue;
+        }
         const rowSource = replayRowSource(source);
         if (rowSource === undefined) continue;
         // `messageRowText`, not `textBlocks`: a prompt that carried only an
@@ -3162,6 +3187,21 @@ export class DshChildSession {
       }
       if (event.type === "user/message") {
         const source = isRecord(data.source) ? data.source : {};
+        // A goal round is the one non-human source kind that still produces a
+        // row — the same compact status row the root replay and the live child
+        // path draw (see `isGoalRoundSource`). It is never a user row.
+        if (isGoalRoundSource(source)) {
+          const itemTimestamp = timestamp ?? lastTimestamp;
+          for (const item of this.#timeline.consume({ type: event.type, seq, data })) {
+            this.#options.emit({
+              type: "timeline.item",
+              sessionId: this.id,
+              ...(itemTimestamp === undefined ? {} : { timestamp: itemTimestamp }),
+              item,
+            });
+          }
+          continue;
+        }
         // The same rule the root replay applies — see {@link replayRowSource}:
         // a host envelope is replayed as a row too, so a child that was ever
         // messaged through Paseo keeps the instruction on reopen.

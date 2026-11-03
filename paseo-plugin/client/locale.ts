@@ -267,6 +267,11 @@ const TEXT: Record<Locale, UiText> = {
       create_goal: "Create goal",
       get_goal: "View goal",
       update_goal: "Update goal",
+      // Not a tool DSH registers: the name of the row this plugin draws for an
+      // automatic goal round (`server/activity-timeline.ts`). The round number is
+      // that row's summary half and comes from the server's own copy table, so the
+      // whole line reads `Goal round · 3`.
+      goal_round: "Goal round",
       read_image: "Read image",
       schedule_create: "Create reminder",
       schedule_list: "List reminders",
@@ -525,6 +530,10 @@ const TEXT: Record<Locale, UiText> = {
       create_goal: "创建目标",
       get_goal: "查看目标",
       update_goal: "更新目标",
+      // 不是 DSH 注册的工具：本插件为自动续跑轮次画的那一行的名字
+      // （`server/activity-timeline.ts`）。轮数是该行的 summary 半，由服务端
+      // 自己的文案表给出，整行读作「目标续跑 · 第 3 轮」。
+      goal_round: "目标续跑",
       read_image: "读取图片",
       schedule_create: "创建定时任务",
       schedule_list: "查看定时任务",

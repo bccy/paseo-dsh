@@ -803,6 +803,11 @@ const TOOL_NAME_ICONS: Record<string, string> = {
   create_goal: "Target",
   get_goal: "Target",
   update_goal: "Target",
+  // Not a tool DSH registers: the name of the row `server/activity-timeline.ts`
+  // draws for one automatic goal round. It is a `plain_text` row with no protocol
+  // icon key, so it borrows the tool's own glyph — the same Target as the goal
+  // tools above, the goal state row (`get_goal`) and the composer's goal pill.
+  goal_round: "Target",
   read_image: "Image",
   todo_write: "ListChecks",
   ask_user_question: "MessageCircleQuestion",
@@ -1027,7 +1032,16 @@ export function toolIcon(name: string, detail: ToolDetail | undefined): string {
   const named = (gateway === undefined ? undefined : paseoMcpIcon(gateway))
     ?? TOOL_NAME_ICONS[normalized]
     ?? paseoMcpIcon(name);
-  if (named !== undefined && (detail === undefined || detail.type === "unknown")) return named;
+  // A `plain_text` row that names no protocol icon key is the second gap the name
+  // map fills: the two goal timeline rows (`server/activity-timeline.ts`) are
+  // exactly that shape, so they draw the goal tools' Target — the same glyph as
+  // the composer's goal pill — instead of the generic wrench. Every other
+  // `plain_text` producer sends an icon key and returns above, untouched.
+  const iconlessPlainText =
+    detail !== undefined && detail.type === "plain_text" && typeof detail.icon !== "string";
+  if (named !== undefined && (detail === undefined || detail.type === "unknown" || iconlessPlainText)) {
+    return named;
+  }
   if (detail !== undefined && typeof detail.type === "string") {
     return DETAIL_ICONS[detail.type] ?? "Wrench";
   }

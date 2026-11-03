@@ -81,6 +81,20 @@ export interface UiCopy {
     askedUser: string;
   };
   /**
+   * The round half of an automatic goal round's timeline row.
+   *
+   * The row's head is `label · summary`: the label names the event and lives in
+   * the *client*'s tool table (`client/locale.ts`, the `goal_round` name), while
+   * the round number is known only here, where the row is built
+   * (`server/activity-timeline.ts`). The item carries `metadata.locale` so the
+   * client half resolves the same language as this one.
+   *
+   * English is the bare number because the head already says "Goal round": the
+   * line reads `Goal round · 3`. Chinese puts the unit in the summary so the line
+   * reads 「目标续跑 · 第 3 轮」, matching the design's wording for the row.
+   */
+  goalRound: (round: number) => string;
+  /**
    * Rewind completion copy.
    *
    * The table itself lives in `shared/rewind-notice.ts` because the client half
@@ -123,6 +137,7 @@ const UI_COPY: Record<Locale, UiCopy> = {
       updateTasks: "Update to-do list",
       askedUser: "Ask question",
     },
+    goalRound: (round) => String(round),
     rewind: REWIND_COPY.en,
   },
   "zh-CN": {
@@ -151,6 +166,7 @@ const UI_COPY: Record<Locale, UiCopy> = {
       updateTasks: "更新任务清单",
       askedUser: "提问",
     },
+    goalRound: (round) => `第 ${round} 轮`,
     rewind: REWIND_COPY["zh-CN"],
   },
 };

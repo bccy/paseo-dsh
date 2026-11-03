@@ -8,6 +8,8 @@ const { TimelineBuilder } = require(join(build, 'server/timeline.js'));
 const req = createRequire(join(build, 'index.server.js'));
 const { ProviderEventSchema } = req('@getpaseo/plugin/server/provider');
 const { toolCallData } = require(join(build, 'client/tool-call-data.js'));
+const { LOCALE: SERVER_LOCALE } = require(join(build, 'server/locale.js'));
+const { currentLocale, localeFromMetadata, setLocale } = require(join(build, 'client/locale.js'));
 const warnings = [];
 const builder = () => new TimelineBuilder({ warn: s => warnings.push(s) });
 let passed = 0;
@@ -67,6 +69,37 @@ test('goal full snapshots replace stale objective/reason; clear and new create s
   for (const item of rows) ProviderEventSchema.parse({type:'timeline.item',sessionId:'a',item});
   assert.equal(b.consume(ev('turn/end',{reason:{kind:'completed'}})).length,0);
   assert.equal(b.settleRunningTools().length,0);
+});
+test('a goal round renders one compact row whose two halves agree on one locale',()=>{
+  // DSH's automatic continuation prompt is a `user/message` attributed to the
+  // goal. It must never render as a user message, and its `<goal_round>` text
+  // must never reach the screen; the row says which round it was instead.
+  const prompt='<goal_round>\nObjective: "SHIP-THE-RENDERER"\nRound: 2/3\n</goal_round>';
+  const row=builder().consume(ev('user/message',{id:'m-round',source:{kind:'goal',goalId:'g-1',revision:1,round:2},content:[{type:'text',text:prompt}]}))[0];
+  assert.equal(row.type,'tool_call');assert.equal(row.id,'tool:goal:round:g-1:2');
+  // The protocol keeps the shape and the locale hint — that hint is how the
+  // client half, which cannot read the daemon's environment, resolves the same
+  // language the server half used.
+  const parsed=ProviderEventSchema.parse({type:'timeline.item',sessionId:'a',item:row}).item;
+  assert.equal(parsed.metadata.locale,SERVER_LOCALE);
+  setLocale(localeFromMetadata(parsed.metadata));
+  try {
+    assert.equal(currentLocale(),SERVER_LOCALE);
+    const copy={'zh-CN':{label:'目标续跑',round:n=>`第 ${n} 轮`},en:{label:'Goal round',round:n=>String(n)}}[SERVER_LOCALE];
+    const view=toolCallData(parsed);
+    assert.equal(view.label,copy.label);
+    assert.equal(view.summary,copy.round(2));
+    assert.equal(view.icon,'Target'); // plain_text without an icon key borrows get_goal/goal_round's Target
+    assert.equal(view.body,'');
+    assert.equal(view.hasDetail,false);
+    assert.doesNotMatch(JSON.stringify(view),/<goal_round>|SHIP-THE-RENDERER/);
+  } finally {
+    setLocale(undefined);
+  }
+  // The live path and a reopen build this row from the same event: same id, same
+  // content. (The session-level replay assertion is in goal-timeline-check.cjs.)
+  const replayed=builder().consume(ev('user/message',{id:'m-round',source:{kind:'goal',goalId:'g-1',revision:1,round:2},content:[{type:'text',text:prompt}]}))[0];
+  assert.deepEqual(replayed,row);
 });
 test('malformed known events are visible errors rather than silent omissions',()=>{
   for(const e of [ev('goal/change',{}),ev('goal/change',{version:2}),goal('block','blocked'),ev('tool-workflow/run-start',{runId:'x'}),ev('tool-workflow/agent-end',{runId:'missing',seq:0,outcome:'completed'})]) {

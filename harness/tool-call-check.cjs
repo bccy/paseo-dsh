@@ -851,6 +851,65 @@ console.log("DSH's own tools are not anonymous");
   equal("a typed detail keeps its own icon", toolIcon("bash", { type: "shell" }), "SquareTerminal");
 }
 
+console.log("the goal timeline rows draw the goal tools' own glyph");
+{
+  // `server/activity-timeline.ts` draws both goal rows as `plain_text` with **no**
+  // `icon` key. The old shape sent `icon: "sparkles"`, which the protocol carries
+  // verbatim — so the goal state row rendered Sparkles while the goal *tools* and
+  // the composer's goal pill rendered Target. A plain_text row that names no glyph
+  // now borrows the tool's own (the second gap the name map fills, after
+  // `unknown`), which is what puts all three on the same symbol.
+  setLocale("zh-CN");
+  const stateRow = {
+    name: "get_goal",
+    status: "completed",
+    detail: { type: "plain_text", label: "进行中 · 目标", text: "进行中 · 目标" },
+  };
+  equal("the goal state row draws Target", toolIcon(stateRow.name, stateRow.detail), "Target");
+  equal("and its rendered data agrees", toolCallData(stateRow, "complete").icon, "Target");
+
+  const roundRow = {
+    name: "goal_round",
+    status: "completed",
+    detail: { type: "plain_text", label: "第 2 轮" },
+    metadata: { locale: "zh-CN" },
+  };
+  equal("the goal round row draws Target", toolIcon(roundRow.name, roundRow.detail), "Target");
+  const roundData = toolCallData(roundRow, "complete");
+  equal("the goal round row's rendered glyph", roundData.icon, "Target");
+  equal("its label comes from the client table", roundData.label, "目标续跑");
+  equal("its summary is the round", roundData.summary, "第 2 轮");
+  equal("it has no body to expand", roundData.hasDetail, false);
+  equal("and it is a completed row, not a running tool", roundData.status, "completed");
+
+  // The name map only fills the icon-less gap. Every other `plain_text` producer
+  // sends an icon key and must keep its own glyph — a bare name lookup would turn
+  // the workflow row into a wrench and the `/command` row into a terminal glyph
+  // chosen by name rather than by the protocol.
+  equal(
+    "a workflow row keeps its protocol glyph",
+    toolIcon("workflow", { type: "plain_text", icon: "bot" }),
+    "Bot",
+  );
+  equal(
+    "a /command row keeps its terminal glyph",
+    toolIcon("/goal", { type: "plain_text", icon: "square_terminal" }),
+    "SquareTerminal",
+  );
+  equal(
+    "a todo row keeps its sparkles",
+    toolIcon("todo_write", { type: "plain_text", icon: "sparkles" }),
+    "Sparkles",
+  );
+  // A name with no entry keeps the generic plain_text glyph rather than a guess.
+  equal(
+    "an unmapped icon-less plain_text row stays on the wrench",
+    toolIcon("not_a_tool", { type: "plain_text" }),
+    "Wrench",
+  );
+  setLocale(undefined);
+}
+
 console.log("the title is not repeated when the block carries it");
 {
   const described = toolCallData(
