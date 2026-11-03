@@ -10,9 +10,11 @@
 
 - `harness/timeline-check.cjs` — `TimelineBuilder` 的工具行状态机：`tool/call` → `tool/result`、
   重复 `tool/call` 不能把完成行重置回 running 或清空输出、`turn/end`（含 `aborted`）要把仍
-  running 的工具收成 `canceled`。本轮 +17 条覆盖 goal 轮次行（`tool:goal:round:*` 由同一
-  builder 产出、同轮幂等、不同轮 id 不同、`turn/end` 不取消它）。**动了 `server/timeline.ts`
-  或 `server/activity-timeline.ts` 的 goal 轮次分支必跑。**
+  running 的工具收成 `canceled`。**235 条**：goal 轮次行 +17（`tool:goal:round:*` 由同一
+  builder 产出、同轮幂等、不同轮 id 不同、`turn/end` 不取消它），todo `status` +6（`todoItems`
+  的 status 序列 / `completed` 由同一 status 派生 / 文本 / 未知值归一 `pending`）。**动了
+  `server/timeline.ts` 的 `todoItems`、`server/activity-timeline.ts` 的 goal 轮次分支或
+  `server/session.ts` 的重放过滤必跑。**
 - `harness/p003-timeline-check.cjs` — 真实 `TimelineBuilder` → `ProviderEventSchema` → 客户端
   渲染数据的端到端：`goal/change`（目标行）与 `tool-workflow/*`（工作流/成员行）的完整快照、
   重复 start 不抹进度、run-end 的终态口径、后台工作流跨回合保持 running、死重放按 canceled
@@ -216,8 +218,12 @@
   取消回合之前失败、闸门与票据清空；本轮补上 **files-only**：不 append 撤回标记、不 flush、
   不 prune journal、不要求 session store，但同样取消/等待被撤回子代理；以及 files-only 后重复
   幂等、对更早/更晚消息做 `both` 时 `planRestore` 仍取目标消息自己的 pre-image。
-  **动了 `server.js` 的 `revert` 事务、`beginFileMutation`/`finishFileMutation`/`ownsFileMutation`
-  或 `file-mutation-gate.js` 必跑。**
+  **本轮 28 条（原 22 + 6）**：刚 steer、尚未进入 surface 的消息撤回——host 流（已被预取消
+  清空 inbox → 成功且不取消回合）/ direct 流（仍在 inbox → `remove` + 成功）/ files 作用域
+  拒绝（「还没有进入对话，不能作为文件恢复的锚点」）/ 已被 claim 正在写入 → 拒绝「还在发送中，
+  稍后再撤回」且保留跟踪 / 落 surface 后走正常撤回 / close 清理 pending 表。**动了
+  `server.js` 的 `revert` 事务、`pendingUserMessages` 跟踪、`beginFileMutation`/
+  `finishFileMutation`/`ownsFileMutation` 或 `file-mutation-gate.js` 必跑。**
 - `harness/plugin-build.cjs` — **不是检查，是需要编译产物的 harness 共用的构建基础设施**
   （当前调用方见 `grep -l plugin-build harness/*`；`plugin-check.cjs` 仍走自己头部注释里的
   手工 `tsc` 步骤，不在其中）。
@@ -563,29 +569,38 @@
   `dsh-bridge/lib/server.js` 的 `paseo/goal` 或 dispatch 必跑；改桥后先重生成内嵌桥
   （`node paseo-plugin/scripts/generate-bridge-assets.mjs`）再跑 `bridge-assets-check.mjs`，
   否则真机检查跑在旧桥上假绿。**
-- `harness/goal-pill-check.cjs` — goal pill 的**数据层**（**131 条**；假时钟 + 假 RPC +
-  假目录页，不 import React/host）：契约枚举与 wire schema（`GoalState` 缺 `activation` 必拒）、
-  `goalCommandArguments` 的 DSH 语法（trim / 空 edit 拒绝 / 控制词开头仍当目标）、四态
-  可见性/label/tone（active+armed、active+disarmed、paused、blocked、`complete`、`null`、
-  `available:false`）、按钮集合与「不可用不显示」、清除二次确认两步、编辑空文本拒绝、
-  tone→主题色 token、节奏常量与 jobs 逐字一致（4000/30000/1000/2000）、控制器行为（答案签名
-  去重、瞬时错误保持、终态停表、退避、`pollNow`、provider/workspace 过滤、closed 移除）。
-  运行：`cd paseo-plugin && npx tsc -p ../harness/goal-pill.tsconfig.json`，再在 `.dbg-goal`
-  里 `node goal-pill-check.cjs`。**动了 `client/goal-polling.ts`、`client/goal-pill.tsx`、
-  `client/agent-polling.ts`、`shared/goal.ts` 或 `client/locale.ts` 的 goal 表必跑；改共享
-  轮询器时 `jobs-poll-check.cjs` 必须同时全绿且断言数不减。**
-- `harness/goal-server-check.cjs` — 插件侧两个 RPC（**31 条**，含 4 条跨层断言；真实插件 +
-  `fake-dsh-bridge.mjs`，一次性 `DSH_HOME`，不 spawn 真 `dsh`）：无会话=准确空答案
-  （`available:true, goal:null`）、`GoalView` 只映射五个绘制字段（`id`/`revision`/时间戳不
-  泄漏）、`blockedReason` 透传、四码分级（含真实桥 unknown-method 文案 → `bridge_too_old`）、
-  `goal.control` 走命令注册表（`name:"goal"` + DSH 参数语法）、DSH 拒绝变 `ok:false` 原文、
-  空 edit 不发帧；跨层断言逐字比较「桥的缺失服务文案 / 插件常量 / 假桥常量」三方，改任一侧
-  即红（否则终态 `goal_unavailable` 会静默降级成 `rpc_failed`）。运行：编译插件到 `.dbg`
+- `harness/goal-pill-check.cjs` — goal pill 的**数据层与 UI 规则**（**254 条**；假时钟 + 假
+  RPC + 假目录页，不 import React/host；UI 规则都抽在 `client/goal-polling.ts` 的纯函数里）：
+  契约枚举与 wire schema（`GoalState` 缺 `activation` 必拒）、`goalCommandArguments` 的 DSH
+  语法、四态可见性/label/tone（label 已无轮数分数：`目标进行中`/`目标未在续跑`/`目标已暂停`/
+  `目标受阻`）、按钮集合与「不可用不显示」、清除二次确认（文案切到「确认清除」/`Confirm`，
+  宽度由 `goalButtonMinWidth` 钉住）、编辑空文本拒绝、tone→主题色 token
+  （`goalToneColorToken` 文字 / `goalIconColorToken` 图标 / `goalStatusDotColorToken` 圆点）、
+  按钮几何（桌面 32 / 手机 44 / gap 12）与右对齐（断言 `goalActionRowStyle` 的**返回值**，不再
+  用源码正则——旧断言被文档注释满足、删代码仍绿，见 FIELD-NOTES 第 89 条）、按钮调色板对比度
+  （AA：确认态红字亮 6.10 / 暗 5.80；编辑/清除形态 ≥1.5）、三钮等宽与安全余量
+  （`GOAL_BUTTON_LABEL_SAFETY` 7px）、`currentTask` 行的三态、`title` 固定「目标」、节奏常量
+  与 jobs 逐字一致（4000/30000/1000/2000）、控制器行为（答案签名去重、瞬时错误保持、终态
+  停表、退避、`pollNow`、provider/workspace 过滤、closed 移除）。运行：
+  `cd paseo-plugin && npx tsc -p ../harness/goal-pill.tsconfig.json`，再在 `.dbg-goal` 里
+  `node goal-pill-check.cjs`。**动了 `client/goal-polling.ts`、`client/goal-popover.tsx`、
+  `client/goal-pill.tsx`、`client/deepseek-mark*.tsx`、`client/agent-polling.ts`、
+  `shared/goal.ts` 或 `client/locale.ts` 的 goal 表必跑；改共享轮询器时
+  `jobs-poll-check.cjs` 必须同时全绿且断言数不减。**
+- `harness/goal-server-check.cjs` — 插件侧两个 RPC 与 `currentTask`（**39 条**，含 4 条跨层
+  断言；真实插件 + `fake-dsh-bridge.mjs`，一次性 `DSH_HOME`，不 spawn 真 `dsh`）：无会话=
+  准确空答案（`available:true, goal:null`）、`GoalView` 只映射绘制字段（`id`/`revision`/
+  时间戳不泄漏）、`blockedReason` 透传、四码分级（含真实桥 unknown-method 文案 →
+  `bridge_too_old`）、`goal.control` 走命令注册表（`name:"goal"` + DSH 参数语法）、DSH 拒绝变
+  `ok:false` 原文、空 edit 不发帧；**+8 条 `currentTask` 三态**：有 `in_progress`（合并进
+  `GoalState.currentTask` 且 trim）/ 无 in_progress / `todos:null` / 投影 key 缺失 / 老桥无
+  `projections` 方法 / 真实读失败（字段缺省 + 一次性 stderr，goal 读取不受影响）；跨层断言
+  逐字比较「桥的缺失服务文案 / 插件常量 / 假桥常量」三方。运行：编译插件到 `.dbg`
   （`npx tsc --noEmit false --outDir .dbg --declaration false --module commonjs
   --moduleResolution node`，类型噪音预期），再 `cd .dbg && node goal-server-check.cjs`。
-  **动了 `server/provider.ts` 的 goal 读写、`server/session.ts` 的 `goal()`/`controlGoal`、
-  `server/dsh-process.ts` 的 goal 分级、`index.server.ts` 的 goal handler 或桥的缺失服务
-  文案必跑。**
+  **动了 `server/provider.ts` 的 goal/`currentTask` 读写、`server/session.ts` 的
+  `goal()`/`currentTask()`/`controlGoal`、`server/dsh-process.ts` 的 goal 分级与
+  `currentTask`、`index.server.ts` 的 goal handler 或桥的缺失服务文案必跑。**
 - `harness/goal-timeline-check.cjs` — 自动续跑轮次行**实时与重放是同一行**（**6 组断言**；
   真实 `DshSession` + 假进程传输，`plugin-build.cjs` 自编译到 `.dbg-goal-timeline`）：实时
   路径出 `tool:goal:round:<goalId>:<round>`（name `goal_round`、completed、文本是 locale 的

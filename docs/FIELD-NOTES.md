@@ -3001,6 +3001,60 @@ goal」（FINAL-verify §6，桥路径；App UI 层未验证）。
 
 ---
 
+## 第二十一轮：目标 pill 的 UI 改版与 todo 状态（2026-11-03）
+
+这一轮把 goal pill 从「只读状态 + 分数」改成可操作的方案 A 面板，并补上 todo 的
+`in_progress` 状态；同时踩到一个测试自身的问题（源码正则被注释满足）。
+
+### 88. DeepSeek 很少更新 todo，插件又丢掉 `in_progress`：拿 todo 当进度会长期停在 0%（TP-01）
+
+**症状**：任务看起来「一直没进展」——todo 卡片全是 pending，或者进度像是永远 0%、结束前突然
+100%。如果拿 todo 算完成度，进度条会长期不动或瞬间跳满。
+
+**根因**（两侧）：
+1. **产生侧**：模型很少调 `todo_write`。调查 38 个真实 DeepSeek 会话：20 个从不调；9 个只写
+   1 次（之后不更新）；8 个写 2 次（多在结束前一次性全标完成，其中 3 个 goal 会话提前标 100%
+   后又跑了 43–101 分钟）；只有 1 个中途逐项更新。**todo 不是可靠的进度源。**
+2. **展示侧**：插件的 `todoItems` 只输出 `{text, completed}`，把 DSH 的 `status` 丢了，于是
+   `in_progress` 不可见（`paseo-plugin/server/timeline.ts:710-750`；协议 `AgentTaskItem` 本来
+   有 `status` 字段）。
+
+**修法**：`todoItems` 补 `status`（`pending`/`in_progress`/`completed`，未知值归一 `pending`，
+`completed` 由同一个 status 派生，`timeline.ts:710-750`）；**不把 todo 当完成度**：goal 的可靠
+进度只有它自己的轮次，而轮次是**预算不是完成度**（默认上限 256），所以 pill 只显示「第 N 轮 ·
+预算 M」，todo 只用来画 popover 的「正在：<当前任务>」一行（有 `in_progress` 才画），
+**不做 todo 进度条**。
+
+**检查**：`timeline-check` 235（+6：status 序列 / completed 同步 / 文本 / 未知值归一）；
+`goal-server-check` 39（+8：currentTask 有 / 无 / null / 投影缺失 / 老桥无方法 / 真实失败）。
+
+**教训**：**先确认数据是否被产生，再讨论怎么展示**。展示侧的丢失（status 被丢）可以修；
+产生侧的稀疏（模型很少写 todo）修不了，只能不把它当指标。
+
+### 89. 源码正则断言被注释满足：删掉代码仍全绿（UA-01）
+
+**症状**：`goal-pill-check` 173/173 全绿，但把 `goal-popover.tsx` 里真正实现按钮右对齐的
+`justifyContent: "flex-end"` 删掉，检查仍然绿——UI 行为没有任何断言覆盖。
+
+**根因**：断言写的是源码正则 `/justifyContent: "flex-end"/`，而同一文件的**文档注释**里就有
+这个字面量（讲解布局的那段），于是删掉代码行后正则仍能匹配注释。这是「以源码正则冒充行为
+覆盖」的典型：匹配到的是注释/文档，不是被执行的逻辑。
+
+**修法**：把布局规则抽成纯函数 `goalActionRowStyle(geometry)`（返回
+`{flexDirection:"row", justifyContent:"flex-end", flexWrap:"wrap", gap}`），JSX 改为
+`<View style={goalActionRowStyle(geometry)}>`；harness 断言**函数返回值**。源码断言只匹配
+**代码形式**（`<View style={goalActionRowStyle(geometry)}>`、`goalButtonPalette(...)` 调用、
+`minWidth={…}`），不再匹配裸标识符或样式字面量。同轮把「右对齐」「三钮等宽」「确认态文案」
+「圆点颜色」都改成行为/返回值断言。
+
+**检查**：变异 R1（`flex-end`→`flex-start`）→ 2 红；S3（只给清除 minWidth）→ 1 红；等价 JSX
+写法（展开对象）不再假红（254/254）；删掉 style 里的调用 → 1 红。
+
+**教训**：**源码正则不是行为覆盖**——注释、文档、字符串常量都能满足它。断言要打在返回值、
+渲染数据或可执行的规则上；每条新增/修改的断言都要做一次「删掉实现还绿吗」的变异验证。
+
+---
+
 ## 关于"哪条路由能用"
 
 这份记录里刻意不提任何具体的 provider、模型或端点——**你的路由和模型完全由你的

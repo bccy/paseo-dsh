@@ -25,6 +25,7 @@ Paseo 0.14.0。
 | activation（`armed`/`disarmed`，续行是否启用） | live agent 的 `ctx.goals.get(agent)` → `GoalView`（`@deepseek-ai/dsh-goal/lib/index.js:611-616`） | **进程本地，不持久化** |
 | 续跑轮次边界 | `user/message` + `source.kind='goal'`，带 `{goalId, revision, round}`（`@deepseek-ai/dsh-goal/lib/types/domain.d.ts:34-40`） | 持久 |
 | 控制结果 | `/goal` 命令执行回执（`success` / `error` + 文案；`@deepseek-ai/dsh-command-goal/lib/index.js:100-160`） | 不持久（即时回执） |
+| 当前任务（`currentTask`） | DSH 的 `todos` 会话投影（`paseo/projections {keys:['todos']}`，取 `in_progress` 项的 `content`，best-effort） | 不持久（DSH 每轮重置） |
 
 桥侧三条读/写路径：
 
@@ -34,9 +35,11 @@ Paseo 0.14.0。
   `{goal:null}`；**`goals` 服务未挂载抛错**（`this DSH runtime composes no goal service`），
   与「无目标」严格分开；未知会话沿用 `requireSession` 的错误，且**不物化会话**（读目标不拿
   会话日志的写租约）。
-- `paseo/projections {sessionId, keys:['goal']}` — 冷读持久投影（`dsh-bridge/lib/server.js:3008-3022`），
-  **不含 activation**（`@deepseek-ai/dsh-goal/lib/types/types.d.ts:84-89`）。pill 不用这条
-  （它要 activation），桥与既有冷读工具仍可用。
+- `paseo/projections {sessionId, keys:[…]}` — 冷读持久投影（`dsh-bridge/lib/server.js:3008-3022`）。
+  两个 key 用在 goal 上：`goal` 是持久 phase（**不含 activation**，
+  `@deepseek-ai/dsh-goal/lib/types/types.d.ts:84-89`，所以 pill 不用它），`todos` 用来取
+  「正在」行的 `in_progress` 项（`paseo-plugin/server/dsh-process.ts:2284-2340`，三态：
+  有任务 / 无任务 / 真实读失败只记一次 stderr，**不拖垮 goal 读取**）。
 - `paseo/command/run {sessionId, name:"goal", arguments}` — 代发 `/goal ...`
   （`dsh-bridge/lib/server.js:2002-2015` → `commands.execute`）；`goal/change` 实时与重放都由
   桥原样转发（`dsh-bridge/lib/server.js:591-619`；重放白名单
@@ -48,8 +51,10 @@ Paseo 0.14.0。
 - `goal.current {agentId}` → `{available, goal: GoalState | null, error?: {message, code?}}`。
   **错误形状与 jobs 的 `{available, jobs, error?: {message, code?}}` 同形**（嵌套 error 对象 +
   可选 code）；DESIGN §1.2 的字面写法是顶层 `error`/`code`，Lead 已裁决以实现为准（验证报告 B-3）。
-  `GoalState = {objective, phase, activation, roundsStarted, maxGoalRounds, blockedReason?{code,message}}`
-  ——只带绘制需要的字段，`id`/`revision`/时间戳不泄漏（`paseo-plugin/server/provider.ts:2116-2128`）。
+  `GoalState = {objective, phase, activation, roundsStarted, maxGoalRounds, blockedReason?{code,message},
+  currentTask?}`——只带绘制需要的字段，`id`/`revision`/时间戳不泄漏
+  （`paseo-plugin/server/provider.ts:2116-2128`）。`currentTask` 是第二次 best-effort 读
+  `todos` 投影的结果，只在 goal 非空时读（`paseo-plugin/server/provider.ts:2184-2195`）。
 - `goal.control {agentId, action: "pause"|"resume"|"clear"|"edit", objective?}` →
   `{ok:true, message} | {ok:false, error}`；`edit` 必须带非空 objective（客户端与服务端各拦一次，
   `paseo-plugin/shared/goal.ts:178-188`），失败把 DSH 原文透传，**不把失败报成成功**。
@@ -76,10 +81,11 @@ Paseo 0.14.0。
 ## 状态、pill 与按钮
 
 目标 pill 注册在 composer（`client.addComposerPill`，独立 id **`dsh-goal`**，与 jobs pill 并列；
-**jobs pill 的语义一行不改**：只在运行中可见、只用转环、文案「N 个后台」）。图标 `Target`，
-与时间线的 goal 行同一符号；**不用转环**，避免和 jobs pill 混淆。注册时先 `visible:false`，
-第一次轮询证明有目标才显示（`paseo-plugin/client/goal-pill.tsx:451-472`）；`title` 是 objective
-按 60 个码点截断加「…」（`paseo-plugin/client/goal-polling.ts:129-146`），全文在 popover 里。
+**jobs pill 的语义一行不改**：只在运行中可见、只用转环、文案「N 个后台」）。图标是自绘的
+`Target`（按 tone 着色，见下），**不用转环**，避免和 jobs pill 混淆；`title` 固定为中性名词
+「目标」/「Goal」——它同时是手机 sheet 的标题与无障碍名，完整 objective 只在 popover 正文出现
+一次（旧实现把截断 objective 当 title，手机上会「截断目标 + 完整目标」出现两遍）。
+注册时先 `visible:false`，第一次轮询证明有目标才显示。
 
 **可见性**：`available && goal !== null && phase !== "complete"`。无目标 / 已完成 / 已清除 →
 隐藏（与 DSH Web GoalBar 同语义：无目标、已完成与成功清除的目标一律不渲染，
@@ -87,37 +93,55 @@ Paseo 0.14.0。
 goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等价，不打扰用户；瞬时错误**保持
 上次状态**，不要把界面闪成「无目标」（`paseo-plugin/client/goal-polling.ts:257-306`）。
 
-| 状态 | label（zh-CN / en） | 语气 | 可用按钮 |
+| 状态 | label（zh-CN / en） | 图标 / 圆点颜色 | 可用按钮 |
 |---|---|---|---|
-| active + armed | `目标 3/10` / `Goal 3/10` | 正常 | 暂停、编辑、清除 |
-| active + disarmed | `目标未在续跑` / `Goal not running` | 警示 | 继续、编辑、清除 |
-| paused | `目标已暂停` / `Goal paused` | 警示 | 继续、编辑、清除 |
-| blocked | `目标受阻` / `Goal blocked` | 错误 | 继续、编辑、清除 |
+| active + armed | `目标进行中` / `Goal running` | `accent`（正常） | 暂停、编辑、清除 |
+| active + disarmed | `目标未在续跑` / `Goal not running` | `statusWarning` | 继续、编辑、清除 |
+| paused | `目标已暂停` / `Goal paused` | `statusWarning` | 继续、编辑、清除 |
+| blocked | `目标受阻` / `Goal blocked` | `statusDanger` | 继续、编辑、清除 |
 
-label 里的数字是 `roundsStarted / maxGoalRounds`（`paseo-plugin/client/locale.ts:478-521,729-781`
-的 `roundsLabel`）。
+**label 不带轮数分数**：`目标 3/10` 在 160px 的按钮里会被读成完成度（上限默认 256），轮数是
+**预算不是完成度**，所以只进 popover 的「第 N 轮 · 预算 M」一行
+（`goalPillPresentation`，`paseo-plugin/client/goal-polling.ts:167-190`）。
 
-**宿主限制：pill 本身不能着色。** `PluginButton.label` 只有文字，没有颜色通道，所以四态语气
-只落在 popover 的状态行上：`goalToneColorToken` 把 `normal`/`warning`/`error` 映射到
-`foreground`/`statusWarning`/`statusDanger`（`paseo-plugin/client/goal-polling.ts:89-108`，
-用在 `paseo-plugin/client/goal-pill.tsx:241-243,322-324`）。这是宿主 API 的边界，不是遗漏；
-要给 pill 本身加颜色得改 Paseo 插件 API。
+**颜色只落在图标与圆点上。** 宿主 `PluginButton.label` 是纯文本、没有颜色通道，pill 的 tone
+由自定义图标组件承载（`goalIconColorToken`：normal→`accent`、warning→`statusWarning`、
+error→`statusDanger`，`paseo-plugin/client/goal-polling.ts:133-144`）；popover 里由「进行中」
+前的 8px 圆点承载（`goalStatusDotColorToken`，`:496-506`）。**状态文字本身不着色**：暗色主题下
+`accent` 作文字只有 2.83:1，不到 AA，所以 active 的文字用 `foreground`（`goalToneColorToken`），
+颜色交给圆点。
 
-- 按钮走「插件 RPC `goal.control` → 桥 `paseo/command/run` → DSH `/goal ...`」，四条命令
-  （pause / resume / clear / 创建）实测全部被接受（survey §F3）；**不可用的不显示而不是禁用**
-  （`goalActionsFor`，`paseo-plugin/client/goal-polling.ts:202-206`）；`blocked` 时「继续」可能被
-  DSH 拒绝（轮数耗尽），失败原文显示在 popover 里、popover 不关闭。
-- `清除` 需二次确认：第一次点击只把按钮文案换成「再点一次确认清除」/「Press again to clear」，
-  第二次才执行；任何其它操作都会复位（`clearConfirmStep`，`paseo-plugin/client/goal-polling.ts:220-222`）。
-  `编辑` 展开单行输入框（占位「新的目标内容」/「New objective」），回车提交，空文本不提交；
-  操作中按钮置忙（「处理中…」/「Working…」）；成功后立即触发一次 `pollNow` 刷新（不等 4s）。
-- popover 内容：目标全文（可选中复制；宿主 popover 表面自己滚动，不套内层 ScrollView）、
-  状态行「进行中 · 已用轮数 3/10」/「Active · Rounds 3/10」、受阻原因
-  「受阻原因：code — message」/「Blocker: code — message」；active+disarmed 时一行解释
-  「重开会话或进程重启后，自动续跑会停止，点『继续』恢复。」（`disarmedHint`）。没有目标时
-  显示「当前没有目标。」，读不到时显示「读不到本会话的目标。」。
-- 底部固定提示：「运行中可以直接发消息，会插入当前轮次，不会打断目标；点停止会暂停目标。」
-  （en 同义，`paseo-plugin/client/locale.ts` 的 `footnote`）。
+**popover 面板**（`paseo-plugin/client/goal-popover.tsx`）：
+
+- 首行：16px DeepSeek 鲸鱼标志（内联 SVG，品牌蓝 `#4d6bfe`，经宿主 `Icon` 的 `{svg}` 形式
+  渲染，`paseo-plugin/client/deepseek-mark*.tsx`）+ 完整 objective（可选中复制；宿主表面自己
+  滚动，不套内层 ScrollView）。
+- 状态行：8px 圆点 + 阶段词（「进行中」/「已暂停」/「受阻」）。
+- 轮数行：「第 N 轮 · 预算 M」/「Round N · budget M」（`rounds`，**不写 `N/M`**）。
+- 「正在：<当前 todo>」/「Now: <content>」：只在 DSH 的 todo 列表有 `in_progress` 项时出现
+  （`goalCurrentTaskLine`，`paseo-plugin/client/goal-polling.ts:559-563`）；没有该项（DSH 每轮
+  重置）就不画这一行。
+- blocked 追加「受阻原因：code — message」；active+disarmed 追加「重开会话或进程重启后，
+  自动续跑会停止，点『继续』恢复。」；错误行。
+- 按钮行：**右对齐、三个按钮等宽**，顺序 `[清除][编辑][主操作]`（主操作最右、唯一 accent
+  填充）；桌面按宿主 sm 几何（高 32），手机按 md（高 44，满足触达下限）；三钮共用同一个
+  `goalButtonMinWidth` 钉宽，标签切换不会让行跳动（`goalActionRowStyle`/`goalButtonRow`/
+  `goalButtonGeometry`，`paseo-plugin/client/goal-polling.ts:223-250,465-530`）。
+- `清除` 二次确认：第一次点击把按钮变红（**红描边 + 红字，不是红底**——红底白字在暗色只有
+  2.80:1，低于 AA）并把文案换成「确认清除」/「Confirm」；宽度被钉住，切换不移动行。
+  任何其它操作复位（`goalActionLabel`/`goalButtonVariant`，`:288-320`）。
+- `编辑` 展开单行输入框（占位「新的目标内容」/「New objective」），回车提交，空文本不提交；
+  操作中按钮置忙（「处理中…」/「Working…」）；成功后立即触发一次 `pollNow` 刷新（不等 4s）；
+  失败原文显示在 popover 里、popover 不关闭。
+- 底部一行提示：「运行中发消息会插入当前轮，不打断目标；停止会暂停目标。」（en 同义，
+  `footnote`）。没有目标时显示「当前没有目标。」，读不到时显示「读不到本会话的目标。」。
+
+**为什么不做 todo 进度条**：todo 的产生侧不可靠——调查 38 个真实 DeepSeek 会话：20 个从不调
+`todo_write`，9 个只写 1 次（之后不再更新），8 个写 2 次（多在结束前一次性全标完成，其中 3 个
+goal 会话提前标 100% 后又跑了 43–101 分钟），只有 1 个中途逐项更新。用 todo 算完成度会长期
+停在 0% 或突然 100%；可靠进度只有 goal 自己的轮次，所以轮次也只当**预算**展示，todo 只用于
+「正在」一行。
+
 - 数据每 agent 轮询 `goal.current`，节奏与 jobs **完全相同**（共用
   `paseo-plugin/client/agent-polling.ts`）：4s 基准（可见/隐藏同频）、20% 抖动封顶 2s、
   首轮 0–1s 抖动、失败退避 4→8→16→30s、终态码停表、答案签名去重（未变不 publish/update）。
@@ -240,6 +264,28 @@ pill 的「继续」按钮与 `/goal resume` 等价；重开后 paused 或 activ
 | A：goal 运行中（active+armed，第 1 轮进行中）撤回一条人类消息 | 立刻转 `paused + disarmed`，`revision` 1→2，`roundsStarted` 保持 1（不回退）；15s 内状态不再变 | **不再续跑**，要用户点「继续」 | 运行中的轮次被 `turn/end {reason:{kind:"aborted"}}` 取消；被撤区间里的 goal 轮次消息（`source.kind='goal'`）随之撤掉，重放只剩人类消息与 `paseo-rewind` 标记 |
 | B：goal 已暂停（paused+disarmed）时撤回 | 完全不变（revision 不变） | 不续跑 | 新增 `paseo-rewind` 标记，被撤的人类消息不在重放里 |
 
+**刚插话、还没进入对话的消息**（P3 修复，`dsh-bridge/lib/server.js`）：撤回不再一律报
+「已被撤回或压缩」。桥在 `prompt()` 时登记「已发给 agent、尚未在 surface 出现」的 message id，
+落 surface 即清除（`:1242,1252,1298-1325`）；`revert()` 预规划失败后先查这张表
+（`:2830-2845` → `#withdrawPendingUserMessage` `:1327-1392`）：
+
+| 消息状态 | conversation / both | files |
+|---|---|---|
+| 仍在待发队列（direct 调用） | 从队列移除 + `success` | 拒绝：「这条消息还没有进入对话，不能作为文件恢复的锚点；如需撤销它请使用对话撤回」 |
+| 已被宿主预取消、不在队列、agent idle | `success`（无需再移除） | 同上拒绝 |
+| 已被 claim、正在写入（agent 仍 running） | 拒绝：「这条消息还在发送中，稍后再撤回」（保留跟踪，可重试；**绝不假成功**） | 同上拒绝 |
+| 真正不在日志里（已撤回/压缩） | 原错误文案「这条消息已不在可撤回的对话中（可能已被撤回或压缩）：<id>」 | 同原 |
+| 已在 surface | 既有正常撤回路径 | 既有 files 撤回路径 |
+
+- pending 撤回**不 append 替换标记、不 flush、不取消回合**：它没有 surface 节点可替换，成功
+  回执只说明「它从未进入对话」。宿主路径下消息其实已被「撤回前预取消」清空 inbox，桥只负责
+  给诚实回执；direct 路径下才真的 `inbox.remove`。
+- **goal × pending**：宿主预取消照旧会取消 goal 轮次并 pause（与普通撤回一致）；pending 撤回
+  本身不额外取消回合（P3 真机探针实测）。这也意味着「刚插话就撤回」同样可能让目标暂停——
+  原因仍是取消回合，不是 pending 撤回新增的行为。
+- 证据：P3 离线 `rewind-transaction-check` 28/28 + 一次性隔离 home 真机探针 8/8
+  （`P3-rewind.md`）；**App UI 上「插话后 1 秒内可点撤回」的窗口未验证**。
+
 **方法学**：插件侧 `session.revert` 在真正撤回前要先 arm 一条时间线报告，需要真实 Paseo API
 句柄（`paseo-plugin/server/rewind-notice-append.ts` 的 `api.agents.ref(...)`）；假宿主给不出，
 请求在到达桥之前就失败。FINAL 按任务书允许改走**桥**路径，所以本节标【实测·桥路径】，
@@ -262,8 +308,8 @@ pill 的「继续」按钮与 `/goal resume` 等价；重开后 paused 或 activ
 | 检查 | 断言 | 依赖 | 触发 |
 |---|---|---|---|
 | `harness/goal-bridge-check.mjs` | 15/15 | **本机 DSH 安装**（从全局安装解析 `@deepseek-ai/*`，`DSH_PACKAGES_DIR`/`DSH_INSTALL_DIR` 可覆盖；没有就 exit 2） | 动 `dsh-bridge/lib/server.js` 的 `paseo/goal` / dispatch |
-| `harness/goal-pill-check.cjs` | 131/131 | 纯模块（`tsc -p harness/goal-pill.tsconfig.json`） | 动 `client/goal-polling.ts`、`client/agent-polling.ts`、`shared/goal.ts`、locale goal 表 |
-| `harness/goal-server-check.cjs` | 31/31 | 真实插件 + 假桥（一次性 `DSH_HOME`） | 动 `server/provider.ts` / `server/session.ts` 的 goal 读写、`server/dsh-process.ts` 的 goal 分级、`index.server.ts` 的 handler、桥的缺失服务文案 |
+| `harness/goal-pill-check.cjs` | 254/254 | 纯模块（`tsc -p harness/goal-pill.tsconfig.json`） | 动 `client/goal-polling.ts`、`client/goal-popover.tsx`、`client/goal-pill.tsx`、`client/agent-polling.ts`、`shared/goal.ts` 或 locale goal 表 |
+| `harness/goal-server-check.cjs` | 39/39 | 真实插件 + 假桥（一次性 `DSH_HOME`） | 动 `server/provider.ts` / `server/session.ts` 的 goal 读写、`server/dsh-process.ts` 的 goal 分级与 `currentTask`、`index.server.ts` 的 handler、桥的缺失服务文案 |
 | `harness/goal-timeline-check.cjs` | 6 组 | 真实 `DshSession` + 假进程传输（`plugin-build.cjs` 自编译） | 动 `server/activity-timeline.ts` 的 goal 行、`server/session.ts` 的重放过滤、`server/locale.ts` 的 `goalRound` |
 
 运行方式（完整步骤见 [HARNESS.md](./HARNESS.md)「目标（goal）链」）：
@@ -280,9 +326,11 @@ env -u DSH_HOME node harness/goal-bridge-check.mjs
 node harness/goal-timeline-check.cjs
 ```
 
-既有检查同步更新：`timeline-check` 230（本轮 +17）、`p003-timeline-check` 9（+1）、
-`tool-call-check` 397（+12，两条 goal 行的图标）、`locale-check`（goal 表双语言覆盖）、
-`jobs-poll-check` 119（+3 钉住 jobs 旧文案，泛化不改 jobs 行为）。
+既有检查同步更新：`timeline-check` **235**（goal 轮次行 +17、todo `status` +6）、
+`p003-timeline-check` 9（+1）、`tool-call-check` 397（+12，两条 goal 行的图标）、
+`locale-check` 358（goal 表双语言覆盖）、`jobs-poll-check` 119（+3 钉住 jobs 旧文案）、
+`rewind-transaction-check` **28**（+6：pending 插话撤回的 host 流 / direct 流 / files 拒绝 /
+claim 后拒绝 / 落 surface 走正常路径 / close 清理）。
 
 真机（一次性隔离 home，`env -u DSH_HOME`，日志首行必须是 `/tmp` 克隆）：
 
