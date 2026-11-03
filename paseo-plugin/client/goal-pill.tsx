@@ -15,6 +15,16 @@
  * channel for daemon-side reads; the cadence is the jobs pill's, shared through
  * `client/agent-polling.ts`.
  *
+ * **What the trigger can and cannot show (UI revision, 2026-11-03).** The host
+ * draws a pill's label as plain text in a 160px-wide button and paints its icon
+ * from `color`/`size` only, so the *label* says the state in words (「目标进行中」/
+ * 「目标未在续跑」/「目标已暂停」/「目标受阻」) while the **icon is a custom component
+ * that colours the Target glyph by tone** (`goalIconColorToken`: accent while
+ * armed, warning when not continuing, danger when blocked). The `title` is the
+ * fixed noun 「目标」/「Goal」 — it is the phone sheet's header and the
+ * accessibility name, and the full objective lives once in the popover body
+ * instead of twice.
+ *
  * **What is never shown.** A goal the user cannot read is not "no goal": the
  * poller keeps the last state on a transient error, and a terminal error (a
  * bridge without `paseo/goal`, a profile with no goal service) removes the pill
@@ -25,57 +35,45 @@
  */
 import type {
   PluginButtonContentProps,
+  PluginButtonIconProps,
   PluginButtonRegistration,
   PluginClientContext,
 } from "@getpaseo/plugin/client";
+import { Icon } from "@getpaseo/plugin/client/ui";
 import { useEffect, useState } from "react";
-import { Platform, Pressable, Text, TextInput, View, type PressableStateCallbackType } from "react-native";
+import { Text, View } from "react-native";
 import { goalControl, goalCurrent, type GoalAction, type GoalState } from "../shared/goal";
+import { GoalPopoverBody } from "./goal-popover";
 import {
-  clearConfirmStep,
   createGoalPoller,
-  goalActionsFor,
-  goalEditDraftValid,
+  goalIconColorToken,
   goalPillPresentation,
-  goalToneColorToken,
   type GoalLabel,
   type GoalPoller,
+  type GoalTone,
   type GoalViewState,
 } from "./goal-polling";
-import {
-  FACTS_FONT_SIZE,
-  POPOVER_HOST_PADDING,
-  ROW_BORDER_RADIUS,
-  ROW_GAP,
-  TITLE_FONT_SIZE,
-  popoverRootBox,
-} from "./jobs-popover-layout";
+import { FACTS_FONT_SIZE } from "./jobs-popover-layout";
 import { localeText, type GoalText } from "./locale";
 
-/** One agent's latest answer, plus the listeners the popover subscribes with. */
+/** One agent's latest answer, plus the listeners the pill and popover subscribe with. */
 interface AgentGoal {
   goal: GoalState | null;
   /** `false` when the runtime could not be read — never confused with "none". */
   available: boolean;
   error?: string;
-  /** Popover bodies re-render from this set when a poll lands. */
+  /** The trigger's glyph and the popover re-render from this set when a poll lands. */
   readonly listeners: Set<() => void>;
 }
 
-/** The live answer per agent, shared by the pill's label and its popover. */
+/** The live answer per agent, shared by the pill, its glyph and its popover. */
 type GoalStore = Map<string, AgentGoal>;
-
-/** The popover's body type, so the theme slot is not spelled out at every call. */
-type PopoverTheme = PluginButtonContentProps["theme"];
-
-/** The host's hover/press callback state, as `jobs-pill.tsx` reads it. */
-type HoverState = PressableStateCallbackType & { hovered?: boolean };
 
 /** The label copy for one semantic label key. */
 function goalLabelText(label: GoalLabel, text: GoalText): string {
   switch (label.kind) {
-    case "rounds":
-      return text.roundsLabel(label.started, label.max);
+    case "running":
+      return text.running;
     case "notRunning":
       return text.notRunning;
     case "paused":
@@ -83,6 +81,17 @@ function goalLabelText(label: GoalLabel, text: GoalText): string {
     case "blocked":
       return text.blocked;
   }
+}
+
+/** The tone the trigger's glyph should draw with for one stored answer. */
+function goalToneOf(entry: AgentGoal | undefined): GoalTone {
+  const presentation = goalPillPresentation({
+    available: entry?.available ?? true,
+    goal: entry?.goal ?? null,
+  });
+  // A hidden pill draws nothing; the warning tone is only the initial value
+  // before the first poll, and the glyph is invisible then anyway.
+  return presentation.visible ? presentation.tone : "warning";
 }
 
 function publish(store: GoalStore, agentId: string, next: Omit<AgentGoal, "listeners">): void {
@@ -98,77 +107,41 @@ function publish(store: GoalStore, agentId: string, next: Omit<AgentGoal, "liste
   }
 }
 
-/** The popover body's spacing. The host draws the surface; these are our gaps. */
-const BODY_GAP = ROW_GAP;
-const BUTTON_PADDING_HORIZONTAL = 10;
-const BUTTON_PADDING_VERTICAL = 6;
-const FIELD_PADDING_HORIZONTAL = 8;
-const FIELD_PADDING_VERTICAL = 6;
-const BUSY_OPACITY = 0.5;
-
 /**
- * One control button.
+ * The trigger's glyph: the Target mark coloured by the goal's tone.
  *
- * A `Pressable` with the host's own row-active fill while hovered/pressed, and
- * a disabled state while another action is in flight. `aria-disabled` is set on
- * web the same way the jobs popover sets `aria-expanded`: React Native Web does
- * not map `accessibilityState.disabled` for a `Pressable` in every host version.
+ * The host paints a plugin pill's icon with a fixed muted colour (`color` is
+ * `foregroundMuted` there) and its label as plain text, so a custom icon
+ * component is the only channel through which the state can reach the trigger.
+ * The component subscribes to the same store the popover reads, so a tone change
+ * repaints the glyph without re-registering the button (a `registration.update`
+ * per poll would republish the composer for nothing).
  */
-function GoalButton({
-  label,
-  tone,
-  primary,
-  disabled,
-  theme,
-  onPress,
-}: {
-  label: string;
-  tone: "normal" | "danger";
-  primary: boolean;
-  disabled: boolean;
-  theme: PopoverTheme;
-  onPress: () => void;
-}) {
-  const style = ({ hovered = false, pressed }: HoverState) => {
-    const fill = primary
-      ? theme.colors.accent
-      : hovered || pressed
-        ? theme.colors.surface2
-        : theme.colors.surface1;
-    return {
-      backgroundColor: fill,
-      borderRadius: ROW_BORDER_RADIUS,
-      paddingHorizontal: BUTTON_PADDING_HORIZONTAL,
-      paddingVertical: BUTTON_PADDING_VERTICAL,
-      opacity: disabled ? BUSY_OPACITY : 1,
-    } as const;
-  };
-  const color = primary
-    ? theme.colors.accentForeground
-    : tone === "danger"
-      ? theme.colors.statusDanger
-      : theme.colors.foreground;
-  return (
-    <Pressable
-      onPress={onPress}
-      disabled={disabled}
-      accessibilityRole="button"
-      accessibilityLabel={label}
-      accessibilityState={{ disabled }}
-      {...(Platform.OS === "web" ? { "aria-disabled": disabled } : null)}
-      style={style}
-    >
-      <Text numberOfLines={1} style={{ fontSize: FACTS_FONT_SIZE, color }}>
-        {label}
-      </Text>
-    </Pressable>
-  );
+function makeGoalIcon(store: GoalStore, agentId: string) {
+  function GoalPillIcon({ size, theme }: PluginButtonIconProps) {
+    const [tone, setTone] = useState<GoalTone>(() => goalToneOf(store.get(agentId)));
+    useEffect(() => {
+      const current = store.get(agentId);
+      if (current === undefined) return;
+      const listener = () => {
+        setTone(goalToneOf(store.get(agentId)));
+      };
+      current.listeners.add(listener);
+      return () => {
+        current.listeners.delete(listener);
+      };
+    }, []);
+    return <Icon name="Target" size={size} color={theme.colors[goalIconColorToken(tone)]} />;
+  }
+  GoalPillIcon.displayName = "GoalPillIcon";
+  return GoalPillIcon;
 }
 
 /**
- * The popover body: the objective, its state, and the control buttons.
+ * The popover container: the interaction state and the RPCs around the pure
+ * body (`goal-popover.tsx`).
  *
- * It reads the shared store rather than issuing its own RPC, so opening the
+ * It reads the shared store rather than issuing its own read, so opening the
  * popover does not double the request rate. After a successful control action it
  * asks the poller for one immediate read (`refresh`) instead of waiting up to
  * the four-second interval: the user just pressed a button and expects the pill
@@ -176,14 +149,8 @@ function GoalButton({
  *
  * **Failure keeps the panel open.** DSH's own sentence is shown in place — a
  * paused goal at its round cap refuses `resume`, and closing the popover would
- * leave the user with no explanation. `清除` is the only destructive action, so
- * it takes two clicks ({@link clearConfirmStep}); the arm resets on any other
- * action.
- *
- * **No inner ScrollView.** The host's popover surface is already scrollable at
- * its own `maxHeight`; a second one capped the body shorter and gave the panel
- * two scroll regions (the jobs popover's note). A long objective therefore wraps
- * inside the body and the surface scrolls.
+ * leave the user with no explanation. `清除` takes two clicks
+ * ({@link clearConfirmStep}); the arm resets on any other action.
  */
 function makeGoalPopover(
   client: PluginClientContext,
@@ -191,7 +158,7 @@ function makeGoalPopover(
   agentId: string,
   refresh: () => Promise<void>,
 ) {
-  function GoalPopover({ theme }: PluginButtonContentProps) {
+  function GoalPopover({ theme, layout }: PluginButtonContentProps) {
     const [entry, setEntry] = useState<AgentGoal | undefined>(store.get(agentId));
     const [busy, setBusy] = useState<GoalAction | null>(null);
     const [error, setError] = useState<string | undefined>(undefined);
@@ -213,13 +180,6 @@ function makeGoalPopover(
     }, []);
 
     const text = localeText().goal;
-    const root = {
-      ...popoverRootBox(),
-      paddingHorizontal: POPOVER_HOST_PADDING,
-      paddingVertical: 4,
-      gap: BODY_GAP,
-    } as const;
-
     const goal = entry?.goal ?? null;
     // Before the first poll lands (or after the pill was removed) the body must
     // render something rather than throw. A read that never succeeded is the
@@ -230,7 +190,7 @@ function makeGoalPopover(
           ? text.noGoal
           : (entry.error ?? text.unavailable);
       return (
-        <View style={root}>
+        <View style={{ padding: 8 }}>
           <Text style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}>
             {message}
           </Text>
@@ -238,10 +198,6 @@ function makeGoalPopover(
       );
     }
 
-    const presentation = goalPillPresentation({ available: true, goal });
-    const tone = presentation.visible ? presentation.tone : "warning";
-    const statusColor = theme.colors[goalToneColorToken(tone)];
-    const actions = goalActionsFor(goal);
     const busyNow = busy !== null;
 
     const run = async (action: GoalAction, objective?: string): Promise<void> => {
@@ -274,7 +230,9 @@ function makeGoalPopover(
 
     const onAction = (action: GoalAction): void => {
       if (action === "clear") {
-        if (clearConfirmStep(clearArmed) === "arm") {
+        // The first click only arms; the label does not change (so the row does
+        // not jump) — the button turns red instead.
+        if (!clearArmed) {
           setClearArmed(true);
           return;
         }
@@ -290,100 +248,25 @@ function makeGoalPopover(
     };
 
     const submitEdit = (): void => {
-      if (!goalEditDraftValid(draft)) return;
+      if (draft.trim() === "") return;
       void run("edit", draft);
     };
 
-    const actionLabel = (action: GoalAction): string => {
-      switch (action) {
-        case "pause":
-          return text.actions.pause;
-        case "resume":
-          return text.actions.resume;
-        case "edit":
-          return text.actions.edit;
-        case "clear":
-          return clearArmed ? text.actions.confirmClear : text.actions.clear;
-      }
-    };
-
-    const disarmed = goal.phase === "active" && goal.activation === "disarmed";
-
     return (
-      <View style={root}>
-        {/* The objective in full: the trigger only carries a cut title, and this
-            is the one place the user can read (and copy) all of it. */}
-        <Text
-          selectable
-          style={{ fontSize: TITLE_FONT_SIZE, color: theme.colors.foreground }}
-        >
-          {goal.objective}
-        </Text>
-        <Text style={{ fontSize: FACTS_FONT_SIZE, color: statusColor }}>
-          {`${text.statuses[goal.phase] ?? goal.phase} · ${text.rounds(goal.roundsStarted, goal.maxGoalRounds)}`}
-        </Text>
-        {goal.blockedReason === undefined ? null : (
-          <Text style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.statusDanger }}>
-            {text.blocker(goal.blockedReason.code, goal.blockedReason.message)}
-          </Text>
-        )}
-        {disarmed ? (
-          <Text style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.statusWarning }}>
-            {text.disarmedHint}
-          </Text>
-        ) : null}
-        {editing ? (
-          <TextInput
-            value={draft}
-            onChangeText={setDraft}
-            onSubmitEditing={submitEdit}
-            placeholder={text.editPlaceholder}
-            placeholderTextColor={theme.colors.foregroundMuted}
-            returnKeyType="done"
-            autoFocus
-            accessibilityLabel={text.editPlaceholder}
-            style={{
-              fontSize: FACTS_FONT_SIZE,
-              color: theme.colors.foreground,
-              borderWidth: 1,
-              borderColor: theme.colors.border,
-              borderRadius: ROW_BORDER_RADIUS,
-              paddingHorizontal: FIELD_PADDING_HORIZONTAL,
-              paddingVertical: FIELD_PADDING_VERTICAL,
-            }}
-          />
-        ) : null}
-        {error === undefined ? null : (
-          <Text style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.statusDanger }}>
-            {error}
-          </Text>
-        )}
-        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: BODY_GAP }}>
-          {actions.map((action) => (
-            <GoalButton
-              key={action}
-              label={actionLabel(action)}
-              tone={action === "clear" ? "danger" : "normal"}
-              primary={action === "pause" || action === "resume"}
-              disabled={busyNow}
-              theme={theme}
-              onPress={() => {
-                onAction(action);
-              }}
-            />
-          ))}
-        </View>
-        {busyNow ? (
-          <Text style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}>
-            {text.busy}
-          </Text>
-        ) : null}
-        {/* The product answer to "can I still send a message?": yes, and it does
-            not interrupt the goal — but stop does pause it. */}
-        <Text style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}>
-          {text.footnote}
-        </Text>
-      </View>
+      <GoalPopoverBody
+        goal={goal}
+        text={text}
+        theme={theme}
+        compact={layout.compact}
+        busy={busyNow}
+        error={error}
+        clearArmed={clearArmed}
+        editing={editing}
+        draft={draft}
+        onAction={onAction}
+        onChangeDraft={setDraft}
+        onSubmitEdit={submitEdit}
+      />
     );
   }
   return GoalPopover;
@@ -411,8 +294,9 @@ export function contributeGoalPill(client: PluginClientContext) {
 
   /**
    * Publish one poll answer: the popover store first (its listeners redraw from
-   * it), then the registration. The visibility/label rule is
-   * {@link goalPillPresentation}; this function only turns its keys into copy.
+   * it, including the trigger's glyph), then the registration. The
+   * visibility/label rule is {@link goalPillPresentation}; this function only
+   * turns its keys into copy.
    */
   const publishState = (agentId: string, next: GoalViewState): void => {
     const registration = pills.get(agentId);
@@ -428,10 +312,10 @@ export function contributeGoalPill(client: PluginClientContext) {
     registration.update({
       visible: presentation.visible,
       label,
-      // The title is the objective cut to one short line; the popover body holds
-      // the full text. When hidden the neutral noun stands in, so the button the
-      // host keeps for its popover header never carries a stale objective.
-      title: presentation.visible ? presentation.title : text.title,
+      // The title is the fixed noun: it is the phone sheet's header and the
+      // button's accessibility name, while the full objective is drawn once, in
+      // the popover body. An objective here would print it twice on a phone.
+      title: text.title,
     });
   };
 
@@ -454,9 +338,9 @@ export function contributeGoalPill(client: PluginClientContext) {
         workspaceId: agent.workspaceId ?? "",
         agentId: agent.id,
         button: {
-          // The same Target glyph DSH's own goal rows use (`tool-call-data`), so
-          // the pill and the timeline row read as the same subject.
-          icon: "Target",
+          // A custom component so the Target glyph can carry the goal's tone
+          // (the host would paint a plain icon name muted for every state).
+          icon: makeGoalIcon(store, agent.id),
           title: localeText().goal.title,
           // Hidden until the first poll proves otherwise: a pill that appears and
           // then disappears is worse.

@@ -27,6 +27,7 @@ import {
   DshProcess,
   type DshAnswer,
   type DshChildOpened,
+  type DshCurrentTask,
   type DshGoal,
   type DshJobs,
   type DshMcpServer,
@@ -1042,6 +1043,26 @@ export class DshSession {
       return await process.goal(this.#dshSessionId);
     } catch (error) {
       return { available: false, error: { message: messageOf(error), code: "rpc_failed" } };
+    }
+  }
+
+  /**
+   * The task DSH's todo list marks `in_progress`, for the goal popover's "now"
+   * line.
+   *
+   * A best-effort companion to {@link goal}: it is only called once the goal
+   * read succeeded, and its failure never fails the goal read (the popover just
+   * draws without the line). A closed session or a missing child answers `none`
+   * rather than throwing, for the same reason {@link goal} does.
+   */
+  async currentTask(): Promise<DshCurrentTask> {
+    if (this.#closed) return { kind: "none" };
+    const process = this.#process;
+    if (process === undefined) return { kind: "none" };
+    try {
+      return await process.currentTask(this.#dshSessionId);
+    } catch (error) {
+      return { kind: "unavailable", message: messageOf(error) };
     }
   }
 

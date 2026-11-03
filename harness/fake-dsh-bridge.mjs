@@ -100,13 +100,16 @@
  * `deleted`, so the success notice's counts are asserted from real arrays rather
  * than from a number the fake also has to invent.
  *
- * Two methods are scripted through JSON files because the goal pill's checks need
- * to steer them between assertions while the shared child stays alive:
+ * Three methods are scripted through JSON files because the goal pill's checks
+ * need to steer them between assertions while the shared child stays alive:
  * `DSH_FAKE_GOAL_FILE` drives `paseo/goal` (`{goal: <view>|null}`,
- * `{unknownMethod: true}`, `{missingService: true}`, `{throw: "<message>"}`) and
+ * `{unknownMethod: true}`, `{missingService: true}`, `{throw: "<message>"}`),
  * `DSH_FAKE_COMMAND_FILE` drives `paseo/command/run`
- * (`{kind: "success"|"error", text}`). See {@link goalScript} and
- * {@link commandScript} for the exact shapes.
+ * (`{kind: "success"|"error", text}`), and `DSH_FAKE_PROJECTIONS_FILE` drives
+ * `paseo/projections` (a `{kind:"sequenced", values:{…}}` snapshot,
+ * `{unknownMethod: true}`, or `{throw: "<message>"}`; unset answers `null`). See
+ * {@link goalScript}, {@link commandScript} and {@link projectionsScript} for
+ * the exact shapes.
  *
  * ## The per-session `initialize` gate
  *
@@ -225,6 +228,22 @@ function goalScript() {
  */
 function commandScript() {
   return scriptFile("DSH_FAKE_COMMAND_FILE");
+}
+
+/**
+ * The scripted `paseo/projections` answer.
+ *
+ * The goal pill's "now" line comes from DSH's `todos` session projection, read
+ * through this existing bridge method (no bridge change). A script lets a check
+ * drive the three answers that matter — a `{kind:"sequenced", values:{todos}}`
+ * snapshot with an `in_progress` item, a snapshot whose `todos` is `null`
+ * (DSH resets it every turn), and the bridge's unknown-key sentence for a
+ * profile without the todo tool — plus any other thrown failure. Unset answers
+ * `null`, which is what the real bridge returns for a session with no stored
+ * log.
+ */
+function projectionsScript() {
+  return scriptFile("DSH_FAKE_PROJECTIONS_FILE");
 }
 
 const LOG_PATH = process.env.DSH_FAKE_LOG;
@@ -919,6 +938,16 @@ async function handle(method, params, id) {
       // unset default is the success reply the steer scenario has always used.
       const scripted = commandScript();
       return scripted === undefined ? { kind: "success", text: "goal: none" } : scripted;
+    }
+    case "paseo/projections": {
+      const scripted = projectionsScript();
+      // The real bridge's `null` for a session with no stored log.
+      if (scripted === undefined) return null;
+      // The real bridge's wording, so the plugin's "no such method" grading is
+      // exercised against the production prefix.
+      if (scripted.unknownMethod === true) throw new Error("unknown paseo bridge method: paseo/projections");
+      if (typeof scripted.throw === "string") throw new Error(scripted.throw);
+      return scripted;
     }
     case "paseo/goal": {
       const scripted = goalScript();

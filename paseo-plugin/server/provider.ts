@@ -2127,6 +2127,16 @@ function goalStateOf(view: DshGoalView): GoalState {
 }
 
 /**
+ * Agents whose `todos` read already failed and was logged once.
+ *
+ * The goal pill polls every four seconds, so an unlatched stderr line per poll
+ * would bury the log (the same reason the bridge latches its own warnings). A
+ * later success does not clear the entry: the line explains why the "now" line
+ * may be missing, and once the read recovers there is nothing left to explain.
+ */
+const CURRENT_TASK_WARNED = new Set<string>();
+
+/**
  * Read one agent's current goal through whichever connection serves it.
  *
  * "No connection / no session" is not an error — same rule as
@@ -2139,6 +2149,12 @@ function goalStateOf(view: DshGoalView): GoalState {
  *
  * A session that *is* open reports its own read failure instead of `null`,
  * which is what keeps an unreadable goal from being drawn as "no goal".
+ *
+ * The optional `currentTask` comes from a **second, best-effort read** of DSH's
+ * `todos` projection, and only when there is a goal to draw (a null goal is a
+ * hidden pill, so the read would be wasted). Its failure never fails the goal:
+ * the projection being absent, null or unreadable all mean "no now line", and
+ * the goal read is what the pill depends on.
  *
  * @param agentId - Paseo's agent id, as the pill knows it.
  */
@@ -2161,9 +2177,21 @@ export async function readAgentGoal(agentId: string): Promise<{
         },
       };
     }
+    if (result.goal === undefined || result.goal === null) {
+      return { available: true, goal: null };
+    }
+    const state = goalStateOf(result.goal);
+    const task = await session.currentTask();
+    if (task.kind === "unavailable" && !CURRENT_TASK_WARNED.has(agentId)) {
+      CURRENT_TASK_WARNED.add(agentId);
+      process.stderr.write(
+        `[${PROVIDER_ID}] goal pill: reading the todo projection failed for ${agentId} `
+          + `(the "now" line will be missing): ${task.message}\n`,
+      );
+    }
     return {
       available: true,
-      goal: result.goal === undefined || result.goal === null ? null : goalStateOf(result.goal),
+      goal: task.kind === "task" ? { ...state, currentTask: task.task } : state,
     };
   }
   return { available: true, goal: null };

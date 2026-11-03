@@ -141,6 +141,79 @@ console.log("tool call lifecycle");
   );
 }
 
+console.log("a todo_write row carries the item statuses");
+{
+  // The native todo card used to receive only `completed`, so an in-progress
+  // item was drawn identically to a pending one — the card could not show what
+  // the model was actually on. Paseo's `AgentTaskItem` has carried `status`
+  // (`pending | in_progress | completed`) all along; the plugin just dropped it.
+  const builder = new TimelineBuilder({ warn: (line) => warnings.push(line) });
+  builder.consume({
+    type: "tool/call",
+    seq: 1,
+    data: {
+      callId: "todo-1",
+      name: "todo_write",
+      arguments: {
+        todos: [
+          { content: "done item", status: "completed" },
+          { content: "current item", status: "in_progress" },
+          { content: "later item", status: "pending" },
+        ],
+      },
+    },
+  });
+  const items = builder.consume({
+    type: "tool/result",
+    seq: 2,
+    data: { toolCallId: "todo-1", message: { content: [{ type: "text", text: "ok" }] } },
+  });
+  const todo = items.find((item) => item.type === "todo");
+  check("a todo_write result emits the native todo row", todo !== undefined, JSON.stringify(items.map((item) => item.type)));
+  check(
+    "todo items keep the protocol status",
+    JSON.stringify(todo?.items?.map((item) => item.status)) === JSON.stringify(["completed", "in_progress", "pending"]),
+    JSON.stringify(todo?.items),
+  );
+  // `completed` stays for older Paseo hosts, derived from the same status so the
+  // two fields cannot disagree.
+  check(
+    "todo items keep `completed` in step with the status",
+    JSON.stringify(todo?.items?.map((item) => item.completed)) === JSON.stringify([true, false, false]),
+    JSON.stringify(todo?.items),
+  );
+  check(
+    "todo text is the item content",
+    JSON.stringify(todo?.items?.map((item) => item.text)) === JSON.stringify(["done item", "current item", "later item"]),
+    JSON.stringify(todo?.items),
+  );
+
+  // An unknown status (a DSH value this plugin does not know) must normalise to
+  // `pending`, never to `completed` — a row that silently looks finished is the
+  // silent downgrade this repo keeps finding.
+  const unknownBuilder = new TimelineBuilder({ warn: (line) => warnings.push(line) });
+  unknownBuilder.consume({
+    type: "tool/call",
+    seq: 1,
+    data: {
+      callId: "todo-2",
+      name: "todo_write",
+      arguments: { todos: [{ content: "future status", status: "deferred" }] },
+    },
+  });
+  const unknownItems = unknownBuilder.consume({
+    type: "tool/result",
+    seq: 2,
+    data: { toolCallId: "todo-2", message: { content: [{ type: "text", text: "ok" }] } },
+  });
+  const unknownTodo = unknownItems.find((item) => item.type === "todo");
+  check(
+    "an unknown todo status normalises to pending",
+    unknownTodo?.items?.[0]?.status === "pending" && unknownTodo?.items?.[0]?.completed === false,
+    JSON.stringify(unknownTodo?.items),
+  );
+}
+
 console.log("a repeated tool/call must not undo a finished row");
 {
   const builder = new TimelineBuilder();

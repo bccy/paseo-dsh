@@ -281,6 +281,28 @@ export interface DshGoal {
 }
 
 /**
+ * What the session's `todos` projection can say about the current round.
+ *
+ * Three states, because they mean three different things to the popover:
+ *
+ * - `task`: an item is `in_progress`; its own `content` is shown verbatim.
+ * - `none`: there is no such item — nothing was written this round (DSH resets
+ *   the projection every turn), every item is settled, or the profile does not
+ *   compose the todo tool at all. The popover draws no "now" line. The last case
+ *   is deliberately folded in: "this profile has no todo tool" and "the model
+ *   did not write a todo" are indistinguishable to the user and both mean "no
+ *   task line", not an error.
+ * - `unavailable`: the read failed for a reason that is not "no data" (a
+ *   transport failure, a throwing projection). The goal read itself is fine, so
+ *   the pill still draws; the failure is logged once instead of being shown as
+ *   a missing line.
+ */
+export type DshCurrentTask =
+  | { kind: "task"; task: string }
+  | { kind: "none" }
+  | { kind: "unavailable"; message: string };
+
+/**
  * One entry of the composer's `/` menu. `kind` decides how running it works:
  * a registered `command` executes in the runtime, a `skill` rides a `/name`
  * user message that DSH's skill tool turns into an injected instruction set.
@@ -529,6 +551,28 @@ function withJobsErrorCode(result: DshJobs): DshJobs {
  * picked against the shorter of them.
  */
 const GOAL_READ_TIMEOUT_MS = 15_000;
+
+/**
+ * The session-projection key DSH's `dsh-tool-todo` maintains.
+ *
+ * Value: `[{content, status: "pending"|"in_progress"|"completed"}]` or `null`
+ * (`dsh-tool-todo/lib/index.js`: written by `todo/write`, reset to `null` on
+ * `turn/start`). Read through the bridge's existing `paseo/projections` method —
+ * no bridge change — which is why the plugin can show "what is happening this
+ * round" at all: the goal itself carries a round *budget*, never a completion
+ * percentage.
+ */
+const TODOS_PROJECTION_KEY = "todos";
+
+/**
+ * The bridge's refusal when a profile composes no projection for a key.
+ *
+ * Verbatim from `dsh-bridge/lib/server.js` (`projections()`: `throw new Error(
+ * \`unknown or unavailable projection key: ${key}\`)`). It is a **normal** answer
+ * for the todo read — a profile without `dsh-tool-todo` simply has no task line
+ * — so it maps to `none`, not to a failure.
+ */
+const UNKNOWN_PROJECTION_KEY_PREFIX = "unknown or unavailable projection key:";
 
 /**
  * What the client logs once when the profile's bridge has no `paseo/goal`.
@@ -2221,6 +2265,59 @@ export class DshProcess {
       }
       throw error;
     }
+  }
+
+  /**
+   * Read the task DSH's todo list marks `in_progress`, for the goal popover.
+   *
+   * The data comes from the `todos` session projection through the bridge's
+   * existing `paseo/projections` method (no bridge change). Every failure that
+   * means "there is no task line to draw" collapses to `none`: the profile
+   * composes no todo tool (the bridge throws its unknown-key sentence), an old
+   * bridge has no `projections` method, the session has no stored log yet, or
+   * the projection value is `null` (DSH resets it every turn). A genuine read
+   * failure stays `unavailable` so the caller can log it once — the goal read
+   * itself is unaffected and the pill keeps working without the line.
+   *
+   * @param sessionId - which session; required — there is no default.
+   */
+  async currentTask(sessionId: string): Promise<DshCurrentTask> {
+    await this.#ensureSessionReady(sessionId);
+    let snapshot: unknown;
+    try {
+      snapshot = await this.#request(
+        "paseo/projections",
+        { sessionId, keys: [TODOS_PROJECTION_KEY] },
+        GOAL_READ_TIMEOUT_MS,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // "No such method" (a bridge older than the plugin) and "no such key"
+      // (a profile without the todo tool) both mean the same thing here: there
+      // is no task line. They are not failures of the goal read.
+      if (this.#isUnknownBridgeMethodError(error) || message.startsWith(UNKNOWN_PROJECTION_KEY_PREFIX)) {
+        return { kind: "none" };
+      }
+      return { kind: "unavailable", message };
+    }
+    // `null` = the session has no stored log to project. `migration-required`
+    // = cached hints, not exact values, so a stale task line is worse than none.
+    if (snapshot === null || typeof snapshot !== "object") return { kind: "none" };
+    const record = snapshot as { kind?: unknown; values?: unknown };
+    if (record.kind !== "sequenced") return { kind: "none" };
+    const values = record.values;
+    if (typeof values !== "object" || values === null) return { kind: "none" };
+    const todos = (values as Record<string, unknown>)[TODOS_PROJECTION_KEY];
+    if (!Array.isArray(todos)) return { kind: "none" };
+    for (const item of todos) {
+      if (typeof item !== "object" || item === null) continue;
+      const entry = item as { content?: unknown; status?: unknown };
+      if (entry.status !== "in_progress") continue;
+      const content = typeof entry.content === "string" ? entry.content.trim() : "";
+      // An empty content would draw a bare "正在：" — treat it as no task.
+      if (content !== "") return { kind: "task", task: content };
+    }
+    return { kind: "none" };
   }
 
   /**

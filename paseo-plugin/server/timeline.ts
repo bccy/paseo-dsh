@@ -706,17 +706,48 @@ function toolDetail(name: string, input: Record<string, unknown>, output?: strin
   }
 }
 
-/** Extract `todo_write` items into Paseo's native todo row. */
-function todoItems(input: Record<string, unknown>): Array<{ text: string; completed: boolean }> | null {
+/**
+ * The statuses Paseo's `AgentTaskItem` understands (`@getpaseo/protocol`
+ * agent-types: `status?: "pending" | "in_progress" | "completed"`).
+ *
+ * Carried through instead of being flattened to `completed`: without it an
+ * in-progress row is indistinguishable from a pending one, which is why the
+ * todo card could never show which item the model is actually on.
+ */
+type TodoItemStatus = "pending" | "in_progress" | "completed";
+
+/** One row of Paseo's native todo card. `completed` stays for older hosts. */
+interface TodoItem {
+  text: string;
+  completed: boolean;
+  status: TodoItemStatus;
+}
+
+/**
+ * Extract `todo_write` items into Paseo's native todo row.
+ *
+ * `status` is passed through when it is one of the three the protocol declares
+ * and normalised to `pending` otherwise (a status DSH adds later must not make
+ * the row look done). `completed` is kept beside it because older Paseo hosts
+ * only read that field; the two cannot disagree, since `completed` is derived
+ * from the same normalised status.
+ */
+function todoItems(input: Record<string, unknown>): TodoItem[] | null {
   const raw = input.todos;
   if (!Array.isArray(raw)) return null;
   const items = raw
     .filter(isRecord)
-    .map((todo) => ({
-      text:
-        stringField(todo, "content") ?? stringField(todo, "text") ?? stringField(todo, "activeForm") ?? "",
-      completed: todo.status === "completed",
-    }))
+    .map((todo): TodoItem => {
+      const rawStatus = todo.status;
+      const status: TodoItemStatus =
+        rawStatus === "in_progress" || rawStatus === "completed" ? rawStatus : "pending";
+      return {
+        text:
+          stringField(todo, "content") ?? stringField(todo, "text") ?? stringField(todo, "activeForm") ?? "",
+        completed: status === "completed",
+        status,
+      };
+    })
     .filter((todo) => todo.text !== "");
   return items.length === 0 ? null : items;
 }

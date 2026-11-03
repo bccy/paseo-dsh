@@ -187,8 +187,14 @@ export interface JobsText {
 export interface GoalText {
   /** The button's title and the popover's heading: the neutral noun. */
   title: string;
-  /** Trigger label while the goal is auto-continuing; carries the round count. */
-  roundsLabel: (started: number, max: number) => string;
+  /**
+   * Trigger label while the goal is auto-continuing.
+   *
+   * Deliberately carries **no round fraction**: the round budget is not a
+   * completion percentage, and `目标 3/10` in a one-line trigger reads as
+   * "30% done". The budget is a sentence in the popover ({@link rounds}).
+   */
+  running: string;
   /** Trigger label when the goal is active but this process will not continue it. */
   notRunning: string;
   /** Trigger label when the goal is paused. */
@@ -197,8 +203,21 @@ export interface GoalText {
   blocked: string;
   /** The popover's status line, per durable phase. */
   statuses: Record<string, string>;
-  /** The popover's round line: how many rounds were admitted, out of the cap. */
+  /**
+   * The popover's round line: the round budget as a sentence.
+   *
+   * `第 N 轮 · 预算 M`, never `N/M`: the cap is a budget DSH may raise while the
+   * goal runs, not a completion target (default 256), so a fraction would be
+   * read as progress the runtime cannot know.
+   */
   rounds: (started: number, max: number) => string;
+  /**
+   * The popover's "now" line: the todo item DSH marks `in_progress`.
+   *
+   * Absent when there is no such item (DSH resets its todo list every turn), in
+   * which case the line is not drawn at all.
+   */
+  currentTask: (content: string) => string;
   /** The popover's blocker line: DSH's machine code and its sentence. */
   blocker: (code: string, message: string) => string;
   /**
@@ -477,9 +496,7 @@ const TEXT: Record<Locale, UiText> = {
     },
     goal: {
       title: "Goal",
-      // "Goal 3/10": the same shape DSH's own `/goal` status line uses for
-      // rounds, so the pill and the command output read alike.
-      roundsLabel: (started, max) => `Goal ${String(started)}/${String(max)}`,
+      running: "Goal running",
       notRunning: "Goal not running",
       paused: "Goal paused",
       blocked: "Goal blocked",
@@ -489,7 +506,8 @@ const TEXT: Record<Locale, UiText> = {
         blocked: "Blocked",
         complete: "Complete",
       },
-      rounds: (started, max) => `Rounds ${String(started)}/${String(max)}`,
+      rounds: (started, max) => `Round ${String(started)} · budget ${String(max)}`,
+      currentTask: (content) => `Now: ${content}`,
       blocker: (code, message) => `Blocker: ${code} — ${message}`,
       disarmedHint:
         "Auto-continue stops after a reopen or a process restart. Press Continue to resume it.",
@@ -498,7 +516,7 @@ const TEXT: Record<Locale, UiText> = {
         resume: "Continue",
         edit: "Edit",
         clear: "Clear",
-        confirmClear: "Press again to clear",
+        confirmClear: "Confirm",
       },
       editPlaceholder: "New objective",
       busy: "Working…",
@@ -506,7 +524,7 @@ const TEXT: Record<Locale, UiText> = {
       unavailable: "Could not read this session's goal.",
       noGoal: "No goal is set.",
       footnote:
-        "You can send a message while the goal runs: it is inserted into the current round and does not interrupt the goal. Pressing stop pauses the goal.",
+        "Sending a message while the goal runs inserts it into the current round without interrupting the goal; pressing stop pauses it.",
     },
   },
   "zh-CN": {
@@ -728,8 +746,7 @@ const TEXT: Record<Locale, UiText> = {
     },
     goal: {
       title: "目标",
-      // 与 DSH 自己的 `/goal` 状态行同一个形状（轮数/上限），命令输出与 pill 读起来一致。
-      roundsLabel: (started, max) => `目标 ${String(started)}/${String(max)}`,
+      running: "目标进行中",
       notRunning: "目标未在续跑",
       paused: "目标已暂停",
       blocked: "目标受阻",
@@ -739,7 +756,9 @@ const TEXT: Record<Locale, UiText> = {
         blocked: "受阻",
         complete: "已完成",
       },
-      rounds: (started, max) => `已用轮数 ${String(started)}/${String(max)}`,
+      // 预算不是完成度：不写 N/M 分数形态，避免被读成进度。
+      rounds: (started, max) => `第 ${String(started)} 轮 · 预算 ${String(max)}`,
+      currentTask: (content) => `正在：${content}`,
       blocker: (code, message) => `受阻原因：${code} — ${message}`,
       // DESIGN §2 的原文：把「为什么没在续跑、怎么恢复」说清楚。
       disarmedHint: "重开会话或进程重启后，自动续跑会停止，点「继续」恢复。",
@@ -748,15 +767,15 @@ const TEXT: Record<Locale, UiText> = {
         resume: "继续",
         edit: "编辑",
         clear: "清除",
-        confirmClear: "再点一次确认清除",
+        confirmClear: "确认清除",
       },
       editPlaceholder: "新的目标内容",
       busy: "处理中…",
       controlFailed: "目标命令执行失败。",
       unavailable: "读不到本会话的目标。",
       noGoal: "当前没有目标。",
-      footnote:
-        "运行中可以直接发消息，会插入当前轮次，不会打断目标；点停止会暂停目标。",
+      // 一行（原两行，占 34px 高）。语义不变：插入当前轮、不打断；停止会暂停。
+      footnote: "运行中发消息会插入当前轮，不打断目标；停止会暂停目标。",
     },
   },
 };

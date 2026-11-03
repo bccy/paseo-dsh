@@ -133,6 +133,18 @@ export const goalStateSchema = z.object({
   maxGoalRounds: z.number(),
   /** Present exactly while `phase` is `blocked`. */
   blockedReason: goalBlockedReasonSchema.optional(),
+  /**
+   * The task DSH's todo list currently marks `in_progress`, if any.
+   *
+   * A separate read from the goal itself: DSH's `todos` session projection is
+   * the only real "what is happening this round" data (the goal has a round
+   * budget, not a completion percentage). It is optional because the projection
+   * can be absent (a profile without `dsh-tool-todo`), `null` (nothing written
+   * this round — DSH resets it every turn), or unreadable; in all of those cases
+   * the popover simply does not draw the "now" line. The value is the item's own
+   * `content`, verbatim, never a summary this plugin invents.
+   */
+  currentTask: z.string().optional(),
 });
 
 export type GoalState = z.infer<typeof goalStateSchema>;

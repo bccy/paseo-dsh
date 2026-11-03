@@ -306,7 +306,7 @@ console.log("the goal pill's copy is covered in both languages");
   equal("goal keys match", Object.keys(en).sort(), Object.keys(zh).sort());
   for (const key of [
     "title",
-    "roundsLabel",
+    "running",
     "notRunning",
     "paused",
     "blocked",
@@ -329,8 +329,15 @@ console.log("the goal pill's copy is covered in both languages");
   // these four states are told apart; a "nicer" wording that collapses
   // `notRunning` into `active` would be the silent degradation the surface was
   // built to expose, and a translation that says something else is a red check.
-  check("goal.roundsLabel(3,10) is `Goal 3/10` (en)", en.roundsLabel(3, 10) === "Goal 3/10", JSON.stringify(en.roundsLabel(3, 10)));
-  check("goal.roundsLabel(3,10) is `目标 3/10` (zh-CN)", zh.roundsLabel(3, 10) === "目标 3/10", JSON.stringify(zh.roundsLabel(3, 10)));
+  check("goal.running is `Goal running` (en)", en.running === "Goal running", JSON.stringify(en.running));
+  check("goal.running is `目标进行中` (zh-CN)", zh.running === "目标进行中", JSON.stringify(zh.running));
+  // The round budget is a sentence, never a fraction: `3/10` in a trigger or a
+  // status line reads as completion, and the cap is a budget (default 256) DSH
+  // may raise while the goal runs.
+  check("goal.rounds(3,10) is `Round 3 · budget 10` (en)", en.rounds(3, 10) === "Round 3 · budget 10", JSON.stringify(en.rounds(3, 10)));
+  check("goal.rounds(3,10) is `第 3 轮 · 预算 10` (zh-CN)", zh.rounds(3, 10) === "第 3 轮 · 预算 10", JSON.stringify(zh.rounds(3, 10)));
+  check("goal.currentTask('x') is `Now: x` (en)", en.currentTask("x") === "Now: x", JSON.stringify(en.currentTask("x")));
+  check("goal.currentTask('x') is `正在：x` (zh-CN)", zh.currentTask("x") === "正在：x", JSON.stringify(zh.currentTask("x")));
   check("goal.notRunning is `Goal not running` (en)", en.notRunning === "Goal not running", JSON.stringify(en.notRunning));
   check("goal.notRunning is `目标未在续跑` (zh-CN)", zh.notRunning === "目标未在续跑", JSON.stringify(zh.notRunning));
   check("goal.paused is `Goal paused` (en)", en.paused === "Goal paused", JSON.stringify(en.paused));
@@ -342,11 +349,11 @@ console.log("the goal pill's copy is covered in both languages");
   // interrupt the goal, pressing stop pauses it. Asserted verbatim in Chinese
   // (the design's own sentence); English must say the same thing without being
   // a copy of the Chinese one.
-  const FOOTNOTE_ZH = "运行中可以直接发消息，会插入当前轮次，不会打断目标；点停止会暂停目标。";
+  const FOOTNOTE_ZH = "运行中发消息会插入当前轮，不打断目标；停止会暂停目标。";
   check("goal.footnote is the DESIGN §2 sentence (zh-CN)", zh.footnote === FOOTNOTE_ZH, JSON.stringify(zh.footnote));
   check(
     "goal.footnote says messages do not interrupt and stop pauses (en)",
-    en.footnote.includes("does not interrupt") && en.footnote.toLowerCase().includes("stop"),
+    en.footnote.toLowerCase().includes("interrupt") && en.footnote.toLowerCase().includes("stop"),
     JSON.stringify(en.footnote),
   );
 
@@ -377,6 +384,7 @@ console.log("the goal pill's copy is covered in both languages");
   // The English column must not be a copy of the Chinese one.
   const copied = [
     "title",
+    "running",
     "notRunning",
     "paused",
     "blocked",
@@ -393,12 +401,12 @@ console.log("the goal pill's copy is covered in both languages");
   // The function-valued entries must return real text in both languages.
   for (const locale of LOCALES) {
     const table = allText()[locale].goal;
-    const roundsLabel = table.roundsLabel(3, 10);
     const rounds = table.rounds(3, 10);
+    const currentTask = table.currentTask("write it");
     const blocker = table.blocker("round-limit", "limit reached");
     for (const [what, value] of [
-      ["roundsLabel", roundsLabel],
       ["rounds", rounds],
+      ["currentTask", currentTask],
       ["blocker", blocker],
     ]) {
       check(
@@ -408,6 +416,7 @@ console.log("the goal pill's copy is covered in both languages");
       );
     }
     check(`goal.rounds carries the count in ${locale}`, rounds.includes("3") && rounds.includes("10"), JSON.stringify(rounds));
+    check(`goal.currentTask carries the task in ${locale}`, currentTask.includes("write it"), JSON.stringify(currentTask));
     check(
       `goal.blocker carries the code and the sentence in ${locale}`,
       blocker.includes("round-limit") && blocker.includes("limit reached"),

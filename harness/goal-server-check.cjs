@@ -37,6 +37,11 @@
  *      three strings are equal. A reworded bridge would otherwise downgrade a
  *      terminal condition to a retried `rpc_failed`, with every other check
  *      still green.
+ *   7. **The "now" line is best-effort.** `goal.currentTask` comes from a second
+ *      read of DSH's `todos` projection through `paseo/projections`; the field
+ *      is present only when an item is `in_progress`, and every "no task" shape
+ *      (absent, null, all settled, no todo tool, an old bridge, a transport
+ *      failure) leaves it out while the goal read still succeeds.
  *
  * Compile the plugin first (type errors under `--moduleResolution node` are
  * expected; the emitted JS is what runs):
@@ -67,12 +72,15 @@ process.env.DSH_FAKE_MODE = "live";
 process.env.DSH_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-goal-check-"));
 const FRAME_LOG = path.join(process.env.DSH_HOME, "frames.jsonl");
 process.env.DSH_FAKE_LOG = FRAME_LOG;
-// The two scripted answers. The fake bridge re-reads both files on every
-// request, so a check can steer them while the shared child stays alive.
+// The scripted answers. The fake bridge re-reads these files on every request,
+// so a check can steer them while the shared child stays alive.
 const GOAL_FILE = path.join(process.env.DSH_HOME, "goal.json");
 const COMMAND_FILE = path.join(process.env.DSH_HOME, "command.json");
+// The `todos` projection the "now" line is read from (`paseo/projections`).
+const PROJECTIONS_FILE = path.join(process.env.DSH_HOME, "projections.json");
 process.env.DSH_FAKE_GOAL_FILE = GOAL_FILE;
 process.env.DSH_FAKE_COMMAND_FILE = COMMAND_FILE;
+process.env.DSH_FAKE_PROJECTIONS_FILE = PROJECTIONS_FILE;
 function script(file, value) {
   if (value === undefined) {
     try {
@@ -308,6 +316,89 @@ const VIEW = {
       && Object.keys(goalFrame.params ?? {}).length === 1,
     JSON.stringify(goalFrame?.params),
   );
+
+  // ---- 1b. the "now" line comes from DSH's todos projection ---------------
+  // `goal.currentTask` is a best-effort companion read: the popover draws a
+  // single "正在：…" line from the item DSH marks `in_progress`, and every state
+  // that means "no task" (absent, null, all settled, no todo tool, an old
+  // bridge) must leave the field out rather than draw an empty line.
+  const todosSnapshot = (todos) => ({ kind: "sequenced", asOfSeq: 5, values: { todos } });
+  script(GOAL_FILE, { goal: VIEW });
+
+  script(PROJECTIONS_FILE, todosSnapshot([
+    { content: "done item", status: "completed" },
+    { content: "write the UI revision", status: "in_progress" },
+    { content: "later item", status: "pending" },
+  ]));
+  const withTask = await read(agentId);
+  check(
+    "an in-progress todo item becomes goal.currentTask",
+    withTask.goal?.currentTask === "write the UI revision",
+    JSON.stringify(withTask.goal),
+  );
+  check(
+    "the task read names the todos projection",
+    (() => {
+      const frames = fs.existsSync(FRAME_LOG)
+        ? fs.readFileSync(FRAME_LOG, "utf8").split("\n").filter((line) => line.trim() !== "").map((line) => JSON.parse(line))
+        : [];
+      const last = frames.filter((frame) => frame.method === "paseo/projections").at(-1);
+      return last?.params?.sessionId === sessionId
+        && Array.isArray(last?.params?.keys)
+        && last.params.keys.length === 1
+        && last.params.keys[0] === "todos";
+    })(),
+    "no paseo/projections frame with keys:[todos]",
+  );
+  check("the goal read itself still answers", withTask.available === true && withTask.goal?.phase === "active", JSON.stringify(withTask));
+
+  script(PROJECTIONS_FILE, todosSnapshot([
+    { content: "done item", status: "completed" },
+    { content: "later item", status: "pending" },
+  ]));
+  const noInProgress = await read(agentId);
+  check(
+    "no in_progress item means no now line",
+    noInProgress.goal !== null && !("currentTask" in noInProgress.goal),
+    JSON.stringify(noInProgress.goal),
+  );
+
+  script(PROJECTIONS_FILE, todosSnapshot(null));
+  const nullTodos = await read(agentId);
+  check(
+    "a null todo projection means no now line",
+    nullTodos.goal !== null && !("currentTask" in nullTodos.goal),
+    JSON.stringify(nullTodos.goal),
+  );
+
+  // A profile without `dsh-tool-todo`: the real bridge throws its unknown-key
+  // sentence. That is a normal answer, not a failure — the goal still reads.
+  script(PROJECTIONS_FILE, { throw: "unknown or unavailable projection key: todos" });
+  const missingProjection = await read(agentId);
+  check(
+    "a profile without the todos projection still reads the goal",
+    missingProjection.available === true && missingProjection.goal !== null && !("currentTask" in missingProjection.goal),
+    JSON.stringify(missingProjection),
+  );
+
+  // A bridge older than the plugin has no `projections` method at all.
+  script(PROJECTIONS_FILE, { unknownMethod: true });
+  const oldBridge = await read(agentId);
+  check(
+    "a bridge without paseo/projections still reads the goal",
+    oldBridge.available === true && oldBridge.goal !== null && !("currentTask" in oldBridge.goal),
+    JSON.stringify(oldBridge),
+  );
+
+  // A genuine read failure is logged once and never fails the goal read.
+  script(PROJECTIONS_FILE, { throw: "the projection transport died" });
+  const failedTask = await read(agentId);
+  check(
+    "a failed todos read leaves the goal readable without the line",
+    failedTask.available === true && failedTask.goal !== null && !("currentTask" in failedTask.goal),
+    JSON.stringify(failedTask),
+  );
+  script(PROJECTIONS_FILE, undefined);
 
   // ---- 2. a blocked goal keeps its reason --------------------------------
   script(GOAL_FILE, {
