@@ -224,7 +224,7 @@ function render(props = {}) {
         goal: props.goal ?? baseGoal,
         text,
         theme,
-        compact: false,
+        compact: props.compact ?? false,
         running: props.running ?? false,
         mode: props.mode ?? "view",
         busy: props.busy ?? false,
@@ -353,6 +353,34 @@ console.log("\nthe edit page is the field in place of the row");
   assert("the now line is hidden while editing", !container.textContent.includes("正在："));
   click(byLabel(container, "取消"));
   check("cancel leaves the edit page", calls.cancelEdit, 1);
+}
+
+console.log("\nthe edit and clear pages follow the host's menu density");
+{
+  // menu-item.tsx:441's `MENU_ITEM_HEIGHT` is 40 under a finger and 28 on a
+  // pointer layout. The phone sheet must use the 40px row: the design's editing
+  // screenshot shows two 40px rows, and the first implementation hard-coded the
+  // wide 28 — the two rows collided and the sheet was shorter than the design.
+  const phone = render({ mode: "edit", draft: baseGoal.objective, compact: true });
+  for (const label of ["保存", "取消"]) {
+    const row = byLabel(phone.container, label);
+    assert(`the phone ${label} row is the host's 40px item`, /min-height:\s*40px/.test(row?.getAttribute("style") ?? ""), row?.getAttribute("style") ?? "missing");
+  }
+  const wide = render({ mode: "edit", draft: baseGoal.objective, compact: false });
+  for (const label of ["保存", "取消"]) {
+    const row = byLabel(wide.container, label);
+    assert(`the wide ${label} row is the host's 28px item`, /min-height:\s*28px/.test(row?.getAttribute("style") ?? ""), row?.getAttribute("style") ?? "missing");
+  }
+  const confirmPhone = render({ mode: "confirm", compact: true });
+  for (const label of ["清除目标", "取消"]) {
+    const row = byLabel(confirmPhone.container, label);
+    assert(`the phone clear page's ${label} row is the host's 40px item`, /min-height:\s*40px/.test(row?.getAttribute("style") ?? ""), row?.getAttribute("style") ?? "missing");
+  }
+  const confirmWide = render({ mode: "confirm", compact: false });
+  for (const label of ["清除目标", "取消"]) {
+    const row = byLabel(confirmWide.container, label);
+    assert(`the wide clear page's ${label} row is the host's 28px item`, /min-height:\s*28px/.test(row?.getAttribute("style") ?? ""), row?.getAttribute("style") ?? "missing");
+  }
 }
 
 console.log("\nsave is disabled for an empty or unchanged draft");

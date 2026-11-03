@@ -188,6 +188,7 @@ function MenuRow({
   label,
   destructive,
   disabled,
+  compact,
   theme,
   onPress,
 }: {
@@ -195,10 +196,12 @@ function MenuRow({
   label: string;
   destructive?: boolean;
   disabled?: boolean;
+  /** Phone sheet density: the host's menu item is 40px tall there, 28 on pointer layouts. */
+  compact: boolean;
   theme: PopoverTheme;
   onPress: () => void;
 }) {
-  const box = goalMenuItem(false);
+  const box = goalMenuItem(compact);
   const color = destructive === true ? theme.colors.statusDanger : theme.colors.foreground;
   const glyphColor = destructive === true ? theme.colors.statusDanger : theme.colors.foregroundMuted;
   const style = ({ hovered = false, pressed }: HoverState) => ({
@@ -391,10 +394,11 @@ export function GoalPopoverBody({
         <MenuRow
           label={text.actions.save}
           disabled={busy || !goalEditSubmittable(draft, goal.objective)}
+          compact={compact}
           theme={theme}
           onPress={onSave}
         />
-        <MenuRow label={text.actions.cancel} theme={theme} onPress={onCancelEdit} />
+        <MenuRow label={text.actions.cancel} compact={compact} theme={theme} onPress={onCancelEdit} />
         {error === undefined ? null : <Hint theme={theme} danger>{error}</Hint>}
       </View>
     );
@@ -410,10 +414,11 @@ export function GoalPopoverBody({
           label={text.actions.clearTarget}
           destructive
           disabled={busy}
+          compact={compact}
           theme={theme}
           onPress={onConfirmClear}
         />
-        <MenuRow label={text.actions.cancel} theme={theme} onPress={onCancelClear} />
+        <MenuRow label={text.actions.cancel} compact={compact} theme={theme} onPress={onCancelClear} />
         {error === undefined ? null : <Hint theme={theme} danger>{error}</Hint>}
       </View>
     );

@@ -445,8 +445,9 @@ console.log("\nthe trigger and popover wiring");
   assert("the objective row is a track row", /goalTrackRow\(compact\)/.test(popover));
   assert("the objective is one truncated line", /numberOfLines=\{1\}[\s\S]{0,400}?\{goal\.objective\}/.test(popover));
   assert("the facts line comes from the pure rule", /goalFactsLine\(goal, text\.statuses, text\.rounds\)/.test(popover));
-  // The edit and clear pages are the host's menu rows.
-  assert("the edit page uses the menu row", /goalMenuItem\(false\)/.test(popover));
+  // The edit and clear pages are the host's menu rows, at the **panel's own
+  // density**: the phone sheet's rows are 40px, not the wide layout's 28.
+  assert("the edit page uses the menu row at the panel density", /goalMenuItem\(compact\)/.test(popover));
   assert("the clear page's row is destructive", /destructive/.test(popover));
   // The old button component and the footnote are gone.
   assert("no filled-button component remains", !/function ActionButton/.test(popover));
