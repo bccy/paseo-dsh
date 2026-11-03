@@ -3150,6 +3150,51 @@ export class PaseoHarnessServer {
     }
   }
 
+  /**
+   * The current goal of one live session, including its process-local activation.
+   *
+   * `activation` (`armed` / `disarmed`) is the one field DSH's `goal` projection
+   * deliberately omits: it says whether THIS process may automatically continue
+   * the goal, and every session start resets it to `disarmed`. Without it a
+   * reopened session's `active` goal renders as "still running" while nothing
+   * continues it — the silent degradation the composer's goal pill exists to
+   * remove. The durable phase is already readable from `paseo/projections`
+   * (`keys: ['goal']`); this method exists for the field the log cannot hold.
+   *
+   * Read through the mounted `goals` service (`get(agent)`, live agents only).
+   * A missing service is an ERROR, never `{goal:null}`: the plugin must keep
+   * "this profile cannot report goals" (terminal, hide the pill) apart from "no
+   * goal is current" (also hidden, but for the opposite reason). A throwing
+   * lookup or read stays loud for the same reason.
+   *
+   * `requireSession` keeps its existing unknown-session error, and this read
+   * must not materialize one: the pill polls agents whose bridge session may not
+   * be open, and resuming each of them just to draw a label would take the
+   * session log's write lease (the exact regression `usage()` had).
+   *
+   * @param {{sessionId: string}} params - must be the caller's own session id.
+   */
+  async goal(params) {
+    const sessionId = typeof params?.sessionId === 'string' ? params.sessionId : '';
+    if (sessionId === '') throw new TypeError('paseo/goal requires a sessionId');
+    const rec = this.requireSession(sessionId);
+    let goals;
+    try {
+      goals = this.ctx.get('goals');
+    } catch (error) {
+      throw new Error(
+        `looking up DSH's goal service failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (goals === undefined) {
+      throw new Error('this DSH runtime composes no goal service');
+    }
+    // `get()` answers undefined when no goal is current — that is `{goal:null}`,
+    // a different answer from the missing service above. A throwing read (agent
+    // no longer live in the goal registry, corrupt projection) propagates.
+    return { goal: goals.get(rec.handle.agent) ?? null };
+  }
+
   /** Report the routes and models the runtime can serve, for the Paseo catalog. */
   async catalog() {
     const llm = this.ctx.get('llm');
@@ -3311,6 +3356,8 @@ export class PaseoHarnessServer {
         return this.usage(params);
       case 'paseo/jobs':
         return this.jobs(params);
+      case 'paseo/goal':
+        return this.goal(params);
       case 'paseo/presets':
         return this.presets(params);
       case 'paseo/sessions':
