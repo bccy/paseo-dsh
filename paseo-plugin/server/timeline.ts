@@ -1164,7 +1164,16 @@ export class TimelineBuilder {
         callId,
         name,
         detail,
-        metadata: toolMetadata(input, presentationMeta),
+        metadata: {
+          ...toolMetadata(input, presentationMeta),
+          // DSH's structured failure code (`HarnessError.code`, e.g.
+          // `GOAL_TOOL_AUTHORITY_REQUIRED`), carried beside the verbatim text so
+          // the client can say in words why a goal call was refused without
+          // parsing English. Only a failed row has one; the text stays the error.
+          ...(failed && isRecord(data.error) && typeof data.error.code === "string" && data.error.code !== ""
+            ? { errorCode: data.error.code }
+            : {}),
+        },
         ...(failed
           ? { status: "failed" as const, error: { message: output || "tool failed" } }
           : { status: "completed" as const, error: null }),

@@ -195,6 +195,27 @@ console.log("the two tables carry the same keys");
   }
 }
 
+console.log("the goal tools' timeline copy is covered in both languages");
+{
+  // `goalCard` is an object, so the scalar loop above skips it. Its tables must
+  // carry the same keys in both languages and every leaf must be set: a missing
+  // refusal sentence in one language would silently fall back to DSH's English.
+  const en = allText().en.goalCard;
+  const zh = allText()["zh-CN"].goalCard;
+  equal("goalCard keys match", Object.keys(en).sort(), Object.keys(zh).sort());
+  equal("goalCard.phases keys match", Object.keys(en.phases).sort(), Object.keys(zh.phases).sort());
+  equal("goalCard.phases are DSH's four phases plus disarmed", Object.keys(en.phases).sort(),
+    ["active", "blocked", "complete", "disarmed", "paused"]);
+  equal("goalCard.refusals keys match", Object.keys(en.refusals).sort(), Object.keys(zh.refusals).sort());
+  for (const [locale, table] of [["en", en], ["zh-CN", zh]]) {
+    const leaves = [table.status, table.rounds, table.reason, table.empty, ...Object.values(table.phases),
+      ...Object.values(table.refusals).flatMap((r) => [r.short, r.hint])];
+    check(`every goalCard string is set (${locale})`, leaves.every((v) => typeof v === "string" && v.trim() !== ""), JSON.stringify(leaves));
+  }
+  equal("the state row's own title (zh-CN)", allText()["zh-CN"].toolLabels.goal_state, "目标状态");
+  equal("the state row's own title (en)", allText().en.toolLabels.goal_state, "Goal status");
+}
+
 console.log("the jobs pill's copy is covered in both languages");
 {
   // The `jobs` table is an **object**, so the `scalarKeys` loop above skips it and

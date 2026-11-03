@@ -218,9 +218,9 @@ pill 的按钮走**命令注册表**而不是 steer：`paseo-plugin/server/sessi
 | 项 | 状态行（已有） | 续跑轮次行（新增） |
 |---|---|---|
 | id / callId | `tool:goal:current` / `goal:current` | `tool:goal:round:<goalId>:<round>` / `goal:round:<goalId>:<round>` |
-| name | `get_goal` | `goal_round` |
-| 文本 | 「进行中 · <目标>」（body 在 blocked 时追加原因） | 行头「目标续跑 · 第 N 轮」/「Goal round · N」 |
-| 图标 | `Target`（name 映射） | `Target`（`goal_round` 映射） |
+| name | `goal_state`（插件自有名） | `goal_round` |
+| 文本 | 行头「目标状态 · 进行中 · <目标>」/「Goal status · …」（body 在 blocked 时追加原因） | 行头「目标续跑 · 第 N 轮」/「Goal round · N」 |
+| 图标 | `Target`（`goal_state` 映射） | `Target`（`goal_round` 映射） |
 | 交互 | 无 | 无；不是 `user_message`、无撤回令牌 |
 
 - 形状复用 `tool_call` + `plain_text`；轮次行 **不点名 `icon` 键**，客户端用工具名映射补图标
@@ -239,6 +239,33 @@ pill 的按钮走**命令注册表**而不是 steer：`paseo-plugin/server/sessi
   （`paseo-plugin/server/session.ts:1201-1219,3190-3203`），所以重开后行逐字节相同。
 - **不**渲染成 `user_message`：不能被撤回选中、不冒充人类提问；行没有 body，`<goal_round>`
   提示原文不显示。
+- **状态行不借用模型工具名。** 它以前叫 `get_goal`（只为拿 Target 图标），于是标题也成了
+  「查看目标」，与模型真实的 `get_goal` 调用同名，读起来像模型多查了一次目标。现在是插件
+  自有名 `goal_state`，标题「目标状态」（FIELD-NOTES 第 90 条）。
+- **「固定 id」只在同一回合内原地更新。** 宿主按 `turnId + callId` 识别 tool_call
+  （`@getpaseo/app` `types/stream.ts` 的 `agentToolCallIdentity`，服务端
+  `timeline-projection.ts` 的合并也要求同 `turnId`）。`/goal <目标>` 在回合外建目标、续跑轮里
+  `update_goal complete`，于是时间线上是两条状态行：开头「进行中」、结尾「已完成」。
+
+## 时间线：模型的 goal 工具行
+
+`create_goal` / `get_goal` / `update_goal` 是 DSH 的模型工具，结果是 `JSON.stringify` 的
+`{goal:{id,revision,objective,phase,roundsStarted,maxGoalRounds,blockedReason?},activation}`
+（`dsh-tool-goal` 的 `GOAL_OUTPUT`）。插件照 DSH 自己的 `goalDetail` 画（`dsh-client-ui-tool`）：
+
+- 成功：行头右半是 objective；展开是字段卡「状态 / 执行轮次」，受阻时加「受阻原因」；
+  `active + disarmed` 读作「等待继续」，`{goal:null}` 读作「没有目标」。解析在客户端
+  （`client/tool-call-data.ts` 的 `parseGoalResult`），服务端协议不变，重放旧会话同样生效。
+- 形状不对（坏 JSON、DSH 新增的 phase、缺字段）不出卡，原始结果照旧作为 body，不吞内容。
+- 失败：不出卡（DSH 也是 `isError → null`）。行仍是 failed、图标与行头仍红。服务端把 DSH 的
+  `tool/result.data.error.code` 放到 `metadata.errorCode`；`client/locale.ts` 的
+  `goalCard.refusals` 认识的码，行头红字换成中文短句（如「已拒绝：续跑轮不能创建或修改目标」
+  「已拒绝：参数组合不合法」），展开先是一句解释 + 错误码，再是 DSH 原文与调用参数。
+  不认识的码、没有码的旧数据：行头保持 DSH 原文首行。
+
+续跑轮里出现这两类红行**不是插件问题**：`/goal` 在回合外执行，续跑轮里没有人类消息，DSH
+按设计拒绝模型 `create_goal`；模型给 `update_goal complete` 抄填了当前 objective/轮数上限，
+DSH 判参数非法。两者都在写入前拒绝，目标不受影响（FIELD-NOTES 第 90 条）。
 - 为什么必须补这一行：goal 轮次的提示是 `user/message` + `source.kind='goal'`，而插件实时路径
   只对 `undefined|'user'` 出用户行（`paseo-plugin/server/session.ts:330,1515-1523`）——这是
   「不冒充人类提问」的正确取舍，但没有任何替代行，用户会看到一个**凭空开始的回合**

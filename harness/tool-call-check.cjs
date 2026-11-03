@@ -860,13 +860,22 @@ console.log("the goal timeline rows draw the goal tools' own glyph");
   // now borrows the tool's own (the second gap the name map fills, after
   // `unknown`), which is what puts all three on the same symbol.
   setLocale("zh-CN");
+  // The state row is the plugin's own `goal_state`, not the model's `get_goal`:
+  // borrowing that name also borrowed its title, so the row read 「查看目标」 like
+  // a real call. Same glyph, its own title.
   const stateRow = {
-    name: "get_goal",
+    name: "goal_state",
     status: "completed",
     detail: { type: "plain_text", label: "进行中 · 目标", text: "进行中 · 目标" },
   };
   equal("the goal state row draws Target", toolIcon(stateRow.name, stateRow.detail), "Target");
   equal("and its rendered data agrees", toolCallData(stateRow, "complete").icon, "Target");
+  equal("the goal state row is titled 目标状态", toolCallData(stateRow, "complete").label, "目标状态");
+  equal(
+    "which is not the model's get_goal title",
+    toolCallData({ name: "get_goal", status: "completed", detail: { type: "unknown", input: {}, output: null } }, "complete").label,
+    "查看目标",
+  );
 
   const roundRow = {
     name: "goal_round",

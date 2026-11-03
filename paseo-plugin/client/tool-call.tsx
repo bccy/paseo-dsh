@@ -42,7 +42,7 @@ import {
 } from "react-native";
 import { shouldPulse, useRowPulse } from "./newest";
 import { PASEO_MARK_ICON } from "./paseo-mark";
-import { blockCopy, type ReadBlockData, type SearchBlockData, type ToolCallData, type WebBlockData } from "./tool-call-data";
+import { blockCopy, type GoalBlockData, type ReadBlockData, type SearchBlockData, type ToolCallData, type WebBlockData } from "./tool-call-data";
 import { TextShimmer } from "./text-shimmer";
 import {
   BODY_INDENT,
@@ -61,7 +61,16 @@ import {
   cardHeadStyle,
   cardHeadTitleTextStyle,
   cardStyle,
+  CODE_FONT_FAMILY,
+  CODE_FONT_SIZE,
   CODE_MAX_HEIGHT,
+  GOAL_CARD_LINE_HEIGHT,
+  GOAL_CARD_PADDING_HORIZONTAL,
+  GOAL_CARD_PADDING_VERTICAL,
+  GOAL_FIELD_COLUMN_GAP,
+  GOAL_FIELD_LABEL_WIDTH,
+  GOAL_FIELD_ROW_GAP,
+  GOAL_FIELDS_MARGIN_TOP,
   codeRegionStyle,
   codeTextStyle,
   commandRegionStyle,
@@ -705,6 +714,21 @@ function buildStyles(colors: TokenColors, hairline: number) {
       fontSize: ROW_FONT_SIZE,
       lineHeight: ROW_LINE_HEIGHT,
     },
+    // The plain-language reason above a known refusal, and DSH's code beside it.
+    hintText: { color: colors.foregroundMuted, fontSize: ROW_FONT_SIZE, lineHeight: GOAL_CARD_LINE_HEIGHT },
+    hintCode: { color: colors.foregroundMuted, fontSize: CODE_FONT_SIZE, fontFamily: CODE_FONT_FAMILY },
+    // DSH's goal details card (see `GOAL_CARD_*` in `./tokens`).
+    goalItem: { paddingVertical: GOAL_CARD_PADDING_VERTICAL, paddingHorizontal: GOAL_CARD_PADDING_HORIZONTAL },
+    goalTitle: { color: colors.foreground, fontSize: ROW_FONT_SIZE, lineHeight: GOAL_CARD_LINE_HEIGHT },
+    goalFields: { marginTop: GOAL_FIELDS_MARGIN_TOP, gap: GOAL_FIELD_ROW_GAP },
+    goalField: { flexDirection: "row" as const, gap: GOAL_FIELD_COLUMN_GAP },
+    goalLabel: {
+      color: colors.foregroundMuted,
+      fontSize: ROW_FONT_SIZE,
+      lineHeight: GOAL_CARD_LINE_HEIGHT,
+      width: GOAL_FIELD_LABEL_WIDTH,
+    },
+    goalValue: { color: colors.foreground, fontSize: ROW_FONT_SIZE, lineHeight: GOAL_CARD_LINE_HEIGHT, flex: 1, minWidth: 0 },
     // RN has no hairline in a plain object; `StyleSheet.hairlineWidth` is the
     // device's own (0.5 at 1x/2x), which is what DSH's `.5px` means here.
     card: cardStyle(colors, hairline),
@@ -800,6 +824,39 @@ function buildStyles(colors: TokenColors, hairline: number) {
 
 type BlockStyles = ReturnType<typeof buildStyles>;
 
+/**
+ * The goal tools' result card: DSH's `DetailsRow` for `create_goal` / `get_goal`
+ * / `update_goal` — the objective, then 状态 / 执行轮次 (/ 受阻原因) as a
+ * label | value list. `{goal: null}` is DSH's 「没有目标」 line.
+ */
+function GoalBlockView({ data, summary, styles }: { data: GoalBlockData; summary: string; styles: BlockStyles }) {
+  return (
+    <View style={styles.card}>
+      <View style={styles.goalItem}>
+        {data.empty ? (
+          <Text style={styles.goalValue}>{summary}</Text>
+        ) : (
+          <>
+            <Text style={styles.goalTitle} selectable>
+              {data.objective}
+            </Text>
+            <View style={styles.goalFields}>
+              {data.fields.map((field) => (
+                <View key={field.label} style={styles.goalField}>
+                  <Text style={styles.goalLabel}>{field.label}</Text>
+                  <Text style={styles.goalValue} selectable>
+                    {field.value}
+                  </Text>
+                </View>
+              ))}
+            </View>
+          </>
+        )}
+      </View>
+    </View>
+  );
+}
+
 /* -------------------------------------------------------------------------- */
 /* Row                                                                        */
 /* -------------------------------------------------------------------------- */
@@ -826,7 +883,9 @@ export function InlineToolCall({
   // reason fits; the expansion carries the whole text.
   const errorLine = data.error === "" ? "" : data.error.split("\n")[0];
   const errorHeadline = data.failed && errorLine !== "";
-  const headSummary = errorHeadline ? errorLine : data.summary;
+  // A refusal DSH gave a known code for reads in words (`goalCard.refusals`);
+  // DSH's verbatim text is still the first thing in the expanded block below.
+  const headSummary = errorHeadline ? (data.errorShort !== "" ? data.errorShort : errorLine) : data.summary;
   // Once expanded the block carries the subject in full, so a row whose title
   // *is* that subject does not repeat a compact copy of it above.
   const showSummary = headSummary !== "" && !(expanded && !data.titled && data.headline !== "");
@@ -941,11 +1000,20 @@ export function InlineToolCall({
               `edit` keeps only what it *would* have written in its block, so
               this is where the error text itself is readable. It is skipped
               when the block already prints the same text (see `errorBlock`). */}
+          {/* A known refusal opens with one plain sentence and DSH's code; the
+              verbatim reason follows, unchanged, so nothing DSH said is lost. */}
+          {data.errorHint !== "" ? (
+            <Text style={styles.hintText}>
+              {data.errorHint}
+              <Text style={styles.hintCode}>{`  ${data.errorCode}`}</Text>
+            </Text>
+          ) : null}
           {errorBlock !== "" ? (
             <Text style={styles.errorText} selectable>
               {errorBlock}
             </Text>
           ) : null}
+          {data.goal !== null ? <GoalBlockView data={data.goal} summary={data.summary} styles={styles} /> : null}
           {/* One card per expanded block, the way DSH's TerminalBlock, DiffBlock
               and ReadBlock all are: same radius, same hairline, same surface.
               `data.kind` picks it; a block whose meta did not parse has no

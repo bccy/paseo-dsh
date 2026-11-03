@@ -180,10 +180,15 @@ export class ActivityTimeline {
     }
     // A goal phase is durable state, not an in-flight tool. turn/end must never
     // cancel an active goal. callId is session-scoped in Paseo, as is this builder.
-    // No `icon` key: the client draws a `plain_text` row that names no glyph with
-    // the tool's own (`get_goal` → Target), so the state row, the round row above
-    // and the composer's goal pill share one symbol.
-    return { type: "tool_call", id: "tool:goal:current", callId: "goal:current", name: "get_goal",
+    //
+    // The name is the plugin's own `goal_state`, never a DSH tool name. It used to
+    // borrow `get_goal` for its Target glyph, and so it also borrowed that tool's
+    // title: the row read 「查看目标」 exactly like the model's real `get_goal`
+    // call a few rows below, as if a read had happened that never did. The client
+    // maps `goal_state` to its own label (「目标状态」) and to Target, the same way
+    // it maps `goal_round`; no `icon` key, so the state row, the round row and
+    // the composer's goal pill still share one symbol.
+    return { type: "tool_call", id: "tool:goal:current", callId: "goal:current", name: "goal_state",
       status: "completed", error: null, detail: { type: "plain_text", label: summary, text: body },
       metadata: { locale: LOCALE } };
   }

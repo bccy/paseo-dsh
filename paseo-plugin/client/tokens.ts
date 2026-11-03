@@ -1332,3 +1332,22 @@ export function terminalOutputScrollStyle(): { maxHeight: number } {
 }
 /** `.bodyScroll { max-height: 260px }` on the code-tool card. */
 export const CODE_MAX_HEIGHT = 260;
+
+/* -------------------------------------------------------------------------- */
+/* Goal result card                                                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * DSH's details card for the goal tools (`dsh-client-ui-tool`'s
+ * `ToolDetails.module.css`): `.item { padding: 10px 14px }`, a title line, then
+ * `.fields` 6px below it as a `5.5em | 1fr` grid with a 12px column gap and 4px
+ * between rows; the label is the caption colour. At the row's 13px that 5.5em is
+ * 71.5px, rounded to 72.
+ */
+export const GOAL_CARD_PADDING_VERTICAL = 10;
+export const GOAL_CARD_PADDING_HORIZONTAL = 14;
+export const GOAL_FIELDS_MARGIN_TOP = 6;
+export const GOAL_FIELD_ROW_GAP = 4;
+export const GOAL_FIELD_COLUMN_GAP = 12;
+export const GOAL_FIELD_LABEL_WIDTH = 72;
+export const GOAL_CARD_LINE_HEIGHT = 20;
