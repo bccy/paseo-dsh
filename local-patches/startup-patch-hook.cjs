@@ -303,7 +303,7 @@ if (!existsSync(patchScript)) {
   if (result.error !== undefined) {
     log(`failed to spawn patch script: ${result.error.message}`);
   } else if (code === 0) {
-    // The script prints "already patched" / "applied" / "patched-on-new-upstream";
+    // The script prints "already patched" / "applied" / "rebuilt" (turnId only);
     // record the line so the log shows which path was taken on each start.
     log(`ok: ${stdout.split("\n").pop() ?? "(no output)"}`);
   } else {
