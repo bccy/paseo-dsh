@@ -56,10 +56,13 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon fork 出的 p
 
 ### 改之前先读
 
-- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 八十余条真实缺陷（编号到 84，含 `b`/`c`
+- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 八十余条真实缺陷（编号到 87，含 `b`/`c`
   补记与 DSH 升版教训；历史段落里 22–25、46–47 有重号，引用旧条目时带标题）。里面有整整一类错误叫
   **静默降级**（把不知道的东西当成成功、把不支持的能力悄悄丢掉）。改动前先看一遍，
   避免重新发明这些 bug。
+- [docs/GOAL.md](./docs/GOAL.md) — 目标（goal）在 Paseo 中怎么工作：数据源、pill 的状态与
+  按钮、运行中发消息的语义（steer 不打断、停止会暂停）、重开会话后的 disarm 与恢复、
+  运行中手打 `/goal` 会被当文本的限制。改 goal 相关代码前先看。
 - [docs/ADOPTION.md](./docs/ADOPTION.md) 第 4 节 — 教训按主题归纳。
 - [docs/FULL-AUDIT-20261020.md](./docs/FULL-AUDIT-20261020.md) — 2026-10-20 全量审查：
   8 个 P1 的成因与修法、有意偏差清单、未修项与待用户决定项。改动前先看有没有踩在同一处。

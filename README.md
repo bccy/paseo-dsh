@@ -24,7 +24,8 @@ DSH 侧是一个 profile bundle。
 | 人设预设（Preset） | ❌ | ✅ profile 挂了 agent-preset registry 时，composer 出现 **Preset** 下拉（建会话时选、首回合后锁定） |
 | 会话恢复 / 导入 | ❌ 无历史、无法导入 | ✅ 重开按 Paseo 的 `history: replay` 回放历史；**导入** DSH 原生会话（`session.list`，从 `~/.dsh/sessions` 列举） |
 | 后台任务（jobs） | — | ✅ composer 的 pill 显示 DSH 后台任务：只在有运行中/停止中的任务时显示运行数量，全部结束即隐藏；点开看每个任务的明细 |
-| 目标 / 工作流时间线 | — | ✅ `goal/change` 与 `tool-workflow/*` 事件按工具行渲染；后台工作流跨回合仍显示运行中 |
+| 目标（goal）pill | — | ✅ composer 的 pill 显示 DSH 目标，label 按状态是「目标 3/10 / 目标未在续跑 / 目标已暂停 / 目标受阻」；点开看目标全文、状态、已用轮数/上限、受阻原因，可暂停 / 继续 / 编辑 / 清除；重开会话后自动续跑会停，pill 直接给出恢复入口 |
+| 目标 / 工作流时间线 | — | ✅ `goal/change` 与 `tool-workflow/*` 事件按工具行渲染；目标自动续跑的每个轮次也各占一行（「目标续跑 · 第 N 轮」）；后台工作流跨回合仍显示运行中 |
 | 工具审批卡 | — | ✅ DSH 的 `approval/request` 转成 Paseo 审批卡（允许一次 / 拒绝） |
 | 会话级系统提示 | — | ✅ 每个会话可带独立的 system prompt（profile 需挂 `systemPrompt` 服务） |
 | 终止后续聊 | — | ✅ 只取消当前回合，会话保留 |
@@ -514,6 +515,8 @@ patch 是本插件自己的发布计数；完整提交记录见
 
 - [docs/ADOPTION.md](docs/ADOPTION.md) — 改造指南：改动点、配置方法、踩坑清单
 - [docs/FIELD-NOTES.md](docs/FIELD-NOTES.md) — 七十余条真实缺陷的症状 → 根因 → 修法
+- [docs/GOAL.md](docs/GOAL.md) — 目标（goal）在 Paseo 中怎么工作：数据源、pill 与按钮、
+  运行中发消息、重开后的恢复
 - [AGENTS.md](AGENTS.md) — 给 AI Agent 的说明（Codex 等会自动读取）。不管你是被叫来
   装它、还是被叫来改它，先看这个
 

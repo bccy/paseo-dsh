@@ -27,7 +27,8 @@ below.
 | Agent presets | ❌ | ✅ when the profile mounts the agent-preset registry, a **Preset** dropdown appears (chosen at session creation, locked after the first turn) |
 | Session resume / import | ❌ no history, no import | ✅ reopening replays history through Paseo's `history: replay`; **import** native DSH sessions (`session.list`, read from `~/.dsh/sessions`) |
 | Background jobs | — | ✅ a composer pill shows DSH background jobs only while some are running/stopping: it shows the live count and hides once every job has finished; expandable to each job |
-| Goal / workflow timeline | — | ✅ `goal/change` and `tool-workflow/*` events render as tool rows; a background workflow keeps its running state across turns |
+| Goal pill | — | ✅ a composer pill shows the DSH goal; its label reads "Goal 3/10 / Goal not running / Goal paused / Goal blocked", and the popover has the full objective, state, rounds used and cap, blocked reason, with pause / resume / edit / clear; auto-continue stops after a reopen and the pill offers the resume entry point |
+| Goal / workflow timeline | — | ✅ `goal/change` and `tool-workflow/*` events render as tool rows; each automatic goal round gets its own compact row ("Goal round · N"); a background workflow keeps its running state across turns |
 | Tool approval cards | — | ✅ DSH's `approval/request` becomes a Paseo approval card (allow once / reject) |
 | Session-level system prompt | — | ✅ each session may carry its own system prompt (the profile must mount the `systemPrompt` service) |
 | Stop and keep chatting | — | ✅ cancels the current turn only; the session survives |
@@ -605,6 +606,8 @@ history is on
 
 - [docs/ADOPTION.md](docs/ADOPTION.md) — adoption guide: what changes, how to configure it, the pitfall list
 - [docs/FIELD-NOTES.md](docs/FIELD-NOTES.md) — seventy-odd real defects: symptom → root cause → fix
+- [docs/GOAL.md](docs/GOAL.md) — how DSH goals work inside Paseo: data source, the pill and its
+  buttons, sending messages while a goal runs, recovery after a reopen
 - [AGENTS.md](AGENTS.md) — notes for AI agents (Codex and others read it automatically). Read it first whether you were asked to install or to change this repository (written in Chinese)
 
 ## Contact

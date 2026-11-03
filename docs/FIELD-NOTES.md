@@ -2910,6 +2910,97 @@ settling (R4)」；变异（`settleAbandoned` 换回一次认领 + `Promise.all`
 
 ---
 
+## 第二十轮：目标（goal）接入（2026-11-03）
+
+这一轮把 DSH 的 goal 接进 Paseo 的可见面（composer pill + 时间线轮次行）。三条都不是
+「跑不起来」，而是「状态看不见 / 入口走错路」——和 FIELD-NOTES 第 84 条 canary 同类：
+能力在，用户不知道。**条目里的 RPC 名、脚本名与文案已按合并后的代码回填**（设计见
+[GOAL.md](./GOAL.md)；文中 survey §X 指开发期摸底文档，不随仓库分发）。
+
+### 85. 运行中手打 `/goal` 走 steer 被当成普通文本（GN-01）
+
+**症状**：目标轮次运行中在 composer 里输入 `/goal pause` 发送，命令没有执行——它作为一条人类
+消息插进了当前轮次（模型看到 "pause" 字样），目标状态不变。**源码推断，未在 App 实测**。
+
+**根因**：宿主对 out-of-band 命令的拦截依赖 provider 的 `tryHandleOutOfBand`
+（Paseo `packages/server/src/server/agent/agent-prompt.ts:114`、`agent-manager.ts:2635-2637`），
+而插件 provider 没有实现该方法；运行中的 steer 路径把 prompt 一律映射成普通 message
+（`plugin-provider.ts:1219-1223`），只有空闲路径才用 `mapPromptInput` 把 `/goal ...` 识别成
+command（`:1193-1198,1768-1784`）。**同一串 `/goal` 在两条路径上是两种东西。**
+
+**修法**：不拦手打命令，控制面放到 pill 按钮：插件 RPC `goal.control` →
+`server/session.ts:1067-1092` 的 `controlGoal` → 桥 `paseo/command/run` → DSH
+`commands.execute`。四条控制命令经这条路径全部被接受、失败以 `error` 回执 + DSH 原文返回
+（survey §F3 实测）；按钮集合由 `goalActionsFor` 决定（active+armed 给「暂停」，其余状态给
+「继续」，`client/goal-polling.ts:202-206`）。文档口径写进 [GOAL.md](./GOAL.md)「已知限制」，
+pill popover 底部也提示运行中发消息的真实语义。**真机点按钮的验收待 FINAL。**
+
+**检查**：`goal-pill-check` 131 条覆盖 control 成功 / DSH `error` 回执 / 空 edit 拒绝、
+按钮集合与二次确认；`goal-server-check` 31 条断言命令经 `paseo/command/run`（`name:"goal"`）
+下发；运行中 steer 不产生 `goal/change`（survey §F1 实测）。
+
+**教训**：命令语义有路径依赖。**不要把「用户会手打命令」当控制面**；能力只在一条路径上成立
+时，要么改入口，要么把入口藏起来。
+
+### 86. 重开会话 activation 静默 disarm：持久投影会把「已停」显示成「进行中」（GN-02）
+
+**症状**：重开会话后时间线仍显示目标「进行中」，但自动续跑已经停了——用户以为还在自动跑，
+其实永远不会再起轮次。实测：关闭时只有人类回合在跑、goal 为 active → 重开 `/goal show` 是
+`Status: active / Activation: disarmed`（survey §F5）。
+
+**根因**：activation 是进程本地状态，任何 session-start 边都 disarm
+（`@deepseek-ai/dsh-goal/README.md:70-72,99`）；而 DSH 的 `goal` 会话投影**刻意不含 activation**
+（`@deepseek-ai/dsh-goal/lib/types/types.d.ts:84-89`）。Paseo 原来只读投影与时间线行，看到的
+永远是 durable phase——**只同步持久状态会把「功能已停止」显示成「正常运行」**。
+
+**修法**：桥新增 `paseo/goal`（`dsh-bridge/lib/server.js:3177-3201`）读 live agent 的
+`GoalView`（`ctx.goals.get(agent)`，`@deepseek-ai/dsh-goal/lib/index.js:611-616`）；插件把它
+缩成只带绘制字段的 `GoalState` 经 `goal.current` 下发（`server/provider.ts:2116-2170`）。
+pill 在 active+disarmed 时显示「目标未在续跑」+「继续」；语气色落在 popover 状态行（宿主
+`PluginButton.label` 只有文字、没有颜色通道）；终态码 `bridge_too_old`/`goal_unavailable`
+直接移除 pill，瞬时错误保持上次状态。重开后 paused / active+disarmed 都能一键 resume
+（survey §F3/F5 实测）。
+
+**检查**：`goal-bridge-check` 15 条断言有目标/无目标/`goals` 未挂载/会话不存在/不物化会话；
+`goal-pill-check` 131 条按 activation 分支断言可见性与 label；`goal-server-check` 31 条钉住
+四码分级与跨层文案。
+
+**补记（撤回 × goal）**：撤回也会走这条「取消 → 持久 pause」路径——运行中撤回等同于点停止，
+目标转 `paused + disarmed`；已暂停的目标撤回后不变。实测见 [GOAL.md](./GOAL.md)「撤回与
+goal」（FINAL-verify §6，桥路径；App UI 层未验证）。
+
+**教训**：持久状态与进程本地状态要分开建模。**静默降级往往不是数据错，而是只同步了一半**；
+补 UI 前先确认「用户看到的那个状态」是不是真源。
+
+### 87. goal 轮次 user/message 被丢弃：回合凭空开始（GN-03）
+
+**症状**：目标自动续跑开始时，Paseo 时间线里出现一个**没有用户提问**的 agent 回合——整会话
+`user_message` 行只有人类那条（survey §C 实测 PASS），用户不知道模型为什么在说话。
+
+**根因**：goal 轮次提示以 `user/message` + `source.kind='goal'` 进历史
+（`@deepseek-ai/dsh-goal/lib/types/domain.d.ts:34-40`）；插件实时路径只对 `undefined|'user'`
+出用户行（`paseo-plugin/server/session.ts:330,1515-1523`）、重放只认 `user|paseo`
+（`:335-365`）——这是「不冒充人类提问」的正确取舍，但**没有任何替代行**，于是回合边界丢了。
+
+**修法**：为每个 goal 轮次产出一行紧凑状态行（`tool_call` + `plain_text`，id
+`tool:goal:round:<goalId>:<round>`、name `goal_round`，行头「目标续跑 · 第 N 轮」/
+「Goal round · N」），实时、根会话重放、子会话重放同 id 同文本
+（`server/activity-timeline.ts:135-154`、`server/session.ts:1201-1219,3190-3203`）；不渲染成
+`user_message`（不能被撤回选中、不冒充人类提问），行没有 body，`<goal_round>` 原文不显示。
+**既有 goal 状态行的图标同时从 Sparkles 改为 Target**（去掉显式 `icon: "sparkles"`，让两条行
+都走工具名映射），这是可见变化，与「goal 家族 → Target」的既有意图一致。文档口径写进
+[GOAL.md](./GOAL.md)「时间线」。
+
+**检查**：`goal-timeline-check` 6 组断言实时/重放深相等、无 `user_message` 行、无
+`<goal_round>` 原文、子会话不丢行；`tool-call-check` 397 条钉住两条 goal 行都解析出 `Target`
+且其余 `plain_text` 行图标不变；`timeline-check` 230（+17）、`p003-timeline-check` 9（+1）
+同步覆盖。
+
+**教训**：丢弃一类事件前先问它是不是**回合边界**。「不显示成用户消息」和「完全不显示」是
+两回事——前者是取舍，后者是让用户面对一个无法解释的回合。
+
+---
+
 ## 关于"哪条路由能用"
 
 这份记录里刻意不提任何具体的 provider、模型或端点——**你的路由和模型完全由你的
