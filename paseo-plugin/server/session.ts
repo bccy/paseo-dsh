@@ -85,7 +85,22 @@ function historyTurnId(turn: unknown, seed: number): string {
   }
   return `turn:history:seq:${seed}`;
 }
-import { UI, commandCopy, presetLabel, skillDescription } from "./locale";
+import { LOCALE, UI, commandCopy, presetLabel, skillDescription } from "./locale";
+
+/**
+ * Suffix on a composer preset option the registry reported as unusable.
+ *
+ * A preset whose plugins failed to mount is still listed by the registry, so it
+ * would otherwise be offered as a working choice. Selecting it is refused (the
+ * bridge throws on `broken`), and without this mark the only feedback would be
+ * the pick snapping back. The mark is localized next to the label it decorates:
+ * `presetLabel` returns DSH's own wording in the active locale, so an English
+ * label must not gain a Chinese suffix.
+ *
+ * It lives here rather than in `locale.ts` because that table's `settings` block
+ * holds whole strings, not per-option decorators.
+ */
+const PRESET_UNAVAILABLE_MARK = LOCALE === "zh-CN" ? "（不可用）" : " (unavailable)";
 
 /**
  * Modes Paseo offers in the composer. `plan` drives DSH's plan-mode service.
@@ -847,7 +862,10 @@ export class DshSession {
       value: preset.id,
       // DSH reports the id; the display name comes from DSH's own wording for its
       // built-in presets (locale.ts), so the app names them like the web UI does.
-      label: presetLabel(preset.id, preset.name),
+      // `broken` carries the registry's reason for a preset it can list but not
+      // compose; the mark keeps the composer from offering it as a working pick.
+      label: presetLabel(preset.id, preset.name)
+        + (preset.broken === undefined ? "" : PRESET_UNAVAILABLE_MARK),
     }));
   }
 
@@ -1582,6 +1600,42 @@ export class DshSession {
     });
   }
 
+  /**
+   * Surface a refused preset switch on the timeline.
+   *
+   * Every refusal on the real path throws, so this is reached from the caller's
+   * `catch`: the bridge's `resolvePreset` throws for a preset the registry
+   * reports `broken`, and the registry's `select` throws `agent-preset/locked`
+   * once the session has started. The session keeps the preset it was running,
+   * the provider re-emits `session.config`, and the composer snaps back — so
+   * without this notice the snap-back is the user's only feedback and the picker
+   * looks broken rather than refused.
+   *
+   * Severity is `error`: the user asked for a change and did not get it, which
+   * is stronger than the `warning` used for the open-time "preset not applied"
+   * report (there the session still opens, and the preset was a saved default
+   * rather than a live pick).
+   *
+   * @param requested - the preset id the user picked.
+   * @param current - the preset the session still runs, or `null` when the
+   *   profile exposes no readable preset catalog.
+   * @param reason - the runtime's message, shown verbatim.
+   */
+  #noticePresetChangeRejected(requested: string, current: string | null, reason: string): void {
+    this.#options.emit({
+      type: "session.notice",
+      sessionId: this.id,
+      notice: {
+        id: `preset-${String(Date.now())}`,
+        severity: "error",
+        title: "切换预设失败",
+        description: current === null
+          ? `无法把预设切换为「${requested}」（${reason}）；本会话按当前预设运行。`
+          : `无法把预设切换为「${requested}」（${reason}）；本会话仍使用预设「${current}」。`,
+      },
+    });
+  }
+
   /** Drop held frames of a child that will not be opened. */
   #dropBufferedChild(nativeId: string): void {
     this.#pendingOpened = this.#pendingOpened.filter((payload) => payload.sessionId !== nativeId);
@@ -1944,13 +1998,33 @@ export class DshSession {
       requestedPreset !== this.#preset
     ) {
       // A preset is a creation-time choice; DSH refuses the change once the
-      // session's first turn has started. On refusal keep the real value and log
-      // it — the caller re-emits config, so the composer snaps back.
+      // session's first turn has started. On refusal keep the real value and
+      // report it: the caller re-emits config, so the composer snaps back, and a
+      // silent snap-back reads as a broken picker rather than a refusal.
+      //
+      // Every refusal on the real path throws, so the catch below is the whole
+      // detection story — there is no "succeeds but keeps the old value" shape to
+      // compare a receipt against. `resolvePreset` throws for a preset the
+      // registry reports `broken` (`dsh-bridge/lib/server.js:1608-1610`) and the
+      // registry's `select` throws `agent-preset/locked` once the session has
+      // started (`dsh-agent-preset-registry/lib/index.js:753`); on success the
+      // receipt is the requested id by construction, because `setPreset` records
+      // `applied ?? resolved` and `currentPreset` reads that record first
+      // (`server.js:1666-1667`). If the bridge ever changes to a silent refusal
+      // (a receipt naming the old preset instead of a throw), a receipt
+      // comparison has to be added back here.
+      //
+      // Only a live session reports. The provider applies a *saved* preset
+      // through this same method before `session.ready`, then reads the value
+      // back and raises its own open warning when they differ; announcing here
+      // as well would put two notices on the timeline for one refusal.
       try {
         const applied = await process.setConfig(this.#dshSessionId, { preset: requestedPreset });
         this.#preset = applied.preset ?? requestedPreset;
       } catch (error) {
-        this.#options.log(`preset change rejected: ${messageOf(error)}`);
+        const message = messageOf(error);
+        this.#options.log(`preset change rejected: ${message}`);
+        if (this.#rootReady) this.#noticePresetChangeRejected(requestedPreset, this.#preset, message);
       }
     }
 
