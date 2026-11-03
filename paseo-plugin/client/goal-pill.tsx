@@ -45,6 +45,7 @@ import { Text, View } from "react-native";
 import { goalControl, goalCurrent, type GoalAction, type GoalState } from "../shared/goal";
 import { GoalPopoverBody } from "./goal-popover";
 import {
+  clearConfirmStep,
   createGoalPoller,
   goalIconColorToken,
   goalPillPresentation,
@@ -230,9 +231,8 @@ function makeGoalPopover(
 
     const onAction = (action: GoalAction): void => {
       if (action === "clear") {
-        // The first click only arms; the label does not change (so the row does
-        // not jump) — the button turns red instead.
-        if (!clearArmed) {
+        // The first click only arms; the row becomes its confirmation state.
+        if (clearConfirmStep(clearArmed) === "arm") {
           setClearArmed(true);
           return;
         }
@@ -241,10 +241,25 @@ function makeGoalPopover(
       }
       setClearArmed(false);
       if (action === "edit") {
-        setEditing((open) => !open);
+        if (editing) {
+          setEditing(false);
+          return;
+        }
+        // Pre-fill with the full objective: the header shows only one truncated
+        // line, so this is where the whole text becomes visible/editable.
+        setDraft(goal.objective);
+        setEditing(true);
         return;
       }
       void run(action);
+    };
+
+    const onCancelEdit = (): void => {
+      setEditing(false);
+    };
+
+    const onCancelClear = (): void => {
+      setClearArmed(false);
     };
 
     const submitEdit = (): void => {
@@ -266,6 +281,8 @@ function makeGoalPopover(
         onAction={onAction}
         onChangeDraft={setDraft}
         onSubmitEdit={submitEdit}
+        onCancelEdit={onCancelEdit}
+        onCancelClear={onCancelClear}
       />
     );
   }

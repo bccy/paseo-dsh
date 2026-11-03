@@ -40,7 +40,6 @@ import {
   type PollRemoveReason,
   type PollViewState,
 } from "./agent-polling";
-import { relativeLuminance } from "./jobs-popover-layout";
 import {
   isTerminalGoalErrorCode,
   type GoalAction,
@@ -185,119 +184,14 @@ export function goalPillPresentation(answer: {
 }
 
 /* -------------------------------------------------------------------------- */
-/* The popover's action row                                                    */
+/* The action rows (Paseo row style, not buttons)                              */
 /* -------------------------------------------------------------------------- */
 
 /**
- * The gap between two action buttons. = the host's form-footer gap
- * (`pair-link-modal.tsx`: `gap: theme.spacing[3]` = 12).
- */
-export const GOAL_BUTTON_GAP = 12;
-
-/** The geometry of one action button, copied from the host's Button contract. */
-export interface GoalButtonGeometry {
-  /** The control's min height (`CONTROL_HEIGHTS`). */
-  readonly height: number;
-  /** Label font size (`theme.fontSize.base`). */
-  readonly fontSize: number;
-  /** Corner radius (`theme.borderRadius.xl` / `2xl`). */
-  readonly borderRadius: number;
-  /** Horizontal padding (`theme.spacing[3]` / `spacing[4]`). */
-  readonly paddingHorizontal: number;
-  /** Gap between buttons. */
-  readonly gap: number;
-}
-
-/**
- * The button geometry for one layout.
+ * The label for one action row.
  *
- * **The host's own two sizes**, not invented: `control-geometry.ts` defines
- * `buttonSm = { minHeight: 32, paddingHorizontal: spacing[3]=12, borderRadius:
- * xl=12 }` and `buttonMd = { minHeight: 44, paddingHorizontal: spacing[4]=16,
- * borderRadius: 2xl=16 }`, with `fontSize.base = 14` for both. The wide popover
- * uses `sm` (pointer precision is enough); the phone's bottom sheet uses `md`
- * so the touch target meets the 44px floor. A plugin cannot import those
- * constants (the bundle's externals are react/react-native/zod/the plugin
- * package), so they are copied here and asserted against literals.
- */
-export function goalButtonGeometry(compact: boolean): GoalButtonGeometry {
-  return compact
-    ? { height: 44, fontSize: 14, borderRadius: 16, paddingHorizontal: 16, gap: GOAL_BUTTON_GAP }
-    : { height: 32, fontSize: 14, borderRadius: 12, paddingHorizontal: 12, gap: GOAL_BUTTON_GAP };
-}
-
-/**
- * The buttons in drawing order: **`[清除][编辑][主操作]`**.
- *
- * The row is right-aligned, so the primary action lands at the right edge where
- * the host's own form dialogs put it (`[Cancel secondary][Primary default]`),
- * and the destructive 清除 is kept away from it on the far left. Only the
- * actions that apply to the state are returned (the caller never draws a
- * disabled one).
- */
-export function goalButtonRow(actions: readonly GoalAction[]): readonly GoalAction[] {
-  const primary = actions.find((action) => action === "pause" || action === "resume");
-  return [
-    ...(actions.includes("clear") ? (["clear"] as const) : []),
-    ...(actions.includes("edit") ? (["edit"] as const) : []),
-    ...(primary === undefined ? [] : [primary]),
-  ];
-}
-
-/* -------------------------------------------------------------------------- */
-/* The action button's look                                                    */
-/* -------------------------------------------------------------------------- */
-
-/** One action button's visual variant. */
-export type GoalButtonVariant = "primary" | "secondary" | "outline" | "destructive";
-
-/** The theme colours a button resolves against (the plugin theme's subset). */
-export interface GoalButtonColors {
-  readonly foreground: string;
-  readonly foregroundMuted: string;
-  readonly surface1: string;
-  readonly accent: string;
-  readonly accentForeground: string;
-  readonly statusDanger: string;
-}
-
-/** One button's resolved look. **Every variant carries a 1px border.** */
-export interface GoalButtonPalette {
-  readonly backgroundColor: string;
-  readonly borderColor: string;
-  readonly borderWidth: number;
-  readonly color: string;
-}
-
-/** One button's hover/press state. */
-export interface GoalButtonState {
-  readonly hovered: boolean;
-  readonly pressed: boolean;
-}
-
-/**
- * The variant for one action.
- *
- * `pause` / `resume` are the primary call to action and the only accent fill.
- * `edit` is secondary. `clear` is a neutral outline until the user arms it, then
- * **destructive**: a red outline with red text, not a red fill. The red-fill
- * variant was tried and measured at 2.80:1 (white on the dark theme's
- * `statusDanger` #d8847b) — below AA — while red-on-panel is 6.10 (light) and
- * 5.80 (dark). See {@link goalButtonPalette}.
- */
-export function goalButtonVariant(action: GoalAction, clearArmed: boolean): GoalButtonVariant {
-  if (action === "pause" || action === "resume") return "primary";
-  if (action === "edit") return "secondary";
-  return clearArmed ? "destructive" : "outline";
-}
-
-/**
- * The label for one action.
- *
- * The destructive button switches to its confirmation sentence when armed, so
- * the screen says "press again to clear" instead of relying on colour alone. The
- * button's width is held by {@link goalButtonMinWidth}, so the switch does not
- * move the row.
+ * The destructive row switches to its confirmation sentence when armed, so the
+ * screen says "press again to clear" instead of relying on colour alone.
  */
 export function goalActionLabel(
   action: GoalAction,
@@ -316,182 +210,33 @@ export function goalActionLabel(
   }
 }
 
-/** An `#rgb` / `#rrggbb` colour as channels, or `undefined` for anything else. */
-export function parseHexColor(hex: string): { readonly r: number; readonly g: number; readonly b: number } | undefined {
-  const match = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(hex.trim());
-  if (match === null) return undefined;
-  const digits = match[1];
-  const full =
-    digits.length === 3
-      ? digits
-          .split("")
-          .map((digit) => digit + digit)
-          .join("")
-      : digits;
-  return {
-    r: Number.parseInt(full.slice(0, 2), 16),
-    g: Number.parseInt(full.slice(2, 4), 16),
-    b: Number.parseInt(full.slice(4, 6), 16),
-  };
-}
-
 /**
- * Mix `foreground` over `background` at `alpha`, returning an opaque `#rrggbb`.
+ * The leading glyph for one action row.
  *
- * The plugin theme carries no translucent tokens (11 opaque colours), and the
- * host's own status tints are `${color}${alphaHex}` strings, so blending here —
- * against the known panel colour — is the same idea without a token the plugin
- * does not have. An unparseable input returns the background unchanged rather
- * than throwing: a button in the wrong tint is cosmetic, a thrown renderer is an
- * empty panel.
+ * Lucide names the host can draw (`Icon` from `@getpaseo/plugin/client/ui`).
+ * Rows carry an icon and a title like the host's own menu rows; there is no
+ * button fill and no border — the brief explicitly forbids both.
  */
-export function blendHex(foreground: string, background: string, alpha: number): string {
-  const fg = parseHexColor(foreground);
-  const bg = parseHexColor(background);
-  if (fg === undefined || bg === undefined) return background;
-  const ratio = Math.min(1, Math.max(0, alpha));
-  const channel = (f: number, b: number): string =>
-    Math.round(ratio * f + (1 - ratio) * b)
-      .toString(16)
-      .padStart(2, "0");
-  return `#${channel(fg.r, bg.r)}${channel(fg.g, bg.g)}${channel(fg.b, bg.b)}`;
-}
-
-/**
- * WCAG 2.1 contrast ratio between two `#rrggbb` colours, or `undefined`.
- *
- * Used by the harness to assert the measured values the verification round asked
- * for (destructive text ≥ 4.5:1, button shapes ≥ 1.5:1, light **and** dark).
- */
-export function contrastRatio(a: string, b: string): number | undefined {
-  const left = relativeLuminance(a);
-  const right = relativeLuminance(b);
-  if (left === undefined || right === undefined) return undefined;
-  const high = Math.max(left, right);
-  const low = Math.min(left, right);
-  return (high + 0.05) / (low + 0.05);
-}
-
-/**
- * The resolved palette for one variant and state.
- *
- * **Every variant returns `borderWidth: 1`.** The outline and destructive
- * variants used to be the only ones with a border, so arming 清除 removed 1px
- * and the button's width moved 2px (measured 54→52 desktop / 62→60 phone). The
- * host's own `Button` keeps `borderWidth: 1, borderColor: "transparent"` on
- * every variant (`packages/app/src/components/ui/button.tsx`), so this does the
- * same: the primary and secondary fills draw their border in their own fill
- * colour.
- *
- * The fills are measured against the panel (`surface1`), not invented:
- * - secondary: `foreground` at 22% over the panel → 1.59:1 (light) / 2.02:1
- *   (dark), above the 1.5:1 floor; 8–12% was tried and measured 1.17–1.43, too
- *   faint in the dark theme (the verification round's F3).
- * - outline: `foregroundMuted` at 50% for the border → 1.94:1 / 2.67:1.
- * - destructive: `statusDanger` text and border on the panel → 6.10:1 / 5.80:1
- *   (AA for the text; ≥3:1 for the border as a graphic).
- */
-export function goalButtonPalette(
-  variant: GoalButtonVariant,
-  colors: GoalButtonColors,
-  state: GoalButtonState,
-): GoalButtonPalette {
-  const active = state.hovered || state.pressed;
-  switch (variant) {
-    case "primary":
-      return {
-        backgroundColor: colors.accent,
-        borderColor: colors.accent,
-        borderWidth: 1,
-        color: colors.accentForeground,
-      };
-    case "secondary": {
-      const fill = blendHex(colors.foreground, colors.surface1, active ? 0.3 : 0.22);
-      return { backgroundColor: fill, borderColor: fill, borderWidth: 1, color: colors.foreground };
-    }
-    case "outline":
-      return {
-        backgroundColor: "transparent",
-        borderColor: blendHex(colors.foregroundMuted, colors.surface1, active ? 0.65 : 0.5),
-        borderWidth: 1,
-        color: colors.foreground,
-      };
-    case "destructive":
-      return {
-        backgroundColor: "transparent",
-        borderColor: colors.statusDanger,
-        borderWidth: 1,
-        color: colors.statusDanger,
-      };
+export function goalActionIcon(action: GoalAction): "Pause" | "Play" | "Pencil" | "Trash2" {
+  switch (action) {
+    case "pause":
+      return "Pause";
+    case "resume":
+      return "Play";
+    case "edit":
+      return "Pencil";
+    case "clear":
+      return "Trash2";
   }
-}
-
-/**
- * The width of one label at `fontSize`, in points.
- *
- * An approximation, not text measurement: CJK and full-width punctuation count
- * as one em, everything else as 0.55em. It only needs to be an upper bound wide
- * enough for both the 清除 and the 确认清除 labels, so the button does not resize
- * between them.
- *
- * Exported so the harness can assert the safety margin {@link goalButtonMinWidth}
- * adds on top of it.
- */
-export function goalTextWidth(label: string, fontSize: number): number {
-  let width = 0;
-  for (const character of label) {
-    width += /[\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef\u3000-\u303f]/.test(character)
-      ? fontSize
-      : fontSize * 0.55;
-  }
-  return width;
-}
-
-/**
- * The horizontal breathing room added **per side** on top of the measured label.
- *
- * `goalTextWidth` is an estimate (CJK = 1em, other = 0.55em), not the native
- * font's real advance. Without a margin the pinned width came out exactly equal
- * to the label's estimated width (measured 56.00 = 56.00 in the verification
- * round), so a native font whose advance is a little wider would ellipsise the
- * confirmation label. The brief's floor is 4px per side or 0.5em; this is the
- * 0.5em value (`fontSize.base` = 14 → 7). 4px was tried first and the rendered
- * margin came out at 6px total (3 per side) because the estimate is ~2px under
- * the web font's real advance — so the floor is not enough on its own.
- *
- * The label is also `numberOfLines={1}`: if an unexpected font still overflows,
- * it truncates with an ellipsis instead of wrapping the action row.
- */
-export const GOAL_BUTTON_LABEL_SAFETY = 7;
-
-/**
- * The minimum outer width that fits the widest of `labels` at this geometry.
- *
- * Pins the button's width so switching 清除 → 确认清除 (or Clear → Confirm)
- * cannot move it: the label change is what tells the user to press again, and a
- * row that jumps while confirming looks broken. Padding and the 1px border on
- * both sides are added because `minWidth` is the outer box, plus
- * {@link GOAL_BUTTON_LABEL_SAFETY} per side for the estimate error.
- *
- * The same value is applied to **every** button in the row (`goal-popover.tsx`),
- * not just the destructive one: a single wider button made the destructive
- * control the widest thing in a row of otherwise compact buttons and read as
- * visually unbalanced (verification round 4a/N1). An equal-width row is the
- * deliberate layout.
- */
-export function goalButtonMinWidth(labels: readonly string[], geometry: GoalButtonGeometry): number {
-  const widest = labels.reduce((width, label) => Math.max(width, goalTextWidth(label, geometry.fontSize)), 0);
-  return Math.ceil(widest) + geometry.paddingHorizontal * 2 + 2 + GOAL_BUTTON_LABEL_SAFETY * 2;
 }
 
 /**
  * The status line's 8px dot colour token per tone.
  *
- * The user asked for the status *colour* to identify the four states; the label
- * text cannot carry it (the host draws the popover's text, and the theme's
- * `accent` fails AA as text on the dark surface at 2.83:1). The dot is the
- * colour channel: accent while auto-continuing, warning when not, danger when
- * blocked — visible at 8px and independent of the text's contrast.
+ * The user asked for the status colour to identify the four states; the label
+ * text cannot carry it (the host draws the popover's text, and `accent` as text
+ * fails AA on the dark surface at 2.83:1). The dot is the colour channel:
+ * accent while auto-continuing, warning when not, danger when blocked.
  */
 export function goalStatusDotColorToken(tone: GoalTone): "accent" | "statusWarning" | "statusDanger" {
   switch (tone) {
@@ -504,27 +249,23 @@ export function goalStatusDotColorToken(tone: GoalTone): "accent" | "statusWarni
   }
 }
 
-/** The action row's layout: right-aligned, wrapping, shared gap. */
-export interface GoalActionRowStyle {
-  readonly flexDirection: "row";
-  readonly justifyContent: "flex-end";
-  readonly flexWrap: "wrap";
-  readonly gap: number;
+/**
+ * The status line: the phase word and the round budget on **one** line.
+ *
+ * `进行中 · 第 3 轮 · 预算 10`. The 8px dot in front carries the tone colour;
+ * the text stays `foreground` because `accent` as text fails AA on the dark
+ * surface (2.83:1), which the verification round made explicit.
+ */
+export function goalStatusLine(
+  goal: GoalState,
+  statuses: Readonly<Record<string, string>>,
+  rounds: (started: number, max: number) => string,
+): string {
+  return `${statuses[goal.phase] ?? goal.phase} · ${rounds(goal.roundsStarted, goal.maxGoalRounds)}`;
 }
 
-/**
- * The action row's layout.
- *
- * Exported as a value (not written inline in the JSX) because the "right
- * aligned" rule is a **behaviour** the harness must pin: the previous version
- * asserted the JSX source with a regex, which the file's own doc comment
- * satisfied — deleting `justifyContent: "flex-end"` left the check green (the
- * verification round's F1). A test that reads this function's return value fails
- * when the rule is removed.
- */
-export function goalActionRowStyle(geometry: GoalButtonGeometry): GoalActionRowStyle {
-  return { flexDirection: "row", justifyContent: "flex-end", flexWrap: "wrap", gap: geometry.gap };
-}
+/** The objective's line count in the popover header: one, truncated. */
+export const GOAL_OBJECTIVE_MAX_LINES = 1;
 
 /* -------------------------------------------------------------------------- */
 /* The popover's content lines                                                 */
@@ -610,7 +351,7 @@ export function goalEditDraftValid(draft: string): boolean {
  * popover shows it verbatim. Hiding the button instead would leave the user with
  * no way to discover why.
  *
- * This is the *set*; the drawing order is {@link goalButtonRow}'s.
+ * The rendering is one row per action, in this order.
  */
 export function goalActionsFor(goal: GoalState): readonly GoalAction[] {
   const primary: GoalAction =

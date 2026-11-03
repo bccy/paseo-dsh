@@ -381,6 +381,30 @@ console.log("the goal pill's copy is covered in both languages");
     }
   }
 
+  // The row-style actions are screen copy the user reads (the confirmation and
+  // the inline edit actions), not just aria labels.
+  for (const locale of LOCALES) {
+    const actions = allText()[locale].goal.actions;
+    for (const key of ["pause", "resume", "edit", "clear", "confirmClear", "save", "cancel"]) {
+      check(
+        `goal.actions.${key} is a non-empty string in ${locale}`,
+        typeof actions[key] === "string" && actions[key].trim() !== "",
+        JSON.stringify(actions[key]),
+      );
+    }
+  }
+  check("the edit row names the goal (en)", en.actions.edit === "Edit goal", JSON.stringify(en.actions.edit));
+  check("the edit row names the goal (zh-CN)", zh.actions.edit === "编辑目标", JSON.stringify(zh.actions.edit));
+  check("the clear row names the goal (en)", en.actions.clear === "Clear goal", JSON.stringify(en.actions.clear));
+  check("the clear row names the goal (zh-CN)", zh.actions.clear === "清除目标", JSON.stringify(zh.actions.clear));
+  check("the confirmation is not the rest label (en)", en.actions.confirmClear !== en.actions.clear, JSON.stringify(en.actions.confirmClear));
+  check("the confirmation is not the rest label (zh-CN)", zh.actions.confirmClear !== zh.actions.clear, JSON.stringify(zh.actions.confirmClear));
+  equal(
+    "the English actions are not the Chinese actions",
+    ["pause", "resume", "edit", "clear", "confirmClear", "save", "cancel"].filter((key) => en.actions[key] === zh.actions[key]),
+    [],
+  );
+
   // The English column must not be a copy of the Chinese one.
   const copied = [
     "title",

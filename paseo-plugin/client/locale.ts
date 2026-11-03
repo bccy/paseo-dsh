@@ -228,14 +228,18 @@ export interface GoalText {
    * the explanation of that state.
    */
   disarmedHint: string;
-  /** The popover's control buttons. */
+  /** The popover's action rows and their inline text actions. */
   actions: {
     pause: string;
     resume: string;
     edit: string;
     clear: string;
-    /** The 清除 button's label after its first click. */
+    /** The 清除 row's label after its first click. */
     confirmClear: string;
+    /** The edit row's save action. */
+    save: string;
+    /** The edit/clear row's cancel action. */
+    cancel: string;
   };
   /** Placeholder of the edit field the 编辑 button reveals. */
   editPlaceholder: string;
@@ -514,9 +518,11 @@ const TEXT: Record<Locale, UiText> = {
       actions: {
         pause: "Pause",
         resume: "Continue",
-        edit: "Edit",
-        clear: "Clear",
-        confirmClear: "Confirm",
+        edit: "Edit goal",
+        clear: "Clear goal",
+        confirmClear: "Confirm clear",
+        save: "Save",
+        cancel: "Cancel",
       },
       editPlaceholder: "New objective",
       busy: "Working…",
@@ -765,9 +771,11 @@ const TEXT: Record<Locale, UiText> = {
       actions: {
         pause: "暂停",
         resume: "继续",
-        edit: "编辑",
-        clear: "清除",
+        edit: "编辑目标",
+        clear: "清除目标",
         confirmClear: "确认清除",
+        save: "保存",
+        cancel: "取消",
       },
       editPlaceholder: "新的目标内容",
       busy: "处理中…",
