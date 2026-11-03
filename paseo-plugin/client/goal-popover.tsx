@@ -13,12 +13,17 @@
  *   `rowActive`), which is how the host's pressable track rows read.
  * - **The "now" row** is a track row with a `CircleDot` and the current todo.
  * - **Blocked / disarmed / error** are the design's one-line rows and hint.
- * - **Edit** replaces the objective row **in place** with a multi-line field in
- *   `MenuTextField`'s box (`menu-item.tsx:441` + `:457-478`: `surface2`, 1px
- *   border, 6px radius), then a separator and two menu rows, 保存 and 取消. The
- *   caret starts at offset 0 so a long goal is read from its start; Enter saves,
- *   Escape cancels, and **blur never saves** — a long objective is too expensive
- *   to change by accident.
+ * - **Edit** (design-opus-v4 direction C) is a small Paseo composer: a header
+ *   (whale + 编辑目标, and on desktop an `Esc 取消` hint), then the host composer's
+ *   box (`composer/input/input.tsx:2259-2287`: 16px radius, same surface as the
+ *   panel, 1px border) holding a field that grows from two lines to six and then
+ *   scrolls, and a button row with the composer's 28px round accent button (a ✓,
+ *   half opacity and inert while the draft is empty or unchanged) and a quiet
+ *   取消. Keys follow the composer: on desktop Enter saves, Shift+Enter is a
+ *   newline, Escape cancels; on a phone Enter is a newline and only ✓ saves.
+ *   The caret starts at offset 0 so a long goal is read from its start, and
+ *   **blur never saves** — a long objective is too expensive to change by
+ *   accident.
  * - **Clear** is an in-place confirmation page (hint, separator, red 清除目标
  *   row, 取消 row). Red appears only after the user has said they want to clear.
  * - **Running**: the whale carries the host's status ring in its bottom-right
@@ -33,12 +38,24 @@
  */
 import type { PluginButtonContentProps } from "@getpaseo/plugin/client";
 import { Icon, TextInput as UiTextInput } from "@getpaseo/plugin/client/ui";
-import { useState } from "react";
-import { Pressable, Text, View, type PressableStateCallbackType } from "react-native";
+import { useState, type ReactNode } from "react";
+import {
+  ActivityIndicator,
+  Platform,
+  Pressable,
+  Text,
+  View,
+  type PressableStateCallbackType,
+} from "react-native";
 import type { GoalState } from "../shared/goal";
 import { DeepSeekMark } from "./deepseek-mark";
 import {
-  GOAL_EDITOR_MIN_HEIGHT,
+  GOAL_EDITOR_GAP,
+  GOAL_EDITOR_MARGIN_HORIZONTAL,
+  GOAL_EDITOR_MAX_LINES,
+  GOAL_EDITOR_PADDING_HORIZONTAL,
+  GOAL_EDITOR_PADDING_VERTICAL,
+  GOAL_EDITOR_RADIUS,
   GOAL_EDITOR_WIDTH_WIDE,
   GOAL_FACTS_LINE_HEIGHT,
   GOAL_HINT_PADDING_HORIZONTAL,
@@ -46,11 +63,16 @@ import {
   GOAL_OBJECTIVE_LINE_HEIGHT,
   GOAL_RING_FRAME_SIZE,
   GOAL_RING_OFFSET,
+  GOAL_SAVE_BUTTON_SIZE,
+  GOAL_SAVE_DISABLED_OPACITY,
   GOAL_SEPARATOR_HEIGHT,
   GOAL_SEPARATOR_MARGIN_VERTICAL,
   GOAL_WHALE_SIZE,
   goalCurrentTaskLine,
+  goalEditKeyAction,
   goalEditSubmittable,
+  goalEditorHeight,
+  goalEditorType,
   goalFactsLine,
   goalIconButton,
   goalMenuItem,
@@ -262,6 +284,268 @@ function Separator({ theme }: { theme: PopoverTheme }) {
   );
 }
 
+/**
+ * A key name in the host's shortcut chip (`components/ui/shortcut.tsx`: 4/2
+ * padding, 6px radius, sm muted text on `surface3` at half opacity). The plugin
+ * theme has no `surface3`; `surface2` is the fallback (DESIGN v4 §6).
+ */
+function KeyChip({ theme, children }: { theme: PopoverTheme; children: string }) {
+  return (
+    <View
+      style={{
+        paddingHorizontal: 4,
+        paddingVertical: 2,
+        borderRadius: 6,
+        backgroundColor: theme.colors.surface2,
+      }}
+    >
+      <Text style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}>{children}</Text>
+    </View>
+  );
+}
+
+/** One muted word beside a chip. */
+function KeyWord({ theme, children }: { theme: PopoverTheme; children: ReactNode }) {
+  return <Text style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}>{children}</Text>;
+}
+
+/** The read-only part of the edit page's props. */
+interface GoalEditorProps {
+  goal: GoalState;
+  text: GoalText;
+  theme: PopoverTheme;
+  compact: boolean;
+  busy: boolean;
+  error?: string;
+  draft: string;
+  onSave: () => void;
+  onCancelEdit: () => void;
+  onChangeDraft: (text: string) => void;
+}
+
+/**
+ * The edit page: a small Paseo composer (design-opus-v4 direction C).
+ *
+ * The field's height comes from a hidden copy of the text laid out at the same
+ * width — the host composer measures its lines the same way (`lineMeasurement`,
+ * `composer/input/input.tsx`) — because a textarea's `scrollHeight` only ever
+ * grows on web, so a field sized from it would never shrink back.
+ */
+function GoalEditor({
+  goal,
+  text,
+  theme,
+  compact,
+  busy,
+  error,
+  draft,
+  onSave,
+  onCancelEdit,
+  onChangeDraft,
+}: GoalEditorProps) {
+  const web = Platform.OS === "web";
+  // Enter submits only where the host composer's does: web, pointer layout.
+  const submitOnEnter = web && !compact;
+  const type = goalEditorType(web);
+  const [measured, setMeasured] = useState(0);
+  // The first selection pins the caret to offset 0 (the start of the goal); the
+  // first keystroke or selection change releases it to the platform.
+  const [selection, setSelection] = useState<{ start: number; end: number } | undefined>({
+    start: 0,
+    end: 0,
+  });
+  const canSave = !busy && goalEditSubmittable(draft, goal.objective);
+  const height = goalEditorHeight(measured, type.lineHeight);
+  const save = (): void => {
+    if (canSave) onSave();
+  };
+
+  return (
+    <View
+      style={{
+        ...popoverRootBox(),
+        margin: -12,
+        paddingBottom: GOAL_EDITOR_PADDING_VERTICAL,
+        ...(compact ? {} : { width: GOAL_EDITOR_WIDTH_WIDE }),
+      }}
+    >
+      <View
+        style={{
+          flexDirection: "row",
+          alignItems: "center",
+          gap: 8,
+          paddingHorizontal: GOAL_HINT_PADDING_HORIZONTAL,
+          paddingVertical: GOAL_HINT_PADDING_VERTICAL,
+        }}
+      >
+        <DeepSeekMark size={GOAL_WHALE_SIZE} />
+        <Text
+          style={{
+            flexGrow: 1,
+            flexShrink: 1,
+            fontSize: TITLE_FONT_SIZE,
+            fontWeight: "500",
+            color: theme.colors.foreground,
+          }}
+        >
+          {text.editor.title}
+        </Text>
+        {submitOnEnter ? (
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+            <KeyChip theme={theme}>{text.editor.escKey}</KeyChip>
+            <KeyWord theme={theme}>{text.editor.escHint}</KeyWord>
+          </View>
+        ) : null}
+      </View>
+      <View
+        style={{
+          marginHorizontal: GOAL_EDITOR_MARGIN_HORIZONTAL,
+          gap: GOAL_EDITOR_GAP,
+          paddingVertical: GOAL_EDITOR_PADDING_VERTICAL,
+          paddingHorizontal: GOAL_EDITOR_PADDING_HORIZONTAL,
+          borderRadius: GOAL_EDITOR_RADIUS,
+          borderWidth: 1,
+          // The composer's `borderAccent` is not in the plugin theme (DESIGN v4 §6).
+          borderColor: theme.colors.border,
+          backgroundColor: theme.colors.surface1,
+        }}
+      >
+        <View style={{ position: "relative" }}>
+          {/* The measuring copy: same width, font and line height, never seen. */}
+          <Text
+            aria-hidden
+            accessibilityElementsHidden
+            importantForAccessibility="no-hide-descendants"
+            pointerEvents="none"
+            onLayout={(event) => setMeasured(event.nativeEvent.layout.height)}
+            style={{
+              position: "absolute",
+              top: 0,
+              left: 0,
+              right: 0,
+              opacity: 0,
+              fontSize: type.fontSize,
+              lineHeight: type.lineHeight,
+            }}
+          >
+            {/* A zero-width space keeps a trailing newline's empty line measured. */}
+            {`${draft}\u200b`}
+          </Text>
+          <UiTextInput
+            value={draft}
+            onChangeText={(next) => {
+              setSelection(undefined);
+              onChangeDraft(next);
+            }}
+            onSelectionChange={() => setSelection(undefined)}
+            onFocus={() => setSelection({ start: 0, end: 0 })}
+            selection={selection}
+            multiline
+            autoFocus
+            editable={!busy}
+            placeholder={text.editPlaceholder}
+            placeholderTextColor={theme.colors.foregroundMuted}
+            onKeyPress={(event) => {
+              const native = event.nativeEvent as {
+                key: string;
+                shiftKey?: boolean;
+                isComposing?: boolean;
+                keyCode?: number;
+              };
+              const action = goalEditKeyAction({
+                key: native.key,
+                shiftKey: native.shiftKey === true,
+                composing: native.isComposing === true || native.keyCode === 229,
+                submitOnEnter,
+              });
+              if (action === null) return;
+              event.preventDefault?.();
+              if (action === "cancel") onCancelEdit();
+              else save();
+            }}
+            accessibilityLabel={text.editPlaceholder}
+            // `resize`/`outline` are web-only keys the RN style type does not
+            // carry; the host's own field strips them the same way.
+            style={{
+              height,
+              maxHeight: GOAL_EDITOR_MAX_LINES * type.lineHeight,
+              fontSize: type.fontSize,
+              lineHeight: type.lineHeight,
+              color: theme.colors.foreground,
+              padding: 0,
+              borderWidth: 0,
+              outlineWidth: 0,
+              textAlignVertical: "top",
+              ...({ resize: "none", outlineStyle: "none" } as Record<string, unknown>),
+            } as never}
+          />
+        </View>
+        {/* The composer's button row bleeds 6px each side (`input.tsx:2350-2356`). */}
+        <View style={{ flexDirection: "row", alignItems: "center", marginHorizontal: -6 }}>
+          <View style={{ flexGrow: 1, flexShrink: 1, flexDirection: "row", alignItems: "center", gap: 6, paddingLeft: 6 }}>
+            {submitOnEnter ? (
+              <>
+                <KeyChip theme={theme}>{text.editor.enterKey}</KeyChip>
+                <KeyWord theme={theme}>{text.editor.enterHint}</KeyWord>
+                <KeyChip theme={theme}>{text.editor.shiftEnterKey}</KeyChip>
+                <KeyWord theme={theme}>{text.editor.shiftEnterHint}</KeyWord>
+              </>
+            ) : null}
+          </View>
+          <Pressable
+            onPress={onCancelEdit}
+            accessibilityRole="button"
+            accessibilityLabel={text.editor.cancel}
+            style={({ hovered = false, pressed }: HoverState) => ({
+              height: GOAL_SAVE_BUTTON_SIZE,
+              paddingHorizontal: 12,
+              borderRadius: 9999,
+              alignItems: "center",
+              justifyContent: "center",
+              backgroundColor: hovered || pressed ? theme.colors.surface2 : "transparent",
+            })}
+          >
+            {({ hovered = false, pressed }: HoverState) => (
+              <Text
+                style={{
+                  fontSize: FACTS_FONT_SIZE,
+                  color: hovered || pressed ? theme.colors.foreground : theme.colors.foregroundMuted,
+                }}
+              >
+                {text.editor.cancel}
+              </Text>
+            )}
+          </Pressable>
+          <Pressable
+            onPress={save}
+            disabled={!canSave}
+            accessibilityRole="button"
+            accessibilityLabel={text.editor.save}
+            accessibilityState={{ disabled: !canSave, busy }}
+            style={{
+              width: GOAL_SAVE_BUTTON_SIZE,
+              height: GOAL_SAVE_BUTTON_SIZE,
+              marginLeft: 4,
+              borderRadius: GOAL_SAVE_BUTTON_SIZE / 2,
+              alignItems: "center",
+              justifyContent: "center",
+              backgroundColor: theme.colors.accent,
+              opacity: canSave || busy ? 1 : GOAL_SAVE_DISABLED_OPACITY,
+            }}
+          >
+            {busy ? (
+              <ActivityIndicator size="small" color={theme.colors.accentForeground} />
+            ) : (
+              <Icon name="Check" size={web ? 16 : 20} color={theme.colors.accentForeground} />
+            )}
+          </Pressable>
+        </View>
+      </View>
+      {error === undefined ? null : <Hint theme={theme} danger>{error}</Hint>}
+    </View>
+  );
+}
+
 /** Everything the popover body draws. State and RPCs stay in `goal-pill.tsx`. */
 export interface GoalPopoverBodyProps {
   goal: GoalState;
@@ -323,12 +607,6 @@ export function GoalPopoverBody({
   // The row's own hover state, so the whale's ring can knock out of the row fill
   // it is drawn on (the host's `backdrop`).
   const [hot, setHot] = useState(false);
-  // The first selection pins the caret to offset 0 (the start of the goal); the
-  // first keystroke or selection change releases it to the platform.
-  const [selection, setSelection] = useState<{ start: number; end: number } | undefined>({
-    start: 0,
-    end: 0,
-  });
   const iconButton = goalIconButton(compact);
   const resumable = goal.phase !== "active" || goal.activation === "disarmed";
   const facts = goalFactsLine(goal, text.statuses, text.rounds);
@@ -337,70 +615,18 @@ export function GoalPopoverBody({
 
   if (mode === "edit") {
     return (
-      <View style={{ ...root, margin: -12, ...(compact ? {} : { width: GOAL_EDITOR_WIDTH_WIDE }) }}>
-        <View
-          style={{
-            marginHorizontal: 4,
-            paddingHorizontal: 8,
-            paddingVertical: 6,
-            borderWidth: 1,
-            borderColor: theme.colors.foregroundMuted,
-            borderRadius: 6,
-            backgroundColor: theme.colors.surface2,
-          }}
-        >
-          <UiTextInput
-            value={draft}
-            onChangeText={(next) => {
-              setSelection(undefined);
-              onChangeDraft(next);
-            }}
-            onSelectionChange={() => setSelection(undefined)}
-            onFocus={() => setSelection({ start: 0, end: 0 })}
-            selection={selection}
-            multiline
-            numberOfLines={4}
-            autoFocus
-            submitBehavior="blurAndSubmit"
-            onSubmitEditing={onSave}
-            onKeyPress={(event) => {
-              const key = event.nativeEvent.key;
-              if (key === "Escape") {
-                event.preventDefault?.();
-                onCancelEdit();
-                return;
-              }
-              if (key === "Enter") {
-                event.preventDefault?.();
-                onSave();
-              }
-            }}
-            accessibilityLabel={text.editPlaceholder}
-            // `resize`/`outline` are web-only keys the RN style type does not
-            // carry; the host's own field strips them the same way.
-            style={{
-              fontSize: TITLE_FONT_SIZE,
-              lineHeight: GOAL_OBJECTIVE_LINE_HEIGHT,
-              minHeight: GOAL_EDITOR_MIN_HEIGHT,
-              color: theme.colors.foreground,
-              padding: 0,
-              borderWidth: 0,
-              outlineWidth: 0,
-              ...({ resize: "none" } as Record<string, unknown>),
-            } as never}
-          />
-        </View>
-        <Separator theme={theme} />
-        <MenuRow
-          label={text.actions.save}
-          disabled={busy || !goalEditSubmittable(draft, goal.objective)}
-          compact={compact}
-          theme={theme}
-          onPress={onSave}
-        />
-        <MenuRow label={text.actions.cancel} compact={compact} theme={theme} onPress={onCancelEdit} />
-        {error === undefined ? null : <Hint theme={theme} danger>{error}</Hint>}
-      </View>
+      <GoalEditor
+        goal={goal}
+        text={text}
+        theme={theme}
+        compact={compact}
+        busy={busy}
+        error={error}
+        draft={draft}
+        onSave={onSave}
+        onCancelEdit={onCancelEdit}
+        onChangeDraft={onChangeDraft}
+      />
     );
   }
 

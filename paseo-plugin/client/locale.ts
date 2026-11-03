@@ -187,21 +187,27 @@ export interface JobsText {
  * fall through to a raw English word.
  */
 export interface GoalText {
-  /** The button's title and the popover's heading: the neutral noun. */
+  /**
+   * The pill's visible label in every state: the neutral noun 「目标」/「Goal」.
+   * The state is carried by the glyph's colour / running ring, and spelled out in
+   * full by the four state names below.
+   */
   title: string;
   /**
-   * Trigger label while the goal is auto-continuing.
+   * The full state name while the goal is auto-continuing: the button's `title`,
+   * which the host uses as its accessibility name, desktop tooltip and phone
+   * sheet header (`buttons/view.tsx`). Not drawn as the label.
    *
    * Deliberately carries **no round fraction**: the round budget is not a
-   * completion percentage, and `目标 3/10` in a one-line trigger reads as
-   * "30% done". The budget is a sentence in the popover ({@link rounds}).
+   * completion percentage, and `目标 3/10` reads as "30% done". The budget is a
+   * sentence in the popover ({@link rounds}).
    */
   running: string;
-  /** Trigger label when the goal is active but this process will not continue it. */
+  /** The full state name when the goal is active but this process will not continue it. */
   notRunning: string;
-  /** Trigger label when the goal is paused. */
+  /** The full state name when the goal is paused. */
   paused: string;
-  /** Trigger label when the goal is blocked. */
+  /** The full state name when the goal is blocked. */
   blocked: string;
   /** The facts line's first word, per durable phase, plus `disarmed`. */
   statuses: Record<string, string>;
@@ -253,12 +259,34 @@ export interface GoalText {
     edit: string;
     /** Accessibility name of the trash icon button and the clear page's red row. */
     clearTarget: string;
-    /** The edit page's save row. */
-    save: string;
-    /** The edit and clear pages' cancel row. */
+    /** The clear page's cancel row. */
     cancel: string;
   };
-  /** Placeholder of the in-place edit field. */
+  /**
+   * The edit page (design-opus-v4 direction C: a small Paseo composer).
+   *
+   * `enterKey` / `shiftEnterKey` / `escKey` are key names drawn in the host's
+   * shortcut chips and stay as the keyboard prints them; the words after them
+   * are translated.
+   */
+  editor: {
+    /** The edit page's header next to the whale. */
+    title: string;
+    /** Accessibility name of the round ✓ button. */
+    save: string;
+    /** The quiet text button left of ✓. */
+    cancel: string;
+    escKey: string;
+    /** Header hint after the Esc chip (desktop only). */
+    escHint: string;
+    enterKey: string;
+    /** Footer hint after the Enter chip (desktop only). */
+    enterHint: string;
+    shiftEnterKey: string;
+    /** Footer hint after the Shift Enter chip (desktop only). */
+    shiftEnterHint: string;
+  };
+  /** Placeholder of the edit field. */
   editPlaceholder: string;
   /** Accessibility name of the running ring on the whale. */
   runningA11y: string;
@@ -525,15 +553,25 @@ const TEXT: Record<Locale, UiText> = {
       },
       rounds: (started, max) => `Round ${String(started)} · budget ${String(max)}`,
       currentTaskPrefix: "Now: ",
-      disarmedHint: "Auto-continue stops after you reopen the session.",
+      disarmedHint: "Auto-continue stops when the session is reopened. Press Resume to continue.",
       clearHint: "Clearing stops the goal for good; this cannot be undone.",
       actions: {
         pauseTarget: "Pause goal",
-        resumeTarget: "Continue goal",
+        resumeTarget: "Resume goal",
         edit: "Edit goal",
         clearTarget: "Clear goal",
-        save: "Save",
         cancel: "Cancel",
+      },
+      editor: {
+        title: "Edit goal",
+        save: "Save goal",
+        cancel: "Cancel",
+        escKey: "Esc",
+        escHint: "to cancel",
+        enterKey: "Enter",
+        enterHint: "Save",
+        shiftEnterKey: "Shift Enter",
+        shiftEnterHint: "New line",
       },
       editPlaceholder: "New objective",
       runningA11y: "Goal running",
@@ -777,16 +815,26 @@ const TEXT: Record<Locale, UiText> = {
       // 预算不是完成度：不写 N/M 分数形态，避免被读成进度。
       rounds: (started, max) => `第 ${String(started)} 轮 · 预算 ${String(max)}`,
       currentTaskPrefix: "正在：",
-      // 设计 v1 §99 的一行提示原文。
-      disarmedHint: "重开会话后自动续跑会停止",
+      // design-opus-v4 §1 的提示文案 B：说清原因，也说清「继续」按钮是解法。
+      disarmedHint: "重开会话后自动续跑会停止，点「继续」恢复",
       clearHint: "清除后目标不再续跑，无法撤销",
       actions: {
         pauseTarget: "暂停目标",
         resumeTarget: "继续目标",
         edit: "编辑目标",
         clearTarget: "清除目标",
-        save: "保存",
         cancel: "取消",
+      },
+      editor: {
+        title: "编辑目标",
+        save: "保存目标",
+        cancel: "取消",
+        escKey: "Esc",
+        escHint: "取消",
+        enterKey: "Enter",
+        enterHint: "保存",
+        shiftEnterKey: "Shift Enter",
+        shiftEnterHint: "换行",
       },
       editPlaceholder: "新的目标内容",
       runningA11y: "目标运行中",

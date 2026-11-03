@@ -81,9 +81,12 @@ Paseo 0.14.0。
 ## 状态、pill 与按钮
 
 目标 pill 注册在 composer（`client.addComposerPill`，独立 id **`dsh-goal`**，与 jobs pill 并列；
-**jobs pill 的语义一行不改**：只在运行中可见、只用转环、文案「N 个后台」）。`title` 固定为中性名词
-「目标」/「Goal」——它同时是手机 sheet 的标题与无障碍名，完整 objective 只在 popover 正文出现
-一次。注册时先 `visible:false`，第一次轮询证明有目标才显示。
+**jobs pill 的语义一行不改**：只在运行中可见、只用转环、文案「N 个后台」）。**label 四态恒为
+「目标」/「Goal」**（UI-v6）：状态由图标的颜色与运行环表达；`title` 是完整状态名（`目标进行中` 等），
+因为宿主把按钮的 `title` 用作无障碍名、桌面 tooltip 与手机 sheet 标题（`plugins/buttons/view.tsx`），
+插件 API 没有单独的无障碍名通道。代价：手机 sheet 头显示完整状态而不是固定「目标」。两个字符串
+由纯函数 `goalPillCopy`（`client/goal-polling.ts`）给出。完整 objective 只在 popover 正文出现一次。
+注册时先 `visible:false`，第一次轮询证明有目标才显示。
 
 **可见性**：`available && goal !== null && phase !== "complete"`。无目标 / 已完成 / 已清除 →
 隐藏（与 DSH Web GoalBar 同语义：无目标、已完成与成功清除的目标一律不渲染，
@@ -91,14 +94,14 @@ Paseo 0.14.0。
 goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等价，不打扰用户；瞬时错误**保持
 上次状态**，不要把界面闪成「无目标」（`goalPillPresentation`，`paseo-plugin/client/goal-polling.ts`）。
 
-| 状态 | label（zh-CN / en） | 图标 | 行尾操作 |
+| 状态 | title = 无障碍名（zh-CN / en；label 恒为「目标」/「Goal」） | 图标 | 行尾操作 |
 |---|---|---|---|
 | active + armed | `目标进行中` / `Goal running` | 运行环（agent 在跑时）/ `Target`（`foregroundMuted`） | 暂停、清除；点行编辑 |
 | active + disarmed | `目标未在续跑` / `Goal not running` | `Target`（`statusWarning`） | 继续、清除；点行编辑 |
 | paused | `目标已暂停` / `Goal paused` | `Target`（`statusWarning`） | 继续、清除；点行编辑 |
 | blocked | `目标受阻` / `Goal blocked` | `Target`（`statusDanger`） | 继续、清除；点行编辑 |
 
-**label 不带轮数分数**：`目标 3/10` 在 160px 的按钮里会被读成完成度（上限默认 256），轮数是
+**pill 文字不带轮数分数**：`目标 3/10` 在 160px 的按钮里会被读成完成度（上限默认 256），轮数是
 **预算不是完成度**，只进 popover 的 facts 行（`goalFactsLine`）。
 
 **运行环（v5）**：pill 图标在「目标真的在跑」时**替换**为运行环（`StatusRingMark`，与 jobs pill
@@ -119,14 +122,25 @@ goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等�
   glyph 14/18，`goalIconButton`）。
 - **点整行进入编辑**（除两个图标按钮外；图标按钮 `stopPropagation`）：行是 `ComposerTrackRow`
   形态（桌面 hover/按下填 `surface2`），a11y 名「编辑目标」。它是面板里唯一的编辑入口。
-- **编辑页（原位）**：多行字段（`MenuTextField` 同框：`surface2` 底、1px 边、圆角 6）替换目标行，
-  预填全文、自动聚焦、光标在开头；下方分隔线 + 「保存」「取消」两行（宿主 `MenuItem` 几何：
-  手机 40 / 桌面 28，`goalMenuItem`）。回车保存、Esc 取消、**失焦不提交**；空文本与「值未变」都
-  禁用保存（后者是对设计的增补，借 `rename-modal.tsx:111`）。编辑时隐藏「正在」与受阻行。
+- **编辑页（原位，UI-v6 = design-opus-v4 方向 C：小号 Paseo 输入框）**：头部鲸鱼 +「编辑目标」
+  （手机也保留；桌面右侧 `Esc` 芯片 +「取消」）；下面是宿主 composer 同款框（`composer/input/input.tsx`
+  `inputWrapper`：圆角 16、与面板同层 `surface1`、1px 边、上下 8 / 左右 12、文字与按钮行间距 12，
+  距面板边 8）。字段预填全文、自动聚焦、光标在开头；字号同 composer（web 15 / 原生 16，行高 1.4×）；
+  高度随内容 2–6 行（隐藏镜像文字量高，宿主 composer 同法；`goalEditorHeight`），超出框内滚动。
+  按钮行：右下 28px accent 圆形 ✓（无障碍名「保存目标」；空文本或「值未变」时 `opacity 0.5` 且不可点，
+  宿主 composer 发送键同规则；保存中换转圈）；其左淡色「取消」文字按钮；桌面左侧按键提示芯片
+  「Enter 保存」「Shift Enter 换行」。按键（纯函数 `goalEditKeyAction`，宿主 composer 约定）：
+  **桌面** Enter 保存、Shift+Enter 换行、IME 组字中的 Enter 不提交、Esc 取消；**手机** Enter 换行，只能点 ✓。
+  **失焦不提交**（没有任何 blur / submitEditing 提交路径）。失败原文显示在框下方（`statusDanger`），保持编辑态。
+  编辑时隐藏「正在」与受阻行。插件主题缺宿主的 `borderAccent`/`surface3`/`surface4`：边框用 `border`、
+  按键芯片底用 `surface2`、placeholder 用 `foregroundMuted`（design-opus-v4 §6 的回退），暗色下边框比
+  宿主 composer 弱一档。
 - **正在行**：`CircleDot` + 「正在：<当前 todo>」（前缀 muted、内容 foreground，单行；
   `goalCurrentTaskLine`）。
-- **blocked 行**：`CircleAlert` + DSH 的 blockedReason 原文（两行内）；**disarmed 提示**：
-  「重开会话后自动续跑会停止」（设计 v1 §99 的一行提示）。
+- **blocked 行**：`CircleAlert` + DSH 的 blockedReason 原文（两行内）；**disarmed 提示**（文案 B，
+  design-opus-v4 §1）：「重开会话后自动续跑会停止，点「继续」恢复」/「Auto-continue stops when the
+  session is reopened. Press Resume to continue.」。提示里的按钮名与行尾 ▶ 按钮同名（en 按钮因此由
+  「Continue goal」改为「Resume goal」）。
 - **清除确认页（原位）**：点清除图标 → 提示「清除后目标不再续跑，无法撤销」→ 分隔线 →
   红色「清除目标」行（`Trash2` + `statusDanger`）→「取消」行。红色只在此态出现（destructive 是
   颜色，不是红按钮）。

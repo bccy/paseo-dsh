@@ -172,6 +172,34 @@ export function goalPillPresentation(answer: {
   return { visible: true, label: { kind: "running" }, tone: "normal" };
 }
 
+/** The copy `goalPillCopy` needs: the noun and the four full state names. */
+export interface GoalPillWords {
+  readonly title: string;
+  readonly running: string;
+  readonly notRunning: string;
+  readonly paused: string;
+  readonly blocked: string;
+}
+
+/**
+ * The trigger's two strings for one presentation (UI-v6).
+ *
+ * - `label`, the text drawn in the pill, is the noun 「目标」/「Goal」 in **every**
+ *   state; the glyph's colour and the running ring carry the state.
+ * - `title` is the state in full words. The host uses a button's `title` as its
+ *   accessibility name and desktop tooltip and as the phone sheet's header
+ *   (`plugins/buttons/view.tsx`), and the plugin API has no other
+ *   accessibility-name slot, so this is where a screen reader hears the state.
+ *   A hidden pill falls back to the noun.
+ */
+export function goalPillCopy(
+  presentation: GoalPillPresentation,
+  words: GoalPillWords,
+): { label: string; title: string } {
+  if (!presentation.visible) return { label: words.title, title: words.title };
+  return { label: words.title, title: words[presentation.label.kind] };
+}
+
 /* -------------------------------------------------------------------------- */
 /* The panel's row geometry (the host's numbers, value for value)              */
 /* -------------------------------------------------------------------------- */
@@ -264,8 +292,89 @@ export const GOAL_OBJECTIVE_LINE_HEIGHT = 20;
 /** The facts line's line height (`fontSize.sm` 12 → 16). */
 export const GOAL_FACTS_LINE_HEIGHT = 16;
 
-/** The edit field's floor: four lines of 20 (`menu-item.tsx:457-478`'s field). */
-export const GOAL_EDITOR_MIN_HEIGHT = 80;
+/* -------------------------------------------------------------------------- */
+/* The edit page: a small Paseo composer (design-opus-v4, direction C)         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The editor box: the host composer's `inputWrapper`
+ * (`composer/input/input.tsx:2259-2287`) at its compact padding — 16px radius,
+ * 8px top/bottom, 12px left/right, 12px between the text and the button row.
+ * The box sits 8px in from the panel edge so its 16px corner is concentric with
+ * the surface's 8px one.
+ */
+export const GOAL_EDITOR_RADIUS = 16;
+export const GOAL_EDITOR_PADDING_VERTICAL = 8;
+export const GOAL_EDITOR_PADDING_HORIZONTAL = 12;
+export const GOAL_EDITOR_GAP = 12;
+export const GOAL_EDITOR_MARGIN_HORIZONTAL = 8;
+
+/** The composer's 28px round send button (`input.tsx:2390-2398`). */
+export const GOAL_SAVE_BUTTON_SIZE = 28;
+
+/** A disabled send button is the same button at half opacity (`input.tsx:2429-2431`). */
+export const GOAL_SAVE_DISABLED_OPACITY = 0.5;
+
+/** The field grows from two lines to six, then scrolls inside the box. */
+export const GOAL_EDITOR_MIN_LINES = 2;
+export const GOAL_EDITOR_MAX_LINES = 6;
+
+/**
+ * The field's type: the host's `fontSize.content` (15 on web, 16 on native) at
+ * the composer's 1.4 line height (`input.tsx:2325-2345`). The plugin theme has
+ * no `fontSize`, so the two host values are restated here.
+ */
+export interface GoalEditorType {
+  readonly fontSize: number;
+  readonly lineHeight: number;
+}
+
+export function goalEditorType(web: boolean): GoalEditorType {
+  const fontSize = web ? 15 : 16;
+  return { fontSize, lineHeight: Math.round(fontSize * 1.4) };
+}
+
+/**
+ * The field's height for a measured text height: at least two lines, at most
+ * six. An unmeasured text (0, or a layout that never ran) is the two-line floor,
+ * never zero — an editor must never collapse to nothing.
+ */
+export function goalEditorHeight(measured: number, lineHeight: number): number {
+  const floor = GOAL_EDITOR_MIN_LINES * lineHeight;
+  const ceiling = GOAL_EDITOR_MAX_LINES * lineHeight;
+  if (!Number.isFinite(measured) || measured <= 0) return floor;
+  return Math.min(ceiling, Math.max(floor, Math.ceil(measured)));
+}
+
+/** The keys the edit field reacts to, as read from a key event. */
+export interface GoalEditKey {
+  readonly key: string;
+  readonly shiftKey: boolean;
+  /** An IME composition is in progress (`isComposing` or keyCode 229). */
+  readonly composing: boolean;
+  /**
+   * Whether Enter submits here: a pointer layout on web only, the host
+   * composer's rule (`input.tsx:1768`, `isWeb && !isCompact`). On a phone Enter
+   * is a newline and only the ✓ button saves.
+   */
+  readonly submitOnEnter: boolean;
+}
+
+/**
+ * What a key does in the edit field.
+ *
+ * - Escape cancels (a phone has no Escape, so this is a desktop key in practice).
+ * - Enter saves only where Enter submits, never with Shift (Shift+Enter is the
+ *   newline, `composer/input/state.ts:167-176`), and never mid-composition (the
+ *   Enter that commits an IME candidate is not a submit).
+ * - Everything else is typing.
+ */
+export function goalEditKeyAction(input: GoalEditKey): "save" | "cancel" | null {
+  if (input.key === "Escape") return "cancel";
+  if (input.key !== "Enter") return null;
+  if (!input.submitOnEnter || input.shiftKey || input.composing) return null;
+  return "save";
+}
 
 /**
  * The edit page's width on wide layouts: the popover surface's own 420 minus

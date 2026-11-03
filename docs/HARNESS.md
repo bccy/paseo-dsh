@@ -98,9 +98,11 @@
   `LANG`/`LC_ALL` 的优先级）和标签表覆盖：每个工具名在**两种语言**下都要有值，英文列是
   中文列的复制也要抓出来。goal 表另有几条：`GoalText.statuses` 必须恰好覆盖
   `shared/goal.ts` 声明的四个 phase 外加 `disarmed`（`active + disarmed` 的 facts 词「未在续跑」/
-  「Not continuing」；DSH 以后加 phase 时不能落到原始英文），`disarmedHint` 是设计原句
-  「重开会话后自动续跑会停止」，且 goal 的 label/按钮/提示文案中英两列都不得为空或互为复制
-  （实跑 367 条）。**动了 `client/locale.ts`、标签表或
+  「Not continuing」；DSH 以后加 phase 时不能落到原始英文），`disarmedHint` 是文案 B 逐字
+  （「重开会话后自动续跑会停止，点「继续」恢复」/「Auto-continue stops when the session is reopened.
+  Press Resume to continue.」），提示里点名的按钮与 ▶ 按钮同名（「继续目标」/「Resume goal」），
+  编辑页 `goal.editor` 表键齐全、键名（Esc/Enter/Shift Enter）两语一致、其余词中英不互抄，且 goal 的
+  label/按钮/提示文案中英两列都不得为空或互为复制（实跑 392 条）。**动了 `client/locale.ts`、标签表或
   `shared/goal.ts` 的 phase 枚举必跑。**
 - `harness/jobs-poll-check.cjs` — jobs 轮询状态机（假时钟 + 假 RPC + 假目录页，不 import
   React/host）：可见性（有 live 显示 live 数、无 live 隐藏；图标恒为转环，仅 `available:false`
@@ -571,32 +573,40 @@
   `dsh-bridge/lib/server.js` 的 `paseo/goal` 或 dispatch 必跑；改桥后先重生成内嵌桥
   （`node paseo-plugin/scripts/generate-bridge-assets.mjs`）再跑 `bridge-assets-check.mjs`，
   否则真机检查跑在旧桥上假绿。**
-- `harness/goal-pill-check.cjs` — goal pill 与 v5 行式面板的**数据层与 UI 规则**（**175 条**；
+- `harness/goal-pill-check.cjs` — goal pill 与行式面板的**数据层与 UI 规则**（**216 条**；
   假时钟 + 假 RPC + 假目录页，不 import React/host；UI 规则都抽在 `client/goal-polling.ts` 的
   纯函数里）：契约枚举与 wire schema（`GoalState` 缺 `activation` 必拒）、`goalCommandArguments`
-  的 DSH 语法、四态可见性/label/tone（label 无轮数分数：`目标进行中`/`目标未在续跑`/`目标已暂停`/
-  `目标受阻`）、面板行几何取宿主值（`goalTrackRow` 32/40、`goalMenuItem` 28/40、
+  的 DSH 语法、四态可见性/label/tone、**pill 文案**（`goalPillCopy` 用真实 locale 表：四态×中英
+  label 恒为「目标」/「Goal」，title=无障碍名是完整状态 `目标进行中`/`目标未在续跑`/`目标已暂停`/
+  `目标受阻`，无轮数分数；隐藏时回退名词）、面板行几何取宿主值（`goalTrackRow` 32/40、`goalMenuItem` 28/40、
   `goalIconButton` 20/32、鲸鱼 16、环框 14 偏移 -5）、facts 行（`goalFactsLine`：
   「进行中 · 第 N 轮 · 预算 M」，**`active + disarmed` 以「未在续跑」/「Not continuing」开头**）、
   运行环真值表（`goalRunningMark`：armed+running 才转、idle 后保持 `GOAL_RUNNING_HOLD_MS`=1500、
   disarmed/paused/blocked/complete 与读不到状态都不转、保持边界）、图标 tone→token
   （`goalIconColorToken`：`foregroundMuted`/`statusWarning`/`statusDanger`）、编辑页空草稿与
-  未改动草稿都不可保存（`goalEditDraftValid`/`goalEditSubmittable`）、trigger 与面板接线
-  （`title` 固定「目标」、静态 glyph 是 `Target`、没有填充按钮组件、旧 footnote 已删）、节奏常量与
+  未改动草稿都不可保存（`goalEditDraftValid`/`goalEditSubmittable`）、**编辑框（小号 composer）**
+  几何（圆角 16、内边距 8/12、gap 12、距边 8、✓ 28、禁用 0.5、2–6 行）、`goalEditorType`
+  （web 15/21、原生 16/22）、`goalEditorHeight` 夹取（未测量/NaN→2 行、12 行→6 行、小数向上取整）、
+  `goalEditKeyAction` 真值表（桌面 Enter 保存、Shift+Enter / 组字中 Enter / 手机 Enter 都不保存、
+  Esc 取消）、trigger 与面板接线（registration 走 `goalPillCopy`、静态 glyph 是 `Target`、没有填充
+  按钮组件、旧 footnote 与旧「保存」菜单行已删、按键走 `goalEditKeyAction`）、节奏常量与
   jobs 逐字一致（4000/30000/1000/2000）、控制器行为（答案签名去重、瞬时错误保持、终态停表、
   退避、`pollNow`、provider/workspace 过滤、closed 移除）。运行：
   `cd paseo-plugin && npx tsc -p ../harness/goal-pill.tsconfig.json`，写入
   `.dbg-goal/package.json`（`{"type":"commonjs"}`）并拷入本脚本，再在 `.dbg-goal` 里
-  `node goal-pill-check.cjs`。**动了 `client/goal-polling.ts`、`client/goal-popover.tsx`、
+  `node goal-pill-check.cjs`（`goal-pill.tsconfig.json` 一并编译 `client/locale.ts`，供文案断言用真实表）。**动了 `client/goal-polling.ts`、`client/goal-popover.tsx`、
   `client/goal-pill.tsx`、`client/goal-running.tsx`、`client/deepseek-mark*.tsx`、
   `client/agent-polling.ts`、`shared/goal.ts` 或 `client/locale.ts` 的 goal 表必跑；改共享轮询器时
   `jobs-poll-check.cjs` 必须同时全绿且断言数不减。**
-- `harness/goal-popover-render-check.cjs` — 面板的**渲染行为**（**51 条**）：用 esbuild 现编真实
+- `harness/goal-popover-render-check.cjs` — 面板的**渲染行为**（**69 条**）：用 esbuild 现编真实
   `GoalPopoverBody`，经 `react-native-web` 渲染进 jsdom（宿主 UI kit 的 `Icon`/`TextInput` 用小桩
-  代替：lucide 真 glyph、内联 SVG、react-native-web 真输入框）。断言：目标行是面板唯一的编辑入口、
-  两个行尾图标按钮不打开编辑、运行时鲸鱼角上出环、编辑页原位替换目标行（预填全文、光标在 0）、
-  编辑/清除页按密度用宿主菜单行高、空/未改动草稿禁用保存、回车保存 / Esc 取消 / **失焦不保存**、
-  清除确认页的红色行只在该页出现、disarmed 页有「自动续跑会停止」提示且 facts 为
+  代替：lucide 真 glyph、内联 SVG、react-native-web 真输入框；文案用真实 zh-CN 表）。断言：目标行是
+  面板唯一的编辑入口、两个行尾图标按钮不打开编辑、运行时鲸鱼角上出环、**编辑页是小号 composer**
+  （「编辑目标」头 + 鲸鱼、真 textarea、预填全文、光标在 0、未测量时 2 行 42px、上限 126px、15px、
+  没有「保存」菜单行）、✓「保存目标」对空/未改动草稿 `aria-disabled` + `opacity 0.5`，点击与回车都不提交、
+  改动后可提交；**桌面** Enter 保存、Shift+Enter 与组字中 Enter 不保存、Esc 取消、显示三组按键提示；
+  **手机** Enter 不保存、无按键提示、保留头部、点 ✓ 保存；**失焦既不保存也不取消**；清除页按密度用
+  宿主菜单行高、红色行只在该页出现、disarmed 页显示文案 B 全句且 facts 为
   「未在续跑 · 第 3 轮 · 预算 10」（不含「进行中」）、blocked 页显示原因。**需要 `HOST_APP`
   指向 Paseo 检出**（提供 react/react-dom/react-native-web/esbuild/jsdom/lucide-react）：
   `HOST_APP=/path/to/paseo node harness/goal-popover-render-check.cjs`；未设置时 **exit 2**

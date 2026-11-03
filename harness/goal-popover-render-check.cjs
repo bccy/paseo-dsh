@@ -2,11 +2,13 @@
  * Offline behaviour check for the goal popover's rendered DOM.
  *
  * The design is a track panel: one pressable objective row (with two icon
- * buttons), an in-place edit page and an in-place clear-confirmation page. A
- * source regex cannot prove that pressing the row opens the editor, that the two
- * icon buttons do not open it, that the field is pre-filled with the caret at 0,
- * that Save is disabled for an empty/unchanged draft, that Escape cancels, that
- * blur never saves, or that the clear page's red row appears only there. This
+ * buttons), an in-place edit page (design-opus-v4 direction C: a small Paseo
+ * composer) and an in-place clear-confirmation page. A source regex cannot prove
+ * that pressing the row opens the editor, that the two icon buttons do not open
+ * it, that the field is pre-filled with the caret at 0, that the round ✓ is
+ * inert for an empty/unchanged draft, that desktop Enter saves while Shift+Enter,
+ * an IME commit and a phone Enter do not, that Escape cancels, that blur never
+ * saves, or that the clear page's red row appears only there. This
  * script renders the **real** `GoalPopoverBody` through `react-native-web` into
  * jsdom and asserts exactly those behaviours.
  *
@@ -94,6 +96,7 @@ const entry = path.join(work, "entry.tsx");
 fs.writeFileSync(
   entry,
   `export { GoalPopoverBody } from ${JSON.stringify(path.join(pluginRoot, "client/goal-popover.tsx"))};
+export { allText } from ${JSON.stringify(path.join(pluginRoot, "client/locale.ts"))};
 export { createRoot } from "react-dom/client";
 export { createElement } from "react";
 export { flushSync } from "react-dom";
@@ -140,35 +143,12 @@ for (const name of ["ShadowRoot", "HTMLElement", "Element", "Node", "MutationObs
 }
 
 const bundled = require(path.join(work, "bundle.cjs"));
-const { GoalPopoverBody, createRoot, createElement, flushSync } = bundled;
+const { GoalPopoverBody, allText, createRoot, createElement, flushSync } = bundled;
 const React = { createElement };
 
-const text = {
-  title: "目标",
-  running: "目标进行中",
-  notRunning: "目标未在续跑",
-  paused: "目标已暂停",
-  blocked: "目标受阻",
-  statuses: { active: "进行中", paused: "已暂停", blocked: "受阻", complete: "已完成", disarmed: "未在续跑" },
-  rounds: (started, max) => `第 ${String(started)} 轮 · 预算 ${String(max)}`,
-  currentTaskPrefix: "正在：",
-  disarmedHint: "重开会话后自动续跑会停止",
-  clearHint: "清除后目标不再续跑，无法撤销",
-  actions: {
-    pauseTarget: "暂停目标",
-    resumeTarget: "继续目标",
-    edit: "编辑目标",
-    clearTarget: "清除目标",
-    save: "保存",
-    cancel: "取消",
-  },
-  editPlaceholder: "新的目标内容",
-  runningA11y: "目标运行中",
-  busy: "处理中…",
-  controlFailed: "目标命令执行失败。",
-  unavailable: "读不到本会话的目标。",
-  noGoal: "当前没有目标。",
-};
+// The shipped zh-CN copy, not a local copy: the disarmed hint and every label
+// asserted below are the strings the plugin actually draws.
+const text = allText()["zh-CN"].goal;
 
 const theme = {
   colors: {
@@ -268,10 +248,13 @@ function click(node) {
     node.dispatchEvent(new window.MouseEvent("click", { bubbles: true, cancelable: true }));
   });
 }
-function keydown(node, key) {
+function keydown(node, key, init = {}) {
   flushSync(() => {
-    node.dispatchEvent(new window.KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+    node.dispatchEvent(new window.KeyboardEvent("keydown", { key, bubbles: true, cancelable: true, ...init }));
   });
+}
+function field(container) {
+  return container.querySelector("input, textarea");
 }
 
 console.log("the objective row is the panel's only action target");
@@ -340,37 +323,96 @@ console.log("\nthe running ring turns on the whale's corner");
   assert("a non-running goal draws no ring", idle.querySelector('[role="progressbar"]') === null);
 }
 
-console.log("\nthe edit page is the field in place of the row");
+console.log("\nthe edit page is a small composer");
 {
   const { container, calls } = render({ mode: "edit", draft: baseGoal.objective });
-  const input = container.querySelector("input, textarea");
-  assert("the edit page renders a real field", input !== null);
+  assert("the edit page names itself 编辑目标", container.textContent.includes("编辑目标"));
+  assert("the edit page keeps the whale", container.querySelector('[data-icon="svg"]') !== null);
+  const input = field(container);
+  assert("the edit page renders a real multi-line field", input !== null && input.tagName === "TEXTAREA");
   check("the field is pre-filled with the full objective", input.value, baseGoal.objective);
   check("the caret starts at the beginning", input.selectionStart, 0);
-  assert("the edit page has a save row", byLabel(container, "保存") !== undefined);
-  assert("the edit page has a cancel row", byLabel(container, "取消") !== undefined);
+  // The field grows from two lines (2 × 21 on web) and stops at six (6 × 21).
+  // jsdom never lays the measuring copy out, so this is the two-line floor.
+  const style = input.getAttribute("style") ?? "";
+  assert("an unmeasured field is two lines tall", /(^|;)\s*height:\s*42px/.test(style), style);
+  assert("the field stops growing at six lines", /max-height:\s*126px/.test(style), style);
+  assert("the field uses the composer's 15px type", /font-size:\s*15px/.test(style), style);
+  // The old menu-row page is gone: no 保存 row, no separator under the field.
+  assert("there is no 保存 menu row", byLabel(container, "保存") === undefined);
+  assert("the save button is named 保存目标", byLabel(container, "保存目标") !== undefined);
   // The now line is hidden while editing: the panel does one thing at a time.
   assert("the now line is hidden while editing", !container.textContent.includes("正在："));
   click(byLabel(container, "取消"));
-  check("cancel leaves the edit page", calls.cancelEdit, 1);
+  check("取消 leaves the edit page", calls.cancelEdit, 1);
 }
 
-console.log("\nthe edit and clear pages follow the host's menu density");
+console.log("\nthe round ✓ is inert for an empty or unchanged draft");
+{
+  for (const [what, draft] of [["blank", "   "], ["unchanged", baseGoal.objective]]) {
+    const { container, calls } = render({ mode: "edit", draft });
+    const save = byLabel(container, "保存目标");
+    assert(`✓ is disabled for a ${what} draft`, save.getAttribute("aria-disabled") === "true", save.outerHTML);
+    assert(`✓ is half opacity for a ${what} draft`, /opacity:\s*0\.5/.test(save.getAttribute("style") ?? ""), save.getAttribute("style"));
+    click(save);
+    check(`clicking ✓ on a ${what} draft submits nothing`, calls.save, 0);
+    keydown(field(container), "Enter");
+    check(`desktop Enter on a ${what} draft submits nothing`, calls.save, 0);
+  }
+  const changed = render({ mode: "edit", draft: `${baseGoal.objective}（已改）` });
+  const save = byLabel(changed.container, "保存目标");
+  assert("✓ is enabled for a changed draft", save.getAttribute("aria-disabled") !== "true", save.outerHTML);
+  assert("an enabled ✓ is fully opaque", /opacity:\s*1(;|$)/.test(save.getAttribute("style") ?? ""), save.getAttribute("style"));
+  click(save);
+  check("clicking ✓ submits", changed.calls.save, 1);
+}
+
+console.log("\ndesktop keys: Enter saves, Shift+Enter and an IME commit do not, Escape cancels");
+{
+  const dirty = `${baseGoal.objective}（已改）`;
+  const desk = render({ mode: "edit", draft: dirty });
+  assert("desktop shows the Enter hint", desk.container.textContent.includes("Enter保存"));
+  assert("desktop shows the Shift Enter hint", desk.container.textContent.includes("Shift Enter换行"));
+  assert("desktop shows the Esc hint", desk.container.textContent.includes("Esc取消"));
+  keydown(field(desk.container), "Enter", { shiftKey: true });
+  check("Shift+Enter does not save", desk.calls.save, 0);
+  keydown(field(desk.container), "Enter", { isComposing: true });
+  check("an Enter that commits an IME candidate does not save", desk.calls.save, 0);
+  keydown(field(desk.container), "Enter");
+  check("desktop Enter saves", desk.calls.save, 1);
+  keydown(field(desk.container), "Escape");
+  check("Escape cancels", desk.calls.cancelEdit, 1);
+
+  const phone = render({ mode: "edit", draft: dirty, compact: true });
+  keydown(field(phone.container), "Enter");
+  check("phone Enter is a newline, not a save", phone.calls.save, 0);
+  assert("phone shows no key hints", !phone.container.textContent.includes("Enter"));
+  assert("phone shows no Esc hint", !phone.container.textContent.includes("Esc"));
+  assert("phone keeps the 编辑目标 header", phone.container.textContent.includes("编辑目标"));
+  click(byLabel(phone.container, "保存目标"));
+  check("phone ✓ saves", phone.calls.save, 1);
+}
+
+console.log("\nblur never saves");
+{
+  const blur = render({ mode: "edit", draft: `${baseGoal.objective}（已改）` });
+  const blurred = field(blur.container);
+  // React's onBlur is delegated from `focusout`; dispatching `blur` alone never
+  // reaches it, which would make this check pass no matter what the component
+  // does. `blur()` + focusout is the real path.
+  flushSync(() => {
+    blurred.focus();
+    blurred.blur();
+    blurred.dispatchEvent(new window.FocusEvent("focusout", { bubbles: true }));
+  });
+  check("blur never saves", blur.calls.save, 0);
+  check("blur never cancels either", blur.calls.cancelEdit, 0);
+}
+
+console.log("\nthe clear page follows the host's menu density");
 {
   // menu-item.tsx:441's `MENU_ITEM_HEIGHT` is 40 under a finger and 28 on a
-  // pointer layout. The phone sheet must use the 40px row: the design's editing
-  // screenshot shows two 40px rows, and the first implementation hard-coded the
-  // wide 28 — the two rows collided and the sheet was shorter than the design.
-  const phone = render({ mode: "edit", draft: baseGoal.objective, compact: true });
-  for (const label of ["保存", "取消"]) {
-    const row = byLabel(phone.container, label);
-    assert(`the phone ${label} row is the host's 40px item`, /min-height:\s*40px/.test(row?.getAttribute("style") ?? ""), row?.getAttribute("style") ?? "missing");
-  }
-  const wide = render({ mode: "edit", draft: baseGoal.objective, compact: false });
-  for (const label of ["保存", "取消"]) {
-    const row = byLabel(wide.container, label);
-    assert(`the wide ${label} row is the host's 28px item`, /min-height:\s*28px/.test(row?.getAttribute("style") ?? ""), row?.getAttribute("style") ?? "missing");
-  }
+  // pointer layout.
   const confirmPhone = render({ mode: "confirm", compact: true });
   for (const label of ["清除目标", "取消"]) {
     const row = byLabel(confirmPhone.container, label);
@@ -381,48 +423,6 @@ console.log("\nthe edit and clear pages follow the host's menu density");
     const row = byLabel(confirmWide.container, label);
     assert(`the wide clear page's ${label} row is the host's 28px item`, /min-height:\s*28px/.test(row?.getAttribute("style") ?? ""), row?.getAttribute("style") ?? "missing");
   }
-}
-
-console.log("\nsave is disabled for an empty or unchanged draft");
-{
-  const empty = render({ mode: "edit", draft: "   " });
-  const emptySave = byLabel(empty.container, "保存");
-  assert("save is disabled for a blank draft", emptySave.getAttribute("aria-disabled") === "true", emptySave.outerHTML);
-  click(emptySave);
-  check("clicking a disabled save submits nothing", empty.calls.save, 0);
-
-  const unchanged = render({ mode: "edit", draft: baseGoal.objective });
-  const unchangedSave = byLabel(unchanged.container, "保存");
-  assert("save is disabled for an unchanged draft", unchangedSave.getAttribute("aria-disabled") === "true", unchangedSave.outerHTML);
-
-  const changed = render({ mode: "edit", draft: `${baseGoal.objective}（已改）` });
-  const changedSave = byLabel(changed.container, "保存");
-  assert("save is enabled for a changed draft", changedSave.getAttribute("aria-disabled") !== "true", changedSave.outerHTML);
-  click(changedSave);
-  check("clicking save submits", changed.calls.save, 1);
-}
-
-console.log("\nEnter saves, Escape cancels, blur never saves");
-{
-  const enter = render({ mode: "edit", draft: `${baseGoal.objective}（已改）` });
-  const input = enter.container.querySelector("input, textarea");
-  keydown(input, "Enter");
-  check("Enter saves", enter.calls.save, 1);
-
-  const escape = render({ mode: "edit", draft: baseGoal.objective });
-  keydown(escape.container.querySelector("input, textarea"), "Escape");
-  check("Escape cancels", escape.calls.cancelEdit, 1);
-
-  const blur = render({ mode: "edit", draft: `${baseGoal.objective}（已改）` });
-  const blurred = blur.container.querySelector("input, textarea");
-  // React's onBlur is delegated from `focusout`; dispatching `blur` alone never
-  // reaches it, which would make this check pass no matter what the component
-  // does. `blur()` + focusout is the real path.
-  flushSync(() => {
-    blurred.blur();
-    blurred.dispatchEvent(new window.FocusEvent("focusout", { bubbles: true }));
-  });
-  check("blur never saves", blur.calls.save, 0);
 }
 
 console.log("\nthe clear page is the design's confirmation");
@@ -454,7 +454,11 @@ console.log("\nthe clear page is the design's confirmation");
 console.log("\nthe disarmed and blocked pages keep the design's rows");
 {
   const disarmed = render({ goal: { ...baseGoal, activation: "disarmed" } }).container;
-  assert("a disarmed goal explains itself", disarmed.textContent.includes("自动续跑会停止"));
+  assert(
+    "a disarmed goal shows hint B in full",
+    disarmed.textContent.includes("重开会话后自动续跑会停止，点「继续」恢复"),
+    disarmed.textContent,
+  );
   // The facts line must agree with the pill's 目标未在续跑, not say 进行中.
   assert("a disarmed goal's facts say 未在续跑", disarmed.textContent.includes("未在续跑 · 第 3 轮 · 预算 10"));
   assert("a disarmed goal's facts do not say 进行中", !disarmed.textContent.includes("进行中"));

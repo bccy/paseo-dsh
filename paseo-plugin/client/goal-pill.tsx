@@ -15,15 +15,16 @@
  * channel for daemon-side reads; the cadence is the jobs pill's, shared through
  * `client/agent-polling.ts`.
  *
- * **What the trigger can and cannot show (design-opus-v3).** The host draws a
- * pill's label as plain text in a 160px-wide button and paints its icon from
- * `color`/`size` only, so the *label* says the state in words (「目标进行中」/
- * 「目标未在续跑」/「目标已暂停」/「目标受阻」) while the **icon is a custom component**:
- * the running ring while the goal is really running, otherwise a `Target` glyph
- * coloured by tone (`goalIconColorToken`: muted while armed, warning when not
- * continuing, danger when blocked). The `title` is the fixed noun 「目标」/「Goal」
- * — it is the phone sheet's header and the accessibility name, and the full
- * objective lives once in the popover body instead of twice.
+ * **What the trigger can and cannot show (UI-v6).** The *label* is the fixed
+ * noun 「目标」/「Goal」 in every state. The state is shown by the **icon**, a
+ * custom component — the running ring while the goal is really running,
+ * otherwise a `Target` glyph coloured by tone (`goalIconColorToken`: muted while
+ * armed, warning when not continuing, danger when blocked) — and spelled out in
+ * the button's `title` (「目标进行中」/「目标未在续跑」/「目标已暂停」/「目标受阻」).
+ * The host uses `title` as the button's accessibility name and desktop tooltip,
+ * and as the phone sheet's header (`plugins/buttons/view.tsx`): the plugin API
+ * has no separate accessibility-name slot, so a screen reader can only hear the
+ * state through `title`. The full objective still lives once, in the popover body.
  *
  * **What is never shown.** A goal the user cannot read is not "no goal": the
  * poller keeps the last state on a transient error, and a terminal error (a
@@ -49,15 +50,15 @@ import {
   createGoalPoller,
   goalEditSubmittable,
   goalIconColorToken,
+  goalPillCopy,
   goalPillPresentation,
-  type GoalLabel,
   type GoalPoller,
   type GoalTone,
   type GoalViewState,
 } from "./goal-polling";
 import { FACTS_FONT_SIZE, ringColorFor } from "./jobs-popover-layout";
 import { StatusRingMark } from "./status-ring";
-import { localeText, type GoalText } from "./locale";
+import { localeText } from "./locale";
 
 /** One agent's latest answer, plus the listeners the pill and popover subscribe with. */
 interface AgentGoal {
@@ -71,20 +72,6 @@ interface AgentGoal {
 
 /** The live answer per agent, shared by the pill, its glyph and its popover. */
 export type GoalStore = Map<string, AgentGoal>;
-
-/** The label copy for one semantic label key. */
-function goalLabelText(label: GoalLabel, text: GoalText): string {
-  switch (label.kind) {
-    case "running":
-      return text.running;
-    case "notRunning":
-      return text.notRunning;
-    case "paused":
-      return text.paused;
-    case "blocked":
-      return text.blocked;
-  }
-}
 
 /** The tone the trigger's glyph should draw with for one stored answer. */
 function goalToneOf(entry: AgentGoal | undefined): GoalTone {
@@ -344,15 +331,11 @@ export function contributeGoalPill(client: PluginClientContext) {
     });
     const presentation = goalPillPresentation(next);
     const text = localeText().goal;
-    const label = presentation.visible ? goalLabelText(presentation.label, text) : text.title;
-    registration.update({
-      visible: presentation.visible,
-      label,
-      // The title is the fixed noun: it is the phone sheet's header and the
-      // button's accessibility name, while the full objective is drawn once, in
-      // the popover body. An objective here would print it twice on a phone.
-      title: text.title,
-    });
+    // The label is the noun in every state; the title is the state in full
+    // words (the host's accessibility name, tooltip and phone sheet header).
+    // Never the objective — that would print it twice on a phone.
+    const { label, title } = goalPillCopy(presentation, text);
+    registration.update({ visible: presentation.visible, label, title });
   };
 
   const poller: GoalPoller = createGoalPoller({

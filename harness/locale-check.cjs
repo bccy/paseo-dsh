@@ -316,6 +316,7 @@ console.log("the goal pill's copy is covered in both languages");
     "disarmedHint",
     "clearHint",
     "actions",
+    "editor",
     "editPlaceholder",
     "runningA11y",
     "busy",
@@ -347,14 +348,21 @@ console.log("the goal pill's copy is covered in both languages");
   // design's disarmed state (v1 §98).
   check("goal.statuses.disarmed is `Not continuing` (en)", en.statuses.disarmed === "Not continuing", JSON.stringify(en.statuses.disarmed));
   check("goal.statuses.disarmed is `未在续跑` (zh-CN)", zh.statuses.disarmed === "未在续跑", JSON.stringify(zh.statuses.disarmed));
-  // The disarmed hint is the design's one-line sentence (v1 §99), not a longer
-  // explanation.
-  check("goal.disarmedHint is the design's sentence (zh-CN)", zh.disarmedHint === "重开会话后自动续跑会停止", JSON.stringify(zh.disarmedHint));
+  // The disarmed hint is copy B (design-opus-v4 §1): the reason and the fix,
+  // verbatim in both languages. The fix names the ▶ button, so its name must be
+  // the button's own (checked below).
   check(
-    "goal.disarmedHint says a reopen stops auto-continue (en)",
-    en.disarmedHint.toLowerCase().includes("reopen") && en.disarmedHint.toLowerCase().includes("stops"),
+    "goal.disarmedHint is hint B (zh-CN)",
+    zh.disarmedHint === "重开会话后自动续跑会停止，点「继续」恢复",
+    JSON.stringify(zh.disarmedHint),
+  );
+  check(
+    "goal.disarmedHint is hint B (en)",
+    en.disarmedHint === "Auto-continue stops when the session is reopened. Press Resume to continue.",
     JSON.stringify(en.disarmedHint),
   );
+  check("the hint names the ▶ button (zh-CN)", zh.disarmedHint.includes("继续") && zh.actions.resumeTarget.startsWith("继续"));
+  check("the hint names the ▶ button (en)", en.disarmedHint.includes("Resume") && en.actions.resumeTarget.startsWith("Resume"));
 
   // The clear page's hint is the design's sentence: clearing is final. Verbatim
   // in Chinese; English must say the same thing.
@@ -397,7 +405,7 @@ console.log("the goal pill's copy is covered in both languages");
   equal("goal.actions keys match", Object.keys(en.actions).sort(), Object.keys(zh.actions).sort());
   for (const locale of LOCALES) {
     const actions = allText()[locale].goal.actions;
-    for (const key of ["pauseTarget", "resumeTarget", "edit", "clearTarget", "save", "cancel"]) {
+    for (const key of ["pauseTarget", "resumeTarget", "edit", "clearTarget", "cancel"]) {
       check(
         `goal.actions.${key} is a non-empty string in ${locale}`,
         typeof actions[key] === "string" && actions[key].trim() !== "",
@@ -411,11 +419,39 @@ console.log("the goal pill's copy is covered in both languages");
   check("the clear row names the goal (zh-CN)", zh.actions.clearTarget === "清除目标", JSON.stringify(zh.actions.clearTarget));
   check("the pause button names the goal (en)", en.actions.pauseTarget === "Pause goal", JSON.stringify(en.actions.pauseTarget));
   check("the pause button names the goal (zh-CN)", zh.actions.pauseTarget === "暂停目标", JSON.stringify(zh.actions.pauseTarget));
-  check("the continue button names the goal (en)", en.actions.resumeTarget === "Continue goal", JSON.stringify(en.actions.resumeTarget));
+  check("the resume button names the goal (en)", en.actions.resumeTarget === "Resume goal", JSON.stringify(en.actions.resumeTarget));
   check("the continue button names the goal (zh-CN)", zh.actions.resumeTarget === "继续目标", JSON.stringify(zh.actions.resumeTarget));
   equal(
     "the English actions are not the Chinese actions",
-    ["pauseTarget", "resumeTarget", "edit", "clearTarget", "save", "cancel"].filter((key) => en.actions[key] === zh.actions[key]),
+    ["pauseTarget", "resumeTarget", "edit", "clearTarget", "cancel"].filter((key) => en.actions[key] === zh.actions[key]),
+    [],
+  );
+
+  // The edit page (design-opus-v4 direction C). Key names stay as the keyboard
+  // prints them in both languages; every other string is translated.
+  equal("goal.editor keys match", Object.keys(en.editor).sort(), Object.keys(zh.editor).sort());
+  const editorKeys = ["title", "save", "cancel", "escKey", "escHint", "enterKey", "enterHint", "shiftEnterKey", "shiftEnterHint"];
+  equal("goal.editor has exactly the page's strings", Object.keys(zh.editor).sort(), [...editorKeys].sort());
+  for (const locale of LOCALES) {
+    const editor = allText()[locale].goal.editor;
+    for (const key of editorKeys) {
+      check(
+        `goal.editor.${key} is a non-empty string in ${locale}`,
+        typeof editor[key] === "string" && editor[key].trim() !== "",
+        JSON.stringify(editor[key]),
+      );
+    }
+  }
+  check("the editor header is 编辑目标 (zh-CN)", zh.editor.title === "编辑目标", JSON.stringify(zh.editor.title));
+  check("the ✓ button is named 保存目标 (zh-CN)", zh.editor.save === "保存目标", JSON.stringify(zh.editor.save));
+  equal(
+    "key names are the keyboard's in both languages",
+    [en.editor.escKey, en.editor.enterKey, en.editor.shiftEnterKey],
+    [zh.editor.escKey, zh.editor.enterKey, zh.editor.shiftEnterKey],
+  );
+  equal(
+    "the English editor words are not the Chinese ones",
+    ["title", "save", "cancel", "escHint", "enterHint", "shiftEnterHint"].filter((key) => en.editor[key] === zh.editor[key]),
     [],
   );
 

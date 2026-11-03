@@ -44,8 +44,16 @@ const {
   goalControl,
 } = require("./shared/goal.js");
 const {
-  GOAL_EDITOR_MIN_HEIGHT,
+  GOAL_EDITOR_GAP,
+  GOAL_EDITOR_MARGIN_HORIZONTAL,
+  GOAL_EDITOR_MAX_LINES,
+  GOAL_EDITOR_MIN_LINES,
+  GOAL_EDITOR_PADDING_HORIZONTAL,
+  GOAL_EDITOR_PADDING_VERTICAL,
+  GOAL_EDITOR_RADIUS,
   GOAL_EDITOR_WIDTH_WIDE,
+  GOAL_SAVE_BUTTON_SIZE,
+  GOAL_SAVE_DISABLED_OPACITY,
   GOAL_FACTS_LINE_HEIGHT,
   GOAL_HINT_PADDING_HORIZONTAL,
   GOAL_HINT_PADDING_VERTICAL,
@@ -63,17 +71,23 @@ const {
   createGoalPoller,
   goalCurrentTaskLine,
   goalEditDraftValid,
+  goalEditKeyAction,
   goalEditSubmittable,
+  goalEditorHeight,
+  goalEditorType,
   goalFactsLine,
   goalIconButton,
   goalIconColorToken,
   goalMenuItem,
+  goalPillCopy,
   goalPillPresentation,
   goalRunningMark,
   goalTrackRow,
   initialPollDelayMs,
   nextPollDelayMs,
 } = require("./client/goal-polling.js");
+const { allText } = require("./client/locale.js");
+const LOCALE_TEXT = allText();
 
 let failures = 0;
 let checks = 0;
@@ -345,7 +359,17 @@ console.log("\nthe panel rows use the host's track geometry");
   equal("the corner ring offset is the host's -5", GOAL_RING_OFFSET, -5);
   equal("the objective line is 20", GOAL_OBJECTIVE_LINE_HEIGHT, 20);
   equal("the facts line is 16", GOAL_FACTS_LINE_HEIGHT, 16);
-  equal("the edit field is four lines tall", GOAL_EDITOR_MIN_HEIGHT, 80);
+  // The edit box is the host composer's `inputWrapper` at compact padding and
+  // its 28px send button (composer/input/input.tsx:2259-2287, :2390-2398).
+  equal("the edit box radius is the composer's 16", GOAL_EDITOR_RADIUS, 16);
+  equal("the edit box pads 8 vertically", GOAL_EDITOR_PADDING_VERTICAL, 8);
+  equal("the edit box pads 12 horizontally", GOAL_EDITOR_PADDING_HORIZONTAL, 12);
+  equal("the edit box's text-to-buttons gap is 12", GOAL_EDITOR_GAP, 12);
+  equal("the edit box sits 8 in from the panel edge", GOAL_EDITOR_MARGIN_HORIZONTAL, 8);
+  equal("the save button is the composer's 28", GOAL_SAVE_BUTTON_SIZE, 28);
+  equal("a disabled save button is half opacity", GOAL_SAVE_DISABLED_OPACITY, 0.5);
+  equal("the field grows from two lines", GOAL_EDITOR_MIN_LINES, 2);
+  equal("the field stops growing at six lines", GOAL_EDITOR_MAX_LINES, 6);
   equal("the edit page is the popover's content width", GOAL_EDITOR_WIDTH_WIDE, 396);
   equal("the separator is 1px", GOAL_SEPARATOR_HEIGHT, 1);
   equal("the separator breathes 4", GOAL_SEPARATOR_MARGIN_VERTICAL, 4);
@@ -434,6 +458,51 @@ console.log("\nthe edit page refuses empty and unchanged drafts");
   equal("a non-empty draft alone", goalEditDraftValid("x"), true);
 }
 
+console.log("\nthe edit field's height grows from two lines to six");
+{
+  equal("web type is the composer's 15/21", goalEditorType(true), { fontSize: 15, lineHeight: 21 });
+  equal("native type is the composer's 16/22", goalEditorType(false), { fontSize: 16, lineHeight: 22 });
+  equal("an unmeasured field is two lines", goalEditorHeight(0, 21), 42);
+  equal("a NaN measurement is two lines", goalEditorHeight(Number.NaN, 21), 42);
+  equal("one line of text still gets two", goalEditorHeight(21, 21), 42);
+  equal("four lines are four lines", goalEditorHeight(84, 21), 84);
+  equal("a fractional height rounds up", goalEditorHeight(84.4, 21), 85);
+  equal("twelve lines stop at six", goalEditorHeight(252, 21), 126);
+}
+
+console.log("\nkeys in the edit field follow the host composer");
+{
+  const desk = { shiftKey: false, composing: false, submitOnEnter: true };
+  const phone = { shiftKey: false, composing: false, submitOnEnter: false };
+  equal("desktop Enter saves", goalEditKeyAction({ ...desk, key: "Enter" }), "save");
+  equal("desktop Shift+Enter is a newline", goalEditKeyAction({ ...desk, key: "Enter", shiftKey: true }), null);
+  equal("Enter that commits an IME candidate is not a save", goalEditKeyAction({ ...desk, key: "Enter", composing: true }), null);
+  equal("desktop Escape cancels", goalEditKeyAction({ ...desk, key: "Escape" }), "cancel");
+  equal("phone Enter is a newline", goalEditKeyAction({ ...phone, key: "Enter" }), null);
+  equal("typing does nothing", goalEditKeyAction({ ...desk, key: "a" }), null);
+}
+
+console.log("\nthe pill reads 目标 in every state; its name carries the state");
+{
+  const cases = [
+    ["running", goal(), "目标进行中", "Goal running"],
+    ["notRunning", goal({ activation: "disarmed" }), "目标未在续跑", "Goal not running"],
+    ["paused", goal({ phase: "paused" }), "目标已暂停", "Goal paused"],
+    ["blocked", goal({ phase: "blocked", blockedReason: { code: "x", message: "y" } }), "目标受阻", "Goal blocked"],
+  ];
+  for (const [what, value, zhTitle, enTitle] of cases) {
+    const presentation = goalPillPresentation({ available: true, goal: value });
+    const zh = goalPillCopy(presentation, LOCALE_TEXT["zh-CN"].goal);
+    const en = goalPillCopy(presentation, LOCALE_TEXT.en.goal);
+    equal(`${what}: the zh label is the noun`, zh.label, "目标");
+    equal(`${what}: the en label is the noun`, en.label, "Goal");
+    equal(`${what}: the zh name says the state`, zh.title, zhTitle);
+    equal(`${what}: the en name says the state`, en.title, enTitle);
+  }
+  const hidden = goalPillCopy(goalPillPresentation({ available: true, goal: null }), LOCALE_TEXT["zh-CN"].goal);
+  equal("a hidden pill falls back to the noun", hidden, { label: "目标", title: "目标" });
+}
+
 /* The popover's wiring (source-level: it is JSX) ---------------------------- */
 
 console.log("\nthe trigger and popover wiring");
@@ -449,7 +518,9 @@ console.log("\nthe trigger and popover wiring");
   const popover = readRepo("paseo-plugin/client/goal-popover.tsx");
   const mark = readRepo("paseo-plugin/client/deepseek-mark.tsx");
 
-  assert("the trigger's title is the fixed noun", /title: text\.title/.test(pill));
+  // The label/title strings themselves are asserted behaviourally above; this
+  // pins that the registration uses that rule rather than its own copy.
+  assert("the trigger's strings come from goalPillCopy", /const \{ label, title \} = goalPillCopy\(presentation, text\)/.test(pill));
   assert("the trigger's title is not the objective", !/title:.*goal\.objective/.test(pill));
   // The pill's icon slot: the running ring replaces the glyph, else a Target.
   assert(
@@ -461,9 +532,12 @@ console.log("\nthe trigger and popover wiring");
   assert("the objective row is a track row", /goalTrackRow\(compact\)/.test(popover));
   assert("the objective is one truncated line", /numberOfLines=\{1\}[\s\S]{0,400}?\{goal\.objective\}/.test(popover));
   assert("the facts line comes from the pure rule", /goalFactsLine\(goal, text\.statuses, text\.rounds\)/.test(popover));
-  // The edit and clear pages are the host's menu rows, at the **panel's own
-  // density**: the phone sheet's rows are 40px, not the wide layout's 28.
-  assert("the edit page uses the menu row at the panel density", /goalMenuItem\(compact\)/.test(popover));
+  // The clear page is the host's menu rows, at the **panel's own density**: the
+  // phone sheet's rows are 40px, not the wide layout's 28. The edit page is no
+  // longer a menu (design-opus-v4 direction C) — its rows must not come back.
+  assert("the clear page uses the menu row at the panel density", /goalMenuItem\(compact\)/.test(popover));
+  assert("the edit page has no save menu row", !/label=\{text\.actions\.save\}/.test(popover));
+  assert("the edit keys go through the pure rule", /goalEditKeyAction\(\{/.test(popover));
   assert("the clear page's row is destructive", /destructive/.test(popover));
   // The old button component and the footnote are gone.
   assert("no filled-button component remains", !/function ActionButton/.test(popover));
