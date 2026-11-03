@@ -422,21 +422,75 @@ console.log("\nblur never saves");
   check("blur never cancels either", blur.calls.cancelEdit, 0);
 }
 
-console.log("\nthe clear page follows the host's menu density");
+console.log("\nthe clear page holds the view page's row in place (UI-v9 direction B)");
 {
-  // menu-item.tsx:441's `MENU_ITEM_HEIGHT` is 40 under a finger and 28 on a
-  // pointer layout.
-  const confirmPhone = render({ mode: "confirm", compact: true });
-  for (const label of ["清除目标", "取消"]) {
-    const row = byLabel(confirmPhone.container, label);
-    assert(`the phone clear page's ${label} row is the host's 40px item`, /min-height:\s*40px/.test(row?.getAttribute("style") ?? ""), row?.getAttribute("style") ?? "missing");
-  }
-  const confirmWide = render({ mode: "confirm", compact: false });
-  for (const label of ["清除目标", "取消"]) {
-    const row = byLabel(confirmWide.container, label);
-    assert(`the wide clear page's ${label} row is the host's 28px item`, /min-height:\s*28px/.test(row?.getAttribute("style") ?? ""), row?.getAttribute("style") ?? "missing");
+  for (const compact of [true, false]) {
+    const where = compact ? "phone" : "wide";
+    const { container } = render({ mode: "confirm", compact });
+    const buttons = [...container.querySelectorAll('[role="button"]')];
+    check(`the ${where} clear page has exactly two buttons`, buttons.length, 2);
+    const red = byLabel(container, "清除目标");
+    const size = compact ? 32 : 24;
+    const style = red?.getAttribute("style") ?? "";
+    assert(`the ${where} red button is ${size}px round`, new RegExp(`width:\\s*${size}px`).test(style) && new RegExp(`height:\\s*${size}px`).test(style), style);
+    assert(`the ${where} red button is filled statusDanger`, /background-color:\s*rgb\(157, 67, 59\)/.test(style), style);
+    assert(`the ${where} red button carries the trash glyph`, red?.querySelector('[data-icon="Trash2"]') !== null);
+    const cancel = byLabel(container, "取消");
+    const cancelStyle = cancel?.getAttribute("style") ?? "";
+    assert(`the ${where} 取消 is quiet (transparent)`, !/background-color:\s*rgb\(157, 67, 59\)/.test(cancelStyle) && !/background-color:\s*rgb\(32, 116, 74\)/.test(cancelStyle), cancelStyle);
+    const cancelText = [...cancel.querySelectorAll("div,span")].find((node) => (node.textContent ?? "").trim() === "取消");
+    assert(`the ${where} 取消 text is muted`, /color:\s*rgb\(113, 113, 122\)/.test(cancelText?.getAttribute("style") ?? ""), cancelText?.outerHTML);
+    // The objective row: whale, one truncated line, facts — not a button.
+    const rowNode = byLabel(container, `目标进行中，${baseGoal.objective}`);
+    assert(`the ${where} clear page shows which goal (row named by state + objective)`, rowNode !== undefined);
+    assert(`…and the row is not a button`, rowNode?.getAttribute("role") !== "button");
+    assert(`the ${where} clear page draws the whale`, container.querySelector('[data-icon="svg"]') !== null);
+    assert(`the ${where} clear page has no running ring`, container.querySelector('[role="progressbar"]') === null);
+    assert(`the ${where} clear page draws the facts`, container.textContent.includes("进行中 · 第 3 轮 · 预算 10"));
+    const objective = [...container.querySelectorAll("div,span")].find((node) => (node.textContent ?? "").trim() === baseGoal.objective);
+    const classes = objective?.getAttribute("class") ?? "";
+    assert(`the ${where} objective is one truncated line`, /whiteSpace/.test(classes) && /textOverflow/.test(classes), classes);
+    // The hint comes after the row (below it), not above.
+    const html = container.innerHTML;
+    assert(`the ${where} hint sits below the row`, html.indexOf(baseGoal.objective) < html.indexOf("清除后目标不再续跑"));
   }
 }
+
+console.log("\nthe red button ignores a press for the first 400ms (double-click guard)");
+const armChecks = (async () => {
+  const { container, calls } = render({ mode: "confirm" });
+  const red = byLabel(container, "清除目标");
+  const style = red.getAttribute("style") ?? "";
+  assert("the fresh red button is faded", /opacity:\s*0\.35/.test(style), style);
+  assert("the fresh red button is shrunk", /scale\(0\.86\)/.test(style), style);
+  check("the fresh red button says it is disabled", red.getAttribute("aria-disabled"), "true");
+  click(red);
+  check("a press in the first 400ms does not clear", calls.confirmClear, 0);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  click(byLabel(container, "清除目标"));
+  check("…nor at 200ms", calls.confirmClear, 0);
+  // 取消 is live from the first frame.
+  click(byLabel(container, "取消"));
+  check("取消 works at once", calls.cancelClear, 1);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const armed = byLabel(container, "清除目标");
+  const armedStyle = armed.getAttribute("style") ?? "";
+  assert("after 400ms the red button is opaque", !/opacity:\s*0\.35/.test(armedStyle), armedStyle);
+  assert("…and full size", /scale\(1\)/.test(armedStyle), armedStyle);
+  assert("…and no longer disabled", armed.getAttribute("aria-disabled") !== "true");
+  click(armed);
+  check("after 400ms the press clears", calls.confirmClear, 1);
+
+  // Busy: the red button spins and is inert; 取消 stays live (interaction unchanged).
+  const busy = render({ mode: "confirm", busy: true });
+  await new Promise((resolve) => setTimeout(resolve, 450));
+  const busyRed = byLabel(busy.container, "清除目标");
+  assert("a busy red button shows the spinner", busyRed.querySelector('[role="progressbar"]') !== null, busyRed.innerHTML);
+  click(busyRed);
+  check("a busy red button does not clear again", busy.calls.confirmClear, 0);
+  click(byLabel(busy.container, "取消"));
+  check("取消 still works while busy", busy.calls.cancelClear, 1);
+})();
 
 console.log("\nthe objective row names every non-complete state");
 {
@@ -496,30 +550,43 @@ console.log("\nthe complete page is read-only, with only clear (UI-v7)");
   assert("an active goal's clear page keeps its sentence", active.textContent.includes("清除后目标不再续跑，无法撤销"));
 }
 
-console.log("\nthe clear page is the design's confirmation");
+console.log("\nthe clear page's red appears only there");
 {
-  const { container, calls } = render({ mode: "confirm" });
+  const { container } = render({ mode: "confirm" });
   assert("the clear page shows the hint", container.textContent.includes("清除后目标不再续跑，无法撤销"));
-  const clearRow = byLabel(container, "清除目标");
-  assert("the clear page's row is named 清除目标", clearRow !== undefined);
-  // The **label** must be red (a `MenuItem destructive`), not just the glyph:
-  // the colour lives on the text node, so the icon cannot satisfy this check.
-  const clearLabel = [...clearRow.querySelectorAll("div,span")].find(
-    (node) => (node.textContent ?? "").trim() === "清除目标",
-  );
-  assert(
-    "the clear row's label is red",
-    clearLabel !== undefined && /color:\s*rgb\(157, 67, 59\)/.test(clearLabel.getAttribute("style") ?? ""),
-    clearRow.outerHTML,
-  );
-  assert("the clear page has a cancel row", byLabel(container, "取消") !== undefined);
-  click(clearRow);
-  check("the confirmation row executes the clear", calls.confirmClear, 1);
-  click(byLabel(container, "取消"));
-  check("cancel leaves the confirmation", calls.cancelClear, 1);
-  // The red row exists only on this page: the view page has no red text.
+  assert("the clear page has red", container.innerHTML.includes("rgb(157, 67, 59)"));
   const view = render().container;
-  assert("the view page has no red row", !view.innerHTML.includes("rgb(157, 67, 59)"));
+  assert("the view page has no red", !view.innerHTML.includes("rgb(157, 67, 59)"));
+}
+
+console.log("\ncontrol errors are shown in Chinese, DSH's sentence kept (UI-v9)");
+{
+  const known = render({ mode: "confirm", error: "No goal to clear." }).container;
+  assert("「No goal to clear.」 is shown in Chinese", known.textContent.includes("没有可清除的目标。"), known.textContent);
+  assert("…with DSH's sentence kept under it", known.textContent.includes("No goal to clear."), known.textContent);
+  const alert = known.querySelector('[role="alert"]');
+  assert("…as one alert named by both", alert?.getAttribute("aria-label") === "没有可清除的目标。 No goal to clear.", alert?.getAttribute("aria-label"));
+  const zhLine = [...known.querySelectorAll('[dir="auto"]')].find((node) => (node.textContent ?? "").trim() === "没有可清除的目标。");
+  assert("…the Chinese line is red", /color:\s*rgb\(157, 67, 59\)/.test(zhLine?.getAttribute("style") ?? ""), zhLine?.outerHTML);
+  const original = [...known.querySelectorAll('[dir="auto"]')].find((node) => (node.textContent ?? "").trim() === "No goal to clear.");
+  assert("…the original is muted", /color:\s*rgb\(113, 113, 122\)/.test(original?.getAttribute("style") ?? ""), original?.outerHTML);
+
+  const unknown = "Goal store is read-only (EROFS).";
+  const raw = render({ mode: "confirm", error: unknown }).container;
+  assert("an unknown sentence is shown verbatim", raw.textContent.includes(unknown), raw.textContent);
+  assert("…not replaced by a generic line", !raw.textContent.includes("目标命令执行失败"), raw.textContent);
+  check("…and drawn once", raw.textContent.split(unknown).length - 1, 1);
+  const unknownLine = [...raw.querySelectorAll('[dir="auto"]')].find((node) => (node.textContent ?? "").trim() === unknown);
+  assert("…in red", /color:\s*rgb\(157, 67, 59\)/.test(unknownLine?.getAttribute("style") ?? ""), unknownLine?.outerHTML);
+
+  // The same display on the view page and the edit page.
+  const view = render({ error: "The goal command is not valid for the current state. Run /goal to view available commands." }).container;
+  assert("the view page translates a pause/resume refusal", view.textContent.includes("目标当前的状态不允许这个操作"), view.textContent);
+  const edit = render({ mode: "edit", draft: "x", error: "Goal editing requires a replacement objective." }).container;
+  assert("the edit page translates a save refusal", edit.textContent.includes("编辑目标需要填写新的目标内容。"), edit.textContent);
+  const done = { ...baseGoal, phase: "complete", activation: "disarmed", currentTask: undefined };
+  const completeView = render({ goal: done, error: "No goal to clear." }).container;
+  assert("the complete page translates too", completeView.textContent.includes("没有可清除的目标。"), completeView.textContent);
 }
 
 console.log("\nthe disarmed and blocked pages keep the design's rows");
@@ -649,6 +716,32 @@ async function containerChecks() {
   }
 
   {
+    // The real container: a refused clear stays on the confirmation, in Chinese.
+    const { container, spies } = mountContainer({ ok: false, error: "No goal to clear." });
+    click(byLabel(container, "清除目标"));
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    click(byLabel(container, "清除目标"));
+    await settle();
+    await settle();
+    check("the armed red button sends one clear", spies.rpc.length, 1);
+    check("…as action clear", spies.rpc[0]?.action, "clear");
+    check("a refused clear does not close", spies.close, 0);
+    assert("…stays on the confirmation", container.textContent.includes("清除后目标不再续跑"));
+    assert("…and shows the refusal in Chinese", container.textContent.includes("没有可清除的目标。"), container.textContent);
+  }
+
+  {
+    // A double click on the view page's trash: the second press lands on the
+    // red button in the same place, and must not clear.
+    const { container, spies } = mountContainer({ ok: true, message: "Goal cleared." });
+    click(byLabel(container, "清除目标"));
+    click(byLabel(container, "清除目标"));
+    await settle();
+    check("a double click on the trash sends no clear", spies.rpc.length, 0);
+    assert("…and leaves the confirmation open", container.textContent.includes("清除后目标不再续跑"));
+  }
+
+  {
     const { container, spies } = mountContainer({ ok: true, message: "ok" });
     click(byLabel(container, "清除目标"));
     assert("the clear button opens the confirmation", container.textContent.includes("清除后目标不再续跑"));
@@ -659,7 +752,8 @@ async function containerChecks() {
   }
 }
 
-containerChecks()
+armChecks
+  .then(() => containerChecks())
   .catch((error) => {
     failures += 1;
     console.error(`  FAIL the container checks threw: ${error instanceof Error ? error.stack : String(error)}`);

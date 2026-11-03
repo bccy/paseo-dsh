@@ -340,10 +340,100 @@ export interface GoalText {
   busy: string;
   /** Fallback when a control action failed without the runtime's own sentence. */
   controlFailed: string;
+  /**
+   * A goal-control refusal in this language, or `undefined` to show the raw
+   * sentence as it came.
+   *
+   * The sentences are `@deepseek-ai/dsh-command-goal`'s (`lib/index.js`) and the
+   * plugin server's own (`server/session.ts` / `server/provider.ts` /
+   * `shared/goal.ts`), matched whole — a sentence with a variable (an action, a
+   * phase) is translated only when the variable is one this table names, never
+   * half-translated. English answers `undefined` for everything: the runtime
+   * already speaks it. **An unknown sentence must come back `undefined`** so the
+   * panel shows it verbatim (FIELD-NOTES "silent degradation"); read it through
+   * {@link goalControlErrorDisplay}, which also keeps the original.
+   */
+  translateControlError: (raw: string) => string | undefined;
   /** Popover line when the goal could not be read at all. */
   unavailable: string;
   /** Popover line when the goal was cleared while the panel was open. */
   noGoal: string;
+}
+
+/** `/goal`'s usage line (`dsh-command-goal`'s `USAGE`), which DSH appends to some refusals. */
+const GOAL_USAGE = /(?:\s*Usage: \/goal \[[^\]]*\])?\s*$/u.source;
+
+/** The `/goal <action>` words the panel sends, in Chinese. */
+const GOAL_ACTION_ZH: Record<string, string> = { edit: "编辑", pause: "暂停", resume: "继续", clear: "清除" };
+
+/** DSH's `phaseLabel` words, in Chinese. */
+const GOAL_PHASE_ZH: Record<string, string> = { active: "进行中", paused: "已暂停", blocked: "受阻", complete: "已完成" };
+
+/**
+ * The known refusals, each matched against the **whole** trimmed sentence.
+ * DSH sources: `dsh-command-goal/lib/index.js` (`missingGoal`, the
+ * `invalid-edit` / `create` / attachment branches, the `GoalError` catch, the
+ * `clear` answer). Plugin sources: `shared/goal.ts` `goalCommandArguments`,
+ * `server/session.ts` `controlGoal`, `server/provider.ts` `controlAgentGoal`.
+ */
+const GOAL_REFUSALS_ZH: ReadonlyArray<readonly [RegExp, (match: RegExpMatchArray) => string | undefined]> = [
+  [
+    new RegExp(`^No goal is currently set; /goal (\\w+) requires one\\.${GOAL_USAGE}`, "u"),
+    (m) => {
+      const action = GOAL_ACTION_ZH[m[1] ?? ""];
+      return action === undefined ? undefined : `当前没有目标，无法${action}。`;
+    },
+  ],
+  [new RegExp(`^No goal is currently set\\.${GOAL_USAGE}`, "u"), () => "当前没有目标。"],
+  [new RegExp(`^Goal editing requires a replacement objective\\.${GOAL_USAGE}`, "u"), () => "编辑目标需要填写新的目标内容。"],
+  [
+    /^A goal is already (\w+)\. Use \/goal edit <objective> to change it or \/goal clear before replacing it\.$/u,
+    (m) => {
+      const phase = GOAL_PHASE_ZH[m[1] ?? ""];
+      return phase === undefined ? undefined : `已有一个${phase}的目标。要修改它请编辑目标，要换新目标请先清除。`;
+    },
+  ],
+  [
+    /^The goal command is not valid for the current state\. Run \/goal to view available commands\.$/u,
+    () => "目标当前的状态不允许这个操作（可发送 /goal 查看可用命令）。",
+  ],
+  [/^Attachments only accompany a goal objective: .*$/u, () => "附件只能随目标内容一起提交。"],
+  [/^No goal to clear\.$/u, () => "没有可清除的目标。"],
+  [/^Goal cleared\.$/u, () => "目标已清除。"],
+  [/^this session is closed; reopen it before controlling its goal$/u, () => "会话已关闭，请重新打开会话后再操作目标。"],
+  [/^the goal command was rejected$/u, () => "目标命令被拒绝。"],
+  [
+    /^no DSH session is open for this agent; send it a message first, then control its goal$/u,
+    () => "这个 agent 还没有打开的 DSH 会话，请先给它发一条消息，再操作目标。",
+  ],
+];
+
+/** One refusal in Chinese, or `undefined` when it is not a known sentence. */
+function translateGoalRefusalZh(raw: string): string | undefined {
+  const sentence = raw.trim();
+  for (const [pattern, render] of GOAL_REFUSALS_ZH) {
+    const match = sentence.match(pattern);
+    if (match !== null) return render(match);
+  }
+  return undefined;
+}
+
+/** What the panel draws for one control error. */
+export interface GoalControlErrorDisplay {
+  /** The line drawn in `statusDanger`: the translation, or the raw sentence. */
+  readonly message: string;
+  /** DSH's own sentence, drawn muted under a translation; absent when `message` already is it. */
+  readonly original?: string;
+}
+
+/**
+ * A control error as the panel shows it: translated when the locale knows the
+ * sentence, with the original kept beside it; verbatim otherwise.
+ */
+export function goalControlErrorDisplay(raw: string, text: GoalText): GoalControlErrorDisplay {
+  const translated = text.translateControlError(raw);
+  if (translated === undefined || translated === raw) return { message: raw };
+  return { message: translated, original: raw.trim() };
 }
 
 const TEXT: Record<Locale, UiText> = {
@@ -662,6 +752,7 @@ const TEXT: Record<Locale, UiText> = {
       runningA11y: "Goal running",
       busy: "Working…",
       controlFailed: "The goal command failed.",
+      translateControlError: () => undefined,
       unavailable: "Could not read this session's goal.",
       noGoal: "No goal is set.",
     },
@@ -963,6 +1054,7 @@ const TEXT: Record<Locale, UiText> = {
       runningA11y: "目标运行中",
       busy: "处理中…",
       controlFailed: "目标命令执行失败。",
+      translateControlError: (raw) => translateGoalRefusalZh(raw),
       unavailable: "读不到本会话的目标。",
       noGoal: "当前没有目标。",
     },

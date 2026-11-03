@@ -24,8 +24,15 @@
  *   The caret starts at offset 0 so a long goal is read from its start, and
  *   **blur never saves** — a long objective is too expensive to change by
  *   accident.
- * - **Clear** is an in-place confirmation page (hint, separator, red 清除目标
- *   row, 取消 row). Red appears only after the user has said they want to clear.
+ * - **Clear** (UI-v9, direction B) holds the view page in place: the same
+ *   objective row, its two row-end icon buttons swapped for a quiet 取消 and a
+ *   red round trash button, the hint below the row. Red appears only after the
+ *   user has said they want to clear, and the red button stays inert for
+ *   `GOAL_CONFIRM_ARM_MS` after the page appears because it sits where the
+ *   trash was (a double click must not clear).
+ * - **Errors** are DSH's refusals, shown in the panel's language when the
+ *   sentence is known (`goalControlErrorDisplay`) with DSH's original under
+ *   the translation; an unknown sentence is shown verbatim.
  * - **Running**: the whale carries the host's status ring in its bottom-right
  *   corner (offset -5, 14px frame, row-colour knockout), exactly as the host's
  *   `StatusIcon` overlays a provider icon.
@@ -38,7 +45,7 @@
  */
 import type { PluginButtonContentProps } from "@getpaseo/plugin/client";
 import { Icon, TextInput as UiTextInput } from "@getpaseo/plugin/client/ui";
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import {
   ActivityIndicator,
   Platform,
@@ -65,9 +72,14 @@ import {
   GOAL_RING_OFFSET,
   GOAL_SAVE_BUTTON_SIZE,
   GOAL_SAVE_DISABLED_OPACITY,
-  GOAL_SEPARATOR_HEIGHT,
-  GOAL_SEPARATOR_MARGIN_VERTICAL,
+  GOAL_CONFIRM_ARM_MS,
+  GOAL_CONFIRM_SETTLE_MS,
+  GOAL_CONFIRM_UNARMED_OPACITY,
+  GOAL_CONFIRM_UNARMED_SCALE,
+  GOAL_DANGER_HOVER_OPACITY,
+  GOAL_DANGER_PRESSED_OPACITY,
   GOAL_WHALE_SIZE,
+  goalConfirmControls,
   goalCurrentTaskLine,
   goalEditKeyAction,
   goalEditSubmittable,
@@ -76,7 +88,6 @@ import {
   goalStateName,
   goalFactsLine,
   goalIconButton,
-  goalMenuItem,
   goalTrackRow,
 } from "./goal-polling";
 import {
@@ -85,7 +96,7 @@ import {
   popoverRootBox,
   ringColorFor,
 } from "./jobs-popover-layout";
-import type { GoalText } from "./locale";
+import { goalControlErrorDisplay, type GoalText } from "./locale";
 import { StatusRingMark } from "./status-ring";
 
 /** The host's popover theme slot, so the type is not spelled at every call. */
@@ -200,64 +211,8 @@ function IconButton({
   );
 }
 
-/**
- * One menu row: `menu-item.tsx:441`'s box, a 16px leading glyph when given, a
- * 14px label, hover filled `surface2`. Destructive rows paint both the glyph and
- * the label `statusDanger` — the host's `MenuItem destructive` (a colour, not a
- * red button).
- */
-function MenuRow({
-  icon,
-  label,
-  destructive,
-  disabled,
-  compact,
-  theme,
-  onPress,
-}: {
-  icon?: "Check" | "Trash2";
-  label: string;
-  destructive?: boolean;
-  disabled?: boolean;
-  /** Phone sheet density: the host's menu item is 40px tall there, 28 on pointer layouts. */
-  compact: boolean;
-  theme: PopoverTheme;
-  onPress: () => void;
-}) {
-  const box = goalMenuItem(compact);
-  const color = destructive === true ? theme.colors.statusDanger : theme.colors.foreground;
-  const glyphColor = destructive === true ? theme.colors.statusDanger : theme.colors.foregroundMuted;
-  const style = ({ hovered = false, pressed }: HoverState) => ({
-    ...box,
-    borderColor: "transparent",
-    backgroundColor: hovered || pressed ? theme.colors.surface2 : "transparent",
-    opacity: disabled === true ? BUSY_OPACITY : 1,
-  });
-  return (
-    <Pressable
-      onPress={() => {
-        if (disabled !== true) onPress();
-      }}
-      disabled={disabled}
-      accessibilityRole="button"
-      accessibilityLabel={label}
-      accessibilityState={{ disabled: disabled === true }}
-      style={style}
-    >
-      {icon === undefined ? null : (
-        <View style={{ width: 16, alignItems: "center" }}>
-          <Icon name={icon} size={16} color={glyphColor} />
-        </View>
-      )}
-      <Text numberOfLines={1} style={{ fontSize: TITLE_FONT_SIZE, lineHeight: 18, color }}>
-        {label}
-      </Text>
-    </Pressable>
-  );
-}
-
 /** `MenuHint`: one muted line, 12px horizontal and 8px vertical padding. */
-function Hint({ theme, danger, children }: { theme: PopoverTheme; danger?: boolean; children: string }) {
+function Hint({ theme, children }: { theme: PopoverTheme; children: string }) {
   return (
     <View
       style={{
@@ -265,23 +220,44 @@ function Hint({ theme, danger, children }: { theme: PopoverTheme; danger?: boole
         paddingVertical: GOAL_HINT_PADDING_VERTICAL,
       }}
     >
-      <Text style={{ fontSize: FACTS_FONT_SIZE, color: danger === true ? theme.colors.statusDanger : theme.colors.foregroundMuted }}>
+      <Text style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}>
         {children}
       </Text>
     </View>
   );
 }
 
-/** `MenuSeparator`: a 1px full-width rule, 4px above and below. */
-function Separator({ theme }: { theme: PopoverTheme }) {
+/**
+ * A control error: DSH's refusal in the panel's language when the sentence is
+ * known, with DSH's own words muted underneath; an unknown sentence verbatim
+ * (`goalControlErrorDisplay`). The pair is one accessible element so a screen
+ * reader hears both.
+ */
+function ControlError({ theme, text, error }: { theme: PopoverTheme; text: GoalText; error: string }) {
+  const shown = goalControlErrorDisplay(error, text);
   return (
     <View
+      accessible
+      accessibilityRole="alert"
+      accessibilityLabel={shown.original === undefined ? shown.message : `${shown.message} ${shown.original}`}
       style={{
-        height: GOAL_SEPARATOR_HEIGHT,
-        marginVertical: GOAL_SEPARATOR_MARGIN_VERTICAL,
-        backgroundColor: theme.colors.border,
+        paddingHorizontal: GOAL_HINT_PADDING_HORIZONTAL,
+        paddingVertical: GOAL_HINT_PADDING_VERTICAL,
+        gap: 2,
       }}
-    />
+    >
+      <Text style={{ fontSize: FACTS_FONT_SIZE, lineHeight: GOAL_FACTS_LINE_HEIGHT, color: theme.colors.statusDanger }}>
+        {shown.message}
+      </Text>
+      {shown.original === undefined ? null : (
+        <Text
+          selectable
+          style={{ fontSize: FACTS_FONT_SIZE - 1, lineHeight: GOAL_FACTS_LINE_HEIGHT - 1, color: theme.colors.foregroundMuted }}
+        >
+          {shown.original}
+        </Text>
+      )}
+    </View>
   );
 }
 
@@ -542,7 +518,150 @@ function GoalEditor({
           </Pressable>
         </View>
       </View>
-      {error === undefined ? null : <Hint theme={theme} danger>{error}</Hint>}
+      {error === undefined ? null : <ControlError theme={theme} text={text} error={error} />}
+    </View>
+  );
+}
+
+/**
+ * Whether the confirmation's red button accepts a press yet: `false` for
+ * `GOAL_CONFIRM_ARM_MS` after the page mounts, then `true`. The button sits
+ * where the view page's trash was, so without this a double click on the trash
+ * clears the goal (UI-v9). A state re-render, not `Animated`: the timer is
+ * reliable on web and native alike (FIELD-NOTES on `Animated` in RN Web).
+ */
+function useArmed(): boolean {
+  const [armed, setArmed] = useState(false);
+  useEffect(() => {
+    const timer = setTimeout(() => setArmed(true), GOAL_CONFIRM_ARM_MS);
+    return () => clearTimeout(timer);
+  }, []);
+  return armed;
+}
+
+/** The read-only props of the clear confirmation. */
+interface GoalClearConfirmProps {
+  goal: GoalState;
+  text: GoalText;
+  theme: PopoverTheme;
+  compact: boolean;
+  busy: boolean;
+  error?: string;
+  onConfirmClear: () => void;
+  onCancelClear: () => void;
+}
+
+/**
+ * The clear confirmation (UI-v9, direction B): the view page held in place.
+ *
+ * The objective row is the view page's (whale without ring, one truncated
+ * line, facts), not pressable. Its end carries a quiet 取消 — the edit page's
+ * ghost text button, muted until hovered — and the red round trash button: the
+ * host's destructive button (`statusDanger` fill, `surface0` glyph, 0.85 when
+ * pressed) at the view page's icon-button size on a phone. The hint sits under
+ * the row. 取消 stays live while the clear is in flight, as before; the red
+ * button shows the composer's spinner then.
+ */
+function GoalClearConfirm({ goal, text, theme, compact, busy, error, onConfirmClear, onCancelClear }: GoalClearConfirmProps) {
+  const armed = useArmed();
+  const controls = goalConfirmControls(compact);
+  const row = goalTrackRow(compact);
+  const facts = goalFactsLine(goal, text.statuses, text.rounds);
+  const live = armed && !busy;
+  const web = Platform.OS === "web";
+  return (
+    <View style={{ ...popoverRootBox(), margin: -12 }}>
+      <View style={row}>
+        <View
+          accessible
+          accessibilityLabel={text.rowLabel(goalStateName(goal, text), goal.objective)}
+          style={{ flexDirection: "row", alignItems: "center", gap: 8, flexGrow: 1, flexShrink: 1, flexBasis: "auto", minWidth: 0 }}
+        >
+          <Whale running={false} theme={theme} backdrop={theme.colors.surface1} label={text.runningA11y} />
+          <View style={{ flexGrow: 1, flexShrink: 1, flexBasis: "auto", minWidth: 0 }}>
+            <Text
+              numberOfLines={1}
+              style={{ fontSize: TITLE_FONT_SIZE, lineHeight: GOAL_OBJECTIVE_LINE_HEIGHT, color: theme.colors.foreground }}
+            >
+              {goal.objective}
+            </Text>
+            <Text
+              numberOfLines={1}
+              style={{ fontSize: FACTS_FONT_SIZE, lineHeight: GOAL_FACTS_LINE_HEIGHT, color: theme.colors.foregroundMuted }}
+            >
+              {facts}
+            </Text>
+          </View>
+        </View>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: controls.gap, flexShrink: 0 }}>
+          <Pressable
+            onPress={onCancelClear}
+            accessibilityRole="button"
+            accessibilityLabel={text.actions.cancel}
+            style={({ hovered = false, pressed }: HoverState) => ({
+              height: controls.dangerSize,
+              paddingHorizontal: controls.cancelPaddingHorizontal,
+              borderRadius: 9999,
+              alignItems: "center",
+              justifyContent: "center",
+              backgroundColor: hovered || pressed ? theme.colors.surface2 : "transparent",
+            })}
+          >
+            {({ hovered = false, pressed }: HoverState) => (
+              <Text
+                style={{
+                  fontSize: FACTS_FONT_SIZE,
+                  color: hovered || pressed ? theme.colors.foreground : theme.colors.foregroundMuted,
+                }}
+              >
+                {text.actions.cancel}
+              </Text>
+            )}
+          </Pressable>
+          <Pressable
+            onPress={() => {
+              if (live) onConfirmClear();
+            }}
+            disabled={!live}
+            accessibilityRole="button"
+            accessibilityLabel={text.actions.clearTarget}
+            accessibilityState={{ disabled: !live, busy }}
+            style={({ hovered = false, pressed }: HoverState) => ({
+              width: controls.dangerSize,
+              height: controls.dangerSize,
+              borderRadius: controls.dangerSize / 2,
+              alignItems: "center",
+              justifyContent: "center",
+              backgroundColor: theme.colors.statusDanger,
+              opacity: !armed
+                ? GOAL_CONFIRM_UNARMED_OPACITY
+                : live && pressed
+                  ? GOAL_DANGER_PRESSED_OPACITY
+                  : live && hovered
+                    ? GOAL_DANGER_HOVER_OPACITY
+                    : 1,
+              transform: [{ scale: armed ? 1 : GOAL_CONFIRM_UNARMED_SCALE }],
+              // Web eases from the unarmed look; native re-renders straight to it.
+              ...(web
+                ? ({
+                    transitionProperty: "opacity, transform",
+                    transitionDuration: `${String(GOAL_CONFIRM_SETTLE_MS)}ms`,
+                    transitionTimingFunction: "ease-out",
+                  } as Record<string, unknown>)
+                : {}),
+            })}
+          >
+            {busy ? (
+              <ActivityIndicator size="small" color={theme.colors.surface0} />
+            ) : (
+              <Icon name="Trash2" size={controls.dangerGlyph} color={theme.colors.surface0} />
+            )}
+          </Pressable>
+        </View>
+      </View>
+      {/* A completed goal stops nothing when cleared; it loses the record. */}
+      <Hint theme={theme}>{goal.phase === "complete" ? text.completeClearHint : text.clearHint}</Hint>
+      {error === undefined ? null : <ControlError theme={theme} text={text} error={error} />}
     </View>
   );
 }
@@ -633,22 +752,16 @@ export function GoalPopoverBody({
 
   if (mode === "confirm") {
     return (
-      <View style={{ ...root, margin: -12 }}>
-        {/* A completed goal stops nothing when cleared; it loses the record. */}
-        <Hint theme={theme}>{goal.phase === "complete" ? text.completeClearHint : text.clearHint}</Hint>
-        <Separator theme={theme} />
-        <MenuRow
-          icon="Trash2"
-          label={text.actions.clearTarget}
-          destructive
-          disabled={busy}
-          compact={compact}
-          theme={theme}
-          onPress={onConfirmClear}
-        />
-        <MenuRow label={text.actions.cancel} compact={compact} theme={theme} onPress={onCancelClear} />
-        {error === undefined ? null : <Hint theme={theme} danger>{error}</Hint>}
-      </View>
+      <GoalClearConfirm
+        goal={goal}
+        text={text}
+        theme={theme}
+        compact={compact}
+        busy={busy}
+        error={error}
+        onConfirmClear={onConfirmClear}
+        onCancelClear={onCancelClear}
+      />
     );
   }
 
@@ -699,7 +812,7 @@ export function GoalPopoverBody({
           />
         </View>
         <Hint theme={theme}>{text.completeHint}</Hint>
-        {error === undefined ? null : <Hint theme={theme} danger>{error}</Hint>}
+        {error === undefined ? null : <ControlError theme={theme} text={text} error={error} />}
       </View>
     );
   }
@@ -803,7 +916,7 @@ export function GoalPopoverBody({
       {goal.phase === "active" && goal.activation === "disarmed" ? (
         <Hint theme={theme}>{text.disarmedHint}</Hint>
       ) : null}
-      {error === undefined ? null : <Hint theme={theme} danger>{error}</Hint>}
+      {error === undefined ? null : <ControlError theme={theme} text={text} error={error} />}
     </View>
   );
 }

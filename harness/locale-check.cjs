@@ -65,6 +65,7 @@ const {
   AGENT_MESSAGE_EVENTS,
   allText,
   currentLocale,
+  goalControlErrorDisplay,
   localeFromMetadata,
   resolveLocale,
   setLocale,
@@ -534,6 +535,87 @@ console.log("the goal pill's copy is covered in both languages");
     const rounds = allText()[locale].goal.rounds(3, 10);
     check(`goal.rounds is a non-empty string in ${locale}`, typeof rounds === "string" && rounds.trim() !== "", JSON.stringify(rounds));
     check(`goal.rounds carries the count in ${locale}`, rounds.includes("3") && rounds.includes("10"), JSON.stringify(rounds));
+  }
+
+  // **Goal-control refusals in Chinese (UI-v9).** Every sentence DSH's
+  // `dsh-command-goal` or the plugin server can answer a control with, as it is
+  // written there, must have a Chinese line; English shows the raw sentence.
+  const USAGE = "Usage: /goal [<objective>|clear|edit <objective>|pause|resume]";
+  const REFUSALS = [
+    [`No goal is currently set; /goal edit requires one. ${USAGE}`, "当前没有目标，无法编辑。"],
+    [`No goal is currently set; /goal pause requires one. ${USAGE}`, "当前没有目标，无法暂停。"],
+    [`No goal is currently set; /goal resume requires one. ${USAGE}`, "当前没有目标，无法继续。"],
+    [`No goal is currently set.\n${USAGE}`, "当前没有目标。"],
+    [`Goal editing requires a replacement objective.\n${USAGE}`, "编辑目标需要填写新的目标内容。"],
+    ["Goal editing requires a replacement objective.", "编辑目标需要填写新的目标内容。"],
+    ["A goal is already active. Use /goal edit <objective> to change it or /goal clear before replacing it.", "已有一个进行中的目标。要修改它请编辑目标，要换新目标请先清除。"],
+    ["A goal is already paused. Use /goal edit <objective> to change it or /goal clear before replacing it.", "已有一个已暂停的目标。要修改它请编辑目标，要换新目标请先清除。"],
+    ["A goal is already blocked. Use /goal edit <objective> to change it or /goal clear before replacing it.", "已有一个受阻的目标。要修改它请编辑目标，要换新目标请先清除。"],
+    ["The goal command is not valid for the current state. Run /goal to view available commands.", "目标当前的状态不允许这个操作（可发送 /goal 查看可用命令）。"],
+    ["Attachments only accompany a goal objective: /goal <objective> or /goal edit <objective>.", "附件只能随目标内容一起提交。"],
+    ["No goal to clear.", "没有可清除的目标。"],
+    ["Goal cleared.", "目标已清除。"],
+    ["this session is closed; reopen it before controlling its goal", "会话已关闭，请重新打开会话后再操作目标。"],
+    ["the goal command was rejected", "目标命令被拒绝。"],
+    ["no DSH session is open for this agent; send it a message first, then control its goal", "这个 agent 还没有打开的 DSH 会话，请先给它发一条消息，再操作目标。"],
+  ];
+  for (const [raw, expected] of REFUSALS) {
+    check(`zh translates ${JSON.stringify(raw.slice(0, 48))}`, zh.translateControlError(raw) === expected, JSON.stringify(zh.translateControlError(raw)));
+    check(`en leaves ${JSON.stringify(raw.slice(0, 48))} as is`, en.translateControlError(raw) === undefined);
+    const shown = goalControlErrorDisplay(raw, zh);
+    check(`zh display keeps DSH's sentence for ${JSON.stringify(raw.slice(0, 32))}`, shown.message === expected && shown.original === raw.trim(), JSON.stringify(shown));
+    const enShown = goalControlErrorDisplay(raw, en);
+    check(`en display is the raw sentence for ${JSON.stringify(raw.slice(0, 32))}`, enShown.message === raw && enShown.original === undefined, JSON.stringify(enShown));
+  }
+  // **Unknown sentences fall through verbatim** — never a generic line
+  // (FIELD-NOTES "silent degradation"). That includes a known shape with a
+  // variable this table does not name (no half-translation).
+  for (const raw of [
+    "Goal store is read-only (EROFS).",
+    `No goal is currently set; /goal frobnicate requires one. ${USAGE}`,
+    "A goal is already sleeping. Use /goal edit <objective> to change it or /goal clear before replacing it.",
+    "No goal to clear. Extra words DSH added later.",
+    "",
+  ]) {
+    check(`zh leaves unknown ${JSON.stringify(raw.slice(0, 40))} untranslated`, zh.translateControlError(raw) === undefined, JSON.stringify(zh.translateControlError(raw)));
+    const shown = goalControlErrorDisplay(raw, zh);
+    check(`…and the display is the raw sentence`, shown.message === raw && shown.original === undefined, JSON.stringify(shown));
+  }
+  // **Drift from the installed DSH.** Every `text:` literal in
+  // `dsh-command-goal/lib/index.js` that is an error (or the clear answer) must
+  // be one this table knows. Located through the global npm root, overridable
+  // with DSH_COMMAND_GOAL; when absent it is reported loudly, not passed.
+  {
+    let lib = process.env.DSH_COMMAND_GOAL;
+    if (lib === undefined) {
+      try {
+        const root = require("node:child_process").execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
+        lib = path.join(root, "@deepseek-ai", "dsh", "node_modules", "@deepseek-ai", "dsh-command-goal", "lib", "index.js");
+      } catch {
+        lib = undefined;
+      }
+    }
+    if (lib === undefined || !fs.existsSync(lib)) {
+      console.log(`  NOTE dsh-command-goal not found (${String(lib)}); set DSH_COMMAND_GOAL to check refusal drift`);
+    } else {
+      const source = fs.readFileSync(lib, "utf8");
+      const literals = [...source.matchAll(/kind: "error",\s*text: (`[^`]*`|"[^"]*")/g)].map((m) => m[1]);
+      literals.push(...[...source.matchAll(/text: "(No goal to clear\.|Goal cleared\.)"/g)].map((m) => JSON.stringify(m[1])));
+      check("dsh-command-goal's refusals are readable", literals.length >= 6, String(literals.length));
+      for (const literal of literals) {
+        // Instantiate the template: ${action} → each panel action, ${phaseLabel(...)} → each phase, ${USAGE} → USAGE.
+        const body = literal.slice(1, -1).replace(/\\n/g, "\n");
+        const variants = body.includes("${action}")
+          ? ["edit", "pause", "resume"].map((a) => body.replace("${action}", a))
+          : body.includes("${phaseLabel(current.phase)}")
+            ? ["active", "paused", "blocked"].map((ph) => body.replace("${phaseLabel(current.phase)}", ph))
+            : [body];
+        for (const variant of variants) {
+          const sentence = variant.replace("${USAGE}", USAGE);
+          check(`DSH refusal ${JSON.stringify(sentence.slice(0, 48))} has a Chinese line`, typeof zh.translateControlError(sentence) === "string", sentence);
+        }
+      }
+    }
   }
 
   // **`statuses` must cover exactly the phases `shared/goal.ts` declares.** Read

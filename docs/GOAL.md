@@ -148,11 +148,21 @@ goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等�
   design-opus-v4 §1）：「重开会话后自动续跑会停止，点「继续」恢复」/「Auto-continue stops when the
   session is reopened. Press Resume to continue.」。提示里的按钮名与行尾 ▶ 按钮同名（en 按钮因此由
   「Continue goal」改为「Resume goal」）。
-- **清除确认页（原位）**：点清除图标 → 提示「清除后目标不再续跑，无法撤销」→ 分隔线 →
-  红色「清除目标」行（`Trash2` + `statusDanger`）→「取消」行。红色只在此态出现（destructive 是
-  颜色，不是红按钮）。这一页的「取消」**不关闭面板**，回到展开的面板（与编辑框的「取消」不同，UI-v8）。
-- 操作中置忙（「处理中…」/「Working…」）；成功后立即 `pollNow` 刷新（不等 4s）；失败原文显示在
-  popover 里、popover 不关闭。没有目标时显示「当前没有目标。」，读不到时显示「读不到本会话的目标。」。
+- **清除确认页（原位，UI-v9 方向 B）**：点清除图标后，view 页的目标行**原地保留**（鲸鱼、单行目标、
+  facts；不可点、不带运行环），行尾的暂停/清除两个图标钮换成安静的「取消」（12px 灰字文本钮，悬停变前景色）
+  + 红色圆钮（`statusDanger` 底、`surface0` 垃圾桶；手机 32px、桌面 24px；悬停 0.92、按下 0.85，
+  对齐宿主 destructive 按钮），行下一行提示「清除后目标不再续跑，无法撤销」（complete 用完成态句）。
+  红色只在这一页出现。**防误触**：红钮落在 view 页垃圾桶的同一位置，确认页出现后
+  `GOAL_CONFIRM_ARM_MS`=400ms 内红钮不接受点击（`aria-disabled`），画成 0.35 透明、0.86 缩放，
+  到点后（web 上 160ms 过渡）变成实色全尺寸；所以双击垃圾桶不会清除。选「定时武装」而不是把红钮挪开，
+  是因为动作留在行尾才和 view 页读成同一个控件。手机上行尾宽 76px（view 页 68px），目标只少 8px。
+  这一页的「取消」**不关闭面板**，回到展开的面板（与编辑框的「取消」不同，UI-v8）；清除进行中
+  红钮转圈、「取消」仍可点。
+- 操作中置忙（「处理中…」/「Working…」）；成功后立即 `pollNow` 刷新（不等 4s）；失败显示在
+  popover 里、popover 不关闭。**失败文案（UI-v9）**：中文环境下，已知的 DSH / 插件拒绝句
+  （`client/locale.ts` 的 `GOAL_REFUSALS_ZH`，逐句整句匹配，带 action/phase 变量的句子只在变量已知时翻）
+  显示为红色中文，DSH 原文以小号灰字跟在下面（可选中、读屏名同时包含两句）；**不认识的句子原样显示**，
+  不换成泛化文案（`goalControlErrorDisplay`）。英文环境一律原文。清除页、编辑页、view 页（暂停/继续）同一处理。没有目标时显示「当前没有目标。」，读不到时显示「读不到本会话的目标。」。
 
 **完成态（UI-v7）**：DSH 的 complete 一直保留到 `/goal clear` 或新建目标（survey §1）。本插件让 pill 在完成后**再显示一次**：
 - **pill**：文字仍「目标」，图标换成绿色 `CircleCheck`（`statusSuccess`，宿主「已完成任务」的标记；`goalIconName`），不转环。

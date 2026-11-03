@@ -103,7 +103,8 @@
   Press Resume to continue.」），提示里点名的按钮与 ▶ 按钮同名（「继续目标」/「Resume goal」），
   编辑页 `goal.editor` 表键齐全、键名（Esc/Enter/Shift Enter）两语一致、其余词中英不互抄，且 goal 的
   label/按钮/提示文案中英两列都不得为空或互为复制；完成态四键（`complete`「目标已完成」、`completeHint` 指向收尾消息、
-  `completeClearHint`「清除后 /goal 将查不到这个目标，无法撤销」且不同于 active 的确认句、`rowLabel` 状态在前）（实跑 419 条）。**动了 `client/locale.ts`、标签表或
+  `completeClearHint`「清除后 /goal 将查不到这个目标，无法撤销」且不同于 active 的确认句、`rowLabel` 状态在前）；**控制错误中文表**（DSH/插件拒绝句逐句译文、英文原样、显示保留原文；未知句与未知变量不翻；
+  读本机 `dsh-command-goal/lib/index.js` 的错误字面量逐条确认都有中文，找不到时打印 NOTE，`DSH_COMMAND_GOAL` 可覆盖路径）（实跑 505 条）。**动了 `client/locale.ts`、标签表或
   `shared/goal.ts` 的 phase 枚举必跑。**
 - `harness/jobs-poll-check.cjs` — jobs 轮询状态机（假时钟 + 假 RPC + 假目录页，不 import
   React/host）：可见性（有 live 显示 live 数、无 live 隐藏；图标恒为转环，仅 `available:false`
@@ -581,7 +582,7 @@
   `dsh-bridge/lib/server.js` 的 `paseo/goal` 或 dispatch 必跑；改桥后先重生成内嵌桥
   （`node paseo-plugin/scripts/generate-bridge-assets.mjs`）再跑 `bridge-assets-check.mjs`，
   否则真机检查跑在旧桥上假绿。**
-- `harness/goal-pill-check.cjs` — goal pill 与行式面板的**数据层与 UI 规则**（**257 条**；
+- `harness/goal-pill-check.cjs` — goal pill 与行式面板的**数据层与 UI 规则**（**267 条**；
   假时钟 + 假 RPC + 假目录页，不 import React/host；UI 规则都抽在 `client/goal-polling.ts` 的
   纯函数里）：契约枚举与 wire schema（`GoalState` 缺 `activation` / `id` / `revision` 必拒，时间戳仍被剥掉）、
   `goalCommandArguments` 的 DSH 语法、五态可见性/label/tone（**complete 未读可见、tone success、已读（同 `id:revision`）隐藏、
@@ -590,7 +591,7 @@
   都是「目标」/「Goal」；`goalStateName` 五态完整状态名）、**完成态已读状态机**（`goalCompleteSeenStep`：完成当轮
   running→idle 不算已读、之后 running 才算、首次观察时已 idle 直接起步、关闭完成面板即已读、非 complete 面板关闭不算、
   已读键跨轮询保持、新 revision 重新观察、清除丢 watch 留已读键、端到端隐藏）、**面板去向**（`goalPanelNext`：编辑取消/Esc→close、
-  保存成功→close、保存被拒→stay、清除页取消→view、其它控制成功→view、被拒→stay）、面板行几何取宿主值（`goalTrackRow` 32/40、`goalMenuItem` 28/40、
+  保存成功→close、保存被拒→stay、清除页取消→view、其它控制成功→view、被拒→stay）、面板行几何取宿主值（`goalTrackRow` 32/40、确认页行尾 `goalConfirmControls`（红钮 32/24、手机行尾比 view 页至多宽 8px）、防误触常量（武装 400ms、未武装 0.35/0.86、过渡短于武装、按下 0.85）、
   `goalIconButton` 20/32、鲸鱼 16、环框 14 偏移 -5）、facts 行（`goalFactsLine`：
   「进行中 · 第 N 轮 · 预算 M」，**`active + disarmed` 以「未在续跑」/「Not continuing」开头**）、
   运行环真值表（`goalRunningMark`：armed+running 才转、idle 后保持 `GOAL_RUNNING_HOLD_MS`=1500、
@@ -601,7 +602,7 @@
   （web 15/21、原生 16/22）、`goalEditorHeight` 夹取（未测量/NaN→2 行、12 行→6 行、小数向上取整）、
   `goalEditKeyAction` 真值表（桌面 Enter 保存、Shift+Enter / 组字中 Enter / 手机 Enter 都不保存、
   Esc 取消）、trigger 与面板接线（registration 走 `goalPillCopy`、静态 glyph 是 `Target`、没有填充
-  按钮组件、旧 footnote 与旧「保存」菜单行已删、按键走 `goalEditKeyAction`）、节奏常量与
+  按钮组件、旧 footnote 与旧「保存」菜单行已删、清除页无菜单行/分隔线、错误一律走 `ControlError`、按键走 `goalEditKeyAction`）、节奏常量与
   jobs 逐字一致（4000/30000/1000/2000）、控制器行为（答案签名去重、瞬时错误保持、终态停表、
   退避、`pollNow`、provider/workspace 过滤、closed 移除）。运行：
   `cd paseo-plugin && npx tsc -p ../harness/goal-pill.tsconfig.json`，写入
@@ -610,20 +611,22 @@
   `client/goal-pill.tsx`、`client/goal-running.tsx`、`client/deepseek-mark*.tsx`、
   `client/agent-polling.ts`、`shared/goal.ts` 或 `client/locale.ts` 的 goal 表必跑；改共享轮询器时
   `jobs-poll-check.cjs` 必须同时全绿且断言数不减。**
-- `harness/goal-popover-render-check.cjs` — 面板的**渲染行为**（**106 条**）：用 esbuild 现编真实
+- `harness/goal-popover-render-check.cjs` — 面板的**渲染行为**（**156 条**）：用 esbuild 现编真实
   `GoalPopoverBody`，经 `react-native-web` 渲染进 jsdom（宿主 UI kit 的 `Icon`/`TextInput` 用小桩
   代替：lucide 真 glyph、内联 SVG、react-native-web 真输入框；文案用真实 zh-CN 表）。断言：目标行是
   面板唯一的编辑入口、两个行尾图标按钮不打开编辑、运行时鲸鱼角上出环、**编辑页是小号 composer**
   （「编辑目标」头 + 鲸鱼、真 textarea、预填全文、光标在 0、未测量时 2 行 42px、上限 126px、15px、
   没有「保存」菜单行）、✓「保存目标」对空/未改动草稿 `aria-disabled` + `opacity 0.5`，点击与回车都不提交、
   改动后可提交；**桌面** Enter 保存、Shift+Enter 与组字中 Enter 不保存、Esc 取消、显示三组按键提示；
-  **手机** Enter 不保存、无按键提示、保留头部、点 ✓ 保存；**失焦既不保存也不取消**；清除页按密度用
-  宿主菜单行高、红色行只在该页出现、**目标行读屏名先说状态**（「目标进行中/未在续跑/已暂停/受阻，编辑目标」）、
+  **手机** Enter 不保存、无按键提示、保留头部、点 ✓ 保存；**失焦既不保存也不取消**；**清除页（UI-v9 方向 B）**恰两个按钮、红钮按密度 32/24 圆形 `statusDanger` 带垃圾桶、「取消」透明灰字、
+  目标行（状态+目标读屏名、非 button、鲸鱼、无环、单行、facts）在提示之上、**红钮前 400ms 不可点**（淡出+缩小+`aria-disabled`，200ms 点也无效，
+  400ms 后可点；「取消」立即可点；busy 时转圈且不可点、「取消」仍可点）、红色只在该页出现、**控制错误中文化**（「No goal to clear.」
+  显示中文 + 灰色原文、读屏名含两句；未知句原样红字且不出现泛化文案；view/编辑/完成页同样翻译）、**目标行读屏名先说状态**（「目标进行中/未在续跑/已暂停/受阻，编辑目标」）、
   **完成态页**（唯一按钮是清除、无暂停/继续、目标行不是 button 且点击不进编辑、单行截断、facts「已完成」、完成提示、无运行环、
   清除进确认页且用完成态确认句，active 确认句不变）、disarmed 页显示文案 B 全句且 facts 为
   「未在续跑 · 第 3 轮 · 预算 10」（不含「进行中」）、blocked 页显示原因；**真实容器**（UI-v8：`makeGoalPopover`
   + 假 RPC client，SDK 的 `useAgent` 用桩）：编辑「取消」与 Esc 各调 `close()` 一次且不发命令、保存成功调 `close()`
-  一次并仍刷新、保存被拒不关且留在编辑框保留草稿并显示原文、清除确认页「取消」不关且回到主页、关闭后上报的目标非
+  一次并仍刷新、保存被拒不关且留在编辑框保留草稿并显示原文、清除确认页「取消」不关且回到主页、清除被拒留在确认页并显示中文、双击垃圾桶不发 clear、关闭后上报的目标非
   complete（不记已读）。**需要 `HOST_APP`
   指向 Paseo 检出**（提供 react/react-dom/react-native-web/esbuild/jsdom/lucide-react）：
   `HOST_APP=/path/to/paseo node harness/goal-popover-render-check.cjs`；未设置时 **exit 2**

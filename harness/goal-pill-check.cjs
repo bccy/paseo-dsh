@@ -61,8 +61,12 @@ const {
   GOAL_RING_FRAME_SIZE,
   GOAL_RING_OFFSET,
   GOAL_RUNNING_HOLD_MS,
-  GOAL_SEPARATOR_HEIGHT,
-  GOAL_SEPARATOR_MARGIN_VERTICAL,
+  GOAL_CONFIRM_ARM_MS,
+  GOAL_CONFIRM_SETTLE_MS,
+  GOAL_CONFIRM_UNARMED_OPACITY,
+  GOAL_CONFIRM_UNARMED_SCALE,
+  GOAL_DANGER_HOVER_OPACITY,
+  GOAL_DANGER_PRESSED_OPACITY,
   GOAL_WHALE_SIZE,
   INITIAL_POLL_JITTER_MS,
   LIVE_POLL_MS,
@@ -70,6 +74,7 @@ const {
   MAX_POLL_MS,
   createGoalPoller,
   goalCompleteSeenStep,
+  goalConfirmControls,
   goalCurrentTaskLine,
   goalEditDraftValid,
   goalEditKeyAction,
@@ -80,7 +85,6 @@ const {
   goalIconButton,
   goalIconColorToken,
   goalIconName,
-  goalMenuItem,
   goalPanelNext,
   goalPillCopy,
   goalPillPresentation,
@@ -382,12 +386,29 @@ console.log("\nthe panel rows use the host's track geometry");
   equal("the row is a row", wide.flexDirection, "row");
   equal("the phone row insets the same 4", compact.marginHorizontal, 4);
 
-  // menu-item.tsx:441 `item`: 28 wide / 40 compact, always a 1px border.
-  equal("the menu row is the host's 28px row", goalMenuItem(false).minHeight, 28);
-  equal("the phone menu row is 40", goalMenuItem(true).minHeight, 40);
-  equal("the menu row keeps a 1px border", goalMenuItem(false).borderWidth, 1);
-  equal("the menu row insets 4", goalMenuItem(false).marginHorizontal, 4);
-  equal("the menu row pads 8 horizontally", goalMenuItem(false).paddingHorizontal, 8);
+  // UI-v9: the clear confirmation's row end. The phone's red button keeps the
+  // view page's 32px touch target; the whole end stays within 8px of the view
+  // page's two buttons + gap, so the objective is not squeezed (UI-v9 issue 2).
+  equal("the phone red button is the 32px touch target", goalConfirmControls(true).dangerSize, 32);
+  equal("the phone red glyph is 18", goalConfirmControls(true).dangerGlyph, 18);
+  equal("the wide red button is 24", goalConfirmControls(false).dangerSize, 24);
+  equal("the wide red glyph is 14", goalConfirmControls(false).dangerGlyph, 14);
+  equal("取消 pads 8 each side", goalConfirmControls(true).cancelPaddingHorizontal, 8);
+  equal("the row-end gap is the view page's 4", goalConfirmControls(true).gap, 4);
+  {
+    // 取消 is two 12px CJK glyphs: 24px of text + 2×8 padding = 40.
+    const c = goalConfirmControls(true);
+    const confirmEnd = 2 * 12 + 2 * c.cancelPaddingHorizontal + c.gap + c.dangerSize;
+    const viewEnd = 2 * goalIconButton(true).size + 4;
+    assert(`the phone confirm row end (${confirmEnd}) is at most 8px wider than the view page's (${viewEnd})`, confirmEnd - viewEnd <= 8);
+  }
+  // The double-click guard and the host destructive button's pressed opacity.
+  equal("the red button arms after 400ms", GOAL_CONFIRM_ARM_MS, 400);
+  assert("the unarmed red button is visibly faded", GOAL_CONFIRM_UNARMED_OPACITY > 0 && GOAL_CONFIRM_UNARMED_OPACITY <= 0.5);
+  assert("the unarmed red button is visibly smaller", GOAL_CONFIRM_UNARMED_SCALE >= 0.8 && GOAL_CONFIRM_UNARMED_SCALE < 1);
+  assert("the settle transition ends before arming", GOAL_CONFIRM_SETTLE_MS > 0 && GOAL_CONFIRM_SETTLE_MS < GOAL_CONFIRM_ARM_MS);
+  equal("the red button presses to the host's 0.85", GOAL_DANGER_PRESSED_OPACITY, 0.85);
+  assert("hover is a lighter step than pressed", GOAL_DANGER_HOVER_OPACITY > GOAL_DANGER_PRESSED_OPACITY && GOAL_DANGER_HOVER_OPACITY < 1);
 
   // icon-button-chrome.ts:11-14: 20x20 / 32x32, glyph 14 / 18.
   equal("the wide icon button is 20", goalIconButton(false).size, 20);
@@ -414,8 +435,6 @@ console.log("\nthe panel rows use the host's track geometry");
   equal("the field grows from two lines", GOAL_EDITOR_MIN_LINES, 2);
   equal("the field stops growing at six lines", GOAL_EDITOR_MAX_LINES, 6);
   equal("the edit page is the popover's content width", GOAL_EDITOR_WIDTH_WIDE, 396);
-  equal("the separator is 1px", GOAL_SEPARATOR_HEIGHT, 1);
-  equal("the separator breathes 4", GOAL_SEPARATOR_MARGIN_VERTICAL, 4);
   equal("the hint pads 12 horizontally", GOAL_HINT_PADDING_HORIZONTAL, 12);
   equal("the hint pads 8 vertically", GOAL_HINT_PADDING_VERTICAL, 8);
   equal("the running hold is 1.5s", GOAL_RUNNING_HOLD_MS, 1500);
@@ -634,13 +653,18 @@ console.log("\nthe trigger and popover wiring");
   assert("the objective row is a track row", /goalTrackRow\(compact\)/.test(popover));
   assert("the objective is one truncated line", /numberOfLines=\{1\}[\s\S]{0,400}?\{goal\.objective\}/.test(popover));
   assert("the facts line comes from the pure rule", /goalFactsLine\(goal, text\.statuses, text\.rounds\)/.test(popover));
-  // The clear page is the host's menu rows, at the **panel's own density**: the
-  // phone sheet's rows are 40px, not the wide layout's 28. The edit page is no
-  // longer a menu (design-opus-v4 direction C) — its rows must not come back.
-  assert("the clear page uses the menu row at the panel density", /goalMenuItem\(compact\)/.test(popover));
+  // The clear page (UI-v9 direction B) is the view page's row held in place,
+  // at the panel's own density; the old menu rows and separator are gone, and
+  // neither page draws menu rows any more.
+  assert("the clear page's row end comes from the pure rule", /goalConfirmControls\(compact\)/.test(popover));
+  assert("the clear page has no menu rows", !/function MenuRow/.test(popover) && !/goalMenuItem/.test(popover));
+  assert("the clear page has no separator", !/function Separator/.test(popover));
   assert("the edit page has no save menu row", !/label=\{text\.actions\.save\}/.test(popover));
   assert("the edit keys go through the pure rule", /goalEditKeyAction\(\{/.test(popover));
-  assert("the clear page's row is destructive", /destructive/.test(popover));
+  assert("the clear page's red button is statusDanger", /backgroundColor: theme\.colors\.statusDanger/.test(popover));
+  // Every place that shows a control error goes through the translated display.
+  assert("control errors render through ControlError", /<ControlError theme=\{theme\} text=\{text\} error=\{error\} \/>/.test(popover));
+  assert("no raw red error hint remains", !/<Hint theme=\{theme\} danger>/.test(popover));
   // The old button component and the footnote are gone.
   assert("no filled-button component remains", !/function ActionButton/.test(popover));
   assert("the footnote is gone", !/text\.footnote/.test(popover));

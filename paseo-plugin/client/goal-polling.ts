@@ -372,30 +372,6 @@ export function goalTrackRow(compact: boolean): GoalTrackRow {
 }
 
 /**
- * A menu row's box: `components/ui/menu/menu-item.tsx:441`'s `item`, value for
- * value (`MENU_ITEM_HEIGHT` xs 40 / md 28). The 1px border is always present —
- * transparent at rest — so a row that turns destructive cannot resize.
- */
-export interface GoalMenuItem extends GoalTrackRow {
-  readonly borderWidth: number;
-}
-
-/** `item` at one density; the caller supplies the border colour. */
-export function goalMenuItem(compact: boolean): GoalMenuItem {
-  return {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    minHeight: compact ? 40 : 28,
-    marginHorizontal: 4,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 6,
-    borderWidth: 1,
-  };
-}
-
-/**
  * The row-end icon button: `components/ui/icon-button-chrome.ts:11-14` — 20×20
  * with a 14px glyph on a pointer layout, 32×32 with an 18px glyph under a finger
  * (the compact touch target).
@@ -517,9 +493,59 @@ export function goalEditKeyAction(input: GoalEditKey): "save" | "cancel" | null 
  */
 export const GOAL_EDITOR_WIDTH_WIDE = 396;
 
-/** `MenuSeparator`: 1px, 4px above and below, full width (`menu-item.tsx:407`). */
-export const GOAL_SEPARATOR_HEIGHT = 1;
-export const GOAL_SEPARATOR_MARGIN_VERTICAL = 4;
+/**
+ * The clear confirmation (UI-v9, direction B): the view page's objective row
+ * held in place, its two row-end icon buttons swapped for a quiet 取消 and a
+ * red round trash button.
+ *
+ * The red button sits where the view page's trash was, so a double click (or
+ * a double tap) on the trash would land on it. For {@link GOAL_CONFIRM_ARM_MS}
+ * after the page appears it is therefore inert and drawn faded and slightly
+ * shrunk, then it settles to full size and colour; the press is the user's
+ * second, deliberate one. Position was kept (rather than moving the button
+ * away) because the row's end is where the action lives on the view page —
+ * moving it would make the confirmation read as a different control.
+ */
+export const GOAL_CONFIRM_ARM_MS = 400;
+
+/** The red button's look while it is not armed yet. */
+export const GOAL_CONFIRM_UNARMED_OPACITY = 0.35;
+export const GOAL_CONFIRM_UNARMED_SCALE = 0.86;
+
+/** The web fade/scale from unarmed to armed; native jumps (state re-render, FIELD-NOTES on Animated). */
+export const GOAL_CONFIRM_SETTLE_MS = 160;
+
+/**
+ * The host destructive button's pressed opacity (`components/ui/button.tsx`
+ * `pressed: { opacity: 0.85 }`); hover is a lighter step of the same.
+ */
+export const GOAL_DANGER_PRESSED_OPACITY = 0.85;
+export const GOAL_DANGER_HOVER_OPACITY = 0.92;
+
+/** The confirmation row's trailing controls at one density. */
+export interface GoalConfirmControls {
+  /** The red round button's edge: the phone's 32px touch floor, 24 on a pointer layout. */
+  readonly dangerSize: number;
+  readonly dangerGlyph: number;
+  /** The quiet 取消: the red button's height, 8px side padding, 12px muted text. */
+  readonly cancelPaddingHorizontal: number;
+  /** Between 取消 and the red button: the view page's 4px icon-button gap. */
+  readonly gap: number;
+}
+
+/**
+ * The confirmation's trailing geometry. With 取消 about 40px wide, the row end
+ * is 76px on a phone against the view page's 68 (two 32px buttons and a 4px
+ * gap), so the objective keeps all but 8px of its width there.
+ */
+export function goalConfirmControls(compact: boolean): GoalConfirmControls {
+  return {
+    dangerSize: compact ? 32 : 24,
+    dangerGlyph: compact ? 18 : 14,
+    cancelPaddingHorizontal: 8,
+    gap: 4,
+  };
+}
 
 /** `MenuHint`'s box: 12px horizontal, 8px vertical (`menu-item.tsx` hint styles). */
 export const GOAL_HINT_PADDING_HORIZONTAL = 12;
