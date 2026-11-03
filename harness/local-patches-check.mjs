@@ -4,50 +4,43 @@
  * The scripts under `local-patches/` rewrite an installed
  * `@getpaseo/server` dist tree, so their regressions cannot use the real
  * install. This check drives the real apply/check scripts in subprocesses with
- * `REWIND_PATCH_TARGET` / `REWIND_PATCH_TURNID_TARGET` pointed at scratch
- * fixtures, and asserts the machine-readable status file — the layer the
- * startup hook and `check-rewind-patch.mjs` actually branch on.
+ * `REWIND_PATCH_TURNID_TARGET` / `REWIND_PATCH_HOME` pointed at scratch
+ * fixtures, and asserts the machine-readable status file and the process exit
+ * code — the layer the startup hook and `check-rewind-patch.mjs` branch on.
  *
- *   1. L1: a stale rebuild must not delete statements that live after the
- *      patch's own inserted CALL in `revert()`. The old region boundary ran
- *      from the `bridge.revert({…});` line to the method's closing brace, so an
- *      upstream cleanup or another local patch in that span was silently
- *      replaced; the result still parsed. The regression asserts the file is
- *      byte-identical and the status says `stale-patch-call-region-foreign`.
- *   2. The control: the same stale body without foreign statements is rebuilt
- *      (`patched-from-stale`), so case 1 cannot be satisfied by a script that
- *      refuses every rebuild.
- *   3. LP-02: `check-rewind-patch.mjs` must report the same runtime field gates
- *      apply runs. An upstream that keeps both anchors but renames
- *      `this.timelineSnapshots` used to read as `patchable` (exit 1, "apply
- *      will fix it") while apply always failed with `host-fields-changed`.
- *   4. LP-02: the #7675 history-object shape is `upstream-history-shape-changed`
- *      in the checker on both a clean and an already-patched file; apply refuses
- *      on both, so neither may read as patchable/patched.
- *   5. `apply --check` names the same two gates instead of a bare `NOT patched`.
- *   6. Controls: a compatible clean file is still `patchable`, and a compatible
- *      clean file still reads as "not patched" from `apply --check`.
- *   7. LP-01: a clean file whose `revert()` renamed its first parameter still has
- *      both anchors and all host fields, so apply used to patch it and then every
- *      rewind threw `ReferenceError: messageId is not defined` inside the host.
- *      The signature gate must make checker / `apply --check` / apply all refuse
- *      (`revert-signature-changed`) and leave the file byte-identical. The
- *      fixture also carries a decoy `ProviderRuntimeSession.revert(token)` class
- *      (like the real host), so the reported "found" signature must be the
- *      patched class's method, not the first `async revert(` in the file (F1).
- *   8. Control for 7: a clean file with the expected signature still patches.
- *   9. LP-02 residual: a stale body apply cannot rebuild (a foreign statement in
- *      `revert()` after the patch's CALL) is `stale-body-unrebuildable` in the
- *      checker (code 2, `autoPatchable: false`) and `apply --check` says apply
- *      will refuse — not "re-run to rebuild".
- *  10. Control for 9: a rebuildable stale body stays `stale-body` (code 1,
- *      `autoPatchable: true`) and `apply --check` still offers the rebuild.
- *  11. LP-01: when no rewind-capable `revert()` exists at all, the reported
- *      "found" text says so explicitly instead of naming an unrelated method.
+ * What is covered (the rewind target was retired with Paseo 0.15.0, so only the
+ * turnId patch remains):
+ *
+ *   1. The 0.15-shaped fixture patches: both replay call sites rewritten, backup
+ *      written to REWIND_PATCH_HOME, `node --check`-clean output, status says
+ *      `turnid-patched`.
+ *   2. Idempotence: a second apply is `turnid-already-patched` and leaves the
+ *      bytes untouched.
+ *   3. The 0.14-shaped fixture (same anchor text; verified byte-identical in the
+ *      real 0.14.0 and 0.15.0 dist trees) patches too, and a 2-space reformat of
+ *      it still patches (whitespace-elastic anchor).
+ *   4. `--check` / the checker on a clean file: exit 1 / `patchable`, and the
+ *      message names the two call sites instead of a bare "not patched".
+ *   5. Half-patched, anchor-mismatch and anchor-context-mismatch files fail
+ *      closed: apply exits 1, leaves the file byte-identical, the status names
+ *      the reason, and the checker exits 2 (never "run apply to fix it").
+ *   6. A stale body is rebuilt in place: checker says `stale-body` (exit 1),
+ *      apply says `turnid-patched-from-stale` and the rebuilt file is exactly the
+ *      current body; the prestale snapshot lands in REWIND_PATCH_HOME.
+ *   7. A stale body whose region would swallow unrelated code is
+ *      `stale-body-unrebuildable` in the checker (exit 2, apply refuses) — and
+ *      apply actually refuses on the same file (agreement, not a promise). This
+ *      is the LP-02 lesson one layer down.
+ *   8. MUTATION WITNESS: a patched body that drops `turnId` from the replay call
+ *      (markers 2/2, so a marker-count-only check is green on it) must be
+ *      reported as `stale-body`, not `patched`. The regression is reproduced by
+ *      the old predicate in the same block.
+ *   9. `--revert` restores the pre-patch bytes and is idempotent; a missing
+ *      target is exit 1 from apply / exit 3 from the checker.
  *
  * No installed `@getpaseo/server` is read or written: every target is a fixture
- * under the system temp directory, and only the scripts' exported logic plus
- * their `--check` read paths run against them.
+ * under the system temp directory, and only the scripts' own logic plus their
+ * `--check` read paths run against them.
  *
  * Usage: node harness/local-patches-check.mjs
  */
@@ -68,141 +61,116 @@ const check = (name, pass, detail) => {
   console.log(`  ${pass ? "PASS" : "FAIL"}  ${name}${detail === undefined ? "" : `  — ${detail}`}`);
 };
 
-const CALL_MARKER = "        // LOCAL PATCH (paseo-dsh): the force-hydrate that follows this reply reads";
+// ── fixture text ────────────────────────────────────────────────────────────
+//
+// The replay call line is copied verbatim from the 0.15.0 dist
+// (`agent-manager.js:3120` / `:3175`); the 0.14.0 dist carries the exact same
+// line (`:3094` / `:3149`), which is why one anchor serves both versions. The
+// two surrounding context lines (`if (broadcastTimeline) {` /
+// `if (deferredBroadcast) {`) are what proves each match is the right path, in
+// the right order.
+const REPLAY_CALL =
+  "            const row = this.recordTimeline(agent.id, event.item, event.timestamp ? { timestamp: event.timestamp } : undefined);";
+const CONTEXTS = ["            if (broadcastTimeline) {", "            if (deferredBroadcast) {"];
+
+const MARKER_LINE =
+  "            // LOCAL PATCH (paseo-dsh): keep the turn id on replay — the replay already has it;";
+const COMMENT_LINE = "            // the timeline-store row needs it for the app to fold turns after a reopen.";
+
+const BODY_CURRENT = [
+  MARKER_LINE,
+  COMMENT_LINE,
+  "            const row = this.recordTimeline(agent.id, event.item, {",
+  "                ...(event.timestamp ? { timestamp: event.timestamp } : {}),",
+  "                ...(event.turnId !== undefined ? { turnId: event.turnId } : {}),",
+  "            });",
+];
+const BODY_DROPPED_TURNID = [
+  MARKER_LINE,
+  COMMENT_LINE,
+  "            const row = this.recordTimeline(agent.id, event.item, {",
+  "                ...(event.timestamp ? { timestamp: event.timestamp } : {}),",
+  "            });",
+];
+const BODY_OLD = [
+  "            // LOCAL PATCH (paseo-dsh): keep the turn id on replay — OLDER BODY",
+  "            const row = this.recordTimeline(agent.id, event.item, {",
+  "                ...(event.timestamp ? { timestamp: event.timestamp } : {}),",
+  "            });",
+];
+// Current body, but its region would not close where a stale rebuild expects it
+// to — the rebuild would swallow the following statements. Must fail closed.
+const BODY_UNREBUILDABLE = [
+  MARKER_LINE,
+  COMMENT_LINE,
+  "            const row = this.recordTimeline(agent.id, event.item, {",
+  "                ...(event.timestamp ? { timestamp: event.timestamp } : {}),",
+  "                ...(event.turnId !== undefined ? { turnId: event.turnId } : {}),",
+  "            this.upstreamCleanupAfterReplay();",
+];
+
+/** Map the fixture's 4-space-per-level indentation onto the requested unit. */
+const reindent = (line, unit) => {
+  const leading = /^ */.exec(line)[0].length;
+  return unit.repeat(leading / 4) + line.slice(leading);
+};
 
 /**
- * A source file in the shape the patch produces, but with a deliberately stale
- * method body. `tail` is inserted inside `revert()` *after* the patch's CALL —
- * the exact span the old rebuild overwrote.
+ * Build an agent-manager.js fixture.
+ *
+ * @param {object} [options]
+ * @param {string} [options.indent] - indentation unit (4 spaces default).
+ * @param {Array<"clean"|"current"|"dropped-turnid"|"old"|"unrebuildable">} [options.sites]
+ *   - one entry per replay path (2 = forceHydrate + primeTimeline).
+ * @param {boolean} [options.renameContext] - break the context proof of site #1.
+ * @returns {string}
  */
-function stalePatchedSource({ tail = "", prefix = "" } = {}) {
-  return [
-    prefix,
-    "class PluginAgentSession {",
-    "    constructor() {",
-    "        this.history = [];",
-    "        this.timelineSnapshots = new Map();",
-    "        this.revertTokens = new Map();",
-    "    }",
-    "    /**",
-    "     * LOCAL PATCH (paseo-dsh): stale copy of the injected method.",
-    "     */",
-    "    truncateHistoryFrom(messageId) {",
-    "        return false;",
-    "    }",
-    "    async revert(messageId, scope) {",
-    "        const token = this.revertTokens.get(messageId);",
-    "        await this.bridge.revert({",
-    '            type: "session.revert",',
-    "            requestId: randomUUID(),",
-    "            sessionId: this.bridge.providerId,",
-    "            token,",
-    "            scope,",
-    "        });",
-    CALL_MARKER,
-    '        if (scope !== "files" && !this.truncateHistoryFrom(messageId)) {',
-    "            process.stderr.write(`[plugin-provider] rewind ${messageId}: no history row carries this id; `",
-    '                + "the timeline keeps the withdrawn turns until the agent is reloaded\\n");',
-    "        }",
-    tail,
-    "    }",
-    "    publish(event) {",
-    "        this.history.push(event);",
-    "        this.emit(event);",
-    "    }",
-    "}",
-    "",
-  ]
-    .filter((line) => line !== "")
-    .join("\n");
-}
-
-/**
- * A clean (unpatched) source with both anchors and the three host fields the
- * injected body dereferences. `omitTimelineSnapshots` removes the field, which
- * is the LP-02 rename shape; `signature` / `tokenLine` let a case rename the
- * `revert()` parameter, which is the LP-01 shape.
- */
-function cleanSource({
-  omitTimelineSnapshots = false,
-  historyObjectShape = false,
-  signature = "async revert(messageId, scope) {",
-  tokenLine = "        const token = this.revertTokens.get(messageId);",
-  decoyRevert = false,
-  omitBridgeCall = false,
-} = {}) {
-  const bridgeCall = omitBridgeCall
-    ? []
-    : [
-        "        await this.bridge.revert({",
-        '            type: "session.revert",',
-        "            requestId: randomUUID(),",
-        "            sessionId: this.bridge.providerId,",
-        "            token,",
-        "            scope,",
-        "        });",
-      ];
-  return [
-    // The real `plugin-provider.js` carries a second `async revert(...)`: the
-    // ProviderRuntimeSession one takes a token and delegates to
-    // `this.runtime.complete()`. F1: the "found signature" excerpt must name the
-    // patched class's method, not whichever `async revert(` comes first.
-    ...(decoyRevert
-      ? [
-          "class ProviderRuntimeSession {",
-          "    async revert(token) {",
-          "        const input = { ...token, sessionId: this.providerSessionId };",
-          "        await this.runtime.complete(input);",
-          "    }",
-          "}",
-        ]
-      : []),
-    historyObjectShape ? "// this is what #7675 uses: new PluginSessionHistory(history)" : "",
-    "class PluginAgentSession {",
-    "    constructor() {",
-    "        this.history = [];",
-    omitTimelineSnapshots ? "" : "        this.timelineSnapshots = new Map();",
-    "        this.revertTokens = new Map();",
-    "    }",
-    "    consume(item) {",
-    omitTimelineSnapshots
-      ? "        return mapTimelineItem(item, undefined, this.revertTokens);"
-      : "        return mapTimelineItem(item, this.timelineSnapshots, this.revertTokens);",
-    "    }",
-    `    ${signature}`,
-    tokenLine,
-    ...bridgeCall,
-    "    }",
-    "    publish(event) {",
-    "        this.history.push(event);",
-    "        this.emit(event);",
-    "    }",
-    "}",
-    "",
-  ]
-    .filter((line) => line !== "")
-    .join("\n");
+function agentManagerSource({ indent = "    ", sites = ["clean", "clean"], renameContext = false } = {}) {
+  const lines = [];
+  lines.push("// Fixture shaped after the Paseo 0.15.0 dist (agent-manager.js replay paths).");
+  lines.push("class AgentManagerFixture {");
+  for (const [index, kind] of sites.entries()) {
+    const method = index === 0 ? "forceHydrateTimelineFromLegacyProviderHistory" : "primeTimelineFromLegacyProviderHistory";
+    const arg = index === 0 ? "broadcastTimeline" : "deferredBroadcast";
+    const context = renameContext && index === 0 ? "            if (broadcastTimeline && extra) {" : CONTEXTS[index];
+    const body = (() => {
+      if (kind === "clean") return [REPLAY_CALL];
+      if (kind === "current") return BODY_CURRENT;
+      if (kind === "dropped-turnid") return BODY_DROPPED_TURNID;
+      if (kind === "old") return BODY_OLD;
+      if (kind === "unrebuildable") return BODY_UNREBUILDABLE;
+      throw new Error(`unknown fixture site kind: ${kind}`);
+    })();
+    lines.push(`    ${method}(agent, ${arg}) {`);
+    lines.push("        for (const event of agent.session.streamHistory()) {");
+    lines.push(...body);
+    lines.push(context);
+    lines.push("            }");
+    lines.push("        }");
+    lines.push("    }");
+  }
+  lines.push("}");
+  lines.push("");
+  return lines.map((line) => reindent(line, indent)).join("\n");
 }
 
 /** One scratch target + its own status/backup home. */
 let fixtureCount = 0;
 function fixture(source) {
   fixtureCount += 1;
-  const target = join(WORK, `plugin-provider-${String(fixtureCount)}.js`);
+  const target = join(WORK, `agent-manager-${String(fixtureCount)}.js`);
   const home = join(WORK, `home-${String(fixtureCount)}`);
   mkdirSync(home, { recursive: true });
   writeFileSync(target, source);
-  writeFileSync(join(WORK, `turnid-${String(fixtureCount)}.js`), "// no turnId anchors\n");
-  return { target, home, turnIdTarget: join(WORK, `turnid-${String(fixtureCount)}.js`) };
+  return { target, home };
 }
 
-function runScript(script, target, home, turnIdTarget, args = []) {
+function runScript(script, target, home, args = []) {
   return spawnSync(process.execPath, [script, ...args], {
     encoding: "utf8",
     env: {
       ...process.env,
-      REWIND_PATCH_TARGET: target,
-      REWIND_PATCH_TURNID_TARGET: turnIdTarget,
+      REWIND_PATCH_TURNID_TARGET: target,
       REWIND_PATCH_HOME: home,
     },
   });
@@ -212,336 +180,200 @@ function statusOf(home) {
   return JSON.parse(readFileSync(join(home, "rewind-patch.status.json"), "utf8"));
 }
 
-// ---- 1. L1: the stale rebuild must not delete a foreign tail -------------
-{
-  const tail = "        this.upstreamCleanupAfterRewind();";
-  const fixtureState = fixture(stalePatchedSource({ tail }));
-  const before = readFileSync(fixtureState.target, "utf8");
-  const run = runScript(APPLY, fixtureState.target, fixtureState.home, fixtureState.turnIdTarget, []);
-  const after = readFileSync(fixtureState.target, "utf8");
-  const status = statusOf(fixtureState.home);
-  check(
-    "a stale rebuild with a foreign statement after CALL leaves the file byte-identical",
-    after === before,
-    `md5changed=${after !== before}`,
-  );
-  check(
-    "and the status names stale-patch-call-region-foreign instead of success",
-    status.patches?.rewind?.reason === "stale-patch-call-region-foreign",
-    `reason=${status.patches?.rewind?.reason}`,
-  );
-  check(
-    "and the warning names the statement it would have deleted",
-    run.stderr.includes("cannot be rebuilt safely") && run.stderr.includes("this.upstreamCleanupAfterRewind();"),
-    run.stderr.trim().split("\n").slice(0, 3).join(" | "),
-  );
-  check(
-    "and the unrelated tail is still present on disk",
-    after.includes("this.upstreamCleanupAfterRewind();"),
-  );
-}
-
-// ---- 2. control: a stale body without foreign content is rebuilt ---------
-{
-  const fixtureState = fixture(stalePatchedSource());
-  const run = runScript(APPLY, fixtureState.target, fixtureState.home, fixtureState.turnIdTarget, []);
-  const status = statusOf(fixtureState.home);
-  const after = readFileSync(fixtureState.target, "utf8");
-  check(
-    "the control: a stale body with no foreign content is rebuilt",
-    status.patches?.rewind?.reason === "patched-from-stale" && status.patches?.rewind?.ok === true,
-    `reason=${status.patches?.rewind?.reason} exit=${run.status}`,
-  );
-  check(
-    "and the rebuilt body is the current METHOD (not the stale stub)",
-    after.includes("this.timelineSnapshots.clear();") && after.includes("this.revertTokens.delete(id);"),
-    after.includes("this.timelineSnapshots.clear();") ? "rebuilt" : "METHOD missing",
-  );
-}
-
-// ---- 3. LP-02: checker reports host-fields-changed ----------------------
-{
-  const fixtureState = fixture(cleanSource({ omitTimelineSnapshots: true }));
-  const run = runScript(CHECKER, fixtureState.target, fixtureState.home, fixtureState.turnIdTarget, ["--json"]);
-  let parsed;
+function jsonOf(run) {
   try {
-    parsed = JSON.parse(run.stdout);
+    return JSON.parse(run.stdout);
   } catch {
-    parsed = undefined;
+    return undefined;
   }
-  check(
-    "a clean file whose fields apply rejects is host-fields-changed, not patchable",
-    parsed?.state === "host-fields-changed" && parsed?.code === 2 && parsed?.ok === false,
-    `state=${parsed?.state} code=${parsed?.code}`,
-  );
-  check("and it is not autoPatchable", parsed?.autoPatchable === false);
-  check("and the missing field is named", parsed?.hostField === "this.timelineSnapshots" && parsed?.hostFieldMissing?.length > 0);
 }
 
-// ---- 4. LP-02: checker reports upstream-history-shape-changed -----------
-{
-  const clean = fixture(cleanSource({ historyObjectShape: true }));
-  const cleanRun = runScript(CHECKER, clean.target, clean.home, clean.turnIdTarget, ["--json"]);
-  let cleanParsed;
-  try {
-    cleanParsed = JSON.parse(cleanRun.stdout);
-  } catch {
-    cleanParsed = undefined;
-  }
-  check(
-    "a clean #7675-shaped file is upstream-history-shape-changed, not patchable",
-    cleanParsed?.state === "upstream-history-shape-changed" && cleanParsed?.code === 2,
-    `state=${cleanParsed?.state} code=${cleanParsed?.code}`,
-  );
-
-  const patched = fixture(stalePatchedSource({ prefix: "// new PluginSessionHistory(history)" }));
-  const patchedRun = runScript(CHECKER, patched.target, patched.home, patched.turnIdTarget, ["--json"]);
-  let patchedParsed;
-  try {
-    patchedParsed = JSON.parse(patchedRun.stdout);
-  } catch {
-    patchedParsed = undefined;
-  }
-  check(
-    "an already-patched #7675-shaped file is upstream-history-shape-changed, not patched",
-    patchedParsed?.state === "upstream-history-shape-changed" && patchedParsed?.code === 2,
-    `state=${patchedParsed?.state} code=${patchedParsed?.code}`,
-  );
+/** A clean 0.15-shaped fixture that has just been patched by the real apply. */
+function patchedFixture() {
+  const state = fixture(agentManagerSource());
+  const run = runScript(APPLY, state.target, state.home);
+  if (run.status !== 0) throw new Error(`fixture setup failed: apply exit ${run.status}: ${run.stderr}`);
+  return state;
 }
 
-// ---- 5. LP-02: apply --check names the same gates ------------------------
+// ---- 1. the 0.15-shaped fixture patches ----------------------------------
 {
-  const hostFields = fixture(cleanSource({ omitTimelineSnapshots: true }));
-  const hostRun = runScript(APPLY, hostFields.target, hostFields.home, hostFields.turnIdTarget, ["--check"]);
-  const hostLine = hostRun.stdout.split("\n").find((line) => line.startsWith("[rewind-patch] rewind:")) ?? "";
-  check(
-    "apply --check names host-fields-changed instead of a bare NOT patched",
-    hostLine.includes("host-fields-changed") && !hostLine.includes("NOT patched"),
-    hostLine.trim(),
-  );
-
-  const history = fixture(cleanSource({ historyObjectShape: true }));
-  const historyRun = runScript(APPLY, history.target, history.home, history.turnIdTarget, ["--check"]);
-  const historyLine = historyRun.stdout.split("\n").find((line) => line.startsWith("[rewind-patch] rewind:")) ?? "";
-  check(
-    "apply --check names upstream-history-shape-changed instead of a bare NOT patched",
-    historyLine.includes("upstream-history-shape-changed") && !historyLine.includes("NOT patched"),
-    historyLine.trim(),
-  );
+  const state = fixture(agentManagerSource());
+  const before = readFileSync(state.target, "utf8");
+  const run = runScript(APPLY, state.target, state.home);
+  const after = readFileSync(state.target, "utf8");
+  const status = statusOf(state.home);
+  check("0.15-shaped fixture: apply exits 0", run.status === 0, `exit=${run.status} ${run.stderr.trim().split("\n").at(-1) ?? ""}`);
+  check("and reports both replay call sites patched", status.reason === "turnid-patched" && status.ok === true, `reason=${status.reason}`);
+  check("and the file actually changed", after !== before && after.includes("event.turnId !== undefined"), "turnId spread missing");
+  check("and the target parses (apply's own ESM syntax check ran)", run.stdout.includes("ESM syntax ok"), run.stdout.trim().split("\n").at(-1));
+  check("and both marker comments are present", (after.match(/LOCAL PATCH \(paseo-dsh\): keep the turn id on replay/g) ?? []).length === 2);
+  check("and the backup landed in REWIND_PATCH_HOME, not next to the target", typeof status.backup === "string" && dirname(status.backup) === state.home, `backup=${status.backup}`);
+  check("and the backup holds the pre-patch bytes", readFileSync(status.backup, "utf8") === before);
+  check("and the status records the upstream/patched md5 pair", typeof status.upstreamMd5 === "string" && typeof status.patchedMd5 === "string" && status.upstreamMd5 !== status.patchedMd5);
 }
 
-// ---- 6. controls: a compatible clean file is still patchable -------------
+// ---- 2. idempotence ------------------------------------------------------
 {
-  const fixtureState = fixture(cleanSource());
-  const checkerRun = runScript(CHECKER, fixtureState.target, fixtureState.home, fixtureState.turnIdTarget, ["--json"]);
-  let parsed;
-  try {
-    parsed = JSON.parse(checkerRun.stdout);
-  } catch {
-    parsed = undefined;
-  }
-  check(
-    "the control: a compatible clean file is still patchable (exit 1)",
-    parsed?.state === "patchable" && parsed?.code === 1 && parsed?.ok === true,
-    `state=${parsed?.state} code=${parsed?.code}`,
-  );
-  check(
-    "and hostFieldShapes did not fail on it",
-    parsed?.hostField === null || parsed?.hostField === undefined,
-    `hostField=${parsed?.hostField}`,
-  );
-
-  const applyRun = runScript(APPLY, fixtureState.target, fixtureState.home, fixtureState.turnIdTarget, ["--check"]);
-  check(
-    "and apply --check still reports it as NOT patched, not as a gate failure",
-    applyRun.stdout.includes("NOT patched") && !applyRun.stdout.includes("host-fields-changed"),
-    applyRun.stdout.trim().split("\n")[0],
-  );
+  const state = patchedFixture();
+  const first = readFileSync(state.target, "utf8");
+  const run = runScript(APPLY, state.target, state.home);
+  const after = readFileSync(state.target, "utf8");
+  const status = statusOf(state.home);
+  check("second apply: exits 0", run.status === 0, `exit=${run.status}`);
+  check("and is an idempotent no-op (`turnid-already-patched`)", status.reason === "turnid-already-patched" && status.ok === true, `reason=${status.reason}`);
+  check("and leaves the bytes untouched", after === first);
 }
 
-// ---- 7. LP-01: a renamed revert() parameter is fail-closed everywhere ------
+// ---- 3. 0.14 shape + reformat still patch --------------------------------
 {
-  const renamed = fixture(
-    cleanSource({
-      signature: "async revert(id, scope) {",
-      tokenLine: "        const token = this.revertTokens.get(id);",
-      // The real host has a `ProviderRuntimeSession.revert(token)` *before* the
-      // patched class. The reported "found" signature must still be this class's.
-      decoyRevert: true,
-    }),
-  );
+  // The 0.14.0 dist carries the same replay call text, so this is the same
+  // fixture — the point of the second run is the whitespace-elastic anchor:
+  // a 2-space reformat must still patch (no md5 gate, no fixed indent).
+  const twoSpace = fixture(agentManagerSource({ indent: "  " }));
+  const run = runScript(APPLY, twoSpace.target, twoSpace.home);
+  const after = readFileSync(twoSpace.target, "utf8");
+  check("a 2-space reformat (0.14/0.15 anchor text) still patches", run.status === 0 && after.includes("event.turnId !== undefined"), `exit=${run.status}`);
+  check("and the injected body still lands inside the 2-space method (turnId present)", after.includes("event.turnId !== undefined") && after.includes("\n  }\n}"), "turnId missing");
+}
+
+// ---- 4. clean file: checker/--check say "patchable", not "patched" -------
+{
+  const state = fixture(agentManagerSource());
+  const run = runScript(CHECKER, state.target, state.home, ["--json"]);
+  const parsed = jsonOf(run);
+  check("checker on a clean file: exit 1 / `patchable`", run.status === 1 && parsed?.state === "patchable" && parsed?.code === 1 && parsed?.autoPatchable === true, `state=${parsed?.state} code=${parsed?.code}`);
+  check("and it says both replay call sites were found", parsed?.summary?.includes("两处重放调用") === true, parsed?.summary);
+
+  const applyCheck = runScript(APPLY, state.target, state.home, ["--check"]);
+  check("apply --check on a clean file: exit 1 and names the patchable call sites", applyCheck.status === 1 && applyCheck.stdout.includes("NOT patched") && applyCheck.stdout.includes("both replay call sites found"), applyCheck.stdout.trim().split("\n")[0]);
+}
+
+// ---- 5. fail-closed states ----------------------------------------------
+{
+  const half = fixture(agentManagerSource({ sites: ["current", "current"] }).replace(`${MARKER_LINE}\n`, ""));
+  const before = readFileSync(half.target, "utf8");
+  const applyRun = runScript(APPLY, half.target, half.home);
+  const status = statusOf(half.home);
+  check("half-patched: apply exits 1 and names `turnid-partially-patched`", applyRun.status === 1 && status.reason === "turnid-partially-patched", `reason=${status.reason}`);
+  check("and leaves the file byte-identical", readFileSync(half.target, "utf8") === before);
+  const checkRun = runScript(CHECKER, half.target, half.home, ["--json"]);
+  const parsed = jsonOf(checkRun);
+  check("and the checker exits 2 / `partially-patched`", checkRun.status === 2 && parsed?.state === "partially-patched", `state=${parsed?.state}`);
+}
+
+{
+  const single = fixture(agentManagerSource({ sites: ["clean", "clean"] }).replace(REPLAY_CALL, "            const row = this.recordTimeline(agent.id, event.item);"));
+  const before = readFileSync(single.target, "utf8");
+  const applyRun = runScript(APPLY, single.target, single.home);
+  const status = statusOf(single.home);
+  check("anchor mismatch: apply exits 1 and names `turnid-anchor-mismatch`", applyRun.status === 1 && status.reason === "turnid-anchor-mismatch", `reason=${status.reason}`);
+  check("and leaves the file byte-identical", readFileSync(single.target, "utf8") === before);
+  const parsed = jsonOf(runScript(CHECKER, single.target, single.home, ["--json"]));
+  check("and the checker exits 2 / `anchor-mismatch`", parsed?.state === "anchor-mismatch" && parsed?.turnIdMatches === 1, `state=${parsed?.state} matches=${parsed?.turnIdMatches}`);
+}
+
+{
+  const renamed = fixture(agentManagerSource({ renameContext: true }));
   const before = readFileSync(renamed.target, "utf8");
-  const checkerRun = runScript(CHECKER, renamed.target, renamed.home, renamed.turnIdTarget, ["--json"]);
-  let parsed;
-  try {
-    parsed = JSON.parse(checkerRun.stdout);
-  } catch {
-    parsed = undefined;
-  }
-  check(
-    "LP-01: a renamed revert() parameter is revert-signature-changed, not patchable",
-    parsed?.state === "revert-signature-changed" && parsed?.code === 2 && parsed?.ok === false,
-    `state=${parsed?.state} code=${parsed?.code} exit=${checkerRun.status}`,
-  );
-  check("LP-01: and it is not autoPatchable", parsed?.autoPatchable === false);
-  check(
-    "LP-01: and the found signature is named",
-    typeof parsed?.revertSignatureFound === "string"
-      && parsed.revertSignatureFound.includes("async revert(id, scope)"),
-    `found=${parsed?.revertSignatureFound}`,
-  );
-  check(
-    "LP-01: the found signature names the patched class, not the decoy revert(token)",
-    typeof parsed?.revertSignatureFound === "string"
-      && parsed.revertSignatureFound.includes("async revert(id, scope)")
-      && !parsed.revertSignatureFound.includes("token"),
-    `found=${parsed?.revertSignatureFound}`,
-  );
-
-  const checkRun = runScript(APPLY, renamed.target, renamed.home, renamed.turnIdTarget, ["--check"]);
-  const checkLine = checkRun.stdout.split("\n").find((line) => line.startsWith("[rewind-patch] rewind:")) ?? "";
-  check(
-    "LP-01: apply --check names revert-signature-changed instead of a bare NOT patched",
-    checkLine.includes("revert-signature-changed") && !checkLine.includes("NOT patched"),
-    checkLine.trim(),
-  );
-
-  const applyRun = runScript(APPLY, renamed.target, renamed.home, renamed.turnIdTarget, []);
+  const applyRun = runScript(APPLY, renamed.target, renamed.home);
   const status = statusOf(renamed.home);
-  const after = readFileSync(renamed.target, "utf8");
-  check(
-    "LP-01: apply refuses with revert-signature-changed",
-    status.patches?.rewind?.reason === "revert-signature-changed" && status.patches?.rewind?.ok === false,
-    `reason=${status.patches?.rewind?.reason} exit=${applyRun.status}`,
-  );
-  check(
-    "LP-01: and the file is byte-identical (no CALL referencing undefined names)",
-    after === before && !after.includes("truncateHistoryFrom"),
-    `changed=${after !== before} injected=${after.includes("truncateHistoryFrom")}`,
-  );
-  check(
-    "LP-01: and the warning explains the ReferenceError it prevents",
-    applyRun.stderr.includes("no longer has the signature")
-      && applyRun.stderr.includes("ReferenceError: messageId is not defined"),
-    applyRun.stderr.trim().split("\n").slice(0, 2).join(" | "),
-  );
-  check(
-    "LP-01: and the FATAL 'found' line names the patched method, not the decoy",
-    applyRun.stderr.includes("found:    async revert(id, scope) {")
-      && !applyRun.stderr.includes("async revert(token)"),
-    applyRun.stderr.split("\n").find((line) => line.includes("found:"))?.trim(),
-  );
-  check(
-    "LP-01: and the status file carries the same correct signature excerpt",
-    typeof status.patches?.rewind?.revertSignature === "string"
-      && status.patches.rewind.revertSignature.includes("async revert(id, scope)")
-      && !status.patches.rewind.revertSignature.includes("token"),
-    `status.revertSignature=${status.patches?.rewind?.revertSignature}`,
-  );
+  check("context mismatch: apply exits 1 and names `turnid-anchor-context-mismatch`", applyRun.status === 1 && status.reason === "turnid-anchor-context-mismatch", `reason=${status.reason}`);
+  check("and leaves the file byte-identical", readFileSync(renamed.target, "utf8") === before);
+  const parsed = jsonOf(runScript(CHECKER, renamed.target, renamed.home, ["--json"]));
+  check("and the checker exits 2 / `anchor-context-mismatch`", parsed?.state === "anchor-context-mismatch" && parsed?.turnIdContext === 1, `state=${parsed?.state} context=${parsed?.turnIdContext}`);
 }
 
-// ---- 8. LP-01 control: the expected signature still patches ----------------
+// ---- 6. stale body is rebuilt in place ----------------------------------
 {
-  const fixtureState = fixture(cleanSource());
-  const applyRun = runScript(APPLY, fixtureState.target, fixtureState.home, fixtureState.turnIdTarget, []);
-  const status = statusOf(fixtureState.home);
-  const after = readFileSync(fixtureState.target, "utf8");
-  check(
-    "LP-01 control: the expected revert() signature still patches",
-    status.patches?.rewind?.reason?.startsWith("patched") === true
-      && after.includes("this.truncateHistoryFrom(messageId)"),
-    `reason=${status.patches?.rewind?.reason} exit=${applyRun.status}`,
-  );
+  const state = fixture(agentManagerSource({ sites: ["old", "old"] }));
+  const stale = readFileSync(state.target, "utf8");
+  const checkRun = runScript(CHECKER, state.target, state.home, ["--json"]);
+  const parsed = jsonOf(checkRun);
+  check("stale body: checker exits 1 / `stale-body` / autoPatchable", checkRun.status === 1 && parsed?.state === "stale-body" && parsed?.autoPatchable === true, `state=${parsed?.state}`);
+  const applyCheck = runScript(APPLY, state.target, state.home, ["--check"]);
+  check("and apply --check offers the in-place rebuild", applyCheck.status === 1 && applyCheck.stdout.includes("re-run without --check to rebuild"), applyCheck.stdout.trim().split("\n")[0]);
+  const applyRun = runScript(APPLY, state.target, state.home);
+  const status = statusOf(state.home);
+  const rebuilt = readFileSync(state.target, "utf8");
+  check("apply rebuilds the stale body in place", applyRun.status === 0 && status.reason === "turnid-patched-from-stale" && status.ok === true, `reason=${status.reason} exit=${applyRun.status}`);
+  check("and the rebuilt file is the current body (byte-equal to a fresh patch)", rebuilt === readFileSync(patchedFixture().target, "utf8"));
+  check("and a prestale snapshot was written to REWIND_PATCH_HOME", typeof status.backup === "string" && dirname(status.backup) === state.home && status.backup.includes("prestale"), `backup=${status.backup}`);
+  check("and the prestale snapshot holds the stale bytes", readFileSync(status.backup, "utf8") === stale);
+  const after = jsonOf(runScript(CHECKER, state.target, state.home, ["--json"]));
+  check("and the checker now reports `patched`", after?.state === "patched" && after?.code === 0, `state=${after?.state}`);
 }
 
-// ---- 9. LP-02 residual: a stale body apply cannot rebuild -------------------
+// ---- 7. unrebuildable stale body: checker and apply agree ----------------
 {
-  const fixtureState = fixture(stalePatchedSource({ tail: "        this.upstreamCleanupAfterRewind();" }));
-  const before = readFileSync(fixtureState.target, "utf8");
-  const checkerRun = runScript(CHECKER, fixtureState.target, fixtureState.home, fixtureState.turnIdTarget, ["--json"]);
-  let parsed;
-  try {
-    parsed = JSON.parse(checkerRun.stdout);
-  } catch {
-    parsed = undefined;
-  }
+  const state = fixture(agentManagerSource({ sites: ["unrebuildable", "current"] }));
+  const before = readFileSync(state.target, "utf8");
+  const checkRun = runScript(CHECKER, state.target, state.home, ["--json"]);
+  const parsed = jsonOf(checkRun);
   check(
-    "LP-02: an unrebuildable stale body is stale-body-unrebuildable, not stale-body",
-    parsed?.state === "stale-body-unrebuildable" && parsed?.code === 2 && parsed?.ok === false,
-    `state=${parsed?.state} code=${parsed?.code} exit=${checkerRun.status}`,
+    "unrebuildable stale body: checker exits 2 / `stale-body-unrebuildable`",
+    checkRun.status === 2 && parsed?.state === "stale-body-unrebuildable" && parsed?.autoPatchable === false,
+    `state=${parsed?.state}`,
   );
-  check("LP-02: and it is not autoPatchable", parsed?.autoPatchable === false);
-  check(
-    "LP-02: and the blocking reason is the same one apply reports",
-    parsed?.rebuildBlockedReason === "stale-patch-call-region-foreign",
-    `reason=${parsed?.rebuildBlockedReason}`,
-  );
-
-  const checkRun = runScript(APPLY, fixtureState.target, fixtureState.home, fixtureState.turnIdTarget, ["--check"]);
-  const checkLine = checkRun.stdout.split("\n").find((line) => line.startsWith("[rewind-patch] rewind:")) ?? "";
-  check(
-    "LP-02: apply --check says apply will refuse instead of promising a rebuild",
-    checkLine.includes("apply will refuse")
-      && checkLine.includes("stale-patch-call-region-foreign")
-      && !checkLine.includes("re-run without --check to rebuild"),
-    checkLine.trim(),
-  );
-
-  const applyRun = runScript(APPLY, fixtureState.target, fixtureState.home, fixtureState.turnIdTarget, []);
-  const status = statusOf(fixtureState.home);
-  check(
-    "LP-02: and apply actually fails closed on the same file (agreement, not a promise)",
-    status.patches?.rewind?.reason === "stale-patch-call-region-foreign"
-      && status.patches?.rewind?.ok === true
-      && readFileSync(fixtureState.target, "utf8") === before,
-    `reason=${status.patches?.rewind?.reason} exit=${applyRun.status} changed=${readFileSync(fixtureState.target, "utf8") !== before}`,
-  );
+  check("and names the blocking reason the apply path would report", parsed?.rebuildBlockedReason === "turnid-stale-anchor-mismatch", `reason=${parsed?.rebuildBlockedReason}`);
+  const applyCheck = runScript(APPLY, state.target, state.home, ["--check"]);
+  check("and apply --check says apply will refuse instead of promising a rebuild", applyCheck.status === 2 && applyCheck.stdout.includes("apply will refuse to rebuild"), applyCheck.stdout.trim().split("\n")[0]);
+  const applyRun = runScript(APPLY, state.target, state.home);
+  const status = statusOf(state.home);
+  check("and apply actually refuses on the same file (agreement, not a promise)", applyRun.status === 1 && status.ok === false && status.reason === "turnid-stale-anchor-mismatch", `reason=${status.reason} exit=${applyRun.status}`);
+  check("and the file is byte-identical", readFileSync(state.target, "utf8") === before);
 }
 
-// ---- 10. LP-02 control: a rebuildable stale body still says rebuild ---------
+// ---- 8. MUTATION WITNESS: markers 2/2 but the replay drops turnId --------
 {
-  const fixtureState = fixture(stalePatchedSource());
-  const checkerRun = runScript(CHECKER, fixtureState.target, fixtureState.home, fixtureState.turnIdTarget, ["--json"]);
-  let parsed;
-  try {
-    parsed = JSON.parse(checkerRun.stdout);
-  } catch {
-    parsed = undefined;
-  }
+  // This is the shape a mutated apply script produces when `turnIdCall()` loses
+  // `turnId` (the regression this check exists to catch): the marker count is
+  // still 2, so a marker-only judgement — the old predicate — calls it healthy.
+  const state = fixture(agentManagerSource({ sites: ["dropped-turnid", "dropped-turnid"] }));
+  const source = readFileSync(state.target, "utf8");
+  const markerCount = (source.match(/LOCAL PATCH \(paseo-dsh\): keep the turn id on replay/g) ?? []).length;
+  const oldPredicateSaysPatched = markerCount === 2;
+  check("witness: a patched body that drops turnId still has 2/2 markers", markerCount === 2 && oldPredicateSaysPatched, `markers=${markerCount}`);
+  const run = runScript(CHECKER, state.target, state.home, ["--json"]);
+  const parsed = jsonOf(run);
   check(
-    "LP-02 control: a rebuildable stale body stays stale-body (code 1, autoPatchable)",
-    parsed?.state === "stale-body" && parsed?.code === 1 && parsed?.autoPatchable === true,
+    "MUTATION: the checker reports `stale-body`, not `patched` (a marker-only check is green here)",
+    run.status === 1 && parsed?.state === "stale-body" && parsed?.patchBody === "stale",
     `state=${parsed?.state} code=${parsed?.code}`,
   );
-  const checkRun = runScript(APPLY, fixtureState.target, fixtureState.home, fixtureState.turnIdTarget, ["--check"]);
-  const checkLine = checkRun.stdout.split("\n").find((line) => line.startsWith("[rewind-patch] rewind:")) ?? "";
+  const applyRun = runScript(APPLY, state.target, state.home);
+  const status = statusOf(state.home);
+  const repaired = readFileSync(state.target, "utf8");
   check(
-    "LP-02 control: and apply --check still offers the in-place rebuild",
-    checkLine.includes("re-run without --check to rebuild"),
-    checkLine.trim(),
+    "and apply repairs it to the current body (turnId restored)",
+    applyRun.status === 0 && status.reason === "turnid-patched-from-stale" && repaired.includes("event.turnId !== undefined"),
+    `reason=${status.reason}`,
   );
+  const after = jsonOf(runScript(CHECKER, state.target, state.home, ["--json"]));
+  check("and the checker is green only after the repair", after?.state === "patched" && after?.code === 0, `state=${after?.state}`);
 }
 
-// ---- 11. LP-01: no rewind-capable revert() -> explicit not-found text ------
+// ---- 9. --revert + missing target ---------------------------------------
 {
-  // No `await this.bridge.revert({...})` anywhere: `locateRewindMethod()` finds
-  // nothing, so the gate must not silently report some other `async revert(` line.
-  const fixtureState = fixture(cleanSource({ omitBridgeCall: true }));
-  const checkerRun = runScript(CHECKER, fixtureState.target, fixtureState.home, fixtureState.turnIdTarget, ["--json"]);
-  let parsed;
-  try {
-    parsed = JSON.parse(checkerRun.stdout);
-  } catch {
-    parsed = undefined;
-  }
-  check(
-    "LP-01: with no rewind-capable revert() the found text says so explicitly",
-    parsed?.state === "revert-signature-changed"
-      && typeof parsed?.revertSignatureFound === "string"
-      && parsed.revertSignatureFound.includes("no `async revert(")
-      && parsed.revertSignatureFound.includes("bridge.revert"),
-    `state=${parsed?.state} found=${parsed?.revertSignatureFound}`,
-  );
+  const state = fixture(agentManagerSource());
+  const clean = readFileSync(state.target, "utf8");
+  const applyRun = runScript(APPLY, state.target, state.home);
+  const revertRun = runScript(APPLY, state.target, state.home, ["--revert"]);
+  const status = statusOf(state.home);
+  check("--revert: exits 0 and restores the pre-patch bytes", applyRun.status === 0 && revertRun.status === 0 && status.reason === "turnid-reverted" && readFileSync(state.target, "utf8") === clean, `reason=${status.reason}`);
+  const second = runScript(APPLY, state.target, state.home, ["--revert"]);
+  check("and a second --revert is an idempotent no-op", second.status === 0 && statusOf(state.home).reason === "turnid-revert-noop", `reason=${statusOf(state.home).reason}`);
+}
+
+{
+  const missing = join(WORK, "no-such-agent-manager.js");
+  const home = join(WORK, "home-missing");
+  mkdirSync(home, { recursive: true });
+  const applyRun = runScript(APPLY, missing, home);
+  const status = statusOf(home);
+  check("missing target: apply exits 1 / `turnid-target-missing`", applyRun.status === 1 && status.reason === "turnid-target-missing", `reason=${status.reason}`);
+  const checkRun = runScript(CHECKER, missing, home, ["--json"]);
+  check("and the checker exits 3 / `target-missing`", checkRun.status === 3 && jsonOf(checkRun)?.state === "target-missing", `exit=${checkRun.status}`);
 }
 
 rmSync(WORK, { recursive: true, force: true });

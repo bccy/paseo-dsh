@@ -372,20 +372,15 @@
   终态，后发的会被丢）、子会话不补编一个 `session.turn` 终态。崩溃由脚本自己 `SIGKILL` 假桥
   记录的 pid 制造（不给假桥加场景）。**动了 `session.ts` 的子会话终态或 `dsh-process.ts` 的
   进程退出扇出必跑；回归同时钉住「已完成子会话不被进程退出改写为 failed」。**
-- `harness/host-contract-sim.mjs` — 见 AGENTS.md「撤回」一节的 canary 说明：唯一直接断言**宿主**行为的
-  脚本（canary 在补丁版被截、原版存活；回执后发的在两种宿主上都存活）。只 import 宿主文件，
-  从不修改。**动了 canary 的文案/顺序或 `rewind-canary.ts` 必跑。**
 - `harness/local-patches-check.mjs` — `local-patches/` 的纯离线检查（spawn 真实 apply/check
-  脚本，`REWIND_PATCH_TARGET` / `REWIND_PATCH_TURNID_TARGET` / `REWIND_PATCH_HOME` 全指向临时
-  fixture，不读写已安装宿主）：stale 重建边界（`CALL` 区域之外有语句必须 fail closed、文件
-  不变）、checker / `apply --check` 的 `host-fields-changed` / `upstream-history-shape-changed`
-  门禁，以及本轮补的两组：**LP-01**（`revert()` 参数名耦合门——apply / `apply --check` /
-  checker 三处同源判 `revert-signature-changed`、apply 拒绝且文件 byte-identical、不注入引用
-  未定义变量的 CALL；带 `ProviderRuntimeSession.revert(token)` decoy 的 fixture 要求诊断指向
-  被打补丁的那个方法）与 **LP-02 残余**（stale 体不可重建时 checker 给
-  `stale-body-unrebuildable`/code 2/`autoPatchable:false`、`apply --check` 不再承诺重建、apply
-  fail closed 文件不动；可重建仍 `stale-body`/code 1 且 `apply --check` 提供原地重建）。
-  **动了 `local-patches/apply-rewind-history-truncation.mjs` 或
+  脚本，`REWIND_PATCH_TURNID_TARGET` / `REWIND_PATCH_HOME` 全指向临时 fixture，不读写已安装
+  宿主）：turnId 补丁在 0.15 形状 fixture 上打上/幂等/备份落在补丁目录；半打、锚点失配、
+  上下文失配三态都 fail closed（文件 byte-identical、checker 不报「跑 apply 就好」）；stale
+  体重建（重建结果必须等于干净重打，prestale 快照落在补丁目录）；stale 不可重建时 checker 与
+  `apply --check` 同源判 `stale-body-unrebuildable`、apply 真的拒绝（LP-02：门禁与实现一致）；
+  **变异见证**——「markers 2/2 但重放调用不带 turnId」必须被判 `stale-body` 而不是 patched
+  （只数 marker 的旧判据在这份 fixture 上是绿的）；`--revert` 复原与幂等、target 缺失的
+  exit 1/3。**动了 `local-patches/apply-rewind-history-truncation.mjs` 或
   `local-patches/check-rewind-patch.mjs` 必跑。**
 - `harness/fake-dsh-bridge.mjs` 的**默认行为变严**：`session/prompt` 现在按会话校验
   `initialize`（文案与真桥一致），漏发 `initialize` 的插件 bug 不再在假桥上一路全绿——`f084c33`
