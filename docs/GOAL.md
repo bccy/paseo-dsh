@@ -135,6 +135,10 @@ goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等�
   「Enter 保存」「Shift Enter 换行」。按键（纯函数 `goalEditKeyAction`，宿主 composer 约定）：
   **桌面** Enter 保存、Shift+Enter 换行、IME 组字中的 Enter 不提交、Esc 取消；**手机** Enter 换行，只能点 ✓。
   **失焦不提交**（没有任何 blur / submitEditing 提交路径）。失败原文显示在框下方（`statusDanger`），保持编辑态。
+  **离开编辑框即关闭面板**（UI-v8）：「取消」、桌面 Esc、保存**成功**都调用宿主给的 `close()`，直接回到对话，
+  不再回到展开的面板；保存失败不关（留在编辑框显示原文、保留草稿）。规则是纯函数 `goalPanelNext`
+  （`client/goal-polling.ts`）。关闭会卸载面板内容、触发完成态的「已读」记录，但编辑只出现在非 complete 目标上，
+  所以编辑后关闭不会把任何目标记为已读。
   编辑时隐藏「正在」与受阻行。插件主题缺宿主的 `borderAccent`/`surface3`/`surface4`：边框用 `border`、
   按键芯片底用 `surface2`、placeholder 用 `foregroundMuted`（design-opus-v4 §6 的回退），暗色下边框比
   宿主 composer 弱一档。
@@ -146,7 +150,7 @@ goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等�
   「Continue goal」改为「Resume goal」）。
 - **清除确认页（原位）**：点清除图标 → 提示「清除后目标不再续跑，无法撤销」→ 分隔线 →
   红色「清除目标」行（`Trash2` + `statusDanger`）→「取消」行。红色只在此态出现（destructive 是
-  颜色，不是红按钮）。
+  颜色，不是红按钮）。这一页的「取消」**不关闭面板**，回到展开的面板（与编辑框的「取消」不同，UI-v8）。
 - 操作中置忙（「处理中…」/「Working…」）；成功后立即 `pollNow` 刷新（不等 4s）；失败原文显示在
   popover 里、popover 不关闭。没有目标时显示「当前没有目标。」，读不到时显示「读不到本会话的目标。」。
 

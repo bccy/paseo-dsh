@@ -92,11 +92,18 @@ const stubSource = [
 ].join("\n");
 fs.writeFileSync(stub, stubSource);
 
+// The container (`makeGoalPopover`) reads the agent's status through the plugin
+// SDK's `useAgent`, a host hook; this stand-in answers "idle", which is all the
+// panel's close/stay behaviour needs.
+const clientStub = path.join(work, "client-stub.ts");
+fs.writeFileSync(clientStub, "export function useAgent() { return \"idle\"; }\n");
+
 const entry = path.join(work, "entry.tsx");
 fs.writeFileSync(
   entry,
   `export { GoalPopoverBody } from ${JSON.stringify(path.join(pluginRoot, "client/goal-popover.tsx"))};
 export { allText } from ${JSON.stringify(path.join(pluginRoot, "client/locale.ts"))};
+export { makeGoalPopover } from ${JSON.stringify(path.join(pluginRoot, "client/goal-pill.tsx"))};
 export { createRoot } from "react-dom/client";
 export { createElement } from "react";
 export { flushSync } from "react-dom";
@@ -124,6 +131,7 @@ esbuild.buildSync({
     "react-dom/client": path.join(hostModules, "react-dom/client.js"),
     "react-native": "react-native-web",
     "@getpaseo/plugin/client/ui": stub,
+    "@getpaseo/plugin/client": clientStub,
   },
   loader: { ".tsx": "tsx", ".ts": "ts" },
   logLevel: "warning",
@@ -143,7 +151,7 @@ for (const name of ["ShadowRoot", "HTMLElement", "Element", "Node", "MutationObs
 }
 
 const bundled = require(path.join(work, "bundle.cjs"));
-const { GoalPopoverBody, allText, createRoot, createElement, flushSync } = bundled;
+const { GoalPopoverBody, allText, makeGoalPopover, createRoot, createElement, flushSync } = bundled;
 const React = { createElement };
 
 // The shipped zh-CN copy, not a local copy: the disarmed hint and every label
@@ -531,10 +539,137 @@ console.log("\nthe disarmed and blocked pages keep the design's rows");
   assert("a blocked goal shows DSH's sentence", blocked.textContent.includes("需要确认能否删除 dist/legacy"));
 }
 
-console.log(`\n${checks - failures}/${checks} checks passed`);
-if (failures > 0) {
-  console.error(`${failures} FAILED`);
-  process.exit(1);
+/* The real container (UI-v8): leaving the editor closes the panel ----------- */
+
+const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
+
+/**
+ * Mount `makeGoalPopover`'s component — the real container with its RPC and
+ * mode state — against a fake client. `close` is the host's own close, spied.
+ */
+function mountContainer(answer) {
+  const spies = { close: 0, refresh: 0, rpc: [], closed: [] };
+  const store = new Map([["agent-1", { goal: baseGoal, available: true, listeners: new Set() }]]);
+  const client = {
+    rpc: async (_definition, input) => {
+      spies.rpc.push(input);
+      return answer;
+    },
+  };
+  const Popover = makeGoalPopover(
+    client,
+    store,
+    "agent-1",
+    async () => {
+      spies.refresh += 1;
+    },
+    (goal) => spies.closed.push(goal),
+  );
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const root = createRoot(container);
+  flushSync(() => {
+    root.render(
+      React.createElement(Popover, {
+        theme,
+        layout: { compact: false, platform: "web" },
+        host: { id: "h", label: "h" },
+        context: "agent",
+        workspaceId: "w",
+        agentId: "agent-1",
+        close: () => {
+          spies.close += 1;
+        },
+      }),
+    );
+  });
+  return { container, root, spies };
 }
-console.log("OK");
-process.exit(0);
+
+function openEditor(container) {
+  click(byLabel(container, "目标进行中，编辑目标"));
+}
+
+/** Type into the edit field the way a browser does: set the value, fire `input`. */
+function typeInto(input, value) {
+  flushSync(() => {
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
+    setter.call(input, value);
+    input.dispatchEvent(new window.Event("input", { bubbles: true }));
+  });
+}
+
+async function containerChecks() {
+  console.log("\nthe real container: leaving the editor closes the panel (UI-v8)");
+
+  {
+    const { container, root, spies } = mountContainer({ ok: true, message: "ok" });
+    openEditor(container);
+    assert("the row opens the editor", field(container) !== null);
+    click(byLabel(container, "取消"));
+    check("the editor's 取消 calls close() once", spies.close, 1);
+    check("…and sends no command", spies.rpc.length, 0);
+    // The host unmounts closed content; that must not mark an active goal seen.
+    flushSync(() => root.unmount());
+    check("closing reports the goal it showed", spies.closed.length, 1);
+    check("…which is not complete, so nothing is marked seen", spies.closed[0]?.phase, "active");
+  }
+
+  {
+    const { container, spies } = mountContainer({ ok: true, message: "ok" });
+    openEditor(container);
+    keydown(field(container), "Escape");
+    check("Escape in the editor calls close() once", spies.close, 1);
+  }
+
+  {
+    const { container, spies } = mountContainer({ ok: true, message: "Goal updated" });
+    openEditor(container);
+    typeInto(field(container), `${baseGoal.objective}（已改）`);
+    click(byLabel(container, "保存目标"));
+    await settle();
+    await settle();
+    check("a save sends one edit", spies.rpc.length, 1);
+    check("…with the new objective", spies.rpc[0]?.objective, `${baseGoal.objective}（已改）`);
+    check("a successful save calls close() once", spies.close, 1);
+    check("…and still asks for a fresh read", spies.refresh, 1);
+  }
+
+  {
+    const { container, spies } = mountContainer({ ok: false, error: "The goal command is not valid for the current state." });
+    openEditor(container);
+    typeInto(field(container), `${baseGoal.objective}（已改）`);
+    click(byLabel(container, "保存目标"));
+    await settle();
+    await settle();
+    check("a refused save does not close", spies.close, 0);
+    assert("…it stays in the editor", field(container) !== null);
+    check("…keeping the draft", field(container)?.value, `${baseGoal.objective}（已改）`);
+    assert("…and shows DSH's sentence", container.textContent.includes("The goal command is not valid"), container.textContent);
+  }
+
+  {
+    const { container, spies } = mountContainer({ ok: true, message: "ok" });
+    click(byLabel(container, "清除目标"));
+    assert("the clear button opens the confirmation", container.textContent.includes("清除后目标不再续跑"));
+    click(byLabel(container, "取消"));
+    check("the clear page's 取消 does not close", spies.close, 0);
+    assert("…it returns to the main page", byLabel(container, "目标进行中，编辑目标") !== undefined);
+    assert("…and leaves the confirmation", !container.textContent.includes("清除后目标不再续跑"));
+  }
+}
+
+containerChecks()
+  .catch((error) => {
+    failures += 1;
+    console.error(`  FAIL the container checks threw: ${error instanceof Error ? error.stack : String(error)}`);
+  })
+  .then(() => {
+    console.log(`\n${checks - failures}/${checks} checks passed`);
+    if (failures > 0) {
+      console.error(`${failures} FAILED`);
+      process.exit(1);
+    }
+    console.log("OK");
+    process.exit(0);
+  });

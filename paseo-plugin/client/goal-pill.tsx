@@ -53,6 +53,7 @@ import {
   goalIconColorToken,
   goalIconName,
   goalPillCopy,
+  goalPanelNext,
   goalPillPresentation,
   type GoalCompleteEvent,
   type GoalPoller,
@@ -164,17 +165,24 @@ export function makeGoalIcon(store: GoalStore, agentId: string) {
  *
  * **Failure keeps the panel open.** DSH's own sentence is shown in place — a
  * paused goal at its round cap refuses `resume`, and closing the popover would
- * leave the user with no explanation. Clearing is an in-place confirmation page
+ * leave the user with no explanation. **Leaving the editor closes it** (UI-v8):
+ * 取消 / Escape, and a successful save, call the host's `close()`; the clear
+ * page's 取消 still returns to the main page (`goalPanelNext`). Closing unmounts
+ * this body, which records "seen" only for a complete goal — and the editor
+ * never shows one, so an edit never marks anything seen.
+ *
+ * Exported only so `harness/goal-popover-render-check.cjs` can mount the real
+ * container with a fake RPC client. Clearing is an in-place confirmation page
  * (`mode: "confirm"`): the red row appears only after the user has asked.
  */
-function makeGoalPopover(
+export function makeGoalPopover(
   client: PluginClientContext,
   store: GoalStore,
   agentId: string,
   refresh: () => Promise<void>,
   onClosed: (goal: GoalState | null) => void,
 ) {
-  function GoalPopover({ theme, layout }: PluginButtonContentProps) {
+  function GoalPopover({ theme, layout, close }: PluginButtonContentProps) {
     const [entry, setEntry] = useState<AgentGoal | undefined>(store.get(agentId));
     // The host unmounts a closed surface's content (`menu-surface.tsx` /
     // `menu-overlay.tsx`), so this body's unmount *is* "the panel was closed".
@@ -236,6 +244,14 @@ function makeGoalPopover(
           setError(result.error ?? text.controlFailed);
           return;
         }
+        if (goalPanelNext({ kind: "control", action, ok: true }) === "close") {
+          // A saved edit closes the panel. The refresh is the poller's, not this
+          // body's, so it is started and not awaited: the panel must not wait
+          // on a read before it closes.
+          void refresh();
+          close();
+          return;
+        }
         setMode("view");
         setDraft("");
         // Immediate refresh: the user just pressed a button and the pill must
@@ -275,7 +291,12 @@ function makeGoalPopover(
       void run("edit", draft);
     };
 
+    // 取消 and Escape (the body routes both here) close the panel.
     const onCancelEdit = (): void => {
+      if (goalPanelNext({ kind: "cancelEdit" }) === "close") {
+        close();
+        return;
+      }
       setMode("view");
       setDraft("");
     };
@@ -285,6 +306,10 @@ function makeGoalPopover(
     };
 
     const onCancelClear = (): void => {
+      if (goalPanelNext({ kind: "cancelClear" }) === "close") {
+        close();
+        return;
+      }
       setMode("view");
     };
 

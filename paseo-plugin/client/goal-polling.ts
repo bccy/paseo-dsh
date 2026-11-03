@@ -605,6 +605,39 @@ export function goalCurrentTaskLine(goal: GoalState): string | undefined {
 /* The edit page's rules                                                       */
 /* -------------------------------------------------------------------------- */
 
+/** What happened in the panel that may move it to another page or close it. */
+export type GoalPanelEvent =
+  /** The edit page's 取消, or Escape in its field. */
+  | { readonly kind: "cancelEdit" }
+  /** The clear confirmation page's 取消. */
+  | { readonly kind: "cancelClear" }
+  /** A `/goal` control action answered. */
+  | { readonly kind: "control"; readonly action: "pause" | "resume" | "clear" | "edit"; readonly ok: boolean };
+
+/**
+ * Where the panel goes after one event (UI-v8).
+ *
+ * - `close`: call the host's `close()`, back to the conversation. Leaving the
+ *   editor — cancelled, or saved successfully — closes the panel outright; the
+ *   user was done with it the moment they started editing the one thing in it.
+ * - `view`: the panel's main page. The clear page's 取消 returns there (it is a
+ *   detour from the main page, not a task of its own), and so does every other
+ *   successful action.
+ * - `stay`: a refused or failed action keeps the current page, so DSH's sentence
+ *   is shown where the user acted (an edit keeps the draft).
+ */
+export function goalPanelNext(event: GoalPanelEvent): "close" | "view" | "stay" {
+  switch (event.kind) {
+    case "cancelEdit":
+      return "close";
+    case "cancelClear":
+      return "view";
+    case "control":
+      if (!event.ok) return "stay";
+      return event.action === "edit" ? "close" : "view";
+  }
+}
+
 /** Whether the draft can be submitted: non-blank **and** changed. */
 export function goalEditDraftValid(draft: string): boolean {
   return draft.trim() !== "";

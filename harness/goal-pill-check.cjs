@@ -81,6 +81,7 @@ const {
   goalIconColorToken,
   goalIconName,
   goalMenuItem,
+  goalPanelNext,
   goalPillCopy,
   goalPillPresentation,
   goalRunningMark,
@@ -588,6 +589,18 @@ console.log("\na completed goal's seen state");
     { kind: "agent", status: "running" },
   );
   check("after the next turn the pill is hidden", goalPillPresentation({ available: true, goal: done }, final.seen).visible, false);
+}
+
+console.log("\nleaving the editor closes the panel (UI-v8)");
+{
+  equal("the editor's 取消 / Escape closes", goalPanelNext({ kind: "cancelEdit" }), "close");
+  equal("the clear page's 取消 returns to the main page", goalPanelNext({ kind: "cancelClear" }), "view");
+  equal("a saved edit closes", goalPanelNext({ kind: "control", action: "edit", ok: true }), "close");
+  equal("a refused edit stays in the editor", goalPanelNext({ kind: "control", action: "edit", ok: false }), "stay");
+  for (const action of ["pause", "resume", "clear"]) {
+    equal(`a successful ${action} returns to the main page`, goalPanelNext({ kind: "control", action, ok: true }), "view");
+    equal(`a refused ${action} stays`, goalPanelNext({ kind: "control", action, ok: false }), "stay");
+  }
 }
 
 /* The popover's wiring (source-level: it is JSX) ---------------------------- */
