@@ -115,7 +115,7 @@ process.on("exit", () => {
   }
 });
 
-/** Minimal `which`, same reasoning as `host-contract-sim.mjs`: no shell, no alias. */
+/** Minimal `which`, same reasoning as the retired `host-contract-sim.mjs`: no shell, no alias. */
 function whichSync(name) {
   const separator = process.platform === "win32" ? ";" : ":";
   for (const dir of (process.env.PATH ?? "").split(separator)) {

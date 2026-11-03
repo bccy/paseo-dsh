@@ -301,8 +301,11 @@ console.log('the rewind canary is emitted before the receipt (order is the mecha
   // receipt disappears on a host that refreshes the timeline (correct: nothing to
   // warn about) and survives on one that does not (correct: the withdrawn rows are
   // still on screen). Emitted after the receipt it survives on both, which is a
-  // false "your timeline is stale" warning on the patched host — reproduced on the
-  // real host code, both directions, by `harness/host-contract-sim.mjs`.
+  // false "your timeline is stale" warning on a host that did refresh. That was
+  // reproduced on the real host code in both directions by
+  // `harness/host-contract-sim.mjs`, which was retired together with the 0.14
+  // truncation patch; on 0.15 the replay clears the buffer
+  // (`plugin-provider.js` `ensureReplay` -> `clearBinding()`), so the rule stands.
   const canaryAt = body.search(/rewindCanaryNotice\(/);
   const receiptAt = body.search(/type: "request\.completed"/);
   check(
