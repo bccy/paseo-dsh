@@ -634,3 +634,23 @@
   同样出这一行、同一轮幂等且不同轮次 id 不同。**动了 `server/activity-timeline.ts` 的 goal
   轮次行、`server/session.ts` 的 `user/message` 来源过滤（两条重放路径）或
   `server/locale.ts` 的 `goalRound` 必跑。**
+- `harness/goal-tool-rows-check.cjs` — 时间线里的 goal 行（真实 `TimelineBuilder` →
+  宿主 `ProviderEventSchema` → 客户端 `toolCallData`，按宿主 `turnId + callId` 合并；
+  `plugin-build.cjs` 自编译到 `.dbg-goal-tool-rows`）：状态行名 `goal_state`、标题「目标状态」、
+  全时间线只有模型真实的那一行叫「查看目标」；`get_goal`/`update_goal` 成功结果是 DSH
+  `goalDetail` 字段卡（objective 作行头、等待继续 / 受阻原因 / 没有目标）；解析不了的结果原样
+  留在 body；失败调用不出卡；`metadata.errorCode` 过宿主 schema 仍在，已知码给中文短句与解释、
+  `error` 仍是 DSH 原文，未知码（含 `constructor`）不给人话。夹具复刻一次真实会话；第一个参数可
+  给一份解压后的真实 `session.v4.jsonl` 另行重放（路径只在命令行上）。运行
+  `node harness/goal-tool-rows-check.cjs [log]`。**动了 `server/activity-timeline.ts` 的状态行、
+  `server/timeline.ts` 的 `#toolResult` metadata、`client/tool-call-data.ts` 的 goal 卡 / 失败码、
+  `client/locale.ts` 的 `goalCard` / `toolLabels.goal_state` 或 `index.client.tsx` 的
+  dsh-tool schema 必跑。**
+- `harness/goal-state-order-check.cjs` — 目标状态行排在引起它的 `/goal` 命令行**之后**（**6 组
+  断言**；真实 `DshSession` + 假进程传输，`plugin-build.cjs` 自编译到 `.dbg-goal-state-order`）：
+  实时路径 `/goal` 行紧接着状态行；`replayHistory()` 的 goal 行顺序与实时逐个相同、状态行深相等；
+  被 compaction 认领（命令行被丢掉）的命令里的 goal 变化仍出状态行；日志停在括号中间时
+  `settleRunningTools` 放出状态行且幂等；括号未关时先出的别的行不会越过暂存的状态行；失败的命令
+  也放出它。运行 `node harness/goal-state-order-check.cjs`。**动了 `server/timeline.ts` 的
+  `consume` / `#heldGoalRows` / `settleRunningTools`、`#commandRun` / `#commandDone` 或
+  `server/session.ts` 的重放循环必跑。**

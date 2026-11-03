@@ -126,6 +126,8 @@ export interface UiText {
   planTitle: string;
   /** Appended to a body cut at the client's size limit. */
   truncated: string;
+  /** Copy for the goal tools' timeline rows (result card and refusals). */
+  goalCard: GoalCardText;
   /** Copy for the composer's background-jobs pill and its popover. */
   jobs: JobsText;
   /** Copy for the composer's goal pill and its popover. */
@@ -168,6 +170,28 @@ export interface JobsText {
   settledLabel: string;
   /** Popover line when the runtime could not read the registry — never "none". */
   unavailable: string;
+}
+
+/**
+ * The goal tools' rows in the timeline (`create_goal` / `get_goal` /
+ * `update_goal`), not the composer pill.
+ *
+ * `status`/`rounds`/`reason`/`empty` and `phases` are DSH's own card copy
+ * (`dsh-client-ui-conversation`'s `detail.state` / `detail.goal.*`), so a
+ * result reads the same here as in DSH's web UI.
+ *
+ * `refusals` is keyed by DSH's structured failure code (`HarnessError.code` on
+ * the `tool/result`, `dsh-tool-goal`). `short` replaces the red half of the row
+ * head; `hint` opens the expanded block. DSH's verbatim text is never replaced,
+ * only preceded. A code missing from this table keeps the verbatim head.
+ */
+export interface GoalCardText {
+  status: string;
+  rounds: string;
+  reason: string;
+  empty: string;
+  phases: Record<"active" | "disarmed" | "paused" | "blocked" | "complete", string>;
+  refusals: Record<string, { short: string; hint: string }>;
 }
 
 /**
@@ -334,6 +358,10 @@ const TEXT: Record<Locale, UiText> = {
       // that row's summary half and comes from the server's own copy table, so the
       // whole line reads `Goal round · 3`.
       goal_round: "Goal round",
+      // Not a DSH tool either: the plugin's own goal state row
+      // (`server/activity-timeline.ts`), drawn after every `goal/change`. It used
+      // to borrow `get_goal`, which titled it "View goal" like the model's call.
+      goal_state: "Goal status",
       read_image: "Read image",
       schedule_create: "Create reminder",
       schedule_list: "List reminders",
@@ -519,6 +547,37 @@ const TEXT: Record<Locale, UiText> = {
     collapseThinking: "Collapse thinking",
     planTitle: "Plan",
     truncated: "\n… (truncated)",
+    goalCard: {
+      status: "Status",
+      rounds: "Rounds",
+      reason: "Blocker",
+      empty: "No goal",
+      phases: {
+        active: "Active",
+        disarmed: "Awaiting continuation",
+        paused: "Paused",
+        blocked: "Blocked",
+        complete: "Completed",
+      },
+      refusals: {
+        GOAL_TOOL_AUTHORITY_REQUIRED: {
+          short: "Rejected: automatic rounds cannot create or change a goal",
+          hint: "The model may only create or change a goal in a turn the user typed; automatic rounds cannot. The goal itself is unchanged.",
+        },
+        GOAL_TOOL_INVALID_UPDATE: {
+          short: "Rejected: invalid argument combination",
+          hint: "The model passed arguments this action does not take. DSH rejected the call; the goal is unchanged.",
+        },
+        GOAL_TOOL_RESUME_PAUSED: {
+          short: "Rejected: only the user can resume a paused goal",
+          hint: "A paused goal can only be resumed by the user. The goal is unchanged.",
+        },
+        GOAL_TOOL_BLOCK_THRESHOLD: {
+          short: "Rejected: too early to mark the goal blocked",
+          hint: "DSH requires several consecutive rounds before a goal may be marked blocked. The goal is unchanged.",
+        },
+      },
+    },
     jobs: {
       // "1 background" rather than "1 background task": the pill's label shares its
       // line with the spinner, and the noun added nothing the ring and the popover
@@ -606,6 +665,9 @@ const TEXT: Record<Locale, UiText> = {
       // （`server/activity-timeline.ts`）。轮数是该行的 summary 半，由服务端
       // 自己的文案表给出，整行读作「目标续跑 · 第 3 轮」。
       goal_round: "目标续跑",
+      // 也不是 DSH 的工具：插件在每次 `goal/change` 后画的状态行。以前借用
+      // `get_goal` 的名字，标题成了「查看目标」，与模型真实的调用同名。
+      goal_state: "目标状态",
       read_image: "读取图片",
       schedule_create: "创建定时任务",
       schedule_list: "查看定时任务",
@@ -779,6 +841,37 @@ const TEXT: Record<Locale, UiText> = {
     collapseThinking: "收起思考",
     planTitle: "计划",
     truncated: "\n…（已截断）",
+    goalCard: {
+      status: "状态",
+      rounds: "执行轮次",
+      reason: "受阻原因",
+      empty: "没有目标",
+      phases: {
+        active: "进行中",
+        disarmed: "等待继续",
+        paused: "已暂停",
+        blocked: "受阻",
+        complete: "已完成",
+      },
+      refusals: {
+        GOAL_TOOL_AUTHORITY_REQUIRED: {
+          short: "已拒绝：续跑轮不能创建或修改目标",
+          hint: "模型只能在用户亲自发消息的回合里创建或修改目标，自动续跑轮不行。目标本身没有变化。",
+        },
+        GOAL_TOOL_INVALID_UPDATE: {
+          short: "已拒绝：参数组合不合法",
+          hint: "模型给这个动作传了它不接受的参数，DSH 拒绝了这次调用，目标没有变化。",
+        },
+        GOAL_TOOL_RESUME_PAUSED: {
+          short: "已拒绝：只有用户能继续已暂停的目标",
+          hint: "已暂停的目标只能由用户继续。目标没有变化。",
+        },
+        GOAL_TOOL_BLOCK_THRESHOLD: {
+          short: "已拒绝：轮数不够，不能标记受阻",
+          hint: "DSH 要求先连续跑够轮数才能把目标标记为受阻。目标没有变化。",
+        },
+      },
+    },
     jobs: {
       // 数量直接在句子里：`2 个后台`。中文没有复数变化，所以单复数同形。
       // 省略"任务"是刻意的：pill 这一行还要放转环，名词与 popover 标题重复。

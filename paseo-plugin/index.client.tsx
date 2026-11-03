@@ -199,6 +199,18 @@ export default function contribute(client: PluginClientContext) {
           truncated: z.boolean(),
         })
         .nullable(),
+      // The goal tools' result card (DSH's `goalDetail`); null keeps the raw body.
+      goal: z
+        .object({
+          objective: z.string(),
+          fields: z.array(z.object({ label: z.string(), value: z.string() })),
+          empty: z.boolean(),
+        })
+        .nullable(),
+      // DSH's failure code and, for a known one, the words drawn for it.
+      errorCode: z.string(),
+      errorShort: z.string(),
+      errorHint: z.string(),
     }),
     Component: InlineToolCall,
   });

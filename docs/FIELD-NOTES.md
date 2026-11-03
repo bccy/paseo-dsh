@@ -3060,3 +3060,37 @@ goal」（FINAL-verify §6，桥路径；App UI 层未验证）。
 这份记录里刻意不提任何具体的 provider、模型或端点——**你的路由和模型完全由你的
 profile 决定**。同一个缺陷在不同人那里会表现成不一样的症状，所以照抄别人的路由表
 没有意义，用 `npx paseo-dsh probe` 测自己的才是正路。
+
+## 第二十二轮：时间线里的 goal 行（2026-11-03）
+
+### 90. 状态行借用 `get_goal` 的名字，与模型真实调用同名；goal 结果是原始 JSON（TL-01）
+
+**症状**：用户用 `/goal <目标>` 建目标后，时间线出现两行「◎ 查看目标」：一行在 `/goal` 之上
+（「查看目标 · 进行中 · <目标>」），一行是模型真实的 `get_goal`，展开是一整串原始 JSON。中间还有
+两条英文红字：`create_goal` 的 "requires a direct human turn"、`update_goal` 的 "objective and
+max_goal_rounds are valid only with action edit"。
+
+**根因**：
+1. 插件的状态行（`server/activity-timeline.ts`）只为拿 Target 图标借了 `name: "get_goal"`，
+   而客户端按 name 查标题，于是它也拿到了「查看目标」这个**动作**名——一行没有调用发生的状态，
+   读成了一次读取。属于「借别人的名字顺带借走了语义」。
+2. 三个 goal 工具没有 detail 类型，落到 `unknown`；结果是字符串，`stringifyValue` 原样返回，
+   连缩进都没有。DSH 自己从不显示这串 JSON（`dsh-client-ui-tool` 的 `goalDetail` 字段卡）。
+3. 两条红字**不是插件问题**：`/goal` 经 `commands.execute` 在回合**外**建目标（DSH Web 端同一
+   路径），续跑轮里只有 `source.kind:"goal"` 的轮次提示，没有人类消息，DSH 按设计拒绝模型
+   `create_goal`；DSH 的续跑提示没有声明「目标已存在，不要再建」，模型把提示里的 Objective 当成
+   新请求。`update_goal` 那条是模型在严格 schema 下把可选字段抄成了当前值（DSH 只把 `""`/`0`
+   当占位）。两者都在写入前抛错，目标不受影响，属上游（提示词 / 校验宽松度）。
+
+**修法**：状态行改插件自有名 `goal_state`，标题「目标状态」；客户端移植 `goalDetail` 画字段卡，
+形状不对保留原文；服务端透传 DSH 的 `error.code`（`metadata.errorCode`），已知码给中文短句 +
+一句解释，DSH 原文留在展开里，行仍红。不改 DSH 提示词。
+
+**检查**：`harness/goal-tool-rows-check.cjs`（含用户会话的同构夹具，可另传真实日志重放），
+`tool-call-check` 钉 `goal_state` 标题与 `get_goal` 不同名，`locale-check` 钉 `goalCard` 两语键集。
+
+**补记（行序）**：同一屏里状态行还在 `/goal` 行**之上**——DSH 的括号是 `command/run` →
+`goal/change` → `command/done`，状态行在 `goal/change` 就画、命令行到 `command/done` 才画。
+修法是 builder 暂存括号内的状态行、`command/done` 后放出，并在 `settleRunningTools` 兜底放出
+（日志停在括号中间时不能吞行）。`harness/goal-state-order-check.cjs` 钉实时 / 重放 / compaction
+认领 / 截断日志 / 括号内他行 / 失败命令六种情形。

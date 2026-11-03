@@ -819,6 +819,20 @@ export class TimelineBuilder {
    * — see {@link #commandDone}.
    */
   #compactionCommands = new Set<string>();
+  /**
+   * Goal state rows written while a `/command` bracket was open, not yet out.
+   *
+   * DSH writes `command/run` → `goal/change` → `command/done` for one `/goal`
+   * (`dsh-commands` `execute` appends the bracket, the handler changes the goal
+   * inside it). The command's own row only exists at `command/done` (its output
+   * is there), so drawing the state row at `goal/change` put the effect above the
+   * command that caused it. The row is held here and released by {@link consume}:
+   * right after the bracket's `command/done`, before any other row that comes
+   * first, and by {@link settleRunningTools} for a log that stops mid-bracket. It
+   * is never dropped, and live and replay share this builder, so both paths get
+   * the same order.
+   */
+  #heldGoalRows: ProviderTimelineItem[] = [];
 
   constructor(options: { warn?: (line: string) => void } = {}) {
     this.#warn = options.warn ?? ((line) => console.warn(line));
@@ -831,6 +845,18 @@ export class TimelineBuilder {
    * `data` payload rather than the envelope itself.
    */
   consume(event: DshEvent): ProviderTimelineItem[] {
+    const rows = this.#consumeOne(event);
+    if (this.#heldGoalRows.length === 0) return rows;
+    // Still inside the bracket and nothing else drawn: keep holding.
+    if (this.#commands.size > 0 && rows.length === 0) return rows;
+    // The bracket closed (its command row, if any, is in `rows`), or some other
+    // row is going out while the bracket is still open — then the held state row
+    // goes first, because that is where it was written.
+    const held = this.#heldGoalRows.splice(0).flatMap((row) => this.#put(row));
+    return this.#commands.size > 0 ? [...held, ...rows] : [...rows, ...held];
+  }
+
+  #consumeOne(event: DshEvent): ProviderTimelineItem[] {
     const data = isRecord(event.data) ? event.data : {};
     // The bridge's own transient frame, not a DSH durable event: a growing
     // snapshot of the step in flight, carrying the same turn/step the durable
@@ -838,6 +864,10 @@ export class TimelineBuilder {
     if (event.type === ASSISTANT_DELTA_EVENT) return this.#assistantDelta(data);
     try {
       const activity = this.#activity.consume(event.type, data);
+      if (activity && event.type === "goal/change" && this.#commands.size > 0) {
+        this.#heldGoalRows.push(activity);
+        return [];
+      }
       if (activity) return this.#put(activity);
     } catch (error) {
       const message = `${event.type}: ${error instanceof Error ? error.message : String(error)}`;
@@ -884,7 +914,11 @@ export class TimelineBuilder {
    * closed row leaves the running set.
    */
   settleRunningTools(): ProviderTimelineItem[] {
+    // A log that stops inside a `/command` bracket never reaches its
+    // `command/done`; the goal state row it held is still the goal's state.
+    const held = this.#heldGoalRows.splice(0).flatMap((row) => this.#put(row));
     return [
+      ...held,
       ...this.#cancelRunningTools(),
       ...this.#activity.settle().flatMap((item) => this.#put(item)),
     ];
@@ -1164,7 +1198,16 @@ export class TimelineBuilder {
         callId,
         name,
         detail,
-        metadata: toolMetadata(input, presentationMeta),
+        metadata: {
+          ...toolMetadata(input, presentationMeta),
+          // DSH's structured failure code (`HarnessError.code`, e.g.
+          // `GOAL_TOOL_AUTHORITY_REQUIRED`), carried beside the verbatim text so
+          // the client can say in words why a goal call was refused without
+          // parsing English. Only a failed row has one; the text stays the error.
+          ...(failed && isRecord(data.error) && typeof data.error.code === "string" && data.error.code !== ""
+            ? { errorCode: data.error.code }
+            : {}),
+        },
         ...(failed
           ? { status: "failed" as const, error: { message: output || "tool failed" } }
           : { status: "completed" as const, error: null }),

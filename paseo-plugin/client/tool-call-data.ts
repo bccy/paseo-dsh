@@ -205,7 +205,41 @@ export interface ToolCallData {
   diffBlock: DiffBlockData | null;
   /** The structured web card, or null when the result carried no usable meta. */
   web: WebBlockData | null;
+  /**
+   * The goal tools' result card (`create_goal` / `get_goal` / `update_goal`), or
+   * null. DSH's own UI never shows these results as JSON: it parses them into a
+   * field card (`goalDetail`, see {@link parseGoalResult}). Null for anything
+   * that is not that exact shape, which keeps the raw body.
+   */
+  goal: GoalBlockData | null;
+  /**
+   * DSH's structured failure code for a failed row (`HarnessError.code`, relayed
+   * on `metadata.errorCode` by `server/timeline.ts`), or "".
+   */
+  errorCode: string;
+  /**
+   * The head's red half for a code `./locale` knows (`goalCard.refusals`), or "".
+   * Empty means the head keeps DSH's verbatim first line, as before.
+   */
+  errorShort: string;
+  /** One plain-language sentence that opens the expanded block, or "". */
+  errorHint: string;
 }
+
+/**
+ * One goal tool result, as DSH's `goalDetail` reads it
+ * (`dsh-client-ui-tool` lib/client.js:3854-3883): the objective is the card's
+ * title and the row's summary; the fields are 状态 / 执行轮次 and, when blocked,
+ * 受阻原因. `empty` is DSH's `{goal: null}` → 「没有目标」.
+ *
+ * A type alias, not an interface: the transformer's output must be a
+ * `JsonValue`, and only an alias carries the implicit index signature.
+ */
+export type GoalBlockData = {
+  objective: string;
+  fields: Array<{ label: string; value: string }>;
+  empty: boolean;
+};
 
 /* -------------------------------------------------------------------------- */
 /* Block copy                                                                 */
@@ -806,8 +840,10 @@ const TOOL_NAME_ICONS: Record<string, string> = {
   // Not a tool DSH registers: the name of the row `server/activity-timeline.ts`
   // draws for one automatic goal round. It is a `plain_text` row with no protocol
   // icon key, so it borrows the tool's own glyph — the same Target as the goal
-  // tools above, the goal state row (`get_goal`) and the composer's goal pill.
+  // tools above, the goal state row and the composer's goal pill.
   goal_round: "Target",
+  // The plugin's goal state row (`server/activity-timeline.ts`), same family.
+  goal_state: "Target",
   read_image: "Image",
   todo_write: "ListChecks",
   ask_user_question: "MessageCircleQuestion",
@@ -1295,6 +1331,61 @@ function agentMessageOf(value: unknown): AgentMessageFacts | undefined {
   return { event: value.event, sender: title !== "" ? title : id, text };
 }
 
+/** DSH's three goal tools, whose results share one shape (`dsh-tool-goal` GOAL_VALUE_SCHEMA). */
+const GOAL_TOOLS: ReadonlySet<string> = new Set(["create_goal", "get_goal", "update_goal"]);
+
+function goalCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * Parse one goal tool result into DSH's card, or return null.
+ *
+ * A port of `goalDetail` (`dsh-client-ui-tool` lib/client.js:3854-3883), not a
+ * reimplementation of its rules: the same required fields, the same phase set,
+ * `active` + `disarmed` read as 「等待继续」, and a blocked reason only when it
+ * carries a message. Anything else — malformed JSON, an extra phase DSH adds
+ * later, a missing count — is null, and null keeps the verbatim body. DSH does
+ * the same (`detailsCardModel` falls back to raw input/output). Nothing is
+ * dropped quietly: a result this cannot read still shows every byte it had.
+ */
+export function parseGoalResult(text: string): GoalBlockData | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!isRecord(value)) return null;
+  const copy = localeText().goalCard;
+  if (value.goal === null) return { objective: "", fields: [], empty: true };
+  const goal = value.goal;
+  if (
+    !isRecord(goal) ||
+    typeof goal.id !== "string" || goal.id === "" ||
+    typeof goal.objective !== "string" || goal.objective === "" ||
+    !goalCount(goal.revision) || !goalCount(goal.roundsStarted) || !goalCount(goal.maxGoalRounds)
+  ) {
+    return null;
+  }
+  const phase = goal.phase;
+  if (phase !== "active" && phase !== "paused" && phase !== "blocked" && phase !== "complete") return null;
+  if (value.activation !== "armed" && value.activation !== "disarmed") return null;
+  const fields = [
+    { label: copy.status, value: copy.phases[phase === "active" && value.activation === "disarmed" ? "disarmed" : phase] },
+    { label: copy.rounds, value: `${goal.roundsStarted} / ${goal.maxGoalRounds}` },
+  ];
+  if (goal.blockedReason !== undefined) {
+    const reason = goal.blockedReason;
+    if (!isRecord(reason) || typeof reason.code !== "string" || reason.code === "" ||
+      typeof reason.message !== "string" || reason.message === "") {
+      return null;
+    }
+    fields.push({ label: copy.reason, value: reason.message });
+  }
+  return { objective: goal.objective, fields, empty: false };
+}
+
 /** Normalize one Paseo tool-call item into JSON-safe render data. */
 export function toolCallData(
   item: {
@@ -1505,10 +1596,31 @@ export function toolCallData(
     code = true;
   }
 
+  // The goal tools' card. A failed call never gets one — DSH's own
+  // `detailsCardModel` returns null on `isError` too — so a refusal keeps its
+  // arguments and text below. A result the parser does not recognise is null and
+  // keeps the raw body set above.
+  const goal =
+    !failed && agentMessage === undefined && type === "unknown" && GOAL_TOOLS.has(item.name) &&
+    typeof detail.output === "string"
+      ? parseGoalResult(detail.output)
+      : null;
+  if (goal !== null) {
+    // DSH's row summary is the card's title (`DetailsRow`: `items[0].title ??
+    // empty`): the objective, not the call's arguments as JSON.
+    primary = goal.empty ? copy.goalCard.empty : goal.objective;
+    detailHeadline = "";
+    body = "";
+    code = false;
+  }
+  // Only a failed row has a code, and only a code `./locale` knows gets words.
+  const errorCode = failed ? str(metadata, "errorCode") : "";
+  const refusals = copy.goalCard.refusals;
+  const refusal = errorCode !== "" && Object.hasOwn(refusals, errorCode) ? refusals[errorCode] : undefined;
   const headline = truncate(
     detailHeadline !== "" ? detailHeadline : description === "" ? "" : primary,
   );
-  const structured = search !== null || read !== null || diffBlock !== null || web !== null;
+  const structured = search !== null || read !== null || diffBlock !== null || web !== null || goal !== null;
   // The daemon hints an agent-message row's glyph with `icon: "bot"`; when that
   // hint is missing the row would fall to the wrench, so a message always reads
   // as an agent's row.
@@ -1579,5 +1691,9 @@ export function toolCallData(
     read,
     diffBlock,
     web,
+    goal,
+    errorCode,
+    errorShort: refusal?.short ?? "",
+    errorHint: refusal?.hint ?? "",
   };
 }
