@@ -15,7 +15,9 @@
  * @module dsh-paseo/client/tool-call-data
  */
 import type { AgentMessage } from "./agent-message";
-import { agentMessageLabel, currentLocale, localeText } from "./locale";
+import { agentMessageLabel, currentLocale, localeText, teamToolErrorDisplay } from "./locale";
+import { teamTaskSchema } from "../shared/team";
+import { teamTaskFields, teamTaskMark, type TeamTaskMark } from "./team-polling";
 
 /**
  * Which of DSH's expanded blocks a row draws.
@@ -213,6 +215,12 @@ export interface ToolCallData {
    */
   goal: GoalBlockData | null;
   /**
+   * The team task tools' card (`team_task_create` / `get` / `update` / `list`),
+   * or null. Null for anything that is not DSH's exact `TeamTaskView` shape,
+   * which keeps the raw JSON body (see {@link parseTeamResult}).
+   */
+  team: TeamBlockData | null;
+  /**
    * DSH's structured failure code for a failed row (`HarnessError.code`, relayed
    * on `metadata.errorCode` by `server/timeline.ts`), or "".
    */
@@ -235,6 +243,25 @@ export interface ToolCallData {
  * A type alias, not an interface: the transformer's output must be a
  * `JsonValue`, and only an alias carries the implicit index signature.
  */
+/** One task as the team card draws it. A type alias so the row stays a `JsonValue`. */
+export type TeamTaskCard = {
+  id: string;
+  subject: string;
+  mark: TeamTaskMark;
+  fields: Array<{ label: string; value: string; tone?: "warning" }>;
+  description: string;
+};
+
+/** The team task tools' card: one task (create/get/update) or a list (list). */
+export type TeamBlockData = {
+  kind: "task" | "list";
+  tasks: TeamTaskCard[];
+  /** list: 「2 个任务 · 筛选 状态=已完成」; update: 「动作 认领 · task-2」; else "". */
+  caption: string;
+  /** `team_task_list` answered a `nextCursor`. */
+  more: boolean;
+};
+
 export type GoalBlockData = {
   objective: string;
   fields: Array<{ label: string; value: string }>;
@@ -1386,6 +1413,63 @@ export function parseGoalResult(text: string): GoalBlockData | null {
   return { objective: goal.objective, fields, empty: false };
 }
 
+const TEAM_TASK_TOOLS: ReadonlySet<string> = new Set(["team_task_create", "team_task_get", "team_task_update", "team_task_list"]);
+const TEAM_TOOLS: ReadonlySet<string> = new Set([...TEAM_TASK_TOOLS, "spawn_teammate", "list_agents", "wait_agent", "send_message", "interrupt_agent"]);
+
+function teamCard(view: unknown): TeamTaskCard | null {
+  const parsed = teamTaskSchema.strict().safeParse(view);
+  if (!parsed.success) return null;
+  const task = parsed.data;
+  const text = localeText().team;
+  // The card's own revision field is in the list too: it is what the model's
+  // next compare-and-set will name.
+  return { id: task.id, subject: task.subject, mark: teamTaskMark(task), fields: teamTaskFields(task, text), description: task.description };
+}
+
+/**
+ * Parse one team task tool's result into its card, or null to keep the raw body.
+ *
+ * Strict on DSH's `TASK_VIEW_SCHEMA` (`additionalProperties: false`): an extra
+ * key, a missing key or a status outside the wire's three is null, and the row
+ * keeps its JSON — a card drawn from a guessed shape would hide what DSH said.
+ */
+export function parseTeamResult(name: string, input: unknown, output: string): TeamBlockData | null {
+  if (!TEAM_TASK_TOOLS.has(name)) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(output);
+  } catch {
+    return null;
+  }
+  const text = localeText().team;
+  if (name === "team_task_list") {
+    if (!isRecord(value) || !Array.isArray(value.tasks)) return null;
+    const extra = Object.keys(value).filter((key) => key !== "tasks" && key !== "nextCursor");
+    if (extra.length > 0 || (value.nextCursor !== undefined && typeof value.nextCursor !== "number")) return null;
+    const cards = value.tasks.map(teamCard);
+    if (cards.some((card) => card === null)) return null;
+    const filters: string[] = [];
+    if (isRecord(input)) {
+      const status = input.status;
+      if (status === "pending" || status === "in_progress" || status === "completed") {
+        const word = status === "completed" ? text.marks.done : status === "in_progress" ? text.marks.doing : text.marks.ready;
+        filters.push(`${text.fields.status}=${word}`);
+      }
+      if (typeof input.owner === "string") filters.push(`${text.fields.owner}=${input.owner === "unowned" ? text.card.unownedFilter : input.owner}`);
+      if (typeof input.ready === "boolean") filters.push(input.ready ? text.card.readyFilter : text.card.notReadyFilter);
+    }
+    const caption = [text.card.count(cards.length), filters.length === 0 ? "" : `${text.card.filter} ${filters.join("，")}`]
+      .filter((part) => part !== "")
+      .join(" · ");
+    return { kind: "list", tasks: cards as TeamTaskCard[], caption, more: typeof value.nextCursor === "number" };
+  }
+  const card = teamCard(value);
+  if (card === null) return null;
+  const action = name === "team_task_update" && isRecord(input) && typeof input.action === "string" ? input.action : "";
+  const caption = action === "" ? "" : `${text.card.action} ${text.card.actions[action] ?? action} · ${card.id}`;
+  return { kind: "task", tasks: [card], caption, more: false };
+}
+
 /** Normalize one Paseo tool-call item into JSON-safe render data. */
 export function toolCallData(
   item: {
@@ -1613,6 +1697,21 @@ export function toolCallData(
     body = "";
     code = false;
   }
+  // The team task tools' card, the goal card's rule: never on a failed row, and
+  // a result the parser does not recognise keeps the raw JSON set above.
+  const team =
+    !failed && agentMessage === undefined && type === "unknown" && typeof detail.output === "string"
+      ? parseTeamResult(item.name, detail.input, detail.output)
+      : null;
+  if (team !== null) {
+    primary = team.kind === "list" ? team.caption : (team.tasks[0]?.subject ?? "");
+    detailHeadline = "";
+    body = "";
+    code = false;
+  }
+  // A failed team tool's DSH sentence, translated when known, DSH's words kept
+  // after it (v9 rule); unknown sentences stay verbatim.
+  const teamError = failed && TEAM_TOOLS.has(item.name) && error !== "" ? teamToolErrorDisplay(error, copy.team) : undefined;
   // Only a failed row has a code, and only a code `./locale` knows gets words.
   const errorCode = failed ? str(metadata, "errorCode") : "";
   const refusals = copy.goalCard.refusals;
@@ -1620,7 +1719,7 @@ export function toolCallData(
   const headline = truncate(
     detailHeadline !== "" ? detailHeadline : description === "" ? "" : primary,
   );
-  const structured = search !== null || read !== null || diffBlock !== null || web !== null || goal !== null;
+  const structured = search !== null || read !== null || diffBlock !== null || web !== null || goal !== null || team !== null;
   // The daemon hints an agent-message row's glyph with `icon: "bot"`; when that
   // hint is missing the row would fall to the wrench, so a message always reads
   // as an agent's row.
@@ -1692,8 +1791,9 @@ export function toolCallData(
     diffBlock,
     web,
     goal,
+    team,
     errorCode,
-    errorShort: refusal?.short ?? "",
-    errorHint: refusal?.hint ?? "",
+    errorShort: refusal?.short ?? (teamError?.original === undefined ? "" : teamError.message),
+    errorHint: refusal?.hint ?? (teamError?.original === undefined ? "" : teamError.message),
   };
 }

@@ -66,6 +66,7 @@ const {
   allText,
   currentLocale,
   goalControlErrorDisplay,
+  teamToolErrorDisplay,
   localeFromMetadata,
   resolveLocale,
   setLocale,
@@ -641,6 +642,94 @@ console.log("the goal pill's copy is covered in both languages");
     equal("goal.statuses keys are GOAL_PHASES plus disarmed (zh-CN)", Object.keys(zh.statuses).sort(), [...phases, "disarmed"].sort());
     const sameStatuses = phases.filter((phase) => en.statuses[phase] === zh.statuses[phase]);
     equal("the English status words are not the Chinese ones", sameStatuses, []);
+  }
+}
+
+console.log("the team pill, panel and cards (T3)");
+{
+  const en = allText().en.team;
+  const zh = allText()["zh-CN"].team;
+  // Every leaf string in both languages, and none copied across.
+  const leaves = (table, prefix = "") =>
+    Object.entries(table).flatMap(([key, value]) =>
+      typeof value === "string" ? [[`${prefix}${key}`, value]] : typeof value === "object" && value !== null ? leaves(value, `${prefix}${key}.`) : [],
+    );
+  const enLeaves = Object.fromEntries(leaves(en));
+  const zhLeaves = Object.fromEntries(leaves(zh));
+  equal("team: both languages have the same string keys", Object.keys(enLeaves).sort(), Object.keys(zhLeaves).sort());
+  for (const [key, value] of Object.entries(zhLeaves)) {
+    check(`team.${key} is non-empty in both`, value.trim() !== "" && (enLeaves[key] ?? "").trim() !== "");
+  }
+  equal("team: English is not a copy of Chinese", Object.keys(zhLeaves).filter((key) => zhLeaves[key] === enLeaves[key]), []);
+  equal("team: the title is the noun (zh)", zh.title, "团队");
+  equal("team: the title is the noun (en)", en.title, "Team");
+  equal("team: the member words", zh.memberStates, { running: "运行中", idle: "空闲", provisioning: "准备中", failed: "创建失败" });
+  check("team: the unknown word is neither running nor idle (zh)", zh.memberActive !== zh.memberStates.running && zh.memberActive !== zh.memberStates.idle, zh.memberActive);
+  check("team: the unknown word is neither running nor idle (en)", en.memberActive !== en.memberStates.running && en.memberActive !== en.memberStates.idle, en.memberActive);
+  equal("team: the group words", zh.marks, { doing: "进行中", ready: "可开始", blocked: "等待依赖", done: "已完成" });
+  equal("team: blockers sentence (zh)", zh.blockedBy(["task-1", "task-2"].join(zh.listSeparator)), "等 task-1、task-2");
+  equal("team: failure keeps DSH's sentence (zh)", zh.failure("x is invalid"), "团队记录无效：x is invalid");
+  for (const key of Object.keys(zh.card.actions)) check(`team.card.actions.${key} has an English word`, typeof en.card.actions[key] === "string");
+  equal("team: the action keys are DSH's eight", Object.keys(zh.card.actions).sort(), ["claim", "complete", "delete", "edit", "reassign", "release", "reopen", "set_dependencies"]);
+
+  // Refusals: DSH's sentences, translated in zh, untouched in en, unknown verbatim.
+  const REFUSALS = [
+    ['team task "task-3" not found', "找不到团队任务 task-3。"],
+    ['Error: team task "task-3" not found', "找不到团队任务 task-3。"],
+    ['stale team task "task-2" revision 1; current revision is 3', "任务 task-2 已被改动（预期修订 1，当前 3），请重新读取后再试。"],
+    ['team task "task-2" is owned by another member', "任务 task-2 已由其他成员认领。"],
+    ['team task "task-2" is not ready to claim', "任务 task-2 的依赖未完成，还不能认领。"],
+    ['team task "task-1" still blocks "task-2"', "任务 task-1 仍被 task-2 依赖，不能删除。"],
+    ["task mutation requires its owner or Team Lead", "只有任务负责人或队长能改这个任务。"],
+    ["only an in-progress task can complete", "只有进行中的任务能标记完成。"],
+    ['Error: invalid workspace-relative write scope "../x"', '写入范围不是工作区内的相对路径："../x"'],
+    ["subject must be non-empty", "subject 不能为空。"],
+    ['teammate name "fixer" was already used in this Team', "队员名 fixer 在本团队已用过。"],
+    ["limit must be an integer from 1 through 100", "limit 必须是 1 到 100 的整数。"],
+  ];
+  for (const [raw, expected] of REFUSALS) {
+    equal(`zh translates ${JSON.stringify(raw.slice(0, 40))}`, zh.translateToolError(raw), expected);
+    equal(`en leaves ${JSON.stringify(raw.slice(0, 40))}`, en.translateToolError(raw), undefined);
+    const shown = teamToolErrorDisplay(raw, zh);
+    check(`zh display keeps DSH's words for ${JSON.stringify(raw.slice(0, 30))}`, shown.message === expected && shown.original === raw.trim(), JSON.stringify(shown));
+  }
+  for (const raw of ["Error: something DSH says later", 'team task "task-1" not found, and more', ""]) {
+    equal(`zh leaves unknown ${JSON.stringify(raw.slice(0, 30))}`, zh.translateToolError(raw), undefined);
+    const shown = teamToolErrorDisplay(raw, zh);
+    check(`…displayed verbatim`, shown.message === raw && shown.original === undefined, JSON.stringify(shown));
+  }
+  equal("zh overlap warning", zh.translateWarning("write scopes overlap with task-4"), "写入范围与 task-4 重叠");
+  equal("en overlap warning untouched", en.translateWarning("write scopes overlap with task-4"), undefined);
+  equal("unknown warning untouched", zh.translateWarning("write scopes overlap"), undefined);
+
+  // Drift: every literal TeamError sentence in the installed agent-team package
+  // must have a Chinese line (variables instantiated). NOTE when absent.
+  let lib = process.env.DSH_AGENT_TEAM;
+  if (lib === undefined) {
+    try {
+      const root = require("node:child_process").execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
+      lib = path.join(root, "@deepseek-ai", "dsh", "node_modules", "@deepseek-ai", "dsh-experimental-agent-team", "lib", "index.js");
+    } catch {
+      lib = undefined;
+    }
+  }
+  if (lib === undefined || !fs.existsSync(lib)) {
+    console.log(`  NOTE dsh-experimental-agent-team not found (${String(lib)}); set DSH_AGENT_TEAM to check refusal drift`);
+  } else {
+    const source = fs.readFileSync(lib, "utf8");
+    // The model-facing refusals: TeamError / TeamTaskGraphError with a code.
+    const literals = [...source.matchAll(/new Team(?:TaskGraph)?Error\((`[^`]*`|"(?:[^"\\]|\\.)*")/g)].map((m) => m[1]);
+    check("agent-team refusals are readable", literals.length >= 20, String(literals.length));
+    const sample = { id: "task-7", "request.taskId": "task-7", "current.id": "task-7", "task.id": "task-7", blockerId: "task-1", "dependent.id": "task-8",
+      "request.expectedRevision": "1", "current.revision": "2", "this.maxTasks": "100", "this.maxMembers": "16", "this.disposalTimeoutMs": "5000", name: "fixer", field: "subject",
+      maxLength: "200", "agent.id": "s-1", "JSON.stringify(value)": '"../x"', toolName: "team_task_get" };
+    const skip = /timeoutMs|wait_agent|teammate creation aborted|unsupported task action|positive safe integer|exceeds \$\{this\.config|message itself|interrupt|provisioned teammate|teammate "\$\{/;
+    for (const literal of literals) {
+      const body = JSON.parse(literal.startsWith("`") ? JSON.stringify(literal.slice(1, -1)) : literal);
+      if (skip.test(body)) continue;
+      const sentence = body.replace(/\$\{([^}]+)\}/g, (_, expr) => sample[expr.trim()] ?? "x");
+      check(`agent-team refusal ${JSON.stringify(sentence.slice(0, 50))} has a Chinese line`, typeof zh.translateToolError(sentence) === "string", sentence);
+    }
   }
 }
 

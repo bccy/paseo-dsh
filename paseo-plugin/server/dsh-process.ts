@@ -22,6 +22,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { GoalErrorCode } from "../shared/goal";
 import type { JobErrorCode } from "../shared/jobs";
+import type { TeamErrorCode } from "../shared/team";
 import { profileName } from "./bootstrap";
 import { createFrameReader, splitFrames, type FrameReader } from "./frame-reader";
 
@@ -301,6 +302,17 @@ export type DshCurrentTask =
   | { kind: "task"; task: string }
   | { kind: "none" }
   | { kind: "unavailable"; message: string };
+
+/**
+ * One session's team board as the team pill reads it: DSH's `agentTeam` wire
+ * view, still unvalidated (`server/provider.ts` parses it with the shared Zod
+ * schema). `team: null` = no stored log, or a log with no team state to show.
+ */
+export interface DshTeam {
+  available: boolean;
+  team?: unknown;
+  error?: { message?: string; code?: TeamErrorCode };
+}
 
 /**
  * One entry of the composer's `/` menu. `kind` decides how running it works:
@@ -634,6 +646,13 @@ function withGoalErrorCode(result: DshGoal): DshGoal {
     (message === GOAL_SERVICE_MISSING_MESSAGE ? "goal_unavailable" : "rpc_failed");
   return { ...result, error: { message, code } };
 }
+
+/** The session-projection key DSH's agent-team bundle maintains (`teamProjectionDefinition.key`). */
+const TEAM_PROJECTION_KEY = "agentTeam";
+
+/** Logged once when the bridge predates `paseo/projections`; the team pill hides. */
+const TEAM_BRIDGE_TOO_OLD_MESSAGE =
+  "this profile's bridge has no paseo/projections; reload the plugin so the embedded bridge is rewritten";
 
 /** What one attached session contributes besides its handlers. */
 export interface DshSessionOptions {
@@ -2373,6 +2392,45 @@ export class DshProcess {
       if (content !== "") return { kind: "task", task: content };
     }
     return { kind: "none" };
+  }
+
+  /**
+   * Read the session's team board from DSH's `agentTeam` projection.
+   *
+   * Same bridge method and same cold-read path as {@link currentTask} (no bridge
+   * change). Grading follows {@link goal}: no `projections` method is terminal
+   * `bridge_too_old`; the bridge's unknown-key sentence means the profile mounts
+   * no agent-team bundle, terminal `team_unavailable` (not "no team"); an unknown
+   * or disposed session is transient `session_missing`; anything else is thrown
+   * so the session layer reports `rpc_failed`. A `null` snapshot (no stored log)
+   * and `migration-required` (cached hints, not exact values) are `team: null`.
+   *
+   * @param sessionId - which session; required — there is no default.
+   */
+  async team(sessionId: string): Promise<DshTeam> {
+    await this.#ensureSessionReady(sessionId);
+    let snapshot: unknown;
+    try {
+      snapshot = await this.#request("paseo/projections", { sessionId, keys: [TEAM_PROJECTION_KEY] }, GOAL_READ_TIMEOUT_MS);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (this.#isUnknownBridgeMethodError(error)) {
+        return { available: false, error: { message: TEAM_BRIDGE_TOO_OLD_MESSAGE, code: "bridge_too_old" } };
+      }
+      if (message.startsWith(UNKNOWN_PROJECTION_KEY_PREFIX)) {
+        return { available: false, error: { message, code: "team_unavailable" } };
+      }
+      if (message.startsWith(UNKNOWN_BRIDGE_SESSION_PREFIX) || message.startsWith(DISPOSED_BRIDGE_AGENT_PREFIX)) {
+        return { available: false, error: { message, code: "session_missing" } };
+      }
+      throw error;
+    }
+    if (snapshot === null || typeof snapshot !== "object") return { available: true, team: null };
+    const record = snapshot as { kind?: unknown; values?: unknown };
+    if (record.kind !== "sequenced") return { available: true, team: null };
+    const values = record.values;
+    if (typeof values !== "object" || values === null) return { available: true, team: null };
+    return { available: true, team: (values as Record<string, unknown>)[TEAM_PROJECTION_KEY] ?? null };
   }
 
   /**

@@ -1,10 +1,11 @@
 import type { PluginHandlerContext, PluginServerContext } from "@getpaseo/plugin/server";
 import { goalControl, goalCurrent } from "./shared/goal";
 import { jobsList } from "./shared/jobs";
+import { teamRead } from "./shared/team";
 import { rewindNoticeArm } from "./shared/rewind-notice";
 import { ensurePaseoProfile } from "./server/bootstrap";
 import { capturePaseo } from "./server/rewind-notice-append";
-import { controlAgentGoal, createDshProvider, readAgentGoal, readAgentJobs } from "./server/provider";
+import { controlAgentGoal, createDshProvider, readAgentGoal, readAgentJobs, readAgentTeam } from "./server/provider";
 
 /**
  * The lifecycle events the server half listens on **only** to capture the Paseo
@@ -121,6 +122,18 @@ export default function contribute(server: PluginServerContext) {
     return result.ok
       ? { ok: true, message: result.message }
       : { ok: false, error: result.error };
+  });
+
+  // The team pill's read (T3): DSH's agentTeam projection plus live `running`.
+  // Read-only — there is no team write path the bridge could carry honestly.
+  server.handle(teamRead, async ({ agentId }, context) => {
+    capture(context);
+    const result = await readAgentTeam(agentId);
+    return {
+      available: result.available,
+      team: result.team,
+      ...(result.error === undefined ? {} : { error: result.error }),
+    };
   });
 
   server.handle(rewindNoticeArm, (_input, context) => {

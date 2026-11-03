@@ -44,6 +44,8 @@ import { shouldPulse, useRowPulse } from "./newest";
 import { PASEO_MARK_ICON } from "./paseo-mark";
 import { blockCopy, type GoalBlockData, type ReadBlockData, type SearchBlockData, type ToolCallData, type WebBlockData } from "./tool-call-data";
 import { TextShimmer } from "./text-shimmer";
+import { TeamBlockView } from "./team-card";
+import { ringColorFor } from "./jobs-popover-layout";
 import {
   BODY_INDENT,
   type TokenColors,
@@ -1014,6 +1016,20 @@ export function InlineToolCall({
             </Text>
           ) : null}
           {data.goal !== null ? <GoalBlockView data={data.goal} summary={data.summary} styles={styles} /> : null}
+          {data.team !== null ? (
+            <TeamBlockView
+              data={data.team}
+              hairline={StyleSheet.hairlineWidth}
+              colors={{
+                ...colors,
+                foregroundMuted: colors.foregroundMuted,
+                extraMuted: (colors as unknown as Record<string, string | undefined>).foregroundExtraMuted ?? colors.foregroundMuted,
+                running: ringColorFor(colors.surface0),
+                warning: colors.statusWarning,
+                border: colors.border,
+              }}
+            />
+          ) : null}
           {/* One card per expanded block, the way DSH's TerminalBlock, DiffBlock
               and ReadBlock all are: same radius, same hairline, same surface.
               `data.kind` picks it; a block whose meta did not parse has no

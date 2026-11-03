@@ -68,6 +68,7 @@ const {
   toolCallData,
   toolIcon,
   toolLabel,
+  parseTeamResult,
 } = require("./client/tool-call-data.js");
 const { diffStat } = require("./client/tokens.js");
 const { localeText, setLocale } = require("./client/locale.js");
@@ -1900,6 +1901,97 @@ console.log("a forked subagent is not a spawned one");
     toolLabel("subagent_fork") !== toolLabel("subagent") &&
       toolIcon("subagent_fork", { type: "unknown" }) !== toolIcon("subagent", { type: "unknown" }),
   );
+}
+
+console.log("team task tools: field cards, raw JSON fallback, translated refusals (T3)");
+{
+  setLocale("zh-CN");
+  // Fictional data in DSH's exact `TeamTaskView` shape (TASK_VIEW_SCHEMA).
+  const view = (over = {}) => ({
+    id: "task-2",
+    revision: 3,
+    subject: "独立审查：修复的正确性与证据",
+    description: "只读审查 task-1 的产出。\n\n必查项：A. 改动落点。B. 回退路径。",
+    status: "completed",
+    blockedBy: ["task-1"],
+    writeScopes: [],
+    ownerName: "reviewer",
+    ready: false,
+    writeScopeWarnings: [],
+    ...over,
+  });
+  const row = (name, input, output, extra = {}) =>
+    toolCallData({ name, status: "completed", detail: { type: "unknown", input, output }, error: null, ...extra }, "complete");
+
+  const get = row("team_task_get", { task_id: "task-2" }, JSON.stringify(view()));
+  check("team_task_get gets a card", get.team !== null && get.team.kind === "task", JSON.stringify(get.team));
+  equal("…the summary is the subject, not the JSON", get.summary, "独立审查：修复的正确性与证据");
+  equal("…the raw body is gone", get.body, "");
+  check("…and it is not a code surface", get.code === false);
+  equal("…fields in the card's order", get.team?.tasks[0].fields.map((f) => f.label), ["状态", "负责人", "依赖", "修订"]);
+  equal("…status word", get.team?.tasks[0].fields[0].value, "已完成");
+  equal("…the description travels whole", get.team?.tasks[0].description, view().description);
+  equal("…mark", get.team?.tasks[0].mark, "done");
+  check("…the row still expands", get.hasDetail === true);
+
+  const create = row("team_task_create", { subject: "x", description: "y", blocked_by: ["task-1"] }, JSON.stringify(view({ id: "task-3", revision: 1, status: "pending", ownerName: undefined, writeScopes: ["src/a.ts", "src/b/"], writeScopeWarnings: ["write scopes overlap with task-1"] })));
+  equal("team_task_create: unowned reads 未分配", create.team?.tasks[0].fields[1], { label: "负责人", value: "未分配" });
+  equal("…a pending task that is not ready is 等待依赖", create.team?.tasks[0].fields[0].value, "等待依赖");
+  equal("…scopes one per line", create.team?.tasks[0].fields.find((f) => f.label === "写入范围")?.value, "src/a.ts\nsrc/b/");
+  equal("…the overlap warning is translated and tinted", create.team?.tasks[0].fields.find((f) => f.label === "提醒"), { label: "提醒", value: "写入范围与 task-1 重叠", tone: "warning" });
+
+  const update = row("team_task_update", { task_id: "task-2", expected_revision: 1, action: "claim" }, JSON.stringify(view({ status: "in_progress", revision: 2 })));
+  equal("team_task_update names its action", update.team?.caption, "动作 认领 · task-2");
+  const unknownAction = row("team_task_update", { task_id: "task-2", expected_revision: 1, action: "frobnicate" }, JSON.stringify(view({ status: "in_progress" })));
+  equal("…an action DSH adds later is shown verbatim", unknownAction.team?.caption, "动作 frobnicate · task-2");
+
+  const list = row("team_task_list", { status: "completed" }, JSON.stringify({ tasks: [view({ id: "task-1", blockedBy: [] }), view()] }));
+  check("team_task_list gets a list card", list.team?.kind === "list" && list.team.tasks.length === 2, JSON.stringify(list.team?.kind));
+  equal("…its caption counts and names the filter", list.team?.caption, "2 个任务 · 筛选 状态=已完成");
+  equal("…the head summary is that caption, not `{\"status\":\"completed\"}`", list.summary, "2 个任务 · 筛选 状态=已完成");
+  const paged = row("team_task_list", {}, JSON.stringify({ tasks: [view()], nextCursor: 50 }));
+  check("…nextCursor marks more", paged.team?.more === true);
+  const ownerFilter = row("team_task_list", { owner: "unowned", ready: true }, JSON.stringify({ tasks: [] }));
+  equal("…owner/ready filters in words", ownerFilter.team?.caption, "0 个任务 · 筛选 负责人=未分配，可开始");
+
+  // The fallback: anything that is not DSH's exact shape keeps the raw JSON.
+  for (const [what, output] of [
+    ["not JSON", "task created"],
+    ["an extra key (DSH's schema is additionalProperties:false)", JSON.stringify({ ...view(), extra: 1 })],
+    ["a missing key", JSON.stringify({ ...view(), ready: undefined })],
+    ["a deleted task", JSON.stringify(view({ status: "deleted" }))],
+    ["a list with one bad task", JSON.stringify({ tasks: [view(), { id: "task-9" }] })],
+    ["a list with an unknown key", JSON.stringify({ tasks: [], total: 0 })],
+  ]) {
+    const name = what.startsWith("a list") ? "team_task_list" : "team_task_get";
+    const raw = row(name, { task_id: "task-2" }, output);
+    check(`${what}: no card`, raw.team === null, JSON.stringify(raw.team));
+    check(`${what}: the raw output stays in the body`, raw.body.includes(output.slice(0, 12)) && raw.code === true, raw.body.slice(0, 80));
+  }
+  equal("parseTeamResult ignores other tools", parseTeamResult("create_goal", {}, JSON.stringify(view())), null);
+
+  // A failed team tool: DSH's sentence in Chinese first, DSH's own words kept.
+  const failedRow = (message) =>
+    toolCallData({ name: "team_task_create", status: "failed", detail: { type: "unknown", input: { subject: "x" }, output: message }, error: { message } }, "complete");
+  const scope = failedRow('Error: invalid workspace-relative write scope "../outside/a.ts"');
+  check("a failed call never gets a card", scope.team === null);
+  equal("…the head reads Chinese", scope.errorShort, '写入范围不是工作区内的相对路径："../outside/a.ts"');
+  equal("…the expansion opens with the Chinese line", scope.errorHint, '写入范围不是工作区内的相对路径："../outside/a.ts"');
+  equal("…and keeps DSH's verbatim error", scope.error, 'Error: invalid workspace-relative write scope "../outside/a.ts"');
+  const stale = failedRow('stale team task "task-2" revision 1; current revision is 3');
+  equal("a stale revision refusal", stale.errorShort, "任务 task-2 已被改动（预期修订 1，当前 3），请重新读取后再试。");
+  const unknown = failedRow("Error: something DSH says later");
+  equal("an unknown refusal is not translated (head keeps DSH's first line)", unknown.errorShort, "");
+  equal("…no hint invented", unknown.errorHint, "");
+  equal("…the verbatim error stays", unknown.error, "Error: something DSH says later");
+  const otherTool = toolCallData({ name: "bash", status: "failed", detail: { type: "unknown", output: "No goal to clear." }, error: { message: 'team task "task-1" not found' } }, "complete");
+  equal("a non-team tool's error is never run through the team table", otherTool.errorShort, "");
+  setLocale("en");
+  const en = failedRow('team task "task-1" not found');
+  equal("English: no translation, DSH's words", en.errorShort, "");
+  const enCard = row("team_task_get", {}, JSON.stringify(view()));
+  equal("English card labels", enCard.team?.tasks[0].fields.map((f) => f.label), ["Status", "Owner", "Blocked by", "Revision"]);
+  setLocale(undefined);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

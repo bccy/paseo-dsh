@@ -10,6 +10,10 @@
  *            tools, a failed `turn/end`, a stray event for an unknown session,
  *            two `paseo/question` requests sharing one callId (root + child-A),
  *            and the root's own turn
+ *   team     after the first prompt, open one live child (`team-child-R`) and
+ *            leave it running, and a second (`team-child-I`) that runs and goes
+ *            idle — the team pill's running overlay is read from exactly this
+ *            (`harness/team-server-check.cjs`).
  *   early    emit a child-opened + child event right after the parent's first
  *            session request, before the plugin emits `session.ready`
  *   nested   after the root is ready, report a grandchild (and great-grandchild)
@@ -530,6 +534,16 @@ async function emitMultiTurn(sessionId) {
     event: { type: "turn/end", seq: 2, data: { turn, reason: { kind: "completed" } } },
   });
   notify("session.status", { sessionId, status: "idle" });
+}
+
+/** `team` mode: one child left running, one that ran and went idle, both live-hosted. */
+async function emitTeam() {
+  notify("session.child-opened", { sessionId: "team-child-R", parentSessionId: rootId, mode: "continuable", label: "Running R", cwd: "/tmp" });
+  notify("session.status", { sessionId: "team-child-R", status: "running" });
+  notify("session.child-opened", { sessionId: "team-child-I", parentSessionId: rootId, mode: "continuable", label: "Idle I", cwd: "/tmp" });
+  notify("session.status", { sessionId: "team-child-I", status: "running" });
+  notify("session.event", { sessionId: "team-child-I", event: { type: "turn/end", seq: 1, data: { turn: 1, reason: { kind: "completed" } } } });
+  notify("session.status", { sessionId: "team-child-I", status: "idle" });
 }
 
 async function emitScenario() {
@@ -1314,6 +1328,10 @@ async function handle(method, params, id) {
       if (mode() === "live" && !state.emitted) {
         state.emitted = true;
         setTimeout(() => { void emitScenario(); }, 30);
+      }
+      if (mode() === "team" && !state.emitted) {
+        state.emitted = true;
+        setTimeout(() => { void emitTeam(); }, 30);
       }
       if (mode() === "nested" && !state.emitted) {
         state.emitted = true;

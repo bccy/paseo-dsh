@@ -30,6 +30,7 @@ import {
   type DshCurrentTask,
   type DshGoal,
   type DshJobs,
+  type DshTeam,
   type DshMcpServer,
   type DshPermissionPreset,
   type DshProcessHandlers,
@@ -1073,6 +1074,39 @@ export class DshSession {
     } catch (error) {
       return { available: false, error: { message: messageOf(error), code: "rpc_failed" } };
     }
+  }
+
+  /**
+   * The team board, for the composer's team pill, with each member's live
+   * `running` overlaid (T3).
+   *
+   * DSH's projection is durable state only. Running is this session's own
+   * knowledge: the Lead row is this root's turn state; a teammate row is the
+   * child session this root hosts under the same DSH session id, and only once
+   * a live frame has proved it is hosted here. A member this process cannot see
+   * gets **no** `running` key — the client then shows no 运行中/空闲 at all.
+   * Validation of DSH's shape is the provider's (`shared/team.ts`).
+   */
+  async team(): Promise<DshTeam> {
+    if (this.#closed) return { available: false, error: { code: "session_missing" } };
+    const process = this.#process;
+    if (process === undefined) return { available: false, error: { code: "session_missing" } };
+    let result: DshTeam;
+    try {
+      result = await process.team(this.#dshSessionId);
+    } catch (error) {
+      return { available: false, error: { message: messageOf(error), code: "rpc_failed" } };
+    }
+    if (!result.available || result.team === null || typeof result.team !== "object") return result;
+    const members = (result.team as { members?: unknown }).members;
+    if (!Array.isArray(members)) return result;
+    const overlaid = members.map((member: unknown) => {
+      if (typeof member !== "object" || member === null) return member;
+      const row = member as { id?: unknown; role?: unknown };
+      const running = row.role === "lead" ? this.#turnStarted && this.#turnId !== null : typeof row.id === "string" ? this.#children.get(row.id)?.running : undefined;
+      return running === undefined ? member : { ...row, running };
+    });
+    return { ...result, team: { ...(result.team as object), members: overlaid } };
   }
 
   /**
@@ -3109,6 +3143,16 @@ export class DshChildSession {
 
   get opened(): boolean {
     return this.#opened;
+  }
+
+  /**
+   * Whether this child is executing a turn now, for the team pill; `undefined`
+   * until a live frame has proved this process hosts it (a replayed child's
+   * turn state says nothing about the present).
+   */
+  get running(): boolean | undefined {
+    if (!this.#observedLive) return undefined;
+    return this.#turnId !== null && !this.#turnEnded;
   }
 
   /** Announce the child to Paseo as a provider-owned subsession. Idempotent. */

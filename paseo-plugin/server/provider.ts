@@ -38,6 +38,7 @@ import { effortLabel, LOCALE, UI } from "./locale";
 import { rewindSuccessText, type RewindTone } from "../shared/rewind-notice";
 import type { GoalAction, GoalErrorCode, GoalState } from "../shared/goal";
 import type { JobErrorCode } from "../shared/jobs";
+import { teamViewSchema, type TeamErrorCode, type TeamView } from "../shared/team";
 import { PROVIDER_ID } from "../shared/provider";
 
 /**
@@ -2211,6 +2212,50 @@ export async function readAgentGoal(agentId: string): Promise<{
     };
   }
   return { available: true, goal: null };
+}
+
+/**
+ * Read one agent's team board (T3), the way {@link readAgentGoal} reads a goal.
+ *
+ * The board is DSH's `agentTeam` wire view plus the session's own `running`
+ * overlay (`DshSession.team`). It is parsed here with the shared schema: an
+ * answer that is not DSH's shape is a transient `rpc_failed` with the Zod
+ * reason, never a silently emptied board. No session for the agent in this
+ * process is an accurate `team: null` (the goal/jobs rule).
+ *
+ * @param agentId - Paseo's agent id, as the pill knows it.
+ */
+export async function readAgentTeam(agentId: string): Promise<{
+  available: boolean;
+  team: TeamView | null;
+  error?: { message: string; code?: TeamErrorCode };
+}> {
+  for (const connection of CONNECTIONS) {
+    const session = connection.sessionForAgent(agentId);
+    if (session === undefined) continue;
+    const result = await session.team();
+    if (!result.available) {
+      return {
+        available: false,
+        team: null,
+        error: {
+          message: result.error?.message ?? "the DSH runtime could not read this session's team",
+          ...(result.error?.code === undefined ? {} : { code: result.error.code }),
+        },
+      };
+    }
+    if (result.team === undefined || result.team === null) return { available: true, team: null };
+    const parsed = teamViewSchema.safeParse(result.team);
+    if (!parsed.success) {
+      return {
+        available: false,
+        team: null,
+        error: { message: `the agentTeam projection is not the expected shape: ${parsed.error.message}`, code: "rpc_failed" },
+      };
+    }
+    return { available: true, team: parsed.data };
+  }
+  return { available: true, team: null };
 }
 
 /**

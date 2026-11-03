@@ -57,7 +57,7 @@
   失败原因、终端卡）与正文截断口径：**generic 卡（MCP unknown、read/fetch 无 meta、plan、
   `/command` 输出、agent message）与结构化 diff 卡的 body 不再截断**，改由视图滚动 + 复制全量
   body（260px，`CODE_MAX_HEIGHT` 的唯一消费者）；仍会截断的只有 legacy 纯文本 diff 回落
-  （6000 + 本地化标记）与 `headline`/`summary`。本轮 385 → **397** 条：goal 状态行
+  （6000 + 本地化标记）与 `headline`/`summary`。本轮 385 → **397** 条（团队字段卡再 +46 → 443，见文末「团队（team）链」）：goal 状态行
   （`get_goal`）与轮次行（`goal_round`）都解析出 `Target`，其余**带 icon 键**的 `plain_text`
   行图标不变，无映射的 iconless `plain_text` 仍是 `Wrench`。**动了工具行渲染必跑（含失败原因：
   错误只认顶层 `item.error.message`；终端正文全量 + 224px 纵向滚动 + 复制；goal 两行的图标/
@@ -104,7 +104,7 @@
   编辑页 `goal.editor` 表键齐全、键名（Esc/Enter/Shift Enter）两语一致、其余词中英不互抄，且 goal 的
   label/按钮/提示文案中英两列都不得为空或互为复制；完成态四键（`complete`「目标已完成」、`completeHint` 指向收尾消息、
   `completeClearHint`「清除后 /goal 将查不到这个目标，无法撤销」且不同于 active 的确认句、`rowLabel` 状态在前）；**控制错误中文表**（DSH/插件拒绝句逐句译文、英文原样、显示保留原文；未知句与未知变量不翻；
-  读本机 `dsh-command-goal/lib/index.js` 的错误字面量逐条确认都有中文，找不到时打印 NOTE，`DSH_COMMAND_GOAL` 可覆盖路径）（实跑 505 条）。**动了 `client/locale.ts`、标签表或
+  读本机 `dsh-command-goal/lib/index.js` 的错误字面量逐条确认都有中文，找不到时打印 NOTE，`DSH_COMMAND_GOAL` 可覆盖路径）（实跑 649 条，含团队段，见文末「团队（team）链」）。**动了 `client/locale.ts`、标签表或
   `shared/goal.ts` 的 phase 枚举必跑。**
 - `harness/jobs-poll-check.cjs` — jobs 轮询状态机（假时钟 + 假 RPC + 假目录页，不 import
   React/host）：可见性（有 live 显示 live 数、无 live 隐藏；图标恒为转环，仅 `available:false`
@@ -686,3 +686,29 @@
   也放出它。运行 `node harness/goal-state-order-check.cjs`。**动了 `server/timeline.ts` 的
   `consume` / `#heldGoalRows` / `settleRunningTools`、`#commandRun` / `#commandDone` 或
   `server/session.ts` 的重放循环必跑。**
+
+## 团队（team）链（2026-11-04）
+
+设计见 [TEAM.md](./TEAM.md)。三个新脚本 + 两个既有脚本的团队段；断言数为回填时实跑值。
+
+- `harness/team-server-check.cjs` — 插件 `team.read`（**22 条**；假桥 `team` 模式 + 一次性 `DSH_HOME`）：只读 `agentTeam`
+  这一个 projection key；无会话 / `null` / `migration-required` / 缺键 → `team: null`；无 `paseo/projections` → 终态
+  `bridge_too_old`；未知 key → 终态 `team_unavailable`（且插件前缀与桥源码逐字一致）；未知会话 → `session_missing`；
+  其它抛错与形状不符 → `rpc_failed`（不清空成空看板）；DSH 字段原样；**`running`**：空闲根的 Lead 为 false、未托管队员无此键、
+  托管中队员回合未结束为 true、已结束为 false、失败成员无此键。编译同 `goal-server-check`（`.dbg` + 拷入本脚本与
+  `fake-dsh-bridge.mjs`）。**动了 `server/{dsh-process,session,provider}.ts` 的 team 部分、`shared/team.ts` 或假桥 `team` 模式必跑。**
+- `harness/team-pill-check.cjs` — `client/team-polling.ts` 纯规则（**73 条**）：可见性（只有 Lead 无任务隐藏）、pill 图标
+  （只有 `running:true` 才转环、failure/失败成员红）、成员词（无 `running` 时中英都不说运行中/空闲）与排序、任务标记只认 DSH 的
+  `ready`、B 分组顺序（被阻塞任务不进可开始）、facts 行、详情字段、重叠警告翻译（未知原样）、契约码、poller 适配（终态移除、
+  瞬态保留上次看板）、pill 接线源码钉（label/title 是名词、无计数）。运行：`cd paseo-plugin && npx tsc -p ../harness/team-pill.tsconfig.json`，
+  写 `.dbg-team/package.json` 并拷入本脚本，`cd .dbg-team && node team-pill-check.cjs`。**动了 `client/team-*.ts(x)` 必跑。**
+- `harness/team-popover-render-check.cjs` — 真实 `TeamPanel` / `makeTeamPopover` 经 react-native-web 渲染进 jsdom（**43 条**）：
+  分区与分组顺序、已完成默认折叠且原地展开、被阻塞任务不在可开始、Lead 鲸鱼、只有运行中队员有环、无 `running` 的队员读「成员」、
+  facts/警告、描述两行多行截断、详情页（返回行、字段、完整描述保留换行、返回回列表）、空看板、只有 Lead、failure 首行红字、
+  只读（按钮只有任务行与折叠行）、容器订阅 store 重绘。**需要 `HOST_APP`**，未设 exit 2。**动了 `client/team-popover.tsx` / `team-pill.tsx` 必跑。**
+- `harness/tool-call-check.cjs` 团队段（399 → **443**）：`team_task_get/create/update/list` 字段卡、update 动作词（未知原样）、
+  list 计数与筛选词、`nextCursor`；**任何形状不符都保留原始 JSON**（非 JSON、多键、少键、deleted、列表坏项、列表多键）；
+  失败行不画卡，已知 DSH 原文中文进 `errorShort`/`errorHint`、原文保留在 `error`，未知句不翻、非团队工具不过团队表、英文不翻。
+- `harness/locale-check.cjs` 团队段（505 → **649**）：`team` 表中英键一致、非空、不互抄；成员词与分组词逐字；未知成员词不是运行中/空闲；
+  拒绝句译文表（含 `Error:` 前缀、未知原样）；**读本机 `dsh-experimental-agent-team/lib/index.js` 的每个 `TeamError` 字面量，实例化变量后确认都有中文**
+  （找不到包时 NOTE，`DSH_AGENT_TEAM` 可覆盖路径）。

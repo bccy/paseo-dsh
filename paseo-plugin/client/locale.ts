@@ -132,6 +132,74 @@ export interface UiText {
   jobs: JobsText;
   /** Copy for the composer's goal pill and its popover. */
   goal: GoalText;
+  /** Copy for the composer's team pill, its panel and the team_task_* cards (T3). */
+  team: TeamText;
+}
+
+/**
+ * The team pill, panel and task cards (T3, design T2 direction B).
+ *
+ * `memberStates.running/idle` are only drawn when the server half sent
+ * `running`; without it the member's word is {@link memberActive} (DSH's durable
+ * phase), never 运行中/空闲 — that would be the silent degradation the server
+ * overlay exists to prevent.
+ */
+export interface TeamText {
+  /** Pill label **and** title (= sheet header): the noun, in every state. */
+  title: string;
+  /** Section header over the roster. */
+  members: string;
+  /** The Lead's role word on its facts line. */
+  lead: string;
+  memberStates: { running: string; idle: string; provisioning: string; failed: string };
+  /** An `active` member whose live state this process cannot see. */
+  memberActive: string;
+  /** Task group / mark names: in progress, ready, waiting on blockers, done. */
+  marks: { doing: string; ready: string; blocked: string; done: string };
+  unowned: string;
+  /** `task-3、task-4` → 「等 task-3、task-4」. */
+  blockedBy: (ids: string) => string;
+  /** Joins blocker ids. */
+  listSeparator: string;
+  /** Shown in the task section when the board is empty. */
+  noTasks: string;
+  /** DSH's terminal projection failure, verbatim inside. */
+  failure: (message: string) => string;
+  /** DSH's advisory overlap sentence in this language, or `undefined` to show it verbatim. */
+  translateWarning: (raw: string) => string | undefined;
+  /** A team tool's failure sentence in this language, or `undefined` to show it verbatim. */
+  translateToolError: (raw: string) => string | undefined;
+  /** Before the first read lands, or after the board went away. */
+  noTeam: string;
+  /** The read failed (transient, kept until the next good poll). */
+  unavailable: string;
+  /** The detail page's back row (accessibility name). */
+  back: string;
+  /** Detail page section headers and field labels; also the timeline card's. */
+  fields: {
+    id: string;
+    status: string;
+    owner: string;
+    blockedBy: string;
+    writeScopes: string;
+    warnings: string;
+    revision: string;
+    description: string;
+  };
+  /** The timeline card's list caption and filter words. */
+  card: {
+    count: (n: number) => string;
+    filter: string;
+    unownedFilter: string;
+    readyFilter: string;
+    notReadyFilter: string;
+    more: string;
+    /** The quiet toggle under a clamped description, and its other half. */
+    expand: string;
+    collapse: string;
+    action: string;
+    actions: Record<string, string>;
+  };
 }
 
 /**
@@ -432,6 +500,77 @@ export interface GoalControlErrorDisplay {
  */
 export function goalControlErrorDisplay(raw: string, text: GoalText): GoalControlErrorDisplay {
   const translated = text.translateControlError(raw);
+  if (translated === undefined || translated === raw) return { message: raw };
+  return { message: translated, original: raw.trim() };
+}
+
+/**
+ * DSH agent-team refusals in Chinese, each matched against the whole trimmed
+ * sentence. Sources: `dsh-experimental-agent-team/lib/index.js` (TeamError /
+ * TeamTaskGraphError throws) and `dsh-experimental-tool-agent-team/lib/index.js`
+ * (list cursor/limit). Tool results arrive as `Error: <message>`; the prefix is
+ * optional. An unknown sentence returns `undefined` and is shown verbatim.
+ */
+const TEAM_REFUSALS_ZH: ReadonlyArray<readonly [RegExp, (m: RegExpMatchArray) => string]> = [
+  [/^team task "([^"]+)" not found$/u, (m) => `找不到团队任务 ${m[1]}。`],
+  [/^blocker task "([^"]+)" not found$/u, (m) => `找不到依赖任务 ${m[1]}。`],
+  [/^stale team task "([^"]+)" revision (\d+); current revision is (\d+)$/u, (m) => `任务 ${m[1]} 已被改动（预期修订 ${m[2]}，当前 ${m[3]}），请重新读取后再试。`],
+  [/^team task "([^"]+)" is deleted$/u, (m) => `任务 ${m[1]} 已删除。`],
+  [/^team task "([^"]+)" is owned by another member$/u, (m) => `任务 ${m[1]} 已由其他成员认领。`],
+  [/^team task "([^"]+)" is not ready to claim$/u, (m) => `任务 ${m[1]} 的依赖未完成，还不能认领。`],
+  [/^team task "([^"]+)" is blocked$/u, (m) => `任务 ${m[1]} 被依赖阻塞。`],
+  [/^team task "([^"]+)" still blocks "([^"]+)"$/u, (m) => `任务 ${m[1]} 仍被 ${m[2]} 依赖，不能删除。`],
+  [/^team task "([^"]+)" cannot block itself$/u, (m) => `任务 ${m[1]} 不能依赖自己。`],
+  [/^a team task cannot block itself$/u, () => "任务不能依赖自己。"],
+  [/^duplicate blocker "([^"]+)"$/u, (m) => `依赖 ${m[1]} 重复。`],
+  [/^task dependency cycle includes "([^"]+)"$/u, (m) => `任务依赖成环（含 ${m[1]}）。`],
+  [/^team task "([^"]+)" repeats blocker "([^"]+)"$/u, (m) => `任务 ${m[1]} 重复依赖 ${m[2]}。`],
+  [/^blocker task "([^"]+)" for "([^"]+)" is missing or deleted$/u, (m) => `任务 ${m[2]} 的依赖 ${m[1]} 不存在或已删除。`],
+  [/^Team task limit (\d+) reached$/u, (m) => `团队任务数已达上限 ${m[1]}。`],
+  [/^Team task id space exhausted$/u, () => "团队任务编号已用尽。"],
+  [/^task mutation requires its owner or Team Lead$/u, () => "只有任务负责人或队长能改这个任务。"],
+  [/^only an in-progress task can be released$/u, () => "只有进行中的任务能放弃认领。"],
+  [/^task edit requires subject, description, or write_scopes$/u, () => "编辑任务需要提供标题、说明或写入范围。"],
+  [/^set_dependencies requires blocked_by$/u, () => "修改依赖需要提供 blocked_by。"],
+  [/^only an in-progress task can complete$/u, () => "只有进行中的任务能标记完成。"],
+  [/^only a completed task can reopen$/u, () => "只有已完成的任务能重新打开。"],
+  [/^only the Team Lead can reassign tasks$/u, () => "只有队长能改派任务。"],
+  [/^only a pending or in-progress task can be reassigned$/u, () => "只有待处理或进行中的任务能改派。"],
+  [/^invalid workspace-relative write scope (".*")$/u, (m) => `写入范围不是工作区内的相对路径：${m[1]}`],
+  [/^(\w+) must be non-empty$/u, (m) => `${m[1]} 不能为空。`],
+  [/^(\w+) exceeds (\d+) characters$/u, (m) => `${m[1]} 超过 ${m[2]} 个字符。`],
+  [/^teammate name "([^"]+)" was already used in this Team$/u, (m) => `队员名 ${m[1]} 在本团队已用过。`],
+  [/^Team member limit (\d+) reached$/u, (m) => `团队成员数已达上限 ${m[1]}。`],
+  [/^teammate name must be lower-kebab-case, at most 64 characters, and not "lead"$/u, () => "队员名必须是小写短横线格式、不超过 64 个字符，且不能是 lead。"],
+  [/^active teammate "([^"]+)" not found$/u, (m) => `找不到在岗队员 ${m[1]}。`],
+  [/^agent "([^"]+)" is not a member of an active Agent Team$/u, (m) => `agent ${m[1]} 不是在岗团队的成员。`],
+  [/^only the Team Lead can create teammates$/u, () => "只有队长能创建队员。"],
+  [/^Agent Teams service is disposing$/u, () => "团队服务正在关闭。"],
+  [/^Agent Teams service disposed$/u, () => "团队服务已关闭。"],
+  [/^Agent Teams runtime disposal exceeded (\d+)ms$/u, (m) => `团队服务关闭超时（${m[1]} 毫秒）。`],
+  [/^cursor must be a non-negative safe integer$/u, () => "cursor 必须是非负整数。"],
+  [/^limit must be an integer from 1 through 100$/u, () => "limit 必须是 1 到 100 的整数。"],
+];
+
+/** One team refusal in Chinese, or `undefined` when it is not a known sentence. */
+function translateTeamRefusalZh(raw: string): string | undefined {
+  const sentence = raw.trim().replace(/^Error:\s*/u, "");
+  for (const [pattern, render] of TEAM_REFUSALS_ZH) {
+    const match = sentence.match(pattern);
+    if (match !== null) return render(match);
+  }
+  return undefined;
+}
+
+/** DSH's overlap warning (`projectTaskView`), in Chinese; anything else verbatim. */
+function translateTeamWarningZh(raw: string): string | undefined {
+  const match = /^write scopes overlap with (\S+)$/u.exec(raw.trim());
+  return match === null ? undefined : `写入范围与 ${match[1]} 重叠`;
+}
+
+/** What a team tool's failure shows: the translation with DSH's words kept, or DSH's words alone. */
+export function teamToolErrorDisplay(raw: string, text: TeamText): { message: string; original?: string } {
+  const translated = text.translateToolError(raw);
   if (translated === undefined || translated === raw) return { message: raw };
   return { message: translated, original: raw.trim() };
 }
@@ -756,6 +895,49 @@ const TEXT: Record<Locale, UiText> = {
       unavailable: "Could not read this session's goal.",
       noGoal: "No goal is set.",
     },
+    team: {
+      title: "Team",
+      members: "Members",
+      lead: "Lead",
+      memberStates: { running: "Running", idle: "Idle", provisioning: "Starting", failed: "Failed to start" },
+      memberActive: "Member",
+      marks: { doing: "In progress", ready: "Ready", blocked: "Waiting", done: "Done" },
+      unowned: "Unassigned",
+      blockedBy: (ids) => `after ${ids}`,
+      listSeparator: ", ",
+      noTasks: "No shared tasks yet",
+      failure: (message) => `Invalid team record: ${message}`,
+      translateWarning: () => undefined,
+      translateToolError: () => undefined,
+      noTeam: "No team in this session.",
+      unavailable: "Could not read this session's team.",
+      back: "Back",
+      fields: {
+        id: "ID",
+        status: "Status",
+        owner: "Owner",
+        blockedBy: "Blocked by",
+        writeScopes: "Write scopes",
+        warnings: "Warnings",
+        revision: "Revision",
+        description: "Details",
+      },
+      card: {
+        count: (n) => `${String(n)} task${n === 1 ? "" : "s"}`,
+        filter: "Filter",
+        unownedFilter: "unassigned",
+        readyFilter: "ready",
+        notReadyFilter: "waiting",
+        more: "More tasks; the model can page through them",
+        expand: "More",
+        collapse: "Less",
+        action: "Action",
+        actions: {
+          claim: "Claim", release: "Release", edit: "Edit", set_dependencies: "Set blockers",
+          complete: "Complete", reopen: "Reopen", reassign: "Reassign", delete: "Delete",
+        },
+      },
+    },
   },
   "zh-CN": {
     toolLabels: {
@@ -1057,6 +1239,49 @@ const TEXT: Record<Locale, UiText> = {
       translateControlError: (raw) => translateGoalRefusalZh(raw),
       unavailable: "读不到本会话的目标。",
       noGoal: "当前没有目标。",
+    },
+    team: {
+      title: "团队",
+      members: "成员",
+      lead: "队长",
+      memberStates: { running: "运行中", idle: "空闲", provisioning: "准备中", failed: "创建失败" },
+      memberActive: "成员",
+      marks: { doing: "进行中", ready: "可开始", blocked: "等待依赖", done: "已完成" },
+      unowned: "未分配",
+      blockedBy: (ids) => `等 ${ids}`,
+      listSeparator: "、",
+      noTasks: "暂无共享任务",
+      failure: (message) => `团队记录无效：${message}`,
+      translateWarning: (raw) => translateTeamWarningZh(raw),
+      translateToolError: (raw) => translateTeamRefusalZh(raw),
+      noTeam: "本会话没有团队。",
+      unavailable: "读不到本会话的团队。",
+      back: "返回",
+      fields: {
+        id: "编号",
+        status: "状态",
+        owner: "负责人",
+        blockedBy: "依赖",
+        writeScopes: "写入范围",
+        warnings: "提醒",
+        revision: "修订",
+        description: "说明",
+      },
+      card: {
+        count: (n) => `${String(n)} 个任务`,
+        filter: "筛选",
+        unownedFilter: "未分配",
+        readyFilter: "可开始",
+        notReadyFilter: "等待依赖",
+        more: "还有更多任务，模型可翻页查看",
+        expand: "展开",
+        collapse: "收起",
+        action: "动作",
+        actions: {
+          claim: "认领", release: "放弃认领", edit: "编辑", set_dependencies: "改依赖",
+          complete: "完成", reopen: "重新打开", reassign: "改派", delete: "删除",
+        },
+      },
     },
   },
 };

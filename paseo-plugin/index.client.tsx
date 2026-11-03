@@ -21,6 +21,7 @@ import { contributeGoalPill } from "./client/goal-pill";
 import { InlineThinking } from "./client/inline-thinking";
 import { contributeJobsPill } from "./client/jobs-pill";
 import { contributeStreamStats } from "./client/stream-stats";
+import { contributeTeamPill } from "./client/team-pill";
 import { localeFromMetadata, setLocale } from "./client/locale";
 import { RewindNotice } from "./client/rewind-notice";
 import {
@@ -207,6 +208,24 @@ export default function contribute(client: PluginClientContext) {
           empty: z.boolean(),
         })
         .nullable(),
+      // The team task tools' card (T3); null keeps the raw JSON body. Declared
+      // in full: an undeclared key is stripped on the way to the row.
+      team: z
+        .object({
+          kind: z.enum(["task", "list"]),
+          tasks: z.array(
+            z.object({
+              id: z.string(),
+              subject: z.string(),
+              mark: z.enum(["doing", "ready", "blocked", "done"]),
+              fields: z.array(z.object({ label: z.string(), value: z.string(), tone: z.literal("warning").optional() })),
+              description: z.string(),
+            }),
+          ),
+          caption: z.string(),
+          more: z.boolean(),
+        })
+        .nullable(),
       // DSH's failure code and, for a known one, the words drawn for it.
       errorCode: z.string(),
       errorShort: z.string(),
@@ -255,6 +274,7 @@ export default function contribute(client: PluginClientContext) {
     contributeStreamStats(client),
     contributeJobsPill(client),
     contributeGoalPill(client),
+    contributeTeamPill(client),
   ];
 
   // The live witness behind the capsule: a per-agent timeline subscription
