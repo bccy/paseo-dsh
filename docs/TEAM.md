@@ -41,7 +41,7 @@ DSH 的 `dsh-experimental-agent-team` 给 Lead 会话一个团队：队员（各
 自上而下：failure 红行（若有）→「成员 N」→ 分隔线 → 任务分组「进行中 n」「可开始 n」「等待依赖 n」→ 折叠的「已完成 n ›」。
 
 - **成员行**：Lead 用鲸鱼标记，队员运行中用宿主运行环，空闲 / 准备中 / 创建失败各一个状态点（border / warning / danger）。
-  facts：队长「队长 · 运行中」；队员「运行中 · <description>」；创建失败「创建失败 · <DSH error 原文>」（红）。
+  facts：队长「队长 · 运行中」；队员「运行中」（DSH 0.2.1 的成员投影没有描述字段；若将来带上 `description` 才追加「 · <description>」）；创建失败「创建失败 · <DSH error 原文>」（红）。
   排序：Lead → 运行中 → 准备中 → 失败 → 不知道 → 空闲。成员行不可点（Paseo 0.15 插件 API 没有打开 provider 子代理的入口）。
 - **任务行**：宿主任务列表的图标（`CircleDot` 运行蓝 / `Circle` / `CircleCheck` 删除线）+ `CircleDashed`（等待依赖）；
   facts「task-N · 负责人或未分配 · 等 task-x · 写入范围」；写入范围重叠警告翻成中文（未知原样）；描述最多两行（换行压成空格）。
