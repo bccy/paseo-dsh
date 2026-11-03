@@ -3088,3 +3088,9 @@ max_goal_rounds are valid only with action edit"。
 
 **检查**：`harness/goal-tool-rows-check.cjs`（含用户会话的同构夹具，可另传真实日志重放），
 `tool-call-check` 钉 `goal_state` 标题与 `get_goal` 不同名，`locale-check` 钉 `goalCard` 两语键集。
+
+**补记（行序）**：同一屏里状态行还在 `/goal` 行**之上**——DSH 的括号是 `command/run` →
+`goal/change` → `command/done`，状态行在 `goal/change` 就画、命令行到 `command/done` 才画。
+修法是 builder 暂存括号内的状态行、`command/done` 后放出，并在 `settleRunningTools` 兜底放出
+（日志停在括号中间时不能吞行）。`harness/goal-state-order-check.cjs` 钉实时 / 重放 / compaction
+认领 / 截断日志 / 括号内他行 / 失败命令六种情形。

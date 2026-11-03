@@ -242,6 +242,11 @@ pill 的按钮走**命令注册表**而不是 steer：`paseo-plugin/server/sessi
 - **状态行不借用模型工具名。** 它以前叫 `get_goal`（只为拿 Target 图标），于是标题也成了
   「查看目标」，与模型真实的 `get_goal` 调用同名，读起来像模型多查了一次目标。现在是插件
   自有名 `goal_state`，标题「目标状态」（FIELD-NOTES 第 90 条）。
+- **状态行排在引起它的 `/goal` 命令行之后。** DSH 写 `command/run` → `goal/change` →
+  `command/done`，命令行要到 `command/done` 才画（输出在那里），所以 `TimelineBuilder` 在命令
+  括号打开期间暂存状态行，`command/done` 后放出；括号里先出了别的行则状态行先放；日志停在括号
+  中间时由 `settleRunningTools` 放出。实时与重放走同一个 builder，顺序一致
+  （`harness/goal-state-order-check.cjs`）。
 - **「固定 id」只在同一回合内原地更新。** 宿主按 `turnId + callId` 识别 tool_call
   （`@getpaseo/app` `types/stream.ts` 的 `agentToolCallIdentity`，服务端
   `timeline-projection.ts` 的合并也要求同 `turnId`）。`/goal <目标>` 在回合外建目标、续跑轮里

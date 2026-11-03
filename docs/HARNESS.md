@@ -636,3 +636,11 @@
   `server/timeline.ts` 的 `#toolResult` metadata、`client/tool-call-data.ts` 的 goal 卡 / 失败码、
   `client/locale.ts` 的 `goalCard` / `toolLabels.goal_state` 或 `index.client.tsx` 的
   dsh-tool schema 必跑。**
+- `harness/goal-state-order-check.cjs` — 目标状态行排在引起它的 `/goal` 命令行**之后**（**6 组
+  断言**；真实 `DshSession` + 假进程传输，`plugin-build.cjs` 自编译到 `.dbg-goal-state-order`）：
+  实时路径 `/goal` 行紧接着状态行；`replayHistory()` 的 goal 行顺序与实时逐个相同、状态行深相等；
+  被 compaction 认领（命令行被丢掉）的命令里的 goal 变化仍出状态行；日志停在括号中间时
+  `settleRunningTools` 放出状态行且幂等；括号未关时先出的别的行不会越过暂存的状态行；失败的命令
+  也放出它。运行 `node harness/goal-state-order-check.cjs`。**动了 `server/timeline.ts` 的
+  `consume` / `#heldGoalRows` / `settleRunningTools`、`#commandRun` / `#commandDone` 或
+  `server/session.ts` 的重放循环必跑。**

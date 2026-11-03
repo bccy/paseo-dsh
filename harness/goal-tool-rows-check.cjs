@@ -16,6 +16,7 @@
  *   3. 失败行带 DSH 的结构化错误码（`metadata.errorCode`，经过 ProviderEventSchema 仍在）；
  *      已知码的行头红字是中文短句、展开有一句解释，`error` 仍是 DSH 原文、行仍是 failed；
  *      未知码与原型链上的名字（`constructor`）不给人话，行头回落原文。
+ *   4. 状态行排在引起它的 `/goal` 命令行之后（细节与实时/重放一致性见 goal-state-order-check）。
  *
  * 夹具是用户那次会话（`/goal <目标>` → 续跑第 1 轮 → 被拒的 create_goal → get_goal →
  * 参数非法的 update_goal → 成功的 update_goal）的同构复刻，id 与文本均为虚构。
@@ -136,6 +137,10 @@ function assertSession(rows, objective, label) {
     assert.equal(data.icon, "Target", `${label}: state row glyph`);
   }
   assert.equal(view(states[0]).summary, `进行中 · ${objective}`, `${label}: first state row`);
+  // The state row follows the `/goal` command that caused it, not the other way round.
+  const names = tools(rows).map((row) => row.name);
+  assert.ok(names.indexOf("/goal") >= 0 && names.indexOf("/goal") < names.indexOf("goal_state"),
+    `${label}: the /goal row comes before its state row, got ${JSON.stringify(names)}`);
   assert.equal(view(states.at(-1)).summary, `已完成 · ${objective}`, `${label}: last state row`);
   assert.equal(byName(rows, "get_goal").length, 1, `${label}: only the model's real get_goal call carries that name`);
   // The confusion the user saw: two 「查看目标」 rows, one of which was never a call.
