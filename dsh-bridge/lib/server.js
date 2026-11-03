@@ -29,7 +29,7 @@ import { FileMutationGate } from './file-mutation-gate.js';
 import { isDelegatedSession, rootSessionFor as resolveRootSession, snapshotOwnerKey } from './snapshot-owners.js';
 import { ChildAnchors } from './child-anchors.js';
 import { cancelWithdrawnDelegations as cancelDelegatedWork } from './delegated-cancel.js';
-import { isHumanUserMessage, planRewind, restoresFiles, revertScope, successText } from './revert.js';
+import { isHumanUserMessage, planRewind, restoresFiles, revertScope, successText, tokenMessageId } from './revert.js';
 import { visibleEvents } from './surface.js';
 import { historyEvents, withImageHostPaths } from './image-host-path.js';
 import { promptSource } from './paseo-system-envelope.js';
@@ -297,6 +297,19 @@ const MAX_SESSION_ROUTE_ENTRIES = 500;
 const MAX_TOOL_DESCRIPTIONS = 200;
 
 /**
+ * How many prompt-issued message ids one session may track as "not on the
+ * surface yet" (`pendingUserMessages`).
+ *
+ * The table exists so a rewind can tell a message that never reached the
+ * conversation (withdrawn while queued) from one that reached it and was later
+ * rewound or compacted away. A message is removed the moment its `user/message`
+ * event appears, so the table only holds genuinely in-flight prompts; the cap
+ * bounds a pathological session that keeps issuing steers and never lets one
+ * land. Oldest first, like the jobs table.
+ */
+const MAX_PENDING_USER_MESSAGES = 64;
+
+/**
  * How long a session's next creation waits for the previous close's teardown.
  *
  * The teardown — `handle.dispose()` waiting for idle and closing the session log's
@@ -438,6 +451,26 @@ export class PaseoHarnessServer {
      * while idle and does not arm later work.
      */
     this.promptDeliveries = new Map();
+    /**
+     * sessionId -> ids of messages this bridge handed to a live agent as a
+     * steer/followup, until that message's `user/message` event shows up on the
+     * session's surface.
+     *
+     * DSH does not append a queued message immediately: `agent.steer` only puts
+     * it in the inbox's next-step list, and the loop claims it at the next step
+     * boundary (`session.append('user/message', …)` inside `step()`). A user can
+     * click rewind inside that window, and the daemon's own pre-rewind cancel
+     * (`agent-manager.rewind` → `session.interrupt` → bridge `session/cancel` →
+     * `agent.cancel` without `keepInbox`) clears the inbox, so the message is
+     * **discarded, never committed**. Without this table the rewind could only
+     * see "no such message on the surface" and reported it as already
+     * rewound/compacted — a wrong reason for a message that never arrived.
+     *
+     * Entries are dropped when the message lands (`#forgetPendingUserMessage`),
+     * when the session closes (`#forgetSessionState`), and capped per session
+     * (see {@link MAX_PENDING_USER_MESSAGES}).
+     */
+    this.pendingUserMessages = new Map();
     /**
      * DSH session ids with a rewind currently running. A second rewind would
      * compute its range from the same surface that the first is about to
@@ -595,6 +628,12 @@ export class PaseoHarnessServer {
         this.observeDelegatedTurn(session, event);
         if (event.type === 'subagent/catalog') this.observeCatalogChild(session, event);
         const sessionId = String(session.id);
+        // A prompt-issued message has now reached the surface: it is a normal
+        // conversation row from here on, so a rewind must resolve it through
+        // `planRewind` instead of the pending-message shortcut.
+        if (event.type === 'user/message' && typeof event.data?.id === 'string') {
+          this.#forgetPendingUserMessage(sessionId, event.data.id);
+        }
         // The durable settlement is appended only after every chunk, so publish
         // the live snapshot first. Otherwise the durable copy carries a tail
         // Paseo has not seen, lands after the text row, and splits the answer in
@@ -1198,11 +1237,21 @@ export class PaseoHarnessServer {
       // `source.kind` — computed once so the receipt cannot disagree with the log.
       const source = promptSource(content);
       const message = createUserMessage({ content, source });
+      // Tracked before delivery, not after: the id is what a rewind matches, and
+      // the agent could (in principle) append it before this call returns.
+      this.#trackPendingUserMessage(sessionId, String(message.id));
       // A steer belongs inside the turn already running; a plain prompt starts the
       // next one. Without this distinction an interjection queues behind the very
       // turn it was meant to correct.
-      if (params.delivery === 'steer') rec.handle.agent.steer(message);
-      else rec.handle.agent.followup(message);
+      try {
+        if (params.delivery === 'steer') rec.handle.agent.steer(message);
+        else rec.handle.agent.followup(message);
+      } catch (error) {
+        // The delivery never happened, so this id cannot be waiting on a surface
+        // append; leaving it tracked would let a later rewind call it "pending".
+        this.#forgetPendingUserMessage(sessionId, String(message.id));
+        throw error;
+      }
       if (delivery.canceled) {
         // A stop arrived while this delivery was in flight. It could not be
         // applied there: DSH cancels only active work and does not arm later
@@ -1234,6 +1283,113 @@ export class PaseoHarnessServer {
     if (deliveries === undefined) return;
     deliveries.delete(delivery);
     if (deliveries.size === 0) this.promptDeliveries.delete(sessionId);
+  }
+
+  /**
+   * Remember one prompt-issued message id until its `user/message` event lands.
+   *
+   * Oldest entries are evicted at {@link MAX_PENDING_USER_MESSAGES}: the table is
+   * only an identification aid for a rewind, and a session that queues more
+   * in-flight prompts than that has bigger problems than a stale entry.
+   *
+   * @param {string} sessionId - the session the prompt was issued for.
+   * @param {string} messageId - the DSH message id the prompt receipt returned.
+   */
+  #trackPendingUserMessage(sessionId, messageId) {
+    let pending = this.pendingUserMessages.get(sessionId);
+    if (pending === undefined) {
+      pending = new Set();
+      this.pendingUserMessages.set(sessionId, pending);
+    }
+    pending.add(messageId);
+    while (pending.size > MAX_PENDING_USER_MESSAGES) {
+      const oldest = pending.values().next().value;
+      if (oldest === undefined) break;
+      pending.delete(oldest);
+    }
+  }
+
+  /**
+   * Stop tracking one message id (it landed on the surface, or its delivery
+   * failed and it will never be queued).
+   *
+   * @param {string} sessionId - owning session.
+   * @param {string} messageId - the id to forget.
+   */
+  #forgetPendingUserMessage(sessionId, messageId) {
+    const pending = this.pendingUserMessages.get(sessionId);
+    if (pending === undefined) return;
+    pending.delete(messageId);
+    if (pending.size === 0) this.pendingUserMessages.delete(sessionId);
+  }
+
+  /**
+   * The message behind a rewind token never reached the visible conversation.
+   *
+   * Called only after `planRewind` failed to find the token on the surface. A
+   * message this bridge issued that never produced a `user/message` event is
+   * still queued (or was discarded with the inbox by the daemon's own
+   * pre-rewind cancel) — it is not "already rewound or compacted", which is
+   * what the caller would otherwise report.
+   *
+   * The chosen behaviour is (b) from the P3 brief: withdraw it from the pending
+   * queue and answer success. Waiting for it to commit (a) would hold the rewind
+   * for a whole model step and, on the daemon path, is impossible: the host
+   * cancels the run before calling revert, and that cancel clears the inbox, so
+   * the message can never commit. Refusing (c) would leave the message queued
+   * and still sendable after the user explicitly withdrew it.
+   *
+   * Nothing is appended to the log: the message has no surface node, so there is
+   * no range to replace, and a `files` rewind has no conversation half at all —
+   * for that scope the honest answer is a refusal (a queued message is not a
+   * file-restore anchor).
+   *
+   * @param {object} agent - the live agent the session owns.
+   * @param {object} session - that agent's DSH session.
+   * @param {unknown} token - the `revertToken` Paseo handed back.
+   * @param {"conversation" | "both" | "files"} scope - normalised revert scope.
+   * @returns {{kind: 'success', text: string} | undefined} receipt when the
+   *   token named a pending message, `undefined` when it did not.
+   */
+  #withdrawPendingUserMessage(agent, session, token, scope) {
+    const messageId = tokenMessageId(token);
+    if (messageId === undefined) return undefined;
+    const sessionId = String(session.id);
+    const inbox = agent.inbox;
+    const queued = [ ...(inbox?.nextStep ?? []), ...(inbox?.nextTurn ?? []) ]
+      .some((message) => String(message?.id) === messageId);
+    const tracked = this.pendingUserMessages.get(sessionId)?.has(messageId) === true;
+    if (!queued && !tracked) return undefined;
+    if (scope === 'files') {
+      // A files-only rewind never withdraws a message, and this one has no
+      // surface node to anchor a restore at. Say exactly that instead of the
+      // generic "already rewound or compacted" line, which is false here.
+      throw new Error('这条消息还没有进入对话，不能作为文件恢复的锚点；如需撤销它请使用对话撤回');
+    }
+    if (queued) {
+      // Still queued (a direct caller's flow; the daemon path already cleared it
+      // with the pre-rewind cancel). Remove it so it can never be sent later.
+      // This is synchronous with the check above, so the agent loop cannot claim
+      // it in between — a claimed message is no longer in the inbox.
+      if (typeof inbox?.remove !== 'function') {
+        throw new Error('这条消息还在待发队列中，但当前 DSH 不提供从队列移除的能力；请等它发送完成后再撤回');
+      }
+      inbox.remove(messageId);
+    } else if (agent.status !== 'idle') {
+      // Tracked, no longer queued, and the agent is still running: the step loop
+      // has already claimed the message and is about to append it (`claim()`
+      // removes it from the inbox before `session.append`). Answering success
+      // here would claim a withdrawal that may not happen — refuse with the
+      // transient reason instead, and keep it tracked so a retry works.
+      throw new Error('这条消息还在发送中，稍后再撤回');
+    }
+    // Withdrawn for good: a later rewind naming the same id must be refused as a
+    // message that is not in the conversation, not withdrawn twice.
+    this.#forgetPendingUserMessage(sessionId, messageId);
+    return {
+      kind: 'success',
+      text: `Withdrawn pending message ${messageId} before it reached the conversation`,
+    };
   }
 
   /**
@@ -2675,7 +2831,16 @@ export class PaseoHarnessServer {
         params.token,
         { rewindsConversation },
       );
-      if (!preliminary.ok) throw new Error(preliminary.reason);
+      if (!preliminary.ok) {
+        // A token that names a message this bridge issued but that never reached
+        // the surface is not "already rewound or compacted": it is still queued
+        // (or the daemon's own pre-rewind cancel just discarded it with the
+        // inbox). Withdraw that instead — decided before anything is cancelled,
+        // which is the same rule this preliminary plan exists for.
+        const pendingReceipt = this.#withdrawPendingUserMessage(agent, session, params.token, scope);
+        if (pendingReceipt !== undefined) return pendingReceipt;
+        throw new Error(preliminary.reason);
+      }
       // `runMaintenance` is DSH's own exclusive scope for one agent: while it
       // runs, that agent's tools are held out. It does **not** cover the agent's
       // independently running descendants, so the file gate is taken inside it —
@@ -3736,6 +3901,7 @@ export class PaseoHarnessServer {
     this.pendingPlanMode.delete(sessionId);
     this.pendingMcpServers.delete(sessionId);
     this.promptDeliveries.delete(sessionId);
+    this.pendingUserMessages.delete(sessionId);
     this.children.delete(sessionId);
     // Bash descriptions only exist to title a listed job; a closed session has
     // no jobs left to list, and the table is per session.

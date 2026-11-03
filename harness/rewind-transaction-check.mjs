@@ -199,11 +199,37 @@ async function fixture(onFlush, options = {}) {
       this.surface.nodes = [...this.surface.nodes.filter((seq) => seq < start), 30];
     },
   };
+  const cancels = [];
   const agent = {
     id,
     session,
     status: 'idle',
-    inbox: { nextStep: [], nextTurn: [] },
+    inbox: {
+      nextStep: [],
+      nextTurn: [],
+      remove(messageId) {
+        for (const target of ['nextStep', 'nextTurn']) {
+          const index = this[target].findIndex((message) => message.id === messageId);
+          if (index >= 0) {
+            this[target].splice(index, 1);
+            return true;
+          }
+        }
+        return false;
+      },
+    },
+    // The pending-steer regression drives the real `prompt()`, so the agent needs
+    // the two delivery methods DSH's ReactLoopAgent has (and the same inbox lists
+    // the loop's Inbox exposes).
+    steer(message) {
+      this.inbox.nextStep.push(message);
+    },
+    followup(message) {
+      this.inbox.nextTurn.push(message);
+    },
+    cancel(cause) {
+      cancels.push(cause);
+    },
   };
   if (options.runMaintenance !== false) {
     agent.runMaintenance = async (task) => {
@@ -213,6 +239,10 @@ async function fixture(onFlush, options = {}) {
   }
   const interrupted = [];
   const state = { fixture: undefined };
+  // The bridge registers its listeners through `ctx.on`; the pending-steer
+  // regression drives them (a `user/message` event is what marks an issued
+  // message committed), so capture the handlers instead of discarding them.
+  const handlers = new Map();
   // `assertLiveAgent` reads `ctx.agents.get(rootId)`; the rewind itself reads the
   // `agents` service for the children it joined. One object serves both: a test
   // that supplies its own child lookup still has to be able to resolve the root.
@@ -221,7 +251,12 @@ async function fixture(onFlush, options = {}) {
   };
   const services = { ...options.services, agents };
   const ctx = {
-    on: () => () => {},
+    on: (name, handler) => {
+      const list = handlers.get(name) ?? [];
+      list.push(handler);
+      handlers.set(name, list);
+      return () => {};
+    },
     agents,
     get: (name) => {
       if (name === 'sessions') {
@@ -258,7 +293,19 @@ async function fixture(onFlush, options = {}) {
     snapshots,
     server,
     agent,
+    session,
     interrupted,
+    /** Add one surface event (a committed message) at `seq`. */
+    appendEvent(seq, event) {
+      events.set(seq, event);
+    },
+    /** Drive the bridge's own `session/event` listeners for one event. */
+    emitSessionEvent(event) {
+      for (const handler of handlers.get('session/event') ?? []) handler(session, event);
+    },
+    get cancels() {
+      return cancels;
+    },
     get maintenance() {
       return maintenance;
     },
@@ -268,10 +315,10 @@ async function fixture(onFlush, options = {}) {
     get flushCalls() {
       return flushCalls;
     },
-    revert: () => server.revert({
+    revert: (token) => server.revert({
       sessionId: id,
       scope: options.scope ?? 'both',
-      token: options.token ?? { messageId: 'm-10' },
+      token: token ?? options.token ?? { messageId: 'm-10' },
     }),
   };
   return state.fixture;
@@ -928,6 +975,170 @@ try {
     `the receipt must carry the capture failure reason: ${JSON.stringify(failedCaptureResult.files.unrecoverable)}`,
   );
   pass('a capture that fails after the read reaches the rewind receipt instead of "no files changed"');
+
+  // -------------------------------------------------------------------------
+  // 18. Rewinding a message that was just steered and has NOT reached the
+  //     surface yet (P3, real daemon): DSH queues a steer in the agent inbox and
+  //     only appends it at the next step boundary. The daemon cancels the run
+  //     before calling revert, and that cancel clears the inbox — so the message
+  //     is discarded, never committed. The rewind must withdraw it and answer
+  //     success, not claim it was "already rewound or compacted".
+  // -------------------------------------------------------------------------
+  {
+    const hostFlow = await fixture(undefined, { scope: 'conversation' });
+    hostFlow.server.initializedSessions.add(hostFlow.id);
+    hostFlow.agent.status = 'running';
+    const steer = await hostFlow.server.prompt({
+      sessionId: hostFlow.id,
+      contentBlocks: [{ type: 'text', text: 'steer: withdraw me before I land' }],
+      delivery: 'steer',
+    });
+    const steerId = steer.messageId;
+    assert.equal(hostFlow.agent.inbox.nextStep.length, 1, 'the steer is queued in the agent inbox');
+    assert.equal(hostFlow.agent.inbox.nextStep[0].id, steerId);
+    assert.equal(
+      hostFlow.session.surface.nodes.some((seq) => hostFlow.session.eventAt(seq)?.data?.id === steerId),
+      false,
+      'the steer is not on the surface yet',
+    );
+    assert.equal(
+      hostFlow.server.pendingUserMessages.get(hostFlow.id)?.has(steerId),
+      true,
+      'the bridge tracks the issued id as pending',
+    );
+
+    // The daemon's pre-rewind cancel clears the inbox and settles the turn; only
+    // the pending table still knows this message. This is the exact state the P3
+    // failure saw when the rewind reached the bridge.
+    hostFlow.agent.inbox.nextStep.length = 0;
+    hostFlow.agent.status = 'idle';
+    const hostReceipt = await hostFlow.revert({ messageId: steerId });
+    assert.equal(hostReceipt.kind, 'success', JSON.stringify(hostReceipt));
+    assert.match(String(hostReceipt.text), /pending message/i, `the receipt must name the pending withdraw: ${hostReceipt.text}`);
+    assert.equal(hostFlow.appended, false, 'nothing is appended to the log for a message that never reached the surface');
+    assert.equal(hostFlow.flushCalls, 0, 'no log flush is needed (nothing was written)');
+    assert.equal(hostFlow.cancels.length, 0, 'the pending withdraw must not cancel the running turn');
+    assert.notEqual(
+      hostFlow.server.pendingUserMessages.get(hostFlow.id)?.has(steerId),
+      true,
+      'the withdrawn message is no longer pending',
+    );
+    // A second rewind naming the same id is now the honest stale case: the
+    // message is not in the conversation and cannot be withdrawn twice.
+    await assert.rejects(
+      hostFlow.revert({ messageId: steerId }),
+      /不在可撤回的对话中/,
+      'a repeated rewind of the withdrawn pending message falls back to the stale-token refusal',
+    );
+    pass('a steer that never reached the surface is withdrawn with a success receipt (host flow)');
+  }
+  {
+    // Direct caller (no daemon pre-cancel): the message is still in the inbox,
+    // so the bridge must remove it itself or it could still be sent later.
+    const direct = await fixture(undefined, { scope: 'conversation' });
+    direct.server.initializedSessions.add(direct.id);
+    direct.agent.status = 'running';
+    const steer = await direct.server.prompt({
+      sessionId: direct.id,
+      contentBlocks: [{ type: 'text', text: 'steer: direct withdraw' }],
+      delivery: 'steer',
+    });
+    const receipt = await direct.revert({ messageId: steer.messageId });
+    assert.equal(receipt.kind, 'success', JSON.stringify(receipt));
+    assert.equal(direct.agent.inbox.nextStep.length, 0, 'the queued message is removed so it can never be sent');
+    assert.equal(direct.cancels.length, 0, 'the turn is left running');
+    assert.equal(direct.appended, false);
+    pass('a still-queued steer is removed from the inbox by the withdraw (direct flow)');
+  }
+  {
+    // Files-only has no conversation half and a queued message is not a surface
+    // anchor: refuse with that reason instead of "already rewound/compacted".
+    const filesScope = await fixture(undefined, { scope: 'files' });
+    filesScope.server.initializedSessions.add(filesScope.id);
+    const steer = await filesScope.server.prompt({
+      sessionId: filesScope.id,
+      contentBlocks: [{ type: 'text', text: 'steer: files scope' }],
+      delivery: 'steer',
+    });
+    await assert.rejects(
+      filesScope.revert({ messageId: steer.messageId }),
+      /不能作为文件恢复的锚点/,
+      'a files-only rewind of a queued message must refuse with the real reason',
+    );
+    assert.equal(filesScope.agent.inbox.nextStep.length, 1, 'a files-only rewind must not withdraw the message');
+    assert.equal(filesScope.appended, false);
+    pass('a files-only rewind of a queued message refuses accurately and keeps the message queued');
+  }
+  {
+    // Tracked but already claimed by a step that is about to append it: the
+    // claim removed it from the inbox, so the bridge cannot remove it any more.
+    // Answering success would claim a withdrawal that may not happen, so this
+    // must be the transient refusal (and keep it tracked for a retry).
+    const claimed = await fixture(undefined, { scope: 'conversation' });
+    claimed.server.initializedSessions.add(claimed.id);
+    claimed.agent.status = 'running';
+    const steer = await claimed.server.prompt({
+      sessionId: claimed.id,
+      contentBlocks: [{ type: 'text', text: 'steer: already claimed' }],
+      delivery: 'steer',
+    });
+    claimed.agent.inbox.nextStep.length = 0;
+    await assert.rejects(
+      claimed.revert({ messageId: steer.messageId }),
+      /还在发送中/,
+      'a claimed-but-not-appended message must be refused as still sending, not silently "withdrawn"',
+    );
+    assert.equal(
+      claimed.server.pendingUserMessages.get(claimed.id)?.has(steer.messageId),
+      true,
+      'the refusal keeps the id tracked so a retry can still withdraw it',
+    );
+    pass('a message claimed by the step but not appended yet is refused as still sending');
+  }
+  {
+    // Once the message lands on the surface it is a normal conversation row: the
+    // pending shortcut must not apply, and the ordinary marker/rewind path runs.
+    const committed = await fixture(undefined, { scope: 'conversation' });
+    committed.server.initializedSessions.add(committed.id);
+    const steer = await committed.server.prompt({
+      sessionId: committed.id,
+      contentBlocks: [{ type: 'text', text: 'steer: this one lands' }],
+      delivery: 'steer',
+    });
+    const steerId = steer.messageId;
+    const event = {
+      type: 'user/message',
+      data: { id: steerId, source: { kind: 'user' }, content: [{ type: 'text', text: 'steer: this one lands' }] },
+    };
+    committed.appendEvent(30, event);
+    committed.session.surface.nodes.push(30);
+    committed.emitSessionEvent(event);
+    assert.notEqual(
+      committed.server.pendingUserMessages.get(committed.id)?.has(steerId),
+      true,
+      'the surface event clears the pending entry',
+    );
+    const receipt = await committed.revert({ messageId: steerId });
+    assert.equal(receipt.kind, 'success', JSON.stringify(receipt));
+    assert.match(String(receipt.text), /Withdrawn seq 30/, `the normal surface rewind applies: ${receipt.text}`);
+    assert.equal(committed.appended, true, 'the normal rewind appends its replacement marker');
+    assert.equal(committed.flushCalls, 1);
+    pass('a steer that reached the surface takes the normal rewind path, not the pending shortcut');
+  }
+  {
+    // Closing the session drops the pending table (bounded memory, no leak).
+    const closing = await fixture(undefined, { scope: 'conversation' });
+    closing.server.initializedSessions.add(closing.id);
+    await closing.server.prompt({
+      sessionId: closing.id,
+      contentBlocks: [{ type: 'text', text: 'steer: close me' }],
+      delivery: 'steer',
+    });
+    assert.equal(closing.server.pendingUserMessages.has(closing.id), true);
+    await closing.server.closeSession({ sessionId: closing.id });
+    assert.equal(closing.server.pendingUserMessages.has(closing.id), false, 'a closed session keeps no pending table');
+    pass('closing a session drops its pending-message table');
+  }
 } finally {
   await rm(root, { recursive: true, force: true });
 }
