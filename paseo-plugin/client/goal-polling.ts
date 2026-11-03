@@ -92,7 +92,9 @@ export type GoalLabel =
   | { readonly kind: "running" }
   | { readonly kind: "notRunning" }
   | { readonly kind: "paused" }
-  | { readonly kind: "blocked" };
+  | { readonly kind: "blocked" }
+  /** A completed goal the user has not seen yet (UI-v7). */
+  | { readonly kind: "complete" };
 
 /**
  * The tone the status line, the trigger icon and the "now" line use.
@@ -103,7 +105,7 @@ export type GoalLabel =
  * 14px trigger glyph); the panel's facts line stays muted, like the host's row
  * facts.
  */
-export type GoalTone = "normal" | "warning" | "error";
+export type GoalTone = "normal" | "warning" | "error" | "success";
 
 /**
  * The theme colour key one tone draws the trigger's glyph with.
@@ -118,7 +120,7 @@ export type GoalTone = "normal" | "warning" | "error";
  */
 export function goalIconColorToken(
   tone: GoalTone,
-): "foregroundMuted" | "statusWarning" | "statusDanger" {
+): "foregroundMuted" | "statusWarning" | "statusDanger" | "statusSuccess" {
   switch (tone) {
     case "normal":
       return "foregroundMuted";
@@ -126,7 +128,21 @@ export function goalIconColorToken(
       return "statusWarning";
     case "error":
       return "statusDanger";
+    case "success":
+      // A completed goal not yet seen: the host's "done, review it" state is
+      // green (`statusDotSuccess` for the `attention` bucket); the plugin theme
+      // carries only `statusSuccess`, so that is the one token.
+      return "statusSuccess";
   }
+}
+
+/**
+ * The trigger's glyph name for one tone: a completed goal draws the host's
+ * completed-task mark (`CircleCheck`, `components/task-list-row.tsx`), every
+ * other non-running state the `Target`. The running ring replaces either.
+ */
+export function goalIconName(tone: GoalTone): "CircleCheck" | "Target" {
+  return tone === "success" ? "CircleCheck" : "Target";
 }
 
 /** What the trigger shows for one answer. */
@@ -139,11 +155,23 @@ export type GoalPillPresentation =
     };
 
 /**
+ * The key a completed goal's "seen" state is remembered under: `id:revision`.
+ * A new goal (new id) or a new mutation of the same goal (new revision) is a
+ * new key, so it is shown again even if its objective reads the same.
+ */
+export function goalSeenKey(goal: Pick<GoalState, "id" | "revision">): string {
+  return `${goal.id}:${String(goal.revision)}`;
+}
+
+/**
  * Whether the pill is shown for one answer, and what it says.
  *
- * Visibility is DESIGN §2's rule: **a goal exists and is not complete**. A
- * `null` goal (never created, or cleared) and a `complete` goal are both hidden
- * — there is nothing to manage and nothing to report. `available: false` is
+ * Visibility (UI-v7): **a goal exists, and if it is complete the user has not
+ * seen it yet**. A `null` goal (never created, or cleared) is hidden. A
+ * `complete` goal is shown once — `seen` is the client's remembered
+ * {@link goalSeenKey} for this agent, and a complete goal whose key equals it is
+ * hidden. DSH's own Web hides a complete goal at once (survey §2); showing it
+ * until seen is this plugin's bounded extension. `available: false` is
  * hidden too, but that branch is normally unreachable: terminal errors remove
  * the pill outright and transient ones keep the last state (see
  * {@link createGoalPoller}).
@@ -152,13 +180,20 @@ export type GoalPillPresentation =
  * finished, it is just not continuing on its own, and the popover's 继续 button
  * is the fix.
  */
-export function goalPillPresentation(answer: {
-  available: boolean;
-  goal?: GoalState | null;
-}): GoalPillPresentation {
+export function goalPillPresentation(
+  answer: {
+    available: boolean;
+    goal?: GoalState | null;
+  },
+  seen?: string,
+): GoalPillPresentation {
   const goal = answer.goal ?? null;
-  if (!answer.available || goal === null || goal.phase === "complete") {
+  if (!answer.available || goal === null) {
     return { visible: false };
+  }
+  if (goal.phase === "complete") {
+    if (seen === goalSeenKey(goal)) return { visible: false };
+    return { visible: true, label: { kind: "complete" }, tone: "success" };
   }
   if (goal.phase === "blocked") {
     return { visible: true, label: { kind: "blocked" }, tone: "error" };
@@ -172,32 +207,131 @@ export function goalPillPresentation(answer: {
   return { visible: true, label: { kind: "running" }, tone: "normal" };
 }
 
-/** The copy `goalPillCopy` needs: the noun and the four full state names. */
+/** The copy `goalPillCopy` needs: the noun. */
 export interface GoalPillWords {
   readonly title: string;
+}
+
+/**
+ * The trigger's two strings (UI-v7): the noun 「目标」/「Goal」 for **both**, in
+ * every state.
+ *
+ * - `label` is the text drawn in the pill; the glyph (tone colour, running ring,
+ *   completed check) carries the state.
+ * - `title` is the host's accessibility name, desktop tooltip **and** phone
+ *   sheet header (`plugins/buttons/view.tsx`) — one string for all three, the
+ *   plugin API has no separate slot. The sheet header must read 「目标」, so the
+ *   accessibility name does too (the user accepted this); the full state is
+ *   spoken by the panel's first row instead (`goalStateName`).
+ */
+export function goalPillCopy(
+  _presentation: GoalPillPresentation,
+  words: GoalPillWords,
+): { label: string; title: string } {
+  return { label: words.title, title: words.title };
+}
+
+/** The full state names, for the panel's first-row accessibility label. */
+export interface GoalStateWords {
   readonly running: string;
   readonly notRunning: string;
   readonly paused: string;
   readonly blocked: string;
+  readonly complete: string;
 }
 
 /**
- * The trigger's two strings for one presentation (UI-v6).
- *
- * - `label`, the text drawn in the pill, is the noun 「目标」/「Goal」 in **every**
- *   state; the glyph's colour and the running ring carry the state.
- * - `title` is the state in full words. The host uses a button's `title` as its
- *   accessibility name and desktop tooltip and as the phone sheet's header
- *   (`plugins/buttons/view.tsx`), and the plugin API has no other
- *   accessibility-name slot, so this is where a screen reader hears the state.
- *   A hidden pill falls back to the noun.
+ * The goal's state in full words (「目标进行中」…「目标已完成」), for the panel's
+ * objective row: with the pill's name fixed to the noun, this is where a screen
+ * reader hears the state. Same rule as the pill, so the two cannot disagree.
  */
-export function goalPillCopy(
-  presentation: GoalPillPresentation,
-  words: GoalPillWords,
-): { label: string; title: string } {
-  if (!presentation.visible) return { label: words.title, title: words.title };
-  return { label: words.title, title: words[presentation.label.kind] };
+export function goalStateName(goal: GoalState, words: GoalStateWords): string {
+  if (goal.phase === "complete") return words.complete;
+  if (goal.phase === "blocked") return words.blocked;
+  if (goal.phase === "paused") return words.paused;
+  if (goal.activation === "disarmed") return words.notRunning;
+  return words.running;
+}
+
+/* -------------------------------------------------------------------------- */
+/* A completed goal's "seen" state (UI-v7)                                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Per-agent progress towards "the user has moved on from this completed goal".
+ *
+ * - `watching`: a complete goal with this key was observed; the turn that
+ *   completed it may still be running (the model writes its closing summary
+ *   after `update_goal(complete)`, survey §3), so a `running` here proves
+ *   nothing.
+ * - `idleSeen`: the agent went idle after the completion. The **next**
+ *   `running` is a new turn — the user's next message, as far as the client can
+ *   tell (the plugin API has no composer-submit signal) — and marks it seen.
+ */
+export interface GoalCompleteWatch {
+  readonly key: string;
+  readonly stage: "watching" | "idleSeen";
+}
+
+/** One input to {@link goalCompleteSeenStep}. */
+export type GoalCompleteEvent =
+  /**
+   * A poll answer: the goal now (null when there is none), and the agent's last
+   * known status. Polls are seconds apart, so the completing turn may already
+   * have ended when "complete" is first observed; an idle agent at that moment
+   * starts the watch at `idleSeen`, or the user's next message would be missed.
+   */
+  | { readonly kind: "goal"; readonly goal: GoalState | null; readonly agentStatus?: string }
+  /** The agent's status, from the agent directory subscription. */
+  | { readonly kind: "agent"; readonly status: string | undefined }
+  /** The completed panel was opened and then closed. */
+  | { readonly kind: "closed"; readonly goal: GoalState | null };
+
+/** The machine's state: the remembered seen key and the watch in progress. */
+export interface GoalSeenState {
+  readonly seen?: string;
+  readonly watch?: GoalCompleteWatch;
+}
+
+/**
+ * Advance one agent's "seen" state.
+ *
+ * Seen means: the panel of that completed goal was closed after being opened,
+ * or a turn started after the completing turn had ended (idle, then running).
+ * The completing turn's own `running → idle` only moves the watch to
+ * `idleSeen`; a completion first observed while the agent is already idle
+ * starts there. A goal that is no longer complete (cleared, replaced) drops the
+ * watch; the remembered key stays, so the same `id:revision` cannot reappear,
+ * and any new key is shown again.
+ */
+export function goalCompleteSeenStep(state: GoalSeenState, event: GoalCompleteEvent): GoalSeenState {
+  switch (event.kind) {
+    case "goal": {
+      const goal = event.goal;
+      if (goal === null || goal.phase !== "complete") {
+        return state.seen === undefined ? {} : { seen: state.seen };
+      }
+      const key = goalSeenKey(goal);
+      if (state.seen === key) return { seen: key };
+      if (state.watch?.key === key) return state;
+      const stage = event.agentStatus === "idle" ? "idleSeen" : "watching";
+      return { ...(state.seen === undefined ? {} : { seen: state.seen }), watch: { key, stage } };
+    }
+    case "agent": {
+      const watch = state.watch;
+      if (watch === undefined) return state;
+      if (event.status === "idle" && watch.stage === "watching") {
+        return { ...state, watch: { key: watch.key, stage: "idleSeen" } };
+      }
+      if (event.status === "running" && watch.stage === "idleSeen") return { seen: watch.key };
+      return state;
+    }
+    case "closed": {
+      const goal = event.goal;
+      if (goal === null || goal.phase !== "complete") return state;
+      return { seen: goalSeenKey(goal) };
+    }
+  }
 }
 
 /* -------------------------------------------------------------------------- */

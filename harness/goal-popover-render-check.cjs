@@ -167,6 +167,8 @@ const theme = {
 };
 
 const baseGoal = {
+  id: "goal-1",
+  revision: 1,
   objective: "持续把 dist 目录的构建产物清理干净，并在每轮结束时追加一条变更记录到 CHANGELOG，直到 CI 全绿为止",
   phase: "active",
   activation: "armed",
@@ -260,8 +262,11 @@ function field(container) {
 console.log("the objective row is the panel's only action target");
 {
   const { container, calls } = render();
-  const row = byLabel(container, "编辑目标");
-  assert("the objective row is a button named 编辑目标", row !== undefined);
+  // The pill's own name is only 「目标」 (UI-v7), so the row speaks the state
+  // first, then its action.
+  const row = byLabel(container, "目标进行中，编辑目标");
+  assert("the objective row is a button named 目标进行中，编辑目标", row !== undefined);
+  check("…with the button role", row?.getAttribute("role"), "button");
   // Exactly three buttons: the row itself and its two icon buttons. There is no
   // separate edit button — the design removed it, the row opens the editor.
   const buttons = [...container.querySelectorAll('[role="button"]')];
@@ -423,6 +428,64 @@ console.log("\nthe clear page follows the host's menu density");
     const row = byLabel(confirmWide.container, label);
     assert(`the wide clear page's ${label} row is the host's 28px item`, /min-height:\s*28px/.test(row?.getAttribute("style") ?? ""), row?.getAttribute("style") ?? "missing");
   }
+}
+
+console.log("\nthe objective row names every non-complete state");
+{
+  const named = (over) => [...render({ goal: { ...baseGoal, ...over } }).container.querySelectorAll('[role="button"][aria-label]')]
+    .map((node) => node.getAttribute("aria-label"))
+    .find((label) => label.endsWith("编辑目标"));
+  check("a disarmed row says 目标未在续跑", named({ activation: "disarmed" }), "目标未在续跑，编辑目标");
+  check("a paused row says 目标已暂停", named({ phase: "paused" }), "目标已暂停，编辑目标");
+  check(
+    "a blocked row says 目标受阻",
+    named({ phase: "blocked", blockedReason: { code: "x", message: "y" } }),
+    "目标受阻，编辑目标",
+  );
+}
+
+console.log("\nthe complete page is read-only, with only clear (UI-v7)");
+{
+  const done = { ...baseGoal, phase: "complete", activation: "disarmed", currentTask: undefined };
+  const { container, calls } = render({ goal: done });
+  // Exactly one button, and it is clear: no pause/resume, no editable row.
+  const buttons = [...container.querySelectorAll('[role="button"]')];
+  check("the complete page has exactly one button", buttons.length, 1);
+  check("…and it is 清除目标", buttons[0]?.getAttribute("aria-label"), "清除目标");
+  assert("there is no pause button", byLabel(container, "暂停目标") === undefined);
+  assert("there is no resume button", byLabel(container, "继续目标") === undefined);
+  // The row is not pressable: clicking it opens no editor.
+  const row = byLabel(container, `目标已完成，${baseGoal.objective}`);
+  assert("the row's name says 目标已完成 and the objective", row !== undefined);
+  assert("the row is not a button", row?.getAttribute("role") !== "button", row?.getAttribute("role"));
+  click(row);
+  check("clicking the row opens no editor", calls.beginEdit, 0);
+  // One truncated line, the same rule as the other states.
+  const objective = [...container.querySelectorAll("div,span")].find(
+    (node) => (node.textContent ?? "").trim() === baseGoal.objective,
+  );
+  const classes = objective?.getAttribute("class") ?? "";
+  const style = objective?.getAttribute("style") ?? "";
+  assert(
+    "the objective is one truncated line",
+    objective !== undefined && ((/whiteSpace/.test(classes) && /textOverflow/.test(classes)) || /white-space:\s*nowrap/.test(style)),
+    `${style} | ${classes}`,
+  );
+  assert("the facts say 已完成", container.textContent.includes("已完成 · 第 3 轮 · 预算 10"));
+  assert("the hint points at the closing message", container.textContent.includes("完成总结见会话最后一条助手消息"));
+  assert("there is no running ring", container.querySelector('[role="progressbar"]') === null);
+  click(byLabel(container, "清除目标"));
+  check("clear opens the confirmation", calls.beginClear, 1);
+
+  const confirm = render({ goal: done, mode: "confirm" }).container;
+  assert(
+    "the complete clear page has its own sentence",
+    confirm.textContent.includes("清除后 /goal 将查不到这个目标，无法撤销"),
+    confirm.textContent,
+  );
+  assert("…not the active goal's sentence", !confirm.textContent.includes("清除后目标不再续跑"));
+  const active = render({ mode: "confirm" }).container;
+  assert("an active goal's clear page keeps its sentence", active.textContent.includes("清除后目标不再续跑，无法撤销"));
 }
 
 console.log("\nthe clear page is the design's confirmation");

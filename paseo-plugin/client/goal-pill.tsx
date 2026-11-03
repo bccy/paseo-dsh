@@ -41,18 +41,22 @@ import type {
   PluginClientContext,
 } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/ui";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Text, View } from "react-native";
 import { goalControl, goalCurrent, type GoalAction, type GoalState } from "../shared/goal";
 import { GoalPopoverBody } from "./goal-popover";
 import { useAgent, useGoalRunningMark } from "./goal-running";
 import {
   createGoalPoller,
+  goalCompleteSeenStep,
   goalEditSubmittable,
   goalIconColorToken,
+  goalIconName,
   goalPillCopy,
   goalPillPresentation,
+  type GoalCompleteEvent,
   type GoalPoller,
+  type GoalSeenState,
   type GoalTone,
   type GoalViewState,
 } from "./goal-polling";
@@ -66,6 +70,8 @@ interface AgentGoal {
   /** `false` when the runtime could not be read — never confused with "none". */
   available: boolean;
   error?: string;
+  /** The remembered `id:revision` of the completed goal the user has seen. */
+  seen?: string;
   /** The trigger's glyph and the popover re-render from this set when a poll lands. */
   readonly listeners: Set<() => void>;
 }
@@ -75,10 +81,13 @@ export type GoalStore = Map<string, AgentGoal>;
 
 /** The tone the trigger's glyph should draw with for one stored answer. */
 function goalToneOf(entry: AgentGoal | undefined): GoalTone {
-  const presentation = goalPillPresentation({
-    available: entry?.available ?? true,
-    goal: entry?.goal ?? null,
-  });
+  const presentation = goalPillPresentation(
+    {
+      available: entry?.available ?? true,
+      goal: entry?.goal ?? null,
+    },
+    entry?.seen,
+  );
   // A hidden pill draws nothing; the warning tone is only the initial value
   // before the first poll, and the glyph is invisible then anyway.
   return presentation.visible ? presentation.tone : "warning";
@@ -135,7 +144,9 @@ export function makeGoalIcon(store: GoalStore, agentId: string) {
       // the rail a running mark is always the ring itself.
       return <StatusRingMark size={size} color={ringColorFor(theme.colors.surface0)} />;
     }
-    return <Icon name="Target" size={size} color={theme.colors[goalIconColorToken(tone)]} />;
+    // A completed goal not yet seen draws the green check; every other
+    // non-running state the tone-coloured Target.
+    return <Icon name={goalIconName(tone)} size={size} color={theme.colors[goalIconColorToken(tone)]} />;
   }
   GoalPillIcon.displayName = "GoalPillIcon";
   return GoalPillIcon;
@@ -161,9 +172,16 @@ function makeGoalPopover(
   store: GoalStore,
   agentId: string,
   refresh: () => Promise<void>,
+  onClosed: (goal: GoalState | null) => void,
 ) {
   function GoalPopover({ theme, layout }: PluginButtonContentProps) {
     const [entry, setEntry] = useState<AgentGoal | undefined>(store.get(agentId));
+    // The host unmounts a closed surface's content (`menu-surface.tsx` /
+    // `menu-overlay.tsx`), so this body's unmount *is* "the panel was closed".
+    // The last goal it showed is what was seen; a completed one is then hidden.
+    const shown = useRef<GoalState | null>(entry?.goal ?? null);
+    shown.current = entry?.goal ?? null;
+    useEffect(() => () => onClosed(shown.current), []);
     const [busy, setBusy] = useState<GoalAction | null>(null);
     const [error, setError] = useState<string | undefined>(undefined);
     const [mode, setMode] = useState<"view" | "edit" | "confirm">("view");
@@ -312,6 +330,15 @@ export function contributeGoalPill(client: PluginClientContext) {
   const store: GoalStore = new Map();
   /** agentId -> the composer registration. */
   const pills = new Map<string, PluginButtonRegistration>();
+  /**
+   * agentId -> the completed goal's "seen" progress (UI-v7). Memory only: a
+   * reload forgets it and a completed goal shows once more (accepted).
+   */
+  const seenStates = new Map<string, GoalSeenState>();
+  /** agentId -> the last poll answer, to re-present it when only "seen" changed. */
+  const answers = new Map<string, GoalViewState>();
+  /** agentId -> the agent's last status from the directory (snapshot or upsert). */
+  const agentStatuses = new Map<string, string | undefined>();
   const lifetime = new AbortController();
   const rpc = (input: { agentId: string }) => client.rpc(goalCurrent, input);
 
@@ -321,21 +348,47 @@ export function contributeGoalPill(client: PluginClientContext) {
    * visibility/label rule is {@link goalPillPresentation}; this function only
    * turns its keys into copy.
    */
-  const publishState = (agentId: string, next: GoalViewState): void => {
+  const present = (agentId: string): void => {
     const registration = pills.get(agentId);
-    if (registration === undefined) return;
+    const next = answers.get(agentId);
+    if (registration === undefined || next === undefined) return;
+    const seen = seenStates.get(agentId)?.seen;
     publish(store, agentId, {
       goal: next.goal,
       available: next.available,
       ...(next.error === undefined ? {} : { error: next.error }),
+      ...(seen === undefined ? {} : { seen }),
     });
-    const presentation = goalPillPresentation(next);
+    const presentation = goalPillPresentation(next, seen);
     const text = localeText().goal;
-    // The label is the noun in every state; the title is the state in full
-    // words (the host's accessibility name, tooltip and phone sheet header).
-    // Never the objective — that would print it twice on a phone.
+    // The label and the title are the noun in every state (UI-v7): the title is
+    // also the phone sheet's header, which must read 「目标」. The state is the
+    // glyph's, and the panel's first row speaks it. Never the objective — that
+    // would print it twice on a phone.
     const { label, title } = goalPillCopy(presentation, text);
     registration.update({ visible: presentation.visible, label, title });
+  };
+
+  /** Feed one event to an agent's "seen" machine; re-present when it changed visibility. */
+  const advanceSeen = (agentId: string, event: GoalCompleteEvent): void => {
+    const before = seenStates.get(agentId) ?? {};
+    const after = goalCompleteSeenStep(before, event);
+    seenStates.set(agentId, after);
+    if (after.seen !== before.seen) present(agentId);
+  };
+
+  const publishState = (agentId: string, next: GoalViewState): void => {
+    if (pills.get(agentId) === undefined) return;
+    answers.set(agentId, next);
+    seenStates.set(
+      agentId,
+      goalCompleteSeenStep(seenStates.get(agentId) ?? {}, {
+        kind: "goal",
+        goal: next.goal,
+        agentStatus: agentStatuses.get(agentId),
+      }),
+    );
+    present(agentId);
   };
 
   const poller: GoalPoller = createGoalPoller({
@@ -366,18 +419,28 @@ export function contributeGoalPill(client: PluginClientContext) {
           visible: false,
           behavior: {
             kind: "popover",
-            Content: makeGoalPopover(client, store, agent.id, () => poller.pollNow(agent.id)),
+            Content: makeGoalPopover(
+              client,
+              store,
+              agent.id,
+              () => poller.pollNow(agent.id),
+              (goal) => advanceSeen(agent.id, { kind: "closed", goal }),
+            ),
           },
         },
       });
       pills.set(agent.id, registration);
       store.delete(agent.id);
+      answers.delete(agent.id);
     },
     removeAgent: (agentId, reason, error) => {
       const entry = pills.get(agentId);
       if (entry === undefined) return;
       pills.delete(agentId);
       entry.remove();
+      answers.delete(agentId);
+      seenStates.delete(agentId);
+      agentStatuses.delete(agentId);
       // Dropped rather than kept: the popover must not show a stale goal for an
       // agent this client may not read, or whose runtime cannot serve goals.
       store.delete(agentId);
@@ -423,6 +486,7 @@ export function contributeGoalPill(client: PluginClientContext) {
     .then(({ subscription }) => {
       subscription.subscribe({
         snapshot: (page) => {
+          for (const { agent } of page.entries) agentStatuses.set(agent.id, agent.status);
           void poller.applySnapshot(page);
         },
         update: (message) => {
@@ -430,6 +494,10 @@ export function contributeGoalPill(client: PluginClientContext) {
           const update = message.payload;
           if (update.kind === "upsert") {
             poller.upsert(update.agent);
+            // The agent's status is the only "the user moved on" signal the
+            // client has: a turn starting after the completing one ended.
+            agentStatuses.set(update.agent.id, update.agent.status);
+            advanceSeen(update.agent.id, { kind: "agent", status: update.agent.status });
             return;
           }
           poller.drop(update.agentId);

@@ -69,6 +69,7 @@ const {
   MAX_POLL_JITTER_MS,
   MAX_POLL_MS,
   createGoalPoller,
+  goalCompleteSeenStep,
   goalCurrentTaskLine,
   goalEditDraftValid,
   goalEditKeyAction,
@@ -78,10 +79,13 @@ const {
   goalFactsLine,
   goalIconButton,
   goalIconColorToken,
+  goalIconName,
   goalMenuItem,
   goalPillCopy,
   goalPillPresentation,
   goalRunningMark,
+  goalSeenKey,
+  goalStateName,
   goalTrackRow,
   initialPollDelayMs,
   nextPollDelayMs,
@@ -115,6 +119,8 @@ function assert(what, condition, detail) {
 /** A goal fixture; `over` replaces single fields. */
 function goal(over = {}) {
   return {
+    id: "goal-1",
+    revision: 1,
     objective: "ship the goal pill",
     phase: "active",
     activation: "armed",
@@ -166,6 +172,22 @@ console.log("the goal contract (phases, activations, error codes)");
     goal: { objective: "x", phase: "active", roundsStarted: 0, maxGoalRounds: 1 },
   });
   check("a goal without activation is rejected", noActivation.success, false);
+  // id/revision are the completed goal's seen key (UI-v7): an old server that
+  // does not send them is rejected rather than read as "never seen".
+  const { id: _id, ...noId } = goal();
+  check("a goal without id is rejected", goalCurrent.output.safeParse({ available: true, goal: noId }).success, false);
+  const { revision: _revision, ...noRevision } = goal();
+  check(
+    "a goal without revision is rejected",
+    goalCurrent.output.safeParse({ available: true, goal: noRevision }).success,
+    false,
+  );
+  const parsed = goalCurrent.output.safeParse({ available: true, goal: { ...goal(), createdAt: 1, updatedAt: 2 } });
+  check(
+    "timestamps are still stripped on the wire",
+    parsed.success && !("createdAt" in parsed.data.goal) && !("updatedAt" in parsed.data.goal),
+    true,
+  );
   const blocked = goalCurrent.output.safeParse({
     available: true,
     goal: goal({ phase: "blocked", blockedReason: { code: "round-limit", message: "limit reached" } }),
@@ -237,7 +259,7 @@ console.log("\nthe /goal argument grammar (DSH's own)");
 
 /* Presentation -------------------------------------------------------------- */
 
-console.log("\nthe four states the trigger must tell apart");
+console.log("\nthe five states the trigger must tell apart");
 {
   const armed = goalPillPresentation({ available: true, goal: goal() });
   check("active+armed is visible", armed.visible, true);
@@ -263,29 +285,49 @@ console.log("\nthe four states the trigger must tell apart");
   equal("blocked labels itself", blocked.label, { kind: "blocked" });
   check("blocked is the error tone", blocked.tone, "error");
 
-  // ---- the hidden states, one named assertion per reason ------------------
-  // DESIGN §2: "无目标/已完成/已清除 → 隐藏". These are different rules that
-  // happen to share one visible outcome, so each gets its own assertion — a
-  // mutation that deletes one rule must show up as its own red, not hide behind
-  // another state's check. The complete rule is the first branch of the
-  // visibility decision, so several assertions pin it: deleting it must be more
-  // than one red (verified by mutation in evidence/mutation.md).
-  const complete = goalPillPresentation({ available: true, goal: goal({ phase: "complete" }) });
-  check("a complete goal is hidden", complete.visible, false);
+  // ---- a completed goal is shown once, until seen (UI-v7) ----------------
+  // DSH's Web hides a complete goal at once; this plugin shows it until the user
+  // has seen it, remembered per `id:revision`. Several assertions pin both
+  // halves: shown while unseen, hidden once seen, shown again for a new key.
+  const complete = goalPillPresentation({ available: true, goal: goal({ phase: "complete", activation: "disarmed" }) });
+  check("an unseen complete goal is visible", complete.visible, true);
+  equal("…labelled complete", complete.label, { kind: "complete" });
+  check("…in the success tone", complete.tone, "success");
   check(
-    "a complete goal is hidden even when it is armed",
+    "an unseen complete goal is visible even when armed",
     goalPillPresentation({ available: true, goal: goal({ phase: "complete", activation: "armed" }) }).visible,
+    true,
+  );
+  check(
+    "an unseen complete goal is visible at any round count",
+    goalPillPresentation({ available: true, goal: goal({ phase: "complete", roundsStarted: 0, maxGoalRounds: 0 }) }).visible,
+    true,
+  );
+  const seenKey = goalSeenKey(goal({ phase: "complete" }));
+  equal("the seen key is id:revision", seenKey, "goal-1:1");
+  check(
+    "a seen complete goal is hidden",
+    goalPillPresentation({ available: true, goal: goal({ phase: "complete" }) }, seenKey).visible,
     false,
   );
   check(
-    "a complete goal is hidden at any round count",
-    goalPillPresentation({
-      available: true,
-      goal: goal({ phase: "complete", roundsStarted: 0, maxGoalRounds: 0 }),
-    }).visible,
-    false,
+    "a new revision of a seen goal is shown again",
+    goalPillPresentation({ available: true, goal: goal({ phase: "complete", revision: 2 }) }, seenKey).visible,
+    true,
   );
-  check("a complete goal carries no label to render", !("label" in complete), true);
+  check(
+    "a new goal with the same objective is shown again",
+    goalPillPresentation({ available: true, goal: goal({ phase: "complete", id: "goal-2" }) }, seenKey).visible,
+    true,
+  );
+  check(
+    "the seen key only hides a complete goal",
+    goalPillPresentation({ available: true, goal: goal() }, seenKey).visible,
+    true,
+  );
+  equal("a completed goal draws the check", goalIconName("success"), "CircleCheck");
+  equal("every other tone draws the Target", ["normal", "warning", "error"].map(goalIconName), ["Target", "Target", "Target"]);
+  equal("the success tone colours the glyph with statusSuccess", goalIconColorToken("success"), "statusSuccess");
 
   // No goal: never created, or cleared (both are `goal: null`).
   check("no goal is hidden", goalPillPresentation({ available: true, goal: null }).visible, false);
@@ -482,25 +524,70 @@ console.log("\nkeys in the edit field follow the host composer");
   equal("typing does nothing", goalEditKeyAction({ ...desk, key: "a" }), null);
 }
 
-console.log("\nthe pill reads 目标 in every state; its name carries the state");
+console.log("\nthe pill's label and title are 目标 in every state; the panel row speaks the state");
 {
   const cases = [
     ["running", goal(), "目标进行中", "Goal running"],
     ["notRunning", goal({ activation: "disarmed" }), "目标未在续跑", "Goal not running"],
     ["paused", goal({ phase: "paused" }), "目标已暂停", "Goal paused"],
     ["blocked", goal({ phase: "blocked", blockedReason: { code: "x", message: "y" } }), "目标受阻", "Goal blocked"],
+    ["complete", goal({ phase: "complete", activation: "disarmed" }), "目标已完成", "Goal complete"],
   ];
-  for (const [what, value, zhTitle, enTitle] of cases) {
+  for (const [what, value, zhState, enState] of cases) {
     const presentation = goalPillPresentation({ available: true, goal: value });
     const zh = goalPillCopy(presentation, LOCALE_TEXT["zh-CN"].goal);
     const en = goalPillCopy(presentation, LOCALE_TEXT.en.goal);
-    equal(`${what}: the zh label is the noun`, zh.label, "目标");
-    equal(`${what}: the en label is the noun`, en.label, "Goal");
-    equal(`${what}: the zh name says the state`, zh.title, zhTitle);
-    equal(`${what}: the en name says the state`, en.title, enTitle);
+    // The title is also the phone sheet's header, which must read the noun.
+    equal(`${what}: zh label and title are the noun`, zh, { label: "目标", title: "目标" });
+    equal(`${what}: en label and title are the noun`, en, { label: "Goal", title: "Goal" });
+    equal(`${what}: the zh state name`, goalStateName(value, LOCALE_TEXT["zh-CN"].goal), zhState);
+    equal(`${what}: the en state name`, goalStateName(value, LOCALE_TEXT.en.goal), enState);
   }
   const hidden = goalPillCopy(goalPillPresentation({ available: true, goal: null }), LOCALE_TEXT["zh-CN"].goal);
   equal("a hidden pill falls back to the noun", hidden, { label: "目标", title: "目标" });
+}
+
+console.log("\na completed goal's seen state");
+{
+  const done = goal({ phase: "complete", activation: "disarmed" });
+  const step = (state, ...events) => events.reduce((acc, event) => goalCompleteSeenStep(acc, event), state);
+  // The completing turn: complete observed while the agent still runs (it is
+  // writing the closing summary), then it goes idle. Neither is "seen".
+  const running = step({}, { kind: "goal", goal: done, agentStatus: "running" });
+  equal("observing complete while running starts watching", running, { watch: { key: "goal-1:1", stage: "watching" } });
+  const idled = step(running, { kind: "agent", status: "idle" });
+  equal("the completing turn's running→idle is not seen", idled.seen, undefined);
+  equal("…it only arms the watch", idled.watch, { key: "goal-1:1", stage: "idleSeen" });
+  equal("a repeated running before idle is not seen", step(running, { kind: "agent", status: "running" }).seen, undefined);
+  // The next turn: running after idle is the user moving on.
+  equal("running after idle marks it seen", step(idled, { kind: "agent", status: "running" }), { seen: "goal-1:1" });
+  // First observed while already idle (the completing turn ended between polls).
+  const lateIdle = step({}, { kind: "goal", goal: done, agentStatus: "idle" });
+  equal("a completion first seen while idle starts armed", lateIdle.watch?.stage, "idleSeen");
+  equal("…so the next running marks it seen", step(lateIdle, { kind: "agent", status: "running" }).seen, "goal-1:1");
+  // Closing the opened panel marks it seen at once.
+  equal("closing the complete panel marks it seen", step(running, { kind: "closed", goal: done }), { seen: "goal-1:1" });
+  equal("closing a non-complete panel marks nothing", step({}, { kind: "closed", goal: goal() }).seen, undefined);
+  // A new key is watched again; the old key stays remembered.
+  const seen = { seen: "goal-1:1" };
+  equal("the seen key survives repeated polls", step(seen, { kind: "goal", goal: done, agentStatus: "running" }), seen);
+  equal(
+    "a new revision is watched again",
+    step(seen, { kind: "goal", goal: { ...done, revision: 2 }, agentStatus: "running" }).watch,
+    { key: "goal-1:2", stage: "watching" },
+  );
+  // Leaving complete (cleared / replaced) drops the watch but keeps the key.
+  equal("a cleared goal drops the watch", step(running, { kind: "goal", goal: null }), {});
+  equal("…and keeps a remembered key", step(seen, { kind: "goal", goal: null }), seen);
+  equal("agent events without a watch change nothing", step({}, { kind: "agent", status: "running" }), {});
+  // End to end with the presentation rule.
+  const final = step(
+    {},
+    { kind: "goal", goal: done, agentStatus: "running" },
+    { kind: "agent", status: "idle" },
+    { kind: "agent", status: "running" },
+  );
+  check("after the next turn the pill is hidden", goalPillPresentation({ available: true, goal: done }, final.seen).visible, false);
 }
 
 /* The popover's wiring (source-level: it is JSX) ---------------------------- */
@@ -527,7 +614,9 @@ console.log("\nthe trigger and popover wiring");
     "the trigger's icon switches to the ring while running",
     /if \(running\) \{[\s\S]{0,400}StatusRingMark/.test(pill),
   );
-  assert("the static glyph is the Target", /name="Target"/.test(pill));
+  // The static glyph's name comes from the pure rule (Target, or the completed
+  // check), asserted behaviourally above; this pins the call site.
+  assert("the static glyph's name comes from goalIconName", /name=\{goalIconName\(tone\)\}/.test(pill));
   // The objective row is the host's track row and the edit entry.
   assert("the objective row is a track row", /goalTrackRow\(compact\)/.test(popover));
   assert("the objective is one truncated line", /numberOfLines=\{1\}[\s\S]{0,400}?\{goal\.objective\}/.test(popover));

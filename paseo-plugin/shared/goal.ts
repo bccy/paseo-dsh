@@ -111,16 +111,26 @@ export type GoalBlockedReason = z.infer<typeof goalBlockedReasonSchema>;
 /**
  * One goal as the pill draws it.
  *
- * Deliberately **not** DSH's whole `GoalView`: `id`/`revision`/`createdAt`/
- * `updatedAt` are compare-and-set plumbing the pill never renders, and carrying
- * them would invite a call site to compare revisions it cannot act on. What is
- * here is exactly what the DESIGN's popover shows.
+ * Deliberately **not** DSH's whole `GoalView`: `createdAt`/`updatedAt` are
+ * never rendered and stay behind. `id` and `revision` are carried for one
+ * reason only (UI-v7): a completed goal is shown until the user has seen it,
+ * and "seen" is remembered per `id:revision` — the objective text cannot be the
+ * key, because the same sentence can be completed twice (clear, then create it
+ * again). The client never sends them back; control actions still go through
+ * `/goal`, which needs no compare-and-set token.
  *
  * `.strip()` is the Zod default: Paseo parses both sides, so an undeclared key
  * would be dropped on the client — the silent-loss shape this repo keeps
  * finding.
  */
 export const goalStateSchema = z.object({
+  /**
+   * DSH's goal identity. Required, like `activation`: a server that does not
+   * send it is an old server, and a missing key must not read as "never seen".
+   */
+  id: z.string(),
+  /** DSH's revision of that goal; every durable mutation increments it. */
+  revision: z.number(),
   /** The human-requested objective, full text. */
   objective: z.string(),
   /** Durable lifecycle phase. */

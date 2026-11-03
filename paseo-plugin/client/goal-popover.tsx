@@ -73,6 +73,7 @@ import {
   goalEditSubmittable,
   goalEditorHeight,
   goalEditorType,
+  goalStateName,
   goalFactsLine,
   goalIconButton,
   goalMenuItem,
@@ -633,7 +634,8 @@ export function GoalPopoverBody({
   if (mode === "confirm") {
     return (
       <View style={{ ...root, margin: -12 }}>
-        <Hint theme={theme}>{text.clearHint}</Hint>
+        {/* A completed goal stops nothing when cleared; it loses the record. */}
+        <Hint theme={theme}>{goal.phase === "complete" ? text.completeClearHint : text.clearHint}</Hint>
         <Separator theme={theme} />
         <MenuRow
           icon="Trash2"
@@ -651,12 +653,64 @@ export function GoalPopoverBody({
   }
 
   const row = goalTrackRow(compact);
+  const stateName = goalStateName(goal, text);
+
+  if (goal.phase === "complete") {
+    // UI-v7: read-only. The objective row is a plain View (no press, no hover
+    // fill — nothing here edits), the whale has no ring, the objective is the
+    // same one truncated line as every other state, and the only action is
+    // clear. The hint points at the model's closing message: DSH has no
+    // summary field to show instead.
+    return (
+      <View style={{ ...root, margin: -12 }}>
+        <View accessible accessibilityLabel={text.rowLabel(stateName, goal.objective)} style={row}>
+          <Whale running={false} theme={theme} backdrop={theme.colors.surface1} label={text.runningA11y} />
+          <View style={{ flexGrow: 1, flexShrink: 1, flexBasis: "auto", minWidth: 0 }}>
+            <Text
+              numberOfLines={1}
+              style={{
+                fontSize: TITLE_FONT_SIZE,
+                lineHeight: GOAL_OBJECTIVE_LINE_HEIGHT,
+                color: theme.colors.foreground,
+              }}
+            >
+              {goal.objective}
+            </Text>
+            <Text
+              numberOfLines={1}
+              style={{
+                fontSize: FACTS_FONT_SIZE,
+                lineHeight: GOAL_FACTS_LINE_HEIGHT,
+                color: theme.colors.foregroundMuted,
+              }}
+            >
+              {facts}
+            </Text>
+          </View>
+          <IconButton
+            name="Trash2"
+            glyph={iconButton.glyph}
+            size={iconButton.size}
+            color={theme.colors.foregroundMuted}
+            disabled={busy}
+            theme={theme}
+            label={text.actions.clearTarget}
+            onPress={onBeginClear}
+          />
+        </View>
+        <Hint theme={theme}>{text.completeHint}</Hint>
+        {error === undefined ? null : <Hint theme={theme} danger>{error}</Hint>}
+      </View>
+    );
+  }
+
   return (
     <View style={{ ...root, margin: -12 }}>
-      {/* The whole row is the edit target. The two buttons stop their own press. */}
+      {/* The whole row is the edit target. The two buttons stop their own press.
+          Its name speaks the state first: the pill's own name is only 「目标」. */}
       <Pressable
         accessibilityRole="button"
-        accessibilityLabel={text.actions.edit}
+        accessibilityLabel={text.rowLabel(stateName, text.actions.edit)}
         onPress={onBeginEdit}
         onHoverIn={() => setHot(true)}
         onHoverOut={() => setHot(false)}

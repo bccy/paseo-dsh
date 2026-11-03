@@ -13,10 +13,10 @@
  *      no goal", the same rule `readAgentJobs` follows. Reporting a failure
  *      there would put an error pill on every agent before its first prompt.
  *   2. **The view is reduced, not passed through.** The bridge answers DSH's
- *      whole `GoalView`; the RPC carries exactly the fields the pill draws.
- *      `id`/`revision`/timestamps must not leak: they are compare-and-set
- *      plumbing the client cannot act on, and a client that compared revisions
- *      would be inventing a protocol Paseo does not have.
+ *      whole `GoalView`; the RPC carries the fields the pill draws plus `id` and
+ *      `revision` — the key a completed goal's "seen" state is remembered under
+ *      (UI-v7). The timestamps must not leak: nothing draws them, and they are
+ *      not part of any key.
  *   3. **The failure grading is the jobs pill's.** `bridge_too_old` (the bridge
  *      does not implement `paseo/goal`) and `goal_unavailable` (the runtime
  *      composes no goal service) are terminal; a not-yet-created session and a
@@ -304,8 +304,13 @@ const VIEW = {
     JSON.stringify(reduced),
   );
   check(
-    "compare-and-set plumbing does not leak to the client",
-    !("id" in reduced) && !("revision" in reduced) && !("createdAt" in reduced) && !("updatedAt" in reduced),
+    "id and revision travel as the seen key",
+    reduced.id === VIEW.id && reduced.revision === VIEW.revision,
+    JSON.stringify(reduced),
+  );
+  check(
+    "the timestamps do not leak to the client",
+    !("createdAt" in reduced) && !("updatedAt" in reduced),
     JSON.stringify(reduced),
   );
   const goalFrame = goalFrames().at(-1);

@@ -51,8 +51,9 @@ Paseo 0.14.0。
 - `goal.current {agentId}` → `{available, goal: GoalState | null, error?: {message, code?}}`。
   **错误形状与 jobs 的 `{available, jobs, error?: {message, code?}}` 同形**（嵌套 error 对象 +
   可选 code）；DESIGN §1.2 的字面写法是顶层 `error`/`code`，Lead 已裁决以实现为准（验证报告 B-3）。
-  `GoalState = {objective, phase, activation, roundsStarted, maxGoalRounds, blockedReason?{code,message},
-  currentTask?}`——只带绘制需要的字段，`id`/`revision`/时间戳不泄漏
+  `GoalState = {id, revision, objective, phase, activation, roundsStarted, maxGoalRounds,
+  blockedReason?{code,message}, currentTask?}`——绘制需要的字段，外加 `id`/`revision`（UI-v7：完成态「已读」的键，
+  客户端从不回传；同一句目标可能完成两次，所以不能用 objective 当键）；时间戳不泄漏
   （`paseo-plugin/server/provider.ts:2116-2128`）。`currentTask` 是第二次 best-effort 读
   `todos` 投影的结果，只在 goal 非空时读（`paseo-plugin/server/provider.ts:2184-2195`）。
 - `goal.control {agentId, action: "pause"|"resume"|"clear"|"edit", objective?}` →
@@ -81,25 +82,27 @@ Paseo 0.14.0。
 ## 状态、pill 与按钮
 
 目标 pill 注册在 composer（`client.addComposerPill`，独立 id **`dsh-goal`**，与 jobs pill 并列；
-**jobs pill 的语义一行不改**：只在运行中可见、只用转环、文案「N 个后台」）。**label 四态恒为
-「目标」/「Goal」**（UI-v6）：状态由图标的颜色与运行环表达；`title` 是完整状态名（`目标进行中` 等），
-因为宿主把按钮的 `title` 用作无障碍名、桌面 tooltip 与手机 sheet 标题（`plugins/buttons/view.tsx`），
-插件 API 没有单独的无障碍名通道。代价：手机 sheet 头显示完整状态而不是固定「目标」。两个字符串
-由纯函数 `goalPillCopy`（`client/goal-polling.ts`）给出。完整 objective 只在 popover 正文出现一次。
+**jobs pill 的语义一行不改**：只在运行中可见、只用转环、文案「N 个后台」）。**label 与 title 在所有
+状态下都是「目标」/「Goal」**（UI-v7）：宿主把按钮的 `title` 同时用作无障碍名、桌面 tooltip 与手机 sheet
+标题（`plugins/buttons/view.tsx`），插件 API 没有分开的通道，而手机 sheet 标题要是「目标」，所以读屏
+在 pill 上也只读「目标」（用户已接受）。状态由图标表达（颜色、运行环、完成对勾），并由**面板目标行的
+无障碍名**说出完整状态：「目标进行中，编辑目标」「目标已完成，<目标>」等（`goalStateName` + `rowLabel`）。
+两个字符串由纯函数 `goalPillCopy`（`client/goal-polling.ts`）给出。完整 objective 只在 popover 正文出现一次。
 注册时先 `visible:false`，第一次轮询证明有目标才显示。
 
-**可见性**：`available && goal !== null && phase !== "complete"`。无目标 / 已完成 / 已清除 →
-隐藏（与 DSH Web GoalBar 同语义：无目标、已完成与成功清除的目标一律不渲染，
-`@deepseek-ai/dsh-client-ui-goal/README.zh.md:38`；survey §D3）。终态错误（桥太旧、profile 没挂
+**可见性**：`available && goal !== null`，且 complete 时**用户还没看过**。无目标 / 已清除 → 隐藏。
+complete 是本插件对 DSH 的有界扩展：DSH Web 的 GoalBar 对 complete 当即不渲染
+（`@deepseek-ai/dsh-client-ui-goal/README.zh.md:38`），这里改为**完成后显示一次**，看过即隐藏（见下文「完成态」）。终态错误（桥太旧、profile 没挂
 goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等价，不打扰用户；瞬时错误**保持
 上次状态**，不要把界面闪成「无目标」（`goalPillPresentation`，`paseo-plugin/client/goal-polling.ts`）。
 
-| 状态 | title = 无障碍名（zh-CN / en；label 恒为「目标」/「Goal」） | 图标 | 行尾操作 |
+| 状态 | 完整状态名（面板目标行读屏；pill 的 label/title 恒为「目标」/「Goal」） | 图标 | 行尾操作 |
 |---|---|---|---|
 | active + armed | `目标进行中` / `Goal running` | 运行环（agent 在跑时）/ `Target`（`foregroundMuted`） | 暂停、清除；点行编辑 |
 | active + disarmed | `目标未在续跑` / `Goal not running` | `Target`（`statusWarning`） | 继续、清除；点行编辑 |
 | paused | `目标已暂停` / `Goal paused` | `Target`（`statusWarning`） | 继续、清除；点行编辑 |
 | blocked | `目标受阻` / `Goal blocked` | `Target`（`statusDanger`） | 继续、清除；点行编辑 |
+| complete（未看过） | `目标已完成` / `Goal complete` | `CircleCheck`（`statusSuccess`），不转环 | 只有清除；目标行不可编辑 |
 
 **pill 文字不带轮数分数**：`目标 3/10` 在 160px 的按钮里会被读成完成度（上限默认 256），轮数是
 **预算不是完成度**，只进 popover 的 facts 行（`goalFactsLine`）。
@@ -146,6 +149,22 @@ goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等�
   颜色，不是红按钮）。
 - 操作中置忙（「处理中…」/「Working…」）；成功后立即 `pollNow` 刷新（不等 4s）；失败原文显示在
   popover 里、popover 不关闭。没有目标时显示「当前没有目标。」，读不到时显示「读不到本会话的目标。」。
+
+**完成态（UI-v7）**：DSH 的 complete 一直保留到 `/goal clear` 或新建目标（survey §1）。本插件让 pill 在完成后**再显示一次**：
+- **pill**：文字仍「目标」，图标换成绿色 `CircleCheck`（`statusSuccess`，宿主「已完成任务」的标记；`goalIconName`），不转环。
+- **面板（只读）**：鲸鱼 + 目标**单行截断**（与其它状态同一行；行是普通 View，不可点、不进编辑）+ facts「已完成 · 第 N 轮 · 预算 M」
+  + 行尾只有清除；下方一行「完成总结见会话最后一条助手消息」/「The summary is in the session's last assistant message.」——DSH 没有
+  summary 字段，总结只在模型的收尾消息里（survey §3），不伪造。没有暂停/继续/编辑：complete 不能 resume，`/goal edit` 对 complete 是新建。
+- **清除确认**：complete 用单独一句「清除后 /goal 将查不到这个目标，无法撤销」/「After clearing, /goal will no longer show this goal;
+  this cannot be undone.」（清除一个已完成目标不会停止任何东西，失去的是 `/goal` 还能查到的记录）；其它状态的确认句不变。
+- **何时隐藏**：按 `id:revision` 记「已读」，同键已读即隐藏（`goalPillPresentation(answer, seen)`）。已读的来源（纯函数
+  `goalCompleteSeenStep`）：①打开完成面板后关闭（宿主关闭时卸载面板内容，卸载即记已读）；②观察到 complete 之后 agent **先 idle 再 running**
+  ——这是插件能拿到的「用户发了下一条消息」的唯一代理信号（插件 API 没有 composer 提交回调），完成当轮的收尾 running→idle 只推进状态、
+  不算已读；若首次观察到 complete 时 agent 已 idle（轮询间隔里那一轮已结束），直接从「已 idle」起步；③清除后 goal 为 null，自然隐藏。
+  非用户发起的回合（schedule、心跳、其它 agent 的消息）也会触发②，失误方向是「提早消失」，不会多出现。agent 状态取自 pill 已有的
+  `agents.list({subscribe})` 快照与 upsert（不用 `useAgent`：pill 隐藏时没有组件挂载，看不到状态变化）。
+- **只在内存**：刷新 / 重开 App / 插件 reload 后清空，complete 会再出现一次（用户已接受）。同一 objective 的新目标（新 id）或新 revision
+  会重新显示。
 
 **为什么不做 todo 进度条**：todo 的产生侧不可靠——调查 38 个真实 DeepSeek 会话：20 个从不调
 `todo_write`，9 个只写 1 次（之后不再更新），8 个写 2 次（多在结束前一次性全标完成，其中 3 个

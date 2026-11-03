@@ -331,6 +331,10 @@ console.log("the goal pill's copy is covered in both languages");
     "notRunning",
     "paused",
     "blocked",
+    "complete",
+    "completeHint",
+    "completeClearHint",
+    "rowLabel",
     "statuses",
     "rounds",
     "currentTaskPrefix",
@@ -365,6 +369,33 @@ console.log("the goal pill's copy is covered in both languages");
   check("goal.paused is `目标已暂停` (zh-CN)", zh.paused === "目标已暂停", JSON.stringify(zh.paused));
   check("goal.blocked is `Goal blocked` (en)", en.blocked === "Goal blocked", JSON.stringify(en.blocked));
   check("goal.blocked is `目标受阻` (zh-CN)", zh.blocked === "目标受阻", JSON.stringify(zh.blocked));
+  // UI-v7: the completed state, its panel hint and its own clear sentence.
+  check("goal.complete is `Goal complete` (en)", en.complete === "Goal complete", JSON.stringify(en.complete));
+  check("goal.complete is `目标已完成` (zh-CN)", zh.complete === "目标已完成", JSON.stringify(zh.complete));
+  check(
+    "goal.completeHint points at the closing message (zh-CN)",
+    zh.completeHint === "完成总结见会话最后一条助手消息",
+    JSON.stringify(zh.completeHint),
+  );
+  check(
+    "goal.completeHint points at the closing message (en)",
+    en.completeHint.includes("last assistant message"),
+    JSON.stringify(en.completeHint),
+  );
+  check(
+    "goal.completeClearHint is the complete page's sentence (zh-CN)",
+    zh.completeClearHint === "清除后 /goal 将查不到这个目标，无法撤销",
+    JSON.stringify(zh.completeClearHint),
+  );
+  check(
+    "goal.completeClearHint names /goal and says it is final (en)",
+    en.completeClearHint.includes("/goal") && en.completeClearHint.toLowerCase().includes("cannot be undone"),
+    JSON.stringify(en.completeClearHint),
+  );
+  check("the complete clear sentence is not the active one (zh-CN)", zh.completeClearHint !== zh.clearHint);
+  // The row name: the state first, then the action.
+  check("goal.rowLabel joins state and action (zh-CN)", zh.rowLabel("目标进行中", "编辑目标") === "目标进行中，编辑目标", JSON.stringify(zh.rowLabel("a", "b")));
+  check("goal.rowLabel joins state and action (en)", en.rowLabel("Goal running", "Edit goal") === "Goal running, Edit goal", JSON.stringify(en.rowLabel("a", "b")));
   // `active + disarmed` is not a phase; its facts word must exist and match the
   // design's disarmed state (v1 §98).
   check("goal.statuses.disarmed is `Not continuing` (en)", en.statuses.disarmed === "Not continuing", JSON.stringify(en.statuses.disarmed));
@@ -402,6 +433,9 @@ console.log("the goal pill's copy is covered in both languages");
       "notRunning",
       "paused",
       "blocked",
+      "complete",
+      "completeHint",
+      "completeClearHint",
       "disarmedHint",
       "clearHint",
       "currentTaskPrefix",

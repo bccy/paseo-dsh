@@ -198,11 +198,12 @@ export interface GoalCardText {
  * The composer's goal pill.
  *
  * The pill is a **state indicator**, not a live counter like the jobs pill: it
- * stays visible while a goal exists and is not complete, because the whole point
- * is that the user can pause/resume/clear it. The label therefore distinguishes
- * four states (DESIGN §2): auto-continuing, active-but-not-continuing, paused,
- * blocked. The last three are warnings: a goal the user believes is running but
- * is not is the silent degradation this surface exists to fix.
+ * stays visible while a goal exists, because the whole point is that the user
+ * can pause/resume/clear it — and, since UI-v7, once more after it completes,
+ * until the user has seen it. Five states are told apart (DESIGN §2 + UI-v7):
+ * auto-continuing, active-but-not-continuing, paused, blocked, complete. The
+ * pill's own strings are the noun in every state; the state is the glyph's, and
+ * the panel's first row speaks it in full ({@link running} … {@link complete}).
  *
  * `statuses` is keyed by DSH's durable `GoalPhase` plus one non-phase word,
  * `disarmed` (the facts word for `active + disarmed`), and
@@ -212,15 +213,16 @@ export interface GoalCardText {
  */
 export interface GoalText {
   /**
-   * The pill's visible label in every state: the neutral noun 「目标」/「Goal」.
-   * The state is carried by the glyph's colour / running ring, and spelled out in
-   * full by the four state names below.
+   * The pill's label **and** title in every state: the neutral noun
+   * 「目标」/「Goal」. The host uses the title as the accessibility name, desktop
+   * tooltip and phone sheet header (`buttons/view.tsx`), so all three read the
+   * noun (UI-v7). The state is carried by the glyph, and spelled out in full by
+   * the state names below on the panel's first row.
    */
   title: string;
   /**
-   * The full state name while the goal is auto-continuing: the button's `title`,
-   * which the host uses as its accessibility name, desktop tooltip and phone
-   * sheet header (`buttons/view.tsx`). Not drawn as the label.
+   * The full state name while the goal is auto-continuing: the accessibility
+   * label of the panel's objective row. Drawn nowhere.
    *
    * Deliberately carries **no round fraction**: the round budget is not a
    * completion percentage, and `目标 3/10` reads as "30% done". The budget is a
@@ -233,6 +235,20 @@ export interface GoalText {
   paused: string;
   /** The full state name when the goal is blocked. */
   blocked: string;
+  /** The full state name when the goal is complete (UI-v7). */
+  complete: string;
+  /**
+   * The completed panel's one-line hint. DSH has no summary field (survey §3):
+   * the closing summary is the model's last assistant message, so the panel
+   * points there instead of inventing one.
+   */
+  completeHint: string;
+  /**
+   * The panel's objective row's accessibility name: the state in full, then
+   * what the row is (its action, or the objective when it has none). With the
+   * pill's own name fixed to the noun, this is where the state is spoken.
+   */
+  rowLabel: (state: string, rest: string) => string;
   /** The facts line's first word, per durable phase, plus `disarmed`. */
   statuses: Record<string, string>;
   /**
@@ -267,6 +283,12 @@ export interface GoalText {
    * asks for.
    */
   clearHint: string;
+  /**
+   * The clear page's hint for a **completed** goal. Clearing one does not stop
+   * anything; what it loses is the record `/goal` can still show, so that is
+   * what the sentence says.
+   */
+  completeClearHint: string;
   /**
    * The row-end icon buttons and the edit/clear pages' labels.
    *
@@ -602,6 +624,9 @@ const TEXT: Record<Locale, UiText> = {
       notRunning: "Goal not running",
       paused: "Goal paused",
       blocked: "Goal blocked",
+      complete: "Goal complete",
+      completeHint: "The summary is in the session's last assistant message.",
+      rowLabel: (state, rest) => `${state}, ${rest}`,
       statuses: {
         active: "Active",
         paused: "Paused",
@@ -614,6 +639,7 @@ const TEXT: Record<Locale, UiText> = {
       currentTaskPrefix: "Now: ",
       disarmedHint: "Auto-continue stops when the session is reopened. Press Resume to continue.",
       clearHint: "Clearing stops the goal for good; this cannot be undone.",
+      completeClearHint: "After clearing, /goal will no longer show this goal; this cannot be undone.",
       actions: {
         pauseTarget: "Pause goal",
         resumeTarget: "Resume goal",
@@ -897,6 +923,9 @@ const TEXT: Record<Locale, UiText> = {
       notRunning: "目标未在续跑",
       paused: "目标已暂停",
       blocked: "目标受阻",
+      complete: "目标已完成",
+      completeHint: "完成总结见会话最后一条助手消息",
+      rowLabel: (state, rest) => `${state}，${rest}`,
       statuses: {
         active: "进行中",
         paused: "已暂停",
@@ -911,6 +940,7 @@ const TEXT: Record<Locale, UiText> = {
       // design-opus-v4 §1 的提示文案 B：说清原因，也说清「继续」按钮是解法。
       disarmedHint: "重开会话后自动续跑会停止，点「继续」恢复",
       clearHint: "清除后目标不再续跑，无法撤销",
+      completeClearHint: "清除后 /goal 将查不到这个目标，无法撤销",
       actions: {
         pauseTarget: "暂停目标",
         resumeTarget: "继续目标",

@@ -2108,13 +2108,15 @@ export async function readAgentJobs(agentId: string): Promise<{
  * One goal as the shared contract carries it.
  *
  * The bridge answers DSH's whole `GoalView`; the pill needs the five fields it
- * draws plus the blocker, and nothing else. `id`/`revision`/timestamps are
- * compare-and-set plumbing — carrying them would invite a client to compare
- * revisions it cannot act on. Copied field by field rather than spread, so a
- * field the bridge adds later cannot leak into the RPC answer by accident.
+ * draws, the blocker, and `id`/`revision` — the key a completed goal's "seen"
+ * state is remembered under (see `shared/goal.ts`). The timestamps stay behind.
+ * Copied field by field rather than spread, so a field the bridge adds later
+ * cannot leak into the RPC answer by accident.
  */
 function goalStateOf(view: DshGoalView): GoalState {
   return {
+    id: view.id,
+    revision: view.revision,
     objective: view.objective,
     phase: view.phase,
     activation: view.activation,
