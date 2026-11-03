@@ -21,7 +21,10 @@
  *      `session.turn started` —— 否则客户端会把它当成一条没有 turnId 的伪行；
  *   4. 子会话的两条路径（`DshChildSession.event` 实时 / `.replay` 重放）同样出这一行，
  *      且与根会话的行一致：子会话重放里 goal 轮次不能被静默丢掉；
- *   5. 同一事件重复喂给 builder 得到同一行（重开不叠行），不同轮次 id 不同。
+ *   5. 同一事件重复喂给 builder 得到同一行（重开不叠行），不同轮次 id 不同；
+ *   6. 非轮次的 goal 消息（round 0 / 负数 / 非整数）在实时、根重放、子会话实时与
+ *      子重放**四条真实路径**上都不出这一行，且每条路径都带一条合法轮次作正控
+ *      （判据一旦放宽成 `round >= 0`，这里必须变红）。
  *
  * 纯离线：假进程传输，不启动模型、不读凭据、不碰正式会话。编译产物落在私有的
  * `.dbg-goal-timeline` 目录（见 `harness/plugin-build.cjs`）。
@@ -365,6 +368,121 @@ const rows = (events) => events.filter((event) => event.type === "timeline.item"
   assert.equal(next.id, "tool:goal:round:goal-1:2", "不同轮次必须不同 id");
   assert.notEqual(next.id, first.id);
   console.log("PASS 同一轮幂等、不同轮次 id 不同");
+
+  // ---- 6. 非轮次 goal 消息：四条真实路径都不出这一行 -----------------------
+  //
+  // `isGoalRoundSource` 的正条件是「kind=goal 且 round 是正整数」：
+  //   - round 0 是 DSH 的 round-zero 归因，不是续跑轮次（round driver 自己的
+  //     `isGoalRound` 也是 `round > 0`，见 dsh-goal-round-driver lib/index.js:31-34）；
+  //   - 负数、非整数 round 都不是 DSH 会记录的轮次号。
+  // 判据放宽（例如把 `round > 0` 写成 `round >= 0`）时，下面四条路径都必须**不**出
+  // goal_round 行。每条路径都放一条合法 round 1 作正控：否则「整条路径根本没跑」也会
+  // 让否定断言假绿 —— 这正是这组夹具此前缺失、只有 `timeline-check` 兜住的那个缺口。
+  const NON_ROUNDS = [
+    { round: 0, why: "round 0 是 DSH 的 round-zero 归因，不是续跑轮次" },
+    { round: -1, why: "负数不是轮次号" },
+    { round: 1.5, why: "非整数不是轮次号" },
+  ];
+  const nonRoundEvent = (round, seq = 6) => ({
+    type: "user/message",
+    seq,
+    data: {
+      id: `msg-non-round-${String(round)}`,
+      source: { kind: "goal", goalId: GOAL_ID, revision: 1, round },
+      content: [{ type: "text", text: prompt }],
+    },
+  });
+  const roundIds = (list) => list.filter((event) => event.item.name === "goal_round").map((event) => event.item.id);
+  const roundList = JSON.stringify(NON_ROUNDS.map((fixture) => fixture.round));
+
+  // 6a. 实时（根会话的真实事件路径）。
+  {
+    const liveEvents = [];
+    const transport = new FakeProcess();
+    const sessionId = "goal-timeline-non-round-live";
+    const session = new DshSession(sessionOptions(liveEvents, transport, { sessionId }));
+    await session.open();
+    const handlers = transport.attached.get(sessionId);
+    assert.ok(handlers !== undefined, "会话没有把 handlers 挂到进程上，实时路径喂不进去");
+    for (const fixture of NON_ROUNDS) {
+      handlers.onEvent({ sessionId, event: nonRoundEvent(fixture.round) });
+    }
+    assert.deepEqual(roundIds(rows(liveEvents)), [], `实时路径为 ${roundList} 出了 goal_round 行`);
+    assert.ok(
+      !rows(liveEvents).some((event) => event.item.type === "user_message"),
+      "实时路径不该把 goal 消息出成 user_message 行",
+    );
+    handlers.onEvent({ sessionId, event: goalRoundEvent });
+    assert.deepEqual(roundIds(rows(liveEvents)), [ROUND_ID], "正控：同一实时路径上合法 round 1 必须出行");
+    console.log("PASS 实时：round 0/负数/非整数都不出行，合法轮次仍出行（正控）");
+  }
+
+  // 6b. 根会话重放（同一段历史里三个非轮次 + 一条合法轮次）。
+  {
+    const history = [
+      { type: "turn/start", seq: 1, time: at(1), data: { turn: 1 } },
+      {
+        type: "user/message",
+        seq: 2,
+        time: at(2),
+        data: { id: "msg-human", source: { kind: "user" }, content: [{ type: "text", text: "开始吧" }] },
+      },
+      { type: "turn/end", seq: 3, time: at(3), data: { turn: 1, reason: { kind: "completed" } } },
+      { type: "turn/start", seq: 4, time: at(4), data: { turn: 2 } },
+      ...NON_ROUNDS.map((fixture, index) => ({
+        ...nonRoundEvent(fixture.round, 5 + index),
+        time: at(5 + index),
+      })),
+      { ...goalRoundEvent, seq: 8, time: at(8) },
+      {
+        type: "assistant/message",
+        seq: 9,
+        time: at(9),
+        data: { turn: 2, step: 1, message: { id: "assistant-2", content: [{ type: "text", text: "ROUND1_OK" }] } },
+      },
+      { type: "turn/end", seq: 10, time: at(10), data: { turn: 2, reason: { kind: "completed" } } },
+    ];
+    const replayEvents = [];
+    const transport = new FakeProcess();
+    transport.historyResponse = { available: true, events: history };
+    const session = new DshSession(
+      sessionOptions(replayEvents, transport, { sessionId: "goal-timeline-non-round-replay" }),
+    );
+    await session.open();
+    await session.replayHistory();
+    assert.deepEqual(roundIds(rows(replayEvents)), [ROUND_ID], `根重放为 ${roundList} 出了 goal_round 行`);
+    assert.ok(
+      !rows(replayEvents).some(
+        (event) => event.item.type === "user_message" && JSON.stringify(event.item.text).includes("<goal_round>"),
+      ),
+      "根重放不该把 goal 消息出成 <goal_round> 原文行",
+    );
+    console.log("PASS 根重放：round 0/负数/非整数都不出行，合法轮次仍出行（正控）");
+  }
+
+  // 6c. 子会话重放 + 6d. 子会话实时（两条路径共用同一 builder，但入口不同）。
+  {
+    const history = [
+      { type: "turn/start", seq: 1, time: at(1), data: { turn: 1 } },
+      ...NON_ROUNDS.map((fixture, index) => ({
+        ...nonRoundEvent(fixture.round, 2 + index),
+        time: at(2 + index),
+      })),
+      { ...goalRoundEvent, seq: 5, time: at(5) },
+      { type: "turn/end", seq: 6, time: at(6), data: { turn: 1, reason: { kind: "completed" } } },
+    ];
+    const replayEvents = [];
+    new DshChildSession(childOptions(replayEvents)).replay(history);
+    assert.deepEqual(roundIds(rows(replayEvents)), [ROUND_ID], `子会话重放为 ${roundList} 出了 goal_round 行`);
+
+    const liveEvents = [];
+    const liveChild = new DshChildSession(childOptions(liveEvents));
+    for (const fixture of NON_ROUNDS) liveChild.event({ type: "user/message", data: nonRoundEvent(fixture.round).data });
+    assert.deepEqual(roundIds(rows(liveEvents)), [], `子会话实时为 ${roundList} 出了 goal_round 行`);
+    liveChild.event({ type: "user/message", data: goalRoundEvent.data });
+    assert.deepEqual(roundIds(rows(liveEvents)), [ROUND_ID], "正控：子会话实时路径上合法 round 1 必须出行");
+    console.log("PASS 子会话重放/实时：round 0/负数/非整数都不出行，合法轮次仍出行（正控）");
+  }
 
   console.log("\ngoal timeline checks passed");
 })().catch((error) => {
