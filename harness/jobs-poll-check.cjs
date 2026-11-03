@@ -526,6 +526,12 @@ async function runControllerChecks() {
           calls.removed.push([agentId, reason, error === undefined ? undefined : error.code]);
         },
         publishState(agentId, state) {
+          // A scenario may need the publish itself to fail (the controller's
+          // top-level `onError` branch is only reachable when a tick rejects).
+          if (overrides.publishState !== undefined) {
+            overrides.publishState(agentId, state, calls);
+            return;
+          }
           calls.states.push([agentId, state]);
         },
         onError(message, error) {
@@ -867,6 +873,81 @@ async function runControllerChecks() {
 
 
   /* ---------------------------------------------------------------------------- */
+  /* The jobs pill's own copy, preserved across the shared-controller refactor     */
+  /* ---------------------------------------------------------------------------- */
+
+  // The controller was extracted from this pill and is now shared with the goal
+  // pill, which means its three diagnostics had to become injected strings. The
+  // jobs pill's wording is what the user already sees (and what a log search for
+  // "jobs pill" finds), so it must be **verbatim** what it was before the
+  // refactor — a genericised sentence would be a silent copy change on a surface
+  // nobody asked to change.
+  console.log("\nthe jobs pill's copy survives the shared controller");
+  {
+    // 1. The fallback sentence a failed read carries when the runtime sent none.
+    //    (Production always sends a message; this is the defensive path, pinned
+    //    because it is user-visible copy all the same.)
+    const harness = createPollerHarness({
+      readJobs: async () => ({ available: false }),
+      random: () => 0,
+    });
+    await harness.poller.applySnapshot({
+      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    await harness.clock.advance(0);
+    equal(
+      "a failed read with no runtime message uses the jobs pill's fallback sentence",
+      harness.calls.states[0]?.[1]?.error,
+      "the DSH runtime could not list this session's jobs",
+    );
+    harness.poller.dispose();
+  }
+  {
+    // 2. The poll-failure log line. Reachable when a tick rejects, i.e. when the
+    //    publish itself throws (the read path is caught inside the tick).
+    const harness = createPollerHarness({
+      readJobs: async () => ({ available: true, jobs: [] }),
+      publishState() {
+        throw new Error("store exploded");
+      },
+      random: () => 0,
+    });
+    await harness.poller.applySnapshot({
+      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    await harness.clock.advance(0);
+    equal(
+      "a failed poll reports the jobs pill's own prefix",
+      harness.calls.errors[0]?.[0],
+      "jobs pill poll failed for a",
+    );
+    harness.poller.dispose();
+  }
+  {
+    // 3. The pagination-cap log line.
+    let pages = 0;
+    const harness = createPollerHarness({
+      listAgentPage: async () => {
+        pages += 1;
+        return {
+          entries: [],
+          pageInfo: { hasMore: true, nextCursor: `cursor-${String(pages)}` },
+        };
+      },
+    });
+    await harness.poller.applySnapshot({
+      entries: [],
+      pageInfo: { hasMore: true, nextCursor: "cursor-0" },
+    });
+    equal(
+      "the pagination cap names the jobs pill",
+      harness.calls.errors[0]?.[0],
+      "agent directory pagination did not terminate; the jobs pill sees only the first pages",
+    );
+    harness.poller.dispose();
+  }
 }
 
 runControllerChecks()

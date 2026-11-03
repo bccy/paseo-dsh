@@ -22,10 +22,12 @@ import type {
   ProviderUsage,
 } from "@getpaseo/plugin/server/provider";
 import type { JsonValue } from "./dsh-process";
+import { goalCommandArguments, type GoalAction } from "../shared/goal";
 import {
   DshProcess,
   type DshAnswer,
   type DshChildOpened,
+  type DshGoal,
   type DshJobs,
   type DshMcpServer,
   type DshPermissionPreset,
@@ -1006,6 +1008,76 @@ export class DshSession {
       return await process.jobs(this.#dshSessionId);
     } catch (error) {
       return { available: false, error: { message: messageOf(error), code: "rpc_failed" } };
+    }
+  }
+
+  /**
+   * The goal this session currently owns, for the composer's goal pill.
+   *
+   * Not cached or coalesced, for the same reason as {@link jobs}: a poll wants a
+   * point-in-time view, and the bridge rebuilds it per call. Unlike jobs, this
+   * read is the only place the pill can see `activation` — the durable goal
+   * projection carries the phase but not whether this live process will
+   * auto-continue, and showing `active` for a disarmed goal is the silent
+   * degradation the pill exists to fix.
+   *
+   * **A closed session answers a transient `session_missing`, not `null`.** A
+   * session that has no goal is `true` + `null` — an accurate "it has none". A
+   * *closed* session is different: it is not "no goal", it is "the thing that
+   * would have told us is gone". Reaching this branch needs a caller that already
+   * holds the reference and calls `goal()` in the same tick as the close, because
+   * all three close paths delete the session before awaiting it. It returns
+   * rather than throws: a throw would surface as a failed request for something
+   * the user already closed.
+   */
+  async goal(): Promise<DshGoal> {
+    if (this.#closed) return { available: false, error: { code: "session_missing" } };
+    const process = this.#process;
+    if (process === undefined) return { available: false, error: { code: "session_missing" } };
+    try {
+      return await process.goal(this.#dshSessionId);
+    } catch (error) {
+      return { available: false, error: { message: messageOf(error), code: "rpc_failed" } };
+    }
+  }
+
+  /**
+   * Run one `/goal` control action through the runtime's command path.
+   *
+   * The path is the one the slash menu already uses — bridge
+   * `paseo/command/run` → DSH's `commands.execute` → `dsh-command-goal` — which
+   * is what makes the buttons work while a turn is running: a hand-typed
+   * `/goal …` during a turn is steered into the model as plain text (the host
+   * intercepts commands only when idle), while this call goes straight to the
+   * command registry. DESIGN §1.2/§2 and the P3 probe both rely on that.
+   *
+   * DSH's answer is returned **verbatim**, including a refusal: a
+   * paused-at-round-limit goal rejects `resume`, and reporting that as success
+   * would leave the user believing it is running. The argument grammar is
+   * DSH's own (`dsh-command-goal`'s `parseGoalCommand`); an `edit` with no
+   * objective is refused here, before a command is sent.
+   *
+   * @param action - one of `pause` / `resume` / `clear` / `edit`.
+   * @param objective - the replacement objective, required by `edit`.
+   */
+  async controlGoal(
+    action: GoalAction,
+    objective?: string,
+  ): Promise<{ ok: true; message: string } | { ok: false; error: string }> {
+    const args = goalCommandArguments(action, objective);
+    if (!args.ok) return { ok: false, error: args.error };
+    const process = this.#process;
+    if (this.#closed || process === undefined) {
+      return { ok: false, error: "this session is closed; reopen it before controlling its goal" };
+    }
+    try {
+      const result = await process.runCommand(this.#dshSessionId, "goal", args.args);
+      if (result.kind === "error") {
+        return { ok: false, error: result.text ?? "the goal command was rejected" };
+      }
+      return { ok: true, message: result.text ?? "" };
+    } catch (error) {
+      return { ok: false, error: messageOf(error) };
     }
   }
 

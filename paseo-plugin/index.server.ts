@@ -1,9 +1,10 @@
 import type { PluginHandlerContext, PluginServerContext } from "@getpaseo/plugin/server";
+import { goalControl, goalCurrent } from "./shared/goal";
 import { jobsList } from "./shared/jobs";
 import { rewindNoticeArm } from "./shared/rewind-notice";
 import { ensurePaseoProfile } from "./server/bootstrap";
 import { capturePaseo } from "./server/rewind-notice-append";
-import { createDshProvider, readAgentJobs } from "./server/provider";
+import { controlAgentGoal, createDshProvider, readAgentGoal, readAgentJobs } from "./server/provider";
 
 /**
  * The lifecycle events the server half listens on **only** to capture the Paseo
@@ -32,7 +33,7 @@ const CAPTURE_HOOKS = [
 
 /**
  * Register the DeepSeek Harness provider, provisioning the DSH profile it needs,
- * and the two RPCs the client half asks through.
+ * and the RPCs the client half asks through.
  *
  * Paseo's plugin installer runs no install scripts, so this plugin is
  * self-sufficient: on load it writes `$DSH_HOME/profiles/<name>` and the bridge
@@ -44,12 +45,12 @@ const CAPTURE_HOOKS = [
  * not name it leaves a half-written or stale bridge looking like a working
  * install.
  *
- * The jobs RPC exists because the pill lives in the app's client bundle and the
- * jobs live in a DSH child process: the client cannot reach `ctx.jobs`, and the
- * provider protocol has no request shape for "background jobs of this agent"
- * (that would be a Paseo protocol extension, not something a plugin may invent).
- * A plugin RPC is the supported channel for exactly this: daemon-side work the
- * client asks for.
+ * The jobs and goal RPCs exist because their pills live in the app's client
+ * bundle while the data lives in a DSH child process: the client cannot reach
+ * `ctx.jobs` or `ctx.goals`, and the provider protocol has no request shape for
+ * "background jobs / current goal of this agent" (that would be a Paseo protocol
+ * extension, not something a plugin may invent). A plugin RPC is the supported
+ * channel for exactly this: daemon-side work the client asks for.
  *
  * The rewind-notice arm RPC carries no answer at all. It exists because the
  * handle can only be captured from a callback, and after a daemon restart the
@@ -93,6 +94,33 @@ export default function contribute(server: PluginServerContext) {
       jobs: result.jobs,
       ...(result.error === undefined ? {} : { error: result.error }),
     };
+  });
+
+  // The goal pill's two RPCs, mirroring the jobs pair. DSH owns the goal state
+  // (there is no Paseo goal protocol and the plugin declares no capability for
+  // it), so the client polls the daemon side for it — a plugin RPC is the
+  // supported channel for daemon-side reads. `goal.control` exists because a
+  // hand-typed `/goal …` during a running turn is steered into the model as
+  // plain text; the pill's buttons must reach the command registry instead.
+  server.handle(goalCurrent, async ({ agentId }, context) => {
+    capture(context);
+    const result = await readAgentGoal(agentId);
+    return {
+      available: result.available,
+      goal: result.goal,
+      ...(result.error === undefined ? {} : { error: result.error }),
+    };
+  });
+
+  server.handle(goalControl, async ({ agentId, action, objective }, context) => {
+    capture(context);
+    const result = await controlAgentGoal(agentId, action, objective);
+    // DSH's own answer travels verbatim in both directions: a refused command
+    // (a paused goal at its round cap rejects `resume`) must reach the popover as
+    // the runtime's sentence, never as a success.
+    return result.ok
+      ? { ok: true, message: result.message }
+      : { ok: false, error: result.error };
   });
 
   server.handle(rewindNoticeArm, (_input, context) => {

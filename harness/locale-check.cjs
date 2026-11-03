@@ -293,6 +293,174 @@ console.log("the jobs pill's copy is covered in both languages");
   }
 }
 
+console.log("the goal pill's copy is covered in both languages");
+{
+  // Same reason as the jobs table above: `goal` is an **object**, so the
+  // `scalarKeys` loop skips it and it is not one of the plain string tables. A
+  // missing entry here would render as an empty pill label or a raw phase name,
+  // which is exactly the silent downgrade the copy tables exist to prevent.
+  const en = allText().en.goal;
+  const zh = allText()["zh-CN"].goal;
+  check("both languages ship a goal table", en !== undefined && zh !== undefined);
+
+  equal("goal keys match", Object.keys(en).sort(), Object.keys(zh).sort());
+  for (const key of [
+    "title",
+    "roundsLabel",
+    "notRunning",
+    "paused",
+    "blocked",
+    "statuses",
+    "rounds",
+    "blocker",
+    "disarmedHint",
+    "actions",
+    "editPlaceholder",
+    "busy",
+    "controlFailed",
+    "unavailable",
+    "noGoal",
+    "footnote",
+  ]) {
+    check(`goal.${key} exists in both languages`, en[key] !== undefined && zh[key] !== undefined);
+  }
+
+  // **DESIGN §2's four labels, verbatim.** The whole point of the pill is that
+  // these four states are told apart; a "nicer" wording that collapses
+  // `notRunning` into `active` would be the silent degradation the surface was
+  // built to expose, and a translation that says something else is a red check.
+  check("goal.roundsLabel(3,10) is `Goal 3/10` (en)", en.roundsLabel(3, 10) === "Goal 3/10", JSON.stringify(en.roundsLabel(3, 10)));
+  check("goal.roundsLabel(3,10) is `目标 3/10` (zh-CN)", zh.roundsLabel(3, 10) === "目标 3/10", JSON.stringify(zh.roundsLabel(3, 10)));
+  check("goal.notRunning is `Goal not running` (en)", en.notRunning === "Goal not running", JSON.stringify(en.notRunning));
+  check("goal.notRunning is `目标未在续跑` (zh-CN)", zh.notRunning === "目标未在续跑", JSON.stringify(zh.notRunning));
+  check("goal.paused is `Goal paused` (en)", en.paused === "Goal paused", JSON.stringify(en.paused));
+  check("goal.paused is `目标已暂停` (zh-CN)", zh.paused === "目标已暂停", JSON.stringify(zh.paused));
+  check("goal.blocked is `Goal blocked` (en)", en.blocked === "Goal blocked", JSON.stringify(en.blocked));
+  check("goal.blocked is `目标受阻` (zh-CN)", zh.blocked === "目标受阻", JSON.stringify(zh.blocked));
+
+  // The footer is product copy fixed by DESIGN §2: sending a message does not
+  // interrupt the goal, pressing stop pauses it. Asserted verbatim in Chinese
+  // (the design's own sentence); English must say the same thing without being
+  // a copy of the Chinese one.
+  const FOOTNOTE_ZH = "运行中可以直接发消息，会插入当前轮次，不会打断目标；点停止会暂停目标。";
+  check("goal.footnote is the DESIGN §2 sentence (zh-CN)", zh.footnote === FOOTNOTE_ZH, JSON.stringify(zh.footnote));
+  check(
+    "goal.footnote says messages do not interrupt and stop pauses (en)",
+    en.footnote.includes("does not interrupt") && en.footnote.toLowerCase().includes("stop"),
+    JSON.stringify(en.footnote),
+  );
+
+  // The plain strings.
+  for (const locale of LOCALES) {
+    const table = allText()[locale].goal;
+    for (const key of [
+      "title",
+      "notRunning",
+      "paused",
+      "blocked",
+      "disarmedHint",
+      "editPlaceholder",
+      "busy",
+      "controlFailed",
+      "unavailable",
+      "noGoal",
+      "footnote",
+    ]) {
+      check(
+        `goal.${key} is a non-empty string in ${locale}`,
+        typeof table[key] === "string" && table[key].trim() !== "",
+        JSON.stringify(table[key]),
+      );
+    }
+  }
+
+  // The English column must not be a copy of the Chinese one.
+  const copied = [
+    "title",
+    "notRunning",
+    "paused",
+    "blocked",
+    "disarmedHint",
+    "editPlaceholder",
+    "busy",
+    "controlFailed",
+    "unavailable",
+    "noGoal",
+    "footnote",
+  ].filter((key) => en[key] === zh[key]);
+  equal("the English goal copy is not the Chinese copy", copied, []);
+
+  // The function-valued entries must return real text in both languages.
+  for (const locale of LOCALES) {
+    const table = allText()[locale].goal;
+    const roundsLabel = table.roundsLabel(3, 10);
+    const rounds = table.rounds(3, 10);
+    const blocker = table.blocker("round-limit", "limit reached");
+    for (const [what, value] of [
+      ["roundsLabel", roundsLabel],
+      ["rounds", rounds],
+      ["blocker", blocker],
+    ]) {
+      check(
+        `goal.${what} is a non-empty string in ${locale}`,
+        typeof value === "string" && value.trim() !== "",
+        JSON.stringify(value),
+      );
+    }
+    check(`goal.rounds carries the count in ${locale}`, rounds.includes("3") && rounds.includes("10"), JSON.stringify(rounds));
+    check(
+      `goal.blocker carries the code and the sentence in ${locale}`,
+      blocker.includes("round-limit") && blocker.includes("limit reached"),
+      JSON.stringify(blocker),
+    );
+  }
+
+  // The control buttons. `confirmClear` must differ from `clear`: if it were the
+  // same string, the two-click confirmation would look like the same button
+  // pressed twice and the user could not tell the destructive click is armed.
+  equal("goal.actions keys match", Object.keys(en.actions).sort(), Object.keys(zh.actions).sort());
+  for (const locale of LOCALES) {
+    const table = allText()[locale].goal.actions;
+    for (const key of ["pause", "resume", "edit", "clear", "confirmClear"]) {
+      check(
+        `goal.actions.${key} is a non-empty string in ${locale}`,
+        typeof table[key] === "string" && table[key].trim() !== "",
+        JSON.stringify(table[key]),
+      );
+    }
+    check(
+      `goal.actions.confirmClear differs from clear in ${locale}`,
+      table.confirmClear !== table.clear,
+      JSON.stringify([table.clear, table.confirmClear]),
+    );
+  }
+  const copiedActions = Object.keys(en.actions).filter((key) => en.actions[key] === zh.actions[key]);
+  equal("the English button copy is not the Chinese copy", copiedActions, []);
+
+  // **`statuses` must cover exactly the phases `shared/goal.ts` declares.** Read
+  // out of that file with a regex, not required: it imports zod and the plugin
+  // package. A key missing here falls back to the wire name on screen.
+  const sharedGoalPath =
+    process.env.SHARED_GOAL ?? path.resolve(__dirname, "..", "..", "paseo-plugin", "shared", "goal.ts");
+  check("shared/goal.ts is readable", fs.existsSync(sharedGoalPath), sharedGoalPath);
+  const declaration = fs.existsSync(sharedGoalPath)
+    ? /export const GOAL_PHASES = \[([^\]]*)\] as const;/.exec(fs.readFileSync(sharedGoalPath, "utf8"))
+    : null;
+  const phases =
+    declaration === null ? undefined : [...declaration[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+  check(
+    "GOAL_PHASES is readable out of shared/goal.ts",
+    phases !== undefined && phases.length > 0,
+    `no array literal in ${sharedGoalPath}`,
+  );
+  if (phases !== undefined) {
+    equal("goal.statuses keys are exactly GOAL_PHASES (en)", Object.keys(en.statuses).sort(), [...phases].sort());
+    equal("goal.statuses keys are exactly GOAL_PHASES (zh-CN)", Object.keys(zh.statuses).sort(), [...phases].sort());
+    const sameStatuses = phases.filter((phase) => en.statuses[phase] === zh.statuses[phase]);
+    equal("the English status words are not the Chinese ones", sameStatuses, []);
+  }
+}
+
 console.log("every tool that draws an icon can also name itself");
 {
   // An icon with no label renders the row as `FileOutput  cordis_define` — the

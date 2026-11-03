@@ -25,6 +25,7 @@ import {
   DshProcess,
   validateMcpServers,
   type DshCatalog,
+  type DshGoalView,
   type DshJob,
   type DshRevertResult,
   type DshRoute,
@@ -34,6 +35,7 @@ import { rewindCanaryNotice } from "./rewind-canary";
 import { beginRewindReport, fallbackNoticeDescription, type RewindReportFallback } from "./rewind-notice-append";
 import { effortLabel, LOCALE, UI } from "./locale";
 import { rewindSuccessText, type RewindTone } from "../shared/rewind-notice";
+import type { GoalAction, GoalErrorCode, GoalState } from "../shared/goal";
 import type { JobErrorCode } from "../shared/jobs";
 import { PROVIDER_ID } from "../shared/provider";
 
@@ -2100,6 +2102,101 @@ export async function readAgentJobs(agentId: string): Promise<{
   // between "we looked and found none" and "we could not look"; this branch is
   // the former.
   return { available: true, jobs: [] };
+}
+
+/**
+ * One goal as the shared contract carries it.
+ *
+ * The bridge answers DSH's whole `GoalView`; the pill needs the five fields it
+ * draws plus the blocker, and nothing else. `id`/`revision`/timestamps are
+ * compare-and-set plumbing — carrying them would invite a client to compare
+ * revisions it cannot act on. Copied field by field rather than spread, so a
+ * field the bridge adds later cannot leak into the RPC answer by accident.
+ */
+function goalStateOf(view: DshGoalView): GoalState {
+  return {
+    objective: view.objective,
+    phase: view.phase,
+    activation: view.activation,
+    roundsStarted: view.roundsStarted,
+    maxGoalRounds: view.maxGoalRounds,
+    ...(view.blockedReason === undefined
+      ? {}
+      : { blockedReason: { code: view.blockedReason.code, message: view.blockedReason.message } }),
+  };
+}
+
+/**
+ * Read one agent's current goal through whichever connection serves it.
+ *
+ * "No connection / no session" is not an error — same rule as
+ * {@link readAgentJobs}: this process holds no DSH session for the agent, so it
+ * has no goal to report. **This is an accurate empty answer, not a failed
+ * read**, which is why it is `available: true` with a `null` goal. The pill is
+ * hidden for that answer, which is right: an agent whose session has not been
+ * opened has no goal to show, and an error pill there would be noise about a
+ * condition the user cannot act on.
+ *
+ * A session that *is* open reports its own read failure instead of `null`,
+ * which is what keeps an unreadable goal from being drawn as "no goal".
+ *
+ * @param agentId - Paseo's agent id, as the pill knows it.
+ */
+export async function readAgentGoal(agentId: string): Promise<{
+  available: boolean;
+  goal: GoalState | null;
+  error?: { message: string; code?: GoalErrorCode };
+}> {
+  for (const connection of CONNECTIONS) {
+    const session = connection.sessionForAgent(agentId);
+    if (session === undefined) continue;
+    const result = await session.goal();
+    if (!result.available) {
+      return {
+        available: false,
+        goal: null,
+        error: {
+          message: result.error?.message ?? "the DSH runtime could not read this session's goal",
+          ...(result.error?.code === undefined ? {} : { code: result.error.code }),
+        },
+      };
+    }
+    return {
+      available: true,
+      goal: result.goal === undefined || result.goal === null ? null : goalStateOf(result.goal),
+    };
+  }
+  return { available: true, goal: null };
+}
+
+/**
+ * Run one `/goal` control action for the agent's open session.
+ *
+ * The command path itself is `DshSession.controlGoal`'s (bridge
+ * `paseo/command/run`); this function only finds the session, exactly like the
+ * jobs read. An agent with no open session cannot be controlled: the command
+ * needs a live DSH agent, and inventing a "queued" answer would claim an action
+ * that never ran. The failure is a value, not a throw, because the popover shows
+ * it in place.
+ *
+ * @param agentId - Paseo's agent id, as the pill knows it.
+ * @param action - one of `pause` / `resume` / `clear` / `edit`.
+ * @param objective - the replacement objective, required by `edit`.
+ */
+export async function controlAgentGoal(
+  agentId: string,
+  action: GoalAction,
+  objective?: string,
+): Promise<{ ok: true; message: string } | { ok: false; error: string }> {
+  for (const connection of CONNECTIONS) {
+    const session = connection.sessionForAgent(agentId);
+    if (session === undefined) continue;
+    return await session.controlGoal(action, objective);
+  }
+  return {
+    ok: false,
+    error: "no DSH session is open for this agent; send it a message first, then control its goal",
+  };
 }
 
 /** The provider registration Paseo installs for `dsh --profile paseo`. */

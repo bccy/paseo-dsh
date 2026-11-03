@@ -128,6 +128,8 @@ export interface UiText {
   truncated: string;
   /** Copy for the composer's background-jobs pill and its popover. */
   jobs: JobsText;
+  /** Copy for the composer's goal pill and its popover. */
+  goal: GoalText;
 }
 
 /**
@@ -166,6 +168,74 @@ export interface JobsText {
   settledLabel: string;
   /** Popover line when the runtime could not read the registry — never "none". */
   unavailable: string;
+}
+
+/**
+ * The composer's goal pill.
+ *
+ * The pill is a **state indicator**, not a live counter like the jobs pill: it
+ * stays visible while a goal exists and is not complete, because the whole point
+ * is that the user can pause/resume/clear it. The label therefore distinguishes
+ * four states (DESIGN §2): auto-continuing, active-but-not-continuing, paused,
+ * blocked. The last three are warnings: a goal the user believes is running but
+ * is not is the silent degradation this surface exists to fix.
+ *
+ * `statuses` is keyed by DSH's durable `GoalPhase`, and `harness/locale-check.cjs`
+ * asserts the table covers exactly the phases `shared/goal.ts` declares, so a
+ * phase DSH adds later cannot fall through to a raw English word.
+ */
+export interface GoalText {
+  /** The button's title and the popover's heading: the neutral noun. */
+  title: string;
+  /** Trigger label while the goal is auto-continuing; carries the round count. */
+  roundsLabel: (started: number, max: number) => string;
+  /** Trigger label when the goal is active but this process will not continue it. */
+  notRunning: string;
+  /** Trigger label when the goal is paused. */
+  paused: string;
+  /** Trigger label when the goal is blocked. */
+  blocked: string;
+  /** The popover's status line, per durable phase. */
+  statuses: Record<string, string>;
+  /** The popover's round line: how many rounds were admitted, out of the cap. */
+  rounds: (started: number, max: number) => string;
+  /** The popover's blocker line: DSH's machine code and its sentence. */
+  blocker: (code: string, message: string) => string;
+  /**
+   * The one-line explanation for `active + disarmed`.
+   *
+   * Without it the pill says "not running" and the user has no idea why, or
+   * what the 继续 button does. DESIGN §2 fixes the meaning; the wording here is
+   * the explanation of that state.
+   */
+  disarmedHint: string;
+  /** The popover's control buttons. */
+  actions: {
+    pause: string;
+    resume: string;
+    edit: string;
+    clear: string;
+    /** The 清除 button's label after its first click. */
+    confirmClear: string;
+  };
+  /** Placeholder of the edit field the 编辑 button reveals. */
+  editPlaceholder: string;
+  /** Shown while one control action is in flight. */
+  busy: string;
+  /** Fallback when a control action failed without the runtime's own sentence. */
+  controlFailed: string;
+  /** Popover line when the goal could not be read at all. */
+  unavailable: string;
+  /** Popover line when the goal was cleared while the panel was open. */
+  noGoal: string;
+  /**
+   * The fixed footer explaining how sending a message relates to a running goal.
+   *
+   * This is the product answer the user asked for (DESIGN §0/§2): a message sent
+   * while a goal round runs is inserted into that round and does not interrupt
+   * it, while pressing stop does pause the goal.
+   */
+  footnote: string;
 }
 
 const TEXT: Record<Locale, UiText> = {
@@ -400,6 +470,39 @@ const TEXT: Record<Locale, UiText> = {
       settledLabel: "Finished",
       unavailable: "Could not read this session's background tasks.",
     },
+    goal: {
+      title: "Goal",
+      // "Goal 3/10": the same shape DSH's own `/goal` status line uses for
+      // rounds, so the pill and the command output read alike.
+      roundsLabel: (started, max) => `Goal ${String(started)}/${String(max)}`,
+      notRunning: "Goal not running",
+      paused: "Goal paused",
+      blocked: "Goal blocked",
+      statuses: {
+        active: "Active",
+        paused: "Paused",
+        blocked: "Blocked",
+        complete: "Complete",
+      },
+      rounds: (started, max) => `Rounds ${String(started)}/${String(max)}`,
+      blocker: (code, message) => `Blocker: ${code} — ${message}`,
+      disarmedHint:
+        "Auto-continue stops after a reopen or a process restart. Press Continue to resume it.",
+      actions: {
+        pause: "Pause",
+        resume: "Continue",
+        edit: "Edit",
+        clear: "Clear",
+        confirmClear: "Press again to clear",
+      },
+      editPlaceholder: "New objective",
+      busy: "Working…",
+      controlFailed: "The goal command failed.",
+      unavailable: "Could not read this session's goal.",
+      noGoal: "No goal is set.",
+      footnote:
+        "You can send a message while the goal runs: it is inserted into the current round and does not interrupt the goal. Pressing stop pauses the goal.",
+    },
   },
   "zh-CN": {
     toolLabels: {
@@ -613,6 +716,38 @@ const TEXT: Record<Locale, UiText> = {
       // 数量不放这里 —— 它挂在行尾那个弱化槽里（宿主 rowTrailing 的位置）。
       settledLabel: "已完成",
       unavailable: "读不到本会话的后台任务。",
+    },
+    goal: {
+      title: "目标",
+      // 与 DSH 自己的 `/goal` 状态行同一个形状（轮数/上限），命令输出与 pill 读起来一致。
+      roundsLabel: (started, max) => `目标 ${String(started)}/${String(max)}`,
+      notRunning: "目标未在续跑",
+      paused: "目标已暂停",
+      blocked: "目标受阻",
+      statuses: {
+        active: "进行中",
+        paused: "已暂停",
+        blocked: "受阻",
+        complete: "已完成",
+      },
+      rounds: (started, max) => `已用轮数 ${String(started)}/${String(max)}`,
+      blocker: (code, message) => `受阻原因：${code} — ${message}`,
+      // DESIGN §2 的原文：把「为什么没在续跑、怎么恢复」说清楚。
+      disarmedHint: "重开会话或进程重启后，自动续跑会停止，点「继续」恢复。",
+      actions: {
+        pause: "暂停",
+        resume: "继续",
+        edit: "编辑",
+        clear: "清除",
+        confirmClear: "再点一次确认清除",
+      },
+      editPlaceholder: "新的目标内容",
+      busy: "处理中…",
+      controlFailed: "目标命令执行失败。",
+      unavailable: "读不到本会话的目标。",
+      noGoal: "当前没有目标。",
+      footnote:
+        "运行中可以直接发消息，会插入当前轮次，不会打断目标；点停止会暂停目标。",
     },
   },
 };

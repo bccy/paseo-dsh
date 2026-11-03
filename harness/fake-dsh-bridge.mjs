@@ -100,6 +100,14 @@
  * `deleted`, so the success notice's counts are asserted from real arrays rather
  * than from a number the fake also has to invent.
  *
+ * Two methods are scripted through JSON files because the goal pill's checks need
+ * to steer them between assertions while the shared child stays alive:
+ * `DSH_FAKE_GOAL_FILE` drives `paseo/goal` (`{goal: <view>|null}`,
+ * `{unknownMethod: true}`, `{missingService: true}`, `{throw: "<message>"}`) and
+ * `DSH_FAKE_COMMAND_FILE` drives `paseo/command/run`
+ * (`{kind: "success"|"error", text}`). See {@link goalScript} and
+ * {@link commandScript} for the exact shapes.
+ *
  * ## The per-session `initialize` gate
  *
  * `session/prompt` refuses a session this process never saw an `initialize` for,
@@ -149,6 +157,76 @@ function currentMode() {
 }
 /** Resolved per use — see {@link currentMode}. */
 const mode = () => currentMode();
+
+/**
+ * Read one JSON script file, re-read on every request.
+ *
+ * The same problem `DSH_FAKE_MODE_FILE` solves: the plugin keeps one shared
+ * child, so a test cannot change the child's environment between assertions. A
+ * file is the channel, and a missing or unparseable file means "no script" so a
+ * half-written fixture degrades to the default instead of crashing the child.
+ */
+function scriptFile(envName) {
+  const file = process.env[envName];
+  if (file === undefined || file === "") return undefined;
+  try {
+    return JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The bridge's "this profile composes no goal service" refusal, verbatim.
+ *
+ * Copied from the real bridge (`dsh-bridge/lib/server.js:3190`, `goal()`'s
+ * `if (goals === undefined)` branch) rather than composed here: the plugin's
+ * `goal_unavailable` grading matches the sentence, so a stand-in that invented
+ * its own wording would let a contract drift pass this harness.
+ * `harness/goal-server-check.cjs` asserts this constant equals the bridge
+ * source, so the copy cannot go stale silently.
+ */
+const GOAL_SERVICE_MISSING_MESSAGE = "this DSH runtime composes no goal service";
+
+/**
+ * The scripted `paseo/goal` answer.
+ *
+ * `paseo/goal` is the bridge method the goal pill polls (DESIGN §1.1); this
+ * stand-in answers the shape the real bridge does — `{goal: GoalView|null}` —
+ * and can be steered through the failure shapes the plugin's grading depends on:
+ *
+ * - `{goal: <view>|null}`: the service's answer, passed through;
+ * - `{unknownMethod: true}`: the bridge does not implement the method at all —
+ *   thrown with the **real** bridge's wording, because the plugin's
+ *   `bridge_too_old` classification matches that prefix and this stand-in's
+ *   generic default says "fake bridge: unknown method", which is not the
+ *   production sentence;
+ * - `{missingService: true}`: the profile composes no goal service — thrown with
+ *   {@link GOAL_SERVICE_MISSING_MESSAGE}, the real bridge's sentence, which is
+ *   what maps to `goal_unavailable`;
+ * - `{throw: "<message>"}`: any other thrown failure (a transport death, a
+ *   disposal race), for the transient grading.
+ *
+ * Unset or unreadable answers `{goal: null}` — an accurate "no goal", which is
+ * what a session that never created one returns.
+ */
+function goalScript() {
+  return scriptFile("DSH_FAKE_GOAL_FILE");
+}
+
+/**
+ * The scripted `paseo/command/run` answer.
+ *
+ * The goal pill's control buttons run `/goal pause|resume|clear|edit` through
+ * this method. A scripted answer is how a check drives DSH's refusal shape
+ * (`{kind: "error", text: "The goal command is not valid for the current
+ * state…"}`) without a real runtime; unset keeps the historical success reply
+ * the steer scenario already relies on.
+ */
+function commandScript() {
+  return scriptFile("DSH_FAKE_COMMAND_FILE");
+}
+
 const LOG_PATH = process.env.DSH_FAKE_LOG;
 const out = (frame) => process.stdout.write(`${JSON.stringify(frame)}\n`);
 const notify = (method, params) => out({ jsonrpc: "2.0", method, params });
@@ -835,8 +913,29 @@ async function handle(method, params, id) {
       if (mode() === "steer") return { commands: [{ name: "goal", description: "read the goal state", kind: "command" }] };
       return { commands: [] };
     }
-    case "paseo/command/run":
-      return { kind: "success", text: "goal: none" };
+    case "paseo/command/run": {
+      // The goal pill's control buttons land here (`/goal pause|resume|clear|
+      // edit`). A scripted answer lets a check drive DSH's refusal shape; the
+      // unset default is the success reply the steer scenario has always used.
+      const scripted = commandScript();
+      return scripted === undefined ? { kind: "success", text: "goal: none" } : scripted;
+    }
+    case "paseo/goal": {
+      const scripted = goalScript();
+      if (scripted === undefined) return { goal: null };
+      // The real bridge's wording, not this stand-in's generic default: the
+      // plugin classifies an outdated bridge by exactly this prefix.
+      if (scripted.unknownMethod === true) throw new Error("unknown paseo bridge method: paseo/goal");
+      // The missing-service sentence, again verbatim from the real bridge
+      // (`dsh-bridge/lib/server.js:3190`): the plugin grades it terminal by
+      // matching the text.
+      if (scripted.missingService === true) throw new Error(GOAL_SERVICE_MISSING_MESSAGE);
+      if (typeof scripted.throw === "string") throw new Error(scripted.throw);
+      if (Object.prototype.hasOwnProperty.call(scripted, "goal")) {
+        return { goal: scripted.goal ?? null };
+      }
+      return { goal: null };
+    }
     case "paseo/permission":
       return {
         available: true,

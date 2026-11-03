@@ -20,6 +20,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { accessSync, constants, existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import type { GoalErrorCode } from "../shared/goal";
 import type { JobErrorCode } from "../shared/jobs";
 import { profileName } from "./bootstrap";
 import { createFrameReader, splitFrames, type FrameReader } from "./frame-reader";
@@ -231,6 +232,52 @@ export interface DshJobs {
    * missing code or `rpc_failed` keeps the normal retry with backoff.
    */
   error?: { message?: string; code?: JobErrorCode };
+}
+
+/**
+ * One goal as the bridge's `paseo/goal` returns it.
+ *
+ * This is DSH's `GoalView` passed through unchanged — the bridge's contract is
+ * "the service's own view, not a reduced one" — so the plugin keeps the fields
+ * it does not draw (`id`/`revision`/timestamps) out of its shared contract but
+ * does not invent replacements for them either.
+ *
+ * `activation` is **process-local**: the bridge reads it from the live goal
+ * service, and a cold session simply has no live goal (the bridge answers
+ * `{goal: null}`). That is why this read cannot be served from the durable
+ * projection alone — the projection deliberately carries no activation.
+ */
+export interface DshGoalView {
+  id: string;
+  revision: number;
+  objective: string;
+  phase: "active" | "paused" | "blocked" | "complete";
+  /** Present exactly while `phase` is `blocked`. */
+  blockedReason?: { code: string; message: string };
+  maxGoalRounds: number;
+  roundsStarted: number;
+  createdAt: number;
+  updatedAt: number;
+  activation: "armed" | "disarmed";
+}
+
+/**
+ * One session's current goal, as the composer's goal pill reads it.
+ *
+ * `available: false` means the goal could not be read — not "no goal". A goal
+ * that was never created and a goal that was cleared are both a real `null`
+ * answer; an unreadable one must not be shown as `null`, or the pill hides a
+ * broken read and the user believes the goal is gone.
+ */
+export interface DshGoal {
+  available: boolean;
+  goal?: DshGoalView | null;
+  /**
+   * Why the goal could not be read. `code` is the machine-readable half the pill
+   * acts on: `bridge_too_old` / `goal_unavailable` stop its timer, while a
+   * missing code or the two transient codes keep the normal retry with backoff.
+   */
+  error?: { message?: string; code?: GoalErrorCode };
 }
 
 /**
@@ -469,6 +516,78 @@ function withJobsErrorCode(result: DshJobs): DshJobs {
   const code =
     result.error?.code ??
     (message === REGISTRY_MISSING_MESSAGE ? "registry_missing" : "rpc_failed");
+  return { ...result, error: { message, code } };
+}
+
+/**
+ * How long one `paseo/goal` read may take.
+ *
+ * The same bound as {@link JOBS_READ_TIMEOUT_MS} and for the same reason: the
+ * goal pill polls this on a timer, so a slow answer is worth less than the next
+ * poll. The two are separate constants because they are two methods with
+ * independent costs, but they are chosen together — the client's interval is
+ * picked against the shorter of them.
+ */
+const GOAL_READ_TIMEOUT_MS = 15_000;
+
+/**
+ * What the client logs once when the profile's bridge has no `paseo/goal`.
+ *
+ * The terminal `bridge_too_old` code makes the pill stop polling and hide; this
+ * sentence is the one explanation of why it went away and what to do.
+ */
+const GOAL_BRIDGE_TOO_OLD_MESSAGE =
+  "this profile's bridge has no goal support (it predates paseo/goal); reload the plugin so the embedded bridge is rewritten";
+
+/**
+ * The bridge's answer when the profile does not compose a goal service.
+ *
+ * **Verbatim from the bridge** (`dsh-bridge/lib/server.js:3190`, `goal()`'s
+ * `if (goals === undefined) throw new Error('this DSH runtime composes no goal
+ * service')`): the plugin half only sees the error message, so it matches this
+ * sentence to turn the terminal `goal_unavailable` code on. The two strings are
+ * one contract across the package boundary, which is why
+ * `harness/goal-server-check.cjs` reads the bridge source and asserts equality
+ * instead of trusting this comment — a reworded bridge sentence would otherwise
+ * silently downgrade "this profile has no goal feature" to a transient
+ * `rpc_failed`, and the pill would retry a condition that cannot change.
+ *
+ * The wording is the bridge's; do not "tidy" it here.
+ */
+const GOAL_SERVICE_MISSING_MESSAGE = "this DSH runtime composes no goal service";
+
+/**
+ * The bridge's `requireSession` refusal, verbatim (`dsh-bridge/lib/server.js`).
+ *
+ * A goal read can arrive before the session exists — the pill polls as soon as
+ * the agent directory lists it — so this is a normal transient state, not a
+ * broken read. Matched as a prefix because the bridge appends the session id.
+ */
+const UNKNOWN_BRIDGE_SESSION_PREFIX = "unknown or not-yet-created session:";
+
+/**
+ * The bridge's refusal when its live agent was disposed underneath it.
+ *
+ * Also transient: the session is being torn down, and the next poll after the
+ * reopen answers (or the agent is gone and the pill is removed with it).
+ */
+const DISPOSED_BRIDGE_AGENT_PREFIX = "session agent was disposed outside the server:";
+
+/**
+ * Give every failed goal answer a machine-readable code.
+ *
+ * The bridge may answer with a code already (`goal_unavailable` travels with the
+ * missing-service message), and this fills the gap for an older bridge that only
+ * sends a message — the same shape {@link withJobsErrorCode} handles. Anything
+ * unrecognised stays `rpc_failed`: transient, retried with backoff, and the pill
+ * keeps its last good state instead of disappearing on one bad poll.
+ */
+function withGoalErrorCode(result: DshGoal): DshGoal {
+  if (result.available) return result;
+  const message = result.error?.message ?? "the DSH runtime could not read this session's goal";
+  const code =
+    result.error?.code ??
+    (message === GOAL_SERVICE_MISSING_MESSAGE ? "goal_unavailable" : "rpc_failed");
   return { ...result, error: { message, code } };
 }
 
@@ -1267,6 +1386,13 @@ export class DshProcess {
    * buries everything else.
    */
   #warnedJobsUnsupported = false;
+  /**
+   * Whether the "this bridge has no paseo/goal" line has been logged.
+   *
+   * Latched for the same reason as {@link #warnedJobsUnsupported}: the goal pill
+   * polls on the same timer, so an unlatched line would bury the log.
+   */
+  #warnedGoalUnsupported = false;
   /** Whether the process-level exit callback has already fired for this child. */
   #exitReported = false;
   #initializeTask: Promise<void> | undefined;
@@ -2029,6 +2155,71 @@ export class DshProcess {
         );
       }
       return { available: false, error: { message: BRIDGE_TOO_OLD_MESSAGE, code: "bridge_too_old" } };
+    }
+  }
+
+  /**
+   * Read the goal this session currently owns.
+   *
+   * The bridge's `paseo/goal` answers the goal service's own `GoalView`, which is
+   * the only place `activation` exists — the durable projection deliberately
+   * omits it (DESIGN §1.1), so a cold read cannot substitute. A session whose
+   * agent has not been created yet is a transient state the pill polls through,
+   * not a failed read: the bridge names it, and it maps to `session_missing`.
+   *
+   * The failure classification mirrors {@link jobs}: a bridge that predates the
+   * method is terminal (`bridge_too_old`), a runtime with no goal service is
+   * terminal (`goal_unavailable`), and everything else is thrown so the session
+   * layer can report it as a transient `rpc_failed`.
+   *
+   * @param sessionId - which session; required — there is no default.
+   */
+  async goal(sessionId: string): Promise<DshGoal> {
+    await this.#ensureSessionReady(sessionId);
+    try {
+      const result = (await this.#request("paseo/goal", { sessionId }, GOAL_READ_TIMEOUT_MS)) as {
+        goal?: DshGoalView | null;
+      };
+      // The bridge answers `{goal: null}` for "no current goal" (never created,
+      // or cleared). An absent key means the same thing and is not an error: a
+      // cleared goal is a real answer the pill hides on.
+      return withGoalErrorCode({ available: true, goal: result.goal ?? null });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // A bridge without this method is not "no goal": the user's next step is to
+      // get a newer bridge, not to wait. Reported through `available: false`
+      // because the pill has no other way to say "I could not look" — but with a
+      // message that says what to do. `bridge_too_old` is terminal: the client
+      // stops polling instead of retrying an answer that cannot change until the
+      // plugin is reloaded.
+      if (this.#isUnknownBridgeMethodError(error)) {
+        if (!this.#warnedGoalUnsupported) {
+          this.#warnedGoalUnsupported = true;
+          // Once per process: an unlatched line would bury the log (same reasoning
+          // as `#warnedJobsUnsupported`).
+          this.#processHandlers.onLog(
+            `the bridge does not implement paseo/goal (it predates goal support); ` +
+              `the goal pill is disabled until the embedded bridge is rewritten: ${GOAL_BRIDGE_TOO_OLD_MESSAGE}`,
+          );
+        }
+        return { available: false, error: { message: GOAL_BRIDGE_TOO_OLD_MESSAGE, code: "bridge_too_old" } };
+      }
+      if (message === GOAL_SERVICE_MISSING_MESSAGE) {
+        // The runtime composes no goal service at all: nothing to show, ever,
+        // until the profile changes. Terminal, not "no goal".
+        return { available: false, error: { message, code: "goal_unavailable" } };
+      }
+      if (
+        message.startsWith(UNKNOWN_BRIDGE_SESSION_PREFIX)
+        || message.startsWith(DISPOSED_BRIDGE_AGENT_PREFIX)
+      ) {
+        // Transient: the session is being created or torn down, and the next poll
+        // answers. Reported as a code rather than thrown so the pill keeps its
+        // backoff and its last good state instead of treating one bad poll as a
+        // permanent condition.
+        return { available: false, error: { message, code: "session_missing" } };
+      }
+      throw error;
     }
   }
 
