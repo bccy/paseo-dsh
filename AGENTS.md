@@ -56,7 +56,7 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon fork 出的 p
 
 ### 改之前先读
 
-- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 八十余条真实缺陷（编号到 89，含 `b`/`c`
+- [docs/FIELD-NOTES.md](./docs/FIELD-NOTES.md) — 八十余条真实缺陷（编号到 90，含 `b`/`c`
   补记与 DSH 升版教训；历史段落里 22–25、46–47 有重号，引用旧条目时带标题）。里面有整整一类错误叫
   **静默降级**（把不知道的东西当成成功、把不支持的能力悄悄丢掉）。改动前先看一遍，
   避免重新发明这些 bug。
