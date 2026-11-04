@@ -663,9 +663,18 @@ console.log("the team pill, panel and cards (T3)");
   equal("team: English is not a copy of Chinese", Object.keys(zhLeaves).filter((key) => zhLeaves[key] === enLeaves[key]), []);
   equal("team: the title is the noun (zh)", zh.title, "团队");
   equal("team: the title is the noun (en)", en.title, "Team");
-  equal("team: the member words", zh.memberStates, { running: "运行中", idle: "空闲", provisioning: "准备中", failed: "创建失败" });
-  check("team: the unknown word is neither running nor idle (zh)", zh.memberActive !== zh.memberStates.running && zh.memberActive !== zh.memberStates.idle, zh.memberActive);
-  check("team: the unknown word is neither running nor idle (en)", en.memberActive !== en.memberStates.running && en.memberActive !== en.memberStates.idle, en.memberActive);
+  // T5: the roster is one summary line; no per-member words remain.
+  equal("team: member count (zh)", zh.memberCount(10), "10 名成员");
+  equal("team: running count (zh)", zh.runningCount(2), "2 个运行中");
+  equal("team: failed count (zh)", zh.failedCount(1), "1 个创建失败");
+  equal("team: member count (en)", [en.memberCount(1), en.memberCount(10)], ["1 member", "10 members"]);
+  equal("team: running / failed (en)", [en.runningCount(2), en.failedCount(1)], ["2 running", "1 failed to start"]);
+  check("team: no member-row keys remain", !("memberStates" in zh) && !("memberActive" in zh) && !("members" in zh) && !("lead" in zh), Object.keys(zh).join(","));
+  equal("team: stopped tag (zh/en)", [zh.ownerStopped, en.ownerStopped], ["已停止", "Stopped"]);
+  equal("team: stopped owners note (zh)", zh.stoppedOwners(10), "10 个负责人已停止");
+  for (const key of ["memberCount", "runningCount", "failedCount", "stoppedOwners"]) {
+    check(`team.${key}: English is not the Chinese`, en[key](3) !== zh[key](3));
+  }
   equal("team: the group words", zh.marks, { doing: "进行中", ready: "可开始", blocked: "等待依赖", done: "已完成" });
   equal("team: blockers sentence (zh)", zh.blockedBy(["task-1", "task-2"].join(zh.listSeparator)), "等 task-1、task-2");
   equal("team: failure keeps DSH's sentence (zh)", zh.failure("x is invalid"), "团队记录无效：x is invalid");

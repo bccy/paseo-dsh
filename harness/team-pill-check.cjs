@@ -31,13 +31,16 @@ const {
   TEAM_GROUP_ORDER,
   TEAM_TASK_ICONS,
   createTeamPoller,
-  teamMemberFacts,
-  teamMemberOrder,
   teamMemberState,
-  teamMemberWord,
+  teamMemberSummary,
+  teamMemberSummaryText,
+  teamOwnerRunning,
+  teamOwnerState,
+  teamStoppedOwnerCount,
   teamPillIcon,
   teamPillVisible,
   teamTaskFacts,
+  teamTaskFactsParts,
   teamTaskFields,
   teamTaskGroups,
   teamTaskMark,
@@ -101,35 +104,65 @@ console.log("\nthe pill icon");
   equal("a projection failure → failed, even with a runner", teamPillIcon({ members: [LEAD, mate({ running: true })], tasks: [], failure: "bad" }), "failed");
 }
 
-console.log("\nmember words: no 运行中/空闲 without the server's running");
+console.log("\nthe roster summary (T5): no running count without the server's running");
 {
   equal("running: true → running", teamMemberState(mate({ running: true })), "running");
   equal("running: false → idle", teamMemberState(mate({ running: false })), "idle");
   equal("no running → unknown", teamMemberState(mate()), "unknown");
   equal("provisioning wins over running", teamMemberState(mate({ phase: "provisioning", running: true })), "provisioning");
   equal("failed wins over running", teamMemberState(mate({ phase: "failed", running: true })), "failed");
+  // The user's screenshot scale: 10 members, 2 running.
+  const ten = [LEAD, ...Array.from({ length: 9 }, (_, i) => mate({ id: `m${i}`, name: `m${i}`, running: i < 2 ? true : false }))];
+  equal("10 members, 2 running", teamMemberSummary(ten), { total: 10, running: 2, failed: 0 });
+  equal("zh summary", teamMemberSummaryText(teamMemberSummary(ten), ZH), { plain: "10 名成员 · 2 个运行中", failed: "" });
+  equal("en summary", teamMemberSummaryText(teamMemberSummary(ten), EN), { plain: "10 members · 2 running", failed: "" });
+  // Running missing everywhere: only the count, no running word, no idle word.
+  const unknown = [LEAD, ...Array.from({ length: 9 }, (_, i) => mate({ id: `u${i}`, name: `u${i}` }))];
   for (const [name, text] of [["zh-CN", ZH], ["en", EN]]) {
-    const unknown = teamMemberWord(mate(), text);
-    assert(`${name}: an unknown member is not called running`, unknown !== text.memberStates.running, unknown);
-    assert(`${name}: an unknown member is not called idle`, unknown !== text.memberStates.idle, unknown);
-    equal(`${name}: an unknown member reads memberActive`, unknown, text.memberActive);
-    const facts = teamMemberFacts(mate({ description: "reviews" }), text);
-    assert(`${name}: an unknown member's facts carry no running word`, !facts.includes(text.memberStates.running) && !facts.includes(text.memberStates.idle), facts);
+    const line = teamMemberSummaryText(teamMemberSummary(unknown), text);
+    equal(`${name}: unknown running → only the count`, line.plain, text.memberCount(10));
+    assert(`${name}: …never a running word`, !line.plain.includes(text.runningCount(0).replace(/^0\s*/, "")), line.plain);
+    assert(`${name}: …never an idle word`, !/空闲|idle/i.test(line.plain), line.plain);
   }
-  equal("zh: a running member's facts", teamMemberFacts(mate({ running: true, description: "修 bug" }), ZH), "运行中 · 修 bug");
-  equal("zh: an idle member's facts", teamMemberFacts(mate({ running: false, description: "审查" }), ZH), "空闲 · 审查");
-  equal("zh: a failed member shows DSH's error", teamMemberFacts(mate({ phase: "failed", error: "child Session recovery failed: x" }), ZH), "创建失败 · child Session recovery failed: x");
-  equal("zh: the Lead running", teamMemberFacts({ ...LEAD, running: true }, ZH), "队长 · 运行中");
-  equal("zh: the Lead unknown says only its role", teamMemberFacts(LEAD, ZH), "队长");
-  const ordered = teamMemberOrder([
-    mate({ id: "i", name: "idle", running: false }),
-    mate({ id: "u", name: "unknown" }),
-    LEAD,
-    mate({ id: "f", name: "failed", phase: "failed" }),
-    mate({ id: "r", name: "running", running: true }),
-    mate({ id: "p", name: "prov", phase: "provisioning" }),
-  ]).map((m) => m.name);
-  equal("members order: lead, running, starting, failed, unknown, idle", ordered, ["lead", "running", "prov", "failed", "unknown", "idle"]);
+  equal("all idle (running:false) also draws only the count", teamMemberSummaryText(teamMemberSummary([LEAD, mate({ running: false })]), ZH).plain, "2 名成员");
+  equal("a running Lead counts", teamMemberSummary([{ ...LEAD, running: true }]).running, 1);
+  const withFailed = [...ten, mate({ id: "f", name: "broken", phase: "failed", running: true, error: "x" })];
+  equal("a failed member is counted apart, not as running", teamMemberSummary(withFailed), { total: 11, running: 2, failed: 1 });
+  equal("zh failed part", teamMemberSummaryText(teamMemberSummary(withFailed), ZH), { plain: "11 名成员 · 2 个运行中", failed: "1 个创建失败" });
+  equal("zh one member", ZH.memberCount(1), "1 名成员");
+  equal("en one member", EN.memberCount(1), "1 member");
+}
+
+console.log("\nthe owner's mark (T5): ring / 已停止 / nothing");
+{
+  const members = [LEAD, mate({ id: "r", name: "fixer", running: true }), mate({ id: "i", name: "reviewer", running: false }), mate({ id: "u", name: "far" })];
+  const doing = (owner) => task({ status: "in_progress", ownerName: owner });
+  equal("a running owner → running", teamOwnerState(doing("fixer"), members), "running");
+  equal("…and the ring", teamOwnerRunning(doing("fixer"), members), true);
+  equal("running:false → stopped", teamOwnerState(doing("reviewer"), members), "stopped");
+  equal("…and no ring", teamOwnerRunning(doing("reviewer"), members), false);
+  equal("running missing → nothing (never stopped)", teamOwnerState(doing("far"), members), undefined);
+  equal("an owner not on the roster → nothing", teamOwnerState(doing("ghost"), members), undefined);
+  equal("no owner → nothing", teamOwnerState(task(), members), undefined);
+  equal("a failed owner (even running:true) → nothing", teamOwnerState(doing("broken"), [mate({ name: "broken", phase: "failed", running: true })]), undefined);
+  equal("a starting owner → nothing", teamOwnerState(doing("new"), [mate({ name: "new", phase: "provisioning", running: false })]), undefined);
+  equal("a completed task's idle owner → nothing (the normal end)", teamOwnerState(task({ status: "completed", ownerName: "reviewer" }), members), undefined);
+  equal("a pending task claimed by a stopped owner → stopped", teamOwnerState(task({ status: "pending", ownerName: "reviewer" }), members), "stopped");
+  equal("the Lead as owner, running → running", teamOwnerState(doing("lead"), [{ ...LEAD, running: true }]), "running");
+  equal("the stopped count only counts running:false owners", teamStoppedOwnerCount([doing("reviewer"), doing("far"), doing("fixer"), doing("ghost"), task()], members), 1);
+  equal("ten in-progress tasks, all owners stopped", teamStoppedOwnerCount(Array.from({ length: 10 }, () => doing("reviewer")), members), 10);
+  equal("ten in-progress tasks, owners unknown → 0", teamStoppedOwnerCount(Array.from({ length: 10 }, () => doing("far")), members), 0);
+  equal("zh stopped tag", ZH.ownerStopped, "已停止");
+  equal("zh header note", ZH.stoppedOwners(3), "3 个负责人已停止");
+  equal("en header note", [EN.stoppedOwners(1), EN.stoppedOwners(3)], ["1 owner stopped", "3 owners stopped"]);
+  equal("the detail owner field: running", teamTaskFields(doing("fixer"), ZH, members)[1], { label: "负责人", value: "fixer", owner: "running" });
+  equal("…stopped", teamTaskFields(doing("reviewer"), ZH, members)[1], { label: "负责人", value: "reviewer", owner: "stopped" });
+  equal("…unknown: no mark", teamTaskFields(doing("far"), ZH, members)[1], { label: "负责人", value: "far" });
+  equal("…no roster (the timeline card): no mark", teamTaskFields(doing("fixer"), ZH)[1], { label: "负责人", value: "fixer" });
+  equal("facts split around the owner", teamTaskFactsParts(task({ ready: false, ownerName: "fixer", blockedBy: ["task-3"], writeScopes: ["a/"] }), ZH), { lead: "task-1 · fixer", owner: true, trail: " · 等 task-3 · a/" });
+  equal("…an unowned task has no owner slot", teamTaskFactsParts(task(), ZH), { lead: "task-1 · 未分配", owner: false, trail: "" });
+  // Status and grouping stay DSH's: a stopped owner does not move its task.
+  equal("a stopped owner's task stays 进行中", teamTaskMark(doing("reviewer")), "doing");
 }
 
 console.log("\ntasks: marks and direction-B groups");

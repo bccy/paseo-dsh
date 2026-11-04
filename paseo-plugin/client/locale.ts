@@ -139,21 +139,25 @@ export interface UiText {
 /**
  * The team pill, panel and task cards (T3, design T2 direction B).
  *
- * `memberStates.running/idle` are only drawn when the server half sent
- * `running`; without it the member's word is {@link memberActive} (DSH's durable
- * phase), never 运行中/空闲 — that would be the silent degradation the server
- * overlay exists to prevent.
+ * The roster is one summary line (T5): 「10 名成员 · 2 个运行中」. The running
+ * count is drawn only when the server half sent `running: true` for someone;
+ * there is no idle word at all — a member without `running` is unknown, and
+ * calling it idle would be the silent degradation the server overlay exists
+ * to prevent.
  */
 export interface TeamText {
   /** Pill label **and** title (= sheet header): the noun, in every state. */
   title: string;
-  /** Section header over the roster. */
-  members: string;
-  /** The Lead's role word on its facts line. */
-  lead: string;
-  memberStates: { running: string; idle: string; provisioning: string; failed: string };
-  /** An `active` member whose live state this process cannot see. */
-  memberActive: string;
+  /** The summary's head: how many members (the Lead included). */
+  memberCount: (n: number) => string;
+  /** The summary's running part, only drawn when n > 0. */
+  runningCount: (n: number) => string;
+  /** The summary's red part, only drawn when n > 0. */
+  failedCount: (n: number) => string;
+  /** The grey tag after an owner the server saw stop (`running === false`) on an unfinished task. */
+  ownerStopped: string;
+  /** The 进行中 header's trailing note, only drawn when n > 0. */
+  stoppedOwners: (n: number) => string;
   /** Task group / mark names: in progress, ready, waiting on blockers, done. */
   marks: { doing: string; ready: string; blocked: string; done: string };
   unowned: string;
@@ -897,10 +901,11 @@ const TEXT: Record<Locale, UiText> = {
     },
     team: {
       title: "Team",
-      members: "Members",
-      lead: "Lead",
-      memberStates: { running: "Running", idle: "Idle", provisioning: "Starting", failed: "Failed to start" },
-      memberActive: "Member",
+      memberCount: (n) => `${String(n)} member${n === 1 ? "" : "s"}`,
+      runningCount: (n) => `${String(n)} running`,
+      failedCount: (n) => `${String(n)} failed to start`,
+      ownerStopped: "Stopped",
+      stoppedOwners: (n) => `${String(n)} owner${n === 1 ? "" : "s"} stopped`,
       marks: { doing: "In progress", ready: "Ready", blocked: "Waiting", done: "Done" },
       unowned: "Unassigned",
       blockedBy: (ids) => `after ${ids}`,
@@ -1242,10 +1247,11 @@ const TEXT: Record<Locale, UiText> = {
     },
     team: {
       title: "团队",
-      members: "成员",
-      lead: "队长",
-      memberStates: { running: "运行中", idle: "空闲", provisioning: "准备中", failed: "创建失败" },
-      memberActive: "成员",
+      memberCount: (n) => `${String(n)} 名成员`,
+      runningCount: (n) => `${String(n)} 个运行中`,
+      failedCount: (n) => `${String(n)} 个创建失败`,
+      ownerStopped: "已停止",
+      stoppedOwners: (n) => `${String(n)} 个负责人已停止`,
       marks: { doing: "进行中", ready: "可开始", blocked: "等待依赖", done: "已完成" },
       unowned: "未分配",
       blockedBy: (ids) => `等 ${ids}`,

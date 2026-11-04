@@ -4,10 +4,13 @@
  * Renders the **real** `TeamPanel` (and the real container `makeTeamPopover`)
  * through `react-native-web` into jsdom, with the same UI-kit stub as
  * `goal-popover-render-check.cjs` (real lucide glyphs, inline SVG). Asserts:
- * the section order (failure → 成员 → tasks), the B groups and their order, the
- * done group folded by default and opening in place, a blocked task never under
- * 可开始, the member marks (whale for the Lead, ring only for `running: true`,
- * no 运行中/空闲 without it), the description clamped to two lines in the list,
+ * the section order (failure → roster summary → tasks), the B groups and their
+ * order, the done group folded by default and opening in place, a blocked task
+ * never under 可开始, **no member rows** (T5: one summary line 「N 名成员 · M 个
+ * 运行中」, the running part only from `running: true`, red 「K 个创建失败」), the
+ * owner's mark (the ring after a running owner, a grey 已停止 tag after an
+ * owner the server saw stop, nothing when running is unknown; list and detail
+ * page) and the 进行中 header's 「N 个负责人已停止」, the description clamped to two lines in the list,
  * the detail page (back row, every field, the whole description, back returns),
  * the empty board and Lead-only states, and that the panel is read-only (the
  * only buttons are task rows, the done fold and the back row).
@@ -181,8 +184,10 @@ const BOARD = {
     task({ id: "task-2", subject: "独立审查修复", status: "in_progress", ownerName: "reviewer", description: LONG, writeScopes: ["docs/audits/"] }),
     task({ id: "task-3", subject: "复审返工", status: "pending", ready: false, blockedBy: ["task-2"] }),
     task({ id: "task-4", subject: "整理证据", status: "pending", ready: true, writeScopes: ["docs/a/", "docs/b/"], writeScopeWarnings: ["write scopes overlap with task-2"] }),
+    task({ id: "task-5", subject: "返工补丁", status: "in_progress", ownerName: "fixer", writeScopes: ["src/"] }),
   ],
 };
+const RING = '[role="progressbar"]';
 
 function render(props) {
   const container = document.createElement("div");
@@ -205,8 +210,8 @@ const order = (container, words) => {
 console.log("sections and direction-B groups");
 {
   const { container } = render({ team: BOARD });
-  const positions = order(container, ["成员", "lead", "进行中", "独立审查修复", "可开始", "整理证据", "等待依赖", "复审返工", "已完成"]);
-  assert("members, then 进行中 → 可开始 → 等待依赖 → 已完成", positions.every((p, i) => p >= 0 && (i === 0 || p > positions[i - 1])), JSON.stringify(positions));
+  const positions = order(container, ["4 名成员", "进行中", "独立审查修复", "可开始", "整理证据", "等待依赖", "复审返工", "已完成"]);
+  assert("the summary, then 进行中 → 可开始 → 等待依赖 → 已完成", positions.every((p, i) => p >= 0 && (i === 0 || p > positions[i - 1])), JSON.stringify(positions));
   assert("the done group is folded by default", !container.textContent.includes("修复选页错位"), container.textContent);
   const ready = container.textContent.slice(container.textContent.indexOf("可开始"), container.textContent.indexOf("等待依赖"));
   assert("a blocked task is not under 可开始", !ready.includes("复审返工"), ready);
@@ -219,27 +224,106 @@ console.log("sections and direction-B groups");
   assert("the old 共享任务 header is not drawn in B", !container.textContent.includes("共享任务"));
 }
 
-console.log("\nmembers: marks and words");
+console.log("\nthe roster is one summary line (T5)");
 {
   const { container } = render({ team: BOARD });
-  assert("the Lead row is first and carries the whale", texts(container).indexOf("lead") < texts(container).indexOf("fixer") && container.querySelector('[data-icon="svg"]') !== null);
-  const rings = container.querySelectorAll('[role="progressbar"]');
-  check("exactly one ring: the running teammate", rings.length, 1);
-  assert("the running teammate reads 运行中", byLabel(container, "fixer，运行中 · 修复并验证") !== undefined);
-  assert("the idle teammate reads 空闲", byLabel(container, "reviewer，空闲 · 只读审查") !== undefined);
-  const unknown = byLabelStart(container, "elsewhere");
-  assert("a teammate without running is neither 运行中 nor 空闲", unknown !== undefined && !/运行中|空闲/.test(unknown.getAttribute("aria-label")), unknown?.getAttribute("aria-label"));
-  check("…it reads 成员", unknown?.getAttribute("aria-label"), "elsewhere，成员 · 别处的队员");
-  const runningFirst = texts(container);
-  assert("running members come before idle ones", runningFirst.indexOf("fixer") < runningFirst.indexOf("reviewer"), runningFirst.join("|"));
+  const summary = byLabel(container, "4 名成员 · 1 个运行中");
+  assert("the summary line reads 4 名成员 · 1 个运行中", summary !== undefined, texts(container).slice(0, 3).join("|"));
+  check("…as a header", summary?.getAttribute("role"), "heading");
+  assert("…and is not pressable", summary?.closest('[role="button"]') === null);
+  for (const name of ["lead", "reviewer", "elsewhere"]) {
+    assert(`no member row: ${name} is not drawn`, !texts(container).includes(name), texts(container).join("|"));
+  }
+  assert("no member row for a running teammate either (fixer only as an owner)", !texts(container).includes("fixer"), texts(container).join("|"));
+  assert("no idle word anywhere", !container.textContent.includes("空闲"));
+  assert("no whale (it marked the Lead row)", container.querySelector('[data-icon="svg"]') === null);
+  assert("no per-member facts like 运行中 · …", !/运行中 ·/.test(container.textContent));
+  const unknown = render({ team: { members: [LEAD, ...BOARD.members.slice(1).map(({ running, ...rest }) => rest)].map(({ running, ...rest }) => rest), tasks: BOARD.tasks } }).container;
+  assert("running missing everywhere: only the count", byLabel(unknown, "4 名成员") !== undefined, texts(unknown).slice(0, 2).join("|"));
+  assert("…no 运行中 anywhere", !unknown.textContent.includes("运行中"), unknown.textContent);
+  check("…and no ring anywhere", unknown.querySelectorAll(RING).length, 0);
+  const failedBoard = { ...BOARD, members: [...BOARD.members, mate({ id: "f", name: "broken", phase: "failed", error: "child Session recovery failed: x" })] };
+  const failed = render({ team: failedBoard }).container;
+  assert("a failed member adds a red part", byLabel(failed, "5 名成员 · 1 个运行中 · 1 个创建失败") !== undefined, texts(failed).slice(0, 3).join("|"));
+  const red = [...failed.querySelectorAll("span, div")].filter((node) => (node.textContent ?? "").trim() === "1 个创建失败").at(-1);
+  assert("…in statusDanger", /color:\s*rgb\(157, 67, 59\)/.test(red?.getAttribute("style") ?? ""), red?.outerHTML);
+  assert("…and DSH's member error is not drawn as a row", !failed.textContent.includes("child Session recovery failed"));
+}
+
+console.log("\nthe owner's running ring (T5)");
+{
+  const { container } = render({ team: BOARD });
+  const rings = [...container.querySelectorAll(RING)];
+  check("exactly one ring: task-5's running owner", rings.length, 1);
+  const ringRow = rings[0]?.closest('[role="button"]');
+  assert("…inside task-5's row", (ringRow?.getAttribute("aria-label") ?? "").startsWith("返工补丁"), ringRow?.getAttribute("aria-label"));
+  const facts = rings[0]?.parentElement;
+  const runs = [...(facts?.querySelectorAll('[dir="auto"]') ?? [])].map((node) => node.textContent);
+  assert("…right after the owner's name", runs[0] === "task-5 · fixer" && runs[1] === " · src/", JSON.stringify(runs));
+  const ringBox = rings[0];
+  assert("…at the facts line's 12px", /width:\s*12px/.test(ringBox?.getAttribute("style") ?? ""), ringBox?.getAttribute("style"));
+  const reviewerRow = byLabelStart(container, "独立审查修复");
+  check("an idle owner's row has no ring", reviewerRow?.querySelectorAll(RING).length, 0);
+  const unowned = byLabelStart(container, "整理证据");
+  check("an unowned row has no ring", unowned?.querySelectorAll(RING).length, 0);
+  click(byLabelStart(container, "返工补丁"));
+  check("the detail page's owner field carries the ring", container.querySelectorAll(RING).length, 1);
+  const owner = [...container.querySelectorAll('[dir="auto"]')].find((node) => node.textContent === "fixer");
+  assert("…next to the owner's name", owner !== undefined && owner.parentElement?.querySelector(RING) !== null);
+  click(byLabel(container, "返回"));
+  click(byLabelStart(container, "独立审查修复"));
+  check("an idle owner's detail page has no ring", container.querySelectorAll(RING).length, 0);
+}
+
+console.log("\nstopped owners (T5): 已停止 only from running:false");
+{
+  // reviewer is running:false and owns in-progress task-2.
+  const { container } = render({ team: BOARD });
+  const row = byLabelStart(container, "独立审查修复");
+  assert("a stopped owner's row carries 已停止", [...row.querySelectorAll('[dir="auto"]')].some((node) => node.textContent === "已停止"), row?.textContent);
+  assert("…and says so to a screen reader", (row?.getAttribute("aria-label") ?? "").endsWith("，已停止"), row?.getAttribute("aria-label"));
+  check("…and no ring", row?.querySelectorAll(RING).length, 0);
+  const running = byLabelStart(container, "返工补丁");
+  assert("a running owner's row has no 已停止", !running.textContent.includes("已停止"));
+  const doneOpen = render({ team: BOARD, initialDoneOpen: true }).container;
+  const doneRow = byLabelStart(doneOpen, "修复选页错位");
+  assert("a completed task never carries 已停止", doneRow !== undefined && !doneRow.textContent.includes("已停止"), doneRow?.textContent);
+  const header = [...container.querySelectorAll('[role="heading"]')].find((node) => (node.textContent ?? "").startsWith("进行中"));
+  check("the 进行中 header counts stopped owners", header?.textContent, "进行中2 · 1 个负责人已停止");
+  // Running unknown for everyone: no 已停止 anywhere and no count.
+  const unknownBoard = { members: BOARD.members.map(({ running, ...rest }) => rest), tasks: BOARD.tasks };
+  const unknown = render({ team: unknownBoard }).container;
+  assert("unknown running: no 已停止 anywhere", !unknown.textContent.includes("已停止"), unknown.textContent);
+  assert("…and no stopped count", !unknown.textContent.includes("负责人已停止"));
+  // The user's case: ten in-progress tasks whose owners all stopped.
+  const ten = {
+    members: [LEAD, ...Array.from({ length: 9 }, (_, i) => mate({ id: `m${i}`, name: `m${i}`, running: false }))],
+    tasks: Array.from({ length: 10 }, (_, i) => task({ id: `task-${i + 1}`, subject: `审查 ${i + 1}`, status: "in_progress", ownerName: `m${i % 9}` })),
+  };
+  const all = render({ team: ten }).container;
+  const allHeader = [...all.querySelectorAll('[role="heading"]')].find((node) => (node.textContent ?? "").startsWith("进行中"));
+  check("all ten stopped: the header says so", allHeader?.textContent, "进行中10 · 10 个负责人已停止");
+  check("…ten 已停止 tags", [...all.querySelectorAll('[dir="auto"]')].filter((node) => node.textContent === "已停止").length, 10);
+  check("…the summary has no running part", byLabel(all, "10 名成员") !== undefined, true);
+  assert("…and the tasks stay under 进行中 (DSH's status, not re-judged)", !all.textContent.includes("已完成"), all.textContent);
+  // The detail page.
+  click(byLabelStart(container, "独立审查修复"));
+  const owner = [...container.querySelectorAll('[dir="auto"]')].find((node) => node.textContent === "reviewer");
+  assert("the detail page's owner field carries 已停止", owner?.parentElement?.textContent === "负责人reviewer已停止", owner?.parentElement?.textContent);
 }
 
 console.log("\ntask rows: facts, warnings, two-line description");
 {
   const { container } = render({ team: BOARD });
-  assert("facts: id · owner · scope", texts(container).includes("task-2 · reviewer · docs/audits/"));
-  assert("facts: blockers while blocked", texts(container).includes("task-3 · 未分配 · 等 task-2"));
-  assert("facts: two scopes", texts(container).includes("task-4 · 未分配 · docs/a/ +1"));
+  // The facts line is runs (id · owner | ring | · trail); read the row's whole line.
+  const factsOf = (prefix) => {
+    const row = byLabelStart(container, prefix);
+    const line = [...(row?.querySelectorAll("div") ?? [])].find((node) => node.firstElementChild?.getAttribute("dir") === "auto" && /^task-\d/.test(node.textContent ?? ""));
+    return line?.textContent;
+  };
+  check("facts: id · owner · 已停止 · scope", factsOf("独立审查修复"), "task-2 · reviewer已停止 · docs/audits/");
+  check("facts: blockers while blocked", factsOf("复审返工"), "task-3 · 未分配 · 等 task-2");
+  check("facts: two scopes", factsOf("整理证据"), "task-4 · 未分配 · docs/a/ +1");
   assert("the overlap warning is translated", texts(container).includes("写入范围与 task-2 重叠"));
   const desc = [...container.querySelectorAll('[dir="auto"]')].find((node) => (node.textContent ?? "").startsWith("第一段"));
   assert("the list shows the description on joined lines", desc !== undefined && !desc.textContent.includes("\n"), desc?.textContent);
@@ -262,11 +346,11 @@ console.log("\nthe detail page");
   assert("the page names the task and its state in the back row", container.textContent.includes("task-2 · 进行中"));
   for (const label of ["状态", "负责人", "写入范围", "修订"]) assert(`the page shows ${label}`, texts(container).includes(label));
   assert("the page shows the whole description, newlines kept", [...container.querySelectorAll('[dir="auto"]')].some((node) => node.textContent === LONG));
-  assert("the member list is gone while the page is open", !container.textContent.includes("成员"));
+  assert("the roster summary is gone while the page is open", !container.textContent.includes("名成员"));
   const back = byLabel(container, "返回");
   assert("the back row is a button", back?.getAttribute("role") === "button");
   click(back);
-  assert("back returns to the list", container.textContent.includes("成员") && container.textContent.includes("等待依赖"));
+  assert("back returns to the list", container.textContent.includes("名成员") && container.textContent.includes("等待依赖"));
 }
 
 console.log("\nempty, Lead-only, failure, read-only");
@@ -274,15 +358,15 @@ console.log("\nempty, Lead-only, failure, read-only");
   const empty = render({ team: { members: [LEAD, mate({ id: "x", name: "x", running: true })], tasks: [] } }).container;
   assert("an empty board says 暂无共享任务", empty.textContent.includes("暂无共享任务"));
   const leadOnly = render({ team: { members: [LEAD], tasks: [task({ id: "task-1", subject: "a", ready: true })] } }).container;
-  assert("a Lead-only board lists the Lead and its tasks", leadOnly.textContent.includes("lead") && leadOnly.textContent.includes("可开始"));
+  assert("a Lead-only board says 1 名成员 and lists its tasks", byLabel(leadOnly, "1 名成员") !== undefined && leadOnly.textContent.includes("可开始"));
   const failed = render({ team: { ...BOARD, failure: 'team task "task-3" revision is not contiguous', members: [...BOARD.members, mate({ id: "f", name: "broken", phase: "failed", error: "child Session recovery failed: x" })] } }).container;
   const alert = failed.querySelector('[role="alert"]');
-  assert("the failure row comes first", alert !== null && failed.textContent.indexOf("团队记录无效") < failed.textContent.indexOf("成员"));
+  assert("the failure row comes first", alert !== null && failed.textContent.indexOf("团队记录无效") < failed.textContent.indexOf("名成员"));
   assert("…with DSH's sentence verbatim", failed.textContent.includes('团队记录无效：team task "task-3" revision is not contiguous'));
-  assert("a failed member shows 创建失败 and DSH's error", byLabel(failed, "broken，创建失败 · child Session recovery failed: x") !== undefined);
+  assert("a failed member shows in the summary", failed.textContent.includes("1 个创建失败"));
   const { container } = render({ team: BOARD });
   const buttons = [...container.querySelectorAll('[role="button"]')].map((node) => node.getAttribute("aria-label"));
-  check("the only buttons are three visible task rows and the done fold", buttons.length, 4);
+  check("the only buttons are four visible task rows and the done fold", buttons.length, 5);
   assert("no member row is pressable", !buttons.some((label) => /^(lead|fixer|reviewer|elsewhere)，/.test(label ?? "")), buttons.join(" | "));
   const note = document.createElement("div");
   document.body.appendChild(note);
