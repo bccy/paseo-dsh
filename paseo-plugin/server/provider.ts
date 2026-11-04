@@ -1594,6 +1594,11 @@ class DshConnection implements ProviderConnection {
       this.#assertOpening(sessionId, opening);
       session = new DshSession({
         systemPrompt: config.systemPrompt,
+        // Paseo's own name for this agent, forwarded so DSH's session list shows
+        // the same name (see `DshSessionOptions.title`). Paseo supplies it on
+        // both a fresh open and a reopen from its stored agent config, so a
+        // restored conversation keeps its name instead of showing as untitled.
+        ...(config.title === undefined ? {} : { title: config.title }),
         permission: this.capabilities.includes("permission"),
         sessionId,
         dshSessionId,

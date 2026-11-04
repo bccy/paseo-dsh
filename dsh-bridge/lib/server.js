@@ -410,6 +410,23 @@ export class PaseoHarnessServer {
      * writes it.
      */
     this.sessionRoutes = new Map();
+    /**
+     * sessionId -> the Paseo agent title carried by that session's `initialize`.
+     *
+     * Paseo names an agent (the label its own UI shows) and hands that name to
+     * the provider as `config.title`; the plugin forwards it on the session's
+     * `initialize` frame, and the bridge writes it as the DSH session title once
+     * the session is live (`applySessionTitle`). DSH's title service never sees
+     * a human turn for an agent started by a host envelope, so without this
+     * passthrough the session is untitled in DSH's own session list.
+     *
+     * Kept across `session/close` for the same reason as the route tables: a
+     * parked resume must re-apply the name without waiting for a re-initialize
+     * (the plugin does re-send it, but the row also survives the bridge's own
+     * reconnect paths). Bounded with the route tables — an entry is dropped when
+     * its route row is evicted, and a re-initialize re-supplies it.
+     */
+    this.sessionTitles = new Map();
     this.sessionSystemPrompts = new Map();
     this.systemPromptDisposers = new Map();
 
@@ -929,6 +946,11 @@ export class PaseoHarnessServer {
    * Keep {@link sessionCwd}, {@link sessionRoutes} and
    * {@link initializedSessions} bounded, and keep their key sets identical.
    *
+   * {@link sessionTitles} is a fourth, sparser table keyed the same way (only
+   * Paseo sessions carry a name). It does not drive the bound, but an evicted
+   * route row drops its title with it — the re-initialize that row already owes
+   * re-supplies the name.
+   *
    * Called with the id `initialize` just wrote. The three tables are re-inserted
    * first so eviction order is least-recently-initialized rather than
    * first-ever-seen: a session re-initialized after a rewind (same DSH id, new
@@ -988,6 +1010,10 @@ export class PaseoHarnessServer {
       this.sessionRoutes.delete(key);
       this.sessionCwd.delete(key);
       this.initializedSessions.delete(key);
+      // The title table is sparser than these three (only Paseo sessions carry
+      // one) and does not drive the bound, but an evicted row must not leave a
+      // name behind: the plugin re-sends it on the re-initialize it already owes.
+      this.sessionTitles.delete(key);
       this.closedSessions.delete(key);
     };
 
@@ -1085,6 +1111,13 @@ export class PaseoHarnessServer {
    * No idempotence conflict: several sessions each send their own `initialize`
    * with a different `sessionId`, which is how one process serves many Paseo
    * sessions at once.
+   *
+   * `title` is Paseo's own agent name, forwarded by the plugin from the
+   * session's `config.title`. It is remembered for the session and written as
+   * the DSH session title when the session goes live (see
+   * {@link applySessionTitle}); a non-string or empty value is ignored rather
+   * than refused, because the name is a label and an older Paseo build that
+   * sends none must not break the open.
    */
   async initialize(params) {
     if (params.cwd === undefined) throw new TypeError('initialize requires cwd');
@@ -1097,6 +1130,9 @@ export class PaseoHarnessServer {
     const sessionId = params.sessionId === undefined || params.sessionId === null
       ? undefined
       : String(params.sessionId);
+    const title = typeof params.title === 'string' && params.title.trim() !== ''
+      ? params.title
+      : undefined;
     const fallback = this.profileDefault();
     const pinned = sessionId === undefined ? undefined : this.sessionRoutes.get(sessionId);
     // The session's own route outranks the process defaults: they are the
@@ -1164,6 +1200,10 @@ export class PaseoHarnessServer {
       const live = this.sessions.get(sessionId);
       if (live) this.installSystemPrompt(sessionId, live.handle.agent.ctx);
       this.sessionCwd.set(sessionId, cwd);
+      // Remember Paseo's name for this agent; `createSession` applies it once
+      // the session is live. A later initialize without a title leaves the
+      // known name alone (an omitted title is "no update", not "clear").
+      if (title !== undefined) this.sessionTitles.set(sessionId, title);
       // `null` (not `undefined`) records "resolved to no thinking level", so a
       // later `configSet` clear and a merely-unpinned row stay distinguishable.
       this.sessionRoutes.set(sessionId, { provider, model, reasoningEffort: reasoningEffort ?? null, maxTokens });
@@ -3884,9 +3924,10 @@ export class PaseoHarnessServer {
    * The single list of "what a close must clear", used both by `closeSession`
    * (for the session and every descendant) and by its create/close race repair,
    * so the two cannot drift apart: a table added to the server but not here
-   * survives a close and leaves `owns()` true forever. The three tables that are
+   * survives a close and leaves `owns()` true forever. The four tables that are
    * deliberately kept across a close (`sessionCwd`, `sessionRoutes`,
-   * `initializedSessions`) do NOT appear here — see `closeSession`'s doc.
+   * `initializedSessions`, `sessionTitles`) do NOT appear here — see
+   * `closeSession`'s doc.
    *
    * @param {string} sessionId
    */
@@ -4185,6 +4226,10 @@ export class PaseoHarnessServer {
         setup: resumeSetup,
       });
     }
+    // Both branches converge here — a freshly created session and a resumed one
+    // both need Paseo's agent name written as the DSH session title. Best-effort:
+    // a title never decides whether the conversation opens.
+    this.applySessionTitle(sessionId, handle.agent.session);
     const rec = { handle, control };
     // Consume the queued plan intent and DELETE the key. Leaving it in place (or
     // resetting a single process-wide boolean) is what forced plan mode onto
@@ -4251,6 +4296,63 @@ export class PaseoHarnessServer {
 
   hasAdapterFor(provider) {
     return this.ctx.get('llm')?.listProviders().some((entry) => entry.id === provider) ?? false;
+  }
+
+  /**
+   * Write Paseo's agent title as this session's DSH title, once it is live.
+   *
+   * Paseo names an agent itself (that name is what its UI shows) and the plugin
+   * forwards it on the session's `initialize`; DSH's title service, by contrast,
+   * derives titles only from human `user` messages — a Paseo child agent is
+   * started by a host envelope, so without this passthrough its DSH session is
+   * untitled and DSH's own session list shows an unnamed row. The Paseo name is
+   * the accurate one for such a session, so it replaces whatever DSH derived.
+   *
+   * Called from `createSession`, so both the fresh-creation and the resume
+   * branch get the same treatment. Deliberately best-effort: a missing service,
+   * an unreadable title or a refused rename is written to stderr and never fails
+   * the open (a conversation is more important than its label). An equal title
+   * is skipped, which keeps a Paseo reopen from appending a redundant
+   * `session/title` event each time.
+   *
+   * @param {string} sessionId
+   * @param {object} session - the live Session `agents.create`/`agents.resume`
+   *   just published.
+   */
+  applySessionTitle(sessionId, session) {
+    const title = this.sessionTitles.get(sessionId);
+    if (title === undefined) return;
+    let service;
+    try {
+      service = this.ctx.get('sessionTitle');
+    } catch (error) {
+      process.stderr.write(
+        `[bridge] looking up DSH's session-title service failed; session ${sessionId} keeps its DSH title: `
+        + `${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      return;
+    }
+    if (service === undefined) {
+      reportMissingService(
+        'sessionTitle',
+        '[bridge] this DSH profile composes no session-title service; sessions keep their DSH titles\n',
+      );
+      return;
+    }
+    try {
+      // Explicit rename is the only public way to accept a title, and it pins it
+      // (`source.kind: 'user'`) so a later prompt cannot replace the agent's name
+      // with a generated one. The comparison uses the raw Paseo title: rename
+      // normalizes it, so a title the service truncates never compares equal and
+      // is re-applied on the next open — one log-only event per open, bounded.
+      if (service.get(session)?.title === title) return;
+      service.rename(session, title);
+    } catch (error) {
+      process.stderr.write(
+        `[bridge] adopting Paseo's agent title for session ${sessionId} failed: `
+        + `${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
   }
 
   /** Register through the agent's scope (DSH SystemPrompt.section contract).
