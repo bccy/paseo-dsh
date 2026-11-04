@@ -139,21 +139,26 @@ export interface UiText {
 /**
  * The team pill, panel and task cards (T3, design T2 direction B).
  *
- * The roster is one summary line (T5): 「10 名成员 · 2 个运行中」. The running
- * count is drawn only when the server half sent `running: true` for someone;
- * there is no idle word at all — a member without `running` is unknown, and
- * calling it idle would be the silent degradation the server overlay exists
- * to prevent.
+ * The roster is one headline (T7): whale + 「DeepSeek」 + 「N 名成员」 and status
+ * chips. 运行中 / 已停止 chips are drawn only when the server half sent
+ * `running` for someone — a member without it is unknown, and calling it
+ * running or stopped would be the silent degradation the server overlay
+ * exists to prevent.
  */
 export interface TeamText {
   /** Pill label **and** title (= sheet header): the noun, in every state. */
   title: string;
-  /** The summary's head: how many members (the Lead included). */
+  /** The headline's member count (the Lead included). */
   memberCount: (n: number) => string;
-  /** The summary's running part, only drawn when n > 0. */
-  runningCount: (n: number) => string;
-  /** The summary's red part, only drawn when n > 0. */
-  failedCount: (n: number) => string;
+  /**
+   * The roster headline (T7): the name next to the whale, and the status chips'
+   * words, full and short (the narrow-width ladder's second level).
+   */
+  head: {
+    title: string;
+    words: { failed: string; running: string; stopped: string; done: string };
+    short: { failed: string; running: string; stopped: string; done: string };
+  };
   /** The grey tag after an owner the server saw stop (`running === false`) on an unfinished task. */
   ownerStopped: string;
   /** The 进行中 header's trailing note, only drawn when n > 0. */
@@ -902,8 +907,11 @@ const TEXT: Record<Locale, UiText> = {
     team: {
       title: "Team",
       memberCount: (n) => `${String(n)} member${n === 1 ? "" : "s"}`,
-      runningCount: (n) => `${String(n)} running`,
-      failedCount: (n) => `${String(n)} failed to start`,
+      head: {
+        title: "DeepSeek",
+        words: { failed: "failed to start", running: "running", stopped: "stopped", done: "tasks done" },
+        short: { failed: "failed", running: "run", stopped: "stop", done: "done" },
+      },
       ownerStopped: "Stopped",
       stoppedOwners: (n) => `${String(n)} owner${n === 1 ? "" : "s"} stopped`,
       marks: { doing: "In progress", ready: "Ready", blocked: "Waiting", done: "Done" },
@@ -1248,8 +1256,11 @@ const TEXT: Record<Locale, UiText> = {
     team: {
       title: "团队",
       memberCount: (n) => `${String(n)} 名成员`,
-      runningCount: (n) => `${String(n)} 个运行中`,
-      failedCount: (n) => `${String(n)} 个创建失败`,
+      head: {
+        title: "DeepSeek",
+        words: { failed: "创建失败", running: "运行中", stopped: "已停止", done: "任务完成" },
+        short: { failed: "失败", running: "运行", stopped: "停止", done: "完成" },
+      },
       ownerStopped: "已停止",
       stoppedOwners: (n) => `${String(n)} 个负责人已停止`,
       marks: { doing: "进行中", ready: "可开始", blocked: "等待依赖", done: "已完成" },

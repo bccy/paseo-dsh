@@ -5,8 +5,9 @@
  *
  * **No member rows (T5).** Ten members filled a phone's first screen and could
  * not be opened, while Paseo's own subagent panel already lists them and opens
- * each conversation. The roster is one summary line in the section-label slot
- * (「10 名成员 · 2 个运行中」, red 「1 个创建失败」), and who is working shows
+ * each conversation. The roster is one headline (T7): whale + 「DeepSeek」 +
+ * 「N 名成员」 and small status chips (创建失败 red, 运行中 with the host ring,
+ * 已停止 grey dot, 任务完成 N/M with the host check), and who is working shows
  * where it matters: right after an owner's name, the host running ring when the
  * server says the owner runs, a grey 已停止 tag when it says the owner stopped
  * (an in-progress task left behind — DSH does not release on exit), and the
@@ -45,11 +46,15 @@ import {
   rowTextColumn,
 } from "./jobs-popover-layout";
 import type { TeamText } from "./locale";
+import { DeepSeekMark } from "./deepseek-mark";
 import { StatusRingMark } from "./status-ring";
 import {
   TEAM_TASK_ICONS,
-  teamMemberSummary,
-  teamMemberSummaryText,
+  TEAM_HEAD_LEVELS,
+  teamHeadAt,
+  teamHeadItems,
+  teamHeadLabel,
+  teamHeadLevel,
   teamOwnerState,
   teamStoppedOwnerCount,
   teamTaskFacts,
@@ -58,6 +63,8 @@ import {
   teamTaskGroups,
   teamTaskMark,
   teamWarningText,
+  type TeamHeadItem,
+  type TeamHeadLevel,
   type TeamOwnerState,
   type TeamTaskMark,
 } from "./team-polling";
@@ -126,29 +133,134 @@ function OwnerMark({ state, theme, text }: { state: TeamOwnerState | undefined; 
 const TEAM_TAG_FONT_SIZE = 11;
 
 /**
- * The roster in one line (T5), in the section-label slot right above the
- * tasks: 「10 名成员 · 2 个运行中」, a red 「· 1 个创建失败」 when someone failed
- * to start. Not pressable — Paseo's own subagent panel lists the members.
+ * The status chips' box (T7). Deliberately **not** the composer pill's shape
+ * (the pill sits right under this panel): 18px tall against the pill's ~28,
+ * a 4px corner against its full round, no border, and a flat tint instead of
+ * the pill's surface + border + hover fill. Not pressable, no chevron.
  */
-function MemberSummary({ team, theme, text }: { team: TeamView; theme: PopoverTheme; text: TeamText }) {
-  const summary = teamMemberSummaryText(teamMemberSummary(team.members), text);
-  const label = summary.failed === "" ? summary.plain : `${summary.plain} · ${summary.failed}`;
+export const TEAM_CHIP_HEIGHT = 18;
+export const TEAM_CHIP_RADIUS = 4;
+
+/** A chip's leading glyph: host ring (运行中), grey dot (已停止), host check (任务完成), red dot (创建失败). */
+function HeadGlyph({ item, theme }: { item: TeamHeadItem; theme: PopoverTheme }) {
+  const box = { width: 12, height: 12, alignItems: "center", justifyContent: "center" } as const;
+  if (item.key === "running") {
+    return (
+      <View style={box}>
+        <StatusRingMark size={12} color={ringColorFor(theme.colors.surface0)} />
+      </View>
+    );
+  }
+  if (item.key === "done") {
+    return (
+      <View style={box}>
+        <Icon name="CircleCheck" size={12} color={theme.colors.statusSuccess} />
+      </View>
+    );
+  }
+  const color = item.key === "failed" ? theme.colors.statusDanger : theme.colors.foregroundMuted;
+  return (
+    <View style={box}>
+      <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: color, opacity: item.key === "stopped" ? 0.6 : 1 }} />
+    </View>
+  );
+}
+
+/** A tint of a `#rrggbb` theme colour; anything else falls back to `surface2`. */
+function tint(color: string, fallback: string): string {
+  return /^#[0-9a-f]{6}$/i.test(color) ? `${color}24` : fallback;
+}
+
+function HeadChip({ item, theme, text, short }: { item: TeamHeadItem; theme: PopoverTheme; text: TeamText; short: boolean }) {
+  const failed = item.key === "failed";
+  return (
+    <View
+      testID={`team-chip-${item.key}`}
+      style={{
+        flexDirection: "row",
+        alignItems: "center",
+        gap: 4,
+        height: TEAM_CHIP_HEIGHT,
+        borderRadius: TEAM_CHIP_RADIUS,
+        paddingHorizontal: 5,
+        backgroundColor: failed ? tint(theme.colors.statusDanger, theme.colors.surface2) : theme.colors.surface2,
+        flexShrink: 0,
+      }}
+    >
+      <HeadGlyph item={item} theme={theme} />
+      <Text numberOfLines={1} style={{ fontSize: FACTS_FONT_SIZE, lineHeight: 16, color: failed ? theme.colors.statusDanger : theme.colors.foregroundMuted }}>
+        {teamHeadLabel(item, text, short)}
+      </Text>
+    </View>
+  );
+}
+
+/**
+ * The roster headline (T7, direction 2): whale + 「DeepSeek」 + 「N 名成员」, then
+ * the status chips, all on one line. Not pressable — Paseo's own subagent
+ * panel lists and opens the members.
+ *
+ * The chips are fitted by measurement: every `TEAM_HEAD_LEVELS` level is laid
+ * out once, invisibly; the first whose width fits the room the title left is
+ * shown (`teamHeadLevel`). `onLayout` works the same on web and native.
+ */
+function TeamHeadline({ team, theme, text }: { team: TeamView; theme: PopoverTheme; text: TeamText }) {
+  const items = teamHeadItems(team);
+  const [room, setRoom] = useState<number | undefined>(undefined);
+  const [widths, setWidths] = useState<(number | undefined)[]>([]);
+  const level = TEAM_HEAD_LEVELS[teamHeadLevel(widths, room)];
+  const members = text.memberCount(team.members.length);
+  const shown = teamHeadAt(items, level);
+  const cluster = (candidate: TeamHeadLevel) => (
+    <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
+      {teamHeadAt(items, candidate).map((item) => (
+        <HeadChip key={item.key} item={item} theme={theme} text={text} short={candidate.short} />
+      ))}
+    </View>
+  );
   return (
     <View
       accessible
       accessibilityRole="header"
-      accessibilityLabel={label}
-      style={{ flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingTop: 8, paddingBottom: 4 }}
+      accessibilityLabel={[text.head.title, members, ...shown.map((item) => teamHeadLabel(item, text, false))].join("，")}
+      style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 12, paddingTop: 10, paddingBottom: 6 }}
     >
-      <Text numberOfLines={1} style={{ flexShrink: 1, fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}>
-        {summary.plain}
-        {summary.failed === "" ? null : (
-          <>
-            <Text>{" · "}</Text>
-            <Text style={{ color: theme.colors.statusDanger }}>{summary.failed}</Text>
-          </>
-        )}
+      <DeepSeekMark size={16} />
+      <Text numberOfLines={1} style={{ flexShrink: 0, fontSize: TITLE_FONT_SIZE, fontWeight: "500", color: theme.colors.foreground }}>
+        {text.head.title}
       </Text>
+      <Text numberOfLines={1} style={{ flexShrink: 0, fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}>
+        {members}
+      </Text>
+      {items.length === 0 ? null : (
+        <View
+          style={{ flexGrow: 1, flexShrink: 1, minWidth: 0, flexDirection: "row", justifyContent: "flex-end" }}
+          onLayout={(event) => setRoom(event.nativeEvent.layout.width)}
+        >
+          {TEAM_HEAD_LEVELS.map((candidate, index) => (
+            <View
+              key={index}
+              aria-hidden
+              accessibilityElementsHidden
+              importantForAccessibility="no-hide-descendants"
+              pointerEvents="none"
+              style={{ position: "absolute", right: 0, top: 0, opacity: 0 }}
+              onLayout={(event) => {
+                const width = event.nativeEvent.layout.width;
+                setWidths((prev) => {
+                  if (prev[index] === width) return prev;
+                  const next = [...prev];
+                  next[index] = width;
+                  return next;
+                });
+              }}
+            >
+              {cluster(candidate)}
+            </View>
+          ))}
+          <View testID="team-head-chips">{cluster(level)}</View>
+        </View>
+      )}
     </View>
   );
 }
@@ -389,7 +501,7 @@ export function TeamPanel({ team, text, theme, compact, initialTaskId, initialDo
   return (
     <View style={{ ...popoverRootBox(), margin: -12, paddingBottom: 4 }}>
       {team.failure === undefined ? null : <FailureRow theme={theme} text={text} compact={compact} failure={team.failure} />}
-      <MemberSummary team={team} theme={theme} text={text} />
+      <TeamHeadline team={team} theme={theme} text={text} />
       {team.tasks.length === 0 ? (
         <NoteLine theme={theme} compact={compact}>
           {text.noTasks}

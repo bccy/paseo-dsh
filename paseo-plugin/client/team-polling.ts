@@ -3,7 +3,7 @@
  *
  * Everything the pill and the panel decide lives here as plain functions, so
  * `harness/team-pill-check.cjs` can assert it without React or a host: whether
- * the pill shows, which icon it wears, the roster's one-line summary and the owner's ring / 已停止 tag (T5: a
+ * the pill shows, which icon it wears, the roster headline's chips (T7) and the owner's ring / 已停止 tag (T5: a
  * member with no live state is never counted as running, and no idle word is
  * ever drawn), the owner's running ring, the task mark and the direction-B
  * grouping, and the facts lines.
@@ -87,35 +87,83 @@ export function teamMemberState(member: TeamMember): TeamMemberState {
 }
 
 /**
- * The roster's one-line summary (T5): 「10 名成员 · 2 个运行中 · 1 个创建失败」.
+ * The roster headline's status chips (T7, direction 2): 「DeepSeek」 +
+ * 「N 名成员」, then one chip per non-zero count — 创建失败, 运行中, 已停止,
+ * 任务完成 N/M — in that order.
  *
- * The member rows are gone — Paseo's own subagent panel lists the members and
- * opens them — so the panel keeps only this line. `running` counts members the
- * server *said* run (`running === true`) and is shown only when there is at
- * least one: a count of zero, or any idle word, would claim knowledge the
- * server half may not have (an unhosted member carries no `running`). Failed
- * members are counted separately so the line can tint that part red.
+ * `running` / `stopped` come only from the server's own run state: they are
+ * left out entirely when no member carries `running` (unknown is not idle and
+ * not busy). `running` counts every active member with `running === true`
+ * (the Lead included, as the pill's sheet always has); `stopped` counts
+ * **teammates** with `running === false` — an idle Lead is waiting for the
+ * user, not stopped. `done` is the board's task completion: members have no
+ * done state. A count of zero never becomes a chip.
  */
-export interface TeamMemberSummary {
-  total: number;
-  running: number;
-  failed: number;
+export type TeamHeadKey = "failed" | "running" | "stopped" | "done";
+
+export interface TeamHeadItem {
+  key: TeamHeadKey;
+  /** `2`, or `5/8` for the task count. */
+  count: string;
 }
 
-export function teamMemberSummary(members: readonly TeamMember[]): TeamMemberSummary {
-  return {
-    total: members.length,
-    running: members.filter((member) => teamMemberState(member) === "running").length,
-    failed: members.filter((member) => teamMemberState(member) === "failed").length,
-  };
+export function teamHeadItems(team: TeamView): TeamHeadItem[] {
+  const known = team.members.some((member) => member.running !== undefined);
+  const states = team.members.map((member) => ({ member, state: teamMemberState(member) }));
+  const failed = states.filter((s) => s.state === "failed").length;
+  const running = states.filter((s) => s.state === "running").length;
+  const stopped = states.filter((s) => s.state === "idle" && s.member.role === "teammate").length;
+  const done = team.tasks.filter((task) => task.status === "completed").length;
+  const items: TeamHeadItem[] = [];
+  if (failed > 0) items.push({ key: "failed", count: String(failed) });
+  if (known && running > 0) items.push({ key: "running", count: String(running) });
+  if (known && stopped > 0) items.push({ key: "stopped", count: String(stopped) });
+  if (done > 0) items.push({ key: "done", count: `${String(done)}/${String(team.tasks.length)}` });
+  return items;
 }
 
-/** The summary's plain half (count, then the running count when positive) and its red half (or ""). */
-export function teamMemberSummaryText(summary: TeamMemberSummary, text: TeamText): { plain: string; failed: string } {
-  const plain = [text.memberCount(summary.total), summary.running > 0 ? text.runningCount(summary.running) : undefined]
-    .filter((part): part is string => part !== undefined)
-    .join(" · ");
-  return { plain, failed: summary.failed > 0 ? text.failedCount(summary.failed) : "" };
+/**
+ * The narrow-width ladder. The chips must stay on the headline's one line;
+ * each level is laid out (invisibly) and the first that fits is shown:
+ * full words → short words → drop 已停止 (the 进行中 header already says
+ * 「N 个负责人已停止」) → drop 任务完成 (the 已完成 group keeps its count).
+ * 创建失败 and 运行中 are never dropped and never lose their word.
+ */
+export interface TeamHeadLevel {
+  short: boolean;
+  drop: readonly TeamHeadKey[];
+}
+export const TEAM_HEAD_LEVELS: readonly TeamHeadLevel[] = [
+  { short: false, drop: [] },
+  { short: true, drop: [] },
+  { short: true, drop: ["stopped"] },
+  { short: true, drop: ["stopped", "done"] },
+];
+
+/** The chips one level keeps. */
+export function teamHeadAt(items: readonly TeamHeadItem[], level: TeamHeadLevel): TeamHeadItem[] {
+  return items.filter((item) => !level.drop.includes(item.key));
+}
+
+/**
+ * Which level to show: the first whose measured width fits `room`. Before
+ * anything is measured the full level is drawn; when nothing fits, the last
+ * (which still keeps 失败 and 运行中 with their words).
+ */
+export function teamHeadLevel(widths: readonly (number | undefined)[], room: number | undefined): number {
+  if (room === undefined) return 0;
+  for (let index = 0; index < TEAM_HEAD_LEVELS.length; index += 1) {
+    const width = widths[index];
+    if (width === undefined) return index === 0 ? 0 : index - 1;
+    if (width <= room) return index;
+  }
+  return TEAM_HEAD_LEVELS.length - 1;
+}
+
+/** One chip's text: 「2 运行中」 / short 「2 运行」. */
+export function teamHeadLabel(item: TeamHeadItem, text: TeamText, short: boolean): string {
+  const words = short ? text.head.short : text.head.words;
+  return `${item.count} ${words[item.key]}`;
 }
 
 /**

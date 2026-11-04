@@ -660,19 +660,22 @@ console.log("the team pill, panel and cards (T3)");
   for (const [key, value] of Object.entries(zhLeaves)) {
     check(`team.${key} is non-empty in both`, value.trim() !== "" && (enLeaves[key] ?? "").trim() !== "");
   }
-  equal("team: English is not a copy of Chinese", Object.keys(zhLeaves).filter((key) => zhLeaves[key] === enLeaves[key]), []);
+  // `head.title` is the brand 「DeepSeek」 in both languages, on purpose.
+  equal("team: English is not a copy of Chinese", Object.keys(zhLeaves).filter((key) => key !== "head.title" && zhLeaves[key] === enLeaves[key]), []);
+  equal("team: the headline title is DeepSeek (zh/en)", [zh.head.title, en.head.title], ["DeepSeek", "DeepSeek"]);
   equal("team: the title is the noun (zh)", zh.title, "团队");
   equal("team: the title is the noun (en)", en.title, "Team");
-  // T5: the roster is one summary line; no per-member words remain.
+  // T7: the roster is a headline with status chips.
   equal("team: member count (zh)", zh.memberCount(10), "10 名成员");
-  equal("team: running count (zh)", zh.runningCount(2), "2 个运行中");
-  equal("team: failed count (zh)", zh.failedCount(1), "1 个创建失败");
   equal("team: member count (en)", [en.memberCount(1), en.memberCount(10)], ["1 member", "10 members"]);
-  equal("team: running / failed (en)", [en.runningCount(2), en.failedCount(1)], ["2 running", "1 failed to start"]);
+  equal("team: chip words (zh)", zh.head.words, { failed: "创建失败", running: "运行中", stopped: "已停止", done: "任务完成" });
+  equal("team: chip short words (zh)", zh.head.short, { failed: "失败", running: "运行", stopped: "停止", done: "完成" });
+  equal("team: chip keys match", [Object.keys(en.head.words).sort(), Object.keys(en.head.short).sort()], [Object.keys(zh.head.words).sort(), Object.keys(zh.head.short).sort()]);
+  check("team: the T5 summary keys are gone", !("runningCount" in zh) && !("failedCount" in zh), Object.keys(zh).join(","));
   check("team: no member-row keys remain", !("memberStates" in zh) && !("memberActive" in zh) && !("members" in zh) && !("lead" in zh), Object.keys(zh).join(","));
   equal("team: stopped tag (zh/en)", [zh.ownerStopped, en.ownerStopped], ["已停止", "Stopped"]);
   equal("team: stopped owners note (zh)", zh.stoppedOwners(10), "10 个负责人已停止");
-  for (const key of ["memberCount", "runningCount", "failedCount", "stoppedOwners"]) {
+  for (const key of ["memberCount", "stoppedOwners"]) {
     check(`team.${key}: English is not the Chinese`, en[key](3) !== zh[key](3));
   }
   equal("team: the group words", zh.marks, { doing: "进行中", ready: "可开始", blocked: "等待依赖", done: "已完成" });

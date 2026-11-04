@@ -6,8 +6,9 @@
  * `goal-popover-render-check.cjs` (real lucide glyphs, inline SVG). Asserts:
  * the section order (failure → roster summary → tasks), the B groups and their
  * order, the done group folded by default and opening in place, a blocked task
- * never under 可开始, **no member rows** (T5: one summary line 「N 名成员 · M 个
- * 运行中」, the running part only from `running: true`, red 「K 个创建失败」), the
+ * never under 可开始, **no member rows** (T5), the roster headline (T7: whale +
+ * 「DeepSeek」 + 「N 名成员」 + status chips — 运行中/已停止 only from `running`,
+ * no chip for a zero count, failed red, chips not pill-shaped), the
  * owner's mark (the ring after a running owner, a grey 已停止 tag after an
  * owner the server saw stop, nothing when running is unknown; list and detail
  * page) and the 进行中 header's 「N 个负责人已停止」, the description clamped to two lines in the list,
@@ -224,30 +225,54 @@ console.log("sections and direction-B groups");
   assert("the old 共享任务 header is not drawn in B", !container.textContent.includes("共享任务"));
 }
 
-console.log("\nthe roster is one summary line (T5)");
+const headline = (c) => [...c.querySelectorAll('[role="heading"]')].find((n) => (n.getAttribute("aria-label") ?? "").startsWith("DeepSeek"));
+const chip = (c, key) => headline(c)?.querySelector(`[data-testid="team-head-chips"] [data-testid="team-chip-${key}"]`) ?? null;
+const chipKeys = (c) => [...(headline(c)?.querySelectorAll('[data-testid="team-head-chips"] [data-testid^="team-chip-"]') ?? [])].map((n) => n.getAttribute("data-testid").slice(10));
+
+console.log("\nthe roster headline (T7): DeepSeek + N 名成员 + status chips");
 {
   const { container } = render({ team: BOARD });
-  const summary = byLabel(container, "4 名成员 · 1 个运行中");
-  assert("the summary line reads 4 名成员 · 1 个运行中", summary !== undefined, texts(container).slice(0, 3).join("|"));
-  check("…as a header", summary?.getAttribute("role"), "heading");
-  assert("…and is not pressable", summary?.closest('[role="button"]') === null);
-  for (const name of ["lead", "reviewer", "elsewhere"]) {
+  const head = headline(container);
+  check("the headline names DeepSeek, the count and its chips", head?.getAttribute("aria-label"), "DeepSeek，4 名成员，1 运行中，1 已停止，1/5 任务完成");
+  check("…as a header", head?.getAttribute("role"), "heading");
+  assert("…and is not pressable", head?.closest('[role="button"]') === null && head?.querySelector('[role="button"]') === null);
+  check("…with the whale", head?.querySelectorAll('[data-icon="svg"]').length, 1);
+  assert("…and the title is DeepSeek, not 团队", [...head.querySelectorAll('[dir="auto"]')].some((n) => n.textContent === "DeepSeek") && !head.textContent.includes("团队"));
+  check("the chips, in order", JSON.stringify(chipKeys(container)), JSON.stringify(["running", "stopped", "done"]));
+  assert("the running chip carries the host ring", chip(container, "running")?.querySelector("div div") !== null && chip(container, "running")?.textContent === "1 运行中");
+  assert("the done chip carries the host check", chip(container, "done")?.querySelector('[data-icon="CircleCheck"]') !== null && chip(container, "done")?.textContent === "1/5 任务完成");
+  // Not a composer pill: 18px tall, 4px corner, no border.
+  const style = chip(container, "running")?.getAttribute("style") ?? "";
+  assert("a chip is 18px tall with a 4px corner", /height:\s*18px/.test(style) && /border-top-left-radius:\s*4px/.test(style), style);
+  assert("…and has no border", !/border-(top|left)-width:\s*[1-9]/.test(style), style);
+  for (const name of ["lead", "reviewer", "elsewhere", "fixer"]) {
     assert(`no member row: ${name} is not drawn`, !texts(container).includes(name), texts(container).join("|"));
   }
-  assert("no member row for a running teammate either (fixer only as an owner)", !texts(container).includes("fixer"), texts(container).join("|"));
   assert("no idle word anywhere", !container.textContent.includes("空闲"));
-  assert("no whale (it marked the Lead row)", container.querySelector('[data-icon="svg"]') === null);
   assert("no per-member facts like 运行中 · …", !/运行中 ·/.test(container.textContent));
-  const unknown = render({ team: { members: [LEAD, ...BOARD.members.slice(1).map(({ running, ...rest }) => rest)].map(({ running, ...rest }) => rest), tasks: BOARD.tasks } }).container;
-  assert("running missing everywhere: only the count", byLabel(unknown, "4 名成员") !== undefined, texts(unknown).slice(0, 2).join("|"));
+  // Run state missing: no 运行中 / 已停止 chip.
+  const unknown = render({ team: { members: BOARD.members.map(({ running, ...rest }) => rest), tasks: BOARD.tasks } }).container;
+  check("running missing: only the done chip", JSON.stringify(chipKeys(unknown)), JSON.stringify(["done"]));
   assert("…no 运行中 anywhere", !unknown.textContent.includes("运行中"), unknown.textContent);
-  check("…and no ring anywhere", unknown.querySelectorAll(RING).length, 0);
+  assert("…no 已停止 anywhere", !unknown.textContent.includes("已停止"), unknown.textContent);
+  check("…and the headline reads", headline(unknown)?.getAttribute("aria-label"), "DeepSeek，4 名成员，1/5 任务完成");
+  // A zero count is never a chip.
+  const zero = render({ team: { members: [LEAD, mate({ id: "a", name: "a", running: true })], tasks: [task({ id: "task-1", subject: "x", status: "in_progress" })] } }).container;
+  check("zero stopped, zero done: only running", JSON.stringify(chipKeys(zero)), JSON.stringify(["running"]));
+  const none = render({ team: { members: [LEAD, mate({ id: "a", name: "a" })], tasks: [] } }).container;
+  check("nothing to count: no chip at all", chipKeys(none).length, 0);
+  // A failed member: a red chip, first.
   const failedBoard = { ...BOARD, members: [...BOARD.members, mate({ id: "f", name: "broken", phase: "failed", error: "child Session recovery failed: x" })] };
   const failed = render({ team: failedBoard }).container;
-  assert("a failed member adds a red part", byLabel(failed, "5 名成员 · 1 个运行中 · 1 个创建失败") !== undefined, texts(failed).slice(0, 3).join("|"));
-  const red = [...failed.querySelectorAll("span, div")].filter((node) => (node.textContent ?? "").trim() === "1 个创建失败").at(-1);
+  check("a failed member: the failed chip leads", chipKeys(failed)[0], "failed");
+  const red = [...(chip(failed, "failed")?.querySelectorAll('[dir="auto"]') ?? [])].find((n) => n.textContent === "1 创建失败");
   assert("…in statusDanger", /color:\s*rgb\(157, 67, 59\)/.test(red?.getAttribute("style") ?? ""), red?.outerHTML);
+  assert("…on a danger tint", /background-color:\s*rgba\(157, 67, 59/.test(chip(failed, "failed")?.getAttribute("style") ?? ""), chip(failed, "failed")?.getAttribute("style"));
   assert("…and DSH's member error is not drawn as a row", !failed.textContent.includes("child Session recovery failed"));
+  // The hidden measuring copies stay out of the accessibility tree.
+  const hidden = [...head.querySelectorAll('[aria-hidden="true"]')].filter((n) => /opacity:\s*0/.test(n.getAttribute("style") ?? "") && /position:\s*absolute/.test(n.getAttribute("style") ?? ""));
+  check("four hidden measuring copies, one per ladder level", hidden.length, 4);
+  assert("…none of them inside the shown chips", hidden.every((n) => n.closest('[data-testid="team-head-chips"]') === null));
 }
 
 console.log("\nthe owner's running ring (T5)");
@@ -304,7 +329,7 @@ console.log("\nstopped owners (T5): 已停止 only from running:false");
   const allHeader = [...all.querySelectorAll('[role="heading"]')].find((node) => (node.textContent ?? "").startsWith("进行中"));
   check("all ten stopped: the header says so", allHeader?.textContent, "进行中10 · 10 个负责人已停止");
   check("…ten 已停止 tags", [...all.querySelectorAll('[dir="auto"]')].filter((node) => node.textContent === "已停止").length, 10);
-  check("…the summary has no running part", byLabel(all, "10 名成员") !== undefined, true);
+  check("…the headline has a stopped chip and no running chip", JSON.stringify(chipKeys(all)), JSON.stringify(["stopped"]));
   assert("…and the tasks stay under 进行中 (DSH's status, not re-judged)", !all.textContent.includes("已完成"), all.textContent);
   // The detail page.
   click(byLabelStart(container, "独立审查修复"));
@@ -358,12 +383,12 @@ console.log("\nempty, Lead-only, failure, read-only");
   const empty = render({ team: { members: [LEAD, mate({ id: "x", name: "x", running: true })], tasks: [] } }).container;
   assert("an empty board says 暂无共享任务", empty.textContent.includes("暂无共享任务"));
   const leadOnly = render({ team: { members: [LEAD], tasks: [task({ id: "task-1", subject: "a", ready: true })] } }).container;
-  assert("a Lead-only board says 1 名成员 and lists its tasks", byLabel(leadOnly, "1 名成员") !== undefined && leadOnly.textContent.includes("可开始"));
+  assert("a Lead-only board says 1 名成员 and lists its tasks", headline(leadOnly)?.getAttribute("aria-label") === "DeepSeek，1 名成员" && leadOnly.textContent.includes("可开始"));
   const failed = render({ team: { ...BOARD, failure: 'team task "task-3" revision is not contiguous', members: [...BOARD.members, mate({ id: "f", name: "broken", phase: "failed", error: "child Session recovery failed: x" })] } }).container;
   const alert = failed.querySelector('[role="alert"]');
   assert("the failure row comes first", alert !== null && failed.textContent.indexOf("团队记录无效") < failed.textContent.indexOf("名成员"));
   assert("…with DSH's sentence verbatim", failed.textContent.includes('团队记录无效：team task "task-3" revision is not contiguous'));
-  assert("a failed member shows in the summary", failed.textContent.includes("1 个创建失败"));
+  assert("a failed member shows in the headline", chipKeys(failed).includes("failed"));
   const { container } = render({ team: BOARD });
   const buttons = [...container.querySelectorAll('[role="button"]')].map((node) => node.getAttribute("aria-label"));
   check("the only buttons are four visible task rows and the done fold", buttons.length, 5);

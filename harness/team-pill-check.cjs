@@ -32,8 +32,11 @@ const {
   TEAM_TASK_ICONS,
   createTeamPoller,
   teamMemberState,
-  teamMemberSummary,
-  teamMemberSummaryText,
+  TEAM_HEAD_LEVELS,
+  teamHeadAt,
+  teamHeadItems,
+  teamHeadLabel,
+  teamHeadLevel,
   teamOwnerRunning,
   teamOwnerState,
   teamStoppedOwnerCount,
@@ -104,33 +107,55 @@ console.log("\nthe pill icon");
   equal("a projection failure → failed, even with a runner", teamPillIcon({ members: [LEAD, mate({ running: true })], tasks: [], failure: "bad" }), "failed");
 }
 
-console.log("\nthe roster summary (T5): no running count without the server's running");
+console.log("\nthe roster headline chips (T7): no running/stopped without the server's running");
 {
   equal("running: true → running", teamMemberState(mate({ running: true })), "running");
   equal("running: false → idle", teamMemberState(mate({ running: false })), "idle");
   equal("no running → unknown", teamMemberState(mate()), "unknown");
   equal("provisioning wins over running", teamMemberState(mate({ phase: "provisioning", running: true })), "provisioning");
   equal("failed wins over running", teamMemberState(mate({ phase: "failed", running: true })), "failed");
-  // The user's screenshot scale: 10 members, 2 running.
-  const ten = [LEAD, ...Array.from({ length: 9 }, (_, i) => mate({ id: `m${i}`, name: `m${i}`, running: i < 2 ? true : false }))];
-  equal("10 members, 2 running", teamMemberSummary(ten), { total: 10, running: 2, failed: 0 });
-  equal("zh summary", teamMemberSummaryText(teamMemberSummary(ten), ZH), { plain: "10 名成员 · 2 个运行中", failed: "" });
-  equal("en summary", teamMemberSummaryText(teamMemberSummary(ten), EN), { plain: "10 members · 2 running", failed: "" });
-  // Running missing everywhere: only the count, no running word, no idle word.
-  const unknown = [LEAD, ...Array.from({ length: 9 }, (_, i) => mate({ id: `u${i}`, name: `u${i}` }))];
-  for (const [name, text] of [["zh-CN", ZH], ["en", EN]]) {
-    const line = teamMemberSummaryText(teamMemberSummary(unknown), text);
-    equal(`${name}: unknown running → only the count`, line.plain, text.memberCount(10));
-    assert(`${name}: …never a running word`, !line.plain.includes(text.runningCount(0).replace(/^0\s*/, "")), line.plain);
-    assert(`${name}: …never an idle word`, !/空闲|idle/i.test(line.plain), line.plain);
+  const keys = (team) => teamHeadItems(team).map((i) => `${i.key}:${i.count}`);
+  // The user's screenshot: 4 members all running, 3 in-progress tasks.
+  const user = { members: [{ ...LEAD, running: true }, mate({ id: "a", name: "a", running: true }), mate({ id: "b", name: "b", running: true }), mate({ id: "c", name: "c", running: true })], tasks: [0, 1, 2].map((i) => task({ id: `task-${i}`, status: "in_progress" })) };
+  equal("user scale: only 4 running", keys(user), ["running:4"]);
+  // Mixed: 2 running (Lead + one), 1 stopped, 1 failed, 5/8 done.
+  const mixed = {
+    members: [{ ...LEAD, running: true }, mate({ id: "f", name: "f", running: true }), mate({ id: "r", name: "r", running: false }), mate({ id: "x", name: "x", phase: "failed" })],
+    tasks: Array.from({ length: 8 }, (_, i) => task({ id: `task-${i}`, status: i < 5 ? "completed" : "in_progress" })),
+  };
+  equal("mixed: failed, running, stopped, done in order", keys(mixed), ["failed:1", "running:2", "stopped:1", "done:5/8"]);
+  // Run state missing for everyone: no running / stopped chip at all.
+  const unknown = { members: mixed.members.map(({ running, ...rest }) => rest), tasks: mixed.tasks };
+  equal("running missing: no running or stopped chip", keys(unknown), ["failed:1", "done:5/8"]);
+  // Zero counts are never chips.
+  equal("nothing to count: no chips", keys({ members: [LEAD, mate()], tasks: [task()] }), []);
+  equal("no completed task: no done chip", keys({ members: [LEAD], tasks: [task({ status: "in_progress" })] }), []);
+  equal("an idle Lead is not stopped", keys({ members: [{ ...LEAD, running: false }, mate({ running: true })], tasks: [] }), ["running:1"]);
+  equal("a failed member with running:true is not running", keys({ members: [LEAD, mate({ phase: "failed", running: true })], tasks: [] }), ["failed:1"]);
+  // Labels.
+  const item = { key: "running", count: "2" };
+  equal("zh full / short", [teamHeadLabel(item, ZH, false), teamHeadLabel(item, ZH, true)], ["2 运行中", "2 运行"]);
+  equal("zh done", teamHeadLabel({ key: "done", count: "5/8" }, ZH, false), "5/8 任务完成");
+  equal("zh failed", [teamHeadLabel({ key: "failed", count: "1" }, ZH, false), teamHeadLabel({ key: "failed", count: "1" }, ZH, true)], ["1 创建失败", "1 失败"]);
+  equal("en running", teamHeadLabel(item, EN, false), "2 running");
+  equal("member count", [ZH.memberCount(4), EN.memberCount(1)], ["4 名成员", "1 member"]);
+  // The ladder: failed and running are never dropped and keep a word at every level.
+  equal("four levels", TEAM_HEAD_LEVELS.length, 4);
+  for (const [index, level] of TEAM_HEAD_LEVELS.entries()) {
+    const kept = teamHeadAt(teamHeadItems(mixed), level).map((i) => i.key);
+    assert(`level ${index} keeps failed and running`, kept.includes("failed") && kept.includes("running"), kept.join(","));
+    for (const key of ["failed", "running"]) {
+      const label = teamHeadLabel({ key, count: "1" }, ZH, level.short);
+      assert(`level ${index}: ${key} keeps a word`, /[^\d\s/]/.test(label), label);
+    }
   }
-  equal("all idle (running:false) also draws only the count", teamMemberSummaryText(teamMemberSummary([LEAD, mate({ running: false })]), ZH).plain, "2 名成员");
-  equal("a running Lead counts", teamMemberSummary([{ ...LEAD, running: true }]).running, 1);
-  const withFailed = [...ten, mate({ id: "f", name: "broken", phase: "failed", running: true, error: "x" })];
-  equal("a failed member is counted apart, not as running", teamMemberSummary(withFailed), { total: 11, running: 2, failed: 1 });
-  equal("zh failed part", teamMemberSummaryText(teamMemberSummary(withFailed), ZH), { plain: "11 名成员 · 2 个运行中", failed: "1 个创建失败" });
-  equal("zh one member", ZH.memberCount(1), "1 名成员");
-  equal("en one member", EN.memberCount(1), "1 member");
+  equal("level order: full, short, -stopped, -done", TEAM_HEAD_LEVELS.map((l) => `${l.short}:${l.drop.join("+")}`), ["false:", "true:", "true:stopped", "true:stopped+done"]);
+  equal("unmeasured → full", teamHeadLevel([], undefined), 0);
+  equal("full fits → 0", teamHeadLevel([200, 160, 120, 90], 250), 0);
+  equal("short fits → 1", teamHeadLevel([300, 200, 120, 90], 250), 1);
+  equal("only -stopped fits → 2", teamHeadLevel([300, 260, 200, 90], 250), 2);
+  equal("only -done fits → 3", teamHeadLevel([300, 260, 255, 200], 250), 3);
+  equal("nothing fits → the last level (failed+running remain)", teamHeadLevel([300, 290, 280, 270], 250), 3);
 }
 
 console.log("\nthe owner's mark (T5): ring / 已停止 / nothing");
