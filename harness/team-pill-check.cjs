@@ -42,6 +42,7 @@ const {
   teamStoppedOwnerCount,
   teamPillIcon,
   teamPillVisible,
+  teamMateCount,
   teamTaskFacts,
   teamTaskFactsParts,
   teamTaskFields,
@@ -95,6 +96,10 @@ console.log("visibility");
   equal("the Lead and one task → visible", teamPillVisible({ members: [LEAD], tasks: [task()] }), true);
   equal("a teammate, no task → visible", teamPillVisible({ members: [LEAD, mate()], tasks: [] }), true);
   equal("a failure on an otherwise empty board stays hidden only when there is no team", teamPillVisible({ members: [LEAD], tasks: [], failure: "x" }), false);
+  // Visibility counts teammates, not rows: it must not lean on the synthesised Lead row.
+  equal("a teammate and no Lead row → visible", teamPillVisible({ members: [mate()], tasks: [] }), true);
+  equal("no rows, no task → hidden", teamPillVisible({ members: [], tasks: [] }), false);
+  equal("teammates are counted without the Lead", teamMateCount({ members: [LEAD, mate({ id: "a" }), mate({ id: "b" })], tasks: [] }), 2);
 }
 
 console.log("\nthe pill icon");
@@ -117,19 +122,21 @@ console.log("\nthe roster headline chips (T7): no running/stopped without the se
   const keys = (team) => teamHeadItems(team).map((i) => `${i.key}:${i.count}`);
   // The user's screenshot: 4 members all running, 3 in-progress tasks.
   const user = { members: [{ ...LEAD, running: true }, mate({ id: "a", name: "a", running: true }), mate({ id: "b", name: "b", running: true }), mate({ id: "c", name: "c", running: true })], tasks: [0, 1, 2].map((i) => task({ id: `task-${i}`, status: "in_progress" })) };
-  equal("user scale: only 4 running", keys(user), ["running:4"]);
+  equal("user scale: 3 running teammates (the running Lead is not counted)", keys(user), ["running:3"]);
   // Mixed: 2 running (Lead + one), 1 stopped, 1 failed, 5/8 done.
   const mixed = {
     members: [{ ...LEAD, running: true }, mate({ id: "f", name: "f", running: true }), mate({ id: "r", name: "r", running: false }), mate({ id: "x", name: "x", phase: "failed" })],
     tasks: Array.from({ length: 8 }, (_, i) => task({ id: `task-${i}`, status: i < 5 ? "completed" : "in_progress" })),
   };
-  equal("mixed: failed, running, stopped, done in order", keys(mixed), ["failed:1", "running:2", "stopped:1", "done:5/8"]);
+  equal("mixed: failed, running, stopped, done in order (Lead excluded)", keys(mixed), ["failed:1", "running:1", "stopped:1", "done:5/8"]);
   // Run state missing for everyone: no running / stopped chip at all.
   const unknown = { members: mixed.members.map(({ running, ...rest }) => rest), tasks: mixed.tasks };
   equal("running missing: no running or stopped chip", keys(unknown), ["failed:1", "done:5/8"]);
   // Zero counts are never chips.
   equal("nothing to count: no chips", keys({ members: [LEAD, mate()], tasks: [task()] }), []);
   equal("no completed task: no done chip", keys({ members: [LEAD], tasks: [task({ status: "in_progress" })] }), []);
+  equal("a running Lead alone is not 运行中", keys({ members: [{ ...LEAD, running: true }, mate()], tasks: [] }), []);
+  equal("a Lead's run state alone does not make it known", keys({ members: [{ ...LEAD, running: true }, mate({ id: "a" })], tasks: [] }), []);
   equal("an idle Lead is not stopped", keys({ members: [{ ...LEAD, running: false }, mate({ running: true })], tasks: [] }), ["running:1"]);
   equal("a failed member with running:true is not running", keys({ members: [LEAD, mate({ phase: "failed", running: true })], tasks: [] }), ["failed:1"]);
   // Labels.

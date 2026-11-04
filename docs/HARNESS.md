@@ -697,13 +697,13 @@
   其它抛错与形状不符 → `rpc_failed`（不清空成空看板）；DSH 字段原样；**`running`**：空闲根的 Lead 为 false、未托管队员无此键、
   托管中队员回合未结束为 true、已结束为 false、失败成员无此键。编译同 `goal-server-check`（`.dbg` + 拷入本脚本与
   `fake-dsh-bridge.mjs`）。**动了 `server/{dsh-process,session,provider}.ts` 的 team 部分、`shared/team.ts` 或假桥 `team` 模式必跑。**
-- `harness/team-pill-check.cjs` — `client/team-polling.ts` 纯规则（**116 条**）：可见性（只有 Lead 无任务隐藏）、成员标题行 chip（顺序、0 不出、运行态缺失不出运行中/已停止、Lead 空闲不算已停止、四档降级顺序与选档、各档保留失败与运行中且带字）、负责人标记（运行环 / 已停止只来自 `running` true/false，缺失不标，已完成不标）与「N 个负责人已停止」计数、pill 图标
+- `harness/team-pill-check.cjs` — `client/team-polling.ts` 纯规则（**121 条**）：可见性（按队员数而非行数：只有 Lead 无任务隐藏、无 Lead 行有队员可见）、成员标题行 chip（顺序、0 不出、运行态缺失不出运行中/已停止、计数只数队员（运行中的 Lead 不算运行中）、Lead 空闲不算已停止、四档降级顺序与选档、各档保留失败与运行中且带字）、负责人标记（运行环 / 已停止只来自 `running` true/false，缺失不标，已完成不标）与「N 个负责人已停止」计数、pill 图标
   （只有 `running:true` 才转环、failure/失败成员红）、成员词（无 `running` 时中英都不说运行中/空闲）与排序、任务标记只认 DSH 的
   `ready`、B 分组顺序（被阻塞任务不进可开始）、facts 行、详情字段、重叠警告翻译（未知原样）、契约码、poller 适配（终态移除、
   瞬态保留上次看板）、pill 接线源码钉（label/title 是名词、无计数）。运行：`cd paseo-plugin && npx tsc -p ../harness/team-pill.tsconfig.json`，
   写 `.dbg-team/package.json` 并拷入本脚本，`cd .dbg-team && node team-pill-check.cjs`。**动了 `client/team-*.ts(x)` 必跑。**
-- `harness/team-popover-render-check.cjs` — 真实 `TeamPanel` / `makeTeamPopover` 经 react-native-web 渲染进 jsdom（**86 条**）：
-  分区与分组顺序、已完成默认折叠且原地展开、被阻塞任务不在可开始、不画逐个成员行、标题行（鲸鱼 +「DeepSeek」+ 人数 + chip，chip 18px/4px 圆角/无边框，失败红底首位，运行态缺失只剩完成 chip，0 不出，四个隐藏量宽副本）、负责人运行环与「已停止」（列表与详情页）、进行中标题的已停止计数、10 个任务负责人全部已停止、
+- `harness/team-popover-render-check.cjs` — 真实 `TeamPanel` / `makeTeamPopover` 经 react-native-web 渲染进 jsdom（**89 条**）：
+  分区与分组顺序、已完成默认折叠且原地展开、被阻塞任务不在可开始、不画逐个成员行、标题行（鲸鱼 +「DeepSeek」+ 队员数 + chip，0 队员不写「0 名成员」，chip 18px/4px 圆角/无边框，失败红底首位，运行态缺失只剩完成 chip，0 不出，四个隐藏量宽副本）、负责人运行环与「已停止」（列表与详情页）、进行中标题的已停止计数、10 个任务负责人全部已停止、
   facts/警告、描述两行多行截断、详情页（返回行、字段、完整描述保留换行、返回回列表）、空看板、只有 Lead、failure 首行红字、
   只读（按钮只有任务行与折叠行）、容器订阅 store 重绘。**需要 `HOST_APP`**，未设 exit 2。**动了 `client/team-popover.tsx` / `team-pill.tsx` 必跑。**
 - `harness/tool-call-check.cjs` 团队段（399 → **443**）：`team_task_get/create/update/list` 字段卡、update 动作词（未知原样）、

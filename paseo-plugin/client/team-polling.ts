@@ -37,15 +37,21 @@ export interface TeamReadResult {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Whether there is a team to show: more than the Lead, or any task.
+ * Whether there is a team to show: at least one teammate, or any task.
  *
- * DSH always synthesises the Lead row, so "one member and no task" is a session
- * that has never used the team tools — no pill (T1 §6.1), the same shape as the
- * jobs pill hiding with nothing live and the goal pill hiding with no goal.
+ * Counted on `role === "teammate"`, not on `members.length > 1`: the rule must
+ * not depend on DSH synthesising the Lead row. A Lead alone with no task is a
+ * session that never used the team tools — no pill (T1 §6.1), the same shape
+ * as the jobs pill hiding with nothing live and the goal pill with no goal.
  */
 export function teamPillVisible(team: TeamView | null | undefined): boolean {
   if (team === null || team === undefined) return false;
-  return team.members.length > 1 || team.tasks.length > 0;
+  return teamMateCount(team) > 0 || team.tasks.length > 0;
+}
+
+/** How many teammates the board has — the Lead (the main session) is not one. */
+export function teamMateCount(team: TeamView): number {
+  return team.members.filter((member) => member.role === "teammate").length;
 }
 
 /** The pill's icon state. The label is always the noun. */
@@ -91,13 +97,14 @@ export function teamMemberState(member: TeamMember): TeamMemberState {
  * 「N 名成员」, then one chip per non-zero count — 创建失败, 运行中, 已停止,
  * 任务完成 N/M — in that order.
  *
- * `running` / `stopped` come only from the server's own run state: they are
- * left out entirely when no member carries `running` (unknown is not idle and
- * not busy). `running` counts every active member with `running === true`
- * (the Lead included, as the pill's sheet always has); `stopped` counts
- * **teammates** with `running === false` — an idle Lead is waiting for the
- * user, not stopped. `done` is the board's task completion: members have no
- * done state. A count of zero never becomes a chip.
+ * **Only teammates are counted** (the Lead is the main session the user is
+ * already looking at): `running` / `stopped` come only from the server's own
+ * run state and are left out entirely when no teammate carries `running`
+ * (unknown is not idle and not busy); `running` counts teammates with
+ * `running === true` (the pill's ring rule), `stopped` teammates with
+ * `running === false`, `failed` teammates that failed to start. `done` is the
+ * board's task completion: members have no done state. A count of zero never
+ * becomes a chip.
  */
 export type TeamHeadKey = "failed" | "running" | "stopped" | "done";
 
@@ -108,11 +115,12 @@ export interface TeamHeadItem {
 }
 
 export function teamHeadItems(team: TeamView): TeamHeadItem[] {
-  const known = team.members.some((member) => member.running !== undefined);
-  const states = team.members.map((member) => ({ member, state: teamMemberState(member) }));
-  const failed = states.filter((s) => s.state === "failed").length;
-  const running = states.filter((s) => s.state === "running").length;
-  const stopped = states.filter((s) => s.state === "idle" && s.member.role === "teammate").length;
+  const mates = team.members.filter((member) => member.role === "teammate");
+  const known = mates.some((member) => member.running !== undefined);
+  const states = mates.map((member) => teamMemberState(member));
+  const failed = states.filter((state) => state === "failed").length;
+  const running = states.filter((state) => state === "running").length;
+  const stopped = states.filter((state) => state === "idle").length;
   const done = team.tasks.filter((task) => task.status === "completed").length;
   const items: TeamHeadItem[] = [];
   if (failed > 0) items.push({ key: "failed", count: String(failed) });

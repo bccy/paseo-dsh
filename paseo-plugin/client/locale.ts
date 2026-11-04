@@ -148,7 +148,7 @@ export interface UiText {
 export interface TeamText {
   /** Pill label **and** title (= sheet header): the noun, in every state. */
   title: string;
-  /** The headline's member count (the Lead included). */
+  /** The headline's teammate count (the Lead — the main session — is not counted). */
   memberCount: (n: number) => string;
   /**
    * The roster headline (T7): the name next to the whale, and the status chips'

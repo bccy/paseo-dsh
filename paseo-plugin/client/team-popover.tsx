@@ -6,7 +6,7 @@
  * **No member rows (T5).** Ten members filled a phone's first screen and could
  * not be opened, while Paseo's own subagent panel already lists them and opens
  * each conversation. The roster is one headline (T7): whale + 「DeepSeek」 +
- * 「N 名成员」 and small status chips (创建失败 red, 运行中 with the host ring,
+ * 「N 名成员」 (teammates only) and small status chips (创建失败 red, 运行中 with the host ring,
  * 已停止 grey dot, 任务完成 N/M with the host check), and who is working shows
  * where it matters: right after an owner's name, the host running ring when the
  * server says the owner runs, a grey 已停止 tag when it says the owner stopped
@@ -55,6 +55,7 @@ import {
   teamHeadItems,
   teamHeadLabel,
   teamHeadLevel,
+  teamMateCount,
   teamOwnerState,
   teamStoppedOwnerCount,
   teamTaskFacts,
@@ -209,7 +210,9 @@ function TeamHeadline({ team, theme, text }: { team: TeamView; theme: PopoverThe
   const [room, setRoom] = useState<number | undefined>(undefined);
   const [widths, setWidths] = useState<(number | undefined)[]>([]);
   const level = TEAM_HEAD_LEVELS[teamHeadLevel(widths, room)];
-  const members = text.memberCount(team.members.length);
+  // Teammates only (the Lead is the main session); none → no 「0 名成员」.
+  const mateCount = teamMateCount(team);
+  const members = mateCount > 0 ? text.memberCount(mateCount) : undefined;
   const shown = teamHeadAt(items, level);
   const cluster = (candidate: TeamHeadLevel) => (
     <View style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
@@ -222,16 +225,18 @@ function TeamHeadline({ team, theme, text }: { team: TeamView; theme: PopoverThe
     <View
       accessible
       accessibilityRole="header"
-      accessibilityLabel={[text.head.title, members, ...shown.map((item) => teamHeadLabel(item, text, false))].join("，")}
+      accessibilityLabel={[text.head.title, ...(members === undefined ? [] : [members]), ...shown.map((item) => teamHeadLabel(item, text, false))].join("，")}
       style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 12, paddingTop: 10, paddingBottom: 6 }}
     >
       <DeepSeekMark size={16} />
       <Text numberOfLines={1} style={{ flexShrink: 0, fontSize: TITLE_FONT_SIZE, fontWeight: "500", color: theme.colors.foreground }}>
         {text.head.title}
       </Text>
-      <Text numberOfLines={1} style={{ flexShrink: 0, fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}>
-        {members}
-      </Text>
+      {members === undefined ? null : (
+        <Text numberOfLines={1} style={{ flexShrink: 0, fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}>
+          {members}
+        </Text>
+      )}
       {items.length === 0 ? null : (
         <View
           style={{ flexGrow: 1, flexShrink: 1, minWidth: 0, flexDirection: "row", justifyContent: "flex-end" }}

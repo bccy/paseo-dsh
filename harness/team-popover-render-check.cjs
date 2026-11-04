@@ -7,7 +7,7 @@
  * the section order (failure → roster summary → tasks), the B groups and their
  * order, the done group folded by default and opening in place, a blocked task
  * never under 可开始, **no member rows** (T5), the roster headline (T7: whale +
- * 「DeepSeek」 + 「N 名成员」 + status chips — 运行中/已停止 only from `running`,
+ * 「DeepSeek」 + 「N 名成员」 (teammates only, none → no count) + status chips — 运行中/已停止 only from `running`,
  * no chip for a zero count, failed red, chips not pill-shaped), the
  * owner's mark (the ring after a running owner, a grey 已停止 tag after an
  * owner the server saw stop, nothing when running is unknown; list and detail
@@ -211,7 +211,7 @@ const order = (container, words) => {
 console.log("sections and direction-B groups");
 {
   const { container } = render({ team: BOARD });
-  const positions = order(container, ["4 名成员", "进行中", "独立审查修复", "可开始", "整理证据", "等待依赖", "复审返工", "已完成"]);
+  const positions = order(container, ["3 名成员", "进行中", "独立审查修复", "可开始", "整理证据", "等待依赖", "复审返工", "已完成"]);
   assert("the summary, then 进行中 → 可开始 → 等待依赖 → 已完成", positions.every((p, i) => p >= 0 && (i === 0 || p > positions[i - 1])), JSON.stringify(positions));
   assert("the done group is folded by default", !container.textContent.includes("修复选页错位"), container.textContent);
   const ready = container.textContent.slice(container.textContent.indexOf("可开始"), container.textContent.indexOf("等待依赖"));
@@ -233,7 +233,7 @@ console.log("\nthe roster headline (T7): DeepSeek + N 名成员 + status chips")
 {
   const { container } = render({ team: BOARD });
   const head = headline(container);
-  check("the headline names DeepSeek, the count and its chips", head?.getAttribute("aria-label"), "DeepSeek，4 名成员，1 运行中，1 已停止，1/5 任务完成");
+  check("the headline names DeepSeek, the count and its chips", head?.getAttribute("aria-label"), "DeepSeek，3 名成员，1 运行中，1 已停止，1/5 任务完成");
   check("…as a header", head?.getAttribute("role"), "heading");
   assert("…and is not pressable", head?.closest('[role="button"]') === null && head?.querySelector('[role="button"]') === null);
   check("…with the whale", head?.querySelectorAll('[data-icon="svg"]').length, 1);
@@ -255,7 +255,7 @@ console.log("\nthe roster headline (T7): DeepSeek + N 名成员 + status chips")
   check("running missing: only the done chip", JSON.stringify(chipKeys(unknown)), JSON.stringify(["done"]));
   assert("…no 运行中 anywhere", !unknown.textContent.includes("运行中"), unknown.textContent);
   assert("…no 已停止 anywhere", !unknown.textContent.includes("已停止"), unknown.textContent);
-  check("…and the headline reads", headline(unknown)?.getAttribute("aria-label"), "DeepSeek，4 名成员，1/5 任务完成");
+  check("…and the headline reads", headline(unknown)?.getAttribute("aria-label"), "DeepSeek，3 名成员，1/5 任务完成");
   // A zero count is never a chip.
   const zero = render({ team: { members: [LEAD, mate({ id: "a", name: "a", running: true })], tasks: [task({ id: "task-1", subject: "x", status: "in_progress" })] } }).container;
   check("zero stopped, zero done: only running", JSON.stringify(chipKeys(zero)), JSON.stringify(["running"]));
@@ -383,7 +383,11 @@ console.log("\nempty, Lead-only, failure, read-only");
   const empty = render({ team: { members: [LEAD, mate({ id: "x", name: "x", running: true })], tasks: [] } }).container;
   assert("an empty board says 暂无共享任务", empty.textContent.includes("暂无共享任务"));
   const leadOnly = render({ team: { members: [LEAD], tasks: [task({ id: "task-1", subject: "a", ready: true })] } }).container;
-  assert("a Lead-only board says 1 名成员 and lists its tasks", headline(leadOnly)?.getAttribute("aria-label") === "DeepSeek，1 名成员" && leadOnly.textContent.includes("可开始"));
+  assert("a Lead-only board's headline is just DeepSeek and it lists its tasks", headline(leadOnly)?.getAttribute("aria-label") === "DeepSeek" && leadOnly.textContent.includes("可开始"), headline(leadOnly)?.getAttribute("aria-label"));
+  assert("…no 「0 名成员」 (nor any member count)", !leadOnly.textContent.includes("名成员"), leadOnly.textContent);
+  const leadDone = render({ team: { members: [{ ...LEAD, running: true }], tasks: [task({ id: "task-1", subject: "a", status: "completed" }), task({ id: "task-2", subject: "b", ready: true })] } }).container;
+  check("0 teammates with tasks: DeepSeek + the done chip only", headline(leadDone)?.getAttribute("aria-label"), "DeepSeek，1/2 任务完成");
+  assert("…and the running Lead is not a 运行中 chip", !leadDone.textContent.includes("运行中"), leadDone.textContent);
   const failed = render({ team: { ...BOARD, failure: 'team task "task-3" revision is not contiguous', members: [...BOARD.members, mate({ id: "f", name: "broken", phase: "failed", error: "child Session recovery failed: x" })] } }).container;
   const alert = failed.querySelector('[role="alert"]');
   assert("the failure row comes first", alert !== null && failed.textContent.indexOf("团队记录无效") < failed.textContent.indexOf("名成员"));
