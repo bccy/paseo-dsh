@@ -694,7 +694,7 @@
   `client/goal-pill.tsx`、`client/goal-running.tsx`、`client/deepseek-mark*.tsx`、
   `client/agent-polling.ts`、`shared/goal.ts` 或 `client/locale.ts` 的 goal 表必跑；改共享轮询器时
   `jobs-poll-check.cjs` 必须同时全绿且断言数不减。**
-- `harness/goal-popover-render-check.cjs` — 面板的**渲染行为**（**210 条**；T10b 新增 54 条：真实 `makeGoalJobsPopover` + 真实协调器 +
+- `harness/goal-popover-render-check.cjs` — 面板的**渲染行为**（**227 条**；T10c 新增 17 条：目标编辑页与清除确认页不画「N 个后台」行、回主页面（取消/清除完成/正文重挂）后再出现、编辑时草稿保留；T10b 新增 54 条：真实 `makeGoalJobsPopover` + 真实协调器 +
   真实目标容器与后台正文——打开取 pill 当前那一半、后台视图顶部目标行（鲸鱼/单行目标/状态行/读屏名）、点切换行就地换视图且**不调
   `close()`、不发 update**、返回行「返回，1 个后台」带终端图标与角标环、打开期间目标受阻不关面板不切视图、后台跑完回落到目标视图、
   目标需处理时打开在目标视图、面板内编辑页「取消」仍 `close()`；`CornerRingIcon`/`JobsPillIcon`/真实目标图标：运行时底图标仍在、

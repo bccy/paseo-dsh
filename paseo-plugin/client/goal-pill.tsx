@@ -46,7 +46,7 @@ import type {
   PluginClientContext,
 } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/ui";
-import { useEffect, useRef, useState, type ComponentType } from "react";
+import { createContext, useContext, useEffect, useLayoutEffect, useRef, useState, type ComponentType } from "react";
 import { Pressable, Text, View, type PressableStateCallbackType } from "react-native";
 import { goalControl, goalCurrent, type GoalAction, type GoalState } from "../shared/goal";
 import { CornerRingIcon } from "./corner-ring";
@@ -59,7 +59,7 @@ import {
   type SlotKind,
   type SlotSnapshot,
 } from "./goal-jobs-slot";
-import { GoalPopoverBody } from "./goal-popover";
+import { GoalPopoverBody, type GoalPanelMode } from "./goal-popover";
 import { useAgent, useGoalRunningMark } from "./goal-running";
 import {
   createGoalPoller,
@@ -192,6 +192,14 @@ export function makeGoalIcon(store: GoalStore, agentId: string) {
 }
 
 /**
+ * How the goal body tells the slot panel which page it is on (T10c). The slot
+ * draws its 「N 个后台」 switch row only on the main page: pressing it unmounts
+ * this body, which on the edit or clear page would drop the draft or the
+ * confirmation without a word. Outside the slot panel nobody listens.
+ */
+const GoalModeReport = createContext<((mode: GoalPanelMode) => void) | undefined>(undefined);
+
+/**
  * The popover container: the interaction state and the RPCs around the pure
  * body (`goal-popover.tsx`).
  *
@@ -230,8 +238,15 @@ export function makeGoalPopover(
     useEffect(() => () => onClosed(shown.current), []);
     const [busy, setBusy] = useState<GoalAction | null>(null);
     const [error, setError] = useState<string | undefined>(undefined);
-    const [mode, setMode] = useState<"view" | "edit" | "confirm">("view");
+    const [mode, setMode] = useState<GoalPanelMode>("view");
     const [draft, setDraft] = useState("");
+    // Layout effect: the switch row must be gone in the same paint the editor
+    // or the clear page first appears in. Unmounting leaves the main page.
+    const reportMode = useContext(GoalModeReport);
+    useLayoutEffect(() => {
+      reportMode?.(mode);
+    }, [mode, reportMode]);
+    useLayoutEffect(() => () => reportMode?.("view"), [reportMode]);
 
     useEffect(() => {
       const current = store.get(agentId);
@@ -519,6 +534,8 @@ export function makeGoalJobsPopover(slot: GoalJobsPluginSlot, agentId: string) {
       return first?.shown ?? (first?.goal !== undefined ? "goal" : "jobs");
     });
     const [chosen, setChosen] = useState<SlotKind>(opened);
+    // The goal body's page (T10c): its edit and clear pages hide the switch row.
+    const [goalMode, setGoalMode] = useState<GoalPanelMode>("view");
     useEffect(() => {
       setSnapshot(slot.snapshot(agentId));
       return slot.subscribe(agentId, () => setSnapshot(slot.snapshot(agentId)));
@@ -538,7 +555,11 @@ export function makeGoalJobsPopover(slot: GoalJobsPluginSlot, agentId: string) {
 
     const half = view === "goal" ? snapshot?.goal : snapshot?.jobs;
     const other: SlotKind = view === "goal" ? "jobs" : "goal";
-    const otherVisible = other === "goal" ? goalVisible : jobsVisible;
+    // On the goal's edit or clear page the switch row is not drawn: pressing it
+    // would unmount the goal body and silently drop the draft or the
+    // confirmation. Saving, cancelling or clearing returns to the main page,
+    // and the row comes back.
+    const otherVisible = other === "goal" ? goalVisible : jobsVisible && goalMode === "view";
     if (half === undefined || snapshot === undefined) {
       // Both halves detached while the panel was open: the host is about to
       // remove the button; render nothing rather than a stale body.
@@ -572,7 +593,9 @@ export function makeGoalJobsPopover(slot: GoalJobsPluginSlot, agentId: string) {
           />
         ) : null}
         <View style={{ padding: POPOVER_HOST_PADDING }}>
-          <Body key={view} {...props} />
+          <GoalModeReport.Provider value={setGoalMode}>
+            <Body key={view} {...props} />
+          </GoalModeReport.Provider>
         </View>
       </View>
     );

@@ -884,6 +884,47 @@ async function slotChecks() {
     check("the editor's 取消 still closes the panel (UI-v8)", spies.close, 1);
   }
   {
+    // T10c: the goal's edit and clear pages hide the 「N 个后台」 row. Pressing
+    // it there would unmount the goal body and drop the draft or the
+    // confirmation without a word; back on the main page the row returns.
+    const jobsRowOf = (c) => c.querySelector('[data-testid="goal-jobs-switch-jobs"]');
+    const { container, spies, presentGoal, rerender } = mountSlot({ goal: { ...baseGoal, phase: "blocked" }, goalAttention: true, jobs: [runningJob] });
+    assert("T10c: the goal main page draws the jobs row", jobsRowOf(container) !== null);
+    click(byLabel(container, "目标受阻，编辑目标"));
+    assert("T10c: the editor is open inside the slot", field(container) !== null);
+    assert("T10c: the edit page draws no jobs row", jobsRowOf(container) === null);
+    assert("T10c: …nor any switch row", container.querySelector('[data-testid^="goal-jobs-switch-"]') === null);
+    typeInto(field(container), `${baseGoal.objective}（草稿）`);
+    check("T10c: …and the draft is kept while it is open", field(container)?.value, `${baseGoal.objective}（草稿）`);
+    // The goal vanishing under the editor unmounts the body; when it comes
+    // back the goal view is on its main page again, so the row is back too.
+    rerender(() => presentGoal(null, false));
+    assert("T10c: the goal vanishing under the editor falls back to the jobs view", container.querySelector('[data-testid="goal-jobs-view-jobs"]') !== null);
+    // The body reads its own store, which still holds the blocked goal.
+    rerender(() => presentGoal({ ...baseGoal, phase: "blocked" }, true));
+    click(container.querySelector('[data-testid="goal-jobs-switch-goal"]'));
+    assert("T10c: a remounted goal body is on its main page", byLabel(container, "目标受阻，编辑目标") !== undefined);
+    assert("T10c: …with the jobs row back", jobsRowOf(container) !== null);
+    // The clear page: no row; its 取消 brings the main page and the row back.
+    click(byLabel(container, "清除目标"));
+    assert("T10c: the clear page is open inside the slot", container.textContent.includes("清除后目标不再续跑"));
+    assert("T10c: the clear page draws no jobs row", jobsRowOf(container) === null);
+    click(byLabel(container, "取消"));
+    check("T10c: the clear page's 取消 does not close", spies.close, 0);
+    assert("T10c: …back on the main page", byLabel(container, "目标受阻，编辑目标") !== undefined);
+    assert("T10c: …the jobs row is drawn again", jobsRowOf(container) !== null);
+    // A finished clear returns to the main page too.
+    click(byLabel(container, "清除目标"));
+    assert("T10c: the clear page again draws no jobs row", jobsRowOf(container) === null);
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    click(byLabel(container, "清除目标"));
+    await settle();
+    await settle();
+    check("T10c: the armed red button sends one clear", spies.rpc.at(-1)?.action, "clear");
+    assert("T10c: after the clear the confirmation is gone", !container.textContent.includes("清除后目标不再续跑"));
+    assert("T10c: …and the jobs row is drawn again", jobsRowOf(container) !== null);
+  }
+  {
     // Only the goal: no switch row, the goal body alone.
     const { container } = mountSlot({ jobs: [] });
     assert("only a goal: the goal view, no switch row", container.querySelector('[data-testid="goal-jobs-view-goal"]') !== null && container.querySelector('[data-testid^="goal-jobs-switch-"]') === null);
