@@ -15,7 +15,7 @@
  * @module dsh-paseo/client/tool-call-data
  */
 import type { AgentMessage } from "./agent-message";
-import { agentMessageLabel, currentLocale, localeText, teamToolErrorDisplay } from "./locale";
+import { agentMessageLabel, currentLocale, localeText, teamToolErrorDisplay, type ToolCardsText } from "./locale";
 import { teamTaskSchema } from "../shared/team";
 import { teamTaskFields, teamTaskMark, type TeamTaskMark } from "./team-polling";
 
@@ -221,6 +221,15 @@ export interface ToolCallData {
    */
   team: TeamBlockData | null;
   /**
+   * The generic card for a row whose detail is `unknown`, or null.
+   *
+   * Null is "nothing to split": an argument-less call whose result was a plain
+   * string keeps the raw body, exactly as before this card existed. The goal and
+   * team cards win when they parse, because they are the more specific
+   * rendering — drawing both would print the same result twice.
+   */
+  fields: ToolFieldsData | null;
+  /**
    * DSH's structured failure code for a failed row (`HarnessError.code`, relayed
    * on `metadata.errorCode` by `server/timeline.ts`), or "".
    */
@@ -266,6 +275,52 @@ export type GoalBlockData = {
   objective: string;
   fields: Array<{ label: string; value: string }>;
   empty: boolean;
+};
+
+/**
+ * One entry of the generic card for a row Paseo has no detail shape for.
+ *
+ * Such a call's payload is opaque — `input` / `output` are whatever the tool
+ * declared — and the old rendering pretty-printed the whole thing into one code
+ * block, which turned every newline inside a string into a literal `\n` and a
+ * long message into one escaped wall of text. Splitting the payload by its own
+ * keys keeps each value in the form it can actually be read in: a short scalar
+ * stays a one-line fact, prose keeps its real newlines, and a value that is
+ * itself a structure keeps the JSON code surface.
+ */
+export type ToolFieldEntry = {
+  /**
+   * `code` is a source block a tool-specific card (L2) hands to the same
+   * monospace surface `json` uses: `run_code`'s program is code, and drawing it
+   * as prose would re-wrap it into something that cannot be read back.
+   */
+  kind: "fact" | "text" | "json" | "code";
+  /** The payload key, or "" for a whole array value (it has no key of its own). */
+  label: string;
+  /** A scalar's own form, prose verbatim, pretty JSON, or the code as written. */
+  value: string;
+};
+
+/**
+ * The generic card for an `unknown` row (every MCP call, and DSH's own tools
+ * without a typed detail), or null when the payload offers nothing to split.
+ *
+ * The two halves stay apart because they come from different sides of the call
+ * and only the second one gets a caption; `copyText` is the complete result as
+ * JSON, so the copy control still hands over every byte even though the card no
+ * longer renders the result as one blob.
+ */
+export type ToolFieldsData = {
+  args: ToolFieldEntry[];
+  result: ToolFieldEntry[];
+  /**
+   * One localized sentence that compresses the result (L2: 「已发送」, 「超时」,
+   * 「已完成 · 退出码 0」), or "". The generic card never sets it — it is the
+   * tool-specific mapping's replacement for the raw result entries.
+   */
+  receipt: string;
+  /** Complete result JSON for the copy control, or "" when `body` carries it. */
+  copyText: string;
 };
 
 /* -------------------------------------------------------------------------- */
@@ -1171,6 +1226,501 @@ function stringifyValue(value: unknown, pretty = false): string {
   }
 }
 
+/* -------------------------------------------------------------------------- */
+/* Generic fields card (rows with no detail shape)                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * How long a single-line string may be and still read as a fact.
+ *
+ * A fact is meant to sit beside its key on one line of a phone-width card; past
+ * this it is prose, and prose belongs in a text block that may wrap.
+ */
+const FIELD_FACT_MAX = 60;
+
+/** The scalar form of a value that belongs on a facts row, or undefined. */
+function factValue(value: unknown): string | undefined {
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  // `null` is a value, not an absence: a tool that answered `null` said so.
+  if (value === null) return "null";
+  if (typeof value === "string" && !value.includes("\n") && value.length <= FIELD_FACT_MAX) {
+    return value;
+  }
+  return undefined;
+}
+
+/**
+ * One payload value as a card entry.
+ *
+ * The three shapes are the three things a reader can do with a value: scan it as
+ * a fact, read it as prose, or read it as a structure. A value JSON cannot
+ * serialize at all (a cycle, a BigInt) keeps `stringifyValue`'s
+ * `<unserializable>` wording rather than disappearing from the card.
+ */
+function fieldEntry(label: string, value: unknown): ToolFieldEntry {
+  const fact = factValue(value);
+  if (fact !== undefined) return { kind: "fact", label, value: fact };
+  if (typeof value === "string") return { kind: "text", label, value };
+  return { kind: "json", label, value: stringifyValue(value, true) };
+}
+
+/**
+ * Split a payload into card entries, in the payload's own key order.
+ *
+ * A top-level object is split by key; anything else (an array, a bare scalar) is
+ * one entry with no label — the payload *is* the value, and inventing a key for
+ * it would be a name the wire never had.
+ */
+function fieldEntries(value: unknown): ToolFieldEntry[] {
+  if (!isRecord(value)) return [fieldEntry("", value)];
+  return Object.keys(value).map((key) => fieldEntry(key, value[key]));
+}
+
+/**
+ * The result as a structure, or undefined when the result is not one.
+ *
+ * A string result is parsed only when it starts like a JSON object/array *and*
+ * parses to one: a tool that answers `"42"` or a sentence stays plain text, and
+ * a parse failure keeps the original string, byte for byte.
+ */
+function structuredResult(value: unknown): unknown {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value === "object") return value;
+  if (typeof value !== "string") return undefined;
+  const text = value.trim();
+  if (!text.startsWith("{") && !text.startsWith("[")) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return typeof parsed === "object" && parsed !== null ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether a payload carries nothing to split (an argument-less call). */
+function emptyPayload(value: unknown): boolean {
+  if (value === null || value === undefined) return true;
+  return typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 0;
+}
+
+/**
+ * The row's second half for an `unknown` row: the first short single-line string
+ * argument as `key: value`, else the first such result field, else "".
+ *
+ * The point is that the head never prints a JSON blob again: `{"to":"lead",…}`
+ * clipped to one line is unreadable on a phone, while `to: lead` names the call.
+ * An empty answer leaves the head to the tool's own label, which is what an
+ * argument-less call should look like.
+ */
+function fieldSummary(input: unknown, result: unknown): string {
+  for (const source of [input, result]) {
+    if (!isRecord(source)) continue;
+    for (const key of Object.keys(source)) {
+      const item = source[key];
+      if (typeof item !== "string" || item === "" || item.includes("\n")) continue;
+      if (item.length > FIELD_FACT_MAX) continue;
+      return `${key}: ${item}`;
+    }
+  }
+  return "";
+}
+
+/**
+ * The generic card's payload and the head summary that goes with it, or null
+ * when there is nothing to split.
+ *
+ * `splitResult` is false for a tool whose result has a card of its own
+ * (`create_goal` / `get_goal` / `update_goal` and the `team_task_*` tools): that
+ * card's documented fallback is the verbatim body, so its result is left there
+ * rather than claimed by this card. Its *arguments* still become entries — the
+ * head no longer prints them as JSON, and a failed call has no card at all.
+ */
+function buildFields(
+  input: unknown,
+  output: unknown,
+  splitResult: boolean,
+): { fields: ToolFieldsData; summary: string } | null {
+  const args = emptyPayload(input) ? [] : fieldEntries(input);
+  const resultValue = splitResult ? structuredResult(output) : undefined;
+  const result = resultValue === undefined ? [] : fieldEntries(resultValue);
+  if (args.length === 0 && result.length === 0) return null;
+  return {
+    fields: {
+      args,
+      result,
+      receipt: "",
+      // The result half only: the arguments are already visible as entries, and
+      // a plain-text result is carried by `body`, whose own card copies it.
+      copyText:
+        result.length === 0
+          ? ""
+          : typeof output === "string"
+            ? output
+            : stringifyValue(output, true),
+    },
+    summary: fieldSummary(input, resultValue),
+  };
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Tool-specific cards (L2)                                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * What a tool-specific card replaces in the generic one (L1).
+ *
+ * A mapping fills only the fields its tool's documented shape supports: an
+ * absent field keeps L1's value, so a mapper that knows the head does not drop
+ * the arguments the generic card already split. Everything emitted here is
+ * derived from the wire payload or from `./locale`; a shape that does not match
+ * returns null, and the row falls back to L1 instead of guessing.
+ */
+export type ToolMapping = {
+  /** The head's second half, replacing L1's first-short-argument rule. */
+  summary: string;
+  args?: ToolFieldEntry[];
+  result?: ToolFieldEntry[];
+  receipt?: string;
+  /** A replacement body (`job_output` strips its status line; a receipt-only output clears it). */
+  body?: string;
+  /** A replacement copy source, when the body was the only one. */
+  copyText?: string;
+};
+
+/** One prose entry: the value is drawn verbatim, never re-serialized. */
+function proseEntry(label: string, value: string): ToolFieldEntry {
+  return { kind: "text", label, value };
+}
+
+/** A receipt-shaped output: the one line of text DSH rendered for the model. */
+function receiptText(output: unknown): string {
+  return typeof output === "string" ? output.trim() : "";
+}
+
+/** The last path segment, for a row whose head should not repeat a whole path. */
+function baseName(path: string): string {
+  const parts = path.split(/[\\/]/u).filter((part) => part !== "");
+  return parts.length === 0 ? path : parts[parts.length - 1];
+}
+
+/**
+ * `send_message`'s card.
+ *
+ * The name has two implementations with different inputs and different results
+ * (survey §5): the Team tool (`target`) renders `{"sent":true}`, or the older
+ * `{messageId,status}`; the subagent-control tool (`agent_id`) renders the
+ * sentence `message delivered to agent <id>`. The *input* decides which one this
+ * row is — the tool name is the same for both.
+ */
+function sendMessageCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed || !isRecord(input)) return null;
+  const message = input.message;
+  if (typeof message !== "string") return null;
+  const cards = localeText().toolCards;
+  // An empty message is a value, not a paragraph: it must not mount an empty
+  // prose block (the head still names the recipient, the receipt still answers).
+  const args = message === "" ? [] : [proseEntry(cards.labels.message, message)];
+  if (typeof input.target === "string" && input.target !== "") {
+    const value = structuredResult(output);
+    if (!isRecord(value)) return null;
+    if (value.sent === true) return { summary: input.target, args, result: [], receipt: cards.sent };
+    if (typeof value.messageId === "string" && typeof value.status === "string") {
+      return { summary: input.target, args, result: [], receipt: cards.sentWithStatus(value.status) };
+    }
+    return null;
+  }
+  if (typeof input.agent_id === "string" && input.agent_id !== "") {
+    if (!/^message delivered to agent\b/u.test(receiptText(output))) return null;
+    return {
+      summary: input.agent_id,
+      args,
+      result: [],
+      receipt: cards.delivered,
+      // The sentence *is* the receipt; keeping it in the body would print the
+      // same confirmation twice.
+      body: "",
+      copyText: typeof output === "string" ? output : "",
+    };
+  }
+  return null;
+}
+
+/** `interrupt_agent`'s card: the same two implementations as `send_message`. */
+function interruptAgentCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed || !isRecord(input)) return null;
+  const cards = localeText().toolCards;
+  if (typeof input.target === "string" && input.target !== "") {
+    const value = structuredResult(output);
+    if (!isRecord(value) || typeof value.previousStatus !== "string") return null;
+    return { summary: input.target, args: [], result: [], receipt: cards.interrupted(value.previousStatus) };
+  }
+  if (typeof input.agent_id === "string" && input.agent_id !== "") {
+    if (!/^interrupt requested for agent\b/u.test(receiptText(output))) return null;
+    return {
+      summary: input.agent_id,
+      args: [],
+      result: [],
+      receipt: cards.interruptRequested,
+      body: "",
+      copyText: typeof output === "string" ? output : "",
+    };
+  }
+  return null;
+}
+
+/**
+ * `spawn_teammate`'s card: the name is the subject (`context: fork` marked), the
+ * description a fact, the prompt prose, and the created member's own status and
+ * model the receipt.
+ */
+function spawnTeammateCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed || !isRecord(input)) return null;
+  const name = input.name;
+  const prompt = input.prompt;
+  if (typeof name !== "string" || name === "" || typeof prompt !== "string") return null;
+  const value = structuredResult(output);
+  if (!isRecord(value) || !isRecord(value.member)) return null;
+  const member = value.member;
+  if (typeof member.target !== "string" || typeof member.status !== "string") return null;
+  const cards = localeText().toolCards;
+  const args: ToolFieldEntry[] = [];
+  if (typeof input.description === "string" && input.description !== "") {
+    args.push({ kind: "fact", label: cards.labels.description, value: input.description });
+  }
+  args.push(proseEntry(cards.labels.prompt, prompt));
+  return {
+    summary: input.context === "fork" ? `${name} · ${cards.inheritsContext}` : name,
+    args,
+    result: [],
+    receipt: cards.created(member.status, typeof member.model === "string" ? member.model : ""),
+  };
+}
+
+/**
+ * `wait_agent`'s card: the head carries the duration, the receipt says how the
+ * wait ended, and the `noProgress` explanation becomes prose.
+ *
+ * `timeout_ms` is DSH's own default of 30 000 when omitted
+ * (`dsh-experimental-tool-agent-team/lib/index.js:336`); a value outside the
+ * documented range is not a shape this card knows, so it falls back to L1.
+ */
+function waitAgentCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed) return null;
+  const value = structuredResult(output);
+  if (!isRecord(value) || typeof value.timedOut !== "boolean") return null;
+  const cards = localeText().toolCards;
+  const timeout = isRecord(input) ? input.timeout_ms : undefined;
+  let summary: string;
+  if (timeout === undefined) {
+    summary = cards.waitSeconds(30);
+  } else if (typeof timeout === "number" && Number.isSafeInteger(timeout) && timeout > 0) {
+    summary =
+      timeout >= 60000 && timeout % 60000 === 0
+        ? cards.waitMinutes(timeout / 60000)
+        : cards.waitSeconds(Math.round(timeout / 1000));
+  } else {
+    return null;
+  }
+  let receipt = value.timedOut ? cards.timedOut : cards.progressed;
+  const result: ToolFieldEntry[] = [];
+  if (isRecord(value.noProgress)) {
+    const reason = value.noProgress.reason;
+    if (typeof reason === "string") {
+      // A reason this table does not know stays verbatim: DSH's words are never
+      // replaced by a guessed one.
+      receipt = `${receipt} · ${reason === "no-active-peer" ? cards.noActivePeer : reason}`;
+    }
+    const message = value.noProgress.message;
+    if (typeof message === "string" && message !== "") result.push(proseEntry("", message));
+  }
+  return { summary, args: [], result, receipt };
+}
+
+/**
+ * `list_agents`' card: one line per member instead of one JSON blob.
+ *
+ * The Lead is listed but not counted: it is the main session, and a row that
+ * says 「3 名成员」 while the array holds four entries would be the counting
+ * mistake the team pill fixed in `d28b88d` (「成员计数排除主会话」). An old daemon's
+ * plain text (`(no subagents)`) is not an array, so it keeps L1's body verbatim.
+ */
+function listAgentsCard(output: unknown, failed: boolean): ToolMapping | null {
+  if (failed) return null;
+  const value = structuredResult(output);
+  if (!Array.isArray(value)) return null;
+  const cards = localeText().toolCards;
+  const members: Record<string, unknown>[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) return null;
+    if (typeof item.target !== "string" || typeof item.role !== "string" || typeof item.status !== "string") {
+      return null;
+    }
+    members.push(item);
+  }
+  if (members.length === 0) return { summary: cards.noMembers, args: [], result: [], receipt: "" };
+  const lines = members.map((member) => {
+    const target = String(member.target);
+    const role = String(member.role);
+    // The Lead's own row carries `target: "lead"` and `role: "lead"`; writing it
+    // twice reads `lead · lead · running`, so the role is dropped when it is the
+    // target's own name.
+    const parts = target === role ? [target, String(member.status)] : [target, role, String(member.status)];
+    if (typeof member.description === "string" && member.description !== "") parts.push(member.description);
+    return parts.join(" · ");
+  });
+  // Counted on `role === "teammate"`, the same rule as the team pill
+  // (`./team-polling`'s `teamMateCount`): the Lead is not a teammate, and a role
+  // DSH adds later must not be counted as one by accident.
+  const teammates = members.filter((member) => member.role === "teammate").length;
+  return {
+    summary: teammates === 0 ? cards.leadOnly : localeText().team.memberCount(teammates),
+    args: [],
+    result: [proseEntry("", lines.join("\n"))],
+    receipt: "",
+  };
+}
+
+/** DSH's status line: `[status: <status>]` / `[status: <status>, <detail>]` (`dsh-tool-jobs/lib/index.js:46`). */
+const JOB_STATUS_LINE = /^\[status: ([a-z]+)(?:, (.+))?\]$/u;
+
+/** `exit code: 0` in the reader's words; any other detail DSH rendered stays verbatim. */
+function jobDetailText(detail: string, cards: ToolCardsText): string {
+  const exit = /^exit code: (-?\d+)$/u.exec(detail.trim());
+  return exit === null ? detail : cards.exitCode(exit[1]);
+}
+
+/**
+ * `job_output`'s card: the trailing `[status: …]` line becomes the receipt, the
+ * rest stays the log in the code surface, and the copy control still hands over
+ * the complete original output (status line included).
+ */
+function jobOutputCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed || !isRecord(input)) return null;
+  const jobId = input.job_id;
+  if (typeof jobId !== "string" || jobId === "" || typeof output !== "string") return null;
+  const lines = output.split("\n");
+  let end = lines.length;
+  while (end > 0 && lines[end - 1].trim() === "") end -= 1;
+  if (end === 0) return null;
+  const match = JOB_STATUS_LINE.exec(lines[end - 1].trim());
+  if (match === null) return null;
+  const cards = localeText().toolCards;
+  const status = cards.jobStatuses[match[1]] ?? match[1];
+  const detail = match[2] === undefined ? "" : jobDetailText(match[2], cards);
+  // The call's own knobs are what a reader needs to interpret the log ("was this
+  // a blocking read? how long did it wait?"); the job id is already the head.
+  const args: ToolFieldEntry[] = [];
+  if (typeof input.wait === "boolean") args.push(fieldEntry("wait", input.wait));
+  if (typeof input.timeout_ms === "number") args.push(fieldEntry("timeout_ms", input.timeout_ms));
+  return {
+    summary: jobId,
+    args,
+    result: [],
+    receipt: detail === "" ? status : `${status} · ${detail}`,
+    body: lines.slice(0, end - 1).join("\n").replace(/\n+$/u, ""),
+    copyText: output,
+  };
+}
+
+/** `job_kill`'s card: the job id is the head, DSH's one-line receipt the card. */
+function jobKillCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed || !isRecord(input)) return null;
+  const jobId = input.job_id;
+  if (typeof jobId !== "string" || jobId === "") return null;
+  if (!/^requested cancellation of job\b/u.test(receiptText(output))) return null;
+  // The model's reason (60/62 real calls carry one) is the only explanation for
+  // *why* the job was killed; L1's own rule decides fact vs prose.
+  const reason = input.reason;
+  return {
+    summary: jobId,
+    args: typeof reason === "string" && reason !== "" ? [fieldEntry("reason", reason)] : [],
+    result: [],
+    receipt: localeText().toolCards.cancellationRequested,
+    body: "",
+    copyText: typeof output === "string" ? output : "",
+  };
+}
+
+/**
+ * `mcp_call_tool`'s card: the proxied `server/tool` is the subject, and the
+ * `arguments` object is split by L1's own rules instead of printed as one blob.
+ * The result is left to L1 — the proxied server decides its shape.
+ */
+function mcpCallToolCard(input: unknown, failed: boolean): ToolMapping | null {
+  if (failed || !isRecord(input)) return null;
+  const server = input.server;
+  const tool = input.tool;
+  if (typeof server !== "string" || server === "" || typeof tool !== "string" || tool === "") return null;
+  const argsValue = input.arguments;
+  if (argsValue !== undefined && !isRecord(argsValue)) return null;
+  return {
+    summary: `${server}/${tool}`,
+    args: isRecord(argsValue) ? fieldEntries(argsValue) : [],
+  };
+}
+
+/**
+ * `read_image`'s card: the head names the file. The image itself is not drawn
+ * here — the plugin emits it as its own assistant message
+ * (`server/timeline.ts`'s `imageRows`), so drawing it again would duplicate it.
+ */
+function readImageCard(input: unknown, failed: boolean): ToolMapping | null {
+  if (failed || !isRecord(input) || typeof input.file_path !== "string") return null;
+  const path = input.file_path.trim();
+  if (path === "") return null;
+  return { summary: baseName(path) };
+}
+
+/**
+ * `run_code`'s card: the description titles the row and the program is a code
+ * block, not prose — re-wrapping source into prose makes it unreadable.
+ */
+function runCodeCard(input: unknown, failed: boolean): ToolMapping | null {
+  if (failed || !isRecord(input) || typeof input.code !== "string" || input.code === "") return null;
+  return {
+    summary: typeof input.description === "string" ? input.description : "",
+    args: [{ kind: "code", label: localeText().toolCards.labels.code, value: input.code }],
+  };
+}
+
+/**
+ * The tool-specific card for one `unknown` row, or null to keep the generic one.
+ *
+ * Dispatch is by the wire tool name, and only for the names the shape survey
+ * measured (survey §2/§3). A mapper returns null for anything that is not the
+ * documented shape — a missing field, a different type, JSON that does not
+ * parse — so the row keeps L1's generic card rather than a card drawn from a
+ * guess. A failed call never reaches a mapper: a failure must not be rendered
+ * as a success receipt, and the existing failure display owns those rows.
+ */
+function toolMapping(name: string, input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  switch (name) {
+    case "send_message":
+      return sendMessageCard(input, output, failed);
+    case "interrupt_agent":
+      return interruptAgentCard(input, output, failed);
+    case "spawn_teammate":
+      return spawnTeammateCard(input, output, failed);
+    case "wait_agent":
+      return waitAgentCard(input, output, failed);
+    case "list_agents":
+      return listAgentsCard(output, failed);
+    case "job_output":
+      return jobOutputCard(input, output, failed);
+    case "job_kill":
+      return jobKillCard(input, output, failed);
+    case "mcp_call_tool":
+      return mcpCallToolCard(input, failed);
+    case "read_image":
+      return readImageCard(input, failed);
+    case "run_code":
+      return runCodeCard(input, failed);
+    default:
+      return null;
+  }
+}
+
 
 /**
  * Paseo's own MCP tools, keyed by the part after `mcp__paseo__`.
@@ -1636,17 +2186,15 @@ export function toolCallData(
     // arguments it was called with, and whatever came back. Without the output
     // an expanded row showed exactly what it already showed collapsed, which
     // reads as "this row will not expand".
-    // An argument-less call (`list_workspaces`) would otherwise label itself
-    // `{}` and open onto another `{}`; the tool's own name is already the label.
     // A message row is exempt: its text is the payload, not this JSON shape.
-    const input = detail.input;
-    const emptyInput =
-      input === null ||
-      input === undefined ||
-      (typeof input === "object" && !Array.isArray(input) && Object.keys(input).length === 0);
-    if (primary === "" && !emptyInput) primary = stringifyValue(input);
-    detailHeadline = emptyInput ? "" : stringifyValue(input, true);
-    body = stringifyValue(detail.output, true);
+    //
+    // The arguments are split into the generic card below rather than printed as
+    // one JSON blob: pretty-printing put the *whole* payload in a code block, so
+    // a string value's newlines arrived as literal `\n` and a long message was
+    // one escaped wall of text on a phone. A plain-text result stays the body,
+    // verbatim — a string was never escaped here, the escapes came from the
+    // enclosing object.
+    body = stringifyValue(detail.output);
     bodyLabel = copy.bodyLabels.result;
     code = true;
   }
@@ -1709,6 +2257,50 @@ export function toolCallData(
     body = "";
     code = false;
   }
+  // The generic card for a row with no detail shape, and the head summary that
+  // goes with it. Only the `unknown` rows the goal/team cards did not claim: a
+  // more specific card is the right rendering, and drawing both would print the
+  // same result twice.
+  const generic =
+    type === "unknown" && agentMessage === undefined && goal === null && team === null
+      ? buildFields(
+          detail.input,
+          detail.output,
+          // A result with its own card keeps that card's verbatim fallback; every
+          // other `unknown` result is split into entries.
+          !GOAL_TOOLS.has(item.name) && !TEAM_TASK_TOOLS.has(item.name),
+        )
+      : null;
+  let fields = generic === null ? null : generic.fields;
+  if (generic !== null) {
+    // The head names the call with its first short string argument (`to: lead`),
+    // never a clipped JSON blob; when no argument qualifies, the label stands
+    // alone. A structured result left the body above — the card's entries are
+    // its rendering, and the copy control still carries the whole JSON.
+    primary = generic.summary;
+    if (generic.fields.result.length > 0) body = "";
+  }
+  // L2: a tool-specific card replaces parts of the generic one. It only ever
+  // claims the shapes the survey measured; a null keeps L1 exactly as it was,
+  // and a failed call never reaches the mappers (a failure must not read as a
+  // success receipt).
+  const mapped =
+    type === "unknown" && agentMessage === undefined && goal === null && team === null
+      ? toolMapping(item.name, detail.input, detail.output, failed)
+      : null;
+  if (mapped !== null) {
+    primary = mapped.summary;
+    if (mapped.body !== undefined) body = mapped.body;
+    const args = mapped.args ?? fields?.args ?? [];
+    const result = mapped.result ?? fields?.result ?? [];
+    const receipt = mapped.receipt ?? "";
+    const copyText = mapped.copyText ?? fields?.copyText ?? "";
+    // Nothing left to draw (an empty member list, say) drops the card instead
+    // of mounting an empty one — the head already carries the answer.
+    fields = args.length > 0 || result.length > 0 || receipt !== ""
+      ? { args, result, receipt, copyText }
+      : null;
+  }
   // A failed team tool's DSH sentence, translated when known, DSH's words kept
   // after it (v9 rule); unknown sentences stay verbatim.
   const teamError = failed && TEAM_TOOLS.has(item.name) && error !== "" ? teamToolErrorDisplay(error, copy.team) : undefined;
@@ -1716,10 +2308,22 @@ export function toolCallData(
   const errorCode = failed ? str(metadata, "errorCode") : "";
   const refusals = copy.goalCard.refusals;
   const refusal = errorCode !== "" && Object.hasOwn(refusals, errorCode) ? refusals[errorCode] : undefined;
+  // A row with the generic card has no separate block lead: the card already
+  // shows the arguments, and a compact copy of its first fact above the card
+  // would be the same line twice.
   const headline = truncate(
-    detailHeadline !== "" ? detailHeadline : description === "" ? "" : primary,
+    fields !== null
+      ? ""
+      : detailHeadline !== "" ? detailHeadline : description === "" ? "" : primary,
   );
-  const structured = search !== null || read !== null || diffBlock !== null || web !== null || goal !== null || team !== null;
+  const structured =
+    search !== null ||
+    read !== null ||
+    diffBlock !== null ||
+    web !== null ||
+    goal !== null ||
+    team !== null ||
+    fields !== null;
   // The daemon hints an agent-message row's glyph with `icon: "bot"`; when that
   // hint is missing the row would fall to the wrench, so a message always reads
   // as an agent's row.
@@ -1738,7 +2342,14 @@ export function toolCallData(
       ? toolLabel(item.name, detail)
       : agentMessageLabel(agentMessage.event);
   const rawSummary = truncate(
-    agentMessage !== undefined ? agentMessage.sender : description === "" ? primary : description,
+    agentMessage !== undefined
+      ? agentMessage.sender
+      : mapped !== null
+        ? // A mapped card's head wins over the generic `description` rule: the
+          // mapper named the subject the reader wants first (a teammate's name,
+          // a proxied `server/tool`), and `description` is only a fallback.
+          mapped.summary
+        : description === "" ? primary : description,
   );
   // The head reads `label · summary`. Two halves saying the same sentence prints
   // the same line twice — every `/command` row did (`/compact · /compact`), and
@@ -1758,10 +2369,11 @@ export function toolCallData(
       ? (item.status as ToolCallData["status"])
       : "completed",
     summary,
-    // A block-specific lead (the pretty arguments of an `unknown` row, the
-    // command of a shell row) always wins: a description must not push the block
-    // back to the compact one-line form. Otherwise the block leads with the
-    // subject only when the head is showing something else — the description.
+    // A block-specific lead (the command of a shell row) always wins: a
+    // description must not push the block back to the compact one-line form.
+    // Otherwise the block leads with the subject only when the head is showing
+    // something else — the description. A row with the generic fields card has
+    // no lead of its own (see `headline` above).
     headline,
     // The card decides whether a body is capped, not the block kind: the
     // terminal renders the whole output inside its own 224px scroll region and
@@ -1792,6 +2404,7 @@ export function toolCallData(
     web,
     goal,
     team,
+    fields,
     errorCode,
     errorShort: refusal?.short ?? (teamError?.original === undefined ? "" : teamError.message),
     errorHint: refusal?.hint ?? (teamError?.original === undefined ? "" : teamError.message),

@@ -54,14 +54,45 @@
   `node harness/rewind-notice-delivery-check.mjs`（自己编译到
   `paseo-plugin/.dbg-p17-delivery`；不需要 daemon、不需要模型）。
 - `harness/tool-call-check.cjs` — `client/tool-call-data.ts` 的工具行映射（图标、命令、diff、
-  失败原因、终端卡）与正文截断口径：**generic 卡（MCP unknown、read/fetch 无 meta、plan、
+  失败原因、终端卡）与正文截断口径：**generic 卡（read/fetch 无 meta、plan、
   `/command` 输出、agent message）与结构化 diff 卡的 body 不再截断**，改由视图滚动 + 复制全量
   body（260px，`CODE_MAX_HEIGHT` 的唯一消费者）；仍会截断的只有 legacy 纯文本 diff 回落
-  （6000 + 本地化标记）与 `headline`/`summary`。本轮 385 → **397** 条（团队字段卡再 +46 → 443，见文末「团队（team）链」）：goal 状态行
-  （`get_goal`）与轮次行（`goal_round`）都解析出 `Target`，其余**带 icon 键**的 `plain_text`
+  （6000 + 本地化标记）与 `headline`/`summary`。本轮 385 → **397** 条（团队字段卡再 +46 → 443，见文末「团队（team）链」）：
+  goal 状态行（`get_goal`）与轮次行（`goal_round`）都解析出 `Target`，其余**带 icon 键**的 `plain_text`
   行图标不变，无映射的 iconless `plain_text` 仍是 `Wrench`。**动了工具行渲染必跑（含失败原因：
   错误只认顶层 `item.error.message`；终端正文全量 + 224px 纵向滚动 + 复制；goal 两行的图标/
   名字映射）。**
+  - unknown 行的**通用字段卡（L1）**再 +38 → **481**（L2 起 `fields` 多一个 `receipt`，
+    见下条）：`fields = {args, result, copyText}` 把
+    `input`（及 output 为对象/可 parse 成对象的 JSON 字符串时的 output）拆成有序条目——
+    短标量（数字/布尔/null/≤60 字符单行串）→ `fact`，多行或长串 → `text`（值保留真换行，
+    **不出现字面 `\n`**），嵌套对象/数组（含顶层数组，如 `list_agents` 的成员数组）→ `json`
+    （pretty JSON）；空对象 input 不出参数区；普通字符串 output 仍是 body 原文。摘要取第一个
+    短的单行字符串参数（`key: value`），不再整段 JSON；结构化 output 的 body 清空、复制控件
+    改拿完整结果 JSON（`copyText`，parse 自字符串时是原串、对象时是 pretty JSON）。有自己卡
+    的工具（`create_goal`/`get_goal`/`update_goal`、`team_task_*`）**结果不拆**：卡解析失败仍
+    保留原文 body（卡自己的回落契约），只把参数拆成条目；agentMessage 整行不出通用 fields；
+    失败的 unknown 行仍出参数条目。渲染侧断言钉 `ToolFieldsView`（`data.fields` 接线、复制拿
+    `copyText`、prose 不重序列化、嵌套值仍走代码面、`fieldFacts` 带 `flexWrap: "wrap"` 以便
+    窄屏折行、正文与 JSON 条目同用 260px 滚动窗——滚动不截断）。
+  - 高频 unknown 工具的**专门映射（L2）**再 +101 → **582**（修一轮再 +21 → **603**）：`send_message`（team `target` 版与
+    subagent-control `agent_id` 版按 input 分流：team `{"sent":true}`→「已发送」、旧
+    `{messageId,status}`→「已发送 · <status>」、subagent-control 文本→「已投递」）、
+    `interrupt_agent`（同分流；`previousStatus`→「已中断（原 running）」）、`spawn_teammate`
+    （摘要 name、`context:fork` 附「继承上下文」，description fact + prompt prose，回执
+    `已创建 · status · model`）、`wait_agent`（摘要 timeout_ms→秒/分钟、缺省 30 秒；回执
+    超时/有变化、`no-active-peer` 翻译、noProgress.message 作 prose）、`list_agents`（顶层数组
+    →每成员一行 `target · role · status`，摘要数**排除 Lead**、仅 Lead→「仅主会话」、空数组→
+    「无成员」且不出卡、旧版 `(no subagents)` 原文留在 body）、`job_output`（末行
+    `[status: …]`→回执（`exit code` 翻译成退出码）、其余输出仍是代码面正文、copyText 保留完整
+    原文含状态行）、`job_kill`（单行 `requested cancellation of job …`→「已请求取消」）、
+    `mcp_call_tool`（摘要 `server/tool`、`arguments` 按 L1 规则拆条目、结果交 L1）、
+    `read_image`（摘要 basename，不重复画图）、`run_code`（摘要 description、程序走新的 `code`
+    条目=代码面）。**形状不符一律返回 null 退回 L1（不猜）**；失败行不进映射、不出成功回执；
+    回执渲染为卡片底部一行弱化文案（`fieldReceipt`）。**动了 `client/tool-call-data.ts` 的
+    `toolMapping` 及其后的 L2 段、`client/tool-call.tsx` 的 `ToolFieldsView`、`client/locale.ts`
+    的 `toolCards` 表或 `index.client.tsx` 的 dsh-tool schema 必跑；动了 `locale.ts` 还要跑
+    `locale-check`。**
 - `harness/thinking-check.cjs` — 思考行折叠预览：结束后取**第一行**、运行中取最后一个首行已终结
   的段落（都是 DSH 的行为，逐字移植在 `client/thinking-text.ts`），以及折叠行在流式中的宽度
   接线（行测自己的宽度、标签测自己要减掉的那段、行宽由两者相减得出，`useRevealedText` 不许
@@ -709,6 +740,6 @@
 - `harness/tool-call-check.cjs` 团队段（399 → **443**）：`team_task_get/create/update/list` 字段卡、update 动作词（未知原样）、
   list 计数与筛选词、`nextCursor`；**任何形状不符都保留原始 JSON**（非 JSON、多键、少键、deleted、列表坏项、列表多键）；
   失败行不画卡，已知 DSH 原文中文进 `errorShort`/`errorHint`、原文保留在 `error`，未知句不翻、非团队工具不过团队表、英文不翻。
-- `harness/locale-check.cjs` 团队段（505 → **661**）：`team` 表中英键一致、非空、不互抄；成员词与分组词逐字；未知成员词不是运行中/空闲；
+- `harness/locale-check.cjs` 团队段（505 → **661**，L2 的 `toolCards` 段再 +46 → **707**）：`team` 表中英键一致、非空、不互抄；成员词与分组词逐字；未知成员词不是运行中/空闲；`toolCards` 同口径（字符串叶子键集/非空/不互抄、6 个 formatter 键一致且中英不同、状态词与回执句逐字）；
   拒绝句译文表（含 `Error:` 前缀、未知原样）；**读本机 `dsh-experimental-agent-team/lib/index.js` 的每个 `TeamError` 字面量，实例化变量后确认都有中文**
   （找不到包时 NOTE，`DSH_AGENT_TEAM` 可覆盖路径）。

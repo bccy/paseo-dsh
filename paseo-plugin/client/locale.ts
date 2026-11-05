@@ -134,6 +134,8 @@ export interface UiText {
   goal: GoalText;
   /** Copy for the composer's team pill, its panel and the team_task_* cards (T3). */
   team: TeamText;
+  /** Copy for the tool-specific timeline cards (L2). */
+  toolCards: ToolCardsText;
 }
 
 /**
@@ -209,6 +211,45 @@ export interface TeamText {
     action: string;
     actions: Record<string, string>;
   };
+}
+
+/**
+ * The tool-specific timeline cards (L2): the words their heads and receipts are
+ * made of.
+ *
+ * A card's *shape* is decided in `./tool-call-data`; only the language-dependent
+ * halves live here, exactly like `goalCard`/`team`. A DSH value the receipt
+ * quotes (a status word, an exit code, a model id) stays verbatim: translating
+ * the words around it must never invent a value DSH did not send.
+ */
+export interface ToolCardsText {
+  /** Entry labels for the wire keys a reader should not have to parse. */
+  labels: { message: string; prompt: string; code: string; description: string };
+  /** `send_message` receipts: the team shape, its old shape, and the subagent-control shape. */
+  sent: string;
+  sentWithStatus: (status: string) => string;
+  delivered: string;
+  /** `interrupt_agent` receipts: the team shape (with the status it replaced) and the subagent-control shape. */
+  interrupted: (previousStatus: string) => string;
+  interruptRequested: string;
+  /** `spawn_teammate`: the fork marker after the name, and the creation receipt. */
+  inheritsContext: string;
+  created: (status: string, model: string) => string;
+  /** `wait_agent`: the duration in the head, and the two outcomes. */
+  waitSeconds: (n: number) => string;
+  waitMinutes: (n: number) => string;
+  timedOut: string;
+  progressed: string;
+  /** DSH's `noProgress.reason` known values; an unknown one stays verbatim. */
+  noActivePeer: string;
+  /** `list_agents`: the head when there is no teammate to count. */
+  leadOnly: string;
+  noMembers: string;
+  /** `job_output` status words, keyed by DSH's `JobStatus`. */
+  jobStatuses: Record<string, string>;
+  exitCode: (code: string) => string;
+  /** `job_kill`'s receipt. */
+  cancellationRequested: string;
 }
 
 /**
@@ -951,6 +992,32 @@ const TEXT: Record<Locale, UiText> = {
         },
       },
     },
+    toolCards: {
+      labels: { message: "Message", prompt: "Prompt", code: "Code", description: "Description" },
+      sent: "Sent",
+      sentWithStatus: (status) => `Sent · ${status}`,
+      delivered: "Delivered",
+      interrupted: (previousStatus) => `Interrupted (was ${previousStatus})`,
+      interruptRequested: "Interrupt requested",
+      inheritsContext: "inherits context",
+      created: (status, model) => (model === "" ? `Created · ${status}` : `Created · ${status} · ${model}`),
+      waitSeconds: (n) => `${String(n)}s`,
+      waitMinutes: (n) => `${String(n)}m`,
+      timedOut: "Timed out",
+      progressed: "Changed",
+      noActivePeer: "No member to wait for",
+      leadOnly: "Lead only",
+      noMembers: "No members",
+      jobStatuses: {
+        running: "Running",
+        stopping: "Stopping",
+        completed: "Completed",
+        killed: "Cancelled",
+        failed: "Failed",
+      },
+      exitCode: (code) => `exit code ${code}`,
+      cancellationRequested: "Cancellation requested",
+    },
   },
   "zh-CN": {
     toolLabels: {
@@ -1299,6 +1366,32 @@ const TEXT: Record<Locale, UiText> = {
           complete: "完成", reopen: "重新打开", reassign: "改派", delete: "删除",
         },
       },
+    },
+    toolCards: {
+      labels: { message: "消息", prompt: "提示词", code: "代码", description: "说明" },
+      sent: "已发送",
+      sentWithStatus: (status) => `已发送 · ${status}`,
+      delivered: "已投递",
+      interrupted: (previousStatus) => `已中断（原 ${previousStatus}）`,
+      interruptRequested: "已请求中断",
+      inheritsContext: "继承上下文",
+      created: (status, model) => (model === "" ? `已创建 · ${status}` : `已创建 · ${status} · ${model}`),
+      waitSeconds: (n) => `${String(n)} 秒`,
+      waitMinutes: (n) => `${String(n)} 分钟`,
+      timedOut: "超时",
+      progressed: "有变化",
+      noActivePeer: "无可等待的成员",
+      leadOnly: "仅主会话",
+      noMembers: "无成员",
+      jobStatuses: {
+        running: "运行中",
+        stopping: "停止中",
+        completed: "已完成",
+        killed: "已取消",
+        failed: "失败",
+      },
+      exitCode: (code) => `退出码 ${code}`,
+      cancellationRequested: "已请求取消",
     },
   },
 };

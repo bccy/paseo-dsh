@@ -42,7 +42,8 @@ import {
 } from "react-native";
 import { shouldPulse, useRowPulse } from "./newest";
 import { PASEO_MARK_ICON } from "./paseo-mark";
-import { blockCopy, type GoalBlockData, type ReadBlockData, type SearchBlockData, type ToolCallData, type WebBlockData } from "./tool-call-data";
+import { blockCopy, type GoalBlockData, type ReadBlockData, type SearchBlockData, type ToolCallData, type ToolFieldEntry, type ToolFieldsData, type WebBlockData } from "./tool-call-data";
+import { localeText } from "./locale";
 import { TextShimmer } from "./text-shimmer";
 import { TeamBlockView } from "./team-card";
 import { ringColorFor } from "./jobs-popover-layout";
@@ -731,6 +732,49 @@ function buildStyles(colors: TokenColors, hairline: number) {
       width: GOAL_FIELD_LABEL_WIDTH,
     },
     goalValue: { color: colors.foreground, fontSize: ROW_FONT_SIZE, lineHeight: GOAL_CARD_LINE_HEIGHT, flex: 1, minWidth: 0 },
+    // The generic fields card (see `ToolFieldsView`): the goal card's geometry,
+    // plus the gap between its entries. Facts share one wrapping row; a phone is
+    // 390px wide, so the row has to fold rather than push a value off the card.
+    fieldsItem: {
+      paddingVertical: GOAL_CARD_PADDING_VERTICAL,
+      paddingHorizontal: GOAL_CARD_PADDING_HORIZONTAL,
+      gap: GOAL_FIELD_ROW_GAP,
+    },
+    fieldFacts: {
+      flexDirection: "row" as const,
+      flexWrap: "wrap" as const,
+      gap: GOAL_FIELD_COLUMN_GAP,
+    },
+    fieldFact: {
+      flexDirection: "row" as const,
+      gap: GOAL_FIELD_COLUMN_GAP,
+      maxWidth: "100%" as const,
+      flexShrink: 1,
+    },
+    fieldFactLabel: {
+      color: colors.foregroundMuted,
+      fontSize: ROW_FONT_SIZE,
+      lineHeight: GOAL_CARD_LINE_HEIGHT,
+      flexShrink: 0,
+    },
+    fieldFactValue: {
+      color: colors.foreground,
+      fontSize: ROW_FONT_SIZE,
+      lineHeight: GOAL_CARD_LINE_HEIGHT,
+      flexShrink: 1,
+      minWidth: 0,
+    },
+    fieldBlock: { gap: GOAL_FIELD_ROW_GAP },
+    fieldLabel: { color: colors.foregroundMuted, fontSize: ROW_FONT_SIZE, lineHeight: GOAL_CARD_LINE_HEIGHT },
+    fieldText: { color: colors.foreground, fontSize: ROW_FONT_SIZE, lineHeight: GOAL_CARD_LINE_HEIGHT },
+    fieldCaption: { color: colors.foregroundMuted, fontSize: ROW_FONT_SIZE, lineHeight: GOAL_CARD_LINE_HEIGHT },
+    // The L2 receipt line: a summary of the card, so it reads quieter than the
+    // values above it.
+    fieldReceipt: { color: colors.foregroundMuted, fontSize: ROW_FONT_SIZE, lineHeight: GOAL_CARD_LINE_HEIGHT },
+    // The same 260px window the generic code surface uses: a long prose value
+    // and a nested object both scroll in place instead of pushing the timeline
+    // down.
+    fieldBodyScroll: { maxHeight: CODE_MAX_HEIGHT },
     // RN has no hairline in a plain object; `StyleSheet.hairlineWidth` is the
     // device's own (0.5 at 1x/2x), which is what DSH's `.5px` means here.
     card: cardStyle(colors, hairline),
@@ -855,6 +899,112 @@ function GoalBlockView({ data, summary, styles }: { data: GoalBlockData; summary
           </>
         )}
       </View>
+    </View>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Generic fields (rows with no detail shape)                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The generic card for a tool Paseo has no detail shape for (every MCP call):
+ * the call's arguments, then a structured result, split into facts rows, prose
+ * blocks and JSON code blocks (see `ToolFieldsData`).
+ *
+ * The goal card's geometry, value for value, like `./team-card` — this is not a
+ * new visual language, only the same label | value rows and the same code
+ * surface. Facts wrap because a phone is 390px wide and a call can carry five of
+ * them; a long value wraps inside its own row instead of pushing the card.
+ */
+function ToolFieldsView({ data, styles }: { data: ToolFieldsData; styles: BlockStyles }) {
+  const blocks: ReactNode[] = [];
+  // Consecutive facts share one wrapping row (`键: 值` ×N); a prose or JSON entry
+  // ends the run, so the payload's own key order survives the grouping.
+  const push = (entries: ToolFieldEntry[], section: string) => {
+    let facts: ToolFieldEntry[] = [];
+    let run = 0;
+    const flush = () => {
+      if (facts.length === 0) return;
+      const key = `${section}-facts-${String(run)}`;
+      blocks.push(
+        <View key={key} style={styles.fieldFacts}>
+          {facts.map((entry, index) => (
+            <View key={`${entry.label}-${String(index)}`} style={styles.fieldFact}>
+              <Text style={styles.fieldFactLabel}>{entry.label}</Text>
+              <Text style={styles.fieldFactValue} selectable>
+                {entry.value}
+              </Text>
+            </View>
+          ))}
+        </View>,
+      );
+      facts = [];
+      run += 1;
+    };
+    for (const entry of entries) {
+      if (entry.kind === "fact") {
+        facts.push(entry);
+        continue;
+      }
+      flush();
+      blocks.push(
+        <View key={`${section}-${entry.kind}-${String(blocks.length)}`} style={styles.fieldBlock}>
+          {entry.label === "" ? null : <Text style={styles.fieldLabel}>{entry.label}</Text>}
+          {/* Both entry kinds sit in the same 260px window the generic code
+              surface uses: a value can be 30KB (a `send_message` body), and the
+              timeline must stay bounded — scrolling, never truncating. Prose is
+              still drawn as prose: the wire's own newlines are the content, and
+              re-serializing the string is what produced the literal `\n` rows. */}
+          {entry.kind === "text" ? (
+            <ScrollView style={styles.fieldBodyScroll} nestedScrollEnabled>
+              <Text style={styles.fieldText} selectable>
+                {entry.value}
+              </Text>
+            </ScrollView>
+          ) : (
+            <ScrollView
+              style={styles.fieldBodyScroll}
+              contentContainerStyle={styles.code}
+              nestedScrollEnabled
+            >
+              <Text style={styles.codeText} selectable>
+                {entry.value}
+              </Text>
+            </ScrollView>
+          )}
+        </View>,
+      );
+    }
+    flush();
+  };
+  push(data.args, "args");
+  if (data.result.length > 0) {
+    // The caption separates the two halves: without it a card of facts does not
+    // say which ones the tool was called with and which it answered.
+    blocks.push(
+      <Text key="result-caption" style={styles.fieldCaption}>
+        {localeText().bodyLabels.result}
+      </Text>,
+    );
+    push(data.result, "result");
+  }
+  if (data.receipt !== "") {
+    // L2's one-line compression of the result (「已发送」/「超时」). Muted like a
+    // caption: it summarizes the card, it is not another value in it.
+    blocks.push(
+      <Text key="receipt" style={styles.fieldReceipt} selectable>
+        {data.receipt}
+      </Text>,
+    );
+  }
+  return (
+    <View style={styles.card}>
+      {/* The complete result JSON, not the card's flattened display: the copy
+          control is what keeps a structured result from losing information when
+          the card turns it into rows. */}
+      {data.copyText === "" ? null : <CardHead lang="" title="" text={data.copyText} styles={styles} />}
+      <View style={styles.fieldsItem}>{blocks}</View>
     </View>
   );
 }
@@ -1030,6 +1180,10 @@ export function InlineToolCall({
               }}
             />
           ) : null}
+          {/* The generic card for a row with no detail shape (every MCP call).
+              A plain-text result keeps its own code surface below this card; a
+              structured one is drawn by the card alone. */}
+          {data.fields !== null ? <ToolFieldsView data={data.fields} styles={styles} /> : null}
           {/* One card per expanded block, the way DSH's TerminalBlock, DiffBlock
               and ReadBlock all are: same radius, same hairline, same surface.
               `data.kind` picks it; a block whose meta did not parse has no

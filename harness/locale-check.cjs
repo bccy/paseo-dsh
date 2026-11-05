@@ -745,6 +745,77 @@ console.log("the team pill, panel and cards (T3)");
   }
 }
 
+console.log("the tool-specific timeline cards' copy is covered in both languages");
+{
+  // F9: `toolCards` is the L2 tables' copy (send_message receipts, the wait
+  // duration, list_agents' counts, job status words). It is a table of strings
+  // and formatters, so it gets the team table's checks: same keys, no empty
+  // value, and Chinese is not the English copied over.
+  const en = allText().en.toolCards;
+  const zh = allText()["zh-CN"].toolCards;
+  const leaves = (table, prefix = "") =>
+    Object.entries(table).flatMap(([key, value]) =>
+      typeof value === "string"
+        ? [[`${prefix}${key}`, value]]
+        : typeof value === "object" && value !== null
+          ? leaves(value, `${prefix}${key}.`)
+          : [],
+    );
+  const enLeaves = Object.fromEntries(leaves(en));
+  const zhLeaves = Object.fromEntries(leaves(zh));
+  equal("toolCards: both languages have the same string keys", Object.keys(enLeaves).sort(), Object.keys(zhLeaves).sort());
+  for (const [key, value] of Object.entries(zhLeaves)) {
+    check(`toolCards.${key} is non-empty in both`, value.trim() !== "" && (enLeaves[key] ?? "").trim() !== "");
+  }
+  equal("toolCards: English is not a copy of Chinese", Object.keys(zhLeaves).filter((key) => zhLeaves[key] === enLeaves[key]), []);
+  equal("toolCards: the labels table keys match", Object.keys(en.labels).sort(), Object.keys(zh.labels).sort());
+  equal("toolCards: the job status words are DSH's five", Object.keys(zh.jobStatuses).sort(), ["completed", "failed", "killed", "running", "stopping"]);
+
+  // The formatters: same keys, and each one reads differently in the two
+  // languages. The values they quote (a status, a model id) stay verbatim.
+  const samples = {
+    sentWithStatus: ["queued"],
+    interrupted: ["running"],
+    created: ["running", "deepseek-flash"],
+    waitSeconds: [90],
+    waitMinutes: [3],
+    exitCode: [0],
+  };
+  const formatters = Object.keys(en).filter((key) => typeof en[key] === "function");
+  equal("toolCards: the formatter keys match", formatters, Object.keys(zh).filter((key) => typeof zh[key] === "function"));
+  for (const key of formatters) {
+    const args = samples[key] ?? [];
+    check(`toolCards.${key}: English is not the Chinese`, en[key](...args) !== zh[key](...args), JSON.stringify([en[key](...args), zh[key](...args)]));
+  }
+
+  // The words themselves, pinned: these are what the rows read.
+  equal("toolCards: sent (zh/en)", [zh.sent, en.sent], ["已发送", "Sent"]);
+  equal("toolCards: sent with the old status (zh)", zh.sentWithStatus("queued"), "已发送 · queued");
+  equal("toolCards: delivered (zh/en)", [zh.delivered, en.delivered], ["已投递", "Delivered"]);
+  equal("toolCards: interrupted quotes the status (zh/en)", [zh.interrupted("running"), en.interrupted("running")], ["已中断（原 running）", "Interrupted (was running)"]);
+  equal("toolCards: interrupt requested (zh)", zh.interruptRequested, "已请求中断");
+  equal("toolCards: fork marker (zh/en)", [zh.inheritsContext, en.inheritsContext], ["继承上下文", "inherits context"]);
+  equal("toolCards: created (zh/en)", [zh.created("running", "deepseek-flash"), en.created("running", "deepseek-flash")], ["已创建 · running · deepseek-flash", "Created · running · deepseek-flash"]);
+  equal("toolCards: created without a model (zh/en)", [zh.created("provisioning", ""), en.created("provisioning", "")], ["已创建 · provisioning", "Created · provisioning"]);
+  equal("toolCards: wait durations (zh/en)", [zh.waitSeconds(90), zh.waitMinutes(3), en.waitSeconds(90), en.waitMinutes(3)], ["90 秒", "3 分钟", "90s", "3m"]);
+  equal("toolCards: outcomes (zh/en)", [zh.timedOut, zh.progressed, en.timedOut, en.progressed], ["超时", "有变化", "Timed out", "Changed"]);
+  equal("toolCards: the known noProgress reason (zh/en)", [zh.noActivePeer, en.noActivePeer], ["无可等待的成员", "No member to wait for"]);
+  equal("toolCards: list_agents heads (zh/en)", [zh.leadOnly, zh.noMembers, en.leadOnly, en.noMembers], ["仅主会话", "无成员", "Lead only", "No members"]);
+  equal("toolCards: job status words (zh)", zh.jobStatuses, {
+    running: "运行中",
+    stopping: "停止中",
+    completed: "已完成",
+    killed: "已取消",
+    failed: "失败",
+  });
+  equal("toolCards: exit code (zh/en)", [zh.exitCode(0), en.exitCode(0)], ["退出码 0", "exit code 0"]);
+  equal("toolCards: cancellation receipt (zh/en)", [zh.cancellationRequested, en.cancellationRequested], ["已请求取消", "Cancellation requested"]);
+  equal("toolCards: the entry labels (zh/en)", [zh.labels, en.labels], [
+    { message: "消息", prompt: "提示词", code: "代码", description: "说明" },
+    { message: "Message", prompt: "Prompt", code: "Code", description: "Description" },
+  ]);
+}
+
 console.log("every tool that draws an icon can also name itself");
 {
   // An icon with no label renders the row as `FileOutput  cordis_define` — the

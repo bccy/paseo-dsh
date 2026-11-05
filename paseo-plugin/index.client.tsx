@@ -226,6 +226,31 @@ export default function contribute(client: PluginClientContext) {
           more: z.boolean(),
         })
         .nullable(),
+      // The generic card for a row with no detail shape (every MCP call): the
+      // arguments and a structured result split into readable entries, plus the
+      // complete result JSON for the copy control. Declared in full for the same
+      // reason as `team` — an undeclared key is stripped on the way to the row.
+      fields: z
+        .object({
+          args: z.array(
+            z.object({
+              kind: z.enum(["fact", "text", "json", "code"]),
+              label: z.string(),
+              value: z.string(),
+            }),
+          ),
+          result: z.array(
+            z.object({
+              kind: z.enum(["fact", "text", "json", "code"]),
+              label: z.string(),
+              value: z.string(),
+            }),
+          ),
+          // L2's one-line compression of the result (「已发送」/「超时」), or "".
+          receipt: z.string(),
+          copyText: z.string(),
+        })
+        .nullable(),
       // DSH's failure code and, for a known one, the words drawn for it.
       errorCode: z.string(),
       errorShort: z.string(),

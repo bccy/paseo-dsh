@@ -71,7 +71,7 @@ const {
   parseTeamResult,
 } = require("./client/tool-call-data.js");
 const { diffStat } = require("./client/tokens.js");
-const { localeText, setLocale } = require("./client/locale.js");
+const { allText, localeText, setLocale } = require("./client/locale.js");
 
 /**
  * Load a sibling harness module from wherever this check runs.
@@ -127,26 +127,22 @@ function equal(label, actual, expected) {
  * instead. The scan is brace-depth aware so a nested object field (a future
  * `meta` shape, say) does not leak its own keys into the set.
  */
-function dshToolSchemaKeys(source) {
-  const marker = source.indexOf('kind: "dsh-tool"');
-  if (marker < 0) return [];
-  const at = source.indexOf("z.object(", marker);
-  if (at < 0) return [];
-  const open = source.indexOf("{", at);
-  if (open < 0) return [];
+function bracedBody(source, from) {
+  const open = source.indexOf("{", from);
+  if (open < 0) return "";
   let depth = 0;
-  let end = -1;
   for (let i = open; i < source.length; i += 1) {
     if (source[i] === "{") depth += 1;
-    else if (source[i] === "}" && (depth -= 1) === 0) {
-      end = i;
-      break;
-    }
+    else if (source[i] === "}" && (depth -= 1) === 0) return source.slice(open + 1, i);
   }
-  if (end < 0) return [];
+  return "";
+}
+
+/** Top-level keys of an object-literal body (a nested bracket run is skipped). */
+function objectLiteralKeys(body) {
   const keys = [];
   let nested = 0;
-  for (const line of source.slice(open + 1, end).split("\n")) {
+  for (const line of body.split("\n")) {
     const match = /^\s*([A-Za-z_$][\w$]*)\s*:/.exec(line);
     if (nested === 0 && match !== null) keys.push(match[1]);
     for (const character of line) {
@@ -155,6 +151,43 @@ function dshToolSchemaKeys(source) {
     }
   }
   return keys;
+}
+
+function dshToolSchemaKeys(source) {
+  const marker = source.indexOf('kind: "dsh-tool"');
+  if (marker < 0) return [];
+  const at = source.indexOf("z.object(", marker);
+  if (at < 0) return [];
+  return objectLiteralKeys(bracedBody(source, at));
+}
+
+/**
+ * The generic card's inner schema: the `fields` object's keys, one entry's keys,
+ * and every `z.enum([…])` member list inside it.
+ *
+ * Read from `index.client.tsx` source for the same reason as the top-level scan
+ * (the renderer imports React Native), and compared against the *data layer's
+ * runtime shapes*: an inner key or enum member the schema omits is stripped
+ * before the row sees it, and nothing errors.
+ */
+function dshFieldsSchema(source) {
+  const marker = source.indexOf('kind: "dsh-tool"');
+  if (marker < 0) return undefined;
+  // The goal card has its own `fields: z.array(...)` earlier in the same schema,
+  // so the generic card is the one declared as an *object* (`fields: z.object(`).
+  const at = source.slice(marker).search(/fields:\s*z\s*\.\s*object\(/u);
+  if (at < 0) return undefined;
+  const fieldsBody = bracedBody(source, marker + at);
+  if (fieldsBody === "") return undefined;
+  const argsAt = fieldsBody.indexOf("args: z.array(");
+  const entryBody = argsAt < 0 ? "" : bracedBody(fieldsBody, argsAt);
+  const kinds = [...fieldsBody.matchAll(/z\.enum\(\[([^\]]*)\]\)/gu)].map((match) =>
+    match[1]
+      .split(",")
+      .map((part) => part.trim().replace(/^"|"$/gu, ""))
+      .filter((part) => part !== ""),
+  );
+  return { fields: objectLiteralKeys(fieldsBody), entry: objectLiteralKeys(entryBody), kinds };
 }
 
 console.log("icons (must match Paseo's own mapping)");
@@ -547,15 +580,27 @@ console.log("provider-native tools (every MCP call)");
     },
     "complete",
   );
-  equal("the arguments are the row's title, on one line", mcp.summary, '{"cron":"* * * *","maxRuns":2}');
-  check("the result is the body", mcp.body.includes('"status": "active"'), mcp.body);
+  equal("the head names the call with its first short argument", mcp.summary, "cron: * * * *");
+  // L1: the payload is split into card entries instead of one pretty-printed
+  // blob, and the structured result moves out of the body — the card is its
+  // rendering. The copy control keeps the complete JSON, so nothing is lost.
+  equal("the arguments become card entries, in payload order", mcp.fields.args, [
+    { kind: "fact", label: "cron", value: "* * * *" },
+    { kind: "fact", label: "maxRuns", value: "2" },
+  ]);
+  equal("a structured result becomes card entries too", mcp.fields.result, [
+    { kind: "fact", label: "id", value: "abc" },
+    { kind: "fact", label: "status", value: "active" },
+  ]);
+  equal("…and leaves the body", mcp.body, "");
   equal(
-    "structured results are pretty-printed",
-    mcp.body,
+    "…while the copy control keeps the complete result JSON",
+    mcp.fields.copyText,
     '{\n  "id": "abc",\n  "status": "active"\n}',
   );
-  check("and so are the arguments in the block", mcp.headline.includes("\n"), JSON.stringify(mcp.headline));
+  equal("the block has no separate lead (the card carries the arguments)", mcp.headline, "");
   equal("and rendered as code", mcp.code, true);
+  equal("the row still expands", mcp.hasDetail, true);
 
   const text = toolCallData(
     {
@@ -567,18 +612,23 @@ console.log("provider-native tools (every MCP call)");
   );
   equal("a string result is kept verbatim", text.body, "No Paseo browser tabs are open.");
   equal("an argument-less call is labelled by its tool name alone", text.summary, "");
+  equal("…and draws no generic card (nothing to split)", text.fields, null);
 
   const silent = toolCallData(
     { name: "mcp__x__y", status: "running", detail: { type: "unknown", input: { a: 1 } } },
     "streaming",
   );
   equal("a running call has no body yet", silent.body, "");
-  equal("its title is still the arguments", silent.summary, '{"a":1}');
-  check("and its block already has them", silent.headline.includes("\n"), JSON.stringify(silent.headline));
+  // A number is not a short *string*, so it never becomes the head's summary;
+  // the card still carries it.
+  equal("its title is left to the tool name", silent.summary, "");
+  equal("and its block already has the arguments", silent.fields.args, [
+    { kind: "fact", label: "a", value: "1" },
+  ]);
   equal("so it has something to reveal", silent.hasDetail, true);
 
-  // A description on an MCP call must not push the block back to the compact
-  // one-line JSON: the pretty form is the whole point of the block.
+  // A description on an MCP call still titles the row; the block now carries the
+  // arguments as entries rather than as a second, pretty-printed copy.
   const described = toolCallData(
     {
       name: "mcp__x__y",
@@ -589,17 +639,20 @@ console.log("provider-native tools (every MCP call)");
     "complete",
   );
   equal("the title is the description", described.summary, "Do the thing");
-  check(
-    "the block still leads with pretty arguments",
-    described.headline.includes("\n"),
-    JSON.stringify(described.headline),
-  );
+  equal("the block carries the arguments as entries", described.fields.args, [
+    { kind: "fact", label: "description", value: "Do the thing" },
+    { kind: "fact", label: "a", value: "1" },
+  ]);
+  equal("…and no pretty-printed lead above them", described.headline, "");
 
   const arrayInput = toolCallData(
     { name: "mcp__x__z", status: "completed", detail: { type: "unknown", input: [1, 2], output: "" } },
     "complete",
   );
-  equal("an array argument is kept", arrayInput.summary, "[1,2]");
+  equal("an array argument is kept, as one unlabelled JSON entry", arrayInput.fields.args, [
+    { kind: "json", label: "", value: "[\n  1,\n  2\n]" },
+  ]);
+  equal("…and names no summary (it has no string field)", arrayInput.summary, "");
 
   const cyclic = {};
   cyclic.self = cyclic;
@@ -607,7 +660,468 @@ console.log("provider-native tools (every MCP call)");
     { name: "mcp__x__w", status: "completed", detail: { type: "unknown", input: cyclic } },
     "complete",
   );
-  equal("an unserializable payload is reported, not swallowed", broken.summary, "<unserializable>");
+  equal("an unserializable payload is reported, not swallowed", broken.fields.args, [
+    { kind: "json", label: "self", value: "<unserializable>" },
+  ]);
+}
+
+console.log("rows without a detail shape: the generic fields card (L1)");
+{
+  const row = (name, input, output, extra = {}) =>
+    toolCallData(
+      { name, status: "completed", detail: { type: "unknown", input, output }, error: null, ...extra },
+      "complete",
+    );
+
+  // A long multi-line string (`send_message`'s `message`) keeps its real
+  // newlines: the old rendering pretty-printed the *enclosing* object, so every
+  // newline inside the value arrived as a literal backslash-n and the message
+  // was one escaped wall of text on a phone.
+  const message = "第一行\n第二行\n\n第四行";
+  const sent = row("mcp__paseo__send_agent_prompt", { to: "lead", message }, "Message sent.");
+  equal("a multi-line value becomes a text entry", sent.fields.args, [
+    { kind: "fact", label: "to", value: "lead" },
+    { kind: "text", label: "message", value: message },
+  ]);
+  const text = sent.fields.args.find((entry) => entry.label === "message");
+  check("…with real newlines", text !== undefined && text.value.split("\n").length === 4);
+  check(
+    "…and no literal backslash-n left in it",
+    text !== undefined && !text.value.includes("\\n"),
+    JSON.stringify(text?.value),
+  );
+  equal("…and the plain-text result stays the body, verbatim", sent.body, "Message sent.");
+
+  // Short scalars pack into facts rows, one per value, in the payload's order.
+  // An empty string is a value here too — the tool was called with it.
+  const scalars = row("mcp__x__scalars", { name: "x", count: 2, ready: true, note: "" }, "");
+  equal("short scalars become facts, in payload order", scalars.fields.args, [
+    { kind: "fact", label: "name", value: "x" },
+    { kind: "fact", label: "count", value: "2" },
+    { kind: "fact", label: "ready", value: "true" },
+    { kind: "fact", label: "note", value: "" },
+  ]);
+
+  // A value that is itself a structure keeps the JSON code surface.
+  const nested = row("mcp__x__nested", { where: { a: 1, b: [2] } }, "");
+  equal("a nested object becomes a JSON entry", nested.fields.args, [
+    { kind: "json", label: "where", value: '{\n  "a": 1,\n  "b": [\n    2\n  ]\n}' },
+  ]);
+
+  // The head is the first short single-line string argument as `key: value`; the
+  // whole JSON blob never reaches the one-line head again.
+  const summary = row("mcp__x__summary", { count: 1, to: "lead", message }, "");
+  equal("the summary is the first short string argument", summary.summary, "to: lead");
+  check("…with no JSON in it", !summary.summary.includes("{"), summary.summary);
+  const argumentless = row("mcp__x__none", {}, "ok");
+  equal("an argument-less call has no summary of its own", argumentless.summary, "");
+  equal("…and draws no generic card", argumentless.fields, null);
+
+  // A tool with its own card keeps that card's documented fallback: a result the
+  // parser rejects stays verbatim in the body, and only the arguments become
+  // entries (the head no longer prints the argument JSON).
+  const unreadable = JSON.stringify({ goal: { id: "g", phase: "archived" } });
+  const goalFallback = row("get_goal", { action: "get" }, unreadable);
+  equal("a goal result the card cannot read keeps its body", goalFallback.body, unreadable);
+  check(
+    "…and only its arguments become entries",
+    goalFallback.fields !== null &&
+      goalFallback.fields.args.length === 1 &&
+      goalFallback.fields.result.length === 0,
+    JSON.stringify(goalFallback.fields),
+  );
+
+  // A result that is a JSON *string* is parsed and split like an object result;
+  // the copy control still carries the original string, byte for byte.
+  const jsonOutput = '{"status":"active","count":2}';
+  const parsed = row("mcp__x__json", {}, jsonOutput);
+  equal("a JSON-string result is split into entries", parsed.fields.result, [
+    { kind: "fact", label: "status", value: "active" },
+    { kind: "fact", label: "count", value: "2" },
+  ]);
+  equal("…the body no longer holds the JSON", parsed.body, "");
+  equal("…and the copy text is the original string", parsed.fields.copyText, jsonOutput);
+  // A string that does not parse (or parses to a scalar) stays plain text: only
+  // a structure is worth a card.
+  const unparseable = row("mcp__x__text", {}, "not json {");
+  equal("a result that is not JSON keeps the plain body", unparseable.body, "not json {");
+  equal("…and offers no card of its own", unparseable.fields, null);
+  const scalarOutput = row("mcp__x__scalar", {}, "42");
+  equal("a scalar-looking result stays text", scalarOutput.body, "42");
+  equal("…and is not a card", scalarOutput.fields, null);
+
+  // The structured cards keep their priority: when one parses, no generic card.
+  const goalRow = row("get_goal", {}, JSON.stringify({ goal: null, activation: "armed" }));
+  check("the goal card wins over the generic card", goalRow.goal !== null && goalRow.fields === null);
+  const teamRow = row("team_task_list", {}, JSON.stringify({ tasks: [] }));
+  check("the team card wins too", teamRow.team !== null && teamRow.fields === null);
+  const messageRow = toolCallData(
+    {
+      name: "agent_message",
+      status: "completed",
+      detail: { type: "plain_text", label: "", text: "hi" },
+      agentMessage: { event: "message", sender: { id: "a" }, text: "hi" },
+    },
+    "complete",
+  );
+  check("an agent message stays prose (no generic card)", messageRow.fields === null);
+
+  // A failed call still shows what it was asked to do; its result is the error
+  // text in the body, exactly as before.
+  const failedRow = toolCallData(
+    {
+      name: "mcp__x__fail",
+      status: "failed",
+      detail: { type: "unknown", input: { to: "lead" }, output: "boom" },
+      error: { message: "boom" },
+    },
+    "complete",
+  );
+  check(
+    "a failed call keeps its arguments as entries",
+    failedRow.fields !== null && failedRow.fields.args[0].label === "to",
+    JSON.stringify(failedRow.fields?.args ?? null),
+  );
+  equal("…and its error text as the body", failedRow.body, "boom");
+}
+
+console.log("high-frequency tools get their own cards (L2)");
+{
+  setLocale("zh-CN");
+  const row = (name, input, output, extra = {}) =>
+    toolCallData(
+      { name, status: "completed", detail: { type: "unknown", input, output }, error: null, ...extra },
+      "complete",
+    );
+  const failedRow = (name, input, output, message) =>
+    toolCallData(
+      { name, status: "failed", detail: { type: "unknown", input, output }, error: { message } },
+      "complete",
+    );
+
+  // --- send_message: one name, two implementations (survey §5) --------------
+  // Fixture from the survey's real samples (`stats-detail-top.txt`), de-identified.
+  const teamSend = row(
+    "send_message",
+    { target: "ban-mechanism-researcher", message: "进度催收：已过约 20 分钟。请**立即收口**…\n\n优先只要这三条…" },
+    '{"sent":true}',
+  );
+  equal("send_message (team): the head is the recipient", teamSend.summary, "ban-mechanism-researcher");
+  equal("…the message is a prose entry, newlines intact", teamSend.fields.args, [
+    { kind: "text", label: "消息", value: "进度催收：已过约 20 分钟。请**立即收口**…\n\n优先只要这三条…" },
+  ]);
+  equal("…the JSON result becomes a receipt, not entries", teamSend.fields.receipt, "已发送");
+  equal("…with no result entries left", teamSend.fields.result, []);
+  equal("…and no body repeating it", teamSend.body, "");
+  equal("…while the copy control keeps the original output", teamSend.fields.copyText, '{"sent":true}');
+
+  // F8: an empty message is a value, not a paragraph — no empty text entry.
+  const emptyMessage = row("send_message", { target: "lead", message: "" }, '{"sent":true}');
+  equal("send_message: an empty message draws no empty entry", emptyMessage.fields.args, []);
+  equal("…the receipt still answers", emptyMessage.fields.receipt, "已发送");
+
+  const oldSend = row(
+    "send_message",
+    { target: "lead", message: "x" },
+    '{"messageId":"team-message-eb227a23","status":"queued"}',
+  );
+  equal("send_message (old team shape): the status joins the receipt", oldSend.fields.receipt, "已发送 · queued");
+
+  const subSend = row(
+    "send_message",
+    { agent_id: "851a7c1e-e899-4a4e-9b3f-000000000000", message: "steer" },
+    "message delivered to agent 851a7c1e-e899-4a4e-9b3f-000000000000",
+  );
+  equal("send_message (subagent-control): the head is the agent id", subSend.summary, "851a7c1e-e899-4a4e-9b3f-000000000000");
+  equal("…its rendered sentence is the receipt", subSend.fields.receipt, "已投递");
+  equal("…the sentence does not stay in the body", subSend.body, "");
+  equal("…and the copy control keeps it", subSend.fields.copyText, "message delivered to agent 851a7c1e-e899-4a4e-9b3f-000000000000");
+
+  // A result neither implementation documents falls back to L1 — no guessing.
+  const oddSend = row("send_message", { target: "lead", message: "x" }, "not json");
+  equal("send_message: an undocumented result keeps L1's summary", oddSend.summary, "target: lead");
+  equal("…L1's body", oddSend.body, "not json");
+  equal("…and no receipt is invented", oddSend.fields.receipt, "");
+
+  // --- interrupt_agent: the same two implementations ------------------------
+  const teamInterrupt = row("interrupt_agent", { target: "ban-mechanism-researcher" }, '{"previousStatus":"running"}');
+  equal("interrupt_agent (team): the head is the target", teamInterrupt.summary, "ban-mechanism-researcher");
+  equal("…the receipt quotes the status it replaced", teamInterrupt.fields.receipt, "已中断（原 running）");
+  equal("…and the copy control keeps the output", teamInterrupt.fields.copyText, '{"previousStatus":"running"}');
+  const subInterrupt = row("interrupt_agent", { agent_id: "abc-123" }, "interrupt requested for agent abc-123");
+  equal("interrupt_agent (subagent-control): receipt", subInterrupt.fields.receipt, "已请求中断");
+  equal("…the head is the agent id", subInterrupt.summary, "abc-123");
+  const oddInterrupt = row("interrupt_agent", { target: "x" }, "done");
+  equal("interrupt_agent: an undocumented result keeps L1", oddInterrupt.summary, "target: x");
+  equal("…and no receipt", oddInterrupt.fields.receipt, "");
+
+  // --- spawn_teammate -------------------------------------------------------
+  const spawn = row(
+    "spawn_teammate",
+    {
+      description: "terminal 输出区无卡壳变体",
+      name: "terminal-bare",
+      context: "fork",
+      prompt: "你是 paseo-dsh 仓库的实现队友…\n\n工作区：<workspace>",
+    },
+    '{"member":{"target":"policy-researcher","role":"teammate","status":"running","description":"取证 Anthropic 官方支持地区与使用政策原文","provider":"spawn","context":"fresh","model":"deepseek-flash","diagnostics":[]}}',
+  );
+  equal("spawn_teammate: the head is the name, fork marked", spawn.summary, "terminal-bare · 继承上下文");
+  equal("…description is a fact (localized label) and the prompt prose", spawn.fields.args, [
+    { kind: "fact", label: "说明", value: "terminal 输出区无卡壳变体" },
+    { kind: "text", label: "提示词", value: "你是 paseo-dsh 仓库的实现队友…\n\n工作区：<workspace>" },
+  ]);
+  equal("…the member's status and model make the receipt", spawn.fields.receipt, "已创建 · running · deepseek-flash");
+  const freshSpawn = row(
+    "spawn_teammate",
+    { name: "x", prompt: "p", context: "fresh" },
+    '{"member":{"target":"x","role":"teammate","status":"provisioning"}}',
+  );
+  equal("spawn_teammate: fresh is not marked", freshSpawn.summary, "x");
+  equal("…a member without a model keeps a two-part receipt", freshSpawn.fields.receipt, "已创建 · provisioning");
+  const oddSpawn = row("spawn_teammate", { name: "x", prompt: "p" }, '{"member":{"target":"x"}}');
+  equal("spawn_teammate: a member without a status falls back to L1", oddSpawn.fields.receipt, "");
+  check(
+    "…keeping L1's argument entries",
+    oddSpawn.fields.args.some((entry) => entry.label === "name"),
+    JSON.stringify(oddSpawn.fields.args),
+  );
+
+  // F4: a mapped card's summary wins over the generic `description` rule (a
+  // bash row is titled by the model's description; a mapped row already named
+  // its subject). Both rows carry `metadata.description`, as the server does.
+  const describedSpawn = row(
+    "spawn_teammate",
+    { name: "terminal-bare", prompt: "p", description: "terminal 输出区无卡壳变体" },
+    '{"member":{"target":"x","role":"teammate","status":"running"}}',
+    { metadata: { description: "terminal 输出区无卡壳变体" } },
+  );
+  equal("a mapped summary beats metadata.description", describedSpawn.summary, "terminal-bare");
+  // `run_code`'s mapping summary is the input's own description, which the server
+  // also copies into metadata; the values are made to differ here only so the
+  // priority itself is observable (a real call sends the same string twice).
+  const describedCode = row(
+    "run_code",
+    { code: "x", description: "查找来源" },
+    "out",
+    { metadata: { description: "另一个描述" } },
+  );
+  equal("run_code: the mapped description wins over metadata.description", describedCode.summary, "查找来源");
+
+  // --- wait_agent -----------------------------------------------------------
+  const waited = row("wait_agent", { timeout_ms: 180000 }, '{"timedOut":true}');
+  equal("wait_agent: the head is the duration", waited.summary, "3 分钟");
+  equal("…the receipt says how it ended", waited.fields.receipt, "超时");
+  const progressed = row("wait_agent", { timeout_ms: 90000 }, '{"timedOut":false}');
+  equal("wait_agent: 90s stays seconds", progressed.summary, "90 秒");
+  equal("…and the other outcome", progressed.fields.receipt, "有变化");
+  equal("wait_agent: the default is DSH's 30s", row("wait_agent", {}, '{"timedOut":false}').summary, "30 秒");
+  const stalled = row(
+    "wait_agent",
+    { timeout_ms: 30000 },
+    '{"timedOut":true,"noProgress":{"reason":"no-active-peer","message":"No other Team member is running or provisioning."}}',
+  );
+  equal("wait_agent: the known reason is translated into the receipt", stalled.fields.receipt, "超时 · 无可等待的成员");
+  equal("…and its message is prose", stalled.fields.result, [
+    { kind: "text", label: "", value: "No other Team member is running or provisioning." },
+  ]);
+  const oddReason = row(
+    "wait_agent",
+    { timeout_ms: 30000 },
+    '{"timedOut":false,"noProgress":{"reason":"new-reason","message":"m"}}',
+  );
+  equal("wait_agent: an unknown reason stays verbatim", oddReason.fields.receipt, "有变化 · new-reason");
+  const oddWait = row("wait_agent", { timeout_ms: 180000 }, "not json");
+  // L1 only summarizes short *strings*, and this call's only argument is a
+  // number — so the fallback head is the label alone, and the body keeps the text.
+  equal("wait_agent: a result that is not the documented shape keeps L1", oddWait.summary, "");
+  equal("…with the raw text as body", oddWait.body, "not json");
+  equal("…and no receipt", oddWait.fields.receipt, "");
+
+  // --- list_agents ----------------------------------------------------------
+  const membersJson = JSON.stringify([
+    { target: "lead", role: "lead", status: "running", model: "deepseek-flash", diagnostics: [] },
+    { target: "reviewer", role: "teammate", status: "inactive", description: "只读审查", diagnostics: [] },
+  ]);
+  const list = row("list_agents", {}, membersJson);
+  equal("list_agents: the Lead is not counted", list.summary, "1 名成员");
+  equal("…one prose line per member, the Lead's role not repeated", list.fields.result, [
+    { kind: "text", label: "", value: "lead · running\nreviewer · teammate · inactive · 只读审查" },
+  ]);
+  // Counted on `role === "teammate"` (the team pill's rule): a role DSH adds
+  // later is listed but is not a teammate, and must not be counted as one.
+  const otherRole = row(
+    "list_agents",
+    {},
+    JSON.stringify([
+      { target: "lead", role: "lead", status: "running", diagnostics: [] },
+      { target: "observer", role: "observer", status: "running", diagnostics: [] },
+    ]),
+  );
+  equal("list_agents: a role that is not a teammate is not counted", otherRole.summary, "仅主会话");
+  equal(
+    "…but it is still listed",
+    otherRole.fields.result[0].value,
+    "lead · running\nobserver · running",
+  );
+  equal("…and the copy control keeps the whole array", list.fields.copyText, membersJson);
+  const leadOnly = row("list_agents", {}, JSON.stringify([{ target: "lead", role: "lead", status: "running", diagnostics: [] }]));
+  equal("list_agents: only the Lead reads as such", leadOnly.summary, "仅主会话");
+  equal("…and its row names it once", leadOnly.fields.result[0].value, "lead · running");
+  const emptyList = row("list_agents", {}, "[]");
+  equal("list_agents: an empty array reads 无成员", emptyList.summary, "无成员");
+  equal("…and draws no card", emptyList.fields, null);
+  const legacyList = row("list_agents", {}, "(no subagents)");
+  equal("list_agents: the old plain text stays L1's body", legacyList.body, "(no subagents)");
+  equal("…with no member lines", legacyList.fields, null);
+
+  // --- job_output / job_kill ------------------------------------------------
+  const jobOut = row(
+    "job_output",
+    { job_id: "bash-3eeee62adb424e3b", timeout_ms: 420000, wait: true },
+    "=== 1. 阿里云内网源（杭州同区）===\naliyun-mirror: 0 B/s  size=0\n[status: completed, exit code: 0]",
+  );
+  equal("job_output: the head is the job id", jobOut.summary, "bash-3eeee62adb424e3b");
+  // F1/F8: the call's own knobs stay visible — they explain the log below.
+  equal("…the wait knobs are kept as facts", jobOut.fields.args, [
+    { kind: "fact", label: "wait", value: "true" },
+    { kind: "fact", label: "timeout_ms", value: "420000" },
+  ]);
+  equal("…the status line is the receipt", jobOut.fields.receipt, "已完成 · 退出码 0");
+  equal("…the log stays the body, status line stripped", jobOut.body, "=== 1. 阿里云内网源（杭州同区）===\naliyun-mirror: 0 B/s  size=0");
+  equal(
+    "…and the copy control keeps the whole output",
+    jobOut.fields.copyText,
+    "=== 1. 阿里云内网源（杭州同区）===\naliyun-mirror: 0 B/s  size=0\n[status: completed, exit code: 0]",
+  );
+  equal("job_output: a running job reads 运行中", row("job_output", { job_id: "bash-5" }, "(no new output)\n[status: running]").fields.receipt, "运行中");
+  equal("job_output: an unknown detail stays verbatim", row("job_output", { job_id: "bash-6" }, "log\n[status: failed, max-tokens]").fields.receipt, "失败 · max-tokens");
+  const oddJob = row("job_output", { job_id: "bash-7" }, "no status line");
+  equal("job_output: a log without the status line keeps L1", oddJob.summary, "job_id: bash-7");
+  equal("…and the whole log as body", oddJob.body, "no status line");
+  const kill = row("job_kill", { job_id: "bash-5", reason: "与当前问题无关，已不需要" }, "requested cancellation of job bash-5");
+  equal("job_kill: the head is the job id", kill.summary, "bash-5");
+  equal("…the one-line output becomes a receipt", kill.fields.receipt, "已请求取消");
+  equal("…the body is cleared", kill.body, "");
+  equal("…and the copy control keeps the original line", kill.fields.copyText, "requested cancellation of job bash-5");
+  // F1: the model's reason was silently dropped by the first cut of this card.
+  equal("…the reason is kept as a fact", kill.fields.args, [
+    { kind: "fact", label: "reason", value: "与当前问题无关，已不需要" },
+  ]);
+  const longReason = "这条长说明会被 L1 的规则判成正文：它超过了六十个字符的单行上限，所以不该挤成一行事实条目；用户写的理由通常是一句解释，而不是一个短标识符，因此它应当原样换行显示。";
+  equal(
+    "job_kill: a long reason becomes prose, not a clipped fact",
+    row("job_kill", { job_id: "bash-8", reason: longReason }, "requested cancellation of job bash-8").fields.args,
+    [{ kind: "text", label: "reason", value: longReason }],
+  );
+  equal(
+    "job_kill: a call without a reason keeps no entry",
+    row("job_kill", { job_id: "bash-9" }, "requested cancellation of job bash-9").fields.args,
+    [],
+  );
+  const oddKill = row("job_kill", { job_id: "bash-5" }, "something else");
+  equal("job_kill: an undocumented output keeps L1", oddKill.body, "something else");
+
+  // --- mcp_call_tool --------------------------------------------------------
+  const proxied = row(
+    "mcp_call_tool",
+    { arguments: { limit: 5, filter: { url: "https://example.test" } }, server: "server_browser", tool: "browser_network_requests" },
+    '{"success":true,"status":"ok"}',
+  );
+  equal("mcp_call_tool: the head is server/tool", proxied.summary, "server_browser/browser_network_requests");
+  equal("…the arguments are entries, not one blob", proxied.fields.args, [
+    { kind: "fact", label: "limit", value: "5" },
+    { kind: "json", label: "filter", value: '{\n  "url": "https://example.test"\n}' },
+  ]);
+  equal("…the proxied result is left to L1", proxied.fields.result, [
+    { kind: "fact", label: "success", value: "true" },
+    { kind: "fact", label: "status", value: "ok" },
+  ]);
+  equal("…and its copy control keeps the result", proxied.fields.copyText, '{"success":true,"status":"ok"}');
+  equal("mcp_call_tool: a call without a server keeps L1", row("mcp_call_tool", { tool: "x", arguments: {} }, "text").summary, "tool: x");
+
+  // --- read_image -----------------------------------------------------------
+  const image = row(
+    "read_image",
+    { file_path: "/tmp/render-research/preview/_thumb.png" },
+    "<path>/tmp/render-research/preview/_thumb.png</path>\n<type>image</type>\n<content>\nimage/png image, 1600x1000 px, 947372 bytes\n</content>",
+  );
+  equal("read_image: the head is the basename", image.summary, "_thumb.png");
+  equal("…the full path is still a fact", image.fields.args, [
+    { kind: "fact", label: "file_path", value: "/tmp/render-research/preview/_thumb.png" },
+  ]);
+  check(
+    "…and the card draws no image of its own",
+    !(image.fields.args ?? []).some((entry) => entry.kind === "json"),
+    JSON.stringify(image.fields.args),
+  );
+  equal("read_image: a call without a path keeps L1", row("read_image", {}, "<path>x</path>").summary, "");
+
+  // --- run_code -------------------------------------------------------------
+  const code = row(
+    "run_code",
+    {
+      code: 'const g = await tools.grep({ pattern: "dbg-full" });\nconsole.log(g);',
+      description: "查找 .dbg-full 的构建来源",
+    },
+    "[]",
+  );
+  equal("run_code: the head is the description", code.summary, "查找 .dbg-full 的构建来源");
+  equal("…the program is a code entry, not prose", code.fields.args, [
+    { kind: "code", label: "代码", value: 'const g = await tools.grep({ pattern: "dbg-full" });\nconsole.log(g);' },
+  ]);
+  equal("run_code: a call without code keeps L1", row("run_code", { description: "d" }, "out").summary, "description: d");
+
+  // --- failure rows never become success receipts --------------------------
+  const failedSend = failedRow(
+    "send_message",
+    { target: "2acfb6a9-773a-4396-9c96-56d549986419", message: "m" },
+    'Error: active teammate "2acfb6a9-773a-4396-9c96-56d549986419" not found',
+    'active teammate "2acfb6a9-773a-4396-9c96-56d549986419" not found',
+  );
+  equal("a failed send_message has no success receipt", failedSend.fields.receipt, "");
+  equal("…keeps L1's argument entries", failedSend.fields.args[0].label, "target");
+  equal("…and its error text is the body", failedSend.body, 'Error: active teammate "2acfb6a9-773a-4396-9c96-56d549986419" not found');
+  const failedWait = failedRow("wait_agent", { timeout_ms: 30000 }, "Error: wait_agent aborted: { kind: 'user' }", "wait_agent aborted");
+  equal("a failed wait_agent has no receipt either", failedWait.fields.receipt, "");
+  equal("…and its error is kept verbatim", failedWait.error, "wait_agent aborted");
+
+  // F2: the mappers' `failed` guard is the only thing between a failed row and a
+  // *success* receipt. These feed a failure the exact output shape its successful
+  // mapper expects — the row must keep L1 and show no receipt at all.
+  const shapedSend = failedRow("send_message", { target: "lead", message: "m" }, '{"sent":true}', "send failed");
+  equal("a failed send_message with a success-shaped output shows no receipt", shapedSend.fields.receipt, "");
+  equal("…its head is not the recipient", shapedSend.summary, "target: lead");
+  equal("…and the success-shaped JSON stays L1 entries", shapedSend.fields.result, [
+    { kind: "fact", label: "sent", value: "true" },
+  ]);
+  const shapedWait = failedRow("wait_agent", { timeout_ms: 180000 }, '{"timedOut":false}', "wait aborted");
+  equal("a failed wait_agent with a success-shaped output shows no receipt", shapedWait.fields.receipt, "");
+  equal("…its head is not the duration", shapedWait.summary, "");
+  const shapedKill = failedRow("job_kill", { job_id: "bash-5", reason: "r" }, "requested cancellation of job bash-5", "kill failed");
+  equal("a failed job_kill with its success sentence shows no receipt", shapedKill.fields.receipt, "");
+  equal("…and the sentence stays the body", shapedKill.body, "requested cancellation of job bash-5");
+
+  // --- the copy comes from the same locale tables --------------------------
+  const en = allText().en.toolCards;
+  const zh = allText()["zh-CN"].toolCards;
+  equal("both languages ship the L2 card copy", Object.keys(en).sort(), Object.keys(zh).sort());
+  for (const key of Object.keys(en)) {
+    const leaf = en[key];
+    const other = zh[key];
+    if (typeof leaf === "function") {
+      check(`toolCards.${key} is a formatter in both languages`, typeof other === "function");
+    } else if (typeof leaf === "object") {
+      equal(`toolCards.${key} keys match`, Object.keys(leaf).sort(), Object.keys(other).sort());
+    } else {
+      check(`toolCards.${key} is set in both languages`, typeof other === "string" && other !== "" && leaf !== "", JSON.stringify([leaf, other]));
+    }
+  }
+  setLocale("en");
+  const englishSend = row("send_message", { target: "lead", message: "m" }, '{"sent":true}');
+  equal("English: the receipt is translated", englishSend.fields.receipt, "Sent");
+  equal("English: the message label too", englishSend.fields.args[0].label, "Message");
+  setLocale("zh-CN");
 }
 
 console.log("a row only expands onto something");
@@ -692,7 +1206,7 @@ console.log("a row only expands onto something");
     equal(
       `${label}: hasDetail agrees with the block's content`,
       data.hasDetail,
-      data.headline !== "" || data.body !== "",
+      data.headline !== "" || data.body !== "" || data.fields !== null,
     );
   }
 }
@@ -942,8 +1456,13 @@ console.log("the title is not repeated when the block carries it");
     "complete",
   );
   equal("a description-less row is not", bare.titled, false);
-  equal("its title is the subject", bare.summary, '{"action":"complete"}');
-  check("and the block carries the same subject in full", bare.headline.includes("\n"), JSON.stringify(bare.headline));
+  // L1: the title names the call's own argument, and the block carries the same
+  // subject as a facts entry — not as a second, pretty-printed JSON copy.
+  equal("its title names the call's own argument", bare.summary, "action: complete");
+  equal("and the block carries the same subject as an entry", bare.fields.args, [
+    { kind: "fact", label: "action", value: "complete" },
+  ]);
+  equal("…with no pretty-printed lead above it", bare.headline, "");
 }
 
 console.log("the block kind is explicit (DSH's own dispatch)");
@@ -1761,6 +2280,58 @@ console.log("the renderer's schema and ToolCallData cannot drift apart");
     [...schemaKeys].sort(),
     [...dataKeys].sort(),
   );
+
+  // F5: the generic card's inner shape, compared against the data layer's own
+  // runtime shapes. A key or enum member the schema omits is stripped before the
+  // row sees it, and nothing errors — so the sets are pinned, not sampled.
+  const schemaSource = sourcePath === undefined ? "" : fs.readFileSync(sourcePath, "utf8");
+  const inner = schemaSource === "" ? undefined : dshFieldsSchema(schemaSource);
+  check(
+    "the generic card's inner schema was found",
+    inner !== undefined && inner.fields.length > 0 && inner.entry.length > 0,
+    JSON.stringify(inner),
+  );
+  const innerSample = toolCallData(
+    {
+      name: "mcp__x__inner",
+      status: "completed",
+      detail: { type: "unknown", input: { a: 1, o: { b: 2 }, t: "x\ny" }, output: "" },
+    },
+    "complete",
+  ).fields;
+  equal(
+    "the fields object declares exactly ToolFieldsData's keys",
+    [...(inner?.fields ?? [])].sort(),
+    Object.keys(innerSample).sort(),
+  );
+  equal(
+    "…and one entry declares exactly ToolFieldEntry's keys",
+    [...(inner?.entry ?? [])].sort(),
+    Object.keys(innerSample.args[0]).sort(),
+  );
+  // Every kind the data layer can produce, derived by producing it: an enum the
+  // schema declares but nothing emits (or one it omits) fails here.
+  const producedKinds = new Set();
+  for (const detail of [
+    { type: "unknown", input: { a: 1 }, output: "" },
+    { type: "unknown", input: { t: "x\ny" }, output: "" },
+    { type: "unknown", input: { o: { b: 2 } }, output: "" },
+  ]) {
+    const produced = toolCallData({ name: "mcp__x__kind", status: "completed", detail }, "complete").fields;
+    for (const entry of produced.args) producedKinds.add(entry.kind);
+  }
+  const codeRow = toolCallData(
+    { name: "run_code", status: "completed", detail: { type: "unknown", input: { code: "x" }, output: "y" } },
+    "complete",
+  );
+  for (const entry of codeRow.fields.args) producedKinds.add(entry.kind);
+  const kindsSorted = [...producedKinds].sort();
+  equal("the data layer produces all four entry kinds", kindsSorted, ["code", "fact", "json", "text"]);
+  equal(
+    "…and both halves' kind enums are exactly that set",
+    (inner?.kinds ?? []).map((members) => [...members].sort()),
+    [kindsSorted, kindsSorted],
+  );
 }
 
 console.log("the renderer reads the state the data layer now carries");
@@ -1860,6 +2431,60 @@ console.log("the renderer reads the state the data layer now carries");
     mentions(stylesBody, "CODE_MAX_HEIGHT") && /maxHeight\s*:\s*CODE_MAX_HEIGHT/.test(stylesBody),
     "buildStyles does not bind maxHeight to CODE_MAX_HEIGHT",
   );
+
+  // L1: a row with no detail shape draws the generic fields card instead of one
+  // pretty-printed JSON blob. The card is wired from `data.fields`, its prose is
+  // drawn as text (re-serializing is what produced the literal `\n`), a nested
+  // value keeps the code surface, the facts row wraps on a phone, and the copy
+  // control gets `copyText` — the complete JSON — not the flattened display.
+  check("the row draws the generic fields card", mentions(component, "fields"), "no `fields` read in the component");
+  const fieldsView = functionBody(codeOnly(rendered), "ToolFieldsView") ?? "";
+  check("the fields card component was found", fieldsView.length > 0, "ToolFieldsView body is missing");
+  check(
+    "…whose copy control gets the complete result JSON",
+    elementsWithAttributes(fieldsView, ["text"]).filter(
+      (element) => element.tag === "CardHead" && mentions(attributeOf(element, "text").value, "copyText"),
+    ).length === 1,
+    "no CardHead wired to copyText",
+  );
+  check(
+    "…prose drawn as text, never re-serialized",
+    elementsWithAttributes(fieldsView, ["style"]).some((element) =>
+      mentions(attributeOf(element, "style").value, "fieldText"),
+    ) &&
+      !mentions(fieldsView, "stringifyValue") &&
+      !mentions(fieldsView, "JSON.stringify"),
+    "no fieldText element, or the value is re-serialized in the view",
+  );
+  const fieldScrolls = elementsWithAttributes(fieldsView, ["style"]).filter(
+    (element) =>
+      element.tag === "ScrollView" &&
+      mentions(attributeOf(element, "style").value, "fieldBodyScroll"),
+  );
+  check(
+    "…a nested value keeps the code surface",
+    fieldScrolls.some((element) => {
+      const content = attributeOf(element, "contentContainerStyle");
+      return content !== undefined && mentions(content.value, "code");
+    }),
+    `${fieldScrolls.length} scroll(s)`,
+  );
+  check(
+    "…and a long prose value is bounded too (scroll, never truncate)",
+    fieldScrolls.length === 2 &&
+      fieldScrolls.some((element) => attributeOf(element, "contentContainerStyle") === undefined),
+    `${fieldScrolls.length} scroll(s)`,
+  );
+  check(
+    "…and the facts row wraps on a narrow screen",
+    mentions(stylesBody, "fieldFacts") && /flexWrap\s*:\s*"wrap"/.test(stylesBody),
+    "buildStyles does not bind a wrapping fieldFacts row",
+  );
+  check(
+    "…and the L2 receipt is drawn in its own quiet line",
+    mentions(fieldsView, "receipt") && mentions(stylesBody, "fieldReceipt"),
+    "no receipt line in ToolFieldsView / buildStyles",
+  );
 }
 
 console.log("Paseo's own mark");
@@ -1954,7 +2579,10 @@ console.log("team task tools: field cards, raw JSON fallback, translated refusal
   const ownerFilter = row("team_task_list", { owner: "unowned", ready: true }, JSON.stringify({ tasks: [] }));
   equal("…owner/ready filters in words", ownerFilter.team?.caption, "0 个任务 · 筛选 负责人=未分配，可开始");
 
-  // The fallback: anything that is not DSH's exact shape keeps the raw JSON.
+  // The fallback: anything that is not DSH's exact shape gets no card. The team
+  // tools keep that card's documented fallback — the raw output in the body (L1
+  // only claims the results of tools with no card of their own, see
+  // `buildFields`) — so the assertion is "the output survives whole".
   for (const [what, output] of [
     ["not JSON", "task created"],
     ["an extra key (DSH's schema is additionalProperties:false)", JSON.stringify({ ...view(), extra: 1 })],
@@ -1966,7 +2594,11 @@ console.log("team task tools: field cards, raw JSON fallback, translated refusal
     const name = what.startsWith("a list") ? "team_task_list" : "team_task_get";
     const raw = row(name, { task_id: "task-2" }, output);
     check(`${what}: no card`, raw.team === null, JSON.stringify(raw.team));
-    check(`${what}: the raw output stays in the body`, raw.body.includes(output.slice(0, 12)) && raw.code === true, raw.body.slice(0, 80));
+    check(
+      `${what}: the output survives whole`,
+      raw.body === output || raw.fields?.copyText === output,
+      `body=${JSON.stringify(raw.body.slice(0, 80))} copy=${JSON.stringify(raw.fields?.copyText.slice(0, 80) ?? null)}`,
+    );
   }
   equal("parseTeamResult ignores other tools", parseTeamResult("create_goal", {}, JSON.stringify(view())), null);
 
