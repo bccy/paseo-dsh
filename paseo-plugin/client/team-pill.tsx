@@ -6,8 +6,10 @@
  * - **Label and title**: the noun 「团队」/「Team」 in every state; no count
  *   (T2 P1). The host uses `title` as the accessibility name, desktop tooltip
  *   and phone sheet header, so all three read the noun.
- * - **Icon**: the host running ring while a teammate runs (only when the server
- *   *said* it runs), red `Users` on a failure, muted `Users` otherwise. Sent
+ * - **Icon**: `Users`, with the host running ring on its corner while a
+ *   teammate runs (only when the server *said* it runs; T10b — the glyph is
+ *   never replaced, so a pill the host shrank to its icon still reads as the
+ *   team), red on a failure, muted otherwise. Sent
  *   through `update` only when it changes, like the jobs pill, so the ring does
  *   not restart on every poll.
  *
@@ -22,12 +24,10 @@ import type {
   PluginButtonRegistration,
   PluginClientContext,
 } from "@getpaseo/plugin/client";
-import { Icon } from "@getpaseo/plugin/client/ui";
 import { useEffect, useState } from "react";
 import { teamRead, type TeamView } from "../shared/team";
-import { ringColorFor } from "./jobs-popover-layout";
 import { localeText } from "./locale";
-import { StatusRingMark } from "./status-ring";
+import { CornerRingIcon } from "./corner-ring";
 import { createTeamPoller, teamPillIcon, teamPillVisible, type TeamPillIcon } from "./team-polling";
 import { TeamPanel, TeamPanelNote } from "./team-popover";
 
@@ -50,15 +50,19 @@ function publish(store: TeamStore, agentId: string, team: TeamView | null): void
   }
 }
 
-/** The icon components, one per state, so `update` swaps a stable identity. */
+/**
+ * The icon components, one per state, so `update` swaps a stable identity. The
+ * `Users` glyph is drawn in every state; a running teammate adds the corner
+ * ring (`./corner-ring`) instead of replacing it.
+ */
 function RunningIcon({ size, theme }: PluginButtonIconProps) {
-  return <StatusRingMark size={size} color={ringColorFor(theme.colors.surface0)} />;
+  return <CornerRingIcon name="Users" size={size} color={theme.colors.foregroundMuted} running theme={theme} />;
 }
 function FailedIcon({ size, theme }: PluginButtonIconProps) {
-  return <Icon name="Users" size={size} color={theme.colors.statusDanger} />;
+  return <CornerRingIcon name="Users" size={size} color={theme.colors.statusDanger} running={false} theme={theme} />;
 }
 function IdleIcon({ size, theme }: PluginButtonIconProps) {
-  return <Icon name="Users" size={size} color={theme.colors.foregroundMuted} />;
+  return <CornerRingIcon name="Users" size={size} color={theme.colors.foregroundMuted} running={false} theme={theme} />;
 }
 const ICONS: Record<TeamPillIcon, typeof IdleIcon> = { running: RunningIcon, failed: FailedIcon, idle: IdleIcon };
 

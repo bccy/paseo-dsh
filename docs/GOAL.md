@@ -81,8 +81,34 @@ Paseo 0.14.0。
 
 ## 状态、pill 与按钮
 
-目标 pill 注册在 composer（`client.addComposerPill`，独立 id **`dsh-goal`**，与 jobs pill 并列；
-**jobs pill 的语义一行不改**：只在运行中可见、只用转环、文案「N 个后台」）。**label 与 title 在所有
+**目标与后台共用一格 pill（T10b，2026-11-05 用户决定）**：手机上一行 5–6 个 pill 时宿主会把插件 pill
+压成纯图标，所以目标与后台合用**一个** composer 注册（`client/goal-jobs-slot.ts`，id **`dsh-goal-jobs`**，
+每个 agent 一颗），团队 pill 不变、单独一格；本插件一行最多占两格。这一格显示哪一半：
+
+| 目标 | 后台（有 running/stopping） | 显示 |
+|---|---|---|
+| 无 / 已清除 / 完成且已看过 | 有 | 后台：转环角标 + `SquareTerminal`，「N 个后台」，title「后台任务」 |
+| 有 | 无 | 目标 |
+| 需要处理（blocked、paused、active+disarmed、complete 未看过） | 有 | 目标 |
+| active + armed | 有 | 后台 |
+| 无 | 无 | 隐藏 |
+
+**后台的语义一行不改**：仍由 `jobsPillPresentation` 判定，只有 running/stopping 才算「有后台」，跑完即不再
+占这一格（registry 读不到时仍显示后台以便面板说明原因，但它不抢正在跑的目标）。判定是纯函数
+`goalJobsSlotShown`；「需要处理」是 `goalNeedsAttention`（目标 pill 的 label 键不是 `running`）。
+
+**面板只有一个、身份不变。** 注册时 `behavior` 设为一个固定的 popover 组件（`makeGoalJobsPopover`），之后
+`update` 只带 `visible`/`label`/`title`/`icon`，**绝不带 `behavior`**：宿主在 patch 带 `behavior`、或隐藏/禁用
+按钮时会关掉已打开的面板（Paseo 0.15.0 `plugins/buttons/model.ts:120-127`），而 `behavior.Content` 渲染为
+`<Content {...props} close={close} />`（`plugins/buttons/view.tsx:169-173`），面板内切视图只能靠这个组件自己的
+状态。打开时取 pill 当前显示的那一半；另一半也在时，面板顶部多一行切换行——目标视图顶部是「N 个后台」行
+（终端图标 + 角标环），后台视图顶部是「鲸鱼 + 目标单行 + 状态行」；点它在面板内切换，切过去的视图顶部那行
+变成带 `ChevronLeft` 的「返回，…」。两半的正文就是原来的 `makeGoalPopover`（编辑页、确认页、`close()` 去向不变）
+与 `makeJobsPopover`。面板打开期间状态翻转（例如后台跑完、目标受阻）只更新 pill 的 label/icon/title，不关面板、
+不自动切视图；当前视图那一半没了（后台全部跑完）才回落到另一半。完成态「已读」在**整个面板关闭时**记，并且
+只有目标视图真的出现过才算（只挂载当前视图，切到后台视图时目标正文也会卸载，不能拿它当「关闭」）。
+
+目标那一半的规则如下。**label 与 title 在所有
 状态下都是「目标」/「Goal」**（UI-v7）：宿主把按钮的 `title` 同时用作无障碍名、桌面 tooltip 与手机 sheet
 标题（`plugins/buttons/view.tsx`），插件 API 没有分开的通道，而手机 sheet 标题要是「目标」，所以读屏
 在 pill 上也只读「目标」（用户已接受）。状态由图标表达（颜色、运行环、完成对勾），并由**面板目标行的
@@ -98,7 +124,7 @@ goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等�
 
 | 状态 | 完整状态名（面板目标行读屏；pill 的 label/title 恒为「目标」/「Goal」） | 图标 | 行尾操作 |
 |---|---|---|---|
-| active + armed | `目标进行中` / `Goal running` | 运行环（agent 在跑时）/ `Target`（`foregroundMuted`） | 暂停、清除；点行编辑 |
+| active + armed | `目标进行中` / `Goal running` | `Target`（`foregroundMuted`），agent 在跑时右下角叠运行环 | 暂停、清除；点行编辑 |
 | active + disarmed | `目标未在续跑` / `Goal not running` | `Target`（`statusWarning`） | 继续、清除；点行编辑 |
 | paused | `目标已暂停` / `Goal paused` | `Target`（`statusWarning`） | 继续、清除；点行编辑 |
 | blocked | `目标受阻` / `Goal blocked` | `Target`（`statusDanger`） | 继续、清除；点行编辑 |
@@ -107,9 +133,11 @@ goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等�
 **pill 文字不带轮数分数**：`目标 3/10` 在 160px 的按钮里会被读成完成度（上限默认 256），轮数是
 **预算不是完成度**，只进 popover 的 facts 行（`goalFactsLine`）。
 
-**运行环（v5）**：pill 图标在「目标真的在跑」时**替换**为运行环（`StatusRingMark`，与 jobs pill
-同一个环：12px、900ms、`ringColorFor` 取运行蓝），否则按 tone 着色的 `Target`
-（`goalIconColorToken`：normal→`foregroundMuted`、warning→`statusWarning`、error→`statusDanger`）。
+**运行环（T10b 起叠在角上）**：pill 图标**始终是**按 tone 着色的 `Target`（完成态是 `CircleCheck`；
+`goalIconColorToken`：normal→`foregroundMuted`、warning→`statusWarning`、error→`statusDanger`），「目标真的在跑」时
+在右下角叠一个运行环（`client/corner-ring.tsx` 的 `CornerRingIcon`：9px 框、1.5px 底色挖空、6px 环、偏移 -1，
+落在宿主 16px 插件图标盒内；组件外框恒等于 `size`，角环绝对定位不撑宽）。以前是用环**替换**图标，宿主把 pill
+压成纯图标时目标、后台、团队都只剩一个蓝环，分不出来；现在三者底图标分别是 `Target`、`SquareTerminal`、`Users`。
 运行判定是纯函数 `goalRunningMark`：`active + armed` 且 agent `running` 才转；agent 转 `idle` 后
 保持 **1.5s**（`GOAL_RUNNING_HOLD_MS`）；disarmed/paused/blocked/complete、agent 非 running、或
 读不到 agent 状态都不转（不猜）。`useAgent(agentId, a => a.status)` 读宿主 session store，不轮询
@@ -384,8 +412,8 @@ DSH 判参数非法。两者都在写入前拒绝，目标不受影响（FIELD-N
 | 检查 | 断言 | 依赖 | 触发 |
 |---|---|---|---|
 | `harness/goal-bridge-check.mjs` | 15/15 | **本机 DSH 安装**（从全局安装解析 `@deepseek-ai/*`，`DSH_PACKAGES_DIR`/`DSH_INSTALL_DIR` 可覆盖；没有就 exit 2） | 动 `dsh-bridge/lib/server.js` 的 `paseo/goal` / dispatch |
-| `harness/goal-pill-check.cjs` | 175/175 | 纯模块（`tsc -p harness/goal-pill.tsconfig.json`） | 动 `client/goal-polling.ts`、`client/goal-popover.tsx`、`client/goal-pill.tsx`、`client/goal-running.tsx`、`client/agent-polling.ts`、`shared/goal.ts` 或 locale goal 表 |
-| `harness/goal-popover-render-check.cjs` | 51/51 | `HOST_APP` 指向 Paseo 检出（react-native-web + jsdom 渲染真实面板）；未设置 exit 2 | 动 `client/goal-popover.tsx`、`client/deepseek-mark*.tsx` 或面板用到的 `goal-polling.ts` 规则 |
+| `harness/goal-pill-check.cjs` | 336/336 | 纯模块（`tsc -p harness/goal-pill.tsconfig.json`） | 动 `client/goal-polling.ts`、`client/goal-popover.tsx`、`client/goal-pill.tsx`、`client/goal-running.tsx`、`client/agent-polling.ts`、`shared/goal.ts` 或 locale goal 表 |
+| `harness/goal-popover-render-check.cjs` | 210/210 | `HOST_APP` 指向 Paseo 检出（react-native-web + jsdom 渲染真实面板）；未设置 exit 2 | 动 `client/goal-popover.tsx`、`client/deepseek-mark*.tsx` 或面板用到的 `goal-polling.ts` 规则 |
 | `harness/goal-server-check.cjs` | 39/39 | 真实插件 + 假桥（一次性 `DSH_HOME`） | 动 `server/provider.ts` / `server/session.ts` 的 goal 读写、`server/dsh-process.ts` 的 goal 分级与 `currentTask`、`index.server.ts` 的 handler、桥的缺失服务文案 |
 | `harness/goal-timeline-check.cjs` | 6 组 | 真实 `DshSession` + 假进程传输（`plugin-build.cjs` 自编译） | 动 `server/activity-timeline.ts` 的 goal 行、`server/session.ts` 的重放过滤、`server/locale.ts` 的 `goalRound` |
 

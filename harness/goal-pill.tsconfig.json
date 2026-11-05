@@ -17,6 +17,9 @@
     "../paseo-plugin/client/agent-polling.ts",
     "../paseo-plugin/client/jobs-popover-layout.ts",
     "../paseo-plugin/client/goal-polling.ts",
+    "../paseo-plugin/client/goal-jobs-slot.ts",
+    "../paseo-plugin/client/jobs-polling.ts",
+    "../paseo-plugin/shared/jobs.ts",
     "../paseo-plugin/client/locale.ts",
     "../paseo-plugin/client/deepseek-mark-svg.ts",
     "../paseo-plugin/shared/goal.ts"

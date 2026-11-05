@@ -103,7 +103,11 @@ fs.writeFileSync(
   entry,
   `export { GoalPopoverBody } from ${JSON.stringify(path.join(pluginRoot, "client/goal-popover.tsx"))};
 export { allText } from ${JSON.stringify(path.join(pluginRoot, "client/locale.ts"))};
-export { makeGoalPopover } from ${JSON.stringify(path.join(pluginRoot, "client/goal-pill.tsx"))};
+export { makeGoalPopover, makeGoalIcon, makeGoalJobsPopover } from ${JSON.stringify(path.join(pluginRoot, "client/goal-pill.tsx"))};
+export { makeJobsPopover } from ${JSON.stringify(path.join(pluginRoot, "client/jobs-pill.tsx"))};
+export { createGoalJobsSlot } from ${JSON.stringify(path.join(pluginRoot, "client/goal-jobs-slot.ts"))};
+export { CornerRingIcon } from ${JSON.stringify(path.join(pluginRoot, "client/corner-ring.tsx"))};
+export { JobsPillIcon } from ${JSON.stringify(path.join(pluginRoot, "client/jobs-spinner.tsx"))};
 export { createRoot } from "react-dom/client";
 export { createElement } from "react";
 export { flushSync } from "react-dom";
@@ -151,7 +155,20 @@ for (const name of ["ShadowRoot", "HTMLElement", "Element", "Node", "MutationObs
 }
 
 const bundled = require(path.join(work, "bundle.cjs"));
-const { GoalPopoverBody, allText, makeGoalPopover, createRoot, createElement, flushSync } = bundled;
+const {
+  GoalPopoverBody,
+  allText,
+  makeGoalPopover,
+  makeGoalIcon,
+  makeGoalJobsPopover,
+  makeJobsPopover,
+  createGoalJobsSlot,
+  CornerRingIcon,
+  JobsPillIcon,
+  createRoot,
+  createElement,
+  flushSync,
+} = bundled;
 const React = { createElement };
 
 // The shipped zh-CN copy, not a local copy: the disarmed hint and every label
@@ -752,8 +769,178 @@ async function containerChecks() {
   }
 }
 
+/* The goal/jobs slot's one panel (T10b) ------------------------------------ */
+
+/**
+ * Mount the real slot panel (`makeGoalJobsPopover`) over the real coordinator,
+ * the real goal container and the real jobs body. The fake registration
+ * records every `update`; `close` is the host's own close, spied.
+ */
+function mountSlot({ goal = baseGoal, jobs = [], goalAttention = false } = {}) {
+  const spies = { close: 0, updates: [], rpc: [] };
+  const goalStore = new Map([["agent-1", { goal, available: true, listeners: new Set() }]]);
+  const jobsStore = new Map([["agent-1", { jobs, available: true, listeners: new Set() }]]);
+  const client = {
+    rpc: async (_definition, input) => {
+      spies.rpc.push(input);
+      return { ok: true, message: "ok" };
+    },
+  };
+  let slot;
+  slot = createGoalJobsSlot({
+    addComposerPill: (contribution) => {
+      spies.contribution = contribution;
+      return { update: (patch) => spies.updates.push(patch), remove: () => {} };
+    },
+    makeContent: (agentId) => makeGoalJobsPopover(slot, agentId),
+  });
+  const agent = { id: "agent-1", workspaceId: "w" };
+  slot.attach("goal", agent, { Content: makeGoalPopover(client, goalStore, "agent-1", async () => {}, () => {}), icon: "GoalIcon", title: "目标" });
+  slot.attach("jobs", agent, { Content: makeJobsPopover(jobsStore, "agent-1"), icon: "JobsIcon", title: "后台任务" });
+  const liveCount = jobs.filter((job) => job.status === "running" || job.status === "stopping").length;
+  const presentGoal = (g, attention) =>
+    slot.presentGoal("agent-1", { visible: g !== null, attention, goal: g, label: "目标", title: "目标", icon: "GoalIcon" });
+  const presentJobs = (count) =>
+    slot.presentJobs("agent-1", { visible: count > 0, live: count > 0, label: count > 0 ? `${count} 个后台` : "后台任务", title: "后台任务", icon: "JobsIcon" });
+  presentGoal(goal, goalAttention);
+  presentJobs(liveCount);
+  const Panel = spies.contribution.button.behavior.Content;
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const root = createRoot(container);
+  flushSync(() => {
+    root.render(
+      React.createElement(Panel, {
+        theme,
+        layout: { compact: true, platform: "web" },
+        host: { id: "h", label: "h" },
+        context: "agent",
+        workspaceId: "w",
+        agentId: "agent-1",
+        close: () => {
+          spies.close += 1;
+        },
+      }),
+    );
+  });
+  const rerender = (fn) => flushSync(fn);
+  return { container, root, spies, slot, presentGoal, presentJobs, goalStore, jobsStore, rerender };
+}
+
+const runningJob = { id: "job-1", kind: "bash", label: "sleep 600", status: "running", startedAt: 0, description: "运行完整测试套件" };
+
+async function slotChecks() {
+  console.log("\nthe goal/jobs slot's one panel (T10b)");
+  {
+    // Armed goal + a running job: the trigger shows the jobs, the panel opens
+    // on the jobs view with the goal switch row on top.
+    const { container, spies, presentJobs, presentGoal, rerender } = mountSlot({ jobs: [runningJob] });
+    check("one behavior for the whole slot, registered once", spies.contribution.button.behavior.kind, "popover");
+    assert("the panel opens on the jobs view (what the trigger shows)", container.querySelector('[data-testid="goal-jobs-view-jobs"]') !== null);
+    assert("…listing the job", container.textContent.includes("运行完整测试套件"));
+    const goalRow = container.querySelector('[data-testid="goal-jobs-switch-goal"]');
+    assert("the jobs view's top row switches to the goal", goalRow !== null);
+    assert("…drawing the whale", goalRow?.querySelector('[data-icon="svg"]') !== null);
+    assert("…the objective on one line", (goalRow?.textContent ?? "").includes(baseGoal.objective));
+    assert("…and the goal's state line", (goalRow?.textContent ?? "").includes("进行中 · 第 3 轮 · 预算 10"));
+    check("…named by state then objective", goalRow?.getAttribute("aria-label"), `目标进行中，${baseGoal.objective}`);
+    const updatesBefore = spies.updates.length;
+    click(goalRow);
+    assert("pressing it switches the panel to the goal view in place", container.querySelector('[data-testid="goal-jobs-view-goal"]') !== null);
+    assert("…the real goal panel is drawn", byLabel(container, "目标进行中，编辑目标") !== undefined);
+    check("switching views does not close the panel", spies.close, 0);
+    check("switching views sends no registration update", spies.updates.length, updatesBefore);
+    const jobsRow = container.querySelector('[data-testid="goal-jobs-switch-jobs"]');
+    assert("the goal view's top row switches back to the jobs", jobsRow !== null);
+    check("…as the way back, naming 「N 个后台」", jobsRow?.getAttribute("aria-label"), "返回，1 个后台");
+    assert("…with the terminal glyph and its corner ring", jobsRow?.querySelector('[data-icon="SquareTerminal"]') !== null && jobsRow?.querySelector('[data-testid="pill-corner-ring"]') !== null);
+    click(jobsRow);
+    assert("…and pressing it returns to the jobs view", container.querySelector('[data-testid="goal-jobs-view-jobs"]') !== null);
+
+    // A flip while the panel is open: the goal blocks. The trigger moves; the
+    // view stays; nothing closes and no behavior is sent.
+    rerender(() => presentGoal({ ...baseGoal, phase: "blocked" }, true));
+    check("the goal blocking while open does not close the panel", spies.close, 0);
+    assert("…and does not move the view", container.querySelector('[data-testid="goal-jobs-view-jobs"]') !== null);
+    check("…the trigger flipped to the goal", spies.updates.at(-1)?.label, "目标");
+    check("no update ever carried a behavior", spies.updates.every((patch) => !("behavior" in patch)), true);
+    // The jobs finish while their view is open: the view falls back to the goal.
+    rerender(() => presentJobs(0));
+    assert("the jobs finishing while their view is open falls back to the goal view", container.querySelector('[data-testid="goal-jobs-view-goal"]') !== null);
+    assert("…with no switch row left (nothing else to show)", container.querySelector('[data-testid^="goal-jobs-switch-"]') === null);
+    check("…and still no close", spies.close, 0);
+    check("…and no visibility change (the goal still holds the slot)", spies.updates.at(-1)?.visible, undefined);
+  }
+  {
+    // A goal that needs the user opens on the goal view, with the jobs row on top.
+    const { container, spies } = mountSlot({ goal: { ...baseGoal, phase: "blocked" }, goalAttention: true, jobs: [runningJob] });
+    assert("a blocked goal beside running jobs opens on the goal view", container.querySelector('[data-testid="goal-jobs-view-goal"]') !== null);
+    const jobsRow = container.querySelector('[data-testid="goal-jobs-switch-jobs"]');
+    check("…its top row opens the jobs, named 「1 个后台」", jobsRow?.getAttribute("aria-label"), "1 个后台");
+    // The goal panel's own close() behaviour is intact inside the slot.
+    click(byLabel(container, "目标受阻，编辑目标"));
+    assert("the goal editor opens inside the slot", field(container) !== null);
+    click(byLabel(container, "取消"));
+    check("the editor's 取消 still closes the panel (UI-v8)", spies.close, 1);
+  }
+  {
+    // Only the goal: no switch row, the goal body alone.
+    const { container } = mountSlot({ jobs: [] });
+    assert("only a goal: the goal view, no switch row", container.querySelector('[data-testid="goal-jobs-view-goal"]') !== null && container.querySelector('[data-testid^="goal-jobs-switch-"]') === null);
+  }
+
+  console.log("\npill icons keep their glyph; the ring sits on the corner (T10b)");
+  {
+    const mount = (element) => {
+      const c = document.createElement("div");
+      document.body.appendChild(c);
+      flushSync(() => createRoot(c).render(element));
+      return c;
+    };
+    for (const name of ["Users", "Target", "SquareTerminal"]) {
+      const running = mount(React.createElement(CornerRingIcon, { name, size: 14, color: "#71717a", running: true, theme }));
+      check(`${name} running: the glyph is still drawn`, running.querySelectorAll(`[data-icon="${name}"]`).length, 1);
+      check(`${name} running: one corner ring`, running.querySelectorAll('[data-testid="pill-corner-ring"]').length, 1);
+      const ring = running.querySelector('[data-testid="pill-corner-ring"]');
+      const style = ring?.getAttribute("style") ?? "";
+      assert(`${name}: the ring frame is 9px at the bottom-right, inside the 16px box`, /width:\s*9px/.test(style) && /right:\s*-1px/.test(style) && /bottom:\s*-1px/.test(style), style);
+      const idle = mount(React.createElement(CornerRingIcon, { name, size: 14, color: "#71717a", running: false, theme }));
+      check(`${name} idle: the glyph`, idle.querySelectorAll(`[data-icon="${name}"]`).length, 1);
+      check(`${name} idle: no ring`, idle.querySelectorAll('[data-testid="pill-corner-ring"]').length, 0);
+    }
+    // The icon component's own frame is exactly `size`, ring or no ring: the
+    // host gives every plugin icon a 16px box and an 8px gap to the label, so a
+    // frame wider than `size` would add a gap of our own. The ring is
+    // absolutely placed.
+    for (const running of [true, false]) {
+      for (const size of [14, 16]) {
+        const box = mount(React.createElement(CornerRingIcon, { name: "Users", size, color: "#71717a", running, theme })).firstElementChild;
+        const style = box?.getAttribute("style") ?? "";
+        assert(`CornerRingIcon frame is ${size}×${size} (running=${running})`, new RegExp(`width:\\s*${size}px`).test(style) && new RegExp(`height:\\s*${size}px`).test(style) && !/padding|margin/.test(style), style);
+      }
+    }
+    const ringed = mount(React.createElement(CornerRingIcon, { name: "Users", size: 14, color: "#71717a", running: true, theme }));
+    assert("the corner ring is out of flow (cannot widen the frame)", /position:\s*absolute/.test(ringed.querySelector('[data-testid="pill-corner-ring"]')?.getAttribute("style") ?? ""));
+    const jobsFrame = mount(React.createElement(JobsPillIcon, { size: 14, color: "#71717a", theme })).firstElementChild;
+    assert("the jobs trigger icon frame is 14×14", /width:\s*14px/.test(jobsFrame?.getAttribute("style") ?? "") && /height:\s*14px/.test(jobsFrame?.getAttribute("style") ?? ""), jobsFrame?.getAttribute("style"));
+    const jobs = mount(React.createElement(JobsPillIcon, { size: 14, color: "#71717a", theme }));
+    check("the jobs trigger icon is the terminal glyph", jobs.querySelectorAll('[data-icon="SquareTerminal"]').length, 1);
+    check("…with the corner ring", jobs.querySelectorAll('[data-testid="pill-corner-ring"]').length, 1);
+    // The real goal trigger glyph: running keeps the Target under the ring.
+    // (`useAgent` is stubbed to "idle" here, so the running state is driven
+    // through CornerRingIcon above; this mounts the real component idle.)
+    const store = new Map([["agent-1", { goal: { ...baseGoal, phase: "paused" }, available: true, listeners: new Set() }]]);
+    const GoalIcon = makeGoalIcon(store, "agent-1");
+    const goalIcon = mount(React.createElement(GoalIcon, { size: 14, color: "#71717a", theme, context: "agent", workspaceId: "w", agentId: "agent-1", host: { id: "h", label: "h" }, layout: { compact: true, platform: "web" } }));
+    check("the goal trigger draws the Target", goalIcon.querySelectorAll('[data-icon="Target"]').length, 1);
+    const goalFrame = goalIcon.firstElementChild?.getAttribute("style") ?? "";
+    assert("…in a 14×14 frame", /width:\s*14px/.test(goalFrame) && /height:\s*14px/.test(goalFrame), goalFrame);
+  }
+}
+
 armChecks
   .then(() => containerChecks())
+  .then(() => slotChecks())
   .catch((error) => {
     failures += 1;
     console.error(`  FAIL the container checks threw: ${error instanceof Error ? error.stack : String(error)}`);

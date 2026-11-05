@@ -487,10 +487,17 @@ assert("the old idle-total branch is gone",
 // The static mark exists only as the baseline branch for an unreadable registry:
 // one occurrence in the source, selected by the explicit `presentation.icon`
 // ternary. `jobs-poll-check.cjs` proves no readable answer selects it.
+// T10b: the live mark is the terminal glyph with the ring on its corner
+// (`JobsPillIcon`), never the bare ring; the static baseline is the same glyph.
+// SquareTerminal, not ListChecks: ListChecks is the host's own task-list pill.
 assert("the static mark is the explicit baseline branch",
-  /presentation\.icon\s*===\s*"spinner"\s*\?\s*JobsSpinner\s*:\s*"ListChecks"/.test(pillSource));
-assert("ListChecks appears exactly once in the pill source",
-  (pillSource.match(/ListChecks/g) ?? []).length === 1);
+  /presentation\.icon\s*===\s*"spinner"\s*\?\s*JobsPillIcon\s*:\s*"SquareTerminal"/.test(pillSource));
+assert("the old ListChecks mark is gone from the pill",
+  !/ListChecks/.test(pillSource));
+assert("the half attaches with the corner-ringed glyph, not the bare spinner",
+  /icon:\s*JobsPillIcon,/.test(pillSource) && !/icon:\s*JobsSpinner/.test(pillSource));
+assert("JobsPillIcon is the terminal glyph with the ring on",
+  /export function JobsPillIcon[\s\S]{0,300}<CornerRingIcon name="SquareTerminal"[^>]*running theme/.test(spinnerSource));
 assert("the old live-only rule is not reimplemented in the JSX",
   !/next\.available\s*\?\s*count\s*>\s*0/.test(pillSource));
 assert("the old live-only counter is gone", !/liveCount\(next\.jobs\)/.test(pillSource));

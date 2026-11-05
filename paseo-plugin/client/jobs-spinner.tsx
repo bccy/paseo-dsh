@@ -19,6 +19,7 @@
  */
 import type { PluginHostProps, PluginIconProps } from "@getpaseo/plugin/client";
 import { ringColorFor } from "./jobs-popover-layout";
+import { CornerRingIcon } from "./corner-ring";
 import { StatusRingMark } from "./status-ring";
 
 export { StatusRingMark } from "./status-ring";
@@ -38,4 +39,18 @@ export { StatusRingMark } from "./status-ring";
 export function JobsSpinner({ size, theme }: PluginIconProps & Partial<PluginHostProps>) {
   const color = ringColorFor(theme?.colors.surface0);
   return <StatusRingMark size={size} color={color} />;
+}
+
+/**
+ * The jobs half's live trigger icon (T10b, from the withdrawn T9 attempt): the terminal glyph with the running ring
+ * on its corner. A job row keeps {@link JobsSpinner}; the pill no longer
+ * swaps its glyph for the ring, so when the host shrinks plugin pills to their
+ * icons the jobs pill stays a terminal, not one more blue ring.
+ *
+ * `SquareTerminal`, not the old static `ListChecks`: the pill counts background
+ * shell commands, and that is the glyph the timeline gives a shell row;
+ * `ListChecks` read like the host's task-list pill beside it.
+ */
+export function JobsPillIcon({ size, theme }: PluginIconProps & Pick<PluginHostProps, "theme">) {
+  return <CornerRingIcon name="SquareTerminal" size={size} color={theme.colors.foregroundMuted} running theme={theme} />;
 }

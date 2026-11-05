@@ -334,7 +334,13 @@ console.log("\npill wiring (source pins)");
   equal("en title", EN.title, "Team");
   const client = fs.readFileSync(path.join(repo, "paseo-plugin/index.client.tsx"), "utf8");
   assert("the client registers the team pill", /contributeTeamPill\(client\)/.test(client));
-  assert("the jobs and goal pills are still registered", /contributeJobsPill\(client\)/.test(client) && /contributeGoalPill\(client\)/.test(client));
+  // T10b: the jobs and goal halves share one slot, handed to both.
+  assert("the jobs and goal halves are still contributed (through their shared slot)", /contributeJobsPill\(client, goalJobsSlot\)/.test(client) && /contributeGoalPill\(client, goalJobsSlot\)/.test(client));
+  // T10b: the Users glyph is never replaced; the running state is a corner ring.
+  assert("every team pill icon draws the Users glyph through CornerRingIcon", (pill.match(/<CornerRingIcon name="Users"/g) ?? []).length === 3, String((pill.match(/<CornerRingIcon name="Users"/g) ?? []).length));
+  assert("…only the running icon turns the ring on", /function RunningIcon[\s\S]{0,200}running theme/.test(pill) && (pill.match(/running=\{false\}/g) ?? []).length === 2);
+  assert("the team pill no longer draws a bare StatusRingMark", !/StatusRingMark/.test(pill));
+  assert("the team pill's visibility rule is untouched", /const visible = teamPillVisible\(team\)/.test(pill));
 }
 
 pollerChecks()

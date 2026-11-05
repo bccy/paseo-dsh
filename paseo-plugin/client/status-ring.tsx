@@ -95,7 +95,7 @@ const ARC_STYLE = {
  * Native: `Animated.loop` on the native driver, so the rotation never re-renders.
  * Both paths stop on unmount.
  */
-function RotatingArc({ color }: { color: string }) {
+function RotatingArc({ color, ring = STATUS_RING_SIZE, stroke = STATUS_RING_STROKE }: { color: string; ring?: number; stroke?: number }) {
   const webRef = useRef<unknown>(null);
   const progress = useRef(new Animated.Value(0)).current;
   const isWeb = Platform.OS === "web";
@@ -138,7 +138,7 @@ function RotatingArc({ color }: { color: string }) {
         ref={(instance) => {
           webRef.current = instance;
         }}
-        style={{ ...ARC_STYLE, borderTopColor: color }}
+        style={{ ...ARC_STYLE, width: ring, height: ring, borderRadius: ring / 2, borderWidth: stroke, borderTopColor: color }}
       />
     );
   }
@@ -146,7 +146,7 @@ function RotatingArc({ color }: { color: string }) {
   const rotate = progress.interpolate({ inputRange: [0, 1], outputRange: ["0deg", "360deg"] });
   return (
     <Animated.View
-      style={[{ ...ARC_STYLE, borderTopColor: color }, { transform: [{ rotate }] }]}
+      style={[{ ...ARC_STYLE, width: ring, height: ring, borderRadius: ring / 2, borderWidth: stroke, borderTopColor: color }, { transform: [{ rotate }] }]}
     />
   );
 }
@@ -164,12 +164,20 @@ export function StatusRingMark({
   size,
   color,
   backdrop,
+  ring = STATUS_RING_SIZE,
 }: {
   size: number;
   color: string;
   backdrop?: string;
+  /**
+   * The ring's own diameter. Default: the host's 12px. A pill's corner mark
+   * (`./corner-ring`) draws a smaller one; stroke and centre dot scale with it.
+   */
+  ring?: number;
 }) {
-  const box = Math.max(size, STATUS_RING_SIZE);
+  const box = Math.max(size, ring);
+  const stroke = ring < STATUS_RING_SIZE ? 1 : STATUS_RING_STROKE;
+  const dot = ring === STATUS_RING_SIZE ? STATUS_RING_CENTER_DOT_SIZE : Math.round(ring / 2);
   return (
     <View
       style={{
@@ -183,15 +191,15 @@ export function StatusRingMark({
       <View
         style={{
           position: "absolute",
-          width: STATUS_RING_SIZE,
-          height: STATUS_RING_SIZE,
-          borderRadius: STATUS_RING_SIZE / 2,
-          borderWidth: STATUS_RING_STROKE,
+          width: ring,
+          height: ring,
+          borderRadius: ring / 2,
+          borderWidth: stroke,
           borderColor: color,
           opacity: STATUS_RING_TRACK_OPACITY,
         }}
       />
-      <RotatingArc color={color} />
+      <RotatingArc color={color} ring={ring} stroke={stroke} />
       {/*
         The solid centre, the host's third layer (`status-ring/frame.tsx`'s
         `centerDot`). Without it the mark reads as a hole punched in the pill rather
@@ -200,9 +208,9 @@ export function StatusRingMark({
       <View
         style={{
           position: "absolute",
-          width: STATUS_RING_CENTER_DOT_SIZE,
-          height: STATUS_RING_CENTER_DOT_SIZE,
-          borderRadius: STATUS_RING_CENTER_DOT_SIZE / 2,
+          width: dot,
+          height: dot,
+          borderRadius: dot / 2,
           backgroundColor: color,
         }}
       />
