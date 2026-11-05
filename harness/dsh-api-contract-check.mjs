@@ -65,6 +65,11 @@ const EXPECTED = {
   },
   'dsh-attachment': { named: { admitEncodedImages: 'function' } },
   'dsh-agent': { named: { installModelSelection: 'function' } },
+  // Display names for the composer's DSH setting rows. The package export is
+  // used instead of the `pluginInventory` service because that service is
+  // composed only by the web-app bundle, while a bare `base+bridge` profile has
+  // none; `readPluginInventory(ctx)` only needs the Loader.
+  'dsh-host-plugin-inventory': { named: { readPluginInventory: 'function' } },
   'dsh-cmdline': { named: { exitOnStdinEnd: 'function', parseCmdline: 'function' } },
   'dsh-tools': { named: { defineTool: 'function' } },
   'dsh-subprocess': { named: { scrubbedParentEnv: 'function' } },

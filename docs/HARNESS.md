@@ -435,9 +435,11 @@
 - `harness/bridge-entry-check.mjs` — 桥入口 `dsh-bridge/lib/index.js` 的 `startBridge` 工具
   生命周期接线（模块解析钩子把 `@deepseek-ai/*` 换成 stub，加载**真实**入口）：`tools/execute`
   → `beginFileMutation` → `captureFileBeforeTool` 的顺序、`post-execute` → commit/finish、
-  `tools/result` → drop/finish、失败路径；纯离线、无需 DSH 安装。**动了 `dsh-bridge/lib/index.js`
-  的 `startBridge` 工具生命周期接线（`beginFileMutation`/`captureFileBeforeTool`/
-  `commitFileTool`/`finishFileMutation`/`dropFileTool`/`rememberToolDescription`）必跑。**
+  `tools/result` → drop/finish、失败路径；另覆盖 `settings/document-updated` →
+  `paseo/settings/changed` 的接线（已暴露 ns 转发、未暴露 ns 不转发、effect dispose 后不再
+  转发）；纯离线、无需 DSH 安装。**动了 `dsh-bridge/lib/index.js` 的 `startBridge` 工具生命周期
+  接线（`beginFileMutation`/`captureFileBeforeTool`/`commitFileTool`/`finishFileMutation`/
+  `dropFileTool`/`rememberToolDescription`）或 settings 事件订阅必跑。**
 - `harness/assistant-retry-check.cjs` — 同一 `turn/step` 内**重试**的助手文本：DSH 在已经流出
   文本后失败重试，第二个 attempt 从空快照重新增长，而 Paseo 对"不是前缀的快照"的规则是整段
   追加——旧行为把两次 attempt 的文本粘成一行，读起来像模型语无伦次。断言两次 attempt 拿到不同
@@ -774,3 +776,63 @@
 - `harness/locale-check.cjs` 团队段（505 → **661**，L2 的 `toolCards` 段再 +46 → **707**）：`team` 表中英键一致、非空、不互抄；成员词与分组词逐字；未知成员词不是运行中/空闲；`toolCards` 同口径（字符串叶子键集/非空/不互抄、6 个 formatter 键一致且中英不同、状态词与回执句逐字）；
   拒绝句译文表（含 `Error:` 前缀、未知原样）；**读本机 `dsh-experimental-agent-team/lib/index.js` 的每个 `TeamError` 字面量，实例化变量后确认都有中文**
   （找不到包时 NOTE，`DSH_AGENT_TEAM` 可覆盖路径）。
+
+## DSH 配置透传链（2026-11-05）
+
+第三方插件的简单布尔开关从 DSH 运行时透传到 Paseo 会话配置菜单（`ProviderConfigState.settings`
+的 `toggle` 行）。范围与语义见 README「DSH 配置透传」。断言数为回填时实跑值。
+
+- `harness/settings-bridge-check.mjs` — 桥的 `paseo/settings/list|set`（真 `PaseoHarnessServer` +
+  假 `settings`/`configEditor`/`loader`+`pluginPackages`；不 spawn `dsh`、不读 profile、不起模型），
+  **48 条**：生产过滤（第三方 + 整个 volatile form 恰好一个 boolean；官方/多字段/非 boolean/dict/
+  缺值/整 schema boolean/`cordis:` specifier/非整数 revision 全部排除）、标题以语言字典原样透传
+  （`meta.title` 的 `{en,zh}`，桥不选语言；无 metadata 时不出 title，由插件回落模块名）、
+  `include:` 前缀 entry id 匹配、`configEditor.configuration()` 一次 list 只调一次、无 settings 服务
+  → `{available:false,items:[]}` 且写请求 `settings_unavailable`、写路径带 ns/path/value/revision、
+  成功后重新 describe 回读、stale revision → `conflict`、未暴露 ns/path → `not_found`、非法写 →
+  `invalid_request`、`expectedValue` 与当前值不一致 → `conflict` 且 0 次 mutate、缺省时仍走 revision、
+  `settingsNamespaceTracked` 只认已暴露 ns、`handleRequest` 每个 case 都有对应方法、两个 RPC 真的被
+  dispatch。**依赖本机 DSH 安装**（同 `bridge-server-check` 的解析方式；`DSH_PACKAGES_DIR` /
+  `DSH_INSTALL_DIR` 可覆盖，没有 DSH 的机器 exit 2）。**动了
+  `dsh-bridge/lib/settings-discovery.js`、`server.js` 的 settings 段或 dispatch 必跑；改桥后先
+  `node paseo-plugin/scripts/generate-bridge-assets.mjs` + `bridge-assets-check.mjs`。** 夹具用真实
+  schemastery `toJSON()` 的 `{uid,refs}` 线格式（不是 plain `{type,dict}`）：原始线格式必须选不出、
+  `new Schema(wire)` 必须选出——这是「真实格式下菜单静默为空」P0 的回归门；另断言 `describe()`
+  收到的 options 带 `redactSecrets:true`、`revision` 必须是有限整数（NaN/浮点转红）；服务 API
+  漂移门（补契约检查看不见 `ctx.get('settings')` 的盲区）：`import('@deepseek-ai/dsh-settings')`
+  后 `SettingsForms.prototype.describe/mutate` 仍是函数、`SettingsConflictError` 仍存在；
+  **`available:false` 早退清空已暴露 ns**（无 settings 服务与 `describe()` 抛错两条早退都要清）：
+  `settingsNamespaceTracked` 在不可读之后不再为旧 ns 返回 true（否则还会为已不显示的行走
+  `settings/changed` 转发）。
+- `harness/settings-passthrough-check.cjs` — 插件侧（假桥 `DSH_FAKE_SETTINGS_FILE` 脚本化
+  `paseo/settings/list|set`，`DSH_FAKE_SETTINGS_TRIGGER` 模拟 DSH Web 界面改同一个 profile 开关，
+  `DSH_FAKE_SETTINGS_FAIL_FILE` 脚本化写失败），**50 条**：list 变成 `session.config.settings` 的
+  `toggle` 行（id `dsh:<ns>:<path>`、label=插件显示名字典按本进程 LOCALE 选、描述写明全局）、
+  configure 发出 `paseo/settings/set {ns,path,value,revision,expectedValue}`、回执值重新发布、
+  同值不写、`paseo/settings/changed` 后**所有**打开会话都重发新值（且整个通知只 `list` 一次，
+  不是每会话一次）、无 settings 服务不出行且桥给的 reason 只 log 一次（latched，第二次 open 不
+  重复）、冲突/不存在/无服务三种码各自的中文文案且 provider 重发真实 config、**新建面板值挂起到首次
+  prompt 才写**（open 时 0 次 set、prompt 前写、回执值发布）、**写失败出时间线 warning 且 prompt
+  照发**、**未 prompt 就关闭（草稿）不写**、**resume 带旧值不写、不发 notice、daemon stderr 一行**、
+  `dshSettingLabel` 中英与回落、失败文案保留桥原文、服务端 locale 中英表（描述含「全局生效 /
+  影响本机所有 DSH 会话」、4 个错误码非空且中英不同、pending warning 标题）、**子会话只读**（原生
+  subagent 会话不出 `dsh:` 行，对它 configure 被拒）、**pending 失败 warning 的本地化**（zh 下
+  description 含「创建会话时选择的 DSH 全局开关未能写回」，另起一个 `DSH_PASEO_LANG=en` 子进程
+  跑同一失败场景，断言 description 无任何 CJK 字符/全角标点且为英文原意——LOCALE 在模块加载时
+  定死，英文文案只能这样端到端验证；同一 en 子进程还断言 configure 的两条失败文本无 CJK：非布尔
+  值的 `accepts only a boolean value` 与桥拒绝的 label+分隔符+错误码文案）、**刷新读取的第一个
+  会话失败不影响其它会话**（给 `DshSession.readDshSettings` 打一个只对首个会话抛错的补丁 →
+  其它打开会话仍收到 `session.config` 新值；全部失败时只写一条 stderr，含
+  `failed for every open session`——快速原型里 `#refreshSettings` 固定读 `sessions[0]` 会整次丢弃
+  刷新）。编译同
+  `mcp-injection-check`（`.dbg` + 拷入本脚本与 `fake-dsh-bridge.mjs`；也可从仓库根跑，回落到
+  `paseo-plugin/.dbg/`）。**动了 `server/{dsh-process,session,provider}.ts` 的 settings 段、
+  `locale.ts` 文案或假桥 settings 支持必跑。**
+- `harness/plugin-check.cjs` 真机段：真实 profile 克隆（`prepareDshHome` 的一次性 `DSH_HOME`）里
+  打开会话后断言 `paseo/settings/list` 的 `available:true`（唯一能证明 profile 真的组合了 settings
+  服务的检查），把第一个第三方布尔开关写到反值 → 断言 `session.config` 与重新 `describe()` 的回执
+  一致 → 再开第二个会话断言同值（全局语义）→ 写回原值（隔离克隆保持干净）。**「本机应该有哪个
+  开关」是显式期望，不写死插件名**（这个仓库给别人用）：设置 `PASEO_EXPECT_DSH_TOGGLE=<ns>[,<ns>]`
+  （settings namespace，如 `unrestricted`）时，list 里缺任何一个就**转红**（静默空菜单）；未设置
+  时，profile 有合格行就跑写入往返、没有就打印 skip 原因（并提示该变量）。**耗 token（真实模型
+  回合）**；跑前先 `bridge-assets-check.mjs`。

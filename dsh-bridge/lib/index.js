@@ -161,6 +161,19 @@ function startBridge(ctx, config = {}) {
     transport.start();
     const offApproval = registerApprovalAnswerer(ctx, server, transport);
 
+    // DSH -> Paseo. A settings document the composer is currently showing
+    // changed (the user toggled it here, or another writer — the DSH web UI —
+    // touched the same profile patch). The plugin re-reads the runtime value and
+    // republishes `session.config` for every open session; the value is global
+    // to the profile, so every conversation must show the same switch state.
+    // Namespaces this bridge never advertised are filtered out: the settings
+    // service emits for all volatile entries, and waking the plugin for a row
+    // that was never drawn would be pure churn.
+    const offSettings = ctx.on('settings/document-updated', (ns) => {
+      if (!server.settingsNamespaceTracked(ns)) return;
+      transport.notify('paseo/settings/changed', { ns });
+    });
+
     // DSH -> Paseo. Root-context registration matches how the shipped ACP
     // adapter claims `approval/request`; each listener answers only for the
     // sessions this server owns and otherwise delegates down the waterfall.
@@ -186,6 +199,7 @@ function startBridge(ctx, config = {}) {
     return async () => {
       offQuestions();
       offApproval();
+      offSettings();
       await server.shutdown();
       transport.close();
     };

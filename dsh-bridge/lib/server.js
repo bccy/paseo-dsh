@@ -11,6 +11,11 @@
  * - `paseo/usage` reports the session's current context occupancy from DSH's
  *   own replay-aware token meter, which is what the composer's usage readout
  *   needs to show a context window.
+ * - `paseo/settings/list` / `paseo/settings/set` expose the runtime's *simple*
+ *   third-party boolean switches (a volatile Config form with exactly one
+ *   boolean field) and write them through `settings.mutate`, so a composer
+ *   toggle reaches DSH's own profile patch without HMR. The projection is pure
+ *   and lives in `settings-discovery.js`.
  * - `paseo/question` is a *server -> client request*: the bridge sends it when
  *   the model calls the user-question tool and waits for the answer batch.
  *
@@ -20,9 +25,11 @@ import { readSessionProjections } from './session-projections.js';
 import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { brandString } from '@deepseek-ai/dsh-brand';
+import Schema from '@deepseek-ai/schemastery';
 import { BlockAssembler, createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { admitEncodedImages } from '@deepseek-ai/dsh-attachment';
 import { installModelSelection } from '@deepseek-ai/dsh-agent';
+import { readPluginInventory } from '@deepseek-ai/dsh-host-plugin-inventory';
 import { underArchivedSession } from './archived-lineage.js';
 import { FileSnapshots, isTrackedTool, mutationPathOf, resolveMutationPath } from './file-snapshots.js';
 import { FileMutationGate } from './file-mutation-gate.js';
@@ -33,6 +40,11 @@ import { isHumanUserMessage, planRewind, restoresFiles, revertScope, successText
 import { visibleEvents } from './surface.js';
 import { historyEvents, withImageHostPaths } from './image-host-path.js';
 import { promptSource } from './paseo-system-envelope.js';
+import {
+  inventoryEntryMatchesNamespace,
+  pluginTitleDictionary,
+  simpleToggleItems,
+} from './settings-discovery.js';
 
 function encodedImage(block) {
   return block.type === 'image' && 'data' in block;
@@ -359,6 +371,16 @@ export class PaseoHarnessServer {
     this.ctx = ctx;
     this.transport = transport;
     this.options = options;
+    /**
+     * Namespaces last projected into the composer by `paseo/settings/list`.
+     *
+     * `settings/document-updated` fires for every volatile entry, including
+     * DSH-internal ones this bridge deliberately does not show (see
+     * `settings-discovery.js`). Only a namespace the plugin was actually told
+     * about is forwarded as `paseo/settings/changed`, so the plugin is never
+     * woken to redraw a row that was never drawn.
+     */
+    this.settingsNamespaces = new Set();
 
     this.cwd = process.cwd();
     // Deliberately unset: a hardcoded route would silently pick a provider for a
@@ -3536,6 +3558,309 @@ export class PaseoHarnessServer {
     return {};
   }
 
+  /**
+   * The simple third-party toggles Paseo's composer should offer.
+   *
+   * Reads DSH's own runtime settings surface — `settings.describe()` reports
+   * every *active* plugin entry whose Config schema declares a volatile node —
+   * and projects it down to one boolean switch per third-party plugin. The
+   * selection rule lives in `settings-discovery.js` (pure, and shared with the
+   * offline checks): a form with exactly one boolean field, whose module
+   * specifier is not `@deepseek-ai/*`.
+   *
+   * The service is looked up lazily rather than injected: a profile without
+   * `profileContext`/`configEditor` legitimately composes no settings service,
+   * and the composer must then simply show no DSH rows instead of failing every
+   * session open. `available:false` is that state; an empty list with
+   * `available:true` means "the service is there, nothing qualifies".
+   *
+   * @returns `{available, items}` where each item is
+   *   `{ns, moduleName, title, field:{path, value, revision}}`.
+   */
+  async settingsList() {
+    const settings = this.ctx.get('settings');
+    if (settings === undefined) {
+      // Not an error: a profile without `profileContext`/`configEditor`
+      // legitimately composes no settings service. The reason is still reported
+      // so the plugin can log *why* the menu has no rows (silence here is
+      // exactly the silent-degradation shape this repo keeps removing).
+      //
+      // An unavailable read must also forget what the last successful list
+      // advertised: the composer no longer shows those rows, so forwarding a
+      // change for an old namespace would wake the plugin for nothing.
+      this.settingsNamespaces = new Set();
+      return { available: false, reason: 'this profile composes no settings service', items: [] };
+    }
+    let descriptors;
+    try {
+      descriptors = settings.describe({ redactSecrets: true });
+    } catch (error) {
+      // Same reasoning as the no-service branch above: the last advertised set
+      // is stale the moment the runtime cannot be read.
+      this.settingsNamespaces = new Set();
+      return {
+        available: false,
+        items: [],
+        reason: `settings.describe() failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+    // `describe()` puts schemastery's reference document on the wire
+    // (`{uid, refs}`), not a plain `{type, dict}` tree. Reading the wire object
+    // directly made `.type` undefined and every real profile produced zero
+    // toggles — a silent no-op. Rehydrate exactly the way DSH's own settings UI
+    // does (`new Schema(serialized)`), then hand the live nodes to the pure
+    // projection. A row whose schema cannot be rebuilt is skipped, not fatal.
+    const rehydrated = descriptors.map((row) => {
+      if (row === null || typeof row !== 'object') return row;
+      const raw = row.schema;
+      if (raw === null || typeof raw !== 'object') return { ...row, schema: raw };
+      if (typeof raw.uid !== 'number' || raw.refs === null || typeof raw.refs !== 'object') {
+        return { ...row, schema: raw };
+      }
+      try {
+        return { ...row, schema: new Schema(raw) };
+      } catch {
+        return { ...row, schema: undefined };
+      }
+    });
+    const titles = await this.#settingsTitles();
+    const titleOf = (ns) => {
+      const exact = titles.get(ns);
+      if (exact !== undefined) return exact;
+      for (const [entryId, title] of titles) {
+        if (inventoryEntryMatchesNamespace(entryId, ns)) return title;
+      }
+      return undefined;
+    };
+    const moduleNames = this.#settingsModuleNames();
+    const items = simpleToggleItems({
+      descriptors: rehydrated,
+      moduleNameOf: (ns) => moduleNames.get(ns),
+      titleOf,
+    });
+    this.settingsNamespaces = new Set(items.map((item) => item.ns));
+    return { available: true, items };
+  }
+
+  /**
+   * Switch one exposed toggle through DSH's own settings writer.
+   *
+   * `settings.mutate(ns, ops, revision)` is what persists the value into the
+   * profile patch and reconciles the live plugin (through configEditor — it does
+   * not need HMR, which the Paseo profile disables). The revision is required:
+   * without it a second session's stale click would overwrite a value another
+   * session already changed.
+   *
+   * `expectedValue` is the value-layer precondition on top of that revision:
+   * the plugin always sends the value its composer displayed, and a mismatch is
+   * refused as `conflict` before the writer runs. Two preconditions are cheap
+   * here and catch different stale states — the revision is the settings
+   * service's own optimistic lock, the value catches a composer whose displayed
+   * state no longer matches the runtime for any reason. Absent for older
+   * plugins, which keep the revision check alone.
+   *
+   * Failures are a value, not a thrown JSON-RPC error, because the plugin maps
+   * them onto distinct user-visible wording: `settings_unavailable` (profile has
+   * no settings service), `not_found` (the row is gone or was never exposed),
+   * `conflict` (another writer moved the revision) and `invalid_request`.
+   * A successful write is re-read from `describe()` before answering, so the
+   * composer never shows a value the runtime did not commit.
+   *
+   * @param params - `{ns, path, value, revision, expectedValue?}` from the plugin.
+   * @returns `{ok:true, ns, field}` or `{ok:false, error:{code, message}}`.
+   */
+  async settingsSet(params) {
+    const settings = this.ctx.get('settings');
+    if (settings === undefined) {
+      return {
+        ok: false,
+        error: { code: 'settings_unavailable', message: 'this profile composes no settings service' },
+      };
+    }
+    const ns = params !== null && typeof params === 'object' && typeof params.ns === 'string' ? params.ns : '';
+    const requestedPath = params !== null && typeof params === 'object' && Array.isArray(params.path)
+      ? params.path
+      : [];
+    const path = requestedPath.filter((part) => typeof part === 'string');
+    const value = params !== null && typeof params === 'object' ? params.value : undefined;
+    const revision = params !== null && typeof params === 'object' ? params.revision : undefined;
+    const expectedValue = params !== null && typeof params === 'object' ? params.expectedValue : undefined;
+    if (ns === '' || path.length === 0 || path.length !== requestedPath.length) {
+      return {
+        ok: false,
+        error: { code: 'invalid_request', message: 'ns and path must name one setting' },
+      };
+    }
+    if (typeof value !== 'boolean') {
+      return { ok: false, error: { code: 'invalid_request', message: 'value must be a boolean' } };
+    }
+    if (!Number.isInteger(revision)) {
+      return {
+        ok: false,
+        error: { code: 'invalid_request', message: 'revision must be a finite integer' },
+      };
+    }
+    if (expectedValue !== undefined && typeof expectedValue !== 'boolean') {
+      return {
+        ok: false,
+        error: { code: 'invalid_request', message: 'expectedValue must be a boolean when present' },
+      };
+    }
+    const list = await this.settingsList();
+    if (!list.available) {
+      return {
+        ok: false,
+        error: {
+          code: 'settings_unavailable',
+          message: list.reason ?? 'settings.describe() is unavailable in this profile',
+        },
+      };
+    }
+    const item = list.items.find((row) => row.ns === ns);
+    if (item === undefined) {
+      return {
+        ok: false,
+        error: { code: 'not_found', message: `no simple third-party toggle named "${ns}" is exposed` },
+      };
+    }
+    if (JSON.stringify(item.field.path) !== JSON.stringify(path)) {
+      return {
+        ok: false,
+        error: { code: 'not_found', message: `"${ns}" has no exposed field ${path.join('.')}` },
+      };
+    }
+    // Value precondition, in addition to the revision. The revision is the
+    // settings service's own optimistic lock; `expectedValue` is the value the
+    // composer showed when the user toggled it. A stale revision is caught by
+    // the service, but a composer can also be stale for reasons the revision
+    // does not cover (a notification that arrived while the click was in
+    // flight), and this comparison costs nothing. Absent for older plugins,
+    // which keep the revision check alone.
+    if (expectedValue !== undefined && item.field.value !== expectedValue) {
+      return {
+        ok: false,
+        error: {
+          code: 'conflict',
+          message:
+            `the value of "${ns}.${path.join('.')}" changed since it was read `
+            + `(expected ${String(expectedValue)}, now ${String(item.field.value)}); reload the composer`,
+        },
+      };
+    }
+    try {
+      await settings.mutate(ns, [{ op: 'set', path, value }], revision);
+    } catch (error) {
+      // `SettingsConflictError` carries the code the settings service exports;
+      // everything else (a schema refusal, a write failure) is a plain failure.
+      const conflict = error !== null && typeof error === 'object' && error.code === 'SETTINGS_CONFLICT';
+      return {
+        ok: false,
+        error: {
+          code: conflict ? 'conflict' : 'failed',
+          message: error instanceof Error ? error.message : String(error),
+        },
+      };
+    }
+    // Re-read rather than trusting the request: the write goes through
+    // configEditor, and the value the composer shows must be the one the
+    // runtime committed (a plugin's config setter may normalise it).
+    const after = await this.settingsList();
+    const applied = after.items.find((row) => row.ns === ns);
+    if (applied === undefined) {
+      return {
+        ok: false,
+        error: { code: 'failed', message: `"${ns}" is no longer a configurable simple toggle` },
+      };
+    }
+    return { ok: true, ns, field: applied.field };
+  }
+
+  /**
+   * Whether a settings namespace is one this bridge last advertised.
+   *
+   * Used by the bridge app to filter `settings/document-updated` before
+   * forwarding it as `paseo/settings/changed`; see {@link settingsNamespaces}.
+   *
+   * @param ns - a profile entry id from the settings event.
+   * @returns true when the composer is currently showing that namespace.
+   */
+  settingsNamespaceTracked(ns) {
+    return typeof ns === 'string' && this.settingsNamespaces.has(ns);
+  }
+
+  /**
+   * The configured module specifiers, keyed by profile entry id.
+   *
+   * `configEditor.configuration()` composes the whole profile configuration on
+   * every call — the README states compositions are not cached between reads —
+   * so it is read **once** per list, not once per descriptor. `entry.options.id`
+   * is exactly the settings namespace `describe()` reports (the settings service
+   * iterates the same rows), so no fuzzy matching is needed here.
+   *
+   * @returns `ns` -> module specifier map; empty when the profile has no
+   *   configEditor (the settings service is absent then too).
+   */
+  #settingsModuleNames() {
+    const names = new Map();
+    const editor = this.ctx.get('configEditor');
+    if (editor === undefined || typeof editor.configuration !== 'function') return names;
+    let rows;
+    try {
+      rows = editor.configuration();
+    } catch {
+      return names;
+    }
+    for (const row of rows) {
+      const id = row?.entry?.options?.id;
+      const name = row?.entry?.options?.name;
+      if (typeof id === 'string' && id !== '' && typeof name === 'string' && name !== '') {
+        names.set(id, name);
+      }
+    }
+    return names;
+  }
+
+  /**
+   * Display titles for the entries, keyed by profile entry id.
+   *
+   * `readPluginInventory(ctx)` reads each package's locale dictionaries without
+   * activating it, so `meta.title` is the plugin's own name — as a language
+   * dictionary (`{en, zh}`), not a string. The bridge passes the dictionary
+   * through untouched; the plugin picks a language with the same `LOCALE` it
+   * uses for the rest of the composer (the bridge's own environment is merged
+   * when the first session opens and can differ from the daemon's, so resolving
+   * here would let one menu mix Chinese and English labels).
+   *
+   * `readPluginInventory` is a package export rather than the `pluginInventory`
+   * service: the service is composed only by the web-app bundle, while a bare
+   * `base+bridge` profile (what a new install bootstraps) has none. The function
+   * only needs `ctx.loader` and the optional `pluginPackages`, so display names
+   * work in every profile. A failure here is never fatal: the plugin falls back
+   * to the module specifier.
+   *
+   * The loader may prefix an id that comes from an `include:` row
+   * (`include:unrestricted` vs the settings ns `unrestricted`); the matching
+   * rule is `inventoryEntryMatchesNamespace` in the caller.
+   *
+   * @returns `entryId` -> title dictionary, in Loader order.
+   */
+  async #settingsTitles() {
+    const titles = new Map();
+    let snapshot;
+    try {
+      snapshot = await readPluginInventory(this.ctx);
+    } catch {
+      return titles;
+    }
+    for (const entry of snapshot?.entries ?? []) {
+      if (typeof entry?.entryId !== 'string' || entry.entryId === '') continue;
+      const title = pluginTitleDictionary(entry?.meta?.title);
+      if (title === undefined) continue;
+      titles.set(entry.entryId, title);
+    }
+    return titles;
+  }
+
   /** Dispatch one incoming JSON-RPC request to its typed handler. */
   async handleRequest(method, params) {
     switch (method) {
@@ -3583,6 +3908,10 @@ export class PaseoHarnessServer {
         return this.configSet(params);
       case 'paseo/mcp/set':
         return this.setMcpServers(params);
+      case 'paseo/settings/list':
+        return this.settingsList();
+      case 'paseo/settings/set':
+        return this.settingsSet(params);
       case 'paseo/projections':
         return this.projections(params);
       case 'session/close':

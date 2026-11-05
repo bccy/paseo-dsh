@@ -58,6 +58,43 @@ export interface UiCopy {
   settings: {
     preset: { label: string; description: string };
     permission: { label: string; description: string };
+    /**
+     * Copy for the DSH-discovered third-party toggles.
+     *
+     * The label comes from the plugin itself (its inventory title); the
+     * description must say the value is **global** — it lives in the DSH
+     * profile, not in this agent, and switching it affects every DSH session on
+     * the machine. That is a property of this provider, not of any one plugin,
+     * so it is generic copy and never names a plugin.
+     *
+     * `errors` is one line per expected bridge failure code
+     * (`DshSettingsSetResult`); the bridge's own message is appended for
+     * `failed` because that text names the technical cause and is not
+     * translated. `pendingFailedTitle` / `pendingFailedDescription` are the
+     * timeline warning a create-panel selection produces when its deferred
+     * write-back fails before the first prompt; the two separators are part of
+     * the copy because Chinese uses full-width punctuation and English does not
+     * (leaving them hardcoded is how a Chinese-only sentence leaks into an
+     * English UI).
+     */
+    dshToggle: {
+      description: string;
+      errors: {
+        conflict: string;
+        not_found: string;
+        settings_unavailable: string;
+        failed: string;
+      };
+      pendingFailedTitle: string;
+      /** A configure(request) carried a non-boolean value for a DSH toggle. */
+      nonBooleanValue: (id: string) => string;
+      /** Prefix sentence of the warning; ends with its own separator. */
+      pendingFailedDescription: string;
+      /** Between one toggle's display label and its failure reason. */
+      failureLabelSeparator: string;
+      /** Between two failed toggles. */
+      failureJoiner: string;
+    };
   };
   /** Title of a card carrying more than one question. */
   questionsTitle: string;
@@ -125,6 +162,22 @@ const UI_COPY: Record<Locale, UiCopy> = {
         label: "Permissions",
         description: "DSH sandbox + approval preset for this session.",
       },
+      dshToggle: {
+        description:
+          "DSH plugin switch — global: it affects every DSH session on this machine.",
+        errors: {
+          conflict: "This switch was changed elsewhere just now; the menu shows the latest value, please try again.",
+          not_found: "This switch no longer exists (the plugin was uninstalled or no longer exposes it).",
+          settings_unavailable: "This DSH profile has no settings service, so the switch cannot be written.",
+          failed: "The switch could not be written.",
+        },
+        pendingFailedTitle: "DSH global switch was not applied",
+        nonBooleanValue: (id) => `DSH switch "${id}" accepts only a boolean value`,
+        pendingFailedDescription:
+          "The DSH global switch chosen when this session was created could not be written back (the prompt was still sent): ",
+        failureLabelSeparator: ": ",
+        failureJoiner: "; ",
+      },
     },
     questionsTitle: "Questions",
     planCard: {
@@ -154,6 +207,20 @@ const UI_COPY: Record<Locale, UiCopy> = {
         label: "权限",
         description: "本次会话的 DSH 沙箱与审批预设。",
       },
+      dshToggle: {
+        description: "DSH 插件开关，全局生效，影响本机所有 DSH 会话。",
+        errors: {
+          conflict: "这个开关刚被别处改过，菜单已刷新为最新值，请重试。",
+          not_found: "这个开关已经不存在（插件可能被卸载，或配置不再暴露它）。",
+          settings_unavailable: "当前 DSH profile 没有可用的设置服务，无法写入。",
+          failed: "开关写入失败。",
+        },
+        pendingFailedTitle: "DSH 全局开关未能写回",
+        nonBooleanValue: (id) => `DSH 配置「${id}」只接受布尔值`,
+        pendingFailedDescription: "创建会话时选择的 DSH 全局开关未能写回（不影响本次提问）：",
+        failureLabelSeparator: "：",
+        failureJoiner: "；",
+      },
     },
     questionsTitle: "问题",
     planCard: {
@@ -173,6 +240,57 @@ const UI_COPY: Record<Locale, UiCopy> = {
 
 /** The copy for the resolved locale. */
 export const UI: UiCopy = UI_COPY[LOCALE];
+
+/**
+ * One failure line for the deferred DSH write-back warning.
+ *
+ * The label is the plugin's own display name (already resolved to this locale
+ * by `session.ts`); the detail is the failure copy for the bridge's error code.
+ * The separator lives in the locale table, so an English line uses `": "` while
+ * a Chinese line uses `"："` — a hardcoded Chinese colon was exactly the
+ * localization leak this function exists to remove.
+ *
+ * @param label - the toggle's display label.
+ * @param detail - why the write failed.
+ * @param locale - copy locale; defaults to the process locale.
+ * @returns one line, without a trailing joiner.
+ */
+export function dshSettingFailureLine(label: string, detail: string, locale: Locale = LOCALE): string {
+  const copy = UI_COPY[locale].settings.dshToggle;
+  return `${label}${copy.failureLabelSeparator}${detail}`;
+}
+
+/**
+ * The configure-time error for a non-boolean DSH toggle value.
+ *
+ * The composer only publishes booleans, so this path is reachable only by a
+ * protocol bug; it still must not leak Chinese into an English timeline. The id
+ * is used because the row lookup happens after this value check.
+ *
+ * @param id - the `dsh:`-prefixed setting id from the configure request.
+ * @param locale - copy locale; defaults to the process locale.
+ * @returns the user-facing error message.
+ */
+export function dshSettingNonBooleanMessage(id: string, locale: Locale = LOCALE): string {
+  return UI_COPY[locale].settings.dshToggle.nonBooleanValue(id);
+}
+
+/**
+ * The timeline warning description for failed deferred DSH write-backs.
+ *
+ * A create-panel pick is written before the session's first prompt; when that
+ * write fails the user gets one warning listing every failed switch. The whole
+ * sentence, including the separators between failures, comes from the locale
+ * table so an English UI never renders a Chinese sentence.
+ *
+ * @param lines - failure lines from {@link dshPendingFailureLine}.
+ * @param locale - copy locale; defaults to the process locale.
+ * @returns the warning description.
+ */
+export function dshPendingFailedDescription(lines: readonly string[], locale: Locale = LOCALE): string {
+  const copy = UI_COPY[locale].settings.dshToggle;
+  return `${copy.pendingFailedDescription}${lines.join(copy.failureJoiner)}`;
+}
 
 /**
  * Display names for DSH's built-in agent presets.

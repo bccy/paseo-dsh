@@ -42,11 +42,95 @@ import {
   type DshApprovalSignal,
   type DshRevertResult,
   type DshRoute,
+  type DshSettingsList,
+  type DshSettingsToggle,
   type DshUsage,
 } from "./dsh-process";
 import { ASSISTANT_DELTA_EVENT, TimelineBuilder } from "./timeline";
 import { isGoalRoundSource } from "./activity-timeline";
 import { assistantStreamFirstTokenTime } from "./first-token";
+
+/**
+ * Prefix of the `ProviderSetting.id` a DSH-discovered toggle carries.
+ *
+ * The id must be stable across sessions and recomputable from the item (Paseo
+ * persists the last value per agent and re-sends it on open), and it must not
+ * collide with the two settings this provider owns (`preset`, `permission`) —
+ * hence a namespace prefix plus the entry id and field path.
+ */
+export const DSH_SETTINGS_ID_PREFIX = "dsh:";
+
+/**
+ * The composer id of one DSH-discovered toggle, e.g. `dsh:dsh-unrestricted:enabled`.
+ *
+ * @param item - one item from the bridge's `paseo/settings/list`.
+ * @returns the `ProviderSetting.id` the composer shows and sends back.
+ */
+export function dshSettingId(item: Pick<DshSettingsToggle, "ns" | "field">): string {
+  return `${DSH_SETTINGS_ID_PREFIX}${item.ns}:${item.field.path.join(".")}`;
+}
+
+/**
+ * The label a composer row shows for one DSH-discovered toggle.
+ *
+ * DSH's plugin inventory reports the plugin's display name as a language
+ * dictionary (`{en: "Unrestricted mode", zh: "破限模式"}`), and the bridge passes
+ * it through untouched. Resolving here — not in the bridge — is what keeps one
+ * menu from mixing languages: this process's `LOCALE` is the same one that
+ * renders every other composer string, while the bridge process's environment is
+ * merged when the first session opens and can differ from the daemon's.
+ *
+ * Falls back to the module specifier, then the namespace, when the plugin ships
+ * no usable title (a bare `base+bridge` profile still gets a row).
+ *
+ * @param item - one item from the bridge's `paseo/settings/list`.
+ * @returns the non-empty display label.
+ */
+export function dshSettingLabel(
+  item: Pick<DshSettingsToggle, "ns" | "moduleName" | "title">,
+): string {
+  const usable = (value: unknown): string | undefined =>
+    typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+  const dictionary = item.title;
+  if (dictionary !== undefined && dictionary !== null && typeof dictionary === "object") {
+    // DSH ships `en` plus one file per language; the Chinese file is `zh`. A
+    // deployment could also use a regional id, so accept those before giving up.
+    const preferred = LOCALE === "zh-CN" ? ["zh", "zh-CN", "zh-Hans"] : ["en"];
+    for (const language of preferred) {
+      const title = usable(dictionary[language]);
+      if (title !== undefined) return title;
+    }
+    for (const value of Object.values(dictionary)) {
+      const title = usable(value);
+      if (title !== undefined) return title;
+    }
+  }
+  const moduleName = usable(item.moduleName);
+  if (moduleName !== undefined) return moduleName;
+  return item.ns;
+}
+
+/**
+ * The user-facing line for one expected DSH write failure.
+ *
+ * The bridge returns expected refusals as values (`{ok:false,error:{code}}`) so
+ * each one can be worded differently — a switch that another writer just moved
+ * is a retry, a switch that no longer exists is gone, and a profile without a
+ * settings service cannot be written at all. `failed` keeps the bridge's own
+ * message appended: it names the technical cause, and rewriting it here would
+ * drift from the half that actually knows what failed.
+ *
+ * @param code - `error.code` from `DshSettingsSetResult`.
+ * @param message - `error.message` from the bridge.
+ * @returns the composer-visible failure text.
+ */
+export function dshSettingFailureCopy(code: string, message: string): string {
+  const errors = UI.settings.dshToggle.errors;
+  if (code === "conflict") return errors.conflict;
+  if (code === "not_found") return errors.not_found;
+  if (code === "settings_unavailable") return errors.settings_unavailable;
+  return `${errors.failed} ${message}`;
+}
 
 /**
  * The durable event time as the provider timestamp for a replayed row.
@@ -86,7 +170,16 @@ function historyTurnId(turn: unknown, seed: number): string {
   }
   return `turn:history:seq:${seed}`;
 }
-import { LOCALE, UI, commandCopy, presetLabel, skillDescription } from "./locale";
+import {
+  LOCALE,
+  UI,
+  commandCopy,
+  dshPendingFailedDescription,
+  dshSettingFailureLine,
+  dshSettingNonBooleanMessage,
+  presetLabel,
+  skillDescription,
+} from "./locale";
 
 /**
  * Suffix on a composer preset option the registry reported as unusable.
@@ -550,6 +643,27 @@ export class DshSession {
   /** Current DSH permission preset key, and the switchable ones. */
   #permission: string | null = null;
   #permissionPresets: DshPermissionPreset[] = [];
+  /**
+   * Simple third-party DSH settings projected as composer toggles.
+   *
+   * These are **global** to the DSH profile (one child serves every session of
+   * the connection), so the list is re-read from the runtime on open and after
+   * every `paseo/settings/changed`; the cached value is only the last
+   * authoritative read, never a local guess.
+   */
+  #dshSettings: DshSettingsToggle[] = [];
+  /**
+   * `dsh:`-prefixed values Paseo sent on **open** that are not yet applied.
+   *
+   * Paseo's create panel puts the user's picks into the new agent's
+   * `featureValues`, and the provider hands them back as `config.settings` on
+   * open. Writing them immediately would be wrong: Paseo also opens a throwaway
+   * session to refresh the draft menu, and applying on open would turn "open the
+   * create panel" into a global write. So they are parked here and written
+   * before the first prompt of a real conversation; a session that is never
+   * prompted (the draft) simply discards them when it closes.
+   */
+  #pendingDshSettings: Map<string, boolean> | undefined;
   /** Current agent preset (persona + capabilities), and the switchable ones. */
   #preset: string | null = null;
   #presetOptions: Array<{ label: string; value: string }> = [];
@@ -768,6 +882,20 @@ export class DshSession {
       });
     }
     const thinkingOptions = this.#thinking();
+    // Simple third-party DSH toggles (see `#dshSettings`). The label is the
+    // plugin's own display name and the description says "global" on purpose:
+    // the value lives in the DSH profile, not in this agent, and switching it
+    // here changes every DSH session on the machine. Hiding that would be the
+    // silent-degradation shape this repository keeps finding.
+    for (const item of this.#dshSettings) {
+      settings.push({
+        type: "toggle",
+        id: dshSettingId(item),
+        label: dshSettingLabel(item),
+        description: UI.settings.dshToggle.description,
+        value: item.field.value,
+      });
+    }
     return {
       model: `${this.#route.provider}/${this.#route.model}`,
       mode: this.#mode,
@@ -840,6 +968,167 @@ export class DshSession {
     if (!permission.available) return;
     this.#permission = permission.current;
     this.#permissionPresets = permission.presets;
+  }
+
+  /**
+   * Read the simple third-party DSH toggles the composer should offer.
+   *
+   * Fail-open by design: an older embedded bridge does not answer
+   * `paseo/settings/list` at all, and a profile that composes no settings
+   * service answers `available:false`. Neither is a reason to fail a session
+   * open — the conversation is perfectly usable without a toggle row. The
+   * bridge already logs the version-mismatch case once; this only reports
+   * unexpected read failures.
+   *
+   * The value is read from the runtime on every call; the cache never invents
+   * one (see `#dshSettings`).
+   */
+  async loadDshSettings(): Promise<void> {
+    try {
+      this.applyDshSettings(await this.#require().settingsList());
+    } catch (error) {
+      this.#dshSettings = [];
+      this.#options.log(
+        `reading DSH settings toggles failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /**
+   * Read the authoritative toggle list for this connection.
+   *
+   * Used by the provider to fan one settings change out to every open session:
+   * the value is the profile's, and one child serves every conversation, so one
+   * read is authoritative for all of them.
+   *
+   * @returns the bridge's list receipt (the `available` half is preserved).
+   */
+  async readDshSettings(): Promise<DshSettingsList> {
+    return this.#require().settingsList();
+  }
+
+  /**
+   * Adopt one authoritative read of the toggle list.
+   *
+   * @param list - the bridge's `paseo/settings/list` receipt.
+   * @returns whether the projected list changed (the provider republishes
+   *   `session.config` only when it did).
+   */
+  applyDshSettings(list: DshSettingsList): boolean {
+    const before = this.#dshSettingsSignature();
+    this.#dshSettings = list.available ? list.items : [];
+    return before !== this.#dshSettingsSignature();
+  }
+
+  /** Stable snapshot of the toggle list, for change detection and tests. */
+  #dshSettingsSignature(): string {
+    return JSON.stringify(this.#dshSettings);
+  }
+
+  /**
+   * The `dsh:`-prefixed settings the composer currently shows, keyed by id.
+   *
+   * Used by the provider on open: Paseo persists the last value it saw per
+   * agent and re-sends it, but the truth is the runtime's global value. The
+   * provider compares the two and logs a stderr line when they differ instead of
+   * applying the stale per-agent value over another session's choice.
+   */
+  dshSettingValues(): Map<string, boolean> {
+    const values = new Map<string, boolean>();
+    for (const item of this.#dshSettings) values.set(dshSettingId(item), item.field.value);
+    return values;
+  }
+
+  /**
+   * Park the `dsh:` values a **new** session's open carried, without writing.
+   *
+   * Only a fresh open (no persistence handle) has this shape: Paseo's create
+   * panel writes the user's picks into the new agent's `featureValues`. A
+   * resumed session must never apply its stored values (they are the host's
+   * memory of a global switch, not the runtime's truth), so the provider does
+   * not call this on resume.
+   *
+   * Non-boolean values and ids the runtime no longer exposes are dropped: the
+   * runtime is authoritative, and an unknown id has no row to write through.
+   *
+   * @param settings - `config.settings` from `session.open`.
+   */
+  stagePendingDshSettings(settings: Record<string, unknown> | undefined): void {
+    if (settings === undefined) return;
+    const pending = new Map<string, boolean>();
+    for (const [id, value] of Object.entries(settings)) {
+      if (!id.startsWith(DSH_SETTINGS_ID_PREFIX) || typeof value !== "boolean") continue;
+      pending.set(id, value);
+    }
+    this.#pendingDshSettings = pending.size === 0 ? undefined : pending;
+  }
+
+  /**
+   * Apply the parked create-panel selections, before the first prompt.
+   *
+   * This runs at the start of {@link prompt} because the draft session Paseo
+   * opens to render the create menu never prompts — a write on open would turn
+   * "open the create panel" into a global write. A write failure must not block
+   * the prompt: the conversation is usable, and the user gets a timeline warning
+   * instead (the alternative — dropping it silently — is the silent-degradation
+   * shape this repository keeps removing).
+   *
+   * The parked map is consumed even when a write fails: retrying on every later
+   * prompt would make one stale click re-write a global switch forever.
+   */
+  async applyPendingDshSettings(): Promise<void> {
+    const pending = this.#pendingDshSettings;
+    if (pending === undefined) return;
+    this.#pendingDshSettings = undefined;
+    const failures: string[] = [];
+    let changed = false;
+    for (const [id, requested] of pending) {
+      const item = this.#dshSettings.find((candidate) => dshSettingId(candidate) === id);
+      if (item === undefined) {
+        // The row disappeared between the open and the prompt (the plugin was
+        // uninstalled, or the profile no longer exposes it). Nothing to write.
+        this.#options.log(`dropping parked DSH setting "${id}": the runtime no longer exposes it`);
+        continue;
+      }
+      if (requested === item.field.value) continue;
+      try {
+        const applied = await this.#require().settingsSet(
+          item.ns,
+          item.field.path,
+          requested,
+          item.field.revision,
+          item.field.value,
+        );
+        if (!applied.ok) {
+          failures.push(
+            dshSettingFailureLine(
+              dshSettingLabel(item),
+              dshSettingFailureCopy(applied.error.code, applied.error.message),
+            ),
+          );
+          continue;
+        }
+        item.field = applied.field;
+        changed = true;
+      } catch (error) {
+        failures.push(dshSettingFailureLine(dshSettingLabel(item), messageOf(error)));
+      }
+    }
+    if (changed) {
+      this.#options.emit({ type: "session.config", sessionId: this.id, config: this.configState() });
+    }
+    if (failures.length > 0) {
+      this.#options.emit({
+        type: "session.notice",
+        sessionId: this.id,
+        notice: {
+          id: `dsh-settings-${String(Date.now())}`,
+          severity: "warning",
+          title: UI.settings.dshToggle.pendingFailedTitle,
+          description: dshPendingFailedDescription(failures),
+        },
+      });
+    }
   }
 
   /**
@@ -1698,6 +1987,11 @@ export class DshSession {
 
   /** Accept one prompt and start its turn. */
   async prompt(prompt: ProviderPrompt): Promise<void> {
+    // The first prompt is the moment a create-panel selection becomes real: the
+    // draft session Paseo opens to render that menu never prompts, so the parked
+    // values must not be written on open (see `#pendingDshSettings`). Failures
+    // are a timeline warning inside the method — they never block the turn.
+    await this.applyPendingDshSettings();
     const process = this.#require();
 
     // A slash-menu pick arrives as a command, not a message. DSH commands and
@@ -2071,6 +2365,48 @@ export class DshSession {
         this.#options.log(`preset change rejected: ${message}`);
         if (this.#rootReady) this.#noticePresetChangeRejected(requestedPreset, this.#preset, message);
       }
+    }
+
+    // Simple third-party DSH toggles. Their values are GLOBAL — the profile's
+    // settings document, shared by every session of this child — so the write
+    // goes to DSH's own settings writer through the bridge and the receipt is
+    // the authority. The composer only ever shows what the runtime committed.
+    for (const [id, requested] of Object.entries(changes.settings ?? {})) {
+      if (!id.startsWith(DSH_SETTINGS_ID_PREFIX)) continue;
+      if (typeof requested !== "boolean") {
+        throw new Error(dshSettingNonBooleanMessage(id));
+      }
+      const item = this.#dshSettings.find((candidate) => dshSettingId(candidate) === id);
+      if (item === undefined) {
+        // The row disappeared between the composer read and the click (the
+        // plugin was uninstalled, or the profile no longer exposes it). Ignore
+        // it and let the re-emitted config drop the row; throwing would turn an
+        // already-gone toggle into a failed configure.
+        this.#options.log(`ignoring unknown DSH setting "${id}"; the runtime no longer exposes it`);
+        continue;
+      }
+      if (requested === item.field.value) continue;
+      // Send the value the composer displayed as the value-layer precondition on
+      // top of the revision: the bridge refuses the write when the runtime no
+      // longer shows it, which is exactly the stale click this protects against.
+      const applied = await process.settingsSet(
+        item.ns,
+        item.field.path,
+        requested,
+        item.field.revision,
+        item.field.value,
+      );
+      if (!applied.ok) {
+        // Expected refusals are values: word each code for the user instead of
+        // collapsing them into one generic configure failure.
+        throw new Error(
+          dshSettingFailureLine(
+            dshSettingLabel(item),
+            dshSettingFailureCopy(applied.error.code, applied.error.message),
+          ),
+        );
+      }
+      item.field = applied.field;
     }
 
     // A model switch changes capacity; a mode switch does not, but both end

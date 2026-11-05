@@ -7,10 +7,14 @@
  * this is where a regression in "declared capability vs actual behaviour" shows
  * up — the class of bug that is invisible in the UI because nothing errors.
  *
- * It covers three things that were each once silently wrong:
+ * It covers four things that were each once silently wrong:
  *   1. `session.usage` is emitted with real token numbers and a turn id
  *   2. a non-text content block reaches DSH instead of being collapsed away
  *   3. an unsupported input type reports `request.failed`, not `request.completed`
+ *   4. a real third-party DSH boolean switch round-trips through the bridge's
+ *      `paseo/settings/list|set` into `session.config` (the offline bridge check
+ *      fakes the settings service; this is the only check that proves the real
+ *      profile composes one)
  *
  * Profile isolation: `ensurePaseoProfile()` rewrites the profile's embedded
  * bridge whenever this script loads the plugin. The script therefore clones the
@@ -18,6 +22,15 @@
  * by default, so the live `~/.dsh` is never written. Pass `--allow-real-profile`
  * to use the live home instead; an explicit `DSH_HOME=<dir>` is used as-is. The
  * first output line names the mode.
+ *
+ * The DSH settings pass-through segment (0d) checks the real profile's settings
+ * service. What counts as an expected toggle is **opt-in**, because this
+ * repository is used by other people and a check must not assume a particular
+ * third-party plugin is installed: set `PASEO_EXPECT_DSH_TOGGLE=<ns>[,<ns>]`
+ * (settings namespaces, e.g. `unrestricted`) and every named namespace must
+ * appear in the bridge's list — a missing one fails the check. Leave it unset
+ * and the segment exercises a qualifying toggle when the profile happens to
+ * expose one, printing the reason when it skips.
  *
  * The plugin is TypeScript, so it has to be compiled before it can be required:
  *
@@ -95,6 +108,19 @@ DshProcess.prototype.prompt = async function prompt(sessionId, text, contentBloc
     contentBlocks: contentBlocks === undefined ? undefined : JSON.parse(JSON.stringify(contentBlocks)),
   });
   return originalPrompt.call(this, sessionId, text, contentBlocks, delivery);
+};
+
+// Record the `paseo/settings/list` receipts the plugin reads while opening a
+// session, and keep the process they came from. The DSH settings pass-through
+// check below needs to talk to the bridge directly (it is the only way to prove
+// the real profile composes a settings service, not just that the composer has
+// no rows); `DshProcess` is the public seam the provider itself uses.
+const settingsReads = [];
+const originalSettingsList = DshProcess.prototype.settingsList;
+DshProcess.prototype.settingsList = async function settingsList() {
+  const result = await originalSettingsList.call(this);
+  settingsReads.push({ process: this, result });
+  return result;
 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -282,6 +308,154 @@ const check = (name, pass, detail) => {
     "permission applied",
   );
   check("permission setting switches the preset", permissionApplied !== undefined, "value=danger-full-access");
+
+  // 0d. DSH settings pass-through against the REAL profile.
+  //
+  // The offline bridge check (`harness/settings-bridge-check.mjs`) uses a fake
+  // settings service; this is the only check that proves the profile actually
+  // composes one, that a real third-party volatile boolean projects to a toggle,
+  // and that a switch round-trips through `settings.mutate` into `session.config`
+  // for every open conversation. It writes only inside the isolated DSH_HOME
+  // clone (prepareDshHome), never the live profile.
+  const settingsProcess = settingsReads.at(-1)?.process;
+  const settingsReceipt = settingsProcess === undefined
+    ? undefined
+    : await settingsProcess.settingsList();
+  check(
+    "→ DSH settings service is available on a real profile",
+    settingsReceipt?.available === true,
+    JSON.stringify(settingsReceipt === undefined
+      ? "no settings read was recorded during the open"
+      : { available: settingsReceipt.available, reason: settingsReceipt.reason }),
+  );
+  // What counts as "expected" is the caller's choice, never a plugin name
+  // hardcoded here: this repository is used by other people. When
+  // `PASEO_EXPECT_DSH_TOGGLE` names one or more settings namespaces
+  // (comma-separated, e.g. `unrestricted`), each must be in the bridge's list —
+  // a missing row is the "silent empty menu" defect and fails the check. When
+  // unset, a qualifying toggle is exercised if the profile happens to expose
+  // one, and the reason for skipping is printed otherwise.
+  const items = settingsReceipt?.available === true ? settingsReceipt.items ?? [] : [];
+  const expectedToggles = (process.env.PASEO_EXPECT_DSH_TOGGLE ?? "")
+    .split(",")
+    .map((ns) => ns.trim())
+    .filter((ns) => ns !== "");
+  const firstToggle = items[0];
+  const dshToggleId = firstToggle === undefined
+    ? undefined
+    : `dsh:${firstToggle.ns}:${firstToggle.field.path.join(".")}`;
+  const toggleIn = (configEvent) =>
+    (configEvent?.config?.settings ?? []).find((setting) => setting.id === dshToggleId);
+  if (settingsReceipt?.available !== true) {
+    console.log("  (this profile composes no settings service — the DSH settings pass-through cannot be verified here)");
+  } else {
+    if (expectedToggles.length > 0) {
+      const listed = new Set(items.map((item) => item.ns));
+      const missing = expectedToggles.filter((ns) => !listed.has(ns));
+      check(
+        "→ paseo/settings/list exposes the toggles this run expects (PASEO_EXPECT_DSH_TOGGLE)",
+        missing.length === 0,
+        missing.length === 0
+          ? `expected=[${expectedToggles.join(", ")}]`
+          : `missing=[${missing.join(", ")}] listed=[${[...listed].join(", ")}]`,
+      );
+    }
+    if (firstToggle === undefined) {
+      console.log(
+        "  (skip: this profile exposes no simple third-party DSH toggle — "
+          + "set PASEO_EXPECT_DSH_TOGGLE=<ns>[,<ns>] to make a missing row fail)",
+      );
+    } else {
+      const originalValue = firstToggle.field.value;
+      const targetValue = !originalValue;
+      const toggleMark = events.length;
+      await conn.send({
+        type: "session.configure",
+        sessionId,
+        requestId: "cfg-dsh-toggle",
+        changes: { settings: { [dshToggleId]: targetValue } },
+      });
+      const toggleApplied = await untilSince(
+        toggleMark,
+        (e) => e.type === "session.config" && toggleIn(e)?.value === targetValue,
+        "DSH toggle applied",
+      );
+      const afterWrite = await settingsProcess.settingsList();
+      const receiptToggle = afterWrite.items?.find(
+        (item) => `dsh:${item.ns}:${item.field.path.join(".")}` === dshToggleId,
+      );
+      // The label must be the plugin's own name from its title dictionary (this
+      // process's LOCALE picks one entry), not a module specifier invented here.
+      const appliedLabel = toggleIn(toggleApplied)?.label;
+      const titleDict = firstToggle.title;
+      const titleChoices = titleDict !== undefined && titleDict !== null && typeof titleDict === "object"
+        ? Object.values(titleDict)
+        : [firstToggle.moduleName];
+      check(
+        "→ a third-party DSH toggle switches through settings.mutate and is republished",
+        toggleApplied !== undefined
+          && receiptToggle?.field.value === targetValue
+          && typeof appliedLabel === "string"
+          && appliedLabel !== ""
+          && titleChoices.includes(appliedLabel),
+        JSON.stringify({
+          id: dshToggleId,
+          target: targetValue,
+          receipt: receiptToggle?.field,
+          label: appliedLabel,
+        }),
+      );
+
+      // The value is global: a second open session must show the same state.
+      const secondSessionId = `check-settings-${Date.now()}`;
+      const secondMark = events.length;
+      await conn.send({
+        type: "session.open",
+        requestId: "open-settings-second",
+        sessionId: secondSessionId,
+        config: { cwd: process.cwd(), mode: "build" },
+      });
+      const secondReady = await untilSince(
+        secondMark,
+        (e) => e.type === "session.ready" && e.sessionId === secondSessionId,
+        "second session ready",
+      );
+      const secondConfig = [...events]
+        .slice(secondMark)
+        .reverse()
+        .find((e) => e.type === "session.config" && e.sessionId === secondSessionId);
+      check(
+        "→ a second open session shows the same global value",
+        secondReady !== undefined && toggleIn(secondConfig)?.value === targetValue,
+        JSON.stringify(toggleIn(secondConfig) ?? null),
+      );
+      await conn.send({ type: "session.close", sessionId: secondSessionId });
+      await untilSince(secondMark, (e) => e.type === "session.closed" && e.sessionId === secondSessionId, "second session closed");
+
+      // Write the value back so the isolated clone is left as it was found.
+      const restoreMark = events.length;
+      await conn.send({
+        type: "session.configure",
+        sessionId,
+        requestId: "cfg-dsh-toggle-restore",
+        changes: { settings: { [dshToggleId]: originalValue } },
+      });
+      const restored = await untilSince(
+        restoreMark,
+        (e) => e.type === "session.config" && toggleIn(e)?.value === originalValue,
+        "DSH toggle restored",
+      );
+      const afterRestore = await settingsProcess.settingsList();
+      const restoredToggle = afterRestore.items?.find(
+        (item) => `dsh:${item.ns}:${item.field.path.join(".")}` === dshToggleId,
+      );
+      check(
+        "→ the toggle is written back to its original value (isolated clone left clean)",
+        restored !== undefined && restoredToggle?.field.value === originalValue,
+        JSON.stringify({ restored: toggleIn(restored)?.value, receipt: restoredToggle?.field }),
+      );
+    }
+  }
 
   // 0c. a registered command executes in the runtime instead of being sent to the
   // model as literal text. `/goal` with no argument only reads state, so it is

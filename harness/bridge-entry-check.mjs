@@ -79,6 +79,9 @@ export function exitOnStdinEnd() {}
 export function parseCmdline(ctx, program) { program._action(); }
 `),
   transport: dataUrl(`
+import { appendFileSync } from 'node:fs';
+const log = process.env.BRIDGE_ENTRY_CALL_LOG;
+const record = (entry) => { if (log !== undefined && log !== '') appendFileSync(log, JSON.stringify(entry) + '\\n'); };
 export class PaseoTransport {
   constructor(stdin, stdout) { this.stdin = stdin; this.stdout = stdout; this.handler = null; }
   onRequest(handler) { this.handler = handler; }
@@ -86,6 +89,7 @@ export class PaseoTransport {
   close() {}
   async flush() {}
   request() { return Promise.resolve({ answers: [] }); }
+  notify(method, params) { record({ method: 'transport.notify', call: method, params }); }
 }
 `),
   approval: dataUrl(`
@@ -108,6 +112,7 @@ export class PaseoHarnessServer {
   dropFileTool(exec) { record({ method: 'dropFileTool', label: exec?.__label }); exec.__owned = false; }
   finishFileMutation(exec) { record({ method: 'finishFileMutation', label: exec?.__label }); exec.__owned = false; }
   rememberToolDescription(exec) { record({ method: 'rememberToolDescription', label: exec?.__label }); }
+  settingsNamespaceTracked(ns) { record({ method: 'settingsNamespaceTracked', ns }); return ns === 'exposed'; }
   async handleRequest() { return {}; }
   async shutdown() {}
   owns() { return false; }
@@ -151,6 +156,12 @@ function readCalls() {
 }
 const scopes = new Map();
 const effectDisposers = [];
+/** Event listeners the entry registers with `ctx.on`, keyed by event name. */
+const eventHandlers = new Map();
+/** Deliver one event the way the DSH context would, to every live listener. */
+const emit = (event, ...args) => {
+  for (const handler of [...(eventHandlers.get(event) ?? [])]) handler(...args);
+};
 const ctx = {
   get(name) {
     if (name === 'cmdlineArgs') return { get: () => [] };
@@ -177,8 +188,11 @@ const ctx = {
       });
     }
   },
-  on() {
-    return () => {};
+  on(event, handler) {
+    const handlers = eventHandlers.get(event) ?? new Set();
+    handlers.add(handler);
+    eventHandlers.set(event, handlers);
+    return () => handlers.delete(handler);
   },
   root: { fiber: { dispose() {} } },
 };
@@ -320,6 +334,32 @@ check(
   `calls=[${recorded('tools-exec').join(', ')}] order=[${toolsOrder.join(', ')}]`,
 );
 
+// The settings notification wiring: DSH's `settings/document-updated` becomes a
+// `paseo/settings/changed` notification for namespaces the composer shows.
+const settingsHandler = eventHandlers.get('settings/document-updated');
+check(
+  'the entry subscribes to settings/document-updated',
+  typeof settingsHandler?.size === 'number' && settingsHandler.size === 1,
+  `${String(settingsHandler?.size ?? 0)} listener(s)`,
+);
+reset();
+emit('settings/document-updated', 'exposed');
+const forwarded = readCalls().filter((call) => call.method === 'transport.notify');
+check(
+  'an advertised namespace is forwarded as paseo/settings/changed',
+  forwarded.length === 1
+    && forwarded[0].call === 'paseo/settings/changed'
+    && JSON.stringify(forwarded[0].params) === JSON.stringify({ ns: 'exposed' }),
+  JSON.stringify(forwarded),
+);
+reset();
+emit('settings/document-updated', 'hidden');
+check(
+  'a namespace the bridge never advertised is not forwarded',
+  readCalls().filter((call) => call.method === 'transport.notify').length === 0,
+  JSON.stringify(readCalls()),
+);
+
 for (const disposer of effectDisposers.reverse()) {
   try {
     await disposer();
@@ -327,6 +367,17 @@ for (const disposer of effectDisposers.reverse()) {
     /* teardown is best-effort */
   }
 }
+
+// After the effect teardown the subscription must be gone: a plugin reload that
+// left the listener behind would notify a transport that is already closed.
+reset();
+emit('settings/document-updated', 'exposed');
+check(
+  'the subscription is removed on teardown (no notify after dispose)',
+  readCalls().filter((call) => call.method === 'transport.notify').length === 0
+    && (eventHandlers.get('settings/document-updated')?.size ?? 0) === 0,
+  JSON.stringify({ calls: readCalls(), listeners: eventHandlers.get('settings/document-updated')?.size ?? 0 }),
+);
 
 const failed = results.filter((result) => !result.pass).length;
 console.log(`\n  ${results.length - failed}/${results.length} passed`);

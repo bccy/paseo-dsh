@@ -145,6 +145,62 @@ export interface DshCatalog {
 }
 
 /**
+ * One simple third-party DSH setting the bridge exposes as a composer toggle.
+ *
+ * The bridge projects DSH's runtime settings surface down to plugins whose
+ * whole volatile Config form is one boolean field (`dsh-bridge/lib/
+ * settings-discovery.js`); everything else (dicts, enums, official internals)
+ * is deliberately absent. The value is **global** — a DSH profile is per
+ * process and one `dsh` child serves every session of the connection — so the
+ * same switch state belongs on every conversation, not on the one whose
+ * composer happens to show it.
+ */
+export interface DshSettingsToggle {
+  /** Profile entry id, e.g. `dsh-unrestricted` (the bridge's settings ns). */
+  ns: string;
+  /** The entry's configured module specifier, for logs and fallbacks. */
+  moduleName: string;
+  /**
+   * Display title as the plugin package's language dictionary, e.g.
+   * `{en: "Unrestricted mode", zh: "破限模式"}` (DSH inventory `meta.title`).
+   *
+   * The bridge deliberately passes the dictionary through instead of picking a
+   * language: the bridge's environment is merged when the first session opens
+   * and can differ from the daemon's, so resolving there could mix languages in
+   * one menu. The session resolves it with the same `LOCALE` as every other
+   * composer string.
+   */
+  title?: Record<string, string>;
+  field: {
+    /** The volatile field path inside that entry's Config. */
+    path: string[];
+    value: boolean;
+    /** The settings document revision the value was read at (write precondition). */
+    revision: number;
+  };
+}
+
+/** The bridge's `paseo/settings/list` receipt. */
+export interface DshSettingsList {
+  /** False when the profile composes no settings service (or it failed to read). */
+  available: boolean;
+  items: DshSettingsToggle[];
+  /** Why the list is unavailable; absent when `available` is true. */
+  reason?: string;
+}
+
+/**
+ * The bridge's `paseo/settings/set` receipt.
+ *
+ * Expected failures are a value, not a thrown JSON-RPC error: the plugin words
+ * `conflict` / `not_found` / `settings_unavailable` differently for the user,
+ * and a throw would collapse them into one generic configure failure.
+ */
+export type DshSettingsSetResult =
+  | { ok: true; ns: string; field: { path: string[]; value: boolean; revision: number } }
+  | { ok: false; error: { code: string; message: string } };
+
+/**
  * The outcome of a rewind's file rollback, as reported by the bridge.
  *
  * `failed` is the only field that means "the conversation was rewound but a file
@@ -369,6 +425,13 @@ export interface DshProcessHandlers {
   onPermission?(request: DshApprovalRequest, sessionId: string, signal: AbortSignal): Promise<DshApprovalAnswer>;
   /** A native subagent child session was observed; Paseo may show it. */
   onChildOpened?(payload: DshChildOpened): void;
+  /**
+   * A settings document the composer shows changed (another writer — the DSH
+   * web UI, another Paseo session — or this connection's own write echoing
+   * back). Process-scoped: one child serves every session, so every open
+   * conversation must republish the same toggle state.
+   */
+  onSettingsChanged?(ns: string): void;
   onLog(line: string): void;
   onExit(code: number | null, signal: string | null): void;
   onProtocolError(message: string): void;
@@ -383,7 +446,10 @@ export interface DshProcessHandlers {
  * process — which is exactly what the parked pool's silent handler set used to
  * do to a whole process.
  */
-export type DshSessionHandlers = Omit<DshProcessHandlers, "onLog" | "onProtocolError">;
+export type DshSessionHandlers = Omit<
+  DshProcessHandlers,
+  "onLog" | "onProtocolError" | "onSettingsChanged"
+>;
 
 /**
  * One frame held until its producing session's lineage becomes resolvable.
@@ -1363,6 +1429,13 @@ export class DshProcess {
     onLog(line: string): void;
     onProtocolError(message: string): void;
     onExit(code: number | null, signal: string | null): void;
+    /**
+     * Process-level DSH settings change (one child serves every session).
+     *
+     * Deliberately here rather than on {@link DshSessionHandlers}: a session
+     * must not be able to consume a change that belongs to the whole profile.
+     */
+    onSettingsChanged(ns: string): void;
   };
   /**
    * One handler set per attached session, keyed by DSH's own session id.
@@ -1503,6 +1576,21 @@ export class DshProcess {
    * polls on the same timer, so an unlatched line would bury the log.
    */
   #warnedGoalUnsupported = false;
+  /**
+   * Whether the "this bridge has no paseo/settings/list" line has been logged.
+   *
+   * Latched like the goal line: a bridge older than this feature answers the
+   * unknown method, and every session open would otherwise repeat it.
+   */
+  #warnedSettingsUnsupported = false;
+  /**
+   * Whether the "DSH settings are unavailable" line has been logged.
+   *
+   * Latched: a profile that composes no settings service answers
+   * `available:false` on every session open, and an unlatched line would bury
+   * the log it exists to provide.
+   */
+  #warnedSettingsUnavailable = false;
   /** Whether the process-level exit callback has already fired for this child. */
   #exitReported = false;
   #initializeTask: Promise<void> | undefined;
@@ -1518,6 +1606,7 @@ export class DshProcess {
       onLog: (line) => options.onLog(line),
       onProtocolError: (message) => options.onProtocolError(message),
       onExit: (code, signal) => options.onExit(code, signal),
+      onSettingsChanged: (ns) => options.onSettingsChanged?.(ns),
     };
     // The session this process was built for is attached immediately, so a
     // single-session construction behaves exactly as it did before the split.
@@ -1565,6 +1654,7 @@ export class DshProcess {
       onLog: (line) => handlers.onLog(line),
       onProtocolError: (message) => handlers.onProtocolError(message),
       onExit: (code, signal) => handlers.onExit(code, signal),
+      onSettingsChanged: (ns) => handlers.onSettingsChanged?.(ns),
     };
     this.#sessionHandlers.set(this.#options.sessionId, {
       onEvent: (payload) => handlers.onEvent(payload),
@@ -2655,6 +2745,107 @@ export class DshProcess {
   }
 
   /**
+   * Read the simple third-party DSH toggles the bridge projects for the composer.
+   *
+   * Process-scoped, not session-scoped: DSH's settings are the profile's, and
+   * the single child serves every conversation. A profile that composes no
+   * settings service answers `available:false`; a bridge older than this method
+   * is treated the same way (logged once) so a plugin upgrade against an old
+   * embedded bridge degrades to "no rows" instead of failing every open.
+   *
+   * @returns the bridge's list receipt, normalised to the documented shape.
+   * @throws when the bridge answers a shape this plugin does not understand —
+   *   that is a version mismatch, not "no settings".
+   */
+  async settingsList(): Promise<DshSettingsList> {
+    let result: unknown;
+    try {
+      result = await this.#request("paseo/settings/list", {});
+    } catch (error) {
+      if (!this.#isUnknownBridgeMethodError(error)) throw error;
+      if (!this.#warnedSettingsUnsupported) {
+        this.#warnedSettingsUnsupported = true;
+        this.#processHandlers.onLog(
+          "the bridge does not implement paseo/settings/list (it predates DSH settings pass-through); "
+            + "the composer shows no DSH toggles until the embedded bridge is rewritten",
+        );
+      }
+      return { available: false, items: [], reason: "this bridge predates paseo/settings/list" };
+    }
+    if (result === null || typeof result !== "object") {
+      throw new Error("the bridge answered paseo/settings/list with a non-object");
+    }
+    const answer = result as { available?: unknown; items?: unknown; reason?: unknown };
+    if (!Array.isArray(answer.items)) {
+      throw new Error("the bridge answered paseo/settings/list without an items array");
+    }
+    const available = answer.available === true;
+    const reason =
+      typeof answer.reason === "string" && answer.reason.trim() !== "" ? answer.reason : undefined;
+    if (!available && reason !== undefined && !this.#warnedSettingsUnavailable) {
+      // Latched, and reported for the whole child: the answer is process-wide.
+      // A `describe()` failure shares this shape (the bridge puts its message in
+      // `reason`), so it is also reported once — the reason text still names it.
+      this.#warnedSettingsUnavailable = true;
+      this.#processHandlers.onLog(
+        `DSH settings are unavailable: ${reason}; the composer shows no DSH plugin toggles`,
+      );
+    }
+    return {
+      available,
+      items: answer.items as DshSettingsToggle[],
+      ...(reason === undefined ? {} : { reason }),
+    };
+  }
+
+  /**
+   * Switch one exposed DSH toggle through the bridge.
+   *
+   * The revision is forwarded verbatim: it is the write precondition that keeps
+   * a stale composer click from overwriting a value another session (or the DSH
+   * web UI) changed in the meantime. Expected failures come back as
+   * `{ok:false, error}` so the session layer can word `conflict` / `not_found` /
+   * `settings_unavailable` differently.
+   *
+   * @param ns - the settings namespace (profile entry id).
+   * @param path - the volatile field path inside that entry.
+   * @param value - the requested boolean.
+   * @param revision - the revision the composer read the current value at.
+   * @param expectedValue - the value the composer displayed when the user
+   *   toggled it. The bridge refuses the write when the runtime value no longer
+   *   matches — a value-layer precondition on top of the revision, so a
+   *   composer that is stale for any reason cannot overwrite another writer.
+   */
+  async settingsSet(
+    ns: string,
+    path: string[],
+    value: boolean,
+    revision: number,
+    expectedValue?: boolean,
+  ): Promise<DshSettingsSetResult> {
+    const result = (await this.#request("paseo/settings/set", {
+      ns,
+      path,
+      value,
+      revision,
+      ...(expectedValue === undefined ? {} : { expectedValue }),
+    })) as DshSettingsSetResult | undefined;
+    if (result === null || typeof result !== "object") {
+      throw new Error("the bridge answered paseo/settings/set with a non-object");
+    }
+    if (result.ok === true) {
+      if (result.field === undefined || typeof result.field.value !== "boolean") {
+        throw new Error("the bridge answered a successful paseo/settings/set without a field value");
+      }
+      return { ok: true, ns: result.ns ?? ns, field: result.field };
+    }
+    if (result.error === undefined || typeof result.error.code !== "string") {
+      throw new Error("the bridge answered a failed paseo/settings/set without an error code");
+    }
+    return result;
+  }
+
+  /**
    * Switch model and/or reasoning effort on the live agent.
    *
    * @param sessionId - which session; required — there is no default.
@@ -3392,6 +3583,17 @@ export class DshProcess {
             "`paseo/assistant-delta`; the live stream from this bridge will not render " +
             "(mismatched bridge/plugin builds)",
         );
+      }
+      return;
+    }
+    if (method === "paseo/settings/changed") {
+      // Process-level, like stderr: DSH's settings belong to the profile, and
+      // one child serves every session of the connection. The frame only names
+      // the namespace that moved; the provider re-reads the authoritative value
+      // and republishes `session.config` for every open conversation.
+      const changed = params as { ns?: unknown };
+      if (typeof changed.ns === "string" && changed.ns !== "") {
+        this.#processHandlers.onSettingsChanged?.(changed.ns);
       }
       return;
     }

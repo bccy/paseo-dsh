@@ -85,10 +85,11 @@ paseo/config/set    切模型 / 切思考档位
 shutdown            收尾
 ```
 
-当前实现已经扩到 24 个请求方法（`dsh-bridge/lib/server.js` 的 `handleRequest` 分派）：除上面
+当前实现已经扩到 27 个请求方法（`dsh-bridge/lib/server.js` 的 `handleRequest` 分派）：除上面
 8 个外，还有 `paseo/revert`、`paseo/permission` / `paseo/permission/set`、`paseo/usage`、
 `paseo/jobs`、`paseo/presets`、`paseo/sessions`、`paseo/history`、`paseo/subagents`、
 `paseo/archive` / `paseo/unarchive`、`paseo/commands`、`paseo/command/run`、`paseo/mcp/set`、
+`paseo/settings/list` / `paseo/settings/set`（第三方插件的简单布尔开关，见 README「DSH 配置透传」）、
 `paseo/projections`、`session/close` 等；新增能力时按需扩。
 
 **最容易漏的一条：`session/cancel` 不是杀进程。** 见第 4.4 节。

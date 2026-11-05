@@ -30,8 +30,9 @@ import {
   type DshJob,
   type DshRevertResult,
   type DshRoute,
+  type DshSettingsList,
 } from "./dsh-process";
-import { DshChildSession, DshSession, modes, parseRoute } from "./session";
+import { DSH_SETTINGS_ID_PREFIX, DshChildSession, DshSession, modes, parseRoute } from "./session";
 import { rewindCanaryNotice } from "./rewind-canary";
 import { beginRewindReport, fallbackNoticeDescription, type RewindReportFallback } from "./rewind-notice-append";
 import { effortLabel, LOCALE, UI } from "./locale";
@@ -707,6 +708,13 @@ class DshConnection implements ProviderConnection {
         onStatus: () => {},
         onQuestion: async () => ({ answers: [] }),
         onChildOpened: () => {},
+        // Settings are the profile's, not a session's: the bridge forwards one
+        // process-level notification and this provider fans it out to every open
+        // conversation (see `#onSettingsChanged`). A handler scoped to a single
+        // session would leave the other sessions showing a stale switch.
+        onSettingsChanged: (ns) => {
+          this.#onSettingsChanged(ns);
+        },
         onLog: (line) => process.stderr.write(`[${PROVIDER_ID}] ${line}\n`),
         onExit: (code, signal) => this.#onPoolExit(child, code, signal),
         onProtocolError: (message) => {
@@ -982,6 +990,76 @@ class DshConnection implements ProviderConnection {
     // child's entry keeps any older child's claims intact for their own release.
     this.#dropPoolClaims(child);
     this.#cancelPoolRelease();
+  }
+
+  /**
+   * One DSH settings document changed; republish the composer for every open
+   * conversation.
+   *
+   * The switch value lives in the DSH profile, which one child serves for the
+   * whole connection, so a change is process-wide by construction. The bridge
+   * only names the namespace; each session re-reads the authoritative value and
+   * the provider republishes `session.config` only for sessions whose projected
+   * settings actually changed — re-emitting on every notification would make the
+   * composer flicker for sessions that share the same value.
+   *
+   * Failures are logged, never thrown: this runs off a notification, and a dead
+   * or closing session must not turn a settings refresh into an unhandled
+   * rejection.
+   *
+   * @param ns - the profile entry id whose settings document changed.
+   */
+  #onSettingsChanged(ns: string): void {
+    void this.#refreshSettings(ns);
+  }
+
+  /**
+   * Re-read the DSH toggles once and republish the sessions whose value changed.
+   *
+   * The settings document belongs to the profile, and one child serves every
+   * conversation, so the authoritative read is connection-wide: reading it once
+   * and fanning the projection out keeps a notification from costing one
+   * `describe()` (a real configuration composition) per open session.
+   *
+   * The read goes through the first open session that still answers, not
+   * `sessions[0]` unconditionally. A session can be mid-close or its shared
+   * process can be gone; every other open session reads the same profile-wide
+   * document, so falling through to the next one keeps the change from being
+   * dropped for every conversation (the narrow window this guards against is
+   * exactly when an external writer changed the switch). Only when every open
+   * session fails is that a real read failure worth a stderr line.
+   *
+   * @param ns - the changed namespace, for the log line only.
+   */
+  async #refreshSettings(ns: string): Promise<void> {
+    const sessions = [...this.#sessions.values()].filter(
+      (session): session is DshSession => session instanceof DshSession,
+    );
+    if (sessions.length === 0) return;
+    let list: DshSettingsList | undefined;
+    let lastError: unknown;
+    for (const session of sessions) {
+      try {
+        list = await session.readDshSettings();
+        break;
+      } catch (error) {
+        // Try the next still-open session; it shares the same profile document.
+        lastError = error;
+      }
+    }
+    if (list === undefined) {
+      process.stderr.write(
+        `[${PROVIDER_ID}] re-reading DSH settings after "${ns}" failed for every open session: `
+          + `${messageOf(lastError)}\n`,
+      );
+      return;
+    }
+    for (const session of sessions) {
+      // The session may have closed while the read was in flight.
+      if (this.#sessions.get(session.id) !== session) continue;
+      if (!session.applyDshSettings(list)) continue;
+      this.#emit({ type: "session.config", sessionId: session.id, config: session.configState() });
+    }
   }
 
   async #dispatch(input: ProviderInput): Promise<void> {
@@ -1721,6 +1799,9 @@ class DshConnection implements ProviderConnection {
         await session.loadCommands();
         await session.loadPermission();
         await session.loadPresets();
+        // Simple third-party DSH toggles: global to the profile, so the value
+        // read here is the runtime's truth, not Paseo's persisted per-agent copy.
+        await session.loadDshSettings();
         // `session.configure()` intentionally keeps the real value when DSH
         // refuses a preset (the composer re-emits config and snaps back), so the
         // only reliable way to tell "applied" from "silently refused" is to read
@@ -1739,6 +1820,35 @@ class DshConnection implements ProviderConnection {
                 ? `Paseo 选择的预设「${requestedPreset}」未生效，且当前 profile 没有可读的预设目录，无法确认实际预设；本会话按 profile 的默认设置运行。`
                 : `Paseo 选择的预设「${requestedPreset}」未生效（当前实际预设为「${appliedPreset}」）；本会话按实际预设运行。`,
             });
+          }
+        }
+        // Paseo sends every setting it persisted for this agent on open. A
+        // `dsh:` toggle is global to the DSH profile, so that stored value is the
+        // host's memory, not the runtime's truth. Two shapes, deliberately
+        // different:
+        //  - a fresh open (the create panel put the user's picks into the new
+        //    agent's featureValues): park them and write before the first prompt.
+        //    Writing on open would be wrong — Paseo also opens a throwaway
+        //    session to refresh the draft menu, and a write there would make
+        //    "open the create panel" change a global switch;
+        //  - a resumed session: never write. The runtime value wins silently,
+        //    with one daemon-stderr line; a timeline warning on every reopen
+        //    would be noise the user cannot dismiss, and writing would let a
+        //    reopened agent override another conversation's choice.
+        const requestedDsh = Object.entries(settings).filter(([id]) =>
+          id.startsWith(DSH_SETTINGS_ID_PREFIX)
+        );
+        if (input.persistence === undefined) {
+          session.stagePendingDshSettings(settings);
+        } else if (requestedDsh.length > 0) {
+          const actual = session.dshSettingValues();
+          const stale = requestedDsh.filter(([id, value]) => actual.has(id) && actual.get(id) !== value);
+          if (stale.length > 0) {
+            process.stderr.write(
+              `[${PROVIDER_ID}] DSH toggle(s) differ from Paseo's stored value — keeping the runtime value: `
+                + `${stale.map(([id, value]) => `${id} (stored ${String(value)}, runtime ${String(actual.get(id))})`).join(", ")}; `
+                + "the switch is global to the DSH profile and is not written back on resume\n",
+            );
           }
         }
       } catch (error) {

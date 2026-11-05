@@ -479,6 +479,44 @@ DSH 的 agent preset 能把"人设 + 一套能力"打包成一个选项。插件
 > 插件对 preset 是"加法"：host 层的工具照常可用，preset 只负责人设与增量能力。
 > 建议把 host `system-prompt` 的人设清空（`personaPrefix: ''`），改由各 preset 自带，避免重复。
 
+## DSH 配置透传（第三方插件的简单开关）
+
+装在 DSH profile 里的第三方插件，如果它的配置**整体只有一个布尔开关**（例如 `dsh-unrestricted`
+的 `enabled`），Paseo 的会话配置菜单（模型 / Thinking / 模式 / 预设 / 权限那一组）会自动多出
+一行：标签取插件自己的显示名（插件包 locale 字典的 `meta.title`，按 Paseo 的界面语言选，读不到
+就用包名），开关值直接从 DSH 运行时读取。装/卸插件后重开一次会话，这一行就会出现/消失。
+
+**范围是刻意收窄的**：只显示第三方插件（模块名不以 `@deepseek-ai/` 开头、且是真正的包名——
+`cordis:` 这类运行时 specifier 与相对路径都不算）、且整个 volatile 配置**恰好一个 boolean
+字段**的项。官方内部开关、多字段表单、字典/枚举型配置都不显示——避免菜单里塞进几十行 DSH
+部署参数。
+
+**语义是全局的**：DSH 配置属于 profile（一个 `dsh` 子进程服务该连接的所有会话），所以这一行
+不属于"某个 agent"——开关会同时影响本机所有 DSH 会话，切换后所有打开会话的菜单一起刷新。行的
+描述文案写明了这一点。
+
+**新建会话面板里的选择**：在创建面板拨这个开关时，值会随新 agent 一起传来，但**不会在打开时
+立刻写入**——宿主为了刷新创建面板本身也会打开一个临时会话，打开即写就等于"刷新菜单改全局
+开关"。所以这个值先挂起，等该会话**第一次提问前**再写回；写失败只在时间线上留一条 warning，
+不阻断提问；打开后没提问就关闭（草稿）则直接丢弃。重开会话（resume）则相反：Paseo 记住的是
+"宿主以为的旧值"，与 DSH 运行时不一致时**以运行时为准，不写回、不发时间线提示**，只在 daemon
+stderr 记一行——全局开关不该被一次重开悄悄覆盖。
+
+实现路径：插件经桥的 `paseo/settings/list` 读 DSH 的 `settings.describe()`，切换经
+`paseo/settings/set` 调 `settings.mutate()` —— 值写进 profile 的 `cordis.patch.yml` 并由
+configEditor 当场 reconcile，**不依赖 HMR**（Paseo profile 的 bridge bundle 显式关掉了 HMR）。
+写入前置条件有两层：`revision`（settings 服务自己的乐观锁）之外还带 `expectedValue`（切换前
+界面上显示的值）——两层锁防的是不同的 stale 状态，值对不上时桥直接返回 `conflict`，不调用
+写入。桥订阅 DSH 的 `settings/document-updated`，外部改动（例如 DSH Web 界面的设置页）会以
+`paseo/settings/changed` 通知插件，再刷新所有会话的菜单。**通知的触发条件**：该事件由 DSH
+settings 在 `describe()` 时对比 revision 后发出；绕过 `settings.write` 的外部写入（例如直接手改
+`cordis.patch.yml`）且之后没有任何人调用 `describe()` 时不会触发，菜单要等到下次打开/刷新会话
+才更新。
+
+**并发写**：同一个 `dsh` 进程内，settings 写入经 configEditor 的文件锁 + 写前 reconcile 串行；
+两个 `dsh` 子进程共用同一个 profile 时是 last-writer-wins，`revision`/`expectedValue` 只防单进程
+内的 stale 点击，跨进程不保证。
+
 ## 版本策略
 
 插件的 `major.minor` **跟随它所适配的 DSH 线**：`0.2.x` 的插件对应 DSH `0.2.x`，

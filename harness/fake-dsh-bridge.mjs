@@ -130,7 +130,7 @@
  *
  * @module paseo-dsh/harness/fake-dsh-bridge
  */
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 /**
@@ -181,6 +181,45 @@ function scriptFile(envName) {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Write a scripted-answer file back, so a later read sees the updated state.
+ *
+ * The settings scenarios are stateful (a set bumps a revision and an external
+ * change flips a value); the scripted-file pattern everywhere else is read-only,
+ * so this is the one writer.
+ */
+function writeScriptFile(envName, value) {
+  const file = process.env[envName];
+  if (file === undefined || file === "") return;
+  writeFileSync(file, JSON.stringify(value));
+}
+
+/**
+ * The scripted `paseo/settings/list` answer.
+ *
+ * `DSH_FAKE_SETTINGS_FILE` holds the whole list receipt the real bridge would
+ * build from `settings.describe()`:
+ * `{available, items:[{ns, moduleName, title, field:{path, value, revision}}]}`.
+ * Unset answers `{available:false, items:[]}` — the "profile composes no
+ * settings service" shape, which is what most checks want unless they opt in.
+ */
+function settingsScript() {
+  return scriptFile("DSH_FAKE_SETTINGS_FILE");
+}
+
+/**
+ * The scripted `paseo/settings/set` refusal.
+ *
+ * `DSH_FAKE_SETTINGS_FAIL_FILE` holds one bridge error envelope
+ * (`{code, message}`), e.g. `{"code":"conflict","message":"..."}`. The real
+ * bridge answers expected write failures as `{ok:false,error}` values (not
+ * thrown JSON-RPC errors), so the plugin's readable-error path needs a stand-in
+ * that can switch the failure on between assertions of one shared child.
+ */
+function settingsFailScript() {
+  return scriptFile("DSH_FAKE_SETTINGS_FAIL_FILE");
 }
 
 /**
@@ -1473,6 +1512,55 @@ async function handle(method, params, id) {
         return { provider: "fake", model: "fake", reasoningEffort: null, preset: "default-pet" };
       }
       return { provider: "fake", model: "fake", reasoningEffort: null, preset: null };
+    // The runtime settings surface: DSH's `settings.describe()` / `mutate()`
+    // projected by the real bridge. The stand-in reads and rewrites one JSON
+    // file so a check can drive both the read and the write path; an unset file
+    // is the "no settings service" shape.
+    case "paseo/settings/list": {
+      const state = settingsScript();
+      if (state === undefined) return { available: false, items: [] };
+      return {
+        available: state.available !== false,
+        items: Array.isArray(state.items) ? state.items : [],
+        ...(typeof state.reason === "string" ? { reason: state.reason } : {}),
+      };
+    }
+    case "paseo/settings/set": {
+      const scriptedFailure = settingsFailScript();
+      if (scriptedFailure !== undefined && typeof scriptedFailure.code === "string") {
+        return {
+          ok: false,
+          error: {
+            code: scriptedFailure.code,
+            message: typeof scriptedFailure.message === "string" ? scriptedFailure.message : scriptedFailure.code,
+          },
+        };
+      }
+      const state = settingsScript();
+      const ns = typeof params?.ns === "string" ? params.ns : "";
+      const path = Array.isArray(params?.path) ? params.path : [];
+      const value = params?.value;
+      const revision = params?.revision;
+      if (state === undefined) {
+        return { ok: false, error: { code: "settings_unavailable", message: "this profile composes no settings service" } };
+      }
+      const item = (Array.isArray(state.items) ? state.items : []).find((row) => row.ns === ns);
+      if (item === undefined) return { ok: false, error: { code: "not_found", message: `no simple third-party toggle named "${ns}" is exposed` } };
+      if (JSON.stringify(item.field.path) !== JSON.stringify(path)) {
+        return { ok: false, error: { code: "not_found", message: `"${ns}" has no exposed field ${path.join(".")}` } };
+      }
+      if (item.field.revision !== revision) {
+        return { ok: false, error: { code: "conflict", message: `settings conflict for "${ns}": expected revision ${String(item.field.revision)}` } };
+      }
+      item.field.value = value === true;
+      item.field.revision += 1;
+      writeScriptFile("DSH_FAKE_SETTINGS_FILE", state);
+      // The real bridge's configEditor write makes the settings service emit
+      // `settings/document-updated`, which the bridge app forwards. Emitting it
+      // here is what lets a check assert the cross-session refresh path.
+      notify("paseo/settings/changed", { ns });
+      return { ok: true, ns, field: item.field };
+    }
     case "shutdown":
       if (cancelTicker !== null) clearInterval(cancelTicker);
       setTimeout(() => process.exit(0), 10);
@@ -1480,6 +1568,38 @@ async function handle(method, params, id) {
     default:
       throw new Error(`fake bridge: unknown method ${method}`);
   }
+}
+
+/**
+ * External settings change: the DSH web UI (or another session) flipping a
+ * profile-wide switch while the composer is open.
+ *
+ * A check writes `{ns, value}` to `DSH_FAKE_SETTINGS_TRIGGER`; this watcher
+ * applies it to the scripted list, bumps the revision and emits the bridge's
+ * `paseo/settings/changed` notification — the only frame that makes the plugin
+ * re-read and republish `session.config` without a configure request.
+ */
+const settingsFile = process.env.DSH_FAKE_SETTINGS_FILE;
+const settingsTrigger = process.env.DSH_FAKE_SETTINGS_TRIGGER;
+if (settingsFile !== undefined && settingsFile !== "" && settingsTrigger !== undefined && settingsTrigger !== "") {
+  setInterval(() => {
+    if (!existsSync(settingsTrigger)) return;
+    let change;
+    try {
+      change = JSON.parse(readFileSync(settingsTrigger, "utf8"));
+    } catch {
+      return;
+    }
+    rmSync(settingsTrigger, { force: true });
+    const state = settingsScript();
+    if (state === undefined) return;
+    const item = (Array.isArray(state.items) ? state.items : []).find((row) => row.ns === change.ns);
+    if (item === undefined) return;
+    item.field.value = change.value === true;
+    item.field.revision += 1;
+    writeScriptFile("DSH_FAKE_SETTINGS_FILE", state);
+    notify("paseo/settings/changed", { ns: change.ns });
+  }, 50).unref();
 }
 
 const rl = createInterface({ input: process.stdin });
