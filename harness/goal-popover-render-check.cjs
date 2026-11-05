@@ -776,7 +776,7 @@ async function containerChecks() {
  * the real goal container and the real jobs body. The fake registration
  * records every `update`; `close` is the host's own close, spied.
  */
-function mountSlot({ goal = baseGoal, jobs = [], goalAttention = false } = {}) {
+function mountSlot({ goal = baseGoal, jobs = [] } = {}) {
   const spies = { close: 0, updates: [], rpc: [] };
   const goalStore = new Map([["agent-1", { goal, available: true, listeners: new Set() }]]);
   const jobsStore = new Map([["agent-1", { jobs, available: true, listeners: new Set() }]]);
@@ -798,11 +798,12 @@ function mountSlot({ goal = baseGoal, jobs = [], goalAttention = false } = {}) {
   slot.attach("goal", agent, { Content: makeGoalPopover(client, goalStore, "agent-1", async () => {}, () => {}), icon: "GoalIcon", title: "目标" });
   slot.attach("jobs", agent, { Content: makeJobsPopover(jobsStore, "agent-1"), icon: "JobsIcon", title: "后台任务" });
   const liveCount = jobs.filter((job) => job.status === "running" || job.status === "stopping").length;
-  const presentGoal = (g, attention) =>
-    slot.presentGoal("agent-1", { visible: g !== null, attention, goal: g, label: "目标", title: "目标", icon: "GoalIcon" });
+  const presentGoal = (g) =>
+    slot.presentGoal("agent-1", { visible: g !== null, goal: g, label: "目标", title: "目标", icon: "GoalIcon" });
+  // T12: the trigger says 「后台」; the count names the goal view's switch row.
   const presentJobs = (count) =>
-    slot.presentJobs("agent-1", { visible: count > 0, live: count > 0, label: count > 0 ? `${count} 个后台` : "后台任务", title: "后台任务", icon: "JobsIcon" });
-  presentGoal(goal, goalAttention);
+    slot.presentJobs("agent-1", { visible: count > 0, live: count > 0, label: "后台", rowLabel: count > 0 ? `${count} 个后台` : "后台任务", title: "后台任务", icon: "JobsIcon" });
+  presentGoal(goal);
   presentJobs(liveCount);
   const Panel = spies.contribution.button.behavior.Content;
   const container = document.createElement("div");
@@ -832,48 +833,81 @@ const runningJob = { id: "job-1", kind: "bash", label: "sleep 600", status: "run
 async function slotChecks() {
   console.log("\nthe goal/jobs slot's one panel (T10b)");
   {
-    // Armed goal + a running job: the trigger shows the jobs, the panel opens
-    // on the jobs view with the goal switch row on top.
-    const { container, spies, presentJobs, presentGoal, rerender } = mountSlot({ jobs: [runningJob] });
+    // T12: an armed goal + a running job: the trigger shows the goal, the
+    // panel opens on the goal view with the 「1 个后台」 switch row on top.
+    const { container, spies, presentJobs, presentGoal, rerender, root } = mountSlot({ jobs: [runningJob] });
+    const title = () => {
+      let t = spies.contribution.button.title;
+      for (const patch of spies.updates) if (patch.title !== undefined) t = patch.title;
+      return t;
+    };
     check("one behavior for the whole slot, registered once", spies.contribution.button.behavior.kind, "popover");
-    assert("the panel opens on the jobs view (what the trigger shows)", container.querySelector('[data-testid="goal-jobs-view-jobs"]') !== null);
+    check("T12: both present: the trigger shows the goal", spies.updates.map((patch) => patch.label).filter(Boolean).at(-1), "目标");
+    assert("the panel opens on the goal view (what the trigger shows)", container.querySelector('[data-testid="goal-jobs-view-goal"]') !== null);
+    assert("…the real goal panel is drawn", byLabel(container, "目标进行中，编辑目标") !== undefined);
+    check("T12: …titled 目标 (the sheet header)", title(), "目标");
+    const jobsRow = container.querySelector('[data-testid="goal-jobs-switch-jobs"]');
+    assert("the goal view's top row switches to the jobs", jobsRow !== null);
+    check("…named by the live count 「1 个后台」", jobsRow?.getAttribute("aria-label"), "1 个后台");
+    assert("…with the terminal glyph and its corner ring", jobsRow?.querySelector('[data-icon="SquareTerminal"]') !== null && jobsRow?.querySelector('[data-testid="pill-corner-ring"]') !== null);
+    const updatesBefore = spies.updates.length;
+    click(jobsRow);
+    assert("pressing it switches the panel to the jobs view in place", container.querySelector('[data-testid="goal-jobs-view-jobs"]') !== null);
     assert("…listing the job", container.textContent.includes("运行完整测试套件"));
+    check("switching views does not close the panel", spies.close, 0);
+    check("T12: switching to the jobs view sends exactly one title-only update",
+      JSON.stringify(spies.updates.slice(updatesBefore)), JSON.stringify([{ title: "后台任务" }]));
+    check("T12: …so the sheet header reads 后台任务", title(), "后台任务");
     const goalRow = container.querySelector('[data-testid="goal-jobs-switch-goal"]');
-    assert("the jobs view's top row switches to the goal", goalRow !== null);
+    assert("the jobs view's top row switches back to the goal", goalRow !== null);
     assert("…drawing the whale", goalRow?.querySelector('[data-icon="svg"]') !== null);
     assert("…the objective on one line", (goalRow?.textContent ?? "").includes(baseGoal.objective));
     assert("…and the goal's state line", (goalRow?.textContent ?? "").includes("进行中 · 第 3 轮 · 预算 10"));
-    check("…named by state then objective", goalRow?.getAttribute("aria-label"), `目标进行中，${baseGoal.objective}`);
-    const updatesBefore = spies.updates.length;
+    check("…as the way back, named by state then objective", goalRow?.getAttribute("aria-label"), `返回，目标进行中，${baseGoal.objective}`);
     click(goalRow);
-    assert("pressing it switches the panel to the goal view in place", container.querySelector('[data-testid="goal-jobs-view-goal"]') !== null);
-    assert("…the real goal panel is drawn", byLabel(container, "目标进行中，编辑目标") !== undefined);
-    check("switching views does not close the panel", spies.close, 0);
-    check("switching views sends no registration update", spies.updates.length, updatesBefore);
-    const jobsRow = container.querySelector('[data-testid="goal-jobs-switch-jobs"]');
-    assert("the goal view's top row switches back to the jobs", jobsRow !== null);
-    check("…as the way back, naming 「N 个后台」", jobsRow?.getAttribute("aria-label"), "返回，1 个后台");
-    assert("…with the terminal glyph and its corner ring", jobsRow?.querySelector('[data-icon="SquareTerminal"]') !== null && jobsRow?.querySelector('[data-testid="pill-corner-ring"]') !== null);
-    click(jobsRow);
-    assert("…and pressing it returns to the jobs view", container.querySelector('[data-testid="goal-jobs-view-jobs"]') !== null);
+    assert("…and pressing it returns to the goal view", container.querySelector('[data-testid="goal-jobs-view-goal"]') !== null);
+    check("T12: …retitled 目标", title(), "目标");
+    click(container.querySelector('[data-testid="goal-jobs-switch-jobs"]'));
+    check("T12: …and 后台任务 again on the jobs view", title(), "后台任务");
 
-    // A flip while the panel is open: the goal blocks. The trigger moves; the
-    // view stays; nothing closes and no behavior is sent.
-    rerender(() => presentGoal({ ...baseGoal, phase: "blocked" }, true));
+    // A change while the panel is open: the goal blocks. The trigger keeps the
+    // goal, the view and its title stay; nothing closes and no behavior is sent.
+    rerender(() => presentGoal({ ...baseGoal, phase: "blocked" }));
     check("the goal blocking while open does not close the panel", spies.close, 0);
     assert("…and does not move the view", container.querySelector('[data-testid="goal-jobs-view-jobs"]') !== null);
-    check("…the trigger flipped to the goal", spies.updates.at(-1)?.label, "目标");
-    check("no update ever carried a behavior", spies.updates.every((patch) => !("behavior" in patch)), true);
+    check("T12: …nor the title", title(), "后台任务");
+    rerender(() => presentJobs(2));
+    check("T12: a poll on the open jobs view sends no label (the trigger has no count)", spies.updates.some((patch) => patch.label !== undefined && patch.label !== "目标"), false);
     // The jobs finish while their view is open: the view falls back to the goal.
     rerender(() => presentJobs(0));
     assert("the jobs finishing while their view is open falls back to the goal view", container.querySelector('[data-testid="goal-jobs-view-goal"]') !== null);
     assert("…with no switch row left (nothing else to show)", container.querySelector('[data-testid^="goal-jobs-switch-"]') === null);
+    check("T12: …and the title follows it back to 目标", title(), "目标");
     check("…and still no close", spies.close, 0);
-    check("…and no visibility change (the goal still holds the slot)", spies.updates.at(-1)?.visible, undefined);
+    check("no update ever carried a behavior", spies.updates.every((patch) => !("behavior" in patch)), true);
+    check("no update ever hid the pill while it was open", spies.updates.slice(1).every((patch) => patch.visible !== false), true);
+    root.unmount();
   }
   {
-    // A goal that needs the user opens on the goal view, with the jobs row on top.
-    const { container, spies } = mountSlot({ goal: { ...baseGoal, phase: "blocked" }, goalAttention: true, jobs: [runningJob] });
+    // T12: closing the panel on the jobs view hands the title back to the goal.
+    const { container, spies, root } = mountSlot({ jobs: [runningJob] });
+    click(container.querySelector('[data-testid="goal-jobs-switch-jobs"]'));
+    check("T12: open on the jobs view: title 后台任务", spies.updates.at(-1)?.title, "后台任务");
+    flushSync(() => root.unmount());
+    check("T12: the panel closing restores the shown half's title 目标", JSON.stringify(spies.updates.at(-1)), JSON.stringify({ title: "目标" }));
+    check("…without a behavior", spies.updates.every((patch) => !("behavior" in patch)), true);
+  }
+  {
+    // T12: only jobs, no goal: the jobs view, titled 后台任务, no switch row.
+    const { container, spies } = mountSlot({ goal: null, jobs: [runningJob] });
+    assert("T12: only jobs: the panel opens on the jobs view", container.querySelector('[data-testid="goal-jobs-view-jobs"]') !== null);
+    assert("T12: …with no switch row", container.querySelector('[data-testid^="goal-jobs-switch-"]') === null);
+    check("T12: …the trigger reads 后台", spies.updates.map((patch) => patch.label).filter(Boolean).at(-1), "后台");
+    check("T12: …titled 后台任务", spies.updates.map((patch) => patch.title).filter(Boolean).at(-1) ?? spies.contribution.button.title, "后台任务");
+  }
+  {
+    // A goal that needs the user opens on the goal view too, with the jobs row on top.
+    const { container, spies } = mountSlot({ goal: { ...baseGoal, phase: "blocked" }, jobs: [runningJob] });
     assert("a blocked goal beside running jobs opens on the goal view", container.querySelector('[data-testid="goal-jobs-view-goal"]') !== null);
     const jobsRow = container.querySelector('[data-testid="goal-jobs-switch-jobs"]');
     check("…its top row opens the jobs, named 「1 个后台」", jobsRow?.getAttribute("aria-label"), "1 个后台");
@@ -888,7 +922,7 @@ async function slotChecks() {
     // it there would unmount the goal body and drop the draft or the
     // confirmation without a word; back on the main page the row returns.
     const jobsRowOf = (c) => c.querySelector('[data-testid="goal-jobs-switch-jobs"]');
-    const { container, spies, presentGoal, rerender } = mountSlot({ goal: { ...baseGoal, phase: "blocked" }, goalAttention: true, jobs: [runningJob] });
+    const { container, spies, presentGoal, rerender } = mountSlot({ goal: { ...baseGoal, phase: "blocked" }, jobs: [runningJob] });
     assert("T10c: the goal main page draws the jobs row", jobsRowOf(container) !== null);
     click(byLabel(container, "目标受阻，编辑目标"));
     assert("T10c: the editor is open inside the slot", field(container) !== null);
@@ -898,10 +932,10 @@ async function slotChecks() {
     check("T10c: …and the draft is kept while it is open", field(container)?.value, `${baseGoal.objective}（草稿）`);
     // The goal vanishing under the editor unmounts the body; when it comes
     // back the goal view is on its main page again, so the row is back too.
-    rerender(() => presentGoal(null, false));
+    rerender(() => presentGoal(null));
     assert("T10c: the goal vanishing under the editor falls back to the jobs view", container.querySelector('[data-testid="goal-jobs-view-jobs"]') !== null);
     // The body reads its own store, which still holds the blocked goal.
-    rerender(() => presentGoal({ ...baseGoal, phase: "blocked" }, true));
+    rerender(() => presentGoal({ ...baseGoal, phase: "blocked" }));
     click(container.querySelector('[data-testid="goal-jobs-switch-goal"]'));
     assert("T10c: a remounted goal body is on its main page", byLabel(container, "目标受阻，编辑目标") !== undefined);
     assert("T10c: …with the jobs row back", jobsRowOf(container) !== null);
@@ -958,6 +992,47 @@ async function slotChecks() {
         const box = mount(React.createElement(CornerRingIcon, { name: "Users", size, color: "#71717a", running, theme })).firstElementChild;
         const style = box?.getAttribute("style") ?? "";
         assert(`CornerRingIcon frame is ${size}×${size} (running=${running})`, new RegExp(`width:\\s*${size}px`).test(style) && new RegExp(`height:\\s*${size}px`).test(style) && !/padding|margin/.test(style), style);
+      }
+    }
+    // T12: the glyph's horizontal centre inside the host's icon box. The host
+    // draws a composer pill's icon at size 14 in a 16px box that centres its
+    // child (Paseo 0.15.0 \`plugins/buttons/view.tsx\` ButtonIcon + styles.icon);
+    // read both numbers from the host source, then place our frame and glyph by
+    // their own styles. Any margin/left/transform on the frame, or a frame wider
+    // than the glyph, moves the glyph off the box centre.
+    {
+      const hostView = fs.readFileSync(path.join(hostApp, "packages/app/src/plugins/buttons/view.tsx"), "utf8");
+      const box = /icon:\s*\{\s*width:\s*(\d+),\s*height:\s*\d+,\s*alignItems:\s*"center",\s*justifyContent:\s*"center"/.exec(hostView);
+      const composerSize = /placement === "composer" \? (\d+) : \d+/.exec(hostView);
+      assert("host: the plugin icon box is a centring box of fixed width", box !== null);
+      assert("host: composer icons are drawn at a fixed size", composerSize !== null);
+      const boxW = Number(box?.[1] ?? NaN);
+      const size = Number(composerSize?.[1] ?? NaN);
+      const px = (style, prop) => {
+        const m = new RegExp(`(?:^|;)\\s*${prop}:\\s*(-?[\\d.]+)px`).exec(style);
+        return m === null ? 0 : Number(m[1]);
+      };
+      for (const [what, element] of [
+        ["team running (Users + ring)", React.createElement(CornerRingIcon, { name: "Users", size, color: "#71717a", running: true, theme })],
+        ["team idle (Users)", React.createElement(CornerRingIcon, { name: "Users", size, color: "#71717a", running: false, theme })],
+        ["goal (Target)", React.createElement(CornerRingIcon, { name: "Target", size, color: "#71717a", running: false, theme })],
+        ["jobs (SquareTerminal + ring)", React.createElement(JobsPillIcon, { size, color: "#71717a", theme })],
+      ]) {
+        const host = mount(element);
+        const frame = host.firstElementChild;
+        const fs_ = frame?.getAttribute("style") ?? "";
+        const frameW = px(fs_, "width");
+        // The box centres the frame; our own offsets then move it.
+        const frameLeft = (boxW - frameW) / 2 + px(fs_, "margin-left") - px(fs_, "margin-right") + px(fs_, "left") - px(fs_, "right");
+        const transformed = /transform|translate/.test(fs_);
+        const glyph = frame?.querySelector("svg");
+        const glyphW = Number(glyph?.getAttribute("width") ?? NaN);
+        // The glyph sits at the frame's left edge (the Icon wrapper adds no offset).
+        const wrap = glyph?.parentElement?.getAttribute("style") ?? "";
+        const glyphLeft = frameLeft + px(wrap, "margin-left") + px(wrap, "left") + px(wrap, "padding-left");
+        const offset = glyphLeft + glyphW / 2 - boxW / 2;
+        assert(`T12 ${what}: glyph centre within 0.5px of the host icon box centre (offset ${offset.toFixed(2)}px)`,
+          Number.isFinite(offset) && Math.abs(offset) <= 0.5 && !transformed, `frame=${fs_} glyph=${glyphW}`);
       }
     }
     const ringed = mount(React.createElement(CornerRingIcon, { name: "Users", size: 14, color: "#71717a", running: true, theme }));

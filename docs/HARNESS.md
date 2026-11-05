@@ -142,14 +142,14 @@
   保留基线静态 mark）、间隔（可见/隐藏同为 4s、失败指数退避 8→16→30s）与抖动、首屏 `pageInfo`
   分页与过期页丢弃、终态错误码停轮询，以及**发布去重**：答案签名
   （`available`/`error`/`code`/`jobs`）未变时不 publish、首答与 `drop` 后重注册必发布、任一
-  真实变化（含 available 回真、错误文案/code 变化）仍发布。**本轮 119 条**：控制器已抽到
+  真实变化（含 available 回真、错误文案/code 变化）仍发布。**本轮 143 条**（T12 新增 24 条：`jobsPillCopy` 在运行中/停止中/混合/九个/registry 读不到五种可见状态 × 中英，trigger label 恒为「后台」/「Background」；切换行 `rowLabel` 仍数 live、无数量时是 title）：控制器已抽到
   `client/agent-polling.ts`（jobs 与 goal 共用），`client/jobs-polling.ts` 只剩 jobs 适配器（T10b 起 jobs 不再自己注册
   pill，结果交给 `client/goal-jobs-slot.ts`，可见性判定本身未动，本检查条数不变）；
   多出的 3 条**逐字钉住 jobs 的旧文案**（读失败兜底句、poll 失败日志、分页上限日志）——泛化
   不得改 jobs 用户可见文案。**动了 `client/jobs-pill.tsx` / `client/jobs-polling.ts` /
   `client/agent-polling.ts` / `client/poll-sequence.ts` / `client/locale.ts` 的 jobs 表 /
   `shared/jobs.ts` 必跑；`jobs-poll.tsconfig.json` 是它的编译配置。**
-- `harness/jobs-popover-check.cjs` — jobs popover 的几何、状态标记、JSX 接线与宿主主题数据（**221 条**；T10b：触发图标钉
+- `harness/jobs-popover-check.cjs` — jobs popover 的几何、状态标记、JSX 接线与宿主主题数据（**222 条**；T12：pill 文字经 `jobsPillCopy`、源码里 label 不再拼 `liveLabel`（原「live count 用 live label」钉改写，+1）；T10b：触发图标钉
   从 `JobsSpinner`/`ListChecks` 改为 `JobsPillIcon`（`SquareTerminal` + 角标环）/`SquareTerminal`，新增 2 条）；
   `HOST_APP` 指 Paseo checkout，没有就会跑完但 exit 2。**同上触发条件必跑（需 `HOST_APP`），
   跑法见文件头注释。**
@@ -660,7 +660,7 @@
   `dsh-bridge/lib/server.js` 的 `paseo/goal` 或 dispatch 必跑；改桥后先重生成内嵌桥
   （`node paseo-plugin/scripts/generate-bridge-assets.mjs`）再跑 `bridge-assets-check.mjs`，
   否则真机检查跑在旧桥上假绿。**
-- `harness/goal-pill-check.cjs` — goal pill 与行式面板的**数据层与 UI 规则**（**336 条**；T10b 新增 69 条「目标/后台共用一格」：
+- `harness/goal-pill-check.cjs` — goal pill 与行式面板的**数据层与 UI 规则**（**369 条**；T12：`goalNeedsAttention` 删除，`goalJobsSlotShown` 全表改为「有目标一律目标」（五种目标态 × 运行中/停止中/读不到/已完成/无后台，只后台才显示后台）、jobs trigger 恒为「后台」且数量变化不发 update、`panelView` 让 title 跟着面板视图（切到后台视图只发 `{title:"后台任务"}`、切回「目标」、轮询与目标变化不拉回、关闭交回显示那一半、从不带 `behavior`/不隐藏）、源码钉（`jobsPillCopy`、切换行用 `rowLabel`、面板上报视图并在卸载时清除）；T10b 新增 69 条「目标/后台共用一格」：
   `goalNeedsAttention` 四种需处理态、`goalJobsSlotShown` 全表（只后台 / 只目标 / 需处理优先 / armed 让位给 running 与 stopping /
   跑完的后台不占格 / registry 读不到不抢目标 / 都无隐藏）、`goalJobsSlotView` 回落、协调器对假宿主（每 agent 恰一个注册、两种挂接顺序与
   重挂都不多注册、update 只带变化字段且**从不带 `behavior`**、两半都摘掉才 remove、已读只在整个面板关闭且目标视图出现过时记），
@@ -694,7 +694,7 @@
   `client/goal-pill.tsx`、`client/goal-running.tsx`、`client/deepseek-mark*.tsx`、
   `client/agent-polling.ts`、`shared/goal.ts` 或 `client/locale.ts` 的 goal 表必跑；改共享轮询器时
   `jobs-poll-check.cjs` 必须同时全绿且断言数不减。**
-- `harness/goal-popover-render-check.cjs` — 面板的**渲染行为**（**227 条**；T10c 新增 17 条：目标编辑页与清除确认页不画「N 个后台」行、回主页面（取消/清除完成/正文重挂）后再出现、编辑时草稿保留；T10b 新增 54 条：真实 `makeGoalJobsPopover` + 真实协调器 +
+- `harness/goal-popover-render-check.cjs` — 面板的**渲染行为**（**247 条**；T12 新增：两者都有时打开在目标视图且 title「目标」、点「1 个后台」切到后台视图只发一次 `{title:"后台任务"}`、切回/再切 title 跟随、打开期间目标受阻与后台轮询不改 title 也不发带数量的 label、后台跑完回落时 title 回「目标」、面板卸载交回「目标」、只有后台时 label「后台」title「后台任务」；**图标水平居中**：从宿主 `view.tsx` 读出图标盒宽（16）与 composer 图标尺寸（14），团队运行/空闲、目标、后台四种图标的 glyph 中心与盒中心偏差 ≤0.5px；T10c 新增 17 条：目标编辑页与清除确认页不画「N 个后台」行、回主页面（取消/清除完成/正文重挂）后再出现、编辑时草稿保留；T10b 新增 54 条：真实 `makeGoalJobsPopover` + 真实协调器 +
   真实目标容器与后台正文——打开取 pill 当前那一半、后台视图顶部目标行（鲸鱼/单行目标/状态行/读屏名）、点切换行就地换视图且**不调
   `close()`、不发 update**、返回行「返回，1 个后台」带终端图标与角标环、打开期间目标受阻不关面板不切视图、后台跑完回落到目标视图、
   目标需处理时打开在目标视图、面板内编辑页「取消」仍 `close()`；`CornerRingIcon`/`JobsPillIcon`/真实目标图标：运行时底图标仍在、
@@ -785,7 +785,7 @@
 - `harness/tool-call-check.cjs` 团队段（399 → **443**）：`team_task_get/create/update/list` 字段卡、update 动作词（未知原样）、
   list 计数与筛选词、`nextCursor`；**任何形状不符都保留原始 JSON**（非 JSON、多键、少键、deleted、列表坏项、列表多键）；
   失败行不画卡，已知 DSH 原文中文进 `errorShort`/`errorHint`、原文保留在 `error`，未知句不翻、非团队工具不过团队表、英文不翻。
-- `harness/locale-check.cjs` 团队段（505 → **661**，L2 的 `toolCards` 段再 +46 → **707**）：`team` 表中英键一致、非空、不互抄；成员词与分组词逐字；未知成员词不是运行中/空闲；`toolCards` 同口径（字符串叶子键集/非空/不互抄、6 个 formatter 键一致且中英不同、状态词与回执句逐字）；
+- `harness/locale-check.cjs` 团队段（505 → **661**，L2 的 `toolCards` 段再 +46 → **707**，T12 `jobs.pillLabel` 再 +4 → **711**）：`team` 表中英键一致、非空、不互抄；成员词与分组词逐字；未知成员词不是运行中/空闲；`toolCards` 同口径（字符串叶子键集/非空/不互抄、6 个 formatter 键一致且中英不同、状态词与回执句逐字）；
   拒绝句译文表（含 `Error:` 前缀、未知原样）；**读本机 `dsh-experimental-agent-team/lib/index.js` 的每个 `TeamError` 字面量，实例化变量后确认都有中文**
   （找不到包时 NOTE，`DSH_AGENT_TEAM` 可覆盖路径）。
 

@@ -34,6 +34,7 @@
 
 const { createPollSequence } = require("./client/poll-sequence.js");
 const {
+  jobsPillCopy,
   jobsPillPresentation,
   nextPollDelayMs,
   initialPollDelayMs,
@@ -348,6 +349,30 @@ console.log("\nthe pill's presentation (live-only, ring-only)");
     "no answer keeps an idle label kind",
     [settledOnly, liveAndSettled, empty].every((presentation) => presentation.label.kind !== "idle"),
   );
+
+  // T12 (user 2026-11-05): the trigger's label is the bare noun in **every**
+  // visible state — running, stopping, mixed, an unreadable registry — in both
+  // languages. The count only names the panel's switch row.
+  const LANGS = {
+    "zh-CN": { pillLabel: "后台", liveLabel: (n) => `${n} 个后台`, title: "后台任务" },
+    en: { pillLabel: "Background", liveLabel: (n) => `${n} background`, title: "Background tasks" },
+  };
+  const visibleAnswers = [
+    ["one running", { available: true, jobs: [{ status: "running" }] }],
+    ["one stopping", { available: true, jobs: [{ status: "stopping" }] }],
+    ["running + stopping + settled", { available: true, jobs: [{ status: "running" }, { status: "stopping" }, { status: "completed" }] }],
+    ["nine running", { available: true, jobs: Array.from({ length: 9 }, () => ({ status: "running" })) }],
+    ["an unreadable registry", { available: false, jobs: [] }],
+  ];
+  for (const [lang, text] of Object.entries(LANGS)) {
+    for (const [what, answer] of visibleAnswers) {
+      const presentation = jobsPillPresentation(answer);
+      check(`${what} is visible`, presentation.visible, true);
+      check(`${lang}: ${what}: the trigger label is exactly ${text.pillLabel}`, jobsPillCopy(presentation, text).label, text.pillLabel);
+    }
+    check(`${lang}: the row label still counts the live jobs`, jobsPillCopy(liveAndSettled, text).rowLabel, text.liveLabel(2));
+    check(`${lang}: the row label without a count is the title`, jobsPillCopy(unreadable, text).rowLabel, text.title);
+  }
 
   // The old route-1 rule, as an oracle: it kept the settled-only pill visible,
   // which is exactly the regression this block exists to catch.

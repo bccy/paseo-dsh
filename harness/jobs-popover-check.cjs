@@ -479,8 +479,12 @@ assert("no dead fallback for an unreachable empty split",
 assert("the pill's presentation comes from the shared rule",
   /const\s+presentation\s*=\s*jobsPillPresentation\(next\)/.test(pillSource));
 assert("visibility is reported from that rule", /visible:\s*presentation\.visible/.test(pillSource));
-assert("the live count uses the live label",
-  /text\.liveLabel\(\s*presentation\.label\.count\s*\)/.test(pillSource));
+// T12: the trigger's label is the bare noun in every state; the live count
+// only names the panel's switch row (`jobsPillCopy`, asserted in jobs-poll-check).
+assert("the pill's words come from jobsPillCopy",
+  /const\s*\{\s*label,\s*rowLabel\s*\}\s*=\s*jobsPillCopy\(presentation,\s*text\)/.test(pillSource));
+assert("the pill never formats the live count into its own label",
+  !/label\s*=\s*[^;]*liveLabel/.test(pillSource.replace(/rowLabel/g, "")));
 assert("the idle label is gone", !/idleLabel/.test(pillSource));
 assert("the old idle-total branch is gone",
   !/presentation\.label\.kind\s*===\s*"idle"/.test(pillSource));

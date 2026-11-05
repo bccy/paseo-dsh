@@ -27,7 +27,7 @@ import { Icon } from "@getpaseo/plugin/client/ui";
 import { useEffect, useState } from "react";
 import { Platform, Pressable, Text, View, type PressableStateCallbackType } from "react-native";
 import { jobsList, splitJobs, type Job } from "../shared/jobs";
-import { createJobsPoller, jobsPillPresentation, type JobsViewState } from "./jobs-polling";
+import { createJobsPoller, jobsPillCopy, jobsPillPresentation, type JobsViewState } from "./jobs-polling";
 import {
   CHEVRON_BOX,
   FACTS_FONT_SIZE,
@@ -513,9 +513,11 @@ export function contributeJobsPill(client: PluginClientContext, slot: GoalJobsPl
     });
     const presentation = jobsPillPresentation(next);
     const text = localeText().jobs;
-    // The only count phrase is the live one; anything else is the neutral title.
-    // There is no idle total: the pill hides when nothing is live.
-    const label = presentation.label.kind === "live" ? text.liveLabel(presentation.label.count) : text.title;
+    // The trigger's label is the bare noun in every visible state (T12: running,
+    // stopping, an unreadable registry alike). The live count only names the
+    // goal view's switch row; there is no idle total: the pill hides when
+    // nothing is live.
+    const { label, rowLabel } = jobsPillCopy(presentation, text);
     // Every readable answer selects the terminal glyph with the turning ring on
     // its corner (T10b: the glyph stays, so a pill the host shrank to its icon
     // still reads as the jobs); the static glyph is the baseline 2f71225 branch
@@ -526,12 +528,13 @@ export function contributeJobsPill(client: PluginClientContext, slot: GoalJobsPl
      * `title` is the neutral noun, **never the count**: on compact the popover is
      * a sheet and the sheet's header is drawn from the button's title, so a title
      * carrying the count would make this the one panel whose heading changes
-     * while you look at it. The count belongs on the label.
+     * while you look at it. The count belongs on the panel's switch row.
      */
     slot.presentJobs(agentId, {
       visible: presentation.visible,
       live: presentation.label.kind === "live",
       label,
+      rowLabel,
       title: text.title,
       icon,
     });

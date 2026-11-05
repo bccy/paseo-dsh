@@ -30,7 +30,6 @@
  * @module dsh-paseo/client/goal-jobs-slot
  */
 import type { GoalState } from "../shared/goal";
-import type { GoalPillPresentation } from "./goal-polling";
 
 /** The two halves that share the slot. */
 export type SlotKind = "goal" | "jobs";
@@ -38,52 +37,36 @@ export type SlotKind = "goal" | "jobs";
 /** The registration id; one per agent, for both halves. A wire value, frozen. */
 export const GOAL_JOBS_SLOT_ID = "dsh-goal-jobs";
 
-/**
- * Whether a goal presentation needs the user: blocked, paused, active but not
- * continuing (「未在续跑」) or complete and not yet seen. Read off the goal
- * pill's own label key, so the two cannot disagree; only an armed, active goal
- * (`running`) leaves the slot to the jobs.
- */
-export function goalNeedsAttention(presentation: GoalPillPresentation): boolean {
-  return presentation.visible && presentation.label.kind !== "running";
-}
-
 /** The slice of each half the slot rule reads. */
 export interface SlotGoalPresence {
   readonly visible: boolean;
-  readonly attention: boolean;
 }
 export interface SlotJobsPresence {
   /** `jobsPillPresentation(...).visible`, unchanged: live work, or an unreadable registry. */
   readonly visible: boolean;
-  /** A running or stopping job is counted (`label.kind === "live"`). */
-  readonly live: boolean;
 }
 
 /**
  * Which half the slot's trigger shows, or `null` to hide it.
  *
- * - One half present: that half.
- * - Both: the goal while it needs the user ({@link goalNeedsAttention});
- *   otherwise (armed and running on its own) the jobs if something is live.
+ * - A goal exists (the goal half is visible): the goal, **always** — whether
+ *   it runs, needs the user or is complete, and whatever the jobs do (user
+ *   decision 2026-11-05, T12). The jobs stay one tap away on the panel's
+ *   switch row.
+ * - No goal, jobs present: the jobs.
  * - Neither: hidden.
  *
  * "Jobs present" is the jobs pill's own visibility, never re-derived here: live
  * work, or an unreadable registry the panel must explain. A finished job never
- * occupies the slot. An unreadable registry has no live count, so beside a
- * running goal it does not take the trigger.
+ * occupies the slot.
  */
 export function goalJobsSlotShown(
   goal: SlotGoalPresence | undefined,
   jobs: SlotJobsPresence | undefined,
 ): SlotKind | null {
-  const goalVisible = goal?.visible === true;
-  const jobsVisible = jobs?.visible === true;
-  if (!goalVisible && !jobsVisible) return null;
-  if (!goalVisible) return "jobs";
-  if (!jobsVisible) return "goal";
-  if (goal?.attention === true) return "goal";
-  return jobs?.live === true ? "jobs" : "goal";
+  if (goal?.visible === true) return "goal";
+  if (jobs?.visible === true) return "jobs";
+  return null;
 }
 
 /**
@@ -108,12 +91,17 @@ export interface SlotSideState<Icon> {
   readonly icon: Icon;
 }
 export interface SlotGoalState<Icon> extends SlotSideState<Icon> {
-  readonly attention: boolean;
   /** What the jobs view's switch row draws. */
   readonly goal: GoalState | null;
 }
 export interface SlotJobsState<Icon> extends SlotSideState<Icon> {
   readonly live: boolean;
+  /**
+   * How the goal view's switch row names the jobs (「N 个后台」 while live).
+   * Separate from `label`: the trigger's label is the bare noun (T12), the row
+   * keeps the count.
+   */
+  readonly rowLabel: string;
 }
 
 /** What a half hands over when its poller registers an agent. */
@@ -179,6 +167,12 @@ export interface GoalJobsSlot<Icon, Content> {
   detach(kind: SlotKind, agentId: string): void;
   snapshot(agentId: string): SlotSnapshot<Icon, Content> | undefined;
   subscribe(agentId: string, listener: () => void): () => void;
+  /**
+   * The open panel's view, so the title (the phone sheet header) follows it;
+   * `undefined` when the panel closes, which hands the title back to the half
+   * the trigger shows. Sends a title-only update, never a `behavior`.
+   */
+  panelView(agentId: string, view: SlotKind | undefined): void;
   /** The slot's panel unmounted (the host closed it); `undefined` = the goal view never showed. */
   panelClosed(agentId: string, goalShown: GoalState | null | undefined): void;
   dispose(): void;
@@ -189,6 +183,8 @@ interface SlotEntry<Icon, Content> {
   goal?: SlotSideAttach<Icon, Content> & { state?: SlotGoalState<Icon> };
   jobs?: SlotSideAttach<Icon, Content> & { state?: SlotJobsState<Icon> };
   shown: SlotKind | null;
+  /** The view the open panel shows; `undefined` while the panel is closed. */
+  panelView?: SlotKind;
   /** What the registration carries now, so a patch holds only real changes. */
   sent: { visible: boolean; label?: string; title: string; icon: Icon };
   readonly listeners: Set<() => void>;
@@ -218,8 +214,8 @@ export function createGoalJobsSlot<Icon, Content>(host: GoalJobsSlotHost<Icon, C
     const goal = entry.goal?.state;
     const jobs = entry.jobs?.state;
     const shown = goalJobsSlotShown(
-      goal === undefined ? undefined : { visible: goal.visible, attention: goal.attention },
-      jobs === undefined ? undefined : { visible: jobs.visible, live: jobs.live },
+      goal === undefined ? undefined : { visible: goal.visible },
+      jobs === undefined ? undefined : { visible: jobs.visible },
     );
     entry.shown = shown;
     const patch: SlotPatch<Icon> = {};
@@ -227,9 +223,16 @@ export function createGoalJobsSlot<Icon, Content>(host: GoalJobsSlotHost<Icon, C
     const side = shown === "goal" ? goal : shown === "jobs" ? jobs : undefined;
     if (side !== undefined) {
       if (entry.sent.label !== side.label) patch.label = side.label;
-      if (entry.sent.title !== side.title) patch.title = side.title;
       if (entry.sent.icon !== side.icon) patch.icon = side.icon;
     }
+    // The title is the phone sheet's header (`sheetTitle={button.title}`,
+    // Paseo 0.15.0 `plugins/buttons/view.tsx:339`), so while the panel is open
+    // it names the view on screen, not the half the trigger shows. A title-only
+    // patch keeps the surface open (`model.ts:126` closes only on hide,
+    // disable or a new `behavior`).
+    const viewed = entry.panelView === "goal" ? goal : entry.panelView === "jobs" ? jobs : undefined;
+    const titleSide = viewed?.visible === true ? viewed : side;
+    if (titleSide !== undefined && entry.sent.title !== titleSide.title) patch.title = titleSide.title;
     if (Object.keys(patch).length > 0) {
       entry.sent = { ...entry.sent, ...patch };
       entry.registration.update(patch);
@@ -311,6 +314,12 @@ export function createGoalJobsSlot<Icon, Content>(host: GoalJobsSlotHost<Icon, C
       return () => {
         entry.listeners.delete(listener);
       };
+    },
+    panelView(agentId, view) {
+      const entry = entries.get(agentId);
+      if (entry === undefined || entry.panelView === view) return;
+      entry.panelView = view;
+      recompute(entry);
     },
     panelClosed(agentId, goalShown) {
       if (goalShown === undefined) return;

@@ -686,14 +686,13 @@ console.log("\nthe goal and the jobs share one slot (T10b)");
     createGoalJobsSlot,
     goalJobsSlotShown,
     goalJobsSlotView,
-    goalNeedsAttention,
   } = require("./client/goal-jobs-slot.js");
   const { jobsPillPresentation } = require("./client/jobs-polling.js");
 
   // The two halves' real rules, so the slot is tested on what they report.
   const goalSide = (g, seen) => {
     const p = goalPillPresentation({ available: true, goal: g }, seen);
-    return { visible: p.visible, attention: goalNeedsAttention(p) };
+    return { visible: p.visible };
   };
   const jobsSide = (answer) => {
     const p = jobsPillPresentation(answer);
@@ -704,42 +703,37 @@ console.log("\nthe goal and the jobs share one slot (T10b)");
   const finished = { available: true, jobs: [{ status: "completed" }, { status: "failed" }, { status: "killed" }] };
   const none = { available: true, jobs: [] };
 
-  // Which goal states need the user: everything but the armed, active goal.
-  check("armed active goal does not need the user", goalSide(goal()).attention, false);
-  for (const [what, g] of [
+  // T12 (user 2026-11-05): whenever a goal exists the slot shows the goal —
+  // armed and running, needing the user or complete, whatever the jobs do.
+  // Only jobs and no goal shows the jobs.
+  const goalStates = [
+    ["armed active", goal()],
     ["blocked", goal({ phase: "blocked" })],
     ["paused", goal({ phase: "paused" })],
     ["active+disarmed", goal({ activation: "disarmed" })],
     ["complete, unseen", goal({ phase: "complete", activation: "disarmed" })],
-  ]) {
-    check(`${what} needs the user`, goalSide(g).attention, true);
-    check(`${what} beside running jobs: the slot shows the goal`, goalJobsSlotShown(goalSide(g), jobsSide(running)), "goal");
+  ];
+  const unreadable = { available: false, jobs: [] };
+  for (const [what, g] of goalStates) {
+    for (const [jobsWhat, answer] of [["running", running], ["stopping", stopping], ["unreadable", unreadable], ["finished", finished], ["no", none]]) {
+      check(`${what} goal + ${jobsWhat} jobs: the slot shows the goal`, goalJobsSlotShown(goalSide(g), jobsSide(answer)), "goal");
+    }
+    check(`${what} goal alone (jobs never reported): goal`, goalJobsSlotShown(goalSide(g), undefined), "goal");
   }
-  check("no goal at all needs nothing", goalNeedsAttention(goalPillPresentation({ available: true, goal: null })), false);
 
   // Only jobs.
   check("only running jobs: jobs", goalJobsSlotShown(undefined, jobsSide(running)), "jobs");
   check("only stopping jobs: jobs", goalJobsSlotShown(undefined, jobsSide(stopping)), "jobs");
   check("cleared goal + running jobs: jobs", goalJobsSlotShown(goalSide(null), jobsSide(running)), "jobs");
   const seenKey = goalSeenKey(goal({ phase: "complete" }));
-  check("seen complete goal + running jobs: jobs",
+  check("seen complete goal (hidden) + running jobs: jobs",
     goalJobsSlotShown(goalSide(goal({ phase: "complete", activation: "disarmed" }), seenKey), jobsSide(running)), "jobs");
-  // Only goal.
-  check("only an armed goal: goal", goalJobsSlotShown(goalSide(goal()), jobsSide(none)), "goal");
-  check("only a blocked goal: goal", goalJobsSlotShown(goalSide(goal({ phase: "blocked" })), undefined), "goal");
-  // Both, goal armed: the jobs while live.
-  check("armed goal + running jobs: jobs", goalJobsSlotShown(goalSide(goal()), jobsSide(running)), "jobs");
-  check("armed goal + stopping jobs: jobs", goalJobsSlotShown(goalSide(goal()), jobsSide(stopping)), "jobs");
   // The jobs' own semantics are unchanged: finished work never holds the slot.
   check("finished jobs only: hidden", goalJobsSlotShown(goalSide(null), jobsSide(finished)), null);
-  check("armed goal + finished jobs: goal", goalJobsSlotShown(goalSide(goal()), jobsSide(finished)), "goal");
   check("nothing at all: hidden", goalJobsSlotShown(goalSide(null), jobsSide(none)), null);
   check("neither half reported: hidden", goalJobsSlotShown(undefined, undefined), null);
-  // An unreadable registry stays visible (baseline), but has no live count, so
-  // it does not take the trigger from a running goal.
-  const unreadable = { available: false, jobs: [] };
+  // An unreadable registry stays visible (baseline) so the panel can explain it.
   check("unreadable registry alone: jobs (the panel explains it)", goalJobsSlotShown(undefined, jobsSide(unreadable)), "jobs");
-  check("armed goal + unreadable registry: goal", goalJobsSlotShown(goalSide(goal()), jobsSide(unreadable)), "goal");
 
   // The open panel's view: stays put, falls back only when its half vanished.
   check("goal view stays while the goal exists", goalJobsSlotView("goal", true, false), "goal");
@@ -793,26 +787,28 @@ console.log("\nthe goal and the jobs share one slot (T10b)");
   regs.splice(before2);
 
   const goalState = (g, label = "目标") => ({ ...goalSide(g), goal: g, label, title: "目标", icon: GoalIcon });
-  const jobsState = (answer, count) => ({ ...jobsSide(answer), label: count === undefined ? "后台任务" : `${count} 个后台`, title: "后台任务", icon: JobsIcon });
+  // T12: the jobs trigger says 「后台」 in every state; the count is the row label.
+  const jobsState = (answer, count) => ({ ...jobsSide(answer), label: "后台", rowLabel: count === undefined ? "后台任务" : `${count} 个后台`, title: "后台任务", icon: JobsIcon });
   const last = () => {
     const merged = { visible: false, title: "后台任务", icon: JobsIcon };
     for (const patch of regs[0].updates) Object.assign(merged, patch);
     return merged;
   };
-  slot.presentGoal("a", goalState(goal()));
   slot.presentJobs("a", jobsState(running, 1));
-  check("armed goal + 1 running job: the trigger reads 1 个后台", last().label, "1 个后台");
+  check("only 1 running job: the trigger reads 后台", last().label, "后台");
   check("…with the jobs icon", last().icon, JobsIcon);
   check("…and the jobs title", last().title, "后台任务");
   check("…visible", last().visible, true);
   check("the snapshot says jobs", slot.snapshot("a").shown, "jobs");
-  slot.presentGoal("a", goalState(goal({ phase: "blocked" })));
-  check("the goal blocks: the trigger flips to 目标", last().label, "目标");
+  slot.presentGoal("a", goalState(goal()));
+  check("an armed goal arrives beside the running job: the trigger flips to 目标", last().label, "目标");
   check("…with the goal icon", last().icon, GoalIcon);
   check("…and the goal title", last().title, "目标");
-  slot.presentGoal("a", goalState(goal()));
+  check("the snapshot says goal", slot.snapshot("a").shown, "goal");
+  slot.presentGoal("a", goalState(goal({ phase: "blocked" })));
+  check("the goal blocks: still 目标", last().label, "目标");
   slot.presentJobs("a", jobsState(finished));
-  check("jobs finished beside an armed goal: back to 目标", last().label, "目标");
+  check("jobs finished beside the goal: still 目标", last().label, "目标");
   check("…still visible", last().visible, true);
   slot.presentGoal("a", goalState(null));
   check("goal cleared and jobs finished: hidden", last().visible, false);
@@ -823,9 +819,44 @@ console.log("\nthe goal and the jobs share one slot (T10b)");
   check("an unchanged answer sends no update", regs[0].updates.length, before);
   slot.presentJobs("a", jobsState(running, 2));
   const flips = regs[0].updates.slice(before);
-  check("a flip sends only the changed fields", JSON.stringify(flips), JSON.stringify([{ visible: true, label: "2 个后台", title: "后台任务", icon: JobsIcon }]));
+  check("a flip sends only the changed fields", JSON.stringify(flips), JSON.stringify([{ visible: true, label: "后台", icon: JobsIcon, title: "后台任务" }]));
+  const beforeCount = regs[0].updates.length;
   slot.presentJobs("a", jobsState(running, 3));
-  check("a count change sends only the label", JSON.stringify(regs[0].updates.at(-1)), JSON.stringify({ label: "3 个后台" }));
+  check("a count change sends nothing (the trigger has no count)", regs[0].updates.length, beforeCount);
+  check("…the count still reaches the switch row's label", slot.snapshot("a").jobs.state.rowLabel, "3 个后台");
+
+  // T12: the open panel's view drives the title (the phone sheet header).
+  // A title-only patch, never a behavior; closing hands the title back.
+  slot.presentGoal("a", goalState(goal()));
+  check("both present: the trigger shows the goal", last().label, "目标");
+  const beforeView = regs[0].updates.length;
+  slot.panelView("a", "goal");
+  check("opening on the goal view (the shown half) sends nothing", regs[0].updates.length, beforeView);
+  slot.panelView("a", "jobs");
+  check("switching the open panel to the jobs view retitles the sheet 后台任务",
+    JSON.stringify(regs[0].updates.slice(beforeView)), JSON.stringify([{ title: "后台任务" }]));
+  check("…the trigger's label and icon stay the goal's", `${last().label}|${last().icon}`, "目标|GoalIcon");
+  slot.panelView("a", "goal");
+  check("switching back to the goal view retitles it 目标", JSON.stringify(regs[0].updates.at(-1)), JSON.stringify({ title: "目标" }));
+  slot.panelView("a", "jobs");
+  slot.presentJobs("a", jobsState(running, 4));
+  check("a poll while the jobs view is open keeps the jobs title", last().title, "后台任务");
+  slot.presentGoal("a", goalState(goal({ phase: "blocked" }), "目标"));
+  check("…and a goal change does not pull the title back", last().title, "后台任务");
+  slot.panelView("a", undefined);
+  check("closing the panel hands the title back to the shown half (目标)", last().title, "目标");
+  check("no view or title patch ever carries a behavior", regs[0].updates.every((patch) => !("behavior" in patch)), true);
+  check("no view patch hides the pill (that would close the surface)", regs[0].updates.slice(beforeView).every((patch) => patch.visible !== false), true);
+  // Only jobs: the jobs view is the shown one, its title is already there.
+  slot.presentGoal("a", goalState(null));
+  slot.panelView("a", "jobs");
+  check("only jobs, panel on the jobs view: title 后台任务", last().title, "后台任务");
+  slot.panelView("a", undefined);
+  check("…and it stays 后台任务 after closing", last().title, "后台任务");
+  // A view whose half is gone does not own the title.
+  slot.panelView("a", "goal");
+  check("a stale goal view (no goal) leaves the title on the shown half", last().title, "后台任务");
+  slot.panelView("a", undefined);
 
   // A second agent gets its own registration; detaching one half keeps the
   // slot, detaching both removes it.
@@ -866,6 +897,11 @@ console.log("\nthe slot is wired as one registration with one fixed panel");
   assert("the goal half reports to the slot", /slot\.presentGoal\(agentId,/.test(pill) && /slot\.attach\("goal"/.test(pill));
   assert("the jobs half reports to the slot", /slot\.presentJobs\(agentId,/.test(jobs) && /slot\.attach\("jobs"/.test(jobs));
   assert("the jobs half reports its own visibility unchanged", /visible: presentation\.visible,\s*live: presentation\.label\.kind === "live"/.test(jobs));
+  assert("T12: the jobs half takes its label and row label from jobsPillCopy",
+    /const \{ label, rowLabel \} = jobsPillCopy\(presentation, text\);/.test(code(jobs)) && /\blabel,\s*rowLabel,/.test(code(jobs)));
+  assert("T12: the switch row names the jobs by their row label", (code(pill).match(/jobs\?\.rowLabel \?\? text\.jobs\.title/g) ?? []).length === 2 && !/jobs\?\.label\b/.test(code(pill)));
+  assert("T12: the panel reports its view to the slot and clears it on unmount",
+    /slot\.panelView\(agentId, view\);\s*\}, \[view\]\)/.test(pill) && /useEffect\(\(\) => \(\) => slot\.panelView\(agentId, undefined\), \[\]\)/.test(pill));
   assert("the client entry creates one slot and hands it to both halves",
     /createGoalJobsPluginSlot\(client\)/.test(index) && /contributeJobsPill\(client, goalJobsSlot\)/.test(index) && /contributeGoalPill\(client, goalJobsSlot\)/.test(index));
   assert("the panel switches views with its own state, not through the registration",

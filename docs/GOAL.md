@@ -85,17 +85,18 @@ Paseo 0.14.0。
 压成纯图标，所以目标与后台合用**一个** composer 注册（`client/goal-jobs-slot.ts`，id **`dsh-goal-jobs`**，
 每个 agent 一颗），团队 pill 不变、单独一格；本插件一行最多占两格。这一格显示哪一半：
 
-| 目标 | 后台（有 running/stopping） | 显示 |
+| 目标 | 后台（有 running/stopping，或 registry 读不到） | 显示 |
 |---|---|---|
-| 无 / 已清除 / 完成且已看过 | 有 | 后台：转环角标 + `SquareTerminal`，「N 个后台」，title「后台任务」 |
-| 有 | 无 | 目标 |
-| 需要处理（blocked、paused、active+disarmed、complete 未看过） | 有 | 目标 |
-| active + armed | 有 | 后台 |
+| 有（任何可见状态：进行中、受阻、暂停、未在续跑、完成未看过） | 有或无 | **目标** |
+| 无 / 已清除 / 完成且已看过 | 有 | 后台：`SquareTerminal` + 右下角转环，文字只写「后台」，title「后台任务」 |
 | 无 | 无 | 隐藏 |
 
-**后台的语义一行不改**：仍由 `jobsPillPresentation` 判定，只有 running/stopping 才算「有后台」，跑完即不再
-占这一格（registry 读不到时仍显示后台以便面板说明原因，但它不抢正在跑的目标）。判定是纯函数
-`goalJobsSlotShown`；「需要处理」是 `goalNeedsAttention`（目标 pill 的 label 键不是 `running`）。
+**T12（2026-11-05 用户决定）：两者都有时一律显示目标**，不再看目标是否需要处理、后台是否在跑；后台从目标视图
+顶部的「N 个后台」切换行进入。**后台 pill 的文字在任何显示状态下都只写「后台」/「Background」**（运行中、
+停止中、registry 读不到都一样，`jobsPillCopy` 的 `label`），数量只出现在面板里（切换行用 `rowLabel` =
+`liveLabel(N)`）；图标与转环不变。**后台的可见性一行不改**：仍由 `jobsPillPresentation` 判定，只有
+running/stopping 才算「有后台」，跑完即不再占这一格（registry 读不到时仍显示后台以便面板说明原因）。判定是纯函数
+`goalJobsSlotShown`。
 
 **面板只有一个、身份不变。** 注册时 `behavior` 设为一个固定的 popover 组件（`makeGoalJobsPopover`），之后
 `update` 只带 `visible`/`label`/`title`/`icon`，**绝不带 `behavior`**：宿主在 patch 带 `behavior`、或隐藏/禁用
@@ -105,8 +106,14 @@ Paseo 0.14.0。
 （终端图标 + 角标环），后台视图顶部是「鲸鱼 + 目标单行 + 状态行」；点它在面板内切换，切过去的视图顶部那行
 变成带 `ChevronLeft` 的「返回，…」。目标的编辑页与清除确认页打开时不画「N 个后台」行（点它会卸载目标正文、静默丢掉草稿或确认状态）；
 保存、取消或清除完成回到目标主页面后它再出现。目标正文经 React context（`GoalModeReport`）把当前页报给面板。后台视图顶部的目标行不受影响。两半的正文就是原来的 `makeGoalPopover`（编辑页、确认页、`close()` 去向不变）
-与 `makeJobsPopover`。面板打开期间状态翻转（例如后台跑完、目标受阻）只更新 pill 的 label/icon/title，不关面板、
-不自动切视图；当前视图那一半没了（后台全部跑完）才回落到另一半。完成态「已读」在**整个面板关闭时**记，并且
+与 `makeJobsPopover`。面板打开期间状态翻转（例如后台跑完、目标受阻）只更新 pill 的 label/icon，不关面板、
+不自动切视图；当前视图那一半没了（后台全部跑完）才回落到另一半。
+
+**title 跟着面板视图走（T12）。** 手机 sheet 的标题就是按钮的 `title`（Paseo 0.15.0 `plugins/buttons/view.tsx:339`
+`sheetTitle={button.title}`），所以面板把当前视图报给协调器（`slot.panelView`）：切到后台视图 → title「后台任务」，
+切回目标视图 → 「目标」，面板卸载（宿主关掉它）→ 回到这一格当前显示那一半的 title。这只是一次只带 `title` 的
+`update`：宿主只在隐藏、禁用或换 `behavior` 时关面板（`model.ts:126`），改 title 不关。label 与 icon 仍是这一格
+显示的那一半，不随面板视图变。完成态「已读」在**整个面板关闭时**记，并且
 只有目标视图真的出现过才算（只挂载当前视图，切到后台视图时目标正文也会卸载，不能拿它当「关闭」）。
 
 目标那一半的规则如下。**label 与 title 在所有

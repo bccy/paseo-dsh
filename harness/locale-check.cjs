@@ -232,7 +232,7 @@ console.log("the jobs pill's copy is covered in both languages");
   // Every key the interface declares must be present in both, and the two key
   // sets must match — a key added to one language only is the drift this catches.
   equal("jobs keys match", Object.keys(en).sort(), Object.keys(zh).sort());
-  for (const key of ["liveLabel", "title", "statuses", "allSettled", "settledLabel", "unavailable"]) {
+  for (const key of ["pillLabel", "liveLabel", "title", "statuses", "allSettled", "settledLabel", "unavailable"]) {
     check(`jobs.${key} exists in both languages`, en[key] !== undefined && zh[key] !== undefined);
   }
   // CJ-01 route 2: the pill is a live indicator and `liveLabel` is its only
@@ -240,7 +240,12 @@ console.log("the jobs pill's copy is covered in both languages");
   // history-visible regression added, so its absence is asserted per language.
   check("jobs has no idleLabel (en)", !("idleLabel" in en));
   check("jobs has no idleLabel (zh-CN)", !("idleLabel" in zh));
-  // The count's wording is product copy: "N background" / "N 个后台", no noun.
+  // T12 (user 2026-11-05): the composer pill says only 「后台」/「Background」,
+  // in every state; no count, no status word.
+  check("jobs.pillLabel is `Background` (en)", en.pillLabel === "Background", JSON.stringify(en.pillLabel));
+  check("jobs.pillLabel is `后台` (zh-CN)", zh.pillLabel === "后台", JSON.stringify(zh.pillLabel));
+  check("jobs.pillLabel carries no digit in either language", !/\d/.test(en.pillLabel) && !/\d/.test(zh.pillLabel));
+  // The count's wording (the panel's switch row) is product copy: "N background" / "N 个后台", no noun.
   // Asserted verbatim, including the singular, because a pluralised "jobs" or a
   // restored "任务" would silently drift from the agreed label.
   check("jobs.liveLabel(1) is `1 background` (en)", en.liveLabel(1) === "1 background", JSON.stringify(en.liveLabel(1)));

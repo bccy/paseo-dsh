@@ -54,7 +54,6 @@ import { DeepSeekMark } from "./deepseek-mark";
 import {
   createGoalJobsSlot,
   goalJobsSlotView,
-  goalNeedsAttention,
   type GoalJobsSlot,
   type SlotKind,
   type SlotSnapshot,
@@ -406,7 +405,8 @@ type SlotHoverState = PressableStateCallbackType & { hovered?: boolean };
  * in place. Drawn only when the other half is present.
  *
  * - In the goal view it is the jobs row: the jobs trigger's own mark (terminal
- *   glyph, ring on its corner while live) and label 「N 个后台」.
+ *   glyph, ring on its corner while live) and the jobs' row label 「N 个后台」
+ *   (the trigger itself only says 「后台」, T12).
  * - In the jobs view it is the goal row: the whale, the objective on one line,
  *   and the goal's facts line (state · round · budget).
  *
@@ -435,7 +435,7 @@ function SlotSwitchRow({
   const jobs = snapshot.jobs?.state;
   const name =
     target === "jobs"
-      ? (jobs?.label ?? text.jobs.title)
+      ? (jobs?.rowLabel ?? text.jobs.title)
       : goal === null
         ? text.goal.title
         : text.goal.rowLabel(goalStateName(goal, text.goal), goal.objective);
@@ -467,7 +467,7 @@ function SlotSwitchRow({
                 )}
               </View>
               <Text numberOfLines={1} style={{ ...rowTextColumn(), fontSize: TITLE_FONT_SIZE, color: theme.colors.foreground }}>
-                {jobs?.label ?? text.jobs.title}
+                {jobs?.rowLabel ?? text.jobs.title}
               </Text>
             </>
           ) : (
@@ -552,6 +552,13 @@ export function makeGoalJobsPopover(slot: GoalJobsPluginSlot, agentId: string) {
     const goalShown = useRef<GoalState | null | undefined>(undefined);
     if (view === "goal" && snapshot?.goal !== undefined) goalShown.current = snapshot.goal.state?.goal ?? null;
     useEffect(() => () => slot.panelClosed(agentId, goalShown.current), []);
+    // T12: the title is the phone sheet's header, so it follows the view on
+    // screen; on unmount (the host closed the panel) it goes back to the half
+    // the trigger shows. A title-only update never closes the surface.
+    useEffect(() => {
+      slot.panelView(agentId, view);
+    }, [view]);
+    useEffect(() => () => slot.panelView(agentId, undefined), []);
 
     const half = view === "goal" ? snapshot?.goal : snapshot?.jobs;
     const other: SlotKind = view === "goal" ? "jobs" : "goal";
@@ -670,7 +677,6 @@ export function contributeGoalPill(client: PluginClientContext, slot: GoalJobsPl
     const { label, title } = goalPillCopy(presentation, text);
     slot.presentGoal(agentId, {
       visible: presentation.visible,
-      attention: goalNeedsAttention(presentation),
       goal: next.goal,
       label,
       title,
