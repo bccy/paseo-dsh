@@ -55,7 +55,7 @@
  * @module paseo-dsh/lib/doctor
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
@@ -147,6 +147,39 @@ function statMode(path) {
   } catch {
     return undefined;
   }
+}
+
+/** Whether a path exists, including a dangling symlink (`existsSync` follows links). */
+function pathExists(path) {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The bridge package directories DSH resolves, in DSH's own order.
+ *
+ * `resolveBundleDir()` in `dsh-app-boot` resolves a profile bundle from the
+ * installation first, then from `createRequire(<profile>/package.json)`, which
+ * is Node's lookup order: `<profile>/node_modules`, then the parent's
+ * `node_modules`. `bootstrap.ts` provisions the shared anchor because pnpm owns
+ * the profile's own `node_modules` and moved the undeclared bridge into
+ * `.ignored` on every `dsh plugin` command; the profile-local path is still
+ * checked first because a pre-migration install has the bridge there, and DSH
+ * resolves that copy before the shared one.
+ *
+ * @param profileDir - absolute profile directory.
+ * @param dshHome - absolute `$DSH_HOME`.
+ * @returns {{ local: string, shared: string }}
+ */
+function bridgeLocations(profileDir, dshHome) {
+  return {
+    local: join(profileDir, "node_modules", BRIDGE_PACKAGE),
+    shared: join(dshHome, "profiles", "node_modules", BRIDGE_PACKAGE),
+  };
 }
 
 /**
@@ -738,7 +771,22 @@ export function runDoctor() {
   if (profileBundle.ok) report("ok", `profile loads the ${BRIDGE_PACKAGE} bundle`);
   else report("fail", profileBundle.label, profileBundle.detail);
 
-  const bridgeDir = join(profileDir, "node_modules", BRIDGE_PACKAGE);
+  const bridge = bridgeLocations(profileDir, dshHome);
+  const localBridge = pathExists(bridge.local);
+  const sharedBridge = pathExists(bridge.shared);
+  const bridgeDir = localBridge ? bridge.local : bridge.shared;
+  if (localBridge && sharedBridge) {
+    // Both copies exist, and DSH resolves the profile-local one first, so the
+    // shared generation the plugin just wrote is not what boots. That is the
+    // state a failed migration or a manual copy leaves behind; naming it keeps
+    // doctor from reporting the provisioned copy while DSH loads the stale one.
+    report(
+      "warn",
+      "a legacy bridge copy shadows the provisioned one",
+      `${bridge.local} is resolved before ${bridge.shared}, so DSH loads the legacy copy. ` +
+        `Restart the Paseo daemon (the plugin moves it to the shared anchor on load) or delete ${bridge.local}.`,
+    );
+  }
   // Every file the plugin writes, not just the entry. `lib/index.js` exists in a
   // bridge missing `lib/child-anchors.js` and still fails to load, and that is
   // exactly the case this check used to call `ok` (see loadBridgeFileList).

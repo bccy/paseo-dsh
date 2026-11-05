@@ -212,10 +212,25 @@
   `DSH_PACKAGES_DIR` 可覆盖安装目录。
 - `harness/bridge-assets-check.mjs` — `server/bridge-assets.ts` 必须与 `dsh-bridge/` 和
   `templates/` 逐字节一致（只读，不起进程）。**改桥后先跑它、再跑任何插件级脚本。**
-- `harness/bootstrap-check.mjs` — 桥安装/替换的 verify-before-switch：暂存目录逐文件写后
-  **回读 size + SHA-256** 校验、失败不发布、旧代际保留、失败日志必须明确 NOT ready（不能把
-  "没装成"说成 "profile ready"）。**动了 `paseo-plugin/server/bootstrap.ts` 的桥安装/替换、
-  `index.server.ts` 的 provisioning 日志、或 `bridge-assets.ts` 的 `BRIDGE_FILES` 结构必跑。**
+- `harness/bootstrap-check.mjs` — 桥安装/替换的 verify-before-switch（**27 条**）：暂存目录逐文件
+  写后**回读 size + SHA-256** 校验、失败不发布、旧代际保留、失败日志必须明确 NOT ready（不能把
+  "没装成"说成 "profile ready"）；桥发布在 `$DSH_HOME/profiles/node_modules/dsh-paseo-bridge`
+  （profile 的 `node_modules` 归 pnpm 管，见下一条），且旧位置的桥（真目录或 install.sh 的符号
+  链接，只删链接不动 checkout）与 pnpm 停在 `.ignored/` 的副本（`dsh-paseo-bridge` /
+  `_<n>`）会被迁移掉，别的包的 `.ignored` 副本与**本桥自己的 `dsh-paseo-bridge.bak-*` 备份
+  保留且逐字节不变**（清理正则只认 pnpm 命名；把正则放宽成 `(?:[._].*)?` 时这条断言会红——这是
+  P3-1 的回归门）。**动了 `paseo-plugin/server/bootstrap.ts` 的桥安装/替换/迁移/`.ignored`
+  清理、`index.server.ts` 的 provisioning 日志、或 `bridge-assets.ts` 的 `BRIDGE_FILES` 结构必跑。**
+- `harness/pnpm-bridge-check.mjs` — **pnpm 不能把桥拿走**（一次性 `mkdtemp` `DSH_HOME`，真
+  `dsh` + 真 pnpm；不改真实 `~/.dsh`，不需要网络）：bootstrap 之后用真
+  `dsh --profile <p> --dump-config` 断言组合里有桥层（独立 oracle，不是插件自己的路径常量）→
+  跑真 `dsh plugin --profile <p> add file:<本地小包>`（pnpm 12 在 `nodeLinker: hoisted` 下把
+  `<profile>/node_modules` 里未记录的目录挪进 `.ignored/`，正是这条命令让桥消失）→ 断言没有
+  `.ignored/dsh-paseo-bridge*`、桥字节不变、DSH 仍组合桥层 → 再跑 `dsh plugin install` 复验 →
+  模拟修前磁盘形态（profile 本地桥 + `.ignored` 副本）断言下一次 provisioning 迁移掉。**修前
+  13 条红、修后 20 条绿。动了 `bootstrap.ts` 的桥位置/迁移、`doctor.mjs` 的桥位置判定、
+  `pnpm-workspace.yaml` 的 linker 设置，或 DSH/pnpm 升级后必跑**（缺 `dsh` 或 pnpm 时按真实
+  错误退出，不静默跳过）。
 - `harness/doctor-check.mjs` — `paseo-plugin/lib/doctor.mjs` 的判定，驱动真实的 `runDoctor()`
   跑在沙箱 `DSH_HOME` 上：空 provider/model、缺 default-model、YAML 错、无值凭据、`refs:` 外
   凭据都必须 fail，完整配置仍通过（负向用例的对照）；桥缺 lazy 加载模块必须 fail 并**点名缺的
@@ -227,8 +242,11 @@
   旧扁平格式仍 ok 并说明会被 DSH 迁移）、**补丁能否被 DSH 应用**（补丁 `name` 写错时 dump
   告警必须让 doctor fail，干净时 ok）、**profile 就绪**（缺 `package.json`、`bundles` 不含
   `dsh-paseo-bridge` 都必须 fail，完整 profile ok）。stub `dsh` 的 `--dump-config` 用补丁里的
-  marker 注释模拟 DSH 的判定，**真实组合语义由 `harness/doctor-live-check.mjs` 覆盖**。
-  **动了 doctor 必跑。**
+  marker 注释模拟 DSH 的判定，**真实组合语义由 `harness/doctor-live-check.mjs` 覆盖**。桥位置
+  两处都判（用例 8b/8c）：桥在 `$DSH_HOME/profiles/node_modules`（bootstrap 现在发布的位置）也
+  必须报 provisioned 并点名该路径；profile 自己的 `node_modules` 里还留着一份时，因为 DSH 先
+  解析它，必须 **warn「legacy bridge copy shadows the provisioned one」** 而不是把共享那份报成
+  生效。**动了 doctor 必跑。**
 - `harness/probe-check.mjs` — `paseo-plugin/lib/probe-provider.mjs` 的退出码与泄密防护
   （200+error/HTML 判失败、4xx 回显 Authorization 不得泄 key、全 429 报 unknown、什么都没
   探测到必须非零）。**动了 probe 必跑。**
@@ -284,14 +302,27 @@
   WORKS/FAILS/TIMEOUT/CANCELED/EMPTY 且全失败必须非零、T02 `tools.mjs` initialize 与 prompt
   共用 sessionId、T03 `plugin-check` 不预过滤 assistant 行、T04 图片证据取插件发出的 prompt
   frame（模型自报的 `IMAGE-SEEN` 不再算数）、HP-08 `session-calls` 无 schema 的调用必须
-  exit 2 而不是 0、HP-05 隔离 home 的默认/opt-in 行为。纯离线，会启动真实入口脚本 + 假 peer。
+  exit 2 而不是 0、HP-05 隔离 home 的默认/opt-in 行为（克隆带共享锚点的桥、且是**真拷贝不是
+  符号链接**——链接会让克隆写回真实 home；源没有锚点时不得凭空造一个）。纯离线，会启动真实入口
+  脚本 + 假 peer；真实 `dsh --dump-config` 的组合半在 `harness/isolated-home-bridge-check.mjs`。
   **动了 `route-test.mjs` / `tools.mjs` / `session-calls.mjs` / `plugin-check.cjs` 的判据，或
   `harness-gates.cjs` / `isolated-dsh-home.cjs` 必跑。**
 - `harness/harness-gates.cjs` / `harness/isolated-dsh-home.cjs` — **不是独立检查**：前者是
   `route-test` / `tools` / `session-calls` / `plugin-check` 共用的纯判据（终态分类、退出码、
   完整时间线投影、图片块断言），后者是真实 profile/模型脚本的一次性 `DSH_HOME`（克隆源
-  profile、凭据只做 symlink、退出清理、`--allow-real-profile` opt-in）。改动它们必跑
-  `harness/harness-gates-check.mjs` 的对应段。
+  profile **与共享锚点的桥**——桥已不在 profile 目录里，只克隆 profile 会让这些脚本在无桥的
+  克隆上起 `dsh --profile`，只打印 skipping 然后静默降级；桥是真拷贝不是符号链接，避免写回
+  真实 home；源没有锚点时保持旧行为。另：凭据只做 symlink、退出清理、`--allow-real-profile`
+  opt-in）。改动它们必跑 `harness/harness-gates-check.mjs` 的对应段 +
+  `harness/isolated-home-bridge-check.mjs`。
+- `harness/isolated-home-bridge-check.mjs` — **一次性 home 克隆必须带得上桥**（真 `dsh`，
+  一次性 `mkdtemp` 源 home，不碰真实 `~/.dsh`、不耗 token）：源 home 只有共享锚点的桥（迁移后
+  形态）→ `prepareDshHome` 克隆 → 断言克隆里有桥、是真目录不是符号链接、写进克隆的桥不会落到
+  源 home、且 `dsh --profile <p> --dump-config` 组合出桥层且**无 skipping**（这是
+  route-test / stream-probe / tools / catalog / probe / rewind-e2e / rewind-merge-e2e 这些
+  「克隆后直接起 dsh、不跑 bootstrap」脚本的真实前提）；源 home 只有 profile 本地桥（迁移前
+  形态）仍克隆出可用 home；源 home 完全没有桥时不得凭空造。**修前 7 passed/5 failed，修后
+  12/0。动了 `harness/isolated-dsh-home.cjs` 或 `bootstrap.ts` 的桥位置必跑。**
 - `harness/frame-reader-check.mjs` — 插件的 stdout 分帧器（`paseo-plugin/server/frame-reader.ts`，
   共享 `dsh` 子进程的每一帧都过它）：20 MB 帧跨数千个 16 KB chunk 逐字节还原、一个 chunk 里的多帧按序到达、
   被 chunk 边界切断的帧能重组、空行被**跳过**而不是报成解析错（两者是 `#consume` 里不同的日志

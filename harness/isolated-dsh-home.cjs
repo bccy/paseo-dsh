@@ -14,7 +14,19 @@
  *      `~/.dsh/profiles/paseo`) into it — the profile is configuration, not
  *      state, and `plugin-check`'s `ensurePaseoProfile()` then rewrites the
  *      bridge **inside the copy**;
- *   3. symlink the credential files (never read or copy their bytes), so the
+ *   3. copy the bridge the plugin provisions beside the profiles
+ *      (`$DSH_HOME_SOURCE/profiles/node_modules/dsh-paseo-bridge`) when the
+ *      source has it. It lives outside the profile directory, so a profile-only
+ *      clone has no bridge at all — and the scripts that start `dsh --profile`
+ *      on the clone without running bootstrap first (`route-test`,
+ *      `stream-probe`, `tools`, `catalog`, `probe`, `rewind-e2e`,
+ *      `rewind-merge-e2e`) would boot a profile DSH composes without the bridge
+ *      layer (it only prints `skipping profile bundle "dsh-paseo-bridge"`). The
+ *      copy is dereferenced on purpose: a symlink would let the clone write
+ *      back into the user's live home. A source without the anchor (a
+ *      pre-migration install, or a home that never ran the plugin) keeps the
+ *      old behaviour;
+ *   4. symlink the credential files (never read or copy their bytes), so the
  *      route can authenticate while the secret stays in the user's own file.
  *
  * Ways to choose a home, in order:
@@ -30,6 +42,15 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+
+/**
+ * The bridge bundle `bootstrap.ts` provisions beside the profiles.
+ *
+ * It must be listed here because it is no longer inside the profile directory:
+ * cloning only `profiles/<name>` leaves the clone without a bridge, and a
+ * `dsh --profile` boot on it silently composes without the bridge layer.
+ */
+const SHARED_BRIDGE_NAME = "dsh-paseo-bridge";
 
 /** The home the clone is built from (never written). */
 function sourceHome(env = process.env) {
@@ -80,6 +101,26 @@ function prepareDshHome({ script, profile, argv = process.argv.slice(2), env = p
     dereference: false,
     force: true,
   });
+  // The bridge is outside the profile directory (see SHARED_BRIDGE_NAME). Copy
+  // it only when the source has it: a pre-migration home keeps it inside the
+  // profile and a never-provisioned home has none, and inventing one would make
+  // the clone lie about what DSH would compose. `dereference: true` here on
+  // purpose: if the source anchor is a symlink (install.sh creates one), a
+  // copied symlink would point back at the checkout and the clone's writes would
+  // land in the live home.
+  const sourceBridge = path.join(source, "profiles", "node_modules", SHARED_BRIDGE_NAME);
+  if (fs.existsSync(path.join(sourceBridge, "package.json"))) {
+    try {
+      fs.cpSync(sourceBridge, path.join(home, "profiles", "node_modules", SHARED_BRIDGE_NAME), {
+        recursive: true,
+        dereference: true,
+        force: true,
+      });
+    } catch (error) {
+      removeTree(home);
+      throw new Error(`could not copy the shared-anchor bridge into the private DSH_HOME: ${error.message}`);
+    }
+  }
   for (const name of [".credentials.yaml", ".credentials.yml", "credentials.json"]) {
     const from = path.join(source, name);
     if (!fs.existsSync(from)) continue;

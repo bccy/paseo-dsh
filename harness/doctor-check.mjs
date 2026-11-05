@@ -24,7 +24,10 @@
  *   6. a complete configuration in the real template shape (separate
  *      `llm-pi-ai` + `agent-default-model` entries) is still accepted
  *   7. a bridge missing a lazy module is a failure, not `ok`
- *   8. a complete bridge is still accepted (the control for 7)
+ *   8. a complete bridge is still accepted (the control for 7); the same bridge
+ *      at the shared anchor beside the profiles (where bootstrap.ts now
+ *      provisions it, outside pnpm's directory) is accepted too, and a leftover
+ *      profile-local copy is reported as shadowing it
  *   9. an unreadable file list is a failure, not a warning with exit 0
  *  10. a YAML syntax error is a failure even when the *plugin* ships no parser,
  *      as long as the DSH install has one — the shape of every published install
@@ -300,10 +303,20 @@ function install({
   bridge = BRIDGE_FILES,
   manifest = VALID_PROFILE_MANIFEST,
   credentialsMode = 0o600,
+  bridgeLocation = "local",
+  shadowBridge = false,
 }) {
   const home = mkdtempSync(join(WORK, "home-"));
   const profileDir = join(home, "profiles", PROFILE);
-  const bridgeDir = join(profileDir, "node_modules", "dsh-paseo-bridge");
+  const localBridgeDir = join(profileDir, "node_modules", "dsh-paseo-bridge");
+  // `bootstrap.ts` provisions the bridge at the shared anchor beside the
+  // profiles (outside the profile's pnpm-managed node_modules); a pre-migration
+  // install still has it profile-locally, which DSH resolves first.
+  const bridgeDir =
+    bridgeLocation === "shared" ? join(home, "profiles", "node_modules", "dsh-paseo-bridge") : localBridgeDir;
+  // The profile directory is no longer implied by the bridge location: at the
+  // shared anchor the bridge lives beside the profiles, not inside this one.
+  mkdirSync(profileDir, { recursive: true });
   mkdirSync(join(bridgeDir, "lib"), { recursive: true });
   // A complete bridge by default: the entry alone is what the old check accepted,
   // and an install shaped like that must be a failure now (case 7).
@@ -311,6 +324,13 @@ function install({
     const target = join(bridgeDir, relativePath);
     mkdirSync(dirname(target), { recursive: true });
     writeFileSync(target, "");
+  }
+  if (shadowBridge) {
+    for (const relativePath of bridge) {
+      const target = join(localBridgeDir, relativePath);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, "");
+    }
   }
   if (manifest !== null) writeFileSync(join(profileDir, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
   writeFileSync(join(profileDir, "cordis.patch.yml"), patch);
@@ -588,6 +608,47 @@ const check = (name, pass, detail) => {
   );
   check("and it is not reported incomplete", !run.out.includes("bridge bundle incomplete"));
   check("and it is not reported missing", !run.out.includes("bridge bundle missing"));
+}
+
+// ---- 8b. the bridge lives at the shared anchor beside the profiles --------
+// pnpm owns `<profile>/node_modules` and moved the undeclared bridge into
+// `.ignored` on every `dsh plugin` command (pnpm 12 hoisted orphan cleanup), so
+// bootstrap.ts now provisions `$DSH_HOME/profiles/node_modules/dsh-paseo-bridge`.
+// A doctor that only looked profile-locally would call that install incomplete.
+{
+  install({ patch: VALID_ROUTE, credentials: VALID_CREDENTIALS, bridgeLocation: "shared" });
+  const run = doctor();
+  check(
+    `a complete ${BRIDGE_FILES.length}-file bridge at the shared anchor reports provisioned`,
+    run.out.includes(`bridge bundle provisioned (${BRIDGE_FILES.length} files)`),
+    run.out.trim().split("\n").find((l) => l.includes("bridge bundle")) ?? "(no bridge line)",
+  );
+  check(
+    "and it names the shared anchor, not the profile-local path",
+    run.out.includes(join("profiles", "node_modules", "dsh-paseo-bridge")),
+    run.out.trim().split("\n").find((l) => l.includes("dsh-paseo-bridge")) ?? "(no path)",
+  );
+  check("and the install is not called incomplete", !run.out.includes("bridge bundle incomplete"));
+}
+
+// ---- 8c. a leftover profile-local copy shadows the provisioned one --------
+// DSH resolves the profile's own node_modules first, so both copies existing
+// means the stale one boots. Doctor has to name that instead of reporting the
+// provisioned copy as what is live.
+{
+  install({ patch: VALID_ROUTE, credentials: VALID_CREDENTIALS, bridgeLocation: "shared", shadowBridge: true });
+  const run = doctor();
+  const plain = stripAnsi(run.out);
+  check(
+    "a legacy profile-local bridge copy is reported as shadowing the provisioned one",
+    plain.includes("legacy bridge copy shadows the provisioned one"),
+    plain.trim().split("\n").find((l) => l.includes("shadows")) ?? "(no shadow line)",
+  );
+  check(
+    "and the shadowed shared copy is still reported provisioned",
+    run.out.includes(`bridge bundle provisioned (${BRIDGE_FILES.length} files)`),
+  );
+  check("and a shadow is a warning, not a blocking failure", run.code === 0, `exit ${run.code}`);
 }
 
 // ---- 9. an unreadable file list is a failure, not a warning --------------

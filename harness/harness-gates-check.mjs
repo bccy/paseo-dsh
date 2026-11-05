@@ -24,6 +24,12 @@
  *   HP-08 session-calls passed with `no schema` calls. The block builds real
  *        zstd session logs (one without `request/header`, one clean, one with an
  *        undeclared key) and asserts exit 2 / 0 / 1 respectively.
+ *   HP-05 the isolated-home helper clones the bridge the plugin provisions
+ *        beside the profiles (`$DSH_HOME/profiles/node_modules/dsh-paseo-bridge`)
+ *        as a real copy, so a `dsh --profile` boot on the clone still composes
+ *        the bridge layer; a source without the anchor keeps the old behaviour.
+ *        The composition half (real `dsh --dump-config`) is
+ *        harness/isolated-home-bridge-check.mjs.
  *
  * No real profile, model or daemon is touched. Run: node harness/harness-gates-check.mjs
  */
@@ -399,6 +405,7 @@ const result = {
   profileCopied: fs.existsSync(path.join(mode.home, 'profiles', 'paseo', 'cordis.patch.yml')),
   credentialsLinked: fs.lstatSync(path.join(mode.home, '.credentials.yaml')).isSymbolicLink() === true,
   credentialsTarget: fs.readlinkSync(path.join(mode.home, '.credentials.yaml')),
+  sharedBridgeAbsent: !fs.existsSync(path.join(mode.home, 'profiles', 'node_modules', 'dsh-paseo-bridge')),
 };
 mode.cleanup();
 result.removedAfterCleanup = !fs.existsSync(result.home);
@@ -428,6 +435,61 @@ check(
   `target=${isolate.credentialsTarget}`,
 );
 check('the throwaway home is removed by cleanup()', isolate.removedAfterCleanup === true);
+check(
+  'a source home without the shared anchor clones without inventing a bridge',
+  isolate.sharedBridgeAbsent === true,
+);
+
+// The plugin provisions the bridge beside the profiles now (pnpm owns the
+// profile's own node_modules), so a profile-only clone would boot a profile DSH
+// composes without the bridge layer. The helper must copy that anchor too, as a
+// real directory: a symlink would let the clone write into the live home.
+const sourceHomeWithBridge = mkdtempSync(join(scratch, 'source-home-bridge-'));
+mkdirSync(join(sourceHomeWithBridge, 'profiles', 'paseo'), { recursive: true });
+mkdirSync(join(sourceHomeWithBridge, 'profiles', 'node_modules', 'dsh-paseo-bridge'), { recursive: true });
+writeFileSync(join(sourceHomeWithBridge, 'profiles', 'paseo', 'cordis.patch.yml'), '[]\n');
+writeFileSync(
+  join(sourceHomeWithBridge, 'profiles', 'node_modules', 'dsh-paseo-bridge', 'package.json'),
+  '{"name":"dsh-paseo-bridge"}\n',
+);
+const bridgeProbe = `
+const helper = require(${JSON.stringify(isolateHelper)});
+const fs = require('node:fs');
+const path = require('node:path');
+const source = ${JSON.stringify(sourceHomeWithBridge)};
+const mode = helper.prepareDshHome({ script: 'probe', profile: 'paseo', argv: [], env: { DSH_HOME_SOURCE: source } });
+const bridge = path.join(mode.home, 'profiles', 'node_modules', 'dsh-paseo-bridge');
+const result = {
+  mode: mode.mode,
+  bridgeCopied: fs.existsSync(path.join(bridge, 'package.json')),
+  bridgeIsSymlink: fs.existsSync(bridge) ? fs.lstatSync(bridge).isSymbolicLink() : null,
+  sourceBridgeIntact: fs.existsSync(path.join(source, 'profiles', 'node_modules', 'dsh-paseo-bridge', 'package.json')),
+};
+mode.cleanup();
+process.stdout.write(JSON.stringify(result));
+`;
+const bridgeRun = spawnSync(process.execPath, ['-e', bridgeProbe], {
+  env: isolationEnv,
+  encoding: 'utf8',
+  timeout: 20000,
+});
+let bridgeClone;
+try {
+  bridgeClone = JSON.parse(bridgeRun.stdout ?? '{}');
+} catch {
+  bridgeClone = {};
+}
+check(
+  'a migrated source home clones with the shared-anchor bridge',
+  bridgeClone.mode === 'isolated' && bridgeClone.bridgeCopied === true,
+  bridgeRun.stderr?.trim() || `mode=${bridgeClone.mode}`,
+);
+check(
+  '…as a real copy, not a symlink (a link would write back into the live home)',
+  bridgeClone.bridgeIsSymlink === false,
+  `symlink=${String(bridgeClone.bridgeIsSymlink)}`,
+);
+check('…and the source home is left untouched', bridgeClone.sourceBridgeIntact === true);
 
 const allowRealProbe = `
 const helper = require(${JSON.stringify(isolateHelper)});

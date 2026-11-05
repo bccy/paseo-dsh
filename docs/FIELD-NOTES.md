@@ -3135,3 +3135,54 @@ max_goal_rounds are valid only with action edit"。
 仍带自己的工作区；删掉第一个会话的工作区后，记录的 spawn cwd 仍存在、同一个 pid 继续服务后续
 prompt。变异：把 `#acquirePoolProcess` 的 spawn cwd 改回 `options.cwd`，检查变红 4 条（退出码 1），
 复原后 13/13。
+
+## 第二十四轮：pnpm 挪走 DSH 桥——`node_modules` 归 pnpm 管，桥别放进去（2026-11-05）
+
+**症状**：每次 `dsh plugin --profile paseo add|remove|install` 之后，DSH 启动报
+`skipping profile bundle "dsh-paseo-bridge"`，桥层消失，直到 daemon 重启由插件重写才自愈。真实
+profile 的 `node_modules/.ignored/` 里累积了 18 份 `dsh-paseo-bridge*` 副本。
+
+**机理**（证据：`paseo-plugin/server/bootstrap.ts` 的 `sharedBridgeDir` 注释、
+`/tmp/paseo-dsh-orch/pnpm-bridge-evidence/`）：
+1. DSH 不内置 pnpm——`dsh plugin` 把参数转发给 PATH 上的 pnpm（`dsh/lib/bin.js:116`；
+   缺 pnpm 时 `plugin-BiveYA7h.js:94` 打印 "dsh: pnpm was not found"）。本机是 pnpm 12.11.2。
+2. pnpm 12 的 `nodeLinker: hoisted`（profile 的 `pnpm-workspace.yaml` 由 bootstrap 写成）在每次
+   install 时清理 orphan 目录：**上次安装没有记录的目录被挪进 `node_modules/.ignored/`**
+   （pnpm CHANGELOG #13676）。桥由插件写入、pnpm 没装过它 → 就是那个 orphan。
+3. DSH 解析 profile bundle 只看两个 anchor：installation，和
+   `createRequire(<profile>/package.json)`（`dsh-app-boot/lib/index.js:976,995`）。桥被挪走后
+   两个都找不到 → `skippedBundles`（`:1015-1039`）→ 启动打印 skipping（`:538`）。
+
+**候选实测**（`/tmp/paseo-dsh-orch/pnpm-bridge-evidence/02-candidates.md`，一次性 home + 真 pnpm）：
+声明 `link:` 依赖能活，但改写用户 `package.json`、pnpm 每次重写同一 `node_modules` 条目、桥的
+`peerDependencies` 让每次插件命令多一行 peer 警告；`externalDependencies` 设置**不管用**（只影响
+pnpm 放依赖的位置，不阻止 orphan 清理）；未声明的符号链接能活只是因为 pnpm 12 挪目录不挪链接
+（未文档化）。**采纳**：把桥移到 `$DSH_HOME/profiles/node_modules/dsh-paseo-bridge`——在 pnpm 的
+项目范围之外（pnpm 只管理 `<profile>/node_modules`），且是 DSH 自己的解析链会走到的地方
+（`computeProfileLayer` 的 `nativeAfter = <profileParent>/package.json`，`index.js:1326-1334,1670`）。
+
+**修法**：`bootstrap.ts` 的 `ensurePaseoProfile()` 把桥发布到共享锚点（仍是暂存+校验+原子
+rename），随后 `retireLegacyBridge()` 把 profile 本地旧桥 rename 走再删、并清掉 `.ignored/` 里
+本桥的副本（别的包的副本不动）。rename 失败要抛：调用方记一行 `NOT ready` 后照常注册 provider，此时 DSH 仍解析到 profile 本地的旧桥，doctor 会报阴影 warn（不静默，但拦不住）。
+`doctor.mjs` 按 DSH 的顺序判两处位置：profile 本地优先，两处都在时 warn「legacy bridge copy
+shadows the provisioned one」——那说明 DSH 加载的不是刚发布的那份。
+
+**检查**：新增 `harness/pnpm-bridge-check.mjs`（真 `dsh` + 真 pnpm，一次性 `mkdtemp` home，
+修前 13 条红/修后 20 条绿；核心断言是 `dsh plugin add` 之后 DSH 仍组合桥层）；`bootstrap-check`
+加迁移段；`doctor-check` 加 8b/8c（共享位置 provisioned、阴影 warn）。桥挪出 profile 还带出两个
+连带面，各补一条门：① `harness/isolated-dsh-home.cjs` 原来只克隆 `profiles/<name>`，桥搬走后
+route-test / stream-probe / tools / catalog / probe / rewind-e2e / rewind-merge-e2e 这些「克隆
+后直接起 `dsh --profile`、不跑 bootstrap」的脚本会在没有桥的克隆上跑（DSH 只打 skipping 警告，
+属静默降级）——克隆时一并**真拷贝**（不是符号链接，避免写回真实 home）`profiles/node_modules/
+dsh-paseo-bridge`，源没有时保持旧行为；`harness/isolated-home-bridge-check.mjs` 用真
+`dsh --dump-config` 钉住（修前 7 passed/5 failed，修后 12/0），`harness-gates-check.mjs` 的
+HP-05 补离线半（克隆带桥、真拷贝、源不动、无锚点不造）。② `install.sh` 原来把 checkout 链到
+`<profile>/node_modules/dsh-paseo-bridge`，那是 pnpm 的地盘、且未加载前会盖过共享锚点——改链到
+`<DSH_HOME>/profiles/node_modules/dsh-paseo-bridge`（同样 transient，插件加载时由
+`replaceBridge` 换成内嵌副本，checkout 本身不动），`--check` 提示同步。
+
+**残留/边界**：共享锚点被同一 `DSH_HOME` 下所有 profile 共用——两个不同插件版本各驱动一个
+profile 时后加载的覆盖前者（同版本写同样字节，正常部署只有一个 daemon 驱动一个 profile）。
+旧版 `install.sh` 已经在 `<profile>/node_modules` 建的符号链接仍会被下一次插件加载的
+`retireLegacyBridge()` 迁移走（与修前 bootstrap 覆盖符号链接的行为一致）。pnpm ≤11 本来没有
+orphan 清理，此改动对它们同样成立（桥不在 pnpm 范围内）。

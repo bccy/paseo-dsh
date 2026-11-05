@@ -4,9 +4,13 @@
 #
 # What it does:
 #   1. creates (or leaves alone) the DSH profile the plugin will drive
-#   2. links this checkout's bridge bundle into that profile — a convenience
-#      for the window before the plugin loads: the plugin replaces the whole
-#      directory from its embedded copy on every load
+#   2. links this checkout's bridge bundle into the shared module anchor beside
+#      the profiles (`$DSH_HOME/profiles/node_modules/dsh-paseo-bridge`) — a
+#      convenience for the window before the plugin loads: the plugin replaces
+#      it from its embedded copy on every load. It must not go inside the
+#      profile's own `node_modules`: pnpm owns that directory and moves anything
+#      it did not install into `.ignored/` on every `dsh plugin` command, and a
+#      copy left there would also shadow the anchor DSH resolves.
 #   3. installs the Paseo provider plugin
 #   4. enables plugins in Paseo's config and registers the plugin
 #
@@ -55,6 +59,10 @@ fi
 DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
 PASEO_HOME="${PASEO_HOME:-$HOME/.paseo}"
 PROFILE_DIR="$DSH_HOME/profiles/$PROFILE"
+# The bridge lives beside the profiles, not inside the profile: the profile's
+# `node_modules` belongs to pnpm (see the header).
+SHARED_MODULES_DIR="$DSH_HOME/profiles/node_modules"
+BRIDGE_LINK="$SHARED_MODULES_DIR/dsh-paseo-bridge"
 
 say()  { printf '  %s\n' "$*"; }
 head() { printf '\n== %s\n' "$*"; }
@@ -102,6 +110,7 @@ fi
 
 if [ "$CHECK_ONLY" -eq 1 ]; then
   printf '\nall prerequisites present (--check: nothing was changed)\n'
+  printf 'a real install would link the checkout bridge at %s\n' "$BRIDGE_LINK"
   printf 'a real install would write the model route to %s\n' "$PROFILE_DIR/cordis.patch.yml"
   exit 0
 fi
@@ -175,23 +184,22 @@ EOF
   say "wrote pnpm-workspace.yaml"
 fi
 
-mkdir -p "$PROFILE_DIR/node_modules"
-LINK="$PROFILE_DIR/node_modules/dsh-paseo-bridge"
+mkdir -p "$SHARED_MODULES_DIR"
 # `ln -sfn <checkout> <existing real directory>` would create a nested link
 # INSIDE that directory instead of replacing it (and the old script printed
 # "linked" anyway). Replace our own symlink; never touch a directory the plugin
 # provisioned; fail loudly if the link did not end up where we said it would.
-if [ -L "$LINK" ]; then
-  rm -f "$LINK"
+if [ -L "$BRIDGE_LINK" ]; then
+  rm -f "$BRIDGE_LINK"
 fi
-if [ -e "$LINK" ]; then
-  say "node_modules/dsh-paseo-bridge is a real directory (plugin-provisioned); leaving it alone"
+if [ -e "$BRIDGE_LINK" ]; then
+  say "profiles/node_modules/dsh-paseo-bridge is a real directory (plugin-provisioned); leaving it alone"
 else
-  ln -s "$REPO/dsh-bridge" "$LINK"
-  if [ ! -L "$LINK" ] || [ "$(readlink "$LINK")" != "$REPO/dsh-bridge" ]; then
-    die "could not link $LINK -> $REPO/dsh-bridge"
+  ln -s "$REPO/dsh-bridge" "$BRIDGE_LINK"
+  if [ ! -L "$BRIDGE_LINK" ] || [ "$(readlink "$BRIDGE_LINK")" != "$REPO/dsh-bridge" ]; then
+    die "could not link $BRIDGE_LINK -> $REPO/dsh-bridge"
   fi
-  say "linked node_modules/dsh-paseo-bridge -> $REPO/dsh-bridge (transient: the plugin replaces it from its embedded copy on load)"
+  say "linked profiles/node_modules/dsh-paseo-bridge -> $REPO/dsh-bridge (transient: the plugin replaces it from its embedded copy on load)"
 fi
 
 # The model route is the one part that differs per person, so an existing file
@@ -258,7 +266,9 @@ cat <<EOF
     5. In Paseo, pick the "DeepSeek Harness" provider.
 
   Note: the profile's bridge is provisioned by the plugin from the copy embedded
-  in paseo-plugin/server/bridge-assets.ts, not from this checkout. After editing
+  in paseo-plugin/server/bridge-assets.ts, not from this checkout; the link this
+  script makes at profiles/node_modules/dsh-paseo-bridge only covers the window
+  before the plugin loads. After editing
   dsh-bridge/, regenerate it (and commit the result):
     node $REPO/paseo-plugin/scripts/generate-bridge-assets.mjs
 
