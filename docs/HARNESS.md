@@ -142,15 +142,13 @@
   保留基线静态 mark）、间隔（可见/隐藏同为 4s、失败指数退避 8→16→30s）与抖动、首屏 `pageInfo`
   分页与过期页丢弃、终态错误码停轮询，以及**发布去重**：答案签名
   （`available`/`error`/`code`/`jobs`）未变时不 publish、首答与 `drop` 后重注册必发布、任一
-  真实变化（含 available 回真、错误文案/code 变化）仍发布。**本轮 143 条**（T12 新增 24 条：`jobsPillCopy` 在运行中/停止中/混合/九个/registry 读不到五种可见状态 × 中英，trigger label 恒为「后台」/「Background」；切换行 `rowLabel` 仍数 live、无数量时是 title）：控制器已抽到
-  `client/agent-polling.ts`（jobs 与 goal 共用），`client/jobs-polling.ts` 只剩 jobs 适配器（T10b 起 jobs 不再自己注册
-  pill，结果交给 `client/goal-jobs-slot.ts`，可见性判定本身未动，本检查条数不变）；
+  真实变化（含 available 回真、错误文案/code 变化）仍发布。**本轮 141 条**（2026-11-05 新增 22 条：`jobsPillCopy` 在运行中/停止中/混合/九个/registry 读不到五种可见状态 × 中英，pill 文字恒为「后台」/「Background」，返回值只有 `label`、不带数量）：控制器已抽到
+  `client/agent-polling.ts`（jobs 与 goal 共用），`client/jobs-polling.ts` 只剩 jobs 适配器；
   多出的 3 条**逐字钉住 jobs 的旧文案**（读失败兜底句、poll 失败日志、分页上限日志）——泛化
   不得改 jobs 用户可见文案。**动了 `client/jobs-pill.tsx` / `client/jobs-polling.ts` /
   `client/agent-polling.ts` / `client/poll-sequence.ts` / `client/locale.ts` 的 jobs 表 /
   `shared/jobs.ts` 必跑；`jobs-poll.tsconfig.json` 是它的编译配置。**
-- `harness/jobs-popover-check.cjs` — jobs popover 的几何、状态标记、JSX 接线与宿主主题数据（**222 条**；T12：pill 文字经 `jobsPillCopy`、源码里 label 不再拼 `liveLabel`（原「live count 用 live label」钉改写，+1）；T10b：触发图标钉
-  从 `JobsSpinner`/`ListChecks` 改为 `JobsPillIcon`（`SquareTerminal` + 角标环）/`SquareTerminal`，新增 2 条）；
+- `harness/jobs-popover-check.cjs` — jobs popover 的几何、状态标记、JSX 接线与宿主主题数据（**222 条**；2026-11-05：pill 文字经 `jobsPillCopy`、源码不再出现 `liveLabel`；触发图标钉从 `JobsSpinner`/`ListChecks` 改为 `JobsPillIcon`（`SquareTerminal` + 角标环）/`SquareTerminal`）；
   `HOST_APP` 指 Paseo checkout，没有就会跑完但 exit 2。**同上触发条件必跑（需 `HOST_APP`），
   跑法见文件头注释。**
 - `harness/replay-turn-check.cjs` — 重放历史的回合标识：`replayHistory()` 必须把 DSH 日志里的
@@ -660,12 +658,7 @@
   `dsh-bridge/lib/server.js` 的 `paseo/goal` 或 dispatch 必跑；改桥后先重生成内嵌桥
   （`node paseo-plugin/scripts/generate-bridge-assets.mjs`）再跑 `bridge-assets-check.mjs`，
   否则真机检查跑在旧桥上假绿。**
-- `harness/goal-pill-check.cjs` — goal pill 与行式面板的**数据层与 UI 规则**（**369 条**；T12：`goalNeedsAttention` 删除，`goalJobsSlotShown` 全表改为「有目标一律目标」（五种目标态 × 运行中/停止中/读不到/已完成/无后台，只后台才显示后台）、jobs trigger 恒为「后台」且数量变化不发 update、`panelView` 让 title 跟着面板视图（切到后台视图只发 `{title:"后台任务"}`、切回「目标」、轮询与目标变化不拉回、关闭交回显示那一半、从不带 `behavior`/不隐藏）、源码钉（`jobsPillCopy`、切换行用 `rowLabel`、面板上报视图并在卸载时清除）；T10b 新增 69 条「目标/后台共用一格」：
-  `goalNeedsAttention` 四种需处理态、`goalJobsSlotShown` 全表（只后台 / 只目标 / 需处理优先 / armed 让位给 running 与 stopping /
-  跑完的后台不占格 / registry 读不到不抢目标 / 都无隐藏）、`goalJobsSlotView` 回落、协调器对假宿主（每 agent 恰一个注册、两种挂接顺序与
-  重挂都不多注册、update 只带变化字段且**从不带 `behavior`**、两半都摘掉才 remove、已读只在整个面板关闭且目标视图出现过时记），
-  以及源码钉（两半都不再自己 `addComposerPill`、旧 id `dsh-goal`/`dsh-jobs` 已删、入口建一个 slot 交给两半、面板用自身状态切视图且不调
-  `update`/`close`）；运行时图标钉改为「`CornerRingIcon` 保留底图标」；
+- `harness/goal-pill-check.cjs` — goal pill 与行式面板的**数据层与 UI 规则**（**275 条**；2026-11-05：运行时图标钉改为「`CornerRingIcon` 保留底图标、不出现裸 `StatusRingMark`」，新增 8 条「目标与后台是两颗独立 pill」源码钉——goal 只注册 `dsh-goal`、jobs 只注册 `dsh-jobs`、各开各的 popover、关闭目标 popover 记完成态已读、入口各自 contribute、没有共用 slot 协调器且其模块已删；
   假时钟 + 假 RPC + 假目录页，不 import React/host；UI 规则都抽在 `client/goal-polling.ts` 的
   纯函数里）：契约枚举与 wire schema（`GoalState` 缺 `activation` / `id` / `revision` 必拒，时间戳仍被剥掉）、
   `goalCommandArguments` 的 DSH 语法、五态可见性/label/tone（**complete 未读可见、tone success、已读（同 `id:revision`）隐藏、
@@ -694,11 +687,7 @@
   `client/goal-pill.tsx`、`client/goal-running.tsx`、`client/deepseek-mark*.tsx`、
   `client/agent-polling.ts`、`shared/goal.ts` 或 `client/locale.ts` 的 goal 表必跑；改共享轮询器时
   `jobs-poll-check.cjs` 必须同时全绿且断言数不减。**
-- `harness/goal-popover-render-check.cjs` — 面板的**渲染行为**（**247 条**；T12 新增：两者都有时打开在目标视图且 title「目标」、点「1 个后台」切到后台视图只发一次 `{title:"后台任务"}`、切回/再切 title 跟随、打开期间目标受阻与后台轮询不改 title 也不发带数量的 label、后台跑完回落时 title 回「目标」、面板卸载交回「目标」、只有后台时 label「后台」title「后台任务」；**图标水平居中**：从宿主 `view.tsx` 读出图标盒宽（16）与 composer 图标尺寸（14），团队运行/空闲、目标、后台四种图标的 glyph 中心与盒中心偏差 ≤0.5px；T10c 新增 17 条：目标编辑页与清除确认页不画「N 个后台」行、回主页面（取消/清除完成/正文重挂）后再出现、编辑时草稿保留；T10b 新增 54 条：真实 `makeGoalJobsPopover` + 真实协调器 +
-  真实目标容器与后台正文——打开取 pill 当前那一半、后台视图顶部目标行（鲸鱼/单行目标/状态行/读屏名）、点切换行就地换视图且**不调
-  `close()`、不发 update**、返回行「返回，1 个后台」带终端图标与角标环、打开期间目标受阻不关面板不切视图、后台跑完回落到目标视图、
-  目标需处理时打开在目标视图、面板内编辑页「取消」仍 `close()`；`CornerRingIcon`/`JobsPillIcon`/真实目标图标：运行时底图标仍在、
-  角环 9px 右下 -1、外框恒等于 size、角环绝对定位）：用 esbuild 现编真实
+- `harness/goal-popover-render-check.cjs` — 面板的**渲染行为**（**218 条**；2026-11-05 新增：真实 `contributeGoalPill` + `contributeJobsPill` 对假宿主——一个 agent 恰两个注册 `dsh-goal`/`dsh-jobs`、各自 popover、update 不带 behavior、两者同时可见、后台文字恒为「后台」且任何 patch 不含数字、后台跑完只隐藏后台不碰目标、registry 读不到显示静态 `SquareTerminal`、目标清除只隐藏目标、后台 popover 不画目标行、关闭完成态目标 popover 即已读、dispose 移除两个注册；`CornerRingIcon`/`JobsPillIcon`/真实目标图标：运行时底图标仍在、角环 9px 右下 -1、外框恒等于 size、角环绝对定位、四种图标 glyph 中心与宿主 16px 图标盒中心偏差 ≤0.5px）：用 esbuild 现编真实
   `GoalPopoverBody`，经 `react-native-web` 渲染进 jsdom（宿主 UI kit 的 `Icon`/`TextInput` 用小桩
   代替：lucide 真 glyph、内联 SVG、react-native-web 真输入框；文案用真实 zh-CN 表）。断言：目标行是
   面板唯一的编辑入口、两个行尾图标按钮不打开编辑、运行时鲸鱼角上出环、**编辑页是小号 composer**
@@ -772,8 +761,7 @@
   其它抛错与形状不符 → `rpc_failed`（不清空成空看板）；DSH 字段原样；**`running`**：空闲根的 Lead 为 false、未托管队员无此键、
   托管中队员回合未结束为 true、已结束为 false、失败成员无此键。编译同 `goal-server-check`（`.dbg` + 拷入本脚本与
   `fake-dsh-bridge.mjs`）。**动了 `server/{dsh-process,session,provider}.ts` 的 team 部分、`shared/team.ts` 或假桥 `team` 模式必跑。**
-- `harness/team-pill-check.cjs` — `client/team-polling.ts` 纯规则（**125 条**；T10b：pill 图标改为 `Users` + 角标环的 4 条源码钉——三种状态都经
-  `CornerRingIcon` 画 `Users`、只有运行态开环、不再出现裸 `StatusRingMark`、可见性仍经 `teamPillVisible`；入口钉改为「jobs/goal 经共用 slot 注册」）：可见性（按队员数而非行数：只有 Lead 无任务隐藏、无 Lead 行有队员可见）、成员标题行 chip（顺序、0 不出、运行态缺失不出运行中/已停止、计数只数队员（运行中的 Lead 不算运行中）、Lead 空闲不算已停止、四档降级顺序与选档、各档保留失败与运行中且带字）、负责人标记（运行环 / 已停止只来自 `running` true/false，缺失不标，已完成不标）与「N 个负责人已停止」计数、pill 图标
+- `harness/team-pill-check.cjs` — `client/team-polling.ts` 纯规则（**125 条**；pill 图标改为 `Users` + 角标环的 4 条源码钉——三种状态都经 `CornerRingIcon` 画 `Users`、只有运行态开环、不再出现裸 `StatusRingMark`、可见性仍经 `teamPillVisible`）：可见性（按队员数而非行数：只有 Lead 无任务隐藏、无 Lead 行有队员可见）、成员标题行 chip（顺序、0 不出、运行态缺失不出运行中/已停止、计数只数队员（运行中的 Lead 不算运行中）、Lead 空闲不算已停止、四档降级顺序与选档、各档保留失败与运行中且带字）、负责人标记（运行环 / 已停止只来自 `running` true/false，缺失不标，已完成不标）与「N 个负责人已停止」计数、pill 图标
   （只有 `running:true` 才转环、failure/失败成员红）、成员词（无 `running` 时中英都不说运行中/空闲）与排序、任务标记只认 DSH 的
   `ready`、B 分组顺序（被阻塞任务不进可开始）、facts 行、详情字段、重叠警告翻译（未知原样）、契约码、poller 适配（终态移除、
   瞬态保留上次看板）、pill 接线源码钉（label/title 是名词、无计数）。运行：`cd paseo-plugin && npx tsc -p ../harness/team-pill.tsconfig.json`，
@@ -785,7 +773,7 @@
 - `harness/tool-call-check.cjs` 团队段（399 → **443**）：`team_task_get/create/update/list` 字段卡、update 动作词（未知原样）、
   list 计数与筛选词、`nextCursor`；**任何形状不符都保留原始 JSON**（非 JSON、多键、少键、deleted、列表坏项、列表多键）；
   失败行不画卡，已知 DSH 原文中文进 `errorShort`/`errorHint`、原文保留在 `error`，未知句不翻、非团队工具不过团队表、英文不翻。
-- `harness/locale-check.cjs` 团队段（505 → **661**，L2 的 `toolCards` 段再 +46 → **707**，T12 `jobs.pillLabel` 再 +4 → **711**）：`team` 表中英键一致、非空、不互抄；成员词与分组词逐字；未知成员词不是运行中/空闲；`toolCards` 同口径（字符串叶子键集/非空/不互抄、6 个 formatter 键一致且中英不同、状态词与回执句逐字）；
+- `harness/locale-check.cjs` 团队段（505 → **661**，L2 的 `toolCards` 段再 +46 → **707**，2026-11-05 jobs 表：+`pillLabel` 3 条、删 `liveLabel` 并断言其不存在，净 −1 → **706**）：`team` 表中英键一致、非空、不互抄；成员词与分组词逐字；未知成员词不是运行中/空闲；`toolCards` 同口径（字符串叶子键集/非空/不互抄、6 个 formatter 键一致且中英不同、状态词与回执句逐字）；
   拒绝句译文表（含 `Error:` 前缀、未知原样）；**读本机 `dsh-experimental-agent-team/lib/index.js` 的每个 `TeamError` 字面量，实例化变量后确认都有中文**
   （找不到包时 NOTE，`DSH_AGENT_TEAM` 可覆盖路径）。
 

@@ -105,25 +105,22 @@ export interface PillPresentation {
 }
 
 /**
- * The jobs half's words for one presentation (T12).
+ * The jobs pill's label for one presentation.
  *
- * - `label` (the composer trigger) is the bare noun 「后台」/「Background」 in
- *   **every** visible state — running, stopping, an unreadable registry: the
- *   user decided (2026-11-05) that the pill never carries a count or a status
- *   word. The ring on the icon says it is working; the panel says how many.
- * - `rowLabel` names the goal view's switch row inside the panel: the live
- *   count (「N 个后台」), or the neutral title when there is none.
+ * The composer trigger reads the bare noun 「后台」/「Background」 in **every**
+ * visible state — running, stopping, an unreadable registry: the user decided
+ * (2026-11-05) that the pill never carries a count or a status word. The ring
+ * on the icon says it is working; the popover says how many. The presentation
+ * is taken so the rule is stated (and checked) per presentation; by design the
+ * label does not read it.
  *
  * The text is passed in (structurally) so this module keeps no locale import.
  */
 export function jobsPillCopy(
-  presentation: { readonly label: PillLabel },
-  text: { readonly pillLabel: string; readonly liveLabel: (count: number) => string; readonly title: string },
-): { label: string; rowLabel: string } {
-  return {
-    label: text.pillLabel,
-    rowLabel: presentation.label.kind === "live" ? text.liveLabel(presentation.label.count) : text.title,
-  };
+  _presentation: { readonly label: PillLabel },
+  text: { readonly pillLabel: string },
+): { label: string } {
+  return { label: text.pillLabel };
 }
 
 /**

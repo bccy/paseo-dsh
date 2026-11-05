@@ -641,9 +641,9 @@ console.log("\nthe trigger and popover wiring");
   // pins that the registration uses that rule rather than its own copy.
   assert("the trigger's strings come from goalPillCopy", /const \{ label, title \} = goalPillCopy\(presentation, text\)/.test(pill));
   assert("the trigger's title is not the objective", !/title:.*goal\.objective/.test(pill));
-  // The pill's icon slot (T10b): the glyph always stays; running adds the
-  // corner ring (`client/corner-ring.tsx`) instead of replacing the glyph. The
-  // rendered half (glyph present, ring on the corner) is in
+  // The pill's icon slot: the glyph always stays; running adds the corner ring
+  // (`client/corner-ring.tsx`) instead of replacing the glyph. The rendered
+  // half (glyph present, ring on the corner) is in
   // `harness/goal-popover-render-check.cjs`.
   assert(
     "the trigger's icon keeps its glyph and puts the ring on the corner while running",
@@ -677,239 +677,35 @@ console.log("\nthe trigger and popover wiring");
   assert("the mark renders through the host's svg icon", /icon=\{\{ svg: DEEPSEEK_MARK_SVG \}\}/.test(mark));
 }
 
-/* The goal/jobs slot (T10b) ------------------------------------------------- */
+/* The goal and the jobs are two separate pills ------------------------------ */
 
-console.log("\nthe goal and the jobs share one slot (T10b)");
+console.log("\nthe goal and the jobs are two separate composer pills");
 {
-  const {
-    GOAL_JOBS_SLOT_ID,
-    createGoalJobsSlot,
-    goalJobsSlotShown,
-    goalJobsSlotView,
-  } = require("./client/goal-jobs-slot.js");
-  const { jobsPillPresentation } = require("./client/jobs-polling.js");
-
-  // The two halves' real rules, so the slot is tested on what they report.
-  const goalSide = (g, seen) => {
-    const p = goalPillPresentation({ available: true, goal: g }, seen);
-    return { visible: p.visible };
-  };
-  const jobsSide = (answer) => {
-    const p = jobsPillPresentation(answer);
-    return { visible: p.visible, live: p.label.kind === "live" };
-  };
-  const running = { available: true, jobs: [{ status: "running" }, { status: "completed" }] };
-  const stopping = { available: true, jobs: [{ status: "stopping" }] };
-  const finished = { available: true, jobs: [{ status: "completed" }, { status: "failed" }, { status: "killed" }] };
-  const none = { available: true, jobs: [] };
-
-  // T12 (user 2026-11-05): whenever a goal exists the slot shows the goal —
-  // armed and running, needing the user or complete, whatever the jobs do.
-  // Only jobs and no goal shows the jobs.
-  const goalStates = [
-    ["armed active", goal()],
-    ["blocked", goal({ phase: "blocked" })],
-    ["paused", goal({ phase: "paused" })],
-    ["active+disarmed", goal({ activation: "disarmed" })],
-    ["complete, unseen", goal({ phase: "complete", activation: "disarmed" })],
-  ];
-  const unreadable = { available: false, jobs: [] };
-  for (const [what, g] of goalStates) {
-    for (const [jobsWhat, answer] of [["running", running], ["stopping", stopping], ["unreadable", unreadable], ["finished", finished], ["no", none]]) {
-      check(`${what} goal + ${jobsWhat} jobs: the slot shows the goal`, goalJobsSlotShown(goalSide(g), jobsSide(answer)), "goal");
-    }
-    check(`${what} goal alone (jobs never reported): goal`, goalJobsSlotShown(goalSide(g), undefined), "goal");
-  }
-
-  // Only jobs.
-  check("only running jobs: jobs", goalJobsSlotShown(undefined, jobsSide(running)), "jobs");
-  check("only stopping jobs: jobs", goalJobsSlotShown(undefined, jobsSide(stopping)), "jobs");
-  check("cleared goal + running jobs: jobs", goalJobsSlotShown(goalSide(null), jobsSide(running)), "jobs");
-  const seenKey = goalSeenKey(goal({ phase: "complete" }));
-  check("seen complete goal (hidden) + running jobs: jobs",
-    goalJobsSlotShown(goalSide(goal({ phase: "complete", activation: "disarmed" }), seenKey), jobsSide(running)), "jobs");
-  // The jobs' own semantics are unchanged: finished work never holds the slot.
-  check("finished jobs only: hidden", goalJobsSlotShown(goalSide(null), jobsSide(finished)), null);
-  check("nothing at all: hidden", goalJobsSlotShown(goalSide(null), jobsSide(none)), null);
-  check("neither half reported: hidden", goalJobsSlotShown(undefined, undefined), null);
-  // An unreadable registry stays visible (baseline) so the panel can explain it.
-  check("unreadable registry alone: jobs (the panel explains it)", goalJobsSlotShown(undefined, jobsSide(unreadable)), "jobs");
-
-  // The open panel's view: stays put, falls back only when its half vanished.
-  check("goal view stays while the goal exists", goalJobsSlotView("goal", true, false), "goal");
-  check("jobs view stays while jobs run", goalJobsSlotView("jobs", true, true), "jobs");
-  check("jobs finished while the jobs view is open: falls back to the goal", goalJobsSlotView("jobs", true, false), "goal");
-  check("goal cleared while the goal view is open: falls back to the jobs", goalJobsSlotView("goal", false, true), "jobs");
-  check("both gone: the view is kept (the host hides the button)", goalJobsSlotView("jobs", false, false), "jobs");
-
-  // The coordinator against a fake host: one registration per agent, never a
-  // behavior in an update, only changed fields sent.
-  const regs = [];
-  const fakeHost = {
-    addComposerPill(contribution) {
-      const reg = { contribution, updates: [], removed: 0 };
-      reg.update = (patch) => reg.updates.push(patch);
-      reg.remove = () => {
-        reg.removed += 1;
-      };
-      regs.push(reg);
-      return reg;
-    },
-    makeContents: 0,
-    makeContent(agentId) {
-      fakeHost.makeContents += 1;
-      return `Content:${agentId}`;
-    },
-  };
-  const slot = createGoalJobsSlot(fakeHost);
-  const agent = { id: "a", workspaceId: "ws" };
-  const GoalIcon = "GoalIcon";
-  const JobsIcon = "JobsIcon";
-  slot.attach("jobs", agent, { Content: "JobsBody", icon: JobsIcon, title: "后台任务" });
-  slot.attach("goal", agent, { Content: "GoalBody", icon: GoalIcon, title: "目标" });
-  check("both halves of one agent share ONE registration", regs.length, 1);
-  check("…under the slot id", regs[0].contribution.id, GOAL_JOBS_SLOT_ID);
-  check("…registered hidden", regs[0].contribution.button.visible, false);
-  check("…with one fixed popover Content", regs[0].contribution.button.behavior.Content, "Content:a");
-  check("…built once", fakeHost.makeContents, 1);
-  // The other order too: whichever half's poller registers the agent first,
-  // the second half joins the same registration (never a second pill).
-  const ordered = createGoalJobsSlot(fakeHost);
-  const before2 = regs.length;
-  ordered.attach("goal", { id: "z", workspaceId: "ws" }, { Content: "GoalBody", icon: GoalIcon, title: "目标" });
-  ordered.attach("jobs", { id: "z", workspaceId: "ws" }, { Content: "JobsBody", icon: JobsIcon, title: "后台任务" });
-  check("goal first, then jobs: still ONE registration", regs.length - before2, 1);
-  // A half re-attaching (after a drop) does not add a pill either.
-  ordered.attach("jobs", { id: "z", workspaceId: "ws" }, { Content: "JobsBody", icon: JobsIcon, title: "后台任务" });
-  ordered.attach("goal", { id: "z", workspaceId: "ws" }, { Content: "GoalBody", icon: GoalIcon, title: "目标" });
-  check("re-attaching either half keeps ONE registration", regs.length - before2, 1);
-  ordered.dispose();
-  regs.splice(before2);
-
-  const goalState = (g, label = "目标") => ({ ...goalSide(g), goal: g, label, title: "目标", icon: GoalIcon });
-  // T12: the jobs trigger says 「后台」 in every state; the count is the row label.
-  const jobsState = (answer, count) => ({ ...jobsSide(answer), label: "后台", rowLabel: count === undefined ? "后台任务" : `${count} 个后台`, title: "后台任务", icon: JobsIcon });
-  const last = () => {
-    const merged = { visible: false, title: "后台任务", icon: JobsIcon };
-    for (const patch of regs[0].updates) Object.assign(merged, patch);
-    return merged;
-  };
-  slot.presentJobs("a", jobsState(running, 1));
-  check("only 1 running job: the trigger reads 后台", last().label, "后台");
-  check("…with the jobs icon", last().icon, JobsIcon);
-  check("…and the jobs title", last().title, "后台任务");
-  check("…visible", last().visible, true);
-  check("the snapshot says jobs", slot.snapshot("a").shown, "jobs");
-  slot.presentGoal("a", goalState(goal()));
-  check("an armed goal arrives beside the running job: the trigger flips to 目标", last().label, "目标");
-  check("…with the goal icon", last().icon, GoalIcon);
-  check("…and the goal title", last().title, "目标");
-  check("the snapshot says goal", slot.snapshot("a").shown, "goal");
-  slot.presentGoal("a", goalState(goal({ phase: "blocked" })));
-  check("the goal blocks: still 目标", last().label, "目标");
-  slot.presentJobs("a", jobsState(finished));
-  check("jobs finished beside the goal: still 目标", last().label, "目标");
-  check("…still visible", last().visible, true);
-  slot.presentGoal("a", goalState(null));
-  check("goal cleared and jobs finished: hidden", last().visible, false);
-  check("no update ever carries a behavior", regs[0].updates.every((patch) => !("behavior" in patch)), true);
-  const before = regs[0].updates.length;
-  slot.presentJobs("a", jobsState(finished));
-  slot.presentGoal("a", goalState(null));
-  check("an unchanged answer sends no update", regs[0].updates.length, before);
-  slot.presentJobs("a", jobsState(running, 2));
-  const flips = regs[0].updates.slice(before);
-  check("a flip sends only the changed fields", JSON.stringify(flips), JSON.stringify([{ visible: true, label: "后台", icon: JobsIcon, title: "后台任务" }]));
-  const beforeCount = regs[0].updates.length;
-  slot.presentJobs("a", jobsState(running, 3));
-  check("a count change sends nothing (the trigger has no count)", regs[0].updates.length, beforeCount);
-  check("…the count still reaches the switch row's label", slot.snapshot("a").jobs.state.rowLabel, "3 个后台");
-
-  // T12: the open panel's view drives the title (the phone sheet header).
-  // A title-only patch, never a behavior; closing hands the title back.
-  slot.presentGoal("a", goalState(goal()));
-  check("both present: the trigger shows the goal", last().label, "目标");
-  const beforeView = regs[0].updates.length;
-  slot.panelView("a", "goal");
-  check("opening on the goal view (the shown half) sends nothing", regs[0].updates.length, beforeView);
-  slot.panelView("a", "jobs");
-  check("switching the open panel to the jobs view retitles the sheet 后台任务",
-    JSON.stringify(regs[0].updates.slice(beforeView)), JSON.stringify([{ title: "后台任务" }]));
-  check("…the trigger's label and icon stay the goal's", `${last().label}|${last().icon}`, "目标|GoalIcon");
-  slot.panelView("a", "goal");
-  check("switching back to the goal view retitles it 目标", JSON.stringify(regs[0].updates.at(-1)), JSON.stringify({ title: "目标" }));
-  slot.panelView("a", "jobs");
-  slot.presentJobs("a", jobsState(running, 4));
-  check("a poll while the jobs view is open keeps the jobs title", last().title, "后台任务");
-  slot.presentGoal("a", goalState(goal({ phase: "blocked" }), "目标"));
-  check("…and a goal change does not pull the title back", last().title, "后台任务");
-  slot.panelView("a", undefined);
-  check("closing the panel hands the title back to the shown half (目标)", last().title, "目标");
-  check("no view or title patch ever carries a behavior", regs[0].updates.every((patch) => !("behavior" in patch)), true);
-  check("no view patch hides the pill (that would close the surface)", regs[0].updates.slice(beforeView).every((patch) => patch.visible !== false), true);
-  // Only jobs: the jobs view is the shown one, its title is already there.
-  slot.presentGoal("a", goalState(null));
-  slot.panelView("a", "jobs");
-  check("only jobs, panel on the jobs view: title 后台任务", last().title, "后台任务");
-  slot.panelView("a", undefined);
-  check("…and it stays 后台任务 after closing", last().title, "后台任务");
-  // A view whose half is gone does not own the title.
-  slot.panelView("a", "goal");
-  check("a stale goal view (no goal) leaves the title on the shown half", last().title, "后台任务");
-  slot.panelView("a", undefined);
-
-  // A second agent gets its own registration; detaching one half keeps the
-  // slot, detaching both removes it.
-  slot.attach("goal", { id: "b", workspaceId: "ws" }, { Content: "GoalBody", icon: GoalIcon, title: "目标" });
-  check("another agent gets its own slot", regs.length, 2);
-  slot.detach("goal", "a");
-  check("detaching the goal keeps the slot for the jobs", regs[0].removed, 0);
-  check("…and the snapshot has no goal half", slot.snapshot("a").goal, undefined);
-  slot.detach("jobs", "a");
-  check("detaching both halves removes the one registration", regs[0].removed, 1);
-  check("…and forgets the agent", slot.snapshot("a"), undefined);
-
-  // "Seen" waits for the whole panel to close, with the goal the goal view showed.
-  const seen = [];
-  slot.attach("goal", { id: "c", workspaceId: "ws" }, { Content: "G", icon: GoalIcon, title: "目标", onPanelClosed: (g) => seen.push(g) });
-  slot.panelClosed("c", undefined);
-  check("a panel closed without the goal view on screen records nothing", seen.length, 0);
-  const done = goal({ phase: "complete" });
-  slot.panelClosed("c", done);
-  check("a panel closed after the goal view showed reports that goal", seen[0], done);
-  slot.dispose();
-  check("dispose removes every remaining registration", regs.slice(1).every((reg) => reg.removed === 1), true);
-}
-
-/* The panel and pill wiring of the slot (source pins) ----------------------- */
-
-console.log("\nthe slot is wired as one registration with one fixed panel");
-{
+  // The shared goal/jobs slot (one registration per agent) was withdrawn on
+  // 2026-11-05: each half registers its own pill again, under its own id, from
+  // its own contribution. These pins fail if either half stops registering, if
+  // the two ids collapse into one, or if a coordinator comes back.
   const repoRoot = path.resolve(__dirname, "..", "..");
   const readRepo = (relative) => fs.readFileSync(path.join(repoRoot, relative), "utf8");
-  const pill = readRepo("paseo-plugin/client/goal-pill.tsx");
-  const jobs = readRepo("paseo-plugin/client/jobs-pill.tsx");
-  const index = readRepo("paseo-plugin/index.client.tsx");
   const code = (source) => source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
-  assert("the goal half registers no composer pill of its own", !/addComposerPill\(/.test(code(pill).replace(/addComposerPill: \(contribution\) => client\.addComposerPill\(contribution\)/, "")));
-  assert("the jobs half registers no composer pill of its own", !/addComposerPill\(/.test(code(jobs)));
-  assert("the old per-half ids are gone", !/"dsh-goal"|"dsh-jobs"/.test(code(pill) + code(jobs)));
-  assert("the goal half reports to the slot", /slot\.presentGoal\(agentId,/.test(pill) && /slot\.attach\("goal"/.test(pill));
-  assert("the jobs half reports to the slot", /slot\.presentJobs\(agentId,/.test(jobs) && /slot\.attach\("jobs"/.test(jobs));
-  assert("the jobs half reports its own visibility unchanged", /visible: presentation\.visible,\s*live: presentation\.label\.kind === "live"/.test(jobs));
-  assert("T12: the jobs half takes its label and row label from jobsPillCopy",
-    /const \{ label, rowLabel \} = jobsPillCopy\(presentation, text\);/.test(code(jobs)) && /\blabel,\s*rowLabel,/.test(code(jobs)));
-  assert("T12: the switch row names the jobs by their row label", (code(pill).match(/jobs\?\.rowLabel \?\? text\.jobs\.title/g) ?? []).length === 2 && !/jobs\?\.label\b/.test(code(pill)));
-  assert("T12: the panel reports its view to the slot and clears it on unmount",
-    /slot\.panelView\(agentId, view\);\s*\}, \[view\]\)/.test(pill) && /useEffect\(\(\) => \(\) => slot\.panelView\(agentId, undefined\), \[\]\)/.test(pill));
-  assert("the client entry creates one slot and hands it to both halves",
-    /createGoalJobsPluginSlot\(client\)/.test(index) && /contributeJobsPill\(client, goalJobsSlot\)/.test(index) && /contributeGoalPill\(client, goalJobsSlot\)/.test(index));
-  assert("the panel switches views with its own state, not through the registration",
-    /onPress=\{\(\) => setChosen\(other\)\}/.test(pill));
-  const panel = pill.slice(pill.indexOf("export function makeGoalJobsPopover"), pill.indexOf("export function createGoalJobsPluginSlot"));
-  assert("the panel never calls update or close itself", panel.length > 0 && !/\.update\(|close\(\)/.test(code(panel)));
-  assert("the completed goal's seen mark waits for the panel's own unmount",
-    /useEffect\(\(\) => \(\) => slot\.panelClosed\(agentId, goalShown\.current\), \[\]\)/.test(panel));
+  const pill = code(readRepo("paseo-plugin/client/goal-pill.tsx"));
+  const jobs = code(readRepo("paseo-plugin/client/jobs-pill.tsx"));
+  const index = code(readRepo("paseo-plugin/index.client.tsx"));
+  const idsOf = (source) => [...source.matchAll(/addComposerPill\(\{\s*id:\s*"([^"]+)"/g)].map((m) => m[1]);
+  equal("the goal pill registers exactly one pill, id dsh-goal", idsOf(pill), ["dsh-goal"]);
+  equal("the jobs pill registers exactly one pill, id dsh-jobs", idsOf(jobs), ["dsh-jobs"]);
+  assert("the goal pill opens its own goal popover", /behavior:\s*\{\s*kind:\s*"popover",\s*Content:\s*makeGoalPopover\(/.test(pill));
+  assert("the jobs pill opens its own jobs popover", /behavior:\s*\{\s*kind:\s*"popover",\s*Content:\s*makeJobsPopover\(store, agent\.id\)\s*\}/.test(jobs));
+  assert("closing the goal popover marks a completed goal seen", /\(goal\) => advanceSeen\(agent\.id, \{ kind: "closed", goal \}\)/.test(pill));
+  assert("the client entry contributes both pills on their own",
+    /contributeJobsPill\(client\),/.test(index) && /contributeGoalPill\(client\),/.test(index));
+  // Assembled from fragments so a repo-wide grep for the withdrawn names finds
+  // nothing in this file either (the pin itself is not a use).
+  const gj = ["goal", "jobs"].join("-");
+  const withdrawn = new RegExp([`${gj}-slot`, "Goal" + "JobsSlot", `dsh-${gj}`, `${gj}-switch`].join("|"));
+  assert("no shared slot coordinator is wired", !withdrawn.test(pill + jobs + index));
+  assert("the coordinator module is gone",
+    !fs.existsSync(path.join(repoRoot, `paseo-plugin/client/${gj}-slot.ts`)));
 }
 
 /* The poll cadence is the jobs pill's ---------------------------------------- */

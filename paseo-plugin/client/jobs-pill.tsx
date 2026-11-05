@@ -22,12 +22,16 @@
  *
  * @module dsh-paseo/client/jobs-pill
  */
-import type { PluginButtonContentProps, PluginClientContext } from "@getpaseo/plugin/client";
+import type {
+  PluginButtonContentProps,
+  PluginButtonRegistration,
+  PluginClientContext,
+} from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/ui";
 import { useEffect, useState } from "react";
 import { Platform, Pressable, Text, View, type PressableStateCallbackType } from "react-native";
 import { jobsList, splitJobs, type Job } from "../shared/jobs";
-import { createJobsPoller, jobsPillCopy, jobsPillPresentation, type JobsViewState } from "./jobs-polling";
+import { createJobsPoller, jobsPillCopy, jobsPillPresentation, type JobsViewState, type PillIcon } from "./jobs-polling";
 import {
   CHEVRON_BOX,
   FACTS_FONT_SIZE,
@@ -48,7 +52,6 @@ import {
   type JobStatus,
 } from "./jobs-popover-layout";
 import { JobsPillIcon, JobsSpinner } from "./jobs-spinner";
-import type { GoalJobsPluginSlot } from "./goal-pill";
 import { localeText, type JobsText } from "./locale";
 
 /** One agent's latest answer, plus the listeners the popover subscribes with. */
@@ -63,6 +66,23 @@ interface AgentJobs {
 
 /** The live answer per agent, shared by the pill's label and its popover. */
 type JobStore = Map<string, AgentJobs>;
+
+/** One agent's registered pill. Polling state lives in `./jobs-polling`. */
+interface PillEntry {
+  readonly registration: PluginButtonRegistration;
+  /**
+   * The mark the last `update` left in the icon slot.
+   *
+   * `update()` merges, so re-sending `icon` on every poll would replace the
+   * `JobsPillIcon` component with an equal-but-new element on each tick. React
+   * reconciles by element type, so that alone would not remount — but the host
+   * re-validates and republishes the button on every update, and a republish that
+   * swaps the component identity is exactly what restarts the animation from zero.
+   * Tracking the state here is what makes the icon part of `update` **only** when it
+   * actually changes, which is the one thing that guarantees the ring never stutters.
+   */
+  icon: PillIcon;
+}
 
 function publish(store: JobStore, agentId: string, next: Omit<AgentJobs, "listeners">): void {
   const previous = store.get(agentId);
@@ -362,7 +382,7 @@ function SettledHeader({
  * rule "still runs the full width of the surface", and the root already cancels
  * the host's 12 on both sides.
  */
-export function makeJobsPopover(store: JobStore, agentId: string) {
+function makeJobsPopover(store: JobStore, agentId: string) {
   function JobsPopover({ theme, layout }: PluginButtonContentProps) {
     const [entry, setEntry] = useState<AgentJobs | undefined>(store.get(agentId));
     // `undefined` means "not chosen yet": the section follows the live count
@@ -476,22 +496,19 @@ export function makeJobsPopover(store: JobStore, agentId: string) {
 const AGENT_DIRECTORY_PAGE_SIZE = 200;
 
 /**
- * Poll every agent of this provider and report its jobs to the shared
- * goal/jobs slot (T10b).
+ * Register one pill per agent of this provider and keep it current.
  *
- * This half no longer registers a composer pill: the goal and the jobs share
- * one (`./goal-jobs-slot`), which owns the registration, decides which half its
- * trigger shows, and hosts this half's popover inside one fixed panel. What
- * stays here is everything jobs-specific — the poller, the React store the
- * popover reads, the presentation rule's copy and icon.
- *
- * Returns the contribution's cleanup: every timer and the agent observation are
- * released there, and each agent's half is detached from the slot.
+ * Returns the contribution's cleanup, which Paseo calls when the plugin, the
+ * client entrypoint or the host connection goes away: every timer, every pill
+ * and the agent observation are released there. Polling itself is
+ * `createJobsPoller`; this function owns the host objects the controller cannot
+ * see — the React store the popover reads, the composer registration, and the
+ * locale.
  */
-export function contributeJobsPill(client: PluginClientContext, slot: GoalJobsPluginSlot) {
+export function contributeJobsPill(client: PluginClientContext) {
   const store: JobStore = new Map();
-  /** The agents this half is attached to the slot for. */
-  const pills = new Set<string>();
+  /** agentId -> the composer registration and its last icon state. */
+  const pills = new Map<string, PillEntry>();
   const lifetime = new AbortController();
   // Captured here and handed to the popover rather than read through a React
   // context: a popover body is rendered by the host's own tree, and depending on
@@ -501,11 +518,13 @@ export function contributeJobsPill(client: PluginClientContext, slot: GoalJobsPl
 
   /**
    * Publish one poll answer: the popover store first (its listeners redraw from
-   * it), then the slot. The visibility/label rule is
-   * {@link jobsPillPresentation}; this function only turns its keys into copy.
+   * it), then the registration. The visibility/label rule is
+   * {@link jobsPillPresentation}; this function only turns its keys into copy and
+   * keeps the icon patch conditional.
    */
   const publishState = (agentId: string, next: JobsViewState<Job>) => {
-    if (!pills.has(agentId)) return;
+    const entry = pills.get(agentId);
+    if (entry === undefined) return;
     publish(store, agentId, {
       jobs: [...next.jobs],
       available: next.available,
@@ -513,31 +532,27 @@ export function contributeJobsPill(client: PluginClientContext, slot: GoalJobsPl
     });
     const presentation = jobsPillPresentation(next);
     const text = localeText().jobs;
-    // The trigger's label is the bare noun in every visible state (T12: running,
-    // stopping, an unreadable registry alike). The live count only names the
-    // goal view's switch row; there is no idle total: the pill hides when
-    // nothing is live.
-    const { label, rowLabel } = jobsPillCopy(presentation, text);
-    // Every readable answer selects the terminal glyph with the turning ring on
-    // its corner (T10b: the glyph stays, so a pill the host shrank to its icon
-    // still reads as the jobs); the static glyph is the baseline 2f71225 branch
-    // for an unreadable registry. Both are stable identities, and the slot
-    // sends `icon` only when it changes, so the ring never restarts on a poll.
+    // The label is the bare noun 「后台」/「Background」 in every visible state
+    // (user decision 2026-11-05): no count, no status word. The ring on the icon
+    // says it is working; the popover says how many. There is no idle total:
+    // the pill hides when nothing is live.
+    const { label } = jobsPillCopy(presentation, text);
+    // `update()` merges, so the icon is sent only when the mark changes — see
+    // `PillEntry.icon`. Every readable answer selects the terminal glyph with
+    // the turning ring on its corner (the glyph stays, so a pill the host shrank
+    // to its icon still reads as the jobs); the static glyph is the baseline
+    // 2f71225 branch for an unreadable registry. `SquareTerminal`, not the old
+    // `ListChecks`: that read like the host's own task-list pill beside it.
     const icon = presentation.icon === "spinner" ? JobsPillIcon : "SquareTerminal";
+    const iconPatch = presentation.icon === entry.icon ? {} : { icon };
+    entry.icon = presentation.icon;
     /**
      * `title` is the neutral noun, **never the count**: on compact the popover is
      * a sheet and the sheet's header is drawn from the button's title, so a title
      * carrying the count would make this the one panel whose heading changes
-     * while you look at it. The count belongs on the panel's switch row.
+     * while you look at it.
      */
-    slot.presentJobs(agentId, {
-      visible: presentation.visible,
-      live: presentation.label.kind === "live",
-      label,
-      rowLabel,
-      title: text.title,
-      icon,
-    });
+    entry.registration.update({ visible: presentation.visible, label, title: text.title, ...iconPatch });
   };
 
   const poller = createJobsPoller<Job>({
@@ -554,21 +569,29 @@ export function contributeJobsPill(client: PluginClientContext, slot: GoalJobsPl
       return { entries: page.entries, pageInfo: page.pageInfo };
     },
     addAgent: (agent) => {
-      // Hidden until the first poll proves otherwise (the slot starts hidden).
-      // The ringed glyph from the start: starting on the static mark would flash
-      // it for one frame before the first answer swapped it.
-      slot.attach("jobs", agent, {
-        Content: makeJobsPopover(store, agent.id),
-        icon: JobsPillIcon,
-        title: localeText().jobs.title,
+      const registration = client.addComposerPill({
+        id: "dsh-jobs",
+        workspaceId: agent.workspaceId ?? "",
+        agentId: agent.id,
+        button: {
+          // The ringed glyph from the start: registering the static mark first
+          // would flash it for one frame before the first `update` swapped it.
+          icon: JobsPillIcon,
+          title: localeText().jobs.title,
+          // Hidden until the first poll proves otherwise: a pill that appears and
+          // then disappears is worse.
+          visible: false,
+          behavior: { kind: "popover", Content: makeJobsPopover(store, agent.id) },
+        },
       });
-      pills.add(agent.id);
+      pills.set(agent.id, { registration, icon: "spinner" });
       store.delete(agent.id);
     },
     removeAgent: (agentId, reason, error) => {
-      if (!pills.has(agentId)) return;
+      const entry = pills.get(agentId);
+      if (entry === undefined) return;
       pills.delete(agentId);
-      slot.detach("jobs", agentId);
+      entry.registration.remove();
       // Dropped rather than kept: the popover must not show a stale list for an
       // agent this client may not read, or whose runtime cannot serve jobs at all.
       store.delete(agentId);

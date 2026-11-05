@@ -2,16 +2,12 @@
  * The composer pill that shows the current DeepSeek Harness goal and lets the
  * user pause, resume, edit or clear it.
  *
- * **One slot with the jobs (T10b).** The jobs half is a live counter that
- * hides the moment nothing runs; a goal stays relevant while it exists,
- * including when it is *not* running. They used to be two registrations; on a
- * phone the host then shrank every plugin pill to a bare icon. They now share
- * one composer slot (`./goal-jobs-slot`): this module reports the goal's
- * presentation to it, and the slot decides which half the trigger shows — the
- * goal whenever it needs the user, the jobs while the goal runs on its own and
- * something is live. Both rules stay their own (`goalPillPresentation`,
- * `jobsPillPresentation`); the slot only chooses between them. This module also
- * hosts the slot's one fixed panel ({@link makeGoalJobsPopover}).
+ * **Why a second pill.** The jobs pill is a live counter and hides the moment
+ * nothing is running; a goal is the opposite kind of surface — it stays relevant
+ * while it exists, including when it is *not* running (paused, blocked, or
+ * active but disarmed after a reopen). Folding it into the jobs pill would give
+ * one button two meanings and change the jobs semantics the user already set,
+ * so this is a separate registration (`id: "dsh-goal"`) beside it.
  *
  * **Why it polls.** DSH's goal lives in the `dsh` child process and Paseo 0.14
  * has no goal protocol at all (no field, no event, no capability bit — see
@@ -21,10 +17,11 @@
  *
  * **What the trigger can and cannot show (UI-v6).** The *label* is the fixed
  * noun 「目标」/「Goal」 in every state. The state is shown by the **icon**, a
- * custom component — a `Target` glyph coloured by tone, with the running ring on
- * its corner while the goal is really running (T10b: the glyph is never
- * replaced, so a pill shrunk to its icon still reads as the goal) (`goalIconColorToken`: muted while
- * armed, warning when not continuing, danger when blocked) — and spelled out in
+ * custom component — a `Target` glyph coloured by tone (`goalIconColorToken`:
+ * muted while armed, warning when not continuing, danger when blocked), with
+ * the running ring on its corner while the goal is really running (the glyph is
+ * never replaced, so a pill the host shrank to its icon still reads as the
+ * goal) — and spelled out in
  * the button's `title` (「目标进行中」/「目标未在续跑」/「目标已暂停」/「目标受阻」).
  * The host uses `title` as the button's accessibility name and desktop tooltip,
  * and as the phone sheet's header (`plugins/buttons/view.tsx`): the plugin API
@@ -41,34 +38,20 @@
  */
 import type {
   PluginButtonContentProps,
-  PluginButtonIcon,
   PluginButtonIconProps,
+  PluginButtonRegistration,
   PluginClientContext,
 } from "@getpaseo/plugin/client";
-import { Icon } from "@getpaseo/plugin/client/ui";
-import { createContext, useContext, useEffect, useLayoutEffect, useRef, useState, type ComponentType } from "react";
-import { Pressable, Text, View, type PressableStateCallbackType } from "react-native";
+import { useEffect, useRef, useState } from "react";
+import { Text, View } from "react-native";
 import { goalControl, goalCurrent, type GoalAction, type GoalState } from "../shared/goal";
 import { CornerRingIcon } from "./corner-ring";
-import { DeepSeekMark } from "./deepseek-mark";
-import {
-  createGoalJobsSlot,
-  goalJobsSlotView,
-  type GoalJobsSlot,
-  type SlotKind,
-  type SlotSnapshot,
-} from "./goal-jobs-slot";
-import { GoalPopoverBody, type GoalPanelMode } from "./goal-popover";
+import { GoalPopoverBody } from "./goal-popover";
 import { useAgent, useGoalRunningMark } from "./goal-running";
 import {
   createGoalPoller,
   goalCompleteSeenStep,
   goalEditSubmittable,
-  goalFactsLine,
-  goalStateName,
-  GOAL_FACTS_LINE_HEIGHT,
-  GOAL_OBJECTIVE_LINE_HEIGHT,
-  GOAL_WHALE_SIZE,
   goalIconColorToken,
   goalIconName,
   goalPillCopy,
@@ -80,21 +63,7 @@ import {
   type GoalTone,
   type GoalViewState,
 } from "./goal-polling";
-import {
-  CHEVRON_BOX,
-  FACTS_FONT_SIZE,
-  POPOVER_HOST_PADDING,
-  SECTION_SEPARATOR_COLOR,
-  SECTION_SEPARATOR_HEIGHT,
-  SECTION_SEPARATOR_MARGIN_VERTICAL,
-  TITLE_FONT_SIZE,
-  chevronColorToken,
-  popoverRootBox,
-  rowActiveFill,
-  rowBox,
-  rowTextColumn,
-} from "./jobs-popover-layout";
-import { JobsPillIcon } from "./jobs-spinner";
+import { FACTS_FONT_SIZE } from "./jobs-popover-layout";
 import { localeText } from "./locale";
 
 /** One agent's latest answer, plus the listeners the pill and popover subscribe with. */
@@ -172,10 +141,10 @@ export function makeGoalIcon(store: GoalStore, agentId: string) {
       goal?.activation ?? "armed",
       agentStatus,
     );
-    // T10b: the glyph always stays — the tone-coloured Target, or the green
-    // check for an unseen completed goal — and a running goal adds the corner
-    // ring (`./corner-ring`). The ring used to replace the glyph, so a goal pill
-    // the host shrank to its icon was one more anonymous blue ring.
+    // The glyph always stays — the tone-coloured Target, or the green check
+    // for an unseen completed goal — and a running goal adds the corner ring
+    // (`./corner-ring`). The ring used to replace the glyph, so a goal pill the
+    // host shrank to its icon was one more anonymous blue ring.
     return (
       <CornerRingIcon
         name={goalIconName(tone)}
@@ -189,14 +158,6 @@ export function makeGoalIcon(store: GoalStore, agentId: string) {
   GoalPillIcon.displayName = "GoalPillIcon";
   return GoalPillIcon;
 }
-
-/**
- * How the goal body tells the slot panel which page it is on (T10c). The slot
- * draws its 「N 个后台」 switch row only on the main page: pressing it unmounts
- * this body, which on the edit or clear page would drop the draft or the
- * confirmation without a word. Outside the slot panel nobody listens.
- */
-const GoalModeReport = createContext<((mode: GoalPanelMode) => void) | undefined>(undefined);
 
 /**
  * The popover container: the interaction state and the RPCs around the pure
@@ -237,15 +198,8 @@ export function makeGoalPopover(
     useEffect(() => () => onClosed(shown.current), []);
     const [busy, setBusy] = useState<GoalAction | null>(null);
     const [error, setError] = useState<string | undefined>(undefined);
-    const [mode, setMode] = useState<GoalPanelMode>("view");
+    const [mode, setMode] = useState<"view" | "edit" | "confirm">("view");
     const [draft, setDraft] = useState("");
-    // Layout effect: the switch row must be gone in the same paint the editor
-    // or the clear page first appears in. Unmounting leaves the main page.
-    const reportMode = useContext(GoalModeReport);
-    useLayoutEffect(() => {
-      reportMode?.(mode);
-    }, [mode, reportMode]);
-    useLayoutEffect(() => () => reportMode?.("view"), [reportMode]);
 
     useEffect(() => {
       const current = store.get(agentId);
@@ -390,254 +344,23 @@ export function makeGoalPopover(
   return GoalPopover;
 }
 
-/* -------------------------------------------------------------------------- */
-/* The goal/jobs slot's one panel (T10b)                                      */
-/* -------------------------------------------------------------------------- */
-
-/** The slot as the plugin instantiates it: host icons, host popover bodies. */
-export type GoalJobsPluginSlot = GoalJobsSlot<PluginButtonIcon, ComponentType<PluginButtonContentProps>>;
-
-/** The host's hover/press callback state, as the jobs and goal panels read it. */
-type SlotHoverState = PressableStateCallbackType & { hovered?: boolean };
-
-/**
- * The switch row at the top of one view: it names the other half and opens it
- * in place. Drawn only when the other half is present.
- *
- * - In the goal view it is the jobs row: the jobs trigger's own mark (terminal
- *   glyph, ring on its corner while live) and the jobs' row label 「N 个后台」
- *   (the trigger itself only says 「后台」, T12).
- * - In the jobs view it is the goal row: the whale, the objective on one line,
- *   and the goal's facts line (state · round · budget).
- *
- * It is a track row (`rowBox`) with the host's hover/press fill. On the view the
- * panel opened on, a trailing `ChevronRight` says "this opens"; on the other
- * view it is the way back, so it leads with the host sheet header's back
- * chevron (`ChevronLeft`, as the team panel's detail page) and is named 「返回，…」.
- */
-function SlotSwitchRow({
-  target,
-  back,
-  snapshot,
-  theme,
-  compact,
-  onPress,
-}: {
-  target: SlotKind;
-  back: boolean;
-  snapshot: SlotSnapshot<PluginButtonIcon, ComponentType<PluginButtonContentProps>>;
-  theme: PluginButtonContentProps["theme"];
-  compact: boolean;
-  onPress: () => void;
-}) {
-  const text = localeText();
-  const goal = snapshot.goal?.state?.goal ?? null;
-  const jobs = snapshot.jobs?.state;
-  const name =
-    target === "jobs"
-      ? (jobs?.rowLabel ?? text.jobs.title)
-      : goal === null
-        ? text.goal.title
-        : text.goal.rowLabel(goalStateName(goal, text.goal), goal.objective);
-  return (
-    <Pressable
-      testID={`goal-jobs-switch-${target}`}
-      onPress={onPress}
-      accessibilityRole="button"
-      accessibilityLabel={back ? `${text.team.back}，${name}` : name}
-      style={({ hovered = false, pressed }: SlotHoverState) => {
-        const fill = rowActiveFill(hovered, pressed);
-        return [rowBox({ compact }), fill === undefined ? undefined : { backgroundColor: theme.colors[fill] }];
-      }}
-    >
-      {({ hovered = false, pressed }: SlotHoverState) => (
-        <>
-          {back ? (
-            <View style={{ width: CHEVRON_BOX, height: CHEVRON_BOX, alignItems: "center", justifyContent: "center" }}>
-              <Icon name="ChevronLeft" size={CHEVRON_BOX} color={theme.colors[chevronColorToken(hovered, pressed)]} />
-            </View>
-          ) : null}
-          {target === "jobs" ? (
-            <>
-              <View style={{ width: GOAL_WHALE_SIZE, height: GOAL_WHALE_SIZE, alignItems: "center", justifyContent: "center" }}>
-                {jobs?.live === true ? (
-                  <JobsPillIcon size={14} color={theme.colors.foregroundMuted} theme={theme} />
-                ) : (
-                  <Icon name="SquareTerminal" size={14} color={theme.colors.foregroundMuted} />
-                )}
-              </View>
-              <Text numberOfLines={1} style={{ ...rowTextColumn(), fontSize: TITLE_FONT_SIZE, color: theme.colors.foreground }}>
-                {jobs?.rowLabel ?? text.jobs.title}
-              </Text>
-            </>
-          ) : (
-            <>
-              <DeepSeekMark size={GOAL_WHALE_SIZE} />
-              <View style={rowTextColumn()}>
-                <Text
-                  numberOfLines={1}
-                  style={{ fontSize: TITLE_FONT_SIZE, lineHeight: GOAL_OBJECTIVE_LINE_HEIGHT, color: theme.colors.foreground }}
-                >
-                  {goal === null ? text.goal.title : goal.objective}
-                </Text>
-                {goal === null ? null : (
-                  <Text
-                    numberOfLines={1}
-                    style={{ fontSize: FACTS_FONT_SIZE, lineHeight: GOAL_FACTS_LINE_HEIGHT, color: theme.colors.foregroundMuted }}
-                  >
-                    {goalFactsLine(goal, text.goal.statuses, text.goal.rounds)}
-                  </Text>
-                )}
-              </View>
-            </>
-          )}
-          {back ? null : (
-            <View style={{ width: CHEVRON_BOX, height: CHEVRON_BOX, alignItems: "center", justifyContent: "center" }}>
-              <Icon name="ChevronRight" size={CHEVRON_BOX} color={theme.colors[chevronColorToken(hovered, pressed)]} />
-            </View>
-          )}
-        </>
-      )}
-    </Pressable>
-  );
-}
-
-/**
- * The slot's one fixed panel (T10b): the goal panel or the jobs panel, with a
- * switch row to the other half when both are present.
- *
- * **One component, internal view.** The registration's `behavior` is this
- * component for the agent's whole life; a view switch is `setView`, never a
- * `registration.update({ behavior })`, which would make the host close the
- * surface (Paseo 0.15.0 `plugins/buttons/model.ts:126`). Pressing the switch
- * row calls neither `close()` nor the registration.
- *
- * - **Opening** takes the half the trigger shows (`snapshot.shown`).
- * - **A flip while open** (jobs finished, the goal blocked) only moves the
- *   trigger; the view stays where it is. If the open view's own half vanished
- *   it falls back to the other ({@link goalJobsSlotView}).
- * - **The two bodies are the existing ones**, unchanged (`makeGoalPopover`,
- *   `makeJobsPopover`), including the goal panel's edit/confirm pages and their
- *   `close()` calls. Each body cancels the host's 12pt content padding itself;
- *   below a switch row the body sits in a 12pt box so that cancel still lands
- *   on the surface edge.
- * - **"Seen".** Only the open view is mounted, so the goal body also unmounts
- *   on a switch; the completed-goal "seen" mark therefore waits for this
- *   panel's own unmount (the host closed it) and uses the goal the goal view
- *   last showed — none when the goal view never came on screen.
- */
-export function makeGoalJobsPopover(slot: GoalJobsPluginSlot, agentId: string) {
-  function GoalJobsPopover(props: PluginButtonContentProps) {
-    const [snapshot, setSnapshot] = useState(() => slot.snapshot(agentId));
-    const [opened] = useState<SlotKind>(() => {
-      const first = slot.snapshot(agentId);
-      return first?.shown ?? (first?.goal !== undefined ? "goal" : "jobs");
-    });
-    const [chosen, setChosen] = useState<SlotKind>(opened);
-    // The goal body's page (T10c): its edit and clear pages hide the switch row.
-    const [goalMode, setGoalMode] = useState<GoalPanelMode>("view");
-    useEffect(() => {
-      setSnapshot(slot.snapshot(agentId));
-      return slot.subscribe(agentId, () => setSnapshot(slot.snapshot(agentId)));
-    }, []);
-
-    const goalVisible = snapshot?.goal?.state?.visible === true;
-    const jobsVisible = snapshot?.jobs?.state?.visible === true;
-    const view = goalJobsSlotView(chosen, goalVisible, jobsVisible);
-    useEffect(() => {
-      if (view !== chosen) setChosen(view);
-    }, [view, chosen]);
-
-    // The goal the goal view last put on screen; `undefined` until it has.
-    const goalShown = useRef<GoalState | null | undefined>(undefined);
-    if (view === "goal" && snapshot?.goal !== undefined) goalShown.current = snapshot.goal.state?.goal ?? null;
-    useEffect(() => () => slot.panelClosed(agentId, goalShown.current), []);
-    // T12: the title is the phone sheet's header, so it follows the view on
-    // screen; on unmount (the host closed the panel) it goes back to the half
-    // the trigger shows. A title-only update never closes the surface.
-    useEffect(() => {
-      slot.panelView(agentId, view);
-    }, [view]);
-    useEffect(() => () => slot.panelView(agentId, undefined), []);
-
-    const half = view === "goal" ? snapshot?.goal : snapshot?.jobs;
-    const other: SlotKind = view === "goal" ? "jobs" : "goal";
-    // On the goal's edit or clear page the switch row is not drawn: pressing it
-    // would unmount the goal body and silently drop the draft or the
-    // confirmation. Saving, cancelling or clearing returns to the main page,
-    // and the row comes back.
-    const otherVisible = other === "goal" ? goalVisible : jobsVisible && goalMode === "view";
-    if (half === undefined || snapshot === undefined) {
-      // Both halves detached while the panel was open: the host is about to
-      // remove the button; render nothing rather than a stale body.
-      return null;
-    }
-    const Body = half.Content;
-    // One tree shape whether or not the switch row is drawn: the body keeps
-    // its position (and so its state — the goal editor's draft) when the other
-    // half appears or goes away while the panel is open. The root cancels the
-    // host's 12pt content padding and the body's box restores it, so a body
-    // without a switch row lands exactly where it would on its own.
-    return (
-      <View testID={`goal-jobs-view-${view}`} style={popoverRootBox()}>
-        {otherVisible ? (
-          <SlotSwitchRow
-            target={other}
-            back={view !== opened}
-            snapshot={snapshot}
-            theme={props.theme}
-            compact={props.layout.compact}
-            onPress={() => setChosen(other)}
-          />
-        ) : null}
-        {otherVisible ? (
-          <View
-            style={{
-              height: SECTION_SEPARATOR_HEIGHT,
-              marginVertical: SECTION_SEPARATOR_MARGIN_VERTICAL,
-              backgroundColor: props.theme.colors[SECTION_SEPARATOR_COLOR],
-            }}
-          />
-        ) : null}
-        <View style={{ padding: POPOVER_HOST_PADDING }}>
-          <GoalModeReport.Provider value={setGoalMode}>
-            <Body key={view} {...props} />
-          </GoalModeReport.Provider>
-        </View>
-      </View>
-    );
-  }
-  GoalJobsPopover.displayName = "GoalJobsPopover";
-  return GoalJobsPopover;
-}
-
-/** The plugin's goal/jobs slot, registered through the host's composer pills. */
-export function createGoalJobsPluginSlot(client: PluginClientContext): GoalJobsPluginSlot {
-  const slot: GoalJobsPluginSlot = createGoalJobsSlot<PluginButtonIcon, ComponentType<PluginButtonContentProps>>({
-    addComposerPill: (contribution) => client.addComposerPill(contribution),
-    makeContent: (agentId) => makeGoalJobsPopover(slot, agentId),
-  });
-  return slot;
-}
-
 /** The daemon's page limit for the agent directory; also the max its schema accepts. */
 const AGENT_DIRECTORY_PAGE_SIZE = 200;
 
 /**
- * Poll every agent of this provider and report its goal to the shared
- * goal/jobs slot (T10b).
+ * Register one goal pill per agent of this provider and keep it current.
  *
  * Returns the contribution's cleanup, which Paseo calls when the plugin, the
- * client entrypoint or the host connection goes away: every timer and the agent
- * observation are released there, and each agent's half is detached from the
- * slot. Polling itself is `createGoalPoller`; this function owns what the
- * controller cannot see — the React store the popover reads, the "seen"
- * machine, and the locale.
+ * client entrypoint or the host connection goes away: every timer, every pill
+ * and the agent observation are released there. Polling itself is
+ * `createGoalPoller`; this function owns the host objects the controller cannot
+ * see — the React store the popover reads, the composer registration, and the
+ * locale.
  */
-export function contributeGoalPill(client: PluginClientContext, slot: GoalJobsPluginSlot) {
+export function contributeGoalPill(client: PluginClientContext) {
   const store: GoalStore = new Map();
-  /** The agents this half is attached to the slot for. */
-  const pills = new Set<string>();
+  /** agentId -> the composer registration. */
+  const pills = new Map<string, PluginButtonRegistration>();
   /**
    * agentId -> the completed goal's "seen" progress (UI-v7). Memory only: a
    * reload forgets it and a completed goal shows once more (accepted).
@@ -647,20 +370,19 @@ export function contributeGoalPill(client: PluginClientContext, slot: GoalJobsPl
   const answers = new Map<string, GoalViewState>();
   /** agentId -> the agent's last status from the directory (snapshot or upsert). */
   const agentStatuses = new Map<string, string | undefined>();
-  /** agentId -> the trigger glyph component, created once per registration. */
-  const goalIcons = new Map<string, PluginButtonIcon>();
   const lifetime = new AbortController();
   const rpc = (input: { agentId: string }) => client.rpc(goalCurrent, input);
 
   /**
    * Publish one poll answer: the popover store first (its listeners redraw from
-   * it, including the trigger's glyph), then the slot. The
+   * it, including the trigger's glyph), then the registration. The
    * visibility/label rule is {@link goalPillPresentation}; this function only
    * turns its keys into copy.
    */
   const present = (agentId: string): void => {
+    const registration = pills.get(agentId);
     const next = answers.get(agentId);
-    if (!pills.has(agentId) || next === undefined) return;
+    if (registration === undefined || next === undefined) return;
     const seen = seenStates.get(agentId)?.seen;
     publish(store, agentId, {
       goal: next.goal,
@@ -675,13 +397,7 @@ export function contributeGoalPill(client: PluginClientContext, slot: GoalJobsPl
     // glyph's, and the panel's first row speaks it. Never the objective — that
     // would print it twice on a phone.
     const { label, title } = goalPillCopy(presentation, text);
-    slot.presentGoal(agentId, {
-      visible: presentation.visible,
-      goal: next.goal,
-      label,
-      title,
-      icon: goalIcons.get(agentId) ?? text.title,
-    });
+    registration.update({ visible: presentation.visible, label, title });
   };
 
   /** Feed one event to an agent's "seen" machine; re-present when it changed visibility. */
@@ -693,7 +409,7 @@ export function contributeGoalPill(client: PluginClientContext, slot: GoalJobsPl
   };
 
   const publishState = (agentId: string, next: GoalViewState): void => {
-    if (!pills.has(agentId)) return;
+    if (pills.get(agentId) === undefined) return;
     answers.set(agentId, next);
     seenStates.set(
       agentId,
@@ -720,34 +436,39 @@ export function contributeGoalPill(client: PluginClientContext, slot: GoalJobsPl
       return { entries: page.entries, pageInfo: page.pageInfo };
     },
     addAgent: (agent) => {
-      // A custom component so the Target glyph can carry the goal's tone (the
-      // host would paint a plain icon name muted for every state). One identity
-      // per agent, so the slot never resends it on a poll.
-      const icon = makeGoalIcon(store, agent.id);
-      goalIcons.set(agent.id, icon);
-      slot.attach("goal", agent, {
-        Content: makeGoalPopover(
-          client,
-          store,
-          agent.id,
-          () => poller.pollNow(agent.id),
-          // Not here: this body also unmounts when the user switches the slot
-          // panel to the jobs view. "Seen" waits for the whole panel to close.
-          () => {},
-        ),
-        icon,
-        title: localeText().goal.title,
-        onPanelClosed: (goal) => advanceSeen(agent.id, { kind: "closed", goal }),
+      const registration = client.addComposerPill({
+        id: "dsh-goal",
+        workspaceId: agent.workspaceId ?? "",
+        agentId: agent.id,
+        button: {
+          // A custom component so the Target glyph can carry the goal's tone
+          // (the host would paint a plain icon name muted for every state).
+          icon: makeGoalIcon(store, agent.id),
+          title: localeText().goal.title,
+          // Hidden until the first poll proves otherwise: a pill that appears and
+          // then disappears is worse.
+          visible: false,
+          behavior: {
+            kind: "popover",
+            Content: makeGoalPopover(
+              client,
+              store,
+              agent.id,
+              () => poller.pollNow(agent.id),
+              (goal) => advanceSeen(agent.id, { kind: "closed", goal }),
+            ),
+          },
+        },
       });
-      pills.add(agent.id);
+      pills.set(agent.id, registration);
       store.delete(agent.id);
       answers.delete(agent.id);
     },
     removeAgent: (agentId, reason, error) => {
-      if (!pills.has(agentId)) return;
+      const entry = pills.get(agentId);
+      if (entry === undefined) return;
       pills.delete(agentId);
-      goalIcons.delete(agentId);
-      slot.detach("goal", agentId);
+      entry.remove();
       answers.delete(agentId);
       seenStates.delete(agentId);
       agentStatuses.delete(agentId);

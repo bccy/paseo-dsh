@@ -350,12 +350,12 @@ console.log("\nthe pill's presentation (live-only, ring-only)");
     [settledOnly, liveAndSettled, empty].every((presentation) => presentation.label.kind !== "idle"),
   );
 
-  // T12 (user 2026-11-05): the trigger's label is the bare noun in **every**
+  // User decision 2026-11-05: the trigger's label is the bare noun in **every**
   // visible state — running, stopping, mixed, an unreadable registry — in both
-  // languages. The count only names the panel's switch row.
+  // languages. No count reaches the composer; the popover lists the jobs.
   const LANGS = {
-    "zh-CN": { pillLabel: "后台", liveLabel: (n) => `${n} 个后台`, title: "后台任务" },
-    en: { pillLabel: "Background", liveLabel: (n) => `${n} background`, title: "Background tasks" },
+    "zh-CN": { pillLabel: "后台", title: "后台任务" },
+    en: { pillLabel: "Background", title: "Background tasks" },
   };
   const visibleAnswers = [
     ["one running", { available: true, jobs: [{ status: "running" }] }],
@@ -370,8 +370,7 @@ console.log("\nthe pill's presentation (live-only, ring-only)");
       check(`${what} is visible`, presentation.visible, true);
       check(`${lang}: ${what}: the trigger label is exactly ${text.pillLabel}`, jobsPillCopy(presentation, text).label, text.pillLabel);
     }
-    check(`${lang}: the row label still counts the live jobs`, jobsPillCopy(liveAndSettled, text).rowLabel, text.liveLabel(2));
-    check(`${lang}: the row label without a count is the title`, jobsPillCopy(unreadable, text).rowLabel, text.title);
+    check(`${lang}: the copy carries the label only (no count field)`, JSON.stringify(Object.keys(jobsPillCopy(liveAndSettled, text))), JSON.stringify(["label"]));
   }
 
   // The old route-1 rule, as an oracle: it kept the settled-only pill visible,

@@ -257,16 +257,13 @@ export interface ToolCardsText {
  *
  * The pill is a **live indicator**: it shows while running/stopping jobs exist
  * and hides once nothing is working. Its label is the bare noun
- * {@link JobsText.pillLabel} in every visible state (user decision 2026-11-05,
- * T12); `liveLabel` is the only count phrase and is used inside the panel only
- * (the goal view's switch row). There is deliberately no idle label — settled
+ * {@link JobsText.pillLabel} in every visible state (user decision 2026-11-05):
+ * no count phrase at all. There is deliberately no idle label — settled
  * history belongs to the popover, not to the composer's trigger.
  */
 export interface JobsText {
   /** The composer pill's label, in every visible state: no count, no status. */
   pillLabel: string;
-  /** The goal view's switch row while jobs are running; `count` is the live count, always >= 1. */
-  liveLabel: (count: number) => string;
   /** The button's title (tooltip, accessibility name, phone sheet header). */
   title: string;
   /** One row's status word, per DSH job status. */
@@ -884,12 +881,9 @@ const TEXT: Record<Locale, UiText> = {
       },
     },
     jobs: {
-      // The pill says only "Background" in every state (T12); the ring on the
-      // icon says it is working, the panel says how many.
+      // The pill says only "Background" in every state (user 2026-11-05); the
+      // ring on the icon says it is working, the popover says how many.
       pillLabel: "Background",
-      // "1 background" rather than "1 background task": the switch row shares its
-      // line with the spinner. This is the only count phrase, used in the panel.
-      liveLabel: (count) => `${String(count)} background`,
       title: "Background tasks",
       statuses: {
         running: "Running",
@@ -1257,11 +1251,8 @@ const TEXT: Record<Locale, UiText> = {
       },
     },
     jobs: {
-      // pill 上任何状态都只写「后台」（T12，用户 2026-11-05）：图标上的转环说明在跑，数量在面板里。
+      // pill 上任何状态都只写「后台」（用户 2026-11-05）：图标上的转环说明在跑，数量在面板里。
       pillLabel: "后台",
-      // 数量直接在句子里：`2 个后台`。中文没有复数变化，所以单复数同形。
-      // 这是唯一的数量短语，只用在面板（目标视图顶部的切换行）。
-      liveLabel: (count) => `${String(count)} 个后台`,
       title: "后台任务",
       statuses: {
         running: "运行中",

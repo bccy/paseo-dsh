@@ -17,7 +17,7 @@
  */
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { z } from "zod";
-import { contributeGoalPill, createGoalJobsPluginSlot } from "./client/goal-pill";
+import { contributeGoalPill } from "./client/goal-pill";
 import { InlineThinking } from "./client/inline-thinking";
 import { contributeJobsPill } from "./client/jobs-pill";
 import { contributeStreamStats } from "./client/stream-stats";
@@ -291,18 +291,14 @@ export default function contribute(client: PluginClientContext) {
   // a real teardown (a timer, a subscription) this line would drop it silently.
   // Composing them costs a line and turns the assumption into code.
   //
-  // The goal and the jobs share one composer slot (T10b): one registration per
-  // agent whose trigger shows the goal while it needs the user and the jobs
-  // while something runs, so a phone rail carries at most two of our pills
-  // (this slot and the team). Both halves keep their own pollers and rules and
-  // report to the slot; it is disposed after them, which removes any
-  // registration they left. The team pill keeps its own slot.
-  const goalJobsSlot = createGoalJobsPluginSlot(client);
+  // The goal pill is a second composer pill beside the jobs one: the jobs pill is
+  // a live counter that hides when nothing runs, while a goal has to stay visible
+  // (and controllable) exactly when it is *not* running — paused, blocked, or
+  // active but disarmed after a reopen. One button cannot carry both meanings.
   const cleanups = [
     contributeStreamStats(client),
-    contributeJobsPill(client, goalJobsSlot),
-    contributeGoalPill(client, goalJobsSlot),
-    () => goalJobsSlot.dispose(),
+    contributeJobsPill(client),
+    contributeGoalPill(client),
     contributeTeamPill(client),
   ];
 

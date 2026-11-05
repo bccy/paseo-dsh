@@ -103,9 +103,8 @@ fs.writeFileSync(
   entry,
   `export { GoalPopoverBody } from ${JSON.stringify(path.join(pluginRoot, "client/goal-popover.tsx"))};
 export { allText } from ${JSON.stringify(path.join(pluginRoot, "client/locale.ts"))};
-export { makeGoalPopover, makeGoalIcon, makeGoalJobsPopover } from ${JSON.stringify(path.join(pluginRoot, "client/goal-pill.tsx"))};
-export { makeJobsPopover } from ${JSON.stringify(path.join(pluginRoot, "client/jobs-pill.tsx"))};
-export { createGoalJobsSlot } from ${JSON.stringify(path.join(pluginRoot, "client/goal-jobs-slot.ts"))};
+export { makeGoalPopover, makeGoalIcon, contributeGoalPill } from ${JSON.stringify(path.join(pluginRoot, "client/goal-pill.tsx"))};
+export { contributeJobsPill } from ${JSON.stringify(path.join(pluginRoot, "client/jobs-pill.tsx"))};
 export { CornerRingIcon } from ${JSON.stringify(path.join(pluginRoot, "client/corner-ring.tsx"))};
 export { JobsPillIcon } from ${JSON.stringify(path.join(pluginRoot, "client/jobs-spinner.tsx"))};
 export { createRoot } from "react-dom/client";
@@ -160,9 +159,8 @@ const {
   allText,
   makeGoalPopover,
   makeGoalIcon,
-  makeGoalJobsPopover,
-  makeJobsPopover,
-  createGoalJobsSlot,
+  contributeGoalPill,
+  contributeJobsPill,
   CornerRingIcon,
   JobsPillIcon,
   createRoot,
@@ -769,202 +767,167 @@ async function containerChecks() {
   }
 }
 
-/* The goal/jobs slot's one panel (T10b) ------------------------------------ */
-
-/**
- * Mount the real slot panel (`makeGoalJobsPopover`) over the real coordinator,
- * the real goal container and the real jobs body. The fake registration
- * records every `update`; `close` is the host's own close, spied.
- */
-function mountSlot({ goal = baseGoal, jobs = [] } = {}) {
-  const spies = { close: 0, updates: [], rpc: [] };
-  const goalStore = new Map([["agent-1", { goal, available: true, listeners: new Set() }]]);
-  const jobsStore = new Map([["agent-1", { jobs, available: true, listeners: new Set() }]]);
-  const client = {
-    rpc: async (_definition, input) => {
-      spies.rpc.push(input);
-      return { ok: true, message: "ok" };
-    },
-  };
-  let slot;
-  slot = createGoalJobsSlot({
-    addComposerPill: (contribution) => {
-      spies.contribution = contribution;
-      return { update: (patch) => spies.updates.push(patch), remove: () => {} };
-    },
-    makeContent: (agentId) => makeGoalJobsPopover(slot, agentId),
-  });
-  const agent = { id: "agent-1", workspaceId: "w" };
-  slot.attach("goal", agent, { Content: makeGoalPopover(client, goalStore, "agent-1", async () => {}, () => {}), icon: "GoalIcon", title: "目标" });
-  slot.attach("jobs", agent, { Content: makeJobsPopover(jobsStore, "agent-1"), icon: "JobsIcon", title: "后台任务" });
-  const liveCount = jobs.filter((job) => job.status === "running" || job.status === "stopping").length;
-  const presentGoal = (g) =>
-    slot.presentGoal("agent-1", { visible: g !== null, goal: g, label: "目标", title: "目标", icon: "GoalIcon" });
-  // T12: the trigger says 「后台」; the count names the goal view's switch row.
-  const presentJobs = (count) =>
-    slot.presentJobs("agent-1", { visible: count > 0, live: count > 0, label: "后台", rowLabel: count > 0 ? `${count} 个后台` : "后台任务", title: "后台任务", icon: "JobsIcon" });
-  presentGoal(goal);
-  presentJobs(liveCount);
-  const Panel = spies.contribution.button.behavior.Content;
-  const container = document.createElement("div");
-  document.body.appendChild(container);
-  const root = createRoot(container);
-  flushSync(() => {
-    root.render(
-      React.createElement(Panel, {
-        theme,
-        layout: { compact: true, platform: "web" },
-        host: { id: "h", label: "h" },
-        context: "agent",
-        workspaceId: "w",
-        agentId: "agent-1",
-        close: () => {
-          spies.close += 1;
-        },
-      }),
-    );
-  });
-  const rerender = (fn) => flushSync(fn);
-  return { container, root, spies, slot, presentGoal, presentJobs, goalStore, jobsStore, rerender };
-}
+/* The goal and the jobs are two separate pills ---------------------------- */
 
 const runningJob = { id: "job-1", kind: "bash", label: "sleep 600", status: "running", startedAt: 0, description: "运行完整测试套件" };
 
-async function slotChecks() {
-  console.log("\nthe goal/jobs slot's one panel (T10b)");
-  {
-    // T12: an armed goal + a running job: the trigger shows the goal, the
-    // panel opens on the goal view with the 「1 个后台」 switch row on top.
-    const { container, spies, presentJobs, presentGoal, rerender, root } = mountSlot({ jobs: [runningJob] });
-    const title = () => {
-      let t = spies.contribution.button.title;
-      for (const patch of spies.updates) if (patch.title !== undefined) t = patch.title;
-      return t;
+/**
+ * The real `contributeGoalPill` and `contributeJobsPill` over a fake host: the
+ * fake `addComposerPill` records every registration and its `update`s, the
+ * fake RPCs answer the scripted scene, and the agent directory delivers one
+ * agent. The pollers' own timers run, sped up 100× for this section only.
+ *
+ * The shared goal/jobs slot (one registration per agent, a coordinator and an
+ * in-panel view switch) was withdrawn on 2026-11-05; these checks pin that
+ * each half is its own pill again, with its own popover, and that the two
+ * kept changes hold: the jobs trigger says 「后台」 in every state, and its
+ * live icon is the terminal glyph with the corner ring.
+ */
+async function separatePillChecks() {
+  console.log("\nthe goal and the jobs are two separate composer pills");
+  const realSetTimeout = global.setTimeout;
+  global.setTimeout = (callback, delayMs, ...rest) => realSetTimeout(callback, Math.ceil((delayMs ?? 0) / 100), ...rest);
+  const pause = (ms) => new Promise((resolve) => realSetTimeout(resolve, ms));
+  // Wait until the pollers have delivered what the scene now says (or 3s).
+  // Fixed pauses raced the backoff after an unreadable answer (8s base, 80ms
+  // here); a condition that never holds still fails its check below.
+  const until = async (condition) => {
+    for (let waited = 0; waited < 3000 && !condition(); waited += 10) await pause(10);
+  };
+  const regs = [];
+  const scene = { goal: baseGoal, jobs: { available: true, jobs: [runningJob] } };
+  const agent = { id: "agent-1", workspaceId: "w", status: "idle" };
+  const client = {
+    rpc: async (definition) => {
+      if (definition.name === "goal.current") return { available: true, goal: scene.goal };
+      if (definition.name === "jobs.list") return scene.jobs;
+      return { ok: true, message: "ok" };
+    },
+    addComposerPill: (contribution) => {
+      const reg = { contribution, updates: [], removed: 0 };
+      reg.update = (patch) => reg.updates.push(patch);
+      reg.remove = () => {
+        reg.removed += 1;
+      };
+      regs.push(reg);
+      return reg;
+    },
+    paseo: {
+      agents: {
+        list: async (options) =>
+          options?.subscribe !== undefined
+            ? { subscription: { subscribe: (handler) => handler.snapshot({ entries: [{ agent }], pageInfo: { hasMore: false, nextCursor: null } }) } }
+            : { entries: [], pageInfo: { hasMore: false, nextCursor: null } },
+      },
+    },
+  };
+  const cleanups = [contributeJobsPill(client), contributeGoalPill(client)];
+  try {
+    await until(() => regs.length >= 2 && regs.every((reg) => reg.updates.some((patch) => patch.visible === true)));
+    const byId = (id) => regs.filter((reg) => reg.contribution.id === id);
+    const merged = (reg) => {
+      const out = { ...reg.contribution.button };
+      for (const patch of reg.updates) Object.assign(out, patch);
+      return out;
     };
-    check("one behavior for the whole slot, registered once", spies.contribution.button.behavior.kind, "popover");
-    check("T12: both present: the trigger shows the goal", spies.updates.map((patch) => patch.label).filter(Boolean).at(-1), "目标");
-    assert("the panel opens on the goal view (what the trigger shows)", container.querySelector('[data-testid="goal-jobs-view-goal"]') !== null);
-    assert("…the real goal panel is drawn", byLabel(container, "目标进行中，编辑目标") !== undefined);
-    check("T12: …titled 目标 (the sheet header)", title(), "目标");
-    const jobsRow = container.querySelector('[data-testid="goal-jobs-switch-jobs"]');
-    assert("the goal view's top row switches to the jobs", jobsRow !== null);
-    check("…named by the live count 「1 个后台」", jobsRow?.getAttribute("aria-label"), "1 个后台");
-    assert("…with the terminal glyph and its corner ring", jobsRow?.querySelector('[data-icon="SquareTerminal"]') !== null && jobsRow?.querySelector('[data-testid="pill-corner-ring"]') !== null);
-    const updatesBefore = spies.updates.length;
-    click(jobsRow);
-    assert("pressing it switches the panel to the jobs view in place", container.querySelector('[data-testid="goal-jobs-view-jobs"]') !== null);
-    assert("…listing the job", container.textContent.includes("运行完整测试套件"));
-    check("switching views does not close the panel", spies.close, 0);
-    check("T12: switching to the jobs view sends exactly one title-only update",
-      JSON.stringify(spies.updates.slice(updatesBefore)), JSON.stringify([{ title: "后台任务" }]));
-    check("T12: …so the sheet header reads 后台任务", title(), "后台任务");
-    const goalRow = container.querySelector('[data-testid="goal-jobs-switch-goal"]');
-    assert("the jobs view's top row switches back to the goal", goalRow !== null);
-    assert("…drawing the whale", goalRow?.querySelector('[data-icon="svg"]') !== null);
-    assert("…the objective on one line", (goalRow?.textContent ?? "").includes(baseGoal.objective));
-    assert("…and the goal's state line", (goalRow?.textContent ?? "").includes("进行中 · 第 3 轮 · 预算 10"));
-    check("…as the way back, named by state then objective", goalRow?.getAttribute("aria-label"), `返回，目标进行中，${baseGoal.objective}`);
-    click(goalRow);
-    assert("…and pressing it returns to the goal view", container.querySelector('[data-testid="goal-jobs-view-goal"]') !== null);
-    check("T12: …retitled 目标", title(), "目标");
-    click(container.querySelector('[data-testid="goal-jobs-switch-jobs"]'));
-    check("T12: …and 后台任务 again on the jobs view", title(), "后台任务");
+    check("one agent gets exactly two registrations", regs.length, 2);
+    check("…one is the goal pill (dsh-goal)", byId("dsh-goal").length, 1);
+    check("…the other is the jobs pill (dsh-jobs)", byId("dsh-jobs").length, 1);
+    const goalReg = byId("dsh-goal")[0];
+    const jobsReg = byId("dsh-jobs")[0];
+    if (goalReg === undefined || jobsReg === undefined) throw new Error("a pill was not registered");
+    check("both are for the agent", `${goalReg.contribution.agentId}|${jobsReg.contribution.agentId}`, "agent-1|agent-1");
+    assert("each opens its own popover", goalReg.contribution.button.behavior.kind === "popover" && jobsReg.contribution.button.behavior.kind === "popover" && goalReg.contribution.button.behavior.Content !== jobsReg.contribution.button.behavior.Content);
+    check("no update ever carries a behavior", [...goalReg.updates, ...jobsReg.updates].some((patch) => "behavior" in patch), false);
 
-    // A change while the panel is open: the goal blocks. The trigger keeps the
-    // goal, the view and its title stay; nothing closes and no behavior is sent.
-    rerender(() => presentGoal({ ...baseGoal, phase: "blocked" }));
-    check("the goal blocking while open does not close the panel", spies.close, 0);
-    assert("…and does not move the view", container.querySelector('[data-testid="goal-jobs-view-jobs"]') !== null);
-    check("T12: …nor the title", title(), "后台任务");
-    rerender(() => presentJobs(2));
-    check("T12: a poll on the open jobs view sends no label (the trigger has no count)", spies.updates.some((patch) => patch.label !== undefined && patch.label !== "目标"), false);
-    // The jobs finish while their view is open: the view falls back to the goal.
-    rerender(() => presentJobs(0));
-    assert("the jobs finishing while their view is open falls back to the goal view", container.querySelector('[data-testid="goal-jobs-view-goal"]') !== null);
-    assert("…with no switch row left (nothing else to show)", container.querySelector('[data-testid^="goal-jobs-switch-"]') === null);
-    check("T12: …and the title follows it back to 目标", title(), "目标");
-    check("…and still no close", spies.close, 0);
-    check("no update ever carried a behavior", spies.updates.every((patch) => !("behavior" in patch)), true);
-    check("no update ever hid the pill while it was open", spies.updates.slice(1).every((patch) => patch.visible !== false), true);
-    root.unmount();
-  }
-  {
-    // T12: closing the panel on the jobs view hands the title back to the goal.
-    const { container, spies, root } = mountSlot({ jobs: [runningJob] });
-    click(container.querySelector('[data-testid="goal-jobs-switch-jobs"]'));
-    check("T12: open on the jobs view: title 后台任务", spies.updates.at(-1)?.title, "后台任务");
-    flushSync(() => root.unmount());
-    check("T12: the panel closing restores the shown half's title 目标", JSON.stringify(spies.updates.at(-1)), JSON.stringify({ title: "目标" }));
-    check("…without a behavior", spies.updates.every((patch) => !("behavior" in patch)), true);
-  }
-  {
-    // T12: only jobs, no goal: the jobs view, titled 后台任务, no switch row.
-    const { container, spies } = mountSlot({ goal: null, jobs: [runningJob] });
-    assert("T12: only jobs: the panel opens on the jobs view", container.querySelector('[data-testid="goal-jobs-view-jobs"]') !== null);
-    assert("T12: …with no switch row", container.querySelector('[data-testid^="goal-jobs-switch-"]') === null);
-    check("T12: …the trigger reads 后台", spies.updates.map((patch) => patch.label).filter(Boolean).at(-1), "后台");
-    check("T12: …titled 后台任务", spies.updates.map((patch) => patch.title).filter(Boolean).at(-1) ?? spies.contribution.button.title, "后台任务");
-  }
-  {
-    // A goal that needs the user opens on the goal view too, with the jobs row on top.
-    const { container, spies } = mountSlot({ goal: { ...baseGoal, phase: "blocked" }, jobs: [runningJob] });
-    assert("a blocked goal beside running jobs opens on the goal view", container.querySelector('[data-testid="goal-jobs-view-goal"]') !== null);
-    const jobsRow = container.querySelector('[data-testid="goal-jobs-switch-jobs"]');
-    check("…its top row opens the jobs, named 「1 个后台」", jobsRow?.getAttribute("aria-label"), "1 个后台");
-    // The goal panel's own close() behaviour is intact inside the slot.
-    click(byLabel(container, "目标受阻，编辑目标"));
-    assert("the goal editor opens inside the slot", field(container) !== null);
-    click(byLabel(container, "取消"));
-    check("the editor's 取消 still closes the panel (UI-v8)", spies.close, 1);
-  }
-  {
-    // T10c: the goal's edit and clear pages hide the 「N 个后台」 row. Pressing
-    // it there would unmount the goal body and drop the draft or the
-    // confirmation without a word; back on the main page the row returns.
-    const jobsRowOf = (c) => c.querySelector('[data-testid="goal-jobs-switch-jobs"]');
-    const { container, spies, presentGoal, rerender } = mountSlot({ goal: { ...baseGoal, phase: "blocked" }, jobs: [runningJob] });
-    assert("T10c: the goal main page draws the jobs row", jobsRowOf(container) !== null);
-    click(byLabel(container, "目标受阻，编辑目标"));
-    assert("T10c: the editor is open inside the slot", field(container) !== null);
-    assert("T10c: the edit page draws no jobs row", jobsRowOf(container) === null);
-    assert("T10c: …nor any switch row", container.querySelector('[data-testid^="goal-jobs-switch-"]') === null);
-    typeInto(field(container), `${baseGoal.objective}（草稿）`);
-    check("T10c: …and the draft is kept while it is open", field(container)?.value, `${baseGoal.objective}（草稿）`);
-    // The goal vanishing under the editor unmounts the body; when it comes
-    // back the goal view is on its main page again, so the row is back too.
-    rerender(() => presentGoal(null));
-    assert("T10c: the goal vanishing under the editor falls back to the jobs view", container.querySelector('[data-testid="goal-jobs-view-jobs"]') !== null);
-    // The body reads its own store, which still holds the blocked goal.
-    rerender(() => presentGoal({ ...baseGoal, phase: "blocked" }));
-    click(container.querySelector('[data-testid="goal-jobs-switch-goal"]'));
-    assert("T10c: a remounted goal body is on its main page", byLabel(container, "目标受阻，编辑目标") !== undefined);
-    assert("T10c: …with the jobs row back", jobsRowOf(container) !== null);
-    // The clear page: no row; its 取消 brings the main page and the row back.
-    click(byLabel(container, "清除目标"));
-    assert("T10c: the clear page is open inside the slot", container.textContent.includes("清除后目标不再续跑"));
-    assert("T10c: the clear page draws no jobs row", jobsRowOf(container) === null);
-    click(byLabel(container, "取消"));
-    check("T10c: the clear page's 取消 does not close", spies.close, 0);
-    assert("T10c: …back on the main page", byLabel(container, "目标受阻，编辑目标") !== undefined);
-    assert("T10c: …the jobs row is drawn again", jobsRowOf(container) !== null);
-    // A finished clear returns to the main page too.
-    click(byLabel(container, "清除目标"));
-    assert("T10c: the clear page again draws no jobs row", jobsRowOf(container) === null);
-    await new Promise((resolve) => setTimeout(resolve, 450));
-    click(byLabel(container, "清除目标"));
-    await settle();
-    await settle();
-    check("T10c: the armed red button sends one clear", spies.rpc.at(-1)?.action, "clear");
-    assert("T10c: after the clear the confirmation is gone", !container.textContent.includes("清除后目标不再续跑"));
-    assert("T10c: …and the jobs row is drawn again", jobsRowOf(container) !== null);
-  }
-  {
-    // Only the goal: no switch row, the goal body alone.
-    const { container } = mountSlot({ jobs: [] });
-    assert("only a goal: the goal view, no switch row", container.querySelector('[data-testid="goal-jobs-view-goal"]') !== null && container.querySelector('[data-testid^="goal-jobs-switch-"]') === null);
-  }
+    // Both present: both visible side by side.
+    check("goal + running job: the goal pill is visible", merged(goalReg).visible, true);
+    check("…labelled 目标", merged(goalReg).label, "目标");
+    check("goal + running job: the jobs pill is visible too", merged(jobsReg).visible, true);
+    check("…labelled exactly 后台 (no count)", merged(jobsReg).label, "后台");
+    check("…titled 后台任务", merged(jobsReg).title, "后台任务");
+    check("…its live icon is the terminal glyph with the corner ring", merged(jobsReg).icon, JobsPillIcon);
+    check("…registered with that icon from the start (no static flash)", jobsReg.contribution.button.icon, JobsPillIcon);
 
-  console.log("\npill icons keep their glyph; the ring sits on the corner (T10b)");
+    // Three running: still 「后台」, no count anywhere on the trigger.
+    scene.jobs = { available: true, jobs: [runningJob, { ...runningJob, id: "job-2" }, { ...runningJob, id: "job-3", status: "stopping" }] };
+    // The label does not change, so this answer sends no update to wait on;
+    // give the pollers several periods (40ms each here) to deliver it.
+    await pause(200);
+    check("three live jobs: the jobs label is still 后台", merged(jobsReg).label, "后台");
+    check("…no jobs patch ever carried a digit in its label", jobsReg.updates.some((patch) => typeof patch.label === "string" && /\d/.test(patch.label)), false);
+
+    // The jobs finish: only the jobs pill hides; the goal pill is untouched.
+    const goalUpdatesBefore = goalReg.updates.length;
+    scene.jobs = { available: true, jobs: [{ ...runningJob, status: "completed" }] };
+    await until(() => merged(jobsReg).visible === false);
+    check("the jobs finishing hides the jobs pill", merged(jobsReg).visible, false);
+    check("…and sends the goal pill nothing", goalReg.updates.length, goalUpdatesBefore);
+    check("…which stays visible", merged(goalReg).visible, true);
+
+    // An unreadable registry: visible (the popover explains), static terminal glyph, still 「后台」.
+    scene.jobs = { available: false, jobs: [], error: "registry offline" };
+    await until(() => merged(jobsReg).visible === true);
+    check("an unreadable registry shows the jobs pill", merged(jobsReg).visible, true);
+    check("…with the static terminal glyph", merged(jobsReg).icon, "SquareTerminal");
+    check("…labelled 后台", merged(jobsReg).label, "后台");
+
+    // The goal clears while jobs run: only the goal pill hides.
+    scene.jobs = { available: true, jobs: [runningJob] };
+    scene.goal = null;
+    await until(() => merged(goalReg).visible === false && merged(jobsReg).icon === JobsPillIcon);
+    check("the goal clearing hides the goal pill", merged(goalReg).visible, false);
+    check("…while the jobs pill stays", merged(jobsReg).visible, true);
+    check("…with the ringed icon back", merged(jobsReg).icon, JobsPillIcon);
+
+    const mountContent = (reg) => {
+      const Content = reg.contribution.button.behavior.Content;
+      const container = document.createElement("div");
+      document.body.appendChild(container);
+      const root = createRoot(container);
+      flushSync(() => {
+        root.render(
+          React.createElement(Content, {
+            theme,
+            layout: { compact: true, platform: "web" },
+            host: { id: "h", label: "h" },
+            context: "agent",
+            workspaceId: "w",
+            agentId: "agent-1",
+            close: () => {},
+          }),
+        );
+      });
+      return { container, root };
+    };
+    // The jobs popover is the jobs list alone.
+    {
+      const { container, root } = mountContent(jobsReg);
+      assert("the jobs popover lists the job", container.textContent.includes("运行完整测试套件"));
+      assert("…and draws no goal row", !container.textContent.includes(baseGoal.objective) && container.querySelector('[data-icon="svg"]') === null);
+      flushSync(() => root.unmount());
+    }
+
+    // A completed goal: shown once, and closing its own popover marks it seen.
+    scene.goal = { ...baseGoal, phase: "complete", activation: "disarmed" };
+    await until(() => merged(goalReg).visible === true);
+    check("a completed goal shows the goal pill once more", merged(goalReg).visible, true);
+    {
+      const { container, root } = mountContent(goalReg);
+      assert("the goal popover is the goal panel alone", container.textContent.includes(baseGoal.objective) && !container.textContent.includes("运行完整测试套件"));
+      flushSync(() => root.unmount());
+    }
+    check("closing the goal popover marks the completed goal seen (the pill hides)", merged(goalReg).visible, false);
+    check("…the jobs pill is unaffected", merged(jobsReg).visible, true);
+  } finally {
+    for (const cleanup of cleanups) cleanup();
+    global.setTimeout = realSetTimeout;
+  }
+  check("disposing removes both registrations", regs.map((reg) => reg.removed).join(","), "1,1");
+}
+
+function iconChecks() {
+  console.log("\npill icons keep their glyph; the ring sits on the corner");
   {
     const mount = (element) => {
       const c = document.createElement("div");
@@ -994,7 +957,7 @@ async function slotChecks() {
         assert(`CornerRingIcon frame is ${size}×${size} (running=${running})`, new RegExp(`width:\\s*${size}px`).test(style) && new RegExp(`height:\\s*${size}px`).test(style) && !/padding|margin/.test(style), style);
       }
     }
-    // T12: the glyph's horizontal centre inside the host's icon box. The host
+    // The glyph's horizontal centre inside the host's icon box. The host
     // draws a composer pill's icon at size 14 in a 16px box that centres its
     // child (Paseo 0.15.0 \`plugins/buttons/view.tsx\` ButtonIcon + styles.icon);
     // read both numbers from the host source, then place our frame and glyph by
@@ -1031,7 +994,7 @@ async function slotChecks() {
         const wrap = glyph?.parentElement?.getAttribute("style") ?? "";
         const glyphLeft = frameLeft + px(wrap, "margin-left") + px(wrap, "left") + px(wrap, "padding-left");
         const offset = glyphLeft + glyphW / 2 - boxW / 2;
-        assert(`T12 ${what}: glyph centre within 0.5px of the host icon box centre (offset ${offset.toFixed(2)}px)`,
+        assert(`${what}: glyph centre within 0.5px of the host icon box centre (offset ${offset.toFixed(2)}px)`,
           Number.isFinite(offset) && Math.abs(offset) <= 0.5 && !transformed, `frame=${fs_} glyph=${glyphW}`);
       }
     }
@@ -1056,7 +1019,8 @@ async function slotChecks() {
 
 armChecks
   .then(() => containerChecks())
-  .then(() => slotChecks())
+  .then(() => separatePillChecks())
+  .then(() => iconChecks())
   .catch((error) => {
     failures += 1;
     console.error(`  FAIL the container checks threw: ${error instanceof Error ? error.stack : String(error)}`);

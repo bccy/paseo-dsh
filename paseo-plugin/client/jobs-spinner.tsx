@@ -42,7 +42,7 @@ export function JobsSpinner({ size, theme }: PluginIconProps & Partial<PluginHos
 }
 
 /**
- * The jobs half's live trigger icon (T10b, from the withdrawn T9 attempt): the terminal glyph with the running ring
+ * The jobs pill's live trigger icon: the terminal glyph with the running ring
  * on its corner. A job row keeps {@link JobsSpinner}; the pill no longer
  * swaps its glyph for the ring, so when the host shrinks plugin pills to their
  * icons the jobs pill stays a terminal, not one more blue ring.

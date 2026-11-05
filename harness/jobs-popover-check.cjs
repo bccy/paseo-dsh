@@ -479,26 +479,26 @@ assert("no dead fallback for an unreachable empty split",
 assert("the pill's presentation comes from the shared rule",
   /const\s+presentation\s*=\s*jobsPillPresentation\(next\)/.test(pillSource));
 assert("visibility is reported from that rule", /visible:\s*presentation\.visible/.test(pillSource));
-// T12: the trigger's label is the bare noun in every state; the live count
-// only names the panel's switch row (`jobsPillCopy`, asserted in jobs-poll-check).
+// User decision 2026-11-05: the trigger's label is the bare noun in every
+// state (`jobsPillCopy`, asserted in jobs-poll-check); no count reaches it.
 assert("the pill's words come from jobsPillCopy",
-  /const\s*\{\s*label,\s*rowLabel\s*\}\s*=\s*jobsPillCopy\(presentation,\s*text\)/.test(pillSource));
-assert("the pill never formats the live count into its own label",
-  !/label\s*=\s*[^;]*liveLabel/.test(pillSource.replace(/rowLabel/g, "")));
+  /const\s*\{\s*label\s*\}\s*=\s*jobsPillCopy\(presentation,\s*text\)/.test(pillSource));
+assert("the pill never formats a live count into its label",
+  !/liveLabel/.test(pillSource));
 assert("the idle label is gone", !/idleLabel/.test(pillSource));
 assert("the old idle-total branch is gone",
   !/presentation\.label\.kind\s*===\s*"idle"/.test(pillSource));
 // The static mark exists only as the baseline branch for an unreadable registry:
 // one occurrence in the source, selected by the explicit `presentation.icon`
 // ternary. `jobs-poll-check.cjs` proves no readable answer selects it.
-// T10b: the live mark is the terminal glyph with the ring on its corner
+// The live mark is the terminal glyph with the ring on its corner
 // (`JobsPillIcon`), never the bare ring; the static baseline is the same glyph.
 // SquareTerminal, not ListChecks: ListChecks is the host's own task-list pill.
 assert("the static mark is the explicit baseline branch",
   /presentation\.icon\s*===\s*"spinner"\s*\?\s*JobsPillIcon\s*:\s*"SquareTerminal"/.test(pillSource));
 assert("the old ListChecks mark is gone from the pill",
   !/ListChecks/.test(pillSource));
-assert("the half attaches with the corner-ringed glyph, not the bare spinner",
+assert("the pill registers with the corner-ringed glyph, not the bare spinner",
   /icon:\s*JobsPillIcon,/.test(pillSource) && !/icon:\s*JobsSpinner/.test(pillSource));
 assert("JobsPillIcon is the terminal glyph with the ring on",
   /export function JobsPillIcon[\s\S]{0,300}<CornerRingIcon name="SquareTerminal"[^>]*running theme/.test(spinnerSource));

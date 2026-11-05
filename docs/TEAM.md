@@ -32,18 +32,19 @@ DSH 的 `dsh-experimental-agent-team` 给 Lead 会话一个团队：队员（各
 
 - **可见**：至少一个队员（`role === "teammate"`）或有任务。不依赖 DSH 合成的 Lead 行；「只有 Lead、没有任务」= 没用过团队，不显示。
 - **文字与 title 恒为「团队」/「Team」**，不带计数（title 同时是读屏名、桌面 tooltip、手机 sheet 标题）。
-- **压缩成纯图标时图标偏右（T12 测量）**：宿主插件 pill 是 `composerPillStyles.body`（边框 1、左右内边距 12、gap 8）
+- **压缩成纯图标时图标偏右（2026-11-05 测量）**：宿主插件 pill 是 `composerPillStyles.body`（边框 1、左右内边距 12、gap 8）
   加 `styles.button { flexShrink: 1, minWidth: 0 }`（Paseo 0.15.0 `plugins/buttons/view.tsx:670`），内容从左排、不居中，
   宿主自带的 pill 不收缩，所以一行放不下时只有插件 pill 被压窄。被压到宽 `w` 时图标盒仍在左边 13 处，图标中心
   = 左边 + 21，pill 中心 = 左边 + w/2，偏右 `21 − w/2`：w=42 才居中；浏览器实测（宿主真实 `PluginComposerPills`）
   w=39.5 偏右 1.27、w=32 偏右 5.0、w=26 偏右 8.0；用户 iOS 截图（402pt 宽，@3x）这一格约 40.3pt 偏右约 0.7pt、团队约 31.3pt 偏右约
-  5.2pt，与公式一致。收缩量按 flex-basis 分摊，所以 label 越短的 pill 被压得越窄：截图里这一格写「1 个后台」、团队写「团队」，
-  团队就更窄、更偏。T12 把后台文字改成「后台」后两颗插件 pill 的 label 等长、被压到同样宽（同一行约 36pt，两颗各偏右约 3pt），
-  偏移变小且一致，但不为 0。插件的图标组件
+  5.2pt，与公式一致（当时目标与后台合用一格，该格写「1 个后台」；合并已于 2026-11-05 撤销）。收缩量按 flex-basis 分摊，
+  所以 label 越短的 pill 被压得越窄：截图里那一格写「1 个后台」、团队写「团队」，团队就更窄、更偏。后台文字改成「后台」后，
+  目标「目标」、后台「后台」、团队「团队」三颗插件 pill 的 label 等长、被压到同样宽，偏移一致，但不为 0（撤销合并后一行多一颗
+  插件 pill，每颗会更窄，偏移按上式随之变大，这一点未重新实测）。插件的图标组件
   只画在宿主那个 16px、`overflow: hidden` 的盒子里，外框恰等于 14、在盒内居中（偏差 0，`goal-popover-render-check`
   有 ≤0.5px 断言）；往左挪最多 1px 就会被盒子裁掉，所以**剩下的偏移插件侧修不掉**，要改宿主（例如插件 composer
   pill 给 `minWidth: 42`，或内容居中）。
-- **图标**：有队员 `running === true` → 宿主运行环；`failure` 或有成员创建失败 → 红色 `Users`；否则灰色 `Users`。
+- **图标**：三种状态都画 `Users`（`CornerRingIcon`）：有队员 `running === true` → 灰色 `Users` 右下角叠运行环；`failure` 或有成员创建失败 → 红色 `Users`；否则灰色 `Users`。
   图标只在状态变化时 `update`，运行环不会每次轮询重启（jobs pill 的做法）。
 - 轮询复用 `client/agent-polling.ts`（4s、抖动、退避到 30s、答案去重），**未改它**；jobs / goal pill 语义不变。
 
