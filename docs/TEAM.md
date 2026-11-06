@@ -48,7 +48,8 @@ DSH 的 `dsh-experimental-agent-team` 给 Lead 会话一个团队：队员（各
   pill 给 `minWidth: 42`，或内容居中）。
 - **图标**：常规画 `Users`（`CornerRingIcon`）：有队员 `running === true` → 灰色 `Users` 右下角叠运行环；`failure` 或有成员创建失败 → 红色 `Users`；否则灰色 `Users`。**全部任务 `completed` → 绿色 `CircleCheck`（`statusSuccess`，与目标 pill 完成态同一标记；2026-11-06 用户决策）**，优先级 `failed`（红）> `complete`（绿）> `running`（环）> `idle`（灰）；无任务不读成 complete（此时 pill 本来就隐藏）。
   图标只在状态变化时 `update`，运行环不会每次轮询重启（jobs pill 的做法）。
-- 轮询复用 `client/agent-polling.ts`（4s、抖动、退避到 30s、答案去重），**未改它**；jobs / goal pill 语义不变。
+- **后台 pill 让位**：同一 agent 的**目标 pill 与团队 pill 同时可见**时，后台（jobs）pill 隐藏（`client/pill-deference.ts` 的 `blocksJobs`）；任一不可见后，若后台自身规则应显示则**立即恢复**，不等下一次 jobs 轮询。后台任务本身照常运行，退避只影响 `visible`。
+- 轮询复用 `client/agent-polling.ts`（4s、抖动、退避到 30s、答案去重），**未改它**；jobs / goal pill 自身可见性不变（后台 pill 仅在同 agent 目标+团队同时可见时退避）。
 
 ## 面板（设计 T2 方向 B）
 

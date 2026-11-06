@@ -49,7 +49,7 @@ What you get that the ACP boundary can't carry:
   persona+capability bundles, chosen at session start and locked once it begins
 - Session **reopen and import**: a reopened session replays its conversation
   history, and native DSH sessions can be imported from Paseo
-- Background **jobs** pill (live count only, hidden when nothing is running, expandable)
+- Background **jobs** pill (visible only while something runs; steps aside while the goal and team pills are both visible, expandable)
 - **Goal** and **workflow** rows in the timeline, including workflows that keep
   running across turns
 - **Tool approval cards** for DSH's `approval/request`
@@ -120,7 +120,7 @@ ACP 承载不了、而这里都有：
 - profile 声明了 agent preset 时的 **Preset** 下拉——人设 + 能力包，
   建会话时选、首个回合后锁定
 - **会话恢复与导入**：重开会话会回放历史；并可从 Paseo 导入 DSH 原生会话
-- 后台任务 **jobs** pill（仅在有 live 任务时显示数量，全部结束即隐藏，点开展开）
+- 后台任务 **jobs** pill（仅在有 live 任务时显示，全部结束即隐藏；同一 agent 的目标与团队 pill 同时显示时让位隐藏，任一消失后若自身规则应显示则立即恢复，点开展开）
 - 时间线里的 **Goal** 与 **workflow** 行，跨回合运行的工作流保持运行中
 - DSH `approval/request` 的**工具审批卡**
 - profile 挂了 `systemPrompt` 服务时，支持**会话级 system prompt**

@@ -522,8 +522,8 @@ console.log("\npill wiring (source pins)");
   equal("zh title", ZH.title, "团队");
   equal("en title", EN.title, "Team");
   const client = fs.readFileSync(path.join(repo, "paseo-plugin/index.client.tsx"), "utf8");
-  assert("the client registers the team pill", /contributeTeamPill\(client\)/.test(client));
-  assert("the jobs and goal pills are still registered", /contributeJobsPill\(client\)/.test(client) && /contributeGoalPill\(client\)/.test(client));
+  assert("the client registers the team pill", /contributeTeamPill\(client, deference\)/.test(client));
+  assert("the jobs and goal pills are still registered", /contributeJobsPill\(client, deference\)/.test(client) && /contributeGoalPill\(client, deference\)/.test(client));
   // The Users glyph is never replaced; the running state is a corner ring.
   assert("every team pill icon draws the Users glyph through CornerRingIcon", (pill.match(/<CornerRingIcon name="Users"/g) ?? []).length === 3, String((pill.match(/<CornerRingIcon name="Users"/g) ?? []).length));
   assert("…only the running icon turns the ring on", /function RunningIcon[\s\S]{0,200}running theme/.test(pill) && (pill.match(/running=\{false\}/g) ?? []).length === 3);

@@ -106,6 +106,8 @@ export { allText } from ${JSON.stringify(path.join(pluginRoot, "client/locale.ts
 export { makeGoalPopover, makeGoalIcon, contributeGoalPill } from ${JSON.stringify(path.join(pluginRoot, "client/goal-pill.tsx"))};
 export { SEEN_CLOSE_CONFIRM_MS } from ${JSON.stringify(path.join(pluginRoot, "client/seen-close-gate.ts"))};
 export { contributeJobsPill } from ${JSON.stringify(path.join(pluginRoot, "client/jobs-pill.tsx"))};
+export { contributeTeamPill } from ${JSON.stringify(path.join(pluginRoot, "client/team-pill.tsx"))};
+export { createPillDeference } from ${JSON.stringify(path.join(pluginRoot, "client/pill-deference.ts"))};
 export { CornerRingIcon } from ${JSON.stringify(path.join(pluginRoot, "client/corner-ring.tsx"))};
 export { JobsPillIcon } from ${JSON.stringify(path.join(pluginRoot, "client/jobs-spinner.tsx"))};
 export { createRoot } from "react-dom/client";
@@ -163,6 +165,8 @@ const {
   SEEN_CLOSE_CONFIRM_MS,
   contributeGoalPill,
   contributeJobsPill,
+  contributeTeamPill,
+  createPillDeference,
   CornerRingIcon,
   JobsPillIcon,
   createRoot,
@@ -966,6 +970,221 @@ async function separatePillChecks() {
   check("disposing removes both registrations", regs.map((reg) => reg.removed).join(","), "1,1");
 }
 
+/* The jobs pill defers while the goal and team pills are both visible ------ */
+
+/**
+ * The three real composer contributions over one shared `createPillDeference()`:
+ * the jobs pill must hide while both the goal and the team pill are visible,
+ * and must come back the moment either hides — from the coordinator's
+ * synchronous repaint, not the next jobs poll.
+ */
+async function pillDeferenceChecks() {
+  console.log("\nthe jobs pill defers while the goal and team pills are both visible");
+  const realSetTimeout = global.setTimeout;
+  global.setTimeout = (callback, delayMs, ...rest) => realSetTimeout(callback, Math.ceil((delayMs ?? 0) / 100), ...rest);
+  const pause = (ms) => new Promise((resolve) => realSetTimeout(resolve, ms));
+  const until = async (condition) => {
+    for (let waited = 0; waited < 3000 && !condition(); waited += 10) await pause(10);
+  };
+  const board = (tasks) => ({
+    members: [{ id: "lead", name: "Lead", role: "lead", phase: "active" }],
+    tasks,
+  });
+  const openTask = {
+    id: "task-1",
+    revision: 1,
+    subject: "检查后台任务",
+    description: "",
+    status: "in_progress",
+    blockedBy: [],
+    writeScopes: [],
+    ready: true,
+    writeScopeWarnings: [],
+  };
+  const regs = [];
+  const scene = { goal: baseGoal, goalError: null, team: board([openTask]), jobs: { available: true, jobs: [runningJob] } };
+  let jobsReads = 0;
+  let holdJobs = false;
+  let releaseJobs = null;
+  const agent = { id: "agent-1", workspaceId: "w", status: "idle" };
+  const client = {
+    rpc: async (definition) => {
+      if (definition.name === "goal.current") {
+        if (scene.goalError !== null) return scene.goalError;
+        return { available: true, goal: scene.goal };
+      }
+      if (definition.name === "team.read") return { available: true, team: scene.team };
+      if (definition.name === "jobs.list") {
+        jobsReads += 1;
+        if (holdJobs) await new Promise((resolve) => { releaseJobs = resolve; });
+        return scene.jobs;
+      }
+      return { ok: true, message: "ok" };
+    },
+    addComposerPill: (contribution) => {
+      const reg = { contribution, updates: [], removed: 0 };
+      reg.update = (patch) => reg.updates.push(patch);
+      reg.remove = () => {
+        reg.removed += 1;
+      };
+      regs.push(reg);
+      return reg;
+    },
+    paseo: {
+      agents: {
+        list: async (options) =>
+          options?.subscribe !== undefined
+            ? { subscription: { subscribe: (handler) => handler.snapshot({ entries: [{ agent }], pageInfo: { hasMore: false, nextCursor: null } }) } }
+            : { entries: [], pageInfo: { hasMore: false, nextCursor: null } },
+      },
+    },
+  };
+  const deference = createPillDeference();
+  const cleanups = [
+    contributeJobsPill(client, deference),
+    contributeGoalPill(client, deference),
+    contributeTeamPill(client, deference),
+  ];
+  const byId = (id) => regs.filter((reg) => reg.contribution.id === id);
+  const one = (id) => byId(id)[0];
+  const merged = (reg) => {
+    const out = { ...reg.contribution.button };
+    for (const patch of reg.updates) Object.assign(out, patch);
+    return out;
+  };
+  /**
+   * Park the jobs poller in one in-flight read, so a later visibility change can
+   * only reach the registration through the coordinator. Returns the read count
+   * at the freeze point.
+   */
+  const freezeJobsPoller = async () => {
+    const before = jobsReads;
+    holdJobs = true;
+    await until(() => jobsReads > before);
+    holdJobs = false;
+    check("the jobs poller is parked in one in-flight read", jobsReads, before + 1);
+    return jobsReads;
+  };
+  const thawJobsPoller = async () => {
+    const release = releaseJobs;
+    releaseJobs = null;
+    if (release !== null) release();
+    await pause(30);
+  };
+  try {
+    await until(() => {
+      const goalReg = one("dsh-goal");
+      const teamReg = one("dsh-team");
+      const jobsReg = one("dsh-jobs");
+      return (
+        goalReg !== undefined &&
+        teamReg !== undefined &&
+        jobsReg !== undefined &&
+        merged(goalReg).visible === true &&
+        merged(teamReg).visible === true &&
+        jobsReg.updates.length > 0 &&
+        merged(jobsReg).visible === false
+      );
+    });
+    const goalReg = one("dsh-goal");
+    const teamReg = one("dsh-team");
+    const jobsReg = one("dsh-jobs");
+    if (goalReg === undefined || teamReg === undefined || jobsReg === undefined) throw new Error("a pill was not registered");
+    check("one agent gets exactly three registrations", regs.length, 3);
+    check("…one per pill", ["dsh-goal", "dsh-team", "dsh-jobs"].map((id) => byId(id).length).join(","), "1,1,1");
+    check("goal + team both visible: the goal pill is visible", merged(goalReg).visible, true);
+    check("…the team pill is visible", merged(teamReg).visible, true);
+    check("…and the jobs pill is hidden by deference", merged(jobsReg).visible, false);
+    check("…while it still owns its popover registration", jobsReg.contribution.button.behavior.kind, "popover");
+
+    // Team hides: the coordinator repaints the jobs pill before the next jobs
+    // poll (the poller is parked in an in-flight read).
+    const readsBeforeTeamHide = await freezeJobsPoller();
+    scene.team = board([]);
+    await until(() => merged(teamReg).visible === false);
+    check("the team pill hides when its board loses its last task", merged(teamReg).visible, false);
+    check("…the jobs pill recovers immediately", merged(jobsReg).visible, true);
+    check("…without a jobs read (no next poll)", jobsReads, readsBeforeTeamHide);
+    await thawJobsPoller();
+
+    // Dedup (P3 review): a deference notification whose recomputed presentation
+    // is identical must not repaint the registration. The team is already
+    // hidden here, so the goal hiding/returning changes only the coordinator —
+    // the jobs pill's own running answer stays visible throughout.
+    const updatesBeforeUnchangedRepaint = jobsReg.updates.length;
+    const readsBeforeUnchangedRepaint = await freezeJobsPoller();
+    scene.goal = null;
+    await until(() => merged(goalReg).visible === false);
+    check("a deference repaint with the same presentation does not update the jobs pill",
+      jobsReg.updates.length, updatesBeforeUnchangedRepaint);
+    check("…the jobs pill stays visible on its own rule", merged(jobsReg).visible, true);
+    scene.goal = baseGoal;
+    await until(() => merged(goalReg).visible === true);
+    check("…and the goal returning stays deduped too",
+      jobsReg.updates.length, updatesBeforeUnchangedRepaint);
+    check("…still without a jobs read", jobsReads, readsBeforeUnchangedRepaint);
+    await thawJobsPoller();
+
+    // Team comes back: the block returns.
+    scene.team = board([openTask]);
+    await until(() => merged(teamReg).visible === true && merged(jobsReg).visible === false);
+    check("the team pill returning hides the jobs pill again", merged(jobsReg).visible, false);
+
+    // Goal hides while the team is visible: recovery from the other side.
+    const readsBeforeGoalHide = await freezeJobsPoller();
+    scene.goal = null;
+    await until(() => merged(goalReg).visible === false);
+    check("the goal pill hides when its goal clears", merged(goalReg).visible, false);
+    check("…the jobs pill recovers immediately", merged(jobsReg).visible, true);
+    check("…again without a jobs read", jobsReads, readsBeforeGoalHide);
+    await thawJobsPoller();
+
+    // The jobs rule itself is untouched: settled still hides with both blockers off.
+    scene.jobs = { available: true, jobs: [{ ...runningJob, status: "completed" }] };
+    await until(() => merged(jobsReg).visible === false);
+    check("a settled registry still hides the jobs pill (own rule)", merged(jobsReg).visible, false);
+
+    // An unreadable registry is visible on the jobs rule while nothing blocks it…
+    scene.jobs = { available: false, jobs: [], error: "registry offline" };
+    await until(() => merged(jobsReg).visible === true && merged(jobsReg).icon === "SquareTerminal");
+    check("an unreadable registry shows the jobs pill while unblocked", merged(jobsReg).visible, true);
+    check("…with the static terminal glyph", merged(jobsReg).icon, "SquareTerminal");
+
+    // …but deference still suppresses it when both blocking pills are visible.
+    scene.goal = baseGoal;
+    scene.team = board([openTask]);
+    await until(() => merged(goalReg).visible === true && merged(teamReg).visible === true && merged(jobsReg).visible === false);
+    check("goal + team visible: an unreadable registry stays hidden", merged(jobsReg).visible, false);
+    check("…its own rule still selects the static mark", merged(jobsReg).icon, "SquareTerminal");
+
+    // Forget wiring (P2 review): one pill disappearing while the other stays
+    // visible must clear its side of the coordinator and bring the jobs pill
+    // back immediately — here through the goal RPC's terminal error, which
+    // removes the goal pill without a new jobs poll.
+    scene.jobs = { available: true, jobs: [runningJob] };
+    await until(() => merged(jobsReg).icon === JobsPillIcon && merged(jobsReg).visible === false);
+    check("a running registry is hidden again while both pills are visible", merged(jobsReg).visible, false);
+    const readsBeforeGoalRemoval = await freezeJobsPoller();
+    scene.goalError = { available: false, goal: null, error: { message: "bridge too old", code: "bridge_too_old" } };
+    await until(() => goalReg.removed === 1 && merged(jobsReg).visible === true);
+    check("a terminal goal error removes the goal pill", goalReg.removed, 1);
+    check("…the team pill stays visible", merged(teamReg).visible, true);
+    check("…and the jobs pill recovers from the forgotten side immediately", merged(jobsReg).visible, true);
+    check("…without a jobs read (no next poll)", jobsReads, readsBeforeGoalRemoval);
+    await thawJobsPoller();
+  } finally {
+    for (const cleanup of cleanups) cleanup();
+    global.setTimeout = realSetTimeout;
+  }
+  check("every pill is removed exactly once (goal by its terminal error, the other two by cleanup)",
+    ["dsh-goal", "dsh-team", "dsh-jobs"].map((id) => one(id).removed).join(","), "1,1,1");
+  const updatesAfterCleanup = regs.reduce((total, reg) => total + reg.updates.length, 0);
+  deference.report("goal", "agent-1", true);
+  deference.report("team", "agent-1", true);
+  check("no update escapes after cleanup", regs.reduce((total, reg) => total + reg.updates.length, 0), updatesAfterCleanup);
+  deference.dispose();
+}
+
 function iconChecks() {
   console.log("\npill icons keep their glyph; the ring sits on the corner");
   {
@@ -1060,6 +1279,7 @@ function iconChecks() {
 armChecks
   .then(() => containerChecks())
   .then(() => separatePillChecks())
+  .then(() => pillDeferenceChecks())
   .then(() => iconChecks())
   .catch((error) => {
     failures += 1;

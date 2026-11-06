@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "rootDir": "../paseo-plugin",
+    "outDir": "../paseo-plugin/.dbg-deference"
+  },
+  "files": ["../paseo-plugin/client/pill-deference.ts"]
+}

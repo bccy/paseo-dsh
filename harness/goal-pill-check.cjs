@@ -709,7 +709,9 @@ console.log("\nthe goal and the jobs are two separate composer pills");
     /if \(pills\.get\(agent\.id\) !== registration\) return;/.test(pill),
   );
   assert("the client entry contributes both pills on their own",
-    /contributeJobsPill\(client\),/.test(index) && /contributeGoalPill\(client\),/.test(index));
+    /contributeJobsPill\(client, deference\),/.test(index) && /contributeGoalPill\(client, deference\),/.test(index));
+  assert("…from one shared pill-deference coordinator",
+    /const deference = createPillDeference\(\)/.test(index));
   // Assembled from fragments so a repo-wide grep for the withdrawn names finds
   // nothing in this file either (the pin itself is not a use).
   const gj = ["goal", "jobs"].join("-");

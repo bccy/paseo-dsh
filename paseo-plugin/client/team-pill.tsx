@@ -33,6 +33,7 @@ import { useEffect, useRef, useState } from "react";
 import { teamRead, type TeamView } from "../shared/team";
 import { localeText } from "./locale";
 import { CornerRingIcon } from "./corner-ring";
+import { createPillDeference, type PillDeference } from "./pill-deference";
 import { createSeenCloseGate } from "./seen-close-gate";
 import {
   createTeamPoller,
@@ -152,7 +153,10 @@ interface PillEntry {
 }
 
 /** Register one team pill per agent of this provider and keep it current. Returns the cleanup. */
-export function contributeTeamPill(client: PluginClientContext) {
+export function contributeTeamPill(
+  client: PluginClientContext,
+  deference: PillDeference = createPillDeference(),
+) {
   const store: TeamStore = new Map();
   const pills = new Map<string, PillEntry>();
   /**
@@ -182,6 +186,9 @@ export function contributeTeamPill(client: PluginClientContext) {
     const seen = seenStates.get(agentId)?.seen;
     const text = localeText().team;
     const visible = teamPillVisible(team, seen);
+    // Report the final visibility so the jobs pill can defer while both this
+    // pill and the goal pill are visible; the coordinator dedupes the change.
+    deference.report("team", agentId, visible);
     const icon = team === null ? "idle" : teamPillIcon(team);
     if (entry.visible === visible && entry.icon === icon && entry.label === text.title && entry.title === text.title) {
       return;
@@ -211,6 +218,7 @@ export function contributeTeamPill(client: PluginClientContext) {
       return { entries: page.entries, pageInfo: page.pageInfo };
     },
     addAgent: (agent) => {
+      deference.forget("team", agent.id);
       const text = localeText().team;
       const registration = client.addComposerPill({
         id: "dsh-team",
@@ -244,6 +252,7 @@ export function contributeTeamPill(client: PluginClientContext) {
       const entry = pills.get(agentId);
       if (entry === undefined) return;
       pills.delete(agentId);
+      deference.forget("team", agentId);
       entry.registration.remove();
       seenStates.delete(agentId);
       agentStatuses.delete(agentId);

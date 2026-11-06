@@ -478,7 +478,9 @@ assert("no dead fallback for an unreachable empty split",
 // absent. `jobs-poll-check.cjs` asserts the rule's behaviour.
 assert("the pill's presentation comes from the shared rule",
   /const\s+presentation\s*=\s*jobsPillPresentation\(next\)/.test(pillSource));
-assert("visibility is reported from that rule", /visible:\s*presentation\.visible/.test(pillSource));
+assert("visibility is that rule gated by the pill deference",
+  /const\s+visible\s*=\s*presentation\.visible\s*&&\s*!deference\.blocksJobs\(agentId\)/.test(pillSource));
+assert("the update sends the gated visibility", /registration\.update\(\{\s*visible,\s*label,\s*title:\s*text\.title,\s*\.\.\.iconPatch\s*\}\)/.test(pillSource));
 // User decision 2026-11-05: the trigger's label is the bare noun in every
 // state (`jobsPillCopy`, asserted in jobs-poll-check); no count reaches it.
 assert("the pill's words come from jobsPillCopy",

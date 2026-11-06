@@ -31,7 +31,7 @@ import { Icon } from "@getpaseo/plugin/client/ui";
 import { useEffect, useState } from "react";
 import { Platform, Pressable, Text, View, type PressableStateCallbackType } from "react-native";
 import { jobsList, splitJobs, type Job } from "../shared/jobs";
-import { createJobsPoller, jobsPillCopy, jobsPillPresentation, type JobsViewState, type PillIcon } from "./jobs-polling";
+import { createJobsPoller, jobsPillCopy, jobsPillPresentation, type JobsViewState, type PillIcon, type PillPresentation } from "./jobs-polling";
 import {
   CHEVRON_BOX,
   FACTS_FONT_SIZE,
@@ -53,6 +53,7 @@ import {
 } from "./jobs-popover-layout";
 import { JobsPillIcon, JobsSpinner } from "./jobs-spinner";
 import { localeText, type JobsText } from "./locale";
+import { createPillDeference, type PillDeference } from "./pill-deference";
 
 /** One agent's latest answer, plus the listeners the popover subscribes with. */
 interface AgentJobs {
@@ -82,6 +83,14 @@ interface PillEntry {
    * actually changes, which is the one thing that guarantees the ring never stutters.
    */
   icon: PillIcon;
+  /** The latest presentation rule answer, kept for a deference repaint. */
+  presentation?: PillPresentation;
+  /** What the host was last told; an unchanged recompute publishes nothing. */
+  visible: boolean;
+  label: string;
+  title: string;
+  /** Releases this agent's deference subscription. */
+  readonly unsubscribe: () => void;
 }
 
 function publish(store: JobStore, agentId: string, next: Omit<AgentJobs, "listeners">): void {
@@ -505,9 +514,12 @@ const AGENT_DIRECTORY_PAGE_SIZE = 200;
  * see — the React store the popover reads, the composer registration, and the
  * locale.
  */
-export function contributeJobsPill(client: PluginClientContext) {
+export function contributeJobsPill(
+  client: PluginClientContext,
+  deference: PillDeference = createPillDeference(),
+) {
   const store: JobStore = new Map();
-  /** agentId -> the composer registration and its last icon state. */
+  /** agentId -> the composer registration and its last published state. */
   const pills = new Map<string, PillEntry>();
   const lifetime = new AbortController();
   // Captured here and handed to the popover rather than read through a React
@@ -517,10 +529,58 @@ export function contributeJobsPill(client: PluginClientContext) {
   const rpc = (input: { agentId: string }) => client.rpc(jobsList, input);
 
   /**
+   * Turn one presentation into the host update, honoring the deference gate.
+   *
+   * The visibility/label rule itself is {@link jobsPillPresentation}; this
+   * function only suppresses its `visible` while both the goal and the team
+   * pill are visible, turns the keys into copy and keeps the icon patch
+   * conditional. `title` is the neutral noun, **never the count**: on compact
+   * the popover is a sheet and the sheet's header is drawn from the button's
+   * title, so a title carrying the count would make this the one panel whose
+   * heading changes while you look at it.
+   */
+  const applyPresentation = (agentId: string, presentation: PillPresentation): void => {
+    const entry = pills.get(agentId);
+    if (entry === undefined) return;
+    const text = localeText().jobs;
+    // The label is the bare noun 「后台」/「Background」 in every visible state
+    // (user decision 2026-11-05): no count, no status word. The ring on the icon
+    // says it is working; the popover says how many. There is no idle total:
+    // the pill hides when nothing is live.
+    const { label } = jobsPillCopy(presentation, text);
+    // The jobs rule itself is untouched; deference only hides the result while
+    // both blocking pills are visible.
+    const visible = presentation.visible && !deference.blocksJobs(agentId);
+    // A deference repaint arrives between polls with the same answer. Only a
+    // real change reaches the host: an identical `update` rebuilds the button
+    // and the open popover's page elements for nothing.
+    if (
+      entry.visible === visible &&
+      entry.label === label &&
+      entry.title === text.title &&
+      entry.icon === presentation.icon
+    ) {
+      return;
+    }
+    // `update()` merges, so the icon is sent only when the mark changes — see
+    // `PillEntry.icon`. Every readable answer selects the terminal glyph with
+    // the turning ring on its corner (the glyph stays, so a pill the host shrank
+    // to its icon still reads as the jobs); the static glyph is the baseline
+    // 2f71225 branch for an unreadable registry. `SquareTerminal`, not the old
+    // `ListChecks`: that read like the host's own task-list pill beside it.
+    const icon = presentation.icon === "spinner" ? JobsPillIcon : "SquareTerminal";
+    const iconPatch = presentation.icon === entry.icon ? {} : { icon };
+    entry.visible = visible;
+    entry.label = label;
+    entry.title = text.title;
+    entry.icon = presentation.icon;
+    entry.registration.update({ visible, label, title: text.title, ...iconPatch });
+  };
+
+  /**
    * Publish one poll answer: the popover store first (its listeners redraw from
-   * it), then the registration. The visibility/label rule is
-   * {@link jobsPillPresentation}; this function only turns its keys into copy and
-   * keeps the icon patch conditional.
+   * it), then the registration. The answer is also kept so a deference change
+   * can repaint immediately, without waiting for the next poll.
    */
   const publishState = (agentId: string, next: JobsViewState<Job>) => {
     const entry = pills.get(agentId);
@@ -531,28 +591,8 @@ export function contributeJobsPill(client: PluginClientContext) {
       ...(next.error === undefined ? {} : { error: next.error }),
     });
     const presentation = jobsPillPresentation(next);
-    const text = localeText().jobs;
-    // The label is the bare noun 「后台」/「Background」 in every visible state
-    // (user decision 2026-11-05): no count, no status word. The ring on the icon
-    // says it is working; the popover says how many. There is no idle total:
-    // the pill hides when nothing is live.
-    const { label } = jobsPillCopy(presentation, text);
-    // `update()` merges, so the icon is sent only when the mark changes — see
-    // `PillEntry.icon`. Every readable answer selects the terminal glyph with
-    // the turning ring on its corner (the glyph stays, so a pill the host shrank
-    // to its icon still reads as the jobs); the static glyph is the baseline
-    // 2f71225 branch for an unreadable registry. `SquareTerminal`, not the old
-    // `ListChecks`: that read like the host's own task-list pill beside it.
-    const icon = presentation.icon === "spinner" ? JobsPillIcon : "SquareTerminal";
-    const iconPatch = presentation.icon === entry.icon ? {} : { icon };
-    entry.icon = presentation.icon;
-    /**
-     * `title` is the neutral noun, **never the count**: on compact the popover is
-     * a sheet and the sheet's header is drawn from the button's title, so a title
-     * carrying the count would make this the one panel whose heading changes
-     * while you look at it.
-     */
-    entry.registration.update({ visible: presentation.visible, label, title: text.title, ...iconPatch });
+    entry.presentation = presentation;
+    applyPresentation(agentId, presentation);
   };
 
   const poller = createJobsPoller<Job>({
@@ -569,6 +609,7 @@ export function contributeJobsPill(client: PluginClientContext) {
       return { entries: page.entries, pageInfo: page.pageInfo };
     },
     addAgent: (agent) => {
+      const text = localeText().jobs;
       const registration = client.addComposerPill({
         id: "dsh-jobs",
         workspaceId: agent.workspaceId ?? "",
@@ -577,20 +618,37 @@ export function contributeJobsPill(client: PluginClientContext) {
           // The ringed glyph from the start: registering the static mark first
           // would flash it for one frame before the first `update` swapped it.
           icon: JobsPillIcon,
-          title: localeText().jobs.title,
+          title: text.title,
           // Hidden until the first poll proves otherwise: a pill that appears and
           // then disappears is worse.
           visible: false,
           behavior: { kind: "popover", Content: makeJobsPopover(store, agent.id) },
         },
       });
-      pills.set(agent.id, { registration, icon: "spinner" });
+      // Repaint from the last answer the moment either blocking pill changes;
+      // before the first poll there is no presentation yet, so the registration
+      // stays hidden until the poll proves something to show. The initial label
+      // is the visible noun, matching what the first presentation would send, so
+      // a hidden idle poll repaints nothing.
+      const unsubscribe = deference.subscribe(agent.id, () => {
+        const current = pills.get(agent.id);
+        if (current?.presentation !== undefined) applyPresentation(agent.id, current.presentation);
+      });
+      pills.set(agent.id, {
+        registration,
+        icon: "spinner",
+        visible: false,
+        label: text.pillLabel,
+        title: text.title,
+        unsubscribe,
+      });
       store.delete(agent.id);
     },
     removeAgent: (agentId, reason, error) => {
       const entry = pills.get(agentId);
       if (entry === undefined) return;
       pills.delete(agentId);
+      entry.unsubscribe();
       entry.registration.remove();
       // Dropped rather than kept: the popover must not show a stale list for an
       // agent this client may not read, or whose runtime cannot serve jobs at all.
@@ -666,5 +724,10 @@ export function contributeJobsPill(client: PluginClientContext) {
   return () => {
     lifetime.abort();
     poller.dispose();
+    // `poller.dispose()` removes every live agent through `removeAgent`; this
+    // sweep is for an entry the controller never owned, so no subscription can
+    // outlive the contribution.
+    for (const entry of [...pills.values()]) entry.unsubscribe();
+    pills.clear();
   };
 }
