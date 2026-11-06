@@ -148,8 +148,8 @@ goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等�
   **失焦不提交**（没有任何 blur / submitEditing 提交路径）。失败原文显示在框下方（`statusDanger`），保持编辑态。
   **离开编辑框即关闭面板**（UI-v8）：「取消」、桌面 Esc、保存**成功**都调用宿主给的 `close()`，直接回到对话，
   不再回到展开的面板；保存失败不关（留在编辑框显示原文、保留草稿）。规则是纯函数 `goalPanelNext`
-  （`client/goal-polling.ts`）。关闭会卸载面板内容、触发完成态的「已读」记录，但编辑只出现在非 complete 目标上，
-  所以编辑后关闭不会把任何目标记为已读。
+  （`client/goal-polling.ts`）。关闭经 `client/seen-close-gate.ts` 的确认窗后才触发完成态的「已读」记录（宿主打开面板时会重挂载一次内容，
+  见下文「何时隐藏」），但编辑只出现在非 complete 目标上，所以编辑后关闭不会把任何目标记为已读。
   编辑时隐藏「正在」与受阻行。插件主题缺宿主的 `borderAccent`/`surface3`/`surface4`：边框用 `border`、
   按键芯片底用 `surface2`、placeholder 用 `foregroundMuted`（design-opus-v4 §6 的回退），暗色下边框比
   宿主 composer 弱一档。
@@ -183,7 +183,11 @@ goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等�
 - **清除确认**：complete 用单独一句「清除后 /goal 将查不到这个目标，无法撤销」/「After clearing, /goal will no longer show this goal;
   this cannot be undone.」（清除一个已完成目标不会停止任何东西，失去的是 `/goal` 还能查到的记录）；其它状态的确认句不变。
 - **何时隐藏**：按 `id:revision` 记「已读」，同键已读即隐藏（`goalPillPresentation(answer, seen)`）。已读的来源（纯函数
-  `goalCompleteSeenStep`）：①打开完成面板后关闭（宿主关闭时卸载面板内容，卸载即记已读）；②观察到 complete 之后 agent **先 idle 再 running**
+  `goalCompleteSeenStep`）：①打开完成面板后**真正关闭**——宿主打开 popover 时会把内容**重挂载一次**（`AnchoredSurface` 的 `FloatingSurface` 带
+  `key={placed ? "placed" : "measuring"}`，Paseo 0.15.0 `packages/app/src/components/ui/menu/menu-overlay.tsx:350`，注释在 :265 明说
+  「Remounting on placement…」），所以 `unmount` 本身不是关闭；`client/seen-close-gate.ts` 的 `SEEN_CLOSE_CONFIRM_MS` = 250ms 确认窗内又挂载 → 取消，
+  卸载后一直没回来 → 记已读（修复前把任何卸载都当关闭：桌面端点开已完成目标 pill 就消失、面板没显示，手机端 sheet 不走这条重挂载路径所以正常）；
+  ②观察到 complete 之后 agent **先 idle 再 running**
   ——这是插件能拿到的「用户发了下一条消息」的唯一代理信号（插件 API 没有 composer 提交回调），完成当轮的收尾 running→idle 只推进状态、
   不算已读；若首次观察到 complete 时 agent 已 idle（轮询间隔里那一轮已结束），直接从「已 idle」起步；③清除后 goal 为 null，自然隐藏。
   非用户发起的回合（schedule、心跳、其它 agent 的消息）也会触发②，失误方向是「提早消失」，不会多出现。agent 状态取自 pill 已有的
@@ -395,8 +399,8 @@ DSH 判参数非法。两者都在写入前拒绝，目标不受影响（FIELD-N
 | 检查 | 断言 | 依赖 | 触发 |
 |---|---|---|---|
 | `harness/goal-bridge-check.mjs` | 15/15 | **本机 DSH 安装**（从全局安装解析 `@deepseek-ai/*`，`DSH_PACKAGES_DIR`/`DSH_INSTALL_DIR` 可覆盖；没有就 exit 2） | 动 `dsh-bridge/lib/server.js` 的 `paseo/goal` / dispatch |
-| `harness/goal-pill-check.cjs` | 275/275 | 纯模块（`tsc -p harness/goal-pill.tsconfig.json`） | 动 `client/goal-polling.ts`、`client/goal-popover.tsx`、`client/goal-pill.tsx`、`client/goal-running.tsx`、`client/agent-polling.ts`、`shared/goal.ts` 或 locale goal 表 |
-| `harness/goal-popover-render-check.cjs` | 218/218 | `HOST_APP` 指向 Paseo 检出（react-native-web + jsdom 渲染真实面板）；未设置 exit 2 | 动 `client/goal-popover.tsx`、`client/deepseek-mark*.tsx` 或面板用到的 `goal-polling.ts` 规则 |
+| `harness/goal-pill-check.cjs` | 281/281 | 纯模块（`tsc -p harness/goal-pill.tsconfig.json`） | 动 `client/goal-polling.ts`、`client/goal-popover.tsx`、`client/goal-pill.tsx`、`client/goal-running.tsx`、`client/agent-polling.ts`、`shared/goal.ts` 或 locale goal 表 |
+| `harness/goal-popover-render-check.cjs` | 224/224 | `HOST_APP` 指向 Paseo 检出（react-native-web + jsdom 渲染真实面板）；未设置 exit 2 | 动 `client/goal-popover.tsx`、`client/deepseek-mark*.tsx` 或面板用到的 `goal-polling.ts` 规则 |
 | `harness/goal-server-check.cjs` | 39/39 | 真实插件 + 假桥（一次性 `DSH_HOME`） | 动 `server/provider.ts` / `server/session.ts` 的 goal 读写、`server/dsh-process.ts` 的 goal 分级与 `currentTask`、`index.server.ts` 的 handler、桥的缺失服务文案 |
 | `harness/goal-timeline-check.cjs` | 6 组 | 真实 `DshSession` + 假进程传输（`plugin-build.cjs` 自编译） | 动 `server/activity-timeline.ts` 的 goal 行、`server/session.ts` 的重放过滤、`server/locale.ts` 的 `goalRound` |
 

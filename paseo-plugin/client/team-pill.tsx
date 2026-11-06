@@ -2,16 +2,21 @@
  * The composer's team pill (T3): one pill per DSH agent whose session has an
  * Agent Team, opening the read-only roster + shared-task panel.
  *
- * - **Visibility**: `teamPillVisible` — more than the Lead, or any task.
+ * - **Visibility**: `teamPillVisible` — any task only; teammates without a
+ *   shared task do not show it. An all-done board is shown once more and then
+ *   hidden after the user has seen it (the panel was really closed, or the next
+ *   turn started; UI-v7, the user's 2026-11-06 decision). A close is a *confirmed*
+ *   one — the host remounts the popover body when it opens, so a bare unmount
+ *   means nothing (`createSeenCloseGate` in `./seen-close-gate`).
  * - **Label and title**: the noun 「团队」/「Team」 in every state; no count
  *   (T2 P1). The host uses `title` as the accessibility name, desktop tooltip
  *   and phone sheet header, so all three read the noun.
- * - **Icon**: `Users`, with the host running ring on its corner while a
- *   teammate runs (only when the server *said* it runs; T10b — the glyph is
- *   never replaced, so a pill the host shrank to its icon still reads as the
- *   team), red on a failure, muted otherwise. Sent
- *   through `update` only when it changes, like the jobs pill, so the ring does
- *   not restart on every poll.
+ * - **Icon**: the `Users` glyph, with the host running ring on its corner while
+ *   a teammate runs (only when the server *said* it runs; T10b), red on a
+ *   failure, muted otherwise; when **every task is completed** it becomes the
+ *   green `CircleCheck` (UI-v8, the goal pill's complete mark). Sent through
+ *   `update` only when it changes, like the jobs pill, so the ring does not
+ *   restart on every poll.
  *
  * Polling is the shared controller (`./agent-polling` via `./team-polling`),
  * at the jobs/goal cadence; the jobs and goal pills are untouched.
@@ -24,11 +29,20 @@ import type {
   PluginButtonRegistration,
   PluginClientContext,
 } from "@getpaseo/plugin/client";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { teamRead, type TeamView } from "../shared/team";
 import { localeText } from "./locale";
 import { CornerRingIcon } from "./corner-ring";
-import { createTeamPoller, teamPillIcon, teamPillVisible, type TeamPillIcon } from "./team-polling";
+import { createSeenCloseGate } from "./seen-close-gate";
+import {
+  createTeamPoller,
+  teamCompleteSeenStep,
+  teamPillIcon,
+  teamPillVisible,
+  type TeamPillIcon,
+  type TeamSeenEvent,
+  type TeamSeenState,
+} from "./team-polling";
 import { TeamPanel, TeamPanelNote } from "./team-popover";
 
 /** One agent's latest board, plus the popover bodies listening for the next one. */
@@ -52,8 +66,9 @@ function publish(store: TeamStore, agentId: string, team: TeamView | null): void
 
 /**
  * The icon components, one per state, so `update` swaps a stable identity. The
- * `Users` glyph is drawn in every state; a running teammate adds the corner
- * ring (`./corner-ring`) instead of replacing it.
+ * team reads through the `Users` glyph; a running teammate adds the corner ring
+ * (`./corner-ring`) instead of replacing it. The exception is an all-done board:
+ * it wears the green `CircleCheck` the goal pill uses for a complete goal.
  */
 function RunningIcon({ size, theme }: PluginButtonIconProps) {
   return <CornerRingIcon name="Users" size={size} color={theme.colors.foregroundMuted} running theme={theme} />;
@@ -61,15 +76,51 @@ function RunningIcon({ size, theme }: PluginButtonIconProps) {
 function FailedIcon({ size, theme }: PluginButtonIconProps) {
   return <CornerRingIcon name="Users" size={size} color={theme.colors.statusDanger} running={false} theme={theme} />;
 }
+function CompleteIcon({ size, theme }: PluginButtonIconProps) {
+  return <CornerRingIcon name="CircleCheck" size={size} color={theme.colors.statusSuccess} running={false} theme={theme} />;
+}
 function IdleIcon({ size, theme }: PluginButtonIconProps) {
   return <CornerRingIcon name="Users" size={size} color={theme.colors.foregroundMuted} running={false} theme={theme} />;
 }
-const ICONS: Record<TeamPillIcon, typeof IdleIcon> = { running: RunningIcon, failed: FailedIcon, idle: IdleIcon };
+const ICONS: Record<TeamPillIcon, typeof IdleIcon> = {
+  running: RunningIcon,
+  failed: FailedIcon,
+  complete: CompleteIcon,
+  idle: IdleIcon,
+};
 
-/** The popover body: reads the shared store, issues no RPC of its own. */
-export function makeTeamPopover(store: TeamStore, agentId: string) {
+/**
+ * The popover body: reads the shared store, issues no RPC of its own.
+ *
+ * `onClosed` is the "seen" signal (UI-v7), but **an unmount is not a close**: the
+ * host renders this body inside `AnchoredSurface`, whose `FloatingSurface` is
+ * keyed `placed ? "placed" : "measuring"` (Paseo 0.15.0,
+ * `packages/app/src/components/ui/menu/menu-overlay.tsx:350`), so the body is
+ * unmounted and mounted again one frame after the panel opens, while the user
+ * has only just opened it. `createSeenCloseGate` therefore confirms a close only
+ * when the unmount survives a short window; a remount cancels it. The last board
+ * it showed is what was seen, and an all-done board is then hidden.
+ */
+export function makeTeamPopover(store: TeamStore, agentId: string, onClosed: (team: TeamView | null) => void) {
+  const gate = createSeenCloseGate({
+    onClosed,
+    setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+    clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+  });
+
   function TeamPopover({ theme, layout }: PluginButtonContentProps) {
     const [team, setTeam] = useState<TeamView | null>(store.get(agentId)?.team ?? null);
+    const shown = useRef<TeamView | null>(team);
+    shown.current = team;
+    // Mount/unmount rather than a dependency array: the gate decides whether the
+    // unmount is a real close, and cancels the pending one when the host
+    // remounts this body (its open-time remount, a panel swap, StrictMode).
+    useEffect(() => {
+      gate.mounted();
+      return () => {
+        gate.unmounted(shown.current);
+      };
+    }, []);
     useEffect(() => {
       const current = store.get(agentId);
       setTeam(current?.team ?? null);
@@ -90,17 +141,68 @@ export function makeTeamPopover(store: TeamStore, agentId: string) {
 /** The daemon's page limit for the agent directory. */
 const AGENT_DIRECTORY_PAGE_SIZE = 200;
 
-/** One agent's registration and the icon state its last update left. */
+/** One agent's registration and the state its last `update` published. */
 interface PillEntry {
   readonly registration: PluginButtonRegistration;
   icon: TeamPillIcon;
+  /** What the host was last told; `present` publishes only a real change. */
+  visible: boolean;
+  label: string;
+  title: string;
 }
 
 /** Register one team pill per agent of this provider and keep it current. Returns the cleanup. */
 export function contributeTeamPill(client: PluginClientContext) {
   const store: TeamStore = new Map();
   const pills = new Map<string, PillEntry>();
+  /**
+   * agentId -> the all-done board's "seen" progress (UI-v7). Memory only: a
+   * reload forgets it and an all-done board shows once more (accepted).
+   */
+  const seenStates = new Map<string, TeamSeenState>();
+  /** agentId -> the agent's last status from the directory (snapshot or upsert). */
+  const agentStatuses = new Map<string, string | undefined>();
   const lifetime = new AbortController();
+
+  /**
+   * Publish the current visibility, label and icon for one agent from the last
+   * board in the store. Called on every poll answer, and again when only "seen"
+   * changed so an all-done board can disappear without waiting for a poll.
+   *
+   * **Only a real change reaches the host.** A poll answers every few seconds and
+   * almost always says the same thing; an identical `update` would rebuild the
+   * host's button view and the popover's page elements for nothing — and a host
+   * that remounts the surface on such an update would look like a user close to
+   * `createSeenCloseGate`. `visible`/`label`/`title`/`icon` are compared here.
+   */
+  const present = (agentId: string): void => {
+    const entry = pills.get(agentId);
+    if (entry === undefined) return;
+    const team = store.get(agentId)?.team ?? null;
+    const seen = seenStates.get(agentId)?.seen;
+    const text = localeText().team;
+    const visible = teamPillVisible(team, seen);
+    const icon = team === null ? "idle" : teamPillIcon(team);
+    if (entry.visible === visible && entry.icon === icon && entry.label === text.title && entry.title === text.title) {
+      return;
+    }
+    entry.visible = visible;
+    entry.icon = icon;
+    entry.label = text.title;
+    entry.title = text.title;
+    entry.registration.update({ visible, label: text.title, title: text.title, icon: ICONS[icon] });
+  };
+
+  /** Feed one event to an agent's "seen" machine; re-present when it changed. */
+  const advanceSeen = (agentId: string, event: TeamSeenEvent): void => {
+    // No pill, nothing to hide: a close the gate still owed a removed agent must
+    // not leave a seen state behind for a later re-add.
+    if (pills.get(agentId) === undefined) return;
+    const before = seenStates.get(agentId) ?? {};
+    const after = teamCompleteSeenStep(before, event);
+    seenStates.set(agentId, after);
+    if (after.seen !== before.seen) present(agentId);
+  };
 
   const poller = createTeamPoller({
     readTeam: (agentId) => client.rpc(teamRead, { agentId }),
@@ -109,20 +211,33 @@ export function contributeTeamPill(client: PluginClientContext) {
       return { entries: page.entries, pageInfo: page.pageInfo };
     },
     addAgent: (agent) => {
+      const text = localeText().team;
       const registration = client.addComposerPill({
         id: "dsh-team",
         workspaceId: agent.workspaceId ?? "",
         agentId: agent.id,
         button: {
           icon: IdleIcon,
-          title: localeText().team.title,
-          label: localeText().team.title,
-          // Hidden until the first poll proves there is a team.
+          title: text.title,
+          label: text.title,
+          // Hidden until the first poll proves there is a task.
           visible: false,
-          behavior: { kind: "popover", Content: makeTeamPopover(store, agent.id) },
+          behavior: {
+            kind: "popover",
+            Content: makeTeamPopover(store, agent.id, (team) => {
+              // A close is only this pill's: the gate's confirmation can land
+              // after the agent's pill was replaced or removed, and a stale
+              // "seen" must never hide a board the user has not been shown.
+              if (pills.get(agent.id)?.registration !== registration) return;
+              advanceSeen(agent.id, { kind: "closed", team });
+            }),
+          },
         },
       });
-      pills.set(agent.id, { registration, icon: "idle" });
+      pills.set(agent.id, { registration, icon: "idle", visible: false, label: text.title, title: text.title });
+      // A re-added agent starts clean: a previous pill's "seen" must not hide a
+      // board the user has not been shown since.
+      seenStates.delete(agent.id);
       store.delete(agent.id);
     },
     removeAgent: (agentId, reason, error) => {
@@ -130,6 +245,8 @@ export function contributeTeamPill(client: PluginClientContext) {
       if (entry === undefined) return;
       pills.delete(agentId);
       entry.registration.remove();
+      seenStates.delete(agentId);
+      agentStatuses.delete(agentId);
       store.delete(agentId);
       if (reason === "unauthorized") {
         console.error(
@@ -141,15 +258,10 @@ export function contributeTeamPill(client: PluginClientContext) {
       }
     },
     publishState: (agentId, team) => {
-      const entry = pills.get(agentId);
-      if (entry === undefined) return;
+      if (pills.get(agentId) === undefined) return;
       publish(store, agentId, team);
-      const text = localeText().team;
-      const visible = teamPillVisible(team);
-      const icon = team === null ? "idle" : teamPillIcon(team);
-      const iconPatch = icon === entry.icon ? {} : { icon: ICONS[icon] };
-      entry.icon = icon;
-      entry.registration.update({ visible, label: text.title, title: text.title, ...iconPatch });
+      advanceSeen(agentId, { kind: "board", team, agentStatus: agentStatuses.get(agentId) });
+      present(agentId);
     },
     onError: (message, error) => {
       if (lifetime.signal.aborted) return;
@@ -171,6 +283,7 @@ export function contributeTeamPill(client: PluginClientContext) {
     .then(({ subscription }) => {
       subscription.subscribe({
         snapshot: (page) => {
+          for (const { agent } of page.entries) agentStatuses.set(agent.id, agent.status);
           void poller.applySnapshot(page);
         },
         update: (message) => {
@@ -178,6 +291,10 @@ export function contributeTeamPill(client: PluginClientContext) {
           const update = message.payload;
           if (update.kind === "upsert") {
             poller.upsert(update.agent);
+            // The agent's status is the only "the user moved on" signal the
+            // client has: a turn starting after the completing one ended.
+            agentStatuses.set(update.agent.id, update.agent.status);
+            advanceSeen(update.agent.id, { kind: "agent", status: update.agent.status });
             return;
           }
           poller.drop(update.agentId);

@@ -8,6 +8,10 @@
  * ever drawn), the owner's running ring, the task mark and the direction-B
  * grouping, and the facts lines.
  *
+ * Which popover unmount is a *user close* (UI-v7) is not decided here: the host
+ * remounts the body once when it opens, so an unmount alone means nothing —
+ * that rule is `./seen-close-gate`, shared with the goal pill.
+ *
  * Polling is `./agent-polling`'s controller, unchanged: this module only adapts
  * the `team.read` answer to it, like `./goal-polling` does for the goal.
  *
@@ -37,16 +41,31 @@ export interface TeamReadResult {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Whether there is a team to show: at least one teammate, or any task.
+ * Whether there is a team to show: **any task**, and nothing else.
  *
- * Counted on `role === "teammate"`, not on `members.length > 1`: the rule must
- * not depend on DSH synthesising the Lead row. A Lead alone with no task is a
- * session that never used the team tools — no pill (T1 §6.1), the same shape
- * as the jobs pill hiding with nothing live and the goal pill with no goal.
+ * The user decided on 2026-11-06 that starting teammates is not a reason to
+ * light the pill: a team of running members with no shared task only shows
+ * 「N 名成员 / 暂无共享任务」, so the pill must stay hidden for exactly that
+ * case. The teammate count no longer takes part — a task is the board's point,
+ * and it shows the pill even when no member row exists yet.
+ *
+ * A board whose tasks are **all completed** is shown once more and then hidden
+ * once the user has seen it (UI-v7, the user's 2026-11-06 decision): `seen` is
+ * the remembered {@link teamAllDoneKey} for this agent, and an all-done board
+ * whose key equals it is hidden. A new task or a revision change makes a new
+ * key, so the pill shows once more.
+ *
+ * A board that is `null`/`undefined` — no team, or one the session never used
+ * — stays hidden, the same shape as the jobs pill hiding with nothing live and
+ * the goal pill with no goal. A profile without the team bundle is **not** this
+ * case: it is the terminal `team_unavailable`, which removes the pill.
  */
-export function teamPillVisible(team: TeamView | null | undefined): boolean {
+export function teamPillVisible(team: TeamView | null | undefined, seen?: string): boolean {
   if (team === null || team === undefined) return false;
-  return teamMateCount(team) > 0 || team.tasks.length > 0;
+  if (team.tasks.length === 0) return false;
+  const key = teamAllDoneKey(team);
+  if (key !== undefined && key === seen) return false;
+  return true;
 }
 
 /** How many teammates the board has — the Lead (the main session) is not one. */
@@ -54,20 +73,131 @@ export function teamMateCount(team: TeamView): number {
   return team.members.filter((member) => member.role === "teammate").length;
 }
 
+/* -------------------------------------------------------------------------- */
+/* An all-done board's "seen" state (UI-v7)                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The key an all-done board's "seen" state is remembered under: the tasks
+ * sorted by id, each as `id:revision`, joined with `,`.
+ *
+ * `undefined` while the board is empty or any task is not `completed` — a
+ * working board is always visible and has nothing to remember. A new task, a
+ * revision change or a different set of ids is a new key, so the pill shows
+ * once more.
+ */
+export function teamAllDoneKey(team: TeamView): string | undefined {
+  if (team.tasks.length === 0) return undefined;
+  if (!team.tasks.every((task) => task.status === "completed")) return undefined;
+  return [...team.tasks]
+    .sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0))
+    .map((task) => `${task.id}:${String(task.revision)}`)
+    .join(",");
+}
+
+/**
+ * Per-agent progress towards "the user has moved on from this all-done board".
+ *
+ * - `watching`: an all-done board with this key was observed; the turn that
+ *   completed it may still be running (the model writes its closing summary
+ *   after the last `team_task_update`), so a `running` here proves nothing.
+ * - `idleSeen`: the agent went idle after the completion. The **next**
+ *   `running` is a new turn — the user's next message, as far as the client can
+ *   tell (the plugin API has no composer-submit signal) — and marks it seen.
+ */
+export interface TeamCompleteWatch {
+  readonly key: string;
+  readonly stage: "watching" | "idleSeen";
+}
+
+/** One input to {@link teamCompleteSeenStep}. */
+export type TeamSeenEvent =
+  /**
+   * A poll answer: the board now (null when there is none), and the agent's last
+   * known status. Polls are seconds apart, so the completing turn may already
+   * have ended when "all done" is first observed; an idle agent at that moment
+   * starts the watch at `idleSeen`, or the user's next message would be missed.
+   */
+  | { readonly kind: "board"; readonly team: TeamView | null; readonly agentStatus?: string }
+  /** The agent's status, from the agent directory subscription. */
+  | { readonly kind: "agent"; readonly status: string | undefined }
+  /**
+   * The all-done panel was opened and then **really** closed: the popover body's
+   * unmount survived the confirmation window in `./seen-close-gate`.
+   */
+  | { readonly kind: "closed"; readonly team: TeamView | null };
+
+/** The machine's state: the remembered seen key and the watch in progress. */
+export interface TeamSeenState {
+  readonly seen?: string;
+  readonly watch?: TeamCompleteWatch;
+}
+
+/**
+ * Advance one agent's "seen" state.
+ *
+ * Seen means: the panel of that all-done board was closed after being opened,
+ * or a turn started after the completing turn had ended (idle, then running).
+ * The completing turn's own `running → idle` only moves the watch to
+ * `idleSeen`; a completion first observed while the agent is already idle
+ * starts there. A board that is no longer all done (a task reopened, a new one
+ * added) drops the watch; the remembered key stays, so the same
+ * `id:revision` set cannot reappear, and any new key is shown again.
+ */
+export function teamCompleteSeenStep(state: TeamSeenState, event: TeamSeenEvent): TeamSeenState {
+  switch (event.kind) {
+    case "board": {
+      const team = event.team;
+      const key = team === null ? undefined : teamAllDoneKey(team);
+      if (key === undefined) {
+        return state.seen === undefined ? {} : { seen: state.seen };
+      }
+      if (state.seen === key) return { seen: key };
+      if (state.watch?.key === key) return state;
+      const stage = event.agentStatus === "idle" ? "idleSeen" : "watching";
+      return { ...(state.seen === undefined ? {} : { seen: state.seen }), watch: { key, stage } };
+    }
+    case "agent": {
+      const watch = state.watch;
+      if (watch === undefined) return state;
+      if (event.status === "idle" && watch.stage === "watching") {
+        return { ...state, watch: { key: watch.key, stage: "idleSeen" } };
+      }
+      if (event.status === "running" && watch.stage === "idleSeen") return { seen: watch.key };
+      return state;
+    }
+    case "closed": {
+      const team = event.team;
+      const key = team === null ? undefined : teamAllDoneKey(team);
+      if (key === undefined) return state;
+      return { seen: key };
+    }
+  }
+}
+
 /** The pill's icon state. The label is always the noun. */
-export type TeamPillIcon = "running" | "failed" | "idle";
+export type TeamPillIcon = "running" | "failed" | "complete" | "idle";
 
 /**
  * Which mark the pill wears.
  *
  * - `failed`: the projection recorded a failure, or a member failed to start.
- *   Red `Users`.
+ *   Red `Users`. **Outranks everything**: an error must not be painted over by a
+ *   finished board.
+ * - `complete`: **every task is `completed`** (UI-v8, the user's 2026-11-06
+ *   decision) — the green `CircleCheck`, the goal pill's complete mark. Only a
+ *   board with at least one task can be complete: `tasks.length > 0` is part of
+ *   the rule, because an empty board has no work to finish (and the pill is
+ *   hidden for it anyway — {@link teamPillVisible}).
  * - `running`: a teammate is executing a turn **and the server said so**
  *   (`running === true`). The host's running ring.
  * - `idle`: everything else, including "we do not know". Muted `Users`.
+ *
+ * Priority: `failed` > `complete` > `running` > `idle`.
  */
 export function teamPillIcon(team: TeamView): TeamPillIcon {
   if (team.failure !== undefined || team.members.some((member) => member.phase === "failed")) return "failed";
+  if (team.tasks.length > 0 && team.tasks.every((task) => task.status === "completed")) return "complete";
   return team.members.some((member) => member.role === "teammate" && member.running === true) ? "running" : "idle";
 }
 

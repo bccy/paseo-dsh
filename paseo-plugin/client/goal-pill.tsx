@@ -65,6 +65,7 @@ import {
 } from "./goal-polling";
 import { FACTS_FONT_SIZE } from "./jobs-popover-layout";
 import { localeText } from "./locale";
+import { createSeenCloseGate } from "./seen-close-gate";
 
 /** One agent's latest answer, plus the listeners the pill and popover subscribe with. */
 interface AgentGoal {
@@ -173,9 +174,10 @@ export function makeGoalIcon(store: GoalStore, agentId: string) {
  * paused goal at its round cap refuses `resume`, and closing the popover would
  * leave the user with no explanation. **Leaving the editor closes it** (UI-v8):
  * 取消 / Escape, and a successful save, call the host's `close()`; the clear
- * page's 取消 still returns to the main page (`goalPanelNext`). Closing unmounts
- * this body, which records "seen" only for a complete goal — and the editor
- * never shows one, so an edit never marks anything seen.
+ * page's 取消 still returns to the main page (`goalPanelNext`). A close is
+ * **confirmed** (`./seen-close-gate`): the body records "seen" only for a
+ * complete goal once it has really been closed — and the editor never shows one,
+ * so an edit never marks anything seen.
  *
  * Exported only so `harness/goal-popover-render-check.cjs` can mount the real
  * container with a fake RPC client. Clearing is an in-place confirmation page
@@ -188,14 +190,31 @@ export function makeGoalPopover(
   refresh: () => Promise<void>,
   onClosed: (goal: GoalState | null) => void,
 ) {
+  /**
+   * An unmount is not a close: the host remounts this body once when the panel
+   * opens (its `FloatingSurface` is keyed `placed ? "placed" : "measuring"`,
+   * `menu-overlay.tsx:350`), so only an unmount that outlives
+   * `./seen-close-gate`'s confirmation window is the user closing the panel. The
+   * last goal it showed is what was seen; a completed one is then hidden.
+   */
+  const gate = createSeenCloseGate<GoalState>({
+    onClosed,
+    setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+    clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+  });
+
   function GoalPopover({ theme, layout, close }: PluginButtonContentProps) {
     const [entry, setEntry] = useState<AgentGoal | undefined>(store.get(agentId));
-    // The host unmounts a closed surface's content (`menu-surface.tsx` /
-    // `menu-overlay.tsx`), so this body's unmount *is* "the panel was closed".
-    // The last goal it showed is what was seen; a completed one is then hidden.
     const shown = useRef<GoalState | null>(entry?.goal ?? null);
     shown.current = entry?.goal ?? null;
-    useEffect(() => () => onClosed(shown.current), []);
+    // Mount/unmount rather than a dependency array: the gate decides whether the
+    // unmount is a real close, and cancels it when the host remounts this body.
+    useEffect(() => {
+      gate.mounted();
+      return () => {
+        gate.unmounted(shown.current);
+      };
+    }, []);
     const [busy, setBusy] = useState<GoalAction | null>(null);
     const [error, setError] = useState<string | undefined>(undefined);
     const [mode, setMode] = useState<"view" | "edit" | "confirm">("view");
@@ -368,6 +387,8 @@ export function contributeGoalPill(client: PluginClientContext) {
   const seenStates = new Map<string, GoalSeenState>();
   /** agentId -> the last poll answer, to re-present it when only "seen" changed. */
   const answers = new Map<string, GoalViewState>();
+  /** agentId -> what the host was last told; an unchanged poll publishes nothing. */
+  const published = new Map<string, { visible: boolean; label: string; title: string }>();
   /** agentId -> the agent's last status from the directory (snapshot or upsert). */
   const agentStatuses = new Map<string, string | undefined>();
   const lifetime = new AbortController();
@@ -397,11 +418,22 @@ export function contributeGoalPill(client: PluginClientContext) {
     // glyph's, and the panel's first row speaks it. Never the objective — that
     // would print it twice on a phone.
     const { label, title } = goalPillCopy(presentation, text);
+    // A poll answers every few seconds and almost always says the same thing; an
+    // identical update would rebuild the host's button view and the popover's
+    // page elements for nothing (the team pill's rule).
+    const before = published.get(agentId);
+    if (before !== undefined && before.visible === presentation.visible && before.label === label && before.title === title) {
+      return;
+    }
+    published.set(agentId, { visible: presentation.visible, label, title });
     registration.update({ visible: presentation.visible, label, title });
   };
 
   /** Feed one event to an agent's "seen" machine; re-present when it changed visibility. */
   const advanceSeen = (agentId: string, event: GoalCompleteEvent): void => {
+    // No pill, nothing to hide: a close the gate still owed a removed agent must
+    // not leave a seen state behind for a later re-add.
+    if (pills.get(agentId) === undefined) return;
     const before = seenStates.get(agentId) ?? {};
     const after = goalCompleteSeenStep(before, event);
     seenStates.set(agentId, after);
@@ -436,6 +468,7 @@ export function contributeGoalPill(client: PluginClientContext) {
       return { entries: page.entries, pageInfo: page.pageInfo };
     },
     addAgent: (agent) => {
+      const text = localeText().goal;
       const registration = client.addComposerPill({
         id: "dsh-goal",
         workspaceId: agent.workspaceId ?? "",
@@ -444,7 +477,7 @@ export function contributeGoalPill(client: PluginClientContext) {
           // A custom component so the Target glyph can carry the goal's tone
           // (the host would paint a plain icon name muted for every state).
           icon: makeGoalIcon(store, agent.id),
-          title: localeText().goal.title,
+          title: text.title,
           // Hidden until the first poll proves otherwise: a pill that appears and
           // then disappears is worse.
           visible: false,
@@ -455,14 +488,25 @@ export function contributeGoalPill(client: PluginClientContext) {
               store,
               agent.id,
               () => poller.pollNow(agent.id),
-              (goal) => advanceSeen(agent.id, { kind: "closed", goal }),
+              (goal) => {
+                // Only this pill's close counts: the gate's confirmation can land
+                // after the agent's pill was replaced or removed, and a stale
+                // "seen" must never hide a goal the user has not been shown.
+                if (pills.get(agent.id) !== registration) return;
+                advanceSeen(agent.id, { kind: "closed", goal });
+              },
             ),
           },
         },
       });
       pills.set(agent.id, registration);
+      // The registration starts hidden with the noun as its effective label.
+      published.set(agent.id, { visible: false, label: text.title, title: text.title });
       store.delete(agent.id);
       answers.delete(agent.id);
+      // A re-added agent starts clean: a previous pill's "seen" must not hide a
+      // goal the user has not been shown since.
+      seenStates.delete(agent.id);
     },
     removeAgent: (agentId, reason, error) => {
       const entry = pills.get(agentId);
@@ -470,6 +514,7 @@ export function contributeGoalPill(client: PluginClientContext) {
       pills.delete(agentId);
       entry.remove();
       answers.delete(agentId);
+      published.delete(agentId);
       seenStates.delete(agentId);
       agentStatuses.delete(agentId);
       // Dropped rather than kept: the popover must not show a stale goal for an

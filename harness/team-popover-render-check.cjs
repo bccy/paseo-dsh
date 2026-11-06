@@ -95,6 +95,7 @@ fs.writeFileSync(
   entry,
   `export { TeamPanel, TeamPanelNote } from ${JSON.stringify(path.join(pluginRoot, "client/team-popover.tsx"))};
 export { makeTeamPopover } from ${JSON.stringify(path.join(pluginRoot, "client/team-pill.tsx"))};
+export { SEEN_CLOSE_CONFIRM_MS } from ${JSON.stringify(path.join(pluginRoot, "client/seen-close-gate.ts"))};
 export { allText } from ${JSON.stringify(path.join(pluginRoot, "client/locale.ts"))};
 export { createRoot } from "react-dom/client";
 export { createElement } from "react";
@@ -143,7 +144,7 @@ for (const name of ["ShadowRoot", "HTMLElement", "Element", "Node", "MutationObs
 }
 
 const bundled = require(path.join(work, "bundle.cjs"));
-const { TeamPanel, TeamPanelNote, makeTeamPopover, allText, createRoot, createElement, flushSync } = bundled;
+const { TeamPanel, TeamPanelNote, makeTeamPopover, SEEN_CLOSE_CONFIRM_MS, allText, createRoot, createElement, flushSync } = bundled;
 const React = { createElement };
 const text = allText()["zh-CN"].team;
 const theme = {
@@ -403,25 +404,59 @@ console.log("\nempty, Lead-only, failure, read-only");
   assert("the note body draws its sentence", note.textContent.includes("本会话没有团队"));
 }
 
-console.log("\nthe real container reads the shared store");
-{
-  const listeners = new Set();
-  const store = new Map([["agent-1", { team: BOARD, listeners }]]);
-  const Popover = makeTeamPopover(store, "agent-1");
-  const container = document.createElement("div");
-  document.body.appendChild(container);
-  flushSync(() => createRoot(container).render(React.createElement(Popover, { theme, layout: { compact: true, platform: "web" }, close: () => {} })));
-  assert("the container draws the board", container.textContent.includes("独立审查修复"));
-  check("…and subscribes for the next poll", listeners.size, 1);
-  store.set("agent-1", { team: { ...BOARD, tasks: [] }, listeners });
-  flushSync(() => [...listeners].forEach((listener) => listener()));
-  assert("a new board redraws in place", container.textContent.includes("暂无共享任务"));
+async function containerChecks() {
+  console.log("\nthe real container reads the shared store, and a close is confirmed");
+  {
+    const listeners = new Set();
+    const store = new Map([["agent-1", { team: BOARD, listeners }]]);
+    const closed = [];
+    const Popover = makeTeamPopover(store, "agent-1", (team) => closed.push(team));
+    const props = { theme, layout: { compact: true, platform: "web" }, close: () => {} };
+    const mount = () => {
+      const container = document.createElement("div");
+      document.body.appendChild(container);
+      const root = createRoot(container);
+      flushSync(() => root.render(React.createElement(Popover, props)));
+      return { container, root };
+    };
+    const first = mount();
+    assert("the container draws the board", first.container.textContent.includes("独立审查修复"));
+    check("…and subscribes for the next poll", listeners.size, 1);
+    store.set("agent-1", { team: { ...BOARD, tasks: [] }, listeners });
+    flushSync(() => [...listeners].forEach((listener) => listener()));
+    assert("a new board redraws in place", first.container.textContent.includes("暂无共享任务"));
+    flushSync(() => first.root.unmount());
+    // The host remounts the popover body once when the panel opens
+    // (`menu-overlay.tsx:350`: `key={placed ? "placed" : "measuring"}`). The
+    // unmount above is that remount, not the user closing the panel — a fresh root
+    // stands in for the body the host mounts again, and the gate (per container)
+    // must swallow it. Before the fix this reported "closed" and hid the pill.
+    const second = mount();
+    await sleep(SEEN_CLOSE_CONFIRM_MS + 80);
+    check("the host's open-time remount is not a close", closed.length, 0);
+    flushSync(() => second.root.unmount());
+    check("…and a real close is not reported before the window elapses", closed.length, 0);
+    await sleep(SEEN_CLOSE_CONFIRM_MS + 80);
+    check("a real close reports the board it showed (the seen signal)", closed.at(-1)?.tasks?.length, 0);
+    check("…exactly once", closed.length, 1);
+  }
 }
 
-console.log(`\n${checks - failures}/${checks} checks passed`);
-if (failures > 0) {
-  console.error(`${failures} FAILED`);
-  process.exit(1);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function report() {
+  console.log(`\n${checks - failures}/${checks} checks passed`);
+  if (failures > 0) {
+    console.error(`${failures} FAILED`);
+    process.exit(1);
+  }
+  console.log("OK");
+  process.exit(0);
 }
-console.log("OK");
-process.exit(0);
+
+containerChecks()
+  .catch((error) => {
+    failures += 1;
+    console.error(`  FAIL the container checks threw: ${error instanceof Error ? error.stack : String(error)}`);
+  })
+  .then(report);

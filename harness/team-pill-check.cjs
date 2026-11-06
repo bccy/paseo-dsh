@@ -4,10 +4,20 @@
  * The rules live in `client/team-polling.ts` as plain functions (no React, no
  * host), so their behaviour can be pinned here:
  *
- *   - **visibility**: only the Lead and no task → hidden; a teammate or a task →
- *     visible; no board → hidden;
- *   - **the pill icon**: failure / failed member → red, a teammate the server
- *     *says* runs → ring, "unknown" is never the ring;
+ *   - **visibility**: tasks only (the user's 2026-11-06 decision) — any task →
+ *     visible, no task → hidden even with teammates running; no board → hidden;
+ *     an all-done board is shown once more and then hidden after the user has
+ *     seen it (`teamAllDoneKey` / `teamCompleteSeenStep`, UI-v7);
+ *   - **"closed" is confirmed, not assumed** (the shared
+ *     `client/seen-close-gate.ts`, UI-v7 fix — the goal pill uses it too):
+ *     the host unmounts the popover body when it *opens* (its surface remounts
+ *     once the position lands), so only an unmount that outlives the window is a
+ *     user close — a remount inside it cancels, and nothing is ever reported
+ *     twice;
+ *   - **the pill icon**: failure / failed member → red, every task completed →
+ *     the green `CircleCheck` (complete outranks running, failure outranks
+ *     complete), a teammate the server *says* runs → ring, "unknown" is never
+ *     the ring;
  *   - **member words**: running/idle only when the server sent `running`; an
  *     `active` member without it reads 成员, never 运行中 or 空闲;
  *   - **direction B grouping**: 进行中 → 可开始 → 等待依赖 → 已完成, by DSH's
@@ -31,6 +41,8 @@ const {
   TEAM_GROUP_ORDER,
   TEAM_TASK_ICONS,
   createTeamPoller,
+  teamAllDoneKey,
+  teamCompleteSeenStep,
   teamMemberState,
   TEAM_HEAD_LEVELS,
   teamHeadAt,
@@ -50,6 +62,7 @@ const {
   teamTaskMark,
   teamWarningText,
 } = require("./client/team-polling.js");
+const { SEEN_CLOSE_CONFIRM_MS, createSeenCloseGate } = require("./client/seen-close-gate.js");
 const { allText } = require("./client/locale.js");
 const { PROVIDER_ID } = require("./shared/provider.js");
 const { isTerminalTeamErrorCode, teamViewSchema, TEAM_ERROR_CODES, TERMINAL_TEAM_ERROR_CODES } = require("./shared/team.js");
@@ -91,15 +104,169 @@ const task = (over = {}) => ({
 
 console.log("visibility");
 {
+  // Tasks only (the user's 2026-11-06 decision): starting teammates without a
+  // shared task must not light the pill — the panel would only say
+  // 「N 名成员 / 暂无共享任务」, which is the screenshot the user rejected.
   equal("no board → hidden", teamPillVisible(null), false);
+  equal("no board (undefined) → hidden", teamPillVisible(undefined), false);
   equal("only the Lead, no task → hidden", teamPillVisible({ members: [LEAD], tasks: [] }), false);
+  equal("a teammate, no task → hidden", teamPillVisible({ members: [LEAD, mate()], tasks: [] }), false);
+  equal("a running teammate, no task → hidden", teamPillVisible({ members: [LEAD, mate({ running: true })], tasks: [] }), false);
   equal("the Lead and one task → visible", teamPillVisible({ members: [LEAD], tasks: [task()] }), true);
-  equal("a teammate, no task → visible", teamPillVisible({ members: [LEAD, mate()], tasks: [] }), true);
-  equal("a failure on an otherwise empty board stays hidden only when there is no team", teamPillVisible({ members: [LEAD], tasks: [], failure: "x" }), false);
-  // Visibility counts teammates, not rows: it must not lean on the synthesised Lead row.
-  equal("a teammate and no Lead row → visible", teamPillVisible({ members: [mate()], tasks: [] }), true);
+  equal("a task and no member rows → visible", teamPillVisible({ members: [], tasks: [task()] }), true);
+  equal("a teammate and a task → visible", teamPillVisible({ members: [LEAD, mate()], tasks: [task()] }), true);
+  equal("a completed task still counts (any task, not only open ones)", teamPillVisible({ members: [LEAD], tasks: [task({ status: "completed" })] }), true);
+  equal("a failure on an otherwise empty board stays hidden", teamPillVisible({ members: [LEAD], tasks: [], failure: "x" }), false);
   equal("no rows, no task → hidden", teamPillVisible({ members: [], tasks: [] }), false);
   equal("teammates are counted without the Lead", teamMateCount({ members: [LEAD, mate({ id: "a" }), mate({ id: "b" })], tasks: [] }), 2);
+}
+
+console.log("\nan all-done board's seen state (UI-v7)");
+{
+  // The key is `id:revision`, sorted by id, and only while every task is done.
+  const done = (id, revision) => task({ id, revision, status: "completed" });
+  const allDone = { members: [LEAD], tasks: [done("task-1", 3), done("task-2", 7)] };
+  const allDoneNewer = { members: [LEAD], tasks: [done("task-1", 3), done("task-2", 8)] };
+  const partial = { members: [LEAD], tasks: [done("task-1", 3), task({ id: "task-2" })] };
+  const KEY = "task-1:3,task-2:7";
+  equal("empty board → no key", teamAllDoneKey({ members: [LEAD], tasks: [] }), undefined);
+  equal("a pending task → no key", teamAllDoneKey({ members: [LEAD], tasks: [task()] }), undefined);
+  equal("one open task among done → no key", teamAllDoneKey(partial), undefined);
+  equal("all done → id:revision joined", teamAllDoneKey(allDone), KEY);
+  equal("…sorted by id, whatever the wire order", teamAllDoneKey({ members: [LEAD], tasks: [...allDone.tasks].reverse() }), KEY);
+  equal("a revision change → a new key", teamAllDoneKey(allDoneNewer), "task-1:3,task-2:8");
+
+  const step = (state, event) => teamCompleteSeenStep(state, event);
+  const watching = { watch: { key: KEY, stage: "watching" } };
+  const idleSeen = { watch: { key: KEY, stage: "idleSeen" } };
+  equal("all done first seen while running → watching", step({}, { kind: "board", team: allDone, agentStatus: "running" }), watching);
+  equal("…first seen while idle → idleSeen (the next message must not be missed)", step({}, { kind: "board", team: allDone, agentStatus: "idle" }), idleSeen);
+  equal("the completing turn's idle only moves the watch", step(watching, { kind: "agent", status: "idle" }), idleSeen);
+  equal("a running while still watching proves nothing", step(watching, { kind: "agent", status: "running" }), watching);
+  equal("the next running marks it seen", step(idleSeen, { kind: "agent", status: "running" }), { seen: KEY });
+  equal("closing the panel marks it seen", step({}, { kind: "closed", team: allDone }), { seen: KEY });
+  equal("closing a not-all-done board marks nothing", step({}, { kind: "closed", team: partial }), {});
+  equal(
+    "a board that stops being all done drops the watch, keeps seen",
+    step({ seen: "old", watch: { key: KEY, stage: "watching" } }, { kind: "board", team: partial }),
+    { seen: "old" },
+  );
+  equal("the same all-done board after seen keeps it seen", step({ seen: KEY }, { kind: "board", team: allDone }), { seen: KEY });
+  equal(
+    "a new key shows again, the old seen stays",
+    step({ seen: KEY }, { kind: "board", team: allDoneNewer, agentStatus: "idle" }),
+    { seen: KEY, watch: { key: "task-1:3,task-2:8", stage: "idleSeen" } },
+  );
+
+  equal("all done + seen → hidden", teamPillVisible(allDone, KEY), false);
+  equal("all done + no seen → visible", teamPillVisible(allDone), true);
+  equal("all done + a different seen → visible", teamPillVisible(allDone, "other"), true);
+  equal("a working board + any seen → visible", teamPillVisible(partial, KEY), true);
+  equal("an empty board + seen → hidden", teamPillVisible({ members: [LEAD], tasks: [] }, KEY), false);
+  equal("no board + seen → hidden", teamPillVisible(null, KEY), false);
+}
+
+console.log("\na close is confirmed, not assumed (UI-v7 fix: the host remounts the body at open)");
+{
+  // The host's popover content is keyed `placed ? "placed" : "measuring"`
+  // (menu-overlay.tsx:350), so opening a panel mounts the body, unmounts it one
+  // measurement frame later and mounts it again. Only a later unmount that stays
+  // unmounted is the user closing the panel.
+  const board = { members: [LEAD], tasks: [task({ id: "task-1", revision: 2, status: "completed" })] };
+  const makeGate = (delayMs) => {
+    const scheduled = [];
+    const closed = [];
+    const created = createSeenCloseGate({
+      onClosed: (team) => closed.push(team),
+      setTimeout: (callback, ms) => {
+        const handle = { callback, ms, live: true };
+        scheduled.push(handle);
+        return handle;
+      },
+      clearTimeout: (handle) => {
+        if (handle !== undefined && handle !== null) handle.live = false;
+      },
+      ...(delayMs === undefined ? {} : { delayMs }),
+    });
+    return {
+      gate: created,
+      closed,
+      scheduled,
+      live: () => scheduled.filter((handle) => handle.live),
+      fire: () => {
+        for (const handle of scheduled.filter((candidate) => candidate.live)) {
+          handle.live = false;
+          handle.callback();
+        }
+      },
+    };
+  };
+
+  assert("the confirmation window is 100–300ms", SEEN_CLOSE_CONFIRM_MS >= 100 && SEEN_CLOSE_CONFIRM_MS <= 300, String(SEEN_CLOSE_CONFIRM_MS));
+  {
+    const one = makeGate();
+    one.gate.mounted();
+    one.gate.unmounted(board);
+    equal("a real close is not reported before the window elapses", one.closed.length, 0);
+    equal("…the window is the default one", one.live()[0]?.ms, SEEN_CLOSE_CONFIRM_MS);
+    one.fire();
+    equal("…and it is reported once the window does", one.closed.length, 1);
+    assert("…with the board it showed", one.closed[0] === board);
+  }
+  {
+    // The host's open-time remount: mount → unmount (measuring) → mount (placed).
+    const one = makeGate();
+    one.gate.mounted();
+    one.gate.unmounted(board);
+    const stale = one.live()[0];
+    one.gate.mounted();
+    equal("a remount inside the window leaves no timer behind", one.live().length, 0);
+    stale.live = false;
+    stale.callback();
+    equal("…and a late fire of the cancelled timer reports nothing", one.closed.length, 0);
+  }
+  {
+    // The whole point: opening an all-done pill must not hide it.
+    const one = makeGate(40);
+    one.gate.mounted();
+    one.gate.unmounted(board); // the open-time measuring unmount
+    one.gate.mounted(); // the placed render
+    one.fire();
+    equal("opening the panel does not report a close", one.closed.length, 0);
+    one.gate.unmounted(board); // the user really closed it
+    one.fire();
+    equal("a close after the open-time remount reports exactly once", one.closed.length, 1);
+    equal("…on the configured window", one.scheduled.at(-1)?.ms, 40);
+  }
+  {
+    // Remount churn (a poll redraw, a panel swap) never accumulates reports.
+    const one = makeGate();
+    for (let index = 0; index < 4; index += 1) {
+      one.gate.mounted();
+      one.gate.unmounted(board);
+    }
+    one.gate.mounted();
+    one.fire();
+    equal("repeated remounts never add a close", one.closed.length, 0);
+    one.gate.unmounted(board);
+    one.fire();
+    equal("…and the eventual real close reports once", one.closed.length, 1);
+  }
+  {
+    // Closing and reopening inside the window: the user is looking at the board
+    // again, so the reopen cancels and only the next close reports.
+    const one = makeGate();
+    one.gate.mounted();
+    one.gate.unmounted(board);
+    one.gate.mounted();
+    one.gate.unmounted(board);
+    one.gate.mounted();
+    one.fire();
+    equal("closing and reopening inside the window reports nothing", one.closed.length, 0);
+    one.gate.unmounted(board);
+    one.fire();
+    equal("…the next close reports it once", one.closed.length, 1);
+  }
 }
 
 console.log("\nthe pill icon");
@@ -110,6 +277,16 @@ console.log("\nthe pill icon");
   equal("a running Lead alone is not the team running", teamPillIcon({ members: [{ ...LEAD, running: true }], tasks: [task()] }), "idle");
   equal("a failed member → failed", teamPillIcon({ members: [LEAD, mate({ phase: "failed", running: true })], tasks: [] }), "failed");
   equal("a projection failure → failed, even with a runner", teamPillIcon({ members: [LEAD, mate({ running: true })], tasks: [], failure: "bad" }), "failed");
+  // UI-v8: an all-done board wears the goal pill's green CircleCheck.
+  const done = (id, revision = 1) => task({ id, revision, status: "completed" });
+  equal("every task completed → complete", teamPillIcon({ members: [LEAD], tasks: [done("task-1")] }), "complete");
+  equal("…several completed tasks → complete", teamPillIcon({ members: [LEAD, mate()], tasks: [done("task-1"), done("task-2", 3)] }), "complete");
+  equal("…complete outranks a running teammate", teamPillIcon({ members: [LEAD, mate({ running: true })], tasks: [done("task-1")] }), "complete");
+  equal("one open task among completed → not complete", teamPillIcon({ members: [LEAD], tasks: [done("task-1"), task({ id: "task-2" })] }), "idle");
+  equal("…a running teammate then decides", teamPillIcon({ members: [LEAD, mate({ running: true })], tasks: [done("task-1"), task({ id: "task-2" })] }), "running");
+  equal("a projection failure beats complete", teamPillIcon({ members: [LEAD], tasks: [done("task-1")], failure: "bad" }), "failed");
+  equal("a failed member beats complete", teamPillIcon({ members: [LEAD, mate({ phase: "failed" })], tasks: [done("task-1")] }), "failed");
+  equal("no tasks is idle, never complete", teamPillIcon({ members: [LEAD], tasks: [] }), "idle");
 }
 
 console.log("\nthe roster headline chips (T7): no running/stopped without the server's running");
@@ -326,9 +503,21 @@ console.log("\npill wiring (source pins)");
 {
   const repo = path.resolve(__dirname, "..", "..");
   const pill = fs.readFileSync(path.join(repo, "paseo-plugin/client/team-pill.tsx"), "utf8");
-  assert("label and title are both the noun", /update\(\{ visible, label: text\.title, title: text\.title/.test(pill));
+  assert(
+    "label and title are both the noun",
+    /registration\.update\(\{ visible, label: text\.title, title: text\.title, icon: ICONS\[icon\] \}\)/.test(pill),
+  );
+  assert(
+    "the popover close is confirmed through the gate, never read off one unmount",
+    /createSeenCloseGate\(\{/.test(pill) && /gate\.mounted\(\)/.test(pill) && /gate\.unmounted\(shown\.current\)/.test(pill),
+  );
+  assert("…the old unmount-is-a-close effect is gone", !/useEffect\(\(\) => \(\) => onClosed\(/.test(pill));
+  assert(
+    "present publishes only a real change (visible/label/title/icon)",
+    /entry\.visible === visible && entry\.icon === icon && entry\.label === text\.title && entry\.title === text\.title[\s\S]{0,80}return;/.test(pill),
+  );
   assert("the pill never puts a count in its label (P1)", !/label: `|pillCount|\.length\}/.test(pill));
-  assert("visibility goes through teamPillVisible", /const visible = teamPillVisible\(team\)/.test(pill));
+  assert("visibility goes through teamPillVisible", /const visible = teamPillVisible\(team, seen\)/.test(pill));
   assert("the pill polls through createTeamPoller", /createTeamPoller\(\{/.test(pill));
   equal("zh title", ZH.title, "团队");
   equal("en title", EN.title, "Team");
@@ -337,9 +526,21 @@ console.log("\npill wiring (source pins)");
   assert("the jobs and goal pills are still registered", /contributeJobsPill\(client\)/.test(client) && /contributeGoalPill\(client\)/.test(client));
   // The Users glyph is never replaced; the running state is a corner ring.
   assert("every team pill icon draws the Users glyph through CornerRingIcon", (pill.match(/<CornerRingIcon name="Users"/g) ?? []).length === 3, String((pill.match(/<CornerRingIcon name="Users"/g) ?? []).length));
-  assert("…only the running icon turns the ring on", /function RunningIcon[\s\S]{0,200}running theme/.test(pill) && (pill.match(/running=\{false\}/g) ?? []).length === 2);
+  assert("…only the running icon turns the ring on", /function RunningIcon[\s\S]{0,200}running theme/.test(pill) && (pill.match(/running=\{false\}/g) ?? []).length === 3);
+  assert("the complete icon is the green CircleCheck", /function CompleteIcon[\s\S]{0,220}name="CircleCheck"[\s\S]{0,220}statusSuccess/.test(pill));
+  assert("ICONS maps complete to CompleteIcon", /complete: CompleteIcon/.test(pill) && /Record<TeamPillIcon, typeof IdleIcon>/.test(pill));
   assert("the team pill no longer draws a bare StatusRingMark", !/StatusRingMark/.test(pill));
-  assert("the team pill's visibility rule is untouched", /const visible = teamPillVisible\(team\)/.test(pill));
+  // The three "seen" inputs must stay wired (UI-v7): the popover's close is the
+  // only user-visible one (an all-done board disappears without waiting for a
+  // poll; it goes through the gate above), the board and agent events feed the
+  // same machine.
+  assert("closing the team popover marks an all-done board seen", /advanceSeen\(agent\.id, \{ kind: "closed", team \}\)/.test(pill));
+  assert(
+    "…only for the pill the close belongs to (a stale close is dropped)",
+    /if \(pills\.get\(agent\.id\)\?\.registration !== registration\) return;/.test(pill),
+  );
+  assert("a poll answer feeds the seen machine", /advanceSeen\(agentId, \{ kind: "board", team, agentStatus: agentStatuses\.get\(agentId\) \}\)/.test(pill));
+  assert("the agent status feeds the seen machine", /advanceSeen\(update\.agent\.id, \{ kind: "agent", status: update\.agent\.status \}\)/.test(pill));
 }
 
 pollerChecks()

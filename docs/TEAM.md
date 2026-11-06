@@ -26,11 +26,13 @@ DSH 的 `dsh-experimental-agent-team` 给 Lead 会话一个团队：队员（各
 | `unknown or unavailable projection key: agentTeam`（profile 没挂 agent-team bundle） | `team_unavailable` | 终态：移除 pill（=「这个 profile 没有团队功能」，不是「没有团队」） |
 | `unknown or not-yet-created session` / 会话 agent 已释放 | `session_missing` | 瞬态：退避重试，保留上次看板 |
 | 其它抛错、形状不符 | `rpc_failed` | 同上 |
-| projection 的 `failure` | 不是错误码 | 面板首行红字（DSH 原文），pill 图标变红，不隐藏 |
+| projection 的 `failure` | 不是错误码 | 面板首行红字（DSH 原文），pill 图标变红；是否隐藏仍按 pill 可见性规则 |
 
 ## pill
 
-- **可见**：至少一个队员（`role === "teammate"`）或有任务。不依赖 DSH 合成的 Lead 行；「只有 Lead、没有任务」= 没用过团队，不显示。
+- **可见**：只看任务（`tasks.length > 0`）——有任务就显示，没任务一律不显示。2026-11-06 用户决策：起了队员但没建任务时不亮 pill（此时面板只会写「N 名成员 / 暂无共享任务」）；队员数不再参与判断，无看板（`null`）也不显示。**全部任务 `completed` 后只再显示一次，看过即隐藏**（照 goal 的 seen 机制，UI-v7）：面板关闭算看过，或全部完成后 agent 从 idle 变 running（用户发了下一条消息）算看过；签名 `teamAllDoneKey`（tasks 按 id 排序的 `id:revision`）变化（新增任务 / revision 变化）会重新显示一次。`seen` 只记在内存：插件 reload / 重启后，已全部完成且看过的看板会再显示一次（已接受，与 goal 一致）。判定「看过」的 idle→running 也包含 schedule / 心跳等非用户回合，失误方向是 pill 提早消失（与 goal 一致）。
+  - **「面板关闭」必须是确认过的关闭**（2026-11-06 真机 bug 修复）：宿主打开 popover 时会把内容**重挂载一次**——`AnchoredSurface` 的 `FloatingSurface` 带 `key={placed ? "placed" : "measuring"}`（Paseo 0.15.0 `packages/app/src/components/ui/menu/menu-overlay.tsx:350`，注释在 :265 明说「Remounting on placement…」），先离屏测量再换 key 正式定位。所以 `unmount` 本身不是「用户关了面板」。规则是 `createSeenCloseGate`（`client/seen-close-gate.ts`，与目标 pill 共用，窗口 `SEEN_CLOSE_CONFIRM_MS` = 250ms）：卸载后 250ms 内又挂载 → 取消，不记 seen；卸载后一直没回来 → 记 seen。修复前的实现把任何卸载都当关闭，用户一点开、宿主测量完重挂载，seen 立刻写入 → pill 当场消失、任务板面板根本没显示出来。
+  - 顺带：`present()` 只在 `visible` / `label` / `title` / `icon` 真变化时才 `registration.update`（`agent-polling.ts:315-321` 的 `publishIfChanged` 已对**相同答案**去重；这里补的是「看板变了、按钮状态没变」仍会推一次 `update` 的情况，白让宿主重建按钮与 popover 页面）。
 - **文字与 title 恒为「团队」/「Team」**，不带计数（title 同时是读屏名、桌面 tooltip、手机 sheet 标题）。
 - **压缩成纯图标时图标偏右（2026-11-05 测量）**：宿主插件 pill 是 `composerPillStyles.body`（边框 1、左右内边距 12、gap 8）
   加 `styles.button { flexShrink: 1, minWidth: 0 }`（Paseo 0.15.0 `plugins/buttons/view.tsx:670`），内容从左排、不居中，
@@ -44,7 +46,7 @@ DSH 的 `dsh-experimental-agent-team` 给 Lead 会话一个团队：队员（各
   只画在宿主那个 16px、`overflow: hidden` 的盒子里，外框恰等于 14、在盒内居中（偏差 0，`goal-popover-render-check`
   有 ≤0.5px 断言）；往左挪最多 1px 就会被盒子裁掉，所以**剩下的偏移插件侧修不掉**，要改宿主（例如插件 composer
   pill 给 `minWidth: 42`，或内容居中）。
-- **图标**：三种状态都画 `Users`（`CornerRingIcon`）：有队员 `running === true` → 灰色 `Users` 右下角叠运行环；`failure` 或有成员创建失败 → 红色 `Users`；否则灰色 `Users`。
+- **图标**：常规画 `Users`（`CornerRingIcon`）：有队员 `running === true` → 灰色 `Users` 右下角叠运行环；`failure` 或有成员创建失败 → 红色 `Users`；否则灰色 `Users`。**全部任务 `completed` → 绿色 `CircleCheck`（`statusSuccess`，与目标 pill 完成态同一标记；2026-11-06 用户决策）**，优先级 `failed`（红）> `complete`（绿）> `running`（环）> `idle`（灰）；无任务不读成 complete（此时 pill 本来就隐藏）。
   图标只在状态变化时 `update`，运行环不会每次轮询重启（jobs pill 的做法）。
 - 轮询复用 `client/agent-polling.ts`（4s、抖动、退避到 30s、答案去重），**未改它**；jobs / goal pill 语义不变。
 

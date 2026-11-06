@@ -658,7 +658,7 @@
   `dsh-bridge/lib/server.js` 的 `paseo/goal` 或 dispatch 必跑；改桥后先重生成内嵌桥
   （`node paseo-plugin/scripts/generate-bridge-assets.mjs`）再跑 `bridge-assets-check.mjs`，
   否则真机检查跑在旧桥上假绿。**
-- `harness/goal-pill-check.cjs` — goal pill 与行式面板的**数据层与 UI 规则**（**275 条**；2026-11-05：运行时图标钉改为「`CornerRingIcon` 保留底图标、不出现裸 `StatusRingMark`」，新增 8 条「目标与后台是两颗独立 pill」源码钉——goal 只注册 `dsh-goal`、jobs 只注册 `dsh-jobs`、各开各的 popover、关闭目标 popover 记完成态已读、入口各自 contribute、没有共用 slot 协调器且其模块已删；
+- `harness/goal-pill-check.cjs` — goal pill 与行式面板的**数据层与 UI 规则**（**281 条**；2026-11-05：运行时图标钉改为「`CornerRingIcon` 保留底图标、不出现裸 `StatusRingMark`」，新增 8 条「目标与后台是两颗独立 pill」源码钉——goal 只注册 `dsh-goal`、jobs 只注册 `dsh-jobs`、各开各的 popover、关闭目标 popover 记完成态已读、入口各自 contribute、没有共用 slot 协调器且其模块已删；
   假时钟 + 假 RPC + 假目录页，不 import React/host；UI 规则都抽在 `client/goal-polling.ts` 的
   纯函数里）：契约枚举与 wire schema（`GoalState` 缺 `activation` / `id` / `revision` 必拒，时间戳仍被剥掉）、
   `goalCommandArguments` 的 DSH 语法、五态可见性/label/tone（**complete 未读可见、tone success、已读（同 `id:revision`）隐藏、
@@ -686,8 +686,8 @@
   `node goal-pill-check.cjs`（`goal-pill.tsconfig.json` 一并编译 `client/locale.ts`，供文案断言用真实表）。**动了 `client/goal-polling.ts`、`client/goal-popover.tsx`、
   `client/goal-pill.tsx`、`client/goal-running.tsx`、`client/deepseek-mark*.tsx`、
   `client/agent-polling.ts`、`shared/goal.ts` 或 `client/locale.ts` 的 goal 表必跑；改共享轮询器时
-  `jobs-poll-check.cjs` 必须同时全绿且断言数不减。**
-- `harness/goal-popover-render-check.cjs` — 面板的**渲染行为**（**218 条**；2026-11-05 新增：真实 `contributeGoalPill` + `contributeJobsPill` 对假宿主——一个 agent 恰两个注册 `dsh-goal`/`dsh-jobs`、各自 popover、update 不带 behavior、两者同时可见、后台文字恒为「后台」且任何 patch 不含数字、后台跑完只隐藏后台不碰目标、registry 读不到显示静态 `SquareTerminal`、目标清除只隐藏目标、后台 popover 不画目标行、关闭完成态目标 popover 即已读、dispose 移除两个注册；`CornerRingIcon`/`JobsPillIcon`/真实目标图标：运行时底图标仍在、角环 9px 右下 -1、外框恒等于 size、角环绝对定位、四种图标 glyph 中心与宿主 16px 图标盒中心偏差 ≤0.5px）：用 esbuild 现编真实
+  `jobs-poll-check.cjs` 必须同时全绿且断言数不减。动了 `client/seen-close-gate.ts` 必跑。**
+- `harness/goal-popover-render-check.cjs` — 面板的**渲染行为**（**224 条**；2026-11-05 新增：真实 `contributeGoalPill` + `contributeJobsPill` 对假宿主——一个 agent 恰两个注册 `dsh-goal`/`dsh-jobs`、各自 popover、update 不带 behavior、两者同时可见、后台文字恒为「后台」且任何 patch 不含数字、后台跑完只隐藏后台不碰目标、registry 读不到显示静态 `SquareTerminal`、目标清除只隐藏目标、后台 popover 不画目标行、关闭完成态目标 popover 即已读、dispose 移除两个注册；`CornerRingIcon`/`JobsPillIcon`/真实目标图标：运行时底图标仍在、角环 9px 右下 -1、外框恒等于 size、角环绝对定位、四种图标 glyph 中心与宿主 16px 图标盒中心偏差 ≤0.5px）：用 esbuild 现编真实
   `GoalPopoverBody`，经 `react-native-web` 渲染进 jsdom（宿主 UI kit 的 `Icon`/`TextInput` 用小桩
   代替：lucide 真 glyph、内联 SVG、react-native-web 真输入框；文案用真实 zh-CN 表）。断言：目标行是
   面板唯一的编辑入口、两个行尾图标按钮不打开编辑、运行时鲸鱼角上出环、**编辑页是小号 composer**
@@ -761,12 +761,12 @@
   其它抛错与形状不符 → `rpc_failed`（不清空成空看板）；DSH 字段原样；**`running`**：空闲根的 Lead 为 false、未托管队员无此键、
   托管中队员回合未结束为 true、已结束为 false、失败成员无此键。编译同 `goal-server-check`（`.dbg` + 拷入本脚本与
   `fake-dsh-bridge.mjs`）。**动了 `server/{dsh-process,session,provider}.ts` 的 team 部分、`shared/team.ts` 或假桥 `team` 模式必跑。**
-- `harness/team-pill-check.cjs` — `client/team-polling.ts` 纯规则（**153 条**；pill 图标改为 `Users` + 角标环的 4 条源码钉——三种状态都经 `CornerRingIcon` 画 `Users`、只有运行态开环、不再出现裸 `StatusRingMark`、可见性仍经 `teamPillVisible(team, seen)`、seen 三路接线源码钉（面板关闭 / board / agent 事件））：可见性（只看任务、不看队员：无任务一律隐藏——含起了队员但没建任务；有任务即可见，无论有无队员行；无看板隐藏；**全部完成只再显示一次、看过即隐藏**：`teamAllDoneKey` 按 id 排序的 `id:revision` 签名（顺序无关、revision 变化换签名）与 `teamCompleteSeenStep` 三分支——board 首见→watch、agent idle→idleSeen、下一回合 running 或面板关闭→seen、未全完成清 watch 保留 seen）、成员标题行 chip（顺序、0 不出、运行态缺失不出运行中/已停止、计数只数队员（运行中的 Lead 不算运行中）、Lead 空闲不算已停止、四档降级顺序与选档、各档保留失败与运行中且带字）、负责人标记（运行环 / 已停止只来自 `running` true/false，缺失不标，已完成不标）与「N 个负责人已停止」计数、pill 图标
-  （只有 `running:true` 才转环、failure/失败成员红）、成员词（无 `running` 时中英都不说运行中/空闲）与排序、任务标记只认 DSH 的
+- `harness/team-pill-check.cjs` — `client/team-polling.ts` 纯规则（**181 条**；pill 图标改为 `Users` + 角标环（全部完成 → 绿色 `CircleCheck`）的 6 条源码钉——三种 `Users` 状态都经 `CornerRingIcon` 画 `Users`、完成态用 `CircleCheck` + `statusSuccess`、只有运行态开环、不再出现裸 `StatusRingMark`、可见性仍经 `teamPillVisible(team, seen)`、seen 三路接线源码钉（面板关闭 / board / agent 事件））：可见性（只看任务、不看队员：无任务一律隐藏——含起了队员但没建任务；有任务即可见，无论有无队员行；无看板隐藏；**全部完成只再显示一次、看过即隐藏**：`teamAllDoneKey` 按 id 排序的 `id:revision` 签名（顺序无关、revision 变化换签名）与 `teamCompleteSeenStep` 三分支——board 首见→watch、agent idle→idleSeen、下一回合 running 或面板关闭→seen、未全完成清 watch 保留 seen）、成员标题行 chip（顺序、0 不出、运行态缺失不出运行中/已停止、计数只数队员（运行中的 Lead 不算运行中）、Lead 空闲不算已停止、四档降级顺序与选档、各档保留失败与运行中且带字）、负责人标记（运行环 / 已停止只来自 `running` true/false，缺失不标，已完成不标）与「N 个负责人已停止」计数、pill 图标
+  （只有 `running:true` 才转环、failure/失败成员红、全部完成绿色 `CircleCheck`）、成员词（无 `running` 时中英都不说运行中/空闲）与排序、任务标记只认 DSH 的
   `ready`、B 分组顺序（被阻塞任务不进可开始）、facts 行、详情字段、重叠警告翻译（未知原样）、契约码、poller 适配（终态移除、
   瞬态保留上次看板）、pill 接线源码钉（label/title 是名词、无计数）。运行：`cd paseo-plugin && npx tsc -p ../harness/team-pill.tsconfig.json`，
-  写 `.dbg-team/package.json` 并拷入本脚本，`cd .dbg-team && node team-pill-check.cjs`。**动了 `client/team-*.ts(x)` 必跑。**
-- `harness/team-popover-render-check.cjs` — 真实 `TeamPanel` / `makeTeamPopover` 经 react-native-web 渲染进 jsdom（**90 条**）：
+  写 `.dbg-team/package.json` 并拷入本脚本，`cd .dbg-team && node team-pill-check.cjs`。**动了 `client/team-*.ts(x)` 必跑；动了 `client/seen-close-gate.ts` 必跑。**
+- `harness/team-popover-render-check.cjs` — 真实 `TeamPanel` / `makeTeamPopover` 经 react-native-web 渲染进 jsdom（**93 条**）：
   分区与分组顺序、已完成默认折叠且原地展开、被阻塞任务不在可开始、不画逐个成员行、标题行（鲸鱼 +「DeepSeek」+ 队员数 + chip，0 队员不写「0 名成员」，chip 18px/4px 圆角/无边框，失败红底首位，运行态缺失只剩完成 chip，0 不出，四个隐藏量宽副本）、负责人运行环与「已停止」（列表与详情页）、进行中标题的已停止计数、10 个任务负责人全部已停止、
   facts/警告、描述两行多行截断、详情页（返回行、字段、完整描述保留换行、返回回列表）、空看板、只有 Lead、failure 首行红字、
   只读（按钮只有任务行与折叠行）、容器订阅 store 重绘、关闭时上报最后一块看板（seen 信号）。**需要 `HOST_APP`**，未设 exit 2。**动了 `client/team-popover.tsx` / `team-pill.tsx` 必跑。**

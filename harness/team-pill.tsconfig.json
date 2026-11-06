@@ -16,6 +16,7 @@
     "../paseo-plugin/client/poll-sequence.ts",
     "../paseo-plugin/client/agent-polling.ts",
     "../paseo-plugin/client/jobs-popover-layout.ts",
+    "../paseo-plugin/client/seen-close-gate.ts",
     "../paseo-plugin/client/team-polling.ts",
     "../paseo-plugin/client/locale.ts",
     "../paseo-plugin/shared/team.ts",

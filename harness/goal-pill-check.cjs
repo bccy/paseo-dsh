@@ -17,6 +17,13 @@
  * the last three into "active" would still render — and would be wrong in the
  * exact way this surface was built to fix.
  *
+ * The popover's "closed" is **confirmed, not assumed** (UI-v7 fix): the host
+ * unmounts and remounts the body once when the panel opens, so
+ * `client/seen-close-gate.ts` — shared with the team pill — reports a close only
+ * when the unmount outlives its window. Its behaviour is asserted in
+ * `harness/team-pill-check.cjs` and `harness/goal-popover-render-check.cjs`; the
+ * pins below hold the goal wiring and forbid a second copy.
+ *
  * The server half's behaviour (a real session over the fake bridge: read,
  * grading of bridge errors, control success/refusal) is
  * `harness/goal-server-check.cjs`; the copy tables are `harness/locale-check.cjs`.
@@ -696,7 +703,11 @@ console.log("\nthe goal and the jobs are two separate composer pills");
   equal("the jobs pill registers exactly one pill, id dsh-jobs", idsOf(jobs), ["dsh-jobs"]);
   assert("the goal pill opens its own goal popover", /behavior:\s*\{\s*kind:\s*"popover",\s*Content:\s*makeGoalPopover\(/.test(pill));
   assert("the jobs pill opens its own jobs popover", /behavior:\s*\{\s*kind:\s*"popover",\s*Content:\s*makeJobsPopover\(store, agent\.id\)\s*\}/.test(jobs));
-  assert("closing the goal popover marks a completed goal seen", /\(goal\) => advanceSeen\(agent\.id, \{ kind: "closed", goal \}\)/.test(pill));
+  assert("closing the goal popover marks a completed goal seen", /advanceSeen\(agent\.id, \{ kind: "closed", goal \}\)/.test(pill));
+  assert(
+    "…only for the pill the close belongs to (a stale close is dropped)",
+    /if \(pills\.get\(agent\.id\) !== registration\) return;/.test(pill),
+  );
   assert("the client entry contributes both pills on their own",
     /contributeJobsPill\(client\),/.test(index) && /contributeGoalPill\(client\),/.test(index));
   // Assembled from fragments so a repo-wide grep for the withdrawn names finds
@@ -706,6 +717,31 @@ console.log("\nthe goal and the jobs are two separate composer pills");
   assert("no shared slot coordinator is wired", !withdrawn.test(pill + jobs + index));
   assert("the coordinator module is gone",
     !fs.existsSync(path.join(repoRoot, `paseo-plugin/client/${gj}-slot.ts`)));
+}
+
+/* The popover's close is confirmed (UI-v7 fix) ------------------------------- */
+
+console.log("\nthe goal popover's close is confirmed, not assumed");
+{
+  // The desktop completed-goal pill vanished the moment it was opened: the host
+  // unmounts and remounts the popover body once when the surface's position
+  // lands (`menu-overlay.tsx:350`, `key={placed ? "placed" : "measuring"}`), and
+  // the old `useEffect(() => () => onClosed(...))` read that as a user close.
+  // The rule is the shared gate (`client/seen-close-gate.ts`), also used by the
+  // team pill; its behaviour is asserted in `harness/team-pill-check.cjs` and
+  // `harness/goal-popover-render-check.cjs`, the wiring here.
+  const repoRoot = path.resolve(__dirname, "..", "..");
+  const readRepo = (relative) => fs.readFileSync(path.join(repoRoot, relative), "utf8");
+  const code = (source) => source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  const pill = code(readRepo("paseo-plugin/client/goal-pill.tsx"));
+  const teamPill = code(readRepo("paseo-plugin/client/team-pill.tsx"));
+  assert("the goal popover's close goes through the shared gate",
+    /createSeenCloseGate<GoalState>\(\{/.test(pill) && /gate\.mounted\(\)/.test(pill) && /gate\.unmounted\(shown\.current\)/.test(pill));
+  assert("…and is imported, not copied, from ./seen-close-gate", /from "\.\/seen-close-gate"/.test(pill));
+  assert("…the old unmount-is-a-close effect is gone", !/useEffect\(\(\) => \(\) => onClosed\(/.test(pill));
+  assert("no pill file re-implements the gate", !/function createSeenCloseGate/.test(pill + teamPill));
+  assert("present publishes only a real change (visible/label/title)",
+    /before\.visible === presentation\.visible && before\.label === label && before\.title === title/.test(pill));
 }
 
 /* The poll cadence is the jobs pill's ---------------------------------------- */

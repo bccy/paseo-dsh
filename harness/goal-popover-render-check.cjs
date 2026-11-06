@@ -104,6 +104,7 @@ fs.writeFileSync(
   `export { GoalPopoverBody } from ${JSON.stringify(path.join(pluginRoot, "client/goal-popover.tsx"))};
 export { allText } from ${JSON.stringify(path.join(pluginRoot, "client/locale.ts"))};
 export { makeGoalPopover, makeGoalIcon, contributeGoalPill } from ${JSON.stringify(path.join(pluginRoot, "client/goal-pill.tsx"))};
+export { SEEN_CLOSE_CONFIRM_MS } from ${JSON.stringify(path.join(pluginRoot, "client/seen-close-gate.ts"))};
 export { contributeJobsPill } from ${JSON.stringify(path.join(pluginRoot, "client/jobs-pill.tsx"))};
 export { CornerRingIcon } from ${JSON.stringify(path.join(pluginRoot, "client/corner-ring.tsx"))};
 export { JobsPillIcon } from ${JSON.stringify(path.join(pluginRoot, "client/jobs-spinner.tsx"))};
@@ -159,6 +160,7 @@ const {
   allText,
   makeGoalPopover,
   makeGoalIcon,
+  SEEN_CLOSE_CONFIRM_MS,
   contributeGoalPill,
   contributeJobsPill,
   CornerRingIcon,
@@ -624,14 +626,29 @@ console.log("\nthe disarmed and blocked pages keep the design's rows");
 /* The real container (UI-v8): leaving the editor closes the panel ----------- */
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Mount `makeGoalPopover`'s component — the real container with its RPC and
  * mode state — against a fake client. `close` is the host's own close, spied.
  */
-function mountContainer(answer) {
+function containerProps(spies) {
+  return {
+    theme,
+    layout: { compact: false, platform: "web" },
+    host: { id: "h", label: "h" },
+    context: "agent",
+    workspaceId: "w",
+    agentId: "agent-1",
+    close: () => {
+      spies.close += 1;
+    },
+  };
+}
+
+function mountContainer(answer, goal = baseGoal) {
   const spies = { close: 0, refresh: 0, rpc: [], closed: [] };
-  const store = new Map([["agent-1", { goal: baseGoal, available: true, listeners: new Set() }]]);
+  const store = new Map([["agent-1", { goal, available: true, listeners: new Set() }]]);
   const client = {
     rpc: async (_definition, input) => {
       spies.rpc.push(input);
@@ -651,21 +668,22 @@ function mountContainer(answer) {
   document.body.appendChild(container);
   const root = createRoot(container);
   flushSync(() => {
-    root.render(
-      React.createElement(Popover, {
-        theme,
-        layout: { compact: false, platform: "web" },
-        host: { id: "h", label: "h" },
-        context: "agent",
-        workspaceId: "w",
-        agentId: "agent-1",
-        close: () => {
-          spies.close += 1;
-        },
-      }),
-    );
+    root.render(React.createElement(Popover, containerProps(spies)));
   });
-  return { container, root, spies };
+  return { container, root, spies, Popover };
+}
+
+/**
+ * A fresh root for the **same** container component: what the host does when its
+ * surface remounts the body (its own open-time remount). The gate lives in the
+ * container's closure, so a new root is exactly what the host hands it.
+ */
+function remountContainer(Popover, spies) {
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const root = createRoot(container);
+  flushSync(() => root.render(React.createElement(Popover, containerProps(spies))));
+  return { container, root };
 }
 
 function openEditor(container) {
@@ -691,10 +709,30 @@ async function containerChecks() {
     click(byLabel(container, "取消"));
     check("the editor's 取消 calls close() once", spies.close, 1);
     check("…and sends no command", spies.rpc.length, 0);
-    // The host unmounts closed content; that must not mark an active goal seen.
+    // A close is confirmed, not read off one unmount (`./seen-close-gate`): the
+    // report lands only after the window, so a host remount can never fake it.
     flushSync(() => root.unmount());
+    check("a close is not reported before the confirmation window elapses", spies.closed.length, 0);
+    await sleep(SEEN_CLOSE_CONFIRM_MS + 80);
     check("closing reports the goal it showed", spies.closed.length, 1);
     check("…which is not complete, so nothing is marked seen", spies.closed[0]?.phase, "active");
+  }
+
+  {
+    // The desktop completed-goal pill used to vanish on open: the host unmounts
+    // and remounts the body once when the surface's position lands
+    // (`menu-overlay.tsx:350`), and that unmount was read as the user closing it.
+    const done = { ...baseGoal, phase: "complete", activation: "disarmed", currentTask: undefined };
+    const first = mountContainer({ ok: true, message: "ok" }, done);
+    flushSync(() => first.root.unmount()); // the measuring unmount
+    const second = remountContainer(first.Popover, first.spies); // the placed render
+    await sleep(SEEN_CLOSE_CONFIRM_MS + 80);
+    check("the host's open-time remount is not a close", first.spies.closed.length, 0);
+    flushSync(() => second.root.unmount()); // the user really closes the panel
+    check("…a real close is not reported before the window elapses", first.spies.closed.length, 0);
+    await sleep(SEEN_CLOSE_CONFIRM_MS + 80);
+    check("a real close reports the goal it showed, exactly once", first.spies.closed.length, 1);
+    check("…with the completed goal", first.spies.closed[0]?.phase, "complete");
   }
 
   {
@@ -916,6 +954,8 @@ async function separatePillChecks() {
       const { container, root } = mountContent(goalReg);
       assert("the goal popover is the goal panel alone", container.textContent.includes(baseGoal.objective) && !container.textContent.includes("运行完整测试套件"));
       flushSync(() => root.unmount());
+      check("…the hide is not immediate (a host remount must not fake a close)", merged(goalReg).visible, true);
+      await sleep(SEEN_CLOSE_CONFIRM_MS + 80);
     }
     check("closing the goal popover marks the completed goal seen (the pill hides)", merged(goalReg).visible, false);
     check("…the jobs pill is unaffected", merged(jobsReg).visible, true);
