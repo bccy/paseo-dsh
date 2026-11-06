@@ -32,7 +32,14 @@ import {
   type DshRoute,
   type DshSettingsList,
 } from "./dsh-process";
-import { DSH_SETTINGS_ID_PREFIX, DshChildSession, DshSession, modes, parseRoute } from "./session";
+import {
+  DSH_SETTINGS_ID_PREFIX,
+  DshChildSession,
+  DshSession,
+  dshSettingBooleanValue,
+  modes,
+  parseRoute,
+} from "./session";
 import { rewindCanaryNotice } from "./rewind-canary";
 import { beginRewindReport, fallbackNoticeDescription, type RewindReportFallback } from "./rewind-notice-append";
 import { effortLabel, LOCALE, UI } from "./locale";
@@ -1014,7 +1021,7 @@ class DshConnection implements ProviderConnection {
   }
 
   /**
-   * Re-read the DSH toggles once and republish the sessions whose value changed.
+   * Re-read the DSH switches once and republish the sessions whose value changed.
    *
    * The settings document belongs to the profile, and one child serves every
    * conversation, so the authoritative read is connection-wide: reading it once
@@ -1799,7 +1806,7 @@ class DshConnection implements ProviderConnection {
         await session.loadCommands();
         await session.loadPermission();
         await session.loadPresets();
-        // Simple third-party DSH toggles: global to the profile, so the value
+        // Simple third-party DSH switches: global to the profile, so the value
         // read here is the runtime's truth, not Paseo's persisted per-agent copy.
         await session.loadDshSettings();
         // `session.configure()` intentionally keeps the real value when DSH
@@ -1823,7 +1830,7 @@ class DshConnection implements ProviderConnection {
           }
         }
         // Paseo sends every setting it persisted for this agent on open. A
-        // `dsh:` toggle is global to the DSH profile, so that stored value is the
+        // `dsh:` switch is global to the DSH profile, so that stored value is the
         // host's memory, not the runtime's truth. Two shapes, deliberately
         // different:
         //  - a fresh open (the create panel put the user's picks into the new
@@ -1842,11 +1849,31 @@ class DshConnection implements ProviderConnection {
           session.stagePendingDshSettings(settings);
         } else if (requestedDsh.length > 0) {
           const actual = session.dshSettingValues();
-          const stale = requestedDsh.filter(([id, value]) => actual.has(id) && actual.get(id) !== value);
+          // The stored value is the composer's select value (`"on"`/`"off"`) for
+          // agents saved after that projection, and a boolean for older ones;
+          // compare booleans so neither shape produces a false "stale" line.
+          const stale = requestedDsh.flatMap(([id, value]) => {
+            const normalized = dshSettingBooleanValue(value);
+            if (normalized === undefined) {
+              // "Failure must be loud": a persisted value this build cannot read
+              // is only reachable through a protocol bug or a hand-edited agent
+              // record, and dropping it silently is the shape this repository
+              // keeps removing. One daemon-stderr line is the whole report —
+              // there is no timeline notice on resume by design (see above).
+              process.stderr.write(
+                `[${PROVIDER_ID}] ignoring DSH switch "${id}" from Paseo's stored settings: `
+                  + `value ${JSON.stringify(value)} is not "on"/"off" or a boolean\n`,
+              );
+              return [];
+            }
+            return actual.has(id) && actual.get(id) !== normalized
+              ? [{ id, stored: normalized, runtime: actual.get(id) }]
+              : [];
+          });
           if (stale.length > 0) {
             process.stderr.write(
-              `[${PROVIDER_ID}] DSH toggle(s) differ from Paseo's stored value — keeping the runtime value: `
-                + `${stale.map(([id, value]) => `${id} (stored ${String(value)}, runtime ${String(actual.get(id))})`).join(", ")}; `
+              `[${PROVIDER_ID}] DSH switch(es) differ from Paseo's stored value — keeping the runtime value: `
+                + `${stale.map((entry) => `${entry.id} (stored ${String(entry.stored)}, runtime ${String(entry.runtime)})`).join(", ")}; `
                 + "the switch is global to the DSH profile and is not written back on resume\n",
             );
           }

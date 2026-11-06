@@ -25,7 +25,7 @@ DSH 侧是一个 profile bundle。
 | 会话恢复 / 导入 | ❌ 无历史、无法导入 | ✅ 重开按 Paseo 的 `history: replay` 回放历史；**导入** DSH 原生会话（`session.list`，从 `~/.dsh/sessions` 列举） |
 | 后台任务（jobs） | — | ✅ composer 的 pill 显示 DSH 后台任务（终端图标，运行中右下角叠转环）：只在有运行中/停止中的任务时显示，文字只写「后台」（数量在面板里），全部结束即隐藏；点开看每个任务的明细 |
 | 目标（goal）pill | — | ✅ composer 的 pill 显示 DSH 目标，文字与手机面板标题恒为「目标」，状态由图标表达（运行中右下角叠转环、完成绿色对勾），面板首行说出完整状态；点开看目标（带 DeepSeek 标志，点文本即可在小号输入框里编辑）、「第 N 轮 · 预算 M」、「正在：<当前任务>」与受阻原因，按钮暂停 / 继续 / 清除（清除二次确认）；目标完成后 pill 再显示一次（只读，只能清除，看过或发下一条消息后隐藏）；重开会话后自动续跑会停，pill 直接给出恢复入口 |
-| 团队（Agent Team）pill | — | ✅ 用了 DSH 团队工具的会话，composer 多一颗「团队」pill（有队员在跑时人形图标右下角叠转环、团队记录出错时红色）；点开是只读面板：成员（队长、运行中 / 空闲 / 准备中 / 创建失败）和按状态分组的共享任务（进行中 / 可开始 / 等待依赖，已完成折叠），点任务看全文；`team_task_*` 工具结果画成字段卡，失败原因在中文环境翻成中文并保留原文 |
+| 团队（Agent Team）pill | — | ✅ 有共享团队任务的会话，composer 多一颗「团队」pill（有队员在跑时人形图标右下角叠转环、团队记录出错时红色）；任务全部完成后只再显示一次，看过（关闭面板或发下一条消息）即隐藏；点开是只读面板：成员（队长、运行中 / 空闲 / 准备中 / 创建失败）和按状态分组的共享任务（进行中 / 可开始 / 等待依赖，已完成折叠），点任务看全文；`team_task_*` 工具结果画成字段卡，失败原因在中文环境翻成中文并保留原文 |
 | 目标 / 工作流时间线 | — | ✅ `goal/change` 与 `tool-workflow/*` 事件按工具行渲染；目标自动续跑的每个轮次也各占一行（「目标续跑 · 第 N 轮」）；目标变化行叫「目标状态」，排在引起它的 `/goal` 命令之后；goal 工具结果画成字段卡，被拒调用给中文短句；后台工作流跨回合仍显示运行中 |
 | 工具审批卡 | — | ✅ DSH 的 `approval/request` 转成 Paseo 审批卡（允许一次 / 拒绝） |
 | 会话级系统提示 | — | ✅ 每个会话可带独立的 system prompt（profile 需挂 `systemPrompt` 服务） |
@@ -483,8 +483,27 @@ DSH 的 agent preset 能把"人设 + 一套能力"打包成一个选项。插件
 
 装在 DSH profile 里的第三方插件，如果它的配置**整体只有一个布尔开关**（例如 `dsh-unrestricted`
 的 `enabled`），Paseo 的会话配置菜单（模型 / Thinking / 模式 / 预设 / 权限那一组）会自动多出
-一行：标签取插件自己的显示名（插件包 locale 字典的 `meta.title`，按 Paseo 的界面语言选，读不到
-就用包名），开关值直接从 DSH 运行时读取。装/卸插件后重开一次会话，这一行就会出现/消失。
+一行**两选一的下拉**：标签取插件自己的显示名（插件包 locale 字典的 `meta.title`，按 Paseo 的
+界面语言选，读不到就用包名），当前值直接从 DSH 运行时读取。桌面工具栏上这一行显示选中项文字
+（如「关闭」），点开是「开启 / 关闭」两项——和「权限」「模式」两个选择器是同一种控件。装/卸
+插件后重开一次会话，这一行就会出现/消失。
+
+**为什么是下拉而不是 Paseo 的开关（toggle）控件**：宽布局下宿主把 toggle 画成无文字的图标按钮
+（`packages/app/src/composer/agent-controls/index.tsx:1344` 的 `showToolbarLabel={false}`），
+且 feature 不活跃、或 feature id 不在高亮表里时图标颜色恒为 muted（`index.tsx:214-239` 的
+`getFeatureIconColor`；`utils.ts:42-46` 对 toggle 只认 `value`，`utils.ts:48-60` 未知 id 走
+`default`）——开关状态没有任何视觉反馈，点了也看不出来。同一个 feature 用 `select` 投影时渲染成
+「图标 + 选中项文字」并可点开菜单（`index.tsx:1360-1400`，选中项文字在 `:1379`），状态可见。
+**只有宽布局直显**：宽布局走 `index.tsx:1092-1100` 的 else 分支逐个渲染 `DesktopFeatureItem`；
+condensed/tight 密度会把所有 feature 收进一个 Settings2 面板
+（`layout.ts:105-130` 决定 `aggregateFeatures`，`index.tsx:1060-1090` 画按钮与面板），面板里
+同样是「label + 选中项」两行（`index.tsx:1501-1503`），所以两种密度下这个开关都有名字和状态。
+**option label 就是纯「开启/关闭」（`On`/`Off`），不再拼开关名**：早先拼成「破限模式：开启」
+时用户反馈与菜单/行里的名字重复；现在宽布局工具栏只显示这个词（开关名仍在行的 `label` 上，
+hover tooltip 与 condensed/tight 面板行会显示），手机端设置行也不再出现重复名字。下拉的选项值
+是 `on`/`off`（Paseo 持久化/回传的也是它）；**桥协议仍是 boolean**，插件在边界上转换，旧 agent
+里持久化的 boolean 同样兼容。（行号取自本地 Paseo checkout 的 `packages/app` 0.15.0；官方桌面端
+0.15.2 的客户端代码据任务背景与之相同，未逐行复核。）
 
 **范围是刻意收窄的**：只显示第三方插件（模块名不以 `@deepseek-ai/` 开头、且是真正的包名——
 `cordis:` 这类运行时 specifier 与相对路径都不算）、且整个 volatile 配置**恰好一个 boolean
@@ -495,15 +514,20 @@ DSH 的 agent preset 能把"人设 + 一套能力"打包成一个选项。插件
 不属于"某个 agent"——开关会同时影响本机所有 DSH 会话，切换后所有打开会话的菜单一起刷新。行的
 描述文案写明了这一点。
 
-**新建会话面板里的选择**：在创建面板拨这个开关时，值会随新 agent 一起传来，但**不会在打开时
-立刻写入**——宿主为了刷新创建面板本身也会打开一个临时会话，打开即写就等于"刷新菜单改全局
-开关"。所以这个值先挂起，等该会话**第一次提问前**再写回；写失败只在时间线上留一条 warning，
-不阻断提问；打开后没提问就关闭（草稿）则直接丢弃。重开会话（resume）则相反：Paseo 记住的是
-"宿主以为的旧值"，与 DSH 运行时不一致时**以运行时为准，不写回、不发时间线提示**，只在 daemon
-stderr 记一行——全局开关不该被一次重开悄悄覆盖。
+**新建会话面板里的选择**：在创建面板选这个下拉时，值会随新 agent 一起传来（`on`/`off`；旧
+agent 可能是 boolean），但**不会在打开时立刻写入**——宿主为了刷新创建面板本身也会打开一个临时
+会话，打开即写就等于"刷新菜单改全局开关"。所以这个值先挂起，等该会话**第一次提问前**再写回；
+写失败只在时间线上留一条 warning，不阻断提问；打开后没提问就关闭（草稿）则直接丢弃。重开会话
+（resume）则相反：Paseo 记住的是"宿主以为的旧值"，与 DSH 运行时不一致时**以运行时为准，不写回、
+不发时间线提示**，只在 daemon stderr 记一行——全局开关不该被一次重开悄悄覆盖。回传值会先归一化
+成 boolean 再比较/写入（`on`/`off` 字符串与旧 boolean 都认）。非预期值分两条路处理：切换
+（configure）时按协议错误响亮失败；open/resume 时无法识别的持久值会被忽略，但**每个被忽略的
+值都记一行 daemon stderr**（不静默丢弃）。
 
-实现路径：插件经桥的 `paseo/settings/list` 读 DSH 的 `settings.describe()`，切换经
-`paseo/settings/set` 调 `settings.mutate()` —— 值写进 profile 的 `cordis.patch.yml` 并由
+实现路径：插件把桥返回的每个布尔项投影成 `ProviderSetting.select`（值 `on`/`off`，option
+label 为「开启/关闭」），经桥的 `paseo/settings/list` 读 DSH 的
+`settings.describe()`，切换经 `paseo/settings/set` 调 `settings.mutate()`（bridge 侧仍是
+boolean）—— 值写进 profile 的 `cordis.patch.yml` 并由
 configEditor 当场 reconcile，**不依赖 HMR**（Paseo profile 的 bridge bundle 显式关掉了 HMR）。
 写入前置条件有两层：`revision`（settings 服务自己的乐观锁）之外还带 `expectedValue`（切换前
 界面上显示的值）——两层锁防的是不同的 stale 状态，值对不上时桥直接返回 `conflict`，不调用

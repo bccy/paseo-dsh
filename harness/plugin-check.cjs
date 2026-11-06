@@ -94,6 +94,9 @@ announceDshHome(runMode);
 const plugin = require("./index.server.js").default;
 const { DshProcess } = require("./server/dsh-process.js");
 const { toDshContent } = require("./server/session.js");
+// Same module the plugin resolves its copy from, so the option labels are
+// compared against this run's actual locale instead of a hardcoded language.
+const { UI: SERVER_UI } = require("./server/locale.js");
 
 // Record the prompt frames the plugin hands to its DSH process. This is the
 // protocol boundary the "non-text block reached DSH" check asserts on: a
@@ -313,9 +316,11 @@ const check = (name, pass, detail) => {
   //
   // The offline bridge check (`harness/settings-bridge-check.mjs`) uses a fake
   // settings service; this is the only check that proves the profile actually
-  // composes one, that a real third-party volatile boolean projects to a toggle,
-  // and that a switch round-trips through `settings.mutate` into `session.config`
-  // for every open conversation. It writes only inside the isolated DSH_HOME
+  // composes one, that a real third-party volatile boolean projects to a
+  // two-option `select` (on/off, so the desktop toolbar has text and state), and
+  // that a switch round-trips through `settings.mutate` into `session.config`
+  // for every open conversation. The composer sends the select value; the
+  // bridge still receives a boolean. It writes only inside the isolated DSH_HOME
   // clone (prepareDshHome), never the live profile.
   const settingsProcess = settingsReads.at(-1)?.process;
   const settingsReceipt = settingsProcess === undefined
@@ -362,22 +367,25 @@ const check = (name, pass, detail) => {
     }
     if (firstToggle === undefined) {
       console.log(
-        "  (skip: this profile exposes no simple third-party DSH toggle — "
+        "  (skip: this profile exposes no simple third-party DSH switch — "
           + "set PASEO_EXPECT_DSH_TOGGLE=<ns>[,<ns>] to make a missing row fail)",
       );
     } else {
       const originalValue = firstToggle.field.value;
       const targetValue = !originalValue;
+      // The composer publishes `"on"`/`"off"` for this row (see
+      // `session.ts`'s `dshSettingSelectValue`); the bridge still gets a boolean.
+      const selectValue = (value) => (value ? "on" : "off");
       const toggleMark = events.length;
       await conn.send({
         type: "session.configure",
         sessionId,
         requestId: "cfg-dsh-toggle",
-        changes: { settings: { [dshToggleId]: targetValue } },
+        changes: { settings: { [dshToggleId]: selectValue(targetValue) } },
       });
       const toggleApplied = await untilSince(
         toggleMark,
-        (e) => e.type === "session.config" && toggleIn(e)?.value === targetValue,
+        (e) => e.type === "session.config" && toggleIn(e)?.value === selectValue(targetValue),
         "DSH toggle applied",
       );
       const afterWrite = await settingsProcess.settingsList();
@@ -386,14 +394,24 @@ const check = (name, pass, detail) => {
       );
       // The label must be the plugin's own name from its title dictionary (this
       // process's LOCALE picks one entry), not a module specifier invented here.
-      const appliedLabel = toggleIn(toggleApplied)?.label;
+      // The option labels are the plain on/off words of the same locale (the
+      // switch's name lives on the row's label; repeating it in every option was
+      // user-visible duplication), so they are compared exactly.
+      const appliedRow = toggleIn(toggleApplied);
+      const appliedLabel = appliedRow?.label;
+      const expectedOptionLabels = [SERVER_UI.settings.dshToggle.on, SERVER_UI.settings.dshToggle.off];
       const titleDict = firstToggle.title;
       const titleChoices = titleDict !== undefined && titleDict !== null && typeof titleDict === "object"
         ? Object.values(titleDict)
         : [firstToggle.moduleName];
       check(
-        "→ a third-party DSH toggle switches through settings.mutate and is republished",
+        "→ a third-party DSH switch projects to an on/off select and is republished",
         toggleApplied !== undefined
+          && appliedRow?.type === "select"
+          && JSON.stringify((appliedRow?.options ?? []).map((option) => option.value))
+            === JSON.stringify(["on", "off"])
+          && JSON.stringify((appliedRow?.options ?? []).map((option) => option.label))
+            === JSON.stringify(expectedOptionLabels)
           && receiptToggle?.field.value === targetValue
           && typeof appliedLabel === "string"
           && appliedLabel !== ""
@@ -403,6 +421,8 @@ const check = (name, pass, detail) => {
           target: targetValue,
           receipt: receiptToggle?.field,
           label: appliedLabel,
+          expectedOptionLabels,
+          row: appliedRow,
         }),
       );
 
@@ -426,7 +446,7 @@ const check = (name, pass, detail) => {
         .find((e) => e.type === "session.config" && e.sessionId === secondSessionId);
       check(
         "→ a second open session shows the same global value",
-        secondReady !== undefined && toggleIn(secondConfig)?.value === targetValue,
+        secondReady !== undefined && toggleIn(secondConfig)?.value === selectValue(targetValue),
         JSON.stringify(toggleIn(secondConfig) ?? null),
       );
       await conn.send({ type: "session.close", sessionId: secondSessionId });
@@ -438,11 +458,11 @@ const check = (name, pass, detail) => {
         type: "session.configure",
         sessionId,
         requestId: "cfg-dsh-toggle-restore",
-        changes: { settings: { [dshToggleId]: originalValue } },
+        changes: { settings: { [dshToggleId]: selectValue(originalValue) } },
       });
       const restored = await untilSince(
         restoreMark,
-        (e) => e.type === "session.config" && toggleIn(e)?.value === originalValue,
+        (e) => e.type === "session.config" && toggleIn(e)?.value === selectValue(originalValue),
         "DSH toggle restored",
       );
       const afterRestore = await settingsProcess.settingsList();
@@ -450,7 +470,7 @@ const check = (name, pass, detail) => {
         (item) => `dsh:${item.ns}:${item.field.path.join(".")}` === dshToggleId,
       );
       check(
-        "→ the toggle is written back to its original value (isolated clone left clean)",
+        "→ the switch is written back to its original value (isolated clone left clean)",
         restored !== undefined && restoredToggle?.field.value === originalValue,
         JSON.stringify({ restored: toggleIn(restored)?.value, receipt: restoredToggle?.field }),
       );

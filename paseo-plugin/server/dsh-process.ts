@@ -145,7 +145,11 @@ export interface DshCatalog {
 }
 
 /**
- * One simple third-party DSH setting the bridge exposes as a composer toggle.
+ * One simple third-party DSH setting the bridge exposes as a composer switch.
+ *
+ * The plugin projects it as a two-option `select` (on/off) so the desktop
+ * toolbar shows a name and the current state; the bridge-side contract here
+ * stays boolean.
  *
  * The bridge projects DSH's runtime settings surface down to plugins whose
  * whole volatile Config form is one boolean field (`dsh-bridge/lib/
@@ -429,7 +433,7 @@ export interface DshProcessHandlers {
    * A settings document the composer shows changed (another writer — the DSH
    * web UI, another Paseo session — or this connection's own write echoing
    * back). Process-scoped: one child serves every session, so every open
-   * conversation must republish the same toggle state.
+   * conversation must republish the same switch state.
    */
   onSettingsChanged?(ns: string): void;
   onLog(line: string): void;
@@ -2745,7 +2749,7 @@ export class DshProcess {
   }
 
   /**
-   * Read the simple third-party DSH toggles the bridge projects for the composer.
+   * Read the simple third-party DSH switches the bridge projects for the composer.
    *
    * Process-scoped, not session-scoped: DSH's settings are the profile's, and
    * the single child serves every conversation. A profile that composes no
@@ -2767,7 +2771,7 @@ export class DshProcess {
         this.#warnedSettingsUnsupported = true;
         this.#processHandlers.onLog(
           "the bridge does not implement paseo/settings/list (it predates DSH settings pass-through); "
-            + "the composer shows no DSH toggles until the embedded bridge is rewritten",
+            + "the composer shows no DSH switches until the embedded bridge is rewritten",
         );
       }
       return { available: false, items: [], reason: "this bridge predates paseo/settings/list" };
@@ -2788,7 +2792,7 @@ export class DshProcess {
       // `reason`), so it is also reported once — the reason text still names it.
       this.#warnedSettingsUnavailable = true;
       this.#processHandlers.onLog(
-        `DSH settings are unavailable: ${reason}; the composer shows no DSH plugin toggles`,
+        `DSH settings are unavailable: ${reason}; the composer shows no DSH plugin switches`,
       );
     }
     return {
@@ -2799,7 +2803,7 @@ export class DshProcess {
   }
 
   /**
-   * Switch one exposed DSH toggle through the bridge.
+   * Switch one exposed DSH switch through the bridge.
    *
    * The revision is forwarded verbatim: it is the write precondition that keeps
    * a stale composer click from overwriting a value another session (or the DSH

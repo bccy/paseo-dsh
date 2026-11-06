@@ -59,7 +59,7 @@ export interface UiCopy {
     preset: { label: string; description: string };
     permission: { label: string; description: string };
     /**
-     * Copy for the DSH-discovered third-party toggles.
+     * Copy for the DSH-discovered third-party switches.
      *
      * The label comes from the plugin itself (its inventory title); the
      * description must say the value is **global** — it lives in the DSH
@@ -67,12 +67,18 @@ export interface UiCopy {
      * the machine. That is a property of this provider, not of any one plugin,
      * so it is generic copy and never names a plugin.
      *
+     * The row is a two-option `select` rather than Paseo's `toggle`: the desktop
+     * toolbar draws a toggle as an icon-only button whose icon color is muted
+     * for an id it does not know, so a toggle shows neither its name nor its
+     * state. A select shows the selected option's label, which is why `on`/`off`
+     * are words.
+     *
      * `errors` is one line per expected bridge failure code
      * (`DshSettingsSetResult`); the bridge's own message is appended for
      * `failed` because that text names the technical cause and is not
      * translated. `pendingFailedTitle` / `pendingFailedDescription` are the
      * timeline warning a create-panel selection produces when its deferred
-     * write-back fails before the first prompt; the two separators are part of
+     * write-back fails before the first prompt; the separators are part of
      * the copy because Chinese uses full-width punctuation and English does not
      * (leaving them hardcoded is how a Chinese-only sentence leaks into an
      * English UI).
@@ -86,13 +92,17 @@ export interface UiCopy {
         failed: string;
       };
       pendingFailedTitle: string;
-      /** A configure(request) carried a non-boolean value for a DSH toggle. */
-      nonBooleanValue: (id: string) => string;
+      /** The selected option's wording when the switch is on. */
+      on: string;
+      /** The selected option's wording when the switch is off. */
+      off: string;
+      /** A configure/open carried a value that is neither on/off nor a boolean. */
+      unexpectedValue: (id: string) => string;
       /** Prefix sentence of the warning; ends with its own separator. */
       pendingFailedDescription: string;
-      /** Between one toggle's display label and its failure reason. */
+      /** Between one switch's display label and its failure reason. */
       failureLabelSeparator: string;
-      /** Between two failed toggles. */
+      /** Between two failed switches. */
       failureJoiner: string;
     };
   };
@@ -172,7 +182,9 @@ const UI_COPY: Record<Locale, UiCopy> = {
           failed: "The switch could not be written.",
         },
         pendingFailedTitle: "DSH global switch was not applied",
-        nonBooleanValue: (id) => `DSH switch "${id}" accepts only a boolean value`,
+        on: "On",
+        off: "Off",
+        unexpectedValue: (id) => `DSH switch "${id}" received an unexpected value (the menu offers only On/Off)`,
         pendingFailedDescription:
           "The DSH global switch chosen when this session was created could not be written back (the prompt was still sent): ",
         failureLabelSeparator: ": ",
@@ -216,7 +228,9 @@ const UI_COPY: Record<Locale, UiCopy> = {
           failed: "开关写入失败。",
         },
         pendingFailedTitle: "DSH 全局开关未能写回",
-        nonBooleanValue: (id) => `DSH 配置「${id}」只接受布尔值`,
+        on: "开启",
+        off: "关闭",
+        unexpectedValue: (id) => `DSH 配置「${id}」收到非预期值（菜单只提供「开启/关闭」）`,
         pendingFailedDescription: "创建会话时选择的 DSH 全局开关未能写回（不影响本次提问）：",
         failureLabelSeparator: "：",
         failureJoiner: "；",
@@ -250,7 +264,7 @@ export const UI: UiCopy = UI_COPY[LOCALE];
  * a Chinese line uses `"："` — a hardcoded Chinese colon was exactly the
  * localization leak this function exists to remove.
  *
- * @param label - the toggle's display label.
+ * @param label - the switch's display label.
  * @param detail - why the write failed.
  * @param locale - copy locale; defaults to the process locale.
  * @returns one line, without a trailing joiner.
@@ -261,18 +275,19 @@ export function dshSettingFailureLine(label: string, detail: string, locale: Loc
 }
 
 /**
- * The configure-time error for a non-boolean DSH toggle value.
+ * The configure-time error for a DSH switch value the menu cannot have sent.
  *
- * The composer only publishes booleans, so this path is reachable only by a
- * protocol bug; it still must not leak Chinese into an English timeline. The id
- * is used because the row lookup happens after this value check.
+ * The composer publishes a `select` row, so a change arrives as `"on"` / `"off"`
+ * (or, from an agent persisted before that projection, a boolean); anything else
+ * is a protocol bug. It still must not leak Chinese into an English timeline.
+ * The id is used because the row lookup happens after this value check.
  *
  * @param id - the `dsh:`-prefixed setting id from the configure request.
  * @param locale - copy locale; defaults to the process locale.
  * @returns the user-facing error message.
  */
-export function dshSettingNonBooleanMessage(id: string, locale: Locale = LOCALE): string {
-  return UI_COPY[locale].settings.dshToggle.nonBooleanValue(id);
+export function dshSettingUnexpectedValueMessage(id: string, locale: Locale = LOCALE): string {
+  return UI_COPY[locale].settings.dshToggle.unexpectedValue(id);
 }
 
 /**

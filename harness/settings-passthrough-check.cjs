@@ -2,23 +2,34 @@
  * Regression: DSH's runtime settings toggles must reach Paseo's composer.
  *
  * The feature: a third-party DSH plugin whose whole volatile Config form is one
- * boolean field (e.g. `dsh-unrestricted`'s `enabled`) becomes one `toggle` row
- * in `ProviderConfigState.settings`, labelled with the plugin's own display
- * name, written back through the bridge's `paseo/settings/set` (which calls
- * DSH's `settings.mutate` — profile patch + configEditor reconcile, no HMR).
+ * boolean field (e.g. `dsh-unrestricted`'s `enabled`) becomes one `select` row
+ * in `ProviderConfigState.settings` — `"on"`/`"off"` options, labelled with the
+ * plugin's own display name — written back through the bridge's
+ * `paseo/settings/set` (which calls DSH's `settings.mutate` — profile patch +
+ * configEditor reconcile, no HMR). The bridge contract stays boolean; the
+ * on/off strings exist only in the composer projection. The first projection
+ * was a `toggle`, which the desktop toolbar draws as an icon-only button with
+ * no state feedback, so the select is what this check now pins (the reason
+ * lives in `session.ts`'s `dshSettingSelectValue`).
  *
  * What this check pins, against the fake bridge (no real DSH, no model):
  *
- *   1. **list becomes a toggle row.** The bridge's `paseo/settings/list` answer
+ *   1. **list becomes a select row.** The bridge's `paseo/settings/list` answer
  *      must appear in `session.config.settings` as
- *      `{type:"toggle", id:"dsh:<ns>:<path>", label:<localized title>, value:<bool>}`
- *      with a description that says the switch is global. The title arrives as a
- *      language dictionary from the bridge; the label is picked with this
- *      process's `LOCALE` (the same one that renders the rest of the composer).
- *   2. **configure sends the right frame.** A composer change of that id must
- *      reach the bridge as `paseo/settings/set {ns, path, value, revision,
- *      expectedValue}` — the revision because it is the service's optimistic
- *      lock, `expectedValue` because it is the value the user actually saw.
+ *      `{type:"select", id:"dsh:<ns>:<path>", label:<localized title>,
+ *      value:"on"|"off", options:[{label:"开启",value:"on"},
+ *      {label:"关闭",value:"off"}]}` with a description that says the switch is
+ *      global. The title arrives as a language dictionary from the bridge; the
+ *      label and the option words are picked with this process's `LOCALE` (the
+ *      same one that renders the rest of the composer). The option labels are
+ *      the plain on/off words — the row's `label` carries the switch's name, and
+ *      repeating it in every option was user-visible duplication.
+ *   2. **configure sends the right frame.** A composer change of that id — the
+ *      select value `"on"`/`"off"`, or a boolean persisted by an agent saved
+ *      while the row was still a toggle — must reach the bridge as
+ *      `paseo/settings/set {ns, path, value, revision, expectedValue}` — value
+ *      boolean, the revision because it is the service's optimistic lock,
+ *      `expectedValue` because it is the value the user actually saw.
  *   3. **a changed notification republishes every open session.** The bridge
  *      forwards `settings/document-updated` as `paseo/settings/changed`; the
  *      plugin must re-read and emit a fresh `session.config` for *all* open
@@ -26,6 +37,10 @@
  *      whose composer was touched.
  *   4. **no settings service means no rows.** `{available:false, items:[]}`
  *      must leave `settings` without any `dsh:` id, and must not fail the open.
+ *      `{available:true, items:[]}` is a different state — a settings service
+ *      with no qualifying row — and must also publish no row while staying
+ *      quiet about "unavailable" (that line is for a profile that has no
+ *      settings service at all).
  *   5. **the filter is the production one.** `dsh-bridge/lib/settings-
  *      discovery.js` is imported directly and asserted against official,
  *      multi-field, non-boolean and dict-shaped forms — the same functions the
@@ -38,10 +53,11 @@
  *      that code (not one generic message) and let the provider re-emit the
  *      committed config.
  *   7. **a create-panel pick is deferred to the first prompt.** A fresh open
- *      carries the user's pick in `config.settings`; it must not be written on
- *      open (Paseo opens a throwaway draft session to refresh the create menu),
- *      must be written before the first prompt, and a write failure must produce
- *      a timeline warning without blocking the prompt.
+ *      carries the user's pick in `config.settings` (`"on"`/`"off"`, or a
+ *      boolean from an older agent); it must not be written on open (Paseo opens
+ *      a throwaway draft session to refresh the create menu), must be written
+ *      before the first prompt, and a write failure must produce a timeline
+ *      warning without blocking the prompt.
  *   8. **a session that is never prompted writes nothing.** The draft path: open
  *      with a `dsh:` value, close without prompting, zero `paseo/settings/set`.
  *   9. **a resumed session never writes its stored value.** Paseo re-sends the
@@ -156,7 +172,15 @@ if (compiled === undefined) {
 }
 const plugin = require(compiled).default;
 const sessionModule = require(path.join(path.dirname(compiled), "server", "session.js"));
-const { DshSession, dshSettingId, dshSettingLabel, dshSettingFailureCopy } = sessionModule;
+const {
+  DshSession,
+  dshSettingBooleanValue,
+  dshSettingFailureCopy,
+  dshSettingId,
+  dshSettingLabel,
+  dshSettingOptionLabel,
+  dshSettingSelectValue,
+} = sessionModule;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const events = [];
@@ -206,8 +230,8 @@ function lastConfig(sessionId) {
   return [...events].reverse().find((event) => event.type === "session.config" && event.sessionId === sessionId);
 }
 
-/** The `dsh:`-prefixed toggle rows of a config. */
-function toggleRows(config) {
+/** The `dsh:`-prefixed switch rows of a config. */
+function dshRows(config) {
   return (config?.config?.settings ?? []).filter((setting) => String(setting.id).startsWith("dsh:"));
 }
 
@@ -314,7 +338,18 @@ process.on("exit", () => {
     writeSettings([settingsItem({ field: { path: ["enabled"], value: false, revision: 7 } })]);
     writeSettingsFailure({ code: "conflict", message: "scripted conflict" });
     const sessionId = `settings-en-${Date.now()}`;
-    await open(sessionId, { settings: { "dsh:dsh-unrestricted:enabled": true } });
+    const enConfig = await open(sessionId, { settings: { "dsh:dsh-unrestricted:enabled": "on" } });
+    const enRow = dshRows(enConfig)[0];
+    printCheck(
+      "the DSH switch row is a select with fully English option labels",
+      enRow?.type === "select"
+        && enRow?.value === "off"
+        && JSON.stringify(enRow?.options) === JSON.stringify([
+          { label: "On", value: "on" },
+          { label: "Off", value: "off" },
+        ]),
+      JSON.stringify(enRow),
+    );
     await prompt(sessionId, "prompt-en-warning");
     const warning = await until(
       (event) => event.type === "session.notice"
@@ -332,8 +367,8 @@ process.on("exit", () => {
       description,
     );
 
-    // A configure that carries a non-boolean value (only reachable through a
-    // protocol bug) must not leak the Chinese copy either.
+    // A configure that carries a value the menu cannot have sent (only
+    // reachable through a protocol bug) must not leak the Chinese copy either.
     const nonBooleanMark = events.length;
     await conn.send({
       type: "session.configure",
@@ -349,8 +384,10 @@ process.on("exit", () => {
     );
     const nonBooleanMessage = String(nonBooleanFailed.error?.message ?? "");
     printCheck(
-      "a non-boolean configure error is fully English",
-      !hasCjk(nonBooleanMessage) && /accepts only a boolean value/.test(nonBooleanMessage),
+      "an unexpected-value configure error is fully English",
+      !hasCjk(nonBooleanMessage)
+        && /received an unexpected value/.test(nonBooleanMessage)
+        && /On\/Off/.test(nonBooleanMessage),
       nonBooleanMessage,
     );
 
@@ -361,7 +398,7 @@ process.on("exit", () => {
       type: "session.configure",
       requestId: "configure-en-refused",
       sessionId,
-      changes: { settings: { "dsh:dsh-unrestricted:enabled": true } },
+      changes: { settings: { "dsh:dsh-unrestricted:enabled": "on" } },
     });
     const refusedFailed = await until(
       (event) => event.type === "request.failed" && event.requestId === "configure-en-refused",
@@ -382,18 +419,26 @@ process.on("exit", () => {
     process.exit(allPass ? 0 : 1);
   }
 
-  // ---- 1. the bridge list becomes a composer toggle ----------------------
+  // ---- 1. the bridge list becomes a composer select ----------------------
   const sessionA = `settings-a-${Date.now()}`;
   const configA = await open(sessionA);
-  const rowsA = toggleRows(configA);
+  const rowsA = dshRows(configA);
   check(
-    "paseo/settings/list becomes one dsh: toggle row in session.config",
+    "paseo/settings/list becomes one dsh: select row in session.config",
     rowsA.length === 1
-      && rowsA[0].type === "toggle"
+      && rowsA[0].type === "select"
       && rowsA[0].id === "dsh:dsh-unrestricted:enabled"
       && rowsA[0].label === "破限模式"
-      && rowsA[0].value === false,
+      && rowsA[0].value === "off",
     JSON.stringify(rowsA),
+  );
+  check(
+    "the select offers plain on/off option labels (the row's label carries the switch's name)",
+    JSON.stringify(rowsA[0]?.options) === JSON.stringify([
+      { label: "开启", value: "on" },
+      { label: "关闭", value: "off" },
+    ]),
+    JSON.stringify(rowsA[0]?.options),
   );
   check(
     "the label comes from the plugin's title dictionary using this process's LOCALE",
@@ -403,12 +448,12 @@ process.on("exit", () => {
     JSON.stringify(rowsA[0]?.label),
   );
   check(
-    "the toggle description says the switch is global (not a per-agent value)",
+    "the switch description says the value is global (not a per-agent value)",
     typeof rowsA[0]?.description === "string" && /全局生效/.test(rowsA[0].description),
     JSON.stringify(rowsA[0]?.description),
   );
   check(
-    "the existing provider settings are not displaced by DSH toggles",
+    "the existing provider settings are not displaced by DSH switches",
     (configA.config.settings ?? []).some((setting) => setting.id === "permission")
       && (configA.config.settings ?? []).every((setting) => setting.id !== "preset"),
     JSON.stringify((configA.config.settings ?? []).map((setting) => setting.id)),
@@ -420,11 +465,14 @@ process.on("exit", () => {
   );
 
   // ---- 2. configure sends the exact write frame --------------------------
+  //
+  // The composer sends the select value (`"on"`), not a boolean: the daemon
+  // passes the feature's option id through unchanged.
   await conn.send({
     type: "session.configure",
     requestId: "configure-settings-1",
     sessionId: sessionA,
-    changes: { settings: { "dsh:dsh-unrestricted:enabled": true } },
+    changes: { settings: { "dsh:dsh-unrestricted:enabled": "on" } },
   });
   await until(
     (event) => event.type === "request.completed" && event.requestId === "configure-settings-1",
@@ -447,9 +495,9 @@ process.on("exit", () => {
   );
   const afterConfigure = lastConfig(sessionA);
   check(
-    "the committed value is republished in session.config",
-    toggleRows(afterConfigure)[0]?.value === true,
-    JSON.stringify(toggleRows(afterConfigure)),
+    "the committed value is republished as the select value in session.config",
+    dshRows(afterConfigure)[0]?.value === "on",
+    JSON.stringify(dshRows(afterConfigure)),
   );
 
   // A no-op configure (the value the runtime already has) must not write.
@@ -457,7 +505,7 @@ process.on("exit", () => {
     type: "session.configure",
     requestId: "configure-settings-noop",
     sessionId: sessionA,
-    changes: { settings: { "dsh:dsh-unrestricted:enabled": true } },
+    changes: { settings: { "dsh:dsh-unrestricted:enabled": "on" } },
   });
   await until(
     (event) => event.type === "request.completed" && event.requestId === "configure-settings-noop",
@@ -470,13 +518,74 @@ process.on("exit", () => {
     `${String(setFrames().length)} set frame(s)`,
   );
 
+  // Legacy shape: Paseo can hand back a boolean persisted while this row was a
+  // toggle. It must be normalised before the no-op comparison and before the
+  // bridge write — `Boolean("off")` is true, so a naive pass-through would
+  // silently flip the switch.
+  await conn.send({
+    type: "session.configure",
+    requestId: "configure-settings-legacy-noop",
+    sessionId: sessionA,
+    changes: { settings: { "dsh:dsh-unrestricted:enabled": true } },
+  });
+  await until(
+    (event) => event.type === "request.completed" && event.requestId === "configure-settings-legacy-noop",
+    "legacy no-op configure completed",
+  );
+  await sleep(100);
+  check(
+    "a legacy boolean that matches the committed value writes nothing",
+    setFrames().length === 1,
+    `${String(setFrames().length)} set frame(s)`,
+  );
+  await conn.send({
+    type: "session.configure",
+    requestId: "configure-settings-legacy-write",
+    sessionId: sessionA,
+    changes: { settings: { "dsh:dsh-unrestricted:enabled": false } },
+  });
+  await until(
+    (event) => event.type === "request.completed" && event.requestId === "configure-settings-legacy-write",
+    "legacy write configure completed",
+  );
+  await sleep(100);
+  check(
+    "a legacy boolean configure still writes a boolean through the bridge",
+    setFrames().length === 2
+      && JSON.stringify(setFrames()[1].params) === JSON.stringify({
+        ns: "dsh-unrestricted",
+        path: ["enabled"],
+        value: false,
+        revision: 4,
+        expectedValue: true,
+      }),
+    JSON.stringify(setFrames().map((frame) => frame.params)),
+  );
+  // Back to on, so the failure phase below starts from the committed true.
+  await conn.send({
+    type: "session.configure",
+    requestId: "configure-settings-restore-on",
+    sessionId: sessionA,
+    changes: { settings: { "dsh:dsh-unrestricted:enabled": "on" } },
+  });
+  await until(
+    (event) => event.type === "request.completed" && event.requestId === "configure-settings-restore-on",
+    "restore configure completed",
+  );
+  await sleep(100);
+  check(
+    "the select value is accepted after a legacy boolean write",
+    setFrames().length === 3 && dshRows(lastConfig(sessionA))[0]?.value === "on",
+    JSON.stringify({ frames: setFrames().map((frame) => frame.params), row: dshRows(lastConfig(sessionA)) }),
+  );
+
   // ---- 2b. a refused write is readable and republishes the real value -----
   //
   // The bridge answers expected write failures as values, not thrown JSON-RPC
   // errors. The plugin must turn each code into its own user-facing copy *and*
   // let the provider republish the committed config (the composer had
   // optimistically drawn the new value; a silent snap-back reads as a broken
-  // toggle). Each phase scripts one bridge code on the shared child.
+  // switch). Each phase scripts one bridge code on the shared child.
   const failureCopy = [
     { code: "conflict", copy: /刚被别处改过/ },
     { code: "not_found", copy: /已经不存在/ },
@@ -490,7 +599,7 @@ process.on("exit", () => {
       type: "session.configure",
       requestId,
       sessionId: sessionA,
-      changes: { settings: { "dsh:dsh-unrestricted:enabled": false } },
+      changes: { settings: { "dsh:dsh-unrestricted:enabled": "off" } },
     });
     const failed = await until(
       (event) => event.type === "request.failed" && event.requestId === requestId,
@@ -510,8 +619,8 @@ process.on("exit", () => {
     );
     check(
       `…and the committed value is republished after the ${failure.code} failure`,
-      republished !== undefined && toggleRows(republished)[0]?.value === true,
-      JSON.stringify(republished === undefined ? null : toggleRows(republished)),
+      republished !== undefined && dshRows(republished)[0]?.value === "on",
+      JSON.stringify(republished === undefined ? null : dshRows(republished)),
     );
     writeSettingsFailure(undefined);
   }
@@ -519,32 +628,34 @@ process.on("exit", () => {
   // ---- 3. a changed notification republishes EVERY open session ----------
   const sessionB = `settings-b-${Date.now()}`;
   await open(sessionB);
-  const beforeA = toggleRows(lastConfig(sessionA))[0]?.value;
-  const beforeB = toggleRows(lastConfig(sessionB))[0]?.value;
+  const beforeA = dshRows(lastConfig(sessionA))[0]?.value;
+  const beforeB = dshRows(lastConfig(sessionB))[0]?.value;
   // Model the DSH web UI flipping the same profile-wide switch. The event
   // index is captured first so the open-time config (which also carried
-  // `false`) cannot satisfy the wait.
+  // `"off"`) cannot satisfy the wait. The trigger file carries the bridge's
+  // boolean (the fake bridge applies `value === true`); the republished row must
+  // project it back to the select value.
   const mark = events.length;
   const listFramesBeforeChange = frames().filter((frame) => frame.method === "paseo/settings/list").length;
   fs.writeFileSync(settingsTrigger, JSON.stringify({ ns: "dsh-unrestricted", value: false }));
   await until(
     (event) => event.type === "session.config"
       && event.sessionId === sessionA
-      && toggleRows(event)[0]?.value === false,
+      && dshRows(event)[0]?.value === "off",
     "session A republished after paseo/settings/changed",
     30000,
     mark,
   );
-  const afterA = toggleRows(lastConfig(sessionA))[0]?.value;
-  const afterB = toggleRows(lastConfig(sessionB))[0]?.value;
+  const afterA = dshRows(lastConfig(sessionA))[0]?.value;
+  const afterB = dshRows(lastConfig(sessionB))[0]?.value;
   check(
     "a settings change notification republishes the new value for the touched session",
-    beforeA === true && afterA === false,
+    beforeA === "on" && afterA === "off",
     `${String(beforeA)} -> ${String(afterA)}`,
   );
   check(
     "…and for every other open session too (the value is global)",
-    beforeB === true && afterB === false,
+    beforeB === "on" && afterB === "off",
     `${String(beforeB)} -> ${String(afterB)}`,
   );
   check(
@@ -574,8 +685,11 @@ process.on("exit", () => {
   // the exact seam the provider uses (`DshSession.readDshSettings`) is patched to
   // throw for one session and restored byte-for-byte afterwards.
   const originalReadDshSettings = DshSession.prototype.readDshSettings;
-  const fallbackBefore = toggleRows(lastConfig(sessionB))[0]?.value;
-  const fallbackNext = !fallbackBefore;
+  const fallbackBefore = dshRows(lastConfig(sessionB))[0]?.value;
+  // The trigger file carries the bridge's boolean; the republished row must
+  // project it back to the select value.
+  const fallbackNextBoolean = fallbackBefore === "on" ? false : true;
+  const fallbackNext = fallbackNextBoolean ? "on" : "off";
   let fallbackApplied;
   try {
     DshSession.prototype.readDshSettings = async function patchedRead() {
@@ -583,11 +697,11 @@ process.on("exit", () => {
       return originalReadDshSettings.call(this);
     };
     const fallbackMark = events.length;
-    fs.writeFileSync(settingsTrigger, JSON.stringify({ ns: "dsh-unrestricted", value: fallbackNext }));
+    fs.writeFileSync(settingsTrigger, JSON.stringify({ ns: "dsh-unrestricted", value: fallbackNextBoolean }));
     try {
       fallbackApplied = await until(
         (event) => event.type === "session.config" && event.sessionId === sessionB
-          && toggleRows(event)[0]?.value === fallbackNext,
+          && dshRows(event)[0]?.value === fallbackNext,
         "session B refreshed through a fallback reader",
         8000,
         fallbackMark,
@@ -601,13 +715,13 @@ process.on("exit", () => {
   check(
     "a failing first reader does not stop the other sessions from refreshing",
     fallbackApplied !== undefined
-      && toggleRows(lastConfig(sessionB))[0]?.value === fallbackNext
-      && toggleRows(lastConfig(sessionA))[0]?.value === fallbackNext,
+      && dshRows(lastConfig(sessionB))[0]?.value === fallbackNext
+      && dshRows(lastConfig(sessionA))[0]?.value === fallbackNext,
     JSON.stringify({
       before: fallbackBefore,
       next: fallbackNext,
-      a: toggleRows(lastConfig(sessionA))[0]?.value,
-      b: toggleRows(lastConfig(sessionB))[0]?.value,
+      a: dshRows(lastConfig(sessionA))[0]?.value,
+      b: dshRows(lastConfig(sessionB))[0]?.value,
     }),
   );
 
@@ -622,7 +736,7 @@ process.on("exit", () => {
       allFailStderr.push(String(chunk));
       return true;
     };
-    fs.writeFileSync(settingsTrigger, JSON.stringify({ ns: "dsh-unrestricted", value: fallbackBefore }));
+    fs.writeFileSync(settingsTrigger, JSON.stringify({ ns: "dsh-unrestricted", value: fallbackBefore === "on" }));
     const started = Date.now();
     while (Date.now() - started < 5000
       && !allFailStderr.some((line) => /re-reading DSH settings after/.test(line))) {
@@ -652,8 +766,8 @@ process.on("exit", () => {
   const configC = lastConfig(sessionC);
   check(
     "a profile with no settings service opens with no DSH rows",
-    toggleRows(configC).length === 0,
-    JSON.stringify(toggleRows(configC)),
+    dshRows(configC).length === 0,
+    JSON.stringify(dshRows(configC)),
   );
   const unavailableLogs = unavailableStderr.filter((line) => /DSH settings are unavailable/.test(line));
   check(
@@ -676,6 +790,31 @@ process.on("exit", () => {
   await conn.send({ type: "session.close", sessionId: sessionC2 });
   await until((event) => event.type === "session.closed" && event.sessionId === sessionC2, "session C2 closed");
 
+  // ---- 4b. available but no qualifying row: no rows, and not "unavailable" --
+  //
+  // The bridge answers `{available:true, items:[]}` when the profile composes a
+  // settings service but exposes no third-party single-boolean form. That must
+  // publish no row while staying quiet about "unavailable": the two states have
+  // different causes and different fixes, and conflating them buries the real
+  // one under the wrong log line.
+  writeSettings([]);
+  const sessionC3 = `settings-c3-${Date.now()}`;
+  const emptyStderr = await captureStderr(async () => {
+    await open(sessionC3);
+  });
+  check(
+    "an available settings service with no qualifying row opens with no DSH rows",
+    dshRows(lastConfig(sessionC3)).length === 0,
+    JSON.stringify(dshRows(lastConfig(sessionC3))),
+  );
+  check(
+    "…and is not reported as unavailable (that line belongs to a profile with no settings service)",
+    emptyStderr.every((line) => !/DSH settings are unavailable/.test(line)),
+    JSON.stringify(emptyStderr.filter((line) => /DSH settings/.test(line))),
+  );
+  await conn.send({ type: "session.close", sessionId: sessionC3 });
+  await until((event) => event.type === "session.closed" && event.sessionId === sessionC3, "session C3 closed");
+
   // ---- 5. a create-panel pick is deferred to the first prompt -------------
   //
   // Paseo's create panel puts the user's picks into the new agent's
@@ -685,7 +824,8 @@ process.on("exit", () => {
   writeSettings([settingsItem({ field: { path: ["enabled"], value: false, revision: 7 } })]);
   const sessionD = `settings-d-${Date.now()}`;
   const setMarkD = setFrames().length;
-  const configD = await open(sessionD, { settings: { "dsh:dsh-unrestricted:enabled": true } });
+  // The create panel publishes the select value, exactly like the daemon.
+  const configD = await open(sessionD, { settings: { "dsh:dsh-unrestricted:enabled": "on" } });
   check(
     "a fresh open carrying a dsh: pick does not write it yet",
     setFrames().length === setMarkD,
@@ -693,15 +833,15 @@ process.on("exit", () => {
   );
   check(
     "…and the open's config shows the runtime value, not the parked pick",
-    toggleRows(configD)[0]?.value === false,
-    JSON.stringify(toggleRows(configD)),
+    dshRows(configD)[0]?.value === "off",
+    JSON.stringify(dshRows(configD)),
   );
   const markD = events.length;
   await prompt(sessionD, "prompt-pending-ok");
   await until(
     (event) => event.type === "session.config"
       && event.sessionId === sessionD
-      && toggleRows(event)[0]?.value === true,
+      && dshRows(event)[0]?.value === "on",
     "pending DSH setting applied before the first prompt",
     30000,
     markD,
@@ -719,9 +859,9 @@ process.on("exit", () => {
     JSON.stringify(setFrames().map((frame) => frame.params)),
   );
   check(
-    "…and the applied value is republished in session.config",
-    toggleRows(lastConfig(sessionD))[0]?.value === true,
-    JSON.stringify(toggleRows(lastConfig(sessionD))),
+    "…and the applied value is republished as the select value in session.config",
+    dshRows(lastConfig(sessionD))[0]?.value === "on",
+    JSON.stringify(dshRows(lastConfig(sessionD))),
   );
   const pendingWarnings = events
     .slice(markD)
@@ -731,6 +871,46 @@ process.on("exit", () => {
     pendingWarnings.length === 0,
     JSON.stringify(pendingWarnings.map((event) => event.notice)),
   );
+
+  // ---- 5a. a legacy boolean pick is still honoured ------------------------
+  //
+  // An agent saved while this row was a toggle can carry a boolean in its
+  // create-panel pick. The parked value must be normalised, not dropped and not
+  // passed through (`Boolean("off")` is true, and a string "on" to the bridge
+  // would fail its boolean check).
+  const sessionD2 = `settings-d2-${Date.now()}`;
+  const setMarkD2 = setFrames().length;
+  const configD2 = await open(sessionD2, { settings: { "dsh:dsh-unrestricted:enabled": false } });
+  check(
+    "a fresh open carrying a legacy boolean pick parks it without writing",
+    setFrames().length === setMarkD2 && dshRows(configD2)[0]?.value === "on",
+    JSON.stringify({ frames: setFrames().length - setMarkD2, row: dshRows(configD2) }),
+  );
+  const markD2 = events.length;
+  await prompt(sessionD2, "prompt-pending-legacy");
+  await until(
+    (event) => event.type === "session.config"
+      && event.sessionId === sessionD2
+      && dshRows(event)[0]?.value === "off",
+    "legacy boolean pick applied before the first prompt",
+    30000,
+    markD2,
+  );
+  check(
+    "a legacy boolean pick is normalised and written as a boolean",
+    setFrames().length === setMarkD2 + 1
+      && JSON.stringify(setFrames().at(-1).params) === JSON.stringify({
+        ns: "dsh-unrestricted",
+        path: ["enabled"],
+        value: false,
+        revision: 8,
+        expectedValue: true,
+      }),
+    JSON.stringify(setFrames().map((frame) => frame.params)),
+  );
+  // Restore the scripted runtime value (true) for the failure/resume phases,
+  // without a write frame: the settings file *is* the runtime in this harness.
+  writeSettings([settingsItem({ field: { path: ["enabled"], value: true, revision: 12 } })]);
 
   // ---- 5b. a native subagent session cannot use this channel --------------
   //
@@ -763,7 +943,7 @@ process.on("exit", () => {
       childMark,
     );
     check(
-      "a child session cannot configure DSH toggles (the channel belongs to the root)",
+      "a child session cannot configure DSH switches (the channel belongs to the root)",
       childRefused !== undefined,
       JSON.stringify(childRefused?.error),
     );
@@ -778,7 +958,7 @@ process.on("exit", () => {
   writeSettingsFailure({ code: "conflict", message: "scripted conflict" });
   const sessionE = `settings-e-${Date.now()}`;
   const markE = events.length;
-  await open(sessionE, { settings: { "dsh:dsh-unrestricted:enabled": false } });
+  await open(sessionE, { settings: { "dsh:dsh-unrestricted:enabled": "off" } });
   await prompt(sessionE, "prompt-pending-fail");
   const warningE = await until(
     (event) => event.type === "session.notice"
@@ -805,8 +985,8 @@ process.on("exit", () => {
   );
   check(
     "…and the runtime value is still the committed one",
-    toggleRows(lastConfig(sessionE))[0]?.value === true,
-    JSON.stringify(toggleRows(lastConfig(sessionE))),
+    dshRows(lastConfig(sessionE))[0]?.value === "on",
+    JSON.stringify(dshRows(lastConfig(sessionE))),
   );
   writeSettingsFailure(undefined);
 
@@ -815,9 +995,10 @@ process.on("exit", () => {
   // The check process itself is zh-CN; the copy is resolved once at module load,
   // so the English sentences a real English UI receives can only be observed
   // from a child process with the locale flipped. That child runs the same
-  // compiled plugin + fake bridge and asserts three user-visible failures carry
-  // no CJK text or punctuation: the deferred-write warning, the non-boolean
-  // configure error, and the bridge-refused configure error.
+  // compiled plugin + fake bridge and asserts four user-visible strings carry
+  // no CJK text or punctuation: the select row's option labels, the
+  // deferred-write warning, the unexpected-value configure error, and the
+  // bridge-refused configure error.
   const enChild = spawnSync(process.execPath, [__filename], {
     env: { ...process.env, DSH_PASEO_LANG: "en", SETTINGS_CHECK_EN_WARNING: "1" },
     encoding: "utf8",
@@ -828,8 +1009,8 @@ process.on("exit", () => {
     .filter((line) => /^  (PASS|FAIL)  /.test(line));
   const enChildFailures = enChildResults.filter((line) => line.startsWith("  FAIL"));
   check(
-    "the pending warning and both configure errors are fully English under DSH_PASEO_LANG=en",
-    enChild.status === 0 && enChildResults.length === 3 && enChildFailures.length === 0,
+    "the select labels, pending warning and both configure errors are fully English under DSH_PASEO_LANG=en",
+    enChild.status === 0 && enChildResults.length === 4 && enChildFailures.length === 0,
     enChild.status === 0
       ? enChildResults.join(" | ").trim()
       : `child exit ${String(enChild.status)}: `
@@ -839,7 +1020,7 @@ process.on("exit", () => {
   // ---- 7. a session that is never prompted writes nothing (draft path) ----
   const sessionF = `settings-f-${Date.now()}`;
   const setMarkF = setFrames().length;
-  await open(sessionF, { settings: { "dsh:dsh-unrestricted:enabled": false } });
+  await open(sessionF, { settings: { "dsh:dsh-unrestricted:enabled": "off" } });
   await conn.send({ type: "session.close", sessionId: sessionF });
   await until((event) => event.type === "session.closed" && event.sessionId === sessionF, "session F closed");
   await sleep(150);
@@ -872,8 +1053,8 @@ process.on("exit", () => {
   );
   check(
     "…and shows the runtime value",
-    toggleRows(lastConfig(sessionG))[0]?.value === true,
-    JSON.stringify(toggleRows(lastConfig(sessionG))),
+    dshRows(lastConfig(sessionG))[0]?.value === "on",
+    JSON.stringify(dshRows(lastConfig(sessionG))),
   );
   check(
     "…with no timeline notice (the divergence is logged to stderr instead)",
@@ -887,6 +1068,21 @@ process.on("exit", () => {
     "…and one daemon-stderr line names the stale value and the runtime value",
     staleLog.length === 1 && /stored false, runtime true/.test(staleLog[0]),
     JSON.stringify(staleLog),
+  );
+  // The same comparison must normalise the select value: a stored `"on"` against
+  // a runtime `true` is not a divergence, and printing it as one would put a
+  // false line on every reopen.
+  const sessionH = `settings-h-${Date.now()}`;
+  const matchingStderr = await captureStderr(async () => {
+    await open(sessionH, {
+      settings: { "dsh:dsh-unrestricted:enabled": "on" }, // runtime is true
+      persistence: { version: 1, data: { sessionId: `settings-resume-${Date.now()}` } },
+    });
+  });
+  check(
+    "a resumed session whose stored select value matches the runtime logs no divergence",
+    matchingStderr.filter((line) => /dsh:dsh-unrestricted:enabled/.test(line)).length === 0,
+    JSON.stringify(matchingStderr),
   );
 
   // ---- 9. label resolution: both languages, fallbacks --------------------
@@ -917,6 +1113,36 @@ process.on("exit", () => {
   );
 
   check(
+    "dshSettingSelectValue projects the boolean state to the composer's select value",
+    dshSettingSelectValue(true) === "on"
+      && dshSettingSelectValue(false) === "off",
+    JSON.stringify([dshSettingSelectValue(true), dshSettingSelectValue(false)]),
+  );
+  check(
+    "dshSettingBooleanValue accepts on/off and the legacy boolean, rejects everything else",
+    dshSettingBooleanValue("on") === true
+      && dshSettingBooleanValue("off") === false
+      && dshSettingBooleanValue(true) === true
+      && dshSettingBooleanValue(false) === false
+      && dshSettingBooleanValue("yes") === undefined
+      && dshSettingBooleanValue(1) === undefined
+      && dshSettingBooleanValue(undefined) === undefined
+      && dshSettingBooleanValue(null) === undefined,
+    JSON.stringify([
+      dshSettingBooleanValue("on"),
+      dshSettingBooleanValue("off"),
+      dshSettingBooleanValue("yes"),
+      dshSettingBooleanValue(1),
+    ]),
+  );
+  check(
+    "dshSettingOptionLabel is the plain on/off word, not the switch's name plus a word",
+    dshSettingOptionLabel(true) === "开启"
+      && dshSettingOptionLabel(false) === "关闭",
+    JSON.stringify([dshSettingOptionLabel(true), dshSettingOptionLabel(false)]),
+  );
+
+  check(
     "dshSettingFailureCopy keeps the bridge's technical message for an unexpected failure",
     /开关写入失败/.test(dshSettingFailureCopy("failed", "schema refused the write"))
       && /schema refused the write/.test(dshSettingFailureCopy("failed", "schema refused the write"))
@@ -929,7 +1155,8 @@ process.on("exit", () => {
 
   // ---- 9b. the server-side copy tables carry both languages ---------------
   //
-  // The composer's toggle description and the per-code failure copy live in
+  // The composer's switch description, on/off wording and the per-code failure
+  // copy live in
   // `server/locale.ts` (the client's `locale-check` only reads the client
   // tables), so both languages are asserted here: every key non-empty, the
   // global wording present, and the Chinese/English columns genuinely different
@@ -937,10 +1164,16 @@ process.on("exit", () => {
   const { execFileSync } = require("node:child_process");
   const localeModule = path.join(path.dirname(compiled), "server", "locale.js");
   const readToggleCopy = (language) => {
+    // `unexpectedValue` is a formatter, and JSON drops functions; render it with
+    // a probe id so the copy itself crosses the process boundary as a string.
     const script =
       `process.env.DSH_PASEO_LANG = ${JSON.stringify(language)};`
       + `const { UI } = require(${JSON.stringify(localeModule)});`
-      + "process.stdout.write(JSON.stringify(UI.settings.dshToggle));";
+      + "const copy = UI.settings.dshToggle;"
+      + "process.stdout.write(JSON.stringify({"
+      + "  ...copy,"
+      + "  unexpectedValue: copy.unexpectedValue('dsh:probe:path'),"
+      + "}));";
     return JSON.parse(
       execFileSync(process.execPath, ["-e", script], {
         env: { ...process.env, DSH_PASEO_LANG: language },
@@ -951,7 +1184,7 @@ process.on("exit", () => {
   const toggleCopyEn = readToggleCopy("en");
   const errorCodes = ["conflict", "not_found", "settings_unavailable", "failed"];
   check(
-    "the toggle description says the switch is global in both languages",
+    "the switch description says the value is global in both languages",
     /全局生效/.test(toggleCopyZh.description) && /影响本机所有 DSH 会话/.test(toggleCopyZh.description)
       && /global/i.test(toggleCopyEn.description) && /every DSH session/i.test(toggleCopyEn.description),
     JSON.stringify({ zh: toggleCopyZh.description, en: toggleCopyEn.description }),
@@ -970,6 +1203,24 @@ process.on("exit", () => {
       && toggleCopyEn.pendingFailedTitle.trim() !== ""
       && toggleCopyZh.pendingFailedTitle !== toggleCopyEn.pendingFailedTitle,
     JSON.stringify([toggleCopyZh.pendingFailedTitle, toggleCopyEn.pendingFailedTitle]),
+  );
+  check(
+    "the on/off option wording exists in both languages (the select needs words, not just a boolean)",
+    toggleCopyZh.on === "开启"
+      && toggleCopyZh.off === "关闭"
+      && toggleCopyEn.on === "On"
+      && toggleCopyEn.off === "Off",
+    JSON.stringify({ zh: [toggleCopyZh.on, toggleCopyZh.off], en: [toggleCopyEn.on, toggleCopyEn.off] }),
+  );
+  check(
+    "the unexpected-value error copy names the two legal values in both languages",
+    /非预期值/.test(toggleCopyZh.unexpectedValue)
+      && /开启\/关闭/.test(toggleCopyZh.unexpectedValue)
+      && /dsh:probe:path/.test(toggleCopyZh.unexpectedValue)
+      && /unexpected value/.test(toggleCopyEn.unexpectedValue)
+      && /On\/Off/.test(toggleCopyEn.unexpectedValue)
+      && /dsh:probe:path/.test(toggleCopyEn.unexpectedValue),
+    JSON.stringify({ zh: toggleCopyZh.unexpectedValue, en: toggleCopyEn.unexpectedValue }),
   );
 
   // ---- 10. the production filter (pure functions, same code as the bridge) -

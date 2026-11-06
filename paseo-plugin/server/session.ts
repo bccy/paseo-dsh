@@ -51,7 +51,7 @@ import { isGoalRoundSource } from "./activity-timeline";
 import { assistantStreamFirstTokenTime } from "./first-token";
 
 /**
- * Prefix of the `ProviderSetting.id` a DSH-discovered toggle carries.
+ * Prefix of the `ProviderSetting.id` a DSH-discovered switch carries.
  *
  * The id must be stable across sessions and recomputable from the item (Paseo
  * persists the last value per agent and re-sends it on open), and it must not
@@ -61,7 +61,7 @@ import { assistantStreamFirstTokenTime } from "./first-token";
 export const DSH_SETTINGS_ID_PREFIX = "dsh:";
 
 /**
- * The composer id of one DSH-discovered toggle, e.g. `dsh:dsh-unrestricted:enabled`.
+ * The composer id of one DSH-discovered switch, e.g. `dsh:dsh-unrestricted:enabled`.
  *
  * @param item - one item from the bridge's `paseo/settings/list`.
  * @returns the `ProviderSetting.id` the composer shows and sends back.
@@ -71,7 +71,46 @@ export function dshSettingId(item: Pick<DshSettingsToggle, "ns" | "field">): str
 }
 
 /**
- * The label a composer row shows for one DSH-discovered toggle.
+ * The two wire values the composer's select row uses for one DSH switch.
+ *
+ * The bridge contract stays boolean (`paseo/settings/set` takes a boolean and
+ * `DshSettingsToggle.field.value` is one), but Paseo's `ProviderSetting` has no
+ * way to give a `toggle` a name or a state on the desktop toolbar: it draws the
+ * toggle as an icon-only button, and `getFeatureIconColor` returns the muted
+ * color for a feature id it does not know, so the button carries neither text
+ * nor state. The same switch projected as a `select` renders as the
+ * "icon + selected text" control the permission/mode menus use, which is what
+ * makes the value visible. These strings are that control's option ids; they
+ * never reach the bridge.
+ */
+export type DshSettingSelectValue = "on" | "off";
+
+/** Project one boolean switch state to the composer's select value. */
+export function dshSettingSelectValue(value: boolean): DshSettingSelectValue {
+  return value ? "on" : "off";
+}
+
+/**
+ * Normalise one value Paseo sent back for a DSH switch.
+ *
+ * Two shapes are legitimate: the select value this projection publishes
+ * (`"on"` / `"off"`), and a boolean from an agent persisted before the switch
+ * became a select — Paseo re-sends the value it last saw, and that memory can
+ * predate the upgrade. Everything else is a protocol bug and must not be
+ * coerced (`Boolean("off")` is `true`, which would silently turn the switch on).
+ *
+ * @param value - `config.settings[id]` from `session.open`/`session.configure`.
+ * @returns the boolean, or `undefined` when the value is not one of the two shapes.
+ */
+export function dshSettingBooleanValue(value: unknown): boolean | undefined {
+  if (value === "on") return true;
+  if (value === "off") return false;
+  if (typeof value === "boolean") return value;
+  return undefined;
+}
+
+/**
+ * The label a composer row shows for one DSH-discovered switch.
  *
  * DSH's plugin inventory reports the plugin's display name as a language
  * dictionary (`{en: "Unrestricted mode", zh: "破限模式"}`), and the bridge passes
@@ -108,6 +147,24 @@ export function dshSettingLabel(
   const moduleName = usable(item.moduleName);
   if (moduleName !== undefined) return moduleName;
   return item.ns;
+}
+
+/**
+ * One select option's label: just the localized on/off word.
+ *
+ * The option labels used to repeat the switch's name ("破限模式：开启"), which
+ * the user saw as duplication against the menu/row that already carries the
+ * name — the option now reads only `开启`/`关闭` (`On`/`Off`). On the wide
+ * desktop toolbar the select trigger therefore shows the word alone; the
+ * switch's name is still the row's `label`, which the tooltip and the
+ * condensed/tight Settings panel render.
+ *
+ * @param value - the option's boolean state.
+ * @returns the localized option label.
+ */
+export function dshSettingOptionLabel(value: boolean): string {
+  const copy = UI.settings.dshToggle;
+  return value ? copy.on : copy.off;
 }
 
 /**
@@ -176,7 +233,7 @@ import {
   commandCopy,
   dshPendingFailedDescription,
   dshSettingFailureLine,
-  dshSettingNonBooleanMessage,
+  dshSettingUnexpectedValueMessage,
   presetLabel,
   skillDescription,
 } from "./locale";
@@ -644,7 +701,7 @@ export class DshSession {
   #permission: string | null = null;
   #permissionPresets: DshPermissionPreset[] = [];
   /**
-   * Simple third-party DSH settings projected as composer toggles.
+   * Simple third-party DSH settings projected as composer select rows.
    *
    * These are **global** to the DSH profile (one child serves every session of
    * the connection), so the list is re-read from the runtime on open and after
@@ -882,18 +939,31 @@ export class DshSession {
       });
     }
     const thinkingOptions = this.#thinking();
-    // Simple third-party DSH toggles (see `#dshSettings`). The label is the
+    // Simple third-party DSH switches (see `#dshSettings`). The label is the
     // plugin's own display name and the description says "global" on purpose:
     // the value lives in the DSH profile, not in this agent, and switching it
     // here changes every DSH session on the machine. Hiding that would be the
     // silent-degradation shape this repository keeps finding.
+    //
+    // A two-option `select`, not Paseo's `toggle`: the desktop toolbar renders a
+    // toggle as an icon-only button, and `getFeatureIconColor` returns the muted
+    // color for a feature id it does not know — so a toggle shows neither the
+    // switch's name nor its state, which is exactly the "invisible switch" this
+    // projection fixes. A select renders as "icon + selected text" and opens a
+    // menu, the same control the permission and mode pickers use. The options are
+    // the plain on/off words; the row's `label` carries the switch's name (see
+    // {@link dshSettingOptionLabel} for why the name is not repeated there).
     for (const item of this.#dshSettings) {
       settings.push({
-        type: "toggle",
+        type: "select",
         id: dshSettingId(item),
         label: dshSettingLabel(item),
         description: UI.settings.dshToggle.description,
-        value: item.field.value,
+        value: dshSettingSelectValue(item.field.value),
+        options: [
+          { label: dshSettingOptionLabel(true), value: dshSettingSelectValue(true) },
+          { label: dshSettingOptionLabel(false), value: dshSettingSelectValue(false) },
+        ],
       });
     }
     return {
@@ -971,12 +1041,12 @@ export class DshSession {
   }
 
   /**
-   * Read the simple third-party DSH toggles the composer should offer.
+   * Read the simple third-party DSH switches the composer should offer.
    *
    * Fail-open by design: an older embedded bridge does not answer
    * `paseo/settings/list` at all, and a profile that composes no settings
    * service answers `available:false`. Neither is a reason to fail a session
-   * open — the conversation is perfectly usable without a toggle row. The
+   * open — the conversation is perfectly usable without a switch row. The
    * bridge already logs the version-mismatch case once; this only reports
    * unexpected read failures.
    *
@@ -989,13 +1059,13 @@ export class DshSession {
     } catch (error) {
       this.#dshSettings = [];
       this.#options.log(
-        `reading DSH settings toggles failed: ${error instanceof Error ? error.message : String(error)}`,
+        `reading DSH settings switches failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
   }
 
   /**
-   * Read the authoritative toggle list for this connection.
+   * Read the authoritative switch list for this connection.
    *
    * Used by the provider to fan one settings change out to every open session:
    * the value is the profile's, and one child serves every conversation, so one
@@ -1008,7 +1078,7 @@ export class DshSession {
   }
 
   /**
-   * Adopt one authoritative read of the toggle list.
+   * Adopt one authoritative read of the switch list.
    *
    * @param list - the bridge's `paseo/settings/list` receipt.
    * @returns whether the projected list changed (the provider republishes
@@ -1020,18 +1090,22 @@ export class DshSession {
     return before !== this.#dshSettingsSignature();
   }
 
-  /** Stable snapshot of the toggle list, for change detection and tests. */
+  /** Stable snapshot of the switch list, for change detection and tests. */
   #dshSettingsSignature(): string {
     return JSON.stringify(this.#dshSettings);
   }
 
   /**
-   * The `dsh:`-prefixed settings the composer currently shows, keyed by id.
+   * The `dsh:`-prefixed switches the composer currently shows, keyed by id.
    *
    * Used by the provider on open: Paseo persists the last value it saw per
    * agent and re-sends it, but the truth is the runtime's global value. The
    * provider compares the two and logs a stderr line when they differ instead of
    * applying the stale per-agent value over another session's choice.
+   *
+   * Values are the bridge's booleans, never the composer's select strings: the
+   * caller normalises whatever Paseo sent (see {@link dshSettingBooleanValue})
+   * so this stays comparable across a projection change.
    */
   dshSettingValues(): Map<string, boolean> {
     const values = new Map<string, boolean>();
@@ -1048,8 +1122,12 @@ export class DshSession {
    * memory of a global switch, not the runtime's truth), so the provider does
    * not call this on resume.
    *
-   * Non-boolean values and ids the runtime no longer exposes are dropped: the
-   * runtime is authoritative, and an unknown id has no row to write through.
+   * Values that are neither the composer's `"on"`/`"off"` nor a boolean (an
+   * agent persisted while this row was still a toggle) are dropped **and
+   * logged**: the runtime is authoritative, but a value this build cannot read
+   * must not disappear silently. Ids the runtime no longer exposes are not
+   * filtered here — {@link applyPendingDshSettings} drops those at write time,
+   * after the list has been re-read, with its own log line.
    *
    * @param settings - `config.settings` from `session.open`.
    */
@@ -1057,8 +1135,16 @@ export class DshSession {
     if (settings === undefined) return;
     const pending = new Map<string, boolean>();
     for (const [id, value] of Object.entries(settings)) {
-      if (!id.startsWith(DSH_SETTINGS_ID_PREFIX) || typeof value !== "boolean") continue;
-      pending.set(id, value);
+      if (!id.startsWith(DSH_SETTINGS_ID_PREFIX)) continue;
+      const normalized = dshSettingBooleanValue(value);
+      if (normalized === undefined) {
+        this.#options.log(
+          `ignoring DSH setting "${id}" from the open: `
+            + `${JSON.stringify(value)} is not "on"/"off" or a boolean`,
+        );
+        continue;
+      }
+      pending.set(id, normalized);
     }
     this.#pendingDshSettings = pending.size === 0 ? undefined : pending;
   }
@@ -2367,32 +2453,37 @@ export class DshSession {
       }
     }
 
-    // Simple third-party DSH toggles. Their values are GLOBAL — the profile's
+    // Simple third-party DSH switches. Their values are GLOBAL — the profile's
     // settings document, shared by every session of this child — so the write
     // goes to DSH's own settings writer through the bridge and the receipt is
     // the authority. The composer only ever shows what the runtime committed.
+    //
+    // The composer sends the select value (`"on"`/`"off"`); a boolean is still
+    // accepted because Paseo can hand back a value persisted while this row was
+    // a toggle. The bridge contract stays boolean either way.
     for (const [id, requested] of Object.entries(changes.settings ?? {})) {
       if (!id.startsWith(DSH_SETTINGS_ID_PREFIX)) continue;
-      if (typeof requested !== "boolean") {
-        throw new Error(dshSettingNonBooleanMessage(id));
+      const requestedValue = dshSettingBooleanValue(requested);
+      if (requestedValue === undefined) {
+        throw new Error(dshSettingUnexpectedValueMessage(id));
       }
       const item = this.#dshSettings.find((candidate) => dshSettingId(candidate) === id);
       if (item === undefined) {
         // The row disappeared between the composer read and the click (the
         // plugin was uninstalled, or the profile no longer exposes it). Ignore
         // it and let the re-emitted config drop the row; throwing would turn an
-        // already-gone toggle into a failed configure.
+        // already-gone switch into a failed configure.
         this.#options.log(`ignoring unknown DSH setting "${id}"; the runtime no longer exposes it`);
         continue;
       }
-      if (requested === item.field.value) continue;
+      if (requestedValue === item.field.value) continue;
       // Send the value the composer displayed as the value-layer precondition on
       // top of the revision: the bridge refuses the write when the runtime no
       // longer shows it, which is exactly the stale click this protects against.
       const applied = await process.settingsSet(
         item.ns,
         item.field.path,
-        requested,
+        requestedValue,
         item.field.revision,
         item.field.value,
       );

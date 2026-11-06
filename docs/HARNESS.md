@@ -761,15 +761,15 @@
   其它抛错与形状不符 → `rpc_failed`（不清空成空看板）；DSH 字段原样；**`running`**：空闲根的 Lead 为 false、未托管队员无此键、
   托管中队员回合未结束为 true、已结束为 false、失败成员无此键。编译同 `goal-server-check`（`.dbg` + 拷入本脚本与
   `fake-dsh-bridge.mjs`）。**动了 `server/{dsh-process,session,provider}.ts` 的 team 部分、`shared/team.ts` 或假桥 `team` 模式必跑。**
-- `harness/team-pill-check.cjs` — `client/team-polling.ts` 纯规则（**125 条**；pill 图标改为 `Users` + 角标环的 4 条源码钉——三种状态都经 `CornerRingIcon` 画 `Users`、只有运行态开环、不再出现裸 `StatusRingMark`、可见性仍经 `teamPillVisible`）：可见性（按队员数而非行数：只有 Lead 无任务隐藏、无 Lead 行有队员可见）、成员标题行 chip（顺序、0 不出、运行态缺失不出运行中/已停止、计数只数队员（运行中的 Lead 不算运行中）、Lead 空闲不算已停止、四档降级顺序与选档、各档保留失败与运行中且带字）、负责人标记（运行环 / 已停止只来自 `running` true/false，缺失不标，已完成不标）与「N 个负责人已停止」计数、pill 图标
+- `harness/team-pill-check.cjs` — `client/team-polling.ts` 纯规则（**153 条**；pill 图标改为 `Users` + 角标环的 4 条源码钉——三种状态都经 `CornerRingIcon` 画 `Users`、只有运行态开环、不再出现裸 `StatusRingMark`、可见性仍经 `teamPillVisible(team, seen)`、seen 三路接线源码钉（面板关闭 / board / agent 事件））：可见性（只看任务、不看队员：无任务一律隐藏——含起了队员但没建任务；有任务即可见，无论有无队员行；无看板隐藏；**全部完成只再显示一次、看过即隐藏**：`teamAllDoneKey` 按 id 排序的 `id:revision` 签名（顺序无关、revision 变化换签名）与 `teamCompleteSeenStep` 三分支——board 首见→watch、agent idle→idleSeen、下一回合 running 或面板关闭→seen、未全完成清 watch 保留 seen）、成员标题行 chip（顺序、0 不出、运行态缺失不出运行中/已停止、计数只数队员（运行中的 Lead 不算运行中）、Lead 空闲不算已停止、四档降级顺序与选档、各档保留失败与运行中且带字）、负责人标记（运行环 / 已停止只来自 `running` true/false，缺失不标，已完成不标）与「N 个负责人已停止」计数、pill 图标
   （只有 `running:true` 才转环、failure/失败成员红）、成员词（无 `running` 时中英都不说运行中/空闲）与排序、任务标记只认 DSH 的
   `ready`、B 分组顺序（被阻塞任务不进可开始）、facts 行、详情字段、重叠警告翻译（未知原样）、契约码、poller 适配（终态移除、
   瞬态保留上次看板）、pill 接线源码钉（label/title 是名词、无计数）。运行：`cd paseo-plugin && npx tsc -p ../harness/team-pill.tsconfig.json`，
   写 `.dbg-team/package.json` 并拷入本脚本，`cd .dbg-team && node team-pill-check.cjs`。**动了 `client/team-*.ts(x)` 必跑。**
-- `harness/team-popover-render-check.cjs` — 真实 `TeamPanel` / `makeTeamPopover` 经 react-native-web 渲染进 jsdom（**89 条**）：
+- `harness/team-popover-render-check.cjs` — 真实 `TeamPanel` / `makeTeamPopover` 经 react-native-web 渲染进 jsdom（**90 条**）：
   分区与分组顺序、已完成默认折叠且原地展开、被阻塞任务不在可开始、不画逐个成员行、标题行（鲸鱼 +「DeepSeek」+ 队员数 + chip，0 队员不写「0 名成员」，chip 18px/4px 圆角/无边框，失败红底首位，运行态缺失只剩完成 chip，0 不出，四个隐藏量宽副本）、负责人运行环与「已停止」（列表与详情页）、进行中标题的已停止计数、10 个任务负责人全部已停止、
   facts/警告、描述两行多行截断、详情页（返回行、字段、完整描述保留换行、返回回列表）、空看板、只有 Lead、failure 首行红字、
-  只读（按钮只有任务行与折叠行）、容器订阅 store 重绘。**需要 `HOST_APP`**，未设 exit 2。**动了 `client/team-popover.tsx` / `team-pill.tsx` 必跑。**
+  只读（按钮只有任务行与折叠行）、容器订阅 store 重绘、关闭时上报最后一块看板（seen 信号）。**需要 `HOST_APP`**，未设 exit 2。**动了 `client/team-popover.tsx` / `team-pill.tsx` 必跑。**
 - `harness/tool-call-check.cjs` 团队段（399 → **443**）：`team_task_get/create/update/list` 字段卡、update 动作词（未知原样）、
   list 计数与筛选词、`nextCursor`；**任何形状不符都保留原始 JSON**（非 JSON、多键、少键、deleted、列表坏项、列表多键）；
   失败行不画卡，已知 DSH 原文中文进 `errorShort`/`errorHint`、原文保留在 `error`，未知句不翻、非团队工具不过团队表、英文不翻。
@@ -780,7 +780,8 @@
 ## DSH 配置透传链（2026-11-05）
 
 第三方插件的简单布尔开关从 DSH 运行时透传到 Paseo 会话配置菜单（`ProviderConfigState.settings`
-的 `toggle` 行）。范围与语义见 README「DSH 配置透传」。断言数为回填时实跑值。
+的 `select` 行，`on`/`off` 两个选项；桥协议仍是 boolean）。范围与语义见 README「DSH 配置透传」。
+断言数为回填时实跑值。
 
 - `harness/settings-bridge-check.mjs` — 桥的 `paseo/settings/list|set`（真 `PaseoHarnessServer` +
   假 `settings`/`configEditor`/`loader`+`pluginPackages`；不 spawn `dsh`、不读 profile、不起模型），
@@ -806,33 +807,47 @@
   `settings/changed` 转发）。
 - `harness/settings-passthrough-check.cjs` — 插件侧（假桥 `DSH_FAKE_SETTINGS_FILE` 脚本化
   `paseo/settings/list|set`，`DSH_FAKE_SETTINGS_TRIGGER` 模拟 DSH Web 界面改同一个 profile 开关，
-  `DSH_FAKE_SETTINGS_FAIL_FILE` 脚本化写失败），**50 条**：list 变成 `session.config.settings` 的
-  `toggle` 行（id `dsh:<ns>:<path>`、label=插件显示名字典按本进程 LOCALE 选、描述写明全局）、
-  configure 发出 `paseo/settings/set {ns,path,value,revision,expectedValue}`、回执值重新发布、
-  同值不写、`paseo/settings/changed` 后**所有**打开会话都重发新值（且整个通知只 `list` 一次，
-  不是每会话一次）、无 settings 服务不出行且桥给的 reason 只 log 一次（latched，第二次 open 不
-  重复）、冲突/不存在/无服务三种码各自的中文文案且 provider 重发真实 config、**新建面板值挂起到首次
-  prompt 才写**（open 时 0 次 set、prompt 前写、回执值发布）、**写失败出时间线 warning 且 prompt
-  照发**、**未 prompt 就关闭（草稿）不写**、**resume 带旧值不写、不发 notice、daemon stderr 一行**、
-  `dshSettingLabel` 中英与回落、失败文案保留桥原文、服务端 locale 中英表（描述含「全局生效 /
-  影响本机所有 DSH 会话」、4 个错误码非空且中英不同、pending warning 标题）、**子会话只读**（原生
-  subagent 会话不出 `dsh:` 行，对它 configure 被拒）、**pending 失败 warning 的本地化**（zh 下
-  description 含「创建会话时选择的 DSH 全局开关未能写回」，另起一个 `DSH_PASEO_LANG=en` 子进程
-  跑同一失败场景，断言 description 无任何 CJK 字符/全角标点且为英文原意——LOCALE 在模块加载时
-  定死，英文文案只能这样端到端验证；同一 en 子进程还断言 configure 的两条失败文本无 CJK：非布尔
-  值的 `accepts only a boolean value` 与桥拒绝的 label+分隔符+错误码文案）、**刷新读取的第一个
-  会话失败不影响其它会话**（给 `DshSession.readDshSettings` 打一个只对首个会话抛错的补丁 →
-  其它打开会话仍收到 `session.config` 新值；全部失败时只写一条 stderr，含
-  `failed for every open session`——快速原型里 `#refreshSettings` 固定读 `sessions[0]` 会整次丢弃
-  刷新）。编译同
+  `DSH_FAKE_SETTINGS_FAIL_FILE` 脚本化写失败），**64 条**：list 变成 `session.config.settings` 的
+  `select` 行（id `dsh:<ns>:<path>`、label=插件显示名字典按本进程 LOCALE 选、value `on`/`off`、
+  options 为纯「开启/关闭」词（设置名在行 label 上，option 不重复）、
+  描述写明全局）、configure 发 `on`/`off` 时桥收到 `paseo/settings/set
+  {ns,path,value(boolean),revision,expectedValue}`、回执值重新发布为 select 值、同值不写、
+  **旧 agent 的 boolean 回传兼容**（同值不写、异值仍按 boolean 写、随后 select 值继续可用）、
+  `paseo/settings/changed` 后**所有**打开会话都重发新值（且整个通知只 `list` 一次，不是每会话
+  一次）、无 settings 服务不出行且桥给的 reason 只 log 一次（latched，第二次 open 不重复）、
+  **有 settings 服务但无合格行（`{available:true,items:[]}`）同样不出行，且不误报
+  「unavailable」**（两种状态原因不同）、
+  冲突/不存在/无服务三种码各自的中文文案且 provider 重发真实 config、**新建面板值挂起到首次
+  prompt 才写**（open 时 0 次 set、prompt 前写、回执值发布；select 值与旧 boolean 两种 pick 都
+  覆盖）、**写失败出时间线 warning 且 prompt 照发**、**未 prompt 就关闭（草稿）不写**、**resume
+  带旧值不写、不发 notice、daemon stderr 一行**、**resume 的 select 值与运行时一致时不误报
+  divergence**、`dshSettingLabel` 中英与回落、`dshSettingSelectValue` / `dshSettingBooleanValue`
+  的投影与归一化（`on`/`off`/boolean 都认，其它值拒绝）、option label 是纯 on/off 词（不拼设置
+  名）、失败文案保留
+  桥原文、服务端 locale 中英表（描述含「全局生效 / 影响本机所有 DSH 会话」、`on`/`off` 词条
+  （开启/关闭、On/Off）、4 个错误码非空且中英不同、
+  pending warning 标题、非预期值文案点明菜单只提供开启/关闭）、**子会话只读**（原生 subagent 会话
+  不出 `dsh:` 行，对它 configure 被拒）、**pending 失败 warning 的本地化**（zh 下 description
+  含「创建会话时选择的 DSH 全局开关未能写回」，另起一个 `DSH_PASEO_LANG=en` 子进程跑同一失败
+  场景，断言 description 无任何 CJK 字符/全角标点且为英文原意——LOCALE 在模块加载时定死，英文
+  文案只能这样端到端验证；同一 en 子进程还断言 select 行 option label 为
+  `On`/`Off`（无 CJK）、configure 的两条失败文本无 CJK：非预期值的
+  `received an unexpected value ... On/Off` 与桥拒绝的 label+分隔符+错误码文案）、**刷新读取的
+  第一个会话失败不影响其它会话**（给 `DshSession.readDshSettings` 打一个只对首个会话抛错的补丁
+  → 其它打开会话仍收到 `session.config` 新值；全部失败时只写一条 stderr，含
+  `failed for every open session`——快速原型里 `#refreshSettings` 固定读 `sessions[0]` 会整次
+  丢弃刷新）。编译同
   `mcp-injection-check`（`.dbg` + 拷入本脚本与 `fake-dsh-bridge.mjs`；也可从仓库根跑，回落到
   `paseo-plugin/.dbg/`）。**动了 `server/{dsh-process,session,provider}.ts` 的 settings 段、
   `locale.ts` 文案或假桥 settings 支持必跑。**
 - `harness/plugin-check.cjs` 真机段：真实 profile 克隆（`prepareDshHome` 的一次性 `DSH_HOME`）里
   打开会话后断言 `paseo/settings/list` 的 `available:true`（唯一能证明 profile 真的组合了 settings
-  服务的检查），把第一个第三方布尔开关写到反值 → 断言 `session.config` 与重新 `describe()` 的回执
-  一致 → 再开第二个会话断言同值（全局语义）→ 写回原值（隔离克隆保持干净）。**「本机应该有哪个
-  开关」是显式期望，不写死插件名**（这个仓库给别人用）：设置 `PASEO_EXPECT_DSH_TOGGLE=<ns>[,<ns>]`
+  服务的检查），用 select 值 `on`/`off` 把第一个第三方布尔开关写到反值 → 断言 `session.config`
+  的行是 `select`、option 值为 `on`/`off` 且 option label 精确等于本进程 locale 的
+  `On`/`Off`（从编译产物的 `server/locale.js` 取，不写死语言）、与重新 `describe()`
+  的回执（boolean）一致 → 再开第二个会话断言同值（全局语义）→ 写回原值（隔离克隆保持干净）。
+  **「本机应该有哪个开关」是显式期望，不写死插件名**（这个仓库给别人用）：设置
+  `PASEO_EXPECT_DSH_TOGGLE=<ns>[,<ns>]`
   （settings namespace，如 `unrestricted`）时，list 里缺任何一个就**转红**（静默空菜单）；未设置
   时，profile 有合格行就跑写入往返、没有就打印 skip 原因（并提示该变量）。**耗 token（真实模型
   回合）**；跑前先 `bridge-assets-check.mjs`。
