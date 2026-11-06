@@ -30,7 +30,7 @@ DSH 的 `dsh-experimental-agent-team` 给 Lead 会话一个团队：队员（各
 
 ## pill
 
-- **可见**：只看任务（`tasks.length > 0`）——有任务就显示，没任务一律不显示。2026-11-06 用户决策：起了队员但没建任务时不亮 pill（此时面板只会写「N 名成员 / 暂无共享任务」）；队员数不再参与判断，无看板（`null`）也不显示。**全部任务 `completed` 后只再显示一次，看过即隐藏**（照 goal 的 seen 机制，UI-v7）：面板关闭算看过，或全部完成后 agent 从 idle 变 running（用户发了下一条消息）算看过；签名 `teamAllDoneKey`（tasks 按 id 排序的 `id:revision`）变化（新增任务 / revision 变化）会重新显示一次。`seen` 只记在内存：插件 reload / 重启后，已全部完成且看过的看板会再显示一次（已接受，与 goal 一致）。判定「看过」的 idle→running 也包含 schedule / 心跳等非用户回合，失误方向是 pill 提早消失（与 goal 一致）。
+- **可见**：只看任务（`tasks.length > 0`）——有任务就显示，没任务一律不显示。2026-11-06 用户决策：起了队员但没建任务时不亮 pill（此时面板只会写「N 名成员 / 暂无共享任务」）；队员数不再参与判断，无看板（`null`）也不显示。**全部任务 `completed` 后只再显示一次，只有点开并关闭面板后才隐藏；不点开时发送新消息不会隐藏**（照 goal 的 seen 机制，UI-v7）：面板关闭（经 `seen-close-gate` 确认）算看过，全部完成后 agent 从 idle 变 running（用户发了下一条消息）**不算**看过；签名 `teamAllDoneKey`（tasks 按 id 排序的 `id:revision`）变化（新增任务 / revision 变化）会重新显示一次。`seen` 只记在内存：插件 reload / 重启后，已全部完成且看过的看板会再显示一次（已接受，与 goal 一致）。
   - **「面板关闭」必须是确认过的关闭**（2026-11-06 真机 bug 修复）：宿主打开 popover 时会把内容**重挂载一次**——`AnchoredSurface` 的 `FloatingSurface` 带 `key={placed ? "placed" : "measuring"}`（Paseo 0.15.0 `packages/app/src/components/ui/menu/menu-overlay.tsx:350`，注释在 :265 明说「Remounting on placement…」），先离屏测量再换 key 正式定位。所以 `unmount` 本身不是「用户关了面板」。规则是 `createSeenCloseGate`（`client/seen-close-gate.ts`，与目标 pill 共用，窗口 `SEEN_CLOSE_CONFIRM_MS` = 250ms）：卸载后 250ms 内又挂载 → 取消，不记 seen；卸载后一直没回来 → 记 seen。修复前的实现把任何卸载都当关闭，用户一点开、宿主测量完重挂载，seen 立刻写入 → pill 当场消失、任务板面板根本没显示出来。
   - 顺带：`present()` 只在 `visible` / `label` / `title` / `icon` 真变化时才 `registration.update`（`agent-polling.ts:315-321` 的 `publishIfChanged` 已对**相同答案**去重；这里补的是「看板变了、按钮状态没变」仍会推一次 `update` 的情况，白让宿主重建按钮与 popover 页面）。
 - **文字与 title 恒为「团队」/「Team」**，不带计数（title 同时是读屏名、桌面 tooltip、手机 sheet 标题）。

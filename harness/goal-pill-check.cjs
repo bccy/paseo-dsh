@@ -578,43 +578,49 @@ console.log("\na completed goal's seen state");
 {
   const done = goal({ phase: "complete", activation: "disarmed" });
   const step = (state, ...events) => events.reduce((acc, event) => goalCompleteSeenStep(acc, event), state);
-  // The completing turn: complete observed while the agent still runs (it is
-  // writing the closing summary), then it goes idle. Neither is "seen".
-  const running = step({}, { kind: "goal", goal: done, agentStatus: "running" });
-  equal("observing complete while running starts watching", running, { watch: { key: "goal-1:1", stage: "watching" } });
+  // Merely observing a complete goal — while the completing turn still runs,
+  // after it idles, or while a later turn runs — is not "seen". Only the user
+  // opening and closing its panel is. The completing turn's own running→idle
+  // and the next message's idle→running must both leave the pill visible.
+  const running = step({}, { kind: "goal", goal: done });
+  equal("observing complete while running records nothing", running, {});
   const idled = step(running, { kind: "agent", status: "idle" });
   equal("the completing turn's running→idle is not seen", idled.seen, undefined);
-  equal("…it only arms the watch", idled.watch, { key: "goal-1:1", stage: "idleSeen" });
+  equal("…and the next running (a new message) is not seen either", step(idled, { kind: "agent", status: "running" }).seen, undefined);
   equal("a repeated running before idle is not seen", step(running, { kind: "agent", status: "running" }).seen, undefined);
-  // The next turn: running after idle is the user moving on.
-  equal("running after idle marks it seen", step(idled, { kind: "agent", status: "running" }), { seen: "goal-1:1" });
   // First observed while already idle (the completing turn ended between polls).
-  const lateIdle = step({}, { kind: "goal", goal: done, agentStatus: "idle" });
-  equal("a completion first seen while idle starts armed", lateIdle.watch?.stage, "idleSeen");
-  equal("…so the next running marks it seen", step(lateIdle, { kind: "agent", status: "running" }).seen, "goal-1:1");
+  const lateIdle = step({}, { kind: "goal", goal: done });
+  equal("a completion first observed while idle records nothing", lateIdle, {});
+  equal("…and the next running still does not mark it seen", step(lateIdle, { kind: "agent", status: "running" }).seen, undefined);
   // Closing the opened panel marks it seen at once.
   equal("closing the complete panel marks it seen", step(running, { kind: "closed", goal: done }), { seen: "goal-1:1" });
   equal("closing a non-complete panel marks nothing", step({}, { kind: "closed", goal: goal() }).seen, undefined);
-  // A new key is watched again; the old key stays remembered.
+  // A new key is shown again; the old key stays remembered.
   const seen = { seen: "goal-1:1" };
-  equal("the seen key survives repeated polls", step(seen, { kind: "goal", goal: done, agentStatus: "running" }), seen);
+  equal("the seen key survives repeated polls", step(seen, { kind: "goal", goal: done }), seen);
   equal(
-    "a new revision is watched again",
-    step(seen, { kind: "goal", goal: { ...done, revision: 2 }, agentStatus: "running" }).watch,
-    { key: "goal-1:2", stage: "watching" },
+    "a new revision is not hidden by the old key",
+    step(seen, { kind: "goal", goal: { ...done, revision: 2 } }).seen,
+    "goal-1:1",
   );
-  // Leaving complete (cleared / replaced) drops the watch but keeps the key.
-  equal("a cleared goal drops the watch", step(running, { kind: "goal", goal: null }), {});
-  equal("…and keeps a remembered key", step(seen, { kind: "goal", goal: null }), seen);
+  check(
+    "…and is shown until its own close is confirmed",
+    goalPillPresentation({ available: true, goal: { ...done, revision: 2 } }, step(seen, { kind: "goal", goal: { ...done, revision: 2 } }).seen).visible,
+    true,
+  );
+  // Leaving complete (cleared / replaced) keeps the key.
+  equal("a cleared goal keeps a remembered key", step(seen, { kind: "goal", goal: null }), seen);
   equal("agent events without a watch change nothing", step({}, { kind: "agent", status: "running" }), {});
-  // End to end with the presentation rule.
+  // End to end with the presentation rule: after the completing turn idles and
+  // the user sends the next message (running), the completed pill stays visible.
   const final = step(
     {},
-    { kind: "goal", goal: done, agentStatus: "running" },
+    { kind: "goal", goal: done },
     { kind: "agent", status: "idle" },
     { kind: "agent", status: "running" },
   );
-  check("after the next turn the pill is hidden", goalPillPresentation({ available: true, goal: done }, final.seen).visible, false);
+  check("after the next turn starts the pill is still visible", goalPillPresentation({ available: true, goal: done }, final.seen).visible, true);
+  check("after the completed panel is closed the pill is hidden", goalPillPresentation({ available: true, goal: done }, step(final, { kind: "closed", goal: done }).seen).visible, false);
 }
 
 console.log("\nleaving the editor closes the panel (UI-v8)");

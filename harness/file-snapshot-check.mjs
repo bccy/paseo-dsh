@@ -44,6 +44,7 @@ import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, utimes, 
 import { existsSync } from 'node:fs';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
@@ -1072,6 +1073,281 @@ console.log('a plan waits for a closing snapshot another caller is settling (R4)
   );
   const journal = await racing.readJournal(session);
   check('and the line is durable afterwards', journal.entries.length === 1, JSON.stringify(journal.entries));
+}
+
+console.log('human-message boundaries preserve external changes to tracked files (plan B)');
+{
+  // (a) The tool edits A at anchor 1, then bash rewrites it before anchor 2.
+  // Rewinding to 2 must keep the bash content; rewinding to 1 must still bring
+  // back the tool's pre-image.
+  const session = 'boundary-keep-bash';
+  const stateRoot = join(root, 'boundary-keep-bash-state');
+  const file = join(root, 'boundary-keep-bash.txt');
+  await writeFile(file, 'TOOL-PRE', 'utf8');
+  const snap = new FileSnapshots({ rootDir: stateRoot, warn: (line) => warnings.push(line) });
+  await snap.capture({ sessionId: session, anchorSeq: 1, callId: 'tool-1', path: file });
+  await writeFile(file, 'TOOL-POST', 'utf8');
+  await snap.commit({ sessionId: session, callId: 'tool-1' }, { isError: false });
+  await writeFile(file, 'BASH-EDIT', 'utf8');
+  const stats = await snap.reconcileTracked(session, 2);
+  const journalAfterBoundary = await snap.readJournal(session);
+  const boundary = journalAfterBoundary.entries.find((entry) => entry.anchorSeq === 2 && entry.path === file);
+  check(
+    'a boundary re-check records the external change once',
+    stats.recorded === 1 && stats.failed === 0 && stats.skipped === 0,
+    JSON.stringify(stats),
+  );
+  check(
+    'and the record is marked origin=boundary with a recheck callId',
+    boundary?.origin === 'boundary' && /^recheck-2-/.test(boundary?.callId ?? ''),
+    JSON.stringify(boundary),
+  );
+  const boundaryObject = boundary === undefined
+    ? undefined
+    : join(stateRoot, encodeURIComponent(session), 'objects', boundary.backup);
+  check(
+    'the boundary record stores the bash edit as its pre-image',
+    boundaryObject !== undefined && (await readFile(boundaryObject, 'utf8')) === 'BASH-EDIT',
+    String(boundaryObject),
+  );
+  const planEarly = await snap.planRestore(session, 1);
+  const earlyObject = planEarly.actions.find((entry) => entry.path === file)?.backup;
+  check(
+    'rewinding to the tool anchor still restores the tool pre-image',
+    earlyObject !== undefined
+      && (await readFile(join(stateRoot, encodeURIComponent(session), 'objects', earlyObject), 'utf8')) === 'TOOL-PRE',
+    String(earlyObject),
+  );
+  // (e) Same disk state on the next boundary is not recorded again.
+  const again = await snap.reconcileTracked(session, 3);
+  check(
+    'a boundary with no change records nothing (recorded 0)',
+    again.recorded === 0 && again.unchanged >= 1 && (await snap.readJournal(session)).entries.length === journalAfterBoundary.entries.length,
+    JSON.stringify(again),
+  );
+  // (P3-4) The boundary pre-image must actually be selected by planRestore
+  // even when a later external change is on disk. Without the boundary record
+  // the target-2 plan would be empty for this path, so this fails if the record
+  // is missing; the body check also rejects picking the later bash content
+  // ('BASH-AFTER-BOUNDARY') or the tool pre-image ('TOOL-PRE').
+  await writeFile(file, 'BASH-AFTER-BOUNDARY', 'utf8');
+  const planBoundary = await snap.planRestore(session, 2);
+  const boundaryAction = planBoundary.actions.find((entry) => entry.path === file);
+  const boundaryActionBody = boundaryAction === undefined
+    ? undefined
+    : await readFile(join(stateRoot, encodeURIComponent(session), 'objects', boundaryAction.backup), 'utf8');
+  check(
+    'planRestore(boundary) selects the boundary pre-image after a later external change',
+    boundaryAction?.backup === boundary?.backup && boundaryActionBody === 'BASH-EDIT',
+    JSON.stringify({ action: boundaryAction, body: boundaryActionBody }),
+  );
+  // Restore the disk state so the later "unchanged" case below is measured on
+  // the same content the boundary recorded (the assertion above already proved
+  // a later write is not selected by planRestore).
+  await writeFile(file, 'BASH-EDIT', 'utf8');
+
+  // (b) A file no editing tool ever touched is never tracked, no matter how
+  // often an external process rewrites it.
+  const untouched = join(root, 'boundary-untouched.txt');
+  await writeFile(untouched, 'ORIGINAL', 'utf8');
+  await writeFile(untouched, 'EXTERNAL', 'utf8');
+  const beforeUntouched = (await snap.readJournal(session)).entries.length;
+  const untouchedStats = await snap.reconcileTracked(session, 2);
+  const untouchedPlan = await snap.planRestore(session, 2);
+  check(
+    'a file no editing tool ever touched never becomes a tracked path',
+    (await snap.trackedPaths(session)).has(untouched) === false
+      && untouchedStats.recorded === 0
+      && untouchedPlan.actions.every((entry) => entry.path !== untouched),
+    JSON.stringify({ stats: untouchedStats, actions: untouchedPlan.actions.map((entry) => entry.path) }),
+  );
+  check(
+    'and re-checking an unchanged tracked file adds no line',
+    (await snap.readJournal(session)).entries.length === beforeUntouched,
+    `${beforeUntouched} entries`,
+  );
+
+  // (c) A tracked file deleted by an external process gets a backup:null
+  // boundary; rewinding to it asks for a delete and finds nothing to delete.
+  const deleteSession = 'boundary-external-delete';
+  const deleteFile = join(root, 'boundary-external-delete.txt');
+  await writeFile(deleteFile, 'PRE', 'utf8');
+  const deleted = new FileSnapshots({ rootDir: join(root, 'boundary-external-delete-state'), warn: (line) => warnings.push(line) });
+  await deleted.capture({ sessionId: deleteSession, anchorSeq: 1, callId: 'tool-del', path: deleteFile });
+  await writeFile(deleteFile, 'POST', 'utf8');
+  await deleted.commit({ sessionId: deleteSession, callId: 'tool-del' }, { isError: false });
+  await rm(deleteFile, { force: true });
+  const deleteStats = await deleted.reconcileTracked(deleteSession, 2);
+  const deletePlan = await deleted.planRestore(deleteSession, 2);
+  const deleteAction = deletePlan.actions.find((entry) => entry.path === deleteFile);
+  check(
+    'an externally deleted tracked file records a backup:null boundary',
+    deleteStats.recorded === 1 && deleteAction !== undefined && deleteAction.backup === null,
+    JSON.stringify({ stats: deleteStats, plan: deletePlan }),
+  );
+  const deleteOutcome = await deleted.restore(deleteSession, deletePlan.actions);
+  check(
+    'and the rewind reports it as already absent, not as a failed restore',
+    deleteOutcome.alreadyAbsent.includes(deleteFile) && deleteOutcome.failed.length === 0,
+    JSON.stringify(deleteOutcome),
+  );
+
+  // (d) An external change that cannot be snapshotted is a boundary skip, and
+  // planRestore must report the path instead of restoring a wrong pre-image.
+  const bigSession = 'boundary-oversize';
+  const bigFile = join(root, 'boundary-oversize.txt');
+  await writeFile(bigFile, 'PRE', 'utf8');
+  const tight = new FileSnapshots({ rootDir: join(root, 'boundary-oversize-state'), maxFileBytes: 8, warn: (line) => warnings.push(line) });
+  await tight.capture({ sessionId: bigSession, anchorSeq: 1, callId: 'tool-big', path: bigFile });
+  await writeFile(bigFile, 'POST', 'utf8');
+  await tight.commit({ sessionId: bigSession, callId: 'tool-big' }, { isError: false });
+  await writeFile(bigFile, 'X'.repeat(64), 'utf8');
+  const bigStats = await tight.reconcileTracked(bigSession, 2);
+  const bigPlan = await tight.planRestore(bigSession, 2);
+  check(
+    'an external change over the size cap is a boundary skip',
+    bigStats.recorded === 1 && bigStats.skipped === 1 && (await tight.trackedPaths(bigSession)).has(bigFile),
+    JSON.stringify(bigStats),
+  );
+  check(
+    'and planRestore reports that path unrecoverable',
+    bigPlan.actions.length === 0
+      && bigPlan.unrecoverable.some((entry) => entry.path === bigFile && /larger than/.test(entry.reason)),
+    JSON.stringify(bigPlan),
+  );
+
+  const dirSession = 'boundary-non-regular';
+  const dirFile = join(root, 'boundary-non-regular.txt');
+  await writeFile(dirFile, 'PRE', 'utf8');
+  const dirSnap = new FileSnapshots({ rootDir: join(root, 'boundary-non-regular-state'), warn: (line) => warnings.push(line) });
+  await dirSnap.capture({ sessionId: dirSession, anchorSeq: 1, callId: 'tool-dir', path: dirFile });
+  await writeFile(dirFile, 'POST', 'utf8');
+  await dirSnap.commit({ sessionId: dirSession, callId: 'tool-dir' }, { isError: false });
+  await rm(dirFile, { force: true });
+  await mkdir(dirFile);
+  const dirStats = await dirSnap.reconcileTracked(dirSession, 2);
+  const dirPlan = await dirSnap.planRestore(dirSession, 2);
+  check(
+    'a tracked path turned into a non-regular file is a boundary skip',
+    dirStats.recorded === 1 && dirStats.skipped === 1,
+    JSON.stringify(dirStats),
+  );
+  check(
+    'and planRestore reports not-a-regular-file unrecoverable',
+    dirPlan.actions.length === 0
+      && dirPlan.unrecoverable.some((entry) => entry.path === dirFile && entry.reason === 'not-a-regular-file'),
+    JSON.stringify(dirPlan),
+  );
+
+  // (P3-1) A tracked file replaced by a symlink must never be read through: the
+  // boundary re-check records a durable skip and `objects/` stays free of the
+  // link target's contents (which could be outside the workspace).
+  const linkSession = 'boundary-symlink';
+  const linkRoot = join(root, 'boundary-symlink-state');
+  const secret = join(root, 'boundary-symlink-secret.txt');
+  const linkFile = join(root, 'boundary-symlink.txt');
+  await writeFile(secret, 'SECRET', 'utf8');
+  await writeFile(linkFile, 'PRE', 'utf8');
+  const linkSnap = new FileSnapshots({ rootDir: linkRoot, warn: (line) => warnings.push(line) });
+  await linkSnap.capture({ sessionId: linkSession, anchorSeq: 1, callId: 'tool-link', path: linkFile });
+  await writeFile(linkFile, 'POST', 'utf8');
+  await linkSnap.commit({ sessionId: linkSession, callId: 'tool-link' }, { isError: false });
+  await rm(linkFile, { force: true });
+  await symlink(secret, linkFile);
+  const linkStats = await linkSnap.reconcileTracked(linkSession, 2);
+  const linkJournal = await linkSnap.readJournal(linkSession);
+  const linkBoundary = linkJournal.entries.find((entry) => entry.anchorSeq === 2 && entry.path === linkFile);
+  const secretHash = createHash('sha256').update('SECRET').digest('hex');
+  const objectNames = await readdir(join(linkRoot, encodeURIComponent(linkSession), 'objects'));
+  check(
+    'a tracked path replaced by a symlink is a boundary skip with no object for the link target',
+    linkStats.recorded === 1 && linkStats.skipped === 1
+      && linkBoundary?.skip === 'not-a-regular-file'
+      && linkBoundary?.backup === undefined
+      && objectNames.includes(secretHash) === false,
+    JSON.stringify({ stats: linkStats, boundary: linkBoundary, objectNames }),
+  );
+  const linkPlan = await linkSnap.planRestore(linkSession, 2);
+  check(
+    'and planRestore reports the symlink path unrecoverable',
+    linkPlan.actions.length === 0
+      && linkPlan.unrecoverable.some((entry) => entry.path === linkFile && entry.reason === 'not-a-regular-file'),
+    JSON.stringify(linkPlan),
+  );
+
+  // (P3-2) A middle-generation row that carries captureSeq but no
+  // captureOrderVersion has no provable order: it must rank below a versioned
+  // capture instead of being trusted by its (larger) number. The disk matches
+  // the versioned row, so a correct comparison records nothing; the old
+  // number-first comparison picked the unversioned row and recorded a spurious
+  // boundary.
+  const orderSession = 'boundary-order-version';
+  const orderRoot = join(root, 'boundary-order-version-state');
+  const orderDir = join(orderRoot, encodeURIComponent(orderSession));
+  await mkdir(orderDir, { recursive: true });
+  const orderFile = join(root, 'boundary-order-version.txt');
+  await writeFile(orderFile, 'VERSIONED', 'utf8');
+  const versionedHash = createHash('sha256').update('VERSIONED').digest('hex');
+  const middleHash = createHash('sha256').update('MIDDLE').digest('hex');
+  const orderLines = [
+    JSON.stringify({
+      anchorSeq: 1,
+      captureSeq: 1,
+      captureOrderVersion: 1,
+      path: orderFile,
+      backup: versionedHash,
+      mode: 0o644,
+    }),
+    JSON.stringify({
+      anchorSeq: 2,
+      captureSeq: 99,
+      path: orderFile,
+      backup: middleHash,
+      mode: 0o644,
+    }),
+  ].join('\n');
+  await writeFile(join(orderDir, 'journal.jsonl'), `${orderLines}\n`, 'utf8');
+  const orderSnap = new FileSnapshots({ rootDir: orderRoot, warn: (line) => warnings.push(line) });
+  const orderStats = await orderSnap.reconcileTracked(orderSession, 3);
+  check(
+    'a captureSeq without captureOrderVersion is not trusted; the versioned capture stays newest',
+    orderStats.recorded === 0 && orderStats.unchanged === 1,
+    JSON.stringify(orderStats),
+  );
+
+  // (f) A journal written before capture ordering existed has no
+  // captureSeq/captureOrderVersion: it must still compare by the recorded
+  // backup hash and record a proper numbered boundary line.
+  const legacySession = 'boundary-legacy';
+  const legacyRoot = join(root, 'boundary-legacy-state');
+  const legacyDir = join(legacyRoot, encodeURIComponent(legacySession));
+  await mkdir(legacyDir, { recursive: true });
+  const legacyFile = join(root, 'boundary-legacy.txt');
+  await writeFile(legacyFile, 'LEGACY-OLD', 'utf8');
+  const legacyHash = createHash('sha256').update('LEGACY-OLD').digest('hex');
+  await writeFile(
+    join(legacyDir, 'journal.jsonl'),
+    `${JSON.stringify({ anchorSeq: 1, path: legacyFile, backup: legacyHash, mode: 0o644 })}\n`,
+    'utf8',
+  );
+  await writeFile(legacyFile, 'LEGACY-NEW', 'utf8');
+  const legacy = new FileSnapshots({ rootDir: legacyRoot, warn: (line) => warnings.push(line) });
+  const legacyStats = await legacy.reconcileTracked(legacySession, 2);
+  const legacyJournal = await legacy.readJournal(legacySession);
+  const legacyBoundary = legacyJournal.entries.find((entry) => entry.anchorSeq === 2 && entry.path === legacyFile);
+  check(
+    'a legacy journal line (no captureSeq/captureOrderVersion) is compared by its backup hash',
+    legacyStats.recorded === 1 && legacyJournal.entries.length === 2 && legacyBoundary?.origin === 'boundary',
+    JSON.stringify({ stats: legacyStats, entries: legacyJournal.entries }),
+  );
+  const legacyObject = legacyBoundary === undefined
+    ? undefined
+    : join(legacyRoot, encodeURIComponent(legacySession), 'objects', legacyBoundary.backup);
+  check(
+    'and its boundary pre-image is the current disk content',
+    legacyObject !== undefined && (await readFile(legacyObject, 'utf8')) === 'LEGACY-NEW',
+    String(legacyObject),
+  );
 }
 
 await rm(root, { recursive: true, force: true });

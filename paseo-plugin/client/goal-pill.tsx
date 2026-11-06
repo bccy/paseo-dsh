@@ -393,8 +393,6 @@ export function contributeGoalPill(
   const answers = new Map<string, GoalViewState>();
   /** agentId -> what the host was last told; an unchanged poll publishes nothing. */
   const published = new Map<string, { visible: boolean; label: string; title: string }>();
-  /** agentId -> the agent's last status from the directory (snapshot or upsert). */
-  const agentStatuses = new Map<string, string | undefined>();
   const lifetime = new AbortController();
   const rpc = (input: { agentId: string }) => client.rpc(goalCurrent, input);
 
@@ -451,14 +449,9 @@ export function contributeGoalPill(
   const publishState = (agentId: string, next: GoalViewState): void => {
     if (pills.get(agentId) === undefined) return;
     answers.set(agentId, next);
-    seenStates.set(
-      agentId,
-      goalCompleteSeenStep(seenStates.get(agentId) ?? {}, {
-        kind: "goal",
-        goal: next.goal,
-        agentStatus: agentStatuses.get(agentId),
-      }),
-    );
+    // A poll never marks a completed goal seen: seen is only the confirmed
+    // panel close (the popover's `onClosed` below). It also never clears the
+    // remembered key — a new goal/revision simply has a new one.
     present(agentId);
   };
 
@@ -526,7 +519,6 @@ export function contributeGoalPill(
       answers.delete(agentId);
       published.delete(agentId);
       seenStates.delete(agentId);
-      agentStatuses.delete(agentId);
       // Dropped rather than kept: the popover must not show a stale goal for an
       // agent this client may not read, or whose runtime cannot serve goals.
       store.delete(agentId);
@@ -572,7 +564,6 @@ export function contributeGoalPill(
     .then(({ subscription }) => {
       subscription.subscribe({
         snapshot: (page) => {
-          for (const { agent } of page.entries) agentStatuses.set(agent.id, agent.status);
           void poller.applySnapshot(page);
         },
         update: (message) => {
@@ -580,9 +571,10 @@ export function contributeGoalPill(
           const update = message.payload;
           if (update.kind === "upsert") {
             poller.upsert(update.agent);
-            // The agent's status is the only "the user moved on" signal the
-            // client has: a turn starting after the completing one ended.
-            agentStatuses.set(update.agent.id, update.agent.status);
+            // The agent's status is **not** a "seen" signal: a turn starting
+            // after the completing one ended is usually just the user sending
+            // the next message, and a completed pill must stay until its panel
+            // is opened and closed. The event is an explicit no-op.
             advanceSeen(update.agent.id, { kind: "agent", status: update.agent.status });
             return;
           }

@@ -50,10 +50,11 @@ export interface TeamReadResult {
  * and it shows the pill even when no member row exists yet.
  *
  * A board whose tasks are **all completed** is shown once more and then hidden
- * once the user has seen it (UI-v7, the user's 2026-11-06 decision): `seen` is
- * the remembered {@link teamAllDoneKey} for this agent, and an all-done board
- * whose key equals it is hidden. A new task or a revision change makes a new
- * key, so the pill shows once more.
+ * only after its panel was opened and really closed (UI-v7, the user's
+ * 2026-11-06 decision): `seen` is the remembered {@link teamAllDoneKey} for this
+ * agent, and an all-done board whose key equals it is hidden. A new task or a
+ * revision change makes a new key, so the pill shows once more. Sending a new
+ * message without opening the panel does **not** hide it.
  *
  * A board that is `null`/`undefined` — no team, or one the session never used
  * — stays hidden, the same shape as the jobs pill hiding with nothing live and
@@ -95,31 +96,18 @@ export function teamAllDoneKey(team: TeamView): string | undefined {
     .join(",");
 }
 
-/**
- * Per-agent progress towards "the user has moved on from this all-done board".
- *
- * - `watching`: an all-done board with this key was observed; the turn that
- *   completed it may still be running (the model writes its closing summary
- *   after the last `team_task_update`), so a `running` here proves nothing.
- * - `idleSeen`: the agent went idle after the completion. The **next**
- *   `running` is a new turn — the user's next message, as far as the client can
- *   tell (the plugin API has no composer-submit signal) — and marks it seen.
- */
-export interface TeamCompleteWatch {
-  readonly key: string;
-  readonly stage: "watching" | "idleSeen";
-}
-
 /** One input to {@link teamCompleteSeenStep}. */
 export type TeamSeenEvent =
+  /** A poll answer: the board now (null when there is none). */
+  | { readonly kind: "board"; readonly team: TeamView | null }
   /**
-   * A poll answer: the board now (null when there is none), and the agent's last
-   * known status. Polls are seconds apart, so the completing turn may already
-   * have ended when "all done" is first observed; an idle agent at that moment
-   * starts the watch at `idleSeen`, or the user's next message would be missed.
+   * The agent's status, from the agent directory subscription.
+   *
+   * **Never a "seen" signal.** This used to mean "the user sent the next
+   * message" (idle, then running), which hid an all-done board the user had
+   * never opened. It is kept as an explicit no-op so the existing subscription
+   * wiring stays harmless.
    */
-  | { readonly kind: "board"; readonly team: TeamView | null; readonly agentStatus?: string }
-  /** The agent's status, from the agent directory subscription. */
   | { readonly kind: "agent"; readonly status: string | undefined }
   /**
    * The all-done panel was opened and then **really** closed: the popover body's
@@ -127,45 +115,29 @@ export type TeamSeenEvent =
    */
   | { readonly kind: "closed"; readonly team: TeamView | null };
 
-/** The machine's state: the remembered seen key and the watch in progress. */
+/** The machine's state: the remembered seen key. */
 export interface TeamSeenState {
   readonly seen?: string;
-  readonly watch?: TeamCompleteWatch;
 }
 
 /**
  * Advance one agent's "seen" state.
  *
- * Seen means: the panel of that all-done board was closed after being opened,
- * or a turn started after the completing turn had ended (idle, then running).
- * The completing turn's own `running → idle` only moves the watch to
- * `idleSeen`; a completion first observed while the agent is already idle
- * starts there. A board that is no longer all done (a task reopened, a new one
- * added) drops the watch; the remembered key stays, so the same
- * `id:revision` set cannot reappear, and any new key is shown again.
+ * Seen means **only one thing**: the panel of that all-done board was opened
+ * and then really closed — the close reported by `./seen-close-gate` after its
+ * confirmation window. An agent status event (including the next turn
+ * starting, i.e. the user sending another message) never marks a board seen: an
+ * all-done pill must stay until the user has actually opened its panel. Polls
+ * never mark anything either; a new task or a revision change is a new key and
+ * shows again. The remembered key is kept when the board stops being all done
+ * (a task reopened, a new one added), so the same `id:revision` set cannot
+ * reappear.
  */
 export function teamCompleteSeenStep(state: TeamSeenState, event: TeamSeenEvent): TeamSeenState {
   switch (event.kind) {
-    case "board": {
-      const team = event.team;
-      const key = team === null ? undefined : teamAllDoneKey(team);
-      if (key === undefined) {
-        return state.seen === undefined ? {} : { seen: state.seen };
-      }
-      if (state.seen === key) return { seen: key };
-      if (state.watch?.key === key) return state;
-      const stage = event.agentStatus === "idle" ? "idleSeen" : "watching";
-      return { ...(state.seen === undefined ? {} : { seen: state.seen }), watch: { key, stage } };
-    }
-    case "agent": {
-      const watch = state.watch;
-      if (watch === undefined) return state;
-      if (event.status === "idle" && watch.stage === "watching") {
-        return { ...state, watch: { key: watch.key, stage: "idleSeen" } };
-      }
-      if (event.status === "running" && watch.stage === "idleSeen") return { seen: watch.key };
+    case "board":
+    case "agent":
       return state;
-    }
     case "closed": {
       const team = event.team;
       const key = team === null ? undefined : teamAllDoneKey(team);

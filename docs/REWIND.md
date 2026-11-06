@@ -82,6 +82,16 @@ Paseo 撤回按钮
   `tools/result`：`write`/`edit` 执行前读旧内容，成功后按锚点记一行 journal；失败/中断丢弃。
   **工具成功但无法快照**（超过 8 MiB、非普通文件、`stat`/`readFile` 失败）时，journal 仍记一行
   `skip`（带原因）；撤回时该路径进 `unrecoverable`，回执与提示会点名原因，而不是当成没改过。
+- **已跟踪文件的人类消息边界重扫（方案 B）**：每条人类 `user/message` 到达时，桥对 journal
+  里已存在的路径重扫磁盘（`FileSnapshots.reconcileTracked`，接线是 `dsh-bridge/lib/index.js`
+  的 `ctx.on('session/event')` → `server.reconcileFileBoundary`）：先 `lstat`（符号链接/非普通
+  文件记 `skip`、不读目标），普通文件直接 `readFile`（`O_NOFOLLOW` 防 lstat→read 竞态），与
+  最新一条 journal 记录（`captureSeq` 最大，旧行按文件序）比较内容；不同就记一条 `origin: "boundary"`、
+  `anchorSeq = 该消息 seq` 的 pre-image（非普通文件 / 超过 8 MiB / 读取失败记 `skip`，撤回时
+  报 `unrecoverable`）。因此 bash 或外部进程对**已跟踪**文件的改动会保留在后续撤回的
+  pre-image 中（撤到该边界消息时保留改动），而从未被编辑工具碰过的纯 bash 文件仍不处理。
+  无变化不重复记录；边界快照与工具捕获共用同一路径串行队列和 journal 写队列，撤回计划
+  （`planRestore`）会等待在飞的重扫（`settle()`）。
 - **子代理编辑归并到根会话**：工具跑在原生子会话里时，沿 `header.parentSession` 上溯到
   根会话（`dsh-bridge/lib/snapshot-owners.js`），快照写进**根会话**的 journal/objects。
   pending 键用「执行会话 id + callId」而不是 owner 键：父/子可能撞同一个 provider 铸的
@@ -140,9 +150,11 @@ Paseo 撤回按钮
   （`dsh-bridge/lib/file-snapshots.js`）；该工具由一等公民包
   `@deepseek-ai/dsh-tool-str-replace-editor` 提供，base/web
   bundle 默认不挂载，部署挂上就生效。
-- 不跟踪：bash/pwsh 等命令产生的改动、用户或外部进程直接改的文件、符号链接目标、> 8 MiB
-  文件。子代理编辑属于归并而不是跳过；只有上溯失败（父会话不 live、header 缺
-  `parentSession`、血缘成环）时才退化为不跟踪，stderr 记一行跳过日志。
+- 不跟踪：从未被编辑工具碰过的文件（纯 bash/pwsh 或用户/外部进程产生的改动没有 journal
+  条目可作锚点，仍不处理）、符号链接目标、> 8 MiB 文件（已跟踪文件在边界重扫时记为 `skip`，
+  撤回报 `unrecoverable`）。已被编辑工具跟踪过的文件随后被 bash/外部进程改动时，会在下一条
+  人类消息边界被重扫并记入边界快照（见上）；子代理编辑属于归并而不是跳过；只有上溯失败
+  （父会话不 live、header 缺 `parentSession`、血缘成环）时才退化为不跟踪，stderr 记一行跳过日志。
 
 ### 只回文件（files-only）
 

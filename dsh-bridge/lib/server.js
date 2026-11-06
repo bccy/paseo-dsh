@@ -2708,6 +2708,51 @@ export class PaseoHarnessServer {
   }
 
   /**
+   * Re-check the files this session has already tracked at a human message
+   * boundary.
+   *
+   * bash and other external processes change tracked files without going
+   * through the editing tools, so the write-ahead journal never sees them. At
+   * every human `user/message` the bridge re-scans the journal's paths and
+   * records the current content as a boundary pre-image anchored to that
+   * message ({@link FileSnapshots.reconcileTracked}); a later rewind to the
+   * message then keeps the external change instead of restoring over it.
+   *
+   * Only a root conversation is scanned: a native subagent's messages are not
+   * rewind targets, and its edits already journal under the root's dispatch
+   * anchor. Failures are logged and swallowed — a boundary scan must never
+   * break the arriving turn.
+   *
+   * @param {object} session - the session the event belongs to.
+   * @param {{type?: string, seq?: number, data?: {source?: {kind?: string}}}} event
+   * @returns {Promise<void>}
+   */
+  async reconcileFileBoundary(session, event) {
+    try {
+      if (!isHumanUserMessage(event)) return;
+      if (isDelegatedSession(session)) return;
+      const root = this.rootSessionFor(session);
+      if (root === undefined) return;
+      // The user/message event has already entered the surface when listeners
+      // run, so its own seq is the newest human anchor. The fallback keeps the
+      // boundary honest if a surface projection ever lags that update.
+      const anchor = this.latestHumanAnchor(root)
+        ?? (typeof event?.seq === 'number' ? event.seq : undefined);
+      if (anchor === undefined) return;
+      const stats = await this.fileSnapshots.reconcileTracked(String(root.id), anchor);
+      if (stats.failed > 0) {
+        process.stderr.write(
+          `[bridge] file boundary re-check failed for ${stats.failed} path(s) at message ${anchor}\n`,
+        );
+      }
+    } catch (error) {
+      process.stderr.write(
+        `[bridge] file boundary re-check: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
+  }
+
+  /**
    * Interrupt every delegated agent whose current turn this rewind withdraws.
    *
    * A child's dispatch anchor is the root human message whose turn started it

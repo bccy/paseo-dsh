@@ -4,10 +4,11 @@
  *
  * - **Visibility**: `teamPillVisible` — any task only; teammates without a
  *   shared task do not show it. An all-done board is shown once more and then
- *   hidden after the user has seen it (the panel was really closed, or the next
- *   turn started; UI-v7, the user's 2026-11-06 decision). A close is a *confirmed*
- *   one — the host remounts the popover body when it opens, so a bare unmount
- *   means nothing (`createSeenCloseGate` in `./seen-close-gate`).
+ *   hidden only after the user has opened and really closed its panel (UI-v7,
+ *   the user's 2026-11-06 decision): sending a new message without opening the
+ *   panel does not hide it. A close is a *confirmed* one — the host remounts the
+ *   popover body when it opens, so a bare unmount means nothing
+ *   (`createSeenCloseGate` in `./seen-close-gate`).
  * - **Label and title**: the noun 「团队」/「Team」 in every state; no count
  *   (T2 P1). The host uses `title` as the accessibility name, desktop tooltip
  *   and phone sheet header, so all three read the noun.
@@ -164,8 +165,6 @@ export function contributeTeamPill(
    * reload forgets it and an all-done board shows once more (accepted).
    */
   const seenStates = new Map<string, TeamSeenState>();
-  /** agentId -> the agent's last status from the directory (snapshot or upsert). */
-  const agentStatuses = new Map<string, string | undefined>();
   const lifetime = new AbortController();
 
   /**
@@ -255,7 +254,6 @@ export function contributeTeamPill(
       deference.forget("team", agentId);
       entry.registration.remove();
       seenStates.delete(agentId);
-      agentStatuses.delete(agentId);
       store.delete(agentId);
       if (reason === "unauthorized") {
         console.error(
@@ -269,7 +267,8 @@ export function contributeTeamPill(
     publishState: (agentId, team) => {
       if (pills.get(agentId) === undefined) return;
       publish(store, agentId, team);
-      advanceSeen(agentId, { kind: "board", team, agentStatus: agentStatuses.get(agentId) });
+      // A poll never marks an all-done board seen: seen is only the confirmed
+      // panel close (the popover's `onClosed` below).
       present(agentId);
     },
     onError: (message, error) => {
@@ -292,7 +291,6 @@ export function contributeTeamPill(
     .then(({ subscription }) => {
       subscription.subscribe({
         snapshot: (page) => {
-          for (const { agent } of page.entries) agentStatuses.set(agent.id, agent.status);
           void poller.applySnapshot(page);
         },
         update: (message) => {
@@ -300,9 +298,10 @@ export function contributeTeamPill(
           const update = message.payload;
           if (update.kind === "upsert") {
             poller.upsert(update.agent);
-            // The agent's status is the only "the user moved on" signal the
-            // client has: a turn starting after the completing one ended.
-            agentStatuses.set(update.agent.id, update.agent.status);
+            // The agent's status is **not** a "seen" signal: a turn starting
+            // after the completing one ended is usually just the user sending
+            // the next message, and an all-done pill must stay until its panel
+            // is opened and closed. The event is an explicit no-op.
             advanceSeen(update.agent.id, { kind: "agent", status: update.agent.status });
             return;
           }

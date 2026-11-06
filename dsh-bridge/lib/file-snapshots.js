@@ -53,6 +53,13 @@
  *   content the rewind is about to replace (already including agent edits), not
  *   the pre-edit backup — the backup stays in the journal until a rewind with no
  *   failures prunes it.
+ * - On every human message boundary the bridge re-checks the paths the journal
+ *   has ever recorded ({@link FileSnapshots.reconcileTracked}). A tracked file
+ *   changed by bash or another process since its latest record gets a boundary
+ *   snapshot anchored to that message: the pre-image is the file as it is *now*,
+ *   so a rewind to that message keeps the external change instead of restoring
+ *   over it. Only recorded paths are re-checked; a file no editing tool ever
+ *   touched is still out of scope.
  *
  * Trust boundaries: the journal is local state, but a rewind writes and deletes
  * paths it names, so `readJournal` only accepts absolute paths and content
@@ -65,8 +72,12 @@
  * field existed carry no identity and keep the old leaf-only check — the
  * recorded path is all they have to go on.
  *
- * Deliberately out of scope (documented): bash/pwsh side effects, edits made by
- * the user or another process, symlinked targets, and files above the size cap.
+ * Deliberately out of scope (documented): files no editing tool ever touched
+ * (their pure-bash changes have no journal entry to anchor a boundary snapshot
+ * to), edits made by the user or another process *between* message boundaries
+ * that outlive the session, symlinked targets, and files above the size cap.
+ * A tracked file above the cap or no longer a regular file is reported as a
+ * boundary `skip` and surfaces as `unrecoverable` on a rewind.
  *
  * @module dsh-bridge/file-snapshots
  */
@@ -109,6 +120,18 @@ const STR_REPLACE_EDITOR_WRITES = new Set(['create', 'str_replace', 'insert']);
 
 /** Default cap for one snapshot; larger files are skipped and reported. */
 const DEFAULT_MAX_FILE_BYTES = 8 * 1024 * 1024;
+
+/**
+ * `readFile` flags for the boundary re-check.
+ *
+ * The re-check decides "regular file" with `lstat`, but the path can be swapped
+ * for a symlink between that check and the read. Adding `O_NOFOLLOW` makes the
+ * read itself fail (`ELOOP`) instead of reading a link target outside the
+ * workspace into `objects/`; a platform without the flag keeps the plain read.
+ */
+const BOUNDARY_READ_FLAGS = fsConstants.O_NOFOLLOW === undefined
+  ? undefined
+  : fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW;
 
 /**
  * Marker written on every journal line whose `captureSeq` was allocated above
@@ -271,6 +294,52 @@ function objectKey(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
+/** Short stable hash used only to keep one boundary call id per path readable. */
+function shortHash(value) {
+  return createHash('sha256').update(value).digest('hex').slice(0, 8);
+}
+
+/**
+ * The `callId` of a boundary re-check record.
+ *
+ * It is an internal label, never matched against a provider tool call, so it
+ * only has to be stable and short enough to read in the journal.
+ *
+ * @param {number} anchorSeq
+ * @param {string} path
+ * @returns {string}
+ */
+function boundaryCallId(anchorSeq, path) {
+  return `recheck-${anchorSeq}-${shortHash(path)}`;
+}
+
+/**
+ * Whether `candidate` is the newer journal record for its path.
+ *
+ * Only a line carrying `captureOrderVersion === 1` has a comparable
+ * `captureSeq` (the order its read observed the bytes). A middle-generation
+ * line that happens to carry a number but no version marker is exactly the
+ * shape `planRestore` refuses to order — ranking it by that number here would
+ * disagree with the fail-closed plan. Such lines rank below every numbered
+ * capture written by this build; among themselves, file order decides.
+ *
+ * @param {{captureSeq?: number, captureOrderVersion?: number}} candidate
+ * @param {{captureSeq?: number, captureOrderVersion?: number}} [current]
+ * @returns {boolean}
+ */
+function isNewerJournalRecord(candidate, current) {
+  if (current === undefined) return true;
+  const candidateRank = candidate.captureOrderVersion === CAPTURE_ORDER_VERSION
+    ? candidate.captureSeq
+    : undefined;
+  const currentRank = current.captureOrderVersion === CAPTURE_ORDER_VERSION
+    ? current.captureSeq
+    : undefined;
+  if (candidateRank === undefined) return currentRank === undefined;
+  if (currentRank === undefined) return true;
+  return candidateRank >= currentRank;
+}
+
 /** One-line text for a caught value, without repeating the ternary everywhere. */
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
@@ -283,6 +352,10 @@ function journalLine(entry) {
     ...(entry.captureSeq === undefined ? {} : { captureSeq: entry.captureSeq }),
     ...(entry.captureOrderVersion === undefined ? {} : { captureOrderVersion: entry.captureOrderVersion }),
     ...(entry.callId === undefined ? {} : { callId: entry.callId }),
+    // `boundary` marks a record written by the human-message re-check rather
+    // than by a tool's own write-ahead capture. Readers must treat it like any
+    // other pre-image; the field only makes the journal auditable.
+    ...(entry.origin === undefined ? {} : { origin: entry.origin }),
     path: entry.path,
     ...(entry.skip === undefined
       ? {
@@ -344,6 +417,17 @@ export class FileSnapshots {
    * captures currently in flight rather than by every path ever edited.
    */
   #pathQueues = new Map();
+
+  /**
+   * Session id -> tail of the chain that serialises boundary re-checks.
+   *
+   * Two human messages can arrive back-to-back while the first re-check is
+   * still scanning. Without this chain both would read the same "latest record"
+   * and record the same unchanged state twice (and they would interleave one
+   * path's sequence allocation with another's). Entries are deleted when the
+   * chain drains, like {@link #pathQueues}.
+   */
+  #reconcileQueues = new Map();
 
   /**
    * Monotonic capture order for journal entries.
@@ -454,6 +538,20 @@ export class FileSnapshots {
     });
   }
 
+  /** Run one boundary re-check after the previous one for the same session. */
+  #serializeOnReconcile(sessionId, task) {
+    const previous = this.#reconcileQueues.get(sessionId) ?? Promise.resolve();
+    const run = previous.then(task, task);
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#reconcileQueues.set(sessionId, tail);
+    return run.finally(() => {
+      if (this.#reconcileQueues.get(sessionId) === tail) this.#reconcileQueues.delete(sessionId);
+    });
+  }
+
   /**
    * Allocate the next capture order, resuming the durable high water first.
    *
@@ -510,9 +608,21 @@ export class FileSnapshots {
    *
    * Closing sessions are included: their pending snapshots are settled after the
    * agent is disposed, which may happen while a rewind is already planning.
+   *
+   * @param {string} [sessionId] - wait only for this session's boundary
+   *   re-check; omitted waits for every session (the legacy behaviour).
    */
-  async settle() {
+  async settle(sessionId) {
     await this.#writeQueue;
+    // A boundary re-check that is still reading files may be about to append a
+    // line the plan needs: a rewind that starts right after the human message
+    // must not restore over the external change the re-check is recording.
+    // Only the rewind's own session is relevant; waiting on every session's
+    // scan would let a slow tree elsewhere block this rewind.
+    const pending = sessionId === undefined
+      ? [...this.#reconcileQueues.values()]
+      : [this.#reconcileQueues.get(String(sessionId))].filter((task) => task !== undefined);
+    await Promise.allSettled(pending);
     await this.settleAbandoned();
   }
 
@@ -627,17 +737,7 @@ export class FileSnapshots {
           const backup = objectKey(bytes);
           fingerprint = { ...fingerprint, contentHash: backup };
           captureSeq = await this.#nextCaptureSequence(input.sessionId);
-          const objects = this.objectsDir(input.sessionId);
-          await mkdir(objects, { recursive: true });
-          const target = join(objects, backup);
-          try {
-            await stat(target);
-          } catch {
-            await writeFile(target, bytes, { flag: 'wx' }).catch(async (error) => {
-              // A concurrent capture of identical content may have won the race.
-              if (error?.code !== 'EEXIST') throw error;
-            });
-          }
+          await this.#storeObject(input.sessionId, bytes, backup);
           this.pending.set(key, {
             ownerSessionId: input.sessionId,
             anchorSeq: input.anchorSeq,
@@ -1150,7 +1250,7 @@ export class FileSnapshots {
    * counted, never acted on.
    *
    * @param {string} sessionId
-   * @returns {Promise<{entries: Array<{anchorSeq: number, captureSeq?: number, callId?: string, path: string, backup?: string | null, mode?: number | null, skip?: string, dirPath?: string, dirReal?: string}>, skippedLines: number}>}
+   * @returns {Promise<{entries: Array<{anchorSeq: number, captureSeq?: number, captureOrderVersion?: number, callId?: string, origin?: string, path: string, backup?: string | null, mode?: number | null, size?: number, skip?: string, dirPath?: string, dirReal?: string}>, skippedLines: number}>}
    */
   async readJournal(sessionId) {
     let text;
@@ -1207,6 +1307,9 @@ export class FileSnapshots {
           ? CAPTURE_ORDER_VERSION
           : undefined,
         callId: typeof parsed.callId === 'string' ? parsed.callId : undefined,
+        // Optional provenance marker; unknown values are ignored, but a string
+        // is preserved so prune/trim rewrites and tests can see it.
+        origin: typeof parsed.origin === 'string' ? parsed.origin : undefined,
         path: parsed.path,
         ...(skipValid
           ? { skip: parsed.skip }
@@ -1219,6 +1322,315 @@ export class FileSnapshots {
       });
     }
     return { entries, skippedLines };
+  }
+
+  /**
+   * Every distinct path this session's journal has ever recorded.
+   *
+   * The boundary re-check only re-scans files a tracked editing tool (or an
+   * earlier boundary) has already journaled — that is the whole difference from
+   * a tree snapshot: a file no editing tool ever touched stays out of scope. A
+   * path first seen through a `skip` line is included too, because a rewind may
+   * still have to report that path as unrecoverable.
+   *
+   * @param {string} sessionId
+   * @returns {Promise<Set<string>>}
+   */
+  async trackedPaths(sessionId) {
+    const { entries } = await this.readJournal(sessionId);
+    return new Set(entries.map((entry) => entry.path));
+  }
+
+  /**
+   * Re-check every tracked file against the disk at one human message boundary.
+   *
+   * Purpose: a tracked file may be changed by bash or another external process
+   * between two editing-tool calls. Those changes are invisible to the
+   * write-ahead journal, so a later rewind would restore the tool's pre-image
+   * over them. At a `user/message` boundary the current bytes are compared with
+   * the newest journal record for each tracked path; when they differ, a
+   * boundary snapshot is recorded with the *current* content as its pre-image,
+   * anchored to that message. Rewinding to that message then keeps the external
+   * change; rewinding to an earlier message still restores the tool's own
+   * pre-image as before.
+   *
+   * A path whose current state cannot be snapshotted (non-regular file, over
+   * the size cap, read or write failure) gets a `skip` boundary line, which
+   * `planRestore` reports as `unrecoverable` — never a silent success.
+   *
+   * Never throws: a failure to re-check is written to stderr and counted, so a
+   * boundary scan can never break the arriving turn.
+   *
+   * @param {string} sessionId
+   * @param {number} anchorSeq - the human message seq this boundary belongs to.
+   * @returns {Promise<{tracked: number, recorded: number, unchanged: number, skipped: number, failed: number}>}
+   */
+  async reconcileTracked(sessionId, anchorSeq) {
+    const stats = { tracked: 0, recorded: 0, unchanged: 0, skipped: 0, failed: 0 };
+    if (typeof anchorSeq !== 'number' || !Number.isSafeInteger(anchorSeq) || anchorSeq < 0) {
+      this.warn(`boundary re-check skipped for ${sessionId}: invalid anchor ${String(anchorSeq)}`);
+      stats.failed = 1;
+      return stats;
+    }
+    try {
+      return await this.#serializeOnReconcile(sessionId, async () => {
+        // See every journal line already submitted by a settled tool before
+        // deciding what the newest record for each path is.
+        await this.#writeQueue;
+        const { entries, skippedLines } = await this.readJournal(sessionId);
+        if (skippedLines > 0) {
+          this.warn(`boundary re-check skipped ${skippedLines} damaged journal line(s) for ${sessionId}`);
+        }
+        /** @type {Map<string, object>} path -> newest journal record */
+        const latestByPath = new Map();
+        for (const entry of entries) {
+          if (isNewerJournalRecord(entry, latestByPath.get(entry.path))) {
+            latestByPath.set(entry.path, entry);
+          }
+        }
+        stats.tracked = latestByPath.size;
+        for (const [path, latest] of latestByPath) {
+          try {
+            // Same per-path lock the tool capture uses: the comparison/read and
+            // the record must not interleave with a capture of this path.
+            const outcome = await this.#serializeOnPath(
+              path,
+              async () => this.#reconcileOnePath(sessionId, anchorSeq, path, latest),
+            );
+            if (outcome === 'recorded') {
+              stats.recorded += 1;
+            } else if (outcome === 'skip-recorded') {
+              stats.recorded += 1;
+              stats.skipped += 1;
+            } else {
+              stats.unchanged += 1;
+            }
+          } catch (error) {
+            stats.failed += 1;
+            this.warn(`boundary re-check failed for ${path}: ${errorMessage(error)}`);
+          }
+        }
+        return stats;
+      });
+    } catch (error) {
+      this.warn(`boundary re-check failed for ${sessionId}: ${errorMessage(error)}`);
+      stats.failed += 1;
+      return stats;
+    }
+  }
+
+  /**
+   * Compare one tracked path with its newest journal record and record the
+   * difference as a boundary snapshot.
+   *
+   * The path is examined with `lstat`: a symlink or any other non-regular file
+   * is reported as a `skip` and its target is never read into the object store.
+   *
+   * `latest` is the newest record as of the journal read this re-check started
+   * from. Compatibility: journal lines written before capture ordering existed
+   * carry no `captureSeq`/`captureOrderVersion` (and no stat fingerprint), so
+   * they are compared by their recorded content hash exactly like current
+   * lines — the hash is the content fingerprint.
+   *
+   * @param {string} sessionId
+   * @param {number} anchorSeq
+   * @param {string} path
+   * @param {{backup?: string | null, skip?: string}} [latest]
+   * @returns {Promise<'recorded' | 'skip-recorded' | 'unchanged'>}
+   */
+  async #reconcileOnePath(sessionId, anchorSeq, path, latest) {
+    let info;
+    try {
+      // `lstat`, not `stat`: a tracked path replaced by a symlink must be
+      // reported as not-a-regular-file and never read through to its target —
+      // the rewind refuses to restore a symlink, so snapshotting target bytes
+      // would only put unrelated content into `objects/`.
+      info = await lstat(path);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      // The file is gone. "Gone then and gone now" is not a change; a file that
+      // had content (or was only ever a skip) was deleted externally.
+      if (latest?.skip === undefined && latest?.backup === null) return 'unchanged';
+      return await this.#recordBoundary(sessionId, anchorSeq, path, null);
+    }
+    if (!info.isFile()) {
+      return await this.#recordBoundarySkip(sessionId, anchorSeq, path, 'not-a-regular-file', latest);
+    }
+    if (info.size > this.maxFileBytes) {
+      return await this.#recordBoundarySkip(
+        sessionId,
+        anchorSeq,
+        path,
+        `larger than ${this.maxFileBytes} bytes`,
+        latest,
+      );
+    }
+    let bytes;
+    try {
+      bytes = await readFile(path, BOUNDARY_READ_FLAGS === undefined ? undefined : { flag: BOUNDARY_READ_FLAGS });
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        if (latest?.skip === undefined && latest?.backup === null) return 'unchanged';
+        return await this.#recordBoundary(sessionId, anchorSeq, path, null);
+      }
+      return await this.#recordBoundarySkip(sessionId, anchorSeq, path, `read failed: ${errorMessage(error)}`, latest);
+    }
+    // A race can grow the file after `lstat`; the cap is a contract, not an
+    // estimate, so re-check the real byte count before hashing/storing it.
+    if (bytes.length > this.maxFileBytes) {
+      return await this.#recordBoundarySkip(
+        sessionId,
+        anchorSeq,
+        path,
+        `larger than ${this.maxFileBytes} bytes`,
+        latest,
+      );
+    }
+    const backup = objectKey(bytes);
+    // The recorded hash is the content fingerprint every journal generation has:
+    // a legacy line without capture metadata still compares correctly here.
+    if (latest?.skip === undefined && latest?.backup === backup) return 'unchanged';
+    return await this.#recordBoundary(sessionId, anchorSeq, path, backup, { bytes, info });
+  }
+
+  /**
+   * Record one boundary snapshot (content hash or `backup: null`).
+   *
+   * The content object is stored before the journal line that names it, its
+   * order comes from {@link #nextCaptureSequence}, and the append goes through
+   * {@link #enqueue}. A failure to store/record is turned into a durable skip
+   * line where possible, so a later rewind reports the path instead of silently
+   * restoring over the external change.
+   *
+   * @param {string} sessionId
+   * @param {number} anchorSeq
+   * @param {string} path
+   * @param {string | null} backup
+   * @param {{bytes: Buffer, info: import('node:fs').Stats}} [details]
+   * @returns {Promise<'recorded' | 'skip-recorded'>}
+   */
+  async #recordBoundary(sessionId, anchorSeq, path, backup, details) {
+    const captureSeq = await this.#nextCaptureSequence(sessionId);
+    const base = {
+      anchorSeq,
+      captureSeq,
+      captureOrderVersion: CAPTURE_ORDER_VERSION,
+      callId: boundaryCallId(anchorSeq, path),
+      origin: 'boundary',
+      path,
+    };
+    try {
+      const identity = await this.#captureIdentity(path);
+      if (backup !== null) {
+        await this.#storeObject(sessionId, details.bytes, backup);
+        await this.#appendBoundaryLine(sessionId, {
+          ...base,
+          backup,
+          mode: details.info.mode & 0o777,
+          size: details.bytes.length,
+          ...(identity === undefined ? {} : identity),
+        });
+      } else {
+        await this.#appendBoundaryLine(sessionId, {
+          ...base,
+          backup: null,
+          mode: null,
+          ...(identity === undefined ? {} : identity),
+        });
+      }
+      return 'recorded';
+    } catch (error) {
+      const reason = `boundary capture failed: ${errorMessage(error)}`;
+      try {
+        await this.#appendBoundaryLine(sessionId, { ...base, skip: reason });
+        return 'skip-recorded';
+      } catch (lineError) {
+        this.#noteUnrecorded(
+          sessionId,
+          anchorSeq,
+          path,
+          `boundary re-check not recorded: ${errorMessage(lineError)}`,
+          backup ?? undefined,
+        );
+        throw error;
+      }
+    }
+  }
+
+  /**
+   * Record one boundary `skip` line (non-regular file, over the cap, read error).
+   *
+   * Consecutive boundaries that observe the same un-snapshottable state record
+   * it once: the state did not change, so there is nothing new to remember.
+   *
+   * @param {string} sessionId
+   * @param {number} anchorSeq
+   * @param {string} path
+   * @param {string} reason
+   * @param {{skip?: string}} [latest]
+   * @returns {Promise<'skip-recorded' | 'unchanged'>}
+   */
+  async #recordBoundarySkip(sessionId, anchorSeq, path, reason, latest) {
+    if (latest?.skip === reason) return 'unchanged';
+    try {
+      const captureSeq = await this.#nextCaptureSequence(sessionId);
+      await this.#appendBoundaryLine(sessionId, {
+        anchorSeq,
+        captureSeq,
+        captureOrderVersion: CAPTURE_ORDER_VERSION,
+        callId: boundaryCallId(anchorSeq, path),
+        origin: 'boundary',
+        path,
+        skip: reason,
+      });
+      return 'skip-recorded';
+    } catch (error) {
+      // A boundary that cannot even record why it cannot snapshot still has to
+      // make the later rewind loud: the ledger makes `planRestore` report the
+      // path unrecoverable instead of restoring an older pre-image silently.
+      this.#noteUnrecorded(sessionId, anchorSeq, path, `boundary re-check not recorded: ${errorMessage(error)}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Append one already-complete boundary line on the journal queue.
+   *
+   * @param {string} sessionId
+   * @param {object} entry
+   * @returns {Promise<void>}
+   */
+  async #appendBoundaryLine(sessionId, entry) {
+    await this.#enqueue(async () => {
+      await mkdir(this.sessionDir(sessionId), { recursive: true });
+      await appendFile(this.journalPath(sessionId), journalLine(entry), 'utf8');
+    });
+  }
+
+  /**
+   * Store one content-addressed object, returning its name.
+   *
+   * Identical content is written once; a concurrent capture that wins the
+   * `wx` race is accepted (`EEXIST`).
+   *
+   * @param {string} sessionId
+   * @param {Buffer} bytes
+   * @param {string} [name] - the object key, when the caller already computed it.
+   * @returns {Promise<string>}
+   */
+  async #storeObject(sessionId, bytes, name = objectKey(bytes)) {
+    const objects = this.objectsDir(sessionId);
+    await mkdir(objects, { recursive: true });
+    const target = join(objects, name);
+    try {
+      await stat(target);
+    } catch {
+      await writeFile(target, bytes, { flag: 'wx' }).catch((error) => {
+        // A concurrent capture of identical content may have won the race.
+        if (error?.code !== 'EEXIST') throw error;
+      });
+    }
+    return name;
   }
 
   /**
@@ -1247,7 +1659,7 @@ export class FileSnapshots {
     // A tool that has settled may still have its journal line queued behind a
     // slow append. Planning without it would silently drop that path from the
     // restore and then prune its entry as if it had been handled.
-    await this.settle();
+    await this.settle(sessionId);
     const { entries, skippedLines } = await this.readJournal(sessionId);
     /** @type {Map<string, {path: string, backup?: string | null, mode?: number | null, skip?: string, dirPath?: string, dirReal?: string, rank: number}>} */
     const byPath = new Map();

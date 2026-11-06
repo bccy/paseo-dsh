@@ -13,6 +13,8 @@ import { exitOnStdinEnd, parseCmdline } from '@deepseek-ai/dsh-cmdline';
 import { PaseoTransport } from './transport.js';
 import { PaseoHarnessServer } from './server.js';
 import { registerApprovalAnswerer } from './approval.js';
+import { isHumanUserMessage } from './revert.js';
+import { isDelegatedSession } from './snapshot-owners.js';
 
 /** Stable Cordis plugin name. */
 export const name = 'paseo-bridge';
@@ -174,6 +176,18 @@ function startBridge(ctx, config = {}) {
       transport.notify('paseo/settings/changed', { ns });
     });
 
+    // DSH -> Paseo. Every human message is a file-layer boundary: a tracked
+    // file may have been changed by bash or another external process since its
+    // latest journal record, and the rewind must keep that change instead of
+    // restoring over it. Injected user-role messages and rewind markers are not
+    // human turns, and a delegated session has no message a human can rewind —
+    // both are filtered before the async scan is started.
+    const offFileBoundary = ctx.on('session/event', (session, event) => {
+      if (!isHumanUserMessage(event)) return;
+      if (isDelegatedSession(session)) return;
+      void server.reconcileFileBoundary(session, event);
+    });
+
     // DSH -> Paseo. Root-context registration matches how the shipped ACP
     // adapter claims `approval/request`; each listener answers only for the
     // sessions this server owns and otherwise delegates down the waterfall.
@@ -200,6 +214,7 @@ function startBridge(ctx, config = {}) {
       offQuestions();
       offApproval();
       offSettings();
+      offFileBoundary();
       await server.shutdown();
       transport.close();
     };

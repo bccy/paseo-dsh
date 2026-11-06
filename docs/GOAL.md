@@ -103,7 +103,7 @@ title 仍是「后台任务」；图标是 `SquareTerminal`，运行中右下角
 
 **可见性**：`available && goal !== null`，且 complete 时**用户还没看过**。无目标 / 已清除 → 隐藏。
 complete 是本插件对 DSH 的有界扩展：DSH Web 的 GoalBar 对 complete 当即不渲染
-（`@deepseek-ai/dsh-client-ui-goal/README.zh.md:38`），这里改为**完成后显示一次**，看过即隐藏（见下文「完成态」）。终态错误（桥太旧、profile 没挂
+（`@deepseek-ai/dsh-client-ui-goal/README.zh.md:38`），这里改为**完成后显示一次**，只有点开并关闭面板后才隐藏；不点开时发送新消息不会隐藏（见下文「完成态」）。终态错误（桥太旧、profile 没挂
 goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等价，不打扰用户；瞬时错误**保持
 上次状态**，不要把界面闪成「无目标」（`goalPillPresentation`，`paseo-plugin/client/goal-polling.ts`）。
 
@@ -184,16 +184,14 @@ goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等�
   summary 字段，总结只在模型的收尾消息里（survey §3），不伪造。没有暂停/继续/编辑：complete 不能 resume，`/goal edit` 对 complete 是新建。
 - **清除确认**：complete 用单独一句「清除后 /goal 将查不到这个目标，无法撤销」/「After clearing, /goal will no longer show this goal;
   this cannot be undone.」（清除一个已完成目标不会停止任何东西，失去的是 `/goal` 还能查到的记录）；其它状态的确认句不变。
-- **何时隐藏**：按 `id:revision` 记「已读」，同键已读即隐藏（`goalPillPresentation(answer, seen)`）。已读的来源（纯函数
-  `goalCompleteSeenStep`）：①打开完成面板后**真正关闭**——宿主打开 popover 时会把内容**重挂载一次**（`AnchoredSurface` 的 `FloatingSurface` 带
+- **何时隐藏**：按 `id:revision` 记「已读」，同键已读即隐藏（`goalPillPresentation(answer, seen)`）。已读的**唯一来源**（纯函数
+  `goalCompleteSeenStep`）：打开完成面板后**真正关闭**——宿主打开 popover 时会把内容**重挂载一次**（`AnchoredSurface` 的 `FloatingSurface` 带
   `key={placed ? "placed" : "measuring"}`，Paseo 0.15.0 `packages/app/src/components/ui/menu/menu-overlay.tsx:350`，注释在 :265 明说
   「Remounting on placement…」），所以 `unmount` 本身不是关闭；`client/seen-close-gate.ts` 的 `SEEN_CLOSE_CONFIRM_MS` = 250ms 确认窗内又挂载 → 取消，
-  卸载后一直没回来 → 记已读（修复前把任何卸载都当关闭：桌面端点开已完成目标 pill 就消失、面板没显示，手机端 sheet 不走这条重挂载路径所以正常）；
-  ②观察到 complete 之后 agent **先 idle 再 running**
-  ——这是插件能拿到的「用户发了下一条消息」的唯一代理信号（插件 API 没有 composer 提交回调），完成当轮的收尾 running→idle 只推进状态、
-  不算已读；若首次观察到 complete 时 agent 已 idle（轮询间隔里那一轮已结束），直接从「已 idle」起步；③清除后 goal 为 null，自然隐藏。
-  非用户发起的回合（schedule、心跳、其它 agent 的消息）也会触发②，失误方向是「提早消失」，不会多出现。agent 状态取自 pill 已有的
-  `agents.list({subscribe})` 快照与 upsert（不用 `useAgent`：pill 隐藏时没有组件挂载，看不到状态变化）。
+  卸载后一直没回来 → 记已读（修复前把任何卸载都当关闭：桌面端点开已完成目标 pill 就消失、面板没显示，手机端 sheet 不走这条重挂载路径所以正常）。
+  **发送新消息不算已读**（2026-11-07 修复）：完成当轮的 running→idle 与用户下一条消息触发的 idle→running 都不写 seen——此前把「下一回合开始」当作用户已看过，
+  未点开面板的目标会在发下一条消息后消失；若首次观察到 complete 时 agent 已 idle，也只等待面板关闭。清除后 goal 为 null，自然隐藏。
+  agent 状态仍从 pill 已有的 `agents.list({subscribe})` 快照与 upsert 记录，但只用于运行环等展示，不参与「已读」判定。
 - **只在内存**：刷新 / 重开 App / 插件 reload 后清空，complete 会再出现一次（用户已接受）。同一 objective 的新目标（新 id）或新 revision
   会重新显示。
 

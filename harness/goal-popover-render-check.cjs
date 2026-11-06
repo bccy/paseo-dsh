@@ -839,6 +839,8 @@ async function separatePillChecks() {
   const regs = [];
   const scene = { goal: baseGoal, jobs: { available: true, jobs: [runningJob] } };
   const agent = { id: "agent-1", workspaceId: "w", status: "idle" };
+  /** The agent-directory subscription handlers, so a test can emit an `agent_update`. */
+  let agentFeed;
   const client = {
     rpc: async (definition) => {
       if (definition.name === "goal.current") return { available: true, goal: scene.goal };
@@ -858,7 +860,14 @@ async function separatePillChecks() {
       agents: {
         list: async (options) =>
           options?.subscribe !== undefined
-            ? { subscription: { subscribe: (handler) => handler.snapshot({ entries: [{ agent }], pageInfo: { hasMore: false, nextCursor: null } }) } }
+            ? {
+                subscription: {
+                  subscribe: (handler) => {
+                    agentFeed = handler;
+                    handler.snapshot({ entries: [{ agent }], pageInfo: { hasMore: false, nextCursor: null } });
+                  },
+                },
+              }
             : { entries: [], pageInfo: { hasMore: false, nextCursor: null } },
       },
     },
@@ -954,6 +963,13 @@ async function separatePillChecks() {
     scene.goal = { ...baseGoal, phase: "complete", activation: "disarmed" };
     await until(() => merged(goalReg).visible === true);
     check("a completed goal shows the goal pill once more", merged(goalReg).visible, true);
+    // The user sends the next message without opening the pill: the agent goes
+    // idle → running. "A new turn started" is not "the user saw the completion";
+    // the completed pill must stay visible until its panel is really closed.
+    agent.status = "running";
+    agentFeed.update({ type: "agent_update", payload: { kind: "upsert", agent } });
+    await pause(120);
+    check("…and a new message (agent running again) does not hide it", merged(goalReg).visible, true);
     {
       const { container, root } = mountContent(goalReg);
       assert("the goal popover is the goal panel alone", container.textContent.includes(baseGoal.objective) && !container.textContent.includes("运行完整测试套件"));

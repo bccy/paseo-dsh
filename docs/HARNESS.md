@@ -509,14 +509,21 @@
   任何东西（绝不猜）。**动了 `surface.js` 或 `replayHistory` 的折叠必跑。**
 - `harness/file-snapshot-check.mjs` — 撤回的文件层（`dsh-bridge/lib/file-snapshots.js`）：写前
   状态按工具调用捕获、成功才提交；目标之后新建的文件被删、改过的恢复最早 post-target 内容、
-  没动过的不碰；bash 与用户自己的改动永不记录；`str_replace_editor` 只认写命令；恢复前 rescue；
-  一条路径失败不打断其余；同一路径两次捕获按读到的字节顺序排序（含第一次读被扣住时）。**本轮
-  补的失败面**：读后捕获失败（objects 建不了 / 对象写失败 / 父身份 realpath 失败）与 journal
-  写不进都落 skip/unrecoverable 并进回执（不再报「这条消息之后没有改动文件」）；损坏对象
-  （截断或同长度哈希不符）不写回用户文件、不产生 rescue；写已原子落盘后被判 `isError` 仍落
-  journal 行（会话关闭路径在 dispose 之后结算）；并发 `planRestore` 等得到另一个调用者正在
-  结算的关闭快照（R4）；`isError` 变更判定先比长度、长度相同才读哈希（R1）。**动了
-  `file-snapshots.js` 的 capture/commit/restore/journal/GC 或 `server.js` 的关闭与回执接线必跑。**
+  没动过的不碰；从未被编辑工具碰过的 bash/用户改动永不记录；`str_replace_editor` 只认写命令；
+  恢复前 rescue；一条路径失败不打断其余；同一路径两次捕获按读到的字节顺序排序（含第一次读被扣住时）。
+  **2026-11-07 方案 B：边界重扫 reduce/reconcile 与 114 条断言**（2026-11-07 返工：symlink
+  不跟随、旧 journal 排序口径、boundary 判别力增强）：每条人类 `user/message` 对
+  journal 已存在路径先 `lstat`、普通文件直接 `readFile`（`O_NOFOLLOW`）后内容比对（最新记录按
+  `captureSeq`，旧行按文件序），变化则记
+  `origin="boundary"`、anchor=`该消息 seq` 的 pre-image，bash/外部进程对已跟踪文件的改动因此
+  进入后续撤回的 pre-image；纯 bash 未跟踪文件仍不处理；非普通文件 / 超 8 MiB / 读失败记
+  `skip` → `unrecoverable`。**本轮补的失败面**：读后捕获失败（objects 建不了 / 对象写失败 /
+  父身份 realpath 失败）与 journal 写不进都落 skip/unrecoverable 并进回执（不再报「这条消息
+  之后没有改动文件」）；损坏对象（截断或同长度哈希不符）不写回用户文件、不产生 rescue；
+  写已原子落盘后被判 `isError` 仍落 journal 行（会话关闭路径在 dispose 之后结算）；并发
+  `planRestore` 等得到另一个调用者正在结算的关闭快照（R4）；`isError` 变更判定先比长度、
+  长度相同才读哈希（R1）。**动了 `file-snapshots.js` 的
+  capture/commit/restore/journal/GC/reconcile/trackedPaths 或 `server.js` 的关闭与回执接线必跑。**
 - `harness/snapshot-lifecycle-check.mjs` — 捕获序号必须跨进程重启续数：第二个实例接着第一个
   的编号、跨该边界的撤回仍恢复原始 pre-image；并行父子捕获顺序反转仍取最早捕获；失去又拿回
   写者身份的进程重读 `beginOwner` 高水位；旧 journal（无 `captureOrderVersion`）有歧义时
@@ -666,8 +673,8 @@
   新 id 或新 revision 重新可见、已读键只隐藏 complete**；`goalIconName` success→`CircleCheck`、余→`Target`；
   `goalIconColorToken("success")`→`statusSuccess`）、**pill 文案**（`goalPillCopy` 用真实 locale 表：五态×中英 label 与 title
   都是「目标」/「Goal」；`goalStateName` 五态完整状态名）、**完成态已读状态机**（`goalCompleteSeenStep`：完成当轮
-  running→idle 不算已读、之后 running 才算、首次观察时已 idle 直接起步、关闭完成面板即已读、非 complete 面板关闭不算、
-  已读键跨轮询保持、新 revision 重新观察、清除丢 watch 留已读键、端到端隐藏）、**面板去向**（`goalPanelNext`：编辑取消/Esc→close、
+  running→idle 不算已读、下一回合 running（发下一条消息）也不算已读、首次观察时已 idle 也不起步、关闭完成面板即已读、非 complete 面板关闭不算、
+  已读键跨轮询保持、新 revision 重新观察且显示、清除留已读键、端到端：下一条消息后仍可见、关闭后隐藏）、**面板去向**（`goalPanelNext`：编辑取消/Esc→close、
   保存成功→close、保存被拒→stay、清除页取消→view、其它控制成功→view、被拒→stay）、面板行几何取宿主值（`goalTrackRow` 32/40、确认页行尾 `goalConfirmControls`（红钮 32/24、手机行尾比 view 页至多宽 8px）、防误触常量（武装 400ms、未武装 0.35/0.86、过渡短于武装、按下 0.85）、
   `goalIconButton` 20/32、鲸鱼 16、环框 14 偏移 -5）、facts 行（`goalFactsLine`：
   「进行中 · 第 N 轮 · 预算 M」，**`active + disarmed` 以「未在续跑」/「Not continuing」开头**）、
@@ -688,7 +695,7 @@
   `client/goal-pill.tsx`、`client/goal-running.tsx`、`client/deepseek-mark*.tsx`、
   `client/agent-polling.ts`、`shared/goal.ts` 或 `client/locale.ts` 的 goal 表必跑；改共享轮询器时
   `jobs-poll-check.cjs` 必须同时全绿且断言数不减。动了 `client/seen-close-gate.ts` 必跑。**
-- `harness/goal-popover-render-check.cjs` — 面板的**渲染行为**（**257 条**；2026-11-05 新增：真实 `contributeGoalPill` + `contributeJobsPill` 对假宿主——一个 agent 恰两个注册 `dsh-goal`/`dsh-jobs`、各自 popover、update 不带 behavior、两者同时可见、后台文字恒为「后台」且任何 patch 不含数字、后台跑完只隐藏后台不碰目标、registry 读不到显示静态 `SquareTerminal`、目标清除只隐藏目标、后台 popover 不画目标行、关闭完成态目标 popover 即已读、dispose 移除两个注册；2026-11-06 新增 33 条三 pill 集成：三个真实 `contribute*` 共用一个 `createPillDeference()`——目标+团队同时可见时后台 `visible=false`，团队或目标任一隐藏后后台立即恢复（先把 jobs 轮询冻结在一次 in-flight 读，证明恢复不依赖下一次轮询）；目标 RPC 终态错误移除 goal pill 后，team 仍可见时 jobs 同样立即恢复且无新轮询（forget 接线）；deference 重绘但 presentation 未变时 `registration.update` 次数不增加（去重）；自身规则保持（settled 仍隐藏、`available:false` 自身应显示但被退避压制），cleanup 移除三个注册；`CornerRingIcon`/`JobsPillIcon`/真实目标图标：运行时底图标仍在、角环 9px 右下 -1、外框恒等于 size、角环绝对定位、四种图标 glyph 中心与宿主 16px 图标盒中心偏差 ≤0.5px）：用 esbuild 现编真实
+- `harness/goal-popover-render-check.cjs` — 面板的**渲染行为**（**258 条**；2026-11-05 新增：真实 `contributeGoalPill` + `contributeJobsPill` 对假宿主——一个 agent 恰两个注册 `dsh-goal`/`dsh-jobs`、各自 popover、update 不带 behavior、两者同时可见、后台文字恒为「后台」且任何 patch 不含数字、后台跑完只隐藏后台不碰目标、registry 读不到显示静态 `SquareTerminal`、目标清除只隐藏目标、后台 popover 不画目标行、关闭完成态目标 popover 即已读、发下一条消息（agent idle→running）不隐藏未点开的完成态目标、dispose 移除两个注册；2026-11-06 新增 33 条三 pill 集成：三个真实 `contribute*` 共用一个 `createPillDeference()`——目标+团队同时可见时后台 `visible=false`，团队或目标任一隐藏后后台立即恢复（先把 jobs 轮询冻结在一次 in-flight 读，证明恢复不依赖下一次轮询）；目标 RPC 终态错误移除 goal pill 后，team 仍可见时 jobs 同样立即恢复且无新轮询（forget 接线）；deference 重绘但 presentation 未变时 `registration.update` 次数不增加（去重）；自身规则保持（settled 仍隐藏、`available:false` 自身应显示但被退避压制），cleanup 移除三个注册；`CornerRingIcon`/`JobsPillIcon`/真实目标图标：运行时底图标仍在、角环 9px 右下 -1、外框恒等于 size、角环绝对定位、四种图标 glyph 中心与宿主 16px 图标盒中心偏差 ≤0.5px）：用 esbuild 现编真实
   `GoalPopoverBody`，经 `react-native-web` 渲染进 jsdom（宿主 UI kit 的 `Icon`/`TextInput` 用小桩
   代替：lucide 真 glyph、内联 SVG、react-native-web 真输入框；文案用真实 zh-CN 表）。断言：目标行是
   面板唯一的编辑入口、两个行尾图标按钮不打开编辑、运行时鲸鱼角上出环、**编辑页是小号 composer**
@@ -764,7 +771,7 @@
   其它抛错与形状不符 → `rpc_failed`（不清空成空看板）；DSH 字段原样；**`running`**：空闲根的 Lead 为 false、未托管队员无此键、
   托管中队员回合未结束为 true、已结束为 false、失败成员无此键。编译同 `goal-server-check`（`.dbg` + 拷入本脚本与
   `fake-dsh-bridge.mjs`）。**动了 `server/{dsh-process,session,provider}.ts` 的 team 部分、`shared/team.ts` 或假桥 `team` 模式必跑。**
-- `harness/team-pill-check.cjs` — `client/team-polling.ts` 纯规则（**181 条**；pill 图标改为 `Users` + 角标环（全部完成 → 绿色 `CircleCheck`）的 6 条源码钉——三种 `Users` 状态都经 `CornerRingIcon` 画 `Users`、完成态用 `CircleCheck` + `statusSuccess`、只有运行态开环、不再出现裸 `StatusRingMark`、可见性仍经 `teamPillVisible(team, seen)`、seen 三路接线源码钉（面板关闭 / board / agent 事件）；2026-11-06：入口源码钉更新为 `contributeTeamPill(client, deference)` / `contributeJobsPill(client, deference)` / `contributeGoalPill(client, deference)`）：可见性（只看任务、不看队员：无任务一律隐藏——含起了队员但没建任务；有任务即可见，无论有无队员行；无看板隐藏；**全部完成只再显示一次、看过即隐藏**：`teamAllDoneKey` 按 id 排序的 `id:revision` 签名（顺序无关、revision 变化换签名）与 `teamCompleteSeenStep` 三分支——board 首见→watch、agent idle→idleSeen、下一回合 running 或面板关闭→seen、未全完成清 watch 保留 seen）、成员标题行 chip（顺序、0 不出、运行态缺失不出运行中/已停止、计数只数队员（运行中的 Lead 不算运行中）、Lead 空闲不算已停止、四档降级顺序与选档、各档保留失败与运行中且带字）、负责人标记（运行环 / 已停止只来自 `running` true/false，缺失不标，已完成不标）与「N 个负责人已停止」计数、pill 图标
+- `harness/team-pill-check.cjs` — `client/team-polling.ts` 纯规则（**181 条**；pill 图标改为 `Users` + 角标环（全部完成 → 绿色 `CircleCheck`）的 6 条源码钉——三种 `Users` 状态都经 `CornerRingIcon` 画 `Users`、完成态用 `CircleCheck` + `statusSuccess`、只有运行态开环、不再出现裸 `StatusRingMark`、可见性仍经 `teamPillVisible(team, seen)`、seen 接线源码钉（面板关闭是唯一写 seen 的输入；board/agent 事件不写）；2026-11-06：入口源码钉更新为 `contributeTeamPill(client, deference)` / `contributeJobsPill(client, deference)` / `contributeGoalPill(client, deference)`）：可见性（只看任务、不看队员：无任务一律隐藏——含起了队员但没建任务；有任务即可见，无论有无队员行；无看板隐藏；**全部完成只再显示一次、只有点开并关闭面板后才隐藏（不点开时发下一条消息不隐藏）**：`teamAllDoneKey` 按 id 排序的 `id:revision` 签名（顺序无关、revision 变化换签名）与 `teamCompleteSeenStep`——board 轮询不写 seen、agent 事件（含下一回合 running）no-op、面板关闭→seen、未全完成时 seen 保留）、成员标题行 chip（顺序、0 不出、运行态缺失不出运行中/已停止、计数只数队员（运行中的 Lead 不算运行中）、Lead 空闲不算已停止、四档降级顺序与选档、各档保留失败与运行中且带字）、负责人标记（运行环 / 已停止只来自 `running` true/false，缺失不标，已完成不标）与「N 个负责人已停止」计数、pill 图标
   （只有 `running:true` 才转环、failure/失败成员红、全部完成绿色 `CircleCheck`）、成员词（无 `running` 时中英都不说运行中/空闲）与排序、任务标记只认 DSH 的
   `ready`、B 分组顺序（被阻塞任务不进可开始）、facts 行、详情字段、重叠警告翻译（未知原样）、契约码、poller 适配（终态移除、
   瞬态保留上次看板）、pill 接线源码钉（label/title 是名词、无计数）。运行：`cd paseo-plugin && npx tsc -p ../harness/team-pill.tsconfig.json`，

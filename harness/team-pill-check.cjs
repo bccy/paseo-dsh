@@ -6,8 +6,9 @@
  *
  *   - **visibility**: tasks only (the user's 2026-11-06 decision) — any task →
  *     visible, no task → hidden even with teammates running; no board → hidden;
- *     an all-done board is shown once more and then hidden after the user has
- *     seen it (`teamAllDoneKey` / `teamCompleteSeenStep`, UI-v7);
+ *     an all-done board is shown once more and then hidden only after its panel
+ *     was opened and confirmed closed (`teamAllDoneKey` / `teamCompleteSeenStep`,
+ *     UI-v7); a new message does not hide it;
  *   - **"closed" is confirmed, not assumed** (the shared
  *     `client/seen-close-gate.ts`, UI-v7 fix — the goal pill uses it too):
  *     the host unmounts the popover body when it *opens* (its surface remounts
@@ -137,25 +138,23 @@ console.log("\nan all-done board's seen state (UI-v7)");
   equal("a revision change → a new key", teamAllDoneKey(allDoneNewer), "task-1:3,task-2:8");
 
   const step = (state, event) => teamCompleteSeenStep(state, event);
-  const watching = { watch: { key: KEY, stage: "watching" } };
-  const idleSeen = { watch: { key: KEY, stage: "idleSeen" } };
-  equal("all done first seen while running → watching", step({}, { kind: "board", team: allDone, agentStatus: "running" }), watching);
-  equal("…first seen while idle → idleSeen (the next message must not be missed)", step({}, { kind: "board", team: allDone, agentStatus: "idle" }), idleSeen);
-  equal("the completing turn's idle only moves the watch", step(watching, { kind: "agent", status: "idle" }), idleSeen);
-  equal("a running while still watching proves nothing", step(watching, { kind: "agent", status: "running" }), watching);
-  equal("the next running marks it seen", step(idleSeen, { kind: "agent", status: "running" }), { seen: KEY });
+  equal("all done first seen while running records nothing", step({}, { kind: "board", team: allDone }), {});
+  equal("…first seen while idle records nothing either", step({}, { kind: "board", team: allDone }), {});
+  equal("the completing turn's idle marks nothing", step({}, { kind: "agent", status: "idle" }), {});
+  equal("a running while the board is complete proves nothing", step({}, { kind: "agent", status: "running" }), {});
+  const afterCompletion = step(step(step({}, { kind: "board", team: allDone }), { kind: "agent", status: "idle" }), {
+    kind: "agent",
+    status: "running",
+  });
+  equal("the next running (the user's next message) is not seen", afterCompletion, {});
   equal("closing the panel marks it seen", step({}, { kind: "closed", team: allDone }), { seen: KEY });
   equal("closing a not-all-done board marks nothing", step({}, { kind: "closed", team: partial }), {});
-  equal(
-    "a board that stops being all done drops the watch, keeps seen",
-    step({ seen: "old", watch: { key: KEY, stage: "watching" } }, { kind: "board", team: partial }),
-    { seen: "old" },
-  );
+  equal("a board that stops being all done keeps seen", step({ seen: "old" }, { kind: "board", team: partial }), { seen: "old" });
   equal("the same all-done board after seen keeps it seen", step({ seen: KEY }, { kind: "board", team: allDone }), { seen: KEY });
   equal(
     "a new key shows again, the old seen stays",
-    step({ seen: KEY }, { kind: "board", team: allDoneNewer, agentStatus: "idle" }),
-    { seen: KEY, watch: { key: "task-1:3,task-2:8", stage: "idleSeen" } },
+    step({ seen: KEY }, { kind: "board", team: allDoneNewer }),
+    { seen: KEY },
   );
 
   equal("all done + seen → hidden", teamPillVisible(allDone, KEY), false);
@@ -530,17 +529,19 @@ console.log("\npill wiring (source pins)");
   assert("the complete icon is the green CircleCheck", /function CompleteIcon[\s\S]{0,220}name="CircleCheck"[\s\S]{0,220}statusSuccess/.test(pill));
   assert("ICONS maps complete to CompleteIcon", /complete: CompleteIcon/.test(pill) && /Record<TeamPillIcon, typeof IdleIcon>/.test(pill));
   assert("the team pill no longer draws a bare StatusRingMark", !/StatusRingMark/.test(pill));
-  // The three "seen" inputs must stay wired (UI-v7): the popover's close is the
-  // only user-visible one (an all-done board disappears without waiting for a
-  // poll; it goes through the gate above), the board and agent events feed the
-  // same machine.
+  // The popover's close is the only "seen" input (UI-v7): an all-done board
+  // disappears only after that confirmed close. Polls and agent status events
+  // must never mark it seen (a new message is not "the user looked at it").
   assert("closing the team popover marks an all-done board seen", /advanceSeen\(agent\.id, \{ kind: "closed", team \}\)/.test(pill));
   assert(
     "…only for the pill the close belongs to (a stale close is dropped)",
     /if \(pills\.get\(agent\.id\)\?\.registration !== registration\) return;/.test(pill),
   );
-  assert("a poll answer feeds the seen machine", /advanceSeen\(agentId, \{ kind: "board", team, agentStatus: agentStatuses\.get\(agentId\) \}\)/.test(pill));
-  assert("the agent status feeds the seen machine", /advanceSeen\(update\.agent\.id, \{ kind: "agent", status: update\.agent\.status \}\)/.test(pill));
+  assert("a poll answer does not mark anything seen", !/advanceSeen\(agentId, \{ kind: "board"/.test(pill));
+  assert(
+    "the agent status is wired as a no-op, never as a seen signal",
+    /advanceSeen\(update\.agent\.id, \{ kind: "agent", status: update\.agent\.status \}\)/.test(pill),
+  );
 }
 
 pollerChecks()

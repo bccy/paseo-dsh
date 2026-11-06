@@ -257,75 +257,45 @@ export function goalStateName(goal: GoalState, words: GoalStateWords): string {
 /* A completed goal's "seen" state (UI-v7)                                     */
 /* -------------------------------------------------------------------------- */
 
-/**
- * Per-agent progress towards "the user has moved on from this completed goal".
- *
- * - `watching`: a complete goal with this key was observed; the turn that
- *   completed it may still be running (the model writes its closing summary
- *   after `update_goal(complete)`, survey §3), so a `running` here proves
- *   nothing.
- * - `idleSeen`: the agent went idle after the completion. The **next**
- *   `running` is a new turn — the user's next message, as far as the client can
- *   tell (the plugin API has no composer-submit signal) — and marks it seen.
- */
-export interface GoalCompleteWatch {
-  readonly key: string;
-  readonly stage: "watching" | "idleSeen";
-}
-
 /** One input to {@link goalCompleteSeenStep}. */
 export type GoalCompleteEvent =
+  /** A poll answer: the goal now (null when there is none). */
+  | { readonly kind: "goal"; readonly goal: GoalState | null }
   /**
-   * A poll answer: the goal now (null when there is none), and the agent's last
-   * known status. Polls are seconds apart, so the completing turn may already
-   * have ended when "complete" is first observed; an idle agent at that moment
-   * starts the watch at `idleSeen`, or the user's next message would be missed.
+   * The agent's status, from the agent directory subscription.
+   *
+   * **Never a "seen" signal.** This used to mean "the user sent the next
+   * message" (idle, then running), which hid a completed goal the user had
+   * never opened. It is kept as an explicit no-op so the existing subscription
+   * wiring stays harmless.
    */
-  | { readonly kind: "goal"; readonly goal: GoalState | null; readonly agentStatus?: string }
-  /** The agent's status, from the agent directory subscription. */
   | { readonly kind: "agent"; readonly status: string | undefined }
-  /** The completed panel was opened and then closed. */
+  /** The completed panel was opened and then **really** closed (`./seen-close-gate`). */
   | { readonly kind: "closed"; readonly goal: GoalState | null };
 
-/** The machine's state: the remembered seen key and the watch in progress. */
+/** The machine's state: the remembered seen key. */
 export interface GoalSeenState {
   readonly seen?: string;
-  readonly watch?: GoalCompleteWatch;
 }
 
 /**
  * Advance one agent's "seen" state.
  *
- * Seen means: the panel of that completed goal was closed after being opened,
- * or a turn started after the completing turn had ended (idle, then running).
- * The completing turn's own `running → idle` only moves the watch to
- * `idleSeen`; a completion first observed while the agent is already idle
- * starts there. A goal that is no longer complete (cleared, replaced) drops the
- * watch; the remembered key stays, so the same `id:revision` cannot reappear,
- * and any new key is shown again.
+ * Seen means **only one thing**: the panel of that completed goal was opened
+ * and then really closed — the close reported by `./seen-close-gate` after its
+ * confirmation window. An agent status event (including the next turn
+ * starting, i.e. the user sending another message) never marks a goal seen: a
+ * completed pill must stay until the user has actually opened its panel. Polls
+ * never mark anything either; a new goal (new `id`) or a new mutation (new
+ * `revision`) is a new key and shows again. The remembered key is kept when
+ * the goal leaves `complete` (cleared, replaced), so the same `id:revision`
+ * cannot reappear.
  */
 export function goalCompleteSeenStep(state: GoalSeenState, event: GoalCompleteEvent): GoalSeenState {
   switch (event.kind) {
-    case "goal": {
-      const goal = event.goal;
-      if (goal === null || goal.phase !== "complete") {
-        return state.seen === undefined ? {} : { seen: state.seen };
-      }
-      const key = goalSeenKey(goal);
-      if (state.seen === key) return { seen: key };
-      if (state.watch?.key === key) return state;
-      const stage = event.agentStatus === "idle" ? "idleSeen" : "watching";
-      return { ...(state.seen === undefined ? {} : { seen: state.seen }), watch: { key, stage } };
-    }
-    case "agent": {
-      const watch = state.watch;
-      if (watch === undefined) return state;
-      if (event.status === "idle" && watch.stage === "watching") {
-        return { ...state, watch: { key: watch.key, stage: "idleSeen" } };
-      }
-      if (event.status === "running" && watch.stage === "idleSeen") return { seen: watch.key };
+    case "goal":
+    case "agent":
       return state;
-    }
     case "closed": {
       const goal = event.goal;
       if (goal === null || goal.phase !== "complete") return state;
