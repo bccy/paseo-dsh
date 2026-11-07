@@ -191,6 +191,10 @@ function startBridge(ctx, config = {}) {
     // DSH -> Paseo. Root-context registration matches how the shipped ACP
     // adapter claims `approval/request`; each listener answers only for the
     // sessions this server owns and otherwise delegates down the waterfall.
+    // Must win the waterfall before dsh-web-app's `dsh-api-remotes` listener,
+    // which is loaded earlier in the paseo profile and enqueues every
+    // `user-questions/request` for a DSH Web client. With no such client the
+    // queue never settles, so the Paseo provider would never see the question.
     const offQuestions = ctx.on('user-questions/request', (request, next) => {
       const agent = request.agent;
       if (agent === undefined) return next();
@@ -208,7 +212,7 @@ function startBridge(ctx, config = {}) {
           request.signal,
         )
         .then(normalizeAnswer);
-    });
+    }, { prepend: true });
 
     return async () => {
       offQuestions();

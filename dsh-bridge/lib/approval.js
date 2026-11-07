@@ -4,6 +4,9 @@ import { randomUUID } from 'node:crypto';
  * asked/decided, applies ask/never and normalizes outcomes. Never grant a session
  * policy here: allowed-once is the only positive decision DSH understands. */
 export function registerApprovalAnswerer(ctx, server, transport, timeoutMs = 300_000) {
+  // Prepend for the same reason as `paseo/question`: dsh-web-app's
+  // `dsh-api-remotes` is registered first in this profile and would otherwise
+  // claim approvals into its remote queue before this bridge can answer them.
   return ctx.on('approval/request', async (request, next) => {
     const sessionId = request.agent?.session?.id;
     if (sessionId === undefined || !server.owns(String(sessionId))) return next();
@@ -35,5 +38,5 @@ export function registerApprovalAnswerer(ctx, server, transport, timeoutMs = 300
       clearTimeout(timer);
       signal.removeEventListener('abort', cancel);
     }
-  });
+  }, { prepend: true });
 }
