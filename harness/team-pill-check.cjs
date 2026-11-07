@@ -532,8 +532,20 @@ console.log("\npill wiring (source pins)");
   equal("zh title", ZH.title, "团队");
   equal("en title", EN.title, "Team");
   const client = fs.readFileSync(path.join(repo, "paseo-plugin/index.client.tsx"), "utf8");
-  assert("the client registers the team pill", /contributeTeamPill\(client, deference\)/.test(client));
-  assert("the jobs and goal pills are still registered", /contributeJobsPill\(client, deference\)/.test(client) && /contributeGoalPill\(client, deference\)/.test(client));
+  assert("the client registers the team pill", /contributeTeamPill\(client\)/.test(client));
+  assert("the jobs and goal pills are still registered", /contributeJobsPill\(client\)/.test(client) && /contributeGoalPill\(client\)/.test(client));
+  // The deference coordinator was deleted on 2026-11-08: the host's composer
+  // track scrolls horizontally (host v0.15.3), so every pill shows by its own
+  // rule and nothing coordinates visibility across them.
+  assert("the team pill takes only the client", /export function contributeTeamPill\(client: PluginClientContext\)/.test(pill));
+  assert("the client entry passes no coordinator", !/deference|PillDeference|createPillDeference|pill-deference/.test(client));
+  assert("the coordinator module is gone", !fs.existsSync(path.join(repo, "paseo-plugin/client/pill-deference.ts")));
+  const clientDir = path.join(repo, "paseo-plugin/client");
+  const deferenceFiles = fs
+    .readdirSync(clientDir)
+    .filter((file) => /\.(ts|tsx)$/.test(file))
+    .filter((file) => /pill-deference|PillDeference|createPillDeference|\bdeference\b/.test(fs.readFileSync(path.join(clientDir, file), "utf8")));
+  equal("no deference reference remains in client/", deferenceFiles, []);
   // The Users glyph is never replaced; the running state is a corner ring.
   assert("every team pill icon draws the Users glyph through CornerRingIcon", (pill.match(/<CornerRingIcon name="Users"/g) ?? []).length === 3, String((pill.match(/<CornerRingIcon name="Users"/g) ?? []).length));
   assert("…only the running icon turns the ring on", /function RunningIcon[\s\S]{0,200}running theme/.test(pill) && (pill.match(/running=\{false\}/g) ?? []).length === 3);

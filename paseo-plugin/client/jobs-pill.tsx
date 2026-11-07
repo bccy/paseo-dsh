@@ -53,7 +53,6 @@ import {
 } from "./jobs-popover-layout";
 import { JobsPillIcon, JobsSpinner } from "./jobs-spinner";
 import { localeText, type JobsText } from "./locale";
-import { createPillDeference, type PillDeference } from "./pill-deference";
 
 /** One agent's latest answer, plus the listeners the popover subscribes with. */
 interface AgentJobs {
@@ -83,14 +82,10 @@ interface PillEntry {
    * actually changes, which is the one thing that guarantees the ring never stutters.
    */
   icon: PillIcon;
-  /** The latest presentation rule answer, kept for a deference repaint. */
-  presentation?: PillPresentation;
   /** What the host was last told; an unchanged recompute publishes nothing. */
   visible: boolean;
   label: string;
   title: string;
-  /** Releases this agent's deference subscription. */
-  readonly unsubscribe: () => void;
 }
 
 function publish(store: JobStore, agentId: string, next: Omit<AgentJobs, "listeners">): void {
@@ -514,10 +509,7 @@ const AGENT_DIRECTORY_PAGE_SIZE = 200;
  * see — the React store the popover reads, the composer registration, and the
  * locale.
  */
-export function contributeJobsPill(
-  client: PluginClientContext,
-  deference: PillDeference = createPillDeference(),
-) {
+export function contributeJobsPill(client: PluginClientContext) {
   const store: JobStore = new Map();
   /** agentId -> the composer registration and its last published state. */
   const pills = new Map<string, PillEntry>();
@@ -529,11 +521,10 @@ export function contributeJobsPill(
   const rpc = (input: { agentId: string }) => client.rpc(jobsList, input);
 
   /**
-   * Turn one presentation into the host update, honoring the deference gate.
+   * Turn one presentation into the host update.
    *
    * The visibility/label rule itself is {@link jobsPillPresentation}; this
-   * function only suppresses its `visible` while both the goal and the team
-   * pill are visible, turns the keys into copy and keeps the icon patch
+   * function only turns its keys into copy and keeps the icon patch
    * conditional. `title` is the neutral noun, **never the count**: on compact
    * the popover is a sheet and the sheet's header is drawn from the button's
    * title, so a title carrying the count would make this the one panel whose
@@ -548,12 +539,9 @@ export function contributeJobsPill(
     // says it is working; the popover says how many. There is no idle total:
     // the pill hides when nothing is live.
     const { label } = jobsPillCopy(presentation, text);
-    // The jobs rule itself is untouched; deference only hides the result while
-    // both blocking pills are visible.
-    const visible = presentation.visible && !deference.blocksJobs(agentId);
-    // A deference repaint arrives between polls with the same answer. Only a
-    // real change reaches the host: an identical `update` rebuilds the button
-    // and the open popover's page elements for nothing.
+    const visible = presentation.visible;
+    // Only a real change reaches the host: an identical `update` rebuilds the
+    // button and the open popover's page elements for nothing.
     if (
       entry.visible === visible &&
       entry.label === label &&
@@ -579,8 +567,7 @@ export function contributeJobsPill(
 
   /**
    * Publish one poll answer: the popover store first (its listeners redraw from
-   * it), then the registration. The answer is also kept so a deference change
-   * can repaint immediately, without waiting for the next poll.
+   * it), then the registration.
    */
   const publishState = (agentId: string, next: JobsViewState<Job>) => {
     const entry = pills.get(agentId);
@@ -591,7 +578,6 @@ export function contributeJobsPill(
       ...(next.error === undefined ? {} : { error: next.error }),
     });
     const presentation = jobsPillPresentation(next);
-    entry.presentation = presentation;
     applyPresentation(agentId, presentation);
   };
 
@@ -625,22 +611,15 @@ export function contributeJobsPill(
           behavior: { kind: "popover", Content: makeJobsPopover(store, agent.id) },
         },
       });
-      // Repaint from the last answer the moment either blocking pill changes;
-      // before the first poll there is no presentation yet, so the registration
-      // stays hidden until the poll proves something to show. The initial label
-      // is the visible noun, matching what the first presentation would send, so
-      // a hidden idle poll repaints nothing.
-      const unsubscribe = deference.subscribe(agent.id, () => {
-        const current = pills.get(agent.id);
-        if (current?.presentation !== undefined) applyPresentation(agent.id, current.presentation);
-      });
+      // The registration stays hidden until the first poll proves something to
+      // show; its initial label is the visible noun, matching what the first
+      // presentation would send, so a hidden idle poll repaints nothing.
       pills.set(agent.id, {
         registration,
         icon: "spinner",
         visible: false,
         label: text.pillLabel,
         title: text.title,
-        unsubscribe,
       });
       store.delete(agent.id);
     },
@@ -648,7 +627,6 @@ export function contributeJobsPill(
       const entry = pills.get(agentId);
       if (entry === undefined) return;
       pills.delete(agentId);
-      entry.unsubscribe();
       entry.registration.remove();
       // Dropped rather than kept: the popover must not show a stale list for an
       // agent this client may not read, or whose runtime cannot serve jobs at all.
@@ -724,10 +702,5 @@ export function contributeJobsPill(
   return () => {
     lifetime.abort();
     poller.dispose();
-    // `poller.dispose()` removes every live agent through `removeAgent`; this
-    // sweep is for an entry the controller never owned, so no subscription can
-    // outlive the contribution.
-    for (const entry of [...pills.values()]) entry.unsubscribe();
-    pills.clear();
   };
 }

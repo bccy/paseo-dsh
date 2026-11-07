@@ -725,10 +725,18 @@ console.log("\nthe goal and the jobs are two separate composer pills");
     "…only for the pill the close belongs to (a stale close is dropped)",
     /if \(pills\.get\(agent\.id\) !== registration\) return;/.test(pill),
   );
-  assert("the client entry contributes both pills on their own",
-    /contributeJobsPill\(client, deference\),/.test(index) && /contributeGoalPill\(client, deference\),/.test(index));
-  assert("…from one shared pill-deference coordinator",
-    /const deference = createPillDeference\(\)/.test(index));
+  assert("the client entry contributes the three pills on their own",
+    /contributeJobsPill\(client\),/.test(index) &&
+      /contributeGoalPill\(client\),/.test(index) &&
+      /contributeTeamPill\(client\),/.test(index));
+  assert("…with no deference reference left",
+    !/deference|PillDeference|createPillDeference|pill-deference/.test(index));
+  assert("…and the coordinator module is gone",
+    !fs.existsSync(path.join(repoRoot, "paseo-plugin/client/pill-deference.ts")));
+  assert("the goal pill takes only the client", /export function contributeGoalPill\(client: PluginClientContext\)/.test(pill));
+  assert("the jobs pill takes only the client", /export function contributeJobsPill\(client: PluginClientContext\)/.test(jobs));
+  assert("the team pill takes only the client",
+    /export function contributeTeamPill\(client: PluginClientContext\)/.test(code(readRepo("paseo-plugin/client/team-pill.tsx"))));
   // Assembled from fragments so a repo-wide grep for the withdrawn names finds
   // nothing in this file either (the pin itself is not a use).
   const gj = ["goal", "jobs"].join("-");

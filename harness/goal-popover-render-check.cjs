@@ -107,7 +107,6 @@ export { makeGoalPopover, makeGoalIcon, contributeGoalPill } from ${JSON.stringi
 export { SEEN_CLOSE_CONFIRM_MS } from ${JSON.stringify(path.join(pluginRoot, "client/seen-close-gate.ts"))};
 export { contributeJobsPill } from ${JSON.stringify(path.join(pluginRoot, "client/jobs-pill.tsx"))};
 export { contributeTeamPill } from ${JSON.stringify(path.join(pluginRoot, "client/team-pill.tsx"))};
-export { createPillDeference } from ${JSON.stringify(path.join(pluginRoot, "client/pill-deference.ts"))};
 export { CornerRingIcon } from ${JSON.stringify(path.join(pluginRoot, "client/corner-ring.tsx"))};
 export { JobsPillIcon } from ${JSON.stringify(path.join(pluginRoot, "client/jobs-spinner.tsx"))};
 export { createRoot } from "react-dom/client";
@@ -166,7 +165,6 @@ const {
   contributeGoalPill,
   contributeJobsPill,
   contributeTeamPill,
-  createPillDeference,
   CornerRingIcon,
   JobsPillIcon,
   createRoot,
@@ -986,16 +984,20 @@ async function separatePillChecks() {
   check("disposing removes both registrations", regs.map((reg) => reg.removed).join(","), "1,1");
 }
 
-/* The jobs pill defers while the goal and team pills are both visible ------ */
+/* Every pill shows on its own rule ------------------------------------------ */
 
 /**
- * The three real composer contributions over one shared `createPillDeference()`:
- * the jobs pill must hide while both the goal and the team pill are visible,
- * and must come back the moment either hides — from the coordinator's
- * synchronous repaint, not the next jobs poll.
+ * The three real composer contributions with **no coordinator between them**:
+ * the host's composer track is a horizontal ScrollView (Paseo v0.15.3,
+ * `packages/app/src/composer/tracks.tsx` `ComposerTrackBar`), so the goal and
+ * team pills being visible must not hide the jobs pill — each registration
+ * decides its own visibility from its own poll answer. The old shared
+ * visibility coordinator and its "jobs pill steps aside" rule were deleted
+ * (2026-11-08); these checks fail if it comes back or if any pill stops
+ * publishing its own rule.
  */
-async function pillDeferenceChecks() {
-  console.log("\nthe jobs pill defers while the goal and team pills are both visible");
+async function independentPillChecks() {
+  console.log("\nevery pill shows on its own rule (no cross-pill coordination)");
   const realSetTimeout = global.setTimeout;
   global.setTimeout = (callback, delayMs, ...rest) => realSetTimeout(callback, Math.ceil((delayMs ?? 0) / 100), ...rest);
   const pause = (ms) => new Promise((resolve) => realSetTimeout(resolve, ms));
@@ -1020,8 +1022,6 @@ async function pillDeferenceChecks() {
   const regs = [];
   const scene = { goal: baseGoal, goalError: null, team: board([openTask]), jobs: { available: true, jobs: [runningJob] } };
   let jobsReads = 0;
-  let holdJobs = false;
-  let releaseJobs = null;
   const agent = { id: "agent-1", workspaceId: "w", status: "idle" };
   const client = {
     rpc: async (definition) => {
@@ -1032,7 +1032,6 @@ async function pillDeferenceChecks() {
       if (definition.name === "team.read") return { available: true, team: scene.team };
       if (definition.name === "jobs.list") {
         jobsReads += 1;
-        if (holdJobs) await new Promise((resolve) => { releaseJobs = resolve; });
         return scene.jobs;
       }
       return { ok: true, message: "ok" };
@@ -1055,37 +1054,14 @@ async function pillDeferenceChecks() {
       },
     },
   };
-  const deference = createPillDeference();
-  const cleanups = [
-    contributeJobsPill(client, deference),
-    contributeGoalPill(client, deference),
-    contributeTeamPill(client, deference),
-  ];
+  // No third argument: the contributions take the client alone.
+  const cleanups = [contributeJobsPill(client), contributeGoalPill(client), contributeTeamPill(client)];
   const byId = (id) => regs.filter((reg) => reg.contribution.id === id);
   const one = (id) => byId(id)[0];
   const merged = (reg) => {
     const out = { ...reg.contribution.button };
     for (const patch of reg.updates) Object.assign(out, patch);
     return out;
-  };
-  /**
-   * Park the jobs poller in one in-flight read, so a later visibility change can
-   * only reach the registration through the coordinator. Returns the read count
-   * at the freeze point.
-   */
-  const freezeJobsPoller = async () => {
-    const before = jobsReads;
-    holdJobs = true;
-    await until(() => jobsReads > before);
-    holdJobs = false;
-    check("the jobs poller is parked in one in-flight read", jobsReads, before + 1);
-    return jobsReads;
-  };
-  const thawJobsPoller = async () => {
-    const release = releaseJobs;
-    releaseJobs = null;
-    if (release !== null) release();
-    await pause(30);
   };
   try {
     await until(() => {
@@ -1099,7 +1075,7 @@ async function pillDeferenceChecks() {
         merged(goalReg).visible === true &&
         merged(teamReg).visible === true &&
         jobsReg.updates.length > 0 &&
-        merged(jobsReg).visible === false
+        merged(jobsReg).visible === true
       );
     });
     const goalReg = one("dsh-goal");
@@ -1110,84 +1086,54 @@ async function pillDeferenceChecks() {
     check("…one per pill", ["dsh-goal", "dsh-team", "dsh-jobs"].map((id) => byId(id).length).join(","), "1,1,1");
     check("goal + team both visible: the goal pill is visible", merged(goalReg).visible, true);
     check("…the team pill is visible", merged(teamReg).visible, true);
-    check("…and the jobs pill is hidden by deference", merged(jobsReg).visible, false);
+    // The rule this section exists for: no coordination — the jobs pill keeps
+    // its own answer (a running registry is visible) beside the other two.
+    check("…and the jobs pill stays visible on its own live rule", merged(jobsReg).visible, true);
     check("…while it still owns its popover registration", jobsReg.contribution.button.behavior.kind, "popover");
 
-    // Team hides: the coordinator repaints the jobs pill before the next jobs
-    // poll (the poller is parked in an in-flight read).
-    const readsBeforeTeamHide = await freezeJobsPoller();
+    // The hide→show transition through the real contribution (the assertion the
+    // deference cleanup once dropped): an empty board makes the team pill hide
+    // on its own rule, and the other two pills are untouched.
     scene.team = board([]);
     await until(() => merged(teamReg).visible === false);
-    check("the team pill hides when its board loses its last task", merged(teamReg).visible, false);
-    check("…the jobs pill recovers immediately", merged(jobsReg).visible, true);
-    check("…without a jobs read (no next poll)", jobsReads, readsBeforeTeamHide);
-    await thawJobsPoller();
-
-    // Dedup (P3 review): a deference notification whose recomputed presentation
-    // is identical must not repaint the registration. The team is already
-    // hidden here, so the goal hiding/returning changes only the coordinator —
-    // the jobs pill's own running answer stays visible throughout.
-    const updatesBeforeUnchangedRepaint = jobsReg.updates.length;
-    const readsBeforeUnchangedRepaint = await freezeJobsPoller();
-    scene.goal = null;
-    await until(() => merged(goalReg).visible === false);
-    check("a deference repaint with the same presentation does not update the jobs pill",
-      jobsReg.updates.length, updatesBeforeUnchangedRepaint);
-    check("…the jobs pill stays visible on its own rule", merged(jobsReg).visible, true);
-    scene.goal = baseGoal;
-    await until(() => merged(goalReg).visible === true);
-    check("…and the goal returning stays deduped too",
-      jobsReg.updates.length, updatesBeforeUnchangedRepaint);
-    check("…still without a jobs read", jobsReads, readsBeforeUnchangedRepaint);
-    await thawJobsPoller();
-
-    // Team comes back: the block returns.
+    check("an empty team board hides the team pill (own rule)", merged(teamReg).visible, false);
+    check("…the jobs pill stays visible on its own live rule", merged(jobsReg).visible, true);
+    check("…and the goal pill is unaffected", merged(goalReg).visible, true);
+    // Restore the board; the team pill follows its own rule back to visible.
     scene.team = board([openTask]);
-    await until(() => merged(teamReg).visible === true && merged(jobsReg).visible === false);
-    check("the team pill returning hides the jobs pill again", merged(jobsReg).visible, false);
+    await until(() => merged(teamReg).visible === true);
 
-    // Goal hides while the team is visible: recovery from the other side.
-    const readsBeforeGoalHide = await freezeJobsPoller();
-    scene.goal = null;
-    await until(() => merged(goalReg).visible === false);
-    check("the goal pill hides when its goal clears", merged(goalReg).visible, false);
-    check("…the jobs pill recovers immediately", merged(jobsReg).visible, true);
-    check("…again without a jobs read", jobsReads, readsBeforeGoalHide);
-    await thawJobsPoller();
-
-    // The jobs rule itself is untouched: settled still hides with both blockers off.
+    // The jobs answer is the only thing that changes its visibility: a settled
+    // registry hides it even while the goal and team pills stay visible.
     scene.jobs = { available: true, jobs: [{ ...runningJob, status: "completed" }] };
     await until(() => merged(jobsReg).visible === false);
-    check("a settled registry still hides the jobs pill (own rule)", merged(jobsReg).visible, false);
+    check("a settled registry hides the jobs pill (own rule, other pills visible)", merged(jobsReg).visible, false);
+    check("…while the goal pill stays visible", merged(goalReg).visible, true);
+    check("…and the team pill stays visible", merged(teamReg).visible, true);
 
-    // An unreadable registry is visible on the jobs rule while nothing blocks it…
+    // An unreadable registry is visible on the jobs rule, other pills present or not.
     scene.jobs = { available: false, jobs: [], error: "registry offline" };
     await until(() => merged(jobsReg).visible === true && merged(jobsReg).icon === "SquareTerminal");
-    check("an unreadable registry shows the jobs pill while unblocked", merged(jobsReg).visible, true);
+    check("an unreadable registry shows the jobs pill beside both other pills", merged(jobsReg).visible, true);
     check("…with the static terminal glyph", merged(jobsReg).icon, "SquareTerminal");
 
-    // …but deference still suppresses it when both blocking pills are visible.
-    scene.goal = baseGoal;
-    scene.team = board([openTask]);
-    await until(() => merged(goalReg).visible === true && merged(teamReg).visible === true && merged(jobsReg).visible === false);
-    check("goal + team visible: an unreadable registry stays hidden", merged(jobsReg).visible, false);
-    check("…its own rule still selects the static mark", merged(jobsReg).icon, "SquareTerminal");
-
-    // Forget wiring (P2 review): one pill disappearing while the other stays
-    // visible must clear its side of the coordinator and bring the jobs pill
-    // back immediately — here through the goal RPC's terminal error, which
-    // removes the goal pill without a new jobs poll.
+    // Dedup survives without a coordinator: an unchanged jobs answer does not
+    // repaint the registration on the next polls.
     scene.jobs = { available: true, jobs: [runningJob] };
-    await until(() => merged(jobsReg).icon === JobsPillIcon && merged(jobsReg).visible === false);
-    check("a running registry is hidden again while both pills are visible", merged(jobsReg).visible, false);
-    const readsBeforeGoalRemoval = await freezeJobsPoller();
+    await until(() => merged(jobsReg).icon === JobsPillIcon && merged(jobsReg).visible === true);
+    const updatesBeforeDedup = jobsReg.updates.length;
+    const readsBeforeDedup = jobsReads;
+    await until(() => jobsReads > readsBeforeDedup + 1);
+    check("an unchanged jobs answer does not repaint (dedup without a coordinator)",
+      jobsReg.updates.length, updatesBeforeDedup);
+
+    // Each pill's own state machine still drives its removal: a terminal goal
+    // error removes the goal pill alone; the other two are untouched.
     scene.goalError = { available: false, goal: null, error: { message: "bridge too old", code: "bridge_too_old" } };
-    await until(() => goalReg.removed === 1 && merged(jobsReg).visible === true);
+    await until(() => goalReg.removed === 1);
     check("a terminal goal error removes the goal pill", goalReg.removed, 1);
     check("…the team pill stays visible", merged(teamReg).visible, true);
-    check("…and the jobs pill recovers from the forgotten side immediately", merged(jobsReg).visible, true);
-    check("…without a jobs read (no next poll)", jobsReads, readsBeforeGoalRemoval);
-    await thawJobsPoller();
+    check("…and the jobs pill stays visible on its own rule", merged(jobsReg).visible, true);
   } finally {
     for (const cleanup of cleanups) cleanup();
     global.setTimeout = realSetTimeout;
@@ -1195,10 +1141,8 @@ async function pillDeferenceChecks() {
   check("every pill is removed exactly once (goal by its terminal error, the other two by cleanup)",
     ["dsh-goal", "dsh-team", "dsh-jobs"].map((id) => one(id).removed).join(","), "1,1,1");
   const updatesAfterCleanup = regs.reduce((total, reg) => total + reg.updates.length, 0);
-  deference.report("goal", "agent-1", true);
-  deference.report("team", "agent-1", true);
+  await pause(30);
   check("no update escapes after cleanup", regs.reduce((total, reg) => total + reg.updates.length, 0), updatesAfterCleanup);
-  deference.dispose();
 }
 
 function iconChecks() {
@@ -1295,7 +1239,7 @@ function iconChecks() {
 armChecks
   .then(() => containerChecks())
   .then(() => separatePillChecks())
-  .then(() => pillDeferenceChecks())
+  .then(() => independentPillChecks())
   .then(() => iconChecks())
   .catch((error) => {
     failures += 1;

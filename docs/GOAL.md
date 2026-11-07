@@ -83,9 +83,10 @@ Paseo 0.14.0。
 
 目标 pill 注册在 composer（`client.addComposerPill`，独立 id **`dsh-goal`**，与 jobs pill（id `dsh-jobs`）并列，
 各有各的面板。**jobs pill 自身的可见性规则不变**：只在有 running/stopping 任务时可见、跑完即隐藏（registry 读不到时
-仍显示，以便面板说明原因），由 `jobsPillPresentation` 判定。额外的退避：同一 agent 的**目标 pill 与团队 pill
-同时可见**时，后台 pill 隐藏（`client/pill-deference.ts` 的 `blocksJobs`）；任一不可见后，若后台自身规则应显示
-则**立即恢复**，不等下一次 jobs 轮询。后台任务照常运行，退避只影响 `visible`。jobs pill 的文字在所有可见状态下恒为「后台」/
+仍显示，以便面板说明原因），由 `jobsPillPresentation` 判定。**没有跨 pill 的可见性协调**（旧的 `client/pill-deference.ts`
+已于 2026-11-08 删除）：Paseo ≥0.15.3 的 composer pill 轨道可横向滚动（宿主 `packages/app/src/composer/tracks.tsx`），
+目标、团队、后台 pill 各自按自身规则显示；老宿主（<0.15.3）不滚动时第三颗 pill 可能被裁切（已知限制）。
+jobs pill 的文字在所有可见状态下恒为「后台」/
 「Background」（`jobs.pillLabel` 经 `jobsPillCopy`，2026-11-05 用户决定：不带数量、不带状态词，数量看面板），
 title 仍是「后台任务」；图标是 `SquareTerminal`，运行中右下角叠转环（`JobsPillIcon`），registry 读不到时是静态
 `SquareTerminal`。

@@ -478,8 +478,12 @@ assert("no dead fallback for an unreachable empty split",
 // absent. `jobs-poll-check.cjs` asserts the rule's behaviour.
 assert("the pill's presentation comes from the shared rule",
   /const\s+presentation\s*=\s*jobsPillPresentation\(next\)/.test(pillSource));
-assert("visibility is that rule gated by the pill deference",
-  /const\s+visible\s*=\s*presentation\.visible\s*&&\s*!deference\.blocksJobs\(agentId\)/.test(pillSource));
+// 2026-11-08: the cross-pill deference gate was deleted once the host's composer
+// track became a horizontal ScrollView (host v0.15.3); the pill's visibility is
+// its own rule again, and its update still sends it unchanged.
+assert("visibility is the presentation rule, with no cross-pill gate",
+  /const\s+visible\s*=\s*presentation\.visible;/.test(pillSource));
+assert("the pill has no deference wiring left", !/deference|pill-deference/.test(pillSource));
 assert("the update sends the gated visibility", /registration\.update\(\{\s*visible,\s*label,\s*title:\s*text\.title,\s*\.\.\.iconPatch\s*\}\)/.test(pillSource));
 // User decision 2026-11-05: the trigger's label is the bare noun in every
 // state (`jobsPillCopy`, asserted in jobs-poll-check); no count reaches it.
@@ -544,6 +548,8 @@ for (const [what, error] of [
 
 const hostApp = process.env.HOST_APP;
 const hostMissing = !hostApp;
+/** Set when the host source tree cannot be loaded: INCOMPLETE (exit 2), never a crash. */
+let hostUnreadable = false;
 if (hostApp === undefined || hostApp === "") {
   console.log(
     "\nhost half SKIPPED (HOST_APP unset) — this is not a pass; the plugin's\n" +
@@ -551,6 +557,11 @@ if (hostApp === undefined || hostApp === "") {
   );
 } else {
   console.log(`\nhost constants from ${hostApp}`);
+  // A missing/moved host file, or a new host module dependency the stub below
+  // does not cover, must read as INCOMPLETE (exit 2 — the same verdict as an
+  // unset HOST_APP), not as an uncaught throw (exit 1) that looks like a crash of
+  // the check itself. Only this error handling changed on 2026-11-08.
+  try {
   const read = (relative) => shape.codeOnly(fs.readFileSync(path.join(hostApp, relative), "utf8"));
 
   // Run host data; stubs affect fonts/highlighting only, never surfaces or status colours.
@@ -746,12 +757,22 @@ if (hostApp === undefined || hostApp === "") {
     "the refusal message still reads `Session is not authorized for <type>`",
     /error:\s*`Session is not authorized for \$\{msg\.type\}`/.test(serverSession),
   );
+  } catch (error) {
+    console.log(
+      `\nhost half INCOMPLETE — could not load the host source tree: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    hostUnreadable = true;
+  }
 }
 
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures > 0) {
   console.error(`${failures} FAILED`);
   process.exit(1);
+}
+if (hostUnreadable) {
+  console.error("INCOMPLETE: the host source tree could not be loaded; host parity is unverified");
+  process.exit(2);
 }
 if (hostMissing) {
   console.error("INCOMPLETE: set HOST_APP to verify host parity");

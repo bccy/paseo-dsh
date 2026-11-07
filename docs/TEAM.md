@@ -48,8 +48,8 @@ DSH 的 `dsh-experimental-agent-team` 给 Lead 会话一个团队：队员（各
   pill 给 `minWidth: 42`，或内容居中）。
 - **图标**：常规画 `Users`（`CornerRingIcon`）：有队员 `running === true` → 灰色 `Users` 右下角叠运行环；`failure` 或有成员创建失败 → 红色 `Users`；否则灰色 `Users`。**全部任务 `completed` → 绿色 `CircleCheck`（`statusSuccess`，与目标 pill 完成态同一标记；2026-11-06 用户决策）**，优先级 `failed`（红）> `complete`（绿）> `running`（环）> `idle`（灰）；无任务不读成 complete（此时 pill 本来就隐藏）。
   图标只在状态变化时 `update`，运行环不会每次轮询重启（jobs pill 的做法）。
-- **后台 pill 让位**：同一 agent 的**目标 pill 与团队 pill 同时可见**时，后台（jobs）pill 隐藏（`client/pill-deference.ts` 的 `blocksJobs`）；任一不可见后，若后台自身规则应显示则**立即恢复**，不等下一次 jobs 轮询。后台任务本身照常运行，退避只影响 `visible`。
-- 轮询复用 `client/agent-polling.ts`（4s、抖动、退避到 30s、答案去重），**未改它**；jobs / goal pill 自身可见性不变（后台 pill 仅在同 agent 目标+团队同时可见时退避）。
+- **各 pill 独立显示**：Paseo 0.15.3 起 composer 的 pill 轨道是横向滚动条（宿主 `packages/app/src/composer/tracks.tsx` 的 `ComposerTrackBar` → 横向 `ScrollView`），三颗 pill 可以同屏左右滑动浏览，所以**没有跨 pill 的可见性协调**（2026-11-06 定的「目标+团队同时可见时后台 pill 隐藏」与 `client/pill-deference.ts` 已于 2026-11-08 一并删除）：目标、团队、后台各按自身规则决定 `visible`。老宿主（<0.15.3）轨道不滚动，第三颗 pill 可能被裁切，这是已知限制，不用隐藏规则规避。
+- 轮询复用 `client/agent-polling.ts`（4s、抖动、退避到 30s、答案去重），**未改它**；三颗 pill 的 `visible` 互不影响。
 
 ## 面板（设计 T2 方向 B）
 

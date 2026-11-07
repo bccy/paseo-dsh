@@ -73,7 +73,6 @@ import {
 } from "./goal-polling";
 import { FACTS_FONT_SIZE } from "./jobs-popover-layout";
 import { localeText } from "./locale";
-import { createPillDeference, type PillDeference } from "./pill-deference";
 import { createSeenCloseGate } from "./seen-close-gate";
 import { createSeenPersistence } from "./seen-persistence";
 
@@ -386,10 +385,7 @@ const AGENT_DIRECTORY_PAGE_SIZE = 200;
  * see — the React store the popover reads, the composer registration, and the
  * locale.
  */
-export function contributeGoalPill(
-  client: PluginClientContext,
-  deference: PillDeference = createPillDeference(),
-) {
+export function contributeGoalPill(client: PluginClientContext) {
   const store: GoalStore = new Map();
   /** agentId -> the composer registration. */
   const pills = new Map<string, PluginButtonRegistration>();
@@ -459,10 +455,6 @@ export function contributeGoalPill(
       ...(seen === undefined ? {} : { seen }),
     });
     const presentation = goalPillPresentation(next, seen);
-    // Report the final visibility so the jobs pill can defer while both this
-    // pill and the team pill are visible; the report is a no-op unless it
-    // changed, and the host update below stays deduped as before.
-    deference.report("goal", agentId, presentation.visible);
     const text = localeText().goal;
     // The label and the title are the noun in every state (UI-v7): the title is
     // also the phone sheet's header, which must read 「目标」. The state is the
@@ -521,7 +513,6 @@ export function contributeGoalPill(
       return { entries: page.entries, pageInfo: page.pageInfo };
     },
     addAgent: (agent) => {
-      deference.forget("goal", agent.id);
       const text = localeText().goal;
       const registration = client.addComposerPill({
         id: "dsh-goal",
@@ -566,7 +557,6 @@ export function contributeGoalPill(
       const entry = pills.get(agentId);
       if (entry === undefined) return;
       pills.delete(agentId);
-      deference.forget("goal", agentId);
       entry.remove();
       answers.delete(agentId);
       published.delete(agentId);

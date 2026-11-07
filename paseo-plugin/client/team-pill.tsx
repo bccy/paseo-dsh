@@ -40,7 +40,6 @@ import { teamRead, type TeamView } from "../shared/team";
 import { TEAM_SEEN_SETTINGS_ID } from "../shared/team-seen-settings";
 import { localeText } from "./locale";
 import { CornerRingIcon } from "./corner-ring";
-import { createPillDeference, type PillDeference } from "./pill-deference";
 import { createSeenCloseGate } from "./seen-close-gate";
 import { createSeenPersistence } from "./seen-persistence";
 import {
@@ -161,10 +160,7 @@ interface PillEntry {
 }
 
 /** Register one team pill per agent of this provider and keep it current. Returns the cleanup. */
-export function contributeTeamPill(
-  client: PluginClientContext,
-  deference: PillDeference = createPillDeference(),
-) {
+export function contributeTeamPill(client: PluginClientContext) {
   const store: TeamStore = new Map();
   const pills = new Map<string, PillEntry>();
   /**
@@ -228,9 +224,6 @@ export function contributeTeamPill(
     const seen = seenStates.get(agentId)?.seen ?? persistence.get(agentId);
     const text = localeText().team;
     const visible = teamPillVisible(team, seen);
-    // Report the final visibility so the jobs pill can defer while both this
-    // pill and the goal pill are visible; the coordinator dedupes the change.
-    deference.report("team", agentId, visible);
     const icon = team === null ? "idle" : teamPillIcon(team);
     if (entry.visible === visible && entry.icon === icon && entry.label === text.title && entry.title === text.title) {
       return;
@@ -267,7 +260,6 @@ export function contributeTeamPill(
       return { entries: page.entries, pageInfo: page.pageInfo };
     },
     addAgent: (agent) => {
-      deference.forget("team", agent.id);
       const text = localeText().team;
       const registration = client.addComposerPill({
         id: "dsh-team",
@@ -301,7 +293,6 @@ export function contributeTeamPill(
       const entry = pills.get(agentId);
       if (entry === undefined) return;
       pills.delete(agentId);
-      deference.forget("team", agentId);
       entry.registration.remove();
       seenStates.delete(agentId);
       // Session-only: the persisted fallback must not hide a board for an agent

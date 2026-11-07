@@ -20,7 +20,6 @@ import { z } from "zod";
 import { contributeGoalPill } from "./client/goal-pill";
 import { InlineThinking } from "./client/inline-thinking";
 import { contributeJobsPill } from "./client/jobs-pill";
-import { createPillDeference } from "./client/pill-deference";
 import { contributeStreamStats } from "./client/stream-stats";
 import { contributeTeamPill } from "./client/team-pill";
 import { localeFromMetadata, setLocale } from "./client/locale";
@@ -296,14 +295,14 @@ export default function contribute(client: PluginClientContext) {
   // a live counter that hides when nothing runs, while a goal has to stay visible
   // (and controllable) exactly when it is *not* running — paused, blocked, or
   // active but disarmed after a reopen. One button cannot carry both meanings.
-  // The team pill is the third. All three share one coordinator so the jobs pill
-  // can defer while both the goal and the team pill are visible for an agent.
-  const deference = createPillDeference();
+  // The team pill is the third. The composer track scrolls horizontally
+  // (host v0.15.3), so all three may be visible together and each decides its
+  // own visibility — no cross-pill coordination.
   const cleanups = [
     contributeStreamStats(client),
-    contributeJobsPill(client, deference),
-    contributeGoalPill(client, deference),
-    contributeTeamPill(client, deference),
+    contributeJobsPill(client),
+    contributeGoalPill(client),
+    contributeTeamPill(client),
   ];
 
   // The live witness behind the capsule: a per-agent timeline subscription
@@ -325,9 +324,7 @@ export default function contribute(client: PluginClientContext) {
   // The jobs pill registers one pill and one poll timer per agent, so its
   // cleanup is the one that actually does work today; running them in order
   // keeps the renderer teardown ahead of it if that ever starts to matter.
-  // The coordinator is released last, after every pill has stopped reporting.
   return () => {
     for (const cleanup of cleanups) cleanup();
-    deference.dispose();
   };
 }
