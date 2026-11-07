@@ -93,6 +93,16 @@
     `toolMapping` 及其后的 L2 段、`client/tool-call.tsx` 的 `ToolFieldsView`、`client/locale.ts`
     的 `toolCards` 表或 `index.client.tsx` 的 dsh-tool schema 必跑；动了 `locale.ts` 还要跑
     `locale-check`。**
+    - 2026-11-07 再补 17 个工具（`memory_update` / `memory_migrate_relation` /
+      `memory_reproject`、`plugin_manager`、`schedule_edit` / `schedule_view`、`remote_*` 11 个）
+      的 L2 卡：每个 mapper 先校验输入必填字段，形状不符一律返回 null 退回 L1；memory 三个按
+      `dsh-prime-memory` 的 render 默认中文句严格整句解析出回执（notice / 自定义句 / 任何不匹配
+      都回落 L1），`plugin_manager` 按 `withNextStep` 的 `application` 出回执、list 的 entries
+      逐项可见且 copyText 完整，`schedule_view/edit` 按 `TASK_SCHEMA` / `EDIT_OUTPUT_SCHEMA`
+      出任务字段，`remote_*` 没有真实 `tool/call` 样本，只做输入侧 + description 明示的 receipt
+      字段（`sessionId` / `localPath`+`bytes` / `path`+`bytes` / `accepted` / `operationId`），
+      其余结果留给 L1。memory 成功卡把 render 句作为回执并清空 body（不重复显示），copyText
+      保留原句；每个工具至少一条正常 + 一条形状不符断言，断言 603 → **732**。
 - `harness/thinking-check.cjs` — 思考行折叠预览：结束后取**第一行**、运行中取最后一个首行已终结
   的段落（都是 DSH 的行为，逐字移植在 `client/thinking-text.ts`），以及折叠行在流式中的宽度
   接线（行测自己的宽度、标签测自己要减掉的那段、行宽由两者相减得出，`useRevealedText` 不许
@@ -135,7 +145,7 @@
   编辑页 `goal.editor` 表键齐全、键名（Esc/Enter/Shift Enter）两语一致、其余词中英不互抄，且 goal 的
   label/按钮/提示文案中英两列都不得为空或互为复制；完成态四键（`complete`「目标已完成」、`completeHint` 指向收尾消息、
   `completeClearHint`「清除后 /goal 将查不到这个目标，无法撤销」且不同于 active 的确认句、`rowLabel` 状态在前）；**控制错误中文表**（DSH/插件拒绝句逐句译文、英文原样、显示保留原文；未知句与未知变量不翻；
-  读本机 `dsh-command-goal/lib/index.js` 的错误字面量逐条确认都有中文，找不到时打印 NOTE，`DSH_COMMAND_GOAL` 可覆盖路径）（实跑 661 条，含团队段，见文末「团队（team）链」）。**动了 `client/locale.ts`、标签表或
+  读本机 `dsh-command-goal/lib/index.js` 的错误字面量逐条确认都有中文，找不到时打印 NOTE，`DSH_COMMAND_GOAL` 可覆盖路径）（实跑 762 条，含团队段与 2026-11-07 的 17 工具标签/图标段，见文末「团队（team）链」）。**动了 `client/locale.ts`、标签表或
   `shared/goal.ts` 的 phase 枚举必跑。**
 - `harness/jobs-poll-check.cjs` — jobs 轮询状态机（假时钟 + 假 RPC + 假目录页，不 import
   React/host）：可见性（有 live 显示 live 数、无 live 隐藏；图标恒为转环，仅 `available:false`
@@ -801,7 +811,7 @@
 - `harness/tool-call-check.cjs` 团队段（399 → **443**）：`team_task_get/create/update/list` 字段卡、update 动作词（未知原样）、
   list 计数与筛选词、`nextCursor`；**任何形状不符都保留原始 JSON**（非 JSON、多键、少键、deleted、列表坏项、列表多键）；
   失败行不画卡，已知 DSH 原文中文进 `errorShort`/`errorHint`、原文保留在 `error`，未知句不翻、非团队工具不过团队表、英文不翻。
-- `harness/locale-check.cjs` 团队段（505 → **661**，L2 的 `toolCards` 段再 +46 → **707**，2026-11-05 jobs 表：+`pillLabel` 3 条、删 `liveLabel` 并断言其不存在，净 −1 → **706**）：`team` 表中英键一致、非空、不互抄；成员词与分组词逐字；未知成员词不是运行中/空闲；`toolCards` 同口径（字符串叶子键集/非空/不互抄、6 个 formatter 键一致且中英不同、状态词与回执句逐字）；
+- `harness/locale-check.cjs` 团队段（505 → **661**，L2 的 `toolCards` 段再 +46 → **707**，2026-11-05 jobs 表：+`pillLabel` 3 条、删 `liveLabel` 并断言其不存在，净 −1 → **706**；2026-11-07 当前 **762**）：`team` 表中英键一致、非空、不互抄；成员词与分组词逐字；未知成员词不是运行中/空闲；`toolCards` 同口径（字符串叶子键集/非空/不互抄、6 个 formatter 键一致且中英不同、状态词与回执句逐字）；
   拒绝句译文表（含 `Error:` 前缀、未知原样）；**读本机 `dsh-experimental-agent-team/lib/index.js` 的每个 `TeamError` 字面量，实例化变量后确认都有中文**
   （找不到包时 NOTE，`DSH_AGENT_TEAM` 可覆盖路径）。
 

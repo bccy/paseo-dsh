@@ -158,7 +158,92 @@ cd .dbg-lc && node locale-check.cjs
    新增的名字按 §1.3 的方法判断缺哪一半；
 3. 补 `locale.ts`（中英）与 `tool-call-data.ts`（图标：先在宿主 bundle 里 grep 确认 lucide 名存在，
    再确认不与同家族重复）；
-4. 更新 harness 里的名单与两个计数（136 / 25）以及本文 §2/§3 的表格。
+4. 更新 harness 里的名单与两个计数（153 / 25）以及本文 §2/§3 的表格。
 
 > 注：快照是**机器/版本相关**的。它故意写死计数，所以上游增删工具时 harness 会报红，
 > 提醒你重新采集而不是假装没变化。
+
+## 6. 2026-11-07：17 个工具行补齐（标签 / 图标 / L2）
+
+### 6.1 缺口
+
+上一轮（§2）之后新增或漏掉的 17 个工具，仍以 wire name + 扳手出现在时间流：
+
+`memory_update`、`memory_migrate_relation`、`memory_reproject`、`plugin_manager`、
+`remote_create_session`、`remote_download_file`、`remote_get_operation`、
+`remote_interrupt_session`、`remote_list_hosts`、`remote_list_sessions`、
+`remote_list_workspaces`、`remote_read_session`、`remote_send_message`、
+`remote_upload_file`、`remote_wait_sessions`、`schedule_edit`、`schedule_view`。
+
+`harness/locale-check.cjs` 的 `MOUNTED_TOOLS` 快照 136 → **153**；memory 家族 19 → **22**
+（新增三个写工具，图标两两不同）。
+
+### 6.2 来源（逐个工具的 schema 依据）
+
+- `memory_update` / `memory_reproject` / `memory_migrate_relation`：
+  `~/.dsh/profiles/paseo/node_modules/dsh-prime-memory/dist/tools/index.js` —
+  输出 schema 分别为 `memory_update` :984 `{id, retired_id, notice}`、`memory_reproject` :1185
+  `{queued, job_ids, skipped_ids, notice}`、`memory_migrate_relation` :1247
+  `{carrier_id, edge_ids, closed_edge_ids, queued, notice}`。**但 Paseo 只拿得到 render 的
+  默认中文句**（memory 工具没有 `presentationMeta`，`detail.output` 是 `message.content` 文本）：
+  `memory_update` :1004-1006 `已修订记忆,新版本 <id>(旧版 <retired_id> 已退场可恢复)`；
+  `memory_reproject` :1207-1213 `已入队 <queued> 个重投作业` /
+  `已入队 <queued> 个重投作业(跳过不存在 <n> 条)`；`memory_migrate_relation` :1275-1282
+  `关系已迁移:<closed> 条旧边闭合,<edge> 条新边 active;源记录 <carrier_id>`。
+  L2 按这些默认句严格整句匹配（允许首尾空白），notice / 自定义句 / 任何不匹配一律回落 L1。
+- `plugin_manager`：`~/.npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-plugin-manager/lib/types/tools.js:75`
+  —— 输出是 JSON 字符串；`list_*` 返回 `{entries, total, nextOffset}`（L2 把 entries **逐项**
+  作为可见条目、顺序不变、整对象显示，`copyText` 保留完整原始 JSON），`set/install/remove/
+  set_version_exemption` 返回 `withNextStep` 的 `{application, ...}` 结果；`list_version_exemptions`
+  按记录自身键拆条目并保留完整 `copyText`。
+- `schedule_edit` / `schedule_view`：
+  `~/.npm-global/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-tool-schedule/lib/index.js:594` / `:611`；
+  `TASK_SCHEMA` :137、`VIEW_OUTPUT_SCHEMA` :364、`EDIT_OUTPUT_SCHEMA` :369、`renderValue` :406
+  （输出一律 `JSON.stringify` 字符串；`delete` → `{id, deleted: true}`，view → task 或
+  `{id, code:"schedule_not_found"}`）。
+- `remote_*`（11 个）：本机真实 `request/header`（会话 `ad42f205-d676-4a21-8674-40885f9152b8`
+  seq 17，87 个工具）带有这 11 个工具的完整 `name` / `description` / `parameters`；扫描
+  本机 1996 个 `session.v4.jsonl.zstd` 中没有任何 `tool/call` 使用它们（0 次调用），所以没有
+  输出样本。L2 只做输入侧 + `description` 明示的 receipt 字段（`sessionId`、`localPath`+
+  `bytes`、`path`+`bytes`、`accepted`、`operationId`），其余结果留给 L1，不猜列表/历史形状。
+
+### 6.3 图标（均已在宿主 web bundle 的 lucide-react 导出表核验）
+
+核验命令（同 §3）：`grep -o ',"<Name>",{enumerable:!0,get:' <web-ui>/index-*.js`。
+
+| 工具名 | 中文 | English | 图标 |
+|--------|------|---------|------|
+| `memory_update` | 修订记忆 | Update memory | `FilePenLine` |
+| `memory_migrate_relation` | 迁移记忆关系 | Migrate memory relation | `ArrowRightLeft` |
+| `memory_reproject` | 重建记忆投影 | Rebuild memory projection | `RefreshCcw` |
+| `plugin_manager` | 管理插件 | Manage plugins | `Puzzle` |
+| `schedule_edit` | 修改定时任务 | Edit scheduled task | `CalendarCog` |
+| `schedule_view` | 查看定时任务详情 | View scheduled task | `CalendarSearch` |
+| `remote_list_hosts` | 列出远程主机 | List remote hosts | `Cloud` |
+| `remote_list_workspaces` | 列出远程工作区 | List remote workspaces | `Folders` |
+| `remote_list_sessions` | 列出远程会话 | List remote sessions | `ListTree` |
+| `remote_read_session` | 读取远程会话 | Read remote session | `FileSearch` |
+| `remote_create_session` | 创建远程会话 | Create remote session | `MessageSquarePlus` |
+| `remote_send_message` | 发送远程消息 | Send remote message | `Send` |
+| `remote_interrupt_session` | 中断远程会话 | Interrupt remote session | `Ban` |
+| `remote_wait_sessions` | 等待远程会话 | Wait for remote sessions | `Clock` |
+| `remote_download_file` | 下载远程文件 | Download remote file | `Download` |
+| `remote_upload_file` | 上传远程文件 | Upload remote file | `Upload` |
+| `remote_get_operation` | 查看远程操作回执 | Read remote operation | `FileCheck` |
+
+### 6.4 断言与检查（2026-11-07 实跑）
+
+| 检查 | 结果 |
+|------|------|
+| `cd paseo-plugin && npx tsc --noEmit` | exit 0 |
+| `harness/locale-check.cjs`（plugin-build 目录） | **762 passed / 0 failed**（原 706；MOUNTED_TOOLS 153、memory 22） |
+| `harness/tool-call-check.cjs`（plugin-build 目录） | **732 passed / 0 failed**（原 603；17 个 mapper 各有正常 + 形状不符断言；memory 成功卡 body 清空、copyText 保留原句） |
+
+### 6.5 未覆盖 / 未验证
+
+1. `remote_list_hosts` / `remote_list_workspaces` / `remote_list_sessions` / `remote_read_session`
+   / `remote_wait_sessions` 只做输入侧行头与参数，不解析列表/历史/等待结果（无实据）。
+2. `remote_get_operation` 只在输出对象含 `operationId` 时出卡，其余回落 L1。
+3. `memory_*` 的 L2 已按真实 `render` 默认中文句（而非 JSON 对象）解析；`notice`、自定义句与
+   非匹配形状回落 L1。仍未做真机回合验证（任务禁止重启 daemon / 跑真实模型回合）。
+4. 未做真机 UI 验证（任务禁止重启 daemon / 跑真实模型回合）。

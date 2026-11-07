@@ -1038,8 +1038,31 @@ const TOOL_NAME_ICONS: Record<string, string> = {
   memory_slot_list: "List",
   memory_slot_write: "PenLine",
   memory_slot_close: "PackageCheck",
+  // 2026-11-07: the three memory tools that were still unnamed. They are the
+  // write side of the family (update/migrate/reproject), so their glyphs say
+  // "edit", "move an edge" and "project again" instead of repeating a sibling's.
+  memory_update: "FilePenLine",
+  memory_migrate_relation: "ArrowRightLeft",
+  memory_reproject: "RefreshCcw",
   conversation_search: "MessagesSquare",
   working_directory: "FolderTree",
+  // 2026-11-07: the remaining profile tools that arrived as `unknown` details
+  // and drew the wrench. `plugin_manager` (dsh-plugin-manager), the schedule
+  // edit/view pair (dsh-tool-schedule) and the Remote-host session family.
+  plugin_manager: "Puzzle",
+  schedule_edit: "CalendarCog",
+  schedule_view: "CalendarSearch",
+  remote_list_hosts: "Cloud",
+  remote_list_workspaces: "Folders",
+  remote_list_sessions: "ListTree",
+  remote_read_session: "FileSearch",
+  remote_create_session: "MessageSquarePlus",
+  remote_send_message: "Send",
+  remote_interrupt_session: "Ban",
+  remote_wait_sessions: "Clock",
+  remote_download_file: "Download",
+  remote_upload_file: "Upload",
+  remote_get_operation: "FileCheck",
 };
 
 /**
@@ -1692,6 +1715,535 @@ function runCodeCard(input: unknown, failed: boolean): ToolMapping | null {
   };
 }
 
+/* -------------------------------------------------------------------------- */
+/* The 17 rows that still printed their wire name (2026-11-07)                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A required, non-empty string field, or undefined when the payload is not the
+ * shape this tool documents. Mappers below use it to refuse a guess: every
+ * required id is checked by name and type before a card claims the row.
+ */
+function requiredString(source: Record<string, unknown>, key: string): string | undefined {
+  const value = source[key];
+  return typeof value === "string" && value !== "" ? value : undefined;
+}
+
+/** The full original output for the copy control, byte for byte. */
+function mappingCopy(output: unknown): string {
+  return typeof output === "string" ? output : stringifyValue(output, true);
+}
+
+/**
+ * `dsh-prime-memory` renders its successful result as one fixed Chinese
+ * sentence; Paseo only ever sees that `message.content` text (the tools have no
+ * `presentationMeta`), so the cards below parse the sentence, not a JSON shape.
+ * A `notice` (refusal / disabled feature / custom sentence) does not match and
+ * keeps L1, which is where the original sentence stays visible.
+ */
+const MEMORY_UPDATED_LINE = /^已修订记忆,新版本 ([^()\n]+)\(旧版 ([^()\n]+) 已退场可恢复\)$/u;
+/** `memory_reproject`'s default render sentence (`dist/tools/index.js:1207-1213`). */
+const MEMORY_REPROJECT_LINE = /^已入队 (\d+) 个重投作业(?:\(跳过不存在 (\d+) 条\))?$/u;
+/** `memory_migrate_relation`'s default render sentence (`dist/tools/index.js:1275-1282`). */
+const MEMORY_MIGRATED_LINE = /^关系已迁移:(\d+) 条旧边闭合,(\d+) 条新边 active;源记录 ([^;\s。]+)$/u;
+
+/** `memory_update`'s card: the record id in the head, the new text in prose. */
+function memoryUpdateCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed || !isRecord(input)) return null;
+  const recordId = requiredString(input, "record_id");
+  if (recordId === undefined || typeof input.content !== "string") return null;
+  const text = typeof output === "string" ? output.trim() : "";
+  const matched = MEMORY_UPDATED_LINE.exec(text);
+  if (matched === null) return null;
+  const cards = localeText().toolCards;
+  return {
+    summary: recordId,
+    args: [
+      { kind: "fact", label: cards.labels.id, value: recordId },
+      ...(input.content === "" ? [] : [proseEntry(cards.labels.content, input.content)]),
+    ],
+    result: [],
+    receipt: cards.memoryUpdated(matched[1]),
+    // The render sentence is the receipt; keeping it in the body would print
+    // the same confirmation twice (the `send_message` sentence-receipt rule).
+    body: "",
+    copyText: mappingCopy(output),
+  };
+}
+
+/** `memory_migrate_relation`'s card: `from → new target` in the head. */
+function memoryMigrateRelationCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed || !isRecord(input)) return null;
+  const from = requiredString(input, "from_node_id");
+  const relation = requiredString(input, "relation");
+  const oldTo = requiredString(input, "old_to_node_id");
+  const newTo = requiredString(input, "new_to_node_id");
+  const sources = input.source_record_ids;
+  if (
+    from === undefined ||
+    relation === undefined ||
+    oldTo === undefined ||
+    newTo === undefined ||
+    !Array.isArray(sources) ||
+    sources.length === 0 ||
+    sources.some((id) => typeof id !== "string" || id === "")
+  ) {
+    return null;
+  }
+  const text = typeof output === "string" ? output.trim() : "";
+  const matched = MEMORY_MIGRATED_LINE.exec(text);
+  if (matched === null) return null;
+  const cards = localeText().toolCards;
+  return {
+    summary: `${from} → ${newTo} · ${relation}`,
+    args: [
+      { kind: "fact", label: cards.labels.relation, value: relation },
+      { kind: "fact", label: cards.labels.target, value: oldTo },
+      { kind: "json", label: cards.labels.records, value: stringifyValue(sources, true) },
+    ],
+    result: [],
+    receipt: cards.memoryMigrated(Number(matched[1]), Number(matched[2])),
+    body: "",
+    copyText: mappingCopy(output),
+  };
+}
+
+/** `memory_reproject`'s card: how many records, and how many jobs were queued. */
+function memoryReprojectCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed || !isRecord(input)) return null;
+  const ids = input.record_ids;
+  if (
+    !Array.isArray(ids) ||
+    ids.length === 0 ||
+    ids.some((id) => typeof id !== "string" || id === "")
+  ) {
+    return null;
+  }
+  const text = typeof output === "string" ? output.trim() : "";
+  const matched = MEMORY_REPROJECT_LINE.exec(text);
+  if (matched === null) return null;
+  const cards = localeText().toolCards;
+  return {
+    summary: cards.recordCount(ids.length),
+    args: [{ kind: "json", label: cards.labels.records, value: stringifyValue(ids, true) }],
+    result: [],
+    receipt: cards.memoryQueued(Number(matched[1]), matched[2] === undefined ? 0 : Number(matched[2])),
+    body: "",
+    copyText: mappingCopy(output),
+  };
+}
+
+/** `plugin_manager`'s card: the action and its target in the head, its outcome a receipt. */
+function pluginManagerCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed || !isRecord(input)) return null;
+  const action = requiredString(input, "action");
+  if (action === undefined) return null;
+  const cards = localeText().toolCards;
+  const actionWord = cards.pluginActions[action];
+  if (actionWord === undefined) return null;
+  const target = typeof input.target === "string" && input.target !== "" ? input.target : "";
+  const baseArgs: ToolFieldEntry[] = [];
+  if (target !== "") baseArgs.push({ kind: "fact", label: cards.labels.target, value: target });
+  for (const key of ["enabled", "runtimeVersion", "acceptRisk", "approvedBuilds", "registry", "offset", "limit"] as const) {
+    if (input[key] !== undefined) baseArgs.push(fieldEntry(key, input[key]));
+  }
+  const value = structuredResult(output);
+  if (action === "list_plugins" || action === "list_bundles") {
+    // The documented list shape: `{entries, total, nextOffset}`. Anything else
+    // keeps L1 rather than inventing a count.
+    if (!isRecord(value) || !Array.isArray(value.entries) || typeof value.total !== "number") return null;
+    // Each entry is one visible code entry in the manager's own order. The entry
+    // objects are drawn whole: their fields differ between plugins and bundles,
+    // so naming a preferred subset here would silently drop keys. The total is
+    // always the first result entry so even an empty page draws a card and
+    // keeps the copy control (fields must not be null, or copyText is lost).
+    const result: ToolFieldEntry[] = [
+      { kind: "fact", label: cards.labels.records, value: String(value.total) },
+      ...value.entries.map((entry) => ({
+        kind: "json" as const,
+        label: "",
+        value: stringifyValue(entry, true),
+      })),
+    ];
+    return {
+      summary: `${actionWord} · ${cards.pluginListed(value.total)}`,
+      args: baseArgs,
+      result,
+      receipt: "",
+      copyText: mappingCopy(output),
+    };
+  }
+  if (action === "list_version_exemptions") {
+    // Its payload is `{runtimeVersion, ...manager.listVersionExemptions()}`, a
+    // shape the manager does not document here: render the record's own keys
+    // (never a guessed subset) so the card and its copy control stay usable.
+    if (!isRecord(value)) return null;
+    return {
+      summary: actionWord,
+      args: baseArgs,
+      result: fieldEntries(value),
+      receipt: "",
+      copyText: mappingCopy(output),
+    };
+  }
+  // set/install/remove: `withNextStep` adds `application` on the manager's
+  // `{application, ...}` result; the word is the whole receipt a reader needs.
+  if (!isRecord(value) || typeof value.application !== "string") return null;
+  const application = cards.pluginApplications[value.application] ?? value.application;
+  return {
+    summary: target === "" ? actionWord : `${actionWord} · ${target}`,
+    args: baseArgs,
+    result: [],
+    receipt: application,
+    copyText: mappingCopy(output),
+  };
+}
+
+/** The schedule task's recurrence in the tool's own vocabulary, or "". */
+function scheduleRuleText(task: Record<string, unknown>): string {
+  const kind = typeof task.kind === "string" ? task.kind : "";
+  const parts: string[] = [];
+  const push = (value: unknown) => {
+    if (typeof value === "string" && value !== "") parts.push(value);
+  };
+  switch (kind) {
+    case "rrule":
+      push(task.rrule);
+      break;
+    case "cron":
+      push(task.expression);
+      push(task.timeZone);
+      break;
+    case "every":
+      if (typeof task.everySeconds === "number") parts.push(`${String(task.everySeconds)}s`);
+      break;
+    case "after":
+      if (typeof task.afterSeconds === "number") parts.push(`${String(task.afterSeconds)}s`);
+      break;
+    case "daily":
+      push(task.time);
+      push(task.timeZone);
+      break;
+    case "weekly":
+      push(task.time);
+      push(task.timeZone);
+      if (Array.isArray(task.weekdays)) {
+        const days = task.weekdays.filter((day): day is number => typeof day === "number");
+        if (days.length > 0) parts.push(days.join(","));
+      }
+      break;
+    case "at":
+      push(task.scheduledAt);
+      break;
+    default:
+      return "";
+  }
+  return parts.length === 0 ? "" : `${kind} · ${parts.join(" · ")}`;
+}
+
+/** A schedule task's documented fields as card entries. */
+function scheduleTaskEntries(task: Record<string, unknown>, cards: ToolCardsText): ToolFieldEntry[] {
+  const entries: ToolFieldEntry[] = [];
+  if (typeof task.status === "string") {
+    entries.push({
+      kind: "fact",
+      label: cards.labels.status,
+      value: cards.scheduleStatuses[task.status] ?? task.status,
+    });
+  }
+  if (typeof task.scheduledAtLocal === "string" && task.scheduledAtLocal !== "") {
+    entries.push({ kind: "fact", label: cards.labels.nextRun, value: task.scheduledAtLocal });
+  }
+  const rule = scheduleRuleText(task);
+  if (rule !== "") entries.push({ kind: "text", label: cards.labels.rule, value: rule });
+  if (typeof task.prompt === "string" && task.prompt !== "") {
+    entries.push(proseEntry(cards.labels.prompt, task.prompt));
+  }
+  if (isRecord(task.target)) {
+    entries.push({ kind: "json", label: cards.labels.target, value: stringifyValue(task.target, true) });
+  }
+  return entries;
+}
+
+/** `schedule_view`'s card: the task title in the head, its documented fields below. */
+function scheduleViewCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed || !isRecord(input)) return null;
+  const id = requiredString(input, "id");
+  if (id === undefined) return null;
+  const value = structuredResult(output);
+  if (!isRecord(value)) return null;
+  const cards = localeText().toolCards;
+  if (value.code === "schedule_not_found" && typeof value.id === "string") {
+    return {
+      summary: id,
+      args: [{ kind: "fact", label: cards.labels.id, value: id }],
+      result: [],
+      receipt: cards.scheduleNotFound,
+      copyText: mappingCopy(output),
+    };
+  }
+  if (
+    typeof value.id !== "string" ||
+    typeof value.title !== "string" ||
+    typeof value.status !== "string"
+  ) {
+    return null;
+  }
+  return {
+    summary: value.title,
+    args: [{ kind: "fact", label: cards.labels.id, value: value.id }],
+    result: scheduleTaskEntries(value, cards),
+    receipt: "",
+    copyText: mappingCopy(output),
+  };
+}
+
+/** `schedule_edit`'s card: updated/deleted/not-found/conflict all have a receipt. */
+function scheduleEditCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed || !isRecord(input)) return null;
+  const id = requiredString(input, "id");
+  const action = requiredString(input, "action");
+  if (id === undefined || action === undefined || (action !== "update" && action !== "delete")) return null;
+  const value = structuredResult(output);
+  if (!isRecord(value)) return null;
+  const cards = localeText().toolCards;
+  const args: ToolFieldEntry[] = [
+    { kind: "fact", label: cards.labels.id, value: id },
+    { kind: "fact", label: cards.labels.action, value: cards.scheduleActions[action] ?? action },
+  ];
+  if (value.code === "schedule_not_found" && typeof value.id === "string") {
+    return { summary: id, args, result: [], receipt: cards.scheduleNotFound, copyText: mappingCopy(output) };
+  }
+  if (value.code === "schedule_conflict" && typeof value.id === "string") {
+    return { summary: id, args, result: [], receipt: cards.scheduleConflict, copyText: mappingCopy(output) };
+  }
+  if (value.deleted === true && typeof value.id === "string") {
+    return { summary: id, args, result: [], receipt: cards.scheduleDeleted, copyText: mappingCopy(output) };
+  }
+  if (
+    typeof value.id !== "string" ||
+    typeof value.title !== "string" ||
+    typeof value.status !== "string"
+  ) {
+    return null;
+  }
+  return {
+    summary: value.title,
+    args,
+    result: scheduleTaskEntries(value, cards),
+    receipt: cards.scheduleUpdated,
+    copyText: mappingCopy(output),
+  };
+}
+
+/**
+ * The `remote_*` family's input shapes.
+ *
+ * The wire definitions were captured from a real `request/header` on this
+ * machine (87 tools; see `docs/research/table-labels.md`). No real `tool/call`
+ * for this family exists in any session log, so the cards below claim the
+ * **input** only and read an output receipt only where the tool's own
+ * description names the field (`sessionId`, `localPath`/`bytes`, `path`/`bytes`,
+ * `accepted`, `operationId`). Everything else keeps L1's result rendering.
+ */
+function remoteInput(input: unknown, fields: readonly string[]): Record<string, unknown> | null {
+  if (!isRecord(input)) return null;
+  for (const field of fields) {
+    if (requiredString(input, field) === undefined) return null;
+  }
+  return input;
+}
+
+/** The shared id args of a remote session operation, localized and filtered. */
+function remoteArgs(input: Record<string, unknown>, cards: ToolCardsText): ToolFieldEntry[] {
+  const pairs: [string, unknown][] = [
+    [cards.labels.host, input.hostId],
+    [cards.labels.workspace, input.workspaceId],
+    [cards.labels.session, input.sessionId],
+    [cards.labels.operation, input.operationId],
+  ];
+  return pairs
+    .filter(([, value]) => typeof value === "string" && value !== "")
+    .map(([label, value]) => fieldEntry(label, value));
+}
+
+/** `remote_list_hosts`: no arguments; the head names the list itself. */
+function remoteListHostsCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed || !isRecord(input) || Object.keys(input).length !== 0) return null;
+  return { summary: localeText().toolCards.remoteAllHosts, copyText: mappingCopy(output) };
+}
+
+/** `remote_list_workspaces`: one host in the head. */
+function remoteListWorkspacesCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed) return null;
+  const value = remoteInput(input, ["hostId"]);
+  if (value === null) return null;
+  const cards = localeText().toolCards;
+  return {
+    summary: String(value.hostId),
+    args: [{ kind: "fact", label: cards.labels.host, value: String(value.hostId) }],
+    copyText: mappingCopy(output),
+  };
+}
+
+/** `remote_list_sessions`: host/workspace in the head, paging knobs as facts. */
+function remoteListSessionsCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed) return null;
+  const value = remoteInput(input, ["hostId", "backend", "workspaceId"]);
+  if (value === null) return null;
+  const cards = localeText().toolCards;
+  const args = remoteArgs(value, cards);
+  if (typeof value.offset === "number") args.push(fieldEntry("offset", value.offset));
+  if (typeof value.limit === "number") args.push(fieldEntry("limit", value.limit));
+  return { summary: `${String(value.hostId)} / ${String(value.workspaceId)}`, args, copyText: mappingCopy(output) };
+}
+
+/** `remote_read_session`: the session in the head, its bounds as facts. */
+function remoteReadSessionCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed) return null;
+  const value = remoteInput(input, ["hostId", "backend", "workspaceId", "sessionId"]);
+  if (value === null) return null;
+  const cards = localeText().toolCards;
+  const args = remoteArgs(value, cards);
+  if (typeof value.maxMessages === "number") args.push(fieldEntry("maxMessages", value.maxMessages));
+  if (isRecord(value.cursor)) args.push({ kind: "json", label: "cursor", value: stringifyValue(value.cursor, true) });
+  return { summary: String(value.sessionId), args, copyText: mappingCopy(output) };
+}
+
+/** `remote_create_session`: the workspace in the head; a `sessionId` receipt when present. */
+function remoteCreateSessionCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed) return null;
+  const value = remoteInput(input, ["hostId", "backend", "workspaceId", "operationId"]);
+  if (value === null) return null;
+  const result = structuredResult(output);
+  if (!isRecord(result) || typeof result.sessionId !== "string") return null;
+  const cards = localeText().toolCards;
+  return {
+    summary: String(value.workspaceId),
+    args: remoteArgs(value, cards),
+    result: [],
+    receipt: cards.remoteCreated(result.sessionId),
+    copyText: mappingCopy(output),
+  };
+}
+
+/** `remote_send_message`: the message in prose, "sent (queued)" as the receipt. */
+function remoteSendMessageCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed) return null;
+  const value = remoteInput(input, ["hostId", "backend", "workspaceId", "sessionId", "operationId", "message"]);
+  if (value === null) return null;
+  const result = structuredResult(output);
+  if (!isRecord(result) || result.accepted !== true) return null;
+  const cards = localeText().toolCards;
+  const args = remoteArgs(value, cards);
+  if (typeof value.message === "string" && value.message !== "") {
+    args.push(proseEntry(cards.labels.message, value.message));
+  }
+  return {
+    summary: String(value.sessionId),
+    args,
+    result: [],
+    receipt: cards.remoteSent,
+    copyText: mappingCopy(output),
+  };
+}
+
+/** `remote_interrupt_session`: "interrupt requested" as the receipt. */
+function remoteInterruptSessionCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed) return null;
+  const value = remoteInput(input, ["hostId", "backend", "workspaceId", "sessionId", "operationId"]);
+  if (value === null) return null;
+  const result = structuredResult(output);
+  if (!isRecord(result) || result.accepted !== true) return null;
+  const cards = localeText().toolCards;
+  return {
+    summary: String(value.sessionId),
+    args: remoteArgs(value, cards),
+    result: [],
+    receipt: cards.interruptRequested,
+    copyText: mappingCopy(output),
+  };
+}
+
+/** `remote_wait_sessions`: how many sessions are being observed. */
+function remoteWaitSessionsCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed || !isRecord(input) || !Array.isArray(input.targets)) return null;
+  const targets = input.targets;
+  if (targets.length === 0 || targets.length > 8) return null;
+  for (const target of targets) {
+    if (
+      !isRecord(target) ||
+      requiredString(target, "hostId") === undefined ||
+      requiredString(target, "backend") === undefined ||
+      requiredString(target, "workspaceId") === undefined ||
+      requiredString(target, "sessionId") === undefined
+    ) {
+      return null;
+    }
+  }
+  const cards = localeText().toolCards;
+  const args: ToolFieldEntry[] = [{ kind: "json", label: cards.labels.targets, value: stringifyValue(targets, true) }];
+  if (typeof input.timeoutMs === "number") args.push(fieldEntry(cards.labels.timeout, input.timeoutMs));
+  return { summary: cards.remoteTargets(targets.length), args, copyText: mappingCopy(output) };
+}
+
+/** `remote_download_file`: the file's basename in the head; `localPath`+`bytes` receipt. */
+function remoteDownloadFileCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed) return null;
+  const value = remoteInput(input, ["hostId", "backend", "workspaceId", "sessionId", "path"]);
+  if (value === null) return null;
+  const result = structuredResult(output);
+  if (!isRecord(result) || typeof result.localPath !== "string" || typeof result.bytes !== "number") return null;
+  const cards = localeText().toolCards;
+  const args = remoteArgs(value, cards);
+  args.push({ kind: "fact", label: cards.labels.path, value: String(value.path) });
+  return {
+    summary: baseName(String(value.path)),
+    args,
+    result: [],
+    receipt: cards.remoteDownloaded(result.bytes),
+    copyText: mappingCopy(output),
+  };
+}
+
+/** `remote_upload_file`: the optional name (else the local basename) in the head. */
+function remoteUploadFileCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed) return null;
+  const value = remoteInput(input, ["hostId", "backend", "workspaceId", "sessionId", "operationId", "localPath"]);
+  if (value === null) return null;
+  const result = structuredResult(output);
+  if (!isRecord(result) || typeof result.path !== "string" || typeof result.bytes !== "number") return null;
+  const cards = localeText().toolCards;
+  const args = remoteArgs(value, cards);
+  args.push({ kind: "fact", label: cards.labels.path, value: String(value.localPath) });
+  if (typeof value.name === "string" && value.name !== "") {
+    args.push({ kind: "fact", label: cards.labels.name, value: value.name });
+  }
+  const name = typeof value.name === "string" && value.name !== "" ? value.name : baseName(String(value.localPath));
+  return {
+    summary: name,
+    args,
+    result: [],
+    receipt: cards.remoteUploaded(result.path, result.bytes),
+    copyText: mappingCopy(output),
+  };
+}
+
+/** `remote_get_operation`: the operation id in the head; its receipt stays L1's unless documented. */
+function remoteGetOperationCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+  if (failed) return null;
+  const value = remoteInput(input, ["operationId"]);
+  if (value === null) return null;
+  const result = structuredResult(output);
+  if (!isRecord(result) || typeof result.operationId !== "string") return null;
+  const cards = localeText().toolCards;
+  return {
+    summary: String(value.operationId),
+    args: [{ kind: "fact", label: cards.labels.operation, value: String(value.operationId) }],
+    copyText: mappingCopy(output),
+  };
+}
+
 /**
  * The tool-specific card for one `unknown` row, or null to keep the generic one.
  *
@@ -1724,6 +2276,41 @@ function toolMapping(name: string, input: unknown, output: unknown, failed: bool
       return readImageCard(input, failed);
     case "run_code":
       return runCodeCard(input, failed);
+    // The 2026-11-07 batch: the tools that were still anonymous rows.
+    case "memory_update":
+      return memoryUpdateCard(input, output, failed);
+    case "memory_migrate_relation":
+      return memoryMigrateRelationCard(input, output, failed);
+    case "memory_reproject":
+      return memoryReprojectCard(input, output, failed);
+    case "plugin_manager":
+      return pluginManagerCard(input, output, failed);
+    case "schedule_edit":
+      return scheduleEditCard(input, output, failed);
+    case "schedule_view":
+      return scheduleViewCard(input, output, failed);
+    case "remote_list_hosts":
+      return remoteListHostsCard(input, output, failed);
+    case "remote_list_workspaces":
+      return remoteListWorkspacesCard(input, output, failed);
+    case "remote_list_sessions":
+      return remoteListSessionsCard(input, output, failed);
+    case "remote_read_session":
+      return remoteReadSessionCard(input, output, failed);
+    case "remote_create_session":
+      return remoteCreateSessionCard(input, output, failed);
+    case "remote_send_message":
+      return remoteSendMessageCard(input, output, failed);
+    case "remote_interrupt_session":
+      return remoteInterruptSessionCard(input, output, failed);
+    case "remote_wait_sessions":
+      return remoteWaitSessionsCard(input, output, failed);
+    case "remote_download_file":
+      return remoteDownloadFileCard(input, output, failed);
+    case "remote_upload_file":
+      return remoteUploadFileCard(input, output, failed);
+    case "remote_get_operation":
+      return remoteGetOperationCard(input, output, failed);
     default:
       return null;
   }

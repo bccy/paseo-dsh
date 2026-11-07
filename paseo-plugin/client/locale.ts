@@ -224,7 +224,30 @@ export interface TeamText {
  */
 export interface ToolCardsText {
   /** Entry labels for the wire keys a reader should not have to parse. */
-  labels: { message: string; prompt: string; code: string; description: string };
+  labels: {
+    message: string;
+    prompt: string;
+    code: string;
+    description: string;
+    id: string;
+    host: string;
+    workspace: string;
+    session: string;
+    operation: string;
+    path: string;
+    name: string;
+    target: string;
+    relation: string;
+    action: string;
+    status: string;
+    record: string;
+    records: string;
+    content: string;
+    nextRun: string;
+    rule: string;
+    targets: string;
+    timeout: string;
+  };
   /** `send_message` receipts: the team shape, its old shape, and the subagent-control shape. */
   sent: string;
   sentWithStatus: (status: string) => string;
@@ -250,6 +273,32 @@ export interface ToolCardsText {
   exitCode: (code: string) => string;
   /** `job_kill`'s receipt. */
   cancellationRequested: string;
+  /** `memory_update`'s receipt: the id of the version that replaced the old one. */
+  memoryUpdated: (id: string) => string;
+  /** `memory_migrate_relation`'s receipt: old edges closed, new edges written. */
+  memoryMigrated: (closed: number, opened: number) => string;
+  /** `memory_reproject`'s receipt: jobs queued, ids that were not in L1 skipped. */
+  memoryQueued: (queued: number, skipped: number) => string;
+  /** `memory_reproject`'s head: how many records the call named. */
+  recordCount: (n: number) => string;
+  /** `plugin_manager`: the per-action words and the `application` outcome words. */
+  pluginActions: Record<string, string>;
+  pluginListed: (total: number) => string;
+  pluginApplications: Record<string, string>;
+  /** `schedule_view` / `schedule_edit`: the durable status words and the receipts. */
+  scheduleStatuses: Record<string, string>;
+  scheduleActions: Record<string, string>;
+  scheduleUpdated: string;
+  scheduleDeleted: string;
+  scheduleNotFound: string;
+  scheduleConflict: string;
+  /** `remote_*`: the argument-less host list's head and the operation receipts. */
+  remoteAllHosts: string;
+  remoteCreated: (sessionId: string) => string;
+  remoteDownloaded: (bytes: number) => string;
+  remoteUploaded: (path: string, bytes: number) => string;
+  remoteSent: string;
+  remoteTargets: (n: number) => string;
 }
 
 /**
@@ -727,7 +776,7 @@ const TEXT: Record<Locale, UiText> = {
       // The profile's own plugins register tools DSH has no `tool.title.*` for.
       // Without an entry each row printed its wire name next to the wrench — the
       // phone screenshot that reopened this was `memory_search`. Provenance:
-      // `dsh-prime-memory` registers the 19 `memory_*` tools and
+      // `dsh-prime-memory` registers the 22 `memory_*` tools and
       // `conversation_search` (`dist/tools/index.js`); DSH's
       // `dsh-tool-working-directory` registers `working_directory`. Every name
       // here also appears in a real `request/header` tool list on this machine —
@@ -753,6 +802,32 @@ const TEXT: Record<Locale, UiText> = {
       memory_slot_close: "Close memory slot",
       conversation_search: "Search conversations",
       working_directory: "Show or change working directory",
+      // The 17 rows added 2026-11-07: tools that were still printing their wire
+      // name next to the wrench. `dsh-prime-memory` registers the three
+      // `memory_*` write tools; `dsh-plugin-manager` registers `plugin_manager`;
+      // `dsh-tool-schedule` adds the `edit`/`view` pair beside the four older
+      // ones; the `remote_*` family is the Remote-host session tool set that
+      // reaches the model through the profile's tool list (its real
+      // `request/header` definitions are recorded in
+      // `docs/research/table-labels.md`). Every English label names the action,
+      // not the wire spelling.
+      memory_update: "Update memory",
+      memory_migrate_relation: "Migrate memory relation",
+      memory_reproject: "Rebuild memory projection",
+      plugin_manager: "Manage plugins",
+      schedule_edit: "Edit scheduled task",
+      schedule_view: "View scheduled task",
+      remote_list_hosts: "List remote hosts",
+      remote_list_workspaces: "List remote workspaces",
+      remote_list_sessions: "List remote sessions",
+      remote_read_session: "Read remote session",
+      remote_create_session: "Create remote session",
+      remote_send_message: "Send remote message",
+      remote_interrupt_session: "Interrupt remote session",
+      remote_wait_sessions: "Wait for remote sessions",
+      remote_download_file: "Download remote file",
+      remote_upload_file: "Upload remote file",
+      remote_get_operation: "Read remote operation",
       // The placeholder a tool row carries when the wire never named its tool.
       // The server no longer invents such a row (`server/timeline.ts` skips a
       // name-less call and drops a result with no call), so this only catches a
@@ -992,7 +1067,30 @@ const TEXT: Record<Locale, UiText> = {
       },
     },
     toolCards: {
-      labels: { message: "Message", prompt: "Prompt", code: "Code", description: "Description" },
+      labels: {
+        message: "Message",
+        prompt: "Prompt",
+        code: "Code",
+        description: "Description",
+        id: "ID",
+        host: "Host",
+        workspace: "Workspace",
+        session: "Session",
+        operation: "Operation",
+        path: "Path",
+        name: "Name",
+        target: "Target",
+        relation: "Relation",
+        action: "Action",
+        status: "Status",
+        record: "Record",
+        records: "Records",
+        content: "Content",
+        nextRun: "Next run",
+        rule: "Schedule",
+        targets: "Targets",
+        timeout: "Timeout",
+      },
       sent: "Sent",
       sentWithStatus: (status) => `Sent · ${status}`,
       delivered: "Delivered",
@@ -1016,6 +1114,48 @@ const TEXT: Record<Locale, UiText> = {
       },
       exitCode: (code) => `exit code ${code}`,
       cancellationRequested: "Cancellation requested",
+      memoryUpdated: (id) => `Updated · new version ${id}`,
+      memoryMigrated: (closed, opened) => `Migrated · closed ${String(closed)} old · opened ${String(opened)} new`,
+      memoryQueued: (queued, skipped) =>
+        skipped === 0 ? `Queued ${String(queued)} job(s)` : `Queued ${String(queued)} job(s) · skipped ${String(skipped)}`,
+      recordCount: (n) => `${String(n)} record(s)`,
+      pluginActions: {
+        list_plugins: "List plugins",
+        list_bundles: "List bundles",
+        set_plugin: "Enable or disable plugin",
+        set_bundle: "Enable or disable bundle",
+        install_bundle: "Install bundle",
+        remove_bundle: "Remove bundle",
+        list_version_exemptions: "List version exemptions",
+        set_version_exemption: "Set version exemption",
+      },
+      pluginListed: (total) => `${String(total)} entries`,
+      pluginApplications: {
+        applied: "Applied",
+        cancelled: "Cancelled",
+        overridden: "Saved (overridden)",
+        "restart-required": "Restart required",
+        failed: "Failed",
+      },
+      scheduleStatuses: {
+        active: "Active",
+        paused: "Paused",
+        ended: "Ended",
+      },
+      scheduleActions: {
+        update: "Update",
+        delete: "Delete",
+      },
+      scheduleUpdated: "Updated",
+      scheduleDeleted: "Deleted",
+      scheduleNotFound: "Task not found",
+      scheduleConflict: "Task changed; nothing written",
+      remoteAllHosts: "All remote hosts",
+      remoteCreated: (sessionId) => `Created · ${sessionId}`,
+      remoteDownloaded: (bytes) => `Downloaded · ${String(bytes)} bytes`,
+      remoteUploaded: (path, bytes) => `Uploaded · ${path} · ${String(bytes)} bytes`,
+      remoteSent: "Sent (queued)",
+      remoteTargets: (n) => `${String(n)} session(s)`,
     },
   },
   "zh-CN": {
@@ -1100,7 +1240,7 @@ const TEXT: Record<Locale, UiText> = {
       archive_subagents: "归档子智能体",
       // profile 自带插件注册的工具，DSH 没有给它们 `tool.title.*`：缺表项时行头会印
       // wire name 加兜底扳手（用户手机截图就是 `memory_search`）。来源：
-      // `dsh-prime-memory` 注册 19 个 `memory_*` 与 `conversation_search`
+      // `dsh-prime-memory` 注册 22 个 `memory_*` 与 `conversation_search`
       //（`dist/tools/index.js`）、DSH 的 `dsh-tool-working-directory` 注册
       // `working_directory`；这些名字也都出现在本机真实的 `request/header` 工具表里
       //（采集与缺口清单见 `docs/research/table-labels.md`）。
@@ -1125,6 +1265,28 @@ const TEXT: Record<Locale, UiText> = {
       memory_slot_close: "关闭记忆槽位",
       conversation_search: "搜索对话记录",
       working_directory: "查看或切换工作目录",
+      // 2026-11-07 补齐的 17 个工具：此前它们在时间流里印 wire name 加扳手。
+      // memory 三个写工具来自 `dsh-prime-memory`；`plugin_manager` 来自
+      // `dsh-plugin-manager`；schedule 的 edit/view 与四个旧工具同属
+      // `dsh-tool-schedule`；remote_* 是 Remote 主机会话工具集（真实
+      // `request/header` 定义已记录在 `docs/research/table-labels.md`）。
+      memory_update: "修订记忆",
+      memory_migrate_relation: "迁移记忆关系",
+      memory_reproject: "重建记忆投影",
+      plugin_manager: "管理插件",
+      schedule_edit: "修改定时任务",
+      schedule_view: "查看定时任务详情",
+      remote_list_hosts: "列出远程主机",
+      remote_list_workspaces: "列出远程工作区",
+      remote_list_sessions: "列出远程会话",
+      remote_read_session: "读取远程会话",
+      remote_create_session: "创建远程会话",
+      remote_send_message: "发送远程消息",
+      remote_interrupt_session: "中断远程会话",
+      remote_wait_sessions: "等待远程会话",
+      remote_download_file: "下载远程文件",
+      remote_upload_file: "上传远程文件",
+      remote_get_operation: "查看远程操作回执",
       // 工具行在 wire 上没拿到名字时的占位名。服务端已不再造这种行
       //（`server/timeline.ts` 跳过无名调用、丢弃没有调用的结果），这里只为
       // 旧版本/其它生产者发来的行兜底：可读标签胜过把字面量 `tool` 摆在扳手旁。
@@ -1365,7 +1527,30 @@ const TEXT: Record<Locale, UiText> = {
       },
     },
     toolCards: {
-      labels: { message: "消息", prompt: "提示词", code: "代码", description: "说明" },
+      labels: {
+        message: "消息",
+        prompt: "提示词",
+        code: "代码",
+        description: "说明",
+        id: "编号",
+        host: "主机",
+        workspace: "工作区",
+        session: "会话",
+        operation: "操作",
+        path: "路径",
+        name: "名称",
+        target: "目标",
+        relation: "关系",
+        action: "动作",
+        status: "状态",
+        record: "记录",
+        records: "记录",
+        content: "内容",
+        nextRun: "下次触发",
+        rule: "调度规则",
+        targets: "目标会话",
+        timeout: "超时",
+      },
       sent: "已发送",
       sentWithStatus: (status) => `已发送 · ${status}`,
       delivered: "已投递",
@@ -1389,6 +1574,48 @@ const TEXT: Record<Locale, UiText> = {
       },
       exitCode: (code) => `退出码 ${code}`,
       cancellationRequested: "已请求取消",
+      memoryUpdated: (id) => `已修订 · 新版本 ${id}`,
+      memoryMigrated: (closed, opened) => `已迁移 · 闭合 ${String(closed)} 条旧边 · 新增 ${String(opened)} 条新边`,
+      memoryQueued: (queued, skipped) =>
+        skipped === 0 ? `已入队 ${String(queued)} 个作业` : `已入队 ${String(queued)} 个作业 · 跳过 ${String(skipped)} 条`,
+      recordCount: (n) => `${String(n)} 条记录`,
+      pluginActions: {
+        list_plugins: "列出插件",
+        list_bundles: "列出插件包",
+        set_plugin: "启用或停用插件",
+        set_bundle: "启用或停用插件包",
+        install_bundle: "安装插件包",
+        remove_bundle: "移除插件包",
+        list_version_exemptions: "查看版本豁免",
+        set_version_exemption: "设置版本豁免",
+      },
+      pluginListed: (total) => `共 ${String(total)} 条`,
+      pluginApplications: {
+        applied: "已应用",
+        cancelled: "已取消",
+        overridden: "已保存（被上层覆盖）",
+        "restart-required": "需重启生效",
+        failed: "失败",
+      },
+      scheduleStatuses: {
+        active: "进行中",
+        paused: "已暂停",
+        ended: "已结束",
+      },
+      scheduleActions: {
+        update: "更新",
+        delete: "删除",
+      },
+      scheduleUpdated: "已更新",
+      scheduleDeleted: "已删除",
+      scheduleNotFound: "未找到该任务",
+      scheduleConflict: "任务已变更，未改动",
+      remoteAllHosts: "全部远程主机",
+      remoteCreated: (sessionId) => `已创建 · ${sessionId}`,
+      remoteDownloaded: (bytes) => `已下载 · ${String(bytes)} 字节`,
+      remoteUploaded: (path, bytes) => `已上传 · ${path} · ${String(bytes)} 字节`,
+      remoteSent: "已发送（排队）",
+      remoteTargets: (n) => `${String(n)} 个会话`,
     },
   },
 };

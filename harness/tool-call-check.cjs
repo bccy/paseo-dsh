@@ -1104,6 +1104,379 @@ console.log("high-frequency tools get their own cards (L2)");
   equal("a failed job_kill with its success sentence shows no receipt", shapedKill.fields.receipt, "");
   equal("…and the sentence stays the body", shapedKill.body, "requested cancellation of job bash-5");
 
+  // --- 2026-11-07: the 17 tools that were still wire names -------------------
+  // Every mapper below gets a normal-shape assertion and at least one
+  // shape-mismatch assertion that must fall back to L1 (no invented summary,
+  // no invented receipt), the same contract as the ten cards above.
+
+  // memory_update: the real data path is the tool's rendered Chinese sentence,
+  // not a JSON object — the memory tools carry no presentationMeta, so Paseo
+  // hands `message.content` text to `detail.output`.
+  const UPDATE_SENTENCE = "已修订记忆,新版本 rec-2(旧版 rec-1 已退场可恢复)";
+  const memUpdate = row(
+    "memory_update",
+    { record_id: "rec-1", content: "修订后的完整内容", scene: "work" },
+    UPDATE_SENTENCE,
+  );
+  equal("memory_update: the head is the record id", memUpdate.summary, "rec-1");
+  equal("…the content is prose under the id fact", memUpdate.fields.args, [
+    { kind: "fact", label: "编号", value: "rec-1" },
+    { kind: "text", label: "内容", value: "修订后的完整内容" },
+  ]);
+  equal("…the receipt names the new version", memUpdate.fields.receipt, "已修订 · 新版本 rec-2");
+  equal("…the sentence is not repeated in the body", memUpdate.body, "");
+  equal("…and the copy control keeps the rendered sentence", memUpdate.fields.copyText, UPDATE_SENTENCE);
+  const memUpdateTrimmed = row("memory_update", { record_id: "rec-1", content: "x" }, `\n  ${UPDATE_SENTENCE}  \n`);
+  equal("memory_update: surrounding whitespace is tolerated", memUpdateTrimmed.fields.receipt, "已修订 · 新版本 rec-2");
+  const memUpdateNotice = row(
+    "memory_update",
+    { record_id: "rec-1", content: "x" },
+    "记录 rec-1 不存在,未修订(可先用 memory_search 定位 id)",
+  );
+  equal("memory_update: a notice sentence keeps L1", memUpdateNotice.summary, "record_id: rec-1");
+  equal("…and invents no receipt", memUpdateNotice.fields.receipt, "");
+  const memUpdateCustom = row("memory_update", { record_id: "rec-1", content: "x" }, `${UPDATE_SENTENCE} 额外说明`);
+  equal("memory_update: a custom sentence keeps L1", memUpdateCustom.summary, "record_id: rec-1");
+  equal("…and invents no receipt", memUpdateCustom.fields.receipt, "");
+  const memUpdateJson = row("memory_update", { record_id: "rec-1", content: "x" }, '{"id":"rec-2","retired_id":"rec-1"}');
+  equal("memory_update: a JSON object is not the real shape and keeps L1", memUpdateJson.summary, "record_id: rec-1");
+  equal("…with no receipt", memUpdateJson.fields.receipt, "");
+
+  // memory_migrate_relation: from -> new target in the head, render sentence receipt.
+  const MIGRATE_SENTENCE = "关系已迁移:1 条旧边闭合,1 条新边 active;源记录 carrier-1";
+  const memMigrate = row(
+    "memory_migrate_relation",
+    {
+      from_node_id: "node-a",
+      relation: "works_at",
+      old_to_node_id: "node-b",
+      new_to_node_id: "node-c",
+      source_record_ids: ["rec-1", "rec-2"],
+    },
+    MIGRATE_SENTENCE,
+  );
+  equal("memory_migrate_relation: the head is from -> new target · relation", memMigrate.summary, "node-a → node-c · works_at");
+  equal("…relation, the old target and the sources are entries", memMigrate.fields.args, [
+    { kind: "fact", label: "关系", value: "works_at" },
+    { kind: "fact", label: "目标", value: "node-b" },
+    { kind: "json", label: "记录", value: '[\n  "rec-1",\n  "rec-2"\n]' },
+  ]);
+  equal("…the receipt counts the edges", memMigrate.fields.receipt, "已迁移 · 闭合 1 条旧边 · 新增 1 条新边");
+  equal("…the sentence is not repeated in the body", memMigrate.body, "");
+  equal("…and the copy keeps the rendered sentence", memMigrate.fields.copyText, MIGRATE_SENTENCE);
+  const memMigrateOdd = row(
+    "memory_migrate_relation",
+    { from_node_id: "node-a", relation: "works_at", old_to_node_id: "node-b" },
+    MIGRATE_SENTENCE,
+  );
+  equal("memory_migrate_relation: a missing new target keeps L1", memMigrateOdd.summary, "from_node_id: node-a");
+  equal("…with no receipt", memMigrateOdd.fields.receipt, "");
+  const memMigrateNotice = row(
+    "memory_migrate_relation",
+    {
+      from_node_id: "node-a",
+      relation: "works_at",
+      old_to_node_id: "node-b",
+      new_to_node_id: "node-c",
+      source_record_ids: ["rec-1"],
+    },
+    "三节点中有不存在的(先用 memory_search_graph 取 id)",
+  );
+  equal("memory_migrate_relation: a notice sentence keeps L1", memMigrateNotice.summary, "from_node_id: node-a");
+  equal("…with no receipt", memMigrateNotice.fields.receipt, "");
+  const memMigrateCustom = row(
+    "memory_migrate_relation",
+    {
+      from_node_id: "node-a",
+      relation: "works_at",
+      old_to_node_id: "node-b",
+      new_to_node_id: "node-c",
+      source_record_ids: ["rec-1"],
+    },
+    `${MIGRATE_SENTENCE}。`,
+  );
+  equal("memory_migrate_relation: a custom sentence keeps L1", memMigrateCustom.summary, "from_node_id: node-a");
+  equal("…with no receipt", memMigrateCustom.fields.receipt, "");
+
+  // memory_reproject: how many records and how many jobs, from the rendered sentence.
+  const REPROJECT_SENTENCE = "已入队 2 个重投作业";
+  const memReproject = row("memory_reproject", { record_ids: ["rec-1", "rec-2"] }, REPROJECT_SENTENCE);
+  equal("memory_reproject: the head counts the records", memReproject.summary, "2 条记录");
+  equal("…the ids are one JSON entry", memReproject.fields.args, [
+    { kind: "json", label: "记录", value: '[\n  "rec-1",\n  "rec-2"\n]' },
+  ]);
+  equal("…the receipt counts the queued jobs", memReproject.fields.receipt, "已入队 2 个作业");
+  equal("…the sentence is not repeated in the body", memReproject.body, "");
+  equal("…and the copy keeps the rendered sentence", memReproject.fields.copyText, REPROJECT_SENTENCE);
+  equal(
+    "…and the skipped clause joins it",
+    row("memory_reproject", { record_ids: ["rec-1"] }, "已入队 0 个重投作业(跳过不存在 1 条)").fields.receipt,
+    "已入队 0 个作业 · 跳过 1 条",
+  );
+  const memReprojectRefusal = row(
+    "memory_reproject",
+    { record_ids: ["rec-1"] },
+    '{"queued":0,"job_ids":[],"skipped_ids":[],"notice":"图谱写面未接线"}',
+  );
+  equal("memory_reproject: the documented refusal object keeps L1", memReprojectRefusal.summary, "notice: 图谱写面未接线");
+  equal("…and never reads as a zero-job success", memReprojectRefusal.fields.receipt, "");
+  const memReprojectNotice = row("memory_reproject", { record_ids: ["rec-1"] }, "图谱写面未接线(runner 未装配),无法入队。");
+  equal("memory_reproject: a notice sentence keeps L1", memReprojectNotice.summary, "");
+  equal("…with no receipt", memReprojectNotice.fields.receipt, "");
+  const memReprojectCustom = row("memory_reproject", { record_ids: ["rec-1"] }, "已入队 2 个重投作业，请稍候");
+  equal("memory_reproject: a custom sentence keeps L1", memReprojectCustom.summary, "");
+  equal("…with no receipt", memReprojectCustom.fields.receipt, "");
+
+  // plugin_manager: list entries are visible, no-argument lists keep a card.
+  const PLUGIN_LIST_JSON = '{"entries":[{"id":"a","name":"Plug A"},{"id":"b","name":"Plug B"}],"total":2,"nextOffset":null}';
+  const pluginList = row("plugin_manager", { action: "list_plugins", limit: 25 }, PLUGIN_LIST_JSON);
+  equal("plugin_manager: a list names the action and the total", pluginList.summary, "列出插件 · 共 2 条");
+  equal("…paging knobs stay facts", pluginList.fields.args, [{ kind: "fact", label: "limit", value: "25" }]);
+  equal("…the total and every entry are visible result entries", pluginList.fields.result, [
+    { kind: "fact", label: "记录", value: "2" },
+    { kind: "json", label: "", value: '{\n  "id": "a",\n  "name": "Plug A"\n}' },
+    { kind: "json", label: "", value: '{\n  "id": "b",\n  "name": "Plug B"\n}' },
+  ]);
+  equal("…and the copy keeps the full JSON", pluginList.fields.copyText, PLUGIN_LIST_JSON);
+  const pluginListNoArgs = row("plugin_manager", { action: "list_bundles" }, '{"entries":[],"total":0,"nextOffset":null}');
+  equal("plugin_manager: an argument-less list keeps a card", pluginListNoArgs.summary, "列出插件包 · 共 0 条");
+  check("…with a non-null fields card", pluginListNoArgs.fields !== null, JSON.stringify(pluginListNoArgs.fields));
+  equal("…the empty total is still visible", pluginListNoArgs.fields.result, [
+    { kind: "fact", label: "记录", value: "0" },
+  ]);
+  equal(
+    "…and its copy control keeps the full JSON",
+    pluginListNoArgs.fields.copyText,
+    '{"entries":[],"total":0,"nextOffset":null}',
+  );
+  const pluginExemptionsJson = '{"runtimeVersion":"1.2.3","exemptions":[{"target":"pkg@1.0.0","enabled":true}]}';
+  const pluginExemptions = row("plugin_manager", { action: "list_version_exemptions" }, pluginExemptionsJson);
+  equal("plugin_manager: version exemptions are a card", pluginExemptions.summary, "查看版本豁免");
+  check(
+    "…its record keys are visible",
+    (pluginExemptions.fields.result ?? []).some((entry) => entry.label === "runtimeVersion"),
+    JSON.stringify(pluginExemptions.fields.result),
+  );
+  equal("…and its copy control keeps the full JSON", pluginExemptions.fields.copyText, pluginExemptionsJson);
+  const pluginSet = row("plugin_manager", { action: "set_plugin", target: "paseo-dsh", enabled: false }, '{"application":"restart-required","nextStep":"restart"}');
+  equal("plugin_manager: the head is the action and target", pluginSet.summary, "启用或停用插件 · paseo-dsh");
+  equal("…the application word is the receipt", pluginSet.fields.receipt, "需重启生效");
+  equal("…enabled stays a fact", pluginSet.fields.args, [
+    { kind: "fact", label: "目标", value: "paseo-dsh" },
+    { kind: "fact", label: "enabled", value: "false" },
+  ]);
+  const pluginOdd = row("plugin_manager", { action: "list_plugins" }, "not json");
+  equal("plugin_manager: an undocumented list result keeps L1", pluginOdd.summary, "action: list_plugins");
+  equal("…with no receipt", pluginOdd.fields.receipt, "");
+  const pluginUnknownAction = row("plugin_manager", { action: "delete_everything" }, '{"application":"applied"}');
+  equal("plugin_manager: an unknown action keeps L1", pluginUnknownAction.summary, "action: delete_everything");
+  equal("…with no receipt", pluginUnknownAction.fields.receipt, "");
+
+  // schedule_view: a task's documented fields, or not_found.
+  const scheduleJson = JSON.stringify({
+    id: "task-1",
+    title: "每日报告",
+    prompt: "生成今天的报告",
+    scheduledAt: "2026-11-08T01:00:00Z",
+    scheduledAtLocal: "2026-11-08 09:00",
+    target: { kind: "session", sessionId: "sess-1" },
+    status: "active",
+    kind: "rrule",
+    rrule: "DTSTART;TZID=Asia/Shanghai:20261108T090000\nRRULE:FREQ=DAILY",
+    updatedAt: "2026-11-07T00:00:00Z",
+  });
+  const scheduleView = row("schedule_view", { id: "task-1" }, scheduleJson);
+  equal("schedule_view: the head is the task title", scheduleView.summary, "每日报告");
+  equal("…status, next run, rule, prompt and target are entries", scheduleView.fields.result, [
+    { kind: "fact", label: "状态", value: "进行中" },
+    { kind: "fact", label: "下次触发", value: "2026-11-08 09:00" },
+    { kind: "text", label: "调度规则", value: "rrule · DTSTART;TZID=Asia/Shanghai:20261108T090000\nRRULE:FREQ=DAILY" },
+    { kind: "text", label: "提示词", value: "生成今天的报告" },
+    { kind: "json", label: "目标", value: '{\n  "kind": "session",\n  "sessionId": "sess-1"\n}' },
+  ]);
+  equal("…and the copy keeps the whole task JSON", scheduleView.fields.copyText, scheduleJson);
+  const scheduleMissing = row("schedule_view", { id: "task-1" }, '{"id":"task-1","code":"schedule_not_found"}');
+  equal("schedule_view: not_found is a receipt", scheduleMissing.fields.receipt, "未找到该任务");
+  const scheduleViewOdd = row("schedule_view", { id: "task-1" }, "not json");
+  equal("schedule_view: an undocumented result keeps L1", scheduleViewOdd.summary, "id: task-1");
+  equal("…with no receipt", scheduleViewOdd.fields.receipt, "");
+
+  // schedule_edit: update and delete are different documented results.
+  const scheduleEdit = row("schedule_edit", { id: "task-1", action: "delete" }, '{"id":"task-1","deleted":true}');
+  equal("schedule_edit: delete names the task", scheduleEdit.summary, "task-1");
+  equal("…with the action as a fact", scheduleEdit.fields.args, [
+    { kind: "fact", label: "编号", value: "task-1" },
+    { kind: "fact", label: "动作", value: "删除" },
+  ]);
+  equal("…and a deleted receipt", scheduleEdit.fields.receipt, "已删除");
+  const scheduleUpdated = row("schedule_edit", { id: "task-1", action: "update", title: "新标题" }, scheduleJson);
+  equal("schedule_edit: an update names the task title", scheduleUpdated.summary, "每日报告");
+  equal("…and says updated", scheduleUpdated.fields.receipt, "已更新");
+  check("…while the task fields stay visible", (scheduleUpdated.fields.result ?? []).length > 0);
+  const scheduleEditOdd = row("schedule_edit", { id: "task-1", action: "update", title: "x" }, "not json");
+  equal("schedule_edit: an undocumented result keeps L1", scheduleEditOdd.summary, "id: task-1");
+  equal("…with no receipt", scheduleEditOdd.fields.receipt, "");
+
+  // remote_list_hosts: argument-less discovery.
+  const remoteHosts = row("remote_list_hosts", {}, '{"hosts":[]}');
+  equal("remote_list_hosts: the head names the list", remoteHosts.summary, "全部远程主机");
+  equal("…and the copy keeps the list JSON", remoteHosts.fields.copyText, '{"hosts":[]}');
+  const remoteHostsOdd = row("remote_list_hosts", { unexpected: "x" }, "not json");
+  equal("remote_list_hosts: an unexpected argument keeps L1", remoteHostsOdd.summary, "unexpected: x");
+
+  // remote_list_workspaces / remote_list_sessions / remote_read_session.
+  const remoteWorkspaces = row("remote_list_workspaces", { hostId: "host-1" }, '{"workspaces":[]}');
+  equal("remote_list_workspaces: the head is the host", remoteWorkspaces.summary, "host-1");
+  equal("…the host is a fact", remoteWorkspaces.fields.args, [{ kind: "fact", label: "主机", value: "host-1" }]);
+  equal("…and the copy keeps the list JSON", remoteWorkspaces.fields.copyText, '{"workspaces":[]}');
+  equal(
+    "remote_list_workspaces: a non-string host keeps L1",
+    row("remote_list_workspaces", { hostId: 3, label: "x" }, "not json").summary,
+    "label: x",
+  );
+  const remoteSessions = row("remote_list_sessions", { hostId: "host-1", backend: "harness", workspaceId: "ws-1" }, '{"sessions":[]}');
+  equal("remote_list_sessions: the head is host/workspace", remoteSessions.summary, "host-1 / ws-1");
+  equal("…and the copy keeps the list JSON", remoteSessions.fields.copyText, '{"sessions":[]}');
+  equal(
+    "remote_list_sessions: a missing workspace keeps L1",
+    row("remote_list_sessions", { hostId: "host-1", backend: "harness" }, "not json").summary,
+    "hostId: host-1",
+  );
+  const remoteRead = row(
+    "remote_read_session",
+    { hostId: "host-1", backend: "harness", workspaceId: "ws-1", sessionId: "sess-1", maxMessages: 10 },
+    '{"messages":[]}',
+  );
+  equal("remote_read_session: the head is the session", remoteRead.summary, "sess-1");
+  equal("…host/workspace/session and the bound are facts", remoteRead.fields.args, [
+    { kind: "fact", label: "主机", value: "host-1" },
+    { kind: "fact", label: "工作区", value: "ws-1" },
+    { kind: "fact", label: "会话", value: "sess-1" },
+    { kind: "fact", label: "maxMessages", value: "10" },
+  ]);
+  equal("…and the copy keeps the history JSON", remoteRead.fields.copyText, '{"messages":[]}');
+  equal(
+    "remote_read_session: a missing session keeps L1",
+    row("remote_read_session", { hostId: "host-1", backend: "harness", workspaceId: "ws-1" }, "not json").summary,
+    "hostId: host-1",
+  );
+
+  // remote_create_session / remote_send_message / remote_interrupt_session:
+  // the documented receipt field gates the card.
+  const remoteCreate = row(
+    "remote_create_session",
+    { hostId: "host-1", backend: "harness", workspaceId: "ws-1", operationId: "op-1" },
+    '{"sessionId":"sess-9"}',
+  );
+  equal("remote_create_session: the head is the workspace", remoteCreate.summary, "ws-1");
+  equal("…the session id is the receipt", remoteCreate.fields.receipt, "已创建 · sess-9");
+  equal(
+    "remote_create_session: a receipt without sessionId keeps L1",
+    row("remote_create_session", { hostId: "host-1", backend: "harness", workspaceId: "ws-1", operationId: "op-1" }, '{"accepted":true}').summary,
+    "hostId: host-1",
+  );
+  const remoteSend = row(
+    "remote_send_message",
+    { hostId: "host-1", backend: "harness", workspaceId: "ws-1", sessionId: "sess-1", operationId: "op-1", message: "跑一下测试" },
+    '{"accepted":true}',
+  );
+  equal("remote_send_message: the head is the session", remoteSend.summary, "sess-1");
+  equal("…the message is prose", remoteSend.fields.args.at(-1), { kind: "text", label: "消息", value: "跑一下测试" });
+  equal("…and accepted is the receipt", remoteSend.fields.receipt, "已发送（排队）");
+  equal(
+    "remote_send_message: a non-accepted output keeps L1",
+    row("remote_send_message", { hostId: "host-1", backend: "harness", workspaceId: "ws-1", sessionId: "sess-1", operationId: "op-1", message: "x" }, '{"accepted":false}').summary,
+    "hostId: host-1",
+  );
+  const remoteInterrupt = row(
+    "remote_interrupt_session",
+    { hostId: "host-1", backend: "harness", workspaceId: "ws-1", sessionId: "sess-1", operationId: "op-1" },
+    '{"accepted":true}',
+  );
+  equal("remote_interrupt_session: the head is the session", remoteInterrupt.summary, "sess-1");
+  equal("…the receipt is the stop request", remoteInterrupt.fields.receipt, "已请求中断");
+  equal(
+    "remote_interrupt_session: a non-accepted output keeps L1",
+    row("remote_interrupt_session", { hostId: "host-1", backend: "harness", workspaceId: "ws-1", sessionId: "sess-1", operationId: "op-1" }, "not json").summary,
+    "hostId: host-1",
+  );
+
+  // remote_wait_sessions: the target count in the head.
+  const remoteWait = row(
+    "remote_wait_sessions",
+    {
+      targets: [
+        { hostId: "host-1", backend: "harness", workspaceId: "ws-1", sessionId: "sess-1" },
+        { hostId: "host-1", backend: "harness", workspaceId: "ws-1", sessionId: "sess-2" },
+      ],
+      timeoutMs: 30000,
+    },
+    '{"timedOut":false}',
+  );
+  equal("remote_wait_sessions: the head counts the sessions", remoteWait.summary, "2 个会话");
+  equal("…the targets are one JSON entry plus the timeout", remoteWait.fields.args, [
+    { kind: "json", label: "目标会话", value: '[\n  {\n    "hostId": "host-1",\n    "backend": "harness",\n    "workspaceId": "ws-1",\n    "sessionId": "sess-1"\n  },\n  {\n    "hostId": "host-1",\n    "backend": "harness",\n    "workspaceId": "ws-1",\n    "sessionId": "sess-2"\n  }\n]' },
+    { kind: "fact", label: "超时", value: "30000" },
+  ]);
+  equal(
+    "remote_wait_sessions: an empty target list keeps L1",
+    row("remote_wait_sessions", { targets: [] }, "not json").fields.args[0].label,
+    "targets",
+  );
+
+  // remote_download_file / remote_upload_file: the documented path/bytes receipts.
+  const remoteDownload = row(
+    "remote_download_file",
+    { hostId: "host-1", backend: "harness", workspaceId: "ws-1", sessionId: "sess-1", path: "docs/report.pdf" },
+    '{"localPath":"/home/user/Downloads/report.pdf","bytes":1024}',
+  );
+  equal("remote_download_file: the head is the basename", remoteDownload.summary, "report.pdf");
+  equal("…the local path is a fact", remoteDownload.fields.args, [
+    { kind: "fact", label: "主机", value: "host-1" },
+    { kind: "fact", label: "工作区", value: "ws-1" },
+    { kind: "fact", label: "会话", value: "sess-1" },
+    { kind: "fact", label: "路径", value: "docs/report.pdf" },
+  ]);
+  equal("…the bytes are the receipt", remoteDownload.fields.receipt, "已下载 · 1024 字节");
+  equal(
+    "remote_download_file: a result without localPath/bytes keeps L1",
+    row("remote_download_file", { hostId: "host-1", backend: "harness", workspaceId: "ws-1", sessionId: "sess-1", path: "a.txt" }, '{"path":"a.txt"}').summary,
+    "hostId: host-1",
+  );
+  const remoteUpload = row(
+    "remote_upload_file",
+    { hostId: "host-1", backend: "harness", workspaceId: "ws-1", sessionId: "sess-1", operationId: "op-1", localPath: "/tmp/a.txt" },
+    '{"path":"/remote/ws/a.txt","bytes":2048}',
+  );
+  equal("remote_upload_file: the head is the local basename", remoteUpload.summary, "a.txt");
+  equal("…the remote path and bytes are the receipt", remoteUpload.fields.receipt, "已上传 · /remote/ws/a.txt · 2048 字节");
+  equal(
+    "remote_upload_file: a result without bytes keeps L1",
+    row("remote_upload_file", { hostId: "host-1", backend: "harness", workspaceId: "ws-1", sessionId: "sess-1", operationId: "op-1", localPath: "/tmp/a.txt" }, '{"path":"/remote/a.txt"}').summary,
+    "hostId: host-1",
+  );
+
+  // remote_get_operation: the operation id in the head, receipt left to L1.
+  const remoteOperation = row("remote_get_operation", { operationId: "op-1" }, '{"operationId":"op-1","status":"accepted"}');
+  equal("remote_get_operation: the head is the operation id", remoteOperation.summary, "op-1");
+  equal("…and it is a fact", remoteOperation.fields.args, [{ kind: "fact", label: "操作", value: "op-1" }]);
+  equal(
+    "remote_get_operation: a result without operationId keeps L1",
+    row("remote_get_operation", { operationId: "op-1" }, '{"status":"accepted"}').summary,
+    "operationId: op-1",
+  );
+
+  // A failed call never reaches any of the new mappers either.
+  const failedMemUpdate = failedRow("memory_update", { record_id: "rec-1", content: "x" }, "已修订记忆,新版本 rec-2(旧版 rec-1 已退场可恢复)", "memory update failed");
+  equal("a failed memory_update has no success receipt", failedMemUpdate.fields.receipt, "");
+  equal("…and its head returns to L1", failedMemUpdate.summary, "record_id: rec-1");
+  const failedPlugin = failedRow("plugin_manager", { action: "set_plugin", target: "x", enabled: true }, '{"application":"applied"}', "plugin manager failed");
+  equal("a failed plugin_manager has no application receipt", failedPlugin.fields.receipt, "");
+  equal("…and its head returns to L1", failedPlugin.summary, "action: set_plugin");
+  const failedRemote = failedRow("remote_create_session", { hostId: "h", backend: "harness", workspaceId: "w", operationId: "o" }, '{"sessionId":"s"}', "remote create failed");
+  equal("a failed remote_create_session has no creation receipt", failedRemote.fields.receipt, "");
+  equal("…and its head returns to L1", failedRemote.summary, "hostId: h");
+
   // --- the copy comes from the same locale tables --------------------------
   const en = allText().en.toolCards;
   const zh = allText()["zh-CN"].toolCards;

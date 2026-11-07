@@ -804,8 +804,159 @@ console.log("the tool-specific timeline cards' copy is covered in both languages
   equal("toolCards: exit code (zh/en)", [zh.exitCode(0), en.exitCode(0)], ["退出码 0", "exit code 0"]);
   equal("toolCards: cancellation receipt (zh/en)", [zh.cancellationRequested, en.cancellationRequested], ["已请求取消", "Cancellation requested"]);
   equal("toolCards: the entry labels (zh/en)", [zh.labels, en.labels], [
-    { message: "消息", prompt: "提示词", code: "代码", description: "说明" },
-    { message: "Message", prompt: "Prompt", code: "Code", description: "Description" },
+    {
+      message: "消息",
+      prompt: "提示词",
+      code: "代码",
+      description: "说明",
+      id: "编号",
+      host: "主机",
+      workspace: "工作区",
+      session: "会话",
+      operation: "操作",
+      path: "路径",
+      name: "名称",
+      target: "目标",
+      relation: "关系",
+      action: "动作",
+      status: "状态",
+      record: "记录",
+      records: "记录",
+      content: "内容",
+      nextRun: "下次触发",
+      rule: "调度规则",
+      targets: "目标会话",
+      timeout: "超时",
+    },
+    {
+      message: "Message",
+      prompt: "Prompt",
+      code: "Code",
+      description: "Description",
+      id: "ID",
+      host: "Host",
+      workspace: "Workspace",
+      session: "Session",
+      operation: "Operation",
+      path: "Path",
+      name: "Name",
+      target: "Target",
+      relation: "Relation",
+      action: "Action",
+      status: "Status",
+      record: "Record",
+      records: "Records",
+      content: "Content",
+      nextRun: "Next run",
+      rule: "Schedule",
+      targets: "Targets",
+      timeout: "Timeout",
+    },
+  ]);
+  // The 2026-11-07 batch's receipts and status words, pinned because they are
+  // what the new rows read.
+  equal("toolCards: memory receipts (zh/en)", [
+    zh.memoryUpdated("rec-1"),
+    zh.memoryMigrated(2, 1),
+    zh.memoryQueued(3, 1),
+    zh.memoryQueued(3, 0),
+    zh.recordCount(3),
+    en.memoryUpdated("rec-1"),
+    en.memoryMigrated(2, 1),
+    en.memoryQueued(3, 1),
+    en.memoryQueued(3, 0),
+    en.recordCount(3),
+  ], [
+    "已修订 · 新版本 rec-1",
+    "已迁移 · 闭合 2 条旧边 · 新增 1 条新边",
+    "已入队 3 个作业 · 跳过 1 条",
+    "已入队 3 个作业",
+    "3 条记录",
+    "Updated · new version rec-1",
+    "Migrated · closed 2 old · opened 1 new",
+    "Queued 3 job(s) · skipped 1",
+    "Queued 3 job(s)",
+    "3 record(s)",
+  ]);
+  equal("toolCards: plugin action words (zh/en)", [zh.pluginActions, en.pluginActions], [
+    {
+      list_plugins: "列出插件",
+      list_bundles: "列出插件包",
+      set_plugin: "启用或停用插件",
+      set_bundle: "启用或停用插件包",
+      install_bundle: "安装插件包",
+      remove_bundle: "移除插件包",
+      list_version_exemptions: "查看版本豁免",
+      set_version_exemption: "设置版本豁免",
+    },
+    {
+      list_plugins: "List plugins",
+      list_bundles: "List bundles",
+      set_plugin: "Enable or disable plugin",
+      set_bundle: "Enable or disable bundle",
+      install_bundle: "Install bundle",
+      remove_bundle: "Remove bundle",
+      list_version_exemptions: "List version exemptions",
+      set_version_exemption: "Set version exemption",
+    },
+  ]);
+  equal("toolCards: plugin application words (zh/en)", [zh.pluginApplications, en.pluginApplications], [
+    { applied: "已应用", cancelled: "已取消", overridden: "已保存（被上层覆盖）", "restart-required": "需重启生效", failed: "失败" },
+    { applied: "Applied", cancelled: "Cancelled", overridden: "Saved (overridden)", "restart-required": "Restart required", failed: "Failed" },
+  ]);
+  equal("toolCards: schedule words (zh/en)", [
+    zh.scheduleStatuses,
+    zh.scheduleActions,
+    zh.scheduleUpdated,
+    zh.scheduleDeleted,
+    zh.scheduleNotFound,
+    zh.scheduleConflict,
+    en.scheduleStatuses,
+    en.scheduleActions,
+    en.scheduleUpdated,
+    en.scheduleDeleted,
+    en.scheduleNotFound,
+    en.scheduleConflict,
+  ], [
+    { active: "进行中", paused: "已暂停", ended: "已结束" },
+    { update: "更新", delete: "删除" },
+    "已更新",
+    "已删除",
+    "未找到该任务",
+    "任务已变更，未改动",
+    { active: "Active", paused: "Paused", ended: "Ended" },
+    { update: "Update", delete: "Delete" },
+    "Updated",
+    "Deleted",
+    "Task not found",
+    "Task changed; nothing written",
+  ]);
+  equal("toolCards: remote words (zh/en)", [
+    zh.remoteAllHosts,
+    zh.remoteCreated("s-1"),
+    zh.remoteDownloaded(1024),
+    zh.remoteUploaded("a.txt", 2048),
+    zh.remoteSent,
+    zh.remoteTargets(2),
+    en.remoteAllHosts,
+    en.remoteCreated("s-1"),
+    en.remoteDownloaded(1024),
+    en.remoteUploaded("a.txt", 2048),
+    en.remoteSent,
+    en.remoteTargets(2),
+  ], [
+    "全部远程主机",
+    "已创建 · s-1",
+    "已下载 · 1024 字节",
+    "已上传 · a.txt · 2048 字节",
+    "已发送（排队）",
+    "2 个会话",
+    "All remote hosts",
+    "Created · s-1",
+    "Downloaded · 1024 bytes",
+    "Uploaded · a.txt · 2048 bytes",
+    "Sent (queued)",
+    "2 session(s)",
   ]);
 }
 
@@ -865,8 +1016,16 @@ console.log("the tools this machine has really been offered are never anonymous"
     "memory_receipts", "memory_resolve_conflict", "memory_room_admin", "memory_room_review",
     "memory_ruminate", "memory_ruminate_cancel", "memory_ruminate_status", "memory_search",
     "memory_search_graph", "memory_slot_close", "memory_slot_list", "memory_slot_write",
-    "present", "read", "read_image", "read_mcp_resource",
-    "schedule_create", "schedule_delete", "schedule_list", "schedule_update",
+    // 2026-11-07: the three memory tools that were added after the first scan.
+    "memory_update", "memory_migrate_relation", "memory_reproject",
+    "plugin_manager", "present", "read", "read_image", "read_mcp_resource",
+    // 2026-11-07: the Remote-host session family (real `request/header` names).
+    "remote_list_hosts", "remote_list_workspaces", "remote_list_sessions",
+    "remote_read_session", "remote_create_session", "remote_send_message",
+    "remote_interrupt_session", "remote_wait_sessions", "remote_download_file",
+    "remote_upload_file", "remote_get_operation",
+    "schedule_create", "schedule_delete", "schedule_edit", "schedule_list",
+    "schedule_update", "schedule_view",
     "send_message", "session_event_read", "session_event_search", "session_event_trace",
     "session_search", "session_trace", "skill", "spawn_teammate",
     "subagent", "subagent_fork", "team_task_create", "team_task_get",
@@ -925,7 +1084,7 @@ console.log("the tools this machine has really been offered are never anonymous"
 
   check(
     "the mounted-tool snapshot is the full scan",
-    MOUNTED_TOOLS.length === 136 && FOREIGN_SERVER_TOOLS.length === 25,
+    MOUNTED_TOOLS.length === 153 && FOREIGN_SERVER_TOOLS.length === 25,
     `${MOUNTED_TOOLS.length} mounted / ${FOREIGN_SERVER_TOOLS.length} foreign`,
   );
 
@@ -953,10 +1112,11 @@ console.log("the tools this machine has really been offered are never anonymous"
   equal("no mounted tool's English label is a copy of its Chinese one", untranslated, []);
 
   // The memory family is the set that was missing entirely. Its glyphs must not
-  // repeat inside the family (19 tools, 19 distinct glyphs), which is the part a
-  // bulk "give them all a Brain" would silently get wrong.
+  // repeat inside the family (22 tools, 22 distinct glyphs), which is the part a
+  // bulk "give them all a Brain" would silently get wrong. 2026-11-07 added the
+  // three write tools (update / migrate / reproject).
   const memoryTools = MOUNTED_TOOLS.filter((name) => name.startsWith("memory_"));
-  equal("the memory family is the plugin's 19 mounted tools", memoryTools.length, 19);
+  equal("the memory family is the plugin's 22 mounted tools", memoryTools.length, 22);
   setLocale("zh-CN");
   const memoryIcons = memoryTools.map((name) => toolIcon(name, { type: "unknown" }));
   equal(
