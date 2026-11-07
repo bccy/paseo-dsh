@@ -6,8 +6,10 @@
  *   paseo-dsh probe    probe a model route's reasoning/developer-role support
  *   paseo-dsh help
  *
- * Ships inside the `paseo-dsh` npm package, so it runs from `npx paseo-dsh ...`
- * with no repository clone.
+ * Runs from the installed plugin directory — the DIRECTORY column of
+ * `paseo plugin ls`, plus `/bin/paseo-dsh.mjs` — or from a checkout as
+ * `node paseo-plugin/bin/paseo-dsh.mjs`. Do not run it through
+ * `npx paseo-dsh`: that resolves to the upstream npm package, not this branch.
  *
  * @module paseo-dsh/bin
  */
@@ -25,7 +27,7 @@ Usage:
       --model <id> [--model <id>]  One or more model ids
   paseo-dsh help
 
-Install the plugin itself with:  paseo plugin add npm:paseo-dsh
+Install the plugin itself with:  paseo plugin add github:bccy/paseo-dsh:paseo-plugin
 `;
 
 const [command, ...rest] = process.argv.slice(2);

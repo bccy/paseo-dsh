@@ -370,8 +370,9 @@ export async function runProbe(argv, program = "paseo-dsh probe") {
 
   if (probed === 0) {
     // The README tells the install agent to paste this snippet verbatim, and
-    // `set -e` / `if ! npx paseo-dsh probe` read the exit code. Reporting a
-    // successful run after every model failed is how that becomes a bad config.
+    // `set -e` / `if ! node <plugin dir>/bin/paseo-dsh.mjs probe` read the exit
+    // code. Reporting a successful run after every model failed is how that
+    // becomes a bad config.
     process.stderr.write("error: no model could be probed; nothing was determined\n");
     process.exitCode = 1;
   }

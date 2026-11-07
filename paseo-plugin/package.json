@@ -1,7 +1,7 @@
 {
   "name": "paseo-dsh",
   "version": "0.2.16",
-  "description": "DeepSeek Harness (dsh) as a native Paseo provider: question cards, plan mode, thinking levels, steering, images and a real slash menu. 把 DeepSeek Harness 接成 Paseo 原生 provider。",
+  "description": "DeepSeek Harness (dsh) as a native Paseo provider: question cards, plan mode, thinking levels, steering, images, a slash menu, permissions and presets, rewind, goal/team/background pills, and session usage. 把 DeepSeek Harness 接成 Paseo 原生 provider：提问卡片、计划模式、思考档位、插话、图片、斜杠菜单、权限与预设、撤回、目标/团队/后台任务 pill、会话用量。",
   "keywords": [
     "paseo",
     "paseo-plugin",
@@ -10,15 +10,15 @@
     "dsh",
     "provider"
   ],
-  "author": "jixy <467677527@qq.com>",
+  "author": "bccy",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/liuxing7954/paseo-dsh.git",
+    "url": "git+https://github.com/bccy/paseo-dsh.git",
     "directory": "paseo-plugin"
   },
-  "homepage": "https://github.com/liuxing7954/paseo-dsh#readme",
-  "bugs": "https://github.com/liuxing7954/paseo-dsh/issues",
+  "homepage": "https://github.com/bccy/paseo-dsh#readme",
+  "bugs": "https://github.com/bccy/paseo-dsh/issues",
   "bin": {
     "paseo-dsh": "bin/paseo-dsh.mjs"
   },

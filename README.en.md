@@ -2,6 +2,9 @@
 
 English · [中文](README.md)
 
+> **Provenance and what you actually install**: this branch is inherited from [liuxing7954/paseo-dsh](https://github.com/liuxing7954/paseo-dsh) (MIT, original author jixy) and is maintained by **bccy**; the `paseo-dsh` on npm is the **upstream stable line** — installing it gives you upstream code, not this branch's features.
+> **To install this branch**: `paseo plugin add github:bccy/paseo-dsh:paseo-plugin` — only the GitHub source installs this branch's code.
+
 Bring [DSH](https://www.npmjs.com/package/@deepseek-ai/dsh) into Paseo as a
 **first-class provider**. No Paseo fork, no DSH fork: everything goes through
 public extension points — a direct-provider plugin on the Paseo side and a
@@ -10,10 +13,9 @@ profile bundle on the DSH side.
 > This is not an ACP integration. ACP cannot carry three of the things below;
 > Paseo's native provider protocol carries all of them.
 
-**One-line install:** `paseo plugin add npm:paseo-dsh` · npm package
-[npmjs.com/package/paseo-dsh](https://www.npmjs.com/package/paseo-dsh) · after
-install the only step left is [your model route](#install-one-line), described
-below.
+**One-line install (this branch):** `paseo plugin add github:bccy/paseo-dsh:paseo-plugin` ·
+repository [bccy/paseo-dsh](https://github.com/bccy/paseo-dsh) · after install the only
+step left is [your model route](#install-one-line), described below.
 
 | Capability | Over ACP | This project |
 | --- | --- | --- |
@@ -31,6 +33,8 @@ below.
 | Team (Agent Team) pill | — | ✅ sessions with shared team tasks get a "Team" composer pill (a people icon with a running ring on its corner while a teammate runs, red on a team record failure); an all-done board is shown once more and hidden only after you open and close its panel (sending a new message without opening it does not hide it); it opens a read-only panel: the members (lead, running / idle / starting / failed to start) and the shared tasks grouped by state (in progress / ready / waiting, done folded), tap a task for its full text; `team_task_*` results render as field cards, and refusals are translated in Chinese with DSH's words kept |
 | Goal / workflow timeline | — | ✅ `goal/change` and `tool-workflow/*` events render as tool rows; each automatic goal round gets its own compact row ("Goal round · N"); goal changes show as a "Goal status" row right after the `/goal` command that caused them; goal tool results render as field cards and refused calls get a short explanation; a background workflow keeps its running state across turns |
 | Tool approval cards | — | ✅ DSH's `approval/request` becomes a Paseo approval card (allow once / reject) |
+| Rewind | — | ✅ the conversation and files both roll back (the message row disappears, files touched by edit tools are restored, the model no longer sees the withdrawn content); file rollback excludes files over 8 MiB, symlink targets and non-regular files; on Paseo 0.15+ the host refreshes the timeline natively, no Reload needed (0.15 still unverified on a real machine) |
+| Session usage | — | ✅ `used / limit` next to the composer, reported per session (each session keeps its own numbers while one `dsh` process serves several Paseo sessions) |
 | Session-level system prompt | — | ✅ each session may carry its own system prompt (the profile must mount the `systemPrompt` service) |
 | Stop and keep chatting | — | ✅ cancels the current turn only; the session survives |
 
@@ -48,7 +52,8 @@ everything — **you only restart Paseo at the end**.
 You are a deployment assistant. Connect Paseo on this machine to DeepSeek
 Harness (DSH).
 
-Repository: https://github.com/liuxing7954/paseo-dsh
+Repository: https://github.com/bccy/paseo-dsh (this branch; the `paseo-dsh` on npm is the
+upstream stable line, not this code)
 Read docs/ADOPTION.md completely before changing anything. Do not edit files by
 guesswork.
 
@@ -71,35 +76,34 @@ users can read).
 Never put the key in a file that could be committed, and never echo it in the
 terminal.
 
-■ Step 3: probe model capabilities (critical, do not skip)
-  npx paseo-dsh probe --base-url <endpoint> --api-key-env <VAR> --model <model-id>
+■ Step 3: install (from this branch's GitHub source)
+Translate Paseo's "Plugins are trusted, unsandboxed code..." security notice
+【verbatim】and ask me whether to continue. Install only after I agree:
+  paseo plugin add github:bccy/paseo-dsh:paseo-plugin
+(The plugin provisions the DSH profile on first load; no script is needed.)
+Note: the `paseo-dsh` on npm is the upstream stable line — it installs upstream
+code without this branch's features, so do not substitute it for the line above.
+Restart the Paseo daemon afterwards.
+
+■ Step 4: probe model capabilities (critical, do not skip)
+Find the plugin directory first: `paseo plugin ls` — the DIRECTORY column for
+  dsh-paseo, e.g. ~/.paseo/plugins/dsh-paseo/<version-dir>/checkout/paseo-plugin
+  node <plugin-dir>/bin/paseo-dsh.mjs probe --base-url <endpoint> --api-key-env <VAR> --model <model-id>
+Do not use `npx paseo-dsh`: that runs the upstream npm CLI, not this branch's code.
 Take its YAML output 【verbatim】. It also tells you about two traps:
   - if the developer role is rejected -> set compat.supportsDeveloperRole: false
   - the `off` reasoning level must stay empty (no value)
   - if it reports `max`, list it explicitly in the config
 If the probe fails, paste the full error to me; do not invent a config.
 
-■ Step 4: install
-Translate Paseo's "Plugins are trusted, unsandboxed code..." security notice
-【verbatim】and ask me whether to continue. Install only after I agree:
-  paseo plugin add npm:paseo-dsh
-If the daemon is Paseo 0.12: install npm >= 0.2.10 (the current latest, 0.2.17,
-satisfies it; only the older 0.2.9 predates the 0.12 adapter, in which case use
-the source install):
-  paseo plugin add github:liuxing7954/paseo-dsh:paseo-plugin
-(The plugin provisions the DSH profile on first load; no script is needed.)
-Restart the Paseo daemon afterwards.
-
 ■ Step 5: write the config
-Put the fragment from step 3 into ~/.dsh/profiles/paseo/cordis.patch.yml and add
+Put the fragment from step 4 into ~/.dsh/profiles/paseo/cordis.patch.yml and add
 an agent-default-model entry pointing at my main model.
 If that file already has content, only append; never overwrite.
 
 ■ Step 6: verify (do not skip)
-  npx paseo-dsh doctor
-(For a source/github install use the repository's own CLI instead of letting npx
-download the published package:
-  node <repo>/paseo-plugin/bin/paseo-dsh.mjs doctor)
+  node <plugin-dir>/bin/paseo-dsh.mjs doctor     # same <plugin-dir> as above (paseo plugin ls DIRECTORY)
+(Do not use `npx paseo-dsh doctor`: it runs the upstream npm stable line, not this branch.)
 Require it to be green (dsh/paseo versions, profile, bridge, route, key). Fix
 any problem and run it again.
 Then restart the Paseo daemon.
@@ -116,26 +120,20 @@ not fake success to finish the flow.
 
 ## Install (one line)
 
-Use Paseo's own plugin installer:
+Install this branch from its GitHub source — **the only way to get this branch's code**:
 
 ```bash
-paseo plugin add npm:paseo-dsh
-paseo plugin ls          # confirm dsh-paseo is installed
+paseo plugin add github:bccy/paseo-dsh:paseo-plugin
+paseo plugin ls          # confirm dsh-paseo is installed; its DIRECTORY column is the plugin directory
 ```
 
-> **Version note (historical, 2026-10-20)**: at that time the newest npm release
-> was `0.2.9` (2026-10-17), which did not carry the Paseo 0.12 adaptation.
-> npm has since moved to `0.2.17`, so the wait-for-`0.2.10` condition was met
-> long ago — use `paseo plugin add npm:paseo-dsh` above. The source install
-> remains available:
+> **The `paseo-dsh` on npm (latest `0.2.17`) is the upstream stable line**: it installs
+> upstream code and **does not carry this branch's features**. Use
+> `paseo plugin add npm:paseo-dsh` only when you explicitly want the upstream stable line.
 >
-> ```bash
-> paseo plugin add github:liuxing7954/paseo-dsh:paseo-plugin
-> ```
->
-> Note that `liuxing7954/paseo-dsh` (without a prefix) is treated by Paseo as a
-> **registry** source; `--path` is the old spelling of the `:plugin/path` suffix
-> and fails outright on a registry source.
+> Note that `bccy/paseo-dsh` (**without** the `github:` prefix) is treated by Paseo as a
+> **registry** source; `--path` is the old spelling of the `:plugin/path` suffix and
+> fails outright on a registry source.
 
 The plugin **provisions the DSH profile on first load** (default
 `~/.dsh/profiles/paseo`; `DSH_PASEO_PROFILE` renames it — and the daemon must
@@ -210,7 +208,9 @@ chmod 600 ~/.dsh/.credentials.yaml
 ### c) Self-check and restart
 
 ```bash
-npx paseo-dsh doctor
+# plugin directory = the DIRECTORY column for dsh-paseo in `paseo plugin ls`
+# (a GitHub-source install looks like ~/.paseo/plugins/dsh-paseo/<version-dir>/checkout/paseo-plugin)
+node <plugin-dir>/bin/paseo-dsh.mjs doctor
 ```
 
 It checks the `dsh`/`paseo` versions, that the profile is ready, that the bridge
@@ -219,12 +219,14 @@ names whatever is missing (read-only, changes nothing). When it is green,
 **restart the Paseo daemon** (`paseo daemon restart`) and pick the
 **DeepSeek Harness** provider when you create a session.
 
+> Do not use `npx paseo-dsh`: it resolves to the **upstream stable line** on npm, not this branch.
+
 > **Unsure whether the endpoint supports reasoning / thinking levels / vision?**
 > Probe it with the same CLI; it calls the endpoint and prints the fragment for
-> step a) (no clone needed either):
+> step a) (no repository clone needed either):
 >
 > ```bash
-> npx paseo-dsh probe \
+> node <plugin-dir>/bin/paseo-dsh.mjs probe \
 >   --base-url https://your-gateway/v1 \
 >   --api-key-env MY_GATEWAY_API_KEY \
 >   --model your-model-id
@@ -237,8 +239,10 @@ names whatever is missing (read-only, changes nothing). When it is green,
 **The full walkthrough and pitfall list are in
 [docs/ADOPTION.md](docs/ADOPTION.md).**
 
-Links: npm package <https://www.npmjs.com/package/paseo-dsh> · Paseo community
-directory <https://paseo.cafe/plugins/dsh-paseo> · discussion
+Links: this branch's repository <https://github.com/bccy/paseo-dsh> · issues
+<https://github.com/bccy/paseo-dsh/issues> · npm package (**upstream stable line**)
+<https://www.npmjs.com/package/paseo-dsh> · upstream community directory
+<https://paseo.cafe/plugins/dsh-paseo> · upstream discussion
 <https://github.com/getpaseo/paseo/discussions/6375>
 
 ## Local development / offline install
@@ -253,7 +257,7 @@ swap fails — so what actually runs is always the embedded asset, never this
 checkout directory.
 
 ```bash
-git clone https://github.com/liuxing7954/paseo-dsh && cd paseo-dsh
+git clone https://github.com/bccy/paseo-dsh && cd paseo-dsh
 ./install.sh --check     # show the prerequisites and which profile would be used, change nothing
 ./install.sh             # create/initialise the profile and register the plugin
 ```
@@ -285,7 +289,7 @@ paseo-dsh/
 │   ├── lib/transport.js #   built-in JSON-RPC line transport (server→client requests)
 │   ├── lib/server.js    #   sessions / plan / thinking levels / catalog
 │   └── cordis.patch.yml #   bundle patch: mounts the bridge and question tool on dsh-base
-├── paseo-plugin/        # Paseo side: provider plugin (direct provider; npm package paseo-dsh)
+├── paseo-plugin/        # Paseo side: provider plugin (direct provider; the same-named npm package is published upstream)
 │   ├── index.server.ts  #   registerProvider() + profile bootstrap on first load
 │   ├── server/
 │   │   ├── provider.ts  #   connection, catalog, session lifecycle, permission cards
@@ -295,7 +299,7 @@ paseo-dsh/
 │   │   ├── bootstrap.ts #   bootstrap: profile files + embedded bridge on disk
 │   │   └── bridge-assets.ts # generated: base64 copy of the bridge
 │   ├── lib/             #   doctor (self-check) / probe (capability discovery)
-│   └── bin/paseo-dsh.mjs#   npx paseo-dsh {doctor|probe}
+│   └── bin/paseo-dsh.mjs#   CLI: doctor / probe
 ├── tools/               # thin launchers for the probe tools (implemented in paseo-plugin/lib)
 ├── templates/           # profile config template (with the traps commented)
 ├── harness/             # standalone probes; verify the bridge and plugin without Paseo
@@ -379,12 +383,16 @@ upgrades is in [local-patches/README.md](local-patches/README.md).
 
 ## Self-test / local verification (no Paseo needed)
 
-**Run the bundled CLI self-check first** (read-only, changes nothing):
+**Run the CLI from this checkout first** (read-only, changes nothing; run it in the
+checkout, never through `npx` — that is the upstream npm package):
 
 ```bash
-npx paseo-dsh doctor          # install integrity: CLIs/versions/profile/bridge/route/key
-npx paseo-dsh probe --base-url <endpoint> --api-key-env <VAR> --model <model-id>   # endpoint capabilities
+node paseo-plugin/bin/paseo-dsh.mjs doctor          # install integrity: CLIs/versions/profile/bridge/route/key
+node paseo-plugin/bin/paseo-dsh.mjs probe --base-url <endpoint> --api-key-env <VAR> --model <model-id>   # endpoint capabilities
 ```
+
+> The plugin installed from the GitHub source ships the same CLI: its path is the
+> DIRECTORY column from `paseo plugin ls` plus `/bin/paseo-dsh.mjs`.
 
 **Then assert on the protocol layer** (the UI is not trustworthy; the event
 stream is):
@@ -578,20 +586,23 @@ counter. Pick the version on the same line as `dsh` on your daemon.
 
 The repository's version number has a single source of truth:
 `paseo-plugin/package.json` (verified `0.2.16` in this round). The latest npm
-release is `0.2.17` (`npm view paseo-dsh version`, 2026-10-30). Publishing waits
-for local verification; pick the version on the same line as `dsh` on your
-daemon.
+release is `0.2.17` (`npm view paseo-dsh version`, 2026-10-30) — that is the
+**upstream stable line**'s version: the npm package `paseo-dsh` is maintained
+upstream, this branch has no publishing rights for it, so **nothing is published
+to npm from here** and this branch is delivered through the GitHub source only.
+Pick the version on the same line as `dsh` on your daemon.
 
 ## Changelog
 
 User-visible changes per patch, in npm release order. For `0.2.x` the minor
-follows the DSH line and the patch is this plugin's own counter; the full commit
-history is on
-[commits](https://github.com/liuxing7954/paseo-dsh/commits/main).
+follows the DSH line and the patch is this plugin's own counter. **The version
+numbers and npm links below come from the upstream release line** (the
+`paseo-dsh` on npm); this branch's own changes are in
+[bccy's commits](https://github.com/bccy/paseo-dsh/commits/main).
 
 | Version | Date | Changes |
 | --- | --- | --- |
-| [0.2.17](https://www.npmjs.com/package/paseo-dsh/v/0.2.17) | 2026-10-30 | **The stats row tucks under the footer again**: it measures where the footer was actually painted, so both the newest turn and a turn pushed down by a newer one settle at about a 4.5px gap under the default theme, and the row adopts the footer's 13px type. When the footer cannot be measured, found, or the gap is implausible, the row keeps the host spacing; native never compensates, and theme placement stays with the theme. |
+| [0.2.17](https://www.npmjs.com/package/paseo-dsh/v/0.2.17) (upstream, not yet merged into this branch) | 2026-10-30 | **The stats row tucks under the footer again**: it measures where the footer was actually painted, so both the newest turn and a turn pushed down by a newer one settle at about a 4.5px gap under the default theme, and the row adopts the footer's 13px type. When the footer cannot be measured, found, or the gap is implausible, the row keeps the host spacing; native never compensates, and theme placement stays with the theme. |
 | [0.2.16](https://www.npmjs.com/package/paseo-dsh/v/0.2.16) | 2026-10-29 | **The stats row returns to its default position**: the automatic tucking, DOM measurement and settings page from 0.2.15 are gone. The row only carries content (turns/steps, first token, tok/s, context, cache hit; tap to expand details) and leaves placement to Paseo and the theme, so it no longer moves when expanded, collapsed or under a theme. `0.2.15` is deprecated. |
 | [0.2.15](https://www.npmjs.com/package/paseo-dsh/v/0.2.15) | 2026-10-29 | **The stats row sits with the turn footer**: the gap to the copy / model / time footer stays the same under the default theme and theme plugins. A completed turn flags its last row `final`; on web the row measures where the footer actually painted and tucks under it, native keeps a constant fallback.<br>**Configurable**: Settings → Plugins → "回答统计行" adjusts the gap (0–24px, default 6) and font size (10–16px, default 13); with no saved settings nothing changes.<br>**Type**: defaults to the footer's 13px with tabular numbers. |
 | [0.2.14](https://www.npmjs.com/package/paseo-dsh/v/0.2.14) | 2026-10-28 | **Clearer stats line**: the session token total in the collapsed line became a context percentage (for example `上下文 77%`); the exact `used / limit` stays in the expanded details. Counts and cache-hit semantics are unchanged. |
@@ -618,17 +629,21 @@ history is on
 - [docs/FIELD-NOTES.md](docs/FIELD-NOTES.md) — seventy-odd real defects: symptom → root cause → fix
 - [docs/GOAL.md](docs/GOAL.md) — how DSH goals work inside Paseo: data source, the pill and its
   buttons, sending messages while a goal runs, recovery after a reopen
+- [docs/REWIND.md](docs/REWIND.md) — rewind: host-side behaviour, canary ordering, the 0.15 native refresh and the degradation behaviour
+- [docs/TEAM.md](docs/TEAM.md) — Agent Team: shared tasks, member states, the pill's show/hide rules
 - [AGENTS.md](AGENTS.md) — notes for AI agents (Codex and others read it automatically). Read it first whether you were asked to install or to change this repository (written in Chinese)
 
 ## Contact
 
-Stuck while using it, found a doc error, or connected it to another runtime? Email
-me:
+Stuck while using it, found a doc error, or connected it to another runtime? Open an
+issue:
 
-**jixy · [467677527@qq.com](mailto:467677527@qq.com)**
+**<https://github.com/bccy/paseo-dsh/issues>**
 
-Issues work too, but email is faster.
+That is this branch's only contact channel (no email support).
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT. This branch is inherited from [liuxing7954/paseo-dsh](https://github.com/liuxing7954/paseo-dsh)
+(MIT, original author jixy); modifications and additions are maintained and credited by
+bccy. See [LICENSE](LICENSE).

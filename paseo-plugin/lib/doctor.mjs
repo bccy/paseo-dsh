@@ -619,10 +619,10 @@ function whichDsh() {
  * This module cannot resolve `yaml` in a real install: `paseo-plugin/package.json`
  * declares no `dependencies`, and `files` does not ship `node_modules`, so both
  * `yaml` and `js-yaml` are dev-only and absent from what
- * `paseo plugin add npm:paseo-dsh` unpacks. DSH, on the other hand, carries a
- * YAML parser for its own config — and that is the parser `cordis.patch.yml` is
- * actually read by, so judging the file with the same implementation is the more
- * faithful answer than a repo-local dev copy.
+ * `paseo plugin add github:bccy/paseo-dsh:paseo-plugin` unpacks. DSH, on the
+ * other hand, carries a YAML parser for its own config — and that is the parser
+ * `cordis.patch.yml` is actually read by, so judging the file with the same
+ * implementation is the more faithful answer than a repo-local dev copy.
  *
  * `dsh` on PATH is a symlink into the global install, so its realpath is walked
  * up to the package root that owns it. `undefined` when `dsh` is missing or the
@@ -743,7 +743,7 @@ export function runDoctor() {
         report(
           "fail",
           "dsh-paseo is not installed in Paseo",
-          "install it with `paseo plugin add npm:paseo-dsh`; on Paseo 0.12 npm 0.2.9 predates the 0.12 adapter, so use the repo source: `paseo plugin add github:liuxing7954/paseo-dsh:paseo-plugin`",
+          "install it with `paseo plugin add github:bccy/paseo-dsh:paseo-plugin` (the npm `paseo-dsh` is the upstream stable line and does not carry this branch)",
         );
       } else if (!/\brunning\b/.test(row)) {
         report("warn", "dsh-paseo is installed but not running", "enable it and restart the daemon");

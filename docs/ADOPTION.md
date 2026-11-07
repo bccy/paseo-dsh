@@ -99,15 +99,20 @@ shutdown            收尾
 Paseo 的模型选择器、思考档位选择器、图片上传按钮**全部由你报的能力驱动**。
 报错了不会报错，只会"功能悄悄不对"。
 
-**别猜，去探测。** 随 npm 包带了一个工具（克隆仓库的话同在 `tools/probe-provider.mjs`，
-是同一个实现的瘦启动器）：
+**别猜，去探测。** 插件自带一个探测工具（克隆仓库的话同在 `tools/probe-provider.mjs`，
+是同一个实现的瘦启动器）。用**已安装插件**的 CLI 跑它——`<插件目录>` 就是
+`paseo plugin ls` 里 dsh-paseo 那行的 DIRECTORY 列：
 
 ```bash
-npx paseo-dsh probe \
+paseo plugin ls          # 取 dsh-paseo 的 DIRECTORY 列
+node <插件目录>/bin/paseo-dsh.mjs probe \
   --base-url https://your-gateway/v1 \
   --api-key-env YOUR_API_KEY \
   --model your-model-id
 ```
+
+> `npx paseo-dsh` 是 **npm 上游稳定线**（`paseo-dsh` 包）的 CLI，跑的不是本分支代码；
+> 只在明确要检查/探测上游安装时才用它。
 
 它会直接打你的端点，回答两个决定配置的问题，并吐出可直接粘贴的片段：
 
@@ -314,20 +319,25 @@ if (provider === undefined || model === undefined) {
 
 界面不可信，日志太吵。**直接对 bridge 打协议帧**是最可靠的方式。
 
-### 5.0 先跑随包的自检
+### 5.0 先跑插件自检
 
-这个项目把"安装是否完整"的自检做成了一条命令，先跑它，能省一堆瞎猜：
+这个项目把"安装是否完整"的自检做成了一条命令，先跑它，能省一堆瞎猜。
+用**已安装插件**的 CLI（`<插件目录>` = `paseo plugin ls` 里 dsh-paseo 那行的 DIRECTORY 列）：
 
 ```bash
-npx paseo-dsh doctor
+node <插件目录>/bin/paseo-dsh.mjs doctor
 ```
 
-**如果你是从 checkout 装的**（`install.sh` 或 `paseo plugin add …:paseo-plugin`），
-要用仓库自己的 CLI，别让 `npx` 去下已发布包——两者版本可能不同：
+**如果你是从 checkout 装的**（`install.sh`），就用仓库自己的 CLI——两者来自同一分支，
+但**已安装的插件是安装那一刻的快照**（`directory` 源时 DIRECTORY 指向本地 checkout，
+本地可能有未提交改动），所以已装版本可能落后或超前于本地工作区：
 
 ```bash
 DSH_PASEO_PROFILE=paseo node paseo-plugin/bin/paseo-dsh.mjs doctor
 ```
+
+> `npx paseo-dsh doctor` 跑的是 **npm 上游稳定线**的 CLI，验的不是本分支；
+> 只在明确要检查上游安装时才用。
 
 只读不改：查 `dsh`/`paseo` 版本（DSH 低于 0.2.1 会判 blocking）、插件是否已把
 DSH profile 建好、bridge 是否落地、`cordis.patch.yml` 是否填了路由、每个 `apiKeyEnv`

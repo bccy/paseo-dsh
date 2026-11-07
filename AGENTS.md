@@ -14,13 +14,15 @@
 
 四条最容易犯的错，先记住：
 
-1. **不要自己编模型配置。** 用 `npx paseo-dsh probe` 探测出结果（仓库里的
-   `tools/probe-provider.mjs` 是同一个实现的瘦启动器），原样采用。
-2. **安装命令是 `paseo plugin add npm:paseo-dsh`。** 它会打印一条「Plugins are trusted,
-   unsandboxed code...」安全提示——先把原文转述给用户并取得同意，再执行安装。
-   插件首次加载会自己建好 DSH profile，**不需要再跑 `install.sh`**。
+1. **不要自己编模型配置。** 用插件自带的 CLI 探测出结果（`paseo plugin ls` 的
+   DIRECTORY 列 + `/bin/paseo-dsh.mjs probe`；仓库里的 `tools/probe-provider.mjs`
+   是同一个实现的瘦启动器），原样采用。不要用 `npx paseo-dsh`——那是 npm 上的上游包。
+2. **安装命令是 `paseo plugin add github:bccy/paseo-dsh:paseo-plugin`（本分支）。** 它会打印一条
+   「Plugins are trusted, unsandboxed code...」安全提示——先把原文转述给用户并取得同意，
+   再执行安装。插件首次加载会自己建好 DSH profile，**不需要再跑 `install.sh`**。
+   npm 上的 `paseo-dsh` 是**上游稳定线**：装到的是上游代码、不含本分支功能，别拿它冒充本分支。
 3. **不要把 API key 写进任何会被提交的文件**。它在 `~/.dsh/.credentials.yaml`。
-4. **装完/改完配置后跑 `npx paseo-dsh doctor`** 确认全绿，再重启 daemon。
+4. **装完/改完配置后跑 `node <插件目录>/bin/paseo-dsh.mjs doctor`** 确认全绿，再重启 daemon。
 
 ---
 
@@ -185,8 +187,9 @@ cd paseo-plugin && npx tsc --noEmit
 ```
 
 改**这个 checkout** 时一律用 `node paseo-plugin/bin/paseo-dsh.mjs ...` 跑本地源码的
-doctor/probe；`npx paseo-dsh` 解析的是**已发布到 npm 的包**，可能与工作区不一致（落后或超前），
-拿它自检会把"非当前代码"的行为当成通过。
+doctor/probe；`npx paseo-dsh` 解析的是**npm 上游稳定线的包**（上游代码，可能与工作区不一致——
+落后或超前），拿它自检会把"非当前代码"的行为当成通过。装到 Paseo 里的插件（github 源）自带
+同一个 CLI，路径是 `paseo plugin ls` 的 DIRECTORY 列 + `/bin/paseo-dsh.mjs`。
 
 **动了插件层（`paseo-plugin/server/*.ts`）就一定跑 `harness/plugin-check.cjs`**——
 它断言的是事件形状，而事件形状错了界面不会报错，只会悄悄不对。运行步骤写在那个文件

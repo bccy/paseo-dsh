@@ -2,9 +2,11 @@
 /**
  * Standalone launcher for the model-route probe.
  *
- * The implementation lives in `paseo-plugin/lib/probe-provider.mjs` so the
- * published `paseo-dsh` CLI and this repo script share one copy. Prefer
- * `npx paseo-dsh probe ...` (no clone needed); this exists for a checkout.
+ * The implementation lives in `paseo-plugin/lib/probe-provider.mjs`, which the
+ * installed plugin's CLI also runs (`<plugin dir>/bin/paseo-dsh.mjs probe`,
+ * where `<plugin dir>` is the DIRECTORY column of `paseo plugin ls`). This
+ * script is the checkout-only launcher; `npx paseo-dsh` is the npm upstream
+ * stable line, not this branch.
  *
  * Usage:
  *   node tools/probe-provider.mjs \

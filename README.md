@@ -2,14 +2,17 @@
 
 [中文](README.md) · [English](README.en.md)
 
+> **来源与安装真相**：本分支继承自 [liuxing7954/paseo-dsh](https://github.com/liuxing7954/paseo-dsh)（MIT，原作者 jixy），由 **bccy** 维护；npm 上的 `paseo-dsh` 是**上游稳定线**，装它拿到的是上游代码，不含本分支的功能。
+> **要装本分支**：`paseo plugin add github:bccy/paseo-dsh:paseo-plugin` —— 从 GitHub 源码安装，装到的才是本分支代码。
+
 把 [DSH](https://www.npmjs.com/package/@deepseek-ai/dsh) 作为 Paseo 的**一等公民 provider**
 接进来。不 fork Paseo、不 fork DSH，全部走公开扩展点：Paseo 侧是 direct provider 插件，
 DSH 侧是一个 profile bundle。
 
 > 这不是 ACP 接入。ACP 缺三样东西，而 Paseo 的原生 provider 协议恰好都有。
 
-**一行安装：** `paseo plugin add npm:paseo-dsh` · npm 包
-[npmjs.com/package/paseo-dsh](https://www.npmjs.com/package/paseo-dsh) · 装完只差
+**一行安装（本分支）：** `paseo plugin add github:bccy/paseo-dsh:paseo-plugin` · 仓库
+[bccy/paseo-dsh](https://github.com/bccy/paseo-dsh) · 装完只差
 [填模型路由](#安装推荐一行)，详见下方。
 
 | 能力 | ACP 接入 | 本项目 |
@@ -28,6 +31,8 @@ DSH 侧是一个 profile bundle。
 | 团队（Agent Team）pill | — | ✅ 有共享团队任务的会话，composer 多一颗「团队」pill（有队员在跑时人形图标右下角叠转环、团队记录出错时红色）；任务全部完成后只再显示一次，只有点开并关闭面板后才隐藏（不点开时发送新消息不会隐藏）；点开是只读面板：成员（队长、运行中 / 空闲 / 准备中 / 创建失败）和按状态分组的共享任务（进行中 / 可开始 / 等待依赖，已完成折叠），点任务看全文；`team_task_*` 工具结果画成字段卡，失败原因在中文环境翻成中文并保留原文 |
 | 目标 / 工作流时间线 | — | ✅ `goal/change` 与 `tool-workflow/*` 事件按工具行渲染；目标自动续跑的每个轮次也各占一行（「目标续跑 · 第 N 轮」）；目标变化行叫「目标状态」，排在引起它的 `/goal` 命令之后；goal 工具结果画成字段卡，被拒调用给中文短句；后台工作流跨回合仍显示运行中 |
 | 工具审批卡 | — | ✅ DSH 的 `approval/request` 转成 Paseo 审批卡（允许一次 / 拒绝） |
+| 撤回（rewind） | — | ✅ 对话 + 文件都回退（消息行消失、被编辑工具改过的文件恢复、模型看不到被撤内容）；文件回退排除 >8 MiB 文件、符号链接目标与非普通文件；Paseo 0.15+ 时间线由宿主原生刷新，无需 Reload（0.15 真机待复验） |
+| 会话用量 | — | ✅ 输入框旁显示 `已用 / 上限`，按会话上报（一个 `dsh` 进程服务多个 Paseo 会话时各算各的） |
 | 会话级系统提示 | — | ✅ 每个会话可带独立的 system prompt（profile 需挂 `systemPrompt` 服务） |
 | 终止后续聊 | — | ✅ 只取消当前回合，会话保留 |
 
@@ -42,7 +47,7 @@ DSH 侧是一个 profile bundle。
 ````text
 你是一个部署助手，帮我把这台机器上的 Paseo 接上 DeepSeek Harness（DSH）。
 
-仓库：https://github.com/liuxing7954/paseo-dsh
+仓库：https://github.com/bccy/paseo-dsh（这是本分支；npm 上的 paseo-dsh 是上游稳定线，不是这份代码）
 先完整读一遍 docs/ADOPTION.md 再动手。不要凭猜测改任何文件。
 
 ■ 第一步：检查前提
@@ -61,33 +66,34 @@ DSH 侧是一个 profile bundle。
 文件权限设成 600（DSH 拒绝别人可读的凭据文件）。
 不要把 key 写进任何会被提交的文件，也不要在终端回显它。
 
-■ 第三步：探测模型能力（关键，不许跳过）
-  npx paseo-dsh probe --base-url <端点> --api-key-env <变量名> --model <模型id>
+■ 第三步：安装（从本分支的 GitHub 源装）
+把 Paseo 会打印的那段「Plugins are trusted, unsandboxed code...」安全提示
+【原文转述给我】，并明确问我是否继续。得到我同意之后再装：
+  paseo plugin add github:bccy/paseo-dsh:paseo-plugin
+（插件首次加载会自己准备好 DSH profile，不需要跑任何脚本。）
+注意：npm 上的 paseo-dsh 是上游稳定线，装到的是上游代码、不含本分支功能，
+不要用它代替上面这条。
+装完重启 Paseo daemon。
+
+■ 第四步：探测模型能力（关键，不许跳过）
+先取插件目录：paseo plugin ls    # dsh-paseo 那行的 DIRECTORY 列，形如
+                                  # ~/.paseo/plugins/dsh-paseo/<版本目录>/checkout/paseo-plugin
+  node <插件目录>/bin/paseo-dsh.mjs probe --base-url <端点> --api-key-env <变量名> --model <模型id>
+不要用 npx paseo-dsh：那会跑 npm 上的上游 CLI，不是本分支代码。
 它输出的 YAML 片段【原样采用】。它会顺便告诉你两个必须处理的坑：
   - 如果 developer 角色被拒 -> 配置里必须有 compat.supportsDeveloperRole: false
   - reasoningEfforts 里的 off 必须留空（不写值）
   - 如果探测出 max，必须显式写进配置
 如果探测工具报错，把完整错误贴给我，不要自己编一个配置。
 
-■ 第四步：安装
-把 Paseo 会打印的那段「Plugins are trusted, unsandboxed code...」安全提示
-【原文转述给我】，并明确问我是否继续。得到我同意之后再装：
-  paseo plugin add npm:paseo-dsh
-如果 daemon 是 Paseo 0.12：装 ≥0.2.10 的 npm 版本即可（当前 latest 0.2.17 已满足；
-  更旧的 0.2.9 不含 0.12 适配，那种情况才改用源码装：
-  paseo plugin add github:liuxing7954/paseo-dsh:paseo-plugin）
-（插件首次加载会自己准备好 DSH profile，不需要跑任何脚本。）
-装完重启 Paseo daemon。
-
 ■ 第五步：写配置
-把第三步探测出的片段填进 ~/.dsh/profiles/paseo/cordis.patch.yml，
+把第四步探测出的片段填进 ~/.dsh/profiles/paseo/cordis.patch.yml，
 并补一段 agent-default-model 指向我选的主模型。
 如果那个文件里已经有内容，只做补充，不要覆盖。
 
 ■ 第六步：验证（不许跳）
-  npx paseo-dsh doctor
-（源码/github 安装时用仓库自己的 CLI，别让 npx 去下已发布包：
-  node <repo>/paseo-plugin/bin/paseo-dsh.mjs doctor）
+  node <插件目录>/bin/paseo-dsh.mjs doctor     # <插件目录> 同上：paseo plugin ls 的 DIRECTORY 列
+（不要用 npx paseo-dsh doctor：它跑的是 npm 上游稳定线的 CLI，验的不是本分支。）
 确认全绿（dsh/paseo 版本、profile、bridge、路由、key）。有问题就修，修完再跑一次。
 然后重启 Paseo daemon。
 
@@ -102,23 +108,18 @@ DSH 侧是一个 profile bundle。
 
 ## 安装（推荐，一行）
 
-用 Paseo 自己的插件安装器：
+本分支从 GitHub 源码安装——**这是唯一装到本分支代码的方式**：
 
 ```bash
-paseo plugin add npm:paseo-dsh
-paseo plugin ls          # 确认 dsh-paseo 已装
+paseo plugin add github:bccy/paseo-dsh:paseo-plugin
+paseo plugin ls          # 确认 dsh-paseo 已装；DIRECTORY 列就是插件目录（后面自检要用）
 ```
 
-> **版本提示（历史注记，2026-10-20）**：当时 npm 最新是 `0.2.9`（2026-10-17），不含 Paseo 0.12
-> 的适配。现在 npm 最新已到 `0.2.17`，`0.2.10` 的等待条件早已满足，直接用上面的
-> `paseo plugin add npm:paseo-dsh` 即可。源码安装方式仍然可用：
+> **npm 上的 `paseo-dsh`（最新 `0.2.17`）是上游稳定线**：装它拿到的是上游代码，
+> **不含本分支的功能**。只有明确要上游稳定线时才用 `paseo plugin add npm:paseo-dsh`。
 >
-> ```bash
-> paseo plugin add github:liuxing7954/paseo-dsh:paseo-plugin
-> ```
->
-> 注意 `liuxing7954/paseo-dsh`（不带前缀）会被 Paseo 当成 **registry** 源；`--path` 是
-> `:plugin/path` 后缀的旧写法，对 registry 源会直接报错。
+> 注意 `bccy/paseo-dsh`（**不带** `github:` 前缀）会被 Paseo 当成 **registry** 源；`--path`
+> 是 `:plugin/path` 后缀的旧写法，对 registry 源会直接报错。
 
 插件**首次加载会自己准备好 DSH profile**（默认 `~/.dsh/profiles/paseo`，用
 `DSH_PASEO_PROFILE` 可改名——改了之后 daemon 也必须用同一个值）和内嵌的 stdio
@@ -185,7 +186,9 @@ chmod 600 ~/.dsh/.credentials.yaml
 ### c) 自检 + 重启
 
 ```bash
-npx paseo-dsh doctor
+# 插件目录 = `paseo plugin ls` 里 dsh-paseo 那行的 DIRECTORY 列
+# （github 源装出来形如 ~/.paseo/plugins/dsh-paseo/<版本目录>/checkout/paseo-plugin）
+node <插件目录>/bin/paseo-dsh.mjs doctor
 ```
 
 它会检查 `dsh`/`paseo` 版本、profile 是否就绪、bridge 是否落地、路由是否填好、
@@ -193,11 +196,13 @@ npx paseo-dsh doctor
 **重启 Paseo daemon**（`paseo daemon restart`），在 Paseo 里新建会话时选
 **DeepSeek Harness** 这个 provider。
 
+> 别用 `npx paseo-dsh`：它解析到 npm 上的**上游稳定线**包，验的不是本分支的代码。
+
 > **不确定端点支不支持推理 / thinking 档位 / vision？** 用同一个 CLI 探测你的端点，
-> 它会直接打过去、把上面 a) 那段填好吐给你（同样不需要 clone）：
+> 它会直接打过去、把上面 a) 那段填好吐给你（同样不需要 clone 仓库）：
 >
 > ```bash
-> npx paseo-dsh probe \
+> node <插件目录>/bin/paseo-dsh.mjs probe \
 >   --base-url https://your-gateway/v1 \
 >   --api-key-env MY_GATEWAY_API_KEY \
 >   --model your-model-id
@@ -208,8 +213,10 @@ npx paseo-dsh doctor
 
 **完整走查与踩坑清单见 [docs/ADOPTION.md](docs/ADOPTION.md)。**
 
-相关地址：npm 包 <https://www.npmjs.com/package/paseo-dsh> · Paseo 社区目录
-<https://paseo.cafe/plugins/dsh-paseo> · 讨论帖
+相关地址：本分支仓库 <https://github.com/bccy/paseo-dsh> · Issue
+<https://github.com/bccy/paseo-dsh/issues> · npm 包（**上游稳定线**）
+<https://www.npmjs.com/package/paseo-dsh> · 上游插件目录页
+<https://paseo.cafe/plugins/dsh-paseo> · 上游讨论帖
 <https://github.com/getpaseo/paseo/discussions/6375>
 
 ## 本地开发 / 离线安装
@@ -221,7 +228,7 @@ profile、注册插件。`dsh-bridge` 的符号链接只是给「插件还没加
 资产，不是这个 checkout 目录。
 
 ```bash
-git clone https://github.com/liuxing7954/paseo-dsh && cd paseo-dsh
+git clone https://github.com/bccy/paseo-dsh && cd paseo-dsh
 ./install.sh --check     # 先看前提条件与将要使用的 profile，不做改动
 ./install.sh             # 创建/初始化 profile + 注册插件
 ```
@@ -250,7 +257,7 @@ paseo-dsh/
 │   ├── lib/transport.js #   自带 JSON-RPC 行传输（支持 server→client 请求）
 │   ├── lib/server.js    #   会话/计划/思考档位/catalog 的实现
 │   └── cordis.patch.yml #   bundle 补丁：往 dsh-base 上挂桥接与提问工具
-├── paseo-plugin/        # Paseo 侧：provider 插件（direct provider 实现；npm 包 paseo-dsh）
+├── paseo-plugin/        # Paseo 侧：provider 插件（direct provider 实现；同名 npm 包由上游发布）
 │   ├── index.server.ts  #   registerProvider() + 首次加载时自举 DSH profile
 │   ├── server/
 │   │   ├── provider.ts  #   连接、catalog、会话生命周期、权限卡片
@@ -260,7 +267,7 @@ paseo-dsh/
 │   │   ├── bootstrap.ts #   自举：写 profile 文件 + 把内嵌 bridge 落盘
 │   │   └── bridge-assets.ts # 生成物：bridge 的 base64 内嵌副本
 │   ├── lib/             #   doctor（自检）/ probe（能力探测）
-│   └── bin/paseo-dsh.mjs#   npx paseo-dsh {doctor|probe}
+│   └── bin/paseo-dsh.mjs#   CLI：doctor / probe
 ├── tools/               # 探测工具的瘦启动器（实现在 paseo-plugin/lib 里）
 ├── templates/           # profile 配置模板（含必踩的坑的注释）
 ├── harness/             # 独立探针，不依赖 Paseo 即可验证桥接与插件
@@ -326,12 +333,16 @@ FULL-AUDIT 的「待用户决定」），不是静默修复。
 
 ## 自测 / 本地验证（不需要 Paseo）
 
-**先跑随包 CLI 自检**（只读，不改任何东西）：
+**先跑仓库里的 CLI 自检**（只读，不改任何东西；在 checkout 里直接跑，不要用 `npx`——
+那是上游 npm 包）：
 
 ```bash
-npx paseo-dsh doctor          # 安装完整性：CLI/版本/profile/bridge/路由/key
-npx paseo-dsh probe --base-url <端点> --api-key-env <变量名> --model <模型id>   # 端点能力
+node paseo-plugin/bin/paseo-dsh.mjs doctor          # 安装完整性：CLI/版本/profile/bridge/路由/key
+node paseo-plugin/bin/paseo-dsh.mjs probe --base-url <端点> --api-key-env <变量名> --model <模型id>   # 端点能力
 ```
+
+> 从 github 源装到 Paseo 的插件带的是同一个 CLI：路径 = `paseo plugin ls` 的 DIRECTORY 列 +
+> `/bin/paseo-dsh.mjs`。
 
 **再对协议层做断言**（界面不可信，事件流才可信）：
 
@@ -546,19 +557,20 @@ settings 在 `describe()` 时对比 revision 后发出；绕过 `settings.write`
 插件的 `major.minor` **跟随它所适配的 DSH 线**：`0.2.x` 的插件对应 DSH `0.2.x`，
 patch 位是插件自己的发布计数。装的时候挑与 daemon 上 `dsh` 同一条线的版本即可。
 
-仓库里的版本号以 `paseo-plugin/package.json` 为**唯一来源**（本轮核对为 `0.2.16`）；npm 上
-最新发布是 `0.2.17`（`npm view paseo-dsh version`，2026-10-30）。发布等本机实测确认后再做；
-安装时挑与 daemon 上 `dsh` 同一条线的版本即可。
+仓库里的版本号以 `paseo-plugin/package.json` 为**唯一来源**（本轮核对为 `0.2.16`）。npm 上
+最新发布是 `0.2.17`（`npm view paseo-dsh version`，2026-10-30）——那是**上游稳定线**的版本：
+npm 包 `paseo-dsh` 由上游维护，本分支没有该包的发布权，所以**本次不发布 npm**，本分支只走
+github 源交付。安装时挑与 daemon 上 `dsh` 同一条线的版本即可。
 
 ## 更新日志
 
 按 npm 发布顺序记录每个 patch 的**用户可见变化**。`0.2.x` 的 minor 跟随它所适配的 DSH 线，
-patch 是本插件自己的发布计数；完整提交记录见
-[commits](https://github.com/liuxing7954/paseo-dsh/commits/main)。
+patch 是本插件自己的发布计数。**下面的版本号和 npm 链接来自上游发布线**（npm 上的 `paseo-dsh`）；
+本分支自己的改动看 [bccy 的 commits](https://github.com/bccy/paseo-dsh/commits/main)。
 
 | 版本 | 日期 | 更新内容 |
 | --- | --- | --- |
-| [0.2.17](https://www.npmjs.com/package/paseo-dsh/v/0.2.17) | 2026-10-30 | **统计行重新贴合页脚**：按页脚实际绘制的位置测量并贴齐，原生皮肤下「最新回合」和「被新回合顶下去」两种状态都稳定在约 4.5px 间距；字号统一为页脚同款 13px。量不到、找不到页脚或间距超出合理范围时退回宿主间距，native 不补偿；第三方主题的位置仍由主题自己控制。 |
+| [0.2.17](https://www.npmjs.com/package/paseo-dsh/v/0.2.17)（上游，本分支尚未合入） | 2026-10-30 | **统计行重新贴合页脚**：按页脚实际绘制的位置测量并贴齐，原生皮肤下「最新回合」和「被新回合顶下去」两种状态都稳定在约 4.5px 间距；字号统一为页脚同款 13px。量不到、找不到页脚或间距超出合理范围时退回宿主间距，native 不补偿；第三方主题的位置仍由主题自己控制。 |
 | [0.2.16](https://www.npmjs.com/package/paseo-dsh/v/0.2.16) | 2026-10-29 | **统计行回到默认位置**：移除 0.2.15 里的自动贴靠、DOM 测量与设置页，只保留内容显示（轮/步、首字、tok/s、上下文、缓存命中，点开展开明细）。位置交还给 Paseo 和主题，不再随展开/收起或换主题移动。`0.2.15` 已标记 deprecated。 |
 | [0.2.15](https://www.npmjs.com/package/paseo-dsh/v/0.2.15) | 2026-10-29 | **统计行贴合回合页脚**：统计行与「复制 / 模型 / 时间 / 耗时」页脚的间距在默认主题和主题插件下保持一致；回合完成时给最后一行打 `final`，web 端实测页脚的实际位置再贴齐，native 用常量回退。<br>**可配置**：Settings → Plugins →「回答统计行」可调间距（0–24px，默认 6）与字号（10–16px，默认 13）；未保存设置时行为与之前完全一致。<br>**字号与数字**：默认对齐页脚的 13px，数字等宽不跳动。 |
 | [0.2.14](https://www.npmjs.com/package/paseo-dsh/v/0.2.14) | 2026-10-28 | **统计行更直观**：收起行里的会话总 tokens 换成上下文占用百分比（如 `上下文 77%`），精确的 `已用 / 上限` 仍在展开详情里；其余计数与缓存命中口径不变。 |
@@ -585,17 +597,20 @@ patch 是本插件自己的发布计数；完整提交记录见
 - [docs/FIELD-NOTES.md](docs/FIELD-NOTES.md) — 七十余条真实缺陷的症状 → 根因 → 修法
 - [docs/GOAL.md](docs/GOAL.md) — 目标（goal）在 Paseo 中怎么工作：数据源、pill 与按钮、
   运行中发消息、重开后的恢复
+- [docs/REWIND.md](docs/REWIND.md) — 撤回：宿主侧行为、canary 顺序、0.15 原生刷新与降级行为
+- [docs/TEAM.md](docs/TEAM.md) — 团队（Agent Team）：共享任务、成员状态、pill 的显示与隐藏规则
 - [AGENTS.md](AGENTS.md) — 给 AI Agent 的说明（Codex 等会自动读取）。不管你是被叫来
   装它、还是被叫来改它，先看这个
 
 ## 联系
 
-用的时候卡住了、发现文档写错了、或者你用它接上了别的运行时——都欢迎直接发邮件：
+用的时候卡住了、发现文档写错了、或者你用它接上了别的运行时——都欢迎直接开 Issue：
 
-**jixy · [467677527@qq.com](mailto:467677527@qq.com)**
+**<https://github.com/bccy/paseo-dsh/issues>**
 
-提 issue 也行，但邮件我回得更快。
+这是本分支唯一的联系入口（不提供邮件支持）。
 
 ## 许可
 
-MIT，见 [LICENSE](LICENSE)。
+MIT。本分支继承自 [liuxing7954/paseo-dsh](https://github.com/liuxing7954/paseo-dsh)
+（MIT，原作者 jixy），修改与新增部分由 bccy 维护并署名，见 [LICENSE](LICENSE)。
