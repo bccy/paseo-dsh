@@ -782,6 +782,59 @@ export class PaseoHarnessServer {
     if (!child.opened) this.openChild(childId, child);
   }
 
+  /**
+   * Register one child from DSH's durable catalog so its live frames are forwarded.
+   *
+   * A bridge restarts with an empty `children` map while DSH's registry still holds
+   * children created by the previous process ("adopted" children). Those never
+   * re-emit the two live facts the label hold waits for — the child's own
+   * `subagent/descriptor` and the parent's `subagent/catalog` are stored log
+   * events, not live notifications — so such a child is registered without a
+   * label and every frame is parked until `CHILD_BUFFER_CAP` (500). A reused
+   * teammate's turn emits far fewer frames than that, so Paseo never received its
+   * `session.turn started` / status and its row stayed completed for the whole
+   * turn. Measured on a plugin reload: a teammate reused after the reload polled
+   * `completed` throughout, while one spawned after it showed `running`.
+   *
+   * The durable listing the plugin already requests on every open (to rebuild its
+   * tree) carries exactly the two facts the hold was waiting for — the parent edge
+   * and the creation label — so registering it here arms live forwarding without a
+   * re-announcement that will never come.
+   *
+   * Idempotent and non-opening: a known entry only fills gaps, and `opened` stays
+   * false so the child is still announced by its first live frame with the real
+   * title. Frames that raced in before this registration are released as soon as
+   * the label makes the hold's condition true (a reload while the child was
+   * mid-turn is exactly that shape).
+   *
+   * @param childId - durable child session id.
+   * @param parentId - durable direct parent session id.
+   * @param label - creation label from the catalog, when it carries one.
+   * @param mode - lifecycle mode (`continuable` / `one-shot`), when present.
+   */
+  registerCatalogChild(childId, parentId, label, mode) {
+    const existing = this.children.get(childId);
+    if (existing !== undefined) {
+      if (existing.label === undefined && label !== undefined) existing.label = String(label);
+      if (existing.mode === undefined && mode !== undefined) existing.mode = mode;
+      if (!existing.opened && existing.label !== undefined && existing.buffered.length > 0) {
+        this.openChild(childId, existing);
+      }
+      return;
+    }
+    // A nested child may be listed before its own parent's entry exists; fall back
+    // to the parent's pinned directory the same way the catalog fallback does.
+    const parent = this.children.get(parentId);
+    this.children.set(childId, {
+      parentId,
+      opened: false,
+      buffered: [],
+      cwd: parent?.cwd ?? this.sessionDirectoryFor(parentId),
+      ...(label === undefined ? {} : { label: String(label) }),
+      ...(mode === undefined ? {} : { mode }),
+    });
+  }
+
   /** Hold one child frame until the child is opened, bounded so output is never lost. */
   holdChildFrame(sessionId, child, frame) {
     // A `subagent/descriptor` is the child's own durable identity; its label is
@@ -2241,10 +2294,19 @@ export class PaseoHarnessServer {
     const headers = await this.#sessionHeaders();
     try {
       const rows = await subagents.listDescendants(params.sessionId);
+      const children = rows.filter((row) => row.kind === 'child');
+      // Register every durable child before answering. The plugin asks for this
+      // listing on each open to rebuild the tree; a bridge that restarted after a
+      // plugin reload otherwise has an empty `children` map and will hold an
+      // adopted child's live frames forever (see `registerCatalogChild`).
+      for (const row of children) {
+        const childId = String(row.id);
+        if (underArchivedSession(headers, archived, childId)) continue;
+        this.registerCatalogChild(childId, String(row.parentId), row.label, row.mode);
+      }
       return {
         available: true,
-        subagents: rows
-          .filter((row) => row.kind === 'child')
+        subagents: children
           .map((row) => ({
             sessionId: String(row.id),
             parentSessionId: String(row.parentId),

@@ -3210,3 +3210,57 @@ Paseo 子代理面板从第二个回合起不再显示「运行中」（终态�
 **验证（离线）**：`harness/subagent-check.cjs` **97/97**（假桥新增 `reuse`/`replay-hang` 模式：同一 native child 两回合、R 子两条信号同回合去重且第二回合只走 status、V 子两回合只发 `turn/start` 不发 status、W 子 `turn/start` 先于 status（反向时序）；新增 7 条断言——4 条复用 + 1 条「replay/skip/reload 的子代理树与 running 证据在 `session.ready` 前」+ 1 条「replay 挂起时 ready 仍在预算内发布、open 不卡死」+ 1 条「turn/start 先到 status 后到仍每回合恰一条 started」）。变异检验：把 `turn/start` 的宣告删掉 → 1 红（V 子 0 started）；把 ready 前的 `await replaySubagents()` 改回 ready 后延迟 → **≥1 红**（首条即 `tree#8 live#5 ready#6`；复审实测（当时 95 条版本）：单回退该 await 为 1 红（94 过），连 `markRootReady()` 一起回退为 2 红（93 过），快照与父子序断言同时响）；把有界预算改成无界（`settlesWithin` 直接等 replay）→ 1 红（挂起读实测 30089 ms 后 ready，预算断言失败，96/97）。`tsc --noEmit` exit 0；未改桥，`bridge-assets-check` 一致（**2/2**）。
 
 **真机复验（待做，未验证）**：装新插件并重载后，① 同一个 teammate 完成一回合后再 `send_message` 让它跑第二回合，面板行应重新显示「运行中」；② 在一个子代理正在跑时重载插件，行应在重载后重新出现（标题/状态保留，cold start 时被杀的子代理按 canceled 收尾，而不是消失）；③ 关掉再打开子代理详情页看第二回合历史（旧观察是详情页不增量刷新，与本条无关）；④ 桥 wedged 时打开会话应在 ~4 s 内出现而不是被 replay 拖住。真机由主会话执行。
+
+### 93. 插件重载后，已存在的（adopted）子代理 live 帧在桥里被无限 hold——复用回合永远不 running
+
+**症状**（2026-11-08 真机对照，daemon WS 探针）：插件 reload 后旧子代理 6 行仍在（#92 的 B 修复
+生效）；reload **之后**新 spawn 的 teammate 复用第二回合，轮询 11 次 running→completed，正常；
+reload **之前**就存在的 teammate（demo-teammate 等）复用回合（sleep 8 / sleep 20 两个长回合），
+25+ 次轮询全程 completed——它的 live 帧根本没到插件。与用户原始反馈一致：#92 的 A 只兜住了
+"收到 turn/start"，收不到帧的 adopted 子会话仍然不显示运行中。
+
+**根因（只在桥，第二层）**：插件 reload → 插件进程换新的 `dsh`/桥进程，桥的 `children` 表是空的。
+`observeChildSession`（`server.js:748-762`）从子会话自己的 header（`origin:'subagent'`）登记它，
+此时没有 label；`holdChildFrame`（`:786-800`）把每一帧 hold 到拿到 label 或攒满
+`CHILD_BUFFER_CAP = 500`（`:293`）才 `openChild` 转发（`:801-829`）。而 adopted 子会话的 label
+只在两处 durable 事实里：它自己的 `subagent/descriptor` 事件、父会话的 `subagent/catalog` 事件
+——两者都是**已写进日志的发布事实，桥重启后不会再 live 发一次**。于是 label 永远学不到，而一个
+回合的帧量（turn/start、step/start、request/header、assistant/message、step/end、turn/end、状态
+切换）远小于 500，`turn/start` 与 `agent/status→session.status` 全滞留在 buffer 里。新 spawn 的
+子会话恰好相反：它的 descriptor/catalog 在本进程内实时到达 → 立刻 open → 帧通。对照实验的两组
+差异至此闭合。
+
+**修法（只改桥）**：`subagents()`（即 `paseo/subagents`，插件每次 open 的 `replaySubagents` 都会
+调）在返回前把 durable 目录里的 child 行登记进 `children` —— 新增
+`registerCatalogChild(childId, parentId, label, mode)`：填 parent 边与 label/mode/cwd，`opened`
+仍保持 false（真正的标题仍由首帧到达时 announce 给 Paseo，不破坏 label 晚到语义）；若登记前已有
+帧被 hold（reload 那一刻子会话正在跑的窗口），**且该行在 durable 目录里带 label 时**，label 一到就
+`openChild` 就地释放；archived 子会话跳过（与 replay 一致，避免复活已归档行）。幂等：已有 entry
+只补空字段。失败降级：`subagents` 服务缺失/读取失败不登记，回到现状——行仍由 history 重放回来，
+只是运行态晚到/缺失，与修复前一致。
+
+**覆盖范围（收窄）**：本次修复覆盖**有 label 的 continuable 子会话**（teammate / `spawn_teammate`
+等，DSH 的 durable 目录为它们记录 creation label）；**无 label 的 one-shot 子会话仍按
+`CHILD_BUFFER_CAP` 语义延后 open（已知边界，未修）**——`registerCatalogChild` 只有拿到 label 才
+能释放已 hold 的帧，目录行没有 label 时它只登记 parent/edge、不提前 announce，最终仍等 CAP。
+
+**代价与边界**：不增加轮询或写盘——登记挂在插件本来就会发的 open-time catalog 读上；新会话路径
+完全不变（label 公告仍优先，登记只预填）。两处未覆盖，均已知不修：① 无 label 的 one-shot
+adopted 子会话（见上条「覆盖范围」），其 live 帧仍延后到 CAP；② 桥在"插件未 open 任何会话"的
+窗口里先收到 adopted 子会话帧（例如插件刚起、宿主尚未重开会话，而子会话又在跑）——这些帧仍按旧
+逻辑 hold，直到某次 open 的 catalog 读登记后释放。
+
+**验证（离线）**：`harness/bridge-server-check.mjs` **77/77**（新增 5 条 adopted-child 用例：
+hold 形状 0 帧 → 读 catalog 后 child-opened+status 释放、随后 turn/start 转发且只 announce 一次、
+重复读 catalog 不重复登记/宣告、children 表幂等；再补 4 条钉登记语义：登记后 0 帧时 `opened`
+保持 false（不提前 announce）、label/mode 传递与 cwd 回退（子会话取 server cwd、孙级继承父 entry
+的 cwd）、archived 行不进 children、archived 行不被后续 catalog 读重新武装（帧仍 hold））。
+变异：删掉 `subagents()` 里的登记循环 → **3 红**（登记+释放、turn/start 转发、children 幂等）；
+登记即 announce → 2 红；丢 mode → 1 红；去掉 archived 跳过 → 2 红；均还原后 77/77。
+`harness/subagent-check.cjs` 97/97 保留全绿；`plugin-build-check` 86；`plugin-check --self-test`
+过；`tsc --noEmit` exit 0。改了桥已重生成内嵌桥
+（`node paseo-plugin/scripts/generate-bridge-assets.mjs`），`bridge-assets-check` **2/2**。
+
+**真机复验（待做，未验证）**：`paseo daemon restart`/插件 reload 后，用一个 reload 前就存在的
+teammate 复用第二回合，WS 探针应看到 running→completed（此前全程 completed）；同场景再 spawn 一个
+新 teammate 复用，行为不得回归。真机由主会话执行。

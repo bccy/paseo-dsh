@@ -170,6 +170,11 @@ const SUBAGENTS = {
 function makeServer(services = {}, { stubCreate = true } = {}) {
   const created = [];
   const agents = new Map();
+  // Every `ctx.on(name, handler)` the server installs, so a check can deliver a
+  // DSH event into the real handler instead of guessing what it does.
+  const handlers = new Map();
+  // Notifications the server would have pushed to Paseo, in order.
+  const frames = [];
   const ctx = {
     get(name) {
       if (!(name in services)) return undefined;
@@ -177,11 +182,14 @@ function makeServer(services = {}, { stubCreate = true } = {}) {
       if (value instanceof Error) throw value;
       return value;
     },
-    on: () => () => {},
+    on(name, handler) {
+      handlers.set(name, handler);
+      return () => {};
+    },
     agents: { get: (id) => agents.get(id) },
   };
   const transport = {
-    notify() {},
+    notify(method, params) { frames.push({ method, params }); },
     write() {},
     flush: async () => {},
     request: async () => ({}),
@@ -195,7 +203,7 @@ function makeServer(services = {}, { stubCreate = true } = {}) {
       return { handle: { agent }, control: { dispose() {} } };
     };
   }
-  return { server, created };
+  return { server, created, handlers, frames };
 }
 
 /**
@@ -1130,6 +1138,137 @@ const present = () => ({
     'a cancel on a live session reaches the agent immediately',
     liveCalls.length === 1 && liveCalls[0] === 'cancel:user',
     JSON.stringify(liveCalls),
+  );
+}
+
+// ===== 8. an adopted child's live frames must reach Paseo ================
+// A plugin reload starts a fresh bridge process while DSH's durable registry
+// still holds children created by the previous one. Those "adopted" children
+// never re-emit the two live facts the label hold waits for (the child's own
+// `subagent/descriptor` and the parent's `subagent/catalog` are stored log
+// events), so the pre-fix bridge parked every frame until CHILD_BUFFER_CAP —
+// measured on a reload: a pre-existing teammate's reused turn stayed
+// `completed` for Paseo throughout. The durable catalog is where the plugin
+// already learns the tree, so reading it must also arm live forwarding.
+{
+  const adoptedRows = [
+    { kind: 'child', id: 'adopted-child', parentId: 'adopted-root', label: 'Adopted', mode: 'continuable' },
+  ];
+  const { server, handlers, frames } = makeServer({
+    subagents: { listDescendants: async () => adoptedRows },
+  });
+  const childSession = {
+    id: 'adopted-child',
+    header: { origin: 'subagent', parentSession: 'adopted-root', cwd: '/tmp' },
+  };
+  // The old drop shape: before the durable identity is read the frame is held.
+  handlers.get('agent/status')({ agent: { session: childSession }, status: 'running' });
+  check(
+    'an adopted child frame is parked before its durable identity is read (the old drop shape)',
+    frames.length === 0,
+    JSON.stringify(frames.map((frame) => frame.method)),
+  );
+
+  const listed = await server.subagents({ sessionId: 'adopted-root' });
+  const openedFrames = frames.filter((frame) => frame.method === 'session.child-opened');
+  check(
+    'reading the durable catalog registers the adopted child and releases its parked frames',
+    listed.available === true &&
+      listed.subagents.length === 1 &&
+      openedFrames.length === 1 &&
+      openedFrames[0].params.sessionId === 'adopted-child' &&
+      openedFrames[0].params.parentSessionId === 'adopted-root' &&
+      openedFrames[0].params.label === 'Adopted' &&
+      frames.some((frame) => frame.method === 'session.status' &&
+        frame.params.sessionId === 'adopted-child' && frame.params.status === 'running'),
+    JSON.stringify(frames.map((frame) => `${frame.method}:${String(frame.params?.sessionId ?? '')}`)),
+  );
+
+  frames.length = 0;
+  handlers.get('session/event')(childSession, { type: 'turn/start', seq: 1, data: { turn: 2 } });
+  check(
+    "an adopted child's live turn/start is forwarded (and announced only once)",
+    frames.some((frame) => frame.method === 'session.event' &&
+      frame.params.sessionId === 'adopted-child' && frame.params.event?.type === 'turn/start') &&
+      !frames.some((frame) => frame.method === 'session.child-opened'),
+    JSON.stringify(frames.map((frame) => `${frame.method}:${String(frame.params?.event?.type ?? '')}`)),
+  );
+
+  // Re-reading the catalog must not re-announce the child (it is already open),
+  // and a child the catalog never listed keeps the bounded-hold fallback.
+  frames.length = 0;
+  await server.subagents({ sessionId: 'adopted-root' });
+  check(
+    'a second catalog read registers nothing twice and announces nothing twice',
+    frames.length === 0,
+    JSON.stringify(frames.map((frame) => frame.method)),
+  );
+  check(
+    'the catalog registration is idempotent in the children table',
+    server.children.has('adopted-child') && server.children.get('adopted-child').opened === true,
+  );
+}
+
+// ===== 9. catalog registration is metadata-only and honours archived rows ====
+// The registration must only arm forwarding: announcing stays the first live
+// frame's job (Paseo can never update a title it was given early), the metadata
+// the hold needed is carried across, and an archived child must not be re-armed
+// through the listing (Paseo drops what the provider stops reporting, so an
+// announcement would resurrect a row the user archived).
+{
+  const rows = [
+    { kind: 'child', id: 'quiet-child', parentId: 'quiet-root', label: 'Quiet C', mode: 'continuable' },
+    { kind: 'child', id: 'quiet-grand', parentId: 'quiet-child', label: 'Quiet G', mode: 'one-shot' },
+  ];
+  const { server, frames } = makeServer({ subagents: { listDescendants: async () => rows } });
+  await server.subagents({ sessionId: 'quiet-root' });
+  const quiet = server.children.get('quiet-child');
+  const grand = server.children.get('quiet-grand');
+  check(
+    'catalog registration alone never announces a child (opened stays false)',
+    frames.length === 0 && quiet?.opened === false && grand?.opened === false,
+    JSON.stringify({ frames: frames.length, quietOpened: quiet?.opened, grandOpened: grand?.opened }),
+  );
+  check(
+    'catalog registration carries label/mode and resolves cwd down the parent chain',
+    quiet?.label === 'Quiet C' && quiet?.mode === 'continuable' && quiet?.parentId === 'quiet-root' &&
+      grand?.label === 'Quiet G' && grand?.mode === 'one-shot' && grand?.parentId === 'quiet-child' &&
+      // A child of a session the bridge does not own falls back to the server
+      // directory; a nested child inherits the directory its parent entry got.
+      quiet?.cwd === process.cwd() && grand?.cwd === quiet?.cwd,
+    JSON.stringify({ quiet: quiet?.cwd, grand: grand?.cwd, serverCwd: process.cwd() }),
+  );
+}
+{
+  const rows = [
+    { kind: 'child', id: 'archived-adopted', parentId: 'adopted-root', label: 'Archived A' },
+    { kind: 'child', id: 'kept-adopted', parentId: 'adopted-root', label: 'Kept K' },
+  ];
+  const { server, handlers, frames } = makeServer({
+    subagents: { listDescendants: async () => rows },
+    workspaceRegistry: { archivedSessionIds: ['archived-adopted'] },
+    sessionPersistence: { list: async () => [] },
+  });
+  await server.subagents({ sessionId: 'adopted-root' });
+  check(
+    'the catalog registration loop skips archived children',
+    server.children.has('archived-adopted') === false &&
+      server.children.get('kept-adopted')?.label === 'Kept K',
+    JSON.stringify([...server.children.keys()]),
+  );
+  // Even if that child's own session emits a frame (registered by its header),
+  // a later catalog read must not fill the label and release it: archived stays
+  // archived.
+  const archivedSession = {
+    id: 'archived-adopted',
+    header: { origin: 'subagent', parentSession: 'adopted-root', cwd: '/tmp' },
+  };
+  handlers.get('agent/status')({ agent: { session: archivedSession }, status: 'running' });
+  await server.subagents({ sessionId: 'adopted-root' });
+  check(
+    'an archived adopted child is not re-armed by a later catalog read (its frames stay held)',
+    frames.length === 0,
+    JSON.stringify(frames.map((frame) => `${frame.method}:${String(frame.params?.sessionId ?? '')}`)),
   );
 }
 

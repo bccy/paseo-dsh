@@ -437,16 +437,27 @@
   **动了 `#onData` / `#dispatchLine` 或 `#partial` 的分帧机制必跑（含未终止帧上限/溢出语义）。**
 - `harness/bridge-server-check.mjs` — 桥 server 本体（`dsh-bridge/lib/server.js`）的只读路径，
   用模块解析钩子把 `@deepseek-ai/*` 映到 DSH 安装目录后**驱动真实类**（假桥只能证明协议形状，
-  证明不了 server 自己的副作用）：`usage()` 不得复活已关闭的会话（`closedSessions` 闸门；
-  重新 initialize 过的与恢复会话的首次查询仍必须创建）、两处归档状态读取失败要**点名原因**
-  （服务缺失每进程一行、读取抛错每次一行，策略不变）、`paseo/permission/set` 必须真的到达一个
-  方法上（3047948 删了 `setPermission` 却留下 `case`，权限预设从此静默不生效），以及
+  证明不了 server 自己的副作用；**77 条**）：`usage()` 不得复活已关闭的会话（`closedSessions`
+  闸门；重新 initialize 过的与恢复会话的首次查询仍必须创建）、两处归档状态读取失败要**点名
+  原因**（服务缺失每进程一行、读取抛错每次一行，策略不变）、`paseo/permission/set` 必须真的
+  到达一个方法上（3047948 删了 `setPermission` 却留下 `case`，权限预设从此静默不生效），以及
   **`handleRequest` 的每个 `case` 调用的方法都必须在原型上**——那正是该回归的形状，任何行为
-  断言都看不出来。**依赖本机 DSH 安装，所以不进 CI**（`DSH_PACKAGES_DIR` / `DSH_INSTALL_DIR`
-  可覆盖，解析失败 exit 2 并打印实际目录）。**动了 `server.js` 的请求分派或这些只读路径必跑**；
-  **另外，凡动了 `server.js` 的请求分派、会话生命周期（`prompt`/`cancel`/`createSession`/
-  `closeSession`）、`listSessions` 或持久化读取区段也必跑**（新增断言覆盖 queued plan 双向
-  应用、query/cwd 不做窄预过滤、persistence signal/迟到句柄、冷会话创建中 cancel）。
+  断言都看不出来。**2026-11-08 新增 5 条（adopted child）**：桥进程重启后，DSH 已有子会话
+  （插件 reload 前创建的）不会重发 `subagent/descriptor`/父 `subagent/catalog`；检查记录
+  `ctx.on` handler 与 `transport.notify` 帧后断言——读 durable catalog（`paseo/subagents`，插件
+  每次 open 都会调）必须顺带登记该 child 并**在目录行带 label 时释放先前被 hold 的 status 帧**
+  （修前 0 帧，修后 child-opened+status；**无 label 的 one-shot 子会话不在此修复范围**，仍按 CAP
+  语义延后，见 FIELD-NOTES #93「覆盖范围」）、此后该 child 的 `session/event turn/start` 必须
+  转发且不重复 announce、重复读 catalog 不重复登记/宣告。**再补 4 条（2026-11-08 收尾）**：
+  登记后 0 帧时 `opened` 仍为 false（不提前 announce）、label/mode 传递且 cwd 回退正确（无主会话
+  取 server cwd、孙级继承父 entry 的 cwd）、登记循环跳过 archived 行、archived 行不被后续
+  catalog 读重新武装（其帧仍 hold）。**依赖本机 DSH 安装，所以不进 CI**
+  （`DSH_PACKAGES_DIR` / `DSH_INSTALL_DIR` 可覆盖，解析失败 exit 2 并打印实际目录）。**动了
+  `server.js` 的请求分派或这些只读路径必跑**；**另外，凡动了 `server.js` 的请求分派、会话生命
+  周期（`prompt`/`cancel`/`createSession`/`closeSession`）、`listSessions`、持久化读取区段，
+  或 `children` 的登记/hold/open（`observeChildSession`/`registerCatalogChild`/
+  `holdChildFrame`/`openChild`/`subagents()`）也必跑**（新增断言覆盖 queued plan 双向应用、
+  query/cwd 不做窄预过滤、persistence signal/迟到句柄、冷会话创建中 cancel）。
 - `harness/model-route-check.mjs` — 桥的**实时模型/思考档切换**是否真的到达 DSH（0.2.1/0.2.2
   双契约）：DSH 0.2.2 把 `installModelSelection` 改成单参（只装切换提示监听），实际路由由
   `agent.model.select()` 写入 durable `model/selection` 投影；旧桥还传第二参并只改
