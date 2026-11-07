@@ -395,6 +395,23 @@
   闸门、`DshChildSession.fail` 守卫、prompt 在 running 后失败仍有回合终态。**动了
   `server/session.ts` 的回合状态、`configure` 的提交顺序/回执回读、`DshSessionOptions.modes`、
   子会话 opened/label 闸门或 `DshChildSession.fail` 必跑。**
+- `harness/subagent-check.cjs` — 原生子代理可见性（脚本化假 `dsh` 驱动真实编译插件 +
+  一次性 `DSH_HOME`，不 spawn 真 DSH、不连 daemon；**97 条**）：能力位与 `restoration:"parent"`、
+  父子/嵌套归属、多子混排、未知子不误归属、子只读拒绝、恢复去重与 provider id 复用、
+  **Paseo 父能力门控**、无 subsession 时只回退根会话、父未就绪缓冲、`turn/end` 终态
+  （completed/aborted/failed）、`skip`/`replay` 重建、fork own-suffix、两个根观察同一 native
+  子会话不冲突、归档不重播、plugin reload 后子 id 不翻倍。**2026-11-08 新增 7 条**（假桥
+  `reuse`/`replay-hang` 模式）：同一 native child 的第二个回合不重播 `session.opened`；每回合
+  恰好一条 `session.turn started` 且 turnId 不同（agent status 与子会话 `turn/start` 同回合到达
+  必须去重）；**只发子会话自身 `turn/start`、不发 `session.status` 时仍出 started**（DSH
+  0.2.2-rc.1 回归的形状）；**turn/start 先到、status 后到仍每回合恰一条**（latch 顺序无关）；
+  `replay`/`skip`/reload 打开时子代理树与 running 证据必须发布在 `session.ready` **之前**
+  （宿主 rehydrate 快照窗口；改回 ready 后 `void replaySubagents()` 时间接败）且 root 的
+  `session.opened` 仍先于 child；**子会话 history 读挂起时 `session.ready` 仍须在 4 s 预算
+  （`SUBAGENT_REPLAY_READY_BUDGET_MS`）+ slack 内发布、open 不卡死**（假桥把这条读 park 到测试
+  写 release marker；无预算时实测 30 s 才 ready）。**动了 `session.ts` 的 `DshChildSession` 回合
+  状态（`event`/`status`/`#announceTurnStarted`）或 `provider.ts` 的 open 顺序/`replaySubagents`
+  接线/ready 预算必跑；假桥 `reuse`/`replay-hang` 模式改动同样必跑。**
 - `harness/mcp-gateway-guard-check.mjs` — gateway 的 `tool` 参数守卫（`resolveTargetTool`，模块
   私有，所以驱动真实的 `apply()` + `defineTool` 注册路径，用 loopback 假 server 接住本该成功的
   调用）：空串与纯空白、把网关自己的元工具名当目标（含大小写变体、零宽字符、CJK 键盘打出的全角

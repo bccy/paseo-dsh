@@ -174,8 +174,48 @@ const RELEASE_TIMEOUT_MS = 5_000;
  */
 const POOL_PLACEHOLDER_SESSION_ID = "__paseo_shared_process__";
 
+/**
+ * Total budget for the native-subagent tree replay that runs before readiness.
+ *
+ * The replay must finish before `session.ready` so the host's hydrate snapshot
+ * carries the replayed tree (that ordering is what keeps a reload from losing
+ * the parent's provider-subagent rows). But it reads one child log per child
+ * through the bridge, and every bridge request is itself bounded at 60 s: a
+ * wedged bridge would otherwise hold the open for 60 + 60N seconds before the
+ * conversation could even appear. This budget keeps both: a replay that settles
+ * in time is awaited exactly as before, and one that does not is published past
+ * immediately (the pre-fix open latency, bounded) while the replay keeps running
+ * in the background — rows then arrive as their frames do, i.e. the pre-fix
+ * behaviour. Normal replays are millisecond-scale local log reads, so the budget
+ * only ever fires on an unhealthy bridge.
+ */
+const SUBAGENT_REPLAY_READY_BUDGET_MS = 4_000;
+
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Await `work` for at most `ms`, reporting whether it settled inside the window.
+ *
+ * Expiry does **not** cancel `work`: the caller keeps it running in the
+ * background and must own its continuation (including its rejection). The timer
+ * is unref'd so a pending budget can never keep the process alive.
+ *
+ * @param work - promise whose settlement (value or throw) ends the wait.
+ * @param ms - bounded wait in milliseconds.
+ * @returns whether the work settled within the budget.
+ */
+function settlesWithin(work: Promise<unknown>, ms: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    timer.unref?.();
+    const settle = (): void => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    work.then(settle, settle);
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1945,12 +1985,14 @@ class DshConnection implements ProviderConnection {
           });
         }
       }
-      // Everything from here to `session.ready` is synchronous, so this one
-      // check covers the whole publish step. It replaces the old "release
-      // `#opening` then `#assertConnected`" pair for two reasons: the claims must
-      // be held through publication (a close that lands during the open has to
-      // invalidate it, not merely race it), and a torn-down connection must not
-      // announce a session it cannot serve. The catch below closes the instance.
+      // The claim has to survive the whole publish step, which is no longer
+      // synchronous: it spans the bounded subagent-replay await and is re-checked
+      // on the far side of it (after a close that landed meanwhile). It replaces
+      // the old "release `#opening` then `#assertConnected`" pair for two reasons:
+      // the claims must be held through publication (a close that lands during
+      // the open has to invalidate it, not merely race it), and a torn-down
+      // connection must not announce a session it cannot serve. The catch below
+      // closes the instance.
       this.#assertOpening(sessionId, opening, session);
     } catch (error) {
       // The daemon drops its own maps and rethrows on a failed open
@@ -2003,6 +2045,52 @@ class DshConnection implements ProviderConnection {
     this.#assertOpening(sessionId, opening, session);
     this.#emit({ type: "session.config", sessionId, config: session.configState() });
     this.#assertOpening(sessionId, opening, session);
+    // Rebuild the native subagent tree on every open (a fresh `skip` or a reopen
+    // `replay`) **before** readiness is published. It reads DSH's durable catalog
+    // and child logs; it never creates an agent, and a fresh session simply has
+    // none. The ordering is the fix for a reload losing rows: the daemon replays
+    // this provider session's history right after `session.ready` resolves
+    // (`agent-manager.js` deletes a parent's provider-subagent rows and re-applies
+    // them from `streamHistory()`), and history can only contain the child events
+    // that were emitted before it was read. Fire-and-forget after ready left the
+    // replayed tree outside that snapshot — and the same applies to a running
+    // child's only chance of showing as running.
+    //
+    // Bounded, because the replay reads one child log per child and every bridge
+    // request can stall: waiting forever would delay `session.ready` (and the
+    // whole conversation) behind a wedged bridge. Past the budget readiness is
+    // published anyway and the replay finishes in the background — rows then
+    // arrive as their frames do, i.e. the pre-fix behaviour, with the worst case
+    // now bounded here instead of by the per-child transport timeout.
+    const replay = session.replaySubagents().catch((error: unknown) => {
+      const message = messageOf(error);
+      process.stderr.write(`[${PROVIDER_ID}] subagent tree replay failed: ${message}\n`);
+      // `replaySubagents` reports its own per-child failures as notices; this is
+      // the last-resort channel for an unexpected throw. Readiness must still be
+      // published, or an unreadable subagent catalog would make a conversation
+      // that is otherwise fine impossible to open — but say so, because the
+      // subagent rows may be missing or stale for the rest of this generation.
+      // A failure that lands after the budget expired is stderr-only: readiness
+      // is already published and the warning list has been flushed.
+      openWarnings.push({
+        severity: "warning",
+        title: "子代理列表重放失败",
+        description: `重开会话时未能重建子代理列表（${message}）；本会话可能看不到正在运行的子代理。`,
+      });
+    });
+    if (!(await settlesWithin(replay, SUBAGENT_REPLAY_READY_BUDGET_MS))) {
+      process.stderr.write(
+        `[${PROVIDER_ID}] subagent tree replay exceeded ${String(SUBAGENT_REPLAY_READY_BUDGET_MS)}ms; `
+          + "publishing the open now and finishing the replay in the background "
+          + "(subagent rows may appear late for this session)\n",
+      );
+    }
+    this.#assertOpening(sessionId, opening, session);
+    // The root is open: release any child the bridge reported during the open,
+    // so a child is never emitted before its parent. Released before readiness on
+    // purpose — held child frames then land in this session's history alongside
+    // the replayed tree, which is the snapshot the daemon hydrates from.
+    session.markRootReady();
     this.#emit({ type: "session.ready", requestId: input.requestId, sessionId });
     // Same reentrancy window as above, but this one must **not** throw: readiness
     // was already published, so a close that came from that very emit has to end
@@ -2013,9 +2101,6 @@ class DshConnection implements ProviderConnection {
     for (const warning of openWarnings) {
       this.#notice(sessionId, warning.severity, warning.title, warning.description);
     }
-    // The root is open: release any child the bridge reported during the open,
-    // so a child is never emitted before its parent.
-    session.markRootReady();
     // A reopened session resumes DSH's stored context without a turn, so ask the
     // runtime for its occupancy now; otherwise the readout stays empty until the
     // next prompt even though the runtime already knows the numbers.
@@ -2028,10 +2113,6 @@ class DshConnection implements ProviderConnection {
     // `resumeAgentFromPersistence` starts the agent with no cached usage. So
     // re-publish the polled answer across the subscription window.
     void session.refreshUsage().then(() => session.publishUsageAfterOpen());
-    // Rebuild the native subagent tree on every open (a fresh `skip` or a reopen
-    // `replay`). It reads DSH's durable catalog and child logs; it never creates
-    // an agent, and a fresh session simply has none.
-    void session.replaySubagents();
   }
 
   /**

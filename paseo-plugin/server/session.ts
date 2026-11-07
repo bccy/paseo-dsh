@@ -1945,8 +1945,13 @@ export class DshSession {
         // case is carried by `replay()`'s own `turnOpen` instead: an open turn in
         // the child's log plus a process that never stopped is the proof.
         // Sampled here, after the history read, so no await can interleave
-        // between the check and the replay that consumes it.
-        const announcedLive = this.#children.has(row.sessionId);
+        // between the check and the replay that consumes it. A notice still
+        // *held* (the root has not gone ready yet) is just as much live evidence
+        // as an opened view: it came from the bridge during this same open. The
+        // tree replay now runs before `session.ready`, which is exactly when a
+        // live child can still be sitting in `#pendingOpened` — reading only
+        // `#children` then closed the adopted running child as canceled.
+        const announcedLive = this.#children.has(row.sessionId) || this.#isPendingChild(row.sessionId);
         // A one-shot child has no label in the durable catalog — DSH only requires
         // one for a continuable child — but the child's own `subagent/descriptor`
         // carries its creation label. Read it from the history *before* opening:
@@ -3528,11 +3533,19 @@ interface DshChildSessionOptions {
  * all addressed by the child's root-scoped provider id so nothing lands on the
  * parent.
  *
- * Paseo's plugin-provider child channel (`acceptChildEvent`) consumes only
- * `timeline.item`, terminal `session.turn`, and `session.runtime_failed` /
- * `session.closed`; a child's `session.turn started` and `session.usage` are
- * therefore ignored by the current host. They are still emitted with the
- * correct child identity rather than dropped or misattributed.
+ * Paseo's plugin-provider child channel (`acceptChildEvent`) maps a child's
+ * `session.turn started` to a running upsert (Paseo 0.15.0+; versions up to
+ * 0.14 dropped it), and consumes `timeline.item`, terminal `session.turn`,
+ * `session.runtime_failed` / `session.closed`. `session.usage` is still ignored
+ * by the host; every event is emitted with the correct child identity rather
+ * than dropped or misattributed.
+ *
+ * A child turn is announced from **two** live signals, the agent's `running`
+ * status and the child's own `turn/start` bracket, deduplicated per turn id.
+ * The status frame used to be the only source, which made the "running" chip
+ * depend on a bridge notification that can be held (a child still missing its
+ * label) or reordered by a DSH upgrade — a reused child's second turn then ran
+ * with no running state and no log line. See `#announceTurnStarted`.
  */
 export class DshChildSession {
   readonly id: string;
@@ -3541,6 +3554,16 @@ export class DshChildSession {
   readonly #timeline = new TimelineBuilder({ warn: (line) => this.#options.log(line) });
   #turnId: string | null = null;
   #turnEnded = false;
+  /**
+   * Whether `started` has already been announced for {@link #turnId}.
+   *
+   * Two independent live signals open a child turn — the agent's `running`
+   * status and the session's own `turn/start` event — and the bridge may carry
+   * both, in either order. The host turns every `session.turn started` into a
+   * running upsert, so a duplicate is harmless but noisy; this latch keeps one
+   * turn to one announcement, whichever signal wins.
+   */
+  #turnAnnounced = false;
   #lastUsage: ProviderUsage | undefined;
   #opened = false;
   /**
@@ -3616,7 +3639,15 @@ export class DshChildSession {
       const data = isRecord(event.data) ? event.data : {};
       this.#endTurn(childTurnState(data.reason));
     } else if (event.type === "turn/start") {
-      this.#turnEnded = false;
+      // The child's own turn bracket is the more direct live signal that a turn
+      // began: it rides the child's event channel, while `session.status` rides
+      // the agent lifecycle notification and can be held for a child whose label
+      // the bridge has not learned yet. DSH 0.2.2 also changed when a subagent
+      // session's events are published (session announcement now precedes agent
+      // registration), so relying on the status frame alone silently lost the
+      // second (reused) turn's running state. Announce here, deduplicated against
+      // the status path by turn id.
+      this.#announceTurnStarted();
     }
     if (event.type === "assistant/message") {
       const data = isRecord(event.data) ? event.data : {};
@@ -3640,11 +3671,7 @@ export class DshChildSession {
     if (this.#options.closed()) return;
     this.#observedLive = true;
     if (status === "running") {
-      if (this.#turnId === null) {
-        this.#turnId = `turn:${Date.now()}`;
-        this.#turnEnded = false;
-      }
-      this.#options.emit({ type: "session.turn", sessionId: this.id, turnId: this.#turnId, state: "started" });
+      this.#announceTurnStarted();
       return;
     }
     // Idle with no explicit `turn/end` observed: close the turn as completed
@@ -3652,10 +3679,34 @@ export class DshChildSession {
     if (this.#turnId !== null && !this.#turnEnded) this.#endTurn("completed");
   }
 
+  /**
+   * Announce that a child turn is running, once per turn id.
+   *
+   * Two live signals can open a turn — see {@link #turnAnnounced} — and either
+   * may arrive first, so both callers go through here: a new turn id is minted
+   * when none is open (or the previous one already ended), and the `started`
+   * event is emitted only by the first signal to claim the latch.
+   *
+   * The status path alone used to emit on every `running` transition; a
+   * transition arrives once per turn, so announcing per turn keeps that
+   * behaviour while letting `turn/start` stand in when the status frame is lost.
+   */
+  #announceTurnStarted(): void {
+    if (this.#turnEnded || this.#turnId === null) {
+      this.#turnId = `turn:${Date.now()}`;
+      this.#turnEnded = false;
+      this.#turnAnnounced = false;
+    }
+    if (this.#turnAnnounced) return;
+    this.#turnAnnounced = true;
+    this.#options.emit({ type: "session.turn", sessionId: this.id, turnId: this.#turnId, state: "started" });
+  }
+
   #endTurn(state: "completed" | "canceled" | "failed"): void {
     const turnId = this.#turnId ?? `turn:${Date.now()}`;
     this.#turnId = null;
     this.#turnEnded = true;
+    this.#turnAnnounced = false;
     this.#options.emit({ type: "session.turn", sessionId: this.id, turnId, state });
   }
 

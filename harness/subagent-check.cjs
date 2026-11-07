@@ -62,6 +62,11 @@ const MODE_FILE = path.join(process.env.DSH_HOME, "fake-dsh-mode");
 process.env.DSH_FAKE_MODE_FILE = MODE_FILE;
 fs.writeFileSync(MODE_FILE, "live\n");
 
+// Release marker for the fake bridge's `replay-hang` scenario: its parked
+// `paseo/history` read polls for this file, so the check can hold a bridge read
+// past the open's replay budget and then let the fake child serve again.
+const REPLAY_HANG_RELEASE = `${MODE_FILE}.replay-hang-release`;
+
 /** Point the long-lived fake child at a new scenario. */
 function setMode(value) {
   process.env.DSH_FAKE_MODE = value;
@@ -435,11 +440,20 @@ async function openSession(conn, sessionId, history) {
   await untilIn(conn3Events, (e) => e.type === "session.ready" && e.sessionId === rootD, "rootD ready", 30000);
   const earlyChild = await untilIn(conn3Events, (e) => e.type === "session.opened" && e.sessionId === scoped(rootD, "child-E"), "child-E opened", 30000);
   const readyIdx = conn3Events.findIndex((e) => e.type === "session.ready" && e.sessionId === rootD);
+  const rootOpenedIdx = conn3Events.findIndex((e) => e.type === "session.opened" && e.sessionId === rootD && e.parentSessionId === undefined);
   const openedIdx = conn3Events.findIndex((e) => e.type === "session.opened" && e.sessionId === scoped(rootD, "child-E"));
+  // The hold keeps a child from being *announced* before its parent exists; it now
+  // releases **before** `session.ready` on purpose. Everything this open publishes
+  // (the replayed child tree included) has to be inside the provider history the
+  // host hydrates from after readiness, and frames sent after ready can miss that
+  // snapshot. The host buffers child events until readiness itself
+  // (`holdPendingOpenDescendant`), so the child still lands after the parent: the
+  // root's own `session.opened` must still precede the child, or the host swallows
+  // a child opened under a parent it never accepted.
   check(
-    "a child reported before the parent was ready is held and released after session.ready",
-    earlyChild.parentSessionId === rootD && openedIdx > readyIdx,
-    `ready#${readyIdx} child#${openedIdx}`,
+    "a child reported before the parent was ready is held, then released before session.ready so the open snapshot carries it",
+    earlyChild.parentSessionId === rootD && rootOpenedIdx >= 0 && rootOpenedIdx < openedIdx && openedIdx < readyIdx,
+    `root#${String(rootOpenedIdx)} ready#${readyIdx} child#${openedIdx}`,
   );
 
   // ---- a replayed one-shot child: label only in its own history ----------
@@ -1181,6 +1195,23 @@ async function openSession(conn, sessionId, history) {
     archivedAnnouncements.length === 0,
     archivedAnnouncements.length === 0 ? "" : `child-Z was announced ${archivedAnnouncements.length}x`,
   );
+  // The reopen is the one moment the daemon deletes a parent's provider-subagent
+  // rows and rebuilds them from this provider session's history
+  // (`agent-manager.js` cancelRunningProviderSubagents + deleteParent, then a
+  // streamHistory pass). History is read when the ready reply resolves, so the
+  // rebuilt tree has to be published **before** `session.ready` or it lands in a
+  // window no row ever reads: the rows vanish at reload and do not come back.
+  // The live child (child-M) is included: its "running" is the host's default on
+  // attach, which only survives if the announcement is part of the same snapshot.
+  const replayReadyIndex = replayed.findIndex((e) => e.type === "session.ready" && e.sessionId === rootA);
+  const replayedTreeIndex = replayed.findIndex((e) => e.type === "session.opened" && e.sessionId === childAScoped);
+  const replayedLiveIndex = replayed.findIndex((e) => e.type === "session.opened" && e.sessionId === scoped(rootA, "child-M"));
+  check(
+    "the replayed subagent tree is published before session.ready (the host's hydrate snapshot)",
+    replayReadyIndex > 0 && replayedTreeIndex >= 0 && replayedTreeIndex < replayReadyIndex &&
+      replayedLiveIndex >= 0 && replayedLiveIndex < replayReadyIndex,
+    `tree#${String(replayedTreeIndex)} live#${String(replayedLiveIndex)} ready#${String(replayReadyIndex)}`,
+  );
 
   // ---- a root killed with a tool in flight -------------------------------
   // The root replay builds its rows with a *local* builder, so the live builder
@@ -1656,11 +1687,142 @@ async function openSession(conn, sessionId, history) {
     `${String(reloadChild4)} vs ${scoped(reloadRoot4, String(reloadParts1[1]))}`,
   );
 
+  // ---- a reused child announces running on every turn ---------------------
+  // A DSH teammate is reused by delivering another message into the same native
+  // child session. Until this fix the only live signal that opened a child turn
+  // was the agent's `running` status (`DshChildSession.status`); the child's own
+  // `turn/start` bracket was ignored. A status frame the bridge holds (a child
+  // whose label has not been learned yet) therefore left the reused row with no
+  // running state and no log line, which is the reported regression. The fake
+  // `reuse` mode splits the two signals across two children:
+  //   reuse-child-R — status + turn/start on turn 1 (must dedupe), status only
+  //                   on turn 2 (the pre-existing path still works);
+  //   reuse-child-V — turn/start only, on both turns, never a status frame (the
+  //                   new source; count is 0 before the fix).
+  const connReuse = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+  const reuseEvents = [];
+  connReuse.onEvent((e) => reuseEvents.push(e));
+  const reuseRoot = `subReuse-${Date.now()}`;
+  setMode("reuse");
+  await connReuse.send({ type: "session.open", sessionId: reuseRoot, config: { cwd: process.cwd(), mode: "build" }, history: "skip" });
+  await untilIn(reuseEvents, (e) => e.type === "session.ready" && e.sessionId === reuseRoot, "reuse root ready", 30000);
+  const reusedR = scoped(reuseRoot, "reuse-child-R");
+  const reusedV = scoped(reuseRoot, "reuse-child-V");
+  const reusedW = scoped(reuseRoot, "reuse-child-W");
+  // `untilSince` reads the suite-wide `events` sink; this case keeps its own
+  // per-connection sink, so it waits on that array instead.
+  const reuseUntil = async (mark, predicate, label) => {
+    const started = Date.now();
+    while (Date.now() - started < 30000) {
+      const hit = reuseEvents.slice(mark).find(predicate);
+      if (hit) return hit;
+      await sleep(50);
+    }
+    throw new Error(`timed out waiting for ${label}`);
+  };
+  const reuseTurn = async (clientMessageId, expectOpen) => {
+    const mark = reuseEvents.length;
+    await connReuse.send({
+      type: "session.prompt",
+      sessionId: reuseRoot,
+      prompt: { clientMessageId, input: { type: "message", content: [{ type: "text", text: "again" }] } },
+    });
+    if (expectOpen) {
+      // Turn 1 opens both children; turn 2 must reuse them, not re-announce.
+      await reuseUntil(mark, (e) => e.type === "session.opened" && e.sessionId === reusedR, `${clientMessageId} R opened`);
+      await reuseUntil(mark, (e) => e.type === "session.opened" && e.sessionId === reusedV, `${clientMessageId} V opened`);
+      await reuseUntil(mark, (e) => e.type === "session.opened" && e.sessionId === reusedW, `${clientMessageId} W opened`);
+    }
+    await reuseUntil(mark, (e) => e.type === "session.turn" && e.sessionId === reusedR && e.state === "completed", `${clientMessageId} R completed`);
+    await reuseUntil(mark, (e) => e.type === "session.turn" && e.sessionId === reusedV && e.state === "completed", `${clientMessageId} V completed`);
+    await reuseUntil(mark, (e) => e.type === "session.turn" && e.sessionId === reusedW && e.state === "completed", `${clientMessageId} W completed`);
+  };
+  await reuseTurn("reuse-1", true);
+  await reuseTurn("reuse-2", false);
+  const reopened = reuseEvents.filter(
+    (e) => e.type === "session.opened" && (e.sessionId === reusedR || e.sessionId === reusedV || e.sessionId === reusedW),
+  );
+  check(
+    "the reuse turn does not re-announce the child (same native session, same provider id)",
+    reopened.length === 3,
+    `${String(reopened.length)} child announcement(s) across 2 turns`,
+  );
+  const startedFor = (sessionId) => reuseEvents.filter((e) => e.type === "session.turn" && e.sessionId === sessionId && e.state === "started");
+  const completedFor = (sessionId) => reuseEvents.filter((e) => e.type === "session.turn" && e.sessionId === sessionId && e.state === "completed");
+  const rStarted = startedFor(reusedR);
+  const rTurnIds = new Set(rStarted.map((e) => e.turnId));
+  const vStarted = startedFor(reusedV);
+  const vTurnIds = new Set(vStarted.map((e) => e.turnId));
+  check(
+    "a reused child announces running once per turn (status + turn/start deduplicated)",
+    rStarted.length === 2 && rTurnIds.size === 2 && completedFor(reusedR).length === 2,
+    `${String(rStarted.length)} started / ${String(rTurnIds.size)} turn id(s) for 2 turns`,
+  );
+  check(
+    "a child turn signalled only by its own turn/start still announces running",
+    vStarted.length === 2 && vTurnIds.size === 2 && completedFor(reusedV).length === 2,
+    `${String(vStarted.length)} started / ${String(vTurnIds.size)} turn id(s) with no session.status frame`,
+  );
+  check(
+    "the two live signals never mint two started events for one child turn",
+    rStarted.length === rTurnIds.size && vStarted.length === vTurnIds.size,
+    `R ${String(rStarted.length)} vs ${String(rTurnIds.size)}, V ${String(vStarted.length)} vs ${String(vTurnIds.size)}`,
+  );
+  const wStarted = startedFor(reusedW);
+  const wTurnIds = new Set(wStarted.map((e) => e.turnId));
+  check(
+    "the announcement is order-independent: turn/start before status still yields one started per turn",
+    wStarted.length === 2 && wTurnIds.size === 2 && completedFor(reusedW).length === 2,
+    `${String(wStarted.length)} started / ${String(wTurnIds.size)} turn id(s) with the bracket first`,
+  );
+
+  // ---- a wedged subagent replay must not hold the open --------------------
+  // The replay that precedes `session.ready` reads one child log per child, and
+  // each bridge request can stall (60 s transport bound): without a total budget
+  // a wedged bridge keeps the conversation invisible for 60 + 60N seconds. The
+  // fake bridge's `replay-hang` mode parks the single child-log read until this
+  // check releases it, so the budget is the only thing that can publish
+  // readiness inside the wait below.
+  const connHang = await registration.connect({ capabilities: ["prompt.message", "session.subsession", "session.persistence"] });
+  const hangEvents = [];
+  connHang.onEvent((e) => hangEvents.push(e));
+  const hangRoot = `subHang-${Date.now()}`;
+  fs.rmSync(REPLAY_HANG_RELEASE, { force: true });
+  setMode("replay-hang");
+  const hangStarted = Date.now();
+  await connHang.send({
+    type: "session.open",
+    sessionId: hangRoot,
+    config: { cwd: process.cwd(), mode: "build" },
+    persistence: { version: 1, data: { sessionId: hangRoot } },
+    history: "replay",
+  });
+  const hangReady = await untilIn(
+    hangEvents,
+    (e) => e.type === "session.ready" && e.sessionId === hangRoot,
+    "wedged-replay root ready",
+    12000,
+  ).catch(() => undefined);
+  const hangElapsed = Date.now() - hangStarted;
+  check(
+    "a wedged subagent replay does not hold session.ready past its budget (the open stays usable)",
+    hangReady !== undefined && hangElapsed < 6000,
+    hangReady === undefined
+      ? `no session.ready within 12000ms (replay wait is unbounded)`
+      : `${String(hangElapsed)}ms — budget 4000ms + slack; the parked child-log read would otherwise wait its 60s transport bound`,
+  );
+  // Let the parked read finish (it then throws, which the replay reports as a
+  // notice in the background) so this fake child can serve the teardown frames.
+  fs.writeFileSync(REPLAY_HANG_RELEASE, "release");
+  await sleep(300);
+  await connHang.close().catch(() => undefined);
+
   await conn.close();
   await conn2.close();
   await conn3.close();
   await conn4.close();
   await connFail.close();
+  await connReuse.close();
 
   // There is no skip path any more: the one that existed (the replay rebuild) is a
   // hard assertion, and every unproven case must be written as a failing `check`.

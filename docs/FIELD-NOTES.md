@@ -3186,3 +3186,27 @@ profile 时后加载的覆盖前者（同版本写同样字节，正常部署只
 旧版 `install.sh` 已经在 `<profile>/node_modules` 建的符号链接仍会被下一次插件加载的
 `retireLegacyBridge()` 迁移走（与修前 bootstrap 覆盖符号链接的行为一致）。pnpm ≤11 本来没有
 orphan 清理，此改动对它们同样成立（桥不在 pnpm 范围内）。
+
+---
+
+## 第二十五轮：复用的子代理第二回合没有「运行中」，插件重载又丢行（DSH 0.2.2-rc.1）
+
+### 92. 复用同一 child session 的第二回合不显示运行中；插件重载后正在跑的子代理行消失且不恢复
+
+**症状**：① 同一个 DSH teammate 被复用（向同一 native child session 再发一条消息）时，
+Paseo 子代理面板从第二个回合起不再显示「运行中」（终态倒是会更新）；② 插件重载时，
+原本在跑的子代理行从面板消失、之后也不再回来。两处都在 DSH 从 0.2.1-rc.x 升到
+0.2.2-rc.1 之后出现，Paseo 0.15.3。
+
+**根因有两处，都在我们这一侧，宿主不用动**：
+
+| 层 | 根因 | 修法 |
+|----|------|------|
+| 运行中信号 | `DshChildSession` 只在 agent 的 `running` **status** 帧上 emit `session.turn started`；子会话自己的 `turn/start` 事件只清 `#turnEnded`、不发 started。桥在子会话 label 尚未学会时会 hold 该 status（`server.js` `holdChildFrame`，`CHILD_BUFFER_CAP` 才放行），而 DSH 0.2.2-rc.1 改了子会话的发布时序（`dsh-subagent` 的 `appendDelegatedPolicyOverrides` 注释放从 "unpublished child's session" 改为 "after Session announcement and before Agent registration"；projection 注册改 `await ctx.sessionProjections.register(...)`；release notes： 「Session Projection 注册 API 调整为异步」「修复会话创建、恢复和销毁期间的事件发布与清理顺序；初始化事件可实时订阅」）。状态帧晚到/不到时，第二回合就一条 running 事件都没有，而且不留日志 | `session.ts` 新增 `#announceTurnStarted()`：agent status 与子会话 `turn/start` 两个 live 信号都走它，同一 turnId 只 emit 一次（新 turn 从 `turn/end` 后重新开 id），纯 status 路径行为不变 |
+| 重载丢行 | `provider.ts` 在 `session.ready` **之后** `void session.replaySubagents()`，而宿主 reload 依次做 `cancelRunningProviderSubagents()` + `providerSubagents.deleteParent()`（`agent-manager.js`），随后只从 provider `streamHistory()` 的 `provider_subagent` 事件重建行。ready 之后才发出的子会话树不在那个快照里：行被删掉，晚到的重播落进宿主已订阅不到的窗口 | `provider.ts` open 流程改为 ready **前** `await session.replaySubagents()`，并把 `markRootReady()` 一起提前（子事件在宿主侧仍由 `holdPendingOpenDescendant` 挂到 ready 之后释放，父子顺序不变）。该 await 有 4 s 总预算（`SUBAGENT_REPLAY_READY_BUDGET_MS`）：超时就先发 ready、剩余 replay 后台收尾（行按到达 upsert，退化回修复前行为但有界），否则桥 wedged 时打开要等 60+60N 秒。顺带：`replaySubagents` 的 live 证据判定把「仍 held 的 child 通知」也算上（否则提前后 label 未知的 adopted child 会被误判成 killed 而 close 成 canceled） |
+
+**为什么以前不犯**：宿主 ≤0.14 的 `acceptChildEvent` 显式丢弃子会话 `session.turn started`，当时靠本机 childRunning 补丁顶上；Paseo 0.15.0 上游把 started 映射为 running（已安装 0.15.3 dist 的 `plugin-provider.js` `acceptChildEvent` 无过滤），补丁随之退役——宿主能消费了，但插件只在 status 帧这条单一来源上发 started，DSH 升版把这个来源弄丢后没有任何兜底。
+
+**验证（离线）**：`harness/subagent-check.cjs` **97/97**（假桥新增 `reuse`/`replay-hang` 模式：同一 native child 两回合、R 子两条信号同回合去重且第二回合只走 status、V 子两回合只发 `turn/start` 不发 status、W 子 `turn/start` 先于 status（反向时序）；新增 7 条断言——4 条复用 + 1 条「replay/skip/reload 的子代理树与 running 证据在 `session.ready` 前」+ 1 条「replay 挂起时 ready 仍在预算内发布、open 不卡死」+ 1 条「turn/start 先到 status 后到仍每回合恰一条 started」）。变异检验：把 `turn/start` 的宣告删掉 → 1 红（V 子 0 started）；把 ready 前的 `await replaySubagents()` 改回 ready 后延迟 → **≥1 红**（首条即 `tree#8 live#5 ready#6`；复审实测（当时 95 条版本）：单回退该 await 为 1 红（94 过），连 `markRootReady()` 一起回退为 2 红（93 过），快照与父子序断言同时响）；把有界预算改成无界（`settlesWithin` 直接等 replay）→ 1 红（挂起读实测 30089 ms 后 ready，预算断言失败，96/97）。`tsc --noEmit` exit 0；未改桥，`bridge-assets-check` 一致（**2/2**）。
+
+**真机复验（待做，未验证）**：装新插件并重载后，① 同一个 teammate 完成一回合后再 `send_message` 让它跑第二回合，面板行应重新显示「运行中」；② 在一个子代理正在跑时重载插件，行应在重载后重新出现（标题/状态保留，cold start 时被杀的子代理按 canceled 收尾，而不是消失）；③ 关掉再打开子代理详情页看第二回合历史（旧观察是详情页不增量刷新，与本条无关）；④ 桥 wedged 时打开会话应在 ~4 s 内出现而不是被 replay 拖住。真机由主会话执行。

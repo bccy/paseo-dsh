@@ -14,6 +14,14 @@
  *            leave it running, and a second (`team-child-I`) that runs and goes
  *            idle — the team pill's running overlay is read from exactly this
  *            (`harness/team-server-check.cjs`).
+ *   reuse    two turns on the same native child sessions, the shape a reused
+ *            DSH teammate produces. `reuse-child-R` gets both live signals each
+ *            turn (agent status *then* the session's own `turn/start`), with
+ *            turn 2 carrying only the status; `reuse-child-V` gets only the
+ *            `turn/start` bracket and **no** `session.status` at all, which is
+ *            the frame a bridge holds for a child whose label it has not learned
+ *            yet. `harness/subagent-check.cjs` pins that every turn announces
+ *            `session.turn started` exactly once, from either signal.
  *   early    emit a child-opened + child event right after the parent's first
  *            session request, before the plugin emits `session.ready`
  *   nested   after the root is ready, report a grandchild (and great-grandchild)
@@ -24,6 +32,12 @@
  *            carries a killed child whose log stops inside a turn with no
  *            terminal, and a live child with the same shape that the bridge
  *            announces during the open, so the two can be told apart
+ *   replay-hang
+ *            answer `paseo/subagents` with one child (`child-H`) whose log read
+ *            (`paseo/history`) parks until the test writes
+ *            `<DSH_FAKE_MODE_FILE>.replay-hang-release`; a wedged bridge then
+ *            holds the open's pre-ready replay past its budget and the test can
+ *            release it
  *   error    answer `paseo/subagents` with `available: false` and an error
  *   history-error
  *            reject `paseo/history` (transport failure, not `available:false`)
@@ -583,6 +597,76 @@ async function emitTeam() {
   notify("session.status", { sessionId: "team-child-I", status: "running" });
   notify("session.event", { sessionId: "team-child-I", event: { type: "turn/end", seq: 1, data: { turn: 1, reason: { kind: "completed" } } } });
   notify("session.status", { sessionId: "team-child-I", status: "idle" });
+}
+
+/**
+ * `reuse` mode: one turn of two reused native children, invoked once per prompt.
+ *
+ * Both children are opened on the first turn and reused (same native session)
+ * on the second — the teammate shape. The two children split the two live
+ * signals a child turn now has:
+ *
+ * - `reuse-child-R` sends agent status **and** `turn/start` on the first turn
+ *   (dedupe case) and only the agent status on the second (the pre-existing
+ *   status path must keep working);
+ * - `reuse-child-V` sends only the `turn/start` bracket, on both turns, and no
+ *   `session.status` at all — the signal the bridge can hold for a label-less
+ *   child, and the one the fix adds as a source.
+ * - `reuse-child-W` is the reverse order: its `turn/start` bracket arrives
+ *   **before** the agent status on both turns, so the latch must be
+ *   order-independent (bracket first must not make the later status duplicate).
+ *
+ * @param turn - 1-based turn number, driven by the prompt count.
+ */
+async function emitReuseTurn(turn) {
+  const root = rootId;
+  const reuseR = "reuse-child-R";
+  const reuseV = "reuse-child-V";
+  const reuseW = "reuse-child-W";
+  notify("session.status", { sessionId: root, status: "running" });
+  if (turn === 1) {
+    notify("session.child-opened", { sessionId: reuseR, parentSessionId: root, mode: "continuable", label: "Reuse R", cwd: "/tmp" });
+    notify("session.child-opened", { sessionId: reuseV, parentSessionId: root, mode: "continuable", label: "Reuse V", cwd: "/tmp" });
+    notify("session.child-opened", { sessionId: reuseW, parentSessionId: root, mode: "continuable", label: "Reuse W", cwd: "/tmp" });
+  }
+  // R: both signals for one turn; the duplicate started must be deduplicated.
+  notify("session.status", { sessionId: reuseR, status: "running" });
+  notify("session.event", { sessionId: reuseR, event: { type: "turn/start", seq: turn * 10, data: { turn } } });
+  notify("session.event", {
+    sessionId: reuseR,
+    event: {
+      type: "assistant/message",
+      seq: turn * 10 + 1,
+      data: { turn, step: 1, message: { id: `reuse-r-${turn}`, content: [{ type: "text", text: `reuse R turn ${turn}` }] } },
+    },
+  });
+  notify("session.event", { sessionId: reuseR, event: { type: "turn/end", seq: turn * 10 + 2, data: { turn, reason: { kind: "completed" } } } });
+  notify("session.status", { sessionId: reuseR, status: "idle" });
+  // V: only the session's own bracket — no status frame anywhere.
+  notify("session.event", { sessionId: reuseV, event: { type: "turn/start", seq: turn * 10 + 3, data: { turn } } });
+  notify("session.event", {
+    sessionId: reuseV,
+    event: {
+      type: "assistant/message",
+      seq: turn * 10 + 4,
+      data: { turn, step: 1, message: { id: `reuse-v-${turn}`, content: [{ type: "text", text: `reuse V turn ${turn}` }] } },
+    },
+  });
+  notify("session.event", { sessionId: reuseV, event: { type: "turn/end", seq: turn * 10 + 5, data: { turn, reason: { kind: "completed" } } } });
+  // W: the bracket arrives before the agent status, the reverse of R's order.
+  notify("session.event", { sessionId: reuseW, event: { type: "turn/start", seq: turn * 10 + 6, data: { turn } } });
+  notify("session.status", { sessionId: reuseW, status: "running" });
+  notify("session.event", {
+    sessionId: reuseW,
+    event: {
+      type: "assistant/message",
+      seq: turn * 10 + 7,
+      data: { turn, step: 1, message: { id: `reuse-w-${turn}`, content: [{ type: "text", text: `reuse W turn ${turn}` }] } },
+    },
+  });
+  notify("session.event", { sessionId: reuseW, event: { type: "turn/end", seq: turn * 10 + 8, data: { turn, reason: { kind: "completed" } } } });
+  notify("session.status", { sessionId: reuseW, status: "idle" });
+  notify("session.status", { sessionId: root, status: "idle" });
 }
 
 async function emitScenario() {
@@ -1192,6 +1276,14 @@ async function handle(method, params, id) {
     }
     case "paseo/subagents":
       if (mode() === "error") return { available: false, subagents: [], error: { message: "subagent catalog exploded" } };
+      if (mode() === "replay-hang") {
+        // One child whose log read is parked below: the open must keep its own
+        // bounded replay budget instead of waiting for this read.
+        return {
+          available: true,
+          subagents: [{ sessionId: "child-H", parentSessionId: String(params?.sessionId ?? ""), mode: "continuable", label: "Wedged H" }],
+        };
+      }
       if (mode() === "replay-no-turn") {
         // A distinct id from `label-never`'s `child-N`: the two scenarios assert
         // opposite things about "a child with no turn" (one has 40 frames of
@@ -1238,6 +1330,17 @@ async function handle(method, params, id) {
       };
     case "paseo/history": {
       const sid = String(params?.sessionId ?? "");
+      // A wedged bridge: park this child's log read until the test releases it.
+      // The release marker lives beside the mode file so both sides derive the
+      // same path without another env variable.
+      if (mode() === "replay-hang" && sid === "child-H") {
+        const release = `${process.env.DSH_FAKE_MODE_FILE ?? ""}.replay-hang-release`;
+        const deadline = Date.now() + 30000;
+        while (!existsSync(release) && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        throw new Error("paseo/history held by the wedged-bridge scenario, then released");
+      }
       // The transport failure shape of `paseo/history`: the request rejects
       // instead of answering `{available:false}`. A reopened session must still
       // say why its conversation is blank (`harness/open-degrade-check.mjs`).
@@ -1371,6 +1474,14 @@ async function handle(method, params, id) {
       if (mode() === "team" && !state.emitted) {
         state.emitted = true;
         setTimeout(() => { void emitTeam(); }, 30);
+      }
+      if (mode() === "reuse") {
+        // One scripted turn per prompt: turn 1 opens the two children, turn 2
+        // reuses the same native sessions (no second `child-opened`).
+        state.promptCount = (state.promptCount ?? 0) + 1;
+        const turn = state.promptCount;
+        if (turn <= 2) setTimeout(() => { void emitReuseTurn(turn); }, 20);
+        return { messageId: `m-reuse-${String(turn)}` };
       }
       if (mode() === "nested" && !state.emitted) {
         state.emitted = true;
