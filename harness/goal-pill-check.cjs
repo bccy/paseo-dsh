@@ -24,6 +24,13 @@
  * `harness/team-pill-check.cjs` and `harness/goal-popover-render-check.cjs`; the
  * pins below hold the goal wiring and forbid a second copy.
  *
+ * The persisted "seen" document (UI-v7 persistence, 2026-11-08) is asserted
+ * here too: a confirmed close writes `agentId -> goalSeenKey` into host-scoped
+ * plugin settings, a fresh controller over the same document (the app restart)
+ * hydrates it and keeps a completed goal hidden, a failed read degrades to the
+ * old in-memory behaviour, a failed write never throws, and the only write path
+ * is `advanceSeen`'s confirmed-close branch (polls never write).
+ *
  * The server half's behaviour (a real session over the fake bridge: read,
  * grading of bridge errors, control success/refusal) is
  * `harness/goal-server-check.cjs`; the copy tables are `harness/locale-check.cjs`.
@@ -103,6 +110,10 @@ const {
   nextPollDelayMs,
 } = require("./client/goal-polling.js");
 const { allText } = require("./client/locale.js");
+const { createSeenPersistence } = require("./client/seen-persistence.js");
+const { SEEN_SETTINGS_LIMIT, seenMapOf, mergeSeenValues } = require("./shared/seen-settings.js");
+const { defineTeamSeenSettings } = require("./shared/team-seen-settings.js");
+const { defineGoalSeenSettings } = require("./shared/goal-seen-settings.js");
 const LOCALE_TEXT = allText();
 
 let failures = 0;
@@ -985,8 +996,335 @@ async function runControllerChecks() {
   }
 }
 
+/**
+ * The persisted "seen" document (UI-v7 persistence, 2026-11-08): a confirmed
+ * close writes one `agentId -> goalSeenKey` entry to the host's plugin settings,
+ * and a *new controller over the same document* — the app restart — hydrates it
+ * and keeps the completed goal hidden. A load failure degrades to the old
+ * in-memory behaviour (show once more); a write failure keeps this session
+ * correct and never throws. The document rules themselves are shared with the
+ * team pill and driven here for the goal id.
+ */
+async function seenPersistenceChecks() {
+  console.log("\nthe persisted \"seen\" document (UI-v7 persistence, 2026-11-08)");
+  const complete = goal({ phase: "complete", activation: "disarmed" });
+  const completeNewer = goal({ phase: "complete", revision: 2 });
+  const KEY = goalSeenKey(complete);
+  const hidden = (seen) => goalPillPresentation({ available: true, goal: complete }, seen).visible === false;
+  const visible = (seen) => goalPillPresentation({ available: true, goal: complete }, seen).visible === true;
+
+  /** A fake host: one in-memory settings file; the revision hashes the raw bytes. */
+  const fakeHost = (initial = null) => {
+    let raw = initial === null ? null : JSON.stringify(initial);
+    const revision = () => (raw === null ? "missing" : `rev:${raw}`);
+    const io = {
+      writes: [],
+      resetCalls: 0,
+      warned: [],
+      failRead: false,
+      failWrite: false,
+      failReset: false,
+      resetHangs: false,
+      resetConflict: false,
+      readInvalid: false,
+      alwaysConflict: false,
+      read: async () => {
+        if (io.failRead) throw new Error("unknown method settings.goal-pill-seen.read");
+        if (io.readInvalid) return { status: "invalid", revision: revision(), error: "a document this schema refuses" };
+        return { status: "ready", revision: revision(), values: raw === null ? {} : JSON.parse(raw) };
+      },
+      write: async (input) => {
+        io.writes.push(input);
+        if (io.alwaysConflict) return { status: "conflict", error: "Settings changed on another client." };
+        if (io.failWrite) throw new Error("settings write failed");
+        if (input.revision !== revision()) return { status: "conflict", error: "Settings changed on another client." };
+        raw = JSON.stringify(input.values);
+        return { status: "saved", revision: revision(), values: input.values };
+      },
+      /** The host's repair write: replaces the document without parsing the envelope. */
+      reset: async (input) => {
+        io.resetCalls += 1;
+        // A host that never answers: hydrate must still finish via the timeout.
+        if (io.resetHangs) return new Promise(() => undefined);
+        if (io.failReset) throw new Error("reset failed");
+        if (io.resetConflict) {
+          // Another client repaired the file while this reset was in flight.
+          raw = JSON.stringify({ seen: { "other-agent": "goal-9:3" } });
+          return { status: "conflict", error: "Settings changed on another client." };
+        }
+        if (input.revision !== revision()) return { status: "conflict", error: "Settings changed on another client." };
+        raw = JSON.stringify({ seen: {} });
+        return { status: "saved", revision: revision(), values: { seen: {} } };
+      },
+      warn: (message) => io.warned.push(message),
+      document: () => (raw === null ? {} : JSON.parse(raw)),
+      externalWrite: (values) => {
+        raw = JSON.stringify(values);
+      },
+    };
+    return io;
+  };
+
+  // The document's pure rules: untrusted JSON normalises to a bounded map.
+  equal("a non-object document is an empty map", seenMapOf(42), {});
+  equal("non-string and empty entries are dropped", seenMapOf({ a: "k", b: 3, "": "k", c: "" }), { a: "k" });
+  const many = {};
+  for (let index = 0; index < SEEN_SETTINGS_LIMIT + 3; index += 1) many[`agent-${String(index)}`] = `goal-${String(index)}:1`;
+  const capped = seenMapOf(many);
+  equal("the document is capped", Object.keys(capped).length, SEEN_SETTINGS_LIMIT);
+  equal("…keeping the newest entry", capped[`agent-${String(SEEN_SETTINGS_LIMIT + 2)}`], `goal-${String(SEEN_SETTINGS_LIMIT + 2)}:1`);
+  equal("…and dropping the oldest", capped["agent-0"], undefined);
+  equal(
+    "merge keeps stored agents and lets pending win",
+    mergeSeenValues({ a: "old", b: "kept" }, new Map([["a", "new"]])),
+    { a: "new", b: "kept" },
+  );
+
+  // Restart semantics: the entry a close wrote is hydrated by the next bundle.
+  {
+    const first = fakeHost();
+    const before = createSeenPersistence(first);
+    await before.hydrate();
+    equal("nothing is remembered before any close", before.get("agent-1"), undefined);
+    equal("…and the completed goal is visible", visible(before.get("agent-1")), true);
+    equal("hydrating never writes the document", first.writes.length, 0);
+    before.remember("agent-1", KEY);
+    await before.flush();
+    equal("the confirmed close wrote the document", first.document(), { seen: { "agent-1": KEY } });
+
+    // "Restart": the client bundle runs again and hydrates the same host file.
+    const after = createSeenPersistence(fakeHost(first.document()));
+    await after.hydrate();
+    equal("a restart remembers the closed goal", after.get("agent-1"), KEY);
+    equal("…so the same completed goal stays hidden", hidden(after.get("agent-1")), true);
+    equal("…a new revision shows it again", goalPillPresentation({ available: true, goal: completeNewer }, after.get("agent-1")).visible, true);
+  }
+
+  // A failed read (older host without the settings RPC) is the old behaviour.
+  {
+    const broken = fakeHost();
+    broken.failRead = true;
+    const persistence = createSeenPersistence(broken);
+    await persistence.hydrate();
+    equal("a failed read still becomes ready", persistence.ready(), true);
+    equal("…with nothing remembered", persistence.get("agent-1"), undefined);
+    equal("…so the completed goal shows once more", visible(persistence.get("agent-1")), true);
+    persistence.remember("agent-1", KEY);
+    await persistence.flush();
+    equal("…and a write without a revision does not throw", persistence.get("agent-1"), KEY);
+  }
+
+  // A failed write keeps the session's answer and never throws.
+  {
+    const broken = fakeHost();
+    broken.failWrite = true;
+    const persistence = createSeenPersistence(broken);
+    await persistence.hydrate();
+    persistence.remember("agent-1", KEY);
+    await persistence.flush();
+    equal("a failed write keeps the in-memory seen", persistence.get("agent-1"), KEY);
+    equal("…so the pill stays hidden this session", hidden(persistence.get("agent-1")), true);
+  }
+
+  // Conflict: another client wrote meanwhile — re-read, merge, keep its agents.
+  {
+    const concurrent = fakeHost();
+    const persistence = createSeenPersistence(concurrent);
+    await persistence.hydrate();
+    concurrent.externalWrite({ seen: { "other-agent": "goal-9:3" } });
+    persistence.remember("agent-1", KEY);
+    await persistence.flush();
+    equal("a conflicted write is retried once", concurrent.writes.length, 2);
+    equal("…and the other client's agent is kept", concurrent.document(), {
+      seen: { "other-agent": "goal-9:3", "agent-1": KEY },
+    });
+    equal("…and a retry that succeeds does not warn", concurrent.warned.length, 0);
+  }
+
+  // A silent host must not hold the first publish forever.
+  {
+    const silent = fakeHost();
+    silent.read = () => new Promise(() => undefined);
+    const persistence = createSeenPersistence(silent, { timeoutMs: 5 });
+    await persistence.flush();
+    equal("a silent read times out into the old behaviour", persistence.ready(), true);
+    equal("…with nothing remembered", persistence.get("agent-1"), undefined);
+  }
+
+  // A removed pill starts clean; a re-add can be closed again.
+  {
+    const removal = fakeHost({ seen: { "agent-1": KEY } });
+    const persistence = createSeenPersistence(removal);
+    await persistence.hydrate();
+    equal("the document remembers a closed goal", persistence.get("agent-1"), KEY);
+    persistence.forget("agent-1");
+    equal("a removed pill starts clean", persistence.get("agent-1"), undefined);
+    equal("…so the goal is visible again", visible(persistence.get("agent-1")), true);
+    persistence.remember("agent-1", KEY);
+    await persistence.flush();
+    equal("a new confirmed close is remembered again", persistence.get("agent-1"), KEY);
+  }
+
+  // P2-1: a document the host refuses (`invalid`: an older version's envelope, a
+  // corrupt file) is repaired by the host's `reset` — a `save` would re-parse the
+  // same envelope and be refused on every attempt, so the stale goal would show
+  // once more after every app/plugin reload for the life of the file.
+  {
+    const repair = fakeHost();
+    repair.readInvalid = true;
+    const persistence = createSeenPersistence(repair);
+    await persistence.hydrate();
+    equal("an invalid document triggers exactly one reset", repair.resetCalls, 1);
+    equal("…hydration continues with an empty map", persistence.get("agent-1"), undefined);
+    equal("…so the completed goal is shown once", visible(persistence.get("agent-1")), true);
+    persistence.remember("agent-1", KEY);
+    await persistence.flush();
+    equal("…and the next confirmed close writes normally", repair.writes.length, 1);
+    equal("…into the repaired document", repair.document(), { seen: { "agent-1": KEY } });
+  }
+  {
+    const refused = fakeHost();
+    refused.readInvalid = true;
+    refused.failReset = true;
+    const persistence = createSeenPersistence(refused);
+    await persistence.hydrate();
+    equal("a refused reset does not throw", persistence.ready(), true);
+    equal("…and was attempted once", refused.resetCalls, 1);
+    equal("…and degrades to the empty map", persistence.get("agent-1"), undefined);
+    equal("…so the goal is shown once more (the old behaviour)", visible(persistence.get("agent-1")), true);
+  }
+  {
+    // The gate P2: a host that never answers the reset must not leave `ready`
+    // false — that would keep present() from ever publishing and the pill would
+    // never show again this session, the opposite of the degrade contract.
+    const hung = fakeHost();
+    hung.readInvalid = true;
+    hung.resetHangs = true;
+    const persistence = createSeenPersistence(hung, { timeoutMs: 5 });
+    await persistence.flush();
+    equal("a hanging reset still resolves hydrate inside the timeout", persistence.ready(), true);
+    equal("…and was attempted once", hung.resetCalls, 1);
+    equal("…with the empty map (old behaviour)", persistence.get("agent-1"), undefined);
+    equal("…so the goal shows once more", visible(persistence.get("agent-1")), true);
+  }
+  {
+    // A reset that answers `conflict` (another client repaired the file): the
+    // next save re-reads the now-valid document and merges, keeping its entries.
+    const heal = fakeHost();
+    heal.readInvalid = true;
+    heal.resetConflict = true;
+    const persistence = createSeenPersistence(heal, { settingsId: "goal-pill-seen" });
+    await persistence.hydrate();
+    equal("a conflicting reset still finishes hydrate", persistence.ready(), true);
+    equal("…until the next close nothing is remembered", persistence.get("agent-1"), undefined);
+    equal("…and nothing was warned about", heal.warned.length, 0);
+    // The other client's repair becomes readable: the next save self-heals.
+    heal.readInvalid = false;
+    persistence.remember("agent-1", KEY);
+    await persistence.flush();
+    equal("…the next save re-reads the repaired document", heal.writes.length, 2);
+    equal("…and merges the other client's agent", heal.document(), {
+      seen: { "other-agent": "goal-9:3", "agent-1": KEY },
+    });
+    equal("…without a conflict warning", heal.warned.length, 0);
+  }
+
+  // P2-2: a write still in conflict after its one retry warns once (diagnostic
+  // only — settings id and agent ids, never the document) and keeps the pending
+  // entry for the next confirmed close; there is no polling retry.
+  {
+    const stubborn = fakeHost();
+    stubborn.alwaysConflict = true;
+    const persistence = createSeenPersistence(stubborn, { settingsId: "goal-pill-seen" });
+    await persistence.hydrate();
+    persistence.remember("agent-1", KEY);
+    await persistence.flush();
+    equal("a conflicting write is attempted twice (one retry)", stubborn.writes.length, 2);
+    equal("…then warns once", stubborn.warned.length, 1);
+    assert("…naming the settings id", /goal-pill-seen/.test(stubborn.warned[0] ?? ""), stubborn.warned[0]);
+    assert("…and the agent id", /agentId=agent-1/.test(stubborn.warned[0] ?? ""), stubborn.warned[0]);
+    assert("…never the document contents", !/goal-1:1/.test(stubborn.warned[0] ?? ""), stubborn.warned[0]);
+    equal("…while the memory keeps the seen state", persistence.get("agent-1"), KEY);
+    equal("…so the pill stays hidden this session", hidden(persistence.get("agent-1")), true);
+    persistence.remember("agent-1", KEY);
+    await persistence.flush();
+    equal("the next confirmed close retries the write", stubborn.writes.length, 4);
+    equal("…but the warning is not repeated", stubborn.warned.length, 1);
+  }
+
+  // P2-3: run the real definitions (not just source regexes): id, scope, version
+  // and normalisation are exactly what the host sees. A team/goal id swap in a
+  // pill's IO wiring is pinned by the source checks below, and this half pins
+  // the ids the definitions actually register.
+  {
+    const goalDefinition = defineGoalSeenSettings();
+    equal("goal definition id", goalDefinition.id, "goal-pill-seen");
+    equal("goal definition scope", goalDefinition.scope, "host");
+    equal("goal definition version", goalDefinition.version, 1);
+    const teamDefinition = defineTeamSeenSettings();
+    equal("team definition id (not swapped)", teamDefinition.id, "team-pill-seen");
+    equal("team definition scope", teamDefinition.scope, "host");
+    equal("team definition version", teamDefinition.version, 1);
+    const cases = [
+      ["an empty document", {}, { seen: {} }],
+      ["mixed value types", { seen: { a: 1, b: "x", "": "y", c: "" } }, { seen: { b: "x" } }],
+      ["a garbage string", "nonsense", { seen: {} }],
+      ["null", null, { seen: {} }],
+    ];
+    for (const [label, input, expected] of cases) {
+      equal(`goal schema normalises ${label}`, await goalDefinition.schema.parseAsync(input), expected);
+      equal(`team schema normalises ${label}`, await teamDefinition.schema.parseAsync(input), expected);
+    }
+  }
+
+  // Sources: one write path only (the confirmed-close branch); polls never write.
+  {
+    const repo = path.resolve(__dirname, "..", "..");
+    const pill = fs.readFileSync(path.join(repo, "paseo-plugin/client/goal-pill.tsx"), "utf8");
+    assert("the pill hydrates the persisted seen state at load", /void persistence\.hydrate\(\)/.test(pill));
+    assert("nothing is published before hydrate resolves", /if \(!persistence\.ready\(\)\) return;/.test(pill));
+    assert(
+      "the persisted fallback is read after the session's own seen state",
+      /seenStates\.get\(agentId\)\?\.seen \?\? persistence\.get\(agentId\)/.test(pill),
+    );
+    assert(
+      "the only write is advanceSeen's confirmed-close branch",
+      /if \(event\.kind === "closed" && after\.seen !== undefined\) persistence\.remember\(agentId, after\.seen\);/.test(pill),
+    );
+    equal("persistence.remember appears exactly once", (pill.match(/persistence\.remember\(/g) ?? []).length, 1);
+    const publishState = pill.slice(pill.indexOf("const publishState"), pill.indexOf("const poller"));
+    assert("the poll path (publishState) never writes", !/persistence\.(remember|write)/.test(publishState));
+    assert("a removed pill forgets the persisted fallback", /persistence\.forget\(agentId\)/.test(pill));
+    assert(
+      "the pill wires read/write/reset/warn against the goal settings id",
+      /settingsRpc\(GOAL_SEEN_SETTINGS_ID\)\.read/.test(pill) &&
+        /settingsRpc\(GOAL_SEEN_SETTINGS_ID\)\.write/.test(pill) &&
+        /settingsRpc\(GOAL_SEEN_SETTINGS_ID\)\.reset/.test(pill) &&
+        /warn: \(message\) => console\.warn/.test(pill),
+    );
+    assert("…and passes the goal settings id to the controller", /settingsId: GOAL_SEEN_SETTINGS_ID/.test(pill));
+    assert("…never references the team settings id (a swap must fail)", !/TEAM_SEEN_SETTINGS_ID/.test(pill));
+    for (const file of ["client/goal-polling.ts", "client/agent-polling.ts"]) {
+      const source = fs.readFileSync(path.join(repo, "paseo-plugin", file), "utf8");
+      assert(`${file} never writes the seen document`, !/seen-persistence|persistence\.remember|settingsRpc/.test(source));
+    }
+    const server = fs.readFileSync(path.join(repo, "paseo-plugin/index.server.ts"), "utf8");
+    assert(
+      "the server registers both seen settings",
+      /registerSettings\(defineTeamSeenSettings\(\)\)/.test(server) && /registerSettings\(defineGoalSeenSettings\(\)\)/.test(server),
+    );
+    assert("…guarded for a host without plugin settings", /typeof server\.registerSettings !== "function"/.test(server));
+    const definition = fs.readFileSync(path.join(repo, "paseo-plugin/shared/goal-seen-settings.ts"), "utf8");
+    assert(
+      "the goal definition is host-scoped and sanitises the document",
+      /scope: "host"/.test(definition) && /seenDocumentOf/.test(definition) && /GOAL_SEEN_SETTINGS_ID = "goal-pill-seen"/.test(definition),
+    );
+  }
+}
+
 (async () => {
   await runControllerChecks();
+  await seenPersistenceChecks();
   console.log(`\n${checks - failures}/${checks} checks passed`);
   if (failures > 0) {
     console.error(`${failures} FAILED`);

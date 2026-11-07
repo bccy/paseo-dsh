@@ -192,8 +192,10 @@ goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等�
   **发送新消息不算已读**（2026-11-07 修复）：完成当轮的 running→idle 与用户下一条消息触发的 idle→running 都不写 seen——此前把「下一回合开始」当作用户已看过，
   未点开面板的目标会在发下一条消息后消失；若首次观察到 complete 时 agent 已 idle，也只等待面板关闭。清除后 goal 为 null，自然隐藏。
   agent 状态仍从 pill 已有的 `agents.list({subscribe})` 快照与 upsert 记录，但只用于运行环等展示，不参与「已读」判定。
-- **只在内存**：刷新 / 重开 App / 插件 reload 后清空，complete 会再出现一次（用户已接受）。同一 objective 的新目标（新 id）或新 revision
-  会重新显示。
+- **持久化（2026-11-08）**：`seen` 写进宿主插件设置 `goal-pill-seen`（host scope，`{seen: {agentId: id:revision}}`，最多 64 条，
+  `shared/goal-seen-settings.ts` + `client/seen-persistence.ts`）：**确认关闭**后写一次，客户端 bundle 启动时异步读取、读完前不推送可见性——
+  刷新 / 重开 App / 插件 reload、daemon 重启后 complete 不再重显；宿主无插件设置或读写失败时退回内存态（会再出现一次，只 console 一次），
+  卸载/重装插件重置一次。读到被拒（corrupt / 版本不符）的文档会 best-effort `reset` 修复（与读共用同一 2s 门限），成功后重新开始记录；修复失败退回内存态。同一 objective 的新目标（新 id）或新 revision 会重新显示。
 
 **为什么不做 todo 进度条**：todo 的产生侧不可靠——调查 38 个真实 DeepSeek 会话：20 个从不调
 `todo_write`，9 个只写 1 次（之后不再更新），8 个写 2 次（多在结束前一次性全标完成，其中 3 个

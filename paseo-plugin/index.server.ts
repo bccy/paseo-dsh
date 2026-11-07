@@ -1,7 +1,9 @@
 import type { PluginHandlerContext, PluginServerContext } from "@getpaseo/plugin/server";
 import { goalControl, goalCurrent } from "./shared/goal";
+import { defineGoalSeenSettings } from "./shared/goal-seen-settings";
 import { jobsList } from "./shared/jobs";
 import { teamRead } from "./shared/team";
+import { defineTeamSeenSettings } from "./shared/team-seen-settings";
 import { rewindNoticeArm } from "./shared/rewind-notice";
 import { ensurePaseoProfile } from "./server/bootstrap";
 import { capturePaseo } from "./server/rewind-notice-append";
@@ -83,6 +85,37 @@ export default function contribute(server: PluginServerContext) {
   const cleanups = CAPTURE_HOOKS.map((name) => server.on(name, (_event, context) => capture(context)));
 
   server.registerProvider(createDshProvider());
+
+  // UI-v7 persistence (2026-11-08): the team and goal pills keep their "seen"
+  // signatures in host-scoped plugin settings, so an app/plugin reload — or a
+  // daemon restart — no longer forgets them and a finished board/answer cannot
+  // show once more. The settings are optional on the host: an older Paseo has no
+  // settings storage, and a failing registration must not take the provider
+  // down — each failure logs once, and the client then falls back to its
+  // in-memory behaviour (a finished pill shows once more after a reload).
+  if (typeof server.registerSettings !== "function") {
+    console.error(
+      "[dsh-paseo] this Paseo has no plugin settings; the pill \"seen\" state stays in memory " +
+        "and an all-done board or a completed goal shows once more after a reload",
+    );
+  } else {
+    try {
+      server.registerSettings(defineTeamSeenSettings());
+    } catch (error) {
+      console.error(
+        "[dsh-paseo] could not register the team pill \"seen\" setting (it stays in memory): "
+          + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    try {
+      server.registerSettings(defineGoalSeenSettings());
+    } catch (error) {
+      console.error(
+        "[dsh-paseo] could not register the goal pill \"seen\" setting (it stays in memory): "
+          + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
 
   server.handle(jobsList, async ({ agentId }, context) => {
     capture(context);

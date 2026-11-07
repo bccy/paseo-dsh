@@ -34,6 +34,12 @@
  * — the same appearance as a profile that never had the feature, rather than an
  * error the user can never dismiss.
  *
+ * **What "seen" survives.** A completed goal is shown once and hidden only after
+ * its panel was opened and really closed (UI-v7). That memory is persisted in
+ * host-scoped plugin settings (`../shared/goal-seen-settings` via
+ * `./seen-persistence`, 2026-11-08), so an app restart or a plugin reload no
+ * longer shows it once more; a host without settings degrades to memory-only.
+ *
  * @module dsh-paseo/client/goal-pill
  */
 import type {
@@ -42,9 +48,11 @@ import type {
   PluginButtonRegistration,
   PluginClientContext,
 } from "@getpaseo/plugin/client";
+import { settingsRpc } from "@getpaseo/plugin";
 import { useEffect, useRef, useState } from "react";
 import { Text, View } from "react-native";
 import { goalControl, goalCurrent, type GoalAction, type GoalState } from "../shared/goal";
+import { GOAL_SEEN_SETTINGS_ID } from "../shared/goal-seen-settings";
 import { CornerRingIcon } from "./corner-ring";
 import { GoalPopoverBody } from "./goal-popover";
 import { useAgent, useGoalRunningMark } from "./goal-running";
@@ -67,6 +75,7 @@ import { FACTS_FONT_SIZE } from "./jobs-popover-layout";
 import { localeText } from "./locale";
 import { createPillDeference, type PillDeference } from "./pill-deference";
 import { createSeenCloseGate } from "./seen-close-gate";
+import { createSeenPersistence } from "./seen-persistence";
 
 /** One agent's latest answer, plus the listeners the pill and popover subscribe with. */
 interface AgentGoal {
@@ -385,8 +394,11 @@ export function contributeGoalPill(
   /** agentId -> the composer registration. */
   const pills = new Map<string, PluginButtonRegistration>();
   /**
-   * agentId -> the completed goal's "seen" progress (UI-v7). Memory only: a
-   * reload forgets it and a completed goal shows once more (accepted).
+   * agentId -> the completed goal's in-session "seen" progress (UI-v7). The
+   * remembered key is also persisted on the host (`../shared/goal-seen-settings`),
+   * so an app restart or a plugin reload no longer forgets it; this map only
+   * carries the closes of this session, and the persistence is the fallback for
+   * everything the host document remembers.
    */
   const seenStates = new Map<string, GoalSeenState>();
   /** agentId -> the last poll answer, to re-present it when only "seen" changed. */
@@ -395,6 +407,35 @@ export function contributeGoalPill(
   const published = new Map<string, { visible: boolean; label: string; title: string }>();
   const lifetime = new AbortController();
   const rpc = (input: { agentId: string }) => client.rpc(goalCurrent, input);
+
+  /**
+   * UI-v7 persistence (2026-11-08): the "seen" keys the user closed a panel on
+   * live in a host setting, so an app restart does not show a completed goal
+   * once more. `present` refuses to publish before `hydrate` resolved (a
+   * registration starts hidden), so an already-seen goal never flashes; a host
+   * without the settings RPC degrades to the old in-memory behaviour. Only
+   * `advanceSeen`'s confirmed-close branch writes (below) — polls never do.
+   */
+  const persistence = createSeenPersistence(
+    {
+      read: () => client.rpc(settingsRpc(GOAL_SEEN_SETTINGS_ID).read, {}),
+      write: (input) => client.rpc(settingsRpc(GOAL_SEEN_SETTINGS_ID).write, input),
+      // A document the host refused is repaired with `reset`, the one write the
+      // host applies without re-parsing the stored envelope (`./seen-persistence`).
+      reset: (input) => client.rpc(settingsRpc(GOAL_SEEN_SETTINGS_ID).reset, input),
+      onError: (message, error) => {
+        console.error(`[dsh-paseo] ${message}: ${error instanceof Error ? error.message : String(error)}`);
+      },
+      warn: (message) => console.warn(`[dsh-paseo] ${message}`),
+    },
+    {
+      settingsId: GOAL_SEEN_SETTINGS_ID,
+      onHydrated: () => {
+        for (const agentId of [...pills.keys()]) present(agentId);
+      },
+    },
+  );
+  void persistence.hydrate();
 
   /**
    * Publish one poll answer: the popover store first (its listeners redraw from
@@ -406,7 +447,11 @@ export function contributeGoalPill(
     const registration = pills.get(agentId);
     const next = answers.get(agentId);
     if (registration === undefined || next === undefined) return;
-    const seen = seenStates.get(agentId)?.seen;
+    // Nothing is published before the persisted "seen" state is known: the
+    // registration starts hidden, so an already-seen completed goal never
+    // flashes on the composer while the settings read is in flight.
+    if (!persistence.ready()) return;
+    const seen = seenStates.get(agentId)?.seen ?? persistence.get(agentId);
     publish(store, agentId, {
       goal: next.goal,
       available: next.available,
@@ -443,7 +488,14 @@ export function contributeGoalPill(
     const before = seenStates.get(agentId) ?? {};
     const after = goalCompleteSeenStep(before, event);
     seenStates.set(agentId, after);
-    if (after.seen !== before.seen) present(agentId);
+    if (after.seen !== before.seen) {
+      // The only write path in this file: a **confirmed panel close** (the
+      // gate's `closed` event, the only event the machine advances on) changed
+      // the remembered completed-goal key. Polls and agent status events are
+      // no-ops above and never reach here.
+      if (event.kind === "closed" && after.seen !== undefined) persistence.remember(agentId, after.seen);
+      present(agentId);
+    }
   };
 
   const publishState = (agentId: string, next: GoalViewState): void => {
@@ -519,6 +571,10 @@ export function contributeGoalPill(
       answers.delete(agentId);
       published.delete(agentId);
       seenStates.delete(agentId);
+      // Session-only: the persisted fallback must not hide a goal for an agent
+      // this pill was removed from and later re-added (`addAgent` clears the
+      // in-session state for the same reason).
+      persistence.forget(agentId);
       // Dropped rather than kept: the popover must not show a stale goal for an
       // agent this client may not read, or whose runtime cannot serve goals.
       store.delete(agentId);
@@ -597,5 +653,6 @@ export function contributeGoalPill(
   return () => {
     lifetime.abort();
     poller.dispose();
+    persistence.dispose();
   };
 }

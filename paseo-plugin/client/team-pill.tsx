@@ -8,7 +8,11 @@
  *   the user's 2026-11-06 decision): sending a new message without opening the
  *   panel does not hide it. A close is a *confirmed* one — the host remounts the
  *   popover body when it opens, so a bare unmount means nothing
- *   (`createSeenCloseGate` in `./seen-close-gate`).
+ *   (`createSeenCloseGate` in `./seen-close-gate`). The remembered signature is
+ *   **persisted on the host** (`../shared/team-seen-settings` via
+ *   `./seen-persistence`, UI-v7 persistence 2026-11-08), so an app restart or a
+ *   plugin reload no longer shows the board once more; a host without plugin
+ *   settings degrades to the old in-memory behaviour.
  * - **Label and title**: the noun 「团队」/「Team」 in every state; no count
  *   (T2 P1). The host uses `title` as the accessibility name, desktop tooltip
  *   and phone sheet header, so all three read the noun.
@@ -30,12 +34,15 @@ import type {
   PluginButtonRegistration,
   PluginClientContext,
 } from "@getpaseo/plugin/client";
+import { settingsRpc } from "@getpaseo/plugin";
 import { useEffect, useRef, useState } from "react";
 import { teamRead, type TeamView } from "../shared/team";
+import { TEAM_SEEN_SETTINGS_ID } from "../shared/team-seen-settings";
 import { localeText } from "./locale";
 import { CornerRingIcon } from "./corner-ring";
 import { createPillDeference, type PillDeference } from "./pill-deference";
 import { createSeenCloseGate } from "./seen-close-gate";
+import { createSeenPersistence } from "./seen-persistence";
 import {
   createTeamPoller,
   teamCompleteSeenStep,
@@ -161,11 +168,43 @@ export function contributeTeamPill(
   const store: TeamStore = new Map();
   const pills = new Map<string, PillEntry>();
   /**
-   * agentId -> the all-done board's "seen" progress (UI-v7). Memory only: a
-   * reload forgets it and an all-done board shows once more (accepted).
+   * agentId -> the all-done board's in-session "seen" progress (UI-v7). The
+   * remembered key is also persisted on the host (`../shared/team-seen-settings`),
+   * so an app restart or a plugin reload no longer forgets it; this map only
+   * carries the closes of this session, and the persistence is the fallback for
+   * everything the host document remembers.
    */
   const seenStates = new Map<string, TeamSeenState>();
   const lifetime = new AbortController();
+
+  /**
+   * UI-v7 persistence (2026-11-08): the "seen" signatures the user closed a
+   * panel on live in a host setting, so an app restart does not show an all-done
+   * board once more. `present` refuses to publish before `hydrate` resolved (a
+   * registration starts hidden), so an already-seen board never flashes; a host
+   * without the settings RPC degrades to the old in-memory behaviour. Only
+   * `advanceSeen`'s confirmed-close branch writes (below) — polls never do.
+   */
+  const persistence = createSeenPersistence(
+    {
+      read: () => client.rpc(settingsRpc(TEAM_SEEN_SETTINGS_ID).read, {}),
+      write: (input) => client.rpc(settingsRpc(TEAM_SEEN_SETTINGS_ID).write, input),
+      // A document the host refused is repaired with `reset`, the one write the
+      // host applies without re-parsing the stored envelope (`./seen-persistence`).
+      reset: (input) => client.rpc(settingsRpc(TEAM_SEEN_SETTINGS_ID).reset, input),
+      onError: (message, error) => {
+        console.error(`[dsh-paseo] ${message}: ${error instanceof Error ? error.message : String(error)}`);
+      },
+      warn: (message) => console.warn(`[dsh-paseo] ${message}`),
+    },
+    {
+      settingsId: TEAM_SEEN_SETTINGS_ID,
+      onHydrated: () => {
+        for (const agentId of [...pills.keys()]) present(agentId);
+      },
+    },
+  );
+  void persistence.hydrate();
 
   /**
    * Publish the current visibility, label and icon for one agent from the last
@@ -181,8 +220,12 @@ export function contributeTeamPill(
   const present = (agentId: string): void => {
     const entry = pills.get(agentId);
     if (entry === undefined) return;
+    // Nothing is published before the persisted "seen" state is known: the
+    // registration starts hidden, so an already-seen all-done board never
+    // flashes on the composer while the settings read is in flight.
+    if (!persistence.ready()) return;
     const team = store.get(agentId)?.team ?? null;
-    const seen = seenStates.get(agentId)?.seen;
+    const seen = seenStates.get(agentId)?.seen ?? persistence.get(agentId);
     const text = localeText().team;
     const visible = teamPillVisible(team, seen);
     // Report the final visibility so the jobs pill can defer while both this
@@ -207,7 +250,14 @@ export function contributeTeamPill(
     const before = seenStates.get(agentId) ?? {};
     const after = teamCompleteSeenStep(before, event);
     seenStates.set(agentId, after);
-    if (after.seen !== before.seen) present(agentId);
+    if (after.seen !== before.seen) {
+      // The only write path in this file: a **confirmed panel close** (the
+      // gate's `closed` event, the only event the machine advances on) changed
+      // the remembered all-done signature. Polls and agent status events are
+      // no-ops above and never reach here.
+      if (event.kind === "closed" && after.seen !== undefined) persistence.remember(agentId, after.seen);
+      present(agentId);
+    }
   };
 
   const poller = createTeamPoller({
@@ -254,6 +304,10 @@ export function contributeTeamPill(
       deference.forget("team", agentId);
       entry.registration.remove();
       seenStates.delete(agentId);
+      // Session-only: the persisted fallback must not hide a board for an agent
+      // this pill was removed from and later re-added — `addAgent` clears the
+      // in-session state for the same reason.
+      persistence.forget(agentId);
       store.delete(agentId);
       if (reason === "unauthorized") {
         console.error(
@@ -319,5 +373,6 @@ export function contributeTeamPill(
   return () => {
     lifetime.abort();
     poller.dispose();
+    persistence.dispose();
   };
 }
