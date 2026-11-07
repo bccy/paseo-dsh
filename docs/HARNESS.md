@@ -421,6 +421,24 @@
   **另外，凡动了 `server.js` 的请求分派、会话生命周期（`prompt`/`cancel`/`createSession`/
   `closeSession`）、`listSessions` 或持久化读取区段也必跑**（新增断言覆盖 queued plan 双向
   应用、query/cwd 不做窄预过滤、persistence signal/迟到句柄、冷会话创建中 cancel）。
+- `harness/model-route-check.mjs` — 桥的**实时模型/思考档切换**是否真的到达 DSH（0.2.1/0.2.2
+  双契约）：DSH 0.2.2 把 `installModelSelection` 改成单参（只装切换提示监听），实际路由由
+  `agent.model.select()` 写入 durable `model/selection` 投影；旧桥还传第二参并只改
+  `control.selection.current`，于是 `paseo/config/set` 回执成功、下一步仍跑旧模型——静默能力
+  丢失（FIELD-NOTES #58 同类：doctor 全绿、功能消失）。0.2.1 仍是两参 + caller-owned ref，
+  所以桥必须用 `installModelSelection.length >= 2` 在运行时分流：旧线走两参并继续依赖
+  `control.selection`，新线走单参 + `agent.model.select`；live `configSet`/`initialize` 在
+  `agent.model?.select` 不存在时只更新 ref（0.2.1），存在时才 select。断言：对已 live 会话
+  `paseo/config/set` 必须让 recording agent 的 `model.select` 收到完整新 route（只改内存镜像
+  不算通过）、`reasoningEffort:null` 以省略键清空、`maxTokens` 不进 selection 但保留在
+  pinned route、`model.select` 抛错时请求必须失败且两处镜像都不更新（不假装成功）、
+  `initialize` 的 live 分支经 `agent.model.select` 应用路由且在写路由表之前、`createSession`
+  分流两支的源码守卫、**queued→resume**（先 `config/set` 到未物化会话、再用真实 `AgentModel`
+  的旧持久 selection 触发 resume，新 route 必须覆盖旧值）、无 `agent.model` 的 0.2.1 live
+  路径只更新 caller-owned ref。模块解析钩子驱动**真实** `server.js`（同 `bridge-server-check`）。
+  **依赖本机 DSH 安装，所以不进 CI**（`DSH_PACKAGES_DIR` / `DSH_INSTALL_DIR` 可覆盖，解析
+  失败 exit 2 并打印实际目录）。**动了 `server.js` 的 `installSelection` / `configSet` /
+  `initialize` live 分支 / `createSession` 的 initial route 应用或 DSH 升版后必跑。**
 - `harness/session-title-adoption-check.mjs` — Paseo 的 agent title 透传成 DSH session title
   （桥这一半）：Paseo 给自己的 agent 起名（UI 显示的就是它），经 `config.title` → 插件 → 会话的
   `initialize` 帧 → 桥记住并 `sessionTitle.rename()`。DSH 标题服务只从人类 `user` 消息派生标题，

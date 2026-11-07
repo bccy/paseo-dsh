@@ -108,6 +108,21 @@ function effortOf(value) {
   return ReasoningEffortId(value);
 }
 
+/**
+ * Whether the installed DSH still uses the pre-0.2.2 model-selection contract.
+ *
+ * DSH 0.2.1: `installModelSelection(agentCtx, selection)` registers listeners
+ * that read the caller-owned mutable `selection` ref at assembly/request time
+ * (`Function.length === 2`). DSH 0.2.2: `installModelSelection(agentCtx)` only
+ * installs the model-switch notice; the route lives in `agent.model` and is
+ * changed through `agent.model.select()`.
+ *
+ * `Function.length` is the only discriminator available before a turn runs:
+ * both versions export the same symbol name, and 0.2.2 silently ignores an
+ * extra argument. Detect at runtime so one bridge build serves either line.
+ */
+const LEGACY_MODEL_SELECTION = installModelSelection.length >= 2;
+
 /** Await a promise, rejecting if it has not settled within `ms`. */
 function withTimeout(promise, ms, label) {
   let timer;
@@ -472,7 +487,12 @@ export class PaseoHarnessServer {
      */
     this.pendingPresets = new Map();
 
-    /** sessionId -> { selection, dispose } for live per-agent model control. */
+    /**
+     * sessionId -> `{ selection, dispose }`. `selection.current` mirrors the
+     * route this bridge last applied (read by `paseo/usage`); it is NOT the live
+     * controller on DSH 0.2.2 — `agent.model.select` is. `dispose` releases the
+     * model-switch notice listener installed per agent.
+     */
     this.controls = new Map();
     /** sessionId -> { handle } for agents this server owns. */
     this.sessions = new Map();
@@ -1214,12 +1234,31 @@ export class PaseoHarnessServer {
     } else {
       // Unlike route defaults, an omitted prompt clears the previous owner's
       // customization. Never inherit another session's or a prior open's text.
+      // Validate the prompt service BEFORE any live switch: a missing service
+      // must fail the initialize without applying half of it.
       const prompt = params.systemPrompt ?? '';
       if (prompt && this.ctx.get('systemPrompt') === undefined) {
         throw new Error('systemPrompt service is not mounted in this profile');
       }
-      this.sessionSystemPrompts.set(sessionId, prompt);
       const live = this.sessions.get(sessionId);
+      // A reconnect can re-initialize a session whose agent is already live. The
+      // route table is what `routeFor` answers with, so leaving the agent on its
+      // old selection would make the bridge's own state disagree with the agent
+      // it is describing — and `paseo/usage` prices against the selection.
+      // Apply the live switch first (0.2.2 `agent.model.select`; 0.2.1 the
+      // caller-owned ref): `applyLiveSelection` also re-checks that the agent is
+      // still the one this server owns. If it throws, no prompt/route-table
+      // state below is written, so a failed initialize cannot leave the bridge
+      // claiming a route the agent never took. A retry replays the same switch
+      // (a no-op when the recorded selection already matches).
+      if (live !== undefined) {
+        this.applyLiveSelection(live, sessionId, {
+          provider,
+          model,
+          ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+        });
+      }
+      this.sessionSystemPrompts.set(sessionId, prompt);
       if (live) this.installSystemPrompt(sessionId, live.handle.agent.ctx);
       this.sessionCwd.set(sessionId, cwd);
       // Remember Paseo's name for this agent; `createSession` applies it once
@@ -1231,20 +1270,6 @@ export class PaseoHarnessServer {
       this.sessionRoutes.set(sessionId, { provider, model, reasoningEffort: reasoningEffort ?? null, maxTokens });
       this.initializedSessions.add(sessionId);
       this.#trimSessionRouteTables(sessionId);
-      // A reconnect can re-initialize a session whose agent is already live. The
-      // route table is what `routeFor` answers with, so leaving the agent on its
-      // old selection would make the bridge's own state disagree with the agent
-      // it is describing — and `paseo/usage` prices against the selection.
-      // Mutating the existing ref (rather than replacing it) keeps the listeners
-      // `installModelSelection` installed pointing at the same object.
-      const control = this.controls.get(sessionId);
-      if (control !== undefined) {
-        control.selection.current = {
-          provider,
-          model,
-          ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
-        };
-      }
     }
     return {
       serverInfo: { name: 'deepseek-harness-paseo-bridge', version: '0.1.0' },
@@ -1590,7 +1615,16 @@ export class PaseoHarnessServer {
     if (next.provider === undefined || next.model === undefined) {
       throw new Error('model selection requires both provider and model');
     }
-    selection.current = next;
+    // Apply the real switch first: on 0.2.2 that is `agent.model.select`; on
+    // 0.2.1 (no `agent.model`) it is the caller-owned ref the installed
+    // listener reads. If the switch throws, the request fails loudly and neither
+    // mirror below is written, so a failed change cannot look like a successful
+    // one. `maxTokens` is deliberately not part of the selection.
+    this.applyLiveSelection(rec, params.sessionId, {
+      provider: next.provider,
+      model: next.model,
+      ...(next.reasoningEffort === undefined ? {} : { reasoningEffort: next.reasoningEffort }),
+    });
     // Mirror the selection into the pinned route. `routeFor` and a reconnect's
     // `initialize` answer from that row, so leaving it behind would undo a live
     // clear (and any other switch) the next time the session is re-initialized —
@@ -1610,6 +1644,38 @@ export class PaseoHarnessServer {
       reasoningEffort: next.reasoningEffort ?? null,
       preset: this.currentPreset(params.sessionId),
     };
+  }
+
+  /**
+   * Apply one complete route to a live agent through the installed DSH's own
+   * switch.
+   *
+   * DSH 0.2.2: `agent.model.select()` appends the durable `model/selection`
+   * event the agent loop reads when it fixes the next step's route. The
+   * bridge's `control.selection` is only a mirror there (`paseo/usage` reads
+   * it), so mutating it alone is a silent no-op.
+   *
+   * DSH 0.2.1: there is no `agent.model`; `installModelSelection(ctx,
+   * selection)` installed listeners that read the caller-owned
+   * `control.selection` ref at assembly/request time, so updating that ref IS
+   * the switch. Feature-detect per agent — `agent.model?.select` is the
+   * authoritative marker for the durable API.
+   *
+   * `selection` is a complete `{ provider, model, reasoningEffort? }`; absence
+   * of `reasoningEffort` clears the effort (adapter default), and `maxTokens`
+   * never belongs in a model selection.
+   *
+   * @param {{ handle: { agent: object } }} rec - live session record.
+   * @param {string} sessionId - the session whose control mirror to update.
+   * @param {{ provider: string, model: string, reasoningEffort?: string }} selection
+   */
+  applyLiveSelection(rec, sessionId, selection) {
+    this.assertLiveAgent(rec, sessionId);
+    if (typeof rec.handle.agent.model?.select === 'function') {
+      rec.handle.agent.model.select({ ...selection });
+    }
+    const control = this.controls.get(sessionId) ?? rec.control;
+    if (control?.selection !== undefined) control.selection.current = { ...selection };
   }
 
   /** The preset a session runs (chosen, else the stored projection, else default). */
@@ -4456,7 +4522,9 @@ export class PaseoHarnessServer {
   async createSession(sessionId, options = {}) {
     const route = options.route === undefined ? this.routeFor(sessionId) : { ...this.routeFor(sessionId), ...options.route };
     // Mirrors the ACP adapter: the durable option carries the initial route and
-    // a scoped mutable selection ref installed during setup owns later switches.
+    // later switches go through `agent.model.select` (DSH 0.2.2). The mutable
+    // `control.selection` is only this bridge's mirror — `paseo/usage` reads it —
+    // not the live controller it was up to 0.2.1.
     const initial = {
       provider: route.provider,
       model: route.model,
@@ -4472,9 +4540,35 @@ export class PaseoHarnessServer {
     // exist on `subagent`/`subagent_fork` (it belongs to bash/workflow), the
     // extra key was ignored, and the re-registration only shadowed the standing
     // tool with an identical definition.
-    const installSelection = (agentCtx) => {
-      control.dispose = installModelSelection(agentCtx, control.selection);
+    // DSH 0.2.2 makes `agent.model.select()` the durable switch, but the
+    // resume path starts from whatever `model/selection` the previous process
+    // recorded — `agentOptions` is only the fallback, so a queued route (one
+    // written by `configSet` before the agent existed) would lose to the old
+    // persisted selection on the first prompt after a reopen. Pin the bridge's
+    // initial route through the same durable API. On 0.2.1 there is no
+    // `agent.model`; `agentOptions` + the caller-owned selection ref remain the
+    // whole contract, so this is a 0.2.2-only step.
+    const applyInitialModelSelection = (agent) => {
+      if (LEGACY_MODEL_SELECTION || typeof agent.model?.select !== 'function') return;
+      if (initial.provider === undefined || initial.model === undefined) return;
+      const previous = agent.model.current?.();
+      if (previous !== undefined
+        && previous.provider === initial.provider
+        && previous.model === initial.model
+        && previous.reasoningEffort === initial.reasoningEffort) {
+        return;
+      }
+      agent.model.select({ ...initial });
+    };
+    const installSelection = (agentCtx, agent) => {
+      // Two contracts share this symbol. `installModelSelection.length` decides
+      // which one this DSH ships: 0.2.1 takes the caller-owned selection ref,
+      // 0.2.2 takes only the agent scope and installs the switch notice.
+      control.dispose = LEGACY_MODEL_SELECTION
+        ? installModelSelection(agentCtx, control.selection)
+        : installModelSelection(agentCtx);
       this.installSystemPrompt(sessionId, agentCtx);
+      applyInitialModelSelection(agent);
     };
 
     // Paseo's MCP servers are mounted at the AGENT scope, not as a profile-wide
@@ -4525,7 +4619,7 @@ export class PaseoHarnessServer {
     // path. Setup itself is awaited before publication in both, so this is the
     // placement that stays true on either line.
     let setup = async (agentCtx, agent) => {
-      installSelection(agentCtx);
+      installSelection(agentCtx, agent);
       await mountMcp(agentCtx);
       this.fileSnapshots.beginOwner(sessionId);
     };
@@ -4535,7 +4629,7 @@ export class PaseoHarnessServer {
       const resolvedId = await this.resolvePreset(sessionId, this.pendingPresets.get(sessionId));
       agentPreset = resolvedId;
       setup = async (agentCtx, agent) => {
-        installSelection(agentCtx);
+        installSelection(agentCtx, agent);
         await presets.mount(agentCtx, resolvedId);
         await mountMcp(agentCtx);
         // Same reason as the default `setup` above: last, so a failed mount
@@ -4590,7 +4684,7 @@ export class PaseoHarnessServer {
       // deployment renames a preset, or when a newer DSH renames the built-in
       // default that every existing session's header recorded.
       let resumeSetup = async (agentCtx, agent) => {
-        installSelection(agentCtx);
+        installSelection(agentCtx, agent);
         await mountMcp(agentCtx);
         // A resume is a new writer epoch on the same journal (this process may
         // have been a previous owner, or may be taking over from another one),
@@ -4618,7 +4712,7 @@ export class PaseoHarnessServer {
           }
         }
         resumeSetup = async (agentCtx, agent) => {
-          installSelection(agentCtx);
+          installSelection(agentCtx, agent);
           await presets.mount(agentCtx, resolvedId);
           await mountMcp(agentCtx);
           // Same reason as the default `resumeSetup` above.
