@@ -866,7 +866,7 @@ console.log("high-frequency tools get their own cards (L2)");
     },
     '{"member":{"target":"policy-researcher","role":"teammate","status":"running","description":"取证 Anthropic 官方支持地区与使用政策原文","provider":"spawn","context":"fresh","model":"deepseek-flash","diagnostics":[]}}',
   );
-  equal("spawn_teammate: the head is the name, fork marked", spawn.summary, "terminal-bare · 继承上下文");
+  equal("spawn_teammate: the head is the description, fork marked", spawn.summary, "terminal 输出区无卡壳变体 · 继承上下文");
   equal("…description is a fact (localized label) and the prompt prose", spawn.fields.args, [
     { kind: "fact", label: "说明", value: "terminal 输出区无卡壳变体" },
     { kind: "text", label: "提示词", value: "你是 paseo-dsh 仓库的实现队友…\n\n工作区：<workspace>" },
@@ -890,13 +890,15 @@ console.log("high-frequency tools get their own cards (L2)");
   // F4: a mapped card's summary wins over the generic `description` rule (a
   // bash row is titled by the model's description; a mapped row already named
   // its subject). Both rows carry `metadata.description`, as the server does.
+  // `spawn_teammate` deliberately maps its subject to the description (the
+  // localized, reader-facing half) and keeps the name as the fallback.
   const describedSpawn = row(
     "spawn_teammate",
     { name: "terminal-bare", prompt: "p", description: "terminal 输出区无卡壳变体" },
     '{"member":{"target":"x","role":"teammate","status":"running"}}',
     { metadata: { description: "terminal 输出区无卡壳变体" } },
   );
-  equal("a mapped summary beats metadata.description", describedSpawn.summary, "terminal-bare");
+  equal("a mapped summary beats metadata.description", describedSpawn.summary, "terminal 输出区无卡壳变体");
   // `run_code`'s mapping summary is the input's own description, which the server
   // also copies into metadata; the values are made to differ here only so the
   // priority itself is observable (a real call sends the same string twice).

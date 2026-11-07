@@ -1470,9 +1470,15 @@ function interruptAgentCard(input: unknown, output: unknown, failed: boolean): T
 }
 
 /**
- * `spawn_teammate`'s card: the name is the subject (`context: fork` marked), the
- * description a fact, the prompt prose, and the created member's own status and
- * model the receipt.
+ * `spawn_teammate`'s card: the description is the subject (`context: fork`
+ * marked), the prompt prose, and the created member's own status and model the
+ * receipt.
+ *
+ * The subject is the description rather than the name because the name is a
+ * lower-kebab-case wire identifier (DSH rejects anything else), while the
+ * description is written in the reader's language. Keeping it in the head makes
+ * the row read the same before and after the tool result arrives; the name is
+ * still reachable from `list_agents` and the team panel.
  */
 function spawnTeammateCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
   if (failed || !isRecord(input)) return null;
@@ -1484,13 +1490,15 @@ function spawnTeammateCard(input: unknown, output: unknown, failed: boolean): To
   const member = value.member;
   if (typeof member.target !== "string" || typeof member.status !== "string") return null;
   const cards = localeText().toolCards;
+  const description = typeof input.description === "string" ? input.description : "";
+  const subject = description === "" ? name : description;
   const args: ToolFieldEntry[] = [];
-  if (typeof input.description === "string" && input.description !== "") {
-    args.push({ kind: "fact", label: cards.labels.description, value: input.description });
+  if (description !== "") {
+    args.push({ kind: "fact", label: cards.labels.description, value: description });
   }
   args.push(proseEntry(cards.labels.prompt, prompt));
   return {
-    summary: input.context === "fork" ? `${name} · ${cards.inheritsContext}` : name,
+    summary: input.context === "fork" ? `${subject} · ${cards.inheritsContext}` : subject,
     args,
     result: [],
     receipt: cards.created(member.status, typeof member.model === "string" ? member.model : ""),
