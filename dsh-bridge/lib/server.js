@@ -2011,7 +2011,45 @@ export class PaseoHarnessServer {
    * Read one stored session's raw event log, for replay into a Paseo timeline.
    * Read-only, so it works while a live agent still owns the session.
    */
-  async history(params) {
+  async history(params = {}) {
+    // A session that is still live in this process already holds its log in
+    // memory. Opening the persistence backend read-only while the live writer
+    // still owns the same file is what stalls a Paseo reopen on DSH 0.2.2: the
+    // read path can block for the full 15s deadline ("timed out reading session
+    // history"). `snapshotEvents()` is the session's own in-memory snapshot, so
+    // this path cannot race its writer.
+    let live;
+    try {
+      live = this.ctx.get('sessions')?.get?.(params.sessionId);
+    } catch (error) {
+      process.stderr.write(
+        `[bridge] live history lookup failed for ${String(params.sessionId)}; falling back to persistence: `
+        + `${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
+    if (live !== undefined && live !== null) {
+      try {
+        const snapshot = live.snapshotEvents();
+        // Same contract as the persistence handle: a forked child's replayed
+        // log starts after the inherited prefix.
+        const inheritedEventCount =
+          typeof live.inheritedEventCount === 'number' && live.inheritedEventCount > 0
+            ? live.inheritedEventCount
+            : 0;
+        return {
+          available: true,
+          inheritedEventCount,
+          events: historyEvents(this.ctx, visibleEvents(snapshot ?? [])),
+        };
+      } catch (error) {
+        // A live snapshot is an optimization, never the only source: fall back
+        // to the durable read instead of turning the reopen into a failure.
+        process.stderr.write(
+          `[bridge] live history snapshot failed for ${String(params.sessionId)}; falling back to persistence: `
+          + `${error instanceof Error ? error.message : String(error)}\n`,
+        );
+      }
+    }
     const persistence = this.ctx.get('sessionPersistence');
     if (persistence === undefined) return { available: false, events: [], inheritedEventCount: 0 };
     let handle;

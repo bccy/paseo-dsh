@@ -795,6 +795,130 @@ const present = () => ({
   );
 }
 
+// ===== 6b. live history reads the in-memory snapshot, not the log ==========
+// A session that is still live owns its log writer. Opening the same file
+// read-only through persistence can stall for the full 15s deadline on DSH
+// 0.2.2, which is what Paseo reports as "timed out reading session history"
+// when a running conversation is reopened. The live session's own snapshot is
+// the race-free source; persistence is only the fallback for non-live sessions
+// and for a snapshot that throws.
+{
+  const liveEvents = [
+    { type: 'user/message', seq: 7, time: 1, data: { role: 'user', content: [] }, surfaceOp: 'append' },
+    { type: 'assistant/message', seq: 8, time: 2, data: { role: 'assistant', content: [] }, surfaceOp: 'append' },
+  ];
+  let openCalls = 0;
+  const sessions = {
+    get: (id) => (id === 'live-history'
+      ? { snapshotEvents: () => liveEvents, inheritedEventCount: 3 }
+      : undefined),
+  };
+  const persistence = {
+    open: async () => {
+      openCalls += 1;
+      throw new Error('persistence must not be opened for a live session');
+    },
+  };
+  const { server } = makeServer({ sessions, sessionPersistence: persistence });
+  const out = await server.history({ sessionId: 'live-history' });
+  check(
+    'live history uses the in-memory snapshot and never opens persistence',
+    openCalls === 0
+      && out.available === true
+      && out.inheritedEventCount === 3
+      && out.events.length === 2
+      && out.events[0].seq === 7
+      && out.events[1].seq === 8,
+    JSON.stringify({ openCalls, out }),
+  );
+}
+
+{
+  // A live snapshot can contain a rewind seam exactly like a persisted log:
+  // `visibleEvents` must fold it before replay, or reopening a live session
+  // would resurrect the rows the rewind removed even though persistence was
+  // never consulted.
+  const liveEvents = [
+    { seq: 1, type: 'user/message', surfaceOp: 'append', data: { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'KEPT-USER' }] } },
+    { seq: 2, type: 'assistant/message', surfaceOp: 'append', data: { message: { id: 'a2', role: 'assistant', content: [{ type: 'text', text: 'KEPT-ANSWER' }] } } },
+    { seq: 3, type: 'user/message', surfaceOp: 'append', data: { id: 'u3', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'WITHDRAWN-USER' }] } },
+    { seq: 4, type: 'assistant/message', surfaceOp: 'append', data: { message: { id: 'a4', role: 'assistant', content: [{ type: 'text', text: 'WITHDRAWN-ANSWER' }] } } },
+    {
+      seq: 5,
+      type: 'user/message',
+      surfaceOp: { op: 'replace', startSeq: 3, endSeq: 4 },
+      sourceEventSeqs: [3, 4],
+      data: { id: 'mark5', role: 'user', content: [], source: { kind: 'paseo-rewind' } },
+    },
+  ];
+  const sessions = { get: () => ({ snapshotEvents: () => liveEvents, inheritedEventCount: 0 }) };
+  const { server } = makeServer({ sessions });
+  const out = await server.history({ sessionId: 'live-rewind' });
+  const seqs = out.events.map((event) => event.seq);
+  const body = JSON.stringify(out.events);
+  check(
+    'a live snapshot folds a paseo-rewind replace before replay',
+    out.available === true
+      && seqs.includes(1)
+      && seqs.includes(2)
+      && seqs.includes(3) === false
+      && seqs.includes(4) === false
+      && body.includes('KEPT-USER')
+      && body.includes('KEPT-ANSWER')
+      && body.includes('WITHDRAWN') === false,
+    JSON.stringify({ seqs, events: out.events }),
+  );
+}
+
+{
+  let openCalls = 0;
+  const sessions = {
+    get: () => ({
+      inheritedEventCount: 0,
+      snapshotEvents: () => {
+        throw new Error('injected snapshot failure');
+      },
+    }),
+  };
+  const persistence = {
+    open: async () => {
+      openCalls += 1;
+      return {
+        inheritedEventCount: 0,
+        read: async () => ({
+          events: [{ type: 'user/message', seq: 1, data: { role: 'user', content: [] }, surfaceOp: 'append' }],
+        }),
+        close: async () => {},
+      };
+    },
+  };
+  const { server } = makeServer({ sessions, sessionPersistence: persistence });
+  const out = await server.history({ sessionId: 'broken-live' });
+  check(
+    'a live snapshot failure falls back to the persistence read',
+    openCalls === 1 && out.available === true && out.events.length === 1,
+    JSON.stringify({ openCalls, out }),
+  );
+}
+
+{
+  let openCalls = 0;
+  const sessions = { get: () => undefined };
+  const persistence = {
+    open: async () => {
+      openCalls += 1;
+      return { inheritedEventCount: 0, read: async () => ({ events: [] }), close: async () => {} };
+    },
+  };
+  const { server } = makeServer({ sessions, sessionPersistence: persistence });
+  const out = await server.history({ sessionId: 'not-live' });
+  check(
+    'a non-live session still reads through persistence',
+    openCalls === 1 && out.available === true && out.events.length === 0,
+    JSON.stringify({ openCalls, out }),
+  );
+}
+
 // ===== 7. queued plan intents are applied in both directions ==============
 {
   const planCalls = [];
