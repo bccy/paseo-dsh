@@ -576,6 +576,19 @@ const DEFAULT_MAX_OUTBOUND_QUEUE_BYTES = 64 * 1024 * 1024;
 const JOBS_READ_TIMEOUT_MS = 15_000;
 
 /**
+ * How many consecutive `paseo/jobs` timeouts are tolerated before the bridge is
+ * declared unusable.
+ *
+ * A long session's open/replay can make the bridge skip the poll for a while
+ * without being old or dead (measured on a 2700+ step session: a freshly
+ * spawned bridge byte-identical to the source missed the first jobs poll for
+ * 15 s). Two silent retries keep the pill quiet through that startup window;
+ * only the third consecutive miss classifies the bridge as terminal. Any answer
+ * (including an `available:false` registry read) resets the streak.
+ */
+const JOBS_TIMEOUT_TOLERANCE = 2;
+
+/**
  * The bridge's reply when it does not implement a method at all — the verbatim
  * prefix its `handleRequest` `default:` branch throws. Matched as a substring for
  * the same reason as {@link DshProcess.#isNotInitializedError}: the transport
@@ -1602,6 +1615,15 @@ export class DshProcess {
    */
   #warnedJobsUnresponsive = false;
   /**
+   * Consecutive `paseo/jobs` timeouts since the last answer from the bridge.
+   *
+   * Process-wide like the bridge itself: all sessions share one child, so a
+   * child that cannot answer jobs for one is the same child for all. Reset by
+   * any successful `paseo/jobs` exchange (a registry-missing answer included —
+   * the bridge answered, which is what this counter measures).
+   */
+  #consecutiveJobsTimeouts = 0;
+  /**
    * Whether the "this bridge has no paseo/goal" line has been logged.
    *
    * Latched for the same reason as {@link #warnedJobsUnsupported}: the goal pill
@@ -2372,11 +2394,17 @@ export class DshProcess {
    * travels through so the caller can say "could not read" instead of "none".
    *
    * @param sessionId - which session; required — there is no default.
+   * @param timeoutMs - read budget; production keeps the 15 s default, checks
+   *   pass a short one so the timeout policy can be driven deterministically.
    */
-  async jobs(sessionId: string): Promise<DshJobs> {
+  async jobs(sessionId: string, timeoutMs = JOBS_READ_TIMEOUT_MS): Promise<DshJobs> {
     await this.#ensureSessionReady(sessionId);
     try {
-      return withJobsErrorCode((await this.#request("paseo/jobs", { sessionId }, JOBS_READ_TIMEOUT_MS)) as DshJobs);
+      const result = withJobsErrorCode((await this.#request("paseo/jobs", { sessionId }, timeoutMs)) as DshJobs);
+      // Any answer ends the timeout streak — including an `available:false`
+      // registry read: the bridge talked, so "it is not answering" is over.
+      this.#consecutiveJobsTimeouts = 0;
+      return result;
     } catch (error) {
       // No answer at all within the short jobs budget. Two shapes reach here:
       // a bridge build that *ignores* methods it does not know (older/foreign
@@ -2388,11 +2416,23 @@ export class DshProcess {
       // code, and the action (reload the plugin so the embedded bridge is
       // rewritten) is identical.
       if (this.#isBridgeTimeoutError(error, "paseo/jobs")) {
+        this.#consecutiveJobsTimeouts += 1;
+        if (this.#consecutiveJobsTimeouts <= JOBS_TIMEOUT_TOLERANCE) {
+          // The bridge is not answering yet, but a fresh bridge opening a long
+          // session legitimately misses the first polls while its replay runs.
+          // Two silent retries keep the pill hidden instead of banning jobs for
+          // the rest of the process; the next poll decides. This deliberately
+          // reports an empty list for a read we could not complete — the
+          // tradeoff (no error pill, but also no jobs) is FIELD-NOTES #95's
+          // recorded choice for the startup window only.
+          return { available: true, jobs: [] };
+        }
         if (!this.#warnedJobsUnresponsive) {
           this.#warnedJobsUnresponsive = true;
           this.#processHandlers.onLog(
-            `the bridge did not answer paseo/jobs within ${String(JOBS_READ_TIMEOUT_MS)}ms ` +
-              `(an old or unresponsive bridge); the jobs pill is disabled until the plugin is reloaded: ` +
+            `the bridge did not answer paseo/jobs ${String(this.#consecutiveJobsTimeouts)} times in a row ` +
+              `(last attempt ${String(timeoutMs)}ms); an old or unresponsive bridge. ` +
+              `The jobs pill is disabled until the plugin is reloaded: ` +
               BRIDGE_UNRESPONSIVE_MESSAGE,
           );
         }
@@ -2405,6 +2445,9 @@ export class DshProcess {
       // terminal: the client stops polling instead of retrying an answer that
       // cannot change until the plugin is reloaded.
       if (!this.#isUnknownBridgeMethodError(error)) throw error;
+      // An unknown-method reply is still an answer: the bridge talked, so the
+      // timeout streak is over (this branch is terminal for the pill anyway).
+      this.#consecutiveJobsTimeouts = 0;
       if (!this.#warnedJobsUnsupported) {
         this.#warnedJobsUnsupported = true;
         // Once per process: an unlatched line would bury the log (same reasoning

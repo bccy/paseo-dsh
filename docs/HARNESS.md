@@ -166,6 +166,15 @@
   不得改 jobs 用户可见文案。**动了 `client/jobs-pill.tsx` / `client/jobs-polling.ts` /
   `client/agent-polling.ts` / `client/poll-sequence.ts` / `client/locale.ts` 的 jobs 表 /
   `shared/jobs.ts` 必跑；`jobs-poll.tsconfig.json` 是它的编译配置。**
+- `harness/jobs-timeout-check.cjs` — `DshProcess.jobs()` 的连续超时策略（真实 `DshProcess` + 自生成
+  假 `dsh` 子进程，真 stdio JSON-RPC，不 stub 方法；**9 条**）：连续第 1/2 次超时→安静
+  `{available:true, jobs:[]}` 且 0 日志；第 3 次→terminal `bridge_too_old` + 单次 latched 日志；
+  第 4 次不再重复日志；成功应答、`available:false`（registry_missing）应答、unknown-method 应答
+  都清零计数（此后两次超时仍被容忍）。运行：`cd paseo-plugin && npx tsc --noEmit false --outDir .dbg
+  --declaration false --module commonjs --moduleResolution node`；`echo '{"type":"commonjs"}' >
+  .dbg/package.json`；`cp ../harness/jobs-timeout-check.cjs .dbg/`；`cd .dbg && node
+  jobs-timeout-check.cjs`。**动了 `dsh-process.ts` 的 `jobs()` / `JOBS_TIMEOUT_TOLERANCE` /
+  `#consecutiveJobsTimeouts` 必跑。**
 - `harness/jobs-popover-check.cjs` — jobs popover 的几何、状态标记、JSX 接线与宿主主题数据（**224 条**；离线半 154 条 + 宿主题半 70 条；2026-11-05：pill 文字经 `jobsPillCopy`、源码不再出现 `liveLabel`；触发图标钉从 `JobsSpinner`/`ListChecks` 改为 `JobsPillIcon`（`SquareTerminal` + 角标环）/`SquareTerminal`；2026-11-08：删除跨 pill 协调器后源码钉改为「`presentation = jobsPillPresentation(next)` 后 `visible = presentation.visible`（无 gate），`update` 发送该 `visible`」+ 源码无 deference 引用；宿主题半在当前 Paseo checkout（含上游 #8748 的 `@/styles/density`）上会因 check 的 vm stub 未覆盖该依赖而失败——HEAD 版同样失败，旧行为是未捕获抛错 exit 1；2026-11-08 起该失败被 catch 成 INCOMPLETE（exit 2，与 `HOST_APP` 未设同语义）；用引入前的宿主快照（`fcbfb4f0d^`）实测全绿 224/224，属既有漂移，与本轮改动无关）；
   `HOST_APP` 指 Paseo checkout，没有就会跑完但 exit 2。**同上触发条件必跑（需 `HOST_APP`），
   跑法见文件头注释。**
