@@ -17,6 +17,7 @@
 import type { AgentMessage } from "./agent-message";
 import { agentMessageLabel, currentLocale, localeText, teamToolErrorDisplay, type ToolCardsText } from "./locale";
 import { teamTaskSchema } from "../shared/team";
+import { labelFor, rosterFromMetadata } from "./team-roster";
 import { teamTaskFields, teamTaskMark, type TeamTaskMark } from "./team-polling";
 
 /**
@@ -1435,8 +1436,17 @@ function baseName(path: string): string {
  * `{messageId,status}`; the subagent-control tool (`agent_id`) renders the
  * sentence `message delivered to agent <id>`. The *input* decides which one this
  * row is — the tool name is the same for both.
+ *
+ * The Team implementation's head is {@link labelFor}`(roster, target)`: DSH
+ * targets are lower-kebab English wire names, and the roster the server wrote on
+ * this item's metadata carries the reader-facing description.
  */
-function sendMessageCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+function sendMessageCard(
+  input: unknown,
+  output: unknown,
+  failed: boolean,
+  roster: ReturnType<typeof rosterFromMetadata>,
+): ToolMapping | null {
   if (failed || !isRecord(input)) return null;
   const message = input.message;
   if (typeof message !== "string") return null;
@@ -1447,9 +1457,9 @@ function sendMessageCard(input: unknown, output: unknown, failed: boolean): Tool
   if (typeof input.target === "string" && input.target !== "") {
     const value = structuredResult(output);
     if (!isRecord(value)) return null;
-    if (value.sent === true) return { summary: input.target, args, result: [], receipt: cards.sent };
+    if (value.sent === true) return { summary: labelFor(roster, input.target), args, result: [], receipt: cards.sent };
     if (typeof value.messageId === "string" && typeof value.status === "string") {
-      return { summary: input.target, args, result: [], receipt: cards.sentWithStatus(value.status) };
+      return { summary: labelFor(roster, input.target), args, result: [], receipt: cards.sentWithStatus(value.status) };
     }
     return null;
   }
@@ -1469,14 +1479,22 @@ function sendMessageCard(input: unknown, output: unknown, failed: boolean): Tool
   return null;
 }
 
-/** `interrupt_agent`'s card: the same two implementations as `send_message`. */
-function interruptAgentCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+/**
+ * `interrupt_agent`'s card: the same two implementations as `send_message`, and
+ * the same {@link labelFor}`(roster, target)` head for the Team one.
+ */
+function interruptAgentCard(
+  input: unknown,
+  output: unknown,
+  failed: boolean,
+  roster: ReturnType<typeof rosterFromMetadata>,
+): ToolMapping | null {
   if (failed || !isRecord(input)) return null;
   const cards = localeText().toolCards;
   if (typeof input.target === "string" && input.target !== "") {
     const value = structuredResult(output);
     if (!isRecord(value) || typeof value.previousStatus !== "string") return null;
-    return { summary: input.target, args: [], result: [], receipt: cards.interrupted(value.previousStatus) };
+    return { summary: labelFor(roster, input.target), args: [], result: [], receipt: cards.interrupted(value.previousStatus) };
   }
   if (typeof input.agent_id === "string" && input.agent_id !== "") {
     if (!/^interrupt requested for agent\b/u.test(receiptText(output))) return null;
@@ -2254,12 +2272,18 @@ function remoteGetOperationCard(input: unknown, output: unknown, failed: boolean
  * guess. A failed call never reaches a mapper: a failure must not be rendered
  * as a success receipt, and the existing failure display owns those rows.
  */
-function toolMapping(name: string, input: unknown, output: unknown, failed: boolean): ToolMapping | null {
+function toolMapping(
+  name: string,
+  input: unknown,
+  output: unknown,
+  failed: boolean,
+  roster: ReturnType<typeof rosterFromMetadata>,
+): ToolMapping | null {
   switch (name) {
     case "send_message":
-      return sendMessageCard(input, output, failed);
+      return sendMessageCard(input, output, failed, roster);
     case "interrupt_agent":
-      return interruptAgentCard(input, output, failed);
+      return interruptAgentCard(input, output, failed, roster);
     case "spawn_teammate":
       return spawnTeammateCard(input, output, failed);
     case "wait_agent":
@@ -2643,6 +2667,9 @@ export function toolCallData(
 ): ToolCallData {
   const detail = (item.detail ?? {}) as ToolDetail;
   const metadata = (item.metadata ?? {}) as ToolDetail;
+  // The server wrote this session's roster on this item (see `team-roster`);
+  // it is item-scoped, so no state is shared between sessions or rows.
+  const teamRoster = rosterFromMetadata(metadata);
   const type = str(detail, "type");
   const failed = item.status === "failed";
   // Only a failed row can have a reason. A successful item carries
@@ -2881,7 +2908,7 @@ export function toolCallData(
   // success receipt).
   const mapped =
     type === "unknown" && agentMessage === undefined && goal === null && team === null
-      ? toolMapping(item.name, detail.input, detail.output, failed)
+      ? toolMapping(item.name, detail.input, detail.output, failed, teamRoster)
       : null;
   if (mapped !== null) {
     primary = mapped.summary;

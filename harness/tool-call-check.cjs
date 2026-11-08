@@ -72,6 +72,7 @@ const {
 } = require("./client/tool-call-data.js");
 const { diffStat } = require("./client/tokens.js");
 const { allText, localeText, setLocale } = require("./client/locale.js");
+const { labelFor, rosterFromMetadata } = require("./client/team-roster.js");
 
 /**
  * Load a sibling harness module from wherever this check runs.
@@ -854,6 +855,63 @@ console.log("high-frequency tools get their own cards (L2)");
   const oddInterrupt = row("interrupt_agent", { target: "x" }, "done");
   equal("interrupt_agent: an undocumented result keeps L1", oddInterrupt.summary, "target: x");
   equal("…and no receipt", oddInterrupt.fields.receipt, "");
+
+  // --- team roster: per-item metadata, never process state ------------------
+  // The zero state must be the old output, field for field: no roster on the
+  // item means the wire target exactly as before this card existed.
+  equal("roster: an unknown target stays the target", labelFor(undefined, "roster-never-seen"), "roster-never-seen");
+  equal("roster: an empty target is never rendered blank", labelFor(undefined, ""), "—");
+
+  // Two items naming the same target with different rosters: the old global
+  // `Map` could leak A's description into B (two sessions, one member name).
+  // Each item now carries its own, and nothing is shared between rows.
+  const rosterA = { metadata: { teamRoster: { "roster-member": "审查支付" } } };
+  const rosterB = { metadata: { teamRoster: { "roster-member": "审查结算" } } };
+  const sendA = row("send_message", { target: "roster-member", message: "x" }, '{"sent":true}', rosterA);
+  equal("send_message: item A's roster names its own member", sendA.summary, "审查支付");
+  const sendB = row("send_message", { target: "roster-member", message: "x" }, '{"sent":true}', rosterB);
+  equal("send_message: item B's roster is not contaminated by item A", sendB.summary, "审查结算");
+  const noRoster = row("send_message", { target: "roster-member", message: "x" }, '{"sent":true}');
+  equal("send_message: an item with no roster falls back to the target", noRoster.summary, "roster-member");
+
+  const rosterInterrupt = row("interrupt_agent", { target: "roster-member" }, '{"previousStatus":"running"}', rosterA);
+  equal("interrupt_agent: the item's roster names the head", rosterInterrupt.summary, "审查支付");
+
+  // The reopen case this design exists for: the item carries the roster, and
+  // the rendered range has no preceding `spawn_teammate` / `list_agents` row.
+  const reopened = row("send_message", { target: "roster-reopened", message: "m" }, '{"sent":true}', {
+    metadata: { teamRoster: { "roster-reopened": "重开会话后的成员" } },
+  });
+  equal("reopen: a roster-bearing item labels without any spawn/list row", reopened.summary, "重开会话后的成员");
+
+  // Empty/whitespace descriptions are not labels, and one dirty entry must not
+  // throw away the well-formed entries beside it.
+  check(
+    "roster: a malformed metadata value yields no roster",
+    rosterFromMetadata({ teamRoster: { "roster-empty": "   ", "roster-bad": 3 } }) === undefined,
+    JSON.stringify(rosterFromMetadata({ teamRoster: { "roster-empty": "   ", "roster-bad": 3 } })),
+  );
+  equal(
+    "roster: whitespace falls back to the target",
+    labelFor(rosterFromMetadata({ teamRoster: { "roster-empty": "   " } }), "roster-empty"),
+    "roster-empty",
+  );
+  const shallowRoster = rosterFromMetadata({ teamRoster: { "roster-ok": "有效说明", "roster-empty": "" } });
+  equal("roster: a dirty sibling does not discard a valid entry", labelFor(shallowRoster, "roster-ok"), "有效说明");
+
+  // No write path remains: a spawn row names its own subject, but a later item
+  // with no roster metadata must still render the target.
+  const rosterSpawn = row(
+    "spawn_teammate",
+    { name: "roster-spawned", prompt: "p", description: "被生成的成员" },
+    '{"member":{"target":"roster-spawned","role":"teammate","status":"running"}}',
+  );
+  equal("spawn_teammate: its own row keeps the description subject", rosterSpawn.summary, "被生成的成员");
+  equal(
+    "send_message: no spawn row leaks a roster into a later item",
+    row("send_message", { target: "roster-spawned", message: "m" }, '{"sent":true}').summary,
+    "roster-spawned",
+  );
 
   // --- spawn_teammate -------------------------------------------------------
   const spawn = row(

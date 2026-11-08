@@ -52,10 +52,11 @@
  * builder directly, which is the only way to stage those orderings.
  *
  * Run (from paseo-plugin):
- *   npx tsc server/timeline.ts \
+ *   npx tsc server/timeline.ts server/session.ts client/team-roster.ts \
  *     --outDir .dbg --rootDir . --module commonjs --moduleResolution node \
  *     --target ES2022 --skipLibCheck
- *   # `server/locale.ts` comes along: `timeline.js` imports it for `UI`/`LOCALE`.
+ *   # `server/locale.ts` / `server/dsh-process.ts` come along transitively; the
+ *   # roster tests also require the real `DshSession` and the client parser.
  *   echo '{"type":"commonjs"}' > .dbg/package.json
  *   cp ../harness/timeline-check.cjs .dbg/
  *   cd .dbg && node timeline-check.cjs
@@ -66,6 +67,7 @@
 "use strict";
 
 const { TimelineBuilder } = require("./server/timeline.js");
+const { rosterFromMetadata } = require("./client/team-roster.js");
 /** The same module the builder reads, so the relay can be compared to its source. */
 const { LOCALE } = require("./server/locale.js");
 /**
@@ -1737,5 +1739,284 @@ console.log("the meta survives the plugin's own event schema");
   );
 }
 
-console.log(`\n${passed} passed, ${failed} failed`);
-process.exit(failed === 0 ? 0 : 1);
+console.log("\nteam roster metadata (server side)");
+{
+  const sendCall = (builder) =>
+    builder.consume({
+      type: "tool/call",
+      seq: 1,
+      data: { callId: "c1", name: "send_message", arguments: { target: "reviewer", message: "m" } },
+    })[0];
+  const a = new TimelineBuilder({ teamRoster: new Map([["reviewer", "审查支付"]]) });
+  const b = new TimelineBuilder({ teamRoster: new Map([["reviewer", "审查结算"]]) });
+  check(
+    "two builders keep same-named members apart",
+    sendCall(a).metadata?.teamRoster?.reviewer === "审查支付"
+      && sendCall(b).metadata?.teamRoster?.reviewer === "审查结算",
+    JSON.stringify([sendCall(a).metadata, sendCall(b).metadata]),
+  );
+  check(
+    "the server key and the client parser agree",
+    rosterFromMetadata(sendCall(a).metadata)?.get("reviewer") === "审查支付",
+    JSON.stringify(sendCall(a).metadata),
+  );
+
+  const seeded = new TimelineBuilder({ teamRoster: new Map([["reviewer", "审查支付"]]) });
+  seeded.consume({
+    type: "tool/call",
+    seq: 1,
+    data: { callId: "s1", name: "spawn_teammate", arguments: { name: "reviewer", prompt: "p" } },
+  });
+  check(
+    "a spawn with a missing description keeps the seeded value",
+    sendCall(seeded).metadata?.teamRoster?.reviewer === "审查支付",
+    JSON.stringify(sendCall(seeded).metadata),
+  );
+  seeded.consume({
+    type: "tool/call",
+    seq: 2,
+    data: { callId: "s2", name: "spawn_teammate", arguments: { name: "reviewer", prompt: "p", description: "" } },
+  });
+  check(
+    "an explicit empty description deletes the value",
+    sendCall(seeded).metadata?.teamRoster?.reviewer === undefined,
+    JSON.stringify(sendCall(seeded).metadata),
+  );
+
+  // Only the team tool rows pay for the roster; a bash/command/activity row must
+  // not carry it.
+  const plain = new TimelineBuilder({ teamRoster: new Map([["reviewer", "审查支付"]]) });
+  const bash = plain.consume({
+    type: "tool/call",
+    seq: 1,
+    data: { callId: "b1", name: "bash", arguments: { command: "pwd" } },
+  })[0];
+  check(
+    "a non-team row carries no roster",
+    !("teamRoster" in (bash.metadata ?? {})),
+    JSON.stringify(bash.metadata),
+  );
+
+  // The late-sequence case: the row was created while the roster was empty, the
+  // roster arrived afterwards, and only `settleRunningTools` gets a chance to
+  // stamp it. An existing empty `teamRoster` must be replaced, not treated as
+  // "already labelled".
+  const running = new TimelineBuilder();
+  const started = running.consume({
+    type: "tool/call",
+    seq: 1,
+    data: { callId: "r1", name: "send_message", arguments: { target: "reviewer", message: "m" } },
+  })[0];
+  check(
+    "a send row created with no roster starts with an empty snapshot",
+    started?.metadata?.teamRoster !== undefined && Object.keys(started.metadata.teamRoster).length === 0,
+    JSON.stringify(started?.metadata),
+  );
+  running.setTeamRoster(new Map([["reviewer", "审查支付"]]));
+  const settled = running.settleRunningTools()[0];
+  check(
+    "settleRunningTools replaces an empty snapshot with the late roster",
+    settled?.metadata?.teamRoster?.reviewer === "审查支付" && settled?.status === "canceled",
+    JSON.stringify(settled),
+  );
+}
+
+console.log("\nteam roster on a child session row");
+{
+  const { DshChildSession } = require("./server/session.js");
+  const emitted = [];
+  const child = new DshChildSession({
+    id: "roster-child",
+    nativeId: "roster-child-native",
+    subsession: true,
+    cwd: process.cwd(),
+    closed: () => false,
+    emit: (event) => emitted.push(event),
+    log() {},
+    resolvePermission() {},
+  });
+  child.setTeamRoster(new Map([["reviewer", "子会话名册"]]));
+  // The parent sync fires on every tool row and may carry an empty snapshot.
+  // That is "unknown", not "child has no members": the child's own label stays.
+  child.mergeTeamRoster(new Map());
+  child.event({
+    type: "tool/call",
+    data: { callId: "cm1", name: "send_message", arguments: { target: "reviewer", message: "m" } },
+  });
+  const row = emitted.find((event) => event.type === "timeline.item" && event.item.name === "send_message")?.item;
+  check(
+    "a child keeps its own roster when the parent sync is empty",
+    row?.metadata?.teamRoster?.reviewer === "子会话名册",
+    JSON.stringify(row?.metadata),
+  );
+  // A non-empty parent roster merges: it adds its own entries and must not
+  // delete a child-only entry.
+  child.mergeTeamRoster(new Map([["parent-only", "父会话说明"]]));
+  child.event({
+    type: "tool/call",
+    data: { callId: "cm2", name: "send_message", arguments: { target: "parent-only", message: "m" } },
+  });
+  const merged = emitted.filter((event) => event.type === "timeline.item" && event.item.name === "send_message").at(-1)?.item;
+  check(
+    "a non-empty parent merge adds entries without deleting the child's",
+    merged?.metadata?.teamRoster?.reviewer === "子会话名册"
+      && merged?.metadata?.teamRoster?.["parent-only"] === "父会话说明",
+    JSON.stringify(merged?.metadata),
+  );
+}
+
+(async () => {
+  console.log("\nteam roster: projection without descriptions does not clear live state");
+  {
+    const dshProcessModule = require("./server/dsh-process.js");
+    class FakeRosterProcess {
+      constructor() {
+        this.events = [];
+        this.handlers = undefined;
+        this.teamResult = {
+          available: true,
+          team: { members: [{ name: "reviewer", role: "teammate", phase: "active" }], tasks: [] },
+        };
+      }
+      async start() {}
+      async shutdown() {}
+      async attachSession(_sessionId, handlers) { this.handlers = handlers; }
+      async closeSession() {}
+      async usage() { return { available: false }; }
+      async history() { return { available: true, events: this.events }; }
+      async team() { return this.teamResult; }
+      emit(event) { this.handlers.onEvent({ sessionId: "roster-projection", event }); }
+    }
+    dshProcessModule.DshProcess = FakeRosterProcess;
+    const { DshSession } = require("./server/session.js");
+    const options = (fakeProcess) => ({
+      sessionId: "roster-projection",
+      cwd: process.cwd(),
+      env: {},
+      route: { provider: "fixture", model: "alpha" },
+      mode: "build",
+      modes: [],
+      models: [],
+      thinkingOptions: [],
+      emit: () => {},
+      log() {},
+      acquireProcess: async () => ({ process: fakeProcess, reused: false }),
+      releaseProcess: () => {},
+    });
+    const fake = new FakeRosterProcess();
+    const collected = [];
+    const live = new DshSession({
+      ...options(fake),
+      emit: (event) => collected.push(event),
+    });
+    await live.open();
+    // A live `list_agents` result is the description source on this path.
+    fake.emit({ type: "tool/call", seq: 1, data: { callId: "l1", name: "list_agents", arguments: {} } });
+    fake.emit({
+      type: "tool/result",
+      seq: 2,
+      data: { toolCallId: "l1", message: { content: [{ type: "text", text: JSON.stringify([
+        { target: "reviewer", role: "teammate", status: "inactive", description: "审查支付" },
+      ]) }] } },
+    });
+    // The real `agentTeam` projection has no description. Calling `team()` must
+    // not clear the description the live builder just learned.
+    const team = await live.team();
+    check(
+      "a projection without descriptions leaves the live roster intact",
+      Array.isArray(team.team?.members)
+        && !("description" in team.team.members[0]),
+      JSON.stringify(team.team),
+    );
+    fake.emit({ type: "tool/call", seq: 3, data: { callId: "m1", name: "send_message", arguments: { target: "reviewer", message: "m" } } });
+    fake.emit({
+      type: "tool/result",
+      seq: 4,
+      data: { toolCallId: "m1", message: { content: [{ type: "text", text: '{"sent":true}' }] } },
+    });
+    const row = collected
+      .filter((event) => event.type === "timeline.item" && event.item?.name === "send_message")
+      .map((event) => event.item)
+      .at(-1);
+    check(
+      "the send row still carries the live description after the projection read",
+      row?.metadata?.teamRoster?.reviewer === "审查支付",
+      JSON.stringify(row?.metadata),
+    );
+  }
+
+  console.log("\nreopen: replayHistory merges historical spawn/list rows into the live builder");
+  {
+    const dshProcessModule = require("./server/dsh-process.js");
+    class FakeRosterProcess {
+      constructor() {
+        this.events = [];
+        this.handlers = undefined;
+      }
+      async start() {}
+      async shutdown() {}
+      async attachSession(_sessionId, handlers) { this.handlers = handlers; }
+      async closeSession() {}
+      async usage() { return { available: false }; }
+      async history() { return { available: true, events: this.events }; }
+      async team() { return { available: true, team: { members: [{ name: "reviewer", role: "teammate", phase: "active" }], tasks: [] } }; }
+      emit(event) { this.handlers.onEvent({ sessionId: "roster-replay", event }); }
+    }
+    dshProcessModule.DshProcess = FakeRosterProcess;
+    const { DshSession } = require("./server/session.js");
+    const fake = new FakeRosterProcess();
+    fake.events = [
+      { type: "turn/start", seq: 1, data: { turn: 1 } },
+      { type: "tool/call", seq: 2, data: { callId: "s1", name: "spawn_teammate", arguments: {
+        name: "reviewer", description: "审查支付", prompt: "p",
+      } } },
+      { type: "tool/call", seq: 3, data: { callId: "l1", name: "list_agents", arguments: {} } },
+      { type: "tool/result", seq: 4, data: { toolCallId: "l1", message: { content: [{ type: "text", text: JSON.stringify([
+        { target: "reviewer", role: "teammate", status: "inactive", description: "审查支付（list）" },
+        { target: "observer", role: "teammate", status: "inactive", description: "观察员" },
+      ]) }] } } },
+      { type: "turn/end", seq: 5, data: { turn: 1, reason: { kind: "completed" } } },
+    ];
+    const collected = [];
+    const live = new DshSession({
+      sessionId: "roster-replay",
+      cwd: process.cwd(),
+      env: {},
+      route: { provider: "fixture", model: "alpha" },
+      mode: "build",
+      modes: [],
+      models: [],
+      thinkingOptions: [],
+      emit: (event) => collected.push(event),
+      log() {},
+      acquireProcess: async () => ({ process: fake, reused: false }),
+      releaseProcess: () => {},
+    });
+    await live.open();
+    await live.replayHistory();
+    // A live row after the replay must read the historical roster merged from
+    // the replay builder, even though this live event has no spawn/list row.
+    fake.emit({ type: "tool/call", seq: 6, data: { callId: "m2", name: "send_message", arguments: { target: "reviewer", message: "m" } } });
+    fake.emit({
+      type: "tool/result",
+      seq: 7,
+      data: { toolCallId: "m2", message: { content: [{ type: "text", text: '{"sent":true}' }] } },
+    });
+    const row = collected
+      .filter((event) => event.type === "timeline.item" && event.item?.name === "send_message")
+      .map((event) => event.item)
+      .at(-1);
+    check(
+      "a live send after replay carries the historical spawn/list roster",
+      row?.metadata?.teamRoster?.reviewer === "审查支付（list）"
+        && row?.metadata?.teamRoster?.observer === "观察员",
+      JSON.stringify(row?.metadata),
+    );
+  }
+
+  console.log(`\n${passed} passed, ${failed} failed`);
+  process.exit(failed === 0 ? 0 : 1);
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

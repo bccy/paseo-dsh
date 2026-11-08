@@ -1499,6 +1499,20 @@ export class DshSession {
   }
 
   /**
+   * Mirror a roster just learned from a live team tool event into the children.
+   *
+   * The parent builder absorbs `spawn_teammate` / `list_agents` synchronously;
+   * the child builders do not see those events, so the teammates panel could
+   * otherwise show English targets on a child's `send_message` row. An empty
+   * parent snapshot is "unknown", never evidence that a child has no members.
+   */
+  #syncChildRosters(): void {
+    const roster = this.#timeline.rosterSnapshot();
+    if (roster.size === 0) return;
+    for (const child of this.#children.values()) child.mergeTeamRoster(roster);
+  }
+
+  /**
    * The task DSH's todo list marks `in_progress`, for the goal popover's "now"
    * line.
    *
@@ -1820,6 +1834,13 @@ export class DshSession {
           "emitting no session.turn for it",
       );
     }
+    // The replay builder is the only place the historical `spawn_teammate` /
+    // `list_agents` rows were consumed. Merge its roster into the live builder
+    // so the first live `send_message` after a restart/reopen gets the labels;
+    // the live builder keeps any descriptions it already learned from live
+    // events (merge, not replace).
+    this.#timeline.mergeTeamRoster(builder.rosterSnapshot());
+    this.#syncChildRosters();
   }
 
   /** Emit one replayed root turn boundary (started or a terminal state). */
@@ -2907,6 +2928,7 @@ export class DshSession {
       emit: (event) => this.#options.emit(event),
       log: (line) => this.#options.log(line),
       resolvePermission: (permissionId, response) => this.resolvePermission(permissionId, response),
+      teamRoster: this.#timeline.rosterSnapshot(),
     });
     this.#children.set(payload.sessionId, child);
     this.#childByProviderId.set(child.id, child);
@@ -3226,6 +3248,9 @@ export class DshSession {
     // one arrival feeds both halves of the feature.
     if (event.type === ASSISTANT_DELTA_EVENT) this.#observeStreamSnapshot(isRecord(event.data) ? event.data : {});
     for (const item of this.#timeline.consume(event)) this.#emitItem(item);
+    // A live `spawn_teammate` / `list_agents` row just taught the parent's
+    // builder a description; mirror it before the next child row is built.
+    if (event.type === "tool/call" || event.type === "tool/result") this.#syncChildRosters();
     if (event.type === "assistant/message") {
       const data = isRecord(event.data) ? event.data : {};
       this.#accumulateTotals(data);
@@ -3609,6 +3634,8 @@ interface DshChildSessionOptions {
   emit(event: ProviderEvent): void;
   log(line: string): void;
   resolvePermission(permissionId: string, response: ProviderPermissionResponse): void;
+  /** The parent's roster at creation time; the parent updates it on later live team events. */
+  teamRoster?: ReadonlyMap<string, string>;
 }
 
 /**
@@ -3676,6 +3703,25 @@ export class DshChildSession {
     this.id = options.id;
     this.nativeId = options.nativeId;
     this.#options = options;
+    if (options.teamRoster !== undefined) this.#timeline.setTeamRoster(options.teamRoster);
+  }
+
+  /** Replace this child's roster (the constructor's initial parent snapshot). */
+  setTeamRoster(roster: ReadonlyMap<string, string>): void {
+    this.#timeline.setTeamRoster(roster);
+  }
+
+  /**
+   * Merge the parent's latest roster into this child's own.
+   *
+   * Used on every live team event. An empty parent roster means
+   * "the parent knows nothing right now", not "this child has no members": the
+   * call is ignored so a child's own `list_agents` labels survive. A non-empty
+   * one only adds/overwrites parent entries; child-only entries are kept.
+   */
+  mergeTeamRoster(roster: ReadonlyMap<string, string>): void {
+    if (roster.size === 0) return;
+    this.#timeline.mergeTeamRoster(roster);
   }
 
   get opened(): boolean {

@@ -529,25 +529,74 @@ function withPresentationMeta(
  * transformed. A session whose only row arrived before the hint would keep the
  * client's default for good, which is why a bare `{ locale }` is a *complete*
  * metadata rather than something the caller may skip.
+ *
+ * A fourth entry, `teamRoster`, carries the session's current
+ * `name → description` roster, learned from `spawn_teammate` / `list_agents`
+ * rows (live and replayed) and merged into the live builder after replay. It
+ * rides only on the **team tool rows** whose head or card consumes it (`send_message` / `interrupt_agent` / `spawn_teammate` /
+ * `list_agents` / `team_task_*`), not on every tool row: a full roster on every
+ * bash/command row multiplied provider metadata for a field those rows never
+ * read. It is a per-session snapshot, never a process-global map, so two
+ * sessions with a member of the same name cannot contaminate each other. The
+ * shape is `Record<string, string>`; only non-empty descriptions appear, so a
+ * missing key means "no description" and the client falls back to the wire
+ * target.
  */
 function toolMetadata(
   input: Record<string, unknown>,
-  presentationMeta?: JsonValue,
+  presentationMeta: JsonValue | undefined,
+  teamRoster?: ReadonlyMap<string, string>,
 ): Record<string, JsonValue> {
   const description = stringField(input, "description");
   return {
     ...(description === undefined || description === "" ? {} : { description }),
     locale: LOCALE,
+    ...(teamRoster === undefined ? {} : { [TEAM_ROSTER_METADATA_KEY]: rosterRecord(teamRoster) }),
     ...(presentationMeta === undefined ? {} : { [PRESENTATION_META_KEY]: presentationMeta }),
   };
 }
 
 /**
- * The locale hint on its own, for a tool-call item that has no arguments to read
- * a description from (a `/command` row) and no result meta yet.
+ * The metadata for a tool-call row that has no arguments to read a description
+ * from (a `/command` row) and no result meta yet. It carries the locale only:
+ * the roster is white-listed to the team tool rows (`TEAM_ROSTER_TOOLS`), and a
+ * `/command` row never consumes it.
  */
 function localeMetadata(): Record<string, JsonValue> {
   return { locale: LOCALE };
+}
+
+/** The metadata key carrying {@link toolMetadata}'s team roster. */
+const TEAM_ROSTER_METADATA_KEY = "teamRoster";
+
+/**
+ * The tools whose rows consume the roster: their heads name a member
+ * (`send_message` / `interrupt_agent`) or their card is the roster itself
+ * (`spawn_teammate` / `list_agents` / `team_task_*`). Every other tool row is
+ * left without the key: carrying a full roster on bash/command/activity rows
+ * multiplied provider metadata for a field those rows never read.
+ */
+const TEAM_ROSTER_TOOLS: ReadonlySet<string> = new Set([
+  "send_message",
+  "interrupt_agent",
+  "spawn_teammate",
+  "list_agents",
+  "team_task_create",
+  "team_task_get",
+  "team_task_update",
+  "team_task_list",
+]);
+
+/** Whether a tool row is allowed to carry {@link TEAM_ROSTER_METADATA_KEY}. */
+function carriesTeamRoster(name: string): boolean {
+  return TEAM_ROSTER_TOOLS.has(name);
+}
+
+/** A plain JSON record of the map, for the provider metadata boundary. */
+function rosterRecord(roster: ReadonlyMap<string, string>): Record<string, JsonValue> {
+  const record: Record<string, JsonValue> = {};
+  for (const [name, description] of roster) record[name] = description;
+  return record;
 }
 
 /**
@@ -768,6 +817,19 @@ export class TimelineBuilder {
   #toolNames = new Map<string, string>();
   #toolInputs = new Map<string, Record<string, unknown>>();
   /**
+   * The session's current team roster (`name → description`), learned from the
+   * `spawn_teammate` / `list_agents` events this builder consumed. A replay
+   * builder additionally absorbs the historical rows, and `DshSession` merges
+   * its snapshot into the live builder after a replay.
+   *
+   * Deliberately **not** process-global: one builder belongs to one session, so
+   * two sessions whose teams both have a `reviewer` cannot see each other's
+   * description. Every team tool row carries a snapshot of it in `metadata`
+   * (see {@link toolMetadata}), because the client transforms a row once and
+   * never re-renders it when a later roster read arrives.
+   */
+  #teamRoster = new Map<string, string>();
+  /**
    * `turn:step` -> the attempt identities this step has streamed, in order.
    *
    * A step can be attempted more than once (DSH retries a failed request inside
@@ -844,8 +906,90 @@ export class TimelineBuilder {
    */
   #heldGoalRows: ProviderTimelineItem[] = [];
 
-  constructor(options: { warn?: (line: string) => void } = {}) {
+  constructor(options: { warn?: (line: string) => void; teamRoster?: ReadonlyMap<string, string> } = {}) {
     this.#warn = options.warn ?? ((line) => console.warn(line));
+    if (options.teamRoster !== undefined) this.setTeamRoster(options.teamRoster);
+  }
+
+  /**
+   * Replace the roster with one snapshot.
+   *
+   * Used for a child builder's initial parent snapshot; live updates use
+   * {@link mergeTeamRoster} so child-only descriptions survive. Entries with no
+   * usable description are dropped; `labelFor` then falls back to the target.
+   */
+  setTeamRoster(roster: ReadonlyMap<string, string>): void {
+    this.#teamRoster.clear();
+    for (const [name, description] of roster) this.#absorbRosterEntry(name, description);
+  }
+
+  /** A copy, for a child builder that starts with this roster. */
+  rosterSnapshot(): ReadonlyMap<string, string> {
+    return new Map(this.#teamRoster);
+  }
+
+  /**
+   * Merge a parent roster into this builder without clearing local entries.
+   *
+   * A child session may learn members from its own `list_agents`; a parent live
+   * update adds/overwrites only the names the parent knows, and never deletes a
+   * child-only entry. An empty input is a no-op (the caller may have no roster).
+   */
+  mergeTeamRoster(roster: ReadonlyMap<string, string>): void {
+    if (roster.size === 0) return;
+    for (const [name, description] of roster) this.#absorbRosterEntry(name, description);
+  }
+
+  /**
+   * Merge one member, with the "missing vs explicitly empty" split:
+   *
+   * - a non-empty description sets the label;
+   * - an **empty string** is DSH saying "this member has no description", so a
+   *   stale label is removed;
+   * - `undefined` is "this source says nothing about the description", so an
+   *   existing label is kept (a later `list_agents` row must not erase a value
+   *   learned from `spawn_teammate`'s input).
+   */
+  #absorbRosterEntry(name: unknown, description: unknown): void {
+    if (typeof name !== "string" || name === "") return;
+    if (typeof description === "string") {
+      if (description.trim() === "") this.#teamRoster.delete(name);
+      else if (this.#teamRoster.get(name) !== description) this.#teamRoster.set(name, description);
+    }
+  }
+
+  /** `spawn_teammate`'s input is the earliest place a new member is named. */
+  #absorbToolCallRoster(name: string, input: Record<string, unknown>): void {
+    if (name !== "spawn_teammate") return;
+    this.#absorbRosterEntry(input.name, input.description);
+  }
+
+  /**
+   * `list_agents` is DSH's roster dump, and `spawn_teammate`'s result carries
+   * the member DSH actually created. Both merge into the same per-session map,
+   * so a team created during a live session gets its descriptions on the rows
+   * that follow.
+   */
+  #absorbToolResultRoster(name: string, output: string, failed: boolean): void {
+    if (failed) return;
+    if (name !== "list_agents" && name !== "spawn_teammate") return;
+    let value: unknown;
+    try {
+      value = JSON.parse(output);
+    } catch {
+      return;
+    }
+    if (name === "list_agents") {
+      if (!Array.isArray(value)) return;
+      for (const member of value) {
+        if (!isRecord(member)) continue;
+        this.#absorbRosterEntry(member.target, member.description);
+      }
+      return;
+    }
+    if (isRecord(value) && isRecord(value.member)) {
+      this.#absorbRosterEntry(value.member.target, value.member.description);
+    }
   }
 
   /**
@@ -856,14 +1000,40 @@ export class TimelineBuilder {
    */
   consume(event: DshEvent): ProviderTimelineItem[] {
     const rows = this.#consumeOne(event);
-    if (this.#heldGoalRows.length === 0) return rows;
+    if (this.#heldGoalRows.length === 0) return this.#stampTeamRoster(rows);
     // Still inside the bracket and nothing else drawn: keep holding.
-    if (this.#commands.size > 0 && rows.length === 0) return rows;
+    if (this.#commands.size > 0 && rows.length === 0) return this.#stampTeamRoster(rows);
     // The bracket closed (its command row, if any, is in `rows`), or some other
     // row is going out while the bracket is still open — then the held state row
     // goes first, because that is where it was written.
     const held = this.#heldGoalRows.splice(0).flatMap((row) => this.#put(row));
-    return this.#commands.size > 0 ? [...held, ...rows] : [...rows, ...held];
+    return this.#stampTeamRoster(this.#commands.size > 0 ? [...held, ...rows] : [...rows, ...held]);
+  }
+
+  /**
+   * Put the current roster on every `tool_call` row that reached this boundary.
+   *
+   * The builder's own tool rows already carry it (see {@link toolMetadata}), but
+   * `ActivityTimeline` also produces `tool_call` rows (workflow and goal-state
+   * rows) and knows nothing about teams. Stamping them here, not at creation,
+   * keeps the two sources from drifting and keeps the "every tool-call item has
+   * a roster snapshot" rule true even for a row produced by that second path.
+   */
+  #stampTeamRoster(rows: ProviderTimelineItem[], replaceEmpty = false): ProviderTimelineItem[] {
+    return rows.map((row) => {
+      if (row.type !== "tool_call") return row;
+      if (!carriesTeamRoster(row.name)) return row;
+      const metadata = isRecord(row.metadata) ? row.metadata : {};
+      const existing = metadata[TEAM_ROSTER_METADATA_KEY];
+      const existingHasEntries = isRecord(existing) && Object.keys(existing).length > 0;
+      // A row already labelled by a non-empty snapshot keeps it. An empty
+      // snapshot (`{}`) is only replaced when the caller is settling a row that
+      // was created before any roster was known (see `settleRunningTools`).
+      if (existingHasEntries) return row;
+      if (existing !== undefined && !replaceEmpty) return row;
+      if (this.#teamRoster.size === 0) return row;
+      return { ...row, metadata: { ...metadata, [TEAM_ROSTER_METADATA_KEY]: rosterRecord(this.#teamRoster) } };
+    });
   }
 
   #consumeOne(event: DshEvent): ProviderTimelineItem[] {
@@ -927,11 +1097,11 @@ export class TimelineBuilder {
     // A log that stops inside a `/command` bracket never reaches its
     // `command/done`; the goal state row it held is still the goal's state.
     const held = this.#heldGoalRows.splice(0).flatMap((row) => this.#put(row));
-    return [
+    return this.#stampTeamRoster([
       ...held,
       ...this.#cancelRunningTools(),
       ...this.#activity.settle().flatMap((item) => this.#put(item)),
-    ];
+    ], true);
   }
 
   /**
@@ -1183,6 +1353,11 @@ export class TimelineBuilder {
     const input = this.#toolInputs.get(callId) ?? {};
     const output = message === undefined ? "" : textOf(message.content);
     const failed = message?.isError === true;
+    // A completed team roster dump (or the member a spawn created) refines the
+    // roster before this row's metadata is built. Synchronous and per-builder:
+    // no process state crosses sessions, and rows after the team tool already
+    // carry the description.
+    this.#absorbToolResultRoster(name, output, failed);
     // DSH attaches the tool's `presentationMeta` to the result event itself
     // (`data.meta`), next to the message. It is the only copy of the structured
     // result there is: `message.content` is already the rendered text. It ends up
@@ -1209,7 +1384,7 @@ export class TimelineBuilder {
         name,
         detail,
         metadata: {
-          ...toolMetadata(input, presentationMeta),
+          ...toolMetadata(input, presentationMeta, carriesTeamRoster(name) ? this.#teamRoster : undefined),
           // DSH's structured failure code (`HarnessError.code`, e.g.
           // `GOAL_TOOL_AUTHORITY_REQUIRED`), carried beside the verbatim text so
           // the client can say in words why a goal call was refused without
@@ -1469,13 +1644,16 @@ export class TimelineBuilder {
       // rebuilt from the input alone, drop the output it already carries.
       return [];
     }
+    // A spawn names its member before any result arrives; remembering it here
+    // is what makes the spawn row itself and the rows after it carry the label.
+    this.#absorbToolCallRoster(name, input);
     const item: ProviderTimelineItem = {
       type: "tool_call",
       id: `tool:${callId}`,
       callId,
       name,
       detail: toolDetail(name, input),
-      metadata: toolMetadata(input),
+      metadata: toolMetadata(input, undefined, carriesTeamRoster(name) ? this.#teamRoster : undefined),
       status: "running",
       error: null,
     };

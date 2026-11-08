@@ -10,13 +10,19 @@
 
 - `harness/timeline-check.cjs` — `TimelineBuilder` 的工具行状态机：`tool/call` → `tool/result`、
   重复 `tool/call` 不能把完成行重置回 running 或清空输出、`turn/end`（含 `aborted`）要把仍
-  running 的工具收成 `canceled`。**239 条**：goal 轮次行 +17（`tool:goal:round:*` 由同一
+  running 的工具收成 `canceled`。**251 条**：goal 轮次行 +17（`tool:goal:round:*` 由同一
   builder 产出、同轮幂等、不同轮 id 不同、`turn/end` 不取消它），todo `status` +6（`todoItems`
   的 status 序列 / `completed` 由同一 status 派生 / 文本 / 未知值归一 `pending`），
   **todo 清空 +4**（2026-11-08：`todo_write(todos: [])` 必须发出 `type:"todo"` 且 `items` 为空的
   行——宿主以空列表删任务、让 pill 消失；此前 `todoItems` 把空数组折成 `null` 被调用处跳过，
   静默丢清空。另钉住 call 级 `todo:<callId>` id、非数组 `todos` 仍不发、非空照旧；变异改回
-  `items.length === 0 ? null : items` → 2 红/237）。**动了 `server/timeline.ts` 的 `todoItems`
+  `items.length === 0 ? null : items` → 2 红/237）。2026-11-08 团队名册服务端 +12 条（239 → **251**）：
+  per-builder 隔离（同名不同 description 不串）、`setTeamRoster` seed、`description` 缺失保留 /
+  明确空串删除、非 team 行不携带 `teamRoster`、`settleRunningTools` 补 stamp、子会话
+  `send_message` 行带名册；真实 `replayHistory()` 的 send 行经历史 `spawn_teammate` /
+  `list_agents` 合并后仍带中文名册；`agentTeam` 投影成员无 description 时不清空 live 名册；
+  child 自有名册不被父空快照清空、父非空快照合并而不删除 child 条目、空名册创建的行在
+  settle 时被晚到名册替换。**动了 `server/timeline.ts` 的 `todoItems`
   （含空列表语义）、`server/activity-timeline.ts` 的 goal 轮次分支或 `server/session.ts` 的重放
   过滤必跑。**
 - `harness/p003-timeline-check.cjs` — 真实 `TimelineBuilder` → `ProviderEventSchema` → 客户端
@@ -107,6 +113,12 @@
       字段（`sessionId` / `localPath`+`bytes` / `path`+`bytes` / `accepted` / `operationId`），
       其余结果留给 L1。memory 成功卡把 render 句作为回执并清空 body（不重复显示），copyText
       保留原句；每个工具至少一条正常 + 一条形状不符断言，断言 603 → **732**。
+    - 2026-11-08 名册改走 item metadata（+12 条，732 → **744**）：`server/timeline.ts` 在团队
+      工具行的 `metadata.teamRoster`（`name→description`，来自 `spawn_teammate` / `list_agents`
+      事件与 replay 合并）携带 **per-session** 快照；客户端 `rosterFromMetadata` / `labelFor`
+      无跨 item 状态，两个不同名册的 item 同 target 各出各的中文、无名册回落 target、空 target
+      不空白；重开会话只有 item 自带名册（无 spawn/list 行）仍显示中文。真实端到端
+      `plugin-check` 40/40 通过（含 replay）。
 - `harness/thinking-check.cjs` — 思考行折叠预览：结束后取**第一行**、运行中取最后一个首行已终结
   的段落（都是 DSH 的行为，逐字移植在 `client/thinking-text.ts`），以及折叠行在流式中的宽度
   接线（行测自己的宽度、标签测自己要减掉的那段、行宽由两者相减得出，`useRevealedText` 不许
