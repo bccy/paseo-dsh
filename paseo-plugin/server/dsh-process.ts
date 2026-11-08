@@ -579,14 +579,15 @@ const JOBS_READ_TIMEOUT_MS = 15_000;
  * How many consecutive `paseo/jobs` timeouts are tolerated before the bridge is
  * declared unusable.
  *
- * A long session's open/replay can make the bridge skip the poll for a while
- * without being old or dead (measured on a 2700+ step session: a freshly
- * spawned bridge byte-identical to the source missed the first jobs poll for
- * 15 s). Two silent retries keep the pill quiet through that startup window;
- * only the third consecutive miss classifies the bridge as terminal. Any answer
- * (including an `available:false` registry read) resets the streak.
+ * A long session's open/replay can make the bridge skip the poll for a long
+ * while without being old or dead (measured on a 2700+ step session: a freshly
+ * spawned bridge byte-identical to the source missed three consecutive jobs
+ * polls for 15 s each). Eight silent retries cover roughly 2.5 minutes of such
+ * a startup window; only the ninth consecutive miss classifies the bridge as
+ * terminal. Any answer (including an `available:false` registry read) resets
+ * the streak.
  */
-const JOBS_TIMEOUT_TOLERANCE = 2;
+const JOBS_TIMEOUT_TOLERANCE = 8;
 
 /**
  * The bridge's reply when it does not implement a method at all — the verbatim
@@ -2420,7 +2421,7 @@ export class DshProcess {
         if (this.#consecutiveJobsTimeouts <= JOBS_TIMEOUT_TOLERANCE) {
           // The bridge is not answering yet, but a fresh bridge opening a long
           // session legitimately misses the first polls while its replay runs.
-          // Two silent retries keep the pill hidden instead of banning jobs for
+          // Eight silent retries keep the pill hidden instead of banning jobs for
           // the rest of the process; the next poll decides. This deliberately
           // reports an empty list for a read we could not complete — the
           // tradeoff (no error pill, but also no jobs) is FIELD-NOTES #95's

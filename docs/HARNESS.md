@@ -167,9 +167,9 @@
   `client/agent-polling.ts` / `client/poll-sequence.ts` / `client/locale.ts` 的 jobs 表 /
   `shared/jobs.ts` 必跑；`jobs-poll.tsconfig.json` 是它的编译配置。**
 - `harness/jobs-timeout-check.cjs` — `DshProcess.jobs()` 的连续超时策略（真实 `DshProcess` + 自生成
-  假 `dsh` 子进程，真 stdio JSON-RPC，不 stub 方法；**9 条**）：连续第 1/2 次超时→安静
-  `{available:true, jobs:[]}` 且 0 日志；第 3 次→terminal `bridge_too_old` + 单次 latched 日志；
-  第 4 次不再重复日志；成功应答、`available:false`（registry_missing）应答、unknown-method 应答
+  假 `dsh` 子进程，真 stdio JSON-RPC，不 stub 方法；**9 条**）：连续前 8 次超时→安静
+  `{available:true, jobs:[]}` 且 0 日志；第 9 次→terminal `bridge_too_old` + 单次 latched 日志；
+  第 10 次不再重复日志；成功应答、`available:false`（registry_missing）应答、unknown-method 应答
   都清零计数（此后两次超时仍被容忍）。运行：`cd paseo-plugin && npx tsc --noEmit false --outDir .dbg
   --declaration false --module commonjs --moduleResolution node`；`echo '{"type":"commonjs"}' >
   .dbg/package.json`；`cp ../harness/jobs-timeout-check.cjs .dbg/`；`cd .dbg && node

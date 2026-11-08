@@ -99,15 +99,18 @@ const TIMEOUT_MS = 60;
 (async () => {
   await proc.start();
 
-  // First two consecutive timeouts: quiet empty answers, no log, no terminal.
+  // The first eight consecutive timeouts are all quiet: empty answers, no log,
+  // no terminal. A 2700+ step session's replay legitimately misses several 15 s
+  // polls while a fresh, byte-identical bridge is opening it.
   setMode("hang");
-  const first = await proc.jobs("probe", TIMEOUT_MS);
-  const second = await proc.jobs("probe", TIMEOUT_MS);
+  const tolerated = [];
+  for (let index = 0; index < 8; index += 1) {
+    tolerated.push(await proc.jobs("probe", TIMEOUT_MS));
+  }
   check(
-    "the first two consecutive timeouts are a quiet empty answer (available:true, jobs:[])",
-    first.available === true && Array.isArray(first.jobs) && first.jobs.length === 0 &&
-      second.available === true && Array.isArray(second.jobs) && second.jobs.length === 0,
-    JSON.stringify({ first, second }),
+    "the first eight consecutive timeouts are quiet empty answers (available:true, jobs:[])",
+    tolerated.every((entry) => entry.available === true && Array.isArray(entry.jobs) && entry.jobs.length === 0),
+    JSON.stringify(tolerated),
   );
   check("no warning is logged for the tolerated timeouts", logs.length === 0, JSON.stringify(logs));
 
@@ -119,20 +122,25 @@ const TIMEOUT_MS = 60;
   await proc.jobs("probe", TIMEOUT_MS);
   await proc.jobs("probe", TIMEOUT_MS);
   check("a successful answer resets the streak (two more timeouts stay tolerated)", logs.length === 0, JSON.stringify(logs));
+  // Six more misses complete the ninth consecutive timeout counting from the
+  // reset; nothing may be logged along the way.
+  for (let index = 0; index < 6; index += 1) {
+    await proc.jobs("probe", TIMEOUT_MS);
+  }
 
-  // Third consecutive timeout: terminal bridge_too_old + exactly one log.
-  const third = await proc.jobs("probe", TIMEOUT_MS);
+  // Ninth consecutive timeout: terminal bridge_too_old + exactly one log.
+  const ninth = await proc.jobs("probe", TIMEOUT_MS);
   check(
-    "the third consecutive timeout becomes terminal bridge_too_old",
-    third.available === false && third.error?.code === "bridge_too_old",
-    JSON.stringify(third),
+    "the ninth consecutive timeout becomes terminal bridge_too_old",
+    ninth.available === false && ninth.error?.code === "bridge_too_old",
+    JSON.stringify(ninth),
   );
   check("the terminal classification logs exactly once", logs.length === 1, JSON.stringify(logs));
-  const fourth = await proc.jobs("probe", TIMEOUT_MS);
+  const tenth = await proc.jobs("probe", TIMEOUT_MS);
   check(
     "later timeouts stay terminal but do not log again (latched)",
-    fourth.available === false && fourth.error?.code === "bridge_too_old" && logs.length === 1,
-    JSON.stringify({ fourth, logs: logs.length }),
+    tenth.available === false && tenth.error?.code === "bridge_too_old" && logs.length === 1,
+    JSON.stringify({ tenth, logs: logs.length }),
   );
 
   // A registry-missing answer is still an answer and must reset the streak: two

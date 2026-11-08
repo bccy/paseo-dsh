@@ -3346,28 +3346,32 @@ profile 并换子进程，应恢复；仅重启 Paseo App 只重连客户端、�
 jobs 功能不会自行恢复（但新客户端已隐藏 pill，不再常驻报错）。会话重开是否恢复，取决于它是否
 重新绑定到新插件代的子进程。
 
-**补充（2026-11-08 二次实测，修正首次超时即终态的误判）**：832a9b4 的 jobs 超时归类上线后，
-第四次 reload 实测——plugin-process 14:23:45、dsh 14:24:15 启动，本会话 14:25:05（dsh 启动约
-50 s）的**首次** `paseo/jobs` 轮询 15 s 超时就被判 terminal `bridge_too_old`、jobs pill 被禁用；
-但核对该会话所用桥文件 236103B 与仓库源**逐字节一致**、含 `paseo/jobs` 两处，说明不是旧桥，而是
-长会话（2700+ 步历史）打开/重放期间桥不应答。修法：`jobs()` 改为**连续超时计数**
-（`JOBS_TIMEOUT_TOLERANCE = 2`）——任何应答（含 `available:false` 的 registry 错误）清零；连续
-第 1、2 次超时静默返回 `{available:true, jobs:[]}`（不写日志、不 terminal、客户端不进入错误态）；
-连续第 3 次才回到本节原来的 terminal `bridge_too_old` + 单次 latched stderr。`DshProcess.jobs`
-增加可选 `timeoutMs`（生产默认仍 15 s，测试传短值；与 `cancel` 的可选超时同惯例）。
+**补充（2026-11-08 二次实测，修正首次超时即终态的误判；同日按第五次 reload 再调容忍次数）**：
+832a9b4 的 jobs 超时归类上线后，第四次 reload 实测（plugin-process 14:23:45、dsh 14:24:15，
+本会话 14:25:05 即 dsh 启动约 50 s）的**首次** `paseo/jobs` 轮询 15 s 超时就被判 terminal
+`bridge_too_old`、jobs pill 被禁用；核对桥文件 236103B 与仓库源**逐字节一致**、含 `paseo/jobs`
+两处，说明不是旧桥，而是长会话（2700+ 步历史）打开/重放期间桥不应答。第五次 reload
+（plugin-process 14:51:25、dsh 14:51:39，HEAD 7e37d94）后同一会话重放期又是**连续 3 次** 15 s
+超时、14:52:33 仍被判 terminal——3 次门槛不够。最终修法：`jobs()` 的连续超时计数
+`JOBS_TIMEOUT_TOLERANCE = 8`——任何应答（含 `available:false` 的 registry 错误）清零；连续
+第 1..8 次超时静默返回 `{available:true, jobs:[]}`（不写日志、不 terminal、客户端不进入错误
+态）；连续第 9 次起才回到本节原来的 terminal `bridge_too_old` + 单次 latched stderr。
+`DshProcess.jobs` 增加可选 `timeoutMs`（生产默认仍 15 s，测试传短值；与 `cancel` 的可选超时
+同惯例）。
 
-**代价（明确取舍）**：前两次超时会把「读不到」暂时表现为空列表——用户看不到错误 pill，也看不到
-真实后台任务；这是为「桥活着、只是打开/重放窗口不应答」这一实测形状买的单。按客户端
-`LIVE_POLL_MS=4s` 间隔与单次 15s 超时，实际首粒超时约 15s、第二粒约 34s、第三粒约 53s
-（受轮询起点影响，约 38–55s 才 terminal）。连续计数为**进程级共享**（`DshProcess` 级，与共享
-桥一致：同一 dsh 子进程的所有会话共用一个计数，任一次应答即清零）。第 3 次起与 #95 原行为
-一致（终态、单日志、pill 隐藏/禁用），真旧桥或真卡死最终仍会被识别，不会永久静默。
+**代价（明确取舍）**：前 8 次超时会把「读不到」暂时表现为空列表——用户看不到错误 pill，也看不到
+真实后台任务；这是为「桥活着、只是打开/重放窗口不应答」这一实测形状买的单。实际窗口 =
+8×15s 请求 + 7×4s 轮询间隔 ≈ **148 s（约 2.5 分钟）**，覆盖 2700+ 步长历史重放。连续计数为
+**进程级共享**（`DshProcess` 级，与共享桥一致：同一 dsh 子进程的所有会话共用一个计数，任一
+次应答即清零）。第 9 次起与 #95 原行为一致（终态、单日志、pill 隐藏/禁用），真旧桥或真卡死
+最终仍会被识别，不会永久静默。
 
-**验证（补充）**：新增 `harness/jobs-timeout-check.cjs` **7/7**（真实 `DshProcess` + 自生成假
-`dsh` 子进程，用 `jobs(sessionId, 60ms)` 驱动）：第 1/2 次超时→`available:true, jobs:[]` 且
-0 条日志；成功应答后计数清零（再来两次仍被容忍）；第 3 次→`bridge_too_old` 且日志恰 1 条；
-第 4 次不再重复日志。变异 `JOBS_TIMEOUT_TOLERANCE = 0`（首次即 terminal）→ **3 红/4**；还原后
-7/7。`jobs-poll-check` 152/152 保留（客户端策略未动）。
+**验证（补充）**：`harness/jobs-timeout-check.cjs` **9/9**（真实 `DshProcess` + 自生成假 `dsh`
+子进程，用 `jobs(sessionId, 60ms)` 驱动）：前 8 次连续超时→`available:true, jobs:[]` 且 0 条
+日志；成功应答后计数清零（再来两次仍被容忍）；第 9 次→`bridge_too_old` 且日志恰 1 条；第 10 次
+不再重复日志；`available:false` registry 应答与 unknown-method 应答均清零计数。变异
+`JOBS_TIMEOUT_TOLERANCE = 0`（首次即 terminal）→ **5 红/4**；还原后 9/9。`jobs-poll-check`
+152/152 保留（客户端策略未动）。
 
 ### 96. 插件 reload 后 replace 报「active run cancellation was not acknowledged」：cancel ack 没有上限
 
