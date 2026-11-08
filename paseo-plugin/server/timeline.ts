@@ -731,6 +731,14 @@ interface TodoItem {
  * the row look done). `completed` is kept beside it because older Paseo hosts
  * only read that field; the two cannot disagree, since `completed` is derived
  * from the same normalised status.
+ *
+ * An empty result is a **clear signal**, not "nothing to report": the model
+ * calls `todo_write` with an empty list to remove the task list, and Paseo's
+ * host deletes the agent's tasks when it receives an empty `todo` item. This
+ * function used to turn that empty array into `null`, the caller skipped it, and
+ * the native task list / todo pill kept showing the previous items forever — a
+ * silent downgrade (FIELD-NOTES #94). Only a non-array `todos` (an input shape
+ * that never meant "clear") still answers `null`.
  */
 function todoItems(input: Record<string, unknown>): TodoItem[] | null {
   const raw = input.todos;
@@ -749,7 +757,9 @@ function todoItems(input: Record<string, unknown>): TodoItem[] | null {
       };
     })
     .filter((todo) => todo.text !== "");
-  return items.length === 0 ? null : items;
+  // `[]` must be emitted: it is the host's clear-tasks signal. Returning null
+  // here dropped it (see this function's doc).
+  return items;
 }
 
 export class TimelineBuilder {

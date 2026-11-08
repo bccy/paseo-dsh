@@ -10,11 +10,15 @@
 
 - `harness/timeline-check.cjs` — `TimelineBuilder` 的工具行状态机：`tool/call` → `tool/result`、
   重复 `tool/call` 不能把完成行重置回 running 或清空输出、`turn/end`（含 `aborted`）要把仍
-  running 的工具收成 `canceled`。**235 条**：goal 轮次行 +17（`tool:goal:round:*` 由同一
+  running 的工具收成 `canceled`。**239 条**：goal 轮次行 +17（`tool:goal:round:*` 由同一
   builder 产出、同轮幂等、不同轮 id 不同、`turn/end` 不取消它），todo `status` +6（`todoItems`
-  的 status 序列 / `completed` 由同一 status 派生 / 文本 / 未知值归一 `pending`）。**动了
-  `server/timeline.ts` 的 `todoItems`、`server/activity-timeline.ts` 的 goal 轮次分支或
-  `server/session.ts` 的重放过滤必跑。**
+  的 status 序列 / `completed` 由同一 status 派生 / 文本 / 未知值归一 `pending`），
+  **todo 清空 +4**（2026-11-08：`todo_write(todos: [])` 必须发出 `type:"todo"` 且 `items` 为空的
+  行——宿主以空列表删任务、让 pill 消失；此前 `todoItems` 把空数组折成 `null` 被调用处跳过，
+  静默丢清空。另钉住 call 级 `todo:<callId>` id、非数组 `todos` 仍不发、非空照旧；变异改回
+  `items.length === 0 ? null : items` → 2 红/237）。**动了 `server/timeline.ts` 的 `todoItems`
+  （含空列表语义）、`server/activity-timeline.ts` 的 goal 轮次分支或 `server/session.ts` 的重放
+  过滤必跑。**
 - `harness/p003-timeline-check.cjs` — 真实 `TimelineBuilder` → `ProviderEventSchema` → 客户端
   渲染数据的端到端：`goal/change`（目标行）与 `tool-workflow/*`（工作流/成员行）的完整快照、
   重复 start 不抹进度、run-end 的终态口径、后台工作流跨回合保持 running、死重放按 canceled

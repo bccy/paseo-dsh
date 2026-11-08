@@ -214,6 +214,77 @@ console.log("a todo_write row carries the item statuses");
   );
 }
 
+console.log("an empty todo_write clears the native task list");
+{
+  // The model clears its task list with `todo_write(todos: [])`. Paseo's host
+  // deletes the agent's tasks when it receives a `todo` item whose `items` is
+  // empty, so a dropped event left the native task list / todo pill showing the
+  // previous items forever — a silent downgrade (FIELD-NOTES #94). The bug was
+  // `todoItems()` returning `null` for an empty filtered list and the caller
+  // skipping `null`.
+  const clearBuilder = new TimelineBuilder({ warn: (line) => warnings.push(line) });
+  clearBuilder.consume({
+    type: "tool/call",
+    seq: 1,
+    data: { callId: "todo-clear", name: "todo_write", arguments: { todos: [] } },
+  });
+  const cleared = clearBuilder.consume({
+    type: "tool/result",
+    seq: 2,
+    data: { toolCallId: "todo-clear", message: { content: [{ type: "text", text: "ok" }] } },
+  });
+  const clearItem = cleared.find((item) => item.type === "todo");
+  check(
+    "an empty todo_write emits the native todo row with no items (the clear signal)",
+    clearItem !== undefined && Array.isArray(clearItem.items) && clearItem.items.length === 0,
+    JSON.stringify(cleared.map((item) => ({ type: item.type, items: item.items }))),
+  );
+  check(
+    "the clear row keeps the call-scoped todo id",
+    clearItem?.id === "todo:todo-clear",
+    JSON.stringify(clearItem),
+  );
+
+  // A shape that never meant "clear" must stay silent: a non-array `todos`
+  // (malformed call, or a different input shape) answered `null` before this fix
+  // and must keep doing so.
+  const malformedBuilder = new TimelineBuilder({ warn: (line) => warnings.push(line) });
+  malformedBuilder.consume({
+    type: "tool/call",
+    seq: 1,
+    data: { callId: "todo-bad", name: "todo_write", arguments: { todos: "not-a-list" } },
+  });
+  const malformed = malformedBuilder.consume({
+    type: "tool/result",
+    seq: 2,
+    data: { toolCallId: "todo-bad", message: { content: [{ type: "text", text: "ok" }] } },
+  });
+  check(
+    "a todo_write whose todos is not an array still emits no todo row",
+    malformed.every((item) => item.type !== "todo"),
+    JSON.stringify(malformed.map((item) => item.type)),
+  );
+
+  // The non-empty path is unchanged; this assertion exists so the clear-signal
+  // fix cannot be "achieved" by suppressing rows for every todo_write.
+  const keptBuilder = new TimelineBuilder({ warn: (line) => warnings.push(line) });
+  keptBuilder.consume({
+    type: "tool/call",
+    seq: 1,
+    data: { callId: "todo-keep", name: "todo_write", arguments: { todos: [{ content: "keep me", status: "pending" }] } },
+  });
+  const kept = keptBuilder.consume({
+    type: "tool/result",
+    seq: 2,
+    data: { toolCallId: "todo-keep", message: { content: [{ type: "text", text: "ok" }] } },
+  }).find((item) => item.type === "todo");
+  check(
+    "a non-empty todo_write still emits its items",
+    kept?.items?.length === 1 && kept?.items?.[0]?.text === "keep me",
+    JSON.stringify(kept?.items),
+  );
+}
+
 console.log("a repeated tool/call must not undo a finished row");
 {
   const builder = new TimelineBuilder();

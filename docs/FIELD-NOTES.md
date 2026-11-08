@@ -3264,3 +3264,32 @@ hold 形状 0 帧 → 读 catalog 后 child-opened+status 释放、随后 turn/s
 **真机复验（待做，未验证）**：`paseo daemon restart`/插件 reload 后，用一个 reload 前就存在的
 teammate 复用第二回合，WS 探针应看到 running→completed（此前全程 completed）；同场景再 spawn 一个
 新 teammate 复用，行为不得回归。真机由主会话执行。
+
+### 94. `todo_write([])` 清空待办被静默丢弃：原生任务清单/待办 pill 永久停在旧列表
+
+**症状**：用户在 DSH 里让模型 `todo_write([])`（清空待办），模型确实照做了，但 Paseo 原生任务
+清单 / 待办 pill 仍显示旧的 3 项，直到之后再写一次非空列表才变化。
+
+**根因**：`paseo-plugin/server/timeline.ts` 的 `todoItems()` 末尾
+`return items.length === 0 ? null : items` —— 空数组被折成 `null`，而调用处
+（`tool/result` 分支）是 `if (items !== null) out.push(... #put({type:"todo", items}))`，
+于是空列表事件从未发出。宿主的清空路径本来是通的：`packages/app/src/types/stream.ts`
+`appendTodoList` 接收 empty，`stores/session-store.ts` `latestTasksFromStream` 取最新
+`todo_list` 的 items、`updateAgentTasks` 在 `length === 0` 时删掉该 agent 的任务（pill 消失）。
+即：宿主准备好了接收"清空"，插件却把清空信号当成"无内容可报"丢了——静默降级家族的又一例
+（与 #58/#92/#93 同类：能力/信号在中间层被当成成功或不存在）。
+
+**修法（最小改动）**：`todoItems()` 对「`input.todos` 是数组但过滤后为空」返回 `[]`，保留
+「`input.todos` 不是数组 → `null`」的语义（非 todo_write 形状不误发）。调用处不变，空列表随
+`items: []` 正常进 `#put`。函数注释写明空列表是宿主侧的**清空信号**，不得静默丢弃，并引用本条。
+只改插件层，宿主无需改动。
+
+**验证（离线）**：`harness/timeline-check.cjs` **239/239**（235 + 4 条：空列表发出
+`type:"todo"` 且 items 为空、id 仍是 `todo:<callId>`、`todos` 非数组仍不发、非空列表照旧）。
+变异：把 `return items` 改回 `items.length === 0 ? null : items` → **2 红 / 237**（两条空列表
+断言，正落在缺陷语义上），还原后 239/239。`tsc --noEmit` exit 0；`plugin-build-check` 86；
+`subagent-check` 97 不回归。
+
+**真机复验（待做，未验证）**：reload 插件后对同一会话执行一次 `todo_write([])`，Paseo 原生任务
+清单/待办 pill 上的旧项应消失（而不是等下一次非空写入）；随后再写非空列表应重新出现。真机由
+主会话执行。
