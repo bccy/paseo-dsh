@@ -588,6 +588,12 @@ const JOBS_READ_TIMEOUT_MS = 15_000;
 const UNKNOWN_BRIDGE_METHOD_PREFIX = "unknown paseo bridge method:";
 
 /**
+ * The transport's own "no answer" sentence; `#request`'s pending timer builds it
+ * and the jobs timeout matcher reads it. One constant so the two cannot drift.
+ */
+const NO_ANSWER_PREFIX = "DeepSeek Harness did not answer ";
+
+/**
  * What the client logs once when the profile's bridge has no `paseo/jobs`.
  *
  * The terminal `bridge_too_old` code makes the pill stop polling and hide; this
@@ -595,6 +601,20 @@ const UNKNOWN_BRIDGE_METHOD_PREFIX = "unknown paseo bridge method:";
  */
 const BRIDGE_TOO_OLD_MESSAGE =
   "this profile's bridge has no jobs support (it predates paseo/jobs); reload the plugin so the embedded bridge is rewritten";
+
+/**
+ * What the client logs/shows when `paseo/jobs` never answers at all.
+ *
+ * Distinct from {@link BRIDGE_TOO_OLD_MESSAGE} because the observed failure is a
+ * timeout, not the bridge's "unknown method" reply: either an older/foreign
+ * bridge build ignores methods it does not know instead of answering, or the
+ * shared child is wedged. The returned code is still `bridge_too_old`: the jobs
+ * contract's enum has no "unresponsive" member (it is the wire schema both sides
+ * parse), and the user action is the same — reload the plugin so the embedded
+ * bridge is rewritten.
+ */
+const BRIDGE_UNRESPONSIVE_MESSAGE =
+  "this profile's bridge did not answer paseo/jobs (it may predate jobs support or be unresponsive); reload the plugin so the embedded bridge is rewritten";
 
 /**
  * The bridge's answer when the profile does not compose a job registry at all.
@@ -1574,6 +1594,14 @@ export class DshProcess {
    */
   #warnedJobsUnsupported = false;
   /**
+   * Whether the "the bridge never answered paseo/jobs" line has been logged.
+   *
+   * Latched for the same reason as {@link #warnedJobsUnsupported}: the pill polls
+   * every four seconds, so an unlatched line would bury the log it exists to
+   * provide.
+   */
+  #warnedJobsUnresponsive = false;
+  /**
    * Whether the "this bridge has no paseo/goal" line has been logged.
    *
    * Latched for the same reason as {@link #warnedJobsUnsupported}: the goal pill
@@ -2350,6 +2378,26 @@ export class DshProcess {
     try {
       return withJobsErrorCode((await this.#request("paseo/jobs", { sessionId }, JOBS_READ_TIMEOUT_MS)) as DshJobs);
     } catch (error) {
+      // No answer at all within the short jobs budget. Two shapes reach here:
+      // a bridge build that *ignores* methods it does not know (older/foreign
+      // builds; this repo's own bridge always answers `unknown paseo bridge
+      // method:`), and a shared child whose event loop is wedged. Either way the
+      // user has no jobs to watch and polling cannot change the answer in this
+      // process — a permanent error pill is the wrong presentation. Classified
+      // terminal under `bridge_too_old`: the jobs contract has no "unresponsive"
+      // code, and the action (reload the plugin so the embedded bridge is
+      // rewritten) is identical.
+      if (this.#isBridgeTimeoutError(error, "paseo/jobs")) {
+        if (!this.#warnedJobsUnresponsive) {
+          this.#warnedJobsUnresponsive = true;
+          this.#processHandlers.onLog(
+            `the bridge did not answer paseo/jobs within ${String(JOBS_READ_TIMEOUT_MS)}ms ` +
+              `(an old or unresponsive bridge); the jobs pill is disabled until the plugin is reloaded: ` +
+              BRIDGE_UNRESPONSIVE_MESSAGE,
+          );
+        }
+        return { available: false, error: { message: BRIDGE_UNRESPONSIVE_MESSAGE, code: "bridge_too_old" } };
+      }
       // A bridge without this method is not "the registry could not be read": the
       // user's next step is to get a newer bridge, not to wait. Reported through
       // `available: false` because the pill has no other way to say "I could not
@@ -2541,6 +2589,21 @@ export class DshProcess {
   }
 
   /**
+   * Whether a rejection is the transport's own "no answer" timeout.
+   *
+   * `#request`'s pending timer rejects with {@link NO_ANSWER_PREFIX} plus the
+   * method name. Matching the exact method keeps a timeout on another read from
+   * ever being classified as an unresponsive jobs bridge.
+   *
+   * @param error - the rejection from `#request`.
+   * @param method - the bridge method whose timeout is being classified.
+   */
+  #isBridgeTimeoutError(error: unknown, method: string): boolean {
+    const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+    return message === `${NO_ANSWER_PREFIX}${method}`;
+  }
+
+  /**
    * Send one text prompt. Resolves when the bridge accepts it, not when the turn ends.
    *
    * The receipt carries the DSH message id — Paseo's rewind button hands it back as
@@ -2715,9 +2778,21 @@ export class DshProcess {
    *
    * @param sessionId - which session; required — there is no default.
    */
-  async cancel(sessionId: string): Promise<void> {
+  /**
+   * Ask the bridge to cancel one session's running turn.
+   *
+   * `timeoutMs` is optional and defaults to the transport's 120 s: the session
+   * layer passes its shorter ack budget so a wedged bridge cannot hold the call
+   * past the host's run-settlement window. The request is a **turn** cancel, not
+   * a process kill — a timeout here never kills the shared child (that would take
+   * every other conversation in the process down with it).
+   *
+   * @param sessionId - which session; required — there is no default.
+   * @param timeoutMs - optional ack bound; omitted keeps the 120 s default.
+   */
+  async cancel(sessionId: string, timeoutMs?: number): Promise<void> {
     await this.#ensureSessionReady(sessionId);
-    await this.#request("session/cancel", { sessionId });
+    await this.#request("session/cancel", { sessionId }, timeoutMs);
   }
 
   /**
@@ -3146,7 +3221,7 @@ export class DshProcess {
     const id = this.#nextId++;
     return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
-        if (this.#pending.delete(id)) reject(new Error(`DeepSeek Harness did not answer ${method}`));
+        if (this.#pending.delete(id)) reject(new Error(`${NO_ANSWER_PREFIX}${method}`));
       }, timeoutMs);
       timer.unref?.();
       const entry: Pending = {

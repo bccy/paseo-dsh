@@ -64,6 +64,16 @@ process.env.DSH_FAKE_LOG = frameLog;
 // node_modules/dsh-paseo-bridge` from the bridge embedded in the plugin. The
 // fake `dsh` needs no profile, so point DSH_HOME at a throwaway tree.
 process.env.DSH_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-steer-check-"));
+// `DSH_FAKE_MODE` is fixed at spawn, but the plugin may reuse a pooled fake
+// child between connections. The file is re-read on every mode access, so each
+// scenario retargets the child it actually talks to.
+const MODE_FILE = path.join(process.env.DSH_HOME, "fake-dsh-mode");
+process.env.DSH_FAKE_MODE_FILE = MODE_FILE;
+fs.writeFileSync(MODE_FILE, "steer\n");
+const setMode = (value) => {
+  process.env.DSH_FAKE_MODE = value;
+  fs.writeFileSync(MODE_FILE, `${value}\n`);
+};
 process.on("exit", () => {
   try {
     fs.rmSync(process.env.DSH_HOME, { recursive: true, force: true });
@@ -301,7 +311,7 @@ let conn;
   // status first (the `steer` mode's order); this synthetic reverse order (reply,
   // then turn) pins the invariant defensively rather than depending on that
   // cross-process ordering.
-  process.env.DSH_FAKE_MODE = "late";
+  setMode("late");
   const conn2 = await registration.connect({ capabilities: ["prompt.message", "prompt.steer", "session.subsession", "permission"] });
   const events2 = [];
   conn2.onEvent((event) => events2.push(event));
@@ -322,7 +332,7 @@ let conn;
   );
 
   // ---- a refused prompt leaves no ghost turn id ---------------------------
-  process.env.DSH_FAKE_MODE = "failonce";
+  setMode("failonce");
   const conn3 = await registration.connect({ capabilities: ["prompt.message", "prompt.steer", "session.subsession", "permission"] });
   const events3 = [];
   conn3.onEvent((event) => events3.push(event));
@@ -381,7 +391,7 @@ let conn;
   //   3. the turn terminal is `canceled`, not `completed`, so a stop is not
   //      indistinguishable from a finish
   // The session must also stay usable: cancel is a turn cancel, never a kill.
-  process.env.DSH_FAKE_MODE = "cancel";
+  setMode("cancel");
   const conn4 = await registration.connect({ capabilities: ["prompt.message", "prompt.steer"] });
   const events4 = [];
   conn4.onEvent((event) => events4.push(event));
@@ -475,10 +485,112 @@ let conn;
     `${frames().filter((frame) => frame.method === "shutdown").length} shutdown frame(s)`,
   );
 
+  // ---- bounded interrupt: an unanswered session/cancel must not hold the ack -
+  //
+  // Paseo's replace waits 2 s for `session.interrupt` to settle a run. A bridge
+  // that never answers `session/cancel` used to keep the plugin's request open
+  // for the transport's 120 s default, so the receipt missed that window and the
+  // daemon refused the replace ("active run cancellation was not acknowledged").
+  // The plugin now settles the turn locally after 1.5 s and answers completed.
+  const runInterruptScenario = async (modeName, sessionId, clientMessageId) => {
+    setMode(modeName);
+    const connX = await registration.connect({ capabilities: ["prompt.message", "prompt.steer"] });
+    const eventsX = [];
+    connX.onEvent((event) => eventsX.push(event));
+    await connX.send({ type: "session.open", sessionId, config: { cwd: process.cwd(), mode: "build" }, history: "skip" });
+    await untilIn(eventsX, (e) => e.type === "session.ready" && e.sessionId === sessionId, `${modeName} ready`);
+    const mark = eventsX.length;
+    const framesBefore = frames().length;
+    await connX.send({
+      type: "session.prompt",
+      sessionId,
+      prompt: { clientMessageId, input: { type: "message", content: [{ type: "text", text: "run" }] } },
+    });
+    const started = await untilIn(eventsX, (e) => e.type === "session.turn" && e.sessionId === sessionId && e.state === "started", `${modeName} turn started`);
+    const requestId = `interrupt-${modeName}-${Date.now()}`;
+    const startedAt = Date.now();
+    await connX.send({ type: "session.interrupt", sessionId, requestId });
+    const receipt = await maybeIn(eventsX, (e) => e.type === "request.completed" && e.requestId === requestId, 5000);
+    const elapsed = Date.now() - startedAt;
+    const canceled = eventsX.slice(mark).filter((e) => e.type === "session.turn" && e.sessionId === sessionId && e.state === "canceled");
+    const failedReceipt = eventsX.some((e) => e.type === "request.failed" && e.requestId === requestId);
+    const cancels = frames().slice(framesBefore).filter((frame) => frame.method === "session/cancel");
+    check(
+      `${modeName}: an unanswered cancel is acknowledged with request.completed under 2 s`,
+      receipt !== undefined && !failedReceipt && elapsed < 2000,
+      `receipt=${receipt === undefined ? "none" : "completed"} failed=${String(failedReceipt)} ${String(elapsed)}ms`,
+    );
+    check(
+      `${modeName}: the runtime receives exactly one session/cancel`,
+      cancels.length === 1 && cancels[0].params?.sessionId === sessionId,
+      `${String(cancels.length)} session/cancel frame(s)`,
+    );
+    check(
+      `${modeName}: the local fallback emits one canceled turn with the live turn id`,
+      canceled.length === 1 && canceled[0].turnId === started.turnId,
+      JSON.stringify(canceled.map((e) => e.turnId)),
+    );
+    return { connX, eventsX, sessionId, started };
+  };
+
+  const hang = await runInterruptScenario("cancel-hang", `cancel-hang-${Date.now()}`, "h1");
+  // Release the parked request: the fake then ends the turn for real. Its late
+  // `turn/end` must not produce a second terminal (the local fallback already
+  // settled the turn and cleared #turnId).
+  fs.writeFileSync(`${MODE_FILE}.cancel-hang-release`, "release");
+  await sleep(600);
+  const hangTerminals = hang.eventsX.filter((e) => e.type === "session.turn" && e.sessionId === hang.sessionId && e.state !== "started");
+  check(
+    "cancel-hang: a late real turn/end after the local fallback does not emit a second terminal",
+    hangTerminals.length === 1,
+    JSON.stringify(hangTerminals.map((e) => e.state)),
+  );
+
+  const rejected = await runInterruptScenario("cancel-reject", `cancel-reject-${Date.now()}`, "r1");
+  await sleep(300);
+  check(
+    "cancel-reject: the rejected cancel produces no second terminal",
+    rejected.eventsX.filter((e) => e.type === "session.turn" && e.sessionId === rejected.sessionId && e.state !== "started").length === 1,
+  );
+
+  // ---- close settles a running turn for a normal plugin reload -------------
+  setMode("cancel");
+  const conn7 = await registration.connect({ capabilities: ["prompt.message", "prompt.steer"] });
+  const events7 = [];
+  conn7.onEvent((event) => events7.push(event));
+  const closeSessionId = `close-settle-${Date.now()}`;
+  await conn7.send({ type: "session.open", sessionId: closeSessionId, config: { cwd: process.cwd(), mode: "build" }, history: "skip" });
+  await untilIn(events7, (e) => e.type === "session.ready" && e.sessionId === closeSessionId, "close-settle ready");
+  const closeMark = events7.length;
+  await conn7.send({
+    type: "session.prompt",
+    sessionId: closeSessionId,
+    prompt: { clientMessageId: "cl1", input: { type: "message", content: [{ type: "text", text: "close me" }] } },
+  });
+  const closeStarted = await untilIn(
+    events7,
+    (e) => e.type === "session.turn" && e.sessionId === closeSessionId && e.state === "started",
+    "close-settle turn started",
+  );
+  const closeRequestId = `close-${Date.now()}`;
+  await conn7.send({ type: "session.close", sessionId: closeSessionId, requestId: closeRequestId });
+  const closeReceipt = await maybeIn(events7, (e) => e.type === "request.completed" && e.requestId === closeRequestId, 5000);
+  const closeCanceled = events7
+    .slice(closeMark)
+    .filter((e) => e.type === "session.turn" && e.sessionId === closeSessionId && e.state === "canceled");
+  check(
+    "close settles a running turn with a live canceled terminal before detaching",
+    closeReceipt !== undefined && closeCanceled.length === 1 && closeCanceled[0].turnId === closeStarted.turnId,
+    `receipt=${closeReceipt === undefined ? "none" : "completed"} canceled=${JSON.stringify(closeCanceled.map((e) => e.turnId))}`,
+  );
+
   await conn.close();
   await conn2.close();
   await conn3.close();
   await conn4.close();
+  await hang.connX.close().catch(() => undefined);
+  await rejected.connX.close().catch(() => undefined);
+  await conn7.close().catch(() => undefined);
   fs.rmSync(path.dirname(frameLog), { recursive: true, force: true });
 
   const failed = results.filter((r) => !r.pass).length;

@@ -36,6 +36,7 @@ const { createPollSequence } = require("./client/poll-sequence.js");
 const {
   jobsPillCopy,
   jobsPillPresentation,
+  isBridgeEnvironmentJobsError,
   nextPollDelayMs,
   initialPollDelayMs,
   isTerminalJobsErrorCode,
@@ -338,6 +339,22 @@ console.log("\nthe pill's presentation (live-only, ring-only)");
   check("an unreadable registry keeps the baseline static mark", unreadable.icon, "static");
   equal("an unreadable registry has the neutral title", unreadable.label, { kind: "title" });
 
+  // The environment case: an old or unresponsive bridge cannot serve jobs at
+  // all. The poller has already stopped on the terminal code; if the same answer
+  // ever reaches a published state it must not leave a permanent error pill —
+  // that was the user-reported "no tasks but always a 后台 pill" (FIELD-NOTES
+  // #95). A runtime answer still shows the error pill ("could not read" must
+  // never look like "nothing here").
+  const oldBridge = jobsPillPresentation({ available: false, jobs: [], code: "bridge_too_old" });
+  check("an old/unresponsive bridge hides the pill", oldBridge.visible, false);
+  check("…and keeps the static mark in the hidden slot", oldBridge.icon, "static");
+  const registryMissing = jobsPillPresentation({ available: false, jobs: [], code: "registry_missing" });
+  check("a missing job registry still shows the error pill", registryMissing.visible, true);
+  const transientFailure = jobsPillPresentation({ available: false, jobs: [], code: "rpc_failed" });
+  check("a transient read failure still shows the error pill", transientFailure.visible, true);
+  check("only bridge_too_old is an environment (hiding) code", isBridgeEnvironmentJobsError("bridge_too_old"), true);
+  check("registry_missing is not an environment (hiding) code", isBridgeEnvironmentJobsError("registry_missing"), false);
+
   // The invariant in one place: no readable answer — live or idle, visible or
   // hidden — may select the static mark. Route 1 made the settled-only pill
   // visible *and* static; this catches that regression at the rule.
@@ -467,6 +484,15 @@ console.log("\nthe jobs error contract (terminal vs transient)");
   assert(
     "an unknown bridge method answers bridge_too_old",
     /code:\s*"bridge_too_old"/.test(dshProcessSource),
+  );
+  assert(
+    "a paseo/jobs timeout is recognised (not rethrown as an unclassified error)",
+    /#isBridgeTimeoutError\(error,\s*"paseo\/jobs"\)/.test(dshProcessSource) &&
+      /const NO_ANSWER_PREFIX = "DeepSeek Harness did not answer "/.test(dshProcessSource),
+  );
+  assert(
+    "a paseo/jobs timeout answers terminal bridge_too_old with the unresponsive message",
+    /BRIDGE_UNRESPONSIVE_MESSAGE,\s*code:\s*"bridge_too_old"/.test(dshProcessSource),
   );
   assert(
     "a profile without a job registry is normalised to registry_missing",
@@ -828,6 +854,41 @@ async function runControllerChecks() {
     harness.poller.upsert({ id: "a", workspaceId: "ws" });
     equal("an upsert does not re-register a terminal agent", harness.calls.added, ["a"]);
     equal("an upsert does not restart a terminal agent", harness.clock.pendingDelays(), []);
+    harness.poller.dispose();
+  }
+  {
+    // The user-visible failure shape: the bridge never answers `paseo/jobs`, so
+    // the server now classifies the 15 s timeout as terminal `bridge_too_old`
+    // with the "did not answer" message. End-to-end at the controller boundary:
+    // one removal (that single removal is the one console.error in jobs-pill),
+    // no timer, and no further reads however long the clock runs — the polling
+    // storm a transient classification would cause.
+    const harness = createPollerHarness({
+      readJobs: async () => {
+        harness.calls.reads += 1;
+        return {
+          available: false,
+          jobs: [],
+          error: {
+            message: "this profile's bridge did not answer paseo/jobs (it may predate jobs support or be unresponsive); reload the plugin so the embedded bridge is rewritten",
+            code: "bridge_too_old",
+          },
+        };
+      },
+    });
+    await harness.poller.applySnapshot({
+      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    await harness.clock.advance(0);
+    equal(
+      "a paseo/jobs timeout removes the pill exactly once (one console line)",
+      harness.calls.removed,
+      [["a", "terminal", "bridge_too_old"]],
+    );
+    equal("…and leaves no retry timer", harness.clock.pendingDelays(), []);
+    await harness.clock.advance(120_000);
+    equal("…and never retries (no polling storm)", harness.calls.reads, 1);
     harness.poller.dispose();
   }
   {

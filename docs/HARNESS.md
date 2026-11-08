@@ -156,7 +156,11 @@
   保留基线静态 mark）、间隔（可见/隐藏同为 4s、失败指数退避 8→16→30s）与抖动、首屏 `pageInfo`
   分页与过期页丢弃、终态错误码停轮询，以及**发布去重**：答案签名
   （`available`/`error`/`code`/`jobs`）未变时不 publish、首答与 `drop` 后重注册必发布、任一
-  真实变化（含 available 回真、错误文案/code 变化）仍发布。**本轮 141 条**（2026-11-05 新增 22 条：`jobsPillCopy` 在运行中/停止中/混合/九个/registry 读不到五种可见状态 × 中英，pill 文字恒为「后台」/「Background」，返回值只有 `label`、不带数量）：控制器已抽到
+  真实变化（含 available 回真、错误文案/code 变化）仍发布。**本轮 152 条**（2026-11-08 新增 11 条：
+  `paseo/jobs` 超时→terminal `bridge_too_old` 的服务器归类钉 2 条（`NO_ANSWER_PREFIX` +
+  `#isBridgeTimeoutError("paseo/jobs")` 与返回 message/code）；呈现规则 6 条（`bridge_too_old`
+  环境错误隐藏 pill、`rpc_failed` 仍显示、`registry_missing` 纯函数可见（实际由控制器 terminal 摘除）、predicate 正反）；控制器 3 条
+  （超时答案只移除一次=单条 console、无 timer、120 s 无重读）。2026-11-05 新增 22 条：`jobsPillCopy` 在运行中/停止中/混合/九个/registry 读不到五种可见状态 × 中英，pill 文字恒为「后台」/「Background」，返回值只有 `label`、不带数量）：控制器已抽到
   `client/agent-polling.ts`（jobs 与 goal 共用），`client/jobs-polling.ts` 只剩 jobs 适配器；
   多出的 3 条**逐字钉住 jobs 的旧文案**（读失败兜底句、poll 失败日志、分页上限日志）——泛化
   不得改 jobs 用户可见文案。**动了 `client/jobs-pill.tsx` / `client/jobs-polling.ts` /
@@ -624,7 +628,13 @@
 - `harness/steer-check.cjs` — 插话回执（假桥 `DSH_FAKE_MODE=steer`）：running 状态先于 prompt
   回执（真 DSH 的顺序）；只有 prompt 结果是 `steer` 且 `turnId` 等于宿主绑定的回合才算送达，
   否则回退取消+替换（复刻宿主 `steerOrReplaceActiveTurn`）；每帧进 `DSH_FAKE_LOG`，断言打在
-  协议边界。**动了 `session.ts` 的 steer 分支或 `provider.ts` 的插话转发必跑。**
+  协议边界。**本轮 34 条**（2026-11-08 新增 9 条：`cancel-hang` 假桥永不回 `session/cancel`、
+  `cancel-reject` 回 error，两种都断言 interrupt **<2 s 拿到 request.completed**（不是 failed）、
+  `session/cancel` 恰一次、本地兜底发出与 live turn 相同 turnId 的 `session.turn canceled`；
+  hang 释放后的迟到 `turn/end` 不得产生第二个终态；reject 同样无第二终态；`close()` 在断开前
+  为运行中回合补发同样的 canceled 终态。取消正常路径的既有断言保留：`session/cancel` 到达、
+  无后续输出、终态 canceled、会话存活）。**动了 `session.ts` 的 steer 分支、`interrupt()` /
+  `close()` 的终态结算、`dsh-process.ts` 的 `cancel()` 超时或 `provider.ts` 的插话转发必跑。**
 - `harness/mcp-injection-check.cjs` — Paseo 注入的 MCP server 必须真的到 DSH：per-session
   `paseo/mcp/set { sessionId, entries }` 帧、HTTP 与白名单 stdio 走 gateway、非白名单 stdio
   仍原生、legacy SSE 按名字拒绝。**动了 `mcpEntries()` / gateway 分派 / `paseo/mcp/set` 必跑。**

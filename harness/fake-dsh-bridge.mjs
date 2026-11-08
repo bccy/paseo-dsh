@@ -67,6 +67,13 @@
  *            `{kind:'aborted', reason:{kind:'user'}}`, then an idle status, and
  *            no further output for the turn. A later prompt still runs, so the
  *            check can prove the process and the conversation survived
+ *   cancel-hang / cancel-reject
+ *            like `cancel`, but the `session/cancel` request is not answered:
+ *            `cancel-hang` parks it until the test writes
+ *            `<DSH_FAKE_MODE_FILE>.cancel-hang-release` (then ends the turn), and
+ *            `cancel-reject` answers it with an error. Both drive the plugin's
+ *            bounded interrupt fallback: a live `session.turn canceled` and a
+ *            `request.completed` without waiting for the 120 s transport bound
  *   stream   replay a growing `paseo/assistant-delta` stream (the bridge's
  *            transient assistant snapshot) followed by the durable
  *            `assistant/message` for the same turn/step, so the plugin's
@@ -1546,7 +1553,7 @@ async function handle(method, params, id) {
           setTimeout(() => { void endRootTurn("recovered answer"); }, 40);
         }
       }
-      if (mode() === "cancel" && params?.delivery !== "steer") {
+      if ((mode() === "cancel" || mode() === "cancel-hang" || mode() === "cancel-reject") && params?.delivery !== "steer") {
         state.cancelPrompts += 1;
         if (state.cancelPrompts === 1) setTimeout(() => { void openCancelTurn(); }, 20);
         else setTimeout(() => { void runAfterCancelTurn(); }, 20);
@@ -1557,6 +1564,28 @@ async function handle(method, params, id) {
       // The one thing this scenario exists to observe: the plugin really asked
       // the runtime to stop the turn it thinks is running.
       if (mode() === "cancel") cancelTurn();
+      if (mode() === "cancel-reject") {
+        // Reject before touching the turn: the plugin must settle it locally,
+        // not rely on a turn/end the runtime never produced.
+        const state = stateOf(rootId);
+        state.rootTurnOpen = false;
+        if (cancelTicker !== null) {
+          clearInterval(cancelTicker);
+          cancelTicker = null;
+        }
+        throw new Error("the runtime refused the cancel");
+      }
+      if (mode() === "cancel-hang") {
+        // Park the acknowledgement past any sane ack budget; the test releases
+        // it and the fake then ends the turn exactly like `cancel`. That late
+        // `turn/end` is the "late terminal after the local fallback" shape.
+        const release = `${process.env.DSH_FAKE_MODE_FILE ?? ""}.cancel-hang-release`;
+        const deadline = Date.now() + 30000;
+        while (!existsSync(release) && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        cancelTurn();
+      }
       return { canceled: true };
     }
     case "paseo/plan/get":

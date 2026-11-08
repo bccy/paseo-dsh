@@ -280,6 +280,20 @@ const CHILD_BUFFER_LIMIT = 2000;
 const CHILD_LABEL_WAIT_EVENTS = 40;
 
 /**
+ * How long `interrupt()` waits for the bridge to acknowledge a cancel.
+ *
+ * Paseo's run ledger is event-driven: a replace first asks the provider to stop
+ * the active run and only settles when it observes a live terminal event. Its
+ * own wait for our ack is 2 s, while a bridge request defaults to 120 s — one
+ * unanswered `session/cancel` used to hold the request open past that window and
+ * the daemon refused the replace with "active run cancellation was not
+ * acknowledged". 1.5 s leaves the daemon its 2 s settlement wait, and the
+ * fallback below still settles the turn locally (the daemon's force-cancel is
+ * the second net).
+ */
+const INTERRUPT_ACK_TIMEOUT_MS = 1_500;
+
+/**
  * When to re-publish the occupancy snapshot polled during `open()`.
  *
  * The host subscribes to a provider session's events only at the end of its own
@@ -2547,9 +2561,48 @@ export class DshSession {
   /**
    * Cancel the running turn. The session and its history survive, so the
    * conversation stays continuable — killing the process stranded it instead.
+   *
+   * The bridge's ack is bounded: a reloaded/unresponsive bridge can leave
+   * `session/cancel` unanswered for the transport's 120 s default, which is
+   * beyond the daemon's 2 s run-settlement window and made a replace fail with
+   * "active run cancellation was not acknowledged". After 1.5 s (or an immediate
+   * rejection) the turn is settled **locally** with the same terminal event a
+   * real `turn/end` would produce, and this method returns normally so the
+   * provider answers `request.completed` instead of `request.failed`; the
+   * daemon's own force-cancel remains the second net.
    */
   async interrupt(): Promise<void> {
-    await this.#require().cancel(this.#dshSessionId);
+    const process = this.#require();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    try {
+      await Promise.race([
+        process.cancel(this.#dshSessionId, INTERRUPT_ACK_TIMEOUT_MS),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            resolve();
+          }, INTERRUPT_ACK_TIMEOUT_MS);
+          timer.unref?.();
+        }),
+      ]);
+    } catch (error) {
+      // The bridge answered with an error (or the request failed before any
+      // turn existed). Settle an open turn locally so the run ledger cannot stay
+      // live; with no turn open there is nothing this method can honestly
+      // acknowledge, so the original failure stays visible.
+      if (this.#cancelTurnLocally()) {
+        this.#clearPendingPermissions("The turn was interrupted, so this question is no longer waiting for an answer.");
+        return;
+      }
+      throw error;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+    // Timed out: the bridge never acknowledged. A locally emitted terminal is
+    // the only signal the daemon's run ledger will ever get from this process;
+    // the underlying request may still answer later, which is harmless.
+    if (timedOut) this.#cancelTurnLocally();
     // A cancelled turn's pending question cards can never be answered: DSH aborts
     // the question with the turn, and the bridge drops its pending request without
     // telling this process, so a later click would answer nobody. Deny them here —
@@ -2580,6 +2633,11 @@ export class DshSession {
    */
   async close(options: { park?: boolean } = {}): Promise<void> {
     if (this.#closed) return;
+    // A normal plugin reload closes the session while a turn may still be
+    // running. Paseo's run ledger only settles from a live terminal event, and
+    // nothing else will arrive after this process detaches — so settle it here,
+    // before the close, with the same `canceled` signal a real interrupt uses.
+    this.#cancelTurnLocally();
     this.#closed = true;
     clearTimeout(this.#usageRefreshTimer);
     this.#clearUsageReplays();
@@ -2665,6 +2723,28 @@ export class DshSession {
   }
 
   /**
+   * Settle the open turn as `canceled` without a bridge acknowledgement.
+   *
+   * Used when a cancel cannot be trusted (timeout/rejection) and when the
+   * session closes: Paseo's run ledger is event-driven, so a turn with no live
+   * terminal keeps the daemon's run alive and the next replace refuses with
+   * "active run cancellation was not acknowledged". Emits the same
+   * `session.turn canceled` shape a real `turn/end` produces. A later real
+   * `turn/end` is ignored because {@link #completeTurn} sees `#turnId === null`.
+   *
+   * @returns whether an open turn was settled.
+   */
+  #cancelTurnLocally(): boolean {
+    if (this.#turnId === null) return false;
+    const turnId = this.#turnId;
+    this.#turnId = null;
+    this.#turnEndState = null;
+    this.#turnStarted = false;
+    this.#options.emit({ type: "session.turn", sessionId: this.id, turnId, state: "canceled" });
+    return true;
+  }
+
+  /**
    * Close the running turn.
    *
    * Extracted so the status-only ending and the explicit path share one
@@ -2672,6 +2752,13 @@ export class DshSession {
    * this fork's.
    */
   #completeTurn(): void {
+    if (this.#turnId === null) {
+      // A late `turn/end` for a turn already settled locally (cancel fallback or
+      // close) records a terminal in `#turnEndState`; with no turn open there is
+      // nothing to close, and the stale recording must not colour the next turn.
+      this.#turnEndState = null;
+      return;
+    }
     if (this.#turnId !== null) {
       const turnId = this.#turnId;
       const ended = this.#turnEndState;
@@ -3148,7 +3235,7 @@ export class DshSession {
       // the transient delta payload.
       this.#emitStreamStats(data, typeof event.time === "number" ? event.time : undefined);
     }
-    if (event.type === "turn/end" && this.#lastStats !== undefined) {
+    if (event.type === "turn/end" && this.#turnId !== null && this.#lastStats !== undefined) {
       this.#lastStats.data = {
         ...this.#lastStats.data,
         toolCalls: this.#turnTool.count,

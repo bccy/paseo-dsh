@@ -139,13 +139,28 @@ export function jobsPillCopy(
  * exception is `available: false`: the pill stays visible so the popover can
  * explain the broken registry, and it keeps baseline 2f71225's static mark
  * because a turning ring would claim progress that is not happening.
+ *
+ * **Environment-level terminal errors are the exception to that exception.**
+ * `bridge_too_old` means the profile's bridge cannot serve `paseo/jobs` at all
+ * (an old or unresponsive process); there is no registry to explain to the user
+ * and no job to watch, and the poller has already stopped. Leaving an error pill
+ * there is the "no tasks but always a red pill" bug (FIELD-NOTES #95): hide it
+ * and let the one console line say what to do. A runtime answer still shows the
+ * error pill — `registry_missing`/`rpc_failed` keep the established "could not
+ * read ≠ nothing here" rule.
  */
 export function jobsPillPresentation(answer: {
   available: boolean;
   jobs?: readonly JobLike[];
+  code?: string;
 }): PillPresentation {
   const jobs = answer.jobs ?? [];
-  if (!answer.available) return { visible: true, icon: "static", label: { kind: "title" } };
+  if (!answer.available) {
+    if (isBridgeEnvironmentJobsError(answer.code)) {
+      return { visible: false, icon: "static", label: { kind: "title" } };
+    }
+    return { visible: true, icon: "static", label: { kind: "title" } };
+  }
   const live = jobs.filter((job) => isLive(job.status)).length;
   if (live > 0) return { visible: true, icon: "spinner", label: { kind: "live", count: live } };
   return { visible: false, icon: "spinner", label: { kind: "title" } };
@@ -171,6 +186,31 @@ function isLive(status: string): boolean {
  */
 export function isTerminalJobsErrorCode(code: string | undefined): boolean {
   return code !== undefined && (TERMINAL_JOB_ERROR_CODES as readonly string[]).includes(code);
+}
+
+/**
+ * The terminal codes that mean the *environment* cannot serve jobs — the bridge
+ * is too old or unresponsive — as opposed to a registry read that failed while
+ * the environment is fine.
+ *
+ * Only codes whose only remedy is a plugin reload belong here. Both halves read
+ * the shared terminal list; this narrower predicate decides the pill's
+ * presentation for the environment case.
+ */
+const BRIDGE_ENVIRONMENT_JOB_ERROR_CODES = ["bridge_too_old"] as const;
+
+/**
+ * Whether a terminal jobs code is an environment (bridge) error.
+ *
+ * The pill hides for these: the poller has already stopped (terminal), and a
+ * permanent per-agent error pill would be the exact "no tasks but always a red
+ * pill" complaint. `registry_missing` is deliberately **not** here — that is a
+ * runtime answer the user can inspect, so it keeps the visible error pill.
+ *
+ * @param code - `error.code` from a jobs answer.
+ */
+export function isBridgeEnvironmentJobsError(code: string | undefined): boolean {
+  return code !== undefined && (BRIDGE_ENVIRONMENT_JOB_ERROR_CODES as readonly string[]).includes(code);
 }
 
 /**

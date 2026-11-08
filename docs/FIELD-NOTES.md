@@ -3293,3 +3293,102 @@ teammate 复用第二回合，WS 探针应看到 running→completed（此前全
 **真机复验（待做，未验证）**：reload 插件后对同一会话执行一次 `todo_write([])`，Paseo 原生任务
 清单/待办 pill 上的旧项应消失（而不是等下一次非空写入）；随后再写非空列表应重新出现。真机由
 主会话执行。
+
+### 95. 没有后台任务却常驻「后台」pill：`paseo/jobs` 超时未归类为 terminal
+
+**症状**（用户截图）：某个会话没有任何后台命令，composer 上却常驻「后台」pill；点开面板显示
+「后台任务 / DeepSeek Harness did not answer paseo/jobs」。换个新会话就正常——坏的是那个会话
+所连的旧桥/旧进程。
+
+**桥侧核实**：本仓库的桥对未知 method **会回 error**——`handleRequest` 的
+`default: throw new Error('unknown paseo bridge method: ' + method)` 从首个提交（2fc1c21）就存在
+（当前 `dsh-bridge/lib/server.js:4133`）。因此 `#isUnknownBridgeMethodError` → `bridge_too_old`
+那条路只覆盖「桥回 unknown method」；用户看到的是 15 s 的 **pending 超时**文案
+（`dsh-process.ts:3212` 用 `NO_ANSWER_PREFIX` + method 生成），即那个旧桥**根本没应答**——
+要么是更老/外来构建对不认识的 method 直接忽略（本仓库任何版本都不会这样，所以只能是更旧的
+桥实现），要么共享 `dsh` 子进程被卡住。两种情况都不能靠"再轮询一次"变好。
+
+**根因（两层）**：① `dsh-process.ts` 的 `jobs()` 只把「unknown method 错误」归成
+`bridge_too_old`，超时异常原样抛出；provider 的 RPC 只能回 `request.failed`，客户端 catch 当
+瞬时失败 → `available:false` 无 code；② 客户端 `jobsPillPresentation` 对 `available:false`
+一律 `{visible:true, icon:"static"}`，于是无任务也常驻错误 pill，且按 4→8→16→30 s 重试风暴，
+每次都重画错误面板。
+
+**修法**：① `dsh-process.ts` 的 `jobs()` catch 增加 `#isBridgeTimeoutError(error, "paseo/jobs")`
+（精确匹配 `NO_ANSWER_PREFIX + method`，不误伤其他 read 的超时）：命中后按进程单条 stderr
+（`#warnedJobsUnresponsive` 锁存）并返回
+`{ available:false, error:{ message: BRIDGE_UNRESPONSIVE_MESSAGE, code:"bridge_too_old" } }`。
+复用 `bridge_too_old` 而不是新增 `bridge_unresponsive`：`JOB_ERROR_CODES` 是客户端与服务端
+共同 parse 的 wire 契约（`shared/jobs.ts`），新增 code 要改共享枚举（本任务写域外）；而两者的
+用户动作相同——reload 插件让内嵌桥重写。**取舍**：真正"活着只是慢"的桥也会被判 terminal（之后
+该 agent 不再轮询）；可接受——4 s 轮询下一份慢答案没有价值，reload 是唯一可行动作。
+② `client/jobs-polling.ts`：`jobsPillPresentation` 接收 `code`，`bridge_too_old` 环境错误返回
+`visible:false`（静态 mark 留在隐藏槽位）；`rpc_failed` 仍 `visible:true`——保留「读不到 ≠ 没有」
+的既定原则。`registry_missing` 属 terminal：控制器 `removeAgent("terminal")` 直接摘 pill 并只打
+一条 console，不会走到呈现层（纯函数对它的 visible:true 只是兜底分支）；本改动是同一答案若被
+发布时的呈现兜底。
+
+**效果**：无任务会话不再常驻错误 pill；旧桥会话第一次轮询即被摘掉并打一条 `[dsh-paseo] jobs pill
+disabled for …: this profile's bridge did not answer paseo/jobs …`，不再有 4 s 重试风暴；
+明确 `rpc_failed` 的运行时错误仍显示错误 pill；`registry_missing` 为 terminal（摘 pill + 单条 console），不显示。
+
+**验证（离线）**：`harness/jobs-poll-check.cjs` **152/152**（141 + 11：服务器归类源码钉 2 条、
+呈现规则 6 条——`bridge_too_old` 隐藏 / `rpc_failed` 仍显示、`registry_missing` 纯函数可见（实际由控制器 terminal 摘除）/ predicate 正反，
+控制器 3 条——超时答案只移除一次(单条 console)、无 timer、120 s 内重读次数仍为 1）。变异：
+服务端把超时归类改回 rethrow → **2 红/150**（两条新源码钉）；客户端去掉 `bridge_too_old`
+隐藏分支 → **1 红/151**（环境错误隐藏断言）；均还原后 152/152。`tsc --noEmit` exit 0；
+`subagent-check` 97 不回归。
+
+**真机复验（待做，未验证）**：reload 插件后，该无任务会话的「后台」pill 不应再常驻（旧桥
+会话也不再显示错误面板）；有后台任务的会话应正常显示/计数。**恢复判断**：`paseo/jobs` 能否读通
+取决于服务该会话的 DSH 子进程从哪份内嵌桥启动——插件 reload / daemon restart 会以新桥重写
+profile 并换子进程，应恢复；仅重启 Paseo App 只重连客户端、不替换 daemon/插件进程里的旧桥，
+jobs 功能不会自行恢复（但新客户端已隐藏 pill，不再常驻报错）。会话重开是否恢复，取决于它是否
+重新绑定到新插件代的子进程。
+
+### 96. 插件 reload 后 replace 报「active run cancellation was not acknowledged」：cancel ack 没有上限
+
+**症状**：插件 reload 之后，同一个 agent 的 replace/发消息反复失败，报
+`Cannot replace agent … active run cancellation was not acknowledged`；daemon 日志在 reload 后
+（实测 12:36 reload 后的 12:51、13:34、13:57）反复出现
+`Timed out interrupting session during cancel`。用户侧表现为 reload 后不能正常继续该会话。
+
+**根因**：daemon 的 run 账本是**事件驱动**的——一个 run 只有收到 live terminal 事件才结算。
+插件 reload 时 `DshSession.close()` 直接断开，运行中的回合没有任何 terminal；随后 replace 的
+`cancelAgentRun` 调 `session.interrupt` 只等 2 s ack（`INTERRUPT_SESSION_TIMEOUT_MS=2000`），
+而插件 `DshProcess.cancel` 的 bridge `session/cancel` 请求用传输默认 120 s——旧桥/不响应进程
+永远不回时，ack 超时、run 仍未 settle，daemon 只能拒绝 replace（并打印上面两条日志）。宿主侧
+不需要改：它后来还有自己的 2 s settlement 超时 force-cancel 兜底，缺的是插件把「本地回合已经
+结束」这个 live 信号发出来。
+
+**修法（插件侧，不碰宿主）**：
+1. `session.ts` `interrupt()`：`INTERRUPT_ACK_TIMEOUT_MS = 1500` 用 `Promise.race` 包住
+   `process.cancel()`（并把该预算传给 `DshProcess.cancel` 的可选 timeout）；超时或立即
+   reject 时，若 `#turnId !== null` 就调用 `#cancelTurnLocally()` —— 发出与 live 回合完全
+   相同 turnId 的 `session.turn canceled`、清空 turn 状态，然后**正常返回**（provider 回
+   `request.completed`，不再 `request.failed`），并照旧清 pending permission 卡。没有打开
+   回合时保留原来的抛出，不伪造 ack。
+2. `session.ts` `close()`：在 `#closed = true` / 断开前，对运行中的回合先发同样的
+   `session.turn canceled`——正常 plugin reload 也会结算当前 run。
+3. `dsh-process.ts` `cancel(sessionId, timeoutMs?)`：可选超时，省略仍用 120 s 默认；**不 kill
+   共享子进程**（会连坐同进程的其他会话）。没有实现「连续两次超时才 kill」——收益低、风险
+   集中，留作已知边界。
+4. `#completeTurn()`：`#turnId === null` 时清掉 `#turnEndState` 直接返回，迟到 `turn/end`
+   不会再给下一回合染色；同一迟到事件也不再补发第二行 stats。
+
+**风险/边界**：本地 canceled 是「我们不再追踪这个回合」的事实，桥若之后仍继续跑，daemon 的
+2 s settlement 超时会再 force-cancel 一次；不 kill 子进程意味着真 wedged 的共享桥仍会影响其他
+会话（与原现状一致，未新增连坐）。`interrupt` 在无回合时仍可抛错——那是真正的链路失败。
+
+**验证（离线）**：`harness/steer-check.cjs` **34/34**（25 + 9：`cancel-hang` 下 <2 s 拿到
+`request.completed`、`session/cancel` 恰一次、同 turnId canceled；释放后的迟到 `turn/end` 不产生
+第二个终态；`cancel-reject` 同样兜底；`close()` 在断开前补发 canceled）。变异：把
+`INTERRUPT_ACK_TIMEOUT_MS` 改回 120 s（等于去掉 1.5 s 兜底）→ **1 红/33**（hang 用例 30008 ms
+才收到 completed）；去掉 `close()` 的补发 → **1 红/33**（close 用例 canceled=[]）。均还原后
+34/34。`tsc --noEmit` exit 0；`subagent-check` 97 不回归；`plugin-build-check` 86；
+`bridge-assets-check` 2/2（未改桥/资产）。
+
+**真机复验（待做，未验证）**：长回合中 reload 插件后立刻 replace/发消息：不应再报
+`active run cancellation was not acknowledged`，日志不再反复出现
+`Timed out interrupting session during cancel`；被 reload 中断的回合在界面上应显示为 canceled
+而不是一直 running。真机由主会话执行。
