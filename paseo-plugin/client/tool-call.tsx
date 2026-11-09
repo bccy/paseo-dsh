@@ -981,12 +981,17 @@ function ToolFieldsView({ data, styles }: { data: ToolFieldsData; styles: BlockS
   push(data.args, "args");
   if (data.result.length > 0) {
     // The caption separates the two halves: without it a card of facts does not
-    // say which ones the tool was called with and which it answered.
-    blocks.push(
-      <Text key="result-caption" style={styles.fieldCaption}>
-        {localeText().bodyLabels.result}
-      </Text>,
-    );
+    // say which ones the tool was called with and which it answered. A card
+    // whose entries all come from the result half (`data.hideResultCaption`)
+    // gains nothing from it — there the caption is a heading over the whole card
+    // (the `skill` row: name, location, then the instructions).
+    if (data.hideResultCaption !== true) {
+      blocks.push(
+        <Text key="result-caption" style={styles.fieldCaption}>
+          {localeText().bodyLabels.result}
+        </Text>,
+      );
+    }
     push(data.result, "result");
   }
   if (data.receipt !== "") {

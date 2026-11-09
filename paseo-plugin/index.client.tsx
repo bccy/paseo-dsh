@@ -249,6 +249,8 @@ export default function contribute(client: PluginClientContext) {
           // L2's one-line compression of the result (「已发送」/「超时」), or "".
           receipt: z.string(),
           copyText: z.string(),
+          // The skill card's 「结果」caption opt-out (see `ToolFieldsData`).
+          hideResultCaption: z.boolean().optional(),
         })
         .nullable(),
       // DSH's failure code and, for a known one, the words drawn for it.

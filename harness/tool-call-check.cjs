@@ -1535,6 +1535,242 @@ console.log("high-frequency tools get their own cards (L2)");
   equal("a failed remote_create_session has no creation receipt", failedRemote.fields.receipt, "");
   equal("…and its head returns to L1", failedRemote.summary, "hostId: h");
 
+  // --- skill: the model-facing frame, parsed down to a card ----------------
+  // The fixtures are `renderSkillContent()`'s own output, rebuilt line for line
+  // from `dsh-skill/lib/index.js:57-81`: the opening tag with its escaped name
+  // attribute, `<skill_resources>` with one hint line plus one English
+  // instruction line, a blank line, then `<skill_instructions>` and the body.
+  // Nothing else is in the text — `tool/result` carries no structured value, so
+  // this string is all the client ever sees.
+  const skillFrame = (name, hint, body) =>
+    [
+      `<skill_content name="${name}">`,
+      "<skill_resources>",
+      ...hint,
+      "</skill_resources>",
+      "",
+      "<skill_instructions>",
+      body,
+      "</skill_instructions>",
+      "</skill_content>",
+    ].join("\n");
+  const FRAME_WORDS = /<\/?skill_(content|resources|instructions)|Base directory for this skill|Base URL for this skill|Resources for this skill|Resolve (relative paths|relative URLs)/u;
+  const skillBody = "# 主会话编排\n\n派发前先加载 `dsh-orchestration`，再按单元清单派 teammate。\n\n- 单元 1：实现\n- 单元 2：审查\n";
+
+  // directory: the provider's base directory, no provider name in the text.
+  const directoryText = skillFrame(
+    "dsh-orchestration",
+    [
+      "Base directory for this skill: /home/runner/.dsh/skills/dsh-orchestration",
+      "Resolve relative paths mentioned by this skill against the base directory before using them. Load referenced resources only as needed.",
+    ],
+    skillBody,
+  );
+  const directoryRow = row("skill", { name: "dsh-orchestration" }, directoryText);
+  equal("skill (directory): the head is the body's own level-1 title", directoryRow.summary, "主会话编排");
+  equal("…the call's name argument is not repeated as a fact", directoryRow.fields?.args, []);
+  equal("…the wire name is still a fact, so /name calls keep it", directoryRow.fields?.result, [
+    { kind: "fact", label: "名称", value: "dsh-orchestration" },
+    { kind: "fact", label: "位置", value: "/home/runner/.dsh/skills/dsh-orchestration" },
+    { kind: "text", label: "指令", value: skillBody },
+  ]);
+  check("…the location is a fact, so it sits beside its label", directoryRow.fields?.result?.[1]?.kind === "fact");
+  check("…the generic 「结果」caption is switched off", directoryRow.fields?.hideResultCaption === true);
+  equal("…the English frame is not put in the body as well", directoryRow.body, "");
+  equal("…the copy control keeps the complete original output", directoryRow.fields?.copyText, directoryText);
+  check(
+    "…no frame line survives in the card's entries",
+    !FRAME_WORDS.test(JSON.stringify(directoryRow.fields?.result ?? null)),
+    JSON.stringify(directoryRow.fields?.result ?? null).slice(0, 200),
+  );
+  check("…and the row still expands onto the card", directoryRow.hasDetail === true);
+
+  // url: same shape, the base URL instead of a directory.
+  const urlText = skillFrame(
+    "remote-skill",
+    [
+      "Base URL for this skill: https://skills.example.test/remote-skill",
+      "Resolve relative URLs mentioned by this skill against the base URL before using them. Load referenced resources only as needed.",
+    ],
+    "Fetch the reference page before answering.\n",
+  );
+  const urlRow = row("skill", { name: "remote-skill" }, urlText);
+  equal("skill (url): the URL is the location fact", urlRow.fields?.result?.[1], {
+    kind: "fact",
+    label: "位置",
+    value: "https://skills.example.test/remote-skill",
+  });
+  equal("…a body with no level-1 heading falls back to the wire name", urlRow.summary, "remote-skill");
+
+  // opaque: a provider-described resource base, still no provider name.
+  const opaqueText = skillFrame(
+    "office-skills",
+    ["Resources for this skill: the templates ship inside the plugin bundle.", "Load referenced resources only as needed."],
+    "Use the bundled templates.",
+  );
+  const opaqueRow = row("skill", { name: "office-skills" }, opaqueText);
+  equal("skill (opaque description): the description is the location", opaqueRow.fields?.result, [
+    { kind: "fact", label: "名称", value: "office-skills" },
+    { kind: "fact", label: "位置", value: "the templates ship inside the plugin bundle." },
+    { kind: "text", label: "指令", value: "Use the bundled templates." },
+  ]);
+
+  // provider-managed: the one hint that names a provider, and no location at all.
+  const managedText = skillFrame(
+    "paseo-upstream",
+    ['Resources for this skill are managed by provider "paseo-plugin-bundle".', "Load referenced resources only as needed."],
+    "Upstream instructions.\n",
+  );
+  const managedRow = row("skill", { name: "paseo-upstream" }, managedText);
+  equal("skill (provider-managed): the head falls back to the wire name", managedRow.summary, "paseo-upstream");
+  equal("…the provider is a fact, and no location is invented", managedRow.fields?.result, [
+    { kind: "fact", label: "名称", value: "paseo-upstream" },
+    { kind: "fact", label: "提供方", value: "paseo-plugin-bundle" },
+    { kind: "text", label: "指令", value: "Upstream instructions.\n" },
+  ]);
+  check("…this card hides the caption too", managedRow.fields?.hideResultCaption === true);
+  equal("…the copy control keeps the frame too", managedRow.fields?.copyText, managedText);
+  check(
+    "…no frame line survives in this card either",
+    !FRAME_WORDS.test(JSON.stringify(managedRow.fields?.result ?? null)),
+    JSON.stringify(managedRow.fields?.result ?? null),
+  );
+
+  // The name attribute and the hint prose are escaped by DSH; the card decodes
+  // them, and the copy control still hands over the escaped original.
+  const escapedText = skillFrame(
+    "a&amp;b",
+    ["Base directory for this skill: /skills/a&amp;b &lt;test&gt;", "Resolve relative paths mentioned by this skill against the base directory before using them. Load referenced resources only as needed."],
+    "body",
+  );
+  const escapedRow = row("skill", { name: "a&b" }, escapedText);
+  equal("skill: the escaped name decodes for the head", escapedRow.summary, "a&b");
+  equal("…and the decoded name is the 名称 fact", escapedRow.fields?.result?.[0], { kind: "fact", label: "名称", value: "a&b" });
+  equal("…so does the escaped location", escapedRow.fields?.result?.[1]?.value, "/skills/a&b <test>");
+  equal("…while copy keeps the escaped bytes", escapedRow.fields?.copyText, escapedText);
+
+  // A frame with no instruction body is not this shape: L1's generic card keeps
+  // the whole text (never a blank card, never a lost byte).
+  const noInstructions = [
+    '<skill_content name="broken-skill">',
+    "<skill_resources>",
+    "Base directory for this skill: /tmp/skills/broken-skill",
+    "Resolve relative paths mentioned by this skill against the base directory before using them. Load referenced resources only as needed.",
+    "</skill_resources>",
+    "",
+    "</skill_content>",
+  ].join("\n");
+  const brokenRow = row("skill", { name: "broken-skill" }, noInstructions);
+  equal("skill: a frame without instructions keeps L1's summary", brokenRow.summary, "name: broken-skill");
+  equal("…L1's argument entry comes back", brokenRow.fields?.args, [{ kind: "fact", label: "name", value: "broken-skill" }]);
+  equal("…no result entry is invented", brokenRow.fields?.result, []);
+  equal("…the whole text stays in the body", brokenRow.body, noInstructions);
+  check("…and it is a card, not an empty row", brokenRow.hasDetail === true);
+  check(
+    "…the skill card's 名称 fact does not survive the fallback",
+    !JSON.stringify(brokenRow.fields ?? null).includes("名称"),
+    JSON.stringify(brokenRow.fields ?? null),
+  );
+  check("…and the caption flag is back to the default", brokenRow.fields?.hideResultCaption === false);
+
+  // A different frame — an unknown hint line — is refused the same way.
+  const oddHint = skillFrame("odd-hint", ["Skills live somewhere the client does not parse.", "Load referenced resources only as needed."], "body");
+  const oddHintRow = row("skill", { name: "odd-hint" }, oddHint);
+  equal("skill: an unknown hint line keeps L1", oddHintRow.summary, "name: odd-hint");
+  equal("…with the text still in the body", oddHintRow.body, oddHint);
+
+  // The resources block is two lines — the hint plus the note DSH writes with
+  // it. An unknown note is a shape this card does not know.
+  const oddNote = skillFrame(
+    "odd-note",
+    ["Base directory for this skill: /tmp/skills/odd-note", "Something the renderer never writes."],
+    "body",
+  );
+  const oddNoteRow = row("skill", { name: "odd-note" }, oddNote);
+  equal("skill: an unknown resource note keeps L1", oddNoteRow.summary, "name: odd-note");
+  equal("…with the text still in the body", oddNoteRow.body, oddNote);
+
+  // Nor does a third line: the renderer emits exactly two, so three is not it.
+  const threeLines = skillFrame(
+    "three-lines",
+    ["Base directory for this skill: /tmp/skills/three-lines", "Load referenced resources only as needed.", "An extra line the renderer never writes."],
+    "body",
+  );
+  const threeLinesRow = row("skill", { name: "three-lines" }, threeLines);
+  equal("skill: a three-line resource block keeps L1", threeLinesRow.summary, "name: three-lines");
+  equal("…with the text still in the body", threeLinesRow.body, threeLines);
+
+  // Only a real level-1 heading titles the card: `## …` is not one, and neither
+  // is a `# ` line with nothing after it.
+  const secondLevelText = skillFrame(
+    "second-level",
+    ["Resources for this skill: a body that starts at level two.", "Load referenced resources only as needed."],
+    "## 二级标题\n正文",
+  );
+  equal(
+    "skill: a level-2 heading is not the card's title",
+    row("skill", { name: "second-level" }, secondLevelText).summary,
+    "second-level",
+  );
+  const emptyHeadingText = skillFrame(
+    "empty-heading",
+    ["Resources for this skill: a body with an empty level-1 heading.", "Load referenced resources only as needed."],
+    "# \n正文",
+  );
+  equal(
+    "skill: an empty level-1 heading falls back to the wire name",
+    row("skill", { name: "empty-heading" }, emptyHeadingText).summary,
+    "empty-heading",
+  );
+
+  // A fenced code block is body, not document structure: `# 安装依赖` inside
+  // ```` ```bash ```` is a shell comment, and the title is the first `# ` line
+  // after the fence closes.
+  const fencedThenTitle = skillFrame(
+    "fenced-then-title",
+    ["Resources for this skill: a body that opens with a code fence.", "Load referenced resources only as needed."],
+    "```bash\n# 安装依赖\nnpm install\n```\n\n# 真标题\n正文",
+  );
+  equal(
+    "skill: a `# ` line inside a code fence is not the title",
+    row("skill", { name: "fenced-then-title" }, fencedThenTitle).summary,
+    "真标题",
+  );
+  const fencedOnly = skillFrame(
+    "fenced-only",
+    ["Resources for this skill: a body whose only `# ` lines are inside a fence.", "Load referenced resources only as needed."],
+    "```bash\n# 只有围栏内的标题\n```\n\n正文",
+  );
+  equal(
+    "skill: a heading only inside a code fence falls back to the wire name",
+    row("skill", { name: "fenced-only" }, fencedOnly).summary,
+    "fenced-only",
+  );
+
+  // The flag is a skill-card opt-out only: every other card keeps its caption.
+  equal(
+    "skill: other cards keep the caption flag at its default",
+    row("probe_tool", { a: 1 }, "").fields?.hideResultCaption,
+    false,
+  );
+
+  // A non-text output is not this shape either: the mapper declines, L1 splits it.
+  const objectOutput = toolCallData(
+    { name: "skill", status: "completed", detail: { type: "unknown", input: { name: "obj" }, output: { name: "obj" } }, error: null },
+    "complete",
+  );
+  equal("skill: an object output keeps L1's entries", objectOutput.fields?.result, [{ kind: "fact", label: "name", value: "obj" }]);
+
+  // A failed call never reaches the mapper: the failure text stays verbatim.
+  const failedSkill = failedRow(
+    "skill",
+    { name: "missing-skill" },
+    'skill "missing-skill" is unknown or no longer available',
+    'skill "missing-skill" is unknown or no longer available',
+  );
+  equal("skill: a failed call has no card and no receipt", failedSkill.fields?.receipt, "");
+  equal("…and keeps DSH's failure sentence", failedSkill.body, 'skill "missing-skill" is unknown or no longer available');
+
   // --- the copy comes from the same locale tables --------------------------
   const en = allText().en.toolCards;
   const zh = allText()["zh-CN"].toolCards;
@@ -1554,6 +1790,22 @@ console.log("high-frequency tools get their own cards (L2)");
   const englishSend = row("send_message", { target: "lead", message: "m" }, '{"sent":true}');
   equal("English: the receipt is translated", englishSend.fields.receipt, "Sent");
   equal("English: the message label too", englishSend.fields.args[0].label, "Message");
+  const englishSkill = row("skill", { name: "dsh-orchestration" }, directoryText);
+  equal("English: the skill card labels", englishSkill.fields?.result?.map((entry) => entry.label), ["Name", "Location", "Instructions"]);
+  equal("English: the card title is the body's own heading", englishSkill.summary, "主会话编排");
+  // The provider-managed form names a provider and no location: in English the
+  // labels must be English too, and the values stay verbatim.
+  const englishManaged = row("skill", { name: "paseo-upstream" }, managedText);
+  equal(
+    "English: the provider-managed skill card labels",
+    englishManaged.fields?.result?.map((entry) => entry.label),
+    ["Name", "Provider", "Instructions"],
+  );
+  equal(
+    "…and its values are not translated",
+    englishManaged.fields?.result?.map((entry) => entry.value),
+    ["paseo-upstream", "paseo-plugin-bundle", "Upstream instructions.\n"],
+  );
   setLocale("zh-CN");
 }
 
@@ -2917,6 +3169,24 @@ console.log("the renderer reads the state the data layer now carries");
     "…and the L2 receipt is drawn in its own quiet line",
     mentions(fieldsView, "receipt") && mentions(stylesBody, "fieldReceipt"),
     "no receipt line in ToolFieldsView / buildStyles",
+  );
+  // The 「结果」caption is opt-out, and the data layer producing the flag is not
+  // the same fact as the view honouring it: a caption drawn anyway looks exactly
+  // like a card that never asked for the opt-out, so no data assertion above can
+  // see it. The `result-caption` push must sit inside the
+  // `data.hideResultCaption !== true` guard, and the element must exist nowhere
+  // else — a second copy outside the guard would undo the opt-out.
+  const guardAt = fieldsView.indexOf("data.hideResultCaption !== true");
+  const guardBody = guardAt < 0 ? "" : bracedBody(fieldsView, guardAt);
+  check(
+    "…and the 「结果」caption push sits inside the card's opt-out guard",
+    guardAt >= 0 && mentions(guardBody, "result-caption") && mentions(guardBody, "push"),
+    guardBody === "" ? "no hideResultCaption guard in ToolFieldsView" : guardBody.slice(0, 160),
+  );
+  check(
+    "…with no second caption element that could bypass it",
+    (fieldsView.match(/result-caption/gu) ?? []).length === 1,
+    `${(fieldsView.match(/result-caption/gu) ?? []).length} occurrence(s) in ToolFieldsView`,
   );
 }
 

@@ -299,6 +299,17 @@ export interface ToolCardsText {
   remoteUploaded: (path: string, bytes: number) => string;
   remoteSent: string;
   remoteTargets: (n: number) => string;
+  /**
+   * `skill`: the skill's wire name, its resource location, the provider that
+   * owns it, and the label introducing its instruction body.
+   *
+   * A section of its own rather than borrowed `labels.*` words: the skill row is
+   * a different kind of card (its location is a directory, a URL or an opaque
+   * description depending on the provider), and sharing a word with another
+   * card would tie two unrelated shapes together. `name` labels the identifier
+   * the head may have replaced with the body's own title — `/name` calls need it.
+   */
+  skillCard: { name: string; location: string; provider: string; instructions: string };
 }
 
 /**
@@ -1156,6 +1167,10 @@ const TEXT: Record<Locale, UiText> = {
       remoteUploaded: (path, bytes) => `Uploaded · ${path} · ${String(bytes)} bytes`,
       remoteSent: "Sent (queued)",
       remoteTargets: (n) => `${String(n)} session(s)`,
+      // `skill`: the row's result is `renderSkillContent()`'s text only (see
+      // `./tool-call-data`), so the card names the skill's resource location, the
+      // provider (only the managed-by form carries one), and the instruction body.
+      skillCard: { name: "Name", location: "Location", provider: "Provider", instructions: "Instructions" },
     },
   },
   "zh-CN": {
@@ -1616,6 +1631,9 @@ const TEXT: Record<Locale, UiText> = {
       remoteUploaded: (path, bytes) => `已上传 · ${path} · ${String(bytes)} 字节`,
       remoteSent: "已发送（排队）",
       remoteTargets: (n) => `${String(n)} 个会话`,
+      // `skill` 行的结果只有 `renderSkillContent()` 的文本（见 `./tool-call-data`）：
+      // 卡里给出技能资源的位置、提供方（仅 managed 形态的文本自带），以及指令正文。
+      skillCard: { name: "名称", location: "位置", provider: "提供方", instructions: "指令" },
     },
   },
 };

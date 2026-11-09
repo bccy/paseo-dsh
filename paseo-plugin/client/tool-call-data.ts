@@ -322,6 +322,16 @@ export type ToolFieldsData = {
   receipt: string;
   /** Complete result JSON for the copy control, or "" when `body` carries it. */
   copyText: string;
+  /**
+   * Whether the card draws the 「结果」caption above its result half.
+   *
+   * The caption exists to separate a call's arguments from what it answered. A
+   * card whose entries all come from one side (the `skill` card: the name, the
+   * resource location, then the instructions) gains nothing from it, and the
+   * caption above prose reads as one more heading the reader has to skip. Absent
+   * means the default, `false` — every other card keeps its caption.
+   */
+  hideResultCaption?: boolean;
 };
 
 /* -------------------------------------------------------------------------- */
@@ -1381,6 +1391,10 @@ function buildFields(
           : typeof output === "string"
             ? output
             : stringifyValue(output, true),
+      // Spelled out rather than omitted: the renderer's schema is pinned
+      // key-for-key against this shape, so a generic card must carry the key
+      // (false) for the sets to stay equal.
+      hideResultCaption: false,
     },
     summary: fieldSummary(input, resultValue),
   };
@@ -1410,6 +1424,8 @@ export type ToolMapping = {
   body?: string;
   /** A replacement copy source, when the body was the only one. */
   copyText?: string;
+  /** Whether the card hides the generic 「结果」caption (see `ToolFieldsData`). */
+  hideResultCaption?: boolean;
 };
 
 /** One prose entry: the value is drawn verbatim, never re-serialized. */
@@ -1730,6 +1746,227 @@ function runCodeCard(input: unknown, failed: boolean): ToolMapping | null {
   return {
     summary: typeof input.description === "string" ? input.description : "",
     args: [{ kind: "code", label: localeText().toolCards.labels.code, value: input.code }],
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* `skill`: the loaded instruction block, untangled from its model-facing frame */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The parts of `renderSkillContent()`'s text that the skill card draws.
+ *
+ * The session never carries the tool's structured value. `skill` returns
+ * `{name, provider, resourceBase, content}` (`dsh-tool-skill/lib/index.js:879-885`),
+ * but its `render` hands the model a single text block
+ * (`dsh-tool-skill/lib/index.js:863`), and `tool/result` has no `value` field —
+ * `ToolResultMessage` is content blocks only. So this text is the only source,
+ * and it is a fixed frame (`dsh-skill/lib/index.js:57-81`):
+ *
+ * ```
+ * <skill_content name="…">
+ * <skill_resources>
+ * <one hint line>
+ * <one English instruction line>
+ * </skill_resources>
+ *
+ * <skill_instructions>
+ * …body…
+ * </skill_instructions>
+ * </skill_content>
+ * ```
+ */
+interface SkillContentText {
+  /** The skill's name, decoded from the `name` attribute. */
+  name: string;
+  /**
+   * The base directory / base URL / opaque resource description, decoded.
+   *
+   * "" for the provider-managed hint, which names a provider and no location.
+   */
+  location: string;
+  /**
+   * The provider, decoded — **only** when the hint itself names it.
+   *
+   * `Resources for this skill are managed by provider "X".` is the one form that
+   * carries a provider (`renderResourceHint`'s `base === undefined` arm); the
+   * directory, URL and opaque-description hints carry the location alone. The
+   * card therefore leaves 提供方 out rather than deriving it from the skill name.
+   */
+  provider: string;
+  /** `<skill_instructions>`'s body, byte for byte: a skill is shown, not translated. */
+  instructions: string;
+}
+
+/** The frame's opening: the name attribute and the resources wrapper, on their own lines. */
+const SKILL_OPEN = /^<skill_content name="([^"]*)">\n<skill_resources>\n/u;
+/** What separates the hint lines from the instruction body. */
+const SKILL_RESOURCES_END = "\n</skill_resources>\n\n<skill_instructions>\n";
+/** The frame's closing, which must be the last thing in the text. */
+const SKILL_TAIL = "\n</skill_instructions>\n</skill_content>";
+/**
+ * The provider-managed hint: the one form that names a provider
+ * (`renderResourceHint`'s `base === undefined` arm).
+ */
+const SKILL_PROVIDER_HINT = /^Resources for this skill are managed by provider "(.*)"\.$/u;
+/** The three hints that name a location instead, and no provider. */
+const SKILL_LOCATION_HINT = /^(?:Base directory for this skill|Base URL for this skill|Resources for this skill): (.*)$/u;
+/**
+ * The second line DSH renders under every hint, one per hint family.
+ *
+ * `renderResourceHint` returns exactly two lines: the hint and one of these
+ * sentences. Pinning them makes the resources block's length and shape part of
+ * the recognised frame, so a text that happens to open with a `Base directory`
+ * line but carries something else beside it falls back instead of being
+ * half-read.
+ */
+const SKILL_HINT_NOTES: ReadonlySet<string> = new Set([
+  "Load referenced resources only as needed.",
+  "Resolve relative paths mentioned by this skill against the base directory before using them. Load referenced resources only as needed.",
+  "Resolve relative URLs mentioned by this skill against the base URL before using them. Load referenced resources only as needed.",
+]);
+
+/**
+ * Decode the entities DSH puts in the skill frame.
+ *
+ * `escapeAttr` escapes `&`, `"` and `<` in the name attribute and `escapeText`
+ * escapes `&`, `<` and `>` in the hint prose, so a skill cannot open or close
+ * the framing tags itself. The card shows the decoded value — a reader never
+ * needs to see `&amp;` — while the copy control still carries the escaped
+ * original. `&amp;` is replaced last: reversing the escaping order is what keeps
+ * a literal `&lt;` in a path reading as `&lt;` instead of `<`.
+ */
+function decodeSkillText(value: string): string {
+  return value
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&amp;", "&");
+}
+
+/**
+ * Read `renderSkillContent()`'s frame, or return null.
+ *
+ * Deliberately strict: the text is the recognised frame or it is nothing. A
+ * missing `<skill_content name="…">` opening, a missing resources wrapper, a
+ * resources block that is not exactly the two lines DSH renders (one known hint
+ * plus its known note), or a missing instruction body all return null — and null
+ * keeps L1's generic card, which prints the text verbatim. A frame DSH changes
+ * later costs the card, never the bytes; the alternative (reading the first
+ * line that looks familiar and guessing the rest) would silently drop part of a
+ * skill.
+ */
+function parseSkillContent(text: string): SkillContentText | null {
+  const open = SKILL_OPEN.exec(text);
+  if (open === null) return null;
+  const hintsEnd = text.indexOf(SKILL_RESOURCES_END, open[0].length);
+  if (hintsEnd < 0) return null;
+  const bodyStart = hintsEnd + SKILL_RESOURCES_END.length;
+  // The tail must be the *last* thing in the text, which is also what makes a
+  // body that happens to contain the closing frame fail closed instead of
+  // cutting the skill in half.
+  const trimmed = text.trimEnd();
+  const bodyEnd = trimmed.lastIndexOf(SKILL_TAIL);
+  if (bodyEnd < bodyStart || bodyEnd !== trimmed.length - SKILL_TAIL.length) return null;
+  // The resources block is exactly two lines: the hint, then its note. Anything
+  // else (an extra line, a missing one, a note DSH does not write) is a shape
+  // this card does not know.
+  const hints = text.slice(open[0].length, hintsEnd).split("\n");
+  if (hints.length !== 2) return null;
+  const hint = hints[0] ?? "";
+  const note = hints[1] ?? "";
+  if (!SKILL_HINT_NOTES.has(note)) return null;
+  let location = "";
+  let provider = "";
+  const managed = SKILL_PROVIDER_HINT.exec(hint);
+  if (managed !== null) {
+    provider = decodeSkillText(managed[1] ?? "");
+  } else {
+    const located = SKILL_LOCATION_HINT.exec(hint);
+    if (located === null) return null;
+    location = decodeSkillText(located[1] ?? "");
+  }
+  const name = decodeSkillText(open[1] ?? "");
+  if (name === "") return null;
+  return {
+    name,
+    location,
+    provider,
+    instructions: text.slice(bodyStart, bodyEnd),
+  };
+}
+
+/**
+ * The first level-1 Markdown heading of a skill's instruction body, or "".
+ *
+ * A skill's body is its own document, and the first `# ` line is the title its
+ * author gave it (`# DSH 多代理编排细节`, `# 共享浏览器`) — a reader-facing name,
+ * while the wire `name` is a lower-kebab identifier chosen for the tool call
+ * (`dsh-orchestration`). Only a real level-1 heading counts: `## x` and `#x`
+ * are not one, and a `# ` line with nothing after it yields "" rather than a
+ * later heading, so the rule stays "the first one, or none".
+ *
+ * Fenced code blocks are body, not document structure: a `# ` line inside one is
+ * a shell comment (`# 安装依赖`), and titling the card with it would name the
+ * skill after its install step. A fence opens and closes on a line starting with
+ * three backticks; headings are read only between fences.
+ */
+function skillHeading(instructions: string): string {
+  let inFence = false;
+  for (const line of instructions.split("\n")) {
+    if (line.startsWith("```")) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+    if (!line.startsWith("# ")) continue;
+    return line.slice(2).trim();
+  }
+  return "";
+}
+
+/**
+ * `skill`'s card: the skill's own title in the head, then its wire name, where
+ * its resources live, who provides it, and the instructions themselves.
+ *
+ * The English around the body (`<skill_content>`, `<skill_resources>`,
+ * `Base directory for this skill: …`, `Resolve relative paths …`,
+ * `<skill_instructions>`) is model-facing prose, not something a phone reader
+ * needs; the body is the answer the call produced, so it stays verbatim and
+ * untranslated. The frame is not lost: `copyText` is the complete original
+ * output and `body` is cleared so the same frame is not printed a second time.
+ *
+ * Name, location and provider are `fact` entries: they sit beside their label on
+ * one line instead of each claiming a label line and a block. The wire name is
+ * kept as a fact even when the head shows the title, because the title is prose
+ * the model wrote and `/name` calls need the identifier.
+ */
+function skillCard(output: unknown, failed: boolean): ToolMapping | null {
+  if (failed || typeof output !== "string") return null;
+  const parsed = parseSkillContent(output);
+  if (parsed === null) return null;
+  const cards = localeText().toolCards.skillCard;
+  const result: ToolFieldEntry[] = [{ kind: "fact", label: cards.name, value: parsed.name }];
+  if (parsed.location !== "") result.push({ kind: "fact", label: cards.location, value: parsed.location });
+  if (parsed.provider !== "") result.push({ kind: "fact", label: cards.provider, value: parsed.provider });
+  if (parsed.instructions !== "") result.push(proseEntry(cards.instructions, parsed.instructions));
+  const title = skillHeading(parsed.instructions);
+  return {
+    // The body's own title when it has one, the wire name otherwise: a skill
+    // without a level-1 heading is still named correctly, just not prettily.
+    summary: title === "" ? parsed.name : title,
+    // The head already names the skill; the call's own `name` argument would
+    // print the same word twice (the name has its own fact row below), and every
+    // other entry comes from the result.
+    args: [],
+    result,
+    receipt: "",
+    // `buildFields` put the whole frame here; the card replaces it.
+    body: "",
+    copyText: output,
+    // Every entry comes from the result half, so the 「结果」caption would be a
+    // heading over the whole card.
+    hideResultCaption: true,
   };
 }
 
@@ -2300,6 +2537,8 @@ function toolMapping(
       return readImageCard(input, failed);
     case "run_code":
       return runCodeCard(input, failed);
+    case "skill":
+      return skillCard(output, failed);
     // The 2026-11-07 batch: the tools that were still anonymous rows.
     case "memory_update":
       return memoryUpdateCard(input, output, failed);
@@ -2920,7 +3159,7 @@ export function toolCallData(
     // Nothing left to draw (an empty member list, say) drops the card instead
     // of mounting an empty one — the head already carries the answer.
     fields = args.length > 0 || result.length > 0 || receipt !== ""
-      ? { args, result, receipt, copyText }
+      ? { args, result, receipt, copyText, hideResultCaption: mapped.hideResultCaption === true }
       : null;
   }
   // A failed team tool's DSH sentence, translated when known, DSH's words kept
