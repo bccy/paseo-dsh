@@ -723,18 +723,22 @@ async function seenPersistenceChecks() {
     equal("…with nothing remembered", persistence.get("agent-1"), undefined);
   }
 
-  // A removed pill starts clean; a re-add can be closed again.
+  // A removal keeps the persisted key (2026-11-09): the signature is the
+  // all-done board's `id:revision` set, so it can only hide the exact board the
+  // user closed. Masking it per session made every removal path (a snapshot
+  // rebuild, a permission retry, a terminal recovery) show that board again.
   {
     const removal = fakeHost({ seen: { "agent-1": KEY } });
     const persistence = createSeenPersistence(removal);
     await persistence.hydrate();
     equal("the document remembers a closed board", persistence.get("agent-1"), KEY);
-    persistence.forget("agent-1");
-    equal("a removed pill starts clean", persistence.get("agent-1"), undefined);
-    equal("…so the board is visible again", teamPillVisible(allDone, persistence.get("agent-1")), true);
-    persistence.remember("agent-1", KEY);
+    equal("a removed pill keeps the persisted key (no per-session mask)", persistence.get("agent-1"), KEY);
+    equal("…so the same all-done board stays hidden after a re-add", teamPillVisible(allDone, persistence.get("agent-1")), false);
+    const newerKey = teamAllDoneKey(allDoneNewer);
+    persistence.remember("agent-1", newerKey);
     await persistence.flush();
-    equal("a new confirmed close is remembered again", persistence.get("agent-1"), KEY);
+    equal("a new confirmed close overwrites the entry", persistence.get("agent-1"), newerKey);
+    equal("…and the older board signature is visible again", teamPillVisible(allDone, persistence.get("agent-1")), true);
   }
 
   // P2-1: a document the host refuses (`invalid`: an older version's envelope, a
@@ -866,7 +870,10 @@ async function seenPersistenceChecks() {
     equal("persistence.remember appears exactly once", (pill.match(/persistence\.remember\(/g) ?? []).length, 1);
     const publishState = pill.slice(pill.indexOf("const publishState"), pill.indexOf("const poller"));
     assert("the poll path (publishState) never writes", !/persistence\.(remember|write)/.test(publishState));
-    assert("a removed pill forgets the persisted fallback", /persistence\.forget\(agentId\)/.test(pill));
+    assert(
+      "the removal path never forgets the persisted fallback (2026-11-09)",
+      !/persistence\.forget\(/.test(pill),
+    );
     assert(
       "the pill wires read/write/reset/warn against the team settings id",
       /settingsRpc\(TEAM_SEEN_SETTINGS_ID\)\.read/.test(pill) &&

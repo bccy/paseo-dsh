@@ -549,8 +549,11 @@ export function contributeGoalPill(client: PluginClientContext) {
       published.set(agent.id, { visible: false, label: text.title, title: text.title });
       store.delete(agent.id);
       answers.delete(agent.id);
-      // A re-added agent starts clean: a previous pill's "seen" must not hide a
-      // goal the user has not been shown since.
+      // A re-added agent starts with no **in-session** seen state: the close
+      // that hid the previous pill belonged to that registration. The persisted
+      // key keeps applying (2026-11-09) — it names the exact completed revision
+      // the user really closed (`goal-<uuid>:revision`), so it cannot hide a goal
+      // the user has not been shown.
       seenStates.delete(agent.id);
     },
     removeAgent: (agentId, reason, error) => {
@@ -561,10 +564,14 @@ export function contributeGoalPill(client: PluginClientContext) {
       answers.delete(agentId);
       published.delete(agentId);
       seenStates.delete(agentId);
-      // Session-only: the persisted fallback must not hide a goal for an agent
-      // this pill was removed from and later re-added (`addAgent` clears the
-      // in-session state for the same reason).
-      persistence.forget(agentId);
+      // The **in-session** memory goes; the persisted one stays (2026-11-09).
+      // A "seen" key is `id:revision` — DSH mints a fresh `goal-<uuid>` per
+      // created goal (`dsh-goal/lib/index.js`), so a remembered key can only
+      // hide the exact completed revision the user closed. Erasing it on every
+      // removal therefore could not prevent showing an unseen goal; it only
+      // made a reconnect / permission retry / terminal recovery show a goal the
+      // user had already read (`docs/GOAL.md`, 2026-11-09 regression). A new
+      // goal or a new mutation is a new key and shows anyway.
       // Dropped rather than kept: the popover must not show a stale goal for an
       // agent this client may not read, or whose runtime cannot serve goals.
       store.delete(agentId);

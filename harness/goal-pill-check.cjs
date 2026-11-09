@@ -1002,6 +1002,282 @@ async function runControllerChecks() {
     equal("a closed agent's pill is removed", harness.calls.removed.map((row) => row[1]), ["gone"]);
     harness.poller.dispose();
   }
+
+  /**
+   * The 2026-11-09 regression: "目标完成点击后，等会又有 pill 按钮了".
+   *
+   * The user closed a completed goal's panel, the confirmed close wrote its
+   * `id:revision` into the host settings and the pill hid — and a few seconds
+   * later it was back. Two client-side memories could lose that fact:
+   *
+   * 1. a websocket reconnect delivers a fresh directory snapshot, and
+   *    `applySnapshot` used to remove *every* agent and re-register the listing
+   *    (this drive's first half);
+   * 2. the removal path itself used to call the persistence controller's
+   *    `forget`, which masked the *persisted* key too — so any removal
+   *    (a snapshot rebuild, a permission retry, a terminal recovery) made the
+   *    completed state unseen again (the second half, after the snapshot rule
+   *    was already a diff).
+   *
+   * This drives the full wiring (poll controller + seen machine + persisted
+   * fallback + the host's visible flag) through that exact sequence: the
+   * snapshot that still lists the agent must not remove anything, the completed
+   * pill must stay hidden across the reconnect, a changed poll answer must not
+   * un-hide it, and the persisted key must outlive a real removal.
+   */
+  console.log("\npoll controller: a snapshot refresh keeps a closed completed goal hidden");
+  {
+    const clock = createFakeClock();
+    const COMPLETE = goal({ phase: "complete", activation: "disarmed", revision: 3 });
+    const KEY = goalSeenKey(COMPLETE);
+    // The host's settings document, in memory, through the real controller.
+    const document = { revision: "rev-1", values: { seen: {} } };
+    const persistence = createSeenPersistence({
+      read: async () => ({
+        status: "ready",
+        revision: document.revision,
+        values: JSON.parse(JSON.stringify(document.values)),
+      }),
+      write: async ({ values }) => {
+        document.revision = "rev-2";
+        document.values = values;
+        return { status: "saved", revision: document.revision, values: document.values };
+      },
+      onError: () => {},
+    });
+    await persistence.hydrate();
+
+    /** agentId -> the completed goal's in-session seen progress (`seenStates`). */
+    const seenStates = new Map();
+    /** agentId -> the last poll answer (`answers`). */
+    const answers = new Map();
+    /** Every host-facing event, in order: registration, removal, publish, visibility. */
+    const events = [];
+    /** The answer the daemon currently gives; a poll change is a new object. */
+    let answer = { available: true, goal: COMPLETE };
+    /** What the pill's `present()` would publish for the current state. */
+    const present = (agentId) => {
+      const current = answers.get(agentId);
+      if (current === undefined) return;
+      const seen = seenStates.get(agentId)?.seen ?? persistence.get(agentId);
+      const presentation = goalPillPresentation(current, seen);
+      events.push(["visible", presentation.visible]);
+    };
+
+    const poller = createGoalPoller({
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout,
+      random: () => 0,
+      readGoal: async () => answer,
+      listAgentPage: async () => ({ entries: [], pageInfo: { hasMore: false, nextCursor: null } }),
+      addAgent(agent) {
+        events.push(["add", agent.id]);
+        seenStates.delete(agent.id);
+        answers.delete(agent.id);
+      },
+      removeAgent(agentId) {
+        events.push(["remove", agentId]);
+        // The pill's removal path: the in-session memory only. The persisted
+        // key survives on purpose (2026-11-09) — it is content-addressed.
+        seenStates.delete(agentId);
+        answers.delete(agentId);
+      },
+      publishState(agentId, state) {
+        events.push(["publish", agentId]);
+        answers.set(agentId, state);
+        present(agentId);
+      },
+      onError() {},
+    });
+
+    const snapshot = () =>
+      poller.applySnapshot({
+        entries: [{ agent: AGENT }],
+        pageInfo: { hasMore: false, nextCursor: null },
+      });
+
+    await snapshot();
+    await clock.advance(0);
+    equal(
+      "the unseen completed goal is registered, polled and shown once",
+      events,
+      [["add", "a"], ["publish", "a"], ["visible", true]],
+    );
+
+    // The user opens the panel, closes it, and `seen-close-gate` confirms it:
+    // the seen machine records the key, `advanceSeen` persists it and re-presents.
+    seenStates.set("a", goalCompleteSeenStep(seenStates.get("a") ?? {}, { kind: "closed", goal: COMPLETE }));
+    persistence.remember("a", seenStates.get("a").seen);
+    present("a");
+    equal("the confirmed close hides the completed pill", events.at(-1), ["visible", false]);
+    equal("…and the key reached the host document", persistence.get("a"), KEY);
+
+    // The reconnect: same directory, fresh snapshot. Nothing was removed, so
+    // the registration and the remembered key are still there.
+    await snapshot();
+    equal("a reconnect snapshot removes no agent that is still listed", events.filter((row) => row[0] === "remove"), []);
+    equal("…and registers nothing twice", events.filter((row) => row[0] === "add").length, 1);
+    equal("…the persisted key survives the snapshot", persistence.get("a"), KEY);
+
+    // The next poll after the reconnect: the goal is unchanged, so the poll
+    // publishes nothing and the pill stays hidden. A re-registered pill has no
+    // publish signature and would show itself again here.
+    const publishesAfterClose = events.filter((row) => row[0] === "publish").length;
+    await clock.advance(LIVE_POLL_MS);
+    equal("an unchanged answer after the reconnect publishes nothing", events.filter((row) => row[0] === "publish").length, publishesAfterClose);
+    equal("the completed pill stays hidden across the reconnect", events.at(-1), ["visible", false]);
+
+    // A poll whose **answer changed** does republish (the dedupe cannot hide
+    // this one), so the seen path itself has to keep the pill hidden: same
+    // completed revision, only its "now" line moved.
+    answer = { available: true, goal: { ...COMPLETE, currentTask: "still shipping" } };
+    await clock.advance(LIVE_POLL_MS);
+    equal(
+      "a changed answer after the reconnect is published again",
+      events.filter((row) => row[0] === "publish").length,
+      publishesAfterClose + 1,
+    );
+    equal("…and the same completed revision stays hidden", events.at(-1), ["visible", false]);
+    equal(
+      "…no poll ever shows it again after the close",
+      events.filter((row) => row[0] === "visible").map((row) => row[1]),
+      [true, false, false],
+    );
+
+    // A real removal drops the in-session state and keeps the persisted key:
+    // the same completed revision the user already closed stays hidden after a
+    // re-add, while anything new has a new key (`goalSeenKey`).
+    poller.drop("a");
+    equal("a real removal keeps the persisted key (content-addressed)", persistence.get("a"), KEY);
+    poller.upsert(AGENT);
+    await clock.advance(0);
+    equal("…so the re-added pill stays hidden for the same revision", events.at(-1), ["visible", false]);
+    answer = { available: true, goal: { ...COMPLETE, revision: 4 } };
+    await clock.advance(LIVE_POLL_MS);
+    equal("…while a new revision is a new key and shows again", events.at(-1), ["visible", true]);
+    poller.dispose();
+    persistence.dispose();
+  }
+
+  console.log("\npoll controller: a snapshot removes only the agents that left");
+  {
+    const B = { id: "b", workspaceId: "ws", provider: "deepseek-harness-native" };
+    const harness = createPollerHarness();
+    await harness.poller.applySnapshot({
+      entries: [{ agent: AGENT }, { agent: B }],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    equal("both agents are registered", harness.calls.added, ["a", "b"]);
+    await harness.poller.applySnapshot({
+      entries: [{ agent: AGENT }],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    equal("an agent the snapshot no longer lists is removed", harness.calls.removed, [["b", "gone", undefined]]);
+    equal("…and the surviving agent keeps its registration", harness.calls.added, ["a", "b"]);
+    equal("…leaving exactly one poll timer", harness.clock.pendingDelays().length, 1);
+    harness.poller.dispose();
+  }
+
+  console.log("\npoll controller: an upsert during pagination is not removed by the diff");
+  {
+    let release = () => {};
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const harness = createPollerHarness({
+      listAgentPage: async () => {
+        await gate;
+        return { entries: [{ agent: AGENT }], pageInfo: { hasMore: false, nextCursor: null } };
+      },
+    });
+    const snapshot = harness.poller.applySnapshot({
+      entries: [{ agent: AGENT }],
+      pageInfo: { hasMore: true, nextCursor: "cursor-1" },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    // The host pushes a brand-new agent while page two is still in flight.
+    harness.poller.upsert({ id: "new-agent", workspaceId: "ws", provider: "deepseek-harness-native" });
+    release();
+    await snapshot;
+    equal("the agent pushed mid-snapshot is not removed", harness.calls.removed, []);
+    equal("…and keeps the pill the upsert gave it", harness.calls.added, ["a", "new-agent"]);
+    harness.poller.dispose();
+  }
+
+  console.log("\npoll controller: the older snapshot's completion does not close the newer one's window");
+  {
+    // A reconnect can start a second snapshot while the first one is still
+    // paginating. The **older** one finishes first; its `finally` must not clear
+    // the collection window the newer one is still filling (P3-2). The guard is
+    // `inflightListed === listed`: without it, an `upsert` landing in the gap
+    // between the two completions is dropped from the newer snapshot's retention
+    // set and its pill is removed at the end of that snapshot.
+    let releaseOlder = () => {};
+    let releaseNewer = () => {};
+    const olderPage = new Promise((resolve) => {
+      releaseOlder = resolve;
+    });
+    const newerPage = new Promise((resolve) => {
+      releaseNewer = resolve;
+    });
+    const harness = createPollerHarness({
+      listAgentPage: async (cursor) => {
+        await (cursor === "cursor-a" ? olderPage : newerPage);
+        return { entries: [{ agent: AGENT }], pageInfo: { hasMore: false, nextCursor: null } };
+      },
+    });
+    const older = harness.poller.applySnapshot({
+      entries: [{ agent: AGENT }],
+      pageInfo: { hasMore: true, nextCursor: "cursor-a" },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const newer = harness.poller.applySnapshot({
+      entries: [{ agent: AGENT }],
+      pageInfo: { hasMore: true, nextCursor: "cursor-b" },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    releaseOlder();
+    await older;
+    // The host pushes a new agent after the older snapshot ended but while the
+    // newer one is still collecting: only the newer window may accept it.
+    harness.poller.upsert({ id: "new-agent", workspaceId: "ws", provider: "deepseek-harness-native" });
+    releaseNewer();
+    await newer;
+    equal("the agent pushed inside the newer snapshot's window is not removed", harness.calls.removed, []);
+    equal("…and keeps its pill", harness.calls.added, ["a", "new-agent"]);
+    harness.poller.dispose();
+  }
+
+  console.log("\npoll controller: a reconnect snapshot revives a terminal pill");
+  {
+    let answer = { available: false, error: { message: "reload the plugin", code: "bridge_too_old" } };
+    const harness = createPollerHarness({
+      readGoal: async () => {
+        harness.calls.reads += 1;
+        return answer;
+      },
+    });
+    await registerOne(harness);
+    equal("the terminal code removes the pill", harness.calls.removed, [["a", "terminal", "bridge_too_old"]]);
+    equal("…and stops the timer", harness.clock.pendingDelays(), []);
+    // A bare upsert says nothing about the runtime: it must not restart the
+    // failing loop (the rule `harness/jobs-poll-check.cjs` also pins).
+    harness.poller.upsert(AGENT);
+    equal("a bare upsert does not re-register a terminal agent", harness.calls.added, ["a"]);
+    equal("…and schedules nothing", harness.clock.pendingDelays(), []);
+    // The directory snapshot is the host re-describing the world after a
+    // reconnect, when a plugin reload may have fixed the bridge: it rebuilds.
+    answer = { available: true, goal: goal({ phase: "complete", revision: 3 }) };
+    await harness.poller.applySnapshot({
+      entries: [{ agent: AGENT }],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    equal("a reconnect snapshot re-registers the terminal agent", harness.calls.added, ["a", "a"]);
+    await harness.clock.advance(0);
+    equal("…it reads the goal again", harness.calls.reads, 2);
+    equal("…and publishes the real answer", harness.calls.states.at(-1)?.[1]?.goal?.phase, "complete");
+    harness.poller.dispose();
+  }
 }
 
 /**
@@ -1159,18 +1435,21 @@ async function seenPersistenceChecks() {
     equal("…with nothing remembered", persistence.get("agent-1"), undefined);
   }
 
-  // A removed pill starts clean; a re-add can be closed again.
+  // A removal keeps the persisted key (2026-11-09): the signature is
+  // content-addressed, so it can only hide the exact completed revision the user
+  // closed. Masking it per session made every removal path (a snapshot rebuild,
+  // a permission retry, a terminal recovery) show that revision again.
   {
     const removal = fakeHost({ seen: { "agent-1": KEY } });
     const persistence = createSeenPersistence(removal);
     await persistence.hydrate();
     equal("the document remembers a closed goal", persistence.get("agent-1"), KEY);
-    persistence.forget("agent-1");
-    equal("a removed pill starts clean", persistence.get("agent-1"), undefined);
-    equal("…so the goal is visible again", visible(persistence.get("agent-1")), true);
-    persistence.remember("agent-1", KEY);
+    equal("a removed pill keeps the persisted key (no per-session mask)", persistence.get("agent-1"), KEY);
+    equal("…so the same completed revision stays hidden after a re-add", hidden(persistence.get("agent-1")), true);
+    persistence.remember("agent-1", goalSeenKey(completeNewer));
     await persistence.flush();
-    equal("a new confirmed close is remembered again", persistence.get("agent-1"), KEY);
+    equal("a new confirmed close overwrites the entry", persistence.get("agent-1"), goalSeenKey(completeNewer));
+    equal("…and the older completed revision is visible again", visible(persistence.get("agent-1")), true);
   }
 
   // P2-1: a document the host refuses (`invalid`: an older version's envelope, a
@@ -1302,7 +1581,22 @@ async function seenPersistenceChecks() {
     equal("persistence.remember appears exactly once", (pill.match(/persistence\.remember\(/g) ?? []).length, 1);
     const publishState = pill.slice(pill.indexOf("const publishState"), pill.indexOf("const poller"));
     assert("the poll path (publishState) never writes", !/persistence\.(remember|write)/.test(publishState));
-    assert("a removed pill forgets the persisted fallback", /persistence\.forget\(agentId\)/.test(pill));
+    // Identifier checks run on comment-stripped source: the pills' comments name
+    // the removed call (`forget`) to explain why it went, and a pin that cannot
+    // tell code from prose would either fail on its own explanation or pass on
+    // one (P3-7).
+    const code = (source) => source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+    assert(
+      "the removal path never calls the persisted-fallback forget",
+      !/persistence\.forget\s*\(/.test(code(pill)),
+    );
+    const persistenceSource = code(
+      fs.readFileSync(path.join(repo, "paseo-plugin/client/seen-persistence.ts"), "utf8"),
+    );
+    assert(
+      "…because the controller has no forget member (interface or implementation)",
+      !/\bforget\b/.test(persistenceSource),
+    );
     assert(
       "the pill wires read/write/reset/warn against the goal settings id",
       /settingsRpc\(GOAL_SEEN_SETTINGS_ID\)\.read/.test(pill) &&

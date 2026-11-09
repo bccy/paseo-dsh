@@ -1,7 +1,10 @@
 /**
  * The poll controller both composer pills drive: one timer per agent, one RPC per
  * timer, terminal errors stop it, a changed answer publishes and an unchanged one
- * does not.
+ * does not. A directory **snapshot refreshes** that set — it keeps every entry the
+ * listing still names and removes only the agents that left (2026-11-09: it used
+ * to tear everything down, and every reconnect then brought a closed completed
+ * pill back; see `applySnapshot`).
  *
  * `jobs-pill.tsx` and `goal-pill.tsx` import the host runtime (React, React
  * Native, the plugin component library), so plain `node` cannot load them and
@@ -303,6 +306,37 @@ export function createAgentPoller<D>(host: AgentPollerHost<D>): AgentPoller {
   };
 
   /**
+   * Drop a `terminal` entry so a fresh registration can be built for it.
+   *
+   * A terminal contract error (`bridge_too_old`, `goal_unavailable`, …) means
+   * "retrying cannot help": the pill is removed and the entry stays in `agents`
+   * flagged `terminal`, which is what keeps a bare `upsert` from restarting the
+   * failing loop (pinned by `harness/jobs-poll-check.cjs`). A **whole new
+   * directory snapshot** is a different statement — the host re-describing the
+   * world after a reconnect, when the runtime may have been fixed since (a
+   * plugin reload is what rewrites an old bridge). It must be able to rebuild
+   * that pill; the old rebuild-everything snapshot path did it by accident, and
+   * the diff path would otherwise leave the agent permanently unpolled.
+   *
+   * Only the snapshot path calls this: `upsert` keeps the terminal entry.
+   */
+  const reviveTerminal = (agentId: string): void => {
+    const entry = agents.get(agentId);
+    if (entry === undefined || !entry.terminal) return;
+    agents.delete(agentId);
+    clearTimer(entry);
+    sequence.invalidate(agentId);
+  };
+
+  /**
+   * The agent ids the **in-flight** directory snapshot has listed so far, if
+   * any. `upsert` adds to it (see `applySnapshot`'s removal diff): an agent the
+   * host pushes while the snapshot is still paginating is newer than the pages
+   * already read, so it must not be mistaken for one the snapshot dropped.
+   */
+  let inflightListed: Set<string> | undefined;
+
+  /**
    * Hand one answer to the host, unless it is the same answer it already has.
    *
    * A poll that found nothing new must not publish: `publishState` rebuilds the
@@ -349,6 +383,11 @@ export function createAgentPoller<D>(host: AgentPollerHost<D>): AgentPoller {
       if (!result.available) {
         const error = result.error ?? { message: host.fallbackErrorMessage };
         if (host.isTerminalErrorCode(error.code)) {
+          // The entry **stays**, flagged `terminal`: that is what keeps a bare
+          // `upsert` (and `pollNow`) from restarting a loop that cannot succeed.
+          // Only a whole new directory snapshot revives it — `reviveTerminal` in
+          // `applySnapshot` — because that is the host re-describing the world
+          // after a reconnect, when a plugin reload may have fixed the runtime.
           entry.terminal = true;
           clearTimer(entry);
           host.removeAgent(entry.agentId, "terminal", error);
@@ -428,47 +467,88 @@ export function createAgentPoller<D>(host: AgentPollerHost<D>): AgentPoller {
     schedule(entry, initialPollDelayMs(random));
   };
 
-  const registerPage = (page: PollAgentPage): void => {
-    for (const { agent } of page.entries) {
-      if (!tombstones.has(agent.id)) register(agent);
-    }
-  };
-
   return {
     async applySnapshot(page: PollAgentPage): Promise<void> {
       if (disposed) return;
       const mine = ++generation;
       tombstones.clear();
-      removeAll();
-      registerPage(page);
-      let hasMore = page.pageInfo?.hasMore === true;
-      let cursor = page.pageInfo?.nextCursor ?? null;
-      let pages = 0;
-      while (hasMore && cursor !== null) {
+      /**
+       * Every agent the snapshot lists, across all of its pages. It is also the
+       * retention set the diff at the end reads.
+       *
+       * A snapshot is a **refresh of the directory, not a teardown of every
+       * pill.** The old code called `removeAll()` here and re-registered the
+       * listing, which removed and re-added every survivor — and the removal
+       * path used to drop the remembered "seen" state *including* the persisted
+       * key (the persistence controller's `forget`, itself removed 2026-11-09).
+       * The first reconnect after the user closed a completed pill's panel
+       * therefore made that pill appear again with the finished state unchanged
+       * (`docs/GOAL.md`, 2026-11-09 regression). Removal is a diff instead: an
+       * entry survives while the snapshot still lists it, so its host
+       * registration, its poll timer and its remembered state all survive too.
+       */
+      const listed = new Set<string>();
+      inflightListed = listed;
+      const registerPage = (one: PollAgentPage): void => {
+        for (const { agent } of one.entries) {
+          if (tombstones.has(agent.id)) continue;
+          listed.add(agent.id);
+          reviveTerminal(agent.id);
+          register(agent);
+        }
+      };
+      try {
+        registerPage(page);
+        let hasMore = page.pageInfo?.hasMore === true;
+        let cursor = page.pageInfo?.nextCursor ?? null;
+        let pages = 0;
+        while (hasMore && cursor !== null) {
+          if (disposed || mine !== generation) return;
+          if (pages >= MAX_AGENT_DIRECTORY_PAGES) {
+            host.onError(`agent directory pagination did not terminate; the ${host.pillLabel} sees only the first pages`);
+            return;
+          }
+          let nextPage: PollAgentPage;
+          try {
+            nextPage = await host.listAgentPage(cursor);
+          } catch (error) {
+            if (!disposed && mine === generation) host.onError("could not read the next page of agents", error);
+            return;
+          }
+          if (disposed || mine !== generation) return;
+          registerPage(nextPage);
+          hasMore = nextPage.pageInfo?.hasMore === true;
+          cursor = nextPage.pageInfo?.nextCursor ?? null;
+          pages += 1;
+        }
         if (disposed || mine !== generation) return;
-        if (pages >= MAX_AGENT_DIRECTORY_PAGES) {
-          host.onError(`agent directory pagination did not terminate; the ${host.pillLabel} sees only the first pages`);
+        if (hasMore && cursor === null) {
+          // An incomplete snapshot is not evidence that any agent left: the rest
+          // of the directory was never read. Keep every pill and say so.
+          host.onError("agent directory reported more pages without a next cursor");
           return;
         }
-        let nextPage: PollAgentPage;
-        try {
-          nextPage = await host.listAgentPage(cursor);
-        } catch (error) {
-          if (!disposed && mine === generation) host.onError("could not read the next page of agents", error);
-          return;
-        }
-        if (disposed || mine !== generation) return;
-        registerPage(nextPage);
-        hasMore = nextPage.pageInfo?.hasMore === true;
-        cursor = nextPage.pageInfo?.nextCursor ?? null;
-        pages += 1;
+      } finally {
+        // Only this snapshot may close its own window: a newer one already
+        // installed its own set, and the `upsert`s it is collecting belong to
+        // that one.
+        if (inflightListed === listed) inflightListed = undefined;
       }
-      if (hasMore && cursor === null && !disposed && mine === generation) {
-        host.onError("agent directory reported more pages without a next cursor");
+      // Only now, with the whole directory in hand, is "not listed" a removal.
+      // Removing per page would delete every pill whose agent sits on a later
+      // one, and an agent pushed by an `upsert` mid-pagination is in `listed`
+      // for the same reason.
+      for (const agentId of [...agents.keys()]) {
+        if (!listed.has(agentId)) remove(agentId, "gone");
       }
     },
 
     upsert(agent: PollAgent): void {
+      // A host push can land while a snapshot is still paginating. That agent is
+      // newer than the pages already read, so it joins the retention set; without
+      // this the diff at the end of the snapshot would remove a pill the host
+      // just told us about, for an agent that is still there.
+      inflightListed?.add(agent.id);
       register(agent);
     },
 

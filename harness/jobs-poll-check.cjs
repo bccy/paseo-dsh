@@ -11,8 +11,11 @@
  *
  * The two scenarios at the top are the bugs review found in the first version:
  *
- * 1. `removeAll` → `register`: the per-agent map was cleared, so the next poll
- *    took the same number again and a stale answer passed the "is it newest" test.
+ * 1. a mass invalidation → `register`: the per-agent numbers were cleared, so
+ *    the next poll took the same number again and a stale answer passed the "is
+ *    it newest" test. (The directory snapshot no longer tears every entry down
+ *    — since 2026-11-09 `applySnapshot` removes the diff and keeps the agents it
+ *    still lists — so this now models a full teardown of the map, e.g. `dispose()`.)
  * 2. `remove` then `register`: `remove` never advanced the number, so an answer in
  *    flight still published into a deleted entry.
  *
@@ -102,11 +105,15 @@ console.log("poll sequence primitives");
   check("another agent's number is not current", sequence.isCurrent("b", second), false);
 }
 
-/* Scenario 1: removeAll() then register() — the snapshot path ----------------- */
+/* Scenario 1: a mass invalidation then register() ---------------------------- */
 
-// registered → poll in flight → snapshot arrives → removeAll() → register() → new
-// poll → the old answer arrives. It must not publish.
-console.log("\nscenario 1: removeAll() then register()");
+// registered → poll in flight → every entry torn down at once → the same id
+// registered again → new poll → the old answer arrives. It must not publish.
+// This is *not* the snapshot path any more: `applySnapshot` removes the diff and
+// keeps every entry the listing still names (2026-11-09, `client/agent-polling.ts`),
+// so the scenario pins the sequence's rule for a full teardown (`dispose()`, or a
+// future snapshot policy that does tear down).
+console.log("\nscenario 1: invalidateAll() then register()");
 
 {
   const sequence = createPollSequence();
@@ -146,7 +153,7 @@ console.log("\nscenario 2: remove() with a poll in flight");
 /* The old algorithm must fail both ------------------------------------------- */
 
 // `const issued = new Map(); seq = (issued.get(id) ?? 0) + 1; current = issued.get(id) === seq`
-// with `removeAll` clearing the map and `remove` doing nothing.
+// with a mass invalidation clearing the map and `remove` doing nothing.
 console.log("\nthe old algorithm must fail the same scenarios");
 
 function createOldSequence() {

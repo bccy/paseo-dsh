@@ -197,6 +197,9 @@ goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等�
   `shared/goal-seen-settings.ts` + `client/seen-persistence.ts`）：**确认关闭**后写一次，客户端 bundle 启动时异步读取、读完前不推送可见性——
   刷新 / 重开 App / 插件 reload、daemon 重启后 complete 不再重显；宿主无插件设置或读写失败时退回内存态（会再出现一次，只 console 一次），
   卸载/重装插件重置一次。读到被拒（corrupt / 版本不符）的文档会 best-effort `reset` 修复（与读共用同一 2s 门限），成功后重新开始记录；修复失败退回内存态。同一 objective 的新目标（新 id）或新 revision 会重新显示。
+- **重连不再清「已读」（2026-11-09 回归修复）**：现象是用户关闭完成面板后 pill「过一会又出现」。先排除了「revision 变了所以键不匹配」这一解释：DSH 只在目标的 durable mutation（create / edit / pause / resume / block / complete / clear）时递增 revision（`dsh-goal/lib/index.js`），一个不再被改动的完成态键是稳定的。问题在**客户端的记忆**，两条路径各丢一次：
+  1. **快照被当成拆除**：`client/agent-polling.ts` 的 `applySnapshot` 原先一进来就 `removeAll()` 再按快照重建，而宿主在**每次 WS 重连**都会重发一份目录快照，于是同一 agent 被「移除→重加」。现在改为**差集移除**：等整份快照（含所有分页）到齐后，只移除新快照里不再出现的 agent；仍被列出的 agent 保留注册、定时器与已读状态。不完整的快照（`hasMore` 但没有 next cursor、分页读失败、被更新的快照取代）一律不移除；分页窗口内由 `upsert` 推送的新 agent 会登记进本次保留集，不会被误删。终态码（`bridge_too_old` / `goal_unavailable`）摘掉的 pill 仍保持「裸 `upsert` 不重启」的既有规则，但**新快照会重建它**（宿主重新描述目录 = 运行时可能已被修好，旧实现靠 `removeAll` 顺带做到这一点）。
+  2. **移除路径抹掉了已读**：移除时调 `persistence.forget`，连**已落盘**的键一起屏蔽，于是重连 / 权限重试 / 终态恢复都会把已读的目标再显示一次。它本来是为了「不要用旧键藏住用户没看过的目标」，但键本身就排除了这种情况——DSH 每个新目标都铸新 `goal-<uuid>`，记下的键只能命中用户确实关过的那个完成 revision。该 API 与两处调用已在 2026-11-09 删除，移除只清内存态（`seenStates.delete`）；新目标或新 revision 自然是新键、照常显示（team pill 同源，同一处修复；team 的键是整板 `task-N:revision` 集合，只在同一 journal 内唯一，见 `docs/TEAM.md`）。
 
 **为什么不做 todo 进度条**：todo 的产生侧不可靠——调查 38 个真实 DeepSeek 会话：20 个从不调
 `todo_write`，9 个只写 1 次（之后不再更新），8 个写 2 次（多在结束前一次性全标完成，其中 3 个
@@ -402,8 +405,8 @@ DSH 判参数非法。两者都在写入前拒绝，目标不受影响（FIELD-N
 | 检查 | 断言 | 依赖 | 触发 |
 |---|---|---|---|
 | `harness/goal-bridge-check.mjs` | 15/15 | **本机 DSH 安装**（从全局安装解析 `@deepseek-ai/*`，`DSH_PACKAGES_DIR`/`DSH_INSTALL_DIR` 可覆盖；没有就 exit 2） | 动 `dsh-bridge/lib/server.js` 的 `paseo/goal` / dispatch |
-| `harness/goal-pill-check.cjs` | 281/281 | 纯模块（`tsc -p harness/goal-pill.tsconfig.json`） | 动 `client/goal-polling.ts`、`client/goal-popover.tsx`、`client/goal-pill.tsx`、`client/goal-running.tsx`、`client/agent-polling.ts`、`shared/goal.ts` 或 locale goal 表 |
-| `harness/goal-popover-render-check.cjs` | 224/224 | `HOST_APP` 指向 Paseo 检出（react-native-web + jsdom 渲染真实面板）；未设置 exit 2 | 动 `client/goal-popover.tsx`、`client/deepseek-mark*.tsx` 或面板用到的 `goal-polling.ts` 规则 |
+| `harness/goal-pill-check.cjs` | 400/400 | 纯模块（`tsc -p harness/goal-pill.tsconfig.json`） | 动 `client/goal-polling.ts`、`client/goal-popover.tsx`、`client/goal-pill.tsx`、`client/goal-running.tsx`、`client/agent-polling.ts`、`shared/goal.ts` 或 locale goal 表 |
+| `harness/goal-popover-render-check.cjs` | 245/245 | `HOST_APP` 指向 Paseo 检出（react-native-web + jsdom 渲染真实面板）；未设置 exit 2 | 动 `client/goal-popover.tsx`、`client/deepseek-mark*.tsx` 或面板用到的 `goal-polling.ts` 规则 |
 | `harness/goal-server-check.cjs` | 39/39 | 真实插件 + 假桥（一次性 `DSH_HOME`） | 动 `server/provider.ts` / `server/session.ts` 的 goal 读写、`server/dsh-process.ts` 的 goal 分级与 `currentTask`、`index.server.ts` 的 handler、桥的缺失服务文案 |
 | `harness/goal-timeline-check.cjs` | 6 组 | 真实 `DshSession` + 假进程传输（`plugin-build.cjs` 自编译） | 动 `server/activity-timeline.ts` 的 goal 行、`server/session.ts` 的重放过滤、`server/locale.ts` 的 `goalRound` |
 

@@ -284,8 +284,11 @@ export function contributeTeamPill(client: PluginClientContext) {
         },
       });
       pills.set(agent.id, { registration, icon: "idle", visible: false, label: text.title, title: text.title });
-      // A re-added agent starts clean: a previous pill's "seen" must not hide a
-      // board the user has not been shown since.
+      // A re-added agent starts with no **in-session** seen state: the close
+      // that hid the previous pill belonged to that registration. The persisted
+      // key keeps applying (2026-11-09) — within this agent's journal it names
+      // the all-done board the user really closed, so it cannot hide a board the
+      // user has not been shown.
       seenStates.delete(agent.id);
       store.delete(agent.id);
     },
@@ -295,10 +298,15 @@ export function contributeTeamPill(client: PluginClientContext) {
       pills.delete(agentId);
       entry.registration.remove();
       seenStates.delete(agentId);
-      // Session-only: the persisted fallback must not hide a board for an agent
-      // this pill was removed from and later re-added — `addAgent` clears the
-      // in-session state for the same reason.
-      persistence.forget(agentId);
+      // The **in-session** memory goes; the persisted one stays (2026-11-09, the
+      // same rule as the goal pill). Within this agent's journal the key (the
+      // all-done board's `id:revision` set) names the board the user closed, and
+      // only that board is hidden; erasing the key on every removal only made a
+      // reconnect / permission retry / terminal recovery show a board already
+      // read. A new task or a new revision is a new signature and shows anyway.
+      // (The task ids are a per-journal counter, so a rewound or re-created
+      // board could in principle mint the same set again — the old mask never
+      // covered that either: it only covered removals.)
       store.delete(agentId);
       if (reason === "unauthorized") {
         console.error(

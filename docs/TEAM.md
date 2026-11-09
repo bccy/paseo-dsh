@@ -22,15 +22,15 @@ DSH 的 `dsh-experimental-agent-team` 给 Lead 会话一个团队：队员（各
 
 | 情况 | 码 | 客户端 |
 |---|---|---|
-| 桥没有 `paseo/projections` | `bridge_too_old` | 终态：移除 pill，console 一行 |
-| `unknown or unavailable projection key: agentTeam`（profile 没挂 agent-team bundle） | `team_unavailable` | 终态：移除 pill（=「这个 profile 没有团队功能」，不是「没有团队」） |
+| 桥没有 `paseo/projections` | `bridge_too_old` | 终态：移除 pill，console 一行；裸 `upsert` 不重启，**重连快照会重建它**（运行时可能已被插件 reload 修好，2026-11-09） |
+| `unknown or unavailable projection key: agentTeam`（profile 没挂 agent-team bundle） | `team_unavailable` | 终态：移除 pill（=「这个 profile 没有团队功能」，不是「没有团队」）；重建规则同上（裸 `upsert` 不重启、**重连快照重建**） |
 | `unknown or not-yet-created session` / 会话 agent 已释放 | `session_missing` | 瞬态：退避重试，保留上次看板 |
 | 其它抛错、形状不符 | `rpc_failed` | 同上 |
 | projection 的 `failure` | 不是错误码 | 面板首行红字（DSH 原文），pill 图标变红；是否隐藏仍按 pill 可见性规则 |
 
 ## pill
 
-- **可见**：只看任务（`tasks.length > 0`）——有任务就显示，没任务一律不显示。2026-11-06 用户决策：起了队员但没建任务时不亮 pill（此时面板只会写「N 名成员 / 暂无共享任务」）；队员数不再参与判断，无看板（`null`）也不显示。**全部任务 `completed` 后只再显示一次，只有点开并关闭面板后才隐藏；不点开时发送新消息不会隐藏**（照 goal 的 seen 机制，UI-v7）：面板关闭（经 `seen-close-gate` 确认）算看过，全部完成后 agent 从 idle 变 running（用户发了下一条消息）**不算**看过；签名 `teamAllDoneKey`（tasks 按 id 排序的 `id:revision`）变化（新增任务 / revision 变化）会重新显示一次。`seen` **持久化在宿主插件设置**（`team-pill-seen`，host scope，`{seen: {agentId: 签名}}`，最多 64 条，见 `shared/team-seen-settings.ts` 与 `client/seen-persistence.ts`，2026-11-08）：每次**确认关闭**把该 agent 的签名写一次，客户端 bundle 启动时异步读取，读取完成前不推送可见性——所以 app / 插件 reload、daemon 重启后已看过的全完成看板仍隐藏，不会先闪一下；宿主没有插件设置（老 Paseo）或读写失败时自动退回内存态（会再显示一次，只 console 一次、不阻塞 pill），卸载/重装插件由宿主删掉设置目录、重置一次，首次读 2s 无响应同样按退回处理。读到被拒（corrupt / 版本不符）的文档会 best-effort `reset` 修复（与读共用同一 2s 门限），成功后重新开始记录；修复失败退回内存态。
+- **可见**：只看任务（`tasks.length > 0`）——有任务就显示，没任务一律不显示。2026-11-06 用户决策：起了队员但没建任务时不亮 pill（此时面板只会写「N 名成员 / 暂无共享任务」）；队员数不再参与判断，无看板（`null`）也不显示。**全部任务 `completed` 后只再显示一次，只有点开并关闭面板后才隐藏；不点开时发送新消息不会隐藏**（照 goal 的 seen 机制，UI-v7）：面板关闭（经 `seen-close-gate` 确认）算看过，全部完成后 agent 从 idle 变 running（用户发了下一条消息）**不算**看过；签名 `teamAllDoneKey`（tasks 按 id 排序的 `id:revision`）变化（新增任务 / revision 变化）会重新显示一次。`seen` **持久化在宿主插件设置**（`team-pill-seen`，host scope，`{seen: {agentId: 签名}}`，最多 64 条，见 `shared/team-seen-settings.ts` 与 `client/seen-persistence.ts`，2026-11-08）：每次**确认关闭**把该 agent 的签名写一次，客户端 bundle 启动时异步读取，读取完成前不推送可见性——所以 app / 插件 reload、daemon 重启后已看过的全完成看板仍隐藏，不会先闪一下；宿主没有插件设置（老 Paseo）或读写失败时自动退回内存态（会再显示一次，只 console 一次、不阻塞 pill），卸载/重装插件由宿主删掉设置目录、重置一次，首次读 2s 无响应同样按退回处理。读到被拒（corrupt / 版本不符）的文档会 best-effort `reset` 修复（与读共用同一 2s 门限），成功后重新开始记录；修复失败退回内存态。**移除 pill（agent 离开 / 无权限 / 终态）只清内存态，已落盘的签名保留**（2026-11-09）：签名只命中用户关过的那块全完成看板，抹掉它只会让重连 / 重试 / 终态恢复后重显示一次；新任务或新 revision 是新签名、照常显示。注意 `task-N` 是 journal 内计数器，同一个签名集合理论上可被 rewind 或重建的看板重新铸出（这一风险在「不移除」的路径上同样存在，旧的 `forget` 只覆盖移除这一条支路）。
   - **「面板关闭」必须是确认过的关闭**（2026-11-06 真机 bug 修复）：宿主打开 popover 时会把内容**重挂载一次**——`AnchoredSurface` 的 `FloatingSurface` 带 `key={placed ? "placed" : "measuring"}`（Paseo 0.15.0 `packages/app/src/components/ui/menu/menu-overlay.tsx:350`，注释在 :265 明说「Remounting on placement…」），先离屏测量再换 key 正式定位。所以 `unmount` 本身不是「用户关了面板」。规则是 `createSeenCloseGate`（`client/seen-close-gate.ts`，与目标 pill 共用，窗口 `SEEN_CLOSE_CONFIRM_MS` = 250ms）：卸载后 250ms 内又挂载 → 取消，不记 seen；卸载后一直没回来 → 记 seen。修复前的实现把任何卸载都当关闭，用户一点开、宿主测量完重挂载，seen 立刻写入 → pill 当场消失、任务板面板根本没显示出来。
   - 顺带：`present()` 只在 `visible` / `label` / `title` / `icon` 真变化时才 `registration.update`（`agent-polling.ts:315-321` 的 `publishIfChanged` 已对**相同答案**去重；这里补的是「看板变了、按钮状态没变」仍会推一次 `update` 的情况，白让宿主重建按钮与 popover 页面）。
 - **文字与 title 恒为「团队」/「Team」**，不带计数（title 同时是读屏名、桌面 tooltip、手机 sheet 标题）。

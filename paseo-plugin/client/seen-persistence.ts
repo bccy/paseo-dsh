@@ -88,8 +88,6 @@ export interface SeenPersistence {
   hydrate(): Promise<void>;
   /** The persisted signature for one agent (pending local writes included); `undefined` when none. */
   get(agentId: string): string | undefined;
-  /** Forget one agent's fallback for this session (a removed pill must not come back pre-seen). */
-  forget(agentId: string): void;
   /** Remember one agent's signature and schedule the document write. Never rejects. */
   remember(agentId: string, signature: string): void;
   /** Await hydration and every scheduled write (tests and teardown only). */
@@ -118,8 +116,6 @@ export function createSeenPersistence(io: SeenSettingsIo, options: SeenPersisten
   let stored: Record<string, string> = {};
   /** Confirmed closes not yet written; they are also the freshest answer for `get`. */
   let pending = new Map<string, string>();
-  /** Agents whose pill was removed this session: their old entry must not hide a re-add. */
-  const forgotten = new Set<string>();
   /** The revision the last read/write answered; `undefined` until a read succeeds. */
   let revision: string | undefined;
   let hydrated = false;
@@ -325,21 +321,23 @@ export function createSeenPersistence(io: SeenSettingsIo, options: SeenPersisten
     ready: () => hydrated,
     hydrate,
     get(agentId: string): string | undefined {
-      const local = pending.get(agentId);
-      if (local !== undefined) return local;
-      return forgotten.has(agentId) ? undefined : stored[agentId];
-    },
-    forget(agentId: string): void {
-      // Session-only: the host document keeps other agents (and the entry is
-      // harmless once stale), but this agent must start clean if re-added.
-      forgotten.add(agentId);
-      pending.delete(agentId);
+      // A pending confirmed close is the freshest answer, the document the
+      // fallback. There is deliberately **no per-session removal here**
+      // (2026-11-09). A signature names the finished state it hides, and that
+      // naming is narrower for one pill than the other: the goal pill's is
+      // `goal-<uuid>:revision` (a new goal is a new uuid, so it can only be the
+      // revision the user closed), while the team pill's is the all-done board's
+      // `task-N:revision` set — unique within that agent's journal, but the task
+      // ids are a counter, so a rewound or re-created board could in principle
+      // mint the same set again. Masking the key on every removal never guarded
+      // that case (it only covered removals); it just made a reconnect / retry /
+      // terminal recovery show a state the user had already closed. Anything new
+      // is a new signature and shows anyway, and a new confirmed close overwrites
+      // this agent's entry.
+      return pending.get(agentId) ?? stored[agentId];
     },
     remember(agentId: string, signature: string): void {
       if (agentId === "" || signature === "" || disposed) return;
-      // A new confirmed close is the truth for this agent again, including after
-      // the pill was removed and re-added.
-      forgotten.delete(agentId);
       pending.set(agentId, signature);
       enqueueWrite();
     },
