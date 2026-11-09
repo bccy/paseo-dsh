@@ -3,10 +3,13 @@
  *
  * A jobs poll can time out during a long session's open/replay window even on a
  * current, byte-identical bridge (measured: a fresh bridge ignoring the first
- * `paseo/jobs` for a 2700+ step history). The plugin therefore tolerates two
- * consecutive timeouts: both answer a quiet `{available:true, jobs:[]}`, no log,
- * no terminal; only the third consecutive miss is `bridge_too_old` with one
- * latched stderr line. Any answer resets the streak.
+ * `paseo/jobs` for a 2700+ step history). The plugin therefore tolerates
+ * `JOBS_TIMEOUT_TOLERANCE = 8` consecutive timeouts: each answers quietly
+ * (`available:true`, no log, no terminal) with **the last list it actually read**
+ * — never a fabricated `jobs: []`, which would claim "nothing is running" for a
+ * registry that was only unreachable (2026-11-10). The ninth consecutive miss is
+ * `bridge_too_old` with one latched stderr line; any answer resets the streak, and
+ * an `available:false` answer does not overwrite the carried list.
  *
  * This drives the **real** `DshProcess` class with a real spawned fake child
  * (the same stdio JSON-RPC surface `dsh --profile` speaks), not a stub of the
@@ -59,6 +62,14 @@ process.stdin.on("data", (chunk) => {
       if (mode === "unknown") {
         // The bridge's unknown-method reply (the shape this repo's bridge uses).
         process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: frame.id, error: { code: -32601, message: "unknown paseo bridge method: paseo/jobs" } }) + "\\n");
+        continue;
+      }
+      if (mode === "jobs") {
+        // A readable answer with a real background job, so the tolerated-timeout
+        // answer can be asserted to carry it (2026-11-10).
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: frame.id, result: { available: true, jobs: [
+          { id: "jobs-probe", kind: "bash", label: "sleep 5", status: "running", startedAt: 1 },
+        ] } }) + "\\n");
         continue;
       }
       process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: frame.id, result: { available: true, jobs: [] } }) + "\\n");
@@ -173,6 +184,44 @@ const TIMEOUT_MS = 60;
       unknownThenFirst.available === true && unknownThenSecond.available === true &&
       logs.length === 1,
     JSON.stringify({ unknown, first: unknownThenFirst, second: unknownThenSecond, logs: logs.length }),
+  );
+
+  // 2026-11-10 (review P2-3): the tolerated window must not fabricate state.
+  // 1) it carries the last readable list; 2) an `available:false` answer does not
+  // overwrite that list; 3) a detached session does not lend it out.
+  logs.length = 0;
+  setMode("jobs");
+  const withJob = await proc.jobs("probe", TIMEOUT_MS);
+  check(
+    "a readable answer with a job reports it",
+    withJob.available === true && withJob.jobs?.length === 1 && withJob.jobs[0].id === "jobs-probe",
+    JSON.stringify(withJob),
+  );
+  setMode("hang");
+  const carried = await proc.jobs("probe", TIMEOUT_MS);
+  check(
+    "a tolerated timeout carries the same job instead of an empty list",
+    carried.available === true && carried.jobs?.length === 1 && carried.jobs[0].id === "jobs-probe",
+    JSON.stringify(carried),
+  );
+  setMode("registry");
+  const registryAfterJob = await proc.jobs("probe", TIMEOUT_MS);
+  setMode("hang");
+  const carriedAfterRegistry = await proc.jobs("probe", TIMEOUT_MS);
+  check(
+    "an unreadable answer does not overwrite the last known list",
+    registryAfterJob.available === false &&
+      registryAfterJob.jobs?.length === 0 &&
+      carriedAfterRegistry.available === true &&
+      carriedAfterRegistry.jobs?.[0]?.id === "jobs-probe",
+    JSON.stringify({ registryAfterJob, carriedAfterRegistry }),
+  );
+  proc.detachSession("probe");
+  const afterDetach = await proc.jobs("probe", TIMEOUT_MS);
+  check(
+    "after detachSession a tolerated timeout carries no stale list",
+    afterDetach.available === true && afterDetach.jobs?.length === 0 && logs.length === 0,
+    JSON.stringify({ afterDetach, logs: logs.length }),
   );
 
   await proc.shutdown().catch(() => undefined);

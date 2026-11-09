@@ -1625,6 +1625,30 @@ export class DshProcess {
    */
   #consecutiveJobsTimeouts = 0;
   /**
+   * The last jobs answer this process read successfully, by session.
+   *
+   * The timeout tolerance in {@link jobs} answers a **tolerated** timeout without
+   * claiming anything new. It used to fabricate `jobs: []`, which the client
+   * draws as "nothing is running": a running job's pill would disappear for the
+   * duration of the tolerated window (up to ~148 s) and the next readable answer
+   * would bring it back — one code-level path by which the pill can disappear
+   * and come back (no such window is in the logs we have; the fabricated list is
+   * wrong on its own terms, which is why it is fixed). Carrying the last answer
+   * we actually read keeps the count where it was; the client's
+   * answer-signature dedup then publishes nothing, so the pill does not even
+   * repaint.
+   *
+   * **Tradeoff, recorded:** a tolerated timeout now also carries a job that
+   * settled during the window, so a finished job can stay counted for at most
+   * ~148 s (8 × 15 s reads + 7 × 4 s polls). The alternative was claiming "no
+   * jobs" for a session whose registry we could not read at all.
+   *
+   * Keyed per session because jobs are per session; cleared by `detachSession`.
+   * Only `available: true` answers are remembered — an unreadable registry is not
+   * a job list.
+   */
+  #lastJobs = new Map<string, readonly DshJob[]>();
+  /**
    * Whether the "this bridge has no paseo/goal" line has been logged.
    *
    * Latched for the same reason as {@link #warnedJobsUnsupported}: the goal pill
@@ -1800,6 +1824,12 @@ export class DshProcess {
    * @param sessionId - the session to detach; unknown ids are ignored.
    */
   detachSession(sessionId: string): void {
+    // The last known jobs answer belongs to this session's registry; a closed
+    // session must not lend it to a tolerated timeout after a later open. Deleted
+    // before the handler check below: a session can be polled for jobs without
+    // this process ever holding a handler for it, and that poll still filled the
+    // cache.
+    this.#lastJobs.delete(sessionId);
     for (const pending of this.#approvalRequests.values()) {
       if (pending.sessionId === sessionId) pending.controller.abort();
     }
@@ -2405,6 +2435,9 @@ export class DshProcess {
       // Any answer ends the timeout streak — including an `available:false`
       // registry read: the bridge talked, so "it is not answering" is over.
       this.#consecutiveJobsTimeouts = 0;
+      // Only a readable answer becomes the "last known" list a tolerated timeout
+      // carries (see {@link #lastJobs}).
+      if (result.available) this.#lastJobs.set(sessionId, result.jobs ?? []);
       return result;
     } catch (error) {
       // No answer at all within the short jobs budget. Two shapes reach here:
@@ -2421,12 +2454,13 @@ export class DshProcess {
         if (this.#consecutiveJobsTimeouts <= JOBS_TIMEOUT_TOLERANCE) {
           // The bridge is not answering yet, but a fresh bridge opening a long
           // session legitimately misses the first polls while its replay runs.
-          // Eight silent retries keep the pill hidden instead of banning jobs for
-          // the rest of the process; the next poll decides. This deliberately
-          // reports an empty list for a read we could not complete — the
-          // tradeoff (no error pill, but also no jobs) is FIELD-NOTES #95's
-          // recorded choice for the startup window only.
-          return { available: true, jobs: [] };
+          // Eight silent retries keep the pill usable instead of banning jobs for
+          // the rest of the process; the next poll decides. The answer carries
+          // the **last list we actually read** (empty before the first success):
+          // a timeout adds no information, so it must not claim the session has
+          // no jobs. A job that settled during the window stays counted until
+          // the next readable answer — at most ~148 s (see {@link #lastJobs}).
+          return { available: true, jobs: [...(this.#lastJobs.get(sessionId) ?? [])] };
         }
         if (!this.#warnedJobsUnresponsive) {
           this.#warnedJobsUnresponsive = true;

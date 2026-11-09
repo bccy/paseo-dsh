@@ -54,6 +54,7 @@ const path = require("node:path");
 const {
   orderJobs,
   splitJobs,
+  settleDownJobs,
   jobsList,
   JOB_ERROR_CODES,
   TERMINAL_JOB_ERROR_CODES,
@@ -313,8 +314,13 @@ console.log("\npopover groups (live rows vs the foldable finished section)");
 
 // CJ-01, route 2: the pill is a **live indicator**. A session with no running /
 // stopping job hides it, however much settled history the registry retains; the
-// label is the live count, never an idle total. The static mark is reserved for
-// the one state baseline 2f71225 kept visible with it: an unreadable registry.
+// label is the live count, never an idle total.
+//
+// 2026-11-10: **visibility is a statement about jobs, never about a read.** A
+// failed read that carries no known live job hides, like any empty answer; a
+// failed read that carries a known live job keeps the pill and its count. The
+// static mark is reserved for an unreadable registry with nothing to show (a
+// hidden slot), matching baseline 2f71225.
 console.log("\nthe pill's presentation (live-only, ring-only)");
 {
   const settledOnly = jobsPillPresentation({
@@ -339,26 +345,47 @@ console.log("\nthe pill's presentation (live-only, ring-only)");
   equal("an empty session has the neutral title", empty.label, { kind: "title" });
 
   const unreadable = jobsPillPresentation({ available: false, jobs: [] });
-  check("an unreadable registry stays visible", unreadable.visible, true);
+  // 2026-11-10: an unreadable answer is a statement about the *read*, not about
+  // jobs. With no known live row it must hide, exactly like a readable empty
+  // answer — otherwise one flaky RPC brings the pill back after it legitimately
+  // hid, and keeps it up while the failure persists. Those are the two halves of
+  // the user's "不消失 / 消失后重复出现".
+  check("an unreadable registry with no known job hides the pill", unreadable.visible, false);
   // Baseline 2f71225 draws the static mark for `available: false`; that one
-  // exception is kept. A turning ring there would claim progress that is not
-  // happening, so the baseline mark is the correct one.
+  // exception is kept (in a hidden slot). A turning ring there would claim
+  // progress that is not happening.
   check("an unreadable registry keeps the baseline static mark", unreadable.icon, "static");
   equal("an unreadable registry has the neutral title", unreadable.label, { kind: "title" });
+
+  // The positive control: the same failed read *carrying* the last known live job
+  // is still a running job. It must keep the pill and its count, or the rule above
+  // would hide real work.
+  const unreadableWithLive = jobsPillPresentation({
+    available: false,
+    jobs: [{ status: "running" }, { status: "completed" }],
+  });
+  check("a failed read that carries a live job keeps the pill", unreadableWithLive.visible, true);
+  check("…with the ring (the job runs; the read is what failed)", unreadableWithLive.icon, "spinner");
+  equal("…and counts that live job", unreadableWithLive.label, { kind: "live", count: 1 });
 
   // The environment case: an old or unresponsive bridge cannot serve jobs at
   // all. The poller has already stopped on the terminal code; if the same answer
   // ever reaches a published state it must not leave a permanent error pill —
   // that was the user-reported "no tasks but always a 后台 pill" (FIELD-NOTES
-  // #95). A runtime answer still shows the error pill ("could not read" must
-  // never look like "nothing here").
+  // #95). The predicate stays checkable on its own.
   const oldBridge = jobsPillPresentation({ available: false, jobs: [], code: "bridge_too_old" });
   check("an old/unresponsive bridge hides the pill", oldBridge.visible, false);
   check("…and keeps the static mark in the hidden slot", oldBridge.icon, "static");
   const registryMissing = jobsPillPresentation({ available: false, jobs: [], code: "registry_missing" });
-  check("a missing job registry still shows the error pill", registryMissing.visible, true);
+  check("a missing job registry hides like any other failed read", registryMissing.visible, false);
   const transientFailure = jobsPillPresentation({ available: false, jobs: [], code: "rpc_failed" });
-  check("a transient read failure still shows the error pill", transientFailure.visible, true);
+  check("a transient read failure hides like any other failed read", transientFailure.visible, false);
+  const oldBridgeWithLive = jobsPillPresentation({
+    available: false,
+    jobs: [{ status: "running" }],
+    code: "bridge_too_old",
+  });
+  check("the environment code hides even a carried live row (the poller has stopped)", oldBridgeWithLive.visible, false);
   check("only bridge_too_old is an environment (hiding) code", isBridgeEnvironmentJobsError("bridge_too_old"), true);
   check("registry_missing is not an environment (hiding) code", isBridgeEnvironmentJobsError("registry_missing"), false);
 
@@ -386,7 +413,9 @@ console.log("\nthe pill's presentation (live-only, ring-only)");
     ["one stopping", { available: true, jobs: [{ status: "stopping" }] }],
     ["running + stopping + settled", { available: true, jobs: [{ status: "running" }, { status: "stopping" }, { status: "completed" }] }],
     ["nine running", { available: true, jobs: Array.from({ length: 9 }, () => ({ status: "running" })) }],
-    ["an unreadable registry", { available: false, jobs: [] }],
+    // A failed read carrying a live job is visible (2026-11-10); the failure
+    // alone is not (that is the assertion above).
+    ["a failed read carrying a live job", { available: false, jobs: [{ status: "running" }] }],
   ];
   for (const [lang, text] of Object.entries(LANGS)) {
     for (const [what, answer] of visibleAnswers) {
@@ -404,6 +433,92 @@ console.log("\nthe pill's presentation (live-only, ring-only)");
     "OLD: history-visible keeps a settled-only pill visible, unlike route 2",
     oldVisible([{ status: "completed" }]) !== settledOnly.visible,
   );
+}
+
+// ── The settlement latch ─────────────────────────────────────────────────
+  // A **defensive** monotonicity guard (2026-11-10, review P2-4): DSH settles a
+  // job once and the controller's in-flight/sequence guards already reject an
+  // answer a newer poll superseded, so no observed answer has reported a settled
+  // job as running. The latch covers only the paths those guards cannot see (a
+  // bridge replaying a long open window, a second connection for the same agent)
+  // and is kept because the symptom it would produce is the pill coming back
+  // after the user watched the job finish.
+  console.log("\nthe settlement latch (a settled job cannot run again)");
+  {
+    const running = { id: "bash-1", status: "running", startedAt: 100 };
+    const completed = { id: "bash-1", status: "completed", startedAt: 100, finishedAt: 200 };
+
+    const first = settleDownJobs([running], new Map());
+    equal("a running job is passed through", first.jobs, [running]);
+    equal("…and is not latched yet", [...first.settled.keys()], []);
+
+    const settled = settleDownJobs([completed], first.settled);
+    equal("a settled job is passed through unchanged", settled.jobs, [completed]);
+    equal("…and is remembered by id", [...settled.settled.keys()], ["bash-1"]);
+    check("…with its real outcome", settled.settled.get("bash-1").status, "completed");
+
+    const regressed = settleDownJobs([running], settled.settled);
+    equal("a later 'running' for the same id is projected back to its settled row", regressed.jobs, [completed]);
+    equal("…so the latch does not grow again", [...regressed.settled.keys()], ["bash-1"]);
+
+    // The positive control: a *new* job is a new id and must appear immediately.
+    const secondJob = { id: "bash-2", status: "running", startedAt: 300 };
+    const both = settleDownJobs([regressed.jobs[0], secondJob], regressed.settled);
+    equal("a new job still appears", both.jobs, [completed, secondJob]);
+
+    // Only a *live* claim is corrected: the rule exists to stop a count going back
+    // up, not to overrule a later settled word. A settled→settled change passes
+    // through, and the latch keeps the first settlement it saw.
+    const refinished = settleDownJobs([{ id: "bash-1", status: "failed", startedAt: 100, finishedAt: 400 }], settled.settled);
+    check("a later settled outcome for the same id is passed through", refinished.jobs[0].status, "failed");
+    check("…and the latch keeps the first settlement", refinished.settled.get("bash-1").status, "completed");
+
+    // Rows with no identity cannot be remembered; they pass through so foreign
+    // payloads and fixtures are not silently dropped.
+    const idless = settleDownJobs([{ status: "completed" }], new Map());
+    equal("a row without a string id passes through unlatched", idless.jobs, [{ status: "completed" }]);
+    equal("…and latches nothing", [...idless.settled.keys()], []);
+}
+
+// ── The popover keeps the failed-read note above the rows ─────────────────
+// Review P3-4 (2026-11-10). The failure used to *replace* the list with the
+// error, which is how a transient RPC failure made the sheet look as if the
+// registry had changed. The fix keeps both: the note is rendered before the live
+// rows in the same `<View>`, so a readable failure no longer early-returns.
+console.log("\nthe popover renders the failed-read note above the rows");
+{
+  const candidates = [
+    path.join(__dirname, "..", "client", "jobs-pill.tsx"),
+    path.join(__dirname, "..", "paseo-plugin", "client", "jobs-pill.tsx"),
+    path.join(__dirname, "client", "jobs-pill.tsx"),
+  ];
+  const sourceFile = candidates.find((candidate) => fs.existsSync(candidate));
+  assert("the jobs pill source is reachable from this harness", sourceFile !== undefined, candidates.join(", "));
+  if (sourceFile !== undefined) {
+    const source = fs.readFileSync(sourceFile, "utf8");
+    /**
+     * The anchor is the marker comment **inside the row list**, not the first
+     * `{unavailableNote}` in the file: the note also appears in the row-less
+     * early return (`entry.jobs.length === 0` → note-only body), so a whole-file
+     * `indexOf` stayed green even when the row list lost its copy — a false
+     * green found in review (2026-11-10). Every index below is searched from the
+     * marker, so the row-less branch cannot satisfy them.
+     */
+    const marker = source.indexOf("Above the rows so the failure is readable without scrolling.");
+    const note = marker < 0 ? -1 : source.indexOf("{unavailableNote}", marker);
+    const rows = marker < 0 ? -1 : source.indexOf("{live.map(", marker);
+    assert("the row list's marker comment is present", marker >= 0, sourceFile);
+    assert("the note is rendered after the row list's marker", note > marker, `marker=${String(marker)} note=${String(note)}`);
+    assert(
+      "the note is rendered immediately above the live rows (a note in another branch does not count)",
+      rows > note && note > marker && note - marker < 400,
+      `marker=${String(marker)} note=${String(note)} rows=${String(rows)} gap=${String(note - marker)}`,
+    );
+    assert(
+      "a readable failure does not early-return the rows away",
+      !/if \(entry !== undefined && !entry\.available\) \{/.test(source),
+    );
+  }
 }
 
 // CJ-02: one timer per agent must not become one burst per four seconds. The
@@ -836,6 +951,209 @@ async function runControllerChecks() {
     harness.poller.dispose();
   }
 
+  // ── The two user-reported paths, end to end through the real controller ────
+  // 2026-11-10. Path A "错误态→成功态": a failed read is a fact about the
+  // transport, so it must not invent a pill when the last known answer had
+  // nothing live, and must keep the pill (with the real count) when a job is
+  // live. The state published on failure is what the popover renders, so it must
+  // carry the last known rows instead of replacing them with the error.
+  console.log("\npath A: a failed read never invents a pill");
+  {
+    let answer = { available: true, jobs: [] };
+    let fail = false;
+    /** Advance to the next scheduled poll (whatever the backoff is). */
+    const step = async () => {
+      const [delay] = harness.clock.pendingDelays();
+      await harness.clock.advance(delay ?? 0);
+    };
+    const harness = createPollerHarness({
+      readJobs: async () => {
+        harness.calls.reads += 1;
+        if (fail) throw new Error("Stream end encountered");
+        return answer;
+      },
+      random: () => 0,
+    });
+    await harness.poller.applySnapshot({
+      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    const last = () => harness.calls.states[harness.calls.states.length - 1][1];
+    await step();
+    check("the first readable empty answer hides the pill", jobsPillPresentation(last()).visible, false);
+
+    fail = true;
+    await step();
+    equal("the failed read is published (the popover can say so)", last().available, false);
+    equal("…carrying the last known rows, not a fabricated list", last().jobs, []);
+    check("…and does not make the pill appear", jobsPillPresentation(last()).visible, false);
+
+    // Path B: with a real job running, the same failure keeps the pill and its
+    // count — the job is running whether or not the registry answers this poll.
+    fail = false;
+    answer = { available: true, jobs: [{ id: "bash-1", status: "running", startedAt: 1 }] };
+    await step();
+    check("a running job shows the pill", jobsPillPresentation(last()).visible, true);
+    fail = true;
+    await step();
+    equal("the failure carries the running job", last().jobs, answer.jobs);
+    check("…so the pill stays visible", jobsPillPresentation(last()).visible, true);
+    equal("…and keeps the real count", jobsPillPresentation(last()).label, { kind: "live", count: 1 });
+
+    // Recovery with the job settled: the pill hides, and the next failure does
+    // not bring it back.
+    fail = false;
+    answer = { available: true, jobs: [{ id: "bash-1", status: "completed", startedAt: 1, finishedAt: 2 }] };
+    await step();
+    check("the settled answer hides the pill", jobsPillPresentation(last()).visible, false);
+    fail = true;
+    await step();
+    check("a later failure does not bring it back", jobsPillPresentation(last()).visible, false);
+    harness.poller.dispose();
+  }
+
+  // Review P2-1 (2026-11-10): with the pill no longer carrying a failed read,
+  // the console line is the only thing that keeps "could not read" loud instead
+  // of looking like "nothing is running". Exactly one line per entry into the
+  // failed state (not per poll), one on recovery, and none for a terminal code —
+  // the pill's removal already logs exactly one line there.
+  console.log("\nthe failed-read console line");
+  {
+    let mode = "ok";
+    const harness = createPollerHarness({
+      readJobs: async () => {
+        harness.calls.reads += 1;
+        if (mode === "throw") throw new Error("Stream end encountered");
+        if (mode === "unreadable") {
+          return { available: false, jobs: [], error: { message: "registry exploded", code: "rpc_failed" } };
+        }
+        if (mode === "terminal") {
+          return { available: false, jobs: [], error: { message: "reload the plugin", code: "bridge_too_old" } };
+        }
+        return { available: true, jobs: [] };
+      },
+      random: () => 0,
+    });
+    const step = async () => {
+      const [delay] = harness.clock.pendingDelays();
+      await harness.clock.advance(delay ?? 0);
+    };
+    await harness.poller.applySnapshot({
+      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    await step();
+    equal("a readable poll logs nothing", harness.calls.errors, []);
+
+    mode = "throw";
+    await step();
+    equal("entering the failed state logs exactly once", harness.calls.errors.length, 1);
+    equal(
+      "…with the pill's console sentence and the agent id",
+      harness.calls.errors[0][0],
+      "jobs pill: could not read this session's jobs for a; keeping the last known answer until a read succeeds",
+    );
+    equal("…and the underlying message", harness.calls.errors[0][1], "Stream end encountered");
+
+    await step();
+    equal("a repeated failure does not log again", harness.calls.errors.length, 1);
+    mode = "unreadable";
+    await step();
+    equal("a different failure shape in the same state does not log again", harness.calls.errors.length, 1);
+
+    mode = "ok";
+    await step();
+    equal("recovery logs one line", harness.calls.errors.length, 2);
+    equal(
+      "…naming the recovery",
+      harness.calls.errors[1][0],
+      "jobs pill: this session's jobs are readable again for a",
+    );
+    equal("…with no error detail (the sink must not print \"undefined\")", harness.calls.errors[1][1], undefined);
+
+    mode = "terminal";
+    await step();
+    equal("a terminal code adds no unreadable line (removal logs its own)", harness.calls.errors.length, 2);
+    equal("…and removes the pill once", harness.calls.removed.map(([id, reason]) => [id, reason]), [["a", "terminal"]]);
+    harness.poller.dispose();
+  }
+
+  // Path B "job 结算后": **a defensive guard, not a diagnosed regression** — the
+  // fixture (a settled id reported running) is a shape DSH does not produce, and
+  // the controller's sequence guard already rejects a superseded in-flight
+  // answer. The latch covers the paths those guards cannot see; the assertion
+  // pins the intended monotonicity: the stale answer is projected back to the
+  // settled row, so it is identical to the previous one and the controller does
+  // not even publish (no repaint, no pill). A genuinely new job is a new id and
+  // still appears in the same poll.
+  console.log("\npath B: a settled job cannot be resurrected by a later answer");
+  {
+    const answers = [
+      { available: true, jobs: [{ id: "bash-1", status: "running", startedAt: 1 }] },
+      { available: true, jobs: [{ id: "bash-1", status: "completed", startedAt: 1, finishedAt: 2 }] },
+      // The stale read: same id, running again.
+      { available: true, jobs: [{ id: "bash-1", status: "running", startedAt: 1 }] },
+      // The positive control: a new job alongside the settled one.
+      {
+        available: true,
+        jobs: [
+          { id: "bash-1", status: "completed", startedAt: 1, finishedAt: 2 },
+          { id: "bash-2", status: "running", startedAt: 3 },
+        ],
+      },
+    ];
+    let index = 0;
+    const harness = createPollerHarness({
+      readJobs: async () => {
+        harness.calls.reads += 1;
+        return answers[Math.min(index, answers.length - 1)];
+      },
+      random: () => 0,
+    });
+    const step = async () => {
+      const [delay] = harness.clock.pendingDelays();
+      await harness.clock.advance(delay ?? 0);
+    };
+    const last = () => harness.calls.states[harness.calls.states.length - 1][1];
+    await harness.poller.applySnapshot({
+      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
+      pageInfo: { hasMore: false, nextCursor: null },
+    });
+    await step();
+    equal("a running job is counted", jobsPillPresentation(last()).label, { kind: "live", count: 1 });
+
+    index = 1;
+    await step();
+    check("the settled answer hides the pill", jobsPillPresentation(last()).visible, false);
+    const publishedWhenSettled = harness.calls.states.length;
+
+    index = 2;
+    await step();
+    equal("a stale 'running' for the settled id is not published again", harness.calls.states.length, publishedWhenSettled);
+    equal("…and the popover still holds the settled row", last().jobs, answers[1].jobs);
+    check("…so the pill does not reappear", jobsPillPresentation(last()).visible, false);
+
+    index = 3;
+    await step();
+    equal("a new job (new id) still appears", jobsPillPresentation(last()).label, { kind: "live", count: 1 });
+    equal("…with the settled row kept beside it", last().jobs, answers[3].jobs);
+
+    // P3-1 (review): tearing the pill down drops the agent's latch, so a
+    // long-lived client cannot accumulate one entry per agent it ever saw. The
+    // observable proof: after removal + re-registration the same id is read from
+    // the wire again instead of being quietly projected back to settled.
+    harness.poller.drop("a");
+    index = 2;
+    harness.poller.upsert({ id: "a", workspaceId: "ws" });
+    await step();
+    equal(
+      "after a teardown the latch is gone (the re-registration trusts the new answer)",
+      jobsPillPresentation(last()).label,
+      { kind: "live", count: 1 },
+    );
+    harness.poller.dispose();
+  }
+
   // CJ-04 (behaviour): a terminal code removes the pill and stops the timer; a
   // transient code keeps retrying. The pair is the positive control — a
   // controller that stopped on every error would pass the first half alone.
@@ -930,6 +1248,9 @@ async function runControllerChecks() {
     await harness.clock.advance(0);
     equal("a permission refusal stops the pill", harness.calls.removed, [["a", "unauthorized", undefined]]);
     equal("a permission refusal leaves no timer", harness.clock.pendingDelays(), []);
+    // The pill's teardown logs the refusal; the adapter must not add a second line
+    // for the same event (2026-11-10, P2-1).
+    equal("a permission refusal logs no extra unreadable line", harness.calls.errors, []);
     // A reconnect can widen permissions, so the agent is not terminal: a later
     // upsert must build a fresh registration and poll again. Without this half, a
     // controller that simply stopped forever would pass the assertions above.

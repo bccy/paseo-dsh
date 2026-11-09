@@ -20,7 +20,23 @@
  * - {@link createJobsPoller}: the jobs payload adapter. A jobs answer is a
  *   list, a goal answer is one object; the controller is generic over that
  *   payload, so this adapter is what keeps the pill's `{jobs, available, error,
- *   code}` state shape unchanged.
+ *   code}` state shape unchanged. It also applies {@link settleDownJobs} — a
+ *   **defensive** monotonicity guard, not a proven root cause: the controller's
+ *   in-flight/sequence guards already reject superseded answers, and DSH settles
+ *   a job once, so the guard covers only the paths those guards cannot see (a
+ *   bridge replaying a long open window, a second connection for the same agent).
+ *
+ * **Visibility is a statement about jobs, never about a read.** The failure half
+ * of the contract (`available: false`) says the registry could not be read; it
+ * cannot say how many jobs there are. It therefore never creates a pill on its
+ * own — see {@link jobsPillPresentation} and `docs/FIELD-NOTES.md` #95, whose
+ * "no tasks but always a 后台 pill" was the same mistake in a terminal form.
+ *
+ * **A failed read is loud in the log instead.** With the pill no longer carrying
+ * the failure, the adapter writes exactly one console line when an agent enters
+ * the unreadable state (and one when it recovers) — see `createJobsPoller` and
+ * FIELD-NOTES #97. Without that line, "could not read" would look exactly like
+ * "nothing is running", the silent degradation this repo keeps finding.
  *
  * The terminal-code predicate is `isTerminalJobsErrorCode`; the codes come from
  * the shared contract so server and client cannot disagree about which are
@@ -41,7 +57,12 @@ import {
   type PollRemoveReason,
   type PollViewState,
 } from "./agent-polling";
-import { LIVE_JOB_STATUSES, TERMINAL_JOB_ERROR_CODES } from "../shared/jobs";
+import { isPermissionDeniedError } from "./jobs-popover-layout";
+import {
+  LIVE_JOB_STATUSES,
+  TERMINAL_JOB_ERROR_CODES,
+  settleDownJobs,
+} from "../shared/jobs";
 
 export {
   INITIAL_POLL_JITTER_MS,
@@ -72,6 +93,15 @@ export interface JobsViewState<J extends JobLike = JobLike> {
   available: boolean;
   error?: string;
   code?: string;
+}
+
+/**
+ * The shape this module's adapter needs from a job: it must be identifiable and
+ * carry a finish time, or {@link settleDownJobs} cannot keep it settled.
+ */
+export interface JobsJobLike extends JobLike {
+  readonly id: string;
+  readonly finishedAt?: number;
 }
 
 /** The fields of an agent the pill cares about. */
@@ -132,38 +162,49 @@ export function jobsPillCopy(
  * to the popover, not to the composer's trigger. This is the product rule the
  * user set for this surface; it is route 2 of CJ-01.
  *
+ * **Visibility is a statement about jobs, never about a read** (2026-11-10). A
+ * failed read is a fact about the transport, and the answer it carries is the
+ * *last known* job list; it must not invent a pill on its own. Before this rule,
+ * any `available: false` whose code was not `bridge_too_old` was drawn visible,
+ * so a flaky RPC made the pill appear after it had legitimately hidden, and kept
+ * it up while the failure persisted — the two halves of the user's "不消失 /
+ * 消失后重复出现". Counting the carried rows instead means: a failure while
+ * nothing is live hides the pill exactly as a readable empty answer would, and a
+ * failure while a job is live keeps showing that job. The popover (which reads
+ * the same answer) says the read failed and keeps the last known rows below that
+ * note — "could not read" stays loud without pretending to be a job.
+ *
  * **The icon is the turning ring on every readable answer**, visible or hidden.
  * Tracking one constant for the whole readable half means `update()` never
  * swaps a static mark into the slot; the ring is this UI's word for a job
  * surface, and a static icon here would read as "nothing works". The one
- * exception is `available: false`: the pill stays visible so the popover can
- * explain the broken registry, and it keeps baseline 2f71225's static mark
- * because a turning ring would claim progress that is not happening.
+ * exception is an unreadable registry with no known live job: the pill is hidden
+ * anyway, and if that answer were ever published the static mark keeps baseline
+ * 2f71225's "no progress is happening" claim. An unreadable registry that *does*
+ * carry a live row keeps the ring — the job is still running, whatever happened
+ * to the read.
  *
- * **Environment-level terminal errors are the exception to that exception.**
- * `bridge_too_old` means the profile's bridge cannot serve `paseo/jobs` at all
- * (an old or unresponsive process); there is no registry to explain to the user
- * and no job to watch, and the poller has already stopped. Leaving an error pill
- * there is the "no tasks but always a red pill" bug (FIELD-NOTES #95): hide it
- * and let the one console line say what to do. A runtime answer still shows the
- * error pill — `registry_missing`/`rpc_failed` keep the established "could not
- * read ≠ nothing here" rule.
+ * **Environment-level terminal errors stay hidden.** `bridge_too_old` means the
+ * profile's bridge cannot serve `paseo/jobs` at all (an old or unresponsive
+ * process); there is no registry to explain to the user and no job to watch, and
+ * the poller has already stopped. Leaving an error pill there is the "no tasks
+ * but always a red pill" bug (FIELD-NOTES #95): hide it and let the one console
+ * line say what to do. The predicate stays exported so the rule is checkable on
+ * its own, independent of which answer carries the code.
  */
 export function jobsPillPresentation(answer: {
   available: boolean;
   jobs?: readonly JobLike[];
   code?: string;
 }): PillPresentation {
-  const jobs = answer.jobs ?? [];
-  if (!answer.available) {
-    if (isBridgeEnvironmentJobsError(answer.code)) {
-      return { visible: false, icon: "static", label: { kind: "title" } };
-    }
-    return { visible: true, icon: "static", label: { kind: "title" } };
+  if (!answer.available && isBridgeEnvironmentJobsError(answer.code)) {
+    return { visible: false, icon: "static", label: { kind: "title" } };
   }
+  const jobs = answer.jobs ?? [];
   const live = jobs.filter((job) => isLive(job.status)).length;
-  if (live > 0) return { visible: true, icon: "spinner", label: { kind: "live", count: live } };
-  return { visible: false, icon: "spinner", label: { kind: "title" } };
+  const icon: PillIcon = answer.available || live > 0 ? "spinner" : "static";
+  if (live > 0) return { visible: true, icon, label: { kind: "live", count: live } };
+  return { visible: false, icon, label: { kind: "title" } };
 }
 
 /**
@@ -204,8 +245,10 @@ const BRIDGE_ENVIRONMENT_JOB_ERROR_CODES = ["bridge_too_old"] as const;
  *
  * The pill hides for these: the poller has already stopped (terminal), and a
  * permanent per-agent error pill would be the exact "no tasks but always a red
- * pill" complaint. `registry_missing` is deliberately **not** here — that is a
- * runtime answer the user can inspect, so it keeps the visible error pill.
+ * pill" complaint. `registry_missing` is deliberately **not** here — it is a
+ * runtime answer worth one console line, but it is still a failed read: it does
+ * not create a pill either (2026-11-10, see {@link jobsPillPresentation}). The
+ * predicate only says which terminal code the *poller* must stop on.
  *
  * @param code - `error.code` from a jobs answer.
  */
@@ -220,7 +263,7 @@ export function isBridgeEnvironmentJobsError(code: string | undefined): boolean 
  * `{jobs}` payload and the pill module owns the React store and the host
  * registration.
  */
-export interface JobsPollerHost<J extends JobLike = JobLike> {
+export interface JobsPollerHost<J extends JobsJobLike = JobsJobLike> {
   readJobs(agentId: string): Promise<JobsReadResult<J>>;
   /** One more directory page, only when the first snapshot said there is one. */
   listAgentPage(cursor: string): Promise<JobsAgentPage>;
@@ -243,17 +286,88 @@ export type JobsPoller = AgentPoller;
  * controller's generic payload and back, and hands it the jobs terminal-code
  * predicate. Behaviour is the controller's, so a rule fixed there is fixed for
  * both pills.
+ *
+ * **One published answer, with settlements latched.** {@link settleDownJobs} is
+ * applied to every readable answer before it leaves this adapter, so the pill,
+ * its count and the popover all read the same corrected list. The latch is
+ * **defensive**: DSH settles a job once and the controller's in-flight and
+ * sequence guards already reject an answer a newer poll superseded, so no
+ * observed answer has reported a settled job as running. It covers the paths the
+ * guards cannot see (a bridge replaying a long session's open window, a second
+ * connection answering for the same agent after a reconnect). A failed read does
+ * not touch the latch: it carries the previous `data` forward.
+ *
+ * **A failed read is logged, once per entry into the failed state.** The pill
+ * no longer shows itself for a failed read (see {@link jobsPillPresentation}),
+ * so the console line is the only thing that keeps the failure loud — without
+ * it, "the runtime cannot answer" would be indistinguishable from "nothing is
+ * running", which is the silent-degradation shape this repo keeps finding. The
+ * line fires on the transition, not on every 4-second poll; a successful read
+ * logs one recovery line; a terminal code logs nothing here because the pill's
+ * removal already logs exactly one line.
  */
-export function createJobsPoller<J extends JobLike>(host: JobsPollerHost<J>): JobsPoller {
+export function createJobsPoller<J extends JobsJobLike>(host: JobsPollerHost<J>): JobsPoller {
+  /**
+   * Per agent, the rows this client has already seen settled.
+   *
+   * Kept for the contribution's lifetime, not per registration: a reconnect
+   * re-registers the same agent, and the settlement it saw is still a fact. A
+   * new job is a new id, so the latch cannot hide it. Dropped when the pill is
+   * torn down, so a long-lived client does not accumulate an entry per agent it
+   * ever saw.
+   */
+  const settled = new Map<string, ReadonlyMap<string, J>>();
+  /**
+   * Agents whose current read state is "could not read".
+   *
+   * The set is what makes the failure line **one per transition** instead of one
+   * per poll, and its `delete` is the recovery edge. Cleared with the pill.
+   */
+  const unreadable = new Set<string>();
+  const noteUnreadable = (agentId: string, error?: unknown): void => {
+    if (unreadable.has(agentId)) return;
+    unreadable.add(agentId);
+    host.onError(
+      `jobs pill: could not read this session's jobs for ${agentId}; keeping the last known answer until a read succeeds`,
+      error,
+    );
+  };
   const adapter: AgentPollerHost<readonly J[]> = {
     read: async (agentId) => {
-      const result = await host.readJobs(agentId);
-      if (!result.available) return { available: false, error: result.error };
-      return { available: true, data: result.jobs ?? [] };
+      let result: JobsReadResult<J>;
+      try {
+        result = await host.readJobs(agentId);
+      } catch (error) {
+        // The RPC itself failed (transport, daemon restart, a host-side "stream
+        // ended"): still a failed read, still exactly one line. A permission
+        // refusal is excluded — the pill's own teardown logs that line, and two
+        // lines for one event is noise. Rethrown so the controller keeps its
+        // transient backoff and permission handling.
+        if (!isPermissionDeniedError(error)) noteUnreadable(agentId, error);
+        throw error;
+      }
+      if (!result.available) {
+        // A terminal code is the pill-removal path, which logs its own line.
+        if (!isTerminalJobsErrorCode(result.error?.code)) noteUnreadable(agentId, result.error?.message);
+        return { available: false, error: result.error };
+      }
+      if (unreadable.delete(agentId)) {
+        host.onError(`jobs pill: this session's jobs are readable again for ${agentId}`);
+      }
+      const projection = settleDownJobs(result.jobs ?? [], settled.get(agentId) ?? new Map());
+      settled.set(agentId, projection.settled);
+      return { available: true, data: projection.jobs };
     },
     listAgentPage: (cursor) => host.listAgentPage(cursor),
     addAgent: (agent) => host.addAgent(agent),
-    removeAgent: (agentId, reason, error) => host.removeAgent(agentId, reason, error),
+    removeAgent: (agentId, reason, error) => {
+      // The pill is gone: forget both per-agent maps. A later re-registration
+      // starts clean, and a long session cannot grow one latch per agent ever
+      // seen.
+      settled.delete(agentId);
+      unreadable.delete(agentId);
+      host.removeAgent(agentId, reason, error);
+    },
     publishState: (agentId, state: PollViewState<readonly J[]>) => {
       host.publishState(agentId, {
         jobs: state.data,

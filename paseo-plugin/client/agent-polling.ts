@@ -180,12 +180,16 @@ export interface AgentPollerHost<D> {
   /**
    * Whether a transient (non-terminal) failure publishes its own state.
    *
-   * `true` is the jobs behaviour: the pill stays visible and its popover says
-   * "could not read". The goal pill passes `false` because DESIGN §2 says a
-   * transient read error **keeps the last state** — a goal pill that flipped to
-   * "could not read" for one bad poll would look like the goal changed, and a
-   * goal that is still active would seem to have gone away. Terminal codes are
-   * unaffected: they always remove the pill.
+   * publishing (the default) is the jobs behaviour: a transient failure **is published**, so the
+   * popover can carry the runtime's message above the last known rows. Visibility
+   * is not this flag's business — the jobs pill derives its visible flag from the
+   * job data alone (2026-11-10, FIELD-NOTES #97), so a published failure can never
+   * create or keep a pill; this file no longer assumes "failed read ⇒ visible".
+   * The goal pill passes `false` because DESIGN §2 says a transient read error
+   * **keeps the last state** — a goal pill that flipped to "could not read" for
+   * one bad poll would look like the goal changed, and a goal that is still
+   * active would seem to have gone away. Terminal codes are unaffected: they
+   * always remove the pill.
    */
   publishOnTransientError?: boolean;
   /**

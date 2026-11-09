@@ -15,10 +15,14 @@
  * itself (interval, jitter, backoff, terminal errors) lives in `./jobs-polling`
  * so it can be driven by a fake clock instead of reviewed by eye.
  *
- * **What is never shown.** An unreadable registry is not "no jobs": the RPC
- * answers `available: false` with the runtime's own message and the popover says
- * so. A pill that silently disappears when the runtime is broken is the failure
- * this repo keeps finding.
+ * **A failed read does not become a pill.** An unreadable registry is not "no
+ * jobs", but it is not a job either: the RPC answers `available: false`, the pill
+ * keeps whatever job list was last readable (hidden when that list had nothing
+ * live), and the popover puts the runtime's own message above those rows. One
+ * console line marks the transition into and out of the failed state
+ * (`jobs-polling.ts`), so "could not read" stays loud without a pill that appears
+ * and disappears on its own. A pill that silently disappears when the runtime is
+ * broken is still forbidden — the log line is what keeps that from happening.
  *
  * @module dsh-paseo/client/jobs-pill
  */
@@ -411,22 +415,31 @@ function makeJobsPopover(store: JobStore, agentId: string) {
     const text = localeText().jobs;
     const root = popoverRootBox();
 
-    if (entry !== undefined && !entry.available) {
-      return (
-        <View style={root}>
-          <NoteLine theme={theme} compact={layout.compact}>
-            {entry.error ?? text.unavailable}
-          </NoteLine>
-        </View>
-      );
-    }
+    /**
+     * The failed-read note, when there is one.
+     *
+     * It is a **note above the list, not a replacement for it** (2026-11-10).
+     * The store's rows are the last answer that could be read, and a failure is
+     * a fact about the read, not about the jobs: replacing the rows with the
+     * error is what made one transient RPC failure look like the registry had
+     * changed — the same publish the pill reads for its count, so the two
+     * surfaces disagreed on screen ("1 个运行中" over "Stream end encountered").
+     * Keeping both means "could not read" stays loud *and* the user still sees
+     * the job that is running.
+     */
+    const unavailableNote =
+      entry !== undefined && !entry.available ? (
+        <NoteLine theme={theme} compact={layout.compact}>
+          {entry.error ?? text.unavailable}
+        </NoteLine>
+      ) : null;
 
     // The transient guard for a popover whose store row is missing or empty:
     // before the first poll lands, or while a terminal read is about to hide the
     // pill. The pill hides as soon as nothing is live, so this is not an idle
     // "session with history" path; the body must render something rather than
     // throw.
-    if (entry === undefined || entry.jobs.length === 0) {
+    if (entry === undefined || (entry.jobs.length === 0 && unavailableNote === null)) {
       return (
         <View style={root}>
           <NoteLine theme={theme} compact={layout.compact}>
@@ -435,6 +448,9 @@ function makeJobsPopover(store: JobStore, agentId: string) {
         </View>
       );
     }
+    // An unreadable registry with no known job has nothing but the note: never
+    // claim "all finished" for a list we could not read.
+    if (entry.jobs.length === 0) return <View style={root}>{unavailableNote}</View>;
 
     const { live, settled } = splitJobs(entry.jobs);
     // While anything runs, the finished half starts folded; with nothing running
@@ -454,6 +470,8 @@ function makeJobsPopover(store: JobStore, agentId: string) {
 
     return (
       <View style={root}>
+        {/* Above the rows so the failure is readable without scrolling. */}
+        {unavailableNote}
         {/* Live rows first in start order — the thing the user opened this for. */}
         {live.map((job) => (
           <JobRow
@@ -649,8 +667,10 @@ export function contributeJobsPill(client: PluginClientContext) {
     onError: (message, error) => {
       if (lifetime.signal.aborted) return;
       // `console`, not `process.stderr`: this module runs inside the app's client
-      // bundle, where there is no `process`.
-      console.error(`[dsh-paseo] ${message}: ${error instanceof Error ? error.message : String(error)}`);
+      // bundle, where there is no `process`. A recovery line carries no error, so
+      // the suffix is omitted rather than printing "undefined".
+      const detail = error === undefined ? "" : `: ${error instanceof Error ? error.message : String(error)}`;
+      console.error(`[dsh-paseo] ${message}${detail}`);
     },
     setTimeout: (callback, delayMs) => {
       const timer = setTimeout(callback, delayMs);

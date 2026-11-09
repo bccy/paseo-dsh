@@ -3324,7 +3324,8 @@ teammate 复用第二回合，WS 探针应看到 running→completed（此前全
 该 agent 不再轮询）；可接受——4 s 轮询下一份慢答案没有价值，reload 是唯一可行动作。
 ② `client/jobs-polling.ts`：`jobsPillPresentation` 接收 `code`，`bridge_too_old` 环境错误返回
 `visible:false`（静态 mark 留在隐藏槽位）；`rpc_failed` 仍 `visible:true`——保留「读不到 ≠ 没有」
-的既定原则。`registry_missing` 属 terminal：控制器 `removeAgent("terminal")` 直接摘 pill 并只打
+的既定原则。**（2026-11-10 已反转，见 #97：任何失败答案都不再显示或保留 pill；「读不到 ≠ 没有」
+改由「每 agent 每转移一条 console」+ popover 顶部 note 承担。）**`registry_missing` 属 terminal：控制器 `removeAgent("terminal")` 直接摘 pill 并只打
 一条 console，不会走到呈现层（纯函数对它的 visible:true 只是兜底分支）；本改动是同一答案若被
 发布时的呈现兜底。
 
@@ -3419,3 +3420,73 @@ jobs 功能不会自行恢复（但新客户端已隐藏 pill，不再常驻报�
 `active run cancellation was not acknowledged`，日志不再反复出现
 `Timed out interrupting session during cancel`；被 reload 中断的回合在界面上应显示为 canceled
 而不是一直 running。真机由主会话执行。
+
+### 97. 后台任务 pill 失败态自造 pill、结算后复活：可见性只由 jobs 决定，失败只留一条日志
+
+**症状（用户截图）**：composer 的「后台」pill 停在「1 个运行中」不下去；点开「后台任务」面板显示
+`Stream end encountered`；有时它自己消失又自己回来。已按 #95 修过多次仍复发。
+
+**实测取证（2026-11-10）**：
+- **job 没有卡住（快照口径）**。取数方法与时间：2026-11-10T03:51:23+08:00，对该会话日志
+  `~/.dsh/sessions/--home-yywl-apps-paseo-dsh--/b8936a98-…/session.v4.jsonl.zstd` 做
+  `zstd -dc … | grep -c '"type":"job/registered"'`（同法数 `job/settled`）并按 jobId 求差：当时
+  **registered 116 / settled 116 / 未结算 0**；结算延迟 p50 156 ms、max 64.4 s（那条 64 s 是一个
+  后台 grep），cause 全为 `producer`。**这个文件在会话运行期间持续追加**：本轮复审另一次取数是
+  151/149（即取数瞬间恰有 2 个 bash 在跑），说明数字随「当前有几个命令在执行」变化，不能当全量
+  断言。但同一方法在多次取数里都**没有出现「命令早已结束、registry 仍 running」**的形状，所以
+  截图里的「1 个运行中」在那一刻是**真实在跑的 job**，不是 registry 未结算，也不是旧快照。
+- **`Stream end encountered` 在本机找不到产出点**：对 5 个代码根（本仓库、`@getpaseo/cli` dist、DSH 安装含
+  `node_modules/@deepseek-ai`、`~/apps/paseo/packages`）`grep -rlF` 0 命中；3 份 ~10 MB daemon 日志、
+  `~/.dsh/logs`、`paseo plugin logs dsh-paseo` 也是 0。**代码依据**：桥与 provider 的 jobs 错误文案一律
+  带前缀（`dsh-bridge/lib/server.js:3551,3585`；`dsh-process.ts` 的 `BRIDGE_TOO_OLD_MESSAGE` /
+  `BRIDGE_UNRESPONSIVE_MESSAGE`；`provider.ts:2318` 的兜底句），只有客户端 tick 的 catch
+  （`agent-polling.ts:424-429`）会把 RPC 拒绝的 message 原样发布。**无前缀的这句话只能来自客户端侧的
+  RPC/传输失败，不可能来自桥或 provider 的 jobs 应答**——这是推断（依据是前缀规则），确切产出点未找到
+  （宿主 app bundle 不在本机）。
+
+**根因（源码，三条叠加）**：
+1. **失败被当成 jobs 状态发布**：读失败 → `agent-polling.ts:396-404`（transient）/`:424-429`（抛错）
+   publish `available:false`；旧 `jobs-polling.ts:158-162` 把任何非 `bridge_too_old` 的
+   `available:false` 画成 `visible:true`。传输失败没有 code → 按 transient 退避到 30 s
+   （`agent-polling.ts:133-137`）→ 错误 pill 一直在。这是「不消失」。
+2. **popover 用错误替换列表**：旧 `jobs-pill.tsx:414-422` 在 `!available` 时直接 return 一句错误文案，
+   把上次已知的行藏掉。同一次 publish 又驱动 pill 的计数，于是两个界面互相矛盾
+   （pill 记着上一份计数、sheet 显示传输错误）——截图的组合就是这条。这是「重复出现」的观感。
+3. **容忍期伪造空表**：旧 `dsh-process.ts:2421-2429` 在 `JOBS_TIMEOUT_TOLERANCE` 窗口内返回
+   `{available:true, jobs:[]}`，真实 job 在跑时也会先被隐藏，下个成功应答又出现（4 s 级闪烁）。
+
+**修法**：
+1. `jobs-polling.ts` `jobsPillPresentation`：**可见性只由 jobs 数据决定**。失败不再单独造 pill：携带的
+   行里 0 live 就隐藏、有 live 就保留并计真实数；`bridge_too_old` 仍隐藏（#95 语义）；图标只在
+   「不可读且 0 live」用基线静态 mark。
+2. `jobs-polling.ts` 适配器：进入不可读状态时**每 agent 一条** `console`（恢复一条；终态与权限拒绝
+   不补，因为摘 pill 那条日志已经写了）。这是「失败不再造 pill」之后唯一让它保持响亮的地方。
+3. `jobs-pill.tsx` popover：失败时**顶部一行错误 + 下面保留上次已知行**，不再二选一。
+4. `dsh-process.ts`：新增 `#lastJobs`（per session，仅 `available:true` 时更新，`detachSession` 清空），
+   容忍期返回**上次可读列表**而不是伪造空表。
+5. `shared/jobs.ts` 新增 `settleDownJobs`：已结算 id 不再被旧应答报成 running。**这是防御性单调化，
+   不是已证根因**——DSH 一个 id 只结算一次，控制器的 in-flight + sequence 守卫已经挡掉被新轮询超越的
+   旧应答，日志里没有出现「结算后又 running」。它只覆盖守卫看不到的路径（长会话重放的桥、重连后
+   同一 agent 的第二个连接），保留是因为代价 4 行、而症状（job 结算后 pill 又回来）正是本 pill 出现过的
+   状态发散形状。
+
+**代价（明确取舍）**：① 0 live 且读失败时 UI 完全静默（无 pill、无 popover），只剩那条 console；
+② 容忍窗口内已结算的 job 最多再挂 ~148 s（8 × 15 s 读 + 7 × 4 s 轮询），换来「不再假装没有任务」；
+③ `#lastJobs` 只在可读应答时更新，`available:false` 不覆盖缓存。
+
+**验证（离线，2026-11-10）**：`harness/jobs-poll-check.cjs` **203/203**（基线 152/152；+51 条：
+呈现反转与失败携带 live 行、`settleDownJobs` 纯函数、控制器 path A「失败不造 pill」/path B
+「结算后不复活」、失败态日志转移、popover 源码钉）。变异：恢复「失败即 visible」旧规则 →
+**195/203，8 红**；`settleDownJobs` 不回放已结算行 → **198/203，5 红**（含端到端 path B）；
+均还原后 202/202。`harness/jobs-timeout-check.cjs` **13/13**（原 9 条 + 携带列表/不覆盖/脱钩 4 条）。
+`jobs-popover-check.cjs` 插件侧 154/154 离线（exit 2 INCOMPLETE）、161/161 带 `HOST_APP` 但宿主半仍
+INCOMPLETE（`@/styles/density` 既有漂移）。`locale-check` 766/766。`tsc --noEmit` exit 0。
+
+**未验证**：真机 UI 与 plugin reload（按约束未做，重载要用户同意）；`Stream end encountered` 的确切
+产出点；截图里的计数文本不是本插件 pill 能渲染的（本插件 trigger 恒为「后台」，`locale.ts` 的
+`jobs.pillLabel`，代码里没有触发计数），DSH 原生 jobs pill 才有「N 个后台任务运行中」——若截图属
+DSH 原生 UI，则该错误文案在 DSH 侧，插件兜底不覆盖。
+
+**边界**：`provider.ts:2337`「本进程没有该 agent 的连接 → `available:true, jobs:[]`」在重连/插件代际
+切换的窗口里仍可能短暂隐藏真实 job；客户端无法区分「真没有」与「看不到」，要修得在 provider 侧加
+判别字段（本轮写域外）。

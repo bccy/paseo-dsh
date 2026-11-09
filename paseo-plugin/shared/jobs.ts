@@ -126,6 +126,75 @@ export function splitJobs<T extends Pick<Job, "status" | "startedAt" | "finished
 }
 
 /**
+ * A job row's identity and the two fields that decide whether it is still work.
+ *
+ * The minimum {@link settleDownJobs} needs: an id to remember it by, the status
+ * that says live/settled, and the finish time a settled row sorts its history by.
+ */
+export interface SettledJobLike {
+  readonly id: string;
+  readonly status: string;
+  readonly finishedAt?: number;
+}
+
+/**
+ * Whether a status string is one of the live statuses.
+ *
+ * A widened copy of {@link isLiveStatus} for callers that hold a plain `string`
+ * (a job projected from a type that is not `Job`); it reads the same shared list,
+ * so the two cannot disagree about which statuses are live.
+ */
+function isLiveStatusText(status: string): boolean {
+  return (LIVE_JOB_STATUSES as readonly string[]).includes(status);
+}
+
+/**
+ * Keep a settled job settled.
+ *
+ * **A defensive monotonicity guard, not a diagnosed root cause.** DSH mints one
+ * job id per call (`bash-<hex>`) and settles it exactly once, and the poll
+ * controller already rejects an answer a newer poll superseded (in-flight and
+ * global sequence guards). So the common "old answer arrives late" case is
+ * handled there; **no observed answer has reported a settled job as running**
+ * (2026-11-10 logs show 49/49 settled jobs, all `producer`). The projection
+ * covers the paths those guards cannot see — a bridge replaying a long session's
+ * open window, or a second connection answering for the same agent after a
+ * reconnect — and is kept because the cost is four lines while the symptom it
+ * would produce (the pill coming back after the user watched the job finish) is
+ * exactly the kind of state divergence this pill has already shown once.
+ *
+ * If an already-settled id does come back as `running`, the projection carries
+ * the **settled row** forward: the count cannot go back up, the popover keeps the
+ * real outcome (`completed`/`killed`/`failed` and its finish time), and a
+ * genuinely new job — a new id — still appears immediately. Only a *live* claim
+ * is corrected; a later settled word passes through.
+ *
+ * Pure and dependency-free: the adapter owns the latch, the offline harness drives
+ * the rule.
+ *
+ * @param jobs - one jobs answer, in whatever shape the caller's rows have.
+ * @param settled - the rows this caller has already observed settled, by id. A
+ *   row without a string id is passed through unlatched (fixtures and foreign
+ *   payloads have no identity to remember).
+ */
+export function settleDownJobs<T extends SettledJobLike>(
+  jobs: readonly T[],
+  settled: ReadonlyMap<string, T>,
+): { jobs: T[]; settled: ReadonlyMap<string, T> } {
+  if (jobs.length === 0) return { jobs: [], settled };
+  let next: Map<string, T> | undefined;
+  const projected = jobs.map((job) => {
+    if (typeof job.id !== "string") return job;
+    const known = settled.get(job.id);
+    if (known !== undefined) return isLiveStatusText(job.status) ? known : job;
+    if (isLiveStatusText(job.status)) return job;
+    (next ??= new Map(settled)).set(job.id, job);
+    return job;
+  });
+  return { jobs: projected, settled: next ?? settled };
+}
+
+/**
  * One job as the pill draws it.
  *
  * `.strip()` is deliberate: Paseo parses both sides, so an undeclared key would be
@@ -166,8 +235,13 @@ export type Job = z.infer<typeof jobSchema>;
  *   including an agent whose DSH session has not been opened yet, which is an
  *   accurate empty answer rather than a failed read.
  * - **`false`** is reserved for "we could not read the registry", and always
- *   carries a message. The pill stays visible and prints it; collapsing the two
- *   would present an unreadable registry as a quiet "no background jobs".
+ *   carries a message. It is a fact about the *read*, not about jobs: it never
+ *   creates or keeps the pill (2026-11-10 — a failure used to be drawn as a
+ *   visible error pill, which is how a flaky RPC produced "不消失 / 消失后重复
+ *   出现"). The client carries the last readable list forward, keeps the popover
+ *   note, and logs one line per entry into the failed state. Collapsing `false`
+ *   into an empty list would present an unreadable registry as a quiet "no
+ *   background jobs"; that is still forbidden.
  *
  * When `available` is false, `error.code` tells the client whether another poll
  * can help. It is optional so an older server half keeps working: a missing

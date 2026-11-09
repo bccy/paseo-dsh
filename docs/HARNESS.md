@@ -164,14 +164,19 @@
   读本机 `dsh-command-goal/lib/index.js` 的错误字面量逐条确认都有中文，找不到时打印 NOTE，`DSH_COMMAND_GOAL` 可覆盖路径）（实跑 762 条，含团队段与 2026-11-07 的 17 工具标签/图标段，见文末「团队（team）链」）。**动了 `client/locale.ts`、标签表或
   `shared/goal.ts` 的 phase 枚举必跑。**
 - `harness/jobs-poll-check.cjs` — jobs 轮询状态机（假时钟 + 假 RPC + 假目录页，不 import
-  React/host）：可见性（有 live 显示 live 数、无 live 隐藏；图标恒为转环，仅 `available:false`
-  保留基线静态 mark）、间隔（可见/隐藏同为 4s、失败指数退避 8→16→30s）与抖动、首屏 `pageInfo`
+  React/host）：可见性（**只由 jobs 数据决定**：有 live 显示并计数、无 live 隐藏；读失败的
+  `available:false` 不再单独造 pill——0 live 隐藏、携带 live 行仍显示且计数，图标只在「不可读且
+  0 live」用基线静态 mark；FIELD-NOTES #97）、间隔（可见/隐藏同为 4s、失败指数退避 8→16→30s）与抖动、首屏 `pageInfo`
   分页与过期页丢弃、终态错误码停轮询，以及**发布去重**：答案签名
   （`available`/`error`/`code`/`jobs`）未变时不 publish、首答与 `drop` 后重注册必发布、任一
-  真实变化（含 available 回真、错误文案/code 变化）仍发布。**本轮 152 条**（2026-11-08 新增 11 条：
+  真实变化（含 available 回真、错误文案/code 变化）仍发布；还有**失败态日志**（每 agent 每转移
+  一条、重复失败与换文案不重复、恢复一条、终态与权限拒绝不补日志）与**结算单调化**
+  （`settleDownJobs` 纯函数 + 控制器 path A「失败不造 pill」/ path B「结算后不复活」，后者是
+  防御性守卫、不是已证根因）。**本轮 203 条**（152 基线 +51，2026-11-10 呈现反转/失败日志/
+  单调化/两条路径/popover 源码钉；2026-11-08 新增 11 条：
   `paseo/jobs` 超时→terminal `bridge_too_old` 的服务器归类钉 2 条（`NO_ANSWER_PREFIX` +
   `#isBridgeTimeoutError("paseo/jobs")` 与返回 message/code）；呈现规则 6 条（`bridge_too_old`
-  环境错误隐藏 pill、`rpc_failed` 仍显示、`registry_missing` 纯函数可见（实际由控制器 terminal 摘除）、predicate 正反）；控制器 3 条
+  环境错误隐藏 pill、`rpc_failed` 仍显示、`registry_missing` 纯函数可见（实际由控制器 terminal 摘除）、predicate 正反；**2026-11-10 已反转，见 FIELD-NOTES #97**——`rpc_failed`/`registry_missing` 等失败答案都不再显示或保留 pill，改为每转移一条 console）；控制器 3 条
   （超时答案只移除一次=单条 console、无 timer、120 s 无重读）。2026-11-05 新增 22 条：`jobsPillCopy` 在运行中/停止中/混合/九个/registry 读不到五种可见状态 × 中英，pill 文字恒为「后台」/「Background」，返回值只有 `label`、不带数量）：控制器已抽到
   `client/agent-polling.ts`（jobs 与 goal 共用），`client/jobs-polling.ts` 只剩 jobs 适配器；
   多出的 3 条**逐字钉住 jobs 的旧文案**（读失败兜底句、poll 失败日志、分页上限日志）——泛化
@@ -179,15 +184,18 @@
   `client/agent-polling.ts` / `client/poll-sequence.ts` / `client/locale.ts` 的 jobs 表 /
   `shared/jobs.ts` 必跑；`jobs-poll.tsconfig.json` 是它的编译配置。**
 - `harness/jobs-timeout-check.cjs` — `DshProcess.jobs()` 的连续超时策略（真实 `DshProcess` + 自生成
-  假 `dsh` 子进程，真 stdio JSON-RPC，不 stub 方法；**9 条**）：连续前 8 次超时→安静
-  `{available:true, jobs:[]}` 且 0 日志；第 9 次→terminal `bridge_too_old` + 单次 latched 日志；
+  假 `dsh` 子进程，真 stdio JSON-RPC，不 stub 方法；**13 条**）：连续前 8 次超时→安静返回
+  **上次可读列表**（无历史时为空）且 0 日志；第 9 次→terminal `bridge_too_old` + 单次 latched 日志；
   第 10 次不再重复日志；成功应答、`available:false`（registry_missing）应答、unknown-method 应答
-  都清零计数（此后两次超时仍被容忍）。运行：`cd paseo-plugin && npx tsc --noEmit false --outDir .dbg
+  都清零计数（此后两次超时仍被容忍）。2026-11-10 新增 4 条（review P2-3）：成功带 job→超时返回
+  同一 job；`available:false` 不覆盖缓存（其后超时仍带该 job）；`detachSession` 后超时为 `[]`
+  且 0 日志。**取舍**：容忍窗口内已结算的 job 最多再挂 ~148s（8×15s 读 + 7×4s 轮询）。运行：
+  `cd paseo-plugin && npx tsc --noEmit false --outDir .dbg
   --declaration false --module commonjs --moduleResolution node`；`echo '{"type":"commonjs"}' >
   .dbg/package.json`；`cp ../harness/jobs-timeout-check.cjs .dbg/`；`cd .dbg && node
   jobs-timeout-check.cjs`。**动了 `dsh-process.ts` 的 `jobs()` / `JOBS_TIMEOUT_TOLERANCE` /
   `#consecutiveJobsTimeouts` 必跑。**
-- `harness/jobs-popover-check.cjs` — jobs popover 的几何、状态标记、JSX 接线与宿主主题数据（**224 条**；离线半 154 条 + 宿主题半 70 条；2026-11-05：pill 文字经 `jobsPillCopy`、源码不再出现 `liveLabel`；触发图标钉从 `JobsSpinner`/`ListChecks` 改为 `JobsPillIcon`（`SquareTerminal` + 角标环）/`SquareTerminal`；2026-11-08：删除跨 pill 协调器后源码钉改为「`presentation = jobsPillPresentation(next)` 后 `visible = presentation.visible`（无 gate），`update` 发送该 `visible`」+ 源码无 deference 引用；宿主题半在当前 Paseo checkout（含上游 #8748 的 `@/styles/density`）上会因 check 的 vm stub 未覆盖该依赖而失败——HEAD 版同样失败，旧行为是未捕获抛错 exit 1；2026-11-08 起该失败被 catch 成 INCOMPLETE（exit 2，与 `HOST_APP` 未设同语义）；用引入前的宿主快照（`fcbfb4f0d^`）实测全绿 224/224，属既有漂移，与本轮改动无关）；
+- `harness/jobs-popover-check.cjs` — jobs popover 的几何、状态标记、JSX 接线与宿主主题数据（**224 条**；离线半 154 条 + 宿主题半 70 条；2026-11-05：pill 文字经 `jobsPillCopy`、源码不再出现 `liveLabel`；触发图标钉从 `JobsSpinner`/`ListChecks` 改为 `JobsPillIcon`（`SquareTerminal` + 角标环）/`SquareTerminal`；2026-11-08：删除跨 pill 协调器后源码钉改为「`presentation = jobsPillPresentation(next)` 后 `visible = presentation.visible`（无 gate），`update` 发送该 `visible`」+ 源码无 deference 引用；宿主题半在当前 Paseo checkout（含上游 #8748 的 `@/styles/density`）上会因 check 的 vm stub 未覆盖该依赖而失败——HEAD 版同样失败，旧行为是未捕获抛错 exit 1；2026-11-08 起该失败被 catch 成 INCOMPLETE（exit 2，与 `HOST_APP` 未设同语义）；用引入前的宿主快照（`fcbfb4f0d^`）实测全绿 224/224，属既有漂移，与本轮改动无关）；2026-11-10 实测：离线半 **154/154**（exit 2，未设 `HOST_APP`）；设 `HOST_APP=~/apps/paseo` 时 **161/161** 但宿主半仍 INCOMPLETE（同一 `@/styles/density` 漂移，与本轮改动无关）；
   `HOST_APP` 指 Paseo checkout，没有就会跑完但 exit 2。**同上触发条件必跑（需 `HOST_APP`），
   跑法见文件头注释。**
 - `harness/replay-turn-check.cjs` — 重放历史的回合标识：`replayHistory()` 必须把 DSH 日志里的
