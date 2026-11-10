@@ -161,7 +161,7 @@ process.env.DSH_PASEO_PROFILE = PROFILE;
  *
  * Keep the versions in step with doctor's constants: `dsh` reports the build
  * this repository was verified against, on the plugin's 0.2.x line and >=
- * MINIMUM_DSH (0.2.1); `paseo` is >= MINIMUM_PASEO (0.9.2). If doctor raises a
+ * MINIMUM_DSH (0.2.1); `paseo` is >= MINIMUM_PASEO (0.16.0). If doctor raises a
  * minimum past these, raise the stubs with it or case 6 turns red wherever the
  * stub is consulted.
  */
@@ -207,7 +207,9 @@ function stubHostClis() {
     [
       "#!/bin/sh",
       'if [ "$1" = "--version" ]; then',
-      '  echo "0.12.0"',
+      // Must clear the plugin's Paseo floor, which this build raised to 0.16
+      // (composer options moved to `controls`/`providerOptions`).
+      '  echo "0.16.0"',
       'elif [ "$1" = "plugin" ] && [ "$2" = "ls" ]; then',
       // The row doctor looks for: a line starting with `dsh-paseo` whose text
       // carries the word `running`.

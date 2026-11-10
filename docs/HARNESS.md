@@ -179,26 +179,35 @@
   `completeClearHint`「清除后 /goal 将查不到这个目标，无法撤销」且不同于 active 的确认句、`rowLabel` 状态在前）；**控制错误中文表**（DSH/插件拒绝句逐句译文、英文原样、显示保留原文；未知句与未知变量不翻；
   读本机 `dsh-command-goal/lib/index.js` 的错误字面量逐条确认都有中文，找不到时打印 NOTE，`DSH_COMMAND_GOAL` 可覆盖路径）（实跑 762 条，含团队段与 2026-11-07 的 17 工具标签/图标段，见文末「团队（team）链」）。**动了 `client/locale.ts`、标签表或
   `shared/goal.ts` 的 phase 枚举必跑。**
-- `harness/jobs-poll-check.cjs` — jobs 轮询状态机（假时钟 + 假 RPC + 假目录页，不 import
-  React/host）：可见性（**只由 jobs 数据决定**：有 live 显示并计数、无 live 隐藏；读失败的
-  `available:false` 不再单独造 pill——0 live 隐藏、携带 live 行仍显示且计数，图标只在「不可读且
-  0 live」用基线静态 mark；FIELD-NOTES #97）、间隔（可见/隐藏同为 4s、失败指数退避 8→16→30s）与抖动、首屏 `pageInfo`
-  分页与过期页丢弃、终态错误码停轮询，以及**发布去重**：答案签名
-  （`available`/`error`/`code`/`jobs`）未变时不 publish、首答与 `drop` 后重注册必发布、任一
-  真实变化（含 available 回真、错误文案/code 变化）仍发布；还有**失败态日志**（每 agent 每转移
-  一条、重复失败与换文案不重复、恢复一条、终态与权限拒绝不补日志）与**结算单调化**
-  （`settleDownJobs` 纯函数 + 控制器 path A「失败不造 pill」/ path B「结算后不复活」，后者是
-  防御性守卫、不是已证根因）。**本轮 203 条**（152 基线 +51，2026-11-10 呈现反转/失败日志/
-  单调化/两条路径/popover 源码钉；2026-11-08 新增 11 条：
-  `paseo/jobs` 超时→terminal `bridge_too_old` 的服务器归类钉 2 条（`NO_ANSWER_PREFIX` +
-  `#isBridgeTimeoutError("paseo/jobs")` 与返回 message/code）；呈现规则 6 条（`bridge_too_old`
-  环境错误隐藏 pill、`rpc_failed` 仍显示、`registry_missing` 纯函数可见（实际由控制器 terminal 摘除）、predicate 正反；**2026-11-10 已反转，见 FIELD-NOTES #97**——`rpc_failed`/`registry_missing` 等失败答案都不再显示或保留 pill，改为每转移一条 console）；控制器 3 条
-  （超时答案只移除一次=单条 console、无 timer、120 s 无重读）。2026-11-05 新增 22 条：`jobsPillCopy` 在运行中/停止中/混合/九个/registry 读不到五种可见状态 × 中英，pill 文字恒为「后台」/「Background」，返回值只有 `label`、不带数量）：控制器已抽到
-  `client/agent-polling.ts`（jobs 与 goal 共用），`client/jobs-polling.ts` 只剩 jobs 适配器；
-  多出的 3 条**逐字钉住 jobs 的旧文案**（读失败兜底句、poll 失败日志、分页上限日志）——泛化
-  不得改 jobs 用户可见文案。**动了 `client/jobs-pill.tsx` / `client/jobs-polling.ts` /
-  `client/agent-polling.ts` / `client/poll-sequence.ts` / `client/locale.ts` 的 jobs 表 /
-  `shared/jobs.ts` 必跑；`jobs-poll.tsconfig.json` 是它的编译配置。**
+- `harness/jobs-poll-check.cjs` — jobs pill 的**数据层**（**189 条**；假订阅宿主 + 假目录页，不
+  import React/host）：可见性（**只由 jobs 数据决定**：有 live 显示并计数、无 live 隐藏；读失败的
+  `available:false` 不单独造 pill——0 live 隐藏、携带 live 行仍显示且计数，图标只在「不可读且
+  0 live」用基线静态 mark；FIELD-NOTES #97）、`orderJobs`/`splitJobs`、popover 的失败注记源码钉、
+  错误码契约（`jobsSnapshot.event`）、首屏 `pageInfo` 分页与过期页丢弃、**每 agent 一条订阅**
+  （注册开、更新不开第二条、移除释放、释放后推送不再发布）、**发布去重**（答案签名
+  `available`/`error`/`code`/`jobs` 未变不 publish、首答与 `drop` 后重注册必发布、任一真实变化
+  仍发布）、**失败态日志**（每 agent 每转移一条、重复失败与换文案不重复、恢复一条、终态与
+  权限拒绝不补日志）、**结算单调化**（`settleDownJobs` 纯函数 + path A「失败不造 pill」/
+  path B「结算后不复活」）、终态码摘 pill 并释放、host 主动关流（一行日志 + 发布失败态 + 下一个
+  snapshot 重订阅）、权限拒绝按 `unauthorized` 移除且后续 upsert 重注册、投影抛错只丢该答案。
+  2026-11-11（0.16 订阅改造）：轮询节拍/退避/抖动与 `poll-sequence` 的过期答案断言**随计时器搬到
+  `harness/pill-feed-check.cjs`/删除**，控制器改为 `client/agent-subscriptions` 的订阅模型；
+  `client/seen-*` 的写入类断言不在此文件。**动了 `client/jobs-pill.tsx` /
+  `client/jobs-polling.ts` / `client/agent-subscriptions.ts` / `client/locale.ts` 的 jobs 表 /
+  `shared/jobs.ts` / `server/pill-feed.ts` 必跑；`jobs-poll.tsconfig.json` 是它的编译配置。**
+  **2026-11-11 合并 jobstop**：`jobSchema.canStop` 变成必填（读侧也一样），本检查加两条契约断言——
+  没有 `canStop` 的 job 行必须**解析失败**（不许默认 false 把可停的 job 画成不可停），带字段才通过；
+  计数 187 → 189。
+- `harness/pill-feed-check.cjs` — **服务端的共享读器**（`server/pill-feed.ts`，**67 条**；假时钟 +
+  假 read + 假订阅者，纯离线）：首帧快照立即推送、**两个订阅者共一次 read**（第二个窗口只多一次
+  推送）、答案不变不推、`available:false` 作为答案推送且 read 空转不重来、read 抛错走退避
+  （4→8→16→30 s，恢复归零）并**不伪造答案**、终态码推一次后停表（迟到的订阅者拿到该终态、全部
+  释放后新订阅重新读）、`refresh`（`goal.control` 成功后立即重读；在飞时只记一次后续读）、在飞
+  read 期间 abort 不再排 timer、推送抛错的订阅者被摘掉而其余继续、`dispose` 清表。
+  **动了 `server/pill-feed.ts`、`index.server.ts` 的 feed 接线或三个 `*-snapshot` 契约必跑；
+  `pill-feed.tsconfig.json` 是它的编译配置。先红后绿证据：`/tmp/paseo-dsh-orch/push-evidence/`
+  的 mutation1/mutation2 日志（去掉变化才推送 → 2 红；无订阅者不停表 → 2 红）。**
+
 - `harness/jobs-timeout-check.cjs` — `DshProcess.jobs()` 的连续超时策略（真实 `DshProcess` + 自生成
   假 `dsh` 子进程，真 stdio JSON-RPC，不 stub 方法；**13 条**）：连续前 8 次超时→安静返回
   **上次可读列表**（无历史时为空）且 0 日志；第 9 次→terminal `bridge_too_old` + 单次 latched 日志；
@@ -211,9 +220,63 @@
   .dbg/package.json`；`cp ../harness/jobs-timeout-check.cjs .dbg/`；`cd .dbg && node
   jobs-timeout-check.cjs`。**动了 `dsh-process.ts` 的 `jobs()` / `JOBS_TIMEOUT_TOLERANCE` /
   `#consecutiveJobsTimeouts` 必跑。**
+- `harness/jobs-stop-check.mjs` — **终止后台 job 的整条离线链**（2026-11-11，**45 条**；假
+  registry + 假 `dsh` 子进程，不耗 token）。前半驱动**真实 `PaseoHarnessServer`** + 假
+  `ctx.jobs`：`canStop` 只对 `running` 为真（`stopping` 与全部终态为假，且必须是显式布尔）、
+  停止成功回 `{stopped:true, outcome:"requested"}` 且投影为 `stopping`、`kill()` 收到的 caller
+  是本会话、**已结束→`job_finished`、停止中→`job_not_stoppable`、未知/他人 job→两者同为
+  `job_not_found`（不泄露归属）、未打开会话→`session_missing`（且不 materialize 会话、不读
+  registry）、无 registry / registry 抛错→`registry_missing`、producer cancel 抛错→
+  `cancel_failed` 且 job 仍 `running`、**list 与 kill 之间已结算（DSH 回 `already-finished`）→
+  仍回 `job_finished` 并带结算后的行、只调一次 kill**、缺参数→抛 `TypeError`**；后半驱动编译后的插件：`jobs.stop`
+  契约名/入参/`canStop` 必填、桥的每个错误码都在 `JOB_STOP_ERROR_CODES` 里、`DshProcess.stopJob`
+  逐形状映射（成功/`job_finished`/未知码降级为 `rpc_failed`/`stopped` 非布尔拒绝/无 job 的成功/
+  unknown-method→`bridge_too_old`/超时→`rpc_failed`/空对象→`rpc_failed`，并钉住实际发出的
+  帧是 `paseo/jobs/stop {sessionId, jobId}` 且无多余字段）、`stopAgentJob` 无打开会话→
+  `session_missing`。运行：先编译插件到 `.dbg`（见 `jobs-timeout-check` 的同一段命令），
+  `echo '{"type":"commonjs"}' > .dbg/package.json`，再从仓库根 `node harness/jobs-stop-check.mjs`
+  （默认读 `paseo-plugin/.dbg`，`PLUGIN_DBG_DIR` 可覆盖）。**动了 `dsh-bridge/lib/server.js` 的
+  `jobProjection`/`jobsStop` 与 `paseo/jobs` 投影、`dsh-process.ts` 的 `stopJob`/`JobStopResult`
+  归一、`session.ts` 的 `stopJob`、`provider.ts` 的 `stopAgentJob`、`index.server.ts` 的
+  `jobs.stop` 注册、`shared/jobs.ts` 的 `canStop`/`JOB_STOP_ERROR_CODES`/`jobsStop` 必跑。**
+- `harness/jobs-stop-live.mjs` — **真机终止**（2026-11-11，**14 条**，**耗 1 个模型回合**）：
+  真 `dsh --profile paseo`，prompt 让模型用 `run_in_background: true` 起 `sleep 517`，等
+  `paseo/jobs` 出现 `running`（且 `canStop:true`）后发 `paseo/jobs/stop`，断言回 `requested`、
+  立即投影 `stopping`、随后结算为 `killed`（`detail: signal: SIGTERM`）、`pgrep '^sleep 517$'`
+  不再有进程、二次停止回 `job_finished`、未知 id 回 `job_not_found`、未打开会话回
+  `session_missing`。**只停本脚本自己起的 job**（session id 每次新造）。运行：
+  `env -u DSH_HOME node harness/jobs-stop-live.mjs`（一次性克隆 `~/.dsh`，live 只读）。两处
+  必要的自举：① 克隆里 `- id: webserver` 的固定端口改成 `0`（live profile 为书签固定了 GUI
+  端口，第二个进程会 `EADDRINUSE`；`port: 0` 是 profile 自己的并发设置）；② 用
+  `ensurePaseoProfile()` 把**本构建**的内嵌桥装进克隆（live 克隆里是旧桥，首次实测就因此报
+  `unknown paseo bridge method: paseo/jobs/stop`）。**因此跑它之前先
+  `node paseo-plugin/scripts/generate-bridge-assets.mjs` 并编译 `.dbg`；改了桥的 `kill` 链必跑。**
+- `harness/jobs-stop-ui-check.cjs` — **行内停止按钮的行为与接线**（2026-11-11，**105 条**；纯离线，
+  假对象 + 真 locale 表）：设计稿的几何常量（28×28、圆角 6、图标 14、hitSlop 8→44×44、5 s 窗口）；
+  `canStop` 才可停（stopping/终态/缺字段都不可停）；pending 期间重复点击返同一状态（不发第二次请求）；
+  **每行独立**（两行可同时 pending，回答/超时互不影响）；拒绝分级（`job_finished`/`job_not_stoppable`/
+  `job_not_found`/`session_missing` 是**中性提示**，`bridge_too_old`/`registry_missing`/`rpc_failed`/
+  `cancel_failed`/无码抛错保留运行时原句且 tone=error）；成功后**保持 pending 直到推送**（本地不伪造
+  已停止）；推送落地（离开可停集即清态、refusal 提示被下一次推送清掉、timeout 提示在仍可停时保留）；
+  5 s 超时（仍可停→恢复按钮 + 「已发送但仍在运行」，推送已推进→丢弃、不产生迟到提示）；
+  a11y 名（中英模板 + `$` 不解释）；`jobs.stop` 契约（名字、成功/拒绝形状、未知码与空 id 拒绝）；源码钉
+  （popover 拿到 client、`client.rpc(jobsStop, …)`、按钮只挂 `jobStoppable` 行、`disabled={pending}`、
+  `ActivityIndicator`、`Icon name="Square"`、`hitSlop` 常量、`rowActiveFill` + `statusDanger`、
+  `NoteLine tone/numberOfLines`、停止路径不写 store、无字面色值、中英文案齐全且不互抄）。
+  **跑法**：`npx tsc -p ../harness/jobs-stop-ui.tsconfig.json` + `.dbg-stop-ui` 后 `node
+  jobs-stop-ui-check.cjs`。**动了 `client/jobs-pill.tsx`（停止按钮/popover）、
+  `client/jobs-polling.ts`（`jobStop*`/`JOB_STOP_*`）、`client/locale.ts` 的 jobs 停止文案或
+  `shared/jobs.ts` 的 `jobsStop` 必跑。先红后绿证据见 `/tmp/paseo-dsh-orch/jobstop-ui-evidence/`
+  的 mutation-1/2/3 日志。**
 - `harness/jobs-popover-check.cjs` — jobs popover 的几何、状态标记、JSX 接线与宿主主题数据（**224 条**；离线半 154 条 + 宿主题半 70 条；2026-11-05：pill 文字经 `jobsPillCopy`、源码不再出现 `liveLabel`；触发图标钉从 `JobsSpinner`/`ListChecks` 改为 `JobsPillIcon`（`SquareTerminal` + 角标环）/`SquareTerminal`；2026-11-08：删除跨 pill 协调器后源码钉改为「`presentation = jobsPillPresentation(next)` 后 `visible = presentation.visible`（无 gate），`update` 发送该 `visible`」+ 源码无 deference 引用；宿主题半在当前 Paseo checkout（含上游 #8748 的 `@/styles/density`）上会因 check 的 vm stub 未覆盖该依赖而失败——HEAD 版同样失败，旧行为是未捕获抛错 exit 1；2026-11-08 起该失败被 catch 成 INCOMPLETE（exit 2，与 `HOST_APP` 未设同语义）；用引入前的宿主快照（`fcbfb4f0d^`）实测全绿 224/224，属既有漂移，与本轮改动无关）；2026-11-10 实测：离线半 **154/154**（exit 2，未设 `HOST_APP`）；设 `HOST_APP=~/apps/paseo` 时 **161/161** 但宿主半仍 INCOMPLETE（同一 `@/styles/density` 漂移，与本轮改动无关）；
   `HOST_APP` 指 Paseo checkout，没有就会跑完但 exit 2。**同上触发条件必跑（需 `HOST_APP`），
-  跑法见文件头注释。**
+  跑法见文件头注释。** 2026-11-11 实测：离线半 **163/163**（`HOST_APP=~/apps/paseo`，exit 2，宿主半仍是同一 `@/styles/density` 漂移）；源码钉改为「订阅 + 共享控制器」四项（`client.subscribe(jobsSnapshot…)`、`createAgentSubscriptions<readonly Job[], JobsAnswer>`、无 `setInterval`、pill 内无数据 `setTimeout`）。
+  **2026-11-11（停止按钮）**：结构钉按新设计更新——pressable 从 1 个变 2 个（披露头 + 行尾停止按钮），
+  且**按契约而不是按位置**选取（披露头 = 带 `accessibilityState.expanded` 的那个，停止按钮 = 名字带
+  `jobStopA11yLabel`/`jobRowTitle` 的那个）；host icon 同样从 1 个变 2 个（`ChevronRight` + 停止用的
+  `Square`，按 `name` 选取）；`JobRow` 仍断言「行本身无 `onPress`」，停止按钮是它的**子元素**；
+  `NoteLine` 调用点 4→5（新增行内停止提示）；定时器钉子改为「无 `setInterval` + 恰一处 `setTimeout`
+  且由 `JOB_STOP_TIMEOUT_MS` 驱动、答复/卸载都清」。实测 **174/174**（exit 2，同一宿主漂移）。
 - `harness/replay-turn-check.cjs` — 重放历史的回合标识：`replayHistory()` 必须把 DSH 日志里的
   `turn/start`…`turn/end` 括号翻译成成对的 `session.turn`（started 在前、行在中间、终态在后），
   否则 Paseo 的 `currentTurnId` 在重放期间恒为 null，重开出来的每一行都没有 `turnId`，
@@ -236,10 +299,13 @@
   子代理枚举失败也点名。**动了 `session.ts` 的 `replayHistory`/open 降级通知、`provider.ts`
   的 `openWarnings`/preset 校验，或 `fake-dsh-bridge.mjs` 的 `history-error`/`preset-reject`/
   `plan-error` 场景必跑。**
-- `harness/agent-message-check.cjs` — Paseo 0.12 的 `agent_message` 行：`agentMessage` 字段
-  取用、英文标签对齐官方 display model、缺 `agentMessage` 时**交还宿主原生渲染**。
-  **动了 `client/tool-call-data.ts` 的 `agent_message` 分支或 `index.client.tsx` 的
-  transformer 必跑。**
+- `harness/agent-message-check.cjs` — `agent_message` 行（**106 条**）：`agentMessage` 字段取用、
+  英文标签对齐官方 display model、畸形/缺失字段的降级（渲染成普通工具行，不伪造消息）。
+  Paseo 0.16 的 app 已把 `agentMessage` 转发给插件 transformer（upstream PR #8492），所以
+  `index.client.tsx` 里"缺字段就 `return undefined` 交还宿主"的老分支已删除——本检查改为**从源码
+  断言这个分支不再回来**（`ifStatements` 结构化读条件/分支体，不靠正则拼写），并继续钉住
+  "transformer 传整个 item、不挑字段"。**动了 `client/tool-call-data.ts` 的 `agent_message` 分支、
+  `client/agent-message.ts` 或 `index.client.tsx` 的 transformer 必跑。**
 - `harness/uploaded-file-check.cjs` — 附件块翻译与官方 `renderPromptAttachmentAsText` 逐字
   一致；text/image 形状不变、未知类型抛错。**动了 `server/session.ts` 的 `toDshContent` 必跑。**
 - `harness/paseo-system-envelope-check.mjs` — 桥的 `<paseo-system>` 信封翻译（无属性/版本化
@@ -263,14 +329,19 @@
 - `harness/dsh-api-contract-check.mjs` — 桥依赖的 **DSH 内部 API** 还在不在（纯离线、秒级，
   不起进程、不耗 token）。桥不是 ACP 适配器，它直接 import 八个 DSH 内部组装包
   （`dsh-llm` / `dsh-agent` / `dsh-attachment` / `dsh-brand` / `dsh-cmdline` / `dsh-tools` /
-  `dsh-subprocess` / `schemastery`），这些包**没有 API 稳定性承诺**。脚本断言两件事：
+  `dsh-subprocess` / `schemastery`），这些包**没有 API 稳定性承诺**。脚本断言三件事：
   **覆盖率**（桥源码里每个 `@deepseek-ai/*` import 都必须在 `EXPECTED` 清单里，且清单里没有
-  桥已不用的条目——**双向**，所以新增依赖漏登记、删了 import 留下死清单都会红）和**存在性**
-  （13 个符号仍被导出、类型没变）。它查的是 FIELD-NOTES #58 那种失效：`{{cwd}}` 变量被上游
+  桥已不用的条目——**双向**，所以新增依赖漏登记、删了 import 留下死清单都会红）、**存在性**
+  （13 个符号仍被导出、类型没变）和**服务面**（2026-11-11 新增，`EXPECTED_SERVICE_SURFACE`：
+  桥经 `ctx.get(...)` 拿到的 service 仍声明它调用的操作。`dsh-jobs` 的 `.d.ts` 必须仍声明
+  `list`/`get`/`kill`，且 `dsh-jobs-local` 的 `LocalJobRegistry.prototype` 必须真的实现它们——
+  `paseo/jobs/stop` 走的就是这个 `kill`，它是 **`dsh-tool-jobs` 的 `job_kill` 同一个入口**；
+  抽象类上不挂实现，所以 d.ts 与实现类两边都要断言。服务面不是 import，第 1/2 项看不见它）。它查的是 FIELD-NOTES #58 那种失效：`{{cwd}}` 变量被上游
   删掉，每个回合都在提示词装配阶段抛错，界面只有一条空的 `[error]`，而 **doctor 全程是绿的**
   （doctor 只查安装完整性，查不出软契约）。**它不查行为**——签名变了但符号还在，这里不会红，
-  那由 `plugin-check.cjs` 的真实回合覆盖。**它也只覆盖 import 符号，不覆盖实例方法**（如
-  live agent 的 `runMaintenance`，类未导出）；升级时这里不会红，别当完整门。两个都跑才算数。
+  那由 `plugin-check.cjs` 的真实回合覆盖。**它覆盖的是 import 符号 + 上面那份服务面清单，
+  其它实例方法仍不覆盖**（如 live agent 的 `runMaintenance`，类未导出）；升级时这里不会红，
+  别当完整门。两个都跑才算数。
   **DSH 升版后必跑、优先于其它一切**：它最快、且失败信息直接点名哪个包的哪个符号没了。
   `DSH_PACKAGES_DIR` 可覆盖安装目录。
 - `harness/bridge-assets-check.mjs` — `server/bridge-assets.ts` 必须与 `dsh-bridge/` 和
@@ -366,8 +437,12 @@
   共用 sessionId、T03 `plugin-check` 不预过滤 assistant 行、T04 图片证据取插件发出的 prompt
   frame（模型自报的 `IMAGE-SEEN` 不再算数）、HP-08 `session-calls` 无 schema 的调用必须
   exit 2 而不是 0、HP-05 隔离 home 的默认/opt-in 行为（克隆带共享锚点的桥、且是**真拷贝不是
-  符号链接**——链接会让克隆写回真实 home；源没有锚点时不得凭空造一个）。纯离线，会启动真实入口
-  脚本 + 假 peer；真实 `dsh --dump-config` 的组合半在 `harness/isolated-home-bridge-check.mjs`。
+  符号链接**——链接会让克隆写回真实 home；源没有锚点时不得凭空造一个；克隆里**把钉死的监听端口
+  归零、把 `dsh-memory` 的 `dataDir` 指进临时 home**，源 profile 逐字节不变、已归零/无该插件时
+  不发明条目）。端口那条是 2026-11-11 实测出来的环境坑：live profile 为书签把 `webserver` 钉成
+  `127.0.0.1:44209` 这类固定值，隔离克隆继承后第二份 DSH 直接 `EADDRINUSE`，真实回合脚本读到的是
+  "timed out waiting for session.ready"，看着像插件 bug。纯离线，会启动真实入口脚本 + 假 peer；
+  真实 `dsh --dump-config` 的组合半在 `harness/isolated-home-bridge-check.mjs`。
   **动了 `route-test.mjs` / `tools.mjs` / `session-calls.mjs` / `plugin-check.cjs` 的判据，或
   `harness-gates.cjs` / `isolated-dsh-home.cjs` 必跑。**
 - `harness/harness-gates.cjs` / `harness/isolated-dsh-home.cjs` — **不是独立检查**：前者是
@@ -376,7 +451,10 @@
   profile **与共享锚点的桥**——桥已不在 profile 目录里，只克隆 profile 会让这些脚本在无桥的
   克隆上起 `dsh --profile`，只打印 skipping 然后静默降级；桥是真拷贝不是符号链接，避免写回
   真实 home；源没有锚点时保持旧行为。另：凭据只做 symlink、退出清理、`--allow-real-profile`
-  opt-in）。改动它们必跑 `harness/harness-gates-check.mjs` 的对应段 +
+  opt-in。**克隆沙箱**（`sandboxClonedProfile`）：`webserver` 的固定 `port` → `0`（否则与
+  live DSH 抢端口，真实脚本报 runtime failure）、`dsh-memory` 的 `dataDir` → `<克隆>/memory-paseo`
+  （否则第二个写者落在用户真实记忆库上），只在克隆里改、源逐字节不动，改了什么写进返回的
+  `sandboxed` 列表并打进那行 mode 输出）。改动它们必跑 `harness/harness-gates-check.mjs` 的对应段 +
   `harness/isolated-home-bridge-check.mjs`。
 - `harness/isolated-home-bridge-check.mjs` — **一次性 home 克隆必须带得上桥**（真 `dsh`，
   一次性 `mkdtemp` 源 home，不碰真实 `~/.dsh`、不耗 token）：源 home 只有共享锚点的桥（迁移后
@@ -585,16 +663,6 @@
   终态，后发的会被丢）、子会话不补编一个 `session.turn` 终态。崩溃由脚本自己 `SIGKILL` 假桥
   记录的 pid 制造（不给假桥加场景）。**动了 `session.ts` 的子会话终态或 `dsh-process.ts` 的
   进程退出扇出必跑；回归同时钉住「已完成子会话不被进程退出改写为 failed」。**
-- `harness/local-patches-check.mjs` — `local-patches/` 的纯离线检查（spawn 真实 apply/check
-  脚本，`REWIND_PATCH_TURNID_TARGET` / `REWIND_PATCH_HOME` 全指向临时 fixture，不读写已安装
-  宿主）：turnId 补丁在 0.15 形状 fixture 上打上/幂等/备份落在补丁目录；半打、锚点失配、
-  上下文失配三态都 fail closed（文件 byte-identical、checker 不报「跑 apply 就好」）；stale
-  体重建（重建结果必须等于干净重打，prestale 快照落在补丁目录）；stale 不可重建时 checker 与
-  `apply --check` 同源判 `stale-body-unrebuildable`、apply 真的拒绝（LP-02：门禁与实现一致）；
-  **变异见证**——「markers 2/2 但重放调用不带 turnId」必须被判 `stale-body` 而不是 patched
-  （只数 marker 的旧判据在这份 fixture 上是绿的）；`--revert` 复原与幂等、target 缺失的
-  exit 1/3。**动了 `local-patches/apply-rewind-history-truncation.mjs` 或
-  `local-patches/check-rewind-patch.mjs` 必跑。**
 - `harness/fake-dsh-bridge.mjs` 的**默认行为变严**：`session/prompt` 现在按会话校验
   `initialize`（文案与真桥一致），漏发 `initialize` 的插件 bug 不再在假桥上一路全绿——`f084c33`
   那个「每个会话都能打开、第一次提问必失败」的缺陷当初就是这么漏过去的。**严格是诚实默认**；
@@ -713,6 +781,12 @@
   `request.completed`）。默认一次性 `DSH_HOME`（克隆源 profile），`--allow-real-profile` 才用
   live home；`--self-test` 只验证编译产物加载与图片块翻译。**动了插件层必跑（含真实模型回合，
   耗 token）；改判据后先跑 `--self-test`。**
+  **环境坑（2026-11-11 实测）**：本机 live `~/.dsh/profiles/paseo/cordis.patch.yml` 把 webServer
+  端口钉成 `44209`，隔离克隆继承该行，于是 harness 自己起的 `dsh --profile` 报 EADDRINUSE、以
+  `session.runtime_failed` 收尾（`40/40` 之外的会话就绪超时）。解法：在**一次性克隆**里把
+  `port: 44209` 改成 `port: 0`（**不动 live profile**），再以 `DSH_HOME=<克隆>` 跑；
+  现成包装脚本 `/tmp/paseo-dsh-orch/push-evidence/run-plugin-check-isolated.cjs <repo>/paseo-plugin/.dbg`。
+  改完实测 `40/40 passed`。
 - `harness/route-test.mjs` — 逐条路由跑真实回合，按终态分类 WORKS/FAILS/TIMEOUT/CANCELED/
   EMPTY（不按"有没有文本"判），全部 WORKS 才 exit 0；默认一次性 `DSH_HOME`。**动了 catalog/
   路由，或要选模型前跑（耗 token）。**
@@ -795,73 +869,47 @@
   `dsh-bridge/lib/server.js` 的 `paseo/goal` 或 dispatch 必跑；改桥后先重生成内嵌桥
   （`node paseo-plugin/scripts/generate-bridge-assets.mjs`）再跑 `bridge-assets-check.mjs`，
   否则真机检查跑在旧桥上假绿。**
-- `harness/goal-pill-check.cjs` — goal pill 与行式面板的**数据层与 UI 规则**（**402 条**；2026-11-08 seen 持久化共 85 条（39 条首轮 + 34 条 P2 返工：invalid 文档 reset 修复、连续 conflict 只 warn 一次、真实 defineSettings 定义 id/scope/version 与归一、两 pill 各自引用正确 id 的源码钉 + 12 条收尾：reset 与 read 共用超时门禁（reset 挂起/抛错都不阻塞 hydrate，ready=true 空表）、reset conflict 后下次 save 自愈合并保留他 agent、conflict 重试成功 warns=0）：确认关闭把 `agentId: id:revision` 写进假 settings 文档 → 同一文档新建 controller（= app 重启）hydrate 后同签名隐藏、新 revision 可见、读失败退回可见且不抛、写失败不抛且本会话仍隐藏、conflict 重读合并保留他 agent、无声宿主超时降级、remove 后已读保留（2026-11-09 起；此前是 forget 干净重加）、64 上限与 sanitize；源码钉：唯一写点在 `advanceSeen` 的 confirmed-close 分支、`publishState` 与轮询模块无写、启动 hydrate、hydrate 前不 present、两个 settings 均在 index.server.ts 注册且有老宿主降级；2026-11-05：运行时图标钉改为「`CornerRingIcon` 保留底图标、不出现裸 `StatusRingMark`」，新增 8 条「目标与后台是两颗独立 pill」源码钉——goal 只注册 `dsh-goal`、jobs 只注册 `dsh-jobs`、各开各的 popover、关闭目标 popover 记完成态已读、入口各自 contribute、没有共用 slot 协调器且其模块已删；2026-11-08（删除跨 pill 协调器）：入口钉改为 `contributeJobsPill(client)` / `contributeGoalPill(client)` / `contributeTeamPill(client)` 单参、`index.client` 无 deference 引用、`client/pill-deference.ts` 已删、goal/jobs/team 单参签名钉；
-  假时钟 + 假 RPC + 假目录页，不 import React/host；UI 规则都抽在 `client/goal-polling.ts` 的
-  纯函数里）：契约枚举与 wire schema（`GoalState` 缺 `activation` / `id` / `revision` 必拒，时间戳仍被剥掉）、
-  `goalCommandArguments` 的 DSH 语法、五态可见性/label/tone（**complete 未读可见、tone success、已读（同 `id:revision`）隐藏、
-  新 id 或新 revision 重新可见、已读键只隐藏 complete**；`goalIconName` success→`CircleCheck`、余→`Target`；
-  `goalIconColorToken("success")`→`statusSuccess`）、**pill 文案**（`goalPillCopy` 用真实 locale 表：五态×中英 label 与 title
-  都是「目标」/「Goal」；`goalStateName` 五态完整状态名）、**完成态已读状态机**（`goalCompleteSeenStep`：完成当轮
-  running→idle 不算已读、下一回合 running（发下一条消息）也不算已读、首次观察时已 idle 也不起步、关闭完成面板即已读、非 complete 面板关闭不算、
-  已读键跨轮询保持、新 revision 重新观察且显示、清除留已读键、端到端：下一条消息后仍可见、关闭后隐藏）、**面板去向**（`goalPanelNext`：编辑取消/Esc→close、
-  保存成功→close、保存被拒→stay、清除页取消→view、其它控制成功→view、被拒→stay）、面板行几何取宿主值（`goalTrackRow` 32/40、确认页行尾 `goalConfirmControls`（红钮 32/24、手机行尾比 view 页至多宽 8px）、防误触常量（武装 400ms、未武装 0.35/0.86、过渡短于武装、按下 0.85）、
-  `goalIconButton` 20/32、鲸鱼 16、环框 14 偏移 -5）、facts 行（`goalFactsLine`：
-  「进行中 · 第 N 轮 · 预算 M」，**`active + disarmed` 以「未在续跑」/「Not continuing」开头**）、
-  运行环真值表（`goalRunningMark`：armed+running 才转、idle 后保持 `GOAL_RUNNING_HOLD_MS`=1500、
-  disarmed/paused/blocked/complete 与读不到状态都不转、保持边界）、图标 tone→token
-  （`goalIconColorToken`：`foregroundMuted`/`statusWarning`/`statusDanger`）、编辑页空草稿与
-  未改动草稿都不可保存（`goalEditDraftValid`/`goalEditSubmittable`）、**编辑框（小号 composer）**
-  几何（圆角 16、内边距 8/12、gap 12、距边 8、✓ 28、禁用 0.5、2–6 行）、`goalEditorType`
-  （web 15/21、原生 16/22）、`goalEditorHeight` 夹取（未测量/NaN→2 行、12 行→6 行、小数向上取整）、
-  `goalEditKeyAction` 真值表（桌面 Enter 保存、Shift+Enter / 组字中 Enter / 手机 Enter 都不保存、
-  Esc 取消）、trigger 与面板接线（registration 走 `goalPillCopy`、静态 glyph 是 `Target`、没有填充
-  按钮组件、旧 footnote 与旧「保存」菜单行已删、清除页无菜单行/分隔线、错误一律走 `ControlError`、按键走 `goalEditKeyAction`）、节奏常量与
-  jobs 逐字一致（4000/30000/1000/2000）、控制器行为（答案签名去重、瞬时错误保持、终态停表、
-  退避、`pollNow`、provider/workspace 过滤、closed 移除）。运行：
-  `cd paseo-plugin && npx tsc -p ../harness/goal-pill.tsconfig.json`，写入
-  `.dbg-goal/package.json`（`{"type":"commonjs"}`）并拷入本脚本，再在 `.dbg-goal` 里
-  `node goal-pill-check.cjs`（`goal-pill.tsconfig.json` 一并编译 `client/locale.ts`，供文案断言用真实表）。**动了 `client/goal-polling.ts`、`client/goal-popover.tsx`、
-  `client/goal-pill.tsx`、`client/goal-running.tsx`、`client/deepseek-mark*.tsx`、
-  `client/agent-polling.ts`、`shared/goal.ts` 或 `client/locale.ts` 的 goal 表必跑；改共享轮询器时
-  `jobs-poll-check.cjs` 必须同时全绿且断言数不减，`team-pill-check.cjs` 也必须全绿（同一 `createAgentPoller` +
-  同一 `seen-persistence`）。**2026-11-09 新增 21 条（381 → 402），覆盖「快照是刷新不是重建」的六个面：
-  ① 完整接线（轮询控制器 + seen 状态机 + 真 `seen-persistence` + 宿主可见性）重放「未见完成态 → 确认关闭写盘并隐藏 →
-  同一 agent 的重连快照 → 下一次 poll」：快照不得移除仍在列表里的 agent、不得重复注册、落盘 key 必须存活、完成态保持
-  hidden；② 重连后 **poll 答案真的变了**（complete 的 `currentTask` 变化 → 一定重新 publish）仍保持 hidden——这条不能只靠
-  publish 去重顺带成立；③ 完整快照**确实移除**已离开的 agent（并保留幸存者的注册与唯一计时器）；④ 分页窗口内 `upsert`
-  推送的新 agent 不被收尾差集误删；⑤ 终态码摘掉的 pill 在**重连快照**上重建并重新读（裸 `upsert` 仍不重启，与
-  `jobs-poll-check` 同一条规则）；⑥ 真移除不再抹掉已落盘的 seen（同一完成 revision 重加后仍 hidden，新 revision 才显示），
-  且源码钉断言移除路径与 `seen-persistence` 里都不存在 `forget`（先剥注释再判标识符，P3-7）。
-  另有「两个快照同时在途、旧的先结束」一条：旧快照的 `finally` 不得关掉新快照的收集窗（`inflightListed === listed` 守卫），
-  其间 `upsert` 的新 agent 不得被误删。
-  变异实测：删掉差集移除循环 → 2 条红（「确实移除已离开的 agent」+「幸存者只留一个计时器」）；去掉终态复活 → 3 条红；
-  去掉分页 upsert 保留 → 1 条红；把 `finally` 的守卫改成无条件清空 → 1 条红（「旧快照结束后 upsert 的新 agent 不被误删」，
-  401/402）；把 `present` 的 seen 查询去掉 → 「答案变了仍 hidden」等 5 条红（而「未变的 poll 不 publish」仍绿，证明该断言
-  走的是 seen 判定而非去重）。**动了 `client/seen-close-gate.ts` 必跑。
-  动了 `client/seen-persistence.ts` / `shared/seen-settings.ts` / `shared/goal-seen-settings.ts` 必跑。**
-- `harness/goal-popover-render-check.cjs` — 面板的**渲染行为**（**245 条**；2026-11-05 新增：真实 `contributeGoalPill` + `contributeJobsPill` 对假宿主——一个 agent 恰两个注册 `dsh-goal`/`dsh-jobs`、各自 popover、update 不带 behavior、两者同时可见、后台文字恒为「后台」且任何 patch 不含数字、后台跑完只隐藏后台不碰目标、registry 读不到显示静态 `SquareTerminal`、目标清除只隐藏目标、后台 popover 不画目标行、关闭完成态目标 popover 即已读、发下一条消息（agent idle→running）不隐藏未点开的完成态目标、dispose 移除两个注册；2026-11-08（删除跨 pill 协调器后）：三 pill 集成改为「各 pill 独立规则」——目标+团队同时可见时 jobs 仍按自身 live 规则可见、settled 时只按自身规则隐藏、不可读 registry 仍显示静态 glyph、无协调器时同答案不重绘（去重）、goal 终态错误只移除 goal pill、cleanup 移除三个注册；2026-11-08 收尾补 3 条真实 `contributeTeamPill` 集成断言（空看板 → team pill 隐藏、同场景 jobs 仍按自身 live 规则可见、goal 不受影响，随后恢复看板再验证 team 复显）；`CornerRingIcon`/`JobsPillIcon`/真实目标图标：运行时底图标仍在、角环 9px 右下 -1、外框恒等于 size、角环绝对定位、四种图标 glyph 中心与宿主 16px 图标盒中心偏差 ≤0.5px）：用 esbuild 现编真实
-  `GoalPopoverBody`，经 `react-native-web` 渲染进 jsdom（宿主 UI kit 的 `Icon`/`TextInput` 用小桩
-  代替：lucide 真 glyph、内联 SVG、react-native-web 真输入框；文案用真实 zh-CN 表）。断言：目标行是
-  面板唯一的编辑入口、两个行尾图标按钮不打开编辑、运行时鲸鱼角上出环、**编辑页是小号 composer**
-  （「编辑目标」头 + 鲸鱼、真 textarea、预填全文、光标在 0、未测量时 2 行 42px、上限 126px、15px、
-  没有「保存」菜单行）、✓「保存目标」对空/未改动草稿 `aria-disabled` + `opacity 0.5`，点击与回车都不提交、
-  改动后可提交；**桌面** Enter 保存、Shift+Enter 与组字中 Enter 不保存、Esc 取消、显示三组按键提示；
-  **手机** Enter 不保存、无按键提示、保留头部、点 ✓ 保存；**失焦既不保存也不取消**；**清除页（UI-v9 方向 B）**恰两个按钮、红钮按密度 32/24 圆形 `statusDanger` 带垃圾桶、「取消」透明灰字、
-  目标行（状态+目标读屏名、非 button、鲸鱼、无环、单行、facts）在提示之上、**红钮前 400ms 不可点**（淡出+缩小+`aria-disabled`，200ms 点也无效，
-  400ms 后可点；「取消」立即可点；busy 时转圈且不可点、「取消」仍可点）、红色只在该页出现、**控制错误中文化**（「No goal to clear.」
-  显示中文 + 灰色原文、读屏名含两句；未知句原样红字且不出现泛化文案；view/编辑/完成页同样翻译）、**目标行读屏名先说状态**（「目标进行中/未在续跑/已暂停/受阻，编辑目标」）、
-  **完成态页**（唯一按钮是清除、无暂停/继续、目标行不是 button 且点击不进编辑、单行截断、facts「已完成」、完成提示、无运行环、
-  清除进确认页且用完成态确认句，active 确认句不变）、disarmed 页显示文案 B 全句且 facts 为
-  「未在续跑 · 第 3 轮 · 预算 10」（不含「进行中」）、blocked 页显示原因；**真实容器**（UI-v8：`makeGoalPopover`
-  + 假 RPC client，SDK 的 `useAgent` 用桩）：编辑「取消」与 Esc 各调 `close()` 一次且不发命令、保存成功调 `close()`
-  一次并仍刷新、保存被拒不关且留在编辑框保留草稿并显示原文、清除确认页「取消」不关且回到主页、清除被拒留在确认页并显示中文、双击垃圾桶不发 clear、关闭后上报的目标非
-  complete（不记已读）。**需要 `HOST_APP`
-  指向 Paseo 检出**（提供 react/react-dom/react-native-web/esbuild/jsdom/lucide-react）：
-  `HOST_APP=/path/to/paseo node harness/goal-popover-render-check.cjs`；未设置时 **exit 2**
-  （incomplete，不进 CI），与 `jobs-popover-check.cjs` 同约定。**动了 `client/goal-popover.tsx`、
-  `client/deepseek-mark*.tsx` 或面板用到的 `goal-polling.ts` 规则必跑；动了 `client/jobs-pill.tsx` / `client/goal-pill.tsx` /
-  `client/team-pill.tsx` / `index.client.tsx` 的 pill 接线必跑。**
-- `harness/goal-server-check.cjs` — 插件侧两个 RPC 与 `currentTask`（**40 条**，含 4 条跨层
+- `harness/goal-pill-check.cjs` — goal pill 与行式面板的**数据层与 UI 规则**（**309 条**；假订阅
+  宿主 + 假目录页，不 import React/host；2026-11-11（0.16 订阅改造）：
+  - **订阅控制器**一节（`client/agent-subscriptions` + `projectGoalAnswer`）：首答发布、同答案不
+    重发、phase 变化与 `goal=null` 各自发布；**瞬态失败保持上一状态**（不发布、不摘 pill、不释放）；
+    终态码摘 pill 并释放、再推送不重读、upsert 不重开、新 snapshot 重建；只注册本 provider 且
+    有 workspace 的 agent；**upsert 把整条 agent（含 metadata）交给 pill**；snapshot 只移除离开的
+    agent、`drop` 移除。
+  - **"seen" 换到 agent metadata**（`shared/pill-metadata` + `client/seen-metadata`）：无 metadata
+    → 可见；观察到 `dsh.goalSeen` → 隐藏；错类型/空串不算签名；确认关闭先入内存再写
+    `paseo.agents.ref(id).setMetadata`；写入回声不算可见变化；过期 snapshot 不改可见答案（pending
+    优先）；写失败一条 console 且本会话仍隐藏；两次关闭按调用序写；移除/`dispose` 不抹掉已读键。
+    源码钉：唯一写点在 `advanceSeen` 的 confirmed-close 分支、目标键走 agent 记录、pill 不再碰
+    plugin settings、轮询/控制器模块不写、`index.server.ts` 不再注册 settings 且服务
+    `goal.snapshot`、`goal.control` 成功后 `goalFeed.refresh`。
+  - 纯规则不变：五态可见性/label/tone、`goalSeenKey`、面板几何、facts 行、运行环真值表、编辑页
+    草稿/键盘/高度、`goalPanelNext`、目标/后台两颗独立 pill 与入口源码钉、popover 关闭是
+    confirmed-close。
+  - **节拍断言已搬走**：原来的"轮询节奏与 jobs 逐字一致"一节（`LIVE_POLL_MS`/退避/抖动/首抖）随
+    计时器移到 `harness/pill-feed-check.cjs`（服务端 4000/30s/20%/2000）。
+  **跑了 `npx tsc -p ../harness/goal-pill.tsconfig.json` + `.dbg-goal` 后 `node goal-pill-check.cjs`。
+  动了 `client/goal-polling.ts`、`client/goal-popover.tsx`、`client/goal-pill.tsx`、
+  `client/goal-running.tsx`、`client/deepseek-mark*.tsx`、`client/seen-metadata.ts`、
+  `client/seen-close-gate.ts`、`client/agent-subscriptions.ts`、`shared/goal.ts`、
+  `shared/pill-metadata.ts` 或 `client/locale.ts` 的 goal 表必跑。先红后绿证据：
+  `/tmp/paseo-dsh-orch/push-evidence/mutation3-goal.log`（丢掉 pending 优先 → 2 红）。**
+
+- `harness/goal-popover-render-check.cjs` — 面板的**渲染行为**（**246 条**；用 esbuild 现编真实
+  `contributeGoalPill` / `contributeJobsPill` / `contributeTeamPill` + `makeGoalPopover`，经
+  react-native-web 渲染进 jsdom，`HOST_APP` 提供 react/esbuild/jsdom）：目标的编辑/保存/清除/
+  Esc/IME/防误触、关闭是 confirmed-close、两颗/三颗 pill 各按自身规则显示、目标徽标几何。
+  **2026-11-11（0.16 订阅改造）**：假宿主改为**推送式**（`client.subscribe` + `pushAll()`，不再有
+  轮询等待）；`makeGoalPopover` 不再收 `refresh` 回调（控制成功后由服务端 `goalFeed.refresh`
+  重读，"保存后仍请求一次读取"的断言改为"只发一次 control 调用"）；并**修正两处过时断言**——
+  它们早于 2026-11-10 的 jobs 可见性反转（FIELD-NOTES #97），仍期待「registry 读不到时 jobs pill
+  可见」，现按现行规则断言隐藏 + 隐藏槽静态 mark；另把"结算后又以同一 id 复活"的场景改成**新
+  job id**（结算闩锁按 DSH 真形状投影，同 id 不应复活）。**动了 `client/goal-popover.tsx` /
+  `client/goal-pill.tsx` / 任一 pill 的入口或订阅接线必跑；未设 `HOST_APP` 时按脚本自身约定
+  exit 2（incomplete）。**
+
+- `harness/goal-server-check.cjs` — 插件侧 `goal.snapshot` 订阅与 `goal.control` RPC + `currentTask`
+  （**41 条**，含 4 条跨层
   断言；真实插件 + `fake-dsh-bridge.mjs`，一次性 `DSH_HOME`，不 spawn 真 `dsh`）：无会话=
   准确空答案（`available:true, goal:null`）、`GoalView` 只映射绘制字段外加 `id`/`revision`（完成态已读键，透传）、
   时间戳不泄漏、`blockedReason` 透传、四码分级（含真实桥 unknown-method 文案 →
@@ -908,18 +956,26 @@
 
 设计见 [TEAM.md](./TEAM.md)。三个新脚本 + 两个既有脚本的团队段；断言数为回填时实跑值。
 
-- `harness/team-server-check.cjs` — 插件 `team.read`（**22 条**；假桥 `team` 模式 + 一次性 `DSH_HOME`）：只读 `agentTeam`
+- `harness/team-server-check.cjs` — 插件 `team.snapshot` 订阅（**23 条**；假桥 `team` 模式 + 一次性 `DSH_HOME`）：只读 `agentTeam`
   这一个 projection key；无会话 / `null` / `migration-required` / 缺键 → `team: null`；无 `paseo/projections` → 终态
   `bridge_too_old`；未知 key → 终态 `team_unavailable`（且插件前缀与桥源码逐字一致）；未知会话 → `session_missing`；
   其它抛错与形状不符 → `rpc_failed`（不清空成空看板）；DSH 字段原样；**`running`**：空闲根的 Lead 为 false、未托管队员无此键、
   托管中队员回合未结束为 true、已结束为 false、失败成员无此键。编译同 `goal-server-check`（`.dbg` + 拷入本脚本与
   `fake-dsh-bridge.mjs`）。**动了 `server/{dsh-process,session,provider}.ts` 的 team 部分、`shared/team.ts` 或假桥 `team` 模式必跑。**
-- `harness/team-pill-check.cjs` — `client/team-polling.ts` 纯规则（**271 条**；2026-11-08 seen 持久化共 85 条（39 条首轮 + 34 条 P2 返工：invalid 文档 reset 修复、连续 conflict 只 warn 一次、真实 defineSettings 定义 id/scope/version 与归一、两 pill 各自引用正确 id 的源码钉 + 12 条收尾：reset 与 read 共用超时门禁（reset 挂起/抛错都不阻塞 hydrate，ready=true 空表）、reset conflict 后下次 save 自愈合并保留他 agent、conflict 重试成功 warns=0）：确认关闭把 `agentId -> teamAllDoneKey` 写进假 settings 文档 → 同一文档新建 controller（= app 重启）hydrate 后同签名隐藏、签名变可见、读失败退回可见且不抛、写失败不抛且本会话仍隐藏、conflict 重读合并保留他 agent、无声宿主超时降级、remove 后已读保留（2026-11-09 起；此前是 forget 干净重加）、64 上限与 sanitize；源码钉：唯一写点在 `advanceSeen` 的 confirmed-close 分支、`publishState` 与轮询模块无写、启动 hydrate、hydrate 前不 present、两个 settings 均在 index.server.ts 注册且有老宿主降级；pill 图标改为 `Users` + 角标环（全部完成 → 绿色 `CircleCheck`）的 6 条源码钉——三种 `Users` 状态都经 `CornerRingIcon` 画 `Users`、完成态用 `CircleCheck` + `statusSuccess`、只有运行态开环、不再出现裸 `StatusRingMark`、可见性仍经 `teamPillVisible(team, seen)`、seen 接线源码钉（面板关闭是唯一写 seen 的输入；board/agent 事件不写）；2026-11-08（删除跨 pill 协调器）：入口钉改为 `contributeTeamPill(client)` / `contributeJobsPill(client)` / `contributeGoalPill(client)` 单参、`index.client` 无 deference 引用、coordinator 模块已删、单参签名钉）：可见性（只看任务、不看队员：无任务一律隐藏——含起了队员但没建任务；有任务即可见，无论有无队员行；无看板隐藏；**全部完成只再显示一次、只有点开并关闭面板后才隐藏（不点开时发下一条消息不隐藏）**：`teamAllDoneKey` 按 id 排序的 `id:revision` 签名（顺序无关、revision 变化换签名）与 `teamCompleteSeenStep`——board 轮询不写 seen、agent 事件（含下一回合 running）no-op、面板关闭→seen、未全完成时 seen 保留）、成员标题行 chip（顺序、0 不出、运行态缺失不出运行中/已停止、计数只数队员（运行中的 Lead 不算运行中）、Lead 空闲不算已停止、四档降级顺序与选档、各档保留失败与运行中且带字）、负责人标记（运行环 / 已停止只来自 `running` true/false，缺失不标，已完成不标）与「N 个负责人已停止」计数、pill 图标
-  （只有 `running:true` 才转环、failure/失败成员红、全部完成绿色 `CircleCheck`）、成员词（无 `running` 时中英都不说运行中/空闲）与排序、任务标记只认 DSH 的
-  `ready`、B 分组顺序（被阻塞任务不进可开始）、facts 行、详情字段、重叠警告翻译（未知原样）、契约码、poller 适配（终态移除、
-  瞬态保留上次看板）、pill 接线源码钉（label/title 是名词、无计数）。运行：`cd paseo-plugin && npx tsc -p ../harness/team-pill.tsconfig.json`，
-  写 `.dbg-team/package.json` 并拷入本脚本，`cd .dbg-team && node team-pill-check.cjs`。**动了 `client/team-*.ts(x)` 必跑；动了 `client/seen-close-gate.ts` 必跑。**
-  动了 `client/seen-persistence.ts` / `shared/seen-settings.ts` / `shared/team-seen-settings.ts` 必跑。**
+- `harness/team-pill-check.cjs` — `client/team-polling.ts` 纯规则 + 订阅适配 + "seen" 元数据
+  （**215 条**；2026-11-11（0.16 订阅改造）：纯规则（可见性只看任务、`teamCompleteSeenStep`、
+  成员 chip、负责人标记、任务 mark/分组、facts 字段、错误码契约）不变；**适配层改为订阅**——
+  DSH agent 注册并开一条订阅、好答案发布看板、瞬态失败不发布不摘、终态码摘并释放、agent 更新把
+  整条（含 metadata）交给 pill；**"seen" 换成 `dsh.teamSeen` agent metadata**——无签名看板可见、
+  观察到签名隐藏、工作进行中/新 revision 不受影响、确认关闭先内存后写 agent、回声不算可见变化、
+  另一窗口的关闭算变化、写失败一条 console 且本会话仍隐藏、移除后仍记住；源码钉：唯一写在
+  confirmed-close 分支、`client.subscribe(teamSnapshot…)`、不再碰 plugin settings、
+  `index.server.ts` 服务 `team.snapshot` 且不注册 settings、状态不是 seen 信号。
+  **跑了 `npx tsc -p ../harness/team-pill.tsconfig.json` + `.dbg-team` 后 `node
+  team-pill-check.cjs`。动了 `client/team-*.ts(x)`、`client/seen-metadata.ts`、
+  `client/seen-close-gate.ts`、`client/agent-subscriptions.ts`、`shared/team.ts`、
+  `shared/pill-metadata.ts` 必跑。**
+
 - `harness/team-popover-render-check.cjs` — 真实 `TeamPanel` / `makeTeamPopover` 经 react-native-web 渲染进 jsdom（**93 条**）：
   分区与分组顺序、已完成默认折叠且原地展开、被阻塞任务不在可开始、不画逐个成员行、标题行（鲸鱼 +「DeepSeek」+ 队员数 + chip，0 队员不写「0 名成员」，chip 18px/4px 圆角/无边框，失败红底首位，运行态缺失只剩完成 chip，0 不出，四个隐藏量宽副本）、负责人运行环与「已停止」（列表与详情页）、进行中标题的已停止计数、10 个任务负责人全部已停止、
   facts/警告、描述两行多行截断、详情页（返回行、字段、完整描述保留换行、返回回列表）、空看板、只有 Lead、failure 首行红字、
@@ -961,11 +1017,14 @@
   `settings/changed` 转发）。
 - `harness/settings-passthrough-check.cjs` — 插件侧（假桥 `DSH_FAKE_SETTINGS_FILE` 脚本化
   `paseo/settings/list|set`，`DSH_FAKE_SETTINGS_TRIGGER` 模拟 DSH Web 界面改同一个 profile 开关，
-  `DSH_FAKE_SETTINGS_FAIL_FILE` 脚本化写失败），**64 条**：list 变成 `session.config.settings` 的
-  `select` 行（id `dsh:<ns>:<path>`、label=插件显示名字典按本进程 LOCALE 选、value `on`/`off`、
-  options 为纯「开启/关闭」词（设置名在行 label 上，option 不重复）、
-  描述写明全局）、configure 发 `on`/`off` 时桥收到 `paseo/settings/set
-  {ns,path,value(boolean),revision,expectedValue}`、回执值重新发布为 select 值、同值不写、
+  `DSH_FAKE_SETTINGS_FAIL_FILE` 脚本化写失败），**71 条**：list 变成 `session.config` 的
+  `controls` 行 + `providerOptions` 值（Paseo 0.16 的成对形态；旧的 `settings` 数组不再上报，
+  同一条断言里钉住这一点：control key `dsh:<ns>:<path>`、label=插件显示名字典按本进程 LOCALE
+  选、`providerOptions[key]` 为 `on`/`off`、choices 为纯「开启/关闭」词（设置名在行 label 上，
+  option 不重复）、描述写明全局）、configure 在 `changes.providerOptions` 里发 `on`/`off` 时桥
+  收到 `paseo/settings/set {ns,path,value(boolean),revision,expectedValue}`、回执值重新发布为
+  select 值、同值不写、**`null`（上游语义「回到 provider 默认」）不写、只 log 一行、回发运行时
+  值为准**、
   **旧 agent 的 boolean 回传兼容**（同值不写、异值仍按 boolean 写、随后 select 值继续可用）、
   `paseo/settings/changed` 后**所有**打开会话都重发新值（且整个通知只 `list` 一次，不是每会话
   一次）、无 settings 服务不出行且桥给的 reason 只 log 一次（latched，第二次 open 不重复）、
@@ -990,9 +1049,12 @@
   第一个会话失败不影响其它会话**（给 `DshSession.readDshSettings` 打一个只对首个会话抛错的补丁
   → 其它打开会话仍收到 `session.config` 新值；全部失败时只写一条 stderr，含
   `failed for every open session`——快速原型里 `#refreshSettings` 固定读 `sessions[0]` 会整次
-  丢弃刷新）。编译同
-  `mcp-injection-check`（`.dbg` + 拷入本脚本与 `fake-dsh-bridge.mjs`；也可从仓库根跑，回落到
-  `paseo-plugin/.dbg/`）。**动了 `server/{dsh-process,session,provider}.ts` 的 settings 段、
+  丢弃刷新）。跑法只有一种：先把插件编译进 `paseo-plugin/.dbg`（命令同 `plugin-check.cjs` 头部第一步，
+  `.dbg/package.json` 写 `{"type":"commonjs"}`），再**从仓库根**跑
+  `node harness/settings-passthrough-check.cjs`——它 require `paseo-plugin/.dbg/index.server.js`，
+  假桥从 `harness/` 取，无需拷贝。在 `.dbg` 内部跑不行：脚本按 `__dirname/..` 定位 `dsh-bridge/`，
+  从 `.dbg` 会指到 `paseo-plugin/dsh-bridge`（V-P3）。**动了 `server/{dsh-process,session,provider}.ts`
+  的 settings 段、
   `locale.ts` 文案或假桥 settings 支持必跑。**
 - `harness/plugin-check.cjs` 真机段：真实 profile 克隆（`prepareDshHome` 的一次性 `DSH_HOME`）里
   打开会话后断言 `paseo/settings/list` 的 `available:true`（唯一能证明 profile 真的组合了 settings

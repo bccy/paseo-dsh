@@ -3490,3 +3490,33 @@ DSH 原生 UI，则该错误文案在 DSH 侧，插件兜底不覆盖。
 **边界**：`provider.ts:2337`「本进程没有该 agent 的连接 → `available:true, jobs:[]`」在重连/插件代际
 切换的窗口里仍可能短暂隐藏真实 job；客户端无法区分「真没有」与「看不到」，要修得在 provider 侧加
 判别字段（本轮写域外）。
+
+### 98. composer 选项搬去 `controls`/`providerOptions` 后，旧 `settings` 通道的任何一半都会静默失效
+
+**现象（Paseo 0.16 适配，2026-11-11）**：0.16 把 `ProviderConfigState` 里"控件 + 值"一体的 `settings`
+数组拆成 `controls`（只描述哪些 key 有控件，**不含值**）与 `providerOptions`（已提交的值）；
+`ProviderConfigChanges` 里读 `providerOptions`，旧 `settings` 只作为兼容字段在宿主侧仍被填充。这不是
+可选升级：宿主 `readPluginOptionState`（`dist/server/server/agent/plugin-provider.js` 的
+`plugin-provider-options.js`）一旦看到 `controls` 或 `providerOptions` 存在，就不再走 legacy 分支，
+`applyOptions` 只往 `providerOptions` 里塞值——**只报 `settings` 的插件，控件还在、值永远回不来**。
+
+**为什么难发现**：三处都可以"编译通过、界面还在"地坏掉，且形状各不相同——
+1. 只把 `settings` 改名成 `controls` 但**没有发布值**：控件照旧渲染，但 `selectedChoice()` 找不到
+   `options[key]` 就退回 `defaultValue ?? null`，下拉框显示空白（不报错）；
+2. 只发布 `providerOptions` **不发布 `controls`**：值在、但没有任何一行可点（功能整块消失）；
+3. 写入端仍读 `changes.settings`：因为插件**自己**报了 `controls`，宿主不会再填这个字段，用户的每次
+   切换都是空操作，宿主 `commitOptions` 还会把旧值当"已提交"重新发一遍——看上去像"点了不生效"。
+
+**修法**：`session.ts` 的 `configState()` 一次产出成对的两半（`controls` 只带 label/description/
+choices，值只放 `providerOptions`），`configure()` 只读 `changes.providerOptions`；旧 `settings` 路径
+整条删除，不做双轨（双轨时宿主按 legacy 读、值走另一条，语义会分叉）。preset/permission 都是
+"Dsh 运行时状态的镜像"而不是本插件自己的默认值，所以上游语义的 `null`（回到 provider 默认）在这里
+没有可清的对象：跳过 + 一行 daemon stderr，随后重发的 config 把运行时值顶回控件。
+
+**验证（离线，2026-11-11）**：`harness/settings-passthrough-check.cjs` **67/67**（原 64 条改成读
+`controls`+`providerOptions`，并新增"状态里不得再有 `settings` 数组"与 `null` 不写/只 log 两条）；
+`harness/plugin-check.cjs` 的 preset/permission/DSH 开关判据同步改读新形态后真机段全绿。
+
+**未验证/边界**：`plugin-check.cjs` 真机段的 preset 与 permission 仍是"镜像值"证明，不能证明宿主
+`options_changed` 事件在 UI 上的回弹动画；`choices[].description`（0.16 新增）有意未使用，避免把
+未翻译的运行时文案塞进菜单。

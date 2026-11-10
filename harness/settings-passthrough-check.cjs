@@ -15,7 +15,8 @@
  * What this check pins, against the fake bridge (no real DSH, no model):
  *
  *   1. **list becomes a select row.** The bridge's `paseo/settings/list` answer
- *      must appear in `session.config.settings` as
+ *      must appear in `session.config` as a `controls` entry plus its value in
+ *      `providerOptions` (Paseo 0.16's split of the old `settings` array) —
  *      `{type:"select", id:"dsh:<ns>:<path>", label:<localized title>,
  *      value:"on"|"off", options:[{label:"开启",value:"on"},
  *      {label:"关闭",value:"off"}]}` with a description that says the switch is
@@ -53,7 +54,7 @@
  *      that code (not one generic message) and let the provider re-emit the
  *      committed config.
  *   7. **a create-panel pick is deferred to the first prompt.** A fresh open
- *      carries the user's pick in `config.settings` (`"on"`/`"off"`, or a
+ *      carries the user's pick in `config.providerOptions` (`"on"`/`"off"`, or a
  *      boolean from an older agent); it must not be written on open (Paseo opens
  *      a throwaway draft session to refresh the create menu), must be written
  *      before the first prompt, and a write failure must produce a timeline
@@ -66,20 +67,22 @@
  *
  * ## Running it
  *
- * The plugin is TypeScript; compile it first and run from the emitted tree:
+ * Two steps, in this order — the compile goes into `paseo-plugin/.dbg`, the run
+ * happens **from the repo root**:
  *
  *   cd paseo-plugin
  *   npx tsc --noEmit false --outDir .dbg --declaration false \
  *     --module commonjs --moduleResolution node
  *   echo '{"type":"commonjs"}' > .dbg/package.json
- *   cp ../harness/settings-passthrough-check.cjs ../harness/fake-dsh-bridge.mjs .dbg/
- *   cd .dbg && node settings-passthrough-check.cjs
- *   rm -rf ../.dbg
- *
- * The script also works from the repo root when the compile output is at
- * `paseo-plugin/.dbg/` (it falls back to that path):
- *
+ *   cd ..
  *   node harness/settings-passthrough-check.cjs
+ *
+ * Running it *inside* `.dbg` (`cd .dbg && node settings-passthrough-check.cjs`)
+ * does not work: this script loads the bridge by walking up from its own
+ * directory (`repoRoot = __dirname/..`), which from `.dbg` points at
+ * `paseo-plugin/` and then looks for `paseo-plugin/dsh-bridge/lib/…`. The copy
+ * of `fake-dsh-bridge.mjs` that step used to require is not needed either — the
+ * provider resolves the fake `dsh` from this checkout.
  */
 const fs = require("node:fs");
 const os = require("node:os");
@@ -132,6 +135,13 @@ const settingsTrigger = path.join(scratch, "settings-trigger.json");
 // `{ok:false,error:{code,message}}` values, and the plugin must word each code
 // for the user while still republishing the committed config.
 const settingsFail = path.join(scratch, "settings-fail.json");
+// The fake bridge resolves its mode per request, but reads it from the *child's*
+// environment — a shared child inherits the environment once, at spawn. A file
+// is the channel for changing it mid-run (the fake's own `currentMode`), and an
+// absent file means "live". It starts absent so the first sessions see the plain
+// bridge; the preset section below writes it for one open.
+const fakeModeFile = path.join(scratch, "fake-mode");
+process.env.DSH_FAKE_MODE_FILE = fakeModeFile;
 process.env.DSH_FAKE_SETTINGS_FILE = settingsFile;
 process.env.DSH_FAKE_SETTINGS_TRIGGER = settingsTrigger;
 process.env.DSH_FAKE_SETTINGS_FAIL_FILE = settingsFail;
@@ -230,9 +240,30 @@ function lastConfig(sessionId) {
   return [...events].reverse().find((event) => event.type === "session.config" && event.sessionId === sessionId);
 }
 
-/** The `dsh:`-prefixed switch rows of a config. */
+/**
+ * The `dsh:`-prefixed switch rows of a config, read the 0.16 way.
+ *
+ * Since Paseo 0.16 a `ProviderConfigState` carries the keys that get a control
+ * in `controls` and their committed values in `providerOptions`; the deprecated
+ * `settings` array held both at once and this plugin no longer reports it. Each
+ * row is flattened back into the shape the assertions below read
+ * (`id`/`value`/`options` out of `key`/`providerOptions[key]`/`choices`), so a
+ * check that fails says which part of the pair is wrong.
+ *
+ * @param config - one `session.config` event.
+ * @returns the `dsh:` rows, in control order.
+ */
 function dshRows(config) {
-  return (config?.config?.settings ?? []).filter((setting) => String(setting.id).startsWith("dsh:"));
+  const controls = config?.config?.controls ?? [];
+  const values = config?.config?.providerOptions ?? {};
+  return controls
+    .filter((control) => String(control.key).startsWith("dsh:"))
+    .map((control) => ({
+      ...control,
+      id: control.key,
+      value: values[control.key],
+      options: control.choices,
+    }));
 }
 
 /** All `paseo/settings/set` request frames so far. */
@@ -244,8 +275,8 @@ function setFrames() {
  * Open a session.
  *
  * @param sessionId - provider session id.
- * @param options - `{settings, persistence}`: settings ride `config.settings`
- *   (the create-panel path); `persistence` marks a resume.
+ * @param options - `{providerOptions, persistence}`: the agent's options ride
+ *   `config.providerOptions` (the create-panel path); `persistence` marks a resume.
  */
 async function open(sessionId, options = {}) {
   await conn.send({
@@ -255,7 +286,7 @@ async function open(sessionId, options = {}) {
     config: {
       cwd: process.cwd(),
       mode: "build",
-      ...(options.settings === undefined ? {} : { settings: options.settings }),
+      ...(options.providerOptions === undefined ? {} : { providerOptions: options.providerOptions }),
     },
     ...(options.persistence === undefined ? {} : { persistence: options.persistence }),
   });
@@ -338,7 +369,7 @@ process.on("exit", () => {
     writeSettings([settingsItem({ field: { path: ["enabled"], value: false, revision: 7 } })]);
     writeSettingsFailure({ code: "conflict", message: "scripted conflict" });
     const sessionId = `settings-en-${Date.now()}`;
-    const enConfig = await open(sessionId, { settings: { "dsh:dsh-unrestricted:enabled": "on" } });
+    const enConfig = await open(sessionId, { providerOptions: { "dsh:dsh-unrestricted:enabled": "on" } });
     const enRow = dshRows(enConfig)[0];
     printCheck(
       "the DSH switch row is a select with fully English option labels",
@@ -374,7 +405,7 @@ process.on("exit", () => {
       type: "session.configure",
       requestId: "configure-en-non-boolean",
       sessionId,
-      changes: { settings: { "dsh:dsh-unrestricted:enabled": "yes" } },
+      changes: { providerOptions: { "dsh:dsh-unrestricted:enabled": "yes" } },
     });
     const nonBooleanFailed = await until(
       (event) => event.type === "request.failed" && event.requestId === "configure-en-non-boolean",
@@ -398,7 +429,7 @@ process.on("exit", () => {
       type: "session.configure",
       requestId: "configure-en-refused",
       sessionId,
-      changes: { settings: { "dsh:dsh-unrestricted:enabled": "on" } },
+      changes: { providerOptions: { "dsh:dsh-unrestricted:enabled": "on" } },
     });
     const refusedFailed = await until(
       (event) => event.type === "request.failed" && event.requestId === "configure-en-refused",
@@ -453,11 +484,74 @@ process.on("exit", () => {
     JSON.stringify(rowsA[0]?.description),
   );
   check(
-    "the existing provider settings are not displaced by DSH switches",
-    (configA.config.settings ?? []).some((setting) => setting.id === "permission")
-      && (configA.config.settings ?? []).every((setting) => setting.id !== "preset"),
-    JSON.stringify((configA.config.settings ?? []).map((setting) => setting.id)),
+    "the existing provider options are not displaced by DSH switches",
+    (configA.config.controls ?? []).some((control) => control.key === "permission")
+      && (configA.config.controls ?? []).every((control) => control.key !== "preset"),
+    JSON.stringify((configA.config.controls ?? []).map((control) => control.key)),
   );
+  // The 0.16 pair replaces the old `settings` array: a state that still carried
+  // it would be a second, unread vocabulary (the host stops sending changes under
+  // that name the moment `controls`/`providerOptions` appear).
+  check(
+    "the state reports controls + providerOptions and no deprecated settings array",
+    configA.config.settings === undefined
+      && (configA.config.controls ?? []).length > 0
+      && configA.config.providerOptions?.["dsh:dsh-unrestricted:enabled"] === "off",
+    JSON.stringify({
+      settings: configA.config.settings,
+      controls: (configA.config.controls ?? []).length,
+      providerOptions: configA.config.providerOptions,
+    }),
+  );
+  // The **value** half, not just the existence of a control (V-P2). Dropping
+  // `providerOptions[OPTION_PERMISSION] = this.#permission` from `configState()`
+  // left every assertion above green: the control was still drawn, but the host
+  // reads the committed value from `providerOptions`, so the select would fall
+  // back to its (absent) `defaultValue` and render empty while the session really
+  // runs under this preset. The fake bridge pins `current: "workspace-write"`.
+  check(
+    "the committed permission value is published in providerOptions",
+    configA.config.providerOptions?.permission === "workspace-write",
+    JSON.stringify({ permission: configA.config.providerOptions?.permission }),
+  );
+
+  // The preset is the other mirrored option, and its value only exists on a
+  // profile that advertises presets. The fake bridge does that in `preset-reject`
+  // mode (the mode `open-degrade-check` uses for the refusal notice), selected
+  // here through `DSH_FAKE_MODE_FILE` for exactly this one open.
+  {
+    const presetSession = `settings-preset-${Date.now()}`;
+    let presetConfig;
+    fs.writeFileSync(fakeModeFile, "preset-reject\n");
+    try {
+      presetConfig = await open(presetSession);
+    } finally {
+      fs.rmSync(fakeModeFile, { force: true });
+    }
+    const presetControl = (presetConfig.config.controls ?? []).find((control) => control.key === "preset");
+    check(
+      "a profile with presets gets a preset control with its choices",
+      presetControl !== undefined
+        && (presetControl.choices ?? []).map((choice) => choice.value).join(",") === "default-pet,chosen-pet",
+      JSON.stringify(presetControl ?? null),
+    );
+    check(
+      "the committed preset value is published in providerOptions (the runtime's current, not a default)",
+      presetConfig.config.providerOptions?.preset === "default-pet",
+      JSON.stringify({ preset: presetConfig.config.providerOptions?.preset }),
+    );
+    check(
+      "…and the permission value rides in the same state",
+      presetConfig.config.providerOptions?.permission === "workspace-write",
+      JSON.stringify(presetConfig.config.providerOptions ?? null),
+    );
+    await conn.send({ type: "session.close", sessionId: presetSession });
+    await until(
+      (event) => event.type === "session.closed" && event.sessionId === presetSession,
+      "preset session closed",
+    );
+  }
+
   check(
     "the plugin asked the bridge for the runtime settings",
     frames().some((frame) => frame.method === "paseo/settings/list"),
@@ -472,7 +566,7 @@ process.on("exit", () => {
     type: "session.configure",
     requestId: "configure-settings-1",
     sessionId: sessionA,
-    changes: { settings: { "dsh:dsh-unrestricted:enabled": "on" } },
+    changes: { providerOptions: { "dsh:dsh-unrestricted:enabled": "on" } },
   });
   await until(
     (event) => event.type === "request.completed" && event.requestId === "configure-settings-1",
@@ -505,7 +599,7 @@ process.on("exit", () => {
     type: "session.configure",
     requestId: "configure-settings-noop",
     sessionId: sessionA,
-    changes: { settings: { "dsh:dsh-unrestricted:enabled": "on" } },
+    changes: { providerOptions: { "dsh:dsh-unrestricted:enabled": "on" } },
   });
   await until(
     (event) => event.type === "request.completed" && event.requestId === "configure-settings-noop",
@@ -518,6 +612,40 @@ process.on("exit", () => {
     `${String(setFrames().length)} set frame(s)`,
   );
 
+  // A `null` is upstream's "put the key back to the provider's default". These
+  // keys mirror DSH's own state (the preset and permission it reports, the
+  // profile's global switch), so there is no default of ours to return to: the
+  // request writes nothing, says so on daemon stderr, and the config re-emitted
+  // after the call keeps carrying the runtime's value.
+  const framesBeforeReset = setFrames().length;
+  const resetStderr = await captureStderr(async () => {
+    await conn.send({
+      type: "session.configure",
+      requestId: "configure-settings-reset",
+      sessionId: sessionA,
+      changes: { providerOptions: { "dsh:dsh-unrestricted:enabled": null } },
+    });
+    await until(
+      (event) => event.type === "request.completed" && event.requestId === "configure-settings-reset",
+      "reset configure completed",
+    );
+  });
+  await sleep(100);
+  check(
+    "a null (back to the provider default) writes nothing and keeps the runtime value",
+    setFrames().length === framesBeforeReset
+      && dshRows(lastConfig(sessionA))[0]?.value === "on",
+    JSON.stringify({
+      frames: setFrames().length - framesBeforeReset,
+      row: dshRows(lastConfig(sessionA)),
+    }),
+  );
+  check(
+    "…and one daemon-stderr line says the runtime value is the only default",
+    resetStderr.filter((line) => /ignoring reset request for DSH setting/.test(line)).length === 1,
+    JSON.stringify(resetStderr),
+  );
+
   // Legacy shape: Paseo can hand back a boolean persisted while this row was a
   // toggle. It must be normalised before the no-op comparison and before the
   // bridge write — `Boolean("off")` is true, so a naive pass-through would
@@ -526,7 +654,7 @@ process.on("exit", () => {
     type: "session.configure",
     requestId: "configure-settings-legacy-noop",
     sessionId: sessionA,
-    changes: { settings: { "dsh:dsh-unrestricted:enabled": true } },
+    changes: { providerOptions: { "dsh:dsh-unrestricted:enabled": true } },
   });
   await until(
     (event) => event.type === "request.completed" && event.requestId === "configure-settings-legacy-noop",
@@ -542,7 +670,7 @@ process.on("exit", () => {
     type: "session.configure",
     requestId: "configure-settings-legacy-write",
     sessionId: sessionA,
-    changes: { settings: { "dsh:dsh-unrestricted:enabled": false } },
+    changes: { providerOptions: { "dsh:dsh-unrestricted:enabled": false } },
   });
   await until(
     (event) => event.type === "request.completed" && event.requestId === "configure-settings-legacy-write",
@@ -566,7 +694,7 @@ process.on("exit", () => {
     type: "session.configure",
     requestId: "configure-settings-restore-on",
     sessionId: sessionA,
-    changes: { settings: { "dsh:dsh-unrestricted:enabled": "on" } },
+    changes: { providerOptions: { "dsh:dsh-unrestricted:enabled": "on" } },
   });
   await until(
     (event) => event.type === "request.completed" && event.requestId === "configure-settings-restore-on",
@@ -599,7 +727,7 @@ process.on("exit", () => {
       type: "session.configure",
       requestId,
       sessionId: sessionA,
-      changes: { settings: { "dsh:dsh-unrestricted:enabled": "off" } },
+      changes: { providerOptions: { "dsh:dsh-unrestricted:enabled": "off" } },
     });
     const failed = await until(
       (event) => event.type === "request.failed" && event.requestId === requestId,
@@ -818,14 +946,14 @@ process.on("exit", () => {
   // ---- 5. a create-panel pick is deferred to the first prompt -------------
   //
   // Paseo's create panel puts the user's picks into the new agent's
-  // `featureValues`; the host hands them back as `config.settings` on a fresh
+  // `providerOptions`; the host hands them back as `config.providerOptions` on a fresh
   // open. Writing on open would be wrong (the draft menu refresh is itself an
   // open), so the value is parked until the first prompt.
   writeSettings([settingsItem({ field: { path: ["enabled"], value: false, revision: 7 } })]);
   const sessionD = `settings-d-${Date.now()}`;
   const setMarkD = setFrames().length;
   // The create panel publishes the select value, exactly like the daemon.
-  const configD = await open(sessionD, { settings: { "dsh:dsh-unrestricted:enabled": "on" } });
+  const configD = await open(sessionD, { providerOptions: { "dsh:dsh-unrestricted:enabled": "on" } });
   check(
     "a fresh open carrying a dsh: pick does not write it yet",
     setFrames().length === setMarkD,
@@ -880,7 +1008,7 @@ process.on("exit", () => {
   // would fail its boolean check).
   const sessionD2 = `settings-d2-${Date.now()}`;
   const setMarkD2 = setFrames().length;
-  const configD2 = await open(sessionD2, { settings: { "dsh:dsh-unrestricted:enabled": false } });
+  const configD2 = await open(sessionD2, { providerOptions: { "dsh:dsh-unrestricted:enabled": false } });
   check(
     "a fresh open carrying a legacy boolean pick parks it without writing",
     setFrames().length === setMarkD2 && dshRows(configD2)[0]?.value === "on",
@@ -934,7 +1062,7 @@ process.on("exit", () => {
       type: "session.configure",
       requestId: "configure-child-settings",
       sessionId: childId,
-      changes: { settings: { "dsh:dsh-unrestricted:enabled": true } },
+      changes: { providerOptions: { "dsh:dsh-unrestricted:enabled": true } },
     });
     const childRefused = await until(
       (event) => event.type === "request.failed" && event.requestId === "configure-child-settings",
@@ -958,7 +1086,7 @@ process.on("exit", () => {
   writeSettingsFailure({ code: "conflict", message: "scripted conflict" });
   const sessionE = `settings-e-${Date.now()}`;
   const markE = events.length;
-  await open(sessionE, { settings: { "dsh:dsh-unrestricted:enabled": "off" } });
+  await open(sessionE, { providerOptions: { "dsh:dsh-unrestricted:enabled": "off" } });
   await prompt(sessionE, "prompt-pending-fail");
   const warningE = await until(
     (event) => event.type === "session.notice"
@@ -1020,7 +1148,7 @@ process.on("exit", () => {
   // ---- 7. a session that is never prompted writes nothing (draft path) ----
   const sessionF = `settings-f-${Date.now()}`;
   const setMarkF = setFrames().length;
-  await open(sessionF, { settings: { "dsh:dsh-unrestricted:enabled": "off" } });
+  await open(sessionF, { providerOptions: { "dsh:dsh-unrestricted:enabled": "off" } });
   await conn.send({ type: "session.close", sessionId: sessionF });
   await until((event) => event.type === "session.closed" && event.sessionId === sessionF, "session F closed");
   await sleep(150);
@@ -1041,7 +1169,7 @@ process.on("exit", () => {
   const markG = events.length;
   const stderrLines = await captureStderr(async () => {
     await open(sessionG, {
-      settings: { "dsh:dsh-unrestricted:enabled": false }, // runtime is true
+      providerOptions: { "dsh:dsh-unrestricted:enabled": false }, // runtime is true
       persistence: { version: 1, data: { sessionId: resumeId } },
     });
   });
@@ -1075,7 +1203,7 @@ process.on("exit", () => {
   const sessionH = `settings-h-${Date.now()}`;
   const matchingStderr = await captureStderr(async () => {
     await open(sessionH, {
-      settings: { "dsh:dsh-unrestricted:enabled": "on" }, // runtime is true
+      providerOptions: { "dsh:dsh-unrestricted:enabled": "on" }, // runtime is true
       persistence: { version: 1, data: { sessionId: `settings-resume-${Date.now()}` } },
     });
   });

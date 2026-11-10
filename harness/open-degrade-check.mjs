@@ -124,7 +124,7 @@ async function openInMode(mode, options = {}) {
     config: {
       cwd: options.cwd ?? process.cwd(),
       mode: options.mode ?? "build",
-      ...(options.settings === undefined ? {} : { settings: options.settings }),
+      ...(options.providerOptions === undefined ? {} : { providerOptions: options.providerOptions }),
     },
     history: options.history ?? "skip",
   });
@@ -162,7 +162,7 @@ console.log("open-time degradations are visible on the timeline");
 
 {
   const { conn, events } = await openInMode("preset-reject", {
-    settings: { preset: "chosen-pet" },
+    providerOptions: { preset: "chosen-pet" },
   });
   const notices = noticesOf(events, "预设未应用");
   check(

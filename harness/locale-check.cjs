@@ -54,7 +54,8 @@
  * type is no longer read from that package — it is declared locally in
  * `client/agent-message.ts`, because Paseo 0.11 and earlier resolve type-only
  * imports at install time and that module does not exist there
- * (`requirements.paseo` is `>=0.9.2`).
+ * (`requirements.paseo` was `>=0.9.2` when this was written; the local
+ * declaration stays as the pinned shape this harness compiles).
  *
  * Only pure modules are compiled: the React renderers import the host runtime,
  * which plain `node` resolution cannot see.
@@ -232,9 +233,28 @@ console.log("the jobs pill's copy is covered in both languages");
   // Every key the interface declares must be present in both, and the two key
   // sets must match — a key added to one language only is the drift this catches.
   equal("jobs keys match", Object.keys(en).sort(), Object.keys(zh).sort());
-  for (const key of ["pillLabel", "title", "statuses", "allSettled", "settledLabel", "unavailable"]) {
+  for (const key of [
+    "pillLabel",
+    "title",
+    "statuses",
+    "allSettled",
+    "settledLabel",
+    "unavailable",
+    // The row's stop button (2026-11-11): its accessible name and the four notes
+    // it can put under a row. A missing one would fall back to nothing on screen
+    // — an empty `NoteLine` — so presence and translation are both asserted.
+    "stop",
+    "stopAlreadyFinished",
+    "stopAlreadyStopping",
+    "stopGone",
+    "stopSentStillRunning",
+  ]) {
     check(`jobs.${key} exists in both languages`, en[key] !== undefined && zh[key] !== undefined);
   }
+  for (const key of ["stopAlreadyFinished", "stopAlreadyStopping", "stopGone", "stopSentStillRunning"]) {
+    check(`jobs.${key} is translated, not copied`, zh[key] !== en[key], JSON.stringify([en[key], zh[key]]));
+  }
+  check("the a11y template keeps its {title} slot in both languages", en.stop.includes("{title}") && zh.stop.includes("{title}"));
   // CJ-01 route 2: the pill is a live indicator. A stale `idleLabel` is exactly
   // the second count shape the history-visible regression added, so its absence
   // is asserted per language.

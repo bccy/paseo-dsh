@@ -440,6 +440,121 @@ check(
   isolate.sharedBridgeAbsent === true,
 );
 
+// The clone must not compete with the live DSH, and must not write the live
+// memory store. A real profile pins `webserver` to one host:port for
+// bookmarkable URLs (a real profile pins something like `127.0.0.1:44209`); a second DSH on
+// that port exits with `EADDRINUSE`, which every real-turn script reports as
+// "timed out waiting for session.ready" — an environment failure that looks like
+// a plugin bug. `dsh-memory`'s `dataDir` is the same shape: the clone would open
+// a second writer on the user's own database. The helper rewrites both inside
+// the clone (never in the source) and says so in the returned `sandboxed` list.
+const pinningPatch = [
+  "- id: webserver",
+  "  config:",
+  "    host: 127.0.0.1",
+  "    port: 44209",
+  "- id: web-runtime",
+  "  config:",
+  "    printUrl: true",
+  "- id: dsh-memory",
+  "  config:",
+  "    dataDir: /home/someone/.dsh/memory-paseo",
+  "    trace:",
+  "      enabled: true",
+  "",
+].join("\n");
+const pinnedHome = mkdtempSync(join(scratch, "source-home-pinned-"));
+mkdirSync(join(pinnedHome, "profiles", "paseo"), { recursive: true });
+writeFileSync(join(pinnedHome, "profiles", "paseo", "cordis.patch.yml"), pinningPatch);
+const sandboxProbe = `
+const helper = require(${JSON.stringify(isolateHelper)});
+const fs = require('node:fs');
+const path = require('node:path');
+const source = ${JSON.stringify(pinnedHome)};
+const before = fs.readFileSync(path.join(source, 'profiles', 'paseo', 'cordis.patch.yml'), 'utf8');
+const mode = helper.prepareDshHome({ script: 'probe', profile: 'paseo', argv: [], env: { DSH_HOME_SOURCE: source } });
+const cloned = fs.readFileSync(path.join(mode.home, 'profiles', 'paseo', 'cordis.patch.yml'), 'utf8');
+const result = {
+  sandboxed: mode.sandboxed,
+  portZeroed: /^\\s+port:\\s*0\\s*$/m.test(cloned) && !/44209/.test(cloned),
+  memoryInsideClone: cloned.includes('dataDir: ' + path.join(mode.home, 'memory-paseo')),
+  unrelatedUntouched: cloned.includes('printUrl: true') && cloned.includes('host: 127.0.0.1'),
+  sourceUnchanged: fs.readFileSync(path.join(source, 'profiles', 'paseo', 'cordis.patch.yml'), 'utf8') === before,
+};
+mode.cleanup();
+process.stdout.write(JSON.stringify(result));
+`;
+const sandboxRun = spawnSync(process.execPath, ['-e', sandboxProbe], {
+  env: isolationEnv,
+  encoding: 'utf8',
+  timeout: 20000,
+});
+let sandbox;
+try {
+  sandbox = JSON.parse(sandboxRun.stdout ?? '{}');
+} catch {
+  sandbox = {};
+}
+check(
+  'a cloned profile with a pinned listener port gets port 0 in the clone',
+  sandbox.portZeroed === true,
+  JSON.stringify(sandbox.sandboxed ?? null),
+);
+check(
+  '…and its memory directory is redirected into the throwaway home',
+  sandbox.memoryInsideClone === true,
+  `sandboxed=${JSON.stringify(sandbox.sandboxed ?? null)}`,
+);
+check(
+  '…while every other option and the source profile are left untouched',
+  sandbox.unrelatedUntouched === true && sandbox.sourceUnchanged === true,
+  `unrelated=${String(sandbox.unrelatedUntouched)} sourceUnchanged=${String(sandbox.sourceUnchanged)}`,
+);
+check(
+  'the helper reports what it sandboxed (so the run says why the clone differs)',
+  Array.isArray(sandbox.sandboxed) &&
+    sandbox.sandboxed.includes('webserver.port') &&
+    sandbox.sandboxed.includes('dsh-memory.dataDir'),
+  JSON.stringify(sandbox.sandboxed ?? null),
+);
+
+// A profile that already listens on port 0 and has no memory plugin is left
+// byte-identical: this is a sandbox for the clone, not a rewrite of the user's
+// config, and inventing an entry would make the clone lie about the profile.
+const freePortHome = mkdtempSync(join(scratch, "source-home-freeport-"));
+mkdirSync(join(freePortHome, "profiles", "paseo"), { recursive: true });
+const freePortPatch = "- id: webserver\n  config:\n    port: 0\n";
+writeFileSync(join(freePortHome, "profiles", "paseo", "cordis.patch.yml"), freePortPatch);
+const freePortProbe = `
+const helper = require(${JSON.stringify(isolateHelper)});
+const fs = require('node:fs');
+const path = require('node:path');
+const source = ${JSON.stringify(freePortHome)};
+const mode = helper.prepareDshHome({ script: 'probe', profile: 'paseo', argv: [], env: { DSH_HOME_SOURCE: source } });
+const cloned = fs.readFileSync(path.join(mode.home, 'profiles', 'paseo', 'cordis.patch.yml'), 'utf8');
+const result = { sandboxed: mode.sandboxed, unchanged: cloned === ${JSON.stringify(freePortPatch)} };
+mode.cleanup();
+process.stdout.write(JSON.stringify(result));
+`;
+const freePortRun = spawnSync(process.execPath, ['-e', freePortProbe], {
+  env: isolationEnv,
+  encoding: 'utf8',
+  timeout: 20000,
+});
+let freePort;
+try {
+  freePort = JSON.parse(freePortRun.stdout ?? '{}');
+} catch {
+  freePort = {};
+}
+check(
+  'a profile already on port 0 with no memory plugin clones byte-identical (nothing invented)',
+  freePort.unchanged === true &&
+    Array.isArray(freePort.sandboxed) &&
+    freePort.sandboxed.length === 0,
+  `sandboxed=${JSON.stringify(freePort.sandboxed ?? null)} unchanged=${String(freePort.unchanged)}`,
+);
+
 // The plugin provisions the bridge beside the profiles now (pnpm owns the
 // profile's own node_modules), so a profile-only clone would boot a profile DSH
 // composes without the bridge layer. The helper must copy that anchor too, as a

@@ -172,6 +172,42 @@ async function maybeSince(start, predicate, ms = 30000) {
   return undefined;
 }
 
+/**
+ * One composer option row of a `session.config`, read the Paseo 0.16 way.
+ *
+ * The state names the keys that get a control in `controls` and carries their
+ * committed values in `providerOptions`; the deprecated `settings` array this
+ * check used to read is no longer reported (reporting both would be a second,
+ * unread vocabulary — the host stops sending changes under that name the moment
+ * the new pair appears). Each row is flattened to the shape the assertions
+ * read: `id` from `key`, `value` from `providerOptions[key]`, `options` from
+ * `choices`.
+ *
+ * @param configEvent - one `session.config` event.
+ * @param key - the option key, e.g. `preset` or `dsh:<ns>:<path>`.
+ * @returns the row, or undefined when this state has no control for the key.
+ */
+function optionRow(configEvent, key) {
+  const control = (configEvent?.config?.controls ?? []).find((candidate) => candidate.key === key);
+  if (control === undefined) return undefined;
+  return {
+    ...control,
+    id: control.key,
+    value: configEvent.config.providerOptions?.[key],
+    options: control.choices,
+  };
+}
+
+/** The first `session.config` that carries a control for `key`, across all events. */
+function firstOptionRow(key) {
+  for (const event of events) {
+    if (event.type !== "session.config") continue;
+    const row = optionRow(event, key);
+    if (row !== undefined) return row;
+  }
+  return undefined;
+}
+
 const results = [];
 const check = (name, pass, detail) => {
   results.push({ name, pass, detail });
@@ -254,10 +290,7 @@ const check = (name, pass, detail) => {
   );
 
   // 0b. the agent-preset select is advertised when the profile declares presets.
-  const presetSetting = events
-    .filter((e) => e.type === "session.config")
-    .flatMap((e) => e.config?.settings ?? [])
-    .find((s) => s.id === "preset");
+  const presetSetting = firstOptionRow("preset");
   if (presetSetting !== undefined) {
     check(
       "→ preset setting advertised",
@@ -269,10 +302,7 @@ const check = (name, pass, detail) => {
   }
 
   // 0c. the permission setting is advertised and switching it moves the DSH preset.
-  const permissionSetting = events
-    .filter((e) => e.type === "session.config")
-    .flatMap((e) => e.config?.settings ?? [])
-    .find((s) => s.id === "permission");
+  const permissionSetting = firstOptionRow("permission");
   const permissionOptions = permissionSetting?.options ?? [];
   check(
     "→ permission setting advertised",
@@ -302,12 +332,12 @@ const check = (name, pass, detail) => {
     type: "session.configure",
     sessionId,
     requestId: "cfg-permission",
-    changes: { settings: { permission: "danger-full-access" } },
+    changes: { providerOptions: { permission: "danger-full-access" } },
   });
   const permissionApplied = await until(
     (e) =>
       e.type === "session.config" &&
-      (e.config?.settings ?? []).some((s) => s.id === "permission" && s.value === "danger-full-access"),
+      optionRow(e, "permission")?.value === "danger-full-access",
     "permission applied",
   );
   check("permission setting switches the preset", permissionApplied !== undefined, "value=danger-full-access");
@@ -349,8 +379,7 @@ const check = (name, pass, detail) => {
   const dshToggleId = firstToggle === undefined
     ? undefined
     : `dsh:${firstToggle.ns}:${firstToggle.field.path.join(".")}`;
-  const toggleIn = (configEvent) =>
-    (configEvent?.config?.settings ?? []).find((setting) => setting.id === dshToggleId);
+  const toggleIn = (configEvent) => optionRow(configEvent, dshToggleId);
   if (settingsReceipt?.available !== true) {
     console.log("  (this profile composes no settings service — the DSH settings pass-through cannot be verified here)");
   } else {
@@ -381,7 +410,7 @@ const check = (name, pass, detail) => {
         type: "session.configure",
         sessionId,
         requestId: "cfg-dsh-toggle",
-        changes: { settings: { [dshToggleId]: selectValue(targetValue) } },
+        changes: { providerOptions: { [dshToggleId]: selectValue(targetValue) } },
       });
       const toggleApplied = await untilSince(
         toggleMark,
@@ -458,7 +487,7 @@ const check = (name, pass, detail) => {
         type: "session.configure",
         sessionId,
         requestId: "cfg-dsh-toggle-restore",
-        changes: { settings: { [dshToggleId]: selectValue(originalValue) } },
+        changes: { providerOptions: { [dshToggleId]: selectValue(originalValue) } },
       });
       const restored = await untilSince(
         restoreMark,
