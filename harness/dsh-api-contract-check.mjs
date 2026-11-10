@@ -13,8 +13,9 @@
  * UI showed a blank error. `doctor` was green throughout — it checks install
  * completeness, not the soft contracts the bridge depends on.
  *
- * This check closes that gap for the import surface specifically. It asserts two
- * things, and both are needed:
+ * This check closes that gap for the two surfaces the bridge depends on: the
+ * **imports** it makes at load time, and the **service operations** it calls at
+ * run time. It asserts:
  *
  *   1. **Coverage** — every `@deepseek-ai/*` package the bridge imports is listed
  *      in `EXPECTED` below. A new import added to the bridge without updating the
@@ -22,6 +23,11 @@
  *   2. **Presence** — every symbol the manifest names is still exported by the
  *      installed package. This is what turns "upgraded, ran a real turn, saw a
  *      blank error" into "upgraded, ran this, got the symbol name".
+ *   3. **Service surface** — the `ctx.<name>` services the bridge looks up at run
+ *      time still declare the operations it calls (`EXPECTED_SERVICE_SURFACE`).
+ *      An import check cannot see these: a service is reached through
+ *      `ctx.get('jobs')` and duck-typed, so a renamed operation would be a
+ *      `TypeError` in the middle of a user action, not an import failure.
  *
  * It deliberately does NOT assert behaviour. Signature changes that keep the symbol
  * name are invisible here; `harness/plugin-check.cjs` covers those by driving a
@@ -35,7 +41,7 @@
  */
 import { homedir } from 'node:os';
 import { readdirSync, readFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, relative } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -74,6 +80,36 @@ const EXPECTED = {
   'dsh-tools': { named: { defineTool: 'function' } },
   'dsh-subprocess': { named: { scrubbedParentEnv: 'function' } },
   schemastery: { default: 'function' },
+};
+
+/**
+ * The services the bridge reaches through `ctx.get(...)`, and the operations it
+ * calls on them.
+ *
+ * Unlike {@link EXPECTED}, these packages are **not** imports: the bridge
+ * duck-types whatever the profile composes, which is what keeps it loadable on a
+ * profile with no job registry at all. The contract lives in the abstract service
+ * (the package's `.d.ts`), and the shipped implementation is what actually runs,
+ * so both are asserted: a rename in either place would otherwise surface as a
+ * failed user action rather than as a load error.
+ *
+ * Scope is deliberately the operations this bridge calls. `list` and `get` are
+ * the jobs read; `kill` is the one `paseo/jobs/stop` added (2026-11-11) — it is
+ * DSH's own stop entry, the same one `dsh-tool-jobs`' `job_kill` uses.
+ */
+const EXPECTED_SERVICE_SURFACE = {
+  'dsh-jobs': {
+    // The abstract contract: what the `.d.ts` must still declare. Read from the
+    // file the package's own `types` field names, so an upstream path move is
+    // reported as "cannot read" instead of silently shrinking the check.
+    abstractOps: ['list', 'get', 'kill'],
+  },
+  'dsh-jobs-local': {
+    // The implementation the `paseo` profile actually composes: the prototype
+    // must still carry the operations, or `ctx.jobs.kill` is not a function.
+    implementationClass: 'LocalJobRegistry',
+    prototypeOps: ['list', 'get', 'kill'],
+  },
 };
 
 const results = [];
@@ -271,6 +307,64 @@ for (const [pkg, spec] of Object.entries(EXPECTED)) {
     problems.length === 0,
     problems.length === 0 ? undefined : problems.join('; '),
   );
+}
+
+// ---- 3b. the service operations the bridge calls at run time ----------------
+//
+// These are not imports, so section 3 cannot see them. Both halves of the job
+// contract are checked: the abstract declaration (dsh-jobs) and the class the
+// profile actually composes (dsh-jobs-local).
+
+for (const [pkg, spec] of Object.entries(EXPECTED_SERVICE_SURFACE)) {
+  const pkgDir = join(dshPackages, pkg);
+  let manifest;
+  try {
+    manifest = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8'));
+  } catch (error) {
+    check(`${pkg} is installed for its service surface`, false, `unreadable at ${pkgDir} (${error.code ?? error.message})`);
+    continue;
+  }
+
+  if (spec.abstractOps !== undefined) {
+    const typesFile = join(pkgDir, manifest.types ?? manifest.main?.replace(/\.js$/, '.d.ts') ?? 'lib/index.d.ts');
+    let text;
+    try {
+      text = readFileSync(typesFile, 'utf8');
+    } catch (error) {
+      check(`${pkg} type surface is readable`, false, `${typesFile} (${error.code ?? error.message})`);
+      continue;
+    }
+    const missing = spec.abstractOps.filter((op) => !new RegExp(`abstract\\s+${op}\\s*\\(`).test(text));
+    check(
+      `${pkg}@${manifest.version ?? '?'} still declares ${spec.abstractOps.join(', ')}`,
+      missing.length === 0,
+      missing.length === 0 ? `declared in ${relative(dshPackages, typesFile)}` : `not declared: ${missing.join(', ')}`,
+    );
+  }
+
+  if (spec.implementationClass !== undefined) {
+    const entry = join(pkgDir, manifest.main ?? 'lib/index.js');
+    let module;
+    try {
+      module = await import(pathToFileURL(entry).href);
+    } catch (error) {
+      check(`${pkg} loads`, false, `${entry} (${error.code ?? error.message})`);
+      continue;
+    }
+    const klass = module[spec.implementationClass];
+    const missing = typeof klass !== 'function'
+      ? spec.prototypeOps
+      : spec.prototypeOps.filter((op) => typeof klass.prototype[op] !== 'function');
+    check(
+      `${pkg}@${manifest.version ?? '?'} ${spec.implementationClass} still implements ${spec.prototypeOps.join(', ')}`,
+      typeof klass === 'function' && missing.length === 0,
+      typeof klass !== 'function'
+        ? `${spec.implementationClass} is ${typeof klass}`
+        : missing.length === 0
+          ? 'all implemented'
+          : `missing on the prototype: ${missing.join(', ')}`,
+    );
+  }
 }
 
 // ---- 4. the version the bridge was verified against ------------------------

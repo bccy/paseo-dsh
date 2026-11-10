@@ -1,26 +1,22 @@
 /**
- * Offline assertions for the jobs pill's state machine: the poll sequence, the
- * visibility/count rule, the polling policy and the controller's terminal and
- * pagination branches.
+ * Offline assertions for the jobs pill's data layer: the visibility/count rule,
+ * the registry ordering, the settle latch, and the per-agent subscription
+ * controller the pill drives.
  *
  * `client/jobs-pill.tsx` imports the host runtime, so plain `node` cannot load it.
- * The rules live in `client/poll-sequence.ts` and `client/jobs-polling.ts`, which
- * have no React or host imports; this drives the real implementations — the
- * controller with a fake clock and a fake RPC, so its timers and terminal paths
- * are behaviour, not source regexes.
+ * The rules live in `client/jobs-polling.ts` and `client/agent-subscriptions.ts`,
+ * which have no React or host imports; this drives the real implementations — a
+ * fake host that pushes answers by hand, a fake directory page and a fake
+ * projection — so the controller's publish, terminal and directory branches are
+ * behaviour, not source regexes.
  *
- * The two scenarios at the top are the bugs review found in the first version:
- *
- * 1. a mass invalidation → `register`: the per-agent numbers were cleared, so
- *    the next poll took the same number again and a stale answer passed the "is
- *    it newest" test. (The directory snapshot no longer tears every entry down
- *    — since 2026-11-09 `applySnapshot` removes the diff and keeps the agents it
- *    still lists — so this now models a full teardown of the map, e.g. `dispose()`.)
- * 2. `remove` then `register`: `remove` never advanced the number, so an answer in
- *    flight still published into a deleted entry.
- *
- * The old algorithm is also re-implemented inline and asserted to *pass* the same
- * stale answers, so this file fails if someone reintroduces that shape.
+ * **What the 0.16 port changed here (2026-11-11).** The four-second poll timer,
+ * its jitter and its failure backoff moved to the server
+ * (`server/pill-feed`), so those are asserted by `harness/pill-feed-check.cjs`;
+ * the poll-sequence module and this file's two stale-answer scenarios were
+ * deleted with the timers they guarded. What remains is the client half: one
+ * subscription per agent, publish-on-change, terminal removal, the directory
+ * diff and pagination, and the pill's own copy.
  *
  * Run (from paseo-plugin):
  *   npx tsc -p ../harness/jobs-poll.tsconfig.json
@@ -35,27 +31,22 @@
 
 "use strict";
 
-const { createPollSequence } = require("./client/poll-sequence.js");
 const {
   jobsPillCopy,
   jobsPillPresentation,
   isBridgeEnvironmentJobsError,
-  nextPollDelayMs,
-  initialPollDelayMs,
   isTerminalJobsErrorCode,
-  createJobsPoller,
-  LIVE_POLL_MS,
-  MAX_POLL_MS,
-  INITIAL_POLL_JITTER_MS,
-  MAX_POLL_JITTER_MS,
+  createJobsProjection,
+  jobsPillViewState,
 } = require("./client/jobs-polling.js");
+const { createAgentSubscriptions } = require("./client/agent-subscriptions.js");
 const fs = require("node:fs");
 const path = require("node:path");
 const {
   orderJobs,
   splitJobs,
   settleDownJobs,
-  jobsList,
+  jobsSnapshot,
   JOB_ERROR_CODES,
   TERMINAL_JOB_ERROR_CODES,
 } = require("./shared/jobs.js");
@@ -82,111 +73,6 @@ function assert(what, condition, detail) {
   if (condition) return;
   failures += 1;
   console.error(`  FAIL ${what}${detail === undefined ? "" : `: ${detail}`}`);
-}
-
-/* Primitives ----------------------------------------------------------------- */
-
-console.log("poll sequence primitives");
-
-{
-  const sequence = createPollSequence();
-  const first = sequence.issue("a");
-  check("issue() starts at 1", first, 1);
-  check("the first number is current", sequence.isCurrent("a", first), true);
-
-  const second = sequence.issue("a");
-  check("a second issue is larger", second > first, true);
-  check("the older number is no longer current", sequence.isCurrent("a", first), false);
-
-  // Numbers are global, not per agent: that is what makes "an old number can never
-  // look newest again" true across a teardown.
-  const other = sequence.issue("b");
-  assert("numbers are unique across agents", other !== second, `a=${second} b=${other}`);
-  check("an unknown agent has no latest number", sequence.latest("never"), undefined);
-  check("another agent's number is not current", sequence.isCurrent("b", second), false);
-}
-
-/* Scenario 1: a mass invalidation then register() ---------------------------- */
-
-// registered → poll in flight → every entry torn down at once → the same id
-// registered again → new poll → the old answer arrives. It must not publish.
-// This is *not* the snapshot path any more: `applySnapshot` removes the diff and
-// keeps every entry the listing still names (2026-11-09, `client/agent-polling.ts`),
-// so the scenario pins the sequence's rule for a full teardown (`dispose()`, or a
-// future snapshot policy that does tear down).
-console.log("\nscenario 1: invalidateAll() then register()");
-
-{
-  const sequence = createPollSequence();
-  const inFlight = sequence.issue("x");
-  sequence.invalidateAll();
-  const fresh = sequence.issue("x");
-
-  assert("the post-snapshot poll gets a NEW number", fresh !== inFlight, `both are ${fresh}`);
-  check("the pre-snapshot answer must NOT publish", sequence.isCurrent("x", inFlight), false);
-  check("the post-snapshot answer must publish", sequence.isCurrent("x", fresh), true);
-}
-
-/* Scenario 2: remove() with a poll in flight ---------------------------------- */
-
-// The positive control matters: a sequence that rejected everything would also
-// pass the first half of this scenario.
-console.log("\nscenario 2: remove() with a poll in flight");
-
-{
-  const sequence = createPollSequence();
-  const beforeRemove = sequence.issue("y");
-  sequence.invalidate("y");
-
-  check("the in-flight answer must NOT publish", sequence.isCurrent("y", beforeRemove), false);
-  check("the agent has no latest number after removal", sequence.latest("y"), undefined);
-
-  const afterReRegister = sequence.issue("y");
-  assert("the new registration's number is larger", afterReRegister > beforeRemove, `${afterReRegister} vs ${beforeRemove}`);
-  check("the new registration's answer MUST publish", sequence.isCurrent("y", afterReRegister), true);
-
-  // Removing one agent must not disturb another's in-flight poll.
-  const z = sequence.issue("z");
-  sequence.invalidate("y");
-  check("removing y leaves z's poll current", sequence.isCurrent("z", z), true);
-}
-
-/* The old algorithm must fail both ------------------------------------------- */
-
-// `const issued = new Map(); seq = (issued.get(id) ?? 0) + 1; current = issued.get(id) === seq`
-// with a mass invalidation clearing the map and `remove` doing nothing.
-console.log("\nthe old algorithm must fail the same scenarios");
-
-function createOldSequence() {
-  const issued = new Map();
-  return {
-    issue(agentId) {
-      const seq = (issued.get(agentId) ?? 0) + 1;
-      issued.set(agentId, seq);
-      return seq;
-    },
-    isCurrent(agentId, seq) {
-      return issued.get(agentId) === seq;
-    },
-    invalidateAll() {
-      issued.clear();
-    },
-    remove() {},
-  };
-}
-
-{
-  const old = createOldSequence();
-  const inFlight = old.issue("x");
-  old.invalidateAll();
-  const fresh = old.issue("x");
-  check("OLD: the post-snapshot poll collides", fresh, inFlight);
-  check("OLD: so the stale answer wrongly publishes", old.isCurrent("x", inFlight), true);
-
-  const old2 = createOldSequence();
-  const beforeRemove = old2.issue("y");
-  old2.remove();
-  check("OLD: the removed agent's answer still publishes", old2.isCurrent("y", beforeRemove), true);
 }
 
 /* ---------------------------------------------------------------------------- */
@@ -521,40 +407,6 @@ console.log("\nthe popover renders the failed-read note above the rows");
   }
 }
 
-// CJ-02: one timer per agent must not become one burst per four seconds. The
-// policy is a pure function of the failure count, so the base interval, the
-// backoff and the jitter are assertable without a clock; the controller tests
-// below drive the real timers. Live-only visibility makes the pill hidden most
-// of the time, so the hidden interval must equal the visible one: the old 15 s
-// hidden probe would make a new job appear up to four times slower than the
-// baseline's 4 s.
-console.log("\npolling intervals (one base rate, failure backoff, jitter)");
-{
-  check("a readable answer polls at the base interval", nextPollDelayMs(0, () => 0), LIVE_POLL_MS);
-  check("the first failed read doubles the base", nextPollDelayMs(1, () => 0), LIVE_POLL_MS * 2);
-  check("the second failed read doubles again", nextPollDelayMs(2, () => 0), LIVE_POLL_MS * 4);
-  check("failure backoff is capped", nextPollDelayMs(8, () => 0), MAX_POLL_MS);
-
-  const jittered = nextPollDelayMs(0, () => 0.99);
-  assert("jitter is added, never subtracted", jittered > LIVE_POLL_MS, String(jittered));
-  assert("jitter is capped", jittered <= LIVE_POLL_MS + MAX_POLL_JITTER_MS, String(jittered));
-  assert(
-    "two agents with different random draws do not share an interval",
-    nextPollDelayMs(0, () => 0.1) !== nextPollDelayMs(0, () => 0.9),
-  );
-
-  const firstInitial = initialPollDelayMs(() => 0);
-  const secondInitial = initialPollDelayMs(() => 0.999);
-  check("an initial poll can start immediately", firstInitial, 0);
-  assert(
-    "initial polls are spread instead of created on one tick",
-    secondInitial > firstInitial && secondInitial < INITIAL_POLL_JITTER_MS,
-    `${firstInitial} / ${secondInitial}`,
-  );
-}
-
-/* CJ-04: the contract's error code and the client's terminal rule ----------------- */
-
 console.log("\nthe jobs error contract (terminal vs transient)");
 {
   equal("the contract lists exactly the error codes", [...JOB_ERROR_CODES], [
@@ -572,26 +424,40 @@ console.log("\nthe jobs error contract (terminal vs transient)");
   check("an unknown code is not terminal", isTerminalJobsErrorCode("something_else"), false);
   check("a missing code is not terminal", isTerminalJobsErrorCode(undefined), false);
 
-  const withTerminal = jobsList.output.safeParse({
+  const withTerminal = jobsSnapshot.event.safeParse({
     available: false,
     jobs: [],
     error: { message: "old bridge", code: "bridge_too_old" },
   });
-  check("jobs.list accepts a terminal code", withTerminal.success, true);
-  const withTransient = jobsList.output.safeParse({
+  check("the jobs snapshot answer accepts a terminal code", withTerminal.success, true);
+  const withTransient = jobsSnapshot.event.safeParse({
     available: false,
     jobs: [],
     error: { message: "flaky", code: "rpc_failed" },
   });
-  check("jobs.list accepts a transient code", withTransient.success, true);
-  const unknownCode = jobsList.output.safeParse({
+  check("the jobs snapshot answer accepts a transient code", withTransient.success, true);
+  const unknownCode = jobsSnapshot.event.safeParse({
     available: false,
     jobs: [],
     error: { message: "x", code: "not_a_code" },
   });
-  check("jobs.list rejects an unknown code", unknownCode.success, false);
-  const legacy = jobsList.output.safeParse({ available: false, jobs: [], error: { message: "x" } });
+  check("the jobs answer rejects an unknown code", unknownCode.success, false);
+  const legacy = jobsSnapshot.event.safeParse({ available: false, jobs: [], error: { message: "x" } });
   check("a code-less error from an older server stays valid", legacy.success, true);
+
+  // `canStop` is required on every row (the jobs-stop RPC's read side). A
+  // bridge that predates the stop feature sends no field at all, and the parse
+  // must fail loudly rather than default it to false — a missing `canStop` on a
+  // *running* row would otherwise draw no stop control on a job that can be
+  // stopped, which is the silent-degradation shape this repo keeps finding.
+  const stoppingRow = { id: "bash-1", kind: "bash", label: "ls", status: "running", startedAt: 1 };
+  const noCanStop = jobsSnapshot.event.safeParse({ available: true, jobs: [stoppingRow] });
+  check("a job row without canStop is rejected (an older bridge cannot look stoppable)", noCanStop.success, false);
+  const withCanStop = jobsSnapshot.event.safeParse({
+    available: true,
+    jobs: [{ ...stoppingRow, canStop: true }],
+  });
+  check("…and one with it parses", withCanStop.success, true);
 
   // The server half's wiring: the contract above only helps if the plugin
   // actually sends the code. These three files are read as source because the
@@ -625,97 +491,155 @@ console.log("\nthe jobs error contract (terminal vs transient)");
     /result\.error\?\.code\s*===\s*undefined\s*\?\s*\{\}\s*:\s*\{\s*code:\s*result\.error\.code\s*\}/.test(providerSource),
   );
   assert(
-    "the jobs.list RPC answers with the error object unchanged",
-    /\(result\.error === undefined \? \{\} : \{ error: result\.error \}\)/.test(serverEntrySource),
+    "index.server serves the jobs snapshot subscription over the shared feed",
+    /server\.handle\(jobsSnapshot/.test(serverEntrySource) &&
+      /jobsFeed\.subscribe\(agentId/.test(serverEntrySource),
+  );
+  assert(
+    "the jobs feed grades the terminal codes from the shared list",
+    /isTerminal: \(answer\) => !answer\.available && isTerminalJobsErrorCode\(answer\.error\?\.code\)/.test(
+      serverEntrySource,
+    ),
   );
 }
 
 /* The controller, driven by a fake clock ----------------------------------------- */
 async function runControllerChecks() {
-
-  const { createFakeClock, createPollerHarness } = (() => {
-    function createFakeClock() {
-      let now = 0;
-      let nextId = 1;
-      const timers = new Map();
-      return {
-        setTimeout(fn, delay) {
-          const id = nextId;
-          nextId += 1;
-          timers.set(id, { at: now + delay, fn });
-          return id;
-        },
-        clearTimeout(id) {
-          timers.delete(id);
-        },
-        pendingDelays() {
-          return [...timers.values()].map((timer) => timer.at - now).sort((left, right) => left - right);
-        },
-        async advance(ms) {
-          const target = now + ms;
-          for (;;) {
-            let due = null;
-            for (const [id, timer] of timers) {
-              if (timer.at <= target && (due === null || timer.at < due.at)) due = { id, at: timer.at, fn: timer.fn };
-            }
-            if (due === null) break;
-            timers.delete(due.id);
-            now = due.at;
-            due.fn();
-            // Let the poll's promise chain and its next schedule land before the
-            // loop looks for the next due timer.
-            await new Promise((resolve) => setImmediate(resolve));
-            await new Promise((resolve) => setImmediate(resolve));
-          }
-          now = target;
-        },
-      };
+  /**
+   * The fake host: one push channel per agent, exactly what `client.subscribe`
+   * gives the real pill — an answer callback, an end callback (the host closed
+   * it by itself) and the abort signal this side releases with.
+   */
+  function createHarness(overrides = {}) {
+    const calls = {
+      added: [],
+      updated: [],
+      removed: [],
+      states: [],
+      errors: [],
+      pages: [],
+      reads: 0,
+      opens: [],
+      aborts: [],
+    };
+    /** agentId -> { onAnswer, onEnd, signal } for the live subscription. */
+    const live = new Map();
+    const settle = () => new Promise((resolve) => setImmediate(resolve));
+    /** Set below; `removeAgent` uses it exactly like the pill's own teardown. */
+    let projection;
+    const host = {
+      open(agentId, onAnswer, onEnd, signal) {
+        calls.opens.push(agentId);
+        live.set(agentId, { onAnswer, onEnd, signal });
+        signal.addEventListener("abort", () => {
+          calls.aborts.push(agentId);
+          live.delete(agentId);
+        });
+      },
+      listAgentPage:
+        overrides.listAgentPage ??
+        (async (cursor) => {
+          calls.pages.push(cursor);
+          return { entries: [], pageInfo: { hasMore: false, nextCursor: null } };
+        }),
+      addAgent(agent) {
+        calls.added.push(agent.id);
+      },
+      updateAgent(agent) {
+        calls.updated.push(agent.id);
+      },
+      removeAgent(agentId, reason, error) {
+        // The real jobs pill drops both per-agent maps here (`createJobsProjection`'s
+        // `forget`); the latch's teardown rule is only meaningful if the fake does
+        // the same.
+        projection?.forget(agentId);
+        calls.removed.push([agentId, reason, error === undefined ? undefined : error.code]);
+      },
+      publishState(agentId, state) {
+        // The real pill's conversion, not a copy of it: what the store and the
+        // popover see is `jobsPillViewState(state)`.
+        const view = jobsPillViewState(state);
+        // A scenario may need the publish itself to fail: the controller must
+        // report that instead of letting it escape into the host's event
+        // dispatch.
+        if (overrides.publishState !== undefined) {
+          overrides.publishState(agentId, view, calls);
+          return;
+        }
+        calls.states.push([agentId, view]);
+      },
+      onError(message, error) {
+        calls.errors.push([message, error instanceof Error ? error.message : error]);
+      },
+      project: overrides.project,
+      isTerminalErrorCode: isTerminalJobsErrorCode,
+      initialData: [],
+      fallbackErrorMessage: "the DSH runtime could not list this session's jobs",
+      pillLabel: "jobs pill",
+    };
+    if (host.project === undefined) {
+      projection = createJobsProjection({ onError: host.onError });
+      host.project = (agentId, answer) => projection.project(agentId, answer);
     }
+    const subscriptions = createAgentSubscriptions(host);
 
-    function createPollerHarness(overrides = {}) {
-      const clock = createFakeClock();
-      const calls = { added: [], removed: [], states: [], errors: [], pages: [], reads: 0 };
-      const host = {
-        setTimeout: clock.setTimeout,
-        clearTimeout: clock.clearTimeout,
-        random: overrides.random ?? (() => 0),
-        readJobs:
-          overrides.readJobs ??
-          (async () => {
-            calls.reads += 1;
-            return { available: true, jobs: [] };
-          }),
-        listAgentPage:
-          overrides.listAgentPage ??
-          (async (cursor) => {
-            calls.pages.push(cursor);
-            return { entries: [], pageInfo: { hasMore: false, nextCursor: null } };
-          }),
-        addAgent(agent) {
-          calls.added.push(agent.id);
+    /**
+     * The answer the server would push for one agent now.
+     *
+     * A `readJobs` that throws models the *server's* read throwing — which the
+     * client never sees: `server/pill-feed` reports that on its side and keeps the
+     * last answer. A **failed** read is an `available: false` answer, and that is
+     * what the controller grades, so a throw here becomes one (`answerFor`
+     * mirrors `pill-feed`'s `answerFor`). The old scenarios said "the read failed"
+     * by throwing; they keep meaning exactly that.
+     */
+    const answerFor = async (agentId) => {
+      calls.reads += 1;
+      try {
+        return await (overrides.readJobs ? overrides.readJobs(agentId) : { available: true, jobs: [] });
+      } catch (error) {
+        return { available: false, jobs: [], error: { message: error instanceof Error ? error.message : String(error) } };
+      }
+    };
+    /** Push one answer to one agent, as the server's feed would. */
+    const deliver = async (agentId) => {
+      const record = live.get(agentId);
+      if (record === undefined) return false;
+      const answer = await answerFor(agentId);
+      record.onAnswer(answer);
+      await settle();
+      return true;
+    };
+    return {
+      calls,
+      live,
+      subscriptions,
+      deliver,
+      settle,
+      /** Deliver one answer to every live subscription (the old "tick"). */
+      async step() {
+        for (const agentId of [...live.keys()]) await deliver(agentId);
+      },
+      /** The host closes one agent's subscription by itself. */
+      close(agentId, error) {
+        const record = live.get(agentId);
+        if (record === undefined) return;
+        record.onEnd(error);
+        live.delete(agentId);
+      },
+      /** The old scenarios advanced a clock; the push model has nothing to time. */
+      clock: {
+        async advance() {
+          for (const agentId of [...live.keys()]) await deliver(agentId);
         },
-        removeAgent(agentId, reason, error) {
-          calls.removed.push([agentId, reason, error === undefined ? undefined : error.code]);
-        },
-        publishState(agentId, state) {
-          // A scenario may need the publish itself to fail (the controller's
-          // top-level `onError` branch is only reachable when a tick rejects).
-          if (overrides.publishState !== undefined) {
-            overrides.publishState(agentId, state, calls);
-            return;
-          }
-          calls.states.push([agentId, state]);
-        },
-        onError(message, error) {
-          calls.errors.push([message, error instanceof Error ? error.message : error]);
-        },
-      };
-      const poller = createJobsPoller(host);
-      return { clock, calls, poller };
-    }
+      },
+    };
+  }
 
-    return { createFakeClock, createPollerHarness };
-  })();
+  const snapshot = (ids) => ({
+    entries: ids.map((id) => ({ agent: { id, workspaceId: "ws" } })),
+    pageInfo: { hasMore: false, nextCursor: null },
+  });
 
   // CJ-03: the subscription snapshot is one page (the daemon caps it at 200
   // entries). The controller must walk pageInfo.nextCursor, or agents after the
@@ -724,30 +648,31 @@ async function runControllerChecks() {
   console.log("\nagent-directory snapshot pagination");
   {
     const pages = [];
-    const harness = createPollerHarness({
+    const harness = createHarness({
       listAgentPage: async (cursor) => {
         pages.push(cursor);
-        return { entries: [{ agent: { id: "agent-2", workspaceId: "ws" } }], pageInfo: { hasMore: false, nextCursor: null } };
+        return {
+          entries: [{ agent: { id: "agent-2", workspaceId: "ws" } }],
+          pageInfo: { hasMore: false, nextCursor: null },
+        };
       },
     });
-    await harness.poller.applySnapshot({
+    await harness.subscriptions.applySnapshot({
       entries: [{ agent: { id: "agent-1", workspaceId: "ws" } }],
       pageInfo: { hasMore: true, nextCursor: "cursor-1" },
     });
     equal("both pages are registered", harness.calls.added, ["agent-1", "agent-2"]);
     equal("the second page is fetched with the snapshot's cursor", pages, ["cursor-1"]);
     equal("a terminating directory raises no pagination error", harness.calls.errors, []);
-    harness.poller.dispose();
+    equal("every registered agent gets a subscription", harness.calls.opens, ["agent-1", "agent-2"]);
+    harness.subscriptions.dispose();
 
     // The reverse control: a one-page snapshot must not fetch a page at all. A
     // controller that always paginates would pass the first half alone.
-    const single = createPollerHarness();
-    await single.poller.applySnapshot({
-      entries: [{ agent: { id: "only", workspaceId: "ws" } }],
-      pageInfo: { hasMore: false, nextCursor: null },
-    });
+    const single = createHarness();
+    await single.subscriptions.applySnapshot(snapshot(["only"]));
     equal("a one-page snapshot makes no extra request", single.calls.pages, []);
-    single.poller.dispose();
+    single.subscriptions.dispose();
   }
 
   // A reconnect can deliver a fresh snapshot while an older snapshot's next page
@@ -757,198 +682,154 @@ async function runControllerChecks() {
     const gate = new Promise((resolve) => {
       release = resolve;
     });
-    const harness = createPollerHarness({
+    const harness = createHarness({
       listAgentPage: async () => {
         await gate;
-        return { entries: [{ agent: { id: "stale-agent", workspaceId: "ws" } }], pageInfo: { hasMore: false, nextCursor: null } };
+        return {
+          entries: [{ agent: { id: "stale-agent", workspaceId: "ws" } }],
+          pageInfo: { hasMore: false, nextCursor: null },
+        };
       },
     });
-    const first = harness.poller.applySnapshot({
+    const first = harness.subscriptions.applySnapshot({
       entries: [{ agent: { id: "fresh-1", workspaceId: "ws" } }],
       pageInfo: { hasMore: true, nextCursor: "cursor-1" },
     });
     await new Promise((resolve) => setImmediate(resolve));
-    await harness.poller.applySnapshot({
-      entries: [{ agent: { id: "fresh-2", workspaceId: "ws" } }],
-      pageInfo: { hasMore: false, nextCursor: null },
-    });
+    await harness.subscriptions.applySnapshot(snapshot(["fresh-2"]));
     release();
     await first;
     assert("the stale page is discarded after a newer snapshot", !harness.calls.added.includes("stale-agent"));
     equal("only the newest snapshot's agents are registered", harness.calls.added.filter((id) => id !== "fresh-1"), ["fresh-2"]);
-    harness.poller.dispose();
+    harness.subscriptions.dispose();
   }
 
-  // CJ-02 (behaviour): the controller's own timers. Every readable answer polls
-  // at the base interval — a settled-only answer now hides the pill, but hidden
-  // is the normal state under live-only visibility, so it must not slow down to
-  // the old 15 s probe. Failures grow 8 s → 16 s → the cap.
-  console.log("\npoll controller cadence");
+  // One subscription per agent, opened when the pill is registered and released
+  // with it. The pill used to start a timer per agent; the push model must not
+  // open a second stream for the same agent, and must close the one it has when
+  // the agent leaves.
+  console.log("\none subscription per agent");
   {
-    let answer = { available: true, jobs: [{ status: "completed" }] };
-    const harness = createPollerHarness({
-      readJobs: async () => {
-        harness.calls.reads += 1;
-        return answer;
-      },
-      random: () => 0,
-    });
-    await harness.poller.applySnapshot({
-      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
-      pageInfo: { hasMore: false, nextCursor: null },
-    });
-    equal("the first poll is scheduled immediately (random 0)", harness.clock.pendingDelays(), [0]);
-    await harness.clock.advance(0);
-    equal("the first readable answer publishes", harness.calls.states.length, 1);
-    check("the settled answer keeps the pill's state available", harness.calls.states[0][1].available, true);
-    equal("a settled (hidden) pill still polls at the base interval", harness.clock.pendingDelays(), [LIVE_POLL_MS]);
+    const harness = createHarness();
+    await harness.subscriptions.applySnapshot(snapshot(["a"]));
+    equal("registering an agent opens its subscription", harness.calls.opens, ["a"]);
+    await harness.step();
+    equal("the first pushed answer publishes", harness.calls.states.length, 1);
+    check("…and it is a readable answer", harness.calls.states[0][1].available, true);
 
-    answer = { available: true, jobs: [] };
-    await harness.clock.advance(LIVE_POLL_MS);
-    equal("a changed answer publishes", harness.calls.states.length, 2);
-    equal("an empty pill keeps the base interval, not a slow hidden one", harness.clock.pendingDelays(), [LIVE_POLL_MS]);
-    harness.poller.dispose();
+    harness.subscriptions.upsert({ id: "a", workspaceId: "ws", status: "running" });
+    equal("an agent update does not reopen the subscription", harness.calls.opens, ["a"]);
+    equal("…and is handed to the pill (its metadata channel)", harness.calls.updated, ["a"]);
+
+    harness.subscriptions.drop("a");
+    equal("a removed agent releases its subscription", harness.calls.aborts, ["a"]);
+    assert("…and nothing is left listening", !harness.live.has("a"));
+    const before = harness.calls.reads;
+    await harness.step();
+    equal("a released agent is never pushed again", harness.calls.reads, before);
+    harness.subscriptions.dispose();
   }
 
-  // CJ-01 (behaviour): a poll that finds nothing new must not publish. Publishing
-  // is what rebuilds the popover's store row (waking its listeners) and calls
+  // A late answer for a released entry must not publish: the pill (and its store
+  // row) is gone, and the host would otherwise show a row for an agent that has
+  // no registration left.
+  {
+    const harness = createHarness();
+    await harness.subscriptions.applySnapshot(snapshot(["a"]));
+    const record = harness.live.get("a");
+    harness.subscriptions.drop("a");
+    const published = harness.calls.states.length;
+    record.onAnswer({ available: true, jobs: [] });
+    await harness.settle();
+    equal("an answer after the release publishes nothing", harness.calls.states.length, published);
+    harness.subscriptions.dispose();
+  }
+
+  // CJ-01 (behaviour): an answer that repeats must not publish. Publishing is
+  // what rebuilds the popover's store row (waking its listeners) and calls
   // `registration.update()`, which the host republishes unconditionally — and
   // under live-only visibility "nothing running" is the normal answer, so the
-  // idle session was repainting the composer and any open popover every 4 s.
-  console.log("\npoll controller publish dedup");
+  // idle session was repainting the composer and any open popover on every push.
+  console.log("\npublish dedup");
   {
     // A readable answer that repeats publishes once; a changed one still goes
-    // through, and the cadence is untouched by the dedup.
+    // through.
     let answer = { available: true, jobs: [] };
-    const harness = createPollerHarness({
-      readJobs: async () => {
-        harness.calls.reads += 1;
-        return answer;
-      },
-      random: () => 0,
-    });
-    await harness.poller.applySnapshot({
-      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
-      pageInfo: { hasMore: false, nextCursor: null },
-    });
-    await harness.clock.advance(0);
+    const harness = createHarness({ readJobs: async () => answer });
+    await harness.subscriptions.applySnapshot(snapshot(["a"]));
+    await harness.clock.advance();
     equal("the first readable answer publishes", harness.calls.states.length, 1);
-    await harness.clock.advance(LIVE_POLL_MS);
-    await harness.clock.advance(LIVE_POLL_MS);
+    await harness.clock.advance();
+    await harness.clock.advance();
     equal("two identical answers do not publish again", harness.calls.states.length, 1);
-    equal("the deduped polls still run at the base interval", harness.clock.pendingDelays(), [LIVE_POLL_MS]);
     answer = { available: true, jobs: [{ status: "running" }] };
-    await harness.clock.advance(LIVE_POLL_MS);
+    await harness.clock.advance();
     equal("a job appearing publishes", harness.calls.states.length, 2);
     equal("…with the live answer", harness.calls.states[1][1].jobs.length, 1);
-    harness.poller.dispose();
+    harness.subscriptions.dispose();
   }
   {
-    // The same failure repeated is also the same answer: it must publish once
-    // while the backoff still grows, and a different message must publish.
+    // The same failure repeated is also the same answer: it must publish once.
+    // (The backoff it used to grow here now lives in `server/pill-feed`, and
+    // `harness/pill-feed-check.cjs` asserts it.)
     let message = "registry exploded";
-    const harness = createPollerHarness({
+    const harness = createHarness({
       readJobs: async () => {
-        harness.calls.reads += 1;
         throw new Error(message);
       },
-      random: () => 0,
     });
-    await harness.poller.applySnapshot({
-      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
-      pageInfo: { hasMore: false, nextCursor: null },
-    });
-    await harness.clock.advance(0);
+    await harness.subscriptions.applySnapshot(snapshot(["a"]));
+    await harness.clock.advance();
     equal("a failure publishes once", harness.calls.states.length, 1);
-    await harness.clock.advance(LIVE_POLL_MS * 2);
+    await harness.clock.advance();
     equal("the same failure repeated does not publish again", harness.calls.states.length, 1);
-    equal("…and the backoff still grows", harness.clock.pendingDelays(), [LIVE_POLL_MS * 4]);
     message = "registry exploded differently";
-    await harness.clock.advance(LIVE_POLL_MS * 4);
+    await harness.clock.advance();
     equal("a different failure message publishes", harness.calls.states.length, 2);
-    harness.poller.dispose();
+    harness.subscriptions.dispose();
   }
   {
     // Recovery is a change even when the job list is empty: the unavailable
     // answer must not stick.
     let fail = true;
-    const harness = createPollerHarness({
+    const harness = createHarness({
       readJobs: async () => {
-        harness.calls.reads += 1;
         if (fail) throw new Error("registry exploded");
         return { available: true, jobs: [] };
       },
-      random: () => 0,
     });
-    await harness.poller.applySnapshot({
-      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
-      pageInfo: { hasMore: false, nextCursor: null },
-    });
-    await harness.clock.advance(0);
+    await harness.subscriptions.applySnapshot(snapshot(["a"]));
+    await harness.clock.advance();
     equal("a failure publishes once", harness.calls.states.length, 1);
     fail = false;
-    await harness.clock.advance(LIVE_POLL_MS * 2);
+    await harness.clock.advance();
     equal("recovery publishes even with no jobs", harness.calls.states.length, 2);
     check("…and the published answer is readable again", harness.calls.states[1][1].available, true);
-    harness.poller.dispose();
+    harness.subscriptions.dispose();
   }
   {
     // The guard is per agent: two agents with identical answers each publish
     // their own first answer, and then neither publishes again.
-    const harness = createPollerHarness({
-      readJobs: async () => ({ available: true, jobs: [] }),
-    });
-    await harness.poller.applySnapshot({
-      entries: [
-        { agent: { id: "a", workspaceId: "ws" } },
-        { agent: { id: "b", workspaceId: "ws" } },
-      ],
-      pageInfo: { hasMore: false, nextCursor: null },
-    });
-    await harness.clock.advance(0);
+    const harness = createHarness();
+    await harness.subscriptions.applySnapshot(snapshot(["a", "b"]));
+    await harness.clock.advance();
     equal("each agent's first answer publishes", harness.calls.states.map(([agentId]) => agentId).sort(), ["a", "b"]);
-    await harness.clock.advance(LIVE_POLL_MS);
+    await harness.clock.advance();
     equal("…and identical answers publish nothing more", harness.calls.states.length, 2);
-    harness.poller.dispose();
+    harness.subscriptions.dispose();
   }
   {
     // A re-registration is a new pill: its store row was dropped, so its first
     // answer must publish even if it is identical to the one before the drop.
-    const harness = createPollerHarness({
-      readJobs: async () => ({ available: true, jobs: [] }),
-    });
-    await harness.poller.applySnapshot({
-      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
-      pageInfo: { hasMore: false, nextCursor: null },
-    });
-    await harness.clock.advance(0);
+    const harness = createHarness();
+    await harness.subscriptions.applySnapshot(snapshot(["a"]));
+    await harness.clock.advance();
     equal("a fresh registration publishes its first answer", harness.calls.states.length, 1);
-    harness.poller.drop("a");
-    harness.poller.upsert({ id: "a", workspaceId: "ws" });
-    await harness.clock.advance(0);
+    harness.subscriptions.drop("a");
+    harness.subscriptions.upsert({ id: "a", workspaceId: "ws" });
+    await harness.clock.advance();
     equal("a re-registration publishes again", harness.calls.states.length, 2);
-    harness.poller.dispose();
-  }
-  {
-    const harness = createPollerHarness({
-      readJobs: async () => {
-        harness.calls.reads += 1;
-        throw new Error("registry exploded");
-      },
-      random: () => 0,
-    });
-    await harness.poller.applySnapshot({
-      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
-      pageInfo: { hasMore: false, nextCursor: null },
-    });
-    await harness.clock.advance(0);
-    check("a failed read publishes an unavailable state", harness.calls.states[0][1].available, false);
-    equal("the first failure backs off to 8 s", harness.clock.pendingDelays(), [LIVE_POLL_MS * 2]);
-    await harness.clock.advance(LIVE_POLL_MS * 2);
-    equal("the second failure backs off to 16 s", harness.clock.pendingDelays(), [LIVE_POLL_MS * 4]);
-    await harness.clock.advance(LIVE_POLL_MS * 4);
-    equal("the third failure is capped", harness.clock.pendingDelays(), [MAX_POLL_MS]);
-    harness.poller.dispose();
+    harness.subscriptions.dispose();
   }
 
   // ── The two user-reported paths, end to end through the real controller ────
@@ -961,41 +842,31 @@ async function runControllerChecks() {
   {
     let answer = { available: true, jobs: [] };
     let fail = false;
-    /** Advance to the next scheduled poll (whatever the backoff is). */
-    const step = async () => {
-      const [delay] = harness.clock.pendingDelays();
-      await harness.clock.advance(delay ?? 0);
-    };
-    const harness = createPollerHarness({
+    const harness = createHarness({
       readJobs: async () => {
-        harness.calls.reads += 1;
         if (fail) throw new Error("Stream end encountered");
         return answer;
       },
-      random: () => 0,
-    });
-    await harness.poller.applySnapshot({
-      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
-      pageInfo: { hasMore: false, nextCursor: null },
     });
     const last = () => harness.calls.states[harness.calls.states.length - 1][1];
-    await step();
+    await harness.subscriptions.applySnapshot(snapshot(["a"]));
+    await harness.step();
     check("the first readable empty answer hides the pill", jobsPillPresentation(last()).visible, false);
 
     fail = true;
-    await step();
+    await harness.step();
     equal("the failed read is published (the popover can say so)", last().available, false);
     equal("…carrying the last known rows, not a fabricated list", last().jobs, []);
     check("…and does not make the pill appear", jobsPillPresentation(last()).visible, false);
 
     // Path B: with a real job running, the same failure keeps the pill and its
-    // count — the job is running whether or not the registry answers this poll.
+    // count — the job is running whether or not the registry answers this read.
     fail = false;
     answer = { available: true, jobs: [{ id: "bash-1", status: "running", startedAt: 1 }] };
-    await step();
+    await harness.step();
     check("a running job shows the pill", jobsPillPresentation(last()).visible, true);
     fail = true;
-    await step();
+    await harness.step();
     equal("the failure carries the running job", last().jobs, answer.jobs);
     check("…so the pill stays visible", jobsPillPresentation(last()).visible, true);
     equal("…and keeps the real count", jobsPillPresentation(last()).label, { kind: "live", count: 1 });
@@ -1004,25 +875,24 @@ async function runControllerChecks() {
     // not bring it back.
     fail = false;
     answer = { available: true, jobs: [{ id: "bash-1", status: "completed", startedAt: 1, finishedAt: 2 }] };
-    await step();
+    await harness.step();
     check("the settled answer hides the pill", jobsPillPresentation(last()).visible, false);
     fail = true;
-    await step();
-    check("a later failure does not bring it back", jobsPillPresentation(last()).visible, false);
-    harness.poller.dispose();
+    await harness.step();
+    check("a later failure does not bring the settled-only pill back", jobsPillPresentation(last()).visible, false);
+    harness.subscriptions.dispose();
   }
 
   // Review P2-1 (2026-11-10): with the pill no longer carrying a failed read,
   // the console line is the only thing that keeps "could not read" loud instead
   // of looking like "nothing is running". Exactly one line per entry into the
-  // failed state (not per poll), one on recovery, and none for a terminal code —
-  // the pill's removal already logs exactly one line there.
+  // failed state (not per answer), one on recovery, and none for a terminal code
+  // — the pill's removal already logs exactly one line there.
   console.log("\nthe failed-read console line");
   {
     let mode = "ok";
-    const harness = createPollerHarness({
+    const harness = createHarness({
       readJobs: async () => {
-        harness.calls.reads += 1;
         if (mode === "throw") throw new Error("Stream end encountered");
         if (mode === "unreadable") {
           return { available: false, jobs: [], error: { message: "registry exploded", code: "rpc_failed" } };
@@ -1032,21 +902,13 @@ async function runControllerChecks() {
         }
         return { available: true, jobs: [] };
       },
-      random: () => 0,
     });
-    const step = async () => {
-      const [delay] = harness.clock.pendingDelays();
-      await harness.clock.advance(delay ?? 0);
-    };
-    await harness.poller.applySnapshot({
-      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
-      pageInfo: { hasMore: false, nextCursor: null },
-    });
-    await step();
-    equal("a readable poll logs nothing", harness.calls.errors, []);
+    await harness.subscriptions.applySnapshot(snapshot(["a"]));
+    await harness.step();
+    equal("a readable answer logs nothing", harness.calls.errors, []);
 
     mode = "throw";
-    await step();
+    await harness.step();
     equal("entering the failed state logs exactly once", harness.calls.errors.length, 1);
     equal(
       "…with the pill's console sentence and the agent id",
@@ -1055,37 +917,36 @@ async function runControllerChecks() {
     );
     equal("…and the underlying message", harness.calls.errors[0][1], "Stream end encountered");
 
-    await step();
+    await harness.step();
     equal("a repeated failure does not log again", harness.calls.errors.length, 1);
     mode = "unreadable";
-    await step();
+    await harness.step();
     equal("a different failure shape in the same state does not log again", harness.calls.errors.length, 1);
 
     mode = "ok";
-    await step();
+    await harness.step();
     equal("recovery logs one line", harness.calls.errors.length, 2);
     equal(
       "…naming the recovery",
       harness.calls.errors[1][0],
       "jobs pill: this session's jobs are readable again for a",
     );
-    equal("…with no error detail (the sink must not print \"undefined\")", harness.calls.errors[1][1], undefined);
+    equal('…with no error detail (the sink must not print "undefined")', harness.calls.errors[1][1], undefined);
 
     mode = "terminal";
-    await step();
+    await harness.step();
     equal("a terminal code adds no unreadable line (removal logs its own)", harness.calls.errors.length, 2);
     equal("…and removes the pill once", harness.calls.removed.map(([id, reason]) => [id, reason]), [["a", "terminal"]]);
-    harness.poller.dispose();
+    harness.subscriptions.dispose();
   }
 
   // Path B "job 结算后": **a defensive guard, not a diagnosed regression** — the
   // fixture (a settled id reported running) is a shape DSH does not produce, and
-  // the controller's sequence guard already rejects a superseded in-flight
-  // answer. The latch covers the paths those guards cannot see; the assertion
-  // pins the intended monotonicity: the stale answer is projected back to the
-  // settled row, so it is identical to the previous one and the controller does
-  // not even publish (no repaint, no pill). A genuinely new job is a new id and
-  // still appears in the same poll.
+  // the transport only pushes changed snapshots. The latch covers the paths those
+  // guards cannot see; the assertion pins the intended monotonicity: the stale
+  // answer is projected back to the settled row, so it is identical to the
+  // previous one and the controller does not even publish (no repaint, no pill).
+  // A genuinely new job is a new id and still appears in the same answer.
   console.log("\npath B: a settled job cannot be resurrected by a later answer");
   {
     const answers = [
@@ -1103,38 +964,27 @@ async function runControllerChecks() {
       },
     ];
     let index = 0;
-    const harness = createPollerHarness({
-      readJobs: async () => {
-        harness.calls.reads += 1;
-        return answers[Math.min(index, answers.length - 1)];
-      },
-      random: () => 0,
+    const harness = createHarness({
+      readJobs: async () => answers[Math.min(index, answers.length - 1)],
     });
-    const step = async () => {
-      const [delay] = harness.clock.pendingDelays();
-      await harness.clock.advance(delay ?? 0);
-    };
     const last = () => harness.calls.states[harness.calls.states.length - 1][1];
-    await harness.poller.applySnapshot({
-      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
-      pageInfo: { hasMore: false, nextCursor: null },
-    });
-    await step();
+    await harness.subscriptions.applySnapshot(snapshot(["a"]));
+    await harness.step();
     equal("a running job is counted", jobsPillPresentation(last()).label, { kind: "live", count: 1 });
 
     index = 1;
-    await step();
+    await harness.step();
     check("the settled answer hides the pill", jobsPillPresentation(last()).visible, false);
     const publishedWhenSettled = harness.calls.states.length;
 
     index = 2;
-    await step();
+    await harness.step();
     equal("a stale 'running' for the settled id is not published again", harness.calls.states.length, publishedWhenSettled);
     equal("…and the popover still holds the settled row", last().jobs, answers[1].jobs);
     check("…so the pill does not reappear", jobsPillPresentation(last()).visible, false);
 
     index = 3;
-    await step();
+    await harness.step();
     equal("a new job (new id) still appears", jobsPillPresentation(last()).label, { kind: "live", count: 1 });
     equal("…with the settled row kept beside it", last().jobs, answers[3].jobs);
 
@@ -1142,206 +992,216 @@ async function runControllerChecks() {
     // long-lived client cannot accumulate one entry per agent it ever saw. The
     // observable proof: after removal + re-registration the same id is read from
     // the wire again instead of being quietly projected back to settled.
-    harness.poller.drop("a");
+    harness.subscriptions.drop("a");
     index = 2;
-    harness.poller.upsert({ id: "a", workspaceId: "ws" });
-    await step();
+    harness.subscriptions.upsert({ id: "a", workspaceId: "ws" });
+    await harness.step();
     equal(
       "after a teardown the latch is gone (the re-registration trusts the new answer)",
       jobsPillPresentation(last()).label,
       { kind: "live", count: 1 },
     );
-    harness.poller.dispose();
+    harness.subscriptions.dispose();
   }
 
-  // CJ-04 (behaviour): a terminal code removes the pill and stops the timer; a
-  // transient code keeps retrying. The pair is the positive control — a
-  // controller that stopped on every error would pass the first half alone.
-  console.log("\npoll controller terminal errors");
+  // CJ-04 (behaviour): a terminal code removes the pill and releases the stream;
+  // a transient code keeps it. The pair is the positive control — a controller
+  // that stopped on every error would pass the first half alone.
+  console.log("\nterminal errors");
   {
-    const harness = createPollerHarness({
-      readJobs: async () => {
-        harness.calls.reads += 1;
-        return { available: false, jobs: [], error: { message: "reload the plugin", code: "bridge_too_old" } };
-      },
+    const harness = createHarness({
+      readJobs: async () => ({ available: false, jobs: [], error: { message: "reload the plugin", code: "bridge_too_old" } }),
     });
-    await harness.poller.applySnapshot({
-      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
-      pageInfo: { hasMore: false, nextCursor: null },
-    });
-    await harness.clock.advance(0);
+    await harness.subscriptions.applySnapshot(snapshot(["a"]));
+    await harness.clock.advance();
     equal("a terminal error removes the pill", harness.calls.removed, [["a", "terminal", "bridge_too_old"]]);
-    equal("a terminal error leaves no timer behind", harness.clock.pendingDelays(), []);
-    await harness.clock.advance(60_000);
-    equal("a terminal error is never retried", harness.calls.reads, 1);
+    equal("a terminal error releases the subscription", harness.calls.aborts, ["a"]);
+    await harness.clock.advance();
+    equal("a terminal error is never re-read", harness.calls.reads, 1);
     // A terminal code is not a permission refusal: an upsert for the same agent
-    // must not bring the retry loop back (a plugin reload is what resets it).
-    harness.poller.upsert({ id: "a", workspaceId: "ws" });
+    // must not bring the stream back (a snapshot is what revives it).
+    harness.subscriptions.upsert({ id: "a", workspaceId: "ws" });
     equal("an upsert does not re-register a terminal agent", harness.calls.added, ["a"]);
-    equal("an upsert does not restart a terminal agent", harness.clock.pendingDelays(), []);
-    harness.poller.dispose();
+    equal("an upsert does not reopen a terminal agent's subscription", harness.calls.opens, ["a"]);
+    harness.subscriptions.dispose();
+  }
+  {
+    // The terminal entry stays flagged, and only a **new directory snapshot** —
+    // the host re-describing the world after a reconnect, when a plugin reload
+    // may have rewritten the bridge — rebuilds the pill.
+    const harness = createHarness({
+      readJobs: async () => ({ available: false, jobs: [], error: { message: "reload the plugin", code: "bridge_too_old" } }),
+    });
+    await harness.subscriptions.applySnapshot(snapshot(["a"]));
+    await harness.clock.advance();
+    equal("the terminal pill is removed", harness.calls.removed.length, 1);
+    await harness.subscriptions.applySnapshot(snapshot(["a"]));
+    equal("a fresh snapshot rebuilds the pill", harness.calls.added, ["a", "a"]);
+    equal("…and opens a new subscription", harness.calls.opens, ["a", "a"]);
+    harness.subscriptions.dispose();
   }
   {
     // The user-visible failure shape: the bridge never answers `paseo/jobs`, so
-    // the server now classifies the 15 s timeout as terminal `bridge_too_old`
-    // with the "did not answer" message. End-to-end at the controller boundary:
-    // one removal (that single removal is the one console.error in jobs-pill),
-    // no timer, and no further reads however long the clock runs — the polling
-    // storm a transient classification would cause.
-    const harness = createPollerHarness({
-      readJobs: async () => {
-        harness.calls.reads += 1;
-        return {
-          available: false,
-          jobs: [],
-          error: {
-            message: "this profile's bridge did not answer paseo/jobs (it may predate jobs support or be unresponsive); reload the plugin so the embedded bridge is rewritten",
-            code: "bridge_too_old",
-          },
-        };
-      },
+    // the server classifies the timeout as terminal `bridge_too_old` with the
+    // "did not answer" message. End-to-end at the controller boundary: one
+    // removal (that single removal is the one console.error in jobs-pill), and no
+    // further reads however long the host pushes — the read storm a transient
+    // classification would cause.
+    const harness = createHarness({
+      readJobs: async () => ({
+        available: false,
+        jobs: [],
+        error: {
+          message:
+            "this profile's bridge did not answer paseo/jobs (it may predate jobs support or be unresponsive); reload the plugin so the embedded bridge is rewritten",
+          code: "bridge_too_old",
+        },
+      }),
     });
-    await harness.poller.applySnapshot({
-      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
-      pageInfo: { hasMore: false, nextCursor: null },
-    });
-    await harness.clock.advance(0);
+    await harness.subscriptions.applySnapshot(snapshot(["a"]));
+    await harness.clock.advance();
     equal(
       "a paseo/jobs timeout removes the pill exactly once (one console line)",
       harness.calls.removed,
       [["a", "terminal", "bridge_too_old"]],
     );
-    equal("…and leaves no retry timer", harness.clock.pendingDelays(), []);
-    await harness.clock.advance(120_000);
-    equal("…and never retries (no polling storm)", harness.calls.reads, 1);
-    harness.poller.dispose();
+    equal("…and releases the stream", harness.calls.aborts, ["a"]);
+    await harness.clock.advance();
+    equal("…and never reads again (no polling storm)", harness.calls.reads, 1);
+    harness.subscriptions.dispose();
   }
   {
-    const harness = createPollerHarness({
-      readJobs: async () => {
-        harness.calls.reads += 1;
-        return { available: false, jobs: [], error: { message: "flaky", code: "rpc_failed" } };
-      },
+    const harness = createHarness({
+      readJobs: async () => ({ available: false, jobs: [], error: { message: "flaky", code: "rpc_failed" } }),
     });
-    await harness.poller.applySnapshot({
-      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
-      pageInfo: { hasMore: false, nextCursor: null },
-    });
-    await harness.clock.advance(0);
+    await harness.subscriptions.applySnapshot(snapshot(["a"]));
+    await harness.clock.advance();
     equal("a transient error keeps the pill", harness.calls.removed, []);
-    assert("a transient error keeps a retry timer", harness.clock.pendingDelays().length === 1);
-    harness.poller.dispose();
+    equal("a transient error keeps the subscription", harness.calls.aborts, []);
+    await harness.clock.advance();
+    equal("…and is still watched for the next answer", harness.calls.reads, 2);
+    harness.subscriptions.dispose();
   }
   {
-    const refusal = Object.assign(new Error("Session is not authorized for plugin.rpc.invoke.request"), {
+    // The host closes the subscription by itself (daemon restart, plugin stop):
+    // one console line and the pill's failed-read behaviour, with no client-side
+    // retry timer — Paseo re-subscribes on its own reconnect, and a fresh
+    // directory snapshot is the other recovery edge.
+    const harness = createHarness();
+    await harness.subscriptions.applySnapshot(snapshot(["a"]));
+    await harness.clock.advance();
+    const published = harness.calls.states.length;
+    harness.close("a", new Error("stream ended"));
+    equal("a host close logs one line", harness.calls.errors.length, 1);
+    equal(
+      "…naming the pill and the agent",
+      harness.calls.errors[0][0],
+      "jobs pill: the subscription for a ended; keeping the last known answer until the host re-subscribes",
+    );
+    equal("…and publishes the failed state", harness.calls.states.length, published + 1);
+    equal("…which is what the pill renders", harness.calls.states[published][1].available, false);
+    equal("…and the pill is not removed", harness.calls.removed, []);
+    await harness.subscriptions.applySnapshot(snapshot(["a"]));
+    equal("a fresh snapshot reopens the subscription", harness.calls.opens, ["a", "a"]);
+    harness.subscriptions.dispose();
+  }
+  {
+    // A refused subscription (`plugin.subscription.subscribe` needs a permission
+    // this connection lacks) rejects `ready`, which reaches this controller as a
+    // host close with that error: the pill goes, like the old RPC's permission
+    // refusal, and logs no extra "unreadable" line (the pill's own removal logs
+    // the refusal once).
+    const refusal = Object.assign(new Error("Session is not authorized for plugin.subscription.subscribe.request"), {
       code: "access_denied",
     });
-    const harness = createPollerHarness({
-      readJobs: async () => {
-        throw refusal;
-      },
+    const harness = createHarness({
+      // The refusal arrives before any answer: open then immediately close.
+      listAgentPage: async () => ({ entries: [], pageInfo: { hasMore: false, nextCursor: null } }),
     });
-    await harness.poller.applySnapshot({
-      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
-      pageInfo: { hasMore: false, nextCursor: null },
-    });
-    await harness.clock.advance(0);
+    await harness.subscriptions.applySnapshot(snapshot(["a"]));
+    harness.close("a", refusal);
     equal("a permission refusal stops the pill", harness.calls.removed, [["a", "unauthorized", undefined]]);
-    equal("a permission refusal leaves no timer", harness.clock.pendingDelays(), []);
-    // The pill's teardown logs the refusal; the adapter must not add a second line
-    // for the same event (2026-11-10, P2-1).
     equal("a permission refusal logs no extra unreadable line", harness.calls.errors, []);
     // A reconnect can widen permissions, so the agent is not terminal: a later
-    // upsert must build a fresh registration and poll again. Without this half, a
-    // controller that simply stopped forever would pass the assertions above.
-    harness.poller.upsert({ id: "a", workspaceId: "ws" });
+    // upsert must build a fresh registration and subscribe again. Without this
+    // half, a controller that simply stopped forever would pass the assertions
+    // above.
+    harness.subscriptions.upsert({ id: "a", workspaceId: "ws" });
     equal("a later upsert re-registers the agent", harness.calls.added, ["a", "a"]);
-    assert("a later upsert schedules a new poll", harness.clock.pendingDelays().length === 1);
-    harness.poller.dispose();
+    equal("…and subscribes again", harness.calls.opens, ["a", "a"]);
+    harness.subscriptions.dispose();
   }
-
-  // Two agents from one snapshot must not share a first tick: the initial delay is
-  // jittered per agent by the injected random source.
   {
-    const draws = [0, 0.5];
-    const harness = createPollerHarness({
-      random: () => draws.shift() ?? 0,
-      readJobs: async () => ({ available: true, jobs: [] }),
+    // A projection that throws is dropped with one line, and the next answer still
+    // reaches the pill: a broken answer must not take the stream with it.
+    let explode = true;
+    const harness = createHarness({
+      project: (agentId, answer) => {
+        if (explode) throw new Error("projection exploded");
+        return { available: answer.available, data: answer.jobs };
+      },
     });
-    await harness.poller.applySnapshot({
-      entries: [
-        { agent: { id: "a", workspaceId: "ws" } },
-        { agent: { id: "b", workspaceId: "ws" } },
-      ],
-      pageInfo: { hasMore: false, nextCursor: null },
-    });
-    const initialDelays = harness.clock.pendingDelays();
-    assert(
-      "two agents do not receive the same first delay",
-      initialDelays.length === 2 && initialDelays[0] !== initialDelays[1],
-      JSON.stringify(initialDelays),
-    );
-    harness.poller.dispose();
+    await harness.subscriptions.applySnapshot(snapshot(["a"]));
+    await harness.clock.advance();
+    equal("a throwing projection is reported", harness.calls.errors[0]?.[0], "jobs pill could not read one answer for a");
+    equal("…with no publish", harness.calls.states.length, 0);
+    explode = false;
+    await harness.clock.advance();
+    equal("…and the stream keeps delivering", harness.calls.states.length, 1);
+    harness.subscriptions.dispose();
   }
-
 
   /* ---------------------------------------------------------------------------- */
   /* The jobs pill's own copy, preserved across the shared-controller refactor     */
   /* ---------------------------------------------------------------------------- */
 
-  // The controller was extracted from this pill and is now shared with the goal
-  // pill, which means its three diagnostics had to become injected strings. The
-  // jobs pill's wording is what the user already sees (and what a log search for
-  // "jobs pill" finds), so it must be **verbatim** what it was before the
-  // refactor — a genericised sentence would be a silent copy change on a surface
-  // nobody asked to change.
+  // The controller is shared with the goal and team pills, which means its
+  // diagnostics had to become injected strings. The jobs pill's wording is what
+  // the user already sees (and what a log search for "jobs pill" finds), so it
+  // must be **verbatim**: a genericised sentence would be a silent copy change on
+  // a surface nobody asked to change.
   console.log("\nthe jobs pill's copy survives the shared controller");
   {
     // 1. The fallback sentence a failed read carries when the runtime sent none.
     //    (Production always sends a message; this is the defensive path, pinned
     //    because it is user-visible copy all the same.)
-    const harness = createPollerHarness({
-      readJobs: async () => ({ available: false }),
-      random: () => 0,
+    const harness = createHarness({
+      // `available: false` with no error object at all — the one shape where the
+      // controller must fall back to the injected sentence.
+      readJobs: async () => ({ available: false, jobs: [] }),
     });
-    await harness.poller.applySnapshot({
-      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
-      pageInfo: { hasMore: false, nextCursor: null },
-    });
-    await harness.clock.advance(0);
+    await harness.subscriptions.applySnapshot(snapshot(["a"]));
+    await harness.clock.advance();
     equal(
       "a failed read with no runtime message uses the jobs pill's fallback sentence",
       harness.calls.states[0]?.[1]?.error,
       "the DSH runtime could not list this session's jobs",
     );
-    harness.poller.dispose();
+    harness.subscriptions.dispose();
   }
   {
-    // 2. The poll-failure log line. Reachable when a tick rejects, i.e. when the
-    //    publish itself throws (the read path is caught inside the tick).
-    const harness = createPollerHarness({
-      readJobs: async () => ({ available: true, jobs: [] }),
+    // 2. The publish-failure log line. A host store that throws must not escape
+    //    into the subscription's dispatch (that would look like a transport
+    //    failure and could kill the stream), so the controller reports it.
+    const harness = createHarness({
       publishState() {
         throw new Error("store exploded");
       },
-      random: () => 0,
     });
-    await harness.poller.applySnapshot({
-      entries: [{ agent: { id: "a", workspaceId: "ws" } }],
-      pageInfo: { hasMore: false, nextCursor: null },
-    });
-    await harness.clock.advance(0);
+    await harness.subscriptions.applySnapshot(snapshot(["a"]));
+    await harness.clock.advance();
     equal(
-      "a failed poll reports the jobs pill's own prefix",
+      "a failed publish reports the jobs pill's own prefix",
       harness.calls.errors[0]?.[0],
-      "jobs pill poll failed for a",
+      "jobs pill could not publish one answer for a",
     );
-    harness.poller.dispose();
+    equal("…with the host's message", harness.calls.errors[0]?.[1], "store exploded");
+    harness.subscriptions.dispose();
   }
   {
     // 3. The pagination-cap log line.
     let pages = 0;
-    const harness = createPollerHarness({
+    const harness = createHarness({
       listAgentPage: async () => {
         pages += 1;
         return {
@@ -1350,7 +1210,7 @@ async function runControllerChecks() {
         };
       },
     });
-    await harness.poller.applySnapshot({
+    await harness.subscriptions.applySnapshot({
       entries: [],
       pageInfo: { hasMore: true, nextCursor: "cursor-0" },
     });
@@ -1359,7 +1219,7 @@ async function runControllerChecks() {
       harness.calls.errors[0]?.[0],
       "agent directory pagination did not terminate; the jobs pill sees only the first pages",
     );
-    harness.poller.dispose();
+    harness.subscriptions.dispose();
   }
 }
 

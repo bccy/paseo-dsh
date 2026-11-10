@@ -209,9 +209,11 @@ assert("popover root is built with popoverRootBox", /const\s+root\s*=\s*popoverR
 check("all three popover branches apply the root box", pillElements.filter((element) =>
   element.tag === "View" && attr(element, "style").trim() === "root").length, 3);
 const rows = pillElements.filter((element) => ["JobRow", "NoteLine"].includes(element.tag));
-// JobRow appears once for the live group and once for the expanded settled group,
-// plus the two NoteLine branches — four call sites, all taking host density.
-assert("rows and notes take host compact density", rows.length === 4 && rows.every((element) =>
+// JobRow appears once for the live group and once for the expanded settled group;
+// NoteLine covers the unreadable note, the all-settled note and — since the stop
+// button (2026-11-11) — the per-row stop note. Five call sites, all taking host
+// density.
+assert("rows and notes take host compact density", rows.length === 5 && rows.every((element) =>
   attr(element, "compact").replace(/\s/g, "") === "layout.compact"));
 // Read-only rows, one pressable exception. A job row is never pressable (killing a
 // job is the model's `job_kill` tool), and nothing here scrolls. The finished
@@ -219,21 +221,66 @@ assert("rows and notes take host compact density", rows.length === 4 && rows.eve
 // `aria-expanded` — so the rule is "no Pressable inside a row", not "no Pressable".
 assert("no inner scroll view", !pillElements.some((element) => element.tag === "ScrollView"));
 const pressables = pillElements.filter((element) => element.tag === "Pressable");
-check("exactly one pressable element (the finished-section header)", pressables.length, 1);
-const pressable = pressables[0];
+// Two since the stop button (2026-11-11): the disclosure header, and the trailing
+// control a running row mounts. **Identified by their contracts, not by position**:
+// the header is the one that publishes `aria-expanded`, the stop button is the one
+// whose accessible name is built from the row's title. Position-based selection is
+// what broke when the button was added before the header in file order — and it
+// would break again the next time the file is reordered.
+check("the popover has exactly two pressable elements (the header and the row's stop button)", pressables.length, 2);
+const pressable = pressables.find((element) => shape.mentions(attr(element, "accessibilityState"), "expanded"));
+const stopPressable = pressables.find((element) => element !== pressable);
 
 // **The only `Pressable` is the folded section's header.** This used to be asserted
 // with a regex over the whole file, which a `Pressable` anywhere else would also
 // satisfy. There is one element now, so its own attributes are the evidence: the
 // disclosure contract lives on it, and a job row still cannot reach a `Pressable`.
-assert("the only pressable is the settled header",
+assert("the first pressable is the settled header",
   pressable !== undefined && shape.hasAttribute(pressable, "onPress")
     && attr(pressable, "accessibilityRole").trim() === "button",
   pressable === undefined ? "no Pressable" : JSON.stringify(pressable.attributes.map((a) => a.name)));
+// The row is still not pressable as a whole: the stop control is a child element
+// in its trailing slot, and the row itself carries no handler. A refactor that put
+// `onPress` on the row would make the panel's whole width a button.
 assert("job rows stay read-only", (() => {
   const body = shape.functionBody(pillSource, "JobRow");
-  return body !== undefined && !body.includes("Pressable");
+  if (body === undefined) return false;
+  // The row itself is a `View` with no handler; the stop control is a **child**
+  // element in its trailing slot (2026-11-11), so the row's own element must not
+  // carry `onPress` — that is what would make the whole panel width a button.
+  const rowElements = shape.jsxElements(body);
+  return !rowElements.some((element) => element.tag === "View" && shape.hasAttribute(element, "onPress"))
+    && rowElements.some((element) => element.tag === "StopJobButton");
 })());
+
+// **The row's stop button** (design 2026-11-11). It is a `button` with a name that
+// carries the job's title, it disables itself while pending, and it is the row's
+// only pressable — the row-level read-only rule above still holds.
+assert("the row's stop button is a labelled button",
+  stopPressable !== undefined
+    && shape.hasAttribute(stopPressable, "onPress")
+    && attr(stopPressable, "accessibilityRole").trim() === "button",
+  stopPressable === undefined ? "no stop Pressable" : JSON.stringify(stopPressable.attributes.map((a) => a.name)));
+assert("the stop button's accessible name carries the row's title",
+  stopPressable !== undefined
+    && shape.mentions(attr(stopPressable, "accessibilityLabel"), "jobStopA11yLabel")
+    && shape.mentions(attr(stopPressable, "accessibilityLabel"), "jobRowTitle"),
+  stopPressable === undefined ? "" : attr(stopPressable, "accessibilityLabel"));
+assert("the stop button disables itself while pending",
+  stopPressable !== undefined && attr(stopPressable, "disabled").trim() === "pending",
+  stopPressable === undefined ? "" : attr(stopPressable, "disabled"));
+assert("the stop button sets its own disabled accessibility state",
+  stopPressable !== undefined && shape.mentions(attr(stopPressable, "accessibilityState"), "disabled"),
+  stopPressable === undefined ? "" : attr(stopPressable, "accessibilityState"));
+assert("the stop button's touch target is enlarged", (() => {
+  if (stopPressable === undefined) return false;
+  if (attr(stopPressable, "hitSlop").trim() !== "touch") return false;
+  // `touch` is the 8-per-side box built from the shared constant; asserting the
+  // wiring here (not a magic number in the JSX) is what keeps the target honest.
+  const body = shape.functionBody(pillSource, "StopJobButton") ?? "";
+  return ["top", "bottom", "left", "right"].every((side) =>
+    new RegExp(`${side}:\\s*JOB_STOP_HIT_SLOP`).test(body));
+})(), stopPressable === undefined ? "no stop Pressable" : attr(stopPressable, "hitSlop"));
 
 // **The reader itself.** `shape.functionBody` used to return the *parameter
 // object* for a destructuring signature — the first `{` after the header is the
@@ -282,10 +329,15 @@ assert("the header styles itself from its own pressable state",
 // makes it reach the screen — the callback has to read both flags, and the colour
 // has to come out of the theme rather than a literal.
 const fillCalls = calls(pillSource, "rowActiveFill");
-assert("the row's style callback reads hover and press",
-  fillCalls.length === 1
-    && shape.mentions(fillCalls[0], "hovered")
-    && shape.mentions(fillCalls[0], "pressed"),
+// Two callbacks use the rule since 2026-11-11: the header (hover/press from its
+// `style` callback) and the stop button (hover/press tracked as state, because its
+// **glyph** changes colour too and a `style` callback cannot reach a child).
+assert("the header's style callback reads hover and press",
+  fillCalls.length === 2 && fillCalls.some((args) =>
+    shape.mentions(args, "hovered") && shape.mentions(args, "pressed")),
+  JSON.stringify(fillCalls));
+assert("the stop button's fill reads its hover state and press",
+  fillCalls.some((args) => shape.mentions(args, "hot") && shape.mentions(args, "pressed")),
   JSON.stringify(fillCalls));
 assert("the row's fill is taken from the theme by token",
   /theme\.colors\[\s*active\s*\]/.test(pillSource));
@@ -297,8 +349,11 @@ assert("the disclosure row keeps the track row's box",
 assert("the folded section no longer draws a text chevron",
   !pillSource.includes("▾") && !pillSource.includes("▸"));
 const chevrons = pillElements.filter((element) => element.tag === "Icon");
-check("exactly one host icon in the popover", chevrons.length, 1);
-const chevron = chevrons[0];
+// Two host icons since 2026-11-11: the disclosure chevron and the stop glyph.
+// Selected by name rather than position.
+check("the popover draws exactly two host icons (the chevron and the stop glyph)", chevrons.length, 2);
+const chevron = chevrons.find((element) => attr(element, "name").trim() === "ChevronRight");
+const stopGlyph = chevrons.find((element) => element !== chevron);
 assert("the chevron is the host's ChevronRight",
   chevron !== undefined && attr(chevron, "name").trim() === "ChevronRight",
   chevron === undefined ? "no Icon" : attr(chevron, "name"));
@@ -314,6 +369,16 @@ const rotations = calls(pillSource, "chevronRotation");
 assert("the chevron's rotation is driven by `expanded` alone",
   rotations.length === 1 && shape.mentions(rotations[0], "expanded"),
   JSON.stringify(rotations));
+// The stop glyph is Lucide's stop square (the host's own `STOP_ICON`), sized by the
+// design's constant and tinted from the theme's danger token when hot.
+assert("the stop glyph is the Square, at the design's size",
+  stopGlyph !== undefined && attr(stopGlyph, "name").trim() === "Square"
+    && shape.mentions(attr(stopGlyph, "size"), "JOB_STOP_GLYPH"),
+  stopGlyph === undefined ? "no stop Icon" : `${attr(stopGlyph, "name")} / ${attr(stopGlyph, "size")}`);
+assert("the stop glyph turns destructive while hot",
+  stopGlyph !== undefined && shape.mentions(attr(stopGlyph, "color"), "statusDanger")
+    && shape.mentions(attr(stopGlyph, "color"), "foregroundMuted"),
+  stopGlyph === undefined ? "" : attr(stopGlyph, "color"));
 assert("the rotation is wired into the chevron's box",
   /\btransform:\s*chevronRotation\(/.test(pillSource));
 
@@ -440,7 +505,10 @@ assert("the shared ring passes the colour to its arc", shape.jsxElements(ringSou
 // has to come from `description` (with the command as the fallback), and the
 // command has to stay visible on the facts line when it is no longer the title.
 // Read as source because `jobs-pill.tsx` imports the host runtime.
-assert("the row title prefers the captured description", /const\s+title\s*=\s*titled\s*\?\s*description\s*:\s*job\.label/.test(pillSource));
+// 2026-11-11: the title rule moved to `jobRowTitle` because the stop button's
+// accessibility name must say the same thing the row says — one rule, two readers.
+assert("the row title comes from the shared rule", /const\s+title\s*=\s*jobRowTitle\(job\)/.test(pillSource));
+assert("…and the stop button's name uses the same rule", /jobStopA11yLabel\(text, jobRowTitle\(job\)\)/.test(pillSource));
 assert("a missing description keeps the command as the title", /const\s+titled\s*=\s*description\s*!==\s*undefined/.test(pillSource));
 assert("the command stays visible when the description becomes the title", /titled\s*\?\s*job\.label\s*:\s*undefined/.test(pillSource));
 assert("the title line renders the resolved title, not the raw label",
@@ -511,11 +579,22 @@ assert("JobsPillIcon is the terminal glyph with the ring on",
 assert("the old live-only rule is not reimplemented in the JSX",
   !/next\.available\s*\?\s*count\s*>\s*0/.test(pillSource));
 assert("the old live-only counter is gone", !/liveCount\(next\.jobs\)/.test(pillSource));
-// Polling policy moved out of the JSX module, so the interval constants and the
-// per-agent `setInterval` are not in this file any more; the controller owns
-// them (and `jobs-poll-check.cjs` drives it with a fake clock).
-assert("the pill delegates polling to the controller", /createJobsPoller<Job>\(/.test(pillSource));
+// The transport moved out of the JSX module twice over: the refresh policy is
+// the server's (`server/pill-feed`, driven with a fake clock by
+// `pill-feed-check.cjs`) and the per-agent lifecycle is the controller's
+// (`client/agent-subscriptions`, driven by `jobs-poll-check.cjs`). The pill keeps
+// only the registration, the store and the copy.
+assert("the pill watches through the jobs subscription", /client\.subscribe\(jobsSnapshot, \{ agentId \}/.test(pillSource));
+assert("…and drives the shared controller", /createAgentSubscriptions<readonly Job\[\], JobsAnswer>\(\{/.test(pillSource));
 assert("the pill no longer creates its own intervals", !/setInterval\(/.test(pillSource));
+// The stop button is the one legitimate timer (2026-11-11): a single one-shot per
+// click that ends the "still running" wait. Data never schedules anything — the
+// subscription pushes — so the count is pinned: one `setTimeout` call site, driven
+// by `JOB_STOP_TIMEOUT_MS`, and every timer is cleared on answer/unmount.
+check("the pill schedules exactly one timeout (the stop window)", (pillSource.match(/setTimeout\(/g) ?? []).length, 1);
+assert("…and that timeout is the stop window", /setTimeout\([\s\S]{0,1000}JOB_STOP_TIMEOUT_MS/.test(pillSource));
+assert("…whose timers are cleared on answer and on unmount",
+  /clearStopTimer\(job\.id\)/.test(pillSource) && /for \(const timer of stopTimers\.current\.values\(\)\) clearTimeout\(timer\)/.test(pillSource));
 
 console.log("\npermission refusal");
 

@@ -21,7 +21,7 @@ import { accessSync, constants, existsSync, readFileSync, statSync } from "node:
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { GoalErrorCode } from "../shared/goal";
-import type { JobErrorCode } from "../shared/jobs";
+import { JOB_STOP_ERROR_CODES, type JobErrorCode, type JobStopErrorCode } from "../shared/jobs";
 import type { TeamErrorCode } from "../shared/team";
 import { profileName } from "./bootstrap";
 import { createFrameReader, splitFrames, type FrameReader } from "./frame-reader";
@@ -260,6 +260,14 @@ export interface DshJob {
   kind: string;
   label: string;
   status: "running" | "stopping" | "completed" | "killed" | "failed";
+  /**
+   * Whether DSH can accept a stop request for this job right now.
+   *
+   * The bridge derives it from the registry's lifecycle (only `running` is
+   * stoppable); it is not re-decided here, because the row's button and the
+   * registry's answer must agree.
+   */
+  canStop: boolean;
   /** Epoch ms when the job was registered. */
   startedAt: number;
   /**
@@ -293,6 +301,26 @@ export interface DshJobs {
    * missing code or `rpc_failed` keeps the normal retry with backoff.
    */
   error?: { message?: string; code?: JobErrorCode };
+}
+
+/**
+ * What a `paseo/jobs/stop` request answers, as the bridge shapes it.
+ *
+ * The bridge answers one of two objects (`{stopped: true, outcome, job}` or
+ * `{stopped: false, code, message, job?}`); this is the plugin's normalized view
+ * of both, so every caller above it handles one shape.
+ */
+export interface DshJobStop {
+  ok: boolean;
+  /** DSH's own `kill()` outcome, on success only. */
+  outcome?: "requested";
+  /** The projection after the attempt, when the bridge could project it. */
+  job?: DshJob;
+  /**
+   * The refusal. `code` is machine-readable and `message` is the runtime's own
+   * sentence — never a re-worded summary of it.
+   */
+  error?: { message: string; code: JobStopErrorCode };
 }
 
 /**
@@ -629,6 +657,61 @@ const BRIDGE_TOO_OLD_MESSAGE =
  */
 const BRIDGE_UNRESPONSIVE_MESSAGE =
   "this profile's bridge did not answer paseo/jobs (it may predate jobs support or be unresponsive); reload the plugin so the embedded bridge is rewritten";
+
+/**
+ * How long one `paseo/jobs/stop` request may take.
+ *
+ * The same budget as a jobs read, and for the same reason: this is asked from a
+ * popover the user is looking at. It is *not* a settlement wait — DSH's `kill()`
+ * only requests cancellation and answers immediately (the job then reports
+ * `stopping`), so the bound only covers the bridge's round trip and a cancel
+ * path that blocks. A stop that needs longer is a bridge that is not answering,
+ * and the user's next action (press again after a reload) is unaffected.
+ */
+const JOBS_STOP_TIMEOUT_MS = 15_000;
+
+/**
+ * What the pill shows when the profile's bridge predates `paseo/jobs/stop`.
+ *
+ * `bridge_too_old`, always: the profile's embedded bridge is only rewritten by a
+ * plugin (re)load, so no retry in this process can add the method.
+ */
+const STOP_BRIDGE_TOO_OLD_MESSAGE =
+  "this profile's bridge has no job-stop support (it predates paseo/jobs/stop); reload the plugin so the embedded bridge is rewritten";
+
+/**
+ * What the pill shows when `paseo/jobs/stop` never answers at all.
+ *
+ * A timeout, not the bridge's "unknown method" reply: an older/foreign bridge
+ * build may ignore methods it does not know, or the shared child is wedged.
+ * Retrying is safe (a second stop on a stopping job answers `job_not_stoppable`),
+ * so this stays `rpc_failed` rather than the terminal `bridge_too_old`.
+ */
+const STOP_NO_ANSWER_MESSAGE =
+  "this profile's bridge did not answer paseo/jobs/stop (it may predate job-stop support or be unresponsive); reload the plugin so the embedded bridge is rewritten";
+
+/**
+ * The bridge's `paseo/jobs/stop` answer as it crosses the wire.
+ *
+ * Deliberately `unknown` fields: the plugin validates the one discriminant it
+ * acts on (`stopped`), and every refusal code against the shared list, instead
+ * of trusting a shape that a profile's older embedded bridge may not honor.
+ */
+interface DshJobStopWire {
+  stopped?: unknown;
+  outcome?: unknown;
+  job?: unknown;
+  code?: unknown;
+  message?: unknown;
+}
+
+/** One refusal's message, with a code that never leaves the shared enum. */
+function jobStopFailure(code: unknown, message: string): DshJobStop {
+  const known = (JOB_STOP_ERROR_CODES as readonly string[]).includes(String(code))
+    ? (String(code) as JobStopErrorCode)
+    : "rpc_failed";
+  return { ok: false, error: { message, code: known } };
+}
 
 /**
  * The bridge's answer when the profile does not compose a job registry at all.
@@ -2494,6 +2577,96 @@ export class DshProcess {
       }
       return { available: false, error: { message: BRIDGE_TOO_OLD_MESSAGE, code: "bridge_too_old" } };
     }
+  }
+
+  /**
+   * Stop one background job this session owns.
+   *
+   * The control half of {@link jobs}, and the path DSH's own `job_kill` tool
+   * takes: the bridge calls the registry's documented `kill()` with this
+   * session's id, so ownership is fenced by the registry rather than re-checked
+   * here. Answering with a value (never a throw) is deliberate — the popover
+   * shows the refusal in place, and a throw would reach it as a generic failed
+   * request with no code to act on. The failure codes are the shared contract's,
+   * normalized here so a bridge that sends an unknown code cannot make the
+   * client's schema reject the whole answer.
+   *
+   * **Not a settlement wait.** `kill()` requests cancellation and answers
+   * `requested` immediately; the row turns `stopping` and the next poll reports
+   * the terminal state. Waiting would hold the popover for as long as the
+   * command takes to die.
+   *
+   * @param sessionId - which session; required — there is no default.
+   * @param jobId - the DSH job id the pill's row carries.
+   * @param timeoutMs - transport budget; checks pass a short one.
+   */
+  async stopJob(sessionId: string, jobId: string, timeoutMs = JOBS_STOP_TIMEOUT_MS): Promise<DshJobStop> {
+    await this.#ensureSessionReady(sessionId);
+    let answer: DshJobStopWire;
+    try {
+      answer = (await this.#request("paseo/jobs/stop", { sessionId, jobId }, timeoutMs)) as DshJobStopWire;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (this.#isUnknownBridgeMethodError(error)) {
+        // Terminal in effect (only a plugin reload rewrites the embedded bridge),
+        // but reported per request rather than latched: a stop is a one-shot
+        // action the user can repeat after the reload, unlike the poll timer.
+        return { ok: false, error: { message: STOP_BRIDGE_TOO_OLD_MESSAGE, code: "bridge_too_old" } };
+      }
+      if (message === `${NO_ANSWER_PREFIX}paseo/jobs/stop`) {
+        return { ok: false, error: { message: STOP_NO_ANSWER_MESSAGE, code: "rpc_failed" } };
+      }
+      return { ok: false, error: { message, code: "rpc_failed" } };
+    }
+    if (answer === null || typeof answer !== "object") {
+      return {
+        ok: false,
+        error: {
+          message: "the bridge's job-stop answer is not an object; refusing to read it as a success",
+          code: "rpc_failed",
+        },
+      };
+    }
+    if (answer.stopped === true) {
+      // A success claim must carry DSH's own word for it. `kill()` returns
+      // `requested` or `already-finished` and the bridge maps the second to a
+      // `stopped:false` refusal, so a `stopped:true` with any other outcome is a
+      // shape the runtime never produces — reading it as success would tell the
+      // user the job is stopping when nothing may have been cancelled (review
+      // P3-4). The module already refuses a non-boolean `stopped` here for the
+      // same reason.
+      if (answer.outcome !== "requested") {
+        return {
+          ok: false,
+          error: {
+            message:
+              `the bridge's job-stop answer claims success without outcome "requested": `
+              + JSON.stringify(answer).slice(0, 200),
+            code: "rpc_failed",
+          },
+        };
+      }
+      const job = answer.job as DshJob | undefined;
+      return { ok: true, outcome: "requested" as const, ...(job === undefined ? {} : { job }) };
+    }
+    if (answer.stopped !== false) {
+      // An answer that is neither the success nor the refusal shape is a
+      // bridge bug (or a proxy in between); claiming either would be a guess.
+      return {
+        ok: false,
+        error: {
+          message: `the bridge's job-stop answer has no boolean "stopped": ${JSON.stringify(answer).slice(0, 200)}`,
+          code: "rpc_failed",
+        },
+      };
+    }
+    const message =
+      typeof answer.message === "string" && answer.message !== ""
+        ? answer.message
+        : "the DSH runtime refused to stop this background job";
+    const failure = jobStopFailure(answer.code, message);
+    const job = answer.job as DshJob | undefined;
+    return job === undefined ? failure : { ...failure, job };
   }
 
   /**

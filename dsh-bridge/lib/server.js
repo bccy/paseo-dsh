@@ -3840,29 +3840,195 @@ export class PaseoHarnessServer {
     try {
       return {
         available: true,
-        jobs: jobs.list(sessionId).map((job) => {
-          const label = String(job.label);
-          // The model's own one-line summary of what the command does, when
-          // this session still remembers it. Absent means the row keeps the
-          // command — never a made-up title.
-          const description = this.toolDescriptionFor(sessionId, label);
-          return {
-            id: String(job.id),
-            kind: String(job.kind),
-            label,
-            status: String(job.status),
-            startedAt: job.startedAt,
-            ...(description === undefined ? {} : { description }),
-            ...(job.progress === undefined ? {} : { progress: String(job.progress) }),
-            ...(job.detail === undefined ? {} : { detail: String(job.detail) }),
-            ...(job.finishedAt === undefined ? {} : { finishedAt: job.finishedAt }),
-          };
-        }),
+        jobs: jobs.list(sessionId).map((job) => this.jobProjection(sessionId, job)),
       };
     } catch (error) {
       const message = `listing DSH's background jobs failed: ${error instanceof Error ? error.message : String(error)}`;
       process.stderr.write(`[bridge] ${message}\n`);
       return { available: false, jobs: [], error: { message } };
+    }
+  }
+
+  /**
+   * One DSH `JobView` as the pill's wire row.
+   *
+   * Shared by `paseo/jobs` and `paseo/jobs/stop` so the row a stop answers with
+   * is the row the next poll draws — a second projection would be free to drift
+   * in `canStop`, which is exactly the field the button reads.
+   *
+   * `canStop` is derived from DSH's lifecycle rather than assumed: `kill()`
+   * answers `already-finished` for a settled job and a `stopping` job has its
+   * cancellation in flight, so only `running` can be stopped. A status this
+   * bridge does not know is not stoppable — an unknown state must not offer an
+   * action whose effect nobody can predict.
+   *
+   * @param {string} sessionId - the owner whose table names the job.
+   * @param {object} job - one `JobView` from `ctx.jobs.list()` / `get()`.
+   */
+  jobProjection(sessionId, job) {
+    const label = String(job.label);
+    // The model's own one-line summary of what the command does, when this
+    // session still remembers it. Absent means the row keeps the command —
+    // never a made-up title.
+    const description = this.toolDescriptionFor(sessionId, label);
+    return {
+      id: String(job.id),
+      kind: String(job.kind),
+      label,
+      status: String(job.status),
+      canStop: job.status === 'running',
+      startedAt: job.startedAt,
+      ...(description === undefined ? {} : { description }),
+      ...(job.progress === undefined ? {} : { progress: String(job.progress) }),
+      ...(job.detail === undefined ? {} : { detail: String(job.detail) }),
+      ...(job.finishedAt === undefined ? {} : { finishedAt: job.finishedAt }),
+    };
+  }
+
+  /**
+   * Stop one background job a session owns.
+   *
+   * DSH's own `job_kill` tool reaches `ctx.jobs.kill(id, caller, reason)` — the
+   * registry's documented control operation, not a process signal — and this
+   * method calls the same entry with this session's id as the caller. That is
+   * also the authorization fence: `kill()` refuses a job owned by another
+   * session, and the registry checks it, so this bridge never repeats the check
+   * with its own rules.
+   *
+   * **The answer is structured, never a quiet success.** Every refusal carries a
+   * `code` the plugin maps to the pill's sentence. Throwing instead would cross
+   * the transport as a message only, and the plugin would have to parse DSH's
+   * prose to tell "already finished" from "no such job" — the string-matching
+   * shape this repo's `registry_missing` constant already had to adopt once.
+   *
+   * **The session must be open.** Unlike {@link jobs} (a read that must not
+   * materialize a session), stopping is a control on a live agent: the owner
+   * session's job registry entry is what `kill()` fences against, and the job was
+   * started by that agent. A session the bridge cannot resolve answers
+   * `session_missing` rather than resuming a session just to stop work nobody
+   * claims.
+   *
+   * **Stopping is asynchronous.** `kill()` requests cancellation, flips the
+   * record to `stopping`, and returns `requested`; the terminal `killed` state
+   * lands whenever the producer actually stops and the pill's poll reports it.
+   * Waiting here would block the popover for as long as the command takes to
+   * die, so the answer carries the post-request projection and stops there.
+   *
+   * @param {{sessionId?: unknown, jobId?: unknown}} params
+   * @returns {{stopped: true, outcome: 'requested', job: object}
+   *   | {stopped: false, code: string, message: string, job?: object}}
+   */
+  async jobsStop(params) {
+    const sessionId = typeof params?.sessionId === 'string' ? params.sessionId : '';
+    const jobId = typeof params?.jobId === 'string' ? params.jobId : '';
+    if (sessionId === '' || jobId === '') {
+      throw new TypeError('paseo/jobs/stop requires a sessionId and a jobId');
+    }
+    // `requireSession` keeps the bridge's single answer for "not open here",
+    // which is also what `paseo/goal` reports. It throws for an unknown id and
+    // for an agent disposed outside the server; both mean this bridge cannot
+    // stop the job, and neither may look like a success.
+    try {
+      // Called for its two refusals (unknown session, disposed agent); the live
+      // record is not needed, only DSH's ownership fence behind it.
+      this.requireSession(sessionId);
+    } catch (error) {
+      return {
+        stopped: false,
+        code: 'session_missing',
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
+    let jobs;
+    try {
+      jobs = this.ctx.get('jobs');
+    } catch (error) {
+      const message = `looking up DSH's job registry failed: ${error instanceof Error ? error.message : String(error)}`;
+      process.stderr.write(`[bridge] ${message}\n`);
+      return { stopped: false, code: 'registry_missing', message };
+    }
+    if (jobs === undefined) {
+      reportMissingService(
+        'jobs',
+        '[bridge] this DSH profile composes no job registry; a job stop has nothing to act on\n',
+      );
+      return {
+        stopped: false,
+        code: 'registry_missing',
+        message: 'this DSH runtime composes no job registry',
+      };
+    }
+    // Look the job up **through this session's own list** before killing:
+    // `list(caller)` is owner-filtered, so "not in it" answers "no such job for
+    // this session" (unknown or another session's — the same fact for the user)
+    // without parsing the registry's error prose, and without a `get()` that
+    // would throw the same way for both cases.
+    let job;
+    try {
+      job = jobs.list(sessionId).find((candidate) => String(candidate.id) === jobId);
+    } catch (error) {
+      const message = `listing DSH's background jobs failed: ${error instanceof Error ? error.message : String(error)}`;
+      process.stderr.write(`[bridge] ${message}\n`);
+      return { stopped: false, code: 'rpc_failed', message };
+    }
+    if (job === undefined) {
+      return {
+        stopped: false,
+        code: 'job_not_found',
+        message: `this session has no background job ${jobId}`,
+      };
+    }
+    if (job.status !== 'running') {
+      // Terminal and `stopping` are different answers: the first says the work
+      // is over (nothing will change), the second says a cancellation is
+      // already in flight. Handing both the same code would let the pill tell
+      // the user "it already finished" about a command still shutting down.
+      const finished = job.status !== 'stopping';
+      return {
+        stopped: false,
+        code: finished ? 'job_finished' : 'job_not_stoppable',
+        message: finished
+          ? `background job ${jobId} is ${String(job.status)}; it already finished`
+          : `background job ${jobId} is already stopping`,
+        job: this.jobProjection(sessionId, job),
+      };
+    }
+    try {
+      const outcome = jobs.kill(jobId, sessionId);
+      // The job was `running` a moment ago, but it can settle between that list
+      // and this call. DSH answers `already-finished` for a terminal record, and
+      // reporting THAT as a success would claim a cancellation that never
+      // happened — the same lie the pre-check exists to prevent, just reaching
+      // through a race. Re-read the record and answer the settled refusal.
+      if (outcome !== 'requested') {
+        let settled = job;
+        try {
+          settled = jobs.get(jobId, sessionId);
+        } catch {
+          // Keep the pre-stop row: the refusal is the fact that matters.
+        }
+        return {
+          stopped: false,
+          code: 'job_finished',
+          message: `background job ${jobId} is ${String(settled.status)}; it already finished`,
+          job: this.jobProjection(sessionId, settled),
+        };
+      }
+      let after = job;
+      try {
+        after = jobs.get(jobId, sessionId);
+      } catch {
+        // The projection is a convenience for the client; the stop itself
+        // succeeded. Keep the pre-stop row rather than failing the request.
+      }
+      return { stopped: true, outcome, job: this.jobProjection(sessionId, after) };
+    } catch (error) {
+      // DSH's `kill()` propagates a producer's cancel throw without changing
+      // the record: the job is still running. Reporting success here would tell
+      // the user a command stopped that is still alive.
+      const message = `stopping DSH's background job ${jobId} failed: ${error instanceof Error ? error.message : String(error)}`;
+      process.stderr.write(`[bridge] ${message}\n`);
+      return { stopped: false, code: 'cancel_failed', message, job: this.jobProjection(sessionId, job) };
     }
   }
 
@@ -4375,6 +4541,8 @@ export class PaseoHarnessServer {
         return this.usage(params);
       case 'paseo/jobs':
         return this.jobs(params);
+      case 'paseo/jobs/stop':
+        return this.jobsStop(params);
       case 'paseo/goal':
         return this.goal(params);
       case 'paseo/presets':

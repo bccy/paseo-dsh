@@ -37,7 +37,7 @@
  *   `{ launch, versions, capabilities }` only; the handle lives in the plugin
  *   process and is passed to hook/RPC/tool callbacks (`PluginHandlerContext`).
  *   It is therefore captured from those callbacks ({@link capturePaseo}) — the
- *   turn hooks and the `jobs.list` RPC cover normal use, and the client bundle
+ *   turn hooks and the `jobs.snapshot` subscription cover normal use, and the client bundle
  *   calls `rewind.notice.arm` on load to cover a daemon restart with no turn
  *   since. If a rewind lands before any capture, the report is queued and
  *   appended on the next capture instead of being dropped; the wait is logged.
@@ -566,7 +566,7 @@ export class RewindReportDelivery {
     let watch = this.#watch;
     if (watch === null && needsReplacementWatch(full.agentId, full.scope)) {
       // The handle was captured **after** this delivery was created — an arm RPC
-      // or a jobs.list reply landed while the rewind was in flight — so the
+      // or a jobs.snapshot push landed while the rewind was in flight — so the
       // constructor could not subscribe. Subscribe now: appending without a
       // watch can land before the host's rebuild and be wiped silently.
       try {

@@ -13,8 +13,10 @@
     "outDir": "../paseo-plugin/.dbg-poll"
   },
   "files": [
-    "../paseo-plugin/client/poll-sequence.ts",
+    "../paseo-plugin/client/agent-subscriptions.ts",
+    "../paseo-plugin/client/jobs-popover-layout.ts",
     "../paseo-plugin/client/jobs-polling.ts",
-    "../paseo-plugin/shared/jobs.ts"
+    "../paseo-plugin/shared/jobs.ts",
+    "../paseo-plugin/shared/provider.ts"
   ]
 }
