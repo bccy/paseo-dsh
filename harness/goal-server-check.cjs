@@ -249,17 +249,45 @@ const VIEW = {
   const conn = await registration.connect({ capabilities: ["prompt.message"] });
   conn.onEvent((event) => events.push(event));
 
-  // The two RPCs have to exist before anything else matters: a pill that polls
-  // a name the server never registered gets a "no such RPC" error, which the
-  // client would have to present as an unreadable goal forever.
-  check("the plugin registers goal.current", handlers.has("goal.current"));
+  // The subscription has to exist before anything else matters: a pill that
+  // watches a name the server never served gets a refused subscription, which the
+  // client presents as an unreadable goal forever. `goal.control` is the one RPC
+  // that stays (2026-11-11, the 0.16 port).
+  check("the plugin serves the goal subscription", handlers.has("goal.snapshot"));
   check("the plugin registers goal.control", handlers.has("goal.control"));
+  check("the polling RPC is gone", !handlers.has("goal.current"));
 
   // An agent with no open session. `capture` needs a Paseo handle object; this
-  // check drives the RPC handlers directly, so an empty stand-in is enough (no
-  // rewind report is pending).
+  // check drives the handler directly, so an empty stand-in is enough (no rewind
+  // report is pending).
   const context = { paseo: {} };
-  const read = (agentId) => handlers.get("goal.current")({ agentId }, context);
+
+  /**
+   * Drive the real subscription handler and return its first pushed snapshot.
+   *
+   * `server.handle` for a subscription starts the work and returns; the answer
+   * arrives through `push`, and aborting the signal is what a released subscriber
+   * does (it also stops the feed's per-agent timer).
+   */
+  const read = (agentId) =>
+    new Promise((resolve, reject) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => {
+        reject(new Error("the goal feed pushed no snapshot"));
+      }, 10_000);
+      handlers.get("goal.snapshot")(
+        { agentId },
+        {
+          paseo: {},
+          signal: controller.signal,
+          push: (event) => {
+            clearTimeout(timer);
+            controller.abort();
+            resolve(event);
+          },
+        },
+      );
+    });
   const control = (input) => handlers.get("goal.control")(input, context);
 
   const beforeSession = await read("agent-with-no-session");

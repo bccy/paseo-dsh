@@ -1,5 +1,6 @@
 /**
- * The team pill's pure rules and its poll adapter (T3).
+ * The team pill's pure rules and the projection one pushed team answer goes
+ * through (T3).
  *
  * Everything the pill and the panel decide lives here as plain functions, so
  * `harness/team-pill-check.cjs` can assert it without React or a host: whether
@@ -12,29 +13,17 @@
  * remounts the body once when it opens, so an unmount alone means nothing —
  * that rule is `./seen-close-gate`, shared with the goal pill.
  *
- * Polling is `./agent-polling`'s controller, unchanged: this module only adapts
- * the `team.read` answer to it, like `./goal-polling` does for the goal.
+ * **The transport moved in the 0.16 port (2026-11-11).** The board used to be
+ * polled every four seconds through the `team.read` RPC; `server/pill-feed` now
+ * reads it once per agent and pushes the snapshot, and this module keeps only
+ * {@link projectTeamAnswer} — the answer-to-payload mapping, exactly as
+ * `./goal-polling` keeps its own.
  *
  * @module dsh-paseo/client/team-polling
  */
-import { isTerminalTeamErrorCode, type TeamMember, type TeamTask, type TeamView } from "../shared/team";
-import {
-  createAgentPoller,
-  type AgentPoller,
-  type AgentPollerHost,
-  type PollAgent,
-  type PollAgentPage,
-  type PollRemoveReason,
-  type PollViewState,
-} from "./agent-polling";
+import type { TeamAnswer, TeamMember, TeamTask, TeamView } from "../shared/team";
+import type { PillReadResult } from "./agent-subscriptions";
 import type { TeamText } from "./locale";
-
-/** One read's answer, mirroring the `team.read` contract. */
-export interface TeamReadResult {
-  available: boolean;
-  team?: TeamView | null;
-  error?: { message: string; code?: string };
-}
 
 /* -------------------------------------------------------------------------- */
 /* The pill                                                                    */
@@ -410,52 +399,25 @@ export function teamTaskFields(
 }
 
 /* -------------------------------------------------------------------------- */
-/* Polling                                                                     */
+/* The pushed answer                                                           */
 /* -------------------------------------------------------------------------- */
 
-/** The team pill's host half, the goal adapter's shape. */
-export interface TeamPollerHost {
-  readTeam(agentId: string): Promise<TeamReadResult>;
-  listAgentPage(cursor: string): Promise<PollAgentPage>;
-  addAgent(agent: PollAgent): void;
-  removeAgent(agentId: string, reason: PollRemoveReason, error?: TeamReadResult["error"]): void;
-  publishState(agentId: string, team: TeamView | null): void;
-  onError(message: string, error?: unknown): void;
-  setTimeout(callback: () => void, delayMs: number): unknown;
-  clearTimeout(handle: unknown): void;
-  random?: () => number;
-}
-
 /**
- * The per-agent poll controller: `createAgentPoller` with the team payload.
+ * Map one pushed team answer to the controller's payload
+ * (`client/agent-subscriptions`).
  *
- * Like the goal pill, a transient read error **keeps the last board** (one bad
- * poll must not make a team vanish), and a terminal code removes the pill (a
- * profile without the agent-team bundle looks like a profile without teams).
+ * A failed answer keeps its message and code so the controller can grade it; an
+ * absent board is `null` — "we looked and there is no team" — never a fabricated
+ * empty one (an empty board would render as "no shared tasks", which is a claim
+ * about a team that was not read).
+ *
+ * Like the goal pill, a transient failure **keeps the last board**
+ * (`publishOnTransientError: false` in the pill's host options): one bad answer
+ * must not make a team vanish. A terminal code removes the pill — a profile
+ * without the agent-team bundle then looks like a profile without teams, which is
+ * the honest answer.
  */
-export function createTeamPoller(host: TeamPollerHost): AgentPoller {
-  const adapter: AgentPollerHost<TeamView | null> = {
-    read: async (agentId) => {
-      const result = await host.readTeam(agentId);
-      if (!result.available) return { available: false, error: result.error };
-      return { available: true, data: result.team ?? null };
-    },
-    listAgentPage: (cursor) => host.listAgentPage(cursor),
-    addAgent: (agent) => host.addAgent(agent),
-    removeAgent: (agentId, reason, error) => host.removeAgent(agentId, reason, error),
-    publishState: (agentId, state: PollViewState<TeamView | null>) => {
-      if (!state.available) return;
-      host.publishState(agentId, state.data);
-    },
-    onError: (message, error) => host.onError(message, error),
-    setTimeout: (callback, delayMs) => host.setTimeout(callback, delayMs),
-    clearTimeout: (handle) => host.clearTimeout(handle),
-    ...(host.random === undefined ? {} : { random: host.random }),
-    isTerminalErrorCode: isTerminalTeamErrorCode,
-    initialData: null,
-    fallbackErrorMessage: "the DSH runtime could not read this agent's team",
-    pillLabel: "team pill",
-    publishOnTransientError: false,
-  };
-  return createAgentPoller(adapter);
+export function projectTeamAnswer(answer: TeamAnswer): PillReadResult<TeamView | null> {
+  if (!answer.available) return { available: false, ...(answer.error === undefined ? {} : { error: answer.error }) };
+  return { available: true, data: answer.team ?? null };
 }

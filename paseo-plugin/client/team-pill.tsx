@@ -9,10 +9,11 @@
  *   panel does not hide it. A close is a *confirmed* one — the host remounts the
  *   popover body when it opens, so a bare unmount means nothing
  *   (`createSeenCloseGate` in `./seen-close-gate`). The remembered signature is
- *   **persisted on the host** (`../shared/team-seen-settings` via
- *   `./seen-persistence`, UI-v7 persistence 2026-11-08), so an app restart or a
- *   plugin reload no longer shows the board once more; a host without plugin
- *   settings degrades to the old in-memory behaviour.
+ *   **stored on the agent** — the `dsh.teamSeen` key of Paseo's durable agent
+ *   metadata (`../shared/pill-metadata` via `./seen-metadata`, 2026-11-11), so an
+ *   app restart, a plugin reload or a daemon restart no longer shows the board
+ *   once more, and the value arrives with the agent before the pill is first
+ *   presented.
  * - **Label and title**: the noun 「团队」/「Team」 in every state; no count
  *   (T2 P1). The host uses `title` as the accessibility name, desktop tooltip
  *   and phone sheet header, so all three read the noun.
@@ -23,8 +24,11 @@
  *   `update` only when it changes, like the jobs pill, so the ring does not
  *   restart on every poll.
  *
- * Polling is the shared controller (`./agent-polling` via `./team-polling`),
- * at the jobs/goal cadence; the jobs and goal pills are untouched.
+ * **The transport moved in the 0.16 port (2026-11-11).** The board used to be
+ * polled every four seconds through the `team.read` RPC; `server/pill-feed` now
+ * reads it once per agent and pushes a snapshot only when it changes, so this
+ * pill holds no timer — `./team-polling` keeps the answer → payload mapping and
+ * the pure presentation rules.
  *
  * @module dsh-paseo/client/team-pill
  */
@@ -34,16 +38,16 @@ import type {
   PluginButtonRegistration,
   PluginClientContext,
 } from "@getpaseo/plugin/client";
-import { settingsRpc } from "@getpaseo/plugin";
 import { useEffect, useRef, useState } from "react";
-import { teamRead, type TeamView } from "../shared/team";
-import { TEAM_SEEN_SETTINGS_ID } from "../shared/team-seen-settings";
+import { teamSnapshot, isTerminalTeamErrorCode, type TeamAnswer, type TeamView } from "../shared/team";
+import { TEAM_SEEN_METADATA_KEY } from "../shared/pill-metadata";
+import { createAgentSubscriptions } from "./agent-subscriptions";
 import { localeText } from "./locale";
 import { CornerRingIcon } from "./corner-ring";
 import { createSeenCloseGate } from "./seen-close-gate";
-import { createSeenPersistence } from "./seen-persistence";
+import { createSeenMetadataStore } from "./seen-metadata";
 import {
-  createTeamPoller,
+  projectTeamAnswer,
   teamCompleteSeenStep,
   teamPillIcon,
   teamPillVisible,
@@ -165,42 +169,40 @@ export function contributeTeamPill(client: PluginClientContext) {
   const pills = new Map<string, PillEntry>();
   /**
    * agentId -> the all-done board's in-session "seen" progress (UI-v7). The
-   * remembered key is also persisted on the host (`../shared/team-seen-settings`),
-   * so an app restart or a plugin reload no longer forgets it; this map only
-   * carries the closes of this session, and the persistence is the fallback for
-   * everything the host document remembers.
+   * remembered key is also persisted as agent metadata (`shared/pill-metadata.ts`
+   * → `dsh.teamSeen`, written through `client/seen-metadata.ts`), so an app
+   * restart or a plugin reload no longer forgets it; this map only carries the
+   * closes of this session, and `seen` is the fallback for everything the agent's
+   * metadata remembers.
    */
   const seenStates = new Map<string, TeamSeenState>();
   const lifetime = new AbortController();
 
   /**
-   * UI-v7 persistence (2026-11-08): the "seen" signatures the user closed a
-   * panel on live in a host setting, so an app restart does not show an all-done
-   * board once more. `present` refuses to publish before `hydrate` resolved (a
-   * registration starts hidden), so an already-seen board never flashes; a host
-   * without the settings RPC degrades to the old in-memory behaviour. Only
-   * `advanceSeen`'s confirmed-close branch writes (below) — polls never do.
+   * UI-v7 "seen" (2026-11-11): the all-done board the user closed a panel on is
+   * remembered in the agent's own metadata (`../shared/pill-metadata`), so an app
+   * restart, a plugin reload or a daemon restart does not show it once more. The
+   * value arrives with the agent in the directory snapshot — the pill is
+   * registered *after* `seen.observe(agent)` in `addAgent`, so nothing flashes
+   * before it is known — and a second window's close reaches this one as an agent
+   * update.
+   *
+   * The write goes through `paseo.agents.ref(agentId).setMetadata`, not the
+   * composer: this pill's code runs in the contribution callback, outside React,
+   * and an agent's composer exists only while its tab is open, whereas the
+   * metadata record belongs to the agent and works for an idle one too. Only
+   * `advanceSeen`'s confirmed-close branch writes (below) — answers never do.
    */
-  const persistence = createSeenPersistence(
+  const seen = createSeenMetadataStore(
     {
-      read: () => client.rpc(settingsRpc(TEAM_SEEN_SETTINGS_ID).read, {}),
-      write: (input) => client.rpc(settingsRpc(TEAM_SEEN_SETTINGS_ID).write, input),
-      // A document the host refused is repaired with `reset`, the one write the
-      // host applies without re-parsing the stored envelope (`./seen-persistence`).
-      reset: (input) => client.rpc(settingsRpc(TEAM_SEEN_SETTINGS_ID).reset, input),
+      write: (agentId, signature) =>
+        client.paseo.agents.ref(agentId).setMetadata({ [TEAM_SEEN_METADATA_KEY]: signature }),
       onError: (message, error) => {
         console.error(`[dsh-paseo] ${message}: ${error instanceof Error ? error.message : String(error)}`);
       },
-      warn: (message) => console.warn(`[dsh-paseo] ${message}`),
     },
-    {
-      settingsId: TEAM_SEEN_SETTINGS_ID,
-      onHydrated: () => {
-        for (const agentId of [...pills.keys()]) present(agentId);
-      },
-    },
+    TEAM_SEEN_METADATA_KEY,
   );
-  void persistence.hydrate();
 
   /**
    * Publish the current visibility, label and icon for one agent from the last
@@ -216,14 +218,10 @@ export function contributeTeamPill(client: PluginClientContext) {
   const present = (agentId: string): void => {
     const entry = pills.get(agentId);
     if (entry === undefined) return;
-    // Nothing is published before the persisted "seen" state is known: the
-    // registration starts hidden, so an already-seen all-done board never
-    // flashes on the composer while the settings read is in flight.
-    if (!persistence.ready()) return;
     const team = store.get(agentId)?.team ?? null;
-    const seen = seenStates.get(agentId)?.seen ?? persistence.get(agentId);
+    const remembered = seenStates.get(agentId)?.seen ?? seen.get(agentId);
     const text = localeText().team;
-    const visible = teamPillVisible(team, seen);
+    const visible = teamPillVisible(team, remembered);
     const icon = team === null ? "idle" : teamPillIcon(team);
     if (entry.visible === visible && entry.icon === icon && entry.label === text.title && entry.title === text.title) {
       return;
@@ -248,19 +246,44 @@ export function contributeTeamPill(client: PluginClientContext) {
       // gate's `closed` event, the only event the machine advances on) changed
       // the remembered all-done signature. Polls and agent status events are
       // no-ops above and never reach here.
-      if (event.kind === "closed" && after.seen !== undefined) persistence.remember(agentId, after.seen);
+      if (event.kind === "closed" && after.seen !== undefined) seen.remember(agentId, after.seen);
       present(agentId);
     }
   };
 
-  const poller = createTeamPoller({
-    readTeam: (agentId) => client.rpc(teamRead, { agentId }),
+  const subscriptions = createAgentSubscriptions<TeamView | null, TeamAnswer>({
+    /**
+     * Watch this agent's team-board snapshots.
+     *
+     * `client.subscribe` re-subscribes by itself after a reconnect and releases
+     * what is left when the plugin stops; aborting `signal` releases this one, so
+     * the controller deliberately keeps no handle. A refused subscription rejects
+     * `ready` instead (a permission refusal removes the pill); the guard keeps
+     * the release path from reporting a close that this side caused.
+     */
+    open: (agentId, onAnswer, onEnd, signal) => {
+      const handle = client.subscribe(teamSnapshot, { agentId }, onAnswer, {
+        signal,
+        onClosed: (closed) => {
+          if (signal.aborted) return;
+          onEnd(closed.error);
+        },
+      });
+      void handle.ready.catch((error: unknown) => {
+        if (signal.aborted) return;
+        onEnd(error instanceof Error ? error : new Error(String(error)));
+      });
+    },
     listAgentPage: async (cursor) => {
       const page = await client.paseo.agents.list({ page: { limit: AGENT_DIRECTORY_PAGE_SIZE, cursor }, signal: lifetime.signal });
       return { entries: page.entries, pageInfo: page.pageInfo };
     },
     addAgent: (agent) => {
       const text = localeText().team;
+      // The durable "seen" value arrives with the agent; taking it before the
+      // pill exists is what removes the old hydrate gate — `present` below always
+      // has an answer, so an all-done board the user already closed never flashes.
+      seen.observe(agent);
       const registration = client.addComposerPill({
         id: "dsh-team",
         workspaceId: agent.workspaceId ?? "",
@@ -292,6 +315,15 @@ export function contributeTeamPill(client: PluginClientContext) {
       seenStates.delete(agent.id);
       store.delete(agent.id);
     },
+    updateAgent: (agent) => {
+      // The "seen" key of this agent changed — this session's own close echoed
+      // back, or another window's close. Either way the pill must re-decide its
+      // visibility now instead of waiting for the next board answer.
+      if (seen.observe(agent)) present(agent.id);
+      // The agent's status is **not** a "seen" signal: a turn starting after the
+      // completing one ended is usually just the user sending the next message,
+      // and an all-done pill must stay until its panel is opened and closed.
+    },
     removeAgent: (agentId, reason, error) => {
       const entry = pills.get(agentId);
       if (entry === undefined) return;
@@ -317,26 +349,29 @@ export function contributeTeamPill(client: PluginClientContext) {
         console.error(`[dsh-paseo] team pill disabled for ${agentId}: ${error?.message ?? "a terminal team error"}`);
       }
     },
-    publishState: (agentId, team) => {
+    // The controller carries the payload as `data`; this pill's store keeps the
+    // board itself. A failed answer never reaches the store (transient ones are
+    // swallowed by `publishOnTransientError: false`, terminal ones remove the pill).
+    publishState: (agentId, state) => {
+      if (!state.available) return;
       if (pills.get(agentId) === undefined) return;
-      publish(store, agentId, team);
-      // A poll never marks an all-done board seen: seen is only the confirmed
+      publish(store, agentId, state.data);
+      // An answer never marks an all-done board seen: seen is only the confirmed
       // panel close (the popover's `onClosed` below).
       present(agentId);
     },
+    project: (_agentId, answer) => projectTeamAnswer(answer),
     onError: (message, error) => {
       if (lifetime.signal.aborted) return;
       console.error(`[dsh-paseo] ${message}: ${error instanceof Error ? error.message : String(error)}`);
     },
-    setTimeout: (callback, delayMs) => {
-      const timer = setTimeout(callback, delayMs);
-      (timer as unknown as { unref?: () => void }).unref?.();
-      return timer;
-    },
-    clearTimeout: (timer) => {
-      clearTimeout(timer as ReturnType<typeof setTimeout>);
-    },
-    random: () => Math.random(),
+    isTerminalErrorCode: isTerminalTeamErrorCode,
+    initialData: null,
+    fallbackErrorMessage: "the DSH runtime could not read this agent's team",
+    pillLabel: "team pill",
+    // A transient failure keeps the last board: one bad answer must not make a
+    // team vanish.
+    publishOnTransientError: false,
   });
 
   void client.paseo.agents
@@ -344,21 +379,18 @@ export function contributeTeamPill(client: PluginClientContext) {
     .then(({ subscription }) => {
       subscription.subscribe({
         snapshot: (page) => {
-          void poller.applySnapshot(page);
+          void subscriptions.applySnapshot(page);
         },
         update: (message) => {
           if (message.type !== "agent_update") return;
           const update = message.payload;
           if (update.kind === "upsert") {
-            poller.upsert(update.agent);
-            // The agent's status is **not** a "seen" signal: a turn starting
-            // after the completing one ended is usually just the user sending
-            // the next message, and an all-done pill must stay until its panel
-            // is opened and closed. The event is an explicit no-op.
-            advanceSeen(update.agent.id, { kind: "agent", status: update.agent.status });
+            // Also the channel the "seen" key arrives on: `updateAgent`
+            // re-presents the pill when the metadata says something changed.
+            subscriptions.upsert(update.agent);
             return;
           }
-          poller.drop(update.agentId);
+          subscriptions.drop(update.agentId);
         },
       });
       return undefined;
@@ -371,7 +403,7 @@ export function contributeTeamPill(client: PluginClientContext) {
 
   return () => {
     lifetime.abort();
-    poller.dispose();
-    persistence.dispose();
+    subscriptions.dispose();
+    seen.dispose();
   };
 }

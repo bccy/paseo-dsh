@@ -352,6 +352,26 @@ export interface JobsText {
   settledLabel: string;
   /** Popover line when the runtime could not read the registry — never "none". */
   unavailable: string;
+  /**
+   * The stop button's accessibility name. `{title}` is filled by
+   * `jobStopA11yLabel` (the row's own title), so the copy keeps the locale's
+   * quote style — 「」 in Chinese, straight quotes in English.
+   */
+  stop: string;
+  /**
+   * A neutral tip, not an error: the job settled between the last push and the
+   * click, so there was nothing left to stop.
+   */
+  stopAlreadyFinished: string;
+  /** A neutral tip: a cancellation was already in flight (a second click). */
+  stopAlreadyStopping: string;
+  /** A neutral tip: the row is stale — the job is no longer in the list. */
+  stopGone: string;
+  /**
+   * The note after {@link JOB_STOP_TIMEOUT_MS}: the request was accepted, but the
+   * job still reports `running`. Neutral, because the verdict is the runtime's.
+   */
+  stopSentStillRunning: string;
 }
 
 /**
@@ -984,6 +1004,11 @@ const TEXT: Record<Locale, UiText> = {
       allSettled: "All background tasks have finished.",
       settledLabel: "Finished",
       unavailable: "Could not read this session's background tasks.",
+      stop: 'Stop "{title}"',
+      stopAlreadyFinished: "The task has already finished",
+      stopAlreadyStopping: "It is already stopping",
+      stopGone: "The task is no longer in the running list",
+      stopSentStillRunning: "Stop requested, but the task is still running",
     },
     goal: {
       title: "Goal",
@@ -1448,6 +1473,13 @@ const TEXT: Record<Locale, UiText> = {
       // 数量不放这里 —— 它挂在行尾那个弱化槽里（宿主 rowTrailing 的位置）。
       settledLabel: "已完成",
       unavailable: "读不到本会话的后台任务。",
+      // 「停止」入口只在运行中且 canStop 的行尾出现；a11y 名要把标题带进去。
+      stop: "停止「{title}」",
+      // 这四句都是中性提示（不是错误）：已结束 / 正在停 / 行已过期 / 5s 后仍在跑。
+      stopAlreadyFinished: "任务已经结束",
+      stopAlreadyStopping: "正在停止，请稍候",
+      stopGone: "任务已不在运行列表中",
+      stopSentStillRunning: "停止请求已发送，但任务仍在运行",
     },
     goal: {
       title: "目标",

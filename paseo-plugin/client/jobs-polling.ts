@@ -1,13 +1,13 @@
 /**
- * The jobs pill's poll policy, its presentation rule, and the adapter that
- * binds both to the shared poll controller.
+ * The jobs pill's presentation rule, its pushed-answer projection, and the stop
+ * button's state machine.
  *
  * `jobs-pill.tsx` imports the host runtime (React, React Native, the plugin
  * component library), so plain `node` cannot load it and its behaviour could
  * only be asserted through source regexes — which is exactly how a rule that
  * hid every finished job passed review. The controller lives in
- * `client/agent-polling.ts` (shared with the goal pill, whose polling policy is
- * this one); this module keeps the two jobs-specific halves:
+ * `client/agent-subscriptions.ts` (shared with the goal and team pills); this
+ * module keeps the jobs-specific rules:
  *
  * - {@link jobsPillPresentation}: when the pill is visible, what it counts, and
  *   which mark sits in its icon slot. By the product rule (route 2 of CJ-01) it
@@ -17,10 +17,10 @@
  *   itself never advertises an idle total. The icon is the turning ring for
  *   every readable answer; the static mark is reserved for `available: false`,
  *   matching baseline 2f71225.
- * - {@link createJobsPoller}: the jobs payload adapter. A jobs answer is a
- *   list, a goal answer is one object; the controller is generic over that
- *   payload, so this adapter is what keeps the pill's `{jobs, available, error,
- *   code}` state shape unchanged. It also applies {@link settleDownJobs} — a
+ * - {@link createJobsProjection}: the answer → pill-payload projection. A jobs
+ *   answer is a list, a goal answer is one object; the controller is generic over
+ *   that payload, so this projection is what keeps the pill's `{jobs, available,
+ *   error, code}` state shape unchanged. It also applies {@link settleDownJobs} — a
  *   **defensive** monotonicity guard, not a proven root cause: the controller's
  *   in-flight/sequence guards already reject superseded answers, and DSH settles
  *   a job once, so the guard covers only the paths those guards cannot see (a
@@ -33,58 +33,35 @@
  * "no tasks but always a 后台 pill" was the same mistake in a terminal form.
  *
  * **A failed read is loud in the log instead.** With the pill no longer carrying
- * the failure, the adapter writes exactly one console line when an agent enters
- * the unreadable state (and one when it recovers) — see `createJobsPoller` and
- * FIELD-NOTES #97. Without that line, "could not read" would look exactly like
+ * the failure, the projection writes exactly one console line when an agent enters
+ * the unreadable state (and one when it recovers) — see {@link createJobsProjection}
+ * and FIELD-NOTES #97. Without that line, "could not read" would look exactly like
  * "nothing is running", the silent degradation this repo keeps finding.
+ *
+ * The stop button's rules are the `jobStop*` functions in the same file: the state
+ * machine per job row (pending, refusal notes, the 5 s window) and the geometry
+ * the popover draws it with.
  *
  * The terminal-code predicate is `isTerminalJobsErrorCode`; the codes come from
  * the shared contract so server and client cannot disagree about which are
- * terminal. The polling cadence, backoff, jitter and answer-signature rules are
- * re-exported from `client/agent-polling.ts` so existing call sites and
- * `harness/jobs-poll-check.cjs` keep reading them from here.
+ * terminal; it is re-exported here so call sites and `harness/jobs-poll-check.cjs`
+ * keep reading it from the pill's own module.
  *
  * @module dsh-paseo/client/jobs-polling
  */
-import {
-  createAgentPoller,
-  initialPollDelayMs,
-  nextPollDelayMs,
-  type AgentPoller,
-  type AgentPollerHost,
-  type PollAgent,
-  type PollAgentPage,
-  type PollRemoveReason,
-  type PollViewState,
-} from "./agent-polling";
-import { isPermissionDeniedError } from "./jobs-popover-layout";
+import type { PillReadResult, PillViewState } from "./agent-subscriptions";
 import {
   LIVE_JOB_STATUSES,
-  TERMINAL_JOB_ERROR_CODES,
+  isTerminalJobsErrorCode,
   settleDownJobs,
+  type Job,
+  type JobsAnswer,
 } from "../shared/jobs";
 
-export {
-  INITIAL_POLL_JITTER_MS,
-  LIVE_POLL_MS,
-  MAX_AGENT_DIRECTORY_PAGES,
-  MAX_POLL_JITTER_MS,
-  MAX_POLL_MS,
-  POLL_JITTER_RATIO,
-  initialPollDelayMs,
-  nextPollDelayMs,
-} from "./agent-polling";
 
 /** The slice of a job the pill's presentation rule needs. */
 export interface JobLike {
   status: string;
-}
-
-/** One read's answer, mirroring the `jobsList` contract. */
-export interface JobsReadResult<J extends JobLike = JobLike> {
-  available: boolean;
-  jobs?: readonly J[];
-  error?: { message: string; code?: string };
 }
 
 /** One agent's state as the popover store keeps it. */
@@ -94,24 +71,6 @@ export interface JobsViewState<J extends JobLike = JobLike> {
   error?: string;
   code?: string;
 }
-
-/**
- * The shape this module's adapter needs from a job: it must be identifiable and
- * carry a finish time, or {@link settleDownJobs} cannot keep it settled.
- */
-export interface JobsJobLike extends JobLike {
-  readonly id: string;
-  readonly finishedAt?: number;
-}
-
-/** The fields of an agent the pill cares about. */
-export type JobsAgent = PollAgent;
-
-/** One page of the agent directory, structurally. */
-export type JobsAgentPage = PollAgentPage;
-
-/** Why an agent's pill was torn down; the host decides what to log. */
-export type JobsRemoveReason = PollRemoveReason;
 
 /**
  * What the pill should show for one answer.
@@ -222,12 +181,11 @@ function isLive(status: string): boolean {
  * Whether an error code means "retrying cannot help".
  *
  * Both terminal codes need a human action — rewrite the embedded bridge, or fix
- * a profile that composes no job registry — so the caller stops the timer and
- * hides the pill instead of retrying every few seconds.
+ * a profile that composes no job registry — so the stream stops and the pill is
+ * removed instead of waiting for an answer that cannot change. Re-exported from
+ * `../shared/jobs`, where the server's feed reads the same predicate.
  */
-export function isTerminalJobsErrorCode(code: string | undefined): boolean {
-  return code !== undefined && (TERMINAL_JOB_ERROR_CODES as readonly string[]).includes(code);
-}
+export { isTerminalJobsErrorCode };
 
 /**
  * The terminal codes that mean the *environment* cannot serve jobs — the bridge
@@ -257,136 +215,357 @@ export function isBridgeEnvironmentJobsError(code: string | undefined): boolean 
 }
 
 /**
- * The host half the jobs pill's poller needs.
+ * The pill's store row from the controller's payload.
  *
- * Same shape as before the controller was shared: the jobs adapter owns the
- * `{jobs}` payload and the pill module owns the React store and the host
- * registration.
+ * The controller (`client/agent-subscriptions`) speaks one generic payload —
+ * `{data, available, error?, code?}` — while this pill's store and its popover
+ * name the payload `jobs`. The mapping is pure and lives here (not in the
+ * `.tsx`) so the offline harness drives the **real** conversion instead of a
+ * hand-written copy of it; `jobs-pill.tsx` only wires it to `registration.update`.
  */
-export interface JobsPollerHost<J extends JobsJobLike = JobsJobLike> {
-  readJobs(agentId: string): Promise<JobsReadResult<J>>;
-  /** One more directory page, only when the first snapshot said there is one. */
-  listAgentPage(cursor: string): Promise<JobsAgentPage>;
-  addAgent(agent: JobsAgent): void;
-  removeAgent(agentId: string, reason: JobsRemoveReason, error?: JobsReadResult["error"]): void;
-  publishState(agentId: string, state: JobsViewState<J>): void;
-  onError(message: string, error?: unknown): void;
-  setTimeout(callback: () => void, delayMs: number): unknown;
-  clearTimeout(handle: unknown): void;
-  random?: () => number;
+export function jobsPillViewState(state: PillViewState<readonly Job[]>): JobsViewState<Job> {
+  return {
+    jobs: state.data,
+    available: state.available,
+    ...(state.error === undefined ? {} : { error: state.error }),
+    ...(state.code === undefined ? {} : { code: state.code }),
+  };
 }
 
-/** The controller `jobs-pill.tsx` drives from its agent subscription. */
-export type JobsPoller = AgentPoller;
+/* -------------------------------------------------------------------------- */
+/* Stopping a running job                                                      */
+/* -------------------------------------------------------------------------- */
 
 /**
- * Create the per-agent jobs poll controller.
+ * The stop control's geometry (ratified design, 2026-11-11).
  *
- * A thin adapter over {@link createAgentPoller}: it maps the jobs answer to the
- * controller's generic payload and back, and hands it the jobs terminal-code
- * predicate. Behaviour is the controller's, so a rule fixed there is fixed for
- * both pills.
+ * **Why the numbers live in this module.** They belong beside the row geometry in
+ * `client/jobs-popover-layout.ts`, which this round's write scope does not cover;
+ * they are pure constants with no React Native import, so the offline check drives
+ * them and the JSX reads them from here. A later pass may move them to the layout
+ * module unchanged — nothing else in this file depends on where they sit.
+ */
+export const JOB_STOP_BOX = 28;
+
+/** The popover's small-button radius (the goal pill's icon buttons are 6). */
+export const JOB_STOP_RADIUS = 6;
+
+/** The glyph is the `JobMark`'s box, so the button's icon matches the row's mark. */
+export const JOB_STOP_GLYPH = 14;
+
+/**
+ * `hitSlop` per side: the box is 28, so the effective target is 44×44 — the
+ * phone/tablet minimum the design asks for.
+ */
+export const JOB_STOP_HIT_SLOP = 8;
+
+/**
+ * How long a "requested" stop may take before the row says so.
+ *
+ * `kill()` is synchronous but the producer settles asynchronously (DSH writes the
+ * terminal row later), and the subscription that carries that settlement reads on
+ * a 4-second base with jitter. 5 s therefore covers one push in the common case and
+ * is short enough to tell the user something is wrong instead of leaving a spinner
+ * forever.
+ */
+export const JOB_STOP_TIMEOUT_MS = 5000;
+
+/** One row's note under a job: a neutral tip, or the runtime's own error. */
+export interface JobStopNote {
+  /**
+   * `refusal` notes clear on the next push (the design's "下次推送…清除");
+   * `timeout` notes stay while the job is still stoppable, because a push that
+   * still reports `running` is exactly the condition they describe.
+   */
+  readonly kind: "refusal" | "timeout";
+  /**
+   * `neutral` is a tip, not an error: "it already finished" and "it is already
+   * stopping" are answers to the user's click, not failures.
+   */
+  readonly tone: "neutral" | "error";
+  readonly message: string;
+}
+
+/** What the popover keeps for one job row's stop attempt. */
+export interface JobStopRowState {
+  /** The request is in flight and the row waits for the push that ends it. */
+  readonly pending: boolean;
+  readonly note?: JobStopNote;
+}
+
+/** The stop state of every row of one agent, keyed by job id. */
+export type JobStopStates = Readonly<Record<string, JobStopRowState>>;
+
+/** What this module's rules need from the locale table's `jobs` block. */
+export interface JobStopText {
+  readonly stopAlreadyFinished: string;
+  readonly stopAlreadyStopping: string;
+  readonly stopGone: string;
+  readonly stopSentStillRunning: string;
+}
+
+/**
+ * Whether the runtime says this job can be stopped **right now**.
+ *
+ * `canStop` is the bridge's derivation (`status === "running"`), not a guess made
+ * here: `stopping` means a cancellation is already in flight, and every terminal
+ * status is settled. A missing field (an older bridge, a fixture) is not
+ * stoppable — the button must not promise what the runtime cannot do.
+ */
+export function jobStoppable(job: { readonly canStop?: boolean }): boolean {
+  return job.canStop === true;
+}
+
+/**
+ * The row's title: the model's own description when it has one, else the raw
+ * command — the rule `JobRow` draws and this module's accessibility label must
+ * agree with, so it is stated once here and both read it.
+ */
+export function jobRowTitle(job: { readonly label: string; readonly description?: string }): string {
+  const description = job.description;
+  return description !== undefined && description !== "" ? description : job.label;
+}
+
+/**
+ * The row's accessibility name for the stop button.
+ *
+ * The locale string carries `{title}`; the title is inserted with a **function**
+ * replacement so a `$` in a command (`awk '{print $1}'`) cannot be read as a
+ * `String.replace` pattern.
+ */
+export function jobStopA11yLabel(text: { readonly stop: string }, title: string): string {
+  return text.stop.replace("{title}", () => title);
+}
+
+/**
+ * A refusal as a note — or nothing when the answer says it was requested.
+ *
+ * Two refusals are **neutral tips**, not errors: the job already finished (the
+ * button was drawn for a row that settled a moment ago) and the job is already
+ * stopping (a second click, or another window's). "No such job" and "no session"
+ * are neutral too: the row is stale and the list will refresh. Everything else —
+ * a bridge without the method, a missing registry, a transport failure, a
+ * producer whose cancel threw — is an **error**, shown with the runtime's own
+ * sentence, because the user's click may have done nothing.
+ */
+export function jobStopRefusalNote(
+  error: { readonly message: string; readonly code?: string } | undefined,
+  text: JobStopText,
+): JobStopNote | undefined {
+  if (error === undefined) return undefined;
+  switch (error.code) {
+    case "job_finished":
+      return { kind: "refusal", tone: "neutral", message: text.stopAlreadyFinished };
+    case "job_not_stoppable":
+      return { kind: "refusal", tone: "neutral", message: text.stopAlreadyStopping };
+    case "job_not_found":
+    case "session_missing":
+      return { kind: "refusal", tone: "neutral", message: text.stopGone };
+    default:
+      return { kind: "refusal", tone: "error", message: error.message };
+  }
+}
+
+/**
+ * One click: pending, and any stale note cleared.
+ *
+ * Two no-ops, both by design: a row the runtime will not stop (`canStop: false`)
+ * and a row that is already pending (the design's "同一行 pending 期间重复点击无效").
+ * Returning the same object lets the popover skip a repaint.
+ */
+export function jobStopStart(
+  states: JobStopStates,
+  job: { readonly id: string; readonly canStop?: boolean },
+): JobStopStates {
+  if (!jobStoppable(job)) return states;
+  if (states[job.id]?.pending === true) return states;
+  return { ...states, [job.id]: { pending: true } };
+}
+
+/**
+ * The `jobs.stop` answer for one row.
+ *
+ * `ok: true` changes nothing visible: the row keeps its pending spinner and waits
+ * for the subscription to report the new status — the client never fabricates a
+ * "stopped" row (design, 2026-11-11). A refusal restores the button and carries
+ * its note.
+ */
+export function jobStopAnswer(
+  states: JobStopStates,
+  jobId: string,
+  result: { readonly ok: boolean; readonly error?: { readonly message: string; readonly code?: string } },
+  text: JobStopText,
+): JobStopStates {
+  const current = states[jobId];
+  if (current === undefined) return states;
+  if (result.ok) {
+    return current.pending ? states : { ...states, [jobId]: { pending: true } };
+  }
+  const note = jobStopRefusalNote(result.error, text);
+  return { ...states, [jobId]: { pending: false, ...(note === undefined ? {} : { note }) } };
+}
+
+/** Drop one row's state (a helper so every branch removes the key the same way). */
+function withoutRow(states: JobStopStates, jobId: string): JobStopStates {
+  if (states[jobId] === undefined) return states;
+  const next: Record<string, JobStopRowState> = {};
+  let changed = false;
+  for (const [id, state] of Object.entries(states)) {
+    if (id !== jobId) next[id] = state;
+    else changed = true;
+  }
+  return changed ? next : states;
+}
+
+/**
+ * A pushed snapshot arrived: the rows it describes are the truth.
+ *
+ * - a job that left the list or is no longer stoppable drops its state (the
+ *   button is gone, so a pending flag or a note would be a ghost);
+ * - a **refusal** note clears on the next push (the design says so: the world
+ *   moved on, the tip has been read);
+ * - a `timeout` note stays while the job is still stoppable — that push is
+ *   exactly the "still running" evidence the note reports;
+ * - a pending row keeps waiting, however many pushes arrive before that one
+ *   ends it.
+ */
+export function jobStopPushed(
+  states: JobStopStates,
+  jobs: readonly { readonly id: string; readonly canStop?: boolean }[],
+): JobStopStates {
+  let next = states;
+  const byId = new Map(jobs.map((job) => [job.id, job] as const));
+  for (const [jobId, state] of Object.entries(states)) {
+    const job = byId.get(jobId);
+    if (job === undefined || !jobStoppable(job)) {
+      next = withoutRow(next, jobId);
+      continue;
+    }
+    if (state.note?.kind === "refusal") {
+      next = { ...next, [jobId]: { pending: state.pending } };
+    }
+  }
+  return next;
+}
+
+/**
+ * The 5-second timer fired.
+ *
+ * A no-op unless the row is still pending **and** the job is still stoppable:
+ * a push that already moved the job to `stopping`/settled made the question moot,
+ * and that row's state is dropped instead of replaced. Otherwise the button comes
+ * back and the row says the request was sent but the job is still running — the
+ * one user-visible answer to "I pressed stop and nothing happened".
+ */
+export function jobStopTimedOut(
+  states: JobStopStates,
+  job: { readonly id: string; readonly canStop?: boolean },
+  text: JobStopText,
+): JobStopStates {
+  if (states[job.id]?.pending !== true) return states;
+  if (!jobStoppable(job)) return withoutRow(states, job.id);
+  return {
+    ...states,
+    [job.id]: {
+      pending: false,
+      note: { kind: "timeout", tone: "neutral", message: text.stopSentStillRunning },
+    },
+  };
+}
+
+/**
+ * The rows whose stop state a push **removed**.
+ *
+ * `jobStopPushed` drops the state of a job that left the list or stopped being
+ * stoppable, but the popover's 5-second timer is keyed by job id outside the
+ * state map — a timer nobody cancelled would fire later and re-enter a row the
+ * push already settled. The caller cancels exactly these ids.
+ */
+export function jobStopDroppedIds(before: JobStopStates, after: JobStopStates): string[] {
+  return Object.keys(before).filter((jobId) => after[jobId] === undefined);
+}
+
+/** The note under one row, if any. */
+export function jobStopNoteOf(states: JobStopStates, jobId: string): JobStopNote | undefined {
+  return states[jobId]?.note;
+}
+
+/** Whether one row's stop request is in flight. */
+export function jobStopPendingOf(states: JobStopStates, jobId: string): boolean {
+  return states[jobId]?.pending === true;
+}
+
+/**
+ * The jobs pill's per-agent projection state.
+ *
+ * Two maps, as long-lived as the contribution: the settle latch must survive a
+ * re-registration of the same agent (a reconnect re-registers it, and the
+ * settlement it saw is still a fact), while a torn-down pill drops its entry so a
+ * long-lived client does not grow one per agent it ever saw.
+ */
+export interface JobsProjection {
+  /** One pushed answer, with settlements latched and the failure line managed. */
+  project(agentId: string, answer: JobsAnswer): PillReadResult<readonly Job[]>;
+  /** The pill was removed: forget both per-agent maps. */
+  forget(agentId: string): void;
+}
+
+/**
+ * Create the jobs projection for one pill contribution.
  *
  * **One published answer, with settlements latched.** {@link settleDownJobs} is
- * applied to every readable answer before it leaves this adapter, so the pill,
- * its count and the popover all read the same corrected list. The latch is
- * **defensive**: DSH settles a job once and the controller's in-flight and
- * sequence guards already reject an answer a newer poll superseded, so no
- * observed answer has reported a settled job as running. It covers the paths the
- * guards cannot see (a bridge replaying a long session's open window, a second
- * connection answering for the same agent after a reconnect). A failed read does
- * not touch the latch: it carries the previous `data` forward.
+ * applied to every readable answer before it leaves this module, so the pill, its
+ * count and the popover all read the same corrected list. The latch is
+ * **defensive**: DSH settles a job once and the server pushes only changed
+ * snapshots, so no observed answer has reported a settled job as running. It
+ * covers the paths those guards cannot see (a bridge replaying a long session's
+ * open window, a second connection answering for the same agent after a
+ * reconnect). A failed answer does not touch the latch: it carries the previous
+ * payload forward.
  *
- * **A failed read is logged, once per entry into the failed state.** The pill
- * no longer shows itself for a failed read (see {@link jobsPillPresentation}),
- * so the console line is the only thing that keeps the failure loud — without
- * it, "the runtime cannot answer" would be indistinguishable from "nothing is
- * running", which is the silent-degradation shape this repo keeps finding. The
- * line fires on the transition, not on every 4-second poll; a successful read
- * logs one recovery line; a terminal code logs nothing here because the pill's
- * removal already logs exactly one line.
+ * **A failed read is logged, once per entry into the failed state.** The pill no
+ * longer shows itself for a failed read (see {@link jobsPillPresentation}), so the
+ * console line is the only thing that keeps the failure loud — without it, "the
+ * runtime cannot answer" would be indistinguishable from "nothing is running".
+ * The line fires on the transition, not on every pushed answer; a successful
+ * answer logs one recovery line; a terminal code logs nothing here because the
+ * pill's removal already logs exactly one line.
+ *
+ * The latch's row is the shared contract's `Job` — {@link settleDownJobs} only
+ * needs an id, a status and a finish time, and the pill's store carries exactly
+ * that row.
  */
-export function createJobsPoller<J extends JobsJobLike>(host: JobsPollerHost<J>): JobsPoller {
-  /**
-   * Per agent, the rows this client has already seen settled.
-   *
-   * Kept for the contribution's lifetime, not per registration: a reconnect
-   * re-registers the same agent, and the settlement it saw is still a fact. A
-   * new job is a new id, so the latch cannot hide it. Dropped when the pill is
-   * torn down, so a long-lived client does not accumulate an entry per agent it
-   * ever saw.
-   */
-  const settled = new Map<string, ReadonlyMap<string, J>>();
-  /**
-   * Agents whose current read state is "could not read".
-   *
-   * The set is what makes the failure line **one per transition** instead of one
-   * per poll, and its `delete` is the recovery edge. Cleared with the pill.
-   */
+export function createJobsProjection(host: {
+  onError(message: string, error?: unknown): void;
+}): JobsProjection {
+  const settled = new Map<string, ReadonlyMap<string, Job>>();
   const unreadable = new Set<string>();
-  const noteUnreadable = (agentId: string, error?: unknown): void => {
-    if (unreadable.has(agentId)) return;
-    unreadable.add(agentId);
-    host.onError(
-      `jobs pill: could not read this session's jobs for ${agentId}; keeping the last known answer until a read succeeds`,
-      error,
-    );
-  };
-  const adapter: AgentPollerHost<readonly J[]> = {
-    read: async (agentId) => {
-      let result: JobsReadResult<J>;
-      try {
-        result = await host.readJobs(agentId);
-      } catch (error) {
-        // The RPC itself failed (transport, daemon restart, a host-side "stream
-        // ended"): still a failed read, still exactly one line. A permission
-        // refusal is excluded — the pill's own teardown logs that line, and two
-        // lines for one event is noise. Rethrown so the controller keeps its
-        // transient backoff and permission handling.
-        if (!isPermissionDeniedError(error)) noteUnreadable(agentId, error);
-        throw error;
-      }
-      if (!result.available) {
+
+  return {
+    project(agentId: string, answer: JobsAnswer): PillReadResult<readonly Job[]> {
+      if (!answer.available) {
         // A terminal code is the pill-removal path, which logs its own line.
-        if (!isTerminalJobsErrorCode(result.error?.code)) noteUnreadable(agentId, result.error?.message);
-        return { available: false, error: result.error };
+        if (!isTerminalJobsErrorCode(answer.error?.code)) {
+          if (!unreadable.has(agentId)) {
+            unreadable.add(agentId);
+            host.onError(
+              `jobs pill: could not read this session's jobs for ${agentId}; keeping the last known answer until a read succeeds`,
+              answer.error?.message,
+            );
+          }
+        }
+        return { available: false, ...(answer.error === undefined ? {} : { error: answer.error }) };
       }
       if (unreadable.delete(agentId)) {
         host.onError(`jobs pill: this session's jobs are readable again for ${agentId}`);
       }
-      const projection = settleDownJobs(result.jobs ?? [], settled.get(agentId) ?? new Map());
+      const projection = settleDownJobs(answer.jobs, settled.get(agentId) ?? new Map());
       settled.set(agentId, projection.settled);
       return { available: true, data: projection.jobs };
     },
-    listAgentPage: (cursor) => host.listAgentPage(cursor),
-    addAgent: (agent) => host.addAgent(agent),
-    removeAgent: (agentId, reason, error) => {
-      // The pill is gone: forget both per-agent maps. A later re-registration
-      // starts clean, and a long session cannot grow one latch per agent ever
-      // seen.
+    forget(agentId: string): void {
       settled.delete(agentId);
       unreadable.delete(agentId);
-      host.removeAgent(agentId, reason, error);
     },
-    publishState: (agentId, state: PollViewState<readonly J[]>) => {
-      host.publishState(agentId, {
-        jobs: state.data,
-        available: state.available,
-        ...(state.error === undefined ? {} : { error: state.error }),
-        ...(state.code === undefined ? {} : { code: state.code }),
-      });
-    },
-    onError: (message, error) => host.onError(message, error),
-    setTimeout: (callback, delayMs) => host.setTimeout(callback, delayMs),
-    clearTimeout: (handle) => host.clearTimeout(handle),
-    ...(host.random === undefined ? {} : { random: host.random }),
-    isTerminalErrorCode: isTerminalJobsErrorCode,
-    initialData: [],
-    // The jobs pill's own copy, unchanged from before the controller was shared:
-    // the trigger, the popover and these two log lines are the surface the user
-    // already knows, and a genericised sentence would be a silent copy change.
-    fallbackErrorMessage: "the DSH runtime could not list this session's jobs",
-    pillLabel: "jobs pill",
   };
-  return createAgentPoller(adapter);
 }

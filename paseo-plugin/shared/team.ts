@@ -22,7 +22,7 @@
  *
  * @module dsh-paseo/shared/team
  */
-import { defineRpc } from "@getpaseo/plugin";
+import { defineSubscription } from "@getpaseo/plugin";
 import { z } from "zod";
 
 /** DSH's member phases (`TeamMemberProjection.phase`), written out so a new one fails the parse. */
@@ -104,24 +104,35 @@ export function isTerminalTeamErrorCode(code: string | undefined): boolean {
 }
 
 /**
- * Read one agent's team board.
+ * One agent's team answer: the complete snapshot one subscription event carries.
  *
  * `available: true` + `team: null` = "we looked and there is no team" (no stored
  * log yet, no team events, or no session for the agent in this process).
  * `available: false` always carries a message and, when known, a code. The two
- * are never collapsed (the `goal.current` / `jobs.list` rule).
+ * are never collapsed (the goal/jobs rule).
+ *
+ * Replaced the `team.read` RPC in the 0.16 port: the pill used to poll it every
+ * four seconds per agent, and the server now shares one read between every client
+ * watching the same agent (`server/pill-feed`), pushing this snapshot only when
+ * it changes.
  */
-export const teamRead = defineRpc({
-  name: "team.read",
+export const teamAnswerSchema = z.object({
+  available: z.boolean(),
+  team: teamViewSchema.nullable(),
+  error: z
+    .object({
+      message: z.string(),
+      code: z.enum(TEAM_ERROR_CODES).optional(),
+    })
+    .optional(),
+});
+
+/** One agent's team answer, as the server pushes it and the client stores it. */
+export type TeamAnswer = z.infer<typeof teamAnswerSchema>;
+
+/** Watch one agent's team board. */
+export const teamSnapshot = defineSubscription({
+  name: "team.snapshot",
   input: z.object({ agentId: z.string().min(1) }),
-  output: z.object({
-    available: z.boolean(),
-    team: teamViewSchema.nullable(),
-    error: z
-      .object({
-        message: z.string(),
-        code: z.enum(TEAM_ERROR_CODES).optional(),
-      })
-      .optional(),
-  }),
+  event: teamAnswerSchema,
 });

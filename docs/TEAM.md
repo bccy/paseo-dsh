@@ -11,7 +11,7 @@ DSH 的 `dsh-experimental-agent-team` 给 Lead 会话一个团队：队员（各
 | 成员、任务、failure | DSH 的 `agentTeam` session projection（wire 视图 `TeamProjection`：`{members, tasks, failure?}`，已删除任务已被 DSH 过滤），经桥已有的 `paseo/projections {sessionId, keys:["agentTeam"]}` 冷读 | 是（只写在 Lead 会话日志里） |
 | 成员是否在跑（`running`） | 插件服务端自己：Lead = 根会话当前回合；队员 = 本进程托管的同 id 子会话，且已收到过它的 live 帧 | 否（运行时） |
 
-- **桥零改动**。RPC `team.read {agentId} → {available, team, error?}`，形状照 `goal.current` / `jobs.list`（`shared/team.ts`）。
+- **桥零改动**。订阅 `team.snapshot {agentId}`，事件就是完整快照 `{available, team, error?}`（`shared/team.ts` 的 `defineSubscription`）。
 - **`running` 缺省 = 不知道**。本进程没托管到的队员（例如在别的进程里跑）不带这个键，面板写「成员」，
   既不说「运行中」也不说「空闲」。把持久的 `active` 当成运行中，就是 FIELD-NOTES 里的静默降级。
 - 服务端用共享 Zod schema 校验 DSH 的形状；不是这个形状 → `rpc_failed` 带解析原因，**不会**画成空看板。
@@ -30,9 +30,9 @@ DSH 的 `dsh-experimental-agent-team` 给 Lead 会话一个团队：队员（各
 
 ## pill
 
-- **可见**：只看任务（`tasks.length > 0`）——有任务就显示，没任务一律不显示。2026-11-06 用户决策：起了队员但没建任务时不亮 pill（此时面板只会写「N 名成员 / 暂无共享任务」）；队员数不再参与判断，无看板（`null`）也不显示。**全部任务 `completed` 后只再显示一次，只有点开并关闭面板后才隐藏；不点开时发送新消息不会隐藏**（照 goal 的 seen 机制，UI-v7）：面板关闭（经 `seen-close-gate` 确认）算看过，全部完成后 agent 从 idle 变 running（用户发了下一条消息）**不算**看过；签名 `teamAllDoneKey`（tasks 按 id 排序的 `id:revision`）变化（新增任务 / revision 变化）会重新显示一次。`seen` **持久化在宿主插件设置**（`team-pill-seen`，host scope，`{seen: {agentId: 签名}}`，最多 64 条，见 `shared/team-seen-settings.ts` 与 `client/seen-persistence.ts`，2026-11-08）：每次**确认关闭**把该 agent 的签名写一次，客户端 bundle 启动时异步读取，读取完成前不推送可见性——所以 app / 插件 reload、daemon 重启后已看过的全完成看板仍隐藏，不会先闪一下；宿主没有插件设置（老 Paseo）或读写失败时自动退回内存态（会再显示一次，只 console 一次、不阻塞 pill），卸载/重装插件由宿主删掉设置目录、重置一次，首次读 2s 无响应同样按退回处理。读到被拒（corrupt / 版本不符）的文档会 best-effort `reset` 修复（与读共用同一 2s 门限），成功后重新开始记录；修复失败退回内存态。**移除 pill（agent 离开 / 无权限 / 终态）只清内存态，已落盘的签名保留**（2026-11-09）：签名只命中用户关过的那块全完成看板，抹掉它只会让重连 / 重试 / 终态恢复后重显示一次；新任务或新 revision 是新签名、照常显示。注意 `task-N` 是 journal 内计数器，同一个签名集合理论上可被 rewind 或重建的看板重新铸出（这一风险在「不移除」的路径上同样存在，旧的 `forget` 只覆盖移除这一条支路）。
+- **可见**：只看任务（`tasks.length > 0`）——有任务就显示，没任务一律不显示。2026-11-06 用户决策：起了队员但没建任务时不亮 pill（此时面板只会写「N 名成员 / 暂无共享任务」）；队员数不再参与判断，无看板（`null`）也不显示。**全部任务 `completed` 后只再显示一次，只有点开并关闭面板后才隐藏；不点开时发送新消息不会隐藏**（照 goal 的 seen 机制，UI-v7）：面板关闭（经 `seen-close-gate` 确认）算看过，全部完成后 agent 从 idle 变 running（用户发了下一条消息）**不算**看过；签名 `teamAllDoneKey`（tasks 按 id 排序的 `id:revision`）变化（新增任务 / revision 变化）会重新显示一次。`seen` **存在 agent 的插件元数据里**（键 `dsh.teamSeen`，值就是 `teamAllDoneKey`，见 `shared/pill-metadata.ts` 与 `client/seen-metadata.ts`，2026-11-08 起、2026-11-11 换到元数据）：每次**确认关闭**把该 agent 的签名写一次（`paseo.agents.ref(agentId).setMetadata`），读随 agent 目录快照到达——注册 pill 之前就已知，所以不需要「读完前不推送」；app / 插件 reload、daemon 重启后已看过的全完成看板仍隐藏，不会先闪一下；写失败一条 console 且本会话仍隐藏（只 console 一次、不阻塞 pill）。原来的宿主插件设置文档（`team-pill-seen`、64 条上限、`invalid` 文档 `reset` 修复、跨端写冲突合并）随 0.16 端口删除。**移除 pill（agent 离开 / 无权限 / 终态）只清内存态，已落盘的签名保留**（2026-11-09）：签名只命中用户关过的那块全完成看板，抹掉它只会让重连 / 重试 / 终态恢复后重显示一次；新任务或新 revision 是新签名、照常显示。注意 `task-N` 是 journal 内计数器，同一个签名集合理论上可被 rewind 或重建的看板重新铸出（这一风险在「不移除」的路径上同样存在，旧的 `forget` 只覆盖移除这一条支路）。
   - **「面板关闭」必须是确认过的关闭**（2026-11-06 真机 bug 修复）：宿主打开 popover 时会把内容**重挂载一次**——`AnchoredSurface` 的 `FloatingSurface` 带 `key={placed ? "placed" : "measuring"}`（Paseo 0.15.0 `packages/app/src/components/ui/menu/menu-overlay.tsx:350`，注释在 :265 明说「Remounting on placement…」），先离屏测量再换 key 正式定位。所以 `unmount` 本身不是「用户关了面板」。规则是 `createSeenCloseGate`（`client/seen-close-gate.ts`，与目标 pill 共用，窗口 `SEEN_CLOSE_CONFIRM_MS` = 250ms）：卸载后 250ms 内又挂载 → 取消，不记 seen；卸载后一直没回来 → 记 seen。修复前的实现把任何卸载都当关闭，用户一点开、宿主测量完重挂载，seen 立刻写入 → pill 当场消失、任务板面板根本没显示出来。
-  - 顺带：`present()` 只在 `visible` / `label` / `title` / `icon` 真变化时才 `registration.update`（`agent-polling.ts:315-321` 的 `publishIfChanged` 已对**相同答案**去重；这里补的是「看板变了、按钮状态没变」仍会推一次 `update` 的情况，白让宿主重建按钮与 popover 页面）。
+  - 顺带：`present()` 只在 `visible` / `label` / `title` / `icon` 真变化时才 `registration.update`（`client/agent-subscriptions` 里的 `publishIfChanged` 已对**相同答案**去重；这里补的是「看板变了、按钮状态没变」仍会推一次 `update` 的情况，白让宿主重建按钮与 popover 页面）。
 - **文字与 title 恒为「团队」/「Team」**，不带计数（title 同时是读屏名、桌面 tooltip、手机 sheet 标题）。
 - **压缩成纯图标时图标偏右（2026-11-05 测量）**：宿主插件 pill 是 `composerPillStyles.body`（边框 1、左右内边距 12、gap 8）
   加 `styles.button { flexShrink: 1, minWidth: 0 }`（Paseo 0.15.0 `plugins/buttons/view.tsx:670`），内容从左排、不居中，
@@ -49,7 +49,9 @@ DSH 的 `dsh-experimental-agent-team` 给 Lead 会话一个团队：队员（各
 - **图标**：常规画 `Users`（`CornerRingIcon`）：有队员 `running === true` → 灰色 `Users` 右下角叠运行环；`failure` 或有成员创建失败 → 红色 `Users`；否则灰色 `Users`。**全部任务 `completed` → 绿色 `CircleCheck`（`statusSuccess`，与目标 pill 完成态同一标记；2026-11-06 用户决策）**，优先级 `failed`（红）> `complete`（绿）> `running`（环）> `idle`（灰）；无任务不读成 complete（此时 pill 本来就隐藏）。
   图标只在状态变化时 `update`，运行环不会每次轮询重启（jobs pill 的做法）。
 - **各 pill 独立显示**：Paseo 0.15.3 起 composer 的 pill 轨道是横向滚动条（宿主 `packages/app/src/composer/tracks.tsx` 的 `ComposerTrackBar` → 横向 `ScrollView`），三颗 pill 可以同屏左右滑动浏览，所以**没有跨 pill 的可见性协调**（2026-11-06 定的「目标+团队同时可见时后台 pill 隐藏」与 `client/pill-deference.ts` 已于 2026-11-08 一并删除）：目标、团队、后台各按自身规则决定 `visible`。老宿主（<0.15.3）轨道不滚动，第三颗 pill 可能被裁切，这是已知限制，不用隐藏规则规避。
-- 轮询复用 `client/agent-polling.ts`（4s、抖动、退避到 30s、答案去重），**未改它**；三颗 pill 的 `visible` 互不影响。
+- 数据由**服务端订阅**推送（2026-11-11，Paseo 0.16）：`shared/team.ts` 的 `team.snapshot`，服务端
+  `server/pill-feed` 每 agent 一次读、只在变化时推、无订阅者即停；客户端 `client/agent-subscriptions`
+  负责 per-agent 生命周期与发布去重。三颗 pill 的 `visible` 互不影响。
 
 ## 面板（设计 T2 方向 B）
 

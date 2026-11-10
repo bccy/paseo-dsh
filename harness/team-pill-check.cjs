@@ -48,7 +48,6 @@ const path = require("node:path");
 const {
   TEAM_GROUP_ORDER,
   TEAM_TASK_ICONS,
-  createTeamPoller,
   teamAllDoneKey,
   teamCompleteSeenStep,
   teamMemberState,
@@ -69,15 +68,15 @@ const {
   teamTaskGroups,
   teamTaskMark,
   teamWarningText,
+  projectTeamAnswer,
 } = require("./client/team-polling.js");
 const { SEEN_CLOSE_CONFIRM_MS, createSeenCloseGate } = require("./client/seen-close-gate.js");
 const { allText } = require("./client/locale.js");
 const { PROVIDER_ID } = require("./shared/provider.js");
 const { isTerminalTeamErrorCode, teamViewSchema, TEAM_ERROR_CODES, TERMINAL_TEAM_ERROR_CODES } = require("./shared/team.js");
-const { createSeenPersistence } = require("./client/seen-persistence.js");
-const { SEEN_SETTINGS_LIMIT, seenMapOf, mergeSeenValues } = require("./shared/seen-settings.js");
-const { defineTeamSeenSettings } = require("./shared/team-seen-settings.js");
-const { defineGoalSeenSettings } = require("./shared/goal-seen-settings.js");
+const { createAgentSubscriptions } = require("./client/agent-subscriptions.js");
+const { createSeenMetadataStore } = require("./client/seen-metadata.js");
+const { TEAM_SEEN_METADATA_KEY } = require("./shared/pill-metadata.js");
 
 const ZH = allText()["zh-CN"].team;
 const EN = allText().en.team;
@@ -97,6 +96,12 @@ function assert(what, condition, detail) {
   if (condition) return;
   failures += 1;
   console.error(`  FAIL ${what}${detail === undefined ? "" : `: ${detail}`}`);
+}
+function check(what, actual, expected) {
+  checks += 1;
+  if (Object.is(actual, expected)) return;
+  failures += 1;
+  console.error(`  FAIL ${what}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
 }
 
 const LEAD = { id: "root", name: "lead", role: "lead", phase: "active" };
@@ -443,69 +448,89 @@ console.log("\nthe contract");
   equal("running survives the schema", stripped.members[0].running, true);
 }
 
-console.log("\nthe poller adapter");
+console.log("\nthe subscription adapter");
 const settle = () => new Promise((resolve) => setImmediate(resolve));
-async function pollerChecks() {
-  const timers = [];
+async function subscriptionChecks() {
+  /** The fake host: one push channel per agent, as `client.subscribe` gives the pill. */
   const make = (answers) => {
-    const log = { added: [], removed: [], published: [] };
-    let i = 0;
-    const poller = createTeamPoller({
-      readTeam: async () => answers[Math.min(i++, answers.length - 1)],
+    const log = { added: [], updated: [], removed: [], published: [], opens: [], aborts: [] };
+    const live = new Map();
+    const host = {
+      open(agentId, onAnswer, onEnd, signal) {
+        log.opens.push(agentId);
+        live.set(agentId, { onAnswer, onEnd });
+        signal.addEventListener("abort", () => {
+          log.aborts.push(agentId);
+          live.delete(agentId);
+        });
+      },
       listAgentPage: async () => ({ entries: [] }),
       addAgent: (agent) => log.added.push(agent.id),
+      updateAgent: (agent) => log.updated.push(agent),
       removeAgent: (agentId, reason) => log.removed.push([agentId, reason]),
-      publishState: (agentId, team) => log.published.push([agentId, team]),
+      publishState: (agentId, state) => log.published.push([agentId, state.data]),
       onError: () => {},
-      setTimeout: (cb, ms) => {
-        timers.push({ cb, ms });
-        return timers.length - 1;
-      },
-      clearTimeout: () => {},
-      random: () => 0,
-    });
-    return { poller, log };
+      project: (_agentId, answer) => projectTeamAnswer(answer),
+      isTerminalErrorCode: isTerminalTeamErrorCode,
+      initialData: null,
+      fallbackErrorMessage: "the DSH runtime could not read this agent's team",
+      pillLabel: "team pill",
+      publishOnTransientError: false,
+    };
+    const subscriptions = createAgentSubscriptions(host);
+    let i = 0;
+    const deliver = async () => {
+      for (const [agentId, record] of [...live.entries()]) {
+        record.onAnswer(answers[Math.min(i++, answers.length - 1)]);
+        await settle();
+        await settle();
+        void agentId;
+      }
+    };
+    return { subscriptions, log, deliver };
   };
   const agent = { id: "a1", provider: PROVIDER_ID, workspaceId: "w" };
   const board = { members: [LEAD, mate()], tasks: [] };
   {
-    const { poller, log } = make([{ available: true, team: board }]);
-    poller.upsert(agent);
-    await settle();
-    timers.at(-1)?.cb();
-    await settle();
-    await settle();
+    const { subscriptions, log, deliver } = make([{ available: true, team: board }]);
+    subscriptions.upsert(agent);
     equal("a DSH agent registers a pill", log.added, ["a1"]);
+    equal("…and opens its subscription", log.opens, ["a1"]);
+    await deliver();
     equal("a good answer publishes the board", log.published.at(-1)?.[1]?.members?.length, 2);
-    poller.dispose();
+    subscriptions.dispose();
   }
   {
-    const { poller, log } = make([{ available: false, team: null, error: { message: "no bundle", code: "team_unavailable" } }]);
-    poller.upsert(agent);
-    await settle();
-    timers.at(-1)?.cb();
-    await settle();
-    await settle();
+    const { subscriptions, log, deliver } = make([
+      { available: false, team: null, error: { message: "no bundle", code: "team_unavailable" } },
+    ]);
+    subscriptions.upsert(agent);
+    await deliver();
     equal("a terminal code removes the pill", log.removed.at(-1), ["a1", "terminal"]);
-    poller.dispose();
+    equal("…and releases the subscription", log.aborts, ["a1"]);
+    subscriptions.dispose();
   }
   {
-    const { poller, log } = make([
+    const { subscriptions, log, deliver } = make([
       { available: true, team: board },
       { available: false, team: null, error: { message: "timeout", code: "rpc_failed" } },
     ]);
-    poller.upsert(agent);
-    await settle();
-    timers.at(-1)?.cb();
-    await settle();
-    await settle();
+    subscriptions.upsert(agent);
+    await deliver();
     const before = log.published.length;
-    timers.at(-1)?.cb();
-    await settle();
-    await settle();
+    await deliver();
     equal("a transient error publishes nothing (the last board stays)", log.published.length, before);
     equal("…and does not remove the pill", log.removed.length, 0);
-    poller.dispose();
+    subscriptions.dispose();
+  }
+  {
+    // An agent update reaches the pill with its metadata: that is the channel the
+    // "seen" key travels on (another window's confirmed close, or this one's echo).
+    const { subscriptions, log } = make([{ available: true, team: board }]);
+    subscriptions.upsert(agent);
+    subscriptions.upsert({ ...agent, metadata: { "dsh.teamSeen": "task-1:1" } });
+    equal("an update reaches the pill with its metadata", log.updated.at(-1)?.metadata, { "dsh.teamSeen": "task-1:1" });
+    subscriptions.dispose();
   }
 }
 
@@ -527,8 +552,9 @@ console.log("\npill wiring (source pins)");
     /entry\.visible === visible && entry\.icon === icon && entry\.label === text\.title && entry\.title === text\.title[\s\S]{0,80}return;/.test(pill),
   );
   assert("the pill never puts a count in its label (P1)", !/label: `|pillCount|\.length\}/.test(pill));
-  assert("visibility goes through teamPillVisible", /const visible = teamPillVisible\(team, seen\)/.test(pill));
-  assert("the pill polls through createTeamPoller", /createTeamPoller\(\{/.test(pill));
+  assert("visibility goes through teamPillVisible", /const visible = teamPillVisible\(team, remembered\)/.test(pill));
+  assert("the pill watches the board through the team subscription", /client\.subscribe\(teamSnapshot, \{ agentId \}/.test(pill));
+  assert("…and the old poller is gone", !/createTeamPoller|readTeam:/.test(pill));
   equal("zh title", ZH.title, "团队");
   equal("en title", EN.title, "Team");
   const client = fs.readFileSync(path.join(repo, "paseo-plugin/index.client.tsx"), "utf8");
@@ -553,364 +579,144 @@ console.log("\npill wiring (source pins)");
   assert("ICONS maps complete to CompleteIcon", /complete: CompleteIcon/.test(pill) && /Record<TeamPillIcon, typeof IdleIcon>/.test(pill));
   assert("the team pill no longer draws a bare StatusRingMark", !/StatusRingMark/.test(pill));
   // The popover's close is the only "seen" input (UI-v7): an all-done board
-  // disappears only after that confirmed close. Polls and agent status events
+  // disappears only after that confirmed close. Answers and agent status events
   // must never mark it seen (a new message is not "the user looked at it").
   assert("closing the team popover marks an all-done board seen", /advanceSeen\(agent\.id, \{ kind: "closed", team \}\)/.test(pill));
   assert(
     "…only for the pill the close belongs to (a stale close is dropped)",
     /if \(pills\.get\(agent\.id\)\?\.registration !== registration\) return;/.test(pill),
   );
-  assert("a poll answer does not mark anything seen", !/advanceSeen\(agentId, \{ kind: "board"/.test(pill));
+  assert("a board answer does not mark anything seen", !/advanceSeen\(agentId, \{ kind: "board"/.test(pill));
   assert(
-    "the agent status is wired as a no-op, never as a seen signal",
-    /advanceSeen\(update\.agent\.id, \{ kind: "agent", status: update\.agent\.status \}\)/.test(pill),
+    "an agent update re-presents only through the metadata store",
+    /if \(seen\.observe\(agent\)\) present\(agent\.id\)/.test(pill),
   );
+  assert(
+    "…the agent's status is never a seen signal",
+    /advanceSeen\([^)]*status/.test(pill) === false,
+  );
+  assert("the confirmed close writes the agent's metadata", /seen\.remember\(agentId, after\.seen\)/.test(pill));
+  assert("…and there is exactly one write path in the pill", (pill.match(/seen\.remember\(/g) ?? []).length === 1);
+  assert("the pill no longer talks to plugin settings", !/settingsRpc|registerSettings/.test(pill));
 }
 
 /**
- * The persisted "seen" document (UI-v7 persistence, 2026-11-08): a confirmed
- * close writes one `agentId -> teamAllDoneKey` entry to the host's plugin
- * settings, and a *new controller over the same document* — the app restart —
- * hydrates it and keeps the board hidden. A load failure degrades to the old
- * in-memory behaviour (show once more); a write failure keeps this session
- * correct and never throws.
+ * The "seen" signature on the agent (agent metadata, 2026-11-11).
+ *
+ * A confirmed close writes one `teamAllDoneKey` under `dsh.teamSeen`, and a new
+ * store over the same agent metadata — the app restart — reads it back and keeps
+ * the all-done board hidden. A load failure degrades to the old in-memory
+ * behaviour (show once more); a write failure keeps this session correct and
+ * never throws.
  */
-async function seenPersistenceChecks() {
-  console.log("\nthe persisted \"seen\" document (UI-v7 persistence, 2026-11-08)");
-  const done = (id, revision) => task({ id, revision, status: "completed" });
-  const allDone = { members: [LEAD], tasks: [done("task-1", 3)] };
-  const allDoneNewer = { members: [LEAD], tasks: [done("task-1", 4)] };
-  const KEY = "task-1:3";
+async function seenMetadataChecks() {
+  console.log('\nthe "seen" signature on the agent (agent metadata, 2026-11-11)');
+  const doneBoard = () => ({ members: [LEAD], tasks: [task({ id: "task-1", revision: 1, status: "completed" })] });
 
-  /** A fake host: one in-memory settings file; the revision hashes the raw bytes. */
-  const fakeHost = (initial = null) => {
-    let raw = initial === null ? null : JSON.stringify(initial);
-    const revision = () => (raw === null ? "missing" : `rev:${raw}`);
-    const io = {
-      reads: 0,
-      writes: [],
-      resetCalls: 0,
-      warned: [],
-      failRead: false,
-      failWrite: false,
-      failReset: false,
-      resetHangs: false,
-      resetConflict: false,
-      readInvalid: false,
-      alwaysConflict: false,
-      read: async () => {
-        io.reads += 1;
-        if (io.failRead) throw new Error("unknown method settings.team-pill-seen.read");
-        if (io.readInvalid) return { status: "invalid", revision: revision(), error: "a document this schema refuses" };
-        return { status: "ready", revision: revision(), values: raw === null ? {} : JSON.parse(raw) };
+  function createStore(overrides = {}) {
+    const writes = [];
+    const errors = [];
+    const store = createSeenMetadataStore(
+      {
+        write: async (agentId, signature) => {
+          writes.push([agentId, signature]);
+          if (overrides.failWrites) throw new Error("the host refused the metadata write");
+        },
+        onError: (message, error) => {
+          errors.push([message, error instanceof Error ? error.message : String(error)]);
+        },
       },
-      write: async (input) => {
-        io.writes.push(input);
-        if (io.alwaysConflict) return { status: "conflict", error: "Settings changed on another client." };
-        if (io.failWrite) throw new Error("settings write failed");
-        if (input.revision !== revision()) return { status: "conflict", error: "Settings changed on another client." };
-        raw = JSON.stringify(input.values);
-        return { status: "saved", revision: revision(), values: input.values };
-      },
-      /** The host's repair write: replaces the document without parsing the envelope. */
-      reset: async (input) => {
-        io.resetCalls += 1;
-        // A host that never answers: hydrate must still finish via the timeout.
-        if (io.resetHangs) return new Promise(() => undefined);
-        if (io.failReset) throw new Error("reset failed");
-        if (io.resetConflict) {
-          // Another client repaired the file while this reset was in flight.
-          raw = JSON.stringify({ seen: { "other-agent": "task-9:3" } });
-          return { status: "conflict", error: "Settings changed on another client." };
-        }
-        if (input.revision !== revision()) return { status: "conflict", error: "Settings changed on another client." };
-        raw = JSON.stringify({ seen: {} });
-        return { status: "saved", revision: revision(), values: { seen: {} } };
-      },
-      warn: (message) => io.warned.push(message),
-      document: () => (raw === null ? {} : JSON.parse(raw)),
-      /** Another client on the same host changes the document now. */
-      externalWrite: (values) => {
-        raw = JSON.stringify(values);
-      },
-    };
-    return io;
-  };
-
-  // The document's pure rules: untrusted JSON normalises to a bounded map.
-  equal("a non-object document is an empty map", seenMapOf("nonsense"), {});
-  equal("non-string and empty entries are dropped", seenMapOf({ a: "k", b: 3, "": "k", c: "" }), { a: "k" });
-  const many = {};
-  for (let index = 0; index < SEEN_SETTINGS_LIMIT + 5; index += 1) many[`agent-${String(index)}`] = `task-${String(index)}:1`;
-  const capped = seenMapOf(many);
-  equal("the document is capped", Object.keys(capped).length, SEEN_SETTINGS_LIMIT);
-  equal("…keeping the newest entry", capped[`agent-${String(SEEN_SETTINGS_LIMIT + 4)}`], `task-${String(SEEN_SETTINGS_LIMIT + 4)}:1`);
-  equal("…and dropping the oldest", capped["agent-0"], undefined);
-  equal(
-    "merge keeps stored agents and lets pending win",
-    mergeSeenValues({ a: "old", b: "kept" }, new Map([["a", "new"]])),
-    { a: "new", b: "kept" },
-  );
-
-  // Restart semantics: the entry a close wrote is hydrated by the next bundle.
-  {
-    const first = fakeHost();
-    const before = createSeenPersistence(first);
-    await before.hydrate();
-    equal("nothing is remembered before any close", before.get("agent-1"), undefined);
-    equal("…and the all-done board is visible", teamPillVisible(allDone, before.get("agent-1")), true);
-    equal("hydrating never writes the document", first.writes.length, 0);
-    before.remember("agent-1", KEY);
-    await before.flush();
-    equal("the confirmed close wrote the document", first.document(), { seen: { "agent-1": KEY } });
-
-    // "Restart": the client bundle runs again and hydrates the same host file.
-    const after = createSeenPersistence(fakeHost(first.document()));
-    await after.hydrate();
-    equal("a restart remembers the closed board", after.get("agent-1"), KEY);
-    equal("…so the same all-done board stays hidden", teamPillVisible(allDone, after.get("agent-1")), false);
-    equal("…a revision change shows it again", teamPillVisible(allDoneNewer, after.get("agent-1")), true);
+      TEAM_SEEN_METADATA_KEY,
+    );
+    return { store, writes, errors };
   }
 
-  // A failed read (older host without the settings RPC) is the old behaviour.
   {
-    const broken = fakeHost();
-    broken.failRead = true;
-    const persistence = createSeenPersistence(broken);
-    await persistence.hydrate();
-    equal("a failed read still becomes ready", persistence.ready(), true);
-    equal("…with nothing remembered", persistence.get("agent-1"), undefined);
-    equal("…so the all-done board shows once more", teamPillVisible(allDone, persistence.get("agent-1")), true);
-    persistence.remember("agent-1", KEY);
-    await persistence.flush();
-    equal("…and a write without a revision does not throw", persistence.get("agent-1"), KEY);
+    const { store } = createStore();
+    equal("an agent with no metadata remembers nothing", store.get("a1"), undefined);
+    check("…so an all-done board shows", teamPillVisible(doneBoard(), store.get("a1")), true);
+    const key = teamAllDoneKey(doneBoard());
+    equal("observing the stored key reports the change", store.observe({ id: "a1", metadata: { [TEAM_SEEN_METADATA_KEY]: key } }), true);
+    equal("…and the board is hidden", teamPillVisible(doneBoard(), store.get("a1")), false);
+    check(
+      "a working board stays visible whatever the key says",
+      teamPillVisible({ members: [LEAD], tasks: [task({ id: "task-1", revision: 1, status: "in_progress" })] }, store.get("a1")),
+      true,
+    );
+    check(
+      "a new revision is a new key and shows again",
+      teamPillVisible(
+        { members: [LEAD], tasks: [task({ id: "task-1", revision: 2, status: "completed" })] },
+        store.get("a1"),
+      ),
+      true,
+    );
+    equal("observing the same key again reports nothing", store.observe({ id: "a1", metadata: { [TEAM_SEEN_METADATA_KEY]: key } }), false);
+    store.dispose();
   }
 
-  // A failed write keeps the session's answer and never throws.
   {
-    const broken = fakeHost();
-    broken.failWrite = true;
-    const persistence = createSeenPersistence(broken);
-    await persistence.hydrate();
-    persistence.remember("agent-1", KEY);
-    await persistence.flush();
-    equal("a failed write keeps the in-memory seen", persistence.get("agent-1"), KEY);
-    equal("…so the pill stays hidden this session", teamPillVisible(allDone, persistence.get("agent-1")), false);
+    // The confirmed close: in memory now, on the agent right after; the daemon's
+    // agent update echoes it back and that echo is not a visible change.
+    const { store, writes } = createStore();
+    const key = teamAllDoneKey(doneBoard());
+    store.observe({ id: "a1", metadata: {} });
+    store.remember("a1", key);
+    equal("the confirmed close is in memory immediately", store.get("a1"), key);
+    await store.flush();
+    equal("…and one write carries it", writes, [["a1", key]]);
+    equal("…the echo reports no visible change", store.observe({ id: "a1", metadata: { [TEAM_SEEN_METADATA_KEY]: key } }), false);
+    equal("…and the answer survives the echo", store.get("a1"), key);
+    // Another window's close lands as an agent update with a different key.
+    const newer = teamAllDoneKey({ members: [LEAD], tasks: [task({ id: "task-2", revision: 3, status: "completed" })] });
+    equal("another window's close reports the change", store.observe({ id: "a1", metadata: { [TEAM_SEEN_METADATA_KEY]: newer } }), true);
+    equal("…and becomes the answer", store.get("a1"), newer);
+    store.dispose();
   }
 
-  // Conflict: another client wrote meanwhile — re-read, merge, keep its agents.
   {
-    const concurrent = fakeHost();
-    const persistence = createSeenPersistence(concurrent);
-    await persistence.hydrate();
-    concurrent.externalWrite({ seen: { "other-agent": "task-9:3" } });
-    persistence.remember("agent-1", KEY);
-    await persistence.flush();
-    equal("a conflicted write is retried once", concurrent.writes.length, 2);
-    equal("…and the other client's agent is kept", concurrent.document(), {
-      seen: { "other-agent": "task-9:3", "agent-1": KEY },
-    });
-    equal("…and a retry that succeeds does not warn", concurrent.warned.length, 0);
+    // A refused write: one line, and this session still hides the all-done board.
+    const { store, errors } = createStore({ failWrites: true });
+    const key = teamAllDoneKey(doneBoard());
+    store.observe({ id: "a1", metadata: {} });
+    store.remember("a1", key);
+    await store.flush();
+    equal("a failed write is reported once", errors.length, 1);
+    equal("…and the in-session board stays hidden", store.get("a1"), key);
+    equal("…which the visibility rule reads", teamPillVisible(doneBoard(), store.get("a1")), false);
+    store.remember("a1", `${key},task-9:1`);
+    await store.flush();
+    equal("a second failure does not log again", errors.length, 1);
+    store.dispose();
   }
 
-  // A silent host must not hold the first publish forever.
   {
-    const silent = fakeHost();
-    silent.read = () => new Promise(() => undefined);
-    const persistence = createSeenPersistence(silent, { timeoutMs: 5 });
-    await persistence.flush();
-    equal("a silent read times out into the old behaviour", persistence.ready(), true);
-    equal("…with nothing remembered", persistence.get("agent-1"), undefined);
+    // A removed pill does not forget the key (the 2026-11-09 rule): a reconnect
+    // re-registers the agent, and the board it already read must stay hidden.
+    const { store } = createStore();
+    const key = teamAllDoneKey(doneBoard());
+    store.observe({ id: "a1", metadata: {} });
+    store.remember("a1", key);
+    await store.flush();
+    equal("a removed pill's key is still remembered", store.get("a1"), key);
+    store.dispose();
   }
 
-  // A removal keeps the persisted key (2026-11-09): the signature is the
-  // all-done board's `id:revision` set, so it can only hide the exact board the
-  // user closed. Masking it per session made every removal path (a snapshot
-  // rebuild, a permission retry, a terminal recovery) show that board again.
-  {
-    const removal = fakeHost({ seen: { "agent-1": KEY } });
-    const persistence = createSeenPersistence(removal);
-    await persistence.hydrate();
-    equal("the document remembers a closed board", persistence.get("agent-1"), KEY);
-    equal("a removed pill keeps the persisted key (no per-session mask)", persistence.get("agent-1"), KEY);
-    equal("…so the same all-done board stays hidden after a re-add", teamPillVisible(allDone, persistence.get("agent-1")), false);
-    const newerKey = teamAllDoneKey(allDoneNewer);
-    persistence.remember("agent-1", newerKey);
-    await persistence.flush();
-    equal("a new confirmed close overwrites the entry", persistence.get("agent-1"), newerKey);
-    equal("…and the older board signature is visible again", teamPillVisible(allDone, persistence.get("agent-1")), true);
-  }
-
-  // P2-1: a document the host refuses (`invalid`: an older version's envelope, a
-  // corrupt file) is repaired by the host's `reset` — a `save` would re-parse the
-  // same envelope and be refused on every attempt, so the stale board would show
-  // once more after every restart for the life of the file.
-  {
-    const repair = fakeHost();
-    repair.readInvalid = true;
-    const persistence = createSeenPersistence(repair);
-    await persistence.hydrate();
-    equal("an invalid document triggers exactly one reset", repair.resetCalls, 1);
-    equal("…hydration continues with an empty map", persistence.get("agent-1"), undefined);
-    equal("…so the board is shown once", teamPillVisible(allDone, persistence.get("agent-1")), true);
-    persistence.remember("agent-1", KEY);
-    await persistence.flush();
-    equal("…and the next confirmed close writes normally", repair.writes.length, 1);
-    equal("…into the repaired document", repair.document(), { seen: { "agent-1": KEY } });
-  }
-  {
-    const refused = fakeHost();
-    refused.readInvalid = true;
-    refused.failReset = true;
-    const persistence = createSeenPersistence(refused);
-    await persistence.hydrate();
-    equal("a refused reset does not throw", persistence.ready(), true);
-    equal("…and was attempted once", refused.resetCalls, 1);
-    equal("…and degrades to the empty map", persistence.get("agent-1"), undefined);
-    equal("…so the board is shown once more (the old behaviour)", teamPillVisible(allDone, persistence.get("agent-1")), true);
-  }
-  {
-    // The gate P2: a host that never answers the reset must not leave `ready`
-    // false — that would keep present() from ever publishing and the pill would
-    // never show again this session, the opposite of the degrade contract.
-    const hung = fakeHost();
-    hung.readInvalid = true;
-    hung.resetHangs = true;
-    const persistence = createSeenPersistence(hung, { timeoutMs: 5 });
-    await persistence.flush();
-    equal("a hanging reset still resolves hydrate inside the timeout", persistence.ready(), true);
-    equal("…and was attempted once", hung.resetCalls, 1);
-    equal("…with the empty map (old behaviour)", persistence.get("agent-1"), undefined);
-    equal("…so the board shows once more", teamPillVisible(allDone, persistence.get("agent-1")), true);
-  }
-  {
-    // A reset that answers `conflict` (another client repaired the file): the
-    // next save re-reads the now-valid document and merges, keeping its entries.
-    const heal = fakeHost();
-    heal.readInvalid = true;
-    heal.resetConflict = true;
-    const persistence = createSeenPersistence(heal, { settingsId: "team-pill-seen" });
-    await persistence.hydrate();
-    equal("a conflicting reset still finishes hydrate", persistence.ready(), true);
-    equal("…until the next close nothing is remembered", persistence.get("agent-1"), undefined);
-    equal("…and nothing was warned about", heal.warned.length, 0);
-    // The other client's repair becomes readable: the next save self-heals.
-    heal.readInvalid = false;
-    persistence.remember("agent-1", KEY);
-    await persistence.flush();
-    equal("…the next save re-reads the repaired document", heal.writes.length, 2);
-    equal("…and merges the other client's agent", heal.document(), {
-      seen: { "other-agent": "task-9:3", "agent-1": KEY },
-    });
-    equal("…without a conflict warning", heal.warned.length, 0);
-  }
-
-  // P2-2: a write still in conflict after its one retry warns once (diagnostic
-  // only — settings id and agent ids, never the document) and keeps the pending
-  // entry for the next confirmed close; there is no polling retry.
-  {
-    const stubborn = fakeHost();
-    stubborn.alwaysConflict = true;
-    const persistence = createSeenPersistence(stubborn, { settingsId: "team-pill-seen" });
-    await persistence.hydrate();
-    persistence.remember("agent-1", KEY);
-    await persistence.flush();
-    equal("a conflicting write is attempted twice (one retry)", stubborn.writes.length, 2);
-    equal("…then warns once", stubborn.warned.length, 1);
-    assert("…naming the settings id", /team-pill-seen/.test(stubborn.warned[0] ?? ""), stubborn.warned[0]);
-    assert("…and the agent id", /agentId=agent-1/.test(stubborn.warned[0] ?? ""), stubborn.warned[0]);
-    assert("…never the document contents", !/task-1:3/.test(stubborn.warned[0] ?? ""), stubborn.warned[0]);
-    equal("…while the memory keeps the seen state", persistence.get("agent-1"), KEY);
-    equal("…so the pill stays hidden this session", teamPillVisible(allDone, persistence.get("agent-1")), false);
-    persistence.remember("agent-1", KEY);
-    await persistence.flush();
-    equal("the next confirmed close retries the write", stubborn.writes.length, 4);
-    equal("…but the warning is not repeated", stubborn.warned.length, 1);
-  }
-
-  // P2-3: run the real definitions (not just source regexes): id, scope, version
-  // and normalisation are exactly what the host sees. A team/goal id swap in a
-  // pill's IO wiring is pinned by the source checks below, and this half pins
-  // the ids the definitions actually register.
-  {
-    const teamDefinition = defineTeamSeenSettings();
-    equal("team definition id", teamDefinition.id, "team-pill-seen");
-    equal("team definition scope", teamDefinition.scope, "host");
-    equal("team definition version", teamDefinition.version, 1);
-    const goalDefinition = defineGoalSeenSettings();
-    equal("goal definition id", goalDefinition.id, "goal-pill-seen");
-    equal("goal definition scope", goalDefinition.scope, "host");
-    equal("goal definition version", goalDefinition.version, 1);
-    const cases = [
-      ["an empty document", {}, { seen: {} }],
-      ["mixed value types", { seen: { a: 1, b: "x", "": "y", c: "" } }, { seen: { b: "x" } }],
-      ["a garbage string", "nonsense", { seen: {} }],
-      ["null", null, { seen: {} }],
-    ];
-    for (const [label, input, expected] of cases) {
-      equal(`team schema normalises ${label}`, await teamDefinition.schema.parseAsync(input), expected);
-      equal(`goal schema normalises ${label}`, await goalDefinition.schema.parseAsync(input), expected);
-    }
-  }
-
-  // Sources: one write path only (the confirmed-close branch); polls never write.
+  // Source pins for the server half: no plugin settings, one subscription.
   {
     const repo = path.resolve(__dirname, "..", "..");
-    const pill = fs.readFileSync(path.join(repo, "paseo-plugin/client/team-pill.tsx"), "utf8");
-    assert("the pill hydrates the persisted seen state at load", /void persistence\.hydrate\(\)/.test(pill));
-    assert("nothing is published before hydrate resolves", /if \(!persistence\.ready\(\)\) return;/.test(pill));
-    assert(
-      "the persisted fallback is read after the session's own seen state",
-      /seenStates\.get\(agentId\)\?\.seen \?\? persistence\.get\(agentId\)/.test(pill),
-    );
-    assert(
-      "the only write is advanceSeen's confirmed-close branch",
-      /if \(event\.kind === "closed" && after\.seen !== undefined\) persistence\.remember\(agentId, after\.seen\);/.test(pill),
-    );
-    equal("persistence.remember appears exactly once", (pill.match(/persistence\.remember\(/g) ?? []).length, 1);
-    const publishState = pill.slice(pill.indexOf("const publishState"), pill.indexOf("const poller"));
-    assert("the poll path (publishState) never writes", !/persistence\.(remember|write)/.test(publishState));
-    assert(
-      "the removal path never forgets the persisted fallback (2026-11-09)",
-      !/persistence\.forget\(/.test(pill),
-    );
-    assert(
-      "the pill wires read/write/reset/warn against the team settings id",
-      /settingsRpc\(TEAM_SEEN_SETTINGS_ID\)\.read/.test(pill) &&
-        /settingsRpc\(TEAM_SEEN_SETTINGS_ID\)\.write/.test(pill) &&
-        /settingsRpc\(TEAM_SEEN_SETTINGS_ID\)\.reset/.test(pill) &&
-        /warn: \(message\) => console\.warn/.test(pill),
-    );
-    assert("…and passes the team settings id to the controller", /settingsId: TEAM_SEEN_SETTINGS_ID/.test(pill));
-    assert("…never references the goal settings id (a swap must fail)", !/GOAL_SEEN_SETTINGS_ID/.test(pill));
-    for (const file of ["client/team-polling.ts", "client/agent-polling.ts"]) {
-      const source = fs.readFileSync(path.join(repo, "paseo-plugin", file), "utf8");
-      assert(`${file} never writes the seen document`, !/seen-persistence|persistence\.remember|settingsRpc/.test(source));
-    }
-    const server = fs.readFileSync(path.join(repo, "paseo-plugin/index.server.ts"), "utf8");
-    assert(
-      "the server registers both seen settings",
-      /registerSettings\(defineTeamSeenSettings\(\)\)/.test(server) && /registerSettings\(defineGoalSeenSettings\(\)\)/.test(server),
-    );
-    assert("…guarded for a host without plugin settings", /typeof server\.registerSettings !== "function"/.test(server));
-    const definition = fs.readFileSync(path.join(repo, "paseo-plugin/shared/team-seen-settings.ts"), "utf8");
-    assert(
-      "the team definition is host-scoped and sanitises the document",
-      /scope: "host"/.test(definition) && /seenDocumentOf/.test(definition) && /TEAM_SEEN_SETTINGS_ID = "team-pill-seen"/.test(definition),
-    );
+    const serverEntry = fs.readFileSync(path.join(repo, "paseo-plugin/index.server.ts"), "utf8");
+    assert("the server registers no settings any more", !/registerSettings/.test(serverEntry));
+    assert("the server serves the team subscription", /server\.handle\(teamSnapshot/.test(serverEntry));
+    const polling = fs.readFileSync(path.join(repo, "paseo-plugin/client/team-polling.ts"), "utf8");
+    assert("the team rules never write a seen key", !/seen\.remember|setMetadata|settingsRpc/.test(polling));
+    assert("the controllers never write a seen key", !/seen\.remember|setMetadata/.test(fs.readFileSync(path.join(repo, "paseo-plugin/client/agent-subscriptions.ts"), "utf8")));
   }
 }
 
-pollerChecks()
-  .catch((error) => {
-    failures += 1;
-    console.error(`  FAIL the poller checks threw: ${error instanceof Error ? error.stack : String(error)}`);
-  })
-  .then(() => seenPersistenceChecks())
-  .catch((error) => {
-    failures += 1;
-    console.error(`  FAIL the seen-persistence checks threw: ${error instanceof Error ? error.stack : String(error)}`);
-  })
+Promise.resolve()
+  .then(() => subscriptionChecks())
+  .then(() => seenMetadataChecks())
   .then(() => {
     console.log(`\n${checks - failures}/${checks} checks passed`);
     if (failures > 0) {
@@ -918,5 +724,8 @@ pollerChecks()
       process.exit(1);
     }
     console.log("OK");
-    process.exit(0);
+  })
+  .catch((error) => {
+    console.error("late checks crashed:", error);
+    process.exit(1);
   });

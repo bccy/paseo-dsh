@@ -13,16 +13,14 @@
     "outDir": "../paseo-plugin/.dbg-goal"
   },
   "files": [
-    "../paseo-plugin/client/poll-sequence.ts",
-    "../paseo-plugin/client/agent-polling.ts",
+    "../paseo-plugin/client/agent-subscriptions.ts",
     "../paseo-plugin/client/jobs-popover-layout.ts",
     "../paseo-plugin/client/goal-polling.ts",
-    "../paseo-plugin/client/seen-persistence.ts",
+    "../paseo-plugin/client/seen-metadata.ts",
     "../paseo-plugin/client/locale.ts",
     "../paseo-plugin/client/deepseek-mark-svg.ts",
     "../paseo-plugin/shared/goal.ts",
-    "../paseo-plugin/shared/seen-settings.ts",
-    "../paseo-plugin/shared/team-seen-settings.ts",
-    "../paseo-plugin/shared/goal-seen-settings.ts"
+    "../paseo-plugin/shared/pill-metadata.ts",
+    "../paseo-plugin/shared/provider.ts"
   ]
 }

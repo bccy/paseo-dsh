@@ -1,6 +1,6 @@
 /**
- * The goal pill's presentation rules, its popover geometry, and the adapter that
- * binds both to the shared poll controller.
+ * The goal pill's presentation rules, its popover geometry, and the projection one
+ * pushed goal answer goes through.
  *
  * `goal-pill.tsx` / `goal-popover.tsx` import the host runtime (React, React
  * Native, the plugin component library), so plain `node` cannot load them.
@@ -24,41 +24,17 @@
  * icon is tone-coloured through a custom component because the host draws the
  * label as plain text.
  *
- * **The polling policy is the jobs pill's** (`client/agent-polling.ts`), shared
- * rather than copied. The two differences are both in the adapter below: the
- * payload is one goal (or `null`) instead of a list, and a transient read error
- * keeps the last state instead of publishing "could not read".
+ * **The transport is not this module's business** (2026-11-11, Paseo 0.16). The
+ * goal used to be polled every four seconds; `server/pill-feed` now reads it once
+ * per agent and pushes the snapshot to every subscriber. What stays goal-specific
+ * is {@link projectGoalAnswer}: the payload is one goal (or `null`) instead of a
+ * list, and a transient failure keeps the last state instead of publishing
+ * "could not read".
  *
  * @module dsh-paseo/client/goal-polling
  */
-import {
-  createAgentPoller,
-  type AgentPoller,
-  type AgentPollerHost,
-  type PollAgent,
-  type PollAgentPage,
-  type PollRemoveReason,
-  type PollViewState,
-} from "./agent-polling";
-import { isTerminalGoalErrorCode, type GoalState } from "../shared/goal";
-
-export {
-  INITIAL_POLL_JITTER_MS,
-  LIVE_POLL_MS,
-  MAX_AGENT_DIRECTORY_PAGES,
-  MAX_POLL_JITTER_MS,
-  MAX_POLL_MS,
-  POLL_JITTER_RATIO,
-  initialPollDelayMs,
-  nextPollDelayMs,
-} from "./agent-polling";
-
-/** One read's answer, mirroring the `goal.current` contract. */
-export interface GoalReadResult {
-  available: boolean;
-  goal?: GoalState | null;
-  error?: { message: string; code?: string };
-}
+import type { PillReadResult } from "./agent-subscriptions";
+import type { GoalAnswer, GoalState } from "../shared/goal";
 
 /** One agent's state as the popover store keeps it. */
 export interface GoalViewState {
@@ -67,15 +43,6 @@ export interface GoalViewState {
   error?: string;
   code?: string;
 }
-
-/** The fields of an agent the pill cares about. */
-export type GoalAgent = PollAgent;
-
-/** One page of the agent directory, structurally. */
-export type GoalAgentPage = PollAgentPage;
-
-/** Why an agent's pill was torn down; the host decides what to log. */
-export type GoalRemoveReason = PollRemoveReason;
 
 /**
  * The label the trigger carries, as a semantic key.
@@ -172,9 +139,9 @@ export function goalSeenKey(goal: Pick<GoalState, "id" | "revision">): string {
  * {@link goalSeenKey} for this agent, and a complete goal whose key equals it is
  * hidden. DSH's own Web hides a complete goal at once (survey §2); showing it
  * until seen is this plugin's bounded extension. `available: false` is
- * hidden too, but that branch is normally unreachable: terminal errors remove
+ * hidden too, but that branch is normally unreachable: terminal answers remove
  * the pill outright and transient ones keep the last state (see
- * {@link createGoalPoller}).
+ * {@link projectGoalAnswer} and the pill's host options).
  *
  * `active + disarmed` is a warning, not a normal label: the goal is not
  * finished, it is just not continuing on its own, and the popover's 继续 button
@@ -651,79 +618,25 @@ export function goalEditSubmittable(draft: string, original: string): boolean {
 }
 
 /* -------------------------------------------------------------------------- */
-/* The poll controller                                                         */
+/* The pushed answer                                                           */
 /* -------------------------------------------------------------------------- */
 
 /**
- * The host half the goal pill's poller needs.
+ * Map one pushed goal answer to the controller's payload
+ * (`client/agent-subscriptions`).
  *
- * Mirrors `JobsPollerHost` with the goal payload: the adapter owns the
- * `{goal}` shape and the pill module owns the React store and registration.
+ * Only two things happen here, both of them rules the old poller's adapter held:
+ * a failed answer keeps its message and code so the controller can grade it, and
+ * an empty goal becomes `null` — "we looked and there is no goal" — never a
+ * fabricated one.
+ *
+ * **A transient failure keeps the last state** (`publishOnTransientError: false`
+ * in the pill's host options): one flaky answer must not make an active goal look
+ * gone. **A terminal code removes the pill**, which is what "no goal support in
+ * this profile" should look like — the same answer as a profile that never had
+ * the feature, not an error the user can never clear.
  */
-export interface GoalPollerHost {
-  readGoal(agentId: string): Promise<GoalReadResult>;
-  /** One more directory page, only when the first snapshot said there is one. */
-  listAgentPage(cursor: string): Promise<GoalAgentPage>;
-  addAgent(agent: GoalAgent): void;
-  removeAgent(agentId: string, reason: GoalRemoveReason, error?: GoalReadResult["error"]): void;
-  publishState(agentId: string, state: GoalViewState): void;
-  onError(message: string, error?: unknown): void;
-  setTimeout(callback: () => void, delayMs: number): unknown;
-  clearTimeout(handle: unknown): void;
-  random?: () => number;
-}
-
-/** The controller `goal-pill.tsx` drives from its agent subscription. */
-export type GoalPoller = AgentPoller;
-
-/**
- * Create the per-agent goal poll controller.
- *
- * A thin adapter over {@link createAgentPoller}: it maps the goal answer to the
- * controller's payload and hands it the goal terminal-code predicate. Two
- * goal-specific policies:
- *
- * - **A transient read error keeps the last state** (`publishOnTransientError:
- *   false`): one flaky poll must not make an active goal look gone.
- * - **A terminal code removes the pill**, which is what "no goal support in
- *   this profile" should look like — the same answer as a profile that never
- *   had the feature, not an error the user can never clear.
- */
-export function createGoalPoller(host: GoalPollerHost): GoalPoller {
-  const adapter: AgentPollerHost<GoalState | null> = {
-    read: async (agentId) => {
-      const result = await host.readGoal(agentId);
-      if (!result.available) return { available: false, error: result.error };
-      return { available: true, data: result.goal ?? null };
-    },
-    listAgentPage: (cursor) => host.listAgentPage(cursor),
-    addAgent: (agent) => host.addAgent(agent),
-    removeAgent: (agentId, reason, error) => host.removeAgent(agentId, reason, error),
-    publishState: (agentId, state: PollViewState<GoalState | null>) => {
-      // The adapter only ever receives a successful answer: transient failures
-      // are swallowed by `publishOnTransientError: false` and terminal ones
-      // remove the pill. Guarded anyway so a future core change cannot publish
-      // "no goal" for a failed read.
-      if (!state.available) return;
-      host.publishState(agentId, {
-        goal: state.data,
-        available: true,
-        ...(state.error === undefined ? {} : { error: state.error }),
-        ...(state.code === undefined ? {} : { code: state.code }),
-      });
-    },
-    onError: (message, error) => host.onError(message, error),
-    setTimeout: (callback, delayMs) => host.setTimeout(callback, delayMs),
-    clearTimeout: (handle) => host.clearTimeout(handle),
-    ...(host.random === undefined ? {} : { random: host.random }),
-    isTerminalErrorCode: isTerminalGoalErrorCode,
-    initialData: null,
-    // The goal pill's own copy for the two diagnostics the shared controller
-    // emits: the fallback sentence a failed read carries when the runtime sent
-    // none, and the noun its console lines name.
-    fallbackErrorMessage: "the DSH runtime could not read this agent's goal",
-    pillLabel: "goal pill",
-    publishOnTransientError: false,
-  };
-  return createAgentPoller(adapter);
+export function projectGoalAnswer(answer: GoalAnswer): PillReadResult<GoalState | null> {
+  if (!answer.available) return { available: false, ...(answer.error === undefined ? {} : { error: answer.error }) };
+  return { available: true, data: answer.goal ?? null };
 }

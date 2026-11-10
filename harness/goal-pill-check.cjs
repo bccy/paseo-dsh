@@ -54,8 +54,8 @@ const {
   TERMINAL_GOAL_ERROR_CODES,
   isTerminalGoalErrorCode,
   goalCommandArguments,
-  goalCurrent,
   goalControl,
+  goalSnapshot,
 } = require("./shared/goal.js");
 const {
   GOAL_EDITOR_GAP,
@@ -82,11 +82,6 @@ const {
   GOAL_DANGER_HOVER_OPACITY,
   GOAL_DANGER_PRESSED_OPACITY,
   GOAL_WHALE_SIZE,
-  INITIAL_POLL_JITTER_MS,
-  LIVE_POLL_MS,
-  MAX_POLL_JITTER_MS,
-  MAX_POLL_MS,
-  createGoalPoller,
   goalCompleteSeenStep,
   goalConfirmControls,
   goalCurrentTaskLine,
@@ -106,14 +101,18 @@ const {
   goalSeenKey,
   goalStateName,
   goalTrackRow,
-  initialPollDelayMs,
-  nextPollDelayMs,
+  projectGoalAnswer,
 } = require("./client/goal-polling.js");
 const { allText } = require("./client/locale.js");
-const { createSeenPersistence } = require("./client/seen-persistence.js");
-const { SEEN_SETTINGS_LIMIT, seenMapOf, mergeSeenValues } = require("./shared/seen-settings.js");
-const { defineTeamSeenSettings } = require("./shared/team-seen-settings.js");
-const { defineGoalSeenSettings } = require("./shared/goal-seen-settings.js");
+const { createAgentSubscriptions } = require("./client/agent-subscriptions.js");
+const { PROVIDER_ID } = require("./shared/provider.js");
+const { createSeenMetadataStore } = require("./client/seen-metadata.js");
+const {
+  GOAL_SEEN_METADATA_KEY,
+  TEAM_SEEN_METADATA_KEY,
+  seenFromMetadata,
+  seenMetadataPatch,
+} = require("./shared/pill-metadata.js");
 const LOCALE_TEXT = allText();
 
 let failures = 0;
@@ -178,19 +177,19 @@ console.log("the goal contract (phases, activations, error codes)");
     check(`${String(code)} keeps retrying`, isTerminalGoalErrorCode(code), false);
   }
 
-  check("goal.current is the read RPC", goalCurrent.name, "goal.current");
+  check("goal.snapshot is the watch subscription", goalSnapshot.name, "goal.snapshot");
   check("goal.control is the control RPC", goalControl.name, "goal.control");
 
   // The wire shapes: a payload with the five drawn fields plus the optional
   // blocker parses, and one without activation does not (activation is what the
   // disarmed state depends on; dropping it would silently present the goal as
   // auto-continuing).
-  const wire = goalCurrent.output.safeParse({
+  const wire = goalSnapshot.event.safeParse({
     available: true,
     goal: goal(),
   });
   check("a full goal parses on the wire", wire.success, true);
-  const noActivation = goalCurrent.output.safeParse({
+  const noActivation = goalSnapshot.event.safeParse({
     available: true,
     goal: { objective: "x", phase: "active", roundsStarted: 0, maxGoalRounds: 1 },
   });
@@ -198,33 +197,33 @@ console.log("the goal contract (phases, activations, error codes)");
   // id/revision are the completed goal's seen key (UI-v7): an old server that
   // does not send them is rejected rather than read as "never seen".
   const { id: _id, ...noId } = goal();
-  check("a goal without id is rejected", goalCurrent.output.safeParse({ available: true, goal: noId }).success, false);
+  check("a goal without id is rejected", goalSnapshot.event.safeParse({ available: true, goal: noId }).success, false);
   const { revision: _revision, ...noRevision } = goal();
   check(
     "a goal without revision is rejected",
-    goalCurrent.output.safeParse({ available: true, goal: noRevision }).success,
+    goalSnapshot.event.safeParse({ available: true, goal: noRevision }).success,
     false,
   );
-  const parsed = goalCurrent.output.safeParse({ available: true, goal: { ...goal(), createdAt: 1, updatedAt: 2 } });
+  const parsed = goalSnapshot.event.safeParse({ available: true, goal: { ...goal(), createdAt: 1, updatedAt: 2 } });
   check(
     "timestamps are still stripped on the wire",
     parsed.success && !("createdAt" in parsed.data.goal) && !("updatedAt" in parsed.data.goal),
     true,
   );
-  const blocked = goalCurrent.output.safeParse({
+  const blocked = goalSnapshot.event.safeParse({
     available: true,
     goal: goal({ phase: "blocked", blockedReason: { code: "round-limit", message: "limit reached" } }),
   });
   check("a blocked goal carries its reason", blocked.success, true);
-  const nullGoal = goalCurrent.output.safeParse({ available: true, goal: null });
+  const nullGoal = goalSnapshot.event.safeParse({ available: true, goal: null });
   check("no goal is a null goal, not a missing field", nullGoal.success, true);
-  const failed = goalCurrent.output.safeParse({
+  const failed = goalSnapshot.event.safeParse({
     available: false,
     goal: null,
     error: { message: "no goal service", code: "goal_unavailable" },
   });
   check("a coded read failure parses", failed.success, true);
-  const olderServer = goalCurrent.output.safeParse({
+  const olderServer = goalSnapshot.event.safeParse({
     available: false,
     goal: null,
     error: { message: "boom" },
@@ -719,7 +718,16 @@ console.log("\nthe goal and the jobs are two separate composer pills");
   equal("the goal pill registers exactly one pill, id dsh-goal", idsOf(pill), ["dsh-goal"]);
   equal("the jobs pill registers exactly one pill, id dsh-jobs", idsOf(jobs), ["dsh-jobs"]);
   assert("the goal pill opens its own goal popover", /behavior:\s*\{\s*kind:\s*"popover",\s*Content:\s*makeGoalPopover\(/.test(pill));
-  assert("the jobs pill opens its own jobs popover", /behavior:\s*\{\s*kind:\s*"popover",\s*Content:\s*makeJobsPopover\(store, agent\.id\)\s*\}/.test(jobs));
+  // The argument list is deliberately not pinned literally: the factory gained a
+  // leading `client` when the popover started issuing `jobs.stop` (2026-11-11), and
+  // a pin on the exact call made an unrelated signature change look like "the jobs
+  // pill stopped opening its own popover" (V-P1). What this assertion is for is
+  // *which* factory draws the popover and that it is the jobs pill's own store and
+  // agent — both still pinned below.
+  assert(
+    "the jobs pill opens its own jobs popover",
+    /behavior:\s*\{\s*kind:\s*"popover",\s*Content:\s*makeJobsPopover\([^)]*\bstore\b[^)]*\bagent\.id\b/.test(jobs),
+  );
   assert("closing the goal popover marks a completed goal seen", /advanceSeen\(agent\.id, \{ kind: "closed", goal \}\)/.test(pill));
   assert(
     "…only for the pill the close belongs to (a stale close is dropped)",
@@ -773,78 +781,28 @@ console.log("\nthe goal popover's close is confirmed, not assumed");
 
 /* The poll cadence is the jobs pill's ---------------------------------------- */
 
-console.log("\nthe poll cadence matches the jobs pill's");
-{
-  // Frozen numbers: the two pills share one policy (DESIGN §2), so a change here
-  // that is not a change there is a red check, not a silent divergence.
-  equal("the base interval is four seconds", LIVE_POLL_MS, 4000);
-  equal("the backoff ceiling is thirty seconds", MAX_POLL_MS, 30_000);
-  equal("the initial jitter is one second", INITIAL_POLL_JITTER_MS, 1000);
-  equal("the jitter cap is two seconds", MAX_POLL_JITTER_MS, 2000);
-  equal("a readable answer polls at the base rate", nextPollDelayMs(0, () => 0), LIVE_POLL_MS);
-  equal("the first failure backs off to 8s", nextPollDelayMs(1, () => 0), 8000);
-  equal("the second failure backs off to 16s", nextPollDelayMs(2, () => 0), 16_000);
-  equal("the third failure hits the cap", nextPollDelayMs(3, () => 0), MAX_POLL_MS);
-  equal("the first poll is jittered", initialPollDelayMs(() => 0.5), Math.floor(0.5 * INITIAL_POLL_JITTER_MS));
-}
-
-/* The controller, driven by a fake clock ------------------------------------- */
+/* The controller and the agent metadata it reads ------------------------------ */
 
 async function runControllerChecks() {
-  function createFakeClock() {
-    let now = 0;
-    let nextId = 1;
-    const timers = new Map();
-    return {
-      setTimeout(fn, delay) {
-        const id = nextId;
-        nextId += 1;
-        timers.set(id, { at: now + delay, fn });
-        return id;
-      },
-      clearTimeout(id) {
-        timers.delete(id);
-      },
-      pendingDelays() {
-        return [...timers.values()].map((timer) => timer.at - now).sort((left, right) => left - right);
-      },
-      async advance(ms) {
-        const target = now + ms;
-        for (;;) {
-          let due = null;
-          for (const [id, timer] of timers) {
-            if (timer.at <= target && (due === null || timer.at < due.at)) due = { id, at: timer.at, fn: timer.fn };
-          }
-          if (due === null) break;
-          timers.delete(due.id);
-          now = due.at;
-          due.fn();
-          // Let the poll's promise chain and its next schedule land before the
-          // loop looks for the next due timer.
-          await new Promise((resolve) => setImmediate(resolve));
-          await new Promise((resolve) => setImmediate(resolve));
-        }
-        now = target;
-      },
-    };
-  }
-
-  /** The provider id the pill registers for; a wire value, frozen on purpose. */
-  const AGENT = { id: "a", workspaceId: "ws", provider: "deepseek-harness-native" };
-
-  function createPollerHarness(overrides = {}) {
-    const clock = createFakeClock();
-    const calls = { added: [], removed: [], states: [], errors: [], pages: [], reads: 0 };
+  /**
+   * The fake host: one push channel per agent, exactly what `client.subscribe`
+   * gives the real pill. The goal-specific policy lives in the injected options
+   * (`publishOnTransientError: false`, the terminal predicate), so this drives the
+   * real controller with the goal pill's own host shape.
+   */
+  function createHarness(overrides = {}) {
+    const calls = { added: [], updated: [], removed: [], states: [], errors: [], pages: [], reads: 0, opens: [], aborts: [] };
+    const live = new Map();
+    const settle = () => new Promise((resolve) => setImmediate(resolve));
     const host = {
-      setTimeout: clock.setTimeout,
-      clearTimeout: clock.clearTimeout,
-      random: overrides.random ?? (() => 0),
-      readGoal:
-        overrides.readGoal ??
-        (async () => {
-          calls.reads += 1;
-          return { available: true, goal: null };
-        }),
+      open(agentId, onAnswer, onEnd, signal) {
+        calls.opens.push(agentId);
+        live.set(agentId, { onAnswer, onEnd, signal });
+        signal.addEventListener("abort", () => {
+          calls.aborts.push(agentId);
+          live.delete(agentId);
+        });
+      },
       listAgentPage:
         overrides.listAgentPage ??
         (async (cursor) => {
@@ -854,787 +812,309 @@ async function runControllerChecks() {
       addAgent(agent) {
         calls.added.push(agent.id);
       },
+      updateAgent(agent) {
+        calls.updated.push(agent);
+      },
       removeAgent(agentId, reason, error) {
         calls.removed.push([agentId, reason, error === undefined ? undefined : error.code]);
       },
       publishState(agentId, state) {
-        calls.states.push([agentId, state]);
+        if (!state.available) return;
+        calls.states.push([agentId, { goal: state.data, available: true }]);
       },
       onError(message, error) {
         calls.errors.push([message, error instanceof Error ? error.message : error]);
       },
+      project: (_agentId, answer) => projectGoalAnswer(answer),
+      isTerminalErrorCode: isTerminalGoalErrorCode,
+      initialData: null,
+      fallbackErrorMessage: "the DSH runtime could not read this agent's goal",
+      pillLabel: "goal pill",
+      publishOnTransientError: false,
     };
-    const poller = createGoalPoller(host);
-    return { clock, calls, poller };
-  }
-
-  async function registerOne(harness) {
-    await harness.poller.applySnapshot({
-      entries: [{ agent: AGENT }],
+    const subscriptions = createAgentSubscriptions(host);
+    const answerFor = async (agentId) => {
+      calls.reads += 1;
+      try {
+        return await (overrides.readGoal ? overrides.readGoal(agentId) : { available: true, goal: null });
+      } catch (error) {
+        return { available: false, goal: null, error: { message: error instanceof Error ? error.message : String(error) } };
+      }
+    };
+    const deliver = async (agentId) => {
+      const record = live.get(agentId);
+      if (record === undefined) return false;
+      record.onAnswer(await answerFor(agentId));
+      await settle();
+      return true;
+    };
+    const snapshot = (ids) => ({
+      entries: ids.map((id) => ({ agent: { id, workspaceId: "ws" } })),
       pageInfo: { hasMore: false, nextCursor: null },
     });
-    // The initial delay is jittered; random() = 0 makes it zero.
-    await harness.clock.advance(0);
+    return {
+      calls,
+      live,
+      subscriptions,
+      snapshot,
+      deliver,
+      settle,
+      async step() {
+        for (const agentId of [...live.keys()]) await deliver(agentId);
+      },
+    };
   }
 
-  console.log("\npoll controller: one publish per change, none per unchanged answer");
-  {
-    const harness = createPollerHarness();
-    await registerOne(harness);
-    equal("the first answer publishes once", harness.calls.states.length, 1);
-    equal("…and it is an empty goal, not a failure", harness.calls.states[0]?.[1]?.goal, null);
-    check("…reported as readable", harness.calls.states[0]?.[1]?.available === true, true);
-    await harness.clock.advance(LIVE_POLL_MS);
-    equal("an unchanged answer is not republished", harness.calls.states.length, 1);
-    equal("…but the read happened", harness.calls.reads, 2);
-    harness.poller.dispose();
-  }
-
-  console.log("\npoll controller: a transient failure keeps the last state");
+  console.log("\npushed answers: one publish per change");
   {
     let answer = { available: true, goal: goal() };
-    const harness = createPollerHarness({
-      readGoal: async () => {
-        harness.calls.reads += 1;
-        return answer;
-      },
-    });
-    await registerOne(harness);
-    equal("the active goal is published", harness.calls.states.length, 1);
-    answer = { available: false, error: { message: "one flaky poll", code: "rpc_failed" } };
-    await harness.clock.advance(LIVE_POLL_MS);
-    equal("a transient failure publishes nothing", harness.calls.states.length, 1);
-    equal("the goal stays on screen (not replaced by an error)", harness.calls.states[0]?.[1]?.goal?.phase, "active");
-    answer = { available: true, goal: goal() };
-    // The failure backed off to 8 s; the same answer as the last published one
-    // must still not republish, because the failed poll never overwrote it.
-    await harness.clock.advance(8000);
-    equal("an unchanged answer after the failure is not republished", harness.calls.states.length, 1);
-    answer = { available: true, goal: goal({ roundsStarted: 4 }) };
-    await harness.clock.advance(LIVE_POLL_MS);
-    equal("a changed answer publishes", harness.calls.states.length, 2);
-    equal("…with the new round count", harness.calls.states[1]?.[1]?.goal?.roundsStarted, 4);
-    harness.poller.dispose();
-  }
-
-  console.log("\npoll controller: a terminal code removes the pill and stops polling");
-  for (const code of ["bridge_too_old", "goal_unavailable"]) {
-    let answer = { available: true, goal: goal() };
-    const harness = createPollerHarness({
-      readGoal: async () => {
-        harness.calls.reads += 1;
-        return answer;
-      },
-    });
-    await registerOne(harness);
-    answer = { available: false, error: { message: "terminal", code } };
-    await harness.clock.advance(LIVE_POLL_MS);
-    equal(`${code} removes the agent's pill`, harness.calls.removed, [["a", "terminal", code]]);
-    const readsAfterTerminal = harness.calls.reads;
-    await harness.clock.advance(MAX_POLL_MS * 3);
-    equal(`${code} stops the timer`, harness.calls.reads, readsAfterTerminal);
-    equal(`${code} leaves no pending timer`, harness.clock.pendingDelays().length, 0);
-    harness.poller.dispose();
-  }
-
-  console.log("\npoll controller: a transient code keeps retrying with backoff");
-  {
-    let answer = { available: false, error: { message: "not open yet", code: "session_missing" } };
-    const harness = createPollerHarness({
-      readGoal: async () => {
-        harness.calls.reads += 1;
-        return answer;
-      },
-    });
-    await registerOne(harness);
-    equal("a session_missing read removes nothing", harness.calls.removed, []);
-    equal("…and publishes nothing (last state kept)", harness.calls.states.length, 0);
-    equal("…and schedules the 8 s backoff", harness.clock.pendingDelays(), [8000]);
-    answer = { available: true, goal: goal() };
-    await harness.clock.advance(8000);
-    equal("the next successful read publishes", harness.calls.states.length, 1);
-    equal("…the goal", harness.calls.states[0]?.[1]?.goal?.phase, "active");
-    harness.poller.dispose();
-  }
-
-  console.log("\npoll controller: pollNow refreshes out of band");
-  {
-    let answer = { available: true, goal: goal() };
-    const harness = createPollerHarness({
-      readGoal: async () => {
-        harness.calls.reads += 1;
-        return answer;
-      },
-    });
-    await registerOne(harness);
-    equal("the initial answer publishes", harness.calls.states.length, 1);
+    const harness = createHarness({ readGoal: async () => answer });
+    const last = () => harness.calls.states[harness.calls.states.length - 1][1];
+    await harness.subscriptions.applySnapshot(harness.snapshot(["a"]));
+    await harness.step();
+    equal("the first answer publishes", harness.calls.states.length, 1);
+    await harness.step();
+    equal("an unchanged answer does not publish again", harness.calls.states.length, 1);
     answer = { available: true, goal: goal({ phase: "paused" }) };
-    await harness.poller.pollNow("a");
-    equal("pollNow reads immediately", harness.calls.reads, 2);
-    equal("pollNow publishes the new phase", harness.calls.states.length, 2);
-    equal("…paused", harness.calls.states[1]?.[1]?.goal?.phase, "paused");
-    await harness.poller.pollNow("a");
-    equal("an unchanged pollNow does not republish", harness.calls.states.length, 2);
-    harness.poller.dispose();
+    await harness.step();
+    equal("a phase change publishes", harness.calls.states.length, 2);
+    equal("…with the new phase", last().goal.phase, "paused");
+    answer = { available: true, goal: null };
+    await harness.step();
+    equal("a cleared goal publishes", harness.calls.states.length, 3);
+    equal("…as null, not as an error", last().goal, null);
+    harness.subscriptions.dispose();
   }
 
-  console.log("\npoll controller: agents outside this provider are not registered");
+  console.log("\na transient failure keeps the last state (DESIGN §2)");
   {
-    const harness = createPollerHarness();
-    await harness.poller.applySnapshot({
+    let fail = false;
+    const harness = createHarness({
+      readGoal: async () => {
+        if (fail) throw new Error("stream ended");
+        return { available: true, goal: goal({ phase: "active" }) };
+      },
+    });
+    await harness.subscriptions.applySnapshot(harness.snapshot(["a"]));
+    await harness.step();
+    const readable = harness.calls.states.length;
+    fail = true;
+    await harness.step();
+    equal("a failed answer publishes nothing", harness.calls.states.length, readable);
+    equal("…it does not remove the pill either", harness.calls.removed, []);
+    equal("…and the controller keeps the stream", harness.calls.aborts, []);
+    fail = false;
+    await harness.step();
+    equal("recovery is compared against the last published answer", harness.calls.states.length, readable);
+    harness.subscriptions.dispose();
+  }
+
+  console.log("\na terminal code removes the pill and releases the stream");
+  {
+    const harness = createHarness({
+      readGoal: async () => ({ available: false, goal: null, error: { message: "no goal service", code: "goal_unavailable" } }),
+    });
+    await harness.subscriptions.applySnapshot(harness.snapshot(["a"]));
+    await harness.step();
+    equal("a terminal code removes the pill", harness.calls.removed, [["a", "terminal", "goal_unavailable"]]);
+    equal("…and releases the subscription", harness.calls.aborts, ["a"]);
+    await harness.step();
+    equal("…and is never re-read", harness.calls.reads, 1);
+    harness.subscriptions.upsert({ id: "a", workspaceId: "ws" });
+    equal("an upsert does not reopen it", harness.calls.opens, ["a"]);
+    await harness.subscriptions.applySnapshot(harness.snapshot(["a"]));
+    equal("a fresh snapshot rebuilds the pill", harness.calls.added, ["a", "a"]);
+    harness.subscriptions.dispose();
+  }
+
+  console.log("\nwhich agents get a goal pill");
+  {
+    const harness = createHarness();
+    await harness.subscriptions.applySnapshot({
       entries: [
-        { agent: { id: "foreign", workspaceId: "ws", provider: "claude-code" } },
-        { agent: { id: "no-workspace", provider: "deepseek-harness-native" } },
+        { agent: { id: "ours", workspaceId: "ws", provider: PROVIDER_ID } },
+        { agent: { id: "foreign", workspaceId: "ws", provider: "some-other-provider" } },
+        { agent: { id: "no-workspace", provider: PROVIDER_ID } },
+        { agent: { id: "closed", workspaceId: "ws", provider: PROVIDER_ID, status: "closed" } },
       ],
       pageInfo: { hasMore: false, nextCursor: null },
     });
-    await harness.clock.advance(0);
-    equal("no pill for another provider's agent", harness.calls.added, []);
-    equal("no read for it either", harness.calls.reads, 0);
-    harness.poller.dispose();
+    equal("only this provider's agents in a workspace are registered", harness.calls.added, ["ours"]);
+    equal("…and only they are subscribed", harness.calls.opens, ["ours"]);
+    harness.subscriptions.dispose();
   }
 
-  console.log("\npoll controller: a closed agent is dropped");
+  console.log("\nan upsert hands the agent's metadata to the pill");
   {
-    const harness = createPollerHarness();
-    await registerOne(harness);
-    harness.poller.upsert({ ...AGENT, status: "closed" });
-    equal("a closed agent's pill is removed", harness.calls.removed.map((row) => row[1]), ["gone"]);
-    harness.poller.dispose();
+    // The "seen" key arrives on agent updates; the controller must pass the whole
+    // agent through so the pill can re-decide its visibility.
+    const harness = createHarness();
+    await harness.subscriptions.applySnapshot(harness.snapshot(["a"]));
+    harness.subscriptions.upsert({ id: "a", workspaceId: "ws", metadata: { "dsh.goalSeen": "goal-1:1" } });
+    equal("the update reaches the pill", harness.calls.updated.length, 1);
+    equal("…with its metadata", harness.calls.updated[0].metadata, { "dsh.goalSeen": "goal-1:1" });
+    equal("…and the subscription is not reopened", harness.calls.opens, ["a"]);
+    harness.subscriptions.dispose();
   }
 
-  /**
-   * The 2026-11-09 regression: "目标完成点击后，等会又有 pill 按钮了".
-   *
-   * The user closed a completed goal's panel, the confirmed close wrote its
-   * `id:revision` into the host settings and the pill hid — and a few seconds
-   * later it was back. Two client-side memories could lose that fact:
-   *
-   * 1. a websocket reconnect delivers a fresh directory snapshot, and
-   *    `applySnapshot` used to remove *every* agent and re-register the listing
-   *    (this drive's first half);
-   * 2. the removal path itself used to call the persistence controller's
-   *    `forget`, which masked the *persisted* key too — so any removal
-   *    (a snapshot rebuild, a permission retry, a terminal recovery) made the
-   *    completed state unseen again (the second half, after the snapshot rule
-   *    was already a diff).
-   *
-   * This drives the full wiring (poll controller + seen machine + persisted
-   * fallback + the host's visible flag) through that exact sequence: the
-   * snapshot that still lists the agent must not remove anything, the completed
-   * pill must stay hidden across the reconnect, a changed poll answer must not
-   * un-hide it, and the persisted key must outlive a real removal.
-   */
-  console.log("\npoll controller: a snapshot refresh keeps a closed completed goal hidden");
+  console.log("\ndrop and snapshot diff");
   {
-    const clock = createFakeClock();
-    const COMPLETE = goal({ phase: "complete", activation: "disarmed", revision: 3 });
-    const KEY = goalSeenKey(COMPLETE);
-    // The host's settings document, in memory, through the real controller.
-    const document = { revision: "rev-1", values: { seen: {} } };
-    const persistence = createSeenPersistence({
-      read: async () => ({
-        status: "ready",
-        revision: document.revision,
-        values: JSON.parse(JSON.stringify(document.values)),
-      }),
-      write: async ({ values }) => {
-        document.revision = "rev-2";
-        document.values = values;
-        return { status: "saved", revision: document.revision, values: document.values };
-      },
-      onError: () => {},
-    });
-    await persistence.hydrate();
-
-    /** agentId -> the completed goal's in-session seen progress (`seenStates`). */
-    const seenStates = new Map();
-    /** agentId -> the last poll answer (`answers`). */
-    const answers = new Map();
-    /** Every host-facing event, in order: registration, removal, publish, visibility. */
-    const events = [];
-    /** The answer the daemon currently gives; a poll change is a new object. */
-    let answer = { available: true, goal: COMPLETE };
-    /** What the pill's `present()` would publish for the current state. */
-    const present = (agentId) => {
-      const current = answers.get(agentId);
-      if (current === undefined) return;
-      const seen = seenStates.get(agentId)?.seen ?? persistence.get(agentId);
-      const presentation = goalPillPresentation(current, seen);
-      events.push(["visible", presentation.visible]);
-    };
-
-    const poller = createGoalPoller({
-      setTimeout: clock.setTimeout,
-      clearTimeout: clock.clearTimeout,
-      random: () => 0,
-      readGoal: async () => answer,
-      listAgentPage: async () => ({ entries: [], pageInfo: { hasMore: false, nextCursor: null } }),
-      addAgent(agent) {
-        events.push(["add", agent.id]);
-        seenStates.delete(agent.id);
-        answers.delete(agent.id);
-      },
-      removeAgent(agentId) {
-        events.push(["remove", agentId]);
-        // The pill's removal path: the in-session memory only. The persisted
-        // key survives on purpose (2026-11-09) — it is content-addressed.
-        seenStates.delete(agentId);
-        answers.delete(agentId);
-      },
-      publishState(agentId, state) {
-        events.push(["publish", agentId]);
-        answers.set(agentId, state);
-        present(agentId);
-      },
-      onError() {},
-    });
-
-    const snapshot = () =>
-      poller.applySnapshot({
-        entries: [{ agent: AGENT }],
-        pageInfo: { hasMore: false, nextCursor: null },
-      });
-
-    await snapshot();
-    await clock.advance(0);
-    equal(
-      "the unseen completed goal is registered, polled and shown once",
-      events,
-      [["add", "a"], ["publish", "a"], ["visible", true]],
-    );
-
-    // The user opens the panel, closes it, and `seen-close-gate` confirms it:
-    // the seen machine records the key, `advanceSeen` persists it and re-presents.
-    seenStates.set("a", goalCompleteSeenStep(seenStates.get("a") ?? {}, { kind: "closed", goal: COMPLETE }));
-    persistence.remember("a", seenStates.get("a").seen);
-    present("a");
-    equal("the confirmed close hides the completed pill", events.at(-1), ["visible", false]);
-    equal("…and the key reached the host document", persistence.get("a"), KEY);
-
-    // The reconnect: same directory, fresh snapshot. Nothing was removed, so
-    // the registration and the remembered key are still there.
-    await snapshot();
-    equal("a reconnect snapshot removes no agent that is still listed", events.filter((row) => row[0] === "remove"), []);
-    equal("…and registers nothing twice", events.filter((row) => row[0] === "add").length, 1);
-    equal("…the persisted key survives the snapshot", persistence.get("a"), KEY);
-
-    // The next poll after the reconnect: the goal is unchanged, so the poll
-    // publishes nothing and the pill stays hidden. A re-registered pill has no
-    // publish signature and would show itself again here.
-    const publishesAfterClose = events.filter((row) => row[0] === "publish").length;
-    await clock.advance(LIVE_POLL_MS);
-    equal("an unchanged answer after the reconnect publishes nothing", events.filter((row) => row[0] === "publish").length, publishesAfterClose);
-    equal("the completed pill stays hidden across the reconnect", events.at(-1), ["visible", false]);
-
-    // A poll whose **answer changed** does republish (the dedupe cannot hide
-    // this one), so the seen path itself has to keep the pill hidden: same
-    // completed revision, only its "now" line moved.
-    answer = { available: true, goal: { ...COMPLETE, currentTask: "still shipping" } };
-    await clock.advance(LIVE_POLL_MS);
-    equal(
-      "a changed answer after the reconnect is published again",
-      events.filter((row) => row[0] === "publish").length,
-      publishesAfterClose + 1,
-    );
-    equal("…and the same completed revision stays hidden", events.at(-1), ["visible", false]);
-    equal(
-      "…no poll ever shows it again after the close",
-      events.filter((row) => row[0] === "visible").map((row) => row[1]),
-      [true, false, false],
-    );
-
-    // A real removal drops the in-session state and keeps the persisted key:
-    // the same completed revision the user already closed stays hidden after a
-    // re-add, while anything new has a new key (`goalSeenKey`).
-    poller.drop("a");
-    equal("a real removal keeps the persisted key (content-addressed)", persistence.get("a"), KEY);
-    poller.upsert(AGENT);
-    await clock.advance(0);
-    equal("…so the re-added pill stays hidden for the same revision", events.at(-1), ["visible", false]);
-    answer = { available: true, goal: { ...COMPLETE, revision: 4 } };
-    await clock.advance(LIVE_POLL_MS);
-    equal("…while a new revision is a new key and shows again", events.at(-1), ["visible", true]);
-    poller.dispose();
-    persistence.dispose();
-  }
-
-  console.log("\npoll controller: a snapshot removes only the agents that left");
-  {
-    const B = { id: "b", workspaceId: "ws", provider: "deepseek-harness-native" };
-    const harness = createPollerHarness();
-    await harness.poller.applySnapshot({
-      entries: [{ agent: AGENT }, { agent: B }],
-      pageInfo: { hasMore: false, nextCursor: null },
-    });
-    equal("both agents are registered", harness.calls.added, ["a", "b"]);
-    await harness.poller.applySnapshot({
-      entries: [{ agent: AGENT }],
-      pageInfo: { hasMore: false, nextCursor: null },
-    });
-    equal("an agent the snapshot no longer lists is removed", harness.calls.removed, [["b", "gone", undefined]]);
-    equal("…and the surviving agent keeps its registration", harness.calls.added, ["a", "b"]);
-    equal("…leaving exactly one poll timer", harness.clock.pendingDelays().length, 1);
-    harness.poller.dispose();
-  }
-
-  console.log("\npoll controller: an upsert during pagination is not removed by the diff");
-  {
-    let release = () => {};
-    const gate = new Promise((resolve) => {
-      release = resolve;
-    });
-    const harness = createPollerHarness({
-      listAgentPage: async () => {
-        await gate;
-        return { entries: [{ agent: AGENT }], pageInfo: { hasMore: false, nextCursor: null } };
-      },
-    });
-    const snapshot = harness.poller.applySnapshot({
-      entries: [{ agent: AGENT }],
-      pageInfo: { hasMore: true, nextCursor: "cursor-1" },
-    });
-    await new Promise((resolve) => setImmediate(resolve));
-    // The host pushes a brand-new agent while page two is still in flight.
-    harness.poller.upsert({ id: "new-agent", workspaceId: "ws", provider: "deepseek-harness-native" });
-    release();
-    await snapshot;
-    equal("the agent pushed mid-snapshot is not removed", harness.calls.removed, []);
-    equal("…and keeps the pill the upsert gave it", harness.calls.added, ["a", "new-agent"]);
-    harness.poller.dispose();
-  }
-
-  console.log("\npoll controller: the older snapshot's completion does not close the newer one's window");
-  {
-    // A reconnect can start a second snapshot while the first one is still
-    // paginating. The **older** one finishes first; its `finally` must not clear
-    // the collection window the newer one is still filling (P3-2). The guard is
-    // `inflightListed === listed`: without it, an `upsert` landing in the gap
-    // between the two completions is dropped from the newer snapshot's retention
-    // set and its pill is removed at the end of that snapshot.
-    let releaseOlder = () => {};
-    let releaseNewer = () => {};
-    const olderPage = new Promise((resolve) => {
-      releaseOlder = resolve;
-    });
-    const newerPage = new Promise((resolve) => {
-      releaseNewer = resolve;
-    });
-    const harness = createPollerHarness({
-      listAgentPage: async (cursor) => {
-        await (cursor === "cursor-a" ? olderPage : newerPage);
-        return { entries: [{ agent: AGENT }], pageInfo: { hasMore: false, nextCursor: null } };
-      },
-    });
-    const older = harness.poller.applySnapshot({
-      entries: [{ agent: AGENT }],
-      pageInfo: { hasMore: true, nextCursor: "cursor-a" },
-    });
-    await new Promise((resolve) => setImmediate(resolve));
-    const newer = harness.poller.applySnapshot({
-      entries: [{ agent: AGENT }],
-      pageInfo: { hasMore: true, nextCursor: "cursor-b" },
-    });
-    await new Promise((resolve) => setImmediate(resolve));
-    releaseOlder();
-    await older;
-    // The host pushes a new agent after the older snapshot ended but while the
-    // newer one is still collecting: only the newer window may accept it.
-    harness.poller.upsert({ id: "new-agent", workspaceId: "ws", provider: "deepseek-harness-native" });
-    releaseNewer();
-    await newer;
-    equal("the agent pushed inside the newer snapshot's window is not removed", harness.calls.removed, []);
-    equal("…and keeps its pill", harness.calls.added, ["a", "new-agent"]);
-    harness.poller.dispose();
-  }
-
-  console.log("\npoll controller: a reconnect snapshot revives a terminal pill");
-  {
-    let answer = { available: false, error: { message: "reload the plugin", code: "bridge_too_old" } };
-    const harness = createPollerHarness({
-      readGoal: async () => {
-        harness.calls.reads += 1;
-        return answer;
-      },
-    });
-    await registerOne(harness);
-    equal("the terminal code removes the pill", harness.calls.removed, [["a", "terminal", "bridge_too_old"]]);
-    equal("…and stops the timer", harness.clock.pendingDelays(), []);
-    // A bare upsert says nothing about the runtime: it must not restart the
-    // failing loop (the rule `harness/jobs-poll-check.cjs` also pins).
-    harness.poller.upsert(AGENT);
-    equal("a bare upsert does not re-register a terminal agent", harness.calls.added, ["a"]);
-    equal("…and schedules nothing", harness.clock.pendingDelays(), []);
-    // The directory snapshot is the host re-describing the world after a
-    // reconnect, when a plugin reload may have fixed the bridge: it rebuilds.
-    answer = { available: true, goal: goal({ phase: "complete", revision: 3 }) };
-    await harness.poller.applySnapshot({
-      entries: [{ agent: AGENT }],
-      pageInfo: { hasMore: false, nextCursor: null },
-    });
-    equal("a reconnect snapshot re-registers the terminal agent", harness.calls.added, ["a", "a"]);
-    await harness.clock.advance(0);
-    equal("…it reads the goal again", harness.calls.reads, 2);
-    equal("…and publishes the real answer", harness.calls.states.at(-1)?.[1]?.goal?.phase, "complete");
-    harness.poller.dispose();
+    const harness = createHarness();
+    await harness.subscriptions.applySnapshot(harness.snapshot(["a", "b"]));
+    await harness.subscriptions.applySnapshot(harness.snapshot(["a"]));
+    equal("a snapshot removes only the agents that left", harness.calls.removed.map(([id, reason]) => [id, reason]), [["b", "gone"]]);
+    equal("…and keeps the survivor's subscription", harness.calls.aborts, ["b"]);
+    harness.subscriptions.drop("a");
+    equal("a push removal tears the pill down", harness.calls.removed.map(([id]) => id), ["b", "a"]);
+    harness.subscriptions.dispose();
   }
 }
 
-/**
- * The persisted "seen" document (UI-v7 persistence, 2026-11-08): a confirmed
- * close writes one `agentId -> goalSeenKey` entry to the host's plugin settings,
- * and a *new controller over the same document* — the app restart — hydrates it
- * and keeps the completed goal hidden. A load failure degrades to the old
- * in-memory behaviour (show once more); a write failure keeps this session
- * correct and never throws. The document rules themselves are shared with the
- * team pill and driven here for the goal id.
- */
-async function seenPersistenceChecks() {
-  console.log("\nthe persisted \"seen\" document (UI-v7 persistence, 2026-11-08)");
-  const complete = goal({ phase: "complete", activation: "disarmed" });
-  const completeNewer = goal({ phase: "complete", revision: 2 });
-  const KEY = goalSeenKey(complete);
-  const hidden = (seen) => goalPillPresentation({ available: true, goal: complete }, seen).visible === false;
-  const visible = (seen) => goalPillPresentation({ available: true, goal: complete }, seen).visible === true;
+/* The agent-metadata store that replaced the settings document ---------------- */
 
-  /** A fake host: one in-memory settings file; the revision hashes the raw bytes. */
-  const fakeHost = (initial = null) => {
-    let raw = initial === null ? null : JSON.stringify(initial);
-    const revision = () => (raw === null ? "missing" : `rev:${raw}`);
-    const io = {
-      writes: [],
-      resetCalls: 0,
-      warned: [],
-      failRead: false,
-      failWrite: false,
-      failReset: false,
-      resetHangs: false,
-      resetConflict: false,
-      readInvalid: false,
-      alwaysConflict: false,
-      read: async () => {
-        if (io.failRead) throw new Error("unknown method settings.goal-pill-seen.read");
-        if (io.readInvalid) return { status: "invalid", revision: revision(), error: "a document this schema refuses" };
-        return { status: "ready", revision: revision(), values: raw === null ? {} : JSON.parse(raw) };
+async function seenMetadataChecks() {
+  console.log('\nthe "seen" signature on the agent (agent metadata, 2026-11-11)');
+
+  /** A fake agent whose metadata this test controls, plus the writes it received. */
+  function createStore(overrides = {}) {
+    const writes = [];
+    const errors = [];
+    const store = createSeenMetadataStore(
+      {
+        write: async (agentId, signature) => {
+          writes.push([agentId, signature]);
+          if (overrides.failWrites) throw new Error("the host refused the metadata write");
+        },
+        onError: (message, error) => {
+          errors.push([message, error instanceof Error ? error.message : error]);
+        },
       },
-      write: async (input) => {
-        io.writes.push(input);
-        if (io.alwaysConflict) return { status: "conflict", error: "Settings changed on another client." };
-        if (io.failWrite) throw new Error("settings write failed");
-        if (input.revision !== revision()) return { status: "conflict", error: "Settings changed on another client." };
-        raw = JSON.stringify(input.values);
-        return { status: "saved", revision: revision(), values: input.values };
-      },
-      /** The host's repair write: replaces the document without parsing the envelope. */
-      reset: async (input) => {
-        io.resetCalls += 1;
-        // A host that never answers: hydrate must still finish via the timeout.
-        if (io.resetHangs) return new Promise(() => undefined);
-        if (io.failReset) throw new Error("reset failed");
-        if (io.resetConflict) {
-          // Another client repaired the file while this reset was in flight.
-          raw = JSON.stringify({ seen: { "other-agent": "goal-9:3" } });
-          return { status: "conflict", error: "Settings changed on another client." };
-        }
-        if (input.revision !== revision()) return { status: "conflict", error: "Settings changed on another client." };
-        raw = JSON.stringify({ seen: {} });
-        return { status: "saved", revision: revision(), values: { seen: {} } };
-      },
-      warn: (message) => io.warned.push(message),
-      document: () => (raw === null ? {} : JSON.parse(raw)),
-      externalWrite: (values) => {
-        raw = JSON.stringify(values);
-      },
-    };
-    return io;
-  };
-
-  // The document's pure rules: untrusted JSON normalises to a bounded map.
-  equal("a non-object document is an empty map", seenMapOf(42), {});
-  equal("non-string and empty entries are dropped", seenMapOf({ a: "k", b: 3, "": "k", c: "" }), { a: "k" });
-  const many = {};
-  for (let index = 0; index < SEEN_SETTINGS_LIMIT + 3; index += 1) many[`agent-${String(index)}`] = `goal-${String(index)}:1`;
-  const capped = seenMapOf(many);
-  equal("the document is capped", Object.keys(capped).length, SEEN_SETTINGS_LIMIT);
-  equal("…keeping the newest entry", capped[`agent-${String(SEEN_SETTINGS_LIMIT + 2)}`], `goal-${String(SEEN_SETTINGS_LIMIT + 2)}:1`);
-  equal("…and dropping the oldest", capped["agent-0"], undefined);
-  equal(
-    "merge keeps stored agents and lets pending win",
-    mergeSeenValues({ a: "old", b: "kept" }, new Map([["a", "new"]])),
-    { a: "new", b: "kept" },
-  );
-
-  // Restart semantics: the entry a close wrote is hydrated by the next bundle.
-  {
-    const first = fakeHost();
-    const before = createSeenPersistence(first);
-    await before.hydrate();
-    equal("nothing is remembered before any close", before.get("agent-1"), undefined);
-    equal("…and the completed goal is visible", visible(before.get("agent-1")), true);
-    equal("hydrating never writes the document", first.writes.length, 0);
-    before.remember("agent-1", KEY);
-    await before.flush();
-    equal("the confirmed close wrote the document", first.document(), { seen: { "agent-1": KEY } });
-
-    // "Restart": the client bundle runs again and hydrates the same host file.
-    const after = createSeenPersistence(fakeHost(first.document()));
-    await after.hydrate();
-    equal("a restart remembers the closed goal", after.get("agent-1"), KEY);
-    equal("…so the same completed goal stays hidden", hidden(after.get("agent-1")), true);
-    equal("…a new revision shows it again", goalPillPresentation({ available: true, goal: completeNewer }, after.get("agent-1")).visible, true);
+      GOAL_SEEN_METADATA_KEY,
+    );
+    return { store, writes, errors };
   }
 
-  // A failed read (older host without the settings RPC) is the old behaviour.
   {
-    const broken = fakeHost();
-    broken.failRead = true;
-    const persistence = createSeenPersistence(broken);
-    await persistence.hydrate();
-    equal("a failed read still becomes ready", persistence.ready(), true);
-    equal("…with nothing remembered", persistence.get("agent-1"), undefined);
-    equal("…so the completed goal shows once more", visible(persistence.get("agent-1")), true);
-    persistence.remember("agent-1", KEY);
-    await persistence.flush();
-    equal("…and a write without a revision does not throw", persistence.get("agent-1"), KEY);
+    const { store } = createStore();
+    equal("an agent with no metadata remembers nothing", store.get("a"), undefined);
+    equal("…and observing it changes nothing", store.observe({ id: "a", metadata: {} }), false);
+    equal("a completed goal that was never closed shows", goalPillPresentation({ available: true, goal: goal({ phase: "complete" }) }, store.get("a")).visible, true);
+    equal("observing a stored key reports the change", store.observe({ id: "a", metadata: { [GOAL_SEEN_METADATA_KEY]: "goal-1:1" } }), true);
+    equal("…and the pill reads it back", store.get("a"), "goal-1:1");
+    equal(
+      "…hiding the completed goal the user closed",
+      goalPillPresentation({ available: true, goal: goal({ phase: "complete" }) }, store.get("a")).visible,
+      false,
+    );
+    equal("observing the same key again reports nothing", store.observe({ id: "a", metadata: { [GOAL_SEEN_METADATA_KEY]: "goal-1:1" } }), false);
+    equal("a value of the wrong type is not a signature", store.observe({ id: "b", metadata: { [GOAL_SEEN_METADATA_KEY]: 7 } }), false);
+    equal("…and is not remembered", store.get("b"), undefined);
+    equal("an empty string is not a signature", seenFromMetadata({ [GOAL_SEEN_METADATA_KEY]: "" }, GOAL_SEEN_METADATA_KEY), undefined);
+    equal("the key is this plugin's namespace", GOAL_SEEN_METADATA_KEY, "dsh.goalSeen");
+    equal("the team key is its own", TEAM_SEEN_METADATA_KEY, "dsh.teamSeen");
+    equal("the patch names the key", seenMetadataPatch(GOAL_SEEN_METADATA_KEY, "goal-1:2"), { "dsh.goalSeen": "goal-1:2" });
+    store.dispose();
   }
 
-  // A failed write keeps the session's answer and never throws.
   {
-    const broken = fakeHost();
-    broken.failWrite = true;
-    const persistence = createSeenPersistence(broken);
-    await persistence.hydrate();
-    persistence.remember("agent-1", KEY);
-    await persistence.flush();
-    equal("a failed write keeps the in-memory seen", persistence.get("agent-1"), KEY);
-    equal("…so the pill stays hidden this session", hidden(persistence.get("agent-1")), true);
+    // A confirmed close: in memory at once (this session hides it), on the agent
+    // right after (a reload hides it too).
+    const { store, writes } = createStore();
+    store.observe({ id: "a", metadata: {} });
+    store.remember("a", "goal-1:1");
+    equal("the confirmed close is in memory immediately", store.get("a"), "goal-1:1");
+    await store.flush();
+    equal("…and one write carries it", writes, [["a", "goal-1:1"]]);
+    // The daemon echoes the new metadata as an agent update; that is what proves
+    // it stored the value.
+    equal("the echo reports no visible change", store.observe({ id: "a", metadata: { [GOAL_SEEN_METADATA_KEY]: "goal-1:1" } }), false);
+    equal("…but the answer is still the signature", store.get("a"), "goal-1:1");
+    // A stale snapshot (read before the write) must not undo the close.
+    store.remember("a", "goal-1:2");
+    await store.flush();
+    equal("a stale snapshot does not change the visible answer", store.observe({ id: "a", metadata: { [GOAL_SEEN_METADATA_KEY]: "goal-1:1" } }), false);
+    equal("…and the pending close wins", store.get("a"), "goal-1:2");
+    store.dispose();
   }
 
-  // Conflict: another client wrote meanwhile — re-read, merge, keep its agents.
   {
-    const concurrent = fakeHost();
-    const persistence = createSeenPersistence(concurrent);
-    await persistence.hydrate();
-    concurrent.externalWrite({ seen: { "other-agent": "goal-9:3" } });
-    persistence.remember("agent-1", KEY);
-    await persistence.flush();
-    equal("a conflicted write is retried once", concurrent.writes.length, 2);
-    equal("…and the other client's agent is kept", concurrent.document(), {
-      seen: { "other-agent": "goal-9:3", "agent-1": KEY },
-    });
-    equal("…and a retry that succeeds does not warn", concurrent.warned.length, 0);
+    // A refused write: one line, and the session still hides the finished state.
+    const { store, errors } = createStore({ failWrites: true });
+    store.observe({ id: "a", metadata: {} });
+    store.remember("a", "goal-1:1");
+    await store.flush();
+    equal("a failed write is reported once", errors.length, 1);
+    assert("…naming the agent", errors[0][1] === "the host refused the metadata write", JSON.stringify(errors[0]));
+    equal("…and the in-session answer survives", store.get("a"), "goal-1:1");
+    store.remember("a", "goal-1:2");
+    await store.flush();
+    equal("…a second failure does not log again", errors.length, 1);
+    equal("…and the newer close still wins", store.get("a"), "goal-1:2");
+    store.dispose();
   }
 
-  // A silent host must not hold the first publish forever.
   {
-    const silent = fakeHost();
-    silent.read = () => new Promise(() => undefined);
-    const persistence = createSeenPersistence(silent, { timeoutMs: 5 });
-    await persistence.flush();
-    equal("a silent read times out into the old behaviour", persistence.ready(), true);
-    equal("…with nothing remembered", persistence.get("agent-1"), undefined);
+    // Writes are chained in call order, and a removal must not forget the key
+    // (the 2026-11-09 rule): a pill that comes back still hides what was read.
+    const { store, writes } = createStore();
+    store.observe({ id: "a", metadata: {} });
+    store.remember("a", "goal-1:1");
+    store.remember("b", "goal-2:1");
+    await store.flush();
+    equal("two closes are written in call order", writes, [["a", "goal-1:1"], ["b", "goal-2:1"]]);
+    equal("a removed pill's key is still remembered", store.get("a"), "goal-1:1");
+    store.dispose();
+    store.remember("c", "goal-3:1");
+    await store.flush();
+    equal("a disposed store writes nothing more", writes.length, 2);
+    equal("…and answers nothing", store.get("c"), undefined);
   }
 
-  // A removal keeps the persisted key (2026-11-09): the signature is
-  // content-addressed, so it can only hide the exact completed revision the user
-  // closed. Masking it per session made every removal path (a snapshot rebuild,
-  // a permission retry, a terminal recovery) show that revision again.
+  // Source pins: where the write may come from, and what the server half no
+  // longer does. These are source reads because the code they pin runs inside the
+  // app's client bundle and the daemon's plugin process.
+  console.log("\nthe seen wiring in the pill and the server half");
   {
-    const removal = fakeHost({ seen: { "agent-1": KEY } });
-    const persistence = createSeenPersistence(removal);
-    await persistence.hydrate();
-    equal("the document remembers a closed goal", persistence.get("agent-1"), KEY);
-    equal("a removed pill keeps the persisted key (no per-session mask)", persistence.get("agent-1"), KEY);
-    equal("…so the same completed revision stays hidden after a re-add", hidden(persistence.get("agent-1")), true);
-    persistence.remember("agent-1", goalSeenKey(completeNewer));
-    await persistence.flush();
-    equal("a new confirmed close overwrites the entry", persistence.get("agent-1"), goalSeenKey(completeNewer));
-    equal("…and the older completed revision is visible again", visible(persistence.get("agent-1")), true);
-  }
-
-  // P2-1: a document the host refuses (`invalid`: an older version's envelope, a
-  // corrupt file) is repaired by the host's `reset` — a `save` would re-parse the
-  // same envelope and be refused on every attempt, so the stale goal would show
-  // once more after every app/plugin reload for the life of the file.
-  {
-    const repair = fakeHost();
-    repair.readInvalid = true;
-    const persistence = createSeenPersistence(repair);
-    await persistence.hydrate();
-    equal("an invalid document triggers exactly one reset", repair.resetCalls, 1);
-    equal("…hydration continues with an empty map", persistence.get("agent-1"), undefined);
-    equal("…so the completed goal is shown once", visible(persistence.get("agent-1")), true);
-    persistence.remember("agent-1", KEY);
-    await persistence.flush();
-    equal("…and the next confirmed close writes normally", repair.writes.length, 1);
-    equal("…into the repaired document", repair.document(), { seen: { "agent-1": KEY } });
-  }
-  {
-    const refused = fakeHost();
-    refused.readInvalid = true;
-    refused.failReset = true;
-    const persistence = createSeenPersistence(refused);
-    await persistence.hydrate();
-    equal("a refused reset does not throw", persistence.ready(), true);
-    equal("…and was attempted once", refused.resetCalls, 1);
-    equal("…and degrades to the empty map", persistence.get("agent-1"), undefined);
-    equal("…so the goal is shown once more (the old behaviour)", visible(persistence.get("agent-1")), true);
-  }
-  {
-    // The gate P2: a host that never answers the reset must not leave `ready`
-    // false — that would keep present() from ever publishing and the pill would
-    // never show again this session, the opposite of the degrade contract.
-    const hung = fakeHost();
-    hung.readInvalid = true;
-    hung.resetHangs = true;
-    const persistence = createSeenPersistence(hung, { timeoutMs: 5 });
-    await persistence.flush();
-    equal("a hanging reset still resolves hydrate inside the timeout", persistence.ready(), true);
-    equal("…and was attempted once", hung.resetCalls, 1);
-    equal("…with the empty map (old behaviour)", persistence.get("agent-1"), undefined);
-    equal("…so the goal shows once more", visible(persistence.get("agent-1")), true);
-  }
-  {
-    // A reset that answers `conflict` (another client repaired the file): the
-    // next save re-reads the now-valid document and merges, keeping its entries.
-    const heal = fakeHost();
-    heal.readInvalid = true;
-    heal.resetConflict = true;
-    const persistence = createSeenPersistence(heal, { settingsId: "goal-pill-seen" });
-    await persistence.hydrate();
-    equal("a conflicting reset still finishes hydrate", persistence.ready(), true);
-    equal("…until the next close nothing is remembered", persistence.get("agent-1"), undefined);
-    equal("…and nothing was warned about", heal.warned.length, 0);
-    // The other client's repair becomes readable: the next save self-heals.
-    heal.readInvalid = false;
-    persistence.remember("agent-1", KEY);
-    await persistence.flush();
-    equal("…the next save re-reads the repaired document", heal.writes.length, 2);
-    equal("…and merges the other client's agent", heal.document(), {
-      seen: { "other-agent": "goal-9:3", "agent-1": KEY },
-    });
-    equal("…without a conflict warning", heal.warned.length, 0);
-  }
-
-  // P2-2: a write still in conflict after its one retry warns once (diagnostic
-  // only — settings id and agent ids, never the document) and keeps the pending
-  // entry for the next confirmed close; there is no polling retry.
-  {
-    const stubborn = fakeHost();
-    stubborn.alwaysConflict = true;
-    const persistence = createSeenPersistence(stubborn, { settingsId: "goal-pill-seen" });
-    await persistence.hydrate();
-    persistence.remember("agent-1", KEY);
-    await persistence.flush();
-    equal("a conflicting write is attempted twice (one retry)", stubborn.writes.length, 2);
-    equal("…then warns once", stubborn.warned.length, 1);
-    assert("…naming the settings id", /goal-pill-seen/.test(stubborn.warned[0] ?? ""), stubborn.warned[0]);
-    assert("…and the agent id", /agentId=agent-1/.test(stubborn.warned[0] ?? ""), stubborn.warned[0]);
-    assert("…never the document contents", !/goal-1:1/.test(stubborn.warned[0] ?? ""), stubborn.warned[0]);
-    equal("…while the memory keeps the seen state", persistence.get("agent-1"), KEY);
-    equal("…so the pill stays hidden this session", hidden(persistence.get("agent-1")), true);
-    persistence.remember("agent-1", KEY);
-    await persistence.flush();
-    equal("the next confirmed close retries the write", stubborn.writes.length, 4);
-    equal("…but the warning is not repeated", stubborn.warned.length, 1);
-  }
-
-  // P2-3: run the real definitions (not just source regexes): id, scope, version
-  // and normalisation are exactly what the host sees. A team/goal id swap in a
-  // pill's IO wiring is pinned by the source checks below, and this half pins
-  // the ids the definitions actually register.
-  {
-    const goalDefinition = defineGoalSeenSettings();
-    equal("goal definition id", goalDefinition.id, "goal-pill-seen");
-    equal("goal definition scope", goalDefinition.scope, "host");
-    equal("goal definition version", goalDefinition.version, 1);
-    const teamDefinition = defineTeamSeenSettings();
-    equal("team definition id (not swapped)", teamDefinition.id, "team-pill-seen");
-    equal("team definition scope", teamDefinition.scope, "host");
-    equal("team definition version", teamDefinition.version, 1);
-    const cases = [
-      ["an empty document", {}, { seen: {} }],
-      ["mixed value types", { seen: { a: 1, b: "x", "": "y", c: "" } }, { seen: { b: "x" } }],
-      ["a garbage string", "nonsense", { seen: {} }],
-      ["null", null, { seen: {} }],
-    ];
-    for (const [label, input, expected] of cases) {
-      equal(`goal schema normalises ${label}`, await goalDefinition.schema.parseAsync(input), expected);
-      equal(`team schema normalises ${label}`, await teamDefinition.schema.parseAsync(input), expected);
+    const repoRoot = path.resolve(__dirname, "..", "..");
+    const readRepo = (relative) => fs.readFileSync(path.join(repoRoot, relative), "utf8");
+    const goalPill = readRepo("paseo-plugin/client/goal-pill.tsx");
+    // The one write path: the confirmed-close branch of `advanceSeen`.
+    assert("the goal pill writes a seen key on a confirmed close", /if \(event\.kind === "closed" && after\.seen !== undefined\) seen\.remember\(/.test(goalPill));
+    assert(
+      "no other code in the pill writes the seen key",
+      (goalPill.match(/seen\.remember\(/g) ?? []).length === 1,
+      String((goalPill.match(/seen\.remember\(/g) ?? []).length),
+    );
+    assert("the goal pill reads its key through the store", /seen\.get\(agentId\)/.test(goalPill));
+    assert("the metadata write targets the agent record", /client\.paseo\.agents\.ref\(agentId\)\.setMetadata\(\{ \[GOAL_SEEN_METADATA_KEY\]/.test(goalPill));
+    assert("the pill no longer talks to plugin settings", !/settingsRpc|registerSettings/.test(goalPill));
+    // The controller and the presentation module never write: the close is the
+    // only input that may.
+    for (const file of ["client/goal-polling.ts", "client/agent-subscriptions.ts"]) {
+      const source = readRepo(`paseo-plugin/${file}`);
+      assert(`${file} never writes a seen key`, !/seen\.remember|setMetadata|settingsRpc/.test(source));
     }
-  }
-
-  // Sources: one write path only (the confirmed-close branch); polls never write.
-  {
-    const repo = path.resolve(__dirname, "..", "..");
-    const pill = fs.readFileSync(path.join(repo, "paseo-plugin/client/goal-pill.tsx"), "utf8");
-    assert("the pill hydrates the persisted seen state at load", /void persistence\.hydrate\(\)/.test(pill));
-    assert("nothing is published before hydrate resolves", /if \(!persistence\.ready\(\)\) return;/.test(pill));
-    assert(
-      "the persisted fallback is read after the session's own seen state",
-      /seenStates\.get\(agentId\)\?\.seen \?\? persistence\.get\(agentId\)/.test(pill),
-    );
-    assert(
-      "the only write is advanceSeen's confirmed-close branch",
-      /if \(event\.kind === "closed" && after\.seen !== undefined\) persistence\.remember\(agentId, after\.seen\);/.test(pill),
-    );
-    equal("persistence.remember appears exactly once", (pill.match(/persistence\.remember\(/g) ?? []).length, 1);
-    const publishState = pill.slice(pill.indexOf("const publishState"), pill.indexOf("const poller"));
-    assert("the poll path (publishState) never writes", !/persistence\.(remember|write)/.test(publishState));
-    // Identifier checks run on comment-stripped source: the pills' comments name
-    // the removed call (`forget`) to explain why it went, and a pin that cannot
-    // tell code from prose would either fail on its own explanation or pass on
-    // one (P3-7).
-    const code = (source) => source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
-    assert(
-      "the removal path never calls the persisted-fallback forget",
-      !/persistence\.forget\s*\(/.test(code(pill)),
-    );
-    const persistenceSource = code(
-      fs.readFileSync(path.join(repo, "paseo-plugin/client/seen-persistence.ts"), "utf8"),
-    );
-    assert(
-      "…because the controller has no forget member (interface or implementation)",
-      !/\bforget\b/.test(persistenceSource),
-    );
-    assert(
-      "the pill wires read/write/reset/warn against the goal settings id",
-      /settingsRpc\(GOAL_SEEN_SETTINGS_ID\)\.read/.test(pill) &&
-        /settingsRpc\(GOAL_SEEN_SETTINGS_ID\)\.write/.test(pill) &&
-        /settingsRpc\(GOAL_SEEN_SETTINGS_ID\)\.reset/.test(pill) &&
-        /warn: \(message\) => console\.warn/.test(pill),
-    );
-    assert("…and passes the goal settings id to the controller", /settingsId: GOAL_SEEN_SETTINGS_ID/.test(pill));
-    assert("…never references the team settings id (a swap must fail)", !/TEAM_SEEN_SETTINGS_ID/.test(pill));
-    for (const file of ["client/goal-polling.ts", "client/agent-polling.ts"]) {
-      const source = fs.readFileSync(path.join(repo, "paseo-plugin", file), "utf8");
-      assert(`${file} never writes the seen document`, !/seen-persistence|persistence\.remember|settingsRpc/.test(source));
-    }
-    const server = fs.readFileSync(path.join(repo, "paseo-plugin/index.server.ts"), "utf8");
-    assert(
-      "the server registers both seen settings",
-      /registerSettings\(defineTeamSeenSettings\(\)\)/.test(server) && /registerSettings\(defineGoalSeenSettings\(\)\)/.test(server),
-    );
-    assert("…guarded for a host without plugin settings", /typeof server\.registerSettings !== "function"/.test(server));
-    const definition = fs.readFileSync(path.join(repo, "paseo-plugin/shared/goal-seen-settings.ts"), "utf8");
-    assert(
-      "the goal definition is host-scoped and sanitises the document",
-      /scope: "host"/.test(definition) && /seenDocumentOf/.test(definition) && /GOAL_SEEN_SETTINGS_ID = "goal-pill-seen"/.test(definition),
-    );
+    const serverEntry = readRepo("paseo-plugin/index.server.ts");
+    assert("the server registers no settings any more", !/registerSettings/.test(serverEntry));
+    assert("the server serves the goal subscription", /server\.handle\(goalSnapshot/.test(serverEntry));
+    assert("the goal control action refreshes the feed", /if \(result\.ok\) goalFeed\.refresh\(agentId\)/.test(serverEntry));
+    const metadata = readRepo("paseo-plugin/shared/pill-metadata.ts");
+    assert("the keys live in the shared metadata module", /GOAL_SEEN_METADATA_KEY = "dsh\.goalSeen"/.test(metadata) && /TEAM_SEEN_METADATA_KEY = "dsh\.teamSeen"/.test(metadata));
   }
 }
 
-(async () => {
-  await runControllerChecks();
-  await seenPersistenceChecks();
-  console.log(`\n${checks - failures}/${checks} checks passed`);
-  if (failures > 0) {
-    console.error(`${failures} FAILED`);
-    process.exitCode = 1;
-    return;
-  }
-  console.log("OK");
-})().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+Promise.resolve()
+  .then(() => seenMetadataChecks())
+  .then(() => runControllerChecks())
+  .then(() => {
+    console.log(`\n${checks - failures}/${checks} checks passed`);
+    if (failures > 0) {
+      console.error(`${failures} FAILED`);
+      process.exit(1);
+    }
+    console.log("OK");
+  })
+  .catch((error) => {
+    console.error("late checks crashed:", error);
+    process.exit(1);
+  });

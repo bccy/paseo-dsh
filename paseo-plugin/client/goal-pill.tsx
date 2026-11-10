@@ -9,11 +9,12 @@
  * one button two meanings and change the jobs semantics the user already set,
  * so this is a separate registration (`id: "dsh-goal"`) beside it.
  *
- * **Why it polls.** DSH's goal lives in the `dsh` child process and Paseo 0.14
+ * **Why it rides a feed.** DSH's goal lives in the `dsh` child process and Paseo
  * has no goal protocol at all (no field, no event, no capability bit — see
- * DESIGN §0), so there is nothing to subscribe to. A plugin RPC is the supported
- * channel for daemon-side reads; the cadence is the jobs pill's, shared through
- * `client/agent-polling.ts`.
+ * DESIGN §0), so the host cannot push it. The server half therefore owns the
+ * read cadence (`server/pill-feed.ts`, one reader per agent shared by every
+ * subscriber) and this pill only consumes its `goal.snapshot` subscription
+ * (`client/agent-subscriptions.ts` handles the directory diff and re-subscribe).
  *
  * **What the trigger can and cannot show (UI-v6).** The *label* is the fixed
  * noun 「目标」/「Goal」 in every state. The state is shown by the **icon**, a
@@ -28,17 +29,18 @@
  * has no separate accessibility-name slot, so a screen reader can only hear the
  * state through `title`. The full objective still lives once, in the popover body.
  *
- * **What is never shown.** A goal the user cannot read is not "no goal": the
- * poller keeps the last state on a transient error, and a terminal error (a
- * bridge without `paseo/goal`, a profile with no goal service) removes the pill
- * — the same appearance as a profile that never had the feature, rather than an
- * error the user can never dismiss.
+ * **What is never shown.** A goal the user cannot read is not "no goal": a
+ * transient error keeps the last state, and a terminal error (a bridge without
+ * `paseo/goal`, a profile with no goal service) removes the pill — the same
+ * appearance as a profile that never had the feature, rather than an error the
+ * user can never dismiss.
  *
  * **What "seen" survives.** A completed goal is shown once and hidden only after
- * its panel was opened and really closed (UI-v7). That memory is persisted in
- * host-scoped plugin settings (`../shared/goal-seen-settings` via
- * `./seen-persistence`, 2026-11-08), so an app restart or a plugin reload no
- * longer shows it once more; a host without settings degrades to memory-only.
+ * its panel was opened and really closed (UI-v7). That memory lives on the agent
+ * itself — the `dsh.goalSeen` key of Paseo's durable agent metadata
+ * (`../shared/pill-metadata` via `./seen-metadata`, 2026-11-11) — so an app
+ * restart, a plugin reload or a daemon restart no longer shows it once more, and
+ * the value arrives with the agent before the pill is first presented.
  *
  * @module dsh-paseo/client/goal-pill
  */
@@ -48,16 +50,22 @@ import type {
   PluginButtonRegistration,
   PluginClientContext,
 } from "@getpaseo/plugin/client";
-import { settingsRpc } from "@getpaseo/plugin";
 import { useEffect, useRef, useState } from "react";
 import { Text, View } from "react-native";
-import { goalControl, goalCurrent, type GoalAction, type GoalState } from "../shared/goal";
-import { GOAL_SEEN_SETTINGS_ID } from "../shared/goal-seen-settings";
+import {
+  goalControl,
+  goalSnapshot,
+  isTerminalGoalErrorCode,
+  type GoalAction,
+  type GoalAnswer,
+  type GoalState,
+} from "../shared/goal";
+import { GOAL_SEEN_METADATA_KEY } from "../shared/pill-metadata";
+import { createAgentSubscriptions } from "./agent-subscriptions";
 import { CornerRingIcon } from "./corner-ring";
 import { GoalPopoverBody } from "./goal-popover";
 import { useAgent, useGoalRunningMark } from "./goal-running";
 import {
-  createGoalPoller,
   goalCompleteSeenStep,
   goalEditSubmittable,
   goalIconColorToken,
@@ -65,8 +73,8 @@ import {
   goalPillCopy,
   goalPanelNext,
   goalPillPresentation,
+  projectGoalAnswer,
   type GoalCompleteEvent,
-  type GoalPoller,
   type GoalSeenState,
   type GoalTone,
   type GoalViewState,
@@ -74,7 +82,7 @@ import {
 import { FACTS_FONT_SIZE } from "./jobs-popover-layout";
 import { localeText } from "./locale";
 import { createSeenCloseGate } from "./seen-close-gate";
-import { createSeenPersistence } from "./seen-persistence";
+import { createSeenMetadataStore } from "./seen-metadata";
 
 /** One agent's latest answer, plus the listeners the pill and popover subscribe with. */
 interface AgentGoal {
@@ -174,10 +182,10 @@ export function makeGoalIcon(store: GoalStore, agentId: string) {
  * body (`goal-popover.tsx`).
  *
  * It reads the shared store rather than issuing its own read, so opening the
- * popover does not double the request rate. After a successful control action it
- * asks the poller for one immediate read (`refresh`) instead of waiting up to
- * the four-second interval: the user just pressed a button and expects the pill
- * to change now.
+ * popover costs nothing: one subscription feeds the trigger, the icon and the
+ * body. After a successful control action the server's goal feed re-reads
+ * immediately (`index.server.ts`), so the new phase reaches this panel through
+ * the same subscription instead of up to one interval later.
  *
  * **Failure keeps the panel open.** DSH's own sentence is shown in place — a
  * paused goal at its round cap refuses `resume`, and closing the popover would
@@ -196,7 +204,6 @@ export function makeGoalPopover(
   client: PluginClientContext,
   store: GoalStore,
   agentId: string,
-  refresh: () => Promise<void>,
   onClosed: (goal: GoalState | null) => void,
 ) {
   /**
@@ -279,18 +286,14 @@ export function makeGoalPopover(
           return;
         }
         if (goalPanelNext({ kind: "control", action, ok: true }) === "close") {
-          // A saved edit closes the panel. The refresh is the poller's, not this
-          // body's, so it is started and not awaited: the panel must not wait
-          // on a read before it closes.
-          void refresh();
           close();
           return;
         }
         setMode("view");
         setDraft("");
-        // Immediate refresh: the user just pressed a button and the pill must
-        // show the new phase now, not on the next scheduled poll.
-        await refresh();
+        // No read here: `goal.control` asks the server's goal feed to re-read
+        // immediately (`index.server.ts`), so the new phase arrives through this
+        // panel's own subscription — the same answer the pill's trigger sees.
       } catch (caught) {
         setError(caught instanceof Error ? caught.message : String(caught));
       } finally {
@@ -381,9 +384,9 @@ const AGENT_DIRECTORY_PAGE_SIZE = 200;
  * Returns the contribution's cleanup, which Paseo calls when the plugin, the
  * client entrypoint or the host connection goes away: every timer, every pill
  * and the agent observation are released there. Polling itself is
- * `createGoalPoller`; this function owns the host objects the controller cannot
- * see — the React store the popover reads, the composer registration, and the
- * locale.
+ * `createAgentSubscriptions`; this function owns the host objects the controller
+ * cannot see — the React store the popover reads, the composer registration, the
+ * subscription call itself, and the locale.
  */
 export function contributeGoalPill(client: PluginClientContext) {
   const store: GoalStore = new Map();
@@ -391,50 +394,45 @@ export function contributeGoalPill(client: PluginClientContext) {
   const pills = new Map<string, PluginButtonRegistration>();
   /**
    * agentId -> the completed goal's in-session "seen" progress (UI-v7). The
-   * remembered key is also persisted on the host (`../shared/goal-seen-settings`),
-   * so an app restart or a plugin reload no longer forgets it; this map only
-   * carries the closes of this session, and the persistence is the fallback for
-   * everything the host document remembers.
+   * remembered key is also stored on the agent (`../shared/pill-metadata`), so an
+   * app restart or a plugin reload no longer forgets it; this map only carries the
+   * closes of this session, and `seen` is the fallback for everything the agent's
+   * metadata remembers.
    */
   const seenStates = new Map<string, GoalSeenState>();
-  /** agentId -> the last poll answer, to re-present it when only "seen" changed. */
+  /** agentId -> the last pushed answer, to re-present it when only "seen" changed. */
   const answers = new Map<string, GoalViewState>();
   /** agentId -> what the host was last told; an unchanged poll publishes nothing. */
   const published = new Map<string, { visible: boolean; label: string; title: string }>();
   const lifetime = new AbortController();
-  const rpc = (input: { agentId: string }) => client.rpc(goalCurrent, input);
 
   /**
-   * UI-v7 persistence (2026-11-08): the "seen" keys the user closed a panel on
-   * live in a host setting, so an app restart does not show a completed goal
-   * once more. `present` refuses to publish before `hydrate` resolved (a
-   * registration starts hidden), so an already-seen goal never flashes; a host
-   * without the settings RPC degrades to the old in-memory behaviour. Only
-   * `advanceSeen`'s confirmed-close branch writes (below) — polls never do.
+   * UI-v7 "seen" (2026-11-11): the completed goal the user closed a panel on is
+   * remembered in the agent's own metadata (`../shared/pill-metadata`), so an app
+   * restart, a plugin reload or a daemon restart does not show it once more. The
+   * value arrives with the agent in the directory snapshot — the pill is
+   * registered *after* `seen.observe(agent)`, so nothing can flash before it is
+   * known — and a second window's close reaches this one as an agent update.
+   *
+   * The write goes through `paseo.agents.ref(agentId).setMetadata`, not the
+   * composer: this pill's code runs in the contribution callback, outside React,
+   * and an agent's composer exists only while its tab is open, whereas the
+   * metadata record belongs to the agent and works for an idle one too. Only
+   * `advanceSeen`'s confirmed-close branch writes (below) — answers never do.
    */
-  const persistence = createSeenPersistence(
+  const seen = createSeenMetadataStore(
     {
-      read: () => client.rpc(settingsRpc(GOAL_SEEN_SETTINGS_ID).read, {}),
-      write: (input) => client.rpc(settingsRpc(GOAL_SEEN_SETTINGS_ID).write, input),
-      // A document the host refused is repaired with `reset`, the one write the
-      // host applies without re-parsing the stored envelope (`./seen-persistence`).
-      reset: (input) => client.rpc(settingsRpc(GOAL_SEEN_SETTINGS_ID).reset, input),
+      write: (agentId, signature) =>
+        client.paseo.agents.ref(agentId).setMetadata({ [GOAL_SEEN_METADATA_KEY]: signature }),
       onError: (message, error) => {
         console.error(`[dsh-paseo] ${message}: ${error instanceof Error ? error.message : String(error)}`);
       },
-      warn: (message) => console.warn(`[dsh-paseo] ${message}`),
     },
-    {
-      settingsId: GOAL_SEEN_SETTINGS_ID,
-      onHydrated: () => {
-        for (const agentId of [...pills.keys()]) present(agentId);
-      },
-    },
+    GOAL_SEEN_METADATA_KEY,
   );
-  void persistence.hydrate();
 
   /**
-   * Publish one poll answer: the popover store first (its listeners redraw from
+   * Publish one pushed answer: the popover store first (its listeners redraw from
    * it, including the trigger's glyph), then the registration. The
    * visibility/label rule is {@link goalPillPresentation}; this function only
    * turns its keys into copy.
@@ -443,18 +441,14 @@ export function contributeGoalPill(client: PluginClientContext) {
     const registration = pills.get(agentId);
     const next = answers.get(agentId);
     if (registration === undefined || next === undefined) return;
-    // Nothing is published before the persisted "seen" state is known: the
-    // registration starts hidden, so an already-seen completed goal never
-    // flashes on the composer while the settings read is in flight.
-    if (!persistence.ready()) return;
-    const seen = seenStates.get(agentId)?.seen ?? persistence.get(agentId);
+    const remembered = seenStates.get(agentId)?.seen ?? seen.get(agentId);
     publish(store, agentId, {
       goal: next.goal,
       available: next.available,
       ...(next.error === undefined ? {} : { error: next.error }),
-      ...(seen === undefined ? {} : { seen }),
+      ...(remembered === undefined ? {} : { seen: remembered }),
     });
-    const presentation = goalPillPresentation(next, seen);
+    const presentation = goalPillPresentation(next, remembered);
     const text = localeText().goal;
     // The label and the title are the noun in every state (UI-v7): the title is
     // also the phone sheet's header, which must read 「目标」. The state is the
@@ -485,7 +479,7 @@ export function contributeGoalPill(client: PluginClientContext) {
       // gate's `closed` event, the only event the machine advances on) changed
       // the remembered completed-goal key. Polls and agent status events are
       // no-ops above and never reach here.
-      if (event.kind === "closed" && after.seen !== undefined) persistence.remember(agentId, after.seen);
+      if (event.kind === "closed" && after.seen !== undefined) seen.remember(agentId, after.seen);
       present(agentId);
     }
   };
@@ -499,8 +493,29 @@ export function contributeGoalPill(client: PluginClientContext) {
     present(agentId);
   };
 
-  const poller: GoalPoller = createGoalPoller({
-    readGoal: (agentId) => rpc({ agentId }),
+  const subscriptions = createAgentSubscriptions<GoalState | null, GoalAnswer>({
+    /**
+     * Watch this agent's goal snapshots.
+     *
+     * `client.subscribe` re-subscribes by itself after a reconnect and releases
+     * what is left when the plugin stops; aborting `signal` releases this one, so
+     * the controller deliberately keeps no handle. A refused subscription rejects
+     * `ready` instead (a permission refusal removes the pill); the guard keeps
+     * the release path from reporting a close that this side caused.
+     */
+    open: (agentId, onAnswer, onEnd, signal) => {
+      const handle = client.subscribe(goalSnapshot, { agentId }, onAnswer, {
+        signal,
+        onClosed: (closed) => {
+          if (signal.aborted) return;
+          onEnd(closed.error);
+        },
+      });
+      void handle.ready.catch((error: unknown) => {
+        if (signal.aborted) return;
+        onEnd(error instanceof Error ? error : new Error(String(error)));
+      });
+    },
     /**
      * The snapshot is only the directory's first page (the daemon defaults to
      * 200 entries); the controller walks `pageInfo.nextCursor` through this.
@@ -514,6 +529,10 @@ export function contributeGoalPill(client: PluginClientContext) {
     },
     addAgent: (agent) => {
       const text = localeText().goal;
+      // The durable "seen" value arrives with the agent; taking it before the
+      // pill exists is what removes the old hydrate gate — `present` below always
+      // has an answer, so a completed goal the user already closed never flashes.
+      seen.observe(agent);
       const registration = client.addComposerPill({
         id: "dsh-goal",
         workspaceId: agent.workspaceId ?? "",
@@ -532,7 +551,6 @@ export function contributeGoalPill(client: PluginClientContext) {
               client,
               store,
               agent.id,
-              () => poller.pollNow(agent.id),
               (goal) => {
                 // Only this pill's close counts: the gate's confirmation can land
                 // after the agent's pill was replaced or removed, and a stale
@@ -555,6 +573,15 @@ export function contributeGoalPill(client: PluginClientContext) {
       // the user really closed (`goal-<uuid>:revision`), so it cannot hide a goal
       // the user has not been shown.
       seenStates.delete(agent.id);
+    },
+    updateAgent: (agent) => {
+      // The "seen" key of this agent changed — this session's own close echoed
+      // back, or another window's close. Either way the pill must re-decide its
+      // visibility now instead of waiting for the next goal answer.
+      if (seen.observe(agent)) present(agent.id);
+      // The agent's status is **not** a "seen" signal: a turn starting after the
+      // completing one ended is usually just the user sending the next message,
+      // and a completed pill must stay until its panel is opened and closed.
     },
     removeAgent: (agentId, reason, error) => {
       const entry = pills.get(agentId);
@@ -589,24 +616,38 @@ export function contributeGoalPill(client: PluginClientContext) {
         );
       }
     },
-    publishState,
+    // The controller carries the payload as `data`; this pill's store row names it
+    // `goal`, so the two shapes are joined here (the old adapter's only job). The
+    // controller already guarantees an available answer here — transient failures
+    // are swallowed by `publishOnTransientError: false` and terminal ones remove
+    // the pill — but the guard keeps a future core change from publishing "no
+    // goal" for a failed answer.
+    publishState: (agentId, state) => {
+      if (!state.available) return;
+      publishState(agentId, {
+        goal: state.data,
+        available: true,
+        ...(state.error === undefined ? {} : { error: state.error }),
+        ...(state.code === undefined ? {} : { code: state.code }),
+      });
+    },
+    project: (_agentId, answer) => projectGoalAnswer(answer),
     onError: (message, error) => {
       if (lifetime.signal.aborted) return;
       // `console`, not `process.stderr`: this module runs inside the app's client
       // bundle, where there is no `process`.
       console.error(`[dsh-paseo] ${message}: ${error instanceof Error ? error.message : String(error)}`);
     },
-    setTimeout: (callback, delayMs) => {
-      const timer = setTimeout(callback, delayMs);
-      // Node keeps the process alive for a pending timer; a plugin must not be
-      // the reason it never exits.
-      (timer as unknown as { unref?: () => void }).unref?.();
-      return timer;
-    },
-    clearTimeout: (timer) => {
-      clearTimeout(timer as ReturnType<typeof setTimeout>);
-    },
-    random: () => Math.random(),
+    isTerminalErrorCode: isTerminalGoalErrorCode,
+    initialData: null,
+    // The goal pill's own copy for the diagnostics the controller emits: the
+    // fallback sentence a failed answer carries when the runtime sent none, and
+    // the noun its console lines name.
+    fallbackErrorMessage: "the DSH runtime could not read this agent's goal",
+    pillLabel: "goal pill",
+    // A transient failure keeps the last state: one flaky answer must not make an
+    // active goal look gone (DESIGN §2).
+    publishOnTransientError: false,
   });
 
   // An owned list subscription delivers the existing agents, then every update,
@@ -617,21 +658,18 @@ export function contributeGoalPill(client: PluginClientContext) {
     .then(({ subscription }) => {
       subscription.subscribe({
         snapshot: (page) => {
-          void poller.applySnapshot(page);
+          void subscriptions.applySnapshot(page);
         },
         update: (message) => {
           if (message.type !== "agent_update") return;
           const update = message.payload;
           if (update.kind === "upsert") {
-            poller.upsert(update.agent);
-            // The agent's status is **not** a "seen" signal: a turn starting
-            // after the completing one ended is usually just the user sending
-            // the next message, and a completed pill must stay until its panel
-            // is opened and closed. The event is an explicit no-op.
-            advanceSeen(update.agent.id, { kind: "agent", status: update.agent.status });
+            // Also the channel the "seen" key arrives on: `updateAgent` re-presents
+            // the pill when the metadata says something changed.
+            subscriptions.upsert(update.agent);
             return;
           }
-          poller.drop(update.agentId);
+          subscriptions.drop(update.agentId);
         },
       });
       return undefined;
@@ -649,7 +687,7 @@ export function contributeGoalPill(client: PluginClientContext) {
 
   return () => {
     lifetime.abort();
-    poller.dispose();
-    persistence.dispose();
+    subscriptions.dispose();
+    seen.dispose();
   };
 }

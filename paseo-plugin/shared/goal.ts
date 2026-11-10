@@ -22,7 +22,7 @@
  *
  * @module dsh-paseo/shared/goal
  */
-import { defineRpc } from "@getpaseo/plugin";
+import { defineRpc, defineSubscription } from "@getpaseo/plugin";
 import { z } from "zod";
 
 /**
@@ -210,51 +210,67 @@ export function goalCommandArguments(
 }
 
 /**
- * Read one agent's current goal.
+ * One agent's goal answer: the complete snapshot one subscription event carries.
  *
  * Keyed by Paseo's **agent** id, not the provider session id — a plugin reload
  * mints a new session id for the same agent, and the server half never guesses
  * one.
  *
- * **The wire shape is the `jobs.list` shape.** `goal.current` answers
- * `{available, goal, error?: {message, code?}}` — a nested error object with an
- * optional machine code — exactly like `shared/jobs.ts`'s
- * `{available, jobs, error?: {message, code?}}`. DESIGN §1.2 spells the same
- * fields with a top-level `error: string` plus a top-level `code`; the nested
- * form is what shipped because DESIGN *also* requires the failure grading to
- * follow jobs, and jobs' grading carries its code inside the error object. Both
- * halves import this one schema, so the shape cannot drift between them; the
- * difference is a wording deviation from the design, not a behaviour one, and
- * the Lead ruled the implementation authoritative (verification report B-3).
+ * **The wire shape is the jobs shape.** `{available, goal, error?: {message,
+ * code?}}` — a nested error object with an optional machine code — exactly like
+ * `shared/jobs.ts`'s `{available, jobs, error?: {message, code?}}`. DESIGN §1.2
+ * spells the same fields with a top-level `error: string` plus a top-level
+ * `code`; the nested form is what shipped because DESIGN *also* requires the
+ * failure grading to follow jobs, and jobs' grading carries its code inside the
+ * error object. Both halves import this one schema, so the shape cannot drift
+ * between them; the difference is a wording deviation from the design, not a
+ * behaviour one, and the Lead ruled the implementation authoritative
+ * (verification report B-3).
  *
- * The `available` contract, stated once (mirrors `jobs.list`):
+ * The `available` contract, stated once (mirrors the jobs answer):
  *
  * - **`true` with `goal: null`** means "we looked and this agent has no goal" —
  *   including an agent whose DSH session has not been opened yet, which is an
- *   accurate empty answer rather than a failed read. A cleared goal is `null`
- *   too, not an error.
+ *   accurate empty answer rather than a failed read A cleared goal is `null` too,
+ *   not an error.
  * - **`false`** means "we could not read it", and always carries a message plus
  *   (when the server half knows one) a code. The two are never collapsed: a
  *   broken read presented as "no goal" is exactly the silent degradation the
  *   goal pill exists to fix.
  *
- * When `available` is false, `error.code` tells the client whether another poll
- * can help. It is optional so an older server half keeps working: a missing code
- * is treated as transient, never as terminal.
+ * When `available` is false, `error.code` tells the client whether another
+ * attempt can help. It is optional so a server half that predates the codes
+ * keeps working: a missing code is treated as transient, never as terminal.
  */
-export const goalCurrent = defineRpc({
-  name: "goal.current",
+export const goalAnswerSchema = z.object({
+  available: z.boolean(),
+  goal: goalStateSchema.nullable(),
+  error: z
+    .object({
+      message: z.string(),
+      code: z.enum(GOAL_ERROR_CODES).optional(),
+    })
+    .optional(),
+});
+
+/** One agent's goal answer, as the server pushes it and the client stores it. */
+export type GoalAnswer = z.infer<typeof goalAnswerSchema>;
+
+/**
+ * Watch one agent's current goal.
+ *
+ * Replaced the `goal.current` RPC in the 0.16 port: the pill used to poll it
+ * every four seconds per agent. The subscription pushes the same answer type
+ * whenever it changes — including the `currentTask` line, which the server adds
+ * to the goal on every read — and the server shares one read between every
+ * client watching the same agent (`server/pill-feed`). A control action asks that
+ * feed to re-read immediately, which is what keeps the popover's phase correct
+ * right after a button press instead of one interval later.
+ */
+export const goalSnapshot = defineSubscription({
+  name: "goal.snapshot",
   input: z.object({ agentId: z.string().min(1) }),
-  output: z.object({
-    available: z.boolean(),
-    goal: goalStateSchema.nullable(),
-    error: z
-      .object({
-        message: z.string(),
-        code: z.enum(GOAL_ERROR_CODES).optional(),
-      })
-      .optional(),
-  }),
+  event: goalAnswerSchema,
 });
 
 /**

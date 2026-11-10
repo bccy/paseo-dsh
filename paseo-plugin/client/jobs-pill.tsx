@@ -6,14 +6,16 @@
  * pressable and the placement, this module owns the label, the visibility rule
  * and the popover body.
  *
- * **Why it polls.** DSH's job registry has an event stream, but it lives in the
- * `dsh` child process and the provider protocol has no request shape that would
- * carry those events to the app — inventing one is the self-invented protocol
- * this repo forbids. A plugin can define its own RPC, which is request/response,
- * so the pill asks on a timer. One timer per agent, not one for the composer:
- * the count has to be known before that composer is shown. The polling policy
- * itself (interval, jitter, backoff, terminal errors) lives in `./jobs-polling`
- * so it can be driven by a fake clock instead of reviewed by eye.
+ * **Where the data comes from (2026-11-11, Paseo 0.16).** DSH's job registry has
+ * an event stream, but it lives in the `dsh` child process and the provider
+ * protocol has no request shape that would carry those events to the app —
+ * inventing one is the self-invented protocol this repo forbids. The plugin's own
+ * `jobs.snapshot` subscription (`../shared/jobs`) is the supported channel: the
+ * server half reads the registry once per agent (`server/pill-feed`, shared by
+ * every client watching that agent) and pushes a complete snapshot only when it
+ * changes. This module therefore holds no timer; it owns the registration, the
+ * visibility rule and the popover body, and `./jobs-polling` owns the answer →
+ * pill mapping that used to sit behind the four-second poll.
  *
  * **A failed read does not become a pill.** An unreadable registry is not "no
  * jobs", but it is not a job either: the RPC answers `available: false`, the pill
@@ -32,10 +34,45 @@ import type {
   PluginClientContext,
 } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/ui";
-import { useEffect, useState } from "react";
-import { Platform, Pressable, Text, View, type PressableStateCallbackType } from "react-native";
-import { jobsList, splitJobs, type Job } from "../shared/jobs";
-import { createJobsPoller, jobsPillCopy, jobsPillPresentation, type JobsViewState, type PillIcon, type PillPresentation } from "./jobs-polling";
+import { Fragment, useEffect, useRef, useState } from "react";
+import {
+  ActivityIndicator,
+  Platform,
+  Pressable,
+  Text,
+  View,
+  type PressableStateCallbackType,
+} from "react-native";
+import { jobsSnapshot, jobsStop, splitJobs, type Job, type JobsAnswer } from "../shared/jobs";
+import { createAgentSubscriptions } from "./agent-subscriptions";
+import {
+  JOB_STOP_BOX,
+  JOB_STOP_GLYPH,
+  JOB_STOP_HIT_SLOP,
+  JOB_STOP_RADIUS,
+  JOB_STOP_TIMEOUT_MS,
+  createJobsProjection,
+  isTerminalJobsErrorCode,
+  jobRowTitle,
+  jobStopA11yLabel,
+  jobStopAnswer,
+  jobStopDroppedIds,
+  jobStopNoteOf,
+  jobStopPendingOf,
+  jobStopPushed,
+  jobStopRefusalNote,
+  jobStopStart,
+  jobStopTimedOut,
+  jobStoppable,
+  jobsPillCopy,
+  jobsPillPresentation,
+  jobsPillViewState,
+  type JobStopNote,
+  type JobStopStates,
+  type JobsViewState,
+  type PillIcon,
+  type PillPresentation,
+} from "./jobs-polling";
 import {
   CHEVRON_BOX,
   FACTS_FONT_SIZE,
@@ -155,22 +192,29 @@ function JobMark({ status, theme }: { status: JobStatus; theme: PopoverTheme }) 
  * every following row out of the popover. The facts line joins its parts with
  * the host's own `·`.
  *
- * **Read-only, no hover fill.** There is nothing to press (killing a job is the
- * model's `job_kill` tool), and the host's rule for that case is a
- * `ComposerTrackRow` with no `onPress`/`opensPage`, which renders
- * `renderRow(false)` and never mounts the pointer handlers. Density follows
- * `layout.compact` for the same reason: the host's row is taller under a finger.
+ * **The row itself stays read-only, with one trailing exception.** There is no
+ * row-level press (opening nothing), so the row keeps the host's
+ * "no `onPress`/`opensPage`" shape and no hover fill; the **stop button** in the
+ * trailing slot is the only pressable inside a job row (2026-11-11), and it owns
+ * its own hover/press state. Density follows `layout.compact` for the same reason
+ * as the host: its row is taller under a finger.
+ *
+ * The title is {@link jobRowTitle}, shared with the stop button's accessibility
+ * name so the row and its button can never name the job differently.
  */
 function JobRow({
   job,
   theme,
   text,
   compact,
+  stop,
 }: {
   job: Job;
   theme: PopoverTheme;
   text: JobsText;
   compact: boolean;
+  /** The trailing stop control, present only for a row the runtime can stop. */
+  stop?: { readonly pending: boolean; readonly onPress: () => void };
 }) {
   const statusWord = text.statuses[job.status] ?? job.status;
   const progress = job.progress ?? job.detail;
@@ -179,7 +223,7 @@ function JobRow({
   // one the row is unchanged, so a job whose call this session never saw (or a
   // non-bash producer) still reads correctly instead of showing an empty title.
   const titled = description !== undefined && description !== "";
-  const title = titled ? description : job.label;
+  const title = jobRowTitle(job);
   // The command is only worth repeating when it is not already the title.
   const facts = [statusWord, titled ? job.label : undefined, progress]
     .filter((part): part is string => part !== undefined && part !== "")
@@ -198,7 +242,86 @@ function JobRow({
           {facts}
         </Text>
       </View>
+      {stop === undefined ? null : (
+        <StopJobButton job={job} theme={theme} text={text} pending={stop.pending} onPress={stop.onPress} />
+      )}
     </View>
+  );
+}
+
+/**
+ * The stop button in a running row's trailing slot (design 2026-11-11).
+ *
+ * A **28×28 icon box** (`hitSlop` 8 per side → a 44×44 target) that becomes a
+ * small `ActivityIndicator` and disables itself while the request is in flight.
+ * The glyph is Lucide's `Square` — the host's own stop mark (`Square` is
+ * `STOP_ICON` in its workspace-scripts menu). Muted at rest, `statusDanger` while
+ * hovered or pressed (the plugin theme has no separate `destructive` token); no
+ * colour is written literally.
+ *
+ * It is mounted only when `canStop === true`: a row already stopping, or one
+ * whose runtime refuses, does not get a button that would do nothing.
+ */
+function StopJobButton({
+  job,
+  theme,
+  text,
+  pending,
+  onPress,
+}: {
+  job: Job;
+  theme: PopoverTheme;
+  text: JobsText;
+  pending: boolean;
+  onPress: () => void;
+}) {
+  // Hover and press are state, not a style callback: the **glyph** changes colour
+  // too, and a `style` callback cannot reach the child. `onHoverIn`/`onHoverOut`
+  // are what the goal popover's icon buttons use on the same host.
+  const [hot, setHot] = useState(false);
+  const [pressed, setPressed] = useState(false);
+  const box = {
+    width: JOB_STOP_BOX,
+    height: JOB_STOP_BOX,
+    borderRadius: JOB_STOP_RADIUS,
+    alignItems: "center",
+    justifyContent: "center",
+  } as const;
+  const touch = {
+    top: JOB_STOP_HIT_SLOP,
+    bottom: JOB_STOP_HIT_SLOP,
+    left: JOB_STOP_HIT_SLOP,
+    right: JOB_STOP_HIT_SLOP,
+  } as const;
+  const active = rowActiveFill(hot, pressed);
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={pending}
+      hitSlop={touch}
+      onHoverIn={() => setHot(true)}
+      onHoverOut={() => setHot(false)}
+      onPressIn={() => setPressed(true)}
+      onPressOut={() => setPressed(false)}
+      accessibilityRole="button"
+      accessibilityLabel={jobStopA11yLabel(text, jobRowTitle(job))}
+      accessibilityState={{ disabled: pending }}
+      style={[
+        box,
+        active === undefined ? undefined : { backgroundColor: theme.colors[active] },
+        pending ? { opacity: 0.6 } : undefined,
+      ]}
+    >
+      {pending ? (
+        <ActivityIndicator size="small" color={theme.colors.foregroundMuted} />
+      ) : (
+        <Icon
+          name="Square"
+          size={JOB_STOP_GLYPH}
+          color={hot || pressed ? theme.colors.statusDanger : theme.colors.foregroundMuted}
+        />
+      )}
+    </Pressable>
   );
 }
 
@@ -214,14 +337,29 @@ function NoteLine({
   children,
   theme,
   compact,
+  tone = "neutral",
+  numberOfLines,
 }: {
   children: string;
   theme: PopoverTheme;
   compact: boolean;
+  /**
+   * `error` is the runtime's own sentence for something it refused or could not
+   * do; `neutral` is a tip (see `jobStopRefusalNote`). The failure note above a
+   * list keeps `neutral`, which is what it has always been.
+   */
+  tone?: "neutral" | "error";
+  numberOfLines?: number;
 }) {
   return (
     <View style={rowBox({ compact })}>
-      <Text style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}>
+      <Text
+        numberOfLines={numberOfLines}
+        style={{
+          fontSize: FACTS_FONT_SIZE,
+          color: tone === "error" ? theme.colors.statusDanger : theme.colors.foregroundMuted,
+        }}
+      >
         {children}
       </Text>
     </View>
@@ -390,9 +528,46 @@ function SettledHeader({
  * rule "still runs the full width of the surface", and the root already cancels
  * the host's 12 on both sides.
  */
-function makeJobsPopover(store: JobStore, agentId: string) {
+function makeJobsPopover(client: PluginClientContext, store: JobStore, agentId: string) {
   function JobsPopover({ theme, layout }: PluginButtonContentProps) {
     const [entry, setEntry] = useState<AgentJobs | undefined>(store.get(agentId));
+    /**
+     * The stop state per job row, and the 5-second timers that watch it.
+     *
+     * All of it is the **popover's**, not the pill's: the button exists only while
+     * a panel is open, and a closed popover must not keep a timer alive. The
+     * rules themselves are pure (`./jobs-polling`'s `jobStop*`), so the offline
+     * check drives them without React.
+     */
+    const [stops, setStops] = useState<JobStopStates>({});
+    /**
+     * A ref mirror of `stops`.
+     *
+     * The RPC answer, the timer and the push listener all run outside the render
+     * that created them, so each must apply its transition to the **latest**
+     * state, not to the `stops` captured when the handler was created. Every
+     * writer goes through {@link applyStops}, which updates both.
+     */
+    const stopsRef = useRef<JobStopStates>({});
+    const stopTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+    const applyStops = (next: JobStopStates): void => {
+      if (next === stopsRef.current) return;
+      stopsRef.current = next;
+      setStops(next);
+    };
+    const clearStopTimer = (jobId: string): void => {
+      const timer = stopTimers.current.get(jobId);
+      if (timer === undefined) return;
+      clearTimeout(timer);
+      stopTimers.current.delete(jobId);
+    };
+    useEffect(
+      () => () => {
+        for (const timer of stopTimers.current.values()) clearTimeout(timer);
+        stopTimers.current.clear();
+      },
+      [],
+    );
     // `undefined` means "not chosen yet": the section follows the live count
     // until the user taps it, and a tap wins from then on. DSH's own list uses
     // exactly this shape (`settledOpen ?? liveRows.length === 0`), so a session
@@ -404,7 +579,19 @@ function makeJobsPopover(store: JobStore, agentId: string) {
       setEntry(current);
       if (current === undefined) return;
       const listener = () => {
-        setEntry(store.get(agentId));
+        const next = store.get(agentId);
+        setEntry(next);
+        // A push is the truth about these rows: a job that stopped being
+        // stoppable drops its button state, and a refusal note has been read
+        // (the design's "下次推送…清除"). A pending row keeps waiting.
+        if (next !== undefined) {
+          const before = stopsRef.current;
+          const after = jobStopPushed(before, next.jobs);
+          // A row whose state the push dropped must not keep its 5 s timer: a late
+          // timeout would re-enter a row the push already settled (review P3-5).
+          for (const jobId of jobStopDroppedIds(before, after)) clearStopTimer(jobId);
+          applyStops(after);
+        }
       };
       current.listeners.add(listener);
       return () => {
@@ -414,6 +601,51 @@ function makeJobsPopover(store: JobStore, agentId: string) {
 
     const text = localeText().jobs;
     const root = popoverRootBox();
+
+    /**
+     * Press stop on one row.
+     *
+     * Pending starts immediately; the answer only decides the **note**. A success
+     * changes nothing visible on purpose: the row must be updated by the
+     * subscription, never by this client (design 2026-11-11), so a job cannot
+     * look stopped in this window while the runtime still runs it. The 5-second
+     * timer is the one exception — if the push has not ended the running state by
+     * then, the row says the request was sent but the job is still running.
+     */
+    const stopJob = (job: Job): void => {
+      const started = jobStopStart(stopsRef.current, job);
+      // Not stoppable, or already pending: the design's "重复点击无效". Applying
+      // the same object would be a no-op anyway; returning keeps the RPC from
+      // being sent twice for one row.
+      if (started === stopsRef.current) return;
+      applyStops(started);
+      clearStopTimer(job.id);
+      stopTimers.current.set(
+        job.id,
+        setTimeout(() => {
+          stopTimers.current.delete(job.id);
+          const current = store.get(agentId)?.jobs ?? [];
+          const row = current.find((candidate) => candidate.id === job.id);
+          // A row that left the list is passed as "not stoppable", which drops
+          // its state instead of reporting a verdict about a job nobody shows.
+          applyStops(jobStopTimedOut(stopsRef.current, row ?? { id: job.id, canStop: false }, text));
+        }, JOB_STOP_TIMEOUT_MS),
+      );
+      void client
+        .rpc(jobsStop, { agentId, jobId: job.id })
+        .then((result) => {
+          applyStops(jobStopAnswer(stopsRef.current, job.id, result, text));
+          if (!jobStopPendingOf(stopsRef.current, job.id)) clearStopTimer(job.id);
+        })
+        .catch((error: unknown) => {
+          // A rejected request is a transport failure, not a refusal value from
+          // the runtime: it has no code, so the message goes through as the
+          // error-tone note (`jobStopRefusalNote`'s default branch).
+          const message = error instanceof Error ? error.message : String(error);
+          applyStops(jobStopAnswer(stopsRef.current, job.id, { ok: false, error: { message } }, text));
+          clearStopTimer(job.id);
+        });
+    };
 
     /**
      * The failed-read note, when there is one.
@@ -473,15 +705,31 @@ function makeJobsPopover(store: JobStore, agentId: string) {
         {/* Above the rows so the failure is readable without scrolling. */}
         {unavailableNote}
         {/* Live rows first in start order — the thing the user opened this for. */}
-        {live.map((job) => (
-          <JobRow
-            key={job.id}
-            job={job}
-            theme={theme}
-            text={text}
-            compact={layout.compact}
-          />
-        ))}
+        {live.map((job) => {
+          const note = jobStopNoteOf(stops, job.id);
+          return (
+            <Fragment key={job.id}>
+              <JobRow
+                job={job}
+                theme={theme}
+                text={text}
+                compact={layout.compact}
+                // Only a row the runtime can stop gets the control (design:
+                // `canStop === true`); a `stopping` row is already on its way.
+                stop={
+                  jobStoppable(job)
+                    ? { pending: jobStopPendingOf(stops, job.id), onPress: () => stopJob(job) }
+                    : undefined
+                }
+              />
+              {note === undefined ? null : (
+                <NoteLine theme={theme} compact={layout.compact} tone={note.tone} numberOfLines={1}>
+                  {note.message}
+                </NoteLine>
+              )}
+            </Fragment>
+          );
+        })}
         {divided ? <View style={separator} /> : null}
         {settled.length > 0 ? (
           <SettledHeader
@@ -521,22 +769,37 @@ const AGENT_DIRECTORY_PAGE_SIZE = 200;
  * Register one pill per agent of this provider and keep it current.
  *
  * Returns the contribution's cleanup, which Paseo calls when the plugin, the
- * client entrypoint or the host connection goes away: every timer, every pill
- * and the agent observation are released there. Polling itself is
- * `createJobsPoller`; this function owns the host objects the controller cannot
- * see — the React store the popover reads, the composer registration, and the
- * locale.
+ * client entrypoint or the host connection goes away: every subscription, every
+ * pill and the agent observation are released there. The per-agent lifecycle is
+ * `createAgentSubscriptions`; this function owns the host objects the controller
+ * cannot see — the React store the popover reads, the composer registration, the
+ * subscription call itself, and the locale.
  */
 export function contributeJobsPill(client: PluginClientContext) {
   const store: JobStore = new Map();
   /** agentId -> the composer registration and its last published state. */
   const pills = new Map<string, PillEntry>();
   const lifetime = new AbortController();
-  // Captured here and handed to the popover rather than read through a React
-  // context: a popover body is rendered by the host's own tree, and depending on
-  // where that sits would throw "useRpc must run inside a contributed plugin
-  // surface".
-  const rpc = (input: { agentId: string }) => client.rpc(jobsList, input);
+
+  /**
+   * One console line per transition, never per answer: a failing host must not
+   * flood the log at the old poll rate.
+   *
+   * `console`, not `process.stderr`: this module runs inside the app's client
+   * bundle, where there is no `process`. A recovery line carries no error, so the
+   * suffix is omitted rather than printing "undefined".
+   */
+  const onError = (message: string, error?: unknown): void => {
+    if (lifetime.signal.aborted) return;
+    const detail = error === undefined ? "" : `: ${error instanceof Error ? error.message : String(error)}`;
+    console.error(`[dsh-paseo] ${message}${detail}`);
+  };
+
+  /**
+   * The jobs half of the answer mapping: settlements latched, and the one
+   * console line per entry into the unreadable state (`./jobs-polling`).
+   */
+  const projection = createJobsProjection({ onError });
 
   /**
    * Turn one presentation into the host update.
@@ -599,8 +862,32 @@ export function contributeJobsPill(client: PluginClientContext) {
     applyPresentation(agentId, presentation);
   };
 
-  const poller = createJobsPoller<Job>({
-    readJobs: (agentId) => rpc({ agentId }),
+  const subscriptions = createAgentSubscriptions<readonly Job[], JobsAnswer>({
+    /**
+     * Watch this agent's snapshots.
+     *
+     * `client.subscribe` re-subscribes by itself after a reconnect and releases
+     * what is left when the plugin stops; aborting `signal` releases this one, so
+     * the controller deliberately keeps no handle. `onClosed` must not fire for
+     * this controller's own release, and the `signal.aborted` guard makes sure a
+     * late one is ignored.
+     */
+    open: (agentId, onAnswer, onEnd, signal) => {
+      const handle = client.subscribe(jobsSnapshot, { agentId }, onAnswer, {
+        signal,
+        onClosed: (closed) => {
+          if (signal.aborted) return;
+          onEnd(closed.error);
+        },
+      });
+      // A refused subscription rejects `ready` instead of closing: same path, so
+      // the pill degrades exactly like a failed read (and a permission refusal
+      // still removes it).
+      void handle.ready.catch((error: unknown) => {
+        if (signal.aborted) return;
+        onEnd(error instanceof Error ? error : new Error(String(error)));
+      });
+    },
     /**
      * The snapshot is only the directory's first page (the daemon defaults to
      * 200 entries); the controller walks `pageInfo.nextCursor` through this.
@@ -626,7 +913,7 @@ export function contributeJobsPill(client: PluginClientContext) {
           // Hidden until the first poll proves otherwise: a pill that appears and
           // then disappears is worse.
           visible: false,
-          behavior: { kind: "popover", Content: makeJobsPopover(store, agent.id) },
+          behavior: { kind: "popover", Content: makeJobsPopover(client, store, agent.id) },
         },
       });
       // The registration stays hidden until the first poll proves something to
@@ -640,6 +927,13 @@ export function contributeJobsPill(client: PluginClientContext) {
         title: text.title,
       });
       store.delete(agent.id);
+    },
+    updateAgent: () => {
+      // The jobs pill keeps nothing in the agent's metadata: its whole state is
+      // the pushed answer, so an agent update (status, title, metadata) has
+      // nothing to re-present. The callback exists because the controller hands
+      // every update to the pill that owns the agent; the goal and team pills
+      // read their "seen" key from it here.
     },
     removeAgent: (agentId, reason, error) => {
       const entry = pills.get(agentId);
@@ -663,26 +957,18 @@ export function contributeJobsPill(client: PluginClientContext) {
         );
       }
     },
-    publishState,
-    onError: (message, error) => {
-      if (lifetime.signal.aborted) return;
-      // `console`, not `process.stderr`: this module runs inside the app's client
-      // bundle, where there is no `process`. A recovery line carries no error, so
-      // the suffix is omitted rather than printing "undefined".
-      const detail = error === undefined ? "" : `: ${error instanceof Error ? error.message : String(error)}`;
-      console.error(`[dsh-paseo] ${message}${detail}`);
-    },
-    setTimeout: (callback, delayMs) => {
-      const timer = setTimeout(callback, delayMs);
-      // Node keeps the process alive for a pending timer; a plugin must not be
-      // the reason it never exits.
-      (timer as unknown as { unref?: () => void }).unref?.();
-      return timer;
-    },
-    clearTimeout: (timer) => {
-      clearTimeout(timer as ReturnType<typeof setTimeout>);
-    },
-    random: () => Math.random(),
+    // The controller carries the payload as `data`; `jobsPillViewState` names it
+    // `jobs` for this pill's store row.
+    publishState: (agentId, state) => publishState(agentId, jobsPillViewState(state)),
+    project: (agentId, answer) => projection.project(agentId, answer),
+    onError,
+    isTerminalErrorCode: isTerminalJobsErrorCode,
+    initialData: [],
+    // The jobs pill's own copy, unchanged from before the transport moved: the
+    // trigger, the popover and these log lines are the surface the user already
+    // knows, and a genericised sentence would be a silent copy change.
+    fallbackErrorMessage: "the DSH runtime could not list this session's jobs",
+    pillLabel: "jobs pill",
   });
 
   // An owned list subscription delivers the existing agents, then every update,
@@ -693,16 +979,16 @@ export function contributeJobsPill(client: PluginClientContext) {
     .then(({ subscription }) => {
       subscription.subscribe({
         snapshot: (page) => {
-          void poller.applySnapshot(page);
+          void subscriptions.applySnapshot(page);
         },
         update: (message) => {
           if (message.type !== "agent_update") return;
           const update = message.payload;
           if (update.kind === "upsert") {
-            poller.upsert(update.agent);
+            subscriptions.upsert(update.agent);
             return;
           }
-          poller.drop(update.agentId);
+          subscriptions.drop(update.agentId);
         },
       });
       return undefined;
@@ -721,6 +1007,6 @@ export function contributeJobsPill(client: PluginClientContext) {
 
   return () => {
     lifetime.abort();
-    poller.dispose();
+    subscriptions.dispose();
   };
 }

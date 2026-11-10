@@ -136,14 +136,38 @@ function bridgeUnknownKeyPrefix() {
 
 (async () => {
   console.log("contract");
-  check("the plugin registers team.read", handlers.has("team.read"));
+  check("the plugin serves the team subscription", handlers.has("team.snapshot"));
+  check("the polling RPC is gone", !handlers.has("team.read"));
   const pluginPrefix = /const UNKNOWN_PROJECTION_KEY_PREFIX = "([^"]+)";/.exec(
     fs.readFileSync(path.resolve(__dirname, "..", "..", "paseo-plugin", "server", "dsh-process.ts"), "utf8"),
   )?.[1];
   check("the plugin's unknown-key prefix is the bridge's verbatim", pluginPrefix !== undefined && pluginPrefix === bridgeUnknownKeyPrefix(), `${pluginPrefix} vs ${bridgeUnknownKeyPrefix()}`);
 
   const context = { paseo: {} };
-  const read = (agentId) => handlers.get("team.read")({ agentId }, context);
+  /**
+   * Drive the real subscription handler and return its first pushed snapshot
+   * (`server/pill-feed` starts a read and pushes the answer; aborting releases
+   * the subscription and its timer).
+   */
+  const read = (agentId) =>
+    new Promise((resolve, reject) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => {
+        reject(new Error("the team feed pushed no snapshot"));
+      }, 10_000);
+      handlers.get("team.snapshot")(
+        { agentId },
+        {
+          paseo: {},
+          signal: controller.signal,
+          push: (event) => {
+            clearTimeout(timer);
+            controller.abort();
+            resolve(event);
+          },
+        },
+      );
+    });
   const none = await read("agent-with-no-session");
   check("an agent with no session answers team: null, available", none.available === true && none.team === null, JSON.stringify(none));
 

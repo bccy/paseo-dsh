@@ -649,7 +649,7 @@ function containerProps(spies) {
 }
 
 function mountContainer(answer, goal = baseGoal) {
-  const spies = { close: 0, refresh: 0, rpc: [], closed: [] };
+  const spies = { close: 0, rpc: [], closed: [] };
   const store = new Map([["agent-1", { goal, available: true, listeners: new Set() }]]);
   const client = {
     rpc: async (_definition, input) => {
@@ -657,15 +657,10 @@ function mountContainer(answer, goal = baseGoal) {
       return answer;
     },
   };
-  const Popover = makeGoalPopover(
-    client,
-    store,
-    "agent-1",
-    async () => {
-      spies.refresh += 1;
-    },
-    (goal) => spies.closed.push(goal),
-  );
+  // No refresh callback: a successful control asks the **server's** goal feed to
+  // re-read (`index.server.ts`), so the panel learns the new phase from its own
+  // subscription instead of issuing a read here.
+  const Popover = makeGoalPopover(client, store, "agent-1", (goal) => spies.closed.push(goal));
   const container = document.createElement("div");
   document.body.appendChild(container);
   const root = createRoot(container);
@@ -754,7 +749,7 @@ async function containerChecks() {
     check("a save sends one edit", spies.rpc.length, 1);
     check("…with the new objective", spies.rpc[0]?.objective, `${baseGoal.objective}（已改）`);
     check("a successful save calls close() once", spies.close, 1);
-    check("…and still asks for a fresh read", spies.refresh, 1);
+    check("…and issues exactly the one control call", spies.rpc.length, 1);
   }
 
   {
@@ -839,12 +834,29 @@ async function separatePillChecks() {
   const agent = { id: "agent-1", workspaceId: "w", status: "idle" };
   /** The agent-directory subscription handlers, so a test can emit an `agent_update`. */
   let agentFeed;
+  /**
+   * The pill subscriptions, and the server's side of the 0.16 model: the pills no
+   * longer poll, so a scene change is delivered by **pushing** the answer the
+   * fake server would send. `answerFor` is that server's translation.
+   */
+  const subs = [];
+  const answerFor = (name) => {
+    if (name === "goal.snapshot") return { available: true, goal: scene.goal };
+    if (name === "jobs.snapshot") return scene.jobs;
+    return undefined;
+  };
+  const pushAll = async () => {
+    for (const sub of [...subs]) sub.onEvent(answerFor(sub.name));
+    await pause(0);
+  };
   const client = {
-    rpc: async (definition) => {
-      if (definition.name === "goal.current") return { available: true, goal: scene.goal };
-      if (definition.name === "jobs.list") return scene.jobs;
-      return { ok: true, message: "ok" };
+    subscribe: (contract, _input, onEvent) => {
+      subs.push({ name: contract.name, onEvent });
+      // The server's first snapshot for this subscription, then pushes on change.
+      void pause(0).then(() => onEvent(answerFor(contract.name)));
+      return { ready: Promise.resolve(), release: async () => {} };
     },
+    rpc: async () => ({ ok: true, message: "ok" }),
     addComposerPill: (contribution) => {
       const reg = { contribution, updates: [], removed: 0 };
       reg.update = (patch) => reg.updates.push(patch);
@@ -856,6 +868,8 @@ async function separatePillChecks() {
     },
     paseo: {
       agents: {
+        // The confirmed close stores its "seen" signature on the agent (0.16).
+        ref: () => ({ setMetadata: async () => {} }),
         list: async (options) =>
           options?.subscribe !== undefined
             ? {
@@ -872,7 +886,9 @@ async function separatePillChecks() {
   };
   const cleanups = [contributeJobsPill(client), contributeGoalPill(client)];
   try {
-    await until(() => regs.length >= 2 && regs.every((reg) => reg.updates.some((patch) => patch.visible === true)));
+    // Registrations are synchronous; both first snapshots arrive as pushes.
+    await pause(20);
+    await pushAll();
     const byId = (id) => regs.filter((reg) => reg.contribution.id === id);
     const merged = (reg) => {
       const out = { ...reg.contribution.button };
@@ -900,31 +916,37 @@ async function separatePillChecks() {
 
     // Three running: still 「后台」, no count anywhere on the trigger.
     scene.jobs = { available: true, jobs: [runningJob, { ...runningJob, id: "job-2" }, { ...runningJob, id: "job-3", status: "stopping" }] };
-    // The label does not change, so this answer sends no update to wait on;
-    // give the pollers several periods (40ms each here) to deliver it.
-    await pause(200);
+    // The label does not change, so this answer sends no update; pushing it is
+    // what the server would do, and the dedup must swallow it.
+    await pushAll();
     check("three live jobs: the jobs label is still 后台", merged(jobsReg).label, "后台");
     check("…no jobs patch ever carried a digit in its label", jobsReg.updates.some((patch) => typeof patch.label === "string" && /\d/.test(patch.label)), false);
 
     // The jobs finish: only the jobs pill hides; the goal pill is untouched.
     const goalUpdatesBefore = goalReg.updates.length;
     scene.jobs = { available: true, jobs: [{ ...runningJob, status: "completed" }] };
-    await until(() => merged(jobsReg).visible === false);
+    await pushAll();
     check("the jobs finishing hides the jobs pill", merged(jobsReg).visible, false);
     check("…and sends the goal pill nothing", goalReg.updates.length, goalUpdatesBefore);
     check("…which stays visible", merged(goalReg).visible, true);
 
-    // An unreadable registry: visible (the popover explains), static terminal glyph, still 「后台」.
+    // An unreadable registry carries no job statement, so it must not invent a
+    // pill: with no known live row it hides (2026-11-10, FIELD-NOTES #97 —
+    // visibility is about jobs, never about a read), and the static glyph is the
+    // hidden slot's baseline mark. **Corrected 2026-11-11**: this scenario
+    // predates that rule and still expected a visible error pill.
     scene.jobs = { available: false, jobs: [], error: "registry offline" };
-    await until(() => merged(jobsReg).visible === true);
-    check("an unreadable registry shows the jobs pill", merged(jobsReg).visible, true);
-    check("…with the static terminal glyph", merged(jobsReg).icon, "SquareTerminal");
+    await pushAll();
+    check("an unreadable registry with nothing live hides the jobs pill", merged(jobsReg).visible, false);
+    check("…with the static terminal glyph in the hidden slot", merged(jobsReg).icon, "SquareTerminal");
     check("…labelled 后台", merged(jobsReg).label, "后台");
 
-    // The goal clears while jobs run: only the goal pill hides.
-    scene.jobs = { available: true, jobs: [runningJob] };
+    // The goal clears while jobs run: only the goal pill hides. The live job is a
+    // **new id** on purpose — the settlement latch projects a settled id reported
+    // running back to its settled row, which is DSH's real shape (one id per job).
+    scene.jobs = { available: true, jobs: [{ ...runningJob, id: "job-4" }] };
     scene.goal = null;
-    await until(() => merged(goalReg).visible === false && merged(jobsReg).icon === JobsPillIcon);
+    await pushAll();
     check("the goal clearing hides the goal pill", merged(goalReg).visible, false);
     check("…while the jobs pill stays", merged(jobsReg).visible, true);
     check("…with the ringed icon back", merged(jobsReg).icon, JobsPillIcon);
@@ -959,7 +981,7 @@ async function separatePillChecks() {
 
     // A completed goal: shown once, and closing its own popover marks it seen.
     scene.goal = { ...baseGoal, phase: "complete", activation: "disarmed" };
-    await until(() => merged(goalReg).visible === true);
+    await pushAll();
     check("a completed goal shows the goal pill once more", merged(goalReg).visible, true);
     // The user sends the next message without opening the pill: the agent goes
     // idle → running. "A new turn started" is not "the user saw the completion";
@@ -1021,21 +1043,34 @@ async function independentPillChecks() {
   };
   const regs = [];
   const scene = { goal: baseGoal, goalError: null, team: board([openTask]), jobs: { available: true, jobs: [runningJob] } };
+  /** How many jobs answers the fake server pushed (the dedup assertion counts them). */
   let jobsReads = 0;
   const agent = { id: "agent-1", workspaceId: "w", status: "idle" };
+  /** The subscriptions, and the answer the fake server pushes for each contract. */
+  const subs = [];
+  const answerFor = (name) => {
+    if (name === "goal.snapshot") {
+      if (scene.goalError !== null) return scene.goalError;
+      return { available: true, goal: scene.goal };
+    }
+    if (name === "team.snapshot") return { available: true, team: scene.team };
+    if (name === "jobs.snapshot") {
+      jobsReads += 1;
+      return scene.jobs;
+    }
+    return undefined;
+  };
+  const pushAll = async () => {
+    for (const sub of [...subs]) sub.onEvent(answerFor(sub.name));
+    await pause(0);
+  };
   const client = {
-    rpc: async (definition) => {
-      if (definition.name === "goal.current") {
-        if (scene.goalError !== null) return scene.goalError;
-        return { available: true, goal: scene.goal };
-      }
-      if (definition.name === "team.read") return { available: true, team: scene.team };
-      if (definition.name === "jobs.list") {
-        jobsReads += 1;
-        return scene.jobs;
-      }
-      return { ok: true, message: "ok" };
+    subscribe: (contract, _input, onEvent) => {
+      subs.push({ name: contract.name, onEvent });
+      void pause(0).then(() => onEvent(answerFor(contract.name)));
+      return { ready: Promise.resolve(), release: async () => {} };
     },
+    rpc: async () => ({ ok: true, message: "ok" }),
     addComposerPill: (contribution) => {
       const reg = { contribution, updates: [], removed: 0 };
       reg.update = (patch) => reg.updates.push(patch);
@@ -1047,6 +1082,7 @@ async function independentPillChecks() {
     },
     paseo: {
       agents: {
+        ref: () => ({ setMetadata: async () => {} }),
         list: async (options) =>
           options?.subscribe !== undefined
             ? { subscription: { subscribe: (handler) => handler.snapshot({ entries: [{ agent }], pageInfo: { hasMore: false, nextCursor: null } }) } }
@@ -1064,20 +1100,9 @@ async function independentPillChecks() {
     return out;
   };
   try {
-    await until(() => {
-      const goalReg = one("dsh-goal");
-      const teamReg = one("dsh-team");
-      const jobsReg = one("dsh-jobs");
-      return (
-        goalReg !== undefined &&
-        teamReg !== undefined &&
-        jobsReg !== undefined &&
-        merged(goalReg).visible === true &&
-        merged(teamReg).visible === true &&
-        jobsReg.updates.length > 0 &&
-        merged(jobsReg).visible === true
-      );
-    });
+    // Registrations are synchronous; the answers arrive as the server's pushes.
+    await pause(20);
+    await pushAll();
     const goalReg = one("dsh-goal");
     const teamReg = one("dsh-team");
     const jobsReg = one("dsh-jobs");
@@ -1095,42 +1120,50 @@ async function independentPillChecks() {
     // deference cleanup once dropped): an empty board makes the team pill hide
     // on its own rule, and the other two pills are untouched.
     scene.team = board([]);
-    await until(() => merged(teamReg).visible === false);
+    await pushAll();
     check("an empty team board hides the team pill (own rule)", merged(teamReg).visible, false);
     check("…the jobs pill stays visible on its own live rule", merged(jobsReg).visible, true);
     check("…and the goal pill is unaffected", merged(goalReg).visible, true);
     // Restore the board; the team pill follows its own rule back to visible.
     scene.team = board([openTask]);
-    await until(() => merged(teamReg).visible === true);
+    await pushAll();
 
     // The jobs answer is the only thing that changes its visibility: a settled
     // registry hides it even while the goal and team pills stay visible.
     scene.jobs = { available: true, jobs: [{ ...runningJob, status: "completed" }] };
-    await until(() => merged(jobsReg).visible === false);
+    await pushAll();
     check("a settled registry hides the jobs pill (own rule, other pills visible)", merged(jobsReg).visible, false);
     check("…while the goal pill stays visible", merged(goalReg).visible, true);
     check("…and the team pill stays visible", merged(teamReg).visible, true);
 
     // An unreadable registry is visible on the jobs rule, other pills present or not.
     scene.jobs = { available: false, jobs: [], error: "registry offline" };
-    await until(() => merged(jobsReg).visible === true && merged(jobsReg).icon === "SquareTerminal");
-    check("an unreadable registry shows the jobs pill beside both other pills", merged(jobsReg).visible, true);
-    check("…with the static terminal glyph", merged(jobsReg).icon, "SquareTerminal");
+    await pushAll();
+    // Same correction as the two-pill scene: an unreadable registry with no known
+    // live row hides the jobs pill while both other pills keep their own rule.
+    check("an unreadable registry hides the jobs pill beside both other pills", merged(jobsReg).visible, false);
+    check("…with the static terminal glyph in the hidden slot", merged(jobsReg).icon, "SquareTerminal");
 
     // Dedup survives without a coordinator: an unchanged jobs answer does not
     // repaint the registration on the next polls.
-    scene.jobs = { available: true, jobs: [runningJob] };
-    await until(() => merged(jobsReg).icon === JobsPillIcon && merged(jobsReg).visible === true);
+    // A new id again: `job-1` completed earlier in this scene, so it cannot come
+    // back as running (the pill's settlement latch, 2026-11-10).
+    scene.jobs = { available: true, jobs: [{ ...runningJob, id: "job-4" }] };
+    await pushAll();
     const updatesBeforeDedup = jobsReg.updates.length;
     const readsBeforeDedup = jobsReads;
-    await until(() => jobsReads > readsBeforeDedup + 1);
+    // Two more pushes of an unchanged answer: the count grows, the registration
+    // must not.
+    await pushAll();
+    await pushAll();
+    assert("the fake server delivered the unchanged answers", jobsReads > readsBeforeDedup + 1, `${String(jobsReads)} vs ${String(readsBeforeDedup)}`);
     check("an unchanged jobs answer does not repaint (dedup without a coordinator)",
       jobsReg.updates.length, updatesBeforeDedup);
 
     // Each pill's own state machine still drives its removal: a terminal goal
     // error removes the goal pill alone; the other two are untouched.
     scene.goalError = { available: false, goal: null, error: { message: "bridge too old", code: "bridge_too_old" } };
-    await until(() => goalReg.removed === 1);
+    await pushAll();
     check("a terminal goal error removes the goal pill", goalReg.removed, 1);
     check("…the team pill stays visible", merged(teamReg).visible, true);
     check("…and the jobs pill stays visible on its own rule", merged(jobsReg).visible, true);
