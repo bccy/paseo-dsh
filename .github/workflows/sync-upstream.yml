@@ -94,7 +94,6 @@ jobs:
             node harness/open-degrade-check.mjs
             node harness/session-state-check.cjs
             node harness/harness-gates-check.mjs
-            node harness/local-patches-check.mjs
             # jobs 状态机自带 tsconfig（@getpaseo/plugin 的 paths 映射），先单独
             # 编译到 .dbg-poll，再把检查脚本放进去跑（它 require 相对路径的产物）。
             ( cd paseo-plugin && npx tsc -p ../harness/jobs-poll.tsconfig.json )
@@ -161,7 +160,6 @@ jobs:
                 "node harness/open-degrade-check.mjs" \
                 "node harness/session-state-check.cjs" \
                 "node harness/harness-gates-check.mjs" \
-                "node harness/local-patches-check.mjs" \
                 "( cd paseo-plugin && npx tsc -p ../harness/jobs-poll.tsconfig.json )" \
                 "echo '{\"type\":\"commonjs\"}' > paseo-plugin/.dbg-poll/package.json" \
                 "cp harness/jobs-poll-check.cjs paseo-plugin/.dbg-poll/" \

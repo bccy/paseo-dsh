@@ -26,7 +26,7 @@ DSH 侧是一个 profile bundle。
 | 权限模式（沙箱） | ❌ 无统一开关 | ✅ composer 里的 **Permissions** 下拉，切换 DSH 的沙箱 + 审批预设 |
 | 人设预设（Preset） | ❌ | ✅ profile 挂了 agent-preset registry 时，composer 出现 **Preset** 下拉（建会话时选、首回合后锁定） |
 | 会话恢复 / 导入 | ❌ 无历史、无法导入 | ✅ 重开按 Paseo 的 `history: replay` 回放历史；**导入** DSH 原生会话（`session.list`，从 `~/.dsh/sessions` 列举） |
-| 后台任务（jobs） | — | ✅ composer 的 pill 显示 DSH 后台任务（终端图标，运行中右下角叠转环）：只在有运行中/停止中的任务时显示，文字只写「后台」（数量在面板里），全部结束即隐藏；多个 pill 同屏时可左右滑动浏览（需 Paseo ≥0.15.3；更老宿主第三颗 pill 可能被裁切，已知限制），目标 / 团队 / 后台各按自身规则独立显示；点开看每个任务的明细 |
+| 后台任务（jobs） | — | ✅ composer 的 pill 显示 DSH 后台任务（终端图标，运行中右下角叠转环）：只在有运行中/停止中的任务时显示，文字只写「后台」（数量在面板里），全部结束即隐藏；多个 pill 同屏时可左右滑动浏览（宿主的 pill 轨道 0.15.3 起可横向滚动），目标 / 团队 / 后台各按自身规则独立显示；点开看每个任务的明细 |
 | 目标（goal）pill | — | ✅ composer 的 pill 显示 DSH 目标，文字与手机面板标题恒为「目标」，状态由图标表达（运行中右下角叠转环、完成绿色对勾），面板首行说出完整状态；点开看目标（带 DeepSeek 标志，点文本即可在小号输入框里编辑）、「第 N 轮 · 预算 M」、「正在：<当前任务>」与受阻原因，按钮暂停 / 继续 / 清除（清除二次确认）；目标完成后 pill 再显示一次（只读，只能清除，只有点开并关闭面板后才隐藏；不点开时发送新消息不会隐藏）；重开会话后自动续跑会停，pill 直接给出恢复入口 |
 | 团队（Agent Team）pill | — | ✅ 有共享团队任务的会话，composer 多一颗「团队」pill（有队员在跑时人形图标右下角叠转环、团队记录出错时红色）；任务全部完成后只再显示一次，只有点开并关闭面板后才隐藏（不点开时发送新消息不会隐藏）；点开是只读面板：成员（队长、运行中 / 空闲 / 准备中 / 创建失败）和按状态分组的共享任务（进行中 / 可开始 / 等待依赖，已完成折叠），点任务看全文；`team_task_*` 工具结果画成字段卡，失败原因在中文环境翻成中文并保留原文 |
 | 目标 / 工作流时间线 | — | ✅ `goal/change` 与 `tool-workflow/*` 事件按工具行渲染；目标自动续跑的每个轮次也各占一行（「目标续跑 · 第 N 轮」）；目标变化行叫「目标状态」，排在引起它的 `/goal` 命令之后；goal 工具结果画成字段卡，被拒调用给中文短句；后台工作流跨回合仍显示运行中 |
@@ -51,7 +51,7 @@ DSH 侧是一个 profile bundle。
 先完整读一遍 docs/ADOPTION.md 再动手。不要凭猜测改任何文件。
 
 ■ 第一步：检查前提
-确认 dsh、paseo、node 都在 PATH 上，paseo 版本 >= 0.9.2，dsh 版本 >= 0.2.1。
+确认 dsh、paseo、node 都在 PATH 上，paseo 版本 >= 0.16，dsh 版本 >= 0.2.1。
 缺任何一样就停下来告诉我，不要替我安装它们。
 
 ■ 第二步：确定用哪个模型
@@ -302,34 +302,24 @@ paseo-dsh/
 DSH 目前没有 per-session shell env 扩展点，这是已知限制（记在 FIELD-NOTES #76 与
 FULL-AUDIT 的「待用户决定」），不是静默修复。
 
-## 不装 local-patches 时的行为
+## 重开会话后的回合折叠（已知问题）
 
-`local-patches/` 里的宿主补丁**不是发布产物**：它改写已安装的 `@getpaseo/server` 的
-`dist`（上游没有对应扩展点），`npm publish` 出去的包里没有。装不装都不影响插件本体。
+仓库**不再提供宿主补丁**：原来 `local-patches/` 只做一件事——重放时补回丢失的 `turnId`，让
+重开的长会话回合折叠正确。它改写**已安装的** `@getpaseo/server` 的 `dist`（上游没有对应扩展
+点），从来不是发布产物（`npm publish` 出去的包里没有它），而且上游到 0.16.0-beta.1 仍未修
+（`agent-manager.js:3461,3516`），所以这个缺陷以"已知问题"的形式留着，**等上游修**。
 
-**从 Paseo 0.15.0 起，撤回后的时间线刷新是宿主原生行为**（上游 PR #8368 修掉 #4667：撤回时
-关掉 provider 会话、带 persistence 重开并按 DSH 持久化会话重放），不再需要本地补丁；
-`local-patches/` 现在只剩 **turnId** 一个 target（重开会话后的回合折叠）。所以：
+| 能力 | 现在的行为（无补丁） |
+|---|---|
+| **撤回**（对话 + 文件） | 撤回**已经生效**：对话、智能体改过的文件、模型上下文都回退了；时间线由宿主**立刻刷新**（Paseo 0.15.0 起，上游 PR #8368 修掉 #4667：撤回时关掉 provider 会话、带 persistence 重开并按 DSH 持久化会话重放），无需 Reload。canary「撤回已生效」仍在回执前发出，0.15+ 的 replay 会把它连同旧 history 清掉（看不到是预期；判据是消息行是否消失）。被编辑工具跟踪过的文件还会在每条人类消息边界重扫磁盘，bash/外部进程对它们的改动会保留在后续撤回的 pre-image 中 |
+| **重开会话后的回合折叠** | **部分失效**：系统触发的回合会并入上一回合、插话回合被拆开（`turnId` 在重放时丢失）。等上游 [#8053](https://github.com/getpaseo/paseo/issues/8053) / PR [#8054](https://github.com/getpaseo/paseo/pull/8054)，0.16.0-beta.1 仍未修 |
+| **子代理第二次派发时的「运行中」** | 卡片停在上一回合的终态。上游 [#8080](https://github.com/getpaseo/paseo/pull/8080) 已修复，Paseo 0.15.0 起生效 |
 
-| 能力 | 装了补丁（turnId） | 不装补丁 |
-|---|---|---|
-| **撤回**（对话 + 文件） | 同右——0.15 起刷新由宿主完成，与补丁无关 | 撤回**已经生效**：对话、智能体改过的文件、模型上下文都回退了；0.15 起界面**立刻刷新**，无需 Reload。canary「撤回已生效」仍在回执前发出，0.15 的 replay 会把它连同旧 history 清掉（看不到是预期；判据是消息行是否消失）。被编辑工具跟踪过的文件还会在每条人类消息边界重扫磁盘，bash/外部进程对它们的改动会保留在后续撤回的 pre-image 中 |
-| **重开会话后的回合折叠** | 折叠正确 | 部分失效：系统触发的回合会并入上一回合、插话回合被拆开（`turnId` 在重放时丢失）。等上游 [#8053](https://github.com/getpaseo/paseo/issues/8053) / PR [#8054](https://github.com/getpaseo/paseo/pull/8054) |
-| **子代理第二次派发时的「运行中」** | 同右（该补丁已退役，现在没有任何补丁覆盖它） | 卡片停在上一回合的终态。上游 [#8080](https://github.com/getpaseo/paseo/pull/8080) 已修复，Paseo 0.15.0 起生效 |
-
-> **回滚到 Paseo 0.14.0** 时撤回刷新会退化：撤回仍生效，但时间线不自动刷新，靠 canary 提示
-> Reload/重开——可接受，不再往 0.14 重打 rewind 补丁。
->
 > 有两件事与补丁无关：记忆插件此前采集过的内容可能仍被召回（模型"记得"）；撤回本身不可撤销。
 >
-> canary 的可见性：live 投递一律看不到；0.14（无补丁）随重建后的时间线重放可见；0.15 的
-> replay 会清掉它（预期）。依据是 0.15.0 的 `plugin-provider.js` 源码（`ensureReplay` /
-> `replayBinding` 先 `clearBinding()`），**0.15 真机撤回未复验**；复验前不要删改 canary。
-
-为什么补丁不默认安装：它改的是 **Paseo 自己的 dist**，而 macOS 桌面版自带的是签名 CLI，
-打不了补丁；命令行的全局安装也会被每次 `npm i -g @getpaseo/cli` 整树覆盖，所以得靠
-`ExecStartPre` 每次启动重打。它只作为给维护者的**可选加速项**存在，装法与升级处置见
-[local-patches/README.md](local-patches/README.md)。
+> canary 的可见性：live 投递一律看不到；Paseo 0.15.0+ 的 replay 会清掉它（预期）。依据是
+> 0.15.0 的 `plugin-provider.js` 源码（`ensureReplay` / `replayBinding` 先 `clearBinding()`），
+> **真机撤回未复验**；复验前不要删改 canary。
 
 ## 自测 / 本地验证（不需要 Paseo）
 
@@ -372,7 +362,7 @@ rm -rf ../.dbg
 
 ## 环境要求
 
-- Paseo ≥ 0.9.2（需要 direct provider 插件 API）
+- Paseo ≥ 0.16（0.16 把 composer 选项改成 `controls` / `providerOptions`，本插件已迁到新契约，不再支持 0.15）
 - **DSH ≥ 0.2.1**（随 0.2.x 线）：桥直接 import 八个 DSH 内部包
   （`@deepseek-ai/dsh-cmdline` / `dsh-brand` / `dsh-llm` / `dsh-attachment` / `dsh-agent` /
   `dsh-tools` / `dsh-subprocess` / `schemastery`），并且 0.2.1 改过 prompt 变量注册与 catalog
@@ -513,8 +503,8 @@ condensed/tight 密度会把所有 feature 收进一个 Settings2 面板
 时用户反馈与菜单/行里的名字重复；现在宽布局工具栏只显示这个词（开关名仍在行的 `label` 上，
 hover tooltip 与 condensed/tight 面板行会显示），手机端设置行也不再出现重复名字。下拉的选项值
 是 `on`/`off`（Paseo 持久化/回传的也是它）；**桥协议仍是 boolean**，插件在边界上转换，旧 agent
-里持久化的 boolean 同样兼容。（行号取自本地 Paseo checkout 的 `packages/app` 0.15.0；官方桌面端
-0.15.2 的客户端代码据任务背景与之相同，未逐行复核。）
+里持久化的 boolean 同样兼容。（行号取自本地 Paseo checkout 的 `packages/app` 0.15.0；0.16 的客户端
+代码未逐行复核，形状以协议类型为准。）
 
 **范围是刻意收窄的**：只显示第三方插件（模块名不以 `@deepseek-ai/` 开头、且是真正的包名——
 `cordis:` 这类运行时 specifier 与相对路径都不算）、且整个 volatile 配置**恰好一个 boolean

@@ -196,11 +196,11 @@ persistence。依据：0.15.0 的 `plugin-provider.js` `ensureReplay()` / `repla
 `clearBinding()` 清空旧 history，再 `reopen(persistence, config)` 重放）与
 `agent-manager.rewind()` 的 `hydrateTimelineFromProvider({force:true})`。
 
-**本地 rewind 补丁已退休**：它依赖的 `this.history` 数组在 0.15 被 `PluginSessionHistory`
-取代（PR #7675），注入的 `truncateHistoryFrom()` 会变成运行期 no-op，所以脚本在 0.15 上主动
-fail closed，rewind target 已从脚本删除（`plugin-provider.js` 不再被触碰）。回滚到 0.14 时
-时间线刷新退化为「不刷新，靠 canary 提示 Reload/重开」——可接受的降级，见
-`local-patches/UPGRADE.md` §7。
+**本地补丁不再提供**：rewind 补丁早先已退休（它依赖的 `this.history` 数组在 0.15 被
+`PluginSessionHistory` 取代，PR #7675，注入的 `truncateHistoryFrom()` 成了运行期 no-op）；
+剩下的 turnId target 也随 `local-patches/` 一起删除，因为上游到 0.16.0-beta.1 仍未修
+（`agent-manager.js:3461,3516`），维护成本高于它修的那一个缺陷。现在只有宿主原生的刷新，
+仓库里没有任何改写已安装 dist 的脚本。
 
 **canary 自证**：插件在**自己进程里**看不出对面是哪种宿主（没有"会刷新 history"这个能力位），
 所以撤回成功时先发一条 info「撤回已生效」（HH:MM:SS · #seq + 一句"若此提示一直停留…执行
@@ -262,7 +262,8 @@ conversation 撤回重建时间线时不会像旧 notice 那样被重新带出�
 **插件进程怎么拿到 `paseo` 句柄**：provider 连接的 `connect()` 拿不到它（只有 launch 配置、
 协议版本与能力位），句柄只出现在 hook / RPC 回调的 `PluginHandlerContext` 里。所以
 `index.server.ts` 从 `agent.created` / `agent.turn_started` / `agent.turn_ended` /
-`agent.permission_*` / `agent.archived` 这些 **`on` hook** 以及 `jobs.list` RPC 里捕获它
+`agent.permission_*` / `agent.archived` 这些 **`on` hook** 以及 `jobs.snapshot` / `goal.snapshot` /
+`team.snapshot` 三个订阅回调（`server/pill-feed.ts` 的 `capture(context)`）里捕获它
 （**绝不注册 `before("agent.session.open")`**，那会让宿主在插件起停时 invalidate 所有 agent 会话）。
 daemon 重启后、第一次 hook 之前就可能发生撤回，所以客户端 bundle 加载时会调一次
 `rewind.notice.arm` RPC 把句柄送进服务端；真拿不到句柄时报告会排队，等下一次捕获后补发
@@ -296,21 +297,6 @@ agent（有上限），加上任何挂载过报告行的 agent（后者保证同
 「会话里还没有任何本插件行、且该 agent 不在最近活跃集合」的第一次撤回可能没有胶囊——行本身
 照常显示。
 
-**本地补丁现在只剩 turnId 一个 target**（脚本名
-`~/.paseo/local-patches/apply-rewind-history-truncation.mjs` 保留，因为 systemd
-`ExecStartPre` 与启动钩子指向它）：
-
-- **目标**：daemon 实际加载的 `@getpaseo/server/dist/server/server/agent/agent-manager.js`
-  （不是仓库 checkout——那里没有构建产物，打上去看着成功却什么也没改）。两条历史重放路径
-  （`forceHydrate…` / `primeTimeline…`）把 `event.turnId` 传给 `recordTimeline`；0.15.0 仍未修，
-  丢了这个 id，重开会话后长对话不折叠轮次（不丢数据）。
-- **判定靠结构锚点，不靠 md5**：干净文件里 `const row = this.recordTimeline(agent.id, event.item,
-  event.timestamp ? …)` 这行**恰好命中 2 次**，且后随上下文必须分别是
-  `if (broadcastTimeline) {` / `if (deferredBroadcast) {`（顺序固定）。锚点/上下文失配、半打
-  （marker 既不是 0 也不是 2）都 fail closed、文件不动；存量旧体（marker 2/2 但内容旧）可原地
-  重建，重建前先做内存语法校验。
-- **幂等 + `ExecStartPre`/启动钩子**：每次 daemon 启动前重打，`npm i -g @getpaseo/cli` 整树替换
-  dist 后会自动补回。check / apply 的退出码表见 `local-patches/UPGRADE.md` §2。
 - **不再有 reload 旁路，也不再有停放会话池**：一次撤回是同步的（桥完成 + 落盘后回执），0.15 的
   close/reopen 由宿主在 `revert()` 内完成，插件侧不需要 `paseo agent reload`、不需要 50ms 延迟、
   不需要按 DSH 原生 session id 接管旧进程。共享子进程仍只有一个（`provider.ts` 的进程池，
@@ -405,9 +391,6 @@ node harness/rewind-merge-check.mjs  # 父子归并：子/孙编辑落根会话 
 node harness/revert-shape-probe.mjs  # 真实 DSH Session：旧写法必抛、新写法通过、marker 不进上下文
 node harness/replay-fidelity-probe.mjs <session.v4.jsonl.zstd>  # 真实日志重放保真
 
-# 本地补丁（只剩 turnId）：纯离线 fixture，覆盖打上/幂等/三态 fail-closed/stale 重建/变异见证
-node harness/local-patches-check.mjs
-
 # 端到端（真 dsh --profile paseo，3 个真实模型回合；会消耗少量 token）
 node harness/rewind-e2e.mjs
 # 断言：成功回执、文件删除、history 折叠成 1 条用户消息、无 command/run、
@@ -421,19 +404,16 @@ cd paseo-plugin/.dbg && node subagent-check.cjs
 
 真机验收（新会话，能力位只对新会话生效）：发两条消息 → 撤回第二条 → 消息行消失、无
 `/rewind` 行/回合页脚、文件回到消息前、模型不知道被撤内容；重开会话后仍正确。
-canary 的可见性按上一节分三层验：**live 一律看不到**；**Paseo 0.15.0+** 的 replay 清空旧
-history，canary 看不到是预期（看消息行是否消失，不要拿提示当刷新判据）；**Paseo 0.14（无补丁）**
-它必须随重建后的时间线出现并说明怎么刷新，执行 Reload agent 后被撤消息与提示一起消失。
-升级到 0.15 后按前一种验收；只有回滚到 0.14 才需要后一种。
+canary 的可见性按上一节验：**live 一律看不到**；**Paseo 0.15.0+** 的 replay 清空旧 history，
+canary 看不到是预期（看消息行是否消失，不要拿提示当刷新判据）。
 父会话派子代理改的文件同样随 `both` 撤回回退（归并到根会话，见 FIELD-NOTES 第 59/60/61/62 条）；
 撤回覆盖派发回合时该子代理被中断，锚更早的子代理继续运行且重开后保持 running；
 `interrupt` 的 fire-and-return 边界见上文「已知限制」。
 
 ## 回滚
 
-- 宿主补丁：`local-patches/` 现在只剩 turnId（rewind 已退休）。回滚到 Paseo 0.14.0 时撤回
-  仍然生效，但时间线刷新退化为「不刷新，靠 canary 提示 Reload/重开」——可接受，不再往 0.14
-  上重打 rewind；turnId 补丁在 0.14 上照样能打。操作见 `local-patches/UPGRADE.md` §7。
+- 宿主：**没有补丁可回滚**（`local-patches/` 已删除，本插件从 0.16 起只支持 0.16+ 宿主）。
+  回滚插件代码时也不用管宿主 dist——它从未被改过。
 - 代码：`git revert` 撤回相关提交（或切回 `main` 重载插件）。
 - 运行时：`git checkout main` → 重新生成内嵌桥（`node paseo-plugin/scripts/generate-bridge-assets.mjs`）
   → `paseo plugin reload dsh-paseo`。

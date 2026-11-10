@@ -41,11 +41,9 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon fork 出的 p
   经 provider 连接与插件 API 和 daemon 交互（`paseo` 句柄只在 hook / RPC handler 的回调上下文
   里拿得到，`connect()` 里没有）。所以**看不到 daemon 内存**，任何"宿主到底做了什么"的断言
   只能在宿主自己的代码上做（`docs/REWIND.md` 的宿主行为断言都标了宿主版本与 file:line）。
-- **唯一的例外是 `local-patches/`**：它改写**已安装的** `@getpaseo/server` dist，因为上游
-  没有对应的扩展点（重放时补 `turnId`；撤回的 history 刷新已由 Paseo 0.15.0 原生修好）。它**不是发布产物**——`npm
-  publish` 出去的包里没有它，装不装都不影响插件本体；不装时各项行为如何降级见 README 与
-  [docs/REWIND.md](./docs/REWIND.md)。它是给维护者的可选加速项，macOS 桌面版自带签名 CLI
-  根本打不了补丁。
+- **没有例外**：仓库里没有任何改写**已安装**宿主 `dist` 的脚本（原 `local-patches/` 已删除）。
+  宿主侧缺陷只能按"已知问题 + 等上游修"处理，写法见 README「重开会话后的回合折叠」与
+  [docs/REWIND.md](./docs/REWIND.md)。
 - `paseo-plugin/server/*.ts` 是 Paseo 那一侧的契约实现；`dsh-bridge/lib/*.js` 是
   运行时的桥接。**中间那层协议是这个仓库自己定的**，改它要同时改两边。
 - 桥的 profile 是 `dsh-base` + `dsh-paseo-bridge`（见 `server/bootstrap.ts`）。`@deepseek-ai/dsh-web-app`
@@ -64,7 +62,7 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon fork 出的 p
   避免重新发明这些 bug。
 - [docs/GOAL.md](./docs/GOAL.md) — 目标（goal）在 Paseo 中怎么工作：数据源、pill 的状态与
   按钮、运行中发消息的语义（steer 不打断、停止会暂停）、重开会话后的 disarm 与恢复、
-  运行中手打 `/goal` 会被当文本的限制。改 goal 相关代码前先看。
+  运行中手打 `/goal` 能正常触发命令（真机确认，旧文档的说法是误推断）。改 goal 相关代码前先看。
 - [docs/ADOPTION.md](./docs/ADOPTION.md) 第 4 节 — 教训按主题归纳。
 - [docs/FULL-AUDIT-20261020.md](./docs/FULL-AUDIT-20261020.md) — 2026-10-20 全量审查：
   8 个 P1 的成因与修法、有意偏差清单、未修项与待用户决定项。改动前先看有没有踩在同一处。
@@ -84,7 +82,7 @@ Paseo  ⇄  paseo-plugin/（direct provider 插件，跑在 daemon fork 出的 p
 | **取消是取消回合，不是杀进程** | 杀进程会连会话一起报废 |
 | **不要硬编码某个人的 provider/model** | 这个仓库是给别人用的。路由从 profile 读，读不到就带说明失败 |
 | **能复用的代码或逻辑，不要自己写** | 上游已经有的实现（DSH 的 `session.append` 表面替换、compaction 折叠、`dsh-rewind` 的 git 快照；Paseo 适配器已经验证过的形状）比我们现编的可靠，也免得下次上游一改就跟不上。复用前先核目标版本的 API 与语义（版本范围满足≠可运行），复用时把边界写进注释；确实没有可复用的，再自己写并在 `docs/` 留痕。 |
-| **替换已在跑的实现，要能删掉一整块代码** | 上一条管"新写的东西先找上游"；已经在跑的自有实现，只有上游提供了**稳定的等价能力**（公开 API 或宿主原生行为，例如上游 0.15.0 修掉 #4667（PR #8368）、宿主自己刷新撤回后的时间线之后，`local-patches` 的撤回补丁已经删掉；turnId 补丁仍保留，因为 0.15 没修）、换完能**删掉一整块代码**时才换，并在同一个提交里删旧实现。把自己的代码换成对 DSH **内部服务**的调用不算减负：依赖从"自己能控制的代码"挪到"上游没有稳定承诺的内部 API"，升级时会静默失效，而且 `dsh-api-contract-check` 只看 import、看不见服务调用。不做成批的"总体迁移"；修 bug 就单独修，不要借迁移的名义一起做。教训：2026-10-31 的迁移分支运行时代码只净减 55 行，换来 13 个没有检查兜底的内部符号和一次 CI 变红，DSH alpha 已经改掉其中两处语义。 |
+| **替换已在跑的实现，要能删掉一整块代码** | 上一条管"新写的东西先找上游"；已经在跑的自有实现，只有上游提供了**稳定的等价能力**（公开 API 或宿主原生行为，例如上游 0.15.0 修掉 #4667（PR #8368）、宿主自己刷新撤回后的时间线之后，`local-patches` 的撤回补丁已经删掉；剩下的 turnId 补丁也在 0.16 适配里连同目录一起删除，缺陷转为已知问题等上游修）、换完能**删掉一整块代码**时才换，并在同一个提交里删旧实现。把自己的代码换成对 DSH **内部服务**的调用不算减负：依赖从"自己能控制的代码"挪到"上游没有稳定承诺的内部 API"，升级时会静默失效，而且 `dsh-api-contract-check` 只看 import、看不见服务调用。不做成批的"总体迁移"；修 bug 就单独修，不要借迁移的名义一起做。教训：2026-10-31 的迁移分支运行时代码只净减 55 行，换来 13 个没有检查兜底的内部符号和一次 CI 变红，DSH alpha 已经改掉其中两处语义。 |
 | **不要注册 `before("agent.session_open")`** | 宿主对带这个 hook 的插件，每次起停都会 `invalidatePluginSessions()`，于是**所有 agent（任何 provider）下一次提问前都会被 reload**。想拿 `paseo` 句柄就用 `on("agent.turn_started")` / `on("agent.turn_ended")` 或一条 RPC 在回调上下文里取 |
 | **改了 `dsh-bridge/` 必须重生成内嵌桥** | `paseo-plugin/server/bridge-assets.ts` 是桥的 base64 内嵌副本，供插件自举 profile（Paseo 安装插件不跑脚本）。跑 `node paseo-plugin/scripts/generate-bridge-assets.mjs`（`npm publish` 的 `prepack` 也会跑），并提交生成结果 |
 
@@ -252,7 +250,6 @@ node harness/rewind-transaction-check.mjs      # 撤回事务；动了 settleDel
 node harness/rewind-merge-check.mjs    # 父子归并；动了 child-anchors 的 recordDelegatedTurn 或 observeDelegatedTurn/snapshotAnchorFor 必跑
 node harness/revert-shape-probe.mjs    # 纯内存离线（用本机已装 @deepseek-ai/dsh-session，DSH_SESSION_MODULE 可覆盖路径）：旧写法必抛、新写法通过
 node harness/replay-fidelity-probe.mjs <session.v4.jsonl.zstd>  # 真实日志重放保真
-node harness/local-patches-check.mjs   # 补丁脚本门禁：turnId 锚点/上下文/stale 重建与 fail-closed，checker 与 apply --check 同源判定（纯离线 fixture）
 node harness/rewind-e2e.mjs            # 真 dsh --profile paseo，3 回合端到端（耗 token）
 node harness/rewind-merge-e2e.mjs      # 真机父子归并：父写+子代理写 → both 撤回 → 两文件都删（耗 token）
 node harness/rewind-native-check.mjs   # 经真实 daemon 的撤回（耗 token；见下）

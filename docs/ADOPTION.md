@@ -285,33 +285,32 @@ if (provider === undefined || model === undefined) {
 同理，"按 provider 名字猜要不要动态加载适配器"也应该变成显式配置（一个
 `provider -> adapter 模块` 的映射），而不是 `if (provider !== 'some-name')`。
 
-### 4.6 教训六：宿主侧缺口不能靠"默认有人打了补丁"掩盖（不装 local-patches 时的行为）
+### 4.6 教训六：宿主侧缺口不能靠"默认有人打了补丁"掩盖
 
-有些缺陷不在你的代码里，而在宿主（Paseo）里。本仓库有 `local-patches/` 去补它，但那**不是
-发布产物**：它改写**已安装的** `@getpaseo/server` 的 `dist`，`npm publish` 出去的包里没有，
-装不装都不影响插件本体。所以"装了补丁的行为"和"没装补丁的行为"必须都是**可解释**的，而且
-没装时必须**看得见**——否则就是本书反复讲的那类静默降级。
+有些缺陷不在你的代码里，而在宿主（Paseo）里。本仓库曾经有一个 `local-patches/` 去补其中
+一个（重放时补回丢失的 `turnId`），但它**不是发布产物**：它改写**已安装的** `@getpaseo/server`
+的 `dist`，`npm publish` 出去的包里没有，装不装都不影响插件本体。**这个补丁已经删除，不再
+维护**（上游到 0.16.0-beta.1 仍未修，`agent-manager.js:3461,3516`）。所以现在只剩"没补丁"
+一种行为，而它必须**可解释、看得见**——否则就是本书反复讲的那类静默降级。
 
-| 能力 | 装了补丁（turnId） | 不装补丁 |
-|---|---|---|
-| **撤回**（对话 + 文件） | 同右——Paseo 0.15.0 起撤回后的时间线刷新是宿主原生行为（上游 PR #8368 修掉 #4667），不再需要本地补丁 | 撤回**已经生效**：对话、智能体改过的文件都回退了，模型在上下文里的记忆也回退了（下一次请求看不到被撤内容，见下方关于记忆插件的说明）；0.15 起界面**立刻刷新**，不需要 Reload。canary 仍在回执前发出，0.15 的 replay 会把它连同旧 history 清掉（看不到是预期） |
-| **重开会话后的回合折叠** | 折叠正确 | 部分失效：系统触发的回合会并入上一回合、插话回合被拆开（`turnId` 在重放时丢失）。等上游 [#8053](https://github.com/getpaseo/paseo/issues/8053) / PR [#8054](https://github.com/getpaseo/paseo/pull/8054) |
-| **子代理第二次派发时的「运行中」** | 同右（该补丁已退役，现在没有任何补丁覆盖它） | 卡片停在上一回合的终态。上游 [#8080](https://github.com/getpaseo/paseo/pull/8080) 已修复，Paseo 0.15.0 起生效 |
+| 能力 | 现在的行为（无补丁） |
+|---|---|
+| **撤回**（对话 + 文件） | 撤回**已经生效**：对话、智能体改过的文件都回退了，模型在上下文里的记忆也回退了（下一次请求看不到被撤内容，见下方关于记忆插件的说明）；时间线由宿主**立刻刷新**（Paseo 0.15.0 起上游 PR #8368 修掉 #4667，不再需要本地补丁），不需要 Reload。canary 仍在回执前发出，0.15+ 的 replay 会把它连同旧 history 清掉（看不到是预期） |
+| **重开会话后的回合折叠** | **部分失效**：系统触发的回合会并入上一回合、插话回合被拆开（`turnId` 在重放时丢失）。等上游 [#8053](https://github.com/getpaseo/paseo/issues/8053) / PR [#8054](https://github.com/getpaseo/paseo/pull/8054)，0.16.0-beta.1 仍未修 |
+| **子代理第二次派发时的「运行中」** | 卡片停在上一回合的终态。上游 [#8080](https://github.com/getpaseo/paseo/pull/8080) 已修复，Paseo 0.15.0 起生效 |
 
 关键在于第一行那个「撤回已生效」提示**同时是自证机制**：它必须在 `request.completed` **之前**
-发出，因为宿主的时间线只能追加、协议里没有"删行"事件。它的可见性分三层：live 投递在宿主 rewind
-的 run lock 内被 `stagedEvents` 丢弃，看不到；Paseo 0.14（无补丁）把它留在 provider history 里，
-随重建后的时间线重放出来，告诉用户执行 Reload/重开；Paseo 0.15.0+ 在 `revert()` 内先
+发出，因为宿主的时间线只能追加、协议里没有"删行"事件。它的可见性分两层：live 投递在宿主
+rewind 的 run lock 内被 `stagedEvents` 丢弃，看不到；Paseo 0.15.0+ 在 `revert()` 内先
 `clearBinding()` 清空旧 history 再按持久化会话重放，回执前的 canary 随旧 history 一起消失
 （预期行为）。**顺序就是机制本身**——放到回执之后，0.15 上它也会留下来，变成「时间线没刷新」
 的误报。顺序由 `harness/revert-check.mjs` 的源码位置门守着；断言宿主行为的
-`harness/host-contract-sim.mjs` 已随 0.14 截断补丁一起删除，**0.15 真机撤回未复验**，复验前
+`harness/host-contract-sim.mjs` 已随 0.14 截断补丁一起删除，**真机撤回未复验**，复验前
 别删改 canary。
 
-为什么补丁不默认装：它改的是 Paseo 自己的 dist，macOS 桌面版自带签名 CLI 打不了补丁；命令行
+为什么当初不默认装：它改的是 Paseo 自己的 dist，macOS 桌面版自带签名 CLI 打不了补丁；命令行
 全局安装又会被每次 `npm i -g @getpaseo/cli` 整树覆盖，只能靠 `ExecStartPre` 每次启动重打。
-它只作为给维护者的**可选加速项**存在，装法与升级处置见
-[local-patches/README.md](../local-patches/README.md)。
+维护成本高于它修的那一个缺陷，所以删掉、等上游。
 
 ---
 
@@ -429,6 +428,5 @@ dsh-bridge/           ← 应交付：bridge bundle（你的运行时那一侧�
 paseo-plugin/         ← 应交付：Paseo provider 插件
 tools/probe-provider.mjs  ← 应交付：能力探测（帮别人填 C）
 harness/              ← 可选：验证脚本，展示第 5 节的方法
-local-patches/        ← 不交付：改写已安装的宿主 dist，只给维护者（见 4.6）
 docs/FIELD-NOTES.md   ← 不交付：作者本机的具体缺陷记录（历史，只读）
 ```

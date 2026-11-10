@@ -6,7 +6,7 @@
 > 上游的修法与草稿里「Suggested fix」两行改法完全一致（`acceptChildEvent` 不再丢弃
 > `started`、并把它映射成 `running`）。在含它的 Paseo 发版之前，二次派发的子代理仍然不会
 > 显示 running——那段时间接受这个降级，本仓库对应的 `childRunning` 宿主补丁已退役
-> （见 [local-patches/README.md](../local-patches/README.md)）。
+> （随 `local-patches/` 整目录删除，本仓不再提供任何宿主补丁）。
 >
 > 下面保留原文，作为该缺陷的现象、根因与复现步骤的记录。
 

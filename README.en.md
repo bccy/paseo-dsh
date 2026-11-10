@@ -28,7 +28,7 @@ step left is [your model route](#install-one-line), described below.
 | Permission modes (sandbox) | ❌ no shared switch | ✅ **Permissions** dropdown in the composer switches DSH's sandbox and approval presets |
 | Agent presets | ❌ | ✅ when the profile mounts the agent-preset registry, a **Preset** dropdown appears (chosen at session creation, locked after the first turn) |
 | Session resume / import | ❌ no history, no import | ✅ reopening replays history through Paseo's `history: replay`; **import** native DSH sessions (`session.list`, read from `~/.dsh/sessions`) |
-| Background jobs | — | ✅ a composer pill shows DSH background jobs (a terminal icon with a running ring on its corner) only while some are running/stopping: it is labelled just "Background" (the count is in the panel) and hides once every job has finished; multiple pills on one row can be scrolled horizontally (needs Paseo ≥0.15.3; on older hosts a third pill may be clipped — known limitation), and the goal, team and jobs pills each show on their own rule; expandable to each job |
+| Background jobs | — | ✅ a composer pill shows DSH background jobs (a terminal icon with a running ring on its corner) only while some are running/stopping: it is labelled just "Background" (the count is in the panel) and hides once every job has finished; multiple pills on one row can be scrolled horizontally (the host's pill track scrolls from 0.15.3 on), and the goal, team and jobs pills each show on their own rule; expandable to each job |
 | Goal pill | — | ✅ a composer pill shows the DSH goal; its label and the phone sheet title are always "Goal" — the icon carries the state (a running ring on its corner while it runs, a green check once it is complete) and the panel's first row speaks it in full; the popover has the objective (with the DeepSeek mark; tap the text to edit it in a small composer-style field), "Round N · budget M", "Now: <current task>" and the blocked reason, with pause / resume / clear (clear asks for confirmation); a completed goal is shown once more (read-only, clear only, hidden only after you open and close its panel; sending a new message without opening it does not hide it); auto-continue stops after a reopen and the pill offers the resume entry point |
 | Team (Agent Team) pill | — | ✅ sessions with shared team tasks get a "Team" composer pill (a people icon with a running ring on its corner while a teammate runs, red on a team record failure); an all-done board is shown once more and hidden only after you open and close its panel (sending a new message without opening it does not hide it); it opens a read-only panel: the members (lead, running / idle / starting / failed to start) and the shared tasks grouped by state (in progress / ready / waiting, done folded), tap a task for its full text; `team_task_*` results render as field cards, and refusals are translated in Chinese with DSH's words kept |
 | Goal / workflow timeline | — | ✅ `goal/change` and `tool-workflow/*` events render as tool rows; each automatic goal round gets its own compact row ("Goal round · N"); goal changes show as a "Goal status" row right after the `/goal` command that caused them; goal tool results render as field cards and refused calls get a short explanation; a background workflow keeps its running state across turns |
@@ -58,7 +58,7 @@ Read docs/ADOPTION.md completely before changing anything. Do not edit files by
 guesswork.
 
 ■ Step 1: check prerequisites
-Confirm that dsh, paseo and node are on PATH, that paseo is >= 0.9.2 and that
+Confirm that dsh, paseo and node are on PATH, that paseo is >= 0.16 and that
 dsh is >= 0.2.1. If anything is missing, stop and tell me; do not install it for
 me.
 
@@ -341,45 +341,30 @@ through bash tools from a later session (heartbeat, schedule, agent send) see th
 today, so this is a documented limit (FIELD-NOTES #76 and the "pending user
 decision" section of the audit), not a silent fix.
 
-## Behaviour without local-patches
+## Turn folding after reopening a session (known issue)
 
-The host patch in `local-patches/` is **not a release artifact**: it rewrites
-the `dist` of the installed `@getpaseo/server` (upstream has no extension point
-for this), and the package published by `npm publish` does not contain it.
-Installing it or not does not affect the plugin itself.
+This repository **no longer ships a host patch**: the old `local-patches/` did one
+thing — put the lost `turnId` back on replay, so a reopened long session folds its
+turns correctly. It rewrote the `dist` of the **installed** `@getpaseo/server`
+(upstream has no extension point for this), was never a release artifact (the
+package published by `npm publish` does not contain it), and upstream has still
+not fixed it in 0.16.0-beta.1 (`agent-manager.js:3461,3516`). So the defect stays
+on record as a **known issue, waiting on upstream**.
 
-**Since Paseo 0.15.0 the timeline refresh after a rewind is host-native** (upstream
-PR #8368 fixes #4667: `revert()` closes the provider session, reopens it with the
-negotiated persistence handle and replays the persisted DSH session), so no local
-patch is needed for rewind. `local-patches/` now carries a single target,
-**turnId** (turn folding after reopening a session):
+| Capability | Current behaviour (no patch) |
+|---|---|
+| **Rewind** (conversation + files) | the rewind **has already taken effect**: the conversation, the files the agent changed and the model's memory of them in context are all rolled back; the timeline is refreshed **immediately** by the host (since Paseo 0.15.0 — upstream PR #8368 fixes #4667: `revert()` closes the provider session, reopens it with the negotiated persistence handle and replays the persisted DSH session), no Reload needed. The "rewind applied" canary is still emitted before the receipt; the 0.15+ replay clears it together with the old history (not seeing it is expected — judge by whether the message rows disappear). Files tracked by the editing tools are also re-scanned at every human message boundary, so bash/external-process changes to them are kept in the pre-image of a later rewind |
+| **Turn folding after reopening a session** | **partly broken**: system-triggered turns merge into the previous turn, and steered turns get split apart (the `turnId` is lost on replay). Waiting on upstream [#8053](https://github.com/getpaseo/paseo/issues/8053) / PR [#8054](https://github.com/getpaseo/paseo/pull/8054); 0.16.0-beta.1 still has it |
+| **"Running" on a second subagent dispatch** | the card stays on the previous turn's terminal state. Upstream [#8080](https://github.com/getpaseo/paseo/pull/8080) is fixed and effective from Paseo 0.15.0 |
 
-| Capability | With the patch (turnId) | Without the patch |
-|---|---|---|
-| **Rewind** (conversation + files) | same as the right column — since 0.15 the refresh is the host's job, not the patch's | the rewind **has already taken effect**: the conversation, the files the agent changed and the model's memory of them in context are all rolled back; since 0.15 the UI refreshes **immediately**, no Reload needed. The "rewind applied" canary is still emitted before the receipt; the 0.15 replay clears it together with the old history (not seeing it is expected — judge by whether the message rows disappear). Files tracked by the editing tools are also re-scanned at every human message boundary, so bash/external-process changes to them are kept in the pre-image of a later rewind |
-| **Turn folding after reopening a session** | folding is correct | partly broken: system-triggered turns merge into the previous turn, and steered turns get split apart (the `turnId` is lost on replay). Waiting on upstream [#8053](https://github.com/getpaseo/paseo/issues/8053) / PR [#8054](https://github.com/getpaseo/paseo/pull/8054) |
-| **"Running" on a second subagent dispatch** | same as the right column (that patch is retired; no patch covers this now) | the card stays on the previous turn's terminal state. Upstream [#8080](https://github.com/getpaseo/paseo/pull/8080) is fixed and effective from Paseo 0.15.0 |
-
-> **Rolling back to Paseo 0.14.0** degrades the rewind refresh: the rewind still
-> works, but the timeline no longer refreshes itself — the canary tells the user
-> to Reload/reopen. That is accepted; the rewind patch is not reapplied on 0.14.
->
 > Two things are unrelated to the patch: content a memory plugin has already
 > collected may still be recalled (the model "remembers"); and a rewind itself
 > cannot be undone.
 >
-> Canary visibility: never live; on 0.14 (no patch) it is replayed from the rebuilt
-> timeline and visible; the 0.15 replay clears it (expected). The evidence is the
-> 0.15.0 `plugin-provider.js` source (`ensureReplay` / `replayBinding` call
-> `clearBinding()` first); a real-daemon rewind on 0.15 is **not yet verified**,
-> so do not remove or change the canary before that check.
-
-Why the patch is not installed by default: it modifies **Paseo's own dist**, and
-the macOS desktop app ships a signed CLI that cannot be patched; a global CLI
-install is also overwritten wholesale by every `npm i -g @getpaseo/cli`, so it
-takes an `ExecStartPre` to reapply it on each start. It exists only as an
-**optional accelerator** for maintainers; how to install it and how to handle
-upgrades is in [local-patches/README.md](local-patches/README.md).
+> Canary visibility: never live; the Paseo 0.15.0+ replay clears it (expected).
+> The evidence is the 0.15.0 `plugin-provider.js` source (`ensureReplay` /
+> `replayBinding` call `clearBinding()` first); a real-daemon rewind is **not yet
+> verified**, so do not remove or change the canary before that check.
 
 ## Self-test / local verification (no Paseo needed)
 
@@ -427,7 +412,7 @@ a false diagnosis).
 
 ## Requirements
 
-- Paseo ≥ 0.9.2 (needs the direct-provider plugin API)
+- Paseo ≥ 0.16 (0.16 moved composer options to `controls` / `providerOptions`; this plugin runs on that contract and no longer supports 0.15)
 - **DSH ≥ 0.2.1** (on the 0.2.x line): the bridge imports eight DSH internal
   packages directly (`@deepseek-ai/dsh-cmdline` / `dsh-brand` / `dsh-llm` /
   `dsh-attachment` / `dsh-agent` / `dsh-tools` / `dsh-subprocess` /
