@@ -247,6 +247,9 @@ export interface ToolCardsText {
     rule: string;
     targets: string;
     timeout: string;
+    /** `job_output`'s own knobs — DSH's `wait` / `timeout_ms` args in words. */
+    wait: string;
+    timeoutMs: string;
   };
   /** `send_message` receipts: the team shape, its old shape, and the subagent-control shape. */
   sent: string;
@@ -1101,6 +1104,8 @@ const TEXT: Record<Locale, UiText> = {
         rule: "Schedule",
         targets: "Targets",
         timeout: "Timeout",
+        wait: "Wait",
+        timeoutMs: "Timeout (ms)",
       },
       sent: "Sent",
       sentWithStatus: (status) => `Sent · ${status}`,
@@ -1565,6 +1570,8 @@ const TEXT: Record<Locale, UiText> = {
         rule: "调度规则",
         targets: "目标会话",
         timeout: "超时",
+        wait: "等待",
+        timeoutMs: "超时（毫秒）",
       },
       sent: "已发送",
       sentWithStatus: (status) => `已发送 · ${status}`,

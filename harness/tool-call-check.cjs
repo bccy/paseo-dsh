@@ -1041,11 +1041,12 @@ console.log("high-frequency tools get their own cards (L2)");
     { job_id: "bash-3eeee62adb424e3b", timeout_ms: 420000, wait: true },
     "=== 1. 阿里云内网源（杭州同区）===\naliyun-mirror: 0 B/s  size=0\n[status: completed, exit code: 0]",
   );
-  equal("job_output: the head is the job id", jobOut.summary, "bash-3eeee62adb424e3b");
-  // F1/F8: the call's own knobs stay visible — they explain the log below.
+  equal("job_output: the head is the job id without a task title", jobOut.summary, "bash-3eeee62adb424e3b");
+  // F1/F8: the call's own knobs stay visible — they explain the log below, and
+  // the keys are words a reader can parse, not DSH's wire names.
   equal("…the wait knobs are kept as facts", jobOut.fields.args, [
-    { kind: "fact", label: "wait", value: "true" },
-    { kind: "fact", label: "timeout_ms", value: "420000" },
+    { kind: "fact", label: "等待", value: "true" },
+    { kind: "fact", label: "超时（毫秒）", value: "420000" },
   ]);
   equal("…the status line is the receipt", jobOut.fields.receipt, "已完成 · 退出码 0");
   equal("…the log stays the body, status line stripped", jobOut.body, "=== 1. 阿里云内网源（杭州同区）===\naliyun-mirror: 0 B/s  size=0");
@@ -1056,9 +1057,118 @@ console.log("high-frequency tools get their own cards (L2)");
   );
   equal("job_output: a running job reads 运行中", row("job_output", { job_id: "bash-5" }, "(no new output)\n[status: running]").fields.receipt, "运行中");
   equal("job_output: an unknown detail stays verbatim", row("job_output", { job_id: "bash-6" }, "log\n[status: failed, max-tokens]").fields.receipt, "失败 · max-tokens");
+  // The status line is a receipt, not a precondition for the card: a log that
+  // simply stops (a corrupt ring, an older tool shape) still draws it, and the
+  // head is the job id — never DSH's `job_id: ` wire key in the reader's face.
   const oddJob = row("job_output", { job_id: "bash-7" }, "no status line");
-  equal("job_output: a log without the status line keeps L1", oddJob.summary, "job_id: bash-7");
+  equal("job_output: a log without the status line keeps the card", oddJob.summary, "bash-7");
+  check("…and never the wire key", !oddJob.summary.startsWith("job_id: "));
+  // Nothing to mount: no title, no knobs, no receipt — the head is the id and
+  // the log is the body, so an empty card would be the same row twice.
+  equal("…with no card to mount", oddJob.fields, null);
   equal("…and the whole log as body", oddJob.body, "no status line");
+
+  // B: the background job's own one-line description is the row's title, and
+  // the id moves into the card (the bridge resolves it from DSH's registry).
+  const titledJob = row(
+    "job_output",
+    { job_id: "bash-9", timeout_ms: 420000, wait: true },
+    "log\n[status: running]",
+    { metadata: { jobTitle: "查看构建是否已开跑" } },
+  );
+  equal("job_output: the task's own words title the head", titledJob.summary, "查看构建是否已开跑");
+  equal("…the job id moves into the card first", titledJob.fields.args[0], { kind: "fact", label: "编号", value: "bash-9" });
+  equal("…then the knobs in words", titledJob.fields.args.slice(1), [
+    { kind: "fact", label: "等待", value: "true" },
+    { kind: "fact", label: "超时（毫秒）", value: "420000" },
+  ]);
+  // P2-1: a failed read is the most common shape after a plugin reload — the
+  // job the row names no longer exists — and it used to fall to the generic card,
+  // which printed DSH's wire keys (`job_id: bash-7`). A failure still gets the
+  // Chinese labels, but never a success receipt.
+  const failedJob = toolCallData(
+    {
+      name: "job_output",
+      status: "failed",
+      detail: { type: "unknown", input: { job_id: "bash-12", wait: true }, output: "Error: job bash-12 not found" },
+      error: { message: "Error: job bash-12 not found" },
+    },
+    "complete",
+  );
+  equal("job_output: a failed read keeps the bare id as its head", failedJob.summary, "bash-12");
+  check("…never the wire key", !failedJob.summary.startsWith("job_id: "));
+  equal("…its knobs still read in Chinese", failedJob.fields.args, [{ kind: "fact", label: "等待", value: "true" }]);
+  equal("…no success receipt is invented", failedJob.fields.receipt, "");
+  equal("…and the DSH error text stays the body", failedJob.body, "Error: job bash-12 not found");
+  const failedTitled = toolCallData(
+    {
+      name: "job_output",
+      status: "failed",
+      detail: { type: "unknown", input: { job_id: "bash-13" }, output: "Error: job bash-13 not found" },
+      error: { message: "Error: job bash-13 not found" },
+      metadata: { jobTitle: "查看构建是否已开跑" },
+    },
+    "complete",
+  );
+  equal("job_output: a failed read still uses the task title", failedTitled.summary, "查看构建是否已开跑");
+  equal("…with the id in the card", failedTitled.fields.args[0], { kind: "fact", label: "编号", value: "bash-13" });
+
+  // P1: a `job_output` row exists **before** any result arrives (the call is
+  // blocking for up to 600 s), and a canceled row never gets one at all. Those
+  // shapes used to return null and fall to L1, which printed `job_id: bash-20`
+  // while the real title was already sitting in metadata.
+  const runningJob = toolCallData(
+    {
+      name: "job_output",
+      status: "running",
+      detail: { type: "unknown", input: { job_id: "bash-20", wait: true, timeout_ms: 30000 } },
+      metadata: { jobTitle: "查看构建是否已开跑" },
+    },
+    "complete",
+  );
+  equal("job_output: a running row already shows the task title", runningJob.summary, "查看构建是否已开跑");
+  check("…never the wire key", !runningJob.summary.startsWith("job_id: "));
+  equal("…with the id and the knobs in Chinese", runningJob.fields?.args, [
+    { kind: "fact", label: "编号", value: "bash-20" },
+    { kind: "fact", label: "等待", value: "true" },
+    { kind: "fact", label: "超时（毫秒）", value: "30000" },
+  ]);
+  equal("…and no receipt before there is a status", runningJob.fields?.receipt, "");
+  const canceledJob = toolCallData(
+    { name: "job_output", status: "canceled", detail: { type: "unknown", input: { job_id: "bash-21" } }, metadata: { jobTitle: "查看构建是否已开跑" } },
+    "complete",
+  );
+  equal("job_output: a canceled row keeps the title", canceledJob.summary, "查看构建是否已开跑");
+  equal("…with the bare id in the card", canceledJob.fields?.args, [{ kind: "fact", label: "编号", value: "bash-21" }]);
+  const emptyFailed = toolCallData(
+    {
+      name: "job_output",
+      status: "failed",
+      detail: { type: "unknown", input: { job_id: "bash-22" }, output: "" },
+      error: { message: "job bash-22 not found" },
+    },
+    "complete",
+  );
+  equal("job_output: a failed row with an empty output keeps the bare id", emptyFailed.summary, "bash-22");
+  equal("…and shows DSH's error, not an empty body", emptyFailed.body, "job bash-22 not found");
+  // Nothing besides the head and the error to draw — the empty-card rule still
+  // applies, and the row keeps the Chinese head and DSH's error text.
+  equal("…mounted as no empty card", emptyFailed.fields, null);
+  const nullOutput = toolCallData(
+    { name: "job_output", status: "completed", detail: { type: "unknown", input: { job_id: "bash-23" }, output: null } },
+    "complete",
+  );
+  equal("job_output: a null output keeps the bare id", nullOutput.summary, "bash-23");
+  check("…never the wire key", !nullOutput.summary.startsWith("job_id: "));
+
+  const titledNoStatus = row(
+    "job_output",
+    { job_id: "bash-10" },
+    "still building",
+    { metadata: { jobTitle: "查看构建是否已开跑" } },
+  );
+  equal("job_output: a title also survives a missing status line", titledNoStatus.summary, "查看构建是否已开跑");
+  equal("…with the log intact", titledNoStatus.body, "still building");
   const kill = row("job_kill", { job_id: "bash-5", reason: "与当前问题无关，已不需要" }, "requested cancellation of job bash-5");
   equal("job_kill: the head is the job id", kill.summary, "bash-5");
   equal("…the one-line output becomes a receipt", kill.fields.receipt, "已请求取消");

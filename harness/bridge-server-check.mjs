@@ -1272,6 +1272,383 @@ const present = () => ({
   );
 }
 
+
+console.log("bridge server: a job_output row takes its own background task's title\n");
+{
+  const { server, handlers, frames } = makeServer();
+  const execute = (name, callId, command, description) =>
+    server.rememberToolDescription({
+      name,
+      agent: { session: { id: 's1' } },
+      callId,
+      arguments: { command, description },
+    });
+  const register = (jobId, callId) =>
+    handlers.get('session/event')(
+      { id: 's1' },
+      { type: 'job/registered', data: { jobId, kind: 'bash', label: 'npm run build', toolCall: { callId } } },
+    );
+
+  // P2-3: the join is by call id, never by the command text. Two runs of the
+  // same command are two different jobs with two different descriptions, and the
+  // old `label -> last description` table would title the first with the second.
+  execute('bash', 'call-a', 'npm run build', '构建 A（旧）');
+  execute('bash', 'call-b', 'npm run build', '构建 B（新）');
+  register('bash-a', 'call-a');
+  register('bash-b', 'call-b');
+  check(
+    'two jobs running the same command keep their own titles',
+    server.jobDescriptionFor('s1', 'bash-a') === '构建 A（旧）'
+      && server.jobDescriptionFor('s1', 'bash-b') === '构建 B（新）',
+    JSON.stringify([server.jobDescriptionFor('s1', 'bash-a'), server.jobDescriptionFor('s1', 'bash-b')]),
+  );
+  check(
+    "the jobs pill's own table still answers by command (its behaviour is unchanged)",
+    server.toolDescriptionFor('s1', 'npm run build') === '构建 B（新）',
+    String(server.toolDescriptionFor('s1', 'npm run build')),
+  );
+
+  // P3-1: win32 composes `pwsh` and no `bash`, so the capture is not bash-only.
+  execute('pwsh', 'call-w', 'Get-ChildItem', '列出目录');
+  register('bash-w', 'call-w');
+  check(
+    'a pwsh job also keeps its description',
+    server.jobDescriptionFor('s1', 'bash-w') === '列出目录',
+    String(server.jobDescriptionFor('s1', 'bash-w')),
+  );
+
+  // P2-3 ordering: the registration can arrive before the execution's
+  // description is known (and a replayed log has the registration but never the
+  // execute hook). The lookup is lazy, so a late description still lands.
+  handlers.get('session/event')(
+    { id: 's1' },
+    { type: 'job/registered', data: { jobId: 'bash-late', kind: 'bash', label: 'x', toolCall: { callId: 'call-late' } } },
+  );
+  check(
+    'a job registered before its description is no title yet',
+    server.jobDescriptionFor('s1', 'bash-late') === undefined,
+    String(server.jobDescriptionFor('s1', 'bash-late')),
+  );
+  execute('bash', 'call-late', 'x', '晚到的描述');
+  check(
+    '...and resolves once the description is captured',
+    server.jobDescriptionFor('s1', 'bash-late') === '晚到的描述',
+    String(server.jobDescriptionFor('s1', 'bash-late')),
+  );
+
+  // A registration without a call id cannot be joined precisely; falling back to
+  // the label is exactly the cross-wiring P2-3 removed.
+  handlers.get('session/event')(
+    { id: 's1' },
+    { type: 'job/registered', data: { jobId: 'bash-nocall', kind: 'bash', label: 'npm run build' } },
+  );
+  check(
+    'a registration with no call id gets no title (never the label fallback)',
+    server.jobDescriptionFor('s1', 'bash-nocall') === undefined,
+    String(server.jobDescriptionFor('s1', 'bash-nocall')),
+  );
+  check('an unknown job id has no title', server.jobDescriptionFor('s1', 'bash-nope') === undefined);
+  check(
+    'a blank description is no title, and keeps out of the command table',
+    (() => {
+      execute('bash', 'call-blank', 'npm ci', '   ');
+      return server.toolDescriptionFor('s1', 'npm ci') === undefined;
+    })(),
+  );
+
+  // Live forwarding: the event, not the plugin, has to carry the title.
+  const live = { type: 'tool/call', seq: 1, data: { callId: 'c1', name: 'job_output', arguments: { job_id: 'bash-a' } } };
+  handlers.get('session/event')({ id: 's1' }, live);
+  const forwarded = frames.at(-1);
+  check(
+    'the forwarded job_output event carries the title',
+    forwarded?.params?.event?.data?.jobTitle === '构建 A（旧）',
+    JSON.stringify(forwarded?.params?.event?.data),
+  );
+  check(
+    '...the type and call survive the stamp',
+    forwarded?.params?.event?.type === 'tool/call' && forwarded?.params?.event?.data?.callId === 'c1',
+    JSON.stringify(forwarded?.params?.event),
+  );
+  check(
+    'the source event is not mutated',
+    live.data.jobTitle === undefined && Object.keys(live.data).length === 3,
+    JSON.stringify(live.data),
+  );
+
+  // An event whose arguments arrived as a JSON string (a replayed or imported
+  // log) resolves the same way; malformed JSON is "no id", never a throw.
+  handlers.get('session/event')({ id: 's1' }, {
+    type: 'tool/call',
+    data: { callId: 'c2', name: 'job_output', arguments: '{"job_id":"bash-b"}' },
+  });
+  check(
+    'string-form arguments resolve too',
+    frames.at(-1)?.params?.event?.data?.jobTitle === '构建 B（新）',
+    JSON.stringify(frames.at(-1)?.params?.event?.data),
+  );
+  handlers.get('session/event')({ id: 's1' }, {
+    type: 'tool/call',
+    data: { callId: 'c3', name: 'job_output', arguments: '{not json' },
+  });
+  check(
+    'malformed arguments are forwarded untouched',
+    frames.at(-1)?.params?.event?.data?.jobTitle === undefined
+      && frames.at(-1)?.params?.event?.data?.arguments === '{not json',
+    JSON.stringify(frames.at(-1)?.params?.event?.data),
+  );
+
+  // Only the read row is stamped: every other tool keeps its own shape.
+  handlers.get('session/event')({ id: 's1' }, {
+    type: 'tool/call',
+    data: { callId: 'c4', name: 'bash', arguments: { command: 'npm run build', description: '构建 A（旧）' } },
+  });
+  check(
+    'a bash row is not stamped',
+    frames.at(-1)?.params?.event?.data?.jobTitle === undefined,
+    JSON.stringify(frames.at(-1)?.params?.event?.data),
+  );
+
+  // A held child's events are stamped on the way out (the flush path), not on
+  // the way in.
+  frames.length = 0;
+  // Held by session id: the handler that decides "hold or forward" looks up
+  // this table with the event's own session id.
+  server.children.set('s1', { opened: false, buffered: [], parentId: 'root-1' });
+  handlers.get('session/event')({ id: 's1' }, {
+    type: 'tool/call',
+    data: { callId: 'c5', name: 'job_output', arguments: { job_id: 'bash-b' } },
+  });
+  check('a held child frame is not forwarded yet', frames.length === 0, JSON.stringify(frames.map((f) => f.method)));
+  server.openChild('s1', server.children.get('s1'));
+  const flushed = frames.find((frame) => frame.method === 'session.event');
+  check(
+    "the held child's flushed frame carries the title",
+    flushed?.params?.event?.data?.jobTitle === '构建 B（新）',
+    JSON.stringify(flushed?.params?.event?.data),
+  );
+}
+{
+  // P3-2: a broken lookup is reported once, and the event still reaches Paseo.
+  const { server } = makeServer();
+  const lines = [];
+  const original = process.stderr.write;
+  process.stderr.write = (chunk) => {
+    lines.push(String(chunk));
+    return true;
+  };
+  let first;
+  let second;
+  try {
+    const evil = () => ({
+      get type() {
+        throw new Error('broken event');
+      },
+      data: {},
+    });
+    first = server.withJobTitle('s1', evil());
+    second = server.withJobTitle('s1', evil());
+  } finally {
+    process.stderr.write = original;
+  }
+  check(
+    'a throwing event is returned untouched',
+    first !== undefined && typeof first === 'object' && second !== undefined,
+    JSON.stringify([typeof first, typeof second]),
+  );
+  // Order-independent: an earlier block may already have latched this reason,
+  // so the claim is "two calls add at most one line", never "exactly one line".
+  // A per-event reporter would add two here.
+  check(
+    'the lookup failure is latched, not one line per event',
+    lines.filter((line) => line.includes('job title')).length <= 1,
+    JSON.stringify(lines),
+  );
+}
+{
+  // P2-2: the replay path is the one the phone uses after reopening a session.
+  const history = (server) => server.history({ sessionId: 's1' });
+  const jobEvents = [
+    { type: 'job/registered', seq: 1, data: { jobId: 'bash-r', kind: 'bash', label: 'npm run build', toolCall: { callId: 'call-r' } } },
+    { type: 'tool/call', seq: 2, data: { callId: 'cr', name: 'job_output', arguments: { job_id: 'bash-r' } } },
+  ];
+  const persistence = {
+    open: async () => ({
+      inheritedEventCount: 0,
+      read: async () => ({ events: jobEvents }),
+      close: async () => {},
+    }),
+  };
+
+  // Same process: the execute hook ran while the job was live, so the table has
+  // the join and the replay frame keeps the title.
+  const warm = makeServer({ sessionPersistence: persistence });
+  warm.server.rememberToolDescription({
+    name: 'bash',
+    agent: { session: { id: 's1' } },
+    callId: 'call-r',
+    arguments: { command: 'npm run build', description: '查看构建是否已开跑' },
+  });
+  warm.handlers.get('session/event')(
+    { id: 's1' },
+    { type: 'job/registered', data: { jobId: 'bash-r', kind: 'bash', label: 'npm run build', toolCall: { callId: 'call-r' } } },
+  );
+  const warmHistory = await history(warm.server);
+  const warmFrame = warmHistory.events.find((event) => event.type === 'tool/call' && event.data?.callId === 'cr');
+  check(
+    'a warm replay stamps the title on the job_output frame',
+    warmFrame?.data?.jobTitle === '查看构建是否已开跑',
+    JSON.stringify(warmFrame?.data),
+  );
+
+  // A fresh process has no execute hook and no capture table; the log's own
+  // `job/registered` is not enough to name the job, so the id stays honest.
+  const cold = makeServer({ sessionPersistence: persistence });
+  const coldHistory = await history(cold.server);
+  const coldFrame = coldHistory.events.find((event) => event.type === 'tool/call' && event.data?.callId === 'cr');
+  check(
+    'a cold replay keeps the bare id instead of inventing a title',
+    coldFrame !== undefined && coldFrame.data?.jobTitle === undefined,
+    JSON.stringify(coldFrame?.data),
+  );
+  check(
+    'the replay keeps the surface events (a log-only job/registered stays out)',
+    coldHistory.events.filter((event) => event.type === 'tool/call').length === 1
+      && coldHistory.events.every((event) => event.type !== 'job/registered'),
+    JSON.stringify(coldHistory.events.map((event) => event.type)),
+  );
+}
+
+console.log("bridge server: the job title tables survive a refresh (close -> reopen)\n");
+{
+  const { server, handlers } = makeServer();
+  server.initializedSessions.add('s1');
+  server.rememberToolDescription({
+    name: 'bash',
+    agent: { session: { id: 's1' } },
+    callId: 'call-refresh',
+    arguments: { command: 'npm run build', description: '构建标题' },
+  });
+  handlers.get('session/event')(
+    { id: 's1' },
+    { type: 'job/registered', data: { jobId: 'bash-r1', toolCall: { callId: 'call-refresh' } } },
+  );
+  const before = server.jobDescriptionFor('s1', 'bash-r1');
+  await server.closeSession({ sessionId: 's1' });
+  const after = server.jobDescriptionFor('s1', 'bash-r1');
+  // P2: Paseo's refresh is close-then-reopen in the same bridge process. The
+  // replay that follows reads `history()`, so deleting these tables on close
+  // guaranteed every refreshed conversation fell back to the bare id.
+  check(
+    'a close keeps the join tables for the reopen',
+    before === '构建标题' && after === '构建标题',
+    JSON.stringify({ before, after }),
+  );
+  check(
+    'the pill table still drops on close (its behaviour is unchanged)',
+    server.toolDescriptionFor('s1', 'npm run build') === undefined,
+    String(server.toolDescriptionFor('s1', 'npm run build')),
+  );
+}
+{
+  // Eviction must not drop a call a live job still points at: the old
+  // "count every call, drop the oldest" rule lost titles on any long session.
+  const { server } = makeServer();
+  server.rememberToolDescription({
+    name: 'bash',
+    agent: { session: { id: 'one' } },
+    callId: 'call-referenced',
+    arguments: { command: 'x', description: '被引用的标题' },
+  });
+  server.observeJobRegistration({ id: 'one' }, {
+    type: 'job/registered',
+    data: { jobId: 'job-referenced', toolCall: { callId: 'call-referenced' } },
+  });
+  for (let i = 0; i < 600; i += 1) {
+    server.rememberToolDescription({
+      name: 'bash',
+      agent: { session: { id: 'one' } },
+      callId: `call-${i}`,
+      arguments: { command: `cmd ${i}`, description: `标题 ${i}` },
+    });
+  }
+  const calls = server.callDescriptions.get('one');
+  check(
+    'a call still referenced by a registration survives the cap',
+    server.jobDescriptionFor('one', 'job-referenced') === '被引用的标题',
+    String(server.jobDescriptionFor('one', 'job-referenced')),
+  );
+  check(
+    'callDescriptions is bounded per session',
+    calls !== undefined && calls.size <= 500,
+    String(calls?.size),
+  );
+  for (let i = 0; i < 600; i += 1) {
+    server.observeJobRegistration({ id: 'one' }, {
+      type: 'job/registered',
+      data: { jobId: `job-${i}`, toolCall: { callId: `call-${i}` } },
+    });
+  }
+  const jobs = server.jobRegistrations.get('one');
+  check(
+    'jobRegistrations is bounded per session too',
+    jobs !== undefined && jobs.size <= 500,
+    String(jobs?.size),
+  );
+}
+
+{
+  // P3: the capture is not bash-only for the title join, but the composer pill
+  // keeps its documented bash-only behaviour (HARNESS).
+  const { server } = makeServer();
+  server.rememberToolDescription({
+    name: 'pwsh',
+    agent: { session: { id: 's1' } },
+    callId: 'call-pwsh',
+    arguments: { command: 'Get-ChildItem', description: '列出目录' },
+  });
+  check(
+    'a pwsh description never reaches the pill table',
+    server.toolDescriptionFor('s1', 'Get-ChildItem') === undefined,
+    String(server.toolDescriptionFor('s1', 'Get-ChildItem')),
+  );
+  server.observeJobRegistration({ id: 's1' }, {
+    type: 'job/registered',
+    data: { jobId: 'bash-pw', toolCall: { callId: 'call-pwsh' } },
+  });
+  check(
+    '...but it still titles its own job row',
+    server.jobDescriptionFor('s1', 'bash-pw') === '列出目录',
+    String(server.jobDescriptionFor('s1', 'bash-pw')),
+  );
+}
+{
+  // The live-snapshot outlet is the other copy of the replay stamp.
+  const snapshot = [
+    { type: 'tool/call', seq: 2, data: { callId: 'cs', name: 'job_output', arguments: { job_id: 'bash-snap' } } },
+  ];
+  const { server, handlers } = makeServer({
+    sessions: { get: () => ({ id: 's1', inheritedEventCount: 0, snapshotEvents: () => snapshot }) },
+  });
+  server.rememberToolDescription({
+    name: 'bash',
+    agent: { session: { id: 's1' } },
+    callId: 'call-snap',
+    arguments: { command: 'x', description: '快照标题' },
+  });
+  handlers.get('session/event')(
+    { id: 's1' },
+    { type: 'job/registered', data: { jobId: 'bash-snap', toolCall: { callId: 'call-snap' } } },
+  );
+  const live = await server.history({ sessionId: 's1' });
+  const liveFrame = live.events.find((event) => event.type === 'tool/call');
+  check(
+    'the live-snapshot replay outlet stamps the title too',
+    liveFrame?.data?.jobTitle === '快照标题',
+    JSON.stringify(liveFrame?.data),
+  );
+}
+
 const failedCount = results.filter((result) => !result.pass).length;
 console.log(`\n  ${results.length - failedCount}/${results.length} passed`);
 process.exit(failedCount === 0 ? 0 : 1);

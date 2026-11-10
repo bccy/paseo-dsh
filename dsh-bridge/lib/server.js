@@ -274,6 +274,17 @@ function unavailableHistory(error) {
 const REPORTED_MISSING_SERVICES = new Set();
 
 /**
+ * Reasons a `job_output` title lookup failed, reported once per process.
+ *
+ * "No title" is the normal answer (the job was never registered in this
+ * process, a replayed log has no capture table), so it is silent. A *broken*
+ * lookup is a different fact and must not hide inside the same silence: the
+ * person reading a bare id would never learn the caution line was eaten. Same
+ * latch shape as {@link reportMissingService}.
+ */
+const REPORTED_JOB_TITLE_FAILURES = new Set();
+
+/**
  * Report an optional service this profile does not compose, once per process.
  *
  * @param {string} service - the ctx service name; also the latch key.
@@ -283,6 +294,16 @@ function reportMissingService(service, line) {
   if (REPORTED_MISSING_SERVICES.has(service)) return;
   REPORTED_MISSING_SERVICES.add(service);
   process.stderr.write(line);
+}
+
+/** Reporter for {@link REPORTED_JOB_TITLE_FAILURES}, one line per reason. */
+function reportJobTitleFailure(reason, error) {
+  if (REPORTED_JOB_TITLE_FAILURES.has(reason)) return;
+  REPORTED_JOB_TITLE_FAILURES.add(reason);
+  process.stderr.write(
+    `[bridge] job title ${reason} (a job_output row keeps its bare id): `
+    + `${error instanceof Error ? error.message : String(error)}\n`,
+  );
 }
 
 /**
@@ -322,6 +343,48 @@ const MAX_SESSION_ROUTE_ENTRIES = 500;
  * single long turn is exactly when it would grow without bound.
  */
 const MAX_TOOL_DESCRIPTIONS = 200;
+
+/**
+ * Per-session cap on the two join tables behind a `job_output` title, in
+ * **calls** (not commands) and in **jobs**.
+ *
+ * The command table above is bounded by distinct commands, and a repeated
+ * command reuses its one slot; these two grow once per call/per job, so 200
+ * would be exhausted by a single long session and start dropping titles that
+ * are still on screen (a 40-minute build reads the same job every few steps).
+ * 500 leaves room for one heavy session while still bounding a process that
+ * serves every conversation forever.
+ *
+ * Eviction prefers a call no registration points at (see
+ * `rememberToolDescription`): a registered job is exactly what a visible row
+ * may still name, so it is the last thing to go.
+ */
+const MAX_CALL_DESCRIPTIONS = 500;
+const MAX_JOB_REGISTRATIONS = 500;
+
+/**
+ * The `job_id` of a `job_output` call, from its arguments.
+ *
+ * DSH events carry `arguments` as an object in the live stream, but a replayed
+ * or imported log may hold the JSON string form, so both are accepted. Anything
+ * else is "no id to look up": the event is forwarded unchanged.
+ *
+ * @param {unknown} raw
+ * @returns {string | undefined}
+ */
+function jobIdOf(raw) {
+  let args = raw;
+  if (typeof raw === 'string') {
+    try {
+      args = JSON.parse(raw);
+    } catch {
+      return undefined;
+    }
+  }
+  if (args === null || typeof args !== 'object') return undefined;
+  const jobId = /** @type {{job_id?: unknown}} */ (args).job_id;
+  return typeof jobId === 'string' && jobId !== '' ? jobId : undefined;
+}
 
 /**
  * How many prompt-issued message ids one session may track as "not on the
@@ -619,6 +682,38 @@ export class PaseoHarnessServer {
      */
     this.toolDescriptions = new Map();
     /**
+     * sessionId -> callId -> the model's one-line `description` of that call.
+     *
+     * The exact join key for a `job_output` title. The command table above is
+     * for the composer pill and is keyed by command text, which is **not**
+     * unique: a command run twice yields two jobs, and the later description
+     * overwrote the earlier one, so an early job's read row would wear the
+     * newer job's words. `tools/execute` knows the call id (`exec.callId`) and
+     * the description at the same moment, so this table keeps that pair.
+     *
+     * Same lifetime and cap as `toolDescriptions`: only ever read for a row that
+     * still exists, dropped when the session closes, bounded per session.
+     */
+    this.callDescriptions = new Map();
+    /**
+     * sessionId -> jobId -> `{ callId }`, from DSH's own `job/registered`
+     * session event.
+     *
+     * `dsh-jobs-local` appends that event through `session.append`, so it
+     * reaches this bridge as an ordinary session event, and its payload carries
+     * `toolCall.callId` — the one stable key shared with `tools/execute`. Chaining
+     * `jobId -> callId -> description` gives each job its own title even when two
+     * jobs ran the same command. A registration with no call id keeps an empty
+     * `callId` (the job exists, it just cannot be named) and resolves to no
+     * title: falling back to the command text is the cross-wiring this join
+     * exists to prevent.
+     *
+     * The event's `label` (the raw command) is deliberately **not** stored: it
+     * has no consumer, and keeping it beside a table that must never join by
+     * command is how a later reader would mistake it for a fallback path.
+     */
+    this.jobRegistrations = new Map();
+    /**
      * sessionId -> live assistant assembly for the attempt in flight. Reset by
      * each attempt's `start`, so the bridge never merges two attempts into one
      * snapshot. (Paseo's timeline is append-only, so a retry that failed
@@ -686,6 +781,10 @@ export class PaseoHarnessServer {
         this.observeChildSession(session);
         this.observeDelegatedTurn(session, event);
         if (event.type === 'subagent/catalog') this.observeCatalogChild(session, event);
+        // `job/registered` is appended by DSH's jobs registry to the session log,
+        // so it reaches the bridge as an ordinary event; absorbing it here is
+        // what gives a later `job_output` read an exact call-id join.
+        this.observeJobRegistration(session, event);
         const sessionId = String(session.id);
         // A prompt-issued message has now reached the surface: it is a normal
         // conversation row from here on, so a rewind must resolve it through
@@ -708,7 +807,10 @@ export class PaseoHarnessServer {
           // An image attachment carries only its reference; the host path Paseo's
           // renderer needs can be resolved here and nowhere else. See
           // `image-host-path.js`.
-          this.transport.notify('session.event', { sessionId, event: withImageHostPaths(this.ctx, event) });
+          this.transport.notify('session.event', {
+            sessionId,
+            event: withImageHostPaths(this.ctx, this.withJobTitle(sessionId, event)),
+          });
         }
       }),
     );
@@ -869,7 +971,7 @@ export class PaseoHarnessServer {
         // way out, exactly once.
         this.transport.notify('session.event', {
           sessionId,
-          event: withImageHostPaths(this.ctx, frame.event),
+          event: withImageHostPaths(this.ctx, this.withJobTitle(sessionId, frame.event)),
         });
       } else this.transport.notify('session.status', { sessionId, status: frame.status });
     }
@@ -1109,6 +1211,12 @@ export class PaseoHarnessServer {
       // one) and does not drive the bound, but an evicted row must not leave a
       // name behind: the plugin re-sends it on the re-initialize it already owes.
       this.sessionTitles.delete(key);
+      // Job titles are the same kind of row: useless without the session they
+      // belong to, and unbounded if a process that outlives every conversation
+      // never drops them. They outlive `session/close` (a refresh reopens the
+      // same id) and die here with the route row.
+      this.callDescriptions.delete(key);
+      this.jobRegistrations.delete(key);
       this.closedSessions.delete(key);
     };
 
@@ -2158,7 +2266,11 @@ export class PaseoHarnessServer {
         return {
           available: true,
           inheritedEventCount,
-          events: historyEvents(this.ctx, visibleEvents(snapshot ?? [])),
+          // Replayed frames take the same stamp as live ones: a phone that
+          // reopens a session gets its titles back only if the replay path
+          // stamps them too (P2-2), and the join table survives in this process.
+          events: historyEvents(this.ctx, visibleEvents(snapshot ?? [])).map((event) =>
+            this.withJobTitle(String(params.sessionId), event)),
         };
       } catch (error) {
         // A live snapshot is an optimization, never the only source: fall back
@@ -2219,8 +2331,10 @@ export class PaseoHarnessServer {
         // the user just removed — which is what Paseo's post-rewind re-hydrate
         // showed. Images are stamped here too — the source file a tool read is
         // usually gone by reopen time, and only the attachment's host path still
-        // resolves.
-        events: historyEvents(this.ctx, visibleEvents(result.events ?? [])),
+        // resolves. The job title is stamped here for the same reason (P2-2):
+        // without it a reopened conversation falls back to the bare id.
+        events: historyEvents(this.ctx, visibleEvents(result.events ?? [])).map((event) =>
+          this.withJobTitle(String(params.sessionId), event)),
       };
     } catch (error) {
       // The open succeeded, so this log exists; failing to read it is never
@@ -2640,7 +2754,10 @@ export class PaseoHarnessServer {
    */
   rememberToolDescription(exec) {
     try {
-      if (exec?.name !== 'bash') return;
+      // Both shells register background jobs: a win32 profile composes `pwsh`
+      // and no `bash`, so a bash-only capture would leave every Windows job
+      // titled by its raw command.
+      if (exec?.name !== 'bash' && exec?.name !== 'pwsh') return;
       const session = exec?.agent?.session;
       if (session === undefined) return;
       const args = exec?.arguments;
@@ -2653,22 +2770,103 @@ export class PaseoHarnessServer {
       // untrimmed is what makes the lookup in `jobs()` an exact match.
       if (text === '' || command === '') return;
       const sessionId = String(session.id);
-      let byCommand = this.toolDescriptions.get(sessionId);
-      if (byCommand === undefined) {
-        byCommand = new Map();
-        this.toolDescriptions.set(sessionId, byCommand);
+      // The command table is the composer pill's, and the pill is documented as
+      // bash-only. `pwsh` therefore contributes to the job-title join below
+      // without changing what the pill shows (HARNESS: jobs pill behaviour is
+      // unchanged).
+      if (exec.name === 'bash') {
+        let byCommand = this.toolDescriptions.get(sessionId);
+        if (byCommand === undefined) {
+          byCommand = new Map();
+          this.toolDescriptions.set(sessionId, byCommand);
+        }
+        // Re-inserting an existing command moves it to the end of the insertion
+        // order, so the eviction below drops the least recently *run* command
+        // rather than the first one this turn happened to use.
+        byCommand.delete(command);
+        byCommand.set(command, text);
+        if (byCommand.size > MAX_TOOL_DESCRIPTIONS) {
+          const oldest = byCommand.keys().next();
+          if (oldest.done !== true) byCommand.delete(oldest.value);
+        }
       }
-      // Re-inserting an existing command moves it to the end of the insertion
-      // order, so the eviction below drops the least recently *run* command
-      // rather than the first one this turn happened to use.
-      byCommand.delete(command);
-      byCommand.set(command, text);
-      if (byCommand.size > MAX_TOOL_DESCRIPTIONS) {
-        const oldest = byCommand.keys().next();
-        if (oldest.done !== true) byCommand.delete(oldest.value);
+      // The exact join: `job/registered` names the same call id. Kept apart from
+      // the command table so the pill's behaviour cannot drift with this one.
+      if (typeof exec.callId === 'string' && exec.callId !== '') {
+        let byCall = this.callDescriptions.get(sessionId);
+        if (byCall === undefined) {
+          byCall = new Map();
+          this.callDescriptions.set(sessionId, byCall);
+        }
+        byCall.delete(exec.callId);
+        byCall.set(exec.callId, text);
+        if (byCall.size > MAX_CALL_DESCRIPTIONS) {
+          // A call whose job registration still exists can be the one a row on
+          // screen names; a call nobody registered cannot. Drop the latter
+          // first, and only fall back to the oldest when every entry is live.
+          const registered = new Set();
+          for (const registration of this.jobRegistrations.get(sessionId)?.values() ?? []) {
+            if (registration.callId !== '') registered.add(registration.callId);
+          }
+          let dropped = false;
+          for (const key of byCall.keys()) {
+            if (registered.has(key)) continue;
+            byCall.delete(key);
+            dropped = true;
+            break;
+          }
+          if (!dropped) {
+            const oldest = byCall.keys().next();
+            if (oldest.done !== true) byCall.delete(oldest.value);
+          }
+        }
       }
     } catch {
       /* a description is a nicety; it must never break the tool call */
+    }
+  }
+
+  /**
+   * Remember one `job/registered` fact for later title lookups.
+   *
+   * DSH's jobs registry appends this event to the session log itself
+   * (`dsh-jobs-local`'s `recordSessionEvent`), which is why no registry call is
+   * needed here: the event arrives through the same `session/event` hook the
+   * bridge already owns, live and (for the live snapshot path) replayable.
+   *
+   * Only the pair is stored — the description comes from `tools/execute`, and
+   * the two may arrive in either order (a replayed log has registrations but no
+   * executions). Resolution is therefore lazy in {@link jobDescriptionFor}.
+   *
+   * @param {{id: unknown}} session
+   * @param {object} event
+   */
+  observeJobRegistration(session, event) {
+    try {
+      if (event?.type !== 'job/registered') return;
+      const data = event.data;
+      if (data === null || typeof data !== 'object') return;
+      const jobId = typeof data.jobId === 'string' ? data.jobId : '';
+      if (jobId === '') return;
+      const toolCall = data.toolCall;
+      const callId =
+        toolCall !== null && typeof toolCall === 'object' && typeof toolCall.callId === 'string'
+          ? toolCall.callId
+          : '';
+      const sessionId = String(session?.id);
+      let byJob = this.jobRegistrations.get(sessionId);
+      if (byJob === undefined) {
+        byJob = new Map();
+        this.jobRegistrations.set(sessionId, byJob);
+      }
+      byJob.delete(jobId);
+      byJob.set(jobId, { callId });
+      if (byJob.size > MAX_JOB_REGISTRATIONS) {
+        const oldest = byJob.keys().next();
+        if (oldest.done !== true) byJob.delete(oldest.value);
+      }
+    } catch (error) {
+      reportJobTitleFailure('registration was unusable', error);
     }
   }
 
@@ -2682,6 +2880,86 @@ export class PaseoHarnessServer {
    */
   toolDescriptionFor(sessionId, command) {
     return this.toolDescriptions.get(sessionId)?.get(command);
+  }
+
+  /**
+   * The model-written title of one background job, looked up by its id.
+   *
+   * **Joined by call id, never by command text.** `dsh-jobs-local` appends
+   * `job/registered` with `toolCall.callId` (see {@link observeJobRegistration}),
+   * and `tools/execute` captures the same call's `description`
+   * (see {@link rememberToolDescription}). The chain is
+   * `jobId -> callId -> description`, so two jobs that ran the same command
+   * still get their own titles. The command-keyed table stays for the composer
+   * pill (its own behaviour is unchanged) and is deliberately not consulted
+   * here: a label fallback is exactly the cross-wiring this join removes.
+   *
+   * The lookup is lazy, so either arrival order works: a registration that
+   * landed before its execution (or a replayed log, which contains
+   * registrations but no executions) resolves once the capture table catches
+   * up. A missing registration, or one with no call id, is "no title" — the row
+   * keeps its bare id rather than inventing a title from a command.
+   *
+   * **`sessionId` must be the caller's own.** Every entry is keyed by the
+   * session whose event is being stamped; no id taken from the wire is ever
+   * forwarded into these tables.
+   *
+   * @param {string} sessionId
+   * @param {string} jobId - the `job_output` call's `job_id` argument
+   * @returns {string | undefined}
+   */
+  jobDescriptionFor(sessionId, jobId) {
+    try {
+      const registration = this.jobRegistrations.get(sessionId)?.get(jobId);
+      if (registration === undefined || registration.callId === '') return undefined;
+      const title = this.callDescriptions.get(sessionId)?.get(registration.callId);
+      return typeof title === 'string' && title !== '' ? title : undefined;
+    } catch (error) {
+      // A broken lookup must not read as "this job has no title": say it once.
+      reportJobTitleFailure('lookup failed', error);
+      return undefined;
+    }
+  }
+
+  /**
+   * Stamp a `job_output` row with the background task's own title.
+   *
+   * The read row is the only place the join is needed: DSH's own UI and the
+   * composer's jobs pill already title the job from `args.description`, but the
+   * `job_output` call is made by the model later and carries only `job_id`. The
+   * title has to ride on the *event* — the plugin process is a separate child
+   * with no access to these tables — so it is added as `data.jobTitle`, a key
+   * the other provider adapters never send and the client reads only for this
+   * tool.
+   *
+   * Returns the event untouched (same object) unless a title was found: a row
+   * with no title is a row that keeps the id, and copying every event would cost
+   * the whole timeline for nothing. The source event is never mutated — a
+   * stamped copy is returned instead — because the same event object is also
+   * this bridge's own view of the session log.
+   *
+   * @param {string} sessionId
+   * @param {object} event
+   * @returns {object}
+   */
+  withJobTitle(sessionId, event) {
+    try {
+      if (event === null || typeof event !== 'object') return event;
+      if (event.type !== 'tool/call') return event;
+      const data = event.data;
+      if (data === null || typeof data !== 'object') return event;
+      if (data.name !== 'job_output') return event;
+      const jobId = jobIdOf(data.arguments);
+      if (jobId === undefined) return event;
+      const title = this.jobDescriptionFor(sessionId, jobId);
+      if (title === undefined) return event;
+      return { ...event, data: { ...data, jobTitle: title } };
+    } catch (error) {
+      // The row still reaches Paseo (untouched); only the title is lost, and the
+      // failure is reported once instead of on every frame of the session.
+      reportJobTitleFailure('stamping failed', error);
+      return event;
+    }
   }
 
   /**
@@ -4484,8 +4762,15 @@ export class PaseoHarnessServer {
     this.promptDeliveries.delete(sessionId);
     this.pendingUserMessages.delete(sessionId);
     this.children.delete(sessionId);
-    // Bash descriptions only exist to title a listed job; a closed session has
-    // no jobs left to list, and the table is per session.
+    // The composer pill's command table only exists to title a listed job; a
+    // closed session has no jobs left to list, so it goes here.
+    //
+    // The two **join** tables do not: Paseo's refresh is a close followed by an
+    // immediate reopen in this same process, and the reopened conversation is
+    // rebuilt from `history()`. Dropping the tables on close deleted exactly the
+    // data that replay needs, so every refreshed session lost its titles. They
+    // are evicted with the session route tables instead
+    // (`#trimSessionRouteTables`, same 500-session bound).
     this.toolDescriptions.delete(sessionId);
     // A rewind in flight for this session will finish on its own; dropping the
     // marker only stops a later rewind from being refused on behalf of a session

@@ -1659,31 +1659,82 @@ function jobDetailText(detail: string, cards: ToolCardsText): string {
  * `job_output`'s card: the trailing `[status: …]` line becomes the receipt, the
  * rest stays the log in the code surface, and the copy control still hands over
  * the complete original output (status line included).
+ *
+ * `jobTitle` is the background job's own one-line description, resolved by the
+ * bridge from DSH's `job/registered` + `tools/execute` pair (`job_id -> callId
+ * -> description`) and carried on the row's metadata. It is the row's head when
+ * present: `bash-70c2…` names a machine, while 「查看构建是否已开跑」 names the
+ * work the reader asked for. The id then moves into the card as its first fact,
+ * so the row still says which job answered.
+ *
+ * **A row exists before any result does.** A blocking read opens as `running`
+ * for up to 600 s, and a canceled read never gets a result at all; both arrive
+ * with no `output`. Returning null there was what printed `job_id: bash-20`
+ * from L1 even though the title was already in metadata, so the card is built
+ * from the call alone in that case — `output` stays L1's (there is nothing to
+ * replace, and the row's own log arrives later on the result frame).
+ *
+ * A **failed** read is the other shape a reload leaves behind (the job the row
+ * names is gone from the registry, or the id itself was rejected). It keeps the
+ * Chinese labels and DSH's error text, and gets no receipt: a failure must never
+ * read as a successful read.
  */
-function jobOutputCard(input: unknown, output: unknown, failed: boolean): ToolMapping | null {
-  if (failed || !isRecord(input)) return null;
+function jobOutputCard(
+  input: unknown,
+  output: unknown,
+  failed: boolean,
+  jobTitle: string | undefined,
+  errorText: string,
+): ToolMapping | null {
+  if (!isRecord(input)) return null;
   const jobId = input.job_id;
-  if (typeof jobId !== "string" || jobId === "" || typeof output !== "string") return null;
+  if (typeof jobId !== "string" || jobId === "") return null;
+  const cards = localeText().toolCards;
+  const title = jobTitle === undefined || jobTitle.trim() === "" ? undefined : jobTitle.trim();
+  // The id is a fact only when the title took the head — otherwise the head
+  // already says it. The knobs read as words, not as DSH's wire keys, on every
+  // path: running, canceled, failed and completed.
+  const args: ToolFieldEntry[] = [];
+  if (title !== undefined) args.push(fieldEntry(cards.labels.id, jobId));
+  if (typeof input.wait === "boolean") args.push(fieldEntry(cards.labels.wait, input.wait));
+  if (typeof input.timeout_ms === "number") args.push(fieldEntry(cards.labels.timeoutMs, input.timeout_ms));
+  if (failed) {
+    const body = errorText !== ""
+      ? errorText
+      : typeof output === "string" ? output.replace(/\n+$/u, "") : "";
+    return {
+      summary: title ?? jobId,
+      args,
+      result: [],
+      // No invented status word: DSH's status line is not a part of a failure.
+      receipt: "",
+      body,
+      ...(typeof output === "string" ? { copyText: output } : {}),
+    };
+  }
+  if (typeof output !== "string") {
+    // Still running (or canceled): the head, the id and the knobs are the whole
+    // answer the call itself carries. `body`/`copyText` are deliberately absent
+    // so L1's own value — nothing yet — is left alone instead of being blanked.
+    return { summary: title ?? jobId, args, result: [], receipt: "" };
+  }
   const lines = output.split("\n");
   let end = lines.length;
   while (end > 0 && lines[end - 1].trim() === "") end -= 1;
-  if (end === 0) return null;
-  const match = JOB_STATUS_LINE.exec(lines[end - 1].trim());
-  if (match === null) return null;
-  const cards = localeText().toolCards;
-  const status = cards.jobStatuses[match[1]] ?? match[1];
-  const detail = match[2] === undefined ? "" : jobDetailText(match[2], cards);
-  // The call's own knobs are what a reader needs to interpret the log ("was this
-  // a blocking read? how long did it wait?"); the job id is already the head.
-  const args: ToolFieldEntry[] = [];
-  if (typeof input.wait === "boolean") args.push(fieldEntry("wait", input.wait));
-  if (typeof input.timeout_ms === "number") args.push(fieldEntry("timeout_ms", input.timeout_ms));
+  // An empty read is still a read: the row belongs to a job that has not written
+  // anything yet, and DSH's own text (often "(no new output)") is the body.
+  const statusLine = end === 0 ? null : JOB_STATUS_LINE.exec(lines[end - 1].trim());
+  const status = statusLine === null ? "" : (cards.jobStatuses[statusLine[1]] ?? statusLine[1]);
+  const detail = statusLine === null || statusLine[2] === undefined ? "" : jobDetailText(statusLine[2], cards);
+  // Without the status line there is no receipt to show — never a made-up one.
+  // The card is still drawn: the row's head and log are the answer.
+  const receipt = status === "" ? "" : detail === "" ? status : `${status} · ${detail}`;
   return {
-    summary: jobId,
+    summary: title ?? jobId,
     args,
     result: [],
-    receipt: detail === "" ? status : `${status} · ${detail}`,
-    body: lines.slice(0, end - 1).join("\n").replace(/\n+$/u, ""),
+    receipt,
+    body: statusLine === null ? output.replace(/\n+$/u, "") : lines.slice(0, end - 1).join("\n").replace(/\n+$/u, ""),
     copyText: output,
   };
 }
@@ -2506,8 +2557,10 @@ function remoteGetOperationCard(input: unknown, output: unknown, failed: boolean
  * measured (survey §2/§3). A mapper returns null for anything that is not the
  * documented shape — a missing field, a different type, JSON that does not
  * parse — so the row keeps L1's generic card rather than a card drawn from a
- * guess. A failed call never reaches a mapper: a failure must not be rendered
- * as a success receipt, and the existing failure display owns those rows.
+ * guess. A failed call does not reach a mapper **except `job_output`**, whose
+ * failure shape is the common post-reload one and must not fall back to L1's
+ * wire-key summary; every other mapper refuses failures, because a failure must
+ * not be rendered as a success receipt.
  */
 function toolMapping(
   name: string,
@@ -2515,6 +2568,8 @@ function toolMapping(
   output: unknown,
   failed: boolean,
   roster: ReturnType<typeof rosterFromMetadata>,
+  jobTitle?: string,
+  errorText = "",
 ): ToolMapping | null {
   switch (name) {
     case "send_message":
@@ -2528,7 +2583,7 @@ function toolMapping(
     case "list_agents":
       return listAgentsCard(output, failed);
     case "job_output":
-      return jobOutputCard(input, output, failed);
+      return jobOutputCard(input, output, failed, jobTitle, errorText);
     case "job_kill":
       return jobKillCard(input, output, failed);
     case "mcp_call_tool":
@@ -3143,11 +3198,12 @@ export function toolCallData(
   }
   // L2: a tool-specific card replaces parts of the generic one. It only ever
   // claims the shapes the survey measured; a null keeps L1 exactly as it was,
-  // and a failed call never reaches the mappers (a failure must not read as a
-  // success receipt).
+  // and a failed call never reaches the mappers **except `job_output`** (whose
+  // failed read is exactly the shape that used to leak `job_id: …`); for every
+  // other mapper a failure must not read as a success receipt.
   const mapped =
     type === "unknown" && agentMessage === undefined && goal === null && team === null
-      ? toolMapping(item.name, detail.input, detail.output, failed, teamRoster)
+      ? toolMapping(item.name, detail.input, detail.output, failed, teamRoster, str(metadata, "jobTitle"), error)
       : null;
   if (mapped !== null) {
     primary = mapped.summary;

@@ -119,6 +119,22 @@
       无跨 item 状态，两个不同名册的 item 同 target 各出各的中文、无名册回落 target、空 target
       不空白；重开会话只有 item 自带名册（无 spawn/list 行）仍显示中文。真实端到端
       `plugin-check` 40/40 通过（含 replay）。
+    - 2026-11-10 `job_output` 行取后台任务自己的标题（实跑 **818** 条全绿；返工 2 后口径）：
+      桥用 **callId 精确 join**（`job/registered` 的 `toolCall.callId` ↔ `tools/execute` 的
+      `exec.callId`）得到 `job_id -> description`，行头变成「读取任务输出 · 查看构建是否已开跑」，
+      `job_id` 退到卡片第一条事实（label 取 `toolCards.labels.id`）；同一命令跑两次的两个 job
+      各取各自的描述（不以命令文本反查）；`wait` / `timeout_ms` 换成中文字段名
+      （`labels.wait` / `labels.timeoutMs`）。
+      **四种调用形态都不再出现 `job_id: ` 这个 wire 键名**：running（结果还没到，head 已是标题
+      或裸 id、参数中文、`receipt` 空、不覆盖 L1 的 body/copyText）、canceled（同上）、
+      failed（head 裸 id 或标题、body 用 DSH 的 `item.error` 原文、`receipt` 恒空）、
+      completed（有/无 `[status: …]` 都出卡），以及重放帧（同进程/refresh 后表还在时带标题；
+      新进程没有捕获表时 head 仍是**裸 id**）。这一条只覆盖 `job_output`；其它工具的失败行
+      仍可能印自己的 wire 键（不在本次范围）。无标题/无 knob/无回执的空卡仍按 L1 规则丢弃
+      （不挂空卡：head 与错误文本照常显示）。同时 `timeline-check` +2 条（实跑 **254**：
+      `data.jobTitle` 透传到 `metadata.jobTitle`、能过 `ProviderEventSchema.parse`、无标题时
+      不出现该键）、`locale-check` +2 条（实跑 **770**：`labels.wait` / `labels.timeoutMs`
+      中英两列逐字）。
 - `harness/thinking-check.cjs` — 思考行折叠预览：结束后取**第一行**、运行中取最后一个首行已终结
   的段落（都是 DSH 的行为，逐字移植在 `client/thinking-text.ts`），以及折叠行在流式中的宽度
   接线（行测自己的宽度、标签测自己要减掉的那段、行宽由两者相减得出，`useRevealedText` 不许
@@ -495,6 +511,21 @@
   或 `children` 的登记/hold/open（`observeChildSession`/`registerCatalogChild`/
   `holdChildFrame`/`openChild`/`subagents()`）也必跑**（新增断言覆盖 queued plan 双向应用、
   query/cwd 不做窄预过滤、persistence signal/迟到句柄、冷会话创建中 cancel）。
+  **2026-11-10 job_output 标题段（返工 2 后实跑 106/106）**：`jobDescriptionFor` 走
+  `job/registered`（`toolCall.callId`）↔ `tools/execute`（`exec.callId`）的精确 join——
+  同命令两 job 各取各自标题、注册先于描述时惰性解析、注册无 callId 时不回落到命令文本
+  （避免串位）；`job/registered` 的 `label` **不入表**（无消费者，留着会被误当回退路径）。
+  `pwsh` 只进 join 的 call 表，**不进** jobs pill 的 command 表（pill 行为保持 bash-only）。
+  两张 join 表：`session/close` **不删**（Paseo refresh = close 后立即同 id 重开，同进程重放
+  要用），随 `#trimSessionRouteTables` 的 500 会话上限回收；每会话上界 500，淘汰优先丢
+  **无 job 注册引用**的 call，全部被引用时才按最老淘汰。`withJobTitle` 只给
+  `type === 'tool/call'` 且 `name === 'job_output'` 的事件加 `data.jobTitle`（返回副本，**源事件
+  不被改**），bash 行/未知 id/坏 JSON 原样通过，`arguments` 的 JSON 字符串形同样解析；
+  held 子会话在 flush 时才注入；lookup 抛错按原因锁存 stderr（断言不依赖测试顺序）。
+  **重放**两向断言：同进程（表还在）持久化出口与 **live-snapshot 出口**都带标题，新进程
+  （无捕获表）保留裸 id，且 log-only 的 `job/registered` 不进入可见重放。**动了
+  `withJobTitle` / `jobDescriptionFor` / `observeJobRegistration` / `rememberToolDescription` /
+  `history()` 的两个出口 / `#trimSessionRouteTables` / `#forgetSessionState` / `jobs()` 必跑。**
 - `harness/model-route-check.mjs` — 桥的**实时模型/思考档切换**是否真的到达 DSH（0.2.1/0.2.2
   双契约）：DSH 0.2.2 把 `installModelSelection` 改成单参（只装切换提示监听），实际路由由
   `agent.model.select()` 写入 durable `model/selection` 投影；旧桥还传第二参并只改

@@ -762,6 +762,10 @@ console.log("the tool-specific timeline cards' copy is covered in both languages
   }
   equal("toolCards: English is not a copy of Chinese", Object.keys(zhLeaves).filter((key) => zhLeaves[key] === enLeaves[key]), []);
   equal("toolCards: the labels table keys match", Object.keys(en.labels).sort(), Object.keys(zh.labels).sort());
+  // The job card's two knobs are words too: printed as `wait` / `timeout_ms`
+  // they leaked DSH's wire names into a Chinese row.
+  equal("toolCards: the wait knob (zh/en)", [zh.labels.wait, en.labels.wait], ["等待", "Wait"]);
+  equal("toolCards: the timeout knob (zh/en)", [zh.labels.timeoutMs, en.labels.timeoutMs], ["超时（毫秒）", "Timeout (ms)"]);
   equal("toolCards: the job status words are DSH's five", Object.keys(zh.jobStatuses).sort(), ["completed", "failed", "killed", "running", "stopping"]);
 
   // The formatters: same keys, and each one reads differently in the two
@@ -827,6 +831,8 @@ console.log("the tool-specific timeline cards' copy is covered in both languages
       rule: "调度规则",
       targets: "目标会话",
       timeout: "超时",
+      wait: "等待",
+      timeoutMs: "超时（毫秒）",
     },
     {
       message: "Message",
@@ -851,6 +857,8 @@ console.log("the tool-specific timeline cards' copy is covered in both languages
       rule: "Schedule",
       targets: "Targets",
       timeout: "Timeout",
+      wait: "Wait",
+      timeoutMs: "Timeout (ms)",
     },
   ]);
   // The 2026-11-07 batch's receipts and status words, pinned because they are

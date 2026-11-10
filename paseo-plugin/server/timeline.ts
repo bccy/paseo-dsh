@@ -546,10 +546,12 @@ function toolMetadata(
   input: Record<string, unknown>,
   presentationMeta: JsonValue | undefined,
   teamRoster?: ReadonlyMap<string, string>,
+  jobTitle?: string,
 ): Record<string, JsonValue> {
   const description = stringField(input, "description");
   return {
     ...(description === undefined || description === "" ? {} : { description }),
+    ...(jobTitle === undefined || jobTitle === "" ? {} : { [JOB_TITLE_METADATA_KEY]: jobTitle }),
     locale: LOCALE,
     ...(teamRoster === undefined ? {} : { [TEAM_ROSTER_METADATA_KEY]: rosterRecord(teamRoster) }),
     ...(presentationMeta === undefined ? {} : { [PRESENTATION_META_KEY]: presentationMeta }),
@@ -568,6 +570,24 @@ function localeMetadata(): Record<string, JsonValue> {
 
 /** The metadata key carrying {@link toolMetadata}'s team roster. */
 const TEAM_ROSTER_METADATA_KEY = "teamRoster";
+
+/**
+ * The metadata key carrying a background job's own one-line title on its
+ * `job_output` row.
+ *
+ * The model writes a `description` for every bash call ("查看构建是否已开跑"),
+ * and DSH titles both its own tool row and the composer's jobs pill with it.
+ * The registry keeps it keyed by the job's `label` (DSH sets `label:
+ * args.command`), so the bridge can resolve `job_id -> label -> description`
+ * and attach the answer as `jobTitle` on the `tool/call` event. The row's head
+ * prefers it and the job id moves into the card: `读取任务输出 ·
+ * bash-70c2a55dab7444e6` names a machine, while the description names the work.
+ *
+ * Absent means "no title known" and the head stays the job id — never an
+ * invented one: a replay whose job registry no longer lists the job (a new
+ * process re-opened the session) legitimately has nothing better to say.
+ */
+const JOB_TITLE_METADATA_KEY = "jobTitle";
 
 /**
  * The tools whose rows consume the roster: their heads name a member
@@ -816,6 +836,23 @@ export class TimelineBuilder {
   #items = new Map<string, ProviderTimelineItem>();
   #toolNames = new Map<string, string>();
   #toolInputs = new Map<string, Record<string, unknown>>();
+  /**
+   * `callId -> jobTitle` for the `job_output` rows that arrived with one.
+   *
+   * Kept beside `#toolInputs`, with the same lifetime and for the same reason:
+   * `tool/result` rebuilds the row's metadata, and the title exists only on the
+   * `tool/call` event the bridge stamped. Without remembering it here the
+   * completed row (the one the user actually sits in front of) would fall back
+   * to the id.
+   *
+   * Deliberately **not** cleared at `turn/end` (unlike `#toolNames`): a
+   * compaction or prune replacement can rewrite a durable `tool/result` node
+   * outside the turn that announced the call, and that replacement rebuilds the
+   * row from the remembered input — it must keep the title for the same reason
+   * it keeps the command. Entries are one per `job_output` call of a live
+   * session and die with the builder.
+   */
+  #toolTitles = new Map<string, string>();
   /**
    * The session's current team roster (`name → description`), learned from the
    * `spawn_teammate` / `list_agents` events this builder consumed. A replay
@@ -1306,10 +1343,14 @@ export class TimelineBuilder {
     const input = parseArguments(data.arguments);
     this.#toolNames.set(callId, name);
     this.#toolInputs.set(callId, input);
+    // The bridge resolved this from DSH's job registry (see
+    // {@link JOB_TITLE_METADATA_KEY}); it only ever exists on `tool/call`.
+    const jobTitle = stringField(data, "jobTitle");
+    if (jobTitle !== undefined && jobTitle !== "") this.#toolTitles.set(callId, jobTitle);
     // The row only ever opens as running: `#emitToolCall` ignores a repeat for a
     // row that already reached a terminal state, so this cannot undo a finished
     // tool.
-    return this.#emitToolCall(callId, name, input);
+    return this.#emitToolCall(callId, name, input, jobTitle);
   }
 
   #toolResult(data: Record<string, unknown>): ProviderTimelineItem[] {
@@ -1384,7 +1425,14 @@ export class TimelineBuilder {
         name,
         detail,
         metadata: {
-          ...toolMetadata(input, presentationMeta, carriesTeamRoster(name) ? this.#teamRoster : undefined),
+          ...toolMetadata(
+            input,
+            presentationMeta,
+            carriesTeamRoster(name) ? this.#teamRoster : undefined,
+            // The title arrived on the `tool/call`; this snapshot is the one the
+            // user reads after the tool finishes, so it must carry it too.
+            this.#toolTitles.get(callId),
+          ),
           // DSH's structured failure code (`HarnessError.code`, e.g.
           // `GOAL_TOOL_AUTHORITY_REQUIRED`), carried beside the verbatim text so
           // the client can say in words why a goal call was refused without
@@ -1632,7 +1680,12 @@ export class TimelineBuilder {
    * asked for this tool". Keeping a status parameter for those states made a
    * `failed` branch that no caller could reach.
    */
-  #emitToolCall(callId: string, name: string, input: Record<string, unknown>): ProviderTimelineItem[] {
+  #emitToolCall(
+    callId: string,
+    name: string,
+    input: Record<string, unknown>,
+    jobTitle?: string,
+  ): ProviderTimelineItem[] {
     const previous = this.#items.get(`tool:${callId}`);
     if (
       previous !== undefined &&
@@ -1653,7 +1706,12 @@ export class TimelineBuilder {
       callId,
       name,
       detail: toolDetail(name, input),
-      metadata: toolMetadata(input, undefined, carriesTeamRoster(name) ? this.#teamRoster : undefined),
+      metadata: toolMetadata(
+        input,
+        undefined,
+        carriesTeamRoster(name) ? this.#teamRoster : undefined,
+        jobTitle,
+      ),
       status: "running",
       error: null,
     };

@@ -1686,6 +1686,57 @@ console.log("an automatic goal round is one compact row, never a user message");
   );
 }
 
+console.log("a job_output row carries the background task's title");
+{
+  const builder = new TimelineBuilder({ warn: (line) => warnings.push(line) });
+  builder.consume({
+    type: "tool/call",
+    seq: 1,
+    data: {
+      callId: "j1",
+      name: "job_output",
+      arguments: { job_id: "bash-70c2a55dab7444e6" },
+      jobTitle: "查看构建是否已开跑",
+    },
+  });
+  const titled = builder.consume({
+    type: "tool/result",
+    seq: 2,
+    data: { toolCallId: "j1", message: { content: [{ type: "text", text: "log\n[status: running]" }] } },
+  }).find((item) => item.type === "tool_call");
+  check(
+    "the task title rides on the row's metadata",
+    titled?.metadata?.jobTitle === "查看构建是否已开跑",
+    JSON.stringify(titled?.metadata),
+  );
+  // The boundary: `metadata` is a JSON object in the provider schema, so the key
+  // must survive the parse the plugin applies to every outgoing event.
+  const parsed = ProviderEventSchema.parse({ type: "timeline.item", sessionId: "s1", item: titled });
+  check(
+    "…and survives ProviderEventSchema.parse",
+    parsed.item.metadata?.jobTitle === "查看构建是否已开跑",
+    JSON.stringify(parsed.item.metadata),
+  );
+  // No title is not a title: an id-only row must not invent the key, or the
+  // client would read an empty string as a real title.
+  const bare = new TimelineBuilder({ warn: (line) => warnings.push(line) });
+  bare.consume({
+    type: "tool/call",
+    seq: 1,
+    data: { callId: "j2", name: "job_output", arguments: { job_id: "bash-1" } },
+  });
+  const untitled = bare.consume({
+    type: "tool/result",
+    seq: 2,
+    data: { toolCallId: "j2", message: { content: [{ type: "text", text: "log\n[status: running]" }] } },
+  }).find((item) => item.type === "tool_call");
+  check(
+    "a missing title leaves the key away",
+    untitled !== undefined && !("jobTitle" in untitled.metadata),
+    JSON.stringify(untitled?.metadata),
+  );
+}
+
 console.log("the meta survives the plugin's own event schema");
 {
   // The plugin subprocess parses every outgoing event with `ProviderEventSchema`
