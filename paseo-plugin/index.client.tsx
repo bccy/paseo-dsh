@@ -79,25 +79,16 @@ export default function contribute(client: PluginClientContext) {
       // keep the locale they were built with. That is a protocol limit, not a
       // bug — there is nowhere on those items to put the hint.
       setLocale(localeFromMetadata(item.metadata));
-      // Paseo 0.12's app rebuilds every tool-call item before it hands it to a
-      // plugin transformer, copying only `callId`/`name`/`status`/`error`/
-      // `detail`/`metadata` (`projectPluginTimelineItems` in the app bundle) —
-      // the `agentMessage` field the daemon's own projection adds is dropped on
-      // the way. A row that reaches us without it cannot be rendered
-      // semantically, and mapping what is left would print the wire name
-      // `agent_message` over the raw `plain_text` echo (the exact regression this
-      // phase exists to fix). Parsing `detail.text` to fake the message back is
-      // not an option: this repo does not read payloads out of a field the
-      // protocol does not define as the carrier.
-      //
-      // Returning `undefined` keeps the *source* item, so Paseo's own renderer
-      // draws the row from the fields it already holds (its `agentMessage`), with
-      // its official event labels. Remove this branch once the host forwards
-      // `agentMessage` to plugins: the mapping below then runs everywhere, and
-      // `harness/agent-message-check.cjs` pins both halves of that contract.
-      if (item.name === "agent_message" && item.agentMessage === undefined) {
-        return undefined;
-      }
+      // Since Paseo 0.16 the app forwards `agentMessage` to plugin transformers:
+      // `sourceToolCallTimelineItem` in `packages/app/src/plugins/timeline/
+      // projection.ts` copies it beside `callId`/`name`/`detail`/`metadata`
+      // (upstream PR #8492), and its shape is the protocol's own — `{event,
+      // sender: {id, title?}, text}`. Before that the field was dropped on this
+      // way, which is why this transformer used to hand `agent_message` rows back
+      // to Paseo's renderer (`return undefined`) instead of printing the wire
+      // name over the `plain_text` echo. That branch is gone: a 0.16 host always
+      // supplies the field, so every tool call is mapped here, and
+      // `harness/agent-message-check.cjs` pins that no such guard comes back.
       return {
         items: [
           {

@@ -38,6 +38,8 @@ import {
   DshSession,
   dshSettingBooleanValue,
   modes,
+  OPTION_PERMISSION,
+  OPTION_PRESET,
   parseRoute,
 } from "./session";
 import { rewindCanaryNotice } from "./rewind-canary";
@@ -45,7 +47,7 @@ import { beginRewindReport, fallbackNoticeDescription, type RewindReportFallback
 import { effortLabel, LOCALE, UI } from "./locale";
 import { rewindSuccessText, type RewindTone } from "../shared/rewind-notice";
 import type { GoalAction, GoalErrorCode, GoalState } from "../shared/goal";
-import type { JobErrorCode } from "../shared/jobs";
+import type { JobErrorCode, JobStopResult } from "../shared/jobs";
 import { teamViewSchema, type TeamErrorCode, type TeamView } from "../shared/team";
 import { PROVIDER_ID } from "../shared/provider";
 
@@ -1817,18 +1819,22 @@ class DshConnection implements ProviderConnection {
         await session.configure({ thinkingOption: config.thinkingOption });
       }
 
-      const settings = config.settings ?? {};
+      // Paseo 0.16 hands the agent's options over as `config.providerOptions`
+      // (the host fills the deprecated `config.settings` from the same record, so
+      // reading it would only be a second name for the same values — see
+      // `mapSessionConfig` in the host's `plugin-provider.js`).
+      const options = config.providerOptions ?? {};
       // The agent preset is a creation-time choice: apply it BEFORE the agent is
       // created (loadCommands creates it) so the session is born under the chosen
       // preset. DSH locks the preset after the session's first turn, so applying it
       // after `session.ready` would already be too late — the pick would snap back
       // to the profile default.
-      const presetSetting = settings["preset"];
+      const presetSetting = options[OPTION_PRESET];
       const requestedPreset =
         typeof presetSetting === "string" && presetSetting !== "" ? presetSetting : undefined;
       if (requestedPreset !== undefined) {
         try {
-          await session.configure({ settings: { preset: requestedPreset } });
+          await session.configure({ providerOptions: { [OPTION_PRESET]: requestedPreset } });
         } catch (error) {
           process.stderr.write(`[${PROVIDER_ID}] preset "${requestedPreset}" rejected: ${messageOf(error)}\n`);
         }
@@ -1856,9 +1862,7 @@ class DshConnection implements ProviderConnection {
         // warning the user got a different persona than the one they picked and
         // no explanation anywhere in the UI.
         if (requestedPreset !== undefined) {
-          const appliedPreset = session
-            .configState()
-            .settings.find((setting) => setting.id === "preset")?.value;
+          const appliedPreset = session.configState().providerOptions?.[OPTION_PRESET];
           if (appliedPreset !== requestedPreset) {
             openWarnings.push({
               severity: "warning",
@@ -1869,12 +1873,12 @@ class DshConnection implements ProviderConnection {
             });
           }
         }
-        // Paseo sends every setting it persisted for this agent on open. A
+        // Paseo sends every option it persisted for this agent on open. A
         // `dsh:` switch is global to the DSH profile, so that stored value is the
         // host's memory, not the runtime's truth. Two shapes, deliberately
         // different:
         //  - a fresh open (the create panel put the user's picks into the new
-        //    agent's featureValues): park them and write before the first prompt.
+        //    agent's providerOptions): park them and write before the first prompt.
         //    Writing on open would be wrong — Paseo also opens a throwaway
         //    session to refresh the draft menu, and a write there would make
         //    "open the create panel" change a global switch;
@@ -1882,11 +1886,11 @@ class DshConnection implements ProviderConnection {
         //    with one daemon-stderr line; a timeline warning on every reopen
         //    would be noise the user cannot dismiss, and writing would let a
         //    reopened agent override another conversation's choice.
-        const requestedDsh = Object.entries(settings).filter(([id]) =>
+        const requestedDsh = Object.entries(options).filter(([id]) =>
           id.startsWith(DSH_SETTINGS_ID_PREFIX)
         );
         if (input.persistence === undefined) {
-          session.stagePendingDshSettings(settings);
+          session.stagePendingDshSettings(options);
         } else if (requestedDsh.length > 0) {
           const actual = session.dshSettingValues();
           // The stored value is the composer's select value (`"on"`/`"off"`) for
@@ -1901,7 +1905,7 @@ class DshConnection implements ProviderConnection {
               // keeps removing. One daemon-stderr line is the whole report —
               // there is no timeline notice on resume by design (see above).
               process.stderr.write(
-                `[${PROVIDER_ID}] ignoring DSH switch "${id}" from Paseo's stored settings: `
+                `[${PROVIDER_ID}] ignoring DSH switch "${id}" from Paseo's stored options: `
                   + `value ${JSON.stringify(value)} is not "on"/"off" or a boolean\n`,
               );
               return [];
@@ -1948,10 +1952,10 @@ class DshConnection implements ProviderConnection {
 
       // Permission applies to the live agent (it runs `/permission`), so it must
       // wait until one exists.
-      const permission = settings["permission"];
+      const permission = options[OPTION_PERMISSION];
       if (typeof permission === "string" && permission !== "") {
         try {
-          await session.configure({ settings: { permission } });
+          await session.configure({ providerOptions: { [OPTION_PERMISSION]: permission } });
         } catch (error) {
           const message = messageOf(error);
           process.stderr.write(`[${PROVIDER_ID}] permission "${permission}" rejected: ${message}\n`);
@@ -2503,6 +2507,35 @@ export async function controlAgentGoal(
   return {
     ok: false,
     error: "no DSH session is open for this agent; send it a message first, then control its goal",
+  };
+}
+
+/**
+ * Stop one background job for the agent's open session.
+ *
+ * The control twin of {@link readAgentJobs}, and it finds the session the same
+ * way: a plugin RPC handler has no channel to the connection a session belongs
+ * to, so it walks the live connections. An agent with no open session cannot be
+ * controlled — the job belongs to a DSH-side session this process must hold to
+ * address it — and that is a refusal with `session_missing`, never a quiet
+ * success: the user pressed a button on a row the pill drew, and "nothing
+ * happened" is the one answer that hides an un-stopped command.
+ *
+ * @param agentId - Paseo's agent id, as the pill knows it.
+ * @param jobId - the DSH job id from the row.
+ */
+export async function stopAgentJob(agentId: string, jobId: string): Promise<JobStopResult> {
+  for (const connection of CONNECTIONS) {
+    const session = connection.sessionForAgent(agentId);
+    if (session === undefined) continue;
+    return await session.stopJob(jobId);
+  }
+  return {
+    ok: false,
+    error: {
+      code: "session_missing",
+      message: "no DSH session is open for this agent; send it a message first, then stop its background jobs",
+    },
   };
 }
 

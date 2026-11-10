@@ -13,10 +13,10 @@ import type {
   ProviderEvent,
   ProviderMode,
   ProviderModel,
+  ProviderOptionControl,
   ProviderPermissionRequest,
   ProviderPermissionResponse,
   ProviderPrompt,
-  ProviderSetting,
   ProviderThinkingOption,
   ProviderTimelineItem,
   ProviderUsage,
@@ -29,6 +29,7 @@ import {
   type DshChildOpened,
   type DshCurrentTask,
   type DshGoal,
+  type DshJobStop,
   type DshJobs,
   type DshTeam,
   type DshMcpServer,
@@ -51,11 +52,21 @@ import { isGoalRoundSource } from "./activity-timeline";
 import { assistantStreamFirstTokenTime } from "./first-token";
 
 /**
- * Prefix of the `ProviderSetting.id` a DSH-discovered switch carries.
+ * The two option keys this provider owns: Paseo's composer reads them under
+ * these names from `providerOptions` and sends them back in `providerOptions`
+ * on a change. Neither is an override this plugin synthesises — both mirror
+ * what DSH itself reports — which is why {@link DshSession.configure} treats a
+ * `null` request (the host's "back to the provider default") as a no-op.
+ */
+export const OPTION_PRESET = "preset";
+export const OPTION_PERMISSION = "permission";
+
+/**
+ * Prefix of the option key a DSH-discovered switch carries.
  *
- * The id must be stable across sessions and recomputable from the item (Paseo
+ * The key must be stable across sessions and recomputable from the item (Paseo
  * persists the last value per agent and re-sends it on open), and it must not
- * collide with the two settings this provider owns (`preset`, `permission`) —
+ * collide with the two options this provider owns (`preset`, `permission`) —
  * hence a namespace prefix plus the entry id and field path.
  */
 export const DSH_SETTINGS_ID_PREFIX = "dsh:";
@@ -64,7 +75,7 @@ export const DSH_SETTINGS_ID_PREFIX = "dsh:";
  * The composer id of one DSH-discovered switch, e.g. `dsh:dsh-unrestricted:enabled`.
  *
  * @param item - one item from the bridge's `paseo/settings/list`.
- * @returns the `ProviderSetting.id` the composer shows and sends back.
+ * @returns the option key the composer shows and sends back.
  */
 export function dshSettingId(item: Pick<DshSettingsToggle, "ns" | "field">): string {
   return `${DSH_SETTINGS_ID_PREFIX}${item.ns}:${item.field.path.join(".")}`;
@@ -74,8 +85,8 @@ export function dshSettingId(item: Pick<DshSettingsToggle, "ns" | "field">): str
  * The two wire values the composer's select row uses for one DSH switch.
  *
  * The bridge contract stays boolean (`paseo/settings/set` takes a boolean and
- * `DshSettingsToggle.field.value` is one), but Paseo's `ProviderSetting` has no
- * way to give a `toggle` a name or a state on the desktop toolbar: it draws the
+ * `DshSettingsToggle.field.value` is one), but a Paseo `toggle` control has no
+ * way to give a gesture a name or a state on the desktop toolbar: it draws the
  * toggle as an icon-only button, and `getFeatureIconColor` returns the muted
  * color for a feature id it does not know, so the button carries neither text
  * nor state. The same switch projected as a `select` renders as the
@@ -99,7 +110,7 @@ export function dshSettingSelectValue(value: boolean): DshSettingSelectValue {
  * predate the upgrade. Everything else is a protocol bug and must not be
  * coerced (`Boolean("off")` is `true`, which would silently turn the switch on).
  *
- * @param value - `config.settings[id]` from `session.open`/`session.configure`.
+ * @param value - `providerOptions[id]` from `session.open`/`session.configure`.
  * @returns the boolean, or `undefined` when the value is not one of the two shapes.
  */
 export function dshSettingBooleanValue(value: unknown): boolean | undefined {
@@ -727,8 +738,8 @@ export class DshSession {
    * `dsh:`-prefixed values Paseo sent on **open** that are not yet applied.
    *
    * Paseo's create panel puts the user's picks into the new agent's
-   * `featureValues`, and the provider hands them back as `config.settings` on
-   * open. Writing them immediately would be wrong: Paseo also opens a throwaway
+   * `providerOptions`, and the provider hands them back as `config.providerOptions`
+   * on open. Writing them immediately would be wrong: Paseo also opens a throwaway
    * session to refresh the draft menu, and applying on open would turn "open the
    * create panel" into a global write. So they are parked here and written
    * before the first prompt of a real conversation; a session that is never
@@ -914,21 +925,37 @@ export class DshSession {
     }
   }
 
-  /** The committed configuration Paseo renders in the composer. */
+  /**
+   * The committed configuration Paseo renders in the composer.
+   *
+   * Paseo 0.16 splits what used to travel as one `settings` array: `controls`
+   * names the option keys that get a composer control (a control holds no value
+   * — see `ProviderOptionControl`), and `providerOptions` carries what this
+   * session runs with now. The host reads the pair as soon as either is present
+   * (`readPluginOptionState` in its `plugin-provider-options.js`) and from then
+   * on sends changes back only under `providerOptions`, so reporting the
+   * deprecated `settings` next to them would be a second, unread vocabulary.
+   */
   configState(): ProviderConfigState {
-    const settings: ProviderSetting[] = [];
+    const controls: ProviderOptionControl[] = [];
+    const providerOptions: Record<string, JsonValue> = {};
     // The agent preset is a creation-time persona + capability set. Paseo still
     // renders it as a normal select, but DSH locks the choice once the session's
     // first turn starts, so switching it later is rejected and snaps back.
     if (this.#presetOptions.length > 0) {
-      settings.push({
+      controls.push({
         type: "select",
-        id: "preset",
+        key: OPTION_PRESET,
         label: UI.settings.preset.label,
         description: UI.settings.preset.description,
-        value: this.#preset,
-        options: this.#presetOptions,
+        // No `defaultValue`: that field marks the choice the composer shows while
+        // the key has no value *and* becomes `isDefault` in the host's legacy
+        // `features` projection, and the default preset is DSH's own pick, not
+        // necessarily the one this session runs. The committed value is published
+        // below, so the control has a value whenever the catalog has one.
+        choices: this.#presetOptions,
       });
+      if (this.#preset !== null) providerOptions[OPTION_PRESET] = this.#preset;
     }
     // Surface DSH's permission presets as a composer control, so switching
     // between sandboxed and full access doesn't require typing /permission.
@@ -936,21 +963,21 @@ export class DshSession {
     // The label is the preset's own configured `name`, never its key: a
     // deployment that renames presets (including into another language) must see
     // its label, while `value` stays the key `/permission` accepts. DSH's
-    // per-preset `description` is not carried here because Paseo's select
-    // options have no description slot — it stays on the bridge response for a
-    // future UI that can show it.
+    // per-preset `description` is still not carried: 0.16's `choices[].description`
+    // could hold it, but showing it is a UI change this options migration does
+    // not make — it stays on the bridge response.
     if (this.#permissionPresets.length > 0) {
-      settings.push({
+      controls.push({
         type: "select",
-        id: "permission",
+        key: OPTION_PERMISSION,
         label: UI.settings.permission.label,
         description: UI.settings.permission.description,
-        value: this.#permission,
-        options: this.#permissionPresets.map((preset) => ({
+        choices: this.#permissionPresets.map((preset) => ({
           label: preset.name,
           value: preset.value,
         })),
       });
+      if (this.#permission !== null) providerOptions[OPTION_PERMISSION] = this.#permission;
     }
     const thinkingOptions = this.#thinking();
     // Simple third-party DSH switches (see `#dshSettings`). The label is the
@@ -968,17 +995,17 @@ export class DshSession {
     // the plain on/off words; the row's `label` carries the switch's name (see
     // {@link dshSettingOptionLabel} for why the name is not repeated there).
     for (const item of this.#dshSettings) {
-      settings.push({
+      controls.push({
         type: "select",
-        id: dshSettingId(item),
+        key: dshSettingId(item),
         label: dshSettingLabel(item),
         description: UI.settings.dshToggle.description,
-        value: dshSettingSelectValue(item.field.value),
-        options: [
+        choices: [
           { label: dshSettingOptionLabel(true), value: dshSettingSelectValue(true) },
           { label: dshSettingOptionLabel(false), value: dshSettingSelectValue(false) },
         ],
       });
+      providerOptions[dshSettingId(item)] = dshSettingSelectValue(item.field.value);
     }
     return {
       model: `${this.#route.provider}/${this.#route.model}`,
@@ -989,7 +1016,8 @@ export class DshSession {
       // {@link DshSessionOptions.modes} for why this has to be one source.
       modes: this.#modes,
       thinkingOptions,
-      settings,
+      controls,
+      providerOptions,
     };
   }
 
@@ -1131,7 +1159,7 @@ export class DshSession {
    * Park the `dsh:` values a **new** session's open carried, without writing.
    *
    * Only a fresh open (no persistence handle) has this shape: Paseo's create
-   * panel writes the user's picks into the new agent's `featureValues`. A
+   * panel writes the user's picks into the new agent's `providerOptions`. A
    * resumed session must never apply its stored values (they are the host's
    * memory of a global switch, not the runtime's truth), so the provider does
    * not call this on resume.
@@ -1143,7 +1171,7 @@ export class DshSession {
    * filtered here — {@link applyPendingDshSettings} drops those at write time,
    * after the list has been re-read, with its own log line.
    *
-   * @param settings - `config.settings` from `session.open`.
+   * @param settings - `config.providerOptions` from `session.open`.
    */
   stagePendingDshSettings(settings: Record<string, unknown> | undefined): void {
     if (settings === undefined) return;
@@ -1436,6 +1464,31 @@ export class DshSession {
   }
 
   /**
+   * Stop one background job this session owns — the jobs popover's row action.
+   *
+   * Routed through the bridge's `paseo/jobs/stop`, which calls DSH's registry
+   * `kill()`; the answer is a value with a code so the popover can show the
+   * refusal in place (see `shared/jobs.ts`). The two "the holder is gone"
+   * branches answer a transient `rpc_failed` rather than throwing, for the same
+   * reason {@link jobs} does: the user closed the session, and a throw would
+   * surface that as a failed request for something already gone.
+   */
+  async stopJob(jobId: string): Promise<DshJobStop> {
+    if (this.#closed) {
+      return { ok: false, error: { code: "rpc_failed", message: "this DSH session is closed" } };
+    }
+    const process = this.#process;
+    if (process === undefined) {
+      return { ok: false, error: { code: "rpc_failed", message: "no DSH process serves this session" } };
+    }
+    try {
+      return await process.stopJob(this.#dshSessionId, jobId);
+    } catch (error) {
+      return { ok: false, error: { code: "rpc_failed", message: messageOf(error) } };
+    }
+  }
+
+  /**
    * The goal this session currently owns, for the composer's goal pill.
    *
    * Not cached or coalesced, for the same reason as {@link jobs}: a poll wants a
@@ -1536,11 +1589,14 @@ export class DshSession {
    * Run one `/goal` control action through the runtime's command path.
    *
    * The path is the one the slash menu already uses — bridge
-   * `paseo/command/run` → DSH's `commands.execute` → `dsh-command-goal` — which
-   * is what makes the buttons work while a turn is running: a hand-typed
-   * `/goal …` during a turn is steered into the model as plain text (the host
-   * intercepts commands only when idle), while this call goes straight to the
-   * command registry. DESIGN §1.2/§2 and the P3 probe both rely on that.
+   * `paseo/command/run` → DSH's `commands.execute` → `dsh-command-goal` — so the
+   * buttons execute the command itself instead of typing it. A hand-typed
+   * `/goal …` works during a turn too (confirmed on a real machine; the earlier
+   * "steered into the model as plain text" note here was a source-code inference
+   * and was wrong), but it travels as a prompt: it lands as a user message and
+   * depends on how the host routes an idle prompt versus a steer. This call skips
+   * that routing entirely and answers with the registry's own receipt, which is
+   * what the popover renders.
    *
    * DSH's answer is returned **verbatim**, including a refusal: a
    * paused-at-round-limit goal rejects `resume`, and reporting that as success
@@ -2442,7 +2498,30 @@ export class DshSession {
       this.#mode = accepted ? "plan" : "build";
     }
 
-    const requestedPermission = changes.settings?.["permission"];
+    // 0.16 sends option changes under `providerOptions` only. This provider
+    // reports `controls`/`providerOptions` (see {@link configState}), which takes
+    // the host out of its legacy-`settings` mode, so the deprecated field is
+    // never filled (`applyOptions` in the host's `plugin-provider.js`). Every key
+    // here must be applied or the whole request fails — the host states that, and
+    // half-applying a composer with several selects would leave the UI lying.
+    //
+    // `null` asks to "return the key to the provider's own default". None of
+    // these keys is such a default: `preset` and `permission` are DSH's own
+    // current values and a `dsh:` switch is the profile's global one, so there is
+    // nothing of ours to clear. A `null` is therefore skipped, with one log line;
+    // the config emitted after this call carries the runtime's value back and the
+    // composer snaps to it instead of showing a default that does not exist.
+    const requestedOptions = changes.providerOptions ?? {};
+
+    const requestedPermission = requestedOptions[OPTION_PERMISSION];
+    if (requestedPermission !== undefined && requestedPermission !== null) {
+      if (typeof requestedPermission !== "string") {
+        throw new Error(
+          `option "${OPTION_PERMISSION}" must be a permission preset key; `
+            + `got ${JSON.stringify(requestedPermission)}`,
+        );
+      }
+    }
     if (
       typeof requestedPermission === "string" &&
       requestedPermission !== "" &&
@@ -2456,7 +2535,15 @@ export class DshSession {
       this.#permission = applied.current ?? requestedPermission;
     }
 
-    const requestedPreset = changes.settings?.["preset"];
+    const requestedPreset = requestedOptions[OPTION_PRESET];
+    if (requestedPreset !== undefined && requestedPreset !== null) {
+      if (typeof requestedPreset !== "string") {
+        throw new Error(
+          `option "${OPTION_PRESET}" must be an agent preset id; `
+            + `got ${JSON.stringify(requestedPreset)}`,
+        );
+      }
+    }
     if (
       typeof requestedPreset === "string" &&
       requestedPreset !== "" &&
@@ -2501,8 +2588,14 @@ export class DshSession {
     // The composer sends the select value (`"on"`/`"off"`); a boolean is still
     // accepted because Paseo can hand back a value persisted while this row was
     // a toggle. The bridge contract stays boolean either way.
-    for (const [id, requested] of Object.entries(changes.settings ?? {})) {
+    for (const [id, requested] of Object.entries(requestedOptions)) {
       if (!id.startsWith(DSH_SETTINGS_ID_PREFIX)) continue;
+      if (requested === null) {
+        // See the block comment above: the runtime's value is the only default
+        // this key has, so a reset request has nothing to write.
+        this.#options.log(`ignoring reset request for DSH setting "${id}"; the runtime value is the only default`);
+        continue;
+      }
       const requestedValue = dshSettingBooleanValue(requested);
       if (requestedValue === undefined) {
         throw new Error(dshSettingUnexpectedValueMessage(id));

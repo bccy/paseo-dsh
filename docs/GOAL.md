@@ -45,12 +45,15 @@ Paseo 0.14.0。
   桥原样转发（`dsh-bridge/lib/server.js:591-619`；重放白名单
   `dsh-bridge/lib/image-host-path.js:397-418` 的 `goal/change`）。
 
-插件侧两个 RPC（`paseo-plugin/shared/goal.ts:223-267`，Zod 两侧同源，仿 `shared/jobs.ts`；
-注册在 `paseo-plugin/index.server.ts:105-124`）：
+插件侧一个订阅 + 一个 RPC（`paseo-plugin/shared/goal.ts:270,291`，Zod 两侧同源，仿 `shared/jobs.ts`；
+订阅注册在 `paseo-plugin/index.server.ts:148`，`goal.control` 在 `:168`）：
 
-- `goal.current {agentId}` → `{available, goal: GoalState | null, error?: {message, code?}}`。
-  **错误形状与 jobs 的 `{available, jobs, error?: {message, code?}}` 同形**（嵌套 error 对象 +
-  可选 code）；DESIGN §1.2 的字面写法是顶层 `error`/`code`，Lead 已裁决以实现为准（验证报告 B-3）。
+- `goal.snapshot {agentId}`（`defineSubscription`）→ 事件就是完整快照
+  `{available, goal: GoalState | null, error?: {message, code?}}`：一个 agent 一条订阅，由服务端
+  `server/pill-feed.ts` 的共享读器推送（首个订阅者立即读，之后 4s 基准、只在快照变化时推），
+  客户端不再自己起定时器。**错误形状与 jobs 的 `{available, jobs, error?: {message, code?}}` 同形**
+  （嵌套 error 对象 + 可选 code）；DESIGN §1.2 的字面写法是顶层 `error`/`code`，Lead 已裁决以实现为准
+  （验证报告 B-3）。
   `GoalState = {id, revision, objective, phase, activation, roundsStarted, maxGoalRounds,
   blockedReason?{code,message}, currentTask?}`——绘制需要的字段，外加 `id`/`revision`（UI-v7：完成态「已读」的键，
   客户端从不回传；同一句目标可能完成两次，所以不能用 objective 当键）；时间戳不泄漏
@@ -66,7 +69,7 @@ Paseo 0.14.0。
 |---|---|---|
 | `bridge_too_old` | profile 的桥没有 `paseo/goal`（旧内嵌桥） | 终态：重载插件重写内嵌桥 |
 | `goal_unavailable` | profile 没挂 goal 服务 | 终态：隐藏 pill，不重试 |
-| `session_missing` | 会话还没建 / 正在拆 | 瞬时：继续退避轮询 |
+| `session_missing` | 会话还没建 / 正在拆 | 瞬时：feed 继续退避重读 |
 | `rpc_failed` | 读本身失败（超时、传输、撕裂的通道） | 瞬时 |
 
 - 缺 code 一律按瞬时处理（老服务端只发 message 时的兼容）。
@@ -100,7 +103,7 @@ title 仍是「后台任务」；图标是 `SquareTerminal`，运行中右下角
 在 pill 上也只读「目标」（用户已接受）。状态由图标表达（颜色、运行环、完成对勾），并由**面板目标行的
 无障碍名**说出完整状态：「目标进行中，编辑目标」「目标已完成，<目标>」等（`goalStateName` + `rowLabel`）。
 两个字符串由纯函数 `goalPillCopy`（`client/goal-polling.ts`）给出。完整 objective 只在 popover 正文出现一次。
-注册时先 `visible:false`，第一次轮询证明有目标才显示。
+注册时先 `visible:false`，`goal.snapshot` 的首个快照证明有目标才显示。
 
 **可见性**：`available && goal !== null`，且 complete 时**用户还没看过**。无目标 / 已清除 → 隐藏。
 complete 是本插件对 DSH 的有界扩展：DSH Web 的 GoalBar 对 complete 当即不渲染
@@ -193,13 +196,16 @@ goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等�
   **发送新消息不算已读**（2026-11-07 修复）：完成当轮的 running→idle 与用户下一条消息触发的 idle→running 都不写 seen——此前把「下一回合开始」当作用户已看过，
   未点开面板的目标会在发下一条消息后消失；若首次观察到 complete 时 agent 已 idle，也只等待面板关闭。清除后 goal 为 null，自然隐藏。
   agent 状态仍从 pill 已有的 `agents.list({subscribe})` 快照与 upsert 记录，但只用于运行环等展示，不参与「已读」判定。
-- **持久化（2026-11-08）**：`seen` 写进宿主插件设置 `goal-pill-seen`（host scope，`{seen: {agentId: id:revision}}`，最多 64 条，
-  `shared/goal-seen-settings.ts` + `client/seen-persistence.ts`）：**确认关闭**后写一次，客户端 bundle 启动时异步读取、读完前不推送可见性——
-  刷新 / 重开 App / 插件 reload、daemon 重启后 complete 不再重显；宿主无插件设置或读写失败时退回内存态（会再出现一次，只 console 一次），
-  卸载/重装插件重置一次。读到被拒（corrupt / 版本不符）的文档会 best-effort `reset` 修复（与读共用同一 2s 门限），成功后重新开始记录；修复失败退回内存态。同一 objective 的新目标（新 id）或新 revision 会重新显示。
+- **持久化（2026-11-08 起；2026-11-11 换到 agent metadata）**：`seen` 现在是 Paseo **agent 记录上的插件元数据**，键
+  `dsh.goalSeen`，值就是 `id:revision`（`shared/pill-metadata.ts` + `client/seen-metadata.ts`）：**确认关闭**后写一次
+  （`paseo.agents.ref(agentId).setMetadata`，非 React、对空闲 agent 也有效），读则随 agent 目录快照一起到达——注册 pill 之前就已知，
+  所以不再需要「读完前不推送」的水位门。刷新 / 重开 App / 插件 reload、daemon 重启后 complete 不再重显；写失败一条 console 且本会话
+  仍隐藏（只是下次重开再显一次）。原来的宿主插件设置文档（`goal-pill-seen`、64 条上限、`invalid` 文档 `reset` 修复、跨端写冲突合并）
+  随 0.16 端口一并删除：一个 agent 只有一条签名，元数据按 key 覆盖写，没有第二个文档要对账。同一 objective 的新目标（新 id）或新
+  revision 会重新显示。
 - **重连不再清「已读」（2026-11-09 回归修复）**：现象是用户关闭完成面板后 pill「过一会又出现」。先排除了「revision 变了所以键不匹配」这一解释：DSH 只在目标的 durable mutation（create / edit / pause / resume / block / complete / clear）时递增 revision（`dsh-goal/lib/index.js`），一个不再被改动的完成态键是稳定的。问题在**客户端的记忆**，两条路径各丢一次：
-  1. **快照被当成拆除**：`client/agent-polling.ts` 的 `applySnapshot` 原先一进来就 `removeAll()` 再按快照重建，而宿主在**每次 WS 重连**都会重发一份目录快照，于是同一 agent 被「移除→重加」。现在改为**差集移除**：等整份快照（含所有分页）到齐后，只移除新快照里不再出现的 agent；仍被列出的 agent 保留注册、定时器与已读状态。不完整的快照（`hasMore` 但没有 next cursor、分页读失败、被更新的快照取代）一律不移除；分页窗口内由 `upsert` 推送的新 agent 会登记进本次保留集，不会被误删。终态码（`bridge_too_old` / `goal_unavailable`）摘掉的 pill 仍保持「裸 `upsert` 不重启」的既有规则，但**新快照会重建它**（宿主重新描述目录 = 运行时可能已被修好，旧实现靠 `removeAll` 顺带做到这一点）。
-  2. **移除路径抹掉了已读**：移除时调 `persistence.forget`，连**已落盘**的键一起屏蔽，于是重连 / 权限重试 / 终态恢复都会把已读的目标再显示一次。它本来是为了「不要用旧键藏住用户没看过的目标」，但键本身就排除了这种情况——DSH 每个新目标都铸新 `goal-<uuid>`，记下的键只能命中用户确实关过的那个完成 revision。该 API 与两处调用已在 2026-11-09 删除，移除只清内存态（`seenStates.delete`）；新目标或新 revision 自然是新键、照常显示（team pill 同源，同一处修复；team 的键是整板 `task-N:revision` 集合，只在同一 journal 内唯一，见 `docs/TEAM.md`）。
+  1. **快照被当成拆除**：`client/agent-subscriptions.ts` 的 `applySnapshot`（前身 `client/agent-polling.ts`）原先一进来就 `removeAll()` 再按快照重建，而宿主在**每次 WS 重连**都会重发一份目录快照，于是同一 agent 被「移除→重加」。现在改为**差集移除**：等整份快照（含所有分页）到齐后，只移除新快照里不再出现的 agent；仍被列出的 agent 保留注册、订阅与已读状态。不完整的快照（`hasMore` 但没有 next cursor、分页读失败、被更新的快照取代）一律不移除；分页窗口内由 `upsert` 推送的新 agent 会登记进本次保留集，不会被误删。终态码（`bridge_too_old` / `goal_unavailable`）摘掉的 pill 仍保持「裸 `upsert` 不重启」的既有规则，但**新快照会重建它**（宿主重新描述目录 = 运行时可能已被修好，旧实现靠 `removeAll` 顺带做到这一点）。
+  2. **移除路径抹掉了已读**：当时的移除路径调 `persistence.forget`，连**已落盘**的键一起屏蔽，于是重连 / 权限重试 / 终态恢复都会把已读的目标再显示一次。它本来是为了「不要用旧键藏住用户没看过的目标」，但键本身就排除了这种情况——DSH 每个新目标都铸新 `goal-<uuid>`，记下的键只能命中用户确实关过的那个完成 revision。该 API 与两处调用已在 2026-11-09 删除，移除只清内存态（`seenStates.delete`；2026-11-11 起 metadata store 也没有任何移除 API）；新目标或新 revision 自然是新键、照常显示（team pill 同源，同一处修复；team 的键是整板 `task-N:revision` 集合，只在同一 journal 内唯一，见 `docs/TEAM.md`）。
 
 **为什么不做 todo 进度条**：todo 的产生侧不可靠——调查 38 个真实 DeepSeek 会话：20 个从不调
 `todo_write`，9 个只写 1 次（之后不再更新），8 个写 2 次（多在结束前一次性全标完成，其中 3 个
@@ -207,11 +213,13 @@ goal 会话提前标 100% 后又跑了 43–101 分钟），只有 1 个中途�
 停在 0% 或突然 100%；可靠进度只有 goal 自己的轮次，所以轮次也只当**预算**展示，todo 只用于
 「正在」一行。
 
-- 数据每 agent 轮询 `goal.current`，节奏与 jobs **完全相同**（共用
-  `paseo-plugin/client/agent-polling.ts`）：4s 基准（可见/隐藏同频）、20% 抖动封顶 2s、
-  首轮 0–1s 抖动、失败退避 4→8→16→30s、终态码停表、答案签名去重（未变不 publish/update）。
-  goal 侧只多一条策略：瞬时错误不发布（保持上次状态）。没有推送通道可用：provider 事件枚举里
-  没有 goal（survey §F4），只能轮询。
+- 数据由**服务端订阅推送**（2026-11-11，Paseo 0.16）：`shared/goal.ts` 的 `goal.snapshot`（input
+  `{agentId}`，事件是完整快照）。`server/pill-feed` 每 agent 只读一次（多个客户端订同一 agent 不
+  加读），4s 基准 + 20% 抖动、失败退避 4→8→16→30s、**只在快照变化时推**、终态码推一次后停表、
+  无订阅者即停；`goal.control` 成功后立刻 `refresh` 一次，所以按钮按下后 pill 当场变。
+  客户端 `client/agent-subscriptions` 只做「一条订阅 per agent + 发布去重 + 终态摘 pill」。
+  goal 侧多一条策略：瞬时错误不发布（保持上次状态）。provider 事件枚举里仍没有 goal（survey §F4），
+  订阅是插件自己的通道，不是 provider 事件。
 - 文案全部进 `client/locale.ts`（zh-CN / en），`locale-check` 覆盖 goal 表。
 
 ## 运行中发消息：默认不打断目标
@@ -237,7 +245,7 @@ Paseo 的发送行为默认是 `sendBehavior: "steer"`（Paseo `packages/app/src
 
 pill 的按钮走**命令注册表**而不是 steer：`paseo-plugin/server/session.ts:1067-1092` 的
 `controlGoal` → `dsh-process.runCommand` → 桥 `paseo/command/run` → DSH `commands.execute` →
-`dsh-command-goal`。所以运行中也能暂停 / 恢复 / 清除，且不会像手打那样被宿主 steer 进模型。
+`dsh-command-goal`。所以运行中也能暂停 / 恢复 / 清除，且不产生一条用户消息。
 **这条是源码结论**（P3 探针在运行中代发过命令，survey §F3）；真机点 pill 按钮的验收待 FINAL。
 
 ## 重开：状态保留，续跑 disarm
@@ -258,22 +266,25 @@ pill 的按钮走**命令注册表**而不是 steer：`paseo-plugin/server/sessi
 补充：重开时历史回合以 `turn:history:N` 重放，Paseo 宿主对 history 事件走 `fromHistory` 分支
 （survey §F5 补充）；UI 侧表现未实测。
 
-## 已知限制：运行中手打 `/goal` 会被当成普通文本
+## 更正：运行中手打 `/goal` 能正常触发命令
 
-**控制必须走 pill 按钮（插件 RPC），不要依赖用户在运行中手打命令。** 原因【源码推断·survey §F1 末尾】：
+**用户真机确认（2026-11-10）：运行中手打 `/goal …` 能正常触发命令。** 本节早先写的「会被当
+普通文本 steer 进模型」是**源码推断**（survey §F1 末尾：宿主对 out-of-band 命令的拦截依赖
+provider 的 `tryHandleOutOfBand`，而插件 provider 没实现该方法；运行中的 steer 路径又把 prompt
+一律映射成 `{type:"message"}`），**结论错误**，已按真机观察更正。别再把这条推断当事实引用。
 
-- 宿主对 out-of-band 命令的拦截依赖 provider 的 `tryHandleOutOfBand`
-  （Paseo `packages/server/src/server/agent/agent-prompt.ts:114`、
-  `agent-manager.ts:2635-2637`），而插件 provider 没有实现该方法。
-- 运行中的 steer 路径把 prompt 一律映射成普通 message
-  （Paseo `plugin-provider.ts:1219-1223` 的 `input: { type: "message", content }`）；
-  只有空闲路径才用 `mapPromptInput` 把 `/goal ...` 识别成 command
-  （`plugin-provider.ts:1193-1198,1768-1784`）。
+pill 的按钮仍然走**插件 RPC → 命令注册表**，不是模拟一条人类输入。理由都是现有代码里能指到的：
 
-所以运行中手打 `/goal pause` 很可能变成一条插进当前轮次的人类消息（模型看到 "pause" 字样），
-命令不执行、目标状态不变。**该结论未在 App 上实测**（survey §F7 未验证第 1 条）。已实测的是
-反过来的路径：插件 RPC 代发 `/goal pause|resume|clear|<objective>` 四条全部被 DSH 接受，失败
-以 `error` 回执 + 原文返回（survey §F3）。
+- **它执行的是命令本身，不经过 prompt 投递**：`controlGoal` → `dsh-process.runCommand` → 桥
+  `paseo/command/run` → `commands.execute(agent, "/goal …")`
+  （`dsh-bridge/lib/server.js:2500-2513`）。因此不产生一条用户消息，也不依赖宿主对「空闲 →
+  `startTurn`」与「运行中 → `steerActiveTurn`」两条路径的区分——后者在 0.16 的
+  `plugin-provider.js` 里把输入硬写成 `{type:"message"}`。
+- **回执就是注册表的执行结果**：`runCommand` 把 `commands.execute` 的 `kind` / `text` 原样带回，
+  popover 显示的是运行时的原话；命令被拒（例如 paused 且到轮数上限的 `resume`）以 `error`
+  原文返回，不会伪装成成功。
+- **两条互补通道**：pill 的状态来自 `goal.snapshot` 订阅（服务端共享读器推送），按钮走 `goal.control`
+  RPC 并在成功后由服务端 `goalFeed.refresh` 立即重读；两者都不借 prompt 事件流。
 
 ## 时间线：状态行与续跑轮次行
 
@@ -390,7 +401,8 @@ DSH 判参数非法。两者都在写入前拒绝，目标不受影响（FIELD-N
 的设计假设（撤回先结算回合），不算缺陷。
 
 **产品含义**：撤回与「点停止」对目标的影响相同——运行中撤回会把目标暂停。pill 在撤回后
-显示「目标已暂停」+「继续」；状态由既有的 `goal.current` 轮询跟上，不需要额外接线。
+显示「目标已暂停」+「继续」；状态由 `goal.snapshot` 订阅推送跟上（`goal.control` 成功后服务端立即
+`goalFeed.refresh(agentId)` 重读，不等下一个节拍），不需要额外接线。
 **不改撤回 × goal 的行为**：`goal/change` 不参与撤回是源码事实，暂停是「取消回合」的既有
 语义，不是撤回新增的副作用。
 
@@ -405,7 +417,7 @@ DSH 判参数非法。两者都在写入前拒绝，目标不受影响（FIELD-N
 | 检查 | 断言 | 依赖 | 触发 |
 |---|---|---|---|
 | `harness/goal-bridge-check.mjs` | 15/15 | **本机 DSH 安装**（从全局安装解析 `@deepseek-ai/*`，`DSH_PACKAGES_DIR`/`DSH_INSTALL_DIR` 可覆盖；没有就 exit 2） | 动 `dsh-bridge/lib/server.js` 的 `paseo/goal` / dispatch |
-| `harness/goal-pill-check.cjs` | 400/400 | 纯模块（`tsc -p harness/goal-pill.tsconfig.json`） | 动 `client/goal-polling.ts`、`client/goal-popover.tsx`、`client/goal-pill.tsx`、`client/goal-running.tsx`、`client/agent-polling.ts`、`shared/goal.ts` 或 locale goal 表 |
+| `harness/goal-pill-check.cjs` | 309/309 | 纯模块（`tsc -p harness/goal-pill.tsconfig.json`） | 动 `client/goal-polling.ts`、`client/goal-popover.tsx`、`client/goal-pill.tsx`、`client/goal-running.tsx`、`client/agent-subscriptions.ts`、`client/seen-metadata.ts`、`shared/goal.ts`、`shared/pill-metadata.ts` 或 locale goal 表 |
 | `harness/goal-popover-render-check.cjs` | 245/245 | `HOST_APP` 指向 Paseo 检出（react-native-web + jsdom 渲染真实面板）；未设置 exit 2 | 动 `client/goal-popover.tsx`、`client/deepseek-mark*.tsx` 或面板用到的 `goal-polling.ts` 规则 |
 | `harness/goal-server-check.cjs` | 39/39 | 真实插件 + 假桥（一次性 `DSH_HOME`） | 动 `server/provider.ts` / `server/session.ts` 的 goal 读写、`server/dsh-process.ts` 的 goal 分级与 `currentTask`、`index.server.ts` 的 handler、桥的缺失服务文案 |
 | `harness/goal-timeline-check.cjs` | 6 组 | 真实 `DshSession` + 假进程传输（`plugin-build.cjs` 自编译） | 动 `server/activity-timeline.ts` 的 goal 行、`server/session.ts` 的重放过滤、`server/locale.ts` 的 `goalRound` |
@@ -445,8 +457,9 @@ claim 后拒绝 / 落 surface 走正常路径 / close 清理）。
 ## 边界（不做）
 
 - **不声明 goal 能力位**：Paseo 的 provider 能力枚举里没有 goal（survey §E2），声明了宿主也不认。
-- **不改 Paseo 协议、不推送 goal 事件**：provider 事件形状里没有 goal，只能轮询（survey §F4）。
+- **不改 Paseo 协议、不推送 goal 事件**：provider 事件形状里没有 goal，只能在服务端定时读、
+  再经插件订阅 `goal.snapshot` 推给客户端（survey §F4）。
 - **不在 pill 里新建目标**：没有目标时 pill 不可见；空闲时用 `/goal <目标>` 创建（或让模型调
   `create_goal`）。
-- **不拦截运行中手打的 `/goal`**：宿主 steer 路径把它当文本；正确入口是 pill。
+- **不拦截运行中手打的 `/goal`**：它能正常触发（真机确认）；pill 走 RPC 只为不经 prompt 投递。
 - **不重写 goal 状态机**：CAS、revision、轮数上限、blocked 码全部由 DSH 维护，我们只读与转发。

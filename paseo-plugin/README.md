@@ -70,7 +70,7 @@ What you get that the ACP boundary can't carry:
 Full documentation, the adoption guide, and 70+ real defects with their fixes
 live in the main repository: **https://github.com/bccy/paseo-dsh**
 
-Requires Paseo ≥ 0.9.2, **DSH ≥ 0.2.1**, **Node.js ≥ 20.4** (the bridge uses
+Requires Paseo ≥ 0.16, **DSH ≥ 0.2.1**, **Node.js ≥ 20.4** (the bridge uses
 `AbortSignal.any` and `Symbol.dispose`) and the official `dsh` on the daemon's
 `PATH`. The bridge imports eight DSH-internal packages (`dsh-cmdline`,
 `dsh-brand`, `dsh-llm`, `dsh-attachment`, `dsh-agent`, `dsh-tools`,
@@ -147,7 +147,7 @@ ACP 承载不了、而这里都有：
 完整文档、改造指南、以及 70+ 个真实缺陷的修复记录都在主仓库：
 **https://github.com/bccy/paseo-dsh**
 
-需要 Paseo ≥ 0.9.2、**DSH ≥ 0.2.1**、**Node.js ≥ 20.4**（桥用了 `AbortSignal.any` 与
+需要 Paseo ≥ 0.16、**DSH ≥ 0.2.1**、**Node.js ≥ 20.4**（桥用了 `AbortSignal.any` 与
 `Symbol.dispose`），且 daemon 的 `PATH` 上有官方 `dsh`。桥直接 import
 八个 DSH 内部包（`dsh-cmdline` / `dsh-brand` / `dsh-llm` / `dsh-attachment` / `dsh-agent` /
 `dsh-tools` / `dsh-subprocess` / `schemastery`）；`0.2.1-rc.2` 是实测通过的版本，0.2.0 及

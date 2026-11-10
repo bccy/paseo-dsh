@@ -71,7 +71,20 @@ const DIM = "\u001b[2m";
 const RESET = "\u001b[0m";
 
 /** Paseo gained the direct-provider-plugin API in this release. */
-const MINIMUM_PASEO = "0.9.2";
+/**
+ * The plugin API this build is written against: Paseo 0.16 moved composer
+ * options to `controls`/`providerOptions`, and 0.15 hosts still read the
+ * deprecated `settings` array — one build cannot serve both, so the floor moves
+ * with the migration.
+ *
+ * Compared by core digits only (`atLeast`), so a `0.16.0-beta.1` host counts as
+ * `0.16.0` and a 0.15 host does not. That is the same policy as `compareCore`
+ * below, and it is why the string here is the stable form while the npm range in
+ * `package.json` has to spell out the prerelease: npm's semver ranks
+ * `0.16.0-beta.1` below `0.16.0`, so `>=0.16.0` would reject the only 0.16 build
+ * published today.
+ */
+const MINIMUM_PASEO = "0.16.0";
 
 /**
  * The DSH version this build was verified against (`0.2.1-rc.2`, 2026-10-20).
@@ -729,7 +742,11 @@ export function runDoctor() {
   if (paseo === undefined) {
     report("fail", "paseo CLI not found", "expected `paseo` on PATH or /Applications/Paseo.app");
   } else if (!atLeast(paseo.version, MINIMUM_PASEO)) {
-    report("fail", `paseo ${paseo.version}`, `needs Paseo >= ${MINIMUM_PASEO} for the direct provider plugin API`);
+    report(
+      "fail",
+      `paseo ${paseo.version}`,
+      `needs Paseo >= ${MINIMUM_PASEO} (composer options moved to controls/providerOptions in 0.16; a 0.15 host is not supported)`,
+    );
   } else {
     report("ok", `paseo ${paseo.version}`);
     // The profile can exist without the plugin — `install.sh` creates one too —
