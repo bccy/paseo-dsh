@@ -22,8 +22,9 @@
  *   before publishing.
  * - **Failure is loud, never silent.** A read that reports `available: false` is
  *   pushed like any other answer (the client decides what a failed read means for
- *   its pill); a read that *throws* is reported once per failure streak and
- *   retried with backoff, because there is no answer to hand the client.
+ *   its pill); a read that *throws* is reported on every failed attempt (one
+ *   line each, no per-failure-streak dedup) and retried with backoff, because
+ *   there is no answer to hand the client.
  * - **A terminal code stops the feed.** `bridge_too_old`, `goal_unavailable`,
  *   `team_unavailable`, `registry_missing` say retrying cannot help; the answer
  *   is pushed once and the timer stops (the client removes its pill on it). A new

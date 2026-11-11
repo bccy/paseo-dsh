@@ -211,22 +211,24 @@ Reload agent 或重开会话"），**再**发 `request.completed`：
          → 插件再发 request.completed
 ```
 
-这条通知的**可见性分三层，别混**（依据 Paseo 0.15.0 的 `plugin-provider.js` 与
+这条通知的**可见性分两层，别混**（依据 Paseo 0.15.0 的 `plugin-provider.js` 与
 `agent-manager.js`；**真机「0.15 撤回」尚未复验**）：
 
 - **live 投递看不到（所有宿主都一样）**：撤回期间宿主持有 foreground run lock
   （`AgentManager.rewind` 的 `createPendingRun` … `finally settleForegroundRun`），
   `enqueueSessionEvent` 把 provider 事件压进 `pendingRun.stagedEvents`，run settle 时随
   `clearRun` 一起丢弃。所以它不会实时出现在时间线上。
-- **Paseo 0.14（无补丁）：重建时间线时可见**。宿主 `accept(event, live)` 在 emit 之前先把它推进
-  `PluginAgentSession.history`，`translateNotice()` 把 `session.notice` 译成 timeline 通知；
-  conversation / `both` 撤回在 `revert()` 返回后 `hydrateTimelineFromProvider({force:true})`，
-  `streamHistory()` 原样重放这段 history，于是它出现在重建后的时间线里，告诉用户执行
-  Reload agent 或重开会话。history 只增不减，后续每次重建都会把历史里所有 canary 一起带出来
-  （会看到多条）。
-- **Paseo 0.15.0+：看不到（预期行为）**。`revert()` 内先 `clearBinding()` 清空旧 history，
-  再按持久化会话重放；canary 在回执前已进旧 history，随旧 history 一起被清掉，重建后的
-  时间线里没有它。它也不进 DSH 日志，重开会话后不存在。
+- **Paseo 0.15+（含 0.16）：看不到（预期行为）**。`revert()` 内先 `clearBinding()` 清空旧
+  history，再按持久化会话重放；canary 在回执前已进旧 history，随旧 history 一起被清掉，
+  重建后的时间线里没有它。它也不进 DSH 日志，重开会话后不存在。
+
+**历史宿主（Paseo 0.14，插件已不支持）**：那时没有 #8368，宿主 `accept(event, live)` 在 emit
+之前先把通知推进 `PluginAgentSession.history`，`translateNotice()` 把 `session.notice` 译成
+timeline 通知；conversation / `both` 撤回在 `revert()` 返回后
+`hydrateTimelineFromProvider({force:true})`，`streamHistory()` 原样重放**未变**的这段 history，
+于是它出现在重建后的时间线里，告诉用户执行 Reload agent 或重开会话。history 只增不减，后续
+每次重建都会把历史里所有 canary 一起带出来（会看到多条）。`paseo-plugin/paseo-plugin.json`
+的 requirements 现在只接受 Paseo ≥0.16，这条只作历史记录。
 
 **顺序就是机制本身。** 放到 `request.completed` 之后，0.15 上它也会留下来，变成
 「时间线没刷新」的**误报**。所以 `provider.ts` 的 `session.revert` 分支里，通知必须在回执
@@ -320,12 +322,12 @@ this.ctx.get('permissionPresets').set(session, name);
   `files` 只恢复工作区、不动对话；daemon 对该模式不重建时间线，插件也不发 canary。
 - 撤回**不可撤销**：不实现 `/unrewind`（Paseo 菜单本身就这么写）。
 - 撤回是**同步**的：`session.revert` 在桥里完成（对话表面替换 + 落盘）后回执，宿主随即重建
-  时间线（0.15 原生 replay；0.14 靠 force-hydrate 重放未变的 history，见「刷新」一节）。没有 reload 窗口，因此**没有**「正在回退，请稍候」通知、没有 prompt 门禁、没有
+  时间线（0.15+ 原生 replay，见「刷新」一节）。没有 reload 窗口，因此**没有**「正在回退，请稍候」通知、没有 prompt 门禁、没有
   15s 安全超时——这些机制随 reload 旁路一起删除了。
   **提示有两条，含义不同**：回执前的「撤回已生效」canary 是自证机制——live 投递在 rewind run
-  lock 内被 `stagedEvents` 丢弃；Paseo 0.14（无补丁）经 provider history 重放后可见（告诉用户
-  执行 Reload agent 或重开会话）；Paseo 0.15.0+ 的 replay 会清空旧 history，canary 随之消失
-  （预期行为，见上一节），所以必须在 `request.completed` 之前发出，顺序不能换。回执后的
+  lock 内被 `stagedEvents` 丢弃；Paseo 0.15+ 的 replay 会清空旧 history，canary 随之消失
+  （预期行为，见上一节），所以必须在 `request.completed` 之前发出，顺序不能换。历史宿主
+  Paseo 0.14（插件已不支持）曾靠 provider history 的重放在重建后的时间线里带出它。回执后的
   completion 报告是**插件时间线行**
   （`timeline.append`，见「完成提示」一节），报告这次撤回了什么（scope 与文件计数），绕过
   run lock、在任何宿主上都能留下；它在 conversation / `both` 的**时间线重建之后**才落行。

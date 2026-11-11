@@ -175,7 +175,8 @@ goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等�
   是因为动作留在行尾才和 view 页读成同一个控件。手机上行尾宽 76px（view 页 68px），目标只少 8px。
   这一页的「取消」**不关闭面板**，回到展开的面板（与编辑框的「取消」不同，UI-v8）；清除进行中
   红钮转圈、「取消」仍可点。
-- 操作中置忙（「处理中…」/「Working…」）；成功后立即 `pollNow` 刷新（不等 4s）；失败显示在
+- 操作中置忙（「处理中…」/「Working…」）；成功后服务端 `goalFeed.refresh` 立即重读并推送（不等 4s，见
+  `paseo-plugin/index.server.ts` 的 `goal.control` 分支）；失败显示在
   popover 里、popover 不关闭。**失败文案（UI-v9）**：中文环境下，已知的 DSH / 插件拒绝句
   （`client/locale.ts` 的 `GOAL_REFUSALS_ZH`，逐句整句匹配，带 action/phase 变量的句子只在变量已知时翻）
   显示为红色中文，DSH 原文以小号灰字跟在下面（可选中、读屏名同时包含两句）；**不认识的句子原样显示**，

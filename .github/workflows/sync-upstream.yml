@@ -120,6 +120,15 @@ jobs:
             # goal-timeline-check 用 plugin-build.cjs 自编译到 .dbg-goal-timeline，
             # 与 concurrent-open-check 同一机制（真实 DshSession + 假进程传输）。
             node harness/goal-timeline-check.cjs
+            # jobs 停止按钮的行内行为（2026-11-11）：纯离线，自带 tsconfig（@getpaseo/plugin
+            # 的 paths 映射），编译到 .dbg-stop-ui 后把检查脚本放进去跑（它 require 相对
+            # 路径的产物）。
+            ( cd paseo-plugin && npx tsc -p ../harness/jobs-stop-ui.tsconfig.json )
+            echo '{"type":"commonjs"}' > paseo-plugin/.dbg-stop-ui/package.json
+            cp harness/jobs-stop-ui-check.cjs paseo-plugin/.dbg-stop-ui/
+            ( cd paseo-plugin/.dbg-stop-ui && node jobs-stop-ui-check.cjs )
+            # jobs-stop-check 不在这里：Part A 按 goal-bridge-check 的方式从本机 DSH 安装
+            # 解析 @deepseek-ai/*，runner 上没有 DSH 会 exit 2（docs/HARNESS.md 已标"不进 CI"）。
             # 不在这里：mcp-gateway-transport-check / mcp-gateway-guard-check /
             # mcp-gateway-call-check 从本机 DSH 安装目录加载 schemastery 与
             # dsh-tools，runner 上没有 DSH，跑了只会 ERR_MODULE_NOT_FOUND；
@@ -174,6 +183,11 @@ jobs:
                 "cp harness/goal-server-check.cjs harness/fake-dsh-bridge.mjs paseo-plugin/.dbg/" \
                 "( cd paseo-plugin/.dbg && node goal-server-check.cjs )" \
                 "node harness/goal-timeline-check.cjs" \
+                "# jobs 停止按钮的行内行为（纯离线，自带 tsconfig）：" \
+                "( cd paseo-plugin && npx tsc -p ../harness/jobs-stop-ui.tsconfig.json )" \
+                "echo '{\"type\":\"commonjs\"}' > paseo-plugin/.dbg-stop-ui/package.json" \
+                "cp harness/jobs-stop-ui-check.cjs paseo-plugin/.dbg-stop-ui/" \
+                "( cd paseo-plugin/.dbg-stop-ui && node jobs-stop-ui-check.cjs )" \
                 "git push origin main" \
                 '```' \
                 "" \

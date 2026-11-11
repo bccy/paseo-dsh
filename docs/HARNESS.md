@@ -239,6 +239,10 @@
   `jobProjection`/`jobsStop` 与 `paseo/jobs` 投影、`dsh-process.ts` 的 `stopJob`/`JobStopResult`
   归一、`session.ts` 的 `stopJob`、`provider.ts` 的 `stopAgentJob`、`index.server.ts` 的
   `jobs.stop` 注册、`shared/jobs.ts` 的 `canStop`/`JOB_STOP_ERROR_CODES`/`jobsStop` 必跑。**
+  **不进 CI**：Part A 用与 `goal-bridge-check.mjs` 相同的 shim 从本机 DSH 安装解析
+  `@deepseek-ai/*`，GitHub runner 上没有 DSH，加载桥就失败并 exit 2（2026-11-11 实测：
+  `DSH_PACKAGES_DIR=/nonexistent/dsh/packages` → exit 2 且点名 `@deepseek-ai/dsh-brand`）。
+  按 CI 的 `.dbg` 编译步骤在本地跑是 **45/45** 全绿，产物够用——缺的只是 DSH 安装。
 - `harness/jobs-stop-live.mjs` — **真机终止**（2026-11-11，**14 条**，**耗 1 个模型回合**）：
   真 `dsh --profile paseo`，prompt 让模型用 `run_in_background: true` 起 `sleep 517`，等
   `paseo/jobs` 出现 `running`（且 `canStop:true`）后发 `paseo/jobs/stop`，断言回 `requested`、
@@ -251,6 +255,9 @@
   `ensurePaseoProfile()` 把**本构建**的内嵌桥装进克隆（live 克隆里是旧桥，首次实测就因此报
   `unknown paseo bridge method: paseo/jobs/stop`）。**因此跑它之前先
   `node paseo-plugin/scripts/generate-bridge-assets.mjs` 并编译 `.dbg`；改了桥的 `kill` 链必跑。**
+  **不进 CI**（真 dsh + 一个模型回合），并且**受 HP-05 隔离清单约束**：`harness-gates-check.mjs`
+  的 `isolatedScripts` 断言它确实调用 `prepareDshHome(`——这批脚本里唯一「耗 token 且必须隔离
+  home」的新增项，漏登记就会在 live profile 上跑。
 - `harness/jobs-stop-ui-check.cjs` — **行内停止按钮的行为与接线**（2026-11-11，**105 条**；纯离线，
   假对象 + 真 locale 表）：设计稿的几何常量（28×28、圆角 6、图标 14、hitSlop 8→44×44、5 s 窗口）；
   `canStop` 才可停（stopping/终态/缺字段都不可停）；pending 期间重复点击返同一状态（不发第二次请求）；
@@ -268,6 +275,10 @@
   `client/jobs-polling.ts`（`jobStop*`/`JOB_STOP_*`）、`client/locale.ts` 的 jobs 停止文案或
   `shared/jobs.ts` 的 `jobsStop` 必跑。先红后绿证据见 `/tmp/paseo-dsh-orch/jobstop-ui-evidence/`
   的 mutation-1/2/3 日志。**
+  **进 CI**（2026-11-11：`sync-upstream.yml` 的 sync 门，以及冲突 PR body 的步骤清单，两处
+  同一段命令）：它只需要 `typescript` 与 `paseo-plugin/node_modules/@getpaseo/plugin`
+  （tsconfig 的 `paths` 映射，`npm ci` 已装），不需要 DSH 安装、profile、daemon 或 token；
+  runner 上实跑 **105/105**。
 - `harness/jobs-popover-check.cjs` — jobs popover 的几何、状态标记、JSX 接线与宿主主题数据（**224 条**；离线半 154 条 + 宿主题半 70 条；2026-11-05：pill 文字经 `jobsPillCopy`、源码不再出现 `liveLabel`；触发图标钉从 `JobsSpinner`/`ListChecks` 改为 `JobsPillIcon`（`SquareTerminal` + 角标环）/`SquareTerminal`；2026-11-08：删除跨 pill 协调器后源码钉改为「`presentation = jobsPillPresentation(next)` 后 `visible = presentation.visible`（无 gate），`update` 发送该 `visible`」+ 源码无 deference 引用；宿主题半在当前 Paseo checkout（含上游 #8748 的 `@/styles/density`）上会因 check 的 vm stub 未覆盖该依赖而失败——HEAD 版同样失败，旧行为是未捕获抛错 exit 1；2026-11-08 起该失败被 catch 成 INCOMPLETE（exit 2，与 `HOST_APP` 未设同语义）；用引入前的宿主快照（`fcbfb4f0d^`）实测全绿 224/224，属既有漂移，与本轮改动无关）；2026-11-10 实测：离线半 **154/154**（exit 2，未设 `HOST_APP`）；设 `HOST_APP=~/apps/paseo` 时 **161/161** 但宿主半仍 INCOMPLETE（同一 `@/styles/density` 漂移，与本轮改动无关）；
   `HOST_APP` 指 Paseo checkout，没有就会跑完但 exit 2。**同上触发条件必跑（需 `HOST_APP`），
   跑法见文件头注释。** 2026-11-11 实测：离线半 **163/163**（`HOST_APP=~/apps/paseo`，exit 2，宿主半仍是同一 `@/styles/density` 漂移）；源码钉改为「订阅 + 共享控制器」四项（`client.subscribe(jobsSnapshot…)`、`createAgentSubscriptions<readonly Job[], JobsAnswer>`、无 `setInterval`、pill 内无数据 `setTimeout`）。
@@ -445,6 +456,8 @@
   真实 `dsh --dump-config` 的组合半在 `harness/isolated-home-bridge-check.mjs`。
   **动了 `route-test.mjs` / `tools.mjs` / `session-calls.mjs` / `plugin-check.cjs` 的判据，或
   `harness-gates.cjs` / `isolated-dsh-home.cjs` 必跑。**
+  **2026-11-11**：隔离清单 `isolatedScripts` 增加 `jobs-stop-live.mjs` 与
+  `identity-live-check.mjs`（真 dsh、耗 token 的脚本同样必须走一次性 home），实跑 **52/52**。
 - `harness/harness-gates.cjs` / `harness/isolated-dsh-home.cjs` — **不是独立检查**：前者是
   `route-test` / `tools` / `session-calls` / `plugin-check` 共用的纯判据（终态分类、退出码、
   完整时间线投影、图片块断言），后者是真实 profile/模型脚本的一次性 `DSH_HOME`（克隆源

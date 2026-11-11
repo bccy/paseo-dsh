@@ -633,7 +633,7 @@ check(
   'plugin-check.cjs uses the structural prompt-frame image predicate',
   pluginCheckSource.includes('countPromptFramesWithImage(') && pluginCheckSource.includes('toDshContent('),
 );
-const isolatedScripts = ['plugin-check.cjs', 'route-test.mjs', 'tools.mjs', 'stream-probe.mjs', 'rewind-e2e.mjs', 'rewind-merge-e2e.mjs'];
+const isolatedScripts = ['plugin-check.cjs', 'route-test.mjs', 'tools.mjs', 'stream-probe.mjs', 'rewind-e2e.mjs', 'rewind-merge-e2e.mjs', 'jobs-stop-live.mjs', 'identity-live-check.mjs'];
 for (const script of isolatedScripts) {
   const source = readFileSync(join(here, script), 'utf8');
   check(`${script} prepares an isolated DSH_HOME`, source.includes('prepareDshHome('));
