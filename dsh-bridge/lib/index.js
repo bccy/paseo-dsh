@@ -70,6 +70,22 @@ function normalizeAnswer(result) {
 function startBridge(ctx, config = {}) {
   const transport = new PaseoTransport(process.stdin, process.stdout);
   const server = new PaseoHarnessServer(ctx, transport, { adapters: config.adapters ?? {} });
+  // Per-session Paseo identity as managed `DSH_*` shell facts. `ctx.shellEnv` is
+  // DSH's public extension point for this (the web app registers `DSH_WEB_URL`
+  // the same way); the resolver reads the identity table by the execution's own
+  // DSH session id and answers `{}` when that session has no row, so a session
+  // without an identity never sees another one's agent/workspace.
+  ctx.inject(['shellEnv'], (scope) => {
+    scope.shellEnv.register({
+      name: 'paseo-identity',
+      variables: {
+        DSH_PASEO_AGENT_ID: { description: 'Paseo agent id of the session this shell runs for (per agent).' },
+        DSH_PASEO_AGENT_CWD: { description: 'Paseo agent working directory of the session this shell runs for.' },
+        DSH_PASEO_WORKSPACE_ID: { description: 'Paseo workspace id of the session this shell runs for, when it belongs to one.' },
+      },
+      resolve: (execution) => server.identityEnvForExecution(execution),
+    });
+  });
   const rootFiber = ctx.root.fiber;
 
   // File snapshots for the rewind's file rollback. DSH dispatches the tool

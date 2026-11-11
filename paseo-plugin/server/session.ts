@@ -47,6 +47,7 @@ import {
   type DshSettingsToggle,
   type DshUsage,
 } from "./dsh-process";
+import { paseoIdentityFromEnv } from "./identity-env";
 import { ASSISTANT_DELTA_EVENT, TimelineBuilder } from "./timeline";
 import { isGoalRoundSource } from "./activity-timeline";
 import { assistantStreamFirstTokenTime } from "./first-token";
@@ -358,12 +359,13 @@ export interface DshSessionOptions {
   /**
    * The spawning session's `config.env`.
    *
-   * **Unused for anything a shared child can honour.** The environment is
-   * applied once at spawn (`DshProcessOptions.env`) and `attachSession` has no
-   * env channel, so a session joining an existing child cannot receive it. The
-   * provider reports that divergence loudly (`#warnEnvDiffers`) instead of
-   * pretending; the field is kept because external callers build this options
-   * object and it is the honest record of what the session asked for.
+   * Mostly a record of what the session asked for: the environment is applied
+   * once at spawn (`DshProcessOptions.env`) and a later session joining a shared
+   * child cannot change arbitrary keys (the provider reports that divergence —
+   * `#warnEnvDiffers`). The exception is the three per-agent identity keys
+   * (`PASEO_AGENT_ID` / `PASEO_AGENT_CWD` / `PASEO_WORKSPACE_ID`): they are
+   * extracted here at open and sent to the bridge on `attachSession`, where they
+   * become that session's `DSH_PASEO_*` shell facts (see `identity-env.ts`).
    */
   env: Record<string, string>;
   /**
@@ -873,12 +875,14 @@ export class DshSession {
     // so a prompt may follow immediately. `setHandlers` must not be used here: it
     // re-points the session the process was constructed for, which on a shared
     // child would move another conversation's events.
+    const identity = paseoIdentityFromEnv(this.#options.env);
     await process.attachSession(this.#dshSessionId, this.#sessionHandlers(), {
       systemPrompt: this.#options.systemPrompt,
       cwd: this.#options.cwd,
       route: this.#route,
       ...(this.#options.title === undefined ? {} : { title: this.#options.title }),
       ...(this.#options.mcpServers === undefined ? {} : { mcpServers: this.#options.mcpServers }),
+      ...(identity === undefined ? {} : { identity }),
     });
     // The mode is per session, and the shared child's plan state may have been set
     // by any other session that opened before this one — so the reopen's mode is

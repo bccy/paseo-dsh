@@ -484,9 +484,26 @@
   起止、关掉一个另一个仍能提问并作答；另外还钉住**共享子进程的引用计数**（每开一个会话加一个
   claim、关一个还一个，另一个仍在跑所以进程不被回收）与**孤儿帧的清理**（一个会话关闭时它的
   帧桶与计时器一起消失，不会 5 s 后打一条误导的「no ancestor announced」，而另一个会话的桶
-  仍然照常上报——正对照，免得"清理过头"也通过）。假 `dsh` + 一次性 `DSH_HOME`，自己编译到私有
-  目录。**动了多会话路由、`#deliverLive`、`provider.ts` 的引用计数或 `session.ts` 的会话归属
-  逻辑必跑；或 `dsh-process.ts` 的 prompt/close 时序也必跑。**
+  仍然照常上报——正对照，免得"清理过头"也通过）。**环境段**钉住共享进程按会话下发不了的 env
+  怎么报：用户真的设了才会以**键名**告警（不报值），宿主按 agent 注入的三键（`PASEO_AGENT_ID`
+  / `PASEO_AGENT_CWD` / `PASEO_WORKSPACE_ID`，0.16 `agentIdentityEnv`）不触发告警、同日 cwd
+  不同 workspace 也不告警；而 **spawn 出去的 `dsh` 子进程里一个身份键都没有**——用一层 wrapper
+  记录子进程真实的 env，正对照（非身份键）证明剔除是选择性的，不是"子进程没拿到 env"。
+  假 `dsh` + 一次性 `DSH_HOME`，自己编译到私有目录，**46/46**。**动了多会话路由、
+  `#deliverLive`、`provider.ts` 的引用计数、env 差异豁免，或 `session.ts` 的会话归属逻辑必跑；
+  或 `dsh-process.ts` 的 prompt/close 时序、spawn env 组装也必跑。**
+- `harness/identity-env-check.mjs` — 离线钉住「每会话身份只到自己的会话」：真 `PaseoHarnessServer`
+  的 identity 表（两会话不同值、未知会话返回 `{}`、子会话沿 `children.parentId` 继承父身份、
+  re-initialize 无 identity 清行、process-level identity 被拒）+ `identity-env.ts` 的 BASH_ENV 脚本
+  （无 `DSH_PASEO_*` 时 unset 而非空、部分字段只导出存在的、用户原 BASH_ENV 末尾保留、脚本在
+  `$DSH_HOME` 下）。**17/17**，不需要模型/daemon。**动了 `dsh-bridge/lib/server.js` 的身份表、
+  `paseo-plugin/server/identity-env.ts`，或 provider/session 的 identity 传参必跑。**
+- `harness/identity-live-check.mjs` — **真机、耗 token（5 个模型回合）**：一个共享 dsh 下三个会话
+  （两个 agent 不同身份 + 一个无身份），模型各跑 bash、sandbox、后台 job 的 `printf`，断言
+  `PASEO_AGENT_ID|PASEO_WORKSPACE_ID` 各自等于自己的值、两会话不同、无身份会话为 `<unset>`。
+  一次性 DSH_HOME 必须放 `$HOME` 下（`/tmp` 是沙箱 tmpfs，BASH_ENV 不可见——envparity E6）；
+  `env -u DSH_HOME node harness/identity-live-check.mjs`，**7/7**。**动了身份投递链
+  （provider → initialize → shellEnv → BASH_ENV）必跑。**
 - `harness/shared-process-cwd-check.mjs` — 共享 `dsh` 子进程**自己的 cwd** 必须是不属于任何
   会话的稳定目录（FIELD-NOTES 91）：插件曾按第一个打开会话的 cwd 启动共享进程，工作区（Paseo
   worktree）被删后 `/proc/<pid>/cwd` 变 `(deleted)`，而 DSH 的 Linux scope 启动器用

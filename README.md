@@ -297,10 +297,13 @@ paseo-dsh/
 （DSH 按 session 维护它们，运行时不需要 `chdir`），所以多个会话可以同时开在不同工作区；
 省掉的是每次新建会话 1.5–2.7 s 的 CLI 冷启动。**环境变量是例外**——它是进程级的，只有首个
 会话打开时的环境生效；后续会话要求不同的值时，差异以 warning 出现在时间线上（只列键名、
-不列值），不静默忽略。**`PASEO_AGENT_ID` / `PASEO_AGENT_CWD` 也在这个进程级环境里**：后续
-会话经 bash 调 Paseo CLI 的 heartbeat / schedule / agent send 会拿到**首个会话**的身份——
-DSH 目前没有 per-session shell env 扩展点，这是已知限制（记在 FIELD-NOTES #76 与
-FULL-AUDIT 的「待用户决定」），不是静默修复。
+不列值），不静默忽略。**宿主按 agent 注入的三个身份键 `PASEO_AGENT_ID` /
+`PASEO_AGENT_CWD` / `PASEO_WORKSPACE_ID` 不放进共享进程的 env**（进程级只能保留首会话的值，
+错比没有更糟）：它们按会话传给桥，再由桥在每次执行时下发为 `DSH_PASEO_*`、经 `BASH_ENV`
+映射回真名——**模型 bash 工具、后台任务和沙箱里的 `PASEO_*` 是本会话自己的值**；持久 shell、
+侧栏终端和 `run_code` 的 `process.env` 里没有（DSH 在这些通道没有 per-session env 注入点）。
+在没有身份的 shell 里调 Paseo CLI：`heartbeat` 报错，`agent send` 不带发件人且默认 interrupt，
+`agent run` 建顶层 agent（未传 `--workspace` 时新建并打印 Tip）。详见 FIELD-NOTES #99。
 
 ## 重开会话后的回合折叠（已知问题）
 

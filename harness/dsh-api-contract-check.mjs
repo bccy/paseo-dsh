@@ -98,6 +98,15 @@ const EXPECTED = {
  * DSH's own stop entry, the same one `dsh-tool-jobs`' `job_kill` uses.
  */
 const EXPECTED_SERVICE_SURFACE = {
+  // The bridge registers per-session Paseo identity as managed DSH_* shell
+  // facts through `ctx.shellEnv.register` (the public extension point the
+  // web app uses for DSH_WEB_URL). `collect` is what the bash tool calls for
+  // every model shell execution; losing either method would silently remove
+  // the per-session identity from bash/background/sandbox shells.
+  'dsh-shell-env': {
+    implementationClass: 'ShellEnvRegistry',
+    prototypeOps: ['register', 'collect'],
+  },
   'dsh-jobs': {
     // The abstract contract: what the `.d.ts` must still declare. Read from the
     // file the package's own `types` field names, so an upstream path move is

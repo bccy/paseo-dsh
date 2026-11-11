@@ -334,12 +334,17 @@ that saves is the 1.5–2.7 s CLI cold start on every new session. **Environment
 variables are the exception** — they are process-wide, so only the environment at
 the time the first session opened applies; when a later session asks for a
 different value, the difference shows up as a warning on the timeline (key names
-only, never values) instead of being silently ignored. **`PASEO_AGENT_ID` /
-`PASEO_AGENT_CWD` live in that same process environment**: Paseo CLI calls made
-through bash tools from a later session (heartbeat, schedule, agent send) see the
-**first** session's identity — DSH has no per-session shell-env extension point
-today, so this is a documented limit (FIELD-NOTES #76 and the "pending user
-decision" section of the audit), not a silent fix.
+only, never values) instead of being silently ignored. **The daemon's three
+per-agent identity keys (`PASEO_AGENT_ID`, `PASEO_AGENT_CWD`, `PASEO_WORKSPACE_ID`)
+are not passed to that process at all** (a process-wide value could only be the
+first session's). They travel per session instead: the bridge republishes them as
+`DSH_PASEO_*` and a `BASH_ENV` hook maps them back, so **model bash tools,
+background jobs and the sandbox see the session's own `PASEO_*`**; persistent
+shells, the sidebar terminal and `run_code`'s `process.env` do not (DSH has no
+per-session env injection point there). In those shells Paseo CLI calls run
+without a caller identity (`paseo heartbeat` fails; `agent send` carries no
+sender and defaults to interrupt; `agent run` creates a top-level agent/workspace).
+See FIELD-NOTES #99.
 
 ## Turn folding after reopening a session (known issue)
 

@@ -217,7 +217,7 @@ function expandHomePath(value: string): string {
  * @param env - environment to read (defaults to the daemon's own).
  * @returns the absolute DSH home directory.
  */
-function dshHome(env: Readonly<Record<string, string | undefined>> = process.env): string {
+export function dshHome(env: Readonly<Record<string, string | undefined>> = process.env): string {
   const configured = env["DSH_HOME"];
   const base =
     configured !== undefined && configured.trim() !== "" ? configured : join(homedir(), ".dsh");

@@ -3520,3 +3520,60 @@ choices，值只放 `providerOptions`），`configure()` 只读 `changes.provide
 **未验证/边界**：`plugin-check.cjs` 真机段的 preset 与 permission 仍是"镜像值"证明，不能证明宿主
 `options_changed` 事件在 UI 上的回弹动画；`choices[].description`（0.16 新增）有意未使用，避免把
 未翻译的运行时文案塞进菜单。
+
+
+## 第二十六轮：Paseo 0.16 的按 agent 身份 env（2026-11-11）
+
+### 99. 共享子进程带着首会话的 agent 身份：跨 workspace 会话每次弹「环境变量未生效」，CLI 还会挂到错 agent/workspace
+
+**现象（Paseo 0.16 真机）**：同一个 provider 连接里从第二个 workspace 打开会话时，时间线每次都出一条
+「会话环境变量未生效：PASEO_WORKSPACE_ID 与共享 DSH 进程启动时的环境不同……」。同时（按 CLI 源码，
+未单独做副作用探针）：后续会话经 bash 调 Paseo CLI 时，心跳/子 agent 会挂到首个会话的 agent、建到
+首个会话的 workspace——共享进程的 env 只有首个会话的值。
+
+**根因**：0.16 的宿主给每个 open 注入 `agentIdentityEnv`（`dist/server/server/agent/agent-manager.js`：
+`{PASEO_AGENT_ID, PASEO_AGENT_CWD, PASEO_WORKSPACE_ID?}`，workspace 键仅当 agent 属于 workspace 时
+才有）。插件一个连接共用一个 `dsh` 子进程，env 只在 spawn 时定一次；`#warnEnvDiffers` 当时只豁免
+前两个键，于是 workspace 键的差异被当成"环境没生效"报出来。更深的隐患在 spawn 侧：进程 env 带着首
+会话的三个键，错的值比没有更糟，且失败不响亮。
+
+**修法**：`server/dsh-process.ts` 用一个 `AGENT_IDENTITY_ENV_KEYS` 常量收三键；`provider.ts` 的
+`#warnEnvDiffers` 用它豁免（只报键名、不报值）；`DshProcess.start()` 在组装 spawn env 后把三键
+**全部删除**（不是保留首会话的旧值）。两条依据都按包内相对路径记：
+
+- 上游 OpenCode v2 适配器同样让三键**不进共享服务进程**：`providers/opencode/v2/configuration.js`
+  的 `V2_SESSION_ENV_KEYS` 正好是这三个、按会话走 `session.environment`；`v2/runtime.js` 对共享
+  服务上的进程级 env 覆盖直接抛错。DSH 没有能设非 `DSH_*` 名字的 per-session env 通道
+  （`dsh-shell-env` 的 `ctx.shellEnv` 只服务 `DSH_*`），能做到的等价物就是"不放进共享进程"。
+- `paseo` CLI 在 shell 里读它们：`dist/utils/caller-agent.js` 用 `PASEO_AGENT_ID` 认调用方，
+  `dist/commands/agent/run.js` 用 `PASEO_WORKSPACE_ID` 当默认 workspace。缺失时**不会**静默沿用
+  首个会话的身份，而是按"没有调用方"处理，三处行为各不相同：`heartbeat` 子命令的
+  `requireCallerAgentId()` 直接报错「Heartbeat commands must run inside a Paseo agent」；
+  `agent send` 的 `sourceAgentId` 为空，消息不带发件人，`activeTurnBehavior` 默认从 steer 变
+  interrupt（行为差异，不报错）；`agent run` 建顶层 agent，未传 `--workspace` 时新建 workspace
+  并打印 Tip「pass --workspace <id> (or set PASEO_WORKSPACE_ID)」。注意 CLI 没有调用方参数。
+  已 grep 插件与桥自身：没有任何代码读子进程的这三个键（`provider.ts` 只读 open 的
+  `config.env`）。
+
+**后续（2026-11-11，P1+P2+P3 落地）**：身份不再只"剔除"，而是按会话投递——插件 open 时把
+`config.env` 三键经 `attachSession` → `initialize.identity` 交给桥，桥按 DSH session id 存表（子会话
+沿 `children.parentId` 继承父身份）；桥用公开 `ctx.shellEnv.register` 贡献 `DSH_PASEO_AGENT_ID` /
+`DSH_PASEO_AGENT_CWD` / `DSH_PASEO_WORKSPACE_ID`，resolve 按 `execution.agent.session.header.id`
+查表、查不到返回 `{}`（不回落）；共享 dsh 的 spawn env 加 `BASH_ENV=<脚本>`，脚本在
+`$DSH_HOME/paseo/bash-env/`（不能放 /tmp：沙箱 tmpfs 会盖住），只在对应 `DSH_PASEO_*` 存在时
+export，并把用户原有 BASH_ENV 放末尾 source。覆盖：模型 bash、后台任务、沙箱里 `PASEO_*` 是本会话
+的值；持久 shell、侧栏终端、`run_code` 的 `process.env` 里没有（DSH 无这些通道的 per-session env
+注入点）。验证：`harness/identity-env-check.mjs` 17/17、`harness/identity-live-check.mjs` 7/7
+（两 agent 同一子进程各自取值、后台 job、sandbox、无身份负例）、multi-session 46/46、
+plugin-check 40/40；变异「resolve 回落首会话 / 脚本无条件导出 / 不剔除 spawn 三键」均红。
+
+**验证（离线，2026-11-11）**：`harness/multi-session-check.mjs` **46/46**（新增：同日 cwd 不同
+workspace 不告警；spawn 出去的子进程 env 里三键皆无——用一层 wrapper 记录子进程真实 env，正对照是
+一个普通会话键确实生效，证明剔除是选择性的）。变异都红：去掉 workspace 豁免 → 3 条红；恢复任一
+身份键（`PASEO_AGENT_ID` / `PASEO_AGENT_CWD` / `PASEO_WORKSPACE_ID` 各做一次）→ 对应那条红。
+`npx tsc --noEmit` 0 错。
+
+**未验证/边界**：P1/P2/P3 只在一次性 DSH_HOME + 直连插件的真机检查里验证过（7/7），没有在
+running daemon / 真实 Paseo UI 上复验；持久 shell、侧栏终端、`run_code` 的 `process.env` 里没有
+`PASEO_*`，是设计边界不是回归。首会话**其它** env 仍是进程级生效，README 那段保留；身份三键走
+P1/P2/P3 的按会话通道。

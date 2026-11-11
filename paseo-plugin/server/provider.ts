@@ -21,6 +21,7 @@ import {
   type ProviderThinkingOption,
 } from "@getpaseo/plugin/server/provider";
 import {
+  AGENT_IDENTITY_ENV_KEYS,
   browserMcpGap,
   DshProcess,
   stableProcessCwd,
@@ -517,12 +518,14 @@ class DshConnection implements ProviderConnection {
    */
   #poolShutdown: Promise<void> | undefined;
   /**
-   * The env the current child was spawned with.
+   * The env the current child was **asked to spawn with**.
    *
    * The environment is process-wide (`DshProcessOptions.env` is applied at
    * spawn) and a later session's `config.env` has no channel to it, so this is
    * only kept to *report* a divergence loudly instead of dropping it in silence
-   * (see {@link #warnEnvDiffers}).
+   * (see {@link #warnEnvDiffers}). It is the requested env, not the child's final
+   * one: the daemon's agent identity keys are exempt from the comparison and all
+   * three are removed before `spawn` (`dsh-process.ts`).
    */
   #poolEnv: Record<string, string> | undefined;
   /**
@@ -698,8 +701,12 @@ class DshConnection implements ProviderConnection {
    * **The environment is the other exception**: it is applied once at spawn and
    * DSH exposes no channel to change it per session, so a later session's
    * `config.env` cannot be honoured. That divergence is not swallowed —
-   * {@link #warnEnvDiffers} reports every key that differs, and the keys are
-   * handed back so the open can also put them on the timeline.
+   * {@link #warnEnvDiffers} reports every key that differs (except the daemon's
+   * per-agent identity keys), and the keys are handed back so the open can also
+   * put them on the timeline. The identity keys are not merely unapplied: the
+   * child drops all three before spawn, because a process-wide value could only
+   * be the first session's and would send a later session's CLI calls to the
+   * wrong agent or workspace.
    *
    * @param options - the route/env to spawn with, when a spawn is needed.
    * @returns the live shared child, whether it was already serving sessions, and
@@ -797,7 +804,9 @@ class DshConnection implements ProviderConnection {
       this.#poolEnv = { ...options.env };
       this.#addPoolClaim(started);
       // Freshly spawned by this very call: the caller is not joining anything, so
-      // its env is the one the child was born with and nothing can differ.
+      // its env is the one the child was born with — except the daemon's agent
+      // identity keys, which `dsh-process.ts` drops at spawn by design (see
+      // {@link #warnEnvDiffers}); neither reads as a difference here.
       return { process: started, reused: false, envDiffering: [] };
     } finally {
       // Cleared on failure too, so a retry spawns again rather than awaiting a
@@ -844,11 +853,20 @@ class DshConnection implements ProviderConnection {
    * a child spawned with a different environment, its values are silently inert
    * unless this says so.
    *
-   * Two keys are excluded because the daemon injects them **per agent**, not per
-   * DSH process: `PASEO_AGENT_ID` and `PASEO_AGENT_CWD` (`agent-manager.js`
-   * writes both into every open's env). They always differ between two agents,
-   * so counting them would make every second session of a connection look like a
+   * The keys the daemon injects **per agent** are exempt, because they can never
+   * be a process-wide value: {@link AGENT_IDENTITY_ENV_KEYS} is
+   * `PASEO_AGENT_ID`, `PASEO_AGENT_CWD` and `PASEO_WORKSPACE_ID` (the host's
+   * `agentIdentityEnv` in `dist/server/server/agent/agent-manager.js`), all
+   * written into every open by design and always different between two agents.
+   * Counting them would make every second session of a connection look like a
    * broken environment and bury the keys the user actually configured.
+   *
+   * None of the three is even in the child: `dsh-process.ts` drops them before
+   * spawn, because a shared process could only hold the first session's identity
+   * (the `paseo` CLI reads `PASEO_AGENT_ID` as the calling agent and
+   * `PASEO_WORKSPACE_ID` as the default workspace, so a stale value files work
+   * under the wrong agent/workspace). The exemption here is what keeps that
+   * deliberate removal from reading as a broken environment on the timeline.
    *
    * The keys are reported, never the values: an env can hold a token, and the
    * stderr line is the one thing a user pastes into an issue.
@@ -861,7 +879,7 @@ class DshConnection implements ProviderConnection {
     if (spawned === undefined) return [];
     const differing: string[] = [];
     for (const key of new Set([...Object.keys(spawned), ...Object.keys(env)])) {
-      if (key === "PASEO_AGENT_ID" || key === "PASEO_AGENT_CWD") continue;
+      if (AGENT_IDENTITY_ENV_KEYS.includes(key)) continue;
       if (spawned[key] !== env[key]) differing.push(key);
     }
     if (differing.length === 0) return [];

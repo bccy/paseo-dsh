@@ -24,10 +24,58 @@ import type { GoalErrorCode } from "../shared/goal";
 import { JOB_STOP_ERROR_CODES, type JobErrorCode, type JobStopErrorCode } from "../shared/jobs";
 import type { TeamErrorCode } from "../shared/team";
 import { profileName } from "./bootstrap";
+import { ensureIdentityBashEnvScript, type PaseoAgentIdentity } from "./identity-env";
 import { createFrameReader, splitFrames, type FrameReader } from "./frame-reader";
 
 /** JSON-compatible value tree; declared in {@link ./json-value}. */
 export type { JsonValue } from "./json-value";
+
+/**
+ * Environment keys Paseo's daemon injects into **every agent open**.
+ *
+ * Host 0.16 spells them out in `agentIdentityEnv` (`agent-manager.js` under the
+ * package's `dist/server/server/agent/`): `PASEO_AGENT_ID`, the agent's own cwd
+ * as `PASEO_AGENT_CWD`, and — only when the agent belongs to a workspace —
+ * `PASEO_WORKSPACE_ID`. The workspace id cannot be derived from the cwd because
+ * several workspaces can share one directory.
+ *
+ * All three are **per agent** by design: two sessions of one connection always
+ * differ on them, so their divergence is not evidence of a process environment
+ * that failed to apply. `#warnEnvDiffers` in `provider.ts` exempts this whole
+ * list for exactly that reason.
+ *
+ * They must also never be handed to the **shared** child ({@link
+ * DshProcess.start} drops every one of them), for two reasons:
+ *
+ * - A process-wide environment can only hold the first session's values, and a
+ *   wrong identity is worse than none. The `paseo` CLI in a shell reads them:
+ *   `utils/caller-agent.js` takes `PASEO_AGENT_ID` as the calling agent (the
+ *   parent of heartbeat/send/run), and `commands/agent/run.js` uses
+ *   `PASEO_WORKSPACE_ID` as the default workspace. A later session would file
+ *   heartbeats and child agents under the **first** session's agent and create
+ *   workspaces in its workspace. Absent, the CLI simply has **no caller**:
+ *   `heartbeat` refuses to run outside an agent, `agent send` sends without a
+ *   sender (and defaults to interrupt instead of steer), and `agent run`
+ *   creates a top-level agent / a new workspace.
+ * - Paseo's own OpenCode v2 adapter solves the same problem the same way: its
+ *   `V2_SESSION_ENV_KEYS` (`providers/opencode/v2/configuration.js`) names
+ *   exactly these three as the keys applied **per session** through
+ *   `session.environment`, and every other env key forces a dedicated process
+ *   (`providers/opencode/v2/runtime.js` throws when a shared service would need
+ *   a process-level override). DSH has no per-session *process* env channel for
+ *   these names (its `ctx.shellEnv` only serves `DSH_*`), so the equivalent is
+ *   "not in the shared process env at all" plus a per-execution delivery: the
+ *   plugin sends the identity on the session's `initialize`, the bridge stores
+ *   it per DSH session and republishes it as `DSH_PASEO_*`, and the `BASH_ENV`
+ *   hook maps those to the real names for every non-interactive `bash -c`
+ *   (model bash, background jobs, sandbox). Persistent shells, the sidebar
+ *   terminal and `run_code`'s `process.env` have no such channel.
+ */
+export const AGENT_IDENTITY_ENV_KEYS: readonly string[] = [
+  "PASEO_AGENT_ID",
+  "PASEO_AGENT_CWD",
+  "PASEO_WORKSPACE_ID",
+];
 
 /** Provider/model/thinking route pinned for the life of one process. */
 export interface DshRoute {
@@ -854,6 +902,16 @@ export interface DshSessionOptions {
    * shows it as untitled.
    */
   title?: string;
+  /**
+   * Paseo's per-agent identity for this session, forwarded on its `initialize`.
+   *
+   * The shared child's process env deliberately carries none of these values
+   * (they would all be the first session's). The bridge records them by DSH
+   * session id and republishes the current execution's as `DSH_PASEO_*`, which
+   * the `BASH_ENV` hook maps to the real `PASEO_*` names. Undefined means "no
+   * Paseo identity" — never "inherit another session's".
+   */
+  identity?: PaseoAgentIdentity;
   /** Working directory this session runs in; defaults to the process's. */
   cwd?: string;
   /** Route this session is pinned to; defaults to the process's. */
@@ -1871,6 +1929,9 @@ export class DshProcess {
     if (options.cwd !== undefined) merged.cwd = options.cwd;
     if (options.route !== undefined) merged.route = options.route;
     if (options.mcpServers !== undefined) merged.mcpServers = options.mcpServers;
+    // The current open's identity is authoritative, like `systemPrompt`: an open
+    // without one must clear a previous row rather than keep a stale agent id.
+    merged.identity = options.identity;
     // An omitted title is "no update", not "clear": Paseo re-sends its stored
     // agent name on every reopen, and a build that sends none must not erase the
     // name a previous attach supplied.
@@ -2058,15 +2119,31 @@ export class DshProcess {
     // DSH cannot mount must fail the start — and be reported by the provider —
     // rather than surface later at this session's first prompt.
     this.#mcpEntriesFor(this.#options.sessionId);
-    // The profile is resolved from the environment the child will actually get,
-    // not the daemon's: a session may override `DSH_PASEO_PROFILE`, and asking DSH
-    // for a profile the session did not provision is a failure with no local
-    // explanation. `profileName` is the single definition of that lookup.
-    const args = ["--profile", profileName({ ...process.env, ...this.#options.env })];
+    // The environment the child will actually get. The daemon's per-agent identity
+    // keys are stripped because this process is shared by every session of a
+    // connection and its environment is fixed once at spawn: it could only ever
+    // carry the first session's agent/workspace identity, and a wrong identity is
+    // worse than none (see {@link AGENT_IDENTITY_ENV_KEYS}). Absent, the `paseo`
+    // CLI in a shell has no caller: `heartbeat` refuses to run, `agent send`
+    // sends without a sender (interrupt instead of steer), and `agent run`
+    // creates a top-level agent/workspace instead of acting as the first session.
+    const env = { ...process.env, ...this.#options.env };
+    for (const key of AGENT_IDENTITY_ENV_KEYS) delete env[key];
+    // Every non-interactive `bash -c` in this child (model bash, background
+    // jobs, sandbox) sources `BASH_ENV`; the hook maps the execution's
+    // per-session `DSH_PASEO_*` facts back to the real `PASEO_*` names the
+    // `paseo` CLI reads. It exports nothing for a session with no identity. A
+    // user-supplied BASH_ENV is preserved by the script itself.
+    env.BASH_ENV = ensureIdentityBashEnvScript(env);
+    // The profile is resolved from that same environment, not the daemon's: a
+    // session may override `DSH_PASEO_PROFILE`, and asking DSH for a profile the
+    // session did not provision is a failure with no local explanation.
+    // `profileName` is the single definition of that lookup.
+    const args = ["--profile", profileName(env)];
     const child = spawn(resolveBinary(), args, {
       cwd: this.#options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, ...this.#options.env },
+      env,
     });
     this.#child = child;
 
@@ -2210,6 +2287,9 @@ export class DshProcess {
       // (see `DshSessionOptions.title`). Omitted rather than sent empty: the
       // bridge treats a missing title as "no update".
       ...(options.title === undefined ? {} : { title: options.title }),
+      // The session's own Paseo identity (see `DshSessionOptions.identity`).
+      // Unlike the title an omitted identity is meaningful: it clears the row.
+      ...(options.identity === undefined ? {} : { identity: options.identity }),
     });
     this.#initializedSessions.add(sessionId);
   }

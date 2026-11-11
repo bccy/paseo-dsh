@@ -23,10 +23,17 @@
  *      — while another session's held bucket still reports normally (the
  *      positive control that the log path and the wait are real)
  *   6. a per-session env the shared process cannot apply is reported on the
- *      timeline by **key name**, and the two keys the daemon injects per agent
- *      (`PASEO_AGENT_ID`, `PASEO_AGENT_CWD`) do not count as a difference — every
- *      second session of a connection has different values for both, so counting
- *      them would make the warning fire always and mean nothing
+ *      timeline by **key name**, and none of the three keys the daemon injects
+ *      per agent (`PASEO_AGENT_ID`, `PASEO_AGENT_CWD`, `PASEO_WORKSPACE_ID`)
+ *      count as a difference — every second session of a connection has
+ *      different values for them by design, so counting them would make the
+ *      warning fire always and mean nothing
+ *   7. the shared child's spawn env carries **none** of the three agent
+ *      identity keys: a process-wide environment can only hold the first
+ *      session's agent/workspace, and a wrong identity is worse than none (the
+ *      `paseo` CLI reads `PASEO_AGENT_ID` as the calling agent and
+ *      `PASEO_WORKSPACE_ID` as the default workspace), while a regular key from
+ *      the first open still reaches the child — the removal is selective
  *
  * Uses the scripted fake `dsh` (`harness/fake-dsh-bridge.mjs`, `multi` mode) and
  * a throwaway `DSH_HOME`, so no profile, model or daemon is touched.
@@ -55,9 +62,6 @@ if (!existsSync(fakeBridge)) {
   console.error(`fake bridge missing at ${fakeBridge}`);
   process.exit(2);
 }
-chmodSync(fakeBridge, 0o755);
-process.env.DSH_BINARY = fakeBridge;
-process.env.DSH_FAKE_MODE = "multi";
 
 // Never touch the user's live profile: loading the plugin calls
 // `ensurePaseoProfile()`, which rewrites `$DSH_HOME/profiles/<name>/...` from the
@@ -71,6 +75,42 @@ process.on("exit", () => {
     /* best-effort cleanup */
   }
 });
+
+/** Single-quote one string for embedding in the generated `bash` wrapper. */
+function shellQuote(value) {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+/**
+ * Where the wrapper below records each spawn's `PASEO_*` environment.
+ *
+ * No bridge frame carries the child's own environment, so the only way to assert
+ * what the plugin handed `dsh` at spawn is to read it from the child process
+ * itself. The wrapper appends a `pid` marker plus the `PASEO_*` variables and then
+ * `exec`s the real scripted bridge — same pid, so the frame log's pid still names
+ * the same process.
+ */
+const spawnEnvLog = join(process.env.DSH_HOME, "spawn-env.log");
+const wrapper = join(process.env.DSH_HOME, "fake-dsh-wrapper.sh");
+writeFileSync(
+  wrapper,
+  [
+    "#!/usr/bin/env bash",
+    "# Record the PASEO_* environment this child was spawned with, then become the",
+    "# scripted bridge under the same pid.",
+    `printf 'pid %s\\n' "$$" >> ${shellQuote(spawnEnvLog)}`,
+    `env | grep -E '^(PASEO_[A-Z_]+|DSH_SPAWN_ENV_MARKER|DSH_MULTI_SESSION_APPLIED_KEY)=' >> ${shellQuote(spawnEnvLog)} || true`,
+    `exec ${shellQuote(process.execPath)} ${shellQuote(fakeBridge)} "$@"`,
+    "",
+  ].join("\n"),
+);
+chmodSync(wrapper, 0o755);
+process.env.DSH_BINARY = wrapper;
+process.env.DSH_FAKE_MODE = "multi";
+// A sentinel the wrapper records along with its whitelisted keys: it proves the
+// record is live even when every identity key is (correctly) absent from the
+// child, so "no PASEO_* lines" cannot pass just because nothing was written.
+process.env.DSH_SPAWN_ENV_MARKER = "spawn-env-record-works-7c1f";
 
 const buildDir = resolvePluginBuild(process.argv[2], ".dbg-t5-multi");
 const plugin = require(join(buildDir, "index.server.js")).default;
@@ -856,14 +896,16 @@ console.log("\nclosing one session leaves the other working");
 // env. That divergence used to be stderr-only — a channel the user never reads —
 // which made "my FOO=bar did nothing" have no symptom at all.
 //
-// Two things have to be true at once, and the second is the one that is easy to
-// get wrong. The warning must fire for a key the caller really set, and it must
-// **not** fire for the keys the daemon injects per agent: `PASEO_AGENT_ID` and
-// `PASEO_AGENT_CWD` are written into every open's env with values that differ per
-// agent by design (`agent-manager.js`), and `PASEO_AGENT_CWD` is the session's own
-// cwd — so **two sessions in different projects always differ on it**. Counting it
-// would make the warning fire on every second session of every connection and bury
-// the key the user actually set, which is why it is exempted rather than reported.
+// Three things have to be true at once, and the latter two are the easy ones to
+// get wrong. The warning must fire for a key the caller really set; it must
+// **not** fire for the keys the daemon injects per agent (`PASEO_AGENT_ID`,
+// `PASEO_AGENT_CWD` and `PASEO_WORKSPACE_ID` — host 0.16's `agentIdentityEnv` in
+// `agent-manager.js`), whose values differ between two agents by design and would
+// otherwise turn the warning into per-open noise; and the shared child must not
+// hold **any** of them at all, because a process-wide environment can only carry
+// the first session's identity and a wrong one is worse than none — the `paseo`
+// CLI reads `PASEO_AGENT_ID` as the calling agent and `PASEO_WORKSPACE_ID` as the
+// default workspace, so a stale value files work under the wrong agent/workspace.
 //
 // A fresh connection is used so the pool's spawn env is this section's to choose:
 // the difference is computed against the env the child was **spawned** with, and
@@ -900,12 +942,21 @@ console.log("\na per-session env the shared process cannot apply");
   // to what is being asserted here.
   const cwdA = process.cwd();
   const cwdB = process.env.DSH_HOME;
+  // A non-identity key the harness itself controls. Every open carries the same
+  // value, so it can never be a divergence; its presence in the child is what
+  // shows the identity-key removal is selective rather than "the child got an
+  // empty env". (`DSH_SPAWN_ENV_MARKER` covers the same ground from the parent's
+  // environment.)
+  const appliedKey = "DSH_MULTI_SESSION_APPLIED_KEY";
+  const appliedValue = "applied-by-first-session";
 
   // The first open of this connection defines the spawn env, exactly as the first
   // session of a real connection does.
   const first = await openWith("env-first", cwdA, {
     PASEO_AGENT_ID: "agent-first",
     PASEO_AGENT_CWD: cwdA,
+    PASEO_WORKSPACE_ID: "workspace-first",
+    [appliedKey]: appliedValue,
   });
   check(
     "the first session of a connection gets no env warning",
@@ -913,17 +964,93 @@ console.log("\na per-session env the shared process cannot apply");
     first.map((event) => String(event.notice?.title)).join(" | ") || "(no notice)",
   );
 
+  // What the child process was actually started with, read from the wrapper's
+  // record. The warning above is computed from the requested env; this is the
+  // other half — the value that really reached `dsh`.
+  const spawnEnvs = () => {
+    let text;
+    try {
+      text = readFileSync(spawnEnvLog, "utf8");
+    } catch {
+      return [];
+    }
+    const records = [];
+    let current;
+    for (const line of text.split("\n")) {
+      if (line === "") continue;
+      if (line.startsWith("pid ")) {
+        current = { pid: line.slice(4), env: {} };
+        records.push(current);
+        continue;
+      }
+      const eq = line.indexOf("=");
+      if (current !== undefined && eq > 0) current.env[line.slice(0, eq)] = line.slice(eq + 1);
+    }
+    return records;
+  };
+  let childSpawnEnv;
+  for (let attempt = 0; attempt < 40 && childSpawnEnv === undefined; attempt += 1) {
+    childSpawnEnv = spawnEnvs().find(
+      (record) => record.env[appliedKey] === appliedValue,
+    );
+    if (childSpawnEnv === undefined) await sleep(50);
+  }
+  const shownSpawnEnv = JSON.stringify(childSpawnEnv?.env ?? null);
+  // Two positive controls before the negative ones: the record itself is live,
+  // and a **non-identity** key from the first open really did reach the child, so
+  // three green "absent" checks cannot be "the wrapper recorded nothing" or "the
+  // child got an empty env".
+  check(
+    "the spawn-env record reaches the child at all",
+    childSpawnEnv !== undefined
+      && childSpawnEnv.env.DSH_SPAWN_ENV_MARKER === process.env.DSH_SPAWN_ENV_MARKER,
+    shownSpawnEnv,
+  );
+  check(
+    "a regular key from the first open still reaches the child",
+    childSpawnEnv !== undefined && childSpawnEnv.env[appliedKey] === appliedValue,
+    shownSpawnEnv,
+  );
+  // The point of this section: none of the daemon's per-agent identity keys may
+  // ride into a process serving several agents. Restoring any one of them (a
+  // mutation) turns exactly that key's check red.
+  for (const identityKey of ["PASEO_AGENT_ID", "PASEO_AGENT_CWD", "PASEO_WORKSPACE_ID"]) {
+    check(
+      `…but not ${identityKey}: the shared child cannot honour a per-session identity`,
+      childSpawnEnv !== undefined && !(identityKey in childSpawnEnv.env),
+      shownSpawnEnv,
+    );
+  }
+
   // **The red case this entry exists for**: a second session in a different cwd.
   // The daemon gives it its own `PASEO_AGENT_CWD`, so before the exemption it was
   // reported as a broken environment on every multi-project connection.
   const second = await openWith("env-second-other-cwd", cwdB, {
     PASEO_AGENT_ID: "agent-second",
     PASEO_AGENT_CWD: cwdB,
+    PASEO_WORKSPACE_ID: "workspace-second",
+    [appliedKey]: appliedValue,
   });
   check(
     "a session in a different cwd gets no env warning",
     second.every((event) => event.notice?.title !== "会话环境变量未生效"),
     second.map((event) => `${String(event.notice?.title)}: ${String(event.notice?.description)}`).join(" | ")
+      || "(no notice)",
+  );
+
+  // Same cwd, different workspace: the daemon supports several workspaces per
+  // directory, so this is the per-agent difference `PASEO_AGENT_CWD` cannot show.
+  // Before the workspace id was exempted it read as a broken environment here.
+  const fourth = await openWith("env-fourth-other-workspace", cwdB, {
+    PASEO_AGENT_ID: "agent-fourth",
+    PASEO_AGENT_CWD: cwdB,
+    PASEO_WORKSPACE_ID: "workspace-fourth",
+    [appliedKey]: appliedValue,
+  });
+  check(
+    "a session in a different workspace gets no env warning",
+    fourth.every((event) => event.notice?.title !== "会话环境变量未生效"),
+    fourth.map((event) => `${String(event.notice?.title)}: ${String(event.notice?.description)}`).join(" | ")
       || "(no notice)",
   );
 
@@ -936,6 +1063,8 @@ console.log("\na per-session env the shared process cannot apply");
   const third = await openWith("env-third-custom", cwdB, {
     PASEO_AGENT_ID: "agent-third",
     PASEO_AGENT_CWD: cwdB,
+    PASEO_WORKSPACE_ID: "workspace-third",
+    [appliedKey]: appliedValue,
     [envKey]: envValue,
   });
   const warnings = third.filter((event) => event.notice?.title === "会话环境变量未生效");
@@ -956,11 +1085,15 @@ console.log("\na per-session env the shared process cannot apply");
     JSON.stringify(warnings[0]?.notice?.description ?? ""),
   );
   // From the other direction: this open's per-agent keys differ from the spawn
-  // env's, so a warning that listed them would be listing exactly the noise the
-  // exemption removes.
+  // env's (the first session's workspace id was requested but dropped, and this
+  // session sets none at all), so a warning that listed them would be listing
+  // exactly the noise the exemption removes.
   check(
     "…and not the keys the daemon injects per agent",
-    text !== "" && !text.includes("PASEO_AGENT_ID") && !text.includes("PASEO_AGENT_CWD"),
+    text !== ""
+      && !text.includes("PASEO_AGENT_ID")
+      && !text.includes("PASEO_AGENT_CWD")
+      && !text.includes("PASEO_WORKSPACE_ID"),
     JSON.stringify(warnings[0]?.notice?.description ?? ""),
   );
 

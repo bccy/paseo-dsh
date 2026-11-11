@@ -109,6 +109,37 @@ function effortOf(value) {
 }
 
 /**
+ * Validate the per-session Paseo identity carried by `initialize`.
+ *
+ * The plugin sends `{ agentId?, agentCwd?, workspaceId? }`, the three values
+ * Paseo's daemon injects into every agent open (`agentIdentityEnv` in
+ * `agent-manager.js`). They travel per session because a shared process cannot
+ * hold them in its environment: all three would be the first session's.
+ *
+ * Fields are trimmed and empty values are dropped. `undefined` means "this
+ * session has no Paseo identity" — resolvers must treat that as empty, never as
+ * a licence to reuse another session's row.
+ *
+ * @param {unknown} value - the `identity` field of one `initialize` frame.
+ * @returns {{agentId?: string, agentCwd?: string, workspaceId?: string} | undefined}
+ */
+function normalizePaseoIdentity(value) {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('initialize identity must be an object');
+  }
+  const identity = {};
+  for (const field of ['agentId', 'agentCwd', 'workspaceId']) {
+    const raw = value[field];
+    if (raw === undefined || raw === null) continue;
+    if (typeof raw !== 'string') throw new TypeError(`initialize identity ${field} must be a string`);
+    const trimmed = raw.trim();
+    if (trimmed !== '') identity[field] = trimmed;
+  }
+  return Object.keys(identity).length === 0 ? undefined : identity;
+}
+
+/**
  * Whether the installed DSH still uses the pre-0.2.2 model-selection contract.
  *
  * DSH 0.2.1: `installModelSelection(agentCtx, selection)` registers listeners
@@ -527,6 +558,17 @@ export class PaseoHarnessServer {
      * its route row is evicted, and a re-initialize re-supplies it.
      */
     this.sessionTitles = new Map();
+    /**
+     * sessionId -> Paseo's per-agent identity (`{ agentId, agentCwd, workspaceId }`).
+     *
+     * Written by `initialize` when the frame carries `identity` (see
+     * `normalizePaseoIdentity`). A native subagent session is never initialized
+     * by the plugin; it inherits the nearest ancestor's row through the
+     * `children` parent links (see `identityForSession`). Bounded with the route
+     * tables: an evicted row is dropped in `#trimSessionRouteTables`, and the
+     * re-initialize that row already owes re-supplies it.
+     */
+    this.sessionIdentity = new Map();
     this.sessionSystemPrompts = new Map();
     this.systemPromptDisposers = new Map();
 
@@ -1211,6 +1253,9 @@ export class PaseoHarnessServer {
       // one) and does not drive the bound, but an evicted row must not leave a
       // name behind: the plugin re-sends it on the re-initialize it already owes.
       this.sessionTitles.delete(key);
+      // Identity is per session exactly like the route; an evicted route row must
+      // not leave a stale identity behind (the re-initialize re-supplies it).
+      this.sessionIdentity.delete(key);
       // Job titles are the same kind of row: useless without the session they
       // belong to, and unbounded if a process that outlives every conversation
       // never drops them. They outlive `session/close` (a refresh reopens the
@@ -1302,6 +1347,57 @@ export class PaseoHarnessServer {
   }
 
   /**
+   * The Paseo identity of one DSH session, following subagent parent edges.
+   *
+   * The plugin initializes only sessions it opens; a native subagent session is
+   * created by DSH and never `initialize`s itself. Its identity is its parent's
+   * — the `children` table records the direct `parentId` from the child's own
+   * durable header / the parent's catalog, and a nested child may point at a
+   * parent that is itself a child. Walk until a row is found; no row anywhere
+   * means "no identity" (never the process default or the first session).
+   *
+   * @param {string} sessionId - DSH session id of the executing agent.
+   * @returns {{agentId?: string, agentCwd?: string, workspaceId?: string} | undefined}
+   */
+  identityForSession(sessionId) {
+    const direct = this.sessionIdentity.get(sessionId);
+    if (direct !== undefined) return direct;
+    const seen = new Set([sessionId]);
+    let current = this.children.get(sessionId)?.parentId;
+    while (current !== undefined && !seen.has(current)) {
+      seen.add(current);
+      const inherited = this.sessionIdentity.get(current);
+      if (inherited !== undefined) return inherited;
+      current = this.children.get(current)?.parentId;
+    }
+    return undefined;
+  }
+
+  /**
+   * The `DSH_PASEO_*` overlay for one shell-tool execution.
+   *
+   * This is the resolver registered with `ctx.shellEnv`: it reads the execution's
+   * own DSH session id (`execution.agent.session.header.id`) and answers only
+   * that session's identity. An execution with no agent or no identity row
+   * answers `{}` — the shell environment must stay empty rather than inherit a
+   * neighbour's values.
+   *
+   * @param {object | undefined} execution - DSH `ToolExecution`.
+   * @returns {Record<string, string>}
+   */
+  identityEnvForExecution(execution) {
+    const sessionId = execution?.agent?.session?.header?.id;
+    if (sessionId === undefined || sessionId === null || String(sessionId) === '') return {};
+    const identity = this.identityForSession(String(sessionId));
+    if (identity === undefined) return {};
+    return {
+      ...(identity.agentId === undefined ? {} : { DSH_PASEO_AGENT_ID: identity.agentId }),
+      ...(identity.agentCwd === undefined ? {} : { DSH_PASEO_AGENT_CWD: identity.agentCwd }),
+      ...(identity.workspaceId === undefined ? {} : { DSH_PASEO_WORKSPACE_ID: identity.workspaceId }),
+    };
+  }
+
+  /**
    * Validate the route and record it — for one session when `params.sessionId`
    * is present, as this process's defaults when it is not.
    *
@@ -1336,6 +1432,10 @@ export class PaseoHarnessServer {
     const title = typeof params.title === 'string' && params.title.trim() !== ''
       ? params.title
       : undefined;
+    const identity = normalizePaseoIdentity(params.identity);
+    if (identity !== undefined && sessionId === undefined) {
+      throw new Error('initialize identity requires sessionId');
+    }
     const fallback = this.profileDefault();
     const pinned = sessionId === undefined ? undefined : this.sessionRoutes.get(sessionId);
     // The session's own route outranks the process defaults: they are the
@@ -1422,6 +1522,10 @@ export class PaseoHarnessServer {
       this.sessionSystemPrompts.set(sessionId, prompt);
       if (live) this.installSystemPrompt(sessionId, live.handle.agent.ctx);
       this.sessionCwd.set(sessionId, cwd);
+      // The current open's identity is authoritative: an open without one clears
+      // a previous row, so a stale agent id can never outlive its session.
+      if (identity === undefined) this.sessionIdentity.delete(sessionId);
+      else this.sessionIdentity.set(sessionId, identity);
       // Remember Paseo's name for this agent; `createSession` applies it once
       // the session is live. A later initialize without a title leaves the
       // known name alone (an omitted title is "no update", not "clear").
