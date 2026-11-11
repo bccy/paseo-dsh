@@ -3577,3 +3577,153 @@ workspace 不告警；spawn 出去的子进程 env 里三键皆无——用一�
 running daemon / 真实 Paseo UI 上复验；持久 shell、侧栏终端、`run_code` 的 `process.env` 里没有
 `PASEO_*`，是设计边界不是回归。首会话**其它** env 仍是进程级生效，README 那段保留；身份三键走
 P1/P2/P3 的按会话通道。
+
+## 第二十七轮：插件重载切在半路，旧共享 dsh 还占着 profile 的固定端口（2026-11-11）
+
+**现象**：`paseo plugin reload dsh-paseo` 后几秒内首个会话 open 失败，DSH 报
+`listen EADDRINUSE <host>:<port>`、`webserver (required)` 未激活、共享 dsh `exit code 1`；
+数秒后重试成功。profile 的 `webserver` 端口是用户故意固定的（书签/Cookie 复用），不能改成 0。
+
+**根因（两段，都有 file:line）**：
+
+1. **宿主给插件进程的关机预算是 2 s**，而插件自己的 teardown 上界更大。
+   `@getpaseo/server`（0.16.0-beta.1，`dist/server/server/plugins/runtime.js`）：
+   `SOFT_SHUTDOWN_TIMEOUT_MS = 2000`（`:20`），`stopPlugin()`（`:1056`）先
+   `await send(child, {type:"shutdown"})`（`:1077`，`send()` 在 `:126` 只等**写出**、不等插件
+   真正关完），随后 `:1080-1085` 的 `forceTimer` 在 2000 ms 发 SIGTERM、再 2000 ms SIGKILL；
+   reload 是「先 stop 后 start」串行（`startPlugin` `:167`、`stopPluginById` `:209`）。
+   插件侧的预算：`SESSION_CLOSE_TIMEOUT_MS = 10_000`（`dsh-process.ts:604`，逐会话关闭）+
+   `pooled.shutdown()` 的 5 s（`dsh-process.ts:3471` 的 `#request("shutdown", {}, 5000)`）+
+   `waitForExit(RELEASE_TIMEOUT_MS = 5_000)`（`provider.ts`）。也就是说**旧插件进程很容易在
+   `close()` 里被 SIGTERM 切掉，它的 `#shutdownPool()` 还没轮到那个共享 dsh**。
+2. **共享 dsh 是另一个 OS 进程，池里的记账看不见它**。旧插件进程一死，dsh 的 stdin 管道写端
+   关闭 → DSH 的 `exitOnStdinEnd`（`@deepseek-ai/dsh-cmdline`）走自己的优雅退出：先
+   `shutdown` 帧（`dsh-bridge/lib/index.js:170` 的 `setImmediate(() => disposeAndExit(0))`）/
+   `rootFiber.dispose()`，**期间 profile 的 `webserver` 一直 listen 着**。宿主此时已经起了新的
+   插件进程，它 open 的第一个会话 spawn 出新 dsh，新 dsh 在 profile 启动阶段 `listen` 撞上旧
+   进程的端口 → `webserver (required)` 未激活 → exit 1。几秒后旧进程退完，重试才成功。
+
+**实测（一次性 DSH_HOME、克隆 profile、端口改成固定非 0）**：
+
+- 空闲 dsh 单条退出路径都很快：`shutdown` 帧 / SIGTERM / 父进程被杀后 stdin EOF 三条都是
+  **端口 ~52 ms 释放、进程 ~230 ms 消失**（E1/E2）。所以「旧 dsh 还占着端口」只可能发生在
+  **有活会话**时：真实 reload 里旧 dsh 拿到 EOF 后要收尾在飞的回合，退出时间 ~2.3 s（与
+  会话数关系不大：1 个和 5 个都测到 ~2.29 s），而它拿到端口到新 dsh 启动到 listen 需要
+  **~4.1 s**（dark start）。两个数同一个量级——**是否撞上取决于本机的 boot 时间**，这正是
+  「偶发、几秒后重试就好」的来源；真机上报那次的旧 dsh 显然活了更久（在飞回合/更多会话）。
+- 修前：旧 dsh 活着占端口时，新进程照样 spawn 新 dsh，新 dsh 拿到 **真实**
+  `listen EADDRINUSE: address already in use 127.0.0.1:<port>` + `webserver (required)` + exit 1
+  （`harness/reload-port-race-live.mjs --mode=port`，在 HEAD 源码的副本上跑）。
+- 修后：同一条命令下新进程**等**旧 dsh 退出再 spawn，open 成功；日志有
+  `waited <N> ms for the previous plugin process's shared dsh (pid …) to exit`。
+
+**修法**：`$DSH_HOME/paseo/shared-dsh.json` 记录共享 dsh（pid + 启动身份 + profile + 命令行），
+spawn 前有界等待（默认 10 s，`DSH_PASEO_SHARED_DSH_WAIT_MS` 可覆盖），超时**响亮失败并报 pid**，
+不静默杀别人的进程；记录在 spawn 的同一 tick 写入（`DshProcess` 新 `onSpawned` 回调），子进程退出
+/正常关机后按 pid 守卫清掉。三个细节是这轮的坑：
+
+- **pid 不是身份**：`/proc/<pid>/stat` 第 22 字段（starttime，Linux）/ `ps -o lstart=`（macOS）
+  作为启动身份，与记录不符就是 pid 复用——否则一个复用的 pid 会让新进程白等满 10 s 再报错。
+- **可执行文件名不能比**：真 `dsh` 是 shebang 脚本，进程 cmdline 是
+  `node /path/bin/dsh --profile paseo`；拿 `basename(cmdline[0])` 和记录的二进制比会把每个真
+  子进程判成"别人的"，等于关掉等待。用 `--profile <name>` + 启动身份两件事判定。
+- **进程内还有一层**：同一个插件进程可以有多个 provider 连接（harness 会开第二个，SDK 不承诺
+  一次只有一个），各自一个池。所以按 pid 只记一个 **`SERVING_SHARED_DSH`**（真正被读的）：
+  **别的活连接正在 serving 的 child 不等**（那是它自己的端口，等它会把那个连接卡死）；
+  **本进程正在退役的 child** 不需要第二个集合——记录里的 `ownerPid === process.pid` 已经让
+  `reclaimPreviousSharedDsh` 走"只等不杀"的分支（池自己关它、并且已经等过它）。
+
+**验证**：`harness/reload-port-race-check.mjs` **51/51**（首版 28/28，补分级回收后 41/41，verify4 收口后 49/49，verify5 收口后 51/51；变异：去掉等待 21/28、去掉启动身份校验
+26/28 均红）；`node harness/reload-port-race-live.mjs --mode=port` 修前 EADDRINUSE / 修后成功；
+`npx tsc --noEmit` 0 错；`bridge-assets-check` 2/2、`harness-gates-check` 52/52、
+`settings-passthrough-check` 71/71、`fake-bridge-multi-check` 23/23、`plugin-check` 真实回合 40/40。
+
+**补记（同日）：分级回收，而不是干等 10 秒。** 用户的第二个要求是"别让重载白等十秒"，于是
+spawn 前的等待改成分级（`shared-dsh-record.ts` 的 `reclaimPreviousSharedDsh`）：
+① 先给 **3 s** 让它自己退（真机常见的 2.29 s 就在这一档，普通 reload 全程不碰信号）；
+② 仍在 → **SIGTERM**（这是 DSH 自己的退出路径 `exitOnStdinEnd`/`disposeAndExit`，会话日志会被
+flush，回收后的会话仍能正常读）→ 再等 **2 s**；
+③ 仍在 → **SIGKILL** → 再等 **3 s**；④ 仍不退 → 报错含 pid。
+每一步一条 stderr 行（pid + 走到哪一级）。**动手前必须"已核实"**：记录里的 pid + 启动身份 +
+`--profile` + `home`/`profile` 都对得上，**且记录的属主插件进程已不在**；属主还活着（同进程的
+兄弟连接 / 本进程正在退役的 child）或身份核实不了，就**只等不杀**，超时照旧响亮失败（错误文案
+分别是"still owned by a running plugin process"与"could not be confirmed"）。这也是拿活人
+（别的程序 / 别的 daemon）开刀的唯一边界。
+
+**补记（同日，verify4 P2-1/P3-1/P3-2 收口）**：
+（P2-1）记录**按 profile 分文件**——`$DSH_HOME/paseo/shared-dsh.<safe-profile>.json`（profile 名里
+非 `[A-Za-z0-9._-]` 的字符换成 `_`，空/点号开头退成 `default`，不会变成路径穿越）。另一个
+profile 下的 dsh 是**另一套 DSH 运行时**（自己的 bundle、会话和端口），所以
+`reclaimPreviousSharedDsh` 见到 profile 不匹配的记录直接返回 `foreign`：**不等、不杀**，provider 只
+打一行日志。这条比"按 home 分文件"更要紧：同一个 `$DSH_HOME` 下两个 profile 共用过一个记录文件，
+谁先写谁赢。
+（P3-1）`RETIRING_SHARED_DSH` 集合**只写不读**，已删除；同一进程里正在退役的 child 由记录的
+`ownerPid === process.pid` 覆盖（只等不杀），不需要第二个真相源。`SERVING_SHARED_DSH` 是唯一被读的
+登记：它豁免"别的活连接正在 serving 的 child"，避免把一个活跃连接卡在别人的端口上。
+（P3-2）`classifyRecordedChild` 改成**三态**：`match` / `mismatch` / `unknown`。身份和 cmdline
+**都读不到**时不再当成"自己的"（旧实现 `return true`），而是 `unknown`：等，但**永不发信号**，
+超时按 `verified:false` 报出来。判据是"只有读得到且相符才算 match，任一读得到且不符就是
+mismatch，其余 unknown"——把无法核实当成自己的，等于允许模块去杀一个它证明不了的进程。
+
+**补记（同日）：`DSH_PASEO_*` 是第二条身份泄漏路径（多会话检查 43/49 的真实成因）。**
+每会话身份上线后，桥按执行把身份发布成 `DSH_PASEO_AGENT_ID`/`_AGENT_CWD`/`_WORKSPACE_ID`，
+而插件给子进程的 `BASH_ENV` 脚本（`identity-env.ts`）就是把这些映射回 `PASEO_*`。原来的
+spawn env 只删了三个 `PASEO_*` 键，`DSH_PASEO_*` 原样传下去 —— 于是任何**从 DSH shell 里起的**
+插件/嵌套 dsh（或检查脚本的 bash wrapper）一启动 bash，就把**外层会话**的身份重新导出成
+`PASEO_AGENT_ID`。`harness/multi-session-check.mjs` 里那条 43/49（当时 49 条）就是它，不是"环境相关"：
+从 Paseo agent 的 shell 里跑必然红。修法是同处新增 `DSH_AGENT_IDENTITY_ENV_KEYS`（由
+`AGENT_IDENTITY_ENV_KEYS` 派生，`DSH_` 前缀，两表不会漂）并在 spawn env 里一并删除；
+`DSH_PASEO_PROFILE`/`_LANG`/harness 旋钮不是身份，保留。检查里补了三键断言（父进程 env 带
+`DSH_PASEO_*` 时子进程两者都不许有），**去掉剔除即红**：43/49 → **49/49**。
+
+**验证（补记）**：`harness/reload-port-race-check.mjs` **41/41**（新增：3 s 内自退不碰信号、
+忽略 SIGTERM→SIGKILL、SIGTERM 即退→不升到 SIGKILL、pid 复用不杀、属主仍活不杀；变异
+「跳过身份核实直接杀」39/41、「跳过 SIGTERM 直接 SIGKILL」38/41 均红）；
+`harness/multi-session-check.mjs` **49/49**（同一条命令，在带 `DSH_PASEO_*` 的 shell 里）；
+`identity-env-check.mjs` 17/17、`harness-gates-check.mjs` 52/52、`tsc --noEmit` 0。
+真机：`reload-port-race-live.mjs --mode=port --keep-holder` → 3.0 s 后发 SIGTERM、201 ms 后旧
+dsh 退出、新会话打开成功（日志两行都在）。
+
+**未验证/边界**：没有在 running daemon 上真机 reload 复验（任务书禁止）；
+记录按 `$DSH_HOME` + **profile 分别成文件**（`shared-dsh.<profile>.json`，profile 名已安全化），
+不同 profile / 不同 home 的部署不会互相等待或互相回收；旧插件进程若在写入记录
+之前就死（spawn 与写记录之间），下一个进程无从得知——这个窗口是同一 tick 内，实际不可观测；
+`SIGKILL` 那一级不会 flush 会话日志，那一级之后的会话可能需要 replay（日志行里写明了）。
+
+## 第二十八轮：新建会话的打开时间——catalog 磁盘缓存（2026-11-11）
+
+**症状**：用户感觉"新建 DSH 会话慢"。拆开看（一次性 DSH_HOME、真实 profile、`env -u DSH_HOME`，
+3 次取中位数）：冷启动首个 open **9230 ms**（第二次 4828 ms），reload 后首个 open **12219 ms**
+（其中回收 3223 ms，孤儿不退的最坏形状）。差值的 4402 ms 就是**冷 catalog probe**：`#open` 里
+`this.#display ?? (await loadCatalog(config.cwd))`（`provider.ts:1818`）先 await 一次 catalog 读，
+而 `loadCatalog` 为读一次模型列表**另起一个整profile 的 dsh**（`probeProcess`，`initializeRoute:false`），
+它的冷启动和共享子进程的冷启动同量级；`#display` 只是**每连接**缓存，Reload = 新进程 = 冷缓存。
+
+**修法**：新增 `server/catalog-cache.ts`，把 catalog 按 (home, profile, cwd) 落到
+`$DSH_HOME/paseo/catalog/<digest>.json`，`loadCatalog` 在内存未命中后先读它。两条铁律防止它变成
+"永久的空模型菜单"或"升级后还在用旧 catalog"：
+
+1. **空 model 列表永远不写**（FIELD-NOTES 第 58 条：0.2.1 的 catalog 是异步物化的，启动瞬间读到 0
+   不是事实）；读回时也再查一次非空。
+2. **每次读都重新核指纹**：`dsh --version` + profile 组成文件（`cordis.yml` / `cordis.patch.yml` /
+   `package.json` / pnpm 锁与 workspace）**内容哈希** + 凭据文件 stat；超 24 h 也作废。
+
+**坑（第一次没生效）**：指纹最初用 **mtime**，结果 reload 后永远不命中——插件自己的
+`ensurePaseoProfile()` **每次加载都重写 `cordis.yml`**，mtime 必然变化。改成**内容哈希**后命中；
+内容哈希对"插件改写但字节相同"免疫，对真实配置改动仍敏感。
+
+**收益（同机、3 次中位数）**：reload 后首个 open **12219 → 8467 ms**（−3752 ms，−30.7%）；
+冷启动首开仍 8930 ms（首次没有缓存可读，符合预期）；稳态（同一连接第二个 open）4631 ms（与之前
+4828 同量级，本来就只受共享子进程冷启动影响）。**没有做的**：① 把共享 dsh 的启动与 catalog 读并行
+（route 解析需要 `display.fallbackRoute`，要先知道 catalog——真要做就得让共享子进程先以无 route
+启动、之后补 initialize，改动大且会动 route 校验时机）；② 插件加载时预热共享 dsh（常驻约 550 MB，
+且改变"无会话时延迟关闭"的语义——只作建议）；③ 缩短回收的 3 s 自退窗口：实测真机自退 2.29 s，
+窗口只在"更慢的孤儿"上才多等，而 SIGTERM 打断进行中的 EOF 优雅退出会走
+`createProcessShutdown.interrupt` 的 `forceExitOnce`（立即 process.exit，不再 flush）——省下的
+最多 0.7 s 换日志不完整，不做。
+
+**验证**：`harness/catalog-cache-check.mjs` **12/12**（新增磁盘层 7 条 + 集成 3 条：新进程回答
+catalog 且不再 spawn probe；截断/形状不对的条目当未命中、回退 probe 且 open 仍成功——条目是**不可信
+输入**，`#open` 用的 `models`/`fallbackRoute`/`defaults.modes` 要做形状校验，否则会在 open 深处抛
+`TypeError`；变异「只写不读」9/10 红、「去掉形状校验」10/12 红）；reload-port-race 49/49、multi-session 49/49、
+identity-env 17/17、harness-gates 52/52、bridge-assets 2/2、plugin-check 真实回合 40/40、tsc 0。

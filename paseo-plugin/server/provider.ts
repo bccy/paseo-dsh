@@ -24,6 +24,7 @@ import {
   AGENT_IDENTITY_ENV_KEYS,
   browserMcpGap,
   DshProcess,
+  resolveDshBinary,
   stableProcessCwd,
   validateMcpServers,
   type DshCatalog,
@@ -43,6 +44,18 @@ import {
   OPTION_PRESET,
   parseRoute,
 } from "./session";
+import { dshHome, profileName } from "./bootstrap";
+import { catalogCachePath, catalogFingerprint, readCatalogCache, writeCatalogCache } from "./catalog-cache";
+import {
+  clearSharedDshRecord,
+  readSharedDshRecord,
+  sharedDshRecordPath,
+  sharedDshStillRunningMessage,
+  sharedDshWaitMs,
+  systemProcessProbe,
+  reclaimPreviousSharedDsh,
+  writeSharedDshRecord,
+} from "./shared-dsh-record";
 import { rewindCanaryNotice } from "./rewind-canary";
 import { beginRewindReport, fallbackNoticeDescription, type RewindReportFallback } from "./rewind-notice-append";
 import { effortLabel, LOCALE, UI } from "./locale";
@@ -309,16 +322,83 @@ function probeProcess(cwd: string, sessionId: string): DshProcess {
   });
 }
 
+/**
+ * Whether a persisted catalog is the whole shape `#open` and the composer use.
+ *
+ * The disk cache is JSON written by another process of another version, so it is
+ * **untrusted input**: `#open` reads `models`, `thinkingOptions`,
+ * `fallbackRoute.provider/model` and `defaults.modes` from it, and a truncated or
+ * half-migrated entry would throw a `TypeError` deep inside the open (or publish a
+ * composer with no modes) instead of probing. A wrong-shaped entry is treated as a
+ * miss — the runtime is right there.
+ */
+function isUsableDisplayCatalog(value: unknown): value is DisplayCatalog {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Partial<DisplayCatalog>;
+  if (!Array.isArray(candidate.models) || candidate.models.length === 0) return false;
+  for (const model of candidate.models) {
+    if (typeof model !== "object" || model === null) return false;
+    const entry = model as { id?: unknown; label?: unknown };
+    if (typeof entry.id !== "string" || typeof entry.label !== "string") return false;
+  }
+  if (!Array.isArray(candidate.thinkingOptions)) return false;
+  const route = candidate.fallbackRoute as { provider?: unknown; model?: unknown } | undefined;
+  if (typeof route !== "object" || route === null
+    || typeof route.provider !== "string" || typeof route.model !== "string") return false;
+  const defaults = candidate.defaults as { modes?: unknown } | undefined;
+  if (typeof defaults !== "object" || defaults === null || !Array.isArray(defaults.modes)) return false;
+  for (const mode of defaults.modes) {
+    if (typeof mode !== "object" || mode === null || typeof (mode as { id?: unknown }).id !== "string") return false;
+  }
+  return true;
+}
+
 /** Read the runtime catalog through a short-lived process and cache it by cwd. */
 async function loadCatalog(cwd: string): Promise<DisplayCatalog> {
   const cached = cachedCatalog(cwd);
   if (cached !== undefined) return cached;
+  // The probe boots a whole `dsh` (measured 4.2 s on a real profile), and the
+  // catalog it returns is read-only profile metadata. A cold plugin process —
+  // which is every process after a reload — would otherwise pay that boot again
+  // on its first open, on top of the shared child's own cold boot. The on-disk
+  // entry is used only when its fingerprint (binary, profile composition,
+  // credentials) still matches, and an empty model list is never stored
+  // (`catalog-cache.ts`; FIELD-NOTES 58).
+  const home = dshHome(process.env);
+  const profile = profileName(process.env);
+  let diskPath: string | undefined;
+  let fingerprint: string | undefined;
+  try {
+    fingerprint = catalogFingerprint({ home, profile, binary: resolveDshBinary() });
+    diskPath = catalogCachePath({ home, profile, cwd });
+    const persisted = readCatalogCache<DisplayCatalog>({ path: diskPath, fingerprint });
+    if (persisted !== undefined) {
+      if (isUsableDisplayCatalog(persisted)) {
+        cacheCatalog(cwd, persisted);
+        return persisted;
+      }
+      process.stderr.write(
+        `[${PROVIDER_ID}] the catalog cache entry at ${diskPath} is not a usable catalog `
+          + "(truncated or written by another version); ignoring it and reading the runtime\n",
+      );
+    }
+  } catch (error) {
+    // An unreachable cache is not a failed open: report it and probe.
+    diskPath = undefined;
+    fingerprint = undefined;
+    process.stderr.write(`[${PROVIDER_ID}] catalog cache unavailable (${messageOf(error)}); reading the runtime\n`);
+  }
   const probe = probeProcess(cwd, "catalog-probe");
   try {
     await probe.start();
     const raw: DshCatalog = await probe.catalog();
     const value = toDisplayCatalog(raw);
     cacheCatalog(cwd, value);
+    if (diskPath !== undefined && fingerprint !== undefined) {
+      // `writeCatalogCache` refuses an empty model list itself: that answer is the
+      // asynchronous-materialization race, not a fact about the profile.
+      writeCatalogCache({ path: diskPath, fingerprint, catalog: value });
+    }
     return value;
   } finally {
     probe.kill();
@@ -529,6 +609,24 @@ class DshConnection implements ProviderConnection {
    */
   #poolEnv: Record<string, string> | undefined;
   /**
+   * The cross-process record of the shared child this connection spawned.
+   *
+   * `#pooled` and its claims only describe what **this** process is doing, which
+   * is exactly the half the reload race is blind to: Paseo stops the old plugin
+   * process on a 2 s budget (`@getpaseo/server` `plugins/runtime.js`,
+   * `SOFT_SHUTDOWN_TIMEOUT_MS`), so the child it spawned can outlive it by the
+   * length of its own teardown — with the profile's fixed listener port still
+   * bound. The record is how the next process learns about that child (see
+   * `shared-dsh-record.ts` for the format and the identity rules).
+   *
+   * Kept beside the pid because a record is cleared by **pid**: a stale record
+   * naming some other process must never be deleted by this connection, and a
+   * successor's record must survive this process's late exit.
+   */
+  #sharedDsh: { path: string; pid: number } | undefined;
+  /** Process probe for the record's identity checks; a field so a check can stub it. */
+  readonly #processProbe = systemProcessProbe();
+  /**
    * Outstanding claims, counted **per child instance**.
    *
    * This has to be keyed by the child, not a single number, because a child can
@@ -668,6 +766,9 @@ class DshConnection implements ProviderConnection {
     // child inherit a debt it never took on.
     this.#pooled = undefined;
     this.#poolEnv = undefined;
+    if (pooled.pid !== undefined) {
+      SERVING_SHARED_DSH.delete(pooled.pid);
+    }
     this.#dropPoolClaims(pooled);
     return undefined;
   }
@@ -743,6 +844,13 @@ class DshConnection implements ProviderConnection {
       return { process: shared, reused: true, envDiffering: this.#warnEnvDiffers(options.env) };
     }
     const spawnTask = (async (): Promise<DshProcess> => {
+      // Nothing is spawned before the *previous* plugin process's shared child is
+      // provably gone. That child belongs to another OS process, so the pool's
+      // own accounting cannot see it; its owner was stopped on Paseo's 2 s budget
+      // (see `shared-dsh-record.ts`) and may still be tearing down after its
+      // `webserver` bound the profile's fixed port. A child spawned into that
+      // window dies at profile boot with `listen EADDRINUSE`.
+      await this.#awaitPreviousSharedDsh(options.env);
       // A placeholder id, not a real conversation: `DshProcess` attaches its
       // constructor id at construction, and `start()` initializes that id. The
       // point of that initialize is to compose the LLM adapters and validate the
@@ -776,6 +884,10 @@ class DshConnection implements ProviderConnection {
         onProtocolError: (message) => {
           process.stderr.write(`[${PROVIDER_ID}] protocol: ${message}\n`);
         },
+        // Recorded in the same tick as the spawn, before the child can bind the
+        // profile's fixed port: the successor that lands after a reload has to
+        // see it there (see `shared-dsh-record.ts`).
+        onSpawned: (pid, command) => this.#onSharedDshSpawned(pid, command, options.env),
       });
       try {
         await child.start();
@@ -801,6 +913,9 @@ class DshConnection implements ProviderConnection {
         throw new Error("the provider connection is closed");
       }
       this.#pooled = started;
+      if (started.pid !== undefined) {
+        SERVING_SHARED_DSH.add(started.pid);
+      }
       this.#poolEnv = { ...options.env };
       this.#addPoolClaim(started);
       // Freshly spawned by this very call: the caller is not joining anything, so
@@ -945,6 +1060,158 @@ class DshConnection implements ProviderConnection {
   }
 
   /**
+   * Where the cross-process record of this child lives, and the profile it serves.
+   *
+   * Resolved from the **child's** environment, exactly as `DshProcess.#start`
+   * resolves it: the daemon's environment with the session's keys on top. Two
+   * different homes (or profiles) are different DSH runtimes on different session
+   * stores, so they must not wait on each other's record.
+   *
+   * @param env - the session env the spawn was asked to use.
+   */
+  #sharedDshIdentity(env: Record<string, string>): { path: string; home: string; profile: string } {
+    const merged: Record<string, string | undefined> = { ...process.env, ...env };
+    const home = dshHome(merged);
+    const profile = profileName(merged);
+    return { path: sharedDshRecordPath(home, profile), home, profile };
+  }
+
+  /**
+   * Wait, bounded, for the previous plugin process's shared child to exit.
+   *
+   * The wait is the whole fix for the reload race: Paseo stops this plugin's
+   * process on a 2 s budget, so the child can outlive its owner and keep the
+   * profile's fixed listener port bound. Answers in three shapes, and only one of
+   * them is allowed to proceed on its word alone:
+   *
+   * - nothing recorded / the pid is gone / the pid now belongs to another
+   *   process → the port is free as far as we can tell, spawn.
+   * - the recorded child was alive and exited during the wait → spawn.
+   * - it was a **verified orphan** that outlived the self-exit window → SIGTERM,
+   *   then SIGKILL, each with its own bound and log line
+   *   ({@link reclaimPreviousSharedDsh}). SIGTERM first is not politeness: it is
+   *   DSH's own exit path, so the reclaimed session logs are flushed rather than
+   *   abandoned. Waiting ten seconds before touching it would make every reload
+   *   with a slow child cost the user ten seconds for nothing.
+   * - it was still there after all of that, or it was not provably this DSH home's
+   *   orphan (owner plugin process alive — another live or still-retiring
+   *   connection of this process; or an identity that does not match) → **throw**,
+   *   naming the pid. Signalling a process this connection cannot prove it owns
+   *   would be guessing at another daemon's state.
+   *
+   * @param env - the session env the spawn will use.
+   */
+  async #awaitPreviousSharedDsh(env: Record<string, string>): Promise<void> {
+    const state = this.#sharedDshIdentity(env);
+    const recorded = readSharedDshRecord(state.path);
+    if (recorded !== undefined && SERVING_SHARED_DSH.has(recorded.pid)) {
+      // Another live connection of this process is serving that child. Its port
+      // is not an orphan's port: this spawn may proceed (and the two contexts are
+      // as separate as they were before the record existed).
+      return;
+    }
+    const outcome = await reclaimPreviousSharedDsh({
+      path: state.path,
+      home: state.home,
+      profile: state.profile,
+      waitMs: sharedDshWaitMs(),
+      selfPid: process.pid,
+      probe: this.#processProbe,
+      log: (line) => process.stderr.write(`${line}\n`),
+    });
+    if (outcome.state === "timed-out") {
+      const record = readSharedDshRecord(state.path);
+      const message =
+        record === undefined
+          ? `the shared dsh of the previous plugin process did not exit within ${String(outcome.waitedMs)} ms `
+            + `(pid ${String(outcome.pid)}, record ${state.path}); refusing to spawn a second dsh for profile `
+            + `"${state.profile}" beside it`
+          : sharedDshStillRunningMessage({
+            record,
+            waitedMs: outcome.waitedMs,
+            ownerAlive: outcome.ownerAlive,
+            verified: outcome.verified,
+          });
+      process.stderr.write(`[${PROVIDER_ID}] ${message}\n`);
+      throw new Error(message);
+    }
+    if (outcome.state === "waited" && outcome.waitedMs >= 250) {
+      process.stderr.write(
+        `[${PROVIDER_ID}] waited ${String(outcome.waitedMs)} ms for the previous plugin process's shared dsh `
+          + `(pid ${String(outcome.pid)}) to exit before spawning a new one\n`,
+      );
+    }
+    if (outcome.state === "reused") {
+      process.stderr.write(
+        `[${PROVIDER_ID}] ignoring the shared-dsh record: ${outcome.reason}; `
+          + "that pid is not this DSH home's child any more\n",
+      );
+    }
+    if (outcome.state === "foreign") {
+      process.stderr.write(
+        `[${PROVIDER_ID}] ignoring a shared-dsh record for profile "${outcome.profile}" (pid `
+          + `${String(outcome.pid)}): it is a different DSH runtime, not this spawn's previous child\n`,
+      );
+    }
+  }
+
+  /**
+   * Write the cross-process record for a child that was just spawned.
+   *
+   * The start identity is read from the live process, not from the pid: a record
+   * without one could only be trusted by pid, and a reused pid would then make a
+   * successor wait out its whole bound for a process that has nothing to do with
+   * DSH. Losing the identity or the file is reported and tolerated — the record is
+   * a hint for the next process, never a precondition for this one's child.
+   *
+   * @param pid - the spawned child's pid.
+   * @param command - the binary it was spawned from (diagnostics).
+   * @param env - the session env the spawn used.
+   */
+  #onSharedDshSpawned(pid: number, command: string, env: Record<string, string>): void {
+    const state = this.#sharedDshIdentity(env);
+    const observed = this.#processProbe.inspect(pid);
+    if (!observed.alive || observed.identity === undefined) {
+      process.stderr.write(
+        `[${PROVIDER_ID}] spawned the shared dsh as pid ${String(pid)} but could not read its start identity; `
+          + "the next plugin process will not be able to wait for it\n",
+      );
+      return;
+    }
+    const written = writeSharedDshRecord(state.path, {
+      pid,
+      identity: observed.identity,
+      command,
+      home: state.home,
+      profile: state.profile,
+      ownerPid: process.pid,
+    });
+    if (!written) {
+      process.stderr.write(
+        `[${PROVIDER_ID}] could not record the shared dsh (pid ${String(pid)}) at ${state.path}; `
+          + "a reload that kills this plugin process mid-teardown may then race its port\n",
+      );
+      return;
+    }
+    this.#sharedDsh = { path: state.path, pid };
+  }
+
+  /**
+   * Remove this connection's record once its child is really gone.
+   *
+   * Pid-guarded twice: the in-memory pair has to name the same pid, and
+   * `clearSharedDshRecord` re-checks the file, because a successor may already own
+   * the path with a child of its own.
+   *
+   * @param pid - the pid that exited; ignored when it is not this connection's child.
+   */
+  #forgetSharedDsh(pid: number | undefined): void {
+    const shared = this.#sharedDsh;
+    if (shared === undefined || pid === undefined || shared.pid !== pid) return;
+    if (clearSharedDshRecord(shared.path, shared.pid)) this.#sharedDsh = undefined;
+  }
+
+  /**
    * Shut the shared child down for real and forget it.
    *
    * Called on provider teardown and by the idle grace timer. Serialized because
@@ -1014,6 +1281,11 @@ class DshConnection implements ProviderConnection {
     this.#pooled = undefined;
     this.#poolEnv = undefined;
     if (pooled === undefined) return;
+    if (pooled.pid !== undefined) {
+      // Retiring, not gone: a spawn that lands before the reap must wait for it,
+      // and the record still names it until `#forgetSharedDsh` below.
+      SERVING_SHARED_DSH.delete(pooled.pid);
+    }
     // Only this child's claims are dropped. Other children can still have
     // outstanding claims (a session that opened onto a child which was later
     // replaced); clearing the whole map would make those claims unreleasable and
@@ -1031,6 +1303,11 @@ class DshConnection implements ProviderConnection {
       process.stderr.write(
         `[${PROVIDER_ID}] the shared DeepSeek Harness process did not exit within ${String(RELEASE_TIMEOUT_MS)}ms of its shutdown; the next open may race its session log lock\n`,
       );
+    } else {
+      // Gone means gone: whoever opens next must not wait for a corpse, and a
+      // successor that already recorded its own child must not lose its record to
+      // this call (`clearSharedDshRecord` is pid-guarded).
+      this.#forgetSharedDsh(pooled.pid);
     }
   }
 
@@ -1057,6 +1334,12 @@ class DshConnection implements ProviderConnection {
     // child's entry keeps any older child's claims intact for their own release.
     this.#dropPoolClaims(child);
     this.#cancelPoolRelease();
+    if (child.pid !== undefined) {
+      SERVING_SHARED_DSH.delete(child.pid);
+    }
+    // An open that follows must not wait for a child that is already reaped; a
+    // crash is as final as a shutdown for this purpose.
+    this.#forgetSharedDsh(child.pid);
   }
 
   /**
@@ -2312,6 +2595,32 @@ class DshConnection implements ProviderConnection {
  * with a count that looks plausible.
  */
 const CONNECTIONS = new Set<DshConnection>();
+
+/**
+ * Shared children **this process** is currently serving, by pid.
+ *
+ * The on-disk record is per DSH home and profile, which is the right granularity
+ * across processes but one level too coarse inside this one: every provider
+ * connection owns its own pool, so two live connections legitimately serve two
+ * children (a harness opens a second connection while the first is in use, and
+ * nothing in the SDK promises one at a time — see {@link CONNECTIONS}). A
+ * successor must wait for an *orphan*, and a pid another live connection of this
+ * very process is serving is not one: waiting on it would stall that connection's
+ * open behind a process that is not going away.
+ *
+ * Kept here (module scope) rather than on the connection because the waiting
+ * connection is a different object from the one being waited for.
+ */
+const SERVING_SHARED_DSH = new Set<number>();
+
+/*
+ * There is deliberately no second registry here. A child this process has stopped
+ * serving is covered by the record's `ownerPid === process.pid`: `reclaimPreviousSharedDsh`
+ * treats a record owned by this process as "never signal, wait only", which is
+ * exactly the retiring case (the pool owns its teardown and has already waited for
+ * it). A `RETIRING` set would be a second source of truth for the same fact and
+ * was, in fact, only ever written.
+ */
 
 /**
  * Read one agent's background jobs through whichever connection serves it.

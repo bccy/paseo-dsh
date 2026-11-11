@@ -302,9 +302,17 @@
   清除旧值、无效计数拒绝、切模型时迟到的旧响应不能覆盖、关闭后不再发）。参数是编译输出
   目录：`node harness/context-usage-check.cjs <dir>`。**动了 `server/dsh-process.ts` 的用量
   读取或 `DshSession` 的用量上报必跑。**
-- `harness/catalog-cache-check.mjs` — catalog 缓存按 cwd 的小 LRU（不是单槽）：多工作区
-  A→B→A 只起 2 个 probe（旧实现 3 个），每个 cwd 命中各自条目。**动了 `provider.ts` 的
-  `loadCatalog` / catalog 缓存 / TTL 必跑。**
+- `harness/catalog-cache-check.mjs` — catalog 缓存的**两层**（假 `dsh` + 一次性 `DSH_HOME`，
+  **10/10**）：① 内存层是按 cwd 的小 LRU（不是单槽），多工作区 A→B→A 只起 2 个 probe（旧实现 3
+  个），每个 cwd 命中各自条目；② **磁盘层**（`server/catalog-cache.ts`）让 reload 后的**新进程**
+  不再为读一次 catalog 另起一个 `dsh`：写入必须带非空 model 列表（空目录是异步物化竞态，
+  FIELD-NOTES 第 58 条——写进去就永远是空模型菜单）、读取要重新核对指纹（`dsh --version` + profile
+  组成文件的**内容哈希** + 凭据文件 stat；profile 文件被插件自己每次重写，mtime 指纹会把这条缓存
+  正好废掉）、坏文件/超 24h 都按"没有缓存"处理；集成断言：**种一条合法缓存后，子进程回答 catalog
+  且不再 spawn probe**；**截断/形状不对的条目**（有非空 models 但缺 `defaults.modes` 等 open 会读的
+  字段）必须当未命中 → 回退 probe 且 open 仍成功（`isUsableDisplayCatalog`，不抛 `TypeError`）。
+  凭据只 `stat`（size+mtime），不读内容。**动了 `server/catalog-cache.ts`、`provider.ts` 的
+  `loadCatalog`/`isUsableDisplayCatalog` 必跑；变异「只写不读」→ 9/10 红、「去掉形状校验」→ 10/12 红。**
 - `harness/open-degrade-check.mjs` — open 期降级必须用户可见：`paseo/history` 抛错、preset
   被拒、plan 对账失败（plan 模式）都要发 `session.notice`/warning，而不是只写 stderr；
   子代理枚举失败也点名。**动了 `session.ts` 的 `replayHistory`/open 降级通知、`provider.ts`
@@ -502,9 +510,41 @@
   / `PASEO_AGENT_CWD` / `PASEO_WORKSPACE_ID`，0.16 `agentIdentityEnv`）不触发告警、同日 cwd
   不同 workspace 也不告警；而 **spawn 出去的 `dsh` 子进程里一个身份键都没有**——用一层 wrapper
   记录子进程真实的 env，正对照（非身份键）证明剔除是选择性的，不是"子进程没拿到 env"。
-  假 `dsh` + 一次性 `DSH_HOME`，自己编译到私有目录，**46/46**。**动了多会话路由、
+  假 `dsh` + 一次性 `DSH_HOME`，自己编译到私有目录，**49/49**。**动了多会话路由、
   `#deliverLive`、`provider.ts` 的引用计数、env 差异豁免，或 `session.ts` 的会话归属逻辑必跑；
-  或 `dsh-process.ts` 的 prompt/close 时序、spawn env 组装也必跑。**
+  或 `dsh-process.ts` 的 prompt/close 时序、spawn env 组装也必跑。**（2026-11-11 新增 3 条：
+  父进程 env 带桥的 `DSH_PASEO_AGENT_ID`/`_AGENT_CWD`/`_WORKSPACE_ID` 时，子进程 env 三个
+  `DSH_PASEO_*` **和**三个 `PASEO_*` 都不许有——`BASH_ENV` 会把前者映射回后者，只删 `PASEO_*`
+  挡不住外层会话身份漏进共享子进程；去掉 `dsh-process.ts` 的 `DSH_AGENT_IDENTITY_ENV_KEYS`
+  剔除就红 6 条。）
+- `harness/reload-port-race-check.mjs` — **插件重载的固定端口竞态**（假 `dsh` + 一次性
+  `DSH_HOME`，自己编译到私有目录，**51/51**）：Paseo 只给插件进程 **2 s** 软关闭预算
+  （`@getpaseo/server` `plugins/runtime.js` 的 `SOFT_SHUTDOWN_TIMEOUT_MS = 2000`，随后 SIGTERM/SIGKILL），
+  而插件自己的 teardown 上界是每会话 10 s + 池 5 s；旧插件进程被切在半路时，它 spawn 的共享 `dsh`
+  成了孤儿——profile 的固定 `webserver` 端口仍被它占着，新插件进程的首个 open 就撞
+  `listen EADDRINUSE … webserver (required)`。断言：spawn 同 tick 就写下
+  `$DSH_HOME/paseo/shared-dsh.json`（pid + 启动身份 + profile，写完不是 spawn 之后）、子进程退出后
+  记录被清掉、**旧 dsh 还在退时新 child 必须等它退出后才 spawn**（旧进程自己写退出时间戳，断言
+  `spawn.at >= old.exitAt`，不靠睡等）、同进程内 sibling 连接不能与「正在退役」的 child 重叠
+  （用假桥 `DSH_FAKE_HOLD_METHOD=shutdown` 把退役停在关机帧上，不靠时序）、**pid 复用**（记录里的
+  启动身份与现进程不符）不等、超时**响亮失败且报出 pid**（`Refusing to start a second dsh`）、
+  死 pid 记录不花等待。**2026-11-11 补分级回收的 5 条**（`reclaimPreviousSharedDsh`）：3 s 内自退
+  → 全程不发信号；**忽略 SIGTERM → 2 s 后 SIGKILL**（日志逐级可见）；**SIGTERM 即退 → 不升到
+  SIGKILL**；pid 被别的程序复用 → 不杀（真身份不符就只等）；**记录属主插件进程仍活 → 不杀**，
+  只等并响亮失败（文案带"still owned by a running plugin process"）。变异都红：去掉等待 21/28
+  （旧 child 还没退就 spawn）、去掉启动身份校验 26/28、**跳过身份核实直接杀 39/41**（把旁观进程
+  SIGTERM 掉）、**跳过 SIGTERM 直接 SIGKILL 38/41**（SIGTERM 那一级与"不必升到 SIGKILL"都没了）。
+  **verify4 收口后 +8 条（41 → 49）**：记录**按 profile 分文件**
+  （`shared-dsh.<safe-profile>.json`），另一 profile 的活 child 只算 `foreign`——**不等、不杀**，也不
+  拖慢本 profile 的 open（模块级 + provider 级各断言一次）；身份与 cmdline **都读不到**时是
+  `unknown`：等、**不发信号**、按 `verified:false` 报出（盲探针只对 child pid 盲、对属主 pid 仍
+  如实——否则该用例会为错误理由变绿，实测踩过）；**路径是行为断言**（`sharedDshRecordPath(home,"a")
+  !== …(home,"b")` 且文件名带 profile），所有路径一律来自该解析函数、检查与真机脚本都不硬编码文件名。
+  变异：**去掉 profile 隔离** 47/49（foreign 那条 + 真的 SIGTERM 了别的 profile 的 child）、
+  **「无法核实」当成自己的** 47/49（SIGTERM+SIGKILL 打在一个它证明不了的 pid 上）、**路径不带
+  profile** 49/51（两条路径断言）。**动了 `server/shared-dsh-record.ts`、
+  `provider.ts` 的 `#awaitPreviousSharedDsh` / `#onSharedDshSpawned` / `#forgetSharedDsh` /
+  `SERVING_SHARED_DSH`，或 `dsh-process.ts` 的 `onSpawned` / `pid` 必跑。**
 - `harness/identity-env-check.mjs` — 离线钉住「每会话身份只到自己的会话」：真 `PaseoHarnessServer`
   的 identity 表（两会话不同值、未知会话返回 `{}`、子会话沿 `children.parentId` 继承父身份、
   re-initialize 无 identity 清行、process-level identity 被拒）+ `identity-env.ts` 的 BASH_ENV 脚本
