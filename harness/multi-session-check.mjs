@@ -99,7 +99,7 @@ writeFileSync(
     "# Record the PASEO_* environment this child was spawned with, then become the",
     "# scripted bridge under the same pid.",
     `printf 'pid %s\\n' "$$" >> ${shellQuote(spawnEnvLog)}`,
-    `env | grep -E '^(PASEO_[A-Z_]+|DSH_SPAWN_ENV_MARKER|DSH_MULTI_SESSION_APPLIED_KEY)=' >> ${shellQuote(spawnEnvLog)} || true`,
+    `env | grep -E '^(PASEO_[A-Z_]+|DSH_PASEO_[A-Z_]+|DSH_SPAWN_ENV_MARKER|DSH_MULTI_SESSION_APPLIED_KEY)=' >> ${shellQuote(spawnEnvLog)} || true`,
     `exec ${shellQuote(process.execPath)} ${shellQuote(fakeBridge)} "$@"`,
     "",
   ].join("\n"),
@@ -912,6 +912,16 @@ console.log("\nclosing one session leaves the other working");
 // the connection above already spawned one with the harness's own env.
 console.log("\na per-session env the shared process cannot apply");
 {
+  // The caller of this check is itself a DSH shell: a real one carries the bridge's
+  // per-execution facts (`DSH_PASEO_AGENT_ID` / `..._CWD` / `..._WORKSPACE_ID`) in
+  // its process environment, and the generated `BASH_ENV` maps them back to the
+  // real `PASEO_*` names in every non-interactive bash. That is a second way into
+  // the shared child — one that removing the three `PASEO_*` keys cannot cover —
+  // so this section arms those keys itself instead of depending on how the check
+  // happened to be started.
+  process.env.DSH_PASEO_AGENT_ID = "outer-agent-id";
+  process.env.DSH_PASEO_AGENT_CWD = process.cwd();
+  process.env.DSH_PASEO_WORKSPACE_ID = "outer-workspace-id";
   const envConn = await registration.connect({ capabilities: ["prompt.message"] });
   const envEvents = [];
   envConn.onEvent((event) => envEvents.push(event));
@@ -1018,6 +1028,18 @@ console.log("\na per-session env the shared process cannot apply");
     check(
       `…but not ${identityKey}: the shared child cannot honour a per-session identity`,
       childSpawnEnv !== undefined && !(identityKey in childSpawnEnv.env),
+      shownSpawnEnv,
+    );
+  }
+  // And not the bridge's own names either. They are what the outer DSH shell
+  // carries, and the child gets a `BASH_ENV` (so its bash tools see their own
+  // session's identity) — that script re-exports `PASEO_*` from `DSH_PASEO_*` the
+  // moment any bash starts, so keeping them leaks the OUTER agent's identity past
+  // the removal of the three `PASEO_*` keys.
+  for (const outerKey of ["DSH_PASEO_AGENT_ID", "DSH_PASEO_AGENT_CWD", "DSH_PASEO_WORKSPACE_ID"]) {
+    check(
+      `…and not ${outerKey} either: BASH_ENV would re-export it as ${outerKey.slice(4)}`,
+      childSpawnEnv !== undefined && !(outerKey in childSpawnEnv.env),
       shownSpawnEnv,
     );
   }

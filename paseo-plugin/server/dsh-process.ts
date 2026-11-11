@@ -77,6 +77,27 @@ export const AGENT_IDENTITY_ENV_KEYS: readonly string[] = [
   "PASEO_WORKSPACE_ID",
 ];
 
+/**
+ * The same three facts as the bridge publishes them **inside** the child,
+ * `DSH_`-prefixed (`ctx.shellEnv`, see `identity-env.ts`).
+ *
+ * They must leave the spawn env for the same reason the plain names do, and one
+ * more: the child is spawned with a `BASH_ENV` script whose whole job is to map
+ * `DSH_PASEO_*` back to `PASEO_*` for every non-interactive bash. Leaving them in
+ * the process environment therefore re-creates the identity **after** the three
+ * `PASEO_*` keys were removed — and it is not a theoretical path: a plugin or a
+ * nested `dsh` started from inside a DSH shell inherits `DSH_PASEO_AGENT_ID` from
+ * that shell's bash, so the shared child would carry the *outer* session's agent,
+ * workspace and cwd, which is exactly the wrong-identity failure the plain-name
+ * removal exists to prevent. `DSH_PASEO_PROFILE` / `_LANG` / the harness knobs are
+ * unrelated settings, not identity, and stay.
+ *
+ * Derived from {@link AGENT_IDENTITY_ENV_KEYS} so the two lists cannot drift.
+ */
+export const DSH_AGENT_IDENTITY_ENV_KEYS: readonly string[] = AGENT_IDENTITY_ENV_KEYS.map(
+  (key) => `DSH_${key}`,
+);
+
 /** Provider/model/thinking route pinned for the life of one process. */
 export interface DshRoute {
   provider: string;
@@ -975,6 +996,15 @@ export interface DshProcessOptions extends DshProcessHandlers {
    * regression slower and less deterministic than the mechanism it tests.
    */
   maxOutboundQueueBytes?: number;
+  /**
+   * Called synchronously right after `spawn()`, with the child's pid and the
+   * binary it was spawned from.
+   *
+   * The provider uses it to write the cross-process record (`shared-dsh-record.ts`)
+   * in the same tick as the spawn. It is **not** a lifecycle hook: a spawn that
+   * later fails still reports, and the provider owns whatever happens next.
+   */
+  onSpawned?: (pid: number, command: string) => void;
 }
 
 /**
@@ -993,7 +1023,16 @@ export interface DshProcessOptions extends DshProcessHandlers {
  *
  * @throws when `DSH_BINARY` names a path that is missing or not executable.
  */
-function resolveBinary(): string {
+/**
+ * The `dsh` executable this plugin spawns (and the catalog cache fingerprints).
+ *
+ * Exported because the on-disk catalog cache must invalidate when the binary it
+ * was read from changes (`catalog-cache.ts`); resolving the path twice with two
+ * different rules would let the cache survive an upgrade.
+ *
+ * @throws when `DSH_BINARY` names a path that is missing or not executable.
+ */
+export function resolveDshBinary(): string {
   const configured = process.env.DSH_BINARY;
   if (configured !== undefined && configured !== "") {
     if (!configured.includes("/")) return configured;
@@ -1855,6 +1894,17 @@ export class DshProcess {
   }
 
   /**
+   * The child's pid, or `undefined` before the first spawn / after a failed one.
+   *
+   * Read by the provider to record the shared child on disk and to name it in a
+   * loud failure; the process itself never treats the pid as an identity (that is
+   * what the start identity in `shared-dsh-record.ts` is for).
+   */
+  get pid(): number | undefined {
+    return this.#child?.pid;
+  }
+
+  /**
    * Point this process at a different set of handlers.
    *
    * Kept for the warm pool: an idle process is parked and a fresh provider
@@ -2129,6 +2179,10 @@ export class DshProcess {
     // creates a top-level agent/workspace instead of acting as the first session.
     const env = { ...process.env, ...this.#options.env };
     for (const key of AGENT_IDENTITY_ENV_KEYS) delete env[key];
+    // The bridge's own names have to go too: the `BASH_ENV` hook below maps them
+    // back to `PASEO_*`, so keeping them would undo the removal on the next bash
+    // start (see {@link DSH_AGENT_IDENTITY_ENV_KEYS}).
+    for (const key of DSH_AGENT_IDENTITY_ENV_KEYS) delete env[key];
     // Every non-interactive `bash -c` in this child (model bash, background
     // jobs, sandbox) sources `BASH_ENV`; the hook maps the execution's
     // per-session `DSH_PASEO_*` facts back to the real `PASEO_*` names the
@@ -2140,12 +2194,26 @@ export class DshProcess {
     // session did not provision is a failure with no local explanation.
     // `profileName` is the single definition of that lookup.
     const args = ["--profile", profileName(env)];
-    const child = spawn(resolveBinary(), args, {
+    const binary = resolveDshBinary();
+    const child = spawn(binary, args, {
       cwd: this.#options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env,
     });
     this.#child = child;
+    // The pid exists synchronously, and it is reported from this same tick: the
+    // provider records it on disk so the *next* plugin process can wait for this
+    // child to exit before spawning beside it (`shared-dsh-record.ts`). Reporting
+    // it after `start()` resolved would leave the child's whole boot window —
+    // the part where it binds the profile's fixed listener port — unrecorded.
+    if (child.pid !== undefined) {
+      try {
+        this.#options.onSpawned?.(child.pid, binary);
+      } catch {
+        // The record is a cross-process hint. Failing the spawn over it would
+        // trade a real child for a diagnostic.
+      }
+    }
 
     // A fresh splitter per spawn: see {@link #frames}. Created before the first
     // `data` handler can run, which is guaranteed because nothing yields between
