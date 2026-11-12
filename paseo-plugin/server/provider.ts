@@ -45,7 +45,13 @@ import {
   parseRoute,
 } from "./session";
 import { dshHome, profileName } from "./bootstrap";
-import { catalogCachePath, catalogFingerprint, readCatalogCache, writeCatalogCache } from "./catalog-cache";
+import {
+  catalogCachePath,
+  catalogFingerprint,
+  readAnyCatalogCache,
+  readCatalogCache,
+  writeCatalogCache,
+} from "./catalog-cache";
 import {
   clearSharedDshRecord,
   readSharedDshRecord,
@@ -154,24 +160,22 @@ interface OpenWarning {
 const FALLBACK_ROUTE = { provider: "unset", model: "unset" };
 const CATALOG_TTL_MS = 5 * 60 * 1000;
 /**
- * How long the shared child survives its last release.
- *
- * Paseo closes a provider session and reopens it with the same persistence on a
- * refresh (and a daemon restart does the same); the grace period is what keeps
- * that from becoming a cold CLI boot (measured 1.5–2.7 s). It deliberately
- * equals {@link RELEASE_TIMEOUT_MS}, the bound teardown waits for the child to
- * exit: both answer "when is a child really gone", and two different numbers
- * would let a reopen land while the old child still holds the log's write lock.
- */
-const POOL_RELEASE_GRACE_MS = 5_000;
-/**
- * Upper bound on waiting for a retired child to release a session log.
+ * Upper bound on waiting for a retiring child to release a session log.
  *
  * A DSH session log carries a kernel write lock (`SessionWriteLease` in
  * `@deepseek-ai/dsh-session-persistence-jsonl`) that outlives SIGTERM until the
  * OS reaps the process. A successor spawned before that fails to materialize the
  * session with "already owned by an active write handle", so this is the bound
  * teardown waits before letting the next open proceed.
+ *
+ * Teardown is the **only** thing that retires a child now. The pool used to kill
+ * an idle one after a grace period as well, and the two numbers were kept equal
+ * so that they answered "when is a child really gone" the same way: a reopen
+ * must never land while the old child still holds the log's write lock. With the
+ * child resident for the connection's whole life ({@link
+ * DshConnection.prewarmSharedDsh}) that job belongs to this bound alone — the
+ * teardown that waits it out before the next spawn is allowed, plus the
+ * cross-process record for a reload (`shared-dsh-record.ts`).
  *
  * A timeout is reported rather than thrown: the open that follows surfaces the
  * lock conflict itself if there is one, and failing the teardown over a slow
@@ -642,15 +646,28 @@ class DshConnection implements ProviderConnection {
    * stuck `refs=1` after every session had closed. A session's claim must be
    * returnable no matter which child it was taken against.
    *
-   * A child is retired when its own count reaches zero **and** the grace timer
-   * expires: Paseo's refresh closes and immediately reopens the session, and
-   * killing the child on the close would turn that fast path back into a cold
-   * start (measured at 1.5–2.7 s of CLI boot). The timer matches the pool's
-   * session-lock release bound so the two never disagree about when a child is
-   * really gone.
+   * A claim says a session is **using** the child; it no longer decides when the
+   * child dies. The child is resident for the whole life of the connection, so
+   * the count reaching zero is not a retirement signal — it means "nobody is
+   * talking to it right now", which is what lets a prewarmed child be replaced
+   * when the first session arrives with an environment it was not born with (see
+   * {@link #acquirePoolProcess}). Every claim that is taken is still returned on
+   * its own session's close, which is the pairing this count exists to prove.
    */
   readonly #poolClaims = new Map<DshProcess, number>();
-  #poolReleaseTimer: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * Whether the current child was spawned by the prewarm **and has never served
+   * a session**.
+   *
+   * Only that child may be retired and respawned to adopt the first session's
+   * environment ({@link #acquirePoolProcess}): a prewarmed child was spawned
+   * before any session's `config.env` existed, so its environment is empty, and
+   * a session that really sets keys would otherwise find them silently inert.
+   * Cleared as soon as a session claims the child — from then on the environment
+   * is the first session's, exactly as it has always been, and a later session
+   * that differs gets the warning instead of a kill.
+   */
+  #poolPrewarmed = false;
   /**
    * This connection's rewind counter, used to keep canary notices distinct.
    *
@@ -740,11 +757,109 @@ class DshConnection implements ProviderConnection {
     // shared child instead of keeping it alive for a reopen that will not happen
     // on this connection.
     await Promise.allSettled(sessions.map((session) => session.close({ park: false })));
-    // Teardown owns the shared child: no grace period, no reuse. The sessions
-    // above released their references, but the process must not outlive the
-    // connection that spawned it (a daemon reload would otherwise leave an
-    // orphan holding every session log's write lock).
+    // Teardown owns the shared child: no reuse, even for a child the prewarm
+    // started. The sessions above released their references, but the process must
+    // not outlive the connection that spawned it (a daemon reload would otherwise
+    // leave an orphan holding every session log's write lock).
     await this.#shutdownPool();
+  }
+
+  /**
+   * Start the shared child now, before any session needs it.
+   *
+   * Why this exists (FIELD-NOTES 100): the child's cold boot is the single largest
+   * cost on the first open of a connection. Measured on this machine against the
+   * real profile: spawn → listening **+8.4 s**, spawn → serving **+23.2 s**. A
+   * user opening a conversation, the first batch of ~20 sessions reopening after
+   * a plugin load, and the 4 s native-subagent replay budget
+   * ({@link SUBAGENT_REPLAY_READY_BUDGET_MS}) all queue behind that one spawn, so
+   * they all paid it. Starting it at provider connect moves the cost to the
+   * moment the plugin loads, where the user is not waiting on it.
+   *
+   * Fire-and-forget by contract: `connect()` must not be held up by a profile
+   * boot, and a failed prewarm is not a failed connection. Every failure is one
+   * stderr line, and **nothing is cached as ready** — the next open runs the
+   * ordinary spawn path and reports its own error to the user. A child that dies
+   * is likewise not restarted here (no supervision loop): the next open spawns.
+   *
+   * The route comes from the profile's own default via the catalog on disk, never
+   * from a hardcoded provider/model (this repository is shared). A cold catalog is
+   * **not** read here: doing that would spawn a throwaway probe and boot the whole
+   * profile a second time, which is the very cost this removes. A profile with no
+   * usable cache is reported and left to the first open.
+   *
+   * The child is spawned with an empty env: a real session's `config.env` carries
+   * only the daemon's three per-agent identity keys (host 0.16
+   * `agent-manager.js#buildLaunchContext` → `...agentIdentityEnv(...)`, and
+   * `CreateAgentOptions.env` is an optional explicit override that nothing in the
+   * normal open path sets — 1726 stored agent records on this machine carry no
+   * `launchEnv` at all). Those keys are dropped before spawn by design
+   * (`dsh-process.ts`), so empty is the env a session would have produced anyway.
+   * A session that does set real keys is not silently broken: {@link
+   * #acquirePoolProcess} retires the unused prewarm and spawns with its env.
+   */
+  prewarmSharedDsh(): void {
+    const task = (async (): Promise<void> => {
+      if (this.#closed) return;
+      const route = this.#prewarmRoute();
+      if (route === undefined) {
+        process.stderr.write(
+          `[${PROVIDER_ID}] prewarm skipped: the profile's catalog is not on disk yet, so its default route is unknown and `
+            + "reading it would boot a second dsh; the first session open will spawn the shared child itself\n",
+        );
+        return;
+      }
+      const { process: child, reused } = await this.#ensurePoolProcess({ route, env: {} });
+      if (!reused && this.#claimsOf(child) === 0) {
+        // Marked only once published and still unclaimed: a session that opened
+        // while this spawn was in flight has already claimed it through
+        // `#ensurePoolProcess`'s join path.
+        this.#poolPrewarmed = true;
+        process.stderr.write(
+          `[${PROVIDER_ID}] prewarmed the shared dsh (pid ${String(child.pid)}); the next session open reuses it\n`,
+        );
+      }
+    })();
+    void task.catch((error: unknown) => {
+      process.stderr.write(
+        `[${PROVIDER_ID}] prewarm failed (${messageOf(error)}); the next session open will spawn the shared child and report `
+          + "its own failure\n",
+      );
+    });
+  }
+
+  /**
+   * The route the prewarm spawns with: the profile's default, from its catalog.
+   *
+   * Read from the catalog cache on disk for **any** workspace, because there is no
+   * session here to name a cwd and the catalog is profile-level anyway
+   * (`catalog-cache.ts`). The fingerprint is re-validated exactly as
+   * {@link loadCatalog} does, so an entry written by another DSH binary, another
+   * profile composition or after a credential change is a miss.
+   *
+   * The in-memory `#display` is deliberately **not** set from this: the cache can
+   * hold a catalog whose model list materialized differently under a cold runtime,
+   * and publishing that as the connection's catalog would hand the composer an
+   * empty model picker (FIELD-NOTES 58). The prewarm only needs the route.
+   *
+   * @returns the route to spawn with, or undefined when the cache has no usable
+   *   catalog (or the profile declares no default at all).
+   */
+  #prewarmRoute(): DshRoute | undefined {
+    const home = dshHome(process.env);
+    const profile = profileName(process.env);
+    const fingerprint = catalogFingerprint({ home, profile, binary: resolveDshBinary() });
+    // No `profile` argument: the fingerprint already hashes this profile's
+    // composition files, which is what scopes an entry to a profile
+    // (`catalog-cache.ts#readAnyCatalogCache`).
+    const cached = readAnyCatalogCache<DisplayCatalog>({ home, fingerprint });
+    if (cached === undefined || !isUsableDisplayCatalog(cached)) return undefined;
+    const route = cached.fallbackRoute;
+    // A profile that declares no default names nothing anyone runs
+    // ({@link FALLBACK_ROUTE}): spawning with it would boot a whole dsh only to
+    // fail its route validation, so leave that one to the open, which reports it.
+    if (route.provider === FALLBACK_ROUTE.provider && route.model === FALLBACK_ROUTE.model) return undefined;
+    return { provider: route.provider, model: route.model };
   }
 
   /**
@@ -766,6 +881,7 @@ class DshConnection implements ProviderConnection {
     // child inherit a debt it never took on.
     this.#pooled = undefined;
     this.#poolEnv = undefined;
+    this.#poolPrewarmed = false;
     if (pooled.pid !== undefined) {
       SERVING_SHARED_DSH.delete(pooled.pid);
     }
@@ -774,49 +890,49 @@ class DshConnection implements ProviderConnection {
   }
 
   /**
-   * Get the shared child, spawning it if this connection has none.
+   * Ensure this connection has a live shared child, spawning one if it has none.
    *
    * The returned process is started (its `start()` completed), so the caller can
    * attach a session to it immediately. Concurrent callers share one spawn: two
    * sessions opening at the same instant must not each create a child, because
    * the second one would then be an unreferenced process holding the same
    * session logs' write locks — the exact "two owners" state `#sessionHolding`
-   * exists to prevent.
+   * exists to prevent. The prewarm ({@link prewarmSharedDsh}) goes through here
+   * too, so a first open that races its spawn **joins** it instead of starting a
+   * second one.
    *
    * `reused` tells the caller whether it **joined** a child that was already
-   * serving other sessions. That is not cosmetic: a session joining a live child
+   * serving sessions. That is not cosmetic: a session joining a live child
    * shares its runtime, so a native subagent child that the previous provider
    * session never saw announced can still be running there. Reporting `reused`
    * lets the session tell "still live" apart from "killed", instead of either
    * resurrecting a dead child or cancelling a live one.
    *
-   * The spawn uses the **first caller's** route/env as the process defaults.
-   * That is deliberate and mostly harmless: every session sends its own cwd and
-   * route in `initialize` (`attachSession`), so those defaults only cover a
-   * request that names no session. **The cwd is the exception, and it is not a
-   * session's**: the child is spawned in {@link stableProcessCwd}, a directory no
-   * workspace owns. Anchoring the process to the first caller's workspace turned
+   * The spawn uses the **caller's** route/env as the process defaults. That is
+   * deliberate and mostly harmless: every session sends its own cwd and route in
+   * `initialize` (`attachSession`), so those defaults only cover a request that
+   * names no session. **The cwd is the exception, and it is not a session's**:
+   * the child is spawned in {@link stableProcessCwd}, a directory no workspace
+   * owns. Anchoring the process to the first caller's workspace turned
    * `/proc/<pid>/cwd` into `(deleted)` as soon as that workspace was removed, and
    * then every session's bash calls failed with `spawn systemd-run ENOENT`
    * (FIELD-NOTES 91) — session cwd is unaffected because it travels per session.
    * **The environment is the other exception**: it is applied once at spawn and
    * DSH exposes no channel to change it per session, so a later session's
-   * `config.env` cannot be honoured. That divergence is not swallowed —
-   * {@link #warnEnvDiffers} reports every key that differs (except the daemon's
-   * per-agent identity keys), and the keys are handed back so the open can also
-   * put them on the timeline. The identity keys are not merely unapplied: the
-   * child drops all three before spawn, because a process-wide value could only
-   * be the first session's and would send a later session's CLI calls to the
-   * wrong agent or workspace.
+   * `config.env` cannot be honoured. That divergence is not swallowed — it is
+   * reported by {@link #warnEnvDiffers}, and {@link #acquirePoolProcess} retires a
+   * prewarmed-but-unused child so the **first** session's environment still
+   * wins. The identity keys are not merely unapplied: the child drops all three
+   * before spawn, because a process-wide value could only be the first session's
+   * and would send a later session's CLI calls to the wrong agent or workspace.
    *
    * @param options - the route/env to spawn with, when a spawn is needed.
-   * @returns the live shared child, whether it was already serving sessions, and
-   *   the env keys this session asked for that the child will not apply.
+   * @returns the live shared child and whether the caller joined an existing one.
    */
-  async #acquirePoolProcess(options: {
+  async #ensurePoolProcess(options: {
     route: DshRoute;
     env: Record<string, string>;
-  }): Promise<{ process: DshProcess; reused: boolean; envDiffering: string[] }> {
+  }): Promise<{ process: DshProcess; reused: boolean }> {
     // `send()` guards only at its entry; an open that is already past it when
     // the connection is torn down must not spawn a child nobody owns.
     if (this.#closed) throw new Error("the provider connection is closed");
@@ -825,23 +941,17 @@ class DshConnection implements ProviderConnection {
     await this.#awaitPoolShutdown();
     if (this.#closed) throw new Error("the provider connection is closed");
     const existing = this.#livePoolProcess();
-    if (existing !== undefined) {
-      this.#addPoolClaim(existing);
-      this.#cancelPoolRelease();
-      return { process: existing, reused: true, envDiffering: this.#warnEnvDiffers(options.env) };
-    }
+    if (existing !== undefined) return { process: existing, reused: true };
     const inFlight = this.#poolSpawn;
     if (inFlight !== undefined) {
       const shared = await inFlight;
       // The connection can be closed while this join awaits somebody else's
-      // spawn. The claim is taken only after this check, so a close in that
-      // window leaves nothing outstanding.
+      // spawn. The claim is taken by the caller only after this check, so a close
+      // in that window leaves nothing outstanding.
       if (this.#closed) throw new Error("the provider connection is closed");
-      this.#addPoolClaim(shared);
-      this.#cancelPoolRelease();
       // Somebody else's spawn: by the time this returns the child has another
       // session attached to it (or is about to), so this caller is joining.
-      return { process: shared, reused: true, envDiffering: this.#warnEnvDiffers(options.env) };
+      return { process: shared, reused: true };
     }
     const spawnTask = (async (): Promise<DshProcess> => {
       // Nothing is spawned before the *previous* plugin process's shared child is
@@ -902,12 +1012,12 @@ class DshConnection implements ProviderConnection {
     this.#poolSpawn = spawnTask;
     try {
       const started = await spawnTask;
-      // Re-checked **after** the spawn: a `close()` that ran while `start()`
-      // was in flight has already shut the pool down (there was no child to
-      // wait for yet), so publishing this one would resurrect a process on a
-      // dead connection. Its claim would never be released, no grace timer
-      // would be armed, and the orphan would keep holding the session logs'
-      // write locks. Kill it here — teardown no longer knows it exists.
+      // Re-checked **after** the spawn: a `close()` that ran while `start()` was
+      // in flight has already shut the pool down (there was no child to wait for
+      // yet), so publishing this one would resurrect a process on a dead
+      // connection. Nothing would ever release it, and the orphan would keep
+      // holding the session logs' write locks. Kill it here — teardown no longer
+      // knows it exists.
       if (this.#closed) {
         started.kill();
         throw new Error("the provider connection is closed");
@@ -917,17 +1027,74 @@ class DshConnection implements ProviderConnection {
         SERVING_SHARED_DSH.add(started.pid);
       }
       this.#poolEnv = { ...options.env };
-      this.#addPoolClaim(started);
-      // Freshly spawned by this very call: the caller is not joining anything, so
-      // its env is the one the child was born with — except the daemon's agent
-      // identity keys, which `dsh-process.ts` drops at spawn by design (see
-      // {@link #warnEnvDiffers}); neither reads as a difference here.
-      return { process: started, reused: false, envDiffering: [] };
+      return { process: started, reused: false };
     } finally {
       // Cleared on failure too, so a retry spawns again rather than awaiting a
       // rejection nobody kept.
       if (this.#poolSpawn === spawnTask) this.#poolSpawn = undefined;
     }
+  }
+
+  /**
+   * Take one claim on the shared child for a session that is opening.
+   *
+   * The claim is the provider's accounting for "this session is using the child";
+   * the child itself stays resident for the connection's whole life, so a claim
+   * does not keep it alive and returning one does not retire it.
+   *
+   * A prewarmed child that no session ever used is retired first if this session
+   * asks for environment keys it was not born with: the prewarm has no session to
+   * take an env from, so it spawns with none, and letting the first session's real
+   * keys be silently inert would be the "my FOO=bar did nothing" failure this
+   * pool reports instead of swallowing. Respawning costs one cold boot on a path
+   * `config.env` almost never takes (the daemon's three identity keys are
+   * exempt, so a normal session does not trigger it), and it keeps the old
+   * contract that the **first** session of a connection defines the environment.
+   *
+   * @param options - the route/env this session would spawn with.
+   * @returns the live shared child, whether it was already serving a session, and
+   *   the env keys this session asked for that the child will not apply.
+   */
+  async #acquirePoolProcess(options: {
+    route: DshRoute;
+    env: Record<string, string>;
+  }): Promise<{ process: DshProcess; reused: boolean; envDiffering: string[] }> {
+    await this.#retireUnusedPrewarmFor(options.env);
+    const { process, reused } = await this.#ensurePoolProcess(options);
+    this.#addPoolClaim(process);
+    // A fresh spawn reports nothing here: the child was born with this session's
+    // env (minus the identity keys `dsh-process.ts` drops by design), so there is
+    // no difference to report. A reused child is compared against the env it was
+    // actually spawned with.
+    return { process, reused, envDiffering: reused ? this.#warnEnvDiffers(options.env) : [] };
+  }
+
+  /**
+   * Retire a prewarmed child that has never served a session, when this session's
+   * environment asks for keys it cannot apply.
+   *
+   * See {@link #acquirePoolProcess} for why only the prewarmed-and-unused case is
+   * allowed to respawn: once a session has claimed the child the environment is
+   * that session's, and a later divergence is reported, never fixed by a kill.
+   *
+   * @param env - the opening session's `config.env`.
+   */
+  async #retireUnusedPrewarmFor(env: Record<string, string>): Promise<void> {
+    if (!this.#poolPrewarmed) return;
+    const pooled = this.#livePoolProcess();
+    // The prewarmed child already died: nothing to retire, and the spawn below is
+    // the ordinary path.
+    if (pooled === undefined || this.#claimsOf(pooled) > 0) {
+      this.#poolPrewarmed = false;
+      return;
+    }
+    const differing = this.#envDifference(env);
+    if (differing.length === 0) return;
+    process.stderr.write(
+      `[${PROVIDER_ID}] the prewarmed shared dsh (pid ${String(pooled.pid)}) was spawned before this session existed, and this `
+        + `session's env sets ${differing.join(", ")}: retiring it so the session's environment applies to the child it gets\n`,
+    );
+    await this.#shutdownPool();
   }
 
   /**
@@ -941,6 +1108,10 @@ class DshConnection implements ProviderConnection {
    */
   #addPoolClaim(process: DshProcess): void {
     this.#poolClaims.set(process, (this.#poolClaims.get(process) ?? 0) + 1);
+    // The child has a session now, so its environment is that session's: from
+    // here on a divergence is reported, never repaired by a respawn (see
+    // {@link #retireUnusedPrewarmFor}).
+    this.#poolPrewarmed = false;
   }
 
   /**
@@ -990,13 +1161,7 @@ class DshConnection implements ProviderConnection {
    * @returns the differing key names, in a stable order, or an empty array.
    */
   #warnEnvDiffers(env: Record<string, string>): string[] {
-    const spawned = this.#poolEnv;
-    if (spawned === undefined) return [];
-    const differing: string[] = [];
-    for (const key of new Set([...Object.keys(spawned), ...Object.keys(env)])) {
-      if (AGENT_IDENTITY_ENV_KEYS.includes(key)) continue;
-      if (spawned[key] !== env[key]) differing.push(key);
-    }
+    const differing = this.#envDifference(env);
     if (differing.length === 0) return [];
     process.stderr.write(
       `[${PROVIDER_ID}] session env differs from the shared process's spawn env (${differing.join(", ")}): `
@@ -1006,21 +1171,46 @@ class DshConnection implements ProviderConnection {
   }
 
   /**
-   * Drop one reference to the shared child, shutting it down when the last one goes.
+   * The keys in `env` the shared child was not spawned with.
+   *
+   * The comparison {@link #warnEnvDiffers} reports and
+   * {@link #retireUnusedPrewarmFor} acts on, kept separate so the retirement
+   * decision costs no stderr line of its own. Both scan the **union** of the two
+   * key sets, because a key the child was spawned with and this session does not
+   * set is just as unapplied as the other direction; the daemon's per-agent
+   * identity keys are exempt in this one place, so the two can never disagree
+   * about what counts as a divergence.
+   *
+   * @param env - the session's `config.env`.
+   * @returns the differing key names in a stable order; empty when they agree.
+   */
+  #envDifference(env: Record<string, string>): string[] {
+    const spawned = this.#poolEnv;
+    if (spawned === undefined) return [];
+    const differing: string[] = [];
+    for (const key of new Set([...Object.keys(spawned), ...Object.keys(env)])) {
+      if (AGENT_IDENTITY_ENV_KEYS.includes(key)) continue;
+      if (spawned[key] !== env[key]) differing.push(key);
+    }
+    return differing;
+  }
+
+  /**
+   * Return one claim on the shared child.
    *
    * The claim is returned **against the child it was taken on**, never against
    * whatever `#pooled` happens to point at now. A session that opened onto a
-   * child which has since been retired and replaced still owes exactly one claim
-   * on the *old* child, and bailing out because `#pooled !== process` would leave
-   * that claim outstanding forever — the counter would never reach zero, no child
-   * would ever retire, and each open would spawn another one.
+   * child which has since been replaced still owes exactly one claim on the *old*
+   * child, and bailing out because `#pooled !== process` would leave that claim
+   * outstanding forever — the number this provider reports as its own accounting
+   * would be wrong. A session's claim must be returnable no matter which child it
+   * was taken against.
    *
-   * The shutdown is **delayed** on purpose. Paseo's refresh closes the provider
-   * session and reopens it a few milliseconds later; killing the child on the
-   * close would turn that into a cold CLI boot (1.5–2.7 s) and lose the reuse
-   * fast path entirely. The delay is the same bound teardown uses for a session
-   * log's write lock, so a reopen inside the window reuses the child and one
-   * outside it starts clean.
+   * Returning the last claim does **not** retire the child. It stays resident for
+   * the connection's whole life, which is the point of the prewarm
+   * ({@link prewarmSharedDsh}): a reopen (Paseo's refresh, a second conversation in
+   * the same workspace) then costs no cold CLI boot at all. Teardown is what kills
+   * it — see {@link #shutdownPool}.
    *
    * @param process - the child the caller was using; an unknown one is ignored.
    */
@@ -1029,34 +1219,11 @@ class DshConnection implements ProviderConnection {
     if (held <= 0) return;
     if (held === 1) this.#poolClaims.delete(process);
     else this.#poolClaims.set(process, held - 1);
-    // A child that is no longer the pooled one has nothing left to schedule: its
-    // remaining claims (if any) are still outstanding, and the pool already moved
-    // on. Only the current child can be retired by this path.
-    if (this.#pooled !== process) return;
-    if (this.#claimsOf(process) > 0) return;
-    this.#cancelPoolRelease();
-    const timer = setTimeout(() => {
-      this.#poolReleaseTimer = undefined;
-      // Re-checked inside the timer: a session may have joined the same child in
-      // the meantime (Paseo's close-then-reopen does exactly that).
-      if (this.#pooled !== process) return;
-      if (this.#claimsOf(process) > 0) return;
-      void this.#shutdownPool();
-    }, POOL_RELEASE_GRACE_MS);
-    timer.unref?.();
-    this.#poolReleaseTimer = timer;
   }
 
   /** Outstanding claims on one child; zero for a child the pool never handed out. */
   #claimsOf(process: DshProcess): number {
     return this.#poolClaims.get(process) ?? 0;
-  }
-
-  /** Cancel a pending idle shutdown (a new session took the child again). */
-  #cancelPoolRelease(): void {
-    if (this.#poolReleaseTimer === undefined) return;
-    clearTimeout(this.#poolReleaseTimer);
-    this.#poolReleaseTimer = undefined;
   }
 
   /**
@@ -1257,14 +1424,13 @@ class DshConnection implements ProviderConnection {
 
   /** One shutdown pass; see {@link #shutdownPool}. */
   async #shutdownPoolNow(): Promise<void> {
-    this.#cancelPoolRelease();
+    this.#poolPrewarmed = false;
     // An in-flight spawn is part of the pool. Clearing only the field (the old
     // behaviour) let `start()` finish afterwards and publish a child on a
-    // connection that was already gone: nothing held its claim, no grace timer
-    // was armed, and the orphan kept the session logs' write locks. Wait for the
-    // spawn, then make sure its child is dead — the acquire path may have
-    // already killed it (it re-checks `#closed` after its own await), in which
-    // case `kill()` is idempotent.
+    // connection that was already gone: nothing held its claim and the orphan
+    // kept the session logs' write locks. Wait for the spawn, then make sure its
+    // child is dead — the acquire path may have already killed it (it re-checks
+    // `#closed` after its own await), in which case `kill()` is idempotent.
     const spawn = this.#poolSpawn;
     this.#poolSpawn = undefined;
     if (spawn !== undefined) {
@@ -1333,7 +1499,7 @@ class DshConnection implements ProviderConnection {
     // them are dead too (each was told through `#exitAll`). Dropping only this
     // child's entry keeps any older child's claims intact for their own release.
     this.#dropPoolClaims(child);
-    this.#cancelPoolRelease();
+    this.#poolPrewarmed = false;
     if (child.pid !== undefined) {
       SERVING_SHARED_DSH.delete(child.pid);
     }
@@ -2880,6 +3046,12 @@ export function createDshProvider(): ProviderRegistration {
       // which is what keeps a reload from leaving dead connections behind for
       // `readAgentJobs` to walk on every pill poll.
       CONNECTIONS.add(connection);
+      // Start the shared child now rather than on the first open: the cold boot
+      // (measured 8.4 s to listening, 23.2 s to serving) is what made opening a
+      // conversation slow, and moving it to load time is the whole fix. Not
+      // awaited — `connect()` must not wait for a profile boot, and a prewarm that
+      // fails is reported on stderr without failing the connection.
+      connection.prewarmSharedDsh();
       return connection;
     },
   };

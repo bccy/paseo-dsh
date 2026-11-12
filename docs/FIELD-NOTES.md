@@ -3727,3 +3727,74 @@ catalog 且不再 spawn probe；截断/形状不对的条目当未命中、回�
 输入**，`#open` 用的 `models`/`fallbackRoute`/`defaults.modes` 要做形状校验，否则会在 open 深处抛
 `TypeError`；变异「只写不读」9/10 红、「去掉形状校验」10/12 红）；reload-port-race 49/49、multi-session 49/49、
 identity-env 17/17、harness-gates 52/52、bridge-assets 2/2、plugin-check 真实回合 40/40、tsc 0。
+
+## 第二十九轮：插件加载时预热共享 dsh（2026-11-12）
+
+### 100. 打开 dsh 会话/子代理卡在子进程冷启动上：首个 open 要等它 23 s，现在改成插件加载就开始起
+
+**现象（用户报）**：打开 dsh 的子代理会一直卡在打开中，必须重启 App 才能再打开数据；同一时刻 team
+成员那条路径正常。
+
+**取证（`/tmp/paseo-dsh-orch/new-session-slow.md`，2026-11-12，daemon 12:02–12:36 日志）**：热态新建
+会话 **1106 / 1107 / 1194 ms**，与 11-11 两代日志持平——慢的不是"新建会话"这段本身。慢的是共享
+子进程的**冷启动**：spawn 12:02:49.659 → `listening` 12:02:58.075（**+8.4 s**）→ 对外可用
+12:03:12.848（**+23.2 s**），而首批会话 12:03:19–12:03:22 的 `agent.provider_subagents.list.request`
+是 **30.1 / 30.1 / 31.8 / 31.8 / 33.6 s**、`list_commands_request` 3.8 s、`provider.controls.list.request`
+4.4 s：**20 个会话的 open 全排在同一个单线程进程的冷启动后面**。子代理重放（`SUBAGENT_REPLAY_READY_BUDGET_MS
+= 4 s`，`provider.ts:208`）当天 6 次触顶全部落在这个窗口里——不是重放本身慢，是它挤在冷启动里。
+
+**根因**：`createDshProvider().connect()`（`provider.ts:2875`）只建 `DshConnection`，**不 spawn**；
+唯一的 spawn 入口 `#acquirePoolProcess`（`:816`）只在第一个会话 open 时才被调用。所以"插件加载后
+第一次打开会话"永远付一次整台 `dsh` 的冷启动，而用户正好在等那一次点击。Paseo 今天更是
+**02:16:14 加载插件、直到 12:02:49 首次 open 才 spawn**——插件进程活了 10 小时才起子进程。
+
+**修法**（`paseo-plugin/server/provider.ts`）：
+
+1. `connect()` 里 `connection.prewarmSharedDsh()`：**不 await**（connect 不能被一次 profile 启动
+   拖住）。预热走与 open 同一条 `#ensurePoolProcess`（原 `#acquirePoolProcess` 拆出来的 spawn 去重
+   段），复用 `#poolSpawn`：首个 open 若正好撞上预热在飞，会**加入**它而不是再 spawn 一个。
+2. 预热 route 来自 **profile 默认路由**，不硬编码任何 provider/model：新增
+   `catalog-cache.ts#readAnyCatalogCache`，从磁盘 catalog 缓存（任意 cwd 条目，catalog 本来就是
+   profile 级）取 `fallbackRoute`，指纹照常重核。**冷缓存不读**：读冷 catalog 会 spawn 一个探测进程、
+   再启动一整台 profile，那正是预热想省掉的开销，而且会让现有 8 个按 spawn 次数断言的检查全部失真。
+   冷缓存 → 一行 stderr + 交给首个 open（首开后缓存就有了，下一次插件加载即可预热）。
+3. **常驻**：最后一个 claim 归还不再启动 5 s 退役（删掉 `POOL_RELEASE_GRACE_MS`、`#poolReleaseTimer`、
+   `#cancelPoolRelease`）。`close()` 仍走 `#shutdownPool()` 完整关掉。`:160` 那条"reopen 不能撞上旧子
+   进程日志写锁"的约束由 `RELEASE_TIMEOUT_MS`（teardown 等它退出）与跨进程记录
+   （`shared-dsh-record.ts`）继续兜住——teardown 现在是**唯一**会退役 child 的路径。
+4. **env 判据先查后做**：宿主 `CreateAgentOptions.env` 是可选，只有显式覆盖才传
+   （`agent-manager.js` `launchEnv` 注释："explicit launch overrides"）；本机 **1726 份真实 agent
+   记录里 `launchEnv` 命中 0 份**，正常 open 的 `config.env` 只有 `agentIdentityEnv` 注入的三键，
+   而三键本来就被 `dsh-process.ts` 在 spawn 前删掉。所以**空 env 预热与首个会话 spawn 等价**。
+   例外兜底：若首个会话的 `config.env` 真的带了非身份键，且预热 child **尚无 claim**，则把它退役并按
+   该会话的 env 重新 spawn（`#retireUnusedPrewarmFor`）——老契约"首个会话定义进程 env"因此不破；
+   已服务过会话后的差异仍然只告警不重 spawn。
+5. **失败要响亮、不致命**：spawn 失败 / 孤儿回收超时 / catalog 读不到 / 无缓存，各一行 stderr，
+   `connect()` 照常返回；**不把失败记成"已就绪"**，下一个 open 走原 spawn 路径并照原样把错误报给用户。
+   子进程意外退出保持现状（下次 open 再 spawn，无自动重启循环）。
+
+**取舍（用户已定）**：常驻一个 `dsh` 子进程（实测约 550 MB 常驻内存，见第二十七轮 ②的估算）换掉
+"插件加载后首次 open 的 23 s 冷启动"。冷启动本身的耗时没变，只是挪到了没人等待的加载阶段。
+
+**验证（离线，2026-11-12）**：新增 `harness/pool-prewarm-check.mjs` **39/39**（假 `dsh` + 一次性
+`DSH_HOME`，自己编译）：a) connect 后无会话已 spawn 一次且 `poolClaimCount` 仍为 0（预热不持 claim）；
+b) 首个 open 复用该 pid（会话自己的 `initialize` 帧带那个 pid）、零二次 spawn；open 与预热在飞的碰撞
+下也只 spawn 一次（假桥把 `initialize` 停在 `DSH_FAKE_HOLD_METHOD`）；c) 最后一个会话关闭后 **6.5 s**
+子进程仍在、没有 `shutdown` 帧、下一个 open 复用同一 pid；d) `close()` 后子进程退出且收到 `shutdown`
+帧；e) 预热失败（`failopen`）时 connect 成功、stderr 有说明、随后 open 重新 spawn 并报错；
+f) 预热的 `initialize` 带的是缓存里的 `fallbackRoute`（`cache-lane/cache-default-model`）；g) 无 catalog
+缓存时不 spawn、不起探测进程、一行 stderr；h) 只带三个身份键的 env **不触发**退役；i) 首次 open 带非身份
+键时走 `#retireUnusedPrewarmFor`——**恰好多 1 次 spawn**、新 pid ≠ 旧 pid、新 child 的 spawn env 真有该键、
+仍无三身份键、旧 child 收到 `shutdown` 且已退出、stderr 那行点名旧 pid 与该键、且这次 open 无 env 告警
+（wrapper 记录子进程实际 env，正对照是身份键仍被剔除）。**变异：去掉预热调用 → 14 红（a/b 全灭）；恢复
+5 s 退役 → 3 红（c 三条）；去掉 `#retireUnusedPrewarmFor` 调用 → 6 红（h/i 那节）**，均记录后还原。同时全绿：`tsc --noEmit` 0、`plugin-build-check` 86/86、
+`multi-session-check` 49/49、`reload-port-race-check` 51/51、`identity-env-check` 17/17、
+`catalog-cache-check` 12/12、`harness-gates-check`、`bridge-assets-check`、`plugin-check --self-test`
+与真实回合、`shared-process-cwd-check`、`concurrent-open-check`、`revert-check`。
+
+**未验证/边界**：① 没有在 running daemon / 真 Paseo UI 上复验"插件加载即预热"（任务书禁止 reload
+与重启 daemon），真机收益（首开是否从 23 s 级降到 1 s 级）待用户测试确认；② 子代理重放 4 s 预算
+本身没动——预热只把冷启动挪出窗口，重放超时是否还会触发要看真机（今天 6 次触顶都在冷启动窗口内，
+推断会大幅减少，未实测）；③ 冷 catalog 缓存的 profile（升级/换 key 后首次加载）不预热，仍付一次
+冷启动，这是 deliberate 的取舍（见修法 2）；④ 常驻内存按第二十七轮的约 550 MB 估算，未在本次任务里
+重新测量。

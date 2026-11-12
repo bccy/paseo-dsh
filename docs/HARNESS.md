@@ -311,7 +311,9 @@
   正好废掉）、坏文件/超 24h 都按"没有缓存"处理；集成断言：**种一条合法缓存后，子进程回答 catalog
   且不再 spawn probe**；**截断/形状不对的条目**（有非空 models 但缺 `defaults.modes` 等 open 会读的
   字段）必须当未命中 → 回退 probe 且 open 仍成功（`isUsableDisplayCatalog`，不抛 `TypeError`）。
-  凭据只 `stat`（size+mtime），不读内容。**动了 `server/catalog-cache.ts`、`provider.ts` 的
+  凭据只 `stat`（size+mtime），不读内容。**动了 `server/catalog-cache.ts`（含预热取 route 用的
+  `readAnyCatalogCache`，它只收 `home`/`fingerprint`——profile 作用域由指纹承担，那一条由
+  `pool-prewarm-check.mjs` 覆盖）、`provider.ts` 的
   `loadCatalog`/`isUsableDisplayCatalog` 必跑；变异「只写不读」→ 9/10 红、「去掉形状校验」→ 10/12 红。**
 - `harness/open-degrade-check.mjs` — open 期降级必须用户可见：`paseo/history` 抛错、preset
   被拒、plan 对账失败（plan 模式）都要发 `session.notice`/warning，而不是只写 stderr；
@@ -503,7 +505,7 @@
   子进程 id 与引用计数，只有过一遍插件才能证明这一对是干净的）：两会话各自提问并各自拿到自己的
   答案、每个时间线只含自己的消息（任何事件类型下都看不到对方的文本）、各自一次 `session.turn`
   起止、关掉一个另一个仍能提问并作答；另外还钉住**共享子进程的引用计数**（每开一个会话加一个
-  claim、关一个还一个，另一个仍在跑所以进程不被回收）与**孤儿帧的清理**（一个会话关闭时它的
+  claim、关一个还一个；claim 现在只记账、**不再决定回收**——子进程在连接存活期内常驻，见 FIELD-NOTES 第 100 条）与**孤儿帧的清理**（一个会话关闭时它的
   帧桶与计时器一起消失，不会 5 s 后打一条误导的「no ancestor announced」，而另一个会话的桶
   仍然照常上报——正对照，免得"清理过头"也通过）。**环境段**钉住共享进程按会话下发不了的 env
   怎么报：用户真的设了才会以**键名**告警（不报值），宿主按 agent 注入的三键（`PASEO_AGENT_ID`
@@ -520,7 +522,8 @@
 - `harness/reload-port-race-check.mjs` — **插件重载的固定端口竞态**（假 `dsh` + 一次性
   `DSH_HOME`，自己编译到私有目录，**51/51**）：Paseo 只给插件进程 **2 s** 软关闭预算
   （`@getpaseo/server` `plugins/runtime.js` 的 `SOFT_SHUTDOWN_TIMEOUT_MS = 2000`，随后 SIGTERM/SIGKILL），
-  而插件自己的 teardown 上界是每会话 10 s + 池 5 s；旧插件进程被切在半路时，它 spawn 的共享 `dsh`
+  而插件自己的 teardown 上界更大（每会话 10 s + 子进程 `shutdown` 5 s + 等它退出 5 s；池的空闲 5 s
+  退役已删除，见 FIELD-NOTES 第 100 条）；旧插件进程被切在半路时，它 spawn 的共享 `dsh`
   成了孤儿——profile 的固定 `webserver` 端口仍被它占着，新插件进程的首个 open 就撞
   `listen EADDRINUSE … webserver (required)`。断言：spawn 同 tick 就写下
   `$DSH_HOME/paseo/shared-dsh.json`（pid + 启动身份 + profile，写完不是 spawn 之后）、子进程退出后
@@ -569,6 +572,30 @@
   `stableProcessCwd` 的现有 home / 缺失 home / 空 home 三个分支。**动了 `provider.ts` 的
   `#acquirePoolProcess` 或共享进程的 spawn cwd、或 `dsh-process.ts` 的 `stableProcessCwd` /
   `#start` 必跑。**
+- `harness/pool-prewarm-check.mjs` — **插件加载时预热共享 `dsh`**（假 `dsh` + 一次性 `DSH_HOME`，自己编译到
+  私有目录，**39/39**）：`connect()` 不等首个 open 就把共享子进程起起来，并让它在连接存活期内**常驻**，
+  把一次整台 `dsh` 的冷启动（真机实测 spawn→`listening` +8.4 s、→可用 +23.2 s）从"用户点开会话"挪到
+  "插件加载"阶段。断言：**a)** connect 之后、没有任何会话时已 spawn **一次**，且 `poolClaimCount` 仍为 0
+  （热身不持 claim，它不是用户）；**b)** 首个 open **复用**那个 pid（会话自己的 `initialize` 帧带该 pid）、
+  零二次 spawn；open 撞上预热**在飞**的 spawn 时也只 spawn 一次（假桥 `DSH_FAKE_HOLD_METHOD=initialize`
+  把 `DshProcess.start()` 停在初始化帧上，不靠睡等）；**c)** 最后一个会话关闭后 **6.5 s**（跨过旧的 5 s
+  空闲退役窗口 + teardown）子进程仍在、没收到 `shutdown` 帧、下一个 open 复用同一 pid；**d)** `close()`
+  之后子进程退出、且桥确实收到 `shutdown`（teardown 仍是唯一会退役 child 的路径）；**e)** 预热失败
+  （假桥 `failopen` 拒 `initialize`）时 `connect()` 照常成功、stderr 一行说明、随后 open **重新 spawn** 并在
+  再失败时把错误报给用户——失败不会被记成"已就绪"；**f)** 预热 spawn 的 `initialize` 带的是 **catalog 缓存
+  里的 `fallbackRoute`**（`cache-lane/cache-default-model`），不是硬编码的 provider/model；**g)** profile
+  还没有 catalog 缓存时**既不 spawn 也不起探测进程**、只一行 stderr（读冷 catalog 要再启动一整台 profile，
+  那正是预热要省的；而且会给所有"按 spawn 次数断言"的检查加噪声）。另有**退役路径**（
+  `#retireUnusedPrewarmFor`）一节：**h)** 只带三个身份键的 env **不触发**退役（复用 pid、零额外 spawn、
+  stderr 无 "retiring it"）；**i)** 首次 open 带了**非身份键**时——恰好**多 1 次 spawn**、新 pid ≠ 旧 pid、
+  新 child 的 spawn env 里真有该键（wrapper 记录子进程实际 env）、仍没有三个身份键、旧预热 child 收到
+  `shutdown` 且已退出、stderr 那行点名旧 pid 与该键、且这次 open 不出「会话环境变量未生效」告警。
+  **变异：去掉 `prewarmSharedDsh()` 调用 → 14 红（a/b 全灭）；把 5 s 空闲退役恢复回去 → 3 红（c 三条）；
+  去掉 `#acquirePoolProcess` 里的 `#retireUnusedPrewarmFor` 调用 → 6 红（h/i 那一节：会话告警出现、
+  没有替换 spawn、新 child 环境里没有该键、旧 child 没被关、stderr 无那行）**，均记录后还原。**动了
+  `provider.ts` 的 `prewarmSharedDsh` / `#prewarmRoute` / `#ensurePoolProcess` / `#acquirePoolProcess` /
+  `#retireUnusedPrewarmFor` / `#releasePoolProcess` / `#poolPrewarmed` / `connect()`，或
+  `catalog-cache.ts` 的 `readAnyCatalogCache`／`loadCatalog` 必跑。**
 - `harness/concurrent-open-check.mjs` — 同一个 DSH 会话的两次并发 `session.open` 不能毁掉成功的
   那次：只有一次到达 `session.ready`；另一次**响亮失败**（`request.failed`，不是沉默）；失败方
   被 in-flight 守卫拒掉（"another open … is already in flight"），**不是** `attachSession` 的

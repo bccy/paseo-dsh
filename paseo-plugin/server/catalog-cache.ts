@@ -36,7 +36,7 @@
  */
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 
@@ -152,7 +152,16 @@ export function catalogCachePath(options: { home: string; profile: string; cwd: 
     .update(`${options.home}\u0000${options.profile}\u0000${options.cwd}`)
     .digest("hex")
     .slice(0, 24);
-  return join(options.home, "paseo", "catalog", `${digest}.json`);
+  return join(catalogCacheDir({ home: options.home }), `${digest}.json`);
+}
+
+/**
+ * The directory every (home, profile, cwd) entry lives in.
+ *
+ * @param options.home - absolute `$DSH_HOME`.
+ */
+export function catalogCacheDir(options: { home: string }): string {
+  return join(options.home, "paseo", "catalog");
 }
 
 /** Shape of the on-disk entry. `catalog` is opaque here: the caller owns its type. */
@@ -183,6 +192,25 @@ export function readCatalogCache<T>(options: {
   fingerprint: string;
   now?: number;
 }): T | undefined {
+  const entry = parseCatalogEntry<T>(options);
+  return entry === undefined ? undefined : entry.catalog;
+}
+
+/**
+ * Validate one entry's raw file against every rule the cache promises.
+ *
+ * Shared by the single-path read and the whole-directory scan so the two cannot
+ * disagree about what a usable entry is (version, age, fingerprint, non-empty
+ * models).
+ *
+ * @param options - path, fingerprint and clock, as {@link readCatalogCache} takes.
+ * @returns the entry's catalog and write time, or undefined when it must not be used.
+ */
+function parseCatalogEntry<T>(options: {
+  path: string;
+  fingerprint: string;
+  now?: number;
+}): CatalogCacheEntry<T> | undefined {
   let text: string;
   try {
     text = readFileSync(options.path, "utf8");
@@ -202,7 +230,59 @@ export function readCatalogCache<T>(options: {
   if (now - entry.writtenAt >= CATALOG_DISK_TTL_MS) return undefined;
   if (entry.fingerprint !== options.fingerprint) return undefined;
   if (!hasModels(entry.catalog)) return undefined;
-  return entry.catalog;
+  return entry as CatalogCacheEntry<T>;
+}
+
+/**
+ * Read the newest usable entry for this runtime, whichever workspace wrote it.
+ *
+ * Exists for the pool prewarm (`provider.ts#prewarmRoute`): the plugin wants the
+ * profile's default route **before** any session exists, so it has no cwd to key
+ * the cache by — and the catalog is profile-level anyway, so every entry carries
+ * the same profile default. Scanning is one `readdir` plus a few file reads, none
+ * of which may spawn anything: a probe here would boot a whole `dsh`, which is the
+ * cost the prewarm exists to move, not to double.
+ *
+ * **Why there is no `profile` argument.** The fingerprint is what scopes an entry
+ * to a profile: it hashes that profile's composition files under
+ * `profiles/<profile>/` (plus the DSH binary and the credentials files), so an
+ * entry written for another profile does not match. A second profile-shaped check
+ * here would have to be built from something the directory does not offer: the
+ * file name is a digest of `(home, profile, cwd)` and cannot be re-derived without
+ * the cwd the entry was written for, so scanning and matching the fingerprint is
+ * the only check available. (The catalog itself is profile-level, so an entry for
+ * another workspace of the **same** profile is the same catalog.) Two profiles
+ * with byte-identical composition files would share a fingerprint by construction
+ * — that is a limitation of the fingerprint's inputs, which do not include the
+ * profile's installed packages, and it predates this scan.
+ *
+ * @param options - `$DSH_HOME`, fingerprint and clock.
+ * @returns the catalog of the newest matching entry, or undefined when none is usable.
+ */
+export function readAnyCatalogCache<T>(options: {
+  home: string;
+  fingerprint: string;
+  now?: number;
+}): T | undefined {
+  const dir = catalogCacheDir({ home: options.home });
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return undefined;
+  }
+  let newest: CatalogCacheEntry<T> | undefined;
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    const entry = parseCatalogEntry<T>({
+      path: join(dir, name),
+      fingerprint: options.fingerprint,
+      ...(options.now === undefined ? {} : { now: options.now }),
+    });
+    if (entry === undefined) continue;
+    if (newest === undefined || entry.writtenAt > newest.writtenAt) newest = entry;
+  }
+  return newest === undefined ? undefined : newest.catalog;
 }
 
 /**
