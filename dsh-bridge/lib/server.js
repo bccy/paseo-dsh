@@ -905,61 +905,6 @@ export class PaseoHarnessServer {
   }
 
   /**
-   * Whether this DSH build names subagent children (0.2.2-rc.2+).
-   *
-   * Duck-typed on the composed `subagents` service, never on a version string:
-   * `namesOf`/`rootOf` arrived together with the naming model (`dsh-subagent`'s
-   * `names.d.ts`), while `listChildren`/`listDescendants` are older than names.
-   * A profile that composes no subagent service answers false, and the plugin
-   * then opens a label-only child exactly the way it did before names existed.
-   *
-   * The reply rides the `initialize` result's `serverInfo`, which the plugin
-   * already reads: the plugin owns the single `session.opened` Paseo accepts, so
-   * it is the layer that has to know whether waiting for a catalog name can
-   * ever pay off.
-   */
-  namesChildren() {
-    const subagents = this.ctx.get('subagents');
-    return typeof subagents?.namesOf === 'function' || typeof subagents?.rootOf === 'function';
-  }
-
-  /**
-   * Take one optional identity field (`name` / `path`) off a durable subagent fact.
-   *
-   * DSH 0.2.2-rc.2+ gives a child a `name` (unique among its siblings) and, in
-   * the recursive listing, a root-relative slash `path` built from every level's
-   * name. Both are absent on DSH ≤ 0.2.2-rc.1 and on historical catalog rows, and
-   * the plugin then simply shows no description.
-   *
-   * A present-but-invalid value is **ignored, never coerced**: `String(…)` would
-   * turn a malformed upstream field into a plausible-looking user-facing
-   * identity, which is exactly the silent degradation this repository keeps
-   * paying for. One stderr line per child and field (not per catalog read, since
-   * `subagents()` re-reads the same rows on every open) keeps it noticeable
-   * without flooding the log. The child still opens on its label, so a bad
-   * identity field never costs the conversation its row.
-   *
-   * @param childId - the child's native session id, so the line names the row.
-   * @param child - the bridge's child record.
-   * @param field - `name` or `path`; the record key to fill.
-   * @param value - the durable value, absent when the row does not carry it.
-   */
-  adoptIdentity(childId, child, field, value) {
-    if (value === undefined) return;
-    if (typeof value === 'string' && value !== '') {
-      if (child[field] === undefined) child[field] = value;
-      return;
-    }
-    const warned = child.identityWarnings ?? (child.identityWarnings = new Set());
-    if (warned.has(field)) return;
-    warned.add(field);
-    process.stderr.write(
-      `[bridge] ignoring a non-string ${field} for subagent ${childId} `
-        + `(parent ${child.parentId}): ${JSON.stringify(value)}\n`,
-    );
-  }
-
-  /**
    * Fallback registration from the parent-owned `subagent/catalog` fact, which
    * also carries the child's creation label and lifecycle mode. Opens the child
    * immediately when its own session was never observed directly.
@@ -978,9 +923,6 @@ export class PaseoHarnessServer {
     }
     if (child.label === undefined && data.label !== undefined) child.label = String(data.label);
     if (child.mode === undefined && data.mode !== undefined) child.mode = data.mode;
-    // Catalog v3 (`SUBAGENT_CATALOG_VERSION = 3`, DSH 0.2.2-rc.2+) names every
-    // child it records; v0–v2 and historical rows carry none.
-    this.adoptIdentity(childId, child, 'name', data.name);
     if (!child.opened) this.openChild(childId, child);
   }
 
@@ -1013,22 +955,12 @@ export class PaseoHarnessServer {
    * @param parentId - durable direct parent session id.
    * @param label - creation label from the catalog, when it carries one.
    * @param mode - lifecycle mode (`continuable` / `one-shot`), when present.
-   * @param name - the child's own name (`SubagentDescendantListEntry.name`,
-   *   DSH 0.2.2-rc.2+), when the listing carries it.
-   * @param path - root-relative slash path (`SubagentDescendantListEntry.path`),
-   *   absent whenever an ancestor below the root is unnamed.
    */
-  registerCatalogChild(childId, parentId, label, mode, name, path) {
+  registerCatalogChild(childId, parentId, label, mode) {
     const existing = this.children.get(childId);
     if (existing !== undefined) {
-      // "This record came from the durable listing" is sticky: a child first seen
-      // live and then listed still carries a listing-derived label/name, and a
-      // later live descriptor must not erase the mark.
-      existing.listed = true;
       if (existing.label === undefined && label !== undefined) existing.label = String(label);
       if (existing.mode === undefined && mode !== undefined) existing.mode = mode;
-      this.adoptIdentity(childId, existing, 'name', name);
-      this.adoptIdentity(childId, existing, 'path', path);
       if (!existing.opened && existing.label !== undefined && existing.buffered.length > 0) {
         this.openChild(childId, existing);
       }
@@ -1041,16 +973,10 @@ export class PaseoHarnessServer {
       parentId,
       opened: false,
       buffered: [],
-      // Registered from DSH's durable listing, not from a live event: see
-      // `openChild` for why the plugin is told (a historical row has no catalog
-      // event left to wait for).
-      listed: true,
       cwd: parent?.cwd ?? this.sessionDirectoryFor(parentId),
       ...(label === undefined ? {} : { label: String(label) }),
       ...(mode === undefined ? {} : { mode }),
     };
-    this.adoptIdentity(childId, child, 'name', name);
-    this.adoptIdentity(childId, child, 'path', path);
     this.children.set(childId, child);
   }
 
@@ -1078,17 +1004,6 @@ export class PaseoHarnessServer {
       parentSessionId: child.parentId,
       ...(child.mode === undefined ? {} : { mode: child.mode }),
       ...(child.label === undefined ? {} : { label: child.label }),
-      // The child's identity, when DSH named it (0.2.2-rc.2+). Optional keys: an
-      // older build and a historical row simply do not carry them, and Paseo's
-      // child row falls back to the label title it has today. `path` can still be
-      // filled in later by a durable listing (`registerCatalogChild`), but a child
-      // is announced exactly once — that late `path` does not re-announce it.
-      ...(typeof child.name === 'string' && child.name !== '' ? { name: child.name } : {}),
-      ...(typeof child.path === 'string' && child.path !== '' ? { path: child.path } : {}),
-      // The durable listing already carried everything DSH knows about this child,
-      // and a historical row will never emit another live catalog fact: the plugin
-      // must not hold such a notice waiting for a name that is not coming.
-      ...(child.listed === true ? { listed: true } : {}),
       ...(child.cwd === undefined ? {} : { cwd: child.cwd }),
     });
     const buffered = child.buffered;
@@ -1626,9 +1541,6 @@ export class PaseoHarnessServer {
       serverInfo: {
         name: 'deepseek-harness-paseo-bridge',
         version: '0.1.0',
-        // Optional capability: absent (or false) on a build whose `subagents`
-        // service predates names, where the plugin must not wait for one.
-        subagentNames: this.namesChildren(),
       },
       route: { provider, model, reasoningEffort: reasoningEffort ?? null },
     };
@@ -2612,7 +2524,7 @@ export class PaseoHarnessServer {
       for (const row of children) {
         const childId = String(row.id);
         if (underArchivedSession(headers, archived, childId)) continue;
-        this.registerCatalogChild(childId, String(row.parentId), row.label, row.mode, row.name, row.path);
+        this.registerCatalogChild(childId, String(row.parentId), row.label, row.mode);
       }
       return {
         available: true,
@@ -2624,20 +2536,17 @@ export class PaseoHarnessServer {
             ...(row.label === undefined ? {} : { label: row.label }),
             // DSH 0.2.2-rc.2+ (`dsh-subagent`'s `SubagentDescendantListEntry`):
             // `name` is the child's name, unique among its siblings, recorded by
-            // the creator's v3 `subagent/catalog` event. The plugin derives the
-            // newer generation's team roster from it, exactly as DSH's own
-            // subagent catalog panel does (`entry.name ?? entry.id`). Absent on
-            // historical entries and on DSH builds that predate it — the plugin
-            // then falls back to the session id, never to `label` (a free-text
-            // creation label is a description, not an identity).
+            // the creator's v3 `subagent/catalog` event. It stays in this reply for
+            // the **team roster**: the plugin builds the newer generation's member
+            // names from it, exactly as DSH's own subagent catalog panel does
+            // (`entry.name ?? entry.id`). It is deliberately not used for a child
+            // row's title — that row is label-only since the 2026-11-15 revert
+            // (`docs/FIELD-NOTES.md` 102), so the `path` this listing also carries
+            // has no consumer and is not sent. Absent on historical entries and on
+            // DSH builds that predate names; the roster then falls back to the
+            // session id, never to `label` (a creation label is a description,
+            // not an identity).
             ...(typeof row.name === 'string' && row.name !== '' ? { name: row.name } : {}),
-            // DSH 0.2.2-rc.2+ (`SubagentDescendantListEntry.path`): slash-separated
-            // names from the requested root, and **absent** as soon as this child or
-            // an ancestor below the root has no name. Never rebuilt from `label`:
-            // the path is the model-addressable identity, the label a description.
-            // A non-string value is ignored here and reported once per child by
-            // `registerCatalogChild` → `adoptIdentity`.
-            ...(typeof row.path === 'string' && row.path !== '' ? { path: row.path } : {}),
             ...(underArchivedSession(headers, archived, String(row.id)) ? { archived: true } : {}),
           })),
         diagnostics: rows

@@ -3983,6 +3983,37 @@ label（与今天一致，只能靠 750 ms 兜底打开）；③ live 打开的�
 乱序变体在插件层不可达（`dsh-process.ts` 的 `#holdOrphan` 会重排，实测插件看到「父通知 → 孙名 → 孙帧」），
 它实际钉的是「孙名来自其父会话的 catalog」，不证明乱序可处理。
 
+**2026-11-15 按产品决定回退（第七轮，最终形态）**：用户判断第二行（短名/路径）没有价值，而**等待机制
+的代价**才是真正的成本，要求完全回退到 rc.3 之前的形态——子代理行只显示一行任务标签，**不做任何名字
+兜底**。所以删的是整套名字机制，不是只关渲染：
+- 插件 `session.ts`：删 `CHILD_NAME_WAIT_MS`（750 ms 兜底）、`childIdentity()`（title/description 唯一
+  规则点）、`#childNames`/`#nameTimers`/`#nameExpired` 三张表，以及 `#isNameWaiting`/
+  `#scheduleNameWait`/`#clearNameTimer`/`#clearNameWait`/`#clearNameWaits`/`#observeCatalogName` 全部
+  方法；`#onSessionEvent` 的 `subagent/catalog` 分支、`#openChildNow`/`#bufferOpened`/
+  `#flushPendingChildren`/`close()`/进程退出/`#dropBufferedChild` 里的等待接线一并删除。live 与 replay
+  两条路径都改成 `title = label`、不写 `description`、不读 `name`/`path`；`DshChildSessionOptions.description`
+  字段与 `session.opened` 上的 description 发射删除。**保留与本功能无关的**
+  `CHILD_LABEL_WAIT_EVENTS`/`#labelWaitExceeded`/`#completeHeldChild`/`#bufferOpened`/`#trimChildBuffer`
+  与父边等待、`#flushPendingChildren` 的父/root/label 闸门。
+- 插件进程层 `dsh-process.ts`：删 `#subagentNames`、`get subagentNames`、`#noteServerInfo` 及两处
+  `initialize` 回执解析；`DshChildOpened` 删 `name`/`path`/`listed`（grep 确认三者只服务本功能）。
+- 桥 `dsh-bridge/lib/server.js`：删 `namesChildren()`、`adoptIdentity()`、`serverInfo.subagentNames`、
+  `session.child-opened` 的 `name`/`path`/`listed`、`registerCatalogChild` 的 name/path 参数与 `listed`
+  标记，以及 `paseo/subagents` 列表里的 `path`；内嵌桥用 `node paseo-plugin/scripts/generate-bridge-assets.mjs`
+  重生成。**`paseo/subagents` 的 `name` 保留**——它有另一个消费者：`session.ts` 的 `team()` 用
+  `row.name ?? row.sessionId` 组新一代 roster（与 DSH 自己的 catalog 面板一致），删掉会把团队成员名降级
+  成会话 id。桥的 `observeCatalogChild`（label/mode 登记）与 catalog 事实转发也保留：它们服务标签与重放。
+- 断言改成反向断言：`subagent-check` **131 条**（数量不变——`catalog-late` 增 1 条「忽略名字且无日志」，
+  `catalog-name-early-gated` 的「重复 fact 不重复打名字日志」随机制删除减 1）；`catalog-none` 从「根帧
+  **之后**才打开」改反成「根帧**之前**就打开」；`catalog-after-flush` 断言迟到名字不改 title；
+  `nested`/`name-missing`/`name-only`/replay 全部改为 `title=label`、无 description；
+  `bridge-server-check` **121 → 116**（删能力位 2 条、删 `listed` 1 条、删 stderr 名字日志 1 条，列表/
+  notice 断言改写）。
+- 验证（2026-11-15，离线，终版代码）：`subagent-check.cjs` **131/131**、`bridge-server-check.mjs`
+  **116/116**、`bridge-assets-check.mjs` **2/2**、`tsc --noEmit` exit 0、改过的 `.js`/`.cjs` 过
+  `node --check`；编译产物 `.dbg` 已清理（`git status` 只显示预期改动）。
+- 未验证：真机重载插件后的界面（本包禁止重载插件/重启 daemon，由派发方另走用户批准）。
+
 ### 103. 工具失败码按常量名查表，永远不命中：`TOOL_ABORTED` 的码值是 `ABORTED`
 
 **现象**：接上 rc.3 后，停止回合/用户拒绝审批这类失败行在 Paseo 里仍是英文原句。把调研报告里写的

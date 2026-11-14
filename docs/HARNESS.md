@@ -672,8 +672,9 @@
   （宿主 rehydrate 快照窗口；改回 ready 后 `void replaySubagents()` 时间接败）且 root 的
   `session.opened` 仍先于 child；**子会话 history 读挂起时 `session.ready` 仍须在 4 s 预算
   （`SUBAGENT_REPLAY_READY_BUDGET_MS`）+ slack 内发布、open 不卡死**（假桥把这条读 park 到测试
-  写 release marker；无预算时实测 30 s 才 ready）。**2026-11-14 新增 13 条（rc.3 具名子代理的
-  title/description 规则，第二轮把两字段对调）**：`childIdentity` 是唯一规则点——**宿主把
+  写 release marker；无预算时实测 30 s 才 ready）。
+  **以下直到本节末尾的「2026-11-15 回退」段都是历史（该名字机制已于 2026-11-15 按产品决定整体删除）**：
+  **2026-11-14 新增 13 条（rc.3 具名子代理的 title/description 规则，第二轮把两字段对调）**：`childIdentity` 是唯一规则点——**宿主把
   `description` 画在轨道行第一行、`title` 画在第二行**（`label = description ?? title`）；
   **2026-11-14 第三轮补 4 条**：假桥按真实 rc.3 时序（label 先、父 catalog 的 name 晚约 14 ms 到）
   断言 `session.opened` 仍是 `title=name`、`description=label`，且等待期间的子会话帧按序补发；
@@ -690,9 +691,9 @@
   用帧数界（`CHILD_NAME_WAIT_EVENTS = 8`）结束名字等待；界在**另一道闸门仍扣着**（此例无 label、
   descriptor 迟到）时到期，`#nameExpired` 粘性标记**当时**必须让它只打一行日志（第四轮代码上是 5 行：
   第 8–12 帧各一行、每帧空跑一次 flush）；随后 descriptor 放行，子会话仍以 label 打开、无 description，
-  12 帧按序各出现一次、无丢帧。**帧数界与那行「held 8 frames」日志在第六轮已整体删除**，本段只作历史记录，
-  当前判据见下一段。
-  **2026-11-15 第六轮：帧数上界删除（真机证伪），catalog 事实只记 name，无 catalog 事实的子会话走 750 ms 兜底**。
+  12 帧按序各出现一次、无丢帧。**帧数界与那行「held 8 frames」日志在第六轮已整体删除**，本段只作历史记录；
+  当前判据见本节末尾的「2026-11-15 回退」段。
+  **2026-11-15 第六轮（历史，已随回退删除）：帧数上界删除（真机证伪），catalog 事实只记 name，无 catalog 事实的子会话走 750 ms 兜底**。
   真机三行日志（子会话 `a571658b-…`，8 帧落在 9 ms 内、catalog 晚 3 ms）证明桥的 buffered flush 是一次
   批量：帧数衡量批量大小而非时间，任何小上界都会抢在 catalog 前触发、把行定死成 label。所以
   `CHILD_NAME_WAIT_EVENTS`/`#openIfNameWaitExceeded` 整体删除，**唯一上界是 750 ms 定时器**。
@@ -707,20 +708,26 @@
   catalog 事实时行必须在根帧**之后**才打开（帧数不是出口）、兜底日志恰好 1 行；`name-bound-gated` 的
   descriptor 延到 850 ms，只钉「兜底到期时仍被 label 闸门扣着 → 日志仍只 1 行、descriptor 到时按 label
   正常打开、12 帧按序无丢」，**不再声称它证明帧数粘性**（帧数界已不存在）。
-  所以要保住「第一行是任务描述」必须 `title = path ?? name`、`description = label`；空串与
-  非字符串一律当缺失，`title === description` 时不带 description（宿主不去重），**绝不**用
-  label 顶 name；无身份（rc.1/历史行）时 `title = label`、无 description，逐字段与改动前一致。
-  嵌套场景（假桥 `nested` 三级带 `name`/`path`）断言父级 `title=name`、孙/曾孙 `title=全路径`、
-  三者 `description` 仍是各自 label、标题三级互不相同不被覆盖；`name-missing` 模式断言 rc.1
-  形状（只有 label）**没有 `description` 键**、非字符串 `name`/`path` 被当缺失且子会话照常打开
-  并出流；`name-only` 模式断言有 name 无 label → `title=name` 且无 description、label 与
-  name 相同 → 不产生第二行同文；replay 段断言同一规则（`child-A` 用 path、`child-B` 用经具名
-  祖先的 path、无 name 的 `child-M` 用 label 且无 description、冷重放里只有 name 的 `child-K`
-  用 name + label）。**动了
+  **2026-11-15 回退（当前判据，用户决定）**：第二行（短名/路径）被判无价值，等待机制本身才是
+  成本，所以整套名字机制整块删除——`title = label`、不带 `description`、不读 `name`/`path`；
+  桥不再发 `serverInfo.subagentNames`，`session.child-opened` 不带 `name`/`path`/`listed`，而
+  `paseo/subagents` 列表**保留 `name`**（插件 `team()` 的新一代 roster 用它，`row.name ?? row.sessionId`）
+  并去掉 `path`。断言随之改反：`catalog-late`/`catalog-after-flush`/`catalog-name-early-gated`
+  断言行**立即**以 label 打开、迟到 catalog 事实不改 `title`/不带 `description`、且 0 行名字或
+  catalog 日志；`catalog-none` 从「根帧之后才打开、兜底日志 1 行」改成「**根帧之前**就打开、
+  0 行等待日志」；`name-bound-gated` 只钉 label 闸门（descriptor 延到 850 ms，放行后按 label
+  打开、12 帧按序、0 行名字日志）；`nested` 三级带 `name`/`path` 的 notice 断言三级各自
+  `title=label`、无 description、标题互不覆盖；`name-missing` 断言 rc.1 形状无 description、
+  非字符串 `name`/`path` 被忽略且行照常打开并出流；`name-only` 断言有 name 无 label → 行
+  **无标题**（name 不是标题）、label==name → 只有一行；replay 段断言 `child-A`/`child-B` 与
+  冷重放的 `child-K` 都以 label 为标题、无 description。桥侧 `bridge-server-check` 同步改为：
+  列表保留 `name`、去掉 `path`，`session.child-opened` 不带 `name`/`path`/`listed`，`initialize`
+  不再有 `subagentNames`，非字符串 `name` 只被忽略（不再打 stderr 行），catalog 事实仍按普通
+  `session.event` 原样转发（**116 条**）。**动了
   `session.ts` 的 `DshChildSession` 回合状态（`event`/`status`/`#announceTurnStarted`）、
-  `childIdentity`/`DshChildSessionOptions.description`/`#openChildNow`/`replaySubagents` 的身份
-  字段或 `provider.ts` 的 open 顺序/`replaySubagents` 接线/ready 预算必跑；假桥
-  `reuse`/`replay-hang`/`nested`/`name-missing`/`name-only` 模式改动同样必跑。**
+  `#openChildNow`/`replaySubagents` 的标题字段或 `provider.ts` 的 open 顺序/`replaySubagents`
+  接线/ready 预算必跑；假桥 `reuse`/`replay-hang`/`nested`/`name-missing`/`name-only` 模式、桥的
+  `registerCatalogChild`/`openChild`/`subagents` 列表形状改动同样必跑。**
   **2026-11-14（FIELD-NOTES 106）**：冷启动用例改用**新连接**取得未服务过任何会话的 child（池改成按连接
   常驻后，「关会话 + 睡 12 s」退休不掉它；同一连接内的 reopen 由 adoption 用例承担），并删掉那段 12 s 等待与
   临时诊断块——冷起点变成了代码性质，而不是等待性质；**动了 `provider.ts` 的 `#ensurePoolProcess`（`reused`
@@ -773,6 +780,12 @@
   时为 true、只有 rc.1 面（`listChildren`/`listDescendants`）时为 false（插件据此决定是否等
   catalog 的 name）、live 子会话的 `session.child-opened` **不带** `listed`、目录登记的子会话带
   `listed:true` 且仍带 name/path、父会话 `subagent/catalog` 事件**原样转发**（name 不被剥掉）。
+  **2026-11-15 回退（当前判据）**：名字/路径第二行按产品决定删除，上述断言随之改反——目录行
+  **保留 `name`**（插件 `team()` 的 roster 消费 `row.name ?? row.sessionId`）但不再转发 `path`；
+  `session.child-opened` 不再带 `name`/`path`/`listed`；`initialize` 不再有
+  `serverInfo.subagentNames`；非字符串 `name` 只被忽略（不再打 stderr 行，roster 回退到会话 id）；
+  父 `subagent/catalog` 仍按普通 `session.event` 原样转发。删掉能力位 2 条、`listed` 1 条、
+  stderr 行 1 条、并把列表/通知断言改写后**实跑 116/116**。
   **依赖本机 DSH 安装，所以不进 CI**
   （`DSH_PACKAGES_DIR` / `DSH_INSTALL_DIR` 可覆盖，解析失败 exit 2 并打印实际目录）。**动了
   `server.js` 的请求分派或这些只读路径必跑**；**另外，凡动了 `server.js` 的请求分派、会话生命

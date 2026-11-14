@@ -183,23 +183,6 @@ export interface DshChildOpened {
   mode?: string;
   label?: string;
   cwd?: string;
-  /**
-   * DSH 0.2.2-rc.2+ (`subagent/catalog` v3): the child's name, unique among its
-   * siblings. Absent on DSH ≤ 0.2.2-rc.1 and on historical rows.
-   */
-  name?: string;
-  /**
-   * DSH 0.2.2-rc.2+ (`SubagentDescendantListEntry.path`): slash-separated names
-   * from the root, absent whenever a level below the root has no name.
-   */
-  path?: string;
-  /**
-   * The bridge learned this child from DSH's durable catalog listing rather than
-   * from a live event. Such a child (adopted after a reload, or a historical row)
-   * will never emit another live `subagent/catalog` fact, so the plugin must not
-   * hold its notice waiting for a name that cannot arrive.
-   */
-  listed?: boolean;
 }
 
 /** A `session.event` payload's outer envelope. */
@@ -1696,17 +1679,6 @@ export class DshProcess {
   /** Sessions that have completed their own `initialize` in this child. */
   readonly #initializedSessions = new Set<string>();
 
-  /**
-   * Whether this bridge advertised that its DSH build names subagent children
-   * (`serverInfo.subagentNames` on `initialize`, 0.2.2-rc.2+).
-   *
-   * False is also the answer for an older bridge, a profile without a subagent
-   * service, and a process whose initialize reply predates the field — in all
-   * three the plugin must open a label-only child immediately, exactly as it did
-   * before names existed. Read by `DshSession` when it decides whether a child
-   * notice may wait for the parent catalog's name.
-   */
-  #subagentNames = false;
   /** Sessions whose MCP entries have been handed to the bridge. */
   readonly #mcpSent = new Set<string>();
   /** The entries each session mounts, translated once (translation may throw). */
@@ -1930,11 +1902,6 @@ export class DshProcess {
   /** Whether the child is still alive and usable. */
   get running(): boolean {
     return this.#closed === false && this.#child !== undefined;
-  }
-
-  /** Whether the bridge advertised DSH-side naming of subagent children. */
-  get subagentNames(): boolean {
-    return this.#subagentNames;
   }
 
   /**
@@ -2366,12 +2333,12 @@ export class DshProcess {
    */
   async #prepareProcess(): Promise<void> {
     const route = this.#options.route;
-    this.#noteServerInfo(await this.#request("initialize", {
+    await this.#request("initialize", {
       cwd: this.#options.cwd,
       provider: route.provider,
       model: route.model,
       ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
-    }));
+    });
   }
 
   /**
@@ -2388,7 +2355,7 @@ export class DshProcess {
     const options = this.#sessionOptions.get(sessionId) ?? {};
     const cwd = options.cwd ?? this.#options.cwd;
     const route = options.route ?? this.#options.route;
-    this.#noteServerInfo(await this.#request("initialize", {
+    await this.#request("initialize", {
       cwd,
       provider: route.provider,
       model: route.model,
@@ -2402,24 +2369,10 @@ export class DshProcess {
       // The session's own Paseo identity (see `DshSessionOptions.identity`).
       // Unlike the title an omitted identity is meaningful: it clears the row.
       ...(options.identity === undefined ? {} : { identity: options.identity }),
-    }));
+    });
     this.#initializedSessions.add(sessionId);
   }
 
-  /**
-   * Read the bridge's optional capabilities off one `initialize` reply.
-   *
-   * `serverInfo.subagentNames` is an optional addition to a field the plugin
-   * never consumed before: an older bridge omits it, which must read as "this
-   * build does not name children" rather than as an absence of the whole reply.
-   */
-  #noteServerInfo(result: unknown): void {
-    if (result === null || typeof result !== "object") return;
-    const info = (result as { serverInfo?: unknown }).serverInfo;
-    if (info === null || typeof info !== "object") return;
-    const names = (info as { subagentNames?: unknown }).subagentNames;
-    this.#subagentNames = names === true;
-  }
   /**
    * Make one session ready to be used: initialized, with its MCP servers queued.
    *

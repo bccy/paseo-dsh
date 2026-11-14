@@ -27,79 +27,70 @@
  *   nested   after the root is ready, report a grandchild (and great-grandchild)
  *            *before* its parent's child-opened, with its earliest message and
  *            status first, so the plugin must hold and release the subtree.
- *            The three levels also carry DSH 0.2.2-rc.2+'s identity fields
- *            (`name`, and `path` where every level below the root is named), so
- *            one scenario pins the path/name/absent description cases at once
+ *            The three notices still carry DSH 0.2.2-rc.2+'s `name`/`path` the
+ *            way a newer bridge sends them — this plugin ignores both (a child
+ *            row is label-only since the 2026-11-15 revert), so the scenario pins
+ *            that unknown identity keys change nothing
  *   name-missing
- *            report the rc.1 shape (a child notice with only a creation label, so
- *            no `description` may appear on its row) plus a notice whose `name`/
- *            `path` are not strings — the plugin must treat both as absent and
- *            still open the child instead of crashing on a foreign bridge version
+ *            the rc.1 shape (a child notice with only a creation label) plus a
+ *            notice whose `name`/`path` are not strings: a foreign bridge's
+ *            fields must be ignored without crashing, and the row still opens
+ *            on its label
  *   catalog-tree / catalog-tree-early
- *            the same real order one level deeper: a child's notice+label, then
- *            the name in its **parent's** catalog fact (the root for a direct
- *            child, a child session for a grandchild). `catalog-tree-early` emits the
- *            out-of-order shape — the grandchild's notice and the catalog fact
- *            naming it before the notice of the child that parents it — but the
- *            plugin never sees that order: its orphan hold re-delivers a notice
- *            whose parent is unknown once that parent's notice arrives
- *            (`paseo-plugin/server/dsh-process.ts` `#holdOrphan`). What it does
- *            test is the name arriving from the **parent child session's** catalog,
- *            after the parent's notice (the true order was measured: parent
- *            notice, then the grandchild's name, then its frames)
+ *            the real order one level deeper: a child's notice+label, then a
+ *            catalog fact naming it on its **parent's** channel (the root for a
+ *            direct child, a child session for a grandchild). `catalog-tree-early`
+ *            emits the out-of-order shape — the grandchild's notice and the
+ *            catalog fact naming it before the notice of the child that parents
+ *            it — but the plugin never sees that order: its orphan hold
+ *            re-delivers a notice whose parent is unknown once that parent's
+ *            notice arrives (`paseo-plugin/server/dsh-process.ts` `#holdOrphan`).
+ *            The catalog fact is ignored either way; the scenario pins that it
+ *            changes no title and that the parent gate still orders the row
  *   name-bound-gated
- *            what the 750 ms cap still has to get right once the frame bound is
- *            gone: the label gate holds a label-less notice past the cap, the cap
- *            is evaluated once (nothing re-arms or re-logs it while that gate
- *            holds), and the row opens with its label when the descriptor arrives
- *            at 850 ms, every frame accounted for. It says nothing about frame
- *            counts — there is no frame bound any more
+ *            the label gate holds a label-less notice while its frames pile up,
+ *            then the child's own descriptor supplies the label at 850 ms: the
+ *            row opens on that label with every frame accounted for. The catalog
+ *            name machinery is gone (2026-11-15), so this scenario only pins the
+ *            label gate itself
  *   catalog-none
  *            no catalog fact ever: a label-only child notice followed by eight
- *            frames and one root marker. The 750 ms timer is the only way such a
- *            child can open, so the row must appear **after** that marker, and
- *            the timer logs exactly once
+ *            frames and one root marker. The notice carries a label, so the row
+ *            opens immediately — **before** the marker; nothing waits for a
+ *            catalog name any more
  *   catalog-late
  *            the real rc.3 order: the child notice carries only its label, the
  *            child emits a frame or two, and only then does the parent's
- *            `subagent/catalog` v3 fact (the only live source of `name`) arrive.
- *            The plugin must hold the single `session.opened` for it and announce
- *            `title = name`, `description = label`
+ *            `subagent/catalog` v3 fact arrive. The row must already be open with
+ *            `title = label` and no `description`, and the late fact must change
+ *            neither field (the second line was reverted on 2026-11-15)
  *   catalog-after-flush
- *            the real rc.3 interleaving a daemon log measured: the child notice
- *            (label only), then one IPC batch of ten child frames (the bridge
- *            flushes everything it buffered for an unannounced child at once),
- *            and only 3 ms after that the parent's catalog v3 fact with the name.
- *            No frame count may open the row on the way there: it must still be
- *            announced `title = name`, `description = label`
+ *            the rc.3 interleaving a daemon log measured: the child notice
+ *            (label only), then one IPC batch of ten child frames, then the
+ *            parent's catalog v3 fact 3 ms later. The row opens on the label
+ *            immediately, every frame arrives in order, and the late name
+ *            changes nothing
  *   catalog-name-early-gated
- *            the name arrives while the notice is still held by another gate: a
- *            label-less notice is followed immediately by the catalog fact naming
- *            it (twice; the root channel), and only 850 ms later does the child's
- *            own descriptor supply the label. Recording a name has to stop that
- *            child's cap timer, or the 750 ms deadline logs "no catalog name"
- *            about a child that already has one. Row: `title = name`,
- *            `description = label`; exactly one "is named" line for the repeated
- *            fact; zero cap lines
+ *            a label-less notice followed immediately by the catalog fact that
+ *            names it (twice), with the child's own descriptor 850 ms later: the
+ *            name is ignored, the label gate releases on the descriptor, and the
+ *            row opens with that label only
  *   catalog-absent
  *            the rc.1 shape: a label-only child notice, a v2 catalog fact with no
- *            name, and a root frame right behind it. The bridge does not
- *            advertise naming, so the child must open immediately with
- *            `title = label` and no `description` (waiting would only delay it)
+ *            name, and a root frame right behind it. The child opens immediately
+ *            with `title = label` and no `description`
  *   name-only
- *            the second-line rule's corners: a child with a `name` but **no**
- *            label (it opens untitled after the label wait, with the name as the
- *            first line and no description at all) and one whose label equals its
- *            name (the description must be omitted, or the host would paint the
- *            same text twice)
+ *            a child with a `name` but **no** label (the label gate holds it and
+ *            it opens untitled after 40 frames — a name is not a title) and one
+ *            whose label equals its name (still one line, no `description`)
  *   replay   answer `paseo/subagents`/`paseo/history` (child-A has an inherited
  *            fork prefix) so a reopen can rebuild the tree; the listing also
  *            carries a killed child whose log stops inside a turn with no
  *            terminal, and a live child with the same shape that the bridge
- *            announces during the open, so the two can be told apart. Rows carry
- *            `name`/`path` where a named DSH would provide them and omit both for
- *            the historical shape, so the replay path's title/description rule is
- *            asserted against the same listing a real reopen reads
+ *            announces during the open, so the two can be told apart. Rows still
+ *            carry `name` (the plugin's team roster reads it) and sometimes
+ *            `path` (ignored), so the replay path is asserted against a listing
+ *            that looks like a real rc.3 reopen
  *   replay-hang
  *            answer `paseo/subagents` with one child (`child-H`) whose log read
  *            (`paseo/history`) parks until the test writes
@@ -374,26 +365,6 @@ function commandScript() {
  */
 function subagentsScript() {
   return scriptFile("DSH_FAKE_SUBAGENTS_FILE");
-}
-
-/**
- * Whether this scenario's runtime advertises DSH-side child naming.
- *
- * The real bridge puts `serverInfo.subagentNames` in its `initialize` reply when
- * the composed `subagents` service exposes `namesOf`/`rootOf` (0.2.2-rc.2+).
- * The plugin uses it to decide whether a label-only child notice may hold for the
- * parent catalog's name; scenarios that assert that hold opt in, and every other
- * scenario keeps the pre-existing immediate open — exactly what an rc.1 bridge
- * asks for. `DSH_FAKE_CAPABILITIES_FILE` overrides the decision so a check can
- * model either generation independently of the scenario body.
- */
-function namesAdvertised() {
-  const scripted = scriptFile("DSH_FAKE_CAPABILITIES_FILE");
-  if (scripted !== undefined && typeof scripted.subagentNames === "boolean") return scripted.subagentNames;
-  return mode() === "catalog-late" || mode() === "name-missing" ||
-    mode() === "catalog-tree" || mode() === "catalog-tree-early" || mode() === "catalog-none" ||
-    mode() === "name-bound-gated" || mode() === "catalog-after-flush" ||
-    mode() === "catalog-name-early-gated";
 }
 
 /**
@@ -805,12 +776,10 @@ async function emitNested() {
   // Every notice arrives before the parent it hangs under, deepest first, and
   // each descendant's earliest message/status precedes its own parent notice.
   //
-  // The identity fields are DSH 0.2.2-rc.2+'s: `child-P` is a live notice from
-  // the parent's `subagent/catalog`, which only carries `name` (a path needs the
-  // recursive listing), while `grand-G`/`great-H` are the shapes a *listing* row
-  // has — `name` plus the root-relative `path` their named ancestors make
-  // available. One scenario therefore covers description = name, = path, and (in
-  // `name-missing`) the rc.1 shape with neither.
+  // The notices still carry DSH 0.2.2-rc.2+'s `name`/`path` the way a newer
+  // bridge sends them (a live notice has `name`, a listing-shaped one also a
+  // root-relative `path`). This plugin ignores both: a child row is label-only
+  // since the 2026-11-15 revert, so the scenario pins that they change nothing.
   notify("session.child-opened", { sessionId: "great-H", parentSessionId: "grand-G", mode: "one-shot", label: "Great H", name: "great-h", path: "parent-p/grand-g/great-h", cwd: "/tmp" });
   notify("session.event", { sessionId: "great-H", event: { type: "assistant/message", seq: 1, data: { turn: 1, step: 1, message: { id: "gh1", content: [{ type: "text", text: "great early answer" }] } } } });
   notify("session.status", { sessionId: "great-H", status: "running" });
@@ -827,16 +796,12 @@ async function emitNested() {
 }
 
 /**
- * Report the two identity shapes a bridge may hand over that are **not** a
- * usable name: the older build's child (label only) and a malformed one.
+ * Report one child with only a creation label and one with non-string identity
+ * fields.
  *
- * The title rule must not invent a description for either. The bridge is
- * responsible for dropping and logging a non-string `name`/`path` before it
- * ever reaches the wire (`dsh-bridge/lib/server.js` `adoptIdentity`,
- * asserted by `harness/bridge-server-check.mjs`); this scenario pins the
- * plugin's half of the same contract — its `childIdentity` treats the values as
- * absent and the child still opens, so a plugin loaded against a bridge of
- * another version can neither mislabel a row nor fail the open.
+ * This plugin does not read `name`/`path` at all any more (2026-11-15), so both
+ * must open on their label with no `description` — a plugin loaded against a
+ * bridge of another version can neither mislabel a row nor fail the open.
  */
 async function emitNameMissing() {
   notify("session.child-opened", { sessionId: "child-NM", parentSessionId: rootId, mode: "continuable", label: "Legacy NM", cwd: "/tmp" });
@@ -851,27 +816,21 @@ async function emitNameMissing() {
 }
 
 /**
- * Report the two corners of the second-line rule: no label at all, and a label
- * that is the name.
+ * Report a named child with no label, and one whose label equals its name.
  *
- * The first child's notice carries a `name` and **no** label, so the plugin's
- * label wait has to expire before it opens (its frames are the count that
- * expires it). It must then open with the name as its first line and no
- * description — a named row beats one stuck on "加载中…", and there is no task
- * text to put on the second line.
- *
- * The second child's label equals its name: the host paints `description` first
- * and does not compare the two, so a description here would show the same text
- * on both lines. The rule drops it.
+ * The first notice has a `name` and **no** label: the label gate holds it, its
+ * frames expire the gate after 40 events, and the row opens **untitled** — a
+ * name is not a title in this plugin any more (2026-11-15). The second child has
+ * a label, so it opens on that single line with no description even though the
+ * name is identical.
  */
 /**
  * Emit the real rc.3 order one level deeper, plus the out-of-order variant.
  *
- * A grandchild's name is in **its direct parent's** catalog fact, not the root's:
- * the plugin sees `subagent/catalog` events for every session it is attached to,
- * and has to record the name regardless of which session carried it — while the
- * parent session is open (`catalog-tree`) and while it is still only a buffered
- * notice (`catalog-tree-early`).
+ * A grandchild's catalog fact rides **its direct parent's** channel, not the
+ * root's: the plugin sees `subagent/catalog` events for every session it is
+ * attached to. It ignores them (2026-11-15), so both variants now pin that the
+ * fact changes no title while the parent gate still orders the row.
  */
 async function emitCatalogTree(early) {
   const parent = early ? "tree-child-E" : "tree-child-P";
@@ -928,8 +887,8 @@ async function emitNameBoundGated() {
   for (let index = 0; index < 12; index += 1) {
     notify("session.event", { sessionId: "child-NB", event: { type: "assistant/message", seq: index + 1, data: { turn: 1, step: 1, message: { id: `nb-${String(index)}`, content: [{ type: "text", text: `bound-gated line ${String(index)}` }] } } } });
   }
-  // Past the 750 ms cap: the label gate has held the notice the whole time, and
-  // the descriptor now releases it onto a decision that must already be sticky.
+  // The label gate has held the notice the whole time; the descriptor now
+  // releases it, and the row opens on that label.
   await new Promise((resolve) => setTimeout(resolve, 850));
   notify("session.event", { sessionId: "child-NB", event: { type: "subagent/descriptor", seq: 20, data: { version: 3, mode: "continuable", provider: "spawn", label: "Bound Gated NB" } } });
   notify("session.event", { sessionId: "child-NB", event: { type: "turn/end", seq: 21, data: { turn: 1, reason: { kind: "completed" } } } });
@@ -940,10 +899,10 @@ async function emitNameBoundGated() {
 /**
  * Emit a label-only child with no catalog fact at all.
  *
- * The catalog event is the precise answer; when it is lost the wall-clock cap is
- * the only exit left. The root marker is emitted right after the frames, so a
- * plugin that opened on frame count would announce before it — this scenario
- * pins the opposite: nothing may open the row before the 750 ms cap fires.
+ * There is nothing to wait for any more: the notice carries a label, so the row
+ * must open **immediately** — the root marker is emitted right after the frames
+ * and the announcement has to precede it (the deleted 750 ms cap would have put
+ * it after).
  */
 async function emitCatalogNone() {
   notify("session.child-opened", { sessionId: "child-NF", parentSessionId: rootId, mode: "continuable", label: "Frames F", cwd: "/tmp" });
@@ -958,11 +917,10 @@ async function emitCatalogNone() {
 /**
  * Emit the real rc.3 announcement order: label first, `name` only later.
  *
- * The child's own `subagent/descriptor` carries no name (rc.3), and the bridge
- * opens the child as soon as that descriptor supplies a label. The name lives in
- * the **parent's** `subagent/catalog` v3 fact, which reaches the plugin a few
- * milliseconds later — after the announcement the host has already made sticky.
- * `session.opened` therefore has to wait for it (bounded).
+ * The child's own `subagent/descriptor` carries no name (rc.3), and the name
+ * lives in the **parent's** `subagent/catalog` v3 fact a few milliseconds later.
+ * The row must open on its label and never gain a second line: the late fact is
+ * ignored (2026-11-15 revert).
  */
 async function emitCatalogLate() {
   const child = "child-NC";
@@ -987,9 +945,8 @@ async function emitCatalogLate() {
  * The bridge keeps a child's frames until it announces that child, then flushes
  * everything it buffered at once — the daemon log for `smoke-probe` shows eight
  * frames landing 9 ms after the descriptor and the catalog fact 3 ms *after*
- * that. Any frame count below that batch size fires before the name arrives, so
- * the row opens with its label and the name is lost for good. Only the catalog
- * fact itself may release the notice.
+ * that. The row opens on its label inside that batch, so every frame arrives in
+ * order and the late name changes nothing.
  */
 async function emitCatalogAfterFlush() {
   const child = "child-NG";
@@ -1015,15 +972,12 @@ async function emitCatalogAfterFlush() {
 }
 
 /**
- * Deliver a child's name before the notice can actually open.
+ * Deliver a child's catalog name before the notice can actually open.
  *
- * The notice arrives with no label, so the label gate holds it; its name rides
- * the root's catalog channel immediately (twice, to pin that the repeat stays
- * silent), and only 850 ms later does the child's own descriptor supply the
- * label. The 750 ms cap was armed when the label-less notice landed, so recording
- * the name has to stop that timer: otherwise the deadline logs "no catalog name
- * after 750ms" about a child whose name the catalog already gave, and writes the
- * sticky expiry behind the label gate.
+ * The notice arrives with no label, so the label gate holds it; the catalog fact
+ * naming it rides the root channel immediately (twice), and only 850 ms later
+ * does the child's own descriptor supply the label. The name is ignored: the row
+ * opens on the label once the gate releases, with no second line.
  */
 async function emitCatalogNameEarlyGated() {
   const child = "child-EN";
@@ -1040,11 +994,10 @@ async function emitCatalogNameEarlyGated() {
 }
 
 /**
- * Emit the rc.1 shape: no naming capability, no name ever.
+ * Emit the rc.1 shape: label only, a v2 catalog fact with no name.
  *
- * The v2 catalog fact and the root frame behind it exist only to give the check
- * an ordering reference: a plugin that waited for a name here would open the
- * child *after* that root frame.
+ * The catalog fact and the root frame behind it give the check an ordering
+ * reference: the child opens on its label immediately, before that root frame.
  */
 async function emitCatalogAbsent() {
   notify("session.child-opened", { sessionId: "child-NR", parentSessionId: rootId, mode: "continuable", label: "Catalog Absent NR", cwd: "/tmp" });
@@ -1388,7 +1341,6 @@ async function handle(method, params, id) {
         serverInfo: {
           name: "fake-dsh-bridge",
           version: "0",
-          ...(namesAdvertised() ? { subagentNames: true } : {}),
         },
         route: { provider: "fake", model: "fake", reasoningEffort: null },
       };
@@ -1686,12 +1638,10 @@ async function handle(method, params, id) {
       return {
         available: true,
         subagents: [
-          // `name`/`path` are DSH 0.2.2-rc.2+'s (`SubagentDescendantListEntry`):
-          // child-A is named at the root, so child-B's path is available; child-M
-          // deliberately omits both — the historical/rc.1 row a reopen still has
-          // to show exactly as before (label title, no description); child-K
-          // carries a name but no path (its parent is the root, so a path would
-          // normally exist — omitted here on purpose to pin description = name).
+          // `name`/`path` are DSH 0.2.2-rc.2+'s (`SubagentDescendantListEntry`).
+          // The plugin's team roster reads `name`; `path` is ignored. Both are
+          // absent on the historical/rc.1 row (child-M), which a reopen still has
+          // to show exactly as before (label title, no description).
           { sessionId: "child-A", parentSessionId: String(params?.sessionId ?? ""), mode: "continuable", label: "Research A", name: "research-a", path: "research-a" },
           // A one-shot child has no label in the catalog (DSH only requires one
           // for a continuable child); its label lives in its own descriptor.

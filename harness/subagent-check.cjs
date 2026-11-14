@@ -424,14 +424,12 @@ async function openSession(conn, sessionId, history) {
       !conn2Events.some((e) => e.type === "session.runtime_failed"),
   );
 
-  // ---- the real rc.3 order: the label arrives before the name --------------
-  // The child's own `subagent/descriptor` carries no name; the name is in the
-  // parent's `subagent/catalog` v3 fact, which reaches the plugin a few
-  // milliseconds *after* the bridge announces the child. Paseo captures
-  // title/description once, at that announcement, so the plugin has to hold the
-  // single `session.opened` for the catalog fact (bounded) and announce
-  // `title = name`, `description = label`. Before this fix it announced
-  // `title = label` and the name was lost for good.
+  // ---- the real rc.3 order: the label arrives first and is final -----------
+  // The child's own `subagent/descriptor` carries no name; the name rides the
+  // parent's `subagent/catalog` v3 fact a few milliseconds later. Since the
+  // 2026-11-15 revert a child row is label-only: the notice must open at once
+  // with `title = label` and no `description`, and the late catalog fact must
+  // change neither field and leave no name log line behind.
   const conn8 = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
   const conn8Events = [];
   conn8.onEvent((e) => conn8Events.push(e));
@@ -439,17 +437,36 @@ async function openSession(conn, sessionId, history) {
   setMode("catalog-late");
   await conn8.send({ type: "session.open", sessionId: rootZ, config: { cwd: process.cwd(), mode: "build" }, history: "skip" });
   await untilIn(conn8Events, (e) => e.type === "session.ready" && e.sessionId === rootZ, "rootZ ready", 30000);
-  await conn8.send({ type: "session.prompt", sessionId: rootZ, prompt: { clientMessageId: "pZ", input: { type: "message", content: [{ type: "text", text: "go" }] } } });
-  const catalogLate = await untilIn(
-    conn8Events,
-    (e) => e.type === "session.opened" && e.sessionId === scoped(rootZ, "child-NC"),
-    "child-NC opened",
-    30000,
+  const stderr8 = [];
+  const originalStderr8 = process.stderr.write;
+  process.stderr.write = (chunk, ...rest) => {
+    stderr8.push(String(chunk));
+    return originalStderr8.call(process.stderr, chunk, ...rest);
+  };
+  let catalogLate;
+  try {
+    await conn8.send({ type: "session.prompt", sessionId: rootZ, prompt: { clientMessageId: "pZ", input: { type: "message", content: [{ type: "text", text: "go" }] } } });
+    catalogLate = await untilIn(
+      conn8Events,
+      (e) => e.type === "session.opened" && e.sessionId === scoped(rootZ, "child-NC"),
+      "child-NC opened",
+      30000,
+    );
+  } finally {
+    process.stderr.write = originalStderr8;
+  }
+  check(
+    "a child announced before the parent catalog opens on its label alone (no second line)",
+    catalogLate.title === "Catalog Late NC" && catalogLate.description === undefined,
+    JSON.stringify({ title: catalogLate.title, description: catalogLate.description }),
+  );
+  const lateNameLines = stderr8.filter(
+    (line) => line.includes("in the parent catalog") || line.includes("catalog name"),
   );
   check(
-    "a child announced before the parent catalog is opened with the catalog name and the label underneath",
-    catalogLate.title === "catalog-late-name" && catalogLate.description === "Catalog Late NC",
-    JSON.stringify({ title: catalogLate.title, description: catalogLate.description }),
+    "and the ignored name leaves no name-wait or catalog log line",
+    lateNameLines.length === 0,
+    JSON.stringify(lateNameLines),
   );
   await untilIn(
     conn8Events,
@@ -457,7 +474,7 @@ async function openSession(conn, sessionId, history) {
     "the held child's output",
     30000,
   );
-  check("the frames held during the name wait still arrive, in order", true, "catalog-late child answer");
+  check("the child's frames still arrive in order, before and after the ignored fact", true, "catalog-late child answer");
   await conn8.send({ type: "session.close", sessionId: rootZ });
   await conn8.close();
 
@@ -496,18 +513,19 @@ async function openSession(conn, sessionId, history) {
     process.stderr.write = originalStderrA;
   }
   check(
-    "a catalog fact arriving after the bridge's frame flush still titles the row with the name",
-    flushChildA.title === "catalog-flush-name" && flushChildA.description === "Catalog Flush NG",
+    "a catalog fact arriving after the bridge's frame flush changes no title: the row is label-only",
+    flushChildA.title === "Catalog Flush NG" && flushChildA.description === undefined,
     JSON.stringify({ title: flushChildA.title, description: flushChildA.description }),
   );
   const boundLinesA = stderrA.filter(
-    (line) => line.includes("name wait is over") || /held \d+ frames with no catalog name/.test(line),
+    (line) => line.includes("name wait is over") || /held \d+ frames with no catalog name/.test(line) ||
+      line.includes("catalog name") || line.includes("in the parent catalog"),
   );
-  // Anti-regression only: the "held N frames ... the name wait is over" line is
-  // gone with the frame bound itself (see the constant's doc), so this assertion
-  // is vacuously true today — it exists so a re-introduced frame bound is caught.
+  // Anti-regression only: every one of those lines died with the name wait
+  // (2026-11-15), so this is vacuously true today — it exists so a re-introduced
+  // wait or name log is caught.
   check(
-    "and no frame-count bound may end the wait: zero 'name wait is over' lines",
+    "and no name-wait machinery may log anything for the late fact",
     boundLinesA.length === 0,
     JSON.stringify(boundLinesA),
   );
@@ -523,12 +541,10 @@ async function openSession(conn, sessionId, history) {
   await connA.send({ type: "session.close", sessionId: rootNG });
   await connA.close();
 
-  // ---- rc.1: no naming capability advertised, so no wait at all -----------
-  // The bridge report is the only difference from the case above: without
-  // `serverInfo.subagentNames` (0.2.2-rc.1, or a profile with no subagent
-  // service) a label-only child must open immediately, as it always did. The
-  // root frame emitted right behind the notice is the ordering witness: a wait
-  // would push the announcement past it.
+  // ---- the rc.1 shape: label only, no identity, opens immediately ----------
+  // A label-only child must open immediately, as it always did. The root frame
+  // emitted right behind the notice is the ordering witness: any wait would push
+  // the announcement past it.
   const conn9 = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
   const conn9Events = [];
   conn9.onEvent((e) => conn9Events.push(e));
@@ -548,12 +564,12 @@ async function openSession(conn, sessionId, history) {
     (e) => e.type === "timeline.item" && e.sessionId === rootW && e.item?.text === "root frame after catalogue",
   );
   check(
-    "without a naming capability a label-only child opens immediately (label title, no description)",
+    "a label-only child opens immediately on its label, with no second line",
     absentChild.title === "Catalog Absent NR" && absentChild.description === undefined,
     JSON.stringify({ title: absentChild.title, description: absentChild.description }),
   );
   check(
-    "and it is announced before the root frame that follows the catalog fact (no wait on rc.1)",
+    "and it is announced before the root frame that follows the catalog fact (nothing waits)",
     absentOpenIndex >= 0 && rootAfterCatalogIndex > absentOpenIndex,
     `open#${String(absentOpenIndex)} root#${String(rootAfterCatalogIndex)}`,
   );
@@ -563,11 +579,8 @@ async function openSession(conn, sessionId, history) {
   // ---- a name that arrives while another gate still holds the notice -------
   // The notice is label-less, so the label gate holds it; its catalog fact names
   // it immediately (twice), and the descriptor that releases the label is 850 ms
-  // away — past the cap armed when the notice landed. Recording a name has to
-  // stop that child's cap timer: a deadline that fired afterwards would log
-  // "no catalog name" about a child the catalog already named, and write the
-  // sticky expiry behind the label gate. The row must still open with the name
-  // (title) over its label (description) when the descriptor arrives.
+  // away. The name is ignored: the row opens on the label once that gate
+  // releases, with no second line and no name log.
   const connD = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
   const connDEvents = [];
   connD.onEvent((e) => connDEvents.push(e));
@@ -589,29 +602,27 @@ async function openSession(conn, sessionId, history) {
     process.stderr.write = originalStderrD;
   }
   check(
-    "a name recorded while the notice was gated still titles the row once the gate releases",
-    gatedNameChild.title === "early-name-n" && gatedNameChild.description === "Early Name EN",
+    "an ignored early name leaves the row label-only once the gate releases",
+    gatedNameChild.title === "Early Name EN" && gatedNameChild.description === undefined,
     JSON.stringify({ title: gatedNameChild.title, description: gatedNameChild.description }),
   );
-  const capLinesD = stderrD.filter((line) => line.includes("has no catalog name"));
-  check(
-    "and recording the name stopped the cap timer: zero 'has no catalog name' lines",
-    capLinesD.length === 0,
-    JSON.stringify(capLinesD),
+  const nameLinesD = stderrD.filter(
+    (line) => line.includes("has no catalog name") || line.includes("in the parent catalog") ||
+      line.includes("catalog name"),
   );
-  const namedLinesD = stderrD.filter((line) => line.includes("is named early-name-n in the parent catalog"));
   check(
-    "and the repeated catalog fact does not re-log the name",
-    namedLinesD.length === 1,
-    JSON.stringify(namedLinesD),
+    "and nothing logs a name, not even for the repeated catalog fact",
+    nameLinesD.length === 0,
+    JSON.stringify(nameLinesD),
   );
   await connD.send({ type: "session.close", sessionId: rootEN });
   await connD.close();
 
-  // ---- two levels: a grandchild's name rides its parent's catalog --------
-  // The root's catalog only names its own direct children. A grandchild is named
-  // in the catalog of the child that created it, and that event reaches the
-  // plugin on the child session's channel — opened or not yet opened.
+  // ---- two levels: the row stays label-only at every depth ----------------
+  // The root's catalog only names its own direct children; a grandchild's fact
+  // rides the child session's channel — opened or not yet opened. Both are
+  // ignored now, so the point is that the parent gate still orders the rows and
+  // the labels are the only titles.
   const connR4a = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
   const connR4aEvents = [];
   connR4a.onEvent((e) => connR4aEvents.push(e));
@@ -623,13 +634,13 @@ async function openSession(conn, sessionId, history) {
   const treeParentR4 = await untilIn(connR4aEvents, (e) => e.type === "session.opened" && e.sessionId === scoped(rootR4tree, "tree-child-P"), "tree-child-P opened", 30000);
   const treeGrandR4 = await untilIn(connR4aEvents, (e) => e.type === "session.opened" && e.sessionId === scoped(rootR4tree, "tree-grand-P"), "tree-grand-P opened", 30000);
   check(
-    "a direct child's name from the root catalog still titles its row",
-    treeParentR4.title === "tree-p" && treeParentR4.description === "Tree P Label",
+    "a direct child opens on its label with no second line",
+    treeParentR4.title === "Tree P Label" && treeParentR4.description === undefined,
     JSON.stringify({ title: treeParentR4.title, description: treeParentR4.description }),
   );
   check(
-    "a grandchild's name arrives on its parent child session's catalog and titles its row",
-    treeGrandR4.title === "tree-g" && treeGrandR4.description === "Tree G Label",
+    "a grandchild's ignored catalog name leaves its label as the only title",
+    treeGrandR4.title === "Tree G Label" && treeGrandR4.description === undefined,
     JSON.stringify({ title: treeGrandR4.title, description: treeGrandR4.description }),
   );
   const treeOpenedR4 = connR4aEvents.findIndex((e) => e.type === "session.opened" && e.sessionId === scoped(rootR4tree, "tree-grand-P"));
@@ -637,7 +648,7 @@ async function openSession(conn, sessionId, history) {
     (e) => e.type === "timeline.item" && e.sessionId === rootR4tree && e.item?.text === "root marker after tree",
   );
   check(
-    "the grandchild opens before the root marker that follows its catalog (not on the 750 ms timer)",
+    "the grandchild opens before the root marker that follows its catalog (the parent gate, not a timer)",
     treeOpenedR4 >= 0 && treeMarkerR4 > treeOpenedR4,
     `open#${String(treeOpenedR4)} marker#${String(treeMarkerR4)}`,
   );
@@ -645,6 +656,8 @@ async function openSession(conn, sessionId, history) {
   await connR4a.close();
 
   // ---- the out-of-order variant: grandchild before its own parent --------
+  // The orphan hold re-delivers the notice once the parent arrives; the ignored
+  // catalog fact must not change the title in either order.
   const connR4b = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
   const connR4bEvents = [];
   connR4b.onEvent((e) => connR4bEvents.push(e));
@@ -655,8 +668,8 @@ async function openSession(conn, sessionId, history) {
   await connR4b.send({ type: "session.prompt", sessionId: rootR4early, prompt: { clientMessageId: "pQ", input: { type: "message", content: [{ type: "text", text: "go" }] } } });
   const earlyGrandR4 = await untilIn(connR4bEvents, (e) => e.type === "session.opened" && e.sessionId === scoped(rootR4early, "tree-grand-E"), "tree-grand-E opened", 30000);
   check(
-    "a grandchild's name still comes from its parent child session's catalog (the bridge re-delivers an out-of-order notice after the parent's)",
-    earlyGrandR4.title === "tree-g-early" && earlyGrandR4.description === "Tree Early G Label",
+    "an out-of-order grandchild keeps its label title after the parent notice and the ignored fact",
+    earlyGrandR4.title === "Tree Early G Label" && earlyGrandR4.description === undefined,
     JSON.stringify({ title: earlyGrandR4.title, description: earlyGrandR4.description }),
   );
   const earlyOpenedR4 = connR4bEvents.findIndex((e) => e.type === "session.opened" && e.sessionId === scoped(rootR4early, "tree-grand-E"));
@@ -664,18 +677,18 @@ async function openSession(conn, sessionId, history) {
     (e) => e.type === "timeline.item" && e.sessionId === rootR4early && e.item?.text === "root marker after tree",
   );
   check(
-    "and it waits only for its parent notice, not for the timer",
+    "and it waits only for its parent notice, never for a catalog name",
     earlyOpenedR4 >= 0 && earlyMarkerR4 > earlyOpenedR4,
     `open#${String(earlyOpenedR4)} marker#${String(earlyMarkerR4)}`,
   );
   await connR4b.send({ type: "session.close", sessionId: rootR4early });
   await connR4b.close();
 
-  // ---- a lost catalog fact: the wall-clock cap is the only exit ----------
-  // The catalog fact is the precise answer, and the 750 ms cap is the sole
-  // fallback for when it never arrives. The root marker is emitted right behind
-  // the frames, so a row opened on frame count would announce before it — this
-  // scenario pins the opposite: the cap is the only thing that may open it.
+  // ---- no catalog fact: the label alone opens the row immediately --------
+  // There is no wait any more, so the notice (which carries a label) must open
+  // the row at once. The root marker is emitted right behind the frames, so the
+  // announcement has to precede it — the deleted 750 ms cap would have put it
+  // after.
   const connR4c = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
   const connR4cEvents = [];
   connR4c.onEvent((e) => connR4cEvents.push(e));
@@ -697,7 +710,7 @@ async function openSession(conn, sessionId, history) {
     process.stderr.write = originalStderrWriteR4;
   }
   check(
-    "with no catalog fact at all the label-only child still opens (on the 750 ms cap)",
+    "with no catalog fact at all the label-only child opens at once on its label",
     framesChildR4.title === "Frames F" && framesChildR4.description === undefined,
     JSON.stringify({ title: framesChildR4.title, description: framesChildR4.description }),
   );
@@ -706,26 +719,26 @@ async function openSession(conn, sessionId, history) {
     (e) => e.type === "timeline.item" && e.sessionId === rootR4frames && e.item?.text === "root marker after frames",
   );
   check(
-    "and it opens only after the root marker that followed the frames (frames are not an exit)",
-    framesOpenedR4 >= 0 && framesMarkerR4 >= 0 && framesOpenedR4 > framesMarkerR4,
+    "and it opens before the root marker that follows the frames (nothing waits)",
+    framesOpenedR4 >= 0 && framesMarkerR4 >= 0 && framesOpenedR4 < framesMarkerR4,
     `open#${String(framesOpenedR4)} marker#${String(framesMarkerR4)}`,
   );
-  const capLinesR4 = stderrLinesR4.filter((line) => line.includes("has no catalog name after 750ms"));
+  const capLinesR4 = stderrLinesR4.filter(
+    (line) => line.includes("has no catalog name") || line.includes("catalog name"),
+  );
   check(
-    "and the cap logs exactly once why it opened with the label",
-    capLinesR4.length === 1,
+    "and no cap timer logs anything: the wait is gone",
+    capLinesR4.length === 0,
     JSON.stringify(capLinesR4),
   );
   await connR4c.send({ type: "session.close", sessionId: rootR4frames });
   await connR4c.close();
 
-  // ---- the wall-clock cap is sticky and logs once, even while gated ------
-  // The notice has no label yet, and the descriptor is delayed past the cap, so
-  // the label gate keeps it unopened when the cap expires. The cap's decision
-  // must be sticky (that flush cannot open anything) and its log singular: an
-  // expiry that only lived in the timer's local scope would be re-decided by
-  // every later flush. Then the descriptor releases the label, the child opens
-  // with it, and every frame arrives in order.
+  // ---- the label gate is the only gate left ------------------------------
+  // The notice has no label yet, and the descriptor is delayed 850 ms, so the
+  // label gate keeps it unopened the whole time. Then the descriptor releases
+  // the label, the child opens with it (no second line), every frame arrives in
+  // order, and no name wait exists to log anything.
   const connR5 = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
   const connR5Events = [];
   connR5.onEvent((e) => connR5Events.push(e));
@@ -752,14 +765,16 @@ async function openSession(conn, sessionId, history) {
   } finally {
     process.stderr.write = originalStderrR5;
   }
-  const boundLogsR5 = stderrR5.filter((line) => line.includes("has no catalog name after 750ms"));
+  const boundLogsR5 = stderrR5.filter(
+    (line) => line.includes("has no catalog name") || line.includes("catalog name"),
+  );
   check(
-    "a cap that expires behind another gate logs exactly once, not once per later flush",
-    boundLogsR5.length === 1,
+    "no name wait exists to log anything behind the label gate",
+    boundLogsR5.length === 0,
     `${String(boundLogsR5.length)} line(s): ${JSON.stringify(boundLogsR5)}`,
   );
   check(
-    "and the child still opens with its label once the other gate releases",
+    "and the child opens with its label once the label gate releases",
     boundChildR5.title === "Bound Gated NB" && boundChildR5.description === undefined,
     JSON.stringify({ title: boundChildR5.title, description: boundChildR5.description }),
   );
@@ -1302,47 +1317,43 @@ async function openSession(conn, sessionId, history) {
     !conn5Events.some((e) => e.type === "timeline.item" && /GHOST-SHOULD-NOT-APPEAR/.test(timelineText(e))),
   );
 
-  // ---- identity: title is DSH's name/path, description is the label --------
-  // DSH 0.2.2-rc.2+ names every child it records and computes a root-relative
-  // slash path in the recursive listing. Paseo's host paints `description` as the
-  // row's FIRST line and `title` as the muted line under it, so keeping the task
-  // description first — where it has always been — means title = identity and
-  // description = label. The two fields stay apart: a label is a free-text task
-  // description, a name is the model-addressable identity, and neither backfills
-  // the other.
+  // ---- a label-only row at every level (identity fields ignored) -----------
+  // DSH 0.2.2-rc.2+ names every child it records, and the notices below carry
+  // those `name`/`path` fields the way a newer bridge sends them. This plugin
+  // ignores both since the 2026-11-15 revert: every row is `title = label` with
+  // no `description`, and the three levels still get three distinct labels.
   const openedOf = (scopedId) =>
     conn5Events.find((e) => e.type === "session.opened" && e.sessionId === scopedId);
   const pOpen = openedOf(pScoped);
   const gOpen = openedOf(gScoped);
   const hOpen = openedOf(hScoped);
   check(
-    "a named direct child titles with its name and keeps the task label as the description",
-    pOpen?.title === "parent-p" && pOpen?.description === "Parent P",
+    "a named direct child titles with its label and has no description",
+    pOpen?.title === "Parent P" && pOpen?.description === undefined,
     JSON.stringify({ title: pOpen?.title, description: pOpen?.description }),
   );
   check(
-    "a grandchild titles with its root-relative path, not its bare name",
-    gOpen?.title === "parent-p/grand-g" && gOpen?.description === "Grand G",
+    "a grandchild's ignored path leaves its label as the title",
+    gOpen?.title === "Grand G" && gOpen?.description === undefined,
     JSON.stringify({ title: gOpen?.title, description: gOpen?.description }),
   );
   check(
-    "a great-grandchild's title is the full path and its description is still the label",
-    hOpen?.title === "parent-p/grand-g/great-h" && hOpen?.description === "Great H",
+    "a great-grandchild's ignored path leaves its label as the title",
+    hOpen?.title === "Great H" && hOpen?.description === undefined,
     JSON.stringify({ title: hOpen?.title, description: hOpen?.description }),
   );
   check(
-    "a parent's identity never overwrites its child's (three levels, three titles)",
+    "a label never overwrites its child's (three levels, three titles)",
     new Set([pOpen?.title, gOpen?.title, hOpen?.title]).size === 3,
     JSON.stringify([pOpen?.title, gOpen?.title, hOpen?.title]),
   );
 
   // ---- the shapes an older or foreign bridge exercises ---------------------
-  // (c) rc.1 has no identity fields at all, so its row must be exactly the one
-  // Paseo showed before this feature — same title, and no `description` key.
-  // (d) a non-string `name`/`path` is absent, never coerced: the real bridge
-  // drops and logs it (`harness/bridge-server-check.mjs` pins that half), and
-  // the plugin must still open the child if some other bridge version passes
-  // one through instead of turning the row into `"[object Object]"`.
+  // (c) rc.1 has no identity fields at all: its row is label-only, with no
+  // `description` key.
+  // (d) a non-string `name`/`path` from a foreign bridge must not be coerced into
+  // a title (`"[object Object]"`); this plugin ignores the keys, so the child
+  // still opens on its label.
   const conn6 = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
   const conn6Events = [];
   conn6.onEvent((e) => conn6Events.push(e));
@@ -1386,12 +1397,12 @@ async function openSession(conn, sessionId, history) {
   await conn6.send({ type: "session.close", sessionId: rootX });
   await conn6.close();
 
-  // ---- the corners of "identity first, label second" -----------------------
-  // (f) a named child with no label: the label wait expires and it opens with the
-  // name as its title and **no** description — a named row beats one stuck on
-  // "加载中…", and there is no task text for the second line. (g) a label equal to
-  // the name: the host does not compare the two, so the description must be
-  // dropped or the same text is painted twice.
+  // ---- a name is not a title ----------------------------------------------
+  // (f) a child with a name but no label: the label gate holds it until its
+  // frames expire it, and the row then opens **untitled** — the name was never a
+  // fallback title, not even before this feature existed. (g) a label equal to
+  // the name: exactly one line, no description (nothing paints the same text
+  // twice).
   const conn7 = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
   const conn7Events = [];
   conn7.onEvent((e) => conn7Events.push(e));
@@ -1407,8 +1418,8 @@ async function openSession(conn, sessionId, history) {
     30000,
   );
   check(
-    "a named child with no label titles with its name and carries no description",
-    namedNoLabel.title === "no-label-child" && namedNoLabel.description === undefined,
+    "a named child with no label opens untitled and carries no description",
+    namedNoLabel.title === undefined && namedNoLabel.description === undefined,
     JSON.stringify({ title: namedNoLabel.title, description: namedNoLabel.description }),
   );
   const sameName = await untilIn(
@@ -1473,25 +1484,24 @@ async function openSession(conn, sessionId, history) {
       + (duplicateRows.length === 0 ? "" : ` — duplicated: ${duplicateRows.join(", ")}`),
   );
 
-  // ---- the replay path applies the same title/description rule -------------
-  // A reopen rebuilds titles from the durable listing, so this is the other half
-  // of the one rule `childIdentity` implements: title = `path` (child-A) / `path`
-  // through a named ancestor (child-B) with the task label in the description,
-  // and the historical/rc.1 row (child-M, no name) stays title = label with no
-  // description at all.
+  // ---- the replay path is label-only too -----------------------------------
+  // A reopen rebuilds titles from the durable listing, which still carries
+  // `name`/`path` the way a real rc.3 reopen does. Both are ignored: child-A and
+  // child-B open with their labels and no description, and the historical/rc.1
+  // row (child-M, no name) looks exactly the same.
   const reusedOpenOf = (nativeId) =>
     reusedRun.find((e) => e.type === "session.opened" && e.sessionId === scoped(rootA, nativeId));
   const reuseA = reusedOpenOf("child-A");
   const reuseB = reusedOpenOf("child-B");
   const reuseM = reusedOpenOf("child-M");
   check(
-    "a replayed child titles with DSH's path and keeps its label as the description",
-    reuseA?.title === "research-a" && reuseA?.description === "Research A",
+    "a replayed child titles with its label and no description (the listing identity is ignored)",
+    reuseA?.title === "Research A" && reuseA?.description === undefined,
     JSON.stringify({ title: reuseA?.title, description: reuseA?.description }),
   );
   check(
-    "a replayed grandchild gets its label from its own descriptor and its title from the listing path",
-    reuseB?.title === "research-a/nested-b" && reuseB?.description === "Nested B",
+    "a replayed grandchild gets its label from its own descriptor and no second line",
+    reuseB?.title === "Nested B" && reuseB?.description === undefined,
     JSON.stringify({ title: reuseB?.title, description: reuseB?.description }),
   );
   check(
@@ -1720,13 +1730,13 @@ async function openSession(conn, sessionId, history) {
   );
   check(
     "the killed child is still announced (closed, never hidden)",
-    replayed.some((e) => e.type === "session.opened" && e.sessionId === killedScoped && e.title === "killed-k"),
+    replayed.some((e) => e.type === "session.opened" && e.sessionId === killedScoped && e.title === "Killed K"),
   );
   check(
-    "a cold-replayed child named without a path titles with its bare name, label underneath",
+    "a cold-replayed child is announced with its label and no second line",
     replayed.some(
       (e) => e.type === "session.opened" && e.sessionId === killedScoped &&
-        e.title === "killed-k" && e.description === "Killed K",
+        e.title === "Killed K" && e.description === undefined,
     ),
     JSON.stringify(replayed.filter((e) => e.type === "session.opened" && e.sessionId === killedScoped).map((e) => ({ title: e.title, description: e.description }))),
   );
