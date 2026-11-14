@@ -83,7 +83,15 @@ Paseo 撤回按钮
   `REWIND_PERSISTENCE_PREFIX`），插件按当前 locale 换成一句点名前提的文案
   （`paseo-plugin/shared/rewind-notice.ts` 的 `rewindPersistenceFailure`，中英各一份）。
   看到「撤回需要持久化的会话存储……」就是本节场景，不是撤回逻辑坏了；`flush-failed` 的
-  括号里还带着 DSH 自己的原因。
+  括号里还带着 DSH 自己的原因（`detail` 原样嵌进句子，允许含冒号与换行；桥没给原因时该
+  括号整段省略，中文句里不会夹英文占位）。
+  **文案强度有前提**：三条路径都发生在替换标记 append 之后、flush 之前。`session.append`
+  带 `surfaceOp` 时会**同步**改写内存 surface（`harness/revert-shape-probe.mjs` 钉住
+  `surface.nodes` 立即缩小），所以本进程的对话面其实已经变了，失败的只是「落盘」——
+  文案因此写「本次撤回没有落盘（重开会话会恢复被撤内容）」，**不写**「未撤回任何内容」。
+  文件层与子代理取消都在 flush 之后，这三条路径上确实未动，文案照实写。
+  插件只认 `no-session-store` / `flush-failed` / `not-durable` 三个码；**更新版桥新增的码
+  原样透传**桥的原文（不猜本地化句子），非本前缀的错误同样原样返回，只有这三码被翻译。
 - **怎么自查**：
   1. `dsh --profile <name> --dump-config`（只读）看组合里有没有会话持久化那一行；
   2. 试撤回一次：收到上面那句提示即为本节场景；

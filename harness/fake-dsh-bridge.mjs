@@ -474,6 +474,15 @@ let rootId = null;
  * Keying them by session id keeps each session's scenario independent.
  */
 const scenarioState = new Map();
+/**
+ * Sessions a completed rewind made shorter, process-wide.
+ *
+ * Not `scenarioState`: the host closes the provider session and reopens it, and
+ * `session/close` drops that bag on purpose (a reopen must start clean). What a
+ * rewind made durable is exactly the state that has to survive that close — the
+ * real bridge reads it back from the session log, so this stands in for the log.
+ */
+const rewoundSessions = new Set();
 /** The state bag for `sessionId`, created on first use. */
 function stateOf(sessionId) {
   let state = scenarioState.get(sessionId);
@@ -1594,6 +1603,11 @@ async function handle(method, params, id) {
           },
         };
       }
+      // A completed rewind changes what this session replays. The real bridge
+      // appended a replacement event before answering, and its `paseo/history`
+      // answers with the folded (shorter) log; the state flag below is how this
+      // scripted bridge models that single durable effect for `paseo/history`.
+      rewoundSessions.add(String(params?.sessionId ?? ""));
       return { kind: "success", text: "Withdrawn seq 3 and everything after it" };
     }
     case "paseo/subagents": {
@@ -1744,6 +1758,19 @@ async function handle(method, params, id) {
       // The image scenario replays the same log, so a reopen proves the picture
       // row is rebuilt from history and not only from the live turn.
       if (mode() === "image") return { available: true, inheritedEventCount: 0, events: withHistoryTimes(imageRootEvents()) };
+      // A session this bridge has already rewound no longer replays the
+      // withdrawn surface. The real bridge appends one replacement event and
+      // `paseo/history` folds the shadowed range away (`dsh-bridge/lib/surface.js`:
+      // only this bridge's own `paseo-rewind` seam, never compaction), so a
+      // reopened conversation comes back shorter. The scripted root is a single
+      // prompt and the rewind target is a message inside it, so the folded log is
+      // empty. Without this the scripted history resurrects the withdrawn answer
+      // on every reopen, and the host's rebuild looks like it read something other
+      // than the provider — the delivery check's "the withdrawn conversation is
+      // gone from the rebuilt timeline" then has no implementation to exercise.
+      if (rewoundSessions.has(sid)) {
+        return { available: true, inheritedEventCount: 0, events: [] };
+      }
       return { available: true, inheritedEventCount: 0, events: withHistoryTimes(rootEvents()) };
     }
     case "session/prompt": {

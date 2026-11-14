@@ -32,7 +32,8 @@
  *
  * Usage: node harness/revert-check.mjs
  */
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import {
@@ -1099,6 +1100,20 @@ console.log('shared-process lifecycle (behaviour, not source text)');
     // child instead of leaking it. Asserting `new ParkedSessions(` / `#parked.stop()`
     // in the source could not tell a wired-up stop from one that runs before
     // anything is parked.
+    //
+    // The spawn is no longer unconditional: `#ensurePoolProcess` first awaits
+    // `#awaitPreviousSharedDsh` (`provider.ts`), which reads the shared-dsh record
+    // of **this DSH home** and refuses to start a second dsh beside a child that
+    // is still alive under another plugin process. On a machine with a running
+    // daemon that record is real, so the open is refused for the right reason —
+    // but then this claim is never exercised at all (the recorded child is not a
+    // fake transport, so nothing gets attached or retired, and the report reads
+    // `spawned [undefined …]`). Point the home at an empty directory for this
+    // case: no record, no wait, and the fake transport is what spawns. The
+    // refusal path belongs to the host-facing provider checks, not to this one.
+    const isolatedHome = mkdtempSync(join(tmpdir(), 'revert-shared-process-'));
+    const previousHome = process.env.DSH_HOME;
+    process.env.DSH_HOME = isolatedHome;
     const provider = require(join(buildDir, 'server', 'provider.js'));
     const conn = await provider.createDshProvider().connect({ capabilities: [] });
     const providerEvents = [];
@@ -1146,6 +1161,9 @@ console.log('shared-process lifecycle (behaviour, not source text)');
         (sharedProcess.killed === true || sharedProcess.shutdownCalled === true),
       `killed ${String(sharedProcess?.killed)}, shutdown ${String(sharedProcess?.shutdownCalled)}`,
     );
+    if (previousHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previousHome;
+    rmSync(isolatedHome, { recursive: true, force: true });
   }
 }
 

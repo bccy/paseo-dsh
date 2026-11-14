@@ -168,6 +168,16 @@ console.log(`host:         ${hostAgentDir}`);
 // Loaded lazily so a build **without** the append module (the pre-fix code this
 // check must be red on) reports the missing mechanism as failures instead of
 // dying before the behavioural assertions run.
+//
+// The replacement timeout is read once, when that module loads. The parent
+// process drives the degraded modes through `spawnSync` with a short value, but
+// the same modes are runnable from a shell (`node … --degraded`) — there the
+// variable is absent, the module falls back to the production 10 s bound, and
+// every degraded assertion that waits seconds times out. Default it here, before
+// the module loads, so both entry points exercise the same degraded window.
+if (degraded && process.env.DSH_PASEO_REWIND_REPLACEMENT_TIMEOUT_MS === undefined) {
+  process.env.DSH_PASEO_REWIND_REPLACEMENT_TIMEOUT_MS = "300";
+}
 let appendModule;
 try {
   appendModule = require(join(buildDir, "server", "rewind-notice-append.js"));
@@ -570,7 +580,12 @@ if (!degraded) {
     !rows.some((candidate) => candidate.item.type === "assistant_message"),
     rows.map((candidate) => candidate.item.type).join(" | "),
   );
-  const historyHasRow = session.history.some(
+  // The host's provider history is a `PluginSessionHistory`, not an array
+  // (Paseo 0.16 / PR #7675): `read(provider)` replays the canonical timeline
+  // items in order. Calling `.some` on the object itself threw here, before this
+  // assertion could run — the report row never entered provider history either
+  // way, but "the check crashed" is not evidence for it.
+  const historyHasRow = session.history.read(session.provider).some(
     (event) => event.type === "timeline" && event.item.type === "plugin",
   );
   check("the report row never entered the provider history", historyHasRow === false);

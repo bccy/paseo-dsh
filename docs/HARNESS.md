@@ -50,7 +50,13 @@
   RPC、只注册允许的 hook、不注册 `before("agent.session.open")`）。本轮补的：兜底 notice 的
   **降级标记**（server/client 两份常量逐字相等的漂移守卫、双 locale 的「带标记可见 / 无标记仍删」）
   与 NC-03 的句柄迟到单元场景（`beginRewindReport` 后、`deliver` 前才捕获句柄 → 先建 replacement
-  订阅再 append，超时后 append 有界）。**动了撤回文案、
+  订阅再 append，超时后 append 有界）。**持久化失败文案**（`shared/rewind-notice.ts` 的
+  `rewindPersistenceFailure`）：三码各自命中中英两份文案、`flush-failed` 的 detail 原样保留
+  冒号与换行、detail 为空时不出现英文占位（中文句不再夹 "flush failed"）、未知码与非本前缀
+  都**原样透传**（`undefined`；`not-durable` 因此必须是显式 `case`，两条断言联合钉住）、桥里
+  `rewind-persistence:` 字面量的**跨进程漂移守卫**，以及三条文案都不得声称「未撤回任何内容」
+  ——桥先 append 标记（内存 surface 已变）再 flush，失败的是落盘。
+  **动了撤回文案、
   `shared/rewind-notice.ts`、`client/rewind-notice*.ts(x)` 或 `index.client.tsx` 的注册必跑。**
   运行：`node harness/rewind-notice-check.cjs`（自己编译到 `paseo-plugin/.dbg-p17-client`）。
 - `harness/rewind-notice-delivery-check.mjs` — 撤回完成提示**能不能确定地到达时间线**：一个进程里
@@ -66,7 +72,12 @@
   （超时后等 4 次有界复核跑完，断言最终一行且 stderr 有 `could not be confirmed` 放弃日志）与
   `--degraded-late`（rebuild 晚于 timeout 到达 → 行被抹 → 补发、两次 append 同一 `noticeId`、
   最终恰好一行）；另有真实宿主 race 场景（begin 之后、deliver 之前才捕获句柄 → 先建订阅再
-  append，绝不裸 append）。**动了 provider 的 `session.revert`
+  append，绝不裸 append）。降级两模式既可由脚本自己 `spawnSync` 子进程（注入 300 ms 覆盖）也可
+  **直接命令行跑**（`--degraded` / `--degraded-late` 在加载 report 模块前自己补上 300 ms 默认，
+  否则会落回生产 10 s 上限、所有秒级断言假红）。provider history 按 0.16 的
+  `PluginSessionHistory.read(provider)` 读（不是数组）；「重建后时间线没有被撤的 assistant 行」
+  依赖假桥的 `paseo/history` 在成功撤回后折叠（模拟真实桥 `surface.js` 的撤回缝折叠），否则
+  重建只能重放未变的脚本历史、断言没有实现可测。**动了 provider 的 `session.revert`
   分支、`server/rewind-notice-append.ts`、`index.server.ts` 的句柄捕获/arm RPC、降级复核/补发，
   或宿主 `agent-manager.js` 的 rewind/hydrate/staging 逻辑必跑**（运行约 40s）。运行：
   `node harness/rewind-notice-delivery-check.mjs`（自己编译到
@@ -904,7 +915,13 @@
   才是撤回目标（注入的 user-role 消息永不解析）、区间取自 `session.surface.nodes`（compacted
   或已撤回的消息拒绝）、令牌解析与前置条件、回执形状、文件层、**canary 先于
   `request.completed`**、共享子进程接线；接线部分编译插件后用真实 `DshSession` + 假进程传输
-  做行为断言，不是源码正则。**动了 `dsh-bridge/lib/revert.js`、`provider.ts`/`session.ts` 的
+  做行为断言，不是源码正则。provider 级的「共享子进程生命周期」用例在**一次性 `DSH_HOME`**
+  下驱动：`#ensurePoolProcess` 起子进程前会先 `#awaitPreviousSharedDsh`，读本 home 的
+  shared-dsh 记录；真机上有运行中的 daemon 时那条记录指向别人拥有的活子进程，provider 会
+  **正确地拒绝**再起第二个 dsh（防的是两个进程抢同一 profile 的固定端口 →
+  `listen EADDRINUSE`），于是假 transport 永远不 spawn、
+  断言只会读到 `undefined`。隔离 home 后没有记录、没有等待，用例才真的在测 pool 的
+  acquire/attach/release/retire。**动了 `dsh-bridge/lib/revert.js`、`provider.ts`/`session.ts` 的
   撤回分支或 `server.js` 的 revert 事务必跑。**
 - `harness/surface-check.mjs` — 重放折叠（`dsh-bridge/lib/surface.js`）：只折本桥撤回缝
   （空 `system/message` 替换，含被撤回合的尾随日志事件）、compaction 的 `user/message` 替换

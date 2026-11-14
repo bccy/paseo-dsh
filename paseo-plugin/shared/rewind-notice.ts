@@ -122,7 +122,11 @@ export interface RewindCopy {
   failureTitle: string;
   /** The profile composes no `sessions` service: the marker cannot be logged. */
   persistenceNoStore: string;
-  /** `sessions.flush` threw; `detail` is the bridge's raw reason. */
+  /**
+   * `sessions.flush` threw; `detail` is the bridge's raw reason, or `""` when
+   * the bridge reported none. The locale picks the empty-case wording so a
+   * Chinese sentence never carries an English placeholder.
+   */
   persistenceFlushFailed: (detail: string) => string;
   /** `sessions.flush` resolved `false`: no durability listener participated. */
   persistenceNotDurable: string;
@@ -142,9 +146,19 @@ export const REWIND_PERSISTENCE_PREFIX = "rewind-persistence:";
 /**
  * Word a bridge persistence failure for the timeline/user in the given locale.
  *
- * Any other error, and any message the prefix does not cover, returns
+ * Only the three codes this module knows are worded. Any other error, any code
+ * a newer bridge adds, and any message the prefix does not cover return
  * `undefined` so the caller rethrows the original — the bridge's own refusals
- * stay verbatim (they already name the stale anchor, the running turn, etc.).
+ * stay verbatim (they already name the stale anchor, the running turn, etc.),
+ * and an unknown persistence code must not inherit the sentence for a failure
+ * mode this half has never seen.
+ *
+ * All three codes fire **after** the replacement marker was appended: the
+ * in-memory surface is already replaced (`session.append` applies `surfaceOp`
+ * synchronously), and only the durable log write failed. The copy therefore says
+ * the rewind was not written to disk — not that nothing happened. The file layer
+ * and delegated turns are untouched on these paths, because both run after the
+ * flush.
  *
  * @param raw - the bridge's error message, verbatim.
  * @param copy - the locale's rewind copy.
@@ -160,12 +174,19 @@ export function rewindPersistenceFailure(raw: string, copy: RewindCopy): string 
     case "no-session-store":
       return copy.persistenceNoStore;
     case "flush-failed":
-      return copy.persistenceFlushFailed(detail === "" ? "flush failed" : detail);
-    default:
-      // Also the answer for a code a newer bridge adds: "rewind needs a durable
-      // store" is true for every member of this family, and a raw prefix thrown
-      // at the user would be worse than the conservative sentence.
+      return copy.persistenceFlushFailed(detail);
+    case "not-durable":
+      // Explicit, not the `default`: a future bridge code must not silently
+      // inherit this sentence, because "the store persisted nothing" is a
+      // specific claim about `sessions.flush` returning `false`.
       return copy.persistenceNotDurable;
+    default:
+      // A code from a newer bridge is **passed through** (`undefined` → the
+      // caller rethrows the bridge's text) instead of inheriting a sentence that
+      // may describe a different failure. The machine prefix is the only public
+      // shape; guessing a translation for a code this module has never seen is
+      // how a wrong prerequisite reaches the user.
+      return undefined;
   }
 }
 
@@ -193,11 +214,13 @@ export const REWIND_COPY: Readonly<Record<RewindLocale, RewindCopy>> = Object.fr
     filesNoCounts: "Files restored",
     failureTitle: "File rollback incomplete",
     persistenceNoStore:
-      "Rewind needs a durable session store, and this profile composes none (no `sessions` service); nothing was rewound and no files or delegated turns were touched.",
+      "Rewind needs a durable session store, and this profile composes none (no `sessions` service); this rewind was not written to disk (reopening the conversation brings the withdrawn rows back), and no files or delegated turns were touched.",
     persistenceFlushFailed: (detail: string) =>
-      `Rewind needs the replacement marker to reach disk, but flushing the session failed; nothing was rewound and no files or delegated turns were touched (${detail}).`,
+      detail === ""
+        ? "Rewind needs the replacement marker to reach disk, but flushing the session failed; this rewind was not written to disk (reopening the conversation brings the withdrawn rows back), and no files or delegated turns were touched."
+        : `Rewind needs the replacement marker to reach disk, but flushing the session failed; this rewind was not written to disk (reopening the conversation brings the withdrawn rows back), and no files or delegated turns were touched (${detail}).`,
     persistenceNotDurable:
-      "Rewind needs a durable session store (`sessions.flush` must return true), but this profile's store persisted nothing; the rewind was stopped before any file or delegated turn was touched.",
+      "Rewind needs a durable session store (`sessions.flush` must return true), but this profile's store persisted nothing; this rewind was not written to disk (reopening the conversation brings the withdrawn rows back), and no files or delegated turns were touched.",
   }),
   "zh-CN": Object.freeze({
     conversation: "已撤回到这条消息",
@@ -211,11 +234,13 @@ export const REWIND_COPY: Readonly<Record<RewindLocale, RewindCopy>> = Object.fr
     filesNoCounts: "文件已恢复",
     failureTitle: "文件回退未完成",
     persistenceNoStore:
-      "撤回需要持久化的会话存储，但当前 profile 没有会话服务（sessions）；本次未撤回任何内容，文件与子代理均未改动。",
+      "撤回需要持久化的会话存储，但当前 profile 没有会话服务（sessions）；本次撤回没有落盘（重开会话会恢复被撤内容），文件与子代理均未改动。",
     persistenceFlushFailed: (detail: string) =>
-      `撤回需要把替换标记写入磁盘，但会话日志 flush 失败；本次未撤回任何内容，文件与子代理均未改动（${detail}）。`,
+      detail === ""
+        ? "撤回需要把替换标记写入磁盘，但会话日志 flush 失败；本次撤回没有落盘（重开会话会恢复被撤内容），文件与子代理均未改动。"
+        : `撤回需要把替换标记写入磁盘，但会话日志 flush 失败；本次撤回没有落盘（重开会话会恢复被撤内容），文件与子代理均未改动（${detail}）。`,
     persistenceNotDurable:
-      "撤回需要持久化的会话存储（sessions.flush 必须返回 true），但当前 profile 的存储未写入任何持久化后端；已在改动文件与子代理之前停止。",
+      "撤回需要持久化的会话存储（sessions.flush 必须返回 true），但当前 profile 的存储未写入任何持久化后端；本次撤回没有落盘（重开会话会恢复被撤内容），文件与子代理均未改动。",
   }),
 } satisfies Record<RewindLocale, RewindCopy>);
 

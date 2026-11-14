@@ -80,10 +80,12 @@ const {
   REWIND_NOTICE_KIND,
   REWIND_NOTICE_ITEM_ID,
   REWIND_NOTICE_VERSION,
+  REWIND_PERSISTENCE_PREFIX,
   rewindFileCounts,
   rewindNoticeHeadline,
   rewindNoticePayloadSchema,
   rewindNoticeTone,
+  rewindPersistenceFailure,
   rewindSuccessText,
 } = require(path.join(buildDir, "shared", "rewind-notice.js"));
 const {
@@ -240,6 +242,125 @@ async function main() {
     );
     equal("en files no files", rewindSuccessText(en, "files", undefined), "No files changed after this message; nothing to restore");
     equal("en both unreadable counts", rewindSuccessText(en, "both", { restored: "x" }), "Conversation rewound");
+  }
+
+  console.log("persistence failure wording — three bridge codes, both locales");
+  {
+    const zh = REWIND_COPY["zh-CN"];
+    const en = REWIND_COPY.en;
+    // The bridge cannot import this table (it runs in the DSH child and has no
+    // locale), so the machine prefix is duplicated as a literal. A drift would
+    // make every persistence refusal miss this translation and reach the user
+    // as the bridge's raw text.
+    const bridgeSource = fs.readFileSync(path.join(here, "..", "dsh-bridge", "lib", "server.js"), "utf8");
+    equal(
+      "the bridge keeps the same persistence prefix literal",
+      bridgeSource.includes(`'${REWIND_PERSISTENCE_PREFIX}'`),
+      true,
+    );
+
+    // One code, one sentence: the three failures name different prerequisites,
+    // so a shared sentence would send the user to the wrong fix.
+    equal(
+      "zh no-session-store",
+      rewindPersistenceFailure(`${REWIND_PERSISTENCE_PREFIX}no-session-store: this profile composes no sessions service`, zh),
+      zh.persistenceNoStore,
+    );
+    equal(
+      "en no-session-store",
+      rewindPersistenceFailure(`${REWIND_PERSISTENCE_PREFIX}no-session-store: x`, en),
+      en.persistenceNoStore,
+    );
+    equal(
+      "zh flush-failed",
+      rewindPersistenceFailure(`${REWIND_PERSISTENCE_PREFIX}flush-failed: disk full`, zh),
+      zh.persistenceFlushFailed("disk full"),
+    );
+    equal(
+      "en flush-failed",
+      rewindPersistenceFailure(`${REWIND_PERSISTENCE_PREFIX}flush-failed: disk full`, en),
+      en.persistenceFlushFailed("disk full"),
+    );
+    equal(
+      "zh not-durable",
+      rewindPersistenceFailure(`${REWIND_PERSISTENCE_PREFIX}not-durable: sessions.flush() reported no durability listener`, zh),
+      zh.persistenceNotDurable,
+    );
+    equal(
+      "en not-durable",
+      rewindPersistenceFailure(`${REWIND_PERSISTENCE_PREFIX}not-durable: x`, en),
+      en.persistenceNotDurable,
+    );
+
+    // The detail is DSH's own reason, verbatim: a colon must not be parsed as a
+    // second code separator, and a newline must survive so the row can render
+    // the store's multi-line error.
+    const colonDetail = "EACCES: permission denied: /home/u/.dsh/sessions/a.jsonl";
+    equal(
+      "zh flush-failed keeps a colon-bearing detail",
+      rewindPersistenceFailure(`${REWIND_PERSISTENCE_PREFIX}flush-failed: ${colonDetail}`, zh),
+      zh.persistenceFlushFailed(colonDetail),
+    );
+    const newlineDetail = "write failed\nclosing the store";
+    check(
+      "flush-failed keeps a multi-line detail",
+      rewindPersistenceFailure(`${REWIND_PERSISTENCE_PREFIX}flush-failed: ${newlineDetail}`, zh)
+        === zh.persistenceFlushFailed(newlineDetail),
+      JSON.stringify(rewindPersistenceFailure(`${REWIND_PERSISTENCE_PREFIX}flush-failed: ${newlineDetail}`, zh)),
+    );
+
+    // An empty detail is the bridge abstaining, not a reason to splice English
+    // into the Chinese sentence ("…（flush failed）" was exactly that).
+    const emptyZh = rewindPersistenceFailure(`${REWIND_PERSISTENCE_PREFIX}flush-failed`, zh);
+    const blankZh = rewindPersistenceFailure(`${REWIND_PERSISTENCE_PREFIX}flush-failed:   `, zh);
+    check(
+      "zh flush-failed with no detail carries no English placeholder",
+      emptyZh === zh.persistenceFlushFailed("")
+        && blankZh === zh.persistenceFlushFailed("")
+        && !/flush failed/u.test(emptyZh + blankZh),
+      JSON.stringify({ emptyZh, blankZh }),
+    );
+    equal(
+      "en flush-failed with an empty detail",
+      rewindPersistenceFailure(`${REWIND_PERSISTENCE_PREFIX}flush-failed:`, en),
+      en.persistenceFlushFailed(""),
+    );
+
+    // `not-durable` is an explicit case now, and that is observable from the
+    // other side: a code this module has never seen is **passed through**
+    // (`undefined` → the caller rethrows the bridge's text). If the explicit case
+    // went away, `not-durable` would fall into `default` and hit this same
+    // passthrough — the two assertions together pin it.
+    equal(
+      "an unknown code is passed through",
+      rewindPersistenceFailure(`${REWIND_PERSISTENCE_PREFIX}future-code: whatever`, zh),
+      undefined,
+    );
+    equal(
+      "a non-prefixed error is passed through",
+      rewindPersistenceFailure("撤回目标无法解析：该消息不在会话表面上", zh),
+      undefined,
+    );
+    equal(
+      "a lookalike prefix is passed through",
+      rewindPersistenceFailure("rewind-persistence no-session-store: x", zh),
+      undefined,
+    );
+
+    // The wording strength is an assertion, not a copy edit: the bridge appends
+    // the replacement marker *before* it flushes, and `session.append` applies
+    // `surfaceOp` to the in-memory surface immediately
+    // (`harness/revert-shape-probe.mjs` pins that), so "nothing was rewound" is
+    // false on all three paths. They must say the rewind was not written to disk.
+    for (const locale of ["en", "zh-CN"]) {
+      const copy = REWIND_COPY[locale];
+      const sentences = [copy.persistenceNoStore, copy.persistenceFlushFailed("x"), copy.persistenceNotDurable];
+      check(
+        `${locale} persistence copy does not claim the rewind never happened`,
+        sentences.every((sentence) => !/nothing was rewound|未撤回任何内容/u.test(sentence)),
+        sentences.join(" || "),
+      );
+    }
   }
 
   console.log("receipt counts");
