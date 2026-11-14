@@ -1636,8 +1636,9 @@ export class DshSession {
   /**
    * Mirror a roster just learned from a live team tool event into the children.
    *
-   * The parent builder absorbs `spawn_teammate` / `list_agents` synchronously;
-   * the child builders do not see those events, so the teammates panel could
+   * The parent builder absorbs the team tools / `subagent/catalog` synchronously;
+   * the child builders do not see those events (the catalog of a child is written
+   * to the *parent's* log), so the teammates panel could
    * otherwise show English targets on a child's `send_message` row. An empty
    * parent snapshot is "unknown", never evidence that a child has no members.
    */
@@ -3431,9 +3432,15 @@ export class DshSession {
     // one arrival feeds both halves of the feature.
     if (event.type === ASSISTANT_DELTA_EVENT) this.#observeStreamSnapshot(isRecord(event.data) ? event.data : {});
     for (const item of this.#timeline.consume(event)) this.#emitItem(item);
-    // A live `spawn_teammate` / `list_agents` row just taught the parent's
-    // builder a description; mirror it before the next child row is built.
-    if (event.type === "tool/call" || event.type === "tool/result") this.#syncChildRosters();
+    // A live `spawn_teammate` / `list_agents` row (or rc.3's durable
+    // `subagent/catalog` fact) just taught the parent's builder a description;
+    // mirror it before the next child row is built. The catalog is the only
+    // source rc.3 has, and it lands on the root session while the child's
+    // `send_message` row is built by the child's own builder — without this line
+    // a subagent's own messages keep the English target after the changeover.
+    if (event.type === "tool/call" || event.type === "tool/result" || event.type === "subagent/catalog") {
+      this.#syncChildRosters();
+    }
     if (event.type === "assistant/message") {
       const data = isRecord(event.data) ? event.data : {};
       this.#accumulateTotals(data);

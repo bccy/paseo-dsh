@@ -24,9 +24,15 @@
   child 自有名册不被父空快照清空、父非空快照合并而不删除 child 条目、空名册创建的行在
   settle 时被晚到名册替换。2026-11-14 工具失败身份 +11 条（实跑 **265**）：`tool/result.error`
   的 `name`/`code`/`reason` 透传到 `metadata.errorName`/`errorCode`/`errorReason`（空值不带键、
-  成功行不带、不在 detail 上、能过 `ProviderEventSchema.parse`）。**动了 `server/timeline.ts` 的 `todoItems`
-  （含空列表语义）、`server/activity-timeline.ts` 的 goal 轮次分支或 `server/session.ts` 的重放
-  过滤必跑。**
+  成功行不带、不在 detail 上、能过 `ProviderEventSchema.parse`）。2026-11-15 rc.3 名册来源
+  **`subagent/catalog` v3** +9 条（实跑 **274**，旧代码 265 过 / 9 红）：catalog 不出行且给紧跟的
+  `send_message` 行带 `name → 中文 label`、客户端 `labelFor` 中文解读与未知 target 回落、
+  `label` 缺失不写（带正控制，防止"什么都没写"也算过）、显式空串删除并回落、重复 catalog 单条
+  且取最新、非 v3/非字符串字段不抛错不写脏值、**replay 路径**（真实 `replayHistory()` 的历史
+  catalog + send 行）与重放后的 live 行都带中文、**子会话同步**（父侧 catalog 到达后子代理自己
+  的 `send_message` 行带中文）。**动了 `server/timeline.ts` 的 `todoItems`
+  （含空列表语义）、名册吸收（`#absorbRosterEntry` / 团队工具 / `subagent/catalog`）、
+  `server/activity-timeline.ts` 的 goal 轮次分支或 `server/session.ts` 的重放过滤必跑。**
 - `harness/p003-timeline-check.cjs` — 真实 `TimelineBuilder` → `ProviderEventSchema` → 客户端
   渲染数据的端到端：`goal/change`（目标行）与 `tool-workflow/*`（工作流/成员行）的完整快照、
   重复 start 不抹进度、run-end 的终态口径、后台工作流跨回合保持 running、死重放按 canceled
@@ -169,8 +175,10 @@
   `dsh-bridge/lib/image-host-path.js` 给 `tool/result` 的每个图片块**追加** `hostPath`，原有
   字段一个不动；attachments 缺失、`imageHostPath` 抛错（无效 ref 抛 `AttachmentError`）、
   返回非字符串、或事件不是 `tool/result` → **原样返回**。`historyEvents` 把同一规则用在
-  `history()` 的重放投影上（`{type, seq?, time?, data}`）。**动了这个模块、桥的三处注入点或
-  `history()` 的事件投影必跑。**
+  `history()` 的重放投影上（`{type, seq?, time?, data}`）。还精确断言 `REPLAYED_EVENT_TYPES`
+  就是插件会读回的类型集合（**46 条**；2026-11-15 起含 `subagent/catalog`——rc.3 名册在重放
+  路径上的唯一来源，白名单漏掉它，重载插件后的中文名册就静默失效）。**动了这个模块、桥的三处注入点、
+  `history()` 的事件投影或那份重放白名单必跑**（白名单变了要同步 `timeline-check` 的重放断言）。
 - `harness/sweep-check.cjs` — 原生扫光的几何：mask 曲线的停点、阶梯 alpha 的对称性与平铺、
   1.5s/0.3s/2-3 行程、`steps(48)`。**动了 `client/sweep-*.ts` 必跑。** iOS 上跑不了，这些
   数字就是"与 DSH 一致"的唯一凭据。

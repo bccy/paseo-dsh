@@ -47,6 +47,13 @@
  * - A `/command` row printed its own name twice (`/compact · /compact`): the
  *   head already carries `item.name`, so `detail.label` now holds the command's
  *   arguments, the one part of the line the head does not already show.
+ * - The team roster (`metadata.teamRoster`) had no live source on DSH 0.2.2-rc.3:
+ *   the old `spawn_teammate` / `list_agents` JSON is gone (rc.3's `list_agents`
+ *   answers plain text, and the parse failure returned silently), so every
+ *   `send_message` row fell back to its English wire target. The durable
+ *   `subagent/catalog` v3 fact — `{version:3, name, label}` in the **parent's**
+ *   log — is the source now, live, on replay through the bridge whitelist, and
+ *   mirrored into a child's own builder. Malformed facts must write nothing.
  *
  * `harness/plugin-check.cjs` drives the plugin end to end; this drives the
  * builder directly, which is the only way to stage those orderings.
@@ -67,7 +74,7 @@
 "use strict";
 
 const { TimelineBuilder } = require("./server/timeline.js");
-const { rosterFromMetadata } = require("./client/team-roster.js");
+const { rosterFromMetadata, labelFor } = require("./client/team-roster.js");
 /** The same module the builder reads, so the relay can be compared to its source. */
 const { LOCALE } = require("./server/locale.js");
 /**
@@ -2062,6 +2069,309 @@ console.log("\nteam roster on a child session row");
       row?.metadata?.teamRoster?.reviewer === "审查支付（list）"
         && row?.metadata?.teamRoster?.observer === "观察员",
       JSON.stringify(row?.metadata),
+    );
+  }
+
+  console.log("\nteam roster: DSH 0.2.2-rc.3's `subagent/catalog` v3 is the label source");
+  {
+    // The shape measured on rc.3 (session `829f05cd`; one fact per child, all
+    // version 3). `name` is the wire target `send_message` / `interrupt_agent`
+    // address, `label` is the Chinese description the row must show. The old
+    // `spawn_teammate` / `list_agents` JSON path is gone on rc.3 (its
+    // `list_agents` answers plain text lines), so without this fact the roster
+    // stays empty and every row falls back to the English target — silently.
+    //
+    // `drop` removes a key outright, so "absent" is asserted rather than
+    // "present but undefined"; a JSON round trip never produces the latter.
+    const catalog = (overrides = {}, drop = [], seq = 1) => {
+      const data = {
+        version: 3,
+        childId: "a10482c8-d1e6-418a-8325-0c2cb29fcc49",
+        childCreatedAt: 1794682647233,
+        mode: "continuable",
+        label: "删除子代理行第二行短名",
+        name: "impl-oneshot",
+        ...overrides,
+      };
+      for (const key of drop) delete data[key];
+      return { type: "subagent/catalog", seq, data };
+    };
+    const sendRow = (builder, target = "impl-oneshot", seq = 9) =>
+      builder.consume({
+        type: "tool/call",
+        seq,
+        data: { callId: `s-${target}-${seq}`, name: "send_message", arguments: { target, message: "m" } },
+      })[0];
+    const labels = (row) => row?.metadata?.teamRoster;
+
+    // 1. The fact itself is not a row; the next send row carries the label.
+    const live = new TimelineBuilder();
+    const drawn = live.consume(catalog());
+    const row = sendRow(live);
+    check(
+      "a v3 catalog fact draws no row and labels the next send_message row",
+      drawn.length === 0 && labels(row)?.["impl-oneshot"] === "删除子代理行第二行短名",
+      JSON.stringify({ drawn, metadata: row?.metadata }),
+    );
+    // ...and the client's own reader — the half that actually decides the row's
+    // title — resolves the target to it, while an unknown target still degrades
+    // to itself.
+    const roster = rosterFromMetadata(row.metadata);
+    check(
+      "the client reader turns the rc.3 target into its Chinese label",
+      labelFor(roster, "impl-oneshot") === "删除子代理行第二行短名"
+        && labelFor(roster, "row-probe") === "row-probe",
+      JSON.stringify({ known: labelFor(roster, "impl-oneshot"), unknown: labelFor(roster, "row-probe") }),
+    );
+
+    // 2. A fact without a label writes nothing — the target stays the label. The
+    // *with*-label half is the positive control: it is what makes this assertion
+    // fail on the pre-fix builder instead of passing because nothing ever wrote.
+    const withLabel = new TimelineBuilder();
+    withLabel.consume(catalog({}, [], 1));
+    const withoutLabel = new TimelineBuilder();
+    withoutLabel.consume(catalog({}, ["label"], 1));
+    const missingRow = sendRow(withoutLabel);
+    check(
+      "a v3 fact with no label writes no entry (the target stays the label)",
+      labels(sendRow(withLabel))?.["impl-oneshot"] === "删除子代理行第二行短名"
+        && labels(missingRow)?.["impl-oneshot"] === undefined
+        && labelFor(rosterFromMetadata(missingRow.metadata), "impl-oneshot") === "impl-oneshot",
+      JSON.stringify({ withLabel: labels(sendRow(withLabel)), withoutLabel: labels(missingRow) }),
+    );
+
+    // ...and an *explicit* empty string is DSH saying "no description", so a
+    // learned label is dropped (`#absorbRosterEntry`'s existing split) and the
+    // row falls back to the target rather than keeping a stale description.
+    const emptied = new TimelineBuilder();
+    emptied.consume(catalog({}, [], 1));
+    const before = labels(sendRow(emptied, "impl-oneshot", 9));
+    emptied.consume(catalog({ label: "" }, [], 2));
+    const afterRow = sendRow(emptied, "impl-oneshot", 10);
+    check(
+      "an explicitly empty catalog label drops a learned one, back to the target",
+      before?.["impl-oneshot"] === "删除子代理行第二行短名"
+        && labels(afterRow)?.["impl-oneshot"] === undefined
+        && labelFor(rosterFromMetadata(afterRow.metadata), "impl-oneshot") === "impl-oneshot",
+      JSON.stringify({ before, after: labels(afterRow) }),
+    );
+
+    // 3. A same-name fact may arrive again (the catalog is versioned); the
+    // newest non-empty label wins and the map is not duplicated. The valid fact
+    // is the positive control for the malformed ones that follow it.
+    const versions = new TimelineBuilder();
+    versions.consume(catalog({}, [], 1));
+    versions.consume(catalog({ label: "修中文名册失效" }, [], 2));
+    const versioned = sendRow(versions, "impl-oneshot", 11);
+    const entries = Object.entries(labels(versioned) ?? {}).filter(([name]) => name === "impl-oneshot");
+    check(
+      "a repeated catalog fact keeps one entry and takes the newest label",
+      entries.length === 1 && entries[0][1] === "修中文名册失效",
+      JSON.stringify(labels(versioned)),
+    );
+
+    // 4. Unknown versions and malformed fields are ignored: no throw, no row, no
+    // dirty entry. `version: 2` is DSH's older shape (`label` there is the
+    // *name* side of an experimental field set) and `version: "3"` is a string —
+    // neither may be trusted; a non-string `name` must not create a `String()`
+    // target, and a non-string label must not be coerced.
+    const bad = [
+      catalog({ version: 2 }, [], 1),
+      catalog({ version: "3" }, [], 1),
+      catalog({}, ["version"], 1),
+      catalog({ name: 42 }, [], 1),
+      catalog({}, ["name"], 1),
+      catalog({ name: "" }, [], 1),
+      catalog({ label: 7 }, [], 1),
+      catalog({ label: ["x"] }, [], 1),
+    ];
+    let threw = null;
+    let badDrawn = 0;
+    const dirty = [];
+    for (const event of bad) {
+      try {
+        badDrawn += new TimelineBuilder().consume(event).length;
+        const builder = new TimelineBuilder();
+        builder.consume(event);
+        const badRow = sendRow(builder, "impl-oneshot", 1);
+        const entriesHere = Object.keys(labels(badRow) ?? {});
+        if (entriesHere.length > 0) dirty.push({ event: event.data.version, entriesHere });
+        // A taken-over target must still render itself, never a blank head.
+        if (labelFor(rosterFromMetadata(badRow.metadata), "impl-oneshot") !== "impl-oneshot") {
+          dirty.push({ event: event.data.version, label: labelFor(rosterFromMetadata(badRow.metadata), "impl-oneshot") });
+        }
+      } catch (error) {
+        threw = error instanceof Error ? error.message : String(error);
+        break;
+      }
+    }
+    const validControl = new TimelineBuilder();
+    validControl.consume(catalog({}, [], 1));
+    check(
+      "a non-v3 or malformed catalog fact is ignored: no row, no throw, no dirty entry",
+      threw === null && badDrawn === 0 && dirty.length === 0
+        && labels(sendRow(validControl))?.["impl-oneshot"] === "删除子代理行第二行短名",
+      JSON.stringify({ threw, badDrawn, dirty }),
+    );
+  }
+
+  console.log("\nreopen: rc.3 catalog facts in the stored log restore the labels");
+  {
+    const dshProcessModule = require("./server/dsh-process.js");
+    class FakeCatalogProcess {
+      constructor() {
+        this.events = [];
+        this.handlers = undefined;
+      }
+      async start() {}
+      async shutdown() {}
+      async attachSession(_sessionId, handlers) { this.handlers = handlers; }
+      async closeSession() {}
+      async usage() { return { available: false }; }
+      async history() { return { available: true, events: this.events }; }
+      async team() { return { available: false }; }
+      emit(event, sessionId = "roster-catalog-replay") {
+        this.handlers.onEvent({ sessionId, event });
+      }
+    }
+    dshProcessModule.DshProcess = FakeCatalogProcess;
+    const { DshSession } = require("./server/session.js");
+    const fake = new FakeCatalogProcess();
+    // A stored log from rc.3: the catalog fact sits between the turn bracket and
+    // the `send_message` row it labels. This is the path a plugin reload takes
+    // (the fact is durable in the *parent's* log), so it is the regression
+    // sentinel for "the roster survives a restart".
+    fake.events = [
+      { type: "turn/start", seq: 1, data: { turn: 1 } },
+      { type: "subagent/catalog", seq: 2, data: {
+        version: 3,
+        childId: "a10482c8-d1e6-418a-8325-0c2cb29fcc49",
+        childCreatedAt: 1794682647233,
+        mode: "continuable",
+        label: "删除子代理行第二行短名",
+        name: "impl-oneshot",
+      } },
+      { type: "tool/call", seq: 3, data: { callId: "h1", name: "send_message", arguments: { target: "impl-oneshot", message: "m" } } },
+      { type: "tool/result", seq: 4, data: { toolCallId: "h1", message: { content: [{ type: "text", text: '{"sent":true}' }] } } },
+      { type: "turn/end", seq: 5, data: { turn: 1, reason: { kind: "completed" } } },
+    ];
+    const collected = [];
+    const live = new DshSession({
+      sessionId: "roster-catalog-replay",
+      cwd: process.cwd(),
+      env: {},
+      route: { provider: "fixture", model: "alpha" },
+      mode: "build",
+      modes: [],
+      models: [],
+      thinkingOptions: [],
+      emit: (event) => collected.push(event),
+      log() {},
+      acquireProcess: async () => ({ process: fake, reused: false }),
+      releaseProcess: () => {},
+    });
+    await live.open();
+    await live.replayHistory();
+    const sendRows = () =>
+      collected
+        .filter((event) => event.type === "timeline.item" && event.item?.name === "send_message")
+        .map((event) => event.item);
+    const replayed = sendRows().at(-1);
+    check(
+      "a reopened session's replayed send_message row carries the rc.3 label",
+      replayed?.metadata?.teamRoster?.["impl-oneshot"] === "删除子代理行第二行短名"
+        && labelFor(rosterFromMetadata(replayed.metadata), "impl-oneshot") === "删除子代理行第二行短名",
+      JSON.stringify(replayed?.metadata),
+    );
+    // The replay builder's roster is merged into the live one, so a row built
+    // *after* the replay (no catalog of its own) still reads it.
+    fake.emit({ type: "tool/call", seq: 6, data: { callId: "h2", name: "send_message", arguments: { target: "impl-oneshot", message: "m" } } });
+    const afterReplay = sendRows().at(-1);
+    check(
+      "a live send after the replay keeps the rc.3 label",
+      afterReplay?.metadata?.teamRoster?.["impl-oneshot"] === "删除子代理行第二行短名",
+      JSON.stringify(afterReplay?.metadata),
+    );
+  }
+
+  console.log("\nlive catalog fact: a child builder follows the parent roster");
+  {
+    // The catalog is written to the *parent's* log, so a child's own
+    // `send_message` row never sees the event. `#syncChildRosters()` is what
+    // mirrors it — and it used to fire only for `tool/call` / `tool/result`,
+    // which left a subagent's own rows on the English target.
+    const dshProcessModule = require("./server/dsh-process.js");
+    class FakeChildProcess {
+      constructor() {
+        this.handlers = undefined;
+      }
+      async start() {}
+      async shutdown() {}
+      async attachSession(_sessionId, handlers) { this.handlers = handlers; }
+      async closeSession() {}
+      async usage() { return { available: false }; }
+      async history() { return { available: false }; }
+      async team() { return { available: false }; }
+      emit(event, sessionId = "roster-child-sync") {
+        this.handlers.onEvent({ sessionId, event });
+      }
+      openChild(payload) {
+        this.handlers.onChildOpened(payload);
+      }
+    }
+    dshProcessModule.DshProcess = FakeChildProcess;
+    const { DshSession } = require("./server/session.js");
+    const fake = new FakeChildProcess();
+    const collected = [];
+    const live = new DshSession({
+      sessionId: "roster-child-sync",
+      cwd: process.cwd(),
+      env: {},
+      route: { provider: "fixture", model: "alpha" },
+      mode: "build",
+      modes: [],
+      models: [],
+      thinkingOptions: [],
+      subsession: true,
+      emit: (event) => collected.push(event),
+      log() {},
+      acquireProcess: async () => ({ process: fake, reused: false }),
+      releaseProcess: () => {},
+    });
+    await live.open();
+    // The provider marks the root ready once Paseo's session is open; without it
+    // every native child notice is buffered (`#onChildOpened`'s gate).
+    live.markRootReady();
+    fake.openChild({ sessionId: "child-native-1", parentSessionId: "roster-child-sync", mode: "continuable", label: "子代理任务" });
+    const childRow = (target) => {
+      fake.emit({ type: "tool/call", data: {
+        callId: `child-${target}-${collected.length}`,
+        name: "send_message",
+        arguments: { target, message: "m" },
+      } }, "child-native-1");
+      return collected
+        .filter((event) => event.type === "timeline.item" && event.item?.name === "send_message")
+        .map((event) => event.item)
+        .at(-1);
+    };
+    // Before the catalog the child only knows the target…
+    const unlabelled = childRow("impl-oneshot");
+    // …then the parent's rc.3 fact arrives and the next child row carries it.
+    fake.emit({ type: "subagent/catalog", data: {
+      version: 3,
+      childId: "a10482c8-d1e6-418a-8325-0c2cb29fcc49",
+      childCreatedAt: 1794682647233,
+      mode: "continuable",
+      label: "删除子代理行第二行短名",
+      name: "impl-oneshot",
+    } });
+    const labelled = childRow("impl-oneshot");
+    check(
+      "a live catalog fact reaches the child's send_message row",
+      labelFor(rosterFromMetadata(unlabelled?.metadata), "impl-oneshot") === "impl-oneshot"
+        && labelled?.metadata?.teamRoster?.["impl-oneshot"] === "删除子代理行第二行短名"
+        && labelFor(rosterFromMetadata(labelled.metadata), "impl-oneshot") === "删除子代理行第二行短名",
+      JSON.stringify({ unlabelled: unlabelled?.metadata, labelled: labelled?.metadata }),
     );
   }
 

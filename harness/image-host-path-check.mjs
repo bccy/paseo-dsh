@@ -337,6 +337,7 @@ const copyHolds = (extension) => {
     'compaction/start',
     'compaction/summary',
     'subagent/descriptor',
+    'subagent/catalog',
     'tool/call',
     'tool/result',
     'turn/end',

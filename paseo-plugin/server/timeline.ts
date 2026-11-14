@@ -1028,10 +1028,47 @@ export class TimelineBuilder {
   }
 
   /**
+   * `subagent/catalog` v3 is the roster source from DSH 0.2.2-rc.3 on.
+   *
+   * rc.3 hands out members through the subagent directory instead of the old
+   * team tools, so `list_agents` now answers *plain text* lines
+   * (`lead [running] — root agent`) and `spawn_teammate` no longer dispatches
+   * anything. The durable fact that still carries both halves is the parent
+   * log's own `subagent/catalog` event — measured shape on rc.3
+   * (session `829f05cd`, five deliveries, one per child, all version 3):
+   *
+   * ```json
+   * {"version":3,"childId":"…","childCreatedAt":…,"mode":"continuable",
+   *  "label":"删除子代理行第二行短名","name":"impl-oneshot"}
+   * ```
+   *
+   * `name` is the wire target (`send_message` / `interrupt_agent` address it),
+   * `label` is the description the row should show. Only `version === 3` with a
+   * non-empty `name` is read: an unknown version or a malformed payload is
+   * ignored rather than turned into a dirty entry, because `labelFor` already
+   * falls back to the target when no label was learned. The label itself goes
+   * through {@link #absorbRosterEntry} unchanged, so "missing" (keep a known
+   * label) and "explicitly empty" (drop it, fall back) keep their meaning.
+   *
+   * One child may be described more than once (the catalog is versioned); the
+   * same-value check inside {@link #absorbRosterEntry} makes that a no-op
+   * without a second dedupe table.
+   */
+  #absorbCatalogRoster(data: Record<string, unknown>): void {
+    if (data.version !== 3) return;
+    if (typeof data.name !== "string" || data.name === "") return;
+    this.#absorbRosterEntry(data.name, data.label);
+  }
+
+  /**
    * `list_agents` is DSH's roster dump, and `spawn_teammate`'s result carries
    * the member DSH actually created. Both merge into the same per-session map,
    * so a team created during a live session gets its descriptions on the rows
    * that follow.
+   *
+   * Kept for older DSH builds (and `dsh-experimental-agent-team`), which are the
+   * only ones that still answer in JSON here; rc.3 answers `list_agents` in plain
+   * text, and that path is {@link #absorbCatalogRoster}'s job now.
    */
   #absorbToolResultRoster(name: string, output: string, failed: boolean): void {
     if (failed) return;
@@ -1124,6 +1161,12 @@ export class TimelineBuilder {
         return this.#toolCall(data);
       case "tool/result":
         return this.#toolResult(data);
+      // DSH 0.2.2-rc.3's member directory, written to the parent's own log. It
+      // draws no row; it only teaches the roster the rows after it read, live
+      // and on replay (see `#absorbCatalogRoster`).
+      case "subagent/catalog":
+        this.#absorbCatalogRoster(data);
+        return [];
       case "command/run":
         return this.#commandRun(data);
       case "command/done":

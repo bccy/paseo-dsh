@@ -365,8 +365,10 @@ export function withoutAssistantStream(event) {
  *
  * - `TimelineBuilder.consume` (`paseo-plugin/server/timeline.ts`) switches on
  *   `assistant/message`, `tool/call`, `tool/result`, `command/run`,
- *   `command/done`, `compaction/start`, `compaction/summary`, `compaction/end`
- *   and `turn/end`; everything else in its `default:` branch yields zero rows.
+ *   `command/done`, `compaction/start`, `compaction/summary`, `compaction/end`,
+ *   `subagent/catalog` (rc.3's roster fact; it draws no row, it only teaches the
+ *   member labels the rows after it read) and `turn/end`; everything else in
+ *   its `default:` branch yields zero rows.
  * - `DshSession.replayHistory` reads `user/message` itself (for the human's
  *   turns) before delegating the rest to the builder.
  * - `DshSession.replaySubagents` replays each native child's log from this same
@@ -412,6 +414,13 @@ export const REPLAYED_EVENT_TYPES = new Set([
   'turn/start',
   'user/message',
   'subagent/descriptor',
+  // DSH 0.2.2-rc.3's member directory: `{version:3, name, label, …}` in the
+  // PARENT's log, and the only place a `send_message` target's description can
+  // be learned from (the old `spawn_teammate` / `list_agents` JSON does not
+  // exist on rc.3). Without it here, a reopened session replays no roster and
+  // every member row silently falls back to its English wire target — the
+  // replay path is exactly where the plugin gets this fact back after a reload.
+  'subagent/catalog',
 ]);
 
 /**

@@ -8,8 +8,9 @@
  * mapper can see.
  *
  * **It comes from the item's own metadata.** `server/timeline.ts` writes the
- * session's current `name → description` roster (learned from `spawn_teammate` /
- * `list_agents` rows and merged from replay) as
+ * session's current `name → description` roster (learned from DSH's durable
+ * `subagent/catalog` v3 fact from 0.2.2-rc.3 on, and from the older
+ * `spawn_teammate` / `list_agents` rows before it, merged from replay) as
  * `metadata.teamRoster` on the team tool rows that consume it. There is no
  * client-side roster cache: a global `Map` keyed by name would mix two sessions that both have a
  * `reviewer`, and the timeline transformer has no agent id to scope it with

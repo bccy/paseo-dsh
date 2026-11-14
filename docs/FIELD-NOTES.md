@@ -4198,3 +4198,73 @@ refresh / close→reopen 状态是对的。界面不可信，证据打在协议�
 缓存失效时预热会 skip（走首开 spawn，安全）——此前提来自代码路径，未在真机计时复现；
 ③ 「Paseo refresh 走同一 provider 连接」沿用既有池设计与既有用例，未重新抓帧确认，若 refresh
 实际换连接则同连接 adoption 的覆盖面更小，冷启动问题不受影响。
+
+## 第三十三轮：DSH 0.2.2-rc.3 的成员名册搬进 `subagent/catalog`（2026-11-15）
+
+### 107. `send_message` / `interrupt_agent` 行显示英文 wire target：rc.3 的 `list_agents` 改答纯文本，旧 JSON 解析静默 return
+
+**症状**：Paseo 里团队/子代理行的标题显示英文 wire target（如 `row-probe`），而不是成员的
+**中文描述**。不报错、不崩，界面只是"名字不好看"——`client/team-roster.ts` 的 `labelFor`
+对未命中的 target **按设计回落**，所以名册为空时整条链路完全静默。实测会话 `829f05cd` 的
+`send_message` 行即如此。
+
+**根因（rc.3 跟版 `a1677fe` 引入；与 `0a6790a` 回退子代理行第二行无关，那次回退一行没动）**：
+服务端 `timeline.ts` 只从两条**旧版团队工具**学名册：
+
+1. `spawn_teammate` 的输入 `{name, description}`——rc.3 已不参与派发（成员由 subagent 目录提供）；
+2. `list_agents` 的**结果**：`JSON.parse` 后要求是**数组**、每项 `{target, description}`。
+
+而 rc.3 的 `list_agents` 返回的是**纯文本行**（同一会话 3 次调用一致）：
+
+```
+lead [running] — root agent
+impl-oneshot [inactive] — 删除子代理行第二行短名
+row-probe [inactive] — 真机验证用最小子代理
+```
+
+`JSON.parse` 抛错 → `#absorbToolResultRoster` 的 `catch { return; }` **直接返回、不打日志**
+（静默降级）→ 名册永远空 → 每行回落英文 target。
+
+**修法**：改用 DSH 的 durable `subagent/catalog` **v3** 事实——`{version:3, childId,
+childCreatedAt, mode, label, name}`，`name` = wire target、`label` = 中文描述；它写在
+**父会话日志**里，所以重放也能恢复。
+
+- `paseo-plugin/server/timeline.ts`：`#consumeOne` 新增 `case "subagent/catalog"` →
+  `#absorbCatalogRoster`。只接受 `version === 3` 且 `name` 为非空字符串；`label` 交给既有
+  `#absorbRosterEntry`，于是「缺失 = 保留已知」「显式空串 = 删除、回落 target」「同值不重写」
+  三条语义原样生效——同一 child 的 catalog 来多次（版本递增）不会重复写，也不需要另建去重表。
+  版本号不认识或字段形状不对**一律忽略**，不抛错、不写脏值。原 JSON 分支**保留**给老 DSH 与
+  `dsh-experimental-agent-team`（那条路今天仍然有效），只是不再是 rc.3 的来源。
+- `paseo-plugin/server/session.ts`：`#syncChildRosters()` 原先只在 `tool/call` /
+  `tool/result` 触发。catalog 写在**父**日志，子代理自己发的 `send_message` 行走子会话
+  builder，不同步的话子代理行仍是英文 target；事件类型加上 `subagent/catalog`。
+- `dsh-bridge/lib/image-host-path.js`：`REPLAYED_EVENT_TYPES` 加入 `subagent/catalog`。
+  桥的 `history()` 是一份**白名单**投影，不在名单里的事件重放时被静默丢弃——只改插件不改这条，
+  「重载插件后名册不丢」在真机上不成立（离线假进程直接喂事件，会假绿）。桥改了，
+  `bridge-assets.ts` 已用 `node paseo-plugin/scripts/generate-bridge-assets.mjs` 重生成，
+  `harness/image-host-path-check.mjs` 的"精确集合"断言同步加一条。
+
+**验证（离线，2026-11-15）**：
+
+- `harness/timeline-check.cjs` **274/274**（新增 **9 条**）：catalog v3 不出行且给紧跟的
+  `send_message` 行带上 `name → 中文 label`；客户端 `labelFor` 把 target 解读成中文、
+  未知 target 回落自身；`label` 缺失不写条目（带**正控制**：同一形状带 label 时必须写，
+  否则这条在旧代码上会假绿）；显式空串删除已学到的条目并回落 target；同名重复 catalog
+  只留一条且取最新 label；非 v3 / 非字符串字段不抛错、不出行、不写脏值；**replay 路径**
+  （历史日志里的 catalog + `send_message` 喂真实 `replayHistory()`）重放行与重放后的 live 行
+  都带中文；**子会话同步**（live catalog 后子代理自己的 `send_message` 行带中文）。
+  **先红后绿**：同一份新断言在 `1b4c914` 的旧代码上 **265 过 / 9 红**（一次性 worktree
+  编译旧源码 + 新 harness），新代码 **274 过 / 0 红**。
+- 同时全绿：`tsc --noEmit` exit 0；`tool-call-check` 854/854；`subagent-check.cjs` 131/131
+  （动了 `session.ts`）；`bridge-assets-check` 2/2；`image-host-path-check` 46/46；
+  `plugin-check.cjs` 40/40（隔离 `DSH_HOME`，首行 `isolated`）与 `--self-test` 通过。
+
+**未验证 / 边界**：① **真机界面未复验**——「重载插件后行标题变中文」由用户做，本轮禁止
+reload / daemon restart；② rc.3 之前的 DSH 仍走旧 JSON 分支，新断言只覆盖 rc.3 形状，
+没有版本矩阵实测；③ `subagent/catalog` 确实出现在 `paseo/history` 里只有离线断言
+（白名单 + 假进程），真实 reopen 的抓帧未做；④ 旧 JSON 分支对 rc.3 的纯文本结果仍然
+**静默无视**（不打日志）——现在那是"形状不匹配的预期"，但名册一旦再次失去来源，日志里
+同样查不到线索；⑤ 本轮 `plugin-check` 曾误用继承的 `DSH_HOME=~/.dsh` 跑了一次（首行
+`explicit DSH_HOME`，因 live daemon 独占 profile 端口而超时失败），期间 `ensurePaseoProfile()`
+把新的内嵌桥写进了 `~/.dsh/profiles/node_modules/dsh-paseo-bridge`（生成物，内容与仓库一致）；
+改隔离 home 后 40/40 通过。
