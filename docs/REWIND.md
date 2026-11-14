@@ -87,7 +87,8 @@ Paseo 撤回按钮
 - **怎么自查**：
   1. `dsh --profile <name> --dump-config`（只读）看组合里有没有会话持久化那一行；
   2. 试撤回一次：收到上面那句提示即为本节场景；
-  3. 桥的 stderr 同时留有日志，插件消息里的 detail 与它同源。
+  3. 失败原因在插件的错误消息里原样带出（`flush-failed:<DSH 原因>` / `no-session-store` /
+     `not-durable`）；桥不另写 stderr，`detail` 就是桥抛出的原因原文。
 
 ### 重放折叠：只折撤回缝
 

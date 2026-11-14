@@ -4285,15 +4285,15 @@ preset，但这一轮对话实际跑在创建时的旧 preset 上；重开会话
 `agentPreset` 头没有变）。
 
 **窗口 / 根因（`dsh-bridge/lib/server.js`）**：`createSession` 在**创建之前**读一次队列
-（`:5308` 新会话 / `:5375` 恢复分支），把解析出的 id 通过 `setup` 挂进
-`ctx.agents.create` / `agents.resume`；而会话记录到 `:5478` 的 `this.sessions.set` 才发布。
+（`:5310` 新会话 / `:5377` 恢复分支），把解析出的 id 通过 `setup` 挂进
+`ctx.agents.create` / `agents.resume`；而会话记录到 `:5480` 的 `this.sessions.set` 才发布。
 `setPreset` 只在 `this.sessions.get(sessionId) === undefined` 时入队
-（`:2068`–`:2073`），所以这中间到达的 configure 会**写进 `pendingPresets`**——但
+（`:2070`–`:2075`），所以这中间到达的 configure 会**写进 `pendingPresets`**——但
 `createSession` 已经读完了，不会再消费它。
 
 `pendingPresets` 在这条路径上不会因为"已应用"被删（只有 `resolvePreset` 的两种终态失败、
 `closeSession` 的 `#forgetSessionState` 会删），而 `currentPreset()` 又**优先**读它
-（`:1973`）——于是：
+（`:1975`）——于是：
 - 回执/preset 查询用的是队列里的新 id；
 - 真正 compose 的是创建时的旧 id，且没有为这个晚到的 id 追加
   `agent-preset/selected`（`resumeSetup` 的 `fellBack` 分支会追加，这里没有）；
@@ -4307,7 +4307,7 @@ preset，但这一轮对话实际跑在创建时的旧 preset 上；重开会话
 理论上的单指令；但 Paseo 侧的 preset 切换通常在会话打开后才可点，且我没有复现记录，所以
 按**低概率、推断可达**记，不作为已确认缺陷。
 
-**修法草案（照抄 `pendingPlanMode` 范式，约 10 行，`:5429`–`:5475` 是正确范式）**：在
+**修法草案（照抄 `pendingPlanMode` 范式，约 10 行，`:5431`–`:5477` 是正确范式）**：在
 `ctx.agents.create` / `agents.resume` 返回之后、`this.sessions.set` 之前重新读队列，若与
 实际挂上的 id 不同，用 `setPreset` 同样的 `presets.select(handle.agent, lateId)` 立刻补上
 （该 API 在首个回合开始前可用，正是 `setPreset` 的适用范围），并追加一条

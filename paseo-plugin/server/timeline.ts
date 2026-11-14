@@ -764,11 +764,6 @@ function toolDetail(name: string, input: Record<string, unknown>, output?: strin
     case "subagent":
       return {
         type: "sub_agent",
-        // The row's head is `description || subAgentType`
-        // (`client/tool-call-data.ts`), and a DSH `subagent` call need not carry
-        // a description — without this the head was empty. The client's own
-        // label table cannot fill it, because this half writes the detail.
-        subAgentType: UI.toolLabels.subagent,
         ...(stringField(input, "description") === undefined
           ? {}
           : { description: stringField(input, "description") as string }),

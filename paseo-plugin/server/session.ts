@@ -3627,9 +3627,11 @@ export class DshSession {
    * (`assistant/message` event time minus this first token), because the last
    * streamed chunk is not the end of decoding — the message settles after it.
    *
-   * A snapshot without timings (a bridge that predates them, or a route that
-   * never streamed) leaves the window unset, and {@link #emitStreamStats} then
-   * reports no row rather than inventing one.
+   * A snapshot without timings (a bridge that predates them) leaves only the
+   * live side unset: the durable `assistant/message` still supplies the decode
+   * window and the settle time, so a route that never streamed still gets a row.
+   * Only `firstTokenMs` can be missing, and {@link #emitStreamStats} omits it
+   * rather than inventing one.
    */
   #observeStreamSnapshot(data: Record<string, unknown>): void {
     const turn = typeof data.turn === "number" ? data.turn : undefined;
