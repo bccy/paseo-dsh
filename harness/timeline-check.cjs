@@ -2065,6 +2065,79 @@ console.log("\nteam roster on a child session row");
     );
   }
 
+  console.log("a failed tool's error identity rides on metadata, only when DSH sends it");
+  {
+    // DSH's `tool/result` carries `error?: {name, code, reason?}` — the same
+    // shape on rc.1 and rc.3. The row must relay it on `metadata`, not on the
+    // detail: `ProviderEventSchema.parse` strips unknown detail fields at the
+    // plugin process boundary (asserted below), so a detail copy would never
+    // reach Paseo. `reason` is DSH's raw user-facing detail, which the client
+    // only prints when the result text is empty.
+    const fail = (error, isError = true) => {
+      const builder = new TimelineBuilder({ warn: (line) => warnings.push(line) });
+      builder.consume({
+        type: "tool/call",
+        seq: 1,
+        data: { callId: "f1", name: "bash", arguments: { command: "ls" } },
+      });
+      return builder
+        .consume({
+          type: "tool/result",
+          seq: 2,
+          data: {
+            toolCallId: "f1",
+            message: { content: [{ type: "text", text: "Error: tool failed" }], ...(isError ? { isError: true } : {}) },
+            ...(error === undefined ? {} : { error }),
+          },
+        })
+        .find((item) => item.type === "tool_call");
+    };
+
+    const row = fail({ name: "ApprovalError", code: "APPROVAL_REJECTED", reason: 'the user rejected tool "bash"' });
+    check("the code lands on metadata", row?.metadata?.errorCode === "APPROVAL_REJECTED", JSON.stringify(row?.metadata));
+    check("the error class lands on metadata", row?.metadata?.errorName === "ApprovalError", JSON.stringify(row?.metadata));
+    check(
+      "the raw reason lands on metadata",
+      row?.metadata?.errorReason === 'the user rejected tool "bash"',
+      JSON.stringify(row?.metadata),
+    );
+    check("the row still fails", row?.status === "failed");
+    check(
+      "and the identity is not on the detail",
+      row?.detail !== null && !("code" in row.detail) && !("name" in row.detail) && !("reason" in row.detail),
+      JSON.stringify(row?.detail),
+    );
+
+    // Empty values are omitted keys, not empty strings: the client's "no
+    // identity" state is the missing key, so a daemon that sends fewer fields
+    // cannot look like it sent empty ones.
+    const codeOnly = fail({ code: "UNKNOWN_TOOL" });
+    check("no name → no errorName key", !("errorName" in (codeOnly?.metadata ?? {})), JSON.stringify(codeOnly?.metadata));
+    check("no reason → no errorReason key", !("errorReason" in (codeOnly?.metadata ?? {})), JSON.stringify(codeOnly?.metadata));
+    check("…the code is still there", codeOnly?.metadata?.errorCode === "UNKNOWN_TOOL");
+    const allEmpty = fail({ code: "", name: "", reason: "" });
+    check(
+      "empty strings add no identity keys at all",
+      !("errorCode" in allEmpty.metadata) && !("errorName" in allEmpty.metadata) && !("errorReason" in allEmpty.metadata),
+      JSON.stringify(allEmpty.metadata),
+    );
+    // Only a failed row gets the identity, even if a dirty payload sends one:
+    // a completed item must never be dressed up as a failure.
+    const successWithError = fail({ code: "APPROVAL_REJECTED" }, false);
+    check(
+      "a completed row carries no identity",
+      !("errorCode" in successWithError.metadata),
+      JSON.stringify(successWithError.metadata),
+    );
+
+    const parsed = ProviderEventSchema.parse({ type: "timeline.item", sessionId: "s1", item: row });
+    check(
+      "the identity survives ProviderEventSchema.parse",
+      parsed.item.metadata?.errorCode === "APPROVAL_REJECTED" && parsed.item.metadata?.errorName === "ApprovalError",
+      JSON.stringify(parsed.item.metadata),
+    );
+  }
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 })().catch((error) => {

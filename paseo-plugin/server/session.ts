@@ -292,6 +292,92 @@ const CHILD_BUFFER_LIMIT = 2000;
 const CHILD_LABEL_WAIT_EVENTS = 40;
 
 /**
+ * Held child frames after which a label-only notice opens without its name.
+ *
+ * DSH 0.2.2-rc.2+ names a child in the **parent's** `subagent/catalog` v3 fact,
+ * which arrives 10-20 ms *after* the child's own `subagent/descriptor` (label).
+ * The bridge opens the child on the descriptor, and Paseo's title/description are
+ * sticky at the first `attachChild`, so an announcement made then can never gain
+ * the name. The plugin owns that single `session.opened` — holding it for the
+ * catalog is the only place the gap can be closed — but the hold must be bounded:
+ * once this many of the child's own frames have arrived, a name that has not
+ * shown up by then is not coming in time, and a visible row beats a perfect one.
+ * Eight is chosen against the measured gap: the catalog lands before the child's
+ * first frame in every real capture, so the bound is never the path taken; it
+ * only stops a lost/late catalog event from parking a row.
+ */
+const CHILD_NAME_WAIT_EVENTS = 8;
+
+/**
+ * Hard cap for the same wait, wall-clock.
+ *
+ * A count bound cannot fire for a child that emits nothing after its descriptor,
+ * and "wait for `CHILD_NAME_WAIT_EVENTS` frames" would then hide the row until the
+ * bridge's own 500-frame `CHILD_BUFFER_CAP`. 750 ms is far above the measured
+ * 10-20 ms catalog gap and far below any human-noticeable delay for a row that
+ * has just started.
+ */
+const CHILD_NAME_WAIT_MS = 750;
+
+/**
+ * Title and description Paseo shows for one native child row.
+ *
+ * The single rule both child paths go through — the live `#onChildOpened` route
+ * and the open-time replay (`replaySubagents`).
+ *
+ * **Why the title is the identity, not the label.** Paseo's host does not show
+ * `title` first: its subagent track renders `label = description ?? title` as the
+ * row's first line and `subtitle = description ? title : null` as the muted
+ * facts line under it (`packages/app/src/subagents/track-presentation.ts:40-64`,
+ * and the installed 0.16.0-beta.2 web bundle has the same rule verbatim). So the
+ * only way to keep the task description on the first line — where it has always
+ * been — is to put the label in `description` and DSH's identity (`path`, else
+ * the child's `name`) in `title`. The first shape below is therefore: title =
+ * identity, description = label. Both fields are captured together at the
+ * host's first `attachChild` and are equally sticky afterwards (`stickyField`
+ * in `provider-subagents/store.js`), so a live notice that only knows `name`
+ * keeps `name` as the title and a later reopen may upgrade it to the full path —
+ * never the other way around in one generation.
+ *
+ * - identity present and label non-empty: `title = identity`, `description = label`
+ *   → first line = task label (unchanged), second line = short name / path.
+ * - identity present, label empty: `title = identity`, no `description` — a named
+ *   row is better than a row stuck on "加载中…".
+ * - no identity (DSH ≤ 0.2.2-rc.1, historical rows): `title = label`, no
+ *   `description` — exactly the pre-existing shape, field for field.
+ * - `title === description`: the description is omitted, because the host does
+ *   not de-duplicate and would draw the same text twice.
+ *
+ * A missing identity is **never** backfilled from the label and the label is
+ * never backfilled from an identity: a task description is not a name, and
+ * making an rc.1 tree look named would turn a later upgrade into a silent change
+ * of what the user sees. Absent and empty mean the same thing; non-string values
+ * are treated as absent, never coerced, because the bridge logs and drops them
+ * on its side and this function must stay safe for a bridge from another version.
+ *
+ * @param input - the child's durable identity fields; any of them may be missing.
+ * @returns the `session.opened` fields to spread; unknown keys are omitted.
+ */
+export function childIdentity(input: {
+  label?: string;
+  name?: string;
+  path?: string;
+}): { title?: string; description?: string } {
+  const usable = (value: unknown): string | undefined =>
+    typeof value === "string" && value !== "" ? value : undefined;
+  const label = usable(input.label);
+  const identity = usable(input.path) ?? usable(input.name);
+  const title = identity ?? label;
+  const description = identity === undefined || label === undefined || label === identity
+    ? undefined
+    : label;
+  return {
+    ...(title === undefined ? {} : { title }),
+    ...(description === undefined ? {} : { description }),
+  };
+}
+
+/**
  * How long `interrupt()` waits for the bridge to acknowledge a cancel.
  *
  * Paseo's run ledger is event-driven: a replace first asks the provider to stop
@@ -667,6 +753,30 @@ export class DshSession {
     | { kind: "status"; sessionId: string; status: string }
   > = [];
   /**
+   * Child names learned from the parent's durable `subagent/catalog` v3 facts.
+   *
+   * The catalog is the only source of a live child's name on 0.2.2-rc.2+; the
+   * child's own `subagent/descriptor` deliberately carries none. Kept after a
+   * notice opens so a later replay/skip open of the same child can use it too.
+   */
+  readonly #childNames = new Map<string, string>();
+  /**
+   * Timers bounding the name wait for held child notices, keyed by native id.
+   *
+   * One per child, cleared when the notice opens or is dropped, so a session
+   * close cannot leave a timer holding the event loop or a flush after close.
+   */
+  #nameTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * Children whose name wait already ran out on the wall-clock cap.
+   *
+   * The cap has to outlive the timer itself: a flush recomputes "may this notice
+   * still wait?" from the child's buffered frames, and a child with fewer than
+   * `CHILD_NAME_WAIT_EVENTS` frames would answer "yes" forever. Remembering the
+   * expiry is what makes the timer's decision stick.
+   */
+  readonly #nameExpired = new Set<string>();
+  /**
    * Children whose stored history is being replayed (read + open + replay).
    *
    * Their frames can arrive during the history round trip, before the child view
@@ -829,6 +939,7 @@ export class DshSession {
         }
         this.#closed = true;
         clearTimeout(this.#usageRefreshTimer);
+        this.#clearNameWaits();
         this.#clearUsageReplays();
         this.#options.emit({
           type: "session.runtime_failed",
@@ -1527,11 +1638,30 @@ export class DshSession {
    * `running` overlaid (T3).
    *
    * DSH's projection is durable state only. Running is this session's own
-   * knowledge: the Lead row is this root's turn state; a teammate row is the
-   * child session this root hosts under the same DSH session id, and only once
-   * a live frame has proved it is hosted here. A member this process cannot see
-   * gets **no** `running` key — the client then shows no 运行中/空闲 at all.
-   * Validation of DSH's shape is the provider's (`shared/team.ts`).
+   * knowledge: a teammate row is the child session this root hosts under the
+   * same DSH session id, and only once a live frame has proved it is hosted
+   * here. A member this process cannot see gets **no** `running` key — the
+   * client then shows no 运行中/空闲 at all.
+   *
+   * **Both generations of the wire view are handled** (`shared/team.ts`):
+   *
+   * - `dsh-experimental-agent-team` (DSH ≤ 0.2.1) carries the roster inside the
+   *   projection (`{members, tasks}`); this method only overlays `running`.
+   * - `dsh-agent-team` (DSH 0.2.2-rc.2+) carries no roster — its own projection
+   *   comment defers to the `subagentCatalog` projection. The roster is
+   *   therefore derived here from the Lead's **continuable direct children**
+   *   (the model-facing rule in `dsh-tool-subagent-control/src/list-agents.ts`
+   *   omits every non-continuable row, and DSH's subagent panel draws one level
+   *   per catalog), with `name` as the row's only identity — the same key
+   *   `SubagentHeaderLineage.tsx` uses (`entry.name ?? entry.id`). No `phase` is
+   *   emitted: that generation expresses it for historical roster records only,
+   *   and inventing `active` would be the same silent degradation as inventing
+   *   `running`.
+   *
+   * A catalog read that fails is **not** an empty roster: it answers a transient
+   * `rpc_failed`, so the pill keeps its last board instead of claiming a team
+   * whose members could not be listed. Validation of DSH's shape is the
+   * provider's (`shared/team.ts`).
    */
   async team(): Promise<DshTeam> {
     if (this.#closed) return { available: false, error: { code: "session_missing" } };
@@ -1544,15 +1674,74 @@ export class DshSession {
       return { available: false, error: { message: messageOf(error), code: "rpc_failed" } };
     }
     if (!result.available || result.team === null || typeof result.team !== "object") return result;
-    const members = (result.team as { members?: unknown }).members;
-    if (!Array.isArray(members)) return result;
-    const overlaid = members.map((member: unknown) => {
-      if (typeof member !== "object" || member === null) return member;
-      const row = member as { id?: unknown; role?: unknown };
-      const running = row.role === "lead" ? this.#turnStarted && this.#turnId !== null : typeof row.id === "string" ? this.#children.get(row.id)?.running : undefined;
-      return running === undefined ? member : { ...row, running };
-    });
-    return { ...result, team: { ...(result.team as object), members: overlaid } };
+    const projection = result.team as Record<string, unknown>;
+    // The older generation: the roster is part of the projection.
+    if (!("enabled" in projection)) {
+      const members = projection.members;
+      if (!Array.isArray(members)) return result;
+      const overlaid = members.map((member: unknown) => {
+        if (typeof member !== "object" || member === null) return member;
+        const row = member as { id?: unknown; role?: unknown };
+        const running = row.role === "lead" ? this.#turnStarted && this.#turnId !== null : typeof row.id === "string" ? this.#children.get(row.id)?.running : undefined;
+        return running === undefined ? member : { ...row, running };
+      });
+      return { ...result, team: { ...projection, members: overlaid } };
+    }
+    // The newer generation: the roster is the Lead's continuable direct children.
+    //
+    // **Read the catalog only when the board is drawable**: `enabled === true`
+    // and at least one task. The roster feeds nothing else — the pill's rule
+    // requires both (`client/team-polling.ts`'s `teamPillVisible`, which is
+    // `enabled && tasks.length > 0`), so when either is missing no surface draws
+    // a member and the read buys nothing. The decision uses the projection's own
+    // two fields; it does not consult that client module.
+    //
+    // The read is not cheap and must not land on sessions that never used a
+    // team: the bridge's `paseo/subagents` calls `sessionPersistence.list()`
+    // (every stored session header) before answering, and the pill feed reads
+    // every watched agent every four seconds. rc.3's base composes `agent-team`
+    // for every session, so without this gate the cost would follow all of them.
+    //
+    // A malformed `tasks` (not an array) is not a reason to read either: the
+    // provider's union reports the shape as `rpc_failed`.
+    if (projection.enabled !== true || !Array.isArray(projection.tasks) || projection.tasks.length === 0) {
+      return { ...result, members: [] };
+    }
+    let listing: Awaited<ReturnType<DshProcess["subagents"]>>;
+    try {
+      // Read-only: the roster read must not replay held child frames or record
+      // edges on every four-second feed read (see `DshProcess.subagents`).
+      listing = await process.subagents(this.#dshSessionId, { register: false });
+    } catch (error) {
+      return { available: false, error: { message: messageOf(error), code: "rpc_failed" } };
+    }
+    if (!listing.available) {
+      return {
+        available: false,
+        error: { message: listing.error?.message ?? "the runtime could not read this session's subagent catalog", code: "rpc_failed" },
+      };
+    }
+    const members: Array<{
+      id: string;
+      name: string;
+      role: "teammate";
+      description?: string;
+      running?: boolean;
+    }> = [];
+    for (const row of listing.subagents) {
+      if (row.archived === true) continue;
+      if (row.parentSessionId !== this.#dshSessionId) continue;
+      if (row.mode !== "continuable") continue;
+      const running = this.#children.get(row.sessionId)?.running;
+      members.push({
+        id: row.sessionId,
+        name: row.name ?? row.sessionId,
+        role: "teammate",
+        ...(row.label === undefined ? {} : { description: row.label }),
+        ...(running === undefined ? {} : { running }),
+      });
+    }
+    return { ...result, members };
   }
 
   /**
@@ -1932,6 +2121,13 @@ export class DshSession {
         parentSessionId: string;
         mode?: string;
         label?: string;
+        /**
+         * DSH 0.2.2-rc.2+ identity of the child (`paseo/subagents` rows): its own
+         * name, and its root-relative slash path when every level is named.
+         * Absent on older builds and for historical rows.
+         */
+        name?: string;
+        path?: string;
         /** Archived in DSH's own registry: replaying it would resurrect it. */
         archived?: boolean;
       }>;
@@ -2054,11 +2250,16 @@ export class DshSession {
         // the only one it can ever have, and opening without one leaves Paseo
         // showing "加载中…" forever.
         const label = row.label ?? labelFromHistory(history.events);
+        // The replay carries the same identity fields as a live notice, so a
+        // reopened conversation shows the same title/description pair the live
+        // path produced (`childIdentity` is the one rule both go through).
         const child = this.#openChildNow({
           sessionId: row.sessionId,
           parentSessionId: row.parentSessionId,
           ...(row.mode === undefined ? {} : { mode: row.mode }),
           ...(label === undefined ? {} : { label }),
+          ...(row.name === undefined ? {} : { name: row.name }),
+          ...(row.path === undefined ? {} : { path: row.path }),
         });
         if (child === undefined) {
           this.#options.log(`subagent ${row.sessionId} has an unresolved parent ${row.parentSessionId}`);
@@ -2158,6 +2359,7 @@ export class DshSession {
 
   /** Drop held frames of a child that will not be opened. */
   #dropBufferedChild(nativeId: string): void {
+    this.#clearNameWait(nativeId);
     this.#pendingOpened = this.#pendingOpened.filter((payload) => payload.sessionId !== nativeId);
     this.#pendingChildEvents = this.#pendingChildEvents.filter((item) => item.sessionId !== nativeId);
   }
@@ -2758,6 +2960,7 @@ export class DshSession {
     this.#cancelTurnLocally();
     this.#closed = true;
     clearTimeout(this.#usageRefreshTimer);
+    this.#clearNameWaits();
     this.#clearUsageReplays();
     const process = this.#process;
     this.#process = undefined;
@@ -2994,6 +3197,9 @@ export class DshSession {
 
   /** Create and open a native child whose parent is already known. */
   #openChildNow(payload: DshChildOpened): DshChildSession | undefined {
+    // The wait ends here, whichever way it ended: a timer that outlived the open
+    // would only log a stale line and flush an empty buffer.
+    this.#clearNameWait(payload.sessionId);
     const existing = this.#children.get(payload.sessionId);
     if (existing !== undefined) {
       if (!existing.opened) {
@@ -3004,6 +3210,21 @@ export class DshSession {
     }
     const parentScoped = this.#parentScopedId(payload.parentSessionId);
     if (parentScoped === undefined) return undefined;
+    // One rule for both paths: DSH's name/path (0.2.2-rc.2+) titles the row and
+    // the creation label becomes its second line — the host paints `description`
+    // first, so this is what keeps the task text on the first line. Missing on
+    // older builds and historical rows, which yields exactly the title=label
+    // shape that existed before.
+    // `#childNames` is the catalog fact recorded while this notice was held: on a
+    // live 0.2.2-rc.2+ child the name is never in the notice itself, it arrives in
+    // the parent's catalog a few milliseconds later.
+    const identity = childIdentity({
+      ...(payload.label === undefined ? {} : { label: payload.label }),
+      ...(payload.name !== undefined || this.#childNames.has(payload.sessionId)
+        ? { name: payload.name ?? this.#childNames.get(payload.sessionId) }
+        : {}),
+      ...(payload.path === undefined ? {} : { path: payload.path }),
+    });
     const child = new DshChildSession({
       // Scoped by Paseo's stable agent id, not by the root provider session id:
       // a plugin reload re-mints the latter for the same agent, and Paseo keys
@@ -3020,7 +3241,7 @@ export class DshSession {
       nativeId: payload.sessionId,
       subsession: this.#subsession,
       cwd: payload.cwd ?? this.#options.cwd,
-      ...(payload.label === undefined ? {} : { title: payload.label }),
+      ...identity,
       closed: () => this.#closed,
       emit: (event) => this.#options.emit(event),
       log: (line) => this.#options.log(line),
@@ -3060,7 +3281,10 @@ export class DshSession {
     if (
       !this.#rootReady ||
       this.#parentScopedId(payload.parentSessionId) === undefined ||
-      (payload.label === undefined && !this.#labelWaitExceeded(payload.sessionId))
+      (payload.label === undefined && !this.#labelWaitExceeded(payload.sessionId)) ||
+      // A live notice without identity waits (bounded) for the parent catalog's
+      // name: Paseo's title/description are captured once, at this announcement.
+      this.#awaitsName(payload)
     ) {
       this.#bufferOpened(payload);
       return;
@@ -3090,6 +3314,9 @@ export class DshSession {
     if (this.#pendingOpened.some((held) => held.sessionId === payload.sessionId)) return;
     this.#trimChildBuffer();
     this.#pendingOpened.push(payload);
+    // A child held only for its name gets a hard cap: a count bound can never
+    // fire for a child that emits nothing after its descriptor.
+    this.#scheduleNameWait(payload);
   }
 
   /** How many events are already waiting for one held child. */
@@ -3102,6 +3329,100 @@ export class DshSession {
   /** Whether a label-less child has waited long enough to be opened without one. */
   #labelWaitExceeded(nativeId: string): boolean {
     return this.#heldEventCount(nativeId) >= CHILD_LABEL_WAIT_EVENTS;
+  }
+
+  /**
+   * Whether a held child notice may still wait for its catalog name.
+   *
+   * Only a live notice from a names-capable bridge can gain anything by waiting:
+   * a `listed` child already carries whatever DSH knows, a notice that has an
+   * identity needs nothing, and a bridge without `subagentNames` (0.2.2-rc.1 and
+   * older, or a profile with no subagent service) never sends one — waiting there
+   * would delay every child for nothing.
+   */
+  #isNameWaiting(payload: DshChildOpened): boolean {
+    if (this.#process?.subagentNames !== true) return false;
+    if (payload.listed === true) return false;
+    if (typeof payload.name === "string" && payload.name !== "") return false;
+    if (typeof payload.path === "string" && payload.path !== "") return false;
+    if (this.#childNames.has(payload.sessionId)) return false;
+    return !this.#nameExpired.has(payload.sessionId);
+  }
+
+  /**
+   * Whether a held notice should still be withheld from Paseo.
+   *
+   * Two independent conditions, deliberately kept apart: the notice is still
+   * *eligible* to wait (capability, origin, identity not known yet), and the
+   * frame bound has not been reached. Collapsing them into one predicate made
+   * {@link #openIfNameWaitExceeded} dead code — "still waiting" already implied
+   * "fewer than the bound frames", so the count path could never fire a flush and
+   * the only exit was the wall-clock timer.
+   */
+  #awaitsName(payload: DshChildOpened): boolean {
+    return this.#isNameWaiting(payload) && this.#heldEventCount(payload.sessionId) < CHILD_NAME_WAIT_EVENTS;
+  }
+
+  /** Start the wall-clock safety net for one held child's name wait. */
+  #scheduleNameWait(payload: DshChildOpened): void {
+    if (!this.#awaitsName(payload) || this.#nameTimers.has(payload.sessionId)) return;
+    const timer = setTimeout(() => {
+      this.#nameTimers.delete(payload.sessionId);
+      if (this.#closed) return;
+      // Remember the expiry: a flush recomputes the gate from frame counts, and a
+      // quiet child would otherwise look like it may still wait.
+      this.#nameExpired.add(payload.sessionId);
+      this.#options.log(
+        `subagent ${payload.sessionId} has no catalog name after ${CHILD_NAME_WAIT_MS}ms; opening it with its label`,
+      );
+      this.#flushPendingChildren();
+    }, CHILD_NAME_WAIT_MS);
+    // A visibility safety net must never keep the process alive by itself.
+    timer.unref?.();
+    this.#nameTimers.set(payload.sessionId, timer);
+  }
+
+  /** Stop any name wait for a child that is opening or being dropped. */
+  #clearNameWait(nativeId: string): void {
+    const timer = this.#nameTimers.get(nativeId);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      this.#nameTimers.delete(nativeId);
+    }
+    this.#nameExpired.delete(nativeId);
+  }
+
+  /** Drop every pending name wait (session close, runtime failure). */
+  #clearNameWaits(): void {
+    for (const timer of this.#nameTimers.values()) clearTimeout(timer);
+    this.#nameTimers.clear();
+    this.#nameExpired.clear();
+  }
+
+  /**
+   * Record one child's name from the parent's durable `subagent/catalog` fact.
+   *
+   * Catalog v3 (0.2.2-rc.2+) is the only live source of a child's name — the
+   * child's own `subagent/descriptor` deliberately carries none — and it reaches
+   * the plugin a few milliseconds after the child's `session.child-opened`. A
+   * malformed fact is ignored rather than coerced (the bridge already drops and
+   * logs a non-string name on its side). A held notice for that child is
+   * re-evaluated immediately.
+   *
+   * @param event - any session's `subagent/catalog` event: the one belonging to the
+   *   child's creator (the root for a direct child, its parent child session for a
+   *   grandchild).
+   */
+  #observeCatalogName(event: { type: string; data?: unknown; [key: string]: unknown }): void {
+    const data = isRecord(event.data) ? event.data : {};
+    const childId = typeof data.childId === "string" && data.childId !== "" ? data.childId : undefined;
+    const name = typeof data.name === "string" && data.name !== "" ? data.name : undefined;
+    if (childId === undefined || name === undefined) return;
+    if (!this.#childNames.has(childId)) {
+      this.#childNames.set(childId, name);
+      this.#options.log(`subagent ${childId} is named ${name} in the parent catalog`);
+    }
+    this.#flushPendingChildren();
   }
 
   /** Attach a late label to a held notice and try to open it. */
@@ -3123,6 +3444,26 @@ export class DshSession {
     // descriptor left the child unopened — its output buffered, then dropped at
     // CHILD_BUFFER_LIMIT, with nothing said.
     this.#openIfLabelWaitExceeded(item.sessionId);
+    // The name bound is frame-counted for the same reason, and the same frame may
+    // be the one that proves a catalog event is not coming in time.
+    this.#openIfNameWaitExceeded(item.sessionId);
+  }
+
+  /** Open a held child once its frames prove the catalog name is not coming. */
+  #openIfNameWaitExceeded(nativeId: string): void {
+    const held = this.#pendingOpened.find((payload) => payload.sessionId === nativeId);
+    if (held === undefined || !this.#isNameWaiting(held)) return;
+    if (this.#heldEventCount(nativeId) < CHILD_NAME_WAIT_EVENTS) return;
+    // The decision is sticky, shared with the wall-clock cap: the notice may
+    // still be held by another gate (its parent's notice, its label, the root
+    // not being ready), in which case this flush opens nothing and every
+    // surplus frame would otherwise re-log "opening it" and re-run the flush.
+    this.#nameExpired.add(nativeId);
+    this.#options.log(
+      `subagent ${nativeId} held ${CHILD_NAME_WAIT_EVENTS} frames with no catalog name; `
+        + "the name wait is over (its label will title the row)",
+    );
+    this.#flushPendingChildren();
   }
 
   /** Open a held, label-less child once it has waited long enough for one. */
@@ -3177,7 +3518,8 @@ export class DshSession {
           if (
             !this.#rootReady ||
             this.#parentScopedId(payload.parentSessionId) === undefined ||
-            (payload.label === undefined && !this.#labelWaitExceeded(payload.sessionId))
+            (payload.label === undefined && !this.#labelWaitExceeded(payload.sessionId)) ||
+            this.#awaitsName(payload)
           ) {
             remaining.push(payload);
           } else {
@@ -3225,6 +3567,12 @@ export class DshSession {
   #onSessionEvent(payload: { sessionId?: string; event: { type: string; [key: string]: unknown } }): void {
     if (this.#closed) return;
     const sid = typeof payload.sessionId === "string" && payload.sessionId !== "" ? payload.sessionId : this.#dshSessionId;
+    // A catalog fact belongs to the session that owns the child it names, which is
+    // the root for a direct child and a **child session** for a grandchild. Record
+    // it before the event is routed, buffered or ignored: a grandchild's name is
+    // the only way its held notice can open with DSH's identity, and the event may
+    // arrive while its own parent session is still unopened (buffered) or unknown.
+    if (payload.event.type === "subagent/catalog") this.#observeCatalogName(payload.event);
     if (sid !== this.#dshSessionId) {
       if (!this.#subsession) return;
       if (this.#children.has(sid)) {
@@ -3727,6 +4075,14 @@ interface DshChildSessionOptions {
   subsession: boolean;
   cwd: string;
   title?: string;
+  /**
+   * The creation label, shown as the row's *first* line: Paseo renders
+   * `description` first and `title` as the muted facts line under it, so the
+   * identity goes in `title` and the task description here (see `childIdentity`).
+   * Absent on DSH ≤ 0.2.2-rc.1, for rows with no identity, and when the label
+   * equals the identity — then `session.opened` carries no `description`.
+   */
+  description?: string;
   closed(): boolean;
   emit(event: ProviderEvent): void;
   log(line: string): void;
@@ -3856,6 +4212,7 @@ export class DshChildSession {
       // the click would be a Paseo-local mark that the next replay undoes.
       persistence: { version: 1, data: { sessionId: this.#options.nativeId } },
       ...(this.#options.title === undefined ? {} : { title: this.#options.title }),
+      ...(this.#options.description === undefined ? {} : { description: this.#options.description }),
     });
   }
 

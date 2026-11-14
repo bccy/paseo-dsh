@@ -136,6 +136,18 @@ export interface UiText {
   team: TeamText;
   /** Copy for the tool-specific timeline cards (L2). */
   toolCards: ToolCardsText;
+  /**
+   * DSH tool failures that are neither the goal tools' refusals nor an
+   * agent-team refusal, keyed by the `HarnessError.code` the server relays on
+   * `metadata.errorCode` (`dsh-tools/lib/types/error-codes.d.ts`,
+   * `contracts.d.ts`'s `TOOL_ABORTED*`).
+   *
+   * `short` replaces the red half of the head, `hint` opens the expanded block;
+   * DSH's verbatim text is never replaced, only preceded. Goal refusals and the
+   * team table win over this one, and a code missing from this table keeps the
+   * verbatim head — the tables only ever add words for a code upstream defines.
+   */
+  toolFailures: Record<string, { short: string; hint: string }>;
 }
 
 /**
@@ -640,9 +652,13 @@ export function goalControlErrorDisplay(raw: string, text: GoalText): GoalContro
 
 /**
  * DSH agent-team refusals in Chinese, each matched against the whole trimmed
- * sentence. Sources: `dsh-experimental-agent-team/lib/index.js` (TeamError /
- * TeamTaskGraphError throws) and `dsh-experimental-tool-agent-team/lib/index.js`
- * (list cursor/limit). Tool results arrive as `Error: <message>`; the prefix is
+ * sentence. Sources — **two generations**, both listed because the old sentences
+ * are still what DSH ≤ 0.2.1 emits:
+ * `dsh-experimental-agent-team/lib/index.js` (TeamError / TeamTaskGraphError) and
+ * `dsh-experimental-tool-agent-team/lib/index.js` (list cursor/limit) for the
+ * older one; `dsh-agent-team/lib/index.js` (TeamError) and
+ * `dsh-tool-agent-team/lib/index.js` (cursor/limit, owner+unowned conflict) for
+ * DSH 0.2.2-rc.2+. Tool results arrive as `Error: <message>`; the prefix is
  * optional. An unknown sentence returns `undefined` and is shown verbatim.
  */
 const TEAM_REFUSALS_ZH: ReadonlyArray<readonly [RegExp, (m: RegExpMatchArray) => string]> = [
@@ -678,6 +694,14 @@ const TEAM_REFUSALS_ZH: ReadonlyArray<readonly [RegExp, (m: RegExpMatchArray) =>
   [/^teammate name must be lower-kebab-case, at most 64 characters, and not "lead"$/u, () => "队员名必须是小写短横线格式、不超过 64 个字符，且不能是 lead。"],
   [/^active teammate "([^"]+)" not found$/u, (m) => `找不到在岗队员 ${m[1]}。`],
   [/^agent "([^"]+)" is not a member of an active Agent Team$/u, (m) => `agent ${m[1]} 不是在岗团队的成员。`],
+  // DSH 0.2.2-rc.2+ (`dsh-agent-team`): the same authorization check reworded
+  // for a task board owned by a subagent tree root, plus the two Team-mode
+  // refusals that replaced the roster-based membership language.
+  [/^agent "([^"]+)" is not a continuable descendant of this task board's root$/u, (m) => `agent ${m[1]} 不是本任务板根代理的可继续子代理。`],
+  [/^enable Agent Teams for this Session before using the task board$/u, () => "当前会话还没开启团队，请先启用团队再使用任务板。"],
+  [/^change Team mode from the root Session$/u, () => "团队开关只能在根会话里切换。"],
+  [/^owner and unowned filters cannot be combined$/u, () => "owner 和 unowned 筛选不能同时使用。"],
+  [/^task "([^"]+)" revision (\d+) is visible, but persistence was not confirmed; read the task before retrying$/u, (m) => `任务 ${m[1]} 的修订 ${m[2]} 已可见，但未确认持久化，请先重新读取任务再重试。`],
   [/^only the Team Lead can create teammates$/u, () => "只有队长能创建队员。"],
   [/^Agent Teams service is disposing$/u, () => "团队服务正在关闭。"],
   [/^Agent Teams service disposed$/u, () => "团队服务已关闭。"],
@@ -1202,6 +1226,41 @@ const TEXT: Record<Locale, UiText> = {
       // provider (only the managed-by form carries one), and the instruction body.
       skillCard: { name: "Name", location: "Location", provider: "Provider", instructions: "Instructions" },
     },
+    // DSH's common tool failures (codes from `dsh-tools`: the approval trio,
+    // the abort pair, `TOOL_CONTEXT_UNAVAILABLE`, `UNKNOWN_TOOL`). A user's
+    // refusal is a decision, not a fault: the sentences stay neutral and DSH's
+    // own text still prints after them. Codes this table does not know render
+    // verbatim (no invented copy).
+    toolFailures: {
+      APPROVAL_REJECTED: {
+        short: "Rejected: the user did not approve this call",
+        hint: "The user declined this tool call in the approval prompt, so DSH did not run it. This is a decision, not a failure.",
+      },
+      APPROVAL_CANCELLED: {
+        short: "Cancelled: the approval request was withdrawn",
+        hint: "The call was cancelled while it waited for approval — neither approved nor rejected — so DSH did not run it.",
+      },
+      APPROVAL_UNAVAILABLE: {
+        short: "No approval path: nothing can answer this request",
+        hint: "This call needs approval, but no approval service, Agent, or channel is available, so DSH did not run it.",
+      },
+      ABORTED: {
+        short: "Aborted: the turn stopped before the tool finished",
+        hint: "The tool had started when the turn was stopped or cancelled, so its result is incomplete.",
+      },
+      ABORTED_BEFORE_DISPATCH: {
+        short: "Aborted: the turn stopped before the tool started",
+        hint: "The turn was stopped or cancelled before the tool body ran at all.",
+      },
+      TOOL_CONTEXT_UNAVAILABLE: {
+        short: "The call is missing its runtime context",
+        hint: "This tool needs a calling Agent, an injected service, or an open turn, and one is missing. Changing the arguments cannot fix it.",
+      },
+      UNKNOWN_TOOL: {
+        short: "No such tool is registered",
+        hint: "The model asked for a tool name that is not available, so DSH did not run it.",
+      },
+    },
   },
   "zh-CN": {
     toolLabels: {
@@ -1673,6 +1732,39 @@ const TEXT: Record<Locale, UiText> = {
       // `skill` 行的结果只有 `renderSkillContent()` 的文本（见 `./tool-call-data`）：
       // 卡里给出技能资源的位置、提供方（仅 managed 形态的文本自带），以及指令正文。
       skillCard: { name: "名称", location: "位置", provider: "提供方", instructions: "指令" },
+    },
+    // DSH 常见的工具失败（码来自 `dsh-tools`：审批三连、中止两连、
+    // `TOOL_CONTEXT_UNAVAILABLE`、`UNKNOWN_TOOL`）。用户拒绝是决定而不是故障，
+    // 措辞保持中性；DSH 的原文仍排在后面。本表不认识的码按原文显示（不发明文案）。
+    toolFailures: {
+      APPROVAL_REJECTED: {
+        short: "已拒绝：用户未批准这次调用",
+        hint: "用户在审批里拒绝了这次工具调用，DSH 没有执行它。这是用户的决定，不是故障。",
+      },
+      APPROVAL_CANCELLED: {
+        short: "审批已取消：调用没有执行",
+        hint: "这次调用在等待审批时被取消（既没有批准也没有拒绝），DSH 没有执行它。",
+      },
+      APPROVAL_UNAVAILABLE: {
+        short: "无法审批：没有能回应审批的通道",
+        hint: "这次调用需要审批，但当前没有可用的审批服务、Agent 或通道，DSH 没有执行它。",
+      },
+      ABORTED: {
+        short: "已中止：回合被停止，工具没有跑完",
+        hint: "工具已经开始执行，随后回合被停止或取消，结果不完整。",
+      },
+      ABORTED_BEFORE_DISPATCH: {
+        short: "已中止：回合被停止，工具没有开始",
+        hint: "工具还没开始执行，回合就被停止或取消了。",
+      },
+      TOOL_CONTEXT_UNAVAILABLE: {
+        short: "调用缺少运行上下文",
+        hint: "这个工具需要调用方 Agent、注入的服务或一个打开的回合，当前缺其中一项；改参数补不上。",
+      },
+      UNKNOWN_TOOL: {
+        short: "工具不存在或没有注册",
+        hint: "模型请求了一个当前不可用的工具名，DSH 没有执行它。",
+      },
     },
   },
 };

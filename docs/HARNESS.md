@@ -22,7 +22,9 @@
   `send_message` 行带名册；真实 `replayHistory()` 的 send 行经历史 `spawn_teammate` /
   `list_agents` 合并后仍带中文名册；`agentTeam` 投影成员无 description 时不清空 live 名册；
   child 自有名册不被父空快照清空、父非空快照合并而不删除 child 条目、空名册创建的行在
-  settle 时被晚到名册替换。**动了 `server/timeline.ts` 的 `todoItems`
+  settle 时被晚到名册替换。2026-11-14 工具失败身份 +11 条（实跑 **265**）：`tool/result.error`
+  的 `name`/`code`/`reason` 透传到 `metadata.errorName`/`errorCode`/`errorReason`（空值不带键、
+  成功行不带、不在 detail 上、能过 `ProviderEventSchema.parse`）。**动了 `server/timeline.ts` 的 `todoItems`
   （含空列表语义）、`server/activity-timeline.ts` 的 goal 轮次分支或 `server/session.ts` 的重放
   过滤必跑。**
 - `harness/p003-timeline-check.cjs` — 真实 `TimelineBuilder` → `ProviderEventSchema` → 客户端
@@ -135,6 +137,14 @@
       `data.jobTitle` 透传到 `metadata.jobTitle`、能过 `ProviderEventSchema.parse`、无标题时
       不出现该键）、`locale-check` +2 条（实跑 **770**：`labels.wait` / `labels.timeoutMs`
       中英两列逐字）。
+    - 2026-11-14 工具失败的本地化身份（实跑 **838**，+20）：`server/timeline.ts` 把
+      `tool/result.error` 的 `name`/`code`/`reason` 三个既有字段透传到 `metadata`
+      （空值不带键；**不是新协议字段**，桥未改）；客户端查表优先级 goal `refusals` → 团队句子
+      → 新 `toolFailures` → 原文不变，未知码不发明文案。七个码逐个在上游核实：`APPROVAL_*`
+      三连、`ABORTED`/`ABORTED_BEFORE_DISPATCH`（常量名是 `TOOL_ABORTED*`，**记录值是码**）、
+      `TOOL_CONTEXT_UNAVAILABLE`（rc.3 新增）、`UNKNOWN_TOOL`。`errorName` 只在展开区
+      （灰色 `code（name）`），`errorReason` 只在结果文本为空时兜底。**动了失败行的 metadata、
+      `toolFailures` 表或 `tool-call.tsx` 的 hint 分支必跑。**
 - `harness/thinking-check.cjs` — 思考行折叠预览：结束后取**第一行**、运行中取最后一个首行已终结
   的段落（都是 DSH 的行为，逐字移植在 `client/thinking-text.ts`），以及折叠行在流式中的宽度
   接线（行测自己的宽度、标签测自己要减掉的那段、行宽由两者相减得出，`useRevealedText` 不许
@@ -177,7 +187,7 @@
   编辑页 `goal.editor` 表键齐全、键名（Esc/Enter/Shift Enter）两语一致、其余词中英不互抄，且 goal 的
   label/按钮/提示文案中英两列都不得为空或互为复制；完成态四键（`complete`「目标已完成」、`completeHint` 指向收尾消息、
   `completeClearHint`「清除后 /goal 将查不到这个目标，无法撤销」且不同于 active 的确认句、`rowLabel` 状态在前）；**控制错误中文表**（DSH/插件拒绝句逐句译文、英文原样、显示保留原文；未知句与未知变量不翻；
-  读本机 `dsh-command-goal/lib/index.js` 的错误字面量逐条确认都有中文，找不到时打印 NOTE，`DSH_COMMAND_GOAL` 可覆盖路径）（实跑 762 条，含团队段与 2026-11-07 的 17 工具标签/图标段，见文末「团队（team）链」）。**动了 `client/locale.ts`、标签表或
+  读本机 `dsh-command-goal/lib/index.js` 的错误字面量逐条确认都有中文，找不到时打印 NOTE，`DSH_COMMAND_GOAL` 可覆盖路径）（实跑 762 条，含团队段与 2026-11-07 的 17 工具标签/图标段，见文末「团队（team）链」）。2026-11-14 工具失败码表再 +13（实跑 **793**）：两语言 `toolFailures` 键一致、7 个上游码都有值、叶子非空、**键是记录值 `ABORTED*` 而不是常量名 `TOOL_ABORTED*`**、拒绝句不得写成故障。**动了 `client/locale.ts`、标签表或
   `shared/goal.ts` 的 phase 枚举必跑。**
 - `harness/jobs-poll-check.cjs` — jobs pill 的**数据层**（**189 条**；假订阅宿主 + 假目录页，不
   import React/host）：可见性（**只由 jobs 数据决定**：有 live 显示并计数、无 live 隐藏；读失败的
@@ -357,7 +367,12 @@
   桥经 `ctx.get(...)` 拿到的 service 仍声明它调用的操作。`dsh-jobs` 的 `.d.ts` 必须仍声明
   `list`/`get`/`kill`，且 `dsh-jobs-local` 的 `LocalJobRegistry.prototype` 必须真的实现它们——
   `paseo/jobs/stop` 走的就是这个 `kill`，它是 **`dsh-tool-jobs` 的 `job_kill` 同一个入口**；
-  抽象类上不挂实现，所以 d.ts 与实现类两边都要断言。服务面不是 import，第 1/2 项看不见它）。它查的是 FIELD-NOTES #58 那种失效：`{{cwd}}` 变量被上游
+  抽象类上不挂实现，所以 d.ts 与实现类两边都要断言。服务面不是 import，第 1/2 项看不见它。
+  2026-11-14 再补两处 rc.3 升版踩到的面：`dsh-subagent` 的委派等待方法**二选一**
+  （`waitForTreeWork` / `waitForChildren`，两代名，桥的兜底都认；两个都没了才红）与
+  `agentTeam` 投影形状**必须是已知两代之一**——`dsh-agent-team` 只认 `{enabled, tasks}`、
+  `dsh-experimental-agent-team` 只认 `{members, tasks}`，且两个包只能装一个；这是
+  projection key，不是 import，前两项永远看不见）。它查的是 FIELD-NOTES #58 那种失效：`{{cwd}}` 变量被上游
   删掉，每个回合都在提示词装配阶段抛错，界面只有一条空的 `[error]`，而 **doctor 全程是绿的**
   （doctor 只查安装完整性，查不出软契约）。**它不查行为**——签名变了但符号还在，这里不会红，
   那由 `plugin-check.cjs` 的真实回合覆盖。**它覆盖的是 import 符号 + 上面那份服务面清单，
@@ -456,16 +471,22 @@
 - `harness/harness-gates-check.mjs` — harness 自己判据的回归：T01 `route-test` 按终态分
   WORKS/FAILS/TIMEOUT/CANCELED/EMPTY 且全失败必须非零、T02 `tools.mjs` initialize 与 prompt
   共用 sessionId、T03 `plugin-check` 不预过滤 assistant 行、T04 图片证据取插件发出的 prompt
-  frame（模型自报的 `IMAGE-SEEN` 不再算数）、HP-08 `session-calls` 无 schema 的调用必须
+  frame（模型自报的 `IMAGE-SEEN` 不再算数）、T05 `rewind-e2e` 的取答（只取最后一次
+   `turn/start` 之后的 assistant 文本；同一条流上旧的整条流 `.at(-1)` 会把上一回合的文本当成
+   这一回合答案、把空答案判成"不知道被撤内容"，新判据返回空串交给非空断言）与 `plugin:*`
+   注入行的读取、HP-08 `session-calls` 无 schema 的调用必须
   exit 2 而不是 0、HP-05 隔离 home 的默认/opt-in 行为（克隆带共享锚点的桥、且是**真拷贝不是
   符号链接**——链接会让克隆写回真实 home；源没有锚点时不得凭空造一个；克隆里**把钉死的监听端口
   归零、把 `dsh-memory` 的 `dataDir` 指进临时 home**，源 profile 逐字节不变、已归零/无该插件时
-  不发明条目）。端口那条是 2026-11-11 实测出来的环境坑：live profile 为书签把 `webserver` 钉成
-  `127.0.0.1:44209` 这类固定值，隔离克隆继承后第二份 DSH 直接 `EADDRINUSE`，真实回合脚本读到的是
+  不发明条目；克隆还能按**行 id** 把请求的 profile 行改成 `disabled: true`——只动克隆、只动请求
+   的行、已 `disabled: true` 的邻居与嵌套列表项不受影响，没有该行时报 `absent` 而不是失败，
+   `--allow-real-profile` 下这个列表不生效）。端口那条是 2026-11-11 实测出来的环境坑：live profile
+   为书签把 `webserver` 钉成 `127.0.0.1:44209` 这类固定值，隔离克隆继承后第二份 DSH 直接 `EADDRINUSE`，真实回合脚本读到的是
   "timed out waiting for session.ready"，看着像插件 bug。纯离线，会启动真实入口脚本 + 假 peer；
   真实 `dsh --dump-config` 的组合半在 `harness/isolated-home-bridge-check.mjs`。
   **动了 `route-test.mjs` / `tools.mjs` / `session-calls.mjs` / `plugin-check.cjs` 的判据，或
   `harness-gates.cjs` / `isolated-dsh-home.cjs` 必跑。**
+  **2026-11-14**：新增 T05（取答 + 注入行）与 HP-05 的「按行 id 禁用克隆行」4 条，实跑 **68/68**。
   **2026-11-11**：隔离清单 `isolatedScripts` 增加 `jobs-stop-live.mjs` 与
   `identity-live-check.mjs`（真 dsh、耗 token 的脚本同样必须走一次性 home），实跑 **52/52**。
 - `harness/harness-gates.cjs` / `harness/isolated-dsh-home.cjs` — **不是独立检查**：前者是
@@ -477,7 +498,14 @@
   opt-in。**克隆沙箱**（`sandboxClonedProfile`）：`webserver` 的固定 `port` → `0`（否则与
   live DSH 抢端口，真实脚本报 runtime failure）、`dsh-memory` 的 `dataDir` → `<克隆>/memory-paseo`
   （否则第二个写者落在用户真实记忆库上），只在克隆里改、源逐字节不动，改了什么写进返回的
-  `sandboxed` 列表并打进那行 mode 输出）。改动它们必跑 `harness/harness-gates-check.mjs` 的对应段 +
+  `sandboxed` 列表并打进那行 mode 输出。**克隆只沙盒了数据目录与端口，现在还按行 id 禁用行**：
+   `prepareDshHome({ …, disable: ["<row id>", …] })` 只在这份克隆的 `cordis.patch.yml` 里给那些
+   `- id:` 行加 `disabled: true`（缺键则插入、`false` 则改写；没有该行返回 `absent`，不算失败），
+   真实 home 与调用方自备的 `DSH_HOME` 永不修改——请求列表以 `disableRequested` 返回，由
+   `announceDshHome` 打印「禁用了哪些行 / 哪行不存在 / 为什么没生效」。用途是**结构性的**：一条测桥
+   的检查不该被用户额外装的第三方插件决定红绿，`rewind-e2e` 因此默认禁用记忆类插件的行
+   （`REWIND_E2E_DISABLE_ROWS`，默认 `dsh-memory`；传的是行 id 不是包名，别硬编码某个厂商的包）。
+   改动它们必跑 `harness/harness-gates-check.mjs` 的对应段 +
   `harness/isolated-home-bridge-check.mjs`。
 - `harness/isolated-home-bridge-check.mjs` — **一次性 home 克隆必须带得上桥**（真 `dsh`，
   一次性 `mkdtemp` 源 home，不碰真实 `~/.dsh`、不耗 token）：源 home 只有共享锚点的桥（迁移后
@@ -573,7 +601,7 @@
   `#acquirePoolProcess` 或共享进程的 spawn cwd、或 `dsh-process.ts` 的 `stableProcessCwd` /
   `#start` 必跑。**
 - `harness/pool-prewarm-check.mjs` — **插件加载时预热共享 `dsh`**（假 `dsh` + 一次性 `DSH_HOME`，自己编译到
-  私有目录，**39/39**）：`connect()` 不等首个 open 就把共享子进程起起来，并让它在连接存活期内**常驻**，
+  私有目录，**49/49**）：`connect()` 不等首个 open 就把共享子进程起起来，并让它在连接存活期内**常驻**，
   把一次整台 `dsh` 的冷启动（真机实测 spawn→`listening` +8.4 s、→可用 +23.2 s）从"用户点开会话"挪到
   "插件加载"阶段。断言：**a)** connect 之后、没有任何会话时已 spawn **一次**，且 `poolClaimCount` 仍为 0
   （热身不持 claim，它不是用户）；**b)** 首个 open **复用**那个 pid（会话自己的 `initialize` 帧带该 pid）、
@@ -590,11 +618,18 @@
   stderr 无 "retiring it"）；**i)** 首次 open 带了**非身份键**时——恰好**多 1 次 spawn**、新 pid ≠ 旧 pid、
   新 child 的 spawn env 里真有该键（wrapper 记录子进程实际 env）、仍没有三个身份键、旧预热 child 收到
   `shutdown` 且已退出、stderr 那行点名旧 pid 与该键、且这次 open 不出「会话环境变量未生效」告警。
+  **j) 预热 child 的「冷/暖」分类**（FIELD-NOTES 106，`reused` 唯一的消费面）：假桥 `replay` 模式带一条
+  日志停在回合中间、没有终态的 `child-K`（被杀子代理的形状）。预热**已完成**后的首个 open 必须把它结算为
+  `canceled`（悬着的工具行同样 settle），第二个会话在**同一连接**上再开则保留 running（adoption）；open 撞上
+  预热**在飞**的 spawn 时同样按冷启动结算。脚本读的是 `reused` 的消费者（重放结算），**provider 不为测试加
+  只读访问器**。
   **变异：去掉 `prewarmSharedDsh()` 调用 → 14 红（a/b 全灭）；把 5 s 空闲退役恢复回去 → 3 红（c 三条）；
+  在飞 join 分支改回 `reused: true` → 2 红（j 的在飞两条）；已完成预热的 `existing` 分支改回 `reused: true`
+  → 2 红（j 的首开两条）——两处变异互不串台，说明分类真的在 `#ensurePoolProcess` 里；
   去掉 `#acquirePoolProcess` 里的 `#retireUnusedPrewarmFor` 调用 → 6 红（h/i 那一节：会话告警出现、
   没有替换 spawn、新 child 环境里没有该键、旧 child 没被关、stderr 无那行）**，均记录后还原。**动了
   `provider.ts` 的 `prewarmSharedDsh` / `#prewarmRoute` / `#ensurePoolProcess` / `#acquirePoolProcess` /
-  `#retireUnusedPrewarmFor` / `#releasePoolProcess` / `#poolPrewarmed` / `connect()`，或
+  `#retireUnusedPrewarmFor` / `#releasePoolProcess` / `#poolPrewarmed` / `#prewarmSpawn` / `connect()`，或
   `catalog-cache.ts` 的 `readAnyCatalogCache`／`loadCatalog` 必跑。**
 - `harness/concurrent-open-check.mjs` — 同一个 DSH 会话的两次并发 `session.open` 不能毁掉成功的
   那次：只有一次到达 `session.ready`；另一次**响亮失败**（`request.failed`，不是沉默）；失败方
@@ -624,7 +659,7 @@
   `server/session.ts` 的回合状态、`configure` 的提交顺序/回执回读、`DshSessionOptions.modes`、
   子会话 opened/label 闸门或 `DshChildSession.fail` 必跑。**
 - `harness/subagent-check.cjs` — 原生子代理可见性（脚本化假 `dsh` 驱动真实编译插件 +
-  一次性 `DSH_HOME`，不 spawn 真 DSH、不连 daemon；**97 条**）：能力位与 `restoration:"parent"`、
+  一次性 `DSH_HOME`，不 spawn 真 DSH、不连 daemon；**125 条**）：能力位与 `restoration:"parent"`、
   父子/嵌套归属、多子混排、未知子不误归属、子只读拒绝、恢复去重与 provider id 复用、
   **Paseo 父能力门控**、无 subsession 时只回退根会话、父未就绪缓冲、`turn/end` 终态
   （completed/aborted/failed）、`skip`/`replay` 重建、fork own-suffix、两个根观察同一 native
@@ -637,9 +672,40 @@
   （宿主 rehydrate 快照窗口；改回 ready 后 `void replaySubagents()` 时间接败）且 root 的
   `session.opened` 仍先于 child；**子会话 history 读挂起时 `session.ready` 仍须在 4 s 预算
   （`SUBAGENT_REPLAY_READY_BUDGET_MS`）+ slack 内发布、open 不卡死**（假桥把这条读 park 到测试
-  写 release marker；无预算时实测 30 s 才 ready）。**动了 `session.ts` 的 `DshChildSession` 回合
-  状态（`event`/`status`/`#announceTurnStarted`）或 `provider.ts` 的 open 顺序/`replaySubagents`
-  接线/ready 预算必跑；假桥 `reuse`/`replay-hang` 模式改动同样必跑。**
+  写 release marker；无预算时实测 30 s 才 ready）。**2026-11-14 新增 13 条（rc.3 具名子代理的
+  title/description 规则，第二轮把两字段对调）**：`childIdentity` 是唯一规则点——**宿主把
+  `description` 画在轨道行第一行、`title` 画在第二行**（`label = description ?? title`）；
+  **2026-11-14 第三轮补 4 条**：假桥按真实 rc.3 时序（label 先、父 catalog 的 name 晚约 14 ms 到）
+  断言 `session.opened` 仍是 `title=name`、`description=label`，且等待期间的子会话帧按序补发；
+  另断言无命名能力声明（rc.1 形状、`catalog-absent` 模式）时 label-only 子会话**立开**、不等，
+  且 announce 早于其后的根帧——这是"等待不得对 rc.1 生效"的判据。**2026-11-14 第四轮再补 8 条**：
+  真实时序的**两层**形态（孙的名字在**其直接父（子会话）**的 catalog 里，`catalog-tree` 模式）与
+  「孙先于父被 announce」的乱序变体（`catalog-tree-early`，孙的 catalog 落在尚未 open 的父会话通道上）
+  都必须让孙的 `session.opened` 为 `title=孙名`、`description=label`，且打开的**事件序号早于**随后的根帧
+  （证明不是等满 750 ms 定时器）；`catalog-none` 模式（无任何 catalog、恰好 8 帧 + 根帧）断言
+  第 8 帧就打开、日志含「held 8 frames with no catalog name」，同样以事件序号而非墙钟判定。
+  **2026-11-14 第五轮再补 3 条**（假桥 `name-bound-gated` 模式）：帧数界在**另一道闸门仍扣着**
+  （此例无 label、descriptor 迟到）时到期，`#nameExpired` 粘性标记必须让它**只打一行**日志
+  （第四轮代码上是 5 行：第 8–12 帧各一行、每帧空跑一次 flush）；随后 descriptor 放行，子会话
+  仍以 label 打开、无 description，12 帧按序各出现一次、无丢帧。
+  所以要保住「第一行是任务描述」必须 `title = path ?? name`、`description = label`；空串与
+  非字符串一律当缺失，`title === description` 时不带 description（宿主不去重），**绝不**用
+  label 顶 name；无身份（rc.1/历史行）时 `title = label`、无 description，逐字段与改动前一致。
+  嵌套场景（假桥 `nested` 三级带 `name`/`path`）断言父级 `title=name`、孙/曾孙 `title=全路径`、
+  三者 `description` 仍是各自 label、标题三级互不相同不被覆盖；`name-missing` 模式断言 rc.1
+  形状（只有 label）**没有 `description` 键**、非字符串 `name`/`path` 被当缺失且子会话照常打开
+  并出流；`name-only` 模式断言有 name 无 label → `title=name` 且无 description、label 与
+  name 相同 → 不产生第二行同文；replay 段断言同一规则（`child-A` 用 path、`child-B` 用经具名
+  祖先的 path、无 name 的 `child-M` 用 label 且无 description、冷重放里只有 name 的 `child-K`
+  用 name + label）。**动了
+  `session.ts` 的 `DshChildSession` 回合状态（`event`/`status`/`#announceTurnStarted`）、
+  `childIdentity`/`DshChildSessionOptions.description`/`#openChildNow`/`replaySubagents` 的身份
+  字段或 `provider.ts` 的 open 顺序/`replaySubagents` 接线/ready 预算必跑；假桥
+  `reuse`/`replay-hang`/`nested`/`name-missing`/`name-only` 模式改动同样必跑。**
+  **2026-11-14（FIELD-NOTES 106）**：冷启动用例改用**新连接**取得未服务过任何会话的 child（池改成按连接
+  常驻后，「关会话 + 睡 12 s」退休不掉它；同一连接内的 reopen 由 adoption 用例承担），并删掉那段 12 s 等待与
+  临时诊断块——冷起点变成了代码性质，而不是等待性质；**动了 `provider.ts` 的 `#ensurePoolProcess`（`reused`
+  分类）/`#prewarmSpawn`/`#poolPrewarmed` 必跑。**
 - `harness/mcp-gateway-guard-check.mjs` — gateway 的 `tool` 参数守卫（`resolveTargetTool`，模块
   私有，所以驱动真实的 `apply()` + `defineTool` 注册路径，用 loopback 假 server 接住本该成功的
   调用）：空串与纯空白、把网关自己的元工具名当目标（含大小写变体、零宽字符、CJK 键盘打出的全角
@@ -679,7 +745,16 @@
   转发且不重复 announce、重复读 catalog 不重复登记/宣告。**再补 4 条（2026-11-08 收尾）**：
   登记后 0 帧时 `opened` 仍为 false（不提前 announce）、label/mode 传递且 cwd 回退正确（无主会话
   取 server cwd、孙级继承父 entry 的 cwd）、登记循环跳过 archived 行、archived 行不被后续
-  catalog 读重新武装（其帧仍 hold）。**依赖本机 DSH 安装，所以不进 CI**
+  catalog 读重新武装（其帧仍 hold）。**2026-11-14 再补 6 条（rc.3 的 name/path，实跑 116/116）**：
+  目录行与 `session.child-opened` 两处都必须带 `name`/`path`（有：具名子目录行、child-opened
+  同值；无：rc.1 形状两处都**没有该键**、label 照旧）、非字符串 `name`/`path` 被忽略（列表与
+  通知都不出现伪值）、子会话仍按 label 打开、**每个 child 每字段恰好一行 stderr**（两次目录读
+  不重复打）、且 `subagents()` 第二次读仍 `available:true`。**2026-11-14 第三轮再补 5 条
+  （实跑 121/121）**：`initialize` 回执的 `serverInfo.subagentNames` 在服务有 `namesOf`/`rootOf`
+  时为 true、只有 rc.1 面（`listChildren`/`listDescendants`）时为 false（插件据此决定是否等
+  catalog 的 name）、live 子会话的 `session.child-opened` **不带** `listed`、目录登记的子会话带
+  `listed:true` 且仍带 name/path、父会话 `subagent/catalog` 事件**原样转发**（name 不被剥掉）。
+  **依赖本机 DSH 安装，所以不进 CI**
   （`DSH_PACKAGES_DIR` / `DSH_INSTALL_DIR` 可覆盖，解析失败 exit 2 并打印实际目录）。**动了
   `server.js` 的请求分派或这些只读路径必跑**；**另外，凡动了 `server.js` 的请求分派、会话生命
   周期（`prompt`/`cancel`/`createSession`/`closeSession`）、`listSessions`、持久化读取区段，
@@ -825,7 +900,10 @@
   `PaseoHarnessServer.createSession` 必须在 factory 的 `setup` 里、第一笔捕获之前为会话续读
   journal 高水位，且序号尊重别的进程已推进的高水位（`snapshot-lifecycle-check` 只证明机制、
   证明不了桥用了它）。**依赖本机 DSH 安装，不进 CI；动了 `server.js` 的 createSession 接线或
-  `FileSnapshots.beginOwner` 必跑。**
+  `FileSnapshots.beginOwner` 必跑。** **0.2.2 起 `dsh-agent`/`dsh-agent-loop` 的接线在
+  `[Service.init]`，离线装配必须走 `ctx.plugin()`**（直接 `new` 是半初始化，第一次 create 就报
+  `no agent factory registered`）；0.2.2 起会话在 setup 前已进入 store，所以脚本只断言「agent
+  发布前」这条关闭捕获窗口的顺序。
 - `harness/rewind-merge-check.mjs` — 父子文件归并（`snapshot-owners.js` / `child-anchors.js` /
   journal 归属）：子与孙都解析到根、断链 fail-open、子编辑落根 journal 且子无自己的 journal、
   独立会话树不交叉、孙锚定在直接父正在跑的回合而不是根最新消息。**动了 `rootSessionFor` /
@@ -839,8 +917,13 @@
   折叠：人类转写必须全部重放，本桥撤回缝只丢自己那一段；日志只读，解不开要报错、不静默当空。
   **动了 `surface.js` 的折叠或 DSH 日志形状必跑。**
 - `harness/rewind-e2e.mjs` — 真 `dsh --profile paseo` 的 3 回合端到端（耗 token，默认一次性
-  `DSH_HOME`）：替换写入、重放折叠、文件回退、原始日志无 `command/run`、模型只记得 ALPHA 不
-  记得 BETA。**动了撤回任一层、要出包前必跑。**
+  `DSH_HOME`）：替换写入、重放折叠、文件回退、记得 BETA。第 3 回合的答案**只取最后一次 `turn/start` 之后的 assistant 文本**，且**先断言
+  答案非空**（空答案算失败：旧写法会把"模型什么都没答"判成"不知道被撤内容"，实测假绿过一次），
+  再断言含 ALPHA、不含 BETA；另有一条**注入面**判据：`paseo/history` 里没有任何 `plugin:*` 来源的
+  `user/message` 携带被撤文本（没有记忆类插件时自然通过）。克隆 profile 默认按行 id 禁用记忆类
+  插件的行（见上一条），首部打印实际禁用了哪些行；`--with-memory` 保留插件、把「被撤文本出现在
+  `plugin:memory` 注入行」当**已知缺口的可观察行为**打印出来（不判红）。**动了撤回任一层、要出包前
+  必跑；动了取答/注入面判据连 `harness-gates-check.mjs` 的 T05 一起跑。**
 - `harness/rewind-merge-e2e.mjs` — 真机父子归并（耗 token）：父写 + 子代理写 → `both` 撤回 →
   两个文件都删、根 journal 两行、子会话无 journal。**动了父子归并必跑。**
 - `harness/rewind-native-check.mjs` — 经真实 daemon 的撤回（`agent.rewind.request`，耗 token，
@@ -1053,14 +1136,25 @@
 
 设计见 [TEAM.md](./TEAM.md)。三个新脚本 + 两个既有脚本的团队段；断言数为回填时实跑值。
 
-- `harness/team-server-check.cjs` — 插件 `team.snapshot` 订阅（**23 条**；假桥 `team` 模式 + 一次性 `DSH_HOME`）：只读 `agentTeam`
+- `harness/team-server-check.cjs` — 插件 `team.snapshot` 订阅（**43 条**；假桥 `team` 模式 + 一次性 `DSH_HOME`）：只读 `agentTeam`
   这一个 projection key；无会话 / `null` / `migration-required` / 缺键 → `team: null`；无 `paseo/projections` → 终态
-  `bridge_too_old`；未知 key → 终态 `team_unavailable`（且插件前缀与桥源码逐字一致）；未知会话 → `session_missing`；
-  其它抛错与形状不符 → `rpc_failed`（不清空成空看板）；DSH 字段原样；**`running`**：空闲根的 Lead 为 false、未托管队员无此键、
-  托管中队员回合未结束为 true、已结束为 false、失败成员无此键。编译同 `goal-server-check`（`.dbg` + 拷入本脚本与
-  `fake-dsh-bridge.mjs`）。**动了 `server/{dsh-process,session,provider}.ts` 的 team 部分、`shared/team.ts` 或假桥 `team` 模式必跑。**
+  `bridge_too_old`；未知 key → 终态 `team_unavailable`（且插件前缀与桥源码逐字一致；**rc.3 上 agent-team 服务加载失败、
+  投影因此不存在时也是这一条**，不是瞬态 `rpc_failed`）；未知会话 → `session_missing`；
+  其它抛错与形状不符 → `rpc_failed`（不清空成空看板，混合形状 `{members, enabled}` 同样红）；DSH 字段原样；
+  **`running`**：空闲根的 Lead 为 false、未托管队员无此键、托管中队员回合未结束为 true、已结束为 false、失败成员无此键。
+  **两代形状**（2026-11-14）：rc.3 的 `{enabled, tasks}` 也解析，成员来自假桥脚本化的 `paseo/subagents`
+  （`DSH_FAKE_SUBAGENTS_FILE`）——只取 Lead 的可继续直接子代理（one-shot 与被隔一层的孙代理排除）、没名字的条目
+  退回 session id、`label` 作 description、不编 `phase`、`running` 仍按本进程托管的子会话叠加、`enabled: false`
+  是正常答案、目录读失败/抛错是瞬态 `rpc_failed` 而不是「0 名成员」。**目录读有门控**（2026-11-14 第二轮）：
+  `enabled: false`、`enabled: true` 但无任务、`tasks` 畸形都不发 `paseo/subagents`（用脚本化目录在被调用时抛错证明
+  「没发」），有任务时恰好发一次；理由是桥侧每次读都要遍历全部持久会话 header，而 pill feed 每 4 秒读每个被观察
+  agent。编译同 `goal-server-check`（`.dbg` + 拷入本脚本与
+  `fake-dsh-bridge.mjs`）。**动了 `server/{dsh-process,session,provider}.ts` 的 team 部分、`shared/team.ts`、
+  `dsh-bridge/lib/server.js` 的 `paseo/subagents` 或假桥 `team`/`paseo/subagents` 必跑。**
 - `harness/team-pill-check.cjs` — `client/team-polling.ts` 纯规则 + 订阅适配 + "seen" 元数据
-  （**215 条**；2026-11-11（0.16 订阅改造）：纯规则（可见性只看任务、`teamCompleteSeenStep`、
+  （**224 条**；2026-11-14 补 rc.3：可见性多一道 `enabled` 门（关掉团队即便有历史任务也不亮 pill）、
+  两代投影 union 的契约（旧 `{members, tasks}`、新 `{enabled, tasks}`、混合形状必须不解析）、
+  无 `phase` 成员的未知态、负责人 `ownerName ?? ownerId`；2026-11-11（0.16 订阅改造）：纯规则（可见性只看任务、`teamCompleteSeenStep`、
   成员 chip、负责人标记、任务 mark/分组、facts 字段、错误码契约）不变；**适配层改为订阅**——
   DSH agent 注册并开一条订阅、好答案发布看板、瞬态失败不发布不摘、终态码摘并释放、agent 更新把
   整条（含 metadata）交给 pill；**"seen" 换成 `dsh.teamSeen` agent metadata**——无签名看板可见、
@@ -1077,7 +1171,9 @@
   分区与分组顺序、已完成默认折叠且原地展开、被阻塞任务不在可开始、不画逐个成员行、标题行（鲸鱼 +「DeepSeek」+ 队员数 + chip，0 队员不写「0 名成员」，chip 18px/4px 圆角/无边框，失败红底首位，运行态缺失只剩完成 chip，0 不出，四个隐藏量宽副本）、负责人运行环与「已停止」（列表与详情页）、进行中标题的已停止计数、10 个任务负责人全部已停止、
   facts/警告、描述两行多行截断、详情页（返回行、字段、完整描述保留换行、返回回列表）、空看板、只有 Lead、failure 首行红字、
   只读（按钮只有任务行与折叠行）、容器订阅 store 重绘、关闭时上报最后一块看板（seen 信号）。**需要 `HOST_APP`**，未设 exit 2。**动了 `client/team-popover.tsx` / `team-pill.tsx` 必跑。**
-- `harness/tool-call-check.cjs` 团队段（399 → **443**）：`team_task_get/create/update/list` 字段卡、update 动作词（未知原样）、
+- `harness/tool-call-check.cjs` 团队段（399 → **459**；2026-11-14 补 rc.3：`list_agents` 的 `{name,status,description}`
+  路径行（根行不算队员、混合形状退回原始 JSON）、`team_task_*` 工具的 `owner` 键、`send_message`/`interrupt_agent`
+  的 `{agent}` 参数与渲染回执）：`team_task_get/create/update/list` 字段卡、update 动作词（未知原样）、
   list 计数与筛选词、`nextCursor`；**任何形状不符都保留原始 JSON**（非 JSON、多键、少键、deleted、列表坏项、列表多键）；
   失败行不画卡，已知 DSH 原文中文进 `errorShort`/`errorHint`、原文保留在 `error`，未知句不翻、非团队工具不过团队表、英文不翻。
 - `harness/locale-check.cjs` 团队段（505 → **661**，L2 的 `toolCards` 段再 +46 → **707**，2026-11-05 jobs 表：+`pillLabel` 3 条、删 `liveLabel` 并断言其不存在，净 −1 → **706**；2026-11-07 当前 **762**）：`team` 表中英键一致、非空、不互抄；成员词与分组词逐字；未知成员词不是运行中/空闲；`toolCards` 同口径（字符串叶子键集/非空/不互抄、6 个 formatter 键一致且中英不同、状态词与回执句逐字）；

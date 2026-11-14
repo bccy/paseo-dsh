@@ -70,6 +70,35 @@
  *      followup open the turn. The cancel must be recorded for that delivery and
  *      applied after the followup that opens it (DSH's cancel is a no-op while
  *      idle and does not arm later work).
+ *   8. **The rewind's delegated-work join accepts both generations of the
+ *      subagent wait.** `dsh-subagent` 0.2.2-rc.2 replaced
+ *      `waitForChildren(parent)` with `waitForTreeWork(root)`; the fallback
+ *      branch of `settleDelegatedWork` must use whichever exists, and a service
+ *      with neither must be **logged** rather than silently return (that branch
+ *      is the only join when a profile composes no `agents` service, so a silent
+ *      no-op would make a rewind's settle step invisible).
+ *   9. **A child's name/path reaches both Paseo surfaces and is never invented.**
+ *      DSH 0.2.2-rc.2+ records a `name` per child (unique among siblings, v3
+ *      `subagent/catalog`) and derives a root-relative `path` in
+ *      `listDescendants`. Both are optional across versions, so the listing and
+ *      `session.child-opened` must carry them when present and omit the keys when
+ *      absent (rc.1 and historical rows), and a non-string value must be ignored
+ *      with **one** stderr line per child and field instead of being coerced —
+ *      `String(…)` on a broken upstream field would put a plausible-looking
+ *      identity in front of the user, and re-reading the catalog on every open
+ *      would otherwise repeat the line without bound. `label` is never a source
+ *      for `name`: one is a task description, the other the model-addressable
+ *      identity.
+ *  10. **The plugin is told whether waiting for a catalog name can pay off.** The
+ *      bridge opens a child as soon as its own descriptor supplies a label, while
+ *      the name only arrives in the parent's `subagent/catalog` v3 fact a few
+ *      milliseconds later — after Paseo has already made title/description
+ *      sticky. The plugin owns the single `session.opened`, so it holds for that
+ *      fact (bounded); it can only do so when the bridge reports that this DSH
+ *      build names children. The `initialize` reply's `serverInfo.subagentNames`
+ *      is that report (duck-typed on `namesOf`/`rootOf`, absent on rc.1), and the
+ *      `listed` marker on `session.child-opened` says a row came from the durable
+ *      listing and has no further live catalog fact to wait for.
  *
  * Usage:
  *
@@ -1273,6 +1302,211 @@ const present = () => ({
 }
 
 
+// ===== 10. a named child: name/path on both Paseo surfaces, never invented ===
+// DSH 0.2.2-rc.2+ names each child (v3 `subagent/catalog`) and derives a
+// root-relative slash path in the recursive listing. The bridge is the only
+// place that sees both, and Paseo has exactly two surfaces for a child's
+// identity: the `paseo/subagents` listing (a reopen) and the `session.child-opened`
+// notice (a live child). They must agree, and an unnamed row must stay
+// byte-identical to the rc.1 shape (no keys at all, never `label` standing in for
+// `name`).
+{
+  const rows = [
+    { kind: 'child', id: 'named-child', parentId: 'named-root', label: 'Named C', mode: 'continuable', name: 'named-c', path: 'named-c' },
+    { kind: 'child', id: 'named-grand', parentId: 'named-child', mode: 'one-shot', label: 'Named G', name: 'named-g', path: 'named-c/named-g' },
+  ];
+  const { server, handlers, frames } = makeServer({ subagents: { listDescendants: async () => rows } });
+  const listed = await server.subagents({ sessionId: 'named-root' });
+  const namedRow = listed.subagents.find((row) => row.sessionId === 'named-child');
+  const namedGrand = listed.subagents.find((row) => row.sessionId === 'named-grand');
+  check(
+    "the subagent listing carries DSH's name and path for every named row",
+    namedRow?.name === 'named-c' && namedRow?.path === 'named-c' &&
+      namedGrand?.name === 'named-g' && namedGrand?.path === 'named-c/named-g',
+    JSON.stringify({ namedRow, namedGrand }),
+  );
+  // The child was never observed directly: the catalog registration is what
+  // learns its label, so its first live frame is released by it — and the notice
+  // must carry the same identity the listing showed.
+  handlers.get('agent/status')({
+    agent: { session: { id: 'named-child', header: { origin: 'subagent', parentSession: 'named-root', cwd: '/tmp' } } },
+    status: 'running',
+  });
+  const opened = frames.filter((frame) => frame.method === 'session.child-opened');
+  check(
+    'the child-opened notice carries the same name and path as the listing',
+    opened.length === 1 && opened[0].params.name === 'named-c' && opened[0].params.path === 'named-c',
+    JSON.stringify(opened.map((frame) => frame.params)),
+  );
+}
+
+// ===== 11. an unnamed child (rc.1 / historical) gains no identity keys =======
+// The same code paths must leave the rc.1 shape exactly as it is today: rc.1's
+// `listDescendants` rows have no `name`/`path` at all, and its `subagent/catalog`
+// is v0–v2. A fallback that filled either from `label` would make an rc.1 tree
+// look named and silently change what the user sees after an upgrade.
+{
+  const rows = [
+    { kind: 'child', id: 'legacy-child', parentId: 'legacy-root', label: 'Legacy C', mode: 'continuable' },
+  ];
+  const { server, handlers, frames } = makeServer({ subagents: { listDescendants: async () => rows } });
+  const listed = await server.subagents({ sessionId: 'legacy-root' });
+  const row = listed.subagents[0];
+  handlers.get('agent/status')({
+    agent: { session: { id: 'legacy-child', header: { origin: 'subagent', parentSession: 'legacy-root', cwd: '/tmp' } } },
+    status: 'running',
+  });
+  const opened = frames.filter((frame) => frame.method === 'session.child-opened');
+  check(
+    'an rc.1-shaped row (no name/path) gains neither key, in the listing or the notice',
+    row !== undefined && !('name' in row) && !('path' in row) &&
+      opened.length === 1 && !('name' in opened[0].params) && !('path' in opened[0].params) &&
+      opened[0].params.label === 'Legacy C',
+    JSON.stringify({ row, params: opened[0]?.params }),
+  );
+}
+
+// ===== 12. a malformed name/path: ignored, logged once, child still opens ===
+// A cross-version input must not throw and must not be coerced. The log line is
+// part of the contract: silently dropping it would leave "why is this row
+// missing its name" unanswerable, and repeating it on every catalog read (the
+// plugin lists on each open) would flood the log for one broken upstream field.
+{
+  const captured = [];
+  const originalWrite = process.stderr.write;
+  process.stderr.write = (chunk, ..._rest) => {
+    captured.push(String(chunk));
+    return true;
+  };
+  try {
+    const rows = [
+      {
+        kind: 'child', id: 'bad-identity', parentId: 'bad-root', label: 'Bad B', mode: 'continuable',
+        name: 42, path: { segments: ['x'] },
+      },
+    ];
+    const { server, handlers, frames } = makeServer({ subagents: { listDescendants: async () => rows } });
+    const listed = await server.subagents({ sessionId: 'bad-root' });
+    // A second read is exactly what a real reopen does; the warning must not repeat.
+    const second = await server.subagents({ sessionId: 'bad-root' });
+    handlers.get('agent/status')({
+      agent: { session: { id: 'bad-identity', header: { origin: 'subagent', parentSession: 'bad-root', cwd: '/tmp' } } },
+      status: 'running',
+    });
+    const row = listed.subagents[0];
+    const opened = frames.filter((frame) => frame.method === 'session.child-opened');
+    check(
+      'a non-string name/path is ignored, never coerced into the listing or the notice',
+      row !== undefined && !('name' in row) && !('path' in row) &&
+        opened.length === 1 && !('name' in opened[0].params) && !('path' in opened[0].params),
+      JSON.stringify({ row, params: opened[0]?.params }),
+    );
+    check(
+      'and the child still opens on its label (a bad identity never costs the row)',
+      opened.length === 1 && opened[0].params.label === 'Bad B',
+      JSON.stringify(opened.map((frame) => frame.params)),
+    );
+    check(
+      'the malformed field is reported with exactly one stderr line per child and field',
+      captured.filter((line) => line.includes('ignoring a non-string name for subagent bad-identity')).length === 1 &&
+        captured.filter((line) => line.includes('ignoring a non-string path for subagent bad-identity')).length === 1 &&
+        second.available === true,
+      JSON.stringify(captured),
+    );
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+}
+
+
+// ===== 13. naming capability, listing origin, catalog forwarding ==========
+// See item 10 in the header. The plugin cannot open a child twice (Paseo's
+// title/description are captured at the first `attachChild`), so the bridge tells
+// it whether a name is coming: `serverInfo.subagentNames` on `initialize`.
+{
+  const llm = { listProviders: () => [{ id: 'fake' }], resolveCallConfig: async () => ({}) };
+  const named = makeServer({
+    llm,
+    subagents: { namesOf: () => ({ name: 'x' }), listDescendants: async () => [] },
+  });
+  const reply = await named.server.initialize({ cwd: '/tmp', provider: 'fake', model: 'fake', sessionId: 'named-cap' });
+  check(
+    'initialize advertises child naming when the composed subagents service has namesOf',
+    reply?.serverInfo?.subagentNames === true,
+    JSON.stringify(reply?.serverInfo ?? null),
+  );
+
+  const legacy = makeServer({
+    llm,
+    // rc.1's surface: the listing exists, names do not.
+    subagents: { listChildren: async () => [], listDescendants: async () => [] },
+  });
+  const legacyReply = await legacy.server.initialize({ cwd: '/tmp', provider: 'fake', model: 'fake', sessionId: 'legacy-cap' });
+  check(
+    'a service without namesOf/rootOf (rc.1) advertises no naming, so no wait is possible',
+    legacyReply?.serverInfo?.subagentNames === false,
+    JSON.stringify(legacyReply?.serverInfo ?? null),
+  );
+}
+
+{
+  const { server, handlers, frames } = makeServer({ subagents: { listDescendants: async () => [] } });
+  const childSession = { id: 'live-child', header: { origin: 'subagent', parentSession: 'live-root', cwd: '/tmp' } };
+  handlers.get('agent/status')({ agent: { session: childSession }, status: 'running' });
+  handlers.get('session/event')(childSession, {
+    type: 'subagent/descriptor',
+    seq: 1,
+    data: { version: 3, mode: 'continuable', provider: 'spawn', label: 'Live C' },
+  });
+  const opened = frames.find((frame) => frame.method === 'session.child-opened');
+  check(
+    'a live child notice is not marked as coming from the durable listing',
+    opened !== undefined && !('listed' in opened.params),
+    JSON.stringify(opened?.params ?? null),
+  );
+}
+
+{
+  // The post-reload child: registered from the durable listing, which is also the
+  // last catalog fact it will ever produce. The plugin must not wait for a name
+  // that cannot arrive, so the notice says where it came from.
+  const rows = [
+    { kind: 'child', id: 'listed-child', parentId: 'listed-root', label: 'Listed L', mode: 'continuable', name: 'listed-l', path: 'listed-l' },
+  ];
+  const { server, handlers, frames } = makeServer({ subagents: { listDescendants: async () => rows } });
+  await server.subagents({ sessionId: 'listed-root' });
+  handlers.get('agent/status')({
+    agent: { session: { id: 'listed-child', header: { origin: 'subagent', parentSession: 'listed-root', cwd: '/tmp' } } },
+    status: 'running',
+  });
+  const opened = frames.find((frame) => frame.method === 'session.child-opened');
+  check(
+    'a listing-registered child notice says listed and still carries its name',
+    opened?.params?.listed === true && opened?.params?.name === 'listed-l' && opened?.params?.path === 'listed-l',
+    JSON.stringify(opened?.params ?? null),
+  );
+}
+
+{
+  // The name source itself: the parent's catalog fact must reach the plugin as an
+  // ordinary `session.event`, or the wait above could never end.
+  const { handlers, frames } = makeServer({ subagents: { namesOf: () => ({}), listDescendants: async () => [] } });
+  handlers.get('session/event')({ id: 'catalog-parent' }, {
+    type: 'subagent/catalog',
+    seq: 1,
+    data: { version: 3, childId: 'catalog-child', childCreatedAt: 1, mode: 'continuable', label: 'Catalog C', name: 'catalog-name' },
+  });
+  const forwarded = frames.find(
+    (frame) => frame.method === 'session.event' && frame.params.sessionId === 'catalog-parent' &&
+      frame.params.event?.type === 'subagent/catalog',
+  );
+  check(
+    'the parent catalog fact (the only live source of a name) is forwarded unchanged',
+    forwarded?.params?.event?.data?.name === 'catalog-name',
+    JSON.stringify(forwarded?.params ?? null),
+  );
+}
+
 console.log("bridge server: a job_output row takes its own background task's title\n");
 {
   const { server, handlers, frames } = makeServer();
@@ -1646,6 +1880,55 @@ console.log("bridge server: the job title tables survive a refresh (close -> reo
     'the live-snapshot replay outlet stamps the title too',
     liveFrame?.data?.jobTitle === '快照标题',
     JSON.stringify(liveFrame?.data),
+  );
+}
+
+// ===== 8. the delegated-work join accepts both subagent wait generations ====
+{
+  // No `agents` service: `settleDelegatedWork` falls back to the subagent wait.
+  let treeCalls = 0;
+  const tree = makeServer({
+    subagents: { waitForTreeWork: async () => { treeCalls += 1; } },
+  }).server;
+  await tree.settleDelegatedWork({ id: 'root-1' }, ['child-1']);
+  check(
+    'waitForTreeWork (DSH 0.2.2-rc.2+) joins the delegated work',
+    treeCalls === 1,
+    String(treeCalls),
+  );
+
+  let childrenArgument;
+  const children = makeServer({
+    subagents: { waitForChildren: async (agent) => { childrenArgument = agent; } },
+  }).server;
+  const root = { id: 'root-1' };
+  await children.settleDelegatedWork(root, ['child-1']);
+  check(
+    'the older waitForChildren (DSH <= 0.2.2-rc.1) is still accepted',
+    childrenArgument === root,
+    JSON.stringify(childrenArgument),
+  );
+
+  const neither = makeServer({ subagents: {} }).server;
+  const { lines } = await captureStderr(() => neither.settleDelegatedWork({ id: 'root-1' }, ['child-1']));
+  check(
+    'a subagent service with neither wait is logged, not silently skipped',
+    lines.some((line) => /neither waitForTreeWork/.test(line)),
+    JSON.stringify(lines),
+  );
+  // A live `agents` service keeps its identity join; the fallback must not be
+  // reached at all (the waits are per withdrawn child, `whenIdle`).
+  let fallbackCalls = 0;
+  let idleResolved = false;
+  const live = makeServer({
+    agents: { get: (id) => (id === 'child-1' ? { id, status: 'running', whenIdle: async () => { idleResolved = true; } } : undefined) },
+    subagents: { waitForTreeWork: async () => { fallbackCalls += 1; } },
+  }).server;
+  await live.settleDelegatedWork({ id: 'root-1' }, ['child-1']);
+  check(
+    'a live agents service still joins by identity, not the tree wait',
+    idleResolved && fallbackCalls === 0,
+    `idle=${String(idleResolved)} tree=${String(fallbackCalls)}`,
   );
 }
 

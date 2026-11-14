@@ -1158,11 +1158,21 @@ export function InlineToolCall({
               this is where the error text itself is readable. It is skipped
               when the block already prints the same text (see `errorBlock`). */}
           {/* A known refusal opens with one plain sentence and DSH's code; the
-              verbatim reason follows, unchanged, so nothing DSH said is lost. */}
+              verbatim reason follows, unchanged, so nothing DSH said is lost.
+              DSH's error class rides inside the same grey span (expanded block
+              only): `APPROVAL_REJECTED（ApprovalError）`. */}
           {data.errorHint !== "" ? (
             <Text style={styles.hintText}>
               {data.errorHint}
-              <Text style={styles.hintCode}>{`  ${data.errorCode}`}</Text>
+              <Text style={styles.hintCode}>{`  ${data.errorCode}${data.errorName === undefined ? "" : `（${data.errorName}）`}`}</Text>
+            </Text>
+          ) : null}
+          {/* A code this client has no sentence for, but which DSH still named:
+              the code and class are wire facts, so they print in the same grey
+              style rather than being dropped. No words are invented for it. */}
+          {data.errorHint === "" && data.errorCode !== "" && data.errorName !== undefined ? (
+            <Text style={styles.hintText}>
+              <Text style={styles.hintCode}>{`${data.errorCode}（${data.errorName}）`}</Text>
             </Text>
           ) : null}
           {errorBlock !== "" ? (

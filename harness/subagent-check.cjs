@@ -73,12 +73,6 @@ function setMode(value) {
   fs.writeFileSync(MODE_FILE, `${value}\n`);
 }
 
-// A **whole-run** frame log, separate from the per-scenario `DSH_FAKE_LOG` files
-// the cases below arm and delete. This one is never deleted, so it can answer
-// "did the pooled child ever die during this run?" — which the per-case logs
-// cannot, because each is armed after the shared child already started.
-const runFrameLog = path.join(process.env.DSH_HOME, "run-frames.jsonl");
-process.env.DSH_FAKE_LOG = runFrameLog;
 process.on("exit", () => {
   // The mode file lives inside DSH_HOME, so the recursive removal below covers it;
   // deleting it explicitly keeps that true if the path ever moves.
@@ -430,6 +424,243 @@ async function openSession(conn, sessionId, history) {
       !conn2Events.some((e) => e.type === "session.runtime_failed"),
   );
 
+  // ---- the real rc.3 order: the label arrives before the name --------------
+  // The child's own `subagent/descriptor` carries no name; the name is in the
+  // parent's `subagent/catalog` v3 fact, which reaches the plugin a few
+  // milliseconds *after* the bridge announces the child. Paseo captures
+  // title/description once, at that announcement, so the plugin has to hold the
+  // single `session.opened` for the catalog fact (bounded) and announce
+  // `title = name`, `description = label`. Before this fix it announced
+  // `title = label` and the name was lost for good.
+  const conn8 = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+  const conn8Events = [];
+  conn8.onEvent((e) => conn8Events.push(e));
+  const rootZ = `subZ-${Date.now()}`;
+  setMode("catalog-late");
+  await conn8.send({ type: "session.open", sessionId: rootZ, config: { cwd: process.cwd(), mode: "build" }, history: "skip" });
+  await untilIn(conn8Events, (e) => e.type === "session.ready" && e.sessionId === rootZ, "rootZ ready", 30000);
+  await conn8.send({ type: "session.prompt", sessionId: rootZ, prompt: { clientMessageId: "pZ", input: { type: "message", content: [{ type: "text", text: "go" }] } } });
+  const catalogLate = await untilIn(
+    conn8Events,
+    (e) => e.type === "session.opened" && e.sessionId === scoped(rootZ, "child-NC"),
+    "child-NC opened",
+    30000,
+  );
+  check(
+    "a child announced before the parent catalog is opened with the catalog name and the label underneath",
+    catalogLate.title === "catalog-late-name" && catalogLate.description === "Catalog Late NC",
+    JSON.stringify({ title: catalogLate.title, description: catalogLate.description }),
+  );
+  await untilIn(
+    conn8Events,
+    (e) => e.type === "timeline.item" && e.sessionId === scoped(rootZ, "child-NC") && e.item?.text === "catalog-late child answer",
+    "the held child's output",
+    30000,
+  );
+  check("the frames held during the name wait still arrive, in order", true, "catalog-late child answer");
+  await conn8.send({ type: "session.close", sessionId: rootZ });
+  await conn8.close();
+
+  // ---- rc.1: no naming capability advertised, so no wait at all -----------
+  // The bridge report is the only difference from the case above: without
+  // `serverInfo.subagentNames` (0.2.2-rc.1, or a profile with no subagent
+  // service) a label-only child must open immediately, as it always did. The
+  // root frame emitted right behind the notice is the ordering witness: a wait
+  // would push the announcement past it.
+  const conn9 = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+  const conn9Events = [];
+  conn9.onEvent((e) => conn9Events.push(e));
+  const rootW = `subW-${Date.now()}`;
+  setMode("catalog-absent");
+  await conn9.send({ type: "session.open", sessionId: rootW, config: { cwd: process.cwd(), mode: "build" }, history: "skip" });
+  await untilIn(conn9Events, (e) => e.type === "session.ready" && e.sessionId === rootW, "rootW ready", 30000);
+  await conn9.send({ type: "session.prompt", sessionId: rootW, prompt: { clientMessageId: "pW", input: { type: "message", content: [{ type: "text", text: "go" }] } } });
+  const absentChild = await untilIn(
+    conn9Events,
+    (e) => e.type === "session.opened" && e.sessionId === scoped(rootW, "child-NR"),
+    "child-NR opened",
+    30000,
+  );
+  const absentOpenIndex = conn9Events.findIndex((e) => e.type === "session.opened" && e.sessionId === scoped(rootW, "child-NR"));
+  const rootAfterCatalogIndex = conn9Events.findIndex(
+    (e) => e.type === "timeline.item" && e.sessionId === rootW && e.item?.text === "root frame after catalogue",
+  );
+  check(
+    "without a naming capability a label-only child opens immediately (label title, no description)",
+    absentChild.title === "Catalog Absent NR" && absentChild.description === undefined,
+    JSON.stringify({ title: absentChild.title, description: absentChild.description }),
+  );
+  check(
+    "and it is announced before the root frame that follows the catalog fact (no wait on rc.1)",
+    absentOpenIndex >= 0 && rootAfterCatalogIndex > absentOpenIndex,
+    `open#${String(absentOpenIndex)} root#${String(rootAfterCatalogIndex)}`,
+  );
+  await conn9.send({ type: "session.close", sessionId: rootW });
+  await conn9.close();
+
+  // ---- two levels: a grandchild's name rides its parent's catalog --------
+  // The root's catalog only names its own direct children. A grandchild is named
+  // in the catalog of the child that created it, and that event reaches the
+  // plugin on the child session's channel — opened or not yet opened.
+  const connR4a = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+  const connR4aEvents = [];
+  connR4a.onEvent((e) => connR4aEvents.push(e));
+  const rootR4tree = `subP-${Date.now()}`;
+  setMode("catalog-tree");
+  await connR4a.send({ type: "session.open", sessionId: rootR4tree, config: { cwd: process.cwd(), mode: "build" }, history: "skip" });
+  await untilIn(connR4aEvents, (e) => e.type === "session.ready" && e.sessionId === rootR4tree, "rootR4tree ready", 30000);
+  await connR4a.send({ type: "session.prompt", sessionId: rootR4tree, prompt: { clientMessageId: "pP", input: { type: "message", content: [{ type: "text", text: "go" }] } } });
+  const treeParentR4 = await untilIn(connR4aEvents, (e) => e.type === "session.opened" && e.sessionId === scoped(rootR4tree, "tree-child-P"), "tree-child-P opened", 30000);
+  const treeGrandR4 = await untilIn(connR4aEvents, (e) => e.type === "session.opened" && e.sessionId === scoped(rootR4tree, "tree-grand-P"), "tree-grand-P opened", 30000);
+  check(
+    "a direct child's name from the root catalog still titles its row",
+    treeParentR4.title === "tree-p" && treeParentR4.description === "Tree P Label",
+    JSON.stringify({ title: treeParentR4.title, description: treeParentR4.description }),
+  );
+  check(
+    "a grandchild's name arrives on its parent child session's catalog and titles its row",
+    treeGrandR4.title === "tree-g" && treeGrandR4.description === "Tree G Label",
+    JSON.stringify({ title: treeGrandR4.title, description: treeGrandR4.description }),
+  );
+  const treeOpenedR4 = connR4aEvents.findIndex((e) => e.type === "session.opened" && e.sessionId === scoped(rootR4tree, "tree-grand-P"));
+  const treeMarkerR4 = connR4aEvents.findIndex(
+    (e) => e.type === "timeline.item" && e.sessionId === rootR4tree && e.item?.text === "root marker after tree",
+  );
+  check(
+    "the grandchild opens before the root marker that follows its catalog (not on the 750 ms timer)",
+    treeOpenedR4 >= 0 && treeMarkerR4 > treeOpenedR4,
+    `open#${String(treeOpenedR4)} marker#${String(treeMarkerR4)}`,
+  );
+  await connR4a.send({ type: "session.close", sessionId: rootR4tree });
+  await connR4a.close();
+
+  // ---- the out-of-order variant: grandchild before its own parent --------
+  const connR4b = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+  const connR4bEvents = [];
+  connR4b.onEvent((e) => connR4bEvents.push(e));
+  const rootR4early = `subQ-${Date.now()}`;
+  setMode("catalog-tree-early");
+  await connR4b.send({ type: "session.open", sessionId: rootR4early, config: { cwd: process.cwd(), mode: "build" }, history: "skip" });
+  await untilIn(connR4bEvents, (e) => e.type === "session.ready" && e.sessionId === rootR4early, "rootR4early ready", 30000);
+  await connR4b.send({ type: "session.prompt", sessionId: rootR4early, prompt: { clientMessageId: "pQ", input: { type: "message", content: [{ type: "text", text: "go" }] } } });
+  const earlyGrandR4 = await untilIn(connR4bEvents, (e) => e.type === "session.opened" && e.sessionId === scoped(rootR4early, "tree-grand-E"), "tree-grand-E opened", 30000);
+  check(
+    "a grandchild announced before its parent still gets the name from the unopened parent's catalog",
+    earlyGrandR4.title === "tree-g-early" && earlyGrandR4.description === "Tree Early G Label",
+    JSON.stringify({ title: earlyGrandR4.title, description: earlyGrandR4.description }),
+  );
+  const earlyOpenedR4 = connR4bEvents.findIndex((e) => e.type === "session.opened" && e.sessionId === scoped(rootR4early, "tree-grand-E"));
+  const earlyMarkerR4 = connR4bEvents.findIndex(
+    (e) => e.type === "timeline.item" && e.sessionId === rootR4early && e.item?.text === "root marker after tree",
+  );
+  check(
+    "and it waits only for its parent notice, not for the timer",
+    earlyOpenedR4 >= 0 && earlyMarkerR4 > earlyOpenedR4,
+    `open#${String(earlyOpenedR4)} marker#${String(earlyMarkerR4)}`,
+  );
+  await connR4b.send({ type: "session.close", sessionId: rootR4early });
+  await connR4b.close();
+
+  // ---- the frame bound fires without any catalog fact --------------------
+  // The count and wall-clock bounds are separate exits; with no catalog fact the
+  // count must be the one that opens the row (the root marker right behind the
+  // frames is the ordering witness, and the log names the bound).
+  const connR4c = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+  const connR4cEvents = [];
+  connR4c.onEvent((e) => connR4cEvents.push(e));
+  const rootR4frames = `subM-${Date.now()}`;
+  setMode("catalog-none");
+  await connR4c.send({ type: "session.open", sessionId: rootR4frames, config: { cwd: process.cwd(), mode: "build" }, history: "skip" });
+  await untilIn(connR4cEvents, (e) => e.type === "session.ready" && e.sessionId === rootR4frames, "rootR4frames ready", 30000);
+  const stderrLinesR4 = [];
+  const originalStderrWriteR4 = process.stderr.write;
+  process.stderr.write = (chunk, ...rest) => {
+    stderrLinesR4.push(String(chunk));
+    return originalStderrWriteR4.call(process.stderr, chunk, ...rest);
+  };
+  let framesChildR4;
+  try {
+    await connR4c.send({ type: "session.prompt", sessionId: rootR4frames, prompt: { clientMessageId: "pM", input: { type: "message", content: [{ type: "text", text: "go" }] } } });
+    framesChildR4 = await untilIn(connR4cEvents, (e) => e.type === "session.opened" && e.sessionId === scoped(rootR4frames, "child-NF"), "child-NF opened", 30000);
+  } finally {
+    process.stderr.write = originalStderrWriteR4;
+  }
+  check(
+    "with no catalog fact the frame bound opens the label-only child",
+    framesChildR4.title === "Frames F" && framesChildR4.description === undefined,
+    JSON.stringify({ title: framesChildR4.title, description: framesChildR4.description }),
+  );
+  const framesOpenedR4 = connR4cEvents.findIndex((e) => e.type === "session.opened" && e.sessionId === scoped(rootR4frames, "child-NF"));
+  const framesMarkerR4 = connR4cEvents.findIndex(
+    (e) => e.type === "timeline.item" && e.sessionId === rootR4frames && e.item?.text === "root marker after frames",
+  );
+  check(
+    "and it opens before the root marker that follows the frames (the 750 ms timer would open after it)",
+    framesOpenedR4 >= 0 && framesMarkerR4 > framesOpenedR4,
+    `open#${String(framesOpenedR4)} marker#${String(framesMarkerR4)}`,
+  );
+  check(
+    "and the frame bound logs why it opened with the label",
+    stderrLinesR4.some((line) => line.includes("held 8 frames with no catalog name")),
+    JSON.stringify(stderrLinesR4.filter((line) => line.includes("catalog name"))),
+  );
+  await connR4c.send({ type: "session.close", sessionId: rootR4frames });
+  await connR4c.close();
+
+  // ---- the frame bound is sticky and logs once, even while gated ----------
+  // The notice has no label yet, so the label gate keeps it unopened after the
+  // name bound expires. Twelve frames follow before the descriptor releases the
+  // label: the bound must log exactly once (and not re-run a flush per surplus
+  // frame), then the child opens with its label and every frame arrives in order.
+  const connR5 = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+  const connR5Events = [];
+  connR5.onEvent((e) => connR5Events.push(e));
+  const rootR5 = `subR5-${Date.now()}`;
+  setMode("name-bound-gated");
+  await connR5.send({ type: "session.open", sessionId: rootR5, config: { cwd: process.cwd(), mode: "build" }, history: "skip" });
+  await untilIn(connR5Events, (e) => e.type === "session.ready" && e.sessionId === rootR5, "rootR5 ready", 30000);
+  const stderrR5 = [];
+  const originalStderrR5 = process.stderr.write;
+  process.stderr.write = (chunk, ...rest) => {
+    stderrR5.push(String(chunk));
+    return originalStderrR5.call(process.stderr, chunk, ...rest);
+  };
+  let boundChildR5;
+  try {
+    await connR5.send({ type: "session.prompt", sessionId: rootR5, prompt: { clientMessageId: "pR5", input: { type: "message", content: [{ type: "text", text: "go" }] } } });
+    boundChildR5 = await untilIn(connR5Events, (e) => e.type === "session.opened" && e.sessionId === scoped(rootR5, "child-NB"), "child-NB opened", 30000);
+    await untilIn(
+      connR5Events,
+      (e) => e.type === "timeline.item" && e.sessionId === scoped(rootR5, "child-NB") && e.item?.text === "bound-gated line 11",
+      "the last of the held frames",
+      30000,
+    );
+  } finally {
+    process.stderr.write = originalStderrR5;
+  }
+  const boundLogsR5 = stderrR5.filter((line) => line.includes("held 8 frames with no catalog name"));
+  check(
+    "a frame bound that expires behind another gate logs exactly once, not once per surplus frame",
+    boundLogsR5.length === 1,
+    `${String(boundLogsR5.length)} line(s): ${JSON.stringify(boundLogsR5)}`,
+  );
+  check(
+    "and the child still opens with its label once the other gate releases",
+    boundChildR5.title === "Bound Gated NB" && boundChildR5.description === undefined,
+    JSON.stringify({ title: boundChildR5.title, description: boundChildR5.description }),
+  );
+  const boundTextsR5 = connR5Events
+    .filter((e) => e.type === "timeline.item" && e.sessionId === scoped(rootR5, "child-NB") && typeof e.item?.text === "string" && e.item.text.startsWith("bound-gated line "))
+    .map((e) => e.item.text);
+  const expectedR5 = Array.from({ length: 12 }, (_, index) => `bound-gated line ${String(index)}`);
+  check(
+    "and every held frame arrives exactly once, in order",
+    boundTextsR5.length === expectedR5.length && boundTextsR5.every((text, index) => text === expectedR5[index]),
+    JSON.stringify(boundTextsR5),
+  );
+  await connR5.send({ type: "session.close", sessionId: rootR5 });
+  await connR5.close();
+
   // ---- child reported before the parent is ready -------------------------
   const conn3 = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
   const conn3Events = [];
@@ -461,8 +692,16 @@ async function openSession(conn, sessionId, history) {
   // opens with is the only one it can ever have (children have no configuration
   // channel), so the replay has to read the descriptor out of the child's own
   // history before opening it.
-  const replayOpens = events.filter((e) => e.type === "session.opened" && e.sessionId.endsWith(":sub:child-B"));
-  check("a replayed one-shot child opens with its own descriptor's label", replayOpens.length > 0 && replayOpens.every((e) => e.title === "Nested B"), JSON.stringify(replayOpens.map((e) => e.title)));
+  const childBOpenEvents = events.filter((e) => e.type === "session.opened" && e.sessionId.endsWith(":sub:child-B"));
+  // At this point `child-B` has only been opened by the live scenario's notice,
+  // which carries a label and no identity: the label keeps the title and there is
+  // no second line. The replayed generation (whose label comes from the child's
+  // own descriptor because the catalog row has none) is asserted further down.
+  check(
+    "a live child with no identity keeps its creation label as the title",
+    childBOpenEvents.length > 0 && childBOpenEvents.every((e) => e.title === "Nested B" && e.description === undefined),
+    JSON.stringify(childBOpenEvents.map((e) => ({ title: e.title, description: e.description }))),
+  );
 
   // ---- a child whose label never arrives --------------------------------
   // The hold exists so a child opens with its real title; it must still be
@@ -949,6 +1188,129 @@ async function openSession(conn, sessionId, history) {
     !conn5Events.some((e) => e.type === "timeline.item" && /GHOST-SHOULD-NOT-APPEAR/.test(timelineText(e))),
   );
 
+  // ---- identity: title is DSH's name/path, description is the label --------
+  // DSH 0.2.2-rc.2+ names every child it records and computes a root-relative
+  // slash path in the recursive listing. Paseo's host paints `description` as the
+  // row's FIRST line and `title` as the muted line under it, so keeping the task
+  // description first — where it has always been — means title = identity and
+  // description = label. The two fields stay apart: a label is a free-text task
+  // description, a name is the model-addressable identity, and neither backfills
+  // the other.
+  const openedOf = (scopedId) =>
+    conn5Events.find((e) => e.type === "session.opened" && e.sessionId === scopedId);
+  const pOpen = openedOf(pScoped);
+  const gOpen = openedOf(gScoped);
+  const hOpen = openedOf(hScoped);
+  check(
+    "a named direct child titles with its name and keeps the task label as the description",
+    pOpen?.title === "parent-p" && pOpen?.description === "Parent P",
+    JSON.stringify({ title: pOpen?.title, description: pOpen?.description }),
+  );
+  check(
+    "a grandchild titles with its root-relative path, not its bare name",
+    gOpen?.title === "parent-p/grand-g" && gOpen?.description === "Grand G",
+    JSON.stringify({ title: gOpen?.title, description: gOpen?.description }),
+  );
+  check(
+    "a great-grandchild's title is the full path and its description is still the label",
+    hOpen?.title === "parent-p/grand-g/great-h" && hOpen?.description === "Great H",
+    JSON.stringify({ title: hOpen?.title, description: hOpen?.description }),
+  );
+  check(
+    "a parent's identity never overwrites its child's (three levels, three titles)",
+    new Set([pOpen?.title, gOpen?.title, hOpen?.title]).size === 3,
+    JSON.stringify([pOpen?.title, gOpen?.title, hOpen?.title]),
+  );
+
+  // ---- the shapes an older or foreign bridge exercises ---------------------
+  // (c) rc.1 has no identity fields at all, so its row must be exactly the one
+  // Paseo showed before this feature — same title, and no `description` key.
+  // (d) a non-string `name`/`path` is absent, never coerced: the real bridge
+  // drops and logs it (`harness/bridge-server-check.mjs` pins that half), and
+  // the plugin must still open the child if some other bridge version passes
+  // one through instead of turning the row into `"[object Object]"`.
+  const conn6 = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+  const conn6Events = [];
+  conn6.onEvent((e) => conn6Events.push(e));
+  const rootX = `subX-${Date.now()}`;
+  setMode("name-missing");
+  await conn6.send({ type: "session.open", sessionId: rootX, config: { cwd: process.cwd(), mode: "build" }, history: "skip" });
+  await untilIn(conn6Events, (e) => e.type === "session.ready" && e.sessionId === rootX, "rootX ready", 30000);
+  await conn6.send({ type: "session.prompt", sessionId: rootX, prompt: { clientMessageId: "pX", input: { type: "message", content: [{ type: "text", text: "go" }] } } });
+  const legacyOpen = await untilIn(
+    conn6Events,
+    (e) => e.type === "session.opened" && e.sessionId === scoped(rootX, "child-NM"),
+    "child-NM opened",
+    30000,
+  );
+  check(
+    "a child with only a label (rc.1 shape) keeps the label title and gains no description",
+    legacyOpen.title === "Legacy NM" && legacyOpen.description === undefined,
+    JSON.stringify({ title: legacyOpen.title, description: legacyOpen.description }),
+  );
+  const invalidOpen = await untilIn(
+    conn6Events,
+    (e) => e.type === "session.opened" && e.sessionId === scoped(rootX, "child-NV"),
+    "child-NV opened",
+    30000,
+  );
+  check(
+    "a non-string name/path is treated as absent: no description, and the child still opens",
+    invalidOpen.title === "Invalid NV" && invalidOpen.description === undefined,
+    JSON.stringify({ title: invalidOpen.title, description: invalidOpen.description }),
+  );
+  await untilIn(
+    conn6Events,
+    (e) => e.type === "timeline.item" && e.sessionId === scoped(rootX, "child-NM") && e.item?.text === "legacy child answer",
+    "the rc.1-shaped child's output",
+    30000,
+  );
+  check(
+    "an absent identity never costs the row its output",
+    conn6Events.some((e) => e.type === "timeline.item" && e.sessionId === scoped(rootX, "child-NV") && e.item?.text === "invalid-identity child answer"),
+  );
+  await conn6.send({ type: "session.close", sessionId: rootX });
+  await conn6.close();
+
+  // ---- the corners of "identity first, label second" -----------------------
+  // (f) a named child with no label: the label wait expires and it opens with the
+  // name as its title and **no** description — a named row beats one stuck on
+  // "加载中…", and there is no task text for the second line. (g) a label equal to
+  // the name: the host does not compare the two, so the description must be
+  // dropped or the same text is painted twice.
+  const conn7 = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+  const conn7Events = [];
+  conn7.onEvent((e) => conn7Events.push(e));
+  const rootY = `subY-${Date.now()}`;
+  setMode("name-only");
+  await conn7.send({ type: "session.open", sessionId: rootY, config: { cwd: process.cwd(), mode: "build" }, history: "skip" });
+  await untilIn(conn7Events, (e) => e.type === "session.ready" && e.sessionId === rootY, "rootY ready", 30000);
+  await conn7.send({ type: "session.prompt", sessionId: rootY, prompt: { clientMessageId: "pY", input: { type: "message", content: [{ type: "text", text: "go" }] } } });
+  const namedNoLabel = await untilIn(
+    conn7Events,
+    (e) => e.type === "session.opened" && e.sessionId === scoped(rootY, "child-NL"),
+    "child-NL opened after the label wait",
+    30000,
+  );
+  check(
+    "a named child with no label titles with its name and carries no description",
+    namedNoLabel.title === "no-label-child" && namedNoLabel.description === undefined,
+    JSON.stringify({ title: namedNoLabel.title, description: namedNoLabel.description }),
+  );
+  const sameName = await untilIn(
+    conn7Events,
+    (e) => e.type === "session.opened" && e.sessionId === scoped(rootY, "child-ND"),
+    "child-ND opened",
+    30000,
+  );
+  check(
+    "a label equal to the name never produces a second identical line",
+    sameName.title === "same-name" && sameName.description === undefined,
+    JSON.stringify({ title: sameName.title, description: sameName.description }),
+  );
+  await conn7.send({ type: "session.close", sessionId: rootY });
+  await conn7.close();
+
   // ---- the two reopen shapes, and why they announce differently ----------
   //
   // `session.ts` `announcedLive` decides whether a replayed child is
@@ -958,14 +1320,12 @@ async function openSession(conn, sessionId, history) {
   // one child (the subagent list would show a duplicate).
   //
   // Which shape a reopen takes depends on whether the shared child survived the
-  // close, and the pool keeps it for a grace period (`POOL_RELEASE_GRACE_MS`,
-  // 5 s). Both shapes are reachable from a test and both must be asserted:
-  //
-  //   close -> open within the grace   => reuse      => child views survive
-  //   close -> wait past the grace     => cold start => tree rebuilt from history
-  //
-  // The second shape is what this block needs, so it waits out the grace period.
-  // Waiting on *an announcement* instead, as an earlier form did, hangs forever.
+  // close. The pool is **per connection** and the child is resident for that
+  // connection's whole life (`ae814f3` removed the 5 s idle retirement), so
+  // closing sessions on this connection no longer retires it: a reopen here is
+  // always an adoption. Both shapes are still reachable and both must be
+  // asserted, but the cold one needs a **second connection** (its own pool, so
+  // its first open spawns a child nothing has served) — see the reopen below.
   //
   // **What a reuse reopen must not do is create a second row for one child.** An
   // earlier version of this check claimed "reuse => no `session.opened` at all",
@@ -999,11 +1359,44 @@ async function openSession(conn, sessionId, history) {
       + (duplicateRows.length === 0 ? "" : ` — duplicated: ${duplicateRows.join(", ")}`),
   );
 
+  // ---- the replay path applies the same title/description rule -------------
+  // A reopen rebuilds titles from the durable listing, so this is the other half
+  // of the one rule `childIdentity` implements: title = `path` (child-A) / `path`
+  // through a named ancestor (child-B) with the task label in the description,
+  // and the historical/rc.1 row (child-M, no name) stays title = label with no
+  // description at all.
+  const reusedOpenOf = (nativeId) =>
+    reusedRun.find((e) => e.type === "session.opened" && e.sessionId === scoped(rootA, nativeId));
+  const reuseA = reusedOpenOf("child-A");
+  const reuseB = reusedOpenOf("child-B");
+  const reuseM = reusedOpenOf("child-M");
+  check(
+    "a replayed child titles with DSH's path and keeps its label as the description",
+    reuseA?.title === "research-a" && reuseA?.description === "Research A",
+    JSON.stringify({ title: reuseA?.title, description: reuseA?.description }),
+  );
+  check(
+    "a replayed grandchild gets its label from its own descriptor and its title from the listing path",
+    reuseB?.title === "research-a/nested-b" && reuseB?.description === "Nested B",
+    JSON.stringify({ title: reuseB?.title, description: reuseB?.description }),
+  );
+  check(
+    "a replayed row without a name (historical/rc.1 shape) still carries no description",
+    reuseM !== undefined && reuseM.title === "Live M" && reuseM.description === undefined,
+    JSON.stringify({ found: reuseM !== undefined, title: reuseM?.title, description: reuseM?.description }),
+  );
+
   // Now the other shape. A **cold start** is what rebuilds the tree from history
-  // with fresh child views, so the block below needs one. Whether it happens
-  // depends on the shared child actually retiring, which requires the reference
-  // count to reach zero: every session on every open connection must have
-  // released it. So all finished connections and sessions are closed first.
+  // with fresh child views, so the block below needs one — and on this connection
+  // there can no longer be one: its child is resident until `close()`, so a
+  // reopen here is the adoption case asserted above. A second connection has its
+  // own pool and its first open spawns a child that has served nothing, which is
+  // exactly the cold start (and, unlike the old "sleep past the grace period"
+  // form, a property of the code rather than of the wait).
+  //
+  // First quiet everything that is done: the rest of the suite needs no live
+  // session on the finished connections, and their claims would otherwise follow
+  // the run to the end.
   for (const [label, connection] of [
     ["conn2", conn2],
     ["conn3", conn3],
@@ -1019,16 +1412,10 @@ async function openSession(conn, sessionId, history) {
       console.error(`  note: closing ${label} failed: ${error.message}`);
     }
   }
-  // Every session still attached to *any* open connection holds a reference to the
-  // one shared child, and the pool only retires it when the count reaches zero.
   // This script keeps a root open per case (they are closed only at the very end),
-  // so by this point six sessions are still attached. Close them all — their
-  // assertions have already run — or the child never retires and the reopen below
-  // silently reuses it.
-  //
-  // Measured: with only `rootA`/`rootB` closed the child was still alive after
-  // 12 s (the grace is 5 s), which is exactly what a lingering reference looks
-  // like.
+  // so by this point every earlier case still has one attached to `conn`. Close
+  // them: their assertions have already run, and the connection's child should
+  // not be left carrying claims from cases that are done.
   for (const [label, sessionId] of [
     // The archive-isolation case leaves `survivorRoot` open on purpose — that is
     // the whole point of the assertion ("the survivor keeps working"). It is closed
@@ -1054,87 +1441,21 @@ async function openSession(conn, sessionId, history) {
       console.error(`  note: closing ${label} failed: ${error.message}`);
     }
   }
-  // Wait for the shared child to actually retire. The pool delays the shutdown by
-  // `POOL_RELEASE_GRACE_MS` (5 s) after the last release, and the shutdown itself
-  // is asynchronous, so a fixed 5 s sleep is not enough — measured: at 8 s the
-  // child is still alive, at 10 s it has sent `shutdown`. Poll instead of guessing,
-  // and cap the wait so a regression that never retires fails fast with a reason
-  // rather than hanging the suite.
-  // The grace is 5 s; measured in isolation the child sends `shutdown` at ~10 s.
-  // 12 s is the margin. Note that whether it retired no longer changes what is
-  // asserted: both reopen shapes rebuild the child tree exactly once (see the
-  // reopen block), so the rebuild assertions run either way instead of being
-  // gated on which shape this run happened to take.
-  await sleep(12_000);
-
-  // ---------------------------------------------------------------------
-  // TEMPORARY DIAGNOSTIC (Lead request): did the pooled child ever die?
-  //
-  // The provider clears `#pooled` when it finds the child dead
-  // (`#livePoolProcess`) but does not reset `#poolRefs` there, unlike
-  // `#shutdownPool`/`#onPoolExit`. If the child was replaced during this run, the
-  // stale count would explain why it never retires. Evidence to gather:
-  //
-  //   - how many `initialize` frames, and from how many distinct pids
-  //     (>1 pid => the child was replaced => stale-count hypothesis is live)
-  //   - whether any `shutdown` frame was recorded
-  //   - every `initialize` pid, in order, so the replacement point is visible
-  // ---------------------------------------------------------------------
-  {
-    const frameLog = runFrameLog;
-    if (fs.existsSync(frameLog)) {
-      const frames = fs
-        .readFileSync(frameLog, "utf8")
-        .split("\n")
-        .filter((line) => line.trim() !== "")
-        .map((line) => JSON.parse(line));
-      const initializes = frames.filter((frame) => frame.method === "initialize");
-      const initPids = [...new Set(initializes.map((frame) => frame.pid))];
-      const allPids = [...new Set(frames.map((frame) => frame.pid))];
-      const shutdowns = frames.filter((frame) => frame.method === "shutdown");
-      console.error(
-        `  diagnostic: initialize frames=${String(initializes.length)}`
-          + ` from ${String(initPids.length)} pid(s) [${initPids.join(",")}]`
-          + `; all pids [${allPids.join(",")}]`
-          + `; shutdown frames=${String(shutdowns.length)}`,
-      );
-      console.error(
-        `  diagnostic: initialize pid order = ${initializes.map((frame) => frame.pid).join(",")}`,
-      );
-      // The pool replaced the child this many times during the run. Each
-      // replacement is a chance for a release to be dropped: `#releasePoolProcess`
-      // starts with `if (this.#pooled !== process) return`, so a session that still
-      // holds an *old* child's handle releases nothing, and the count never returns
-      // to zero. That is the measured cause of "the child never retires in this
-      // script but does in isolation" — reported to the Lead, provider-side.
-      const shutdownPids = new Set(shutdowns.map((frame) => frame.pid));
-      console.error(
-        `  diagnostic: distinct child pids=${String(initPids.length)},`
-          + ` shutdowns=${String(shutdownPids.size)} pids,`
-          + ` so the pool replaced the child ${String(Math.max(0, initPids.length - 1))} time(s)`,
-      );
-    } else {
-      console.error("  diagnostic: no frame log (DSH_FAKE_LOG unset or missing)");
-    }
-  }
-  // If the child is still alive, some session still holds a reference. Ask the
-  // plugin which sessions it thinks are open rather than guessing: an extra
-  // `session.closed` per id is cheap and its absence is the diagnostic.
-  // Only **root** sessions hold a pool reference; a native child is a view inside
-  // its root's process and has no claim of its own. Filtering them out matters:
-  // the first version of this diagnostic listed `:sub:child-*` ids and pointed at
-  // the wrong cause.
-  const openRoots = events
-    .filter((event) => event.type === "session.opened" && !event.sessionId.includes(":sub:"))
-    .map((event) => event.sessionId)
-    .filter((id) => !events.some((event) => event.type === "session.closed" && event.sessionId === id));
-  if (openRoots.length > 0) {
-    console.error(`  diagnostic: root sessions still open (each holds a pool reference) = ${openRoots.join(", ")}`);
-  }
+  // A cold start is a child process nothing has served. This connection cannot
+  // produce one any more — its pooled child is resident until `close()`, so a
+  // reopen here is the adoption case above — and waiting for a retirement that no
+  // longer happens is what made the old form silently test the wrong shape. A
+  // second connection has its own pool, so its first open spawns a child and that
+  // child classifies as cold (`reused: false`) by construction.
+  const connCold = await registration.connect({
+    capabilities: ["prompt.message", "session.configure", "session.persistence", "session.list", "session.subsession", "permission"],
+  });
+  connCold.onEvent((event) => events.push(event));
 
   setMode("replay");
   const replayMark = events.length;
-  await conn.send({ type: "session.open", requestId: "reopen-replay", sessionId: rootA, config: { cwd: process.cwd(), mode: "build" }, persistence: { version: 1, data: { sessionId: rootA } }, history: "replay" });
+  // The cold connection, not `conn`: only a fresh pool has an unserved child.
+  await connCold.send({ type: "session.open", requestId: "reopen-replay", sessionId: rootA, config: { cwd: process.cwd(), mode: "build" }, persistence: { version: 1, data: { sessionId: rootA } }, history: "replay" });
   await untilSince(replayMark, (e) => e.type === "session.ready" && e.sessionId === rootA, "replay ready", 30000);
   await sleep(600);
   const replayed = since(replayMark);
@@ -1285,7 +1606,15 @@ async function openSession(conn, sessionId, history) {
   );
   check(
     "the killed child is still announced (closed, never hidden)",
-    replayed.some((e) => e.type === "session.opened" && e.sessionId === killedScoped && e.title === "Killed K"),
+    replayed.some((e) => e.type === "session.opened" && e.sessionId === killedScoped && e.title === "killed-k"),
+  );
+  check(
+    "a cold-replayed child named without a path titles with its bare name, label underneath",
+    replayed.some(
+      (e) => e.type === "session.opened" && e.sessionId === killedScoped &&
+        e.title === "killed-k" && e.description === "Killed K",
+    ),
+    JSON.stringify(replayed.filter((e) => e.type === "session.opened" && e.sessionId === killedScoped).map((e) => ({ title: e.title, description: e.description }))),
   );
 
   // ---- the same shape, but hosted live: it must stay running -------------
@@ -1818,6 +2147,7 @@ async function openSession(conn, sessionId, history) {
   await connHang.close().catch(() => undefined);
 
   await conn.close();
+  await connCold.close();
   await conn2.close();
   await conn3.close();
   await conn4.close();

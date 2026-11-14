@@ -15,9 +15,11 @@
  *      loses the BETA turn, and the raw log has no `command/run` event;
  *   4. re-read the history (the replay Paseo rebuilds a reopened session from)
  *      and assert the folded surface;
- *   5. turn 3: ask for the secret — the model must answer ALPHA and not BETA.
+ *   5. turn 3: ask for the secret — the model must answer ALPHA and not BETA,
+ *      with the answer read from the LAST turn only and asserted non-empty
+ *      first (an empty answer is a failure, not "it forgot").
  *
- * Usage: node harness/rewind-e2e.mjs [--cwd <dir>]
+ * Usage: node harness/rewind-e2e.mjs [--cwd <dir>] [--with-memory]
  * Requires a working `dsh` on PATH and the `paseo` profile (the same one
  * `paseo-dsh doctor` checks). The session runs in a temp directory.
  *
@@ -25,7 +27,22 @@
  * DSH_PASEO_PROFILE (default `paseo`) into a throwaway DSH_HOME, so the live
  * `~/.dsh` is never written (sessions, journals and rewind state all land in the
  * copy). Pass `--allow-real-profile` to use the live home instead; an explicit
- * `DSH_HOME=<dir>` is used as-is. The first output line names the mode.
+ * `DSH_HOME=<dir>` is used as-is. The first output line names the mode, the
+ * second says which profile rows the clone switched off.
+ *
+ * Third-party plugins: this probe measures the bridge's rewind, so a plugin
+ * whose state a rewind does not touch must not decide the verdict. The last two
+ * turns used to be red purely because the live profile ships a memory plugin:
+ * the model wrote the withdrawn secret into its memory store during the
+ * withdrawn turn, the rewind withdrew the transcript but not the store, and the
+ * plugin injected the secret back before turn 3 (`docs/REWIND.md`, known gap).
+ * The clone therefore switches off the profile rows listed in
+ * `REWIND_E2E_DISABLE_ROWS` (default `dsh-memory`; set it to an empty string to
+ * disable nothing). The list holds **profile row ids**, not package names, so
+ * nothing here is tied to one vendor; an id the profile does not have is
+ * "nothing to disable" and is printed, not failed. The live home is never
+ * modified. Pass `--with-memory` to keep those rows and observe the gap
+ * instead: the answer and injection lines become observations, not pass/fail.
  */
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
@@ -35,6 +52,13 @@ import { join } from "node:path";
 
 const require = createRequire(import.meta.url);
 const { announceDshHome, prepareDshHome } = require("./isolated-dsh-home.cjs");
+const { lastTurnAnswer, pluginInjectedUserTexts } = require("./harness-gates.cjs");
+
+// The two secrets are the whole assertion: ALPHA survives the rewind, BETA was
+// withdrawn. Named constants so a prompt and the check that reads it back can
+// never drift apart.
+const SECRET_FIRST = "ALPHA";
+const SECRET_WITHDRAWN = "BETA";
 
 const argv = process.argv.slice(2);
 const cwdFlag = argv.indexOf("--cwd");
@@ -42,14 +66,35 @@ const root = cwdFlag >= 0 && argv[cwdFlag + 1] !== undefined
   ? argv[cwdFlag + 1]
   : mkdtempSync(join(tmpdir(), "rewind-e2e-"));
 
+// `--with-memory` is the explicit opt-in to measure the known gap: memory rows
+// stay enabled and the two memory-sensitive judgements only print.
+const withMemory = argv.includes("--with-memory");
+const disableRows = withMemory
+  ? []
+  : (process.env.REWIND_E2E_DISABLE_ROWS ?? "dsh-memory")
+      .split(",")
+      .map((id) => id.trim())
+      .filter((id) => id !== "");
+
 let runMode;
 try {
-  runMode = prepareDshHome({ script: "rewind-e2e", profile: process.env.DSH_PASEO_PROFILE ?? "paseo" });
+  runMode = prepareDshHome({
+    script: "rewind-e2e",
+    profile: process.env.DSH_PASEO_PROFILE ?? "paseo",
+    disable: disableRows,
+  });
 } catch (error) {
   console.error(`rewind-e2e: ${error.message}`);
   process.exit(2);
 }
 announceDshHome(runMode);
+if (withMemory) {
+  console.log(
+    "--with-memory: memory rows stay enabled in the clone; the documented known gap " +
+      "(a rewind withdraws the transcript, not a memory store) may show up below as observations, " +
+      "not as pass/fail",
+  );
+}
 
 const child = spawn("dsh", ["--profile", process.env.DSH_PASEO_PROFILE ?? "paseo"], {
   cwd: root,
@@ -126,7 +171,7 @@ try {
   await request("initialize", { cwd: root, sessionId });
   const first = await request("session/prompt", {
     sessionId,
-    contentBlocks: [{ type: "text", text: "记住一个暗号：ALPHA。只回复“记住了”。" }],
+    contentBlocks: [{ type: "text", text: `记住一个暗号：${SECRET_FIRST}。只回复“记住了”。` }],
   });
   await waitForTurns(1);
 
@@ -134,7 +179,7 @@ try {
     sessionId,
     contentBlocks: [{
       type: "text",
-      text: "暗号改成 BETA；必须用 write 工具（不要用 bash）在当前目录创建 rewind-probe.txt，内容写 hello。完成后只回复“好”。",
+      text: `暗号改成 ${SECRET_WITHDRAWN}；必须用 write 工具（不要用 bash）在当前目录创建 rewind-probe.txt，内容写 hello。完成后只回复“好”。`,
     }],
   });
   await waitForTurns(2);
@@ -188,15 +233,57 @@ try {
   });
   await waitForTurns(3);
   await sleep(1500);
-  const replies = events
-    .filter((frame) => frame.params?.event?.type === "assistant/message")
-    .map((frame) => (frame.params.event.data?.message?.content ?? [])
-      .filter((block) => block.type === "text")
-      .map((block) => block.text)
-      .join(""));
-  const answer = replies.at(-1) ?? "";
-  check("the model still knows ALPHA", answer.includes("ALPHA"), answer.slice(0, 120));
-  check("and no longer knows BETA", answer.includes("BETA") === false, answer.slice(0, 120));
+  // Scoped to the last turn (see `lastTurnAnswer`): the old picker took the last
+  // assistant text of the *whole* stream, so a turn that emitted only tool calls
+  // would be judged on the previous turn's answer.
+  const answer = lastTurnAnswer(
+    events.map((frame) => frame.params?.event).filter((event) => event !== undefined),
+  );
+
+  // An empty answer is a failure, not "the model forgot BETA". Without this
+  // assertion a reader that produced nothing (one real run did, from a
+  // mis-indexed frame) reported "and no longer knows BETA" PASS — a fake green.
+  if (withMemory) {
+    console.log(`  OBSERVED  the third turn answered ${JSON.stringify(answer.slice(0, 160))}`);
+  } else {
+    check("the third turn produced an answer", answer.trim() !== "", JSON.stringify(answer.slice(0, 120)));
+    check(`the model still knows ${SECRET_FIRST}`, answer.includes(SECRET_FIRST), answer.slice(0, 120));
+    check(
+      `and no longer knows ${SECRET_WITHDRAWN}`,
+      answer.includes(SECRET_WITHDRAWN) === false,
+      answer.slice(0, 120),
+    );
+  }
+
+  // The same contract, one layer down: whatever a rewind folds away must not
+  // come back through a *plugin-injected* message. A plugin writes an ordinary
+  // `user/message` (source.kind `plugin:…`) before the human's; the fold only
+  // covers the withdrawn turn's seq range, so an injection that quotes the
+  // withdrawn text survives and reaches the model. With the memory rows off
+  // there is nothing to inject; this is the assertion that fails loudly if that
+  // ever stops being true, instead of leaving the answer check to catch it.
+  const finalSurface = await request("paseo/history", { sessionId });
+  const injected = pluginInjectedUserTexts(finalSurface.events ?? []);
+  const carrying = injected.filter((row) => row.text.includes(SECRET_WITHDRAWN));
+  if (withMemory) {
+    console.log(
+      `  OBSERVED  ${injected.length} plugin-injected row(s) in the replayed surface` +
+        (carrying.length === 0 ? "" : `, ${carrying.length} carrying the withdrawn text`),
+    );
+    for (const row of injected) console.log(`    OBSERVED  ${row.kind} — ${row.text.replace(/\s+/g, " ").slice(0, 200)}`);
+    if (carrying.length > 0) {
+      console.log(
+        "  KNOWN GAP  the withdrawn text is back in the model's context through a plugin injection " +
+          "(docs/REWIND.md, known gap; the rewind withdraws the transcript, not the plugin's store)",
+      );
+    }
+  } else {
+    check(
+      "no plugin-injected message carries the withdrawn text",
+      carrying.length === 0,
+      JSON.stringify(carrying.map((row) => `${row.kind}: ${row.text.slice(0, 80)}`)),
+    );
+  }
 } catch (error) {
   console.log("probe failed:", error.message);
   console.log(stderr.join("").slice(-2500));

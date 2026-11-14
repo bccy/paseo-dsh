@@ -1,20 +1,40 @@
 # 团队（Agent Team）在 Paseo 中怎么工作
 
-DSH 的 `dsh-experimental-agent-team` 给 Lead 会话一个团队：队员（各自是一个子会话）和一块共享任务板。
+DSH 给 Lead 会话一个团队：任务板，加上（旧版）队员名单或（新版）子代理目录里的具名子代理。
 本插件把它画成 composer 上的「团队」pill 和一个只读面板，并把时间线里的 `team_task_*` 工具结果画成字段卡。
 **全程只读**：桥没有团队写通道，面板不放按钮（假成功比没有按钮更糟）。
+
+## 两代形状（都要支持）
+
+| DSH | 包 | `agentTeam` wire 视图 | 队员来源 |
+|---|---|---|---|
+| ≤ 0.2.1 | `dsh-experimental-agent-team` | `{members, tasks, failure?}` | 投影自带名单（Lead + teammates） |
+| 0.2.2-rc.2+ | `dsh-agent-team` | `{enabled, tasks, failure?}` | **不在投影里**：包自己的投影注释写明「Current subagents are supplied separately by the existing `subagentCatalog` projection」（`lib/types/projection.d.ts`，`teamProjectionDefinition`）。插件取 Lead 的**可继续直接子代理**（`mode === "continuable"`、`parentSessionId === Lead`），名字取 `name`，没有名字的历史条目退回 session id；`label` 只作 description |
+
+`shared/team.ts` 用**两个 strict 分支的 union**（`teamProjectionSchema`）解析这两代：既是旧又是新的混合形状、
+或第三种形状，都是带 Zod 原因的 `rpc_failed`，不会被「剥掉未知键」后当成成功。解析后归一化成
+`{enabled, members, tasks, failure?}`（旧代 `enabled` 恒为 true，因为旧投影只在有团队时存在）。
+
+成员语义依据（rc.3）：`dsh-client-ui-agent-team` 的 `TeamBoard.tsx` 只画任务板（`if (!team?.enabled) return null`），
+成员面板是共享的 `subagentCatalog`；`dsh-tool-subagent-control/src/list-agents.ts` 只把 `mode === 'continuable'`
+的行当作可消息成员（one-shot 被省略），名字用 `path`；子代理目录面板用 `entry.name ?? entry.id`
+（`dsh-client-ui-subagent/src/client/SubagentHeaderLineage.tsx` 的 `entryName`）。一步嵌套的子代理（`path` 含 `/`）
+不在 Lead 的成员名单里，它们出现在各自父级的目录层级。
 
 ## 数据源
 
 | 数据 | 来源 | 持久 |
 |---|---|---|
-| 成员、任务、failure | DSH 的 `agentTeam` session projection（wire 视图 `TeamProjection`：`{members, tasks, failure?}`，已删除任务已被 DSH 过滤），经桥已有的 `paseo/projections {sessionId, keys:["agentTeam"]}` 冷读 | 是（只写在 Lead 会话日志里） |
-| 成员是否在跑（`running`） | 插件服务端自己：Lead = 根会话当前回合；队员 = 本进程托管的同 id 子会话，且已收到过它的 live 帧 | 否（运行时） |
+| 任务板、failure、`enabled` | DSH 的 `agentTeam` session projection，经桥已有的 `paseo/projections {sessionId, keys:["agentTeam"]}` 冷读 | 是（只写在 Lead 会话日志里） |
+| 旧代名单 / 新代成员 | 旧代：投影自带；新代：桥的 `paseo/subagents`（DSH 的 `subagents.listDescendants`，插件只读、不登记边、不重放孤儿帧）。**只在看板可画时才读**：`enabled === true` 且有任务；否则 `members: []`，不发这次调用——桥侧每次都要 `persistence.list()` 遍历全部持久会话 header（2026-11-14 第二轮） | 是 |
+| 成员是否在跑（`running`） | 插件服务端自己：队员 = 本进程托管的同 id 子会话，且已收到过它的 live 帧 | 否（运行时） |
 
-- **桥零改动**。订阅 `team.snapshot {agentId}`，事件就是完整快照 `{available, team, error?}`（`shared/team.ts` 的 `defineSubscription`）。
+- **订阅** `team.snapshot {agentId}`，事件就是完整快照 `{available, team, error?}`（`shared/team.ts` 的 `defineSubscription`）。
 - **`running` 缺省 = 不知道**。本进程没托管到的队员（例如在别的进程里跑）不带这个键，面板写「成员」，
   既不说「运行中」也不说「空闲」。把持久的 `active` 当成运行中，就是 FIELD-NOTES 里的静默降级。
-- 服务端用共享 Zod schema 校验 DSH 的形状；不是这个形状 → `rpc_failed` 带解析原因，**不会**画成空看板。
+  新代成员没有 `phase`（那一代的 `TeamMemberPhase` 只用于历史名单事件），插件也不编一个 `active` 出来。
+- 服务端用共享 Zod schema 校验 DSH 的形状；不是这两代之一 → `rpc_failed` 带解析原因，**不会**画成空看板。
+- 新代的成员读取失败（`paseo/subagents` 报错或抛错）是瞬态 `rpc_failed`，**不会**画成「0 名成员」。
 - 没有该 agent 的会话、没有存档日志（`null`）、`migration-required`（缓存提示不是精确值）→ `team: null`，
   与 goal 的「我们看了，没有」同义。
 
@@ -23,14 +43,17 @@ DSH 的 `dsh-experimental-agent-team` 给 Lead 会话一个团队：队员（各
 | 情况 | 码 | 客户端 |
 |---|---|---|
 | 桥没有 `paseo/projections` | `bridge_too_old` | 终态：移除 pill，console 一行；裸 `upsert` 不重启，**重连快照会重建它**（运行时可能已被插件 reload 修好，2026-11-09） |
-| `unknown or unavailable projection key: agentTeam`（profile 没挂 agent-team bundle） | `team_unavailable` | 终态：移除 pill（=「这个 profile 没有团队功能」，不是「没有团队」）；重建规则同上（裸 `upsert` 不重启、**重连快照重建**） |
+| `unknown or unavailable projection key: agentTeam`（profile 没挂 agent-team bundle，**或 rc.3 上 agent-team 服务加载失败**——rc.2+ 对旧 profile 的 `maxMembers` 等配置抛 `TEAM_INVALID_CONFIG`，投影因此不注册） | `team_unavailable` | 终态：移除 pill（=「这个 profile 没有团队功能」，不是「没有团队」）；重建规则同上（裸 `upsert` 不重启、**重连快照重建**） |
 | `unknown or not-yet-created session` / 会话 agent 已释放 | `session_missing` | 瞬态：退避重试，保留上次看板 |
 | 其它抛错、形状不符 | `rpc_failed` | 同上 |
 | projection 的 `failure` | 不是错误码 | 面板首行红字（DSH 原文），pill 图标变红；是否隐藏仍按 pill 可见性规则 |
 
 ## pill
 
-- **可见**：只看任务（`tasks.length > 0`）——有任务就显示，没任务一律不显示。2026-11-06 用户决策：起了队员但没建任务时不亮 pill（此时面板只会写「N 名成员 / 暂无共享任务」）；队员数不再参与判断，无看板（`null`）也不显示。**全部任务 `completed` 后只再显示一次，只有点开并关闭面板后才隐藏；不点开时发送新消息不会隐藏**（照 goal 的 seen 机制，UI-v7）：面板关闭（经 `seen-close-gate` 确认）算看过，全部完成后 agent 从 idle 变 running（用户发了下一条消息）**不算**看过；签名 `teamAllDoneKey`（tasks 按 id 排序的 `id:revision`）变化（新增任务 / revision 变化）会重新显示一次。`seen` **存在 agent 的插件元数据里**（键 `dsh.teamSeen`，值就是 `teamAllDoneKey`，见 `shared/pill-metadata.ts` 与 `client/seen-metadata.ts`，2026-11-08 起、2026-11-11 换到元数据）：每次**确认关闭**把该 agent 的签名写一次（`paseo.agents.ref(agentId).setMetadata`），读随 agent 目录快照到达——注册 pill 之前就已知，所以不需要「读完前不推送」；app / 插件 reload、daemon 重启后已看过的全完成看板仍隐藏，不会先闪一下；写失败一条 console 且本会话仍隐藏（只 console 一次、不阻塞 pill）。原来的宿主插件设置文档（`team-pill-seen`、64 条上限、`invalid` 文档 `reset` 修复、跨端写冲突合并）随 0.16 端口删除。**移除 pill（agent 离开 / 无权限 / 终态）只清内存态，已落盘的签名保留**（2026-11-09）：签名只命中用户关过的那块全完成看板，抹掉它只会让重连 / 重试 / 终态恢复后重显示一次；新任务或新 revision 是新签名、照常显示。注意 `task-N` 是 journal 内计数器，同一个签名集合理论上可被 rewind 或重建的看板重新铸出（这一风险在「不移除」的路径上同样存在，旧的 `forget` 只覆盖移除这一条支路）。
+- **可见**：`enabled === true` **且** `tasks.length > 0`——有任务就显示，没任务一律不显示。rc.3 的 `enabled: false`
+  （用户在这个会话里关掉了团队）**即使还有历史任务也不显示**：DSH 自己的任务板对 `enabled: false` 就是
+  `return null`（`dsh-client-ui-agent-team` 的 `TeamBoard.tsx`），任务与开关在新代是两份独立持久状态，
+  所以关掉团队不会删任务。旧代没有这个开关，归一化后恒为 true。2026-11-06 用户决策：起了队员但没建任务时不亮 pill（此时面板只会写「N 名成员 / 暂无共享任务」）；队员数不再参与判断，无看板（`null`）也不显示。**全部任务 `completed` 后只再显示一次，只有点开并关闭面板后才隐藏；不点开时发送新消息不会隐藏**（照 goal 的 seen 机制，UI-v7）：面板关闭（经 `seen-close-gate` 确认）算看过，全部完成后 agent 从 idle 变 running（用户发了下一条消息）**不算**看过；签名 `teamAllDoneKey`（tasks 按 id 排序的 `id:revision`）变化（新增任务 / revision 变化）会重新显示一次。`seen` **存在 agent 的插件元数据里**（键 `dsh.teamSeen`，值就是 `teamAllDoneKey`，见 `shared/pill-metadata.ts` 与 `client/seen-metadata.ts`，2026-11-08 起、2026-11-11 换到元数据）：每次**确认关闭**把该 agent 的签名写一次（`paseo.agents.ref(agentId).setMetadata`），读随 agent 目录快照到达——注册 pill 之前就已知，所以不需要「读完前不推送」；app / 插件 reload、daemon 重启后已看过的全完成看板仍隐藏，不会先闪一下；写失败一条 console 且本会话仍隐藏（只 console 一次、不阻塞 pill）。原来的宿主插件设置文档（`team-pill-seen`、64 条上限、`invalid` 文档 `reset` 修复、跨端写冲突合并）随 0.16 端口删除。**移除 pill（agent 离开 / 无权限 / 终态）只清内存态，已落盘的签名保留**（2026-11-09）：签名只命中用户关过的那块全完成看板，抹掉它只会让重连 / 重试 / 终态恢复后重显示一次；新任务或新 revision 是新签名、照常显示。注意 `task-N` 是 journal 内计数器，同一个签名集合理论上可被 rewind 或重建的看板重新铸出（这一风险在「不移除」的路径上同样存在，旧的 `forget` 只覆盖移除这一条支路）。
   - **「面板关闭」必须是确认过的关闭**（2026-11-06 真机 bug 修复）：宿主打开 popover 时会把内容**重挂载一次**——`AnchoredSurface` 的 `FloatingSurface` 带 `key={placed ? "placed" : "measuring"}`（Paseo 0.15.0 `packages/app/src/components/ui/menu/menu-overlay.tsx:350`，注释在 :265 明说「Remounting on placement…」），先离屏测量再换 key 正式定位。所以 `unmount` 本身不是「用户关了面板」。规则是 `createSeenCloseGate`（`client/seen-close-gate.ts`，与目标 pill 共用，窗口 `SEEN_CLOSE_CONFIRM_MS` = 250ms）：卸载后 250ms 内又挂载 → 取消，不记 seen；卸载后一直没回来 → 记 seen。修复前的实现把任何卸载都当关闭，用户一点开、宿主测量完重挂载，seen 立刻写入 → pill 当场消失、任务板面板根本没显示出来。
   - 顺带：`present()` 只在 `visible` / `label` / `title` / `icon` 真变化时才 `registration.update`（`client/agent-subscriptions` 里的 `publishIfChanged` 已对**相同答案**去重；这里补的是「看板变了、按钮状态没变」仍会推一次 `update` 的情况，白让宿主重建按钮与 popover 页面）。
 - **文字与 title 恒为「团队」/「Team」**，不带计数（title 同时是读屏名、桌面 tooltip、手机 sheet 标题）。
@@ -65,7 +88,8 @@ DSH 的 `dsh-experimental-agent-team` 给 Lead 会话一个团队：队员（各
   - **chip 与 composer pill 区分**：高 18px（pill 约 28）、圆角 4px（pill 全圆）、无边框、无悬停填充、无箭头；底色 surface2，失败用 danger 浅底。
   - **一行放不下**：四档同构副本隐藏排版、`onLayout` 量宽，取第一个放得下的：全称 → 短称（失败/运行/停止/完成）→ 去「已停止」
    （进行中标题已有「N 个负责人已停止」）→ 去「任务完成」（已完成分组仍有计数）。「创建失败」「运行中」永不删、永不退化成纯数字。
-- **负责人标记（T5）**：任务行 facts 里负责人名字后面：`running === true` → 宿主运行环（12px）；`running === false`
+- **负责人标记（T5）**：负责人名字取 DSH 的 `ownerName ?? ownerId`（`TeamBoard.tsx` 同序；新代的历史任务只有
+  `ownerId`），与成员匹配先按名字（= 代理路径）、再按 session id。任务行 facts 里负责人名字后面：`running === true` → 宿主运行环（12px）；`running === false`
   （服务端确定该成员已不在跑）→ 灰色小标签「已停止」；`running` 缺失、成员失败/准备中、不在名单、未分配 → 什么都不画。
   只标未完成任务（已完成任务的负责人空闲是正常结局）。详情页负责人字段同理。「进行中」分组标题行尾追加「· N 个负责人已停止」
   （仅 N>0，只数 `running === false`）。背景：成员按指令认领后结束会话，DSH 不会自动 release，任务停在 in_progress；
@@ -95,8 +119,9 @@ DSH 的 `dsh-experimental-agent-team` 给 Lead 会话一个团队：队员（各
 
 ## 检查
 
-见 [HARNESS.md](./HARNESS.md)「团队（team）链」：`team-server-check`（假桥）、`team-pill-check`（纯规则）、
-`team-popover-render-check`（jsdom 渲染），以及 `tool-call-check` / `locale-check` 的团队段。
+见 [HARNESS.md](./HARNESS.md)「团队（team）链」：`team-server-check`（假桥；**两代形状 + 投影缺失 + 目录读失败**
+的用例都在里面）、`team-pill-check`（纯规则，含 `enabled: false` 可见性）、`team-popover-render-check`（jsdom 渲染），
+以及 `tool-call-check` / `locale-check` 的团队段（`locale-check` 的拒句漂移扫描会检查装的哪一代包）。
 
 ## 未验证
 

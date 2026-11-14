@@ -73,7 +73,15 @@ const {
 const { SEEN_CLOSE_CONFIRM_MS, createSeenCloseGate } = require("./client/seen-close-gate.js");
 const { allText } = require("./client/locale.js");
 const { PROVIDER_ID } = require("./shared/provider.js");
-const { isTerminalTeamErrorCode, teamViewSchema, TEAM_ERROR_CODES, TERMINAL_TEAM_ERROR_CODES } = require("./shared/team.js");
+const {
+  isTerminalTeamErrorCode,
+  TEAM_ERROR_CODES,
+  TERMINAL_TEAM_ERROR_CODES,
+  teamModeProjectionSchema,
+  teamProjectionSchema,
+  teamRosterProjectionSchema,
+  teamViewSchema,
+} = require("./shared/team.js");
 const { createAgentSubscriptions } = require("./client/agent-subscriptions.js");
 const { createSeenMetadataStore } = require("./client/seen-metadata.js");
 const { TEAM_SEEN_METADATA_KEY } = require("./shared/pill-metadata.js");
@@ -126,31 +134,36 @@ console.log("visibility");
   // 「N 名成员 / 暂无共享任务」, which is the screenshot the user rejected.
   equal("no board → hidden", teamPillVisible(null), false);
   equal("no board (undefined) → hidden", teamPillVisible(undefined), false);
-  equal("only the Lead, no task → hidden", teamPillVisible({ members: [LEAD], tasks: [] }), false);
-  equal("a teammate, no task → hidden", teamPillVisible({ members: [LEAD, mate()], tasks: [] }), false);
-  equal("a running teammate, no task → hidden", teamPillVisible({ members: [LEAD, mate({ running: true })], tasks: [] }), false);
-  equal("the Lead and one task → visible", teamPillVisible({ members: [LEAD], tasks: [task()] }), true);
-  equal("a task and no member rows → visible", teamPillVisible({ members: [], tasks: [task()] }), true);
-  equal("a teammate and a task → visible", teamPillVisible({ members: [LEAD, mate()], tasks: [task()] }), true);
-  equal("a completed task still counts (any task, not only open ones)", teamPillVisible({ members: [LEAD], tasks: [task({ status: "completed" })] }), true);
-  equal("a failure on an otherwise empty board stays hidden", teamPillVisible({ members: [LEAD], tasks: [], failure: "x" }), false);
-  equal("no rows, no task → hidden", teamPillVisible({ members: [], tasks: [] }), false);
-  equal("teammates are counted without the Lead", teamMateCount({ members: [LEAD, mate({ id: "a" }), mate({ id: "b" })], tasks: [] }), 2);
+  equal("only the Lead, no task → hidden", teamPillVisible({ enabled: true, members: [LEAD], tasks: [] }), false);
+  equal("a teammate, no task → hidden", teamPillVisible({ enabled: true, members: [LEAD, mate()], tasks: [] }), false);
+  equal("a running teammate, no task → hidden", teamPillVisible({ enabled: true, members: [LEAD, mate({ running: true })], tasks: [] }), false);
+  equal("the Lead and one task → visible", teamPillVisible({ enabled: true, members: [LEAD], tasks: [task()] }), true);
+  equal("a task and no member rows → visible", teamPillVisible({ enabled: true, members: [], tasks: [task()] }), true);
+  equal("a teammate and a task → visible", teamPillVisible({ enabled: true, members: [LEAD, mate()], tasks: [task()] }), true);
+  equal("a completed task still counts (any task, not only open ones)", teamPillVisible({ enabled: true, members: [LEAD], tasks: [task({ status: "completed" })] }), true);
+  equal("a failure on an otherwise empty board stays hidden", teamPillVisible({ enabled: true, members: [LEAD], tasks: [], failure: "x" }), false);
+  equal("no rows, no task → hidden", teamPillVisible({ enabled: true, members: [], tasks: [] }), false);
+  equal("teammates are counted without the Lead", teamMateCount({ enabled: true, members: [LEAD, mate({ id: "a" }), mate({ id: "b" })], tasks: [] }), 2);
+  // The rc.3 selection: `enabled: false` hides the pill even when historical
+  // tasks are still on the board — DSH's own TeamBoard renders nothing for it.
+  equal("a disabled team with tasks → hidden", teamPillVisible({ enabled: false, members: [], tasks: [task()] }), false);
+  const disabledDone = { enabled: false, members: [], tasks: [task({ status: "completed" })] };
+  equal("a disabled all-done team with its seen key → still hidden", teamPillVisible(disabledDone, teamAllDoneKey(disabledDone)), false);
 }
 
 console.log("\nan all-done board's seen state (UI-v7)");
 {
   // The key is `id:revision`, sorted by id, and only while every task is done.
   const done = (id, revision) => task({ id, revision, status: "completed" });
-  const allDone = { members: [LEAD], tasks: [done("task-1", 3), done("task-2", 7)] };
-  const allDoneNewer = { members: [LEAD], tasks: [done("task-1", 3), done("task-2", 8)] };
-  const partial = { members: [LEAD], tasks: [done("task-1", 3), task({ id: "task-2" })] };
+  const allDone = { enabled: true, members: [LEAD], tasks: [done("task-1", 3), done("task-2", 7)] };
+  const allDoneNewer = { enabled: true, members: [LEAD], tasks: [done("task-1", 3), done("task-2", 8)] };
+  const partial = { enabled: true, members: [LEAD], tasks: [done("task-1", 3), task({ id: "task-2" })] };
   const KEY = "task-1:3,task-2:7";
-  equal("empty board → no key", teamAllDoneKey({ members: [LEAD], tasks: [] }), undefined);
-  equal("a pending task → no key", teamAllDoneKey({ members: [LEAD], tasks: [task()] }), undefined);
+  equal("empty board → no key", teamAllDoneKey({ enabled: true, members: [LEAD], tasks: [] }), undefined);
+  equal("a pending task → no key", teamAllDoneKey({ enabled: true, members: [LEAD], tasks: [task()] }), undefined);
   equal("one open task among done → no key", teamAllDoneKey(partial), undefined);
   equal("all done → id:revision joined", teamAllDoneKey(allDone), KEY);
-  equal("…sorted by id, whatever the wire order", teamAllDoneKey({ members: [LEAD], tasks: [...allDone.tasks].reverse() }), KEY);
+  equal("…sorted by id, whatever the wire order", teamAllDoneKey({ enabled: true, members: [LEAD], tasks: [...allDone.tasks].reverse() }), KEY);
   equal("a revision change → a new key", teamAllDoneKey(allDoneNewer), "task-1:3,task-2:8");
 
   const step = (state, event) => teamCompleteSeenStep(state, event);
@@ -177,7 +190,7 @@ console.log("\nan all-done board's seen state (UI-v7)");
   equal("all done + no seen → visible", teamPillVisible(allDone), true);
   equal("all done + a different seen → visible", teamPillVisible(allDone, "other"), true);
   equal("a working board + any seen → visible", teamPillVisible(partial, KEY), true);
-  equal("an empty board + seen → hidden", teamPillVisible({ members: [LEAD], tasks: [] }, KEY), false);
+  equal("an empty board + seen → hidden", teamPillVisible({ enabled: true, members: [LEAD], tasks: [] }, KEY), false);
   equal("no board + seen → hidden", teamPillVisible(null, KEY), false);
 }
 
@@ -187,7 +200,7 @@ console.log("\na close is confirmed, not assumed (UI-v7 fix: the host remounts t
   // (menu-overlay.tsx:350), so opening a panel mounts the body, unmounts it one
   // measurement frame later and mounts it again. Only a later unmount that stays
   // unmounted is the user closing the panel.
-  const board = { members: [LEAD], tasks: [task({ id: "task-1", revision: 2, status: "completed" })] };
+  const board = { enabled: true, members: [LEAD], tasks: [task({ id: "task-1", revision: 2, status: "completed" })] };
   const makeGate = (delayMs) => {
     const scheduled = [];
     const closed = [];
@@ -286,22 +299,22 @@ console.log("\na close is confirmed, not assumed (UI-v7 fix: the host remounts t
 
 console.log("\nthe pill icon");
 {
-  equal("a running teammate → ring", teamPillIcon({ members: [LEAD, mate({ running: true })], tasks: [] }), "running");
-  equal("an idle teammate → idle", teamPillIcon({ members: [LEAD, mate({ running: false })], tasks: [] }), "idle");
-  equal("an unknown teammate is never the ring", teamPillIcon({ members: [LEAD, mate()], tasks: [] }), "idle");
-  equal("a running Lead alone is not the team running", teamPillIcon({ members: [{ ...LEAD, running: true }], tasks: [task()] }), "idle");
-  equal("a failed member → failed", teamPillIcon({ members: [LEAD, mate({ phase: "failed", running: true })], tasks: [] }), "failed");
-  equal("a projection failure → failed, even with a runner", teamPillIcon({ members: [LEAD, mate({ running: true })], tasks: [], failure: "bad" }), "failed");
+  equal("a running teammate → ring", teamPillIcon({ enabled: true, members: [LEAD, mate({ running: true })], tasks: [] }), "running");
+  equal("an idle teammate → idle", teamPillIcon({ enabled: true, members: [LEAD, mate({ running: false })], tasks: [] }), "idle");
+  equal("an unknown teammate is never the ring", teamPillIcon({ enabled: true, members: [LEAD, mate()], tasks: [] }), "idle");
+  equal("a running Lead alone is not the team running", teamPillIcon({ enabled: true, members: [{ ...LEAD, running: true }], tasks: [task()] }), "idle");
+  equal("a failed member → failed", teamPillIcon({ enabled: true, members: [LEAD, mate({ phase: "failed", running: true })], tasks: [] }), "failed");
+  equal("a projection failure → failed, even with a runner", teamPillIcon({ enabled: true, members: [LEAD, mate({ running: true })], tasks: [], failure: "bad" }), "failed");
   // UI-v8: an all-done board wears the goal pill's green CircleCheck.
   const done = (id, revision = 1) => task({ id, revision, status: "completed" });
-  equal("every task completed → complete", teamPillIcon({ members: [LEAD], tasks: [done("task-1")] }), "complete");
-  equal("…several completed tasks → complete", teamPillIcon({ members: [LEAD, mate()], tasks: [done("task-1"), done("task-2", 3)] }), "complete");
-  equal("…complete outranks a running teammate", teamPillIcon({ members: [LEAD, mate({ running: true })], tasks: [done("task-1")] }), "complete");
-  equal("one open task among completed → not complete", teamPillIcon({ members: [LEAD], tasks: [done("task-1"), task({ id: "task-2" })] }), "idle");
-  equal("…a running teammate then decides", teamPillIcon({ members: [LEAD, mate({ running: true })], tasks: [done("task-1"), task({ id: "task-2" })] }), "running");
-  equal("a projection failure beats complete", teamPillIcon({ members: [LEAD], tasks: [done("task-1")], failure: "bad" }), "failed");
-  equal("a failed member beats complete", teamPillIcon({ members: [LEAD, mate({ phase: "failed" })], tasks: [done("task-1")] }), "failed");
-  equal("no tasks is idle, never complete", teamPillIcon({ members: [LEAD], tasks: [] }), "idle");
+  equal("every task completed → complete", teamPillIcon({ enabled: true, members: [LEAD], tasks: [done("task-1")] }), "complete");
+  equal("…several completed tasks → complete", teamPillIcon({ enabled: true, members: [LEAD, mate()], tasks: [done("task-1"), done("task-2", 3)] }), "complete");
+  equal("…complete outranks a running teammate", teamPillIcon({ enabled: true, members: [LEAD, mate({ running: true })], tasks: [done("task-1")] }), "complete");
+  equal("one open task among completed → not complete", teamPillIcon({ enabled: true, members: [LEAD], tasks: [done("task-1"), task({ id: "task-2" })] }), "idle");
+  equal("…a running teammate then decides", teamPillIcon({ enabled: true, members: [LEAD, mate({ running: true })], tasks: [done("task-1"), task({ id: "task-2" })] }), "running");
+  equal("a projection failure beats complete", teamPillIcon({ enabled: true, members: [LEAD], tasks: [done("task-1")], failure: "bad" }), "failed");
+  equal("a failed member beats complete", teamPillIcon({ enabled: true, members: [LEAD, mate({ phase: "failed" })], tasks: [done("task-1")] }), "failed");
+  equal("no tasks is idle, never complete", teamPillIcon({ enabled: true, members: [LEAD], tasks: [] }), "idle");
 }
 
 console.log("\nthe roster headline chips (T7): no running/stopped without the server's running");
@@ -313,7 +326,7 @@ console.log("\nthe roster headline chips (T7): no running/stopped without the se
   equal("failed wins over running", teamMemberState(mate({ phase: "failed", running: true })), "failed");
   const keys = (team) => teamHeadItems(team).map((i) => `${i.key}:${i.count}`);
   // The user's screenshot: 4 members all running, 3 in-progress tasks.
-  const user = { members: [{ ...LEAD, running: true }, mate({ id: "a", name: "a", running: true }), mate({ id: "b", name: "b", running: true }), mate({ id: "c", name: "c", running: true })], tasks: [0, 1, 2].map((i) => task({ id: `task-${i}`, status: "in_progress" })) };
+  const user = { enabled: true, members: [{ ...LEAD, running: true }, mate({ id: "a", name: "a", running: true }), mate({ id: "b", name: "b", running: true }), mate({ id: "c", name: "c", running: true })], tasks: [0, 1, 2].map((i) => task({ id: `task-${i}`, status: "in_progress" })) };
   equal("user scale: 3 running teammates (the running Lead is not counted)", keys(user), ["running:3"]);
   // Mixed: 2 running (Lead + one), 1 stopped, 1 failed, 5/8 done.
   const mixed = {
@@ -322,15 +335,15 @@ console.log("\nthe roster headline chips (T7): no running/stopped without the se
   };
   equal("mixed: failed, running, stopped, done in order (Lead excluded)", keys(mixed), ["failed:1", "running:1", "stopped:1", "done:5/8"]);
   // Run state missing for everyone: no running / stopped chip at all.
-  const unknown = { members: mixed.members.map(({ running, ...rest }) => rest), tasks: mixed.tasks };
+  const unknown = { enabled: true, members: mixed.members.map(({ running, ...rest }) => rest), tasks: mixed.tasks };
   equal("running missing: no running or stopped chip", keys(unknown), ["failed:1", "done:5/8"]);
   // Zero counts are never chips.
-  equal("nothing to count: no chips", keys({ members: [LEAD, mate()], tasks: [task()] }), []);
-  equal("no completed task: no done chip", keys({ members: [LEAD], tasks: [task({ status: "in_progress" })] }), []);
-  equal("a running Lead alone is not 运行中", keys({ members: [{ ...LEAD, running: true }, mate()], tasks: [] }), []);
-  equal("a Lead's run state alone does not make it known", keys({ members: [{ ...LEAD, running: true }, mate({ id: "a" })], tasks: [] }), []);
-  equal("an idle Lead is not stopped", keys({ members: [{ ...LEAD, running: false }, mate({ running: true })], tasks: [] }), ["running:1"]);
-  equal("a failed member with running:true is not running", keys({ members: [LEAD, mate({ phase: "failed", running: true })], tasks: [] }), ["failed:1"]);
+  equal("nothing to count: no chips", keys({ enabled: true, members: [LEAD, mate()], tasks: [task()] }), []);
+  equal("no completed task: no done chip", keys({ enabled: true, members: [LEAD], tasks: [task({ status: "in_progress" })] }), []);
+  equal("a running Lead alone is not 运行中", keys({ enabled: true, members: [{ ...LEAD, running: true }, mate()], tasks: [] }), []);
+  equal("a Lead's run state alone does not make it known", keys({ enabled: true, members: [{ ...LEAD, running: true }, mate({ id: "a" })], tasks: [] }), []);
+  equal("an idle Lead is not stopped", keys({ enabled: true, members: [{ ...LEAD, running: false }, mate({ running: true })], tasks: [] }), ["running:1"]);
+  equal("a failed member with running:true is not running", keys({ enabled: true, members: [LEAD, mate({ phase: "failed", running: true })], tasks: [] }), ["failed:1"]);
   // Labels.
   const item = { key: "running", count: "2" };
   equal("zh full / short", [teamHeadLabel(item, ZH, false), teamHeadLabel(item, ZH, true)], ["2 运行中", "2 运行"]);
@@ -441,11 +454,23 @@ console.log("\nthe contract");
   equal("terminal codes", TERMINAL_TEAM_ERROR_CODES, ["bridge_too_old", "team_unavailable"]);
   equal("a missing code is not terminal", isTerminalTeamErrorCode(undefined), false);
   equal("session_missing is transient", isTerminalTeamErrorCode("session_missing"), false);
-  const ok = teamViewSchema.safeParse({ members: [LEAD], tasks: [task()] });
-  assert("DSH's view parses", ok.success, ok.success ? "" : ok.error.message);
-  assert("a deleted task does not parse (the wire filters tombstones)", !teamViewSchema.safeParse({ members: [LEAD], tasks: [task({ status: "deleted" })] }).success);
-  const stripped = teamViewSchema.parse({ members: [{ ...LEAD, running: true }], tasks: [] });
+  const ok = teamViewSchema.safeParse({ enabled: true, members: [LEAD], tasks: [task()] });
+  assert("the normalized view parses", ok.success, ok.success ? "" : ok.error.message);
+  assert("a deleted task does not parse (the wire filters tombstones)", !teamViewSchema.safeParse({ enabled: true, members: [LEAD], tasks: [task({ status: "deleted" })] }).success);
+  const stripped = teamViewSchema.parse({ enabled: true, members: [{ ...LEAD, running: true }], tasks: [] });
   equal("running survives the schema", stripped.members[0].running, true);
+  // The two wire generations (shared/team.ts): both must parse, a hybrid or a
+  // third shape must not. This is the rc.3 (dsh-agent-team) shape — no roster.
+  const rc3Projection = teamModeProjectionSchema.safeParse({ enabled: true, tasks: [task()] });
+  assert("the rc.3 projection (enabled, no roster) parses", rc3Projection.success, rc3Projection.success ? "" : rc3Projection.error.message);
+  assert("the older projection (members, no enabled) parses", teamRosterProjectionSchema.safeParse({ members: [LEAD], tasks: [task()] }).success);
+  assert("a hybrid {members, enabled} is neither generation", !teamProjectionSchema.safeParse({ members: [LEAD], enabled: true, tasks: [] }).success);
+  assert("a projection with neither marker is neither generation", !teamProjectionSchema.safeParse({ tasks: [] }).success);
+  equal("the union keeps each arm's own keys", Object.keys(teamModeProjectionSchema.parse({ enabled: false, tasks: [] })).sort(), ["enabled", "tasks"]);
+  // A member derived from the rc.3 subagent catalog carries no phase: its
+  // absence is "this generation does not express it", not `active`.
+  equal("a phase-less member reads unknown without running", teamMemberState({ id: "x", name: "x", role: "teammate" }), "unknown");
+  equal("…and running:false still reads idle", teamMemberState({ id: "x", name: "x", role: "teammate", running: false }), "idle");
 }
 
 console.log("\nthe subscription adapter");
@@ -490,7 +515,7 @@ async function subscriptionChecks() {
     return { subscriptions, log, deliver };
   };
   const agent = { id: "a1", provider: PROVIDER_ID, workspaceId: "w" };
-  const board = { members: [LEAD, mate()], tasks: [] };
+  const board = { enabled: true, members: [LEAD, mate()], tasks: [] };
   {
     const { subscriptions, log, deliver } = make([{ available: true, team: board }]);
     subscriptions.upsert(agent);
@@ -611,7 +636,7 @@ console.log("\npill wiring (source pins)");
  */
 async function seenMetadataChecks() {
   console.log('\nthe "seen" signature on the agent (agent metadata, 2026-11-11)');
-  const doneBoard = () => ({ members: [LEAD], tasks: [task({ id: "task-1", revision: 1, status: "completed" })] });
+  const doneBoard = () => ({ enabled: true, members: [LEAD], tasks: [task({ id: "task-1", revision: 1, status: "completed" })] });
 
   function createStore(overrides = {}) {
     const writes = [];
@@ -640,13 +665,13 @@ async function seenMetadataChecks() {
     equal("…and the board is hidden", teamPillVisible(doneBoard(), store.get("a1")), false);
     check(
       "a working board stays visible whatever the key says",
-      teamPillVisible({ members: [LEAD], tasks: [task({ id: "task-1", revision: 1, status: "in_progress" })] }, store.get("a1")),
+      teamPillVisible({ enabled: true, members: [LEAD], tasks: [task({ id: "task-1", revision: 1, status: "in_progress" })] }, store.get("a1")),
       true,
     );
     check(
       "a new revision is a new key and shows again",
       teamPillVisible(
-        { members: [LEAD], tasks: [task({ id: "task-1", revision: 2, status: "completed" })] },
+        { enabled: true, members: [LEAD], tasks: [task({ id: "task-1", revision: 2, status: "completed" })] },
         store.get("a1"),
       ),
       true,
@@ -668,7 +693,7 @@ async function seenMetadataChecks() {
     equal("…the echo reports no visible change", store.observe({ id: "a1", metadata: { [TEAM_SEEN_METADATA_KEY]: key } }), false);
     equal("…and the answer survives the echo", store.get("a1"), key);
     // Another window's close lands as an agent update with a different key.
-    const newer = teamAllDoneKey({ members: [LEAD], tasks: [task({ id: "task-2", revision: 3, status: "completed" })] });
+    const newer = teamAllDoneKey({ enabled: true, members: [LEAD], tasks: [task({ id: "task-2", revision: 3, status: "completed" })] });
     equal("another window's close reports the change", store.observe({ id: "a1", metadata: { [TEAM_SEEN_METADATA_KEY]: newer } }), true);
     equal("…and becomes the answer", store.get("a1"), newer);
     store.dispose();

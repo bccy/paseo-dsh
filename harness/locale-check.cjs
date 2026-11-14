@@ -219,6 +219,47 @@ console.log("the goal tools' timeline copy is covered in both languages");
   equal("the state row's own title (en)", allText().en.toolLabels.goal_state, "Goal status");
 }
 
+console.log("the tool failures' copy is covered in both languages");
+{
+  // Codes verified upstream (`dsh-tools/lib/types/error-codes.d.ts` and
+  // `contracts.d.ts`): the approval trio, the abort pair, rc.3's context error,
+  // and the unknown-tool code. `TOOL_ABORTED*` are the *constants*; the strings
+  // DSH records (and the client looks up) are `ABORTED*`, so those are the keys.
+  const CODES = [
+    "APPROVAL_REJECTED",
+    "APPROVAL_CANCELLED",
+    "APPROVAL_UNAVAILABLE",
+    "ABORTED",
+    "ABORTED_BEFORE_DISPATCH",
+    "TOOL_CONTEXT_UNAVAILABLE",
+    "UNKNOWN_TOOL",
+  ];
+  const en = allText().en.toolFailures;
+  const zh = allText()["zh-CN"].toolFailures;
+  check("both languages ship a toolFailures table", en !== undefined && zh !== undefined);
+  equal("toolFailures keys match", Object.keys(en).sort(), Object.keys(zh).sort());
+  for (const code of CODES) {
+    check(`${code} has copy in both languages`,
+      typeof en[code]?.short === "string" && typeof zh[code]?.short === "string", code);
+  }
+  for (const [locale, table] of [["en", en], ["zh-CN", zh]]) {
+    const leaves = Object.values(table).flatMap((entry) => [entry.short, entry.hint]);
+    check(`every toolFailures string is set (${locale})`,
+      leaves.every((v) => typeof v === "string" && v.trim() !== ""), JSON.stringify(leaves));
+  }
+  // Keying by the constant names would never match a row: the lookup reads the
+  // recorded code, so a name-keyed table is a silent no-op.
+  check(
+    "the abort keys are the recorded values, not the constants' names",
+    Object.hasOwn(en, "ABORTED") && Object.hasOwn(en, "ABORTED_BEFORE_DISPATCH") &&
+      !Object.hasOwn(en, "TOOL_ABORTED") && !Object.hasOwn(en, "TOOL_ABORTED_BEFORE_DISPATCH"),
+    JSON.stringify(Object.keys(en)),
+  );
+  // A user's refusal is a decision, not a fault: the Chinese sentence must not
+  // call it a failure.
+  check("the rejection reads as a decision, not a fault", !zh.APPROVAL_REJECTED.hint.includes("失败"), zh.APPROVAL_REJECTED.hint);
+}
+
 console.log("the jobs pill's copy is covered in both languages");
 {
   // The `jobs` table is an **object**, so the `scalarKeys` loop above skips it and
@@ -711,6 +752,13 @@ console.log("the team pill, panel and cards (T3)");
     ["subject must be non-empty", "subject 不能为空。"],
     ['teammate name "fixer" was already used in this Team', "队员名 fixer 在本团队已用过。"],
     ["limit must be an integer from 1 through 100", "limit 必须是 1 到 100 的整数。"],
+    // DSH 0.2.2-rc.2+ (`dsh-agent-team` / `dsh-tool-agent-team`). The older
+    // sentences stay above for DSH <= 0.2.1.
+    ['agent "checker" is not a continuable descendant of this task board\'s root', "agent checker 不是本任务板根代理的可继续子代理。"],
+    ["enable Agent Teams for this Session before using the task board", "当前会话还没开启团队，请先启用团队再使用任务板。"],
+    ["change Team mode from the root Session", "团队开关只能在根会话里切换。"],
+    ["owner and unowned filters cannot be combined", "owner 和 unowned 筛选不能同时使用。"],
+    ['task "task-2" revision 3 is visible, but persistence was not confirmed; read the task before retrying', "任务 task-2 的修订 3 已可见，但未确认持久化，请先重新读取任务再重试。"],
   ];
   for (const [raw, expected] of REFUSALS) {
     equal(`zh translates ${JSON.stringify(raw.slice(0, 40))}`, zh.translateToolError(raw), expected);
@@ -729,26 +777,36 @@ console.log("the team pill, panel and cards (T3)");
 
   // Drift: every literal TeamError sentence in the installed agent-team package
   // must have a Chinese line (variables instantiated). NOTE when absent.
+  // Two generations: `dsh-agent-team` (DSH 0.2.2-rc.2+) replaced
+  // `dsh-experimental-agent-team` (<= 0.2.1); whichever is installed is checked.
   let lib = process.env.DSH_AGENT_TEAM;
   if (lib === undefined) {
     try {
       const root = require("node:child_process").execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
-      lib = path.join(root, "@deepseek-ai", "dsh", "node_modules", "@deepseek-ai", "dsh-experimental-agent-team", "lib", "index.js");
+      const installed = ["dsh-agent-team", "dsh-experimental-agent-team"]
+        .map((name) => path.join(root, "@deepseek-ai", "dsh", "node_modules", "@deepseek-ai", name, "lib", "index.js"))
+        .find((candidate) => fs.existsSync(candidate));
+      lib = installed;
     } catch {
       lib = undefined;
     }
   }
   if (lib === undefined || !fs.existsSync(lib)) {
-    console.log(`  NOTE dsh-experimental-agent-team not found (${String(lib)}); set DSH_AGENT_TEAM to check refusal drift`);
+    console.log(`  NOTE no agent-team package found (${String(lib)}); set DSH_AGENT_TEAM to check refusal drift`);
   } else {
     const source = fs.readFileSync(lib, "utf8");
     // The model-facing refusals: TeamError / TeamTaskGraphError with a code.
     const literals = [...source.matchAll(/new Team(?:TaskGraph)?Error\((`[^`]*`|"(?:[^"\\]|\\.)*")/g)].map((m) => m[1]);
     check("agent-team refusals are readable", literals.length >= 20, String(literals.length));
     const sample = { id: "task-7", "request.taskId": "task-7", "current.id": "task-7", "task.id": "task-7", blockerId: "task-1", "dependent.id": "task-8",
-      "request.expectedRevision": "1", "current.revision": "2", "this.maxTasks": "100", "this.maxMembers": "16", "this.disposalTimeoutMs": "5000", name: "fixer", field: "subject",
+      "request.expectedRevision": "1", "current.revision": "2", "task.revision": "3", "this.maxTasks": "100", "this.maxMembers": "16", "this.disposalTimeoutMs": "5000", name: "fixer", field: "subject",
       maxLength: "200", "agent.id": "s-1", "JSON.stringify(value)": '"../x"', toolName: "team_task_get" };
-    const skip = /timeoutMs|wait_agent|teammate creation aborted|unsupported task action|positive safe integer|exceeds \$\{this\.config|message itself|interrupt|provisioned teammate|teammate "\$\{/;
+    // Internal/projection sentences are not model-facing refusals: a projection
+    // fold failure becomes the board's `failure` line (translated nowhere), and
+    // the load-time config check never reaches a tool result. `wait_agent` /
+    // interrupt / teammate-provisioning sentences belong to the older roster
+    // generation, whose Chinese lines are covered by its own package's check.
+    const skip = /timeoutMs|wait_agent|teammate creation aborted|unsupported task action|positive safe integer|exceeds \$\{this\.config|message itself|interrupt|provisioned teammate|teammate "\$\{|persisted Agent Teams .* payload is invalid|unsupported Agent Teams event version|must begin at revision 1|revision is not contiguous|requires a calling Agent|requires a calling agent|tool-agent-team: .* is no longer supported|agent-team: .* is no longer supported/;
     for (const literal of literals) {
       const body = JSON.parse(literal.startsWith("`") ? JSON.stringify(literal.slice(1, -1)) : literal);
       if (skip.test(body)) continue;

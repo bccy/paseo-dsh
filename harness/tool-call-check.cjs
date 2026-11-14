@@ -838,6 +838,17 @@ console.log("high-frequency tools get their own cards (L2)");
   equal("…the sentence does not stay in the body", subSend.body, "");
   equal("…and the copy control keeps it", subSend.fields.copyText, "message delivered to agent 851a7c1e-e899-4a4e-9b3f-000000000000");
 
+  // DSH 0.2.2-rc.2+ (`dsh-tool-subagent-control`): the recipient is `agent`
+  // (a path from the root), and the output is `{messageId}` rendered as
+  // `message delivered to agent <name>`.
+  const rc3Send = row("send_message", { agent: "reviewer/checker", message: "go" }, "message delivered to agent reviewer/checker");
+  equal("send_message (rc.3): the `agent` parameter is the head", rc3Send.summary, "reviewer/checker");
+  equal("…its rendered sentence is the receipt", rc3Send.fields.receipt, "已投递");
+  equal("…and no body repeats it", rc3Send.body, "");
+  equal("…the copy control keeps the sentence", rc3Send.fields.copyText, "message delivered to agent reviewer/checker");
+  const rc3SendJson = row("send_message", { agent: "reviewer", message: "x" }, '{"messageId":"m-1"}');
+  equal("send_message (rc.3): the structured {messageId} is accepted too", rc3SendJson.fields.receipt, "已投递");
+
   // A result neither implementation documents falls back to L1 — no guessing.
   const oddSend = row("send_message", { target: "lead", message: "x" }, "not json");
   equal("send_message: an undocumented result keeps L1's summary", oddSend.summary, "target: lead");
@@ -845,6 +856,13 @@ console.log("high-frequency tools get their own cards (L2)");
   equal("…and no receipt is invented", oddSend.fields.receipt, "");
 
   // --- interrupt_agent: the same two implementations ------------------------
+  // DSH 0.2.2-rc.2+ (`dsh-tool-subagent-control`; base disables it by default):
+  // `{agent}` in, `{accepted}` out, rendered as `interrupt requested for agent`.
+  const rc3Interrupt = row("interrupt_agent", { agent: "reviewer" }, "interrupt requested for agent reviewer");
+  equal("interrupt_agent (rc.3): the `agent` parameter is the head", rc3Interrupt.summary, "reviewer");
+  equal("…the request receipt", rc3Interrupt.fields.receipt, "已请求中断");
+  const rc3InterruptJson = row("interrupt_agent", { agent: "reviewer" }, '{"accepted":true}');
+  equal("…and the structured {accepted} is accepted too", rc3InterruptJson.fields.receipt, "已请求中断");
   const teamInterrupt = row("interrupt_agent", { target: "ban-mechanism-researcher" }, '{"previousStatus":"running"}');
   equal("interrupt_agent (team): the head is the target", teamInterrupt.summary, "ban-mechanism-researcher");
   equal("…the receipt quotes the status it replaced", teamInterrupt.fields.receipt, "已中断（原 running）");
@@ -1034,6 +1052,29 @@ console.log("high-frequency tools get their own cards (L2)");
   const legacyList = row("list_agents", {}, "(no subagents)");
   equal("list_agents: the old plain text stays L1's body", legacyList.body, "(no subagents)");
   equal("…with no member lines", legacyList.fields, null);
+
+  // DSH 0.2.2-rc.2+ (`dsh-tool-subagent-control/src/list-agents.ts`): the row is
+  // `{name, status, description?}` with no role, and a descendant's name is its
+  // path from the root (`lead` for the root). The older roster shape above is
+  // still the only thing DSH ≤ 0.2.1 emits, so both stay supported.
+  const treeMembers = JSON.stringify([
+    { name: "lead", status: "running", description: "root agent" },
+    { name: "reviewer", status: "inactive", description: "只读审查" },
+    { name: "reviewer/checker", status: "running" },
+  ]);
+  const treeList = row("list_agents", {}, treeMembers);
+  equal("list_agents (rc.3): the root row is not a teammate", treeList.summary, "2 名成员");
+  equal("…one line per path, no role column", treeList.fields.result, [
+    { kind: "text", label: "", value: "lead · running · root agent\nreviewer · inactive · 只读审查\nreviewer/checker · running" },
+  ]);
+  equal("…and the copy control keeps the whole array", treeList.fields.copyText, treeMembers);
+  const treeLeadOnly = row("list_agents", {}, JSON.stringify([{ name: "lead", status: "inactive" }]));
+  equal("list_agents (rc.3): a root-only tree reads 仅主会话", treeLeadOnly.summary, "仅主会话");
+  const mixedList = row("list_agents", {}, JSON.stringify([
+    { target: "lead", role: "lead", status: "running" },
+    { name: "reviewer", status: "running" },
+  ]));
+  equal("list_agents: a mixed array is neither generation → raw JSON", mixedList.fields?.result?.[0]?.kind, "json");
 
   // --- job_output / job_kill ------------------------------------------------
   const jobOut = row(
@@ -3372,6 +3413,17 @@ console.log("team task tools: field cards, raw JSON fallback, translated refusal
   equal("…mark", get.team?.tasks[0].mark, "done");
   check("…the row still expands", get.hasDetail === true);
 
+  // DSH 0.2.2-rc.2+'s `team_task_*` output: `NamedTaskView` omits
+  // `ownerId`/`ownerName` and carries the same value as `owner`. The card must
+  // fill its 负责人 field from it instead of claiming 未分配.
+  const { ownerName: _oldOwner, ...rc3Base } = view();
+  const rc3Task = { ...rc3Base, owner: "reviewer" };
+  const getRc3 = row("team_task_get", { task_id: "task-2" }, JSON.stringify(rc3Task));
+  check("team_task_get (rc.3) still gets a card", getRc3.team !== null && getRc3.team.kind === "task", JSON.stringify(getRc3.team));
+  equal("…and the `owner` key fills the 负责人 field", getRc3.team?.tasks[0].fields[1].value, "reviewer");
+  const rc3Unowned = row("team_task_get", { task_id: "task-2" }, JSON.stringify({ ...rc3Base, status: "pending" }));
+  equal("…an ownerless rc.3 task still reads 未分配", rc3Unowned.team?.tasks[0].fields[1].value, "未分配");
+
   const create = row("team_task_create", { subject: "x", description: "y", blocked_by: ["task-1"] }, JSON.stringify(view({ id: "task-3", revision: 1, status: "pending", ownerName: undefined, writeScopes: ["src/a.ts", "src/b/"], writeScopeWarnings: ["write scopes overlap with task-1"] })));
   equal("team_task_create: unowned reads 未分配", create.team?.tasks[0].fields[1], { label: "负责人", value: "未分配" });
   equal("…a pending task that is not ready is 等待依赖", create.team?.tasks[0].fields[0].value, "等待依赖");
@@ -3436,6 +3488,99 @@ console.log("team task tools: field cards, raw JSON fallback, translated refusal
   equal("English: no translation, DSH's words", en.errorShort, "");
   const enCard = row("team_task_get", {}, JSON.stringify(view()));
   equal("English card labels", enCard.team?.tasks[0].fields.map((f) => f.label), ["Status", "Owner", "Blocked by", "Revision"]);
+  setLocale(undefined);
+}
+
+console.log("tool failures: DSH's codes get words, unknown codes stay verbatim");
+{
+  // The server writes DSH's `tool/result.error` identity onto the row's
+  // `metadata` (`errorCode`/`errorName`/`errorReason`, see `server/timeline.ts`);
+  // this mapping is the only reader. A daemon that predates the name/reason
+  // fields sends the code alone, so every case below must also work without them.
+  const failure = (metadata, message = "Error: tool failed") =>
+    toolCallData(
+      {
+        name: "bash",
+        status: "failed",
+        detail: { type: "shell", command: "ls", output: message },
+        error: { message },
+        metadata,
+      },
+      "complete",
+    );
+
+  const rejected = failure({ errorCode: "APPROVAL_REJECTED", errorName: "ApprovalError" });
+  equal("APPROVAL_REJECTED: the head reads the Chinese short", rejected.errorShort, "已拒绝：用户未批准这次调用");
+  equal(
+    "…the expansion opens with the hint",
+    rejected.errorHint,
+    "用户在审批里拒绝了这次工具调用，DSH 没有执行它。这是用户的决定，不是故障。",
+  );
+  equal("…and DSH's verbatim sentence stays", rejected.error, "Error: tool failed");
+  equal("…the error class travels for the expanded block", rejected.errorName, "ApprovalError");
+
+  // The constant is `TOOL_ABORTED`, but the *code DSH records* is `ABORTED`
+  // (`dsh-tools/lib/types/contracts.d.ts`); the table is keyed by the recorded
+  // string, so the constant's name must not be the key.
+  const aborted = failure({ errorCode: "ABORTED", errorName: "AbortError" });
+  equal("ABORTED (constant `TOOL_ABORTED`'s value): the head reads words", aborted.errorShort, "已中止：回合被停止，工具没有跑完");
+  const beforeDispatch = failure({ errorCode: "ABORTED_BEFORE_DISPATCH" });
+  equal("ABORTED_BEFORE_DISPATCH: its own sentence", beforeDispatch.errorShort, "已中止：回合被停止，工具没有开始");
+
+  // A code alone still gets words: rc.1's approval failures already carry one.
+  const codeOnly = failure({ errorCode: "UNKNOWN_TOOL" });
+  equal("a code without a name still gets words", codeOnly.errorShort, "工具不存在或没有注册");
+  check("…and no name is invented", codeOnly.errorName === undefined);
+
+  // Unknown code: "do not invent copy" — the head keeps DSH's first line, and
+  // the block only gains the raw identity DSH actually sent.
+  const future = failure({ errorCode: "SOME_FUTURE_CODE", errorName: "FutureError" });
+  equal("an unknown code gets no short", future.errorShort, "");
+  equal("…no hint", future.errorHint, "");
+  equal("…the verbatim error stays", future.error, "Error: tool failed");
+  equal("…the code stays a fact", future.errorCode, "SOME_FUTURE_CODE");
+  equal("…and so does the class", future.errorName, "FutureError");
+
+  // Priority: the team table wins over the shared one (the goal table is read
+  // first by code, before either). A row can carry both an identity and a
+  // translatable sentence; the more specific translation must not be replaced.
+  const teamFirst = toolCallData(
+    {
+      name: "team_task_create",
+      status: "failed",
+      detail: { type: "unknown", input: { subject: "x" }, output: 'team task "task-1" not found' },
+      error: { message: 'team task "task-1" not found' },
+      metadata: { errorCode: "APPROVAL_REJECTED", errorName: "ApprovalError" },
+    },
+    "complete",
+  );
+  equal("the team table wins over the shared table", teamFirst.errorShort, "找不到团队任务 task-1。");
+
+  // `reason` is a fallback for an empty result text, never a second copy of it.
+  const reasonOnly = toolCallData(
+    {
+      name: "bash",
+      status: "failed",
+      detail: { type: "shell", command: "ls", output: "" },
+      error: null,
+      metadata: { errorCode: "APPROVAL_REJECTED", errorReason: 'the user rejected tool "bash"' },
+    },
+    "complete",
+  );
+  equal("an empty result text falls back to DSH's reason", reasonOnly.error, 'the user rejected tool "bash"');
+  check("…so the row is still expandable", reasonOnly.hasDetail === true);
+  const doubled = failure({ errorCode: "APPROVAL_REJECTED", errorReason: 'the user rejected tool "bash"' });
+  equal("…while a present result text is never doubled", doubled.error, "Error: tool failed");
+
+  setLocale("en");
+  const en = failure({ errorCode: "APPROVAL_REJECTED", errorName: "ApprovalError" });
+  equal("English: the short says the user decided", en.errorShort, "Rejected: the user did not approve this call");
+  equal(
+    "…the hint does not read as a fault",
+    en.errorHint,
+    "The user declined this tool call in the approval prompt, so DSH did not run it. This is a decision, not a failure.",
+  );
+  equal("…the code and class are locale-independent", `${en.errorCode}|${en.errorName}`, "APPROVAL_REJECTED|ApprovalError");
   setLocale(undefined);
 }
 

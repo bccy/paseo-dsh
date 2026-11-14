@@ -175,6 +175,7 @@ const mate = (over) => ({ role: "teammate", phase: "active", ...over });
 const task = (over) => ({ revision: 1, description: "", blockedBy: [], writeScopes: [], ready: false, writeScopeWarnings: [], status: "pending", ...over });
 const LONG = "第一段：只读审查实现。\n第二段：逐条给结论与 file:line。\n第三段：变异抽查。\n第四段：交付报告写到编排目录。";
 const BOARD = {
+  enabled: true,
   members: [
     LEAD,
     mate({ id: "i", name: "reviewer", running: false, description: "只读审查" }),
@@ -252,15 +253,15 @@ console.log("\nthe roster headline (T7): DeepSeek + N 名成员 + status chips")
   assert("no idle word anywhere", !container.textContent.includes("空闲"));
   assert("no per-member facts like 运行中 · …", !/运行中 ·/.test(container.textContent));
   // Run state missing: no 运行中 / 已停止 chip.
-  const unknown = render({ team: { members: BOARD.members.map(({ running, ...rest }) => rest), tasks: BOARD.tasks } }).container;
+  const unknown = render({ team: { enabled: true, members: BOARD.members.map(({ running, ...rest }) => rest), tasks: BOARD.tasks } }).container;
   check("running missing: only the done chip", JSON.stringify(chipKeys(unknown)), JSON.stringify(["done"]));
   assert("…no 运行中 anywhere", !unknown.textContent.includes("运行中"), unknown.textContent);
   assert("…no 已停止 anywhere", !unknown.textContent.includes("已停止"), unknown.textContent);
   check("…and the headline reads", headline(unknown)?.getAttribute("aria-label"), "DeepSeek，3 名成员，1/5 任务完成");
   // A zero count is never a chip.
-  const zero = render({ team: { members: [LEAD, mate({ id: "a", name: "a", running: true })], tasks: [task({ id: "task-1", subject: "x", status: "in_progress" })] } }).container;
+  const zero = render({ team: { enabled: true, members: [LEAD, mate({ id: "a", name: "a", running: true })], tasks: [task({ id: "task-1", subject: "x", status: "in_progress" })] } }).container;
   check("zero stopped, zero done: only running", JSON.stringify(chipKeys(zero)), JSON.stringify(["running"]));
-  const none = render({ team: { members: [LEAD, mate({ id: "a", name: "a" })], tasks: [] } }).container;
+  const none = render({ team: { enabled: true, members: [LEAD, mate({ id: "a", name: "a" })], tasks: [] } }).container;
   check("nothing to count: no chip at all", chipKeys(none).length, 0);
   // A failed member: a red chip, first.
   const failedBoard = { ...BOARD, members: [...BOARD.members, mate({ id: "f", name: "broken", phase: "failed", error: "child Session recovery failed: x" })] };
@@ -317,12 +318,13 @@ console.log("\nstopped owners (T5): 已停止 only from running:false");
   const header = [...container.querySelectorAll('[role="heading"]')].find((node) => (node.textContent ?? "").startsWith("进行中"));
   check("the 进行中 header counts stopped owners", header?.textContent, "进行中2 · 1 个负责人已停止");
   // Running unknown for everyone: no 已停止 anywhere and no count.
-  const unknownBoard = { members: BOARD.members.map(({ running, ...rest }) => rest), tasks: BOARD.tasks };
+  const unknownBoard = { enabled: true, members: BOARD.members.map(({ running, ...rest }) => rest), tasks: BOARD.tasks };
   const unknown = render({ team: unknownBoard }).container;
   assert("unknown running: no 已停止 anywhere", !unknown.textContent.includes("已停止"), unknown.textContent);
   assert("…and no stopped count", !unknown.textContent.includes("负责人已停止"));
   // The user's case: ten in-progress tasks whose owners all stopped.
   const ten = {
+    enabled: true,
     members: [LEAD, ...Array.from({ length: 9 }, (_, i) => mate({ id: `m${i}`, name: `m${i}`, running: false }))],
     tasks: Array.from({ length: 10 }, (_, i) => task({ id: `task-${i + 1}`, subject: `审查 ${i + 1}`, status: "in_progress", ownerName: `m${i % 9}` })),
   };
@@ -381,12 +383,12 @@ console.log("\nthe detail page");
 
 console.log("\nempty, Lead-only, failure, read-only");
 {
-  const empty = render({ team: { members: [LEAD, mate({ id: "x", name: "x", running: true })], tasks: [] } }).container;
+  const empty = render({ team: { enabled: true, members: [LEAD, mate({ id: "x", name: "x", running: true })], tasks: [] } }).container;
   assert("an empty board says 暂无共享任务", empty.textContent.includes("暂无共享任务"));
-  const leadOnly = render({ team: { members: [LEAD], tasks: [task({ id: "task-1", subject: "a", ready: true })] } }).container;
+  const leadOnly = render({ team: { enabled: true, members: [LEAD], tasks: [task({ id: "task-1", subject: "a", ready: true })] } }).container;
   assert("a Lead-only board's headline is just DeepSeek and it lists its tasks", headline(leadOnly)?.getAttribute("aria-label") === "DeepSeek" && leadOnly.textContent.includes("可开始"), headline(leadOnly)?.getAttribute("aria-label"));
   assert("…no 「0 名成员」 (nor any member count)", !leadOnly.textContent.includes("名成员"), leadOnly.textContent);
-  const leadDone = render({ team: { members: [{ ...LEAD, running: true }], tasks: [task({ id: "task-1", subject: "a", status: "completed" }), task({ id: "task-2", subject: "b", ready: true })] } }).container;
+  const leadDone = render({ team: { enabled: true, members: [{ ...LEAD, running: true }], tasks: [task({ id: "task-1", subject: "a", status: "completed" }), task({ id: "task-2", subject: "b", ready: true })] } }).container;
   check("0 teammates with tasks: DeepSeek + the done chip only", headline(leadDone)?.getAttribute("aria-label"), "DeepSeek，1/2 任务完成");
   assert("…and the running Lead is not a 运行中 chip", !leadDone.textContent.includes("运行中"), leadDone.textContent);
   const failed = render({ team: { ...BOARD, failure: 'team task "task-3" revision is not contiguous', members: [...BOARD.members, mate({ id: "f", name: "broken", phase: "failed", error: "child Session recovery failed: x" })] } }).container;

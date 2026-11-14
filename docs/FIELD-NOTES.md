@@ -3798,3 +3798,326 @@ f) 预热的 `initialize` 带的是缓存里的 `fallbackRoute`（`cache-lane/ca
 推断会大幅减少，未实测）；③ 冷 catalog 缓存的 profile（升级/换 key 后首次加载）不预热，仍付一次
 冷启动，这是 deliberate 的取舍（见修法 2）；④ 常驻内存按第二十七轮的约 550 MB 估算，未在本次任务里
 重新测量。
+
+## 第三十轮：DSH 0.2.2-rc.1 → 0.2.2-rc.3 跟版——团队投影换代（2026-11-14）
+
+### 101. `agentTeam` 投影换代与 `waitForChildren` 改名：不跟版就是团队 pill 永久不出现、撤回的委派等待静默变 no-op
+
+**上游变化**（两个都在 rc.2，rc.3 无增量）：
+
+1. `dsh-experimental-agent-team` 整个被 `dsh-agent-team` 取代。它的 `TeamProjection` 从
+   `{members, tasks, failure?}` 改成 `{enabled, tasks, failure?}`，`members`/`TeamMemberProjection`
+   整体删除，包自己的投影注释写明「Current subagents are supplied separately by the existing
+   `subagentCatalog` projection」（`dsh-agent-team/lib/types/projection.d.ts`）。当前子代理不再有
+   `phase`（`TeamMemberPhase` 只留给历史 `team/member` 记录），任务视图新增 `ownerId`，`team_task_*`
+   的工具输出把负责人从 `ownerName` 改名为 `owner`。同一版本 base 默认组合 `agent-team` + `tool-agent-team`。
+2. `dsh-subagent` 的公开服务方法 `waitForChildren(parent)` 改名 `waitForTreeWork(root)`
+   （`dsh-subagent/lib/types/index.d.ts`，语义从「委派父的直接子」扩到「子代理树的根」）。
+
+**失效形状**（这是本条要记的教训）：
+
+- 插件这边 `shared/team.ts` 的 Zod 把 `members` 当必填，rc.3 的视图 `safeParse` 必失败 →
+  `provider.readAgentTeam` 报 `rpc_failed`。那是**瞬态**码，客户端按设计「保留上一块看板」重试：
+  老会话还留着上一块；**新会话没有上一块，pill 永远不出现**，只有控制台每 4 秒一行同样的错。
+  这正是本文件反复记的静默降级：没有崩溃、没有报错弹窗、功能消失。
+- 桥的 `settleDelegatedWork` 兜底分支写着 `typeof subagents.waitForChildren !== 'function' → return`，
+  上游一改名，这条守卫就把「方法没了」吞成「无事可做」。它只在 profile 不组合 `agents` 时才走，
+  当前 profile 走不到，所以没有任何检查会红——直到用户换了一个无 `agents` 的组合，撤回结束后
+  仍在写文件，而无一行日志。
+
+**修法**：
+
+- `shared/team.ts` 用**两个 strict 分支的 union**（旧 `{members, tasks}` / 新 `{enabled, tasks}`）解析，
+  归一化成 `{enabled, members, tasks, failure?}`：混合形状或第三种形状仍是响亮的 `rpc_failed`，
+  不是「把未知键剥掉算成功」。旧代 `enabled` 恒 true（旧投影只在有团队时存在）。
+- 新代成员来自 Lead 的**可继续直接子代理**（`paseo/subagents`，只读、不登记边/不重放帧），
+  名字取 `name`、没名字退回 session id、`label` 只作 description；不编造 `phase`。依据是 rc.3 自己：
+  `dsh-client-ui-agent-team` 的 `TeamBoard.tsx` 只画任务板（`if (!team?.enabled) return null`），
+  成员面板是共享的 `subagentCatalog`，`dsh-tool-subagent-control/src/list-agents.ts` 只把
+  `mode === 'continuable'` 的行当作可消息成员。目录读失败是瞬态 `rpc_failed`，绝不画成「0 名成员」。
+- `enabled` 驱动 pill：`enabled: false` 即便还有历史任务也不显示（与上游任务板一致；任务与开关是两份
+  独立持久状态）。
+- 桥 `paseo/subagents` 透出行的 `name`（rc.3 新增的 catalogue v3 字段，旧版没有就不带）。
+- 桥的等待改为 `waitForTreeWork ?? waitForChildren`，两个都没有时**打一行 stderr** 再返回，注释写清两代名字。
+- `harness/dsh-api-contract-check.mjs` 补两处它原本看不见的面：`dsh-subagent` 的等待方法「二选一」、
+  `agentTeam` 投影必须是已知两代之一（按 key 读的 projection 不是 import）。
+
+**验证**（2026-11-14，离线）：`team-server-check` **38/38**（新增 rc.3 五种用例：正常新形状、`enabled:false`、
+目录读失败、目录抛错、混合/无标记形状）、`team-pill-check` **224/224**、`team-popover-render-check` **93/93**、
+`bridge-server-check` **110/110**（新增 §8：两代等待、都没有时日志、`agents` 在时仍按身份 join）、
+`dsh-api-contract-check` 对 rc.1 **19/19**、对 rc.3 前缀 **19/19**、`locale-check` rc.1 **795/795** / rc.3 包 **790/790**。
+**变异**：把新形状从 union 里去掉 → team-server-check 28/37（9 条 rc.3 用例红）；删掉 `waitForTreeWork`
+分支 → bridge-server-check 109/110（那条断言红）；均还原并确认 diff 干净。rc.1 全量 `plugin-check.cjs` 40/40。
+
+**未验证 / 环境**：① rc.3 真实回合由另一个基线包覆盖（用户 profile 是 base + web-app + 已退役的
+`dsh-experimental-agent-team-profile` + `maxMembers: 50`；rc.3 的 `dsh-agent-team` 对这些旧配置抛
+`TEAM_INVALID_CONFIG`，服务加载失败 → `agentTeam` 投影不存在 → 插件落到终态 `team_unavailable`，
+已加 fixture 钉住）。② 本机有真实 daemon 在跑，`revert-check` 的共享子进程 3 条无法通过
+（日志原句：前一插件进程的共享 dsh 仍占着 `paseo` profile 的监听端口），与本轮改动无关；
+`subagent-check` 94/97，用 HEAD 快照复跑失败项逐字相同，属既有失败。
+
+### 102. 具名子代理：要给的是"第一行任务描述、第二行短名/路径"，所以 title 放名字、description 放 label
+
+**上游能力**（rc.2 起，rc.3 无增量）：`subagent/catalog` v3 给每个新写入的 child 记 `name`（同父唯一）；
+`listDescendants` 的行带 `path?`（根开始的斜杠路径，任一段无名就缺失）。插件的 `session.opened`
+早就有 `title`/`description` 两个字段（`@getpaseo/plugin` 0.16.0-beta.1 `dist/server/provider.d.ts`
+":601-614"），上游不需要任何新事件形状。
+
+**宿主怎么画（决定规则的方向）**：Paseo 0.16.0-beta.2 的子代理轨道行
+`label = description ?? title`、`subtitle = (description ? title : null)`，第一行画 `label`、
+第二行画 facts（`subtitle`）；子代理面板 tab 是 `label = description?.trim() || title || "Subagent"`、
+`subtitle = "title · <Provider> subagent"`（源码 `packages/app/src/subagents/track-presentation.ts:40-64`、
+`track.tsx:214,244`、`panels/provider-subagent-panel.tsx:99-105`；安装版 bundle
+`@getpaseo/server/dist/server/web-ui/_expo/static/js/web/index-44e0190efcaf1d129a235c27b64ac76f.js`
+有逐字相同的可检索片段）。→ **只有 `title` 放名字/路径、`description` 放 label，屏幕上才是
+「第一行 = 任务描述（与现状相同）、第二行 = 短名/路径」**。反过来（title=label、description=名字）
+会让第一行变成短名、任务描述掉到第二行，正好是用户不要的观感。
+
+**规则（唯一实现点：`session.ts` 的 `childIdentity`，live 与 replay 都走它）**：
+- 有 `path`/`name` 且 label 非空：`title = path ?? name`，`description = label`；
+- 有 `path`/`name`、label 为空：`title = path ?? name`，不带 `description`（有名字的行的好过「无标题」）；
+- 没有 `path`/`name`：`title = label`，不带 `description`（rc.1 与历史行逐字段不变）；
+- `title === description`（label 与名字同文）时不带 `description`——宿主不去重，会画两行同文；
+- 空串当缺失、非字符串当缺失（桥已忽略并打日志）；**不用 label 填 name，反过来也不填**。
+
+**真实时序与假桥不符（2026-11-14 第三轮教训）**：上面那套规则在离线假桥里一直绿，真 rc.3 上却始终只显示 label——
+假桥把 `name`/`path` 直接塞进了 `session.child-opened`，而真实 rc.3 的到达顺序是：**子会话自己的
+`subagent/descriptor`（只有 label）先到 → 桥立刻 announce（一次）→ 父会话的 `subagent/catalog` v3
+（唯一带 `name` 的事实）晚约 14 ms 到**（真机抓帧：openChild@T、descriptor@T+0、catalog@T+15，
+catalog payload `{"version":3,…,"name":"mint-probe"}`）。宿主的 title/description 在首次
+`attachChild` 后 sticky，所以这一次 announce 就定死了整行——名字晚到也补不上。修法：**插件持有那唯一
+一次 `session.opened`，有界等待父 catalog 的 name**：
+- 仅当桥在 `initialize` 回执的 `serverInfo.subagentNames` 里声明"这个 DSH 会给名字"时才等
+  （桥用鸭子类型探测 `subagents.namesOf`/`rootOf`，rc.1 没有 → 旧行为，一个都不等）；
+- `session.child-opened` 带 `listed: true` 的行（桥从 durable 目录登记、重载后 adopted 或历史条目）
+  不等——它们再不会有新的 live catalog 事实；
+- 边界双保险：子会话帧数达 `CHILD_NAME_WAIT_EVENTS = 8` 或墙钟 `CHILD_NAME_WAIT_MS = 750` 即按
+  label 打开（实测 catalog 在子会话第一帧之前就到，正常路径永远走不到边界；750 ms 只是防止
+  catalog 丢失时把行永久扣住）。拿到 name 后仍走同一条 `childIdentity`：`title = name`、`description = label`。
+- 代价：live announce 晚约 10–20 ms；rc.1 完全不变。
+
+**title 与 description 的 sticky 是对称的（已读宿主代码确认）**：首次 `attachChild` 的 upsert 同时带
+`opened.title ?? null` / `opened.description ?? null`（`@getpaseo/server@0.16.0-beta.2`
+`dist/server/server/agent/plugin-provider.js:1160-1180`），之后回合状态 upsert 只带 `status`，
+`provider-subagents/store.js:7-9,45-63` 的 `stickyField` 对省略值保留、对显式 `null` 清空。所以两个字段
+一起在首次 open 时定下、之后同样不升级：**live 时只有 `name`（catalog v3 不带 path）→ title 停在短名，
+下一次 reopen（新 attach）才可能升级为全路径**；description 同理，不会单独变。这是可接受的回退。
+
+**三个静默退化形状（都被断言钉住）**：① 用 label 填 name（或反过来）→ rc.1 树看起来"有名字"，
+升级后观感突变；② 只接 live 不接 replay → 重开会话第一行退回 label、第二行消失，像"时好时坏"；
+③ 非字符串 name/path 走 `String()` → `[object Object]` 当身份展示（桥的做法：忽略 + 每个 child
+每字段一行 stderr，不抛，仍按 label 打开）。
+
+**第四轮补：catalog 事实属于"创建者会话"，以及"够不够格等"与"帧数到没到界"必须分开判**（2026-11-14）：
+① 孙代理的名字不在根会话的 `subagent/catalog` 里，而在**它的直接父（一个子会话）**的那条事件里；如果
+只在根路径上记名字，每个 live 孙代理都会既没有名字、又白等满 750 ms——这是对现状的回归（真 rc.3 默认
+`maxDepth: 1`，所以日常看不到，一旦放宽深度就会暴露）。修法：在事件路由/缓冲**之前**对任何 session 的
+`subagent/catalog` 都记名字并触发 flush；父会话尚未 open（甚至还没被 announce）时，这条事件照样要能被
+看见。② 判断"通知是否还该等"时把两件事拆开：**还有没有资格等**（能力位、listed、identity 未知、
+未到定时器上界）与**帧数是否已到界**。写成 `awaits = 有资格 && 帧数<界` 之后，再用 `awaits` 去判
+"帧数到界就打开"是恒假——帧数上界那条路径和它的日志成了死代码，只剩 750 ms 定时器兜底（第三轮的实际
+bug）。两个判断分开，帧数到界才能真的打开并留下「held N frames with no catalog name」那行。
+但到界时**必须把"已到界"记成粘性状态**（与 750 ms 定时器共用 `#nameExpired`）：此时通知可能仍被
+另一道闸门扣着（父 notice 未到、label 未到、根未就绪），flush 打不开它，于是此后**每一帧**都会
+再打一遍"opening it"并空跑一次 flush——第四轮就是这样漏的（假桥 `name-bound-gated` 上实测 5 行
+同句日志，修后 1 行）。日志文案也不要说谎：到界只是"不再等名字"，就此写
+"the name wait is over (its label will title the row)"，不写"opening it"。
+
+**边界（不修，写在这里免得复发现）**：① 宿主 `resolveRowLabel` 把字面 `"new agent"`（大小写不敏感）
+当空，命中该名字的 child 会退回 label 标题，插件侧无法预判；② one-shot 的 catalog v3 不带 name（`path`
+随之缺失）→ 这类行只显示 label（与今天一致）；③ live 打开的行可能只有短名、reopen 后才变全路径。
+
+**验证（2026-11-14，离线，两轮都在终版代码上重跑）**：`subagent-check` **114 条**（第三轮新增 4 条：真实时序下
+`title=name`/`description=label`、等待期间帧仍按序到达、rc.1 无能力声明时立开、且立开早于随后的
+根帧；第二轮 2 条同文/无 label 断言保留）、`bridge-server-check` **121/121**（第三轮新增 5 条：能力位
+有/无、listed 有/无、catalog 原样转发）、`dsh-api-contract-check` rc.1/rc.3 各 **20/20**、
+`bridge-assets-check` 2/2（桥改动后已重生成）、
+`tsc --noEmit` exit 0、`plugin-check.cjs --self-test` 通过、`harness-gates-check` 52/52、
+`session-state-check` 25/25。变异（第二轮）：规则改回「title=label、description=名字」→ (a)(b) 红；
+只接 live 不接 replay → replay 段红；删桥 name 透传 → bridge-server-check 2 红；均还原并核 sha256。
+**真机未验证**：需要新会话才看到（能力位按会话生效），且本包禁止装/重载插件。
+
+### 103. 工具失败码按常量名查表，永远不命中：`TOOL_ABORTED` 的码值是 `ABORTED`
+
+**现象**：接上 rc.3 后，停止回合/用户拒绝审批这类失败行在 Paseo 里仍是英文原句。把调研报告里写的
+`TOOL_ABORTED` / `TOOL_ABORTED_BEFORE_DISPATCH` 当作码表键补了文案，界面上也不出现——而且**不报错**。
+
+**根因**：这两个是**常量名**，不是码值。`dsh-tools/lib/types/contracts.d.ts:250-252` 写的是
+`TOOL_ABORTED = "ABORTED"`、`TOOL_ABORTED_BEFORE_DISPATCH = "ABORTED_BEFORE_DISPATCH"`；
+`pipeline.js:231/483/939/958` 记到结果上的也是这个值，`metadata.errorCode` 里自然只有 `ABORTED`。
+码表 miss 的既定行为是"保持原样文本"，所以键写错既不红也不崩，只是永远不生效。
+
+**修法**：码表键用记录值；`locale-check` 钉住 `ABORTED`/`ABORTED_BEFORE_DISPATCH` 存在且
+`TOOL_ABORTED*` 不存在（键写错会红），`tool-call-check` 用记录值跑用例。rc.1 与 rc.3 的值逐字相同，
+所以无需版本门。
+
+**顺带**：`tool/result.error` 的 `name`/`reason` 是 rc.1 就有的字段（rc.3 逐字相同），桥全量转发，
+插件此前只读 `code`；补 `errorName`/`errorReason` 属于既有 metadata 透传，不是新协议字段。
+`reason` 只在结果文本为空时兜底，否则同一个句子会打印两遍。
+
+**验证（2026-11-14）**：`tool-call-check` 838、`timeline-check` 265、`locale-check` 793 全绿；
+变异（删掉 `APPROVAL_REJECTED`、让未知码也出 hint）各 2 红后还原，sha256 与备份一致。
+
+---
+
+## 第三十一轮：DSH 0.2.2 的 `[Service.init]` 与「照着抄」的离线装配（2026-11-14）
+
+### 104. 离线装配 DSH 的 agent 服务在 0.2.2 失效：接线搬进 `[Service.init]`，`factory-ownership-order-check` 全红
+
+**症状**：`node harness/factory-ownership-order-check.mjs` 在 0.2.2-rc.1 上 exit 1，报
+`no agent factory registered (load an agent-loop plugin)`（栈落在脚本的 `createSession`）；只修这一处后
+改报 `Cannot read properties of undefined (reading 'stateOf')`；两处都修完，断言又红
+`beginOwner must run before the session is published — true !== false`。这道门从升到 0.2.2 起就一直红，
+实际什么都没守住。
+
+**根因**（三处，同一轮 0.2.2 上游改动；报告里有逐版源码比对）：
+1. 0.2.2 把 `dsh-agent-loop` 的 `agents.setFactory(this)` 与 `dsh-agent` 的 turn-boundary 投影句柄注册
+   都搬进了 `async [Service.init]()`。该钩子**只在 Cordis 以插件方式构造类时执行**
+   （`cordis/lib/index.js` 的 `Fiber._runner.execute` 里 `instance?.[symbols.init]?.()`），直接 `new`
+   只完成 `ctx.reflect.provide`——服务看起来构造成功，实际半初始化。
+2. 同上：`turnBoundaryOf()` 读的句柄由 `[Service.init]` 建，直连构造必拿 `undefined`。
+3. 0.2.2 把会话发布移到 `setup` 之前（0.2.1 在 `publish()` 里、setup 之后），脚本「会话发布之前」那条
+   代理断言随之失真。真正关闭捕获窗口的是 **agent 发布**：捕获从 `agent/created` 观察者里跑，这条在
+   0.2.2 仍是 setup 之后。
+
+**修法**（`harness/factory-ownership-order-check.mjs`）：`new AgentRegistry` →
+`await ctx.plugin(AgentRegistry)`，并把 `new SessionProjectionRegistry(ctx)` 提到它之前（`AgentRegistry`
+声明 `inject = ["sessionProjections"]`，先备依赖）；`new AgentLoop(ctx, {…, maxParallelToolCalls:
+{get: () => 10}})` → `await ctx.plugin(AgentLoop, {…, maxParallelToolCalls: 10})`。**数字 10 不是风格问题**：
+插件路径过 Config 校验（`z.number()`），schemastery 的 `volatile()` 再包成带 `.get()` 的持有者，正是消费点
+要的形状；`{get}` 只在直连构造绕过校验时才「能跑」，混用立刻报 `invalid config:
+$.maxParallelToolCalls expected number`。删掉「会话未发布」断言与只写不读的 `inSessionTable` 记录，保留
+「agent 未发布」，并把这条装配规则写进脚本头部；`docs/HARNESS.md` 条目补同一句。**桥不用改**：
+`beginOwner` 仍在默认 `setup` 末尾，0.2.2 下仍在「第一笔捕获之前、agent 发布之前」，只是不再在「会话进入
+store 之前」——`dsh-bridge/lib/server.js` 那段注释按 0.2.2 的事实改准（只改注释），并重生成内嵌桥。
+
+**检查**：`harness/factory-ownership-order-check.mjs` 在全局 0.2.2-rc.1 与临时前缀 0.2.2-rc.3 上都
+**6/6 PASS、exit 0**；变异 m1（删掉桥默认 `setup` 里的 `beginOwner` 调用）→ 红
+`createSession must call beginOwner exactly once (called 0 time(s))`；变异 m3（把它挪到 `agent/created`
+之后）→ 红 `beginOwner must run before the agent is published`，均还原、`git diff` 干净。同批全绿：
+`node --check`、`bridge-assets-check`、`bridge-server-check` 106/106、`harness-gates-check`、
+`rewind-transaction-check` 28/28、`tsc --noEmit`。
+
+**未验证**：本机没有完整 0.2.1 安装，`ctx.plugin` 在 0.2.1 走构造函数路径是源码推理（插件加载是宿主
+路径，两条线都应通），未实测；本检查不起模型回合，真实 profile 下的表现不在其覆盖范围。
+
+### 105. `rewind-e2e` 末两条判据随用户 profile 变红，而且取答写法本身能"空答案假绿"
+
+**现象**：`harness/rewind-e2e.mjs` 在 HEAD 上 **10/12**，末两条（"模型仍知道 ALPHA"、"不再知道
+BETA"）稳定红，第 3 回合答 `BETA`。初见像撤回坏了（撤回后模型还记得被撤内容），
+`docs/REWIND.md` 的已知缺口把它挡成了"预期行为"，于是红就这样躺着。
+
+**根因（两层，都是判据的错，不是撤回的）**：
+
+1. **判据把第三方插件的状态算进来了**。用户 profile 里 `dsh-memory`（`dsh-prime-memory`）开着
+   `live.capture/distill/recall`。第 2 回合（被撤回合）里模型自己调了 `memory_update`，把暗号写成
+   BETA；撤回只折 DSH 的对话 surface 与工作区文件，**不撤记忆库**；第 3 回合起手时插件把它作为一条
+   `user/message`（`source.kind = "plugin:memory"`）注入到用户问题之前。该注入行的 seq **在撤回
+   标记之后**（标记：`source.kind = "paseo-rewind"` + `surfaceOp.replace`，本次区间 `[28,37]`，
+   注入在 `seq 46`），重放折叠删不到它。对照实验：同一个克隆只把 `dsh-memory` 禁用 → 第 3 回合答
+   `ALPHA`、`plugin:memory` 事件 0 条，末两条转绿。**这条脚本测的是桥的撤回，不该由用户额外装的
+   第三方插件决定红绿。**
+2. **取答写法本身有缺陷**（真正的"假绿"来源）。旧代码把**整条流**所有 `assistant/message` 的文本
+   取 `.at(-1)` 当第 3 回合答案：既没按 `turn/start` 分回合（这一回合只出工具时，会拿上一回合的
+   回答当答案——和 `AGENTS.md` 记的 `waitFor` 匹到陈旧事件同类），又没有"答案非空"这个前置断言。
+   定位取证时把取答写错（给 `textOf` 传了 frame 而不是 event），答案变成空串，于是
+   `and no longer knows BETA` **PASS**——**"模型什么都没答"被判成"不知道被撤内容"**。
+
+**修法**：
+
+- 取答下沉到 `harness/harness-gates.cjs#lastTurnAnswer`（纯函数，`harness-gates-check.mjs` 的
+  T05 段守着）：记录最后一次 `turn/start` 的下标，只取它之后的 `assistant/message` 文本，空快照
+  丢弃、多条拼接；没有回合边界时返回 `""` 而不是流的尾巴。`rewind-e2e` 先用
+  `answer.trim() !== ""` 断言"这一回合答了"，再断言含 ALPHA、不含 BETA。
+- 新增注入面判据：`paseo/history` 重放里不允许出现任何 `plugin:*` 来源、正文含被撤文本的
+  `user/message`（`harness-gates.cjs#pluginInjectedUserTexts`，同样在 T05 段）。没有记忆类插件时
+  自然通过；有插件时它就是把已知缺口钉成可观察行为的那条。
+- `harness/isolated-dsh-home.cjs#sandboxClonedProfile` 加**仅作用于克隆**的 `disable: ["<行 id>"]`：
+  在克隆的 `cordis.patch.yml` 里给那些 `- id:` 行加 `disabled: true`（缺键插入、`false` 改写真、
+  没有该行返回 `absent` 且不算失败）。**是行 id 不是包名**，真实 home 与调用方自备的 `DSH_HOME`
+  永不修改（`--allow-real-profile` 下请求列表只回显为 `disableRequested`）。`rewind-e2e` 默认传
+  `dsh-memory`（`REWIND_E2E_DISABLE_ROWS` 可覆盖），首部打印"禁用了哪些行/哪行不存在/为什么没生效"。
+- `--with-memory` 保留插件，把「被撤文本出现在 `plugin:memory` 注入行、模型据此作答」当**已知缺口
+  的可观察行为**打印（`OBSERVED` / `KNOWN GAP` 行），不判红，也不掩盖其他判据。
+
+**验证（2026-11-14，真 dsh `0.2.2-rc.1`、`--profile paseo`、每步一次性克隆 home）**：
+`rewind-e2e` **14/14** 连跑 2 次；首部含 `profile rows disabled in the clone … dsh-memory`。
+**先红后绿**：① 去掉禁用（`REWIND_E2E_DISABLE_ROWS=""`）→ 末两条 + 注入面 3 红、答案 `BETA`；
+② 把取答换成恒返回空串 → "the third turn produced an answer" 红（旧写法这里会绿）；
+③ 去掉回合边界过滤的构造：T05 用同一条事件流证明旧的整条流 `.at(-1)` 在"只出工具的一回合"上
+返回上一回合的 `好`、新判据返回 `""`（真机上构造一回合无文本是不确定的，所以这条落在离线判据里）。
+全部还原后 `git diff` 无残留。离线全绿：`node --check` 两个脚本、`harness-gates-check` **68/68**、
+`isolated-home-bridge-check` **12/0**、`revert-check` **121/3**（3 条与未改 HEAD 的基线完全相同的
+"共享子进程"环境红：本机 live daemon 的常驻 dsh 占着 `paseo` 端口，与本次改动无关）、
+`rewind-transaction-check` **28/28**、`revert-shape-probe` **10/0**、`plugin-check.cjs` 完整一遍。
+
+**教训**：① 判据里"取错了/取不到"必须显式判失败，否则最坏的情况（模型没答）会被读成最好的结论；
+② 一条端到端脚本若把用户自己装的插件结果算进断言，它的红绿就不可重现——隔离要连**行为**一起隔离，
+只沙盒数据目录和端口不算；③ 文档里写了"已知缺口"不等于判据可以继续超出契约，两边必须对上。
+
+## 第三十二轮：预热把「新起的共享 dsh」当成「已服务的进程」（2026-11-14）
+
+### 106. 插件重载 / daemon 重启后首开旧会话：日志停在回合中间的子代理永久显示「运行中」（PW-01）
+
+**症状**：插件 reload 或 daemon 重启后第一次打开旧会话，那个被重启杀掉的子代理在 Paseo 里一直
+转圈（「运行中」）——不报错、不崩，行也不会自己结束，只有关掉会话才消失。同一连接内的
+refresh / close→reopen 状态是对的。界面不可信，证据打在协议层：重放时该子代理连一条
+`session.turn` 都没有，工具行停在 `running`。
+
+**根因（我们这一侧，`ae814f3` 引入）**：该提交把共享 child 改成「连接存活期内常驻」并在
+`connect()` 里 `prewarmSharedDsh()` 预热，但 `#ensurePoolProcess` 的两条 join 分支都**无条件**
+返回 `reused: true`：
+
+1. child 已在池中——包括预热刚 publish、**一个会话都没服务过**的那个；
+2. 预热的 spawn 仍在飞，首个 open 加入它（冷启动要 8–23 s，首开最常落在这个窗口，此时
+   `#poolPrewarmed` 还没置位）。
+
+`reused` 被 `DshSession` 记成 `#joinedLiveProcess`，重放子会话时
+`adoptingProvesOpenTurn = (live || processKeptRunning) && turnOpen` 成立 → 提前返回：不发
+`canceled` 回合、不 settle 悬着的工具行。DSH 不会为「进程已死」追加任何 durable 事实，所以之后
+没有任何事件能再关闭它。
+
+| 路径 | 进程状态 | 修前 | 正确行为 |
+|---|---|---|---|
+| 重载 / 重启后首开旧会话 | 预热刚起的 child，没服务过任何会话 | 当成 adoption → 保留 running | 冷启动 → canceled |
+| 同一连接内 close→reopen（Paseo refresh） | child 一直在服务会话 | adoption | adoption（不变，`session.ts` 的规则不动） |
+
+**修法（只改 `provider.ts`）**：把「joined a process that was already serving conversations」
+收窄回它字面的意思，分类集中在一处（`#ensurePoolProcess`）：
+
+- `existing` 分支 → `reused: !this.#poolPrewarmed`（`#addPoolClaim` 随即清掉该标记，所以之后的
+  join 都报「已服务」）；
+- 在飞 join 分支 → `reused: !this.#prewarmSpawn`。新字段 `#prewarmSpawn` 由
+  `prewarmSharedDsh()` 在 spawn 期间置位、`finally` 复位：`#poolPrewarmed` 只能等 spawn 完成才置位，
+  而这个窗口恰恰是首开最常见的位置。
+- `#acquirePoolProcess` 不再二次判断（透传 classify 结果）；`envDiffering` **不**跟着收窄：
+  env 有没有生效由 `#envDifference` 对着 child 真实的 spawn env 判断，在飞 join 的来源会话键确实
+  不生效，必须仍然响亮（若跟着 `reused` 收窄，这条会静默）。
+
+**验证（离线，2026-11-14）**：
+
+- `harness/subagent-check.cjs` **97/97**（连跑 3 次 + 终版复跑）：冷启动用例改用**新连接**取得
+  未服务过的 child——池按连接常驻后「关会话 + 睡 12 s」再也退休不掉它，旧写法实际在测
+  adoption（同一条用例与 `an adopted reopen ...` 语义互斥）；那段 12 s 等待与
+  TEMPORARY DIAGNOSTIC 块已删（无断言依赖）。
+- `harness/pool-prewarm-check.mjs` **49/49**：新增 **j)** 段守住**真实 prewarm 路径**（脚本预置
+  catalog 缓存，让预热真的发生——`subagent-check` 的一次性 home 没有缓存，预热永远 skip，守不住
+  这条）。假桥 `replay` 模式的 `child-K` 日志停在回合中间、没有终态：预热**已完成**后首开必须
+  结算 `canceled`（工具行同样 settle），预热**在飞**时首开同样如此；同一连接上第二个会话 open
+  则保留 running（adoption）。断言读的是 `reused` 的唯一消费者（重放结算），不为测试给
+  provider 加只读访问器。**先红后绿**：未改 HEAD 上 4 红（首开/在飞的 turns + tool 各两条）。
+  变异：在飞 join 改回 `reused: true` → 2 红；已完成预热的 `existing` 分支改回 `reused: true`
+  → 2 红（两处互不串台）；`session.ts` 的 `adoptingProvesOpenTurn` 强制 true → `subagent-check`
+  3 红（94/97）。均还原，`git diff` 无残留。
+- 同时全绿：`tsc --noEmit` exit 0、`plugin-build-check` 86/86、`plugin-check.cjs` **40/40**
+  （默认一次性 `DSH_HOME`，首行 `DSH home: isolated (throwaway clone…)`）、`plugin-check --self-test`、
+  `harness-gates-check` 52/52、`bridge-assets-check` 2/2（未动桥）、`session-state-check` 25/25、
+  `catalog-cache-check` 12/12、`concurrent-open-check` 15/15、`multi-session-check` 49/49、
+  `process-crash-check` 24/24、`child-crash-check` 14/14、`reload-port-race-check` 51/51；
+  `revert-check` 121 过 + 3 条既有环境红（共享子进程段），与未改 HEAD 快照的失败集合逐条一致。
+
+**未验证 / 边界**：① 真机端到端未做（本轮禁止重启 daemon / reload 插件 / 动 `~/.dsh`，真 Paseo UI
+未复验）；② 触发前提是 profile `$DSH_HOME/paseo/catalog/` 有可用缓存——升级 / 换 key 后首次加载
+缓存失效时预热会 skip（走首开 spawn，安全）——此前提来自代码路径，未在真机计时复现；
+③ 「Paseo refresh 走同一 provider 连接」沿用既有池设计与既有用例，未重新抓帧确认，若 refresh
+实际换连接则同连接 adoption 的覆盖面更小，冷启动问题不受影响。

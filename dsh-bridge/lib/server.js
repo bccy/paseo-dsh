@@ -905,6 +905,61 @@ export class PaseoHarnessServer {
   }
 
   /**
+   * Whether this DSH build names subagent children (0.2.2-rc.2+).
+   *
+   * Duck-typed on the composed `subagents` service, never on a version string:
+   * `namesOf`/`rootOf` arrived together with the naming model (`dsh-subagent`'s
+   * `names.d.ts`), while `listChildren`/`listDescendants` are older than names.
+   * A profile that composes no subagent service answers false, and the plugin
+   * then opens a label-only child exactly the way it did before names existed.
+   *
+   * The reply rides the `initialize` result's `serverInfo`, which the plugin
+   * already reads: the plugin owns the single `session.opened` Paseo accepts, so
+   * it is the layer that has to know whether waiting for a catalog name can
+   * ever pay off.
+   */
+  namesChildren() {
+    const subagents = this.ctx.get('subagents');
+    return typeof subagents?.namesOf === 'function' || typeof subagents?.rootOf === 'function';
+  }
+
+  /**
+   * Take one optional identity field (`name` / `path`) off a durable subagent fact.
+   *
+   * DSH 0.2.2-rc.2+ gives a child a `name` (unique among its siblings) and, in
+   * the recursive listing, a root-relative slash `path` built from every level's
+   * name. Both are absent on DSH ≤ 0.2.2-rc.1 and on historical catalog rows, and
+   * the plugin then simply shows no description.
+   *
+   * A present-but-invalid value is **ignored, never coerced**: `String(…)` would
+   * turn a malformed upstream field into a plausible-looking user-facing
+   * identity, which is exactly the silent degradation this repository keeps
+   * paying for. One stderr line per child and field (not per catalog read, since
+   * `subagents()` re-reads the same rows on every open) keeps it noticeable
+   * without flooding the log. The child still opens on its label, so a bad
+   * identity field never costs the conversation its row.
+   *
+   * @param childId - the child's native session id, so the line names the row.
+   * @param child - the bridge's child record.
+   * @param field - `name` or `path`; the record key to fill.
+   * @param value - the durable value, absent when the row does not carry it.
+   */
+  adoptIdentity(childId, child, field, value) {
+    if (value === undefined) return;
+    if (typeof value === 'string' && value !== '') {
+      if (child[field] === undefined) child[field] = value;
+      return;
+    }
+    const warned = child.identityWarnings ?? (child.identityWarnings = new Set());
+    if (warned.has(field)) return;
+    warned.add(field);
+    process.stderr.write(
+      `[bridge] ignoring a non-string ${field} for subagent ${childId} `
+        + `(parent ${child.parentId}): ${JSON.stringify(value)}\n`,
+    );
+  }
+
+  /**
    * Fallback registration from the parent-owned `subagent/catalog` fact, which
    * also carries the child's creation label and lifecycle mode. Opens the child
    * immediately when its own session was never observed directly.
@@ -923,6 +978,9 @@ export class PaseoHarnessServer {
     }
     if (child.label === undefined && data.label !== undefined) child.label = String(data.label);
     if (child.mode === undefined && data.mode !== undefined) child.mode = data.mode;
+    // Catalog v3 (`SUBAGENT_CATALOG_VERSION = 3`, DSH 0.2.2-rc.2+) names every
+    // child it records; v0–v2 and historical rows carry none.
+    this.adoptIdentity(childId, child, 'name', data.name);
     if (!child.opened) this.openChild(childId, child);
   }
 
@@ -955,12 +1013,22 @@ export class PaseoHarnessServer {
    * @param parentId - durable direct parent session id.
    * @param label - creation label from the catalog, when it carries one.
    * @param mode - lifecycle mode (`continuable` / `one-shot`), when present.
+   * @param name - the child's own name (`SubagentDescendantListEntry.name`,
+   *   DSH 0.2.2-rc.2+), when the listing carries it.
+   * @param path - root-relative slash path (`SubagentDescendantListEntry.path`),
+   *   absent whenever an ancestor below the root is unnamed.
    */
-  registerCatalogChild(childId, parentId, label, mode) {
+  registerCatalogChild(childId, parentId, label, mode, name, path) {
     const existing = this.children.get(childId);
     if (existing !== undefined) {
+      // "This record came from the durable listing" is sticky: a child first seen
+      // live and then listed still carries a listing-derived label/name, and a
+      // later live descriptor must not erase the mark.
+      existing.listed = true;
       if (existing.label === undefined && label !== undefined) existing.label = String(label);
       if (existing.mode === undefined && mode !== undefined) existing.mode = mode;
+      this.adoptIdentity(childId, existing, 'name', name);
+      this.adoptIdentity(childId, existing, 'path', path);
       if (!existing.opened && existing.label !== undefined && existing.buffered.length > 0) {
         this.openChild(childId, existing);
       }
@@ -969,14 +1037,21 @@ export class PaseoHarnessServer {
     // A nested child may be listed before its own parent's entry exists; fall back
     // to the parent's pinned directory the same way the catalog fallback does.
     const parent = this.children.get(parentId);
-    this.children.set(childId, {
+    const child = {
       parentId,
       opened: false,
       buffered: [],
+      // Registered from DSH's durable listing, not from a live event: see
+      // `openChild` for why the plugin is told (a historical row has no catalog
+      // event left to wait for).
+      listed: true,
       cwd: parent?.cwd ?? this.sessionDirectoryFor(parentId),
       ...(label === undefined ? {} : { label: String(label) }),
       ...(mode === undefined ? {} : { mode }),
-    });
+    };
+    this.adoptIdentity(childId, child, 'name', name);
+    this.adoptIdentity(childId, child, 'path', path);
+    this.children.set(childId, child);
   }
 
   /** Hold one child frame until the child is opened, bounded so output is never lost. */
@@ -1003,6 +1078,17 @@ export class PaseoHarnessServer {
       parentSessionId: child.parentId,
       ...(child.mode === undefined ? {} : { mode: child.mode }),
       ...(child.label === undefined ? {} : { label: child.label }),
+      // The child's identity, when DSH named it (0.2.2-rc.2+). Optional keys: an
+      // older build and a historical row simply do not carry them, and Paseo's
+      // child row falls back to the label title it has today. `path` can still be
+      // filled in later by a durable listing (`registerCatalogChild`), but a child
+      // is announced exactly once — that late `path` does not re-announce it.
+      ...(typeof child.name === 'string' && child.name !== '' ? { name: child.name } : {}),
+      ...(typeof child.path === 'string' && child.path !== '' ? { path: child.path } : {}),
+      // The durable listing already carried everything DSH knows about this child,
+      // and a historical row will never emit another live catalog fact: the plugin
+      // must not hold such a notice waiting for a name that is not coming.
+      ...(child.listed === true ? { listed: true } : {}),
       ...(child.cwd === undefined ? {} : { cwd: child.cwd }),
     });
     const buffered = child.buffered;
@@ -1537,7 +1623,13 @@ export class PaseoHarnessServer {
       this.#trimSessionRouteTables(sessionId);
     }
     return {
-      serverInfo: { name: 'deepseek-harness-paseo-bridge', version: '0.1.0' },
+      serverInfo: {
+        name: 'deepseek-harness-paseo-bridge',
+        version: '0.1.0',
+        // Optional capability: absent (or false) on a build whose `subagents`
+        // service predates names, where the plugin must not wait for one.
+        subagentNames: this.namesChildren(),
+      },
       route: { provider, model, reasoningEffort: reasoningEffort ?? null },
     };
   }
@@ -2520,7 +2612,7 @@ export class PaseoHarnessServer {
       for (const row of children) {
         const childId = String(row.id);
         if (underArchivedSession(headers, archived, childId)) continue;
-        this.registerCatalogChild(childId, String(row.parentId), row.label, row.mode);
+        this.registerCatalogChild(childId, String(row.parentId), row.label, row.mode, row.name, row.path);
       }
       return {
         available: true,
@@ -2530,6 +2622,22 @@ export class PaseoHarnessServer {
             parentSessionId: String(row.parentId),
             ...(row.mode === undefined ? {} : { mode: row.mode }),
             ...(row.label === undefined ? {} : { label: row.label }),
+            // DSH 0.2.2-rc.2+ (`dsh-subagent`'s `SubagentDescendantListEntry`):
+            // `name` is the child's name, unique among its siblings, recorded by
+            // the creator's v3 `subagent/catalog` event. The plugin derives the
+            // newer generation's team roster from it, exactly as DSH's own
+            // subagent catalog panel does (`entry.name ?? entry.id`). Absent on
+            // historical entries and on DSH builds that predate it — the plugin
+            // then falls back to the session id, never to `label` (a free-text
+            // creation label is a description, not an identity).
+            ...(typeof row.name === 'string' && row.name !== '' ? { name: row.name } : {}),
+            // DSH 0.2.2-rc.2+ (`SubagentDescendantListEntry.path`): slash-separated
+            // names from the requested root, and **absent** as soon as this child or
+            // an ancestor below the root has no name. Never rebuilt from `label`:
+            // the path is the model-addressable identity, the label a description.
+            // A non-string value is ignored here and reported once per child by
+            // `registerCatalogChild` → `adoptIdentity`.
+            ...(typeof row.path === 'string' && row.path !== '' ? { path: row.path } : {}),
             ...(underArchivedSession(headers, archived, String(row.id)) ? { archived: true } : {}),
           })),
         diagnostics: rows
@@ -3364,9 +3472,10 @@ export class PaseoHarnessServer {
    * right after it. Only the children this rewind withdrew are joined (including
    * the ones whose interrupt was refused): a child anchored before the target
    * keeps running by design, and if it is waiting for the file gate this rewind
-   * holds, joining it would deadlock until the three-second cap
-   * (`waitForChildren` is based on `whenIdle`). Its writes are anchored before
-   * the target, so they are not part of this restore and must not delay it.
+   * holds, joining it would deadlock until the three-second cap (the
+   * `waitForTreeWork`/`waitForChildren` fallback is based on `whenIdle`). Its
+   * writes are anchored before the target, so they are not part of this restore
+   * and must not delay it.
    *
    * A signalled id that is not live has nothing left to observe: `interrupt`
    * already accepted it as a no-op. The three-second cap bounds the rewind's
@@ -3391,8 +3500,27 @@ export class PaseoHarnessServer {
         }
         if (waits.length === 0) return;
       } else {
-        if (subagents === undefined || typeof subagents.waitForChildren !== 'function') return;
-        waits = [subagents.waitForChildren(agent)];
+        // Two generations of the waiting method, both accepted:
+        // - `dsh-subagent` ≤ 0.2.2-rc.1: `waitForChildren(parent)` — waits for
+        //   the delegated parent's direct children.
+        // - `dsh-subagent` 0.2.2-rc.2+ (`lib/types/index.d.ts`):
+        //   `waitForTreeWork(root)` — waits for the subtree rooted at `root`.
+        // A build with neither is a contract break, not "nothing to wait for":
+        // returning here silently would turn the rewind's settle step into a
+        // no-op that no log line explains (the silent degradation FIELD-NOTES
+        // exists for). The log names the build's missing method.
+        const wait = typeof subagents?.waitForTreeWork === 'function'
+          ? subagents.waitForTreeWork
+          : subagents?.waitForChildren;
+        if (subagents === undefined || typeof wait !== 'function') {
+          process.stderr.write(
+            '[bridge] settleDelegatedWork: subagents has neither waitForTreeWork (DSH 0.2.2-rc.2+) '
+            + 'nor waitForChildren (DSH <= 0.2.2-rc.1); delegated work withdrawn by the rewind '
+            + 'was not joined\n',
+          );
+          return;
+        }
+        waits = [wait.call(subagents, agent)];
       }
       await withTimeout(
         Promise.all(waits),
@@ -5224,19 +5352,26 @@ export class PaseoHarnessServer {
     let agentPreset;
     // `beginOwner` belongs at the END of setup, and setup is the right hook:
     // DSH awaits it while this process already holds the session's write lease
-    // and BEFORE the agent/session are published
-    // (`dsh-agent-loop/lib/index.js` `setupAndPublish` — `setup?.(...)` then
-    // `prepared.publish(...)`), so no capture can have run for this session yet
-    // and no other process can be allocating for its journal. That is exactly the
-    // guarantee `FileSnapshots.beginOwner` needs to re-read the durable high
-    // water, so no extra factory contract is required.
+    // and BEFORE the agent is published (`dsh-agent-loop/lib/index.js`
+    // `setupAndPublish` — `setup?.(...)` then the enter/announce/publish path),
+    // so no capture can have run for this session yet and no other process can be
+    // allocating for its journal. That is exactly the guarantee
+    // `FileSnapshots.beginOwner` needs to re-read the durable high water, so no
+    // extra factory contract is required.
+    //
+    // The *session* is another matter: 0.2.1 entered and announced it inside
+    // `publish()`, after setup, while 0.2.2 moved `sessions.enter/announce` ahead
+    // of `setup?.(...)`. So on 0.2.2 the session is already in the store while
+    // setup runs; captures still first run at `agent/created`, after setup on both
+    // lines, so the capture window is closed either way. Keep the call here rather
+    // than keying on the session table.
     //
     // `AgentSetupCommit.commit()` would also work, but it is a narrower internal
     // contract and its position relative to publication is not the same across
     // DSH versions: on 0.2.1-rc.5 it runs immediately before publication
     // (`setupAndPublish`), while 0.2.2-alpha moved the call after the announce
-    // path. Setup itself is awaited before publication in both, so this is the
-    // placement that stays true on either line.
+    // path. Setup itself is awaited before the agent is published on both lines,
+    // so this is the placement that stays true on either.
     let setup = async (agentCtx, agent) => {
       installSelection(agentCtx, agent);
       await mountMcp(agentCtx);

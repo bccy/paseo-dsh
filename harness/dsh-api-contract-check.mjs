@@ -27,7 +27,11 @@
  *      time still declare the operations it calls (`EXPECTED_SERVICE_SURFACE`).
  *      An import check cannot see these: a service is reached through
  *      `ctx.get('jobs')` and duck-typed, so a renamed operation would be a
- *      `TypeError` in the middle of a user action, not an import failure.
+ *      `TypeError` in the middle of a user action, not an import failure. The
+ *      check also pins the two surfaces the DSH 0.2.2-rc.2 rename broke in a way
+ *      nothing else could see: the `subagents` delegated-work join
+ *      (`waitForChildren` → `waitForTreeWork`, either accepted) and the
+ *      `agentTeam` projection view (one of the two known generations).
  *
  * It deliberately does NOT assert behaviour. Signature changes that keep the symbol
  * name are invisible here; `harness/plugin-check.cjs` covers those by driving a
@@ -118,6 +122,23 @@ const EXPECTED_SERVICE_SURFACE = {
     // must still carry the operations, or `ctx.jobs.kill` is not a function.
     implementationClass: 'LocalJobRegistry',
     prototypeOps: ['list', 'get', 'kill'],
+  },
+  // The rewind gives withdrawn delegated work a bounded moment to observe the
+  // cancel (`settleDelegatedWork`), joining through this service when the
+  // profile composes no live `agents` registry. DSH 0.2.2-rc.2 renamed that
+  // join: `waitForChildren(parent)` (`dsh-subagent` ≤ 0.2.2-rc.1) became
+  // `waitForTreeWork(root)` (`dsh-subagent` 0.2.2-rc.2+). The bridge accepts
+  // either, so the contract is "at least one is still declared" — both missing
+  // makes the settle step a logged no-op on every rewind.
+  'dsh-subagent': {
+    oneOfAbstractOps: ['waitForTreeWork', 'waitForChildren'],
+    // 0.2.2-rc.2+ also names children: `namesOf`/`rootOf` are what the bridge
+    // duck-types to tell the plugin whether a held child notice may wait for a
+    // catalog name. The rc.1 generation has neither and is expected to miss them;
+    // but a build that declares the newer tree wait while declaring no naming
+    // method would silently turn that report off (the plugin then keeps opening
+    // label-only children), so the two are asserted together.
+    namesGate: { whenDeclared: 'waitForTreeWork', ops: ['namesOf', 'rootOf'] },
   },
 };
 
@@ -351,6 +372,45 @@ for (const [pkg, spec] of Object.entries(EXPECTED_SERVICE_SURFACE)) {
     );
   }
 
+  if (spec.oneOfAbstractOps !== undefined) {
+    const typesFile = join(pkgDir, manifest.types ?? manifest.main?.replace(/\.js$/, '.d.ts') ?? 'lib/index.d.ts');
+    let text;
+    try {
+      text = readFileSync(typesFile, 'utf8');
+    } catch (error) {
+      check(`${pkg} type surface is readable`, false, `${typesFile} (${error.code ?? error.message})`);
+      continue;
+    }
+    // `abstract waitForTreeWork(...)` in the abstract service class. Either name
+    // satisfies the bridge's two-generation fallback; neither is a break.
+    const declared = spec.oneOfAbstractOps.filter((op) => new RegExp(`\\b${op}\\s*\\(`).test(text));
+    check(
+      `${pkg}@${manifest.version ?? '?'} still declares one of ${spec.oneOfAbstractOps.join(', ')}`,
+      declared.length > 0,
+      declared.length > 0 ? `declared: ${declared.join(', ')}` : `none of them are declared`,
+    );
+  }
+
+  if (spec.namesGate !== undefined) {
+    const typesFile = join(pkgDir, manifest.types ?? manifest.main?.replace(/\.js$/, '.d.ts') ?? 'lib/index.d.ts');
+    let text;
+    try {
+      text = readFileSync(typesFile, 'utf8');
+    } catch (error) {
+      check(`${pkg} type surface is readable for naming`, false, `${typesFile} (${error.code ?? error.message})`);
+      continue;
+    }
+    const newerGeneration = new RegExp(`\\b${spec.namesGate.whenDeclared}\\s*\\(`).test(text);
+    const naming = spec.namesGate.ops.filter((op) => new RegExp(`\\b${op}\\s*\\(`).test(text));
+    check(
+      `${pkg}@${manifest.version ?? '?'} declares ${spec.namesGate.ops.join(' or ')} when it declares ${spec.namesGate.whenDeclared}`,
+      !newerGeneration || naming.length > 0,
+      newerGeneration
+        ? (naming.length > 0 ? `declared: ${naming.join(', ')}` : 'the newer tree wait is declared but no naming method is')
+        : 'rc.1 generation: no naming is expected, and the bridge reports none',
+    );
+  }
+
   if (spec.implementationClass !== undefined) {
     const entry = join(pkgDir, manifest.main ?? 'lib/index.js');
     let module;
@@ -372,6 +432,91 @@ for (const [pkg, spec] of Object.entries(EXPECTED_SERVICE_SURFACE)) {
         : missing.length === 0
           ? 'all implemented'
           : `missing on the prototype: ${missing.join(', ')}`,
+    );
+  }
+}
+
+// ---- 3c. the `agentTeam` projection is one of the two known generations ----
+//
+// The plugin reads this projection through `paseo/projections` and parses it with
+// `paseo-plugin/shared/team.ts`'s union. The package that owns it was replaced
+// wholesale (`dsh-experimental-agent-team` → `dsh-agent-team` in DSH
+// 0.2.2-rc.2), and it is reached by projection **key**, never by import — so
+// neither the import coverage nor the service-surface sections can see it.
+// Whichever package the install ships, its `TeamProjection` must be one of the
+// two generations the plugin knows. A third shape would be an accepted
+// `rpc_failed` at runtime; here it fails by name, before a user opens the pill.
+const TEAM_PROJECTION_PACKAGES = [
+  {
+    pkg: 'dsh-agent-team',
+    generation: '0.2.2-rc.2+ {enabled, tasks, failure?}',
+    required: ['enabled', 'tasks'],
+    forbidden: ['members'],
+  },
+  {
+    pkg: 'dsh-experimental-agent-team',
+    generation: '<= 0.2.2-rc.1 {members, tasks, failure?}',
+    required: ['members', 'tasks'],
+    forbidden: ['enabled'],
+  },
+];
+
+/** Read the `TeamProjection` interface body from one package's `.d.ts` tree. */
+function teamProjectionBody(pkgDir) {
+  const root = join(pkgDir, 'lib', 'types');
+  const pending = [root];
+  while (pending.length > 0) {
+    const dir = pending.pop();
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        pending.push(path);
+        continue;
+      }
+      if (!entry.name.endsWith('.d.ts')) continue;
+      const match = /interface\s+TeamProjection\s*\{([\s\S]*?)\n\}/u.exec(readFileSync(path, 'utf8'));
+      if (match !== null) return match[1];
+    }
+  }
+  return undefined;
+}
+
+{
+  const shipped = TEAM_PROJECTION_PACKAGES.filter((candidate) => {
+    try {
+      readFileSync(join(dshPackages, candidate.pkg, 'package.json'), 'utf8');
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  check(
+    'exactly one agentTeam projection package is installed',
+    shipped.length === 1,
+    shipped.map((candidate) => candidate.pkg).join(', ') || 'none',
+  );
+  for (const candidate of shipped) {
+    const body = teamProjectionBody(join(dshPackages, candidate.pkg));
+    if (body === undefined) {
+      check(`${candidate.pkg} type surface declares TeamProjection`, false, 'interface TeamProjection not found');
+      continue;
+    }
+    const missing = candidate.required.filter((field) => !new RegExp(`\\b${field}\\s*:`, 'u').test(body));
+    const extra = candidate.forbidden.filter((field) => new RegExp(`\\b${field}\\s*:`, 'u').test(body));
+    check(
+      `${candidate.pkg} TeamProjection is the ${candidate.generation} generation`,
+      missing.length === 0 && extra.length === 0,
+      missing.length > 0
+        ? `missing: ${missing.join(', ')}`
+        : extra.length > 0
+          ? `unexpected: ${extra.join(', ')}`
+          : undefined,
     );
   }
 }

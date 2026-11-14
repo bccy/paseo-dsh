@@ -348,7 +348,19 @@ this.ctx.get('permissionPresets').set(session, name);
   它仍会发 canary（对话被刷新了，需要自证），`both` 与 `files` 才做文件恢复，其中只有 `both`
   同时改对话。
 - 时间线折叠后仍会保留压缩前的完整对话（撤回只影响它自己那段）。
-- 记忆插件可能仍召回被撤内容（模型"记得"）——已知缺口，不在本次范围。
+- **记忆类插件可能仍召回被撤内容（模型"记得"）——已知缺口，不在本实现范围。**
+  撤回覆盖的是 DSH 的对话 surface 与工作区文件，**不触碰任何插件自己的存储**；记忆类插件
+  （profile 里如 `dsh-memory`）另有一个库。触发条件是**被撤内容已经落进那个库**：
+  模型在被撤回合里自己调了 `memory_add`/`memory_update`（立即副作用），或后台蒸馏泵已经把
+  该切片落袋（渐进 `extract.minMessages` 门槛 + `extract.idleSeconds`，单回合未必落袋）。
+  证据形状：后续回合起手前多出一条 `user/message`，`source.kind = "plugin:memory"`，正文里就是
+  被撤文本；它的 seq **在撤回标记之后**（标记是 `source.kind = "paseo-rewind"` + `surfaceOp.replace`），
+  不在被撤区间内，所以重放折叠删不掉它，`paseo/history` 里照样出现——Paseo 时间线上表现为
+  「上下文注入 · memory」行，是**用户可见的注入行**，不是模型幻觉。
+  `harness/rewind-e2e.mjs` 因此在克隆 profile 里**按行 id 禁用记忆插件**再测撤回
+  （`REWIND_E2E_DISABLE_ROWS`，默认 `dsh-memory`；只改克隆，`--allow-real-profile` 下不生效）；
+  `--with-memory` 可保留插件、把这条缺口当可观察行为打印出来（不判红）。真要"撤回也遗忘"，
+  需要记忆插件提供**按会话/按 seq 遗忘**的公开接口，属上游能力。
 - 由于首条被拒绝，本实现不会再产生"空对话"；历史上已被旧版本撤空的会话，重开时就是一个
   没有消息的空对话（不再额外插入提示行）。
 - **子代理编辑已归并到根会话（2026-10-19 起）**：父会话 `both` 撤回会回退子代理在目标消息
@@ -396,7 +408,10 @@ node harness/replay-fidelity-probe.mjs <session.v4.jsonl.zstd>  # 真实日志�
 # 端到端（真 dsh --profile paseo，3 个真实模型回合；会消耗少量 token）
 node harness/rewind-e2e.mjs
 # 断言：成功回执、文件删除、history 折叠成 1 条用户消息、无 command/run、
-#       模型仍知道 ALPHA、不再知道 BETA
+#       第三回合（只取最后一次 turn/start 之后的 assistant 文本，且答案必须非空）
+#       仍知道 ALPHA、不再知道 BETA、没有任何 plugin:* 注入行携带被撤文本。
+# 克隆里按行 id 禁用记忆类插件（默认 dsh-memory），首部打印实际禁用了哪些行；
+# node harness/rewind-e2e.mjs --with-memory   # 保留记忆插件，缺口只作为观察打印，不判红
 node harness/rewind-merge-e2e.mjs    # 父写 + 子代理写 → both 撤回 → 两个文件都删除、子会话无 journal
 
 # 插件层（先按 plugin-check.cjs 头部步骤编译到 .dbg）

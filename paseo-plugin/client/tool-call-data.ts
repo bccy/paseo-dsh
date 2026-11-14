@@ -236,8 +236,16 @@ export interface ToolCallData {
    */
   errorCode: string;
   /**
-   * The head's red half for a code `./locale` knows (`goalCard.refusals`), or "".
-   * Empty means the head keeps DSH's verbatim first line, as before.
+   * DSH's error class for a failed row (`HarnessError.name`, e.g.
+   * `ApprovalError`, relayed on `metadata.errorName`), or undefined. It is
+   * shown only in the expanded block: the head already says what happened, and
+   * the class is a fact about the wire, not a sentence for the reader.
+   */
+  errorName?: string;
+  /**
+   * The head's red half for a code `./locale` knows (`goalCard.refusals`, then
+   * the team table, then `toolFailures`), or "". Empty means the head keeps
+   * DSH's verbatim first line, as before.
    */
   errorShort: string;
   /** One plain-language sentence that opens the expanded block, or "". */
@@ -1492,6 +1500,26 @@ function sendMessageCard(
       copyText: typeof output === "string" ? output : "",
     };
   }
+  // DSH 0.2.2-rc.2+ (`dsh-tool-subagent-control`): the recipient parameter is
+  // `agent` (a path from the root, as `list_agents` names it) and the output is
+  // `{messageId}` rendered as `message delivered to agent <name>`. Both the
+  // structured value and the rendered sentence are accepted; an answer that is
+  // neither keeps L1's JSON.
+  if (typeof input.agent === "string" && input.agent !== "") {
+    const value = structuredResult(output);
+    const delivered = typeof output === "string" && /^message delivered to agent\b/u.test(output);
+    if (delivered || (isRecord(value) && typeof value.messageId === "string")) {
+      return {
+        summary: labelFor(roster, input.agent),
+        args,
+        result: [],
+        receipt: cards.delivered,
+        body: "",
+        copyText: delivered && typeof output === "string" ? output : "",
+      };
+    }
+    return null;
+  }
   return null;
 }
 
@@ -1522,6 +1550,24 @@ function interruptAgentCard(
       body: "",
       copyText: typeof output === "string" ? output : "",
     };
+  }
+  // DSH 0.2.2-rc.2+'s `interrupt_agent` (base disables it by default,
+  // `tool-subagent-control.interrupt=false`): `{agent}` in, `{accepted}` out,
+  // rendered as `interrupt requested for agent <name>`.
+  if (typeof input.agent === "string" && input.agent !== "") {
+    const value = structuredResult(output);
+    const requested = typeof output === "string" && /^interrupt requested for agent\b/u.test(output);
+    if (requested || (isRecord(value) && typeof value.accepted === "boolean")) {
+      return {
+        summary: labelFor(roster, input.agent),
+        args: [],
+        result: [],
+        receipt: cards.interruptRequested,
+        body: "",
+        copyText: requested && typeof output === "string" ? output : "",
+      };
+    }
+    return null;
   }
   return null;
 }
@@ -1618,26 +1664,40 @@ function listAgentsCard(output: unknown, failed: boolean): ToolMapping | null {
   const members: Record<string, unknown>[] = [];
   for (const item of value) {
     if (!isRecord(item)) return null;
-    if (typeof item.target !== "string" || typeof item.role !== "string" || typeof item.status !== "string") {
-      return null;
-    }
     members.push(item);
   }
+  // Two generations of the row shape. The older tool
+  // (`dsh-experimental-tool-agent-team`) publishes `{target, role, status,
+  // description?}`; the newer one (`dsh-tool-subagent-control`'s
+  // `list-agents.ts`) publishes `{name, status, description?}` with no role,
+  // and names a descendant by its path from the root (`lead` for the root).
+  // A mixed array is neither shape; the row keeps its JSON.
+  const rosterShaped = members.every((item) => typeof item.target === "string" && typeof item.role === "string" && typeof item.status === "string");
+  const treeShaped = members.every((item) => item.target === undefined && item.role === undefined
+    && typeof item.name === "string" && item.name !== "" && typeof item.status === "string");
+  if (!rosterShaped && !treeShaped) return null;
   if (members.length === 0) return { summary: cards.noMembers, args: [], result: [], receipt: "" };
   const lines = members.map((member) => {
-    const target = String(member.target);
-    const role = String(member.role);
-    // The Lead's own row carries `target: "lead"` and `role: "lead"`; writing it
-    // twice reads `lead · lead · running`, so the role is dropped when it is the
-    // target's own name.
-    const parts = target === role ? [target, String(member.status)] : [target, role, String(member.status)];
+    const parts = treeShaped
+      ? [String(member.name), String(member.status)]
+      : (() => {
+        const target = String(member.target);
+        const role = String(member.role);
+        // The Lead's own row carries `target: "lead"` and `role: "lead"`;
+        // writing it twice reads `lead · lead · running`, so the role is
+        // dropped when it is the target's own name.
+        return target === role ? [target, String(member.status)] : [target, role, String(member.status)];
+      })();
     if (typeof member.description === "string" && member.description !== "") parts.push(member.description);
     return parts.join(" · ");
   });
-  // Counted on `role === "teammate"`, the same rule as the team pill
-  // (`./team-polling`'s `teamMateCount`): the Lead is not a teammate, and a role
-  // DSH adds later must not be counted as one by accident.
-  const teammates = members.filter((member) => member.role === "teammate").length;
+  // Counted the same way as the team pill (`./team-polling`'s `teamMateCount`):
+  // the Lead is not a teammate. The older shape marks it with `role`; the newer
+  // one with the fixed root name `lead` (`dsh-subagent/src/names.ts`), which no
+  // child may take.
+  const teammates = treeShaped
+    ? members.filter((member) => member.name !== "lead").length
+    : members.filter((member) => member.role === "teammate").length;
   return {
     summary: teammates === 0 ? cards.leadOnly : localeText().team.memberCount(teammates),
     args: [],
@@ -2879,10 +2939,20 @@ export function parseGoalResult(text: string): GoalBlockData | null {
 const TEAM_TASK_TOOLS: ReadonlySet<string> = new Set(["team_task_create", "team_task_get", "team_task_update", "team_task_list"]);
 const TEAM_TOOLS: ReadonlySet<string> = new Set([...TEAM_TASK_TOOLS, "spawn_teammate", "list_agents", "wait_agent", "send_message", "interrupt_agent"]);
 
+/**
+ * One team task tool result. DSH's `team_task_*` output keeps the projection's
+ * `ownerName` on `dsh-experimental-tool-agent-team` but the newer
+ * `dsh-tool-agent-team` projects it as `owner` (`NamedTaskView`: `omit(ownerId,
+ * ownerName)` + `owner: ownerName ?? ownerId`), so both keys are accepted and
+ * `owner` is mapped onto the field the shared card reads.
+ */
+const teamToolTaskSchema = teamTaskSchema.extend({ owner: teamTaskSchema.shape.ownerName }).strict();
+
 function teamCard(view: unknown): TeamTaskCard | null {
-  const parsed = teamTaskSchema.strict().safeParse(view);
+  const parsed = teamToolTaskSchema.safeParse(view);
   if (!parsed.success) return null;
-  const task = parsed.data;
+  const { owner, ...rest } = parsed.data;
+  const task = taskOwnerName(rest, owner);
   const text = localeText().team;
   // The card's own revision field is in the list too: it is what the model's
   // next compare-and-set will name.
@@ -2931,6 +3001,16 @@ export function parseTeamResult(name: string, input: unknown, output: string): T
   const action = name === "team_task_update" && isRecord(input) && typeof input.action === "string" ? input.action : "";
   const caption = action === "" ? "" : `${text.card.action} ${text.card.actions[action] ?? action} · ${card.id}`;
   return { kind: "task", tasks: [card], caption, more: false };
+}
+
+/**
+ * Merge the newer generation's tool-only `owner` key into the projection field
+ * the shared task card draws. A result that carries both is the newer shape's
+ * `owner` plus a stray `ownerName`; the tool's own key wins there because it is
+ * what `NamedTaskView` promises the model saw.
+ */
+function taskOwnerName<T extends { ownerName?: string }>(task: T, owner: string | undefined): T {
+  return owner === undefined ? task : { ...task, ownerName: owner };
 }
 
 /** Normalize one Paseo tool-call item into JSON-safe render data. */
@@ -3225,6 +3305,21 @@ export function toolCallData(
   const errorCode = failed ? str(metadata, "errorCode") : "";
   const refusals = copy.goalCard.refusals;
   const refusal = errorCode !== "" && Object.hasOwn(refusals, errorCode) ? refusals[errorCode] : undefined;
+  // The other half of DSH's failure identity: the error class. No words are
+  // derived from it, and the renderer keeps it to the expanded block.
+  const errorName = failed ? str(metadata, "errorName") : "";
+  // DSH's raw user-facing detail (`HarnessError.reason`) stands in only when the
+  // result text itself is missing; printing both would show the same sentence
+  // twice. DSH already keeps it out of `message.content` for the model.
+  const failureDetail = failed && error === "" ? str(metadata, "errorReason") : "";
+  // The common tool failures (`dsh-tools`' error-codes): goal refusals and the
+  // team sentences above win, and an unknown code keeps the verbatim text — this
+  // table only ever adds words for a code DSH names.
+  const toolFailure =
+    errorCode !== "" && Object.hasOwn(copy.toolFailures, errorCode) ? copy.toolFailures[errorCode] : undefined;
+  // What the block prints as the failure: DSH's own text, or the reason it kept
+  // out of that text.
+  const failureText = error !== "" ? error : failureDetail;
   // A row with the generic card has no separate block lead: the card already
   // shows the arguments, and a compact copy of its first fact above the card
   // would be the same line twice.
@@ -3306,14 +3401,14 @@ export function toolCallData(
     diff,
     code,
     failed,
-    error,
+    error: failureText,
     // Whether the expanded block has anything to show. A row whose only content
     // is its title still expands — the title wraps to its full width — but must
     // not draw an empty code surface. A structured card counts even when the
     // plain text is empty: the card is the content. A failure reason counts
     // too: that is the only content a failed tool with an empty output has.
     titled: agentMessage !== undefined || description !== "",
-    hasDetail: headline !== "" || body !== "" || structured || error !== "",
+    hasDetail: headline !== "" || body !== "" || structured || failureText !== "",
     kind,
     search,
     read,
@@ -3323,7 +3418,12 @@ export function toolCallData(
     team,
     fields,
     errorCode,
-    errorShort: refusal?.short ?? (teamError?.original === undefined ? "" : teamError.message),
-    errorHint: refusal?.hint ?? (teamError?.original === undefined ? "" : teamError.message),
+    ...(errorName === "" ? {} : { errorName }),
+    errorShort:
+      refusal?.short ??
+      (teamError?.original === undefined ? (toolFailure?.short ?? "") : teamError.message),
+    errorHint:
+      refusal?.hint ??
+      (teamError?.original === undefined ? (toolFailure?.hint ?? "") : teamError.message),
   };
 }

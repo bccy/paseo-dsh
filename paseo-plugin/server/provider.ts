@@ -68,7 +68,7 @@ import { effortLabel, LOCALE, UI } from "./locale";
 import { rewindSuccessText, type RewindTone } from "../shared/rewind-notice";
 import type { GoalAction, GoalErrorCode, GoalState } from "../shared/goal";
 import type { JobErrorCode, JobStopResult } from "../shared/jobs";
-import { teamViewSchema, type TeamErrorCode, type TeamView } from "../shared/team";
+import { teamMemberSchema, teamProjectionSchema, type TeamErrorCode, type TeamView } from "../shared/team";
 import { PROVIDER_ID } from "../shared/provider";
 
 /**
@@ -669,6 +669,18 @@ class DshConnection implements ProviderConnection {
    */
   #poolPrewarmed = false;
   /**
+   * True while {@link prewarmSharedDsh}'s own spawn is in flight.
+   *
+   * `#poolPrewarmed` can only be set once that spawn resolves, but a session that
+   * opens while the child is still booting joins it through `#ensurePoolProcess`'s
+   * in-flight branch — the common case, since a real cold boot takes seconds.
+   * Without this flag that joining session would be reported as having joined a
+   * child that was already serving conversations, which is the claim
+   * `DshSession#joinedLiveProcess` then trusts when it replays a native child's
+   * open turn: a killed child's last turn would be kept "running" forever.
+   */
+  #prewarmSpawn = false;
+  /**
    * This connection's rewind counter, used to keep canary notices distinct.
    *
    * Two rewinds in one session each leave a notice behind on a host that cannot
@@ -809,7 +821,12 @@ class DshConnection implements ProviderConnection {
         );
         return;
       }
-      const { process: child, reused } = await this.#ensurePoolProcess({ route, env: {} });
+      this.#prewarmSpawn = true;
+      const prewarm = await this.#ensurePoolProcess({ route, env: {} })
+        .finally(() => {
+          this.#prewarmSpawn = false;
+        });
+      const { process: child, reused } = prewarm;
       if (!reused && this.#claimsOf(child) === 0) {
         // Marked only once published and still unclaimed: a session that opened
         // while this spawn was in flight has already claimed it through
@@ -908,6 +925,14 @@ class DshConnection implements ProviderConnection {
    * lets the session tell "still live" apart from "killed", instead of either
    * resurrecting a dead child or cancelling a live one.
    *
+   * The prewarm is the one child that is published yet has served **nothing**
+   * (`{@link #poolPrewarmed}`, and the in-flight window before that is published
+   * is `{@link #prewarmSpawn}`). Joining it is a cold start: its process was born
+   * after whatever killed the previous one, so nothing it holds can be a live
+   * carry-over. Reporting it as reused made every restart (with a warm catalog
+   * cache) look like an adoption and kept killed subagents "running" forever
+   * (`FIELD-NOTES` 106).
+   *
    * The spawn uses the **caller's** route/env as the process defaults. That is
    * deliberate and mostly harmless: every session sends its own cwd and route in
    * `initialize` (`attachSession`), so those defaults only cover a request that
@@ -941,7 +966,14 @@ class DshConnection implements ProviderConnection {
     await this.#awaitPoolShutdown();
     if (this.#closed) throw new Error("the provider connection is closed");
     const existing = this.#livePoolProcess();
-    if (existing !== undefined) return { process: existing, reused: true };
+    if (existing !== undefined) {
+      // A prewarmed child that no session has claimed yet has served no
+      // conversation, so joining it is a **cold start**, not an adoption.
+      // `#addPoolClaim` clears the marker, so every later join on this connection
+      // reports the child as serving — which is what a replay may trust when it
+      // treats a native child's open turn as still live (`FIELD-NOTES` 106).
+      return { process: existing, reused: !this.#poolPrewarmed };
+    }
     const inFlight = this.#poolSpawn;
     if (inFlight !== undefined) {
       const shared = await inFlight;
@@ -951,7 +983,14 @@ class DshConnection implements ProviderConnection {
       if (this.#closed) throw new Error("the provider connection is closed");
       // Somebody else's spawn: by the time this returns the child has another
       // session attached to it (or is about to), so this caller is joining.
-      return { process: shared, reused: true };
+      //
+      // ...unless that spawn is the prewarm's. A prewarmed child has served no
+      // session yet, so joining it proves nothing about a native child's open
+      // turn: the only process that could still be running that turn is one that
+      // was already serving conversations. Reporting `reused` here made every
+      // restart look like an adoption and left killed children "running" forever
+      // (`FIELD-NOTES` 106).
+      return { process: shared, reused: !this.#prewarmSpawn };
     }
     const spawnTask = (async (): Promise<DshProcess> => {
       // Nothing is spawned before the *previous* plugin process's shared child is
@@ -1062,11 +1101,19 @@ class DshConnection implements ProviderConnection {
     await this.#retireUnusedPrewarmFor(options.env);
     const { process, reused } = await this.#ensurePoolProcess(options);
     this.#addPoolClaim(process);
-    // A fresh spawn reports nothing here: the child was born with this session's
-    // env (minus the identity keys `dsh-process.ts` drops by design), so there is
-    // no difference to report. A reused child is compared against the env it was
-    // actually spawned with.
-    return { process, reused, envDiffering: reused ? this.#warnEnvDiffers(options.env) : [] };
+    // `reused` is the acquire's answer, and it now means exactly one thing: this
+    // session joined a child that has served conversations. Both no-service cases
+    // are classified there — the completed prewarm (`#poolPrewarmed`) and its
+    // in-flight spawn (`#prewarmSpawn`) — so this path must not second-guess them.
+    //
+    // `envDiffering` is **not** gated on `reused`: whether this session's env was
+    // applied depends on the env the child was actually spawned with, which
+    // `#envDifference` compares (a fresh spawn reports nothing by itself). The
+    // case that would otherwise go silent is an open that joined the prewarm's
+    // in-flight spawn: it cannot be retired yet (`#retireUnusedPrewarmFor` needs a
+    // published child), so its non-identity keys really are inert and must be
+    // reported.
+    return { process, reused, envDiffering: this.#warnEnvDiffers(options.env) };
   }
 
   /**
@@ -2933,10 +2980,18 @@ export async function readAgentGoal(agentId: string): Promise<{
  * Read one agent's team board (T3), the way {@link readAgentGoal} reads a goal.
  *
  * The board is DSH's `agentTeam` wire view plus the session's own `running`
- * overlay (`DshSession.team`). It is parsed here with the shared schema: an
- * answer that is not DSH's shape is a transient `rpc_failed` with the Zod
- * reason, never a silently emptied board. No session for the agent in this
- * process is an accurate `team: null` (the goal/jobs rule).
+ * overlay (`DshSession.team`). **Two generations of that view exist** and both
+ * are accepted (`shared/team.ts`): `{members, tasks}` from
+ * `dsh-experimental-agent-team` and `{enabled, tasks}` from `dsh-agent-team`.
+ * The newer generation carries no roster, so for it the session half supplies
+ * `members` separately from the Lead's continuable direct children
+ * (`DshSession.team` → the bridge's `paseo/subagents`).
+ *
+ * Parsing is done here with the shared union: an answer that is neither
+ * generation is a transient `rpc_failed` with the Zod reason, never a silently
+ * emptied board, and the two normalized halves (`enabled` present, `members`
+ * array) are what the pill draws. No session for the agent in this process is
+ * an accurate `team: null` (the goal/jobs rule).
  *
  * @param agentId - Paseo's agent id, as the pill knows it.
  */
@@ -2960,7 +3015,7 @@ export async function readAgentTeam(agentId: string): Promise<{
       };
     }
     if (result.team === undefined || result.team === null) return { available: true, team: null };
-    const parsed = teamViewSchema.safeParse(result.team);
+    const parsed = teamProjectionSchema.safeParse(result.team);
     if (!parsed.success) {
       return {
         available: false,
@@ -2968,7 +3023,43 @@ export async function readAgentTeam(agentId: string): Promise<{
         error: { message: `the agentTeam projection is not the expected shape: ${parsed.error.message}`, code: "rpc_failed" },
       };
     }
-    return { available: true, team: parsed.data };
+    // The newer generation has no roster in the projection; its members are the
+    // named continuable direct children the session half derived from the
+    // subagent catalog. `undefined` there is an internal inconsistency, not an
+    // empty roster: report it instead of drawing "0 名成员".
+    if ("enabled" in parsed.data) {
+      const roster = teamMemberSchema.array().safeParse(result.members);
+      if (!roster.success) {
+        return {
+          available: false,
+          team: null,
+          error: {
+            message: `the agentTeam projection has no readable subagent roster: ${roster.error.message}`,
+            code: "rpc_failed",
+          },
+        };
+      }
+      return {
+        available: true,
+        team: {
+          enabled: parsed.data.enabled,
+          members: roster.data,
+          tasks: parsed.data.tasks,
+          ...(parsed.data.failure === undefined ? {} : { failure: parsed.data.failure }),
+        },
+      };
+    }
+    // The older generation's projection only existed while a team did, so it is
+    // `enabled` by definition.
+    return {
+      available: true,
+      team: {
+        enabled: true,
+        members: parsed.data.members,
+        tasks: parsed.data.tasks,
+        ...(parsed.data.failure === undefined ? {} : { failure: parsed.data.failure }),
+      },
+    };
   }
   return { available: true, team: null };
 }

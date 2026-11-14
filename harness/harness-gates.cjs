@@ -188,6 +188,101 @@ function contentBlocksIncludeImage(contentBlocks, data, mimeType) {
 }
 
 /**
+ * The text blocks of one message's content array, joined.
+ *
+ * `assistant/message` carries its blocks under `data.message.content`; a
+ * `user/message` carries them under `data.content` (verified against a real v4
+ * log). Non-text blocks (reasoning, tool-call, image) contribute nothing.
+ *
+ * @param {unknown} content
+ * @returns {string}
+ */
+function textOfContentBlocks(content) {
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter(
+      (block) =>
+        block !== null &&
+        typeof block === "object" &&
+        block.type === "text" &&
+        typeof block.text === "string",
+    )
+    .map((block) => block.text)
+    .join("");
+}
+
+/**
+ * The assistant text of the **last turn** in a bridge event stream.
+ *
+ * The predicate this replaces took `.at(-1)` across the whole stream, which two
+ * ways goes wrong. It is not scoped to a turn, so a turn that emits only tool
+ * calls silently inherits the previous turn's text as its "answer" (the same
+ * stale-event trap that once made a waiting check match the canceled turn);
+ * and an empty answer then reads as "the model did not know the withdrawn
+ * secret", which is the fake green this helper exists to stop. Here "no turn
+ * boundary seen" and "no assistant text in the turn" both return `""`, so the
+ * caller's non-empty assertion decides, rather than defaulting to a pass.
+ *
+ * Text is joined across the turn's assistant messages (empty ones dropped): a
+ * turn may emit an empty snapshot before its final message, and a turn whose
+ * *last* frame happens to be empty still answered.
+ *
+ * @param {Array<{type?: string, data?: {message?: {content?: unknown}}}>} events - DSH session events, in arrival order.
+ * @returns {string} the turn's answer text, `""` when it produced none.
+ */
+function lastTurnAnswer(events) {
+  if (!Array.isArray(events)) return "";
+  let start = -1;
+  for (let index = 0; index < events.length; index += 1) {
+    if (events[index]?.type === "turn/start") start = index;
+  }
+  // No boundary at all: the stream cannot be attributed to a turn, so there is
+  // no answer to judge. Returning the stream's tail here would restore the bug.
+  if (start < 0) return "";
+  const texts = [];
+  for (let index = start + 1; index < events.length; index += 1) {
+    const event = events[index];
+    if (event?.type !== "assistant/message") continue;
+    const text = textOfContentBlocks(event.data?.message?.content);
+    if (text.trim() !== "") texts.push(text);
+  }
+  return texts.join("\n");
+}
+
+/**
+ * Every `user/message` in a replayed surface that a **plugin** injected.
+ *
+ * A plugin (for example a memory/recall plugin) injects its own message before
+ * the human's, carrying `source.kind` such as `plugin:memory`; those rows are
+ * ordinary `user/message` events in the durable log and in `paseo/history`, so
+ * a rewind that folds the transcript does not fold them. Reading them back is
+ * how a check can tell "the model forgot" from "a plugin handed it back".
+ *
+ * Content is read tolerantly (`data.content`, then `data.message.content`)
+ * because a shape change must not turn this predicate into a silent pass; a
+ * broken reader yields no rows, and a check that only looks for absence would
+ * never notice. Callers that need certainty should pair it with a positive
+ * observation (see `--with-memory` in `rewind-e2e.mjs`).
+ *
+ * @param {Array<{type?: string, data?: {source?: {kind?: string}, content?: unknown, message?: {content?: unknown}}}>} events
+ * @returns {Array<{kind: string, text: string}>}
+ */
+function pluginInjectedUserTexts(events) {
+  if (!Array.isArray(events)) return [];
+  const rows = [];
+  for (const event of events) {
+    if (event?.type !== "user/message") continue;
+    const kind = event.data?.source?.kind;
+    if (typeof kind !== "string" || kind.startsWith("plugin:") === false) continue;
+    rows.push({
+      kind,
+      text: textOfContentBlocks(event.data?.content ?? event.data?.message?.content),
+    });
+  }
+  return rows;
+}
+
+/**
  * Pick the prompt frames that carried an image, from a recorder's list.
  *
  * @param {Array<{sessionId?: string, contentBlocks?: unknown}>} prompts
@@ -208,6 +303,8 @@ module.exports = {
   classifyRouteOutcome,
   contentBlocksIncludeImage,
   countPromptFramesWithImage,
+  lastTurnAnswer,
+  pluginInjectedUserTexts,
   projectTimelineLikePaseo,
   routeExitCode,
   timelineItemsWithTurns,

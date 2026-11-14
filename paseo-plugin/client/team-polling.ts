@@ -49,9 +49,19 @@ import type { TeamText } from "./locale";
  * — stays hidden, the same shape as the jobs pill hiding with nothing live and
  * the goal pill with no goal. A profile without the team bundle is **not** this
  * case: it is the terminal `team_unavailable`, which removes the pill.
+ *
+ * **A disabled team hides the pill even when it still owns tasks.** DSH
+ * 0.2.2-rc.2+ reports the Team selection as `enabled` and its own task board
+ * renders nothing for `enabled: false` (`dsh-client-ui-agent-team`'s
+ * `TeamBoard.tsx`: `if (!team?.enabled) return null`); switching Team off keeps
+ * the task board (tasks and mode are separate durable state there), so this
+ * gate is what keeps the pill matching what the panel would draw. The older
+ * generation has no selection at all — its projection only existed while a team
+ * did — so `enabled` is normalized to `true` for it (`shared/team.ts`).
  */
 export function teamPillVisible(team: TeamView | null | undefined, seen?: string): boolean {
   if (team === null || team === undefined) return false;
+  if (!team.enabled) return false;
   if (team.tasks.length === 0) return false;
   const key = teamAllDoneKey(team);
   if (key !== undefined && key === seen) return false;
@@ -283,9 +293,25 @@ export function teamHeadLabel(item: TeamHeadItem, text: TeamText, short: boolean
  */
 export type TeamOwnerState = "running" | "stopped";
 
+/**
+ * The owner as the row labels it: DSH's captured agent **path** (`ownerName`,
+ * present on both generations for named owners) or, for the newer generation's
+ * historical assignments, the owner's `SessionId` (`ownerId`). This is the same
+ * fallback order DSH's own task board uses (`dsh-client-ui-agent-team`'s
+ * `TeamBoard.tsx`: `task.ownerName ?? task.ownerId ?? unowned`). `undefined`
+ * means the task has no owner at all.
+ */
+export function teamOwnerLabel(task: TeamTask): string | undefined {
+  return task.ownerName ?? task.ownerId;
+}
+
 export function teamOwnerState(task: TeamTask, members: readonly TeamMember[]): TeamOwnerState | undefined {
-  if (task.ownerName === undefined || task.status === "completed") return undefined;
-  const owner = members.find((member) => member.name === task.ownerName);
+  if (teamOwnerLabel(task) === undefined || task.status === "completed") return undefined;
+  // The path is the roster's `name`; a historical owner only has an id, which
+  // is the member's session id. Both are DSH's own identities, never a guess.
+  const owner =
+    members.find((member) => task.ownerName !== undefined && member.name === task.ownerName)
+    ?? members.find((member) => task.ownerId !== undefined && member.id === task.ownerId);
   if (owner === undefined) return undefined;
   const state = teamMemberState(owner);
   return state === "running" ? "running" : state === "idle" ? "stopped" : undefined;
@@ -355,13 +381,14 @@ function scopesLine(scopes: readonly string[]): string | undefined {
  */
 export function teamTaskFactsParts(task: TeamTask, text: TeamText): { lead: string; owner: boolean; trail: string } {
   const blocking = task.status === "pending" && !task.ready && task.blockedBy.length > 0;
-  const head = [task.id, task.ownerName ?? (task.status === "completed" ? undefined : text.unowned)].filter(
+  const ownerLabel = teamOwnerLabel(task);
+  const head = [task.id, ownerLabel ?? (task.status === "completed" ? undefined : text.unowned)].filter(
     (part): part is string => typeof part === "string" && part !== "",
   );
   const rest = [blocking ? text.blockedBy(task.blockedBy.join(text.listSeparator)) : undefined, scopesLine(task.writeScopes)].filter(
     (part): part is string => typeof part === "string" && part !== "",
   );
-  return { lead: head.join(" · "), owner: task.ownerName !== undefined, trail: rest.length === 0 ? "" : ` · ${rest.join(" · ")}` };
+  return { lead: head.join(" · "), owner: ownerLabel !== undefined, trail: rest.length === 0 ? "" : ` · ${rest.join(" · ")}` };
 }
 
 /** The same facts as one string (accessibility names, tests). */
@@ -382,7 +409,7 @@ export function teamTaskFields(
   /** The board's roster, for the owner's running ring; omitted (the timeline card) → never running. */
   members: readonly TeamMember[] = [],
 ): Array<{ label: string; value: string; tone?: "warning"; owner?: TeamOwnerState }> {
-  const owner: { label: string; value: string; owner?: TeamOwnerState } = { label: text.fields.owner, value: task.ownerName ?? text.unowned };
+  const owner: { label: string; value: string; owner?: TeamOwnerState } = { label: text.fields.owner, value: teamOwnerLabel(task) ?? text.unowned };
   const state = teamOwnerState(task, members);
   if (state !== undefined) owner.owner = state;
   const fields: Array<{ label: string; value: string; tone?: "warning"; owner?: TeamOwnerState }> = [

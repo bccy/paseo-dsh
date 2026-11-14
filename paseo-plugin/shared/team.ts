@@ -5,27 +5,52 @@
  * directory both sides may import; defining it twice would let the halves drift
  * into a Zod error at runtime instead of a type error here.
  *
- * **What the team is.** DSH's `dsh-experimental-agent-team` keeps a durable
- * `agentTeam` session projection on the Lead's session: a roster (the Lead plus
- * every teammate) and a shared task board. The wire view is DSH's
- * `TeamProjection` (`lib/types/types.d.ts`: `{members, tasks, failure?}`, with
- * deleted tasks already filtered out). The plugin reads it cold through the
- * bridge's existing `paseo/projections` method — no bridge change, no Paseo
- * capability bit, no invented event.
+ * **What the team is.** DSH keeps a durable `agentTeam` session projection on
+ * the Lead's session: whether the team is selected plus a shared task board.
+ * Two generations of the wire view exist and **both must parse** (npm `latest`
+ * is still the older one; `MINIMUM_DSH` is `0.2.1`):
+ *
+ * - `dsh-experimental-agent-team` (DSH ≤ 0.2.1): `TeamProjection` is
+ *   `{members, tasks, failure?}` — a roster (Lead plus teammates) and the board.
+ *   The wire type lives in that package's `lib/types/types.d.ts`.
+ * - `dsh-agent-team` (DSH 0.2.2-rc.2+): `{enabled, tasks, failure?}`. The
+ *   roster is gone; the package's own projection comment says "Current
+ *   subagents are supplied separately by the existing `subagentCatalog`
+ *   projection" (`lib/types/projection.d.ts`, `teamProjectionDefinition`). The
+ *   roster therefore comes from the Lead's `subagentCatalog` rows, which the
+ *   plugin's server half reads through the bridge's `paseo/subagents` and
+ *   narrows to continuable direct children — the model's own member rule
+ *   (`dsh-tool-subagent-control/src/list-agents.ts`: only `mode !==
+ *   'continuable'` rows are omitted from the messageable tree).
+ *
+ * {@link teamProjectionSchema} is that union, kept strict on each arm so a
+ * hybrid or third shape is a loud `rpc_failed` rather than an accepted object
+ * with dropped fields. {@link teamViewSchema} is the **normalized** view both
+ * halves draw: `enabled` is always present (`true` for the older generation,
+ * whose projection only existed when a team did), and `members` is always an
+ * array (empty for "the roster could not name anyone", never `undefined`).
  *
  * **One field is not DSH's.** The projection is durable state only; whether a
  * member is *running right now* is runtime state (DSH's own Web UI overlays it
  * from session state). The plugin's server half adds `running` from the child
  * sessions it hosts, and **omits it when it does not know** — the client must
  * then not say 运行中/空闲 (docs/TEAM.md). Showing a durable `active` as
- * "running" is the silent degradation this field exists to prevent.
+ * "running" is the silent degradation this field exists to prevent. The newer
+ * generation has no `phase` for current subagents at all (`TeamMemberPhase` is
+ * kept there for historical roster records only), so `phase` is optional here
+ * and its absence is "this generation does not express it", not `active`.
  *
  * @module dsh-paseo/shared/team
  */
 import { defineSubscription } from "@getpaseo/plugin";
 import { z } from "zod";
 
-/** DSH's member phases (`TeamMemberProjection.phase`), written out so a new one fails the parse. */
+/**
+ * DSH's historical member phases (`TeamMemberSnapshot.phase`), written out so a
+ * new one fails the parse. Only the older generation's projection carries them;
+ * the newer one records them for historical roster events only, so a current
+ * subagent-derived member has no phase at all.
+ */
 export const TEAM_MEMBER_PHASES = ["provisioning", "active", "failed"] as const;
 export type TeamMemberPhase = (typeof TEAM_MEMBER_PHASES)[number];
 
@@ -33,13 +58,19 @@ export type TeamMemberPhase = (typeof TEAM_MEMBER_PHASES)[number];
 export const TEAM_TASK_STATUSES = ["pending", "in_progress", "completed"] as const;
 export type TeamTaskStatus = (typeof TEAM_TASK_STATUSES)[number];
 
-/** One roster row: DSH's `TeamMemberProjection` plus the server-added `running`. */
+/** One roster row: DSH's `TeamMemberSnapshot` plus the server-added `running`. */
 export const teamMemberSchema = z.object({
-  /** The member's DSH session id (the Lead's is the root session id). */
+  /** The member's DSH session id (the older generation's Lead row carries the root session id). */
   id: z.string(),
   name: z.string(),
   role: z.enum(["lead", "teammate"]),
-  phase: z.enum(TEAM_MEMBER_PHASES),
+  /**
+   * Present only when the older generation's projection (`{members, tasks}`)
+   * supplied it. The newer generation has no phase for current subagents, so a
+   * roster derived from its `subagentCatalog` omits the key — that is "DSH does
+   * not express this", not `active`.
+   */
+  phase: z.enum(TEAM_MEMBER_PHASES).optional(),
   /** DSH's failure sentence for a `failed` member, verbatim. */
   error: z.string().optional(),
   /** The one-line description the Lead gave at spawn, when DSH recorded one. */
@@ -53,7 +84,7 @@ export const teamMemberSchema = z.object({
 });
 export type TeamMember = z.infer<typeof teamMemberSchema>;
 
-/** One shared task: DSH's `TeamTaskView` (`TASK_VIEW_SCHEMA`), field for field. */
+/** One shared task: DSH's `TeamTaskView` (`projectTaskView`), field for field. */
 export const teamTaskSchema = z.object({
   id: z.string(),
   revision: z.number(),
@@ -62,6 +93,17 @@ export const teamTaskSchema = z.object({
   status: z.enum(TEAM_TASK_STATUSES),
   blockedBy: z.array(z.string()),
   writeScopes: z.array(z.string()),
+  /**
+   * The newer generation's assignment identity (DSH 0.2.2-rc.2+,
+   * `TeamTaskView.ownerId`): the owner's `SessionId`. Optional in both
+   * generations; the older one had no such key, so it stays absent there.
+   */
+  ownerId: z.string().optional(),
+  /**
+   * The owner's agent **path** captured at assignment (`TeamTaskView.ownerName`;
+   * `team_task_*` tool results rename it to `owner`). Absent on historical
+   * owners recorded before names existed.
+   */
   ownerName: z.string().optional(),
   /** DSH's own readiness: pending and every blocker completed. Never recomputed here. */
   ready: z.boolean(),
@@ -70,8 +112,46 @@ export const teamTaskSchema = z.object({
 });
 export type TeamTask = z.infer<typeof teamTaskSchema>;
 
-/** The board as the pill draws it. `failure` is DSH's terminal projection failure, verbatim. */
+/** The shared task fields both generations carry; the arms add their own keys. */
+const teamProjectionFields = {
+  tasks: z.array(teamTaskSchema),
+  failure: z.string().optional(),
+} as const;
+
+/**
+ * DSH ≤ 0.2.1's wire view (`dsh-experimental-agent-team`): `{members, tasks,
+ * failure?}`. `strict()` so `enabled` (and anything else) on this arm is a
+ * shape error instead of a silently stripped field.
+ */
+export const teamRosterProjectionSchema = z
+  .object({ members: z.array(teamMemberSchema), ...teamProjectionFields })
+  .strict();
+
+/**
+ * DSH 0.2.2-rc.2+'s wire view (`dsh-agent-team`): `{enabled, tasks, failure?}`.
+ * The roster is deliberately absent — it comes from the `subagentCatalog`
+ * projection (see this module's comment). `strict()` for the same reason.
+ */
+export const teamModeProjectionSchema = z
+  .object({ enabled: z.boolean(), ...teamProjectionFields })
+  .strict();
+
+/**
+ * The `agentTeam` wire view of either generation.
+ *
+ * A union with two strict arms, not one loosened object: a hybrid
+ * (`{members, enabled, …}`) or a third shape fails both arms and is reported as
+ * a transient `rpc_failed` with Zod's reason — never accepted with unknown keys
+ * dropped, which is how a changed upstream shape silently degrades a UI.
+ */
+export const teamProjectionSchema = z.union([teamRosterProjectionSchema, teamModeProjectionSchema]);
+export type TeamProjection = z.infer<typeof teamProjectionSchema>;
+
+/** The board as the pill draws it — the normalized view both generations map to. */
 export const teamViewSchema = z.object({
+  /** Whether this session has the Team selected. Older-generation boards are always `true`. */
+  enabled: z.boolean(),
+  /** The teammate roster; the Lead is the main session and is never listed here. */
   members: z.array(teamMemberSchema),
   tasks: z.array(teamTaskSchema),
   failure: z.string().optional(),

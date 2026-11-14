@@ -183,6 +183,23 @@ export interface DshChildOpened {
   mode?: string;
   label?: string;
   cwd?: string;
+  /**
+   * DSH 0.2.2-rc.2+ (`subagent/catalog` v3): the child's name, unique among its
+   * siblings. Absent on DSH ≤ 0.2.2-rc.1 and on historical rows.
+   */
+  name?: string;
+  /**
+   * DSH 0.2.2-rc.2+ (`SubagentDescendantListEntry.path`): slash-separated names
+   * from the root, absent whenever a level below the root has no name.
+   */
+  path?: string;
+  /**
+   * The bridge learned this child from DSH's durable catalog listing rather than
+   * from a live event. Such a child (adopted after a reload, or a historical row)
+   * will never emit another live `subagent/catalog` fact, so the plugin must not
+   * hold its notice waiting for a name that cannot arrive.
+   */
+  listed?: boolean;
 }
 
 /** A `session.event` payload's outer envelope. */
@@ -463,11 +480,21 @@ export type DshCurrentTask =
 /**
  * One session's team board as the team pill reads it: DSH's `agentTeam` wire
  * view, still unvalidated (`server/provider.ts` parses it with the shared Zod
- * schema). `team: null` = no stored log, or a log with no team state to show.
+ * schema).
+ *
+ * `team: null` = no stored log, or a log with no team state to show.
+ *
+ * `members` is **not** part of that wire view: the newer generation
+ * (`dsh-agent-team`, DSH 0.2.2-rc.2+) removed the roster and defers to the
+ * `subagentCatalog` projection, so `DshSession.team` derives it from the
+ * Lead's continuable direct children and passes it here. The older generation
+ * keeps its roster inside `team` and leaves this key absent.
  */
 export interface DshTeam {
   available: boolean;
   team?: unknown;
+  /** The derived roster for the newer generation; absent for the older one. */
+  members?: unknown;
   error?: { message?: string; code?: TeamErrorCode };
 }
 
@@ -1668,6 +1695,18 @@ export class DshProcess {
   readonly #approvalRequests = new Map<string, { sessionId: string; controller: AbortController }>();
   /** Sessions that have completed their own `initialize` in this child. */
   readonly #initializedSessions = new Set<string>();
+
+  /**
+   * Whether this bridge advertised that its DSH build names subagent children
+   * (`serverInfo.subagentNames` on `initialize`, 0.2.2-rc.2+).
+   *
+   * False is also the answer for an older bridge, a profile without a subagent
+   * service, and a process whose initialize reply predates the field — in all
+   * three the plugin must open a label-only child immediately, exactly as it did
+   * before names existed. Read by `DshSession` when it decides whether a child
+   * notice may wait for the parent catalog's name.
+   */
+  #subagentNames = false;
   /** Sessions whose MCP entries have been handed to the bridge. */
   readonly #mcpSent = new Set<string>();
   /** The entries each session mounts, translated once (translation may throw). */
@@ -1891,6 +1930,11 @@ export class DshProcess {
   /** Whether the child is still alive and usable. */
   get running(): boolean {
     return this.#closed === false && this.#child !== undefined;
+  }
+
+  /** Whether the bridge advertised DSH-side naming of subagent children. */
+  get subagentNames(): boolean {
+    return this.#subagentNames;
   }
 
   /**
@@ -2322,12 +2366,12 @@ export class DshProcess {
    */
   async #prepareProcess(): Promise<void> {
     const route = this.#options.route;
-    await this.#request("initialize", {
+    this.#noteServerInfo(await this.#request("initialize", {
       cwd: this.#options.cwd,
       provider: route.provider,
       model: route.model,
       ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
-    });
+    }));
   }
 
   /**
@@ -2344,7 +2388,7 @@ export class DshProcess {
     const options = this.#sessionOptions.get(sessionId) ?? {};
     const cwd = options.cwd ?? this.#options.cwd;
     const route = options.route ?? this.#options.route;
-    await this.#request("initialize", {
+    this.#noteServerInfo(await this.#request("initialize", {
       cwd,
       provider: route.provider,
       model: route.model,
@@ -2358,8 +2402,23 @@ export class DshProcess {
       // The session's own Paseo identity (see `DshSessionOptions.identity`).
       // Unlike the title an omitted identity is meaningful: it clears the row.
       ...(options.identity === undefined ? {} : { identity: options.identity }),
-    });
+    }));
     this.#initializedSessions.add(sessionId);
+  }
+
+  /**
+   * Read the bridge's optional capabilities off one `initialize` reply.
+   *
+   * `serverInfo.subagentNames` is an optional addition to a field the plugin
+   * never consumed before: an older bridge omits it, which must read as "this
+   * build does not name children" rather than as an absence of the whole reply.
+   */
+  #noteServerInfo(result: unknown): void {
+    if (result === null || typeof result !== "object") return;
+    const info = (result as { serverInfo?: unknown }).serverInfo;
+    if (info === null || typeof info !== "object") return;
+    const names = (info as { subagentNames?: unknown }).subagentNames;
+    this.#subagentNames = names === true;
   }
   /**
    * Make one session ready to be used: initialized, with its MCP servers queued.
@@ -3477,9 +3536,19 @@ export class DshProcess {
    *
    * @param sessionId - which session; required — there is no default.
    */
-  async subagents(sessionId: string): Promise<{
+  async subagents(
+    sessionId: string,
+    /**
+     * `register: false` reads the same catalog without recording child edges or
+     * replaying held frames. The team pill derives the newer generation's roster
+     * from it on every feed read (every four seconds per watched agent); the
+     * registration half exists for the tree rebuild on open, and repeating its
+     * side effects on a poll would replay orphan frames for no reason.
+     */
+    options: { register?: boolean } = {},
+  ): Promise<{
     available: boolean;
-    subagents: Array<{ sessionId: string; parentSessionId: string; mode?: string; label?: string; archived?: boolean }>;
+    subagents: Array<{ sessionId: string; parentSessionId: string; mode?: string; label?: string; name?: string; archived?: boolean }>;
     diagnostics?: unknown[];
     error?: { message: string };
   }> {
@@ -3490,11 +3559,19 @@ export class DshProcess {
       60000,
     )) as {
       available?: boolean;
-      subagents?: Array<{ sessionId: string; parentSessionId: string; mode?: string; label?: string }>;
+      subagents?: Array<{ sessionId: string; parentSessionId: string; mode?: string; label?: string; name?: string }>;
       diagnostics?: unknown[];
       error?: { message?: string };
     };
     const subagents = result.subagents ?? [];
+    if (options.register === false) {
+      return {
+        available: result.available === true,
+        subagents,
+        ...(result.diagnostics === undefined ? {} : { diagnostics: result.diagnostics }),
+        ...(result.error === undefined ? {} : { error: { message: result.error.message ?? "subagent listing failed" } }),
+      };
+    }
     // The listing is read from DSH's own durable headers, so it names every
     // child's direct parent — including children whose `session.child-opened` this
     // process never received (a reopen, or a child announced to a previous

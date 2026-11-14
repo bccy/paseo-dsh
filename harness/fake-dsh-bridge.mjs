@@ -26,12 +26,56 @@
  *            session request, before the plugin emits `session.ready`
  *   nested   after the root is ready, report a grandchild (and great-grandchild)
  *            *before* its parent's child-opened, with its earliest message and
- *            status first, so the plugin must hold and release the subtree
+ *            status first, so the plugin must hold and release the subtree.
+ *            The three levels also carry DSH 0.2.2-rc.2+'s identity fields
+ *            (`name`, and `path` where every level below the root is named), so
+ *            one scenario pins the path/name/absent description cases at once
+ *   name-missing
+ *            report the rc.1 shape (a child notice with only a creation label, so
+ *            no `description` may appear on its row) plus a notice whose `name`/
+ *            `path` are not strings — the plugin must treat both as absent and
+ *            still open the child instead of crashing on a foreign bridge version
+ *   catalog-tree / catalog-tree-early
+ *            the same real order one level deeper: a child's notice+label, then
+ *            the name in its **parent's** catalog fact (the root for a direct
+ *            child, a child session for a grandchild). `catalog-tree-early` is the
+ *            out-of-order variant — the grandchild's notice and the catalog fact
+ *            naming it arrive before the notice of the child that parents it
+ *   name-bound-gated
+ *            the frame bound expires while the notice is still held by another
+ *            gate (no label yet): exactly one "held 8 frames" line may be logged,
+ *            not one per surplus frame, and the child must still open correctly
+ *            once its descriptor supplies the label
+ *   catalog-none
+ *            no catalog fact ever: a label-only child notice followed by exactly
+ *            `CHILD_NAME_WAIT_EVENTS` frames and one root marker. The bound must
+ *            open it on the frame count (before the marker), not on the 750 ms
+ *            timer
+ *   catalog-late
+ *            the real rc.3 order: the child notice carries only its label, the
+ *            child emits a frame or two, and only then does the parent's
+ *            `subagent/catalog` v3 fact (the only live source of `name`) arrive.
+ *            The plugin must hold the single `session.opened` for it and announce
+ *            `title = name`, `description = label`
+ *   catalog-absent
+ *            the rc.1 shape: a label-only child notice, a v2 catalog fact with no
+ *            name, and a root frame right behind it. The bridge does not
+ *            advertise naming, so the child must open immediately with
+ *            `title = label` and no `description` (waiting would only delay it)
+ *   name-only
+ *            the second-line rule's corners: a child with a `name` but **no**
+ *            label (it opens untitled after the label wait, with the name as the
+ *            first line and no description at all) and one whose label equals its
+ *            name (the description must be omitted, or the host would paint the
+ *            same text twice)
  *   replay   answer `paseo/subagents`/`paseo/history` (child-A has an inherited
  *            fork prefix) so a reopen can rebuild the tree; the listing also
  *            carries a killed child whose log stops inside a turn with no
  *            terminal, and a live child with the same shape that the bridge
- *            announces during the open, so the two can be told apart
+ *            announces during the open, so the two can be told apart. Rows carry
+ *            `name`/`path` where a named DSH would provide them and omit both for
+ *            the historical shape, so the replay path's title/description rule is
+ *            asserted against the same listing a real reopen reads
  *   replay-hang
  *            answer `paseo/subagents` with one child (`child-H`) whose log read
  *            (`paseo/history`) parks until the test writes
@@ -292,6 +336,39 @@ function goalScript() {
  */
 function commandScript() {
   return scriptFile("DSH_FAKE_COMMAND_FILE");
+}
+
+/**
+ * The scripted `paseo/subagents` answer.
+ *
+ * The team pill's newer-generation roster comes from DSH's durable subagent
+ * catalog, which the plugin reads through this existing bridge method. A script
+ * lets a check drive the three answers that matter — catalog rows with
+ * `name`/`label`/`mode`/parent, an explicit `{available:false, error}` refusal,
+ * and a thrown read — without a real runtime. Unset keeps the scenario's
+ * built-in listing below.
+ */
+function subagentsScript() {
+  return scriptFile("DSH_FAKE_SUBAGENTS_FILE");
+}
+
+/**
+ * Whether this scenario's runtime advertises DSH-side child naming.
+ *
+ * The real bridge puts `serverInfo.subagentNames` in its `initialize` reply when
+ * the composed `subagents` service exposes `namesOf`/`rootOf` (0.2.2-rc.2+).
+ * The plugin uses it to decide whether a label-only child notice may hold for the
+ * parent catalog's name; scenarios that assert that hold opt in, and every other
+ * scenario keeps the pre-existing immediate open — exactly what an rc.1 bridge
+ * asks for. `DSH_FAKE_CAPABILITIES_FILE` overrides the decision so a check can
+ * model either generation independently of the scenario body.
+ */
+function namesAdvertised() {
+  const scripted = scriptFile("DSH_FAKE_CAPABILITIES_FILE");
+  if (scripted !== undefined && typeof scripted.subagentNames === "boolean") return scripted.subagentNames;
+  return mode() === "catalog-late" || mode() === "name-missing" ||
+    mode() === "catalog-tree" || mode() === "catalog-tree-early" || mode() === "catalog-none" ||
+    mode() === "name-bound-gated";
 }
 
 /**
@@ -702,19 +779,208 @@ async function emitScenario() {
 async function emitNested() {
   // Every notice arrives before the parent it hangs under, deepest first, and
   // each descendant's earliest message/status precedes its own parent notice.
-  notify("session.child-opened", { sessionId: "great-H", parentSessionId: "grand-G", mode: "one-shot", label: "Great H", cwd: "/tmp" });
+  //
+  // The identity fields are DSH 0.2.2-rc.2+'s: `child-P` is a live notice from
+  // the parent's `subagent/catalog`, which only carries `name` (a path needs the
+  // recursive listing), while `grand-G`/`great-H` are the shapes a *listing* row
+  // has — `name` plus the root-relative `path` their named ancestors make
+  // available. One scenario therefore covers description = name, = path, and (in
+  // `name-missing`) the rc.1 shape with neither.
+  notify("session.child-opened", { sessionId: "great-H", parentSessionId: "grand-G", mode: "one-shot", label: "Great H", name: "great-h", path: "parent-p/grand-g/great-h", cwd: "/tmp" });
   notify("session.event", { sessionId: "great-H", event: { type: "assistant/message", seq: 1, data: { turn: 1, step: 1, message: { id: "gh1", content: [{ type: "text", text: "great early answer" }] } } } });
   notify("session.status", { sessionId: "great-H", status: "running" });
   notify("session.event", { sessionId: "great-H", event: { type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "completed" } } } });
-  notify("session.child-opened", { sessionId: "grand-G", parentSessionId: "child-P", mode: "continuable", label: "Grand G", cwd: "/tmp" });
+  notify("session.child-opened", { sessionId: "grand-G", parentSessionId: "child-P", mode: "continuable", label: "Grand G", name: "grand-g", path: "parent-p/grand-g", cwd: "/tmp" });
   notify("session.event", { sessionId: "grand-G", event: { type: "assistant/message", seq: 1, data: { turn: 1, step: 1, message: { id: "gg1", content: [{ type: "text", text: "grand early answer" }] } } } });
   notify("session.status", { sessionId: "grand-G", status: "running" });
   notify("session.event", { sessionId: "grand-G", event: { type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "completed" } } } });
   // The unresolved-parent grandchild output must not leak into the root view.
   notify("session.event", { sessionId: "ghost-session", event: { type: "assistant/message", seq: 1, data: { turn: 1, step: 1, message: { id: "gm1", content: [{ type: "text", text: "GHOST-SHOULD-NOT-APPEAR" }] } } } });
-  notify("session.child-opened", { sessionId: "child-P", parentSessionId: rootId, mode: "continuable", label: "Parent P", cwd: "/tmp" });
+  notify("session.child-opened", { sessionId: "child-P", parentSessionId: rootId, mode: "continuable", label: "Parent P", name: "parent-p", cwd: "/tmp" });
   notify("session.event", { sessionId: "child-P", event: { type: "assistant/message", seq: 1, data: { turn: 1, step: 1, message: { id: "pp1", content: [{ type: "text", text: "parent answer" }] } } } });
   notify("session.event", { sessionId: "child-P", event: { type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "completed" } } } });
+}
+
+/**
+ * Report the two identity shapes a bridge may hand over that are **not** a
+ * usable name: the older build's child (label only) and a malformed one.
+ *
+ * The title rule must not invent a description for either. The bridge is
+ * responsible for dropping and logging a non-string `name`/`path` before it
+ * ever reaches the wire (`dsh-bridge/lib/server.js` `adoptIdentity`,
+ * asserted by `harness/bridge-server-check.mjs`); this scenario pins the
+ * plugin's half of the same contract — its `childIdentity` treats the values as
+ * absent and the child still opens, so a plugin loaded against a bridge of
+ * another version can neither mislabel a row nor fail the open.
+ */
+async function emitNameMissing() {
+  notify("session.child-opened", { sessionId: "child-NM", parentSessionId: rootId, mode: "continuable", label: "Legacy NM", cwd: "/tmp" });
+  notify("session.event", { sessionId: "child-NM", event: { type: "assistant/message", seq: 1, data: { turn: 1, step: 1, message: { id: "nm1", content: [{ type: "text", text: "legacy child answer" }] } } } });
+  notify("session.status", { sessionId: "child-NM", status: "running" });
+  notify("session.event", { sessionId: "child-NM", event: { type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "completed" } } } });
+  notify("session.status", { sessionId: "child-NM", status: "idle" });
+  notify("session.child-opened", { sessionId: "child-NV", parentSessionId: rootId, mode: "continuable", label: "Invalid NV", name: 123, path: { segments: ["x"] }, cwd: "/tmp" });
+  notify("session.event", { sessionId: "child-NV", event: { type: "assistant/message", seq: 1, data: { turn: 1, step: 1, message: { id: "nv1", content: [{ type: "text", text: "invalid-identity child answer" }] } } } });
+  notify("session.event", { sessionId: "child-NV", event: { type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "completed" } } } });
+  notify("session.status", { sessionId: "child-NV", status: "idle" });
+}
+
+/**
+ * Report the two corners of the second-line rule: no label at all, and a label
+ * that is the name.
+ *
+ * The first child's notice carries a `name` and **no** label, so the plugin's
+ * label wait has to expire before it opens (its frames are the count that
+ * expires it). It must then open with the name as its first line and no
+ * description — a named row beats one stuck on "加载中…", and there is no task
+ * text to put on the second line.
+ *
+ * The second child's label equals its name: the host paints `description` first
+ * and does not compare the two, so a description here would show the same text
+ * on both lines. The rule drops it.
+ */
+/**
+ * Emit the real rc.3 order one level deeper, plus the out-of-order variant.
+ *
+ * A grandchild's name is in **its direct parent's** catalog fact, not the root's:
+ * the plugin sees `subagent/catalog` events for every session it is attached to,
+ * and has to record the name regardless of which session carried it — while the
+ * parent session is open (`catalog-tree`) and while it is still only a buffered
+ * notice (`catalog-tree-early`).
+ */
+async function emitCatalogTree(early) {
+  const parent = early ? "tree-child-E" : "tree-child-P";
+  const parentLabel = early ? "Tree Early P Label" : "Tree P Label";
+  const grand = early ? "tree-grand-E" : "tree-grand-P";
+  const grandLabel = early ? "Tree Early G Label" : "Tree G Label";
+  const rootChildren = { version: 3, childCreatedAt: Date.now(), mode: "continuable" };
+  if (early) {
+    // The grandchild's catalog fact exists before its parent's notice does; the
+    // plugin is attached to a session it has not opened yet, and must still see it.
+    notify("session.event", {
+      sessionId: parent,
+      event: { type: "subagent/catalog", seq: 1, data: { ...rootChildren, childId: grand, label: grandLabel, name: "tree-g-early" } },
+    });
+  }
+  notify("session.child-opened", { sessionId: grand, parentSessionId: parent, mode: "continuable", label: grandLabel, cwd: "/tmp" });
+  notify("session.event", { sessionId: grand, event: { type: "turn/start", seq: 2, data: { turn: 1 } } });
+  if (!early) {
+    // The parent session is open by now: the catalog fact rides its own channel.
+    notify("session.event", {
+      sessionId: parent,
+      event: { type: "subagent/catalog", seq: 3, data: { ...rootChildren, childId: grand, label: grandLabel, name: "tree-g" } },
+    });
+  }
+  notify("session.event", { sessionId: grand, event: { type: "assistant/message", seq: 4, data: { turn: 1, step: 1, message: { id: `${grand}-msg`, content: [{ type: "text", text: `${grand} answer` }] } } } });
+  notify("session.event", { sessionId: grand, event: { type: "turn/end", seq: 5, data: { turn: 1, reason: { kind: "completed" } } } });
+  notify("session.status", { sessionId: grand, status: "idle" });
+  notify("session.child-opened", { sessionId: parent, parentSessionId: rootId, mode: "continuable", label: parentLabel, cwd: "/tmp" });
+  notify("session.event", {
+    sessionId: rootId,
+    event: { type: "subagent/catalog", seq: 6, data: { ...rootChildren, childId: parent, label: parentLabel, name: early ? "tree-p-early" : "tree-p" } },
+  });
+  notify("session.event", { sessionId: parent, event: { type: "turn/end", seq: 7, data: { turn: 1, reason: { kind: "completed" } } } });
+  notify("session.status", { sessionId: parent, status: "idle" });
+  notify("session.event", {
+    sessionId: rootId,
+    event: { type: "assistant/message", seq: 8, data: { turn: 1, step: 1, message: { id: "root-tree", content: [{ type: "text", text: "root marker after tree" }] } } },
+  });
+}
+
+/**
+ * Let the frame bound expire while another gate still holds the notice.
+ *
+ * The child notice arrives without a label, so the label gate keeps it unopened
+ * even after the name bound is reached; twelve frames follow and only then the
+ * child's own descriptor supplies the label. The bound's decision has to be
+ * sticky and its log line singular: without that, every surplus frame re-logs
+ * "opening it" and re-runs the flush while nothing can open.
+ */
+async function emitNameBoundGated() {
+  notify("session.child-opened", { sessionId: "child-NB", parentSessionId: rootId, mode: "continuable", cwd: "/tmp" });
+  for (let index = 0; index < 12; index += 1) {
+    notify("session.event", { sessionId: "child-NB", event: { type: "assistant/message", seq: index + 1, data: { turn: 1, step: 1, message: { id: `nb-${String(index)}`, content: [{ type: "text", text: `bound-gated line ${String(index)}` }] } } } });
+  }
+  notify("session.event", { sessionId: "child-NB", event: { type: "subagent/descriptor", seq: 20, data: { version: 3, mode: "continuable", provider: "spawn", label: "Bound Gated NB" } } });
+  notify("session.event", { sessionId: "child-NB", event: { type: "turn/end", seq: 21, data: { turn: 1, reason: { kind: "completed" } } } });
+  notify("session.status", { sessionId: "child-NB", status: "idle" });
+  notify("session.event", { sessionId: rootId, event: { type: "assistant/message", seq: 30, data: { turn: 1, step: 1, message: { id: "root-nb", content: [{ type: "text", text: "root marker after bound-gated" }] } } } });
+}
+
+/**
+ * Emit a label-only child and exactly the frame bound, with no catalog fact.
+ *
+ * The bound must be the frame count, not the wall clock: the root marker is
+ * emitted right after the frames, so a plugin that only opens on the timer would
+ * announce after it.
+ */
+async function emitCatalogNone() {
+  notify("session.child-opened", { sessionId: "child-NF", parentSessionId: rootId, mode: "continuable", label: "Frames F", cwd: "/tmp" });
+  for (let index = 0; index < 8; index += 1) {
+    notify("session.event", { sessionId: "child-NF", event: { type: "assistant/message", seq: index + 1, data: { turn: 1, step: 1, message: { id: `nf-${String(index)}`, content: [{ type: "text", text: `frames line ${String(index)}` }] } } } });
+  }
+  notify("session.event", { sessionId: "child-NF", event: { type: "turn/end", seq: 9, data: { turn: 1, reason: { kind: "completed" } } } });
+  notify("session.status", { sessionId: "child-NF", status: "idle" });
+  notify("session.event", { sessionId: rootId, event: { type: "assistant/message", seq: 10, data: { turn: 1, step: 1, message: { id: "root-none", content: [{ type: "text", text: "root marker after frames" }] } } } });
+}
+
+/**
+ * Emit the real rc.3 announcement order: label first, `name` only later.
+ *
+ * The child's own `subagent/descriptor` carries no name (rc.3), and the bridge
+ * opens the child as soon as that descriptor supplies a label. The name lives in
+ * the **parent's** `subagent/catalog` v3 fact, which reaches the plugin a few
+ * milliseconds later — after the announcement the host has already made sticky.
+ * `session.opened` therefore has to wait for it (bounded).
+ */
+async function emitCatalogLate() {
+  const child = "child-NC";
+  notify("session.child-opened", { sessionId: child, parentSessionId: rootId, mode: "continuable", label: "Catalog Late NC", cwd: "/tmp" });
+  notify("session.event", { sessionId: child, event: { type: "turn/start", seq: 1, data: { turn: 1 } } });
+  notify("session.event", { sessionId: child, event: { type: "assistant/message", seq: 2, data: { turn: 1, step: 1, message: { id: "nc1", content: [{ type: "text", text: "catalog-late child answer" }] } } } });
+  notify("session.event", {
+    sessionId: rootId,
+    event: {
+      type: "subagent/catalog",
+      seq: 3,
+      data: { version: 3, childId: child, childCreatedAt: Date.now(), mode: "continuable", label: "Catalog Late NC", name: "catalog-late-name" },
+    },
+  });
+  notify("session.event", { sessionId: child, event: { type: "turn/end", seq: 4, data: { turn: 1, reason: { kind: "completed" } } } });
+  notify("session.status", { sessionId: child, status: "idle" });
+}
+
+/**
+ * Emit the rc.1 shape: no naming capability, no name ever.
+ *
+ * The v2 catalog fact and the root frame behind it exist only to give the check
+ * an ordering reference: a plugin that waited for a name here would open the
+ * child *after* that root frame.
+ */
+async function emitCatalogAbsent() {
+  notify("session.child-opened", { sessionId: "child-NR", parentSessionId: rootId, mode: "continuable", label: "Catalog Absent NR", cwd: "/tmp" });
+  notify("session.event", {
+    sessionId: rootId,
+    event: { type: "subagent/catalog", seq: 1, data: { version: 2, childId: "child-NR", childCreatedAt: Date.now(), mode: "continuable", label: "Catalog Absent NR" } },
+  });
+  notify("session.event", { sessionId: "child-NR", event: { type: "assistant/message", seq: 2, data: { turn: 1, step: 1, message: { id: "nr1", content: [{ type: "text", text: "catalog-absent child answer" }] } } } });
+  notify("session.event", { sessionId: "child-NR", event: { type: "turn/end", seq: 3, data: { turn: 1, reason: { kind: "completed" } } } });
+  notify("session.status", { sessionId: "child-NR", status: "idle" });
+  notify("session.event", { sessionId: rootId, event: { type: "assistant/message", seq: 4, data: { turn: 1, step: 1, message: { id: "root-nr", content: [{ type: "text", text: "root frame after catalogue" }] } } } });
+}
+
+async function emitNameOnly() {
+  notify("session.child-opened", { sessionId: "child-NL", parentSessionId: rootId, mode: "continuable", name: "no-label-child", cwd: "/tmp" });
+  for (let index = 0; index < 41; index += 1) {
+    notify("session.event", { sessionId: "child-NL", event: { type: "assistant/message", seq: index + 1, data: { turn: 1, step: 1, message: { id: `nl-${String(index)}`, content: [{ type: "text", text: `no-label line ${String(index)}` }] } } } });
+  }
+  notify("session.status", { sessionId: "child-NL", status: "running" });
+  notify("session.event", { sessionId: "child-NL", event: { type: "turn/end", seq: 99, data: { turn: 1, reason: { kind: "completed" } } } });
+  notify("session.status", { sessionId: "child-NL", status: "idle" });
+  notify("session.child-opened", { sessionId: "child-ND", parentSessionId: rootId, mode: "continuable", label: "same-name", name: "same-name", cwd: "/tmp" });
+  notify("session.event", { sessionId: "child-ND", event: { type: "assistant/message", seq: 1, data: { turn: 1, step: 1, message: { id: "nd1", content: [{ type: "text", text: "same-name child answer" }] } } } });
+  notify("session.event", { sessionId: "child-ND", event: { type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "completed" } } } });
+  notify("session.status", { sessionId: "child-ND", status: "idle" });
 }
 
 /**
@@ -1029,7 +1295,14 @@ async function handle(method, params, id) {
       // Recording the id here is what makes `prompt`'s gate real; the *absence*
       // of one is the plugin bug this stand-in exists to catch.
       if (requested !== null) initializedSessions.add(requested);
-      return { serverInfo: { name: "fake-dsh-bridge", version: "0" }, route: { provider: "fake", model: "fake", reasoningEffort: null } };
+      return {
+        serverInfo: {
+          name: "fake-dsh-bridge",
+          version: "0",
+          ...(namesAdvertised() ? { subagentNames: true } : {}),
+        },
+        route: { provider: "fake", model: "fake", reasoningEffort: null },
+      };
     case "paseo/catalog":
       // The real catalog also reports the profile's configured default route
       // (`server.js` `catalog()`), which the plugin reads for the composer's
@@ -1281,7 +1554,13 @@ async function handle(method, params, id) {
       }
       return { kind: "success", text: "Withdrawn seq 3 and everything after it" };
     }
-    case "paseo/subagents":
+    case "paseo/subagents": {
+      const scriptedSubagents = subagentsScript();
+      if (scriptedSubagents !== undefined) {
+        if (scriptedSubagents.unknownMethod === true) throw new Error("unknown paseo bridge method: paseo/subagents");
+        if (typeof scriptedSubagents.throw === "string") throw new Error(scriptedSubagents.throw);
+        return scriptedSubagents;
+      }
       if (mode() === "error") return { available: false, subagents: [], error: { message: "subagent catalog exploded" } };
       if (mode() === "replay-hang") {
         // One child whose log read is parked below: the open must keep its own
@@ -1318,10 +1597,16 @@ async function handle(method, params, id) {
       return {
         available: true,
         subagents: [
-          { sessionId: "child-A", parentSessionId: String(params?.sessionId ?? ""), mode: "continuable", label: "Research A" },
+          // `name`/`path` are DSH 0.2.2-rc.2+'s (`SubagentDescendantListEntry`):
+          // child-A is named at the root, so child-B's path is available; child-M
+          // deliberately omits both — the historical/rc.1 row a reopen still has
+          // to show exactly as before (label title, no description); child-K
+          // carries a name but no path (its parent is the root, so a path would
+          // normally exist — omitted here on purpose to pin description = name).
+          { sessionId: "child-A", parentSessionId: String(params?.sessionId ?? ""), mode: "continuable", label: "Research A", name: "research-a", path: "research-a" },
           // A one-shot child has no label in the catalog (DSH only requires one
           // for a continuable child); its label lives in its own descriptor.
-          { sessionId: "child-B", parentSessionId: "child-A", mode: "one-shot" },
+          { sessionId: "child-B", parentSessionId: "child-A", mode: "one-shot", name: "nested-b", path: "research-a/nested-b" },
           // Archived in DSH's own registry: it must not be announced again, or
           // "archive all" would be undone by the next replay.
           { sessionId: "child-Z", parentSessionId: "child-A", mode: "one-shot", archived: true },
@@ -1332,9 +1617,10 @@ async function handle(method, params, id) {
           // Killed mid-turn: in the durable catalog only, its log stops with no
           // terminal. Nothing live vouches for it, so it must not be announced
           // as running.
-          { sessionId: "child-K", parentSessionId: String(params?.sessionId ?? ""), mode: "continuable", label: "Killed K" },
+          { sessionId: "child-K", parentSessionId: String(params?.sessionId ?? ""), mode: "continuable", label: "Killed K", name: "killed-k" },
         ],
       };
+    }
     case "paseo/history": {
       const sid = String(params?.sessionId ?? "");
       // A wedged bridge: park this child's log read until the test releases it.
@@ -1493,6 +1779,38 @@ async function handle(method, params, id) {
       if (mode() === "nested" && !state.emitted) {
         state.emitted = true;
         setTimeout(() => { void emitNested(); }, 30);
+      }
+      if (mode() === "name-missing" && !state.emitted) {
+        state.emitted = true;
+        setTimeout(() => { void emitNameMissing(); }, 30);
+      }
+      if (mode() === "catalog-tree" && !state.emitted) {
+        state.emitted = true;
+        setTimeout(() => { void emitCatalogTree(false); }, 30);
+      }
+      if (mode() === "catalog-tree-early" && !state.emitted) {
+        state.emitted = true;
+        setTimeout(() => { void emitCatalogTree(true); }, 30);
+      }
+      if (mode() === "name-bound-gated" && !state.emitted) {
+        state.emitted = true;
+        setTimeout(() => { void emitNameBoundGated(); }, 30);
+      }
+      if (mode() === "catalog-none" && !state.emitted) {
+        state.emitted = true;
+        setTimeout(() => { void emitCatalogNone(); }, 30);
+      }
+      if (mode() === "catalog-late" && !state.emitted) {
+        state.emitted = true;
+        setTimeout(() => { void emitCatalogLate(); }, 30);
+      }
+      if (mode() === "catalog-absent" && !state.emitted) {
+        state.emitted = true;
+        setTimeout(() => { void emitCatalogAbsent(); }, 30);
+      }
+      if (mode() === "name-only" && !state.emitted) {
+        state.emitted = true;
+        setTimeout(() => { void emitNameOnly(); }, 30);
       }
       if (mode() === "stream" && !state.emitted) {
         state.emitted = true;

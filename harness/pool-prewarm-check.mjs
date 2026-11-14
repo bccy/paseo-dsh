@@ -2,7 +2,7 @@
  * The pool prewarm: the shared `dsh` child is started when the provider connects,
  * kept resident for the connection's life, and reused by the first session open.
  *
- * Why this exists (FIELD-NOTES 92). The shared child's cold boot is the largest
+ * Why this exists (FIELD-NOTES 100). The shared child's cold boot is the largest
  * cost on the first open of a connection — measured on the real profile at
  * **+8.4 s** to `listening` and **+23.2 s** to serving. Every open that arrives
  * inside that window queues behind it: the user's click, the first batch of ~20
@@ -35,6 +35,13 @@
  *      spawn, one stderr line. Reading a cold catalog would boot the whole
  *      profile a second time — the cost the prewarm exists to remove — and would
  *      also break every check that counts bridge processes.
+ *   j) the prewarmed child is a **cold start** for the first session and joined
+ *      only afterwards (FIELD-NOTES 106): `child-K` — a log that stops inside a
+ *      turn — is settled `canceled` on the first open after a completed prewarm
+ *      and on an open that joined its in-flight spawn, while a second session on
+ *      the same connection keeps it running. The assertions read the flag's only
+ *      consumer (a replay's adoption decision); the provider gains no test-only
+ *      accessor.
  *
  * Uses the scripted fake `dsh` (`harness/fake-dsh-bridge.mjs`, `live` mode) and a
  * throwaway `DSH_HOME`, so no profile, model, or daemon is touched.
@@ -577,6 +584,98 @@ console.log("\na first session with a non-identity env key retires the unused pr
 }
 
 // ---------------------------------------------------------------------------
+// b4) the prewarmed child is a **cold start** for the first session and only
+// then a process that has served conversations (FIELD-NOTES 106).
+//
+// `reused` is the provider's classification of that difference, and its single
+// consumer is a replay's decision to treat a native child's open turn as still
+// live (`DshSession#joinedLiveProcess`). That consumer is therefore what the
+// assertions read: the fake bridge's `replay` mode carries `child-K`, whose log
+// stops inside a turn with no terminal — exactly the shape a subagent killed by
+// a restart leaves. A cold start settles it `canceled`; a joined process, which
+// never stopped running it, must keep it running.
+//
+// No test-only accessor for the flag is added to the provider: the visible half
+// is the whole point, and an accessor would be production code existing only for
+// this script.
+console.log("\nthe prewarmed child is cold for its first session and joined for the next");
+{
+  // The fake bridge reads its scenario at start, so the child this connection's
+  // prewarm spawns is the one that carries the replay fixture.
+  process.env.DSH_FAKE_MODE = "replay";
+  const spawnMark = spawns().length;
+  const stderrMark = stderrChunks.length;
+  // `session.subsession` is what makes the plugin replay native children at all;
+  // without it the whole section would pass by never constructing the fixture.
+  const classified = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+  const classifiedEvents = [];
+  classified.onEvent((event) => classifiedEvents.push(event));
+  let classifiedPid;
+  let prewarmed = false;
+  try {
+    await waitFor(() => spawns().length > spawnMark, 10000, "the classified connection's prewarm spawn");
+    classifiedPid = spawns().at(-1)?.pid;
+    await waitForPrewarmLog(classifiedPid, stderrMark);
+    prewarmed = true;
+  } catch {
+    /* reported by the assertions below */
+  }
+  check("the classified connection prewarmed a child", prewarmed, `pid ${String(classifiedPid)}`);
+
+  const coldId = "prewarm-cold";
+  const coldChildK = `${coldId}:sub:child-K`;
+  const first = await openSession(classified, classifiedEvents, coldId);
+  check("…and its first session opened", first.ready === true, first.ready ? "ready" : (first.error ?? "no error"));
+  await sleep(500);
+  const coldTurns = classifiedEvents.filter((event) => event.type === "session.turn" && event.sessionId === coldChildK);
+  const coldTool = classifiedEvents.filter(
+    (event) => event.type === "timeline.item" && event.sessionId === coldChildK && event.item?.callId === "ck-1",
+  );
+  check(
+    "the first open after a completed prewarm is a cold start (reused === false): the killed child's open turn is settled canceled",
+    coldTurns.some((event) => event.state === "canceled") && !coldTurns.some((event) => event.state === "started"),
+    `turns=${JSON.stringify(coldTurns.map((event) => event.state))}`,
+  );
+  check(
+    "…and its in-flight tool row is settled canceled (it would otherwise pulse forever)",
+    coldTool.length > 0 && coldTool.at(-1)?.item?.status === "canceled",
+    JSON.stringify(coldTool.map((event) => event.item?.status)),
+  );
+  check(
+    "…on the prewarmed process itself (no second spawn)",
+    classifiedPid !== undefined
+      && vias("initialize", coldId).includes(classifiedPid)
+      && spawns().length === spawnMark + 1,
+    `initialize pids ${vias("initialize", coldId).join(",") || "(none)"}, `
+      + `${String(spawns().length - spawnMark - 1)} extra spawn(s)`,
+  );
+
+  // The counter-case, on the same connection: the child now *has* served a
+  // session, so the next open is an adoption and its open turn is real.
+  const warmId = "prewarm-warm";
+  const warmChildK = `${warmId}:sub:child-K`;
+  const second = await openSession(classified, classifiedEvents, warmId);
+  check("the second session on that connection opened", second.ready === true, second.ready ? "ready" : (second.error ?? "no error"));
+  await sleep(500);
+  const warmTurns = classifiedEvents.filter((event) => event.type === "session.turn" && event.sessionId === warmChildK);
+  const warmTool = classifiedEvents.filter(
+    (event) => event.type === "timeline.item" && event.sessionId === warmChildK && event.item?.callId === "ck-1",
+  );
+  check(
+    "the next open on the same connection is an adoption (reused === true): that child's open turn is kept running",
+    warmTurns.length === 0,
+    JSON.stringify(warmTurns.map((event) => event.state)),
+  );
+  check(
+    "…and its tool row is left running, the same log shape judged the other way",
+    warmTool.length > 0 && warmTool.at(-1)?.item?.status === "running",
+    JSON.stringify(warmTool.map((event) => event.item?.status)),
+  );
+  await classified.close();
+  process.env.DSH_FAKE_MODE = "live";
+}
+
+// ---------------------------------------------------------------------------
 // b) an open that races the prewarm's in-flight spawn joins it.
 console.log("\nan open that races the prewarm's spawn joins it instead of spawning");
 await conn.close();
@@ -588,8 +687,11 @@ await conn.close();
   process.env.DSH_FAKE_HOLD_METHOD = "initialize";
   process.env.DSH_FAKE_HOLD_READY = holdReady;
   process.env.DSH_FAKE_HOLD_RELEASE = holdRelease;
+  // The replay fixture: its killed child is what tells "joined a process that was
+  // serving" apart from "joined the prewarm's own in-flight spawn".
+  process.env.DSH_FAKE_MODE = "replay";
 
-  const racing = await registration.connect({ capabilities: ["prompt.message"] });
+  const racing = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
   const racingEvents = [];
   racing.onEvent((event) => racingEvents.push(event));
 
@@ -621,7 +723,24 @@ await conn.close();
     spawns().length === spawnCount,
     `${String(spawns().length - spawnCount)} extra spawn(s) after the release`,
   );
+  await sleep(500);
+  const racingChildK = "prewarm-racing:sub:child-K";
+  const racingTurns = racingEvents.filter((event) => event.type === "session.turn" && event.sessionId === racingChildK);
+  const racingTool = racingEvents.filter(
+    (event) => event.type === "timeline.item" && event.sessionId === racingChildK && event.item?.callId === "ck-1",
+  );
+  check(
+    "an open that joined the prewarm's in-flight spawn is a cold start too (reused === false): the killed child is settled canceled",
+    racingTurns.some((event) => event.state === "canceled") && !racingTurns.some((event) => event.state === "started"),
+    `turns=${JSON.stringify(racingTurns.map((event) => event.state))}`,
+  );
+  check(
+    "…and its tool row is settled canceled",
+    racingTool.length > 0 && racingTool.at(-1)?.item?.status === "canceled",
+    JSON.stringify(racingTool.map((event) => event.item?.status)),
+  );
   await racing.close();
+  process.env.DSH_FAKE_MODE = "live";
   delete process.env.DSH_FAKE_HOLD_METHOD;
   delete process.env.DSH_FAKE_HOLD_READY;
   delete process.env.DSH_FAKE_HOLD_RELEASE;

@@ -20,6 +20,20 @@
  *      teammate this process never saw gets **no** `running` key.
  *   5. **DSH's fields arrive untouched**: ownerName, ready, blockedBy,
  *      writeScopes, writeScopeWarnings, failure, a member's error.
+ *   6. **The rc.3 generation (`dsh-agent-team`)**: `{enabled, tasks}` parses too; its
+ *      roster costs a `paseo/subagents` read (the bridge lists every stored
+ *      session header), so the read is **gated on a drawable board** — no read
+ *      for `enabled: false` or an empty task list, exactly one for a visible
+ *      board, and none when `tasks` is malformed (the union reports the shape);
+ *      its roster is the Lead's **continuable direct children** from
+ *      `paseo/subagents` (one-shot and grandchild rows excluded, a row without
+ *      `name` falling back to its session id, no invented `phase`), `running`
+ *      overlays the ones this process hosts, and `enabled: false` is a real
+ *      answer (not an error). A failed catalog read is a transient
+ *      `rpc_failed`, never an empty roster.
+ *   7. **A hybrid shape is neither generation**: `{members, enabled, tasks}` is
+ *      `rpc_failed`. The two wire shapes are a strict union, not a loosened
+ *      object.
  *
  * Compile the plugin first (type errors under `--moduleResolution node` are
  * expected; the emitted JS is what runs):
@@ -51,9 +65,16 @@ const FRAME_LOG = path.join(process.env.DSH_HOME, "frames.jsonl");
 process.env.DSH_FAKE_LOG = FRAME_LOG;
 const PROJECTIONS_FILE = path.join(process.env.DSH_HOME, "projections.json");
 process.env.DSH_FAKE_PROJECTIONS_FILE = PROJECTIONS_FILE;
+const SUBAGENTS_FILE = path.join(process.env.DSH_HOME, "subagents.json");
+process.env.DSH_FAKE_SUBAGENTS_FILE = SUBAGENTS_FILE;
 function script(value) {
   if (value === undefined) fs.rmSync(PROJECTIONS_FILE, { force: true });
   else fs.writeFileSync(PROJECTIONS_FILE, JSON.stringify(value));
+}
+/** The scripted `paseo/subagents` answer; `undefined` clears it. */
+function catalog(value) {
+  if (value === undefined) fs.rmSync(SUBAGENTS_FILE, { force: true });
+  else fs.writeFileSync(SUBAGENTS_FILE, JSON.stringify(value));
 }
 process.on("exit", () => {
   try {
@@ -90,14 +111,21 @@ async function until(predicate, label, ms = 30000) {
   throw new Error(`timed out waiting for ${label}`);
 }
 
-function projectionFrames() {
+function framesOf(method) {
   if (!fs.existsSync(FRAME_LOG)) return [];
   return fs
     .readFileSync(FRAME_LOG, "utf8")
     .split("\n")
     .filter((line) => line.trim() !== "")
     .map((line) => JSON.parse(line))
-    .filter((frame) => frame.method === "paseo/projections");
+    .filter((frame) => frame.method === method);
+}
+function projectionFrames() {
+  return framesOf("paseo/projections");
+}
+/** Every `paseo/subagents` request the plugin sent, for the read-gate checks. */
+function subagentFrames() {
+  return framesOf("paseo/subagents");
 }
 
 let passed = 0;
@@ -214,6 +242,20 @@ function bridgeUnknownKeyPrefix() {
   script({ throw: "unknown or unavailable projection key: agentTeam" });
   const noBundle = await read(agentId);
   check("no agent-team bundle → terminal team_unavailable (not 'no team')", noBundle.available === false && noBundle.error?.code === "team_unavailable" && noBundle.team === null, JSON.stringify(noBundle));
+  // The third case, and the one the user's real rc.3 profile hits: the
+  // `agent-team` **service failed to load** (rc.3 rejects the old profile's
+  // `maxMembers` with TEAM_INVALID_CONFIG, so the projection is never
+  // registered). The bridge answers the same unknown-key sentence as a profile
+  // with no bundle at all, so the grading must stay the terminal
+  // `team_unavailable` — a transient `rpc_failed` would make the pill retry a
+  // condition that cannot change until the profile is fixed.
+  const absentProjection = await read(agentId);
+  check(
+    "a failed agent-team service (projection absent) is the same terminal team_unavailable",
+    absentProjection.available === false && absentProjection.error?.code === "team_unavailable"
+      && absentProjection.team === null,
+    JSON.stringify(absentProjection),
+  );
   script({ throw: `unknown or not-yet-created session: ${rootId}` });
   const missing = await read(agentId);
   check("an unknown session → transient session_missing", missing.available === false && missing.error?.code === "session_missing", JSON.stringify(missing));
@@ -253,6 +295,150 @@ function bridgeUnknownKeyPrefix() {
   check("a hosted teammate whose turn ended is running: false", liveMembers.reviewer?.running === false, JSON.stringify(liveMembers.reviewer));
   check("a teammate this process does not host still carries no running key", liveMembers.elsewhere !== undefined && !("running" in liveMembers.elsewhere), JSON.stringify(liveMembers.elsewhere));
   check("a failed member is not given a running state it cannot have", !("running" in (liveMembers.broken ?? {})), JSON.stringify(liveMembers.broken));
+
+  console.log("\nthe rc.3 generation: enabled plus a subagent-catalog roster");
+  // The rc.3 wire view has no roster (`dsh-agent-team`'s projection defers to
+  // `subagentCatalog`); the plugin derives it from the Lead's continuable direct
+  // children and overlays the running state of the ones it hosts.
+  const rc3Board = (enabled) => ({
+    enabled,
+    tasks: board(rootId).tasks,
+  });
+  catalog({
+    available: true,
+    subagents: [
+      { sessionId: "team-child-R", parentSessionId: rootId, mode: "continuable", label: "Running R", name: "fixer" },
+      { sessionId: "team-child-I", parentSessionId: rootId, mode: "continuable", label: "Idle I", name: "reviewer" },
+      { sessionId: "team-child-X", parentSessionId: rootId, mode: "continuable", label: "Elsewhere X", name: "elsewhere" },
+      { sessionId: "team-child-O", parentSessionId: rootId, mode: "one-shot", label: "One shot" },
+      { sessionId: "team-child-N", parentSessionId: rootId, mode: "continuable", label: "Unnamed" },
+      { sessionId: "team-child-G", parentSessionId: "team-child-R", mode: "continuable", label: "Grand", name: "grand" },
+    ],
+  });
+  script(sequenced(rc3Board(true)));
+  const rc3 = await read(agentId);
+  check("the rc.3 shape is available with enabled: true", rc3.available === true && rc3.team?.enabled === true, JSON.stringify(rc3).slice(0, 300));
+  const rc3Members = Object.fromEntries((rc3.team?.members ?? []).map((m) => [m.name, m]));
+  check(
+    "the roster is the Lead's continuable direct children (one-shot and grandchild excluded)",
+    Object.keys(rc3Members).sort().join(",") === ["elsewhere", "fixer", "reviewer", "team-child-N"].sort().join(","),
+    JSON.stringify(Object.keys(rc3Members)),
+  );
+  check("a catalog row without a name falls back to its session id", rc3Members["team-child-N"]?.role === "teammate", JSON.stringify(rc3Members["team-child-N"]));
+  check("…and keeps DSH's creation label as its description", rc3Members["team-child-N"]?.description === "Unnamed", JSON.stringify(rc3Members["team-child-N"]));
+  check("no phase is invented for a current subagent", Object.values(rc3Members).every((m) => !("phase" in m)), JSON.stringify(Object.values(rc3Members)));
+  check("a hosted teammate mid-turn is running: true", rc3Members.fixer?.running === true, JSON.stringify(rc3Members.fixer));
+  check("a hosted teammate whose turn ended is running: false", rc3Members.reviewer?.running === false, JSON.stringify(rc3Members.reviewer));
+  check("a teammate this process does not host carries no running key", rc3Members.elsewhere !== undefined && !("running" in rc3Members.elsewhere), JSON.stringify(rc3Members.elsewhere));
+  check(
+    "the task board still arrives verbatim",
+    rc3.team?.tasks?.length === 2 && rc3.team.tasks[0].writeScopeWarnings.length === 0,
+    JSON.stringify(rc3.team?.tasks),
+  );
+
+  script(sequenced(rc3Board(false)));
+  const disabled = await read(agentId);
+  check(
+    "enabled: false is a real answer; the roster is left empty because nothing is drawn",
+    disabled.available === true && disabled.team?.enabled === false && (disabled.team?.members?.length ?? 0) === 0
+      && disabled.error === undefined,
+    JSON.stringify(disabled).slice(0, 300),
+  );
+
+  // A visible board is the only case that reads the catalog, so put one back
+  // before testing how a failed read is graded.
+  script(sequenced(rc3Board(true)));
+  catalog({ available: false, error: { message: "subagent catalog exploded" } });
+  const noCatalog = await read(agentId);
+  check(
+    "a failed catalog read is rpc_failed, never an empty roster",
+    noCatalog.available === false && noCatalog.error?.code === "rpc_failed" && noCatalog.team === null
+      && /subagent catalog exploded/.test(noCatalog.error?.message ?? ""),
+    JSON.stringify(noCatalog),
+  );
+  catalog({ throw: "catalog transport exploded" });
+  const thrownCatalog = await read(agentId);
+  check(
+    "a throwing catalog read is rpc_failed with its words",
+    thrownCatalog.available === false && thrownCatalog.error?.code === "rpc_failed"
+      && /catalog transport exploded/.test(thrownCatalog.error?.message ?? ""),
+    JSON.stringify(thrownCatalog),
+  );
+  catalog(undefined);
+  script(sequenced({ members: [{ id: rootId, name: "lead", role: "lead", phase: "active" }], enabled: true, tasks: [] }));
+  const hybrid = await read(agentId);
+  check(
+    "a hybrid {members, enabled} is neither generation",
+    hybrid.available === false && hybrid.error?.code === "rpc_failed" && /expected shape/.test(hybrid.error?.message ?? ""),
+    JSON.stringify(hybrid),
+  );
+  script(sequenced({ tasks: [] }));
+  const noMarker = await read(agentId);
+  check(
+    "a projection with neither marker is rpc_failed too",
+    noMarker.available === false && noMarker.error?.code === "rpc_failed",
+    JSON.stringify(noMarker),
+  );
+
+  console.log("\nthe catalog read is gated on a drawable board");
+  // A throwing catalog is the proof that no read happened: one call would turn
+  // the answer into a transient rpc_failed. The gate must not pay the bridge's
+  // `persistence.list()` (every stored session header) for a board nobody draws.
+  const forbiddenCatalog = { throw: "the subagent catalog must not be read for a hidden board" };
+  catalog(forbiddenCatalog);
+  script(sequenced(rc3Board(false)));
+  const gatedDisabled = await read(agentId);
+  check(
+    "enabled: false → no paseo/subagents read, empty roster",
+    gatedDisabled.available === true && gatedDisabled.team?.enabled === false
+      && Array.isArray(gatedDisabled.team?.members) && gatedDisabled.team.members.length === 0
+      && gatedDisabled.error === undefined,
+    JSON.stringify(gatedDisabled).slice(0, 300),
+  );
+  script(sequenced({ enabled: true, tasks: [] }));
+  const gatedEmpty = await read(agentId);
+  check(
+    "enabled: true with no task → no read, empty roster",
+    gatedEmpty.available === true && gatedEmpty.team?.enabled === true
+      && Array.isArray(gatedEmpty.team?.members) && gatedEmpty.team.members.length === 0
+      && gatedEmpty.error === undefined,
+    JSON.stringify(gatedEmpty).slice(0, 300),
+  );
+  // Drawable: exactly one read, and the roster is built from it.
+  catalog({
+    available: true,
+    subagents: [
+      { sessionId: "team-child-R", parentSessionId: rootId, mode: "continuable", label: "Running R", name: "fixer" },
+      { sessionId: "team-child-I", parentSessionId: rootId, mode: "continuable", label: "Idle I", name: "reviewer" },
+    ],
+  });
+  script(sequenced(rc3Board(true)));
+  const readsBefore = subagentFrames().length;
+  const gatedVisible = await read(agentId);
+  const readsAfter = subagentFrames().length;
+  check(
+    "enabled: true with tasks → exactly one paseo/subagents read",
+    readsAfter - readsBefore === 1,
+    `${String(readsBefore)} → ${String(readsAfter)}`,
+  );
+  check(
+    "…and the board's roster comes from it",
+    gatedVisible.available === true && (gatedVisible.team?.members?.length ?? 0) === 2,
+    JSON.stringify(gatedVisible).slice(0, 300),
+  );
+  // A malformed `tasks` is not drawable either: no read, and the provider's
+  // union is what reports the shape failure (not the catalog).
+  catalog(forbiddenCatalog);
+  script(sequenced({ enabled: true, tasks: "not-an-array" }));
+  const malformedTasks = await read(agentId);
+  check(
+    "a malformed tasks field → no read and the projection's shape error",
+    malformedTasks.available === false && malformedTasks.error?.code === "rpc_failed"
+      && /expected shape/.test(malformedTasks.error?.message ?? "")
+      && !/must not be read/.test(malformedTasks.error?.message ?? ""),
+    JSON.stringify(malformedTasks).slice(0, 300),
+  );
+  catalog(undefined);
 
   console.log(`\n${passed}/${passed + failed} checks passed`);
   process.exit(failed === 0 ? 0 : 1);

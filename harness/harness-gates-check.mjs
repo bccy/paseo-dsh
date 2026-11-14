@@ -21,6 +21,13 @@
  *   T04  the image check accepted `IMAGE-SEEN` text demanded by the prompt.
  *        The image block shows the old text predicate passing with zero image
  *        blocks, while the structural prompt-frame predicate rejects it.
+ *   T05  rewind-e2e took `.at(-1)` over every assistant message in the whole
+ *        stream, so a turn that emitted only tool calls inherited the previous
+ *        turn's text as its answer, and an empty answer read as "no longer knows
+ *        BETA". The block shows the old whole-stream picker returning a stale
+ *        answer on the same events while the turn-scoped predicate returns an
+ *        empty one (which the probe now fails on), and pins the `plugin:*`
+ *        injection reader used against the memory-plugin known gap.
  *   HP-08 session-calls passed with `no schema` calls. The block builds real
  *        zstd session logs (one without `request/header`, one clean, one with an
  *        undeclared key) and asserts exit 2 / 0 / 1 respectively.
@@ -28,6 +35,9 @@
  *        beside the profiles (`$DSH_HOME/profiles/node_modules/dsh-paseo-bridge`)
  *        as a real copy, so a `dsh --profile` boot on the clone still composes
  *        the bridge layer; a source without the anchor keeps the old behaviour.
+ *        It also sandboxes a pinned listener port and the memory data directory,
+ *        and can switch requested profile **rows** off in the clone (`disable`,
+ *        by row id) — never in the source, and never on the real home.
  *        The composition half (real `dsh --dump-config`) is
  *        harness/isolated-home-bridge-check.mjs.
  *
@@ -43,7 +53,7 @@ import { zstdCompressSync } from 'node:zlib';
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
-const { assistantFragmentation, classifyRouteOutcome, contentBlocksIncludeImage, projectTimelineLikePaseo, routeExitCode, timelineItemsWithTurns } = require('./harness-gates.cjs');
+const { assistantFragmentation, classifyRouteOutcome, contentBlocksIncludeImage, lastTurnAnswer, pluginInjectedUserTexts, projectTimelineLikePaseo, routeExitCode, timelineItemsWithTurns } = require('./harness-gates.cjs');
 
 const results = [];
 const check = (name, pass, detail) => {
@@ -330,6 +340,104 @@ check(
   contentBlocksIncludeImage([{ type: 'text', text: 'describe' }, { type: 'image', data: png, mimeType: 'image/png' }], png, 'image/png') === true,
 );
 
+// --------------------------------------------------------------- T05: rewind answer
+
+console.log('\nT05 rewind third-turn answer and plugin injections');
+// `rewind-e2e` used to take `.at(-1)` over every assistant message in the
+// stream. That is not scoped to a turn (a turn that only calls tools inherits
+// the previous turn's text as its "answer") and an empty answer then read as
+// "the model no longer knows BETA" — the fake green a real run hit when the
+// reader was mis-indexed. The predicate below is the one the probe uses.
+const sessionEvents = [
+  { type: 'turn/start' },
+  { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '记住 ALPHA' }] } },
+  { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '记住了' }] } } },
+  { type: 'turn/end' },
+  { type: 'turn/start' },
+  { type: 'user/message', data: { source: { kind: 'plugin:memory' }, content: [{ type: 'text', text: '暗号是 BETA（ALPHA 已作废）' }] } },
+  { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '换成 BETA' }] } },
+  { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '好' }] } } },
+  { type: 'turn/end' },
+  { type: 'turn/start' },
+  { type: 'assistant/message', data: { message: { content: [] } } },
+  {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'reasoning', text: '想想' }, { type: 'text', text: 'ALPHA' }] } },
+  },
+  { type: 'turn/end' },
+];
+// The old predicate, reproduced exactly: every assistant text in the stream,
+// last one wins.
+const legacyAnswer = (events) =>
+  events
+    .filter((event) => event.type === 'assistant/message')
+    .map((event) =>
+      (event.data?.message?.content ?? [])
+        .filter((block) => block.type === 'text')
+        .map((block) => block.text)
+        .join(''),
+    )
+    .at(-1) ?? '';
+check(
+  'the answer is the last turn\'s assistant text (empty snapshots and reasoning ignored)',
+  lastTurnAnswer(sessionEvents) === 'ALPHA',
+  JSON.stringify(lastTurnAnswer(sessionEvents)),
+);
+check(
+  '…and text from earlier turns, including the withdrawn one, never becomes the answer',
+  lastTurnAnswer(sessionEvents).includes('BETA') === false &&
+    lastTurnAnswer(sessionEvents).includes('记住了') === false,
+  JSON.stringify(lastTurnAnswer(sessionEvents)),
+);
+
+const toolOnlyTurn = [
+  { type: 'turn/start' },
+  { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '好' }] } } },
+  { type: 'turn/end' },
+  { type: 'turn/start' },
+  { type: 'tool/call', data: { name: 'write' } },
+  { type: 'tool/result', data: {} },
+  { type: 'turn/end' },
+];
+check(
+  'a turn that emitted only tool calls has no answer (not the previous turn\'s text)',
+  lastTurnAnswer(toolOnlyTurn) === '',
+  JSON.stringify(lastTurnAnswer(toolOnlyTurn)),
+);
+check(
+  'old whole-stream picker is green on that same turn (regression witness)',
+  legacyAnswer(toolOnlyTurn) === '好',
+  `legacy answer=${JSON.stringify(legacyAnswer(toolOnlyTurn))}`,
+);
+check(
+  'no turn boundary at all yields an empty answer instead of the stream tail',
+  lastTurnAnswer([
+    { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'ALPHA' }] } } },
+  ]) === '',
+);
+check('a non-array stream yields an empty answer', lastTurnAnswer(undefined) === '');
+
+const injected = pluginInjectedUserTexts(sessionEvents);
+check(
+  'only plugin-sourced user/messages are reported as injections',
+  injected.length === 1 && injected[0].kind === 'plugin:memory' && injected[0].text.includes('BETA'),
+  JSON.stringify(injected.map((row) => row.kind)),
+);
+check(
+  'the human and runtime-context messages are not mistaken for injections',
+  injected.every((row) => row.kind !== 'user' && row.kind !== 'runtime-context'),
+);
+check(
+  'an injection row using the assistant message shape is still read (tolerant reader)',
+  pluginInjectedUserTexts([
+    { type: 'user/message', data: { source: { kind: 'plugin:memory' }, message: { content: [{ type: 'text', text: 'BETA' }] } } },
+  ])[0]?.text.includes('BETA') === true,
+);
+check('a surface without injections reports none', pluginInjectedUserTexts([
+  { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'ALPHA' }] } },
+  { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'ALPHA' }] } } },
+]).length === 0);
+
 // --------------------------------------------------------------- HP-08 session-calls
 
 console.log('\nHP-08 session-calls fail-closed');
@@ -555,6 +663,97 @@ check(
   `sandboxed=${JSON.stringify(freePort.sandboxed ?? null)} unchanged=${String(freePort.unchanged)}`,
 );
 
+// The clone can also switch whole profile rows off, by row id. That is how a
+// check whose verdict must not depend on a third-party plugin gets a clean
+// measurement (a memory/recall plugin surviving a rewind is the documented known
+// gap in docs/REWIND.md). Only requested rows are touched, an id with no row is
+// "nothing to disable" rather than a failure, and the source profile is never
+// written.
+const disableHome = mkdtempSync(join(scratch, "source-home-disable-"));
+mkdirSync(join(disableHome, "profiles", "paseo"), { recursive: true });
+const disablePatch = [
+  "- id: dsh-memory",
+  "  config:",
+  "    dataDir: /home/someone/.dsh/memory-paseo",
+  "- id: plan-mode",
+  "  disabled: false",
+  "- id: other-plugin",
+  "  disabled: true",
+  "- id: keep-config",
+  "  config:",
+  "    label: untouched",
+  "- insert:",
+  "    - id: nested-row",
+  "      name: some-package",
+  "",
+].join("\n");
+writeFileSync(join(disableHome, "profiles", "paseo", "cordis.patch.yml"), disablePatch);
+const disableProbe = `
+const helper = require(${JSON.stringify(isolateHelper)});
+const fs = require('node:fs');
+const path = require('node:path');
+const source = ${JSON.stringify(disableHome)};
+const before = fs.readFileSync(path.join(source, 'profiles', 'paseo', 'cordis.patch.yml'), 'utf8');
+const mode = helper.prepareDshHome({
+  script: 'probe',
+  profile: 'paseo',
+  argv: [],
+  env: { DSH_HOME_SOURCE: source },
+  disable: ['dsh-memory', 'keep-config', 'not-there'],
+});
+const cloned = fs.readFileSync(path.join(mode.home, 'profiles', 'paseo', 'cordis.patch.yml'), 'utf8');
+const result = {
+  disabled: mode.disabled,
+  absent: mode.absent,
+  memoryDisabled: /^- id: dsh-memory\\n  disabled: true\\n/m.test(cloned),
+  configKept: cloned.includes('- id: keep-config\\n  disabled: true\\n  config:\\n    label: untouched'),
+  othersUntouched:
+    cloned.includes('- id: plan-mode\\n  disabled: false\\n') &&
+    cloned.includes('- id: other-plugin\\n  disabled: true\\n') &&
+    cloned.includes('    - id: nested-row'),
+  sourceUnchanged: fs.readFileSync(path.join(source, 'profiles', 'paseo', 'cordis.patch.yml'), 'utf8') === before,
+};
+mode.cleanup();
+process.stdout.write(JSON.stringify(result));
+`;
+const disableRun = spawnSync(process.execPath, ["-e", disableProbe], {
+  env: isolationEnv,
+  encoding: "utf8",
+  timeout: 20000,
+});
+let disableClone;
+try {
+  disableClone = JSON.parse(disableRun.stdout ?? "{}");
+} catch {
+  disableClone = {};
+}
+check(
+  "a requested row id is switched off inside the clone",
+  disableClone.memoryDisabled === true &&
+    Array.isArray(disableClone.disabled) &&
+    disableClone.disabled.includes("dsh-memory"),
+  `disabled=${JSON.stringify(disableClone.disabled ?? null)}`,
+);
+check(
+  "…by adding `disabled: true` and leaving that row's own config in place",
+  disableClone.configKept === true &&
+    Array.isArray(disableClone.disabled) &&
+    disableClone.disabled.includes("keep-config"),
+);
+check(
+  "…while unrequested rows (false or already true) and nested list items are untouched",
+  disableClone.othersUntouched === true,
+);
+check(
+  "a requested id with no such row is reported, not failed",
+  Array.isArray(disableClone.absent) &&
+    disableClone.absent.length === 1 &&
+    disableClone.absent[0] === "not-there" &&
+    disableClone.disabled.length === 2,
+  `absent=${JSON.stringify(disableClone.absent ?? null)}`,
+);
+check("…and the source profile stays byte-identical", disableClone.sourceUnchanged === true);
+
 // The plugin provisions the bridge beside the profiles now (pnpm owns the
 // profile's own node_modules), so a profile-only clone would boot a profile DSH
 // composes without the bridge layer. The helper must copy that anchor too, as a
@@ -608,13 +807,25 @@ check('…and the source home is left untouched', bridgeClone.sourceBridgeIntact
 
 const allowRealProbe = `
 const helper = require(${JSON.stringify(isolateHelper)});
-const mode = helper.prepareDshHome({ script: 'probe', profile: 'paseo', argv: ['--allow-real-profile'], env: { DSH_HOME_SOURCE: ${JSON.stringify(sourceHome)} } });
-process.stdout.write(JSON.stringify({ mode: mode.mode, home: mode.home }));
+const mode = helper.prepareDshHome({ script: 'probe', profile: 'paseo', argv: ['--allow-real-profile'], env: { DSH_HOME_SOURCE: ${JSON.stringify(sourceHome)} }, disable: ['dsh-memory'] });
+process.stdout.write(JSON.stringify({ mode: mode.mode, home: mode.home, disabled: mode.disabled ?? null, disableRequested: mode.disableRequested }));
 `;
 const allowReal = spawnSync(process.execPath, ['-e', allowRealProbe], { env: isolationEnv, encoding: 'utf8', timeout: 20000 });
 check(
   '--allow-real-profile opts into the live home explicitly',
   JSON.parse(allowReal.stdout ?? '{}').mode === 'real',
+  allowReal.stdout,
+);
+check(
+  '…and never applies the disable list to it (the live home is not modified)',
+  (() => {
+    const parsed = JSON.parse(allowReal.stdout ?? '{}');
+    return (
+      parsed.disabled === null &&
+      Array.isArray(parsed.disableRequested) &&
+      parsed.disableRequested.includes('dsh-memory')
+    );
+  })(),
   allowReal.stdout,
 );
 

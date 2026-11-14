@@ -30,15 +30,42 @@
  *      file-restoring rewind runs inside. It is an instance method of a class DSH
  *      does not export, so only a real created agent can be checked (RW-02).
  *
+ * ## How the services are assembled
+ *
+ * DSH 0.2.2 moved the wiring of `dsh-agent` and `dsh-agent-loop` into the Cordis
+ * service init hook `[Service.init]` (factory registration in `dsh-agent-loop`;
+ * the turn-boundary projection handle in `dsh-agent`). That hook only runs when
+ * Cordis constructs the class as a plugin, so a plain `new AgentRegistry(ctx)` /
+ * `new AgentLoop(ctx, ...)` now builds a half-initialized service and the first
+ * `createSession` throws `no agent factory registered (load an agent-loop
+ * plugin)`. This check therefore loads both of them with `await ctx.plugin(...)`,
+ * which runs the init hook on 0.2.2 and the constructor path on 0.2.1 — the host
+ * (profile plugin) loads them the same way, so one assembly covers both lines.
+ * **Do not replace these with `new`**: it regresses to that half-initialized
+ * state. The plugin path also validates the config, which is why
+ * `maxParallelToolCalls` is the number 10 (the factory wraps it in a holder with
+ * `.get()`, the shape the consumer reads).
+ *
  * ## The hook choice this pins
  *
  * `setup` is awaited while the process already holds the session's write lease and
- * BEFORE the agent/session are published (`dsh-agent-loop/lib/index.js`
- * `setupAndPublish`: `await setup?.(...)` then `prepared.publish(...)`), so no
- * capture can have run and no other writer exists. That is why no extra factory
- * contract (`AgentSetupCommit.commit()`) is needed — and that contract's position
- * is not stable across DSH lines, so relying on it would be worse. Assertion 2 is
- * what would fail if someone moved the call after publication.
+ * BEFORE the agent is published (`dsh-agent-loop/lib/index.js` `setupAndPublish`:
+ * `await setup?.(...)` then `prepared.publish(...)`), so no capture can have run
+ * and no other writer exists. That is why no extra factory contract
+ * (`AgentSetupCommit.commit()`) is needed — and that contract's position is not
+ * stable across DSH lines, so relying on it would be worse. Assertion 2 is what
+ * would fail if someone moved the call after publication.
+ *
+ * **What "published" has to mean here changed on 0.2.2.** Upstream moved the
+ * session publication ahead of `setup` (0.2.1: `sessions.enter/announce` inside
+ * `publish()`, after setup; 0.2.2: before `setup?.(...)`), while the agent is
+ * still created, entered and announced after setup on both lines. So the session
+ * is already in the sessions store when `setup` runs on 0.2.2, and a "session not
+ * yet published" assertion would only be testing that upstream ordering. What
+ * closes the capture window is the *agent* publication (`agent/created` is where
+ * a capture can first run), which is still after setup — that is the assertion
+ * kept below. The session-table observation was dropped with it; a write-only
+ * record of it would be dead weight.
  *
  * Usage:
  *
@@ -197,8 +224,8 @@ class MemoryPersistence extends SessionPersistence {
 
 const ctx = new Context();
 new SessionStore(ctx);
-new AgentRegistry(ctx);
 new SessionProjectionRegistry(ctx);
+await ctx.plugin(AgentRegistry);
 ctx.provide('systemPrompt', {
   variable() { return () => {}; },
   tools() { return () => {}; },
@@ -214,7 +241,7 @@ ctx.provide('llm', new Proxy({}, {
 }));
 ctx.provide('tools', { register() { return () => {}; } });
 const persistence = new MemoryPersistence(ctx);
-new AgentLoop(ctx, { agents: [], maxParallelToolCalls: { get: () => 10 } });
+await ctx.plugin(AgentLoop, { agents: [], maxParallelToolCalls: 10 });
 
 const server = new PaseoHarnessServer(
   ctx,
@@ -234,7 +261,6 @@ realSnapshots.beginOwner = (sessionId) => {
   beginCalls.push({
     sessionId,
     published: ctx.agents.get(sessionId) !== undefined,
-    inSessionTable: ctx.sessions.get(sessionId) !== undefined,
   });
   realBegin(sessionId);
 };
@@ -286,8 +312,7 @@ try {
   pass('createSession calls beginOwner for the session it creates');
 
   assert.equal(beginCalls[0].published, false, 'beginOwner must run before the agent is published');
-  assert.equal(beginCalls[0].inSessionTable, false, 'beginOwner must run before the session is published');
-  pass('…before the agent and session are published (the capture window is closed at that point)');
+  pass('…before the agent is published (the capture window is closed at that point)');
 
   const firstCapture = captures.find((entry) => entry.sessionId === sessionId);
   assert.ok(firstCapture !== undefined, 'the publication observer must have captured');

@@ -559,6 +559,32 @@ function toolMetadata(
 }
 
 /**
+ * DSH's structured failure identity, copied from the `tool/result` event's
+ * `error` onto the row's `metadata`.
+ *
+ * `code` is a `HarnessError.code` the client may have words for
+ * (`APPROVAL_REJECTED`, `ABORTED`, …); `name` is the error class
+ * (`ApprovalError`, `ToolNotFoundError`, …) and is shown only in the expanded
+ * block; `reason` is DSH's raw user-facing detail, which the client uses only
+ * when the result text is empty (`message.content` never carries it). All three
+ * already ride on rc.1's `tool/result`; `metadata` is the plugin's free-form
+ * passthrough, so this adds no wire field.
+ *
+ * Empty values are omitted rather than sent as "": the client's "no identity"
+ * state is the missing key, the same convention `toolMetadata` uses.
+ */
+function toolFailureMetadata(error: Record<string, unknown>): Record<string, JsonValue> {
+  const code = stringField(error, "code");
+  const name = stringField(error, "name");
+  const reason = stringField(error, "reason");
+  return {
+    ...(code === undefined ? {} : { errorCode: code }),
+    ...(name === undefined ? {} : { errorName: name }),
+    ...(reason === undefined ? {} : { errorReason: reason }),
+  };
+}
+
+/**
  * The metadata for a tool-call row that has no arguments to read a description
  * from (a `/command` row) and no result meta yet. It carries the locale only:
  * the roster is white-listed to the team tool rows (`TEAM_ROSTER_TOOLS`), and a
@@ -1433,13 +1459,11 @@ export class TimelineBuilder {
             // user reads after the tool finishes, so it must carry it too.
             this.#toolTitles.get(callId),
           ),
-          // DSH's structured failure code (`HarnessError.code`, e.g.
-          // `GOAL_TOOL_AUTHORITY_REQUIRED`), carried beside the verbatim text so
-          // the client can say in words why a goal call was refused without
-          // parsing English. Only a failed row has one; the text stays the error.
-          ...(failed && isRecord(data.error) && typeof data.error.code === "string" && data.error.code !== ""
-            ? { errorCode: data.error.code }
-            : {}),
+          // DSH's structured failure identity (`HarnessError.code` /
+          // `.name` / `.reason`), carried beside the verbatim text so the client
+          // can say in words why a call failed without parsing English. Only a
+          // failed row has one, and the text stays the error.
+          ...(failed && isRecord(data.error) ? toolFailureMetadata(data.error) : {}),
         },
         ...(failed
           ? { status: "failed" as const, error: { message: output || "tool failed" } }
