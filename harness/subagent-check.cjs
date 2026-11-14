@@ -461,6 +461,68 @@ async function openSession(conn, sessionId, history) {
   await conn8.send({ type: "session.close", sessionId: rootZ });
   await conn8.close();
 
+  // ---- the measured rc.3 interleaving: the frames flush first, then the name -
+  // A real daemon log for the named child `smoke-probe` (2026-11-15) shows the
+  // child's descriptor announced, the bridge's buffered flush arriving as eight
+  // frames 9 ms later, and the parent's catalog fact (the only source of `name`)
+  // 3 ms after that. A frame count can never be the right bound against that
+  // shape: the flush is a batch whose size is whatever the bridge happened to
+  // hold, so any small count fires before the name. Only the catalog fact itself
+  // may release the notice.
+  const connA = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+  const connAEvents = [];
+  connA.onEvent((e) => connAEvents.push(e));
+  const rootNG = `subNG-${Date.now()}`;
+  setMode("catalog-after-flush");
+  await connA.send({ type: "session.open", sessionId: rootNG, config: { cwd: process.cwd(), mode: "build" }, history: "skip" });
+  await untilIn(connAEvents, (e) => e.type === "session.ready" && e.sessionId === rootNG, "rootNG ready", 30000);
+  const stderrA = [];
+  const originalStderrA = process.stderr.write;
+  process.stderr.write = (chunk, ...rest) => {
+    stderrA.push(String(chunk));
+    return originalStderrA.call(process.stderr, chunk, ...rest);
+  };
+  let flushChildA;
+  try {
+    await connA.send({ type: "session.prompt", sessionId: rootNG, prompt: { clientMessageId: "pNG", input: { type: "message", content: [{ type: "text", text: "go" }] } } });
+    flushChildA = await untilIn(connAEvents, (e) => e.type === "session.opened" && e.sessionId === scoped(rootNG, "child-NG"), "child-NG opened", 30000);
+    await untilIn(
+      connAEvents,
+      (e) => e.type === "timeline.item" && e.sessionId === scoped(rootNG, "child-NG") && e.item?.text === "flush line 9",
+      "the last of the flushed frames",
+      30000,
+    );
+  } finally {
+    process.stderr.write = originalStderrA;
+  }
+  check(
+    "a catalog fact arriving after the bridge's frame flush still titles the row with the name",
+    flushChildA.title === "catalog-flush-name" && flushChildA.description === "Catalog Flush NG",
+    JSON.stringify({ title: flushChildA.title, description: flushChildA.description }),
+  );
+  const boundLinesA = stderrA.filter(
+    (line) => line.includes("name wait is over") || /held \d+ frames with no catalog name/.test(line),
+  );
+  // Anti-regression only: the "held N frames ... the name wait is over" line is
+  // gone with the frame bound itself (see the constant's doc), so this assertion
+  // is vacuously true today — it exists so a re-introduced frame bound is caught.
+  check(
+    "and no frame-count bound may end the wait: zero 'name wait is over' lines",
+    boundLinesA.length === 0,
+    JSON.stringify(boundLinesA),
+  );
+  const flushedA = connAEvents
+    .filter((e) => e.type === "timeline.item" && e.sessionId === scoped(rootNG, "child-NG") && typeof e.item?.text === "string" && e.item.text.startsWith("flush line "))
+    .map((e) => e.item.text);
+  const expectedA = Array.from({ length: 10 }, (_, index) => `flush line ${String(index)}`);
+  check(
+    "and every frame from that flush arrives exactly once, in order",
+    flushedA.length === expectedA.length && flushedA.every((text, index) => text === expectedA[index]),
+    JSON.stringify(flushedA),
+  );
+  await connA.send({ type: "session.close", sessionId: rootNG });
+  await connA.close();
+
   // ---- rc.1: no naming capability advertised, so no wait at all -----------
   // The bridge report is the only difference from the case above: without
   // `serverInfo.subagentNames` (0.2.2-rc.1, or a profile with no subagent
@@ -497,6 +559,54 @@ async function openSession(conn, sessionId, history) {
   );
   await conn9.send({ type: "session.close", sessionId: rootW });
   await conn9.close();
+
+  // ---- a name that arrives while another gate still holds the notice -------
+  // The notice is label-less, so the label gate holds it; its catalog fact names
+  // it immediately (twice), and the descriptor that releases the label is 850 ms
+  // away — past the cap armed when the notice landed. Recording a name has to
+  // stop that child's cap timer: a deadline that fired afterwards would log
+  // "no catalog name" about a child the catalog already named, and write the
+  // sticky expiry behind the label gate. The row must still open with the name
+  // (title) over its label (description) when the descriptor arrives.
+  const connD = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
+  const connDEvents = [];
+  connD.onEvent((e) => connDEvents.push(e));
+  const rootEN = `subEN-${Date.now()}`;
+  setMode("catalog-name-early-gated");
+  await connD.send({ type: "session.open", sessionId: rootEN, config: { cwd: process.cwd(), mode: "build" }, history: "skip" });
+  await untilIn(connDEvents, (e) => e.type === "session.ready" && e.sessionId === rootEN, "rootEN ready", 30000);
+  const stderrD = [];
+  const originalStderrD = process.stderr.write;
+  process.stderr.write = (chunk, ...rest) => {
+    stderrD.push(String(chunk));
+    return originalStderrD.call(process.stderr, chunk, ...rest);
+  };
+  let gatedNameChild;
+  try {
+    await connD.send({ type: "session.prompt", sessionId: rootEN, prompt: { clientMessageId: "pEN", input: { type: "message", content: [{ type: "text", text: "go" }] } } });
+    gatedNameChild = await untilIn(connDEvents, (e) => e.type === "session.opened" && e.sessionId === scoped(rootEN, "child-EN"), "child-EN opened", 30000);
+  } finally {
+    process.stderr.write = originalStderrD;
+  }
+  check(
+    "a name recorded while the notice was gated still titles the row once the gate releases",
+    gatedNameChild.title === "early-name-n" && gatedNameChild.description === "Early Name EN",
+    JSON.stringify({ title: gatedNameChild.title, description: gatedNameChild.description }),
+  );
+  const capLinesD = stderrD.filter((line) => line.includes("has no catalog name"));
+  check(
+    "and recording the name stopped the cap timer: zero 'has no catalog name' lines",
+    capLinesD.length === 0,
+    JSON.stringify(capLinesD),
+  );
+  const namedLinesD = stderrD.filter((line) => line.includes("is named early-name-n in the parent catalog"));
+  check(
+    "and the repeated catalog fact does not re-log the name",
+    namedLinesD.length === 1,
+    JSON.stringify(namedLinesD),
+  );
+  await connD.send({ type: "session.close", sessionId: rootEN });
+  await connD.close();
 
   // ---- two levels: a grandchild's name rides its parent's catalog --------
   // The root's catalog only names its own direct children. A grandchild is named
@@ -545,7 +655,7 @@ async function openSession(conn, sessionId, history) {
   await connR4b.send({ type: "session.prompt", sessionId: rootR4early, prompt: { clientMessageId: "pQ", input: { type: "message", content: [{ type: "text", text: "go" }] } } });
   const earlyGrandR4 = await untilIn(connR4bEvents, (e) => e.type === "session.opened" && e.sessionId === scoped(rootR4early, "tree-grand-E"), "tree-grand-E opened", 30000);
   check(
-    "a grandchild announced before its parent still gets the name from the unopened parent's catalog",
+    "a grandchild's name still comes from its parent child session's catalog (the bridge re-delivers an out-of-order notice after the parent's)",
     earlyGrandR4.title === "tree-g-early" && earlyGrandR4.description === "Tree Early G Label",
     JSON.stringify({ title: earlyGrandR4.title, description: earlyGrandR4.description }),
   );
@@ -561,10 +671,11 @@ async function openSession(conn, sessionId, history) {
   await connR4b.send({ type: "session.close", sessionId: rootR4early });
   await connR4b.close();
 
-  // ---- the frame bound fires without any catalog fact --------------------
-  // The count and wall-clock bounds are separate exits; with no catalog fact the
-  // count must be the one that opens the row (the root marker right behind the
-  // frames is the ordering witness, and the log names the bound).
+  // ---- a lost catalog fact: the wall-clock cap is the only exit ----------
+  // The catalog fact is the precise answer, and the 750 ms cap is the sole
+  // fallback for when it never arrives. The root marker is emitted right behind
+  // the frames, so a row opened on frame count would announce before it — this
+  // scenario pins the opposite: the cap is the only thing that may open it.
   const connR4c = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
   const connR4cEvents = [];
   connR4c.onEvent((e) => connR4cEvents.push(e));
@@ -586,7 +697,7 @@ async function openSession(conn, sessionId, history) {
     process.stderr.write = originalStderrWriteR4;
   }
   check(
-    "with no catalog fact the frame bound opens the label-only child",
+    "with no catalog fact at all the label-only child still opens (on the 750 ms cap)",
     framesChildR4.title === "Frames F" && framesChildR4.description === undefined,
     JSON.stringify({ title: framesChildR4.title, description: framesChildR4.description }),
   );
@@ -595,23 +706,26 @@ async function openSession(conn, sessionId, history) {
     (e) => e.type === "timeline.item" && e.sessionId === rootR4frames && e.item?.text === "root marker after frames",
   );
   check(
-    "and it opens before the root marker that follows the frames (the 750 ms timer would open after it)",
-    framesOpenedR4 >= 0 && framesMarkerR4 > framesOpenedR4,
+    "and it opens only after the root marker that followed the frames (frames are not an exit)",
+    framesOpenedR4 >= 0 && framesMarkerR4 >= 0 && framesOpenedR4 > framesMarkerR4,
     `open#${String(framesOpenedR4)} marker#${String(framesMarkerR4)}`,
   );
+  const capLinesR4 = stderrLinesR4.filter((line) => line.includes("has no catalog name after 750ms"));
   check(
-    "and the frame bound logs why it opened with the label",
-    stderrLinesR4.some((line) => line.includes("held 8 frames with no catalog name")),
-    JSON.stringify(stderrLinesR4.filter((line) => line.includes("catalog name"))),
+    "and the cap logs exactly once why it opened with the label",
+    capLinesR4.length === 1,
+    JSON.stringify(capLinesR4),
   );
   await connR4c.send({ type: "session.close", sessionId: rootR4frames });
   await connR4c.close();
 
-  // ---- the frame bound is sticky and logs once, even while gated ----------
-  // The notice has no label yet, so the label gate keeps it unopened after the
-  // name bound expires. Twelve frames follow before the descriptor releases the
-  // label: the bound must log exactly once (and not re-run a flush per surplus
-  // frame), then the child opens with its label and every frame arrives in order.
+  // ---- the wall-clock cap is sticky and logs once, even while gated ------
+  // The notice has no label yet, and the descriptor is delayed past the cap, so
+  // the label gate keeps it unopened when the cap expires. The cap's decision
+  // must be sticky (that flush cannot open anything) and its log singular: an
+  // expiry that only lived in the timer's local scope would be re-decided by
+  // every later flush. Then the descriptor releases the label, the child opens
+  // with it, and every frame arrives in order.
   const connR5 = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
   const connR5Events = [];
   connR5.onEvent((e) => connR5Events.push(e));
@@ -638,9 +752,9 @@ async function openSession(conn, sessionId, history) {
   } finally {
     process.stderr.write = originalStderrR5;
   }
-  const boundLogsR5 = stderrR5.filter((line) => line.includes("held 8 frames with no catalog name"));
+  const boundLogsR5 = stderrR5.filter((line) => line.includes("has no catalog name after 750ms"));
   check(
-    "a frame bound that expires behind another gate logs exactly once, not once per surplus frame",
+    "a cap that expires behind another gate logs exactly once, not once per later flush",
     boundLogsR5.length === 1,
     `${String(boundLogsR5.length)} line(s): ${JSON.stringify(boundLogsR5)}`,
   );

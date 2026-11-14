@@ -292,30 +292,31 @@ const CHILD_BUFFER_LIMIT = 2000;
 const CHILD_LABEL_WAIT_EVENTS = 40;
 
 /**
- * Held child frames after which a label-only notice opens without its name.
+ * The **only** bound on the child-name wait: wall clock.
  *
  * DSH 0.2.2-rc.2+ names a child in the **parent's** `subagent/catalog` v3 fact,
  * which arrives 10-20 ms *after* the child's own `subagent/descriptor` (label).
  * The bridge opens the child on the descriptor, and Paseo's title/description are
  * sticky at the first `attachChild`, so an announcement made then can never gain
  * the name. The plugin owns that single `session.opened` — holding it for the
- * catalog is the only place the gap can be closed — but the hold must be bounded:
- * once this many of the child's own frames have arrived, a name that has not
- * shown up by then is not coming in time, and a visible row beats a perfect one.
- * Eight is chosen against the measured gap: the catalog lands before the child's
- * first frame in every real capture, so the bound is never the path taken; it
- * only stops a lost/late catalog event from parking a row.
- */
-const CHILD_NAME_WAIT_EVENTS = 8;
-
-/**
- * Hard cap for the same wait, wall-clock.
+ * catalog fact is the only place the gap can be closed — but the hold must be
+ * bounded, and it is bounded by the wall clock **alone**.
  *
- * A count bound cannot fire for a child that emits nothing after its descriptor,
- * and "wait for `CHILD_NAME_WAIT_EVENTS` frames" would then hide the row until the
- * bridge's own 500-frame `CHILD_BUFFER_CAP`. 750 ms is far above the measured
- * 10-20 ms catalog gap and far below any human-noticeable delay for a row that
- * has just started.
+ * A frame count is not a usable bound here, and an earlier version of this code
+ * learned that on a real daemon: the bridge buffers a child's frames until it
+ * announces the child and then flushes the whole batch at once, so a frame count
+ * measures the batch size, not elapsed time. Measured (2026-11-15, Paseo daemon,
+ * DSH 0.2.2-rc.3): eight child frames arrived 9 ms after the descriptor in one
+ * flush, and the catalog fact naming the child arrived 3 ms *after* them. Any
+ * small count fires inside that flush, the row opens with its label, and the name
+ * is lost for good. So there is no count bound at all: the normal release is the
+ * catalog fact naming the child (`#observeCatalogName`). This timer is the only
+ * exit for a child that will never get such a fact — a caller-delivered external
+ * run is not cataloged at all — and the last resort when the fact is late: a fact
+ * that lands after the cap finds the row already fixed with its label, so the
+ * short name is lost (the sticky-title cost, documented in `docs/FIELD-NOTES.md`,
+ * not a reason to wait again). 750 ms is far above the measured 10-20 ms gap and
+ * far below any human-noticeable delay for a row that has just started.
  */
 const CHILD_NAME_WAIT_MS = 750;
 
@@ -771,9 +772,10 @@ export class DshSession {
    * Children whose name wait already ran out on the wall-clock cap.
    *
    * The cap has to outlive the timer itself: a flush recomputes "may this notice
-   * still wait?" from the child's buffered frames, and a child with fewer than
-   * `CHILD_NAME_WAIT_EVENTS` frames would answer "yes" forever. Remembering the
-   * expiry is what makes the timer's decision stick.
+   * still wait?" from the capability bit and the recorded catalog facts, so a
+   * child that is still gated by another condition (its parent's notice, its
+   * label, the root not being ready) would look eligible again on every later
+   * flush. Remembering the expiry is what makes the timer's decision stick.
    */
   readonly #nameExpired = new Set<string>();
   /**
@@ -3284,7 +3286,7 @@ export class DshSession {
       (payload.label === undefined && !this.#labelWaitExceeded(payload.sessionId)) ||
       // A live notice without identity waits (bounded) for the parent catalog's
       // name: Paseo's title/description are captured once, at this announcement.
-      this.#awaitsName(payload)
+      this.#isNameWaiting(payload)
     ) {
       this.#bufferOpened(payload);
       return;
@@ -3314,8 +3316,9 @@ export class DshSession {
     if (this.#pendingOpened.some((held) => held.sessionId === payload.sessionId)) return;
     this.#trimChildBuffer();
     this.#pendingOpened.push(payload);
-    // A child held only for its name gets a hard cap: a count bound can never
-    // fire for a child that emits nothing after its descriptor.
+    // A child held only for its name gets a wall-clock cap: it may emit nothing
+    // at all after its descriptor, and the catalog fact that would release it can
+    // be lost.
     this.#scheduleNameWait(payload);
   }
 
@@ -3338,7 +3341,8 @@ export class DshSession {
    * a `listed` child already carries whatever DSH knows, a notice that has an
    * identity needs nothing, and a bridge without `subagentNames` (0.2.2-rc.1 and
    * older, or a profile with no subagent service) never sends one — waiting there
-   * would delay every child for nothing.
+   * would delay every child for nothing. A catalog fact that names the child
+   * ends the wait (`#childNames`), and so does the wall clock (`#nameExpired`).
    */
   #isNameWaiting(payload: DshChildOpened): boolean {
     if (this.#process?.subagentNames !== true) return false;
@@ -3349,23 +3353,9 @@ export class DshSession {
     return !this.#nameExpired.has(payload.sessionId);
   }
 
-  /**
-   * Whether a held notice should still be withheld from Paseo.
-   *
-   * Two independent conditions, deliberately kept apart: the notice is still
-   * *eligible* to wait (capability, origin, identity not known yet), and the
-   * frame bound has not been reached. Collapsing them into one predicate made
-   * {@link #openIfNameWaitExceeded} dead code — "still waiting" already implied
-   * "fewer than the bound frames", so the count path could never fire a flush and
-   * the only exit was the wall-clock timer.
-   */
-  #awaitsName(payload: DshChildOpened): boolean {
-    return this.#isNameWaiting(payload) && this.#heldEventCount(payload.sessionId) < CHILD_NAME_WAIT_EVENTS;
-  }
-
   /** Start the wall-clock safety net for one held child's name wait. */
   #scheduleNameWait(payload: DshChildOpened): void {
-    if (!this.#awaitsName(payload) || this.#nameTimers.has(payload.sessionId)) return;
+    if (!this.#isNameWaiting(payload) || this.#nameTimers.has(payload.sessionId)) return;
     const timer = setTimeout(() => {
       this.#nameTimers.delete(payload.sessionId);
       if (this.#closed) return;
@@ -3382,13 +3372,23 @@ export class DshSession {
     this.#nameTimers.set(payload.sessionId, timer);
   }
 
+  /**
+   * Stop the cap timer for one child without touching any recorded decision.
+   *
+   * The symmetric counterpart of the cap firing: a name recorded while the timer
+   * is still armed means the timer's premise ("no catalog name") is already
+   * false, so it must not fire later and log a decision it never made.
+   */
+  #clearNameTimer(nativeId: string): void {
+    const timer = this.#nameTimers.get(nativeId);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    this.#nameTimers.delete(nativeId);
+  }
+
   /** Stop any name wait for a child that is opening or being dropped. */
   #clearNameWait(nativeId: string): void {
-    const timer = this.#nameTimers.get(nativeId);
-    if (timer !== undefined) {
-      clearTimeout(timer);
-      this.#nameTimers.delete(nativeId);
-    }
+    this.#clearNameTimer(nativeId);
     this.#nameExpired.delete(nativeId);
   }
 
@@ -3405,9 +3405,16 @@ export class DshSession {
    * Catalog v3 (0.2.2-rc.2+) is the only live source of a child's name — the
    * child's own `subagent/descriptor` deliberately carries none — and it reaches
    * the plugin a few milliseconds after the child's `session.child-opened`. A
-   * malformed fact is ignored rather than coerced (the bridge already drops and
-   * logs a non-string name on its side). A held notice for that child is
-   * re-evaluated immediately.
+   * v3 fact always carries a name: the type requires it, a local child's
+   * descriptor is always `continuable` (which is cataloged with its reserved
+   * name), and a caller-delivered external run is not cataloged at all. There is
+   * therefore no "the catalog says this child has no name" fact to act on; a
+   * child that gets none is opened by the wall-clock cap instead.
+   *
+   * A malformed fact is ignored rather than coerced (the bridge already drops and
+   * logs a non-string name on its side); a fact with no `childId` names nobody.
+   * Recording the name also stops the cap timer: the name answers the wait, so a
+   * stale deadline must not log that the catalog gave none.
    *
    * @param event - any session's `subagent/catalog` event: the one belonging to the
    *   child's creator (the root for a direct child, its parent child session for a
@@ -3422,6 +3429,7 @@ export class DshSession {
       this.#childNames.set(childId, name);
       this.#options.log(`subagent ${childId} is named ${name} in the parent catalog`);
     }
+    this.#clearNameTimer(childId);
     this.#flushPendingChildren();
   }
 
@@ -3444,26 +3452,6 @@ export class DshSession {
     // descriptor left the child unopened — its output buffered, then dropped at
     // CHILD_BUFFER_LIMIT, with nothing said.
     this.#openIfLabelWaitExceeded(item.sessionId);
-    // The name bound is frame-counted for the same reason, and the same frame may
-    // be the one that proves a catalog event is not coming in time.
-    this.#openIfNameWaitExceeded(item.sessionId);
-  }
-
-  /** Open a held child once its frames prove the catalog name is not coming. */
-  #openIfNameWaitExceeded(nativeId: string): void {
-    const held = this.#pendingOpened.find((payload) => payload.sessionId === nativeId);
-    if (held === undefined || !this.#isNameWaiting(held)) return;
-    if (this.#heldEventCount(nativeId) < CHILD_NAME_WAIT_EVENTS) return;
-    // The decision is sticky, shared with the wall-clock cap: the notice may
-    // still be held by another gate (its parent's notice, its label, the root
-    // not being ready), in which case this flush opens nothing and every
-    // surplus frame would otherwise re-log "opening it" and re-run the flush.
-    this.#nameExpired.add(nativeId);
-    this.#options.log(
-      `subagent ${nativeId} held ${CHILD_NAME_WAIT_EVENTS} frames with no catalog name; `
-        + "the name wait is over (its label will title the row)",
-    );
-    this.#flushPendingChildren();
   }
 
   /** Open a held, label-less child once it has waited long enough for one. */
@@ -3519,7 +3507,7 @@ export class DshSession {
             !this.#rootReady ||
             this.#parentScopedId(payload.parentSessionId) === undefined ||
             (payload.label === undefined && !this.#labelWaitExceeded(payload.sessionId)) ||
-            this.#awaitsName(payload)
+            this.#isNameWaiting(payload)
           ) {
             remaining.push(payload);
           } else {

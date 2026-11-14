@@ -3891,9 +3891,15 @@ catalog payload `{"version":3,…,"name":"mint-probe"}`）。宿主的 title/des
   （桥用鸭子类型探测 `subagents.namesOf`/`rootOf`，rc.1 没有 → 旧行为，一个都不等）；
 - `session.child-opened` 带 `listed: true` 的行（桥从 durable 目录登记、重载后 adopted 或历史条目）
   不等——它们再不会有新的 live catalog 事实；
-- 边界双保险：子会话帧数达 `CHILD_NAME_WAIT_EVENTS = 8` 或墙钟 `CHILD_NAME_WAIT_MS = 750` 即按
-  label 打开（实测 catalog 在子会话第一帧之前就到，正常路径永远走不到边界；750 ms 只是防止
-  catalog 丢失时把行永久扣住）。拿到 name 后仍走同一条 `childIdentity`：`title = name`、`description = label`。
+- 上界**只有一个**：墙钟 `CHILD_NAME_WAIT_MS = 750`。正常放行路径是 catalog 事实（它只负责**记 name**）；
+  750 ms 兜底两类子会话：**根本没有** catalog 事实的（caller-delivered external 不建 catalog），以及
+  catalog 事实晚于兜底的。**原句「帧数达 8 或 750 ms 双保险，实测 catalog 在子会话第一帧之前就到、
+  正常路径永远走不到边界」已被真机证伪**（2026-11-15，第六轮补）：
+  帧数不是时间而是**批量大小**——桥会把它在子会话未打开期间缓冲的帧成批 flush，一次 IPC 批次里 8 帧以上
+  是常态。真机三行（本机 Paseo daemon，DSH 0.2.2-rc.3，子会话 `a571658b-…`，pid 2887982：
+  `held 8 frames with no catalog name; the name wait is over` → 3 ms 后 → `is named smoke-probe in the
+  parent catalog`）说明帧数上界在 catalog 之前先触发：该行以 label 打开、短名丢失。所以帧数上界整体删除。
+  拿到 name 后仍走同一条 `childIdentity`：`title = name`、`description = label`。
 - 代价：live announce 晚约 10–20 ms；rc.1 完全不变。
 
 **title 与 description 的 sticky 是对称的（已读宿主代码确认）**：首次 `attachChild` 的 upsert 同时带
@@ -3923,9 +3929,37 @@ bug）。两个判断分开，帧数到界才能真的打开并留下「held N f
 同句日志，修后 1 行）。日志文案也不要说谎：到界只是"不再等名字"，就此写
 "the name wait is over (its label will title the row)"，不写"opening it"。
 
+**第六轮补：帧数是时间的不良代理；catalog 事实只记 name，无 catalog 事实的子会话仍走 750 ms 兜底**（2026-11-15）：
+① 真机证据见上一节那三行——8 帧落在 descriptor 之后的 9 ms 内、catalog 晚 3 ms，**任何小的帧数上界都可能
+抢在 catalog 前面触发**，所以不是「把 8 调大」而是删掉这条上界。② 代码面：删 `CHILD_NAME_WAIT_EVENTS`、
+`#openIfNameWaitExceeded()` 及其在 `#bufferChildEvent` 里的调用，`#awaitsName` 退化为直接
+`#isNameWaiting(payload)`（不再有「帧数到没到」这一维），唯一上界是 750 ms 定时器，粘性语义不变
+（`#nameExpired`）。③ catalog 事实的真实形状（读 rc.3 源码核实；本条的草稿曾按「one-shot 的 v3 行不带
+name」写，属错误前提，已改）：`subagent/catalog` 的 v3 联合体**必带 `name: string`**，mode 只有
+`continuable` 与 `external`（`dsh-subagent/lib/types/catalog.d.ts`），`one-shot` 只可能出现在 v0/v1；
+本机子会话的 descriptor 恒为 `mode:"continuable"`（`dsh-subagent/lib/index.js:1503`），建目录时写 v3 +
+`reservation.name`（`:1566`）；caller-delivered external 则**根本不进 catalog**（`:1586` 原文
+「agent names require a cataloged child; caller-delivered external runs are not cataloged」）。
+→ rc.3 的 live catalog 事实**恒有 name**，不存在「catalog 回答这个 child 没有名字」的事实；`#observeCatalogName`
+因此只做「记 `#childNames` + 打那行 named 日志 + 停该 child 的定时器 + flush」，`name` 缺失直接 return。
+没有 catalog 事实的子会话（caller-delivered external，即 one-shot 执行）仍只能按 750 ms 兜底打开——既有代价，本轮不改。
+④ 记 name 时**清掉该 child 的名字定时器**（与到期处理对称，抽成 `#clearNameTimer`）：name 已到、而通告
+仍被父边/root-ready/label 闸门扣着时，留着的定时器会在 750 ms 打出一行与事实相反的「has no catalog name
+after 750ms」并把 `#nameExpired` 写脏。⑤ 假桥与断言：`catalog-after-flush`（一次同步批量 10 帧 + 3 ms
+后 catalog；改前红：`title` 只剩 label、出现 `held 8 frames` 那行；改后 `title=短名`、`description=label`、
+0 行「name wait is over」、10 帧各出现一次）与 `catalog-name-early-gated`（label 闸门扣着时 name 先到：
+改前 750 ms 打出「has no catalog name」→ 红；改后 0 行、行仍以 `title=name`/`description=label` 打开、
+重复 fact 不重复打名字日志）。`catalog-none` 与 `name-bound-gated` 钉 750 ms 兜底：前者断言行在根帧
+**之后**才打开、兜底日志恰好 1 行（删掉帧数上界后它才真正只测兜底）；后者把 descriptor 延到 850 ms，
+只证明「兜底到期时仍被 label 闸门扣着 → 日志仍只 1 行、descriptor 到时按 label 正常打开、12 帧按序无丢」，
+**不再声称它证明帧数粘性**（帧数界已不存在）。
+
 **边界（不修，写在这里免得复发现）**：① 宿主 `resolveRowLabel` 把字面 `"new agent"`（大小写不敏感）
-当空，命中该名字的 child 会退回 label 标题，插件侧无法预判；② one-shot 的 catalog v3 不带 name（`path`
-随之缺失）→ 这类行只显示 label（与今天一致）；③ live 打开的行可能只有短名、reopen 后才变全路径。
+当空，命中该名字的 child 会退回 label 标题，插件侧无法预判；② **不会**有 catalog 事实的子会话
+（caller-delivered external 不建 catalog；v3 必带 `name`，所以也不存在"没有名字的 v3 行"）→ 这类行只显示
+label（与今天一致，只能靠 750 ms 兜底打开）；③ live 打开的行可能只有短名、reopen 后才变全路径；
+④ **catalog 事实晚于 750 ms 才到 → 行已按 label 打开定死，短名仍会丢**——宿主 `title`/`description` 在首次
+`attachChild` 后 sticky，兜底一开就没有第二次机会；这是兜底机制本身的代价，不另加等待。
 
 **验证（2026-11-14，离线，两轮都在终版代码上重跑）**：`subagent-check` **114 条**（第三轮新增 4 条：真实时序下
 `title=name`/`description=label`、等待期间帧仍按序到达、rc.1 无能力声明时立开、且立开早于随后的
@@ -3936,6 +3970,18 @@ bug）。两个判断分开，帧数到界才能真的打开并留下「held N f
 `session-state-check` 25/25。变异（第二轮）：规则改回「title=label、description=名字」→ (a)(b) 红；
 只接 live 不接 replay → replay 段红；删桥 name 透传 → bridge-server-check 2 红；均还原并核 sha256。
 **真机未验证**：需要新会话才看到（能力位按会话生效），且本包禁止装/重载插件。
+
+**第六轮验证（2026-11-15，离线，终版代码）**：`subagent-check` **131/131**（连跑 2 次；A 3 条 + 记 name
+停定时器 3 条，`catalog-none`/`name-bound-gated` 的 3 条钉 750 ms 兜底）、`tsc --noEmit` exit 0、
+`bridge-assets-check` 2/2（桥未动）、`bridge-server-check` 121/121、`harness-gates-check` 68/68、
+`plugin-check.cjs --self-test` 通过。**红先**：把 `session.ts` 换回改动前版本（基线 `a1677fe`）再跑新
+断言，`126/131`、5 条红——A 的 `title` 只剩 label 与「name wait is over」那一行、`catalog-name-early-gated`
+的「0 行 has no catalog name」（基线的 750 ms 定时器在 name 已到后仍打了那行）、`catalog-none` 的两条
+（帧数不是出口、兜底日志行数）。**变异**：删掉「记 name 时清定时器」→ 恰好那 1 条红（`130/131`），
+还原后 sha256 一致。**这一轮的真机部分仍未验证**：真机要重载插件才生效，本轮禁止重启 daemon，由派发方验。
+另：**两层（孙代理）命名没有真机证据**——唯一真机捕获是直接子代理 `smoke-probe`；离线的 `catalog-tree-early`
+乱序变体在插件层不可达（`dsh-process.ts` 的 `#holdOrphan` 会重排，实测插件看到「父通知 → 孙名 → 孙帧」），
+它实际钉的是「孙名来自其父会话的 catalog」，不证明乱序可处理。
 
 ### 103. 工具失败码按常量名查表，永远不命中：`TOOL_ABORTED` 的码值是 `ABORTED`
 

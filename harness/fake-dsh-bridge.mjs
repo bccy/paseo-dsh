@@ -38,25 +38,49 @@
  *   catalog-tree / catalog-tree-early
  *            the same real order one level deeper: a child's notice+label, then
  *            the name in its **parent's** catalog fact (the root for a direct
- *            child, a child session for a grandchild). `catalog-tree-early` is the
- *            out-of-order variant — the grandchild's notice and the catalog fact
- *            naming it arrive before the notice of the child that parents it
+ *            child, a child session for a grandchild). `catalog-tree-early` emits the
+ *            out-of-order shape — the grandchild's notice and the catalog fact
+ *            naming it before the notice of the child that parents it — but the
+ *            plugin never sees that order: its orphan hold re-delivers a notice
+ *            whose parent is unknown once that parent's notice arrives
+ *            (`paseo-plugin/server/dsh-process.ts` `#holdOrphan`). What it does
+ *            test is the name arriving from the **parent child session's** catalog,
+ *            after the parent's notice (the true order was measured: parent
+ *            notice, then the grandchild's name, then its frames)
  *   name-bound-gated
- *            the frame bound expires while the notice is still held by another
- *            gate (no label yet): exactly one "held 8 frames" line may be logged,
- *            not one per surplus frame, and the child must still open correctly
- *            once its descriptor supplies the label
+ *            what the 750 ms cap still has to get right once the frame bound is
+ *            gone: the label gate holds a label-less notice past the cap, the cap
+ *            is evaluated once (nothing re-arms or re-logs it while that gate
+ *            holds), and the row opens with its label when the descriptor arrives
+ *            at 850 ms, every frame accounted for. It says nothing about frame
+ *            counts — there is no frame bound any more
  *   catalog-none
- *            no catalog fact ever: a label-only child notice followed by exactly
- *            `CHILD_NAME_WAIT_EVENTS` frames and one root marker. The bound must
- *            open it on the frame count (before the marker), not on the 750 ms
- *            timer
+ *            no catalog fact ever: a label-only child notice followed by eight
+ *            frames and one root marker. The 750 ms timer is the only way such a
+ *            child can open, so the row must appear **after** that marker, and
+ *            the timer logs exactly once
  *   catalog-late
  *            the real rc.3 order: the child notice carries only its label, the
  *            child emits a frame or two, and only then does the parent's
  *            `subagent/catalog` v3 fact (the only live source of `name`) arrive.
  *            The plugin must hold the single `session.opened` for it and announce
  *            `title = name`, `description = label`
+ *   catalog-after-flush
+ *            the real rc.3 interleaving a daemon log measured: the child notice
+ *            (label only), then one IPC batch of ten child frames (the bridge
+ *            flushes everything it buffered for an unannounced child at once),
+ *            and only 3 ms after that the parent's catalog v3 fact with the name.
+ *            No frame count may open the row on the way there: it must still be
+ *            announced `title = name`, `description = label`
+ *   catalog-name-early-gated
+ *            the name arrives while the notice is still held by another gate: a
+ *            label-less notice is followed immediately by the catalog fact naming
+ *            it (twice; the root channel), and only 850 ms later does the child's
+ *            own descriptor supply the label. Recording a name has to stop that
+ *            child's cap timer, or the 750 ms deadline logs "no catalog name"
+ *            about a child that already has one. Row: `title = name`,
+ *            `description = label`; exactly one "is named" line for the repeated
+ *            fact; zero cap lines
  *   catalog-absent
  *            the rc.1 shape: a label-only child notice, a v2 catalog fact with no
  *            name, and a root frame right behind it. The bridge does not
@@ -368,7 +392,8 @@ function namesAdvertised() {
   if (scripted !== undefined && typeof scripted.subagentNames === "boolean") return scripted.subagentNames;
   return mode() === "catalog-late" || mode() === "name-missing" ||
     mode() === "catalog-tree" || mode() === "catalog-tree-early" || mode() === "catalog-none" ||
-    mode() === "name-bound-gated";
+    mode() === "name-bound-gated" || mode() === "catalog-after-flush" ||
+    mode() === "catalog-name-early-gated";
 }
 
 /**
@@ -888,19 +913,24 @@ async function emitCatalogTree(early) {
 }
 
 /**
- * Let the frame bound expire while another gate still holds the notice.
+ * Let the wall-clock cap expire while another gate still holds the notice.
  *
  * The child notice arrives without a label, so the label gate keeps it unopened
- * even after the name bound is reached; twelve frames follow and only then the
- * child's own descriptor supplies the label. The bound's decision has to be
- * sticky and its log line singular: without that, every surplus frame re-logs
- * "opening it" and re-runs the flush while nothing can open.
+ * past the cap; twelve frames follow, and only after the cap has fired does the
+ * child's own descriptor supply the label. What this pins today: the cap is
+ * evaluated once and does not re-arm or re-log while that other gate holds the
+ * notice, and the row then opens correctly with its label. It deliberately says
+ * nothing about frame counts — the frame bound is gone (the bridge flushes a
+ * child's buffered frames as one batch, so a count races the catalog fact).
  */
 async function emitNameBoundGated() {
   notify("session.child-opened", { sessionId: "child-NB", parentSessionId: rootId, mode: "continuable", cwd: "/tmp" });
   for (let index = 0; index < 12; index += 1) {
     notify("session.event", { sessionId: "child-NB", event: { type: "assistant/message", seq: index + 1, data: { turn: 1, step: 1, message: { id: `nb-${String(index)}`, content: [{ type: "text", text: `bound-gated line ${String(index)}` }] } } } });
   }
+  // Past the 750 ms cap: the label gate has held the notice the whole time, and
+  // the descriptor now releases it onto a decision that must already be sticky.
+  await new Promise((resolve) => setTimeout(resolve, 850));
   notify("session.event", { sessionId: "child-NB", event: { type: "subagent/descriptor", seq: 20, data: { version: 3, mode: "continuable", provider: "spawn", label: "Bound Gated NB" } } });
   notify("session.event", { sessionId: "child-NB", event: { type: "turn/end", seq: 21, data: { turn: 1, reason: { kind: "completed" } } } });
   notify("session.status", { sessionId: "child-NB", status: "idle" });
@@ -908,11 +938,12 @@ async function emitNameBoundGated() {
 }
 
 /**
- * Emit a label-only child and exactly the frame bound, with no catalog fact.
+ * Emit a label-only child with no catalog fact at all.
  *
- * The bound must be the frame count, not the wall clock: the root marker is
- * emitted right after the frames, so a plugin that only opens on the timer would
- * announce after it.
+ * The catalog event is the precise answer; when it is lost the wall-clock cap is
+ * the only exit left. The root marker is emitted right after the frames, so a
+ * plugin that opened on frame count would announce before it — this scenario
+ * pins the opposite: nothing may open the row before the 750 ms cap fires.
  */
 async function emitCatalogNone() {
   notify("session.child-opened", { sessionId: "child-NF", parentSessionId: rootId, mode: "continuable", label: "Frames F", cwd: "/tmp" });
@@ -947,6 +978,64 @@ async function emitCatalogLate() {
     },
   });
   notify("session.event", { sessionId: child, event: { type: "turn/end", seq: 4, data: { turn: 1, reason: { kind: "completed" } } } });
+  notify("session.status", { sessionId: child, status: "idle" });
+}
+
+/**
+ * Emit the interleaving the daemon log actually measured, in one batch.
+ *
+ * The bridge keeps a child's frames until it announces that child, then flushes
+ * everything it buffered at once — the daemon log for `smoke-probe` shows eight
+ * frames landing 9 ms after the descriptor and the catalog fact 3 ms *after*
+ * that. Any frame count below that batch size fires before the name arrives, so
+ * the row opens with its label and the name is lost for good. Only the catalog
+ * fact itself may release the notice.
+ */
+async function emitCatalogAfterFlush() {
+  const child = "child-NG";
+  notify("session.child-opened", { sessionId: child, parentSessionId: rootId, mode: "continuable", label: "Catalog Flush NG", cwd: "/tmp" });
+  // One synchronous batch: no await between these writes, exactly like the
+  // bridge's buffered flush.
+  notify("session.event", { sessionId: child, event: { type: "turn/start", seq: 1, data: { turn: 1 } } });
+  for (let index = 0; index < 10; index += 1) {
+    notify("session.event", { sessionId: child, event: { type: "assistant/message", seq: index + 2, data: { turn: 1, step: 1, message: { id: `ng-${String(index)}`, content: [{ type: "text", text: `flush line ${String(index)}` }] } } } });
+  }
+  // The measured gap between the flush and the catalog fact.
+  await new Promise((resolve) => setTimeout(resolve, 3));
+  notify("session.event", {
+    sessionId: rootId,
+    event: {
+      type: "subagent/catalog",
+      seq: 20,
+      data: { version: 3, childId: child, childCreatedAt: Date.now(), mode: "continuable", label: "Catalog Flush NG", name: "catalog-flush-name" },
+    },
+  });
+  notify("session.event", { sessionId: child, event: { type: "turn/end", seq: 21, data: { turn: 1, reason: { kind: "completed" } } } });
+  notify("session.status", { sessionId: child, status: "idle" });
+}
+
+/**
+ * Deliver a child's name before the notice can actually open.
+ *
+ * The notice arrives with no label, so the label gate holds it; its name rides
+ * the root's catalog channel immediately (twice, to pin that the repeat stays
+ * silent), and only 850 ms later does the child's own descriptor supply the
+ * label. The 750 ms cap was armed when the label-less notice landed, so recording
+ * the name has to stop that timer: otherwise the deadline logs "no catalog name
+ * after 750ms" about a child whose name the catalog already gave, and writes the
+ * sticky expiry behind the label gate.
+ */
+async function emitCatalogNameEarlyGated() {
+  const child = "child-EN";
+  const row = { version: 3, childId: child, childCreatedAt: Date.now(), mode: "continuable", label: "Early Name EN", name: "early-name-n" };
+  notify("session.child-opened", { sessionId: child, parentSessionId: rootId, mode: "continuable", cwd: "/tmp" });
+  notify("session.event", { sessionId: rootId, event: { type: "subagent/catalog", seq: 1, data: row } });
+  notify("session.event", { sessionId: rootId, event: { type: "subagent/catalog", seq: 2, data: row } });
+  // Past the cap: only now does the gate that holds the notice (its label) open.
+  await new Promise((resolve) => setTimeout(resolve, 850));
+  notify("session.event", { sessionId: child, event: { type: "subagent/descriptor", seq: 3, data: { version: 3, mode: "continuable", provider: "spawn", label: "Early Name EN" } } });
+  notify("session.event", { sessionId: child, event: { type: "assistant/message", seq: 4, data: { turn: 1, step: 1, message: { id: "en1", content: [{ type: "text", text: "early-name child answer" }] } } } });
+  notify("session.event", { sessionId: child, event: { type: "turn/end", seq: 5, data: { turn: 1, reason: { kind: "completed" } } } });
   notify("session.status", { sessionId: child, status: "idle" });
 }
 
@@ -1803,6 +1892,14 @@ async function handle(method, params, id) {
       if (mode() === "catalog-late" && !state.emitted) {
         state.emitted = true;
         setTimeout(() => { void emitCatalogLate(); }, 30);
+      }
+      if (mode() === "catalog-after-flush" && !state.emitted) {
+        state.emitted = true;
+        setTimeout(() => { void emitCatalogAfterFlush(); }, 30);
+      }
+      if (mode() === "catalog-name-early-gated" && !state.emitted) {
+        state.emitted = true;
+        setTimeout(() => { void emitCatalogNameEarlyGated(); }, 30);
       }
       if (mode() === "catalog-absent" && !state.emitted) {
         state.emitted = true;

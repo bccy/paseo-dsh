@@ -659,7 +659,7 @@
   `server/session.ts` 的回合状态、`configure` 的提交顺序/回执回读、`DshSessionOptions.modes`、
   子会话 opened/label 闸门或 `DshChildSession.fail` 必跑。**
 - `harness/subagent-check.cjs` — 原生子代理可见性（脚本化假 `dsh` 驱动真实编译插件 +
-  一次性 `DSH_HOME`，不 spawn 真 DSH、不连 daemon；**125 条**）：能力位与 `restoration:"parent"`、
+  一次性 `DSH_HOME`，不 spawn 真 DSH、不连 daemon；**131 条**）：能力位与 `restoration:"parent"`、
   父子/嵌套归属、多子混排、未知子不误归属、子只读拒绝、恢复去重与 provider id 复用、
   **Paseo 父能力门控**、无 subsession 时只回退根会话、父未就绪缓冲、`turn/end` 终态
   （completed/aborted/failed）、`skip`/`replay` 重建、fork own-suffix、两个根观察同一 native
@@ -680,14 +680,33 @@
   另断言无命名能力声明（rc.1 形状、`catalog-absent` 模式）时 label-only 子会话**立开**、不等，
   且 announce 早于其后的根帧——这是"等待不得对 rc.1 生效"的判据。**2026-11-14 第四轮再补 8 条**：
   真实时序的**两层**形态（孙的名字在**其直接父（子会话）**的 catalog 里，`catalog-tree` 模式）与
-  「孙先于父被 announce」的乱序变体（`catalog-tree-early`，孙的 catalog 落在尚未 open 的父会话通道上）
-  都必须让孙的 `session.opened` 为 `title=孙名`、`description=label`，且打开的**事件序号早于**随后的根帧
-  （证明不是等满 750 ms 定时器）；`catalog-none` 模式（无任何 catalog、恰好 8 帧 + 根帧）断言
-  第 8 帧就打开、日志含「held 8 frames with no catalog name」，同样以事件序号而非墙钟判定。
-  **2026-11-14 第五轮再补 3 条**（假桥 `name-bound-gated` 模式）：帧数界在**另一道闸门仍扣着**
-  （此例无 label、descriptor 迟到）时到期，`#nameExpired` 粘性标记必须让它**只打一行**日志
-  （第四轮代码上是 5 行：第 8–12 帧各一行、每帧空跑一次 flush）；随后 descriptor 放行，子会话
-  仍以 label 打开、无 description，12 帧按序各出现一次、无丢帧。
+  `catalog-tree-early`（假桥按「孙先于父」发出）都必须让孙的 `session.opened` 为 `title=孙名`、
+  `description=label`，且打开的**事件序号早于**随后的根帧（证明不是等满 750 ms 定时器）。
+  **但这条例外：`catalog-tree-early` 的乱序在插件层不可达**——`dsh-process.ts` 的 `#holdOrphan` 会把
+  未知父会话的 `child-opened` 扣到父通知到达后再重放，实测插件看到的是「父通知 → 孙名 → 孙帧」，
+  两个变体的先后被对调（2026-11-15 复审实测）。所以该场景实际钉的是「孙名来自其父会话的 catalog」，
+  **不证明**插件能处理「孙先于父被 announce」；两层命名的真机证据为 0（唯一真机捕获是直接子代理）。
+  **2026-11-14 第五轮再补 3 条（旧实现，见下一段）**（假桥 `name-bound-gated` 模式）：**那段代码当时**
+  用帧数界（`CHILD_NAME_WAIT_EVENTS = 8`）结束名字等待；界在**另一道闸门仍扣着**（此例无 label、
+  descriptor 迟到）时到期，`#nameExpired` 粘性标记**当时**必须让它只打一行日志（第四轮代码上是 5 行：
+  第 8–12 帧各一行、每帧空跑一次 flush）；随后 descriptor 放行，子会话仍以 label 打开、无 description，
+  12 帧按序各出现一次、无丢帧。**帧数界与那行「held 8 frames」日志在第六轮已整体删除**，本段只作历史记录，
+  当前判据见下一段。
+  **2026-11-15 第六轮：帧数上界删除（真机证伪），catalog 事实只记 name，无 catalog 事实的子会话走 750 ms 兜底**。
+  真机三行日志（子会话 `a571658b-…`，8 帧落在 9 ms 内、catalog 晚 3 ms）证明桥的 buffered flush 是一次
+  批量：帧数衡量批量大小而非时间，任何小上界都会抢在 catalog 前触发、把行定死成 label。所以
+  `CHILD_NAME_WAIT_EVENTS`/`#openIfNameWaitExceeded` 整体删除，**唯一上界是 750 ms 定时器**。
+  事实形状（读 rc.3 源码核实）：catalog v3 联合体**必带 `name`**（mode 只有 `continuable`/`external`），
+  本地 descriptor 恒 `continuable` 且写 v3+name，caller-delivered external **不建 catalog**——所以
+  「catalog 回答这个子会话没有名字」不存在，`#observeCatalogName` 只记 name 并在记 name 时**停掉该子会话的
+  750 ms 定时器**（否则 name 已到、行还被别的闸门扣着时会误报兜底）。
+  新增假桥 `catalog-after-flush`（一次批量 10 帧 + 3 ms 后 catalog：断言 `title=短名`、`description=label`、
+  0 行「name wait is over」类日志——该日志已随帧数界删除，此断言是防回退、当前恒真、10 帧各出现一次）与
+  `catalog-name-early-gated`（label 闸门扣着时 name 先到：断言 0 行「has no catalog name」、行仍以
+  `title=name`/`description=label` 打开、重复 fact 不重复打名字日志）。`catalog-none` 钉兜底：无任何
+  catalog 事实时行必须在根帧**之后**才打开（帧数不是出口）、兜底日志恰好 1 行；`name-bound-gated` 的
+  descriptor 延到 850 ms，只钉「兜底到期时仍被 label 闸门扣着 → 日志仍只 1 行、descriptor 到时按 label
+  正常打开、12 帧按序无丢」，**不再声称它证明帧数粘性**（帧数界已不存在）。
   所以要保住「第一行是任务描述」必须 `title = path ?? name`、`description = label`；空串与
   非字符串一律当缺失，`title === description` 时不带 description（宿主不去重），**绝不**用
   label 顶 name；无身份（rc.1/历史行）时 `title = label`、无 description，逐字段与改动前一致。
