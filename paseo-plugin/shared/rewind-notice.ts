@@ -214,7 +214,7 @@ export const REWIND_COPY: Readonly<Record<RewindLocale, RewindCopy>> = Object.fr
     filesNoCounts: "Files restored",
     failureTitle: "File rollback incomplete",
     persistenceNoStore:
-      "Rewind needs a durable session store, and this profile composes none (no `sessions` service); this rewind was not written to disk (reopening the conversation brings the withdrawn rows back), and no files or delegated turns were touched.",
+      "Rewind needs a durable session store, and this profile composes none (no `sessions` service); this rewind was not written to disk, and no files or delegated turns were touched.",
     persistenceFlushFailed: (detail: string) =>
       detail === ""
         ? "Rewind needs the replacement marker to reach disk, but flushing the session failed; this rewind was not written to disk (reopening the conversation brings the withdrawn rows back), and no files or delegated turns were touched."
@@ -234,7 +234,7 @@ export const REWIND_COPY: Readonly<Record<RewindLocale, RewindCopy>> = Object.fr
     filesNoCounts: "文件已恢复",
     failureTitle: "文件回退未完成",
     persistenceNoStore:
-      "撤回需要持久化的会话存储，但当前 profile 没有会话服务（sessions）；本次撤回没有落盘（重开会话会恢复被撤内容），文件与子代理均未改动。",
+      "撤回需要持久化的会话存储，但当前 profile 没有会话服务（sessions）；本次撤回没有落盘，文件与子代理均未改动。",
     persistenceFlushFailed: (detail: string) =>
       detail === ""
         ? "撤回需要把替换标记写入磁盘，但会话日志 flush 失败；本次撤回没有落盘（重开会话会恢复被撤内容），文件与子代理均未改动。"

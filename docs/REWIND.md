@@ -95,8 +95,10 @@ Paseo 撤回按钮
 - **怎么自查**：
   1. `dsh --profile <name> --dump-config`（只读）看组合里有没有会话持久化那一行；
   2. 试撤回一次：收到上面那句提示即为本节场景；
-  3. 失败原因在插件的错误消息里原样带出（`flush-failed:<DSH 原因>` / `no-session-store` /
-     `not-durable`）；桥不另写 stderr，`detail` 就是桥抛出的原因原文。
+  3. 三条已知码（`no-session-store` / `flush-failed:<DSH 原因>` / `not-durable`）会被翻成本地化
+     句子，其中 `flush-failed` 括号里原样带出 DSH 的原因；**本模块不认识的码**才原样透传桥原文。
+     桥不另写 stderr。`no-session-store` 的重开表现尚未真机验证（可能表现为历史不可用，而不是
+     「恢复被撤内容」），所以那句话不承诺重开后的结果。
 
 ### 重放折叠：只折撤回缝
 
