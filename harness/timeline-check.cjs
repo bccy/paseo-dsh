@@ -765,9 +765,27 @@ console.log("every detail branch carries what it claims");
   check("plan: text", plan.text === "## Plan");
 
   const sub = runTool("subagent", { description: "Explore" }, "log text").detail;
+  // DSH's `tool.title.subagent` verbatim, pinned per locale for the same reason
+  // as `DSH_TOOL_TITLES` above: the server's table is the only copy of it, and
+  // the client can only fall back to whatever `subAgentType` the detail carries.
+  const SUBAGENT_TITLE = { "zh-CN": "创建子智能体", en: "Create subagent" }[LOCALE];
   check("sub_agent: type", sub.type === "sub_agent");
-  check("sub_agent: description", sub.description === "Explore");
+  check(
+    "sub_agent: description wins, and the fallback label still rides along",
+    sub.description === "Explore" && sub.subAgentType === SUBAGENT_TITLE,
+    JSON.stringify({ description: sub.description, subAgentType: sub.subAgentType }),
+  );
   check("sub_agent: log", sub.log === "log text");
+  // A `subagent` call need not carry a description, and the row's head is
+  // `description || subAgentType` on the client — this branch wrote neither, so
+  // the head was empty. The label has to come from here; the client cannot fill
+  // a value the server already left out.
+  const subNoDescription = runTool("subagent", {}, "log text").detail;
+  check(
+    "sub_agent: a call without description still names the row",
+    subNoDescription.subAgentType === SUBAGENT_TITLE && subNoDescription.description === undefined,
+    JSON.stringify({ subAgentType: subNoDescription.subAgentType, description: subNoDescription.description }),
+  );
 
   const unknown = runTool("mcp__x__y", { a: 1 }, "result text").detail;
   check("unknown: type", unknown.type === "unknown");

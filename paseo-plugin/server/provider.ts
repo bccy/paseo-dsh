@@ -65,7 +65,11 @@ import {
 import { rewindCanaryNotice } from "./rewind-canary";
 import { beginRewindReport, fallbackNoticeDescription, type RewindReportFallback } from "./rewind-notice-append";
 import { effortLabel, LOCALE, UI } from "./locale";
-import { rewindSuccessText, type RewindTone } from "../shared/rewind-notice";
+import {
+  rewindPersistenceFailure,
+  rewindSuccessText,
+  type RewindTone,
+} from "../shared/rewind-notice";
 import type { GoalAction, GoalErrorCode, GoalState } from "../shared/goal";
 import type { JobErrorCode, JobStopResult } from "../shared/jobs";
 import { teamMemberSchema, teamProjectionSchema, type TeamErrorCode, type TeamView } from "../shared/team";
@@ -1717,7 +1721,15 @@ class DshConnection implements ProviderConnection {
           // Nothing to report: release the timeline subscription the delivery
           // opened before the revert.
           delivery?.cancel();
-          throw error;
+          // A rewind that cannot make its marker durable answers with the
+          // bridge's machine prefix (`dsh-bridge/lib/server.js`,
+          // `REWIND_PERSISTENCE_PREFIX`). Word that one here: the bridge has no
+          // locale table, and this failure disables the whole feature — the one
+          // refusal that must name its prerequisite rather than echo the store
+          // internals. Every other refusal (stale anchor, running turn) stays
+          // verbatim.
+          const persistence = rewindPersistenceFailure(messageOf(error), UI.rewind);
+          throw persistence === undefined ? error : new Error(persistence);
         }
         // The rewind itself needs no refresh: the daemon rebuilds the timeline from
         // `PluginProviderSession.streamHistory()` right after this reply. Whether the

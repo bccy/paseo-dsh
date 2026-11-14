@@ -65,6 +65,30 @@ Paseo 撤回按钮
   标记会让重放仍带着被撤行。flush 失败（或 profile 没有 session store）时整个撤回直接失败：
   **不做文件回退、也不取消子代理**——否则会出现「对话仍带被撤行、文件已回滚」的不可见错位。
 
+### 前提：持久化的 session store（`flush` 必须生效）
+
+对话撤回（`conversation` / `both`）只有在**替换标记真的落盘**后才算成功。这是平台前提，
+不是实现细节：
+
+- **`await sessions.flush(session)` 必须返回 `true`。** DSH 的 `SessionStore.flush` 语义是
+  "至少有一个持久化监听者参与了写入"：返回 `false` 表示没有任何持久化后端真正写了这份日志，
+  即使没抛错也按失败处理。桥把 `false` 与抛错同样对待（都不会继续）。
+- **profile 组合换了 store 就整体失效。** 撤回复用 profile 组合出的 `sessions` 服务及其持久化
+  监听者。若换成只挂内存 store（或干脆没有 `sessions` 服务）的组合，`conversation` / `both`
+  撤回不可用：桥在**改动文件与取消子代理之前**就抛错，所以文件不会被回退、子代理不会被取消，
+  但这一次撤回整个失败。**`files` 作用域不受影响**——它不追加标记、不 flush、不动对话，
+  只依赖文件快照 journal。
+- **失败怎么呈现**：桥的三个失败路径（没有 `sessions` 服务 / `flush` 抛错 / `flush` 返回
+  非 `true`）都带 `rewind-persistence:` 前缀回给插件（`dsh-bridge/lib/server.js` 的
+  `REWIND_PERSISTENCE_PREFIX`），插件按当前 locale 换成一句点名前提的文案
+  （`paseo-plugin/shared/rewind-notice.ts` 的 `rewindPersistenceFailure`，中英各一份）。
+  看到「撤回需要持久化的会话存储……」就是本节场景，不是撤回逻辑坏了；`flush-failed` 的
+  括号里还带着 DSH 自己的原因。
+- **怎么自查**：
+  1. `dsh --profile <name> --dump-config`（只读）看组合里有没有会话持久化那一行；
+  2. 试撤回一次：收到上面那句提示即为本节场景；
+  3. 桥的 stderr 同时留有日志，插件消息里的 detail 与它同源。
+
 ### 重放折叠：只折撤回缝
 
 桥的 `history()` 是 Paseo 重开会话时重建时间线的数据源，必须折叠撤回缝。规则：

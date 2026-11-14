@@ -4277,3 +4277,65 @@ reload / daemon restart；② rc.3 之前的 DSH 仍走旧 JSON 分支，新断�
 ⑥ 另两处只由代码顺序推断、无断言：子代理自身**重放**行拿到父名册，靠
 `provider.ts` 先 `replayHistory` 再 `replaySubagents` 加创建时快照合并；显式空 `label`
 的删除不会传导到已学过的子 builder（`mergeTeamRoster` 只增不删）。
+
+### 108. 建会话期间并发到达的 preset 选择：`createSession` 先读队列、后注册，回执声称已应用而实际没用
+
+**症状**：用户在会话打开的同时（或紧随打开）切了 agent preset，Paseo 回执/composer 显示新
+preset，但这一轮对话实际跑在创建时的旧 preset 上；重开会话后仍显示旧 preset（日志里的
+`agentPreset` 头没有变）。
+
+**窗口 / 根因（`dsh-bridge/lib/server.js`）**：`createSession` 在**创建之前**读一次队列
+（`:5308` 新会话 / `:5375` 恢复分支），把解析出的 id 通过 `setup` 挂进
+`ctx.agents.create` / `agents.resume`；而会话记录到 `:5478` 的 `this.sessions.set` 才发布。
+`setPreset` 只在 `this.sessions.get(sessionId) === undefined` 时入队
+（`:2068`–`:2073`），所以这中间到达的 configure 会**写进 `pendingPresets`**——但
+`createSession` 已经读完了，不会再消费它。
+
+`pendingPresets` 在这条路径上不会因为"已应用"被删（只有 `resolvePreset` 的两种终态失败、
+`closeSession` 的 `#forgetSessionState` 会删），而 `currentPreset()` 又**优先**读它
+（`:1973`）——于是：
+- 回执/preset 查询用的是队列里的新 id；
+- 真正 compose 的是创建时的旧 id，且没有为这个晚到的 id 追加
+  `agent-preset/selected`（`resumeSetup` 的 `fellBack` 分支会追加，这里没有）；
+- 冷重开按日志头重新 compose 旧 id，分歧跨重启保留。
+
+这是本项目反复记的一类**静默降级**：把"没应用"报成"已应用"。
+
+**可达性（推断，未实测）**：要求同一 sessionId 上，外部 `paseo/config/set`（preset）与本
+进程的 `createSession` 在"读完队列 → `sessions.set` 发布"之间并发。这段包含
+`ctx.agents.create`（挂 preset、挂 MCP、`beginOwner`），正常也要几十到几百毫秒，窗口不是
+理论上的单指令；但 Paseo 侧的 preset 切换通常在会话打开后才可点，且我没有复现记录，所以
+按**低概率、推断可达**记，不作为已确认缺陷。
+
+**修法草案（照抄 `pendingPlanMode` 范式，约 10 行，`:5429`–`:5475` 是正确范式）**：在
+`ctx.agents.create` / `agents.resume` 返回之后、`this.sessions.set` 之前重新读队列，若与
+实际挂上的 id 不同，用 `setPreset` 同样的 `presets.select(handle.agent, lateId)` 立刻补上
+（该 API 在首个回合开始前可用，正是 `setPreset` 的适用范围），并追加一条
+`agent-preset/selected` 让日志与运行态一致；`select` 抛错时按 `pendingPlanMode` 的
+`disposeUnpublished` 纪律**dispose `handle.agent`、把意图留在队列里**再抛，让下一次重试
+还能拿到它，不要在发布之后才失败：
+
+```js
+    // after create/resume, before `this.sessions.set(sessionId, rec)`
+    // `appliedPreset` 是两个分支各自**实际挂上**的 id（create 分支的 `agentPreset`，
+    // resume 分支已经在算的 `resolvedId`）；比较必须用它，不要拿队列里的值比较。
+    const latePreset = this.pendingPresets.get(sessionId);
+    if (presets !== undefined && latePreset !== undefined && latePreset !== appliedPreset) {
+      const disposeUnpublished = async () => { try { control.dispose?.(); } catch {}
+        try { await handle.dispose?.(); } catch {} };      // pendingPlanMode 的同款清理
+      try {
+        await presets.select(handle.agent, latePreset);
+        handle.agent.session.append('agent-preset/selected', { agentPreset: latePreset });
+        appliedPreset = latePreset;
+      } catch (error) { await disposeUnpublished(); throw error; }  // 队列保留，重试可再用
+    }
+```
+
+**为什么本轮不做**：① 改 `dsh-bridge/` 必须跑 `node paseo-plugin/scripts/generate-bridge-assets.mjs`
+重生成内嵌桥，并让**共享子进程**里所有会话都换到新桥——影响面远大于这个窗口本身；②
+`presets.select` 在 `ctx.agents.create` 之后、首回合之前的真实行为（rc.3 与更早版本的返回值
+形态、`meta.agentPreset` 与日志的同步）需要真机核；③ 没有可复现用例（要制造并发
+configure），离线断言只能测到"代码形状"，按下述原则这不算验证。
+
+**未验证**：无复现、无断言、未真机；修法草案里的 `presets.select` 时机与 dispose 顺序都只
+按 `setPreset` / `pendingPlanMode` 的既有实现推断。

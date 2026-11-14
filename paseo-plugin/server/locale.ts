@@ -115,17 +115,25 @@ export interface UiCopy {
     implement: string;
   };
   /**
-   * Titles for the two tools this half draws as a `plain_text` row.
+   * Titles this half writes into a row itself.
    *
-   * Both are DSH's own wording verbatim, from the `TOOL_TITLE_KEYS` table in
+   * All three are DSH's own wording verbatim, from the `TOOL_TITLE_KEYS` table in
    * `@deepseek-ai/dsh-client-ui-tool`: `todo_write` → `todo.rowTitle`,
-   * `ask_user_question` → `ask.rowTitle`. Everything else in DSH's `tool.title.*`
-   * table belongs to rows the *client* half draws, and lives in
-   * `client/locale.ts`.
+   * `ask_user_question` → `ask.rowTitle`, `subagent` → `tool.title.subagent`
+   * (the same strings `client/locale.ts` carries for the client's fallback).
+   * Everything else in DSH's `tool.title.*` table belongs to rows the *client*
+   * half draws, and lives in `client/locale.ts`.
+   *
+   * `subagent` is not a row title: it is the `sub_agent` detail's
+   * `subAgentType`, the head's fallback when the call carries no `description`
+   * (`client/tool-call-data.ts` reads `description || subAgentType`). The server
+   * writes that field, so the copy has to live on this side too — a client-side
+   * label cannot fill a value the server already sent.
    */
   toolLabels: {
     updateTasks: string;
     askedUser: string;
+    subagent: string;
   };
   /**
    * The round half of an automatic goal round's timeline row.
@@ -201,6 +209,7 @@ const UI_COPY: Record<Locale, UiCopy> = {
     toolLabels: {
       updateTasks: "Update to-do list",
       askedUser: "Ask question",
+      subagent: "Create subagent",
     },
     goalRound: (round) => String(round),
     rewind: REWIND_COPY.en,
@@ -246,6 +255,7 @@ const UI_COPY: Record<Locale, UiCopy> = {
     toolLabels: {
       updateTasks: "更新任务清单",
       askedUser: "提问",
+      subagent: "创建子智能体",
     },
     goalRound: (round) => `第 ${round} 轮`,
     rewind: REWIND_COPY["zh-CN"],

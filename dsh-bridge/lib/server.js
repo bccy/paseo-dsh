@@ -475,6 +475,24 @@ const ASSISTANT_STREAM_INTERVAL_MS = 100;
  */
 const ASSISTANT_DELTA_EVENT = 'paseo/assistant-delta';
 
+/**
+ * Machine prefix on a rewind whose replacement marker cannot become durable.
+ *
+ * The conversation half of a rewind is only usable when the session log reaches
+ * disk: the host rebuilds its timeline from that log right after the receipt, so
+ * a buffered marker would let the withdrawn turn come back while the file layer
+ * is already rolled back. `SessionStore.flush` resolves to whether at least one
+ * durability listener participated, so a profile composing a store without a
+ * persistence backend disables `conversation` / `both` outright (`files` writes
+ * no marker and needs no flush). This bridge has no locale table (it runs in the
+ * DSH child), so all three failure paths answer
+ * `rewind-persistence:<code>:<detail>` and the plugin words the refusal in the
+ * user's locale — the literal is kept in sync with
+ * `paseo-plugin/shared/rewind-notice.ts`, which cannot be imported here. Do not
+ * "tidy" the prefix: the plugin matches it verbatim.
+ */
+const REWIND_PERSISTENCE_PREFIX = 'rewind-persistence:';
+
 export class PaseoHarnessServer {
   constructor(ctx, transport, options = {}) {
     this.ctx = ctx;
@@ -3615,16 +3633,16 @@ export class PaseoHarnessServer {
         // receipt claims durability the log does not have.
         const sessions = this.ctx.get('sessions');
         if (sessions === undefined) {
-          throw new Error('撤回标记无法持久化：该 profile 没有会话存储；已停止文件回退');
+          throw new Error(`${REWIND_PERSISTENCE_PREFIX}no-session-store: this profile composes no sessions service`);
         }
         let durable;
         try {
           durable = await sessions.flush(session);
         } catch (error) {
-          throw new Error(`撤回标记无法持久化，已停止文件回退：${error instanceof Error ? error.message : String(error)}`);
+          throw new Error(`${REWIND_PERSISTENCE_PREFIX}flush-failed: ${error instanceof Error ? error.message : String(error)}`);
         }
         if (durable !== true) {
-          throw new Error('撤回标记未获得任何持久化参与者（该 profile 未组合会话持久化后端）；已停止文件回退');
+          throw new Error(`${REWIND_PERSISTENCE_PREFIX}not-durable: sessions.flush() reported no durability listener`);
         }
       }
       let files;

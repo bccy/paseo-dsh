@@ -703,10 +703,14 @@ export class DshSession {
   /**
    * Per-step timing for the streamed-stats row.
    *
-   * Fed from the bridge's transient `paseo/assistant-delta` snapshots rather
-   * than from the durable `assistant/message`: only the live frames carry the
-   * moment each token was produced, and a route that never streams gets no row
-   * at all instead of a fabricated duration.
+   * The bridge's transient `paseo/assistant-delta` snapshots are only the
+   * *start* side: `startedAt` is the step's first live frame, which is what
+   * makes `firstTokenMs` the wait the user actually saw rather than a duration
+   * measured backwards from the end. The first token itself and the settle time
+   * come from the durable `assistant/message` (`data.stream` and the envelope's
+   * `event.time`), so a route that never streams still gets a row — and so does
+   * a step that emits no text at all (a pure tool call), instead of being
+   * dropped as "nothing was timed".
    */
   #streamStats:
     | {
@@ -3463,10 +3467,16 @@ export class DshSession {
   /**
    * Publish the per-step latency and throughput row beneath the answer.
    *
-   * The numbers are measured from the bridge's live snapshots, so a route that
-   * does not stream (no snapshots, hence no timings) simply gets no row instead
-   * of a fabricated duration. Output tokens come from the step's own usage
-   * record.
+   * Both ends of the window come from the durable `assistant/message`: the first
+   * token time from `data.stream` (`assistantStreamFirstTokenTime`, DSH's own
+   * reader) and the settle time from the event envelope's `time`. The live
+   * snapshots only supply the step's start (`#streamStats.startedAt`) and a
+   * turn/step fallback, so a route that does not stream still gets measured
+   * numbers instead of a fabricated duration — and a step that produced no text
+   * (a pure tool call) still has a first token, because tool-call deltas count.
+   * `firstTokenMs` is the one field that can be absent there: with no live
+   * snapshot nobody observed the wait. Output tokens come from the step's own
+   * usage record.
    */
   #emitStreamStats(data: Record<string, unknown>, completedAt?: number): void {
     const stats = this.#streamStats;

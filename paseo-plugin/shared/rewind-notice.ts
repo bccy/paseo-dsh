@@ -120,6 +120,53 @@ export interface RewindCopy {
   filesNoCounts: string;
   /** Title of the existing partial-failure notice row. */
   failureTitle: string;
+  /** The profile composes no `sessions` service: the marker cannot be logged. */
+  persistenceNoStore: string;
+  /** `sessions.flush` threw; `detail` is the bridge's raw reason. */
+  persistenceFlushFailed: (detail: string) => string;
+  /** `sessions.flush` resolved `false`: no durability listener participated. */
+  persistenceNotDurable: string;
+}
+
+/**
+ * Machine prefix the bridge puts on a rewind it cannot make durable.
+ *
+ * `dsh-bridge/lib/server.js` has no locale table and runs in the DSH child, so
+ * the three failure paths answer `rewind-persistence:<code>:<detail>` and this
+ * half words the refusal in the user's locale ({@link rewindPersistenceFailure}).
+ * The bridge keeps the same literal and its comment names this module, so a
+ * change to either must move both — the bridge cannot import this file.
+ */
+export const REWIND_PERSISTENCE_PREFIX = "rewind-persistence:";
+
+/**
+ * Word a bridge persistence failure for the timeline/user in the given locale.
+ *
+ * Any other error, and any message the prefix does not cover, returns
+ * `undefined` so the caller rethrows the original — the bridge's own refusals
+ * stay verbatim (they already name the stale anchor, the running turn, etc.).
+ *
+ * @param raw - the bridge's error message, verbatim.
+ * @param copy - the locale's rewind copy.
+ * @returns the sentence to show, or `undefined` when this is not that failure.
+ */
+export function rewindPersistenceFailure(raw: string, copy: RewindCopy): string | undefined {
+  if (!raw.startsWith(REWIND_PERSISTENCE_PREFIX)) return undefined;
+  const rest = raw.slice(REWIND_PERSISTENCE_PREFIX.length);
+  const separator = rest.indexOf(":");
+  const code = separator === -1 ? rest : rest.slice(0, separator);
+  const detail = separator === -1 ? "" : rest.slice(separator + 1).trim();
+  switch (code.trim()) {
+    case "no-session-store":
+      return copy.persistenceNoStore;
+    case "flush-failed":
+      return copy.persistenceFlushFailed(detail === "" ? "flush failed" : detail);
+    default:
+      // Also the answer for a code a newer bridge adds: "rewind needs a durable
+      // store" is true for every member of this family, and a raw prefix thrown
+      // at the user would be worse than the conservative sentence.
+      return copy.persistenceNotDurable;
+  }
 }
 
 /** English counts read as a plural noun phrase; `1 file`, `0 files`, `2 files`. */
@@ -145,6 +192,12 @@ export const REWIND_COPY: Readonly<Record<RewindLocale, RewindCopy>> = Object.fr
     filesNoFiles: "No files changed after this message; nothing to restore",
     filesNoCounts: "Files restored",
     failureTitle: "File rollback incomplete",
+    persistenceNoStore:
+      "Rewind needs a durable session store, and this profile composes none (no `sessions` service); nothing was rewound and no files or delegated turns were touched.",
+    persistenceFlushFailed: (detail: string) =>
+      `Rewind needs the replacement marker to reach disk, but flushing the session failed; nothing was rewound and no files or delegated turns were touched (${detail}).`,
+    persistenceNotDurable:
+      "Rewind needs a durable session store (`sessions.flush` must return true), but this profile's store persisted nothing; the rewind was stopped before any file or delegated turn was touched.",
   }),
   "zh-CN": Object.freeze({
     conversation: "已撤回到这条消息",
@@ -157,6 +210,12 @@ export const REWIND_COPY: Readonly<Record<RewindLocale, RewindCopy>> = Object.fr
     filesNoFiles: "这条消息之后没有改动文件，无需恢复",
     filesNoCounts: "文件已恢复",
     failureTitle: "文件回退未完成",
+    persistenceNoStore:
+      "撤回需要持久化的会话存储，但当前 profile 没有会话服务（sessions）；本次未撤回任何内容，文件与子代理均未改动。",
+    persistenceFlushFailed: (detail: string) =>
+      `撤回需要把替换标记写入磁盘，但会话日志 flush 失败；本次未撤回任何内容，文件与子代理均未改动（${detail}）。`,
+    persistenceNotDurable:
+      "撤回需要持久化的会话存储（sessions.flush 必须返回 true），但当前 profile 的存储未写入任何持久化后端；已在改动文件与子代理之前停止。",
   }),
 } satisfies Record<RewindLocale, RewindCopy>);
 
