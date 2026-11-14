@@ -4265,6 +4265,15 @@ reload / daemon restart；② rc.3 之前的 DSH 仍走旧 JSON 分支，新断�
 （白名单 + 假进程），真实 reopen 的抓帧未做；④ 旧 JSON 分支对 rc.3 的纯文本结果仍然
 **静默无视**（不打日志）——现在那是"形状不匹配的预期"，但名册一旦再次失去来源，日志里
 同样查不到线索；⑤ 本轮 `plugin-check` 曾误用继承的 `DSH_HOME=~/.dsh` 跑了一次（首行
-`explicit DSH_HOME`，因 live daemon 独占 profile 端口而超时失败），期间 `ensurePaseoProfile()`
-把新的内嵌桥写进了 `~/.dsh/profiles/node_modules/dsh-paseo-bridge`（生成物，内容与仓库一致）；
-改隔离 home 后 40/40 通过。
+`explicit DSH_HOME`，因 live daemon 独占 profile 端口而超时失败）。它按 `ensurePaseoProfile()`
+的固定路径动作，因此**确实触碰了 live home**：重写了共享锚点
+`~/.dsh/profiles/node_modules/dsh-paseo-bridge`（这是 `bootstrap.ts` 的 `sharedBridgeDir`
+设计位置，不是误写；改后与仓库 `dsh-bridge/` sha256 全等）、重写了 profile 生成的
+`~/.dsh/profiles/paseo/cordis.yml`（内容与 `bootstrap.ts` 的常量逐字节相等，DSH 每次启动
+本就会重写它）、并留下一条 `~/.dsh/paseo/catalog/<hash>.json` 模型目录缓存。三者均无功能
+差异，`package.json` / `cordis.patch.yml` / profile 的 `node_modules` / 凭据都未被触碰。
+改隔离 home 后 40/40 通过。**教训**：跑任何会起真 dsh 的脚本一律用一次性 `DSH_HOME`
+（`harness/isolated-dsh-home.cjs`），继承来的 `DSH_HOME` 会被当成"显式 home"。
+⑥ 另两处只由代码顺序推断、无断言：子代理自身**重放**行拿到父名册，靠
+`provider.ts` 先 `replayHistory` 再 `replaySubagents` 加创建时快照合并；显式空 `label`
+的删除不会传导到已学过的子 builder（`mergeTeamRoster` 只增不删）。
