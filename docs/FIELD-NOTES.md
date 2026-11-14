@@ -4007,8 +4007,8 @@ label（与今天一致，只能靠 750 ms 兜底打开）；③ live 打开的�
   `catalog-name-early-gated` 的「重复 fact 不重复打名字日志」随机制删除减 1）；`catalog-none` 从「根帧
   **之后**才打开」改反成「根帧**之前**就打开」；`catalog-after-flush` 断言迟到名字不改 title；
   `nested`/`name-missing`/`name-only`/replay 全部改为 `title=label`、无 description；
-  `bridge-server-check` **121 → 116**（删能力位 2 条、删 `listed` 1 条、删 stderr 名字日志 1 条，列表/
-  notice 断言改写）。
+  `bridge-server-check` **121 → 116**（删能力位 2 条、删 `listed` 2 条、删 stderr 名字日志 1 条，合计
+  5 条；其余列表/notice 断言改写）。
 - 验证（2026-11-15，离线，终版代码）：`subagent-check.cjs` **131/131**、`bridge-server-check.mjs`
   **116/116**、`bridge-assets-check.mjs` **2/2**、`tsc --noEmit` exit 0、改过的 `.js`/`.cjs` 过
   `node --check`；编译产物 `.dbg` 已清理（`git status` 只显示预期改动）。

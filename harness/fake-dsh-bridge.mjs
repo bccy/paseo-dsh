@@ -28,9 +28,10 @@
  *            *before* its parent's child-opened, with its earliest message and
  *            status first, so the plugin must hold and release the subtree.
  *            The three notices still carry DSH 0.2.2-rc.2+'s `name`/`path` the
- *            way a newer bridge sends them — this plugin ignores both (a child
- *            row is label-only since the 2026-11-15 revert), so the scenario pins
- *            that unknown identity keys change nothing
+ *            way a pre-revert (or any foreign) bridge sends them — this plugin
+ *            ignores both (a child row is label-only since the 2026-11-15
+ *            revert), so the scenario pins that unknown identity keys change
+ *            nothing
  *   name-missing
  *            the rc.1 shape (a child notice with only a creation label) plus a
  *            notice whose `name`/`path` are not strings: a foreign bridge's

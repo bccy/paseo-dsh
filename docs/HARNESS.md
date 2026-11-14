@@ -776,7 +776,7 @@
   同值；无：rc.1 形状两处都**没有该键**、label 照旧）、非字符串 `name`/`path` 被忽略（列表与
   通知都不出现伪值）、子会话仍按 label 打开、**每个 child 每字段恰好一行 stderr**（两次目录读
   不重复打）、且 `subagents()` 第二次读仍 `available:true`。**2026-11-14 第三轮再补 5 条
-  （实跑 121/121）**：`initialize` 回执的 `serverInfo.subagentNames` 在服务有 `namesOf`/`rootOf`
+  （当时实跑 121/121）**：`initialize` 回执的 `serverInfo.subagentNames` 在服务有 `namesOf`/`rootOf`
   时为 true、只有 rc.1 面（`listChildren`/`listDescendants`）时为 false（插件据此决定是否等
   catalog 的 name）、live 子会话的 `session.child-opened` **不带** `listed`、目录登记的子会话带
   `listed:true` 且仍带 name/path、父会话 `subagent/catalog` 事件**原样转发**（name 不被剥掉）。
@@ -784,8 +784,8 @@
   **保留 `name`**（插件 `team()` 的 roster 消费 `row.name ?? row.sessionId`）但不再转发 `path`；
   `session.child-opened` 不再带 `name`/`path`/`listed`；`initialize` 不再有
   `serverInfo.subagentNames`；非字符串 `name` 只被忽略（不再打 stderr 行，roster 回退到会话 id）；
-  父 `subagent/catalog` 仍按普通 `session.event` 原样转发。删掉能力位 2 条、`listed` 1 条、
-  stderr 行 1 条、并把列表/通知断言改写后**实跑 116/116**。
+  父 `subagent/catalog` 仍按普通 `session.event` 原样转发。删掉能力位 2 条、`listed` 2 条、
+  stderr 行 1 条（合计 5 条），并把列表/通知断言改写后**实跑 116/116**。
   **依赖本机 DSH 安装，所以不进 CI**
   （`DSH_PACKAGES_DIR` / `DSH_INSTALL_DIR` 可覆盖，解析失败 exit 2 并打印实际目录）。**动了
   `server.js` 的请求分派或这些只读路径必跑**；**另外，凡动了 `server.js` 的请求分派、会话生命
