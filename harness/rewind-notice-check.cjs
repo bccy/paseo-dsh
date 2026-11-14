@@ -67,6 +67,60 @@ function equal(label, actual, expected) {
   check(label, actual === expected, `expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
 }
 
+/**
+ * Phrasings that claim nothing happened at all — the one thing the persistence
+ * copy may not say.
+ *
+ * Every `rewind-persistence:` failure fires **after** the replacement marker was
+ * appended, and `session.append` applies its `surfaceOp` to the in-memory surface
+ * synchronously (`harness/revert-shape-probe.mjs` pins that). The copy may say the
+ * write did not reach disk; it may not deny the rewind happened.
+ *
+ * This is a set, not one exact phrase: the previous regex pinned the single
+ * sentence that existed at the time, so any reword ("什么都没撤回") passed. The
+ * list covers the wordings this copy could plausibly take in both columns, and
+ * `claimsNothingHappened` is itself asserted against a counterexample so the
+ * main check cannot go vacuous.
+ */
+const NOTHING_HAPPENED_CLAIMS = [
+  // zh-CN: "did not rewind anything" / "the rewind did not happen".
+  "未撤回任何内容",
+  "未撤回任何东西",
+  "什么都没撤回",
+  "没有撤回任何内容",
+  "没有撤回任何东西",
+  "撤回未发生",
+  "未发生撤回",
+  "没有发生撤回",
+  "未执行任何撤回",
+  "撤回没有发生",
+  // en: the same claim in the wordings this table uses.
+  "nothing was rewound",
+  "nothing has been rewound",
+  "nothing was reverted",
+  "nothing has been reverted",
+  "nothing was withdrawn",
+  "nothing happened",
+  "no rewind happened",
+  "the rewind did not happen",
+  "the rewind never happened",
+  "nothing was changed",
+];
+
+/**
+ * The phrase in `sentence` that claims nothing happened, or `undefined`.
+ *
+ * Chinese phrases match as substrings of the sentence; English ones match
+ * case-insensitively (a copy could capitalise "Nothing was rewound" after a
+ * colon).
+ */
+function claimsNothingHappened(sentence) {
+  const lowered = String(sentence).toLowerCase();
+  return NOTHING_HAPPENED_CLAIMS.find((phrase) => (
+    /^[\u4e00-\u9fff]/u.test(phrase) ? String(sentence).includes(phrase) : lowered.includes(phrase)
+  ));
+}
+
 const buildDir = resolvePluginBuild(process.argv[2], ".dbg-p17-client");
 console.log(`plugin build: ${buildDir}`);
 
@@ -350,15 +404,29 @@ async function main() {
     // The wording strength is an assertion, not a copy edit: the bridge appends
     // the replacement marker *before* it flushes, and `session.append` applies
     // `surfaceOp` to the in-memory surface immediately
-    // (`harness/revert-shape-probe.mjs` pins that), so "nothing was rewound" is
-    // false on all three paths. They must say the rewind was not written to disk.
+    // (`harness/revert-shape-probe.mjs` pins that), so a copy that says nothing
+    // happened is false on all three paths. They must say the rewind was not
+    // written to disk — in any wording, which is what the phrase set covers.
     for (const locale of ["en", "zh-CN"]) {
       const copy = REWIND_COPY[locale];
       const sentences = [copy.persistenceNoStore, copy.persistenceFlushFailed("x"), copy.persistenceNotDurable];
+      for (const [index, sentence] of sentences.entries()) {
+        check(
+          `${locale} persistence copy #${index + 1} does not claim nothing happened`,
+          claimsNothingHappened(sentence) === undefined,
+          `\"${String(claimsNothingHappened(sentence))}\" in ${JSON.stringify(sentence)}`,
+        );
+      }
+      // Positive control: without this, a detector that matches nothing would make
+      // every check above pass. This is the exact sentence the three paths used to
+      // emit, so a regression to it is caught in any locale.
+      const counterexample = locale === "zh-CN"
+        ? "撤回需要持久化的会话存储，但当前 profile 没有会话服务；什么都没撤回。"
+        : "Rewind needs a durable session store; nothing was rewound.";
       check(
-        `${locale} persistence copy does not claim the rewind never happened`,
-        sentences.every((sentence) => !/nothing was rewound|未撤回任何内容/u.test(sentence)),
-        sentences.join(" || "),
+        `${locale} the nothing-happened detector catches its counterexample`,
+        claimsNothingHappened(counterexample) !== undefined,
+        `counterexample not recognised: ${JSON.stringify(counterexample)}`,
       );
     }
   }

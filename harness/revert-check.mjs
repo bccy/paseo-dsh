@@ -1114,56 +1114,59 @@ console.log('shared-process lifecycle (behaviour, not source text)');
     const isolatedHome = mkdtempSync(join(tmpdir(), 'revert-shared-process-'));
     const previousHome = process.env.DSH_HOME;
     process.env.DSH_HOME = isolatedHome;
-    const provider = require(join(buildDir, 'server', 'provider.js'));
-    const conn = await provider.createDshProvider().connect({ capabilities: [] });
-    const providerEvents = [];
-    conn.onEvent((event) => providerEvents.push(event));
-    await conn.send({
-      type: 'session.open',
-      requestId: 'share-open',
-      sessionId: 'revert-pool-1',
-      config: { cwd: '/work', mode: 'build' },
-      history: 'skip',
-    });
-    await waitFor(() => providerEvents.some((event) => event.type === 'session.ready'), 5000);
-    // The provider spawns exactly one **shared** child (under its own sentinel id)
-    // plus a short-lived `catalog-probe` for the catalog read. The session does not
-    // get a process of its own — that is the change — so the claim is that it
-    // attached to the shared one.
-    const sharedProcess = spawned.find(
-      (process) => process.options?.sessionId === '__paseo_shared_process__',
-    );
-    const probeSpawns = spawned.filter(
-      (process) => process.options?.sessionId === 'catalog-probe',
-    ).length;
-    check(
-      'a provider session attaches to the one shared child',
-      sharedProcess !== undefined &&
-        spawned.filter((process) => process.options?.sessionId === '__paseo_shared_process__').length === 1 &&
-        sharedProcess.attached.has('revert-pool-1'),
-      `spawned [${spawned.map((process) => String(process.options?.sessionId)).join(', ')}]`
-        + ` (${String(probeSpawns)} probe spawn(s))`,
-    );
-    await conn.send({ type: 'session.close', sessionId: 'revert-pool-1' });
-    await sleep(300);
-    check(
-      'an idle provider-session close detaches but keeps the child alive',
-      sharedProcess !== undefined &&
-        sharedProcess.shutdownCalled === false &&
-        sharedProcess.killed === false &&
-        sharedProcess.running === true,
-      `shutdown ${String(sharedProcess?.shutdownCalled)}, killed ${String(sharedProcess?.killed)}`,
-    );
-    await conn.close();
-    check(
-      'provider teardown retires the shared child',
-      sharedProcess !== undefined &&
-        (sharedProcess.killed === true || sharedProcess.shutdownCalled === true),
-      `killed ${String(sharedProcess?.killed)}, shutdown ${String(sharedProcess?.shutdownCalled)}`,
-    );
-    if (previousHome === undefined) delete process.env.DSH_HOME;
-    else process.env.DSH_HOME = previousHome;
-    rmSync(isolatedHome, { recursive: true, force: true });
+    try {
+      const provider = require(join(buildDir, 'server', 'provider.js'));
+      const conn = await provider.createDshProvider().connect({ capabilities: [] });
+      const providerEvents = [];
+      conn.onEvent((event) => providerEvents.push(event));
+      await conn.send({
+        type: 'session.open',
+        requestId: 'share-open',
+        sessionId: 'revert-pool-1',
+        config: { cwd: '/work', mode: 'build' },
+        history: 'skip',
+      });
+      await waitFor(() => providerEvents.some((event) => event.type === 'session.ready'), 5000);
+      // The provider spawns exactly one **shared** child (under its own sentinel id)
+      // plus a short-lived `catalog-probe` for the catalog read. The session does not
+      // get a process of its own — that is the change — so the claim is that it
+      // attached to the shared one.
+      const sharedProcess = spawned.find(
+        (process) => process.options?.sessionId === '__paseo_shared_process__',
+      );
+      const probeSpawns = spawned.filter(
+        (process) => process.options?.sessionId === 'catalog-probe',
+      ).length;
+      check(
+        'a provider session attaches to the one shared child',
+        sharedProcess !== undefined &&
+          spawned.filter((process) => process.options?.sessionId === '__paseo_shared_process__').length === 1 &&
+          sharedProcess.attached.has('revert-pool-1'),
+        `spawned [${spawned.map((process) => String(process.options?.sessionId)).join(', ')}]`
+          + ` (${String(probeSpawns)} probe spawn(s))`,
+      );
+      await conn.send({ type: 'session.close', sessionId: 'revert-pool-1' });
+      await sleep(300);
+      check(
+        'an idle provider-session close detaches but keeps the child alive',
+        sharedProcess !== undefined &&
+          sharedProcess.shutdownCalled === false &&
+          sharedProcess.killed === false &&
+          sharedProcess.running === true,
+        `shutdown ${String(sharedProcess?.shutdownCalled)}, killed ${String(sharedProcess?.killed)}`,
+      );
+      await conn.close();
+      check(
+        'provider teardown retires the shared child',
+        sharedProcess !== undefined &&
+          (sharedProcess.killed === true || sharedProcess.shutdownCalled === true),
+        `killed ${String(sharedProcess?.killed)}, shutdown ${String(sharedProcess?.shutdownCalled)}`,
+      );
+    } finally {
+      if (previousHome === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = previousHome;
+      rmSync(isolatedHome, { recursive: true, force: true });
+    }
   }
 }
 

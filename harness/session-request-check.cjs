@@ -61,6 +61,12 @@
  *      of the canary's ordering: a truncating host would cut anything sent before
  *      the receipt, and this report has to survive). A partial file restore emits
  *      only the failure notice, never a success line beside it.
+ *  10. the bridge's **persistence failures** (`rewind-persistence:<code>`) are
+ *      worded by the provider before the host sees them: a known code arrives as
+ *      the localized sentence with the bridge's own reason preserved, and a code
+ *      this build does not know arrives **verbatim**. The wording table itself is
+ *      pinned by `harness/rewind-notice-check.cjs`; this drives the real
+ *      `session.revert` failure branch, which a pure-function test cannot.
  *
  * The completion copy is localized by `server/locale.ts`; this check pins the
  * Chinese column by setting `DSH_PASEO_LANG` before the plugin is required, so
@@ -535,6 +541,73 @@ const check = (name, pass, detail) => {
       && /· #2。/u.test(secondCanaryDescription)
       && secondCanaryDescription !== firstCanaryDescription,
     `${secondCanaries.length} notice(s); second=${JSON.stringify(secondCanaryDescription)} first=${JSON.stringify(firstCanaryDescription)}`,
+  );
+
+  // ---- 3b. persistence failures from the bridge reach the host worded -----
+  //
+  // A rewind that appended the replacement marker but could not make it durable
+  // answers `rewind-persistence:<code>` (`dsh-bridge/lib/server.js`,
+  // `REWIND_PERSISTENCE_PREFIX`): the bridge has no locale table and runs in the
+  // DSH child, so naming the prerequisite in the user's language is the
+  // provider's job (`shared/rewind-notice.ts` `rewindPersistenceFailure`).
+  //
+  // The sentence is spelled out here on purpose: importing it from the module
+  // under test would only prove the module equals itself, and this file's job is
+  // to pin copy. The bridge's detail is part of the sentence, so "flush-failed:
+  // disk full" must keep `disk full` — the user needs DSH's reason.
+  const knownPersistenceStart = events.length;
+  await conn.send({
+    type: "session.revert",
+    requestId: "revert-persistence-known",
+    sessionId,
+    token: { messageId: "revert-persistence-known" },
+    scope: "conversation",
+  });
+  const knownPersistenceFailure = await untilSince(
+    knownPersistenceStart,
+    (e) => e.requestId === "revert-persistence-known"
+      && (e.type === "request.completed" || e.type === "request.failed"),
+    "known persistence failure reply",
+  );
+  const KNOWN_PERSISTENCE_MESSAGE =
+    "撤回需要把替换标记写入磁盘，但会话日志 flush 失败；本次撤回没有落盘（重开会话会恢复被撤内容），文件与子代理均未改动（disk full）。";
+  check(
+    "a known persistence failure is request.failed, not a silent success",
+    knownPersistenceFailure.type === "request.failed",
+    JSON.stringify(knownPersistenceFailure.error ?? knownPersistenceFailure),
+  );
+  check(
+    "…and reaches the host as the localized sentence with the bridge's reason",
+    knownPersistenceFailure.error?.message === KNOWN_PERSISTENCE_MESSAGE,
+    JSON.stringify(knownPersistenceFailure.error?.message),
+  );
+  check(
+    "…with the machine prefix kept out of the user-facing message",
+    !String(knownPersistenceFailure.error?.message ?? "").includes("rewind-persistence:"),
+    JSON.stringify(knownPersistenceFailure.error?.message),
+  );
+
+  // A code this build does not word must reach the host as the bridge's own text:
+  // applying the nearest sentence would describe a failure mode nobody verified.
+  const unknownPersistenceStart = events.length;
+  await conn.send({
+    type: "session.revert",
+    requestId: "revert-persistence-unknown",
+    sessionId,
+    token: { messageId: "revert-persistence-unknown" },
+    scope: "conversation",
+  });
+  const unknownPersistenceFailure = await untilSince(
+    unknownPersistenceStart,
+    (e) => e.requestId === "revert-persistence-unknown"
+      && (e.type === "request.completed" || e.type === "request.failed"),
+    "unknown persistence failure reply",
+  );
+  check(
+    "an unknown persistence code is passed through verbatim",
+    unknownPersistenceFailure.type === "request.failed"
+      && unknownPersistenceFailure.error?.message === "rewind-persistence:future-code: x",
+    JSON.stringify(unknownPersistenceFailure.error ?? unknownPersistenceFailure),
   );
 
   // ---- 4. the scope decides whether there is a canary at all -------------

@@ -54,8 +54,10 @@
   `rewindPersistenceFailure`）：三码各自命中中英两份文案、`flush-failed` 的 detail 原样保留
   冒号与换行、detail 为空时不出现英文占位（中文句不再夹 "flush failed"）、未知码与非本前缀
   都**原样透传**（`undefined`；`not-durable` 因此必须是显式 `case`，两条断言联合钉住）、桥里
-  `rewind-persistence:` 字面量的**跨进程漂移守卫**，以及三条文案都不得声称「未撤回任何内容」
-  ——桥先 append 标记（内存 surface 已变）再 flush，失败的是落盘。
+  `rewind-persistence:` 字面量的**跨进程漂移守卫**，以及三条文案按**关键短语集合**不得声称
+  「什么都没撤回 / nothing was rewound」这类句子（只钉一条精确短语时，换个措辞就能绕过），
+  并带**检测器反例控制**（把旧句写回去必须被识别出来，主断言才非恒真）——桥先 append 标记
+  （内存 surface 已变）再 flush，失败的是落盘。
   **动了撤回文案、
   `shared/rewind-notice.ts`、`client/rewind-notice*.ts(x)` 或 `index.client.tsx` 的注册必跑。**
   运行：`node harness/rewind-notice-check.cjs`（自己编译到 `paseo-plugin/.dbg-p17-client`）。
@@ -77,7 +79,10 @@
   否则会落回生产 10 s 上限、所有秒级断言假红）。provider history 按 0.16 的
   `PluginSessionHistory.read(provider)` 读（不是数组）；「重建后时间线没有被撤的 assistant 行」
   依赖假桥的 `paseo/history` 在成功撤回后折叠（模拟真实桥 `surface.js` 的撤回缝折叠），否则
-  重建只能重放未变的脚本历史、断言没有实现可测。**动了 provider 的 `session.revert`
+  重建只能重放未变的脚本历史、断言没有实现可测。该折叠按 `scope !== "files"` 门控，与真实桥
+  `rewindsConversation` 一致（files-only 不动对话、不折）。**已知潜伏保真度差异**：`files.error`
+  / plan-failed 这类「对话已撤、文件层失败」的 success-error 回执，真实桥的标记已 append+flush
+  成功、历史会折，假桥不折——当前没有检查在其后重放历史；若新增这类检查，必须先补折叠。**动了 provider 的 `session.revert`
   分支、`server/rewind-notice-append.ts`、`index.server.ts` 的句柄捕获/arm RPC、降级复核/补发，
   或宿主 `agent-manager.js` 的 rewind/hydrate/staging 逻辑必跑**（运行约 40s）。运行：
   `node harness/rewind-notice-delivery-check.mjs`（自己编译到
@@ -455,7 +460,10 @@
   `harness/rewind-notice-delivery-check.mjs` 覆盖。假桥 + 一次性 `DSH_HOME`。**动了 provider 的
   `session.revert`/`sessions` 分支、能力位声明、canary/完成报告的发出位置与文案、`dsh-process.ts`
   的这两个请求、或假桥对应分支必跑**；**`listDshSessions`/`#listSessions` 或 `DshProcess.sessions()`
-  的 cwd 透传也算（断言出站帧 `params.cwd`）。**
+  的 cwd 透传也算（断言出站帧 `params.cwd`）。**本轮补第 10 段：桥的持久化失败码经**真实
+  `session.revert` 失败路径**到宿主——已知码（`flush-failed: disk full`）到宿主是本地化句子、
+  保留桥的原因，且机器前缀不得出现在用户消息里；未知码原样透传（不套本地化文案）。文案表本身
+  由 `harness/rewind-notice-check.cjs` 钉，纯函数断言不能替代这条路径。**
 - `harness/rewind-transaction-check.mjs` — 撤回事务（真实 `PaseoHarnessServer` + 真实
   `FileSnapshots` + 记录型 ctx，私临时目录，无 profile/daemon/模型）：计划在日志写入前后各算
   一次、door 挡住中途的写入、durability 失败保留文件与 journal、`runMaintenance` 缺失时在
@@ -921,7 +929,8 @@
   **正确地拒绝**再起第二个 dsh（防的是两个进程抢同一 profile 的固定端口 →
   `listen EADDRINUSE`），于是假 transport 永远不 spawn、
   断言只会读到 `undefined`。隔离 home 后没有记录、没有等待，用例才真的在测 pool 的
-  acquire/attach/release/retire。**动了 `dsh-bridge/lib/revert.js`、`provider.ts`/`session.ts` 的
+  acquire/attach/release/retire。恢复 `DSH_HOME` 与删除临时目录在 `try/finally` 里：用例中途
+  抛错也必须还原，否则后续检查会跑在空 home 上、临时目录也会残留。**动了 `dsh-bridge/lib/revert.js`、`provider.ts`/`session.ts` 的
   撤回分支或 `server.js` 的 revert 事务必跑。**
 - `harness/surface-check.mjs` — 重放折叠（`dsh-bridge/lib/surface.js`）：只折本桥撤回缝
   （空 `system/message` 替换，含被撤回合的尾随日志事件）、compaction 的 `user/message` 替换

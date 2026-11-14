@@ -1507,6 +1507,19 @@ async function handle(method, params, id) {
       const token = params === undefined || params === null ? undefined : params.token;
       const messageId = token !== null && typeof token === "object" ? token.messageId : undefined;
       if (messageId === "revert-unknown") throw new Error("撤回目标无法解析：该消息不在会话表面上");
+      if (messageId === "revert-persistence-known") {
+        // The bridge's shape for an append that succeeded but could not be made
+        // durable: `server.js` answers `rewind-persistence:flush-failed:<reason>`
+        // from `sessions.flush`. `session-request-check` drives it through the
+        // real provider to pin that the localized sentence keeps the reason.
+        throw new Error("rewind-persistence:flush-failed: disk full");
+      }
+      if (messageId === "revert-persistence-unknown") {
+        // A code from a newer bridge. The plugin knows three codes; this one must
+        // reach the host verbatim instead of inheriting a sentence for a failure
+        // mode it was never written for.
+        throw new Error("rewind-persistence:future-code: x");
+      }
       if (messageId === "revert-plan-failed") {
         // The bridge's post-durability failure shape: no per-path outcome, no
         // rescue copy, and a message that already names the cause and the
@@ -1607,7 +1620,21 @@ async function handle(method, params, id) {
       // appended a replacement event before answering, and its `paseo/history`
       // answers with the folded (shorter) log; the state flag below is how this
       // scripted bridge models that single durable effect for `paseo/history`.
-      rewoundSessions.add(String(params?.sessionId ?? ""));
+      //
+      // Only `conversation` / `both` touch the conversation half: the real bridge
+      // gates the marker append (and therefore the fold) on
+      // `scope !== "files"` (`dsh-bridge/lib/server.js` `rewindsConversation` at
+      // `:3525` / `:3596`), so a files-only rewind must replay the same log.
+      //
+      // Known fidelity gap, latent: the real bridge has already folded by the
+      // time it answers a **post-durability** failure — the `files.error` /
+      // plan-failed shapes above answer a success receipt after the marker was
+      // appended and flushed, so their history is shorter too. This stand-in does
+      // not mark those. No check reopens a session after one of them today; a
+      // check that starts to must fold there as well.
+      if (params?.scope !== "files") {
+        rewoundSessions.add(String(params?.sessionId ?? ""));
+      }
       return { kind: "success", text: "Withdrawn seq 3 and everything after it" };
     }
     case "paseo/subagents": {
