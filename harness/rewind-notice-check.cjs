@@ -104,7 +104,9 @@ const NOTHING_HAPPENED_CLAIMS = [
   "no rewind happened",
   "the rewind did not happen",
   "the rewind never happened",
-  "nothing was changed",
+  // Deliberately narrow: "nothing was changed" is dropped because a legitimate
+  // copy can say "nothing was changed in the working tree" (the file layer really
+  // is untouched on these failures), which this table must not flag.
 ];
 
 /**

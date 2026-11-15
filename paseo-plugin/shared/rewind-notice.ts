@@ -220,7 +220,7 @@ export const REWIND_COPY: Readonly<Record<RewindLocale, RewindCopy>> = Object.fr
         ? "Rewind needs the replacement marker to reach disk, but flushing the session failed; this rewind was not written to disk (reopening the conversation brings the withdrawn rows back), and no files or delegated turns were touched."
         : `Rewind needs the replacement marker to reach disk, but flushing the session failed; this rewind was not written to disk (reopening the conversation brings the withdrawn rows back), and no files or delegated turns were touched (${detail}).`,
     persistenceNotDurable:
-      "Rewind needs a durable session store (`sessions.flush` must return true), but this profile's store persisted nothing; this rewind was not written to disk (reopening the conversation brings the withdrawn rows back), and no files or delegated turns were touched.",
+      "Rewind needs a durable session store (`sessions.flush` must return true), but this profile's store persisted nothing; this rewind was not written to disk, and no files or delegated turns were touched.",
   }),
   "zh-CN": Object.freeze({
     conversation: "已撤回到这条消息",
@@ -240,7 +240,7 @@ export const REWIND_COPY: Readonly<Record<RewindLocale, RewindCopy>> = Object.fr
         ? "撤回需要把替换标记写入磁盘，但会话日志 flush 失败；本次撤回没有落盘（重开会话会恢复被撤内容），文件与子代理均未改动。"
         : `撤回需要把替换标记写入磁盘，但会话日志 flush 失败；本次撤回没有落盘（重开会话会恢复被撤内容），文件与子代理均未改动（${detail}）。`,
     persistenceNotDurable:
-      "撤回需要持久化的会话存储（sessions.flush 必须返回 true），但当前 profile 的存储未写入任何持久化后端；本次撤回没有落盘（重开会话会恢复被撤内容），文件与子代理均未改动。",
+      "撤回需要持久化的会话存储（sessions.flush 必须返回 true），但当前 profile 的存储未写入任何持久化后端；本次撤回没有落盘，文件与子代理均未改动。",
   }),
 } satisfies Record<RewindLocale, RewindCopy>);
 
