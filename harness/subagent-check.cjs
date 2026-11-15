@@ -1945,16 +1945,21 @@ async function openSession(conn, sessionId, history) {
   //
   // **What the rollback owes, measured rather than assumed:**
   //
-  //   frames after the failure:  paseo/catalog@<probe>, initialize@<child>
-  //   frames after a retry:      ... initialize@<a different pid>
-  //   frames after close:        shutdown@<the retried child>
+  //   frames after the failure:  paseo/catalog@<child>, initialize@<child> (rejected)
+  //   frames after a retry:      initialize@<the same child> (accepted, re-pinned)
+  //   frames after close:        shutdown@<that child>, exactly once
   //
-  // Two things follow, and the old assertion had both wrong. First, there is **no
-  // `shutdown` at the moment of failure**: `start()` failed, so the child was
-  // killed before it was ever recorded as pooled (`provider.ts` kill-on-start
-  // -failure), and shutting the pool down there would be wrong anyway — the shared
-  // child may be serving other conversations. Second, the proof of "no leak" is
-  // that the **retry gets a fresh child**, not that a shutdown appears.
+  // Three things follow, and the assertion this replaced had the last two wrong.
+  // First, there is **no `shutdown` at the moment of failure**: shutting the pool
+  // down there would be wrong anyway — the shared child may be serving other
+  // conversations (that is the product behaviour keep). Second, since the cold
+  // prewarm spawns the child at `connect()` and the process-level `initialize` is
+  // **deferred** to the first session's `pinRoute()` (`dsh-process.ts`
+  // `deferRoute`), a rejected `initialize` fails the *open*, not the child: the
+  // child stays live and the retry re-sends `pinRoute` on it. A fresh child per
+  // retry is therefore no longer the leak proof — the proof is "no new child, the
+  // same child re-pins its route". Third, the child must still be retired exactly
+  // once when the connection closes.
   const failOpenLog = path.join(require("node:os").tmpdir(), `dsh-fake-log-${Date.now()}.jsonl`);
   const connFailOpen = await registration.connect({ capabilities: ["prompt.message", "session.subsession"] });
   const connFailOpenEvents = [];
@@ -2021,10 +2026,18 @@ async function openSession(conn, sessionId, history) {
   );
   const retryFrames = readFailOpenFrames();
   const retryPids = [...new Set(retryFrames.map((frame) => frame.pid))];
+  const initializeCount = (frames) => frames.filter((frame) => frame.method === "initialize").length;
+  // The product keeps one shared child alive when a session's route fails to pin
+  // (a shared child may be serving siblings; killing it per failed open was the
+  // old behaviour). What must hold instead: no second child appears, and the
+  // retry really re-sent the deferred process-level `initialize` on the same pid.
   check(
-    "a retry after a failed open spawns a fresh child instead of reusing the corpse",
-    retryPids.length > failOpenPids.length,
-    `failed run pids [${failOpenPids.join(",")}], after retry [${retryPids.join(",")}]`,
+    "a retry after a failed open reuses the shared child and re-pins its route",
+    retryPids.every((pid) => failOpenPids.includes(pid))
+      && retryPids.length === failOpenPids.length
+      && initializeCount(retryFrames) > initializeCount(failOpenFrames),
+    `failed run pids [${failOpenPids.join(",")}], after retry [${retryPids.join(",")}], `
+      + `initialize frames ${String(initializeCount(failOpenFrames))} → ${String(initializeCount(retryFrames))}`,
   );
   void retryMark;
 
@@ -2032,20 +2045,22 @@ async function openSession(conn, sessionId, history) {
   // open left nothing outstanding.
   await connFailOpen.send({ type: "session.close", sessionId: retrySession });
   await connFailOpen.close();
-  const failOpenRetired = await (async () => {
+  const shutFrames = await (async () => {
     const deadline = Date.now() + 20_000;
+    let seen = [];
     while (Date.now() < deadline) {
-      if (readFailOpenFrames().some((frame) => frame.method === "shutdown")) return true;
+      seen = readFailOpenFrames().filter((frame) => frame.method === "shutdown");
+      if (seen.length > 0) break;
       await sleep(250);
     }
-    return false;
+    return seen;
   })();
   check(
-    "and the connection still retires its child after the failed open",
-    failOpenRetired,
-    failOpenRetired
-      ? "shutdown frame observed"
-      : `frames: ${readFailOpenFrames().map((frame) => frame.method).join(", ")}`,
+    "and the connection retires the failed-open child exactly once",
+    shutFrames.length === 1 && retryPids.includes(shutFrames[0]?.pid),
+    shutFrames.length === 0
+      ? `no shutdown frame; frames: ${readFailOpenFrames().map((frame) => frame.method).join(", ")}`
+      : `${String(shutFrames.length)} shutdown frame(s): ${shutFrames.map((frame) => `pid ${String(frame.pid)}`).join(", ")}`,
   );
   delete process.env.DSH_FAKE_LOG;
 

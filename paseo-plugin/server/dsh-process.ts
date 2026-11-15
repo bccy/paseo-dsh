@@ -990,6 +990,22 @@ export interface DshProcessOptions extends DshProcessHandlers {
    */
   initializeRoute?: boolean;
   /**
+   * Leave the process-level route **unpinned** in `start()` and let the first
+   * attached session pin it through {@link DshProcess.pinRoute}.
+   *
+   * Used by the connection prewarm when the profile's catalog is not on disk
+   * (a profile edit, a DSH upgrade or a key rotation invalidates it): the route is
+   * only this process's default, and the first session initializes with its own
+   * any way. Spawning still boots the profile — which is the whole point of the
+   * prewarm — without reading a cold catalog through a throwaway probe, the spawn
+   * that used to collide with the successor's shared child on the profile's fixed
+   * listener.
+   *
+   * Unlike `initializeRoute: false` this leaves `#ensureSessionReady` armed, so
+   * sessions still initialize normally once their route is pinned.
+   */
+  deferRoute?: boolean;
+  /**
    * Cap on in-flight requests; production uses {@link DEFAULT_MAX_PENDING_REQUESTS}.
    *
    * Exposed so a check can drive the refusal path with a small value instead of
@@ -1864,6 +1880,8 @@ export class DshProcess {
   /** Whether the process-level exit callback has already fired for this child. */
   #exitReported = false;
   #initializeTask: Promise<void> | undefined;
+  /** In-flight {@link DshProcess.pinRoute}; idempotent per child. */
+  #routeTask: Promise<void> | undefined;
   /** Resolved once the child is gone; created lazily by {@link waitForExit}. */
   #exited: Promise<void> | undefined;
   #resolveExited: (() => void) | undefined;
@@ -2175,6 +2193,28 @@ export class DshProcess {
     return this.#initializeTask;
   }
 
+  /**
+   * Pin this process's default route after a deferred start.
+   *
+   * Only a child built with `deferRoute` does anything here: every other child
+   * pinned a route in `start()`, and a probe (`initializeRoute: false`) must never
+   * pin one — a bad route would hide the model list it exists to read. Idempotent
+   * and memoized, so concurrent acquires of one prewarmed child send exactly one
+   * process-level `initialize`. A failed pin is not memoized: the next acquire
+   * retries instead of inheriting a rejection nobody kept.
+   *
+   * @param route - the route of the session that joined the prewarmed child.
+   */
+  pinRoute(route: DshRoute): Promise<void> {
+    if (this.#options.initializeRoute === false || this.#options.deferRoute !== true) return Promise.resolve();
+    this.#routeTask ??= this.#prepareProcess(route);
+    const task = this.#routeTask;
+    task.catch(() => {
+      if (this.#routeTask === task) this.#routeTask = undefined;
+    });
+    return task;
+  }
+
   async #start(): Promise<void> {
     // Translate the construction session's MCP servers before spawning: a server
     // DSH cannot mount must fail the start — and be reported by the provider —
@@ -2293,6 +2333,11 @@ export class DshProcess {
     });
 
     if (this.#options.initializeRoute === false) return;
+    if (this.#options.deferRoute === true) {
+      // The route is pinned by the first session (see {@link pinRoute}): the
+      // prewarm's spawn must not need the catalog on disk to boot the profile.
+      return;
+    }
 
     // The **process** is initialized here, never the construction id as a
     // session. See {@link #prepareProcess}: the shared process is built under a
@@ -2331,8 +2376,7 @@ export class DshProcess {
    * {@link attachSession} does so explicitly, so that id initializes itself with
    * its own id on first use.
    */
-  async #prepareProcess(): Promise<void> {
-    const route = this.#options.route;
+  async #prepareProcess(route: DshRoute = this.#options.route): Promise<void> {
     await this.#request("initialize", {
       cwd: this.#options.cwd,
       provider: route.provider,

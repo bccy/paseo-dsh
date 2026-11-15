@@ -61,6 +61,7 @@ import {
   systemProcessProbe,
   reclaimPreviousSharedDsh,
   writeSharedDshRecord,
+  type ProcessProbe,
 } from "./shared-dsh-record";
 import { rewindCanaryNotice } from "./rewind-canary";
 import { beginRewindReport, fallbackNoticeDescription, type RewindReportFallback } from "./rewind-notice-append";
@@ -331,6 +332,191 @@ function probeProcess(cwd: string, sessionId: string): DshProcess {
 }
 
 /**
+ * Bound for a killed probe to be reaped before the next child boots.
+ *
+ * `DshProcess.kill()` sends SIGTERM and SIGKILLs only at +4 s, so this bound has
+ * to sit past that. On expiry the next spawn is still attempted (a probe that
+ * will not die must not wedge every open) and the risk is reported.
+ */
+const PROBE_EXIT_TIMEOUT_MS = 10_000;
+
+/**
+ * One profile-booting `dsh` at a time, per plugin process.
+ *
+ * The `paseo` profile pins `webserver` to one fixed host:port (the user's own
+ * `cordis.patch.yml`; bookmarks and cookies depend on it), so two `dsh` children
+ * of one plugin process cannot both boot it: the second dies at profile start
+ * with `listen EADDRINUSE … webserver (required)`. Both the resident shared child
+ * and the throwaway probes boot that profile, and `DshProcess.kill()` returns
+ * before the child is reaped, so "kill the probe, spawn the shared child" is a
+ * real race. Measured on the 2026-11-15T05:50:03Z daemon restart: the first
+ * open's shared child died at bind with `listen EADDRINUSE … 44209`
+ * (`webserver (required)`) and the retry 4.4 s later succeeded.
+ *
+ * The gate serializes every profile spawn with the **exit** of the previous one.
+ * A probe that finds the shared child alive reuses it instead of spawning: the
+ * profile has one listener, so there is no second process for it to be.
+ */
+let profileChildGate: Promise<void> = Promise.resolve();
+function withProfileChildGate<T>(work: () => Promise<T>): Promise<T> {
+  const previous = profileChildGate;
+  let release!: () => void;
+  profileChildGate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return previous.then(work).finally(release);
+}
+
+/**
+ * Where the cross-process record of a shared child lives, and the profile it serves.
+ *
+ * Resolved from the **child's** environment, exactly as `DshProcess.#start`
+ * resolves it: the daemon's environment with the session's keys on top. Two
+ * different homes (or profiles) are different DSH runtimes on different session
+ * stores, so they must not wait on each other's record.
+ *
+ * @param env - the session env the spawn was asked to use.
+ */
+function sharedDshIdentity(env: Readonly<Record<string, string | undefined>>): {
+  path: string;
+  home: string;
+  profile: string;
+} {
+  const merged: Record<string, string | undefined> = { ...process.env, ...env };
+  const home = dshHome(merged);
+  const profile = profileName(merged);
+  return { path: sharedDshRecordPath(home, profile), home, profile };
+}
+
+/**
+ * Wait, bounded, for the previous plugin process's shared child to exit.
+ *
+ * Extracted from the connection because **both spawn paths** must do it: the
+ * shared child (its pool never sees a child of another OS process) and the
+ * throwaway probes (a successor's first catalog read can happen before any
+ * session opens, and used to spawn straight into the orphan's port).
+ * `shared-dsh-record.ts` owns the identity rules and the staged reclaim; this
+ * function only turns its outcome into the provider's log/throw contract.
+ *
+ * @param options.env - environment of the spawn that is about to happen.
+ * @param options.processProbe - injectable process probe (the record's identity checks).
+ * @param options.log - one line per reclaim step.
+ */
+async function awaitPreviousSharedDshRecord(options: {
+  env: Readonly<Record<string, string | undefined>>;
+  processProbe: ProcessProbe;
+  log: (line: string) => void;
+}): Promise<void> {
+  const state = sharedDshIdentity(options.env);
+  const recorded = readSharedDshRecord(state.path);
+  if (recorded !== undefined && SERVING_SHARED_DSH.has(recorded.pid)) {
+    // Another live connection of this process is serving that child. Its port is
+    // not an orphan's port: this spawn may proceed (the two contexts are as
+    // separate as they were before the record existed).
+    return;
+  }
+  const outcome = await reclaimPreviousSharedDsh({
+    path: state.path,
+    home: state.home,
+    profile: state.profile,
+    waitMs: sharedDshWaitMs(),
+    selfPid: process.pid,
+    probe: options.processProbe,
+    log: options.log,
+  });
+  if (outcome.state === "timed-out") {
+    const record = readSharedDshRecord(state.path);
+    const message =
+      record === undefined
+        ? `the shared dsh of the previous plugin process did not exit within ${String(outcome.waitedMs)} ms `
+          + `(pid ${String(outcome.pid)}, record ${state.path}); refusing to spawn a second dsh for profile `
+          + `"${state.profile}" beside it`
+        : sharedDshStillRunningMessage({
+          record,
+          waitedMs: outcome.waitedMs,
+          ownerAlive: outcome.ownerAlive,
+          verified: outcome.verified,
+        });
+    options.log(`[${PROVIDER_ID}] ${message}`);
+    throw new Error(message);
+  }
+  if (outcome.state === "waited" && outcome.waitedMs >= 250) {
+    options.log(
+      `[${PROVIDER_ID}] waited ${String(outcome.waitedMs)} ms for the previous plugin process's shared dsh `
+        + `(pid ${String(outcome.pid)}) to exit before spawning a new one`,
+    );
+  }
+  if (outcome.state === "reused") {
+    options.log(
+      `[${PROVIDER_ID}] ignoring the shared-dsh record: ${outcome.reason}; `
+        + "that pid is not this DSH home's child any more",
+    );
+  }
+  if (outcome.state === "foreign") {
+    options.log(
+      `[${PROVIDER_ID}] ignoring a shared-dsh record for profile "${outcome.profile}" (pid `
+        + `${String(outcome.pid)}): it is a different DSH runtime, not this spawn's previous child`,
+    );
+  }
+}
+
+/**
+ * Run one throwaway probe under the profile-child gate.
+ *
+ * The gate is what keeps a probe's process from racing the shared child's boot
+ * on the profile's fixed listener (see {@link withProfileChildGate}); the record
+ * wait is what keeps it from racing the *previous plugin process's* child. When
+ * this process already has a live shared child, that child is used instead —
+ * booting a second `dsh` on the same profile is impossible, and the shared child
+ * answers the same process-wide requests (catalog, sessions, archive).
+ *
+ * `awaitResident` runs **outside** the gate: it waits for an in-flight pool spawn
+ * to publish, and that spawn holds the gate, so awaiting it inside would
+ * deadlock. After it returns, the `resident` re-check inside the gate is the one
+ * that decides.
+ *
+ * @param options.cwd - working directory for the probe (or ignored when reusing).
+ * @param options.sessionId - sentinel id in logs and the record.
+ * @param options.awaitResident - wait for an in-flight pool spawn (class-owned).
+ * @param options.resident - the live shared child, when this connection has one.
+ * @param options.env - the spawn's environment (default: this process's).
+ * @param options.use - one request against whichever child was chosen.
+ */
+async function withProfileProbe<T>(options: {
+  cwd: string;
+  sessionId: string;
+  awaitResident?: () => Promise<void>;
+  resident?: () => DshProcess | undefined;
+  env?: Readonly<Record<string, string | undefined>>;
+  use: (child: DshProcess) => Promise<T>;
+}): Promise<T> {
+  if (options.awaitResident !== undefined) await options.awaitResident();
+  return withProfileChildGate(async () => {
+    const resident = options.resident?.();
+    if (resident !== undefined && resident.running) return options.use(resident);
+    await awaitPreviousSharedDshRecord({
+      env: options.env ?? process.env,
+      processProbe: systemProcessProbe(),
+      log: (line) => process.stderr.write(`${line}\n`),
+    });
+    const probe = probeProcess(options.cwd, options.sessionId);
+    try {
+      await probe.start();
+      return await options.use(probe);
+    } finally {
+      probe.kill();
+      const exited = await probe.waitForExit(PROBE_EXIT_TIMEOUT_MS);
+      if (!exited) {
+        process.stderr.write(
+          `[${PROVIDER_ID}] the ${options.sessionId} dsh probe (pid ${String(probe.pid)}) did not exit within `
+            + `${String(PROBE_EXIT_TIMEOUT_MS)} ms of its kill; the next spawn may race its fixed listener port\n`,
+        );
+      }
+    }
+  });
+}
+
+/**
  * Whether a persisted catalog is the whole shape `#open` and the composer use.
  *
  * The disk cache is JSON written by another process of another version, so it is
@@ -362,7 +548,10 @@ function isUsableDisplayCatalog(value: unknown): value is DisplayCatalog {
 }
 
 /** Read the runtime catalog through a short-lived process and cache it by cwd. */
-async function loadCatalog(cwd: string): Promise<DisplayCatalog> {
+async function loadCatalog(
+  cwd: string,
+  access: { awaitResident?: () => Promise<void>; resident?: () => DshProcess | undefined } = {},
+): Promise<DisplayCatalog> {
   const cached = cachedCatalog(cwd);
   if (cached !== undefined) return cached;
   // The probe boots a whole `dsh` (measured 4.2 s on a real profile), and the
@@ -396,21 +585,20 @@ async function loadCatalog(cwd: string): Promise<DisplayCatalog> {
     fingerprint = undefined;
     process.stderr.write(`[${PROVIDER_ID}] catalog cache unavailable (${messageOf(error)}); reading the runtime\n`);
   }
-  const probe = probeProcess(cwd, "catalog-probe");
-  try {
-    await probe.start();
-    const raw: DshCatalog = await probe.catalog();
-    const value = toDisplayCatalog(raw);
-    cacheCatalog(cwd, value);
-    if (diskPath !== undefined && fingerprint !== undefined) {
-      // `writeCatalogCache` refuses an empty model list itself: that answer is the
-      // asynchronous-materialization race, not a fact about the profile.
-      writeCatalogCache({ path: diskPath, fingerprint, catalog: value });
-    }
-    return value;
-  } finally {
-    probe.kill();
+  const raw = await withProfileProbe({
+    cwd,
+    sessionId: "catalog-probe",
+    ...access,
+    use: (child) => child.catalog(),
+  });
+  const value = toDisplayCatalog(raw);
+  cacheCatalog(cwd, value);
+  if (diskPath !== undefined && fingerprint !== undefined) {
+    // `writeCatalogCache` refuses an empty model list itself: that answer is the
+    // asynchronous-materialization race, not a fact about the profile.
+    writeCatalogCache({ path: diskPath, fingerprint, catalog: value });
   }
+  return value;
 }
 
 /**
@@ -429,18 +617,18 @@ async function loadCatalog(cwd: string): Promise<DisplayCatalog> {
 async function listDshSessions(
   probeCwd: string,
   options: { cwd?: string; query?: string; limit?: number },
+  access: { awaitResident?: () => Promise<void>; resident?: () => DshProcess | undefined } = {},
 ): Promise<Array<{ sessionId: string; cwd?: string; title?: string; createdAt?: number }>> {
-  const probe = probeProcess(probeCwd, "sessions-probe");
-  try {
-    await probe.start();
-    return await probe.sessions({
+  return withProfileProbe({
+    cwd: probeCwd,
+    sessionId: "sessions-probe",
+    ...access,
+    use: (child) => child.sessions({
       ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
       ...(options.query === undefined ? {} : { query: options.query }),
       ...(options.limit === undefined ? {} : { limit: options.limit }),
-    });
-  } finally {
-    probe.kill();
-  }
+    }),
+  });
 }
 
 /**
@@ -454,17 +642,22 @@ async function listDshSessions(
  * it; a refusal (unknown session, active session, absent registry) still
  * throws, so a click that does nothing is never reported as success.
  */
-async function applyArchivedStandalone(dshSessionId: string, archived: boolean): Promise<void> {
-  const probe = probeProcess(process.cwd(), "archive-probe");
-  try {
-    await probe.start();
-    const result = await probe.setArchived(dshSessionId, archived);
-    if (!result.available) {
-      throw new Error(result.error?.message ?? `${archived ? "archive" : "unarchive"} failed`);
-    }
-  } finally {
-    probe.kill();
-  }
+async function applyArchivedStandalone(
+  dshSessionId: string,
+  archived: boolean,
+  access: { awaitResident?: () => Promise<void>; resident?: () => DshProcess | undefined } = {},
+): Promise<void> {
+  await withProfileProbe({
+    cwd: process.cwd(),
+    sessionId: "archive-probe",
+    ...access,
+    use: async (child) => {
+      const result = await child.setArchived(dshSessionId, archived);
+      if (!result.available) {
+        throw new Error(result.error?.message ?? `${archived ? "archive" : "unarchive"} failed`);
+      }
+    },
+  });
 }
 
 function toDisplayCatalog(raw: DshCatalog): DisplayCatalog {
@@ -798,11 +991,14 @@ class DshConnection implements ProviderConnection {
    * ordinary spawn path and reports its own error to the user. A child that dies
    * is likewise not restarted here (no supervision loop): the next open spawns.
    *
-   * The route comes from the profile's own default via the catalog on disk, never
-   * from a hardcoded provider/model (this repository is shared). A cold catalog is
-   * **not** read here: doing that would spawn a throwaway probe and boot the whole
-   * profile a second time, which is the very cost this removes. A profile with no
-   * usable cache is reported and left to the first open.
+   * The route, when the catalog cache has one, is the profile's own default —
+   * never a hardcoded provider/model (this repository is shared). A cold catalog is
+   * still not **read** here: doing that would spawn a throwaway probe and boot the
+   * whole profile a second time, which is the very cost this removes. Instead the
+   * child is spawned with the route **deferred** (`DshProcessOptions.deferRoute`)
+   * and the first session pins its own route before initializing; the prewarm must
+   * survive the cold cache, because a profile edit or a DSH upgrade invalidates
+   * that cache and that reload is exactly when the cold boot hurts.
    *
    * The child is spawned with an empty env: a real session's `config.env` carries
    * only the daemon's three per-agent identity keys (host 0.16
@@ -817,19 +1013,21 @@ class DshConnection implements ProviderConnection {
   prewarmSharedDsh(): void {
     const task = (async (): Promise<void> => {
       if (this.#closed) return;
+      // A cold catalog is **not** a reason to skip: the route is only the child's
+      // process-level default, and the first session pins its own route before it
+      // initializes (`DshProcess.pinRoute`). Reading the cold catalog here would
+      // boot a throwaway probe first — the cost the prewarm exists to remove — and
+      // giving up would leave the first open to pay the whole cold boot in the
+      // user's window, which is exactly where the fixed-port race lives.
       const route = this.#prewarmRoute();
-      if (route === undefined) {
-        process.stderr.write(
-          `[${PROVIDER_ID}] prewarm skipped: the profile's catalog is not on disk yet, so its default route is unknown and `
-            + "reading it would boot a second dsh; the first session open will spawn the shared child itself\n",
-        );
-        return;
-      }
       this.#prewarmSpawn = true;
-      const prewarm = await this.#ensurePoolProcess({ route, env: {} })
-        .finally(() => {
-          this.#prewarmSpawn = false;
-        });
+      const prewarm = await this.#ensurePoolProcess({
+        route: route ?? FALLBACK_ROUTE,
+        env: {},
+        deferRoute: route === undefined,
+      }).finally(() => {
+        this.#prewarmSpawn = false;
+      });
       const { process: child, reused } = prewarm;
       if (!reused && this.#claimsOf(child) === 0) {
         // Marked only once published and still unclaimed: a session that opened
@@ -837,7 +1035,10 @@ class DshConnection implements ProviderConnection {
         // `#ensurePoolProcess`'s join path.
         this.#poolPrewarmed = true;
         process.stderr.write(
-          `[${PROVIDER_ID}] prewarmed the shared dsh (pid ${String(child.pid)}); the next session open reuses it\n`,
+          route === undefined
+            ? `[${PROVIDER_ID}] prewarmed the shared dsh (pid ${String(child.pid)}) with no route: the profile's `
+              + "catalog is not on disk, so the first session pins its own route\n"
+            : `[${PROVIDER_ID}] prewarmed the shared dsh (pid ${String(child.pid)}); the next session open reuses it\n`,
         );
       }
     })();
@@ -911,6 +1112,18 @@ class DshConnection implements ProviderConnection {
   }
 
   /**
+   * How the throwaway probes reach this connection's shared child.
+   *
+   * The profile has exactly one listener, so a probe may never spawn while the
+   * shared child lives: it must use that child instead (`withProfileProbe`). The
+   * `awaitResident` half waits for an in-flight spawn to publish, and is called
+   * outside the spawn gate by design (the spawn holds it).
+   */
+  #probeAccess(): { awaitResident: () => Promise<void>; resident: () => DshProcess | undefined } {
+    return { awaitResident: () => this.#awaitPoolSpawn(), resident: () => this.#livePoolProcess() };
+  }
+
+  /**
    * Ensure this connection has a live shared child, spawning one if it has none.
    *
    * The returned process is started (its `start()` completed), so the caller can
@@ -961,6 +1174,12 @@ class DshConnection implements ProviderConnection {
   async #ensurePoolProcess(options: {
     route: DshRoute;
     env: Record<string, string>;
+    /**
+     * Spawn without pinning the route, for the cold-catalog prewarm: the route is
+     * pinned by the first session (`DshProcess.pinRoute`). Never set on a spawn
+     * that serves a session.
+     */
+    deferRoute?: boolean;
   }): Promise<{ process: DshProcess; reused: boolean }> {
     // `send()` guards only at its entry; an open that is already past it when
     // the connection is torn down must not spawn a child nobody owns.
@@ -996,7 +1215,7 @@ class DshConnection implements ProviderConnection {
       // (`FIELD-NOTES` 106).
       return { process: shared, reused: !this.#prewarmSpawn };
     }
-    const spawnTask = (async (): Promise<DshProcess> => {
+    const spawnTask = (async (): Promise<DshProcess> => withProfileChildGate(async (): Promise<DshProcess> => {
       // Nothing is spawned before the *previous* plugin process's shared child is
       // provably gone. That child belongs to another OS process, so the pool's
       // own accounting cannot see it; its owner was stopped on Paseo's 2 s budget
@@ -1019,6 +1238,7 @@ class DshConnection implements ProviderConnection {
         route: options.route,
         sessionId: POOL_PLACEHOLDER_SESSION_ID,
         env: options.env,
+        ...(options.deferRoute === true ? { deferRoute: true } : {}),
         // MCP servers are per session now (`paseo/mcp/set`), so the process
         // default stays empty; `attachSession` carries each session's own map.
         onEvent: () => {},
@@ -1050,26 +1270,30 @@ class DshConnection implements ProviderConnection {
         child.kill();
         throw error;
       }
+      // Published **inside** the gate: a probe that acquires the gate next must
+      // find the child already in the pool and reuse it, instead of spawning a
+      // second one into the same profile port one microtask later.
+      if (this.#closed) {
+        child.kill();
+        throw new Error("the provider connection is closed");
+      }
+      this.#pooled = child;
+      if (child.pid !== undefined) {
+        SERVING_SHARED_DSH.add(child.pid);
+      }
+      // Marked here, while the spawn is still inside the gate: `#prewarmSpawn` is
+      // true exactly when the prewarm is the spawner (a session never spawns
+      // beside an in-flight prewarm — it joins it). A first session that lands
+      // before the prewarm's own continuation runs must still see the same
+      // "prewarmed and untouched" child the published-after case sees, so the
+      // retirement decision cannot depend on that microtask race.
+      this.#poolPrewarmed = this.#prewarmSpawn;
+      this.#poolEnv = { ...options.env };
       return child;
-    })();
+    }))();
     this.#poolSpawn = spawnTask;
     try {
       const started = await spawnTask;
-      // Re-checked **after** the spawn: a `close()` that ran while `start()` was
-      // in flight has already shut the pool down (there was no child to wait for
-      // yet), so publishing this one would resurrect a process on a dead
-      // connection. Nothing would ever release it, and the orphan would keep
-      // holding the session logs' write locks. Kill it here — teardown no longer
-      // knows it exists.
-      if (this.#closed) {
-        started.kill();
-        throw new Error("the provider connection is closed");
-      }
-      this.#pooled = started;
-      if (started.pid !== undefined) {
-        SERVING_SHARED_DSH.add(started.pid);
-      }
-      this.#poolEnv = { ...options.env };
       return { process: started, reused: false };
     } finally {
       // Cleared on failure too, so a retry spawns again rather than awaiting a
@@ -1102,8 +1326,19 @@ class DshConnection implements ProviderConnection {
     route: DshRoute;
     env: Record<string, string>;
   }): Promise<{ process: DshProcess; reused: boolean; envDiffering: string[] }> {
+    // A first session that lands **inside** the prewarm's spawn used to join an
+    // env-less child and only get a warning, while the same session arriving a
+    // moment later took `#retireUnusedPrewarmFor` and defined the spawn env — the
+    // same input with two outcomes depending on timing. Waiting for the in-flight
+    // spawn to publish first, then taking the *same* retirement path, makes the
+    // first open's environment deterministic (FIELD-NOTES 34, verify round 2).
+    if (this.#prewarmSpawn) await this.#awaitPoolSpawn();
     await this.#retireUnusedPrewarmFor(options.env);
     const { process, reused } = await this.#ensurePoolProcess(options);
+    // A prewarmed child was spawned before any session existed, so its route may
+    // be deferred (`deferRoute`); the first session pins its own before the
+    // session's `initialize` is sent. A no-op for every other child.
+    await process.pinRoute(options.route);
     this.#addPoolClaim(process);
     // `reused` is the acquire's answer, and it now means exactly one thing: this
     // session joined a child that has served conversations. Both no-service cases
@@ -1112,11 +1347,11 @@ class DshConnection implements ProviderConnection {
     //
     // `envDiffering` is **not** gated on `reused`: whether this session's env was
     // applied depends on the env the child was actually spawned with, which
-    // `#envDifference` compares (a fresh spawn reports nothing by itself). The
-    // case that would otherwise go silent is an open that joined the prewarm's
-    // in-flight spawn: it cannot be retired yet (`#retireUnusedPrewarmFor` needs a
-    // published child), so its non-identity keys really are inert and must be
-    // reported.
+    // `#envDifference` compares (a fresh spawn reports nothing by itself). It now
+    // covers the *later* sessions of a connection: once one session claimed the
+    // child, its env is the process-wide truth and a divergence is reported, never
+    // repaired by a respawn. The first session can no longer land here: it waits
+    // out an in-flight prewarm and retires the unused child above.
     return { process, reused, envDiffering: this.#warnEnvDiffers(options.env) };
   }
 
@@ -1288,10 +1523,7 @@ class DshConnection implements ProviderConnection {
    * @param env - the session env the spawn was asked to use.
    */
   #sharedDshIdentity(env: Record<string, string>): { path: string; home: string; profile: string } {
-    const merged: Record<string, string | undefined> = { ...process.env, ...env };
-    const home = dshHome(merged);
-    const profile = profileName(merged);
-    return { path: sharedDshRecordPath(home, profile), home, profile };
+    return sharedDshIdentity(env);
   }
 
   /**
@@ -1320,57 +1552,13 @@ class DshConnection implements ProviderConnection {
    * @param env - the session env the spawn will use.
    */
   async #awaitPreviousSharedDsh(env: Record<string, string>): Promise<void> {
-    const state = this.#sharedDshIdentity(env);
-    const recorded = readSharedDshRecord(state.path);
-    if (recorded !== undefined && SERVING_SHARED_DSH.has(recorded.pid)) {
-      // Another live connection of this process is serving that child. Its port
-      // is not an orphan's port: this spawn may proceed (and the two contexts are
-      // as separate as they were before the record existed).
-      return;
-    }
-    const outcome = await reclaimPreviousSharedDsh({
-      path: state.path,
-      home: state.home,
-      profile: state.profile,
-      waitMs: sharedDshWaitMs(),
-      selfPid: process.pid,
-      probe: this.#processProbe,
+    // Shared with the probe path (`withProfileProbe`): a probe can be the first
+    // spawn of a successor process, and it must not take the orphan's port either.
+    await awaitPreviousSharedDshRecord({
+      env,
+      processProbe: this.#processProbe,
       log: (line) => process.stderr.write(`${line}\n`),
     });
-    if (outcome.state === "timed-out") {
-      const record = readSharedDshRecord(state.path);
-      const message =
-        record === undefined
-          ? `the shared dsh of the previous plugin process did not exit within ${String(outcome.waitedMs)} ms `
-            + `(pid ${String(outcome.pid)}, record ${state.path}); refusing to spawn a second dsh for profile `
-            + `"${state.profile}" beside it`
-          : sharedDshStillRunningMessage({
-            record,
-            waitedMs: outcome.waitedMs,
-            ownerAlive: outcome.ownerAlive,
-            verified: outcome.verified,
-          });
-      process.stderr.write(`[${PROVIDER_ID}] ${message}\n`);
-      throw new Error(message);
-    }
-    if (outcome.state === "waited" && outcome.waitedMs >= 250) {
-      process.stderr.write(
-        `[${PROVIDER_ID}] waited ${String(outcome.waitedMs)} ms for the previous plugin process's shared dsh `
-          + `(pid ${String(outcome.pid)}) to exit before spawning a new one\n`,
-      );
-    }
-    if (outcome.state === "reused") {
-      process.stderr.write(
-        `[${PROVIDER_ID}] ignoring the shared-dsh record: ${outcome.reason}; `
-          + "that pid is not this DSH home's child any more\n",
-      );
-    }
-    if (outcome.state === "foreign") {
-      process.stderr.write(
-        `[${PROVIDER_ID}] ignoring a shared-dsh record for profile "${outcome.profile}" (pid `
-          + `${String(outcome.pid)}): it is a different DSH runtime, not this spawn's previous child\n`,
-      );
-    }
   }
 
   /**
@@ -1470,6 +1658,22 @@ class DshConnection implements ProviderConnection {
       const shutdown = this.#poolShutdown;
       if (shutdown === undefined) return;
       await shutdown.catch(() => undefined);
+    }
+  }
+
+  /**
+   * Wait until no pool spawn is in flight.
+   *
+   * Called by the probe path **outside** {@link withProfileChildGate}: a spawn
+   * holds the gate while it runs, so awaiting it under the gate would deadlock.
+   * After this returns the child is published (or the spawn failed), and the
+   * probe's in-gate re-check sees it.
+   */
+  async #awaitPoolSpawn(): Promise<void> {
+    for (;;) {
+      const spawn = this.#poolSpawn;
+      if (spawn === undefined) return;
+      await spawn.catch(() => undefined);
     }
   }
 
@@ -1897,7 +2101,7 @@ class DshConnection implements ProviderConnection {
 
   async #catalog(requestId: string, cwd: string | undefined): Promise<void> {
     try {
-      const display = await loadCatalog(cwd ?? process.cwd());
+      const display = await loadCatalog(cwd ?? process.cwd(), this.#probeAccess());
       this.#display = display;
       this.#emit({ type: "catalog", requestId, catalog: display.defaults });
     } catch (error) {
@@ -1926,7 +2130,7 @@ class DshConnection implements ProviderConnection {
         ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
         ...(input.query === undefined ? {} : { query: input.query }),
         ...(input.limit === undefined ? {} : { limit: input.limit }),
-      });
+      }, this.#probeAccess());
     } catch (error) {
       this.#emit({ type: "request.failed", requestId: input.requestId, error: { message: messageOf(error) } });
       return;
@@ -2111,7 +2315,7 @@ class DshConnection implements ProviderConnection {
     // dropped. The second check inside the transaction covers a teardown that
     // lands while the open is in flight.
     this.#assertConnected();
-    const display = this.#display ?? (await loadCatalog(config.cwd));
+    const display = this.#display ?? (await loadCatalog(config.cwd, this.#probeAccess()));
     this.#display = display;
     // The catalog load awaits, so the claim taken by `#openTransaction` is
     // re-checked before anything is torn down or spawned on its behalf.
@@ -2751,7 +2955,7 @@ class DshConnection implements ProviderConnection {
       );
     }
     try {
-      await applyArchivedStandalone(dshSessionId, archived);
+      await applyArchivedStandalone(dshSessionId, archived, this.#probeAccess());
     } catch (error) {
       reasons.push(messageOf(error));
       throw new Error(`cannot ${verb} ${dshSessionId}: ${reasons.join("; ")}`);

@@ -31,10 +31,13 @@
  *   f) the prewarm's route is the **profile default from the catalog on disk**,
  *      not a hardcoded provider/model: the cached entry's `fallbackRoute` is what
  *      arrives in the child's `initialize`.
- *   g) a profile with **no** catalog cache is left alone: no probe process, no
- *      spawn, one stderr line. Reading a cold catalog would boot the whole
- *      profile a second time — the cost the prewarm exists to remove — and would
- *      also break every check that counts bridge processes.
+ *   g) a profile with **no** catalog cache still prewarms: exactly one spawn, no
+ *      probe process, and one stderr line saying the route was deferred to the
+ *      first session. Reading a cold catalog would boot the whole profile a
+ *      second time — the cost the prewarm exists to remove — so the child is
+ *      started without a route instead (`DshProcessOptions.deferRoute`); a cold
+ *      cache is the reload after a profile edit or a DSH upgrade, which is
+ *      exactly when the cold boot hurts.
  *   j) the prewarmed child is a **cold start** for the first session and joined
  *      only afterwards (FIELD-NOTES 106): `child-K` — a log that stops inside a
  *      turn — is settled `canceled` on the first open after a completed prewarm
@@ -903,26 +906,30 @@ console.log("\na failed prewarm is reported and retried by the next open");
 
 // ---------------------------------------------------------------------------
 // g) no catalog cache: no probe, no spawn, one line.
-console.log("\na profile with no catalog cache is left to its first open");
+console.log("\na profile with no catalog cache still prewarms, with the route deferred");
 {
   const coldHome = mkdtempSync(join(tmpdir(), "dsh-pool-prewarm-cold-"));
   process.env.DSH_HOME = coldHome;
-  const coldSpawnLog = spawnLog;
-  void coldSpawnLog;
+  // A cold catalog used to mean "skip the prewarm, let the first open pay the
+  // cold boot". That gave the whole boot back to the user on exactly the reloads
+  // that follow a profile edit or a DSH upgrade (the on-disk fingerprint has no
+  // entry to match), and the first open then raced the fixed listener port. The
+  // child is now started anyway: the route is the process's default only, so it
+  // is deferred to the first session (`DshProcess.pinRoute`).
   const spawnCountBefore = spawns().length;
   const stderrMark = stderrChunks.length;
   const cold = await registration.connect({ capabilities: ["prompt.message"] });
   await sleep(1500);
   const lines = stderrChunks.slice(stderrMark).join("");
   check(
-    "no child and no probe are spawned without a cached catalog",
-    spawns().length === spawnCountBefore,
+    "the shared child is spawned without a cached catalog",
+    spawns().length === spawnCountBefore + 1,
     `${String(spawns().length - spawnCountBefore)} spawn(s)`,
   );
   check(
-    "…and the skip is reported on stderr",
-    /prewarm skipped/.test(lines),
-    lines.split("\n").filter((line) => line.includes("prewarm skipped")).join(" | ") || "(nothing logged)",
+    "…and the deferred route is reported on stderr",
+    /prewarmed the shared dsh .*with no route/.test(lines) && !/prewarm skipped/.test(lines),
+    lines.split("\n").filter((line) => line.includes("prewarmed the shared dsh")).join(" | ") || "(nothing logged)",
   );
   await cold.close();
   try {

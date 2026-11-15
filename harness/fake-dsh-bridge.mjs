@@ -212,6 +212,7 @@
  * @module paseo-dsh/harness/fake-dsh-bridge
  */
 import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { createInterface } from "node:readline";
 
 /**
@@ -387,6 +388,59 @@ function projectionsScript() {
 const LOG_PATH = process.env.DSH_FAKE_LOG;
 const out = (frame) => process.stdout.write(`${JSON.stringify(frame)}\n`);
 const notify = (method, params) => out({ jsonrpc: "2.0", method, params });
+
+/**
+ * Optional fixed listener, slow exit and exit journal, for the reload port race.
+ *
+ * The real `paseo` profile pins `webserver` to one fixed host:port (the user's
+ * `cordis.patch.yml`; bookmarks and cookies depend on it), so only one `dsh`
+ * process per `$DSH_HOME` can boot that profile: the second dies at profile start
+ * with `listen EADDRINUSE … webserver (required)`. Both the resident shared child
+ * and the throwaway probes boot the same profile, so a check needs a child that
+ * actually holds a listener to reproduce it:
+ *
+ * - `DSH_FAKE_PORT` — bind that TCP port at startup. A second child on the same
+ *   port writes the real profile-boot failure line to stderr and exits 1.
+ * - `DSH_FAKE_EXIT_HOLD_MS` — keep the process (and its listener) alive this long
+ *   after SIGTERM. `DshProcess.kill()` returns immediately and only SIGKILLs at
+ *   +4 s, which is the teardown window a successor's spawn can land in.
+ * - `DSH_FAKE_EXIT_LOG` — append `exit <pid> <epoch-ms>` when this process exits,
+ *   so a check can assert spawn/exit ordering from outside the plugin.
+ *
+ * Unset (the default in every other check) means no listener, no hold, no journal.
+ */
+const FAKE_PORT = process.env.DSH_FAKE_PORT;
+if (FAKE_PORT !== undefined && FAKE_PORT.trim() !== "") {
+  const server = createServer();
+  server.on("error", (error) => {
+    process.stderr.write(
+      `dsh web: startup failed: listen ${String(error?.code ?? "error")}: ${String(error?.message ?? error)}\n`,
+    );
+    setTimeout(() => process.exit(1), 20);
+  });
+  server.listen(Number(FAKE_PORT), "127.0.0.1");
+}
+const FAKE_EXIT_HOLD_MS = (() => {
+  const raw = Number(process.env.DSH_FAKE_EXIT_HOLD_MS ?? "0");
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+})();
+if (FAKE_EXIT_HOLD_MS > 0) {
+  // Hold the listener past SIGTERM: this is the window `probe.kill()` opens in
+  // production while the killed probe is still tearing the profile down.
+  process.on("SIGTERM", () => {
+    setTimeout(() => process.exit(0), FAKE_EXIT_HOLD_MS);
+  });
+}
+const FAKE_EXIT_LOG = process.env.DSH_FAKE_EXIT_LOG;
+if (FAKE_EXIT_LOG !== undefined && FAKE_EXIT_LOG !== "") {
+  process.on("exit", () => {
+    try {
+      appendFileSync(FAKE_EXIT_LOG, `exit ${String(process.pid)} ${String(Date.now())}\n`);
+    } catch {
+      /* best effort: the journal is a check assertion, not protocol */
+    }
+  });
+}
 
 /**
  * Sessions this process has been initialized for, mirroring the real bridge's

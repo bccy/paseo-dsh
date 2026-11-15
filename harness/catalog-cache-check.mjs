@@ -7,13 +7,18 @@
  * 1.5–2.7 s in the code comments). A single slot therefore turned ordinary
  * project switching into a cold start every time.
  *
- * The regression is pinned by counting bridge processes that actually received
- * a `paseo/catalog` request, not by reading the cache map: the map is module
- * private, and the user-visible cost is the probe spawn.
+ * The regression is pinned by counting the `paseo/catalog` requests that actually
+ * reached a runtime, not by reading the cache map: the map is module private, and
+ * the user-visible cost is the extra request (a cold read on the fixed code used
+ * to boot a whole `dsh`).
  *
  * Scenario: A → B → A. With the old single slot the third request misses and
- * spawns a third probe. With the LRU the first A is still fresh, so exactly two
- * probes are spawned and all three requests answer with a catalog.
+ * issues a third browser read. With the LRU the first A is still fresh, so the
+ * runtime answers exactly two reads (A, B) and all three requests answer with a
+ * catalog. The reads are **not** throwaway probes any more: when the plugin has a
+ * resident shared child (the prewarm starts one on every connect, now even with a
+ * cold catalog), a read reuses it — the profile has one listener port, so a
+ * second `dsh` could not boot beside it.
  *
  * Uses the scripted fake `dsh` and a throwaway `DSH_HOME`; no profile, model or
  * daemon is touched.
@@ -133,13 +138,17 @@ console.log("catalog cache: A → B → A keeps the first workspace warm");
   const frames = existsSync(frameLog)
     ? readFileSync(frameLog, "utf8").split("\n").filter((line) => line.trim() !== "").map((line) => JSON.parse(line))
     : [];
-  const catalogPids = new Set(
-    frames.filter((frame) => frame.method === "paseo/catalog").map((frame) => frame.pid),
+  const catalogFrames = frames.filter((frame) => frame.method === "paseo/catalog");
+  const catalogPids = new Set(catalogFrames.map((frame) => frame.pid));
+  check(
+    "the third request reuses the first workspace's cached catalog (2 runtime reads, not 3)",
+    catalogFrames.length === 2,
+    `${String(catalogFrames.length)} paseo/catalog frame(s) from ${String(catalogPids.size)} pid(s)`,
   );
   check(
-    "the third request reuses the first workspace's cached catalog (2 probes, not 3)",
-    catalogPids.size === 2,
-    `spawned ${String(catalogPids.size)} catalog probe(s)`,
+    "…served by the one resident child, not one process per miss",
+    catalogPids.size === 1,
+    `pids ${[...catalogPids].map(String).join(",") || "(none)"}`,
   );
 }
 
@@ -149,6 +158,11 @@ console.log("catalog cache: A → B → A keeps the first workspace warm");
 // new process — which is the 4.2 s this cache exists to remove.
 console.log("\nthe on-disk catalog cache is used by the next process, and only when provably fresh");
 {
+  // These cases really run separate plugin processes, and the fixed listener port
+  // means one profile child at a time: this process's resident child has to be
+  // gone before the "new process" may spawn its own (otherwise the successor
+  // correctly waits for the recorded child and then refuses loudly).
+  await conn.close();
   const cacheModule = require(join(buildDir, "server", "catalog-cache.js"));
   const cacheHome = join(dshHome, "catalog-home");
   const profileName = "paseo";
@@ -285,7 +299,5 @@ process.exit(ready ? 0 : 1);
   );
 }
 
-await conn.close();
-await conn.close();
 console.log(`\n${String(passed)} passed, ${String(failed)} failed`);
 if (failed > 0) process.exit(1);

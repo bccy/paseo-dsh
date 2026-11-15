@@ -4339,3 +4339,98 @@ configure），离线断言只能测到"代码形状"，按下述原则这不算
 
 **未验证**：无复现、无断言、未真机；修法草案里的 `presets.select` 时机与 dispose 顺序都只
 按 `setPreset` / `pendingPlanMode` 的既有实现推断。
+
+
+## 第三十四轮：重载后的固定端口竞态不是「旧 child 没退」，而是同类 child 之间没有串行（2026-11-15）
+
+**现象（观察，daemon.log / DSH startup 日志）**：用户报「重载插件后 DSH 启动变慢、新会话响应慢」。
+2026-11-15T05:49Z（本地 13:49）那次 daemon worker 重启：`Stopping plugin` → `Plugin stopped` 仅 72 ms；
+旧 worker 在 13:49:28.966 因优雅关机超时被进程树 SIGKILL；新插件 13:49:34 就绪，13:49:38.775 打
+`prewarm skipped: the profile's catalog is not on disk yet …`；13:50:03.793 新起的共享 dsh 在 profile
+启动阶段报 `listen EADDRINUSE <host>:<port>` + `webserver (required)` →
+`the shared DeepSeek Harness process exited (code 1)` → 13:50:03.86 第二次 spawn → 13:50:08.218
+`dsh web: listening on <host>:<port>` 成功。用户可见的就是「首开失败/等十几秒、重试才好」。
+
+**根因（两段，都有 file:line）**：
+
+1. **固定端口 + 两类 profile child 没有互斥。** 用户的 `$DSH_HOME/profiles/paseo/cordis.patch.yml` 把
+   `webserver` 钉在一个固定 host:port 上（该用户为书签/Cookie 复用故意固定，文件注释里自己写了
+   「若将来并发多个 dsh 进程需改回 port: 0」），所以同一 home 同一 profile 同时只能有一个 `dsh`。插件却有两类
+   都启动整台 profile 的 child：常驻共享 child（`provider.ts:1186` 起 `new DshProcess`，prod 路径）
+   与一次性 probe（`provider.ts` 的 `probeProcess`，catalog/sessions/archive 用）。跨进程 record 等待
+   原先只接在池 spawn 上（`#awaitPreviousSharedDsh`），probe 直接 spawn；而 `DshProcess.kill()`
+   （`dsh-process.ts` `kill()`）只发 SIGTERM、`+4 s` 才 SIGKILL，**函数立即返回**，probe 的
+   `finally probe.kill()` 之后 pool spawn 可以立刻落在 probe 还在关 profile 的窗口里。13:49:57.2
+   三条 catalog 缓存被写入（probe 刚答完）→ 57.4 pool spawn → 03.79 bind 失败，正好复刻这个交接。
+2. **冷 catalog 让预热退出，把这段窗口留给首个 open。** 03:39 的缓存条目指纹是
+   `cordis.patch.yml=46256d8d…:8303`，13:33 用户编辑了 profile（备份 `cordis.patch.yml.bak-agy-133331`），
+   05:49 新插件算出的指纹是 `b1582e69…:8496`——**按内容失效是正确的**（模型目录可能真的变了），
+   但旧的 `prewarmSharedDsh` 把「缓存不可用」等同于「跳过预热」，于是首个 open 才 spawn，正好落在
+   旧 worker 刚被 SIGKILL、probe 与 pool 又在交接的窗口里。旧 `#prewarmRoute` 只从磁盘 catalog 取
+   route，因此无法预热。
+
+**修法**：
+
+- `provider.ts` 新增模块级串行门 `withProfileChildGate`（`profileChildGate` promise 链）：**所有**
+  profile child 的 spawn 都在门内，直到 child 启动完成（池的 child 还会在门内 publish）；
+  `withProfileProbe` 走同一道门，并且：① 门内先复用本连接已 publish 的常驻 child（一个 profile
+  一个 listener，再起一个必定 EADDRINUSE），`awaitResident`（`#awaitPoolSpawn`）在门外等，避免与
+  门的持有者互等死锁；② probe 也先做一次有界跨进程回收等待（`awaitPreviousSharedDshRecord`，
+  从 `#awaitPreviousSharedDsh` 提取，断口语义不变）；③ probe start 之后一定 `kill()` 并
+  `waitForExit(PROBE_EXIT_TIMEOUT_MS = 10 s)`（超时一行 stderr，不静默），让端口真的还回来。
+- `dsh-process.ts` 新增 `DshProcessOptions.deferRoute` 与 `pinRoute()`：`start()` 在
+  `deferRoute` 时跳过 process-level `initialize`（不读 route、因此不需要磁盘 catalog），首个会话
+  在 `#acquirePoolProcess` 里先 `pinRoute(自己会话的 route)` 再 attach；`initializeRoute: false`
+  （probe）语义不变。
+- `provider.ts#prewarmSharedDsh` 冷缓存不再跳过：用 `FALLBACK_ROUTE` + `deferRoute:true` spawn，
+  stderr 记「with no route: the profile's catalog is not on disk, so the first session pins its own
+  route」。**没有**去放宽缓存指纹——profile 改了就该失效（FIELD-NOTES 58 的老教训：不要把陈旧的
+  目录缓存成事实）。
+
+**根因边界（推断，未真机复验）**：13:50:03.79 撞端口的那个「别人」到底是 probe 还是旧 worker 的
+child，日志只能证明「新进程在 57.4 发起 pool spawn、03.79 bind 失败、04~05 之后端口自由」；record
+等待在 57.4 时没有产生等待日志，说明当时没有可信的旧 child 记录（旧 worker 的 child 已在 13:49:39
+前退出，否则 catalog probe 不可能在 57.2 成功 bind）。所以修法按「两类 child 都不许在端口被占时
+spawn」而不是「只修旧 child 等待」来做，两种情况都覆盖。
+
+**验证（离线，2026-11-15）**：新增 `harness/profile-child-gate-check.mjs`，假 `dsh` 真监听端口
+（`DSH_FAKE_PORT`）、SIGTERM 后延迟退出（`DSH_FAKE_EXIT_HOLD_MS`）、退出日志（`DSH_FAKE_EXIT_LOG`）。
+**未修复 HEAD 副本：7 failed / 6 passed**（connect 零 spawn 且 `prewarm skipped`；pool 在 probe 退出前
+spawn、`listen EADDRINUSE`；orphan 未回收、无 SIGTERM 日志）；修复后 **14/14**。既有检查更新后
+全绿：`reload-port-race-check` 51/51、`pool-prewarm-check` 49/49（g 改为冷缓存仍预热）、
+`catalog-cache-check` 13/13（内存层由常驻 child 承接；新进程用例先关本进程连接）。`npx tsc --noEmit`
+0 错。
+
+**未验证/边界**：① 没有 running daemon / 真机 Paseo UI 复验（任务书禁止 reload/重启）；「重载后
+首开不再撞端口、预热在冷 catalog 下也起」需要在真机再跑一次 reload 观察；② 真机冷缓存预热的
+收益取决于 profile 冷启动时间（实测 spawn→listening +8.4 s、→可用 +23.2 s），本轮只把它从用户
+窗口挪到插件加载窗口，未测真机端到端；③ 假桥的「固定端口」是 `127.0.0.1` 的一个真实 listener，
+与用户 profile 的 `host:port` 在语义上等价（都是 bind 冲突），但不是同一个地址；④
+`plugin-check.cjs` 的真实模型回合按任务书留给后续验证包。
+
+
+**补记（2026-11-15 第二轮独立验证后的返修）**：
+
+- **在飞预热 join 的确定性**（验证报告 P2）：首个会话撞上预热**在飞**的 spawn 时，旧补丁让它 join
+  一个 env 为空的 child，非身份键只给警告；而预热**已发布**时同一会话走 `#retireUnusedPrewarmFor`
+  退役重起、键生效——同一输入两种结果。修法：`#acquirePoolProcess` 先 `#awaitPoolSpawn()` 等预热
+  发布，再走同一条退役路径；`#ensurePoolProcess` 在 publish（仍持有串行门）时就把
+  `#poolPrewarmed` 置成 `#prewarmSpawn`，使“预热 continuation 还没跑”不再影响判定。冷缓存
+  `deferRoute` 预热 `start()` 立即返回，所以这条等待对真实会话是毫秒级、不是整台 profile 启动。
+  `multi-session-check.mjs` 回到 49/49（未改判据）。
+- **`subagent-check.cjs` 一条断言随设计作废**（验证报告 P2）：`failopen` 拒的是 `pinRoute` 的进程级
+  `initialize`，失败点在 `pinRoute()` 不在 `start()`；共享 child 保持存活（可能正在服务别的会话）
+  是对的。断言改为「重试复用同一 child 并重发 `initialize`（route 重新 pin），不多起 child」+
+  「close 后该 child 恰好退役一次」（检查总数仍 131）。**产品行为未改**。
+- **M1 变异暴露检查漏洞并补齐**：删掉 `withProfileProbe` 的 `withProfileChildGate` 时，加场景前的
+  `profile-child-gate-check` 仍 14/14（验证报告实测，原检查只有顺序请求）。新增「同一连接并发
+  两条 catalog」场景，用 `DSH_FAKE_EXIT_HOLD_MS=1200` 让两个 probe 的 spawn/exit 区间必须不重叠；
+  M1 红（`1 failed / 17 passed`：`…alive …1077→2326 | …alive …1081→1144`），还原后 18/18。
+  **经验**：门/串行类的修复不能只靠顺序场景断言，必须有一个真正交叉的并发输入。
+- **第二轮必跑**（均 `env -u DSH_HOME`，假 dsh/一次性 DSH_HOME）：`npx tsc --noEmit` 0；
+  `bridge-assets` 2/2；`plugin-build` 86；`fake-bridge-multi` 23/23；`harness-gates` 68/68；
+  `dsh-api-contract` 20/20；`concurrent-open` 15/15；`shared-process-cwd` 13/13；
+  `identity-env` 17/17；`process-crash` 24/24；`open-degrade` 8/0；`reload-port-race` 51/51；
+  `catalog-cache` 13/13；`steer` 34/34；`jobs-timeout` 13/13；`plugin-check --self-test` 通过；
+  `style-check` 254/254；`multi-session` 49/49；`pool-prewarm` 49/49；`subagent-check` 131/131；
+  `profile-child-gate` 18/18（含 M1 红/绿两次）。

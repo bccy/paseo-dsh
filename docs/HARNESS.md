@@ -337,18 +337,24 @@
   目录：`node harness/context-usage-check.cjs <dir>`。**动了 `server/dsh-process.ts` 的用量
   读取或 `DshSession` 的用量上报必跑。**
 - `harness/catalog-cache-check.mjs` — catalog 缓存的**两层**（假 `dsh` + 一次性 `DSH_HOME`，
-  **10/10**）：① 内存层是按 cwd 的小 LRU（不是单槽），多工作区 A→B→A 只起 2 个 probe（旧实现 3
-  个），每个 cwd 命中各自条目；② **磁盘层**（`server/catalog-cache.ts`）让 reload 后的**新进程**
+  **13/13**）：① 内存层是按 cwd 的小 LRU（不是单槽），多工作区 A→B→A 只向运行时发 **2 次**
+  `paseo/catalog` 读（旧单槽实现 3 次），每个 cwd 命中各自条目；这些读现在由**同一个常驻
+  child** 承接（连接上的预热 child；一个 profile 只有一个固定端口，miss 不再各起一个 probe）；② **磁盘层**（`server/catalog-cache.ts`）让 reload 后的**新进程**
   不再为读一次 catalog 另起一个 `dsh`：写入必须带非空 model 列表（空目录是异步物化竞态，
   FIELD-NOTES 第 58 条——写进去就永远是空模型菜单）、读取要重新核对指纹（`dsh --version` + profile
   组成文件的**内容哈希** + 凭据文件 stat；profile 文件被插件自己每次重写，mtime 指纹会把这条缓存
   正好废掉）、坏文件/超 24h 都按"没有缓存"处理；集成断言：**种一条合法缓存后，子进程回答 catalog
-  且不再 spawn probe**；**截断/形状不对的条目**（有非空 models 但缺 `defaults.modes` 等 open 会读的
-  字段）必须当未命中 → 回退 probe 且 open 仍成功（`isUsableDisplayCatalog`，不抛 `TypeError`）。
+  且不再多一次运行时候读**；**截断/形状不对的条目**（有非空 models 但缺 `defaults.modes` 等 open 会读的
+  字段）必须当未命中 → 回退运行时读且 open 仍成功（`isUsableDisplayCatalog`，不抛 `TypeError`）。
+  （2026-11-15：这两条集成用例真的开**新的插件进程**，所以先 `close()` 本进程的连接——固定端口下
+  一个 profile 只能有一个 child，否则后继进程会按设计**响亮拒绝**而不是悄悄再起一个，用例会成为
+  假红。）
   凭据只 `stat`（size+mtime），不读内容。**动了 `server/catalog-cache.ts`（含预热取 route 用的
   `readAnyCatalogCache`，它只收 `home`/`fingerprint`——profile 作用域由指纹承担，那一条由
   `pool-prewarm-check.mjs` 覆盖）、`provider.ts` 的
-  `loadCatalog`/`isUsableDisplayCatalog` 必跑；变异「只写不读」→ 9/10 红、「去掉形状校验」→ 10/12 红。**
+  `loadCatalog`/`withProfileProbe`/`isUsableDisplayCatalog` 必跑；变异「只写不读」与「去掉形状校验」
+  在旧断言集上分别红 9/10 与 10/12（2026-11-15 断言从 10 调到 13，变异按新断言集重跑时以实际红数
+  为准）。**
 - `harness/open-degrade-check.mjs` — open 期降级必须用户可见：`paseo/history` 抛错、preset
   被拒、plan 对账失败（plan 模式）都要发 `session.notice`/warning，而不是只写 stderr；
   子代理枚举失败也点名。**动了 `session.ts` 的 `replayHistory`/open 降级通知、`provider.ts`
@@ -603,6 +609,36 @@
   profile** 49/51（两条路径断言）。**动了 `server/shared-dsh-record.ts`、
   `provider.ts` 的 `#awaitPreviousSharedDsh` / `#onSharedDshSpawned` / `#forgetSharedDsh` /
   `SERVING_SHARED_DSH`，或 `dsh-process.ts` 的 `onSpawned` / `pid` 必跑。**
+  2026-11-15 起**同一记录等待也接在探测进程上**（`provider.ts#withProfileProbe`），并且**所有**
+  profile child 的 spawn（常驻 child 与一次性 probe）都走模块级**串行门**
+  （`withProfileChildGate`），因为 profile 的固定端口同时只能给一个 child。这两条由
+  `harness/profile-child-gate-check.mjs` 覆盖；改了 `provider.ts` 的 `withProfileProbe` /
+  `withProfileChildGate` / `#probeAccess` / `#awaitPoolSpawn` 或 `prewarmSharedDsh` 必跑。
+
+- `harness/profile-child-gate-check.mjs` — **profile 固定端口下所有 dsh 子进程的串行与预热**
+  （假 `dsh` + 一次性 `DSH_HOME`，自己编译到私有目录，**18/18**）。真实 `paseo` profile 把
+  `webserver` 钉在一个 host:port 上（用户为书签/Cookie 固定的），所以同一 home 同一 profile
+  同时只能有一个 `dsh` 进程；插件却有两类 child 都会启动整台 profile：常驻共享 child 和一次性
+  探测进程（catalog/sessions/archive）。假桥用 `DSH_FAKE_PORT` 真的监听一个端口（第二个 child
+  的 bind 报 `listen EADDRINUSE` 并以 1 退出，复刻 profile 启动失败）、`DSH_FAKE_EXIT_HOLD_MS`
+  让 SIGTERM 后仍占着端口（`DshProcess.kill()` 立即返回、+4 s 才 SIGKILL 的 teardown 窗口）、
+  `DSH_FAKE_EXIT_LOG` 记退出时刻。断言：**a)** catalog 缓存为空时 `connect()` 仍 spawn 一次并写入
+  记录（route 延迟，`deferRoute`；旧代码在这里打 `prewarm skipped` 且零 spawn）；首个 open 复用
+  该 pid、零二次 spawn；**b)** 一次 catalog 请求的 probe 被 kill 后，**下一个 child（池的 spawn）
+  必须等它真的退出后才 spawn**（spawn 时间 ≥ probe 的退出时间，不靠睡等）；旧代码里 pool 在 probe
+  还占端口时启动，得到 `listen EADDRINUSE`，open 或碰撞路径变红；**c)** 前一个插件进程的共享 dsh
+  还活着（记录在、属主进程已死）时，后继进程的第一个请求/预热 spawn **先分级回收**（3 s 自退窗口
+  → SIGTERM，日志两条），回收完成后才 spawn（spawn 时间 ≥ orphan 退出时间）；旧代码零等待；**d)**
+  **同一连接的并发两条 catalog 请求**：两个 probe 的 spawn/exit 区间**不许重叠**（用
+  `DSH_FAKE_EXIT_HOLD_MS=1200` 把关前/关后区分开：串行是两条 ~1.2 s 的寿命一前一后，并发时其中一个
+  bind 失败几十毫秒就死，区间必然交叉）。这一条是**为 M1 变异而加**：删掉 `withProfileProbe` 的
+  `withProfileChildGate` 时，前三节全部顺序请求，检查仍绿（验证报告实测的漏洞）；加上 d) 后 M1 红
+  （`1 failed / 17 passed`：`…alive …1077→2326 | …alive …1081→1144`），还原后 `18/18`。
+  **变异（红跑）**：在未修复的 HEAD 副本上 `7 failed / 6 passed`（`prewarm skipped`、probe 与 pool 的
+  spawn/exit 顺序、orphan 未回收），修复后 `14/14`；第二轮加 d) 后 18/18、M1 红。**动了 `provider.ts` 的
+  `withProfileProbe`/`withProfileChildGate`/`#probeAccess`/`#awaitPoolSpawn`/`prewarmSharedDsh`、
+  `dsh-process.ts` 的 `deferRoute`/`pinRoute`/`#start`，或 `fake-dsh-bridge.mjs` 的
+  `DSH_FAKE_PORT`/`DSH_FAKE_EXIT_HOLD_MS`/`DSH_FAKE_EXIT_LOG` 必跑。**
 - `harness/identity-env-check.mjs` — 离线钉住「每会话身份只到自己的会话」：真 `PaseoHarnessServer`
   的 identity 表（两会话不同值、未知会话返回 `{}`、子会话沿 `children.parentId` 继承父身份、
   re-initialize 无 identity 清行、process-level identity 被拒）+ `identity-env.ts` 的 BASH_ENV 脚本
@@ -639,12 +675,18 @@
   （假桥 `failopen` 拒 `initialize`）时 `connect()` 照常成功、stderr 一行说明、随后 open **重新 spawn** 并在
   再失败时把错误报给用户——失败不会被记成"已就绪"；**f)** 预热 spawn 的 `initialize` 带的是 **catalog 缓存
   里的 `fallbackRoute`**（`cache-lane/cache-default-model`），不是硬编码的 provider/model；**g)** profile
-  还没有 catalog 缓存时**既不 spawn 也不起探测进程**、只一行 stderr（读冷 catalog 要再启动一整台 profile，
-  那正是预热要省的；而且会给所有"按 spawn 次数断言"的检查加噪声）。另有**退役路径**（
+  还没有 catalog 缓存时**仍然 spawn 一次**、不起探测进程，stderr 一行说明 route 已**延迟到首个
+  会话**（`catalog-cache.ts` 的冷缓存；旧行为是「跳过预热交给首个 open」，那正好把整台 profile 的
+  冷启动还给用户，见 FIELD-NOTES 第 100/34 条）。读冷 catalog 要再启动一整台 profile，那正是预热
+  要省的，所以只延迟 route（`DshProcessOptions.deferRoute`），不读缓存、不起 probe。另有**退役路径**（
   `#retireUnusedPrewarmFor`）一节：**h)** 只带三个身份键的 env **不触发**退役（复用 pid、零额外 spawn、
   stderr 无 "retiring it"）；**i)** 首次 open 带了**非身份键**时——恰好**多 1 次 spawn**、新 pid ≠ 旧 pid、
   新 child 的 spawn env 里真有该键（wrapper 记录子进程实际 env）、仍没有三个身份键、旧预热 child 收到
   `shutdown` 且已退出、stderr 那行点名旧 pid 与该键、且这次 open 不出「会话环境变量未生效」告警。
+  **第二轮补**：首个 open **撞上在飞的预热 spawn** 也必须走同一条退役重起路径（`#acquirePoolProcess`
+  先 `#awaitPoolSpawn()` 再 `#retireUnusedPrewarmFor`；预热 child 在 publish 的同一 gate 内就置
+  `#poolPrewarmed`），否则同一输入会因时序得到「env 生效/仅告警」两种结果（`multi-session-check`
+  因此从 49/49 掉到 38/49，见 FIELD-NOTES 第三十四轮补记）。
   **j) 预热 child 的「冷/暖」分类**（FIELD-NOTES 106，`reused` 唯一的消费面）：假桥 `replay` 模式带一条
   日志停在回合中间、没有终态的 `child-K`（被杀子代理的形状）。预热**已完成**后的首个 open 必须把它结算为
   `canceled`（悬着的工具行同样 settle），第二个会话在**同一连接**上再开则保留 running（adoption）；open 撞上
