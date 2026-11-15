@@ -123,6 +123,15 @@ const EXPECTED_SERVICE_SURFACE = {
     implementationClass: 'LocalJobRegistry',
     prototypeOps: ['list', 'get', 'kill'],
   },
+  // The bridge reads stored session state through this seam: `list` for the
+  // import dialog, `open` for history/summary reads, and -- since perf-c -- `stat`
+  // for the archive-lineage walk's lazy per-id header reads, which replaced a
+  // whole-store `list()` on every open. All three are declared on the abstract
+  // class; a rename of `stat` would silently turn every archived-subagent answer
+  // into "not archived" (the resurrect bug), with only a narrow stderr line.
+  'dsh-session-persistence': {
+    abstractOps: ['list', 'stat', 'open'],
+  },
   // The rewind gives withdrawn delegated work a bounded moment to observe the
   // cancel (`settleDelegatedWork`), joining through this service when the
   // profile composes no live `agents` registry. DSH 0.2.2-rc.2 renamed that

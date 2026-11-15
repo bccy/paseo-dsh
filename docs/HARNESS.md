@@ -402,7 +402,10 @@
   （`waitForTreeWork` / `waitForChildren`，两代名，桥的兜底都认；两个都没了才红）与
   `agentTeam` 投影形状**必须是已知两代之一**——`dsh-agent-team` 只认 `{enabled, tasks}`、
   `dsh-experimental-agent-team` 只认 `{members, tasks}`，且两个包只能装一个；这是
-  projection key，不是 import，前两项永远看不见）。它查的是 FIELD-NOTES #58 那种失效：`{{cwd}}` 变量被上游
+  projection key，不是 import，前两项永远看不见）。2026-11-15 perf-c 把 `dsh-session-persistence`
+  的 `list`/`stat`/`open` 登记进服务面：桥用 `stat` 惰性读归档血缘 header，替代每次 open 的全仓
+  `list()`——`stat` 一旦改名，归档子代理会被静默判成未归档（复活缺陷），只有一行窄 stderr。
+  它查的是 FIELD-NOTES #58 那种失效：`{{cwd}}` 变量被上游
   删掉，每个回合都在提示词装配阶段抛错，界面只有一条空的 `[error]`，而 **doctor 全程是绿的**
   （doctor 只查安装完整性，查不出软契约）。**它不查行为**——签名变了但符号还在，这里不会红，
   那由 `plugin-check.cjs` 的真实回合覆盖。**它覆盖的是 import 符号 + 上面那份服务面清单，
@@ -877,6 +880,16 @@
   （无捕获表）保留裸 id，且 log-only 的 `job/registered` 不进入可见重放。**动了
   `withJobTitle` / `jobDescriptionFor` / `observeJobRegistration` / `rememberToolDescription` /
   `history()` 的两个出口 / `#trimSessionRouteTables` / `#forgetSessionState` / `jobs()` 必跑。**
+  **2026-11-15 perf-c 再补 27 条（实跑 142/142；三轮先红后绿）**：`paseo/subagents` 的归档血缘与树读取
+  不再付全仓价——`sessionPersistence.list()` 一次都不许调（S1：旧桥每次 open 把 2585 份会话日志的
+  首帧全解一遍，实测 747–837ms）；缓存命中路径不许再调 `listDescendants`，而树形状的四类变化
+  必须让缓存失效：新增直接子代理（父 log 的 `subagent/catalog` 推动父 revision）、新增孙代理
+  （子 log 的 revision）、本进程观察到 live `subagent/catalog` 事件（live 父没有 stored revision
+  变化，靠 catalog 世代计数器）、以及归档状态——归档**不缓存**，每次从 registry 重算，所以
+  「归档根会话后整棵树不再报出」在缓存命中路径上也成立（旧桥在无 header 列表时漏判，本检查先红）。
+  另断言归档祖先在 opened root 之上时仍隐藏其子代理、血缘 walk 不需要任何子会话 header（子 header
+  读失败也不改答案）、失败读数每次点名（`stat` 抛错）。**动了 `subagents()` 的读取/缓存/归档判定
+  必跑**；先红后绿：基线 `server.js` 上 9 条红（122/131），实现后 131/131；第二轮补缓存构建竞态 3 条（假 `stat` 延迟制造窗口），再红 2 条（132/134）后 134/134；第三轮把不变量改成「token 不得晚于 rows」——新增 6 条（外部写者落在读树与 stat 之间的 3 条、close→外部追加→reopen 2 条、正常路径第二次建缓存/第三次命中 1 条），并随语义调整 14a/14f/14g 三次调用口径（净 +9 → 142/142；对 pre-r3 实现红 9 条）。
 - `harness/model-route-check.mjs` — 桥的**实时模型/思考档切换**是否真的到达 DSH（0.2.1/0.2.2
   双契约）：DSH 0.2.2 把 `installModelSelection` 改成单参（只装切换提示监听），实际路由由
   `agent.model.select()` 写入 durable `model/selection` 投影；旧桥还传第二参并只改

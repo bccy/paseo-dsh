@@ -4434,3 +4434,63 @@ spawn、`listen EADDRINUSE`；orphan 未回收、无 SIGTERM 日志）；修复�
   `catalog-cache` 13/13；`steer` 34/34；`jobs-timeout` 13/13；`plugin-check --self-test` 通过；
   `style-check` 254/254；`multi-session` 49/49；`pool-prewarm` 49/49；`subagent-check` 131/131；
   `profile-child-gate` 18/18（含 M1 红/绿两次）。
+
+## 第三十五轮：每次 open 都把全仓会话日志首帧解一遍（2026-11-15）
+
+### 109. `paseo/subagents` 为一条归档血缘付全仓扫描 + 每次重读整棵子代理树：打开会话的固定 0.75s + 每子代理 0.3s
+
+**症状**：重开有子代理的会话几乎都会撞插件 4s 预算（43 次命中里的 36 次配对到
+`Agent resumed from persistence`；新建不命中但 `agent.create.request` p50 从 ~1.0s 涨到 2.2s）；
+同一会话重复 `paseo/subagents` 每次都是 3.5–5.5s，与子代理数线性相关。
+
+**根因（两条，都在桥内，与 DSH 无关）**：
+1. `paseo/subagents` 要判「该子代理是否在某个已归档祖先之下」，旧实现为此调用
+   `#sessionHeaders()` → `sessionPersistence.list()`，把**全仓每份会话日志的 zstd 首帧都解一遍**
+   建 header 表；空仓 1–4ms、全量仓（2585 会话 / 178 项目目录）747–837ms，且**每次 open 都重做**，
+   新建会话也照付。实际只需要 opened session 自己的 header（它是不是 subagent、父是谁）与
+   其上祖先链——listing 行本来就带着每个后代的 catalog 父边。
+2. 树读取 `subagents.listDescendants` 对每个节点 `observeSession`（读整份子日志算
+   `subagentCatalog` 投影），桥每次重发、`sessionQuery` 的 observation 缓存容量只有 5，
+   10 子代理 ≈ 3.0s、25 个 ≈ 5.4s，同一会话无变化再调也一样。
+
+**修法**（`dsh-bridge/lib/server.js`）：归档血缘改「行边 + opened root 祖先链懒读」——
+`archivedSessionIds` 为空时零 IO；非空时只对 opened root 及其祖先按 id `persistence.stat()`
+取 header（子会话 header 一次都不读：`dsh-subagent` 的 `childSessionMeta` 保证 catalog 子会话
+`origin:"subagent"` 且 `parentSession =` 行里的 `parentId`）。树读取加 LRU 缓存（8 个 root），
+校验 token 分两类：cold 节点用 `stat().revision`、live 节点用本进程 `session/event` 里
+`subagent/catalog` 维护的世代计数器（普通回合不冲缓存）；**归档状态绝不缓存**，每次从
+`workspaceRegistry` 重读重算，所以归档根仍会在缓存命中路径下隐藏整棵树。缓存层任何失败只降级为
+重新读树，不改答案。
+
+**第二轮补修（缓存构建竞态）**：建缓存要跨两个 await——先读树，再逐 cold 节点 `stat()` 收校验 token
+（实测 ~50ms/个）。若 `subagent/catalog` 事件落在**第二个**窗口，live 父的 token 会记下已 +1 的世代
+而 rows 还是旧形状，下一次调用就拿新世代匹配上自己、把旧树钉住（新子代理行要等下一次 catalog
+事件才出现 = 静默丢行）。修法：`subagentCatalogEvents` 单调计数器在两次 await 后各比一次，任一变过
+就不缓存；检查里用「park 住 cold root 的 stat、期间触发 live 子会话的 catalog 事件」确定性复现，
+旧实现红 132/134、修后 134/134。
+
+**第三轮补修（token 不得晚于 rows）**：若「读树 → 收 token」之间**另一个 OS 进程**（用户手工
+`dsh resume` 了树里一个在本进程 cold 的会话）向该节点追加 catalog 事实，token 记的是追加后
+revision、rows 是追加前形状；进程内事件计数挡不住外部写者，旧行会被永久钉住（静默丢行）。
+变体：root live:0 → close → 外部追加 → 同 id reopen，世代不增、旧 `live:0` 仍命中。
+修法：缓存构建前先对 root + 上次已知节点集合取 **pre-token**，读树后取 **post-token**，只有
+id 集相同且两样本逐项相等才写缓存（首次见到的节点没有 pre-token → 本次不建，下一次打开再建；
+正常路径因此第 2 次建、第 3 次命中）；`session/close` 时清掉提到该 id 的缓存条目并删掉它的
+live 世代（`#forgetSubagentListings`，顺带把世代表收敛为只含 live 会话，P3）。检查用可 park 假
+`stat` 确定性地造「外部写者落在窗口内」与「close→追加→reopen」两种输入：pre-r3 实现红 9 条
+（133/142），修后 142/142。
+
+**实测**（一次性 DSH_HOME + 真实 2585 会话仓，零模型回合）：真实 open 顺序的新会话
+755/702ms → **7/1ms**；无子代理会话活 root 746/703/684ms → **2/1/0ms**；10 子代理会话
+3682/3611/3512ms → **3400/583/488ms**；12 子代理 2811 → **2674/566**。冷首次直接 RPC 的
+122–166ms 残余是 DSH `findLog` 扫 178 个项目目录（~80ms）+ 首次惰性初始化，不是被修的扫描。
+
+**为什么不顺手收紧 4s 预算**：冷树第一次仍要 ~3.4s（逐子日志读，缓存救不了第一次），插件随后
+逐子读 history ~1.3s；收紧预算会让每次重载的每个会话在 ready 前放弃整棵树，而**已 settle 的
+子代理在 ready 后没有 live 帧可补**（第 106 条同族）。预算保持 `4_000`，等冷树读取也降下来再谈。
+
+**判据**：`harness/bridge-server-check.mjs` 新增 18 条（S1 不许再调 `sessionPersistence.list()`、
+缓存命中不再 `listDescendants`、四类变化立即失效、归档命中路径仍隐藏、live catalog 事件失效），
+先红后绿 122/131 → 131/131，第二轮竞态 3 条再红 132/134 → 134/134；`dsh-api-contract-check` 登记 `dsh-session-persistence` 的
+`list`/`stat`/`open`。**动了 `subagents()` 的读取/缓存/归档判定必跑这两条 + `archived-lineage-check`
++ `archive-registry-check`。**

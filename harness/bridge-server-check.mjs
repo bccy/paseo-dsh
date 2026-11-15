@@ -301,15 +301,20 @@ console.log('bridge server: usage gate and archive-state reporting\n');
 }
 
 // ===== 2. archive-state reads report their failures =====================
-// The report order matters: `#archivedSessionIds` runs before `#sessionHeaders`
-// on every call, and the once-per-process latch for a missing service is spent
-// by the first assertion that exercises it. Each block below therefore leaves
-// the services it is NOT testing present, so its capture holds only its own
-// line.
+// The report order matters: `#archivedSessionIds` runs before the lazy
+// stored-header walk on every call, and the once-per-process latch for a
+// missing service is spent by the first assertion that exercises it. Each block
+// below therefore leaves the services it is NOT testing present, so its capture
+// holds only its own line. The stored-header walk only runs when the archive set
+// is non-empty (nothing else needs a header), so the blocks that exercise it
+// arm the registry with an archived id.
 const present = () => ({
   workspaceRegistry: { archivedSessionIds: new Set() },
-  sessionPersistence: { list: async () => [] },
-  sessions: { list: () => [] },
+  sessionPersistence: {
+    list: async () => [],
+    stat: async (id) => ({ header: { id, origin: 'user' }, revision: 'rev-1' }),
+  },
+  sessions: { list: () => [], get: () => undefined },
   subagents: SUBAGENTS,
 });
 
@@ -335,8 +340,14 @@ const present = () => ({
 }
 
 // ---- 2b. a missing persistence says so once, not once per call ---------
+// Only the archive-lineage walk needs stored headers now, so an archived id has
+// to be in the set for a missing persistence to matter at all: with no archived
+// session every row is unarchived by definition and no header is read.
 {
-  const services = { ...present() };
+  const services = {
+    ...present(),
+    workspaceRegistry: { archivedSessionIds: new Set(['archived-1']) },
+  };
   delete services.sessionPersistence;
   const { server } = makeServer(services);
   const { lines: first } = await captureStderr(() => server.subagents({ sessionId: 'root-1' }));
@@ -401,26 +412,36 @@ const present = () => ({
   );
 }
 
-// ---- 2e. a throwing stored-header list is reported on every call -------
+// ---- 2e. a throwing stored-header read is reported on every call -------
+// The lazy walk resolves the chain above the opened session one header at a
+// time through `sessionPersistence.stat()` (header-only; the event log is never
+// read). A failure there narrows the walk to "not archived", which must be
+// reported every time — a quiet failure here is how an archived subagent comes
+// back after a reload.
 {
   const persistence = {
-    list: async () => {
-      throw new Error('storage fault');
+    list: async () => [],
+    stat: async () => {
+      throw new Error('header fault');
     },
   };
-  const { server } = makeServer({ ...present(), sessionPersistence: persistence });
+  const { server } = makeServer({
+    ...present(),
+    workspaceRegistry: { archivedSessionIds: new Set(['archived-1']) },
+    sessionPersistence: persistence,
+  });
   const { value, lines: firstLines } = await captureStderr(() => server.subagents({ sessionId: 'root-1' }));
   const { lines: secondLines } = await captureStderr(() => server.subagents({ sessionId: 'root-1' }));
-  const listFailed = (lines) => lines.filter((line) => line.includes('listing stored session headers failed'));
+  const readFailed = (lines) => lines.filter((line) => line.includes('reading the stored header of root-1 failed'));
   check(
-    'a throwing stored-header list is reported, naming the read and the cause',
-    listFailed(firstLines).length === 1 && listFailed(firstLines)[0].includes('storage fault'),
+    'a throwing stored-header read is reported, naming the read and the cause',
+    readFailed(firstLines).length === 1 && readFailed(firstLines)[0].includes('header fault'),
     JSON.stringify(firstLines),
   );
   check(
-    'a throwing stored-header list is reported on every call',
-    listFailed(secondLines).length === 1,
-    `${listFailed(firstLines).length} + ${listFailed(secondLines).length}`,
+    'a throwing stored-header read is reported on every call',
+    readFailed(secondLines).length === 1,
+    `${readFailed(firstLines).length} + ${readFailed(secondLines).length}`,
   );
   check('the subagent answer still succeeds', value?.available === true, JSON.stringify(value));
 }
@@ -1837,6 +1858,446 @@ console.log("bridge server: the job title tables survive a refresh (close -> reo
     'a live agents service still joins by identity, not the tree wait',
     idleResolved && fallbackCalls === 0,
     `idle=${String(idleResolved)} tree=${String(fallbackCalls)}`,
+  );
+}
+
+// ===== 14. a cached subagent listing never goes stale ====================
+// `paseo/subagents` runs on **every** open. It used to answer by materializing
+// every stored session header (one `sessionPersistence.list()` — a whole-store
+// scan that decodes each log's first frame: 747–837 ms measured on a 2.5k
+// session profile) and then by re-reading the entire descendant tree on each
+// call (one `observeSession` per node, ~0.3 s per child measured). The cache
+// added here removes both, and this block pins the invalidation rules that make
+// it safe.
+//
+// Cache building needs pre-read tokens (`#subagentRows`): the ids a root's last
+// listing carried are sampled **before** the tree read and again after it, and
+// the entry is written only when both samples agree. The first call for a tree
+// therefore only learns its node ids (it cannot prove pre == post for ids it has
+// never seen), the **second** call builds the cache, and the **third** call is
+// the first one served from it. Blocks below state which call they mean.
+//
+//   * a repeat call with no catalog change is served from the cache and never
+//     touches the store listing;
+//   * every way the tree can change misses the cache — a new direct child (the
+//     parent log gains a `subagent/catalog` fact), a new grandchild (a child's
+//     log does), a live `subagent/catalog` event this process observed, or an
+//     external writer's append between the read and the token sample (§15);
+//   * the archive state is recomputed on every call and never cached, so
+//     archiving a root hides its whole tree even on a cache hit. A cache that
+//     answered stale rows would re-announce an archived subagent — the defect
+//     this repository already fixed once (`docs/FIELD-NOTES.md`).
+//
+// The fixture keeps every session cold unless a block supplies a live one, so
+// `stat()` is the only header/revision source and the recorded calls are the
+// evidence: `list` must stay at 0 (S1) and `descendants` must stop growing once
+// the tree is cached (S2).
+function makeSubagentTree({ archived = [], live = new Map() } = {}) {
+  const calls = { list: 0, descendants: 0, stat: [] };
+  const state = {
+    rows: [],
+    archived: new Set(archived),
+    revisions: new Map(),
+    headers: new Map(),
+  };
+  const services = {
+    workspaceRegistry: {
+      get archivedSessionIds() {
+        return state.archived;
+      },
+    },
+    sessions: {
+      list: () => [...live.values()],
+      get: (id) => live.get(id),
+    },
+    sessionPersistence: {
+      list: async () => {
+        calls.list += 1;
+        return [];
+      },
+      stat: async (id) => {
+        calls.stat.push(id);
+        return {
+          header: state.headers.get(id) ?? { id, origin: 'user' },
+          revision: state.revisions.get(id) ?? 'rev-1',
+        };
+      },
+    },
+    subagents: {
+      // Fresh row objects per call: the bridge must not mutate what it cached.
+      listDescendants: async () => {
+        calls.descendants += 1;
+        return state.rows.map((row) => ({ ...row }));
+      },
+    },
+  };
+  return { calls, state, services };
+}
+
+const childRow = (id, parentId, label) => ({ kind: 'child', id, parentId, label, mode: 'continuable' });
+
+// ---- 14a. no whole-store scan; build on the second call, hit on the third
+{
+  const tree = makeSubagentTree();
+  tree.state.rows = [childRow('child-1', 'root-1', 'Child')];
+  tree.state.revisions.set('root-1', 'root-r1');
+  tree.state.revisions.set('child-1', 'child-c1');
+  const { server } = makeServer(tree.services);
+  const first = await server.subagents({ sessionId: 'root-1' });
+  check(
+    'subagents() lists no stored session headers at all (the whole-store scan is gone)',
+    tree.calls.list === 0,
+    `${tree.calls.list} sessionPersistence.list() call(s)`,
+  );
+  check(
+    'the first listing reads the descendant tree once',
+    tree.calls.descendants === 1 && first?.subagents?.length === 1,
+    `descendants=${tree.calls.descendants}, rows=${first?.subagents?.length}`,
+  );
+  await server.subagents({ sessionId: 'root-1' });
+  check(
+    'the first repeat learns the node ids and builds the cache',
+    tree.calls.descendants === 2,
+    `${tree.calls.descendants} tree read(s) before the cache can exist`,
+  );
+  const statsBeforeThird = tree.calls.stat.length;
+  const third = await server.subagents({ sessionId: 'root-1' });
+  check(
+    'the third listing with no catalog change is answered from the cache (token reads only)',
+    tree.calls.descendants === 2 && tree.calls.stat.length - statsBeforeThird === 2,
+    `descendants=${tree.calls.descendants}, token reads=${tree.calls.stat.length - statsBeforeThird}`,
+  );
+  check(
+    'the cached listing answers exactly the same rows',
+    JSON.stringify(third.subagents) === JSON.stringify(first.subagents),
+    JSON.stringify(third.subagents),
+  );
+}
+
+// ---- 14b. a new direct child is visible on the very next call ----------
+{
+  const tree = makeSubagentTree();
+  tree.state.rows = [childRow('child-1', 'root-1', 'Child')];
+  tree.state.revisions.set('root-1', 'root-r1');
+  const { server } = makeServer(tree.services);
+  await server.subagents({ sessionId: 'root-1' });
+  // Creating a child appends a `subagent/catalog` fact to the parent's log, so
+  // the parent's stored revision moves.
+  tree.state.rows.push(childRow('child-2', 'root-1', 'Second'));
+  tree.state.revisions.set('root-1', 'root-r2');
+  const second = await server.subagents({ sessionId: 'root-1' });
+  check(
+    'a new direct child invalidates the cache and is reported immediately',
+    second?.subagents?.length === 2 && tree.calls.descendants === 2,
+    `descendants=${tree.calls.descendants}, rows=${JSON.stringify(second?.subagents?.map((row) => row.sessionId))}`,
+  );
+}
+
+// ---- 14c. a new grandchild changes only the child's own log ------------
+{
+  const tree = makeSubagentTree();
+  tree.state.rows = [childRow('child-1', 'root-1', 'Child')];
+  tree.state.revisions.set('root-1', 'root-r1');
+  tree.state.revisions.set('child-1', 'child-c1');
+  const { server } = makeServer(tree.services);
+  await server.subagents({ sessionId: 'root-1' });
+  tree.state.rows.push(childRow('grand-1', 'child-1', 'Grand'));
+  tree.state.revisions.set('child-1', 'child-c2');
+  const second = await server.subagents({ sessionId: 'root-1' });
+  check(
+    'a new grandchild invalidates the cache even when the root log is unchanged',
+    second?.subagents?.length === 2 && tree.calls.descendants === 2,
+    `descendants=${tree.calls.descendants}, rows=${JSON.stringify(second?.subagents?.map((row) => row.sessionId))}`,
+  );
+}
+
+// ---- 14d. archiving a root hides its tree on the cache-hit path --------
+{
+  const tree = makeSubagentTree();
+  tree.state.rows = [childRow('child-1', 'root-1', 'Child')];
+  tree.state.revisions.set('root-1', 'root-r1');
+  const { server } = makeServer(tree.services);
+  const before = await server.subagents({ sessionId: 'root-1' });
+  check(
+    'an unarchived listing carries no archived flag',
+    before?.subagents?.[0]?.archived === undefined,
+    JSON.stringify(before?.subagents),
+  );
+  await server.subagents({ sessionId: 'root-1' });   // build the cache
+  tree.state.archived.add('root-1');
+  const archived = await server.subagents({ sessionId: 'root-1' });   // cache hit
+  check(
+    'archiving the root marks every descendant archived, recomputed on each call',
+    archived?.subagents?.every((row) => row.archived === true),
+    JSON.stringify(archived?.subagents),
+  );
+  check(
+    'the archive change is answered without re-reading the tree (cache hit)',
+    tree.calls.descendants === 2,
+    `${tree.calls.descendants} tree read(s)`,
+  );
+  tree.state.archived.delete('root-1');
+  const restored = await server.subagents({ sessionId: 'root-1' });
+  check(
+    'unarchiving clears the flag on the same cached listing',
+    restored?.subagents?.every((row) => row.archived === undefined),
+    JSON.stringify(restored?.subagents),
+  );
+}
+
+// ---- 14e. an archived ancestor above the opened root still wins --------
+// The rows carry the subtree's parent edges; the chain **above** the opened
+// session is the only thing a durable header is needed for. Opening a subagent
+// session directly must still hide it when its own root was archived, and a
+// child header that cannot be read must not change that answer: the walk never
+// asks the store for a child's header.
+{
+  const tree = makeSubagentTree({ archived: ['ancestor-1'] });
+  tree.state.rows = [childRow('child-1', 'root-1', 'Child')];
+  tree.state.headers.set('root-1', { id: 'root-1', origin: 'subagent', parentSession: 'ancestor-1' });
+  const statBelow = tree.services.sessionPersistence.stat;
+  tree.services.sessionPersistence.stat = async (id) => {
+    if (id === 'child-1') throw new Error('child header unreadable');
+    return statBelow(id);
+  };
+  const { server } = makeServer(tree.services);
+  const { value, lines } = await captureStderr(() => server.subagents({ sessionId: 'root-1' }));
+  check(
+    'a root under an archived ancestor still hides its children',
+    value?.subagents?.length === 1 && value.subagents[0]?.archived === true,
+    JSON.stringify(value?.subagents),
+  );
+  check(
+    'the lineage walk needed the opened root only (an unreadable child header changed nothing)',
+    value?.subagents?.[0]?.archived === true && lines.length === 0,
+    `${lines.length} line(s): ${JSON.stringify(lines)}`,
+  );
+}
+
+// ---- 14f. a live catalog fact invalidates the cache --------------------
+// A child created while this process serves the parent is announced by a
+// `subagent/catalog` event, not by a stored-revision change (the parent's log is
+// live in memory). The bridge must invalidate on that event too, or a running
+// teammate's own child would never appear on the next reopen. The event makes the
+// re-read carry a *new* node id, so that read cannot cache either (no pre-token
+// for the new id): the cache is built by the third call and hit by the fourth.
+{
+  const liveSession = { id: 'root-1', header: { id: 'root-1', origin: 'user' } };
+  const live = new Map([['root-1', liveSession]]);
+  const tree = makeSubagentTree({ live });
+  tree.state.rows = [childRow('child-1', 'root-1', 'Child')];
+  const { server, handlers } = makeServer(tree.services);
+  await server.subagents({ sessionId: 'root-1' });
+  check(
+    'a live session is validated by catalog generation, not a stored revision',
+    tree.calls.stat.includes('root-1') === false,
+    JSON.stringify(tree.calls.stat),
+  );
+  tree.state.rows.push(childRow('child-2', 'root-1', 'Second'));
+  handlers.get('session/event')(liveSession, { type: 'subagent/catalog', data: { childId: 'child-2' } });
+  const afterEvent = await server.subagents({ sessionId: 'root-1' });
+  check(
+    'a live subagent/catalog event invalidates the cached listing',
+    afterEvent?.subagents?.length === 2 && tree.calls.descendants === 2,
+    `descendants=${tree.calls.descendants}, rows=${JSON.stringify(afterEvent?.subagents?.map((row) => row.sessionId))}`,
+  );
+  await server.subagents({ sessionId: 'root-1' });
+  check(
+    'with no further catalog change the re-read tree is cached on the third call',
+    tree.calls.descendants === 3,
+    `descendants=${tree.calls.descendants}`,
+  );
+  const settled = await server.subagents({ sessionId: 'root-1' });
+  check(
+    'the fourth call is served from the cache',
+    settled?.subagents?.length === 2 && tree.calls.descendants === 3,
+    `descendants=${tree.calls.descendants}, rows=${JSON.stringify(settled?.subagents?.map((row) => row.sessionId))}`,
+  );
+}
+
+// ---- 14g. a catalog fact during the token sample must not pin old rows ----
+// A catalog fact that lands while the tokens are being sampled (after the tree
+// read) makes the pair `(rows, tokens)` describe two shapes: the live parent's
+// token carries the already-bumped generation while the rows are the pre-event
+// tree. Two mechanisms catch it (the second one only where a cache entry was
+// already valid): the in-process event guards, and the pre/post token samples in
+// `#subagentRows`. The fixture parks the first cold sample taken **after a tree
+// read** — on the build path that is a post-read sample on every implementation
+// — and makes `child-1` live.
+{
+  const liveSession = { id: 'child-1', header: { id: 'child-1', origin: 'subagent', parentSession: 'root-1' } };
+  const live = new Map([['child-1', liveSession]]);
+  const tree = makeSubagentTree({ live });
+  tree.state.rows = [childRow('child-1', 'root-1', 'Child')];
+  const { server, handlers } = makeServer(tree.services);
+  // Warm-up: learn the tree (and, on an implementation that caches on the first
+  // call, establish the entry the event could pin).
+  const warm = await server.subagents({ sessionId: 'root-1' });
+  check('14g setup: the warm-up call answers the tree', warm?.subagents?.length === 1, JSON.stringify(warm?.subagents));
+  // Move the root's revision so the next call must take a build/miss path.
+  tree.state.revisions.set('root-1', 'root-r2');
+  let entered;
+  let release;
+  const statEntered = new Promise((resolve) => { entered = resolve; });
+  const statRelease = new Promise((resolve) => { release = resolve; });
+  let parked = false;
+  const statBelow = tree.services.sessionPersistence.stat;
+  tree.services.sessionPersistence.stat = async (id) => {
+    if (id === 'root-1' && tree.calls.descendants >= 2 && !parked) {
+      parked = true;
+      entered();
+      await statRelease;
+    }
+    return statBelow(id);
+  };
+  const inFlight = server.subagents({ sessionId: 'root-1' });
+  const parkedOrSettled = await Promise.race([statEntered.then(() => true), inFlight.then(() => false)]);
+  if (parkedOrSettled) {
+    tree.state.rows.push(childRow('grand-1', 'child-1', 'Grand'));
+    handlers.get('session/event')(liveSession, { type: 'subagent/catalog', data: { childId: 'grand-1' } });
+    release();
+  }
+  const first = await inFlight;
+  check(
+    'the in-flight call still answers the rows its own read saw',
+    first?.subagents?.length === 1,
+    JSON.stringify(first?.subagents?.map((row) => row.sessionId)),
+  );
+  const next = await server.subagents({ sessionId: 'root-1' });
+  check(
+    'a catalog fact sampled into the token window is not pinned — the next call sees the new child',
+    next?.subagents?.length === 2 && tree.calls.descendants === 3,
+    `descendants=${tree.calls.descendants}, rows=${JSON.stringify(next?.subagents?.map((row) => row.sessionId))}`,
+  );
+}
+
+// ===== 15. a cached token must not postdate the rows it is stored with =====
+// Building the cache reads the tree first and samples revisions/tokens after it.
+// A session that is cold in this process can be written by **another OS process**
+// (a hand `dsh resume` of one of these subagent sessions): the token then carries
+// the post-write revision while `rows` keeps the pre-write shape, both in-process
+// guards are blind to it (no event reaches this process), and every later call
+// matches its own revision and serves the old rows — a silently missing subagent.
+// The invariant pinned here is pre-read tokens == post-read tokens for every id
+// the cached rows name; the first call for a tree only learns its ids (nothing
+// can be proven yet), the second builds the cache, the third hits it.
+
+// ---- 15a. an external write between read and token sample must not cache
+{
+  const tree = makeSubagentTree();
+  tree.state.rows = [childRow('child-1', 'root-1', 'Child')];
+  tree.state.revisions.set('root-1', 'root-r1');
+  tree.state.revisions.set('child-1', 'child-c1');
+  const { server } = makeServer(tree.services);
+  const first = await server.subagents({ sessionId: 'root-1' });
+  check(
+    '15a setup: the first call reads the tree (nothing cached yet)',
+    first?.subagents?.length === 1 && tree.calls.descendants === 1,
+    `descendants=${tree.calls.descendants}`,
+  );
+  // Force the second call to be a cache miss on every implementation (an
+  // unrelated append to the root moves its revision, not the tree shape), so its
+  // build path is the one under test.
+  tree.state.revisions.set('root-1', 'root-r2');
+  // Park the first `child-1` sample taken **after the second tree read** — on
+  // every implementation that is a post-read sample of the build path (a
+  // validation sample runs before that read).
+  let entered;
+  let release;
+  const statEntered = new Promise((resolve) => { entered = resolve; });
+  const statRelease = new Promise((resolve) => { release = resolve; });
+  let childStatCalls = 0;
+  let parked = false;
+  const statBelow = tree.services.sessionPersistence.stat;
+  tree.services.sessionPersistence.stat = async (id) => {
+    if (id === 'child-1') {
+      childStatCalls += 1;
+      if (tree.calls.descendants === 2 && !parked) {
+        parked = true;
+        entered();
+        await statRelease;
+      }
+    }
+    return statBelow(id);
+  };
+  const inFlight = server.subagents({ sessionId: 'root-1' });
+  // If an implementation stops sampling after the read, the call settles without
+  // reaching the parked stat; the assertions below then fail instead of hanging.
+  const parkedOrSettled = await Promise.race([statEntered.then(() => true), inFlight.then(() => false)]);
+  if (parkedOrSettled) {
+    // The external writer appends a catalog fact to the cold child while this
+    // process only holds its pre-write token.
+    tree.state.rows.push(childRow('grand-1', 'child-1', 'Grand'));
+    tree.state.revisions.set('child-1', 'child-c2');
+    release();
+  }
+  const second = await inFlight;
+  check(
+    '15a: the in-flight call still answers the rows its own read saw',
+    second?.subagents?.length === 1,
+    JSON.stringify(second?.subagents?.map((row) => row.sessionId)),
+  );
+  const third = await server.subagents({ sessionId: 'root-1' });
+  check(
+    '15a: the external write was not pinned — the next call re-reads and sees the new child',
+    third?.subagents?.length === 2 && tree.calls.descendants === 3,
+    `descendants=${tree.calls.descendants}, rows=${JSON.stringify(third?.subagents?.map((row) => row.sessionId))}`,
+  );
+}
+
+// ---- 15b. close → external append → reopen must not reuse the live token
+// Paseo's refresh is close followed by an immediate reopen of the same native id;
+// the live-catalog generation does not move, so `live:<gen>` from the old entry
+// would match again even though another process appended to the log while the
+// session was cold in both processes.
+{
+  const liveRoot = { id: 'root-1', header: { id: 'root-1', origin: 'user' } };
+  const live = new Map([['root-1', liveRoot]]);
+  const tree = makeSubagentTree({ live });
+  tree.state.rows = [childRow('child-1', 'root-1', 'Child')];
+  tree.state.revisions.set('child-1', 'child-c1');
+  const { server } = makeServer(tree.services);
+  server.initializedSessions.add('root-1');   // closeSession's `known` gate
+  await server.subagents({ sessionId: 'root-1' });   // learn ids
+  await server.subagents({ sessionId: 'root-1' });   // build the cache
+  check(
+    '15b setup: the cache exists for the live root',
+    tree.calls.descendants === 2,
+    `descendants=${tree.calls.descendants}`,
+  );
+  live.delete('root-1');
+  const closed = await server.closeSession({ sessionId: 'root-1' });
+  // External writer appends while the session is cold, then the same id reopens
+  // (a refreshed conversation). No catalog event reaches this process.
+  tree.state.rows.push(childRow('child-2', 'root-1', 'Second'));
+  tree.state.revisions.set('root-1', 'root-r2');
+  live.set('root-1', { id: 'root-1', header: { id: 'root-1', origin: 'user' } });
+  const reopened = await server.subagents({ sessionId: 'root-1' });
+  check(
+    '15b: a closed/reopened session does not reuse the old live-token entry',
+    closed?.closed === true && reopened?.subagents?.length === 2 && tree.calls.descendants === 3,
+    `closed=${String(closed?.closed)}, descendants=${tree.calls.descendants}, rows=${JSON.stringify(reopened?.subagents?.map((row) => row.sessionId))}`,
+  );
+}
+
+// ---- 15c. the normal path still hits the cache on the third call -------
+{
+  const tree = makeSubagentTree();
+  tree.state.rows = [childRow('child-1', 'root-1', 'Child')];
+  tree.state.revisions.set('root-1', 'root-r1');
+  tree.state.revisions.set('child-1', 'child-c1');
+  const { server } = makeServer(tree.services);
+  const first = await server.subagents({ sessionId: 'root-1' });
+  const second = await server.subagents({ sessionId: 'root-1' });
+  const statsBeforeThird = tree.calls.stat.length;
+  const third = await server.subagents({ sessionId: 'root-1' });
+  check(
+    '15c: without external writes the second call builds the cache and the third call hits it',
+    tree.calls.descendants === 2
+      && tree.calls.stat.length - statsBeforeThird === 2
+      && JSON.stringify(third.subagents) === JSON.stringify(first.subagents)
+      && second?.subagents?.length === 1,
+    `descendants=${tree.calls.descendants}, token reads after the third call start=${tree.calls.stat.length - statsBeforeThird}`,
   );
 }
 

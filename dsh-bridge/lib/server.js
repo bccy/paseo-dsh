@@ -327,6 +327,21 @@ function reportMissingService(service, line) {
   process.stderr.write(line);
 }
 
+/**
+ * Whether two id -> token maps describe the same state for the same id set.
+ *
+ * Used by the subagent-listing cache: the pre-read and post-read samples must be
+ * identical for the entry to be written, which also means every id the cached
+ * rows name had a pre-read token.
+ */
+function tokensAgree(before, after) {
+  if (before.size !== after.size) return false;
+  for (const [id, token] of before) {
+    if (after.get(id) !== token) return false;
+  }
+  return true;
+}
+
 /** Reporter for {@link REPORTED_JOB_TITLE_FAILURES}, one line per reason. */
 function reportJobTitleFailure(reason, error) {
   if (REPORTED_JOB_TITLE_FAILURES.has(reason)) return;
@@ -363,6 +378,17 @@ const CHILD_BUFFER_CAP = 500;
  * plugin re-initializes on its next attach anyway).
  */
 const MAX_SESSION_ROUTE_ENTRIES = 500;
+
+/**
+ * How many recently read subagent trees the bridge keeps.
+ *
+ * One entry is the descendant listing of one opened session, kept so opening the
+ * same session again does not re-read every child's log (one `observeSession`
+ * per node, ~0.3 s per child measured). The key is the DSH session id and the
+ * entry is small (catalog rows, never session history), so a handful of slots
+ * covers the sessions a user actually moves between while staying bounded.
+ */
+const SUBAGENT_LISTING_CACHE_LIMIT = 8;
 
 /**
  * How many bash `description`s one session may keep for the jobs pill.
@@ -719,6 +745,46 @@ export class PaseoHarnessServer {
      */
     this.children = new Map();
     /**
+     * sessionId -> how many `subagent/catalog` facts this process has observed on
+     * that session.
+     *
+     * A cached descendant listing is only reusable while nothing under it gained
+     * a child. A persisted parent's catalog change moves its stored revision,
+     * which the cache validates; a **live** parent's change reaches this process
+     * as an event and its in-memory log revision is the only other signal, so the
+     * counter is the live-side invalidation fact (see
+     * {@link #subagentListingStillValid}). Only catalog events bump it — ordinary
+     * turns on the parent must not throw the tree away.
+     */
+    this.subagentCatalogGenerations = new Map();
+    /**
+     * sessionId -> the ids its last descendant listing carried, the root excluded.
+     *
+     * Cache building samples revisions/generations **before** the tree read and
+     * again after it, and only writes an entry when both samples agree (see
+     * `#subagentRows`). The pre-read sample can only cover ids that are already
+     * known, so this list is what a reopened tree offers on its second open: the
+     * first open of a tree learns the ids only, the next one can build the entry.
+     * It deliberately survives invalidation — a stale entry is exactly what the
+     * next build needs the id set for.
+     */
+    this.subagentListingNodeIds = new Map();
+    /**
+     * sessionId -> `{ rows, tokens }`, the last descendant listing the bridge read
+     * and the revision/generation tokens its shape was read at.
+     *
+     * `paseo/subagents` runs on every open, and a reopened conversation usually
+     * has the same subagent tree it had a moment ago; re-reading every child log
+     * to answer the same rows is what made the plugin's replay budget fire on
+     * nearly every reopen. The tokens are re-read on each call
+     * ({@link #subagentListingStillValid}) so a new child, a new grandchild, or a
+     * live catalog event misses instead of answering stale rows — a stale listing
+     * re-announces an archived subagent, which is why the invalidation rules
+     * matter more than the hit rate. Archive state is deliberately NOT part of
+     * the entry: it is recomputed from the live registry on every call.
+     */
+    this.subagentListingCache = new Map();
+    /**
      * sessionId -> command text -> the model-written `description` of the bash
      * call that ran it.
      *
@@ -840,7 +906,16 @@ export class PaseoHarnessServer {
         // parent edge by the time the event lands and never misattributes it.
         this.observeChildSession(session);
         this.observeDelegatedTurn(session, event);
-        if (event.type === 'subagent/catalog') this.observeCatalogChild(session, event);
+        if (event.type === 'subagent/catalog') {
+          this.observeCatalogChild(session, event);
+          // A catalog fact changes the tree below this session; cached listings
+          // for its ancestors must miss rather than answer the old shape.
+          const parentId = String(session.id);
+          this.subagentCatalogGenerations.set(
+            parentId,
+            (this.subagentCatalogGenerations.get(parentId) ?? 0) + 1,
+          );
+        }
         // `job/registered` is appended by DSH's jobs registry to the session log,
         // so it reaches the bridge as an ordinary event; absorbing it here is
         // what gives a later `job_output` read an exact call-id join.
@@ -2164,12 +2239,17 @@ export class PaseoHarnessServer {
   }
 
   /**
-   * Durable headers for every Session this runtime can see, keyed by id.
+   * Durable header for one Session id, read only when the walk needs it.
    *
-   * The archive-lineage rule walks `origin: 'subagent'` + `parentSession`
-   * through headers, and a descendant's ancestors are usually NOT live (they
-   * settled), so stored snapshots are what make the walk reach the root. Live
-   * headers are layered on top because DSH's own gate reads the live object.
+   * The archive-lineage walk only needs headers for the chain **above** the
+   * session Paseo opened: a listing already carries every descendant's catalog
+   * parent (see {@link #archivedClassifier}). This used to be answered by
+   * materializing every stored header -- `sessionPersistence.list()` walks the
+   * whole store and decodes each log's first frame (0.75-0.84 s on the measured
+   * 2.5k-session store) on **every open**, including sessions with no subagents
+   * at all. The walk now reads only the ids it visits: a live Session's header is
+   * already in memory, and a stored one costs a single `stat()` (header only,
+   * never the event log).
    *
    * Both sources are optional peers and a missing one only narrows the walk.
    * Missing and unreadable are still reported apart, for the same reason as
@@ -2178,62 +2258,132 @@ export class PaseoHarnessServer {
    * the truth unless someone says otherwise. The standing "not composed" facts
    * go through {@link reportMissingService} (once per process); a throwing
    * lookup or read is reported every time.
+   *
+   * @param id - Session whose header the lineage walk needs.
+   * @param cache - per-call id -> header map; a walk visits shared ancestors.
    */
-  async #sessionHeaders() {
-    const headers = new Map();
-    let persistence;
-    try {
-      persistence = this.ctx.get('sessionPersistence');
-    } catch (error) {
-      process.stderr.write(
-        `[bridge] looking up DSH's session persistence failed; the archived-session walk sees only live `
-        + `sessions: ${error instanceof Error ? error.message : String(error)}\n`,
-      );
-      persistence = undefined;
-    }
-    if (persistence === undefined) {
-      reportMissingService(
-        'sessionPersistence',
-        '[bridge] this DSH profile composes no session persistence; the archived-session walk sees only '
-        + 'live sessions (archived subagents may be re-announced)\n',
-      );
-    } else {
-      try {
-        for (const snapshot of await persistence.list()) {
-          const header = snapshot?.header;
-          if (header?.id !== undefined) headers.set(String(header.id), header);
-        }
-      } catch (error) {
-        process.stderr.write(
-          `[bridge] listing stored session headers failed; the archived-session walk keeps only what it `
-          + `already has (archived subagents may be re-announced): ${error instanceof Error ? error.message : String(error)}\n`,
-        );
-      }
-    }
+  async #durableSessionHeader(id, cache) {
+    if (cache.has(id)) return cache.get(id);
+    let header;
     let sessions;
     try {
       sessions = this.ctx.get('sessions');
     } catch (error) {
       process.stderr.write(
-        `[bridge] looking up DSH's live session service failed; the archived-session walk keeps only stored `
-        + `headers: ${error instanceof Error ? error.message : String(error)}\n`,
+        `[bridge] looking up DSH's live session service failed; the archived-session walk cannot resolve `
+        + `${id} from live sessions: ${error instanceof Error ? error.message : String(error)}\n`,
       );
       sessions = undefined;
     }
-    if (sessions !== undefined) {
+    const live = sessions?.get?.(id);
+    if (live?.header?.id !== undefined) {
+      header = live.header;
+    } else {
+      let persistence;
       try {
-        for (const session of sessions.list()) {
-          const header = session?.header;
-          if (header?.id !== undefined) headers.set(String(header.id), header);
-        }
+        persistence = this.ctx.get('sessionPersistence');
       } catch (error) {
         process.stderr.write(
-          `[bridge] listing live session headers failed; the archived-session walk keeps only stored headers: `
-          + `${error instanceof Error ? error.message : String(error)}\n`,
+          `[bridge] looking up DSH's session persistence failed; the archived-session walk cannot resolve `
+          + `${id} from stored headers: ${error instanceof Error ? error.message : String(error)}\n`,
         );
+        persistence = undefined;
+      }
+      if (persistence === undefined) {
+        reportMissingService(
+          'sessionPersistence',
+          '[bridge] this DSH profile composes no session persistence; the archived-session walk sees only '
+          + 'live sessions (archived subagents may be re-announced)\n',
+        );
+      } else if (typeof persistence.stat !== 'function') {
+        reportMissingService(
+          'sessionPersistence.stat',
+          '[bridge] this DSH session persistence has no stat(); the archived-session walk sees only live '
+          + 'sessions (archived subagents may be re-announced)\n',
+        );
+      } else {
+        try {
+          header = (await persistence.stat(id))?.header;
+        } catch (error) {
+          process.stderr.write(
+            `[bridge] reading the stored header of ${id} failed; the archived-session walk stops there `
+            + `(archived subagents may be re-announced): ${error instanceof Error ? error.message : String(error)}\n`,
+          );
+        }
       }
     }
-    return headers;
+    cache.set(id, header);
+    return header;
+  }
+
+  /**
+   * Classifier for DSH's archive-lineage rule over one subagent listing.
+   *
+   * The rule (`archived-lineage.js`) walks a session's `origin: "subagent"` +
+   * `parentSession` chain. A listing already carries the whole reachable
+   * subtree's catalog parent (`row.parentId`, recorded by the parent in its own
+   * `subagent/catalog` fact), and a catalog child is always created as a
+   * subagent Session whose durable `parentSession` is that same catalog parent
+   * (`dsh-subagent`'s `childSessionMeta`), so the rows ARE the subtree half of
+   * the walk. Only the chain **above** the opened session needs a durable header
+   * ({@link #durableSessionHeader}).
+   *
+   * With no archived session the answer is trivially "not archived" for every
+   * id, and no header is read at all -- the common case pays nothing.
+   *
+   * @param archived - DSH's registry-global archive set, as strings.
+   * @param rows - the listing's rows (catalog children and diagnostics).
+   * @returns async `(sessionId) => boolean`, memoized within the call.
+   */
+  #archivedClassifier(archived, rows) {
+    if (archived.size === 0) return async () => false;
+    const parentOf = new Map();
+    for (const row of rows) {
+      if (row?.id === undefined || row?.parentId === undefined) continue;
+      parentOf.set(String(row.id), String(row.parentId));
+    }
+    const memo = new Map();
+    const headers = new Map();
+    const classify = async (sessionId) => {
+      const start = String(sessionId);
+      const chain = [];
+      const visited = new Set();
+      let current = start;
+      let verdict = false;
+      for (;;) {
+        if (current === '' || visited.has(current)) {
+          verdict = false;
+          break;
+        }
+        const known = memo.get(current);
+        if (known !== undefined) {
+          verdict = known;
+          break;
+        }
+        visited.add(current);
+        chain.push(current);
+        if (archived.has(current)) {
+          verdict = true;
+          break;
+        }
+        const parent = parentOf.get(current);
+        if (parent !== undefined) {
+          current = parent;
+          continue;
+        }
+        // The row edges end at the opened session; only its own ancestors live in
+        // stored headers.
+        const header = await this.#durableSessionHeader(current, headers);
+        if (header === undefined || header.origin !== 'subagent' || header.parentSession === undefined) {
+          verdict = false;
+          break;
+        }
+        current = String(header.parentSession);
+      }
+      for (const id of chain) memo.set(id, verdict);
+      return verdict;
+    };
+    return classify;
   }
 
   /**
@@ -2518,6 +2668,162 @@ export class PaseoHarnessServer {
     return { available: true };
   }
 
+  /**
+   * Validation tokens for the tree shape of one cached subagent listing.
+   *
+   * The shape is a function of every session whose catalog was reachable: the
+   * opened session plus every listed row. Each id is reduced to one token -- a
+   * live Session is validated by how many `subagent/catalog` facts this process
+   * has observed on it, and a cold one by its stored revision (a new child is a
+   * new catalog fact in that session's log, which moves its revision). A session
+   * that is cold here cannot gain a child behind this process's back: appending
+   * needs the log's write lease, which the live owner holds, so the stored
+   * revision is exact for the read-only side.
+   *
+   * `undefined` means "cannot validate", and the caller then neither caches nor
+   * reuses. That is deliberately silent: the listing itself is unchanged, only a
+   * performance shortcut is skipped, and a profile whose persistence cannot
+   * answer `stat()` already reports that where it matters.
+   *
+   * @param ids - session ids the cached shape depends on.
+   * @returns id -> token map, or `undefined` when it cannot be validated.
+   */
+  async #subagentListingTokens(ids) {
+    let sessions;
+    try {
+      sessions = this.ctx.get('sessions');
+    } catch {
+      sessions = undefined;
+    }
+    let persistence;
+    try {
+      persistence = this.ctx.get('sessionPersistence');
+    } catch {
+      persistence = undefined;
+    }
+    const tokens = new Map();
+    for (const id of ids) {
+      const live = sessions?.get?.(id);
+      if (live !== undefined && live !== null) {
+        tokens.set(id, `live:${String(this.subagentCatalogGenerations.get(id) ?? 0)}`);
+        continue;
+      }
+      if (typeof persistence?.stat !== 'function') return undefined;
+      let snapshot;
+      try {
+        snapshot = await persistence.stat(id);
+      } catch {
+        // A read that fails might still be the file the listing came from;
+        // without a token there is no way to tell, so do not cache.
+        return undefined;
+      }
+      tokens.set(id, snapshot === undefined ? 'stored:missing' : `stored:${String(snapshot.revision)}`);
+    }
+    return tokens;
+  }
+
+  /** Whether one cached listing's rows still match the current store/catalog. */
+  async #subagentListingStillValid(entry) {
+    const tokens = await this.#subagentListingTokens([...entry.tokens.keys()]);
+    if (tokens === undefined || tokens.size !== entry.tokens.size) return false;
+    for (const [id, token] of entry.tokens) {
+      if (tokens.get(id) !== token) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Read one subagent listing, reusing and refreshing {@link subagentListingCache}.
+   *
+   * Any failure in the cache layer is reported and downgraded to a fresh read: a
+   * broken shortcut must never change the answer.
+   *
+   * @param rootSessionId - session Paseo opened.
+   * @param subagents - DSH's `subagents` service.
+   * @returns the descendant rows of that session.
+   */
+  async #subagentRows(rootSessionId, subagents) {
+    const key = String(rootSessionId);
+    const cached = this.subagentListingCache.get(key);
+    if (cached !== undefined) {
+      let valid = false;
+      try {
+        valid = await this.#subagentListingStillValid(cached);
+      } catch (error) {
+        process.stderr.write(
+          `[bridge] validating the cached subagent listing for ${key} failed; reading the tree again: `
+          + `${error instanceof Error ? error.message : String(error)}\n`,
+        );
+      }
+      if (valid) {
+        // Least-recently-used eviction: move the entry to the tail.
+        this.subagentListingCache.delete(key);
+        this.subagentListingCache.set(key, cached);
+        return cached.rows;
+      }
+      this.subagentListingCache.delete(key);
+    }
+    // A cached token must never be newer than the shape it is stored with. The
+    // tree read and the token samples are separate awaits, and a node that is
+    // cold here can be written by **another OS process** (a hand `dsh resume` of
+    // one of these sessions) in between: the token would then describe the
+    // post-write log while `rows` kept the pre-write shape, the next call would
+    // match its own revision, and the old rows would be served forever. Two
+    // samples around the read close that window: only a pair taken from one
+    // instant is stored.
+    const lastKnownIds = this.subagentListingNodeIds.get(key) ?? [];
+    const preTokens = await this.#subagentListingTokens([key, ...lastKnownIds]);
+    const rows = await subagents.listDescendants(key);
+    const nodeIds = [...new Set([key, ...rows.map((row) => String(row?.id))])];
+    this.#rememberSubagentNodeIds(key, nodeIds);
+    const postTokens = await this.#subagentListingTokens(nodeIds);
+    // `tokensAgree` also requires the same id set, so an id the pre-read sample
+    // never saw (a tree opened for the first time, or a just-created child) has
+    // no pre-read token and blocks the entry: the next open builds it.
+    if (preTokens !== undefined && postTokens !== undefined && tokensAgree(preTokens, postTokens)) {
+      this.subagentListingCache.set(key, { rows, tokens: postTokens });
+      while (this.subagentListingCache.size > SUBAGENT_LISTING_CACHE_LIMIT) {
+        const oldest = this.subagentListingCache.keys().next();
+        if (oldest.done === true) break;
+        this.subagentListingCache.delete(oldest.value);
+      }
+    }
+    return rows;
+  }
+
+  /** Remember the node ids a listing carried, bounded like the listing cache. */
+  #rememberSubagentNodeIds(rootSessionId, ids) {
+    this.subagentListingNodeIds.delete(rootSessionId);
+    this.subagentListingNodeIds.set(rootSessionId, ids.filter((id) => id !== rootSessionId));
+    while (this.subagentListingNodeIds.size > SUBAGENT_LISTING_CACHE_LIMIT) {
+      const oldest = this.subagentListingNodeIds.keys().next();
+      if (oldest.done === true) break;
+      this.subagentListingNodeIds.delete(oldest.value);
+    }
+  }
+
+  /**
+   * Drop every cached listing that mentions one session, plus its live catalog
+   * generation.
+   *
+   * A close ends that id's live event channel, and Paseo's refresh reopens the
+   * same id immediately. `live:<gen>` from the old entry would match the reopened
+   * session again — the generation cannot move for a catalog fact this process
+   * never saw, so an external append while the session was cold would otherwise
+   * go unnoticed. Dropping the entry forces the reopen to re-read; dropping the
+   * generation row keeps that table bounded by live sessions instead of every
+   * session ever observed. The last-known node id list is kept on purpose — see
+   * `#subagentRows`.
+   */
+  #forgetSubagentListings(sessionId) {
+    for (const [rootSessionId, entry] of this.subagentListingCache) {
+      if (rootSessionId === sessionId || entry.tokens.has(sessionId)) {
+        this.subagentListingCache.delete(rootSessionId);
+      }
+    }
+    this.subagentCatalogGenerations.delete(sessionId);
+  }
+
   async subagents(params) {
     const subagents = this.ctx.get('subagents');
     if (subagents === undefined) return { available: false, subagents: [] };
@@ -2531,9 +2837,9 @@ export class PaseoHarnessServer {
     // subagent tree as far as DSH's gate is concerned, so the replay must skip
     // descendants whose own id was never added to the set.
     const archived = this.#archivedSessionIds();
-    const headers = await this.#sessionHeaders();
     try {
-      const rows = await subagents.listDescendants(params.sessionId);
+      const rows = await this.#subagentRows(params.sessionId, subagents);
+      const classify = this.#archivedClassifier(archived, rows);
       const children = rows.filter((row) => row.kind === 'child');
       // Register every durable child before answering. The plugin asks for this
       // listing on each open to rebuild the tree; a bridge that restarted after a
@@ -2541,32 +2847,36 @@ export class PaseoHarnessServer {
       // adopted child's live frames forever (see `registerCatalogChild`).
       for (const row of children) {
         const childId = String(row.id);
-        if (underArchivedSession(headers, archived, childId)) continue;
+        if (await classify(childId)) continue;
         this.registerCatalogChild(childId, String(row.parentId), row.label, row.mode);
+      }
+      const listed = [];
+      for (const row of children) {
+        const childId = String(row.id);
+        listed.push({
+          sessionId: childId,
+          parentSessionId: String(row.parentId),
+          ...(row.mode === undefined ? {} : { mode: row.mode }),
+          ...(row.label === undefined ? {} : { label: row.label }),
+          // DSH 0.2.2-rc.2+ (`dsh-subagent`'s `SubagentDescendantListEntry`):
+          // `name` is the child's name, unique among its siblings, recorded by
+          // the creator's v3 `subagent/catalog` event. It stays in this reply for
+          // the **team roster**: the plugin builds the newer generation's member
+          // names from it, exactly as DSH's own subagent catalog panel does
+          // (`entry.name ?? entry.id`). It is deliberately not used for a child
+          // row's title — that row is label-only since the 2026-11-15 revert
+          // (`docs/FIELD-NOTES.md` 102), so the `path` this listing also carries
+          // has no consumer and is not sent. Absent on historical entries and on
+          // DSH builds that predate names; the roster then falls back to the
+          // session id, never to `label` (a creation label is a description,
+          // not an identity).
+          ...(typeof row.name === 'string' && row.name !== '' ? { name: row.name } : {}),
+          ...((await classify(childId)) ? { archived: true } : {}),
+        });
       }
       return {
         available: true,
-        subagents: children
-          .map((row) => ({
-            sessionId: String(row.id),
-            parentSessionId: String(row.parentId),
-            ...(row.mode === undefined ? {} : { mode: row.mode }),
-            ...(row.label === undefined ? {} : { label: row.label }),
-            // DSH 0.2.2-rc.2+ (`dsh-subagent`'s `SubagentDescendantListEntry`):
-            // `name` is the child's name, unique among its siblings, recorded by
-            // the creator's v3 `subagent/catalog` event. It stays in this reply for
-            // the **team roster**: the plugin builds the newer generation's member
-            // names from it, exactly as DSH's own subagent catalog panel does
-            // (`entry.name ?? entry.id`). It is deliberately not used for a child
-            // row's title — that row is label-only since the 2026-11-15 revert
-            // (`docs/FIELD-NOTES.md` 102), so the `path` this listing also carries
-            // has no consumer and is not sent. Absent on historical entries and on
-            // DSH builds that predate names; the roster then falls back to the
-            // session id, never to `label` (a creation label is a description,
-            // not an identity).
-            ...(typeof row.name === 'string' && row.name !== '' ? { name: row.name } : {}),
-            ...(underArchivedSession(headers, archived, String(row.id)) ? { archived: true } : {}),
-          })),
+        subagents: listed,
         diagnostics: rows
           .filter((row) => row.kind !== 'child')
           .map((row) => ({ sessionId: String(row.id), reason: row.reason })),
@@ -5089,6 +5399,10 @@ export class PaseoHarnessServer {
     this.promptDeliveries.delete(sessionId);
     this.pendingUserMessages.delete(sessionId);
     this.children.delete(sessionId);
+    // A closed session leaves the live catalog event channel; cached listings
+    // that name it and its generation row must go too (see
+    // `#forgetSubagentListings`).
+    this.#forgetSubagentListings(sessionId);
     // The composer pill's command table only exists to title a listed job; a
     // closed session has no jobs left to list, so it goes here.
     //
