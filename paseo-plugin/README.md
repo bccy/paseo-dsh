@@ -38,6 +38,7 @@ node <plugin-dir>/bin/paseo-dsh.mjs probe --base-url https://your-gateway/v1 \
 ```
 
 Do not use `npx paseo-dsh`: that resolves to the upstream npm package, not this branch.
+`doctor` invokes DSH composition, which can regenerate `cordis.yml`; it is not a strictly read-only command.
 
 What you get that the ACP boundary can't carry:
 
@@ -53,7 +54,8 @@ What you get that the ACP boundary can't carry:
   persona+capability bundles, chosen at session start and locked once it begins
 - Session **reopen and import**: a reopened session replays its conversation
   history, and native DSH sessions can be imported from Paseo
-- Background **jobs** pill (visible only while something runs; steps aside while the goal and team pills are both visible, expandable)
+- Background **jobs** pill (visible only while something runs, expandable; it can coexist with the goal and team pills)
+- Native **workspace badges** summarize goals, teams and live DSH jobs using those same subscriptions, with per-category toggles in the sidebar Show menu
 - **Goal** and **workflow** rows in the timeline, including workflows that keep
   running across turns
 - **Tool approval cards** for DSH's `approval/request`
@@ -70,11 +72,11 @@ What you get that the ACP boundary can't carry:
 Full documentation, the adoption guide, and 70+ real defects with their fixes
 live in the main repository: **https://github.com/bccy/paseo-dsh**
 
-Requires Paseo ≥ 0.16, **DSH ≥ 0.2.1**, **Node.js ≥ 20.4** (the bridge uses
+Requires Paseo ≥ 0.16.0 stable on the host and app, **DSH ≥ 0.2.1**, **Node.js ≥ 20.4** (the bridge uses
 `AbortSignal.any` and `Symbol.dispose`) and the official `dsh` on the daemon's
-`PATH`. The bridge imports eight DSH-internal packages (`dsh-cmdline`,
+`PATH`. The bridge imports nine DSH-internal packages (`dsh-cmdline`,
 `dsh-brand`, `dsh-llm`, `dsh-attachment`, `dsh-agent`, `dsh-tools`,
-`dsh-subprocess`, `schemastery`); `0.2.1-rc.2` is the verified build and 0.2.0
+`dsh-subprocess`, `dsh-host-plugin-inventory`, `schemastery`); this adaptation was checked with `0.2.2-rc.3` and 0.2.0
 and older are unverified (doctor fails them).
 
 ## Versioning
@@ -123,6 +125,7 @@ node <插件目录>/bin/paseo-dsh.mjs probe --base-url https://your-gateway/v1 \
 ```
 
 不要用 `npx paseo-dsh`：它解析到 npm 上的上游包，不是本分支。
+`doctor` 会调用 DSH 配置组合，可能重生成 `cordis.yml`，并非严格只读命令。
 
 ACP 承载不了、而这里都有：
 
@@ -137,7 +140,8 @@ ACP 承载不了、而这里都有：
 - profile 声明了 agent preset 时的 **Preset** 下拉——人设 + 能力包，
   建会话时选、首个回合后锁定
 - **会话恢复与导入**：重开会话会回放历史；并可从 Paseo 导入 DSH 原生会话
-- 后台任务 **jobs** pill（仅在有 live 任务时显示，全部结束即隐藏；同一 agent 的目标与团队 pill 同时显示时让位隐藏，任一消失后若自身规则应显示则立即恢复，点开展开）
+- 后台任务 **jobs** pill（仅在有 live 任务时显示，全部结束即隐藏；可与目标、团队 pill 同时显示，点开展开）
+- 原生**工作区徽标**：复用这些订阅聚合目标、团队和运行中的 DSH 后台任务，侧栏 Show 菜单可分别隐藏
 - 时间线里的 **Goal** 与 **workflow** 行，跨回合运行的工作流保持运行中
 - DSH `approval/request` 的**工具审批卡**
 - **撤回**：对话 + 文件都回退（消息行消失、被编辑工具改过的文件恢复、模型看不到被撤内容）；Paseo 0.15+ 时间线由宿主原生刷新，无需 Reload
@@ -147,10 +151,10 @@ ACP 承载不了、而这里都有：
 完整文档、改造指南、以及 70+ 个真实缺陷的修复记录都在主仓库：
 **https://github.com/bccy/paseo-dsh**
 
-需要 Paseo ≥ 0.16、**DSH ≥ 0.2.1**、**Node.js ≥ 20.4**（桥用了 `AbortSignal.any` 与
+需要 App 和宿主 Paseo ≥ 0.16.0 正式版、**DSH ≥ 0.2.1**、**Node.js ≥ 20.4**（桥用了 `AbortSignal.any` 与
 `Symbol.dispose`），且 daemon 的 `PATH` 上有官方 `dsh`。桥直接 import
-八个 DSH 内部包（`dsh-cmdline` / `dsh-brand` / `dsh-llm` / `dsh-attachment` / `dsh-agent` /
-`dsh-tools` / `dsh-subprocess` / `schemastery`）；`0.2.1-rc.2` 是实测通过的版本，0.2.0 及
+九个 DSH 内部包（`dsh-cmdline` / `dsh-brand` / `dsh-llm` / `dsh-attachment` / `dsh-agent` /
+`dsh-tools` / `dsh-subprocess` / `dsh-host-plugin-inventory` / `schemastery`）；本轮适配以 `0.2.2-rc.3` 验证，0.2.0 及
 更早未验证（`doctor` 会判 blocking）。
 
 ### 版本策略
