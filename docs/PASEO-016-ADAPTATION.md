@@ -39,16 +39,16 @@
 | B3 | `addNewWorkspaceItem` / 工作区 metadata | 新建工作区时，DSH 没有需要预先选的东西（profile/路由由 provider 读取） | 不适用。如果用户想在新建工作区时就选 DSH profile/预设，那是新功能，需要单独决定 |
 | B4 | `addSidebarView` | 替换整个侧栏属于产品范围扩大，和 DSH provider 职责无关 | 不适用 |
 | B5 | 组件化设置页（Settings cog/tabs，#8675） | 插件没有设置页（配置在 DSH profile） | 不适用 |
-| B6 | 插件 gallery / registry（#9752） | 收录属于发布；用户规则是不做 npm 发布 | 不在本轮。manifest 里的 icon/OVERVIEW 已经有了，不影响 |
+| B6 | 插件 gallery / registry（#9752） | 收录属于发布；须等用户真实环境测试通过并明确确认 | 交付元数据继续维护；不在测试完成前发布或提交目录收录 |
 | B7 | composer pill 上箭头（#8673） | 宿主自动画 | 宿主自动；真机看三个 pill |
 
-> 给用户的口径：B 节每一项都评估过，"不适用"的理由是 DSH 没有对应数据，或者宿主已经原生承接，不是遗漏。B1/B3 如果用户想要具体功能，需要他给出想要的控件。
+B 节的功能已按数据来源逐项评估。宿主已有的模型、思考、权限、草稿与附件交互继续由原生接口承接；没有 DSH 数据源的扩展点不注册占位控件。
 
 ## C. 工作区徽标最小完整设计
 
 **数据来源：复用现有三个 pill 的订阅，不新增 RPC，也不新增按 agent 的轮询。**
 - 三个 pill 模块（goal/team/jobs）的 `createAgentSubscriptions` 已经对每个 DSH agent（有 workspaceId、未关闭）开着订阅，answer 由 `publishState` 交给 pill。
-- 新增一个客户端模块 `client/workspace-status.ts`：纯 store，`Map<agentId, {workspaceId, goal?, team?, jobs?}>`，提供 `subscribe/getSnapshot`（给 useSyncExternalStore）。三个 pill 在 `publishState` / `removeAgent` 时顺带写入或删除自己那一份（只多一行调用，不改发布去重逻辑）。agent 的 workspaceId 从 `PillAgent` 拿。
+- 新增一个客户端模块 `client/workspace-status.ts`：纯 store，`Map<agentId, {workspaceId, goal?, team?, jobs?}>`，提供 `subscribe/getSnapshot`（给 useSyncExternalStore）。三个 pill 在 `publishState` / `removeAgent` 时顺带写入或删除自己那一份（观察器不拥有额外读取；仅在成功发布后提交去重签名）。agent 的 workspaceId 从 `PillAgent` 拿。
 - 徽标组件按 `workspaceId` 用 selector 读出聚合结果，用浅比较避免每行都重渲染。
 
 **每个工作区最多三个徽标，按类别各一个，只显示有意义的状态：**
@@ -56,20 +56,22 @@
 | 类别 | 显示条件 | 图标 / 文字 | tone |
 |---|---|---|---|
 | 目标 | 有 agent 的目标在运行 | 目标图标 + "目标" | info |
-| 目标 | 受阻 / 需要恢复（重开后 disarm）/ 读取失败 | 同上 | warning（失败用 danger） |
+| 目标 | 暂停 / 需要恢复（重开后 disarm）/ 受阻 / 读取失败 | 同上 | warning（受阻和读取失败用 danger） |
 | 目标 | 完成且**未读**（复用 seen 判定，和 pill 一致） | 对勾 | success |
 | 团队 | 有队员在跑 | 人形 + "团队" | info；团队记录出错时 danger |
-| 后台 | 有运行中的 DSH job（只看运行中，和 jobs pill 的"只做 live 指示"一致；文字只写"后台"） | 后台图标 + "后台"，多个时 "后台 N" | info |
+| 后台 | 有运行中的 DSH job（只看运行中，和 jobs pill 的"只做 live 指示"一致；文字只写"后台"） | 后台图标 + "后台"；数量仅放在 accessibilityLabel | info |
 
 - 多个 agent 同类时取最高优先级：danger > warning > success > info；accessibilityLabel 写出数量（例如"2 个目标运行中"）。
 - background agent：只计入 info（运行态），不贡献 warning/success（官方语义是"不吸引注意"）。
+- 未建立会话（`session_missing`）和明确未挂载的服务不生成警示徽标；RPC 读取失败保留错误语义，并与执行失败使用不同的无障碍文案。
+- 目标 active + armed 在自主回合间短暂 idle 时仍保持 info，与 composer pill 的目标状态一致；paused/disarmed 为 warning，blocked 为 danger。
 - 什么都没有就返回 `null`（文档：不留空隙）。
 - 文案走 `locale.ts`（中英）；图标复用现有 DeepSeek/目标/团队/后台图标。
 - 本轮徽标按用户确认的完整适配范围实现；后台 composer pill 保持原有 live-only 语义。
 
 **生命周期 / 边界**
 - 每个 host 一个插件客户端实例，徽标只渲染本 host 的工作区（文档）。
-- 订阅断开或终止（terminal）时，该 agent 的条目删除，徽标不保留过期状态。
+- 订阅断开或终止（terminal）时，该 agent 的条目删除，徽标不保留过期状态。重连间隙徽标会短暂消失，composer pill 则按既有策略保留最后内容；订阅重建后的首个相同答案也会恢复徽标。
 - 依赖 R2（关闭时释放订阅）：不修的话，关闭的 agent 会让徽标一直亮着 → R2 是徽标的前置。
 
 **验收**
