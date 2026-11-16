@@ -323,6 +323,9 @@ export function createAgentSubscriptions<D, Answer>(
     if (disposed || entry.terminal || entry.live) return;
     entry.live = true;
     entry.ended = false;
+    // An ended stream released observer ownership even though its composer pill
+    // kept the last UI. Re-register before the replacement can deliver a frame.
+    observe(observer => observer.agent(entry.agent));
     host.open(
       entry.agentId,
       (answer) => onAnswer(entry, answer),
@@ -411,13 +414,13 @@ export function createAgentSubscriptions<D, Answer>(
       remove(entry, "unauthorized");
       return;
     }
+    observe(observer => observer.remove(entry.agentId));
     host.onError(
       `${host.pillLabel}: the subscription for ${entry.agentId} ended; keeping the last known answer until the host re-subscribes`,
       error,
     );
     try {
       const failed = failedState(entry, error === undefined ? undefined : { message: error.message });
-      observe(observer => observer.state(entry.agentId, failed));
       publishTransient(entry, failed);
     } catch (publishError) {
       host.onError(`${host.pillLabel} could not publish the failed state for ${entry.agentId}`, publishError);
@@ -461,7 +464,7 @@ export function createAgentSubscriptions<D, Answer>(
     if (existing !== undefined) {
       existing.agent = agent;
       if (!existing.terminal) {
-        observe(observer => observer.agent(agent));
+        if (!existing.ended) observe(observer => observer.agent(agent));
         host.updateAgent(agent);
       }
       return;
@@ -477,7 +480,6 @@ export function createAgentSubscriptions<D, Answer>(
       lastPublished: undefined,
     };
     agents.set(agent.id, entry);
-    observe(observer => observer.agent(agent));
     host.addAgent(agent);
     open(entry);
   };

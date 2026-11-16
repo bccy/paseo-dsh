@@ -67,6 +67,7 @@ function makeHost(kind, observer) {
     snapshot(metadata = {}) { directory.snapshot({ entries: [{ agent: { ...agent, metadata } }], pageInfo: { hasMore: false, nextCursor: null } }); },
     upsert(metadata = {}) { directory.update({ type: "agent_update", payload: { kind: "upsert", agent: { ...agent, metadata } } }); },
     push(answer) { streams.at(-1).onAnswer(answer); },
+    end(error = new Error("subscription ended")) { streams.at(-1).options.onClosed({ error }); },
     get current() { return registrations.at(-1).current; },
     closePanel() {
       effects = [];
@@ -162,6 +163,30 @@ async function main() {
     check("an observer failure cannot stop the pill", h.current.visible, true);
     h.cleanup();
     check("an observer failure cannot stop cleanup", h.streams[0].options.signal.aborted, true);
+  }
+  for (const kind of ["goal", "team", "jobs"]) {
+    const current = new Map(), events = [];
+    const h = makeHost(kind, {
+      agent(agent) { current.set(agent.id, {}); events.push("agent"); },
+      state(id, state) { check(`${kind}: a state always belongs to a registered observer agent`, current.has(id), true); current.set(id, state); events.push("state"); },
+      remove(id) { current.delete(id); events.push("remove"); },
+    });
+    await flush(); h.snapshot();
+    const pushed = kind === "jobs"
+      ? { available: true, jobs: [{ id: "reconnect-job", status: "running", description: "live", createdAt: 1 }] }
+      : answer(kind, value(kind, "reconnect"));
+    h.push(pushed);
+    h.end();
+    check(`${kind}: subscription end removes observer ownership`, current.size, 0);
+    check(`${kind}: subscription end keeps the existing composer UI`, h.current.visible, true);
+    const at = events.length;
+    h.snapshot();
+    check(`${kind}: reopen registers the observer before any state`, events[at], "agent");
+    h.push(pushed);
+    check(`${kind}: same-value recovery publishes current observer state`, current.get(h.agent.id)?.available, true);
+    check(`${kind}: same-value recovery carries current visibility`, current.get(h.agent.id)?.visible, true);
+    check(`${kind}: exactly one replacement subscription`, h.streams.length, 2);
+    h.cleanup();
   }
   console.log(`${checks} contribution checks passed`);
 }
