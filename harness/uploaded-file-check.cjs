@@ -32,6 +32,7 @@
  * `@getpaseo/plugin` types need the project's bundler resolution); the emitted
  * JavaScript is what runs.
  */
+const { ProviderInputSchema } = require("@getpaseo/plugin/server/provider");
 const { renderPromptAttachmentAsText, toDshContent } = require("./server/session.js");
 
 const results = [];
@@ -132,6 +133,15 @@ const review = {
     },
   ],
 };
+
+const allReview = { ...review, mode: "all" };
+const allPrompt = ProviderInputSchema.safeParse({
+  type: "session.prompt", sessionId: "review-all",
+  prompt: { clientMessageId: "review-all-1", delivery: "auto", input: { type: "message", content: [allReview] } },
+});
+check("Review All passes the stable provider input schema", allPrompt.success, json(allPrompt.error));
+check("Review All preserves comments and diff context",
+  renderPromptAttachmentAsText(allReview) === renderPromptAttachmentAsText(review).replace("(base)", "(all)"));
 
 check(
   "review renders header, each comment, and its diff lines",
