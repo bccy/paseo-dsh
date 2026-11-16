@@ -271,7 +271,7 @@ export function contributeTeamPill(client: PluginClientContext, observer?: PillO
       });
     },
     listAgentPage: async (cursor) => {
-      const page = await client.paseo.agents.list({ page: { limit: AGENT_DIRECTORY_PAGE_SIZE, cursor }, signal: lifetime.signal });
+      const page = await client.paseo.agents.list({ filter: { includeBackground: true }, page: { limit: AGENT_DIRECTORY_PAGE_SIZE, cursor }, signal: lifetime.signal });
       return { entries: page.entries, pageInfo: page.pageInfo };
     },
     addAgent: (agent) => {
@@ -365,8 +365,9 @@ export function contributeTeamPill(client: PluginClientContext, observer?: PillO
     publishOnTransientError: false,
   });
 
+  // Background agents contribute running workspace badges through these streams.
   void client.paseo.agents
-    .list({ subscribe: {}, signal: lifetime.signal })
+    .list({ filter: { includeBackground: true }, subscribe: {}, signal: lifetime.signal })
     .then(({ subscription }) => {
       subscription.subscribe({
         snapshot: (page) => {

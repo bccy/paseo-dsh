@@ -20,7 +20,7 @@
 | A6 | `timeline.refetch({wholeTurns})` | 撤回提示按 noticeId 查 tail 20 | 不适用（已有共识） | 不改。只有"读取刚结束的那个回合的内容"才用它，而且要按 turnId 过滤；插件现在没有这类功能 | 无 |
 | A7 | 插件时间线 kind 格式校验（#7677） | `dsh-rewind-notice`、`dsh-stream-stats` 都合规 | 宿主自动 | 加一条离线断言：所有 kind 常量都满足 `^[a-z][a-z0-9-]*$`，防止以后新增的 kind 不合规 | 离线判据必须拒绝大写 kind；变异结果另行记录 |
 | A8 | review 附件 `mode:"all"`（#9590） | 渲染里直接插入 mode，已经能用 | 只补测试 | 补 all 的测试，并过 0.16.0 的 schema | 测试先红后绿（例如临时把 all 映射为 throw） |
-| A9 | 子代理关闭时保留 canceled/failed（#8563） | 插件本来就发 session.turn canceled/failed | 宿主自动 | 插件层断言：子会话"失败/取消→关闭"时最后一个 session.turn 的状态正确（subagent-check 已有 228/229 两条，确认它们覆盖了"之后再 close"） | 真机：取消一个 DSH 子代理，子代理轨道显示 canceled，不是 completed |
+| A9 | 子代理关闭时保留 canceled/failed（#8563） | 插件本来就发 session.turn canceled/failed | 宿主自动 | `subagent-check` 验证插件发出的失败/取消回合状态；`stable-host-child-check` 另以真实宿主类验证这些终态之后再 close 仍保持终态，后者需要宿主安装、不进 portable CI | 真机：取消一个 DSH 子代理，子代理轨道显示 canceled，不是 completed |
 | A10 | replace/Stop 串行化（#9537，agent-manager replaceRunInForegroundLane） | steer 走插件自己的回执 | 宿主自动 | 不复制宿主的队列 | steer-check；真机：运行中插话、发替换消息、Stop 立刻生效、冷启动时 Stop |
 | A11 | 完成通知取当前回合的回复（#9793，按 turnId 分段） | DSH 目标驱动的自主回合会带 live turnId | 宿主自动（**和我们直接相关**：goal 的自主回合） | 无 | 真机：goal 自主跑完一轮后，完成通知显示的是这一轮的回复 |
 | A12 | 插件渲染最终回复时 Collapse turns 的修复（#8811） | 我们用 timeline transformer/renderer | 宿主自动 | 无 | 真机：折叠回合后最后的回复正常；**重放丢 turnId（#8053）仍未修**，docs 更新到 0.16.0（agent-manager.js:3508,3563） |
@@ -63,6 +63,7 @@ B 节的功能已按数据来源逐项评估。宿主已有的模型、思考、
 
 - 多个 agent 同类时取最高优先级：danger > warning > success > info；accessibilityLabel 写出数量（例如"2 个目标运行中"）。
 - background agent：只计入 info（运行态），不贡献 warning/success（官方语义是"不吸引注意"）。
+  三个 pill 的目录订阅和后续分页都显式传 `filter: { includeBackground: true }`，否则宿主默认不返回这些 agent。
 - 未建立会话（`session_missing`）和明确未挂载的服务不生成警示徽标；RPC 读取失败保留错误语义，并与执行失败使用不同的无障碍文案。
 - 目标 active + armed 在自主回合间短暂 idle 时仍保持 info，与 composer pill 的目标状态一致；paused/disarmed 为 warning，blocked 为 danger。
 - 什么都没有就返回 `null`（文档：不留空隙）。

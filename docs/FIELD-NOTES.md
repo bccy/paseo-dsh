@@ -4512,3 +4512,21 @@ shellEnv 时遗漏了两个夹具，产生假红；因此新增 push/PR gate，�
 
 公开文档曾把 doctor 描述为只读，但它已复用 DSH `--dump-config`，会重写生成的 cordis.yml；
 文案已订正。完整验证与真机验收分别记录，离线通过不代表插件已经安装或发布。
+
+### 111. 本机离线通过不等于 portable；聚合夹具也不能证明目录订阅可达
+
+2026-11-16 复核发现三处问题：
+
+- `offline-checks` 把 `mcp-stdio-check` 纳入无需 DSH 的清单，但后者必须加载已安装 DSH 的
+  `dsh-subprocess`。GitHub Node 22 runner 因缺包报 ENOENT。本机装有 DSH 才会通过。
+  修复将它从 portable 清单拆出，仍保留为 MCP stdio 改动的本机必跑项；不做缺包即跳过算绿。
+- 三个 pill 未在 `agents.list` 目录订阅和分页传 `includeBackground`。徽标聚合器虽有后台 agent
+  规则，真实目录默认不返回它们。两条查询路径都显式选择包含后台 agent；贡献函数回归用会过滤
+  background 的目录夹具，断言首批和后页 agent 均建立订阅，且数据实际进入徽标 store。
+- 已结束的订阅遇上「重连分页在飞 → live upsert → 后页返回该 agent」时，tombstone 会连恢复
+  订阅一起跳过。现在只保护 metadata，不跳过当前 entry 的 ended 恢复；已经移除、不合资格或
+  terminal 的 entry 仍不被复活。回归同时检查重开、实时 metadata 保留及反向的删除/关闭场景。
+
+复核另纠正一处假宿主反例：直接调用已关闭流的答案回调会覆盖新数据，但 Paseo 0.16 SDK 的
+`subscribePluginRpc` 在 `closed` 后丢弃事件。该反例绕过了真实封装，不能作为线上迟到帧缺陷的
+证据；本轮没有为它另造一套流代号。测试要保留真实边界，不能用比宿主更宽的夹具证明线上故障。

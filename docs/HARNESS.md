@@ -20,10 +20,12 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
 运行真实 profile/模型、连接 daemon；脚本需要的写入只在生成编译树与一次性夹具中。
 新增 portable 检查登记到该 runner，本页说明判据；不要复制到第二份 shell 列表。
 
-不在 portable CI：`dsh-api-contract-check`、`bridge-server-check`、`rewind-transaction-check`、
+不在 portable CI：`mcp-stdio-check`、`dsh-api-contract-check`、`bridge-server-check`、`rewind-transaction-check`、
 `identity-env-check` 等需已安装 DSH 包的检查；`rewind-notice-delivery-check`、
 `stable-host-child-check` 等需宿主类的检查；以及所有真实模型/daemon/UI 检查。
 没有安装对应运行时是未验证，不能当成通过。
+其中 `mcp-stdio-check` 虽然不需要网络、profile 或模型，但仍加载 DSH 安装中的
+`dsh-subprocess` 环境策略；修改 MCP stdio 路径时必须另跑，不能只交付 portable CI 结果。
 
 - `harness/lifecycle-hook-check.cjs`：真实编译 `index.server`，fake server **只有 addHook**，
   没有旧 `on/before` 兼容口。精确断言六个 hook（create.after、turn.before/after、
@@ -40,6 +42,10 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   seen/删除/断开清理、旧 App 缺少注册 API 的降级；复用现有订阅而不额外读取。
   修改徽标或三个 pill 向徽标传递状态时必跑；`node harness/workspace-badges-check.cjs` 自编译，纳入 portable CI。
   `workspace-badges-preview.cjs` 需显式宿主 checkout 与输出参数，只生成预览，不进 portable CI，也不替代真实 App 截图。
+- `harness/pill-contribution-check.cjs`：驱动真实 goal/team/jobs contribution，验证注册、发布失败恢复、
+  本地/远端已读与 observer 生命周期。目录夹具按宿主的 `filter.includeBackground` 过滤首批快照、
+  live upsert 和分页；background agent 必须经真实 pill 订阅进入真实徽标 store，不能只注入聚合夹具。
+  修改三个 pill 的目录查询、发布或 observer 接线必跑；自编译，纳入 portable CI。
 
 还有一组**离线**脚本，直接 require 编译产物、不需要 daemon（运行步骤写在各自头部注释里）。
 下面清单里穿插的 `subagent-check.cjs` 归档用例与 `archive-registry-check.mjs` **不属于这组**：
@@ -250,7 +256,7 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   `completeClearHint`「清除后 /goal 将查不到这个目标，无法撤销」且不同于 active 的确认句、`rowLabel` 状态在前）；**控制错误中文表**（DSH/插件拒绝句逐句译文、英文原样、显示保留原文；未知句与未知变量不翻；
   读本机 `dsh-command-goal/lib/index.js` 的错误字面量逐条确认都有中文，找不到时打印 NOTE，`DSH_COMMAND_GOAL` 可覆盖路径）（实跑 762 条，含团队段与 2026-11-07 的 17 工具标签/图标段，见文末「团队（team）链」）。2026-11-14 工具失败码表再 +13（实跑 **793**）：两语言 `toolFailures` 键一致、7 个上游码都有值、叶子非空、**键是记录值 `ABORTED*` 而不是常量名 `TOOL_ABORTED*`**、拒绝句不得写成故障。**动了 `client/locale.ts`、标签表或
   `shared/goal.ts` 的 phase 枚举必跑。**
-- `harness/jobs-poll-check.cjs` — jobs pill 的**数据层**（**189 条**；假订阅宿主 + 假目录页，不
+- `harness/jobs-poll-check.cjs` — jobs pill 的**数据层**（假订阅宿主 + 假目录页，不
   import React/host）：可见性（**只由 jobs 数据决定**：有 live 显示并计数、无 live 隐藏；读失败的
   `available:false` 不单独造 pill——0 live 隐藏、携带 live 行仍显示且计数，图标只在「不可读且
   0 live」用基线静态 mark；FIELD-NOTES #97）、`orderJobs`/`splitJobs`、popover 的失败注记源码钉、
@@ -268,7 +274,8 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   `shared/jobs.ts` / `server/pill-feed.ts` 必跑；`jobs-poll.tsconfig.json` 是它的编译配置。**
   **2026-11-11 合并 jobstop**：`jobSchema.canStop` 变成必填（读侧也一样），本检查加两条契约断言——
   没有 `canStop` 的 job 行必须**解析失败**（不许默认 false 把可停的 job 画成不可停），带字段才通过；
-  计数 187 → 189。
+  计数 187 → 189（历史记录）。2026-11-16 补充已结束订阅在重连分页期间收到 live upsert 后的
+  恢复：后页仍可重开订阅，但不能覆盖实时 metadata、重建已有 pill，或复活已移除/不合资格的 agent。
 - `harness/pill-feed-check.cjs` — **服务端的共享读器**（`server/pill-feed.ts`，**67 条**；假时钟 +
   假 read + 假订阅者，纯离线）：首帧快照立即推送、**两个订阅者共一次 read**（第二个窗口只多一次
   推送）、答案不变不推、`available:false` 作为答案推送且 read 空转不重来、read 抛错走退避
@@ -416,7 +423,8 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   缓存与 `refresh`、`tools/call` 的参数、JSON-RPC error 变 reject、**stdout 混入非 JSON 行
   不能炸**（Playwright MCP 会往 stdout 打日志）、超时生效、子进程退出时在途请求被 reject
   且**后续调用立即失败**（不悬挂、不重启死进程）、`dispose` 收得掉子进程。用一个临时 .mjs
-  假 server 驱动，纯离线。**动了
+  假 server 驱动，纯离线但**依赖本机 DSH 安装，不进 portable CI**（`DSH_PACKAGES_DIR` 可覆盖
+  包目录；环境策略使用真实 `dsh-subprocess`，不以 stub 代替）。**动了
   `dsh-bridge/lib/mcp-stdio.js`（含取消路径）或 gateway 的 stdio 分支必跑。**
 - `harness/mcp-gateway-transport-check.mjs` — gateway 的传输判定（`transportOf`）与配置
   校验：`url` → HTTP、`command` → stdio，而**两者都给、都不给、给空串、拼错键名都必须

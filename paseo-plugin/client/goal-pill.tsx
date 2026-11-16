@@ -519,6 +519,7 @@ export function contributeGoalPill(client: PluginClientContext, observer?: PillO
      */
     listAgentPage: async (cursor) => {
       const page = await client.paseo.agents.list({
+        filter: { includeBackground: true },
         page: { limit: AGENT_DIRECTORY_PAGE_SIZE, cursor },
         signal: lifetime.signal,
       });
@@ -647,8 +648,9 @@ export function contributeGoalPill(client: PluginClientContext, observer?: PillO
   // An owned list subscription delivers the existing agents, then every update,
   // and a fresh snapshot after a reconnect — which is what keeps the pills
   // correct across a daemon restart without a reload of this bundle.
+  // Background agents contribute running workspace badges through these streams.
   void client.paseo.agents
-    .list({ subscribe: {}, signal: lifetime.signal })
+    .list({ filter: { includeBackground: true }, subscribe: {}, signal: lifetime.signal })
     .then(({ subscription }) => {
       subscription.subscribe({
         snapshot: (page) => {

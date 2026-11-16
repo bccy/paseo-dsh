@@ -503,13 +503,16 @@ export function createAgentSubscriptions<D, Answer>(
       inflightListed = listed;
       const registerPage = (one: PillAgentPage): void => {
         for (const { agent } of one.entries) {
-          if (tombstones.has(agent.id)) continue;
-          listed.add(agent.id);
-          reviveTerminal(agent.id);
-          register(agent);
+          if (!tombstones.has(agent.id)) {
+            listed.add(agent.id);
+            reviveTerminal(agent.id);
+            register(agent);
+          }
           // A snapshot is also how an interrupted subscription comes back: the
           // host has just re-described the world, so reopening is a fresh
-          // attempt, not a retry timer.
+          // attempt, not a retry timer. A live upsert wins over this page's
+          // metadata, but must not suppress recovery of its current entry.
+          // Removed/ineligible agents have no entry; terminal entries stay stopped.
           const entry = agents.get(agent.id);
           if (entry !== undefined && entry.ended) open(entry);
         }

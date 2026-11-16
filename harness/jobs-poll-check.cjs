@@ -676,6 +676,39 @@ async function runControllerChecks() {
   // first page never get a pill until an unrelated agent_update happens to name
   // them.
   console.log("\nagent-directory snapshot pagination");
+  {
+    let release;
+    const page = new Promise(resolve => { release = resolve; });
+    const h = createHarness({ listAgentPage: () => page });
+    await h.subscriptions.applySnapshot(snapshot(["a"]));
+    h.close("a", new Error("stream ended"));
+    const pending = h.subscriptions.applySnapshot({ entries: [], pageInfo: { hasMore: true, nextCursor: "parked" } });
+    h.subscriptions.upsert({ id: "a", workspaceId: "ws", metadata: { seen: "live-new" } });
+    equal("an upsert alone does not retry an ended stream", h.calls.opens, ["a"]);
+    release({ entries: [{ agent: { id: "a", workspaceId: "ws", metadata: { seen: "stale" } } }] });
+    await pending;
+    equal("a later snapshot page reopens the ended stream despite a live upsert", h.calls.opens, ["a", "a"]);
+    equal("reopening keeps live metadata instead of the stale page", h.calls.updatedAgents.map(agent => agent.metadata?.seen), ["live-new"]);
+    equal("reopening retains the existing pill registration", h.calls.added, ["a"]);
+    check("the recovered stream can publish again", await h.deliver("a"), true);
+    check("the recovered answer is available", h.calls.states.at(-1)[1].available, true);
+    h.subscriptions.dispose();
+  }
+  for (const change of [null, { status: "closed" }, { provider: "another-provider" }, { workspaceId: null }]) {
+    let release;
+    const page = new Promise(resolve => { release = resolve; });
+    const h = createHarness({ listAgentPage: () => page });
+    await h.subscriptions.applySnapshot(snapshot(["a"]));
+    h.close("a", new Error("stream ended"));
+    const pending = h.subscriptions.applySnapshot({ entries: [], pageInfo: { hasMore: true, nextCursor: "parked" } });
+    if (change === null) h.subscriptions.drop("a");
+    else h.subscriptions.upsert({ id: "a", workspaceId: "ws", ...change });
+    release(snapshot(["a"]));
+    await pending;
+    equal(`a page cannot reopen an ended but removed/ineligible agent ${JSON.stringify(change)}`, h.calls.opens, ["a"]);
+    check("a removed ended stream stays absent", h.live.has("a"), false);
+    h.subscriptions.dispose();
+  }
   for (const change of [{ status: "closed" }, { provider: "another-provider" }, { workspaceId: null }]) {
     let release;
     const page = new Promise(resolve => { release = resolve; });

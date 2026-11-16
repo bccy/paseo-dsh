@@ -39,13 +39,18 @@ const contributions = {
 };
 Module._load = originalLoad;
 const { teamAllDoneKey } = require(path.join(build, "client/team-polling.js"));
+const { createWorkspaceStatusStore } = require(path.join(build, "client/workspace-status.js"));
 const provider = require(path.join(build, "shared/provider.js")).PROVIDER_ID;
 let checks = 0;
 const check = (label, actual, expected) => { checks++; assert.deepEqual(actual, expected, label); };
 const flush = async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); };
 function makeHost(kind, observer) {
-  const registrations = [], streams = [], writes = [], errors = [];
-  let directory, failUpdate = false, failWrite = false;
+  const registrations = [], streams = [], writes = [], errors = [], directoryRequests = [];
+  let directory, directoryOptions, nextPageAgents = [], failUpdate = false, failWrite = false;
+  // Match the host's opt-in background visibility on both subscription and pages.
+  const entries = (agents, options) => agents
+    .filter(agent => !agent.background || options?.filter?.includeBackground === true)
+    .map(agent => ({ agent }));
   const client = {
     addComposerPill(input) {
       const registration = { input, current: { ...input.button }, updates: [], removed: false,
@@ -55,18 +60,33 @@ function makeHost(kind, observer) {
     },
     subscribe(contract, input, onAnswer, options) { streams.push({ contract, input, onAnswer, options }); return { ready: Promise.resolve() }; },
     paseo: { agents: {
-      list: async () => ({ subscription: { subscribe: value => { directory = value; } } }),
+      list: async options => {
+        directoryRequests.push(options);
+        if (options.subscribe) {
+          directoryOptions = options;
+          return { subscription: { subscribe: value => { directory = value; } } };
+        }
+        return { entries: entries(nextPageAgents, options), pageInfo: { hasMore: false, nextCursor: null } };
+      },
       ref: id => ({ setMetadata: async patch => { if (failWrite) throw new Error("metadata write failed"); writes.push({ id, patch }); } }),
     } },
   };
   const cleanup = contributions[kind](client, observer);
   const agent = { id: "agent-a", workspaceId: "workspace-a", provider, status: "idle", background: true };
   return {
-    registrations, streams, writes, errors, cleanup, agent,
+    registrations, streams, writes, errors, directoryRequests, cleanup, agent,
     setFailUpdate(value) { failUpdate = value; },
     setFailWrite(value) { failWrite = value; },
-    snapshot(metadata = {}) { directory.snapshot({ entries: [{ agent: { ...agent, metadata } }], pageInfo: { hasMore: false, nextCursor: null } }); },
-    upsert(metadata = {}) { directory.update({ type: "agent_update", payload: { kind: "upsert", agent: { ...agent, metadata } } }); },
+    snapshot(metadata = {}, pageAgents = []) {
+      nextPageAgents = pageAgents;
+      directory.snapshot({ entries: entries([{ ...agent, metadata }], directoryOptions),
+        pageInfo: { hasMore: pageAgents.length > 0, nextCursor: pageAgents.length > 0 ? "next-page" : null } });
+    },
+    upsert(metadata = {}) {
+      for (const entry of entries([{ ...agent, metadata }], directoryOptions)) {
+        directory.update({ type: "agent_update", payload: { kind: "upsert", agent: entry.agent } });
+      }
+    },
     push(answer) { streams.at(-1).onAnswer(answer); },
     end(error = new Error("subscription ended")) { streams.at(-1).options.onClosed({ error }); },
     get current() { return registrations.at(-1).current; },
@@ -90,6 +110,25 @@ const value = (kind, id) => kind === "goal" ? goal(id) : team(id);
 const key = (kind, item) => kind === "goal" ? `${item.id}:${item.revision}` : teamAllDoneKey(item);
 const answer = (kind, item) => ({ available: true, [kind]: item });
 async function main() {
+  for (const kind of ["goal", "team", "jobs"]) {
+    const store = createWorkspaceStatusStore();
+    const h = makeHost(kind, store.observer(kind));
+    await flush();
+    h.snapshot({}, [{ ...h.agent, id: "agent-page" }]);
+    await flush();
+    check(`${kind}: background agents on the first and later pages get streams`, h.streams.map(stream => stream.input.agentId), ["agent-a", "agent-page"]);
+    check(`${kind}: pagination keeps the supplied cursor`, h.directoryRequests[1].page.cursor, "next-page");
+    const payload = kind === "goal" ? { ...goal("active"), phase: "active", activation: "armed" }
+      : kind === "team" ? { enabled: true, members: [{ id: "worker", role: "member", running: true }], tasks: [] }
+      : [{ id: "job", status: "running", description: "live", createdAt: 1 }];
+    for (const stream of h.streams) stream.onAnswer({ available: true, [kind]: payload });
+    check(`${kind}: discovered background work reaches the real badge store`, store.getSnapshot(h.agent.workspaceId)[kind]?.counts.info, 2);
+    check(`${kind}: background work has info tone`, store.getSnapshot(h.agent.workspaceId)[kind]?.tone, "info");
+    check(`${kind}: badges reuse exactly the two existing pill streams`, h.streams.length, 2);
+    h.cleanup();
+    check(`${kind}: cleanup removes the background badge`, store.getSnapshot(h.agent.workspaceId)[kind], null);
+    store.dispose();
+  }
   for (const kind of ["goal", "team"]) {
     const h = makeHost(kind); await flush(); h.snapshot();
     const old = value(kind, "old"), next = value(kind, "new");

@@ -15,7 +15,7 @@ const sourceChecks = [
   'bridge-assets-check.mjs', 'archived-lineage-check.mjs', 'image-host-path-check.mjs',
   'paseo-system-envelope-check.mjs', 'revert-check.mjs', 'surface-check.mjs',
   'file-snapshot-check.mjs', 'snapshot-lifecycle-check.mjs', 'file-mutation-gate-check.mjs',
-  'rewind-merge-check.mjs', 'mcp-http-check.mjs', 'mcp-stdio-check.mjs',
+  'rewind-merge-check.mjs', 'mcp-http-check.mjs',
   'doctor-check.mjs', 'probe-check.mjs', 'plugin-build-check.mjs',
   'frame-reader-check.mjs', 'transport-frame-check.mjs', 'replay-turn-check.cjs',
   'concurrent-open-check.mjs', 'bootstrap-check.mjs', 'bridge-entry-check.mjs',
@@ -26,6 +26,8 @@ const sourceChecks = [
   'multi-session-check.mjs', 'process-crash-check.mjs', 'child-crash-check.mjs',
   'reload-port-race-check.mjs', 'shared-process-cwd-check.mjs',
 ];
+// mcp-stdio-check.mjs imports the installed DSH child-environment policy. Run it
+// separately with DSH installed; it is not a skipped/passed portable CI gate.
 // These older checks require siblings relative to their compiled entry. Copying
 // only the harness scripts leaves the plugin-build stamp/output set intact.
 const compiledChecks = [
