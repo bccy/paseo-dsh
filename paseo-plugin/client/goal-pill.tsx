@@ -453,8 +453,8 @@ export function contributeGoalPill(client: PluginClientContext) {
     if (before !== undefined && before.visible === presentation.visible && before.label === label && before.title === title) {
       return;
     }
-    published.set(agentId, { visible: presentation.visible, label, title });
     registration.update({ visible: presentation.visible, label, title });
+    published.set(agentId, { visible: presentation.visible, label, title });
   };
 
   /** Feed one event to an agent's "seen" machine; re-present when it changed visibility. */

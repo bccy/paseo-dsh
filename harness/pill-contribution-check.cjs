@@ -106,6 +106,22 @@ async function main() {
     check(`${kind}: snapshot keeps one subscription`, h.streams.length, 1);
     h.cleanup(); check(`${kind}: cleanup releases stream`, h.streams[0].options.signal.aborted, true);
   }
+  for (const kind of ["goal", "team", "jobs"]) {
+    const h = makeHost(kind); await flush(); h.snapshot();
+    const pushed = kind === "jobs"
+      ? { available: true, jobs: [{ id: "job-live", status: "running", description: "live", createdAt: 1 }] }
+      : answer(kind, value(kind, "completed"));
+    h.setFailUpdate(true);
+    h.push(pushed);
+    check(`${kind}: failed registration update leaves host hidden`, h.current.visible, false);
+    h.setFailUpdate(false);
+    h.push(pushed);
+    check(`${kind}: identical answer retries failed publication`, h.current.visible, true);
+    check(`${kind}: successful update is delivered once`, h.registrations[0].updates.length, 1);
+    h.push(pushed);
+    check(`${kind}: duplicate after success stays deduplicated`, h.registrations[0].updates.length, 1);
+    h.cleanup();
+  }
   console.log(`${checks} contribution checks passed`);
 }
 main().catch(error => { console.error(error.stack); process.exitCode = 1; });

@@ -839,11 +839,11 @@ export function contributeJobsPill(client: PluginClientContext) {
     // `ListChecks`: that read like the host's own task-list pill beside it.
     const icon = presentation.icon === "spinner" ? JobsPillIcon : "SquareTerminal";
     const iconPatch = presentation.icon === entry.icon ? {} : { icon };
+    entry.registration.update({ visible, label, title: text.title, ...iconPatch });
     entry.visible = visible;
     entry.label = label;
     entry.title = text.title;
     entry.icon = presentation.icon;
-    entry.registration.update({ visible, label, title: text.title, ...iconPatch });
   };
 
   /**

@@ -235,8 +235,8 @@ export function createAgentSubscriptions<D, Answer>(
   const publishIfChanged = (entry: Entry<D, Answer>, state: PillViewState<D>): void => {
     const signature = answerSignature(state);
     if (entry.lastPublished === signature) return;
-    entry.lastPublished = signature;
     host.publishState(entry.agentId, state);
+    entry.lastPublished = signature;
   };
 
   /**

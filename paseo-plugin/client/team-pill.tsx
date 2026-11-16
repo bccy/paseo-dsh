@@ -216,11 +216,11 @@ export function contributeTeamPill(client: PluginClientContext) {
     if (entry.visible === visible && entry.icon === icon && entry.label === text.title && entry.title === text.title) {
       return;
     }
+    entry.registration.update({ visible, label: text.title, title: text.title, icon: ICONS[icon] });
     entry.visible = visible;
     entry.icon = icon;
     entry.label = text.title;
     entry.title = text.title;
-    entry.registration.update({ visible, label: text.title, title: text.title, icon: ICONS[icon] });
   };
 
   /** Feed one event to an agent's "seen" machine; re-present when it changed. */
