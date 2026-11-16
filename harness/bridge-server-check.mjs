@@ -2301,6 +2301,31 @@ const childRow = (id, parentId, label) => ({ kind: 'child', id, parentId, label,
   );
 }
 
+// A transient observation failure is not a cacheable tree. Recovery need not
+// append any event, so revision-only validation cannot detect it.
+{
+  let healthy = false;
+  let reads = 0;
+  const { server } = makeServer({
+    sessions: { get: () => undefined },
+    sessionPersistence: { stat: async (id) => ({ revision: 7, header: { id } }) },
+    subagents: { listDescendants: async () => {
+      reads += 1;
+      return healthy
+        ? [{ kind: 'child', id: 'recover-child', parentId: 'recover-root', mode: 'continuable', label: 'Recovered' }]
+        : [{ kind: 'diagnostic', id: 'recover-child', parentId: 'recover-root', reason: 'unavailable' }];
+    } },
+  });
+  await server.subagents({ sessionId: 'recover-root' });
+  const failedRead = await server.subagents({ sessionId: 'recover-root' });
+  check('a failed observation remains a visible diagnostic', failedRead.diagnostics?.[0]?.reason === 'unavailable');
+  healthy = true;
+  const recovered = await server.subagents({ sessionId: 'recover-root' });
+  check('unchanged revisions do not pin a transient diagnostic', reads === 3 && recovered.subagents?.[0]?.sessionId === 'recover-child', JSON.stringify({ reads, recovered }));
+  await server.subagents({ sessionId: 'recover-root' });
+  check('the recovered successful tree is cached normally', reads === 3, String(reads));
+}
+
 const failedCount = results.filter((result) => !result.pass).length;
 console.log(`\n  ${results.length - failedCount}/${results.length} passed`);
 process.exit(failedCount === 0 ? 0 : 1);

@@ -2780,7 +2780,10 @@ export class PaseoHarnessServer {
     // `tokensAgree` also requires the same id set, so an id the pre-read sample
     // never saw (a tree opened for the first time, or a just-created child) has
     // no pre-read token and blocks the entry: the next open builds it.
-    if (preTokens !== undefined && postTokens !== undefined && tokensAgree(preTokens, postTokens)) {
+    // Observation failures can recover without a log revision changing. A
+    // diagnostic tree is not a successful snapshot and must be retried.
+    if (!rows.some((row) => row.kind === 'diagnostic')
+      && preTokens !== undefined && postTokens !== undefined && tokensAgree(preTokens, postTokens)) {
       this.subagentListingCache.set(key, { rows, tokens: postTokens });
       while (this.subagentListingCache.size > SUBAGENT_LISTING_CACHE_LIMIT) {
         const oldest = this.subagentListingCache.keys().next();
