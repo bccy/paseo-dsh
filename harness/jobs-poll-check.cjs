@@ -641,6 +641,34 @@ async function runControllerChecks() {
     pageInfo: { hasMore: false, nextCursor: null },
   });
 
+  // Directory reconciliation applies the same eligibility rules to snapshots
+  // and live upserts; a closed/foreign/detached agent releases its stream.
+  for (const change of [{ status: "closed" }, { provider: "another-provider" }, { workspaceId: null }]) {
+    const h = createHarness();
+    await h.subscriptions.applySnapshot(snapshot(["a"]));
+    const stale = h.live.get("a");
+    h.subscriptions.upsert({ id: "a", workspaceId: "ws", ...change });
+    equal(`ineligible upsert removes the pill ${JSON.stringify(change)}`, h.calls.removed.map(([id]) => id), ["a"]);
+    equal("ineligible upsert aborts the stream", stale.signal.aborted, true);
+    stale.onAnswer({ available: true, jobs: [] });
+    equal("an old answer cannot publish after removal", h.calls.states.length, 0);
+    h.subscriptions.upsert({ id: "a", workspaceId: "ws" });
+    equal("an eligible re-add creates one fresh subscription", h.calls.opens, ["a", "a"]);
+    h.subscriptions.dispose();
+  }
+  {
+    const h = createHarness();
+    await h.subscriptions.applySnapshot(snapshot(["a"]));
+    await h.subscriptions.applySnapshot({ entries: [{ agent: { id: "a", workspaceId: "ws", metadata: { seen: "new" } } }] });
+    equal("a reconnect forwards metadata to the existing pill", h.calls.updated, ["a"]);
+    equal("a reconnect retains the existing registration", h.calls.added, ["a"]);
+    equal("a reconnect retains the existing stream", h.calls.opens, ["a"]);
+    h.subscriptions.upsert({ id: "a", workspaceId: "other-workspace" });
+    equal("moving workspace replaces the old registration", h.calls.added, ["a", "a"]);
+    equal("moving workspace releases the old stream", h.calls.aborts, ["a"]);
+    h.subscriptions.dispose();
+  }
+
   // CJ-03: the subscription snapshot is one page (the daemon caps it at 200
   // entries). The controller must walk pageInfo.nextCursor, or agents after the
   // first page never get a pill until an unrelated agent_update happens to name

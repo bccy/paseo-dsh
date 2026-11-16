@@ -379,16 +379,21 @@ export function createAgentSubscriptions<D, Answer>(
     // agent would put a pill on a Claude/Codex composer that can only ever be
     // empty. All three pills serve the same provider, so the filter is here
     // rather than repeated in each adapter.
-    if (agent.provider !== undefined && agent.provider !== PROVIDER_ID) return;
-    if ((agent.workspaceId ?? "") === "") return;
-    if (agent.status === "closed") {
+    if ((agent.provider !== undefined && agent.provider !== PROVIDER_ID)
+      || (agent.workspaceId ?? "") === "" || agent.status === "closed") {
       const entry = agents.get(agent.id);
       if (entry !== undefined) remove(entry, "gone");
       return;
     }
-    const existing = agents.get(agent.id);
+    let existing = agents.get(agent.id);
+    if (existing !== undefined && existing.agent.workspaceId !== agent.workspaceId) {
+      // A registration belongs to one workspace; update() cannot move it.
+      remove(existing, "gone");
+      existing = undefined;
+    }
     if (existing !== undefined) {
       existing.agent = agent;
+      if (!existing.terminal) host.updateAgent(agent);
       return;
     }
     const entry: Entry<D, Answer> = {
@@ -487,14 +492,6 @@ export function createAgentSubscriptions<D, Answer>(
       // this the diff at the end of the snapshot would remove a pill the host
       // just told us about, for an agent that is still there.
       inflightListed?.add(agent.id);
-      const existing = agents.get(agent.id);
-      if (existing !== undefined && !existing.terminal) {
-        existing.agent = agent;
-        // The metadata the "seen" keys live in arrives on these updates; the
-        // pill decides whether anything it shows actually changed.
-        host.updateAgent(agent);
-        return;
-      }
       register(agent);
     },
 
