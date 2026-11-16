@@ -19,7 +19,7 @@ export function workspaceBadgePresentation(kind: WorkspaceBadgeKind, state: Work
       ...(state.readFailures > 0 ? [text.count(state.readFailures, text.readFailure)] : []),
       ...BADGE_PRIORITY.flatMap((tone) => {
         const count = state.counts[tone] - (tone === "danger" ? state.readFailures : 0);
-        return count > 0 ? [text.count(count, text.states[tone])] : [];
+        return count > 0 ? [text.count(count, kind === "goal" && tone === "danger" ? text.blocked : text.states[tone])] : [];
       }),
     ].join(text.separator)}`,
   };

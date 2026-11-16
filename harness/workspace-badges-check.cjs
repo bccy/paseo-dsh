@@ -20,16 +20,16 @@ const tone = (kind,data,extra,meta) => result(kind,data,extra,meta)?.tone ?? nul
 for (const [name, actual, expected] of [
  ['no data', aggregateWorkspaceStatus([]), {goal:null,team:null,jobs:null}],
  ['active armed goal',tone('goal',goal),'info'],
- ['armed idle goal',tone('goal',goal,{}, {status:'idle'}),'warning'],
- ['armed unknown activity',tone('goal',goal,{}, {status:undefined}),'warning'],
- ['background armed idle hidden',tone('goal',goal,{}, {status:'idle',background:true}),null],
+ ['armed idle goal',tone('goal',goal,{}, {status:'idle'}),'info'],
+ ['armed unknown activity',tone('goal',goal,{}, {status:undefined}),'info'],
+ ['background armed goal between rounds',tone('goal',goal,{}, {status:'idle',background:true}),'info'],
  ['missing goal session hidden',tone('goal',null,{available:false,code:'session_missing'}),null],
  ['missing team session hidden',tone('team',null,{available:false,code:'session_missing'}),null],
  ['goal service absent hidden',tone('goal',null,{available:false,code:'goal_unavailable'}),null],
  ['team service absent hidden',tone('team',null,{available:false,code:'team_unavailable'}),null],
  ['active disarmed goal',tone('goal',{...goal,activation:'disarmed'}),'warning'],
  ['paused goal',tone('goal',{...goal,phase:'paused'}),'warning'],
- ['blocked goal',tone('goal',{...goal,phase:'blocked'}),'warning'],
+ ['blocked goal',tone('goal',{...goal,phase:'blocked'}),'danger'],
  ['unread completed goal',tone('goal',{...goal,phase:'complete'},{visible:true}),'success'],
  ['read completed goal',tone('goal',{...goal,phase:'complete'},{visible:false}),null],
  ['unknown seen state',tone('goal',{...goal,phase:'complete'}),null],
@@ -56,7 +56,7 @@ for (const [name, actual, expected] of [
 const multi = [
  {agent,state:{goal:{available:true,data:goal}}},
  {agent:{...agent,id:'b'},state:{goal:{available:true,data:{...goal,phase:'complete'},visible:true}}},
- {agent:{...agent,id:'c'},state:{goal:{available:true,data:{...goal,phase:'blocked'}}}},
+ {agent:{...agent,id:'c'},state:{goal:{available:true,data:{...goal,phase:'paused'}}}},
  {agent:{...agent,id:'d'},state:{goal:{available:false,data:null,error:'read failed'}}},
 ];
 check('priority danger',aggregateWorkspaceStatus(multi).goal.tone,'danger');
@@ -83,7 +83,7 @@ const {contributeWorkspaceBadges,workspaceBadgePresentation}=require(path.join(b
 let warns=[];const warn=console.warn;console.warn=(s)=>warns.push(s);contributeWorkspaceBadges({},createWorkspaceStatusStore())();console.warn=warn;
 check('missing API warns exactly once',warns.length,1);check('missing API warning names 0.16.0',warns[0].includes('0.16.0'),true);
 for(const locale of ['zh-CN','en']){setLocale(locale);const p=workspaceBadgePresentation('jobs',result('jobs',[job,{...job,id:'j2'}]));check('fixed background label '+locale,p.label,locale==='en'?'Background':'后台');check('count remains accessible '+locale,p.accessibilityLabel.includes('2'),true);}
-setLocale('zh-CN');const errorLabel=workspaceBadgePresentation('goal',result('goal',null,{available:false,code:'rpc_failed'})).accessibilityLabel;check('read failure accessible wording',errorLabel.includes('状态读取失败'),true);check('read error is not execution failure',errorLabel.includes('执行失败'),false);let reads=0,removes=0;const registrations=[];const s=createWorkspaceStatusStore();const observer=s.observer('jobs');observer.agent(agent);
+setLocale('zh-CN');check('blocked goal uses blocked wording',workspaceBadgePresentation('goal',result('goal',{...goal,phase:'blocked'})).accessibilityLabel.includes('受阻'),true);const errorLabel=workspaceBadgePresentation('goal',result('goal',null,{available:false,code:'rpc_failed'})).accessibilityLabel;check('read failure accessible wording',errorLabel.includes('状态读取失败'),true);check('read error is not execution failure',errorLabel.includes('执行失败'),false);let reads=0,removes=0;const registrations=[];const s=createWorkspaceStatusStore();const observer=s.observer('jobs');observer.agent(agent);
 const {createPillFeed}=require(path.join(build,'server/pill-feed.js'));const controller=new AbortController();
 const feed=createPillFeed({read:async()=>{reads++;return {available:true,data:[job]}},isTerminal:()=>false,setTimeout:()=>0,clearTimeout:()=>{}});
 feed.subscribe('a',answer=>observer.state('a',answer),controller.signal);await new Promise(setImmediate);const before=reads;

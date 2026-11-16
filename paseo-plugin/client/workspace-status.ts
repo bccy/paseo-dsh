@@ -42,13 +42,16 @@ export function aggregateWorkspaceStatus(entries: readonly WorkspaceAgentStatus[
     if (goal !== undefined) {
       if (!goal.available) {
         if (!background && goal.code !== "session_missing" && goal.code !== "goal_unavailable") { totals.goal.danger++; readFailures.goal++; }
-      } else if (goal.data?.phase === "active" && goal.data.activation === "armed" && agent.status === "running") {
+      } else if (goal.data?.phase === "active" && goal.data.activation === "armed") {
+        // An armed goal owns autonomous work between turns too. Directory
+        // status can briefly be idle (or lag the goal); that is not a warning.
         totals.goal.info++;
       } else if (!background && goal.data !== null) {
         if (goal.data.phase === "complete") {
           // The pill owns the durable seen decision; absence is not evidence of unread.
           if (goal.visible === true) totals.goal.success++;
-        } else totals.goal.warning++;
+        } else if (goal.data.phase === "blocked") totals.goal.danger++;
+        else totals.goal.warning++;
       }
     }
     const team = state.team;

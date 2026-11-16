@@ -114,6 +114,7 @@ export interface WorkspaceBadgeText {
   separator: string;
   unavailable: string;
   readFailure: string;
+  blocked: string;
 }
 
 export interface UiText {
@@ -749,7 +750,7 @@ export function teamToolErrorDisplay(raw: string, text: TeamText): { message: st
 const TEXT: Record<Locale, UiText> = {
   en: {
     workspaceBadge: {
-      goal: "Goal", team: "Team", jobs: "Background", readFailure: "state unreadable",
+      goal: "Goal", team: "Team", jobs: "Background", readFailure: "state unreadable", blocked: "blocked",
       states: { danger: "execution failed", warning: "waiting for attention", success: "complete and unread", info: "running" },
       count: (count, state) => `${count} ${state}`, separator: "; ",
       unavailable: "Workspace badges need Paseo app 0.16.0 or later; this app has no workspace badge API.",
@@ -1283,7 +1284,7 @@ const TEXT: Record<Locale, UiText> = {
   },
   "zh-CN": {
     workspaceBadge: {
-      goal: "目标", team: "团队", jobs: "后台", readFailure: "状态读取失败",
+      goal: "目标", team: "团队", jobs: "后台", readFailure: "状态读取失败", blocked: "受阻",
       states: { danger: "执行失败", warning: "待处理", success: "已完成未读", info: "运行中" },
       count: (count, state) => `${count} 项${state}`, separator: "；",
       unavailable: "工作区徽标需要 Paseo 应用 0.16.0 或更新版本；当前应用没有工作区徽标 API。",
