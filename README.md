@@ -29,6 +29,7 @@ DSH 侧是一个 profile bundle。
 | 后台任务（jobs） | — | ✅ composer 的 pill 显示 DSH 后台任务（终端图标，运行中右下角叠转环）：只在有运行中/停止中的任务时显示，文字只写「后台」（数量在面板里），全部结束即隐藏；多个 pill 同屏时可左右滑动浏览（宿主的 pill 轨道 0.15.3 起可横向滚动），目标 / 团队 / 后台各按自身规则独立显示；点开看每个任务的明细（弹层里运行中且可停的任务行带停止按钮：不弹确认，停止中转圈、以推送为准，失败在行下显示原因） |
 | 目标（goal）pill | — | ✅ composer 的 pill 显示 DSH 目标，文字与手机面板标题恒为「目标」，状态由图标表达（运行中右下角叠转环、完成绿色对勾），面板首行说出完整状态；点开看目标（带 DeepSeek 标志，点文本即可在小号输入框里编辑）、「第 N 轮 · 预算 M」、「正在：<当前任务>」与受阻原因，按钮暂停 / 继续 / 清除（清除二次确认）；目标完成后 pill 再显示一次（只读，只能清除，只有点开并关闭面板后才隐藏；不点开时发送新消息不会隐藏）；重开会话后自动续跑会停，pill 直接给出恢复入口 |
 | 团队（Agent Team）pill | — | ✅ 有共享团队任务的会话，composer 多一颗「团队」pill（有队员在跑时人形图标右下角叠转环、团队记录出错时红色）；任务全部完成后只再显示一次，只有点开并关闭面板后才隐藏（不点开时发送新消息不会隐藏）；点开是只读面板：成员（队长、运行中 / 空闲 / 准备中 / 创建失败）和按状态分组的共享任务（进行中 / 可开始 / 等待依赖，已完成折叠），点任务看全文；`team_task_*` 工具结果画成字段卡，失败原因在中文环境翻成中文并保留原文 |
+| 工作区状态徽标 | — | ✅ 侧栏聚合目标、团队和运行中的 DSH 后台任务；复用 pill 订阅，支持 Show 菜单隐藏；需要 0.16.0 正式版 App，旧 App 跳过注册 |
 | 目标 / 工作流时间线 | — | ✅ `goal/change` 与 `tool-workflow/*` 事件按工具行渲染；目标自动续跑的每个轮次也各占一行（「目标续跑 · 第 N 轮」）；目标变化行叫「目标状态」，排在引起它的 `/goal` 命令之后；goal 工具结果画成字段卡，被拒调用给中文短句；后台工作流跨回合仍显示运行中 |
 | 工具审批卡 | — | ✅ DSH 的 `approval/request` 转成 Paseo 审批卡（允许一次 / 拒绝） |
 | 撤回（rewind） | — | ✅ 对话 + 文件都回退（消息行消失、被编辑工具改过的文件恢复、模型看不到被撤内容）；文件回退排除 >8 MiB 文件、符号链接目标与非普通文件；Paseo 0.15+ 时间线由宿主原生刷新，无需 Reload（0.15 真机待复验） |
@@ -51,7 +52,7 @@ DSH 侧是一个 profile bundle。
 先完整读一遍 docs/ADOPTION.md 再动手。不要凭猜测改任何文件。
 
 ■ 第一步：检查前提
-确认 dsh、paseo、node 都在 PATH 上，paseo 版本 >= 0.16，dsh 版本 >= 0.2.1。
+确认 dsh、paseo、node 都在 PATH 上，paseo 版本 >= 0.16.0（正式版），dsh 版本 >= 0.2.1。
 缺任何一样就停下来告诉我，不要替我安装它们。
 
 ■ 第二步：确定用哪个模型
@@ -192,7 +193,7 @@ node <插件目录>/bin/paseo-dsh.mjs doctor
 ```
 
 它会检查 `dsh`/`paseo` 版本、profile 是否就绪、bridge 是否落地、路由是否填好、
-`apiKeyEnv` 对应的 key 是否存在——缺什么直接告诉你（只读，不改任何东西）。全绿后
+`apiKeyEnv` 对应的 key 是否存在——缺什么直接告诉你。组合检查会运行 `dsh --dump-config`，重写 profile 的生成文件 `cordis.yml`；不修改路由补丁或凭据。全绿后
 **重启 Paseo daemon**（`paseo daemon restart`），在 Paseo 里新建会话时选
 **DeepSeek Harness** 这个 provider。
 
@@ -309,13 +310,13 @@ paseo-dsh/
 
 仓库**不再提供宿主补丁**：原来 `local-patches/` 只做一件事——重放时补回丢失的 `turnId`，让
 重开的长会话回合折叠正确。它改写**已安装的** `@getpaseo/server` 的 `dist`（上游没有对应扩展
-点），从来不是发布产物（`npm publish` 出去的包里没有它），而且上游到 0.16.0-beta.1 仍未修
-（`agent-manager.js:3461,3516`），所以这个缺陷以"已知问题"的形式留着，**等上游修**。
+点），从来不是发布产物（`npm publish` 出去的包里没有它），而且上游到 0.16.0 仍未修
+（`agent-manager.js:3508,3563`），所以这个缺陷以"已知问题"的形式留着，**等上游修**。
 
 | 能力 | 现在的行为（无补丁） |
 |---|---|
 | **撤回**（对话 + 文件） | 撤回**已经生效**：对话、智能体改过的文件、模型上下文都回退了；时间线由宿主**立刻刷新**（Paseo 0.15.0 起，上游 PR #8368 修掉 #4667：撤回时关掉 provider 会话、带 persistence 重开并按 DSH 持久化会话重放），无需 Reload。canary「撤回已生效」仍在回执前发出，0.15+ 的 replay 会把它连同旧 history 清掉（看不到是预期；判据是消息行是否消失）。被编辑工具跟踪过的文件还会在每条人类消息边界重扫磁盘，bash/外部进程对它们的改动会保留在后续撤回的 pre-image 中 |
-| **重开会话后的回合折叠** | **部分失效**：系统触发的回合会并入上一回合、插话回合被拆开（`turnId` 在重放时丢失）。等上游 [#8053](https://github.com/getpaseo/paseo/issues/8053) / PR [#8054](https://github.com/getpaseo/paseo/pull/8054)，0.16.0-beta.1 仍未修 |
+| **重开会话后的回合折叠** | **部分失效**：系统触发的回合会并入上一回合、插话回合被拆开（`turnId` 在重放时丢失）。等上游 [#8053](https://github.com/getpaseo/paseo/issues/8053) / PR [#8054](https://github.com/getpaseo/paseo/pull/8054)，0.16.0 仍未修 |
 | **子代理第二次派发时的「运行中」** | 卡片停在上一回合的终态。上游 [#8080](https://github.com/getpaseo/paseo/pull/8080) 已修复，Paseo 0.15.0 起生效 |
 
 > 有两件事与补丁无关：记忆插件此前采集过的内容可能仍被召回（模型"记得"）；撤回本身不可撤销。
@@ -326,7 +327,7 @@ paseo-dsh/
 
 ## 自测 / 本地验证（不需要 Paseo）
 
-**先跑仓库里的 CLI 自检**（只读，不改任何东西；在 checkout 里直接跑，不要用 `npx`——
+**先跑仓库里的 CLI 自检**（组合检查会重写生成的 `cordis.yml`；在 checkout 里直接跑，不要用 `npx`——
 那是上游 npm 包）：
 
 ```bash
@@ -365,11 +366,11 @@ rm -rf ../.dbg
 
 ## 环境要求
 
-- Paseo ≥ 0.16（0.16 把 composer 选项改成 `controls` / `providerOptions`，本插件已迁到新契约，不再支持 0.15）
-- **DSH ≥ 0.2.1**（随 0.2.x 线）：桥直接 import 八个 DSH 内部包
+- **Paseo ≥ 0.16.0 正式版**：SDK 固定 0.16.0，使用 `server.addHook` 与正式版工作区徽标 API。App 与 daemon 可独立升级；较旧 App 没有徽标 API 时跳过徽标注册。composer 继续由 `controls` / `providerOptions` 提供。完整逐项取舍见 [0.16 适配矩阵](docs/PASEO-016-ADAPTATION.md)。
+- **DSH ≥ 0.2.1**（随 0.2.x 线）：桥直接 import 九个 DSH 内部包
   （`@deepseek-ai/dsh-cmdline` / `dsh-brand` / `dsh-llm` / `dsh-attachment` / `dsh-agent` /
-  `dsh-tools` / `dsh-subprocess` / `schemastery`），并且 0.2.1 改过 prompt 变量注册与 catalog
-  物化时机。实测通过的是 `0.2.1-rc.2`（2026-10-20）；**0.2.0 及更早未验证**，`doctor` 会把
+  `dsh-tools` / `dsh-subprocess` / `dsh-host-plugin-inventory` / `schemastery`），并且 0.2.1 改过 prompt 变量注册与 catalog
+  物化时机。最近跟版的是 `0.2.2-rc.3`；最低版本与完整行为验收是两项判断，**0.2.0 及更早未验证**，`doctor` 会把
   低于 0.2.1 判为 blocking。
 - Node ≥ 20.4（20.x 线）：桥用了 `AbortSignal.any`（Node 20.3 起提供）与 `Symbol.dispose`
   （Node 20.4 起提供，`dsh-bridge/lib/session-projections.js`）。实际只在 Node 22.23.1 上验证过，

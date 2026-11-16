@@ -75,7 +75,7 @@ plugin({
     registration = r;
   },
   registerSettings() {},
-  on() {},
+  addHook() { return () => {}; },
   before() {},
 });
 if (registration === undefined) {
@@ -209,7 +209,7 @@ const require = createRequire(import.meta.url);
 const plugin = require(${JSON.stringify(join(buildDir, "index.server.js"))}).default;
 const events = [];
 let registration;
-plugin({ handle() {}, registerProvider(r) { registration = r; }, registerSettings() {}, on() {}, before() {} });
+plugin({ handle() {}, registerProvider(r) { registration = r; }, registerSettings() {}, addHook() { return () => {}; }, before() {} });
 const conn = await registration.connect({ capabilities: ["prompt.message"] });
 conn.onEvent((event) => events.push(event));
 const requestId = "child-" + process.argv[2];
@@ -262,7 +262,7 @@ const require = createRequire(import.meta.url);
 const plugin = require(${JSON.stringify(join(buildDir, "index.server.js"))}).default;
 const events = [];
 let registration;
-plugin({ handle() {}, registerProvider(r) { registration = r; }, registerSettings() {}, on() {}, before() {} });
+plugin({ handle() {}, registerProvider(r) { registration = r; }, registerSettings() {}, addHook() { return () => {}; }, before() {} });
 const conn = await registration.connect({ capabilities: ["prompt.message"] });
 conn.onEvent((event) => events.push(event));
 const sessionId = "child-session-" + process.argv[2];

@@ -57,82 +57,9 @@ jobs:
           echo "Upstream has new commits: ${upstream_sha}"
 
           if git merge --no-ff --no-edit upstream/main; then
-            # 最小可信门：依赖 + 类型检查 + 零依赖离线回归。任何一步失败，
-            # `set -e` 都会中止，main 不会被 push（合并只留在 runner 上）。
-            # 需要 .dbg 编译的脚本（plugin-check/timeline/…）与要真 daemon、
-            # 真 profile 或 token 的脚本不在这里跑，见 AGENTS.md 的分层清单。
+            # Same offline gate as push/PR CI; no DSH, daemon or model needed.
             ( cd paseo-plugin && npm ci --no-audit --no-fund )
-            ( cd paseo-plugin && npx tsc --noEmit )
-            node --check dsh-bridge/lib/server.js
-            node harness/bridge-assets-check.mjs
-            node harness/archived-lineage-check.mjs
-            node harness/image-host-path-check.mjs
-            node harness/paseo-system-envelope-check.mjs
-            node harness/revert-check.mjs
-            node harness/surface-check.mjs
-            node harness/file-snapshot-check.mjs
-            node harness/snapshot-lifecycle-check.mjs
-            node harness/file-mutation-gate-check.mjs
-            node harness/rewind-merge-check.mjs
-            node harness/mcp-http-check.mjs
-            node harness/doctor-check.mjs
-            node harness/probe-check.mjs
-            # 构建地基与分帧/重放：都不需要 profile、daemon 或 token。
-            # plugin-build-check 自己用临时目录编译（node_modules 走符号链接），
-            # 是整条链的地基——它退化会让下游每个 harness 在陈旧产物上假绿。
-            node harness/plugin-build-check.mjs
-            node harness/frame-reader-check.mjs
-            node harness/replay-turn-check.cjs
-            # 开/关事务：假 dsh + 一次性 DSH_HOME，不碰 profile/daemon/token。
-            # 它把插件编译到 paseo-plugin/.dbg-t6，驱动真实 provider 的 open 事务。
-            node harness/concurrent-open-check.mjs
-            # 2026-11-02 轮新增：都只用假 dsh / 一次性 DSH_HOME / 临时夹具，
-            # 不依赖本机 DSH 安装，也不需要 profile、daemon 或 token。
-            node harness/bootstrap-check.mjs
-            node harness/bridge-entry-check.mjs
-            node harness/catalog-cache-check.mjs
-            node harness/open-degrade-check.mjs
-            node harness/session-state-check.cjs
-            node harness/harness-gates-check.mjs
-            # jobs 状态机自带 tsconfig（@getpaseo/plugin 的 paths 映射），先单独
-            # 编译到 .dbg-poll，再把检查脚本放进去跑（它 require 相对路径的产物）。
-            ( cd paseo-plugin && npx tsc -p ../harness/jobs-poll.tsconfig.json )
-            echo '{"type":"commonjs"}' > paseo-plugin/.dbg-poll/package.json
-            cp harness/jobs-poll-check.cjs paseo-plugin/.dbg-poll/
-            ( cd paseo-plugin/.dbg-poll && node jobs-poll-check.cjs )
-            # goal 链的纯离线三段（2026-11-03）：pill 数据层、插件两个 RPC、时间线
-            # 续跑行。goal-bridge-check 不在这里：它按 bridge-server-check 的方式从
-            # 本机全局安装解析 @deepseek-ai/*，runner 上没有 DSH，跑了只会
-            # ERR_MODULE_NOT_FOUND（docs/HARNESS.md 已标"不进 CI"）。
-            ( cd paseo-plugin && npx tsc -p ../harness/goal-pill.tsconfig.json )
-            echo '{"type":"commonjs"}' > paseo-plugin/.dbg-goal/package.json
-            cp harness/goal-pill-check.cjs paseo-plugin/.dbg-goal/
-            ( cd paseo-plugin/.dbg-goal && node goal-pill-check.cjs )
-            # goal-server-check 跑的是编译后的整个插件（独立 .dbg 目录）：在
-            # --moduleResolution node 下 tsc 会报类型解析错误并 exit 2，那是预期噪音
-            # ——emit 产物才是运行物，所以容忍退出码，再用产物存在性兜底（裸
-            # `|| true` 会把真正的编译失败也吞掉）。
-            ( cd paseo-plugin && npx tsc --noEmit false --outDir .dbg --declaration false --module commonjs --moduleResolution node || true )
-            test -f paseo-plugin/.dbg/index.server.js
-            echo '{"type":"commonjs"}' > paseo-plugin/.dbg/package.json
-            cp harness/goal-server-check.cjs harness/fake-dsh-bridge.mjs paseo-plugin/.dbg/
-            ( cd paseo-plugin/.dbg && node goal-server-check.cjs )
-            # goal-timeline-check 用 plugin-build.cjs 自编译到 .dbg-goal-timeline，
-            # 与 concurrent-open-check 同一机制（真实 DshSession + 假进程传输）。
-            node harness/goal-timeline-check.cjs
-            # jobs 停止按钮的行内行为（2026-11-11）：纯离线，自带 tsconfig（@getpaseo/plugin
-            # 的 paths 映射），编译到 .dbg-stop-ui 后把检查脚本放进去跑（它 require 相对
-            # 路径的产物）。
-            ( cd paseo-plugin && npx tsc -p ../harness/jobs-stop-ui.tsconfig.json )
-            echo '{"type":"commonjs"}' > paseo-plugin/.dbg-stop-ui/package.json
-            cp harness/jobs-stop-ui-check.cjs paseo-plugin/.dbg-stop-ui/
-            ( cd paseo-plugin/.dbg-stop-ui && node jobs-stop-ui-check.cjs )
-            # jobs-stop-check 不在这里：Part A 按 goal-bridge-check 的方式从本机 DSH 安装
-            # 解析 @deepseek-ai/*，runner 上没有 DSH 会 exit 2（docs/HARNESS.md 已标"不进 CI"）。
-            # 不在这里：mcp-gateway-transport-check / mcp-gateway-guard-check /
-            # mcp-gateway-call-check 从本机 DSH 安装目录加载 schemastery 与
-            # dsh-tools，runner 上没有 DSH，跑了只会 ERR_MODULE_NOT_FOUND；
-            # jobs-popover-check 需要把 HOST_APP 指向一份 Paseo 检出。
+            node harness/offline-checks.cjs
 
             git push origin main
             echo "Merged upstream ${upstream_sha} into main."
@@ -150,44 +77,8 @@ jobs:
                 "git fetch upstream" \
                 "git checkout main" \
                 "git merge upstream/main   # 手动解决冲突" \
-                "( cd paseo-plugin && npm ci && npx tsc --noEmit )" \
-                "node --check dsh-bridge/lib/server.js" \
-                "node harness/bridge-assets-check.mjs" \
-                "# 其余离线回归与 CI 的门保持一致：" \
-                "for s in archived-lineage-check image-host-path-check paseo-system-envelope-check revert-check \\" \
-                "         surface-check file-snapshot-check snapshot-lifecycle-check file-mutation-gate-check \\" \
-                "         rewind-merge-check mcp-http-check doctor-check probe-check \\" \
-                "         plugin-build-check frame-reader-check; do" \
-                "  node \"harness/\$s.mjs\" || exit 1" \
-                "done" \
-                "node harness/replay-turn-check.cjs" \
-                "node harness/concurrent-open-check.mjs" \
-                "# 2026-11-02 轮新增的纯离线门：" \
-                "node harness/bootstrap-check.mjs" \
-                "node harness/bridge-entry-check.mjs" \
-                "node harness/catalog-cache-check.mjs" \
-                "node harness/open-degrade-check.mjs" \
-                "node harness/session-state-check.cjs" \
-                "node harness/harness-gates-check.mjs" \
-                "( cd paseo-plugin && npx tsc -p ../harness/jobs-poll.tsconfig.json )" \
-                "echo '{\"type\":\"commonjs\"}' > paseo-plugin/.dbg-poll/package.json" \
-                "cp harness/jobs-poll-check.cjs paseo-plugin/.dbg-poll/" \
-                "( cd paseo-plugin/.dbg-poll && node jobs-poll-check.cjs )" \
-                "# goal 链纯离线三段（goal-bridge-check 需要本机 DSH，不在门里）：" \
-                "( cd paseo-plugin && npx tsc -p ../harness/goal-pill.tsconfig.json )" \
-                "echo '{\"type\":\"commonjs\"}' > paseo-plugin/.dbg-goal/package.json" \
-                "cp harness/goal-pill-check.cjs paseo-plugin/.dbg-goal/" \
-                "( cd paseo-plugin/.dbg-goal && node goal-pill-check.cjs )" \
-                "( cd paseo-plugin && npx tsc --noEmit false --outDir .dbg --declaration false --module commonjs --moduleResolution node || true )" \
-                "echo '{\"type\":\"commonjs\"}' > paseo-plugin/.dbg/package.json" \
-                "cp harness/goal-server-check.cjs harness/fake-dsh-bridge.mjs paseo-plugin/.dbg/" \
-                "( cd paseo-plugin/.dbg && node goal-server-check.cjs )" \
-                "node harness/goal-timeline-check.cjs" \
-                "# jobs 停止按钮的行内行为（纯离线，自带 tsconfig）：" \
-                "( cd paseo-plugin && npx tsc -p ../harness/jobs-stop-ui.tsconfig.json )" \
-                "echo '{\"type\":\"commonjs\"}' > paseo-plugin/.dbg-stop-ui/package.json" \
-                "cp harness/jobs-stop-ui-check.cjs paseo-plugin/.dbg-stop-ui/" \
-                "( cd paseo-plugin/.dbg-stop-ui && node jobs-stop-ui-check.cjs )" \
+                "( cd paseo-plugin && npm ci --no-audit --no-fund )" \
+                "node harness/offline-checks.cjs" \
                 "git push origin main" \
                 '```' \
                 "" \

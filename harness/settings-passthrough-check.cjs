@@ -202,7 +202,7 @@ plugin({
     registration = value;
   },
   registerSettings() {},
-  on() {},
+  addHook() { return () => {}; },
   before() {},
 });
 

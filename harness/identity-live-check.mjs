@@ -78,7 +78,7 @@ plugin({
     registration = providerRegistration;
   },
   registerSettings() {},
-  on() {},
+  addHook() { return () => {}; },
   before() {},
 });
 

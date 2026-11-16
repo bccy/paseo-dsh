@@ -96,7 +96,7 @@ Paseo 撤回按钮
   插件只认 `no-session-store` / `flush-failed` / `not-durable` 三个码；**更新版桥新增的码
   原样透传**桥的原文（不猜本地化句子），非本前缀的错误同样原样返回，只有这三码被翻译。
 - **怎么自查**：
-  1. `dsh --profile <name> --dump-config`（只读）看组合里有没有会话持久化那一行；
+  1. `dsh --profile <name> --dump-config`（会重写生成的 `cordis.yml`）看组合里有没有会话持久化那一行；
   2. 试撤回一次：收到上面那句提示即为本节场景；
   3. 三条已知码（`no-session-store` / `flush-failed:<DSH 原因>` / `not-durable`）会被翻成本地化
      句子，其中 `flush-failed` 括号里原样带出 DSH 的原因；**本模块不认识的码**才原样透传桥原文。
@@ -236,8 +236,8 @@ persistence。依据：0.15.0 的 `plugin-provider.js` `ensureReplay()` / `repla
 
 **本地补丁不再提供**：rewind 补丁早先已退休（它依赖的 `this.history` 数组在 0.15 被
 `PluginSessionHistory` 取代，PR #7675，注入的 `truncateHistoryFrom()` 成了运行期 no-op）；
-剩下的 turnId target 也随 `local-patches/` 一起删除，因为上游到 0.16.0-beta.1 仍未修
-（`agent-manager.js:3461,3516`），维护成本高于它修的那一个缺陷。现在只有宿主原生的刷新，
+剩下的 turnId target 也随 `local-patches/` 一起删除，因为上游到 0.16.0 仍未修
+（`agent-manager.js:3508,3563`），维护成本高于它修的那一个缺陷。现在只有宿主原生的刷新，
 仓库里没有任何改写已安装 dist 的脚本。
 
 **canary 自证**：插件在**自己进程里**看不出对面是哪种宿主（没有"会刷新 history"这个能力位），
@@ -266,7 +266,7 @@ timeline 通知；conversation / `both` 撤回在 `revert()` 返回后
 `hydrateTimelineFromProvider({force:true})`，`streamHistory()` 原样重放**未变**的这段 history，
 于是它出现在重建后的时间线里，告诉用户执行 Reload agent 或重开会话。history 只增不减，后续
 每次重建都会把历史里所有 canary 一起带出来（会看到多条）。`paseo-plugin/paseo-plugin.json`
-的 requirements 现在只接受 Paseo ≥0.16，这条只作历史记录。
+的 requirements 现在只接受 Paseo ≥0.16.0 正式版，这条只作历史记录。
 
 **顺序就是机制本身。** 放到 `request.completed` 之后，0.15 上它也会留下来，变成
 「时间线没刷新」的**误报**。所以 `provider.ts` 的 `session.revert` 分支里，通知必须在回执
@@ -475,3 +475,16 @@ canary 看不到是预期（看消息行是否消失，不要拿提示当刷新�
 - 外部状态：`~/.dsh/paseo-rewind/`（journal/objects/rescue）可直接清理，丢失的只是文件回退能力；
   旧实现残留（`~/.dsh/rewind-ledger`、`~/.dsh/rewind-git`、`~/.dsh/rewind-snapshots`）已不再读取。
 - profile 备份：`~/.dsh/backups/paseo-profile-before-rewind-*.tgz`、`profile-bridge-before-file-layer-*.tgz`。
+
+
+## 0.16.0 正式版复核（2026-11-16）
+
+依据 npm 发布的 `@getpaseo/server@0.16.0`，`plugin-provider.js` 的 `revert` /
+`ensureReplay` / `replayBinding` 机制仍是持久化句柄、关闭旧 binding、重开重放。
+`agent-manager.js:3508,3563` 的历史落行仍仅传 timestamp，未传 event.turnId；
+因此 #8053/#8054 的已知限制继续保留，不能把“完成通知按当前回合取回复”的另一处修复当成它。
+
+`timeline.refetch({wholeTurns:true})` 适合读取某个结束回合并按 turnId 筛选；撤回完成提示是
+独立 plugin notice，不属于一个模型回合，仍按 noticeId 检查投递和重建后的存活，不套 wholeTurns。
+本轮验收分离线宿主重建与真实 daemon/UI 两层，离线通过不替代真机验收；详见
+[Paseo 0.16 适配矩阵](PASEO-016-ADAPTATION.md)。

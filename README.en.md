@@ -31,6 +31,7 @@ step left is [your model route](#install-one-line), described below.
 | Background jobs | — | ✅ a composer pill shows DSH background jobs (a terminal icon with a running ring on its corner) only while some are running/stopping: it is labelled just "Background" (the count is in the panel) and hides once every job has finished; multiple pills on one row can be scrolled horizontally (the host's pill track scrolls from 0.15.3 on), and the goal, team and jobs pills each show on their own rule; expandable to each job, where a running job that can be stopped carries a stop button (no confirmation, a spinner while stopping, the push decides, and a failure reason is shown under the row) |
 | Goal pill | — | ✅ a composer pill shows the DSH goal; its label and the phone sheet title are always "Goal" — the icon carries the state (a running ring on its corner while it runs, a green check once it is complete) and the panel's first row speaks it in full; the popover has the objective (with the DeepSeek mark; tap the text to edit it in a small composer-style field), "Round N · budget M", "Now: <current task>" and the blocked reason, with pause / resume / clear (clear asks for confirmation); a completed goal is shown once more (read-only, clear only, hidden only after you open and close its panel; sending a new message without opening it does not hide it); auto-continue stops after a reopen and the pill offers the resume entry point |
 | Team (Agent Team) pill | — | ✅ sessions with shared team tasks get a "Team" composer pill (a people icon with a running ring on its corner while a teammate runs, red on a team record failure); an all-done board is shown once more and hidden only after you open and close its panel (sending a new message without opening it does not hide it); it opens a read-only panel: the members (lead, running / idle / starting / failed to start) and the shared tasks grouped by state (in progress / ready / waiting, done folded), tap a task for its full text; `team_task_*` results render as field cards, and refusals are translated in Chinese with DSH's words kept |
+| Workspace status badges | — | ✅ sidebar summaries for goals, teams and running DSH jobs, using the existing pill subscriptions; hide them from the Show menu; requires the stable 0.16.0 App, with registration skipped on older Apps |
 | Goal / workflow timeline | — | ✅ `goal/change` and `tool-workflow/*` events render as tool rows; each automatic goal round gets its own compact row ("Goal round · N"); goal changes show as a "Goal status" row right after the `/goal` command that caused them; goal tool results render as field cards and refused calls get a short explanation; a background workflow keeps its running state across turns |
 | Tool approval cards | — | ✅ DSH's `approval/request` becomes a Paseo approval card (allow once / reject) |
 | Rewind | — | ✅ the conversation and files both roll back (the message row disappears, files touched by edit tools are restored, the model no longer sees the withdrawn content); file rollback excludes files over 8 MiB, symlink targets and non-regular files; on Paseo 0.15+ the host refreshes the timeline natively, no Reload needed (0.15 still unverified on a real machine) |
@@ -58,7 +59,7 @@ Read docs/ADOPTION.md completely before changing anything. Do not edit files by
 guesswork.
 
 ■ Step 1: check prerequisites
-Confirm that dsh, paseo and node are on PATH, that paseo is >= 0.16 and that
+Confirm that dsh, paseo and node are on PATH, that paseo is >= 0.16.0 stable and that
 dsh is >= 0.2.1. If anything is missing, stop and tell me; do not install it for
 me.
 
@@ -215,7 +216,7 @@ node <plugin-dir>/bin/paseo-dsh.mjs doctor
 
 It checks the `dsh`/`paseo` versions, that the profile is ready, that the bridge
 landed, that the route is filled in and that the key for `apiKeyEnv` exists — and
-names whatever is missing (read-only, changes nothing). When it is green,
+names whatever is missing. Its composition check runs `dsh --dump-config`, which rewrites the profile’s generated `cordis.yml`; it does not change the route patch or credentials. When it is green,
 **restart the Paseo daemon** (`paseo daemon restart`) and pick the
 **DeepSeek Harness** provider when you create a session.
 
@@ -353,13 +354,13 @@ thing — put the lost `turnId` back on replay, so a reopened long session folds
 turns correctly. It rewrote the `dist` of the **installed** `@getpaseo/server`
 (upstream has no extension point for this), was never a release artifact (the
 package published by `npm publish` does not contain it), and upstream has still
-not fixed it in 0.16.0-beta.1 (`agent-manager.js:3461,3516`). So the defect stays
+not fixed it in 0.16.0 (`agent-manager.js:3508,3563`). So the defect stays
 on record as a **known issue, waiting on upstream**.
 
 | Capability | Current behaviour (no patch) |
 |---|---|
 | **Rewind** (conversation + files) | the rewind **has already taken effect**: the conversation, the files the agent changed and the model's memory of them in context are all rolled back; the timeline is refreshed **immediately** by the host (since Paseo 0.15.0 — upstream PR #8368 fixes #4667: `revert()` closes the provider session, reopens it with the negotiated persistence handle and replays the persisted DSH session), no Reload needed. The "rewind applied" canary is still emitted before the receipt; the 0.15+ replay clears it together with the old history (not seeing it is expected — judge by whether the message rows disappear). Files tracked by the editing tools are also re-scanned at every human message boundary, so bash/external-process changes to them are kept in the pre-image of a later rewind |
-| **Turn folding after reopening a session** | **partly broken**: system-triggered turns merge into the previous turn, and steered turns get split apart (the `turnId` is lost on replay). Waiting on upstream [#8053](https://github.com/getpaseo/paseo/issues/8053) / PR [#8054](https://github.com/getpaseo/paseo/pull/8054); 0.16.0-beta.1 still has it |
+| **Turn folding after reopening a session** | **partly broken**: system-triggered turns merge into the previous turn, and steered turns get split apart (the `turnId` is lost on replay). Waiting on upstream [#8053](https://github.com/getpaseo/paseo/issues/8053) / PR [#8054](https://github.com/getpaseo/paseo/pull/8054); 0.16.0 still has it |
 | **"Running" on a second subagent dispatch** | the card stays on the previous turn's terminal state. Upstream [#8080](https://github.com/getpaseo/paseo/pull/8080) is fixed and effective from Paseo 0.15.0 |
 
 > Two things are unrelated to the patch: content a memory plugin has already
@@ -373,7 +374,7 @@ on record as a **known issue, waiting on upstream**.
 
 ## Self-test / local verification (no Paseo needed)
 
-**Run the CLI from this checkout first** (read-only, changes nothing; run it in the
+**Run the CLI from this checkout first** (composition rewrites the generated `cordis.yml`; run it in the
 checkout, never through `npx` — that is the upstream npm package):
 
 ```bash
@@ -417,13 +418,12 @@ a false diagnosis).
 
 ## Requirements
 
-- Paseo ≥ 0.16 (0.16 moved composer options to `controls` / `providerOptions`; this plugin runs on that contract and no longer supports 0.15)
-- **DSH ≥ 0.2.1** (on the 0.2.x line): the bridge imports eight DSH internal
+- **Paseo ≥ 0.16.0 stable**: the SDK is pinned to 0.16.0, with `server.addHook` and the stable workspace badge API. App and daemon versions can differ; an older App without the badge API skips that contribution. Composer settings still use `controls` / `providerOptions`. See the [0.16 adaptation matrix](docs/PASEO-016-ADAPTATION.md) for each capability decision.
+- **DSH ≥ 0.2.1** (on the 0.2.x line): the bridge imports nine DSH internal
   packages directly (`@deepseek-ai/dsh-cmdline` / `dsh-brand` / `dsh-llm` /
-  `dsh-attachment` / `dsh-agent` / `dsh-tools` / `dsh-subprocess` /
+  `dsh-attachment` / `dsh-agent` / `dsh-tools` / `dsh-subprocess` / `dsh-host-plugin-inventory` /
   `schemastery`), and 0.2.1 changed both prompt-variable registration and catalog
-  materialisation timing. What has actually been tested is `0.2.1-rc.2`
-  (2026-10-20); **0.2.0 and earlier are unverified**, and `doctor` reports
+  materialisation timing. The latest tracked DSH release is `0.2.2-rc.3`; a minimum-version check is separate from end-to-end acceptance; **0.2.0 and earlier are unverified**, and `doctor` reports
   anything below 0.2.1 as blocking.
 - Node ≥ 20.4 (on the 20.x line): the bridge uses `AbortSignal.any` (available
   since Node 20.3) and `Symbol.dispose` (since Node 20.4, in

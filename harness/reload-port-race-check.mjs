@@ -227,7 +227,7 @@ plugin({
     registration = r;
   },
   registerSettings() {},
-  on() {},
+  addHook() { return () => {}; },
   before() {},
 });
 if (registration === undefined) {

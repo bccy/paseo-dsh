@@ -4494,3 +4494,21 @@ live 世代（`#forgetSubagentListings`，顺带把世代表收敛为只含 live
 先红后绿 122/131 → 131/131，第二轮竞态 3 条再红 132/134 → 134/134；`dsh-api-contract-check` 登记 `dsh-session-persistence` 的
 `list`/`stat`/`open`。**动了 `subagents()` 的读取/缓存/归档判定必跑这两条 + `archived-lineage-check`
 + `archive-registry-check`。**
+
+
+## 第三十六轮：Paseo 0.16 正式版的契约与检查入口（2026-11-16）
+
+### 110. 宿主修复、公开 provider 能力与夹具更新是三件事
+
+0.16.0 正式包保留子代理关闭前的 canceled/failed 状态，并串行处理 replace/Stop；
+但历史重放仍在 `agent-manager.js:3508,3563` 丢掉 turnId，direct-provider SDK 也没有
+`background_work` / stopBackgroundWork。不能把相邻修复当成已有自有实现的稳定等价替代，
+jobs pill、shared DSH 回收与撤回提示仍保留。完整取舍在 [适配矩阵](PASEO-016-ADAPTATION.md)。
+
+本轮把六个捕获句柄的旧 `server.on` hook 迁到正式 `addHook`，对应 fake server 也移除旧 on
+入口，避免测试借兼容层通过却没有测试新契约。此前 profile gate 增加 pinRoute、桥入口增加
+shellEnv 时遗漏了两个夹具，产生假红；因此新增 push/PR gate，和 upstream sync 共用
+`harness/offline-checks.cjs`，不再等上游有新提交时才验证本仓改动。
+
+公开文档曾把 doctor 描述为只读，但它已复用 DSH `--dump-config`，会重写生成的 cordis.yml；
+文案已订正。完整验证与真机验收分别记录，离线通过不代表插件已经安装或发布。

@@ -202,11 +202,16 @@ writeFileSync(fakeServerPath, FAKE_SERVER);
 writeFileSync(envServerPath, ENV_SERVER);
 
 
-/** Every message the fake server received, in arrival order. */
-const readLog = () => readFileSync(logPath, 'utf8')
+/**
+ * Only newline-committed records: readFileSync can race another process's
+ * append and return a partial final JSON value. A malformed complete record
+ * still throws; only the unfinished tail is retried on the next read.
+ */
+const parseLog = (text) => text.slice(0, text.lastIndexOf('\n') + 1)
   .split('\n')
   .filter((line) => line !== '')
   .map((line) => JSON.parse(line));
+const readLog = () => parseLog(readFileSync(logPath, 'utf8'));
 const methods = () => readLog().filter((entry) => typeof entry.method === 'string').map((entry) => entry.method);
 const countOf = (method) => methods().filter((name) => name === method).length;
 const lastCall = () => readLog().filter((entry) => entry.method === 'tools/call').at(-1);
@@ -243,6 +248,11 @@ const makeClient = (options = {}, mode) => {
 };
 
 try {
+  check('fixture log tolerates an in-flight partial tail',
+    JSON.stringify(parseLog('{"id":1}\n{"id":')) === '[{"id":1}]');
+  let corruptRejected = false;
+  try { parseLog('{broken}\n'); } catch { corruptRejected = true; }
+  check('fixture log still rejects a corrupt completed record', corruptRejected);
   // ── handshake, catalog, cache, calls: one client, sequential ──────────────
   const client = makeClient();
   const tools = await client.listTools();

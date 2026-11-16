@@ -209,7 +209,7 @@ function stubHostClis() {
       'if [ "$1" = "--version" ]; then',
       // Must clear the plugin's Paseo floor, which this build raised to 0.16
       // (composer options moved to `controls`/`providerOptions`).
-      '  echo "0.16.0"',
+      '  echo "${DOCTOR_CHECK_PASEO_VERSION:-0.16.0}"',
       'elif [ "$1" = "plugin" ] && [ "$2" = "ls" ]; then',
       // The row doctor looks for: a line starting with `dsh-paseo` whose text
       // carries the word `running`.
@@ -956,6 +956,20 @@ const check = (name, pass, detail) => {
       flat.code === 0,
     flat.out.trim().split("\n").find((l) => l.includes("flat layout")) ?? `exit ${flat.code}`,
   );
+}
+
+// The manifest's >=0.16.0 floor is stable, not a core-digit beta allowance.
+for (const [version, expectedCode] of [['0.16.0-beta.2', 1], ['0.16.0', 0], ['0.17.0', 0], ['0.17.0-alpha.1', 0]]) {
+  install({ patch: VALID_ROUTE, credentials: VALID_CREDENTIALS });
+  process.env.DOCTOR_CHECK_PASEO_VERSION = version;
+  try {
+    const run = doctor();
+    check(`Paseo ${version} respects the stable floor`, run.code === expectedCode,
+      `exit ${run.code}; expected ${expectedCode}`);
+    if (version === '0.17.0-alpha.1') check('a later prerelease is unverified, not green', run.out.includes('this later prerelease was not verified'));
+  } finally {
+    delete process.env.DOCTOR_CHECK_PASEO_VERSION;
+  }
 }
 
 rmSync(WORK, { recursive: true, force: true });

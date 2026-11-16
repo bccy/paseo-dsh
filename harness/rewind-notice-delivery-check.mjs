@@ -222,7 +222,7 @@ plugin({
     registration = candidate;
   },
   registerSettings() {},
-  on(name, handler) {
+  addHook(name, handler) {
     hookHandlers.set(name, handler);
     return () => hookHandlers.delete(name);
   },
@@ -511,7 +511,7 @@ if (!degraded) {
   );
   // The real host hands the handle to every lifecycle hook. Model the first
   // turn hook firing after the rewind.
-  const turnHook = hookHandlers.get("agent.turn_started");
+  const turnHook = hookHandlers.get("agent.turn.before");
   check("the plugin registered the turn hook that captures the handle", typeof turnHook === "function");
   if (typeof turnHook === "function") {
     turnHook({ agent: { id: agent.id }, turnId: null }, { paseo, signal: new AbortController().signal });

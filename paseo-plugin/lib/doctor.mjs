@@ -70,27 +70,18 @@ const RED = "\u001b[31m";
 const DIM = "\u001b[2m";
 const RESET = "\u001b[0m";
 
-/** Paseo gained the direct-provider-plugin API in this release. */
 /**
- * The plugin API this build is written against: Paseo 0.16 moved composer
- * options to `controls`/`providerOptions`, and 0.15 hosts still read the
- * deprecated `settings` array — one build cannot serve both, so the floor moves
- * with the migration.
- *
- * Compared by core digits only (`atLeast`), so a `0.16.0-beta.1` host counts as
- * `0.16.0` and a 0.15 host does not. That is the same policy as `compareCore`
- * below, and it is why the string here is the stable form while the npm range in
- * `package.json` has to spell out the prerelease: npm's semver ranks
- * `0.16.0-beta.1` below `0.16.0`, so `>=0.16.0` would reject the only 0.16 build
- * published today.
+ * This build uses the stable 0.16.0 SDK and workspace row badge API. A beta
+ * whose core digits are 0.16.0 does not satisfy the package/manifest >=0.16.0
+ * floor. App and daemon versions can differ; the client guards its badge API.
  */
 const MINIMUM_PASEO = "0.16.0";
 
 /**
- * The DSH version this build was verified against (`0.2.1-rc.2`, 2026-10-20).
+ * The DSH compatibility floor; the latest tracked runtime is `0.2.2-rc.3`.
  *
- * The bridge imports five DSH-internal packages (`@deepseek-ai/dsh-cmdline`,
- * `dsh-brand`, `dsh-llm`, `dsh-attachment`, `dsh-agent`), and 0.2.1 changed both
+ * The bridge imports nine internal/runtime packages (the authoritative list is
+ * in `harness/dsh-api-contract-check.mjs`), and 0.2.1 changed both
  * the prompt-variable registry and catalog materialization. An older line is a
  * blocking issue, not a warning: the plugin's version line tracks DSH only at
  * `major.minor`, which cannot tell `0.2.0` from `0.2.1`.
@@ -480,14 +471,14 @@ function line(v) {
  * 0.9.2, and warned about `1.0.0`.
  */
 function atLeast(version, minimum) {
-  const parts = (value) => String(value).match(/(\d+)\.(\d+)\.(\d+)/)?.slice(1).map(Number);
-  const got = parts(version);
-  const want = parts(minimum);
+  const got = parseVersion(version);
+  const want = parseVersion(minimum);
+  // A prerelease of the floor predates the stable badge API. A later
+  // prerelease retains the existing non-blocking warning policy, not a claim
+  // that its behavior has been verified.
   if (got === undefined || want === undefined) return false;
-  for (let i = 0; i < 3; i += 1) {
-    if (got[i] !== want[i]) return got[i] > want[i];
-  }
-  return true;
+  const core = compareCore(got, want);
+  return core > 0 || (core === 0 && got.prerelease === undefined);
 }
 
 /** `major.minor.patch` plus the prerelease tag, or `undefined` when unreadable. */
@@ -745,10 +736,14 @@ export function runDoctor() {
     report(
       "fail",
       `paseo ${paseo.version}`,
-      `needs Paseo >= ${MINIMUM_PASEO} (composer options moved to controls/providerOptions in 0.16; a 0.15 host is not supported)`,
+      `needs Paseo >= ${MINIMUM_PASEO} stable (this build uses the stable SDK and workspace row badge API; 0.16.0 prerelease hosts do not satisfy this floor)`,
     );
   } else {
-    report("ok", `paseo ${paseo.version}`);
+    if (parseVersion(paseo.version)?.prerelease !== undefined) {
+      report("warn", `paseo ${paseo.version}`, "this later prerelease was not verified; run the host contract checks before adopting it");
+    } else {
+      report("ok", `paseo ${paseo.version}`);
+    }
     // The profile can exist without the plugin — `install.sh` creates one too —
     // so "profile is there" never proved the plugin is.
     const listed = run(paseo.cmd, ["plugin", "ls"]);

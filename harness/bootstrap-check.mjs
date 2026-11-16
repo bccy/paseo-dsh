@@ -313,7 +313,7 @@ console.log("\nbootstrap: a provisioning failure never claims the profile is rea
         registered = true;
       },
       registerSettings() {},
-      on() {},
+      addHook() { return () => {}; },
       before() {},
     });
   } finally {
@@ -344,7 +344,7 @@ console.log("\nbootstrap: the success path still reports ready");
         registered = true;
       },
       registerSettings() {},
-      on() {},
+      addHook() { return () => {}; },
       before() {},
     });
   } finally {

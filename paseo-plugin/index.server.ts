@@ -27,17 +27,17 @@ import {
  * `server/rewind-notice-append`), so it is captured from every callback the
  * host offers.
  *
- * These are `on` hooks, never `before("agent.session_open")`: the host
+ * These use the public `addHook` API, never `agent.open.before`: the host
  * invalidates plugin sessions for a plugin that registers that before-hook on
  * every start and stop, which reloads every agent before its next prompt.
  */
 const CAPTURE_HOOKS = [
-  "agent.created",
-  "agent.turn_started",
-  "agent.turn_ended",
-  "agent.permission_requested",
-  "agent.permission_resolved",
-  "agent.archived",
+  "agent.create.after",
+  "agent.turn.before",
+  "agent.turn.after",
+  "agent.permission.before",
+  "agent.permission.after",
+  "agent.archive.after",
 ] as const;
 
 /**
@@ -97,7 +97,7 @@ export default function contribute(server: PluginServerContext) {
   const capture = (context: PluginHandlerContext): void => {
     capturePaseo(context.paseo);
   };
-  const cleanups = CAPTURE_HOOKS.map((name) => server.on(name, (_event, context) => capture(context)));
+  const cleanups = CAPTURE_HOOKS.map((name) => server.addHook(name, async (_event: unknown, context: PluginHandlerContext) => capture(context)));
 
   server.registerProvider(createDshProvider());
 

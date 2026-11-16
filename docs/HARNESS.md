@@ -4,6 +4,43 @@
 拆出去是因为 AGENTS.md 会作为工作区指令整份注入 DSH 会话，而 DSH 的工作区指令总预算是 64 KiB，
 超出时会整份丢弃更外层的 `~/.dsh/AGENTS.md`（FIELD-NOTES 第 77 条）。往这里加条目不占那份预算。
 
+## 统一 portable CI（Paseo 0.16.0）
+
+```bash
+cd paseo-plugin && npm ci --no-audit --no-fund
+cd ..
+node harness/offline-checks.cjs
+node harness/offline-checks.cjs --list       # 只列出当前机器可执行清单
+```
+
+`harness/offline-checks.cjs` 是唯一可执行清单，push / PR workflow 和 upstream sync 共用。
+它先严格执行 `tsc --noEmit`，再用 `plugin-build.cjs` 构建 `.dbg-offline-checks` 并在每个检查前
+复核 `freshness()`。CJS emit 的兼容诊断不代替类型检查；流程中没有 `tsc || true`。
+默认首个失败即退出，`--keep-going` 收集所有失败但最终仍 exit 1。不会安装全局 DSH/Paseo、
+运行真实 profile/模型、连接 daemon；脚本需要的写入只在生成编译树与一次性夹具中。
+新增 portable 检查登记到该 runner，本页说明判据；不要复制到第二份 shell 列表。
+
+不在 portable CI：`dsh-api-contract-check`、`bridge-server-check`、`rewind-transaction-check`、
+`identity-env-check` 等需已安装 DSH 包的检查；`rewind-notice-delivery-check`、
+`stable-host-child-check` 等需宿主类的检查；以及所有真实模型/daemon/UI 检查。
+没有安装对应运行时是未验证，不能当成通过。
+
+- `harness/lifecycle-hook-check.cjs`：真实编译 `index.server`，fake server **只有 addHook**，
+  没有旧 `on/before` 兼容口。精确断言六个 hook（create.after、turn.before/after、
+  permission.before/after、archive.after），每个异步 handler 都捕获本次 callback 的 Paseo
+  句柄，cleanup 全部释放；open.before / create.before / 多余 close hook 均不能混入。
+  改 server 入口或 hook 名称必跑；不创建 profile，不开 provider connection。
+- `harness/timeline-kind-check.cjs`：执行编译的 client entry 与 stream-stats 注册逻辑，
+  拦截实际 `addTimelineRenderer` 的四个 kind，按 `^[a-z][a-z0-9-]*$` 校验。UI 组件不挂载；
+  在内存里把实际注册的 kind 改为大写字符串，必须拒绝（负向变异控制）。新增 renderer 必跑。
+- `harness/stable-host-child-check.mjs`：真实 `PluginAgentClientRegistry` + 协议假 provider，
+  断言 canceled / failed / completed 后关闭仍保持终态。`PASEO_CLI_ROOT` 指向待验收宿主 CLI
+  根目录，必须记录其实际版本；不进 portable CI。升级宿主、改 child close/终态必跑。
+- `harness/workspace-badges-check.cjs`：工作区徽标的状态聚合、background agent 只计运行态、
+  seen/删除/断开清理、旧 App 缺少注册 API 的降级；复用现有订阅而不额外读取。
+  修改徽标或三个 pill 向徽标传递状态时必跑；`node harness/workspace-badges-check.cjs` 自编译，纳入 portable CI。
+  `workspace-badges-preview.cjs` 需显式宿主 checkout 与输出参数，只生成预览，不进 portable CI，也不替代真实 App 截图。
+
 还有一组**离线**脚本，直接 require 编译产物、不需要 daemon（运行步骤写在各自头部注释里）。
 下面清单里穿插的 `subagent-check.cjs` 归档用例与 `archive-registry-check.mjs` **不属于这组**：
 前者是假 `dsh` 驱动的，后者要真 profile。
@@ -47,7 +84,7 @@
   `client/rewind-notice-live.ts` 的实时监视器（live 事件弹一次、重复投递/重挂载不弹、回放/重拉
   不弹、交接窗口、目录观察的 provider/新鲜度/数量上限、失败上报、dispose 释放），以及
   `index.client.tsx` / `index.server.ts` 的接线（renderer 用 shared kind、启动监视器并调用 arm
-  RPC、只注册允许的 hook、不注册 `before("agent.session.open")`）。本轮补的：兜底 notice 的
+  RPC、只以 `addHook` 注册允许的六个 hook、不注册 `agent.open.before` / `agent.create.before`）。本轮补的：兜底 notice 的
   **降级标记**（server/client 两份常量逐字相等的漂移守卫、双 locale 的「带标记可见 / 无标记仍删」）
   与 NC-03 的句柄迟到单元场景（`beginRewindReport` 后、`deliver` 前才捕获句柄 → 先建 replacement
   订阅再 append，超时后 append 有界）。**持久化失败文案**（`shared/rewind-notice.ts` 的

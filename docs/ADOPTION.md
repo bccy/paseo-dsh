@@ -290,13 +290,13 @@ if (provider === undefined || model === undefined) {
 有些缺陷不在你的代码里，而在宿主（Paseo）里。本仓库曾经有一个 `local-patches/` 去补其中
 一个（重放时补回丢失的 `turnId`），但它**不是发布产物**：它改写**已安装的** `@getpaseo/server`
 的 `dist`，`npm publish` 出去的包里没有，装不装都不影响插件本体。**这个补丁已经删除，不再
-维护**（上游到 0.16.0-beta.1 仍未修，`agent-manager.js:3461,3516`）。所以现在只剩"没补丁"
+维护**（上游到 0.16.0 仍未修，`agent-manager.js:3508,3563`）。所以现在只剩"没补丁"
 一种行为，而它必须**可解释、看得见**——否则就是本书反复讲的那类静默降级。
 
 | 能力 | 现在的行为（无补丁） |
 |---|---|
 | **撤回**（对话 + 文件） | 撤回**已经生效**：对话、智能体改过的文件都回退了，模型在上下文里的记忆也回退了（下一次请求看不到被撤内容，见下方关于记忆插件的说明）；时间线由宿主**立刻刷新**（Paseo 0.15.0 起上游 PR #8368 修掉 #4667，不再需要本地补丁），不需要 Reload。canary 仍在回执前发出，0.15+ 的 replay 会把它连同旧 history 清掉（看不到是预期） |
-| **重开会话后的回合折叠** | **部分失效**：系统触发的回合会并入上一回合、插话回合被拆开（`turnId` 在重放时丢失）。等上游 [#8053](https://github.com/getpaseo/paseo/issues/8053) / PR [#8054](https://github.com/getpaseo/paseo/pull/8054)，0.16.0-beta.1 仍未修 |
+| **重开会话后的回合折叠** | **部分失效**：系统触发的回合会并入上一回合、插话回合被拆开（`turnId` 在重放时丢失）。等上游 [#8053](https://github.com/getpaseo/paseo/issues/8053) / PR [#8054](https://github.com/getpaseo/paseo/pull/8054)，0.16.0 仍未修 |
 | **子代理第二次派发时的「运行中」** | 卡片停在上一回合的终态。上游 [#8080](https://github.com/getpaseo/paseo/pull/8080) 已修复，Paseo 0.15.0 起生效 |
 
 关键在于第一行那个「撤回已生效」提示**同时是自证机制**：它必须在 `request.completed` **之前**
@@ -338,10 +338,10 @@ DSH_PASEO_PROFILE=paseo node paseo-plugin/bin/paseo-dsh.mjs doctor
 > `npx paseo-dsh doctor` 跑的是 **npm 上游稳定线**的 CLI，验的不是本分支；
 > 只在明确要检查上游安装时才用。
 
-只读不改：查 `dsh`/`paseo` 版本（DSH 低于 0.2.1 会判 blocking）、插件是否已把
+检查 `dsh`/`paseo` 版本（DSH 低于 0.2.1 会判 blocking）、插件是否已把
 DSH profile 建好、bridge 是否落地、`cordis.patch.yml` 是否填了路由、每个 `apiKeyEnv`
 是否有对应凭证，缺什么直接点出来。它回答的是"**装好了没**"；下面几节回答的是
-"**行为对不对**"——两者互补。绝大多数"接不上"的报障，跑一遍 `doctor` 就定位了。
+"**行为对不对**"——两者互补。组合检查调用 DSH 的 `--dump-config`，会重写生成的 `cordis.yml`，因此不是严格只读。绝大多数"接不上"的报障，跑一遍 `doctor` 就定位了。
 
 ### 5.1 用一次性脚本断言事件流
 
@@ -430,3 +430,16 @@ tools/probe-provider.mjs  ← 应交付：能力探测（帮别人填 C）
 harness/              ← 可选：验证脚本，展示第 5 节的方法
 docs/FIELD-NOTES.md   ← 不交付：作者本机的具体缺陷记录（历史，只读）
 ```
+
+
+## Paseo 0.16.0 正式版的边界
+
+本分支要求宿主 ≥0.16.0，SDK 固定正式版；工作区徽标复用 goal/team/jobs 订阅，不增加读取循环。
+`background` 字段透传且不滤掉 agent：隐藏 helper 的运行态可以计入徽标，但不贡献警示或完成提醒；
+宿主的 `backgroundWork.count` 不等于 DSH jobs。direct-provider SDK 没有 `background_work`
+事件与停止入口，所以保留 jobs pill / RPC。
+
+`addComposerItem`、附件来源、新建工作区项和侧栏替换已逐项评估：DSH 没有额外数据来源或
+宿主已原生提供控件，属于本轮不适用，不是 API 不支持。完整依据和验收边界见
+[Paseo 0.16 适配矩阵](PASEO-016-ADAPTATION.md)。生命周期只以 `server.addHook` 注册六个
+观察/回合/权限事件；不注册 `agent.open.before` 或 `agent.create.before`。

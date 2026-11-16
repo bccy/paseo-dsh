@@ -153,7 +153,7 @@ async function runPortMode() {
   const plugin = require(join(buildDir, "index.server.js")).default;
   const events = [];
   let registration;
-  plugin({ handle() {}, registerProvider(r) { registration = r; }, registerSettings() {}, on() {}, before() {} });
+  plugin({ handle() {}, registerProvider(r) { registration = r; }, registerSettings() {}, addHook() { return () => {}; }, before() {} });
   const conn = await registration.connect({ capabilities: ["prompt.message"] });
   conn.onEvent((event) => events.push(event));
   const openAt = Date.now();
@@ -219,7 +219,7 @@ const require = createRequire(import.meta.url);
 const plugin = require(${JSON.stringify(join(buildDir, "index.server.js"))}).default;
 const events = [];
 let registration;
-plugin({ handle() {}, registerProvider(r) { registration = r; }, registerSettings() {}, on() {}, before() {} });
+plugin({ handle() {}, registerProvider(r) { registration = r; }, registerSettings() {}, addHook() { return () => {}; }, before() {} });
 const step = (message) => process.stderr.write("OLD: " + message + "\\n");
 step("plugin loaded");
 const conn = await registration.connect({ capabilities: ["prompt.message"] });
@@ -396,7 +396,7 @@ const orphanPoll = orphanAliveAtKill
 const plugin = require(join(buildDir, "index.server.js")).default;
 const events = [];
 let registration;
-plugin({ handle() {}, registerProvider(r) { registration = r; }, registerSettings() {}, on() {}, before() {} });
+plugin({ handle() {}, registerProvider(r) { registration = r; }, registerSettings() {}, addHook() { return () => {}; }, before() {} });
 const conn = await registration.connect({ capabilities: ["prompt.message"] });
 conn.onEvent((event) => events.push(event));
 

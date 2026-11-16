@@ -100,7 +100,7 @@ plugin({
     registration = r;
   },
   registerSettings() {},
-  on() {},
+  addHook() { return () => {}; },
   before() {},
 });
 

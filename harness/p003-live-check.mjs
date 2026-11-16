@@ -10,7 +10,7 @@ const require = createRequire(join(profile.build,'index.server.js'));
 const {ProviderEventSchema}=require('@getpaseo/plugin/server/provider');
 let registration, conn;
 const events=[], schemaErrors=[];
-const cleanup=require(join(profile.build,'index.server.js')).default({handle(){},registerSettings(){},on(){},registerProvider(r){registration=r;}});
+const cleanup=require(join(profile.build,'index.server.js')).default({handle(){},registerSettings(){},addHook(){return ()=>{};},registerProvider(r){registration=r;}});
 let serial=0;
 async function send(input) {
   const start=events.length;

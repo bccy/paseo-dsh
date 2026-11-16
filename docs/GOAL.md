@@ -464,3 +464,14 @@ claim 后拒绝 / 落 surface 走正常路径 / close 清理）。
   `create_goal`）。
 - **不拦截运行中手打的 `/goal`**：它能正常触发（真机确认）；pill 走 RPC 只为不经 prompt 投递。
 - **不重写 goal 状态机**：CAS、revision、轮数上限、blocked 码全部由 DSH 维护，我们只读与转发。
+
+
+## Paseo 0.16.0 正式版适配
+
+目标仍由 DSH 持久状态和 activation 驱动，三个 pill 共用服务端订阅机制；新增的工作区徽标
+复用这些订阅快照，不新增目标读取或轮询。background helper 不被订阅层滤掉，只向徽标贡献
+运行态，避免隐藏 helper 产生警示或完成提醒。
+
+正式版宿主的完成通知按当前 turnId 取最后一段回复，可改善 goal 自主回合的通知；这不代表
+重开后的历史 turnId 丢失已修复。`agent.turn.after` 不再提供 timeline，当前捕获句柄的 hook
+不读取该字段。功能矩阵与尚需真机验证的项目见 [0.16 适配矩阵](PASEO-016-ADAPTATION.md)。

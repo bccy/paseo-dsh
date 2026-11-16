@@ -818,7 +818,7 @@ async function main() {
     );
     check(
       "the server captures the handle from allowed hooks only",
-      indexServer.includes('"agent.turn_started"') && indexServer.includes('"agent.turn_ended"'),
+      indexServer.includes('server.addHook(') && indexServer.includes('"agent.turn.before"') && indexServer.includes('"agent.turn.after"'),
       "capture hooks missing",
     );
     check(
