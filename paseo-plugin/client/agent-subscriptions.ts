@@ -274,10 +274,10 @@ export function createAgentSubscriptions<D, Answer>(
     }
   };
   /**
-   * Agents removed by an `agent_update` while a snapshot is still paginating.
-   * The same `agent_update` could be followed by a later page that still lists
-   * the agent; skipping tombstones keeps the removal from being undone by a page
-   * that was already in flight when it happened.
+   * Agent ids changed by a live update while a snapshot is still paginating.
+   * Later pages describe an older directory: they must neither undo a removal
+   * nor overwrite a live metadata/workspace change. Live upserts reconcile on
+   * their own and join `inflightListed`; a new snapshot clears this exclusion.
    */
   const tombstones = new Set<string>();
   let generation = 0;
@@ -563,6 +563,7 @@ export function createAgentSubscriptions<D, Answer>(
       // this the diff at the end of the snapshot would remove a pill the host
       // just told us about, for an agent that is still there.
       inflightListed?.add(agent.id);
+      if (inflightListed !== undefined) tombstones.add(agent.id);
       register(agent);
     },
 

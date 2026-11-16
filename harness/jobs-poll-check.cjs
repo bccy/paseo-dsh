@@ -514,6 +514,7 @@ async function runControllerChecks() {
     const calls = {
       added: [],
       updated: [],
+      updatedAgents: [],
       removed: [],
       states: [],
       errors: [],
@@ -547,6 +548,7 @@ async function runControllerChecks() {
       },
       updateAgent(agent) {
         calls.updated.push(agent.id);
+        calls.updatedAgents.push(agent);
       },
       removeAgent(agentId, reason, error) {
         // The real jobs pill drops both per-agent maps here (`createJobsProjection`'s
@@ -674,6 +676,53 @@ async function runControllerChecks() {
   // first page never get a pill until an unrelated agent_update happens to name
   // them.
   console.log("\nagent-directory snapshot pagination");
+  for (const change of [{ status: "closed" }, { provider: "another-provider" }, { workspaceId: null }]) {
+    let release;
+    const page = new Promise(resolve => { release = resolve; });
+    const h = createHarness({ listAgentPage: () => page });
+    await h.subscriptions.applySnapshot(snapshot(["a"]));
+    const oldStream = h.live.get("a");
+    const pending = h.subscriptions.applySnapshot({ entries: [], pageInfo: { hasMore: true, nextCursor: "parked" } });
+    h.subscriptions.upsert({ id: "a", workspaceId: "ws", ...change });
+    release(snapshot(["a"]));
+    await pending;
+    equal(`a stale page cannot revive an ineligible upsert ${JSON.stringify(change)}`, h.calls.added, ["a"]);
+    check("the old stream stays aborted after the stale page", oldStream.signal.aborted, true);
+    check("the stale page opens no replacement stream", h.live.has("a"), false);
+    await h.subscriptions.applySnapshot(snapshot(["a"]));
+    equal("a new snapshot can register the agent again", h.calls.added, ["a", "a"]);
+    h.subscriptions.dispose();
+  }
+  for (const droppedFirst of [false, true]) {
+    let release;
+    const page = new Promise(resolve => { release = resolve; });
+    const h = createHarness({ listAgentPage: () => page });
+    await h.subscriptions.applySnapshot(snapshot(["a"]));
+    const pending = h.subscriptions.applySnapshot({ entries: [], pageInfo: { hasMore: true, nextCursor: "parked" } });
+    if (droppedFirst) h.subscriptions.drop("a");
+    h.subscriptions.upsert({ id: "a", workspaceId: "new-workspace", metadata: { seen: "live-new" } });
+    const current = h.live.get("a");
+    release({ entries: [{ agent: { id: "a", workspaceId: "ws", metadata: { seen: "stale" } } }], pageInfo: { hasMore: false, nextCursor: null } });
+    await pending;
+    check(`live upsert survives a stale page (drop first=${droppedFirst})`, h.live.get("a"), current);
+    check("a stale page cannot roll the registration back to the old workspace", current.signal.aborted, false);
+    equal("only the intended workspace replacement is registered", h.calls.added, ["a", "a"]);
+    check("old metadata is never delivered to the new registration", h.calls.updatedAgents.some(agent => agent.metadata?.seen === "stale"), false);
+    h.subscriptions.dispose();
+  }
+  {
+    let release;
+    const page = new Promise(resolve => { release = resolve; });
+    const h = createHarness({ listAgentPage: () => page });
+    await h.subscriptions.applySnapshot(snapshot(["a"]));
+    const pending = h.subscriptions.applySnapshot({ entries: [], pageInfo: { hasMore: true, nextCursor: "parked" } });
+    h.subscriptions.upsert({ id: "a", workspaceId: "ws", metadata: { seen: "live-new" } });
+    release({ entries: [{ agent: { id: "a", workspaceId: "ws", metadata: { seen: "stale" } } }], pageInfo: { hasMore: false, nextCursor: null } });
+    await pending;
+    equal("a live metadata update wins over a later stale page", h.calls.updatedAgents.map(agent => agent.metadata?.seen), ["live-new"]);
+    check("metadata reconciliation keeps the live stream", h.live.has("a"), true);
+    h.subscriptions.dispose();
+  }
   {
     const pages = [];
     const harness = createHarness({
