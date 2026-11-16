@@ -588,7 +588,7 @@ console.log("\npill wiring (source pins)");
   // The deference coordinator was deleted on 2026-11-08: the host's composer
   // track scrolls horizontally (host v0.15.3), so every pill shows by its own
   // rule and nothing coordinates visibility across them.
-  assert("the team pill takes only the client", /export function contributeTeamPill\(client: PluginClientContext\)/.test(pill));
+  assert("the team pill takes the client and an optional stream observer", /export function contributeTeamPill\(client: PluginClientContext, observer\?: PillObserver<[^\n]+>\)/.test(pill));
   assert("the client entry passes no coordinator", !/deference|PillDeference|createPillDeference|pill-deference/.test(client));
   assert("the coordinator module is gone", !fs.existsSync(path.join(repo, "paseo-plugin/client/pill-deference.ts")));
   const clientDir = path.join(repo, "paseo-plugin/client");

@@ -48,6 +48,8 @@ export interface PillViewState<D> {
   available: boolean;
   error?: string;
   code?: string;
+  /** Actual composer visibility, supplied by a contribution observer adapter. */
+  visible?: boolean;
 }
 
 /**
@@ -66,6 +68,57 @@ export interface PillAgent {
   provider?: string;
   status?: string;
   metadata?: Readonly<Record<string, unknown>>;
+  /** Host creation policy; carried to observers without filtering the pill. */
+  background?: boolean;
+}
+
+/** Observe the existing pill stream; observers never own another read loop. */
+export interface PillObserver<D> {
+  agent(agent: PillAgent): void;
+  state(agentId: string, state: PillViewState<D>): void;
+  remove(agentId: string): void;
+}
+
+/**
+ * Join raw availability to the contribution's actual presentation. Keep failures
+ * even when goal/team deliberately retain their previous UI. `presented` also
+ * forwards metadata-only visibility changes without querying the daemon.
+ */
+export function createPillObserver<D>(
+  observer: PillObserver<D> | undefined,
+  visible: (agentId: string) => boolean,
+  onError: (error: unknown) => void,
+): { observer: PillObserver<D>; presented(agentId: string): void } {
+  const states = new Map<string, PillViewState<D>>();
+  const signatures = new Map<string, string>();
+  const safely = (work: () => void): void => {
+    try { work(); } catch (error) {
+      try { onError(error); } catch { /* diagnostics cannot break a pill */ }
+    }
+  };
+  const presented = (agentId: string): void => {
+    if (observer === undefined) return;
+    const state = states.get(agentId);
+    if (state === undefined) return;
+    const next = { ...state, visible: visible(agentId) };
+    const signature = JSON.stringify(next);
+    if (signatures.get(agentId) === signature) return;
+    safely(() => { observer.state(agentId, next); signatures.set(agentId, signature); });
+  };
+  return {
+    observer: {
+      agent: agent => safely(() => observer?.agent(agent)),
+      state(agentId, state) {
+        if (observer === undefined) return;
+        states.set(agentId, state); presented(agentId);
+      },
+      remove(agentId) {
+        states.delete(agentId); signatures.delete(agentId);
+        safely(() => observer?.remove(agentId));
+      },
+    },
+    presented,
+  };
 }
 
 /** One page of the agent directory, structurally. */
@@ -85,6 +138,7 @@ export type PillRemoveReason = "gone" | "unauthorized" | "terminal";
  * the React store, the composer registration and the locale.
  */
 export interface AgentSubscriptionHost<D, Answer> {
+  observer?: PillObserver<D>;
   /**
    * Watch one agent's snapshots until `signal` aborts.
    *
@@ -213,6 +267,12 @@ export function createAgentSubscriptions<D, Answer>(
   host: AgentSubscriptionHost<D, Answer>,
 ): AgentSubscriptions {
   const agents = new Map<string, Entry<D, Answer>>();
+  const observe = (work: (observer: PillObserver<D>) => void): void => {
+    if (host.observer === undefined) return;
+    try { work(host.observer); } catch (error) {
+      try { host.onError(`${host.pillLabel} observer failed`, error); } catch { /* isolated observer */ }
+    }
+  };
   /**
    * Agents removed by an `agent_update` while a snapshot is still paginating.
    * The same `agent_update` could be followed by a later page that still lists
@@ -277,7 +337,10 @@ export function createAgentSubscriptions<D, Answer>(
     if (reason !== "terminal") agents.delete(entry.agentId);
     entry.live = false;
     entry.controller.abort();
-    if (current) host.removeAgent(entry.agentId, reason, error);
+    if (current) {
+      observe(observer => observer.remove(entry.agentId));
+      host.removeAgent(entry.agentId, reason, error);
+    }
   };
 
   /**
@@ -307,6 +370,7 @@ export function createAgentSubscriptions<D, Answer>(
     try {
       if (!result.available) {
         const error = result.error ?? { message: host.fallbackErrorMessage };
+        observe(observer => observer.state(entry.agentId, failedState(entry, error)));
         if (host.isTerminalErrorCode(error.code)) {
           entry.terminal = true;
           remove(entry, "terminal", error);
@@ -317,6 +381,7 @@ export function createAgentSubscriptions<D, Answer>(
       }
       const data = result.data ?? host.initialData;
       entry.lastData = data;
+      observe(observer => observer.state(entry.agentId, { data, available: true }));
       publishIfChanged(entry, { data, available: true });
     } catch (error) {
       host.onError(`${host.pillLabel} could not publish one answer for ${entry.agentId}`, error);
@@ -351,7 +416,9 @@ export function createAgentSubscriptions<D, Answer>(
       error,
     );
     try {
-      publishTransient(entry, failedState(entry, error === undefined ? undefined : { message: error.message }));
+      const failed = failedState(entry, error === undefined ? undefined : { message: error.message });
+      observe(observer => observer.state(entry.agentId, failed));
+      publishTransient(entry, failed);
     } catch (publishError) {
       host.onError(`${host.pillLabel} could not publish the failed state for ${entry.agentId}`, publishError);
     }
@@ -393,7 +460,10 @@ export function createAgentSubscriptions<D, Answer>(
     }
     if (existing !== undefined) {
       existing.agent = agent;
-      if (!existing.terminal) host.updateAgent(agent);
+      if (!existing.terminal) {
+        observe(observer => observer.agent(agent));
+        host.updateAgent(agent);
+      }
       return;
     }
     const entry: Entry<D, Answer> = {
@@ -407,6 +477,7 @@ export function createAgentSubscriptions<D, Answer>(
       lastPublished: undefined,
     };
     agents.set(agent.id, entry);
+    observe(observer => observer.agent(agent));
     host.addAgent(agent);
     open(entry);
   };

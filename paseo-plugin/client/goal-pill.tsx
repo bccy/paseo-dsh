@@ -61,7 +61,7 @@ import {
   type GoalState,
 } from "../shared/goal";
 import { GOAL_SEEN_METADATA_KEY } from "../shared/pill-metadata";
-import { createAgentSubscriptions } from "./agent-subscriptions";
+import { createAgentSubscriptions, createPillObserver, type PillObserver } from "./agent-subscriptions";
 import { CornerRingIcon } from "./corner-ring";
 import { GoalPopoverBody } from "./goal-popover";
 import { useAgent, useGoalRunningMark } from "./goal-running";
@@ -387,7 +387,7 @@ const AGENT_DIRECTORY_PAGE_SIZE = 200;
  * cannot see — the React store the popover reads, the composer registration, the
  * subscription call itself, and the locale.
  */
-export function contributeGoalPill(client: PluginClientContext) {
+export function contributeGoalPill(client: PluginClientContext, observer?: PillObserver<GoalState | null>) {
   const store: GoalStore = new Map();
   /** agentId -> the composer registration. */
   const pills = new Map<string, PluginButtonRegistration>();
@@ -396,6 +396,10 @@ export function contributeGoalPill(client: PluginClientContext) {
   /** agentId -> what the host was last told; an unchanged poll publishes nothing. */
   const published = new Map<string, { visible: boolean; label: string; title: string }>();
   const lifetime = new AbortController();
+  const observation = createPillObserver(observer,
+    agentId => published.get(agentId)?.visible === true,
+    error => console.error("[dsh-paseo] goal pill observer failed", error),
+  );
 
   /**
    * UI-v7 "seen" (2026-11-11): the completed goal the user closed a panel on is
@@ -455,6 +459,7 @@ export function contributeGoalPill(client: PluginClientContext) {
     }
     registration.update({ visible: presentation.visible, label, title });
     published.set(agentId, { visible: presentation.visible, label, title });
+    observation.presented(agentId);
   };
 
   /** Feed one event to an agent's "seen" machine; re-present when it changed visibility. */
@@ -484,6 +489,7 @@ export function contributeGoalPill(client: PluginClientContext) {
   };
 
   const subscriptions = createAgentSubscriptions<GoalState | null, GoalAnswer>({
+    observer: observation.observer,
     /**
      * Watch this agent's goal snapshots.
      *

@@ -41,7 +41,7 @@ import type {
 import { useEffect, useRef, useState } from "react";
 import { teamSnapshot, isTerminalTeamErrorCode, type TeamAnswer, type TeamView } from "../shared/team";
 import { TEAM_SEEN_METADATA_KEY } from "../shared/pill-metadata";
-import { createAgentSubscriptions } from "./agent-subscriptions";
+import { createAgentSubscriptions, createPillObserver, type PillObserver } from "./agent-subscriptions";
 import { localeText } from "./locale";
 import { CornerRingIcon } from "./corner-ring";
 import { createSeenCloseGate } from "./seen-close-gate";
@@ -163,10 +163,14 @@ interface PillEntry {
 }
 
 /** Register one team pill per agent of this provider and keep it current. Returns the cleanup. */
-export function contributeTeamPill(client: PluginClientContext) {
+export function contributeTeamPill(client: PluginClientContext, observer?: PillObserver<TeamView | null>) {
   const store: TeamStore = new Map();
   const pills = new Map<string, PillEntry>();
   const lifetime = new AbortController();
+  const observation = createPillObserver(observer,
+    agentId => pills.get(agentId)?.visible === true,
+    error => console.error("[dsh-paseo] team pill observer failed", error),
+  );
 
   /**
    * UI-v7 "seen" (2026-11-11): the all-done board the user closed a panel on is
@@ -221,6 +225,7 @@ export function contributeTeamPill(client: PluginClientContext) {
     entry.icon = icon;
     entry.label = text.title;
     entry.title = text.title;
+    observation.presented(agentId);
   };
 
   /** Feed one event to an agent's "seen" machine; re-present when it changed. */
@@ -241,6 +246,7 @@ export function contributeTeamPill(client: PluginClientContext) {
   };
 
   const subscriptions = createAgentSubscriptions<TeamView | null, TeamAnswer>({
+    observer: observation.observer,
     /**
      * Watch this agent's team-board snapshots.
      *

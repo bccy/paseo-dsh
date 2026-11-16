@@ -741,10 +741,10 @@ console.log("\nthe goal and the jobs are two separate composer pills");
     !/deference|PillDeference|createPillDeference|pill-deference/.test(index));
   assert("…and the coordinator module is gone",
     !fs.existsSync(path.join(repoRoot, "paseo-plugin/client/pill-deference.ts")));
-  assert("the goal pill takes only the client", /export function contributeGoalPill\(client: PluginClientContext\)/.test(pill));
-  assert("the jobs pill takes only the client", /export function contributeJobsPill\(client: PluginClientContext\)/.test(jobs));
-  assert("the team pill takes only the client",
-    /export function contributeTeamPill\(client: PluginClientContext\)/.test(code(readRepo("paseo-plugin/client/team-pill.tsx"))));
+  assert("the goal pill takes the client and an optional stream observer", /export function contributeGoalPill\(client: PluginClientContext, observer\?: PillObserver<[^\n]+>\)/.test(pill));
+  assert("the jobs pill takes the client and an optional stream observer", /export function contributeJobsPill\(client: PluginClientContext, observer\?: PillObserver<[^\n]+>\)/.test(jobs));
+  assert("the team pill takes the client and an optional stream observer",
+    /export function contributeTeamPill\(client: PluginClientContext, observer\?: PillObserver<[^\n]+>\)/.test(code(readRepo("paseo-plugin/client/team-pill.tsx"))));
   // Assembled from fragments so a repo-wide grep for the withdrawn names finds
   // nothing in this file either (the pin itself is not a use).
   const gj = ["goal", "jobs"].join("-");

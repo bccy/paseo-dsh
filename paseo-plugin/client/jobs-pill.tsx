@@ -44,7 +44,7 @@ import {
   type PressableStateCallbackType,
 } from "react-native";
 import { jobsSnapshot, jobsStop, splitJobs, type Job, type JobsAnswer } from "../shared/jobs";
-import { createAgentSubscriptions } from "./agent-subscriptions";
+import { createAgentSubscriptions, createPillObserver, type PillObserver } from "./agent-subscriptions";
 import {
   JOB_STOP_BOX,
   JOB_STOP_GLYPH,
@@ -775,11 +775,15 @@ const AGENT_DIRECTORY_PAGE_SIZE = 200;
  * cannot see — the React store the popover reads, the composer registration, the
  * subscription call itself, and the locale.
  */
-export function contributeJobsPill(client: PluginClientContext) {
+export function contributeJobsPill(client: PluginClientContext, observer?: PillObserver<readonly Job[]>) {
   const store: JobStore = new Map();
   /** agentId -> the composer registration and its last published state. */
   const pills = new Map<string, PillEntry>();
   const lifetime = new AbortController();
+  const observation = createPillObserver(observer,
+    agentId => pills.get(agentId)?.visible === true,
+    error => console.error("[dsh-paseo] jobs pill observer failed", error),
+  );
 
   /**
    * One console line per transition, never per answer: a failing host must not
@@ -844,6 +848,7 @@ export function contributeJobsPill(client: PluginClientContext) {
     entry.label = label;
     entry.title = text.title;
     entry.icon = presentation.icon;
+    observation.presented(agentId);
   };
 
   /**
@@ -863,6 +868,7 @@ export function contributeJobsPill(client: PluginClientContext) {
   };
 
   const subscriptions = createAgentSubscriptions<readonly Job[], JobsAnswer>({
+    observer: observation.observer,
     /**
      * Watch this agent's snapshots.
      *

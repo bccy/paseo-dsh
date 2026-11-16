@@ -122,6 +122,47 @@ async function main() {
     check(`${kind}: duplicate after success stays deduplicated`, h.registrations[0].updates.length, 1);
     h.cleanup();
   }
+  for (const kind of ["goal", "team", "jobs"]) {
+    const observed = { agents: [], states: [], removed: [] };
+    const h = makeHost(kind, {
+      agent: agent => observed.agents.push(agent),
+      state: (id, state) => observed.states.push({ id, ...state }),
+      remove: id => observed.removed.push(id),
+    });
+    await flush(); h.snapshot();
+    check(`${kind}: observer sees background without hiding it`, observed.agents[0].background, true);
+    const item = kind === "jobs" ? [{ id: "job-observed", status: "running", description: "live", createdAt: 1 }] : value(kind, "observed");
+    h.push({ available: true, [kind]: item });
+    check(`${kind}: observer sees successful payload`, observed.states.at(-1).data, item);
+    check(`${kind}: observer sees actual visibility after presentation`, observed.states.at(-1).visible, true);
+    h.push({ available: false, error: { code: "rpc_failed", message: "temporarily unavailable" } });
+    check(`${kind}: observer sees unavailable despite retained UI`, observed.states.at(-1).available, false);
+    check(`${kind}: observer preserves known payload on failure`, observed.states.at(-1).data, item);
+    check(`${kind}: transient read leaves UI visible`, h.current.visible, true);
+    if (kind !== "jobs") {
+      h.upsert({ [`dsh.${kind}Seen`]: key(kind, item) });
+      check(`${kind}: metadata-only close reaches observer`, observed.states.at(-1).visible, false);
+      check(`${kind}: metadata-only close retains failure fact`, observed.states.at(-1).available, false);
+      const next = value(kind, "observed-new"); h.push(answer(kind, next));
+      h.closePanel(); await flush();
+      check(`${kind}: confirmed panel close reaches observer`, observed.states.at(-1).visible, false);
+      check(`${kind}: recovered answer restores availability`, observed.states.at(-1).available, true);
+    }
+    check(`${kind}: observer adds no subscription`, h.streams.length, 1);
+    h.cleanup();
+    check(`${kind}: cleanup removes observer state`, observed.removed, ["agent-a"]);
+  }
+  {
+    const h = makeHost("goal", {
+      agent() { throw new Error("observer agent failure"); },
+      state() { throw new Error("observer state failure"); },
+      remove() { throw new Error("observer removal failure"); },
+    });
+    await flush(); h.snapshot(); h.push(answer("goal", goal("observer-throws")));
+    check("an observer failure cannot stop the pill", h.current.visible, true);
+    h.cleanup();
+    check("an observer failure cannot stop cleanup", h.streams[0].options.signal.aborted, true);
+  }
   console.log(`${checks} contribution checks passed`);
 }
 main().catch(error => { console.error(error.stack); process.exitCode = 1; });
