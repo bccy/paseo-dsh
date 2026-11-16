@@ -740,6 +740,9 @@ console.log('shared-process lifecycle (behaviour, not source text)');
     async start() {
       this.started = true;
     }
+    async pinRoute(route) {
+      this.pinnedRoute = route;
+    }
     async shutdown() {
       this.shutdownCalled = true;
       this.running = false;
@@ -1126,7 +1129,11 @@ console.log('shared-process lifecycle (behaviour, not source text)');
         config: { cwd: '/work', mode: 'build' },
         history: 'skip',
       });
-      await waitFor(() => providerEvents.some((event) => event.type === 'session.ready'), 5000);
+      await waitFor(() => providerEvents.some((event) => event.type === 'session.ready'
+        || event.type === 'request.failed'), 5000);
+      check('shared open reports no request failure',
+        !providerEvents.some((event) => event.type === 'request.failed'),
+        JSON.stringify(providerEvents.filter((event) => event.type === 'request.failed')));
       // The provider spawns exactly one **shared** child (under its own sentinel id)
       // plus a short-lived `catalog-probe` for the catalog read. The session does not
       // get a process of its own — that is the change — so the claim is that it
@@ -1137,6 +1144,10 @@ console.log('shared-process lifecycle (behaviour, not source text)');
       const probeSpawns = spawned.filter(
         (process) => process.options?.sessionId === 'catalog-probe',
       ).length;
+      check('the shared process pins the session route before attach',
+        sharedProcess?.pinnedRoute !== undefined
+          && JSON.stringify(sharedProcess.pinnedRoute) === JSON.stringify(sharedProcess.attached.get('revert-pool-1')?.options.route),
+        JSON.stringify(sharedProcess?.pinnedRoute));
       check(
         'a provider session attaches to the one shared child',
         sharedProcess !== undefined &&

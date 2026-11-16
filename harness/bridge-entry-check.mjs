@@ -158,6 +158,7 @@ const scopes = new Map();
 const effectDisposers = [];
 /** Event listeners the entry registers with `ctx.on`, keyed by event name. */
 const eventHandlers = new Map();
+const shellResolvers = [];
 /** Deliver one event the way the DSH context would, to every live listener. */
 const emit = (event, ...args) => {
   for (const handler of [...(eventHandlers.get(event) ?? [])]) handler(...args);
@@ -181,6 +182,7 @@ const ctx = {
       const handlers = new Map();
       scopes.set(name, handlers);
       callback({
+        ...(name === 'shellEnv' ? { shellEnv: { register: (resolver) => shellResolvers.push(resolver) } } : {}),
         on(event, handler) {
           handlers.set(event, handler);
           return () => handlers.delete(event);
@@ -205,6 +207,10 @@ try {
   applyError = error;
 }
 check('the real bridge entry loads and registers its hooks', applyError === undefined, applyError?.message);
+check('the bridge registers its per-execution identity resolver',
+  shellResolvers.length === 1 && shellResolvers[0].name === 'paseo-identity'
+    && typeof shellResolvers[0].resolve === 'function'
+    && Object.keys(shellResolvers[0].variables).length === 3);
 
 const fsHandlers = scopes.get('fs');
 const toolsHandlers = scopes.get('tools');
