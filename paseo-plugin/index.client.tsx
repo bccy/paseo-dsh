@@ -22,6 +22,8 @@ import { InlineThinking } from "./client/inline-thinking";
 import { contributeJobsPill } from "./client/jobs-pill";
 import { contributeStreamStats } from "./client/stream-stats";
 import { contributeTeamPill } from "./client/team-pill";
+import { createWorkspaceStatusStore } from "./client/workspace-status";
+import { contributeWorkspaceBadges } from "./client/workspace-badges";
 import { localeFromMetadata, setLocale } from "./client/locale";
 import { RewindNotice } from "./client/rewind-notice";
 import {
@@ -291,11 +293,14 @@ export default function contribute(client: PluginClientContext) {
   // The team pill is the third. The composer track scrolls horizontally
   // (host v0.15.3), so all three may be visible together and each decides its
   // own visibility — no cross-pill coordination.
+  const workspaceStatus = createWorkspaceStatusStore();
   const cleanups = [
     contributeStreamStats(client),
-    contributeJobsPill(client),
-    contributeGoalPill(client),
-    contributeTeamPill(client),
+    contributeJobsPill(client, workspaceStatus.observer("jobs")),
+    contributeGoalPill(client, workspaceStatus.observer("goal")),
+    contributeTeamPill(client, workspaceStatus.observer("team")),
+    contributeWorkspaceBadges(client, workspaceStatus),
+    () => workspaceStatus.dispose(),
   ];
 
   // The live witness behind the capsule: a per-agent timeline subscription

@@ -734,9 +734,9 @@ console.log("\nthe goal and the jobs are two separate composer pills");
     /if \(pills\.get\(agent\.id\) !== registration\) return;/.test(pill),
   );
   assert("the client entry contributes the three pills on their own",
-    /contributeJobsPill\(client\),/.test(index) &&
-      /contributeGoalPill\(client\),/.test(index) &&
-      /contributeTeamPill\(client\),/.test(index));
+    /contributeJobsPill\(client,\s*workspaceStatus\.observer\("jobs"\)\),/.test(index) &&
+      /contributeGoalPill\(client,\s*workspaceStatus\.observer\("goal"\)\),/.test(index) &&
+      /contributeTeamPill\(client,\s*workspaceStatus\.observer\("team"\)\),/.test(index));
   assert("…with no deference reference left",
     !/deference|PillDeference|createPillDeference|pill-deference/.test(index));
   assert("…and the coordinator module is gone",

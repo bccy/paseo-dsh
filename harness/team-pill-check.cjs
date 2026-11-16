@@ -583,8 +583,8 @@ console.log("\npill wiring (source pins)");
   equal("zh title", ZH.title, "团队");
   equal("en title", EN.title, "Team");
   const client = fs.readFileSync(path.join(repo, "paseo-plugin/index.client.tsx"), "utf8");
-  assert("the client registers the team pill", /contributeTeamPill\(client\)/.test(client));
-  assert("the jobs and goal pills are still registered", /contributeJobsPill\(client\)/.test(client) && /contributeGoalPill\(client\)/.test(client));
+  assert("the client registers the team pill", /contributeTeamPill\(client,\s*workspaceStatus\.observer\("team"\)\)/.test(client));
+  assert("the jobs and goal pills are still registered", /contributeJobsPill\(client,\s*workspaceStatus\.observer\("jobs"\)\)/.test(client) && /contributeGoalPill\(client,\s*workspaceStatus\.observer\("goal"\)\)/.test(client));
   // The deference coordinator was deleted on 2026-11-08: the host's composer
   // track scrolls horizontally (host v0.15.3), so every pill shows by its own
   // rule and nothing coordinates visibility across them.

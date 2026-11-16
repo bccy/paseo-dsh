@@ -105,7 +105,20 @@ export interface BodyLabels {
 }
 
 /** Everything the client renders that is language-dependent. */
+export interface WorkspaceBadgeText {
+  goal: string;
+  team: string;
+  jobs: string;
+  states: Record<"danger" | "warning" | "success" | "info", string>;
+  count: (count: number, state: string) => string;
+  separator: string;
+  unavailable: string;
+  readFailure: string;
+}
+
 export interface UiText {
+  /** Native workspace-row summaries of the existing pill streams. */
+  workspaceBadge: WorkspaceBadgeText;
   /** Row label per DSH tool name (`tool.title.*`), falling back to the wire name. */
   toolLabels: Record<string, string>;
   /** Row label per Paseo MCP tool, keyed by the bare name after `mcp__paseo__`. */
@@ -735,6 +748,12 @@ export function teamToolErrorDisplay(raw: string, text: TeamText): { message: st
 
 const TEXT: Record<Locale, UiText> = {
   en: {
+    workspaceBadge: {
+      goal: "Goal", team: "Team", jobs: "Background", readFailure: "state unreadable",
+      states: { danger: "execution failed", warning: "waiting for attention", success: "complete and unread", info: "running" },
+      count: (count, state) => `${count} ${state}`, separator: "; ",
+      unavailable: "Workspace badges need Paseo app 0.16.0 or later; this app has no workspace badge API.",
+    },
     toolLabels: {
       bash: "Bash",
       pwsh: "Pwsh",
@@ -1263,6 +1282,12 @@ const TEXT: Record<Locale, UiText> = {
     },
   },
   "zh-CN": {
+    workspaceBadge: {
+      goal: "目标", team: "团队", jobs: "后台", readFailure: "状态读取失败",
+      states: { danger: "执行失败", warning: "待处理", success: "已完成未读", info: "运行中" },
+      count: (count, state) => `${count} 项${state}`, separator: "；",
+      unavailable: "工作区徽标需要 Paseo 应用 0.16.0 或更新版本；当前应用没有工作区徽标 API。",
+    },
     toolLabels: {
       bash: "运行命令",
       pwsh: "运行命令",
