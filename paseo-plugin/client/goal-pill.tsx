@@ -75,7 +75,6 @@ import {
   goalPillPresentation,
   projectGoalAnswer,
   type GoalCompleteEvent,
-  type GoalSeenState,
   type GoalTone,
   type GoalViewState,
 } from "./goal-polling";
@@ -392,14 +391,6 @@ export function contributeGoalPill(client: PluginClientContext) {
   const store: GoalStore = new Map();
   /** agentId -> the composer registration. */
   const pills = new Map<string, PluginButtonRegistration>();
-  /**
-   * agentId -> the completed goal's in-session "seen" progress (UI-v7). The
-   * remembered key is also stored on the agent (`../shared/pill-metadata`), so an
-   * app restart or a plugin reload no longer forgets it; this map only carries the
-   * closes of this session, and `seen` is the fallback for everything the agent's
-   * metadata remembers.
-   */
-  const seenStates = new Map<string, GoalSeenState>();
   /** agentId -> the last pushed answer, to re-present it when only "seen" changed. */
   const answers = new Map<string, GoalViewState>();
   /** agentId -> what the host was last told; an unchanged poll publishes nothing. */
@@ -441,7 +432,7 @@ export function contributeGoalPill(client: PluginClientContext) {
     const registration = pills.get(agentId);
     const next = answers.get(agentId);
     if (registration === undefined || next === undefined) return;
-    const remembered = seenStates.get(agentId)?.seen ?? seen.get(agentId);
+    const remembered = seen.get(agentId);
     publish(store, agentId, {
       goal: next.goal,
       available: next.available,
@@ -471,9 +462,8 @@ export function contributeGoalPill(client: PluginClientContext) {
     // No pill, nothing to hide: a close the gate still owed a removed agent must
     // not leave a seen state behind for a later re-add.
     if (pills.get(agentId) === undefined) return;
-    const before = seenStates.get(agentId) ?? {};
+    const before = { seen: seen.get(agentId) };
     const after = goalCompleteSeenStep(before, event);
-    seenStates.set(agentId, after);
     if (after.seen !== before.seen) {
       // The only write path in this file: a **confirmed panel close** (the
       // gate's `closed` event, the only event the machine advances on) changed
@@ -567,12 +557,10 @@ export function contributeGoalPill(client: PluginClientContext) {
       published.set(agent.id, { visible: false, label: text.title, title: text.title });
       store.delete(agent.id);
       answers.delete(agent.id);
-      // A re-added agent starts with no **in-session** seen state: the close
-      // that hid the previous pill belonged to that registration. The persisted
-      // key keeps applying (2026-11-09) — it names the exact completed revision
-      // the user really closed (`goal-<uuid>:revision`), so it cannot hide a goal
-      // the user has not been shown.
-      seenStates.delete(agent.id);
+      // The metadata store owns both pending local closes and confirmed remote
+      // signatures. Keeping one source lets a newer remote close replace an old
+      // local one without forgetting a failed write during this client lifetime.
+
     },
     updateAgent: (agent) => {
       // The "seen" key of this agent changed — this session's own close echoed
@@ -590,8 +578,7 @@ export function contributeGoalPill(client: PluginClientContext) {
       entry.remove();
       answers.delete(agentId);
       published.delete(agentId);
-      seenStates.delete(agentId);
-      // The **in-session** memory goes; the persisted one stays (2026-11-09).
+      // The metadata store survives removal (2026-11-09).
       // A "seen" key is `id:revision` — DSH mints a fresh `goal-<uuid>` per
       // created goal (`dsh-goal/lib/index.js`), so a remembered key can only
       // hide the exact completed revision the user closed. Erasing it on every

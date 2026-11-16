@@ -53,7 +53,6 @@ import {
   teamPillVisible,
   type TeamPillIcon,
   type TeamSeenEvent,
-  type TeamSeenState,
 } from "./team-polling";
 import { TeamPanel, TeamPanelNote } from "./team-popover";
 
@@ -167,15 +166,6 @@ interface PillEntry {
 export function contributeTeamPill(client: PluginClientContext) {
   const store: TeamStore = new Map();
   const pills = new Map<string, PillEntry>();
-  /**
-   * agentId -> the all-done board's in-session "seen" progress (UI-v7). The
-   * remembered key is also persisted as agent metadata (`shared/pill-metadata.ts`
-   * → `dsh.teamSeen`, written through `client/seen-metadata.ts`), so an app
-   * restart or a plugin reload no longer forgets it; this map only carries the
-   * closes of this session, and `seen` is the fallback for everything the agent's
-   * metadata remembers.
-   */
-  const seenStates = new Map<string, TeamSeenState>();
   const lifetime = new AbortController();
 
   /**
@@ -219,7 +209,7 @@ export function contributeTeamPill(client: PluginClientContext) {
     const entry = pills.get(agentId);
     if (entry === undefined) return;
     const team = store.get(agentId)?.team ?? null;
-    const remembered = seenStates.get(agentId)?.seen ?? seen.get(agentId);
+    const remembered = seen.get(agentId);
     const text = localeText().team;
     const visible = teamPillVisible(team, remembered);
     const icon = team === null ? "idle" : teamPillIcon(team);
@@ -238,9 +228,8 @@ export function contributeTeamPill(client: PluginClientContext) {
     // No pill, nothing to hide: a close the gate still owed a removed agent must
     // not leave a seen state behind for a later re-add.
     if (pills.get(agentId) === undefined) return;
-    const before = seenStates.get(agentId) ?? {};
+    const before = { seen: seen.get(agentId) };
     const after = teamCompleteSeenStep(before, event);
-    seenStates.set(agentId, after);
     if (after.seen !== before.seen) {
       // The only write path in this file: a **confirmed panel close** (the
       // gate's `closed` event, the only event the machine advances on) changed
@@ -307,12 +296,9 @@ export function contributeTeamPill(client: PluginClientContext) {
         },
       });
       pills.set(agent.id, { registration, icon: "idle", visible: false, label: text.title, title: text.title });
-      // A re-added agent starts with no **in-session** seen state: the close
-      // that hid the previous pill belonged to that registration. The persisted
-      // key keeps applying (2026-11-09) — within this agent's journal it names
-      // the all-done board the user really closed, so it cannot hide a board the
-      // user has not been shown.
-      seenStates.delete(agent.id);
+      // The metadata store owns both pending local closes and confirmed remote
+      // signatures. Keeping one source lets a newer remote close replace an old
+      // local one without forgetting a failed write during this client lifetime.
       store.delete(agent.id);
     },
     updateAgent: (agent) => {
@@ -329,9 +315,7 @@ export function contributeTeamPill(client: PluginClientContext) {
       if (entry === undefined) return;
       pills.delete(agentId);
       entry.registration.remove();
-      seenStates.delete(agentId);
-      // The **in-session** memory goes; the persisted one stays (2026-11-09, the
-      // same rule as the goal pill). Within this agent's journal the key (the
+      // The metadata store survives removal (the same rule as the goal pill). Within this agent's journal the key (the
       // all-done board's `id:revision` set) names the board the user closed, and
       // only that board is hidden; erasing the key on every removal only made a
       // reconnect / permission retry / terminal recovery show a board already
