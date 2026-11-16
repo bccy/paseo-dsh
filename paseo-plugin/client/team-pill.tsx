@@ -48,6 +48,7 @@ import { createSeenCloseGate } from "./seen-close-gate";
 import { createSeenMetadataStore } from "./seen-metadata";
 import {
   projectTeamAnswer,
+  teamAllDoneKey,
   teamCompleteSeenStep,
   teamPillIcon,
   teamPillVisible,
@@ -213,7 +214,8 @@ export function contributeTeamPill(client: PluginClientContext, observer?: PillO
     const entry = pills.get(agentId);
     if (entry === undefined) return;
     const team = store.get(agentId)?.team ?? null;
-    const remembered = seen.get(agentId);
+    const currentKey = team === null ? undefined : teamAllDoneKey(team);
+    const remembered = currentKey !== undefined && seen.hasSeen(agentId, currentKey) ? currentKey : undefined;
     const text = localeText().team;
     const visible = teamPillVisible(team, remembered);
     const icon = team === null ? "idle" : teamPillIcon(team);
@@ -233,9 +235,8 @@ export function contributeTeamPill(client: PluginClientContext, observer?: PillO
     // No pill, nothing to hide: a close the gate still owed a removed agent must
     // not leave a seen state behind for a later re-add.
     if (pills.get(agentId) === undefined) return;
-    const before = { seen: seen.get(agentId) };
-    const after = teamCompleteSeenStep(before, event);
-    if (after.seen !== before.seen) {
+    const after = teamCompleteSeenStep({}, event);
+    if (after.seen !== undefined && !seen.hasSeen(agentId, after.seen)) {
       // The only write path in this file: a **confirmed panel close** (the
       // gate's `closed` event, the only event the machine advances on) changed
       // the remembered all-done signature. Polls and agent status events are

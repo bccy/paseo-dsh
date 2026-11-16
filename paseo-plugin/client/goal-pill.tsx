@@ -73,6 +73,7 @@ import {
   goalPillCopy,
   goalPanelNext,
   goalPillPresentation,
+  goalSeenKey,
   projectGoalAnswer,
   type GoalCompleteEvent,
   type GoalTone,
@@ -436,7 +437,8 @@ export function contributeGoalPill(client: PluginClientContext, observer?: PillO
     const registration = pills.get(agentId);
     const next = answers.get(agentId);
     if (registration === undefined || next === undefined) return;
-    const remembered = seen.get(agentId);
+    const currentKey = next.goal === null ? undefined : goalSeenKey(next.goal);
+    const remembered = currentKey !== undefined && seen.hasSeen(agentId, currentKey) ? currentKey : undefined;
     publish(store, agentId, {
       goal: next.goal,
       available: next.available,
@@ -467,9 +469,8 @@ export function contributeGoalPill(client: PluginClientContext, observer?: PillO
     // No pill, nothing to hide: a close the gate still owed a removed agent must
     // not leave a seen state behind for a later re-add.
     if (pills.get(agentId) === undefined) return;
-    const before = { seen: seen.get(agentId) };
-    const after = goalCompleteSeenStep(before, event);
-    if (after.seen !== before.seen) {
+    const after = goalCompleteSeenStep({}, event);
+    if (after.seen !== undefined && !seen.hasSeen(agentId, after.seen)) {
       // The only write path in this file: a **confirmed panel close** (the
       // gate's `closed` event, the only event the machine advances on) changed
       // the remembered completed-goal key. Polls and agent status events are

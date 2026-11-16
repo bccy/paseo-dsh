@@ -1034,6 +1034,10 @@ async function seenMetadataChecks() {
     await store.flush();
     equal("a stale snapshot does not change the visible answer", store.observe({ id: "a", metadata: { [GOAL_SEEN_METADATA_KEY]: "goal-1:1" } }), false);
     equal("…and the pending close wins", store.get("a"), "goal-1:2");
+    equal("a different stored close is noticed while the local echo is missing", store.observe({ id: "a", metadata: { [GOAL_SEEN_METADATA_KEY]: "goal-remote:1" } }), true);
+    equal("the local close remains a matching candidate", store.hasSeen("a", "goal-1:2"), true);
+    equal("the remote close is also a matching candidate", store.hasSeen("a", "goal-remote:1"), true);
+    equal("neither candidate hides a new completion", store.hasSeen("a", "goal-unseen:1"), false);
     store.dispose();
   }
 
@@ -1085,7 +1089,7 @@ async function seenMetadataChecks() {
       (goalPill.match(/seen\.remember\(/g) ?? []).length === 1,
       String((goalPill.match(/seen\.remember\(/g) ?? []).length),
     );
-    assert("the goal pill reads its key through the store", /seen\.get\(agentId\)/.test(goalPill));
+    assert("the goal pill matches the current key through the store", /seen\.hasSeen\(agentId, currentKey\)/.test(goalPill));
     assert("the metadata write targets the agent record", /client\.paseo\.agents\.ref\(agentId\)\.setMetadata\(\{ \[GOAL_SEEN_METADATA_KEY\]/.test(goalPill));
     assert("the pill no longer talks to plugin settings", !/settingsRpc|registerSettings/.test(goalPill));
     // The controller and the presentation module never write: the close is the

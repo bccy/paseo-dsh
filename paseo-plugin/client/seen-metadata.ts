@@ -59,8 +59,10 @@ export interface SeenMetadataStore {
    * @returns whether the remembered answer changed (the pill then re-presents).
    */
   observe(agent: { readonly id: string; readonly metadata?: Readonly<Record<string, unknown>> }): boolean;
-  /** The signature this pill should hide for one agent, if any. */
+  /** Representative local-first key; use `hasSeen` to test a particular state. */
   get(agentId: string): string | undefined;
+  /** Whether this exact state was closed locally or arrived as stored metadata. */
+  hasSeen(agentId: string, signature: string): boolean;
   /** Remember one confirmed close: in memory now, on the agent right after. Never rejects. */
   remember(agentId: string, signature: string): void;
   /** Await every scheduled write (tests and teardown only). */
@@ -81,10 +83,10 @@ export function createSeenMetadataStore(io: SeenMetadataIo, key: string): SeenMe
   /**
    * Confirmed closes whose metadata write has not been echoed back yet.
    *
-   * They are also the freshest answer for `get`: the daemon emits an
-   * `agent_update` carrying the new metadata after a write, and until it lands
-   * (or if it never does — a refused write) the local close is still the truth
-   * for this session.
+   * The daemon echoes the write as an `agent_update`, but a disconnect can lose
+   * that echo even after the write succeeded. This local fact and a different
+   * stored signature are both evidence of a confirmed close; neither has a
+   * sequence number that could justify discarding the other.
    */
   const pending = new Map<string, string>();
   let disposed = false;
@@ -120,25 +122,31 @@ export function createSeenMetadataStore(io: SeenMetadataIo, key: string): SeenMe
   const enqueueWrite = (agentId: string, signature: string): void => {
     writes = writes.then(() => persist(agentId, signature)).catch(() => undefined);
   };
+  // Bounded to the current local and stored keys, not a history of every close.
+  // A later snapshot may replace the stored key; metadata carries no ordering
+  // token with which to reconstruct arbitrary out-of-order remote history.
+  const candidates = (agentId: string): string => JSON.stringify(
+    [...new Set([pending.get(agentId), stored.get(agentId)].filter(value => value !== undefined))].sort(),
+  );
 
   return {
     observe(agent): boolean {
       if (disposed) return false;
       const seen = seenFromMetadata(agent.metadata, key);
-      // The comparison is against what the pill would hide with — a pending
-      // confirmed close wins over the snapshot — not against `stored` alone:
-      // the echo of this client's own write lands in `stored` a moment later and
-      // must not look like a visible change (it would re-present a pill for
-      // nothing).
-      const before = pending.get(agent.id) ?? stored.get(agent.id);
+      // Compare the effective candidates, not the priority of one slot. The
+      // echo moving the same key from pending to stored remains a no-op; a new
+      // remote key must notify the pill even while another local echo is lost.
+      const before = candidates(agent.id);
       if (seen === undefined) stored.delete(agent.id);
       else stored.set(agent.id, seen);
       if (seen !== undefined && pending.get(agent.id) === seen) pending.delete(agent.id);
-      const after = pending.get(agent.id) ?? stored.get(agent.id);
-      return before !== after;
+      return before !== candidates(agent.id);
     },
     get(agentId: string): string | undefined {
       return pending.get(agentId) ?? stored.get(agentId);
+    },
+    hasSeen(agentId: string, signature: string): boolean {
+      return pending.get(agentId) === signature || stored.get(agentId) === signature;
     },
     remember(agentId: string, signature: string): void {
       if (agentId === "" || signature === "" || disposed) return;

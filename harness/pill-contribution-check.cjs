@@ -45,7 +45,7 @@ const check = (label, actual, expected) => { checks++; assert.deepEqual(actual, 
 const flush = async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); };
 function makeHost(kind, observer) {
   const registrations = [], streams = [], writes = [], errors = [];
-  let directory, failUpdate = false;
+  let directory, failUpdate = false, failWrite = false;
   const client = {
     addComposerPill(input) {
       const registration = { input, current: { ...input.button }, updates: [], removed: false,
@@ -56,7 +56,7 @@ function makeHost(kind, observer) {
     subscribe(contract, input, onAnswer, options) { streams.push({ contract, input, onAnswer, options }); return { ready: Promise.resolve() }; },
     paseo: { agents: {
       list: async () => ({ subscription: { subscribe: value => { directory = value; } } }),
-      ref: id => ({ setMetadata: async patch => { writes.push({ id, patch }); } }),
+      ref: id => ({ setMetadata: async patch => { if (failWrite) throw new Error("metadata write failed"); writes.push({ id, patch }); } }),
     } },
   };
   const cleanup = contributions[kind](client, observer);
@@ -64,6 +64,7 @@ function makeHost(kind, observer) {
   return {
     registrations, streams, writes, errors, cleanup, agent,
     setFailUpdate(value) { failUpdate = value; },
+    setFailWrite(value) { failWrite = value; },
     snapshot(metadata = {}) { directory.snapshot({ entries: [{ agent: { ...agent, metadata } }], pageInfo: { hasMore: false, nextCursor: null } }); },
     upsert(metadata = {}) { directory.update({ type: "agent_update", payload: { kind: "upsert", agent: { ...agent, metadata } } }); },
     push(answer) { streams.at(-1).onAnswer(answer); },
@@ -95,7 +96,9 @@ async function main() {
     h.push(answer(kind, old)); check(`${kind}: completed state is visible`, h.current.visible, true);
     h.closePanel(); await flush(); check(`${kind}: confirmed local close hides`, h.current.visible, false);
     check(`${kind}: one metadata write`, h.writes.length, 1);
+    const beforeEcho = h.registrations[0].updates.length;
     h.upsert(h.writes[0].patch);
+    check(`${kind}: own echo does not repaint`, h.registrations[0].updates.length, beforeEcho);
     h.push(answer(kind, next)); check(`${kind}: new state appears`, h.current.visible, true);
     h.upsert({ [`dsh.${kind}Seen`]: key(kind, next) });
     check(`${kind}: remote new close supersedes old local close`, h.current.visible, false);
@@ -121,6 +124,36 @@ async function main() {
     check(`${kind}: successful update is delivered once`, h.registrations[0].updates.length, 1);
     h.push(pushed);
     check(`${kind}: duplicate after success stays deduplicated`, h.registrations[0].updates.length, 1);
+    h.cleanup();
+  }
+  for (const kind of ["goal", "team"]) {
+    const h = makeHost(kind); await flush(); h.snapshot();
+    const local = value(kind, "local-with-lost-echo"), remote = value(kind, "remote-after-reconnect");
+    h.push(answer(kind, local)); h.closePanel(); await flush();
+    check(`${kind}: a confirmed close is hidden before its echo`, h.current.visible, false);
+    // The write succeeded, but its own update was lost during disconnect. An
+    // old snapshot must not undo the local close while the echo is absent.
+    check(`${kind}: the lost-echo premise includes a successful write`, h.writes.length, 1);
+    h.snapshot({});
+    check(`${kind}: an old snapshot cannot undo the local close`, h.current.visible, false);
+    h.push(answer(kind, remote));
+    check(`${kind}: the new remote completion starts unread`, h.current.visible, true);
+    h.snapshot({ [`dsh.${kind}Seen`]: key(kind, remote) });
+    check(`${kind}: a remote close is visible despite the missing local echo`, h.current.visible, false);
+    h.push(answer(kind, local));
+    check(`${kind}: the earlier local completion is still remembered`, h.current.visible, false);
+    h.push(answer(kind, value(kind, "unseen-third")));
+    check(`${kind}: a third completion matches neither candidate and stays visible`, h.current.visible, true);
+    check(`${kind}: observing remote metadata never writes it back`, h.writes.length, 1);
+    h.cleanup();
+  }
+  for (const kind of ["goal", "team"]) {
+    const h = makeHost(kind); await flush(); h.snapshot(); h.setFailWrite(true);
+    h.push(answer(kind, value(kind, "failed-write"))); h.closePanel(); await flush();
+    check(`${kind}: a refused write still hides the confirmed local close`, h.current.visible, false);
+    check(`${kind}: the failed-write premise has no stored update`, h.writes.length, 0);
+    h.snapshot({});
+    check(`${kind}: an old snapshot does not undo a failed local write`, h.current.visible, false);
     h.cleanup();
   }
   for (const kind of ["goal", "team", "jobs"]) {
