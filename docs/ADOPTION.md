@@ -296,7 +296,7 @@ if (provider === undefined || model === undefined) {
 | 能力 | 现在的行为（无补丁） |
 |---|---|
 | **撤回**（对话 + 文件） | 撤回**已经生效**：对话、智能体改过的文件都回退了，模型在上下文里的记忆也回退了（下一次请求看不到被撤内容，见下方关于记忆插件的说明）；时间线由宿主**立刻刷新**（Paseo 0.15.0 起上游 PR #8368 修掉 #4667，不再需要本地补丁），不需要 Reload。canary 仍在回执前发出，0.15+ 的 replay 会把它连同旧 history 清掉（看不到是预期） |
-| **重开会话后的回合折叠** | **部分失效**：系统触发的回合会并入上一回合、插话回合被拆开（`turnId` 在重放时丢失）。等上游 [#8053](https://github.com/getpaseo/paseo/issues/8053) / PR [#8054](https://github.com/getpaseo/paseo/pull/8054)，0.16.0 仍未修 |
+| **重开会话后的回合折叠** | **部分失效**：系统触发的回合会并入上一回合、插话回合被拆开（`turnId` 在重放时丢失）。等上游 [#8053](https://github.com/getpaseo/paseo/issues/8053) （PR [#8054](https://github.com/getpaseo/paseo/pull/8054) 已关闭未合并），0.16.1 仍未修 |
 | **子代理第二次派发时的「运行中」** | 卡片停在上一回合的终态。上游 [#8080](https://github.com/getpaseo/paseo/pull/8080) 已修复，Paseo 0.15.0 起生效 |
 
 关键在于第一行那个「撤回已生效」提示**同时是自证机制**：它必须在 `request.completed` **之前**
