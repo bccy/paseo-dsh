@@ -4602,6 +4602,11 @@ waterfall 缺失时返回空、范围改成全部 live agent、child 能力位�
 
 **根因**：`resolvePermission` 不看 `interrupt`；卡片只完成了"回答"这一半。
 
+**更正（2026-11-19，用户真机 + 宿主源码）**：Paseo 0.16.1 的界面**没有**"拒绝并停止"按钮。
+web 端拒绝只发 `{behavior:"deny", selectedActionId, message:"Denied by user"}`，不带 `interrupt`；
+`interrupt` 只出现在宿主协议 schema、Codex 适配器内部（MCP elicitation 取消）和测试夹具里。
+所以上面的"症状"在 0.16.1 上用户触发不到，本修复是对协议字段的前向兼容处理，真机不可验。
+
 **修法**：resolve 之后，若 `deny && interrupt === true`，中断**提出请求的那个会话**：root 卡走
 `interrupt()`（它自有回执上限与本地兜底）；子会话提升上来的卡按 pending 记录里的 `sessionId`
 找到 child，用其 native session id 发 `session/cancel`。中断失败写日志，不静默吞。
