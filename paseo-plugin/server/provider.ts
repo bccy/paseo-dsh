@@ -141,6 +141,14 @@ const CAPABILITIES = [
   "session.revert.both",
   "session.revert.conversation",
   "session.revert.files",
+  // Paseo releases a resumable session after an hour without activity. It rules
+  // out its own foreground work first, but a background shell, a running
+  // subagent or a scheduled reminder lives only in the DSH process. Without this
+  // capability Paseo releases the session without asking; with it, the bridge
+  // answers from DSH's own archive admission and Paseo keeps the runtime while
+  // that work runs. The answer is its own event (`session.can_stop_runtime`),
+  // never `request.completed`, and every failure keeps the runtime.
+  "session.can_stop_runtime",
   "permission",
 ] as const;
 
@@ -2062,6 +2070,19 @@ class DshConnection implements ProviderConnection {
         this.#emit({ type: "request.completed", requestId: input.requestId });
         return;
       }
+      case "session.can_stop_runtime": {
+        // The answer is this event and nothing else. A failure reaches Paseo as
+        // `request.failed` (see `send`), which keeps the runtime, as a timeout
+        // does; `request.completed` would be an invalid reply to this question.
+        const canStop = await this.#owner(input.sessionId).canStopRuntime(input.sessionId);
+        this.#emit({
+          type: "session.can_stop_runtime",
+          requestId: input.requestId,
+          sessionId: input.sessionId,
+          canStop,
+        });
+        return;
+      }
       case "session.close": {
         // Invalidate an open still in flight for this provider id: the daemon
         // asked for the session to be gone, so the open must not go on to
@@ -2988,6 +3009,25 @@ class DshConnection implements ProviderConnection {
     for (const root of this.#sessions.values()) {
       const child = root.child(sessionId);
       if (child !== undefined) return child;
+    }
+    throw new Error(`unknown session: ${sessionId}`);
+  }
+
+  /**
+   * The root `DshSession` that owns one provider session id, root or native child.
+   *
+   * The idle-cleanup question names either a root session or a child session, and
+   * the answer has to be asked on the root's shared process with the child's own
+   * native id; the root is the only object that holds both the process and the
+   * child mapping.
+   *
+   * @param sessionId - Paseo provider session id.
+   */
+  #owner(sessionId: string): DshSession {
+    const root = this.#sessions.get(sessionId);
+    if (root !== undefined) return root;
+    for (const candidate of this.#sessions.values()) {
+      if (candidate.child(sessionId) !== undefined) return candidate;
     }
     throw new Error(`unknown session: ${sessionId}`);
   }

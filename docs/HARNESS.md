@@ -1436,3 +1436,43 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   （settings namespace，如 `unrestricted`）时，list 里缺任何一个就**转红**（静默空菜单）；未设置
   时，profile 有合格行就跑写入往返、没有就打印 skip 原因（并提示该变量）。**耗 token（真实模型
   回合）**；跑前先 `bridge-assets-check.mjs`。
+
+## 空闲回收否决链（2026-11-19）
+
+Paseo 回收空闲会话前会问 provider「现在释放运行时会不会杀掉 DSH 里还在跑的工作」
+（`session.can_stop_runtime`）。这条链横跨桥与插件两层，而且答错的代价是**杀掉用户的后台任务**：
+答 `canStop:true` 但实际有 job/子代理/提醒在跑 = 静默丢工作；答不出来 = Paseo 保留运行时（安全）。
+
+- `paseo-plugin/test/runtime-activity.test.cjs`（**纯离线**，不需要真实 DSH profile，不耗 token）：
+  - `dsh-bridge/lib/activity.js` 的 `runtimeActivity`：root 只问自己 + 子代理子树（不是整个进程，
+    见 FIELD-NOTES 112 的 fork 差异）、child 只问子树、live child 用会话 header 补父链、
+    环结束、未知 kind 也算活动、缺 waterfall / 缺 agents registry / 非数组答复一律抛错；
+  - 桥 `paseo/activity` 分发表（root/child 答案、`unknown session`、缺 sessionId）——需要已安装的
+    `@deepseek-ai/dsh` 提供内部包解析，**没装 DSH 时该用例 skip**，其余照跑；
+  - `DshSession.canStopRuntime`（假 process 注入）：无活动→true、有 job→false 且日志点名、
+    child 的 job 按 child 原生 id 阻止 root、桥抛错→拒绝、已关闭→true 不问桥；
+  - `DshChildSession.open` 的 `session.opened.capabilities` 含 `session.can_stop_runtime`；
+  - 真 provider 连接 + 假桥：协商到能力位、未知会话只回 `request.failed`。
+    跑法：`cd paseo-plugin && node --test test/runtime-activity.test.cjs`
+    （测试用 `paseo-plugin/test/register-typescript.cjs` 的 transpile 钩子直接 require 源码，
+    并把 `DSH_HOME` 指向一次性目录，不会碰到真实 profile / 正在跑的共享子进程记录）。
+- `harness/plugin-check.cjs` 真机段（3b，**耗 token**）：空闲会话 `canStop:true`（事件类型必须是
+  `session.can_stop_runtime`，不是 `request.completed`）→ 真实回合运行中 `canStop:false` →
+  中断、回合结束后又 `true` → 未知会话 `request.failed`。跑前先 `bridge-assets-check.mjs`，
+  按该文件头部把插件编译进 `paseo-plugin/.dbg`，`env -u DSH_HOME` 从 `.dbg` 运行。
+
+- `harness/dsh-api-contract-check.mjs` 的 **3d 段**（纯离线，秒级）：本链依赖的两处
+  DSH 内部运行期契约，import 检查看不到，而改名恰好往「静默放行」方向坏——事件名一改，
+  activity.js 的 `waterfall` 找不到 listener，Cordis 调用它传入的空 `next` 返回 `[]`，
+  canStop 变 `true`。断言三件事：① `dsh-bridge/lib/activity.js` 的 `ACTIVITY_EVENT` 字面量
+  必须等于期望名；② 本机 DSH 的 workspace registry 入口仍以该名调用
+  `waterfall('workspace/session-activity', …)`；③ 已安装包里至少有一个 provider 仍以
+  `on('workspace/session-activity', …)` 注册该事件（0.2.2-rc.3 实测 4 个：dsh-agent、dsh-jobs、
+  dsh-schedule、dsh-subagent）；同一段还钉 `agents` 服务：`super(ctx, "agents")` 注册名、
+  Context 增强里的 `agents: AgentRegistry`、以及运行期 `AgentRegistry.prototype.list`。
+  **变异口径**：把脚本里的期望事件名临时改错，这三条断言必须转红（恢复后 27/27 绿）。
+
+**改动区域必跑**：动了 `dsh-bridge/lib/activity.js`、`dsh-bridge/lib/server.js` 的
+`paseo/activity` / `session/close` 段，或 `paseo-plugin/server/{session,dsh-process,provider}.ts`
+的能力声明与关闭段 → 上面三项 + `harness/bridge-assets-check.mjs`（改桥后必须先重生成内嵌桥）
++ `harness/dsh-api-contract-check.mjs`（本链的事件名与 `agents` 服务契约在 3d 段，改名必须转红）。

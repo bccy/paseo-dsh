@@ -252,6 +252,7 @@ Paseo 自己的实现就是最权威的协议文档，而且比你读类型定�
 | 图片凭空消失，模型还煞有介事地回答 | 非文本内容块被映射成空字符串，且 `contentBlocks` 传了 `undefined` |
 | 用量读数永远空白 | 运行时把 token 记账挂在消息事件上，我从没转发（`session.usage` 从未发出） |
 | 未知请求"成功"了 | `switch` 的 `default` 分支发的是 `request.completed` |
+| 会话空闲一小时后，DSH 的后台任务、还在跑的子代理、定时提醒一起消失 | Paseo 回收空闲会话前只看自己的前台工作；没声明 `session.can_stop_runtime` 就**不问直接回收**，而释放一个会话会结束该 agent 及其原生子代理子树 | 声明它，用 DSH 自己归档前的判定（`workspace/session-activity` waterfall）回答；查不到就失败，Paseo 会保留运行时 |
 
 **规则：宁可响亮地失败，也不要安静地做错。** 具体做法：
 

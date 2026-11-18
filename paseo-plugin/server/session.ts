@@ -25,6 +25,7 @@ import type { DshCommand, JsonValue } from "./dsh-process";
 import { goalCommandArguments, type GoalAction } from "../shared/goal";
 import {
   DshProcess,
+  type DshActivity,
   type DshAnswer,
   type DshChildOpened,
   type DshCurrentTask,
@@ -492,6 +493,16 @@ function messageOf(error: unknown): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/** One log line naming what keeps a runtime alive, e.g. `job "npm test" (in child-1)`. */
+function describeActivity(activity: DshActivity[]): string {
+  return activity
+    .map((entry) => {
+      const items = (entry.items ?? []).map((item) => JSON.stringify(item.label ?? item.id)).join(", ");
+      return `${entry.kind}${items === "" ? "" : ` ${items}`} (in ${entry.sessionId})`;
+    })
+    .join("; ");
 }
 
 /**
@@ -2942,6 +2953,34 @@ export class DshSession {
     this.#options.releaseProcess?.(process);
   }
 
+  /**
+   * Whether Paseo may release this runtime now without ending DSH work.
+   *
+   * Paseo asks after a session has been idle for an hour, having already ruled
+   * out its own foreground work. What it cannot see runs inside the DSH process
+   * — a background shell, a running subagent, a scheduled reminder — and
+   * releasing a session ends that session's agent and the native subagents below
+   * it. The bridge answers from DSH's own archive admission
+   * (`workspace/session-activity`); this only maps the Paseo provider id to the
+   * native one. A closed session has no process left, so nothing can be lost.
+   *
+   * Coverage includes native children, because a child's runtime is a session
+   * too: Paseo asks every agent's session, and the child's own jobs live under
+   * the child's native id (a job belongs to the session that started it).
+   *
+   * @param sessionId - the Paseo provider session id (this root or a native child).
+   * @returns true when nothing DSH runs would be lost.
+   */
+  async canStopRuntime(sessionId = this.id): Promise<boolean> {
+    if (this.#closed) return true;
+    const native = sessionId === this.id ? this.#dshSessionId : this.#requireChild(sessionId).nativeId;
+    const activity = await this.#require().activity(native);
+    if (activity.length > 0) {
+      this.#options.log(`kept ${sessionId} running for DSH work: ${describeActivity(activity)}`);
+    }
+    return activity.length === 0;
+  }
+
   #require(): DshProcess {
     if (this.#process === undefined || this.#closed) {
       throw new Error(`session ${this.id} is not open`);
@@ -3113,6 +3152,13 @@ export class DshSession {
   /** The child view for one root-scoped Paseo provider id, if it is known. */
   child(sessionId: string): DshChildSession | undefined {
     return this.#childByProviderId.get(sessionId);
+  }
+
+  /** The child view for one Paseo provider id, refusing an id this root does not own. */
+  #requireChild(sessionId: string): DshChildSession {
+    const child = this.#childByProviderId.get(sessionId);
+    if (child === undefined) throw new Error(`unknown native child session: ${sessionId}`);
+    return child;
   }
 
   /** This session's own DSH id, which is what DSH's registry knows it by. */
@@ -4042,7 +4088,12 @@ export class DshChildSession {
       // refuses to attach a child whose parent did not negotiate it, so a
       // grandchild under this read-only child needs it too. No prompt/configure
       // capability is offered, so Paseo cannot drive the child.
-      capabilities: this.#options.subsession ? ["session.subsession"] : [],
+      //
+      // `session.can_stop_runtime` travels with it: the host gates its
+      // idle-cleanup question on the child's *negotiated* capabilities, so
+      // without it a child runtime would be released without asking and a
+      // background job the child left running would end with it.
+      capabilities: this.#options.subsession ? ["session.subsession", "session.can_stop_runtime"] : [],
       restoration: "parent",
       cwd: this.#options.cwd,
       // Paseo addresses an archive request by persistence handle, not by session
