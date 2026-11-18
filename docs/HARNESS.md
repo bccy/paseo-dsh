@@ -380,6 +380,14 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   清除旧值、无效计数拒绝、切模型时迟到的旧响应不能覆盖、关闭后不再发）。参数是编译输出
   目录：`node harness/context-usage-check.cjs <dir>`。**动了 `server/dsh-process.ts` 的用量
   读取或 `DshSession` 的用量上报必跑。**
+- `harness/menu-translate-check.mjs` — `/` 菜单说明的自动翻译（纯离线，进 CI）：桥侧
+  `dsh-bridge/lib/menu-translate.js` 的参数校验、模型答复解析（只认整段 JSON 对象，可带一层
+  代码围栏；多余键、空行、超长行丢弃；**缺的名字保持缺，不回填原文**）、假 `llm` 上的
+  `runTranslate`（选最低思考档、不给工具、非 `stop` 收尾响亮抛错）；插件侧
+  `server/menu-translations.ts` 的优先级（用户文件 > 内置表 > 自动缓存 > 原文）、源文变了即失效、
+  中文原文不送、失败/漏答不缓存且本进程不重试、英文环境不翻、坏用户文件记日志后忽略、40 条一批、
+  并发打开不重复翻译、新实例读到磁盘缓存。**动了菜单翻译、`DshSession.loadCommands` 或
+  `paseo/translate` 必跑**；真机效果（真实模型答复质量）不在它的范围里。
 - `harness/catalog-cache-check.mjs` — catalog 缓存的**两层**（假 `dsh` + 一次性 `DSH_HOME`，
   **13/13**）：① 内存层是按 cwd 的小 LRU（不是单槽），多工作区 A→B→A 只向运行时发 **2 次**
   `paseo/catalog` 读（旧单槽实现 3 次），每个 cwd 命中各自条目；这些读现在由**同一个常驻

@@ -40,6 +40,7 @@ import { isHumanUserMessage, planRewind, restoresFiles, revertScope, successText
 import { visibleEvents } from './surface.js';
 import { historyEvents, withImageHostPaths } from './image-host-path.js';
 import { promptSource } from './paseo-system-envelope.js';
+import { parseTranslateParams, runTranslate } from './menu-translate.js';
 import {
   inventoryEntryMatchesNamespace,
   pluginTitleDictionary,
@@ -4191,6 +4192,36 @@ export class PaseoHarnessServer {
     };
   }
 
+  /**
+   * Translate `/` menu descriptions on one session's route (`menu-translate.js`).
+   *
+   * Only an already-open session is used: the request must not materialize a
+   * DSH session, and a session this process does not hold has no route of its
+   * own. The answer maps each translated name to its line; a name the model
+   * left out is absent, never echoed back as source text.
+   *
+   * @param {{sessionId: string, locale: string, items: {name: string, text: string}[]}} params
+   */
+  async translate(params) {
+    const request = parseTranslateParams(params);
+    if (this.sessions.get(request.sessionId) === undefined) {
+      throw new Error(`paseo/translate: session ${request.sessionId} is not open in this bridge`);
+    }
+    const route = this.routeFor(request.sessionId);
+    if (route.provider === undefined || route.model === undefined) {
+      throw new Error(`paseo/translate: session ${request.sessionId} has no pinned route`);
+    }
+    const llm = this.ctx.get('llm');
+    if (llm === undefined) throw new Error('paseo/translate: this DSH runtime composes no llm service');
+    const translations = await runTranslate(
+      llm,
+      { provider: route.provider, model: route.model },
+      request,
+      { BlockAssembler, createUserMessage },
+    );
+    return { translations };
+  }
+
   /** Non-activating upstream read. Keep its sequenced/migration-required/null
    * distinction; cached migration hints are not exact values. No usage cache. */
   async projections(params) {
@@ -5043,6 +5074,8 @@ export class PaseoHarnessServer {
         return this.settingsSet(params);
       case 'paseo/projections':
         return this.projections(params);
+      case 'paseo/translate':
+        return this.translate(params);
       case 'session/close':
         return this.closeSession(params);
       case 'shutdown':

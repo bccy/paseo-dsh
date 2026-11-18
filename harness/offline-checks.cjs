@@ -24,7 +24,7 @@ const sourceChecks = [
   'subagent-history-check.cjs', 'pill-contribution-check.cjs',
   'lifecycle-hook-check.cjs', 'timeline-kind-check.cjs', 'workspace-badges-check.cjs', 'pool-prewarm-check.mjs', 'profile-child-gate-check.mjs',
   'multi-session-check.mjs', 'process-crash-check.mjs', 'child-crash-check.mjs',
-  'reload-port-race-check.mjs', 'shared-process-cwd-check.mjs',
+  'reload-port-race-check.mjs', 'shared-process-cwd-check.mjs', 'menu-translate-check.mjs',
 ];
 // mcp-stdio-check.mjs imports the installed DSH child-environment policy. Run it
 // separately with DSH installed; it is not a skipped/passed portable CI gate.

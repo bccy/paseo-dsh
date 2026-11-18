@@ -439,6 +439,15 @@ const SKILL_COPY: Record<Locale, Readonly<Record<string, string>>> = {
   },
 };
 
+/**
+ * Whether the built-in tables localize this `/` menu name — a command or a
+ * skill. `menu-translations.ts` does not auto-translate those: the table's
+ * wording was chosen by hand.
+ */
+export function hasBuiltinMenuCopy(name: string): boolean {
+  return COMMAND_COPY[LOCALE][name] !== undefined || SKILL_COPY[LOCALE][name] !== undefined;
+}
+
 /** The menu description for one skill: localized when known, the author's otherwise. */
 export function skillDescription(name: string, fallback: string): string {
   return SKILL_COPY[LOCALE][name] ?? fallback;

@@ -2650,6 +2650,31 @@ export class DshProcess {
   }
 
   /**
+   * Translate `/` menu descriptions on one open session's route
+   * (`dsh-bridge/lib/menu-translate.js`). The answer holds only the names the
+   * model actually translated; a bridge predating the method throws its
+   * `unknown paseo bridge method:` error, which the caller logs.
+   *
+   * @param sessionId - an already-open session; the bridge refuses to open one.
+   */
+  async translate(
+    sessionId: string,
+    locale: string,
+    items: ReadonlyArray<{ name: string; text: string }>,
+  ): Promise<Record<string, string>> {
+    const result = (await this.#request("paseo/translate", { sessionId, locale, items }, 90000)) as {
+      translations?: unknown;
+    };
+    const out: Record<string, string> = {};
+    const translations = result.translations;
+    if (typeof translations !== "object" || translations === null) return out;
+    for (const [name, text] of Object.entries(translations)) {
+      if (typeof text === "string" && text !== "") out[name] = text;
+    }
+    return out;
+  }
+
+  /**
    * Execute one registered slash command (skills are sent as text instead).
    *
    * @param sessionId - which session; required — there is no default.

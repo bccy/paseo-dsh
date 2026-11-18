@@ -21,7 +21,7 @@ import type {
   ProviderTimelineItem,
   ProviderUsage,
 } from "@getpaseo/plugin/server/provider";
-import type { JsonValue } from "./dsh-process";
+import type { DshCommand, JsonValue } from "./dsh-process";
 import { goalCommandArguments, type GoalAction } from "../shared/goal";
 import {
   DshProcess,
@@ -246,9 +246,33 @@ import {
   dshPendingFailedDescription,
   dshSettingFailureLine,
   dshSettingUnexpectedValueMessage,
+  hasBuiltinMenuCopy,
   presetLabel,
   skillDescription,
 } from "./locale";
+import { MenuTranslations } from "./menu-translations";
+import { dshHome } from "./bootstrap";
+
+/**
+ * One translation cache per `$DSH_HOME` for the whole plugin process, so every
+ * session reads the same lines and two sessions opening together translate a
+ * new skill once (`MenuTranslations` serializes its batches).
+ */
+const menuTranslationsByHome = new Map<string, MenuTranslations>();
+
+function menuTranslationsFor(home: string): MenuTranslations {
+  let translations = menuTranslationsByHome.get(home);
+  if (translations === undefined) {
+    translations = new MenuTranslations({
+      home,
+      locale: LOCALE,
+      builtin: hasBuiltinMenuCopy,
+      log: (line) => process.stderr.write(`[dsh-paseo] ${line}\n`),
+    });
+    menuTranslationsByHome.set(home, translations);
+  }
+  return translations;
+}
 
 /**
  * Suffix on a composer preset option the registry reported as unusable.
@@ -1062,27 +1086,76 @@ export class DshSession {
   async loadCommands(): Promise<void> {
     const commands = await this.#require().commands(this.#dshSessionId);
     this.#commandKinds.clear();
-    const advertised = commands.map((command) => {
-      this.#commandKinds.set(command.name, command.kind);
-      // A skill keeps its name — that token is what DSH injects from a `/name`
-      // line — and only its menu description is localized.
-      if (command.kind !== "command") {
-        return {
-          name: command.name,
-          description: skillDescription(command.name, command.description),
-          ...(command.argumentHint === undefined ? {} : { argumentHint: command.argumentHint }),
-        };
-      }
-      return commandCopy(command.name, {
-        description: command.description,
-        ...(command.argumentHint === undefined ? {} : { argumentHint: command.argumentHint }),
-      });
+    for (const command of commands) this.#commandKinds.set(command.name, command.kind);
+    this.#lastCommands = commands;
+    this.#emitCommands();
+    this.#translateMenu(commands);
+  }
+
+  /** The DSH command list the `/` menu was last built from, for a re-emit. */
+  #lastCommands: DshCommand[] = [];
+
+  /**
+   * The cache for this session's `$DSH_HOME` — the home the shared `dsh` child
+   * runs in, resolved the same way the provider resolves it (`process.env`
+   * overlaid with the session env).
+   */
+  #menuTranslations(): MenuTranslations {
+    return menuTranslationsFor(dshHome({ ...process.env, ...this.#options.env }));
+  }
+
+  /**
+   * Emit the `/` menu from {@link #lastCommands}.
+   *
+   * Description precedence: the user's own locale file, then the built-in
+   * tables (`commandCopy` / `skillDescription`), then an automatically
+   * translated line, then the runtime's text. A skill keeps its name — that
+   * token is what DSH injects from a `/name` line — and only its menu
+   * description changes; a command keeps its name for the same dispatch reason.
+   */
+  #emitCommands(): void {
+    const translations = this.#menuTranslations();
+    const advertised = this.#lastCommands.map((command) => {
+      const hint = command.argumentHint === undefined ? {} : { argumentHint: command.argumentHint };
+      const base =
+        command.kind !== "command"
+          ? { name: command.name, description: skillDescription(command.name, command.description), ...hint }
+          : commandCopy(command.name, { description: command.description, ...hint });
+      const user = translations.userLine(command.name);
+      if (user !== undefined) return { ...base, description: user };
+      if (hasBuiltinMenuCopy(command.name)) return base;
+      const auto = translations.autoLine(command.name, command.description);
+      return auto === undefined ? base : { ...base, description: auto };
     });
     this.#options.emit({
       type: "session.commands",
       sessionId: this.id,
       commands: advertised,
     });
+  }
+
+  /**
+   * Translate the menu lines nothing localizes yet, in the background, and
+   * re-emit the menu when new lines arrive. Never blocks or fails the open: a
+   * failure is logged by `MenuTranslations` and the original text stays.
+   */
+  #translateMenu(commands: readonly DshCommand[]): void {
+    const translations = this.#menuTranslations();
+    const missing = translations.missing(
+      commands.map((command) => ({ name: command.name, description: command.description })),
+    );
+    if (missing.length === 0) return;
+    const dsh = this.#process;
+    if (dsh === undefined) return;
+    const dshSessionId = this.#dshSessionId;
+    void translations
+      .translate(missing, (items) => dsh.translate(dshSessionId, LOCALE, items))
+      .then((added) => {
+        if (added > 0 && !this.#closed) this.#emitCommands();
+      })
+      .catch((error: unknown) => {
+        this.#options.log(`menu translation failed: ${messageOf(error)}`);
+      });
   }
 
   /** Read the current permission preset and the switchable ones, for the composer. */
