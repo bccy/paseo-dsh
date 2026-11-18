@@ -37,6 +37,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { resolveDshCommand } from "../paseo-plugin/server/dsh-command.mjs";
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -45,6 +46,7 @@ const { prepareDshHome } = require("./isolated-dsh-home.cjs");
 const BRIDGE_NAME = "dsh-paseo-bridge";
 const BRIDGE_SOURCE = join(here, "..", "dsh-bridge");
 const BINARY = process.env.DSH_BINARY ?? "dsh";
+const LAUNCH = resolveDshCommand(BINARY, process.env, process.cwd());
 const PROFILE = "paseo";
 
 let passed = 0;
@@ -99,7 +101,7 @@ function clone(source) {
 
 /** DSH's own composition of the cloned profile: the oracle for "bridge loaded". */
 function compose(home) {
-  const result = spawnSync(BINARY, ["--profile", PROFILE, "--dump-config"], {
+  const result = spawnSync(LAUNCH.command, [...LAUNCH.args, "--profile", PROFILE, "--dump-config"], {
     encoding: "utf8",
     env: { ...process.env, DSH_HOME: home },
     timeout: 180_000,

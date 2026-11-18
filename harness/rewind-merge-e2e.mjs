@@ -29,6 +29,7 @@
  * names the mode.
  */
 import { spawn } from 'node:child_process';
+import { resolveDshCommand } from '../paseo-plugin/server/dsh-command.mjs';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir, tmpdir } from 'node:os';
@@ -53,10 +54,12 @@ try {
 }
 announceDshHome(runMode);
 
-const child = spawn('dsh', ['--profile', PROFILE], {
+const launch = resolveDshCommand(process.env.DSH_BINARY ?? 'dsh', process.env, root);
+const child = spawn(launch.command, [...launch.args, '--profile', PROFILE], {
   cwd: root,
   stdio: ['pipe', 'pipe', 'pipe'],
   env: process.env,
+  windowsHide: true,
 });
 
 let buffer = '';

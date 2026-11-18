@@ -45,6 +45,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { resolveDshCommand } from "../paseo-plugin/server/dsh-command.mjs";
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -52,6 +53,7 @@ const { resolvePluginBuild } = require("./plugin-build.cjs");
 
 const PROFILE = "paseo";
 const BINARY = process.env.DSH_BINARY ?? "dsh";
+const LAUNCH = resolveDshCommand(BINARY, process.env, process.cwd());
 const buildDir = resolvePluginBuild(undefined, ".dbg-pnpm-bridge");
 const bootstrap = require(join(buildDir, "server", "bootstrap.js"));
 const { BRIDGE_FILES } = require(join(buildDir, "server", "bridge-assets.js"));
@@ -87,7 +89,7 @@ function check(label, condition, detail) {
 
 /** Run the real DSH CLI with this check's throwaway home. */
 function dsh(args) {
-  const result = spawnSync(BINARY, args, {
+  const result = spawnSync(LAUNCH.command, [...LAUNCH.args, ...args], {
     encoding: "utf8",
     env: { ...process.env, DSH_HOME: dshHome },
     timeout: 180_000,

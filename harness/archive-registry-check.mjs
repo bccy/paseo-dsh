@@ -26,14 +26,17 @@
  * Exit status is non-zero when the registry was not reached.
  */
 import { spawn } from 'node:child_process';
+import { resolveDshCommand } from '../paseo-plugin/server/dsh-command.mjs';
 
 const PROFILE = process.env.DSH_PASEO_PROFILE ?? 'paseo';
 const BINARY = process.env.DSH_BINARY ?? 'dsh';
 const MISSING = `dsh-paseo-archive-registry-probe-${Date.now()}`;
 
-const child = spawn(BINARY, ['--profile', PROFILE], {
+const launch = resolveDshCommand(BINARY, process.env, process.cwd());
+const child = spawn(launch.command, [...launch.args, '--profile', PROFILE], {
   cwd: process.cwd(),
   stdio: ['pipe', 'pipe', 'pipe'],
+  windowsHide: true,
 });
 
 let buffer = '';

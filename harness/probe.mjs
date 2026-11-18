@@ -13,8 +13,10 @@
  */
 import { spawn } from 'node:child_process';
 import { createWriteStream } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { resolveDshCommand } from '../paseo-plugin/server/dsh-command.mjs';
 
-const RAW = new URL('./frames-probe.jsonl', import.meta.url).pathname;
+const RAW = fileURLToPath(new URL('./frames-probe.jsonl', import.meta.url));
 const rawOut = createWriteStream(RAW);
 
 const SESSION_ID = `probe-${Date.now()}`;
@@ -23,11 +25,13 @@ const PROMPT =
   'Give exactly three options: staging, canary, production. Then report which one I chose.';
 
 const PROFILE = process.env.DSH_PASEO_PROFILE ?? 'paseo';
+const launch = resolveDshCommand(process.env.DSH_BINARY ?? 'dsh', process.env, process.cwd());
 
-const child = spawn('dsh', ['--profile', PROFILE], {
+const child = spawn(launch.command, [...launch.args, '--profile', PROFILE], {
   cwd: process.cwd(),
   stdio: ['pipe', 'pipe', 'pipe'],
   env: process.env,
+  windowsHide: true,
 });
 
 const pending = new Map();

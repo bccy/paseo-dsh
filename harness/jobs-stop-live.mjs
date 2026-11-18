@@ -35,6 +35,7 @@
  * pre-existing session's jobs are touched.
  */
 import { execFileSync, spawn } from 'node:child_process';
+import { resolveDshCommand } from '../paseo-plugin/server/dsh-command.mjs';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -131,9 +132,11 @@ if (runMode.mode !== 'real') {
   console.log(`probe: bridge provisioned into the clone from this build (${provisioned.bridgeFiles} file(s))`);
 }
 
-const child = spawn('dsh', ['--profile', profile], {
+const launch = resolveDshCommand(process.env.DSH_BINARY ?? 'dsh', process.env, root);
+const child = spawn(launch.command, [...launch.args, '--profile', profile], {
   cwd: root,
   stdio: ['pipe', 'pipe', 'pipe'],
+  windowsHide: true,
 });
 
 let buffer = '';

@@ -39,6 +39,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { resolveDshCommand } from "./dsh-command.mjs";
 
 /** Format version of the on-disk entry; another version is read as "no cache". */
 const ENTRY_VERSION = 1;
@@ -99,7 +100,16 @@ let memoizedVersion: string | undefined;
 function dshVersionStamp(binary: string): string {
   if (memoizedVersion !== undefined) return memoizedVersion;
   try {
-    const out = execFileSync(binary, ["--version"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] });
+    // Same launcher resolution as the spawn path: on Windows the npm shim is a
+    // `.cmd` file that `execFileSync` cannot run, which would make every
+    // Windows install fingerprint as `version:unknown` and cache across
+    // upgrades.
+    const launch = resolveDshCommand(binary, process.env);
+    const out = execFileSync(launch.command, [...launch.args, "--version"], {
+      encoding: "utf8",
+      timeout: 10_000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
     memoizedVersion = `version:${out.trim()}`;
   } catch {
     memoizedVersion = "version:unknown";
