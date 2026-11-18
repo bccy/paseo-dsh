@@ -41,6 +41,7 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { resolveDshCommand } from "../paseo-plugin/server/dsh-command.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, "..");
@@ -152,7 +153,7 @@ function doctor(home) {
 
 /** Compose one home with DSH's own dump — the independent evidence per case. */
 function dump(home) {
-  const result = spawnSync(DSH, ["--profile", PROFILE, "--dump-config"], {
+  const result = spawnSync(DSH_LAUNCH.command, [...DSH_LAUNCH.args, "--profile", PROFILE, "--dump-config"], {
     encoding: "utf8",
     env: { ...process.env, DSH_HOME: home },
     timeout: 60_000,
@@ -196,7 +197,11 @@ async function loadCredentialParser() {
   return await import(pathToFileURL(resolved).href);
 }
 
-const DSH = findDsh();
+const DSH_LAUNCH = resolveDshCommand(process.env.DSH_BINARY ?? "dsh", process.env, process.cwd());
+// On Windows the launch is `node.exe <package entry>`; that entry is also the
+// file whose package root carries the credentials parser. On POSIX the launch
+// is the plain `dsh` from PATH, as before.
+const DSH = DSH_LAUNCH.args.length > 0 ? DSH_LAUNCH.args[0] : findDsh();
 if (DSH === undefined) {
   console.error("doctor-live-check: no `dsh` on PATH; this check needs a real DeepSeek Harness install");
   process.exit(1);

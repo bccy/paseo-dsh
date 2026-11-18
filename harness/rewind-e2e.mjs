@@ -45,6 +45,7 @@
  * instead: the answer and injection lines become observations, not pass/fail.
  */
 import { spawn } from "node:child_process";
+import { resolveDshCommand } from "../paseo-plugin/server/dsh-command.mjs";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -96,9 +97,11 @@ if (withMemory) {
   );
 }
 
-const child = spawn("dsh", ["--profile", process.env.DSH_PASEO_PROFILE ?? "paseo"], {
+const launch = resolveDshCommand(process.env.DSH_BINARY ?? "dsh", process.env, root);
+const child = spawn(launch.command, [...launch.args, "--profile", process.env.DSH_PASEO_PROFILE ?? "paseo"], {
   cwd: root,
   stdio: ["pipe", "pipe", "pipe"],
+  windowsHide: true,
 });
 
 let buffer = "";

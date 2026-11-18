@@ -1,0 +1,42 @@
+name: Process compatibility
+
+# Windows/macOS/Linux 三平台回归：npm 全局安装的 DSH 在 Windows 上是 dsh.cmd
+# shim，插件/doctor/harness 必须把它解析成 Node 入口。其他平台只允许行为不变，
+# 所以同一组测试在三个平台上都跑；只改 docs 的提交不会触发本 workflow。
+on:
+  push:
+    branches: [main, port/windows-launcher]
+  pull_request:
+    paths:
+      - "paseo-plugin/server/dsh-*"
+      - "paseo-plugin/lib/doctor.mjs"
+      - "paseo-plugin/test/**"
+      - "paseo-plugin/package*.json"
+      - "harness/plugin-build.cjs"
+      - ".github/workflows/process-compatibility.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  process:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: paseo-plugin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: paseo-plugin/package-lock.json
+      - run: npm ci --ignore-scripts --no-audit --no-fund --replace-registry-host=always --registry=https://registry.npmjs.org/
+      - run: npm run typecheck
+      - run: npm run test:process

@@ -19,7 +19,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { accessSync, constants, existsSync, readFileSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
+import { resolveDshCommand } from "./dsh-command.mjs";
 import type { GoalErrorCode } from "../shared/goal";
 import { JOB_STOP_ERROR_CODES, type JobErrorCode, type JobStopErrorCode } from "../shared/jobs";
 import type { TeamErrorCode } from "../shared/team";
@@ -1081,12 +1082,21 @@ export interface DshProcessOptions extends DshProcessHandlers {
  * was read from changes (`catalog-cache.ts`); resolving the path twice with two
  * different rules would let the cache survive an upgrade.
  *
+ * `DSH_BINARY` is read from the plugin process's environment, not the session's:
+ * the on-disk catalog cache fingerprints the binary from this same function
+ * (`provider.ts`), and letting the spawn path read a session override would
+ * give the two sides different answers — the cache rule at the top of this
+ * comment is exactly what that would break. Sessions may still override
+ * `DSH_PASEO_PROFILE`; the binary is a process-wide runtime choice.
+ *
  * @throws when `DSH_BINARY` names a path that is missing or not executable.
  */
 export function resolveDshBinary(): string {
   const configured = process.env.DSH_BINARY;
   if (configured !== undefined && configured !== "") {
-    if (!configured.includes("/")) return configured;
+    // Both separators: a Windows path arrives with `\`, and treating it as a
+    // bare name would hand an unvalidated shim to `spawn`.
+    if (!configured.includes("/") && !configured.includes("\\")) return configured;
     assertExecutable(configured);
     return configured;
   }
@@ -1119,6 +1129,55 @@ function assertExecutable(path: string): void {
         + "refusing to fall back to the dsh on PATH — fix DSH_BINARY or unset it",
     );
   }
+}
+
+/**
+ * Whether this launch is a Windows npm-shim shape that the resolver left alone.
+ *
+ * `launch.args.length === 0` means `resolveDshCommand` did not rewrite the
+ * command; on Windows a `dsh`/`dsh.cmd`/`dsh.ps1` name in that state cannot be
+ * spawned directly. Native `dsh.exe` and custom non-`dsh` executables are not
+ * this shape and keep their existing error text.
+ *
+ * @param binary - the command `resolveDshBinary` selected.
+ * @param launch - `resolveDshCommand`'s result.
+ */
+function isUnresolvedWindowsShim(binary: string, launch: { command: string; args: string[] }): boolean {
+  return (
+    process.platform === "win32"
+    && launch.args.length === 0
+    && /^dsh(?:\.cmd|\.ps1)?$/i.test(basename(binary))
+  );
+}
+
+/**
+ * Explain a Windows spawn failure caused by an unresolved npm launcher.
+ *
+ * `resolveDshCommand` deliberately returns the original command when the layout
+ * is not an official npm install (a custom `.cmd` wrapper, a broken
+ * `package.json`, a missing `bin` entry). On Windows that leaves `spawn` failing
+ * with a bare `ENOENT`/`EINVAL` that names no cause and suggests no fix. This
+ * wrapper adds the reason and the two ways out — while leaving POSIX and
+ * resolved/native launches byte-identical.
+ *
+ * @param error - the spawn error (its message is extended in place).
+ * @param binary - the command `resolveDshBinary` selected.
+ * @param launch - `resolveDshCommand`'s result; non-empty args mean it resolved.
+ */
+function explainUnresolvedShim(
+  error: Error,
+  binary: string,
+  launch: { command: string; args: string[] },
+): Error {
+  if (!isUnresolvedWindowsShim(binary, launch)) return error;
+  // Two error listeners may see the same Error object; extend it once.
+  if (error.message.includes("docs/WINDOWS.md")) return error;
+  error.message +=
+    " — Windows could not resolve this dsh launcher to its Node entry point: it is not the official npm"
+    + " @deepseek-ai/dsh layout (dsh.cmd beside node_modules/@deepseek-ai/dsh with a readable package.json"
+    + " bin entry), or the entry file is missing. Set DSH_BINARY to the real dsh.exe or to that package's"
+    + " Node entry file, and see docs/WINDOWS.md.";
+  return error;
 }
 
 function toError(value: unknown, fallback: string): Error {
@@ -2292,12 +2351,25 @@ export class DshProcess {
     // session did not provision is a failure with no local explanation.
     // `profileName` is the single definition of that lookup.
     const args = ["--profile", profileName(env)];
+    // Same rule as the catalog fingerprint: the daemon process's DSH_BINARY.
     const binary = resolveDshBinary();
-    const child = spawn(binary, args, {
-      cwd: this.#options.cwd,
-      stdio: ["pipe", "pipe", "pipe"],
-      env,
-    });
+    // On Windows an npm-installed `dsh` is a `.cmd` shim that `spawn` cannot
+    // execute; resolve it to its Node entrypoint instead of inserting a shell,
+    // so stdio, argv and child termination keep their native behaviour. POSIX
+    // and native executables return unchanged.
+    const launch = resolveDshCommand(binary, env, this.#options.cwd);
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = spawn(launch.command, [...launch.args, ...args], {
+        cwd: this.#options.cwd,
+        stdio: ["pipe", "pipe", "pipe"],
+        env,
+      });
+    } catch (thrown) {
+      // A synchronous EINVAL is what Windows can raise for an unresolved `.cmd`
+      // launcher; give it the same explanation as the asynchronous error path.
+      throw explainUnresolvedShim(toError(thrown, "failed to spawn dsh"), binary, launch);
+    }
     this.#child = child;
     // The pid exists synchronously, and it is reported from this same tick: the
     // provider records it on disk so the *next* plugin process can wait for this
@@ -2367,9 +2439,10 @@ export class DshProcess {
       // `'exit'`, so this is the only event that can mark the process dead.
       // Without it `running` stayed `true` after a failed `start()` and every
       // later request queued behind a pipe that no longer exists.
+      const failure = explainUnresolvedShim(error, binary, launch);
       this.#closed = true;
-      this.#failAll(error);
-      this.#processHandlers.onProtocolError(error.message);
+      this.#failAll(failure);
+      this.#processHandlers.onProtocolError(failure.message);
       this.#markExited();
     });
     child.on("exit", (code, signal) => {
@@ -2378,6 +2451,16 @@ export class DshProcess {
       this.#exitAll(code, signal);
       this.#markExited();
     });
+
+    // An unresolved Windows npm shim fails on the 'error' event. Wait for it so
+    // `start()` rejects with the explanation instead of racing the first request
+    // into a pipe that never existed. Resolved launches emit 'spawn' and go on.
+    if (isUnresolvedWindowsShim(binary, launch)) {
+      await new Promise<void>((resolveSpawn, rejectSpawn) => {
+        child.once("spawn", () => resolveSpawn());
+        child.once("error", (error) => rejectSpawn(explainUnresolvedShim(error, binary, launch)));
+      });
+    }
 
     if (this.#options.initializeRoute === false) return;
     if (this.#options.deferRoute === true) {

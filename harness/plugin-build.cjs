@@ -31,8 +31,8 @@
 
 "use strict";
 
-const { existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } = require("node:fs");
-const { join, relative, resolve, sep } = require("node:path");
+const { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } = require("node:fs");
+const { dirname, join, relative, resolve, sep } = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 const PLUGIN_DIR = resolve(__dirname, "..", "paseo-plugin");
@@ -116,6 +116,28 @@ function sourceFiles() {
 }
 
 /**
+ * Plain-JavaScript runtime assets under `server/` that `tsc` does not copy.
+ *
+ * `server/dsh-command.mjs` is deliberately ESM: the standalone `lib/doctor.mjs`
+ * imports it without a compile step, and `dsh-process.ts` imports it at runtime.
+ * A build that compiles the TypeScript but omits this file dies on the first
+ * `require("./server/dsh-process.js")` with MODULE_NOT_FOUND — the harness would
+ * report a plugin failure that is really a missing build artifact.
+ */
+function runtimeAssets() {
+  let entries;
+  try {
+    entries = readdirSync(join(PLUGIN_DIR, "server"));
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((name) => name.endsWith(".mjs"))
+    .sort()
+    .map((name) => join(PLUGIN_DIR, "server", name));
+}
+
+/**
  * Files that change what the compiler emits without being sources themselves.
  *
  * `sourceFiles()` is derived from `tsconfig.json`, so the config decides the
@@ -129,12 +151,17 @@ function sourceFiles() {
  *
  * The two files are compared with the same mtime logic as the sources and
  * recorded in the same stamp; `freshness()` keeps them out of the
- * expected-output list, because there is no `tsconfig.js` to emit.
+ * expected-output list, because there is no `tsconfig.js` to emit. The plain-JS
+ * runtime assets are recorded the same way: the build copies them verbatim, so
+ * an edited `dsh-command.mjs` must invalidate an existing tree just like an
+ * edited `.ts` source does.
  */
 function configInputs() {
-  return [join(PLUGIN_DIR, "tsconfig.json"), join(PLUGIN_DIR, "package.json")].filter((file) =>
-    existsSync(file),
-  );
+  return [
+    join(PLUGIN_DIR, "tsconfig.json"),
+    join(PLUGIN_DIR, "package.json"),
+    ...runtimeAssets(),
+  ].filter((file) => existsSync(file));
 }
 
 /** Everything the stamp records: the sources plus the config that produced them. */
@@ -272,6 +299,10 @@ function freshness(outDir, sources = sourceFiles()) {
   const expected = new Map(sources.map((file) => [compiledPath(relSource(file)), relSource(file)]));
   const missing = [...expected.keys()].filter((rel) => !existsSync(join(outDir, rel)));
   if (missing.length > 0) reasons.push(`missing compiled output: ${missing.join(", ")}`);
+  const missingAssets = runtimeAssets()
+    .map((file) => relSource(file))
+    .filter((rel) => !existsSync(join(outDir, rel)));
+  if (missingAssets.length > 0) reasons.push(`missing runtime asset: ${missingAssets.join(", ")}`);
   if (!existsSync(join(outDir, "package.json"))) {
     reasons.push("missing package.json marker (node would load the tree as ESM)");
   }
@@ -367,6 +398,15 @@ function buildPlugin(options = {}) {
     process.stderr.write(
       `[harness] warning: tsc exited ${String(result.status)} but emitted no output for ${missing.join(", ")}\n`,
     );
+  }
+
+  // Copy the plain-JS runtime assets `tsc` does not emit. They are imported by
+  // the compiled modules (and by the standalone doctor), so their absence is a
+  // broken build, not a missing optional file.
+  for (const asset of runtimeAssets()) {
+    const rel = relSource(asset);
+    mkdirSync(dirname(join(outDir, rel)), { recursive: true });
+    copyFileSync(asset, join(outDir, rel));
   }
 
   // The compiled tree is CommonJS even though `paseo-plugin/package.json` may

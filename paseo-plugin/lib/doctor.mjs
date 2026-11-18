@@ -60,6 +60,7 @@ import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveDshCommand } from "../server/dsh-command.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -284,10 +285,11 @@ function profileBundleVerdict(profileDir, profile) {
  * boot). Nothing else is touched.
  *
  * @param profile - profile name.
+ * @param launcher - the resolved DSH launcher (command + leading args).
  * @returns {{ status: number|null, stderr: string, error?: Error }}
  */
-function dumpProfile(profile) {
-  const result = spawnSync("dsh", ["--profile", profile, "--dump-config"], {
+function dumpProfile(profile, launcher) {
+  const result = spawnSync(launcher.command, [...launcher.args, "--profile", profile, "--dump-config"], {
     encoding: "utf8",
     stdio: ["ignore", "ignore", "pipe"],
     timeout: DUMP_TIMEOUT_MS,
@@ -450,6 +452,10 @@ function credentialContract(document, text, path) {
 
 function findPaseo() {
   // Prefer the app-bundled CLI: a `paseo` on PATH is often a stale npm install.
+  if (process.env.PASEO_CLI) {
+    const version = run(process.env.PASEO_CLI, ["--version"]);
+    if (version !== undefined) return { cmd: process.env.PASEO_CLI, version };
+  }
   const bundled = "/Applications/Paseo.app/Contents/Resources/bin/paseo";
   if (existsSync(bundled)) {
     const v = run(bundled, ["--version"]);
@@ -602,17 +608,27 @@ function loadBridgeFileList() {
 }
 
 /**
- * Absolute path of `dsh` on PATH, or `undefined`.
+ * Absolute path of the file that actually implements `dsh`, or `undefined`.
  *
- * `which` is not used: it is a separate process, absent on some minimal hosts,
- * and `run("dsh", …)` has already proved the CLI is startable by the time this
- * matters.
+ * On POSIX this is the `dsh` found on PATH (a symlink into the global install,
+ * as before). On Windows the launcher is a `.cmd` shim that does not live in the
+ * package, so the Node entry a resolved npm launch names is the file to walk up
+ * from. `which` is not used: it is a separate process, absent on some minimal
+ * hosts, and the dsh row above has already proved the CLI is startable by the
+ * time this matters.
  */
-function whichDsh() {
+function whichDsh(launcher) {
+  if (launcher !== undefined && launcher.args.length > 0) {
+    const entry = launcher.args[0];
+    if (existsSync(entry)) return entry;
+  }
+  const names = process.platform === "win32" ? ["dsh.exe", "dsh.cmd", "dsh"] : ["dsh"];
   for (const entry of (process.env.PATH ?? "").split(delimiter)) {
     if (entry === "") continue;
-    const candidate = join(entry, "dsh");
-    if (existsSync(candidate)) return candidate;
+    for (const name of names) {
+      const candidate = join(entry, name);
+      if (existsSync(candidate)) return candidate;
+    }
   }
   return undefined;
 }
@@ -631,9 +647,12 @@ function whichDsh() {
  * `dsh` on PATH is a symlink into the global install, so its realpath is walked
  * up to the package root that owns it. `undefined` when `dsh` is missing or the
  * layout does not match, and the caller then says the syntax was not validated.
+ *
+ * @param launcher - the resolved DSH launcher, whose Node entry (if any) points
+ *   straight at the package on Windows.
  */
-function dshPackageRequire() {
-  const dsh = whichDsh();
+function dshPackageRequire(launcher) {
+  const dsh = whichDsh(launcher);
   if (dsh === undefined) return undefined;
   try {
     let dir = dirname(realpathSync(dsh));
@@ -659,7 +678,7 @@ function dshPackageRequire() {
  * published install used to land there every time, which turned "this patch is
  * not YAML at all" into a `[warn]` and exit 0.
  */
-function loadYaml() {
+function loadYaml(launcher) {
   for (const name of ["yaml", "js-yaml"]) {
     try {
       return { name, module: require(name) };
@@ -667,7 +686,7 @@ function loadYaml() {
       // Try the next spelling; the caller reports when none resolves.
     }
   }
-  const fromDsh = dshPackageRequire();
+  const fromDsh = dshPackageRequire(launcher);
   if (fromDsh === undefined) return undefined;
   for (const name of ["yaml", "js-yaml"]) {
     try {
@@ -700,7 +719,12 @@ export function runDoctor() {
   );
 
   // 1. CLIs
-  const dshVersion = run("dsh", ["--version"]);
+  // The doctor must launch DSH the same way the provider will: on Windows the
+  // npm global install is a `.cmd` shim that neither `run()` nor `dumpProfile()`
+  // can execute directly. `PASEO_CLI` is the explicit escape hatch for hosts
+  // where the desktop app's bundled CLI is not on PATH.
+  const launcher = resolveDshCommand(process.env.DSH_BINARY ?? "dsh", process.env);
+  const dshVersion = run(launcher.command, [...launcher.args, "--version"]);
   if (dshVersion === undefined) {
     report("fail", "dsh on PATH", "install the official DeepSeek Harness and put `dsh` on the daemon's PATH");
   } else {
@@ -731,7 +755,16 @@ export function runDoctor() {
 
   const paseo = findPaseo();
   if (paseo === undefined) {
-    report("fail", "paseo CLI not found", "expected `paseo` on PATH or /Applications/Paseo.app");
+    // The Windows desktop app can host this provider without a PATH CLI, so a
+    // missing `paseo` is not a blocking install defect there; the app's own
+    // version has to be checked in the app instead (this row cannot read it).
+    report(
+      process.platform === "win32" ? "warn" : "fail",
+      process.platform === "win32" ? "paseo CLI version not checked" : "paseo CLI not found",
+      process.platform === "win32"
+        ? `the Windows desktop app can run without a PATH CLI; verify its version in the app (Paseo >= ${MINIMUM_PASEO})`
+        : "expected `paseo` on PATH, PASEO_CLI, or /Applications/Paseo.app",
+    );
   } else if (!atLeast(paseo.version, MINIMUM_PASEO)) {
     report(
       "fail",
@@ -856,7 +889,7 @@ export function runDoctor() {
   }
   const patch = patchRead.text;
 
-  const yaml = loadYaml();
+  const yaml = loadYaml(launcher);
   if (yaml === undefined) {
     // Semantics are judged on the parsed document now, so without a parser
     // there is nothing honest to say about the route or the credentials. Say
@@ -947,7 +980,7 @@ export function runDoctor() {
   // (a missing package.json makes it print `profile does not exist`, which the
   // row above already reports) and once the dsh CLI was found.
   if (profileBundle.ok && dshVersion !== undefined) {
-    const dumped = dumpProfile(profile);
+    const dumped = dumpProfile(profile, launcher);
     const diagnostics = dumpDiagnostics(dumped.stderr);
     const profileSkips = diagnostics.filter((entry) => entry.includes(`[${patchPath}]`));
     const skippedBundles = diagnostics.filter((entry) => /^dsh: skipping profile bundle "[^"]*":/.test(entry));

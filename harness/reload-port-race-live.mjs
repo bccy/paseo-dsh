@@ -34,6 +34,7 @@
  */
 import { createRequire } from "node:module";
 import { spawn, spawnSync } from "node:child_process";
+import { resolveDshCommand } from "../paseo-plugin/server/dsh-command.mjs";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { dirname, join } from "node:path";
@@ -106,9 +107,11 @@ async function runPortMode() {
     return realWrite(chunk, ...rest);
   };
 
-  const holder = spawn(process.env.DSH_BIN ?? "dsh", ["--profile", PROFILE], {
+  const holderLaunch = resolveDshCommand(process.env.DSH_BIN ?? process.env.DSH_BINARY ?? "dsh", process.env, process.cwd());
+  const holder = spawn(holderLaunch.command, [...holderLaunch.args, "--profile", PROFILE], {
     stdio: ["pipe", "pipe", "pipe"],
     env: { ...process.env, DSH_HOME: HOME },
+    windowsHide: true,
   });
   const holderLines = [];
   holder.stdout.setEncoding("utf8");

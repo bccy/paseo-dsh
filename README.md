@@ -376,6 +376,9 @@ rm -rf ../.dbg
   （Node 20.4 起提供，`dsh-bridge/lib/session-projections.js`）。实际只在 Node 22.23.1 上验证过，
   20.4 本身未实测。插件本身跑在 Paseo daemon 的 Node 里，包**不**声明 `engines`——没有实测过的
   最小版本不写进声明。
+- **Windows**：npm 全局安装的 `dsh` 是 `dsh.cmd` shim，provider、`doctor` 与 harness 会自动把它
+  解析成 Node 入口启动（不经过命令 shell）；`DSH_BINARY` 与原生可执行文件覆盖保持优先。详见
+  [docs/WINDOWS.md](docs/WINDOWS.md)。
 
 ## 界面语言（中文 / English）
 

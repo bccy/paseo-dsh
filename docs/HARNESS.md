@@ -293,9 +293,9 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   都清零计数（此后两次超时仍被容忍）。2026-11-10 新增 4 条（review P2-3）：成功带 job→超时返回
   同一 job；`available:false` 不覆盖缓存（其后超时仍带该 job）；`detachSession` 后超时为 `[]`
   且 0 日志。**取舍**：容忍窗口内已结算的 job 最多再挂 ~148s（8×15s 读 + 7×4s 轮询）。运行：
-  `cd paseo-plugin && npx tsc --noEmit false --outDir .dbg
-  --declaration false --module commonjs --moduleResolution node`；`echo '{"type":"commonjs"}' >
-  .dbg/package.json`；`cp ../harness/jobs-timeout-check.cjs .dbg/`；`cd .dbg && node
+  从仓库根 `node -e "require('./harness/plugin-build.cjs').buildPlugin({dir:'.dbg',quiet:false})"`
+  （`buildPlugin` 会复制 `server/*.mjs` 运行时资产并写好 CJS `package.json`）；
+  `cp harness/jobs-timeout-check.cjs paseo-plugin/.dbg/`；`cd paseo-plugin/.dbg && node
   jobs-timeout-check.cjs`。**动了 `dsh-process.ts` 的 `jobs()` / `JOBS_TIMEOUT_TOLERANCE` /
   `#consecutiveJobsTimeouts` 必跑。**
 - `harness/jobs-stop-check.mjs` — **终止后台 job 的整条离线链**（2026-11-11，**45 条**；假
@@ -539,8 +539,8 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   `server.js` 的 `revert` 事务、`pendingUserMessages` 跟踪、`beginFileMutation`/
   `finishFileMutation`/`ownsFileMutation` 或 `file-mutation-gate.js` 必跑。**
 - `harness/plugin-build.cjs` — **不是检查，是需要编译产物的 harness 共用的构建基础设施**
-  （当前调用方见 `grep -l plugin-build harness/*`；`plugin-check.cjs` 仍走自己头部注释里的
-  手工 `tsc` 步骤，不在其中）。
+  （当前调用方见 `grep -l plugin-build harness/*`；`plugin-check.cjs` 的产物由它头部注释里的
+  `buildPlugin()` 调用生成，它自身要先被复制进产物目录，所以不在这些调用方之中）。
   它决定已有的编译树能否复用（源码集合 + 构建戳），判错不会让产物看起来有任何异常，只会让
   **其它检查在陈旧或残缺的产物上假绿**——这是这里最危险的失效形态。`resolvePluginBuild()`
   自动编译到 `paseo-plugin/.dbg-*`（产物必须在仓库内，`/tmp` 下 node 向上找不到
@@ -1285,9 +1285,10 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   `ok:false` 原文、空 edit 不发帧；**+8 条 `currentTask` 三态**：有 `in_progress`（合并进
   `GoalState.currentTask` 且 trim）/ 无 in_progress / `todos:null` / 投影 key 缺失 / 老桥无
   `projections` 方法 / 真实读失败（字段缺省 + 一次性 stderr，goal 读取不受影响）；跨层断言
-  逐字比较「桥的缺失服务文案 / 插件常量 / 假桥常量」三方。运行：编译插件到 `.dbg`
-  （`npx tsc --noEmit false --outDir .dbg --declaration false --module commonjs
-  --moduleResolution node`，类型噪音预期），再 `cd .dbg && node goal-server-check.cjs`。
+  逐字比较「桥的缺失服务文案 / 插件常量 / 假桥常量」三方。运行：从仓库根
+  `node -e "require('./harness/plugin-build.cjs').buildPlugin({dir:'.dbg',quiet:false})"`
+  编译插件到 `paseo-plugin/.dbg`（会复制 `server/*.mjs` 并写好 CJS `package.json`），
+  再 `cd paseo-plugin/.dbg && node goal-server-check.cjs`。
   **动了 `server/provider.ts` 的 goal/`currentTask` 读写、`server/session.ts` 的
   `goal()`/`currentTask()`/`controlGoal`、`server/dsh-process.ts` 的 goal 分级与
   `currentTask`、`index.server.ts` 的 goal handler 或桥的缺失服务文案必跑。**
@@ -1430,8 +1431,9 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   第一个会话失败不影响其它会话**（给 `DshSession.readDshSettings` 打一个只对首个会话抛错的补丁
   → 其它打开会话仍收到 `session.config` 新值；全部失败时只写一条 stderr，含
   `failed for every open session`——快速原型里 `#refreshSettings` 固定读 `sessions[0]` 会整次
-  丢弃刷新）。跑法只有一种：先把插件编译进 `paseo-plugin/.dbg`（命令同 `plugin-check.cjs` 头部第一步，
-  `.dbg/package.json` 写 `{"type":"commonjs"}`），再**从仓库根**跑
+  丢弃刷新）。跑法只有一种：先从仓库根把插件编译进 `paseo-plugin/.dbg`（用
+  `node -e "require('./harness/plugin-build.cjs').buildPlugin({dir:'.dbg',quiet:false})"`
+  构建，它复制 `server/*.mjs` 并写好 CJS `package.json`），再**从仓库根**跑
   `node harness/settings-passthrough-check.cjs`——它 require `paseo-plugin/.dbg/index.server.js`，
   假桥从 `harness/` 取，无需拷贝。在 `.dbg` 内部跑不行：脚本按 `__dirname/..` 定位 `dsh-bridge/`，
   从 `.dbg` 会指到 `paseo-plugin/dsh-bridge`（V-P3）。**动了 `server/{dsh-process,session,provider}.ts`
@@ -1488,3 +1490,22 @@ Paseo 回收空闲会话前会问 provider「现在释放运行时会不会杀�
 `paseo/activity` / `session/close` 段，或 `paseo-plugin/server/{session,dsh-process,provider}.ts`
 的能力声明与关闭段 → 上面三项 + `harness/bridge-assets-check.mjs`（改桥后必须先重生成内嵌桥）
 + `harness/dsh-api-contract-check.mjs`（本链的事件名与 `agents` 服务契约在 3d 段，改名必须转红）。
+
+## Windows 启动器（2026-11-18）
+
+- `paseo-plugin/test/process.test.cjs` — Windows npm 启动器与进程回归。断言：`dsh.cmd` shim
+  按官方 npm 布局解析成 `node.exe <package>/<bin>`（相邻 `node.exe` 优先、原生 `dsh.exe` 不被
+  改写）、入口缺失时带说明失败且不回退为直接 spawn `.cmd`、macOS/Linux 启动命令不变、
+  `DSH_BINARY` 从插件进程环境生效、spawn 与 catalog 指纹同源且优先于 PATH、argv/stdin/stderr/退出码原样传递、doctor 识别 npm
+  DSH 且 Windows 上把缺失 `paseo` CLI 降为 warning。用一次性 npm 布局夹具，不需要凭据/profile/
+  模型；测试先经 `harness/plugin-build.cjs` 编译（Node 24）。
+  命令：`cd paseo-plugin && npm ci --ignore-scripts --no-audit --no-fund && npm run typecheck && npm run test:process`。
+  CI：`.github/workflows/process-compatibility.yml`（windows/ubuntu/macos 三平台）。
+  **改了 `server/dsh-command.mjs`/`.d.mts`、`server/dsh-process.ts` 的 spawn 段、
+  `server/catalog-cache.ts` 的版本探测、`lib/doctor.mjs` 的 CLI/dump 段、任一 harness 启动
+  dsh 的脚本，或 `harness/plugin-build.cjs` 的 runtime asset 复制必跑。**
+- `harness/plugin-build.cjs` 现在会把 `paseo-plugin/server/*.mjs` 原样复制进编译树（`tsc` 不
+  emit 非 TS 文件），并把它们计入构建新鲜度。改这一段必须同时跑
+  `node harness/plugin-build-check.mjs` 与 `node harness/bridge-assets-check.mjs`。
+- 改 `resolveDshBinary()` 的 DSH_BINARY 语义（显式路径必须可执行、不静默回退）时，另跑
+  `node harness/dsh-binary-check.mjs`。

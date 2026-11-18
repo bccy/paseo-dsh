@@ -35,18 +35,19 @@
  * and the segment exercises a qualifying toggle when the profile happens to
  * expose one, printing the reason when it skips.
  *
- * The plugin is TypeScript, so it has to be compiled before it can be required:
+ * The plugin is TypeScript, so it has to be compiled before it can be required.
+ * Use the repository's own builder, **not** a bare `tsc --outDir`: `tsc` only
+ * emits TypeScript, so the plain-JS runtime assets (`server/dsh-command.mjs`,
+ * which the compiled `server/dsh-process.js` requires) would be missing and the
+ * first `require` would die with MODULE_NOT_FOUND on every platform.
+ * `buildPlugin()` copies them, writes the CommonJS `package.json` marker and
+ * records build freshness (see the header of `harness/plugin-build.cjs`).
  *
- *   cd paseo-plugin
- *   npx tsc --noEmit false --outDir .dbg --declaration false \
- *     --module commonjs --moduleResolution node
- *   echo '{"type":"commonjs"}' > .dbg/package.json
- *   cp ../harness/plugin-check.cjs .dbg/
- *   cd .dbg && node plugin-check.cjs
- *   rm -rf ../.dbg          # afterwards
- *
- * The type errors tsc prints under `--moduleResolution node` are expected; the
- * emitted JavaScript is what runs.
+ *   # from the repository root:
+ *   node -e "require('./harness/plugin-build.cjs').buildPlugin({ dir: '.dbg', quiet: false })"
+ *   cp harness/plugin-check.cjs paseo-plugin/.dbg/
+ *   ( cd paseo-plugin/.dbg && node plugin-check.cjs )
+ *   rm -rf paseo-plugin/.dbg      # afterwards
  *
  * `--self-test` runs only the offline half (compiled module loads + the
  * image-block translation the real-model checks below assert on), so the

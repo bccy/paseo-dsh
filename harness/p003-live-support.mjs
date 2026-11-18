@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { resolveDshCommand } from '../paseo-plugin/server/dsh-command.mjs';
 const require = createRequire(import.meta.url);
 
 export function liveProfile({ projections = false } = {}) {
@@ -63,8 +64,9 @@ export function apply(ctx) {
 }
 
 export function bridge(profile) {
-  const child = spawn(process.env.DSH_BINARY ?? join(homedir(), '.npm-global/bin/dsh'), ['--profile', 'p003'],
-    { cwd: profile.home, env: profile.env, stdio: ['pipe', 'pipe', 'pipe'] });
+  const launch = resolveDshCommand(process.env.DSH_BINARY ?? join(homedir(), '.npm-global/bin/dsh'), profile.env, profile.home);
+  const child = spawn(launch.command, [...launch.args, '--profile', 'p003'],
+    { cwd: profile.home, env: profile.env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   const frames = [], pending = new Map(); let id = 0, stderr = '';
   child.stderr.on('data', data => { stderr += data; });
   const send = frame => child.stdin.write(JSON.stringify(frame) + '\n');

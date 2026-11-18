@@ -26,6 +26,7 @@
  * runtime when done. It does not read or print any credential.
  */
 import { spawn } from "node:child_process";
+import { resolveDshCommand } from "../paseo-plugin/server/dsh-command.mjs";
 
 const PROFILE = process.env.DSH_PASEO_PROFILE ?? "paseo";
 const SESSION_ID = `subagent-live-${Date.now()}`;
@@ -35,10 +36,12 @@ const PROMPT =
   "Inside the subagent, do not start any further subagents. " +
   "After it answers, reply with the word DONE.";
 
-const child = spawn("dsh", ["--profile", PROFILE], {
+const launch = resolveDshCommand(process.env.DSH_BINARY ?? "dsh", process.env, process.cwd());
+const child = spawn(launch.command, [...launch.args, "--profile", PROFILE], {
   cwd: process.cwd(),
   stdio: ["pipe", "pipe", "pipe"],
   env: process.env,
+  windowsHide: true,
 });
 
 const pending = new Map();

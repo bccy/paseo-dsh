@@ -23,6 +23,7 @@
  */
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
+import { resolveDshCommand } from "../paseo-plugin/server/dsh-command.mjs";
 
 const require = createRequire(import.meta.url);
 const { announceDshHome, prepareDshHome } = require("./isolated-dsh-home.cjs");
@@ -42,10 +43,12 @@ try {
 }
 announceDshHome(runMode);
 
-const child = spawn("dsh", ["--profile", PROFILE], {
+const launch = resolveDshCommand(process.env.DSH_BINARY ?? "dsh", process.env, process.cwd());
+const child = spawn(launch.command, [...launch.args, "--profile", PROFILE], {
   cwd: process.cwd(),
   stdio: ["pipe", "pipe", "pipe"],
   env: process.env,
+  windowsHide: true,
 });
 
 const pending = new Map();

@@ -191,7 +191,8 @@ doctor/probe；`npx paseo-dsh` 解析的是**npm 上游稳定线的包**（上�
 
 **动了插件层（`paseo-plugin/server/*.ts`）就一定跑 `harness/plugin-check.cjs`**——
 它断言的是事件形状，而事件形状错了界面不会报错，只会悄悄不对。运行步骤写在那个文件
-的头部注释里（插件是 TS，要先编成 CJS 才能 require）。
+的头部注释里（插件是 TS，要先编成 CJS 才能 require；用仓库自带的 `harness/plugin-build.cjs`
+构建，它会连 `server/*.mjs` 运行时资产一起复制——裸 `tsc --outDir` 会缺文件）。
 
 注意它**不是纯离线**：不设 `DSH_BINARY` 时会起真实 `dsh --profile` 跑真实模型回合（耗
 token），并且加载插件会把内嵌桥写进所用 `DSH_HOME` 的 profile（默认是一次性克隆；

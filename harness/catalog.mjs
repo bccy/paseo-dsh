@@ -7,9 +7,15 @@
  *   DSH_PASEO_PROFILE=my-profile node harness/catalog.mjs
  */
 import { spawn } from 'node:child_process';
+import { resolveDshCommand } from '../paseo-plugin/server/dsh-command.mjs';
 
 const PROFILE = process.env.DSH_PASEO_PROFILE ?? 'paseo';
-const child = spawn('dsh', ['--profile', PROFILE], { cwd: process.cwd(), stdio: ['pipe', 'pipe', 'pipe'] });
+const launch = resolveDshCommand(process.env.DSH_BINARY ?? 'dsh', process.env, process.cwd());
+const child = spawn(launch.command, [...launch.args, '--profile', PROFILE], {
+  cwd: process.cwd(),
+  stdio: ['pipe', 'pipe', 'pipe'],
+  windowsHide: true,
+});
 let buffer = '';
 const pending = new Map();
 let nextId = 1;

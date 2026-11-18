@@ -23,6 +23,8 @@
 import { spawn } from 'node:child_process';
 import { createWriteStream } from 'node:fs';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+import { resolveDshCommand } from '../paseo-plugin/server/dsh-command.mjs';
 
 const require = createRequire(import.meta.url);
 const { announceDshHome, prepareDshHome } = require('./isolated-dsh-home.cjs');
@@ -35,7 +37,7 @@ function argumentOf(name, fallback) {
   return index >= 0 && process.argv[index + 1] !== undefined ? process.argv[index + 1] : fallback;
 }
 
-const OUT = argumentOf('--out', new URL('./frames.jsonl', import.meta.url).pathname);
+const OUT = argumentOf('--out', fileURLToPath(new URL('./frames.jsonl', import.meta.url)));
 const WAIT_MS = Number(argumentOf('--wait-ms', '45000'));
 
 let runMode;
@@ -49,10 +51,12 @@ announceDshHome(runMode);
 
 const out = createWriteStream(OUT);
 
-const child = spawn(BINARY, ['--profile', process.env.DSH_PASEO_PROFILE ?? 'paseo'], {
+const launch = resolveDshCommand(BINARY, process.env, process.cwd());
+const child = spawn(launch.command, [...launch.args, '--profile', process.env.DSH_PASEO_PROFILE ?? 'paseo'], {
   cwd: process.cwd(),
   stdio: ['pipe', 'pipe', 'pipe'],
   env: process.env,
+  windowsHide: true,
 });
 
 const pending = new Map();

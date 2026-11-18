@@ -35,13 +35,13 @@
  */
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { resolveDshCommand } from '../paseo-plugin/server/dsh-command.mjs';
 
 const require = createRequire(import.meta.url);
 const { announceDshHome, prepareDshHome } = require('./isolated-dsh-home.cjs');
 const { classifyRouteOutcome, routeExitCode } = require('./harness-gates.cjs');
 
 const PROFILE = process.env.DSH_PASEO_PROFILE ?? 'paseo';
-const BINARY = process.env.DSH_BINARY ?? 'dsh';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function argumentOf(name, fallback) {
@@ -62,7 +62,12 @@ announceDshHome(runMode);
 
 /** Spawn one bridge process and return JSON-RPC plus a raw event sink. */
 function bridge(onEvent, onExit) {
-  const child = spawn(BINARY, ['--profile', PROFILE], { cwd: process.cwd(), stdio: ['pipe', 'pipe', 'pipe'] });
+  const launch = resolveDshCommand(process.env.DSH_BINARY ?? 'dsh', process.env, process.cwd());
+  const child = spawn(launch.command, [...launch.args, '--profile', PROFILE], {
+    cwd: process.cwd(),
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
   let buffer = '';
   const pending = new Map();
   let nextId = 1;
