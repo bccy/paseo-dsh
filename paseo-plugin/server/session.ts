@@ -664,6 +664,15 @@ export class DshSession {
    * back to the same session.
    */
   #pendingPermissions = new Map<string, { sessionId: string; resolve: (response: ProviderPermissionResponse) => void }>();
+  /**
+   * Suffix counter for a card whose natural id is already pending in this session.
+   *
+   * Cards are keyed by id in {@link #pendingPermissions}, so a duplicate would
+   * replace the earlier promise. The question/plan ids are derived from the DSH
+   * request's tool-call id, which the bridge may omit, so two of them can derive
+   * the same id; see {@link uniqueCardId}.
+   */
+  #cardSeq = 0;
   /** Native subagent child sessions, keyed by DSH's own child session id. */
   #children = new Map<string, DshChildSession>();
   /**
@@ -2814,6 +2823,56 @@ export class DshSession {
     // card must resolve on the child, not the parent.
     this.#options.emit({ type: "session.permission_resolved", sessionId: entry.sessionId, permissionId });
     entry.resolve(response);
+    // Deny-and-stop: the host sets `interrupt` when the user chose to stop rather
+    // than merely answer. Without this the model kept running after the user
+    // stopped it — the card was answered, so nothing failed and nothing said so.
+    if (response.behavior === "deny" && response.interrupt === true) {
+      this.#interruptAfterDenial(entry.sessionId);
+    }
+  }
+
+  /**
+   * Cancel the turn that asked for a card the user denied with "stop".
+   *
+   * The card remembers the session that asked (the root, or a native child whose
+   * card was promoted into this one), because that is what the interruption must
+   * target: deny-and-stop on a promoted child card stops only that child, while a
+   * root card stops the root turn.
+   *
+   * A root interruption goes through {@link interrupt}, which owns the local
+   * settle/fallback bookkeeping; a child's turn is canceled by its own DSH session
+   * id through the bridge, because a child view is read-only from Paseo and DSH's
+   * own `turn/end` (canceled) is what settles its row. Note that this fork's
+   * bridge does not (yet) carry the child-cancel branch upstream's does, so a real
+   * bridge answers the child cancel with "unknown or not-yet-created session" —
+   * the attempt is still the only protocol the plugin can make, and the failure is
+   * logged (see docs/FIELD-NOTES.md, "拒绝并停止").
+   *
+   * An interruption that fails is logged, never swallowed: a stop the user asked
+   * for and the runtime refused is exactly what someone has to be able to find.
+   */
+  #interruptAfterDenial(ownerSessionId: string): void {
+    if (ownerSessionId === this.id) {
+      this.interrupt().catch((error: unknown) => {
+        this.#options.log(`interrupt after denial failed: ${messageOf(error)}`);
+      });
+      return;
+    }
+    const child = this.#childByProviderId.get(ownerSessionId);
+    if (child === undefined) {
+      this.#options.log(`interrupt after denial skipped: no live child view for ${ownerSessionId}`);
+      return;
+    }
+    let cancel: Promise<void>;
+    try {
+      cancel = this.#require().cancel(child.nativeId, INTERRUPT_ACK_TIMEOUT_MS);
+    } catch (error) {
+      this.#options.log(`interrupt after denial of subagent ${child.nativeId} failed: ${messageOf(error)}`);
+      return;
+    }
+    cancel.catch((error: unknown) => {
+      this.#options.log(`interrupt after denial of subagent ${child.nativeId} failed: ${messageOf(error)}`);
+    });
   }
 
   /**
@@ -3815,8 +3874,9 @@ export class DshSession {
   ): Promise<ProviderPermissionResponse> {
     const permission: ProviderPermissionRequest = {
       // Session-scoped so a parent and a child that share a tool-call id never
-      // collide in the pending map, and the resolution returns to the asker.
-      id: `${sessionId}:${request.callId ?? "question"}`,
+      // collide in the pending map, and the resolution returns to the asker; a
+      // card already pending in this session gets a suffix instead of replacing it.
+      id: this.#nextCardId(`${sessionId}:${request.callId ?? "question"}`),
       name: "ask_user_question",
       kind: "question",
       title: request.questions.length === 1 ? (headers[0] as string) : UI.questionsTitle,
@@ -3850,7 +3910,7 @@ export class DshSession {
     question: DshQuestion,
   ): Promise<ProviderPermissionResponse> {
     const permission: ProviderPermissionRequest = {
-      id: `${sessionId}:${request.callId ?? "question"}:${question.id}`,
+      id: this.#nextCardId(`${sessionId}:${request.callId ?? "question"}:${question.id}`),
       name: "exit_plan_mode",
       kind: "plan",
       title: UI.planCard.title,
@@ -3903,6 +3963,38 @@ export class DshSession {
       });
       return { outcome: signal.aborted ? "cancelled" : response.behavior === "allow" ? "allowed-once" : "rejected" };
     } finally { signal.removeEventListener("abort", cancel); }
+  }
+
+  /**
+   * Reserve a card id that no other pending card in this session holds.
+   *
+   * Question and plan cards are both derived from the DSH request's tool-call id.
+   * **This is a defensive guard, not a demonstrated end-to-end defect.** The
+   * fork's bridge mounts `tool-ask-user` with no config
+   * (`dsh-bridge/cordis.patch.yml:29-31`), which selects that tool's legacy mode
+   * (`@deepseek-ai/dsh-tool-ask-user/lib/index.js:212-222`); the legacy `execute`
+   * calls `userQuestions.ask({ questions, agent, signal })` without `wait`
+   * (same file:304-315), so the bridge frames `callId: null`
+   * (`dsh-bridge/lib/index.js:224`) and every legacy question in one session
+   * derives the same `${sessionId}:question` id. In normal flow two of them cannot
+   * be pending at once: `ask_user_question` declares no `isConcurrencySafe`, so
+   * DSH runs it exclusive (`@deepseek-ai/dsh-tools/lib/pipeline.js:284-289`) and
+   * the blocking legacy ask holds its step. The collision is therefore structural
+   * (the id derivation is not injective), not something this package reproduced;
+   * the guard keeps such a duplicate from silently replacing an earlier promise in
+   * `#pendingPermissions` — that card could never be answered and DSH would wait
+   * for its own timeout. The caller passes the id to {@link #openCard}
+   * synchronously, so no other registration can slip between the check and the
+   * insert.
+   *
+   * Tool approvals do not go through this: their id carries the bridge's
+   * per-request UUID (`dsh-bridge/lib/approval.js`), which is already unique, and
+   * the abort path resolves it by that exact id.
+   */
+  #nextCardId(id: string): string {
+    const picked = uniqueCardId(id, new Set(this.#pendingPermissions.keys()), this.#cardSeq);
+    this.#cardSeq = picked.seq;
+    return picked.id;
   }
 
   #openCard(sessionId: string, permission: ProviderPermissionRequest): Promise<ProviderPermissionResponse> {
@@ -4662,25 +4754,33 @@ function uniqueHeaders(questions: readonly DshQuestion[]): string[] {
   });
 }
 
+/** One question's answer in DSH's shape: option labels, and what the user typed. */
+type QuestionAnswer = { selected: string[]; custom?: string };
+
 /**
  * Recover one question's answer from a permission response.
  *
- * Paseo answers through `updatedInput.answers[<header>]` — a string, comma-joined
- * when multi-select — so `selectedActionId` is only a fallback for button-style
- * resolutions. A string that matches none of the question's option labels is the
- * picker's "Other" free text rather than a chosen label: DSH's answer item has a
- * separate `custom` field for exactly that, so it travels there instead of being
- * reported as an option label the model never offered.
+ * DSH keeps the two channels apart: `selected` holds option labels only and
+ * `custom` holds what the user typed, which is also how DSH's own question card
+ * answers. Paseo answers through `updatedInput.answers[<header>]` as **one
+ * string**: a single-select question returns the chosen label, or the typed text
+ * in its place; a multi-select one joins the chosen labels and then any typed text
+ * with ", ". So a single-select answer is a label when it matches one exactly and
+ * typed text otherwise, and a multi-select answer is read against the question's
+ * own labels (see {@link readMultiSelect}) instead of being split — a label may
+ * itself contain ", ", which is exactly what splitting cannot recover.
+ * `selectedActionId` is only a fallback for button-style resolutions.
  *
- * Multi-select stays one list: the picker joins labels (and an "Other" entry,
- * when present) into the same comma-separated string, and Paseo's own adapters
- * split it the same way, so there is no reliable boundary to recover.
+ * A denial has no labels at all; the user's dismissal note is the answer.
+ *
+ * Pure, and exported so the answer reading can be unit-tested directly (see
+ * `test/question-answer.test.cjs`) instead of only through a scripted bridge.
  */
-function selectAnswer(
+export function selectAnswer(
   question: DshQuestion,
   header: string,
   response: ProviderPermissionResponse,
-): { selected: string[]; custom?: string } {
+): QuestionAnswer {
   if (response.behavior === "deny") {
     return {
       selected: [],
@@ -4690,22 +4790,46 @@ function selectAnswer(
   const answers = isRecord(response.updatedInput) ? response.updatedInput["answers"] : undefined;
   const raw = isRecord(answers) ? answers[header] : undefined;
   if (typeof raw === "string" && raw.trim().length > 0) {
-    const answer = raw.trim();
+    const text = raw.trim();
     if (question.multiSelect === true) {
-      return {
-        selected: answer
-          .split(",")
-          .map((entry) => entry.trim())
-          .filter((entry) => entry.length > 0),
-      };
+      return readMultiSelect(text, (question.options ?? []).map((option) => option.label));
     }
-    const match = (question.options ?? []).find((option) => option.label === answer);
-    return match === undefined ? { selected: [], custom: answer } : { selected: [match.label] };
+    const match = (question.options ?? []).find((option) => option.label === text);
+    return match === undefined ? { selected: [], custom: text } : { selected: [match.label] };
   }
   const options = question.options ?? [];
   const index = Number(response.selectedActionId);
   const label = Number.isInteger(index) ? options[index]?.label : undefined;
   return { selected: label === undefined ? [] : [label] };
+}
+
+/**
+ * Read a multi-select answer as the labels it starts with and the typed text after
+ * them.
+ *
+ * Paseo joins the chosen labels with ", " and appends the picker's "Other" text the
+ * same way, and a label may itself contain ", " — so the string cannot be split.
+ * At each position the longest label that is followed by ", " or ends the string
+ * wins, so "Red, warm" is one option when the question offers it, not "Red" plus
+ * typed "warm". Whatever no label accounts for is the text the user typed, which
+ * Paseo always appends last.
+ */
+function readMultiSelect(text: string, labels: readonly string[]): QuestionAnswer {
+  const longestFirst = [...new Set(labels)]
+    .filter((label) => label.length > 0)
+    .sort((a, b) => b.length - a.length);
+  const selected: string[] = [];
+  let rest = text;
+  for (;;) {
+    const label = longestFirst.find(
+      (candidate) => rest === candidate || rest.startsWith(`${candidate}, `),
+    );
+    if (label === undefined) break;
+    if (!selected.includes(label)) selected.push(label);
+    rest = rest.slice(label.length + ", ".length);
+  }
+  const custom = rest.trim();
+  return custom === "" ? { selected } : { selected, custom };
 }
 
 /**
@@ -4722,4 +4846,39 @@ function planAnswer(question: DshQuestion, response: ProviderPermissionResponse)
   }
   const keep = (question.options ?? []).find((option) => option.label !== approve)?.label;
   return keep === undefined ? [] : [keep];
+}
+
+/**
+ * A card id that no pending card in this session already holds.
+ *
+ * `#pendingPermissions` is keyed by this id, so a duplicate **replaces** the
+ * earlier promise: the replaced card can no longer be answered, and DSH sits on it
+ * until its own timeout. The natural id is not unique by construction — a question
+ * request without a tool-call id falls back to one shared literal, and DSH's
+ * question service permits several pending questions in one session — so a
+ * collision gets a numeric suffix. The caller keeps the returned counter, so a
+ * third card skips the suffix the second one took.
+ *
+ * Pure so the collision rule can be unit-tested directly (see
+ * `test/question-answer.test.cjs`); the session layer wraps it in
+ * `#nextCardId`.
+ *
+ * @param id - the card's natural id.
+ * @param taken - ids that are already pending in this session.
+ * @param seq - the first suffix to try.
+ * @returns the id to register and the next suffix to try.
+ */
+export function uniqueCardId(
+  id: string,
+  taken: ReadonlySet<string>,
+  seq: number,
+): { id: string; seq: number } {
+  if (!taken.has(id)) return { id, seq };
+  let candidate = `${id}:${seq}`;
+  let next = seq + 1;
+  while (taken.has(candidate)) {
+    candidate = `${id}:${next}`;
+    next += 1;
+  }
+  return { id: candidate, seq: next };
 }

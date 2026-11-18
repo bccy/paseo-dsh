@@ -1130,6 +1130,18 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   块恰好多出一条 markdown `assistant_message`、路径逐段编码、无 `hostPath` 不出行、过
   `ProviderEventSchema`、`history: "replay"` 重建同一条。**动了图片块翻译必跑。**
 
+- `paseo-plugin/test/question-answer.test.cjs` — 提问卡的两条回答通道、拒绝并停止、待答卡片
+  id 唯一化（直载 `server/provider.ts` + `test/register-typescript.cjs`；假 `dsh` 用
+  `harness/fake-dsh-bridge.mjs` 的 `live` 场景，不 spawn 真 DSH、不读 profile、不耗模型）。
+  **9 条**：多选按问题自己的选项标签读（标签本身含 ", " 不被拆开）、"其他"文字进 `custom`、
+  无选项题一律 `custom`、单选标签/文字回归、deny + message 进 `custom`、`uniqueCardId` 四组；
+  集成两条用假桥 `DSH_FAKE_LOG` 的请求帧断言协议边界：child 卡 deny+interrupt 只发 child native
+  id 的 `session/cancel`、root 卡取消 root、不带 `interrupt` 不产生 cancel 帧。运行：
+  `cd paseo-plugin && npm ci && node --test test/question-answer.test.cjs`。这是
+  **`paseo-plugin/test/` 新测试树的第一项**，因而不在 `harness/offline-checks.cjs` 的可执行清单
+  里（runner 接入方式待定，见交付记录）。**动了 `server/session.ts` 的 `selectAnswer` /
+  `readMultiSelect`、`resolvePermission` / `#interruptAfterDenial`、问题/计划卡 id 生成必跑。**
+
 ### 真实 profile / 诊断工具
 
 - `harness/plugin-check.cjs` — 插件层总检（驱动真实插件，无 daemon）：`session.usage` 真实
