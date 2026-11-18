@@ -4530,3 +4530,49 @@ shellEnv 时遗漏了两个夹具，产生假红；因此新增 push/PR gate，�
 复核另纠正一处假宿主反例：直接调用已关闭流的答案回调会覆盖新数据，但 Paseo 0.16 SDK 的
 `subscribePluginRpc` 在 `closed` 后丢弃事件。该反例绕过了真实封装，不能作为线上迟到帧缺陷的
 证据；本轮没有为它另造一套流代号。测试要保留真实边界，不能用比宿主更宽的夹具证明线上故障。
+
+## 第三十七轮：空闲回收不问 DSH，后台工作随会话一起消失（2026-11-19）
+
+### 112. 宿主只认协商到的能力位：没声明 `session.can_stop_runtime`，Paseo 空闲回收直接释放会话
+
+**症状**：会话空闲一小时后，DSH 进程里还在跑的后台 shell（jobs）、运行中的子代理、定时提醒
+一起消失，界面上没有任何报错。用户看到的是「过一阵子我的任务就没了」。
+
+**根因**：Paseo 0.16.1 的回收器先排除自己的前台工作（`runtimeHasNoPendingWork`，见
+`@getpaseo/server/dist/server/server/agent/agent-manager.js:1284-1297`），再看 provider 有没有
+协商 `session.can_stop_runtime`（`idle-runtime-cleanup/index.js:29-40`）：**没声明就不问直接回收**。
+而「保留/释放」判定的是 DSH 进程这一侧看不见的工作——后台 shell、子代理、定时提醒都只存在于
+DSH 进程内。宿主问到时，它只给 10 s（`plugin-provider.js:512-524`），超时或 `request.failed`
+都按「保留运行时」处理。
+
+**fork 与上游的结构差异**：上游（0.2.26）一个 bridge 进程只服务一个 root 会话，所以
+`1867f0e` 让 root 问「本进程全部 live agent」。fork 的 provider 是一个进程池 —— 一个 DSH 子进程
+服务同一连接的所有 root 会话，`#releasePoolProcess` 明确「最后一个 claim 归还也不回收子进程」。
+因此释放一个 root 只会结束**该 root 的 agent 及其原生子代理子树**，其他 root 的会话不受影响：
+桥的 `paseo/activity` 范围是「被释放的会话 + 它的子代理子树」，root 与 child 同一条规则。
+子会话 id 映射也按 fork 结构走：Paseo 的 child provider id 是 `agentId:sub:<原生 id>`，桥侧只认
+原生 id（`DshChildSession.nativeId`），root 用 `DshSession.dshId`。
+
+**修法**：
+
+- `dsh-bridge/lib/activity.js`：`runtimeActivity` 用 DSH 自己的归档准入
+  `ctx.waterfall('workspace/session-activity', { sessionId }, () => Promise.resolve([]))` 回答每
+  个范围内的会话，条目按 stdio 形状收窄（family 没有可识别 kind 也算活动）。缺 `ctx.waterfall`、
+  缺 `ctx.agents.list`、waterfall 返回非数组都**抛错**；答案为空才表示「没有会丢的工作」。
+- `dsh-bridge/lib/server.js`：新增 `paseo/activity`（只认本桥 initialize 过的 root 或已登记的
+  原生 child，其他 id 一律 `unknown session`），分发表接线。范围来自桥自己的 `children` 表，
+  表里没有的 live child 用其会话 header 的 `parentSession` 补链。
+- `paseo-plugin/server/dsh-process.ts`：`activity(sessionId)`，8 s 超时（先于宿主的 10 s 失败，
+  让日志说清原因），答复不是数组就抛错。
+- `paseo-plugin/server/session.ts`：`canStopRuntime` 把 Paseo provider id 映射到原生 id，
+  活动非空时写一行 `kept <id> running for DSH work: <kind> "<label>" (in <native id>)`；
+  已关闭会话直接 `true`（进程都没了，没有可丢的工作）。child 的 `session.opened` 能力位必须
+  一起带上——宿主对 child 的门控读的是 child 自己协商到的能力（`plugin-provider.js:1032`）。
+- `paseo-plugin/server/provider.ts`：声明能力；`session.can_stop_runtime` 分支只回它自己的事件
+  （`request.completed` 是无效答复），任何异常走 `send()` 的 `request.failed`。
+
+**验证**：`paseo-plugin/test/runtime-activity.test.cjs` 15 例（桥范围/失败要响亮、桥
+`paseo/activity` 的表、假 process 驱动的 `DshSession`、child 能力位、provider 对未知会话回
+`request.failed`）；`harness/plugin-check.cjs` 新增真机段（空闲 `canStop:true` → 回合中 false →
+中断后 true → 未知会话 `request.failed`）。变异：`canStopRuntime` 直接 `return true`、
+waterfall 缺失时返回空、范围改成全部 live agent、child 能力位摘掉——各自使对应断言转红。

@@ -317,6 +317,21 @@ export interface DshUsage {
 }
 
 /**
+ * One kind of work DSH still runs for a session, as its own archive admission
+ * (`workspace/session-activity`) reports it: `turn`, `job`, `subagent`,
+ * `schedule`, or whatever else the profile composes.
+ *
+ * Paseo's idle cleanup is the consumer: a non-empty list means releasing this
+ * session's runtime would end live work, so the runtime is kept.
+ */
+export interface DshActivity {
+  /** The native session the work belongs to; a child's jobs are reported under the child. */
+  sessionId: string;
+  kind: string;
+  items?: Array<{ id: string; label?: string }>;
+}
+
+/**
  * One background job of the composer's jobs pill, as the bridge projects it.
  *
  * The fields are DSH's own `JobView` vocabulary reduced to what a pill row
@@ -633,6 +648,16 @@ const ORPHAN_FRAME_TTL_MS = 5_000;
  * waiting" and "nobody is waiting any more".
  */
 const SESSION_CLOSE_TIMEOUT_MS = 10_000;
+/**
+ * How long the idle-cleanup question waits for the bridge's activity answer.
+ *
+ * Paseo waits 10 s for the whole answer (`plugin-provider.js`
+ * `ProviderRuntimeSession.canStopRuntime`, plus its own outer timeout in the
+ * cleanup sweep), and its verdict on a timeout is "keep the runtime" — so giving
+ * up first and **failing** the call says why in the log instead of leaving Paseo
+ * to report the generic timeout. 8 s leaves room for the host's own bookkeeping.
+ */
+const ACTIVITY_TIMEOUT_MS = 8_000;
 /**
  * How long the next attach waits for a close that outlived
  * {@link SESSION_CLOSE_TIMEOUT_MS}.
@@ -2100,6 +2125,28 @@ export class DshProcess {
       // replaced it, and that one's waiters must not be released early.
       if (this.#closeTasks.get(sessionId) === task) this.#closeTasks.delete(sessionId);
     }
+  }
+
+  /**
+   * The DSH work that releasing `sessionId`'s runtime would end; empty only
+   * when nothing would be lost.
+   *
+   * Paseo asks this before its idle cleanup closes a session, so the answer is a
+   * safety verdict, not a status read: a bridge that cannot answer throws (the
+   * host turns every failed request into "keep the runtime"), and a malformed
+   * answer is refused here rather than read as "nothing runs".
+   *
+   * @param sessionId - native DSH session id (root or native child).
+   * @returns one entry per reported activity family.
+   */
+  async activity(sessionId = this.#options.sessionId): Promise<DshActivity[]> {
+    const result = (await this.#request("paseo/activity", { sessionId }, ACTIVITY_TIMEOUT_MS)) as
+      | { activity?: unknown }
+      | null;
+    if (!Array.isArray(result?.activity)) {
+      throw new Error("DeepSeek Harness answered paseo/activity without an activity list");
+    }
+    return result.activity as DshActivity[];
   }
 
   /**

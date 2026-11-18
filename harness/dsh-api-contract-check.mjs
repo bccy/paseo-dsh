@@ -32,6 +32,14 @@
  *      nothing else could see: the `subagents` delegated-work join
  *      (`waitForChildren` → `waitForTreeWork`, either accepted) and the
  *      `agentTeam` projection view (one of the two known generations).
+ *   4. **Archive admission** — the `workspace/session-activity` waterfall the
+ *      idle-cleanup veto asks is still dispatched by the workspace registry and
+ *      still answered by at least one composed provider, and the `agents`
+ *      service is still registered under that name with its `list()` operation.
+ *      A rename here is silent in the one direction that loses data: the veto's
+ *      waterfall finds no listener, Cordis calls the empty `next` it passes,
+ *      and the veto answers `canStop: true` — Paseo releases the runtime and the
+ *      background job/subagent/reminder it was asked about dies with it.
  *
  * It deliberately does NOT assert behaviour. Signature changes that keep the symbol
  * name are invisible here; `harness/plugin-check.cjs` covers those by driving a
@@ -527,6 +535,162 @@ function teamProjectionBody(pkgDir) {
           ? `unexpected: ${extra.join(', ')}`
           : undefined,
     );
+  }
+}
+
+// ---- 3d. the archive-admission event the idle-cleanup veto asks ------------
+//
+// `dsh-bridge/lib/activity.js` asks DSH's own archive-admission question through
+// `ctx.waterfall('workspace/session-activity', { sessionId }, () => [])`. Neither
+// side of that seam is an import: the registry that dispatches the event and the
+// providers that answer it are composed at run time (the bridge itself composes
+// no listener), so sections 1–3 cannot see a rename. The failure is silent in the
+// veto's unsafe direction: a renamed event reaches no listener, Cordis invokes
+// the `next` callback the bridge passed — which returns `[]` — and the veto
+// answers `canStop: true`. Paseo then releases the runtime and ends the live DSH
+// work (background job, subagent, reminder) it asked about. So the name is
+// asserted on both sides of the seam, and the bridge's own literal must be that
+// same name: either side drifting red here is the early warning that the runtime
+// would otherwise just quietly release.
+//
+// `ctx.agents.list()` is how the veto finds the released session's live
+// descendants. The service is reached by name and duck-typed, so its registered
+// name, class and `list` operation are pinned together here; unknown live
+// children would otherwise be answered as "nothing runs".
+
+const ACTIVITY_EVENT = 'workspace/session-activity';
+
+/** Escape one literal for use inside a RegExp built from an event name. */
+const reEscape = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** Read one installed package's entry source, or undefined when it has none. */
+function installedEntrySource(pkg) {
+  try {
+    return readFileSync(entryOf(join(dshPackages, pkg)).path, 'utf8');
+  } catch {
+    return undefined;
+  }
+}
+
+{
+  // The bridge's own literal, so "the event this veto asks" is compared against
+  // the runtime rather than trusted from the check's copy.
+  let bridgeEvent;
+  try {
+    const activity = readFileSync(join(BRIDGE_LIB, 'activity.js'), 'utf8');
+    bridgeEvent = /const\s+ACTIVITY_EVENT\s*=\s*['"]([^'"]+)['"]/u.exec(activity)?.[1];
+  } catch {
+    bridgeEvent = undefined;
+  }
+  check(
+    `dsh-bridge/lib/activity.js asks ${ACTIVITY_EVENT}`,
+    bridgeEvent === ACTIVITY_EVENT,
+    bridgeEvent === undefined
+      ? 'no ACTIVITY_EVENT literal found in activity.js'
+      : `bridge literal: ${bridgeEvent}`,
+  );
+
+  // The dispatcher: `this.ctx.waterfall("workspace/session-activity", { sessionId }, () => Promise.resolve([]))`
+  // in `WorkspaceRegistry.archiveSession` — the call the bridge is imitating.
+  const eventRe = reEscape(ACTIVITY_EVENT);
+  const workspaceDir = join(dshPackages, 'dsh-workspace');
+  let workspaceVersion = '?';
+  let workspaceSource;
+  try {
+    const manifest = JSON.parse(readFileSync(join(workspaceDir, 'package.json'), 'utf8'));
+    workspaceVersion = manifest.version ?? workspaceVersion;
+    workspaceSource = readFileSync(entryOf(workspaceDir).path, 'utf8');
+  } catch (error) {
+    workspaceSource = undefined;
+    check(
+      'dsh-workspace is installed for its archive admission',
+      false,
+      `unreadable at ${workspaceDir} (${error.code ?? error.message})`,
+    );
+  }
+  if (workspaceSource !== undefined) {
+    const dispatched = new RegExp(`waterfall\\s*\\(\\s*['"]${eventRe}['"]`, 'u').test(workspaceSource);
+    check(
+      `dsh-workspace@${workspaceVersion} still dispatches ${ACTIVITY_EVENT}`,
+      dispatched,
+      dispatched ? 'waterfall call site found' : `no waterfall('${ACTIVITY_EVENT}') call in its entry`,
+    );
+  }
+
+  // The provider side: at least one installed package must still register a
+  // listener under that name, or the dispatcher above reaches nobody and the
+  // bridge's own waterfall would fall through to the empty default.
+  const registrarRe = new RegExp(`\\bon\\s*\\(\\s*['"]${eventRe}['"]`, 'u');
+  const registrars = [];
+  let installedScanned = 0;
+  for (const entry of readdirSync(dshPackages, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    installedScanned += 1;
+    const source = installedEntrySource(entry.name);
+    if (source !== undefined && registrarRe.test(source)) registrars.push(entry.name);
+  }
+  check(
+    `at least one installed provider still registers ${ACTIVITY_EVENT}`,
+    registrars.length > 0,
+    registrars.length > 0
+      ? `${registrars.join(', ')} (of ${installedScanned} installed package(s))`
+      : `no ctx.on('${ACTIVITY_EVENT}') listener among ${installedScanned} installed package(s)`,
+  );
+
+  // The `agents` service: the veto's "which live sessions descend from this
+  // one" half. `ctx.agents.list()` is required by activity.js (it refuses to
+  // answer without it); here the name, the class and `list()` are pinned
+  // before that refusal can be reached in a real session.
+  const agentDir = join(dshPackages, 'dsh-agent');
+  let agentManifest;
+  let agentSource;
+  try {
+    agentManifest = JSON.parse(readFileSync(join(agentDir, 'package.json'), 'utf8'));
+    agentSource = readFileSync(entryOf(agentDir).path, 'utf8');
+  } catch (error) {
+    agentManifest = undefined;
+    check('dsh-agent is installed for the agents service', false, `unreadable at ${agentDir} (${error.code ?? error.message})`);
+  }
+  if (agentManifest !== undefined && agentSource !== undefined) {
+    // A Cordis Service registers under its name in the constructor
+    // (`super(ctx, "agents")`, dsh-agent/lib/index.js); the bridge asks for
+    // that name, not the class name.
+    const registered = /super\s*\(\s*ctx\s*,\s*['"]agents['"]\s*\)/u.test(agentSource);
+    check(
+      `dsh-agent@${agentManifest.version ?? '?'} still registers the "agents" service`,
+      registered,
+      registered ? 'super(ctx, "agents") found' : 'no super(ctx, "agents") registration in its entry',
+    );
+
+    const typesFile = join(agentDir, agentManifest.types ?? 'lib/types/index.d.ts');
+    let types = '';
+    try {
+      types = readFileSync(typesFile, 'utf8');
+    } catch {
+      types = '';
+    }
+    const augmented = /\bagents\s*:\s*AgentRegistry\b/u.test(types);
+    check(
+      `dsh-agent@${agentManifest.version ?? '?'} still augments Context with agents: AgentRegistry`,
+      augmented,
+      augmented ? `declared in ${relative(dshPackages, typesFile)}` : 'no `agents: AgentRegistry` on the Context augmentation',
+    );
+
+    let module;
+    try {
+      module = await import(pathToFileURL(entryOf(agentDir).path).href);
+    } catch (error) {
+      module = undefined;
+      check('dsh-agent loads for the agents service', false, `${error.code ?? error.message}`);
+    }
+    if (module !== undefined) {
+      const hasList = typeof module.AgentRegistry === 'function' && typeof module.AgentRegistry.prototype?.list === 'function';
+      check(
+        `dsh-agent@${agentManifest.version ?? '?'} AgentRegistry still implements list()`,
+        hasList,
+        hasList ? 'class and prototype.list found' : `AgentRegistry is ${typeof module.AgentRegistry}, list is ${typeof module.AgentRegistry?.prototype?.list}`,
+      );
+    }
   }
 }
 

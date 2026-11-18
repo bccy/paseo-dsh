@@ -16,11 +16,14 @@
  *   boolean field) and write them through `settings.mutate`, so a composer
  *   toggle reaches DSH's own profile patch without HMR. The projection is pure
  *   and lives in `settings-discovery.js`.
+ * - `paseo/activity` reports the DSH work that releasing a session's runtime
+ *   would end, so Paseo's idle cleanup can wait for it (see `activity.js`).
  * - `paseo/question` is a *server -> client request*: the bridge sends it when
  *   the model calls the user-question tool and waits for the answer batch.
  *
  * @module dsh-paseo-bridge/server
  */
+import { runtimeActivity } from './activity.js';
 import { readSessionProjections } from './session-projections.js';
 import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -5076,6 +5079,8 @@ export class PaseoHarnessServer {
         return this.projections(params);
       case 'paseo/translate':
         return this.translate(params);
+      case 'paseo/activity':
+        return this.activity(params);
       case 'session/close':
         return this.closeSession(params);
       case 'shutdown':
@@ -5483,6 +5488,45 @@ export class PaseoHarnessServer {
     // disk. Park the entries; the session teardown settles them once the agent is
     // quiescent (BF-02). `discard` would throw the only pre-image away.
     this.fileSnapshots.abandonSession(sessionId);
+  }
+
+  /**
+   * Report the DSH work that releasing one session's runtime would end.
+   *
+   * Paseo asks this before its idle cleanup closes a session. A child is
+   * released by draining its own subtree. One shared process serves every Paseo
+   * root session of this connection, so a **root** is released by closing its
+   * own agent and the native subagents below it: the process stays up for the
+   * other roots, which are therefore not this answer's business. The scope is
+   * the session and its subtree either way, and it is computed from native DSH
+   * ids (see `activity.js`).
+   *
+   * An id this bridge does not own — neither an initialized root nor a known
+   * native child — fails the request. Paseo keeps the runtime on a failure, as
+   * it does on a timeout; answering "nothing" for a session this bridge cannot
+   * account for would let it end work it never looked at.
+   *
+   * @param {{sessionId?: unknown}} params
+   * @returns {Promise<{activity: Array<{ sessionId: string, kind: string, items?: Array<{ id: string, label?: string }> }>}>}
+   */
+  async activity(params) {
+    const sessionId = params?.sessionId;
+    if (typeof sessionId !== 'string' || sessionId === '') {
+      throw new TypeError('paseo/activity requires sessionId');
+    }
+    // A root that was only initialized (Paseo opens a session to read its
+    // capabilities without ever prompting it) has no `sessions` record; the
+    // initialized table is what makes it ours. A closed root keeps that table
+    // entry on purpose, and answering "nothing runs" for it is correct: its
+    // handle was disposed, so it owns no live work any more.
+    if (!this.initializedSessions.has(sessionId) && !this.children.has(sessionId)) {
+      throw new Error(`unknown session: ${sessionId}`);
+    }
+    const activity = await runtimeActivity(this.ctx, {
+      sessionId,
+      parentOf: (id) => this.children.get(id)?.parentId,
+    });
+    return { activity };
   }
 
   requireSession(sessionId) {
