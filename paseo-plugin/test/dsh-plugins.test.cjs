@@ -170,7 +170,14 @@ test("setEnabled keeps the ordered bundle list and releases the lock", async () 
       path.join(packageDir, "package.json"),
       `${JSON.stringify({ name: bundle, version: "1.0.0", dsh: { bundle: {} } })}\n`,
     );
-    const plugins = new DshPlugins({ dir: space.dir, profile: "paseo", dshHome: space.root });
+    // `installAnchor: null`: this test is about the lock, and must not read the
+    // real global dsh installation for a package it never resolves.
+    const plugins = new DshPlugins({
+      dir: space.dir,
+      profile: "paseo",
+      dshHome: space.root,
+      installAnchor: null,
+    });
 
     assert.deepEqual(await plugins.setEnabled(bundle, true), {
       ok: true,
@@ -199,4 +206,226 @@ test("failureOf keeps a manager code and degrades an unknown throw to command-fa
 
   const noDetail = failureOf(new ManagerError("busy"));
   assert.deepEqual(noDetail, { errorCode: "busy" });
+});
+
+/**
+ * Bundle resolution fixtures.
+ *
+ * The real profile resolves a selected bundle from three places, in DSH's own
+ * order (`@deepseek-ai/dsh-app-boot`'s `resolveBundleDir`: the dsh installation
+ * anchor first, then `<profile>/package.json`, whose Node lookup walks
+ * `<profile>/node_modules` -> `~/.dsh/profiles/node_modules` -> ...):
+ *
+ *   1. the profile's own `node_modules/` (pnpm-installed dependencies),
+ *   2. the shared `$DSH_HOME/profiles/node_modules/` anchor (the bridge),
+ *   3. the dsh installation's `node_modules/` (in-box `@deepseek-ai/*` bundles).
+ *
+ * A package found in none of them is the only case that may read "missing".
+ * These fixtures build one home with all three layouts plus one truly absent
+ * package, and assert the page's view of each.
+ */
+function dshHomeLayout() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-plugins-resolve-"));
+  const profileDir = path.join(root, "profiles", "paseo");
+  const installDir = path.join(root, "install", "node_modules", "@deepseek-ai", "dsh");
+  const installAnchor = path.join(installDir, "package.json");
+  const layout = {
+    root,
+    profileDir,
+    installDir,
+    installAnchor,
+    profilePackage(name) {
+      return path.join(profileDir, "node_modules", ...name.split("/"));
+    },
+    sharedPackage(name) {
+      return path.join(root, "profiles", "node_modules", ...name.split("/"));
+    },
+    /** In-box bundles live under the installation package's own node_modules. */
+    installedPackage(name) {
+      return path.join(installDir, "node_modules", ...name.split("/"));
+    },
+    cleanup() {
+      fs.rmSync(root, { recursive: true, force: true });
+    },
+  };
+  fs.mkdirSync(profileDir, { recursive: true });
+  writePackage(installDir, { name: "@deepseek-ai/dsh", version: "0.2.2-rc.3" });
+  return layout;
+}
+
+function writePackage(dir, manifest) {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+}
+
+const BASE = "@deepseek-ai/dsh-base";
+
+/** A home whose dsh installation ships the base bundle, as every install does. */
+function writeInstalledBase(layout) {
+  writePackage(layout.installedPackage(BASE), {
+    name: BASE,
+    version: "0.2.2-rc.3",
+    dsh: { bundle: { patch: "cordis.patch.yml" } },
+  });
+}
+
+function bundleEntry(snapshot, name) {
+  const entry = snapshot.bundles.find((bundle) => bundle.name === name);
+  assert.ok(entry !== undefined, `expected a row for ${name}: ${JSON.stringify(snapshot.bundles.map((row) => row.name))}`);
+  return entry;
+}
+
+test("resolves a bundle from the profile's own node_modules", async () => {
+  const layout = dshHomeLayout();
+  try {
+    writeInstalledBase(layout);
+    writeManifest(layout.profileDir, {
+      name: "dsh-profile-paseo",
+      dependencies: { "@example/profile-bundle": "1.0.0" },
+      dsh: { profile: { bundles: [BASE, "@example/profile-bundle"] } },
+    });
+    writePackage(layout.profilePackage("@example/profile-bundle"), {
+      name: "@example/profile-bundle",
+      version: "1.0.0",
+      dsh: { bundle: { patch: "cordis.patch.yml" } },
+    });
+    const plugins = new DshPlugins({
+      dir: layout.profileDir,
+      profile: "paseo",
+      dshHome: layout.root,
+      installAnchor: layout.installAnchor,
+    });
+    const row = bundleEntry(await plugins.list(), "@example/profile-bundle");
+    assert.equal(row.installed, true);
+    assert.equal(row.kind, "bundle");
+    assert.equal(row.official, false);
+    assert.equal(row.version, "1.0.0");
+    assert.equal(row.removable, true);
+    assert.equal(fs.existsSync(path.join(layout.profileDir, "package.json.lock")), false);
+  } finally {
+    layout.cleanup();
+  }
+});
+
+test("resolves a bundle from the shared profiles node_modules anchor", async () => {
+  const layout = dshHomeLayout();
+  try {
+    writeInstalledBase(layout);
+    writeManifest(layout.profileDir, {
+      name: "dsh-profile-paseo",
+      dsh: { profile: { bundles: [BASE, "@example/shared-bundle"] } },
+    });
+    writePackage(layout.sharedPackage("@example/shared-bundle"), {
+      name: "@example/shared-bundle",
+      version: "2.3.4",
+      dsh: { bundle: { patch: "cordis.patch.yml" } },
+    });
+    const plugins = new DshPlugins({
+      dir: layout.profileDir,
+      profile: "paseo",
+      dshHome: layout.root,
+      installAnchor: layout.installAnchor,
+    });
+    const row = bundleEntry(await plugins.list(), "@example/shared-bundle");
+    assert.equal(row.installed, true);
+    assert.equal(row.kind, "bundle");
+    assert.equal(row.official, false);
+    assert.equal(row.version, "2.3.4");
+  } finally {
+    layout.cleanup();
+  }
+});
+
+test("an installation bundle is official, keeps its version, and is not removable or updatable", async () => {
+  const layout = dshHomeLayout();
+  try {
+    writeInstalledBase(layout);
+    writePackage(layout.installedPackage("@deepseek-ai/dsh-web-app"), {
+      name: "@deepseek-ai/dsh-web-app",
+      version: "0.2.2-rc.3",
+      dsh: { bundle: { patch: "cordis.patch.yml" } },
+    });
+    writeManifest(layout.profileDir, {
+      name: "dsh-profile-paseo",
+      dsh: { profile: { bundles: [BASE, "@deepseek-ai/dsh-web-app"] } },
+    });
+    const plugins = new DshPlugins({
+      dir: layout.profileDir,
+      profile: "paseo",
+      dshHome: layout.root,
+      installAnchor: layout.installAnchor,
+    });
+    const snapshot = await plugins.list();
+    const webApp = bundleEntry(snapshot, "@deepseek-ai/dsh-web-app");
+    assert.equal(webApp.installed, true, "an installation-supplied bundle is not missing");
+    assert.equal(webApp.official, true);
+    assert.equal(webApp.kind, "bundle");
+    assert.equal(webApp.version, "0.2.2-rc.3");
+    assert.equal(webApp.removable, false, "official bundles follow the DSH installation");
+    assert.equal(webApp.updatable, false);
+
+    const base = bundleEntry(snapshot, BASE);
+    assert.equal(base.official, true);
+    assert.equal(base.installed, true);
+    assert.equal(base.version, "0.2.2-rc.3");
+  } finally {
+    layout.cleanup();
+  }
+});
+
+test("the installation's copy wins over a profile-local copy", async () => {
+  const layout = dshHomeLayout();
+  try {
+    writeInstalledBase(layout);
+    writePackage(layout.installedPackage("@deepseek-ai/dsh-web-app"), {
+      name: "@deepseek-ai/dsh-web-app",
+      version: "0.2.2-rc.3",
+      dsh: { bundle: { patch: "cordis.patch.yml" } },
+    });
+    writeManifest(layout.profileDir, {
+      name: "dsh-profile-paseo",
+      dependencies: { "@deepseek-ai/dsh-web-app": "0.1.0" },
+      dsh: { profile: { bundles: [BASE, "@deepseek-ai/dsh-web-app"] } },
+    });
+    writePackage(layout.profilePackage("@deepseek-ai/dsh-web-app"), {
+      name: "@deepseek-ai/dsh-web-app",
+      version: "0.1.0",
+      dsh: { bundle: { patch: "cordis.patch.yml" } },
+    });
+    const plugins = new DshPlugins({
+      dir: layout.profileDir,
+      profile: "paseo",
+      dshHome: layout.root,
+      installAnchor: layout.installAnchor,
+    });
+    const row = bundleEntry(await plugins.list(), "@deepseek-ai/dsh-web-app");
+    assert.equal(row.official, true, "the installation's copy is the one DSH loads");
+    assert.equal(row.version, "0.2.2-rc.3");
+  } finally {
+    layout.cleanup();
+  }
+});
+
+test("a package resolved from none of the three layouts still reads missing", async () => {
+  const layout = dshHomeLayout();
+  try {
+    writeInstalledBase(layout);
+    writeManifest(layout.profileDir, {
+      name: "dsh-profile-paseo",
+      dependencies: { "@example/absent-bundle": "1.0.0" },
+      dsh: { profile: { bundles: [BASE, "@example/absent-bundle"] } },
+    });
+    const plugins = new DshPlugins({
+      dir: layout.profileDir,
+      profile: "paseo",
+      dshHome: layout.root,
+      installAnchor: layout.installAnchor,
+    });
+    const row = bundleEntry(await plugins.list(), "@example/absent-bundle");
+    assert.equal(row.installed, false);
+    assert.equal(row.kind, "missing");
+    assert.equal(row.version, undefined);
+  } finally {
+    layout.cleanup();
+  }
 });

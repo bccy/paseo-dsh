@@ -43,6 +43,13 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   `$DSH_HOME`、不起 `dsh`。**改 `server/dsh-plugins.ts` 的锁、`setEnabled` 或 profile
   manifest 读写必跑。** 本页锁与 DSH 的差异（DSH 无条件释放、本页只释放自己仍持有的）见
   `docs/FIELD-NOTES.md` 第 116 条。
+- `paseo-plugin/test/dsh-plugins.test.cjs` — DSH Plugins 页服务端回归：profile 锁（只释放
+  自己持有的、活持有者超时、陈旧锁回收）、失败码过 RPC，以及 **bundle 解析**（2026-11-19 修复：
+  profile 自己的 `node_modules`、共享 `$DSH_HOME/profiles/node_modules`、dsh 安装目录三种布局
+  + 真缺失；解析顺序为安装锚点→profile 锚点、安装副本优先且 `official`；官方包显示版本且
+  不可卸载/更新）。夹具自建三种布局并用显式 `installAnchor`（`null` 关闭安装解析），不读真实
+  `$DSH_HOME` 或全局安装、不起 `dsh`。**改 `server/dsh-plugins.ts` 的 `resolveBundlePackage`、
+  `#describe`、`setEnabled`、remove/update 或 `readRows` 的包目录来源必跑。**
 - `paseo-plugin/test/*.test.cjs`（**已登记在本 runner 的 `pluginTests` 清单里**，cwd 为
   `paseo-plugin`；也可 `cd paseo-plugin && npm test` 跑全部、`npm run test:process` 只跑 Windows
   启动器那一条）。四个文件各自的判据见下文「空闲回收否决链」「提问卡回答」「Windows 启动器」
