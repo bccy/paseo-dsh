@@ -689,15 +689,23 @@ const check = (name, pass, detail) => {
   const stats = events.slice(imageStart).filter(
     (e) => e.sessionId === sessionId && e.type === "timeline.item" && e.item?.type === "plugin" && e.item.kind === "dsh-stream-stats",
   );
-  // A tool-only step can have durable token timing without any transient text
-  // frame, so its stats legitimately omit firstTokenMs. Require an actual timed
-  // row from this prompt instead of assuming the first step produced text.
+  // A row exists to show the 首字, so only a step whose first token a live frame
+  // observed publishes one. A step with no live snapshot (e.g. a tool-only step
+  // whose durable message still carries token timing) must stay invisible.
   const timedStats = stats.find((e) => typeof e.item.data?.firstTokenMs === "number"
     && Number.isFinite(e.item.data.firstTokenMs) && e.item.data.firstTokenMs >= 0);
   check(
     "live frames produce a stream-stats row",
     timedStats !== undefined,
     timedStats ? JSON.stringify(timedStats.item.data) : "no timed dsh-stream-stats item from this prompt",
+  );
+  const untimedStats = stats.filter((e) => typeof e.item.data?.firstTokenMs !== "number");
+  check(
+    "every stream-stats row carries a measured first token",
+    untimedStats.length === 0,
+    untimedStats.length === 0
+      ? `${stats.length} timed row(s)`
+      : JSON.stringify(untimedStats.map((e) => e.item)),
   );
 
   const lastStats = stats[stats.length - 1];

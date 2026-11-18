@@ -698,19 +698,22 @@ export class DshSession {
   /** Tool call start times and the current turn's tool total. */
   #toolStarts = new Map<string, number>();
   #turnTool = { count: 0, ms: 0 };
-  /** Most recent stats row, so context and tool totals can update it in place. */
+  /**
+   * Most recent measured stats row (one carrying a 首字), so context and tool
+   * totals can update it in place.
+   */
   #lastStats: { id: string; data: Record<string, unknown> } | undefined;
   /**
    * Per-step timing for the streamed-stats row.
    *
-   * The bridge's transient `paseo/assistant-delta` snapshots are only the
-   * *start* side: `startedAt` is the step's first live frame, which is what
-   * makes `firstTokenMs` the wait the user actually saw rather than a duration
-   * measured backwards from the end. The first token itself and the settle time
-   * come from the durable `assistant/message` (`data.stream` and the envelope's
-   * `event.time`), so a route that never streams still gets a row — and so does
-   * a step that emits no text at all (a pure tool call), instead of being
-   * dropped as "nothing was timed".
+   * The bridge's transient `paseo/assistant-delta` snapshots are the *only*
+   * source of a row: `startedAt` is the step's first live frame and
+   * `firstTokenAt` the first token it observed, which is what makes
+   * `firstTokenMs` the wait the user actually saw rather than a duration measured
+   * backwards from the end. The durable `assistant/message` confirms the first
+   * token and supplies the settle time (`data.stream` and the envelope's
+   * `event.time`), so a pure tool call still has a measured first token. A step
+   * with no live snapshot keeps `#streamStats` unset and publishes no row at all.
    */
   #streamStats:
     | {
@@ -2914,6 +2917,10 @@ export class DshSession {
         this.#turnTool = { count: 0, ms: 0 };
         // A later usage refresh must not rewrite the previous turn's row.
         this.#lastStats = undefined;
+        // A live window left un-consumed by a cancelled step belongs to the
+        // previous turn; reusing it would fabricate this turn's 首字 from an
+        // unrelated start. The next step's own snapshot sets a fresh window.
+        this.#streamStats = undefined;
         this.#turnStarted = true;
       }
       const turnId = this.#turnId ?? `turn:${Date.now()}`;
@@ -3455,6 +3462,9 @@ export class DshSession {
       this.#emitStreamStats(data, typeof event.time === "number" ? event.time : undefined);
     }
     if (event.type === "turn/end" && this.#turnId !== null && this.#lastStats !== undefined) {
+      // Republish the turn's tool totals on the last *measured* row. A step that
+      // emitted no row (no live first token) leaves `#lastStats` on the previous
+      // row, so this updates that one instead of fabricating an unmeasured row.
       this.#lastStats.data = {
         ...this.#lastStats.data,
         toolCalls: this.#turnTool.count,
@@ -3467,16 +3477,21 @@ export class DshSession {
   /**
    * Publish the per-step latency and throughput row beneath the answer.
    *
-   * Both ends of the window come from the durable `assistant/message`: the first
-   * token time from `data.stream` (`assistantStreamFirstTokenTime`, DSH's own
-   * reader) and the settle time from the event envelope's `time`. The live
-   * snapshots only supply the step's start (`#streamStats.startedAt`) and a
-   * turn/step fallback, so a route that does not stream still gets measured
-   * numbers instead of a fabricated duration — and a step that produced no text
-   * (a pure tool call) still has a first token, because tool-call deltas count.
-   * `firstTokenMs` is the one field that can be absent there: with no live
-   * snapshot nobody observed the wait. Output tokens come from the step's own
-   * usage record.
+   * The row's reason to exist is the 首字 (first-token wait), so a row is
+   * published only for a step whose first token a live snapshot actually
+   * observed: the wait is `firstTokenAt - #streamStats.startedAt`, and with no
+   * snapshot its start is unknown. A step that produced no row here must also
+   * leave `#lastStats` untouched — the `turn/end` and context-refresh
+   * republishes then update the last *measured* row instead of overwriting it
+   * with numbers that have no 首字. No wait is invented and no row is emitted
+   * with a missing one.
+   *
+   * Both ends of the decode window still come from the durable
+   * `assistant/message`: the first token time from `data.stream`
+   * (`assistantStreamFirstTokenTime`, DSH's own reader) and the settle time from
+   * the event envelope's `time`, so a streamed step that settles late is
+   * measured by the model's clock rather than this process's. Output tokens come
+   * from the step's own usage record.
    */
   #emitStreamStats(data: Record<string, unknown>, completedAt?: number): void {
     const stats = this.#streamStats;
@@ -3491,6 +3506,10 @@ export class DshSession {
     const firstTokenAt = assistantStreamFirstTokenTime(data.stream) ?? stats?.firstTokenAt;
     if (firstTokenAt === undefined) return;
     const firstTokenMs = stats === undefined ? undefined : Math.max(0, firstTokenAt - stats.startedAt);
+    // No live snapshot, no 首字: the durable stream may name the first token but
+    // the wait has no observed start, so there is nothing to show. Return before
+    // touching `#lastStats` — see this method's doc comment.
+    if (firstTokenMs === undefined) return;
     // Decode window, copied from DSH's own session-stats:
     //   decodeMs = assistant/message event time - first token time
     // Both ends describe the same tokens. `outputTokens` counts everything the
@@ -3512,7 +3531,7 @@ export class DshSession {
     const turn = typeof data.turn === "number" ? data.turn : stats?.turn;
     const step = typeof data.step === "number" ? data.step : stats?.step;
     const statsData: Record<string, unknown> = {
-      ...(firstTokenMs === undefined ? {} : { firstTokenMs }),
+      firstTokenMs,
       ...(tokensPerSecond === undefined ? {} : { tokensPerSecond }),
       ...(outputTokens === undefined ? {} : { outputTokens }),
       ...(typeof usage?.inputTokens === "number" ? { inputTokens: usage.inputTokens } : {}),
@@ -3627,11 +3646,9 @@ export class DshSession {
    * (`assistant/message` event time minus this first token), because the last
    * streamed chunk is not the end of decoding — the message settles after it.
    *
-   * A snapshot without timings (a bridge that predates them) leaves only the
-   * live side unset: the durable `assistant/message` still supplies the decode
-   * window and the settle time, so a route that never streamed still gets a row.
-   * Only `firstTokenMs` can be missing, and {@link #emitStreamStats} omits it
-   * rather than inventing one.
+   * A snapshot without timings (a bridge that predates them) records nothing, so
+   * that step publishes no row at all: a row must carry a measured 首字, and
+   * {@link #emitStreamStats} neither invents the wait nor emits a row without it.
    */
   #observeStreamSnapshot(data: Record<string, unknown>): void {
     const turn = typeof data.turn === "number" ? data.turn : undefined;

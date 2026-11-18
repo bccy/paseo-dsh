@@ -769,12 +769,14 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   `paseo/commands`**，所以它们同时覆盖"close 使进行中的 open 失效"与"provider 身份也是排他的"。
   **动了 `provider.ts` 的 `#openTransaction` / `#assertOpening` / `#openingProviders`，或假桥的
   `DSH_FAKE_HOLD_*` 必跑；open 发出的 `session.config.modes` 必须与 catalog 的 modes 全等（单源）。**
-- `harness/session-state-check.cjs` — 会话状态机（真实编译 `DshSession` + 假传输，不 spawn、
+- `harness/session-state-check.cjs` — 会话状态机（真实编译 `DshSession` + 假传输，**32 条**，不 spawn、
   不读凭据）：`#turnId`/`#turnStarted`/统计 reset、`configure` 的提交顺序与回执回读（被拒不落
   本地值）、切模型后 `thinkingOption` 回写、`DshSessionOptions.modes` 单源、子会话 opened/label
-  闸门、`DshChildSession.fail` 守卫、prompt 在 running 后失败仍有回合终态。**动了
+  闸门、`DshChildSession.fail` 守卫、prompt 在 running 后失败仍有回合终态、**统计行只在有首字的
+  步骤发布**（无 live 首字不出行、不覆盖 `#lastStats`、换回合清掉未消费的 live 窗口；之后
+  `turn/end` 与上下文刷新重发的仍是上一条带首字的行，且已发布的行必须全部带 `firstTokenMs`）。**动了
   `server/session.ts` 的回合状态、`configure` 的提交顺序/回执回读、`DshSessionOptions.modes`、
-  子会话 opened/label 闸门或 `DshChildSession.fail` 必跑。**
+  子会话 opened/label 闸门、`DshChildSession.fail` 或 `#emitStreamStats` 的发布规则必跑。**
 - `harness/subagent-check.cjs` — 原生子代理可见性（脚本化假 `dsh` 驱动真实编译插件 +
   一次性 `DSH_HOME`，不 spawn 真 DSH、不连 daemon；**131 条**）：能力位与 `restoration:"parent"`、
   父子/嵌套归属、多子混排、未知子不误归属、子只读拒绝、恢复去重与 provider id 复用、

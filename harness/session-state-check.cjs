@@ -229,17 +229,31 @@ function emitDelta(set, turn, step) {
     data: { turn, step, startedAt: Date.now() - 200, firstTextAt: Date.now() - 100 },
   });
 }
-/** Emit the durable assistant message for one step (the stats row is published here). */
-function emitAssistant(set, turn, step) {
+/**
+ * Emit the durable assistant message for one step (the stats row is published here).
+ *
+ * `options.time` is the event envelope's settle timestamp and `options.stream`
+ * DSH's compact timed chunk list; the real `assistant/message` carries both. A
+ * step whose live frames the plugin never saw (no `emitDelta`) still has a
+ * durable first-token time in `stream`, which is exactly the shape the stats row
+ * must not be published for.
+ */
+function emitAssistant(set, turn, step, options = {}) {
   emitEvent(set, {
     type: 'assistant/message',
+    ...(options.time === undefined ? {} : { time: options.time }),
     data: {
       turn,
       step,
       message: { id: `am-${turn}-${step}`, content: [{ type: 'text', text: `answer ${turn}.${step}` }] },
       usage: { inputTokens: 10, outputTokens: 5 },
+      ...(options.stream === undefined ? {} : { stream: options.stream }),
     },
   });
+}
+/** One timed text delta, the compact shape `assistantStreamFirstTokenTime` reads. */
+function timedStream(firstTokenAt) {
+  return [{ type: 'chunk', time: firstTokenAt, chunk: { type: 'text-delta', text: 'hi' } }];
 }
 function emitToolCall(set, callId) {
   emitEvent(set, { type: 'tool/call', data: { callId, name: 'bash', arguments: { command: 'echo hi' } } });
@@ -259,6 +273,10 @@ function latestStatsRow(events) {
   return events
     .filter((event) => event.type === 'timeline.item' && event.item?.kind === 'dsh-stream-stats')
     .at(-1);
+}
+/** Every collapsed stats row item published so far. */
+function statsRows(events) {
+  return events.filter((event) => event.type === 'timeline.item' && event.item?.kind === 'dsh-stream-stats');
 }
 function statsRowById(events, id) {
   return events
@@ -532,6 +550,119 @@ const promptInput = (text) => ({
       assert.ok(late !== undefined, JSON.stringify(opened().map((event) => event.sessionId)));
       assert.equal(late.title, 'Late L');
     });
+    await session.close();
+  }
+
+  // -------------------------------------------------------------------------
+  // 7. the collapsed stats row appears only for a step with a 首字.
+  // -------------------------------------------------------------------------
+  console.log('the collapsed stats row appears only for a step with a first token');
+  {
+    const { session, handlers, events } = makeSession({ sessionId: 'stats-first-token' });
+    await session.open();
+    const set = handlers();
+    await session.prompt(promptInput('stats'));
+
+    // Step 1: a live snapshot observed the first token, so the durable message
+    // has both ends of the wait. The row exists and carries the measured 首字.
+    const startedAt = Date.now();
+    emitEvent(set, {
+      type: ASSISTANT_DELTA_EVENT,
+      data: { turn: 1, step: 1, startedAt, firstTextAt: startedAt + 40 },
+    });
+    emitAssistant(set, 1, 1, { time: startedAt + 400, stream: timedStream(startedAt + 40) });
+    const row1 = latestStatsRow(events);
+    check('precondition: a step with a live first token publishes its measured row', () => {
+      assert.equal(row1?.item?.id, 'stream-stats:1:1');
+      assert.equal(row1?.item?.data?.firstTokenMs, 40);
+      assert.equal(statsRows(events).length, 1);
+    });
+
+    // Step 2: only the durable message — no live snapshot ever observed this
+    // step's first token. The durable stream names the token but the wait has no
+    // start, so the row would show no 首字; it must not be published at all.
+    const step2At = Date.now();
+    emitAssistant(set, 1, 2, { time: step2At, stream: timedStream(step2At - 30) });
+    check('a step without a live first token publishes no stats row', () => {
+      assert.equal(
+        statsRows(events).length,
+        1,
+        JSON.stringify(statsRows(events).map((event) => event.item.id)),
+      );
+    });
+
+    // The turn's own settlement republishes the accumulated tool totals on the
+    // last row that has a 首字 — never on the unmeasured step.
+    emitTurnEnd(set, 1, 'completed');
+    check('turn/end republishes the last measured row, not the unmeasured step', () => {
+      const latest = latestStatsRow(events);
+      assert.equal(
+        latest?.item?.id,
+        'stream-stats:1:1',
+        JSON.stringify(statsRows(events).map((event) => event.item.id)),
+      );
+      assert.equal(typeof latest?.item?.data?.firstTokenMs, 'number');
+      assert.equal(latest?.item?.data?.toolCalls, 0);
+    });
+
+    // A context refresh has the same "republish the last row" shape (`:1359`);
+    // it must refresh the measured row instead of resurrecting an unmeasured one.
+    await session.refreshUsage();
+    check('a context refresh keeps republishing the measured row', () => {
+      const latest = latestStatsRow(events);
+      assert.equal(
+        latest?.item?.id,
+        'stream-stats:1:1',
+        JSON.stringify(statsRows(events).map((event) => event.item.id)),
+      );
+      assert.equal(latest?.item?.data?.contextUsed, 1024);
+    });
+    check('every published stats row carries a measured first token', () => {
+      const missing = statsRows(events).filter(
+        (event) => typeof event.item.data?.firstTokenMs !== 'number',
+      );
+      assert.equal(missing.length, 0, JSON.stringify(missing.map((event) => event.item.data)));
+    });
+    set.onStatus('idle', 'stats-first-token');
+    await session.close();
+  }
+
+  // -------------------------------------------------------------------------
+  // 8. a live window from an aborted turn must not time the next turn's step.
+  // -------------------------------------------------------------------------
+  console.log('a new turn does not inherit the previous turn\'s live first-token window');
+  {
+    const { session, handlers, events } = makeSession({ sessionId: 'stats-stale-window' });
+    await session.open();
+    const set = handlers();
+    await session.prompt(promptInput('stale-one'));
+    // The step's live frames arrive, then the turn is cancelled before its
+    // durable `assistant/message` settles — the window stays un-consumed.
+    const abortedAt = Date.now();
+    emitEvent(set, {
+      type: ASSISTANT_DELTA_EVENT,
+      data: { turn: 1, step: 1, startedAt: abortedAt, firstTextAt: abortedAt + 40 },
+    });
+    emitTurnEnd(set, 1, 'aborted');
+    set.onStatus('idle', 'stats-stale-window');
+    check('precondition: the aborted step published no stats row', () => {
+      assert.equal(statsRows(events).length, 0);
+    });
+
+    // The next turn's step has a durable first token but no live snapshot of its
+    // own. Reusing the previous turn's window would fabricate a 首字, so this
+    // step must publish nothing.
+    await session.prompt(promptInput('stale-two'));
+    const nextAt = Date.now();
+    emitAssistant(set, 2, 1, { time: nextAt, stream: timedStream(nextAt - 30) });
+    check('a step with no live window of its own publishes no stats row', () => {
+      assert.equal(
+        statsRows(events).length,
+        0,
+        JSON.stringify(statsRows(events).map((event) => event.item)),
+      );
+    });
+    set.onStatus('idle', 'stats-stale-window');
     await session.close();
   }
 
