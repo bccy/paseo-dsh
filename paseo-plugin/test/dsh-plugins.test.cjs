@@ -796,3 +796,102 @@ test("a malformed locale file falls back instead of failing the list", async () 
     layout.cleanup();
   }
 });
+
+
+/**
+ * README frontmatter fallback fixtures.
+ *
+ * DSH ships its in-box bundles without a locale directory when only the README
+ * is translated (`dsh-base` has README.zh.md). The page's third fallback reads
+ * the leading `---` block's `description:` line from `README.<lang>.md`, then
+ * the plain README.md for English, and only then package.json. No YAML parser:
+ * one `description:` line, quoted or bare.
+ *
+ * The chain mirrors the locale chain (zh-CN -> zh-cn -> zh), but stops before
+ * English for a Chinese request, because the fallback after README is the
+ * package.json description and extending to an English README would make that
+ * step unreachable for packages that only ship README.md.
+ */
+function writeReadme(dir, file, content) {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, file), content);
+}
+
+function frontmatterReadme(description, extras = "kind: \"package-bundle\"\n") {
+  return `---\ndescription: ${description}\n${extras}---\n\n# Title\n\nBody text.\n`;
+}
+
+function addBundle(layout, name, description) {
+  writePackage(layout.profilePackage(name), {
+    name,
+    version: "1.0.0",
+    description,
+    dsh: { bundle: { patch: "cordis.patch.yml" } },
+  });
+  const manifestPath = path.join(layout.profileDir, "package.json");
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  manifest.dependencies[name] = "1.0.0";
+  manifest.dsh.profile.bundles.push(name);
+  writeManifest(layout.profileDir, manifest);
+}
+
+test("a translated README frontmatter description is the second fallback", async () => {
+  const { layout, dir } = localizedLayout();
+  try {
+    writeReadme(dir, "README.zh.md", frontmatterReadme("\"中文 README 简介\""));
+    writeReadme(dir, "README.md", frontmatterReadme("English README introduction"));
+    const plugins = localizedManager(layout);
+
+    const zh = bundleEntry(await plugins.list({ locale: "zh-CN" }), "@example/localized-bundle");
+    assert.equal(zh.description, "中文 README 简介");
+    assert.equal(zh.title, undefined, "the title is never taken from a README");
+
+    // English has no `README.en.md` here; the plain README.md carries its
+    // frontmatter (dsh-base ships exactly that pairing).
+    const en = bundleEntry(await plugins.list({ locale: "en" }), "@example/localized-bundle");
+    assert.equal(en.description, "English README introduction");
+  } finally {
+    layout.cleanup();
+  }
+});
+
+test("a locale file's description wins over README frontmatter", async () => {
+  const { layout, dir } = localizedLayout();
+  try {
+    writeLocale(dir, "zh.json", { meta: { title: "中文标题", description: "locale 中文简介" } });
+    writeReadme(dir, "README.zh.md", frontmatterReadme("\"README 中文简介\""));
+    const plugins = localizedManager(layout);
+    const row = bundleEntry(await plugins.list({ locale: "zh-CN" }), "@example/localized-bundle");
+    assert.equal(row.description, "locale 中文简介");
+    assert.equal(row.title, "中文标题");
+  } finally {
+    layout.cleanup();
+  }
+});
+
+test("missing or malformed README frontmatter falls back to package.json", async () => {
+  const { layout, dir } = localizedLayout();
+  try {
+    // No frontmatter block at all.
+    writeReadme(dir, "README.zh.md", "# 没有 frontmatter\n\n正文。\n");
+    addBundle(layout, "@example/malformed-readme", "Malformed README package");
+    writeReadme(
+      layout.profilePackage("@example/malformed-readme"),
+      "README.zh.md",
+      "---\ndescription: \"没有收尾的 frontmatter\n\n# 坏格式\n",
+    );
+    const plugins = localizedManager(layout);
+    const snapshot = await plugins.list({ locale: "zh-CN" });
+    assert.equal(snapshot.errorCode, undefined, "README parsing never fails the list");
+    assert.equal(
+      bundleEntry(snapshot, "@example/localized-bundle").description,
+      "English package description",
+    );
+    assert.equal(
+      bundleEntry(snapshot, "@example/malformed-readme").description,
+      "Malformed README package",
+    );
+  } finally {
+    layout.cleanup();
+  }
+});

@@ -40,6 +40,17 @@
  *   marks anything found under the installation as official: it shows that
  *   copy's version and is neither removable nor updatable, because it follows
  *   the DSH upgrade rather than the profile.
+ * - **A bundle's display text has three sources, in this order**: the package's
+ *   `locale/*.json` `meta.title`/`meta.description` along the requested language
+ *   chain (DSH's own rule, `@deepseek-ai/dsh-app-boot/src/package-meta.ts:121-201`
+ *   and `@deepseek-ai/dsh-plugin-detail/src/document.ts:16-25`), then a
+ *   `README.<lang>.md` leading YAML frontmatter `description:` line, then
+ *   `package.json.description`. The README step is a local extension: DSH has
+ *   no such rule — its detail reader strips frontmatter as "file metadata rather
+ *   than description text" (`dsh-plugin-detail/src/document.ts:68-72`) and its
+ *   README names carry no language suffix (`:54-78`). The step exists because
+ *   in-box bundles such as `@deepseek-ai/dsh-base` ship `README.zh.md` with a
+ *   Chinese frontmatter description and no `locale/` directory.
  *
  * @module dsh-paseo/server/dsh-plugins
  */
@@ -581,6 +592,124 @@ function localizedField(
   return undefined;
 }
 
+/** One package's README frontmatter descriptions, keyed by language id (`""` = README.md). */
+type ReadmeDisplayText = Map<string, string>;
+
+const README_LANGUAGE = /^readme(?:\.([a-z0-9-]+))?\.md$/iu;
+
+/** Whether a README language suffix is a language id, like the locale filenames. */
+function isLanguageId(value: string): boolean {
+  return /^[a-z]{2,8}(?:-[a-z0-9]{1,8})*$/.test(value);
+}
+
+/**
+ * Read the `description:` line of a Markdown file's leading YAML frontmatter.
+ *
+ * Deliberately not a YAML parser: only the opening `---` block is inspected,
+ * the first `description:` line in it is read, and one layer of matching single
+ * or double quotes is removed. Anything else — no block, unterminated block,
+ * an empty value, a folded scalar — is `undefined` so the caller falls through
+ * to the next source. BOM is tolerated; nothing past the frontmatter is read.
+ *
+ * @param content - the Markdown file's text.
+ * @returns the description, or `undefined` when there is no single-line one.
+ */
+function readFrontmatterDescription(content: string): string | undefined {
+  const match = /^---\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/u.exec(
+    content.replace(/^\uFEFF/u, ""),
+  );
+  if (match === null) return undefined;
+  for (const line of match[1].split(/\r?\n/)) {
+    const field = /^description[ \t]*:[ \t]*(.*)$/u.exec(line);
+    if (field === null) continue;
+    const raw = field[1].trim();
+    if (raw === "") return undefined;
+    const quoted = /^(["'])([\s\S]*)\1$/u.exec(raw);
+    const value = (quoted?.[2] ?? raw).trim();
+    return value === "" ? undefined : value;
+  }
+  return undefined;
+}
+
+/**
+ * Read a package's translated README frontmatter descriptions.
+ *
+ * File rule: `README.<language>.md` for a language suffix, and the plain
+ * `README.md` under the `""` key (the English README when a package ships no
+ * `README.en.md`; `@deepseek-ai/dsh-base` ships exactly `README.md` +
+ * `README.zh.md`). Filename matching is case-insensitive and `.markdown` is not
+ * accepted: the fallback reads the file the frontmatter contract is written in.
+ *
+ * @param packageDir - resolved package root.
+ * @returns the description by lowercased language id; empty when none parses.
+ */
+function readReadmeDescriptions(packageDir: string): ReadmeDisplayText {
+  const descriptions: ReadmeDisplayText = new Map();
+  let entries: string[];
+  try {
+    entries = readdirSync(packageDir);
+  } catch {
+    return descriptions;
+  }
+  for (const file of entries) {
+    const match = README_LANGUAGE.exec(file);
+    if (match === null) continue;
+    const suffix = match[1]?.toLowerCase();
+    if (suffix !== undefined && !isLanguageId(suffix)) continue;
+    let description: string | undefined;
+    try {
+      description = readFrontmatterDescription(readFileSync(join(packageDir, file), "utf8"));
+    } catch {
+      continue;
+    }
+    if (description === undefined) continue;
+    const key = suffix ?? "";
+    // First name wins on case-variant collisions (`README.md` and `readme.md`).
+    if (!descriptions.has(key)) descriptions.set(key, description);
+  }
+  return descriptions;
+}
+
+/**
+ * The languages a README description is looked up in.
+ *
+ * The locale chain (zh-CN -> zh-cn -> zh -> en) minus its final English slot,
+ * because that slot exists for locale files (where English is the package.json
+ * fallback value); for README the next step is the package.json description
+ * itself, so only an English request reads the English README.
+ */
+function readmeLanguageChain(locale: PluginLocale): string[] {
+  if (locale === "en") return ["en"];
+  return languageChain(locale).filter((language) => language !== "en");
+}
+
+/** First README description along the README chain; English may use plain README.md. */
+function readmeField(dictionaries: ReadmeDisplayText, chain: string[]): string | undefined {
+  for (const language of chain) {
+    const specific = dictionaries.get(language);
+    if (specific !== undefined) return specific;
+    if (language === "en") {
+      const plain = dictionaries.get("");
+      if (plain !== undefined) return plain;
+    }
+  }
+  return undefined;
+}
+
+/** Both display-text sources of one package, read once per snapshot. */
+interface PackageDisplayText {
+  locale: Map<string, LocaleDisplayText>;
+  readme: ReadmeDisplayText;
+}
+
+/** Read a package's display text from its locale files and translated READMEs. */
+function readPackageDisplayText(packageDir: string): PackageDisplayText {
+  return {
+    locale: readLocaleDisplayText(packageDir),
+    readme: readReadmeDescriptions(packageDir),
+  };
+}
+
 function isRegistrySpec(spec: string): boolean {
   const value = spec.trim();
   if (value === "" || value.length > 214) return false;
@@ -927,9 +1056,9 @@ export class DshPlugins {
       : undefined;
     // One read per distinct package directory for this snapshot: the page lists
     // often, and every row of the same bundle would re-read the same files.
-    const localeTextCache = new Map<string, Map<string, LocaleDisplayText>>();
+    const displayTextCache = new Map<string, PackageDisplayText>();
     const bundles = names.map((name) =>
-      this.#describe(name, deps[name], selected, dshVersion, locale, localeTextCache));
+      this.#describe(name, deps[name], selected, dshVersion, locale, displayTextCache));
     const activeJob = this.#activeJobId === undefined ? undefined : this.#jobs.get(this.#activeJobId);
     return {
       profile: this.profile,
@@ -1108,7 +1237,7 @@ export class DshPlugins {
     selected: string[],
     dshVersion: string | undefined,
     locale: PluginLocale,
-    localeTextCache: Map<string, Map<string, LocaleDisplayText>>,
+    displayTextCache: Map<string, PackageDisplayText>,
   ): BundleInfo {
     const resolved = this.resolveBundlePackage(name);
     const pkg = resolved?.manifest;
@@ -1139,21 +1268,25 @@ export class DshPlugins {
     // Rows come from the resolved copy: an installation bundle's patch is inside
     // the dsh package, not under the profile.
     const rows = resolved === undefined ? [] : readRows(resolved.dir, resolved.manifest);
-    // Display text follows DSH's rule: the locale files' `meta.title` /
-    // `meta.description` for the requested language chain, the package.json
-    // description as the final fallback, and no title at all when the package
-    // ships none (the page then shows the package name alone).
-    let localeText: Map<string, LocaleDisplayText> | undefined;
+    // Display text, in order: locale files' `meta.title`/`meta.description` along
+    // the requested language chain, a translated README's frontmatter
+    // description, then the package.json description. The title has only the
+    // locale source (never a README); when it is absent the page shows the
+    // package name alone.
+    let displayText: PackageDisplayText | undefined;
     if (resolved !== undefined) {
-      localeText = localeTextCache.get(resolved.dir);
-      if (localeText === undefined) {
-        localeText = readLocaleDisplayText(resolved.dir);
-        localeTextCache.set(resolved.dir, localeText);
+      displayText = displayTextCache.get(resolved.dir);
+      if (displayText === undefined) {
+        displayText = readPackageDisplayText(resolved.dir);
+        displayTextCache.set(resolved.dir, displayText);
       }
     }
     const chain = languageChain(locale);
-    const localizedTitle = localeText === undefined ? undefined : localizedField(localeText, chain, "title");
-    const localizedDescription = localeText === undefined ? undefined : localizedField(localeText, chain, "description");
+    const localizedTitle = displayText === undefined ? undefined : localizedField(displayText.locale, chain, "title");
+    const localizedDescription = displayText === undefined
+      ? undefined
+      : localizedField(displayText.locale, chain, "description")
+        ?? readmeField(displayText.readme, readmeLanguageChain(locale));
     const description = localizedDescription ?? (pkg === undefined ? "" : stringValue(pkg.description) ?? "");
     const updatable = !official
       && !protectedBundle
