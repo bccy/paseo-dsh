@@ -561,6 +561,22 @@ settings 在 `describe()` 时对比 revision 后发出；绕过 `settings.write`
 两个 `dsh` 子进程共用同一个 profile 时是 last-writer-wins，`revision`/`expectedValue` 只防单进程
 内的 stale 点击，跨进程不保证。
 
+## DSH 插件页
+
+左侧栏新增 **DSH Plugins** 入口，管理本插件所驱动的 profile（默认
+`~/.dsh/profiles/paseo`）：列出 `@deepseek-ai/dsh-base`、桥接包以及 profile 里的每个
+bundle 与依赖；每行显示版本、是否声明 `dsh.bundle`（普通依赖不会成为 profile 层）、
+以及是否自带 DSH Web/Desktop 客户端界面——那套界面不由 Paseo 承载，所以行上只做标注，
+不会隐藏。
+
+启停只改有序的 `dsh.profile.bundles`（已装代码保留，所以停用不需要重新下载），
+写入时持有 profile 自己的 `package.json.lock`；安装、卸载、更新走 `dsh plugin`，
+新装 bundle 的激活也由它完成，没有 `dsh.bundle` 的包会被它拒绝。所有改动只对新会话生效，
+正在运行的会话保持启动时的 bundle 集合。页面不会在没有「检查 + 确认」的情况下安装任何
+东西，除了 bundle 列表之外也不改写 profile 文件。包操作需要 daemon 的 `PATH` 上有
+`pnpm`（与 `dsh plugin` 的要求相同）以及可用的 npm registry；失败会显示一句说明加原始
+`dsh` 输出，不会当成功处理。
+
 ## 版本策略
 
 插件的 `major.minor` **跟随它所适配的 DSH 线**：`0.2.x` 的插件对应 DSH `0.2.x`，

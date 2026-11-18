@@ -4,6 +4,8 @@ import { isTerminalJobsErrorCode, jobsSnapshot, jobsStop, type JobsAnswer } from
 import { isTerminalTeamErrorCode, teamSnapshot, type TeamAnswer } from "./shared/team";
 import { rewindNoticeArm } from "./shared/rewind-notice";
 import { ensurePaseoProfile } from "./server/bootstrap";
+import { DshPlugins } from "./server/dsh-plugins";
+import { registerDshPluginsRpc } from "./server/dsh-plugins-rpc";
 import { createPillFeed } from "./server/pill-feed";
 import { capturePaseo } from "./server/rewind-notice-append";
 import {
@@ -101,6 +103,13 @@ export default function contribute(server: PluginServerContext) {
 
   server.registerProvider(createDshProvider());
 
+  // The DSH Plugins page manages the profile this provider drives. One manager
+  // for the whole plugin process: its in-flight job is the page's serialization
+  // point, and the write lock it takes is DSH's own (`package.json.lock`), so a
+  // page action queues behind a DSH-side install instead of racing it.
+  const dshPlugins = new DshPlugins();
+  const disposeDshPlugins = registerDshPluginsRpc(server, dshPlugins);
+
   /**
    * One feed per pill. Each is a singleton for the plugin process, which is what
    * makes "two app windows, one read" true: the second window's subscription
@@ -186,6 +195,7 @@ export default function contribute(server: PluginServerContext) {
   });
 
   return () => {
+    disposeDshPlugins();
     for (const cleanup of cleanups) cleanup();
     jobsFeed.dispose();
     goalFeed.dispose();

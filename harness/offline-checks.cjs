@@ -17,6 +17,7 @@ const sourceChecks = [
   'file-snapshot-check.mjs', 'snapshot-lifecycle-check.mjs', 'file-mutation-gate-check.mjs',
   'rewind-merge-check.mjs', 'mcp-http-check.mjs',
   'doctor-check.mjs', 'probe-check.mjs', 'plugin-build-check.mjs',
+  'plugins-lock-check.cjs',
   'frame-reader-check.mjs', 'transport-frame-check.mjs', 'replay-turn-check.cjs',
   'concurrent-open-check.mjs', 'bootstrap-check.mjs', 'bridge-entry-check.mjs',
   'catalog-cache-check.mjs', 'open-degrade-check.mjs', 'session-state-check.cjs',

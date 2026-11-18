@@ -24,6 +24,10 @@ function readKinds(source) {
       kinds.push(spec.kind);
       return noop;
     },
+    // The screen and sidebar registrations are not timeline kinds; they only
+    // need to be accepted so the entry body runs to the renderer registrations.
+    addScreen() { return noop; },
+    addSidebarHeaderItem() { return noop; },
     paseo: {},
   };
   const requireClient = (id) => {
@@ -33,6 +37,25 @@ function readKinds(source) {
         (name) => name === 'react-native' ? {} : fromBuild(name));
     }
     if (id === './client/rewind-notice-live') return { startRewindLiveMonitor: () => noop };
+    if (id === './client/dsh-plugins-page') return { DshPluginsPage: () => null };
+    if (id === './client/dsh-plugins-icon') return { PluginsIcon: () => null };
+    // The entry runs `installFatalGuard()` on load and registers the screen and
+    // sidebar item through `guardCleanup`; none of that is a timeline kind, but
+    // the module itself imports React Native, which plain node cannot load.
+    if (id === './client/dsh-plugins-guard') {
+      return {
+        installFatalGuard: noop,
+        report: noop,
+        guardCleanup: (_label, run) => {
+          try {
+            return run();
+          } catch {
+            return noop;
+          }
+        },
+      };
+    }
+    if (id === '@getpaseo/plugin/client/ui') return { SidebarRow: () => null };
     if (/^\.\/client\/(goal-pill|jobs-pill|team-pill|workspace-badges)$/.test(id)) {
       // These register composer/side-bar surfaces, not timeline kinds.
       return new Proxy({}, { get: () => () => noop });

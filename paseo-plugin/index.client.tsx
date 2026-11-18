@@ -15,8 +15,12 @@
  *
  * @module dsh-paseo/index.client
  */
-import type { PluginClientContext } from "@getpaseo/plugin/client";
+import type { PluginClientContext, PluginSidebarItemProps } from "@getpaseo/plugin/client";
+import { SidebarRow } from "@getpaseo/plugin/client/ui";
 import { z } from "zod";
+import { DshPluginsPage } from "./client/dsh-plugins-page";
+import { guardCleanup, installFatalGuard } from "./client/dsh-plugins-guard";
+import { PluginsIcon } from "./client/dsh-plugins-icon";
 import { contributeGoalPill } from "./client/goal-pill";
 import { InlineThinking } from "./client/inline-thinking";
 import { contributeJobsPill } from "./client/jobs-pill";
@@ -24,7 +28,7 @@ import { contributeStreamStats } from "./client/stream-stats";
 import { contributeTeamPill } from "./client/team-pill";
 import { createWorkspaceStatusStore } from "./client/workspace-status";
 import { contributeWorkspaceBadges } from "./client/workspace-badges";
-import { localeFromMetadata, setLocale } from "./client/locale";
+import { localeFromMetadata, localeText, setLocale } from "./client/locale";
 import { RewindNotice } from "./client/rewind-notice";
 import {
   isLegacyRewindNotice,
@@ -39,7 +43,46 @@ import {
   rewindNoticeArm,
 } from "./shared/rewind-notice";
 
+/** The screen's id; the sidebar row opens this same id. */
+const PLUGINS_SCREEN_ID = "dsh-plugins";
+
+/**
+ * The sidebar header row that opens the page.
+ *
+ * A component, not a host-drawn icon+surface pair: host 0.16's current API
+ * (`addSidebarHeaderItem`) takes a component rendering `SidebarRow`, and the
+ * deprecated `addSidebarItem({ icon, surface })` that upstream 0.2.22 used is
+ * not worth adopting in a new port. The registered title is a resolved string
+ * (see `contribute`), which is what the native app can render safely; the icon
+ * is view-drawn for the same reason (`client/dsh-plugins-icon`).
+ */
+function PluginsSidebarItem({ currentScreen, openScreen }: PluginSidebarItemProps) {
+  return (
+    <SidebarRow
+      icon={PluginsIcon}
+      active={currentScreen?.screenId === PLUGINS_SCREEN_ID}
+      onPress={() => openScreen({ screenId: PLUGINS_SCREEN_ID })}
+    />
+  );
+}
+
 export default function contribute(client: PluginClientContext) {
+  // A fatal error raised while the host draws one of this plugin's
+  // contributions (the sidebar row above all) reaches RN's fatal handler, and a
+  // release build aborts the whole app. The guard swallows only errors that name
+  // this plugin.
+  //
+  // Deliberately NOT wrapped in a try/catch: the existing timeline contributions
+  // below have always let a refused registration fail the client entry loudly,
+  // and swallowing that here would turn any of them into a silently missing row
+  // (a parked test, `harness/timeline-kind-check.cjs`, pins exactly this: an
+  // invalid kind must still throw). The new page's own registrations are guarded
+  // individually in `buildContributions`.
+  installFatalGuard();
+  return buildContributions(client);
+}
+
+function buildContributions(client: PluginClientContext): () => void {
   client.addTimelineTransformer({
     id: "dsh-inline-thinking",
     query: { itemType: "reasoning" },
@@ -294,12 +337,32 @@ export default function contribute(client: PluginClientContext) {
   // (host v0.15.3), so all three may be visible together and each decides its
   // own visibility — no cross-pill coordination.
   const workspaceStatus = createWorkspaceStatusStore();
+  // The DSH Plugins page. `localeText()` is the fork's client half of the copy
+  // tables (`client/locale.ts`): the title registered with the host is the
+  // *resolved* string, because on native the host renders contribution titles
+  // outside this plugin's boundaries and a message object it cannot resolve is
+  // the failure mode the 0.2.22 native-safety work removed. Each registration is
+  // guarded on its own: a host that rejects one (unknown icon, unsupported
+  // surface) costs that entry only, never the four timeline renderers above.
+  const pluginsTitle = localeText().plugins.pageTitle;
   const cleanups = [
     contributeStreamStats(client),
     contributeJobsPill(client, workspaceStatus.observer("jobs")),
     contributeGoalPill(client, workspaceStatus.observer("goal")),
     contributeTeamPill(client, workspaceStatus.observer("team")),
     contributeWorkspaceBadges(client, workspaceStatus),
+    guardCleanup("plugins screen", () =>
+      client.addScreen({
+        id: PLUGINS_SCREEN_ID,
+        title: pluginsTitle,
+        Component: DshPluginsPage,
+      })),
+    guardCleanup("plugins sidebar", () =>
+      client.addSidebarHeaderItem({
+        id: PLUGINS_SCREEN_ID,
+        title: pluginsTitle,
+        Component: PluginsSidebarItem,
+      })),
     () => workspaceStatus.dispose(),
   ];
 

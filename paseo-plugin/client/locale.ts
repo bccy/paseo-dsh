@@ -59,6 +59,7 @@
  *
  * @module dsh-paseo/client/locale
  */
+import type { FailureCode } from "../shared/dsh-plugins-api";
 
 export type Locale = "en" | "zh-CN";
 
@@ -117,6 +118,84 @@ export interface WorkspaceBadgeText {
   blocked: string;
 }
 
+/**
+ * A failure code the DSH Plugins page can show. The shared contract's
+ * {@link FailureCode} is the source of truth (one entry per code the server can
+ * send), plus the page-local `render`, which only its error boundary can raise.
+ */
+export type DshPluginsFailureCode = FailureCode | "render";
+
+/**
+ * Copy for the DSH Plugins page (`client/dsh-plugins-page.tsx`).
+ *
+ * The server half never writes a user-facing sentence: every failure crosses the
+ * RPC boundary as a code (`shared/dsh-plugins-api.ts`), and the page picks the
+ * words here. `errors` is a `Record<DshPluginsFailureCode, string>` on purpose —
+ * a new code without copy is then a compile error, not a blank error card.
+ *
+ * Interpolation is written as functions (this fork has no client i18n engine;
+ * see the module note): the page composes `job.running(job.installAction)` the
+ * same way the goal card composes `rounds(round, cap)`.
+ */
+export interface DshPluginsText {
+  /** Screen title and sidebar row label. */
+  pageTitle: string;
+  header: {
+    refresh: string;
+    refreshing: string;
+    checkUpdates: string;
+    checkingUpdates: string;
+    notice: string;
+    retry: string;
+    profile: (profile: string, host: string) => string;
+  };
+  groups: { enabled: string; disabled: string; dependencies: string };
+  badges: {
+    official: string;
+    protected: string;
+    client: string;
+    platformUnsupported: string;
+    missing: string;
+    updateAvailable: (version: string) => string;
+  };
+  bundle: {
+    dependencyNote: string;
+    clientNote: string;
+    platforms: (platforms: string) => string;
+    platformsUnknown: string;
+    remove: string;
+    confirmRemove: string;
+    cancel: string;
+    update: (version: string) => string;
+    confirmUpdate: (version: string) => string;
+  };
+  install: {
+    title: string;
+    hint: string;
+    placeholder: string;
+    check: string;
+    checking: string;
+    confirm: string;
+    unknown: string;
+    trust: string;
+    notBundle: string;
+  };
+  job: {
+    installAction: string;
+    removeAction: string;
+    updateAction: string;
+    checkAction: string;
+    running: (action: string) => string;
+    failed: (action: string) => string;
+    succeeded: (action: string) => string;
+    failedBadge: string;
+    doneBadge: string;
+    updatesFound: (count: number) => string;
+  };
+  status: { loadingProfile: string };
+  errors: Record<DshPluginsFailureCode, string>;
+}
+
 export interface UiText {
   /** Native workspace-row summaries of the existing pill streams. */
   workspaceBadge: WorkspaceBadgeText;
@@ -162,6 +241,8 @@ export interface UiText {
    * verbatim head — the tables only ever add words for a code upstream defines.
    */
   toolFailures: Record<string, { short: string; hint: string }>;
+  /** Copy for the DSH Plugins screen and its sidebar row. */
+  plugins: DshPluginsText;
 }
 
 /**
@@ -1281,6 +1362,90 @@ const TEXT: Record<Locale, UiText> = {
         hint: "The model asked for a tool name that is not available, so DSH did not run it.",
       },
     },
+    // The DSH Plugins page. Every failure code the server can send has words
+    // here (the interface makes a missing one a compile error); the detail half
+    // of a failure is raw dsh/pnpm output and is shown verbatim underneath.
+    plugins: {
+      pageTitle: "DSH Plugins",
+      header: {
+        refresh: "Refresh",
+        refreshing: "Refreshing…",
+        checkUpdates: "Check for updates",
+        checkingUpdates: "Checking…",
+        notice: "Changes apply to new sessions; running sessions keep their current state.",
+        retry: "Retry",
+        profile: (profile, host) => `${profile} · ${host}`,
+      },
+      groups: { enabled: "Enabled", disabled: "Disabled", dependencies: "Plain dependencies" },
+      badges: {
+        official: "Built in",
+        protected: "Protected",
+        client: "Web UI",
+        platformUnsupported: "Not supported here",
+        missing: "Missing",
+        updateAvailable: (version) => `Update to ${version}`,
+      },
+      bundle: {
+        dependencyNote: "This is a plain dependency, not a DSH bundle; it does not become a profile layer.",
+        clientNote: "Its UI only appears in DSH Web/Desktop.",
+        platforms: (platforms) => `Supported platforms: ${platforms}`,
+        platformsUnknown: "This bundle does not list support for the current platform.",
+        remove: "Remove",
+        confirmRemove: "Confirm removal",
+        cancel: "Cancel",
+        update: (version) => `Update to ${version}`,
+        confirmUpdate: (version) => `Confirm update to ${version}`,
+      },
+      install: {
+        title: "Install a DSH plugin",
+        hint: "Only npm registry package names are accepted. The package is checked for dsh.bundle before installation.",
+        placeholder: "Package name or name@version",
+        check: "Check",
+        checking: "Checking…",
+        confirm: "Install",
+        unknown: "Unknown package",
+        trust: "This is third-party code. It runs inside every new DSH session. Install only packages you trust.",
+        notBundle: "This package does not declare dsh.bundle, so it would not take effect in this profile.",
+      },
+      job: {
+        installAction: "Installation",
+        removeAction: "Removal",
+        updateAction: "Update",
+        checkAction: "Update check",
+        running: (action) => `${action} in progress…`,
+        failed: (action) => `${action} failed`,
+        succeeded: (action) => `${action} finished`,
+        failedBadge: "Failed",
+        doneBadge: "Done",
+        updatesFound: (count) => `${count} update${count === 1 ? "" : "s"} available.`,
+      },
+      status: { loadingProfile: "Reading the profile…" },
+      errors: {
+        "profile-unreadable": "Could not read the profile's package.json.",
+        "profile-invalid": "The profile's package.json is not valid JSON.",
+        "invalid-platform": "This bundle does not support the current platform.",
+        "lock-timeout": "Timed out waiting for the profile write lock.",
+        "invalid-name": "The bundle name is empty.",
+        "protected": "This bundle is protected.",
+        "not-installed": "This package is not installed.",
+        "not-a-bundle": "This package does not declare dsh.bundle.",
+        "invalid-spec": "Only npm registry package names are supported.",
+        "registry-unreadable": "Could not read the registry response.",
+        "registry-invalid": "The registry returned no usable package information.",
+        "already-installed": "This package is already installed. Enable it in the list instead.",
+        "not-removable": "Only packages in the profile dependencies can be removed.",
+        "not-in-dependencies": "This package is not a profile dependency.",
+        "invalid-version": "This is not a valid registry version.",
+        "check-failed": "Some bundles could not be checked.",
+        "disposed": "The plugin was unloaded.",
+        "busy": "Another management task is running.",
+        "job-missing": "The task is no longer available.",
+        "spawn-failed": "Could not start dsh.",
+        "command-failed": "The dsh command failed.",
+        "request-failed": "The request failed.",
+        "render": "This screen failed to render. Reopen it; if it happens again, check the daemon log.",
+      },
+    },
   },
   "zh-CN": {
     workspaceBadge: {
@@ -1790,6 +1955,87 @@ const TEXT: Record<Locale, UiText> = {
       UNKNOWN_TOOL: {
         short: "工具不存在或没有注册",
         hint: "模型请求了一个当前不可用的工具名，DSH 没有执行它。",
+      },
+    },
+    plugins: {
+      pageTitle: "DSH 插件",
+      header: {
+        refresh: "刷新",
+        refreshing: "刷新中…",
+        checkUpdates: "检查更新",
+        checkingUpdates: "检查中…",
+        notice: "改动只影响新建会话；正在运行的会话保持原样。",
+        retry: "重试",
+        profile: (profile, host) => `${profile} · ${host}`,
+      },
+      groups: { enabled: "已启用", disabled: "未启用", dependencies: "普通依赖" },
+      badges: {
+        official: "内置",
+        protected: "受保护",
+        client: "客户端界面",
+        platformUnsupported: "当前平台不支持",
+        missing: "缺失",
+        updateAvailable: (version) => `可更新到 ${version}`,
+      },
+      bundle: {
+        dependencyNote: "普通依赖，不是 DSH bundle，不会成为 profile 层。",
+        clientNote: "界面只在 DSH Web/Desktop 显示。",
+        platforms: (platforms) => `支持的平台：${platforms}`,
+        platformsUnknown: "这个 bundle 没有声明支持当前平台。",
+        remove: "卸载",
+        confirmRemove: "确认卸载",
+        cancel: "取消",
+        update: (version) => `更新到 ${version}`,
+        confirmUpdate: (version) => `确认更新到 ${version}`,
+      },
+      install: {
+        title: "安装 DSH 插件",
+        hint: "只接受 npm registry 包名。安装前会检查它是否声明 dsh.bundle。",
+        placeholder: "包名或包名@版本",
+        check: "检查",
+        checking: "检查中…",
+        confirm: "确认安装",
+        unknown: "未知包",
+        trust: "这是第三方代码，会在每个新会话的 DSH 进程里运行。只安装你信任的包。",
+        notBundle: "这个包没有声明 dsh.bundle，装进 profile 不会生效。",
+      },
+      job: {
+        installAction: "安装",
+        removeAction: "卸载",
+        updateAction: "更新",
+        checkAction: "检查更新",
+        running: (action) => `正在${action}…`,
+        failed: (action) => `${action}失败`,
+        succeeded: (action) => `${action}完成`,
+        failedBadge: "失败",
+        doneBadge: "完成",
+        updatesFound: (count) => `发现 ${count} 个可更新项。`,
+      },
+      status: { loadingProfile: "正在读取 profile…" },
+      errors: {
+        "profile-unreadable": "读不到 profile 的 package.json。",
+        "profile-invalid": "profile 的 package.json 不是有效 JSON。",
+        "invalid-platform": "这个 bundle 不支持当前平台。",
+        "lock-timeout": "等待 profile 写锁超时。",
+        "invalid-name": "bundle 名称不能为空。",
+        "protected": "这个 bundle 受保护。",
+        "not-installed": "这个包没有安装。",
+        "not-a-bundle": "这个包没有声明 dsh.bundle。",
+        "invalid-spec": "只支持 npm registry 包名。",
+        "registry-unreadable": "无法解析 registry 返回的信息。",
+        "registry-invalid": "registry 没有返回有效的包信息。",
+        "already-installed": "这个包已经安装，请在列表里启用它。",
+        "not-removable": "只有 profile 依赖里的包可以卸载。",
+        "not-in-dependencies": "这个包不在 profile 依赖里。",
+        "invalid-version": "这不是有效的 registry 版本。",
+        "check-failed": "部分 bundle 检查失败。",
+        "disposed": "插件已卸载。",
+        "busy": "已有管理任务在运行。",
+        "job-missing": "任务不存在或已过期。",
+        "spawn-failed": "无法启动 dsh。",
+        "command-failed": "dsh 命令执行失败。",
+        "request-failed": "请求失败。",
+        "render": "这个页面渲染失败。重新打开试试；如果反复出现，请检查 daemon 日志。",
       },
     },
   },
