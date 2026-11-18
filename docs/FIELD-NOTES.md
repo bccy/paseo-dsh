@@ -4530,8 +4530,7 @@ shellEnv 时遗漏了两个夹具，产生假红；因此新增 push/PR gate，�
 复核另纠正一处假宿主反例：直接调用已关闭流的答案回调会覆盖新数据，但 Paseo 0.16 SDK 的
 `subscribePluginRpc` 在 `closed` 后丢弃事件。该反例绕过了真实封装，不能作为线上迟到帧缺陷的
 证据；本轮没有为它另造一套流代号。测试要保留真实边界，不能用比宿主更宽的夹具证明线上故障。
-
-## 第三十七轮：空闲回收不问 DSH，后台工作随会话一起消失（2026-11-19）
+## 第三十七轮：空闲回收否决、提问/拒绝路径与 DSH 插件页（2026-11-19，跟上游）
 
 ### 112. 宿主只认协商到的能力位：没声明 `session.can_stop_runtime`，Paseo 空闲回收直接释放会话
 
@@ -4576,3 +4575,84 @@ DSH 进程内。宿主问到时，它只给 10 s（`plugin-provider.js:512-524`�
 `request.failed`）；`harness/plugin-check.cjs` 新增真机段（空闲 `canStop:true` → 回合中 false →
 中断后 true → 未知会话 `request.failed`）。变异：`canStopRuntime` 直接 `return true`、
 waterfall 缺失时返回空、范围改成全部 live agent、child 能力位摘掉——各自使对应断言转红。
+
+### 113. 多选回答按逗号切分：标签里的 ", " 被拆成假选项，"其他"文字被当成选项标签
+
+**症状**：多选卡片选 "Red, warm" 与 "Blue" 时模型收到三个标签 `["Red","warm","Blue"]`；"其他"里输入
+的文字同样被拆成若干"标签"。DSH 不校验标签是否真在选项里，所以没有报错、没有失败——只是模型被告知
+了用户没选过的选项（静默降级）。
+
+**根因**：Paseo 的多选卡片把所选标签与"其他"文字用 ", " 拼成一个字符串
+（`updatedInput.answers[<header>]`），而 `selectAnswer` 对它 `split(",")`。标签本身可以含 ", "，
+所以这个字符串**没有可靠的分隔边界**。
+
+**修法**：按问题自己的选项标签读这个字符串（`readMultiSelect`）：每个位置取"最长、且后接 ', ' 或
+正好到串尾"的标签，剩下的部分才是用户输入的文字（Paseo 总把"其他"追加在最后）。单选保持原逻辑：
+完全等于某标签才算标签，否则进 `custom`；无选项的题一律按 `custom`。`deny` 分支（dismissal note
+进 `custom`）与 `planAnswer` 不变。
+
+**判据**：`paseo-plugin/test/question-answer.test.cjs`。旧实现红证据：`'Red, warm, Blue'` →
+`["Red","warm","Blue"]`；无选项题 `"ship it"` → `["ship it"]`（应当是 `custom`）；修后 9/9 绿。
+**动了 `selectAnswer` 必跑该测试。**
+
+### 114. 拒绝并停止（`interrupt: true`）被忽略：用户点了停止，回合继续跑
+
+**症状**：权限卡上"拒绝并停止"，宿主在 deny 回执里带 `interrupt: true`；插件只 resolve 卡片，
+模型继续跑完。宿主把"停止"表达在权限回执里，没有第二条停止请求，所以插件不处理就没人处理。
+
+**根因**：`resolvePermission` 不看 `interrupt`；卡片只完成了"回答"这一半。
+
+**修法**：resolve 之后，若 `deny && interrupt === true`，中断**提出请求的那个会话**：root 卡走
+`interrupt()`（它自有回执上限与本地兜底）；子会话提升上来的卡按 pending 记录里的 `sessionId`
+找到 child，用其 native session id 发 `session/cancel`。中断失败写日志，不静默吞。
+
+**边界（未验证）**：本 fork 的桥 `session/cancel` 只认 Paseo 根会话（native 子会话不在桥的
+`sessions` 表里，`dsh-bridge/lib/server.js` 的 `cancel()`/`owns()`），上游 0ad6416 依赖的桥内子
+会话分支在这里没有。所以 child 卡的中断请求今天会被真桥拒绝并留下失败日志；要真正生效必须改桥
+（范围外，见第 43 条同族缺口）。另外 child 卡在真机上**不可达**，且是两层：① 真桥的提问/审批
+转发都以 `owns()` 为门（提问 `dsh-bridge/lib/index.js:217-218`、审批 `dsh-bridge/lib/approval.js:10-12`），
+native 子会话不在桥的 `sessions`/`sessionCreations` 里，子会话的提问与审批永不发给 Paseo；② 更前面，
+DSH 0.2.2-rc.3 的 `user-questions` 服务对 `origin:"subagent"` 的 agent 直接抛 `DELEGATED_CALLER`
+（`@deepseek-ai/dsh-user-questions/lib/index.js:539-543`；子会话 origin 由
+`@deepseek-ai/dsh-subagent/lib/index.js:300` 写入）。因此让 child 卡真正生效不止要改桥（补
+`subsessions` 分支），还要 DSH 允许子代理提问——后者不受本插件控制。插件侧先把协议形状发对，
+假桥检查钉住"只取消那个 child、不碰 root"（只证插件路由，不证真机可达）。
+
+**判据**：`question-answer.test.cjs` 集成两条：child 卡 deny+interrupt 只产生 `session/cancel`
+(child native id)、root 卡 deny+interrupt 取消 root、不带 `interrupt` 不产生 cancel 帧（断言取
+假桥请求日志的协议边界）。**动了 `resolvePermission` / `#interruptAfterDenial` 必跑。**
+
+### 115. 两张待答卡片共用一个 id：后一张顶掉前一张（**防御性修正**）
+
+**症状（结构性风险，非实测复现）**：`#pendingPermissions` 按卡片 id 做键；若同一会话真的同时存在
+两张由同一字面量派生的待答卡，后注册的 promise 会**覆盖**前一张——被覆盖的 DSH 请求永远得不到
+回答，只能等 DSH 自己的超时。
+
+**根因（已按 VB 订正，2026-11-19）**：问题/计划卡的 id 由 DSH 请求的 tool-call id 派生；本 fork 的桥
+profile 以**无 config** 方式装配 `tool-ask-user`（`dsh-bridge/cordis.patch.yml:29-31`），于是走该工具
+的 **legacy** 默认模式（`@deepseek-ai/dsh-tool-ask-user/lib/index.js:212-222`）；legacy 的 `execute`
+调 `ctx.userQuestions.ask({ questions, agent, signal })` **不带 `wait`**（同文件 `:304-315`），桥组帧
+时 `callId: request.wait?.callId === undefined ? null : …`（`dsh-bridge/lib/index.js:224`）→ 该会话
+所有 legacy 问题卡都派生 `${sessionId}:question`。
+
+> **原文保留 + 更正**：本条最初把 `callId: null` 归因于"带 timeout 的 `ask_user_question` 走
+> `askTimed`、请求不带 `wait`"。**该归因已被独立验证（VB §5）推翻**：`askTimed` 在服务层调
+> `ask()` 前自行注入 `wait: { callId, timed: true }`（`@deepseek-ai/dsh-user-questions/lib/index.js:621-638`），
+> 桥对 timed 请求拿到的是**真实 callId**（`callId:null` 只发生在 legacy 路径）。
+
+**可达性（未验证，倾向不可达）**：`ask_user_question` 未声明 `isConcurrencySafe`，DSH 工具流水线
+只把**显式返回 true** 的调用判为 parallel，其余一律 exclusive（`@deepseek-ai/dsh-tools/lib/pipeline.js:284-289`），
+而 legacy ask 会阻塞它所在的 step，所以正常流程下同会话看不到两张同时 pending 的 legacy 卡。要出现
+同 id 需非常规路径（例如请求被放弃后插件 pending 未清、下一张卡再取同一字面量），本包**未构造出该
+场景、未做真机复现**。root/child 之间冲突在本 fork 不成立：id 带会话前缀，`harness/subagent-check.cjs:240-250`
+用假桥钉住了两卡 id 不同（该用例只证插件路由，不代表 child 卡真机可达，见 114）。
+
+**修法（保留，定位为防御）**：生成 id 时对已 pending 的 id 加数字后缀（`uniqueCardId` + `#nextCardId`），
+第三张跳过已用的后缀；会话前缀照旧。工具审批不走这里：它的 id 带桥的每请求 UUID
+（`dsh-bridge/lib/approval.js` 的 `randomUUID()`），本来唯一，而 abort 路径要按这个确切 id 回写。
+上游 e320298 加后缀的动机里还包含"**sibling sessions** 可撞同一 tool-call id"——那一刻上游卡 id
+不带会话前缀，本 fork 已用 `${sessionId}:` 前缀消除该类别。
+
+**判据**：`question-answer.test.cjs` 的 `uniqueCardId` 四组（无冲突原样返回、冲突加后缀、第三张
+跳过已用后缀、本身像后缀的 id 仍再加后缀）先红（导出不存在）后绿。这是 **id 派生层的判据，不证明
+真实可达性**；可达性按上文记为未验证。
