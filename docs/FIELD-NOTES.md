@@ -4695,3 +4695,42 @@ profile 以**无 config** 方式装配 `tool-ask-user`（`dsh-bridge/cordis.patc
   由 `paseo-plugin/test/dsh-plugins.test.cjs` 的「锁在写入期间被接管时不得删除」钉住。
 - 复现与验证命令在 `harness/plugins-lock-check.cjs` 头部；注意 `dsh plugin view` 一次就会
   初始化 profile 文件（**但不留锁**，残留锁来自异常终止），核对时一律用一次性 `DSH_HOME`。
+
+### 117. DSH 插件页把正常工作的包标成「缺失」：只查了 profile 自己的 node_modules
+
+2026-11-18 合入插件页后用户真机发现：真实 profile（`~/.dsh/profiles/paseo`）里
+`dsh-paseo-bridge`、`@deepseek-ai/dsh-web-app`、`@deepseek-ai/dsh-experimental-*` 全显示
+「缺失」，而它们都被 DSH 正常加载（doctor 全绿）。根因在 `server/dsh-plugins.ts` 的
+`#describe`/`readInstalledPackage`：只查 `<profile>/node_modules/<name>`，且只把
+`@deepseek-ai/dsh-base` 当官方包。
+
+DSH 自己的解析（`@deepseek-ai/dsh-app-boot/src/profile.ts:629-637` `packageDirFromAnchor`、
+`:651-662` `resolveBundleDir`）是**先安装锚点、后 profile 锚点**：
+
+- 安装锚点 = 运行中 dsh 包自己的 `package.json`（launcher 用
+  `new URL("../package.json", import.meta.url)` 得到）。所以 in-box 的 `@deepseek-ai/*`
+  bundle 永远从**运行中的安装**加载，profile 里即使也装了一份，加载的仍是安装那份
+  （README 明写这个 installation-first 是契约）。
+- profile 锚点 = `<profile>/package.json`，用 Node 原生 node_modules 链：先
+  `<profile>/node_modules`（pnpm 依赖），再 `$DSH_HOME/profiles/node_modules`（桥的共享锚点），
+  再往上到祖先 node_modules。
+- 实测（只读）：真实 profile 锚点只解析到 `dsh-paseo-bridge`（共享锚）与
+  `dsh-prime-memory` 等 profile 依赖；`@deepseek-ai/dsh-web-app`/`dsh-base`/`experimental-*`
+  只有安装锚点能解析到——这正是显示「缺失」的原因。
+
+修法：`DshPlugins.resolveBundlePackage()` 用 `createRequire(anchor).resolve.paths(name)` 按
+上述顺序（安装→profile）解析；`official` 的判据从「名字是 dsh-base」改成「解析来自安装锚点」。
+官方包显示安装副本的版本，且不可卸载/不可更新（它们跟随 DSH 升级）；共享 `profiles/node_modules`
+与 profile 的包同等对待；三处都解析不到才显示「缺失」。安装锚点从本页要 spawn 的 `dsh` 可执行
+文件推出（POSIX 走 npm 全局 symlink 的 `realpath`，Windows 复用 `server/dsh-command.mjs` 给
+的包内入口）；认不出的 wrapper 降级为只按 profile 解析（base 行保留回退，避免误报缺失）。
+
+没有复用 DSH 内部函数：`dsh-app-boot` 不是本插件依赖，动态 require 安装树里的内部符号属于
+新增内部服务依赖（且 `dsh-api-contract-check` 只能按 import 检查）；这里复用的是**顺序**这个
+契约，注释写明了对应 DSH 的 file:line。未新增任何 DSH 内部 import，契约检查不变（27/27）。
+
+回归：`paseo-plugin/test/dsh-plugins.test.cjs` 新增 5 条（profile 自己的 node_modules、共享
+`profiles/node_modules`、安装目录、安装副本优先于 profile 副本、真缺失仍为 missing）；
+先红后绿（前四条里共享/安装/优先三条在旧实现上红，profile 与真缺失两条是既有行为的对照）。
+真实 profile 只读清单（`new DshPlugins().list()` + 逐包 `resolveBundlePackage()`）11/11 行
+installed，0 行 missing，5 个官方包 version `0.2.2-rc.3`、origin `installation`。

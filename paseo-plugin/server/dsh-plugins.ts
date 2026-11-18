@@ -29,6 +29,17 @@
  *   pass through to pnpm's `view`, which answers a registry document and a JSON
  *   string respectively; both are parsed leniently (pnpm may print progress
  *   lines around the JSON).
+ * - **A bundle's files are not in one place.** DSH resolves a selected bundle
+ *   from the **dsh installation first**, then from `<profile>/package.json`
+ *   whose Node lookup covers the profile's own `node_modules`, the shared
+ *   `$DSH_HOME/profiles/node_modules` anchor, and any ancestor node_modules
+ *   (`@deepseek-ai/dsh-app-boot/src/profile.ts:629-637` `packageDirFromAnchor`
+ *   and `:651-662` `resolveBundleDir`; the installation-first order is the
+ *   stated contract, so an in-box bundle always comes from the running
+ *   installation). The page therefore resolves with the same two anchors and
+ *   marks anything found under the installation as official: it shows that
+ *   copy's version and is neither removable nor updatable, because it follows
+ *   the DSH upgrade rather than the profile.
  *
  * @module dsh-paseo/server/dsh-plugins
  */
@@ -36,14 +47,17 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
+  existsSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import type {
   BundleInfo,
   BundleRow,
@@ -56,6 +70,8 @@ import type {
   SetEnabledOutput,
   StartJobInput,
   StartJobOutput,
+  UpdateOutcome,
+  UpdateTarget,
 } from "../shared/dsh-plugins-api";
 import { dshHome, profileDir, profileName } from "./bootstrap";
 import { resolveDshCommand } from "./dsh-command.mjs";
@@ -103,6 +119,8 @@ interface Job {
   errorCode?: FailureCode;
   errorDetail?: string;
   updates?: Record<string, string>;
+  /** Per-target outcomes, set by the batch update path. */
+  updateResults?: UpdateOutcome[];
   startedAt: number;
   finishedAt?: number;
   child?: ChildProcess;
@@ -138,6 +156,33 @@ export interface DshPluginsOptions {
   profile?: string;
   dir?: string;
   dshHome?: string;
+  /**
+   * The running dsh installation's `package.json`, used as the **first** bundle
+   * anchor (see {@link DshPlugins.resolveBundlePackage}).
+   *
+   * Omitted: derived from the `dsh` executable this page would spawn
+   * ({@link resolveInstallAnchor}), cached once per plugin process.
+   * `null`: installation resolution disabled, so only the profile anchor is
+   * consulted. Tests pass `null` (or their own fixture path) so they never read
+   * the real global installation.
+   */
+  installAnchor?: string | null;
+  /**
+   * @internal Test seam: spawn one `dsh` invocation (`cwd`/`env`/`detached` are
+   * the launcher inputs). Defaults to {@link spawnDshCommand}.
+   *
+   * The batch-update regression uses it to script exit codes and count commands
+   * without a real dsh, pnpm, registry, or network — and without a shell, which
+   * is also what keeps it portable to Windows CI.
+   */
+  spawn?: (args: readonly string[], options: SpawnDshOptions) => ChildProcess;
+}
+
+/** The launch inputs {@link spawnDshCommand} hands to a spawner. */
+export interface SpawnDshOptions {
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  detached: boolean;
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -236,17 +281,145 @@ function dependencies(manifest: ProfileManifest): Record<string, string> {
   return result;
 }
 
-function readInstalledPackage(dir: string, name: string): Record<string, unknown> | undefined {
+/** Where a resolved bundle's files live, in DSH's own resolution order. */
+export type PackageOrigin = "installation" | "profile";
+
+export interface ResolvedBundlePackage {
+  /** Absolute package directory (the one holding `package.json`). */
+  dir: string;
+  /** The package's own manifest. */
+  manifest: Record<string, unknown>;
+  /** Which anchor resolved it; `installation` is what the page calls official. */
+  origin: PackageOrigin;
+}
+
+/**
+ * Node's own `node_modules` lookup from one anchor file, exactly as DSH
+ * resolves a bundle (`@deepseek-ai/dsh-app-boot` `src/profile.ts:629-637`):
+ * probe `createRequire(anchor).resolve.paths(name)` for the first directory
+ * that holds the named package's `package.json`. `existsSync` follows the
+ * symlinks pnpm's isolated layout uses, which is why this matches what the
+ * Loader imports from the same anchor.
+ *
+ * Reimplemented rather than imported: `dsh-app-boot` is not a dependency of
+ * this plugin, and reaching into the daemon's install tree for an internal
+ * function would be a new internal-service dependency that
+ * `harness/dsh-api-contract-check.mjs` must pin. The *order* is the contract,
+ * not the implementation.
+ *
+ * @param anchor - absolute file inside the tree to resolve from (a
+ *   `package.json`), like DSH's own anchors.
+ * @param name - the package name.
+ * @returns the package directory, or `undefined` when no lookup path has it.
+ */
+function packageDirFromAnchor(anchor: string, name: string): string | undefined {
+  let searchPaths: readonly string[] | null;
   try {
-    const parsed: unknown = JSON.parse(
-      readFileSync(join(dir, "node_modules", name, "package.json"), "utf8"),
-    );
-    return isRecord(parsed) ? parsed : undefined;
+    searchPaths = createRequire(anchor).resolve.paths(name);
   } catch {
-    // A broken or absent package is a normal inventory state, not a reason to
-    // fail the whole list.
     return undefined;
   }
+  for (const searchPath of searchPaths ?? []) {
+    const candidate = join(searchPath, name);
+    if (existsSync(join(candidate, "package.json"))) return candidate;
+  }
+  return undefined;
+}
+
+/**
+ * Candidate absolute paths for the configured `dsh` command, in PATH order.
+ *
+ * Mirrors what `spawn` would execute: a path is used as given; a bare name is
+ * looked up in `PATH` (with `PATHEXT` on Windows). Every candidate is only a
+ * starting point for {@link installationAnchorFromEntry} — a candidate that is
+ * not actually inside the dsh package simply does not yield an anchor.
+ */
+function executableCandidates(binary: string, env: NodeJS.ProcessEnv): string[] {
+  if (binary.includes("/") || binary.includes("\\")) return [resolve(binary)];
+  const pathValue = env.PATH ?? env.Path ?? "";
+  const extensions = process.platform === "win32"
+    ? (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter((value) => value !== "")
+    : [""];
+  const candidates: string[] = [];
+  for (const directory of pathValue.split(delimiter)) {
+    if (directory === "") continue;
+    for (const extension of extensions) {
+      const candidate = join(directory, `${binary}${extension}`);
+      if (existsSync(candidate)) candidates.push(candidate);
+    }
+  }
+  return candidates;
+}
+
+/**
+ * Walk up from a launcher entry point to the dsh package's own `package.json`.
+ *
+ * DSH's own launcher takes its installation anchor from
+ * `new URL("../package.json", import.meta.url)` inside the running package
+ * (`dsh/lib/profile-boot-*.js`), so the entry file sits one level below the
+ * package root. npm's global install on POSIX makes the `dsh` on PATH a symlink
+ * into that same tree (`.../node_modules/@deepseek-ai/dsh/lib/bin.js`), which is
+ * why `realpathSync` is enough there; on Windows the launcher resolution in
+ * `server/dsh-command.mjs` already hands over the in-package entry.
+ *
+ * @param entry - absolute path of the launcher file to start from.
+ * @returns the package's manifest path, or `undefined` when no ancestor is dsh.
+ */
+function installationAnchorFromEntry(entry: string): string | undefined {
+  let real: string;
+  try {
+    real = realpathSync(entry);
+  } catch {
+    return undefined;
+  }
+  let directory = dirname(real);
+  for (let depth = 0; depth < 6; depth += 1) {
+    const candidate = join(directory, "package.json");
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(candidate, "utf8"));
+      if (isRecord(parsed) && parsed.name === "@deepseek-ai/dsh") return candidate;
+    } catch {
+      // The entry lives in `bin/`/`lib/`: keep walking towards the package root.
+    }
+    const parent = dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
+  }
+  return undefined;
+}
+
+/**
+ * The running dsh installation's manifest, derived from the binary this page
+ * would spawn. `undefined` when that binary is not recognisably inside a dsh
+ * package (a hand-written wrapper, a renamed launcher): the page then degrades
+ * to profile-only resolution instead of guessing at another installation tree.
+ */
+function resolveInstallAnchor(): string | undefined {
+  let binary: string;
+  try {
+    binary = resolveDshBinary();
+  } catch {
+    return undefined;
+  }
+  const env = process.env;
+  const launch = resolveDshCommand(binary, env, process.cwd());
+  const candidates = launch.args.length > 0
+    ? [resolve(launch.args[0] as string)]
+    : executableCandidates(binary, env);
+  for (const candidate of candidates) {
+    const anchor = installationAnchorFromEntry(candidate);
+    if (anchor !== undefined) return anchor;
+  }
+  return undefined;
+}
+
+/** Derivation is filesystem-only but not free; one answer per plugin process. */
+let derivedInstallAnchor: { value: string | undefined } | undefined;
+
+/** The cached {@link resolveInstallAnchor} result. */
+function defaultInstallAnchor(): string | undefined {
+  derivedInstallAnchor ??= { value: resolveInstallAnchor() };
+  return derivedInstallAnchor.value;
 }
 
 function packageDsh(pkg: Record<string, unknown>): Record<string, unknown> | undefined {
@@ -540,11 +713,7 @@ function dshCommandLabel(): string {
  */
 function spawnDshCommand(
   args: readonly string[],
-  options: {
-    cwd: string;
-    env: NodeJS.ProcessEnv;
-    detached: boolean;
-  },
+  options: SpawnDshOptions,
 ): ChildProcess {
   const launch = resolveDshCommand(resolveDshBinary(), options.env, options.cwd);
   return spawn(launch.command, [...launch.args, ...args], {
@@ -559,6 +728,15 @@ export class DshPlugins {
   readonly profile: string;
   readonly dir: string;
   readonly dshHome: string;
+  /**
+   * The installation anchor this instance resolves official bundles from;
+   * `undefined` when installation resolution is disabled or the launcher is not
+   * recognisably inside a dsh package.
+   */
+  readonly installAnchor: string | undefined;
+
+  /** One spawn point; overridable only by the test seam in the options. */
+  readonly #spawnDsh: (args: readonly string[], options: SpawnDshOptions) => ChildProcess;
 
   #jobs = new Map<string, Job>();
   #activeJobId: string | undefined;
@@ -571,6 +749,59 @@ export class DshPlugins {
     this.profile = options.profile ?? profileName();
     this.dshHome = options.dshHome ?? dshHome();
     this.dir = options.dir ?? profileDir(this.profile, this.dshHome);
+    this.installAnchor = options.installAnchor === null
+      ? undefined
+      : options.installAnchor ?? defaultInstallAnchor();
+    this.#spawnDsh = options.spawn ?? spawnDshCommand;
+  }
+
+  /**
+   * Resolve one package the way DSH resolves a profile bundle.
+   *
+   * Order is DSH's own (`@deepseek-ai/dsh-app-boot/src/profile.ts:651-662`,
+   * `resolveBundleDir`): the **installation anchor first**, then
+   * `<profile>/package.json`. The installation-first rule is a stated DSH
+   * contract — an in-box bundle always comes from the same installation as the
+   * running dsh, never from a profile-local copy — so a package the installation
+   * also ships is reported from there even when the profile depends on it.
+   *
+   * The profile anchor covers three layouts at once because it is Node's normal
+   * lookup: `<profile>/node_modules` (pnpm dependencies), the shared
+   * `$DSH_HOME/profiles/node_modules` anchor the bridge lives in, and any
+   * ancestor `node_modules`. A package none of them holds is the only one that
+   * may be reported missing.
+   *
+   * A candidate whose `package.json` exists but cannot be parsed is skipped and
+   * the next anchor is tried: a damaged package copy is an inventory state, and
+   * the whole list must not fail over it. Only when every anchor misses does the
+   * row read missing, so a broken copy does not turn into "not installed".
+   *
+   * Public beyond this module on purpose: the regression tests and the read-only
+   * real-profile evidence call it per row to show which anchor answered. Within
+   * the page it serves `list()`/`setEnabled()` and the package jobs.
+   *
+   * @param name - package name, as it appears in `dsh.profile.bundles`.
+   * @returns the resolved package and its origin, or `undefined` when absent.
+   */
+  resolveBundlePackage(name: string): ResolvedBundlePackage | undefined {
+    const anchors: Array<readonly [PackageOrigin, string | undefined]> = [
+      ["installation", this.installAnchor],
+      ["profile", join(this.dir, "package.json")],
+    ];
+    for (const [origin, anchor] of anchors) {
+      if (anchor === undefined) continue;
+      const dir = packageDirFromAnchor(anchor, name);
+      if (dir === undefined) continue;
+      let manifest: Record<string, unknown> | undefined;
+      try {
+        const parsed: unknown = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+        manifest = isRecord(parsed) ? parsed : undefined;
+      } catch {
+        continue;
+      }
+      if (manifest !== undefined) return { dir, manifest, origin };
+    }
+    return undefined;
   }
 
   /** Read the profile inventory. Never starts a package operation. */
@@ -603,7 +834,12 @@ export class DshPlugins {
     selected.forEach(add);
     Object.keys(deps).forEach(add);
 
-    const dshVersion = await this.#getDshVersion();
+    // `dsh --version` is only the base row's fallback: when the installation's
+    // base package resolves, its own manifest is authoritative and the page
+    // needs no child process for a plain list (the page refreshes often).
+    const dshVersion = this.resolveBundlePackage(BASE_BUNDLE) === undefined
+      ? await this.#getDshVersion()
+      : undefined;
     const bundles = names.map((name) => this.#describe(name, deps[name], selected, dshVersion));
     const activeJob = this.#activeJobId === undefined ? undefined : this.#jobs.get(this.#activeJobId);
     return {
@@ -633,17 +869,19 @@ export class DshPlugins {
 
     return withPackageLock(this.dir, () => {
       const manifest = readProfileManifest(this.dir);
-      const deps = dependencies(manifest);
       const current = selectedBundles(manifest);
       if (enabled) {
-        if (deps[bundleName] === undefined) {
+        // Enabling used to require a profile dependency; that rejected an
+        // installation-supplied bundle (deselect then reselect) even though DSH
+        // loads it. Resolve the same way DSH does instead.
+        const resolved = this.resolveBundlePackage(bundleName);
+        if (resolved === undefined) {
           throw new ManagerError("not-installed", bundleName);
         }
-        const installed = readInstalledPackage(this.dir, bundleName);
-        if (installed === undefined || !hasBundleManifest(installed)) {
+        if (!hasBundleManifest(resolved.manifest)) {
           throw new ManagerError("not-a-bundle", bundleName);
         }
-        const platform = bundlePlatformSupport(installed);
+        const platform = bundlePlatformSupport(resolved.manifest);
         if (!platform.supported) throw new ManagerError("invalid-platform", platform.reason);
         if (current.includes(bundleName)) {
           return { ok: true, changed: false, enabled: true };
@@ -751,6 +989,7 @@ export class DshPlugins {
       ...(job.errorCode === undefined ? {} : { errorCode: job.errorCode }),
       ...(job.errorDetail === undefined ? {} : { errorDetail: job.errorDetail }),
       ...(job.updates === undefined ? {} : { updates: job.updates }),
+      ...(job.updateResults === undefined ? {} : { updateResults: job.updateResults }),
       startedAt: job.startedAt,
       ...(job.finishedAt === undefined ? {} : { finishedAt: job.finishedAt }),
     };
@@ -780,17 +1019,25 @@ export class DshPlugins {
     selected: string[],
     dshVersion: string | undefined,
   ): BundleInfo {
-    const official = name === BASE_BUNDLE;
+    const resolved = this.resolveBundlePackage(name);
+    const pkg = resolved?.manifest;
+    // Official means "the installation supplied it", not "the name starts with
+    // @deepseek-ai": DSH's contract is that an in-box bundle always loads from
+    // the installation, so that is the copy this row describes.
+    const official = resolved?.origin === "installation";
     const protectedBundle = PROTECTED_BUNDLES.has(name);
-    const pkg = official ? undefined : readInstalledPackage(this.dir, name);
-    const installed = official || pkg !== undefined;
-    const bundleManifest = official || (pkg !== undefined && hasBundleManifest(pkg));
+    // A base bundle this process cannot see (an unrecognised launcher) is still
+    // installed: the running dsh composed this profile from it. Reporting it
+    // missing would be the same false alarm this resolution removes.
+    const baseFallback = name === BASE_BUNDLE && resolved === undefined;
+    const installed = resolved !== undefined || baseFallback;
+    const bundleManifest = baseFallback || (pkg !== undefined && hasBundleManifest(pkg));
     const enabled = selected.includes(name);
-    const version = official
-      ? dshVersion
-      : pkg === undefined
-        ? undefined
-        : stringValue(pkg.version);
+    const version = pkg !== undefined
+      ? stringValue(pkg.version)
+      : baseFallback
+        ? dshVersion
+        : undefined;
     const kind: BundleInfo["kind"] = !installed
       ? "missing"
       : bundleManifest || enabled
@@ -798,12 +1045,10 @@ export class DshPlugins {
         : "dependency";
     const client = pkg !== undefined && hasClientUi(pkg);
     const platform = pkg === undefined ? { supported: true as const } : bundlePlatformSupport(pkg);
-    const rows = pkg === undefined ? [] : readRows(join(this.dir, "node_modules", name), pkg);
-    const description = official
-      ? ""
-      : pkg !== undefined
-        ? stringValue(pkg.description) ?? ""
-        : "";
+    // Rows come from the resolved copy: an installation bundle's patch is inside
+    // the dsh package, not under the profile.
+    const rows = resolved === undefined ? [] : readRows(resolved.dir, resolved.manifest);
+    const description = pkg === undefined ? "" : stringValue(pkg.description) ?? "";
     const updatable = !official
       && !protectedBundle
       && installed
@@ -831,7 +1076,9 @@ export class DshPlugins {
       client,
       platformSupported: platform.supported,
       ...(platform.supported ? {} : { platformReason: platform.reason }),
-      removable: !protectedBundle && installed && spec !== undefined,
+      // Official bundles follow the DSH upgrade: removing one would only edit a
+      // profile dependency the installation's copy keeps overriding.
+      removable: !protectedBundle && !official && installed && spec !== undefined,
       updatable,
       ...(update === undefined ? {} : { update }),
       rows,
@@ -864,6 +1111,9 @@ export class DshPlugins {
         if (PROTECTED_BUNDLES.has(name)) {
           throw new ManagerError("protected", name);
         }
+        if (this.resolveBundlePackage(name)?.origin === "installation") {
+          throw new ManagerError("not-removable", name);
+        }
         const manifest = readProfileManifest(this.dir);
         if (dependencies(manifest)[name] === undefined) {
           throw new ManagerError("not-removable", name);
@@ -873,34 +1123,106 @@ export class DshPlugins {
         return;
       }
       case "update": {
-        const name = input.name.trim();
-        const version = input.version.trim();
-        if (PROTECTED_BUNDLES.has(name)) {
-          throw new ManagerError("protected", name);
-        }
-        if (!isRegistrySpec(`${name}@${version}`)) {
-          throw new ManagerError("invalid-version", version);
-        }
-        const manifest = readProfileManifest(this.dir);
-        if (dependencies(manifest)[name] === undefined) {
-          throw new ManagerError("not-in-dependencies", name);
-        }
-        const installed = readInstalledPackage(this.dir, name);
-        if (installed === undefined || !hasBundleManifest(installed)) {
-          throw new ManagerError("not-a-bundle", name);
-        }
-        const result = await this.#runPlugin(
-          ["add", "--save-exact", `${name}@${version}`],
-          INSTALL_TIMEOUT_MS,
-          job,
-        );
-        if (result.code !== 0) throw new ManagerError("command-failed", this.#commandFailure(result).errorDetail);
-        this.#updates.delete(name);
+        await this.#updateOne(input.name, input.version, job);
+        return;
+      }
+      case "update-all": {
+        await this.#updateAll(input.targets, job);
         return;
       }
       case "check":
         await this.#checkUpdates(job);
         return;
+    }
+  }
+
+  /**
+   * Move one installed bundle to a discovered version, the single and the
+   * batch path both. Validation is the single-update contract: a protected,
+   * installation-supplied, malformed, undeclared or non-bundle target never
+   * reaches `dsh plugin`.
+   */
+  async #updateOne(rawName: string, rawVersion: string, job?: Job): Promise<void> {
+    const name = rawName.trim();
+    const version = rawVersion.trim();
+    if (PROTECTED_BUNDLES.has(name)) {
+      throw new ManagerError("protected", name);
+    }
+    if (this.resolveBundlePackage(name)?.origin === "installation") {
+      throw new ManagerError("protected", name);
+    }
+    if (!isRegistrySpec(`${name}@${version}`)) {
+      throw new ManagerError("invalid-version", version);
+    }
+    const manifest = readProfileManifest(this.dir);
+    if (dependencies(manifest)[name] === undefined) {
+      throw new ManagerError("not-in-dependencies", name);
+    }
+    const installed = this.resolveBundlePackage(name);
+    if (installed === undefined || !hasBundleManifest(installed.manifest)) {
+      throw new ManagerError("not-a-bundle", name);
+    }
+    const result = await this.#runPlugin(
+      ["add", "--save-exact", `${name}@${version}`],
+      INSTALL_TIMEOUT_MS,
+      job,
+    );
+    if (result.code !== 0) throw new ManagerError("command-failed", this.#commandFailure(result).errorDetail);
+    this.#updates.delete(name);
+  }
+
+  /**
+   * Update every updatable bundle in one job.
+   *
+   * `dsh plugin update <names…>` exists (pnpm's `update` is forwarded) but is
+   * not usable here: on DSH 0.2.2-rc.3 it answers "Already up to date" and
+   * leaves the profile's exact-pinned dependencies where they were (measured in
+   * a throwaway DSH_HOME), so a batch must reuse the single update path, which
+   * pins the *discovered* version with `add --save-exact`. One job, one process
+   * lock at a time (`startJob` refuses a second job); targets are re-checked
+   * against the current inventory, so an official bundle is dropped even if a
+   * stale page asks for it. Any failure fails the job while keeping every
+   * target's own outcome — a partial success must never read as success.
+   *
+   * @param targets - the rows the page showed as updatable.
+   * @param job - the job these calls stream into.
+   */
+  async #updateAll(targets: UpdateTarget[], job: Job): Promise<void> {
+    const snapshot = await this.list();
+    if (snapshot.errorCode !== undefined) {
+      throw new ManagerError(snapshot.errorCode, snapshot.errorDetail);
+    }
+    const updatable = new Set(
+      snapshot.bundles
+        .filter((bundle) => bundle.updatable && !bundle.official)
+        .map((bundle) => bundle.name),
+    );
+    const selected = targets.filter((target) => updatable.has(target.name.trim()));
+    job.updateResults = [];
+    if (selected.length === 0) return;
+
+    for (const target of selected) {
+      const name = target.name.trim();
+      const version = target.version.trim();
+      try {
+        await this.#updateOne(name, version, job);
+        job.updateResults.push({ name, version, ok: true });
+      } catch (error) {
+        const failure = failureOf(error);
+        job.updateResults.push({
+          name,
+          version,
+          ok: false,
+          errorCode: failure.errorCode,
+          ...(failure.errorDetail === undefined ? {} : { errorDetail: failure.errorDetail }),
+        });
+      }
+    }
+
+    // The task fails as a whole; the per-target list above carries the reasons,
+    // so no single error detail is invented here.
+    if (job.updateResults.some((outcome) => !outcome.ok)) {
+      throw new ManagerError("command-failed");
     }
   }
 
@@ -990,7 +1312,7 @@ export class DshPlugins {
       // inherits a *different* environment from managing another tree.
       const env = { ...process.env, DSH_HOME: this.dshHome };
       try {
-        child = spawnDshCommand(args, {
+        child = this.#spawnDsh(args, {
           cwd: this.dir,
           env,
           detached: process.platform !== "win32",

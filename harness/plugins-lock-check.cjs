@@ -83,7 +83,14 @@ async function main() {
   });
   installBundle();
 
-  const plugins = new DshPlugins({ dir: profileDir, profile: "paseo", dshHome: root });
+  // `installAnchor: null` keeps this lock-only check from reading the real
+  // global dsh installation; nothing here resolves a bundle.
+  const plugins = new DshPlugins({
+    dir: profileDir,
+    profile: "paseo",
+    dshHome: root,
+    installAnchor: null,
+  });
 
   const enabled = await plugins.setEnabled(bundleName, true);
   assert.deepEqual(enabled, { ok: true, changed: true, enabled: true });

@@ -49,6 +49,10 @@ const {
   readProfileManifestIfPresent,
   withPackageLock,
 } = require(path.join(compiled, "server/dsh-plugins.js"));
+const {
+  jobStatusSchema,
+  startJobInputSchema,
+} = require(path.join(compiled, "shared/dsh-plugins-api.js"));
 
 function scratch() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-plugins-test-"));
@@ -170,7 +174,14 @@ test("setEnabled keeps the ordered bundle list and releases the lock", async () 
       path.join(packageDir, "package.json"),
       `${JSON.stringify({ name: bundle, version: "1.0.0", dsh: { bundle: {} } })}\n`,
     );
-    const plugins = new DshPlugins({ dir: space.dir, profile: "paseo", dshHome: space.root });
+    // `installAnchor: null`: this test is about the lock, and must not read the
+    // real global dsh installation for a package it never resolves.
+    const plugins = new DshPlugins({
+      dir: space.dir,
+      profile: "paseo",
+      dshHome: space.root,
+      installAnchor: null,
+    });
 
     assert.deepEqual(await plugins.setEnabled(bundle, true), {
       ok: true,
@@ -199,4 +210,478 @@ test("failureOf keeps a manager code and degrades an unknown throw to command-fa
 
   const noDetail = failureOf(new ManagerError("busy"));
   assert.deepEqual(noDetail, { errorCode: "busy" });
+});
+
+/**
+ * Bundle resolution fixtures.
+ *
+ * The real profile resolves a selected bundle from three places, in DSH's own
+ * order (`@deepseek-ai/dsh-app-boot`'s `resolveBundleDir`: the dsh installation
+ * anchor first, then `<profile>/package.json`, whose Node lookup walks
+ * `<profile>/node_modules` -> `~/.dsh/profiles/node_modules` -> ...):
+ *
+ *   1. the profile's own `node_modules/` (pnpm-installed dependencies),
+ *   2. the shared `$DSH_HOME/profiles/node_modules/` anchor (the bridge),
+ *   3. the dsh installation's `node_modules/` (in-box `@deepseek-ai/*` bundles).
+ *
+ * A package found in none of them is the only case that may read "missing".
+ * These fixtures build one home with all three layouts plus one truly absent
+ * package, and assert the page's view of each.
+ */
+function dshHomeLayout() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-plugins-resolve-"));
+  const profileDir = path.join(root, "profiles", "paseo");
+  const installDir = path.join(root, "install", "node_modules", "@deepseek-ai", "dsh");
+  const installAnchor = path.join(installDir, "package.json");
+  const layout = {
+    root,
+    profileDir,
+    installDir,
+    installAnchor,
+    profilePackage(name) {
+      return path.join(profileDir, "node_modules", ...name.split("/"));
+    },
+    sharedPackage(name) {
+      return path.join(root, "profiles", "node_modules", ...name.split("/"));
+    },
+    /** In-box bundles live under the installation package's own node_modules. */
+    installedPackage(name) {
+      return path.join(installDir, "node_modules", ...name.split("/"));
+    },
+    cleanup() {
+      fs.rmSync(root, { recursive: true, force: true });
+    },
+  };
+  fs.mkdirSync(profileDir, { recursive: true });
+  writePackage(installDir, { name: "@deepseek-ai/dsh", version: "0.2.2-rc.3" });
+  return layout;
+}
+
+function writePackage(dir, manifest) {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+}
+
+const BASE = "@deepseek-ai/dsh-base";
+
+/** A home whose dsh installation ships the base bundle, as every install does. */
+function writeInstalledBase(layout) {
+  writePackage(layout.installedPackage(BASE), {
+    name: BASE,
+    version: "0.2.2-rc.3",
+    dsh: { bundle: { patch: "cordis.patch.yml" } },
+  });
+}
+
+function bundleEntry(snapshot, name) {
+  const entry = snapshot.bundles.find((bundle) => bundle.name === name);
+  assert.ok(entry !== undefined, `expected a row for ${name}: ${JSON.stringify(snapshot.bundles.map((row) => row.name))}`);
+  return entry;
+}
+
+test("resolves a bundle from the profile's own node_modules", async () => {
+  const layout = dshHomeLayout();
+  try {
+    writeInstalledBase(layout);
+    writeManifest(layout.profileDir, {
+      name: "dsh-profile-paseo",
+      dependencies: { "@example/profile-bundle": "1.0.0" },
+      dsh: { profile: { bundles: [BASE, "@example/profile-bundle"] } },
+    });
+    writePackage(layout.profilePackage("@example/profile-bundle"), {
+      name: "@example/profile-bundle",
+      version: "1.0.0",
+      dsh: { bundle: { patch: "cordis.patch.yml" } },
+    });
+    const plugins = new DshPlugins({
+      dir: layout.profileDir,
+      profile: "paseo",
+      dshHome: layout.root,
+      installAnchor: layout.installAnchor,
+    });
+    const row = bundleEntry(await plugins.list(), "@example/profile-bundle");
+    assert.equal(row.installed, true);
+    assert.equal(row.kind, "bundle");
+    assert.equal(row.official, false);
+    assert.equal(row.version, "1.0.0");
+    assert.equal(row.removable, true);
+    assert.equal(fs.existsSync(path.join(layout.profileDir, "package.json.lock")), false);
+  } finally {
+    layout.cleanup();
+  }
+});
+
+test("resolves a bundle from the shared profiles node_modules anchor", async () => {
+  const layout = dshHomeLayout();
+  try {
+    writeInstalledBase(layout);
+    writeManifest(layout.profileDir, {
+      name: "dsh-profile-paseo",
+      dsh: { profile: { bundles: [BASE, "@example/shared-bundle"] } },
+    });
+    writePackage(layout.sharedPackage("@example/shared-bundle"), {
+      name: "@example/shared-bundle",
+      version: "2.3.4",
+      dsh: { bundle: { patch: "cordis.patch.yml" } },
+    });
+    const plugins = new DshPlugins({
+      dir: layout.profileDir,
+      profile: "paseo",
+      dshHome: layout.root,
+      installAnchor: layout.installAnchor,
+    });
+    const row = bundleEntry(await plugins.list(), "@example/shared-bundle");
+    assert.equal(row.installed, true);
+    assert.equal(row.kind, "bundle");
+    assert.equal(row.official, false);
+    assert.equal(row.version, "2.3.4");
+  } finally {
+    layout.cleanup();
+  }
+});
+
+test("an installation bundle is official, keeps its version, and is not removable or updatable", async () => {
+  const layout = dshHomeLayout();
+  try {
+    writeInstalledBase(layout);
+    writePackage(layout.installedPackage("@deepseek-ai/dsh-web-app"), {
+      name: "@deepseek-ai/dsh-web-app",
+      version: "0.2.2-rc.3",
+      dsh: { bundle: { patch: "cordis.patch.yml" } },
+    });
+    writeManifest(layout.profileDir, {
+      name: "dsh-profile-paseo",
+      dsh: { profile: { bundles: [BASE, "@deepseek-ai/dsh-web-app"] } },
+    });
+    const plugins = new DshPlugins({
+      dir: layout.profileDir,
+      profile: "paseo",
+      dshHome: layout.root,
+      installAnchor: layout.installAnchor,
+    });
+    const snapshot = await plugins.list();
+    const webApp = bundleEntry(snapshot, "@deepseek-ai/dsh-web-app");
+    assert.equal(webApp.installed, true, "an installation-supplied bundle is not missing");
+    assert.equal(webApp.official, true);
+    assert.equal(webApp.kind, "bundle");
+    assert.equal(webApp.version, "0.2.2-rc.3");
+    assert.equal(webApp.removable, false, "official bundles follow the DSH installation");
+    assert.equal(webApp.updatable, false);
+
+    const base = bundleEntry(snapshot, BASE);
+    assert.equal(base.official, true);
+    assert.equal(base.installed, true);
+    assert.equal(base.version, "0.2.2-rc.3");
+  } finally {
+    layout.cleanup();
+  }
+});
+
+test("the installation's copy wins over a profile-local copy", async () => {
+  const layout = dshHomeLayout();
+  try {
+    writeInstalledBase(layout);
+    writePackage(layout.installedPackage("@deepseek-ai/dsh-web-app"), {
+      name: "@deepseek-ai/dsh-web-app",
+      version: "0.2.2-rc.3",
+      dsh: { bundle: { patch: "cordis.patch.yml" } },
+    });
+    writeManifest(layout.profileDir, {
+      name: "dsh-profile-paseo",
+      dependencies: { "@deepseek-ai/dsh-web-app": "0.1.0" },
+      dsh: { profile: { bundles: [BASE, "@deepseek-ai/dsh-web-app"] } },
+    });
+    writePackage(layout.profilePackage("@deepseek-ai/dsh-web-app"), {
+      name: "@deepseek-ai/dsh-web-app",
+      version: "0.1.0",
+      dsh: { bundle: { patch: "cordis.patch.yml" } },
+    });
+    const plugins = new DshPlugins({
+      dir: layout.profileDir,
+      profile: "paseo",
+      dshHome: layout.root,
+      installAnchor: layout.installAnchor,
+    });
+    const row = bundleEntry(await plugins.list(), "@deepseek-ai/dsh-web-app");
+    assert.equal(row.official, true, "the installation's copy is the one DSH loads");
+    assert.equal(row.version, "0.2.2-rc.3");
+  } finally {
+    layout.cleanup();
+  }
+});
+
+test("a package resolved from none of the three layouts still reads missing", async () => {
+  const layout = dshHomeLayout();
+  try {
+    writeInstalledBase(layout);
+    writeManifest(layout.profileDir, {
+      name: "dsh-profile-paseo",
+      dependencies: { "@example/absent-bundle": "1.0.0" },
+      dsh: { profile: { bundles: [BASE, "@example/absent-bundle"] } },
+    });
+    const plugins = new DshPlugins({
+      dir: layout.profileDir,
+      profile: "paseo",
+      dshHome: layout.root,
+      installAnchor: layout.installAnchor,
+    });
+    const row = bundleEntry(await plugins.list(), "@example/absent-bundle");
+    assert.equal(row.installed, false);
+    assert.equal(row.kind, "missing");
+    assert.equal(row.version, undefined);
+  } finally {
+    layout.cleanup();
+  }
+});
+
+
+/**
+ * Batch "update all" fixtures.
+ *
+ * The job runs on the production `DshPlugins`, with the spawn seam pointed at a
+ * scripted `dsh` (a JS file spawned through `process.execPath`, so it works on
+ * POSIX and Windows alike). The fake logs every argv it receives and fails any
+ * spec naming `bad-bundle`, which is how the assertions tell "one failure" from
+ * "success everywhere" without a registry, pnpm, or network.
+ */
+function batchUpdateLayout() {
+  const layout = dshHomeLayout();
+  writeInstalledBase(layout);
+  writePackage(layout.installedPackage("@deepseek-ai/dsh-web-app"), {
+    name: "@deepseek-ai/dsh-web-app",
+    version: "0.2.2-rc.3",
+    dsh: { bundle: { patch: "cordis.patch.yml" } },
+  });
+  writeManifest(layout.profileDir, {
+    name: "dsh-profile-paseo",
+    dependencies: {
+      "@example/ok-bundle": "1.0.0",
+      "@example/bad-bundle": "1.0.0",
+    },
+    dsh: {
+      profile: {
+        bundles: [BASE, "@example/ok-bundle", "@example/bad-bundle", "@deepseek-ai/dsh-web-app"],
+      },
+    },
+  });
+  for (const name of ["@example/ok-bundle", "@example/bad-bundle"]) {
+    writePackage(layout.profilePackage(name), {
+      name,
+      version: "1.0.0",
+      dsh: { bundle: { patch: "cordis.patch.yml" } },
+    });
+  }
+  return layout;
+}
+
+function fakeDsh() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fake-dsh-"));
+  const script = path.join(dir, "fake-dsh.cjs");
+  const log = path.join(dir, "calls.jsonl");
+  fs.writeFileSync(script, [
+    '"use strict";',
+    'const fs = require("node:fs");',
+    'const args = process.argv.slice(2);',
+    'fs.appendFileSync(process.env.FAKE_DSH_LOG, JSON.stringify(args) + "\\n");',
+    'if (args.includes("--version")) { console.log("0.2.2-rc.3"); process.exit(0); }',
+    'const spec = args[args.length - 1] ?? "";',
+    'if (spec.includes("bad-bundle")) {',
+    '  process.stderr.write("E_BAD_PACKAGE: registry refused " + spec + "\\n");',
+    '  process.exit(1);',
+    '}',
+    'console.log("done " + spec);',
+    '',
+  ].join("\n"));
+  return {
+    dir,
+    calls() {
+      try {
+        return fs.readFileSync(log, "utf8").split("\n").filter((line) => line !== "")
+          .map((line) => JSON.parse(line));
+      } catch {
+        return [];
+      }
+    },
+    addCalls() {
+      return this.calls().filter((argv) => argv.includes("add"));
+    },
+    spawn(args, options) {
+      return spawn(process.execPath, [script, ...args], {
+        cwd: options.cwd,
+        env: { ...options.env, FAKE_DSH_LOG: log },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    },
+    cleanup() {
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+function batchManager(layout, fake) {
+  return new DshPlugins({
+    dir: layout.profileDir,
+    profile: "paseo",
+    dshHome: layout.root,
+    installAnchor: layout.installAnchor,
+    spawn: (args, options) => fake.spawn(args, options),
+  });
+}
+
+async function waitForJob(plugins, id, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const status = plugins.status(id);
+    if (status.state !== "running") return status;
+    if (Date.now() > deadline) throw new Error(`job ${id} did not settle`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+test("update-all updates every target in one job and succeeds", async () => {
+  const layout = batchUpdateLayout();
+  const fake = fakeDsh();
+  try {
+    const plugins = batchManager(layout, fake);
+    const started = plugins.startJob({
+      kind: "update-all",
+      targets: [{ name: "@example/ok-bundle", version: "1.1.0" }],
+    });
+    assert.equal(started.ok, true);
+    const status = await waitForJob(plugins, started.id);
+    assert.equal(status.kind, "update-all");
+    assert.equal(status.state, "succeeded");
+    assert.deepEqual(status.updateResults, [
+      { name: "@example/ok-bundle", version: "1.1.0", ok: true },
+    ]);
+    const addCalls = fake.addCalls();
+    assert.equal(addCalls.length, 1);
+    assert.deepEqual(addCalls[0], [
+      "plugin", "--profile", "paseo", "add", "--save-exact", "@example/ok-bundle@1.1.0",
+    ]);
+  } finally {
+    fake.cleanup();
+    layout.cleanup();
+  }
+});
+
+test("update-all records a partial failure per item and fails the task", async () => {
+  const layout = batchUpdateLayout();
+  const fake = fakeDsh();
+  try {
+    const plugins = batchManager(layout, fake);
+    const started = plugins.startJob({
+      kind: "update-all",
+      targets: [
+        { name: "@example/ok-bundle", version: "1.1.0" },
+        { name: "@example/bad-bundle", version: "9.9.9" },
+      ],
+    });
+    const status = await waitForJob(plugins, started.id);
+    assert.equal(status.state, "failed");
+    assert.ok(status.errorCode !== undefined, "a partially failed batch must not read as success");
+    assert.equal(status.updateResults.length, 2);
+    assert.deepEqual(status.updateResults[0], {
+      name: "@example/ok-bundle",
+      version: "1.1.0",
+      ok: true,
+    });
+    const failed = status.updateResults[1];
+    assert.equal(failed.name, "@example/bad-bundle");
+    assert.equal(failed.version, "9.9.9");
+    assert.equal(failed.ok, false);
+    assert.equal(failed.errorCode, "command-failed");
+    assert.match(failed.errorDetail, /E_BAD_PACKAGE/);
+    assert.equal(fake.addCalls().length, 2, "both targets are attempted in the one job");
+  } finally {
+    fake.cleanup();
+    layout.cleanup();
+  }
+});
+
+test("update-all spawns no command when no target is updatable", async () => {
+  const layout = batchUpdateLayout();
+  const fake = fakeDsh();
+  try {
+    const plugins = batchManager(layout, fake);
+    const started = plugins.startJob({
+      kind: "update-all",
+      // An installation-supplied bundle is never updatable; a stale page (or a
+      // direct RPC) must not turn it into a command.
+      targets: [{ name: "@deepseek-ai/dsh-web-app", version: "0.2.2-rc.4" }],
+    });
+    const status = await waitForJob(plugins, started.id);
+    assert.equal(status.state, "succeeded");
+    assert.deepEqual(status.updateResults, []);
+    assert.equal(fake.addCalls().length, 0, "no updatable target means no dsh command");
+  } finally {
+    fake.cleanup();
+    layout.cleanup();
+  }
+});
+
+test("update-all excludes official bundles and still updates the rest", async () => {
+  const layout = batchUpdateLayout();
+  const fake = fakeDsh();
+  try {
+    const plugins = batchManager(layout, fake);
+    const started = plugins.startJob({
+      kind: "update-all",
+      targets: [
+        { name: "@deepseek-ai/dsh-web-app", version: "0.2.2-rc.3" },
+        { name: "@example/ok-bundle", version: "1.1.0" },
+      ],
+    });
+    const status = await waitForJob(plugins, started.id);
+    assert.equal(status.state, "succeeded");
+    assert.deepEqual(status.updateResults, [
+      { name: "@example/ok-bundle", version: "1.1.0", ok: true },
+    ]);
+    const addCalls = fake.addCalls();
+    assert.equal(addCalls.length, 1);
+    assert.equal(addCalls[0][addCalls[0].length - 1], "@example/ok-bundle@1.1.0");
+  } finally {
+    fake.cleanup();
+    layout.cleanup();
+  }
+});
+
+
+test("the RPC contract carries update-all and its per-target outcomes", () => {
+  const accepted = startJobInputSchema.safeParse({
+    kind: "update-all",
+    targets: [{ name: "@example/ok-bundle", version: "1.1.0" }],
+  });
+  assert.equal(accepted.success, true);
+  assert.equal(
+    startJobInputSchema.safeParse({ kind: "update-all", targets: [] }).success,
+    false,
+    "the page must not ask for an empty batch",
+  );
+
+  const status = jobStatusSchema.safeParse({
+    id: "job-1",
+    kind: "update-all",
+    state: "failed",
+    output: "",
+    updateResults: [
+      { name: "@example/ok-bundle", version: "1.1.0", ok: true },
+      { name: "@example/bad-bundle", version: "9.9.9", ok: false, errorCode: "command-failed", errorDetail: "E_BAD_PACKAGE" },
+    ],
+    startedAt: 1,
+    finishedAt: 2,
+  });
+  assert.equal(status.success, true);
+  assert.equal(
+    jobStatusSchema.safeParse({
+      id: "job-1",
+      kind: "update-all",
+      state: "failed",
+      output: "",
+      updateResults: [{ name: "x", version: "1", ok: false, errorCode: "not-a-real-code" }],
+      startedAt: 1,
+    }).success,
+    false,
+    "a per-target failure code must stay inside the shared failure-code enum",
+  );
 });

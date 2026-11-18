@@ -14,7 +14,7 @@ import { z } from "zod";
  * module note there).
  */
 
-export const jobKindSchema = z.enum(["install", "remove", "update", "check"]);
+export const jobKindSchema = z.enum(["install", "remove", "update", "update-all", "check"]);
 export const jobStateSchema = z.enum(["running", "succeeded", "failed"]);
 
 /**
@@ -51,6 +51,27 @@ const failureFields = {
   errorCode: failureCodeSchema.optional(),
   errorDetail: z.string().optional(),
 };
+
+/** One bundle the page asks "update all" to move to a discovered version. */
+export const updateTargetSchema = z.object({
+  name: z.string().min(1),
+  version: z.string().min(1),
+});
+
+/**
+ * What happened to one target of a batch update.
+ *
+ * A batch is one job over several packages, so its outcome cannot be a single
+ * flag: every target reports `ok` plus, on failure, the same failure code and
+ * raw detail a single update would have returned. A partially failed batch is a
+ * failed job whose `updateResults` still lists what did succeed.
+ */
+export const updateOutcomeSchema = z.object({
+  name: z.string(),
+  version: z.string(),
+  ok: z.boolean(),
+  ...failureFields,
+});
 
 export const bundleRowSchema = z.object({
   id: z.string(),
@@ -92,6 +113,8 @@ export const jobStatusSchema = z.object({
   state: jobStateSchema,
   output: z.string(),
   updates: z.record(z.string(), z.string()).optional(),
+  /** Per-target outcomes of an `update-all` job, in the order they ran. */
+  updateResults: z.array(updateOutcomeSchema).optional(),
   startedAt: z.number(),
   finishedAt: z.number().optional(),
   ...failureFields,
@@ -126,6 +149,9 @@ export const startJobInputSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("install"), spec: z.string().min(1) }),
   z.object({ kind: z.literal("remove"), name: z.string().min(1) }),
   z.object({ kind: z.literal("update"), name: z.string().min(1), version: z.string().min(1) }),
+  // The page sends the rows it showed as updatable; the server re-derives the
+  // updatable set and refuses to touch anything else (official bundles).
+  z.object({ kind: z.literal("update-all"), targets: z.array(updateTargetSchema).min(1) }),
   z.object({ kind: z.literal("check") }),
 ]);
 
@@ -146,6 +172,8 @@ export type BundleRow = z.infer<typeof bundleRowSchema>;
 export type BundleInfo = z.infer<typeof bundleInfoSchema>;
 export type PluginsSnapshot = z.infer<typeof pluginsSnapshotSchema>;
 export type JobStatus = z.infer<typeof jobStatusSchema>;
+export type UpdateTarget = z.infer<typeof updateTargetSchema>;
+export type UpdateOutcome = z.infer<typeof updateOutcomeSchema>;
 export type SetEnabledInput = z.infer<typeof setEnabledInputSchema>;
 export type SetEnabledOutput = z.infer<typeof setEnabledOutputSchema>;
 export type InspectSpecOutput = z.infer<typeof inspectSpecOutputSchema>;
