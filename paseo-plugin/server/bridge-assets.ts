@@ -10301,22 +10301,21 @@ export const BRIDGE_FILES: Readonly<Record<string, string>> = {
     "cmFtZS5yZXN1bHQpOwogICAgfQogIH0KfQo=",
   "package.json":
     "ewogICJuYW1lIjogImRzaC1wYXNlby1icmlkZ2UiLAogICJ2ZXJzaW9uIjogIjAuMS4wIiwKICAi" +
-    "cHJpdmF0ZSI6IHRydWUsCiAgImRlc2NyaXB0aW9uIjogIkRTSCBwcm9maWxlIGJ1bmRsZSB0aGF0" +
-    "IHNlcnZlcyBhIFBhc2VvLWRyaXZhYmxlIHJ1bnRpbWUgb3ZlciBzdGRpbyBKU09OLVJQQywgaW5j" +
-    "bHVkaW5nIHVzZXItcXVlc3Rpb24gY2FyZHMsIHBsYW4gbW9kZSBhbmQgdGhpbmtpbmctZWZmb3J0" +
-    "IGNvbnRyb2wuIiwKICAiYXV0aG9yIjogImJjY3kiLAogICJyZXBvc2l0b3J5IjogewogICAgInR5" +
-    "cGUiOiAiZ2l0IiwKICAgICJ1cmwiOiAiZ2l0K2h0dHBzOi8vZ2l0aHViLmNvbS9iY2N5L3Bhc2Vv" +
-    "LWRzaC5naXQiLAogICAgImRpcmVjdG9yeSI6ICJkc2gtYnJpZGdlIgogIH0sCiAgImhvbWVwYWdl" +
-    "IjogImh0dHBzOi8vZ2l0aHViLmNvbS9iY2N5L3Bhc2VvLWRzaCNyZWFkbWUiLAogICJidWdzIjog" +
-    "Imh0dHBzOi8vZ2l0aHViLmNvbS9iY2N5L3Bhc2VvLWRzaC9pc3N1ZXMiLAogICJ0eXBlIjogIm1v" +
-    "ZHVsZSIsCiAgIm1haW4iOiAibGliL2luZGV4LmpzIiwKICAiZXhwb3J0cyI6IHsKICAgICIuIjog" +
-    "Ii4vbGliL2luZGV4LmpzIiwKICAgICIuL2NvcmRpcy5wYXRjaC55bWwiOiAiLi9jb3JkaXMucGF0" +
-    "Y2gueW1sIiwKICAgICIuL3BhY2thZ2UuanNvbiI6ICIuL3BhY2thZ2UuanNvbiIsCiAgICAiLi9t" +
-    "Y3AtZ2F0ZXdheSI6ICIuL2xpYi9tY3AtZ2F0ZXdheS5qcyIKICB9LAogICJmaWxlcyI6IFsKICAg" +
-    "ICJsaWIiLAogICAgImNvcmRpcy5wYXRjaC55bWwiCiAgXSwKICAibGljZW5zZSI6ICJNSVQiLAog" +
-    "ICJkc2giOiB7CiAgICAiYnVuZGxlIjogewogICAgICAicGF0Y2giOiAiLi9jb3JkaXMucGF0Y2gu" +
-    "eW1sIgogICAgfQogIH0sCiAgInBlZXJEZXBlbmRlbmNpZXMiOiB7CiAgICAiQGRlZXBzZWVrLWFp" +
-    "L2NvcmRpcyI6ICJ+NC4wLjQiCiAgfQp9Cg==",
+    "cHJpdmF0ZSI6IHRydWUsCiAgImRlc2NyaXB0aW9uIjogIuiuqSBQYXNlbyDpgJrov4cgc3RkaW8g" +
+    "SlNPTi1SUEMg6amx5YqoIERTSCDnmoQgcHJvZmlsZSBidW5kbGXvvJvmj5Dkvpvmj5Dpl67ljaHj" +
+    "gIHorqHliJLmqKHlvI/kuI7mgJ3ogIPmoaPkvY3mjqfliLbjgIIiLAogICJhdXRob3IiOiAiYmNj" +
+    "eSIsCiAgInJlcG9zaXRvcnkiOiB7CiAgICAidHlwZSI6ICJnaXQiLAogICAgInVybCI6ICJnaXQr" +
+    "aHR0cHM6Ly9naXRodWIuY29tL2JjY3kvcGFzZW8tZHNoLmdpdCIsCiAgICAiZGlyZWN0b3J5Ijog" +
+    "ImRzaC1icmlkZ2UiCiAgfSwKICAiaG9tZXBhZ2UiOiAiaHR0cHM6Ly9naXRodWIuY29tL2JjY3kv" +
+    "cGFzZW8tZHNoI3JlYWRtZSIsCiAgImJ1Z3MiOiAiaHR0cHM6Ly9naXRodWIuY29tL2JjY3kvcGFz" +
+    "ZW8tZHNoL2lzc3VlcyIsCiAgInR5cGUiOiAibW9kdWxlIiwKICAibWFpbiI6ICJsaWIvaW5kZXgu" +
+    "anMiLAogICJleHBvcnRzIjogewogICAgIi4iOiAiLi9saWIvaW5kZXguanMiLAogICAgIi4vY29y" +
+    "ZGlzLnBhdGNoLnltbCI6ICIuL2NvcmRpcy5wYXRjaC55bWwiLAogICAgIi4vcGFja2FnZS5qc29u" +
+    "IjogIi4vcGFja2FnZS5qc29uIiwKICAgICIuL21jcC1nYXRld2F5IjogIi4vbGliL21jcC1nYXRl" +
+    "d2F5LmpzIgogIH0sCiAgImZpbGVzIjogWwogICAgImxpYiIsCiAgICAiY29yZGlzLnBhdGNoLnlt" +
+    "bCIKICBdLAogICJsaWNlbnNlIjogIk1JVCIsCiAgImRzaCI6IHsKICAgICJidW5kbGUiOiB7CiAg" +
+    "ICAgICJwYXRjaCI6ICIuL2NvcmRpcy5wYXRjaC55bWwiCiAgICB9CiAgfSwKICAicGVlckRlcGVu" +
+    "ZGVuY2llcyI6IHsKICAgICJAZGVlcHNlZWstYWkvY29yZGlzIjogIn40LjAuNCIKICB9Cn0K",
 };
 
 /** The starter cordis.patch.yml written only when the profile has none. */

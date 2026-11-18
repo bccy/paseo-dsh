@@ -2,7 +2,7 @@
   "name": "dsh-paseo-bridge",
   "version": "0.1.0",
   "private": true,
-  "description": "DSH profile bundle that serves a Paseo-drivable runtime over stdio JSON-RPC, including user-question cards, plan mode and thinking-effort control.",
+  "description": "让 Paseo 通过 stdio JSON-RPC 驱动 DSH 的 profile bundle；提供提问卡、计划模式与思考档位控制。",
   "author": "bccy",
   "repository": {
     "type": "git",
