@@ -42,12 +42,13 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   受保护 bundle 拒绝、坏 manifest 拒绝且不重写。全部在 `mkdtemp` 目录里跑，不读真实
   `$DSH_HOME`、不起 `dsh`。**改 `server/dsh-plugins.ts` 的锁、`setEnabled` 或 profile
   manifest 读写必跑。** 本页锁与 DSH 的差异（DSH 无条件释放、本页只释放自己仍持有的）见
-  `docs/FIELD-NOTES.md` 第 112 条。
-- `paseo-plugin/test/*.test.cjs`（不在本 runner 清单里，单独跑）：DSH Plugins 页的服务端回归
-  （只释放自己持有的锁、活着的外部持有者超时报 `lock-timeout`、首次安装无 `package.json`
-  不是错误、失败码原样过 RPC 边界）。命令：
-  `node --test paseo-plugin/test/*.test.cjs`。**改 `server/dsh-plugins.ts` 的锁/manifest/
-  失败码映射必跑。**
+  `docs/FIELD-NOTES.md` 第 116 条。
+- `paseo-plugin/test/*.test.cjs`（**已登记在本 runner 的 `pluginTests` 清单里**，cwd 为
+  `paseo-plugin`；也可 `cd paseo-plugin && npm test` 跑全部、`npm run test:process` 只跑 Windows
+  启动器那一条）。四个文件各自的判据见下文「空闲回收否决链」「提问卡回答」「Windows 启动器」
+  与 DSH Plugins 段落；共同点是每个文件自建一次性 `DSH_HOME`/`mkdtemp` 夹具或经
+  `harness/plugin-build.cjs` 编译，不 spawn 真实模型、不读真实 profile。**改了对应运行时代码
+  只跑对应文件时，也必须保证本 runner 全绿。**
 - `harness/stable-host-child-check.mjs`：真实 `PluginAgentClientRegistry` + 协议假 provider，
   断言 canceled / failed / completed 后关闭仍保持终态。`PASEO_CLI_ROOT` 指向待验收宿主 CLI
   根目录，必须记录其实际版本；不进 portable CI。升级宿主、改 child close/终态必跑。
@@ -1150,10 +1151,10 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   无选项题一律 `custom`、单选标签/文字回归、deny + message 进 `custom`、`uniqueCardId` 四组；
   集成两条用假桥 `DSH_FAKE_LOG` 的请求帧断言协议边界：child 卡 deny+interrupt 只发 child native
   id 的 `session/cancel`、root 卡取消 root、不带 `interrupt` 不产生 cancel 帧。运行：
-  `cd paseo-plugin && npm ci && node --test test/question-answer.test.cjs`。这是
-  **`paseo-plugin/test/` 新测试树的第一项**，因而不在 `harness/offline-checks.cjs` 的可执行清单
-  里（runner 接入方式待定，见交付记录）。**动了 `server/session.ts` 的 `selectAnswer` /
-  `readMultiSelect`、`resolvePermission` / `#interruptAfterDenial`、问题/计划卡 id 生成必跑。**
+  `cd paseo-plugin && npm ci && node --test test/question-answer.test.cjs`（已登记在
+  `harness/offline-checks.cjs` 的 `pluginTests` 清单里，portable CI 会跑）。**动了
+  `server/session.ts` 的 `selectAnswer` / `readMultiSelect`、`resolvePermission` /
+  `#interruptAfterDenial`、问题/计划卡 id 生成必跑。**
 
 ### 真实 profile / 诊断工具
 
@@ -1480,8 +1481,9 @@ Paseo 回收空闲会话前会问 provider「现在释放运行时会不会杀�
     child 的 job 按 child 原生 id 阻止 root、桥抛错→拒绝、已关闭→true 不问桥；
   - `DshChildSession.open` 的 `session.opened.capabilities` 含 `session.can_stop_runtime`；
   - 真 provider 连接 + 假桥：协商到能力位、未知会话只回 `request.failed`。
-    跑法：`cd paseo-plugin && node --test test/runtime-activity.test.cjs`
-    （测试用 `paseo-plugin/test/register-typescript.cjs` 的 transpile 钩子直接 require 源码，
+    跑法：`cd paseo-plugin && node --test test/runtime-activity.test.cjs`（已登记在
+    `harness/offline-checks.cjs` 的 `pluginTests` 清单里；测试用
+    `paseo-plugin/test/register-typescript.cjs` 的 transpile 钩子直接 require 源码，
     并把 `DSH_HOME` 指向一次性目录，不会碰到真实 profile / 正在跑的共享子进程记录）。
 - `harness/plugin-check.cjs` 真机段（3b，**耗 token**）：空闲会话 `canStop:true`（事件类型必须是
   `session.can_stop_runtime`，不是 `request.completed`）→ 真实回合运行中 `canStop:false` →
@@ -1512,7 +1514,8 @@ Paseo 回收空闲会话前会问 provider「现在释放运行时会不会杀�
   `DSH_BINARY` 从插件进程环境生效、spawn 与 catalog 指纹同源且优先于 PATH、argv/stdin/stderr/退出码原样传递、doctor 识别 npm
   DSH 且 Windows 上把缺失 `paseo` CLI 降为 warning。用一次性 npm 布局夹具，不需要凭据/profile/
   模型；测试先经 `harness/plugin-build.cjs` 编译（Node 24）。
-  命令：`cd paseo-plugin && npm ci --ignore-scripts --no-audit --no-fund && npm run typecheck && npm run test:process`。
+  命令：`cd paseo-plugin && npm ci --ignore-scripts --no-audit --no-fund && npm run typecheck && npm run test:process`
+  （本文件也随 `npm test` 跑；`harness/offline-checks.cjs` 的 `pluginTests` 清单同样覆盖它）。
   CI：`.github/workflows/process-compatibility.yml`（windows/ubuntu/macos 三平台）。
   **改了 `server/dsh-command.mjs`/`.d.mts`、`server/dsh-process.ts` 的 spawn 段、
   `server/catalog-cache.ts` 的版本探测、`lib/doctor.mjs` 的 CLI/dump 段、任一 harness 启动

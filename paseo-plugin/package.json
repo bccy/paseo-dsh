@@ -40,6 +40,7 @@
     "generate": "node scripts/generate-bridge-assets.mjs",
     "prepack": "node scripts/generate-bridge-assets.mjs",
     "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.cjs",
     "test:process": "node --test test/process.test.cjs"
   },
   "peerDependencies": {

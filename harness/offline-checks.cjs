@@ -39,7 +39,21 @@ const compiledChecks = [
   'mcp-injection-check.cjs', 'image-check.cjs', 'steer-check.cjs',
   'timeline-check.cjs', 'tool-call-check.cjs', 'locale-check.cjs',
 ];
-const inventory = ['typecheck', 'bridge syntax', ...sourceChecks, ...compiledChecks, 'plugin-check.cjs --self-test'];
+// The plugin's own `node:test` trees run from `paseo-plugin`, where their
+// `require("../server/…")` and `node_modules` resolve. Each file builds the
+// plugin (or transpiles the TS sources) itself and points `DSH_HOME` at a
+// throwaway directory, so they stay inside the same portable-CI boundary.
+const pluginTests = [
+  'test/runtime-activity.test.cjs',
+  'test/question-answer.test.cjs',
+  'test/process.test.cjs',
+  'test/dsh-plugins.test.cjs',
+];
+const inventory = [
+  'typecheck', 'bridge syntax', ...sourceChecks, ...compiledChecks,
+  ...pluginTests.map((name) => `paseo-plugin/${name}`),
+  'plugin-check.cjs --self-test',
+];
 const args = process.argv.slice(2);
 if (args.includes('--list')) {
   console.log(inventory.join('\n'));
@@ -81,6 +95,10 @@ for (const name of [...compiledChecks, 'plugin-check.cjs', 'fake-dsh-bridge.mjs'
 for (const name of compiledChecks) {
   assertFresh();
   run(name, path.join(build, name), [], env, build);
+}
+for (const name of pluginTests) {
+  assertFresh();
+  run(`paseo-plugin/${name}`, '--test', [path.join(PLUGIN_DIR, name)], env, PLUGIN_DIR);
 }
 assertFresh();
 run('plugin-check.cjs --self-test', path.join(build, 'plugin-check.cjs'), ['--self-test'], env, build);

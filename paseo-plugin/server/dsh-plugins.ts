@@ -58,6 +58,7 @@ import type {
   StartJobOutput,
 } from "../shared/dsh-plugins-api";
 import { dshHome, profileDir, profileName } from "./bootstrap";
+import { resolveDshCommand } from "./dsh-command.mjs";
 import { resolveDshBinary } from "./dsh-process";
 
 const BASE_BUNDLE = "@deepseek-ai/dsh-base";
@@ -525,13 +526,13 @@ function dshCommandLabel(): string {
 /**
  * Spawn one `dsh` invocation for the page.
  *
- * **The one place this module starts a process.** The Windows-launcher package
- * adds `server/dsh-command.mjs` (a `resolveDshCommand` that rewrites the argv
- * for `.cmd` shims); when that lands, only this function changes:
- * `spawn(resolveDshBinary(), args)` becomes
- * `const launch = resolveDshCommand(resolveDshBinary(), env); spawn(launch.command, [...launch.args, ...args])`.
- * Until then the page follows this fork's existing launch path
- * (`dsh-process.ts`): the resolved binary, spawned directly.
+ * **The one place this module starts a process.** It uses the same launcher
+ * resolution as `dsh-process.ts`: on Windows an npm-installed `dsh` is a
+ * `.cmd` shim that `spawn` cannot execute, so `resolveDshCommand` (from
+ * `server/dsh-command.mjs`) rewrites it to `node.exe <package>/<bin entry>`;
+ * POSIX and native executables pass through unchanged, so the spawn is exactly
+ * the previous one there. Keeping this shared with the plugin's own launch path
+ * means the page and the provider cannot drift apart on Windows.
  *
  * @param args - arguments after the binary, e.g. `["plugin", "--profile", "paseo", "view", …]`.
  * @param options - cwd, environment, and whether to lead a process group.
@@ -545,7 +546,8 @@ function spawnDshCommand(
     detached: boolean;
   },
 ): ChildProcess {
-  return spawn(resolveDshBinary(), [...args], {
+  const launch = resolveDshCommand(resolveDshBinary(), options.env, options.cwd);
+  return spawn(launch.command, [...launch.args, ...args], {
     cwd: options.cwd,
     env: options.env,
     stdio: ["ignore", "pipe", "pipe"],
