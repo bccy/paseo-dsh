@@ -49,6 +49,7 @@ import {
   closeSync,
   existsSync,
   openSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -70,6 +71,7 @@ import type {
   SetEnabledOutput,
   StartJobInput,
   StartJobOutput,
+  PluginLocale,
   UpdateOutcome,
   UpdateTarget,
 } from "../shared/dsh-plugins-api";
@@ -501,6 +503,84 @@ function readRows(packageDir: string, pkg: Record<string, unknown>): BundleRow[]
   return rows;
 }
 
+/**
+ * The languages one display field is looked up in: the requested id lowercased,
+ * each shorter prefix, then English.
+ *
+ * The same chain DSH uses for bundle detail documents
+ * (`@deepseek-ai/dsh-plugin-detail/src/document.ts:16-25` `languageChain`); the
+ * client locale service resolves `meta` text through the equivalent
+ * `LocaleRuntime.resolveText` chain (`dsh-client-locale/src/client/index.ts`,
+ * its active-language fallbacks ending at `en`). Files on disk in the shipped
+ * packages are `locale/zh.json` + `locale/en.json`, so `zh-CN` resolves through
+ * `zh` here rather than requiring a `zh-CN.json` file.
+ */
+function languageChain(locale: PluginLocale): string[] {
+  const parts = locale.toLowerCase().split("-");
+  const chain = parts.map((_part, index) => parts.slice(0, parts.length - index).join("-"));
+  return [...new Set([...chain, "en"])];
+}
+
+/** One package's display fields per lowercased language id. */
+type LocaleDisplayText = { title?: string; description?: string };
+
+/**
+ * Read a package's `locale/*.json` display text, keyed by lowercased language id.
+ *
+ * Mirrors DSH's reader (`@deepseek-ai/dsh-app-boot/src/package-meta.ts:121-149`
+ * `dictionariesOf`): every `*.json` beside the locale directory is a language id
+ * and its `meta.title` / `meta.description` must be non-empty strings when
+ * present. One deliberate difference: a malformed file is dropped here instead
+ * of turning the whole package's metadata into a diagnostic — the page must
+ * fall back to `package.json` and keep listing every other package.
+ *
+ * @param packageDir - resolved package root.
+ * @returns the display text by language id; empty when the package ships none.
+ */
+function readLocaleDisplayText(packageDir: string): Map<string, LocaleDisplayText> {
+  const dictionaries = new Map<string, LocaleDisplayText>();
+  let entries: string[];
+  try {
+    entries = readdirSync(join(packageDir, "locale"));
+  } catch {
+    return dictionaries;
+  }
+  for (const file of entries) {
+    if (!file.endsWith(".json")) continue;
+    const language = file.slice(0, -".json".length).toLowerCase();
+    if (!/^[a-z]{2,8}(?:-[a-z0-9]{1,8})*$/.test(language)) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(join(packageDir, "locale", file), "utf8"));
+    } catch {
+      continue;
+    }
+    if (!isRecord(parsed)) continue;
+    const meta = isRecord(parsed.meta) ? parsed.meta : undefined;
+    const text: LocaleDisplayText = {
+      ...(stringValue(meta?.title) === undefined ? {} : { title: stringValue(meta?.title) }),
+      ...(stringValue(meta?.description) === undefined ? {} : { description: stringValue(meta?.description) }),
+    };
+    if (text.title !== undefined || text.description !== undefined) {
+      dictionaries.set(language, text);
+    }
+  }
+  return dictionaries;
+}
+
+/** First value of one display field along the requested language chain. */
+function localizedField(
+  dictionaries: Map<string, LocaleDisplayText>,
+  chain: string[],
+  field: keyof LocaleDisplayText,
+): string | undefined {
+  for (const language of chain) {
+    const value = dictionaries.get(language)?.[field];
+    if (value !== undefined) return value;
+  }
+  return undefined;
+}
+
 function isRegistrySpec(spec: string): boolean {
   const value = spec.trim();
   if (value === "" || value.length > 214) return false;
@@ -804,10 +884,15 @@ export class DshPlugins {
     return undefined;
   }
 
-  /** Read the profile inventory. Never starts a package operation. */
-  async list(): Promise<PluginsSnapshot> {
+  /**
+   * Read the profile inventory. Never starts a package operation.
+   *
+   * @param input.locale - display language for a bundle's localized title and
+   *   introduction; omitted keeps `package.json` text (English).
+   */
+  async list(input: { locale?: PluginLocale } = {}): Promise<PluginsSnapshot> {
     try {
-      return await this.#snapshot();
+      return await this.#snapshot(input.locale ?? "en");
     } catch (error) {
       const failure = failureOf(error);
       return {
@@ -821,7 +906,7 @@ export class DshPlugins {
     }
   }
 
-  async #snapshot(): Promise<PluginsSnapshot> {
+  async #snapshot(locale: PluginLocale): Promise<PluginsSnapshot> {
     const manifest = readProfileManifest(this.dir);
     const deps = dependencies(manifest);
     const selected = selectedBundles(manifest);
@@ -840,7 +925,11 @@ export class DshPlugins {
     const dshVersion = this.resolveBundlePackage(BASE_BUNDLE) === undefined
       ? await this.#getDshVersion()
       : undefined;
-    const bundles = names.map((name) => this.#describe(name, deps[name], selected, dshVersion));
+    // One read per distinct package directory for this snapshot: the page lists
+    // often, and every row of the same bundle would re-read the same files.
+    const localeTextCache = new Map<string, Map<string, LocaleDisplayText>>();
+    const bundles = names.map((name) =>
+      this.#describe(name, deps[name], selected, dshVersion, locale, localeTextCache));
     const activeJob = this.#activeJobId === undefined ? undefined : this.#jobs.get(this.#activeJobId);
     return {
       profile: this.profile,
@@ -1018,6 +1107,8 @@ export class DshPlugins {
     spec: string | undefined,
     selected: string[],
     dshVersion: string | undefined,
+    locale: PluginLocale,
+    localeTextCache: Map<string, Map<string, LocaleDisplayText>>,
   ): BundleInfo {
     const resolved = this.resolveBundlePackage(name);
     const pkg = resolved?.manifest;
@@ -1048,7 +1139,22 @@ export class DshPlugins {
     // Rows come from the resolved copy: an installation bundle's patch is inside
     // the dsh package, not under the profile.
     const rows = resolved === undefined ? [] : readRows(resolved.dir, resolved.manifest);
-    const description = pkg === undefined ? "" : stringValue(pkg.description) ?? "";
+    // Display text follows DSH's rule: the locale files' `meta.title` /
+    // `meta.description` for the requested language chain, the package.json
+    // description as the final fallback, and no title at all when the package
+    // ships none (the page then shows the package name alone).
+    let localeText: Map<string, LocaleDisplayText> | undefined;
+    if (resolved !== undefined) {
+      localeText = localeTextCache.get(resolved.dir);
+      if (localeText === undefined) {
+        localeText = readLocaleDisplayText(resolved.dir);
+        localeTextCache.set(resolved.dir, localeText);
+      }
+    }
+    const chain = languageChain(locale);
+    const localizedTitle = localeText === undefined ? undefined : localizedField(localeText, chain, "title");
+    const localizedDescription = localeText === undefined ? undefined : localizedField(localeText, chain, "description");
+    const description = localizedDescription ?? (pkg === undefined ? "" : stringValue(pkg.description) ?? "");
     const updatable = !official
       && !protectedBundle
       && installed
@@ -1067,6 +1173,7 @@ export class DshPlugins {
     return {
       name,
       ...(version === undefined ? {} : { version }),
+      ...(localizedTitle === undefined ? {} : { title: localizedTitle }),
       description,
       enabled,
       installed,

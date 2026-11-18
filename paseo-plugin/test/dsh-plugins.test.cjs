@@ -685,3 +685,114 @@ test("the RPC contract carries update-all and its per-target outcomes", () => {
     "a per-target failure code must stay inside the shared failure-code enum",
   );
 });
+
+
+/**
+ * Localized display text fixtures.
+ *
+ * DSH reads a package's display text from the locale files it exports beside
+ * `<package>/locale/en.json` (all `locale/*.json`), and the client resolves the
+ * active locale through its fallback chain. Here the selection is pinned to the
+ * same file rules (`languageChain`: zh-CN -> zh-cn -> zh -> en) so the page can
+ * ask for one language over the RPC:
+ *
+ *   locale/<lang>.json  meta.title / meta.description
+ *   otherwise            package.json description (title stays the package name)
+ *   malformed locale     ignored for that file, package.json fallback kept
+ */
+function writeLocale(dir, file, value) {
+  const localeDir = path.join(dir, "locale");
+  fs.mkdirSync(localeDir, { recursive: true });
+  fs.writeFileSync(path.join(localeDir, file), `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function localizedLayout() {
+  const layout = dshHomeLayout();
+  writeInstalledBase(layout);
+  writeManifest(layout.profileDir, {
+    name: "dsh-profile-paseo",
+    dependencies: { "@example/localized-bundle": "1.0.0" },
+    dsh: { profile: { bundles: [BASE, "@example/localized-bundle"] } },
+  });
+  const dir = layout.profilePackage("@example/localized-bundle");
+  writePackage(dir, {
+    name: "@example/localized-bundle",
+    version: "1.0.0",
+    description: "English package description",
+    dsh: { bundle: { patch: "cordis.patch.yml" } },
+  });
+  return { layout, dir };
+}
+
+function localizedManager(layout) {
+  return new DshPlugins({
+    dir: layout.profileDir,
+    profile: "paseo",
+    dshHome: layout.root,
+    installAnchor: layout.installAnchor,
+  });
+}
+
+test("a package's locale meta title and description follow the requested language", async () => {
+  const { layout, dir } = localizedLayout();
+  try {
+    // Both spellings exist on purpose: the more specific `zh-CN.json` must win
+    // over `zh.json`, matching DSH's lowercased-id fallback chain.
+    writeLocale(dir, "zh-CN.json", { meta: { title: "中文标题", description: "中文简介" } });
+    writeLocale(dir, "zh.json", { meta: { title: "备选标题", description: "备选简介" } });
+    writeLocale(dir, "en.json", { meta: { title: "English title", description: "English locale description" } });
+    const plugins = localizedManager(layout);
+
+    const zh = bundleEntry(await plugins.list({ locale: "zh-CN" }), "@example/localized-bundle");
+    assert.equal(zh.description, "中文简介");
+    assert.equal(zh.title, "中文标题");
+
+    // DSH puts the English locale file's description in the English slot, ahead
+    // of the raw package.json description.
+    const en = bundleEntry(await plugins.list({ locale: "en" }), "@example/localized-bundle");
+    assert.equal(en.description, "English locale description");
+    assert.equal(en.title, "English title");
+  } finally {
+    layout.cleanup();
+  }
+});
+
+test("a package without locale files falls back to its package.json description", async () => {
+  const { layout } = localizedLayout();
+  try {
+    const plugins = localizedManager(layout);
+    const row = bundleEntry(await plugins.list({ locale: "zh-CN" }), "@example/localized-bundle");
+    assert.equal(row.description, "English package description");
+    assert.equal(row.title, undefined);
+  } finally {
+    layout.cleanup();
+  }
+});
+
+test("a malformed locale file falls back instead of failing the list", async () => {
+  const { layout, dir } = localizedLayout();
+  try {
+    writeLocale(dir, "zh.json", "{");
+    writePackage(layout.profilePackage("@example/second-bundle"), {
+      name: "@example/second-bundle",
+      version: "1.0.0",
+      description: "Second bundle",
+      dsh: { bundle: { patch: "cordis.patch.yml" } },
+    });
+    const manifestPath = path.join(layout.profileDir, "package.json");
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    manifest.dependencies["@example/second-bundle"] = "1.0.0";
+    manifest.dsh.profile.bundles.push("@example/second-bundle");
+    writeManifest(layout.profileDir, manifest);
+
+    const plugins = localizedManager(layout);
+    const snapshot = await plugins.list({ locale: "zh-CN" });
+    assert.equal(snapshot.errorCode, undefined, "one bad locale file must not fail the whole list");
+    const row = bundleEntry(snapshot, "@example/localized-bundle");
+    assert.equal(row.description, "English package description");
+    assert.equal(row.title, undefined);
+    assert.equal(bundleEntry(snapshot, "@example/second-bundle").description, "Second bundle");
+  } finally {
+    layout.cleanup();
+  }
+});

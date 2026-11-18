@@ -168,6 +168,12 @@ export interface DshPluginsText {
     cancel: string;
     update: (version: string) => string;
     confirmUpdate: (version: string) => string;
+    /**
+     * The collapsed disclosure line under a card: how many component rows the
+     * bundle declares. Tapping it expands the ids; the open state lives only in
+     * the page's memory.
+     */
+    componentCount: (count: number) => string;
   };
   install: {
     title: string;
@@ -1402,6 +1408,7 @@ const TEXT: Record<Locale, UiText> = {
         cancel: "Cancel",
         update: (version) => `Update to ${version}`,
         confirmUpdate: (version) => `Confirm update to ${version}`,
+        componentCount: (count) => `${count} component${count === 1 ? "" : "s"}`,
       },
       install: {
         title: "Install a DSH plugin",
@@ -1998,6 +2005,7 @@ const TEXT: Record<Locale, UiText> = {
         cancel: "取消",
         update: (version) => `更新到 ${version}`,
         confirmUpdate: (version) => `确认更新到 ${version}`,
+        componentCount: (count) => `${count} 个组件`,
       },
       install: {
         title: "安装 DSH 插件",

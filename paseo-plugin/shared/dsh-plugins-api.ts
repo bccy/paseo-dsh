@@ -14,6 +14,15 @@ import { z } from "zod";
  * module note there).
  */
 
+/**
+ * The display language the page asks the daemon for.
+ *
+ * It travels on `list` because the locale files live on the daemon's disk; the
+ * client's own locale chain (`client/locale.ts`) has no way to read them.
+ */
+export const pluginLocaleSchema = z.enum(["en", "zh-CN"]);
+export type PluginLocale = z.infer<typeof pluginLocaleSchema>;
+
 export const jobKindSchema = z.enum(["install", "remove", "update", "update-all", "check"]);
 export const jobStateSchema = z.enum(["running", "succeeded", "failed"]);
 
@@ -81,6 +90,9 @@ export const bundleRowSchema = z.object({
 export const bundleInfoSchema = z.object({
   name: z.string(),
   version: z.string().optional(),
+  /** Localized display title from the package's `locale/*.json`; absent keeps the name. */
+  title: z.string().optional(),
+  /** Localized introduction, with the package.json description as fallback. */
   description: z.string().optional(),
   enabled: z.boolean(),
   installed: z.boolean(),
@@ -182,7 +194,7 @@ export type StartJobOutput = z.infer<typeof startJobOutputSchema>;
 
 export const listRpc = defineRpc({
   name: "dsh-plugins.list",
-  input: z.object({}),
+  input: z.object({ locale: pluginLocaleSchema.optional() }),
   output: pluginsSnapshotSchema,
 });
 

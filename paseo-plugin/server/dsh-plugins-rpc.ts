@@ -18,7 +18,7 @@ export function registerDshPluginsRpc(
   server: PluginServerContext,
   manager: DshPlugins,
 ): () => void {
-  server.handle(listRpc, async () => manager.list());
+  server.handle(listRpc, async (input) => manager.list(input));
   server.handle(setEnabledRpc, async (input) => {
     try {
       return await manager.setEnabled(input.name, input.enabled);

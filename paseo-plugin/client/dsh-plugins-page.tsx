@@ -10,7 +10,12 @@ import {
 } from "react-native";
 import type { PluginScreenProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
-import { localeText, type DshPluginsFailureCode, type DshPluginsText } from "./locale";
+import {
+  currentLocale,
+  localeText,
+  type DshPluginsFailureCode,
+  type DshPluginsText,
+} from "./locale";
 import { PluginsBoundary, PluginsFailedCard } from "./dsh-plugins-guard";
 import {
   inspectSpecRpc,
@@ -170,6 +175,7 @@ function createStyles(colors: ThemeColors, compact: boolean) {
       flexWrap: "wrap" as const,
     },
     name: { color: colors.foreground, fontSize: 14, fontWeight: "600" as const },
+    subtitle: { color: colors.foreground, fontSize: 13, fontWeight: "500" as const },
     version: { color: colors.foregroundMuted, fontSize: 12 },
     description: { color: colors.foregroundMuted, fontSize: 13, lineHeight: 19 },
     badgeRow: {
@@ -392,6 +398,9 @@ function BundleRow({
   const removePending = confirmRemove === bundle.name;
   const updatePending = confirmUpdate?.name === bundle.name;
   const rowBusy = busy || toggleBusy === bundle.name;
+  // Disclosure only: a card lists its component ids when asked, not by default.
+  // The state is render-local by design (no persistence, no RPC).
+  const [rowsOpen, setRowsOpen] = useState(false);
 
   return (
     <View style={styles.card}>
@@ -408,6 +417,12 @@ function BundleRow({
           : <Badge label={text.badges.updateAvailable(bundle.update)} tone="warn" styles={styles} />}
       </View>
 
+      {/* Package names stay the row's identity (the actions address them); a
+          localized display title rides under it as a subtitle instead of
+          replacing the name, so a third-party package remains recognizable. */}
+      {bundle.title === undefined || bundle.title === ""
+        ? null
+        : <Text style={styles.subtitle}>{bundle.title}</Text>}
       {bundle.description === undefined || bundle.description === ""
         ? null
         : <Text style={styles.description}>{bundle.description}</Text>}
@@ -423,16 +438,6 @@ function BundleRow({
         : bundle.platformReason === undefined || bundle.platformReason === ""
           ? <Text style={styles.muted}>{text.bundle.platformsUnknown}</Text>
           : <Text style={styles.muted}>{text.bundle.platforms(bundle.platformReason)}</Text>}
-
-      {bundle.rows.length === 0 ? null : (
-        <View style={styles.rowTags}>
-          {bundle.rows.map((row) => (
-            <View key={row.id} style={styles.tag}>
-              <Text style={styles.tagText}>{row.id}</Text>
-            </View>
-          ))}
-        </View>
-      )}
 
       <View style={styles.rowActions}>
         {canToggle ? (
@@ -486,6 +491,29 @@ function BundleRow({
           />
         )}
       </View>
+
+      {/* Default-collapsed component list. The line itself is the toggle; a card
+          with no rows shows nothing (a "0 components" row would be noise). */}
+      {bundle.rows.length === 0 ? null : (
+        <>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={text.bundle.componentCount(bundle.rows.length)}
+            onPress={() => setRowsOpen((open) => !open)}
+          >
+            <Text style={styles.muted}>{text.bundle.componentCount(bundle.rows.length)}</Text>
+          </Pressable>
+          {rowsOpen ? (
+            <View style={styles.rowTags}>
+              {bundle.rows.map((row) => (
+                <View key={row.id} style={styles.tag}>
+                  <Text style={styles.tagText}>{row.id}</Text>
+                </View>
+              ))}
+            </View>
+          ) : null}
+        </>
+      )}
     </View>
   );
 }
@@ -519,7 +547,9 @@ function DshPluginsPageBody({ theme, host, layout }: PluginScreenProps) {
   const refresh = useCallback(async (): Promise<void> => {
     setRefreshing(true);
     try {
-      const next = await list({});
+      // The locale files live on the daemon; ask for the language this page
+      // renders in so the localized title/description come back resolved.
+      const next = await list({ locale: currentLocale() });
       setSnapshot(next);
       setLoadError(next.errorCode === undefined
         ? null
