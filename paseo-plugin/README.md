@@ -63,6 +63,8 @@ What you get that the ACP boundary can't carry:
   disappears, files touched by edit tools are restored, the model no longer sees
   the withdrawn content); on Paseo 0.15+ the host refreshes the timeline
   natively, no Reload needed
+- A **DSH Plugins** page in the sidebar that lists the profile's bundles and
+  can enable, install, remove and update them (new sessions pick up changes)
 - **Session usage** — `used / limit` next to the composer, reported per session
   (each session keeps its own numbers while one `dsh` process serves several
   Paseo sessions)
@@ -145,6 +147,8 @@ ACP 承载不了、而这里都有：
 - 时间线里的 **Goal** 与 **workflow** 行，跨回合运行的工作流保持运行中
 - DSH `approval/request` 的**工具审批卡**
 - **撤回**：对话 + 文件都回退（消息行消失、被编辑工具改过的文件恢复、模型看不到被撤内容）；Paseo 0.15+ 时间线由宿主原生刷新，无需 Reload
+- **DSH 插件页**：左侧栏一个页面列出 profile 里的 bundle，可启停、安装、卸载、检查
+  更新（新会话生效）
 - **会话用量**：输入框旁显示 `已用 / 上限`，按会话上报（一个 `dsh` 进程服务多个 Paseo 会话时各算各的）
 - profile 挂了 `systemPrompt` 服务时，支持**会话级 system prompt**
 

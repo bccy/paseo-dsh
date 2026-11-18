@@ -35,6 +35,19 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
 - `harness/timeline-kind-check.cjs`：执行编译的 client entry 与 stream-stats 注册逻辑，
   拦截实际 `addTimelineRenderer` 的四个 kind，按 `^[a-z][a-z0-9-]*$` 校验。UI 组件不挂载；
   在内存里把实际注册的 kind 改为大写字符串，必须拒绝（负向变异控制）。新增 renderer 必跑。
+- `harness/plugins-lock-check.cjs`：DSH Plugins 页唯一直接写入（启停 bundle，改
+  `dsh.profile.bundles`）的 profile 锁协议：`<profile>/package.json.lock`，`wx` 创建、
+  内容 `` `${pid}\n` ``，与 DSH 自己的 `@deepseek-ai/dsh-atomic-write` 互斥。断言成功写入
+  有序落盘并释放、重复启用幂等、并发两个修改恰好一个 changed、死持有者的陈旧锁被回收、
+  受保护 bundle 拒绝、坏 manifest 拒绝且不重写。全部在 `mkdtemp` 目录里跑，不读真实
+  `$DSH_HOME`、不起 `dsh`。**改 `server/dsh-plugins.ts` 的锁、`setEnabled` 或 profile
+  manifest 读写必跑。** 本页锁与 DSH 的差异（DSH 无条件释放、本页只释放自己仍持有的）见
+  `docs/FIELD-NOTES.md` 第 112 条。
+- `paseo-plugin/test/*.test.cjs`（不在本 runner 清单里，单独跑）：DSH Plugins 页的服务端回归
+  （只释放自己持有的锁、活着的外部持有者超时报 `lock-timeout`、首次安装无 `package.json`
+  不是错误、失败码原样过 RPC 边界）。命令：
+  `node --test paseo-plugin/test/*.test.cjs`。**改 `server/dsh-plugins.ts` 的锁/manifest/
+  失败码映射必跑。**
 - `harness/stable-host-child-check.mjs`：真实 `PluginAgentClientRegistry` + 协议假 provider，
   断言 canceled / failed / completed 后关闭仍保持终态。`PASEO_CLI_ROOT` 指向待验收宿主 CLI
   根目录，必须记录其实际版本；不进 portable CI。升级宿主、改 child close/终态必跑。

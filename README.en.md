@@ -27,6 +27,7 @@ step left is [your model route](#install-one-line), described below.
 | Slash commands / skills | ⚠️ often a command subset | ✅ the `/` menu lists DSH commands and user-invocable skills; commands run in the runtime, skills are injected by `/name` |
 | Permission modes (sandbox) | ❌ no shared switch | ✅ **Permissions** dropdown in the composer switches DSH's sandbox and approval presets |
 | Agent presets | ❌ | ✅ when the profile mounts the agent-preset registry, a **Preset** dropdown appears (chosen at session creation, locked after the first turn) |
+| DSH Plugins page | — | ✅ a sidebar page lists the profile's bundles; enable/disable, install registry packages that declare `dsh.bundle`, remove, check for updates and update them — package changes go through `dsh plugin` and apply to new sessions |
 | Session resume / import | ❌ no history, no import | ✅ reopening replays history through Paseo's `history: replay`; **import** native DSH sessions (`session.list`, read from `~/.dsh/sessions`) |
 | Background jobs | — | ✅ a composer pill shows DSH background jobs (a terminal icon with a running ring on its corner) only while some are running/stopping: it is labelled just "Background" (the count is in the panel) and hides once every job has finished; multiple pills on one row can be scrolled horizontally (the host's pill track scrolls from 0.15.3 on), and the goal, team and jobs pills each show on their own rule; expandable to each job, where a running job that can be stopped carries a stop button (no confirmation, a spinner while stopping, the push decides, and a failure reason is shown under the row) |
 | Goal pill | — | ✅ a composer pill shows the DSH goal; its label and the phone sheet title are always "Goal" — the icon carries the state (a running ring on its corner while it runs, a green check once it is complete) and the panel's first row speaks it in full; the popover has the objective (with the DeepSeek mark; tap the text to edit it in a small composer-style field), "Round N · budget M", "Now: <current task>" and the blocked reason, with pause / resume / clear (clear asks for confirmation); a completed goal is shown once more (read-only, clear only, hidden only after you open and close its panel; sending a new message without opening it does not hide it); auto-continue stops after a reopen and the pill offers the resume entry point |
@@ -567,6 +568,26 @@ Example (in the profile's `cordis.patch.yml`):
 > preset only owns the persona and incremental capabilities. Prefer clearing the
 > host `system-prompt` persona (`personaPrefix: ''`) and letting each preset own
 > its own, to avoid duplication.
+
+## DSH Plugins page
+
+The sidebar has a **DSH Plugins** entry that manages the profile this plugin
+drives (by default `~/.dsh/profiles/paseo`). It lists `@deepseek-ai/dsh-base`,
+the bridge and every bundle and dependency in the profile; each row shows its
+version, whether the bundle declares a `dsh.bundle` (a plain dependency never
+becomes a profile layer) and whether it ships a DSH Web/Desktop client UI — that
+UI is not hosted by Paseo, so the row is marked rather than hidden.
+
+Switch a bundle on or off to edit only the ordered `dsh.profile.bundles` list
+(installed code stays, so disabling needs no download) under the profile's own
+`package.json.lock`; install, remove and update go through `dsh plugin`, which
+also re-activates a newly installed bundle and refuses packages without a
+`dsh.bundle`. Every change applies to new sessions; running sessions keep the
+bundles they started with. Nothing is installed without an explicit check and
+confirmation, and the page never edits a profile file on its own beyond the
+bundle list. Package operations need `pnpm` on the daemon's `PATH` (the same
+requirement `dsh plugin` has) and a working npm registry; failures are shown as
+a sentence plus the raw `dsh` output, never as a silent success.
 
 ## Version policy
 

@@ -4530,3 +4530,36 @@ shellEnv 时遗漏了两个夹具，产生假红；因此新增 push/PR gate，�
 复核另纠正一处假宿主反例：直接调用已关闭流的答案回调会覆盖新数据，但 Paseo 0.16 SDK 的
 `subscribePluginRpc` 在 `closed` 后丢弃事件。该反例绕过了真实封装，不能作为线上迟到帧缺陷的
 证据；本轮没有为它另造一套流代号。测试要保留真实边界，不能用比宿主更宽的夹具证明线上故障。
+
+### 112. `dsh plugin` 不是 pnpm 转发：它是 plugin-manager（自带锁、自带 bundle 激活）
+
+2026-11-18 移植上游 0.2.22 的「DSH Plugins 页」时，按任务书核对本机 DSH `0.2.2-rc.3` 的
+`dsh plugin` 子命令与锁文件形状，上游注释里的两个假设都要修正（都是「照文档/照 help 写会
+静默坏」的类型）：
+
+- **`dsh plugin` 的 help 仍写「forwarding the remaining arguments to pnpm」**，实现却调
+  `@deepseek-ai/dsh-plugin-manager` 的 `runPluginCommand`：它在 120s 等待窗口内持有
+  `<profile>/package.json.lock`（`@deepseek-ai/dsh-atomic-write` 的 `withFileLock`，`wx`
+  创建、内容 `` `${pid}\n` ``），安装完成后把新 bundle 追加进 `dsh.profile.bundles`，
+  没有 `dsh.bundle` 的包只当普通依赖并在 stderr 告警。所以「安装后还要用户手动启用」
+  这一推断是错的：只有普通依赖需要用户理解它不生效。`view <name> version --json`
+  返回 JSON 字符串（`"4.6.7"`），`view <spec> --json` 返回 registry 文档。
+- **死持有者的锁来自异常终止（如 SIGKILL），不是正常初始化。**（2026-11-19 复核更正，VD 推翻
+  原成因）验证代理在 6 个全新的一次性 `DSH_HOME` 里各跑一次 `dsh plugin view`，命令退出后
+  **都没有**残留 `package.json.lock`；20ms 轮询的 128 次采样中 120 次看到锁、8 次没有，进程
+  退出后 `AFTER=no`——锁只在命令执行期间存在。只有**强杀**（SIGKILL，exit 137）才残留一把
+  持有者已退出的锁。证据：`/tmp/paseo-dsh-orch/verify-D/evidence/v4-lock-matrix.log`、
+  `v4-profile-probe.log`、`v4-lock-poll.log`、`v4-kill.log`（验证报告
+  `/tmp/paseo-dsh-orch/verify-D.md` V4 节）。
+  页面的「死持有者锁回收」逻辑**保留**，作为异常终止的防御：否则一次 SIGKILL 会让下一次写
+  白等满 120s 再报 `lock-timeout`——用户看到的是「锁超时」，而不是真正的原因。
+  **原文保留（成因错误，作对照）：**「profile 初始化会留下死持有者的锁。在一次性 `DSH_HOME`
+  里 `dsh plugin --profile probe view zod@4.4.3 --json` 之后，profile 目录里留下一个
+  `package.json.lock`，内容是已退出进程的 pid；下一次 `dsh plugin add` 由 DSH 自己接管该
+  锁。」— 该观察不成立，不是正常初始化产生的。
+- **释放语义两侧不同，别照抄。** DSH 的 `withFileLock` 在 `finally` 里无条件 `rm`；页面采用
+  更严格的「只释放自己仍持有的锁」，因为页面写可能被杀、随后 DSH 接管；无条件 unlink 会删掉
+  新持有者的锁并让两个写者同时进 manifest。这个差值写在 `server/dsh-plugins.ts` 的注释里，
+  由 `paseo-plugin/test/dsh-plugins.test.cjs` 的「锁在写入期间被接管时不得删除」钉住。
+- 复现与验证命令在 `harness/plugins-lock-check.cjs` 头部；注意 `dsh plugin view` 一次就会
+  初始化 profile 文件（**但不留锁**，残留锁来自异常终止），核对时一律用一次性 `DSH_HOME`。

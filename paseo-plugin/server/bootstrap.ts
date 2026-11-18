@@ -190,6 +190,25 @@ export function profileName(env: Readonly<Record<string, string | undefined>> = 
 }
 
 /**
+ * The absolute directory of one DSH profile.
+ *
+ * DSH's own layout is `$DSH_HOME/profiles/<name>`, and the plugin page reads
+ * and edits that directory directly (`server/dsh-plugins.ts`), so the rule must
+ * exist here rather than be spelled a second time there: two spellings that
+ * drift would leave the page managing a profile nobody boots.
+ *
+ * @param profile - profile name; defaults to {@link profileName} of this env.
+ * @param home - `$DSH_HOME`; defaults to {@link dshHome} of this env.
+ * @returns the absolute profile directory (which may not exist yet).
+ */
+export function profileDir(
+  profile: string = profileName(),
+  home: string = dshHome(),
+): string {
+  return join(home, "profiles", profile);
+}
+
+/**
  * Expand a leading `~` exactly like DSH's own home resolver.
  *
  * Copied verbatim from `@deepseek-ai/dsh-home-paths` `expandHomePath`: a leading
@@ -354,7 +373,7 @@ export interface ProvisionResult {
 export function ensurePaseoProfile(): ProvisionResult {
   const profile = profileName();
   const home = dshHome();
-  const dir = join(home, "profiles", profile);
+  const dir = profileDir(profile, home);
   mkdirSync(join(dir, "node_modules"), { recursive: true });
 
   // The profile's own files belong to the user: create a missing one, but never
