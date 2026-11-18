@@ -374,6 +374,7 @@ const COMMAND_COPY: Record<Locale, Readonly<Record<string, Omit<CommandCopy, "na
     feedback: { description: "记录对本次会话的反馈", argumentHint: "<文本>" },
     permission: { description: "切换权限预设（沙箱模式 + 审批策略）", argumentHint: "<预设>" },
     plan: { description: "进入或退出计划模式", argumentHint: "[off|消息]" },
+    export: { description: "把本会话日志下载为 ZIP 压缩包" },
   },
 };
 
@@ -428,6 +429,13 @@ const SKILL_COPY: Record<Locale, Readonly<Record<string, string>>> = {
     "paseo-handoff": "把当前任务连上下文交接给另一个 agent",
     "paseo-help": "回答 Paseo 产品与 App 的问题：配置、连接、provider、日志、排障",
     "paseo-plugin": "开发和管理本地 Paseo 插件：贡献点、生命周期钩子、RPC、发布",
+    // DSH's own bundled skills (`@deepseek-ai/dsh-skill-office`,
+    // `@deepseek-ai/dsh-sandbox-windows-acl`).
+    office: "创建或编辑 Office 文件，查看 Office 文件与 PDF；渲染、转换、重算前先加载",
+    "office-docx": "创建、读取、编辑并校验 Word 文档（.docx）",
+    "office-pptx": "创建、读取、编辑并校验 PowerPoint 演示文稿（.pptx）",
+    "office-xlsx": "读取、创建、编辑并校验 Excel 工作簿、数据与公式（.xlsx）",
+    "diagnose-windows-sandbox-acl": "Windows 上排查 DSH 沙箱的意外拒绝访问（工作区读写或列目录失败）",
   },
 };
 
