@@ -111,7 +111,9 @@ function actionOf(job: JobStatus, text: DshPluginsText): string {
       ? text.job.removeAction
       : job.kind === "update"
         ? text.job.updateAction
-        : text.job.checkAction;
+        : job.kind === "update-all"
+          ? text.job.updateAllAction
+          : text.job.checkAction;
 }
 
 function jobTitle(job: JobStatus, text: DshPluginsText): string {
@@ -241,6 +243,26 @@ function createStyles(colors: ThemeColors, compact: boolean) {
       paddingVertical: 10,
       fontSize: 14,
     },
+    inputRow: {
+      flexDirection: "row" as const,
+      alignItems: "center" as const,
+      gap: 8,
+    },
+    inputStack: { gap: 8 },
+    inputGrow: { flex: 1 },
+    checkRow: {
+      flexDirection: "row" as const,
+      justifyContent: "flex-end" as const,
+    },
+    resultRow: {
+      flexDirection: "row" as const,
+      alignItems: "center" as const,
+      flexWrap: "wrap" as const,
+      justifyContent: "space-between" as const,
+      gap: 8,
+    },
+    resultAction: { marginLeft: "auto" as const },
+    resultItem: { gap: 4 },
     statusCard: {
       backgroundColor: colors.surface1,
       borderColor: colors.border,
@@ -490,6 +512,9 @@ function DshPluginsPageBody({ theme, host, layout }: PluginScreenProps) {
   const [toggleBusy, setToggleBusy] = useState<string | null>(null);
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
   const [confirmUpdate, setConfirmUpdate] = useState<{ name: string; version: string } | null>(null);
+  // The batch button has the same two-step confirm as a row's update button:
+  // one press asks, the second runs. A new job clears the ask.
+  const [confirmUpdateAll, setConfirmUpdateAll] = useState(false);
 
   const refresh = useCallback(async (): Promise<void> => {
     setRefreshing(true);
@@ -671,7 +696,47 @@ function DshPluginsPageBody({ theme, host, layout }: PluginScreenProps) {
     await beginJob({ kind: "update", name, version });
   };
 
+  // A new or finished job invalidates a pending "confirm update all": the
+  // button must not keep an armed state across a refresh or a re-check.
+  useEffect(() => {
+    setConfirmUpdateAll(false);
+  }, [job?.id, job?.state]);
+
+  /**
+   * Update every row that currently reads updatable.
+   *
+   * The target list is recomputed from the snapshot in front of the user rather
+   * than from `job.updates`: that map belongs to the check job, and the list is
+   * what the rows show. No updatable row means no job at all.
+   */
+  const runUpdateAll = async (): Promise<void> => {
+    const targets = bundles
+      .filter((bundle) => bundle.updatable && bundle.update !== undefined)
+      .map((bundle) => ({ name: bundle.name, version: bundle.update as string }));
+    if (targets.length === 0) {
+      setConfirmUpdateAll(false);
+      return;
+    }
+    if (!confirmUpdateAll) {
+      setConfirmUpdateAll(true);
+      return;
+    }
+    setConfirmUpdateAll(false);
+    await beginJob({ kind: "update-all", targets });
+  };
+
   const bundles = snapshot?.bundles ?? [];
+
+  const checkButton = (
+    <ActionButton
+      label={inspecting ? text.install.checking : text.install.check}
+      disabled={busy || inspecting || spec.trim() === ""}
+      onPress={() => {
+        void inspect();
+      }}
+      styles={styles}
+    />
+  );
   const groups = [
     { title: text.groups.enabled, items: bundles.filter((bundle) => bundle.enabled && bundle.kind !== "dependency") },
     { title: text.groups.disabled, items: bundles.filter((bundle) => !bundle.enabled && bundle.kind !== "dependency") },
@@ -755,10 +820,56 @@ function DshPluginsPageBody({ theme, host, layout }: PluginScreenProps) {
               </Text>
             )}
           {job.kind === "check" && job.updates !== undefined && Object.keys(job.updates).length > 0 ? (
-            <Text style={styles.muted}>
-              {text.job.updatesFound(Object.keys(job.updates).length)}
-            </Text>
+            <View style={styles.resultRow}>
+              <Text style={styles.muted}>
+                {text.job.updatesFound(Object.keys(job.updates).length)}
+              </Text>
+              {/* marginLeft:"auto" right-aligns the button on the same line
+                  when it fits, and on its own wrapped line when it does not. */}
+              <View style={styles.resultAction}>
+                <ActionButton
+                  label={confirmUpdateAll
+                    ? text.job.confirmUpdateAll(Object.keys(job.updates).length)
+                    : text.job.updateAll}
+                  disabled={busy}
+                  primary={confirmUpdateAll}
+                  onPress={() => {
+                    void runUpdateAll();
+                  }}
+                  styles={styles}
+                />
+              </View>
+            </View>
           ) : null}
+          {job.updateResults === undefined || job.updateResults.length === 0 ? null : (
+            <View style={styles.section}>
+              <Text style={styles.muted}>
+                {text.job.updateResultsSummary(
+                  job.updateResults.filter((outcome) => outcome.ok).length,
+                  job.updateResults.filter((outcome) => !outcome.ok).length,
+                )}
+              </Text>
+              {job.updateResults.map((outcome) => (
+                <View key={outcome.name} style={styles.resultItem}>
+                  <View style={styles.rowTop}>
+                    <Text style={styles.name}>{outcome.name}</Text>
+                    <Text style={styles.version}>{outcome.version}</Text>
+                    {outcome.ok
+                      ? <Badge label={text.job.doneBadge} tone="success" styles={styles} />
+                      : <Badge label={text.job.failedBadge} tone="danger" styles={styles} />}
+                  </View>
+                  {outcome.ok ? null : (
+                    <Text style={styles.errorText}>
+                      {failureText(text, {
+                        code: outcome.errorCode ?? "command-failed",
+                        ...(outcome.errorDetail === undefined ? {} : { detail: outcome.errorDetail }),
+                      })}
+                    </Text>
+                  )}
+                </View>
+              ))}
+            </View>
+          )}
           {job.output === "" ? null : (
             <Text style={styles.output}>{tailLines(job.output, 12)}</Text>
           )}
@@ -768,29 +879,27 @@ function DshPluginsPageBody({ theme, host, layout }: PluginScreenProps) {
       <View style={styles.card}>
         <Text style={styles.groupTitle}>{text.install.title}</Text>
         <Text style={styles.muted}>{text.install.hint}</Text>
-        <TextInput
-          value={spec}
-          onChangeText={(value: string) => {
-            setSpec(value);
-            setInspection(null);
-          }}
-          placeholder={text.install.placeholder}
-          placeholderTextColor={theme.colors.foregroundMuted}
-          editable={!busy && !inspecting && !(inspection?.ok === true)}
-          autoCapitalize="none"
-          autoCorrect={false}
-          style={styles.input}
-        />
-        <View style={styles.rowActions}>
-          <ActionButton
-            label={inspecting ? text.install.checking : text.install.check}
-            disabled={busy || inspecting || spec.trim() === ""}
-            onPress={() => {
-              void inspect();
+        {/* Wide: the input grows and the check button sits on its right edge.
+            Compact: the button moves under the input, right-aligned. */}
+        <View style={compact ? styles.inputStack : styles.inputRow}>
+          <TextInput
+            value={spec}
+            onChangeText={(value: string) => {
+              setSpec(value);
+              setInspection(null);
             }}
-            styles={styles}
+            placeholder={text.install.placeholder}
+            placeholderTextColor={theme.colors.foregroundMuted}
+            editable={!busy && !inspecting && !(inspection?.ok === true)}
+            autoCapitalize="none"
+            autoCorrect={false}
+            style={compact ? styles.input : [styles.input, styles.inputGrow]}
           />
-          {inspection === null ? null : (
+          {compact ? null : checkButton}
+        </View>
+        {compact ? <View style={styles.checkRow}>{checkButton}</View> : null}
+        {inspection === null ? null : (
+          <View style={styles.rowActions}>
             <ActionButton
               label={text.bundle.cancel}
               disabled={busy || inspecting}
@@ -799,8 +908,8 @@ function DshPluginsPageBody({ theme, host, layout }: PluginScreenProps) {
               }}
               styles={styles}
             />
-          )}
-        </View>
+          </View>
+        )}
 
         {inspection === null ? null : inspection.ok ? (
           <View style={styles.infoBox}>

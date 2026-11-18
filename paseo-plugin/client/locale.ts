@@ -184,6 +184,8 @@ export interface DshPluginsText {
     installAction: string;
     removeAction: string;
     updateAction: string;
+    /** Batch update; its own action word so "更新失败" cannot mean two rows. */
+    updateAllAction: string;
     checkAction: string;
     running: (action: string) => string;
     failed: (action: string) => string;
@@ -191,6 +193,11 @@ export interface DshPluginsText {
     failedBadge: string;
     doneBadge: string;
     updatesFound: (count: number) => string;
+    /** Trigger on the update-check result card, and its confirm step. */
+    updateAll: string;
+    confirmUpdateAll: (count: number) => string;
+    /** Summary line above the per-target outcomes of a batch. */
+    updateResultsSummary: (succeeded: number, failed: number) => string;
   };
   status: { loadingProfile: string };
   errors: Record<DshPluginsFailureCode, string>;
@@ -1411,6 +1418,7 @@ const TEXT: Record<Locale, UiText> = {
         installAction: "Installation",
         removeAction: "Removal",
         updateAction: "Update",
+        updateAllAction: "Update all",
         checkAction: "Update check",
         running: (action) => `${action} in progress…`,
         failed: (action) => `${action} failed`,
@@ -1418,6 +1426,9 @@ const TEXT: Record<Locale, UiText> = {
         failedBadge: "Failed",
         doneBadge: "Done",
         updatesFound: (count) => `${count} update${count === 1 ? "" : "s"} available.`,
+        updateAll: "Update all",
+        confirmUpdateAll: (count) => `Confirm ${count} update${count === 1 ? "" : "s"}`,
+        updateResultsSummary: (succeeded, failed) => `${succeeded} updated, ${failed} failed`,
       },
       status: { loadingProfile: "Reading the profile…" },
       errors: {
@@ -2003,6 +2014,7 @@ const TEXT: Record<Locale, UiText> = {
         installAction: "安装",
         removeAction: "卸载",
         updateAction: "更新",
+        updateAllAction: "全部更新",
         checkAction: "检查更新",
         running: (action) => `正在${action}…`,
         failed: (action) => `${action}失败`,
@@ -2010,6 +2022,9 @@ const TEXT: Record<Locale, UiText> = {
         failedBadge: "失败",
         doneBadge: "完成",
         updatesFound: (count) => `发现 ${count} 个可更新项。`,
+        updateAll: "全部更新",
+        confirmUpdateAll: (count) => `确认更新 ${count} 项`,
+        updateResultsSummary: (succeeded, failed) => `成功 ${succeeded} 项，失败 ${failed} 项`,
       },
       status: { loadingProfile: "正在读取 profile…" },
       errors: {

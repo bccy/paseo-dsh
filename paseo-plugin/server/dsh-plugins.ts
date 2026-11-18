@@ -70,6 +70,8 @@ import type {
   SetEnabledOutput,
   StartJobInput,
   StartJobOutput,
+  UpdateOutcome,
+  UpdateTarget,
 } from "../shared/dsh-plugins-api";
 import { dshHome, profileDir, profileName } from "./bootstrap";
 import { resolveDshCommand } from "./dsh-command.mjs";
@@ -117,6 +119,8 @@ interface Job {
   errorCode?: FailureCode;
   errorDetail?: string;
   updates?: Record<string, string>;
+  /** Per-target outcomes, set by the batch update path. */
+  updateResults?: UpdateOutcome[];
   startedAt: number;
   finishedAt?: number;
   child?: ChildProcess;
@@ -163,6 +167,22 @@ export interface DshPluginsOptions {
    * the real global installation.
    */
   installAnchor?: string | null;
+  /**
+   * @internal Test seam: spawn one `dsh` invocation (`cwd`/`env`/`detached` are
+   * the launcher inputs). Defaults to {@link spawnDshCommand}.
+   *
+   * The batch-update regression uses it to script exit codes and count commands
+   * without a real dsh, pnpm, registry, or network — and without a shell, which
+   * is also what keeps it portable to Windows CI.
+   */
+  spawn?: (args: readonly string[], options: SpawnDshOptions) => ChildProcess;
+}
+
+/** The launch inputs {@link spawnDshCommand} hands to a spawner. */
+export interface SpawnDshOptions {
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  detached: boolean;
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -693,11 +713,7 @@ function dshCommandLabel(): string {
  */
 function spawnDshCommand(
   args: readonly string[],
-  options: {
-    cwd: string;
-    env: NodeJS.ProcessEnv;
-    detached: boolean;
-  },
+  options: SpawnDshOptions,
 ): ChildProcess {
   const launch = resolveDshCommand(resolveDshBinary(), options.env, options.cwd);
   return spawn(launch.command, [...launch.args, ...args], {
@@ -719,6 +735,9 @@ export class DshPlugins {
    */
   readonly installAnchor: string | undefined;
 
+  /** One spawn point; overridable only by the test seam in the options. */
+  readonly #spawnDsh: (args: readonly string[], options: SpawnDshOptions) => ChildProcess;
+
   #jobs = new Map<string, Job>();
   #activeJobId: string | undefined;
   #updates = new Map<string, string>();
@@ -733,6 +752,7 @@ export class DshPlugins {
     this.installAnchor = options.installAnchor === null
       ? undefined
       : options.installAnchor ?? defaultInstallAnchor();
+    this.#spawnDsh = options.spawn ?? spawnDshCommand;
   }
 
   /**
@@ -969,6 +989,7 @@ export class DshPlugins {
       ...(job.errorCode === undefined ? {} : { errorCode: job.errorCode }),
       ...(job.errorDetail === undefined ? {} : { errorDetail: job.errorDetail }),
       ...(job.updates === undefined ? {} : { updates: job.updates }),
+      ...(job.updateResults === undefined ? {} : { updateResults: job.updateResults }),
       startedAt: job.startedAt,
       ...(job.finishedAt === undefined ? {} : { finishedAt: job.finishedAt }),
     };
@@ -1102,37 +1123,106 @@ export class DshPlugins {
         return;
       }
       case "update": {
-        const name = input.name.trim();
-        const version = input.version.trim();
-        if (PROTECTED_BUNDLES.has(name)) {
-          throw new ManagerError("protected", name);
-        }
-        if (this.resolveBundlePackage(name)?.origin === "installation") {
-          throw new ManagerError("protected", name);
-        }
-        if (!isRegistrySpec(`${name}@${version}`)) {
-          throw new ManagerError("invalid-version", version);
-        }
-        const manifest = readProfileManifest(this.dir);
-        if (dependencies(manifest)[name] === undefined) {
-          throw new ManagerError("not-in-dependencies", name);
-        }
-        const installed = this.resolveBundlePackage(name);
-        if (installed === undefined || !hasBundleManifest(installed.manifest)) {
-          throw new ManagerError("not-a-bundle", name);
-        }
-        const result = await this.#runPlugin(
-          ["add", "--save-exact", `${name}@${version}`],
-          INSTALL_TIMEOUT_MS,
-          job,
-        );
-        if (result.code !== 0) throw new ManagerError("command-failed", this.#commandFailure(result).errorDetail);
-        this.#updates.delete(name);
+        await this.#updateOne(input.name, input.version, job);
+        return;
+      }
+      case "update-all": {
+        await this.#updateAll(input.targets, job);
         return;
       }
       case "check":
         await this.#checkUpdates(job);
         return;
+    }
+  }
+
+  /**
+   * Move one installed bundle to a discovered version, the single and the
+   * batch path both. Validation is the single-update contract: a protected,
+   * installation-supplied, malformed, undeclared or non-bundle target never
+   * reaches `dsh plugin`.
+   */
+  async #updateOne(rawName: string, rawVersion: string, job?: Job): Promise<void> {
+    const name = rawName.trim();
+    const version = rawVersion.trim();
+    if (PROTECTED_BUNDLES.has(name)) {
+      throw new ManagerError("protected", name);
+    }
+    if (this.resolveBundlePackage(name)?.origin === "installation") {
+      throw new ManagerError("protected", name);
+    }
+    if (!isRegistrySpec(`${name}@${version}`)) {
+      throw new ManagerError("invalid-version", version);
+    }
+    const manifest = readProfileManifest(this.dir);
+    if (dependencies(manifest)[name] === undefined) {
+      throw new ManagerError("not-in-dependencies", name);
+    }
+    const installed = this.resolveBundlePackage(name);
+    if (installed === undefined || !hasBundleManifest(installed.manifest)) {
+      throw new ManagerError("not-a-bundle", name);
+    }
+    const result = await this.#runPlugin(
+      ["add", "--save-exact", `${name}@${version}`],
+      INSTALL_TIMEOUT_MS,
+      job,
+    );
+    if (result.code !== 0) throw new ManagerError("command-failed", this.#commandFailure(result).errorDetail);
+    this.#updates.delete(name);
+  }
+
+  /**
+   * Update every updatable bundle in one job.
+   *
+   * `dsh plugin update <names…>` exists (pnpm's `update` is forwarded) but is
+   * not usable here: on DSH 0.2.2-rc.3 it answers "Already up to date" and
+   * leaves the profile's exact-pinned dependencies where they were (measured in
+   * a throwaway DSH_HOME), so a batch must reuse the single update path, which
+   * pins the *discovered* version with `add --save-exact`. One job, one process
+   * lock at a time (`startJob` refuses a second job); targets are re-checked
+   * against the current inventory, so an official bundle is dropped even if a
+   * stale page asks for it. Any failure fails the job while keeping every
+   * target's own outcome — a partial success must never read as success.
+   *
+   * @param targets - the rows the page showed as updatable.
+   * @param job - the job these calls stream into.
+   */
+  async #updateAll(targets: UpdateTarget[], job: Job): Promise<void> {
+    const snapshot = await this.list();
+    if (snapshot.errorCode !== undefined) {
+      throw new ManagerError(snapshot.errorCode, snapshot.errorDetail);
+    }
+    const updatable = new Set(
+      snapshot.bundles
+        .filter((bundle) => bundle.updatable && !bundle.official)
+        .map((bundle) => bundle.name),
+    );
+    const selected = targets.filter((target) => updatable.has(target.name.trim()));
+    job.updateResults = [];
+    if (selected.length === 0) return;
+
+    for (const target of selected) {
+      const name = target.name.trim();
+      const version = target.version.trim();
+      try {
+        await this.#updateOne(name, version, job);
+        job.updateResults.push({ name, version, ok: true });
+      } catch (error) {
+        const failure = failureOf(error);
+        job.updateResults.push({
+          name,
+          version,
+          ok: false,
+          errorCode: failure.errorCode,
+          ...(failure.errorDetail === undefined ? {} : { errorDetail: failure.errorDetail }),
+        });
+      }
+    }
+
+    // The task fails as a whole; the per-target list above carries the reasons,
+    // so no single error detail is invented here.
+    if (job.updateResults.some((outcome) => !outcome.ok)) {
+      throw new ManagerError("command-failed");
     }
   }
 
@@ -1222,7 +1312,7 @@ export class DshPlugins {
       // inherits a *different* environment from managing another tree.
       const env = { ...process.env, DSH_HOME: this.dshHome };
       try {
-        child = spawnDshCommand(args, {
+        child = this.#spawnDsh(args, {
           cwd: this.dir,
           env,
           detached: process.platform !== "win32",
