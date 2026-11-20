@@ -15,9 +15,9 @@
  *   `@deepseek-ai/` and is a real package specifier. `cordis:*`-style runtime
  *   specifiers and relative paths have no package locale and are not user
  *   plugins, so they are excluded too.
- * - **Exactly one field, and that field is a boolean** — the whole volatile form
- *   must project to `{<key>: boolean}`. Anything else (dicts, enums, numbers,
- *   multi-field forms) is not a "simple switch" and stays out of the menu.
+ * - **One boolean per plugin** — by default the form must project to
+ *   `{<key>: boolean}`. The dsh-unrestricted form gained additional fields in
+ *   v0.2.12, so select its documented `enabled` field explicitly.
  *
  * Everything here is pure: no ctx, no services, no I/O. `server.js` supplies the
  * descriptors and the entry/title lookups; `harness/settings-bridge-check.mjs`
@@ -54,6 +54,14 @@
 
 /** Module-specifier prefix owned by the DSH distribution itself. */
 export const OFFICIAL_MODULE_PREFIX = '@deepseek-ai/';
+
+/**
+ * Explicit main-switch field names for multi-field third-party plugins whose
+ * documented top-level toggle should still be exposed as a single switch.
+ */
+export const MAIN_SWITCH_BY_MODULE = new Map([
+  ['dsh-unrestricted', 'enabled'],
+]);
 
 /**
  * Whether a configured module specifier names a real package.
@@ -145,7 +153,7 @@ export function inventoryEntryMatchesNamespace(entryId, ns) {
 }
 
 /**
- * The single boolean field a volatile form projects to, or undefined.
+ * The designated boolean field, or the sole boolean field of a one-field form.
  *
  * Accepts **both** shapes this bridge may hold:
  *
@@ -172,18 +180,25 @@ export function inventoryEntryMatchesNamespace(entryId, ns) {
  * `field.description` and never used it — removed rather than kept as dead code.
  *
  * @param formSchema - live schemastery node or plain form JSON.
- * @returns `{path}` for the single boolean field, or undefined.
+ * @param [fieldName] - the documented main switch of a multi-field form.
+ * @returns `{path}` for the selected boolean field, or undefined.
  */
-export function simpleToggleField(formSchema) {
+export function simpleToggleField(formSchema, fieldName) {
   const isNode = (value) =>
     value !== null && (typeof value === 'object' || typeof value === 'function');
   if (!isNode(formSchema)) return undefined;
   if (formSchema.type !== 'object') return undefined;
   const dict = formSchema.dict;
   if (!isNode(dict)) return undefined;
-  const keys = Object.keys(dict);
-  if (keys.length !== 1) return undefined;
-  const key = keys[0];
+  let key;
+  if (fieldName !== undefined) {
+    if (typeof fieldName !== 'string' || fieldName.length === 0) return undefined;
+    key = fieldName;
+  } else {
+    const keys = Object.keys(dict);
+    key = keys.length === 1 ? keys[0] : undefined;
+  }
+  if (key === undefined || !Object.hasOwn(dict, key)) return undefined;
   const field = dict[key];
   if (!isNode(field) || field.type !== 'boolean') return undefined;
   return { path: [key] };
@@ -231,7 +246,8 @@ export function simpleToggleItems({ descriptors, moduleNameOf, titleOf } = {}) {
     if (ns === undefined || ns === '') continue;
     const moduleName = typeof moduleNameOf === 'function' ? moduleNameOf(ns) : undefined;
     if (!isThirdPartyModule(moduleName)) continue;
-    const toggle = simpleToggleField(row.schema);
+    const fieldName = MAIN_SWITCH_BY_MODULE.get(moduleName.trim());
+    const toggle = simpleToggleField(row.schema, fieldName);
     if (toggle === undefined) continue;
     const value = formFieldValue(row.value, toggle.path);
     if (typeof value !== 'boolean') continue;

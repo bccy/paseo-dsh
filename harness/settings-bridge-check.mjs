@@ -12,7 +12,8 @@
  *
  *   1. **The filter is the production one.** `settingsList()` must project
  *      `settings.describe()` through `settings-discovery.js` — third-party +
- *      exactly one boolean field. Official entries, multi-field forms,
+ *      exactly one boolean field or dsh-unrestricted's main switch.
+ *      Official entries, other multi-field forms,
  *      non-boolean single fields, dict-shaped forms and rows whose projected
  *      value is missing are excluded, or the composer fills with DSH internals.
  *      A `cordis:*` runtime specifier is not a user plugin and is excluded too.
@@ -150,6 +151,11 @@ function row({ ns, revision = 1, value, schema }) {
  */
 const wireForm = (build) => build(Schema).toJSON();
 const BOOLEAN_FORM = wireForm((schema) => schema.object({ enabled: schema.boolean().default(false) }));
+const UNRESTRICTED_FORM = wireForm((schema) => schema.object({
+  enabled: schema.boolean().default(false),
+  stripHostIdentity: schema.boolean().default(false),
+  extraPresets: schema.array(schema.string()).default([]),
+}));
 const TWO_FIELD_FORM = wireForm((schema) =>
   schema.object({ enabled: schema.boolean(), allowed: schema.array(schema.string()) }));
 const STRING_FORM = wireForm((schema) => schema.object({ label: schema.string() }));
@@ -259,7 +265,12 @@ function inventory(entries) {
 /** The descriptors a real profile would produce for the mixed candidate set. */
 function candidateRows() {
   return [
-    row({ ns: 'unrestricted', revision: 7, value: { enabled: false }, schema: BOOLEAN_FORM }),
+    row({
+      ns: 'unrestricted',
+      revision: 7,
+      value: { enabled: false, stripHostIdentity: false, extraPresets: ['custom'] },
+      schema: UNRESTRICTED_FORM,
+    }),
     row({ ns: 'memory', revision: 2, value: { enabled: true }, schema: BOOLEAN_FORM }),
     row({ ns: 'web', revision: 4, value: { enabled: true }, schema: BOOLEAN_FORM }),
     row({ ns: 'subagent-settings', revision: 1, value: { enabled: false }, schema: BOOLEAN_FORM }),
@@ -278,7 +289,7 @@ const NO_SUCH_NS = 'not-in-describe';
 
 console.log('bridge server: paseo/settings/list|set\n');
 
-// ===== 1. the production filter: third-party + exactly one boolean =========
+// ===== 1. the production filter: one eligible switch per namespace =========
 {
   const rows = candidateRows();
   const fake = settingsService(rows);
@@ -292,7 +303,7 @@ console.log('bridge server: paseo/settings/list|set\n');
   });
   const out = await server.handleRequest('paseo/settings/list', {});
   check(
-    'only the third-party single-boolean namespaces are exposed',
+    'the multi-field unrestricted form and the ordinary single-boolean form are exposed',
     JSON.stringify(out.items.map((item) => item.ns)) === JSON.stringify(['unrestricted', 'memory']),
     JSON.stringify(out.items.map((item) => item.ns)),
   );
@@ -336,7 +347,7 @@ console.log('bridge server: paseo/settings/list|set\n');
     JSON.stringify({ title: out.items[1]?.title, moduleName: out.items[1]?.moduleName }),
   );
   check(
-    'official namespaces, multi-field forms, non-boolean fields, dicts, missing values, cordis: specifiers and bad revisions are excluded',
+    'official namespaces, other multi-field forms, non-boolean fields, dicts, missing values, cordis: specifiers and bad revisions are excluded',
     !out.items.some((item) => ['web', 'subagent-settings', 'two-field', 'string-field', 'dict-field', 'no-value', 'bare-boolean', 'cordis-row', 'bad-revision'].includes(item.ns)),
     JSON.stringify(out.items.map((item) => item.ns)),
   );
@@ -522,9 +533,22 @@ console.log('bridge server: paseo/settings/list|set\n');
     JSON.stringify(out),
   );
   check(
-    'the underlying row was actually written',
-    rows.find((entry) => entry.ns === 'unrestricted')?.value.enabled === true,
-    JSON.stringify(rows.find((entry) => entry.ns === 'unrestricted')?.value),
+    'updating the main switch preserves the other fields',
+    JSON.stringify(rows[0].value) === JSON.stringify({
+      enabled: true, stripHostIdentity: false, extraPresets: ['custom'],
+    }),
+    JSON.stringify(rows[0].value),
+  );
+  const otherField = await server.handleRequest('paseo/settings/set', {
+    ns: 'unrestricted',
+    path: ['stripHostIdentity'],
+    value: true,
+    revision: 8,
+  });
+  check(
+    'the other boolean is not writable through the bridge',
+    otherField.ok === false && otherField.error.code === 'not_found' && fake.calls.mutate.length === 1,
+    JSON.stringify(otherField),
   );
 }
 
@@ -760,13 +784,35 @@ console.log('bridge server: paseo/settings/list|set\n');
   check(
     'simpleToggleField rejects multi-field, non-boolean, dict and bare-boolean forms',
     simpleToggleField(new Schema(TWO_FIELD_FORM)) === undefined
+      && simpleToggleField(new Schema(UNRESTRICTED_FORM)) === undefined
       && simpleToggleField(new Schema(STRING_FORM)) === undefined
       && simpleToggleField(new Schema(DICT_FORM)) === undefined
       && simpleToggleField({ type: 'boolean' }) === undefined
       && simpleToggleField(undefined) === undefined,
     JSON.stringify([
       simpleToggleField(new Schema(TWO_FIELD_FORM)),
+      simpleToggleField(new Schema(UNRESTRICTED_FORM)),
       simpleToggleField({ type: 'boolean' }),
+    ]),
+  );
+  check(
+    'simpleToggleField selects the explicitly named boolean field on a multi-field form',
+    simpleToggleField(new Schema(UNRESTRICTED_FORM), 'enabled')?.path.join('.') === 'enabled',
+    JSON.stringify(simpleToggleField(new Schema(UNRESTRICTED_FORM), 'enabled')),
+  );
+  check(
+    'simpleToggleField rejects non-boolean, missing, empty or non-string explicit fieldName values',
+    simpleToggleField(new Schema(UNRESTRICTED_FORM), 'extraPresets') === undefined
+      && simpleToggleField(new Schema(UNRESTRICTED_FORM), 'missingField') === undefined
+      && simpleToggleField(new Schema(UNRESTRICTED_FORM), '') === undefined
+      && simpleToggleField(new Schema(BOOLEAN_FORM), '') === undefined
+      && simpleToggleField(new Schema(BOOLEAN_FORM), null) === undefined,
+    JSON.stringify([
+      simpleToggleField(new Schema(UNRESTRICTED_FORM), 'extraPresets'),
+      simpleToggleField(new Schema(UNRESTRICTED_FORM), 'missingField'),
+      simpleToggleField(new Schema(UNRESTRICTED_FORM), ''),
+      simpleToggleField(new Schema(BOOLEAN_FORM), ''),
+      simpleToggleField(new Schema(BOOLEAN_FORM), null),
     ]),
   );
   check(
@@ -813,6 +859,28 @@ console.log('bridge server: paseo/settings/list|set\n');
     'simpleToggleItems carries the raw title dictionary, not a localized string',
     JSON.stringify(projected[0]?.title) === JSON.stringify({ en: 'X third', zh: '第三方' }),
     JSON.stringify(projected[0]?.title),
+  );
+  const unrestrictedWithoutEnabled = wireForm((schema) => schema.object({
+    stripHostIdentity: schema.boolean().default(false),
+    extraPresets: schema.array(schema.string()).default([]),
+  }));
+  const unrestrictedNonBooleanEnabled = wireForm((schema) => schema.object({
+    enabled: schema.string().default('yes'),
+    extraPresets: schema.array(schema.string()).default([]),
+  }));
+  const unrestrictedEdgeCases = discovery.simpleToggleItems({
+    descriptors: [
+      { ns: 'trimmed', schema: new Schema(UNRESTRICTED_FORM), value: { enabled: true }, revision: 1 },
+      { ns: 'missing-enabled', schema: new Schema(unrestrictedWithoutEnabled), value: { stripHostIdentity: false }, revision: 1 },
+      { ns: 'non-bool-enabled', schema: new Schema(unrestrictedNonBooleanEnabled), value: { enabled: 'yes' }, revision: 1 },
+    ],
+    moduleNameOf: (ns) => (ns === 'trimmed' ? ' dsh-unrestricted ' : 'dsh-unrestricted'),
+  });
+  check(
+    'simpleToggleItems trims moduleName before main-switch lookup and skips dsh-unrestricted when enabled is missing or non-boolean',
+    JSON.stringify(unrestrictedEdgeCases.map((item) => ({ ns: item.ns, path: item.field.path, value: item.field.value })))
+      === JSON.stringify([{ ns: 'trimmed', path: ['enabled'], value: true }]),
+    JSON.stringify(unrestrictedEdgeCases),
   );
 }
 

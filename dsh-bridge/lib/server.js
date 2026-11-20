@@ -4726,8 +4726,8 @@ export class PaseoHarnessServer {
    * every *active* plugin entry whose Config schema declares a volatile node —
    * and projects it down to one boolean switch per third-party plugin. The
    * selection rule lives in `settings-discovery.js` (pure, and shared with the
-   * offline checks): a form with exactly one boolean field, whose module
-   * specifier is not `@deepseek-ai/*`.
+   * offline checks): the third-party form's sole boolean field or its
+   * explicitly selected main switch.
    *
    * The service is looked up lazily rather than injected: a profile without
    * `profileContext`/`configEditor` legitimately composes no settings service,

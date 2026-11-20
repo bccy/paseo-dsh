@@ -1398,8 +1398,11 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
 
 - `harness/settings-bridge-check.mjs` — 桥的 `paseo/settings/list|set`（真 `PaseoHarnessServer` +
   假 `settings`/`configEditor`/`loader`+`pluginPackages`；不 spawn `dsh`、不读 profile、不起模型），
-  **48 条**：生产过滤（第三方 + 整个 volatile form 恰好一个 boolean；官方/多字段/非 boolean/dict/
-  缺值/整 schema boolean/`cordis:` specifier/非整数 revision 全部排除）、标题以语言字典原样透传
+  **52 条**：生产过滤（第三方单字段布尔表单，以及新版 `dsh-unrestricted` 的 `enabled` 主开关；官方/
+  其他多字段/非 boolean/dict/缺值/整 schema boolean/`cordis:` specifier/非整数 revision 全部排除，
+  另含 `simpleToggleField(form, fieldName)` 正反例、`moduleName` trim 与 `dsh-unrestricted` 缺或非
+  boolean `enabled` 跳过）、
+  主开关写入保留其他字段，写其他字段被拒绝、标题以语言字典原样透传
   （`meta.title` 的 `{en,zh}`，桥不选语言；无 metadata 时不出 title，由插件回落模块名）、
   `include:` 前缀 entry id 匹配、`configEditor.configuration()` 一次 list 只调一次、无 settings 服务
   → `{available:false,items:[]}` 且写请求 `settings_unavailable`、写路径带 ns/path/value/revision、

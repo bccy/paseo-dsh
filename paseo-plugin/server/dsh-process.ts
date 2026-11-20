@@ -221,10 +221,12 @@ export interface DshCatalog {
  * toolbar shows a name and the current state; the bridge-side contract here
  * stays boolean.
  *
- * The bridge projects DSH's runtime settings surface down to plugins whose
- * whole volatile Config form is one boolean field (`dsh-bridge/lib/
- * settings-discovery.js`); everything else (dicts, enums, official internals)
- * is deliberately absent. The value is **global** — a DSH profile is per
+ * The bridge projects DSH's runtime settings surface down to one boolean
+ * switch per third-party plugin — either a form whose sole volatile field is
+ * a boolean, or an explicitly selected main switch on a multi-field form
+ * (`dsh-bridge/lib/settings-discovery.js`); everything else (other
+ * multi-field forms, dicts, enums, official internals) is deliberately absent.
+ * The value is **global** — a DSH profile is per
  * process and one `dsh` child serves every session of the connection — so the
  * same switch state belongs on every conversation, not on the one whose
  * composer happens to show it.
