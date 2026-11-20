@@ -72,7 +72,8 @@ const DIM = "\u001b[2m";
 const RESET = "\u001b[0m";
 
 /**
- * This build uses the stable 0.16.0 SDK and workspace row badge API. A beta
+ * This build requires Paseo >= 0.16.0 and uses the stable workspace row badge
+ * API (dev/test SDK version follows `paseo-plugin/package.json`). A beta
  * whose core digits are 0.16.0 does not satisfy the package/manifest >=0.16.0
  * floor. App and daemon versions can differ; the client guards its badge API.
  */
@@ -769,7 +770,7 @@ export function runDoctor() {
     report(
       "fail",
       `paseo ${paseo.version}`,
-      `needs Paseo >= ${MINIMUM_PASEO} stable (this build uses the stable SDK and workspace row badge API; 0.16.0 prerelease hosts do not satisfy this floor)`,
+      `needs Paseo >= ${MINIMUM_PASEO} stable (this build uses the stable workspace badge API; 0.16.0 prerelease hosts do not satisfy this floor)`,
     );
   } else {
     if (parseVersion(paseo.version)?.prerelease !== undefined) {

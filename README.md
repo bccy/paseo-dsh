@@ -366,7 +366,7 @@ rm -rf ../.dbg
 
 ## 环境要求
 
-- **Paseo ≥ 0.16.0 正式版**：SDK 固定 0.16.0，使用 `server.addHook` 与正式版工作区徽标 API。App 与 daemon 可独立升级；较旧 App 没有徽标 API 时跳过徽标注册。composer 继续由 `controls` / `providerOptions` 提供。完整逐项取舍见 [0.16 适配矩阵](docs/PASEO-016-ADAPTATION.md)。
+- **Paseo ≥ 0.16.0 正式版**：宿主兼容下限为 `0.16.0`（开发与测试用 SDK 版本见 `paseo-plugin/package.json` 的 `devDependencies`），使用 `server.addHook` 与正式版工作区徽标 API。App 与 daemon 可独立升级；较旧 App 没有徽标 API 时跳过徽标注册。composer 继续由 `controls` / `providerOptions` 提供。完整逐项取舍见 [0.16 适配矩阵](docs/PASEO-016-ADAPTATION.md)。
 - **DSH ≥ 0.2.1**（随 0.2.x 线）：桥直接 import 九个 DSH 内部包
   （`@deepseek-ai/dsh-cmdline` / `dsh-brand` / `dsh-llm` / `dsh-attachment` / `dsh-agent` /
   `dsh-tools` / `dsh-subprocess` / `dsh-host-plugin-inventory` / `schemastery`），并且 0.2.1 改过 prompt 变量注册与 catalog

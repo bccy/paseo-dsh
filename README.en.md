@@ -419,7 +419,7 @@ a false diagnosis).
 
 ## Requirements
 
-- **Paseo ≥ 0.16.0 stable**: the SDK is pinned to 0.16.0, with `server.addHook` and the stable workspace badge API. App and daemon versions can differ; an older App without the badge API skips that contribution. Composer settings still use `controls` / `providerOptions`. See the [0.16 adaptation matrix](docs/PASEO-016-ADAPTATION.md) for each capability decision.
+- **Paseo ≥ 0.16.0 stable**: host floor is `>=0.16.0` (test/dev SDK version follows `paseo-plugin/package.json` `devDependencies`), with `server.addHook` and the stable workspace badge API. App and daemon versions can differ; an older App without the badge API skips that contribution. Composer settings still use `controls` / `providerOptions`. See the [0.16 adaptation matrix](docs/PASEO-016-ADAPTATION.md) for each capability decision.
 - **DSH ≥ 0.2.1** (on the 0.2.x line): the bridge imports nine DSH internal
   packages directly (`@deepseek-ai/dsh-cmdline` / `dsh-brand` / `dsh-llm` /
   `dsh-attachment` / `dsh-agent` / `dsh-tools` / `dsh-subprocess` / `dsh-host-plugin-inventory` /

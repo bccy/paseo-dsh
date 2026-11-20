@@ -435,7 +435,7 @@ docs/FIELD-NOTES.md   ← 不交付：作者本机的具体缺陷记录（历史
 
 ## Paseo 0.16.0 正式版的边界
 
-本分支要求宿主 ≥0.16.0，SDK 固定正式版；工作区徽标复用 goal/team/jobs 订阅，不增加读取循环。
+本分支要求宿主 ≥0.16.0（测试用 SDK 版本见 `paseo-plugin/package.json` 的 `devDependencies`）；工作区徽标复用 goal/team/jobs 订阅，不增加读取循环。
 `background` 字段透传且不滤掉 agent：隐藏 helper 的运行态可以计入徽标，但不贡献警示或完成提醒；
 宿主的 `backgroundWork.count` 不等于 DSH jobs。direct-provider SDK 没有 `background_work`
 事件与停止入口，所以保留 jobs pill / RPC。

@@ -4,7 +4,7 @@
 拆出去是因为 AGENTS.md 会作为工作区指令整份注入 DSH 会话，而 DSH 的工作区指令总预算是 64 KiB，
 超出时会整份丢弃更外层的 `~/.dsh/AGENTS.md`（FIELD-NOTES 第 77 条）。往这里加条目不占那份预算。
 
-## 统一 portable CI（Paseo 0.16.0）
+## 统一 portable CI（宿主 ≥ 0.16.0；测试 SDK 见 `paseo-plugin/package.json` `devDependencies`）
 
 ```bash
 cd paseo-plugin && npm ci --no-audit --no-fund
