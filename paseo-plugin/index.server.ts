@@ -3,6 +3,7 @@ import { goalControl, goalSnapshot, isTerminalGoalErrorCode, type GoalAnswer } f
 import { isTerminalJobsErrorCode, jobsSnapshot, jobsStop, type JobsAnswer } from "./shared/jobs";
 import { isTerminalTeamErrorCode, teamSnapshot, type TeamAnswer } from "./shared/team";
 import { rewindNoticeArm } from "./shared/rewind-notice";
+import { languageSettings, timelineStyleSettings } from "./shared/settings";
 import { ensurePaseoProfile } from "./server/bootstrap";
 import { DshPlugins } from "./server/dsh-plugins";
 import { registerDshPluginsRpc } from "./server/dsh-plugins-rpc";
@@ -102,6 +103,8 @@ export default function contribute(server: PluginServerContext) {
   const cleanups = CAPTURE_HOOKS.map((name) => server.addHook(name, async (_event: unknown, context: PluginHandlerContext) => capture(context)));
 
   server.registerProvider(createDshProvider());
+  server.registerSettings(timelineStyleSettings);
+  server.registerSettings(languageSettings);
 
   // The DSH Plugins page manages the profile this provider drives. One manager
   // for the whole plugin process: its in-flight job is the page's serialization

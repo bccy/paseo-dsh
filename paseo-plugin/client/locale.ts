@@ -64,6 +64,14 @@ import type { FailureCode } from "../shared/dsh-plugins-api";
 export type Locale = "en" | "zh-CN";
 
 /**
+ * User-selected language override from Display settings.
+ * `"auto"` clears the override and falls back to the relayed locale (or the
+ * client default). Kept structurally equivalent to `shared/settings.ts`'s
+ * `LanguageChoice` so this module stays free of `@getpaseo/plugin` and `zod`.
+ */
+export type LanguageOverride = "auto" | Locale;
+
+/**
  * The event a 0.12 agent-to-agent message row reports.
  *
  * The five values are the protocol's own `AgentMessage.event` enum
@@ -209,6 +217,43 @@ export interface DshPluginsText {
   errors: Record<DshPluginsFailureCode, string>;
 }
 
+/** Editable numeric fields on the Display settings screen. */
+export type DisplaySettingsFieldKey =
+  | "rowMarginY"
+  | "toolRowPaddingY"
+  | "toolRowMinHeight"
+  | "toolRowGap"
+  | "commandMaxHeightRatio"
+  | "commandMinHeight";
+
+/** Copy for the Display settings screen and its Command Center shortcut. */
+export interface DisplaySettingsText {
+  /** Settings screen title and header link label on the DSH Plugins page. */
+  title: string;
+  /** Command Center shortcut title. */
+  command: string;
+  intro: string;
+  save: string;
+  saving: string;
+  reset: string;
+  saved: string;
+  saveFailed: string;
+  resetDone: string;
+  resetFailed: string;
+  loading: string;
+  invalidNumber: (label: string) => string;
+  outOfRange: (label: string, min: number, max: number) => string;
+  language: {
+    label: string;
+    hint: string;
+    auto: string;
+    en: string;
+    zhCN: string;
+  };
+  fields: Record<DisplaySettingsFieldKey, { label: string; hint: string }>;
+  renderFailed: string;
+}
+
 export interface UiText {
   /** Native workspace-row summaries of the existing pill streams. */
   workspaceBadge: WorkspaceBadgeText;
@@ -256,6 +301,8 @@ export interface UiText {
   toolFailures: Record<string, { short: string; hint: string }>;
   /** Copy for the DSH Plugins screen and its sidebar row. */
   plugins: DshPluginsText;
+  /** Copy for the Display settings screen and its entry points. */
+  settings: DisplaySettingsText;
 }
 
 /**
@@ -1468,6 +1515,55 @@ const TEXT: Record<Locale, UiText> = {
         "render": "This screen failed to render. Reopen it; if it happens again, check the daemon log.",
       },
     },
+    settings: {
+      title: "Display settings",
+      command: "DSH display settings",
+      intro: "Row spacing and the language this plugin draws in. Language changes apply immediately; row spacing applies when you save.",
+      save: "Save",
+      saving: "Saving…",
+      reset: "Restore defaults",
+      saved: "Saved",
+      saveFailed: "Could not save",
+      resetDone: "Defaults restored",
+      resetFailed: "Could not restore defaults",
+      loading: "Loading settings…",
+      invalidNumber: (label) => `“${label}” is not a valid number`,
+      outOfRange: (label, min, max) => `“${label}” must be between ${min} and ${max}`,
+      language: {
+        label: "Language",
+        hint: "Automatic follows the server-relayed locale (defaulting to Simplified Chinese). A choice here overrides it for this plugin's own UI.",
+        auto: "Automatic",
+        en: "English",
+        zhCN: "简体中文",
+      },
+      fields: {
+        rowMarginY: {
+          label: "Extra spacing between rows",
+          hint: "Added on top of the host's row spacing for tool rows and the streaming thinking row. Default 0; negative values tighten the gap. Range -16 to 24.",
+        },
+        toolRowPaddingY: {
+          label: "Tool row vertical padding (inside the row)",
+          hint: "Changes only the padding inside a row, not the gap between rows. Default 0. Range 0 to 12.",
+        },
+        toolRowMinHeight: {
+          label: "Tool row minimum height",
+          hint: "Minimum height of a collapsed tool row, in pixels. Default 24. Range 12 to 64.",
+        },
+        toolRowGap: {
+          label: "Horizontal gap between icon and text",
+          hint: "Between the icon, the verb and the target. Default 6. Range 0 to 24.",
+        },
+        commandMaxHeightRatio: {
+          label: "Command block maximum height (share of the window)",
+          hint: "0.25 means at most a quarter of the window height; beyond that the command block scrolls internally and the output area stays visible. Range 0.1 to 0.6.",
+        },
+        commandMinHeight: {
+          label: "Command block minimum height cap",
+          hint: "The height the command block keeps even in a very small window, in pixels. Default 150. Range 60 to 360.",
+        },
+      },
+      renderFailed: "This screen could not be rendered.",
+    },
   },
   "zh-CN": {
     workspaceBadge: {
@@ -2069,6 +2165,55 @@ const TEXT: Record<Locale, UiText> = {
         "render": "这个页面渲染失败。重新打开试试；如果反复出现，请检查 daemon 日志。",
       },
     },
+    settings: {
+      title: "显示设置",
+      command: "DSH 显示设置",
+      intro: "行间距和插件界面语言。语言选择立即生效，行间距保存后生效。",
+      save: "保存",
+      saving: "保存中…",
+      reset: "恢复默认",
+      saved: "已保存",
+      saveFailed: "保存失败",
+      resetDone: "已恢复默认值",
+      resetFailed: "重置失败",
+      loading: "正在读取设置…",
+      invalidNumber: (label) => `「${label}」不是有效数字`,
+      outOfRange: (label, min, max) => `「${label}」须在 ${min} ~ ${max} 之间`,
+      language: {
+        label: "界面语言",
+        hint: "「自动」跟随服务端透传的语言（默认简体中文）；在这里选择后，本插件自己的界面优先使用所选语言。",
+        auto: "自动",
+        en: "English",
+        zhCN: "简体中文",
+      },
+      fields: {
+        rowMarginY: {
+          label: "行之间的额外间距",
+          hint: "同时叠加在工具行和正在输出的思考行之上。默认 0；可填负数收紧间距。范围 -16 ~ 24。",
+        },
+        toolRowPaddingY: {
+          label: "工具行上下内边距（行内留白）",
+          hint: "只改行内留白，不改行之间的距离；要缩小行间距请改上面的「行之间的额外间距」。默认 0。范围 0 ~ 12。",
+        },
+        toolRowMinHeight: {
+          label: "工具行最小高度",
+          hint: "工具行至少多高（像素）。默认 24。范围 12 ~ 64。",
+        },
+        toolRowGap: {
+          label: "图标与文字的水平间距",
+          hint: "图标、标题与摘要之间的间距。默认 6。范围 0 ~ 24。",
+        },
+        commandMaxHeightRatio: {
+          label: "命令块最大高度（窗口占比）",
+          hint: "0.25 表示最多占窗口高度的四分之一；超过后命令块内部滚动，输出区始终保留。范围 0.1 ~ 0.6。",
+        },
+        commandMinHeight: {
+          label: "命令块最小高度上限",
+          hint: "窗口很小时仍给命令块保留的高度（像素）。默认 150。范围 60 ~ 360。",
+        },
+      },
+      renderFailed: "这个页面渲染失败。",
+    },
   },
 };
 
@@ -2115,6 +2260,18 @@ export function resolveLocale(
 /** The locale a host has relayed, if any. Unset means "nobody told us". */
 let relayed: Locale | undefined;
 
+/** Explicit user language choice from Display settings, if any. */
+let override: Locale | undefined;
+
+/** Subscribers notified whenever `currentLocale()` changes. */
+const listeners = new Set<() => void>();
+
+function notifyLocaleListeners(): void {
+  for (const listener of Array.from(listeners)) {
+    listener();
+  }
+}
+
 /**
  * Adopt a host-supplied display locale.
  *
@@ -2123,12 +2280,40 @@ let relayed: Locale | undefined;
  * silently switching the UI to English.
  */
 export function setLocale(value: unknown): void {
+  const previous = currentLocale();
   relayed = normalizeLocale(value);
+  if (currentLocale() !== previous) notifyLocaleListeners();
+}
+
+/**
+ * Apply or clear a user-selected language override.
+ *
+ * Only exact bundled locales (`"en"` / `"zh-CN"`) activate an override;
+ * `"auto"` or anything else clears it so `currentLocale()` falls back to
+ * `relayed ?? DEFAULT_LOCALE`.
+ */
+export function setLanguageOverride(value: unknown): void {
+  const previous = currentLocale();
+  override = value === "en" || value === "zh-CN" ? value : undefined;
+  if (currentLocale() !== previous) notifyLocaleListeners();
+}
+
+/** The active language override (`"auto"` when following relayed/default). */
+export function getLanguageOverride(): LanguageOverride {
+  return override ?? "auto";
+}
+
+/** Subscribe to effective display locale changes; returns an unsubscribe handle. */
+export function subscribeLocale(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
 }
 
 /** The locale the client renders in right now. */
 export function currentLocale(): Locale {
-  return relayed ?? DEFAULT_LOCALE;
+  return override ?? relayed ?? DEFAULT_LOCALE;
 }
 
 /** The copy for the current locale. Read it per render, never hoist it. */

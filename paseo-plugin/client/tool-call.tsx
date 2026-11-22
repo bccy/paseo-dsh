@@ -26,7 +26,7 @@
  *
  * @module dsh-paseo/client/tool-call
  */
-import type { PluginTimelineItemProps } from "@getpaseo/plugin/client";
+import { useSettings, type PluginTimelineItemProps } from "@getpaseo/plugin/client";
 import { Icon, ScrollView, copyText } from "@getpaseo/plugin/client/react-native";
 import { ExternalLink } from "@getpaseo/plugin/client/ui";
 import { type ReactNode, useCallback, useMemo, useState } from "react";
@@ -36,14 +36,21 @@ import {
   StyleSheet,
   Text,
   View,
+  useWindowDimensions,
   type StyleProp,
   type TextStyle,
   type ViewStyle,
 } from "react-native";
+import {
+  TIMELINE_STYLE_DEFAULTS,
+  resolveCommandMaxHeight,
+  timelineStyleSettings,
+  type TimelineStyleValues,
+} from "../shared/settings";
 import { shouldPulse, useRowPulse } from "./newest";
 import { PASEO_MARK_ICON } from "./paseo-mark";
 import { blockCopy, type GoalBlockData, type ReadBlockData, type SearchBlockData, type ToolCallData, type ToolFieldEntry, type ToolFieldsData, type WebBlockData } from "./tool-call-data";
-import { localeText } from "./locale";
+import { useLocaleText } from "./use-locale";
 import { TextShimmer } from "./text-shimmer";
 import { TeamBlockView } from "./team-card";
 import { ringColorFor } from "./jobs-popover-layout";
@@ -692,24 +699,42 @@ function WebBlockView({ data, styles }: { data: WebBlockData; styles: BlockStyle
 /* Styles                                                                     */
 /* -------------------------------------------------------------------------- */
 
-function buildStyles(colors: TokenColors, hairline: number) {
+function buildStyles(
+  colors: TokenColors,
+  hairline: number,
+  style: TimelineStyleValues,
+  commandMaxHeight: number,
+) {
   // The wash is 8% on a light card and 12% on a dark one; the card's own
   // surface is what the diff lines are painted on.
   const light = isLightSurface(colors.surface1);
+  // Drop `rowHeadStyle()`'s fixed `height` so `minHeight: style.toolRowMinHeight`
+  // governs both shrinking and growing (still 24px at defaults). Cap row-head
+  // text `lineHeight` to `toolRowMinHeight` so shrinking below 24px takes effect.
+  const { height: _unusedHeight, ...baseRowHead } = rowHeadStyle();
+  const rowLineHeight = Math.min(ROW_LINE_HEIGHT, style.toolRowMinHeight);
   return {
-    root: rowRootStyle(),
-    head: rowHeadStyle(),
+    root: {
+      ...rowRootStyle(),
+      marginVertical: style.rowMarginY,
+      paddingVertical: style.toolRowPaddingY,
+    },
+    head: {
+      ...baseRowHead,
+      gap: style.toolRowGap,
+      minHeight: style.toolRowMinHeight,
+    },
     // The text run, and the flex row the shimmer's copy re-lays-out. No gap:
     // the separator carries its own margins, the way DSH's `.sep` does.
     text: { flexDirection: "row" as const, alignItems: "center" as const, flex: 1, minWidth: 0 },
-    label: rowLabelTextStyle(colors),
+    label: { ...rowLabelTextStyle(colors), lineHeight: rowLineHeight },
     sep: separatorStyle(colors),
-    summary: summaryTextStyle(colors),
+    summary: { ...summaryTextStyle(colors), lineHeight: rowLineHeight },
     // A failed row puts its reason where the summary sits (DSH's
     // `.errorSummary` does the same), so the reason reads before expanding.
     summaryError: { color: colors.statusDanger },
-    statAdded: diffStatTextStyle(colors, "added"),
-    statRemoved: diffStatTextStyle(colors, "removed"),
+    statAdded: { ...diffStatTextStyle(colors, "added"), lineHeight: rowLineHeight },
+    statRemoved: { ...diffStatTextStyle(colors, "removed"), lineHeight: rowLineHeight },
     body: { marginLeft: BODY_INDENT, gap: ROW_GAP },
     // The whole failure reason inside the expansion, selectable and red.
     errorText: {
@@ -780,6 +805,9 @@ function buildStyles(colors: TokenColors, hairline: number) {
     card: cardStyle(colors, hairline),
     divider: dividerStyle(colors, hairline),
     command: commandRegionStyle(),
+    // Bounded scroll window around the terminal card's command banner, sized
+    // from timeline style settings (`commandMaxHeightRatio` / `commandMinHeight`).
+    commandScroll: { maxHeight: commandMaxHeight },
     // The command and its copy control share the banner line; the command
     // takes the remaining width so the control never wraps off the card.
     commandRow: {
@@ -796,8 +824,7 @@ function buildStyles(colors: TokenColors, hairline: number) {
     codeText: codeTextStyle(colors),
     // DSH's `.bodyScroll { max-height: 260px; overflow-y: auto }` around the
     // code-tool card's body: the generic surface renders the whole text and
-    // scrolls it in place instead of being cut at 6000 characters. This is the
-    // one consumer of `CODE_MAX_HEIGHT`.
+    // scrolls it in place instead of being cut at 6000 characters.
     codeScroll: { maxHeight: CODE_MAX_HEIGHT },
     diffLine: diffRowStyle(),
     diffBody: diffBodyStyle(),
@@ -917,7 +944,15 @@ function GoalBlockView({ data, summary, styles }: { data: GoalBlockData; summary
  * surface. Facts wrap because a phone is 390px wide and a call can carry five of
  * them; a long value wraps inside its own row instead of pushing the card.
  */
-function ToolFieldsView({ data, styles }: { data: ToolFieldsData; styles: BlockStyles }) {
+function ToolFieldsView({
+  data,
+  styles,
+  resultCaption,
+}: {
+  data: ToolFieldsData;
+  styles: BlockStyles;
+  resultCaption: string;
+}) {
   const blocks: ReactNode[] = [];
   // Consecutive facts share one wrapping row (`键: 值` ×N); a prose or JSON entry
   // ends the run, so the payload's own key order survives the grouping.
@@ -988,7 +1023,7 @@ function ToolFieldsView({ data, styles }: { data: ToolFieldsData; styles: BlockS
     if (data.hideResultCaption !== true) {
       blocks.push(
         <Text key="result-caption" style={styles.fieldCaption}>
-          {localeText().bodyLabels.result}
+          {resultCaption}
         </Text>,
       );
     }
@@ -1071,8 +1106,18 @@ export function InlineToolCall({
   // green when an edit completed, muted otherwise. The label and the summary stay
   // muted on every state (`client/tokens.ts`).
   const iconColor = rowIconColor(colors, data.status, data.diff);
+  const styleState = useSettings(timelineStyleSettings);
+  const style = styleState.status === "ready" ? styleState.values : TIMELINE_STYLE_DEFAULTS;
+  const { height: windowHeight } = useWindowDimensions();
+  const commandMaxHeight = resolveCommandMaxHeight(style, windowHeight);
+  // Subscribe via `useLocaleText()` so language changes immediately re-render
+  // this row and all nested block views reading `blockCopy()`.
+  const text = useLocaleText();
 
-  const styles = useMemo(() => buildStyles(colors, StyleSheet.hairlineWidth), [colors]);
+  const styles = useMemo(
+    () => buildStyles(colors, StyleSheet.hairlineWidth, style, commandMaxHeight),
+    [colors, style, commandMaxHeight],
+  );
 
   return (
     <Pressable
@@ -1198,7 +1243,13 @@ export function InlineToolCall({
           {/* The generic card for a row with no detail shape (every MCP call).
               A plain-text result keeps its own code surface below this card; a
               structured one is drawn by the card alone. */}
-          {data.fields !== null ? <ToolFieldsView data={data.fields} styles={styles} /> : null}
+          {data.fields !== null ? (
+            <ToolFieldsView
+              data={data.fields}
+              styles={styles}
+              resultCaption={text.bodyLabels.result}
+            />
+          ) : null}
           {/* One card per expanded block, the way DSH's TerminalBlock, DiffBlock
               and ReadBlock all are: same radius, same hairline, same surface.
               `data.kind` picks it; a block whose meta did not parse has no
@@ -1210,7 +1261,11 @@ export function InlineToolCall({
                   line, then a hairline, then what it printed. A running
                   command that has printed nothing yet draws no divider, the
                   same as DSH's banner-only terminal card. */}
-              <View style={styles.command}>
+              <ScrollView
+                style={styles.commandScroll}
+                contentContainerStyle={styles.command}
+                nestedScrollEnabled
+              >
                 <View style={styles.commandRow}>
                   <Text style={styles.commandText} selectable>
                     {data.headline}
@@ -1223,7 +1278,7 @@ export function InlineToolCall({
                     <CopyControl text={data.body} style={styles.cardHeadAction} />
                   ) : null}
                 </View>
-              </View>
+              </ScrollView>
               {hasBody ? <View style={styles.divider} /> : null}
               {hasBody ? (
                 // DSH renders every line inside a capped scroll region

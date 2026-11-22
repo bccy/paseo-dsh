@@ -21,13 +21,14 @@
  *
  * @module dsh-paseo/client/inline-thinking
  */
-import type { PluginTimelineItemProps } from "@getpaseo/plugin/client";
+import { useSettings, type PluginTimelineItemProps } from "@getpaseo/plugin/client";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Image, Pressable, Text, View } from "react-native";
+import { TIMELINE_STYLE_DEFAULTS, timelineStyleSettings } from "../shared/settings";
 import { TextShimmer } from "./text-shimmer";
 import { reasoningPreview, streamingTail } from "./thinking-text";
-import { BODY_INDENT, ROW_FONT_SIZE, ROW_GAP, ROW_HEAD_GAP, ROW_HEIGHT, ROW_LINE_HEIGHT } from "./tokens";
-import { localeText } from "./locale";
+import { BODY_INDENT, ROW_FONT_SIZE, ROW_GAP, ROW_LINE_HEIGHT } from "./tokens";
+import { useLocaleText } from "./use-locale";
 
 /**
  * DSH's thinking icon (`PROCESS_ICONS.thinking` = `IconThinkOutlineRegular`:
@@ -101,18 +102,19 @@ export function InlineThinking({
   // collapsed the window to a couple of characters on the desktop client while
   // the settled row (which needs no width) looked fine. The row and the label are
   // both definite, so the line is what is left over.
+  const styleState = useSettings(timelineStyleSettings);
+  const style = styleState.status === "ready" ? styleState.values : TIMELINE_STYLE_DEFAULTS;
   const [rowWidth, setRowWidth] = useState(0);
   const [labelWidth, setLabelWidth] = useState(0);
   const lineWidth = Math.max(
     0,
-    rowWidth - THINK_ICON_SIZE - ROW_HEAD_GAP - labelWidth - ROW_HEAD_GAP,
+    rowWidth - THINK_ICON_SIZE - style.toolRowGap - labelWidth - style.toolRowGap,
   );
   const [manual, setManual] = useState<boolean | null>(null);
   const open = manual ?? false;
-  // Read per render, not hoisted: `./locale` follows a locale the host relays
-  // after this module loaded, and the label and the two screen-reader strings
-  // have to move with it.
-  const copy = localeText();
+  // Subscribe via `useLocaleText()` so host-relayed or settings-driven locale
+  // changes re-render the label and screen-reader strings live.
+  const copy = useLocaleText();
 
 
   // While streaming the collapsed line is a **tail window**: it advances with
@@ -125,29 +127,34 @@ export function InlineThinking({
       ? streamingTail(text, lineWidth, ROW_FONT_SIZE)
       : reasoningPreview(text, growing);
 
-  const styles = useMemo(
-    () => ({
+  const styles = useMemo(() => {
+    const rowLineHeight = Math.min(ROW_LINE_HEIGHT, style.toolRowMinHeight);
+    return {
       // DSH renders a thought and a tool call through the same DisclosureRow, so
       // the two rows must not disagree about their rhythm: same 24px line, same
-      // head gap, no vertical padding of their own.
-      root: { gap: ROW_GAP, paddingVertical: 0 },
+      // head gap, no vertical padding of their own (overridable via settings).
+      root: {
+        gap: ROW_GAP,
+        marginVertical: style.rowMarginY,
+        paddingVertical: style.toolRowPaddingY,
+      },
       row: {
         flexDirection: "row" as const,
         alignItems: "center" as const,
-        gap: ROW_HEAD_GAP,
-        minHeight: ROW_HEIGHT,
+        gap: style.toolRowGap,
+        minHeight: style.toolRowMinHeight,
       },
       textRow: {
         flex: 1,
         minWidth: 0,
         flexDirection: "row" as const,
         alignItems: "center" as const,
-        gap: ROW_HEAD_GAP,
+        gap: style.toolRowGap,
       },
       label: {
         color: theme.colors.foregroundMuted,
         fontSize: ROW_FONT_SIZE,
-        lineHeight: ROW_LINE_HEIGHT,
+        lineHeight: rowLineHeight,
         opacity: growing ? 0.9 : 0.6,
       },
       line: {
@@ -155,7 +162,7 @@ export function InlineThinking({
         minWidth: 0,
         color: theme.colors.foregroundMuted,
         fontSize: ROW_FONT_SIZE,
-        lineHeight: ROW_LINE_HEIGHT,
+        lineHeight: rowLineHeight,
         opacity: growing ? 0.95 : 0.7,
       },
       full: {
@@ -165,9 +172,8 @@ export function InlineThinking({
         lineHeight: layout.compact ? 19 : 21,
         opacity: 0.8,
       },
-    }),
-    [theme, layout.compact, growing],
-  );
+    };
+  }, [theme, layout.compact, growing, style]);
 
   return (
     // The whole block toggles, so a tap anywhere (including on the expanded

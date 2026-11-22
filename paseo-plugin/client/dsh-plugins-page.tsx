@@ -10,12 +10,11 @@ import {
 } from "react-native";
 import type { PluginScreenProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
-import {
-  currentLocale,
-  localeText,
-  type DshPluginsFailureCode,
-  type DshPluginsText,
+import type {
+  DshPluginsFailureCode,
+  DshPluginsText,
 } from "./locale";
+import { useCurrentLocale, useLocaleText } from "./use-locale";
 import { PluginsBoundary, PluginsFailedCard } from "./dsh-plugins-guard";
 import {
   inspectSpecRpc,
@@ -518,9 +517,11 @@ function BundleRow({
   );
 }
 
-function DshPluginsPageBody({ theme, host, layout }: PluginScreenProps) {
+function DshPluginsPageBody({ theme, host, layout, openDisplaySettings }: DshPluginsPageProps) {
   const compact = layout.compact || layout.platform === "ios" || layout.platform === "android";
-  const text = localeText().plugins;
+  const uiText = useLocaleText();
+  const text = uiText.plugins;
+  const locale = useCurrentLocale();
   const styles = useMemo(() => createStyles(theme.colors, compact), [theme.colors, compact]);
 
   const list = useRpc(listRpc);
@@ -549,7 +550,7 @@ function DshPluginsPageBody({ theme, host, layout }: PluginScreenProps) {
     try {
       // The locale files live on the daemon; ask for the language this page
       // renders in so the localized title/description come back resolved.
-      const next = await list({ locale: currentLocale() });
+      const next = await list({ locale });
       setSnapshot(next);
       setLoadError(next.errorCode === undefined
         ? null
@@ -573,7 +574,7 @@ function DshPluginsPageBody({ theme, host, layout }: PluginScreenProps) {
     } finally {
       setRefreshing(false);
     }
-  }, [list]);
+  }, [list, locale]);
 
   useEffect(() => {
     void refresh();
@@ -807,6 +808,13 @@ function DshPluginsPageBody({ theme, host, layout }: PluginScreenProps) {
             }}
             styles={styles}
           />
+          {openDisplaySettings === undefined ? null : (
+            <ActionButton
+              label={uiText.settings.title}
+              onPress={openDisplaySettings}
+              styles={styles}
+            />
+          )}
         </View>
       </View>
 
@@ -1027,14 +1035,19 @@ function DshPluginsPageBody({ theme, host, layout }: PluginScreenProps) {
   );
 }
 
+export interface DshPluginsPageProps extends PluginScreenProps {
+  /** Opens the display settings; the header shows no button without it. */
+  openDisplaySettings?: () => void;
+}
+
 /**
  * The registered screen. A render error used to be fatal for the whole app:
  * release Hermes hands it to RN's fatal handler, which aborts the process. Keep
  * one malformed field or host prop from taking the sidebar and every open agent
  * down with it.
  */
-export function DshPluginsPage(props: PluginScreenProps) {
-  const text = localeText().plugins;
+export function DshPluginsPage(props: DshPluginsPageProps) {
+  const text = useLocaleText().plugins;
   return (
     <PluginsBoundary
       fallback={(

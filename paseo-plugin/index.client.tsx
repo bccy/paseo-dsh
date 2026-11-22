@@ -15,20 +15,35 @@
  *
  * @module dsh-paseo/index.client
  */
-import type { PluginClientContext, PluginSidebarItemProps } from "@getpaseo/plugin/client";
+import { settingsRpc } from "@getpaseo/plugin";
+import type {
+  PluginClientContext,
+  PluginScreenProps,
+  PluginSidebarItemProps,
+} from "@getpaseo/plugin/client";
 import { SidebarRow } from "@getpaseo/plugin/client/ui";
 import { z } from "zod";
 import { DshPluginsPage } from "./client/dsh-plugins-page";
-import { guardCleanup, installFatalGuard } from "./client/dsh-plugins-guard";
+import { guardCleanup, installFatalGuard, report } from "./client/dsh-plugins-guard";
 import { PluginsIcon } from "./client/dsh-plugins-icon";
 import { contributeGoalPill } from "./client/goal-pill";
 import { InlineThinking } from "./client/inline-thinking";
 import { contributeJobsPill } from "./client/jobs-pill";
+import {
+  DISPLAY_SETTINGS_ID,
+  contributeDisplaySettingsCommand,
+  contributeTimelineSettings,
+} from "./client/settings-screen";
 import { contributeStreamStats } from "./client/stream-stats";
 import { contributeTeamPill } from "./client/team-pill";
 import { createWorkspaceStatusStore } from "./client/workspace-status";
 import { contributeWorkspaceBadges } from "./client/workspace-badges";
-import { localeFromMetadata, localeText, setLocale } from "./client/locale";
+import {
+  localeFromMetadata,
+  localeText,
+  setLanguageOverride,
+  setLocale,
+} from "./client/locale";
 import { RewindNotice } from "./client/rewind-notice";
 import {
   isLegacyRewindNotice,
@@ -42,6 +57,7 @@ import {
   REWIND_NOTICE_VERSION,
   rewindNoticeArm,
 } from "./shared/rewind-notice";
+import { languageSettings } from "./shared/settings";
 
 /** The screen's id; the sidebar row opens this same id. */
 const PLUGINS_SCREEN_ID = "dsh-plugins";
@@ -82,7 +98,27 @@ export default function contribute(client: PluginClientContext) {
   return buildContributions(client);
 }
 
+/**
+ * Read the host's persisted language choice once at plugin load.
+ *
+ * Failures degrade silently to `"auto"` (relayed locale or client default) so
+ * an older host or transient RPC failure never blocks client startup.
+ */
+function bootstrapLanguage(client: PluginClientContext): void {
+  void Promise.resolve()
+    .then(() => client.rpc(settingsRpc(languageSettings.id).read, {}))
+    .then((state) => {
+      if (state.status !== "ready") return;
+      const parsed = languageSettings.schema.safeParse(state.values);
+      if (parsed.success) setLanguageOverride(parsed.data.language);
+    })
+    .catch((error) => {
+      report("language settings", error);
+    });
+}
+
 function buildContributions(client: PluginClientContext): () => void {
+  bootstrapLanguage(client);
   client.addTimelineTransformer({
     id: "dsh-inline-thinking",
     query: { itemType: "reasoning" },
@@ -345,17 +381,29 @@ function buildContributions(client: PluginClientContext): () => void {
   // guarded on its own: a host that rejects one (unknown icon, unsupported
   // surface) costs that entry only, never the four timeline renderers above.
   const pluginsTitle = localeText().plugins.pageTitle;
+  const openDisplaySettings = () => {
+    void Promise.resolve()
+      .then(() => client.openSettings(DISPLAY_SETTINGS_ID))
+      .catch((error) => {
+        report("open display settings", error);
+      });
+  };
+  const PluginsScreen = (props: PluginScreenProps) => (
+    <DshPluginsPage {...props} openDisplaySettings={openDisplaySettings} />
+  );
   const cleanups = [
     contributeStreamStats(client),
     contributeJobsPill(client, workspaceStatus.observer("jobs")),
     contributeGoalPill(client, workspaceStatus.observer("goal")),
     contributeTeamPill(client, workspaceStatus.observer("team")),
     contributeWorkspaceBadges(client, workspaceStatus),
+    guardCleanup("timeline settings", () => contributeTimelineSettings(client)),
+    guardCleanup("display settings command", () => contributeDisplaySettingsCommand(client)),
     guardCleanup("plugins screen", () =>
       client.addScreen({
         id: PLUGINS_SCREEN_ID,
         title: pluginsTitle,
-        Component: DshPluginsPage,
+        Component: PluginsScreen,
       })),
     guardCleanup("plugins sidebar", () =>
       client.addSidebarHeaderItem({
