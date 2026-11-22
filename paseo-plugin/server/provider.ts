@@ -9,17 +9,20 @@
  * @module dsh-paseo/server/provider
  */
 import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
 import {
   negotiateProviderCapabilities,
   type ProviderCatalog,
   type ProviderConnection,
   type ProviderEvent,
   type ProviderInput,
+  type ProviderInspection,
   type ProviderModel,
   type ProviderRegistration,
   type ProviderThinkingOption,
 } from "@getpaseo/plugin/server/provider";
+import { resolveDshCommand } from "./dsh-command.mjs";
 import {
   AGENT_IDENTITY_ENV_KEYS,
   browserMcpGap,
@@ -3379,12 +3382,49 @@ export async function stopAgentJob(agentId: string, jobId: string): Promise<JobS
   };
 }
 
+const execFileAsync = promisify(execFile);
+
+/** Package page Paseo links to when `dsh` is missing or the user asks how to install it. */
+const DSH_INSTALL_URL = "https://www.npmjs.com/package/@deepseek-ai/dsh";
+
+/**
+ * Inspect whether `dsh` is installed and read its version for Paseo >= 0.17.1's
+ * provider installation UI (older hosts ignore `installation`).
+ *
+ * Uses the same binary resolution ({@link resolveDshBinary} +
+ * {@link resolveDshCommand}) as {@link DshProcess.start} so `DSH_BINARY` and
+ * Windows npm `.cmd` shims report the exact executable sessions run.
+ */
+async function inspectDshInstallation({ signal }: { signal: AbortSignal }): Promise<ProviderInspection> {
+  const binary = resolveDshBinary();
+  const launch = resolveDshCommand(binary);
+  try {
+    const { stdout } = await execFileAsync(launch.command, [...launch.args, "--version"], {
+      timeout: 5000,
+      maxBuffer: 8192,
+      signal,
+    });
+    const firstLine = stdout.trim().split(/\r?\n/)[0]?.trim();
+    const version = /\b\d+\.\d+\.\d+\S*/.exec(stdout)?.[0] ?? (firstLine || undefined);
+    return version ? { status: "installed", version } : { status: "installed" };
+  } catch (error) {
+    if (signal.aborted) throw error;
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (code === "ENOENT") return { status: "not_installed" };
+    throw error;
+  }
+}
+
 /** The provider registration Paseo installs for `dsh --profile paseo`. */
 export function createDshProvider(): ProviderRegistration {
   return {
     id: PROVIDER_ID,
     label: "DeepSeek Harness",
     icon: "icon.svg",
+    installation: {
+      installUrl: DSH_INSTALL_URL,
+      inspect: ({ signal }) => inspectDshInstallation({ signal }),
+    },
     async connect(request) {
       const capabilities = negotiateProviderCapabilities(request.capabilities, CAPABILITIES);
       const connection = new DshConnection(capabilities);

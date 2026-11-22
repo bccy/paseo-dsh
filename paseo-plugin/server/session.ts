@@ -1137,10 +1137,11 @@ export class DshSession {
     const translations = this.#menuTranslations();
     const advertised = this.#lastCommands.map((command) => {
       const hint = command.argumentHint === undefined ? {} : { argumentHint: command.argumentHint };
+      const kind = command.kind;
       const base =
-        command.kind !== "command"
-          ? { name: command.name, description: skillDescription(command.name, command.description), ...hint }
-          : commandCopy(command.name, { description: command.description, ...hint });
+        kind !== "command"
+          ? { name: command.name, description: skillDescription(command.name, command.description), ...hint, kind }
+          : { ...commandCopy(command.name, { description: command.description, ...hint }), kind };
       const user = translations.userLine(command.name);
       if (user !== undefined) return { ...base, description: user };
       if (hasBuiltinMenuCopy(command.name)) return base;
