@@ -217,7 +217,7 @@ node <插件目录>/bin/paseo-dsh.mjs doctor
 相关地址：本分支仓库 <https://github.com/bccy/paseo-dsh> · Issue
 <https://github.com/bccy/paseo-dsh/issues> · npm 包（**上游稳定线**）
 <https://www.npmjs.com/package/paseo-dsh> · 上游插件目录页
-<https://paseo.cafe/plugins/dsh-paseo> · 上游讨论帖
+<https://paseo.sh/plugins/liuxing7954/dsh-paseo> · 上游讨论帖
 <https://github.com/getpaseo/paseo/discussions/6375>
 
 ## 本地开发 / 离线安装

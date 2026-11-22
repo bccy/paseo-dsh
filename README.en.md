@@ -244,7 +244,7 @@ names whatever is missing. Its composition check runs `dsh --dump-config`, which
 Links: this branch's repository <https://github.com/bccy/paseo-dsh> · issues
 <https://github.com/bccy/paseo-dsh/issues> · npm package (**upstream stable line**)
 <https://www.npmjs.com/package/paseo-dsh> · upstream community directory
-<https://paseo.cafe/plugins/dsh-paseo> · upstream discussion
+<https://paseo.sh/plugins/liuxing7954/dsh-paseo> · upstream discussion
 <https://github.com/getpaseo/paseo/discussions/6375>
 
 ## Local development / offline install
