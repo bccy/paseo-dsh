@@ -435,6 +435,11 @@ export interface DshSessionOptions {
    * must not emit any child opened/event (and must not fail the parent either).
    */
   subsession: boolean;
+  /**
+   * ID of the plugin that registered the provider; Paseo accepts this session's
+   * plugin timeline items only under it. Defaults to `dsh-paseo`.
+   */
+  pluginId?: string;
   emit(event: ProviderEvent): void;
   log(line: string): void;
   /**
@@ -3779,7 +3784,7 @@ export class DshSession {
     this.#emitItem({
       type: "plugin",
       id: row.id,
-      pluginId: "dsh-paseo",
+      pluginId: this.#options.pluginId ?? "dsh-paseo",
       kind: "dsh-stream-stats",
       version: 1,
       data: row.data as JsonValue,

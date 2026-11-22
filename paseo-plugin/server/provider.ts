@@ -227,8 +227,69 @@ const POOL_PLACEHOLDER_SESSION_ID = "__paseo_shared_process__";
  */
 const SUBAGENT_REPLAY_READY_BUDGET_MS = 4_000;
 
+/** The plugin ID this provider ships under by default. */
+const DEFAULT_PLUGIN_ID = "dsh-paseo";
+
+/** A catalog read whose inputs changed while it ran; the same read can be retried. */
+class CatalogInputsChangedError extends Error {
+  readonly code = "catalog_inputs_changed";
+
+  constructor() {
+    super("DSH configuration changed while the model list was read; try again / 读取模型列表时 DSH 配置发生了变化，请重试");
+  }
+}
+
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function providerError(error: unknown): { message: string; code?: string } {
+  return error instanceof CatalogInputsChangedError
+    ? { message: error.message, code: error.code }
+    : { message: messageOf(error) };
+}
+
+/** Default error message when a connection's `close()` aborts an in-flight probe. */
+const CONNECTION_CLOSED_MESSAGE = "the provider connection closed / 提供方连接已关闭";
+
+function abortError(signal: AbortSignal): Error {
+  const reason = (signal as { reason?: unknown }).reason;
+  if (reason instanceof Error) return reason;
+  if (typeof reason === "string" && reason !== "") return new Error(reason);
+  return new Error(CONNECTION_CLOSED_MESSAGE);
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError(signal);
+}
+
+/**
+ * Race `work` against an optional `AbortSignal`, cleaning up the listener on
+ * settlement and suppressing any late rejection from `work` after an abort.
+ */
+function raceAbort<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (signal === undefined) return work;
+  if (signal.aborted) {
+    work.catch(() => {});
+    return Promise.reject(abortError(signal));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      work.catch(() => {});
+      reject(abortError(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    work.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 /**
@@ -269,23 +330,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * open at once).
  */
 const CATALOG_CACHE_LIMIT = 4;
-/** One cached catalog, tagged with the cwd it belongs to and when it was read. */
+/** One cached catalog, tagged with the input fingerprint and when it was read. */
 interface CatalogCacheEntry {
   at: number;
+  fingerprint: string;
   value: DisplayCatalog;
 }
 const catalogCache = new Map<string, CatalogCacheEntry>();
 
 /**
- * Read a still-fresh catalog for `cwd` and mark it most recently used.
+ * Read a still-fresh catalog for `cwd` whose input fingerprint matches, and
+ * mark it most recently used.
+ *
+ * Never short-circuits on cwd + TTL alone: an edit to the profile, credentials,
+ * bridge, binary or environment changes `fingerprint` and invalidates the entry
+ * immediately.
  *
  * @param cwd - workspace the catalog describes; the cache is keyed by it.
- * @returns the cached catalog, or undefined when missing/expired.
+ * @param fingerprint - current full input fingerprint from `catalogFingerprint`.
+ * @returns the cached catalog, or undefined when missing, stale, or expired.
  */
-function cachedCatalog(cwd: string): DisplayCatalog | undefined {
+function cachedCatalog(cwd: string, fingerprint: string): DisplayCatalog | undefined {
   const entry = catalogCache.get(cwd);
   if (entry === undefined) return undefined;
-  if (Date.now() - entry.at >= CATALOG_TTL_MS) {
+  if (entry.fingerprint !== fingerprint || Date.now() - entry.at >= CATALOG_TTL_MS) {
     catalogCache.delete(cwd);
     return undefined;
   }
@@ -296,19 +364,41 @@ function cachedCatalog(cwd: string): DisplayCatalog | undefined {
 }
 
 /**
- * Publish one freshly probed catalog and evict the least recently used entry.
+ * Publish one freshly probed catalog under its input fingerprint and evict the
+ * least recently used entry.
  *
  * @param cwd - workspace the catalog was read for.
+ * @param fingerprint - full input fingerprint that produced `value`.
  * @param value - the display catalog to cache.
  */
-function cacheCatalog(cwd: string, value: DisplayCatalog): void {
+function cacheCatalog(cwd: string, fingerprint: string, value: DisplayCatalog): void {
   catalogCache.delete(cwd);
-  catalogCache.set(cwd, { at: Date.now(), value });
+  catalogCache.set(cwd, { at: Date.now(), fingerprint, value });
   while (catalogCache.size > CATALOG_CACHE_LIMIT) {
     const oldest = catalogCache.keys().next().value;
     if (oldest === undefined) return;
     catalogCache.delete(oldest);
   }
+}
+
+/**
+ * Compute the current full catalog input fingerprint for this process.
+ *
+ * Always resolves relative launch paths against `process.cwd()` so `loadCatalog`,
+ * `#prewarmRoute`, `#ensurePoolProcess`, and `#retireIdleStalePool` share one
+ * consistent baseline across workspaces.
+ */
+function currentCatalogFingerprint(): { home: string; profile: string; fingerprint: string } {
+  const home = dshHome(process.env);
+  const profile = profileName(process.env);
+  const fingerprint = catalogFingerprint({
+    home,
+    profile,
+    binary: resolveDshBinary(),
+    env: process.env,
+    cwd: process.cwd(),
+  });
+  return { home, profile, fingerprint };
 }
 
 interface DisplayCatalog {
@@ -369,13 +459,20 @@ const PROBE_EXIT_TIMEOUT_MS = 10_000;
  * profile has one listener, so there is no second process for it to be.
  */
 let profileChildGate: Promise<void> = Promise.resolve();
-function withProfileChildGate<T>(work: () => Promise<T>): Promise<T> {
+function withProfileChildGate<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
   const previous = profileChildGate;
   let release!: () => void;
   profileChildGate = new Promise<void>((resolve) => {
     release = resolve;
   });
-  return previous.then(work).finally(release);
+  const run = previous
+    .then(() => {
+      throwIfAborted(signal);
+      return work();
+    })
+    .finally(release);
+  if (signal === undefined) return run;
+  return raceAbort(run, signal);
 }
 
 /**
@@ -471,6 +568,21 @@ async function awaitPreviousSharedDshRecord(options: {
   }
 }
 
+interface ProfileProbeAccess {
+  awaitResident?: () => Promise<void>;
+  resident?: () => DshProcess | undefined;
+  /** Startup catalog fingerprint of the live shared child, if known. */
+  residentFingerprint?: () => string | undefined;
+  /** Number of active sessions claiming the live shared child. */
+  residentClaims?: () => number;
+  /** Safely retire an idle (zero-claim) shared child and wait for its port to release. */
+  retireIdleResident?: () => Promise<void>;
+  /** Connection-scoped abort signal fired by `close()`. */
+  signal?: AbortSignal;
+  /** Register an in-flight throwaway probe's exit wait so `close()` can await port release. */
+  trackCleanup?: (cleanup: Promise<void>) => void;
+}
+
 /**
  * Run one throwaway probe under the profile-child gate.
  *
@@ -481,40 +593,117 @@ async function awaitPreviousSharedDshRecord(options: {
  * booting a second `dsh` on the same profile is impossible, and the shared child
  * answers the same process-wide requests (catalog, sessions, archive).
  *
- * `awaitResident` runs **outside** the gate: it waits for an in-flight pool spawn
- * to publish, and that spawn holds the gate, so awaiting it inside would
- * deadlock. After it returns, the `resident` re-check inside the gate is the one
- * that decides.
+ * When `expectedFingerprint` is given (catalog reads) and the live shared child
+ * was started under an older fingerprint:
+ * - if it has **no** active session claims (e.g. an untouched prewarm or after
+ *   all sessions closed), it is safely retired outside the gate first so a fresh
+ *   probe can read the updated configuration without colliding on the port;
+ * - if it **does** have active session claims, it is never killed (which would
+ *   break live conversations) and no second `dsh` is spawned beside it (which
+ *   would fail with `EADDRINUSE`); instead we read its live catalog and call
+ *   `onStaleResident` so the caller does not persist stale data under the new
+ *   fingerprint.
  *
- * @param options.cwd - working directory for the probe (or ignored when reusing).
- * @param options.sessionId - sentinel id in logs and the record.
- * @param options.awaitResident - wait for an in-flight pool spawn (class-owned).
- * @param options.resident - the live shared child, when this connection has one.
- * @param options.env - the spawn's environment (default: this process's).
- * @param options.use - one request against whichever child was chosen.
+ * Aborting `signal` stops any throwaway probe spawned by this call (while still
+ * awaiting its exit inside the gate so the port is released before the next
+ * child boots), and detaches from a resident shared child without killing it
+ * (the connection's `close()` shuts the pool down through `#shutdownPool`).
  */
-async function withProfileProbe<T>(options: {
-  cwd: string;
-  sessionId: string;
-  awaitResident?: () => Promise<void>;
-  resident?: () => DshProcess | undefined;
-  env?: Readonly<Record<string, string | undefined>>;
-  use: (child: DshProcess) => Promise<T>;
-}): Promise<T> {
-  if (options.awaitResident !== undefined) await options.awaitResident();
+async function withProfileProbe<T>(
+  options: ProfileProbeAccess & {
+    cwd: string;
+    sessionId: string;
+    env?: Readonly<Record<string, string | undefined>>;
+    expectedFingerprint?: string;
+    onStaleResident?: () => void;
+    use: (child: DshProcess) => Promise<T>;
+  },
+): Promise<T> {
+  throwIfAborted(options.signal);
+  if (options.awaitResident !== undefined) {
+    await raceAbort(options.awaitResident(), options.signal);
+  }
+  throwIfAborted(options.signal);
+
+  if (options.expectedFingerprint !== undefined && options.retireIdleResident !== undefined) {
+    const currentResident = options.resident?.();
+    if (
+      currentResident !== undefined &&
+      currentResident.running &&
+      options.residentFingerprint?.() !== options.expectedFingerprint &&
+      (options.residentClaims?.() ?? 0) === 0
+    ) {
+      await raceAbort(options.retireIdleResident(), options.signal);
+      throwIfAborted(options.signal);
+    }
+  }
+
   return withProfileChildGate(async () => {
+    throwIfAborted(options.signal);
     const resident = options.resident?.();
-    if (resident !== undefined && resident.running) return options.use(resident);
-    await awaitPreviousSharedDshRecord({
-      env: options.env ?? process.env,
-      processProbe: systemProcessProbe(),
-      log: (line) => process.stderr.write(`${line}\n`),
-    });
+    if (resident !== undefined && resident.running) {
+      if (
+        options.expectedFingerprint !== undefined &&
+        options.residentFingerprint?.() !== options.expectedFingerprint
+      ) {
+        options.onStaleResident?.();
+        const claims = options.residentClaims?.() ?? 0;
+        const statusNote =
+          claims > 0
+            ? `still serves ${String(claims)} active session(s)`
+            : "was published concurrently before probing";
+        process.stderr.write(
+          `[${PROVIDER_ID}] the shared dsh (pid ${String(resident.pid)}) was started under an older configuration `
+            + `fingerprint and ${statusNote}; serving its live catalog without `
+            + "caching it under the new fingerprint (close active sessions or reload to pick up profile edits)\n",
+        );
+      }
+      // Never kill the resident shared child on probe abort: it belongs to the
+      // connection pool and may serve active sessions (`close()` retires it via
+      // `#shutdownPool`).
+      return await raceAbort(options.use(resident), options.signal);
+    }
+
+    await raceAbort(
+      awaitPreviousSharedDshRecord({
+        env: options.env ?? process.env,
+        processProbe: systemProcessProbe(),
+        log: (line) => process.stderr.write(`${line}\n`),
+      }),
+      options.signal,
+    );
+    throwIfAborted(options.signal);
+
     const probe = probeProcess(options.cwd, options.sessionId);
+    let resolveCleanup!: () => void;
+    const cleanupDone = new Promise<void>((resolve) => {
+      resolveCleanup = resolve;
+    });
+    options.trackCleanup?.(cleanupDone);
+
+    let rejectStopped!: (reason: unknown) => void;
+    const stopped = new Promise<never>((_, reject) => {
+      rejectStopped = reject;
+    });
+    const onAbort = (): void => {
+      // Kill this exclusive throwaway probe immediately on close(), while the
+      // `finally` block below still awaits `waitForExit` before releasing the
+      // profile child gate.
+      probe.kill();
+      rejectStopped(options.signal === undefined ? new Error(CONNECTION_CLOSED_MESSAGE) : abortError(options.signal));
+    };
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+
     try {
-      await probe.start();
-      return await options.use(probe);
+      if (options.signal?.aborted) {
+        probe.kill();
+        throwIfAborted(options.signal);
+      }
+      const work = probe.start().then(() => options.use(probe));
+      work.catch(() => {});
+      return await (options.signal === undefined ? work : Promise.race([work, stopped]));
     } finally {
+      options.signal?.removeEventListener("abort", onAbort);
       probe.kill();
       const exited = await probe.waitForExit(PROBE_EXIT_TIMEOUT_MS);
       if (!exited) {
@@ -523,8 +712,9 @@ async function withProfileProbe<T>(options: {
             + `${String(PROBE_EXIT_TIMEOUT_MS)} ms of its kill; the next spawn may race its fixed listener port\n`,
         );
       }
+      resolveCleanup();
     }
-  });
+  }, options.signal);
 }
 
 /**
@@ -558,31 +748,31 @@ function isUsableDisplayCatalog(value: unknown): value is DisplayCatalog {
   return true;
 }
 
-/** Read the runtime catalog through a short-lived process and cache it by cwd. */
+/**
+ * Read the runtime catalog: from memory or disk only while the full input
+ * fingerprint matches, otherwise through the profile probe path.
+ *
+ * If the inputs change while the probe runs, the result is discarded (cached
+ * neither in memory nor on disk) and {@link CatalogInputsChangedError} is thrown
+ * so the caller can retry safely.
+ */
 async function loadCatalog(
   cwd: string,
-  access: { awaitResident?: () => Promise<void>; resident?: () => DshProcess | undefined } = {},
+  access: ProfileProbeAccess = {},
 ): Promise<DisplayCatalog> {
-  const cached = cachedCatalog(cwd);
-  if (cached !== undefined) return cached;
-  // The probe boots a whole `dsh` (measured 4.2 s on a real profile), and the
-  // catalog it returns is read-only profile metadata. A cold plugin process —
-  // which is every process after a reload — would otherwise pay that boot again
-  // on its first open, on top of the shared child's own cold boot. The on-disk
-  // entry is used only when its fingerprint (binary, profile composition,
-  // credentials) still matches, and an empty model list is never stored
-  // (`catalog-cache.ts`; FIELD-NOTES 58).
-  const home = dshHome(process.env);
-  const profile = profileName(process.env);
+  throwIfAborted(access.signal);
   let diskPath: string | undefined;
-  let fingerprint: string | undefined;
+  let beforeFingerprint: string | undefined;
   try {
-    fingerprint = catalogFingerprint({ home, profile, binary: resolveDshBinary() });
-    diskPath = catalogCachePath({ home, profile, cwd });
-    const persisted = readCatalogCache<DisplayCatalog>({ path: diskPath, fingerprint });
+    const info = currentCatalogFingerprint();
+    beforeFingerprint = info.fingerprint;
+    diskPath = catalogCachePath({ home: info.home, profile: info.profile, cwd });
+    const inMemory = cachedCatalog(cwd, beforeFingerprint);
+    if (inMemory !== undefined) return inMemory;
+    const persisted = readCatalogCache<DisplayCatalog>({ path: diskPath, fingerprint: beforeFingerprint });
     if (persisted !== undefined) {
       if (isUsableDisplayCatalog(persisted)) {
-        cacheCatalog(cwd, persisted);
+        cacheCatalog(cwd, beforeFingerprint, persisted);
         return persisted;
       }
       process.stderr.write(
@@ -593,21 +783,41 @@ async function loadCatalog(
   } catch (error) {
     // An unreachable cache is not a failed open: report it and probe.
     diskPath = undefined;
-    fingerprint = undefined;
+    beforeFingerprint = undefined;
     process.stderr.write(`[${PROVIDER_ID}] catalog cache unavailable (${messageOf(error)}); reading the runtime\n`);
   }
+
+  throwIfAborted(access.signal);
+  let usedStaleResident = false;
   const raw = await withProfileProbe({
     cwd,
     sessionId: "catalog-probe",
     ...access,
+    ...(beforeFingerprint === undefined ? {} : { expectedFingerprint: beforeFingerprint }),
+    onStaleResident: () => {
+      usedStaleResident = true;
+    },
     use: (child) => child.catalog(),
   });
+  throwIfAborted(access.signal);
   const value = toDisplayCatalog(raw);
-  cacheCatalog(cwd, value);
-  if (diskPath !== undefined && fingerprint !== undefined) {
-    // `writeCatalogCache` refuses an empty model list itself: that answer is the
-    // asynchronous-materialization race, not a fact about the profile.
-    writeCatalogCache({ path: diskPath, fingerprint, catalog: value });
+
+  if (beforeFingerprint !== undefined) {
+    // A file or env change saved while DSH was reading may or may not be in
+    // this answer, so cache it under neither fingerprint and ask the caller to
+    // retry.
+    const afterFingerprint = currentCatalogFingerprint().fingerprint;
+    if (afterFingerprint !== beforeFingerprint) {
+      throw new CatalogInputsChangedError();
+    }
+    if (!usedStaleResident) {
+      cacheCatalog(cwd, beforeFingerprint, value);
+      if (diskPath !== undefined) {
+        // `writeCatalogCache` refuses an empty model list itself: that answer is the
+        // asynchronous-materialization race, not a fact about the profile.
+        writeCatalogCache({ path: diskPath, fingerprint: beforeFingerprint, catalog: value });
+      }
+    }
   }
   return value;
 }
@@ -628,7 +838,7 @@ async function loadCatalog(
 async function listDshSessions(
   probeCwd: string,
   options: { cwd?: string; query?: string; limit?: number },
-  access: { awaitResident?: () => Promise<void>; resident?: () => DshProcess | undefined } = {},
+  access: ProfileProbeAccess = {},
 ): Promise<Array<{ sessionId: string; cwd?: string; title?: string; createdAt?: number }>> {
   return withProfileProbe({
     cwd: probeCwd,
@@ -656,7 +866,7 @@ async function listDshSessions(
 async function applyArchivedStandalone(
   dshSessionId: string,
   archived: boolean,
-  access: { awaitResident?: () => Promise<void>; resident?: () => DshProcess | undefined } = {},
+  access: ProfileProbeAccess = {},
 ): Promise<void> {
   await withProfileProbe({
     cwd: process.cwd(),
@@ -771,7 +981,11 @@ class DshConnection implements ProviderConnection {
    * {@link #openTransaction}.
    */
   readonly #openingProviders = new Map<string, { nativeId: string; closed: boolean }>();
-  #display: DisplayCatalog | undefined;
+  readonly #pluginId: string;
+  /** Aborted by `close()`, which stops this connection's in-flight probes. */
+  readonly #stopProbes = new AbortController();
+  /** Exclusive throwaway probe exit waits, awaited by `close()` so ports are released. */
+  readonly #activeProbeCleanups = new Set<Promise<void>>();
   #closed = false;
   /**
    * The one DeepSeek Harness process this connection shares between its sessions.
@@ -820,6 +1034,8 @@ class DshConnection implements ProviderConnection {
    * three are removed before `spawn` (`dsh-process.ts`).
    */
   #poolEnv: Record<string, string> | undefined;
+  /** Catalog input fingerprint captured when `#pooled` was spawned. */
+  #poolFingerprint: string | undefined;
   /**
    * The cross-process record of the shared child this connection spawned.
    *
@@ -898,8 +1114,9 @@ class DshConnection implements ProviderConnection {
    */
   #rewindSeq = 0;
 
-  constructor(capabilities: readonly string[]) {
+  constructor(capabilities: readonly string[], pluginId: string = DEFAULT_PLUGIN_ID) {
     this.capabilities = capabilities;
+    this.#pluginId = pluginId;
   }
 
   /**
@@ -955,17 +1172,17 @@ class DshConnection implements ProviderConnection {
     try {
       await this.#dispatch(input);
     } catch (error) {
-      const message = messageOf(error);
       if ("requestId" in input && typeof input.requestId === "string") {
-        this.#emit({ type: "request.failed", requestId: input.requestId, error: { message } });
+        this.#emit({ type: "request.failed", requestId: input.requestId, error: providerError(error) });
       } else if ("sessionId" in input && typeof input.sessionId === "string") {
-        this.#emit({ type: "session.runtime_failed", sessionId: input.sessionId, error: { message } });
+        this.#emit({ type: "session.runtime_failed", sessionId: input.sessionId, error: { message: messageOf(error) } });
       }
     }
   }
 
   async close(): Promise<void> {
     this.#closed = true;
+    this.#stopProbes.abort();
     // Deregister before the awaits below: `readAgentJobs` must never walk a
     // connection that is tearing down, and a close that throws partway through
     // would otherwise leave it registered for the life of the process.
@@ -982,6 +1199,11 @@ class DshConnection implements ProviderConnection {
     // not outlive the connection that spawned it (a daemon reload would otherwise
     // leave an orphan holding every session log's write lock).
     await this.#shutdownPool();
+    // Also wait for any exclusive throwaway probe that `close()` aborted to be
+    // reaped so the profile's fixed port is released before `close()` returns.
+    if (this.#activeProbeCleanups.size > 0) {
+      await Promise.allSettled([...this.#activeProbeCleanups]);
+    }
   }
 
   /**
@@ -1079,9 +1301,7 @@ class DshConnection implements ProviderConnection {
    *   catalog (or the profile declares no default at all).
    */
   #prewarmRoute(): DshRoute | undefined {
-    const home = dshHome(process.env);
-    const profile = profileName(process.env);
-    const fingerprint = catalogFingerprint({ home, profile, binary: resolveDshBinary() });
+    const { home, fingerprint } = currentCatalogFingerprint();
     // No `profile` argument: the fingerprint already hashes this profile's
     // composition files, which is what scopes an entry to a profile
     // (`catalog-cache.ts#readAnyCatalogCache`).
@@ -1114,6 +1334,7 @@ class DshConnection implements ProviderConnection {
     // child inherit a debt it never took on.
     this.#pooled = undefined;
     this.#poolEnv = undefined;
+    this.#poolFingerprint = undefined;
     this.#poolPrewarmed = false;
     if (pooled.pid !== undefined) {
       SERVING_SHARED_DSH.delete(pooled.pid);
@@ -1130,8 +1351,28 @@ class DshConnection implements ProviderConnection {
    * `awaitResident` half waits for an in-flight spawn to publish, and is called
    * outside the spawn gate by design (the spawn holds it).
    */
-  #probeAccess(): { awaitResident: () => Promise<void>; resident: () => DshProcess | undefined } {
-    return { awaitResident: () => this.#awaitPoolSpawn(), resident: () => this.#livePoolProcess() };
+  #probeAccess(): ProfileProbeAccess {
+    return {
+      awaitResident: () => this.#awaitPoolSpawn(),
+      resident: () => this.#livePoolProcess(),
+      residentFingerprint: () => this.#poolFingerprint,
+      residentClaims: () => {
+        const pooled = this.#livePoolProcess();
+        return pooled === undefined ? 0 : this.#claimsOf(pooled);
+      },
+      retireIdleResident: async () => {
+        const pooled = this.#livePoolProcess();
+        if (pooled === undefined || this.#claimsOf(pooled) > 0) return;
+        await this.#shutdownPool();
+      },
+      signal: this.#stopProbes.signal,
+      trackCleanup: (cleanup) => {
+        this.#activeProbeCleanups.add(cleanup);
+        void cleanup.finally(() => {
+          this.#activeProbeCleanups.delete(cleanup);
+        });
+      },
+    };
   }
 
   /**
@@ -1227,6 +1468,7 @@ class DshConnection implements ProviderConnection {
       return { process: shared, reused: !this.#prewarmSpawn };
     }
     const spawnTask = (async (): Promise<DshProcess> => withProfileChildGate(async (): Promise<DshProcess> => {
+      if (this.#closed) throw new Error("the provider connection is closed");
       // Nothing is spawned before the *previous* plugin process's shared child is
       // provably gone. That child belongs to another OS process, so the pool's
       // own accounting cannot see it; its owner was stopped on Paseo's 2 s budget
@@ -1234,6 +1476,13 @@ class DshConnection implements ProviderConnection {
       // `webserver` bound the profile's fixed port. A child spawned into that
       // window dies at profile boot with `listen EADDRINUSE`.
       await this.#awaitPreviousSharedDsh(options.env);
+      if (this.#closed) throw new Error("the provider connection is closed");
+      let spawnFingerprint: string | undefined;
+      try {
+        spawnFingerprint = currentCatalogFingerprint().fingerprint;
+      } catch {
+        spawnFingerprint = undefined;
+      }
       // A placeholder id, not a real conversation: `DshProcess` attaches its
       // constructor id at construction, and `start()` initializes that id. The
       // point of that initialize is to compose the LLM adapters and validate the
@@ -1279,6 +1528,7 @@ class DshConnection implements ProviderConnection {
         // A child that never came up must not be left in the field: the next
         // acquire has to try again instead of reusing a corpse.
         child.kill();
+        await child.waitForExit(PROBE_EXIT_TIMEOUT_MS);
         throw error;
       }
       // Published **inside** the gate: a probe that acquires the gate next must
@@ -1286,6 +1536,7 @@ class DshConnection implements ProviderConnection {
       // second one into the same profile port one microtask later.
       if (this.#closed) {
         child.kill();
+        await child.waitForExit(PROBE_EXIT_TIMEOUT_MS);
         throw new Error("the provider connection is closed");
       }
       this.#pooled = child;
@@ -1300,6 +1551,7 @@ class DshConnection implements ProviderConnection {
       // retirement decision cannot depend on that microtask race.
       this.#poolPrewarmed = this.#prewarmSpawn;
       this.#poolEnv = { ...options.env };
+      this.#poolFingerprint = spawnFingerprint;
       return child;
     }))();
     this.#poolSpawn = spawnTask;
@@ -1345,12 +1597,21 @@ class DshConnection implements ProviderConnection {
     // first open's environment deterministic (FIELD-NOTES 34, verify round 2).
     if (this.#prewarmSpawn) await this.#awaitPoolSpawn();
     await this.#retireUnusedPrewarmFor(options.env);
+    await this.#retireIdleStalePool();
     const { process, reused } = await this.#ensurePoolProcess(options);
+    // Claim in the same synchronous tick as `#ensurePoolProcess` settles so no
+    // concurrent `#retireIdleStalePool()` or catalog probe can see `claims === 0`
+    // and retire this child while `pinRoute()` awaits.
+    this.#addPoolClaim(process);
     // A prewarmed child was spawned before any session existed, so its route may
     // be deferred (`deferRoute`); the first session pins its own before the
     // session's `initialize` is sent. A no-op for every other child.
-    await process.pinRoute(options.route);
-    this.#addPoolClaim(process);
+    try {
+      await process.pinRoute(options.route);
+    } catch (error) {
+      this.#releasePoolProcess(process);
+      throw error;
+    }
     // `reused` is the acquire's answer, and it now means exactly one thing: this
     // session joined a child that has served conversations. Both no-service cases
     // are classified there — the completed prewarm (`#poolPrewarmed`) and its
@@ -1390,6 +1651,31 @@ class DshConnection implements ProviderConnection {
     process.stderr.write(
       `[${PROVIDER_ID}] the prewarmed shared dsh (pid ${String(pooled.pid)}) was spawned before this session existed, and this `
         + `session's env sets ${differing.join(", ")}: retiring it so the session's environment applies to the child it gets\n`,
+    );
+    await this.#shutdownPool();
+  }
+
+  /**
+   * Retire an idle shared child (zero active sessions) whose startup catalog
+   * fingerprint no longer matches the current configuration.
+   *
+   * Never touches a child that still serves active sessions (`#claimsOf > 0`):
+   * killing it would tear down live conversations.
+   */
+  async #retireIdleStalePool(): Promise<void> {
+    const pooled = this.#livePoolProcess();
+    if (pooled === undefined || this.#claimsOf(pooled) > 0) return;
+    if (this.#poolFingerprint === undefined) return;
+    let current: string;
+    try {
+      current = currentCatalogFingerprint().fingerprint;
+    } catch {
+      return;
+    }
+    if (current === this.#poolFingerprint) return;
+    process.stderr.write(
+      `[${PROVIDER_ID}] the idle shared dsh (pid ${String(pooled.pid)}) was started under an older configuration `
+        + "fingerprint; retiring it before opening the next session so the updated profile takes effect\n",
     );
     await this.#shutdownPool();
   }
@@ -1712,6 +1998,7 @@ class DshConnection implements ProviderConnection {
     const pooled = this.#pooled;
     this.#pooled = undefined;
     this.#poolEnv = undefined;
+    this.#poolFingerprint = undefined;
     if (pooled === undefined) return;
     if (pooled.pid !== undefined) {
       // Retiring, not gone: a spawn that lands before the reap must wait for it,
@@ -1761,6 +2048,7 @@ class DshConnection implements ProviderConnection {
     this.#pooled = undefined;
     this.#poolSpawn = undefined;
     this.#poolEnv = undefined;
+    this.#poolFingerprint = undefined;
     // The child is gone, so every claim on it is void: the sessions that held
     // them are dead too (each was told through `#exitAll`). Dropping only this
     // child's entry keeps any older child's claims intact for their own release.
@@ -2126,7 +2414,12 @@ class DshConnection implements ProviderConnection {
   async #catalog(requestId: string, cwd: string | undefined): Promise<void> {
     try {
       const display = await loadCatalog(cwd ?? process.cwd(), this.#probeAccess());
-      this.#display = display;
+      // A closed connection publishes no catalog, not even one read just before
+      // it closed.
+      if (this.#closed || this.#stopProbes.signal.aborted) {
+        throwIfAborted(this.#stopProbes.signal);
+        return;
+      }
       this.#emit({ type: "catalog", requestId, catalog: display.defaults });
     } catch (error) {
       // A failed probe must still answer the request. Leaving it unanswered
@@ -2136,7 +2429,7 @@ class DshConnection implements ProviderConnection {
       this.#emit({
         type: "request.failed",
         requestId,
-        error: { message: messageOf(error) },
+        error: providerError(error),
       });
     }
   }
@@ -2339,8 +2632,9 @@ class DshConnection implements ProviderConnection {
     // dropped. The second check inside the transaction covers a teardown that
     // lands while the open is in flight.
     this.#assertConnected();
-    const display = this.#display ?? (await loadCatalog(config.cwd, this.#probeAccess()));
-    this.#display = display;
+    // Read through the fingerprinted cache rather than reusing a connection-wide
+    // snapshot, so thinking options and modes reflect the profile as it is now.
+    const display = await loadCatalog(config.cwd, this.#probeAccess());
     // The catalog load awaits, so the claim taken by `#openTransaction` is
     // re-checked before anything is torn down or spawned on its behalf.
     this.#assertOpening(sessionId, opening);
@@ -2514,6 +2808,7 @@ class DshConnection implements ProviderConnection {
         // it did not, the host cannot accept a child and the session must stay
         // root-only rather than fail the whole connection.
         subsession: this.capabilities.includes("session.subsession"),
+        pluginId: this.#pluginId,
         emit: (event) => this.#emit(event),
         log: (line) => {
           process.stderr.write(`[${PROVIDER_ID}] ${line}\n`);
@@ -3415,8 +3710,18 @@ async function inspectDshInstallation({ signal }: { signal: AbortSignal }): Prom
   }
 }
 
+export interface DshProviderOptions {
+  /**
+   * ID of the plugin that registers this provider. Paseo accepts a plugin's
+   * timeline items only under that plugin's own ID, so a plugin that reuses
+   * this provider must pass its ID. Defaults to `dsh-paseo`.
+   */
+  pluginId?: string;
+}
+
 /** The provider registration Paseo installs for `dsh --profile paseo`. */
-export function createDshProvider(): ProviderRegistration {
+export function createDshProvider(options: DshProviderOptions = {}): ProviderRegistration {
+  const pluginId = options.pluginId ?? DEFAULT_PLUGIN_ID;
   return {
     id: PROVIDER_ID,
     label: "DeepSeek Harness",
@@ -3427,7 +3732,7 @@ export function createDshProvider(): ProviderRegistration {
     },
     async connect(request) {
       const capabilities = negotiateProviderCapabilities(request.capabilities, CAPABILITIES);
-      const connection = new DshConnection(capabilities);
+      const connection = new DshConnection(capabilities, pluginId);
       // Registered here rather than in the constructor so a connection that is
       // never handed to the daemon cannot be observed; `close()` deregisters it,
       // which is what keeps a reload from leaving dead connections behind for

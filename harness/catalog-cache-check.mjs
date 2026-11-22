@@ -188,6 +188,37 @@ console.log("\nthe on-disk catalog cache is used by the next process, and only w
     const moved = cacheModule.catalogFingerprint({ home: cacheHome, profile: profileName, binary });
     return moved !== fingerprint && cacheModule.readCatalogCache({ path: cachePath, fingerprint: moved }) === undefined;
   })());
+  check("…a home-level cordis.patch.yml edit invalidates it", (() => {
+    const before = cacheModule.catalogFingerprint({ home: cacheHome, profile: profileName, binary });
+    writeFileSync(join(cacheHome, "cordis.patch.yml"), "- id: home-extra\n");
+    const after = cacheModule.catalogFingerprint({ home: cacheHome, profile: profileName, binary });
+    return after !== before;
+  })());
+  check("…a shared bridge directory edit invalidates it", (() => {
+    const sharedBridgeDir = join(cacheHome, "profiles", "node_modules", "dsh-paseo-bridge");
+    mkdirSync(sharedBridgeDir, { recursive: true });
+    writeFileSync(join(sharedBridgeDir, "index.js"), "module.exports = 1;\n");
+    const before = cacheModule.catalogFingerprint({ home: cacheHome, profile: profileName, binary });
+    writeFileSync(join(sharedBridgeDir, "index.js"), "module.exports = 2;\n");
+    const after = cacheModule.catalogFingerprint({ home: cacheHome, profile: profileName, binary });
+    return after !== before;
+  })());
+  check("…an env change invalidates it without leaking secret values into the fingerprint", (() => {
+    const secret = "harness-secret-token-xyz";
+    const before = cacheModule.catalogFingerprint({ home: cacheHome, profile: profileName, binary, env: { ...process.env } });
+    const after = cacheModule.catalogFingerprint({
+      home: cacheHome,
+      profile: profileName,
+      binary,
+      env: { ...process.env, HARNESS_FAKE_KEY: secret },
+    });
+    return after !== before && !after.includes(secret);
+  })());
+  check("…a different profile name produces a different fingerprint", (() => {
+    const a = cacheModule.catalogFingerprint({ home: cacheHome, profile: profileName, binary });
+    const b = cacheModule.catalogFingerprint({ home: cacheHome, profile: "other-profile", binary });
+    return a !== b;
+  })());
   check("…a corrupt file is ignored, not fatal", (() => {
     writeFileSync(cachePath, "{ this is not json");
     return cacheModule.readCatalogCache({ path: cachePath, fingerprint }) === undefined;
