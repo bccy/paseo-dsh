@@ -48,6 +48,8 @@ const pluginTests = [
   'test/question-answer.test.cjs',
   'test/process.test.cjs',
   'test/dsh-plugins.test.cjs',
+  'test/paseo-0171.test.cjs',
+  'test/paseo-0173.test.cjs',
 ];
 const inventory = [
   'typecheck', 'bridge syntax', ...sourceChecks, ...compiledChecks,

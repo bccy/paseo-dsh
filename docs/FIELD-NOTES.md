@@ -4734,3 +4734,20 @@ DSH 自己的解析（`@deepseek-ai/dsh-app-boot/src/profile.ts:629-637` `packag
 先红后绿（前四条里共享/安装/优先三条在旧实现上红，profile 与真缺失两条是既有行为的对照）。
 真实 profile 只读清单（`new DshPlugins().list()` + 逐包 `resolveBundlePackage()`）11/11 行
 installed，0 行 missing，5 个官方包 version `0.2.2-rc.3`、origin `installation`。
+
+### 118. Paseo 0.17.3 扫描内嵌桥时耗尽调用栈
+
+2026-11-24，本机从 Paseo 0.17.1 升到 0.17.3 后，daemon 仍在运行，`dsh-paseo` 加载失败，
+`deepseek-harness-native` 未能注册。宿主报 `paseo-plugin-server-runtime-boundary` 的
+`Maximum call stack size exceeded`。用 0.17.3 的 `compileDirectoryPlugin` 对照编译，升级前
+的提交 `fe97ecc` 连同 0.17.1 SDK 也报同样的错。升级期间的 provider 改动无需参与复现。
+
+第 47 条为防止工作区 diff 卡住，把 Base64 切成 76 字符一行，再用 `+` 串起来。0.17.3 的
+`compiler-imports.js` 用 `ts.forEachChild` 递归扫描语法树，长串二元表达式耗尽了调用栈。
+生成器保留分块，将长字符串改为数组 `.join("")`。24 个桥文件和配置模板的载荷保持一致，
+最长行 85 字符。升级验收需要用目标宿主的编译器打包服务端和客户端入口，`tsc --noEmit`
+与仓库自己的 `plugin-build.cjs` 走的是不同的编译路径。
+
+恢复时只重载 `dsh-paseo`。0.17.3 的宿主编译通过，daemon worker PID 保持一致，插件状态
+恢复为 `running`，模型目录返回 5 个模型，原会话历史可读取。通过生产 provider 发起的新会话
+完成了真实模型回合。

@@ -66,9 +66,9 @@ function literal(value, indent) {
   if (value.length <= BRIDGE_ASSET_CHUNK) return JSON.stringify(value);
   const chunks = [];
   for (let at = 0; at < value.length; at += BRIDGE_ASSET_CHUNK) {
-    chunks.push(`${indent}${JSON.stringify(value.slice(at, at + BRIDGE_ASSET_CHUNK))}`);
+    chunks.push(`${indent}  ${JSON.stringify(value.slice(at, at + BRIDGE_ASSET_CHUNK))},`);
   }
-  return chunks.join(" +\n");
+  return [`${indent}[`, ...chunks, `${indent}].join("")`].join("\n");
 }
 
 const expected = [
@@ -113,15 +113,13 @@ check("and no line is long enough to make its diff quadratic", longest <= 200, `
 // them what they forgot.
 if (actual !== expected) {
   const block = /export const BRIDGE_FILES[^{]*\{([\s\S]*?)\n\};/.exec(actual)?.[1] ?? "";
-  // An entry is a key followed by one or more concatenated string chunks, so the
-  // value has to be joined back together before it can be compared.
+  // Entries use a single string or a joined array of Base64 chunks.
+  const value = String.raw`("[A-Za-z0-9+/=]*"|\[\s*(?:"[A-Za-z0-9+/=]*",\s*)*\]\.join\(""\))`;
   const entries = new Map();
-  for (const [, key, body] of block.matchAll(
-    /^\s*("(?:[^"\\]|\\.)*"):\s*((?:"(?:[^"\\]|\\.)*"(?:\s*\+)?\s*)+),/gm,
-  )) {
+  for (const [, key, body] of block.matchAll(new RegExp(String.raw`^\s*("(?:[^"\\]|\\.)*"):\s*${value},`, "gm"))) {
     entries.set(
       JSON.parse(key),
-      [...body.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map(([, text]) => text).join(""),
+      [...body.matchAll(/"([A-Za-z0-9+/=]*)"/g)].map(([, text]) => text).join(""),
     );
   }
   const drifted = [];
@@ -133,13 +131,13 @@ if (actual !== expected) {
   for (const path of entries.keys()) {
     if (!bridgeFiles.some(([bridgePath]) => bridgePath === path)) drifted.push(`${path} (no such file under dsh-bridge/)`);
   }
-  const templateBody = /PROFILE_PATCH_TEMPLATE_BASE64\s*=\s*((?:"(?:[^"\\]|\\.)*"(?:\s*\+)?\s*)+);/.exec(actual)?.[1];
+  const templateBody = new RegExp(String.raw`PROFILE_PATCH_TEMPLATE_BASE64\s*=\s*${value};`).exec(actual)?.[1];
   const template =
     templateBody === undefined
       ? undefined
-      : [...templateBody.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map(([, text]) => text).join("");
-  if (template !== undefined && template !== b64(patchTemplate)) {
-    drifted.push("templates/cordis.patch.yml (content differs)");
+      : [...templateBody.matchAll(/"([A-Za-z0-9+/=]*)"/g)].map(([, text]) => text).join("");
+  if (template !== b64(patchTemplate)) {
+    drifted.push(`templates/cordis.patch.yml (${template === undefined ? "absent from the assets" : "content differs"})`);
   }
   check("the drift is attributable to a named file", drifted.length > 0, drifted.join(", ") || "(nothing identified)");
 }

@@ -46,7 +46,7 @@ const patchTemplate = readFileSync(templateFile, "utf8");
 const b64 = (value) => Buffer.from(value, "utf8").toString("base64");
 
 /**
- * Base64 as a concatenation of short string chunks, one per line.
+ * Base64 as an array of short string chunks, one per line.
  *
  * Emitting one string per file made a single ~77 KB line, and every commit that
  * touched the bridge produced a diff of a dozen lines in which *one line was
@@ -55,15 +55,17 @@ const b64 = (value) => Buffer.from(value, "utf8").toString("base64");
  * 77318² is 6.0e9 cells, ~22 GB of table. Paseo's checkout-diff panel froze on
  * it. Chunked like a PEM body the longest line is 76 characters, so a
  * regenerated bridge reads as many short changed lines — linear work.
+ * Joining the array also keeps the syntax tree shallow for Paseo's recursive
+ * import scan. A long chain of `+` expressions overflows its call stack.
  */
 const BRIDGE_ASSET_CHUNK = 76;
 function literal(value, indent) {
   if (value.length <= BRIDGE_ASSET_CHUNK) return JSON.stringify(value);
   const chunks = [];
   for (let at = 0; at < value.length; at += BRIDGE_ASSET_CHUNK) {
-    chunks.push(`${indent}${JSON.stringify(value.slice(at, at + BRIDGE_ASSET_CHUNK))}`);
+    chunks.push(`${indent}  ${JSON.stringify(value.slice(at, at + BRIDGE_ASSET_CHUNK))},`);
   }
-  return chunks.join(" +\n");
+  return [`${indent}[`, ...chunks, `${indent}].join("")`].join("\n");
 }
 
 const lines = [

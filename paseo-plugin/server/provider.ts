@@ -881,7 +881,7 @@ async function applyArchivedStandalone(
   });
 }
 
-function toDisplayCatalog(raw: DshCatalog): DisplayCatalog {
+export function toDisplayCatalog(raw: DshCatalog): DisplayCatalog {
   const providerName = new Map(raw.providers.map((entry) => [entry.id, entry.name]));
   const models: ProviderModel[] = raw.models.map((model) => {
     const thinkingOptions = (model.reasoning?.efforts ?? []).map((effort) => ({
@@ -889,18 +889,28 @@ function toDisplayCatalog(raw: DshCatalog): DisplayCatalog {
       label: effortLabel(effort.id, effort.name),
       ...(effort.description === undefined ? {} : { description: effort.description }),
     }));
+    // Paseo >= 0.17.3 (#10524) stopped falling back from a model's own
+    // `thinkingOptions` to the catalog-wide `defaultThinkingOption`. When a
+    // model declares thinking options without a model-level default, carry the
+    // global `defaultReasoningEffort` down if the model actually supports it.
+    const defaultThinkingOptionId =
+      thinkingOptions.length === 0
+        ? undefined
+        : model.reasoning?.defaultEffort !== undefined
+          ? thinkingOptions.some((option) => option.id === model.reasoning?.defaultEffort)
+            ? model.reasoning.defaultEffort
+            : thinkingOptions[0]?.id
+          : raw.defaultReasoningEffort !== undefined &&
+              raw.defaultReasoningEffort !== null &&
+              thinkingOptions.some((option) => option.id === raw.defaultReasoningEffort)
+            ? raw.defaultReasoningEffort
+            : undefined;
     return {
       // `provider/model` survives the round trip because DSH model ids carry no slash.
       id: `${model.provider}/${model.id}`,
       label: model.name,
       description: providerName.get(model.provider) ?? model.provider,
-      ...(model.reasoning?.defaultEffort === undefined || thinkingOptions.length === 0
-        ? {}
-        : {
-            defaultThinkingOptionId: thinkingOptions.some((option) => option.id === model.reasoning?.defaultEffort)
-              ? model.reasoning.defaultEffort
-              : thinkingOptions[0]?.id,
-          }),
+      ...(defaultThinkingOptionId === undefined ? {} : { defaultThinkingOptionId }),
       ...(thinkingOptions.length === 0 ? {} : { thinkingOptions }),
     };
   });
@@ -3719,6 +3729,9 @@ export interface DshProviderOptions {
   pluginId?: string;
 }
 
+/** Provider documentation link rendered on Paseo >= 0.17.2's provider settings page. */
+const DSH_DOCS_URL = "https://github.com/bccy/paseo-dsh#readme";
+
 /** The provider registration Paseo installs for `dsh --profile paseo`. */
 export function createDshProvider(options: DshProviderOptions = {}): ProviderRegistration {
   const pluginId = options.pluginId ?? DEFAULT_PLUGIN_ID;
@@ -3726,6 +3739,7 @@ export function createDshProvider(options: DshProviderOptions = {}): ProviderReg
     id: PROVIDER_ID,
     label: "DeepSeek Harness",
     icon: "icon.svg",
+    docsUrl: DSH_DOCS_URL,
     installation: {
       installUrl: DSH_INSTALL_URL,
       inspect: ({ signal }) => inspectDshInstallation({ signal }),
