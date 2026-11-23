@@ -145,6 +145,12 @@ export interface RowStatusIconProps {
   colors: RowStatusIconColors;
   /** Smoothly rotate the base glyph while running (used for thinking petals). */
   spinBase?: boolean;
+  /**
+   * Surface behind the icon so the bottom-right corner badge knocks out
+   * cleanly when mounted on an elevated card (e.g. `colors.surface1`).
+   * Defaults to `colors.surface0`.
+   */
+  backdropColor?: string;
   children: ReactNode;
 }
 
@@ -345,6 +351,7 @@ export function RowStatusIcon({
   size,
   colors,
   spinBase = false,
+  backdropColor,
   children,
 }: RowStatusIconProps): ReactElement {
   // Track previous status in state (React's render-phase derived transition
@@ -366,6 +373,7 @@ export function RowStatusIcon({
   }
 
   const metrics = cornerBadgeMetrics(size);
+  const backdrop = backdropColor ?? colors.surface0;
   const successColor = colors.statusSuccess ?? FALLBACK_SUCCESS_COLOR;
   const dangerColor = colors.statusDanger ?? FALLBACK_DANGER_COLOR;
 
@@ -376,7 +384,7 @@ export function RowStatusIcon({
     width: metrics.frame,
     height: metrics.frame,
     borderRadius: metrics.frame / 2,
-    backgroundColor: colors.surface0,
+    backgroundColor: backdrop,
     alignItems: "center" as const,
     justifyContent: "center" as const,
   };
@@ -398,8 +406,8 @@ export function RowStatusIcon({
         <StatusRingMark
           size={metrics.frame}
           ring={metrics.ring}
-          color={ringColorFor(colors.surface0)}
-          backdrop={colors.surface0}
+          color={ringColorFor(backdrop)}
+          backdrop={backdrop}
         />
       </View>
     );
@@ -442,7 +450,7 @@ export function RowStatusIcon({
             <Image
               source={{ uri: ERROR_BADGE_ICON }}
               style={{ width: metrics.errorGlyph, height: metrics.errorGlyph }}
-              tintColor={colors.surface0}
+              tintColor={backdrop}
             />
           </View>
         </PopBadge>

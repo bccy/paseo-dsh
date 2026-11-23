@@ -26,8 +26,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Image, Pressable, ScrollView, Text, View } from "react-native";
 import {
   EXPANDED_MAX_HEIGHT_DEFAULT,
+  THINKING_STYLE_DEFAULT,
   TIMELINE_STYLE_DEFAULTS,
+  isThinkingStyleChoice,
   timelineStyleSettings,
+  type ThinkingStyleChoice,
 } from "../shared/settings";
 import { normalizeRowTimestamp, noteRender } from "./newest";
 import {
@@ -39,6 +42,7 @@ import {
 } from "./row-entrance";
 import { RowStatusIcon, resolveThinkingIconStatus } from "./row-status-icon";
 import { TextShimmer } from "./text-shimmer";
+import { EnhancedThinkingView } from "./thinking-styles";
 import { reasoningPreview, streamingTail } from "./thinking-text";
 import { BODY_INDENT, ROW_FONT_SIZE, ROW_GAP, ROW_LINE_HEIGHT } from "./tokens";
 import { useLocaleText } from "./use-locale";
@@ -129,6 +133,9 @@ export function InlineThinking({
     typeof (style as { expandedMaxHeight?: unknown }).expandedMaxHeight === "number"
       ? (style as { expandedMaxHeight: number }).expandedMaxHeight
       : EXPANDED_MAX_HEIGHT_DEFAULT;
+  const thinkingStyle: ThinkingStyleChoice = isThinkingStyleChoice(style.thinkingStyle)
+    ? style.thinkingStyle
+    : THINKING_STYLE_DEFAULT;
   const [rowWidth, setRowWidth] = useState(0);
   const [labelWidth, setLabelWidth] = useState(0);
   const lineWidth = Math.max(
@@ -216,6 +223,38 @@ export function InlineThinking({
     };
   }, [theme, layout.compact, growing, style, expandedMaxHeight]);
 
+  const toggleOpen = () => setManual((value) => !(value ?? false));
+
+  if (thinkingStyle !== "classic") {
+    return (
+      <RowEntrance
+        agentId={agentId}
+        timestamp={timestamp}
+        rowKey={rowKey}
+        liveHint={phase === "streaming" || growing}
+      >
+        <EnhancedThinkingView
+          variant={thinkingStyle}
+          text={text}
+          growing={growing}
+          open={open}
+          onToggle={toggleOpen}
+          onCollapse={collapseBody}
+          colors={theme.colors}
+          compact={layout.compact}
+          iconUri={THINK_ICON}
+          iconSize={THINK_ICON_SIZE}
+          rowMarginY={style.rowMarginY}
+          rowPaddingY={style.toolRowPaddingY}
+          rowMinHeight={style.toolRowMinHeight}
+          rowGap={style.toolRowGap}
+          expandedMaxHeight={expandedMaxHeight}
+          copy={copy}
+        />
+      </RowEntrance>
+    );
+  }
+
   return (
     <RowEntrance
       agentId={agentId}
@@ -230,7 +269,7 @@ export function InlineThinking({
         <Pressable
           accessibilityRole="button"
           accessibilityLabel={open ? copy.collapseThinking : copy.expandThinking}
-          onPress={() => setManual((value) => !(value ?? false))}
+          onPress={toggleOpen}
           style={styles.row}
           onLayout={(event) => setRowWidth(event.nativeEvent.layout.width)}
         >

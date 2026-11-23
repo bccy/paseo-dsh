@@ -231,13 +231,15 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
       `TOOL_CONTEXT_UNAVAILABLE`（rc.3 新增）、`UNKNOWN_TOOL`。`errorName` 只在展开区
       （灰色 `code（name）`），`errorReason` 只在结果文本为空时兜底。**动了失败行的 metadata、
       `toolFailures` 表或 `tool-call.tsx` 的 hint 分支必跑。**
-- `harness/thinking-check.cjs` — 思考行折叠预览：结束后取**第一行**、运行中取最后一个首行已终结
-  的段落（都是 DSH 的行为，逐字移植在 `client/thinking-text.ts`），以及折叠行在流式中的宽度
-  接线（行测自己的宽度、标签测自己要减掉的那段、行宽由两者相减得出，`useRevealedText` 不许
-  再接管文本节奏）。**它不断言行标题**：标题恒为 `思考` 是 `client/locale.ts` 标签表里的一个键，
-  由 `harness/locale-check.cjs` 的整表遍历覆盖——改坏了标题，这个脚本不会红。
-  **动了思考行显示必跑。** 运行步骤现在需要同时编译 `client/inline-thinking.tsx`
-  （`--jsx react-jsx --noCheck`），见文件头。
+- `harness/thinking-check.cjs` — 思考行折叠预览与多样式渲染：结束后取**第一行**、运行中取最后一个首行已终结
+  的段落（`client/thinking-text.ts`）、折叠行流式宽度接线与防抖 settle 状态机；同时断言 5 套可选思考行
+  样式的纯解析函数（`parseThinkingSections`、`parseInlineRuns`、`thinkingHeadline`、`thinkingPeekTail`、
+  `formatThinkingDuration`）以及全部 6 套样式（`classic` / `rail` / `silk` / `capsule` / `stepper` / `editorial`）
+  在真实编译组件下的流式/展开/收起/复制与 Native 动画清理闭环。**动了思考行显示、样式切换或文本解析必跑。**
+- `harness/row-status-icon-check.cjs` — 工具行与思考行左侧动态状态图标（`client/row-status-icon.tsx`、
+  `client/row-status-icon-data.ts`）：状态映射、完成态弹出判定、16px/14px 几何尺寸、48×48 PNG 角标资源、
+  Web CSS 注入与 Native `Animated` 启停清理、`backdropColor` 卡片底色镂空（供柔雾思考舱等抬升表面使用），
+  以及 `tool-call.tsx` / `inline-thinking.tsx` 接线。**动了行头状态图标或角标必跑。**
 - `harness/subagent-check.cjs` 里另有归档用例：假桥的 replay 列表带一条 `archived: true` 的
   子会话，断言它**不被重放播报**（归档重启后必须仍然成立）；还断言归档往返本身——有打开的
   会话时代为转发、**没有**打开的会话时经一次性 probe 仍能往返、以及 registry 拒绝的 id 必须
