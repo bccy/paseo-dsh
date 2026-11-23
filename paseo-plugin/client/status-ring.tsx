@@ -97,8 +97,17 @@ const ARC_STYLE = {
  */
 function RotatingArc({ color, ring = STATUS_RING_SIZE, stroke = STATUS_RING_STROKE }: { color: string; ring?: number; stroke?: number }) {
   const webRef = useRef<unknown>(null);
-  const progress = useRef(new Animated.Value(0)).current;
-  const isWeb = Platform.OS === "web";
+  const isWeb = Platform?.OS === "web";
+  const canNative =
+    !isWeb &&
+    typeof Animated?.View !== "undefined" &&
+    typeof Animated?.Value === "function" &&
+    typeof Animated?.loop === "function" &&
+    typeof Animated?.timing === "function";
+  const progressRef = useRef<InstanceType<typeof Animated.Value> | null>(null);
+  if (canNative && progressRef.current === null) {
+    progressRef.current = new Animated.Value(0);
+  }
 
   useLayoutEffect(() => {
     if (!isWeb) return;
@@ -114,12 +123,13 @@ function RotatingArc({ color, ring = STATUS_RING_SIZE, stroke = STATUS_RING_STRO
   }, [isWeb]);
 
   useEffect(() => {
-    if (isWeb) return;
+    if (!canNative || progressRef.current === null) return;
+    const progress = progressRef.current;
     const loop = Animated.loop(
       Animated.timing(progress, {
         toValue: 1,
         duration: STATUS_RING_PERIOD_MS,
-        easing: Easing.linear,
+        ...(Easing?.linear !== undefined ? { easing: Easing.linear } : {}),
         useNativeDriver: true,
       }),
     );
@@ -130,7 +140,7 @@ function RotatingArc({ color, ring = STATUS_RING_SIZE, stroke = STATUS_RING_STRO
       loop.stop();
       progress.setValue(0);
     };
-  }, [isWeb, progress]);
+  }, [canNative]);
 
   if (isWeb) {
     return (
@@ -143,10 +153,18 @@ function RotatingArc({ color, ring = STATUS_RING_SIZE, stroke = STATUS_RING_STRO
     );
   }
 
-  const rotate = progress.interpolate({ inputRange: [0, 1], outputRange: ["0deg", "360deg"] });
+  if (canNative && progressRef.current !== null) {
+    const rotate = progressRef.current.interpolate({ inputRange: [0, 1], outputRange: ["0deg", "360deg"] });
+    return (
+      <Animated.View
+        style={[{ ...ARC_STYLE, width: ring, height: ring, borderRadius: ring / 2, borderWidth: stroke, borderTopColor: color }, { transform: [{ rotate }] }]}
+      />
+    );
+  }
+
   return (
-    <Animated.View
-      style={[{ ...ARC_STYLE, width: ring, height: ring, borderRadius: ring / 2, borderWidth: stroke, borderTopColor: color }, { transform: [{ rotate }] }]}
+    <View
+      style={{ ...ARC_STYLE, width: ring, height: ring, borderRadius: ring / 2, borderWidth: stroke, borderTopColor: color }}
     />
   );
 }

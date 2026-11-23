@@ -37,6 +37,7 @@ import {
   shouldCollapseOnBodyPress,
   useInkStreamReveal,
 } from "./row-entrance";
+import { RowStatusIcon, resolveThinkingIconStatus } from "./row-status-icon";
 import { TextShimmer } from "./text-shimmer";
 import { reasoningPreview, streamingTail } from "./thinking-text";
 import { BODY_INDENT, ROW_FONT_SIZE, ROW_GAP, ROW_LINE_HEIGHT } from "./tokens";
@@ -233,11 +234,18 @@ export function InlineThinking({
           style={styles.row}
           onLayout={(event) => setRowWidth(event.nativeEvent.layout.width)}
         >
-          <Image
-            source={{ uri: THINK_ICON }}
-            style={{ width: 16, height: 16 }}
-            tintColor={theme.colors.foregroundMuted}
-          />
+          <RowStatusIcon
+            status={resolveThinkingIconStatus(growing)}
+            size={THINK_ICON_SIZE}
+            colors={theme.colors}
+            spinBase
+          >
+            <Image
+              source={{ uri: THINK_ICON }}
+              style={{ width: THINK_ICON_SIZE, height: THINK_ICON_SIZE }}
+              tintColor={theme.colors.foregroundMuted}
+            />
+          </RowStatusIcon>
           <TextShimmer
             active={growing && !open}
             contentStyle={styles.textRow}

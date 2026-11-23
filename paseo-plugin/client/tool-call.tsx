@@ -57,6 +57,7 @@ import {
   shouldCollapseOnBodyPress,
   useInkStreamReveal,
 } from "./row-entrance";
+import { RowStatusIcon, resolveRowIconStatus } from "./row-status-icon";
 import { TeamBlockView } from "./team-card";
 import { TextShimmer } from "./text-shimmer";
 import {
@@ -1120,6 +1121,7 @@ export function InlineToolCall({
   const compact = layout.compact;
   const iconSize = compact ? 14 : 16;
   const running = shouldPulse(data.status, useRowPulse(agentId, timestamp));
+  const iconStatus = resolveRowIconStatus(data.status, running);
   const stat = diffStat(data);
   const terminal = data.kind === "terminal";
   const errorBlock = data.error !== "" && !data.body.includes(data.error) ? data.error : "";
@@ -1212,17 +1214,20 @@ export function InlineToolCall({
           style={styles.head}
         >
           {/* The glyph carries the state: red for a failure, green for a completed
-              edit. A Paseo-owned tool with no glyph of its own draws Paseo's mark,
-              tinted the same. */}
-          {data.paseoMark ? (
-            <Image
-              source={{ uri: PASEO_MARK_ICON }}
-              style={{ width: iconSize, height: iconSize }}
-              tintColor={iconColor}
-            />
-          ) : (
-            <Icon name={data.icon} size={iconSize} color={iconColor} />
-          )}
+              edit, plus a bottom-right corner badge (blue ring while running, bare
+              green checkmark when completed, red cross on failure). A Paseo-owned
+              tool with no glyph of its own draws Paseo's mark, tinted the same. */}
+          <RowStatusIcon status={iconStatus} size={iconSize} colors={colors}>
+            {data.paseoMark ? (
+              <Image
+                source={{ uri: PASEO_MARK_ICON }}
+                style={{ width: iconSize, height: iconSize }}
+                tintColor={iconColor}
+              />
+            ) : (
+              <Icon name={data.icon} size={iconSize} color={iconColor} />
+            )}
+          </RowStatusIcon>
           <TextShimmer
             active={running}
             contentStyle={styles.text}

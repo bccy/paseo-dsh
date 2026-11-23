@@ -39,7 +39,7 @@ const compiledChecks = [
   'mcp-injection-check.cjs', 'image-check.cjs', 'steer-check.cjs',
   'timeline-check.cjs', 'tool-call-check.cjs', 'locale-check.cjs',
   'newest-check.cjs', 'style-check.cjs', 'thinking-check.cjs',
-  'code-highlight-check.cjs',
+  'code-highlight-check.cjs', 'row-status-icon-check.cjs',
 ];
 // The plugin's own `node:test` trees run from `paseo-plugin`, where their
 // `require("../server/…")` and `node_modules` resolve. Each file builds the
