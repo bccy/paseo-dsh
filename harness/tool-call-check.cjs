@@ -3263,9 +3263,135 @@ console.log("the renderer reads the state the data layer now carries");
   const stylesBody = functionBody(codeOnly(rendered), "buildStyles") ?? "";
   check("buildStyles was found", stylesBody.length > 0, "buildStyles body is missing");
   check(
-    "and the scroll window is DSH's 260px token, not a second literal",
-    mentions(stylesBody, "CODE_MAX_HEIGHT") && /maxHeight\s*:\s*CODE_MAX_HEIGHT/.test(stylesBody),
-    "buildStyles does not bind maxHeight to CODE_MAX_HEIGHT",
+    "InlineToolCall reads style.expandedMaxHeight with EXPANDED_MAX_HEIGHT_DEFAULT fallback",
+    mentions(component, "EXPANDED_MAX_HEIGHT_DEFAULT") &&
+      /\bstyle\.expandedMaxHeight\s*\?\?\s*EXPANDED_MAX_HEIGHT_DEFAULT\b/.test(component),
+    "InlineToolCall does not bind expandedMaxHeight from style.expandedMaxHeight ?? EXPANDED_MAX_HEIGHT_DEFAULT",
+  );
+  const expandedScrollCalls = callArguments(stylesBody, "expandedScrollStyle");
+  check(
+    "buildStyles binds expanded scroll cap via expandedScrollStyle(expandedMaxHeight)",
+    expandedScrollCalls.some((args) => mentions(args, "expandedMaxHeight")) &&
+      mentions(stylesBody, "codeScroll") &&
+      mentions(stylesBody, "expandedScroll") &&
+      mentions(stylesBody, "terminalOutput") &&
+      !mentions(stylesBody, "fieldBodyScroll") &&
+      mentions(stylesBody, "webSources"),
+    expandedScrollCalls.map((args) => `expandedScrollStyle(${args.trim()})`).join(" | ") || "no expandedScrollStyle call in buildStyles",
+  );
+
+  // Frameless interaction & layout invariants:
+  // - InlineToolCall wraps its root in `<RowEntrance ...>`;
+  // - the head `<Pressable>` closes before `<View style={styles.body}>` so
+  //   scrolling/selecting/copying inside the expanded body never collapses the row;
+  // - Read/Diff/Search replace head+tail line folding with bounded ScrollViews;
+  // - HighlightedCode / HighlightedLine wire into terminal, Read, Diff, JSON fields, and generic code;
+  // - TeamBlockView receives `maxHeight={expandedMaxHeight}`.
+  const renderedCode = codeOnly(rendered);
+  const componentElements = elementsWithAttributes(component, []);
+  check(
+    "InlineToolCall outer shell is wrapped in <RowEntrance>",
+    componentElements.length > 0 &&
+      componentElements[0].tag === "RowEntrance" &&
+      component.includes("</RowEntrance>"),
+    componentElements.length > 0 ? `first JSX tag is <${componentElements[0].tag}>` : "no JSX elements",
+  );
+  const headPressables = elementsWithAttributes(component, ["style"]).filter(
+    (element) => element.tag === "Pressable" && mentions(attributeOf(element, "style").value, "head"),
+  );
+  const bodyViews = elementsWithAttributes(component, ["style"]).filter(
+    (element) => element.tag === "View" && mentions(attributeOf(element, "style").value, "body"),
+  );
+  const headCloseAt =
+    headPressables.length === 1 ? component.indexOf("</Pressable>", headPressables[0].start) : -1;
+  check(
+    "the head <Pressable> and expanded <View style={styles.body}> are siblings",
+    headPressables.length === 1 &&
+      bodyViews.length === 1 &&
+      headCloseAt > headPressables[0].start &&
+      headCloseAt < bodyViews[0].start,
+    `headPressables=${headPressables.length}, bodyViews=${bodyViews.length}, headCloseAt=${headCloseAt}, bodyStart=${bodyViews[0]?.start ?? -1}`,
+  );
+
+  const readView = functionBody(renderedCode, "ReadBlockView") ?? "";
+  const diffView = functionBody(renderedCode, "DiffBlockView") ?? "";
+  const searchView = functionBody(renderedCode, "SearchBlockView") ?? "";
+  const diffRows = functionBody(renderedCode, "DiffRows") ?? "";
+  check("ReadBlockView, DiffBlockView, SearchBlockView and DiffRows were found", readView.length > 0 && diffView.length > 0 && searchView.length > 0 && diffRows.length > 0);
+  check(
+    "Read/Diff/Search drop foldWindow and FOLD_LINES truncation",
+    !mentions(renderedCode, "foldWindow") && !mentions(renderedCode, "FOLD_LINES"),
+    "found foldWindow or FOLD_LINES in tool-call.tsx",
+  );
+  const hasBoundedScrollView = (src) =>
+    elementsWithAttributes(src, ["nestedScrollEnabled", "testID"]).some(
+      (element) =>
+        element.tag === "ScrollView" &&
+        mentions(attributeOf(element, "testID").value, "SCROLL_BOX_TEST_ID"),
+    );
+  check("ReadBlockView scrolls in a bounded ScrollView with SCROLL_BOX_TEST_ID", hasBoundedScrollView(readView));
+  check("DiffBlockView scrolls in a bounded ScrollView with SCROLL_BOX_TEST_ID", hasBoundedScrollView(diffView));
+  check("SearchBlockView scrolls in a bounded ScrollView with SCROLL_BOX_TEST_ID", hasBoundedScrollView(searchView));
+
+  check(
+    "terminal command uses HighlightedCode (lang=\"shell\")",
+    elementsWithAttributes(component, ["text", "lang"]).some(
+      (element) =>
+        element.tag === "HighlightedCode" &&
+        attributeOf(element, "lang").value === "shell" &&
+        mentions(attributeOf(element, "text").value, "headline"),
+    ),
+    "no HighlightedCode shell wiring for terminal command",
+  );
+  check(
+    "ReadBlockView uses HighlightedLine",
+    elementsWithAttributes(readView, ["line", "mode"]).some(
+      (element) => element.tag === "HighlightedLine" && mentions(attributeOf(element, "mode").value, "mode"),
+    ),
+    "no HighlightedLine wiring in ReadBlockView",
+  );
+  check(
+    "DiffRows uses HighlightedLine",
+    elementsWithAttributes(diffRows, ["line", "mode"]).some(
+      (element) => element.tag === "HighlightedLine" && mentions(attributeOf(element, "mode").value, "mode"),
+    ),
+    "no HighlightedLine wiring in DiffRows",
+  );
+  check(
+    "generic code surface uses HighlightedCode with inferred lang",
+    elementsWithAttributes(component, ["text", "lang"]).some(
+      (element) =>
+        element.tag === "HighlightedCode" &&
+        mentions(attributeOf(element, "text").value, "body") &&
+        mentions(attributeOf(element, "lang").value, "genericLang"),
+    ),
+    "no HighlightedCode genericLang wiring in InlineToolCall",
+  );
+  check(
+    "TeamBlockView receives maxHeight={expandedMaxHeight} and onCollapse={collapseBody}",
+    elementsWithAttributes(component, ["maxHeight", "onCollapse"]).some(
+      (element) =>
+        element.tag === "TeamBlockView" &&
+        mentions(attributeOf(element, "maxHeight").value, "expandedMaxHeight") &&
+        mentions(attributeOf(element, "onCollapse").value, "collapseBody"),
+    ),
+    "TeamBlockView does not receive maxHeight={expandedMaxHeight} and onCollapse={collapseBody}",
+  );
+  check(
+    "InlineToolCall wires collapseBody into expanded body and inner scroll boxes",
+    mentions(component, "shouldCollapseOnBodyPress") &&
+      elementsWithAttributes(component, ["onPress"]).filter(
+        (element) => element.tag === "Pressable" && mentions(attributeOf(element, "onPress").value, "collapseBody"),
+      ).length >= 5,
+    "missing collapseBody Pressable wiring inside expanded scroll boxes",
+  );
+  check(
+    "InlineToolCall wires Plan A ink-trail streaming for label and summary",
+    mentions(component, "useInkStreamReveal") &&
+      mentions(component, "renderInkTrailText") &&
+      mentions(component, "stream.labelProgress") &&
+      mentions(component, "stream.summaryProgress"),
+    "missing useInkStreamReveal / renderInkTrailText wiring in InlineToolCall",
   );
 
   // L1: a row with no detail shape draws the generic fields card instead of one
@@ -3292,24 +3418,29 @@ console.log("the renderer reads the state the data layer now carries");
       !mentions(fieldsView, "JSON.stringify"),
     "no fieldText element, or the value is re-serialized in the view",
   );
-  const fieldScrolls = elementsWithAttributes(fieldsView, ["style"]).filter(
-    (element) =>
-      element.tag === "ScrollView" &&
-      mentions(attributeOf(element, "style").value, "fieldBodyScroll"),
+  const allFieldScrolls = elementsWithAttributes(fieldsView, []).filter(
+    (element) => element.tag === "ScrollView",
   );
   check(
-    "…a nested value keeps the code surface",
-    fieldScrolls.some((element) => {
-      const content = attributeOf(element, "contentContainerStyle");
-      return content !== undefined && mentions(content.value, "code");
-    }),
-    `${fieldScrolls.length} scroll(s)`,
+    "…ToolFieldsView uses a single outer bounded ScrollView (no nested vertical scrolling)",
+    allFieldScrolls.length === 1 &&
+      !mentions(fieldsView, "fieldBodyScroll") &&
+      mentions(attributeOf(allFieldScrolls[0], "style")?.value ?? "", "expandedScroll") &&
+      attributeOf(allFieldScrolls[0], "nestedScrollEnabled") !== undefined &&
+      mentions(attributeOf(allFieldScrolls[0], "testID")?.value ?? "", "SCROLL_BOX_TEST_ID"),
+    `${allFieldScrolls.length} ScrollView(s) in ToolFieldsView`,
   );
   check(
-    "…and a long prose value is bounded too (scroll, never truncate)",
-    fieldScrolls.length === 2 &&
-      fieldScrolls.some((element) => attributeOf(element, "contentContainerStyle") === undefined),
-    `${fieldScrolls.length} scroll(s)`,
+    "…a nested value keeps the code surface with JSON highlighting",
+    elementsWithAttributes(fieldsView, ["style"]).some(
+      (element) => element.tag === "View" && mentions(attributeOf(element, "style").value, "code"),
+    ) &&
+      elementsWithAttributes(fieldsView, ["text", "lang"]).some(
+        (element) =>
+          element.tag === "HighlightedCode" &&
+          attributeOf(element, "lang").value === "json",
+      ),
+    "missing <View style={styles.code}> or JSON HighlightedCode in ToolFieldsView",
   );
   check(
     "…and the facts row wraps on a narrow screen",
@@ -3338,6 +3469,113 @@ console.log("the renderer reads the state the data layer now carries");
     "…with no second caption element that could bypass it",
     (fieldsView.match(/result-caption/gu) ?? []).length === 1,
     `${(fieldsView.match(/result-caption/gu) ?? []).length} occurrence(s) in ToolFieldsView`,
+  );
+
+  // Regression guards for P1/P2/P3 fixes:
+  // - P1-2: fallback rowKey includes normalized timestamp + tool identity so
+  //   same-millisecond parallel calls never collide;
+  // - P2-1: ReadBlockView and DiffRows tokenize the whole block via tokenizeCode + useMemo;
+  // - P2-2: displayLabel guards toolLabels with Object.prototype.hasOwnProperty,
+  //   normalizes exclusion checks, and falls back through paseoMcpLabel;
+  // - P2-3: errorBlock and WebBlockView answer scroll inside bounded ScrollViews;
+  // - P2-5: terminal CopyControl sits outside commandScroll and never shrinks;
+  // - P3-4: team-card.tsx subscribes via useLocaleText() instead of localeText().
+  check(
+    "InlineToolCall builds a non-colliding fallback rowKey when item id/callId is absent",
+    mentions(component, "normalizeTimestampMs") &&
+      /`tool:\$\{String\(tsMs\)\}:\$\{data\.name\}:\$\{data\.summary\}:\$\{data\.headline\.slice\(0,\s*64\)\}`/.test(
+        component,
+      ),
+    "missing stable fallback rowKey in InlineToolCall",
+  );
+  check(
+    "ReadBlockView tokenizes the whole file via tokenizeCode + useMemo and passes tokens to HighlightedLine",
+    mentions(readView, "tokenizeCode") &&
+      mentions(readView, "useMemo") &&
+      elementsWithAttributes(readView, ["line", "mode", "tokens"]).some(
+        (element) => element.tag === "HighlightedLine",
+      ),
+    "ReadBlockView does not pass whole-block tokens to HighlightedLine",
+  );
+  check(
+    "DiffRows tokenizes the whole diff via tokenizeCode + useMemo and passes tokens to HighlightedLine",
+    mentions(diffRows, "tokenizeCode") &&
+      mentions(diffRows, "useMemo") &&
+      elementsWithAttributes(diffRows, ["line", "mode", "tokens"]).some(
+        (element) => element.tag === "HighlightedLine",
+      ),
+    "DiffRows does not pass whole-block tokens to HighlightedLine",
+  );
+  check(
+    "displayLabel guards toolLabels with hasOwnProperty, normalizes exclusions, and syncs paseoMcpLabel",
+    /Object\.prototype\.hasOwnProperty\.call\(\s*text\.toolLabels\s*,\s*data\.name\s*\)/.test(component) &&
+      mentions(component, "paseoMcpLabel") &&
+      /data\.name\.trim\(\)\.toLowerCase\(\)/.test(component),
+    "displayLabel missing hasOwnProperty guard, normalized exclusion, or paseoMcpLabel",
+  );
+  const errorTextEl = elementsWithAttributes(component, ["style"]).find(
+    (element) => element.tag === "Text" && mentions(attributeOf(element, "style").value, "errorText"),
+  );
+  const errorScrolls = elementsWithAttributes(component, ["style", "nestedScrollEnabled", "testID"]).filter(
+    (element) =>
+      element.tag === "ScrollView" &&
+      mentions(attributeOf(element, "style").value, "expandedScroll") &&
+      mentions(attributeOf(element, "testID").value, "SCROLL_BOX_TEST_ID"),
+  );
+  const errorWrappedInScroll =
+    errorTextEl !== undefined &&
+    errorScrolls.some((scrollEl) => {
+      const closeAt = component.indexOf("</ScrollView>", scrollEl.start);
+      return scrollEl.start < errorTextEl.start && closeAt > errorTextEl.start;
+    });
+  check(
+    "errorBlock is wrapped in a bounded ScrollView (expandedScroll + SCROLL_BOX_TEST_ID)",
+    errorWrappedInScroll,
+    "errorText is not wrapped inside a bounded expandedScroll ScrollView",
+  );
+  const webView = functionBody(renderedCode, "WebBlockView") ?? "";
+  const webScrollEl = elementsWithAttributes(webView, ["style", "nestedScrollEnabled", "testID"]).find(
+    (element) =>
+      element.tag === "ScrollView" &&
+      mentions(attributeOf(element, "style").value, "webSources") &&
+      mentions(attributeOf(element, "testID").value, "SCROLL_BOX_TEST_ID"),
+  );
+  const webAnswerAt = webView.indexOf("{data.answer}");
+  const webScrollCloseAt =
+    webScrollEl === undefined ? -1 : webView.indexOf("</ScrollView>", webScrollEl.start);
+  check(
+    "WebBlockView search answer sits inside the bounded webSources ScrollView",
+    webScrollEl !== undefined &&
+      webAnswerAt > webScrollEl.start &&
+      webScrollCloseAt > webAnswerAt,
+    "WebBlockView answer is outside bounded webSources ScrollView",
+  );
+  const commandScrollEl = elementsWithAttributes(component, ["style", "nestedScrollEnabled", "testID"]).find(
+    (element) =>
+      element.tag === "ScrollView" &&
+      mentions(attributeOf(element, "style").value, "commandScroll") &&
+      mentions(attributeOf(element, "testID").value, "SCROLL_BOX_TEST_ID"),
+  );
+  const commandScrollCloseAt =
+    commandScrollEl === undefined ? -1 : component.indexOf("</ScrollView>", commandScrollEl.start);
+  const copyControlBody = functionBody(renderedCode, "CopyControl") ?? "";
+  check(
+    "terminal CopyControl sits outside commandScroll and sets flexShrink: 0",
+    commandScrollEl !== undefined &&
+      terminalCopy.length === 1 &&
+      commandScrollCloseAt > commandScrollEl.start &&
+      terminalCopy[0].start > commandScrollCloseAt &&
+      /flexShrink\s*:\s*0/.test(copyControlBody),
+    "terminal CopyControl is inside commandScroll or lacks flexShrink: 0",
+  );
+  const teamCardPath = findRepoFile("client/team-card.tsx");
+  const teamCardCode = teamCardPath === undefined ? "" : codeOnly(fs.readFileSync(teamCardPath, "utf8"));
+  check(
+    "team-card.tsx subscribes to locale changes via useLocaleText()",
+    teamCardCode.length > 0 &&
+      mentions(teamCardCode, "useLocaleText") &&
+      !/\blocaleText\s*\(/.test(teamCardCode),
+    "team-card.tsx still calls localeText() directly or misses useLocaleText",
   );
 }
 

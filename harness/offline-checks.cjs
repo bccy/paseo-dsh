@@ -38,6 +38,8 @@ const compiledChecks = [
   'uploaded-file-check.cjs', 'assistant-stream-check.cjs', 'assistant-retry-check.cjs',
   'mcp-injection-check.cjs', 'image-check.cjs', 'steer-check.cjs',
   'timeline-check.cjs', 'tool-call-check.cjs', 'locale-check.cjs',
+  'newest-check.cjs', 'style-check.cjs', 'thinking-check.cjs',
+  'code-highlight-check.cjs',
 ];
 // The plugin's own `node:test` trees run from `paseo-plugin`, where their
 // `require("../server/…")` and `node_modules` resolve. Each file builds the
@@ -50,6 +52,7 @@ const pluginTests = [
   'test/dsh-plugins.test.cjs',
   'test/paseo-0171.test.cjs',
   'test/paseo-0173.test.cjs',
+  'test/timeline-spacing.test.cjs',
 ];
 const inventory = [
   'typecheck', 'bridge syntax', ...sourceChecks, ...compiledChecks,

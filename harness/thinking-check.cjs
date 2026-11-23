@@ -305,7 +305,7 @@ console.log("the row wires the window in");
       return mentions(expression, "rowWidth")
         && mentions(expression, "labelWidth")
         && mentions(expression, "THINK_ICON_SIZE")
-        && mentions(expression, "ROW_HEAD_GAP");
+        && (mentions(expression, "ROW_HEAD_GAP") || mentions(expression, "toolRowGap"));
     }),
     lineWidth.map((args) => `Math.max(${args.trim()})`).join(" | ") || "lineWidth derivation is missing",
   );
@@ -432,10 +432,22 @@ console.log("the row settles when the last frame both grows and completes");
       }
       return slots[index].value;
     },
+    useSyncExternalStore(_subscribe, getSnapshot) {
+      return getSnapshot();
+    },
   };
 
-  // Stand-ins for the host modules only; `./thinking-text`, `./tokens` and
-  // `./locale` are the real compiled modules.
+  let styleSettingsValues = {
+    rowMarginY: 0,
+    toolRowPaddingY: 0,
+    toolRowMinHeight: 24,
+    toolRowGap: 6,
+    commandMaxHeightRatio: 0.25,
+    commandMinHeight: 150,
+  };
+
+  // Stand-ins for the host modules only; `./thinking-text`, `./tokens`,
+  // `./row-entrance`, `./newest`, and `./locale` are the real compiled modules.
   const stubs = {
     react: () => hooks,
     "react/jsx-runtime": () => ({
@@ -443,7 +455,19 @@ console.log("the row settles when the last frame both grows and completes");
       jsxs: (type, props) => ({ type, props }),
       Fragment: "Fragment",
     }),
-    "react-native": () => ({ Image: "Image", Pressable: "Pressable", Text: "Text", View: "View" }),
+    "react-native": () => ({
+      Image: "Image",
+      Pressable: "Pressable",
+      ScrollView: "ScrollView",
+      Text: "Text",
+      View: "View",
+    }),
+    "@getpaseo/plugin": () => ({
+      defineSettings: (config) => config,
+    }),
+    "@getpaseo/plugin/client": () => ({
+      useSettings: () => ({ status: "ready", values: styleSettingsValues }),
+    }),
     "./text-shimmer": () => ({ TextShimmer: "TextShimmer" }),
   };
   const originalLoad = Module._load;
@@ -562,6 +586,235 @@ console.log("the row settles when the last frame both grows and completes");
     `${timers.size} timer(s)`,
   );
   check("unmount clears the pending window", unmount() === 0, `${timers.size} timer(s)`);
+
+  console.log("expanded body renders in a bounded sibling ScrollView");
+  {
+    // Reset hooks for a fresh component instance.
+    slots = [];
+    cursor = 0;
+    effects = [];
+    changed = false;
+
+    function findNode(node, predicate) {
+      if (node === null || typeof node !== "object") return null;
+      if (predicate(node)) return node;
+      const children = node.props === undefined ? undefined : node.props.children;
+      for (const child of Array.isArray(children) ? children : [children]) {
+        const hit = findNode(child, predicate);
+        if (hit !== null) return hit;
+      }
+      return null;
+    }
+
+    function childArray(node) {
+      const c = node?.props?.children;
+      return Array.isArray(c) ? c.filter(Boolean) : c ? [c] : [];
+    }
+
+    const longThought = "first line\nsecond line\nthird line";
+    const collapsedTree = renderToStable(longThought, "complete");
+    const rootViewCollapsed = findNode(collapsedTree, (n) => n.type === "View" && n.props?.style?.gap !== undefined);
+    const pressableCollapsed = findNode(rootViewCollapsed, (n) => n.type === "Pressable");
+    check(
+      "collapsed state renders head Pressable without ScrollView",
+      pressableCollapsed !== null && findNode(collapsedTree, (n) => n.type === "ScrollView") === null,
+    );
+
+    // Clicking the head toggles open.
+    pressableCollapsed.props.onPress();
+    const expandedTree = renderToStable(longThought, "complete");
+    const rootView = findNode(expandedTree, (n) => n.type === "View" && n.props?.style?.gap !== undefined);
+    const rootChildren = childArray(rootView);
+    const headSibling = rootChildren.find((n) => n.type === "Pressable");
+    const bodySibling = rootChildren.find((n) => n.type === "ScrollView");
+
+    check(
+      "head Pressable and expanded ScrollView are siblings under root View",
+      headSibling !== undefined && bodySibling !== undefined,
+    );
+    check(
+      "ScrollView is not nested inside Pressable",
+      findNode(headSibling, (n) => n.type === "ScrollView") === null,
+    );
+    check(
+      "expanded ScrollView enables nestedScrollEnabled and carries scroll-box testID",
+      bodySibling?.props?.nestedScrollEnabled === true &&
+        bodySibling?.props?.testID === "dsh-scroll-box",
+    );
+    check(
+      "expanded ScrollView defaults maxHeight to 260 when setting is absent",
+      bodySibling?.props?.style?.maxHeight === 260,
+      String(bodySibling?.props?.style?.maxHeight),
+    );
+    const bodyText = findNode(bodySibling, (n) => n.type === "Text");
+    check(
+      "expanded body renders selectable raw text",
+      bodyText?.props?.selectable === true && bodyText?.props?.children === longThought,
+    );
+
+    // When settings provide `expandedMaxHeight`, the ScrollView adopts it.
+    styleSettingsValues = { ...styleSettingsValues, expandedMaxHeight: 340 };
+    const resizedTree = renderToStable(longThought, "complete");
+    const resizedScroll = findNode(resizedTree, (n) => n.type === "ScrollView");
+    check(
+      "expanded ScrollView respects style.expandedMaxHeight when present",
+      resizedScroll?.props?.style?.maxHeight === 340,
+      String(resizedScroll?.props?.style?.maxHeight),
+    );
+
+    // Clicking head again collapses the body.
+    const headToClose = findNode(resizedTree, (n) => n.type === "Pressable");
+    headToClose.props.onPress();
+    const recollapsedTree = renderToStable(longThought, "complete");
+    check(
+      "second head press collapses ScrollView",
+      findNode(recollapsedTree, (n) => n.type === "ScrollView") === null,
+    );
+
+    // Re-expand and verify tapping inside the expanded ScrollView closes it.
+    findNode(recollapsedTree, (n) => n.type === "Pressable").props.onPress();
+    const reopenedTree = renderToStable(longThought, "complete");
+    const reopenedScroll = findNode(reopenedTree, (n) => n.type === "ScrollView");
+    const innerScrollPressable = findNode(reopenedScroll, (n) => n.type === "Pressable");
+    check(
+      "expanded ScrollView wraps its content in an inner tap-to-collapse Pressable",
+      innerScrollPressable !== null && typeof innerScrollPressable.props?.onPress === "function",
+    );
+    innerScrollPressable.props.onPress();
+    const collapsedViaBodyTree = renderToStable(longThought, "complete");
+    check(
+      "tapping inside expanded ScrollView collapses the thinking row",
+      findNode(collapsedViaBodyTree, (n) => n.type === "ScrollView") === null,
+    );
+
+    // RowEntrance itself renders cleanly even with the minimal react-native stub
+    // (no Platform, Animated, or Easing).
+    const RowEntranceFn = expandedTree.type;
+    check("InlineThinking wraps output in RowEntrance", typeof RowEntranceFn === "function");
+    slots = [];
+    cursor = 0;
+    effects = [];
+    changed = false;
+    const entranceOut = RowEntranceFn(expandedTree.props);
+    check(
+      "RowEntrance falls back to plain View cleanly under minimal RN stub",
+      entranceOut?.type === "View" && entranceOut?.props?.children === expandedTree.props.children,
+    );
+
+    unmount();
+  }
+
+  console.log("InlineThinking participates in newest first-pass batching & uses EXPANDED_MAX_HEIGHT_DEFAULT");
+  {
+    const {
+      resetNewestForTests,
+      shouldEnterLive,
+    } = require(join(dirname(componentPath), "newest.js"));
+    const { EXPANDED_MAX_HEIGHT_DEFAULT } = require(join(dirname(componentPath), "..", "shared", "settings.js"));
+
+    const source = readFileSync(INLINE_THINKING_SOURCE, "utf8");
+    const code = source
+      .split("\n")
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join("\n");
+    check(
+      "inline-thinking.tsx imports EXPANDED_MAX_HEIGHT_DEFAULT instead of hardcoding 260",
+      /\bEXPANDED_MAX_HEIGHT_DEFAULT\b/.test(code) && !/:\s*260\b/.test(code),
+    );
+    check(
+      "EXPANDED_MAX_HEIGHT_DEFAULT equals 260",
+      EXPANDED_MAX_HEIGHT_DEFAULT === 260,
+      String(EXPANDED_MAX_HEIGHT_DEFAULT),
+    );
+
+    const noTsAgent = "thinking-no-timestamp";
+    resetNewestForTests(noTsAgent);
+    slots = [];
+    cursor = 0;
+    effects = [];
+    changed = false;
+    InlineThinking({
+      theme: {
+        colors: { foreground: "#ffffff", foregroundMuted: "#888888", surface0: "#000000" },
+      },
+      layout: { compact: false },
+      agentId: noTsAgent,
+      item: { data: { text: "no ts", phase: "complete" } },
+    });
+    const baseTs = Date.UTC(2026, 0, 1, 0, 0, 0);
+    check(
+      "InlineThinking without timestamp does not pollute newest pending batch",
+      shouldEnterLive(noTsAgent, baseTs, true, "k-no-ts", baseTs) === true,
+    );
+    resetNewestForTests(noTsAgent);
+
+    const batchAgent = "thinking-first-pass-batch";
+    resetNewestForTests(batchAgent);
+    // Render two distinct thinking rows in the same pass: both call noteRender,
+    // making pending.fresh.size === 2 so liveHint is suppressed as a replay batch.
+    slots = [];
+    cursor = 0;
+    effects = [];
+    changed = false;
+    InlineThinking({
+      theme: {
+        colors: { foreground: "#ffffff", foregroundMuted: "#888888", surface0: "#000000" },
+      },
+      layout: { compact: false },
+      agentId: batchAgent,
+      timestamp: baseTs,
+      item: { data: { text: "first", phase: "complete" } },
+    });
+    slots = [];
+    cursor = 0;
+    effects = [];
+    changed = false;
+    const secondTree = InlineThinking({
+      theme: {
+        colors: { foreground: "#ffffff", foregroundMuted: "#888888", surface0: "#000000" },
+      },
+      layout: { compact: false },
+      agentId: batchAgent,
+      timestamp: baseTs + 1000,
+      item: { data: { text: "second", phase: "streaming" } },
+    });
+    check(
+      "two InlineThinking rows in the first pass trigger multi-row pending suppression",
+      shouldEnterLive(batchAgent, baseTs + 2000, true, "k-batch", baseTs + 2000) === false,
+    );
+
+    // Verify RowEntrance commit effect marks the row animated via markRowAnimated
+    const RowEntranceFn = secondTree.type;
+    const strictAgent = "thinking-strict-entrance";
+    resetNewestForTests(strictAgent);
+    slots = [];
+    cursor = 0;
+    effects = [];
+    changed = false;
+    const strictProps = {
+      agentId: strictAgent,
+      timestamp: baseTs + 500,
+      rowKey: "thinking-strict-1",
+      liveHint: true,
+      children: null,
+    };
+    RowEntranceFn(strictProps);
+    check(
+      "before RowEntrance commit effect runs, shouldEnterLive remains true (StrictMode safe)",
+      shouldEnterLive(strictAgent, baseTs + 500, true, "thinking-strict-1", baseTs + 500) === true,
+    );
+    for (const { index, effect } of effects) {
+      const cleanup = effect();
+      slots[index].cleanup = typeof cleanup === "function" ? cleanup : undefined;
+    }
+    check(
+      "after RowEntrance commit effect runs, same rowKey is marked animated",
+      shouldEnterLive(strictAgent, baseTs + 500, true, "thinking-strict-1", baseTs + 500) === false,
+    );
+    unmount();
+    resetNewestForTests(batchAgent);
+    resetNewestForTests(strictAgent);
+  }
 
   global.setTimeout = realSetTimeout;
   global.clearTimeout = realClearTimeout;

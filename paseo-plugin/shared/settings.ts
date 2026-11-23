@@ -1,6 +1,8 @@
 import { defineSettings } from "@getpaseo/plugin";
 import { z } from "zod";
 
+export const EXPANDED_MAX_HEIGHT_DEFAULT = 260;
+
 /**
  * Host-scoped presentation knobs for the DSH timeline rows and the tool drawer.
  *
@@ -11,7 +13,7 @@ import { z } from "zod";
 export const timelineStyleSettings = defineSettings({
   id: "timeline-style",
   scope: "host",
-  version: 5,
+  version: 6,
   migrate(values) {
     if (!isRecord(values)) return values;
     const {
@@ -33,6 +35,9 @@ export const timelineStyleSettings = defineSettings({
           ? liveRowMarginY
           : 0;
     rest["rowMarginY"] = merged;
+    if (typeof rest["expandedMaxHeight"] !== "number") {
+      rest["expandedMaxHeight"] = EXPANDED_MAX_HEIGHT_DEFAULT;
+    }
     return rest;
   },
   schema: z.object({
@@ -40,6 +45,7 @@ export const timelineStyleSettings = defineSettings({
     toolRowPaddingY: z.number().min(0).max(12).default(0),
     toolRowMinHeight: z.number().min(12).max(64).default(24),
     toolRowGap: z.number().min(0).max(24).default(6),
+    expandedMaxHeight: z.number().min(120).max(640).default(EXPANDED_MAX_HEIGHT_DEFAULT),
     commandMaxHeightRatio: z.number().min(0.1).max(0.6).default(0.25),
     commandMinHeight: z.number().min(60).max(360).default(150),
   }),
@@ -78,6 +84,7 @@ export const TIMELINE_STYLE_DEFAULTS: TimelineStyleValues = {
   toolRowPaddingY: 0,
   toolRowMinHeight: 24,
   toolRowGap: 6,
+  expandedMaxHeight: EXPANDED_MAX_HEIGHT_DEFAULT,
   commandMaxHeightRatio: 0.25,
   commandMinHeight: 150,
 };
@@ -95,6 +102,7 @@ export const TIMELINE_STYLE_KEYS = [
   "toolRowPaddingY",
   "toolRowMinHeight",
   "toolRowGap",
+  "expandedMaxHeight",
   "commandMaxHeightRatio",
   "commandMinHeight",
 ] as const satisfies readonly TimelineStyleKey[];

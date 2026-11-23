@@ -23,8 +23,20 @@
  */
 import { useSettings, type PluginTimelineItemProps } from "@getpaseo/plugin/client";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Image, Pressable, Text, View } from "react-native";
-import { TIMELINE_STYLE_DEFAULTS, timelineStyleSettings } from "../shared/settings";
+import { Image, Pressable, ScrollView, Text, View } from "react-native";
+import {
+  EXPANDED_MAX_HEIGHT_DEFAULT,
+  TIMELINE_STYLE_DEFAULTS,
+  timelineStyleSettings,
+} from "../shared/settings";
+import { normalizeRowTimestamp, noteRender } from "./newest";
+import {
+  RowEntrance,
+  SCROLL_BOX_TEST_ID,
+  renderInkTrailText,
+  shouldCollapseOnBodyPress,
+  useInkStreamReveal,
+} from "./row-entrance";
 import { TextShimmer } from "./text-shimmer";
 import { reasoningPreview, streamingTail } from "./thinking-text";
 import { BODY_INDENT, ROW_FONT_SIZE, ROW_GAP, ROW_LINE_HEIGHT } from "./tokens";
@@ -89,10 +101,17 @@ function useGrowing(text: string, phase: "streaming" | "complete"): boolean {
 export function InlineThinking({
   theme,
   layout,
+  agentId,
+  timestamp,
   item,
 }: PluginTimelineItemProps<InlineThinkingData>) {
   const { text, phase } = item.data;
   const growing = useGrowing(text, phase);
+  const rowAt = normalizeRowTimestamp(timestamp);
+  if (typeof agentId === "string" && agentId !== "" && rowAt !== 0) {
+    noteRender(agentId, rowAt);
+  }
+  const rowKey = rowAt !== 0 ? `thinking:${rowAt}` : undefined;
   // The width the preview line has to work with, derived from its ancestors.
   //
   // Measuring the line itself does not work: the sweep container is
@@ -104,6 +123,11 @@ export function InlineThinking({
   // both definite, so the line is what is left over.
   const styleState = useSettings(timelineStyleSettings);
   const style = styleState.status === "ready" ? styleState.values : TIMELINE_STYLE_DEFAULTS;
+  const expandedMaxHeight =
+    "expandedMaxHeight" in style &&
+    typeof (style as { expandedMaxHeight?: unknown }).expandedMaxHeight === "number"
+      ? (style as { expandedMaxHeight: number }).expandedMaxHeight
+      : EXPANDED_MAX_HEIGHT_DEFAULT;
   const [rowWidth, setRowWidth] = useState(0);
   const [labelWidth, setLabelWidth] = useState(0);
   const lineWidth = Math.max(
@@ -112,6 +136,9 @@ export function InlineThinking({
   );
   const [manual, setManual] = useState<boolean | null>(null);
   const open = manual ?? false;
+  const collapseBody = (event?: unknown) => {
+    if (shouldCollapseOnBodyPress(event)) setManual(false);
+  };
   // Subscribe via `useLocaleText()` so host-relayed or settings-driven locale
   // changes re-render the label and screen-reader strings live.
   const copy = useLocaleText();
@@ -126,6 +153,16 @@ export function InlineThinking({
     growing && lineWidth > 0
       ? streamingTail(text, lineWidth, ROW_FONT_SIZE)
       : reasoningPreview(text, growing);
+  const tailSliding = growing && lineWidth > 0 && line.startsWith("…");
+  const stream = useInkStreamReveal({
+    agentId,
+    timestamp,
+    rowKey,
+    liveHint: phase === "streaming" || growing,
+    label: copy.thinking,
+    summary: !open && !tailSliding ? line : "",
+    streamSummary: !open && !tailSliding,
+  });
 
   const styles = useMemo(() => {
     const rowLineHeight = Math.min(ROW_LINE_HEIGHT, style.toolRowMinHeight);
@@ -165,6 +202,9 @@ export function InlineThinking({
         lineHeight: rowLineHeight,
         opacity: growing ? 0.95 : 0.7,
       },
+      fullScroll: {
+        maxHeight: expandedMaxHeight,
+      },
       full: {
         marginLeft: BODY_INDENT,
         color: theme.colors.foregroundMuted,
@@ -173,61 +213,83 @@ export function InlineThinking({
         opacity: 0.8,
       },
     };
-  }, [theme, layout.compact, growing, style]);
+  }, [theme, layout.compact, growing, style, expandedMaxHeight]);
 
   return (
-    // The whole block toggles, so a tap anywhere (including on the expanded
-    // text) closes it. No inner ScrollView: an inner scroll swallows the tap.
-    <Pressable
-      accessibilityRole="button"
-      accessibilityLabel={open ? copy.collapseThinking : copy.expandThinking}
-      onPress={() => setManual((value) => !(value ?? false))}
-      style={styles.root}
+    <RowEntrance
+      agentId={agentId}
+      timestamp={timestamp}
+      rowKey={rowKey}
+      liveHint={phase === "streaming" || growing}
     >
-      <View
-        style={styles.row}
-        onLayout={(event) => setRowWidth(event.nativeEvent.layout.width)}
-      >
-        <Image
-          source={{ uri: THINK_ICON }}
-          style={{ width: 16, height: 16 }}
-          tintColor={theme.colors.foregroundMuted}
-        />
-        <TextShimmer
-          active={growing && !open}
-          contentStyle={styles.textRow}
-          highlightColor={theme.colors.foreground}
-          surfaceColor={theme.colors.surface0}
+      <View style={styles.root}>
+        {/* The head row toggles open/closed; the expanded body sits beside it in
+            its own bounded ScrollView so scrolling long thoughts never competes
+            with tapping the toggle or pushes the timeline off screen. */}
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={open ? copy.collapseThinking : copy.expandThinking}
+          onPress={() => setManual((value) => !(value ?? false))}
+          style={styles.row}
+          onLayout={(event) => setRowWidth(event.nativeEvent.layout.width)}
         >
-          {(color) => (
-            <>
-              {/* DSH titles every reasoning row "思考" (its English table says
-                  "Thinking") and never swaps it for a finished form; the
-                  "已思考" string it ships belongs to its collapsed whole-turn
-                  summary, not to this row. */}
-              <Text
-                style={[styles.label, color === null ? null : { color }]}
-                onLayout={(event) => setLabelWidth(event.nativeEvent.layout.width)}
-              >
-                {copy.thinking}
-              </Text>
-              {!open ? (
+          <Image
+            source={{ uri: THINK_ICON }}
+            style={{ width: 16, height: 16 }}
+            tintColor={theme.colors.foregroundMuted}
+          />
+          <TextShimmer
+            active={growing && !open}
+            contentStyle={styles.textRow}
+            highlightColor={theme.colors.foreground}
+            surfaceColor={theme.colors.surface0}
+          >
+            {(color) => (
+              <>
+                {/* DSH titles every reasoning row "思考" (its English table says
+                    "Thinking") and never swaps it for a finished form; the
+                    "已思考" string it ships belongs to its collapsed whole-turn
+                    summary, not to this row. */}
                 <Text
-                  style={[styles.line, color === null ? null : { color }]}
-                  numberOfLines={1}
+                  style={[styles.label, color === null ? null : { color }]}
+                  onLayout={(event) => setLabelWidth(event.nativeEvent.layout.width)}
                 >
-                  {line}
+                  {renderInkTrailText(copy.thinking, stream.labelProgress, theme.colors.foreground, color)}
                 </Text>
-              ) : null}
-            </>
-          )}
-        </TextShimmer>
+                {!open ? (
+                  <Text
+                    style={[styles.line, color === null ? null : { color }]}
+                    numberOfLines={1}
+                  >
+                    {renderInkTrailText(line, stream.summaryProgress, theme.colors.foreground, color)}
+                  </Text>
+                ) : null}
+              </>
+            )}
+          </TextShimmer>
+        </Pressable>
+        {open ? (
+          // Render the raw source, not the paced reveal: a per-frame re-render of
+          // a very long thought is what froze the app before. Wrapping the inner
+          // content in a Pressable lets short taps collapse the scroll box while
+          // scroll gestures still pan smoothly on iOS/Android/Web.
+          <ScrollView
+            style={styles.fullScroll}
+            nestedScrollEnabled
+            testID={SCROLL_BOX_TEST_ID}
+          >
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={copy.collapseThinking}
+              onPress={collapseBody}
+            >
+              <Text style={styles.full} selectable>
+                {text}
+              </Text>
+            </Pressable>
+          </ScrollView>
+        ) : null}
       </View>
-      {open ? (
-        // Render the raw source, not the paced reveal: a per-frame re-render of
-        // a very long thought is what froze the app before.
-        <Text style={styles.full}>{text}</Text>
-      ) : null}
-    </Pressable>
+    </RowEntrance>
   );
 }

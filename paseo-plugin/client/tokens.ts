@@ -231,6 +231,68 @@ export function dividerStyle(
 }
 
 /* -------------------------------------------------------------------------- */
+/* Frameless expanded block (Scheme A)                                        */
+/* -------------------------------------------------------------------------- */
+
+/** Left padding between the 2px vertical rail and the expanded block body. */
+export const FRAMELESS_PADDING_LEFT = 10;
+/** Subtle 2px vertical rail linking the expanded content back to its row head. */
+export const FRAMELESS_BORDER_WIDTH = 2;
+/** Vertical gap between stacked pieces inside a frameless expanded block. */
+export const FRAMELESS_GAP = 4;
+
+/**
+ * Frameless expanded block container: transparent surface, no card radius or
+ * surrounding border — only a subtle 2px left rail in `colors.border` tying
+ * the expanded flow to its row head.
+ */
+export function framelessBlockStyle(colors: TokenColors): {
+  paddingLeft: number;
+  borderLeftWidth: number;
+  borderLeftColor: string;
+  gap: number;
+} {
+  return {
+    paddingLeft: FRAMELESS_PADDING_LEFT,
+    borderLeftWidth: FRAMELESS_BORDER_WIDTH,
+    borderLeftColor: colors.border,
+    gap: FRAMELESS_GAP,
+  };
+}
+
+/**
+ * Minimal transparent metadata / copy bar above a frameless block body,
+ * separated from the scroll area by a hairline instead of a raised `surface2` strip.
+ */
+export function framelessHeadStyle(
+  colors: TokenColors,
+  hairline: number = HAIRLINE,
+): {
+  flexDirection: "row";
+  alignItems: "center";
+  justifyContent: "space-between";
+  gap: number;
+  paddingBottom: number;
+  borderBottomWidth: number;
+  borderBottomColor: string;
+} {
+  return {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: CARD_HEAD_GAP,
+    paddingBottom: FRAMELESS_GAP,
+    borderBottomWidth: hairline,
+    borderBottomColor: colors.border,
+  };
+}
+
+/** Unified vertical cap for every scrollable expanded block region. */
+export function expandedScrollStyle(maxHeight: number): { maxHeight: number } {
+  return { maxHeight };
+}
+
+/* -------------------------------------------------------------------------- */
 /* Code surfaces                                                              */
 /* -------------------------------------------------------------------------- */
 
@@ -406,6 +468,10 @@ export interface DiffLineStyle {
  * DSH's bar is an inset shadow and does not consume layout, while a real border
  * does — a context line without one would sit 3px to the left of its neighbours
  * and the hunk would read as misaligned.
+ *
+ * In the frameless expanded layout, diff rows paint directly on the timeline
+ * surface (`colors.surface0`), so the renderer passes
+ * `isLightSurface(colors.surface0)` as `light`.
  */
 export function diffLineStyle(colors: TokenColors, kind: DiffKind, light: boolean): DiffLineStyle {
   const base: DiffLineStyle = { borderLeftWidth: DIFF_BAR_WIDTH, borderLeftColor: "transparent" };

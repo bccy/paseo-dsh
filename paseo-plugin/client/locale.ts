@@ -223,6 +223,7 @@ export type DisplaySettingsFieldKey =
   | "toolRowPaddingY"
   | "toolRowMinHeight"
   | "toolRowGap"
+  | "expandedMaxHeight"
   | "commandMaxHeightRatio"
   | "commandMinHeight";
 
@@ -1553,6 +1554,10 @@ const TEXT: Record<Locale, UiText> = {
           label: "Horizontal gap between icon and text",
           hint: "Between the icon, the verb and the target. Default 6. Range 0 to 24.",
         },
+        expandedMaxHeight: {
+          label: "Expanded content max height (px)",
+          hint: "Scroll window cap for expanded code, command output, diffs, and reasoning (120–640, default 260).",
+        },
         commandMaxHeightRatio: {
           label: "Command block maximum height (share of the window)",
           hint: "0.25 means at most a quarter of the window height; beyond that the command block scrolls internally and the output area stays visible. Range 0.1 to 0.6.",
@@ -2202,6 +2207,10 @@ const TEXT: Record<Locale, UiText> = {
         toolRowGap: {
           label: "图标与文字的水平间距",
           hint: "图标、标题与摘要之间的间距。默认 6。范围 0 ~ 24。",
+        },
+        expandedMaxHeight: {
+          label: "展开内容最大高度 (px)",
+          hint: "展开的代码、命令输出、Diff 与思考正文的滚动窗口上限（120–640，默认 260）。",
         },
         commandMaxHeightRatio: {
           label: "命令块最大高度（窗口占比）",

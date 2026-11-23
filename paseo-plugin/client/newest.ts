@@ -74,6 +74,8 @@ interface PendingPass {
 const rows = new Map<string, AgentRows>();
 /** The current render pass per agent, folded in afterwards. */
 const pending = new Map<string, PendingPass>();
+/** Per-agent bounded set of row keys that have already played an entrance animation. */
+const animatedKeys = new Map<string, Set<string>>();
 let flushScheduled = false;
 let seqCounter = 0;
 /**
@@ -82,6 +84,8 @@ let seqCounter = 0;
  * order, because an existing entry is never re-set.
  */
 const MAX_AGENTS = 200;
+/** Per-agent cap on remembered animated row keys (evicts oldest first). */
+const MAX_ANIMATED_KEYS = 500;
 
 export interface Commit {
   seq: number;
@@ -104,7 +108,12 @@ export interface RowPulse {
   fresh: boolean;
 }
 
-function atOf(timestamp: Date | string | number): number {
+/**
+ * Normalize a timeline row timestamp to epoch milliseconds, returning `0` when
+ * the input is missing or cannot be parsed into a finite number.
+ */
+export function normalizeRowTimestamp(timestamp: Date | string | number | undefined): number {
+  if (timestamp === undefined) return 0;
   const at = timestamp instanceof Date ? timestamp.getTime() : new Date(timestamp).getTime();
   return Number.isFinite(at) ? at : 0;
 }
@@ -232,6 +241,94 @@ export function pulseRemainingMs(commit: Commit, now: number): number {
   return Math.max(0, commit.seenAt + PULSE_MS - now);
 }
 
+function rememberAnimatedKey(agentId: string, key: string): void {
+  let set = animatedKeys.get(agentId);
+  if (set === undefined) {
+    if (animatedKeys.size >= MAX_AGENTS) {
+      const oldestAgent = animatedKeys.keys().next().value;
+      if (oldestAgent !== undefined) animatedKeys.delete(oldestAgent);
+    }
+    set = new Set<string>();
+    animatedKeys.set(agentId, set);
+  }
+  if (set.has(key)) return;
+  if (set.size >= MAX_ANIMATED_KEYS) {
+    const oldestKey = set.values().next().value;
+    if (oldestKey !== undefined) set.delete(oldestKey);
+  }
+  set.add(key);
+}
+
+function rowAnimationKey(at: number, rowKey?: string): string {
+  return rowKey !== undefined && rowKey !== "" ? rowKey : String(at);
+}
+
+/**
+ * Record that a timeline row has committed so later remounts (e.g. after
+ * virtual-list recycling) do not replay the entrance animation.
+ */
+export function markRowAnimated(agentId: string, at: number, rowKey?: string): void {
+  if (agentId === "") return;
+  rememberAnimatedKey(agentId, rowAnimationKey(at, rowKey));
+}
+
+/**
+ * Pure read-only check for whether a mounting timeline row arrived live and
+ * should play a one-shot entrance animation.
+ *
+ * Replayed history rows, bulk-load bursts, older rows remounting after
+ * virtual-list recycling, and rows whose key has already committed via
+ * {@link markRowAnimated} all return `false` so only genuine live arrivals
+ * animate. Deliberately side-effect free so React 18 StrictMode double-invoked
+ * `useState` initializers and discarded concurrent renders always observe the
+ * same result.
+ */
+export function shouldEnterLive(
+  agentId: string,
+  at: number,
+  liveHint = false,
+  rowKey?: string,
+  now = Date.now(),
+): boolean {
+  if (agentId === "") return false;
+  const key = rowAnimationKey(at, rowKey);
+  if (animatedKeys.get(agentId)?.has(key)) return false;
+
+  const state = rows.get(agentId);
+  if (state !== undefined) {
+    if (now < state.replayUntil) return false;
+    if (state.recent.filter((t) => now - t < BULK_WINDOW_MS).length >= BULK_MIN_ROWS - 1) {
+      return false;
+    }
+    if (at < state.at) return false;
+    return true;
+  }
+
+  // Session has not settled its first render pass yet: only allow a live row
+  // (e.g. a brand-new session's first streaming thought or running tool) when
+  // no multi-row history pass is queued. Deliberately avoids touching `rows` so
+  // `noteRender`'s first-pass `known === undefined` invariant stays intact.
+  if (liveHint === true && (pending.get(agentId)?.fresh?.size ?? 0) <= 1) {
+    return true;
+  }
+  return false;
+}
+
+/** Clear per-agent (or all) module state. Intended for offline tests. */
+export function resetNewestForTests(agentId?: string): void {
+  if (agentId === undefined) {
+    rows.clear();
+    pending.clear();
+    animatedKeys.clear();
+    flushScheduled = false;
+    seqCounter = 0;
+    return;
+  }
+  rows.delete(agentId);
+  pending.delete(agentId);
+  animatedKeys.delete(agentId);
+}
+
 /**
  * The pulse for one timeline row.
  *
@@ -250,7 +347,7 @@ export function useRowPulse(
   agentId: string,
   timestamp: Date | string | number,
 ): RowPulse {
-  const at = atOf(timestamp);
+  const at = normalizeRowTimestamp(timestamp);
   // A row that has never committed calls this for the first time: that is what
   // `flush` counts to tell a history load (several first paints in one pass)
   // from live activity (one row per pass).

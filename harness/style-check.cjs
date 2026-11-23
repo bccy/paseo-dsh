@@ -45,6 +45,9 @@ const {
   DIFF_TINT_DARK,
   DIFF_TINT_LIGHT,
   FOLD_LINES,
+  FRAMELESS_BORDER_WIDTH,
+  FRAMELESS_GAP,
+  FRAMELESS_PADDING_LEFT,
   HAIRLINE,
   OUTPUT_FONT_SIZE,
   OUTPUT_LINE_HEIGHT,
@@ -123,7 +126,10 @@ const {
   diffTint,
   diffTotals,
   dividerStyle,
+  expandedScrollStyle,
   foldWindow,
+  framelessBlockStyle,
+  framelessHeadStyle,
   isLightSurface,
   outputRegionStyle,
   outputTextStyle,
@@ -185,7 +191,7 @@ function requireHarnessModule(name) {
   throw new Error(`could not find harness/${name} above ${__dirname}`);
 }
 
-const { attributeOf, callArguments, elementsWithAttributes, mentions, splitArguments } =
+const { attributeOf, callArguments, codeOnly, elementsWithAttributes, mentions, splitArguments } =
   requireHarnessModule("source-shape.cjs");
 
 /**
@@ -210,6 +216,11 @@ function findRepoFile(relative, levels = 4) {
 const TOOL_CALL_SOURCE = findRepoFile("client/tool-call.tsx");
 if (TOOL_CALL_SOURCE === undefined) {
   console.error(`could not find paseo-plugin/client/tool-call.tsx above ${__dirname}`);
+  process.exit(1);
+}
+const TEAM_CARD_SOURCE = findRepoFile("client/team-card.tsx");
+if (TEAM_CARD_SOURCE === undefined) {
+  console.error(`could not find paseo-plugin/client/team-card.tsx above ${__dirname}`);
   process.exit(1);
 }
 
@@ -771,6 +782,96 @@ console.log("folding and caps for the next phase");
   // the only thing keeping a long log from pushing the timeline down.
   equal("the terminal output scrolls in 224px", TERMINAL_OUTPUT_MAX_HEIGHT, 224);
   equal("the code card caps at 260px", CODE_MAX_HEIGHT, 260);
+}
+
+console.log("frameless expanded block and scroll cap tokens");
+{
+  equal("frameless paddingLeft", FRAMELESS_PADDING_LEFT, 10);
+  equal("frameless left rail width", FRAMELESS_BORDER_WIDTH, 2);
+  equal("frameless stacked gap", FRAMELESS_GAP, 4);
+
+  const block = framelessBlockStyle(COLORS);
+  equal("frameless block paddingLeft", block.paddingLeft, 10);
+  equal("frameless block borderLeftWidth", block.borderLeftWidth, 2);
+  equal("frameless block borderLeftColor is theme border", block.borderLeftColor, COLORS.border);
+  equal("frameless block gap", block.gap, 4);
+  check("frameless block has no borderRadius", !("borderRadius" in block), JSON.stringify(block));
+  check("frameless block has no backgroundColor", !("backgroundColor" in block), JSON.stringify(block));
+  check("frameless block has no surrounding borderWidth", !("borderWidth" in block), JSON.stringify(block));
+
+  const head = framelessHeadStyle(COLORS);
+  check("frameless head is transparent (no backgroundColor)", !("backgroundColor" in head), JSON.stringify(head));
+  equal("frameless head flexDirection", head.flexDirection, "row");
+  equal("frameless head alignItems", head.alignItems, "center");
+  equal("frameless head justifyContent", head.justifyContent, "space-between");
+  equal("frameless head gap", head.gap, CARD_HEAD_GAP);
+  equal("frameless head paddingBottom", head.paddingBottom, FRAMELESS_GAP);
+  equal("frameless head default hairline bottom divider", head.borderBottomWidth, HAIRLINE);
+  equal("frameless head bottom divider colour", head.borderBottomColor, COLORS.border);
+  equal("frameless head passes RN hairline through", framelessHeadStyle(COLORS, 0.33).borderBottomWidth, 0.33);
+
+  const cap260 = expandedScrollStyle(260);
+  const cap420 = expandedScrollStyle(420);
+  equal("expandedScrollStyle binds maxHeight (260)", cap260.maxHeight, 260);
+  equal("expandedScrollStyle binds maxHeight (420)", cap420.maxHeight, 420);
+  equal("expandedScrollStyle returns only maxHeight", JSON.stringify(Object.keys(cap260)), '["maxHeight"]');
+}
+
+console.log("frameless layout guards on tool-call.tsx and team-card.tsx");
+{
+  const toolCallCode = codeOnly(readFileSync(TOOL_CALL_SOURCE, "utf8"));
+  const teamCardCode = codeOnly(readFileSync(TEAM_CARD_SOURCE, "utf8"));
+
+  const toolFramelessBlock = callArguments(toolCallCode, "framelessBlockStyle");
+  const toolFramelessHead = callArguments(toolCallCode, "framelessHeadStyle");
+  const teamFramelessBlock = callArguments(teamCardCode, "framelessBlockStyle");
+  check(
+    "tool-call.tsx uses framelessBlockStyle(colors)",
+    toolFramelessBlock.some((args) => mentions(args, "colors")),
+    `found ${String(toolFramelessBlock.length)} call(s)`,
+  );
+  check(
+    "tool-call.tsx uses framelessHeadStyle(colors, hairline)",
+    toolFramelessHead.some((args) => mentions(args, "colors") && mentions(args, "hairline")),
+    `found ${String(toolFramelessHead.length)} call(s)`,
+  );
+  check(
+    "team-card.tsx uses framelessBlockStyle(colors)",
+    teamFramelessBlock.some((args) => mentions(args, "colors")),
+    `found ${String(teamFramelessBlock.length)} call(s)`,
+  );
+  check(
+    "tool-call.tsx does not use cardStyle or cardHeadStyle",
+    !mentions(toolCallCode, "cardStyle") && !mentions(toolCallCode, "cardHeadStyle"),
+    "found cardStyle/cardHeadStyle reference in tool-call.tsx",
+  );
+  check(
+    "team-card.tsx does not use cardStyle or cardHeadStyle",
+    !mentions(teamCardCode, "cardStyle") && !mentions(teamCardCode, "cardHeadStyle"),
+    "found cardStyle/cardHeadStyle reference in team-card.tsx",
+  );
+
+  const surfaceChecks = callArguments(toolCallCode, "isLightSurface");
+  check(
+    "diff wash surface check reads colors.surface0 (not surface1)",
+    surfaceChecks.length > 0 &&
+      surfaceChecks.every((args) => /\bcolors\.surface0\b/.test(args) && !/\bsurface1\b/.test(args)),
+    surfaceChecks.map((args) => `isLightSurface(${args.trim()})`).join(" | ") || "(no call found)",
+  );
+
+  const HARDCODED_COLOUR = /#[0-9a-fA-F]{3,8}\b|\brgba?\s*\(|\bhsla?\s*\(/;
+  const toolColourHit = HARDCODED_COLOUR.exec(toolCallCode);
+  const teamColourHit = HARDCODED_COLOUR.exec(teamCardCode);
+  check(
+    "tool-call.tsx contains no hardcoded hex/rgb/hsl colours",
+    toolColourHit === null,
+    toolColourHit === null ? "" : `matched ${toolColourHit[0]}`,
+  );
+  check(
+    "team-card.tsx contains no hardcoded hex/rgb/hsl colours",
+    teamColourHit === null,
+    teamColourHit === null ? "" : `matched ${teamColourHit[0]}`,
+  );
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 const { test } = require("node:test");
 
 const {
+  EXPANDED_MAX_HEIGHT_DEFAULT,
   LANGUAGE_DEFAULTS,
   TIMELINE_STYLE_DEFAULTS,
   TIMELINE_STYLE_KEYS,
@@ -23,6 +24,7 @@ const {
 
 test("TIMELINE_STYLE_DEFAULTS mirrors schema defaults and preserves fork layout", () => {
   const defaults = timelineStyleSettings.schema.parse({});
+  assert.equal(EXPANDED_MAX_HEIGHT_DEFAULT, 260);
   assert.deepEqual(
     TIMELINE_STYLE_DEFAULTS,
     {
@@ -30,12 +32,14 @@ test("TIMELINE_STYLE_DEFAULTS mirrors schema defaults and preserves fork layout"
       toolRowPaddingY: 0,
       toolRowMinHeight: 24,
       toolRowGap: 6,
+      expandedMaxHeight: 260,
       commandMaxHeightRatio: 0.25,
       commandMinHeight: 150,
     },
     "defaults must keep the fork's tokens.ts spacing",
   );
   assert.deepEqual(TIMELINE_STYLE_DEFAULTS, defaults, "TIMELINE_STYLE_DEFAULTS must mirror the schema");
+  assert.ok(TIMELINE_STYLE_KEYS.includes("expandedMaxHeight"), "TIMELINE_STYLE_KEYS must include expandedMaxHeight");
   assert.deepEqual(
     [...TIMELINE_STYLE_KEYS].sort(),
     Object.keys(defaults).sort(),
@@ -43,7 +47,7 @@ test("TIMELINE_STYLE_DEFAULTS mirrors schema defaults and preserves fork layout"
   );
   assert.equal(timelineStyleSettings.id, "timeline-style");
   assert.equal(timelineStyleSettings.scope, "host");
-  assert.equal(timelineStyleSettings.version, 5);
+  assert.equal(timelineStyleSettings.version, 6);
 });
 
 test("timelineStyleSettings schema enforces numeric bounds", () => {
@@ -55,13 +59,17 @@ test("timelineStyleSettings schema enforces numeric bounds", () => {
   assert.throws(() => timelineStyleSettings.schema.parse({ toolRowMinHeight: 65 }));
   assert.throws(() => timelineStyleSettings.schema.parse({ toolRowGap: -1 }));
   assert.throws(() => timelineStyleSettings.schema.parse({ toolRowGap: 25 }));
+  assert.throws(() => timelineStyleSettings.schema.parse({ expandedMaxHeight: 119 }));
+  assert.throws(() => timelineStyleSettings.schema.parse({ expandedMaxHeight: 641 }));
+  assert.equal(timelineStyleSettings.schema.parse({ expandedMaxHeight: 120 }).expandedMaxHeight, 120);
+  assert.equal(timelineStyleSettings.schema.parse({ expandedMaxHeight: 640 }).expandedMaxHeight, 640);
   assert.throws(() => timelineStyleSettings.schema.parse({ commandMaxHeightRatio: 0.09 }));
   assert.throws(() => timelineStyleSettings.schema.parse({ commandMaxHeightRatio: 0.61 }));
   assert.throws(() => timelineStyleSettings.schema.parse({ commandMinHeight: 59 }));
   assert.throws(() => timelineStyleSettings.schema.parse({ commandMinHeight: 361 }));
 });
 
-test("v1-v5 migrate collapses legacy margin fields and falls back to fork default 0", () => {
+test("v1-v5 migrate collapses legacy margin fields, backfills expandedMaxHeight, and preserves valid values", () => {
   assert.deepEqual(
     timelineStyleSettings.migrate(
       {
@@ -74,29 +82,49 @@ test("v1-v5 migrate collapses legacy margin fields and falls back to fork defaul
       },
       5,
     ),
-    { rowMarginY: 2, toolRowGap: 10 },
+    { rowMarginY: 2, toolRowGap: 10, expandedMaxHeight: 260 },
+  );
+  assert.deepEqual(
+    timelineStyleSettings.migrate(
+      {
+        rowMarginY: 2,
+        expandedMaxHeight: 400,
+      },
+      5,
+    ),
+    { rowMarginY: 2, expandedMaxHeight: 400 },
+  );
+  assert.deepEqual(
+    timelineStyleSettings.migrate(
+      {
+        rowMarginY: 2,
+        expandedMaxHeight: "invalid",
+      },
+      5,
+    ),
+    { rowMarginY: 2, expandedMaxHeight: 260 },
   );
   assert.deepEqual(
     timelineStyleSettings.migrate(
       { toolRowMarginY: -8, liveReasoningRowMarginY: -8, liveRowMarginY: 12 },
       4,
     ),
-    { rowMarginY: -8 },
+    { rowMarginY: -8, expandedMaxHeight: 260 },
   );
   assert.deepEqual(
     timelineStyleSettings.migrate(
       { toolRowMarginY: 4, liveReasoningRowMarginY: 16 },
       3,
     ),
-    { rowMarginY: 4 },
+    { rowMarginY: 4, expandedMaxHeight: 260 },
   );
   assert.deepEqual(
     timelineStyleSettings.migrate({ liveRowMarginY: 8, liveToolRowMarginY: -4 }, 1),
-    { rowMarginY: 8 },
+    { rowMarginY: 8, expandedMaxHeight: 260 },
   );
   assert.deepEqual(
     timelineStyleSettings.migrate({}, 1),
-    { rowMarginY: 0 },
+    { rowMarginY: 0, expandedMaxHeight: 260 },
   );
   assert.equal(timelineStyleSettings.migrate(null, 1), null);
   assert.deepEqual(timelineStyleSettings.migrate([1, 2], 1), [1, 2]);

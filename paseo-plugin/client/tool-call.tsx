@@ -1,28 +1,25 @@
 /**
  * Inline tool-call row for the Paseo timeline.
  *
- * Paseo's stock tool row is a single line that expands on click. This keeps
- * that shape and its icon, and expands downward the way the reasoning row
- * does: the block below the row is a card at full width, not a squeeze beside
- * the icon and label.
+ * Renders a compact frameless disclosure row aligned with `InlineThinking`:
+ * a fixed 24px head row (state-tinted glyph, label, 2x2 separator square,
+ * summary, and optional `+A -R` diff stat) that toggles an indented,
+ * borderless expanded flow marked only by a 2px left rail (`framelessBlockStyle`
+ * in `./tokens`).
  *
- * The row head and the card follow DSH's own metrics (`./tokens`): a fixed
- * 24px line, a 13px UI-font summary, a 2x2 separator square, 16px card radius
- * on a card surface, and a `+A -R` suffix on diff rows. A command row splits
- * into a command banner, a hairline, and an output region; a diff row gives
- * every line a 3px semantic left bar and an 8%/12% wash.
- *
- * `data.kind` is DSH's own block dispatch, computed in `./tool-call-data`:
- * `terminal` (command banner + output), `diff` (hunks + `@@`), `read` (numbered
- * lines), `search` (grep/glob groups), `web` (citations / fetch status) and
- * `generic` (one code surface). Each structured block also carries its payload;
- * when that payload is missing the renderer falls back to the plain text body
- * this row showed before those blocks existed, so an unrecognized meta is a
- * plainer row rather than an empty card.
- *
- * While the tool is running the row pulses (see `./text-shimmer` for the sweep
- * and `./newest` for the position rule that decides *which* row runs it),
- * matching the "still working" feel Paseo's own loading rows have.
+ * Interaction & layout invariants:
+ * - **Head/body separation**: only the head line is a `<Pressable>`; the
+ *   expanded body is its sibling `<View>` so scrolling, selecting, or copying
+ *   inside an expanded block never collapses the row.
+ * - **Uniform scroll cap**: every expanded surface renders its full payload
+ *   inside a height-capped `<ScrollView>` bound to `style.expandedMaxHeight`
+ *   (and tagged with `SCROLL_BOX_TEST_ID` for Web `overscroll-behavior: contain`),
+ *   replacing the old head+tail line folding.
+ * - **Semantic syntax highlighting**: shell commands, read files, diffs, JSON
+ *   fields, and inferred generic code blocks use `HighlightedCode` /
+ *   `HighlightedLine` strictly over Paseo's 11 semantic theme colours.
+ * - **Live entrance motion**: wrapped in `<RowEntrance>` so newly arrived rows
+ *   lift and fade in once while replayed history renders statically.
  *
  * @module dsh-paseo/client/tool-call
  */
@@ -42,92 +39,89 @@ import {
   type ViewStyle,
 } from "react-native";
 import {
+  EXPANDED_MAX_HEIGHT_DEFAULT,
   TIMELINE_STYLE_DEFAULTS,
   resolveCommandMaxHeight,
   timelineStyleSettings,
   type TimelineStyleValues,
 } from "../shared/settings";
+import { highlightModeFor, tokenizeCode, type CodeToken, type HighlightMode } from "./code-highlight";
+import { HighlightedCode, HighlightedLine } from "./highlighted-code";
+import { ringColorFor } from "./jobs-popover-layout";
 import { shouldPulse, useRowPulse } from "./newest";
 import { PASEO_MARK_ICON } from "./paseo-mark";
-import { blockCopy, type GoalBlockData, type ReadBlockData, type SearchBlockData, type ToolCallData, type ToolFieldEntry, type ToolFieldsData, type WebBlockData } from "./tool-call-data";
-import { useLocaleText } from "./use-locale";
-import { TextShimmer } from "./text-shimmer";
+import {
+  RowEntrance,
+  SCROLL_BOX_TEST_ID,
+  renderInkTrailText,
+  shouldCollapseOnBodyPress,
+  useInkStreamReveal,
+} from "./row-entrance";
 import { TeamBlockView } from "./team-card";
-import { ringColorFor } from "./jobs-popover-layout";
+import { TextShimmer } from "./text-shimmer";
+import {
+  blockCopy,
+  paseoMcpLabel,
+  type GoalBlockData,
+  type ReadBlockData,
+  type SearchBlockData,
+  type ToolCallData,
+  type ToolFieldEntry,
+  type ToolFieldsData,
+  type WebBlockData,
+} from "./tool-call-data";
 import {
   BODY_INDENT,
-  type TokenColors,
   CARD_HEAD_GAP,
+  CODE_FONT_FAMILY,
+  CODE_FONT_SIZE,
+  GOAL_CARD_LINE_HEIGHT,
+  GOAL_FIELD_COLUMN_GAP,
+  GOAL_FIELD_LABEL_WIDTH,
+  GOAL_FIELD_ROW_GAP,
+  GOAL_FIELDS_MARGIN_TOP,
   ROW_FONT_SIZE,
   ROW_GAP,
   ROW_LINE_HEIGHT,
   WEB_META_GAP,
   WEB_TRUNCATED_MARGIN_TOP,
-  cardHeadActionsStyle,
   cardHeadActionTextStyle,
+  cardHeadActionsStyle,
   cardHeadHeadingStyle,
   cardHeadLangTextStyle,
   cardHeadStatusTextStyle,
-  cardHeadStyle,
   cardHeadTitleTextStyle,
-  cardStyle,
-  CODE_FONT_FAMILY,
-  CODE_FONT_SIZE,
-  CODE_MAX_HEIGHT,
-  GOAL_CARD_LINE_HEIGHT,
-  GOAL_CARD_PADDING_HORIZONTAL,
-  GOAL_CARD_PADDING_VERTICAL,
-  GOAL_FIELD_COLUMN_GAP,
-  GOAL_FIELD_LABEL_WIDTH,
-  GOAL_FIELD_ROW_GAP,
-  GOAL_FIELDS_MARGIN_TOP,
-  codeRegionStyle,
   codeTextStyle,
-  commandRegionStyle,
   commandTextStyle,
-  DIFF_LINE_PADDING_HORIZONTAL,
-  READ_BODY_PADDING_BOTTOM,
-  READ_BODY_PADDING_HORIZONTAL,
-  READ_BODY_PADDING_TOP,
-  SEARCH_BODY_PADDING_BOTTOM,
-  SEARCH_BODY_PADDING_RIGHT,
-  SEARCH_BODY_PADDING_TOP,
-  diffBodyStyle,
   diffBodyTextStyle,
   diffChromeTextStyle,
   diffLineStyle,
   diffMarkerTextStyle,
-  diffRowStyle,
   diffStat,
   diffStatTextStyle,
   dividerStyle,
-  FOLD_LINES,
-  foldWindow,
+  expandedScrollStyle,
+  framelessBlockStyle,
+  framelessHeadStyle,
   isLightSurface,
-  outputRegionStyle,
   outputTextStyle,
-  readExpandTextStyle,
   readGutterTextStyle,
   readLineStyle,
   readLineTextStyle,
   rowHeadStyle,
+  rowIconColor,
   rowLabelTextStyle,
   rowRootStyle,
-  rowIconColor,
   searchEmptyTextStyle,
-  searchExpandTextStyle,
   searchFileCountTextStyle,
   searchFileHeadStyle,
   searchFilePathTextStyle,
-  searchHeadStyle,
   searchLineNumberTextStyle,
   searchLineStyle,
   searchLineTextStyle,
   searchSummaryTextStyle,
   separatorStyle,
   summaryTextStyle,
-  terminalOutputScrollStyle,
-  webCardBodyStyle,
   webFetchStyle,
   webMetaTextStyle,
   webPublishedTextStyle,
@@ -135,14 +129,48 @@ import {
   webSourceIndexTextStyle,
   webSourceLinkTextStyle,
   webSourceRowStyle,
-  webSourcesStyle,
   webTruncatedTextStyle,
   webUrlTextStyle,
+  type TokenColors,
 } from "./tokens";
+import { useLocaleText } from "./use-locale";
 
 /* -------------------------------------------------------------------------- */
-/* Shared pieces                                                              */
+/* Shared helpers                                                             */
 /* -------------------------------------------------------------------------- */
+
+/** Extract a file extension or well-known filename token from a path/headline. */
+function extensionOf(path: string): string | undefined {
+  const trimmed = path.trim();
+  if (trimmed === "") return undefined;
+  const base = trimmed.split(/[\\/]/).pop() ?? "";
+  if (base === "") return undefined;
+  const lower = base.toLowerCase();
+  if (lower === "dockerfile" || lower === "makefile") return lower;
+  const dot = base.lastIndexOf(".");
+  if (dot <= 0 || dot === base.length - 1) return undefined;
+  const ext = base.slice(dot + 1);
+  return /^[a-z0-9_+-]+$/i.test(ext) ? ext.toLowerCase() : undefined;
+}
+
+/**
+ * Infer a highlight language for a generic code block: prefer a recognizable
+ * file extension from `headline`, otherwise detect JSON objects/arrays in `body`.
+ */
+function inferLang(headline: string, body: string): string | undefined {
+  const fromHeadline = extensionOf(headline);
+  if (fromHeadline !== undefined && highlightModeFor(fromHeadline) !== "plain") {
+    return fromHeadline;
+  }
+  const trimmed = body.trim();
+  if (
+    (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+    (trimmed.startsWith("[") && trimmed.endsWith("]"))
+  ) {
+    return "json";
+  }
+  return undefined;
+}
 
 /**
  * Copy-to-clipboard with DSH's own feedback: the label flips for a second.
@@ -166,6 +194,22 @@ function useCopy(text: string): { copied: boolean; onCopy: () => void } {
   return { copied, onCopy };
 }
 
+/** Normalize a timeline item timestamp into finite epoch milliseconds, or 0. */
+function normalizeTimestampMs(timestamp: unknown): number {
+  if (timestamp instanceof Date) {
+    const ms = timestamp.getTime();
+    return Number.isFinite(ms) ? ms : 0;
+  }
+  if (typeof timestamp === "number") {
+    return Number.isFinite(timestamp) ? timestamp : 0;
+  }
+  if (typeof timestamp === "string") {
+    const parsed = Date.parse(timestamp);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}
+
 /** The copy control: text, not an icon, so it needs no host icon name. */
 function CopyControl({ text, style }: { text: string; style: StyleProp<TextStyle> }) {
   const copy = blockCopy();
@@ -175,10 +219,9 @@ function CopyControl({ text, style }: { text: string; style: StyleProp<TextStyle
     <Pressable
       accessibilityRole="button"
       accessibilityLabel={label}
+      style={{ flexShrink: 0 }}
       onPress={(event) => {
-        // The whole row is a Pressable too; without this a copy would also
-        // collapse the card it was clicked in (RN Web bubbles the click).
-        event.stopPropagation();
+        event?.stopPropagation?.();
         onCopy();
       }}
     >
@@ -187,41 +230,7 @@ function CopyControl({ text, style }: { text: string; style: StyleProp<TextStyle
   );
 }
 
-/**
- * The one fold control every capped block shares.
- *
- * DSH has no separate "expand all" button: the same control reads
- * `… 其余 N 行` while folded and `收起` once open.
- */
-function FoldToggle({
-  hidden,
-  expanded,
-  onToggle,
-  textStyle,
-  accessibilityLabel,
-}: {
-  hidden: number;
-  expanded: boolean;
-  onToggle: () => void;
-  textStyle: StyleProp<TextStyle>;
-  accessibilityLabel: string;
-}) {
-  const copy = blockCopy();
-  return (
-    <Pressable
-      accessibilityRole="button"
-      accessibilityLabel={accessibilityLabel}
-      onPress={(event) => {
-        event.stopPropagation();
-        onToggle();
-      }}
-    >
-      <Text style={textStyle}>{expanded ? copy.collapse : copy.expandRest(hidden)}</Text>
-    </Pressable>
-  );
-}
-
-/** DSH's `CodeToolbar`: language tag, title, status, copy. */
+/** Minimal transparent toolbar above a frameless block: language, title, status, copy. */
 function CardHead({
   lang,
   title,
@@ -284,8 +293,7 @@ function Link({
  * RN has no `pre` and no "do not wrap but stay scrollable" text mode:
  * `numberOfLines={1}` would truncate the content and a plain `Text` wraps it.
  * A horizontal scroll view is the one faithful option, so the search and read
- * rows live in one. The diff and terminal surfaces keep wrapping — that is what
- * the row already did before these blocks existed.
+ * rows live in one. The diff and terminal surfaces keep wrapping.
  */
 function CodeScroller({
   style,
@@ -302,7 +310,7 @@ function CodeScroller({
       showsHorizontalScrollIndicator={false}
       nestedScrollEnabled
       style={style}
-      contentContainerStyle={contentStyle}
+      contentContainerStyle={[contentStyle, { flexGrow: 1 }]}
     >
       {children}
     </ScrollView>
@@ -323,7 +331,7 @@ type SearchRow =
     }
   | { readonly type: "path"; readonly path: string };
 
-/** Flatten a search card into rows, dropping a collapsed group's matches. */
+/** Flatten a search block into rows, dropping a collapsed group's matches. */
 function searchRows(data: SearchBlockData, collapsed: ReadonlySet<number>): SearchRow[] {
   if (data.shape === "paths") return data.paths.map((path) => ({ type: "path", path }));
   const rows: SearchRow[] = [];
@@ -345,31 +353,15 @@ function searchRows(data: SearchBlockData, collapsed: ReadonlySet<number>): Sear
 function SearchBlockView({
   data,
   styles,
+  onCollapse,
 }: {
   data: SearchBlockData;
   styles: BlockStyles;
+  onCollapse: (event?: unknown) => void;
 }) {
   const copy = blockCopy();
-  const [expanded, setExpanded] = useState(false);
   const [collapsed, setCollapsed] = useState<ReadonlySet<number>>(() => new Set<number>());
   const rows = useMemo(() => searchRows(data, collapsed), [data, collapsed]);
-  const folded = foldWindow(rows.length, FOLD_LINES.search, expanded);
-  const head = folded.capped ? rows.slice(0, folded.headLines) : rows;
-  let tail: SearchRow[] = folded.capped ? rows.slice(rows.length - folded.tailLines) : [];
-  // DSH re-draws a group's header when the fold drops it and the tail starts
-  // mid-group: a bare match row with no path above it reads as a different
-  // file's result. The header takes the leading match's slot, so the tail keeps
-  // the same number of rows.
-  if (folded.capped && tail.length > 0) {
-    const lead = tail[0];
-    if (
-      lead.type === "match" &&
-      !head.some((row) => row.type === "file" && row.index === lead.fileIndex)
-    ) {
-      const header = rows.find((row) => row.type === "file" && row.index === lead.fileIndex);
-      if (header !== undefined) tail = [header, ...tail.slice(1)];
-    }
-  }
   const summary =
     data.shape === "paths"
       ? copy.pathsSummary(data.shown, data.total, data.truncated)
@@ -379,7 +371,9 @@ function SearchBlockView({
     if (row.type === "path") {
       return (
         <View key={key} style={styles.searchLine}>
-          <Text style={styles.searchLineText}>{row.path}</Text>
+          <Text style={styles.searchLineText} selectable>
+            {row.path}
+          </Text>
         </View>
       );
     }
@@ -387,11 +381,11 @@ function SearchBlockView({
       return (
         <View key={key} style={styles.searchLine}>
           {/* The number is DSH's `<span class="lineNumber">`, dimmed so the
-              match text stays salient. Nothing highlights the matched
-              substring — DSH does not, and inventing it would make our rows
-              disagree with the tool the model saw. */}
+              match text stays salient. */}
           <Text style={styles.searchLineNumber}>{`${row.lineNumber}: `}</Text>
-          <Text style={styles.searchLineText}>{row.line}</Text>
+          <Text style={styles.searchLineText} selectable>
+            {row.line}
+          </Text>
         </View>
       );
     }
@@ -401,7 +395,7 @@ function SearchBlockView({
         accessibilityRole="button"
         accessibilityLabel={`${row.path} ${row.count}`}
         onPress={(event) => {
-          event.stopPropagation();
+          event?.stopPropagation?.();
           setCollapsed((previous) => {
             const next = new Set(previous);
             if (next.has(row.index)) next.delete(row.index);
@@ -419,7 +413,7 @@ function SearchBlockView({
   };
 
   return (
-    <View style={styles.card}>
+    <View style={styles.block}>
       <View style={styles.searchHead}>
         <Text style={styles.searchSummary} numberOfLines={1} ellipsizeMode="tail">
           {summary}
@@ -429,21 +423,19 @@ function SearchBlockView({
       {rows.length === 0 ? (
         <Text style={styles.searchEmpty}>{copy.noResults}</Text>
       ) : (
-        <CodeScroller style={styles.searchScroll} contentStyle={styles.searchBody}>
-          <View>
-            {head.map((row, index) => renderRow(row, `head:${index}`))}
-            {folded.hidden > 0 ? (
-              <FoldToggle
-                hidden={folded.hidden}
-                expanded={expanded}
-                onToggle={() => setExpanded((value) => !value)}
-                textStyle={styles.searchExpand}
-                accessibilityLabel={expanded ? copy.collapseAria : copy.expandAria(folded.hidden)}
-              />
-            ) : null}
-            {tail.map((row, index) => renderRow(row, `tail:${index}`))}
-          </View>
-        </CodeScroller>
+        <ScrollView
+          style={styles.expandedScroll}
+          nestedScrollEnabled
+          testID={SCROLL_BOX_TEST_ID}
+        >
+          <CodeScroller style={styles.searchScroll} contentStyle={styles.searchBody}>
+            <Pressable onPress={onCollapse} style={{ flex: 1 }}>
+              <View>
+                {rows.map((row, index) => renderRow(row, `row:${index}`))}
+              </View>
+            </Pressable>
+          </CodeScroller>
+        </ScrollView>
       )}
     </View>
   );
@@ -457,22 +449,25 @@ function ReadBlockView({
   data,
   styles,
   colors,
+  onCollapse,
 }: {
   data: ReadBlockData;
   styles: BlockStyles;
   colors: TokenColors;
+  onCollapse: (event?: unknown) => void;
 }) {
   const copy = blockCopy();
-  const [expanded, setExpanded] = useState(false);
   const digits = data.lines.reduce((max, line) => Math.max(max, String(line.number).length), 0);
   const gutter = useMemo(() => readGutterTextStyle(colors, digits), [colors, digits]);
-  const expand = useMemo(() => readExpandTextStyle(colors, digits), [colors, digits]);
-  const folded = foldWindow(data.lines.length, FOLD_LINES.read, expanded);
-  const head = folded.capped ? data.lines.slice(0, folded.headLines) : data.lines;
-  const tail = folded.capped ? data.lines.slice(data.lines.length - folded.tailLines) : [];
+  const lang = data.lang !== "" ? data.lang : extensionOf(data.path);
+  const mode = highlightModeFor(lang);
+  const tokenLines: readonly (readonly CodeToken[])[] = useMemo(
+    () => tokenizeCode(data.lines.map((line) => line.text).join("\n"), lang),
+    [data.lines, lang],
+  );
   // DSH says so when the tool returned a window of a longer file.
   const windowed = data.lines.length < data.totalLines;
-  const renderLine = (line: { number: number; text: string }) => (
+  const renderLine = (line: { number: number; text: string }, index: number) => (
     <View key={line.number} style={styles.readLine}>
       {/* `aria-hidden` mirrors DSH's `user-select: none` gutter: the number is
           chrome, and copying the block should not drag it along. `selectable` is
@@ -480,13 +475,18 @@ function ReadBlockView({
       <Text style={gutter} aria-hidden>
         {line.number}
       </Text>
-      <Text style={styles.readLineText} selectable>
-        {line.text}
-      </Text>
+      <HighlightedLine
+        line={line.text}
+        mode={mode}
+        tokens={tokenLines[index]}
+        colors={colors}
+        baseStyle={styles.readLineText}
+        selectable
+      />
     </View>
   );
   return (
-    <View style={styles.card}>
+    <View style={styles.block}>
       <CardHead
         lang={data.lang}
         title={data.path}
@@ -494,21 +494,17 @@ function ReadBlockView({
         text={data.text}
         styles={styles}
       />
-      <CodeScroller style={styles.readScroll} contentStyle={styles.readBody}>
-        <View>
-          {head.map(renderLine)}
-          {folded.hidden > 0 ? (
-            <FoldToggle
-              hidden={folded.hidden}
-              expanded={expanded}
-              onToggle={() => setExpanded((value) => !value)}
-              textStyle={expand}
-              accessibilityLabel={expanded ? copy.collapseAria : copy.expandAria(folded.hidden)}
-            />
-          ) : null}
-          {tail.map(renderLine)}
-        </View>
-      </CodeScroller>
+      <ScrollView
+        style={styles.expandedScroll}
+        nestedScrollEnabled
+        testID={SCROLL_BOX_TEST_ID}
+      >
+        <CodeScroller style={styles.readScroll} contentStyle={styles.readBody}>
+          <Pressable onPress={onCollapse} style={{ flex: 1 }}>
+            <View>{data.lines.map(renderLine)}</View>
+          </Pressable>
+        </CodeScroller>
+      </ScrollView>
     </View>
   );
 }
@@ -529,17 +525,35 @@ function DiffRows({
   rows,
   styles,
   keyPrefix,
+  mode,
+  lang,
+  colors,
 }: {
   rows: readonly { kind: string; text: string }[];
   styles: BlockStyles;
   keyPrefix: string;
+  mode: HighlightMode;
+  lang?: string;
+  colors: TokenColors;
 }) {
+  const tokenLines: readonly (readonly CodeToken[])[] | null = useMemo(
+    () => (mode === "plain" ? null : tokenizeCode(rows.map((row) => row.text).join("\n"), lang)),
+    [rows, mode, lang],
+  );
   return (
     <>
       {rows.map((row, index) => {
         const key = `${keyPrefix}:${index}`;
         if (row.kind === "add" || row.kind === "del" || row.kind === "context") {
           const marker = row.kind === "add" ? "+" : row.kind === "del" ? "-" : " ";
+          const baseTextStyle =
+            mode === "plain"
+              ? row.kind === "add"
+                ? styles.diffTextAdd
+                : row.kind === "del"
+                  ? styles.diffTextDel
+                  : styles.diffTextContext
+              : styles.diffBodyText;
           return (
             <View
               key={key}
@@ -567,17 +581,14 @@ function DiffRows({
               >
                 {marker}
               </Text>
-              <Text
-                style={
-                  row.kind === "add"
-                    ? styles.diffTextAdd
-                    : row.kind === "del"
-                      ? styles.diffTextDel
-                      : styles.diffTextContext
-                }
-              >
-                {row.text === "" ? " " : row.text}
-              </Text>
+              <HighlightedLine
+                line={row.text === "" ? " " : row.text}
+                mode={mode}
+                tokens={row.text === "" ? undefined : tokenLines?.[index]}
+                colors={colors}
+                baseStyle={baseTextStyle}
+                selectable
+              />
             </View>
           );
         }
@@ -585,7 +596,9 @@ function DiffRows({
         // the same 3px left border so it lines up with the changed rows.
         return (
           <View key={key} style={[styles.diffLine, styles.diffContext]}>
-            <Text style={styles.diffChrome}>{row.text}</Text>
+            <Text style={styles.diffChrome} selectable>
+              {row.text}
+            </Text>
           </View>
         );
       })}
@@ -593,39 +606,44 @@ function DiffRows({
   );
 }
 
-function DiffBlockView({ data, styles }: { data: NonNullable<ToolCallData["diffBlock"]>; styles: BlockStyles }) {
+function DiffBlockView({
+  data,
+  styles,
+  colors,
+  onCollapse,
+}: {
+  data: NonNullable<ToolCallData["diffBlock"]>;
+  styles: BlockStyles;
+  colors: TokenColors;
+  onCollapse: (event?: unknown) => void;
+}) {
   const copy = blockCopy();
-  const [expanded, setExpanded] = useState(false);
-  const folded = foldWindow(data.rows.length, FOLD_LINES.diff, expanded);
-  const head = folded.capped ? data.rows.slice(0, folded.headLines) : data.rows;
-  const tail = folded.capped ? data.rows.slice(data.rows.length - folded.tailLines) : [];
+  const rawLang = (data as { lang?: string }).lang;
+  const lang = rawLang !== undefined && rawLang !== "" ? rawLang : extensionOf(data.path);
+  const mode = highlightModeFor(lang);
   const status =
     data.operation === "create" ? copy.create : data.operation === "update" ? copy.update : undefined;
   return (
-    <View style={styles.card}>
+    <View style={styles.block}>
       <CardHead
-        // DSH prints the file's language here. We have no language map (and
-        // DSH's own fallback is a hardcoded `typescript`, a wart the plan says
-        // not to copy), so the tag says what the surface is.
+        // DSH prints the file's language here. We have no hardcoded `typescript`
+        // fallback; keep `"diff"` so the toolbar names the surface honestly.
         lang="diff"
         title={data.path}
         status={status}
         text={data.rows.map(diffRowText).join("\n")}
         styles={styles}
       />
-      <View style={styles.diffBody}>
-        <DiffRows rows={head} styles={styles} keyPrefix="head" />
-        {folded.hidden > 0 ? (
-          <FoldToggle
-            hidden={folded.hidden}
-            expanded={expanded}
-            onToggle={() => setExpanded((value) => !value)}
-            textStyle={styles.diffExpand}
-            accessibilityLabel={expanded ? copy.collapseAria : copy.expandAria(folded.hidden)}
-          />
-        ) : null}
-        <DiffRows rows={tail} styles={styles} keyPrefix="tail" />
-      </View>
+      <ScrollView
+        style={styles.expandedScroll}
+        contentContainerStyle={styles.diffBody}
+        nestedScrollEnabled
+        testID={SCROLL_BOX_TEST_ID}
+      >
+        <Pressable onPress={onCollapse}>
+          <DiffRows rows={data.rows} styles={styles} keyPrefix="diff" mode={mode} lang={lang} colors={colors} />
+        </Pressable>
+      </ScrollView>
     </View>
   );
 }
@@ -634,18 +652,26 @@ function DiffBlockView({ data, styles }: { data: NonNullable<ToolCallData["diffB
 /* Web                                                                        */
 /* -------------------------------------------------------------------------- */
 
-function WebBlockView({ data, styles }: { data: WebBlockData; styles: BlockStyles }) {
+function WebBlockView({
+  data,
+  styles,
+  onCollapse,
+}: {
+  data: WebBlockData;
+  styles: BlockStyles;
+  onCollapse: (event?: unknown) => void;
+}) {
   const copy = blockCopy();
   if (data.shape === "fetch") {
     return (
-      <View style={styles.card}>
+      <View style={styles.block}>
         <View style={styles.webBody}>
           <View style={styles.webFetch}>
             <Link href={data.url} style={styles.webUrl}>
               {data.url}
             </Link>
             <View style={styles.webMetaRow}>
-              {/* `parseWeb` returns a fetch card only when its meta carried a
+              {/* `parseWeb` returns a fetch block only when its meta carried a
                   numeric status code, so this is never null on this shape. */}
               <Text style={styles.webMeta}>{`${copy.http} ${data.statusCode}`}</Text>
               {data.truncated ? (
@@ -658,33 +684,47 @@ function WebBlockView({ data, styles }: { data: WebBlockData; styles: BlockStyle
     );
   }
   return (
-    <View style={styles.card}>
+    <View style={styles.block}>
       <View style={styles.webBody}>
-        {data.answer === "" ? null : <Text style={styles.webSnippet}>{data.answer}</Text>}
-        {data.sources.length === 0 ? (
+        {data.answer === "" && data.sources.length === 0 ? (
           <Text style={styles.webMeta}>{copy.webNoResults}</Text>
         ) : (
-          // DSH caps the citation list at 320px and scrolls it in place; the
-          // whole list stays rendered, so scrolling never hides a source.
-          <ScrollView style={styles.webSources} nestedScrollEnabled>
-            {data.sources.map((source, index) => (
-              <View key={`${index}:${source.url}`} style={styles.webSourceRow}>
-                {/* RN has no `<ol>` and no `value` attribute, so the
-                    reference number is a column of its own. */}
-                <Text style={styles.webSourceIndex}>{`${index + 1}.`}</Text>
-                <View style={styles.webSourceBody}>
-                  <Link href={source.url} style={styles.webSourceLink}>
-                    {source.label}
-                  </Link>
-                  {source.snippet === "" ? null : (
-                    <Text style={styles.webSnippet}>{source.snippet}</Text>
-                  )}
-                  {source.publishedAt === "" ? null : (
-                    <Text style={styles.webPublished}>{source.publishedAt}</Text>
-                  )}
-                </View>
-              </View>
-            ))}
+          <ScrollView
+            style={styles.webSources}
+            nestedScrollEnabled
+            testID={SCROLL_BOX_TEST_ID}
+          >
+            <Pressable onPress={onCollapse}>
+              {data.answer === "" ? null : (
+                <Text style={styles.webSnippet} selectable>
+                  {data.answer}
+                </Text>
+              )}
+              {data.sources.length === 0 ? (
+                <Text style={styles.webMeta}>{copy.webNoResults}</Text>
+              ) : (
+                data.sources.map((source, index) => (
+                  <View key={`${index}:${source.url}`} style={styles.webSourceRow}>
+                    {/* RN has no `<ol>` and no `value` attribute, so the
+                        reference number is a column of its own. */}
+                    <Text style={styles.webSourceIndex}>{`${index + 1}.`}</Text>
+                    <View style={styles.webSourceBody}>
+                      <Link href={source.url} style={styles.webSourceLink}>
+                        {source.label}
+                      </Link>
+                      {source.snippet === "" ? null : (
+                        <Text style={styles.webSnippet} selectable>
+                          {source.snippet}
+                        </Text>
+                      )}
+                      {source.publishedAt === "" ? null : (
+                        <Text style={styles.webPublished}>{source.publishedAt}</Text>
+                      )}
+                    </View>
+                  </View>
+                ))
+              )}
+            </Pressable>
           </ScrollView>
         )}
         {data.truncated ? (
@@ -704,15 +744,17 @@ function buildStyles(
   hairline: number,
   style: TimelineStyleValues,
   commandMaxHeight: number,
+  expandedMaxHeight: number,
 ) {
-  // The wash is 8% on a light card and 12% on a dark one; the card's own
-  // surface is what the diff lines are painted on.
-  const light = isLightSurface(colors.surface1);
+  // Without an enclosing card surface, diff washes paint directly over the
+  // timeline surface (`surface0`): 8% on light themes, 12% on dark themes.
+  const light = isLightSurface(colors.surface0);
   // Drop `rowHeadStyle()`'s fixed `height` so `minHeight: style.toolRowMinHeight`
   // governs both shrinking and growing (still 24px at defaults). Cap row-head
   // text `lineHeight` to `toolRowMinHeight` so shrinking below 24px takes effect.
   const { height: _unusedHeight, ...baseRowHead } = rowHeadStyle();
   const rowLineHeight = Math.min(ROW_LINE_HEIGHT, style.toolRowMinHeight);
+  const scrollCap = expandedScrollStyle(expandedMaxHeight);
   return {
     root: {
       ...rowRootStyle(),
@@ -736,6 +778,11 @@ function buildStyles(
     statAdded: { ...diffStatTextStyle(colors, "added"), lineHeight: rowLineHeight },
     statRemoved: { ...diffStatTextStyle(colors, "removed"), lineHeight: rowLineHeight },
     body: { marginLeft: BODY_INDENT, gap: ROW_GAP },
+    bodyInner: { gap: ROW_GAP },
+    // Frameless expanded flow (Scheme A): transparent, no border radius or outer
+    // card box — just a subtle 2px left rail tying the expanded content to its head.
+    block: framelessBlockStyle(colors),
+    expandedScroll: scrollCap,
     // The whole failure reason inside the expansion, selectable and red.
     errorText: {
       color: colors.statusDanger,
@@ -745,8 +792,8 @@ function buildStyles(
     // The plain-language reason above a known refusal, and DSH's code beside it.
     hintText: { color: colors.foregroundMuted, fontSize: ROW_FONT_SIZE, lineHeight: GOAL_CARD_LINE_HEIGHT },
     hintCode: { color: colors.foregroundMuted, fontSize: CODE_FONT_SIZE, fontFamily: CODE_FONT_FAMILY },
-    // DSH's goal details card (see `GOAL_CARD_*` in `./tokens`).
-    goalItem: { paddingVertical: GOAL_CARD_PADDING_VERTICAL, paddingHorizontal: GOAL_CARD_PADDING_HORIZONTAL },
+    // Goal details inside the frameless flow (tight horizontal padding for 390pt screens).
+    goalItem: { paddingVertical: 4 },
     goalTitle: { color: colors.foreground, fontSize: ROW_FONT_SIZE, lineHeight: GOAL_CARD_LINE_HEIGHT },
     goalFields: { marginTop: GOAL_FIELDS_MARGIN_TOP, gap: GOAL_FIELD_ROW_GAP },
     goalField: { flexDirection: "row" as const, gap: GOAL_FIELD_COLUMN_GAP },
@@ -757,12 +804,13 @@ function buildStyles(
       width: GOAL_FIELD_LABEL_WIDTH,
     },
     goalValue: { color: colors.foreground, fontSize: ROW_FONT_SIZE, lineHeight: GOAL_CARD_LINE_HEIGHT, flex: 1, minWidth: 0 },
-    // The generic fields card (see `ToolFieldsView`): the goal card's geometry,
-    // plus the gap between its entries. Facts share one wrapping row; a phone is
-    // 390px wide, so the row has to fold rather than push a value off the card.
+    // Generic fields (see `ToolFieldsView`): wrapping facts rows plus bounded
+    // scroll regions for long prose and JSON entries.
     fieldsItem: {
-      paddingVertical: GOAL_CARD_PADDING_VERTICAL,
-      paddingHorizontal: GOAL_CARD_PADDING_HORIZONTAL,
+      paddingVertical: 4,
+      gap: GOAL_FIELD_ROW_GAP,
+    },
+    fieldsInner: {
       gap: GOAL_FIELD_ROW_GAP,
     },
     fieldFacts: {
@@ -793,88 +841,63 @@ function buildStyles(
     fieldLabel: { color: colors.foregroundMuted, fontSize: ROW_FONT_SIZE, lineHeight: GOAL_CARD_LINE_HEIGHT },
     fieldText: { color: colors.foreground, fontSize: ROW_FONT_SIZE, lineHeight: GOAL_CARD_LINE_HEIGHT },
     fieldCaption: { color: colors.foregroundMuted, fontSize: ROW_FONT_SIZE, lineHeight: GOAL_CARD_LINE_HEIGHT },
-    // The L2 receipt line: a summary of the card, so it reads quieter than the
-    // values above it.
+    // The L2 receipt line: a summary of the block, quieter than the values above it.
     fieldReceipt: { color: colors.foregroundMuted, fontSize: ROW_FONT_SIZE, lineHeight: GOAL_CARD_LINE_HEIGHT },
-    // The same 260px window the generic code surface uses: a long prose value
-    // and a nested object both scroll in place instead of pushing the timeline
-    // down.
-    fieldBodyScroll: { maxHeight: CODE_MAX_HEIGHT },
-    // RN has no hairline in a plain object; `StyleSheet.hairlineWidth` is the
-    // device's own (0.5 at 1x/2x), which is what DSH's `.5px` means here.
-    card: cardStyle(colors, hairline),
     divider: dividerStyle(colors, hairline),
-    command: commandRegionStyle(),
-    // Bounded scroll window around the terminal card's command banner, sized
-    // from timeline style settings (`commandMaxHeightRatio` / `commandMinHeight`).
+    command: { paddingVertical: 4 },
+    // Bounded scroll window around the terminal command banner, sized from
+    // timeline style settings (`commandMaxHeightRatio` / `commandMinHeight`).
     commandScroll: { maxHeight: commandMaxHeight },
     // The command and its copy control share the banner line; the command
-    // takes the remaining width so the control never wraps off the card.
+    // takes the remaining width so the control never wraps off the block.
     commandRow: {
       flexDirection: "row" as const,
       alignItems: "flex-start" as const,
       gap: CARD_HEAD_GAP,
     },
     commandText: { ...commandTextStyle(colors), flex: 1, minWidth: 0 },
-    output: outputRegionStyle(),
+    output: { paddingVertical: 4 },
     outputText: outputTextStyle(colors),
-    // DSH's TerminalBlock output window (`.output` inside `.terminalBody`).
-    terminalOutput: terminalOutputScrollStyle(),
-    code: codeRegionStyle(),
+    terminalOutput: scrollCap,
+    code: { paddingVertical: 4 },
     codeText: codeTextStyle(colors),
-    // DSH's `.bodyScroll { max-height: 260px; overflow-y: auto }` around the
-    // code-tool card's body: the generic surface renders the whole text and
-    // scrolls it in place instead of being cut at 6000 characters.
-    codeScroll: { maxHeight: CODE_MAX_HEIGHT },
-    diffLine: diffRowStyle(),
-    diffBody: diffBodyStyle(),
+    codeScroll: scrollCap,
+    diffLine: { flexDirection: "row" as const, paddingHorizontal: 8 },
+    diffBody: { paddingVertical: 4 },
     diffAdd: diffLineStyle(colors, "add", light),
     diffDel: diffLineStyle(colors, "del", light),
     diffContext: diffLineStyle(colors, "context", light),
     markerAdd: diffMarkerTextStyle(colors, "add"),
     markerDel: diffMarkerTextStyle(colors, "del"),
     markerContext: diffMarkerTextStyle(colors, "context"),
+    diffBodyText: diffBodyTextStyle(colors, "context"),
     diffTextAdd: diffBodyTextStyle(colors, "add"),
     diffTextDel: diffBodyTextStyle(colors, "del"),
     diffTextContext: diffBodyTextStyle(colors, "context"),
     diffChrome: diffChromeTextStyle(colors),
-    diffExpand: {
-      ...diffChromeTextStyle(colors),
-      paddingHorizontal: DIFF_LINE_PADDING_HORIZONTAL,
-      flexShrink: 0,
-    },
-    cardHead: cardHeadStyle(),
+    cardHead: framelessHeadStyle(colors, hairline),
     cardHeadHeading: cardHeadHeadingStyle(),
     cardHeadActions: cardHeadActionsStyle(),
     cardHeadLang: cardHeadLangTextStyle(colors),
     cardHeadTitle: cardHeadTitleTextStyle(colors),
     cardHeadStatus: cardHeadStatusTextStyle(colors),
     cardHeadAction: cardHeadActionTextStyle(colors),
-    searchHead: searchHeadStyle(colors),
+    searchHead: framelessHeadStyle(colors, hairline),
     searchSummary: searchSummaryTextStyle(colors),
-    searchBody: {
-      paddingTop: SEARCH_BODY_PADDING_TOP,
-      paddingBottom: SEARCH_BODY_PADDING_BOTTOM,
-      paddingRight: SEARCH_BODY_PADDING_RIGHT,
-    },
+    searchBody: { paddingVertical: 4, paddingRight: 4 },
     searchScroll: { flexGrow: 0 },
-    searchLine: searchLineStyle(),
-    searchFileHead: searchFileHeadStyle(),
+    searchLine: { ...searchLineStyle(), paddingLeft: 0 },
+    searchFileHead: { ...searchFileHeadStyle(), paddingHorizontal: 0 },
     searchLineNumber: searchLineNumberTextStyle(colors),
     searchLineText: searchLineTextStyle(colors),
     searchFilePath: searchFilePathTextStyle(colors),
     searchFileCount: searchFileCountTextStyle(colors),
-    searchExpand: searchExpandTextStyle(colors),
-    searchEmpty: searchEmptyTextStyle(colors),
-    readBody: {
-      paddingTop: READ_BODY_PADDING_TOP,
-      paddingBottom: READ_BODY_PADDING_BOTTOM,
-      paddingHorizontal: READ_BODY_PADDING_HORIZONTAL,
-    },
+    searchEmpty: { ...searchEmptyTextStyle(colors), paddingVertical: 4, paddingHorizontal: 0 },
+    readBody: { paddingVertical: 4 },
     readScroll: { flexGrow: 0 },
     readLine: readLineStyle(),
     readLineText: readLineTextStyle(colors),
-    webBody: webCardBodyStyle(),
+    webBody: { paddingVertical: 4 },
     webFetch: webFetchStyle(),
     webUrl: webUrlTextStyle(colors),
     webMeta: webMetaTextStyle(colors),
@@ -885,7 +908,7 @@ function buildStyles(
     },
     webTruncated: webTruncatedTextStyle(colors),
     webTruncatedSearch: webTruncatedTextStyle(colors, WEB_TRUNCATED_MARGIN_TOP),
-    webSources: webSourcesStyle(),
+    webSources: scrollCap,
     webSourceRow: webSourceRowStyle(),
     webSourceBody: { flex: 1, minWidth: 0 },
     webSourceIndex: webSourceIndexTextStyle(colors),
@@ -898,34 +921,51 @@ function buildStyles(
 type BlockStyles = ReturnType<typeof buildStyles>;
 
 /**
- * The goal tools' result card: DSH's `DetailsRow` for `create_goal` / `get_goal`
+ * The goal tools' result block: DSH's `DetailsRow` for `create_goal` / `get_goal`
  * / `update_goal` — the objective, then 状态 / 执行轮次 (/ 受阻原因) as a
  * label | value list. `{goal: null}` is DSH's 「没有目标」 line.
  */
-function GoalBlockView({ data, summary, styles }: { data: GoalBlockData; summary: string; styles: BlockStyles }) {
+function GoalBlockView({
+  data,
+  summary,
+  styles,
+  onCollapse,
+}: {
+  data: GoalBlockData;
+  summary: string;
+  styles: BlockStyles;
+  onCollapse: (event?: unknown) => void;
+}) {
   return (
-    <View style={styles.card}>
-      <View style={styles.goalItem}>
-        {data.empty ? (
-          <Text style={styles.goalValue}>{summary}</Text>
-        ) : (
-          <>
-            <Text style={styles.goalTitle} selectable>
-              {data.objective}
-            </Text>
-            <View style={styles.goalFields}>
-              {data.fields.map((field) => (
-                <View key={field.label} style={styles.goalField}>
-                  <Text style={styles.goalLabel}>{field.label}</Text>
-                  <Text style={styles.goalValue} selectable>
-                    {field.value}
-                  </Text>
-                </View>
-              ))}
-            </View>
-          </>
-        )}
-      </View>
+    <View style={styles.block}>
+      <ScrollView
+        style={styles.expandedScroll}
+        contentContainerStyle={styles.goalItem}
+        nestedScrollEnabled
+        testID={SCROLL_BOX_TEST_ID}
+      >
+        <Pressable onPress={onCollapse}>
+          {data.empty ? (
+            <Text style={styles.goalValue}>{summary}</Text>
+          ) : (
+            <>
+              <Text style={styles.goalTitle} selectable>
+                {data.objective}
+              </Text>
+              <View style={styles.goalFields}>
+                {data.fields.map((field) => (
+                  <View key={field.label} style={styles.goalField}>
+                    <Text style={styles.goalLabel}>{field.label}</Text>
+                    <Text style={styles.goalValue} selectable>
+                      {field.value}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            </>
+          )}
+        </Pressable>
+      </ScrollView>
     </View>
   );
 }
@@ -935,23 +975,22 @@ function GoalBlockView({ data, summary, styles }: { data: GoalBlockData; summary
 /* -------------------------------------------------------------------------- */
 
 /**
- * The generic card for a tool Paseo has no detail shape for (every MCP call):
+ * The generic block for a tool Paseo has no detail shape for (every MCP call):
  * the call's arguments, then a structured result, split into facts rows, prose
  * blocks and JSON code blocks (see `ToolFieldsData`).
- *
- * The goal card's geometry, value for value, like `./team-card` — this is not a
- * new visual language, only the same label | value rows and the same code
- * surface. Facts wrap because a phone is 390px wide and a call can carry five of
- * them; a long value wraps inside its own row instead of pushing the card.
  */
 function ToolFieldsView({
   data,
   styles,
+  colors,
   resultCaption,
+  onCollapse,
 }: {
   data: ToolFieldsData;
   styles: BlockStyles;
+  colors: TokenColors;
   resultCaption: string;
+  onCollapse: (event?: unknown) => void;
 }) {
   const blocks: ReactNode[] = [];
   // Consecutive facts share one wrapping row (`键: 值` ×N); a prose or JSON entry
@@ -986,27 +1025,23 @@ function ToolFieldsView({
       blocks.push(
         <View key={`${section}-${entry.kind}-${String(blocks.length)}`} style={styles.fieldBlock}>
           {entry.label === "" ? null : <Text style={styles.fieldLabel}>{entry.label}</Text>}
-          {/* Both entry kinds sit in the same 260px window the generic code
-              surface uses: a value can be 30KB (a `send_message` body), and the
-              timeline must stay bounded — scrolling, never truncating. Prose is
-              still drawn as prose: the wire's own newlines are the content, and
-              re-serializing the string is what produced the literal `\n` rows. */}
+          {/* Prose stays prose (never re-serialized), JSON gets semantic highlighting;
+              both live inside the single outer expanded ScrollView so vertical
+              scrolling is never nested. */}
           {entry.kind === "text" ? (
-            <ScrollView style={styles.fieldBodyScroll} nestedScrollEnabled>
-              <Text style={styles.fieldText} selectable>
-                {entry.value}
-              </Text>
-            </ScrollView>
+            <Text style={styles.fieldText} selectable>
+              {entry.value}
+            </Text>
           ) : (
-            <ScrollView
-              style={styles.fieldBodyScroll}
-              contentContainerStyle={styles.code}
-              nestedScrollEnabled
-            >
-              <Text style={styles.codeText} selectable>
-                {entry.value}
-              </Text>
-            </ScrollView>
+            <View style={styles.code}>
+              <HighlightedCode
+                text={entry.value}
+                lang="json"
+                colors={colors}
+                baseStyle={styles.codeText}
+                selectable
+              />
+            </View>
           )}
         </View>,
       );
@@ -1015,11 +1050,8 @@ function ToolFieldsView({
   };
   push(data.args, "args");
   if (data.result.length > 0) {
-    // The caption separates the two halves: without it a card of facts does not
-    // say which ones the tool was called with and which it answered. A card
-    // whose entries all come from the result half (`data.hideResultCaption`)
-    // gains nothing from it — there the caption is a heading over the whole card
-    // (the `skill` row: name, location, then the instructions).
+    // The caption separates the two halves unless every entry belongs to the
+    // result half (`data.hideResultCaption`).
     if (data.hideResultCaption !== true) {
       blocks.push(
         <Text key="result-caption" style={styles.fieldCaption}>
@@ -1030,8 +1062,7 @@ function ToolFieldsView({
     push(data.result, "result");
   }
   if (data.receipt !== "") {
-    // L2's one-line compression of the result (「已发送」/「超时」). Muted like a
-    // caption: it summarizes the card, it is not another value in it.
+    // L2's one-line compression of the result (「已发送」/「超时」).
     blocks.push(
       <Text key="receipt" style={styles.fieldReceipt} selectable>
         {data.receipt}
@@ -1039,12 +1070,20 @@ function ToolFieldsView({
     );
   }
   return (
-    <View style={styles.card}>
-      {/* The complete result JSON, not the card's flattened display: the copy
-          control is what keeps a structured result from losing information when
-          the card turns it into rows. */}
+    <View style={styles.block}>
+      {/* The complete result JSON, not the flattened display: the copy control
+          keeps a structured result from losing information when laid out as rows. */}
       {data.copyText === "" ? null : <CardHead lang="" title="" text={data.copyText} styles={styles} />}
-      <View style={styles.fieldsItem}>{blocks}</View>
+      <ScrollView
+        style={styles.expandedScroll}
+        contentContainerStyle={styles.fieldsItem}
+        nestedScrollEnabled
+        testID={SCROLL_BOX_TEST_ID}
+      >
+        <Pressable onPress={onCollapse} style={styles.fieldsInner}>
+          {blocks}
+        </Pressable>
+      </ScrollView>
     </View>
   );
 }
@@ -1062,44 +1101,27 @@ export function InlineToolCall({
 }: PluginTimelineItemProps<ToolCallData>) {
   const data = item.data;
   const [expanded, setExpanded] = useState(false);
+  const collapseBody = useCallback((event?: unknown) => {
+    if (shouldCollapseOnBodyPress(event)) setExpanded(false);
+  }, []);
   const hasBody = data.body !== "";
   // Expanding is only worth offering when the block below actually has
-  // something in it — `hasDetail` is that answer, computed in the data layer.
-  // The row is a Pressable, so promising an expansion that never renders left a
-  // button which did nothing when pressed.
+  // something in it — `hasDetail` is computed in the data layer.
   const canExpand = data.hasDetail;
   // A failure's reason, in the head's second half: DSH shows it there
   // (`.errorSummary`) instead of the normal summary, because the block below
-  // may carry what was *requested* (a write's content, an edit's diff) rather
-  // than what went wrong. The head is one line, so only the first line of the
-  // reason fits; the expansion carries the whole text.
+  // may carry what was *requested* rather than what went wrong.
   const errorLine = data.error === "" ? "" : data.error.split("\n")[0];
   const errorHeadline = data.failed && errorLine !== "";
-  // A refusal DSH gave a known code for reads in words (`goalCard.refusals`);
-  // DSH's verbatim text is still the first thing in the expanded block below.
   const headSummary = errorHeadline ? (data.errorShort !== "" ? data.errorShort : errorLine) : data.summary;
   // Once expanded the block carries the subject in full, so a row whose title
   // *is* that subject does not repeat a compact copy of it above.
   const showSummary = headSummary !== "" && !(expanded && !data.titled && data.headline !== "");
   const compact = layout.compact;
-  // Icon size is Paseo's own (and was settled in an earlier round); everything
-  // else in the row now comes from the shared token table.
   const iconSize = compact ? 14 : 16;
-  // Only the newest row is "running": while it runs, and for a window after it
-  // commits (the only way a short command — call and result in the same tick —
-  // ever shows a signal). Gating on the newest row also keeps an interrupted
-  // tool, stuck `running` forever, from blinking for the rest of the session.
   const running = shouldPulse(data.status, useRowPulse(agentId, timestamp));
-  // `+A -R` beside the summary, for a row whose body is a real diff and which
-  // did not settle with a cue (DSH hides the stat on error/stopped rows).
   const stat = diffStat(data);
-  // A shell block: command banner, hairline, output region. This is the field
-  // the data layer computes from the detail's own type — the old guess (no diff
-  // and no code flag and an "output" caption) only worked by accident.
   const terminal = data.kind === "terminal";
-  // The expanded reason, unless the body already says it: a failed shell's body
-  // *is* the failing output (`error.message` is built from the same string), so
-  // repeating it in the card would read as two separate failures.
   const errorBlock = data.error !== "" && !data.body.includes(data.error) ? data.error : "";
   const colors = theme.colors;
   // The leading icon is the row's only state signal: red when the call failed,
@@ -1110,262 +1132,305 @@ export function InlineToolCall({
   const style = styleState.status === "ready" ? styleState.values : TIMELINE_STYLE_DEFAULTS;
   const { height: windowHeight } = useWindowDimensions();
   const commandMaxHeight = resolveCommandMaxHeight(style, windowHeight);
+  const expandedMaxHeight = style.expandedMaxHeight ?? EXPANDED_MAX_HEIGHT_DEFAULT;
   // Subscribe via `useLocaleText()` so language changes immediately re-render
-  // this row and all nested block views reading `blockCopy()`.
+  // this row (including tool labels and all nested block views reading `blockCopy()`).
   const text = useLocaleText();
+  const normalizedName = data.name.trim().toLowerCase();
+  const displayLabel =
+    normalizedName === "mcp_call_tool" || normalizedName === "agent_message"
+      ? data.label
+      : Object.prototype.hasOwnProperty.call(text.toolLabels, data.name)
+        ? text.toolLabels[data.name]
+        : Object.prototype.hasOwnProperty.call(text.toolLabels, normalizedName)
+          ? text.toolLabels[normalizedName]
+          : (paseoMcpLabel(data.name) ?? data.label);
+
+  const tsMs = normalizeTimestampMs(timestamp);
+  const rawRowKey =
+    (item as { id?: string }).id ?? (item as { callId?: string }).callId;
+  const rowKey =
+    typeof rawRowKey === "string" && rawRowKey !== ""
+      ? rawRowKey
+      : `tool:${String(tsMs)}:${data.name}:${data.summary}:${data.headline.slice(0, 64)}`;
+
+  const stream = useInkStreamReveal({
+    agentId,
+    timestamp,
+    rowKey,
+    liveHint: data.status === "running",
+    label: displayLabel,
+    summary: showSummary ? headSummary : "",
+  });
 
   const styles = useMemo(
-    () => buildStyles(colors, StyleSheet.hairlineWidth, style, commandMaxHeight),
-    [colors, style, commandMaxHeight],
+    () => buildStyles(colors, StyleSheet.hairlineWidth, style, commandMaxHeight, expandedMaxHeight),
+    [colors, style, commandMaxHeight, expandedMaxHeight],
   );
 
+  const plainDiffLang = data.diff ? extensionOf(data.headline) : undefined;
+  const plainDiffMode = data.diff ? highlightModeFor(plainDiffLang) : "plain";
+  const plainDiffRows = useMemo(
+    () =>
+      data.diff && hasBody
+        ? data.body.split("\n").map((line) => {
+            const added = line.startsWith("+");
+            const removed = line.startsWith("-");
+            return {
+              kind: added ? "add" : removed ? "del" : "context",
+              text: added || removed ? line.slice(1) : line,
+            };
+          })
+        : [],
+    [data.diff, hasBody, data.body],
+  );
+  const genericLang =
+    !terminal &&
+    data.search === null &&
+    data.read === null &&
+    data.diffBlock === null &&
+    data.web === null &&
+    !data.diff &&
+    hasBody
+      ? inferLang(data.headline, data.body)
+      : undefined;
+
   return (
-    <Pressable
-      accessibilityRole="button"
-      accessibilityLabel={`${data.label} ${headSummary}`}
-      onPress={() => {
-        if (canExpand) setExpanded((value) => !value);
-      }}
-      style={styles.root}
+    <RowEntrance
+      agentId={agentId}
+      timestamp={timestamp}
+      rowKey={rowKey}
+      liveHint={data.status === "running"}
     >
-      <View style={styles.head}>
-        {/* The glyph carries the state: red for a failure, green for a completed
-            edit. DSH leaves it muted and reddens the summary instead; see
-            `docs/RENDER-PLAN.md` for why this row inverts that. A Paseo-owned
-            tool with no glyph of its own draws Paseo's mark, tinted the same —
-            Paseo's own UI gives every one of its tools that mark and none of them
-            a per-tool glyph. */}
-        {data.paseoMark ? (
-          <Image
-            source={{ uri: PASEO_MARK_ICON }}
-            style={{ width: iconSize, height: iconSize }}
-            tintColor={iconColor}
-          />
-        ) : (
-          <Icon name={data.icon} size={iconSize} color={iconColor} />
-        )}
-        <TextShimmer
-          active={running}
-          contentStyle={styles.text}
-          highlightColor={colors.foreground}
-          surfaceColor={colors.surface0}
+      <View style={styles.root}>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`${displayLabel} ${headSummary}`}
+          onPress={() => {
+            if (canExpand) setExpanded((value) => !value);
+          }}
+          style={styles.head}
         >
-          {(color) => (
-            <>
-              <Text style={[styles.label, color === null ? null : { color }]}>{data.label}</Text>
-              {/* The row stays one line, label and summary together: moving the
-                  summary onto its own line just pushed it away from the row it
-                  names. It is only dropped once the block below carries the same
-                  subject in full, so a description-less row does not print its
-                  arguments twice. `numberOfLines` stays 1 for the same reason —
-                  an unbounded line beside a long label wrapped one character per
-                  line, which is what "并行显示" was. */}
-              {showSummary ? (
-                <>
-                  {/* A 2x2 square with 1px corners, not a dot — DSH's separator
-                      between the title and its summary. */}
-                  <View style={styles.sep} />
-                  <Text
-                    style={[
-                      styles.summary,
-                      errorHeadline ? styles.summaryError : null,
-                      color === null ? null : { color },
-                    ]}
-                    numberOfLines={1}
-                  >
-                    {headSummary}
-                  </Text>
-                </>
-              ) : null}
-              {stat !== null ? (
-                <>
-                  {/* Semantic colours rather than the row's tone: the counts
-                      describe the diff, so `+` is green and `-` is red whatever
-                      the row itself is doing. The separating space lives inside
-                      the `-` run, so the pair stays exactly as far apart as the
-                      single grey run it replaced. */}
-                  <Text style={[styles.statAdded, color === null ? null : { color }]}>
-                    {`+${stat.added}`}
-                  </Text>
-                  <Text style={[styles.statRemoved, color === null ? null : { color }]}>
-                    {` -${stat.removed}`}
-                  </Text>
-                </>
-              ) : null}
-            </>
+          {/* The glyph carries the state: red for a failure, green for a completed
+              edit. A Paseo-owned tool with no glyph of its own draws Paseo's mark,
+              tinted the same. */}
+          {data.paseoMark ? (
+            <Image
+              source={{ uri: PASEO_MARK_ICON }}
+              style={{ width: iconSize, height: iconSize }}
+              tintColor={iconColor}
+            />
+          ) : (
+            <Icon name={data.icon} size={iconSize} color={iconColor} />
           )}
-        </TextShimmer>
-      </View>
-      {expanded && canExpand ? (
-        <View style={styles.body}>
-          {/* The whole failure reason first, selectable: a failed `write` or
-              `edit` keeps only what it *would* have written in its block, so
-              this is where the error text itself is readable. It is skipped
-              when the block already prints the same text (see `errorBlock`). */}
-          {/* A known refusal opens with one plain sentence and DSH's code; the
-              verbatim reason follows, unchanged, so nothing DSH said is lost.
-              DSH's error class rides inside the same grey span (expanded block
-              only): `APPROVAL_REJECTED（ApprovalError）`. */}
-          {data.errorHint !== "" ? (
-            <Text style={styles.hintText}>
-              {data.errorHint}
-              <Text style={styles.hintCode}>{`  ${data.errorCode}${data.errorName === undefined ? "" : `（${data.errorName}）`}`}</Text>
-            </Text>
-          ) : null}
-          {/* A code this client has no sentence for, but which DSH still named:
-              the code and class are wire facts, so they print in the same grey
-              style rather than being dropped. No words are invented for it. */}
-          {data.errorHint === "" && data.errorCode !== "" && data.errorName !== undefined ? (
-            <Text style={styles.hintText}>
-              <Text style={styles.hintCode}>{`${data.errorCode}（${data.errorName}）`}</Text>
-            </Text>
-          ) : null}
-          {errorBlock !== "" ? (
-            <Text style={styles.errorText} selectable>
-              {errorBlock}
-            </Text>
-          ) : null}
-          {data.goal !== null ? <GoalBlockView data={data.goal} summary={data.summary} styles={styles} /> : null}
-          {data.team !== null ? (
-            <TeamBlockView
-              data={data.team}
-              hairline={StyleSheet.hairlineWidth}
-              colors={{
-                ...colors,
-                foregroundMuted: colors.foregroundMuted,
-                extraMuted: (colors as unknown as Record<string, string | undefined>).foregroundExtraMuted ?? colors.foregroundMuted,
-                running: ringColorFor(colors.surface0),
-                warning: colors.statusWarning,
-                border: colors.border,
-              }}
-            />
-          ) : null}
-          {/* The generic card for a row with no detail shape (every MCP call).
-              A plain-text result keeps its own code surface below this card; a
-              structured one is drawn by the card alone. */}
-          {data.fields !== null ? (
-            <ToolFieldsView
-              data={data.fields}
-              styles={styles}
-              resultCaption={text.bodyLabels.result}
-            />
-          ) : null}
-          {/* One card per expanded block, the way DSH's TerminalBlock, DiffBlock
-              and ReadBlock all are: same radius, same hairline, same surface.
-              `data.kind` picks it; a block whose meta did not parse has no
-              payload and falls through to the plain code surface below, so a
-              row never opens onto nothing. */}
-          {terminal ? (
-            <View style={styles.card}>
-              {/* The command the row ran, at full contrast and on its own
-                  line, then a hairline, then what it printed. A running
-                  command that has printed nothing yet draws no divider, the
-                  same as DSH's banner-only terminal card. */}
-              <ScrollView
-                style={styles.commandScroll}
-                contentContainerStyle={styles.command}
-                nestedScrollEnabled
-              >
-                <View style={styles.commandRow}>
-                  <Text style={styles.commandText} selectable>
-                    {data.headline}
-                  </Text>
-                  {/* DSH's TerminalBlock copies the whole output — not the
-                      visible window — and hides the control while the command
-                      is still printing or has produced nothing but blank lines
-                      (`!running && !empty`). */}
-                  {hasBody && data.status !== "running" && data.body.trim() !== "" ? (
-                    <CopyControl text={data.body} style={styles.cardHeadAction} />
-                  ) : null}
-                </View>
-              </ScrollView>
-              {hasBody ? <View style={styles.divider} /> : null}
-              {hasBody ? (
-                // DSH renders every line inside a capped scroll region
-                // (`.output` with `max-height: var(--dsl-terminal-output-max-height)`
-                // and `overflow-y: auto`), so a long log scrolls in place
-                // instead of being cut off or pushing the timeline down.
+          <TextShimmer
+            active={running}
+            contentStyle={styles.text}
+            highlightColor={colors.foreground}
+            surfaceColor={colors.surface0}
+          >
+            {(color) => (
+              <>
+                <Text style={[styles.label, color === null ? null : { color }]}>
+                  {renderInkTrailText(displayLabel, stream.labelProgress, colors.foreground, color)}
+                </Text>
+                {showSummary && stream.showSeparator ? (
+                  <>
+                    {/* A 2x2 square with 1px corners, not a dot — DSH's separator
+                        between the title and its summary. */}
+                    <View style={styles.sep} />
+                    <Text
+                      style={[
+                        styles.summary,
+                        errorHeadline ? styles.summaryError : null,
+                        color === null ? null : { color },
+                      ]}
+                      numberOfLines={1}
+                    >
+                      {renderInkTrailText(headSummary, stream.summaryProgress, colors.foreground, color)}
+                    </Text>
+                  </>
+                ) : null}
+                {stat !== null && stream.showStat ? (
+                  <>
+                    <Text style={[styles.statAdded, color === null ? null : { color }]}>
+                      {`+${stat.added}`}
+                    </Text>
+                    <Text style={[styles.statRemoved, color === null ? null : { color }]}>
+                      {` -${stat.removed}`}
+                    </Text>
+                  </>
+                ) : null}
+              </>
+            )}
+          </TextShimmer>
+        </Pressable>
+        {expanded && canExpand ? (
+          <View style={styles.body}>
+            <Pressable style={styles.bodyInner} onPress={collapseBody}>
+              {/* The whole failure reason first, selectable. */}
+              {data.errorHint !== "" ? (
+                <Text style={styles.hintText} selectable>
+                  {data.errorHint}
+                  <Text style={styles.hintCode}>{`  ${data.errorCode}${data.errorName === undefined ? "" : `（${data.errorName}）`}`}</Text>
+                </Text>
+              ) : null}
+              {data.errorHint === "" && data.errorCode !== "" && data.errorName !== undefined ? (
+                <Text style={styles.hintText} selectable>
+                  <Text style={styles.hintCode}>{`${data.errorCode}（${data.errorName}）`}</Text>
+                </Text>
+              ) : null}
+              {errorBlock !== "" ? (
                 <ScrollView
-                  style={styles.terminalOutput}
-                  contentContainerStyle={styles.output}
+                  style={styles.expandedScroll}
                   nestedScrollEnabled
+                  testID={SCROLL_BOX_TEST_ID}
                 >
-                  <Text style={styles.outputText} selectable>
-                    {data.body}
-                  </Text>
+                  <Pressable onPress={collapseBody}>
+                    <Text style={styles.errorText} selectable>
+                      {errorBlock}
+                    </Text>
+                  </Pressable>
                 </ScrollView>
               ) : null}
-            </View>
-          ) : data.search !== null ? (
-            <SearchBlockView data={data.search} styles={styles} />
-          ) : data.read !== null ? (
-            <ReadBlockView data={data.read} styles={styles} colors={colors} />
-          ) : data.diffBlock !== null ? (
-            <DiffBlockView data={data.diffBlock} styles={styles} />
-          ) : data.web !== null ? (
-            <WebBlockView data={data.web} styles={styles} />
-          ) : data.diff ? (
-            <View style={styles.card}>
-              {data.headline !== "" ? (
-                <View style={styles.code}>
-                  <Text style={styles.codeText} selectable>
-                    {data.headline}
-                  </Text>
+              {data.goal !== null ? (
+                <GoalBlockView data={data.goal} summary={data.summary} styles={styles} onCollapse={collapseBody} />
+              ) : null}
+              {data.team !== null ? (
+                <TeamBlockView
+                  data={data.team}
+                  hairline={StyleSheet.hairlineWidth}
+                  maxHeight={expandedMaxHeight}
+                  onCollapse={collapseBody}
+                  colors={{
+                    ...colors,
+                    foregroundMuted: colors.foregroundMuted,
+                    extraMuted: (colors as unknown as Record<string, string | undefined>).foregroundExtraMuted ?? colors.foregroundMuted,
+                    running: ringColorFor(colors.surface0),
+                    warning: colors.statusWarning,
+                    border: colors.border,
+                  }}
+                />
+              ) : null}
+              {data.fields !== null ? (
+                <ToolFieldsView
+                  data={data.fields}
+                  styles={styles}
+                  colors={colors}
+                  resultCaption={text.bodyLabels.result}
+                  onCollapse={collapseBody}
+                />
+              ) : null}
+              {terminal ? (
+                <View style={styles.block}>
+                  <View style={styles.commandRow}>
+                    <ScrollView
+                      style={[styles.commandScroll, { flex: 1, minWidth: 0 }]}
+                      contentContainerStyle={styles.command}
+                      nestedScrollEnabled
+                      testID={SCROLL_BOX_TEST_ID}
+                    >
+                      <Pressable onPress={collapseBody}>
+                        <HighlightedCode
+                          text={data.headline}
+                          lang="shell"
+                          colors={colors}
+                          baseStyle={styles.commandText}
+                          selectable
+                        />
+                      </Pressable>
+                    </ScrollView>
+                    {hasBody && data.status !== "running" && data.body.trim() !== "" ? (
+                      <CopyControl text={data.body} style={styles.cardHeadAction} />
+                    ) : null}
+                  </View>
+                  {hasBody ? <View style={styles.divider} /> : null}
+                  {hasBody ? (
+                    <ScrollView
+                      style={styles.terminalOutput}
+                      contentContainerStyle={styles.output}
+                      nestedScrollEnabled
+                      testID={SCROLL_BOX_TEST_ID}
+                    >
+                      <Pressable onPress={collapseBody}>
+                        <Text style={styles.outputText} selectable>
+                          {data.body}
+                        </Text>
+                      </Pressable>
+                    </ScrollView>
+                  ) : null}
+                </View>
+              ) : data.search !== null ? (
+                <SearchBlockView data={data.search} styles={styles} onCollapse={collapseBody} />
+              ) : data.read !== null ? (
+                <ReadBlockView data={data.read} styles={styles} colors={colors} onCollapse={collapseBody} />
+              ) : data.diffBlock !== null ? (
+                <DiffBlockView data={data.diffBlock} styles={styles} colors={colors} onCollapse={collapseBody} />
+              ) : data.web !== null ? (
+                <WebBlockView data={data.web} styles={styles} onCollapse={collapseBody} />
+              ) : data.diff ? (
+                <View style={styles.block}>
+                  {data.headline !== "" ? (
+                    <View style={styles.code}>
+                      <Text style={styles.codeText} selectable>
+                        {data.headline}
+                      </Text>
+                    </View>
+                  ) : null}
+                  {hasBody ? (
+                    <ScrollView
+                      style={styles.expandedScroll}
+                      contentContainerStyle={styles.diffBody}
+                      nestedScrollEnabled
+                      testID={SCROLL_BOX_TEST_ID}
+                    >
+                      <Pressable onPress={collapseBody}>
+                        <DiffRows
+                          rows={plainDiffRows}
+                          styles={styles}
+                          keyPrefix="plain"
+                          mode={plainDiffMode}
+                          lang={plainDiffLang}
+                          colors={colors}
+                        />
+                      </Pressable>
+                    </ScrollView>
+                  ) : null}
+                </View>
+              ) : data.headline !== "" || hasBody ? (
+                <View style={styles.block}>
+                  {hasBody && data.body.trim() !== "" ? (
+                    <CardHead lang="" title="" text={data.body} styles={styles} />
+                  ) : null}
+                  <ScrollView
+                    style={styles.codeScroll}
+                    contentContainerStyle={styles.code}
+                    nestedScrollEnabled
+                    testID={SCROLL_BOX_TEST_ID}
+                  >
+                    <Pressable onPress={collapseBody}>
+                      {data.headline !== "" ? (
+                        <Text style={styles.codeText} selectable>
+                          {data.headline}
+                        </Text>
+                      ) : null}
+                      {hasBody ? (
+                        <HighlightedCode
+                          text={data.body}
+                          lang={genericLang}
+                          colors={colors}
+                          baseStyle={styles.codeText}
+                          selectable
+                        />
+                      ) : null}
+                    </Pressable>
+                  </ScrollView>
                 </View>
               ) : null}
-              {hasBody ? (
-                <View style={styles.diffBody}>
-                  <DiffRows
-                    rows={data.body.split("\n").map((line) => {
-                      const added = line.startsWith("+");
-                      const removed = line.startsWith("-");
-                      return {
-                        kind: added ? "add" : removed ? "del" : "context",
-                        text: added || removed ? line.slice(1) : line,
-                      };
-                    })}
-                    styles={styles}
-                    keyPrefix="plain"
-                  />
-                </View>
-              ) : null}
-            </View>
-          ) : data.headline !== "" || hasBody ? (
-            <View style={styles.card}>
-              {/* DSH's code-card toolbar, with the copy control as its only
-                  action: it hands over the whole body, not the part inside the
-                  scroll window. That is the recovery path for a body too long
-                  to read in place, and it is what makes the 260px window safe —
-                  nothing is dropped, only scrolled. No language tag: DSH
-                  hardcodes `typescript` there, a wart this repo deliberately
-                  does not copy. */}
-              {hasBody && data.body.trim() !== "" ? (
-                <CardHead lang="" title="" text={data.body} styles={styles} />
-              ) : null}
-              {/* DSH's `.bodyScroll { max-height: 260px; overflow-y: auto }`
-                  around the code surface: the whole body is rendered and this
-                  is the only thing keeping a long one from pushing the timeline
-                  down (the same shape as the terminal card's 224px window). */}
-              <ScrollView
-                style={styles.codeScroll}
-                contentContainerStyle={styles.code}
-                nestedScrollEnabled
-              >
-                {data.headline !== "" ? (
-                  <Text style={styles.codeText} selectable>
-                    {data.headline}
-                  </Text>
-                ) : null}
-                {hasBody ? (
-                  <Text style={styles.codeText} selectable>
-                    {data.body}
-                  </Text>
-                ) : null}
-              </ScrollView>
-            </View>
-          ) : null}
-        </View>
-      ) : null}
-    </Pressable>
+            </Pressable>
+          </View>
+        ) : null}
+      </View>
+    </RowEntrance>
   );
 }

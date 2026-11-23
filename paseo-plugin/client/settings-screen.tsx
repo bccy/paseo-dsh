@@ -31,6 +31,7 @@ const FIELD_BOUNDS: Record<TimelineStyleKey, { readonly min: number; readonly ma
   toolRowPaddingY: { min: 0, max: 12 },
   toolRowMinHeight: { min: 12, max: 64 },
   toolRowGap: { min: 0, max: 24 },
+  expandedMaxHeight: { min: 120, max: 640 },
   commandMaxHeightRatio: { min: 0.1, max: 0.6 },
   commandMinHeight: { min: 60, max: 360 },
 };
