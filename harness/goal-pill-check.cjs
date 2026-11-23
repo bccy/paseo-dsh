@@ -1099,7 +1099,7 @@ async function seenMetadataChecks() {
       assert(`${file} never writes a seen key`, !/seen\.remember|setMetadata|settingsRpc/.test(source));
     }
     const serverEntry = readRepo("paseo-plugin/index.server.ts");
-    assert("the server registers no settings any more", !/registerSettings/.test(serverEntry));
+    assert("the server registers no goal-seen settings", !/registerSettings\([^)]*(?:goal|seen)/i.test(serverEntry));
     assert("the server serves the goal subscription", /server\.handle\(goalSnapshot/.test(serverEntry));
     assert("the goal control action refreshes the feed", /if \(result\.ok\) goalFeed\.refresh\(agentId\)/.test(serverEntry));
     const metadata = readRepo("paseo-plugin/shared/pill-metadata.ts");

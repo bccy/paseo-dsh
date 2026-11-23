@@ -34,6 +34,7 @@ const expected = [
         return () => { released.push(name); handlers.delete(name); };
       },
       registerProvider() {},
+      registerSettings() {},
       handle() {},
     });
     assert.deepEqual([...handlers.keys()], expected, 'exactly the six observation hooks; no open/create before hook');
@@ -59,7 +60,7 @@ const expected = [
     mutated.paths = Module._nodeModulePaths(build);
     mutated._compile(source.replace('server.addHook(', 'server.on('), filename);
     assert.throws(() => mutated.exports.default({
-      addHook() { return () => {}; }, registerProvider() {}, handle() {},
+      addHook() { return () => {}; }, registerProvider() {}, registerSettings() {}, handle() {},
     }), /server.on is not a function/);
     console.log('lifecycle hooks: six registrations, handle capture, cleanup and legacy-hook mutation passed');
   } finally {

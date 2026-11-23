@@ -28,6 +28,7 @@ function readKinds(source) {
     // need to be accepted so the entry body runs to the renderer registrations.
     addScreen() { return noop; },
     addSidebarHeaderItem() { return noop; },
+    rpc() { return Promise.resolve({ status: 'ready', values: {} }); },
     paseo: {},
   };
   const requireClient = (id) => {
@@ -39,6 +40,13 @@ function readKinds(source) {
     if (id === './client/rewind-notice-live') return { startRewindLiveMonitor: () => noop };
     if (id === './client/dsh-plugins-page') return { DshPluginsPage: () => null };
     if (id === './client/dsh-plugins-icon') return { PluginsIcon: () => null };
+    if (id === './client/settings-screen') {
+      return {
+        DISPLAY_SETTINGS_ID: 'dsh-display',
+        contributeDisplaySettingsCommand: () => noop,
+        contributeTimelineSettings: () => noop,
+      };
+    }
     // The entry runs `installFatalGuard()` on load and registers the screen and
     // sidebar item through `guardCleanup`; none of that is a timeline kind, but
     // the module itself imports React Native, which plain node cannot load.

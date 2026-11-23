@@ -731,7 +731,7 @@ async function seenMetadataChecks() {
   {
     const repo = path.resolve(__dirname, "..", "..");
     const serverEntry = fs.readFileSync(path.join(repo, "paseo-plugin/index.server.ts"), "utf8");
-    assert("the server registers no settings any more", !/registerSettings/.test(serverEntry));
+    assert("the server registers no team-seen settings", !/registerSettings\([^)]*(?:team|seen)/i.test(serverEntry));
     assert("the server serves the team subscription", /server\.handle\(teamSnapshot/.test(serverEntry));
     const polling = fs.readFileSync(path.join(repo, "paseo-plugin/client/team-polling.ts"), "utf8");
     assert("the team rules never write a seen key", !/seen\.remember|setMetadata|settingsRpc/.test(polling));
