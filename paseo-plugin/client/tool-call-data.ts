@@ -126,6 +126,14 @@ export type WebBlockData = {
 };
 
 export interface ToolCallData {
+  /**
+   * Protocol tool-call identifier (`item.callId`), or `""` when absent.
+   *
+   * Carried on the transformed plugin row so `InlineToolCall` keeps a stable
+   * `rowKey` across running -> completed transitions even when the row finishes
+   * off-screen and scrolls back into view.
+   */
+  callId: string;
   name: string;
   label: string;
   /** Lucide icon name, chosen to match Paseo's own tool-call icon. */
@@ -3020,6 +3028,7 @@ function taskOwnerName<T extends { ownerName?: string }>(task: T, owner: string 
 /** Normalize one Paseo tool-call item into JSON-safe render data. */
 export function toolCallData(
   item: {
+    callId?: unknown;
     name: string;
     status: string;
     detail: unknown;
@@ -3375,6 +3384,7 @@ export function toolCallData(
   const summary = rawSummary === label ? "" : rawSummary;
 
   return {
+    callId: typeof item.callId === "string" ? item.callId : "",
     name: item.name,
     label,
     icon,

@@ -22,14 +22,20 @@
  */
 "use strict";
 
+const Module = require("node:module");
+const { existsSync } = require("node:fs");
+const { join } = require("node:path");
+
 const {
   BULK_MIN_ROWS,
   BULK_WINDOW_MS,
   PULSE_MS,
+  commitMountEntrance,
   isPulsing,
   markRowAnimated,
   normalizeRowTimestamp,
   noteCommit,
+  noteMountCandidate,
   noteRender,
   pulseRemainingMs,
   resetNewestForTests,
@@ -252,6 +258,43 @@ async function main() {
       shouldEnterLive(histFirst, base + 40, false, "h4", afterReplay) === true,
     );
 
+    // Same-millisecond multi-row first pass must NOT collapse to 1.
+    const sameMsFirst = "enter-same-ms-first";
+    noteRender(sameMsFirst, base);
+    noteRender(sameMsFirst, base);
+    check(
+      "same-millisecond multi-row first pass suppresses even liveHint",
+      shouldEnterLive(sameMsFirst, base, true, "same-ms-1", base) === false,
+    );
+    await settle();
+    check(
+      "same-millisecond multi-row first pass activates replayUntil after flush",
+      shouldEnterLive(sameMsFirst, base + 10, true, "same-ms-2", Date.now()) === false,
+    );
+    resetNewestForTests(sameMsFirst);
+
+    // Already-settled agent receiving a multi-row batch (including same-ms rows)
+    // must also be classified as a batch and activate replayUntil.
+    const knownBatch = "enter-known-agent-batch";
+    await pass(knownBatch, [base]);
+    noteRender(knownBatch, base + 100);
+    noteRender(knownBatch, base + 100);
+    check(
+      "settled agent with same-ms multi-row pending suppresses entrance immediately",
+      shouldEnterLive(knownBatch, base + 100, true, "kb-1", Date.now() + BULK_WINDOW_MS + 100) === false,
+    );
+    await settle();
+    const afterKnownBatchNow = Date.now();
+    check(
+      "settled agent multi-row flush sets replayUntil (not gated on !sawFirstPass)",
+      shouldEnterLive(knownBatch, base + 200, true, "kb-2", afterKnownBatchNow) === false,
+    );
+    check(
+      "settled agent resumes live entrance once replayUntil elapses",
+      shouldEnterLive(knownBatch, base + 200, false, "kb-2", afterKnownBatchNow + BULK_WINDOW_MS + 50) === true,
+    );
+    resetNewestForTests(knownBatch);
+
     // Brand-new session first live row: liveHint=true allowed when pending has <= 1 row,
     // is pure / side-effect free (StrictMode double-render safe), and must NOT populate
     // `rows` prematurely (preserving noteRender first-pass semantics).
@@ -444,7 +487,1229 @@ async function main() {
     );
   }
 
-console.log(`\n${passed} passed, ${failed} failed`);
+  console.log("row-entrance & useInkStreamReveal: batch mount, terminal snap, and Web overflow observer");
+  {
+    const rowEntrancePath = join(__dirname, "client", "row-entrance.js");
+    check("compiled client/row-entrance.js exists", existsSync(rowEntrancePath));
+
+    function createMiniReactHarness({ includeLayoutEffect = true } = {}) {
+      const instances = new Map();
+      let activeKey = "root";
+      let activeSlot = 0;
+      let pendingLayoutEffects = [];
+      let pendingEffects = [];
+      let seenInstances = new Set();
+      let changed = false;
+
+      const sameDeps = (a, b) =>
+        Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => Object.is(v, b[i]));
+
+      function storeOf(key) {
+        let s = instances.get(key);
+        if (!s) {
+          s = [];
+          instances.set(key, s);
+        }
+        return s;
+      }
+
+      function cleanupInstance(key) {
+        const slots = instances.get(key);
+        if (!slots) return;
+        for (const slot of slots) {
+          if (slot && typeof slot === "object" && typeof slot.cleanup === "function") {
+            slot.cleanup();
+            slot.cleanup = undefined;
+          }
+        }
+        instances.delete(key);
+      }
+
+      function scheduleEffect(queue, effect, deps) {
+        const slots = storeOf(activeKey);
+        const i = activeSlot++;
+        const slot = slots[i];
+        if (slot !== undefined && sameDeps(slot.deps, deps)) return;
+        slots[i] = { deps, cleanup: slot === undefined ? undefined : slot.cleanup };
+        queue.push({ key: activeKey, index: i, effect });
+      }
+
+      const hooks = {
+        useState(initial) {
+          const slots = storeOf(activeKey);
+          const i = activeSlot++;
+          if (!(i in slots)) slots[i] = typeof initial === "function" ? initial() : initial;
+          const keyCapture = activeKey;
+          return [
+            slots[i],
+            (next) => {
+              const s = storeOf(keyCapture);
+              const value = typeof next === "function" ? next(s[i]) : next;
+              if (!Object.is(value, s[i])) {
+                s[i] = value;
+                changed = true;
+              }
+            },
+          ];
+        },
+        useRef(initial) {
+          const slots = storeOf(activeKey);
+          const i = activeSlot++;
+          if (!(i in slots)) slots[i] = { current: initial };
+          return slots[i];
+        },
+        useEffect(effect, deps) {
+          scheduleEffect(pendingEffects, effect, deps);
+        },
+      };
+      if (includeLayoutEffect) {
+        hooks.useLayoutEffect = function useLayoutEffect(effect, deps) {
+          scheduleEffect(pendingLayoutEffects, effect, deps);
+        };
+      }
+
+      function expand(node, path) {
+        if (node === null || node === undefined || typeof node !== "object") return node;
+        if (Array.isArray(node)) return node.map((child, idx) => expand(child, `${path}[${idx}]`));
+        if (typeof node.type === "function") {
+          const instKey = `${path}:${node.type.name || "fn"}:${node.key ?? ""}`;
+          seenInstances.add(instKey);
+          const prevKey = activeKey;
+          const prevSlot = activeSlot;
+          activeKey = instKey;
+          activeSlot = 0;
+          const rendered = node.type(node.props);
+          activeKey = prevKey;
+          activeSlot = prevSlot;
+          return expand(rendered, instKey);
+        }
+        if (node.props && node.props.children !== undefined) {
+          return {
+            ...node,
+            props: {
+              ...node.props,
+              children: expand(node.props.children, `${path}/${String(node.type)}`),
+            },
+          };
+        }
+        return node;
+      }
+
+      function runQueue(queue) {
+        for (const { key, index, effect } of queue) {
+          if (!instances.has(key)) continue;
+          const slot = storeOf(key)[index];
+          if (typeof slot.cleanup === "function") slot.cleanup();
+          const cleanup = effect();
+          slot.cleanup = typeof cleanup === "function" ? cleanup : undefined;
+        }
+      }
+
+      let lastRoot = null;
+      function render(Component, props, onFirstFrame) {
+        lastRoot = { Component, props };
+        let tree;
+        let passes = 0;
+        do {
+          changed = false;
+          pendingLayoutEffects = [];
+          pendingEffects = [];
+          seenInstances = new Set();
+          tree = expand({ type: Component, props }, "root");
+          if (passes === 0 && typeof onFirstFrame === "function") onFirstFrame(tree);
+          for (const key of Array.from(instances.keys())) {
+            if (!seenInstances.has(key)) cleanupInstance(key);
+          }
+          const layouts = pendingLayoutEffects;
+          const passives = pendingEffects;
+          pendingLayoutEffects = [];
+          pendingEffects = [];
+          runQueue(layouts);
+          runQueue(passives);
+          passes += 1;
+        } while (changed && passes < 6);
+        return tree;
+      }
+
+      function flushPendingRerender() {
+        if (changed && lastRoot !== null) {
+          return render(lastRoot.Component, lastRoot.props);
+        }
+        return null;
+      }
+
+      function unmountAll() {
+        for (const key of Array.from(instances.keys())) {
+          cleanupInstance(key);
+        }
+      }
+
+      return { hooks, render, flushPendingRerender, unmountAll };
+    }
+
+    function findAllNodes(node, predicate, out = []) {
+      if (node === null || node === undefined || typeof node !== "object") return out;
+      if (Array.isArray(node)) {
+        for (const item of node) findAllNodes(item, predicate, out);
+        return out;
+      }
+      if (predicate(node)) out.push(node);
+      if (node.props && node.props.children !== undefined) {
+        findAllNodes(node.props.children, predicate, out);
+      }
+      return out;
+    }
+
+    function loadRowEntrance(rnStub, hooks) {
+      const originalLoad = Module._load;
+      for (const key of Object.keys(require.cache)) {
+        if (key.endsWith("row-entrance.js")) delete require.cache[key];
+      }
+      Module._load = function load(request, parent, isMain) {
+        if (request === "react") return hooks;
+        if (request === "react/jsx-runtime") {
+          return {
+            jsx: (type, props, key) => ({ type, props, key }),
+            jsxs: (type, props, key) => ({ type, props, key }),
+            Fragment: "Fragment",
+          };
+        }
+        if (request === "react-native") return rnStub;
+        return originalLoad.call(this, request, parent, isMain);
+      };
+      try {
+        return require(rowEntrancePath);
+      } finally {
+        Module._load = originalLoad;
+      }
+    }
+
+    // 1. Known settled agent batch-mounting 5 completed rows at once (both
+    //    distinct and same-ms timestamps): 0 entrance animations, 0 ink reveals,
+    //    full titles visible on frame 0.
+    {
+      const prevDoc = global.document;
+      const prevWin = global.window;
+      global.document = {
+        getElementById: () => null,
+        createElement: (tag) => ({ tag, id: "", textContent: "" }),
+        head: { appendChild: () => {} },
+      };
+      global.window = {};
+      const harness = createMiniReactHarness({ includeLayoutEffect: true });
+      try {
+        const mod = loadRowEntrance(
+          { Platform: { OS: "web" }, View: "View", Text: "Text" },
+          harness.hooks,
+        );
+        const { RowEntrance, ROW_ENTER_TEST_ID, useInkStreamReveal, renderInkTrailText } = mod;
+
+        const batchAgent = "component-known-batch-5";
+        resetNewestForTests(batchAgent);
+        await pass(batchAgent, [base]);
+        // Wait past any initial window by verifying state is settled.
+        const rowsSpec = [0, 1, 2, 3, 4].map((i) => ({
+          key: `hist-${i}`,
+          ts: base + 100 + i * 10,
+          label: `读取文件${i}`,
+          summary: `src/file-${i}.ts`,
+        }));
+
+        function RowItem({ agentId, ts, rowKey, liveHint, label, summary }) {
+          const stream = useInkStreamReveal({
+            agentId,
+            timestamp: ts,
+            rowKey,
+            liveHint,
+            label,
+            summary,
+          });
+          const renderedLabel = renderInkTrailText(label, stream.labelProgress, "#fff", null);
+          return {
+            type: RowEntrance,
+            props: {
+              agentId,
+              timestamp: ts,
+              rowKey,
+              liveHint,
+              children: {
+                type: "Title",
+                props: {
+                  rowKey,
+                  active: stream.active,
+                  labelProgress: stream.labelProgress,
+                  renderedLabel,
+                },
+              },
+            },
+          };
+        }
+
+        function BatchList({ agentId, items }) {
+          return {
+            type: "List",
+            props: {
+              children: items.map((item) => ({
+                type: RowItem,
+                key: item.key,
+                props: {
+                  agentId,
+                  ts: item.ts,
+                  rowKey: item.key,
+                  liveHint: false,
+                  label: item.label,
+                  summary: item.summary,
+                },
+              })),
+            },
+          };
+        }
+
+        let firstFrameTitles = [];
+        let firstFrameEnters = [];
+        const finalTree = harness.render(BatchList, { agentId: batchAgent, items: rowsSpec }, (frame0) => {
+          firstFrameTitles = findAllNodes(frame0, (n) => n.type === "Title");
+          firstFrameEnters = findAllNodes(frame0, (n) => n.props?.testID === ROW_ENTER_TEST_ID);
+        });
+        const finalTitles = findAllNodes(finalTree, (n) => n.type === "Title");
+        const finalEnters = findAllNodes(finalTree, (n) => n.props?.testID === ROW_ENTER_TEST_ID);
+
+        check(
+          "known agent batch-mounting 5 completed rows: frame 0 has full non-empty titles and 0 entrance animations",
+          firstFrameTitles.length === 5 &&
+            firstFrameTitles.every(
+              (t, idx) =>
+                t.props.renderedLabel === rowsSpec[idx].label &&
+                t.props.active === false &&
+                t.props.labelProgress === Number.POSITIVE_INFINITY,
+            ) &&
+            firstFrameEnters.length === 0,
+          JSON.stringify(firstFrameTitles.map((t) => t.props)),
+        );
+        check(
+          "known agent batch-mounting 5 completed rows: after commit 0 rows animate or stream-reveal",
+          finalEnters.length === 0 &&
+            finalTitles.length === 5 &&
+            finalTitles.every((t) => t.props.active === false && t.props.labelProgress === Number.POSITIVE_INFINITY),
+        );
+        // All 5 rows must be marked animated so later remounts stay static too.
+        const farFuture = Date.now() + BULK_WINDOW_MS + 500;
+        check(
+          "all 5 batch-mounted completed rows are recorded in animatedKeys",
+          rowsSpec.every((r) => shouldEnterLive(batchAgent, r.ts, false, r.key, farFuture) === false),
+        );
+        harness.unmountAll();
+        await settle();
+
+        // Same-ms 5-row batch on known agent also triggers 0 animations.
+        const sameMsAgent = "component-known-same-ms-batch";
+        resetNewestForTests(sameMsAgent);
+        await pass(sameMsAgent, [base]);
+        const sameMsRows = [0, 1, 2, 3, 4].map((i) => ({
+          key: `same-ms-${i}`,
+          ts: base,
+          label: `命令${i}`,
+          summary: `echo ${i}`,
+        }));
+        const sameMsTree = harness.render(BatchList, { agentId: sameMsAgent, items: sameMsRows });
+        const sameMsEnters = findAllNodes(sameMsTree, (n) => n.props?.testID === ROW_ENTER_TEST_ID);
+        const sameMsTitles = findAllNodes(sameMsTree, (n) => n.type === "Title");
+        check(
+          "known agent batch-mounting 5 same-ms rows triggers 0 entrance and 0 reveal",
+          sameMsEnters.length === 0 &&
+            sameMsTitles.every((t, idx) => t.props.active === false && t.props.renderedLabel === sameMsRows[idx].label),
+        );
+        harness.unmountAll();
+        await settle();
+
+        // Control: a single genuine live row on a known agent DOES trigger both
+        // RowEntrance and useInkStreamReveal (proving the gate is not always-off).
+        const singleLiveAgent = "component-single-live-row";
+        resetNewestForTests(singleLiveAgent);
+        await pass(singleLiveAgent, [base]);
+        const singleTree = harness.render(RowItem, {
+          agentId: singleLiveAgent,
+          ts: base + 500,
+          rowKey: "live-only-1",
+          liveHint: true,
+          label: "运行命令",
+          summary: "git status",
+        });
+        const singleEnters = findAllNodes(singleTree, (n) => n.props?.testID === ROW_ENTER_TEST_ID);
+        const singleTitles = findAllNodes(singleTree, (n) => n.type === "Title");
+        check(
+          "control: single genuine live row activates both RowEntrance and useInkStreamReveal",
+          singleEnters.length === 1 && singleTitles.length === 1 && singleTitles[0].props.active === true,
+          `enters=${singleEnters.length}, active=${singleTitles[0]?.props?.active}`,
+        );
+        harness.unmountAll();
+        await settle();
+        resetNewestForTests(batchAgent);
+        resetNewestForTests(sameMsAgent);
+        resetNewestForTests(singleLiveAgent);
+      } finally {
+        global.document = prevDoc;
+        global.window = prevWin;
+      }
+    }
+
+    // 2. Minimal React stub without useLayoutEffect must fall back to useEffect safely.
+    {
+      const prevDoc = global.document;
+      const prevWin = global.window;
+      global.document = {
+        getElementById: () => null,
+        createElement: (tag) => ({ tag, id: "", textContent: "" }),
+        head: { appendChild: () => {} },
+      };
+      global.window = {};
+      const noLayoutHarness = createMiniReactHarness({ includeLayoutEffect: false });
+      try {
+        const mod = loadRowEntrance(
+          { Platform: { OS: "web" }, View: "View", Text: "Text" },
+          noLayoutHarness.hooks,
+        );
+        const { RowEntrance, ROW_ENTER_TEST_ID, useInkStreamReveal } = mod;
+        const stubAgent = "no-layout-effect-agent";
+        resetNewestForTests(stubAgent);
+        await pass(stubAgent, [base]);
+        let threw = false;
+        let tree = null;
+        try {
+          function SingleProbe() {
+            const s = useInkStreamReveal({
+              agentId: stubAgent,
+              timestamp: base + 100,
+              rowKey: "stub-1",
+              liveHint: true,
+              label: "读取",
+              summary: "a.ts",
+            });
+            return {
+              type: RowEntrance,
+              props: {
+                agentId: stubAgent,
+                timestamp: base + 100,
+                rowKey: "stub-1",
+                liveHint: true,
+                children: { type: "Out", props: { active: s.active } },
+              },
+            };
+          }
+          tree = noLayoutHarness.render(SingleProbe, {});
+        } catch (err) {
+          threw = true;
+          console.error(err);
+        }
+        const enters = tree ? findAllNodes(tree, (n) => n.props?.testID === ROW_ENTER_TEST_ID) : [];
+        const outs = tree ? findAllNodes(tree, (n) => n.type === "Out") : [];
+        check(
+          "row-entrance safely falls back to useEffect when useLayoutEffect is absent from stub",
+          !threw && enters.length === 1 && outs[0]?.props?.active === true,
+        );
+        noLayoutHarness.unmountAll();
+        await settle();
+        resetNewestForTests(stubAgent);
+      } finally {
+        global.document = prevDoc;
+        global.window = prevWin;
+      }
+    }
+
+    // 3. useInkStreamReveal snaps immediately to Infinity and cancels RAF/timer
+    //    when liveHint transitions from true -> false mid-reveal.
+    {
+      const prevRaf = global.requestAnimationFrame;
+      const prevCancelRaf = global.cancelAnimationFrame;
+      const prevPerf = global.performance;
+      const prevWin = global.window;
+      let fakeNow = 1000;
+      let nextRafId = 1;
+      const pendingRafs = new Map();
+      const cancelledRafIds = [];
+      global.performance = { now: () => fakeNow };
+      global.requestAnimationFrame = (cb) => {
+        const id = nextRafId++;
+        pendingRafs.set(id, cb);
+        return id;
+      };
+      global.cancelAnimationFrame = (id) => {
+        cancelledRafIds.push(id);
+        pendingRafs.delete(id);
+      };
+      global.window = {};
+
+      const harness = createMiniReactHarness({ includeLayoutEffect: true });
+      const snapAgent = "stream-terminal-snap-raf";
+      resetNewestForTests(snapAgent);
+      try {
+        await pass(snapAgent, [base]);
+        const mod = loadRowEntrance(
+          { Platform: { OS: "web" }, View: "View", Text: "Text" },
+          harness.hooks,
+        );
+        const { useInkStreamReveal, renderInkTrailText } = mod;
+
+        let latest = null;
+        function StreamProbe({ liveHint, label, summary }) {
+          const s = useInkStreamReveal({
+            agentId: snapAgent,
+            timestamp: base + 200,
+            rowKey: "snap-row-1",
+            liveHint,
+            label,
+            summary,
+          });
+          latest = {
+            ...s,
+            renderedLabel: renderInkTrailText(label, s.labelProgress, "#fff", null),
+            renderedSummary: renderInkTrailText(summary, s.summaryProgress, "#fff", null),
+          };
+          return { type: "Probe", props: latest };
+        }
+
+        // Start running: reveal becomes active and schedules a RAF callback.
+        harness.render(StreamProbe, {
+          liveHint: true,
+          label: "运行命令",
+          summary: "npm run test:all",
+        });
+        const initialPendingRafCount = pendingRafs.size;
+        // Advance halfway through reveal (still finite).
+        fakeNow += 120;
+        for (const [id, cb] of Array.from(pendingRafs.entries())) {
+          pendingRafs.delete(id);
+          cb(fakeNow);
+        }
+        harness.flushPendingRerender();
+        const midActive = latest.active;
+        const midFinite = Number.isFinite(latest.labelProgress);
+        const rafQueuedMid = pendingRafs.size;
+
+        check(
+          "mid-stream live row is actively revealing with a queued RAF frame",
+          initialPendingRafCount === 1 && midActive === true && midFinite === true && rafQueuedMid === 1,
+          JSON.stringify({ initialPendingRafCount, midActive, midFinite, rafQueuedMid }),
+        );
+
+        // Transition liveHint true -> false (e.g. tool failed early).
+        let snapFrame0 = null;
+        harness.render(
+          StreamProbe,
+          {
+            liveHint: false,
+            label: "运行命令",
+            summary: "已失败：exit code 1",
+          },
+          (f0) => {
+            snapFrame0 = f0.props;
+          },
+        );
+        check(
+          "liveHint true -> false snaps immediately on frame 0 to Infinity with full headline & failure summary",
+          snapFrame0 !== null &&
+            snapFrame0.active === false &&
+            snapFrame0.labelProgress === Number.POSITIVE_INFINITY &&
+            snapFrame0.summaryProgress === Number.POSITIVE_INFINITY &&
+            snapFrame0.renderedLabel === "运行命令" &&
+            snapFrame0.renderedSummary === "已失败：exit code 1",
+          JSON.stringify(snapFrame0),
+        );
+        check(
+          "liveHint true -> false cancels pending RAF and leaves zero queued frames",
+          cancelledRafIds.length >= 1 &&
+            pendingRafs.size === 0 &&
+            latest.active === false &&
+            latest.labelProgress === Number.POSITIVE_INFINITY,
+          `cancelled=${JSON.stringify(cancelledRafIds)}, pending=${pendingRafs.size}`,
+        );
+        harness.unmountAll();
+        await settle();
+
+        // Also verify timer fallback path (no requestAnimationFrame) clears setTimeout immediately.
+        global.requestAnimationFrame = undefined;
+        global.cancelAnimationFrame = undefined;
+        const prevSetTimeout = global.setTimeout;
+        const prevClearTimeout = global.clearTimeout;
+        let nextTimerId = 100;
+        const pendingTimers = new Map();
+        const clearedTimerIds = [];
+        global.setTimeout = (fn) => {
+          const id = nextTimerId++;
+          pendingTimers.set(id, fn);
+          return id;
+        };
+        global.clearTimeout = (id) => {
+          clearedTimerIds.push(id);
+          pendingTimers.delete(id);
+        };
+        const timerAgent = "stream-terminal-snap-timer";
+        resetNewestForTests(timerAgent);
+        try {
+          // settle without our mocked setTimeout by advancing state directly
+          noteRender(timerAgent, base);
+          await Promise.resolve();
+          const timerHarness = createMiniReactHarness({ includeLayoutEffect: true });
+          const timerMod = loadRowEntrance(
+            { Platform: { OS: "web" }, View: "View", Text: "Text" },
+            timerHarness.hooks,
+          );
+          let timerLatest = null;
+          function TimerProbe({ liveHint, label, summary }) {
+            timerLatest = timerMod.useInkStreamReveal({
+              agentId: timerAgent,
+              timestamp: base + 200,
+              rowKey: "snap-timer-1",
+              liveHint,
+              label,
+              summary,
+            });
+            return { type: "Probe", props: timerLatest };
+          }
+          timerHarness.render(TimerProbe, { liveHint: true, label: "编辑", summary: "app.ts" });
+          const queuedBefore = pendingTimers.size;
+          timerHarness.render(TimerProbe, { liveHint: false, label: "编辑", summary: "已完成" });
+          check(
+            "timer fallback path cancels pending setTimeout and snaps to Infinity on liveHint true -> false",
+            queuedBefore === 1 &&
+              clearedTimerIds.length >= 1 &&
+              pendingTimers.size === 0 &&
+              timerLatest.active === false &&
+              timerLatest.labelProgress === Number.POSITIVE_INFINITY,
+            `queuedBefore=${queuedBefore}, cleared=${JSON.stringify(clearedTimerIds)}, pending=${pendingTimers.size}`,
+          );
+          timerHarness.unmountAll();
+          await Promise.resolve();
+        } finally {
+          global.setTimeout = prevSetTimeout;
+          global.clearTimeout = prevClearTimeout;
+          resetNewestForTests(timerAgent);
+        }
+      } finally {
+        global.requestAnimationFrame = prevRaf;
+        global.cancelAnimationFrame = prevCancelRaf;
+        global.performance = prevPerf;
+        global.window = prevWin;
+        resetNewestForTests(snapAgent);
+      }
+    }
+
+    // 4. Web scroll-box overflow observer: dynamic data-dsh-overflow-y toggling,
+    //    unobserve on unmount, and safety under minimal DOM stubs.
+    {
+      const prevDoc = global.document;
+      const prevRO = global.ResizeObserver;
+      const prevMO = global.MutationObserver;
+      try {
+        const harness = createMiniReactHarness({ includeLayoutEffect: true });
+        const mod = loadRowEntrance(
+          { Platform: { OS: "web" }, View: "View", Text: "Text" },
+          harness.hooks,
+        );
+        const {
+          SCROLL_BOX_TEST_ID,
+          SCROLL_OVERFLOW_Y_ATTR,
+          ensureRowEntranceStyles,
+        } = mod;
+
+        function makeFakeElement({ testId, scrollHeight = 100, clientHeight = 200, child = null } = {}) {
+          const attrs = new Map();
+          if (testId !== undefined) attrs.set("data-testid", testId);
+          const el = {
+            scrollHeight,
+            clientHeight,
+            firstElementChild: child,
+            parentElement: null,
+            isConnected: true,
+            getAttribute: (name) => (attrs.has(name) ? attrs.get(name) : null),
+            setAttribute: (name, value) => attrs.set(name, String(value)),
+            removeAttribute: (name) => attrs.delete(name),
+            matches: (sel) => sel === `[data-testid="${SCROLL_BOX_TEST_ID}"]` && attrs.get("data-testid") === SCROLL_BOX_TEST_ID,
+            closest: (sel) => (el.matches(sel) ? el : null),
+            querySelectorAll: () => [],
+          };
+          if (child) {
+            child.parentElement = el;
+            child.closest = (sel) => (el.matches(sel) ? el : null);
+          }
+          return el;
+        }
+
+        const observedTargets = new Set();
+        const unobservedTargets = [];
+        let resizeCb = null;
+        let mutationCb = null;
+        global.ResizeObserver = class FakeResizeObserver {
+          constructor(cb) {
+            resizeCb = cb;
+          }
+          observe(target) {
+            observedTargets.add(target);
+          }
+          unobserve(target) {
+            observedTargets.delete(target);
+            unobservedTargets.push(target);
+          }
+        };
+        global.MutationObserver = class FakeMutationObserver {
+          constructor(cb) {
+            mutationCb = cb;
+          }
+          observe() {}
+          disconnect() {}
+        };
+
+        const child1 = makeFakeElement({});
+        const shortBox = makeFakeElement({
+          testId: SCROLL_BOX_TEST_ID,
+          scrollHeight: 120,
+          clientHeight: 200,
+          child: child1,
+        });
+        const injected = new Map();
+        global.document = {
+          getElementById: (id) => injected.get(id) ?? null,
+          createElement: (tag) => ({ tag, id: "", textContent: "" }),
+          head: { appendChild: (el) => injected.set(el.id, el) },
+          body: makeFakeElement({}),
+          querySelectorAll: (sel) => (sel === `[data-testid="${SCROLL_BOX_TEST_ID}"]` ? [shortBox] : []),
+        };
+
+        ensureRowEntranceStyles();
+        const styleSheet = injected.get("dsh-paseo-row-entrance");
+        check(
+          "Web CSS scopes overscroll-behavior-y: contain strictly to [data-dsh-overflow-y=\"true\"]",
+          styleSheet !== undefined &&
+            styleSheet.textContent.includes(
+              `[data-testid="${SCROLL_BOX_TEST_ID}"][${SCROLL_OVERFLOW_Y_ATTR}="true"]`,
+            ) &&
+            styleSheet.textContent.includes("overscroll-behavior-y: contain") &&
+            !styleSheet.textContent.includes(`[data-testid="${SCROLL_BOX_TEST_ID}"] {`),
+          styleSheet?.textContent,
+        );
+        check(
+          "short scroll box (scrollHeight <= clientHeight + 1) does NOT get data-dsh-overflow-y",
+          shortBox.getAttribute(SCROLL_OVERFLOW_Y_ATTR) === null &&
+            observedTargets.has(shortBox) &&
+            observedTargets.has(child1),
+        );
+
+        // Grow content child so scrollBox now overflows vertically.
+        shortBox.scrollHeight = 340;
+        resizeCb([{ target: child1 }]);
+        check(
+          "overflowing scroll box gets data-dsh-overflow-y=\"true\" when content child resizes",
+          shortBox.getAttribute(SCROLL_OVERFLOW_Y_ATTR) === "true",
+        );
+
+        // Shrink back to non-overflowing via DOM/text mutation (within +1px tolerance).
+        shortBox.scrollHeight = 201;
+        mutationCb([{ type: "characterData", target: child1 }]);
+        check(
+          "scroll box removes data-dsh-overflow-y when content shrinks within +1px tolerance",
+          shortBox.getAttribute(SCROLL_OVERFLOW_Y_ATTR) === null,
+        );
+
+        // Dynamically mount a second overflowing box via MutationObserver addedNodes.
+        const child2 = makeFakeElement({});
+        const dynamicBox = makeFakeElement({
+          testId: SCROLL_BOX_TEST_ID,
+          scrollHeight: 480,
+          clientHeight: 260,
+          child: child2,
+        });
+        mutationCb([{ type: "childList", target: global.document.body, addedNodes: [dynamicBox], removedNodes: [] }]);
+        check(
+          "dynamically mounted overflowing scroll box immediately receives data-dsh-overflow-y=\"true\" and is observed",
+          dynamicBox.getAttribute(SCROLL_OVERFLOW_Y_ATTR) === "true" &&
+            observedTargets.has(dynamicBox) &&
+            observedTargets.has(child2),
+        );
+
+        // Unmount the dynamic box -> must unobserve both box and its content child to prevent leaks.
+        dynamicBox.isConnected = false;
+        mutationCb([{ type: "childList", target: global.document.body, addedNodes: [], removedNodes: [dynamicBox] }]);
+        check(
+          "removed scroll box unobserves both container and content child (no observer leak)",
+          !observedTargets.has(dynamicBox) &&
+            !observedTargets.has(child2) &&
+            unobservedTargets.includes(dynamicBox) &&
+            unobservedTargets.includes(child2),
+        );
+
+        // Minimal DOM stub missing MutationObserver, ResizeObserver, querySelectorAll, and body.
+        global.ResizeObserver = undefined;
+        global.MutationObserver = undefined;
+        const minimalInjected = new Map();
+        global.document = {
+          getElementById: (id) => minimalInjected.get(id) ?? null,
+          createElement: (tag) => ({ tag, id: "", textContent: "" }),
+          head: { appendChild: (el) => minimalInjected.set(el.id, el) },
+        };
+        let minimalOk = true;
+        try {
+          ensureRowEntranceStyles();
+          // Calling a second time is idempotent.
+          ensureRowEntranceStyles();
+        } catch (err) {
+          minimalOk = false;
+          console.error(err);
+        }
+        check(
+          "ensureRowEntranceStyles is safe and idempotent under minimal stub without MutationObserver/ResizeObserver/body",
+          minimalOk && minimalInjected.has("dsh-paseo-row-entrance"),
+        );
+        mod.disposeRowEntranceObservers();
+      } finally {
+        global.document = prevDoc;
+        global.ResizeObserver = prevRO;
+        global.MutationObserver = prevMO;
+      }
+    }
+
+    // 5. StrictMode double-render of a single live row with stable identity does NOT trigger batch suppression;
+    //    existing row updating timestamp (firstPaint=false) alongside 1 new tool row also enters cleanly.
+    {
+      const prevDoc = global.document;
+      const prevWin = global.window;
+      global.document = {
+        getElementById: () => null,
+        createElement: (tag) => ({ tag, id: "", textContent: "" }),
+        head: { appendChild: () => {} },
+      };
+      global.window = {};
+      const harness = createMiniReactHarness({ includeLayoutEffect: true });
+      const strictAgent = "strict-mode-single-live";
+      const mixedUpdateAgent = "existing-update-plus-new-tool";
+      const distinctSameMsAgent = "distinct-identities-same-ms";
+      resetNewestForTests(strictAgent);
+      resetNewestForTests(mixedUpdateAgent);
+      resetNewestForTests(distinctSameMsAgent);
+      try {
+        await pass(strictAgent, [base]);
+        await pass(mixedUpdateAgent, [base]);
+        await pass(distinctSameMsAgent, [base]);
+
+        const mod = loadRowEntrance(
+          { Platform: { OS: "web" }, View: "View", Text: "Text" },
+          harness.hooks,
+        );
+        const { RowEntrance, ROW_ENTER_TEST_ID, useInkStreamReveal } = mod;
+
+        // 5a. Simulate React StrictMode rendering a single live row twice in one pass with the same identity.
+        const rowTs = base + 100;
+        const rowId = "tool:strict-single-1";
+        noteRender(strictAgent, rowTs, true, rowId);
+        noteRender(strictAgent, rowTs, true, rowId);
+        noteMountCandidate(strictAgent, rowTs, rowId);
+        noteMountCandidate(strictAgent, rowTs, rowId);
+
+        function StrictLiveRow() {
+          const stream = useInkStreamReveal({
+            agentId: strictAgent,
+            timestamp: rowTs,
+            rowKey: rowId,
+            liveHint: true,
+            label: "运行命令",
+            summary: "echo strict",
+          });
+          return {
+            type: RowEntrance,
+            props: {
+              agentId: strictAgent,
+              timestamp: rowTs,
+              rowKey: rowId,
+              liveHint: true,
+              children: { type: "Title", props: { active: stream.active } },
+            },
+          };
+        }
+
+        const strictTree = harness.render(StrictLiveRow, {});
+        const strictEnters = findAllNodes(strictTree, (n) => n.props?.testID === ROW_ENTER_TEST_ID);
+        const strictTitles = findAllNodes(strictTree, (n) => n.type === "Title");
+        check(
+          "StrictMode double render of a single live row with stable identity still activates entrance and reveal",
+          strictEnters.length === 1 && strictTitles.length === 1 && strictTitles[0].props.active === true,
+          `enters=${strictEnters.length}, active=${strictTitles[0]?.props?.active}`,
+        );
+        harness.unmountAll();
+        await settle();
+        check(
+          "StrictMode single live row does not arm replayUntil after pass flush",
+          shouldEnterLive(strictAgent, rowTs + 20, true, "tool:strict-next", Date.now()) === true,
+        );
+
+        // Negative control: two distinct identities at the same ms STILL register as a batch.
+        noteRender(distinctSameMsAgent, base + 100, true, "tool:batch-a");
+        noteRender(distinctSameMsAgent, base + 100, true, "tool:batch-b");
+        check(
+          "two distinct row identities at the same ms still suppress entrance as a batch",
+          commitMountEntrance(distinctSameMsAgent, base + 100, true, "tool:batch-a") === false,
+        );
+        await settle();
+
+        // 5b. Existing row updates timestamp (firstPaint=false) + 1 new tool row mounts in same pass.
+        noteRender(mixedUpdateAgent, base + 50, false, "row:existing-1");
+        noteRender(mixedUpdateAgent, base + 60, true, "tool:new-live-1");
+        noteMountCandidate(mixedUpdateAgent, base + 60, "tool:new-live-1");
+        const mixedEntered = commitMountEntrance(mixedUpdateAgent, base + 60, true, "tool:new-live-1");
+        await settle();
+        check(
+          "existing row updating timestamp (firstPaint=false) plus 1 new tool row does not misclassify as batch",
+          mixedEntered === true &&
+            shouldEnterLive(mixedUpdateAgent, base + 70, true, "tool:new-live-2", Date.now()) === true,
+          `mixedEntered=${mixedEntered}`,
+        );
+      } finally {
+        global.document = prevDoc;
+        global.window = prevWin;
+        resetNewestForTests(strictAgent);
+        resetNewestForTests(mixedUpdateAgent);
+        resetNewestForTests(distinctSameMsAgent);
+      }
+    }
+
+    // 6. Hot-swap CSS overwrite, cross-bundle observer replacement/disposal,
+    //    and zero scrollHeight reads on unrelated scroll boxes during outside DOM mutations.
+    {
+      const prevDoc = global.document;
+      const prevRO = global.ResizeObserver;
+      const prevMO = global.MutationObserver;
+      try {
+        const harness = createMiniReactHarness({ includeLayoutEffect: true });
+        const rnStub = { Platform: { OS: "web" }, View: "View", Text: "Text" };
+        const mod1 = loadRowEntrance(rnStub, harness.hooks);
+        const { SCROLL_BOX_TEST_ID, SCROLL_OVERFLOW_Y_ATTR } = mod1;
+
+        const createdROs = [];
+        const createdMOs = [];
+        global.ResizeObserver = class TrackingResizeObserver {
+          constructor(cb) {
+            this.cb = cb;
+            this.disconnected = false;
+            this.observed = new Set();
+            createdROs.push(this);
+          }
+          observe(target) {
+            this.observed.add(target);
+          }
+          unobserve(target) {
+            this.observed.delete(target);
+          }
+          disconnect() {
+            this.disconnected = true;
+            this.observed.clear();
+          }
+        };
+        global.MutationObserver = class TrackingMutationObserver {
+          constructor(cb) {
+            this.cb = cb;
+            this.disconnected = false;
+            this.observeOptions = null;
+            createdMOs.push(this);
+          }
+          observe(_root, options) {
+            this.observeOptions = options;
+          }
+          disconnect() {
+            this.disconnected = true;
+          }
+        };
+
+        function makeTrackedBox(initialScrollHeight, clientHeight) {
+          let scrollHeightVal = initialScrollHeight;
+          let scrollHeightReads = 0;
+          const attrs = new Map([["data-testid", SCROLL_BOX_TEST_ID]]);
+          const child = {
+            parentElement: null,
+            isConnected: true,
+            matches: () => false,
+            closest: null,
+            querySelectorAll: () => [],
+          };
+          const box = {
+            clientHeight,
+            firstElementChild: child,
+            parentElement: null,
+            isConnected: true,
+            getAttribute: (name) => (attrs.has(name) ? attrs.get(name) : null),
+            setAttribute: (name, value) => attrs.set(name, String(value)),
+            removeAttribute: (name) => attrs.delete(name),
+            matches: (sel) => sel === `[data-testid="${SCROLL_BOX_TEST_ID}"]` && attrs.get("data-testid") === SCROLL_BOX_TEST_ID,
+            closest: (sel) => (box.matches(sel) ? box : null),
+            querySelectorAll: () => [],
+            getReads: () => scrollHeightReads,
+            resetReads: () => {
+              scrollHeightReads = 0;
+            },
+          };
+          Object.defineProperty(box, "scrollHeight", {
+            get() {
+              scrollHeightReads += 1;
+              return scrollHeightVal;
+            },
+            set(v) {
+              scrollHeightVal = v;
+            },
+            enumerable: true,
+            configurable: true,
+          });
+          child.parentElement = box;
+          child.closest = (sel) => (box.matches(sel) ? box : null);
+          return { box, child };
+        }
+
+        const trackedA = makeTrackedBox(120, 200);
+        const trackedB = makeTrackedBox(400, 200);
+        const unrelatedDiv = {
+          parentElement: null,
+          isConnected: true,
+          matches: () => false,
+          closest: () => null,
+          querySelectorAll: () => [],
+        };
+        const unrelatedSpan = {
+          parentElement: unrelatedDiv,
+          isConnected: true,
+          matches: () => false,
+          closest: () => null,
+          querySelectorAll: () => [],
+        };
+
+        // 6a. Pre-seed stale legacy stylesheet with unconditional overscroll-behavior-y: contain.
+        const staleStyle = {
+          id: "dsh-paseo-row-entrance",
+          textContent: `[data-testid="${SCROLL_BOX_TEST_ID}"] { overscroll-behavior-y: contain; }`,
+        };
+        const injected = new Map([["dsh-paseo-row-entrance", staleStyle]]);
+        let appendCalls = 0;
+        const sharedDoc = {
+          getElementById: (id) => injected.get(id) ?? null,
+          createElement: (tag) => ({ tag, id: "", textContent: "" }),
+          head: {
+            appendChild: (el) => {
+              appendCalls += 1;
+              injected.set(el.id, el);
+            },
+          },
+          body: { matches: () => false, closest: () => null, querySelectorAll: () => [] },
+          querySelectorAll: (sel) =>
+            sel === `[data-testid="${SCROLL_BOX_TEST_ID}"]` ? [trackedA.box, trackedB.box] : [],
+        };
+        global.document = sharedDoc;
+
+        mod1.ensureRowEntranceStyles();
+        check(
+          "ensureRowEntranceStyles overwrites stale legacy stylesheet in place with conditional overflow-y CSS",
+          appendCalls === 0 &&
+            staleStyle.textContent.includes(
+              `[data-testid="${SCROLL_BOX_TEST_ID}"][${SCROLL_OVERFLOW_Y_ATTR}="true"]`,
+            ) &&
+            staleStyle.textContent.includes("overscroll-behavior-y: contain") &&
+            !staleStyle.textContent.includes(`[data-testid="${SCROLL_BOX_TEST_ID}"] {`),
+          `appendCalls=${appendCalls}, css=${staleStyle.textContent}`,
+        );
+        check(
+          "MutationObserver does not subscribe to characterData mutations",
+          createdMOs.length === 1 && createdMOs[0].observeOptions?.characterData !== true,
+          JSON.stringify(createdMOs[0]?.observeOptions),
+        );
+
+        // 6b. Outside unrelated DOM mutations must NOT read scrollHeight on any tracked scroll box.
+        trackedA.box.resetReads();
+        trackedB.box.resetReads();
+        createdMOs[0].cb([
+          { type: "childList", target: unrelatedDiv, addedNodes: [unrelatedSpan], removedNodes: [] },
+          { type: "childList", target: {}, addedNodes: [], removedNodes: [] },
+        ]);
+        check(
+          "outside unrelated DOM mutations perform 0 scrollHeight reads on tracked scroll boxes",
+          trackedA.box.getReads() === 0 && trackedB.box.getReads() === 0,
+          `readsA=${trackedA.box.getReads()}, readsB=${trackedB.box.getReads()}`,
+        );
+
+        // Inside-box mutation only resyncs the single affected scroll box, leaving other boxes untouched.
+        createdMOs[0].cb([
+          { type: "childList", target: trackedA.child, addedNodes: [unrelatedSpan], removedNodes: [] },
+        ]);
+        check(
+          "mutation inside box A only resyncs box A and leaves unrelated box B unread",
+          trackedA.box.getReads() >= 1 && trackedB.box.getReads() === 0,
+          `readsA=${trackedA.box.getReads()}, readsB=${trackedB.box.getReads()}`,
+        );
+
+        // 6c. Reloading a second row-entrance bundle instance on the same document disposes the old observer
+        //     so only 1 active observer remains; disposeRowEntranceObservers() cleans up completely.
+        mod1.ensureRowEntranceStyles(); // idempotent for same bundle
+        const countAfterIdempotent = { mo: createdMOs.length, ro: createdROs.length };
+        const mod2 = loadRowEntrance(rnStub, harness.hooks);
+        mod2.ensureRowEntranceStyles();
+        const activeMOsAfterReload = createdMOs.filter((o) => !o.disconnected);
+        const activeROsAfterReload = createdROs.filter((o) => !o.disconnected);
+        check(
+          "cross-bundle reload on same document disconnects previous observers and keeps exactly 1 active pair",
+          countAfterIdempotent.mo === 1 &&
+            countAfterIdempotent.ro === 1 &&
+            createdMOs[0].disconnected === true &&
+            createdROs[0].disconnected === true &&
+            activeMOsAfterReload.length === 1 &&
+            activeROsAfterReload.length === 1,
+          JSON.stringify({
+            countAfterIdempotent,
+            mo0Disconnected: createdMOs[0]?.disconnected,
+            ro0Disconnected: createdROs[0]?.disconnected,
+            activeMOs: activeMOsAfterReload.length,
+            activeROs: activeROsAfterReload.length,
+          }),
+        );
+
+        mod2.disposeRowEntranceObservers();
+        const sym = Symbol.for("dsh.paseo.scrollOverflowObserver.v1");
+        check(
+          "disposeRowEntranceObservers disconnects active observers and clears document symbol handle",
+          createdMOs.every((o) => o.disconnected) &&
+            createdROs.every((o) => o.disconnected) &&
+            sharedDoc[sym] === undefined,
+          `remainingMOs=${createdMOs.filter((o) => !o.disconnected).length}, hasSym=${sharedDoc[sym] !== undefined}`,
+        );
+
+        // 6d. Multi-host coexistence via retainRowEntranceObservers():
+        //     Host A & Host B coexist on the same document; Host A's render-time
+        //     ensureRowEntranceStyles() shares the v2 observer without ping-pong;
+        //     uninstalling Host B leaves Host A's existing & newly added scroll boxes
+        //     observed; uninstalling Host A disconnects observers & strips markers.
+        createdMOs.length = 0;
+        createdROs.length = 0;
+        const hostABox = makeTrackedBox(300, 120);
+        const hostBMod = loadRowEntrance(rnStub, harness.hooks);
+        const hostAMod = loadRowEntrance(rnStub, harness.hooks);
+        const multiDocBoxes = [hostABox.box];
+        const multiDoc = {
+          head: { appendChild: () => {} },
+          body: {},
+          getElementById: () => staleStyle,
+          createElement: () => ({ id: "", textContent: "" }),
+          querySelectorAll: () => multiDocBoxes,
+        };
+        global.document = multiDoc;
+
+        const releaseHostA = hostAMod.retainRowEntranceObservers();
+        const releaseHostB = hostBMod.retainRowEntranceObservers();
+        const moCountBeforeRenderCheck = createdMOs.length;
+        // Render-time implicit calls from either host must share the v2 observer (zero ping-pong).
+        hostAMod.ensureRowEntranceStyles();
+        hostBMod.ensureRowEntranceStyles();
+        check(
+          "multi-host render-time ensureRowEntranceStyles shares active observer without recreating it",
+          createdMOs.length === moCountBeforeRenderCheck &&
+            createdMOs.filter((o) => !o.disconnected).length === 1 &&
+            createdROs.filter((o) => !o.disconnected).length === 1 &&
+            hostABox.box.getAttribute("data-dsh-overflow-y") === "true",
+          JSON.stringify({
+            totalMOs: createdMOs.length,
+            before: moCountBeforeRenderCheck,
+            activeMOs: createdMOs.filter((o) => !o.disconnected).length,
+            activeROs: createdROs.filter((o) => !o.disconnected).length,
+            attr: hostABox.box.getAttribute("data-dsh-overflow-y"),
+          }),
+        );
+
+        // Uninstall Host B while Host A remains active.
+        releaseHostB();
+        const activeMOAfterB = createdMOs.filter((o) => !o.disconnected);
+        const activeROAfterB = createdROs.filter((o) => !o.disconnected);
+        // Shrink Host A's existing box -> ResizeObserver must still fire and remove marker.
+        hostABox.box.scrollHeight = 80;
+        activeROAfterB[0]?.cb([{ target: hostABox.box }]);
+        // Mount a brand-new overflowing box in Host A -> MutationObserver must still mark it.
+        const hostANewBox = makeTrackedBox(400, 100);
+        activeMOAfterB[0]?.cb([
+          { type: "childList", target: multiDoc.body, addedNodes: [hostANewBox.box], removedNodes: [] },
+        ]);
+        check(
+          "uninstalling Host B keeps observer alive for Host A (both resize shrink and newly added overflow box)",
+          activeMOAfterB.length === 1 &&
+            activeROAfterB.length === 1 &&
+            hostABox.box.getAttribute("data-dsh-overflow-y") === null &&
+            hostANewBox.box.getAttribute("data-dsh-overflow-y") === "true",
+          JSON.stringify({
+            activeMOs: activeMOAfterB.length,
+            activeROs: activeROAfterB.length,
+            shrunkAttr: hostABox.box.getAttribute("data-dsh-overflow-y"),
+            newBoxAttr: hostANewBox.box.getAttribute("data-dsh-overflow-y"),
+          }),
+        );
+
+        // 6e. Subtree-local childList removals must NOT scan `isConnected` across unrelated tracked boxes.
+        let trackedConnectedReads = 0;
+        const makeConnectedProbeBox = (scrollH, clientH) => {
+          const base = makeTrackedBox(scrollH, clientH);
+          Object.defineProperty(base.box, "isConnected", {
+            configurable: true,
+            get() {
+              trackedConnectedReads += 1;
+              return true;
+            },
+          });
+          return base;
+        };
+        const probeBox1 = makeConnectedProbeBox(280, 100);
+        const probeBox2 = makeConnectedProbeBox(280, 100);
+        activeMOAfterB[0].cb([
+          { type: "childList", target: multiDoc.body, addedNodes: [probeBox1.box, probeBox2.box], removedNodes: [] },
+        ]);
+        trackedConnectedReads = 0;
+        probeBox1.box.resetReads();
+        probeBox2.box.resetReads();
+        const removedTextNode = { nodeType: 3 };
+        const removedUnrelatedEl = { nodeType: 1, querySelectorAll: () => [] };
+        activeMOAfterB[0].cb([
+          { type: "childList", target: unrelatedDiv, addedNodes: [], removedNodes: [removedTextNode, removedUnrelatedEl] },
+        ]);
+        check(
+          "unrelated DOM text/element removals perform 0 isConnected checks and 0 scrollHeight reads on tracked boxes",
+          trackedConnectedReads === 0 && probeBox1.box.getReads() === 0 && probeBox2.box.getReads() === 0,
+          `connectedReads=${trackedConnectedReads}, reads1=${probeBox1.box.getReads()}, reads2=${probeBox2.box.getReads()}`,
+        );
+
+        // Removing a wrapper containing probeBox1 untracks probeBox1 via subtree querySelectorAll without touching probeBox2.
+        const wrapperHoldingBox1 = { nodeType: 1, querySelectorAll: () => [probeBox1.box] };
+        activeMOAfterB[0].cb([
+          { type: "childList", target: multiDoc.body, addedNodes: [], removedNodes: [wrapperHoldingBox1] },
+        ]);
+        check(
+          "removing a wrapper containing a tracked box untracks only that box without scanning unrelated boxes",
+          trackedConnectedReads === 0 &&
+            !activeROAfterB[0].observed.has(probeBox1.box) &&
+            activeROAfterB[0].observed.has(probeBox2.box),
+          `connectedReads=${trackedConnectedReads}, stillObserved1=${activeROAfterB[0].observed.has(probeBox1.box)}, stillObserved2=${activeROAfterB[0].observed.has(probeBox2.box)}`,
+        );
+
+        // Uninstalling the last host (Host A) disconnects observers, strips overflow markers, and clears symbol.
+        releaseHostA();
+        check(
+          "uninstalling the last host disconnects observers, strips data-dsh-overflow-y, and clears symbol",
+          createdMOs.every((o) => o.disconnected) &&
+            createdROs.every((o) => o.disconnected) &&
+            hostANewBox.box.getAttribute("data-dsh-overflow-y") === null &&
+            multiDoc[sym] === undefined,
+          JSON.stringify({
+            remainingMOs: createdMOs.filter((o) => !o.disconnected).length,
+            remainingROs: createdROs.filter((o) => !o.disconnected).length,
+            newBoxAttr: hostANewBox.box.getAttribute("data-dsh-overflow-y"),
+            hasSym: multiDoc[sym] !== undefined,
+          }),
+        );
+      } finally {
+        global.document = prevDoc;
+        global.ResizeObserver = prevRO;
+        global.MutationObserver = prevMO;
+      }
+    }
+  }
+
+  console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed === 0 ? 0 : 1);
 }
 

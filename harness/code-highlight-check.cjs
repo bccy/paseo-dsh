@@ -66,6 +66,7 @@ const {
   highlightModeFor,
   tokenColor,
   tokenizeCode,
+  tokenizeCodeLines,
   tokenizeLine,
 } = highlight;
 
@@ -415,6 +416,105 @@ try {
     check(
       "findTokenCovering sanity",
       findTokenCovering(tokenizeLine('const a = "hi"', "code"), '"hi"')?.kind === "string",
+    );
+  }
+
+  console.log("8. tokenizeCodeLines (cross-record state & embedded \\n / \\r\\n)");
+  {
+    const assertCodeLinesInvariants = (label, lines, rows) => {
+      equal(`${label}: record count matches`, rows.length, lines.length);
+      for (let i = 0; i < lines.length; i += 1) {
+        assertLineInvariants(`${label}[record ${i}]`, lines[i], rows[i]);
+      }
+    };
+
+    // Empty input
+    const emptyRows = tokenizeCodeLines([], "ts");
+    equal("tokenizeCodeLines([]) returns empty array", emptyRows.length, 0);
+
+    // Cross-record block comment preservation
+    const crossLines = [
+      "/* start comment",
+      "const ignored = 1;",
+      "end */ const active = 2;",
+    ];
+    const crossRows = tokenizeCodeLines(crossLines, "ts");
+    assertCodeLinesInvariants("cross-record-block-comment", crossLines, crossRows);
+    equal("middle record stays comment", crossRows[1].length, 1);
+    equal("middle record token kind is comment", crossRows[1][0].kind, "comment");
+    check(
+      "closing record recovers keyword after */",
+      hasToken(crossRows[2], "keyword", "const"),
+      JSON.stringify(crossRows[2]),
+    );
+
+    // Embedded \n inside a single record must not shift subsequent record indices
+    const embeddedLf = [
+      "/* open\nstill inside\nclose */ const x = 1;",
+      "const y = 2;",
+    ];
+    const lfRows = tokenizeCodeLines(embeddedLf, "ts");
+    assertCodeLinesInvariants("embedded-lf", embeddedLf, lfRows);
+    check(
+      "embedded-lf record 0 keeps comment span across internal newlines",
+      hasToken(lfRows[0], "comment", "/* open\nstill inside\nclose */"),
+      JSON.stringify(lfRows[0]),
+    );
+    check(
+      "embedded-lf record 0 highlights keyword after closing comment",
+      hasToken(lfRows[0], "keyword", "const"),
+      JSON.stringify(lfRows[0]),
+    );
+    check(
+      "embedded-lf record 1 aligns to second record and highlights keyword",
+      hasToken(lfRows[1], "keyword", "const"),
+      JSON.stringify(lfRows[1]),
+    );
+
+    // Embedded \r\n with line comment, blank sub-line, and cross-record block comment
+    const embeddedCrLf = [
+      "const a = 1;\r\n// line note\r\n\r\nconst b = 2;",
+      "/* unclosed\r\nstill comment",
+      "done */ return a + b;",
+    ];
+    const crlfRows = tokenizeCodeLines(embeddedCrLf, "ts");
+    assertCodeLinesInvariants("embedded-crlf", embeddedCrLf, crlfRows);
+    check(
+      "embedded-crlf record 0 keeps line comment without poisoning next sub-line",
+      hasToken(crlfRows[0], "comment", "// line note") &&
+        crlfRows[0].filter((t) => t.kind === "keyword" && t.text === "const").length === 2,
+      JSON.stringify(crlfRows[0]),
+    );
+    equal("embedded-crlf record 1 stays wholly comment", crlfRows[1].length, 1);
+    equal("embedded-crlf record 1 kind is comment", crlfRows[1][0].kind, "comment");
+    check(
+      "embedded-crlf record 2 closes comment and recovers return keyword",
+      hasToken(crlfRows[2], "comment", "done */") && hasToken(crlfRows[2], "keyword", "return"),
+      JSON.stringify(crlfRows[2]),
+    );
+
+    // Bare newline and empty records round-trip losslessly
+    const bareBreaks = ["\n", "\r\n", "", "foo\r\n"];
+    const bareRows = tokenizeCodeLines(bareBreaks, "ts");
+    assertCodeLinesInvariants("bare-newlines", bareBreaks, bareRows);
+
+    // Plain mode and >HIGHLIGHT_MAX_TOTAL_CHARS degrade cleanly while preserving length
+    const plainLines = ["const a = 1;\nconst b = 2;", "return a;"];
+    const plainRows = tokenizeCodeLines(plainLines, "text");
+    assertCodeLinesInvariants("plain-mode-lines", plainLines, plainRows);
+    check(
+      "plain mode keeps single plain token per non-empty record",
+      plainRows.every((row) => row.length === 1 && row[0].kind === "plain"),
+    );
+
+    const bigLine = "const v = 123;\nconst w = 456;";
+    const bigCount = Math.ceil((HIGHLIGHT_MAX_TOTAL_CHARS + 100) / bigLine.length);
+    const hugeLines = Array.from({ length: bigCount }, () => bigLine);
+    const hugeRows = tokenizeCodeLines(hugeLines, "ts");
+    assertCodeLinesInvariants("huge-lines", hugeLines, hugeRows);
+    check(
+      "over-24000 lines degrade every non-empty record to plain",
+      hugeRows.every((row) => row.length === 1 && row[0].kind === "plain"),
     );
   }
 

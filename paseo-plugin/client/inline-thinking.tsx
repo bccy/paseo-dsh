@@ -85,6 +85,7 @@ const SETTLE_WINDOW_MS = 300;
  */
 interface GrowingState {
   identity: string | undefined;
+  hostId: string;
   agentId: string | undefined;
   rowAt: number;
   text: string;
@@ -104,14 +105,16 @@ interface GrowingResult {
  *
  * Paseo's timeline projection can overwrite a merged row's `timestamp` with the
  * latest chunk's record time (`docs/FIELD-NOTES.md` #26 / `client/newest.ts`).
- * When that happens mid-stream or on the final `complete` frame, the same
- * mounted component sees a newer timestamp for the same agent with monotonic
- * prefix growth and an unseen key — carry the live timer forward instead of
- * resetting to 0 or dropping the duration on finish.
+ * When that happens mid-stream, on the final `complete` frame, or after a brief
+ * >300ms pause that already settled the previous key, the same mounted
+ * component sees a newer timestamp for the same host/agent with monotonic
+ * prefix growth and an unseen key — carry the timer forward instead of
+ * resetting to 0 or dropping the duration.
  */
 function isSameThoughtKeyShift(
   prev: {
     identity: string | undefined;
+    hostId: string;
     agentId: string | undefined;
     rowAt: number;
     text: string;
@@ -119,6 +122,7 @@ function isSameThoughtKeyShift(
   },
   next: {
     identity: string | undefined;
+    hostId: string;
     agentId: string | undefined;
     rowAt: number;
     text: string;
@@ -126,22 +130,36 @@ function isSameThoughtKeyShift(
   },
 ): boolean {
   if (prev.identity === next.identity) return false;
-  if (!prev.growing) return false;
+  const prevTracked =
+    prev.growing || (prev.identity !== undefined && durationRecords.has(prev.identity));
+  if (!prevTracked) return false;
+  if (prev.hostId !== next.hostId) return false;
   if (prev.agentId !== next.agentId) return false;
   if (next.rowAt < prev.rowAt) return false;
   if (next.identity !== undefined && durationRecords.has(next.identity)) return false;
-  return prev.text.length > 0 ? next.text.startsWith(prev.text) : next.phase === "streaming";
+  if (prev.growing) {
+    return prev.text.length > 0 ? next.text.startsWith(prev.text) : next.phase === "streaming";
+  }
+  if (prev.text.length > 0) {
+    return (
+      next.text.startsWith(prev.text) &&
+      (next.text.length > prev.text.length || next.phase === "streaming")
+    );
+  }
+  return next.phase === "streaming";
 }
 
 function useGrowing(
   text: string,
   phase: "streaming" | "complete",
   rowIdentity: string | undefined,
+  hostId: string,
   agentId: string | undefined,
   rowAt: number,
 ): GrowingResult {
   const [state, setState] = useState<GrowingState>(() => ({
     identity: rowIdentity,
+    hostId,
     agentId,
     rowAt,
     text,
@@ -149,6 +167,7 @@ function useGrowing(
     lastActivityAt: Date.now(),
   }));
   const prevIdentity = useRef<string | undefined>(rowIdentity);
+  const prevHostId = useRef<string>(hostId);
   const prevAgentId = useRef<string | undefined>(agentId);
   const prevRowAt = useRef<number>(rowAt);
   const prevText = useRef<string>(text);
@@ -158,6 +177,7 @@ function useGrowing(
 
   const continuedKeyShift = isSameThoughtKeyShift(state, {
     identity: rowIdentity,
+    hostId,
     agentId,
     rowAt,
     text,
@@ -171,17 +191,19 @@ function useGrowing(
       isSameThoughtKeyShift(
         {
           identity: prevIdentity.current,
+          hostId: prevHostId.current,
           agentId: prevAgentId.current,
           rowAt: prevRowAt.current,
           text: prevText.current,
           growing: prevGrowing.current,
         },
-        { identity: rowIdentity, agentId, rowAt, text, phase },
+        { identity: rowIdentity, hostId, agentId, rowAt, text, phase },
       );
 
     if (switched && !isContinuation) {
       const now = Date.now();
       prevIdentity.current = rowIdentity;
+      prevHostId.current = hostId;
       prevAgentId.current = agentId;
       prevRowAt.current = rowAt;
       prevText.current = text;
@@ -190,6 +212,7 @@ function useGrowing(
       lastActivityAtRef.current = now;
       setState({
         identity: rowIdentity,
+        hostId,
         agentId,
         rowAt,
         text,
@@ -205,6 +228,7 @@ function useGrowing(
       phase === "streaming" || grew || becameComplete ? Date.now() : lastActivityAtRef.current;
 
     prevIdentity.current = rowIdentity;
+    prevHostId.current = hostId;
     prevAgentId.current = agentId;
     prevRowAt.current = rowAt;
     prevText.current = text;
@@ -216,6 +240,7 @@ function useGrowing(
 
     setState((prev) =>
       prev.identity === rowIdentity &&
+      prev.hostId === hostId &&
       prev.agentId === agentId &&
       prev.rowAt === rowAt &&
       prev.text === text &&
@@ -224,6 +249,7 @@ function useGrowing(
         ? prev
         : {
             identity: rowIdentity,
+            hostId,
             agentId,
             rowAt,
             text,
@@ -242,12 +268,17 @@ function useGrowing(
     // Runs on unmount and before the next frame's effect, so a timer never
     // outlives the row and a stream that continues never settles.
     return () => clearTimeout(timer);
-  }, [text, phase, rowIdentity, agentId, rowAt]);
+  }, [text, phase, rowIdentity, hostId, agentId, rowAt]);
 
   const sameOrContinued = state.identity === rowIdentity || continuedKeyShift;
+  const resumedOnRender =
+    sameOrContinued &&
+    !state.growing &&
+    (phase === "streaming" || text.length > state.text.length);
   return {
-    growing: sameOrContinued ? state.growing : phase === "streaming",
-    lastActivityAt: sameOrContinued ? state.lastActivityAt : Date.now(),
+    growing: sameOrContinued ? state.growing || resumedOnRender : phase === "streaming",
+    lastActivityAt:
+      sameOrContinued && !resumedOnRender ? state.lastActivityAt : Date.now(),
     continuedKeyShift,
   };
 }
@@ -258,17 +289,37 @@ const STICK_TO_BOTTOM_THRESHOLD = 24;
 interface BodyScrollTracker {
   stickToBottom: boolean;
   lastScrollY: number | null;
+  lastMaxReachableY: number | null;
+  stickyAnchorY: number | null;
+  /** Pre-growth bottom edge preserved across multi-frame iOS bottom overscroll bounces. */
+  overscrollReturnFloorY: number | null;
   userDragging: boolean;
   userMomentum: boolean;
+  awaitingMomentum: boolean;
+  endDragTimer: ReturnType<typeof setTimeout> | null;
+  pendingFollow: boolean;
 }
 
 function createBodyScrollTracker(): BodyScrollTracker {
   return {
     stickToBottom: true,
     lastScrollY: null,
+    lastMaxReachableY: null,
+    stickyAnchorY: null,
+    overscrollReturnFloorY: null,
     userDragging: false,
     userMomentum: false,
+    awaitingMomentum: false,
+    endDragTimer: null,
+    pendingFollow: false,
   };
+}
+
+function clearEndDragTimer(tracker: BodyScrollTracker): void {
+  if (tracker.endDragTimer !== null) {
+    clearTimeout(tracker.endDragTimer);
+    tracker.endDragTimer = null;
+  }
 }
 
 /** Polling cadence for the live thinking timer (matches 0.1s display granularity). */
@@ -281,57 +332,153 @@ const MAX_DURATION_RECORDS = 500;
 export const THINKING_DURATION_TEST_ID = "dsh-thinking-duration";
 
 interface DurationRecord {
-  startedAt: number;
   elapsedMs: number;
   settled: boolean;
+  text: string;
 }
 
 const durationRecords = new Map<string, DurationRecord>();
+const collisionSlotsByBaseKey = new Map<string, Set<string>>();
+const collisionSlotToBaseKey = new Map<string, string>();
 
-function rememberDuration(key: string, record: DurationRecord): void {
+function mergeAnchorText(existingText: string | undefined, nextText: string): string {
+  if (existingText === undefined || existingText === "") return nextText;
+  if (nextText === "") return existingText;
+  return nextText.length >= existingText.length ? nextText : existingText;
+}
+
+function isCompatibleThoughtText(
+  record: DurationRecord,
+  currentText: string,
+  currentPhase: "streaming" | "complete",
+): boolean {
+  const cachedText = record.text;
+  if (cachedText === currentText) return true;
+  if (cachedText === "") return currentPhase === "streaming" || !record.settled;
+  if (currentText === "") return !record.settled;
+  if (record.settled && currentPhase === "complete") return false;
+  if (record.settled) return currentText.startsWith(cachedText);
+  return currentText.startsWith(cachedText) || cachedText.startsWith(currentText);
+}
+
+function deleteDurationRecord(key: string): void {
+  durationRecords.delete(key);
+  const baseKey = collisionSlotToBaseKey.get(key);
+  if (baseKey !== undefined) {
+    collisionSlotToBaseKey.delete(key);
+    const slots = collisionSlotsByBaseKey.get(baseKey);
+    if (slots !== undefined) {
+      slots.delete(key);
+      if (slots.size === 0) collisionSlotsByBaseKey.delete(baseKey);
+    }
+  }
+}
+
+function rememberDuration(key: string, record: DurationRecord, baseKey?: string): void {
   if (!durationRecords.has(key) && durationRecords.size >= MAX_DURATION_RECORDS) {
     const oldest = durationRecords.keys().next().value;
-    if (oldest !== undefined) durationRecords.delete(oldest);
+    if (oldest !== undefined) deleteDurationRecord(oldest);
   }
   durationRecords.set(key, record);
+  if (baseKey !== undefined && baseKey !== key) {
+    collisionSlotToBaseKey.set(key, baseKey);
+    let slots = collisionSlotsByBaseKey.get(baseKey);
+    if (slots === undefined) {
+      slots = new Set<string>();
+      collisionSlotsByBaseKey.set(baseKey, slots);
+    }
+    slots.add(key);
+  }
+}
+
+/**
+ * Resolve the storage slot for `(baseKey, text)` so two unrelated thoughts
+ * sharing the exact same millisecond timestamp never collide or reuse each
+ * other's cached duration.
+ */
+function resolveDurationKey(
+  baseKey: string | undefined,
+  text: string,
+  phase: "streaming" | "complete",
+): string | undefined {
+  if (baseKey === undefined) return undefined;
+  const primary = durationRecords.get(baseKey);
+  if (primary !== undefined && isCompatibleThoughtText(primary, text, phase)) {
+    return baseKey;
+  }
+  const slots = collisionSlotsByBaseKey.get(baseKey);
+  if (slots !== undefined) {
+    for (const slotKey of slots) {
+      const record = durationRecords.get(slotKey);
+      if (record !== undefined && isCompatibleThoughtText(record, text, phase)) {
+        return slotKey;
+      }
+    }
+  }
+  if (primary === undefined) return baseKey;
+  let slotIndex = 1;
+  while (durationRecords.has(`${baseKey}\0#${slotIndex}`)) {
+    slotIndex += 1;
+  }
+  return `${baseKey}\0#${slotIndex}`;
 }
 
 /** Clear cached thinking durations; test-only helper. */
 export function resetThinkingDurationsForTests(): void {
   durationRecords.clear();
+  collisionSlotsByBaseKey.clear();
+  collisionSlotToBaseKey.clear();
 }
 
 /**
  * Observe live elapsed duration strictly when the row is seen streaming.
  *
  * Historic / replayed rows that mount already settled keep `0` so the UI never
- * invents a fake elapsed time. Once observed streaming, the elapsed time ticks
- * monotonically (guarded against system clock rollbacks) until the row settles,
- * freezes at the last real activity moment so the 300ms settle window does not
- * inflate the final reading, and is cached in memory per row key so
- * virtual-list recycling preserves the observed duration without inflating it
- * across unmounted intervals or re-opening a settled record.
+ * invents a fake elapsed time. Active duration is accumulated as
+ * `baseElapsedMs + (now - segmentStartedAt)` so unmounting or pausing past the
+ * 300ms settle window never inflates elapsed time with idle/unmounted gaps,
+ * resuming a stream continues monotonically from the saved total, and system
+ * clock rollbacks never move the reading backwards.
  */
 function useThinkingDuration(
   growing: boolean,
   phase: "streaming" | "complete",
   cacheKey: string | undefined,
+  baseKey: string | undefined,
+  text: string,
   lastActivityAt: number,
   continuedKeyShift: boolean,
 ): number {
   const cached = cacheKey === undefined ? undefined : durationRecords.get(cacheKey);
   const prevKeyRef = useRef<string | undefined>(cacheKey);
-  const startedAtRef = useRef<number | null>(
-    cached !== undefined && !cached.settled ? cached.startedAt : null,
-  );
+  const baseElapsedRef = useRef<number>(cached?.elapsedMs ?? 0);
+  const segmentStartedAtRef = useRef<number | null>(null);
   const maxElapsedRef = useRef<number>(cached?.elapsedMs ?? 0);
   const wasGrowingRef = useRef<boolean>(false);
+  const boundKeyRef = useRef<string | undefined>(cacheKey);
+  const boundTextRef = useRef<string>(text);
+  if (boundKeyRef.current === cacheKey) {
+    boundTextRef.current = text;
+  }
   const [state, setState] = useState<{ key: string | undefined; elapsedMs: number }>(() => ({
     key: cacheKey,
     elapsedMs: cached?.elapsedMs ?? 0,
   }));
 
   useEffect(() => {
+    if (cacheKey === undefined) return;
+    const existing = durationRecords.get(cacheKey);
+    if (existing === undefined) return;
+    const merged = mergeAnchorText(existing.text, text);
+    if (merged !== existing.text) {
+      rememberDuration(cacheKey, { ...existing, text: merged }, baseKey);
+    }
+  }, [cacheKey, baseKey, text]);
+
+  useEffect(() => {
+    boundKeyRef.current = cacheKey;
+    boundTextRef.current = text;
+
     const commit = (nextElapsed: number) => {
       setState((prev) =>
         prev.key === cacheKey && prev.elapsedMs === nextElapsed
@@ -340,75 +487,108 @@ function useThinkingDuration(
       );
     };
 
+    const computeElapsedAt = (sampleAt: number): number => {
+      if (segmentStartedAtRef.current === null) return maxElapsedRef.current;
+      const delta = Math.max(0, sampleAt - segmentStartedAtRef.current);
+      return Math.max(maxElapsedRef.current, baseElapsedRef.current + delta);
+    };
+
+    const flushSegmentAt = (sampleAt: number): number => {
+      const total = computeElapsedAt(sampleAt);
+      maxElapsedRef.current = total;
+      baseElapsedRef.current = total;
+      segmentStartedAtRef.current = null;
+      return total;
+    };
+
     if (prevKeyRef.current !== cacheKey) {
       const oldKey = prevKeyRef.current;
       prevKeyRef.current = cacheKey;
-      if (continuedKeyShift && startedAtRef.current !== null) {
+      if (continuedKeyShift) {
+        const oldCached = oldKey === undefined ? undefined : durationRecords.get(oldKey);
+        const carried = Math.max(flushSegmentAt(Date.now()), oldCached?.elapsedMs ?? 0);
+        baseElapsedRef.current = carried;
+        maxElapsedRef.current = carried;
+        segmentStartedAtRef.current = null;
         if (oldKey !== undefined) {
-          durationRecords.delete(oldKey);
+          deleteDurationRecord(oldKey);
         }
         if (cacheKey !== undefined) {
-          rememberDuration(cacheKey, {
-            startedAt: startedAtRef.current,
-            elapsedMs: maxElapsedRef.current,
-            settled: false,
-          });
+          rememberDuration(
+            cacheKey,
+            {
+              elapsedMs: carried,
+              settled: false,
+              text: mergeAnchorText(oldCached?.text, boundTextRef.current),
+            },
+            baseKey,
+          );
         }
-        commit(maxElapsedRef.current);
+        commit(carried);
       } else {
         wasGrowingRef.current = false;
+        segmentStartedAtRef.current = null;
         const keyCached = cacheKey === undefined ? undefined : durationRecords.get(cacheKey);
-        startedAtRef.current =
-          keyCached !== undefined && !keyCached.settled ? keyCached.startedAt : null;
+        baseElapsedRef.current = keyCached?.elapsedMs ?? 0;
         maxElapsedRef.current = keyCached?.elapsedMs ?? 0;
         commit(maxElapsedRef.current);
       }
     }
 
     const currentCached = cacheKey === undefined ? undefined : durationRecords.get(cacheKey);
-    if (currentCached?.settled) {
-      wasGrowingRef.current = false;
-      startedAtRef.current = null;
-      maxElapsedRef.current = currentCached.elapsedMs;
-      commit(currentCached.elapsedMs);
-      return undefined;
-    }
 
     if (growing) {
       wasGrowingRef.current = true;
-      if (startedAtRef.current === null) {
-        startedAtRef.current = Date.now();
+      const resumeBase = Math.max(maxElapsedRef.current, currentCached?.elapsedMs ?? 0);
+      if (segmentStartedAtRef.current === null) {
+        baseElapsedRef.current = resumeBase;
+        maxElapsedRef.current = resumeBase;
+      } else if (resumeBase > maxElapsedRef.current) {
+        maxElapsedRef.current = resumeBase;
       }
+
       const recordSample = (sampleAt: number) => {
-        if (startedAtRef.current === null) return;
-        const next = Math.max(maxElapsedRef.current, sampleAt - startedAtRef.current);
+        const next = computeElapsedAt(sampleAt);
         maxElapsedRef.current = next;
         if (cacheKey !== undefined) {
-          rememberDuration(cacheKey, {
-            startedAt: startedAtRef.current,
-            elapsedMs: next,
-            settled: false,
-          });
+          const existing = durationRecords.get(cacheKey);
+          rememberDuration(
+            cacheKey,
+            {
+              elapsedMs: next,
+              settled: false,
+              text: mergeAnchorText(existing?.text, boundTextRef.current),
+            },
+            baseKey,
+          );
         }
         commit(next);
       };
 
       if (phase === "streaming") {
+        if (segmentStartedAtRef.current === null) {
+          segmentStartedAtRef.current = Date.now();
+        }
         const tick = () => recordSample(Date.now());
         tick();
         const id = setInterval(tick, DURATION_TICK_MS);
         return () => {
           clearInterval(id);
-          if (startedAtRef.current !== null && cacheKey !== undefined) {
-            const existing = durationRecords.get(cacheKey);
-            if (existing === undefined || !existing.settled) {
-              const flushed = Math.max(maxElapsedRef.current, Date.now() - startedAtRef.current);
-              maxElapsedRef.current = flushed;
-              rememberDuration(cacheKey, {
-                startedAt: startedAtRef.current,
-                elapsedMs: flushed,
-                settled: false,
-              });
+          if (segmentStartedAtRef.current !== null) {
+            const flushed = flushSegmentAt(Date.now());
+            if (cacheKey !== undefined) {
+              const existing = durationRecords.get(cacheKey);
+              if (existing === undefined || !existing.settled) {
+                rememberDuration(
+                  cacheKey,
+                  {
+                    elapsedMs: flushed,
+                    settled: false,
+                    text: mergeAnchorText(existing?.text, boundTextRef.current),
+                  },
+                  baseKey,
+                );
+              }
             }
           }
         };
@@ -416,31 +596,66 @@ function useThinkingDuration(
 
       // Inside the settle debounce window (`phase === "complete"`): anchor to
       // the last real activity moment rather than ticking through the 300ms wait.
-      recordSample(lastActivityAt);
+      const settledSample = flushSegmentAt(lastActivityAt);
+      if (cacheKey !== undefined) {
+        const existing = durationRecords.get(cacheKey);
+        rememberDuration(
+          cacheKey,
+          {
+            elapsedMs: settledSample,
+            settled: false,
+            text: mergeAnchorText(existing?.text, boundTextRef.current),
+          },
+          baseKey,
+        );
+      }
+      commit(settledSample);
       return undefined;
     }
 
-    if (wasGrowingRef.current && startedAtRef.current !== null) {
+    if (wasGrowingRef.current) {
       wasGrowingRef.current = false;
-      const finalMs = Math.max(maxElapsedRef.current, lastActivityAt - startedAtRef.current);
-      maxElapsedRef.current = finalMs;
+      const finalMs = flushSegmentAt(lastActivityAt);
       if (cacheKey !== undefined) {
-        rememberDuration(cacheKey, {
-          startedAt: startedAtRef.current,
-          elapsedMs: finalMs,
-          settled: true,
-        });
+        const existing = durationRecords.get(cacheKey);
+        rememberDuration(
+          cacheKey,
+          {
+            elapsedMs: finalMs,
+            settled: true,
+            text: mergeAnchorText(existing?.text, boundTextRef.current),
+          },
+          baseKey,
+        );
       }
-      startedAtRef.current = null;
       commit(finalMs);
-    } else if (cacheKey !== undefined) {
-      const existing = durationRecords.get(cacheKey);
-      if (existing !== undefined && !existing.settled) {
-        rememberDuration(cacheKey, { ...existing, settled: true });
-      }
+      return undefined;
+    }
+
+    if (currentCached?.settled) {
+      segmentStartedAtRef.current = null;
+      baseElapsedRef.current = currentCached.elapsedMs;
+      maxElapsedRef.current = currentCached.elapsedMs;
+      commit(currentCached.elapsedMs);
+      return undefined;
+    }
+
+    if (cacheKey !== undefined && currentCached !== undefined && !currentCached.settled) {
+      rememberDuration(
+        cacheKey,
+        {
+          elapsedMs: currentCached.elapsedMs,
+          settled: true,
+          text: mergeAnchorText(currentCached.text, boundTextRef.current),
+        },
+        baseKey,
+      );
+      baseElapsedRef.current = currentCached.elapsedMs;
+      maxElapsedRef.current = currentCached.elapsedMs;
+      commit(currentCached.elapsedMs);
     }
     return undefined;
-  }, [growing, phase, cacheKey, lastActivityAt, continuedKeyShift]);
+  }, [growing, phase, cacheKey, baseKey, lastActivityAt, continuedKeyShift]);
 
   if (state.key === cacheKey || continuedKeyShift) return state.elapsedMs;
   return cached?.elapsedMs ?? 0;
@@ -448,6 +663,7 @@ function useThinkingDuration(
 
 export function InlineThinking({
   theme,
+  host,
   layout,
   agentId,
   timestamp,
@@ -455,18 +671,34 @@ export function InlineThinking({
 }: PluginTimelineItemProps<InlineThinkingData>) {
   const { text, phase } = item.data;
   const rowAt = normalizeRowTimestamp(timestamp);
-  if (typeof agentId === "string" && agentId !== "" && rowAt !== 0) {
-    noteRender(agentId, rowAt);
-  }
+  const hostId = typeof host?.id === "string" ? host.id : "";
   const rowKey = rowAt !== 0 ? `thinking:${rowAt}` : undefined;
-  const durationKey =
+  const baseDurationKey =
     typeof agentId === "string" && agentId !== "" && rowKey !== undefined
-      ? `${agentId}\0${rowKey}`
+      ? `${hostId}\0${agentId}\0${rowKey}`
       : undefined;
+  const durationKey = resolveDurationKey(baseDurationKey, text, phase);
+  const hasCommittedRenderRef = useRef(false);
+  const renderIdentityRef = useRef<object | null>(null);
+  if (renderIdentityRef.current === null) {
+    renderIdentityRef.current = {};
+  }
+  useEffect(() => {
+    hasCommittedRenderRef.current = true;
+  }, []);
+  if (typeof agentId === "string" && agentId !== "" && rowAt !== 0) {
+    noteRender(
+      agentId,
+      rowAt,
+      !hasCommittedRenderRef.current,
+      renderIdentityRef.current,
+    );
+  }
   const { growing, lastActivityAt, continuedKeyShift } = useGrowing(
     text,
     phase,
     durationKey,
+    hostId,
     agentId,
     rowAt,
   );
@@ -474,6 +706,8 @@ export function InlineThinking({
     growing,
     phase,
     durationKey,
+    baseDurationKey,
+    text,
     lastActivityAt,
     continuedKeyShift,
   );
@@ -521,10 +755,39 @@ export function InlineThinking({
 
   const scrollBodyToBottom = () => {
     const tracker = scrollTrackerRef.current;
-    if (!tracker.stickToBottom || tracker.userDragging || tracker.userMomentum) return;
+    if (!tracker.stickToBottom) {
+      tracker.pendingFollow = false;
+      return;
+    }
+    if (tracker.userDragging || tracker.userMomentum || tracker.awaitingMomentum) {
+      tracker.pendingFollow = true;
+      return;
+    }
     const node = scrollRef.current;
     if (node === null || typeof node.scrollToEnd !== "function") return;
+    tracker.pendingFollow = false;
+    tracker.overscrollReturnFloorY = null;
+    if (tracker.lastScrollY !== null) {
+      tracker.stickyAnchorY =
+        tracker.stickyAnchorY === null
+          ? tracker.lastScrollY
+          : Math.max(tracker.stickyAnchorY, tracker.lastScrollY);
+    }
     node.scrollToEnd({ animated: false });
+  };
+
+  const flushPendingFollow = () => {
+    const tracker = scrollTrackerRef.current;
+    if (
+      !tracker.userDragging &&
+      !tracker.userMomentum &&
+      !tracker.awaitingMomentum &&
+      tracker.pendingFollow &&
+      tracker.stickToBottom
+    ) {
+      tracker.pendingFollow = false;
+      scrollBodyToBottom();
+    }
   };
 
   // Opening an expanded thought starts at the latest (bottom) content; live
@@ -538,12 +801,15 @@ export function InlineThinking({
     prevScrollKeyRef.current = durationKey;
 
     if (openChanged || keySwitched) {
+      clearEndDragTimer(scrollTrackerRef.current);
       scrollTrackerRef.current = createBodyScrollTracker();
       if (open) {
         scrollBodyToBottom();
       }
     }
   }, [open, durationKey]);
+
+  useEffect(() => () => clearEndDragTimer(scrollTrackerRef.current), []);
 
   const handleScrollLayout = () => {
     scrollBodyToBottom();
@@ -554,20 +820,75 @@ export function InlineThinking({
   };
 
   const handleScrollBeginDrag = () => {
-    scrollTrackerRef.current.userDragging = true;
-    scrollTrackerRef.current.userMomentum = false;
+    const tracker = scrollTrackerRef.current;
+    clearEndDragTimer(tracker);
+    tracker.awaitingMomentum = false;
+    tracker.userDragging = true;
+    tracker.userMomentum = false;
   };
 
-  const handleScrollEndDrag = () => {
-    scrollTrackerRef.current.userDragging = false;
+  const handleScrollEndDrag = (event?: {
+    nativeEvent?: {
+      velocity?: { y?: number };
+      contentOffset?: { y?: number };
+      targetContentOffset?: { y?: number };
+    };
+  }) => {
+    const tracker = scrollTrackerRef.current;
+    tracker.userDragging = false;
+    clearEndDragTimer(tracker);
+    if (tracker.userMomentum) {
+      tracker.awaitingMomentum = false;
+      return;
+    }
+
+    const velocityY = event?.nativeEvent?.velocity?.y;
+    const hasVelocity = typeof velocityY === "number" && Number.isFinite(velocityY);
+    const offsetY = event?.nativeEvent?.contentOffset?.y;
+    const targetY = event?.nativeEvent?.targetContentOffset?.y;
+    const hasTargetOffset =
+      typeof offsetY === "number" &&
+      Number.isFinite(offsetY) &&
+      typeof targetY === "number" &&
+      Number.isFinite(targetY);
+    const expectsMomentum =
+      (hasVelocity && Math.abs(velocityY) > 0.01) ||
+      (hasTargetOffset && Math.abs(targetY - offsetY) > 1);
+    const confirmedStationary =
+      hasVelocity &&
+      Math.abs(velocityY) <= 0.01 &&
+      (!hasTargetOffset || Math.abs(targetY - offsetY) <= 1);
+
+    if (confirmedStationary) {
+      tracker.awaitingMomentum = false;
+      flushPendingFollow();
+      return;
+    }
+
+    tracker.awaitingMomentum = true;
+    const delayMs = expectsMomentum ? 120 : 0;
+    tracker.endDragTimer = setTimeout(() => {
+      tracker.endDragTimer = null;
+      if (scrollTrackerRef.current !== tracker) return;
+      tracker.awaitingMomentum = false;
+      flushPendingFollow();
+    }, delayMs);
   };
 
   const handleMomentumScrollBegin = () => {
-    scrollTrackerRef.current.userMomentum = true;
+    const tracker = scrollTrackerRef.current;
+    clearEndDragTimer(tracker);
+    tracker.awaitingMomentum = false;
+    tracker.userMomentum = true;
   };
 
   const handleMomentumScrollEnd = () => {
-    scrollTrackerRef.current.userMomentum = false;
+    const tracker = scrollTrackerRef.current;
+    clearEndDragTimer(tracker);
+    tracker.awaitingMomentum = false;
+    tracker.userMomentum = false;
+    tracker.overscrollReturnFloorY = null;
+    flushPendingFollow();
   };
 
   const handleBodyScroll = (event: {
@@ -595,20 +916,66 @@ export function InlineThinking({
     const tracker = scrollTrackerRef.current;
     const distanceFromBottom = contentH - (y + viewportH);
     const atBottom = distanceFromBottom <= STICK_TO_BOTTOM_THRESHOLD;
-    const scrolledUp = tracker.lastScrollY !== null && y < tracker.lastScrollY - 1;
+    const maxReachableY = Math.max(0, contentH - viewportH);
+    const overscrolledBottomNow = y > maxReachableY + 1;
+    if (overscrolledBottomNow) {
+      tracker.overscrollReturnFloorY =
+        tracker.overscrollReturnFloorY === null
+          ? maxReachableY
+          : Math.min(tracker.overscrollReturnFloorY, maxReachableY);
+    }
+    const activeOverscrollFloor = tracker.overscrollReturnFloorY;
+    const movedDown = tracker.lastScrollY !== null && y > tracker.lastScrollY;
+    const inOverscrollBounce =
+      activeOverscrollFloor !== null && !movedDown && y >= activeOverscrollFloor - 1;
+    const effectiveY =
+      overscrolledBottomNow || inOverscrollBounce
+        ? Math.min(y, maxReachableY, activeOverscrollFloor ?? maxReachableY)
+        : Math.min(y, maxReachableY);
+    const scrolledUp = inOverscrollBounce
+      ? false
+      : tracker.lastScrollY !== null &&
+        (y < tracker.lastScrollY - 1 ||
+          (!movedDown && tracker.stickyAnchorY !== null && y < tracker.stickyAnchorY - 1));
 
     if (scrolledUp && distanceFromBottom > 1) {
-      // Any explicit upward movement off the bottom edge — including the first
-      // pixels of a drag/fling or wheel-up — disengages auto-follow immediately,
-      // while iOS overscroll bounce back to `distanceFromBottom <= 1` stays sticky.
+      // Any explicit upward movement off the bottom edge — including repeated
+      // small (-1px) wheel ticks — disengages auto-follow immediately, while
+      // iOS overscroll bounce back to `distanceFromBottom <= 1` stays sticky.
       tracker.stickToBottom = false;
-    } else if (atBottom) {
+      tracker.pendingFollow = false;
+      tracker.stickyAnchorY = null;
+      tracker.overscrollReturnFloorY = null;
+    } else if (atBottom && (tracker.stickToBottom || movedDown || distanceFromBottom <= 1)) {
+      if (!tracker.stickToBottom) {
+        tracker.stickyAnchorY = effectiveY;
+      } else {
+        tracker.stickyAnchorY =
+          tracker.stickyAnchorY === null
+            ? effectiveY
+            : Math.max(tracker.stickyAnchorY, effectiveY);
+      }
       tracker.stickToBottom = true;
-    } else if (tracker.userDragging || tracker.userMomentum) {
-      tracker.stickToBottom = false;
+    } else if (tracker.stickToBottom) {
+      tracker.stickyAnchorY =
+        tracker.stickyAnchorY === null
+          ? effectiveY
+          : Math.max(tracker.stickyAnchorY, effectiveY);
+      if (tracker.userDragging || tracker.userMomentum || tracker.awaitingMomentum) {
+        tracker.pendingFollow = true;
+      }
+    }
+
+    if (
+      !overscrolledBottomNow &&
+      tracker.overscrollReturnFloorY !== null &&
+      (y <= tracker.overscrollReturnFloorY + 1 || movedDown || scrolledUp)
+    ) {
+      tracker.overscrollReturnFloorY = null;
     }
 
     tracker.lastScrollY = y;
+    tracker.lastMaxReachableY = maxReachableY;
   };
   // Subscribe via `useLocaleText()` so host-relayed or settings-driven locale
   // changes re-render the label and screen-reader strings live.
@@ -617,19 +984,21 @@ export function InlineThinking({
 
   // While streaming the collapsed line is a **tail window**: it advances with
   // every arrived character instead of waiting for a paragraph to finish, which
-  // is what made it lag the expanded view. Before the box has been measured (the
-  // very first frame) and once the thought settles, dsh's own rule applies —
-  // the latest completed paragraph's first line, then the first line outright.
+  // is what made it lag the expanded view. Once `phase` flips to `"complete"`
+  // the collapsed summary snaps immediately to DSH's completed first-line rule
+  // (avoiding a 300ms tail hold or an empty first frame on short unmeasured
+  // thoughts), while the status icon, shimmer, and duration still keep the
+  // 300ms `growing` debounce.
   const line =
-    growing && lineWidth > 0
+    growing && phase === "streaming" && lineWidth > 0
       ? streamingTail(text, lineWidth, ROW_FONT_SIZE)
-      : reasoningPreview(text, growing);
-  const tailSliding = growing && lineWidth > 0 && line.startsWith("…");
+      : reasoningPreview(text, growing && phase === "streaming");
+  const tailSliding = growing && phase === "streaming" && lineWidth > 0 && line.endsWith("…");
   const stream = useInkStreamReveal({
     agentId,
     timestamp,
     rowKey,
-    liveHint: phase === "streaming" || growing,
+    liveHint: phase === "streaming",
     label: copy.thinking,
     summary: !open && !tailSliding ? line : "",
     streamSummary: !open && !tailSliding,

@@ -68,6 +68,7 @@ function readKinds(source) {
       // These register composer/side-bar surfaces, not timeline kinds.
       return new Proxy({}, { get: () => () => noop });
     }
+    if (id === './client/row-entrance') return { retainRowEntranceObservers: () => noop, disposeRowEntranceObservers: noop };
     if (/^\.\/client\/(inline-thinking|rewind-notice|tool-call)$/.test(id)) return {};
     return fromBuild(id);
   };

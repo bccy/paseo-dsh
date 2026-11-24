@@ -137,12 +137,22 @@ console.log("rasterized PNG badge assets");
   }
 }
 
-/** Tiny synchronous React renderer with per-instance hooks for component execution tests. */
-function createHooksHarness() {
+/**
+ * Tiny synchronous React renderer with per-instance hooks, subtree unmount
+ * cleanup, and host ref attachment (function refs and object refs) for
+ * component execution tests.
+ */
+function createHooksHarness(options = {}) {
+  const createHostNode =
+    typeof options.createHostNode === "function" ? options.createHostNode : () => null;
   const instances = new Map();
+  const attachedRefs = new Map();
   let activeKey = "root";
   let activeSlot = 0;
   let pendingEffects = [];
+  let pendingRefs = [];
+  let seenInstances = new Set();
+  let seenHostRefs = new Set();
   let changed = false;
 
   const sameDeps = (a, b) =>
@@ -155,6 +165,26 @@ function createHooksHarness() {
       instances.set(key, s);
     }
     return s;
+  }
+
+  function applyRef(ref, value) {
+    if (typeof ref === "function") {
+      ref(value);
+    } else if (ref && typeof ref === "object" && "current" in ref) {
+      ref.current = value;
+    }
+  }
+
+  function cleanupInstance(key) {
+    const slots = instances.get(key);
+    if (!slots) return;
+    for (const slot of slots) {
+      if (slot && typeof slot === "object" && typeof slot.cleanup === "function") {
+        slot.cleanup();
+        slot.cleanup = undefined;
+      }
+    }
+    instances.delete(key);
   }
 
   const hooks = {
@@ -199,6 +229,7 @@ function createHooksHarness() {
     if (Array.isArray(node)) return node.map((child, idx) => expand(child, `${path}[${idx}]`));
     if (typeof node.type === "function") {
       const instKey = `${path}:${node.type.name || "fn"}:${node.key ?? ""}`;
+      seenInstances.add(instKey);
       const prevKey = activeKey;
       const prevSlot = activeSlot;
       activeKey = instKey;
@@ -208,12 +239,17 @@ function createHooksHarness() {
       activeSlot = prevSlot;
       return expand(rendered, instKey);
     }
+    const hostPath = `${path}/${String(node.type)}:${node.key ?? ""}`;
+    if (node.props && node.props.ref !== undefined && node.props.ref !== null) {
+      seenHostRefs.add(hostPath);
+      pendingRefs.push({ hostPath, type: node.type, props: node.props, ref: node.props.ref });
+    }
     if (node.props && node.props.children !== undefined) {
       return {
         ...node,
         props: {
           ...node.props,
-          children: expand(node.props.children, `${path}/${String(node.type)}`),
+          children: expand(node.props.children, hostPath),
         },
       };
     }
@@ -226,10 +262,41 @@ function createHooksHarness() {
     do {
       changed = false;
       pendingEffects = [];
+      pendingRefs = [];
+      seenInstances = new Set();
+      seenHostRefs = new Set();
       tree = expand({ type: Component, props }, "root");
+
+      // Unmount component instances that disappeared from the tree.
+      for (const key of Array.from(instances.keys())) {
+        if (!seenInstances.has(key)) cleanupInstance(key);
+      }
+
+      // Detach host refs that disappeared from the tree.
+      for (const [hostPath, entry] of Array.from(attachedRefs.entries())) {
+        if (!seenHostRefs.has(hostPath)) {
+          applyRef(entry.ref, null);
+          attachedRefs.delete(hostPath);
+        }
+      }
+
+      // Attach active host refs BEFORE layout/passive effects run (matching React).
+      const refsNow = pendingRefs;
+      pendingRefs = [];
+      for (const { hostPath, type, props: hostProps, ref } of refsNow) {
+        const existing = attachedRefs.get(hostPath);
+        const domNode = existing ? existing.node : createHostNode(type, hostProps);
+        if (existing && existing.ref !== ref) {
+          applyRef(existing.ref, null);
+        }
+        attachedRefs.set(hostPath, { ref, node: domNode });
+        applyRef(ref, domNode);
+      }
+
       const effectsNow = pendingEffects;
       pendingEffects = [];
       for (const { key, index, effect } of effectsNow) {
+        if (!instances.has(key)) continue;
         const slot = storeOf(key)[index];
         if (typeof slot.cleanup === "function") slot.cleanup();
         const cleanup = effect();
@@ -241,15 +308,13 @@ function createHooksHarness() {
   }
 
   function unmountAll() {
-    for (const slots of instances.values()) {
-      for (const slot of slots) {
-        if (slot && typeof slot === "object" && typeof slot.cleanup === "function") {
-          slot.cleanup();
-          slot.cleanup = undefined;
-        }
-      }
+    for (const key of Array.from(instances.keys())) {
+      cleanupInstance(key);
     }
-    instances.clear();
+    for (const entry of attachedRefs.values()) {
+      applyRef(entry.ref, null);
+    }
+    attachedRefs.clear();
   }
 
   return { hooks, render, unmountAll };
@@ -303,7 +368,24 @@ const COLORS = {
 
 console.log("component execution — Web platform");
 {
-  const harness = createHooksHarness();
+  const webAnimations = [];
+  const createWebHostNode = (type) => ({
+    tagName: String(type),
+    animate(keyframes, timing) {
+      const handle = {
+        keyframes,
+        timing,
+        startTime: null,
+        cancelCalls: 0,
+        cancel() {
+          this.cancelCalls += 1;
+        },
+      };
+      webAnimations.push(handle);
+      return handle;
+    },
+  });
+  const harness = createHooksHarness({ createHostNode: createWebHostNode });
   const injected = new Map();
   const prevDoc = global.document;
   global.document = {
@@ -326,7 +408,42 @@ console.log("component execution — Web platform");
       ROW_BADGE_POP_TEST_ID,
     } = mod;
 
-    // 1. Historic completed row: bare green check, NO pop animation.
+    // 0. Sanity: harness attaches both function refs and object refs with spyable animate().
+    {
+      const objRef = { current: null };
+      let fnRefNode = null;
+      function RefProbe() {
+        return {
+          type: "View",
+          props: {
+            children: [
+              { type: "View", props: { ref: objRef } },
+              {
+                type: "View",
+                props: {
+                  ref: (node) => {
+                    fnRefNode = node;
+                  },
+                },
+              },
+            ],
+          },
+        };
+      }
+      harness.render(RefProbe, {});
+      const attachedOk =
+        objRef.current !== null &&
+        typeof objRef.current.animate === "function" &&
+        fnRefNode !== null &&
+        typeof fnRefNode.animate === "function";
+      harness.unmountAll();
+      check(
+        "test renderer binds spyable DOM nodes to both object refs and function refs and detaches on unmount",
+        attachedOk && objRef.current === null && fnRefNode === null,
+      );
+    }
+
+    // 1. Historic completed row: bare green check, NO pop animation, NO Web ring animate().
     const historic = harness.render(RowStatusIcon, {
       status: "completed",
       size: 16,
@@ -339,9 +456,10 @@ console.log("component execution — Web platform");
     check("historic completed renders bare green checkmark badge", compBadges.length === 1 && checkImgs.length === 1);
     check("bare green checkmark is tinted with colors.statusSuccess", checkImgs[0]?.props?.tintColor === COLORS.statusSuccess);
     check("historic completed does NOT trigger pop animation", popNodes.length === 0);
+    check("historic completed does NOT call Web element.animate()", webAnimations.length === 0);
     harness.unmountAll();
 
-    // 2. Running thinking row (spinBase=true) -> settles to completed -> pops once.
+    // 2. Running thinking row (spinBase=true) -> settles to completed -> pops once & cancels ring animation.
     const runningThink = harness.render(RowStatusIcon, {
       status: "running",
       size: 16,
@@ -353,6 +471,16 @@ console.log("component execution — Web platform");
       "running thinking row applies spin testID and running corner ring badge",
       findAll(runningThink, (n) => n.props?.testID === ROW_ICON_SPIN_TEST_ID).length === 1 &&
         findAll(runningThink, (n) => n.props?.testID === ROW_BADGE_RUNNING_TEST_ID).length === 1,
+    );
+    const thinkRingAnim = webAnimations[webAnimations.length - 1];
+    check(
+      "Web running status invokes StatusRingMark element.animate() with shared startTime=0",
+      webAnimations.length === 1 &&
+        thinkRingAnim?.startTime === 0 &&
+        thinkRingAnim?.timing?.duration === 900 &&
+        thinkRingAnim?.timing?.iterations === Number.POSITIVE_INFINITY &&
+        thinkRingAnim?.cancelCalls === 0,
+      JSON.stringify(thinkRingAnim),
     );
     const sheet = injected.get("dsh-paseo-row-status-icon");
     check(
@@ -376,9 +504,14 @@ console.log("component execution — Web platform");
         findAll(settledThink, (n) => n.props?.testID === ROW_BADGE_POP_TEST_ID).length === 1 &&
         findAll(settledThink, (n) => n.props?.testID === ROW_ICON_SPIN_TEST_ID).length === 0,
     );
+    check(
+      "exiting running -> completed cancels Web ring animation immediately (before unmount)",
+      thinkRingAnim?.cancelCalls === 1 && webAnimations.length === 1,
+      `cancelCalls=${thinkRingAnim?.cancelCalls}, total=${webAnimations.length}`,
+    );
     harness.unmountAll();
 
-    // 3. Running tool row (spinBase=false) -> fails -> failed badge pops.
+    // 3. Running tool row (spinBase=false) -> fails -> failed badge pops & cancels ring animation.
     const runningTool = harness.render(RowStatusIcon, {
       status: "running",
       size: 14,
@@ -386,11 +519,14 @@ console.log("component execution — Web platform");
       spinBase: false,
       children: { type: "BaseGlyph", props: {} },
     });
+    const toolRingAnim = webAnimations[webAnimations.length - 1];
     check(
       "running tool row applies pulse testID (not spin) and running badge",
       findAll(runningTool, (n) => n.props?.testID === ROW_ICON_PULSE_TEST_ID).length === 1 &&
         findAll(runningTool, (n) => n.props?.testID === ROW_ICON_SPIN_TEST_ID).length === 0 &&
-        findAll(runningTool, (n) => n.props?.testID === ROW_BADGE_RUNNING_TEST_ID).length === 1,
+        findAll(runningTool, (n) => n.props?.testID === ROW_BADGE_RUNNING_TEST_ID).length === 1 &&
+        webAnimations.length === 2 &&
+        toolRingAnim?.cancelCalls === 0,
     );
     const failedTool = harness.render(RowStatusIcon, {
       status: "failed",
@@ -407,9 +543,35 @@ console.log("component execution — Web platform");
         errorImgs.length === 1 &&
         errorImgs[0]?.props?.tintColor === COLORS.surface0,
     );
+    check(
+      "exiting running -> failed cancels Web ring animation immediately",
+      toolRingAnim?.cancelCalls === 1,
+      `cancelCalls=${toolRingAnim?.cancelCalls}`,
+    );
     harness.unmountAll();
 
-    // 4. Idle row renders base glyph with zero badges.
+    // 4. Unmounting while still running cancels the active Web ring animation.
+    harness.render(RowStatusIcon, {
+      status: "running",
+      size: 16,
+      colors: COLORS,
+      spinBase: false,
+      children: { type: "BaseGlyph", props: {} },
+    });
+    const unmountRingAnim = webAnimations[webAnimations.length - 1];
+    check(
+      "running mount starts a third Web ring animation",
+      webAnimations.length === 3 && unmountRingAnim?.cancelCalls === 0,
+      `total=${webAnimations.length}, cancelCalls=${unmountRingAnim?.cancelCalls}`,
+    );
+    harness.unmountAll();
+    check(
+      "unmounting while running cancels Web ring animation cleanly",
+      unmountRingAnim?.cancelCalls === 1,
+      `cancelCalls=${unmountRingAnim?.cancelCalls}`,
+    );
+
+    // 5. Idle row renders base glyph with zero badges and zero Web animations.
     const idleRow = harness.render(RowStatusIcon, {
       status: "idle",
       size: 16,
@@ -421,7 +583,8 @@ console.log("component execution — Web platform");
       findAll(idleRow, (n) => n.type === "BaseGlyph").length === 1 &&
         findAll(idleRow, (n) => n.props?.testID === ROW_BADGE_RUNNING_TEST_ID).length === 0 &&
         findAll(idleRow, (n) => n.props?.testID === ROW_BADGE_COMPLETED_TEST_ID).length === 0 &&
-        findAll(idleRow, (n) => n.props?.testID === ROW_BADGE_FAILED_TEST_ID).length === 0,
+        findAll(idleRow, (n) => n.props?.testID === ROW_BADGE_FAILED_TEST_ID).length === 0 &&
+        webAnimations.length === 3,
     );
     harness.unmountAll();
   } finally {

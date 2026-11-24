@@ -50,12 +50,20 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   不可卸载/更新）。夹具自建三种布局并用显式 `installAnchor`（`null` 关闭安装解析），不读真实
   `$DSH_HOME` 或全局安装、不起 `dsh`。**改 `server/dsh-plugins.ts` 的 `resolveBundlePackage`、
   `#describe`、`setEnabled`、remove/update 或 `readRows` 的包目录来源必跑。**
+- `paseo-plugin/test/timeline-spacing.test.cjs` — 时间线间距、展开区高度上限与显示语言设置回归：
+  `TIMELINE_STYLE_DEFAULTS` / `TIMELINE_STYLE_KEYS` / `EXPANDED_MAX_HEIGHT_DEFAULT`（260）与
+  `timelineStyleSettings` schema（v6）默认值和数值边界一致；v1–v5 `migrate()` 折叠旧 margin 字段、
+  补齐 `expandedMaxHeight` 并保留合法值；`languageSettings`（默认 `auto`，仅接受 `auto`/`en`/`zh-CN`）；
+  `resolveCommandMaxHeight` 正常与边界窗口高度（0、负数、`NaN`、`Infinity`）；`client/locale.ts`
+  语言覆盖优先级、未知值回退 `auto` 与订阅通知；`en` / `zh-CN` 设置页文案键对称且非空。运行：
+  `cd paseo-plugin && node --test test/timeline-spacing.test.cjs`（已登记在 `offline-checks.cjs` 的
+  `pluginTests`，纳入 portable CI）。**动了 `shared/settings.ts`（间距/展开高度/命令高度/语言设置或迁移）
+  或 `client/locale.ts` 的语言覆盖/设置文案必跑。**
 - `paseo-plugin/test/*.test.cjs`（**已登记在本 runner 的 `pluginTests` 清单里**，cwd 为
   `paseo-plugin`；也可 `cd paseo-plugin && npm test` 跑全部、`npm run test:process` 只跑 Windows
-  启动器那一条）。四个文件各自的判据见下文「空闲回收否决链」「提问卡回答」「Windows 启动器」
-  与 DSH Plugins 段落；共同点是每个文件自建一次性 `DSH_HOME`/`mkdtemp` 夹具或经
-  `harness/plugin-build.cjs` 编译，不 spawn 真实模型、不读真实 profile。**改了对应运行时代码
-  只跑对应文件时，也必须保证本 runner 全绿。**
+  启动器那一条）。各文件的判据见上文与下文对应段落；共同点是每个文件自建一次性 `DSH_HOME`/`mkdtemp`
+  夹具或经 `harness/plugin-build.cjs` / `register-typescript.cjs` 加载，不 spawn 真实模型、不读真实
+  profile。**改了对应运行时代码只跑对应文件时，也必须保证本 runner 全绿。**
 - `harness/stable-host-child-check.mjs`：真实 `PluginAgentClientRegistry` + 协议假 provider，
   断言 canceled / failed / completed 后关闭仍保持终态。`PASEO_CLI_ROOT` 指向待验收宿主 CLI
   根目录，必须记录其实际版本；不进 portable CI。升级宿主、改 child close/终态必跑。
@@ -103,8 +111,23 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   收尾。本轮 +1 个用例：goal 轮次行渲染成 `Target`（`view.icon === "Target"`）。**动了
   `server/activity-timeline.ts`、`server/timeline.ts` 的 activity 分支或
   `client/tool-call-data.ts` 的 workflow/goal 映射必跑。**
-- `harness/newest-check.cjs` — `client/newest.ts` 的"哪一行是最新、该不该脉冲"：位置判定、
-  提交批次（回放历史不闪）、窗口、交接、时钟。**动了客户端脉冲条件必跑。**
+- `harness/newest-check.cjs` — `client/newest.ts`、`client/stream-reveal.ts` 与 `client/row-entrance.tsx`
+  的实时脉冲、入场门控、墨迹逐字揭示与 Web 滚动溢出观察器：
+  - `client/newest.ts`：位置判定、提交批次（回放历史不闪）、窗口、交接、时钟、`normalizeRowTimestamp`、
+    `shouldEnterLive` 纯函数契约、有界 `animatedKeys`（500 上限淘汰）与 `resetNewestForTests`；以及
+    单次渲染批次挂载 `>= 2` 条新行（含**已有状态 agent** 与**同毫秒多行**，不因时间戳去重折叠为 1）
+    识别为 batch 并激活 `replayUntil`。
+  - `client/stream-reveal.ts`：CJK/ASCII 揭示节奏、`streamCursorAt`、Unicode 代理对不拆分、
+    `splitRowStreamProgress`（含长摘要上限交接与 `streamSummary=false`）。
+  - `client/row-entrance.tsx` 真实编译组件/hook 执行：已有状态 agent 一次批量挂载 5 条完成态行（含同毫秒）
+    → 0 条触发 `RowEntrance` / `useInkStreamReveal`、首帧标题全显且全部写入 `animatedKeys`；单条真实新行
+    对照正常触发；缺 `useLayoutEffect` 的最小 React 桩安全回退 `useEffect`；`useInkStreamReveal` 在
+    `liveHint` 由 `true → false` 时立即取消 RAF/timer 并将 `cursor` 置 `Infinity`；Web 滚动框仅在
+    `scrollHeight > clientHeight + 1` 时切换 `data-dsh-overflow-y="true"`（对应 `overscroll-behavior-y: contain`）、
+    卸载时 `unobserve` 防泄漏、且兼容缺失 `MutationObserver`/`ResizeObserver`/`querySelectorAll`/`document.body`
+    的最小 DOM 桩。
+  **动了 `client/newest.ts`、`client/row-entrance.tsx` 或 `client/stream-reveal.ts` 必跑**（已登记在
+  `offline-checks.cjs` 的 `compiledChecks`，纳入 portable CI）。
 - `harness/rewind-notice-check.cjs` — 撤回完成提示的客户端半：`shared/rewind-notice.ts` 的两种
   locale 文案与计数回退（读不出计数时不得编数字）、`client/rewind-notice-data.ts` 对**旧**
   session.notice 撤回行的识别（transformer 要删掉它们，canary 不得误伤）、
@@ -152,14 +175,18 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   `node harness/rewind-notice-delivery-check.mjs`（自己编译到
   `paseo-plugin/.dbg-p17-delivery`；不需要 daemon、不需要模型）。
 - `harness/tool-call-check.cjs` — `client/tool-call-data.ts` 的工具行映射（图标、命令、diff、
-  失败原因、终端卡）与正文截断口径：**generic 卡（read/fetch 无 meta、plan、
-  `/command` 输出、agent message）与结构化 diff 卡的 body 不再截断**，改由视图滚动 + 复制全量
-  body（260px，`CODE_MAX_HEIGHT` 的唯一消费者）；仍会截断的只有 legacy 纯文本 diff 回落
-  （6000 + 本地化标记）与 `headline`/`summary`。本轮 385 → **397** 条（团队字段卡再 +46 → 443，见文末「团队（team）链」）：
+  失败原因、终端卡）、渲染器结构守卫与正文截断口径：**generic 卡（read/fetch 无 meta、plan、
+  `/command` 输出、agent message）与结构化 diff 卡的 body 不再截断**，改由受限 `<ScrollView>` 滚动
+  + 复制全量 body（展开区高度上限由 `style.expandedMaxHeight ?? EXPANDED_MAX_HEIGHT_DEFAULT` 驱动，
+  默认 260px，经 `expandedScrollStyle(expandedMaxHeight)` 绑定）；仍会截断的只有 legacy 纯文本 diff
+  回落（6000 + 本地化标记）与 `headline`/`summary`。渲染器结构守卫亦覆盖 `InlineToolCall` 外壳包裹
+  `<RowEntrance>`、各展开滚动区（Read/Diff/Search/Fields/Error/Generic）挂 `SCROLL_BOX_TEST_ID`、
+  `HighlightedCode` / `HighlightedLine` 语义着色接线（shell/read/diff/JSON/generic）及 `TeamBlockView`
+  接收 `maxHeight={expandedMaxHeight}` 与 `onCollapse`。本轮 385 → **397** 条（团队字段卡再 +46 → 443，见文末「团队（team）链」）：
   goal 状态行（`get_goal`）与轮次行（`goal_round`）都解析出 `Target`，其余**带 icon 键**的 `plain_text`
   行图标不变，无映射的 iconless `plain_text` 仍是 `Wrench`。**动了工具行渲染必跑（含失败原因：
-  错误只认顶层 `item.error.message`；终端正文全量 + 224px 纵向滚动 + 复制；goal 两行的图标/
-  名字映射）。**
+  错误只认顶层 `item.error.message`；终端正文全量 + 动态高度/224px 纵向滚动 + 复制；展开高度/高亮/
+  `<RowEntrance>`/`SCROLL_BOX_TEST_ID` 接线；goal 两行的图标/名字映射）。**
   - unknown 行的**通用字段卡（L1）**再 +38 → **481**（L2 起 `fields` 多一个 `receipt`，
     见下条）：`fields = {args, result, copyText}` 把
     `input`（及 output 为对象/可 parse 成对象的 JSON 字符串时的 output）拆成有序条目——
@@ -235,11 +262,15 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   运行中取最后一个首行已终结的段落（都是 DSH 的行为，逐字移植在 `client/thinking-text.ts`），
   折叠行在流式中的宽度接线（行测自己的宽度、标签与右侧时长盒各自测宽、行宽由行宽扣减图标/标签/时长
   得出，`useRevealedText` 不许再接管文本节奏）；`formatThinkingDuration` 边界（`<100ms`/非有限值为空、
-  `59950ms` 进位为 `1m 0s`、整秒边界单调）；以及 `InlineThinking` 真实组件计时生命周期（历史已完成行
-  不启计时器不显徽章、流式 0.1s 递增且展开后仍可见、settle 防抖窗口不计入时长、已定格行遇晚到抖动不重启、
-  虚拟列表重挂保留与原位切键不泄漏、宿主合并刷新 `timestamp` 无缝续计并迁移键、时钟回拨单调、`MAX_DURATION_RECORDS=500`
+  `59950ms` 进位为 `1m 0s`、整秒边界单调）；以及 `InlineThinking` 真实组件计时与揭示生命周期（历史已完成行
+  不启计时器不显徽章、流式 0.1s 递增且展开后仍可见、300ms settle 防抖窗口 `+299ms/+1ms` 精确夹逼且不计入时长、
+  settle 后恢复流式重锚续计（不计暂停空档）、同毫秒前缀撞键隔离（已落定记录遇已完成挂载须文本全等、恢复流式仍允许单向续计）、
+  虚拟列表重挂保留与原位切键不泄漏且 cleanup 不污染旧键文本、宿主合并刷新 `timestamp` 无缝续计并迁移键、
+  终态 `phase="complete"` 立即向 `useInkStreamReveal` 传 `liveHint=false` 全显而图标/扫光/时长仍守 300ms 防抖、
+  已提交行刷新 `timestamp` 向 `noteRender` 传 `firstPaint=false`、时钟回拨单调、`MAX_DURATION_RECORDS=500`
   上限淘汰），以及展开区 `<ScrollView>` 默认滚底与智能跟随更新（点开即停在最底部、流式增长自动追底且容忍增长滞后
-  `onScroll`、用户上翻/拖离底部暂停跟随且不因时间戳推进回弹、滚回底部或收起重开后恢复跟底）。**它不断言行标题**：标题恒为 `思考` 是 `client/locale.ts` 标签表里的一个键，
+  `onScroll`、iOS `endDrag → momentumBegin → momentumEnd` 与无参 `endDrag` 延迟补发不抢滚、拖动中内容增高不掉粘、
+  iOS 底部回弹遇并发内容增长保持粘底、用户上翻/拖离底部暂停跟随且不因时间戳推进回弹、滚回底部或收起重开后恢复跟底）。**它不断言行标题**：标题恒为 `思考` 是 `client/locale.ts` 标签表里的一个键，
   由 `harness/locale-check.cjs` 的整表遍历覆盖——改坏了标题，这个脚本不会红。
   **动了思考行显示或思考时长必跑。** 运行步骤现在需要同时编译 `client/inline-thinking.tsx`
   （`--jsx react-jsx --noCheck`），见文件头。
@@ -267,9 +298,30 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
 - `harness/sweep-check.cjs` — 原生扫光的几何：mask 曲线的停点、阶梯 alpha 的对称性与平铺、
   1.5s/0.3s/2-3 行程、`steps(48)`。**动了 `client/sweep-*.ts` 必跑。** iOS 上跑不了，这些
   数字就是"与 DSH 一致"的唯一凭据。
-- `harness/style-check.cjs` — `client/tokens.ts` 的共享样式常量表（Phase 1 把工具行每个数值
-  收进这里；13 还是 14、2×2 方块还是圆点、8% 还是 20% 底纹，漂移了在截图里都照样渲染，
-  所以断言表本身，React 组件刻意不断言）。**动了 `client/tokens.ts` 或行样式必跑。**
+- `harness/style-check.cjs` — `client/tokens.ts` 的共享样式常量表与无框紧凑展开块守卫：断言间距、字号、
+  折行上限、底纹与颜色语义 token，新增无框展开块 token（`FRAMELESS_PADDING_LEFT`/`FRAMELESS_BORDER_WIDTH`/
+  `FRAMELESS_GAP`、`framelessBlockStyle`、`framelessHeadStyle`、`expandedScrollStyle`），以及
+  `client/tool-call.tsx` 与 `client/team-card.tsx` 的源码守卫（使用 `framelessBlockStyle`/
+  `framelessHeadStyle`、不再引用 `cardStyle`/`cardHeadStyle`、diff wash 读 `colors.surface0`、零硬编码
+  hex/rgb/hsl 色值）。**动了 `client/tokens.ts`、无框展开布局或行样式必跑**（已登记在 `offline-checks.cjs`
+  的 `compiledChecks`，纳入 portable CI）。
+- `harness/code-highlight-check.cjs` — 语义着色代码高亮器（`client/code-highlight.ts` +
+  `client/highlighted-code.tsx`）：断言 Palette 1 在 TS/JS/Python/Rust/SQL/JSON/Shell/CJK 及边界用例下
+  无损分词（拼回逐字等于原文）、相邻同类 token 合并、`json`/`shell`/`code`/`plain` 模式与跨行块注释分类、
+  超长行（>400 字符）与超长片段（>24000 字符）安全降级、`TokenColors` 语义映射零硬编码色值且无 React/RN
+  依赖，以及 `highlighted-code.tsx` 静态接线守卫。运行：`node harness/code-highlight-check.cjs`
+  （自动构建到临时目录并清理）或在编译目录内运行（已登记在 `offline-checks.cjs` 的 `compiledChecks`，
+  纳入 portable CI）。**动了 `client/code-highlight.ts` 或 `client/highlighted-code.tsx` 必跑。**
+- `harness/row-status-icon-check.cjs` — 时间线行首状态图标（Plan A：`client/row-status-icon-data.ts`、
+  `client/row-status-icon.tsx`、`client/status-ring.tsx`）：断言纯状态映射（`resolveRowIconStatus`、
+  `resolveThinkingIconStatus`）、角标弹出条件（`shouldPopRowBadge`，仅 `running → completed/failed`）与
+  14/16px 几何尺度；校验 48×48 8-bit RGBA PNG 角标资产（`CHECK_BADGE_ICON`、`ERROR_BADGE_ICON`）；
+  真实执行编译后的组件（Web 端绑定带 `animate()`/`cancel()` 间谍的模拟 DOM ref，断言 `running` 调用
+  `element.animate()`、退出 `running` 及 `running` 中卸载均调用 `cancel()`，以及 keyframes 样式表与
+  `prefers-reduced-motion`；Native 端 `Animated` 启停清理；最小 RN 桩不抛错）；并核对 `client/tool-call.tsx`
+  与 `client/inline-thinking.tsx` 的 `<RowStatusIcon>` 源码接线。运行：在编译目录内执行
+  `node row-status-icon-check.cjs`（已登记在 `offline-checks.cjs` 的 `compiledChecks`，纳入 portable CI）。
+  **动了 `client/row-status-icon*.ts(x)`、`client/status-ring.tsx` 或工具/思考行状态图标接线必跑。**
 - `harness/locale-check.cjs` — 客户端显示 locale 的纯函数解析链（`DSH_PASEO_LANG` 与
   `LANG`/`LC_ALL` 的优先级）和标签表覆盖：每个工具名在**两种语言**下都要有值，英文列是
   中文列的复制也要抓出来。goal 表另有几条：`GoalText.statuses` 必须恰好覆盖

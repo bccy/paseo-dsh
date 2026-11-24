@@ -46,15 +46,18 @@ const {
  * from `harness/`, or copied into a build dir under `paseo-plugin/`).
  */
 function requireHarnessModule(name) {
-  let dir = __dirname;
-  for (let i = 0; i < 6; i += 1) {
-    const candidate = join(dir, "harness", name);
-    if (existsSync(candidate)) return require(candidate);
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
+  const roots = [__dirname, process.cwd()];
+  for (const start of roots) {
+    let dir = start;
+    for (let i = 0; i < 6; i += 1) {
+      const candidate = join(dir, "harness", name);
+      if (existsSync(candidate)) return require(candidate);
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
   }
-  throw new Error(`could not find harness/${name} above ${__dirname}`);
+  throw new Error(`could not find harness/${name} above ${__dirname} or ${process.cwd()}`);
 }
 
 const { attributeOf, callArguments, elementWithAttributes, elementsWithAttributes, mentions, splitArguments } =
@@ -63,18 +66,22 @@ const { attributeOf, callArguments, elementWithAttributes, elementsWithAttribute
 /**
  * Locate a repo source file from wherever this check runs. The documented
  * compile step copies the check into `paseo-plugin/.dbg` (one level below
- * `paseo-plugin`), but a scratch build dir such as `.tmp-test/<name>` sits one
- * level deeper; walking up finds the source either way instead of failing on
- * `__dirname/..`.
+ * `paseo-plugin`), while an isolated temp build dir (e.g. `/tmp/...`) relies on
+ * `process.cwd()` being inside the repo; walking up from both finds the source
+ * either way instead of failing on `__dirname/..`.
  */
-function findRepoFile(relative, levels = 4) {
-  let dir = __dirname;
-  for (let i = 0; i < levels; i += 1) {
-    const candidate = join(dir, relative);
-    if (existsSync(candidate)) return candidate;
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
+function findRepoFile(relative, levels = 5) {
+  const roots = [__dirname, process.cwd()];
+  for (const start of roots) {
+    let dir = start;
+    for (let i = 0; i < levels; i += 1) {
+      for (const candidate of [join(dir, relative), join(dir, "paseo-plugin", relative)]) {
+        if (existsSync(candidate)) return candidate;
+      }
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
   }
   return undefined;
 }
@@ -392,33 +399,84 @@ console.log("the row settles when the last frame both grows and completes");
   }
   const Module = require("node:module");
 
-  // Fake clock: settle timeouts and duration intervals are tracked separately
-  // so settle-window assertions remain exact and intervals never leak.
-  let timers = new Map();
-  let nextTimerId = 0;
+  // Fake clock: records real delay and dueAt for setTimeout and setInterval,
+  // advancing monotonic time step-by-step and firing only due callbacks.
+  // `wallOffset` lets wall-clock rollback tests shift `Date.now()` independently
+  // of monotonic timer scheduling.
+  const realDateNow = Date.now;
   const realSetTimeout = global.setTimeout;
   const realClearTimeout = global.clearTimeout;
-  global.setTimeout = (callback) => {
+  const realSetInterval = global.setInterval;
+  const realClearInterval = global.clearInterval;
+
+  let monoNow = 1_700_000_000_000;
+  let wallOffset = 0;
+  let timers = new Map();
+  let nextTimerId = 0;
+  let intervals = new Map();
+  let nextIntervalId = 0;
+
+  Date.now = () => monoNow + wallOffset;
+  global.setTimeout = (callback, delay = 0) => {
+    const ms = Math.max(0, Number(delay) || 0);
     nextTimerId += 1;
-    timers.set(nextTimerId, callback);
+    timers.set(nextTimerId, { callback, delay: ms, dueAt: monoNow + ms });
     return nextTimerId;
   };
   global.clearTimeout = (id) => {
     timers.delete(id);
   };
-
-  let intervals = new Map();
-  let nextIntervalId = 0;
-  const realSetInterval = global.setInterval;
-  const realClearInterval = global.clearInterval;
-  global.setInterval = (callback) => {
+  global.setInterval = (callback, delay = 0) => {
+    const ms = Math.max(1, Number(delay) || 1);
     nextIntervalId += 1;
-    intervals.set(nextIntervalId, callback);
+    intervals.set(nextIntervalId, { callback, delay: ms, dueAt: monoNow + ms });
     return nextIntervalId;
   };
   global.clearInterval = (id) => {
     intervals.delete(id);
   };
+
+  function advanceClock(ms) {
+    if (ms < 0) throw new Error(`advanceClock expects non-negative ms, got ${ms}`);
+    const target = monoNow + ms;
+    while (true) {
+      let nextKind = null;
+      let nextId = null;
+      let nextDue = Number.POSITIVE_INFINITY;
+      for (const [id, entry] of timers.entries()) {
+        if (entry.dueAt <= target && entry.dueAt < nextDue) {
+          nextKind = "timeout";
+          nextId = id;
+          nextDue = entry.dueAt;
+        }
+      }
+      for (const [id, entry] of intervals.entries()) {
+        if (entry.dueAt <= target && entry.dueAt < nextDue) {
+          nextKind = "interval";
+          nextId = id;
+          nextDue = entry.dueAt;
+        }
+      }
+      if (nextKind === null) break;
+      monoNow = nextDue;
+      if (nextKind === "timeout") {
+        const entry = timers.get(nextId);
+        timers.delete(nextId);
+        if (entry !== undefined) entry.callback();
+      } else {
+        const entry = intervals.get(nextId);
+        if (entry !== undefined) {
+          entry.dueAt = monoNow + entry.delay;
+          entry.callback();
+        }
+      }
+    }
+    monoNow = target;
+  }
+
+  function shiftWallClock(deltaMs) {
+    wallOffset += deltaMs;
+  }
 
   // The hook slots live across passes, so `useState` holds its value the way
   // React would; `cursor` restarts every pass because the hook order is fixed.
@@ -506,8 +564,32 @@ console.log("the row settles when the last frame both grows and completes");
     }),
     "./text-shimmer": () => ({ TextShimmer: "TextShimmer" }),
   };
+  const inkStreamCalls = [];
+  const noteRenderCalls = [];
   const originalLoad = Module._load;
   Module._load = function load(request, parent, isMain) {
+    if (parent && parent.filename === componentPath) {
+      if (request === "./row-entrance") {
+        const real = originalLoad.call(this, request, parent, isMain);
+        return {
+          ...real,
+          useInkStreamReveal(options) {
+            inkStreamCalls.push(options);
+            return real.useInkStreamReveal(options);
+          },
+        };
+      }
+      if (request === "./newest") {
+        const real = originalLoad.call(this, request, parent, isMain);
+        return {
+          ...real,
+          noteRender(...args) {
+            noteRenderCalls.push(args);
+            return real.noteRender(...args);
+          },
+        };
+      }
+    }
     const stub = stubs[request];
     if (stub !== undefined) return stub();
     return originalLoad.call(this, request, parent, isMain);
@@ -574,11 +656,9 @@ console.log("the row settles when the last frame both grows and completes");
     return findShimmerActive(renderToStable(text, phase));
   }
 
-  /** Advance past the settle window — no host frame is involved. */
+  /** Advance past the 300ms settle window — no host frame is involved. */
   function settle() {
-    const pending = [...timers.values()];
-    timers.clear();
-    for (const callback of pending) callback();
+    advanceClock(300);
     return findShimmerActive(renderToStable(lastText, lastPhase));
   }
 
@@ -612,7 +692,25 @@ console.log("the row settles when the last frame both grows and completes");
     "the frame that both grows and completes starts the window",
     update("abcd", "complete") === true,
   );
-  check("…and then settles without another host frame", settle() === false);
+  // Explicit 300ms settle-window boundary: +250ms & +299ms must NOT settle yet, +300ms settles.
+  advanceClock(250);
+  check(
+    "at +250ms inside the 300ms settle window, row is still scrolling and timer remains pending",
+    timers.size === 1 && findShimmerActive(renderToStable(lastText, lastPhase)) === true,
+    `timers=${timers.size}`,
+  );
+  advanceClock(49);
+  check(
+    "at +299ms (1ms before 300ms settle window), row is still scrolling and timer remains pending",
+    timers.size === 1 && findShimmerActive(renderToStable(lastText, lastPhase)) === true,
+    `timers=${timers.size}`,
+  );
+  advanceClock(1);
+  check(
+    "…and at +300ms settles without another host frame",
+    timers.size === 0 && findShimmerActive(renderToStable(lastText, lastPhase)) === false,
+    `timers=${timers.size}`,
+  );
   check("a settled thought stays settled", update("abcd", "complete") === false);
 
   // Positive control for the no-growth shape: `complete` with the text
@@ -860,10 +958,6 @@ console.log("the row settles when the last frame both grows and completes");
 
   console.log("right-aligned thinking duration ticks live, freezes on settle, and survives remount");
   {
-    const realDateNow = Date.now;
-    let fakeNow = 1_700_000_000_000;
-    Date.now = () => fakeNow;
-
     function findNode(node, predicate) {
       if (node === null || typeof node !== "object") return null;
       if (predicate(node)) return node;
@@ -915,10 +1009,6 @@ console.log("the row settles when the last frame both grows and completes");
       return tree;
     }
 
-    function tickIntervals() {
-      for (const callback of [...intervals.values()]) callback();
-    }
-
     try {
       resetThinkingDurationsForTests();
 
@@ -940,7 +1030,8 @@ console.log("the row settles when the last frame both grows and completes");
       );
       unmount();
 
-      // 2. Live streaming thought: ticks on the right, stays visible when expanded, freezes on settle.
+      // 2. Live streaming thought: respects 100ms interval cadence & 300ms settle window,
+      // stays visible when expanded, freezes on settle, and resumes monotonically if reopened.
       resetHooks();
       const liveTs = 1_700_000_002_000;
       const t0Tree = renderRow({
@@ -958,8 +1049,31 @@ console.log("the row settles when the last frame both grows and completes");
         findNode(t0Tree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID) === null,
       );
 
-      fakeNow += 1250;
-      tickIntervals();
+      // Explicit 100ms cadence boundary: +50ms must NOT fire the interval, +100ms fires -> 0.1s.
+      advanceClock(50);
+      const t50Tree = renderRow({
+        agentId: "dur-agent",
+        timestamp: liveTs,
+        item: { data: { text: "starting", phase: "streaming" } },
+      });
+      check(
+        "at +50ms before 100ms interval dueAt, duration has not ticked yet",
+        findNode(t50Tree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID) === null,
+        `text=${findNode(t50Tree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      advanceClock(50);
+      const t100Tree = renderRow({
+        agentId: "dur-agent",
+        timestamp: liveTs,
+        item: { data: { text: "starting", phase: "streaming" } },
+      });
+      check(
+        "at +100ms when 100ms interval fires, duration ticks to 0.1s",
+        findNode(t100Tree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "0.1s",
+        `text=${findNode(t100Tree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+
+      advanceClock(1150);
       const t1Tree = renderRow({
         agentId: "dur-agent",
         timestamp: liveTs,
@@ -1017,7 +1131,8 @@ console.log("the row settles when the last frame both grows and completes");
 
       // Width budget: reporting durationBox width narrows streamingTail's budget.
       headPressable.props.onPress(); // collapse again
-      const longStreaming = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+      const longStreaming =
+        "starting to reason through the layout abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
       const measuredTree = renderRow({
         agentId: "dur-agent",
         timestamp: liveTs,
@@ -1061,94 +1176,263 @@ console.log("the row settles when the last frame both grows and completes");
       );
 
       // Final chunk arrives at 2400ms total; advancing wall clock by SETTLE_WINDOW_MS (300ms)
-      // before firing the settle timer must still freeze at 2.4s (not 2.7s).
-      fakeNow += 1150;
+      // must hold until +300ms and still freeze at 2.4s (not 2.7s).
+      advanceClock(1150);
       renderRow({
         agentId: "dur-agent",
         timestamp: liveTs,
         item: { data: { text: `${longStreaming}!`, phase: "complete" } },
       });
-      fakeNow += 300;
-      for (const cb of [...timers.values()]) cb();
-      timers.clear();
+      advanceClock(250);
+      const settlingMidTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: liveTs,
+        item: { data: { text: `${longStreaming}!`, phase: "complete" } },
+      });
+      check(
+        "at +250ms into settle window, row has not settled yet and stays at 2.4s with 0 intervals",
+        timers.size === 1 &&
+          intervals.size === 0 &&
+          findShimmerActive(settlingMidTree) === true &&
+          findNode(settlingMidTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "2.4s",
+        `timers=${timers.size}, intervals=${intervals.size}, active=${findShimmerActive(settlingMidTree)}, text=${findNode(settlingMidTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      advanceClock(49);
+      const settling299Tree = renderRow({
+        agentId: "dur-agent",
+        timestamp: liveTs,
+        item: { data: { text: `${longStreaming}!`, phase: "complete" } },
+      });
+      check(
+        "at +299ms into settle window, row still has not settled and holds 2.4s",
+        timers.size === 1 &&
+          intervals.size === 0 &&
+          findShimmerActive(settling299Tree) === true &&
+          findNode(settling299Tree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "2.4s",
+        `timers=${timers.size}, intervals=${intervals.size}, active=${findShimmerActive(settling299Tree)}, text=${findNode(settling299Tree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      advanceClock(1);
       const settledTree = renderRow({
         agentId: "dur-agent",
         timestamp: liveTs,
         item: { data: { text: `${longStreaming}!`, phase: "complete" } },
       });
       check(
-        "settling clears the duration interval and freezes at 2.4s without adding the 300ms settle window",
-        intervals.size === 0 &&
+        "settling at +300ms clears the duration interval and freezes at 2.4s without adding the 300ms settle window",
+        timers.size === 0 &&
+          intervals.size === 0 &&
+          findShimmerActive(settledTree) === false &&
           findNode(settledTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "2.4s",
-        `intervals=${intervals.size}, text=${findNode(settledTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+        `timers=${timers.size}, intervals=${intervals.size}, active=${findShimmerActive(settledTree)}, text=${findNode(settledTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
       );
 
       // Further wall-clock advance while still mounted does not change the frozen duration.
-      fakeNow += 600_000;
+      advanceClock(600_000);
       const stillFrozenTree = renderRow({
         agentId: "dur-agent",
         timestamp: liveTs,
         item: { data: { text: `${longStreaming}!`, phase: "complete" } },
       });
       check(
-        "frozen duration stays 2.4s after wall clock advances",
-        findNode(stillFrozenTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "2.4s",
+        "frozen duration stays 2.4s after 10m idle wall-clock advance",
+        intervals.size === 0 &&
+          findNode(stillFrozenTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "2.4s",
       );
 
-      // Late growth or streaming jitter on an already-settled row must NOT restart
-      // the timer using the stale startedAt (would jump from 2.4s to 10m+).
-      const lateGrowthTree = renderRow({
+      // Resuming streaming on the same key after a >300ms settle pause must continue
+      // accumulating from 2.4s without resetting to 0 or adding the 10m idle pause.
+      const resumedSameKeyTree = renderRow({
         agentId: "dur-agent",
         timestamp: liveTs,
-        item: { data: { text: `${longStreaming}! (patch)`, phase: "streaming" } },
+        item: { data: { text: `${longStreaming}! (resumed)`, phase: "streaming" } },
       });
       check(
-        "settled row stays frozen at 2.4s with 0 intervals even if late growth/streaming arrives",
+        "resuming streaming on same key after 10m settle restarts interval at 2.4s without counting idle gap",
+        intervals.size === 1 &&
+          findNode(resumedSameKeyTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "2.4s",
+        `intervals=${intervals.size}, text=${findNode(resumedSameKeyTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      advanceClock(500);
+      const resumedTickTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: liveTs,
+        item: { data: { text: `${longStreaming}! (resumed) more`, phase: "streaming" } },
+      });
+      check(
+        "resumed stream advances monotonically from 2.4s to 2.9s after 500ms",
+        intervals.size === 1 &&
+          findNode(resumedTickTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "2.9s",
+        `intervals=${intervals.size}, text=${findNode(resumedTickTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      renderRow({
+        agentId: "dur-agent",
+        timestamp: liveTs,
+        item: { data: { text: `${longStreaming}! (resumed) more`, phase: "complete" } },
+      });
+      advanceClock(300);
+      const resettledTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: liveTs,
+        item: { data: { text: `${longStreaming}! (resumed) more`, phase: "complete" } },
+      });
+      check(
+        "re-settling after resumed stream freezes at new cumulative 2.9s",
         intervals.size === 0 &&
-          findNode(lateGrowthTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "2.4s",
-        `intervals=${intervals.size}, text=${findNode(lateGrowthTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+          findNode(resettledTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "2.9s",
+        `intervals=${intervals.size}, text=${findNode(resettledTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
       );
       unmount();
 
-      // 3. Remounting the same row (virtual-list recycle) 10 minutes later preserves 2.4s.
+      // 3. Remounting the same row (virtual-list recycle) 10 minutes later preserves 2.9s.
       resetHooks();
+      advanceClock(600_000);
       const remountedTree = renderRow({
         agentId: "dur-agent",
         timestamp: liveTs,
-        item: { data: { text: `${longStreaming}!`, phase: "complete" } },
+        item: { data: { text: `${longStreaming}! (resumed) more`, phase: "complete" } },
       });
       check(
-        "remounting settled row preserves cached 2.4s without inflating or starting intervals",
+        "remounting settled row preserves cached 2.9s without inflating or starting intervals",
         intervals.size === 0 &&
-          findNode(remountedTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "2.4s",
+          findNode(remountedTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "2.9s",
         `intervals=${intervals.size}, text=${findNode(remountedTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
       );
       unmount();
 
-      // 4. Unmounting mid-stream clears interval and remounting later as complete keeps last observed elapsed.
+      // 3b. Resuming streaming after a >300ms settle pause WITH a host timestamp advance
+      // migrates the cached elapsed time to the new key and continues cleanly.
       resetHooks();
-      const midTs = 1_700_000_003_000;
+      const pauseShiftTs1 = 1_700_000_002_500;
+      const pauseShiftTs2 = 1_700_000_062_500;
       renderRow({
         agentId: "dur-agent",
-        timestamp: midTs,
+        timestamp: pauseShiftTs1,
+        item: { data: { text: "phase one", phase: "streaming" } },
+      });
+      advanceClock(1400);
+      renderRow({
+        agentId: "dur-agent",
+        timestamp: pauseShiftTs1,
+        item: { data: { text: "phase one done", phase: "complete" } },
+      });
+      advanceClock(300);
+      renderRow({
+        agentId: "dur-agent",
+        timestamp: pauseShiftTs1,
+        item: { data: { text: "phase one done", phase: "complete" } },
+      });
+      advanceClock(60_000); // 60s pause after settle
+      const shiftedResumeTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: pauseShiftTs2,
+        item: { data: { text: "phase one done -> phase two", phase: "streaming" } },
+      });
+      check(
+        "resuming after settle with host timestamp advance carries 1.4s without resetting or adding 60s pause",
+        intervals.size === 1 &&
+          findNode(shiftedResumeTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "1.4s",
+        `intervals=${intervals.size}, text=${findNode(shiftedResumeTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      advanceClock(400);
+      renderRow({
+        agentId: "dur-agent",
+        timestamp: pauseShiftTs2,
+        item: { data: { text: "phase one done -> phase two end", phase: "complete" } },
+      });
+      advanceClock(300);
+      const shiftedResettledTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: pauseShiftTs2,
+        item: { data: { text: "phase one done -> phase two end", phase: "complete" } },
+      });
+      check(
+        "re-settling after timestamp-shifted resume freezes at 1.8s on the migrated key",
+        intervals.size === 0 &&
+          findNode(shiftedResettledTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "1.8s",
+        `intervals=${intervals.size}, text=${findNode(shiftedResettledTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      unmount();
+      resetHooks();
+      const shiftedRemountTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: pauseShiftTs2,
+        item: { data: { text: "phase one done -> phase two end", phase: "complete" } },
+      });
+      check(
+        "remounting migrated key after post-settle resume preserves 1.8s",
+        intervals.size === 0 &&
+          findNode(shiftedRemountTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "1.8s",
+        `intervals=${intervals.size}, text=${findNode(shiftedRemountTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      unmount();
+
+      // 4. Unmounting mid-stream flushes segment & clears interval; remounting 5 minutes later
+      // as streaming continues from 1.5s -> 1.6s (never jumps to 5m 1s), and remounting as
+      // complete keeps 1.5s with 0 intervals.
+      resetHooks();
+      const midStreamTs = 1_700_000_003_000;
+      renderRow({
+        agentId: "dur-agent",
+        timestamp: midStreamTs,
         item: { data: { text: "mid", phase: "streaming" } },
       });
-      fakeNow += 1500;
-      tickIntervals();
+      advanceClock(1500);
       renderRow({
         agentId: "dur-agent",
-        timestamp: midTs,
+        timestamp: midStreamTs,
         item: { data: { text: "mid stream", phase: "streaming" } },
       });
       unmount();
       check("unmounting mid-stream clears the interval", intervals.size === 0, `${intervals.size}`);
 
-      fakeNow += 300_000;
+      advanceClock(300_000); // 5 minutes unmounted
+      resetHooks();
+      const remountStreamingTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: midStreamTs,
+        item: { data: { text: "mid stream still going", phase: "streaming" } },
+      });
+      check(
+        "remounting mid-stream row 5m later as streaming resumes at 1.5s (not 5m 1s)",
+        intervals.size === 1 &&
+          findNode(remountStreamingTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "1.5s",
+        `intervals=${intervals.size}, text=${findNode(remountStreamingTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      advanceClock(100);
+      const remountStreamingNextTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: midStreamTs,
+        item: { data: { text: "mid stream still going", phase: "streaming" } },
+      });
+      check(
+        "after +100ms on remounted streaming row, duration advances from 1.5s to 1.6s",
+        intervals.size === 1 &&
+          findNode(remountStreamingNextTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "1.6s",
+        `intervals=${intervals.size}, text=${findNode(remountStreamingNextTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      unmount();
+
+      // 4b. Unmounting mid-stream and remounting 5 minutes later as complete keeps 1.5s & 0 intervals.
+      resetHooks();
+      const midCompleteTs = 1_700_000_003_500;
+      renderRow({
+        agentId: "dur-agent",
+        timestamp: midCompleteTs,
+        item: { data: { text: "mid-c", phase: "streaming" } },
+      });
+      advanceClock(1500);
+      renderRow({
+        agentId: "dur-agent",
+        timestamp: midCompleteTs,
+        item: { data: { text: "mid-c stream", phase: "streaming" } },
+      });
+      unmount();
+      advanceClock(300_000);
       resetHooks();
       const remountMidTree = renderRow({
         agentId: "dur-agent",
-        timestamp: midTs,
-        item: { data: { text: "mid stream done", phase: "complete" } },
+        timestamp: midCompleteTs,
+        item: { data: { text: "mid-c stream done", phase: "complete" } },
       });
       check(
         "remounting mid-stream row as complete keeps last observed 1.5s without adding unmounted gap",
@@ -1157,8 +1441,216 @@ console.log("the row settles when the last frame both grows and completes");
         `intervals=${intervals.size}, text=${findNode(remountMidTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
       );
 
+      // 4c. Same-millisecond collision isolation: unrelated thoughts sharing the exact same
+      // timestamp (same host/agent or across hosts) never reuse each other's cached duration.
+      unmount();
+      resetHooks();
+      const collideTs = 1_700_000_003_800;
+      renderRow({
+        host: { id: "host-a", label: "Host A" },
+        agentId: "collide-agent",
+        timestamp: collideTs,
+        item: { data: { text: "alpha plan", phase: "streaming" } },
+      });
+      advanceClock(1200);
+      renderRow({
+        host: { id: "host-a", label: "Host A" },
+        agentId: "collide-agent",
+        timestamp: collideTs,
+        item: { data: { text: "alpha plan finalized", phase: "complete" } },
+      });
+      advanceClock(300);
+      const alphaSettled = renderRow({
+        host: { id: "host-a", label: "Host A" },
+        agentId: "collide-agent",
+        timestamp: collideTs,
+        item: { data: { text: "alpha plan finalized", phase: "complete" } },
+      });
+      check(
+        "same-ms primary thought settles at 1.2s",
+        findNode(alphaSettled, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "1.2s",
+      );
+      unmount();
+
+      resetHooks();
+      const unrelatedHistoricSameMs = renderRow({
+        host: { id: "host-a", label: "Host A" },
+        agentId: "collide-agent",
+        timestamp: collideTs,
+        item: { data: { text: "beta unrelated history", phase: "complete" } },
+      });
+      check(
+        "unrelated completed thought at the exact same millisecond does not reuse primary 1.2s badge",
+        intervals.size === 0 &&
+          findNode(unrelatedHistoricSameMs, (n) => n.props?.testID === THINKING_DURATION_TEST_ID) === null,
+        `text=${findNode(unrelatedHistoricSameMs, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      unmount();
+
+      resetHooks();
+      renderRow({
+        host: { id: "host-a", label: "Host A" },
+        agentId: "collide-agent",
+        timestamp: collideTs,
+        item: { data: { text: "gamma fresh stream", phase: "streaming" } },
+      });
+      advanceClock(600);
+      renderRow({
+        host: { id: "host-a", label: "Host A" },
+        agentId: "collide-agent",
+        timestamp: collideTs,
+        item: { data: { text: "gamma fresh stream done", phase: "complete" } },
+      });
+      advanceClock(300);
+      const gammaSettled = renderRow({
+        host: { id: "host-a", label: "Host A" },
+        agentId: "collide-agent",
+        timestamp: collideTs,
+        item: { data: { text: "gamma fresh stream done", phase: "complete" } },
+      });
+      check(
+        "unrelated streaming thought at the exact same millisecond gets its own 0.6s slot",
+        intervals.size === 0 &&
+          findNode(gammaSettled, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "0.6s",
+        `text=${findNode(gammaSettled, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      unmount();
+
+      resetHooks();
+      const alphaRemount = renderRow({
+        host: { id: "host-a", label: "Host A" },
+        agentId: "collide-agent",
+        timestamp: collideTs,
+        item: { data: { text: "alpha plan finalized", phase: "complete" } },
+      });
+      unmount();
+      resetHooks();
+      const gammaRemount = renderRow({
+        host: { id: "host-a", label: "Host A" },
+        agentId: "collide-agent",
+        timestamp: collideTs,
+        item: { data: { text: "gamma fresh stream done", phase: "complete" } },
+      });
+      unmount();
+      resetHooks();
+      const otherHostSameText = renderRow({
+        host: { id: "host-b", label: "Host B" },
+        agentId: "collide-agent",
+        timestamp: collideTs,
+        item: { data: { text: "alpha plan finalized", phase: "complete" } },
+      });
+      check(
+        "remounting colliding thoughts preserves 1.2s and 0.6s independently, and different host.id is isolated",
+        findNode(alphaRemount, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "1.2s" &&
+          findNode(gammaRemount, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "0.6s" &&
+          findNode(otherHostSameText, (n) => n.props?.testID === THINKING_DURATION_TEST_ID) === null,
+        JSON.stringify({
+          alpha: findNode(alphaRemount, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children,
+          gamma: findNode(gammaRemount, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children,
+          otherHost: findNode(otherHostSameText, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children,
+        }),
+      );
+      unmount();
+
+      // 4d. Same-millisecond prefix collision isolation: a settled thought ("Analyze") must NOT
+      // lend its cached duration to another completed thought sharing the same prefix
+      // ("Analyze further") at the exact same millisecond, while exact-match remount and
+      // streaming continuation still hit the original slot.
+      resetHooks();
+      const prefixTs = 1_700_000_003_900;
+      renderRow({
+        host: { id: "host-a", label: "Host A" },
+        agentId: "prefix-collide-agent",
+        timestamp: prefixTs,
+        item: { data: { text: "Analyze", phase: "streaming" } },
+      });
+      advanceClock(600);
+      renderRow({
+        host: { id: "host-a", label: "Host A" },
+        agentId: "prefix-collide-agent",
+        timestamp: prefixTs,
+        item: { data: { text: "Analyze", phase: "complete" } },
+      });
+      advanceClock(300);
+      const analyzeSettled = renderRow({
+        host: { id: "host-a", label: "Host A" },
+        agentId: "prefix-collide-agent",
+        timestamp: prefixTs,
+        item: { data: { text: "Analyze", phase: "complete" } },
+      });
+      check(
+        "same-ms prefix-collision baseline thought settles at 0.6s",
+        intervals.size === 0 &&
+          findNode(analyzeSettled, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "0.6s",
+        `text=${findNode(analyzeSettled, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      unmount();
+
+      resetHooks();
+      const prefixCompletedOther = renderRow({
+        host: { id: "host-a", label: "Host A" },
+        agentId: "prefix-collide-agent",
+        timestamp: prefixTs,
+        item: { data: { text: "Analyze further", phase: "complete" } },
+      });
+      check(
+        "another completed thought sharing the same prefix at the exact same ms does not inherit 0.6s",
+        intervals.size === 0 &&
+          findNode(prefixCompletedOther, (n) => n.props?.testID === THINKING_DURATION_TEST_ID) === null,
+        `text=${findNode(prefixCompletedOther, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      unmount();
+
+      resetHooks();
+      const analyzeExactRemount = renderRow({
+        host: { id: "host-a", label: "Host A" },
+        agentId: "prefix-collide-agent",
+        timestamp: prefixTs,
+        item: { data: { text: "Analyze", phase: "complete" } },
+      });
+      check(
+        "exact-match remount of original settled thought still retains 0.6s",
+        intervals.size === 0 &&
+          findNode(analyzeExactRemount, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "0.6s",
+        `text=${findNode(analyzeExactRemount, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      unmount();
+
+      resetHooks();
+      const analyzeStreamingResume = renderRow({
+        host: { id: "host-a", label: "Host A" },
+        agentId: "prefix-collide-agent",
+        timestamp: prefixTs,
+        item: { data: { text: "Analyze further", phase: "streaming" } },
+      });
+      advanceClock(400);
+      const analyzeStreamingTick = renderRow({
+        host: { id: "host-a", label: "Host A" },
+        agentId: "prefix-collide-agent",
+        timestamp: prefixTs,
+        item: { data: { text: "Analyze further", phase: "streaming" } },
+      });
+      check(
+        "settled thought resuming in streaming mode with appended prefix continues cleanly from 0.6s to 1.0s",
+        intervals.size === 1 &&
+          findNode(analyzeStreamingResume, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "0.6s" &&
+          findNode(analyzeStreamingTick, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "1.0s",
+        JSON.stringify({
+          resume: findNode(analyzeStreamingResume, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children,
+          tick: findNode(analyzeStreamingTick, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children,
+          intervals: intervals.size,
+        }),
+      );
+      unmount();
+
       // 5. In-place key recycling (same mounted instance switches to a historic row without unmounting)
-      // must not leak the previous row's elapsed time or startedAt into the new key.
+      // must not leak the previous row's elapsed time or segment into the new key.
+      resetHooks();
+      renderRow({
+        agentId: "dur-agent",
+        timestamp: midCompleteTs,
+        item: { data: { text: "mid-c stream done", phase: "complete" } },
+      });
       const recycledHistoricTree = renderRow({
         agentId: "dur-agent",
         timestamp: 1_700_000_004_000,
@@ -1179,8 +1671,7 @@ console.log("the row settles when the last frame both grows and completes");
         timestamp: 1_700_000_005_000,
         item: { data: { text: "currently streaming long reasoning text", phase: "streaming" } },
       });
-      fakeNow += 800;
-      tickIntervals();
+      advanceClock(800);
       const switchedFromStreamingTree = renderRow({
         agentId: "dur-agent",
         timestamp: 1_700_000_000_500,
@@ -1191,6 +1682,75 @@ console.log("the row settles when the last frame both grows and completes");
         intervals.size === 0 &&
           findNode(switchedFromStreamingTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID) === null,
         `intervals=${intervals.size}, text=${findNode(switchedFromStreamingTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      unmount();
+
+      // 6b. In-place key switch from active streaming row ("short", 0.5s) to a longer unrelated
+      // historic row must flush "short" back to the old key (never polluting old key with the new
+      // row's text), so remounting the old row preserves 0.5s and a new same-ms stream does not inherit it.
+      resetHooks();
+      const cleanOldTs = 1_700_000_005_500;
+      const cleanNewTs = 1_700_000_000_800;
+      renderRow({
+        host: { id: "host-a", label: "Host A" },
+        agentId: "recycle-clean-agent",
+        timestamp: cleanOldTs,
+        item: { data: { text: "short", phase: "streaming" } },
+      });
+      advanceClock(500);
+      const beforeRecycleTree = renderRow({
+        host: { id: "host-a", label: "Host A" },
+        agentId: "recycle-clean-agent",
+        timestamp: cleanOldTs,
+        item: { data: { text: "short", phase: "streaming" } },
+      });
+      check(
+        "streaming row accumulates 0.5s before in-place recycle to longer unrelated row",
+        intervals.size === 1 &&
+          findNode(beforeRecycleTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "0.5s",
+        `text=${findNode(beforeRecycleTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      const afterRecycleTree = renderRow({
+        host: { id: "host-a", label: "Host A" },
+        agentId: "recycle-clean-agent",
+        timestamp: cleanNewTs,
+        item: { data: { text: "very long unrelated historic thought", phase: "complete" } },
+      });
+      check(
+        "in-place recycle onto longer unrelated historic row clears interval and badge",
+        intervals.size === 0 &&
+          findNode(afterRecycleTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID) === null,
+        `intervals=${intervals.size}, text=${findNode(afterRecycleTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      unmount();
+
+      resetHooks();
+      const remountedShortTree = renderRow({
+        host: { id: "host-a", label: "Host A" },
+        agentId: "recycle-clean-agent",
+        timestamp: cleanOldTs,
+        item: { data: { text: "short", phase: "complete" } },
+      });
+      check(
+        "remounting original short row after in-place recycle retains 0.5s without text pollution",
+        intervals.size === 0 &&
+          findNode(remountedShortTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "0.5s",
+        `text=${findNode(remountedShortTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      unmount();
+
+      resetHooks();
+      const sameMsUnrelatedStreamTree = renderRow({
+        host: { id: "host-a", label: "Host A" },
+        agentId: "recycle-clean-agent",
+        timestamp: cleanOldTs,
+        item: { data: { text: "very long unrelated historic thought", phase: "streaming" } },
+      });
+      check(
+        "new same-ms streaming row with recycled text does not inherit original short row's 0.5s",
+        intervals.size === 1 &&
+          findNode(sameMsUnrelatedStreamTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID) === null,
+        `text=${findNode(sameMsUnrelatedStreamTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
       );
       unmount();
 
@@ -1205,8 +1765,7 @@ console.log("the row settles when the last frame both grows and completes");
         timestamp: driftTs1,
         item: { data: { text: "step 1", phase: "streaming" } },
       });
-      fakeNow += 1200;
-      tickIntervals();
+      advanceClock(1200);
       const driftMidTree = renderRow({
         agentId: "dur-agent",
         timestamp: driftTs2,
@@ -1218,15 +1777,13 @@ console.log("the row settles when the last frame both grows and completes");
           findNode(driftMidTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "1.2s",
         `intervals=${intervals.size}, text=${findNode(driftMidTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
       );
-      fakeNow += 600;
+      advanceClock(600);
       renderRow({
         agentId: "dur-agent",
         timestamp: driftTs3,
         item: { data: { text: "step 1 -> step 2 -> done", phase: "complete" } },
       });
-      fakeNow += 300;
-      for (const cb of [...timers.values()]) cb();
-      timers.clear();
+      advanceClock(300);
       const driftSettledTree = renderRow({
         agentId: "dur-agent",
         timestamp: driftTs3,
@@ -1260,15 +1817,13 @@ console.log("the row settles when the last frame both grows and completes");
         timestamp: shortTs,
         item: { data: { text: "ok", phase: "streaming" } },
       });
-      fakeNow += 50;
+      advanceClock(50);
       renderRow({
         agentId: "dur-agent",
         timestamp: shortTs,
         item: { data: { text: "ok!", phase: "complete" } },
       });
-      fakeNow += 300;
-      for (const cb of [...timers.values()]) cb();
-      timers.clear();
+      advanceClock(300);
       const shortSettledTree = renderRow({
         agentId: "dur-agent",
         timestamp: shortTs,
@@ -1290,10 +1845,9 @@ console.log("the row settles when the last frame both grows and completes");
         timestamp: rollbackTs,
         item: { data: { text: "clock", phase: "streaming" } },
       });
-      fakeNow += 1500;
-      tickIntervals();
-      fakeNow -= 5000; // clock jumps backward before startedAt
-      tickIntervals();
+      advanceClock(1500);
+      shiftWallClock(-5000); // wall clock jumps backward before segmentStartedAt
+      advanceClock(100);
       const rollbackTree = renderRow({
         agentId: "dur-agent",
         timestamp: rollbackTs,
@@ -1304,7 +1858,7 @@ console.log("the row settles when the last frame both grows and completes");
         findNode(rollbackTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "1.5s",
         `text=${findNode(rollbackTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
       );
-      fakeNow += 5000;
+      shiftWallClock(5000);
       unmount();
 
       // 10. MAX_DURATION_RECORDS (500) eviction boundary: 501st row evicts the oldest entry.
@@ -1317,8 +1871,7 @@ console.log("the row settles when the last frame both grows and completes");
           timestamp: baseEvictTs + i * 1000,
           item: { data: { text: `row-${i}`, phase: "streaming" } },
         });
-        fakeNow += 500;
-        tickIntervals();
+        advanceClock(500);
         unmount();
       }
       resetHooks();
@@ -1632,6 +2185,260 @@ console.log("the row settles when the last frame both grows and completes");
           `unexpected calls=${scrollCalls.length}`,
         );
 
+        // Repeated small (-1px) Web wheel upward scrolls disengage stickToBottom cleanly.
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 600 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 860 },
+          },
+        });
+        for (let step = 1; step <= 40; step += 1) {
+          streamScroll.props.onScroll({
+            nativeEvent: {
+              contentOffset: { y: 600 - step },
+              layoutMeasurement: { height: 260 },
+              contentSize: { height: 860 },
+            },
+          });
+        }
+        scrollCalls.length = 0;
+        streamScroll.props.onContentSizeChange(320, 920);
+        check(
+          "40 consecutive -1px upward wheel scrolls disengage stick-to-bottom",
+          scrollCalls.length === 0,
+          `unexpected scrollToEnd calls=${scrollCalls.length}`,
+        );
+
+        // Scrolling back to bottom resumes sticky state, and pending follow requests skipped
+        // during native drag or momentum while still at the bottom flush when gestures end.
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 660 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 920 },
+          },
+        });
+        scrollCalls.length = 0;
+        streamScroll.props.onScrollBeginDrag();
+        streamScroll.props.onContentSizeChange(320, 980);
+        check(
+          "content growth during active native drag hold defers scrollToEnd",
+          scrollCalls.length === 0,
+          `unexpected calls=${scrollCalls.length}`,
+        );
+        streamScroll.props.onScrollEndDrag({
+          nativeEvent: {
+            velocity: { y: 0 },
+            contentOffset: { y: 660 },
+            targetContentOffset: { y: 660 },
+          },
+        });
+        check(
+          "ending native drag while still sticky flushes the deferred scrollToEnd",
+          scrollCalls.length === 1 && scrollCalls[0]?.animated === false,
+          JSON.stringify(scrollCalls),
+        );
+
+        // Parameterless onScrollEndDrag() (e.g. Android or synthetic callers without velocity)
+        // defers flush to a 0ms macrotask so an immediate momentumBegin can still cancel it.
+        scrollCalls.length = 0;
+        streamScroll.props.onScrollBeginDrag();
+        streamScroll.props.onContentSizeChange(320, 1000);
+        streamScroll.props.onScrollEndDrag();
+        check(
+          "parameterless onScrollEndDrag defers flush past synchronous turn",
+          scrollCalls.length === 0,
+          `unexpected sync calls=${scrollCalls.length}`,
+        );
+        advanceClock(0);
+        check(
+          "parameterless onScrollEndDrag with no momentum flushes on 0ms macrotask",
+          scrollCalls.length === 1 && scrollCalls[0]?.animated === false,
+          JSON.stringify(scrollCalls),
+        );
+
+        // Real iOS ordering: onScrollBeginDrag -> onContentSizeChange -> onScrollEndDrag(velocity) ->
+        // onMomentumScrollBegin -> onMomentumScrollEnd must not yank before momentum finishes.
+        scrollCalls.length = 0;
+        streamScroll.props.onScrollBeginDrag();
+        streamScroll.props.onContentSizeChange(320, 1020);
+        streamScroll.props.onScrollEndDrag({
+          nativeEvent: {
+            velocity: { y: -0.8 },
+            contentOffset: { y: 660 },
+            targetContentOffset: { y: 740 },
+          },
+        });
+        check(
+          "iOS endDrag with momentum velocity does not yank before onMomentumScrollBegin",
+          scrollCalls.length === 0,
+          `unexpected calls=${scrollCalls.length}`,
+        );
+        advanceClock(50);
+        check(
+          "iOS endDrag stays deferred within 120ms momentum handoff window",
+          scrollCalls.length === 0,
+          `unexpected calls=${scrollCalls.length}`,
+        );
+        streamScroll.props.onMomentumScrollBegin();
+        advanceClock(200);
+        check(
+          "once iOS momentum begins, timer is cancelled and flush waits for momentumEnd",
+          scrollCalls.length === 0,
+          `unexpected calls=${scrollCalls.length}`,
+        );
+        streamScroll.props.onMomentumScrollEnd();
+        check(
+          "iOS momentumEnd flushes deferred scrollToEnd once",
+          scrollCalls.length === 1 && scrollCalls[0]?.animated === false,
+          JSON.stringify(scrollCalls),
+        );
+
+        // Parameterless endDrag -> momentumBegin -> momentumEnd ordering also cancels 0ms timer cleanly.
+        scrollCalls.length = 0;
+        streamScroll.props.onScrollBeginDrag();
+        streamScroll.props.onContentSizeChange(320, 1030);
+        streamScroll.props.onScrollEndDrag();
+        check(
+          "parameterless endDrag before momentumBegin does not scroll prematurely",
+          scrollCalls.length === 0,
+          `unexpected calls=${scrollCalls.length}`,
+        );
+        streamScroll.props.onMomentumScrollBegin();
+        advanceClock(50);
+        check(
+          "momentumBegin cancels parameterless endDrag 0ms timer",
+          scrollCalls.length === 0,
+          `unexpected calls=${scrollCalls.length}`,
+        );
+        streamScroll.props.onMomentumScrollEnd();
+        check(
+          "parameterless endDrag -> momentumBegin -> momentumEnd flushes once at momentumEnd",
+          scrollCalls.length === 1 && scrollCalls[0]?.animated === false,
+          JSON.stringify(scrollCalls),
+        );
+
+        // Drag hold + content growth + stationary onScroll (y unchanged) stays sticky and flushes on stationary endDrag.
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 770 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 1030 },
+          },
+        });
+        scrollCalls.length = 0;
+        streamScroll.props.onScrollBeginDrag();
+        streamScroll.props.onContentSizeChange(320, 1110);
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 770 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 1110 },
+          },
+        });
+        streamScroll.props.onScrollEndDrag({
+          nativeEvent: {
+            velocity: { y: 0 },
+            contentOffset: { y: 770 },
+            targetContentOffset: { y: 770 },
+          },
+        });
+        check(
+          "content growth with stationary y during drag hold stays sticky and flushes on endDrag",
+          scrollCalls.length === 1 && scrollCalls[0]?.animated === false,
+          JSON.stringify(scrollCalls),
+        );
+
+        // Drag hold + content growth + genuine upward drag disengages stickiness (0 scrollToEnd after endDrag).
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 850 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 1110 },
+          },
+        });
+        scrollCalls.length = 0;
+        streamScroll.props.onScrollBeginDrag();
+        streamScroll.props.onContentSizeChange(320, 1180);
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 800 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 1180 },
+          },
+        });
+        streamScroll.props.onScrollEndDrag({
+          nativeEvent: {
+            velocity: { y: 0 },
+            contentOffset: { y: 800 },
+            targetContentOffset: { y: 800 },
+          },
+        });
+        check(
+          "genuine upward drag while content grows disengages stickiness and never yanks on endDrag",
+          scrollCalls.length === 0,
+          `unexpected calls=${scrollCalls.length}`,
+        );
+
+        // iOS bottom overscroll bounce (y=635 > maxReachableY=600) with concurrent content growth
+        // (contentH 860 -> 940, bounce settles to y=620) must remain sticky and follow subsequent growth.
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 600 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 860 },
+          },
+        });
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 635 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 860 },
+          },
+        });
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 620 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 940 },
+          },
+        });
+        scrollCalls.length = 0;
+        streamScroll.props.onContentSizeChange(320, 1000);
+        check(
+          "iOS bottom overscroll bounce during concurrent content growth remains sticky",
+          scrollCalls.length === 1 && scrollCalls[0]?.animated === false,
+          JSON.stringify(scrollCalls),
+        );
+
+        // Reset back to bottom before the overlapping drag+momentum test below.
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 740 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 1000 },
+          },
+        });
+
+        // Same deferred flush across overlapping drag + momentum coasting at the bottom.
+        scrollCalls.length = 0;
+        streamScroll.props.onScrollBeginDrag();
+        streamScroll.props.onMomentumScrollBegin();
+        streamScroll.props.onContentSizeChange(320, 1040);
+        streamScroll.props.onScrollEndDrag();
+        check(
+          "deferred scrollToEnd waits until momentum also finishes",
+          scrollCalls.length === 0,
+          `unexpected calls=${scrollCalls.length}`,
+        );
+        streamScroll.props.onMomentumScrollEnd();
+        check(
+          "ending momentum while still sticky flushes the deferred scrollToEnd",
+          scrollCalls.length === 1 && scrollCalls[0]?.animated === false,
+          JSON.stringify(scrollCalls),
+        );
+
         // Virtual-list in-place key switch to a different row while open resets stick-to-bottom and jumps to end.
         scrollCalls.length = 0;
         const switchedOpenTree = renderWithScrollRef({
@@ -1681,6 +2488,258 @@ console.log("the row settles when the last frame both grows and completes");
           JSON.stringify(scrollCalls),
         );
         unmount();
+      }
+
+      console.log("terminal phase drops ink-stream liveHint immediately & committed updates pass firstPaint=false");
+      {
+        const { resetNewestForTests } = require(join(dirname(componentPath), "newest.js"));
+
+        // 11. Terminal phase (`streaming` -> `complete`) immediately drops `useInkStreamReveal`'s
+        // `liveHint` to `false` without waiting for the 300ms `growing` debounce, while
+        // RowStatusIcon, TextShimmer, and thinking duration still obey the 300ms debounce.
+        resetHooks();
+        inkStreamCalls.length = 0;
+        const revealTs = 1_700_003_000_000;
+        const streamingRevealTree = renderRow({
+          agentId: "reveal-agent",
+          timestamp: revealTs,
+          item: { data: { text: "reasoning step one", phase: "streaming" } },
+        });
+        advanceClock(400);
+        const streamingRevealTickTree = renderRow({
+          agentId: "reveal-agent",
+          timestamp: revealTs,
+          item: { data: { text: "reasoning step one", phase: "streaming" } },
+        });
+        const streamingLiveHint = inkStreamCalls[inkStreamCalls.length - 1]?.liveHint;
+        const streamingIconStatus = findNode(
+          streamingRevealTickTree,
+          (n) => typeof n.type === "function" && n.type.name === "RowStatusIcon",
+        )?.props?.status;
+        check(
+          "while streaming, useInkStreamReveal receives liveHint=true and RowStatusIcon is running",
+          streamingLiveHint === true &&
+            streamingIconStatus === "running" &&
+            findShimmerActive(streamingRevealTree) === true,
+          JSON.stringify({ liveHint: streamingLiveHint, iconStatus: streamingIconStatus }),
+        );
+
+        inkStreamCalls.length = 0;
+        const completeImmediateTree = renderRow({
+          agentId: "reveal-agent",
+          timestamp: revealTs,
+          item: { data: { text: "reasoning step one done", phase: "complete" } },
+        });
+        const completeLiveHint = inkStreamCalls[inkStreamCalls.length - 1]?.liveHint;
+        const completeImmediateIconStatus = findNode(
+          completeImmediateTree,
+          (n) => typeof n.type === "function" && n.type.name === "RowStatusIcon",
+        )?.props?.status;
+        check(
+          "transitioning to phase=complete immediately passes liveHint=false to useInkStreamReveal while icon/shimmer/duration hold 300ms debounce",
+          completeLiveHint === false &&
+            completeImmediateIconStatus === "running" &&
+            findShimmerActive(completeImmediateTree) === true &&
+            findNode(completeImmediateTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "0.4s",
+          JSON.stringify({
+            liveHint: completeLiveHint,
+            iconStatus: completeImmediateIconStatus,
+            shimmer: findShimmerActive(completeImmediateTree),
+            duration: findNode(completeImmediateTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children,
+          }),
+        );
+        advanceClock(299);
+        const complete299Tree = renderRow({
+          agentId: "reveal-agent",
+          timestamp: revealTs,
+          item: { data: { text: "reasoning step one done", phase: "complete" } },
+        });
+        advanceClock(1);
+        const complete300Tree = renderRow({
+          agentId: "reveal-agent",
+          timestamp: revealTs,
+          item: { data: { text: "reasoning step one done", phase: "complete" } },
+        });
+        check(
+          "RowStatusIcon stays running at +299ms and flips to completed at +300ms",
+          findNode(complete299Tree, (n) => typeof n.type === "function" && n.type.name === "RowStatusIcon")?.props?.status === "running" &&
+            findNode(complete300Tree, (n) => typeof n.type === "function" && n.type.name === "RowStatusIcon")?.props?.status === "completed",
+          JSON.stringify({
+            at299: findNode(complete299Tree, (n) => typeof n.type === "function" && n.type.name === "RowStatusIcon")?.props?.status,
+            at300: findNode(complete300Tree, (n) => typeof n.type === "function" && n.type.name === "RowStatusIcon")?.props?.status,
+          }),
+        );
+        unmount();
+
+        // 11b. Terminal phase (`streaming` -> `complete`) must immediately switch the collapsed
+        // summary from `streamingTail` to completed `firstLine` without waiting for the 300ms
+        // `growing` debounce — and an unmeasured (`lineWidth === 0`) short single-line thought
+        // must never render an empty summary on its terminal first frame.
+        const readCollapsedPreview = (tree) => {
+          const shimmer = findNode(tree, (n) => n.type === "TextShimmer");
+          const content =
+            typeof shimmer?.props?.children === "function" ? shimmer.props.children(null) : tree;
+          const node = findNode(content, (n) => n.type === "Text" && n.props?.numberOfLines === 1);
+          const raw = node?.props?.children;
+          return Array.isArray(raw) ? raw.join("") : String(raw ?? "");
+        };
+        resetHooks();
+        const summaryTs = 1_700_003_005_000;
+        const multiLineThought =
+          "First summary line\nmiddle reasoning paragraph\nfinal streaming tail tokens that should vanish immediately on complete";
+        const measuredStreamingTree = renderRow({
+          agentId: "summary-snap-agent",
+          timestamp: summaryTs,
+          item: { data: { text: multiLineThought, phase: "streaming" } },
+        });
+        const headForSnap = findNode(measuredStreamingTree, (n) => n.type === "Pressable");
+        headForSnap.props.onLayout({ nativeEvent: { layout: { width: 220 } } });
+        const shimmerForSnap = findNode(measuredStreamingTree, (n) => n.type === "TextShimmer");
+        const labelForSnap = findNode(
+          shimmerForSnap.props.children(null),
+          (n) => n.type === "Text" && typeof n.props?.onLayout === "function",
+        );
+        labelForSnap.props.onLayout({ nativeEvent: { layout: { width: 26 } } });
+        const streamingWithWidthTree = renderRow({
+          agentId: "summary-snap-agent",
+          timestamp: summaryTs,
+          item: { data: { text: multiLineThought, phase: "streaming" } },
+        });
+        const streamingPreviewText = readCollapsedPreview(streamingWithWidthTree);
+        const completeImmediateSnapTree = renderRow({
+          agentId: "summary-snap-agent",
+          timestamp: summaryTs,
+          item: { data: { text: multiLineThought, phase: "complete" } },
+        });
+        const completeImmediatePreviewText = readCollapsedPreview(completeImmediateSnapTree);
+        const completeImmediateIcon = findNode(
+          completeImmediateSnapTree,
+          (n) => typeof n.type === "function" && n.type.name === "RowStatusIcon",
+        )?.props?.status;
+        check(
+          "collapsed summary snaps from streaming tail to completed first line immediately on phase=complete while icon still holds 300ms debounce",
+          streamingPreviewText !== "First summary line" &&
+            streamingPreviewText.includes("complete") &&
+            completeImmediatePreviewText === "First summary line" &&
+            completeImmediateIcon === "running",
+          JSON.stringify({
+            streamingPreviewText,
+            completeImmediatePreviewText,
+            completeImmediateIcon,
+          }),
+        );
+        unmount();
+
+        resetHooks();
+        renderRow({
+          agentId: "summary-unmeasured-agent",
+          timestamp: summaryTs + 1000,
+          item: { data: { text: "Short unmeasured thought", phase: "streaming" } },
+        });
+        const unmeasuredCompleteTree = renderRow({
+          agentId: "summary-unmeasured-agent",
+          timestamp: summaryTs + 1000,
+          item: { data: { text: "Short unmeasured thought", phase: "complete" } },
+        });
+        const unmeasuredCompletePreview = readCollapsedPreview(unmeasuredCompleteTree);
+        check(
+          "unmeasured short thought renders full first line immediately on terminal first frame (never empty)",
+          unmeasuredCompletePreview === "Short unmeasured thought",
+          JSON.stringify({ unmeasuredCompletePreview }),
+        );
+        unmount();
+
+        // 11c. Scroll follow regressions: multi-frame iOS bottom overscroll bounce stays sticky
+        //      and Web near-bottom upward scroll inside the 24px threshold does not re-stick.
+        resetHooks();
+        const scrollTs = 1_700_003_008_000;
+        const scrollTree0 = renderRow({
+          agentId: "scroll-reg-agent",
+          timestamp: scrollTs,
+          item: { data: { text: "streaming body", phase: "streaming" } },
+        });
+        const scrollHead = findNode(scrollTree0, (n) => n.type === "Pressable");
+        scrollHead.props.onPress(); // expand
+        const scrollTree1 = renderRow({
+          agentId: "scroll-reg-agent",
+          timestamp: scrollTs,
+          item: { data: { text: "streaming body expanded", phase: "streaming" } },
+        });
+        const sv = findNode(scrollTree1, (n) => n.type === "ScrollView");
+        let scrollToEndCalls = 0;
+        sv.props.ref.current = { scrollToEnd: () => { scrollToEndCalls += 1; } };
+        // Land at bottom (contentH=860, viewport=260, maxReachableY=600).
+        sv.props.onScroll({ nativeEvent: { contentOffset: { y: 600 }, layoutMeasurement: { height: 260 }, contentSize: { height: 860 } } });
+        // Multi-frame iOS bottom overscroll bounce (600 -> 635 -> 620 -> 600) with concurrent growth (860 -> 940 -> 960).
+        sv.props.onScroll({ nativeEvent: { contentOffset: { y: 635 }, layoutMeasurement: { height: 260 }, contentSize: { height: 860 } } });
+        sv.props.onScroll({ nativeEvent: { contentOffset: { y: 620 }, layoutMeasurement: { height: 260 }, contentSize: { height: 940 } } });
+        sv.props.onScroll({ nativeEvent: { contentOffset: { y: 605 }, layoutMeasurement: { height: 260 }, contentSize: { height: 960 } } });
+        scrollToEndCalls = 0;
+        sv.props.onContentSizeChange(300, 1000);
+        const stayedStickyAfterMultiFrameBounce = scrollToEndCalls === 1;
+
+        // Now land at bottom (y=740, contentH=1000, viewport=260), then scroll up 10px (inside 24px threshold)
+        // and settle 2px further up without moving down -> must disengage and NOT re-stick.
+        sv.props.onScroll({ nativeEvent: { contentOffset: { y: 740 }, layoutMeasurement: { height: 260 }, contentSize: { height: 1000 } } });
+        sv.props.onScroll({ nativeEvent: { contentOffset: { y: 730 }, layoutMeasurement: { height: 260 }, contentSize: { height: 1000 } } });
+        sv.props.onScroll({ nativeEvent: { contentOffset: { y: 729.5 }, layoutMeasurement: { height: 260 }, contentSize: { height: 1000 } } });
+        scrollToEndCalls = 0;
+        sv.props.onContentSizeChange(300, 1080);
+        const stayedDisengagedOnNearBottomUpScroll = scrollToEndCalls === 0;
+        check(
+          "multi-frame iOS bottom overscroll bounce stays sticky while near-bottom upward scroll stays disengaged",
+          stayedStickyAfterMultiFrameBounce && stayedDisengagedOnNearBottomUpScroll,
+          JSON.stringify({ stayedStickyAfterMultiFrameBounce, stayedDisengagedOnNearBottomUpScroll }),
+        );
+        unmount();
+
+        // 12. Existing thinking row updating its timestamp after initial commit must pass
+        // `firstPaint=false` to `noteRender` (alongside a stable 4th-arg identity).
+        resetHooks();
+        resetNewestForTests("fp-agent");
+        noteRenderCalls.length = 0;
+        const fpTs1 = 1_700_003_010_000;
+        const fpTs2 = 1_700_003_011_000;
+        renderRow({
+          agentId: "fp-agent",
+          timestamp: fpTs1,
+          item: { data: { text: "step 1", phase: "streaming" } },
+        });
+        const firstMountCall = noteRenderCalls[0];
+        check(
+          "initial mount passes firstPaint=true and non-empty 4th-arg identity to noteRender",
+          Array.isArray(firstMountCall) &&
+            firstMountCall[0] === "fp-agent" &&
+            firstMountCall[1] === fpTs1 &&
+            firstMountCall[2] === true &&
+            firstMountCall.length >= 4 &&
+            firstMountCall[3] !== undefined &&
+            firstMountCall[3] !== null,
+          JSON.stringify(firstMountCall),
+        );
+
+        noteRenderCalls.length = 0;
+        renderRow({
+          agentId: "fp-agent",
+          timestamp: fpTs2,
+          item: { data: { text: "step 1 -> step 2", phase: "streaming" } },
+        });
+        check(
+          "subsequent timestamp update on committed thinking row passes firstPaint=false to noteRender",
+          noteRenderCalls.length > 0 &&
+            noteRenderCalls.every(
+              (call) =>
+                call[0] === "fp-agent" &&
+                call[1] === fpTs2 &&
+                call[2] === false &&
+                call.length >= 4 &&
+                call[3] !== undefined &&
+                call[3] !== null,
+            ),
+          JSON.stringify(noteRenderCalls),
+        );
+        unmount();
+        resetNewestForTests("fp-agent");
       }
     } finally {
       Date.now = realDateNow;

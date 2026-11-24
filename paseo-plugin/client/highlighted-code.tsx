@@ -56,6 +56,17 @@ function appendTokenNodes(
   }
 }
 
+function tokensMatchLine(tokens: readonly CodeToken[], line: string): boolean {
+  let offset = 0;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const text = tokens[i].text;
+    if (text.length === 0) continue;
+    if (!line.startsWith(text, offset)) return false;
+    offset += text.length;
+  }
+  return offset === line.length;
+}
+
 export function HighlightedLine({
   line,
   mode,
@@ -65,7 +76,7 @@ export function HighlightedLine({
   tokens,
 }: HighlightedLineProps): ReactElement {
   const resolvedTokens = useMemo(
-    () => tokens ?? tokenizeLine(line, mode),
+    () => (tokens !== undefined && tokensMatchLine(tokens, line) ? tokens : tokenizeLine(line, mode)),
     [tokens, line, mode],
   );
   const children: ReactNode[] = [];

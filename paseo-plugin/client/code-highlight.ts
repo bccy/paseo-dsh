@@ -1042,3 +1042,66 @@ export function tokenizeCode(text: string, lang?: string): readonly (readonly Co
   }
   return result;
 }
+
+/**
+ * Tokenize an array of line records while preserving multi-line `/* ... *\/`
+ * block comment state across records.
+ *
+ * Unlike `tokenizeCode(lines.join("\n"), lang)`, a record containing embedded
+ * `\n` or `\r\n` breaks is split into sub-lines to advance lexer state and
+ * then re-merged into a single `CodeToken[]` (retaining exact newline
+ * separator tokens). Thus `result.length === lines.length` and
+ * `result[i].map((t) => t.text).join("") === lines[i]` hold for every input.
+ */
+export function tokenizeCodeLines(
+  lines: readonly string[],
+  lang?: string,
+): readonly (readonly CodeToken[])[] {
+  const mode = highlightModeFor(lang);
+  let totalChars = 0;
+  for (let i = 0; i < lines.length; i += 1) {
+    totalChars += lines[i].length;
+    if (totalChars > HIGHLIGHT_MAX_TOTAL_CHARS) break;
+  }
+  if (totalChars > HIGHLIGHT_MAX_TOTAL_CHARS || mode === "plain") {
+    return lines.map((line) => (line === "" ? [] : [{ kind: "plain", text: line }]));
+  }
+  const result: (readonly CodeToken[])[] = [];
+  let inBlockComment = false;
+  for (let i = 0; i < lines.length; i += 1) {
+    const entry = lines[i];
+    if (!entry.includes("\n")) {
+      const step = tokenizeLineWithState(entry, mode, inBlockComment);
+      result.push(step.tokens);
+      inBlockComment = step.inBlockComment;
+      continue;
+    }
+    const merged: MutableToken[] = [];
+    let start = 0;
+    while (start <= entry.length) {
+      const lfIdx = entry.indexOf("\n", start);
+      if (lfIdx === -1) {
+        const sub = entry.slice(start);
+        const step = tokenizeLineWithState(sub, mode, inBlockComment);
+        for (let j = 0; j < step.tokens.length; j += 1) {
+          pushToken(merged, step.tokens[j].kind, step.tokens[j].text);
+        }
+        inBlockComment = step.inBlockComment;
+        break;
+      }
+      const hasCr = lfIdx > start && entry.charCodeAt(lfIdx - 1) === 13;
+      const subEnd = hasCr ? lfIdx - 1 : lfIdx;
+      const sep = hasCr ? "\r\n" : "\n";
+      const sub = entry.slice(start, subEnd);
+      const step = tokenizeLineWithState(sub, mode, inBlockComment);
+      for (let j = 0; j < step.tokens.length; j += 1) {
+        pushToken(merged, step.tokens[j].kind, step.tokens[j].text);
+      }
+      inBlockComment = step.inBlockComment;
+      pushToken(merged, inBlockComment ? "comment" : "plain", sep);
+      start = lfIdx + 1;
+    }
+    result.push(merged);
+  }
+  return result;
+}

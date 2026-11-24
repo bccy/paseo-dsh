@@ -26,7 +26,7 @@
 import { useSettings, type PluginTimelineItemProps } from "@getpaseo/plugin/client";
 import { Icon, ScrollView, copyText } from "@getpaseo/plugin/client/react-native";
 import { ExternalLink } from "@getpaseo/plugin/client/ui";
-import { type ReactNode, useCallback, useMemo, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Image,
   Pressable,
@@ -45,7 +45,7 @@ import {
   timelineStyleSettings,
   type TimelineStyleValues,
 } from "../shared/settings";
-import { highlightModeFor, tokenizeCode, type CodeToken, type HighlightMode } from "./code-highlight";
+import { highlightModeFor, tokenizeCodeLines, type CodeToken, type HighlightMode } from "./code-highlight";
 import { HighlightedCode, HighlightedLine } from "./highlighted-code";
 import { ringColorFor } from "./jobs-popover-layout";
 import { shouldPulse, useRowPulse } from "./newest";
@@ -463,7 +463,7 @@ function ReadBlockView({
   const lang = data.lang !== "" ? data.lang : extensionOf(data.path);
   const mode = highlightModeFor(lang);
   const tokenLines: readonly (readonly CodeToken[])[] = useMemo(
-    () => tokenizeCode(data.lines.map((line) => line.text).join("\n"), lang),
+    () => tokenizeCodeLines(data.lines.map((line) => line.text), lang),
     [data.lines, lang],
   );
   // DSH says so when the tool returned a window of a longer file.
@@ -538,7 +538,7 @@ function DiffRows({
   colors: TokenColors;
 }) {
   const tokenLines: readonly (readonly CodeToken[])[] | null = useMemo(
-    () => (mode === "plain" ? null : tokenizeCode(rows.map((row) => row.text).join("\n"), lang)),
+    () => (mode === "plain" ? null : tokenizeCodeLines(rows.map((row) => row.text), lang)),
     [rows, mode, lang],
   );
   return (
@@ -1090,6 +1090,275 @@ function ToolFieldsView({
 }
 
 /* -------------------------------------------------------------------------- */
+/* Cross-turn callId generation tracking                                      */
+/* -------------------------------------------------------------------------- */
+
+interface ToolCallSignature {
+  name: string;
+  kind: ToolCallData["kind"];
+  detailSig: string;
+  /** True when summary/args can legitimately change between running and terminal (`goal`/`team`/mapped `generic`). */
+  flexibleDetail: boolean;
+}
+
+interface CallGenEntry {
+  gen: number;
+  /** Mounted React instance token currently owning this generation, or null when unmounted. */
+  liveToken: symbol | null;
+  status: ToolCallData["status"];
+  firstTs: number;
+  lastTs: number;
+  terminalTs: number;
+  signature: ToolCallSignature;
+}
+
+interface CallIdTrack {
+  entries: CallGenEntry[];
+  renderClaims: Map<symbol, number>;
+  nextGen: number;
+}
+
+interface BoundToolRow {
+  agentId: string;
+  callId: string;
+  gen: number;
+  rowKey: string;
+}
+
+const MAX_AGENTS = 200;
+const MAX_CALL_TRACK = 500;
+const MAX_GENS_PER_CALL = 32;
+
+const callTrackByAgent = new Map<string, Map<string, CallIdTrack>>();
+let claimCleanupScheduled = false;
+
+/** Reset module-level callId generation tracking state. Intended for offline tests. */
+export function resetToolRowIdentityForTests(): void {
+  callTrackByAgent.clear();
+  claimCleanupScheduled = false;
+}
+
+function scheduleRenderClaimCleanup(): void {
+  if (claimCleanupScheduled) return;
+  claimCleanupScheduled = true;
+  Promise.resolve().then(() => {
+    claimCleanupScheduled = false;
+    for (const [agentId, agentTracks] of callTrackByAgent) {
+      for (const [callId, track] of agentTracks) {
+        track.renderClaims.clear();
+        if (track.entries.length === 0 && track.nextGen === 0) {
+          agentTracks.delete(callId);
+        }
+      }
+      if (agentTracks.size === 0) {
+        callTrackByAgent.delete(agentId);
+      }
+    }
+  });
+}
+
+function toolCallSignature(data: ToolCallData): ToolCallSignature {
+  // Typed tools (terminal/diff/read/search/web) expose their invariant request
+  // subject (`command` / `filePath` / `query` / `url`) via `headline || summary`
+  // even when `metadata.description` only arrives on the completed snapshot.
+  const subject = data.headline || data.summary;
+  if (data.kind !== "generic") {
+    return {
+      name: data.name,
+      kind: data.kind,
+      detailSig: subject,
+      flexibleDetail: false,
+    };
+  }
+  // Generic cards whose summary/fields can be replaced by result mappers
+  // (`goal`, `team`, or `fields`-backed MCP/mapped tools) match on `(name, kind)`.
+  if (data.goal !== null || data.team !== null || data.fields !== null || data.failed) {
+    return {
+      name: data.name,
+      kind: data.kind,
+      detailSig: "",
+      flexibleDetail: true,
+    };
+  }
+  return {
+    name: data.name,
+    kind: data.kind,
+    detailSig: subject,
+    flexibleDetail: false,
+  };
+}
+
+function signaturesCompatible(a: ToolCallSignature, b: ToolCallSignature): boolean {
+  if (a.name !== b.name || a.kind !== b.kind) return false;
+  if (a.flexibleDetail || b.flexibleDetail) return true;
+  return a.detailSig === b.detailSig;
+}
+
+function getOrCreateAgentTracks(agentId: string): Map<string, CallIdTrack> {
+  let agentTracks = callTrackByAgent.get(agentId);
+  if (agentTracks !== undefined) return agentTracks;
+  if (callTrackByAgent.size >= MAX_AGENTS) {
+    const oldestAgent = callTrackByAgent.keys().next().value;
+    if (oldestAgent !== undefined) callTrackByAgent.delete(oldestAgent);
+  }
+  agentTracks = new Map<string, CallIdTrack>();
+  callTrackByAgent.set(agentId, agentTracks);
+  return agentTracks;
+}
+
+function getOrCreateCallTrack(agentId: string, callId: string): CallIdTrack {
+  const agentTracks = getOrCreateAgentTracks(agentId);
+  let track = agentTracks.get(callId);
+  if (track !== undefined) return track;
+  if (agentTracks.size >= MAX_CALL_TRACK) {
+    const oldestCallId = agentTracks.keys().next().value;
+    if (oldestCallId !== undefined) agentTracks.delete(oldestCallId);
+  }
+  track = {
+    entries: [],
+    renderClaims: new Map<symbol, number>(),
+    nextGen: 0,
+  };
+  agentTracks.set(callId, track);
+  return track;
+}
+
+function isGenBusy(track: CallIdTrack, gen: number, selfToken: symbol): boolean {
+  for (const entry of track.entries) {
+    if (entry.gen === gen && entry.liveToken !== null && entry.liveToken !== selfToken) {
+      return true;
+    }
+  }
+  for (const [claimToken, claimGen] of track.renderClaims) {
+    if (claimToken !== selfToken && claimGen === gen) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function getOrCreateGenEntry(
+  track: CallIdTrack,
+  gen: number,
+  status: ToolCallData["status"],
+  tsMs: number,
+  signature: ToolCallSignature,
+): CallGenEntry {
+  const existing = track.entries.find((entry) => entry.gen === gen);
+  if (existing !== undefined) return existing;
+  if (track.entries.length >= MAX_GENS_PER_CALL) {
+    const evictIndex = track.entries.findIndex((entry) => entry.liveToken === null);
+    track.entries.splice(evictIndex >= 0 ? evictIndex : 0, 1);
+  }
+  const entry: CallGenEntry = {
+    gen,
+    liveToken: null,
+    status,
+    firstTs: tsMs,
+    lastTs: tsMs,
+    terminalTs: status !== "running" && tsMs > 0 ? tsMs : 0,
+    signature,
+  };
+  track.entries.push(entry);
+  return entry;
+}
+
+function formatToolRowKey(callId: string, gen: number): string {
+  return gen === 0 ? `tool:${callId}` : `tool:${callId}#${gen}`;
+}
+
+function resolveToolCallGen(
+  agentId: string,
+  callId: string,
+  data: ToolCallData,
+  tsMs: number,
+  token: symbol,
+): number {
+  const existing = callTrackByAgent.get(agentId)?.get(callId);
+  const incomingSig = toolCallSignature(data);
+  const isTerminal = data.status !== "running";
+  let gen: number;
+
+  if (existing === undefined) {
+    gen = 0;
+  } else {
+    const claimed = existing.renderClaims.get(token);
+    if (claimed !== undefined) return claimed;
+
+    let maxClaimedGen = -1;
+    for (const claimGen of existing.renderClaims.values()) {
+      if (claimGen > maxClaimedGen) maxClaimedGen = claimGen;
+    }
+    const freshGen = Math.max(existing.nextGen, maxClaimedGen + 1);
+
+    let matchedGen: number | null = null;
+
+    // 1. Exact terminal-timestamp match on a free terminal generation: scrolling an
+    //    earlier completed row back into view keeps its original key even while a
+    //    newer turn reusing the same callId is still mounted.
+    if (isTerminal && tsMs > 0) {
+      for (let i = existing.entries.length - 1; i >= 0; i -= 1) {
+        const entry = existing.entries[i]!;
+        if (
+          entry.status !== "running" &&
+          entry.terminalTs === tsMs &&
+          !isGenBusy(existing, entry.gen, token) &&
+          signaturesCompatible(entry.signature, incomingSig)
+        ) {
+          matchedGen = entry.gen;
+          break;
+        }
+      }
+    }
+
+    // 2. Unmounted running generation with a compatible call signature: matches an
+    //    off-screen row that either returns still running or returns after completing/
+    //    failing off-screen — even when an older turn's row with the same callId is
+    //    still mounted. Incompatible signatures (a different call reusing callId)
+    //    fall through and get a fresh generation.
+    if (matchedGen === null) {
+      for (let i = existing.entries.length - 1; i >= 0; i -= 1) {
+        const entry = existing.entries[i]!;
+        const tsOrderOk = tsMs === 0 || entry.firstTs === 0 || tsMs >= entry.firstTs;
+        if (
+          entry.status === "running" &&
+          tsOrderOk &&
+          !isGenBusy(existing, entry.gen, token) &&
+          signaturesCompatible(entry.signature, incomingSig)
+        ) {
+          matchedGen = entry.gen;
+          break;
+        }
+      }
+    }
+
+    // 3. Fallback when timestamps are unavailable (`tsMs === 0`): reuse a free
+    //    timestampless terminal entry with a compatible signature.
+    if (matchedGen === null && isTerminal && tsMs === 0) {
+      for (let i = existing.entries.length - 1; i >= 0; i -= 1) {
+        const entry = existing.entries[i]!;
+        if (
+          entry.status !== "running" &&
+          entry.terminalTs === 0 &&
+          !isGenBusy(existing, entry.gen, token) &&
+          signaturesCompatible(entry.signature, incomingSig)
+        ) {
+          matchedGen = entry.gen;
+          break;
+        }
+      }
+    }
+
+    gen = matchedGen !== null ? matchedGen : freshGen;
+  }
+
+  const track = existing ?? getOrCreateCallTrack(agentId, callId);
+  track.renderClaims.set(token, gen);
+  scheduleRenderClaimCleanup();
+  return gen;
+}
+
+/* -------------------------------------------------------------------------- */
 /* Row                                                                        */
 /* -------------------------------------------------------------------------- */
 
@@ -1105,6 +1374,73 @@ export function InlineToolCall({
   const collapseBody = useCallback((event?: unknown) => {
     if (shouldCollapseOnBodyPress(event)) setExpanded(false);
   }, []);
+
+  const tsMs = normalizeTimestampMs(timestamp);
+  const tokenRef = useRef<symbol | null>(null);
+  if (tokenRef.current === null) tokenRef.current = Symbol("tool-row");
+  const token = tokenRef.current;
+  const boundRef = useRef<BoundToolRow | null>(null);
+
+  const incomingSig = toolCallSignature(data);
+  let boundGen: number | null = null;
+  let rowKey: string;
+  if (data.callId !== "" && agentId !== "") {
+    const bound = boundRef.current;
+    if (bound !== null && bound.agentId === agentId && bound.callId === data.callId) {
+      boundGen = bound.gen;
+      rowKey = bound.rowKey;
+    } else {
+      boundGen = resolveToolCallGen(agentId, data.callId, data, tsMs, token);
+      rowKey = formatToolRowKey(data.callId, boundGen);
+    }
+  } else {
+    rowKey = `tool:${String(tsMs)}:${data.name}:${data.summary}:${data.headline.slice(0, 64)}`;
+  }
+
+  useEffect(() => {
+    if (data.callId === "" || agentId === "" || boundGen === null) {
+      boundRef.current = null;
+      return;
+    }
+    const gen = boundGen;
+    boundRef.current = { agentId, callId: data.callId, gen, rowKey };
+    const track = getOrCreateCallTrack(agentId, data.callId);
+    const entry = getOrCreateGenEntry(track, gen, data.status, tsMs, incomingSig);
+    entry.liveToken = token;
+    track.renderClaims.delete(token);
+    track.nextGen = Math.max(track.nextGen, gen + 1);
+    return () => {
+      if (entry.liveToken === token) {
+        entry.liveToken = null;
+      }
+      track.renderClaims.delete(token);
+    };
+  }, [agentId, data.callId]);
+
+  const sigKey = `${incomingSig.name}\0${incomingSig.kind}\0${incomingSig.flexibleDetail ? "1" : "0"}\0${incomingSig.detailSig}`;
+  useEffect(() => {
+    if (data.callId === "" || agentId === "" || boundGen === null) return;
+    const track = getOrCreateCallTrack(agentId, data.callId);
+    const gen =
+      boundRef.current !== null &&
+      boundRef.current.agentId === agentId &&
+      boundRef.current.callId === data.callId
+        ? boundRef.current.gen
+        : boundGen;
+    const entry = getOrCreateGenEntry(track, gen, data.status, tsMs, incomingSig);
+    entry.status = data.status;
+    if (tsMs > 0) {
+      if (entry.firstTs === 0 || tsMs < entry.firstTs) entry.firstTs = tsMs;
+      if (tsMs > entry.lastTs) entry.lastTs = tsMs;
+      if (data.status !== "running") {
+        entry.terminalTs = tsMs;
+      }
+    }
+    if (!incomingSig.flexibleDetail || entry.signature.flexibleDetail) {
+      entry.signature = incomingSig;
+    }
+  }, [agentId, data.callId, data.status, tsMs, sigKey]);
+
   const hasBody = data.body !== "";
   // Expanding is only worth offering when the block below actually has
   // something in it — `hasDetail` is computed in the data layer.
@@ -1120,7 +1456,7 @@ export function InlineToolCall({
   const showSummary = headSummary !== "" && !(expanded && !data.titled && data.headline !== "");
   const compact = layout.compact;
   const iconSize = compact ? 14 : 16;
-  const running = shouldPulse(data.status, useRowPulse(agentId, timestamp));
+  const running = shouldPulse(data.status, useRowPulse(agentId, timestamp, rowKey));
   const iconStatus = resolveRowIconStatus(data.status, running);
   const stat = diffStat(data);
   const terminal = data.kind === "terminal";
@@ -1147,14 +1483,6 @@ export function InlineToolCall({
         : Object.prototype.hasOwnProperty.call(text.toolLabels, normalizedName)
           ? text.toolLabels[normalizedName]
           : (paseoMcpLabel(data.name) ?? data.label);
-
-  const tsMs = normalizeTimestampMs(timestamp);
-  const rawRowKey =
-    (item as { id?: string }).id ?? (item as { callId?: string }).callId;
-  const rowKey =
-    typeof rawRowKey === "string" && rawRowKey !== ""
-      ? rawRowKey
-      : `tool:${String(tsMs)}:${data.name}:${data.summary}:${data.headline.slice(0, 64)}`;
 
   const stream = useInkStreamReveal({
     agentId,

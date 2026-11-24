@@ -14,43 +14,52 @@
  * otherwise print the same sentence twice (`/compact · /compact`,
  * 「更新任务清单 · 更新任务清单」).
  *
- * Run (from paseo-plugin):
- *   npx tsc client/tool-call-data.ts client/tokens.ts client/paseo-mark.ts \
- *     --outDir .dbg --rootDir . --module node16 --moduleResolution node16 \
- *     --target ES2022 --skipLibCheck
- *   echo '{"type":"commonjs"}' > .dbg/package.json
- *   cp ../harness/tool-call-check.cjs .dbg/
- *   cd .dbg && node tool-call-check.cjs
+ * Run (from repo root):
+ *   node -e 'require("./harness/plugin-build.cjs").buildPlugin()'
+ *   PASEO_PLUGIN_BUILD=paseo-plugin/.dbg-harness node harness/tool-call-check.cjs
  *
- * `--module node16` is required, not cosmetic: `client/tool-call-data.ts` reads
- * the 0.12 `AgentMessage` type from the protocol package's ESM declarations, and
- * node16 is the resolution mode that honours its `exports` map while still
- * emitting CommonJS for this harness to `require`. The source carries the
- * matching `resolution-mode` attribute.
- *
- * Only the pure modules are compiled: the React renderer imports the host
- * runtime, which plain `node` resolution cannot see. `tokens.ts` and
- * `paseo-mark.ts` come along because `diffStat()` and the Paseo-mark fallback
- * are exactly the claims being checked (this script requires both directly, and
- * `tsc` only emits modules it was handed or that are imported transitively).
+ * `harness/plugin-build.cjs` compiles the full plugin to CommonJS (including
+ * client React components and runtime assets) so both data-layer assertions and
+ * runtime component checks run against the same build tree.
  */
 "use strict";
 
 const fs = require("node:fs");
+const Module = require("node:module");
 const path = require("node:path");
+
+/**
+ * Resolve the directory containing compiled `client/*.js` outputs.
+ *
+ * Supports both running a copied script inside a build directory (the
+ * `offline-checks.cjs` flow) and running directly from `harness/` with
+ * `PASEO_PLUGIN_BUILD=/path/to/build`.
+ */
+function resolveCompiledBase() {
+  if (fs.existsSync(path.join(__dirname, "client", "tool-call-data.js"))) {
+    return __dirname;
+  }
+  const envBuild = process.env.PASEO_PLUGIN_BUILD;
+  if (envBuild && fs.existsSync(path.join(envBuild, "client", "tool-call-data.js"))) {
+    return path.resolve(envBuild);
+  }
+  return __dirname;
+}
+
+const compiledBase = resolveCompiledBase();
 
 /**
  * Locate a repo source file from wherever this check runs. The documented
  * compile step copies the check into `paseo-plugin/.dbg` (one level below
- * `paseo-plugin`), but a scratch build dir such as `.tmp-test/<name>` sits one
- * level deeper; walking up finds the source either way instead of failing on
- * `__dirname/..`.
+ * `paseo-plugin`), a scratch build dir sits elsewhere, or the script runs
+ * directly from `harness/` (where `paseo-plugin/` is a sibling directory).
  */
-function findRepoFile(relative, levels = 4) {
+function findRepoFile(relative, levels = 6) {
   let dir = __dirname;
   for (let i = 0; i < levels; i += 1) {
-    const candidate = path.join(dir, relative);
-    if (fs.existsSync(candidate)) return candidate;
+    for (const candidate of [path.join(dir, relative), path.join(dir, "paseo-plugin", relative)]) {
+      if (fs.existsSync(candidate)) return candidate;
+    }
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
@@ -69,10 +78,10 @@ const {
   toolIcon,
   toolLabel,
   parseTeamResult,
-} = require("./client/tool-call-data.js");
-const { diffStat } = require("./client/tokens.js");
-const { allText, localeText, setLocale } = require("./client/locale.js");
-const { labelFor, rosterFromMetadata } = require("./client/team-roster.js");
+} = require(path.join(compiledBase, "client", "tool-call-data.js"));
+const { diffStat } = require(path.join(compiledBase, "client", "tokens.js"));
+const { allText, localeText, setLocale } = require(path.join(compiledBase, "client", "locale.js"));
+const { labelFor, rosterFromMetadata } = require(path.join(compiledBase, "client", "team-roster.js"));
 
 /**
  * Load a sibling harness module from wherever this check runs.
@@ -3116,6 +3125,30 @@ console.log("the renderer's schema and ToolCallData cannot drift apart");
     [...schemaKeys].sort(),
     [...dataKeys].sort(),
   );
+  check("the schema declares callId for stable rowKey forwarding", schemaKeys.includes("callId"), JSON.stringify(schemaKeys));
+  equal(
+    "toolCallData forwards string item.callId verbatim",
+    toolCallData(
+      { callId: "call_stable_42", name: "bash", status: "running", detail: { type: "shell", command: "ls" } },
+      "streaming",
+    ).callId,
+    "call_stable_42",
+  );
+  for (const [label, badCallId] of [
+    ["absent", undefined],
+    ["null", null],
+    ["number", 123],
+    ["object", { id: "x" }],
+  ]) {
+    equal(
+      `toolCallData normalizes ${label} item.callId to ""`,
+      toolCallData(
+        { callId: badCallId, name: "bash", status: "completed", detail: { type: "shell", command: "ls" } },
+        "complete",
+      ).callId,
+      "",
+    );
+  }
 
   // F5: the generic card's inner shape, compared against the data layer's own
   // runtime shapes. A key or enum member the schema omits is stripped before the
@@ -3324,14 +3357,24 @@ console.log("the renderer reads the state the data layer now carries");
     "found foldWindow or FOLD_LINES in tool-call.tsx",
   );
   const hasBoundedScrollView = (src) =>
-    elementsWithAttributes(src, ["nestedScrollEnabled", "testID"]).some(
+    elementsWithAttributes(src, ["style", "nestedScrollEnabled", "testID"]).some(
       (element) =>
         element.tag === "ScrollView" &&
+        mentions(attributeOf(element, "style").value, "expandedScroll") &&
         mentions(attributeOf(element, "testID").value, "SCROLL_BOX_TEST_ID"),
     );
-  check("ReadBlockView scrolls in a bounded ScrollView with SCROLL_BOX_TEST_ID", hasBoundedScrollView(readView));
-  check("DiffBlockView scrolls in a bounded ScrollView with SCROLL_BOX_TEST_ID", hasBoundedScrollView(diffView));
-  check("SearchBlockView scrolls in a bounded ScrollView with SCROLL_BOX_TEST_ID", hasBoundedScrollView(searchView));
+  check(
+    "ReadBlockView scrolls in a bounded ScrollView bound to styles.expandedScroll with SCROLL_BOX_TEST_ID",
+    hasBoundedScrollView(readView),
+  );
+  check(
+    "DiffBlockView scrolls in a bounded ScrollView bound to styles.expandedScroll with SCROLL_BOX_TEST_ID",
+    hasBoundedScrollView(diffView),
+  );
+  check(
+    "SearchBlockView scrolls in a bounded ScrollView bound to styles.expandedScroll with SCROLL_BOX_TEST_ID",
+    hasBoundedScrollView(searchView),
+  );
 
   check(
     "terminal command uses HighlightedCode (lang=\"shell\")",
@@ -3472,39 +3515,54 @@ console.log("the renderer reads the state the data layer now carries");
   );
 
   // Regression guards for P1/P2/P3 fixes:
-  // - P1-2: fallback rowKey includes normalized timestamp + tool identity so
-  //   same-millisecond parallel calls never collide;
-  // - P2-1: ReadBlockView and DiffRows tokenize the whole block via tokenizeCode + useMemo;
+  // - P1-2: rowKey prefers forwarded data.callId (`tool:${data.callId}`) and
+  //   removes dead casts on `item`, falling back to normalized timestamp + tool identity;
+  // - P2-1: ReadBlockView and DiffRows tokenize via tokenizeCodeLines + useMemo
+  //   and pass real per-record token expressions (not undefined) to HighlightedLine;
   // - P2-2: displayLabel guards toolLabels with Object.prototype.hasOwnProperty,
   //   normalizes exclusion checks, and falls back through paseoMcpLabel;
   // - P2-3: errorBlock and WebBlockView answer scroll inside bounded ScrollViews;
   // - P2-5: terminal CopyControl sits outside commandScroll and never shrinks;
   // - P3-4: team-card.tsx subscribes via useLocaleText() instead of localeText().
   check(
-    "InlineToolCall builds a non-colliding fallback rowKey when item id/callId is absent",
+    "InlineToolCall prefers data.callId for rowKey, removes dead item casts, and keeps non-colliding fallback",
     mentions(component, "normalizeTimestampMs") &&
+      !/item\s+as\s+\{\s*(?:id|callId)\?:/u.test(component) &&
+      /data\.callId\s*!==\s*""\s*&&\s*agentId\s*!==\s*""/.test(component) &&
+      mentions(component, "resolveToolCallGen") &&
+      mentions(component, "formatToolRowKey") &&
       /`tool:\$\{String\(tsMs\)\}:\$\{data\.name\}:\$\{data\.summary\}:\$\{data\.headline\.slice\(0,\s*64\)\}`/.test(
         component,
       ),
-    "missing stable fallback rowKey in InlineToolCall",
+    "InlineToolCall rowKey must prefer generation-tracked data.callId, drop dead item casts, and keep timestamp fallback",
+  );
+  const readHighlightEls = elementsWithAttributes(readView, ["line", "mode", "tokens"]).filter(
+    (element) => element.tag === "HighlightedLine",
   );
   check(
-    "ReadBlockView tokenizes the whole file via tokenizeCode + useMemo and passes tokens to HighlightedLine",
-    mentions(readView, "tokenizeCode") &&
+    "ReadBlockView tokenizes records via tokenizeCodeLines + useMemo and passes tokenLines[index] to HighlightedLine",
+    mentions(readView, "tokenizeCodeLines") &&
       mentions(readView, "useMemo") &&
-      elementsWithAttributes(readView, ["line", "mode", "tokens"]).some(
-        (element) => element.tag === "HighlightedLine",
+      readHighlightEls.some(
+        (element) => attributeOf(element, "tokens").value.replace(/\s+/g, "") === "tokenLines[index]",
       ),
-    "ReadBlockView does not pass whole-block tokens to HighlightedLine",
+    readHighlightEls.map((e) => `tokens={${attributeOf(e, "tokens").value}}`).join(" | ") ||
+      "ReadBlockView does not pass tokenLines[index] to HighlightedLine",
+  );
+  const diffHighlightEls = elementsWithAttributes(diffRows, ["line", "mode", "tokens"]).filter(
+    (element) => element.tag === "HighlightedLine",
   );
   check(
-    "DiffRows tokenizes the whole diff via tokenizeCode + useMemo and passes tokens to HighlightedLine",
-    mentions(diffRows, "tokenizeCode") &&
+    "DiffRows tokenizes records via tokenizeCodeLines + useMemo and passes non-empty tokenLines?.[index] to HighlightedLine",
+    mentions(diffRows, "tokenizeCodeLines") &&
       mentions(diffRows, "useMemo") &&
-      elementsWithAttributes(diffRows, ["line", "mode", "tokens"]).some(
-        (element) => element.tag === "HighlightedLine",
+      diffHighlightEls.some((element) =>
+        /^row\.text\s*===\s*""\s*\?\s*undefined\s*:\s*tokenLines\?\.\[index\]$/.test(
+          attributeOf(element, "tokens").value.trim(),
+        ),
       ),
-    "DiffRows does not pass whole-block tokens to HighlightedLine",
+    diffHighlightEls.map((e) => `tokens={${attributeOf(e, "tokens").value}}`).join(" | ") ||
+      "DiffRows does not pass row.text === \"\" ? undefined : tokenLines?.[index] to HighlightedLine",
   );
   check(
     "displayLabel guards toolLabels with hasOwnProperty, normalizes exclusions, and syncs paseoMcpLabel",
@@ -3581,7 +3639,7 @@ console.log("the renderer reads the state the data layer now carries");
 
 console.log("Paseo's own mark");
 {
-  const { PASEO_MARK_ICON } = require("./client/paseo-mark.js");
+  const { PASEO_MARK_ICON } = require(path.join(compiledBase, "client", "paseo-mark.js"));
   check("is a PNG data URI", PASEO_MARK_ICON.startsWith("data:image/png;base64,"));
   const bytes = Buffer.from(PASEO_MARK_ICON.slice("data:image/png;base64,".length), "base64");
   // Read the header rather than trusting the file: a truncated paste would still
@@ -3820,6 +3878,805 @@ console.log("tool failures: DSH's codes get words, unknown codes stay verbatim")
   );
   equal("…the code and class are locale-independent", `${en.errorCode}|${en.errorName}`, "APPROVAL_REJECTED|ApprovalError");
   setLocale(undefined);
+}
+
+console.log("runtime component checks (expandedMaxHeight, Read/HighlightedLine alignment & fallback, callId rowKey)");
+{
+  const toolCallJs = path.join(compiledBase, "client", "tool-call.js");
+  const highlightedCodeJs = path.join(compiledBase, "client", "highlighted-code.js");
+  const hasCompiledComponents = fs.existsSync(toolCallJs) && fs.existsSync(highlightedCodeJs);
+  check(
+    "compiled client/tool-call.js and client/highlighted-code.js exist for runtime checks",
+    hasCompiledComponents,
+    `compiledBase=${compiledBase}`,
+  );
+
+  if (hasCompiledComponents) {
+    let currentStyleSettings = {
+      rowMarginY: 2,
+      toolRowPaddingY: 0,
+      toolRowGap: 6,
+      toolRowMinHeight: 24,
+      commandMaxHeight: 160,
+      expandedMaxHeight: 312,
+    };
+    const capturedStreamRowKeys = [];
+    const capturedPulseRowKeys = [];
+    const stateStore = new Map();
+    const effectCleanups = new Map();
+    const effectDeps = new Map();
+    let pendingEffects = [];
+    let currentPath = "root";
+    let hookIndex = 0;
+
+    const sameDeps = (a, b) =>
+      Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => Object.is(v, b[i]));
+
+    function unmountPrefix(prefix) {
+      for (const key of Array.from(effectCleanups.keys())) {
+        if (key === prefix || key.startsWith(`${prefix}#`) || key.startsWith(`${prefix}/`)) {
+          const cleanup = effectCleanups.get(key);
+          effectCleanups.delete(key);
+          effectDeps.delete(key);
+          if (typeof cleanup === "function") cleanup();
+        }
+      }
+      for (const key of Array.from(stateStore.keys())) {
+        if (key === prefix || key.startsWith(`${prefix}#`) || key.startsWith(`${prefix}/`)) {
+          stateStore.delete(key);
+        }
+      }
+    }
+
+    function flushEffects() {
+      const queue = pendingEffects;
+      pendingEffects = [];
+      for (const { key, effect } of queue) {
+        const prevCleanup = effectCleanups.get(key);
+        if (typeof prevCleanup === "function") prevCleanup();
+        const nextCleanup = effect();
+        effectCleanups.set(key, typeof nextCleanup === "function" ? nextCleanup : undefined);
+      }
+    }
+
+    const reactStub = {
+      useState(initial) {
+        const key = `${currentPath}#${hookIndex}`;
+        hookIndex += 1;
+        if (!stateStore.has(key)) {
+          stateStore.set(key, typeof initial === "function" ? initial() : initial);
+        }
+        const setState = (next) => {
+          const prev = stateStore.get(key);
+          stateStore.set(key, typeof next === "function" ? next(prev) : next);
+        };
+        return [stateStore.get(key), setState];
+      },
+      useMemo(factory) {
+        return factory();
+      },
+      useCallback(fn) {
+        return fn;
+      },
+      useEffect(effect, deps) {
+        const key = `${currentPath}#${hookIndex}`;
+        hookIndex += 1;
+        const prev = effectDeps.get(key);
+        if (prev !== undefined && sameDeps(prev, deps)) return;
+        effectDeps.set(key, deps);
+        pendingEffects.push({ key, effect });
+      },
+      useRef(initial) {
+        const key = `${currentPath}#${hookIndex}`;
+        hookIndex += 1;
+        if (!stateStore.has(key)) {
+          stateStore.set(key, { current: initial });
+        }
+        return stateStore.get(key);
+      },
+      useSyncExternalStore(_subscribe, getSnapshot) {
+        return getSnapshot();
+      },
+    };
+    const jsxRuntimeStub = {
+      jsx: (type, props, key) => ({ type, props: props ?? {}, key }),
+      jsxs: (type, props, key) => ({ type, props: props ?? {}, key }),
+      Fragment: "Fragment",
+    };
+    const rnStub = {
+      Image: "Image",
+      Pressable: "Pressable",
+      ScrollView: "ScrollView",
+      Text: "Text",
+      View: "View",
+      StyleSheet: {
+        hairlineWidth: 1,
+        create: (styles) => styles,
+      },
+      useWindowDimensions: () => ({ width: 1024, height: 800 }),
+      Platform: { OS: "web", select: (options) => options.web ?? options.default },
+    };
+    const SCROLL_BOX_TEST_ID_STUB = "dsh-scroll-box";
+
+    const stubs = {
+      react: () => reactStub,
+      "react/jsx-runtime": () => jsxRuntimeStub,
+      "react-native": () => rnStub,
+      "@getpaseo/plugin": () => ({ defineSettings: (config) => config }),
+      "@getpaseo/plugin/client": () => ({
+        useSettings: () => ({ status: "ready", values: currentStyleSettings }),
+      }),
+      "@getpaseo/plugin/client/react-native": () => ({
+        Icon: "Icon",
+        ScrollView: "ScrollView",
+        copyText: () => {},
+      }),
+      "@getpaseo/plugin/client/ui": () => ({
+        ExternalLink: "ExternalLink",
+      }),
+      "./newest": () => ({
+        shouldPulse: (status) => status === "running",
+        useRowPulse: (_agentId, _timestamp, rowKey) => {
+          capturedPulseRowKeys.push(rowKey);
+          return true;
+        },
+      }),
+      "./row-entrance": () => ({
+        RowEntrance: "RowEntrance",
+        SCROLL_BOX_TEST_ID: SCROLL_BOX_TEST_ID_STUB,
+        renderInkTrailText: (text) => text,
+        shouldCollapseOnBodyPress: () => false,
+        useInkStreamReveal: (opts) => {
+          capturedStreamRowKeys.push(opts.rowKey);
+          return { labelProgress: 1, summaryProgress: 1, showSeparator: true, showStat: true };
+        },
+      }),
+      "./row-status-icon": () => ({
+        RowStatusIcon: "RowStatusIcon",
+        resolveRowIconStatus: (status) => status,
+      }),
+      "./team-card": () => ({ TeamBlockView: "TeamBlockView" }),
+      "./text-shimmer": () => ({
+        TextShimmer: ({ children }) => (typeof children === "function" ? children(null) : children),
+      }),
+    };
+
+    const originalLoad = Module._load;
+    const prevCacheKeys = new Set(Object.keys(require.cache));
+    Module._load = function load(request, parent, isMain) {
+      const stub = stubs[request];
+      if (stub !== undefined) return stub();
+      return originalLoad.call(this, request, parent, isMain);
+    };
+
+    let InlineToolCall;
+    let resetToolRowIdentityForTests;
+    let HighlightedLine;
+    try {
+      // Load fresh copies against our stubs without polluting cached modules.
+      delete require.cache[require.resolve(highlightedCodeJs)];
+      delete require.cache[require.resolve(toolCallJs)];
+      ({ HighlightedLine } = require(highlightedCodeJs));
+      ({ InlineToolCall, resetToolRowIdentityForTests } = require(toolCallJs));
+    } finally {
+      Module._load = originalLoad;
+      for (const key of Object.keys(require.cache)) {
+        if (!prevCacheKeys.has(key)) delete require.cache[key];
+      }
+    }
+
+    const COLORS = {
+      surface0: "#111111",
+      surface1: "#1a1a1a",
+      surface2: "#242424",
+      border: "#333333",
+      foreground: "tok:fg",
+      foregroundMuted: "tok:muted",
+      accent: "tok:accent",
+      statusSuccess: "tok:success",
+      statusWarning: "tok:warning",
+      statusDanger: "tok:danger",
+    };
+
+    function expandNode(node, nodePath = "root") {
+      if (node === null || node === undefined || typeof node !== "object") return node;
+      if (Array.isArray(node)) {
+        return node.map((child, idx) => expandNode(child, `${nodePath}[${idx}]`));
+      }
+      if (typeof node.type === "function") {
+        const prevPath = currentPath;
+        const prevHook = hookIndex;
+        currentPath = `${nodePath}/${node.type.name || "Fn"}`;
+        hookIndex = 0;
+        let rendered;
+        try {
+          rendered = node.type(node.props ?? {});
+        } finally {
+          currentPath = prevPath;
+          hookIndex = prevHook;
+        }
+        return expandNode(rendered, currentPath);
+      }
+      const nextProps = { ...(node.props ?? {}) };
+      if ("children" in nextProps) {
+        nextProps.children = expandNode(nextProps.children, `${nodePath}/${String(node.type)}`);
+      }
+      return { ...node, props: nextProps };
+    }
+
+    function flattenStyle(style) {
+      if (style === null || style === undefined || typeof style !== "object") return {};
+      if (Array.isArray(style)) {
+        return style.reduce((acc, entry) => Object.assign(acc, flattenStyle(entry)), {});
+      }
+      return { ...style };
+    }
+
+    function findAll(node, predicate, out = []) {
+      if (node === null || node === undefined || typeof node !== "object") return out;
+      if (Array.isArray(node)) {
+        for (const child of node) findAll(child, predicate, out);
+        return out;
+      }
+      if (predicate(node)) out.push(node);
+      if (node.props && "children" in node.props) findAll(node.props.children, predicate, out);
+      return out;
+    }
+
+    function extractText(node) {
+      if (node === null || node === undefined || typeof node === "boolean") return "";
+      if (typeof node === "string" || typeof node === "number") return String(node);
+      if (Array.isArray(node)) return node.map(extractText).join("");
+      if (typeof node === "object" && node.props && "children" in node.props) {
+        return extractText(node.props.children);
+      }
+      return "";
+    }
+
+    function renderInlineToolCall(
+      data,
+      {
+        timestamp = 1700000000000,
+        expand = false,
+        agentId = "agent-runtime-test",
+        mountKey = "root",
+        keepMounted = false,
+      } = {},
+    ) {
+      if (!keepMounted) unmountPrefix(mountKey);
+      const props = {
+        theme: { colors: COLORS },
+        layout: { compact: false },
+        item: { data },
+        agentId,
+        timestamp,
+      };
+      const collapsedTree = expandNode({ type: InlineToolCall, props }, mountKey);
+      flushEffects();
+      if (!expand) return collapsedTree;
+      const headPressable = findAll(
+        collapsedTree,
+        (el) => el.type === "Pressable" && el.props.accessibilityRole === "button",
+      )[0];
+      if (headPressable && typeof headPressable.props.onPress === "function") {
+        headPressable.props.onPress();
+      }
+      const expandedTree = expandNode({ type: InlineToolCall, props }, mountKey);
+      flushEffects();
+      return expandedTree;
+    }
+
+    // 1. Changing expandedMaxHeight updates styles.expandedScroll.maxHeight on Read, Diff, and Search ScrollViews.
+    const readData = toolCallData(
+      {
+        callId: "call-read-1",
+        name: "read",
+        status: "completed",
+        detail: { type: "read", filePath: "/repo/sample.ts", content: "const x = 1;\nconst y = 2;" },
+        metadata: {
+          presentationMeta: {
+            path: "/repo/sample.ts",
+            lang: "ts",
+            totalLines: 2,
+            lines: [
+              { number: 1, text: "const x = 1;" },
+              { number: 2, text: "const y = 2;" },
+            ],
+          },
+        },
+      },
+      "complete",
+    );
+    const diffData = toolCallData(
+      {
+        callId: "call-diff-1",
+        name: "edit",
+        status: "completed",
+        detail: { type: "edit", filePath: "/repo/sample.ts", oldString: "const a = 1;", newString: "const a = 2;" },
+        metadata: {
+          presentationMeta: {
+            path: "/repo/sample.ts",
+            diffs: [
+              {
+                path: "/repo/sample.ts",
+                oldText: "const a = 1;\n",
+                newText: "const a = 2;\n",
+              },
+            ],
+          },
+        },
+      },
+      "complete",
+    );
+    const searchData = toolCallData(
+      {
+        callId: "call-search-1",
+        name: "grep",
+        status: "completed",
+        detail: { type: "search", query: "foo", content: "a.ts:1:foo" },
+        metadata: {
+          presentationMeta: {
+            shape: "paths",
+            paths: ["/repo/a.ts", "/repo/b.ts"],
+            total: 2,
+            truncated: false,
+          },
+        },
+      },
+      "complete",
+    );
+
+    check(
+      "readData fixture produces structured read block with non-empty lines",
+      readData.read !== null && readData.read.lines.length > 0,
+      `read=${JSON.stringify(readData.read)}`,
+    );
+    check(
+      "diffData fixture produces structured diffBlock with non-empty rows (not plain fallback)",
+      diffData.diffBlock !== null && diffData.diffBlock.rows.length > 0,
+      `diffBlock=${JSON.stringify(diffData.diffBlock)}`,
+    );
+    check(
+      "searchData fixture produces structured search block with non-empty paths",
+      searchData.search !== null && searchData.search.paths.length > 0,
+      `search=${JSON.stringify(searchData.search)}`,
+    );
+
+    for (const [blockName, sampleData] of [
+      ["ReadBlockView", readData],
+      ["DiffBlockView", diffData],
+      ["SearchBlockView", searchData],
+    ]) {
+      currentStyleSettings = { ...currentStyleSettings, expandedMaxHeight: 312 };
+      const treeA = renderInlineToolCall(sampleData, { expand: true });
+      if (blockName === "DiffBlockView") {
+        const texts = findAll(treeA, (el) => el.type === "Text").map((el) => extractText(el));
+        const hasDiffLangHead = texts.includes("diff");
+        const hasDiffTitleHead = texts.includes("/repo/sample.ts");
+        const hasCopyControl = findAll(
+          treeA,
+          (el) => el.type === "Pressable" && el.props.accessibilityRole === "button",
+        ).length >= 2;
+        check(
+          "DiffBlockView expanded tree actually renders structured CardHead(lang='diff') rather than plain diff fallback",
+          hasDiffLangHead && hasDiffTitleHead && hasCopyControl,
+          `texts=${JSON.stringify(texts)}`,
+        );
+      }
+      const scrollsA = findAll(
+        treeA,
+        (el) => el.type === "ScrollView" && el.props.testID === SCROLL_BOX_TEST_ID_STUB,
+      );
+      const maxHeightsA = scrollsA.map((el) => flattenStyle(el.props.style).maxHeight);
+      check(
+        `${blockName} ScrollView applies expandedMaxHeight=312`,
+        maxHeightsA.includes(312),
+        `got maxHeights=${JSON.stringify(maxHeightsA)}`,
+      );
+
+      currentStyleSettings = { ...currentStyleSettings, expandedMaxHeight: 528 };
+      const treeB = renderInlineToolCall(sampleData, { expand: true });
+      const scrollsB = findAll(
+        treeB,
+        (el) => el.type === "ScrollView" && el.props.testID === SCROLL_BOX_TEST_ID_STUB,
+      );
+      const maxHeightsB = scrollsB.map((el) => flattenStyle(el.props.style).maxHeight);
+      check(
+        `${blockName} ScrollView updates maxHeight when expandedMaxHeight changes to 528`,
+        maxHeightsB.includes(528) && !maxHeightsB.includes(312),
+        `got maxHeights=${JSON.stringify(maxHeightsB)}`,
+      );
+    }
+
+    // 2. ReadBlockView + HighlightedLine keep every record aligned without dropping lines when a record embeds \n / \r\n.
+    const multiLineReadData = {
+      ...readData,
+      read: {
+        path: "/repo/multiline.ts",
+        lang: "ts",
+        totalLines: 3,
+        text: "/* block\nstill comment\nclose */ const a = 1;\r\nconst b = 2;\nreturn a + b;",
+        lines: [
+          { number: 1, text: "/* block\nstill comment" },
+          { number: 2, text: "close */ const a = 1;\r\nconst b = 2;" },
+          { number: 3, text: "return a + b;" },
+        ],
+      },
+    };
+    const multiTree = renderInlineToolCall(multiLineReadData, { expand: true });
+    const readLineTexts = findAll(
+      multiTree,
+      (el) => el.type === "Text" && el.props.selectable === true,
+    ).map((el) => ({
+      text: extractText(el),
+      spans: findAll(el, (child) => child !== el && child.type === "Text").map((span) => ({
+        text: extractText(span),
+        color: flattenStyle(span.props.style).color,
+      })),
+    }));
+    equal("ReadBlockView renders all 3 records including embedded newlines", readLineTexts.length, 3);
+    equal("ReadBlockView record 0 text is exact and unshifted", readLineTexts[0]?.text, "/* block\nstill comment");
+    equal(
+      "ReadBlockView record 1 text keeps embedded \\r\\n and does not shift",
+      readLineTexts[1]?.text,
+      "close */ const a = 1;\r\nconst b = 2;",
+    );
+    equal("ReadBlockView record 2 text is not dropped or shifted", readLineTexts[2]?.text, "return a + b;");
+    check(
+      "ReadBlockView record 0 highlights block comment with comment color",
+      readLineTexts[0]?.spans.some((s) => s.text === "/* block\nstill comment" && s.color === COLORS.foregroundMuted),
+      JSON.stringify(readLineTexts[0]),
+    );
+    check(
+      "ReadBlockView record 1 highlights keyword after closing cross-record comment",
+      readLineTexts[1]?.spans.some((s) => s.text === "const" && s.color === COLORS.accent),
+      JSON.stringify(readLineTexts[1]),
+    );
+    check(
+      "ReadBlockView record 2 highlights return keyword",
+      readLineTexts[2]?.spans.some((s) => s.text === "return" && s.color === COLORS.accent),
+      JSON.stringify(readLineTexts[2]),
+    );
+
+    // 3. HighlightedLine safely falls back to tokenizeLine when passed mismatched tokens,
+    //    and preserves matching cross-line tokens when they agree with `line`.
+    const mismatchTree = expandNode({
+      type: HighlightedLine,
+      props: {
+        line: "const ok = 42;",
+        mode: "code",
+        tokens: [{ kind: "comment", text: "STALE_WRONG_LINE" }],
+        colors: COLORS,
+        baseStyle: {},
+        selectable: true,
+      },
+    });
+    equal("HighlightedLine falls back to line text on mismatched tokens", extractText(mismatchTree), "const ok = 42;");
+    check(
+      "HighlightedLine fallback re-tokenizes keyword correctly",
+      findAll(mismatchTree, (el) => el !== mismatchTree && el.type === "Text").some(
+        (span) => extractText(span) === "const" && flattenStyle(span.props.style).color === COLORS.accent,
+      ),
+      JSON.stringify(mismatchTree),
+    );
+
+    const emptyMismatchTree = expandNode({
+      type: HighlightedLine,
+      props: {
+        line: "return 1;",
+        mode: "code",
+        tokens: [],
+        colors: COLORS,
+        baseStyle: {},
+        selectable: true,
+      },
+    });
+    equal("HighlightedLine falls back when given empty tokens for non-empty line", extractText(emptyMismatchTree), "return 1;");
+
+    const matchingCrossLineTree = expandNode({
+      type: HighlightedLine,
+      props: {
+        line: "const insideBlock = 1;",
+        mode: "code",
+        tokens: [{ kind: "comment", text: "const insideBlock = 1;" }],
+        colors: COLORS,
+        baseStyle: {},
+        selectable: true,
+      },
+    });
+    equal("HighlightedLine preserves matching cross-line tokens text", extractText(matchingCrossLineTree), "const insideBlock = 1;");
+    check(
+      "HighlightedLine preserves matching cross-line comment styling without false fallback",
+      findAll(matchingCrossLineTree, (el) => el !== matchingCrossLineTree && el.type === "Text").some(
+        (span) => extractText(span) === "const insideBlock = 1;" && flattenStyle(span.props.style).color === COLORS.foregroundMuted,
+      ),
+      JSON.stringify(matchingCrossLineTree),
+    );
+
+    // 4. InlineToolCall rowKey uses forwarded data.callId across running -> completed transitions
+    //    and falls back cleanly when callId is empty.
+    capturedStreamRowKeys.length = 0;
+    const runningCall = toolCallData(
+      { callId: "call-offscreen-99", name: "bash", status: "running", detail: { type: "shell", command: "npm test" } },
+      "streaming",
+    );
+    const completedCall = toolCallData(
+      {
+        callId: "call-offscreen-99",
+        name: "bash",
+        status: "completed",
+        detail: { type: "shell", command: "npm test", output: "all passed" },
+        metadata: { description: "Run tests" },
+      },
+      "complete",
+    );
+    const runningTree = renderInlineToolCall(runningCall, { timestamp: 1700000001000 });
+    const completedTree = renderInlineToolCall(completedCall, { timestamp: 1700000005000 });
+    equal("InlineToolCall running rowKey uses data.callId", runningTree.props.rowKey, "tool:call-offscreen-99");
+    equal("InlineToolCall completed rowKey stays identical across off-screen transition", completedTree.props.rowKey, "tool:call-offscreen-99");
+    equal(
+      "useInkStreamReveal receives the same stable callId rowKey on both renders",
+      capturedStreamRowKeys.slice(-2),
+      ["tool:call-offscreen-99", "tool:call-offscreen-99"],
+    );
+
+    const noCallIdData = toolCallData(
+      { name: "bash", status: "completed", detail: { type: "shell", command: "echo hi" } },
+      "complete",
+    );
+    const fallbackTree = renderInlineToolCall(noCallIdData, { timestamp: 1700000009000 });
+    equal(
+      "InlineToolCall falls back to timestamp+identity rowKey when callId is empty",
+      fallbackTree.props.rowKey,
+      `tool:1700000009000:${noCallIdData.name}:${noCallIdData.summary}:${noCallIdData.headline.slice(0, 64)}`,
+    );
+
+    // 5. Cross-turn callId reuse generation tracking:
+    //    - concurrent on-screen rows sharing a callId get distinct generations;
+    //    - terminal row unmounted then reused in a later turn advances generation;
+    //    - running row unmounted off-screen and remounted completed reuses the same key.
+    unmountPrefix("root");
+    resetToolRowIdentityForTests();
+    capturedStreamRowKeys.length = 0;
+    capturedPulseRowKeys.length = 0;
+
+    // 5a. Same-screen Turn 1 running + Turn 2 reusing the exact same callId -> two distinct rowKeys.
+    const sameScreenRun1 = toolCallData(
+      { callId: "call-reuse-1", name: "bash", status: "running", detail: { type: "shell", command: "echo turn1" } },
+      "streaming",
+    );
+    const sameScreenRun2 = toolCallData(
+      { callId: "call-reuse-1", name: "bash", status: "running", detail: { type: "shell", command: "echo turn2" } },
+      "streaming",
+    );
+    const turn1Live = renderInlineToolCall(sameScreenRun1, {
+      agentId: "agent-reuse-a",
+      mountKey: "reuse-a-turn1",
+      keepMounted: true,
+      timestamp: 1700000100000,
+    });
+    const turn2Live = renderInlineToolCall(sameScreenRun2, {
+      agentId: "agent-reuse-a",
+      mountKey: "reuse-a-turn2",
+      keepMounted: true,
+      timestamp: 1700000200000,
+    });
+    equal("same-screen Turn 1 gets base generation rowKey", turn1Live.props.rowKey, "tool:call-reuse-1");
+    equal("same-screen Turn 2 reusing callId gets next generation rowKey", turn2Live.props.rowKey, "tool:call-reuse-1#1");
+    check(
+      "same-screen Turn 1 and Turn 2 never collide on rowKey and forward distinct keys to useRowPulse",
+      turn1Live.props.rowKey !== turn2Live.props.rowKey &&
+        capturedPulseRowKeys.slice(-2)[0] === "tool:call-reuse-1" &&
+        capturedPulseRowKeys.slice(-2)[1] === "tool:call-reuse-1#1",
+      JSON.stringify(capturedPulseRowKeys.slice(-2)),
+    );
+    unmountPrefix("reuse-a-turn1");
+    unmountPrefix("reuse-a-turn2");
+
+    // 5b. Turn 1 reaches terminal and unmounts -> Turn 2 reuses same callId -> new generation rowKey.
+    const turn1Done = toolCallData(
+      {
+        callId: "call-reuse-2",
+        name: "bash",
+        status: "completed",
+        detail: { type: "shell", command: "echo done1", output: "done1" },
+      },
+      "complete",
+    );
+    const turn2Start = toolCallData(
+      { callId: "call-reuse-2", name: "bash", status: "running", detail: { type: "shell", command: "echo start2" } },
+      "streaming",
+    );
+    const turn1DoneTree = renderInlineToolCall(turn1Done, {
+      agentId: "agent-reuse-b",
+      mountKey: "reuse-b-turn1",
+      timestamp: 1700000300000,
+    });
+    unmountPrefix("reuse-b-turn1");
+    const turn2StartTree = renderInlineToolCall(turn2Start, {
+      agentId: "agent-reuse-b",
+      mountKey: "reuse-b-turn2",
+      timestamp: 1700000400000,
+    });
+    equal("terminal Turn 1 gets base generation rowKey", turn1DoneTree.props.rowKey, "tool:call-reuse-2");
+    equal("Turn 2 reusing callId after Turn 1 terminal unmount gets new generation", turn2StartTree.props.rowKey, "tool:call-reuse-2#1");
+    unmountPrefix("reuse-b-turn2");
+
+    // 5c. Turn 1 running unmounts off-screen, completes off-screen, scrolls back -> reuses original rowKey.
+    const offscreenRun = toolCallData(
+      { callId: "call-reuse-3", name: "bash", status: "running", detail: { type: "shell", command: "sleep 1" } },
+      "streaming",
+    );
+    const offscreenDone = toolCallData(
+      {
+        callId: "call-reuse-3",
+        name: "bash",
+        status: "completed",
+        detail: { type: "shell", command: "sleep 1", output: "ok" },
+      },
+      "complete",
+    );
+    const offscreenRunTree = renderInlineToolCall(offscreenRun, {
+      agentId: "agent-reuse-c",
+      mountKey: "reuse-c-1",
+      timestamp: 1700000500000,
+    });
+    unmountPrefix("reuse-c-1");
+    const offscreenDoneTree = renderInlineToolCall(offscreenDone, {
+      agentId: "agent-reuse-c",
+      mountKey: "reuse-c-2",
+      timestamp: 1700000505000,
+    });
+    equal("off-screen running row gets base generation rowKey", offscreenRunTree.props.rowKey, "tool:call-reuse-3");
+    equal(
+      "off-screen running row scrolled back after completion reuses exact original rowKey",
+      offscreenDoneTree.props.rowKey,
+      "tool:call-reuse-3",
+    );
+    unmountPrefix("reuse-c-2");
+
+    // 5d. Turn 1 completed stays mounted while Turn 2 running unmounts and fails off-screen:
+    //     scrolling Turn 2 back in must match Turn 2's unmounted running generation (#1),
+    //     not allocate a new generation (#2) that would replay entrance with an empty failure frame.
+    const reuse4Turn1Done = toolCallData(
+      {
+        callId: "call-reuse-4",
+        name: "bash",
+        status: "completed",
+        detail: { type: "shell", command: "echo old-turn", output: "old" },
+      },
+      "complete",
+    );
+    const reuse4Turn2Run = toolCallData(
+      { callId: "call-reuse-4", name: "bash", status: "running", detail: { type: "shell", command: "echo new-turn" } },
+      "streaming",
+    );
+    const reuse4Turn2Fail = toolCallData(
+      {
+        callId: "call-reuse-4",
+        name: "bash",
+        status: "failed",
+        detail: { type: "shell", command: "echo new-turn" },
+        error: { message: "command exited 1" },
+      },
+      "complete",
+    );
+    const reuse4Turn1Tree = renderInlineToolCall(reuse4Turn1Done, {
+      agentId: "agent-reuse-d",
+      mountKey: "reuse-d-turn1",
+      keepMounted: true,
+      timestamp: 1700000600000,
+    });
+    const reuse4Turn2RunTree = renderInlineToolCall(reuse4Turn2Run, {
+      agentId: "agent-reuse-d",
+      mountKey: "reuse-d-turn2-run",
+      keepMounted: true,
+      timestamp: 1700000610000,
+    });
+    // Turn 2 scrolls off-screen while Turn 1 remains mounted.
+    unmountPrefix("reuse-d-turn2-run");
+    const reuse4Turn2FailTree = renderInlineToolCall(reuse4Turn2Fail, {
+      agentId: "agent-reuse-d",
+      mountKey: "reuse-d-turn2-fail",
+      keepMounted: true,
+      timestamp: 1700000615000,
+    });
+    equal("Turn 1 mounted completed row keeps base generation", reuse4Turn1Tree.props.rowKey, "tool:call-reuse-4");
+    equal("Turn 2 running row alongside mounted Turn 1 gets #1", reuse4Turn2RunTree.props.rowKey, "tool:call-reuse-4#1");
+    equal(
+      "Turn 2 failed off-screen and scrolled back while Turn 1 stays mounted matches #1 instead of allocating #2",
+      reuse4Turn2FailTree.props.rowKey,
+      "tool:call-reuse-4#1",
+    );
+    unmountPrefix("reuse-d-turn1");
+    unmountPrefix("reuse-d-turn2-fail");
+
+    // 5e. Turn 1 completed mounts & unmounts -> Turn 2 mounts and stays mounted ->
+    //     Turn 1 scrolls back into view: must reclaim its original base key (not #2).
+    const reuse5Turn1 = toolCallData(
+      {
+        callId: "call-reuse-5",
+        name: "bash",
+        status: "completed",
+        detail: { type: "shell", command: "echo first", output: "1" },
+      },
+      "complete",
+    );
+    const reuse5Turn2 = toolCallData(
+      {
+        callId: "call-reuse-5",
+        name: "bash",
+        status: "completed",
+        detail: { type: "shell", command: "echo second", output: "2" },
+      },
+      "complete",
+    );
+    const reuse5Turn1Initial = renderInlineToolCall(reuse5Turn1, {
+      agentId: "agent-reuse-e",
+      mountKey: "reuse-e-turn1-a",
+      keepMounted: true,
+      timestamp: 1700000700000,
+    });
+    unmountPrefix("reuse-e-turn1-a");
+    const reuse5Turn2Live = renderInlineToolCall(reuse5Turn2, {
+      agentId: "agent-reuse-e",
+      mountKey: "reuse-e-turn2",
+      keepMounted: true,
+      timestamp: 1700000710000,
+    });
+    const reuse5Turn1Returned = renderInlineToolCall(reuse5Turn1, {
+      agentId: "agent-reuse-e",
+      mountKey: "reuse-e-turn1-b",
+      keepMounted: true,
+      timestamp: 1700000700000,
+    });
+    equal("initial completed Turn 1 gets base key", reuse5Turn1Initial.props.rowKey, "tool:call-reuse-5");
+    equal("mounted Turn 2 reusing callId gets #1", reuse5Turn2Live.props.rowKey, "tool:call-reuse-5#1");
+    equal(
+      "old completed Turn 1 scrolling back while Turn 2 is mounted keeps original base key",
+      reuse5Turn1Returned.props.rowKey,
+      "tool:call-reuse-5",
+    );
+    unmountPrefix("reuse-e-turn2");
+    unmountPrefix("reuse-e-turn1-b");
+
+    // 5f. Turn 1 running unmounts and completes off-screen; Turn 2 reuses callId for a
+    //     different call and first renders already completed -> must get a fresh generation (#1).
+    const reuse6Turn1Run = toolCallData(
+      { callId: "call-reuse-6", name: "bash", status: "running", detail: { type: "shell", command: "echo turn1" } },
+      "streaming",
+    );
+    const reuse6Turn2Done = toolCallData(
+      {
+        callId: "call-reuse-6",
+        name: "bash",
+        status: "completed",
+        detail: { type: "shell", command: "echo turn2", output: "done2" },
+      },
+      "complete",
+    );
+    const reuse6Turn1Tree = renderInlineToolCall(reuse6Turn1Run, {
+      agentId: "agent-reuse-f",
+      mountKey: "reuse-f-turn1",
+      keepMounted: true,
+      timestamp: 1700000800000,
+    });
+    unmountPrefix("reuse-f-turn1");
+    const reuse6Turn2Tree = renderInlineToolCall(reuse6Turn2Done, {
+      agentId: "agent-reuse-f",
+      mountKey: "reuse-f-turn2",
+      keepMounted: true,
+      timestamp: 1700000820000,
+    });
+    equal("Turn 1 running row gets base key", reuse6Turn1Tree.props.rowKey, "tool:call-reuse-6");
+    equal(
+      "Turn 2 reusing callId with a different command and first rendering completed gets #1",
+      reuse6Turn2Tree.props.rowKey,
+      "tool:call-reuse-6#1",
+    );
+    unmountPrefix("reuse-f-turn2");
+    resetToolRowIdentityForTests();
+  }
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

@@ -33,7 +33,7 @@
  *
  * @module dsh-paseo/client/newest
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 /** How long the newest row keeps pulsing after it commits. */
 export const PULSE_MS = 6000;
@@ -60,8 +60,6 @@ interface AgentRows {
    * live activity (set by the first-pass rule in `flush`).
    */
   replayUntil: number;
-  /** Whether a render pass that painted at least one row has been folded in. */
-  sawFirstPass: boolean;
 }
 
 /** One render pass's running maximum, plus the rows it painted for the first time. */
@@ -69,11 +67,29 @@ interface PendingPass {
   at: number;
   /** Distinct timestamps of first-paint calls in this pass; null once none are new. */
   fresh: Set<number> | null;
+  /** Distinct row identities supplied by callers for StrictMode-safe deduplication. */
+  freshIdentities: Set<unknown> | null;
+  /** Count of fresh first-paint calls without an explicit identity (legacy compatibility). */
+  anonymousFreshCount: number;
+}
+
+/** Per-agent render/commit batch tracker for entrance & stream-reveal gating. */
+interface MountBatch {
+  /** Distinct row keys attempting a first mount in the current render pass. */
+  keys: Set<string>;
+  /** Once the first commit effect runs, freeze batch classification & decisions. */
+  sealed: boolean;
+  /** Whether this render/commit pass mounted >= 2 fresh rows (a history/bulk batch). */
+  isBatch: boolean;
+  /** Cached entrance decision per row key so RowEntrance & useInkStreamReveal agree. */
+  decisions: Map<string, boolean>;
 }
 
 const rows = new Map<string, AgentRows>();
 /** The current render pass per agent, folded in afterwards. */
 const pending = new Map<string, PendingPass>();
+/** Per-agent mount batch state for entrance/reveal commit-phase coordination. */
+const mountBatches = new Map<string, MountBatch>();
 /** Per-agent bounded set of row keys that have already played an entrance animation. */
 const animatedKeys = new Map<string, Set<string>>();
 let flushScheduled = false;
@@ -131,33 +147,52 @@ function stateOf(agentId: string): AgentRows {
     seenAt: 0,
     recent: [],
     replayUntil: 0,
-    sawFirstPass: false,
   };
   rows.set(agentId, created);
   return created;
 }
 
+function scheduleFlush(): void {
+  if (flushScheduled) return;
+  flushScheduled = true;
+  // A promise job, not `queueMicrotask`: available on every RN runtime.
+  Promise.resolve().then(flush);
+}
+
+function passFreshCount(pass: PendingPass | undefined): number {
+  if (pass === undefined) return 0;
+  return Math.max(
+    pass.fresh?.size ?? 0,
+    (pass.freshIdentities?.size ?? 0) + pass.anonymousFreshCount,
+  );
+}
+
+function pendingFreshCount(agentId: string): number {
+  const fromPass = passFreshCount(pending.get(agentId));
+  const fromMounts = mountBatches.get(agentId)?.keys.size ?? 0;
+  return Math.max(fromPass, fromMounts);
+}
+
 /** Fold this render pass's maxima into the state the next pass will read. */
 function flush(): void {
   flushScheduled = false;
+  const now = Date.now();
   for (const [agentId, pass] of pending) {
     const state = stateOf(agentId);
     if (pass.at > state.at) state.at = pass.at;
-    const freshRows = pass.fresh?.size ?? 0;
+    const freshRows = passFreshCount(pass);
     if (freshRows === 0) continue;
-    if (!state.sawFirstPass) {
-      state.sawFirstPass = true;
-      // A first pass that paints several rows at once is a history load: a
-      // replayed session emits its whole timeline before anything commits, while
-      // a live pair arrives in two passes (the first row commits before the
-      // second is even rendered). `BULK_MIN_ROWS` cannot see this case — a
-      // history of fewer rows than that never reaches it — so its last row used
-      // to pulse every time a short session was reopened. One row is left alone:
-      // a single-row history and a live first command are the same shape.
-      if (freshRows >= 2) state.replayUntil = Date.now() + BULK_WINDOW_MS;
+    // Any single render pass that paints two or more fresh rows at once is a
+    // batch (initial history load, session switch, or bulk replay) — even on an
+    // agent that has already settled its first pass, and even when replayed
+    // rows share the exact same millisecond timestamp. A single row is left
+    // alone so live activity can still pulse and enter smoothly.
+    if (freshRows >= 2) {
+      state.replayUntil = Math.max(state.replayUntil, now + BULK_WINDOW_MS);
     }
   }
   pending.clear();
+  mountBatches.clear();
 }
 
 /**
@@ -181,21 +216,40 @@ function flush(): void {
  * Both updates are idempotent running maxima, so a discarded concurrent render
  * cannot corrupt them — unlike `seenAt`, which is why that one lives in an effect.
  */
-export function noteRender(agentId: string, at: number, firstPaint = true): boolean {
+export function noteRender(
+  agentId: string,
+  at: number,
+  firstPaint = true,
+  identity?: unknown,
+): boolean {
   const known = rows.get(agentId)?.at;
   const newest = known !== undefined && at >= known;
+  // On an unseen agent every firstPaint row is new; once the agent has a known
+  // watermark, only strictly newer timestamps count via `noteRender` so
+  // callers without commit state (e.g. re-rendered existing rows) do not turn a
+  // normal re-render into a replay batch. Component-level multi-row mounts at
+  // any timestamp are separately caught by `noteMountCandidate` / `commitMountEntrance`.
+  const countsAsFresh = firstPaint && (known === undefined || at > known);
   const queued = pending.get(agentId);
   if (queued === undefined) {
-    pending.set(agentId, { at, fresh: firstPaint ? new Set([at]) : null });
+    pending.set(agentId, {
+      at,
+      fresh: countsAsFresh ? new Set([at]) : null,
+      freshIdentities: countsAsFresh && identity !== undefined ? new Set([identity]) : null,
+      anonymousFreshCount: countsAsFresh && identity === undefined ? 1 : 0,
+    });
   } else {
     if (at > queued.at) queued.at = at;
-    if (firstPaint) (queued.fresh ??= new Set<number>()).add(at);
+    if (countsAsFresh) {
+      (queued.fresh ??= new Set<number>()).add(at);
+      if (identity !== undefined) {
+        (queued.freshIdentities ??= new Set<unknown>()).add(identity);
+      } else {
+        queued.anonymousFreshCount += 1;
+      }
+    }
   }
-  if (!flushScheduled) {
-    flushScheduled = true;
-    // A promise job, not `queueMicrotask`: available on every RN runtime.
-    Promise.resolve().then(flush);
-  }
+  scheduleFlush();
   return newest;
 }
 
@@ -273,6 +327,84 @@ export function markRowAnimated(agentId: string, at: number, rowKey?: string): v
 }
 
 /**
+ * Register a mounting row in the current render pass so commit-phase entrance
+ * checks (`commitMountEntrance`) can detect multi-row batch mounts before any
+ * row activates entrance or ink-stream animations.
+ *
+ * Strictly idempotent per row key (safe under React 18 StrictMode double
+ * renders and shared across `RowEntrance` + `useInkStreamReveal` on the same
+ * row). Does not mutate `rows` or `animatedKeys`.
+ */
+export function noteMountCandidate(agentId: string, at: number, rowKey?: string): void {
+  if (agentId === "") return;
+  const key = rowAnimationKey(at, rowKey);
+  if (animatedKeys.get(agentId)?.has(key)) return;
+  let batch = mountBatches.get(agentId);
+  if (batch === undefined || batch.sealed) {
+    batch = {
+      keys: new Set<string>(),
+      sealed: false,
+      isBatch: false,
+      decisions: new Map<string, boolean>(),
+    };
+    mountBatches.set(agentId, batch);
+  }
+  batch.keys.add(key);
+  scheduleFlush();
+}
+
+/**
+ * Commit-phase entrance gate called from `useLayoutEffect` (or `useEffect`
+ * fallback in minimal stubs) by `RowEntrance` and `useInkStreamReveal`.
+ *
+ * Seals the current render pass's mount batch on first commit, suppressing
+ * every row (and extending `replayUntil`) when >= 2 fresh rows mounted in the
+ * same pass. Caches the per-key decision for the duration of the sealed commit
+ * so both `RowEntrance` and `useInkStreamReveal` on the same row agree even
+ * though child layout effects commit before parent layout effects, while still
+ * marking the row animated so any subsequent remount renders statically.
+ */
+export function commitMountEntrance(
+  agentId: string,
+  at: number,
+  liveHint = false,
+  rowKey?: string,
+  now = Date.now(),
+): boolean {
+  if (agentId === "") return false;
+  const key = rowAnimationKey(at, rowKey);
+  let batch = mountBatches.get(agentId);
+  if (batch === undefined) {
+    batch = {
+      keys: new Set<string>([key]),
+      sealed: false,
+      isBatch: false,
+      decisions: new Map<string, boolean>(),
+    };
+    mountBatches.set(agentId, batch);
+    scheduleFlush();
+  }
+
+  if (!batch.sealed) {
+    batch.sealed = true;
+    const passFresh = passFreshCount(pending.get(agentId));
+    batch.isBatch = batch.keys.size >= 2 || passFresh >= 2;
+    if (batch.isBatch) {
+      const state = stateOf(agentId);
+      state.replayUntil = Math.max(state.replayUntil, now + BULK_WINDOW_MS);
+    }
+  }
+
+  const cached = batch.decisions.get(key);
+  if (cached !== undefined) return cached;
+
+  const decision = batch.isBatch ? false : shouldEnterLive(agentId, at, liveHint, rowKey, now);
+  batch.decisions.set(key, decision);
+  rememberAnimatedKey(agentId, key);
+  return decision;
+}
+
+/**
  * Pure read-only check for whether a mounting timeline row arrived live and
  * should play a one-shot entrance animation.
  *
@@ -297,6 +429,7 @@ export function shouldEnterLive(
   const state = rows.get(agentId);
   if (state !== undefined) {
     if (now < state.replayUntil) return false;
+    if (pendingFreshCount(agentId) >= 2) return false;
     if (state.recent.filter((t) => now - t < BULK_WINDOW_MS).length >= BULK_MIN_ROWS - 1) {
       return false;
     }
@@ -308,7 +441,7 @@ export function shouldEnterLive(
   // (e.g. a brand-new session's first streaming thought or running tool) when
   // no multi-row history pass is queued. Deliberately avoids touching `rows` so
   // `noteRender`'s first-pass `known === undefined` invariant stays intact.
-  if (liveHint === true && (pending.get(agentId)?.fresh?.size ?? 0) <= 1) {
+  if (liveHint === true && pendingFreshCount(agentId) <= 1) {
     return true;
   }
   return false;
@@ -319,6 +452,7 @@ export function resetNewestForTests(agentId?: string): void {
   if (agentId === undefined) {
     rows.clear();
     pending.clear();
+    mountBatches.clear();
     animatedKeys.clear();
     flushScheduled = false;
     seqCounter = 0;
@@ -326,6 +460,7 @@ export function resetNewestForTests(agentId?: string): void {
   }
   rows.delete(agentId);
   pending.delete(agentId);
+  mountBatches.delete(agentId);
   animatedKeys.delete(agentId);
 }
 
@@ -346,13 +481,18 @@ export function resetNewestForTests(agentId?: string): void {
 export function useRowPulse(
   agentId: string,
   timestamp: Date | string | number,
+  rowKey?: string,
 ): RowPulse {
   const at = normalizeRowTimestamp(timestamp);
+  const instanceTokenRef = useRef<object | null>(null);
+  if (instanceTokenRef.current === null) instanceTokenRef.current = {};
   // A row that has never committed calls this for the first time: that is what
   // `flush` counts to tell a history load (several first paints in one pass)
-  // from live activity (one row per pass).
+  // from live activity (one row per pass). Passing a stable row identity keeps
+  // React StrictMode double renders of a single row from inflating the batch count.
   const [commit, setCommit] = useState<Commit | null>(null);
-  const newest = noteRender(agentId, at, commit === null);
+  const identity = rowKey !== undefined && rowKey !== "" ? rowKey : instanceTokenRef.current;
+  const newest = noteRender(agentId, at, commit === null, identity);
   const [, setTick] = useState(0);
   useEffect(() => {
     setCommit(noteCommit(agentId, Date.now()));

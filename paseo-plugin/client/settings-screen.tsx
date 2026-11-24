@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { Platform, Pressable, ScrollView, Text, View } from "react-native";
 import type { PluginClientContext, PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { useSettings } from "@getpaseo/plugin/client";
@@ -76,6 +76,11 @@ export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
   const [draft, setDraft] = useState<Partial<Record<TimelineStyleKey, string>>>({});
   const [pickedLanguage, setPickedLanguage] = useState<LanguageChoice | null>(null);
   const [feedback, setFeedback] = useState<FeedbackState | null>(null);
+  // Synchronous in-flight locks close the rapid double-tap window before the
+  // host hook flips `saving: true` on the next render, preventing duplicate
+  // writes against the same revision.
+  const styleInFlightRef = useRef(false);
+  const languageInFlightRef = useRef(false);
 
   const current: TimelineStyleValues =
     settings.status === "ready" ? settings.values : TIMELINE_STYLE_DEFAULTS;
@@ -154,7 +159,7 @@ export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
   };
 
   const save = async () => {
-    if (settings.status !== "ready" || settings.saving) return;
+    if (settings.status !== "ready" || settings.saving || styleInFlightRef.current) return;
     const candidate: TimelineStyleValues = { ...current };
     for (const key of TIMELINE_STYLE_KEYS) {
       const raw = textOf(key).trim();
@@ -182,8 +187,17 @@ export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
       });
       return;
     }
+    styleInFlightRef.current = true;
     setFeedback(null);
-    const saved = await settings.save(parsed.data, settings.revision);
+    let saved = false;
+    try {
+      saved = await settings.save(parsed.data, settings.revision);
+    } catch (error) {
+      report("timeline style save", error);
+      saved = false;
+    } finally {
+      styleInFlightRef.current = false;
+    }
     if (saved) {
       setDraft({});
       setFeedback({ kind: "saved" });
@@ -193,15 +207,22 @@ export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
   };
 
   const reset = async () => {
-    if (settings.saving) return;
+    if (settings.saving || styleInFlightRef.current) return;
+    if (settings.status !== "ready" && settings.status !== "invalid") return;
+    styleInFlightRef.current = true;
     let saved = false;
     setFeedback(null);
-    if (settings.status === "ready") {
-      saved = await settings.save(TIMELINE_STYLE_DEFAULTS, settings.revision);
-    } else if (settings.status === "invalid") {
-      saved = await settings.reset();
-    } else {
-      return;
+    try {
+      if (settings.status === "ready") {
+        saved = await settings.save(TIMELINE_STYLE_DEFAULTS, settings.revision);
+      } else {
+        saved = await settings.reset();
+      }
+    } catch (error) {
+      report("timeline style reset", error);
+      saved = false;
+    } finally {
+      styleInFlightRef.current = false;
     }
     if (saved) {
       setDraft({});
@@ -212,7 +233,15 @@ export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
   };
 
   const chooseLanguage = async (choice: LanguageChoice) => {
-    if (language.status !== "ready" || language.saving || choice === currentLanguage) return;
+    if (
+      language.status !== "ready"
+      || language.saving
+      || languageInFlightRef.current
+      || choice === currentLanguage
+    ) {
+      return;
+    }
+    languageInFlightRef.current = true;
     const previousOverride = getLanguageOverride();
     const previousPicked = pickedLanguage;
     setPickedLanguage(choice);
@@ -224,6 +253,8 @@ export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
     } catch (error) {
       report("language save", error);
       saved = false;
+    } finally {
+      languageInFlightRef.current = false;
     }
     if (saved) {
       setPickedLanguage(null);

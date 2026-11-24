@@ -50,6 +50,7 @@ import {
   rewindNoticeSchema,
 } from "./client/rewind-notice-data";
 import { startRewindLiveMonitor } from "./client/rewind-notice-live";
+import { retainRowEntranceObservers } from "./client/row-entrance";
 import { InlineToolCall } from "./client/tool-call";
 import { toolCallData } from "./client/tool-call-data";
 import {
@@ -195,6 +196,7 @@ function buildContributions(client: PluginClientContext): () => void {
     // `harness/tool-call-check.cjs`: Paseo strips a key the schema does not
     // declare, and the component then silently loses a block.
     schema: z.object({
+      callId: z.string(),
       name: z.string(),
       label: z.string(),
       icon: z.string(),
@@ -412,6 +414,7 @@ function buildContributions(client: PluginClientContext): () => void {
         Component: PluginsSidebarItem,
       })),
     () => workspaceStatus.dispose(),
+    retainRowEntranceObservers(),
   ];
 
   // The live witness behind the capsule: a per-agent timeline subscription
