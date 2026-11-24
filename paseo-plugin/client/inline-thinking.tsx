@@ -252,6 +252,25 @@ function useGrowing(
   };
 }
 
+/** Distance (px) from the bottom edge that still counts as following the tail. */
+const STICK_TO_BOTTOM_THRESHOLD = 24;
+
+interface BodyScrollTracker {
+  stickToBottom: boolean;
+  lastScrollY: number | null;
+  userDragging: boolean;
+  userMomentum: boolean;
+}
+
+function createBodyScrollTracker(): BodyScrollTracker {
+  return {
+    stickToBottom: true,
+    lastScrollY: null,
+    userDragging: false,
+    userMomentum: false,
+  };
+}
+
 /** Polling cadence for the live thinking timer (matches 0.1s display granularity). */
 const DURATION_TICK_MS = 100;
 
@@ -493,6 +512,104 @@ export function InlineThinking({
   const collapseBody = (event?: unknown) => {
     if (shouldCollapseOnBodyPress(event)) setManual(false);
   };
+  const scrollRef = useRef<ScrollView | null>(null);
+  const scrollTrackerRef = useRef<BodyScrollTracker>(createBodyScrollTracker());
+  const prevOpenRef = useRef<boolean>(open);
+  const prevScrollKeyRef = useRef<string | undefined>(durationKey);
+  const continuedKeyShiftRef = useRef<boolean>(continuedKeyShift);
+  continuedKeyShiftRef.current = continuedKeyShift;
+
+  const scrollBodyToBottom = () => {
+    const tracker = scrollTrackerRef.current;
+    if (!tracker.stickToBottom || tracker.userDragging || tracker.userMomentum) return;
+    const node = scrollRef.current;
+    if (node === null || typeof node.scrollToEnd !== "function") return;
+    node.scrollToEnd({ animated: false });
+  };
+
+  // Opening an expanded thought starts at the latest (bottom) content; live
+  // follow during streaming is driven by `onContentSizeChange`/`onLayout` so we
+  // do not fire duplicate pre-layout `scrollToEnd` calls per chunk. Only reset
+  // on expand/collapse or a genuine row switch (never on a merge-timestamp shift).
+  useEffect(() => {
+    const openChanged = prevOpenRef.current !== open;
+    const keySwitched = prevScrollKeyRef.current !== durationKey && !continuedKeyShiftRef.current;
+    prevOpenRef.current = open;
+    prevScrollKeyRef.current = durationKey;
+
+    if (openChanged || keySwitched) {
+      scrollTrackerRef.current = createBodyScrollTracker();
+      if (open) {
+        scrollBodyToBottom();
+      }
+    }
+  }, [open, durationKey]);
+
+  const handleScrollLayout = () => {
+    scrollBodyToBottom();
+  };
+
+  const handleContentSizeChange = () => {
+    scrollBodyToBottom();
+  };
+
+  const handleScrollBeginDrag = () => {
+    scrollTrackerRef.current.userDragging = true;
+    scrollTrackerRef.current.userMomentum = false;
+  };
+
+  const handleScrollEndDrag = () => {
+    scrollTrackerRef.current.userDragging = false;
+  };
+
+  const handleMomentumScrollBegin = () => {
+    scrollTrackerRef.current.userMomentum = true;
+  };
+
+  const handleMomentumScrollEnd = () => {
+    scrollTrackerRef.current.userMomentum = false;
+  };
+
+  const handleBodyScroll = (event: {
+    nativeEvent?: {
+      contentOffset?: { y?: number };
+      layoutMeasurement?: { height?: number };
+      contentSize?: { height?: number };
+    };
+  }) => {
+    const native = event?.nativeEvent;
+    const y = native?.contentOffset?.y;
+    const viewportH = native?.layoutMeasurement?.height;
+    const contentH = native?.contentSize?.height;
+    if (
+      typeof y !== "number" ||
+      !Number.isFinite(y) ||
+      typeof viewportH !== "number" ||
+      !Number.isFinite(viewportH) ||
+      typeof contentH !== "number" ||
+      !Number.isFinite(contentH)
+    ) {
+      return;
+    }
+
+    const tracker = scrollTrackerRef.current;
+    const distanceFromBottom = contentH - (y + viewportH);
+    const atBottom = distanceFromBottom <= STICK_TO_BOTTOM_THRESHOLD;
+    const scrolledUp = tracker.lastScrollY !== null && y < tracker.lastScrollY - 1;
+
+    if (scrolledUp && distanceFromBottom > 1) {
+      // Any explicit upward movement off the bottom edge — including the first
+      // pixels of a drag/fling or wheel-up — disengages auto-follow immediately,
+      // while iOS overscroll bounce back to `distanceFromBottom <= 1` stays sticky.
+      tracker.stickToBottom = false;
+    } else if (atBottom) {
+      tracker.stickToBottom = true;
+    } else if (tracker.userDragging || tracker.userMomentum) {
+      tracker.stickToBottom = false;
+    }
+
+    tracker.lastScrollY = y;
+  };
   // Subscribe via `useLocaleText()` so host-relayed or settings-driven locale
   // changes re-render the label and screen-reader strings live.
   const copy = useLocaleText();
@@ -664,8 +781,17 @@ export function InlineThinking({
           // content in a Pressable lets short taps collapse the scroll box while
           // scroll gestures still pan smoothly on iOS/Android/Web.
           <ScrollView
+            ref={scrollRef}
             style={styles.fullScroll}
             nestedScrollEnabled
+            scrollEventThrottle={16}
+            onLayout={handleScrollLayout}
+            onContentSizeChange={handleContentSizeChange}
+            onScroll={handleBodyScroll}
+            onScrollBeginDrag={handleScrollBeginDrag}
+            onScrollEndDrag={handleScrollEndDrag}
+            onMomentumScrollBegin={handleMomentumScrollBegin}
+            onMomentumScrollEnd={handleMomentumScrollEnd}
             testID={SCROLL_BOX_TEST_ID}
           >
             <Pressable

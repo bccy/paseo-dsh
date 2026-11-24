@@ -889,7 +889,7 @@ console.log("the row settles when the last frame both grows and completes");
       intervals.clear();
     }
 
-    function renderRow(props) {
+    function renderRow(props, onBeforeEffects) {
       let tree;
       let passes = 0;
       do {
@@ -903,6 +903,7 @@ console.log("the row settles when the last frame both grows and completes");
           layout: { compact: false },
           ...props,
         });
+        if (typeof onBeforeEffects === "function") onBeforeEffects(tree);
         for (const { index, effect } of effects) {
           const slot = slots[index];
           if (typeof slot.cleanup === "function") slot.cleanup();
@@ -1343,6 +1344,344 @@ console.log("the row settles when the last frame both grows and completes");
         }),
       );
       unmount();
+
+      console.log("expanded ScrollView defaults to bottom and smartly follows live updates");
+      {
+        const scrollCalls = [];
+        const attachScrollRef = (tree) => {
+          const scroll = findNode(tree, (n) => n.type === "ScrollView");
+          if (scroll && scroll.props?.ref) {
+            scroll.props.ref.current = {
+              scrollToEnd(opts) {
+                scrollCalls.push(opts);
+              },
+            };
+          }
+          return scroll;
+        };
+        const renderWithScrollRef = (props) => renderRow(props, attachScrollRef);
+
+        // 1. Opening a completed long thought jumps to the bottom in useEffect as soon
+        // as the ref commits, AND survives out-of-order onContentSizeChange -> onScroll(y=0) -> onLayout.
+        scrollCalls.length = 0;
+        resetHooks();
+        const histTs = 1_700_002_000_000;
+        const closedHist = renderWithScrollRef({
+          agentId: "scroll-agent",
+          timestamp: histTs,
+          item: { data: { text: "line1\n".repeat(40), phase: "complete" } },
+        });
+        findNode(closedHist, (n) => n.type === "Pressable").props.onPress();
+        const openHist = renderWithScrollRef({
+          agentId: "scroll-agent",
+          timestamp: histTs,
+          item: { data: { text: "line1\n".repeat(40), phase: "complete" } },
+        });
+        const histScroll = findNode(openHist, (n) => n.type === "ScrollView");
+        check(
+          "expanded ScrollView wires ref, scrollEventThrottle, onContentSizeChange, onScroll and momentum hooks",
+          histScroll !== null &&
+            histScroll.props?.ref !== undefined &&
+            histScroll.props?.scrollEventThrottle === 16 &&
+            typeof histScroll.props?.onContentSizeChange === "function" &&
+            typeof histScroll.props?.onScroll === "function" &&
+            typeof histScroll.props?.onMomentumScrollBegin === "function" &&
+            typeof histScroll.props?.onMomentumScrollEnd === "function",
+        );
+        check(
+          "opening a completed thought invokes scrollToEnd in mount effect once ref commits",
+          scrollCalls.length === 1 && scrollCalls[0]?.animated === false,
+          JSON.stringify(scrollCalls),
+        );
+        // Out-of-order mount sequence: onContentSizeChange fires BEFORE spurious onScroll(y=0) and onLayout.
+        scrollCalls.length = 0;
+        histScroll.props.onContentSizeChange(320, 1000);
+        histScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 0 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 1000 },
+          },
+        });
+        scrollCalls.length = 0;
+        histScroll.props.onLayout({ nativeEvent: { layout: { height: 260 } } });
+        check(
+          "opening a completed thought scrolls to the bottom without animation even after out-of-order onScroll(y=0)",
+          scrollCalls.length === 1 && scrollCalls[0]?.animated === false,
+          JSON.stringify(scrollCalls),
+        );
+        unmount();
+
+        // 2. Short thought that starts below expandedMaxHeight and later overflows
+        // stays sticky when the first non-bottom onScroll(y=0) arrives.
+        scrollCalls.length = 0;
+        resetHooks();
+        const shortFlowTs = 1_700_002_005_000;
+        const shortClosed = renderWithScrollRef({
+          agentId: "scroll-agent",
+          timestamp: shortFlowTs,
+          item: { data: { text: "short", phase: "streaming" } },
+        });
+        findNode(shortClosed, (n) => n.type === "Pressable").props.onPress();
+        const shortOpen = renderWithScrollRef({
+          agentId: "scroll-agent",
+          timestamp: shortFlowTs,
+          item: { data: { text: "short", phase: "streaming" } },
+        });
+        const shortScroll = findNode(shortOpen, (n) => n.type === "ScrollView");
+        shortScroll.props.onContentSizeChange(320, 40); // fits inside 260px, no onScroll yet
+        shortScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 0 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 400 },
+          },
+        });
+        scrollCalls.length = 0;
+        shortScroll.props.onContentSizeChange(320, 500);
+        check(
+          "short thought overflowing past expandedMaxHeight keeps following to bottom",
+          scrollCalls.length === 1 && scrollCalls[0]?.animated === false,
+          JSON.stringify(scrollCalls),
+        );
+        unmount();
+
+        // 3. Streaming thought follows updates without duplicate pre-layout scrollToEnd,
+        // tolerates consecutive growth-lag & downward intermediate onScroll frames,
+        // pauses on user upward scroll (and stays paused across timestamp drift),
+        // resumes when scrolled back to bottom, guards Native drag/fling windows,
+        // tolerates iOS bottom overscroll bounce, and resets on re-open or in-place row switch.
+        scrollCalls.length = 0;
+        resetHooks();
+        const streamTs1 = 1_700_002_010_000;
+        const streamTs2 = 1_700_002_011_000;
+        const streamClosed = renderWithScrollRef({
+          agentId: "scroll-agent",
+          timestamp: streamTs1,
+          item: { data: { text: "chunk-1", phase: "streaming" } },
+        });
+        findNode(streamClosed, (n) => n.type === "Pressable").props.onPress();
+        let streamTree = renderWithScrollRef({
+          agentId: "scroll-agent",
+          timestamp: streamTs1,
+          item: { data: { text: "chunk-1", phase: "streaming" } },
+        });
+        let streamScroll = findNode(streamTree, (n) => n.type === "ScrollView");
+        streamScroll.props.onLayout({ nativeEvent: { layout: { height: 260 } } });
+        streamScroll.props.onContentSizeChange(320, 400);
+        // Scroll lands at bottom (y=140, viewport=260, content=400).
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 140 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 400 },
+          },
+        });
+        scrollCalls.length = 0;
+
+        // Streaming text update does not fire duplicate pre-layout scrollToEnd in useEffect.
+        streamTree = renderWithScrollRef({
+          agentId: "scroll-agent",
+          timestamp: streamTs1,
+          item: { data: { text: "chunk-1\nchunk-2", phase: "streaming" } },
+        });
+        streamScroll = findNode(streamTree, (n) => n.type === "ScrollView");
+        check(
+          "streaming text update waits for layout/onContentSizeChange instead of firing duplicate effect scrollToEnd",
+          scrollCalls.length === 0,
+          `pre-layout calls=${scrollCalls.length}`,
+        );
+
+        // Consecutive growth-lag and downward intermediate onScroll frames must NOT disengage auto-follow.
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 140 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 480 },
+          },
+        });
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 180 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 480 },
+          },
+        });
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 180 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 480 },
+          },
+        });
+        streamScroll.props.onContentSizeChange(320, 560);
+        check(
+          "live growth while at bottom keeps auto-scrolling to end despite consecutive lag and intermediate frames",
+          scrollCalls.length === 1 && scrollCalls[0]?.animated === false,
+          `calls=${scrollCalls.length}`,
+        );
+        // Land at new bottom (y=300), then simulate iOS overscroll bounce (300 -> 330 -> 300).
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 300 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 560 },
+          },
+        });
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 330 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 560 },
+          },
+        });
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 300 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 560 },
+          },
+        });
+        scrollCalls.length = 0;
+        streamScroll.props.onContentSizeChange(320, 600);
+        check(
+          "iOS bottom overscroll bounce back to edge stays sticky",
+          scrollCalls.length === 1,
+          `calls=${scrollCalls.length}`,
+        );
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 340 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 600 },
+          },
+        });
+
+        // User scrolls up manually (Web wheel / scrollbar to y=120).
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 120 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 600 },
+          },
+        });
+        scrollCalls.length = 0;
+
+        // Next chunk arrives AND host merge advances timestamp -> must NOT yank user back to bottom.
+        streamTree = renderWithScrollRef({
+          agentId: "scroll-agent",
+          timestamp: streamTs2,
+          item: { data: { text: "chunk-1\nchunk-2\nchunk-3", phase: "streaming" } },
+        });
+        streamScroll = findNode(streamTree, (n) => n.type === "ScrollView");
+        streamScroll.props.onContentSizeChange(320, 680);
+        check(
+          "manual upward scroll pauses auto-follow even across new chunks and merge-timestamp advance",
+          scrollCalls.length === 0,
+          `unexpected scrollToEnd calls=${scrollCalls.length}`,
+        );
+
+        // User scrolls back down near the bottom (distance = 10px <= 24px threshold) -> resumes follow.
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 410 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 680 },
+          },
+        });
+        scrollCalls.length = 0;
+        streamTree = renderWithScrollRef({
+          agentId: "scroll-agent",
+          timestamp: streamTs2,
+          item: { data: { text: "chunk-1\nchunk-2\nchunk-3\nchunk-4", phase: "streaming" } },
+        });
+        streamScroll = findNode(streamTree, (n) => n.type === "ScrollView");
+        streamScroll.props.onContentSizeChange(320, 740);
+        check(
+          "scrolling back near bottom resumes live auto-follow",
+          scrollCalls.length === 1,
+          `calls=${scrollCalls.length}`,
+        );
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 480 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 740 },
+          },
+        });
+
+        // Native drag in progress (even inside 24px threshold) and short upward fling window must never yank back.
+        scrollCalls.length = 0;
+        streamScroll.props.onScrollBeginDrag();
+        streamScroll.props.onContentSizeChange(320, 780); // chunk during active touch hold
+        streamScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 470 }, // moved up 10px, still within 24px of 480 (50px of 780)
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 740 },
+          },
+        });
+        streamScroll.props.onScrollEndDrag();
+        streamScroll.props.onContentSizeChange(320, 820); // chunk between endDrag and momentumBegin
+        streamScroll.props.onMomentumScrollBegin();
+        streamScroll.props.onContentSizeChange(320, 860); // chunk during momentum coasting
+        streamScroll.props.onMomentumScrollEnd();
+        check(
+          "native drag hold, short upward fling inside 24px threshold, and momentum window pause auto-follow",
+          scrollCalls.length === 0,
+          `unexpected calls=${scrollCalls.length}`,
+        );
+
+        // Virtual-list in-place key switch to a different row while open resets stick-to-bottom and jumps to end.
+        scrollCalls.length = 0;
+        const switchedOpenTree = renderWithScrollRef({
+          agentId: "scroll-agent",
+          timestamp: 1_700_002_099_000,
+          item: { data: { text: "another historic row\n".repeat(20), phase: "complete" } },
+        });
+        const switchedScroll = findNode(switchedOpenTree, (n) => n.type === "ScrollView");
+        check(
+          "in-place key switch while expanded resets stick-to-bottom and scrolls new row to end",
+          scrollCalls.length === 1 && scrollCalls[0]?.animated === false,
+          JSON.stringify(scrollCalls),
+        );
+        // Scroll up on the new row, then collapse and re-expand to verify re-open resets to bottom.
+        switchedScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 300 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 560 },
+          },
+        });
+        switchedScroll.props.onScroll({
+          nativeEvent: {
+            contentOffset: { y: 80 },
+            layoutMeasurement: { height: 260 },
+            contentSize: { height: 560 },
+          },
+        });
+        findNode(switchedOpenTree, (n) => n.type === "Pressable").props.onPress(); // collapse
+        const collapsedAgain = renderWithScrollRef({
+          agentId: "scroll-agent",
+          timestamp: 1_700_002_099_000,
+          item: { data: { text: "another historic row\n".repeat(20), phase: "complete" } },
+        });
+        scrollCalls.length = 0;
+        findNode(collapsedAgain, (n) => n.type === "Pressable").props.onPress(); // re-open
+        const reopened = renderWithScrollRef({
+          agentId: "scroll-agent",
+          timestamp: 1_700_002_099_000,
+          item: { data: { text: "another historic row\n".repeat(20), phase: "complete" } },
+        });
+        const reopenedScroll = findNode(reopened, (n) => n.type === "ScrollView");
+        reopenedScroll.props.onContentSizeChange(320, 560);
+        check(
+          "re-expanding after collapsing resets stick-to-bottom and jumps to the bottom",
+          scrollCalls.length === 2 && scrollCalls.every((c) => c?.animated === false),
+          JSON.stringify(scrollCalls),
+        );
+        unmount();
+      }
     } finally {
       Date.now = realDateNow;
       resetThinkingDurationsForTests();

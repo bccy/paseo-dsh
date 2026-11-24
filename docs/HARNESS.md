@@ -238,7 +238,8 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   `59950ms` 进位为 `1m 0s`、整秒边界单调）；以及 `InlineThinking` 真实组件计时生命周期（历史已完成行
   不启计时器不显徽章、流式 0.1s 递增且展开后仍可见、settle 防抖窗口不计入时长、已定格行遇晚到抖动不重启、
   虚拟列表重挂保留与原位切键不泄漏、宿主合并刷新 `timestamp` 无缝续计并迁移键、时钟回拨单调、`MAX_DURATION_RECORDS=500`
-  上限淘汰）。**它不断言行标题**：标题恒为 `思考` 是 `client/locale.ts` 标签表里的一个键，
+  上限淘汰），以及展开区 `<ScrollView>` 默认滚底与智能跟随更新（点开即停在最底部、流式增长自动追底且容忍增长滞后
+  `onScroll`、用户上翻/拖离底部暂停跟随且不因时间戳推进回弹、滚回底部或收起重开后恢复跟底）。**它不断言行标题**：标题恒为 `思考` 是 `client/locale.ts` 标签表里的一个键，
   由 `harness/locale-check.cjs` 的整表遍历覆盖——改坏了标题，这个脚本不会红。
   **动了思考行显示或思考时长必跑。** 运行步骤现在需要同时编译 `client/inline-thinking.tsx`
   （`--jsx react-jsx --noCheck`），见文件头。
