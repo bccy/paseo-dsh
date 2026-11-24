@@ -152,24 +152,28 @@ export function InlineThinking({
   const copy = useLocaleText();
 
 
+  const isClassic = thinkingStyle === "classic";
+
   // While streaming the collapsed line is a **tail window**: it advances with
   // every arrived character instead of waiting for a paragraph to finish, which
   // is what made it lag the expanded view. Before the box has been measured (the
   // very first frame) and once the thought settles, dsh's own rule applies —
   // the latest completed paragraph's first line, then the first line outright.
-  const line =
-    growing && lineWidth > 0
+  const line = isClassic
+    ? growing && lineWidth > 0
       ? streamingTail(text, lineWidth, ROW_FONT_SIZE)
-      : reasoningPreview(text, growing);
-  const tailSliding = growing && lineWidth > 0 && line.startsWith("…");
+      : reasoningPreview(text, growing)
+    : "";
+  const tailSliding = isClassic && growing && lineWidth > 0 && line.startsWith("…");
   const stream = useInkStreamReveal({
     agentId,
     timestamp,
     rowKey,
-    liveHint: phase === "streaming" || growing,
-    label: copy.thinking,
-    summary: !open && !tailSliding ? line : "",
-    streamSummary: !open && !tailSliding,
+    liveHint: isClassic && (phase === "streaming" || growing),
+    label: isClassic ? copy.thinking : "",
+    summary: isClassic && !open && !tailSliding ? line : "",
+    streamSummary: isClassic && !open && !tailSliding,
+    enabled: isClassic,
   });
 
   const styles = useMemo(() => {

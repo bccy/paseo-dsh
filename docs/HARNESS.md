@@ -233,9 +233,12 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
       `toolFailures` 表或 `tool-call.tsx` 的 hint 分支必跑。**
 - `harness/thinking-check.cjs` — 思考行折叠预览与多样式渲染：结束后取**第一行**、运行中取最后一个首行已终结
   的段落（`client/thinking-text.ts`）、折叠行流式宽度接线与防抖 settle 状态机；同时断言 5 套可选思考行
-  样式的纯解析函数（`parseThinkingSections`、`parseInlineRuns`、`thinkingHeadline`、`thinkingPeekTail`、
-  `formatThinkingDuration`）以及全部 6 套样式（`classic` / `rail` / `silk` / `capsule` / `stepper` / `editorial`）
-  在真实编译组件下的流式/展开/收起/复制与 Native 动画清理闭环。**动了思考行显示、样式切换或文本解析必跑。**
+  样式的纯解析函数（`parseThinkingSections`、`parseInlineRuns`、`thinkingHeadline`、`thinkingSubtitleKey`、
+  `thinkingPeekTail`、`formatThinkingDuration` 含 59.95s 进位）、6 套样式（`classic` / `rail` / `silk` /
+  `capsule` / `stepper` / `editorial`）在真实编译组件下的流式/展开/收起（rail 展开区点按收起与 peek 高度、
+  silk 复制按钮与 Native 字幕仅段落切换重启、capsule `surface1` 角标底色接线、stepper 隐式段不重复与流式有界预览及历史行零伪耗时、
+  Native `Animated` 清理、4 文件零硬编码色审计），以及显示设置页的 6 样式即时保存、失败回滚、数字草稿保留、
+  保存数字项不回退样式、并发防重入锁与恢复默认重置。**动了思考行显示、样式切换或文本解析必跑。**
 - `harness/row-status-icon-check.cjs` — 工具行与思考行左侧动态状态图标（`client/row-status-icon.tsx`、
   `client/row-status-icon-data.ts`）：状态映射、完成态弹出判定、16px/14px 几何尺寸、48×48 PNG 角标资源、
   Web CSS 注入与 Native `Animated` 启停清理、`backdropColor` 卡片底色镂空（供柔雾思考舱等抬升表面使用），

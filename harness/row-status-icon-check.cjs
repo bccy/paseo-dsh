@@ -497,6 +497,19 @@ console.log("component execution — Native Animated lifecycle & minimal stub sa
     { Platform: { OS: "web" }, View: "View", Image: "Image" },
     elevatedHarness.hooks,
   );
+  const elevatedRunning = elevatedHarness.render(ElevatedIcon, {
+    status: "running",
+    size: 16,
+    colors: COLORS,
+    backdropColor: "#141418",
+    children: { type: "BaseGlyph", props: {} },
+  });
+  const elevatedRunningBadge = findAll(elevatedRunning, (n) => n.props?.testID === "dsh-row-badge-running")[0];
+  check(
+    "backdropColor overrides running-ring knockout backgroundColor (for surface1 cards)",
+    findAll(elevatedRunningBadge, (n) => n.props?.style?.backgroundColor === "#141418").length >= 1,
+    JSON.stringify(elevatedRunningBadge),
+  );
   const elevatedCompleted = elevatedHarness.render(ElevatedIcon, {
     status: "completed",
     size: 16,

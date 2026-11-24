@@ -45,6 +45,7 @@ import {
   parseThinkingSections,
   thinkingHeadline,
   thinkingPeekTail,
+  thinkingSubtitleKey,
   type ThinkingSection,
 } from "./thinking-text";
 import {
@@ -333,12 +334,8 @@ function formatMetaSummary(
           : copy.thinkingUi.stepCount(sectionCount)
         : copy.thinkingUi.sectionCount(sectionCount);
 
-  if (mode === "step") {
-    if (countLabel && durationText) return `${countLabel} · ${durationText}`;
-    return countLabel || durationText;
-  }
-  if (durationText) return durationText;
-  return countLabel;
+  if (countLabel && durationText) return `${countLabel} · ${durationText}`;
+  return countLabel || durationText;
 }
 
 /**
@@ -366,9 +363,13 @@ export function EnhancedThinkingView({
   const { copied, onCopy } = useThinkingCopy(text);
   const sections = useMemo(() => parseThinkingSections(text), [text]);
   const headline = useMemo(() => {
-    const raw = thinkingHeadline(text, growing);
+    const raw = thinkingHeadline(text, growing, sections);
     return raw.length > 0 ? raw : growing ? copy.thinkingUi.organizing : "";
-  }, [text, growing, copy.thinkingUi.organizing]);
+  }, [text, growing, sections, copy.thinkingUi.organizing]);
+  const subtitleKey = useMemo(
+    () => thinkingSubtitleKey(sections, growing),
+    [sections, growing],
+  );
 
   const durationText = formatThinkingDuration(elapsedMs);
   const sectionCount = sections.length;
@@ -502,9 +503,9 @@ export function EnhancedThinkingView({
               onPress={onToggle}
               style={{
                 position: "relative",
-                maxHeight: 62,
+                maxHeight: 72,
                 overflow: "hidden",
-                paddingVertical: 2,
+                paddingVertical: 1,
               }}
             >
               <View style={{ minHeight: 36, justifyContent: "flex-end" }}>
@@ -620,7 +621,7 @@ export function EnhancedThinkingView({
                 {showTicker ? <View style={sepStyle} /> : null}
                 {showTicker ? (
                   <SilkSubtitleSlide
-                    slideKey={headline}
+                    slideKey={subtitleKey}
                     active={growing && color === null}
                     style={{ flex: 1, minWidth: 0, overflow: "hidden" }}
                   >
@@ -943,85 +944,107 @@ export function EnhancedThinkingView({
       gap: rowGap,
     };
 
-    const renderStepList = (): ReactElement => (
-      <View testID={THINKING_STEPS_TEST_ID} style={{ marginLeft: 7, paddingVertical: 3 }}>
-        {sections.map((section, index) => {
-          const isLast = index === sections.length - 1;
-          const isActiveStep = growing && isLast;
-          const compactStep = growing && !open && !isLast;
-          return (
-            <View
-              key={index}
-              style={{
-                position: "relative",
-                paddingLeft: 16,
-                paddingBottom: isLast ? 2 : 9,
-                borderLeftWidth: isLast ? 0 : 1.5,
-                borderLeftColor: colors.border,
-              }}
-            >
+    const renderStepList = (previewMode: boolean): ReactElement => {
+      const visibleSections = previewMode ? sections.slice(-2) : sections;
+      const indexOffset = sections.length - visibleSections.length;
+      return (
+        <View testID={THINKING_STEPS_TEST_ID} style={{ marginLeft: 7, paddingVertical: 3 }}>
+          {visibleSections.map((section, localIndex) => {
+            const index = indexOffset + localIndex;
+            const isLast = index === sections.length - 1;
+            const isActiveStep = growing && isLast;
+            const compactStep = previewMode && !isLast;
+            // For implicit paragraphs (`explicitTitle === false`), `section.body`
+            // already contains the full paragraph including its first line, so
+            // suppress the synthetic title whenever the body is rendered.
+            const showTitle =
+              compactStep || section.explicitTitle || section.body.length === 0;
+            const previewSnippet =
+              previewMode && !compactStep && section.body.length > 0
+                ? thinkingPeekTail(section.body, compact ? 76 : 136)
+                : "";
+            return (
               <View
-                pointerEvents="none"
+                key={index}
                 style={{
-                  position: "absolute",
-                  left: -4.25,
-                  top: 4,
-                  width: 9,
-                  height: 9,
-                  borderRadius: 4.5,
-                  backgroundColor: isActiveStep
-                    ? withAlpha(colors.accent, light ? 0.2 : 0.26)
-                    : "transparent",
-                  alignItems: "center",
-                  justifyContent: "center",
+                  position: "relative",
+                  paddingLeft: 16,
+                  paddingBottom: isLast ? 2 : previewMode ? 6 : 9,
+                  borderLeftWidth: isLast ? 0 : 1.5,
+                  borderLeftColor: colors.border,
                 }}
               >
-                {isActiveStep ? (
-                  <BreathingDot color={colors.accent} size={6} />
-                ) : (
-                  <View
-                    style={{
-                      width: 6,
-                      height: 6,
-                      borderRadius: 3,
-                      backgroundColor: colors.foregroundMuted,
-                      opacity: 0.72,
-                    }}
-                  />
-                )}
-              </View>
-              <Text
-                style={{
-                  fontSize: compactStep ? 12 : 12.5,
-                  lineHeight: 18,
-                  fontWeight: compactStep ? "500" : "600",
-                  color: compactStep ? colors.foregroundMuted : colors.foreground,
-                  marginBottom: compactStep ? 0 : 2,
-                }}
-                numberOfLines={compactStep ? 1 : undefined}
-                selectable={open}
-              >
-                {section.title}
-              </Text>
-              {!compactStep && section.body.length > 0 ? (
-                <InlineFormattedText
-                  text={section.body}
-                  baseStyle={bodyStyle}
-                  boldStyle={boldStyle}
-                  codeStyle={codeStyle}
-                  selectable={open}
-                />
-              ) : null}
-              {isActiveStep ? (
-                <View style={{ paddingTop: 3 }}>
-                  <BreathingDot color={colors.accent} size={4.5} />
+                <View
+                  pointerEvents="none"
+                  style={{
+                    position: "absolute",
+                    left: -4.25,
+                    top: 4,
+                    width: 9,
+                    height: 9,
+                    borderRadius: 4.5,
+                    backgroundColor: isActiveStep
+                      ? withAlpha(colors.accent, light ? 0.2 : 0.26)
+                      : "transparent",
+                    alignItems: "center",
+                    justifyContent: "center",
+                  }}
+                >
+                  {isActiveStep ? (
+                    <BreathingDot color={colors.accent} size={6} />
+                  ) : (
+                    <View
+                      style={{
+                        width: 6,
+                        height: 6,
+                        borderRadius: 3,
+                        backgroundColor: colors.foregroundMuted,
+                        opacity: 0.72,
+                      }}
+                    />
+                  )}
                 </View>
-              ) : null}
-            </View>
-          );
-        })}
-      </View>
-    );
+                {showTitle ? (
+                  <Text
+                    style={{
+                      fontSize: compactStep ? 12 : 12.5,
+                      lineHeight: 18,
+                      fontWeight: compactStep ? "500" : "600",
+                      color: compactStep ? colors.foregroundMuted : colors.foreground,
+                      marginBottom: compactStep ? 0 : 2,
+                    }}
+                    numberOfLines={compactStep ? 1 : undefined}
+                    selectable={open}
+                  >
+                    {section.title}
+                  </Text>
+                ) : null}
+                {!compactStep && section.body.length > 0 ? (
+                  previewMode ? (
+                    <Text style={bodyStyle} numberOfLines={2}>
+                      {previewSnippet}
+                    </Text>
+                  ) : (
+                    <InlineFormattedText
+                      text={section.body}
+                      baseStyle={bodyStyle}
+                      boldStyle={boldStyle}
+                      codeStyle={codeStyle}
+                      selectable={open}
+                    />
+                  )
+                ) : null}
+                {isActiveStep ? (
+                  <View style={{ paddingTop: 3 }}>
+                    <BreathingDot color={colors.accent} size={4.5} />
+                  </View>
+                ) : null}
+              </View>
+            );
+          })}
+        </View>
+      );
+    };
 
     return (
       <View testID={thinkingStyleTestId("stepper")} style={rootStyle}>
@@ -1112,7 +1135,7 @@ export function EnhancedThinkingView({
                 accessibilityLabel={copy.collapseThinking}
                 onPress={collapseFromPress}
               >
-                {renderStepList()}
+                {renderStepList(false)}
               </Pressable>
             </ScrollView>
           ) : (
@@ -1121,8 +1144,10 @@ export function EnhancedThinkingView({
               accessibilityRole="button"
               accessibilityLabel={copy.expandThinking}
               onPress={onToggle}
+              style={{ position: "relative", maxHeight: 96, overflow: "hidden" }}
             >
-              {renderStepList()}
+              {renderStepList(true)}
+              <SteppedFadeVeil backgroundColor={colors.surface0} height={14} />
             </Pressable>
           )
         ) : open ? (

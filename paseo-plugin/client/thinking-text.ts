@@ -224,8 +224,15 @@ export function parseInlineRuns(text: string): InlineRun[] {
  * - Running (`running === true`): latest section's explicit heading, or the
  *   latest non-empty clause in the newest paragraph. Returns `""` when the
  *   thought has no readable text yet so the caller can show localized fallback.
+ *
+ * Pass `precomputedSections` when the caller has already parsed `text` to avoid
+ * a redundant pass on every streaming frame.
  */
-export function thinkingHeadline(text: string, running: boolean): string {
+export function thinkingHeadline(
+  text: string,
+  running: boolean,
+  precomputedSections?: readonly ThinkingSection[],
+): string {
   if (!running) {
     const firstNonEmpty = text
       .replace(/\r\n?/gu, "\n")
@@ -233,7 +240,7 @@ export function thinkingHeadline(text: string, running: boolean): string {
       .find((line) => line.trim().length > 0);
     return (firstNonEmpty ?? "").replaceAll("**", "").trim();
   }
-  const sections = parseThinkingSections(text);
+  const sections = precomputedSections ?? parseThinkingSections(text);
   if (sections.length === 0) return "";
   const last = sections[sections.length - 1];
   if (last.explicitTitle) return last.title;
@@ -246,13 +253,51 @@ export function thinkingHeadline(text: string, running: boolean): string {
 }
 
 /**
+ * Paragraph/clause-level stable transition key for the Silk subtitle ticker.
+ *
+ * Unlike `thinkingHeadline`, which grows character-by-character as tokens stream,
+ * this key only changes when a new section, explicit `**Heading**`, or sentence
+ * clause begins — so the 240ms slide-up transition plays once per thought beat
+ * instead of restarting on every arriving token.
+ */
+export function thinkingSubtitleKey(
+  sections: readonly ThinkingSection[],
+  running: boolean,
+): string {
+  if (!running) return "settled";
+  if (sections.length === 0) return "empty";
+  const last = sections[sections.length - 1];
+  if (last.explicitTitle) return `s:${sections.length}:h:${last.title}`;
+  const clauses = last.body
+    .replaceAll("**", "")
+    .split(/[。；！？\n]+/u)
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+  return `s:${sections.length}:c:${clauses.length}`;
+}
+
+/**
  * Flattened tail window for multi-line streaming peek boxes (Rail / Capsule / Editorial).
  *
  * Slices by Unicode code points so CJK characters and emoji are never split.
+ * For long thoughts, scans only a bounded tail slice first to stay O(maxChars)
+ * per streaming frame, falling back to full input if the tail is mostly whitespace.
  */
 export function thinkingPeekTail(text: string, maxChars: number): string {
   if (!(maxChars > 0)) return "";
-  const clean = text.replaceAll("**", "").replace(/\s+/gu, " ").trim();
+  const flatten = (raw: string): string => raw.replaceAll("**", "").replace(/\s+/gu, " ").trim();
+  const windowUnits = maxChars * 4 + 64;
+  if (text.length > windowUnits) {
+    let start = text.length - windowUnits;
+    const lead = text.charCodeAt(start);
+    if (lead >= 0xdc00 && lead <= 0xdfff) start += 1;
+    const tailClean = flatten(text.slice(start));
+    const tailChars = [...tailClean];
+    if (tailChars.length > maxChars + 1) {
+      return `…${tailChars.slice(tailChars.length - maxChars).join("")}`;
+    }
+  }
+  const clean = flatten(text);
   if (clean.length === 0) return "";
   const chars = [...clean];
   if (chars.length <= maxChars) return clean;
@@ -263,12 +308,14 @@ export function thinkingPeekTail(text: string, maxChars: number): string {
  * Format an observed streaming duration in milliseconds for tabular metadata.
  *
  * Returns `""` below 100ms (or for non-finite values) so instant/replayed rows
- * never show noisy `0.0s` badges.
+ * never show noisy `0.0s` badges. Rounds tenths before checking the 60s
+ * boundary so `59_950ms`–`59_999ms` formats as `"1m 0s"` rather than `"60.0s"`.
  */
 export function formatThinkingDuration(ms: number): string {
   if (!Number.isFinite(ms) || ms < 100) return "";
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-  const totalSec = Math.floor(ms / 1000);
+  const tenths = Math.round(ms / 100);
+  if (tenths < 600) return `${(tenths / 10).toFixed(1)}s`;
+  const totalSec = Math.floor(tenths / 10);
   const mins = Math.floor(totalSec / 60);
   const secs = totalSec % 60;
   return `${mins}m ${secs}s`;

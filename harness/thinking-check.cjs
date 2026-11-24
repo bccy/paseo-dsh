@@ -38,6 +38,7 @@ const {
   streamingTail,
   thinkingHeadline,
   thinkingPeekTail,
+  thinkingSubtitleKey,
 } = require("./client/thinking-text.js");
 
 /**
@@ -910,10 +911,28 @@ console.log("pure parsers for enhanced thinking-row styles");
     emojiTail.startsWith("…") && emojiTail.isWellFormed() && emojiTail.includes("🎯"),
     emojiTail,
   );
+  const longPaddedTail = `${"前置内容 ".repeat(120)}末尾关键词${" ".repeat(400)}`;
+  check(
+    "thinkingPeekTail handles long text and whitespace-heavy tail fallback cleanly",
+    thinkingPeekTail(longPaddedTail, 12).endsWith("末尾关键词"),
+    thinkingPeekTail(longPaddedTail, 12),
+  );
   check("thinkingPeekTail returns empty on non-positive maxChars", thinkingPeekTail("abc", 0) === "");
+
+  const keyA = thinkingSubtitleKey(parseThinkingSections("第一句。\n第二句。\n第三句准备落码"), true);
+  const keyB = thinkingSubtitleKey(parseThinkingSections("第一句。\n第二句。\n第三句准备落码并且"), true);
+  const keyC = thinkingSubtitleKey(parseThinkingSections("第一句。\n第二句。\n第三句准备落码并且。\n第四句"), true);
+  const keyHeading1 = thinkingSubtitleKey(parseThinkingSections("**定位问题**\n读取"), true);
+  const keyHeading2 = thinkingSubtitleKey(parseThinkingSections("**定位问题**\n读取更多内容"), true);
+  check(
+    "thinkingSubtitleKey stays stable on per-token growth and changes on clause/paragraph swaps",
+    keyA === keyB && keyB !== keyC && keyHeading1 === keyHeading2 && keyHeading1 !== keyC,
+    `A=${keyA}, B=${keyB}, C=${keyC}, H1=${keyHeading1}, H2=${keyHeading2}`,
+  );
 
   check("formatThinkingDuration suppresses sub-100ms and non-finite values", formatThinkingDuration(0) === "" && formatThinkingDuration(99) === "" && formatThinkingDuration(Number.NaN) === "");
   check("formatThinkingDuration formats seconds to 1 decimal", formatThinkingDuration(2340) === "2.3s");
+  check("formatThinkingDuration rounds 59.95s–59.999s to 1m 0s (never 60.0s)", formatThinkingDuration(59_950) === "1m 0s" && formatThinkingDuration(59_999) === "1m 0s");
   check("formatThinkingDuration formats minutes and seconds", formatThinkingDuration(72_400) === "1m 12s");
 }
 
@@ -1168,11 +1187,14 @@ console.log("all 5 enhanced thinking styles execute end-to-end (rail, silk, caps
       layout: { compact: false },
       item: { data: { text: sampleThought, phase: "streaming" } },
     });
+    const railPeek = findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-peek")[0];
     check(
-      "rail running mounts style container, breathing rail, and peek window",
+      "rail running mounts style container, breathing rail, and unclipped 3-line peek window",
       findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-style-rail").length === 1 &&
         findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-rail-breathe").length === 1 &&
-        findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-peek").length === 1,
+        railPeek !== undefined &&
+        (railPeek.props?.style?.maxHeight ?? 0) >= 70,
+      `maxHeight=${railPeek?.props?.style?.maxHeight}`,
     );
     const headBtn = findAll(runningTree, (n) => n.type === "Pressable")[0];
     headBtn.props.onPress();
@@ -1187,6 +1209,17 @@ console.log("all 5 enhanced thinking styles execute end-to-end (rail, silk, caps
       scroll?.props?.testID === "dsh-scroll-box" &&
         scroll?.props?.style?.maxHeight === 310 &&
         collectText(scroll).includes("第一步：分析代码"),
+    );
+    const bodyCollapseBtn = findAll(scroll, (n) => n.type === "Pressable")[0];
+    bodyCollapseBtn?.props?.onPress();
+    const collapsedTree = h.render({
+      theme: { colors: COLORS },
+      layout: { compact: false },
+      item: { data: { text: sampleThought, phase: "complete" } },
+    });
+    check(
+      "tapping inside rail expanded ScrollView collapses the row",
+      findAll(collapsedTree, (n) => n.type === "ScrollView").length === 0,
     );
     h.unmountAll();
   }
@@ -1232,12 +1265,16 @@ console.log("all 5 enhanced thinking styles execute end-to-end (rail, silk, caps
       item: { data: { text: sampleThought, phase: "streaming" } },
     });
     const runningBadge = findAll(runningTree, (n) => n.props?.testID === "dsh-row-badge-running")[0];
+    const hasSurface1Backdrop =
+      runningBadge !== undefined &&
+      findAll(runningBadge, (n) => n.props?.style?.backgroundColor === COLORS.surface1).length >= 1;
     check(
       "capsule running mounts gliding progress bar, peek window, and surface1 badge backdrop",
       findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-style-capsule").length === 1 &&
         findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-progress-bar").length === 1 &&
         findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-peek").length === 1 &&
-        runningBadge !== undefined,
+        hasSurface1Backdrop,
+      `hasSurface1Backdrop=${hasSurface1Backdrop}`,
     );
     const settledTree = h.render({
       theme: { colors: COLORS },
@@ -1262,17 +1299,32 @@ console.log("all 5 enhanced thinking styles execute end-to-end (rail, silk, caps
   {
     const h = createTreeHarness();
     h.setStyle({ thinkingStyle: "stepper" });
+    const multiParaLong = [
+      "**步骤一**\n读取设置 schema。",
+      "**步骤二**\n核对双语词表。",
+      "**步骤三**\n检查样式接线。",
+      `**步骤四**\n${"长段落内容持续输出中，用于验证折叠流式预览高度与字符截断边界。".repeat(12)}`,
+    ].join("\n\n");
     const runningTree = h.render({
       theme: { colors: COLORS },
       layout: { compact: false },
-      item: { data: { text: sampleThought, phase: "streaming" } },
+      item: { data: { text: multiParaLong, phase: "streaming" } },
     });
+    const runningPeek = findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-peek")[0];
+    const runningStepsText = collectText(runningPeek);
     check(
-      "stepper running shows step timeline while streaming",
+      "stepper running bounds collapsed preview height and slices to recent 2 steps",
       findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-style-stepper").length === 1 &&
-        findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-steps").length === 1,
+        findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-steps").length === 1 &&
+        runningPeek?.props?.style?.maxHeight <= 96 &&
+        runningPeek?.props?.style?.overflow === "hidden" &&
+        !runningStepsText.includes("步骤一") &&
+        runningStepsText.includes("步骤三") &&
+        runningStepsText.includes("步骤四") &&
+        runningStepsText.length < 240,
+      `maxHeight=${runningPeek?.props?.style?.maxHeight}, len=${runningStepsText.length}`,
     );
-    // Fresh settled instance: historic complete row collapses steps and never fabricates 0.0s duration.
+    // Fresh settled instance: historic complete row collapses steps and never fabricates ANY duration.
     const hSettled = createTreeHarness();
     hSettled.setStyle({ thinkingStyle: "stepper" });
     const historicTree = hSettled.render({
@@ -1280,10 +1332,13 @@ console.log("all 5 enhanced thinking styles execute end-to-end (rail, silk, caps
       layout: { compact: false },
       item: { data: { text: sampleThought, phase: "complete" } },
     });
+    const historicText = collectText(historicTree);
     check(
-      "stepper historic settled row starts collapsed with honest step count (no fake 0.0s)",
+      "stepper historic settled row starts collapsed with honest step count (no fabricated duration)",
       findAll(historicTree, (n) => n.props?.testID === "dsh-thinking-steps").length === 0 &&
-        !collectText(historicTree).includes("0.0s"),
+        !/\d+(?:\.\d+)?s\b/.test(historicText) &&
+        !/\d+m\s+\d+s/.test(historicText),
+      historicText,
     );
     const headBtn = findAll(historicTree, (n) => n.type === "Pressable")[0];
     headBtn.props.onPress();
@@ -1297,8 +1352,33 @@ console.log("all 5 enhanced thinking styles execute end-to-end (rail, silk, caps
       findAll(expandedTree, (n) => n.type === "ScrollView" && n.props?.testID === "dsh-scroll-box").length === 1 &&
         findAll(expandedTree, (n) => n.props?.testID === "dsh-thinking-steps").length === 1,
     );
+    // Implicit paragraphs (no **Heading**) must never duplicate their first line in stepper expanded view.
+    const hImplicit = createTreeHarness();
+    hImplicit.setStyle({ thinkingStyle: "stepper" });
+    const implicitThought = "没有小标题的首行内容\n第二行补充说明。\n\n另一个隐式段落。";
+    const implicitInit = hImplicit.render({
+      theme: { colors: COLORS },
+      layout: { compact: false },
+      item: { data: { text: implicitThought, phase: "complete" } },
+    });
+    findAll(implicitInit, (n) => n.type === "Pressable")[0].props.onPress();
+    const implicitExpanded = hImplicit.render({
+      theme: { colors: COLORS },
+      layout: { compact: false },
+      item: { data: { text: implicitThought, phase: "complete" } },
+    });
+    const implicitSteps = findAll(implicitExpanded, (n) => n.props?.testID === "dsh-thinking-steps")[0];
+    const implicitText = collectText(implicitSteps);
+    const countOccurrences = (haystack, needle) => haystack.split(needle).length - 1;
+    check(
+      "stepper expanded does not duplicate first line of implicit paragraphs",
+      countOccurrences(implicitText, "没有小标题的首行内容") === 1 &&
+        countOccurrences(implicitText, "另一个隐式段落。") === 1,
+      implicitText,
+    );
     h.unmountAll();
     hSettled.unmountAll();
+    hImplicit.unmountAll();
   }
 
   // 5. Editorial Marginalia (E)
@@ -1384,17 +1464,60 @@ console.log("all 5 enhanced thinking styles execute end-to-end (rail, silk, caps
       animatedViews >= 3 && starts >= 3 && activeWhileMounted >= 3 && activeAnims.size === 0,
       `animatedViews=${animatedViews}, starts=${starts}, activeWhileMounted=${activeWhileMounted}, leaked=${activeAnims.size}`,
     );
+
+    // 6b. Native silk subtitle does NOT restart animation on per-token growth, only on clause/paragraph swaps
+    const hSilkNative = createTreeHarness({
+      Platform: { OS: "ios" },
+      Easing: { linear: "linear", sin: "sin", quad: "quad", cubic: "cubic", inOut: (x) => x, out: (x) => x },
+      Animated: {
+        Value: FakeAnimatedValue,
+        View: "Animated.View",
+        delay: () => makeAnim(),
+        timing: () => makeAnim(),
+        sequence: () => makeAnim(),
+        parallel: () => makeAnim(),
+        loop: () => makeAnim(),
+      },
+    });
+    hSilkNative.setStyle({ thinkingStyle: "silk" });
+    hSilkNative.render({
+      theme: { colors: COLORS },
+      layout: { compact: false },
+      item: { data: { text: "第一句。\n第二句。\n第三句准备落码", phase: "streaming" } },
+    });
+    const startsAfterBase = starts;
+    hSilkNative.render({
+      theme: { colors: COLORS },
+      layout: { compact: false },
+      item: { data: { text: "第一句。\n第二句。\n第三句准备落码并且继续", phase: "streaming" } },
+    });
+    const startsAfterToken = starts;
+    hSilkNative.render({
+      theme: { colors: COLORS },
+      layout: { compact: false },
+      item: { data: { text: "第一句。\n第二句。\n第三句准备落码并且继续。\n第四句新起点", phase: "streaming" } },
+    });
+    const startsAfterClause = starts;
+    hSilkNative.unmountAll();
+    check(
+      "Native silk subtitle keeps 0 extra Animated starts on per-token growth and triggers on clause swap",
+      startsAfterToken === startsAfterBase &&
+        startsAfterClause > startsAfterToken &&
+        activeAnims.size === 0,
+      `base=${startsAfterBase}, token=${startsAfterToken}, clause=${startsAfterClause}, leaked=${activeAnims.size}`,
+    );
   }
 
-  // 7. Zero hardcoded colors in thinking-styles.tsx and thinking-motion.tsx
+  // 7. Zero hardcoded colors across all thinking & status icon client files
   {
-    const stylesSrcPath = findRepoFile("client/thinking-styles.tsx");
-    const motionSrcPath = findRepoFile("client/thinking-motion.tsx");
     const colorPattern = /#[0-9a-fA-F]{3,8}\b|\b(?:rgba?|hsla?)\s*\(/;
-    for (const [label, srcPath] of [
-      ["thinking-styles.tsx", stylesSrcPath],
-      ["thinking-motion.tsx", motionSrcPath],
+    for (const [label, relPath] of [
+      ["thinking-styles.tsx", "client/thinking-styles.tsx"],
+      ["thinking-motion.tsx", "client/thinking-motion.tsx"],
+      ["inline-thinking.tsx", "client/inline-thinking.tsx"],
+      ["row-status-icon.tsx", "client/row-status-icon.tsx"],
     ]) {
+      const srcPath = findRepoFile(relPath);
       check(`located ${label} for colour audit`, srcPath !== undefined);
       if (srcPath !== undefined) {
         const code = readFileSync(srcPath, "utf8")
@@ -1409,12 +1532,14 @@ console.log("all 5 enhanced thinking styles execute end-to-end (rail, silk, caps
     }
   }
 
-  // 8. Display settings screen renders all 6 thinking styles and saves selection immediately
+  // 8. Display settings screen: 6 thinking styles, draft preservation, save failure rollback, concurrency lock, reset
   {
     const settingsPath = join(__dirname, "client", "settings-screen.js");
     check("compiled client/settings-screen.js exists", existsSync(settingsPath));
     if (existsSync(settingsPath)) {
       const savedCalls = [];
+      let nextSaveBehavior = "succeed";
+      let pendingResolve = null;
       let currentStyleValues = {
         rowMarginY: 0,
         toolRowPaddingY: 0,
@@ -1438,6 +1563,11 @@ console.log("all 5 enhanced thinking styles execute end-to-end (rail, silk, caps
               screenSlots[i] = typeof next === "function" ? next(screenSlots[i]) : next;
             },
           ];
+        },
+        useRef(init) {
+          const i = screenCursor++;
+          if (!(i in screenSlots)) screenSlots[i] = { current: init };
+          return screenSlots[i];
         },
         useMemo(fn) {
           return fn();
@@ -1482,6 +1612,19 @@ console.log("all 5 enhanced thinking styles execute end-to-end (rail, silk, caps
               saveError: null,
               save: async (data, rev) => {
                 savedCalls.push({ data, rev });
+                if (nextSaveBehavior === "fail") {
+                  nextSaveBehavior = "succeed";
+                  return false;
+                }
+                if (nextSaveBehavior === "defer") {
+                  nextSaveBehavior = "succeed";
+                  return new Promise((resolve) => {
+                    pendingResolve = (ok) => {
+                      if (ok) currentStyleValues = data;
+                      resolve(ok);
+                    };
+                  });
+                }
                 currentStyleValues = data;
                 return true;
               },
@@ -1526,6 +1669,11 @@ console.log("all 5 enhanced thinking styles execute end-to-end (rail, silk, caps
           layout: { compact: false },
         });
       };
+      const flushMicrotasks = () =>
+        Promise.resolve()
+          .then(() => Promise.resolve())
+          .then(() => Promise.resolve());
+
       const screenTree = renderScreen();
       const pressables = findAll(screenTree, (n) => n.type === "Pressable");
       const styleKeys = ["classic", "rail", "silk", "capsule", "stepper", "editorial"];
@@ -1538,30 +1686,100 @@ console.log("all 5 enhanced thinking styles execute end-to-end (rail, silk, caps
         `found ${styleButtons.length} button(s)`,
       );
 
-      const railButton = styleButtons.find((b) => b.key === "rail");
+      // Edit numeric draft (expandedMaxHeight -> "320"), then pick 'rail' thinking style.
+      const inputs = findAll(screenTree, (n) => n.type === "TextInput");
+      const maxHeightInput = inputs.find((n) => n.props?.value === "260");
+      maxHeightInput?.props?.onChangeText?.("320");
+      const treeWithDraft = renderScreen();
+      const railButton = findAll(treeWithDraft, (n) => n.type === "Pressable").find((b) => b.key === "rail");
       railButton?.props?.onPress();
-      Promise.resolve()
-        .then(() => Promise.resolve())
+
+      flushMicrotasks()
         .then(() => {
+          const afterRailTree = renderScreen();
+          const preservedInput = findAll(afterRailTree, (n) => n.type === "TextInput").find(
+            (n) => n.props?.value === "320",
+          );
           check(
-            "tapping Breathing Rail saves thinkingStyle='rail' with current revision",
+            "tapping Breathing Rail saves thinkingStyle='rail' with current revision and preserves numeric draft",
             savedCalls.length === 1 &&
               savedCalls[0].data.thinkingStyle === "rail" &&
-              savedCalls[0].rev === 7,
+              savedCalls[0].rev === 7 &&
+              preservedInput !== undefined,
             JSON.stringify(savedCalls),
           );
-          const afterSelectTree = renderScreen();
-          const resetBtn = findAll(afterSelectTree, (n) => n.type === "Pressable").find(
+          // Saving numeric draft must keep thinkingStyle='rail' (never revert to 'classic').
+          const saveBtn = findAll(afterRailTree, (n) => n.type === "Pressable").find(
+            (n) => n.props?.accessibilityLabel === "保存" || n.props?.accessibilityLabel === "Save",
+          );
+          saveBtn?.props?.onPress();
+          return flushMicrotasks();
+        })
+        .then(() => {
+          check(
+            "saving numeric draft persists expandedMaxHeight=320 while preserving thinkingStyle='rail'",
+            savedCalls.length === 2 &&
+              savedCalls[1].data.expandedMaxHeight === 320 &&
+              savedCalls[1].data.thinkingStyle === "rail",
+            JSON.stringify(savedCalls[1]),
+          );
+          // Failure path: save returns false without mutating values -> rolls back picked style and shows error.
+          const beforeFailTree = renderScreen();
+          nextSaveBehavior = "fail";
+          const stepperBtn = findAll(beforeFailTree, (n) => n.type === "Pressable").find(
+            (b) => b.key === "stepper",
+          );
+          stepperBtn?.props?.onPress();
+          return flushMicrotasks();
+        })
+        .then(() => {
+          const afterFailTree = renderScreen();
+          const afterFailButtons = findAll(afterFailTree, (n) => n.type === "Pressable").filter((b) =>
+            styleKeys.includes(b.key),
+          );
+          const errorTexts = findAll(
+            afterFailTree,
+            (n) => n.type === "Text" && n.props?.style?.color === COLORS.statusDanger,
+          );
+          check(
+            "failed style save rolls back selection to 'rail' and shows fallback error banner",
+            savedCalls.length === 3 &&
+              afterFailButtons.find((b) => b.key === "rail")?.props?.accessibilityState?.selected === true &&
+              afterFailButtons.find((b) => b.key === "stepper")?.props?.accessibilityState?.selected === false &&
+              errorTexts.length >= 1,
+            `selected=${afterFailButtons.find((b) => b.props?.accessibilityState?.selected)?.key}, errors=${errorTexts.length}`,
+          );
+          // Concurrency guard: two rapid taps while save promise is in-flight only fire one save.
+          nextSaveBehavior = "defer";
+          const silkBtn = afterFailButtons.find((b) => b.key === "silk");
+          const capsuleBtn = afterFailButtons.find((b) => b.key === "capsule");
+          silkBtn?.props?.onPress();
+          capsuleBtn?.props?.onPress();
+          return flushMicrotasks();
+        })
+        .then(() => {
+          check(
+            "synchronous inFlight lock blocks rapid double-tap from firing duplicate concurrent saves",
+            savedCalls.length === 4 && savedCalls[3].data.thinkingStyle === "silk",
+            `calls=${savedCalls.length}`,
+          );
+          pendingResolve?.(true);
+          pendingResolve = null;
+          return flushMicrotasks();
+        })
+        .then(() => {
+          const afterSilkTree = renderScreen();
+          const resetBtn = findAll(afterSilkTree, (n) => n.type === "Pressable").find(
             (n) => n.props?.accessibilityLabel === "恢复默认" || n.props?.accessibilityLabel === "Restore defaults",
           );
           resetBtn?.props?.onPress();
-          return Promise.resolve().then(() => Promise.resolve());
+          return flushMicrotasks();
         })
         .then(() => {
           check(
             "tapping Restore defaults resets thinkingStyle back to 'classic'",
-            savedCalls.length === 2 && savedCalls[1].data.thinkingStyle === "classic",
-            JSON.stringify(savedCalls[1]),
+            savedCalls.length === 5 && savedCalls[4].data.thinkingStyle === "classic",
+            JSON.stringify(savedCalls[4]),
           );
           console.log(`\n${passed} passed, ${failed} failed`);
           process.exit(failed === 0 ? 0 : 1);
