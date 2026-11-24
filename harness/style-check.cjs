@@ -18,44 +18,30 @@
  */
 "use strict";
 
+const tokensModule = require("./client/tokens.js");
 const {
   BODY_INDENT,
   CARD_HEAD_ACTION_GAP,
   CARD_HEAD_FONT_SIZE,
   CARD_HEAD_GAP,
   CARD_HEAD_LINE_HEIGHT,
-  CARD_HEAD_PADDING_BOTTOM,
-  CARD_HEAD_PADDING_LEFT,
-  CARD_HEAD_PADDING_RIGHT,
-  CARD_HEAD_PADDING_TOP,
   CARD_HEAD_STATUS_MARGIN_RIGHT,
-  CARD_RADIUS,
   CODE_FONT_FAMILY,
   CODE_FONT_SIZE,
   CODE_LINE_HEIGHT,
-  CODE_MAX_HEIGHT,
   COMMAND_FONT_SIZE,
   COMMAND_LINE_HEIGHT,
-  COMMAND_PADDING_HORIZONTAL,
-  COMMAND_PADDING_VERTICAL,
   DIFF_BAR_WIDTH,
-  DIFF_LINE_PADDING_HORIZONTAL,
   DIFF_STAT_FONT_SIZE,
   DIFF_STAT_MARGIN_LEFT,
   DIFF_TINT_DARK,
   DIFF_TINT_LIGHT,
-  FOLD_LINES,
   FRAMELESS_BORDER_WIDTH,
   FRAMELESS_GAP,
   FRAMELESS_PADDING_LEFT,
   HAIRLINE,
   OUTPUT_FONT_SIZE,
   OUTPUT_LINE_HEIGHT,
-  OUTPUT_PADDING_HORIZONTAL,
-  OUTPUT_PADDING_VERTICAL,
-  READ_BODY_PADDING_BOTTOM,
-  READ_BODY_PADDING_HORIZONTAL,
-  READ_BODY_PADDING_TOP,
   READ_GUTTER_CHAR_WIDTH,
   READ_GUTTER_MARGIN,
   READ_GUTTER_MIN_DIGITS,
@@ -64,15 +50,9 @@ const {
   ROW_HEAD_GAP,
   ROW_HEIGHT,
   ROW_LINE_HEIGHT,
-  SEARCH_BODY_PADDING_BOTTOM,
-  SEARCH_BODY_PADDING_RIGHT,
-  SEARCH_BODY_PADDING_TOP,
   SEARCH_EMPTY_PADDING_HORIZONTAL,
   SEARCH_EMPTY_PADDING_VERTICAL,
   SEARCH_FILE_GAP,
-  SEARCH_HEAD_GAP,
-  SEARCH_HEAD_PADDING_HORIZONTAL,
-  SEARCH_HEAD_PADDING_VERTICAL,
   SEARCH_LINE_MIN_HEIGHT,
   SEARCH_LINE_PADDING_LEFT,
   SEARCH_SUMMARY_FONT_SIZE,
@@ -80,12 +60,8 @@ const {
   SEP_MARGIN,
   SEP_RADIUS,
   SEP_SIZE,
-  TERMINAL_MAX_LINES,
-  TERMINAL_OUTPUT_MAX_HEIGHT,
   WEB_GAP,
   WEB_META_GAP,
-  WEB_PADDING_HORIZONTAL,
-  WEB_PADDING_VERTICAL,
   WEB_PUBLISHED_LINE_HEIGHT,
   WEB_SNIPPET_FONT_SIZE,
   WEB_SNIPPET_LINE_HEIGHT,
@@ -95,7 +71,6 @@ const {
   WEB_SOURCE_INDEX_WIDTH,
   WEB_SOURCE_LINK_FONT_SIZE,
   WEB_SOURCE_LINK_LINE_HEIGHT,
-  WEB_SOURCES_MAX_HEIGHT,
   WEB_STATUS_FONT_SIZE,
   WEB_STATUS_LINE_HEIGHT,
   WEB_TRUNCATED_MARGIN_TOP,
@@ -106,19 +81,13 @@ const {
   cardHeadHeadingStyle,
   cardHeadLangTextStyle,
   cardHeadStatusTextStyle,
-  cardHeadStyle,
   cardHeadTitleTextStyle,
-  cardStyle,
-  codeRegionStyle,
   codeTextStyle,
-  commandRegionStyle,
   commandTextStyle,
-  diffBodyStyle,
   diffBodyTextStyle,
   diffChromeTextStyle,
   diffLineStyle,
   diffMarkerTextStyle,
-  diffRowStyle,
   diffShaped,
   diffStat,
   diffStatTextStyle,
@@ -127,13 +96,10 @@ const {
   diffTotals,
   dividerStyle,
   expandedScrollStyle,
-  foldWindow,
   framelessBlockStyle,
   framelessHeadStyle,
   isLightSurface,
-  outputRegionStyle,
   outputTextStyle,
-  readExpandTextStyle,
   readGutterTextStyle,
   readGutterWidth,
   readLineStyle,
@@ -143,18 +109,15 @@ const {
   rowLabelTextStyle,
   rowRootStyle,
   searchEmptyTextStyle,
-  searchExpandTextStyle,
   searchFileCountTextStyle,
   searchFileHeadStyle,
   searchFilePathTextStyle,
-  searchHeadStyle,
   searchLineNumberTextStyle,
   searchLineStyle,
   searchLineTextStyle,
   searchSummaryTextStyle,
   separatorStyle,
   summaryTextStyle,
-  webCardBodyStyle,
   webFetchStyle,
   webMetaTextStyle,
   webPublishedTextStyle,
@@ -162,11 +125,10 @@ const {
   webSourceIndexTextStyle,
   webSourceLinkTextStyle,
   webSourceRowStyle,
-  webSourcesStyle,
   webTruncatedTextStyle,
   webUrlTextStyle,
   withAlpha,
-} = require("./client/tokens.js");
+} = tokensModule;
 
 const { readFileSync, existsSync } = require("node:fs");
 const { dirname, join } = require("node:path");
@@ -335,26 +297,20 @@ console.log("the diff stat suffix");
 
 console.log("the command banner and the output region are split");
 {
-  equal("banner padding V", COMMAND_PADDING_VERTICAL, 9);
-  equal("banner padding H", COMMAND_PADDING_HORIZONTAL, 14);
   equal("command size", COMMAND_FONT_SIZE, 11);
   // `.promptLine { line-height: var(--dsl-terminal-line-height) }`, and the card
   // rebinds that variable to 18px (`.o3BgMG_terminalBody`). The 16px in
   // `--dsl-terminal-font`'s shorthand (`11px/16px …`) is inherited, not declared,
   // so it never wins on this element.
   equal("command line height (the card's rebound 18)", COMMAND_LINE_HEIGHT, 18);
-  equal("command region", JSON.stringify(commandRegionStyle()), JSON.stringify({ paddingVertical: 9, paddingHorizontal: 14 }));
   const command = commandTextStyle(COLORS);
   equal("command size in the style", command.fontSize, 11);
   equal("command line height in the style", command.lineHeight, 18);
   equal("the command is grey like the row title", command.color, COLORS.foregroundMuted);
   equal("command is monospace", command.fontFamily, CODE_FONT_FAMILY);
 
-  equal("output padding V", OUTPUT_PADDING_VERTICAL, 12);
-  equal("output padding H", OUTPUT_PADDING_HORIZONTAL, 14);
   equal("output size", OUTPUT_FONT_SIZE, 11);
   equal("output line height", OUTPUT_LINE_HEIGHT, 18);
-  equal("output region", JSON.stringify(outputRegionStyle()), JSON.stringify({ paddingVertical: 12, paddingHorizontal: 14 }));
   const output = outputTextStyle(COLORS);
   equal("output size in the style", output.fontSize, 11);
   equal("output line height in the style", output.lineHeight, 18);
@@ -362,7 +318,6 @@ console.log("the command banner and the output region are split");
 
   equal("code size", CODE_FONT_SIZE, 11);
   equal("code line height", CODE_LINE_HEIGHT, 19);
-  equal("code region", JSON.stringify(codeRegionStyle()), JSON.stringify({ paddingVertical: 12, paddingHorizontal: 14 }));
   // The fallback every non-diff expanded block uses (a `write` body, a plain
   // `bash` detail, a row whose meta did not parse). It is grey on purpose: the
   // user asked for those blocks to read like the thinking row, and only the
@@ -381,51 +336,14 @@ console.log("the command banner and the output region are split");
   );
 }
 
-console.log("folding: DSH's headTailCap, shared by search, read and diff");
-{
-  // The old "is this a command block" guess lived here; it is gone. Which block
-  // a row draws is now an explicit field on ToolCallData (`kind`), asserted in
-  // tool-call-check.cjs where the data layer is available. What stays in this
-  // file is the arithmetic the fold is made of.
-  const eight = foldWindow(20, FOLD_LINES.search, false);
-  equal("an 8-line cap hides 12 of 20", eight.hidden, 12);
-  check("and is capped", eight.capped === true);
-  equal("head is ceil(8/2)", eight.headLines, 4);
-  equal("tail is the rest", eight.tailLines, 4);
-  check("head + tail is the cap", eight.headLines + eight.tailLines === FOLD_LINES.search);
-
-  const nine = foldWindow(20, FOLD_LINES.diff, false);
-  equal("a 9-line cap keeps 5 at the head", nine.headLines, 5);
-  equal("and 4 at the tail", nine.tailLines, 4);
-
-  const short = foldWindow(8, FOLD_LINES.search, false);
-  check("exactly the cap is not folded", short.hidden === 0 && short.capped === false);
-  check("and shows nothing as hidden", short.hidden === 0);
-
-  const expanded = foldWindow(20, FOLD_LINES.search, true);
-  equal("expanding keeps the same hidden count (the button still needs it)", expanded.hidden, 12);
-  check("but stops capping", expanded.capped === false);
-
-  const tail = foldWindow(9, FOLD_LINES.search, true);
-  check("an expanded block past the cap is never capped", tail.capped === false);
-}
-
 console.log("the card head (DSH's CodeToolbar)");
 {
-  equal("head padding top", CARD_HEAD_PADDING_TOP, 10);
-  equal("head padding right", CARD_HEAD_PADDING_RIGHT, 18);
-  equal("head padding bottom", CARD_HEAD_PADDING_BOTTOM, 8);
-  equal("head padding left (aligns with the diff body)", CARD_HEAD_PADDING_LEFT, 22);
   equal("heading gap", CARD_HEAD_GAP, 12);
   equal("head font size", CARD_HEAD_FONT_SIZE, 11);
   equal("head line height", CARD_HEAD_LINE_HEIGHT, 18);
   equal("status keeps 8px off the copy control", CARD_HEAD_STATUS_MARGIN_RIGHT, 8);
   equal("actions gap", CARD_HEAD_ACTION_GAP, 4);
 
-  const head = cardHeadStyle();
-  equal("head is one row", head.flexDirection, "row");
-  equal("status and copy sit at the far end", head.justifyContent, "space-between");
-  equal("head padding", JSON.stringify([head.paddingTop, head.paddingRight, head.paddingBottom, head.paddingLeft]), "[10,18,8,22]");
   equal("heading aligns its baseline", cardHeadHeadingStyle().alignItems, "baseline");
   check("and may shrink", cardHeadHeadingStyle().flexShrink === 1);
   check("while the actions never do", cardHeadActionsStyle().flexShrink === 0);
@@ -441,23 +359,13 @@ console.log("the card head (DSH's CodeToolbar)");
 
 console.log("the search card");
 {
-  equal("header padding V", SEARCH_HEAD_PADDING_VERTICAL, 9);
-  equal("header padding H", SEARCH_HEAD_PADDING_HORIZONTAL, 14);
-  equal("header gap", SEARCH_HEAD_GAP, 12);
   equal("summary size", SEARCH_SUMMARY_FONT_SIZE, 13);
   equal("summary line height", SEARCH_SUMMARY_LINE_HEIGHT, 20);
-  equal("body padding top", SEARCH_BODY_PADDING_TOP, 8);
-  equal("body padding bottom", SEARCH_BODY_PADDING_BOTTOM, 12);
-  equal("body pads right 0 + our 14 (DSH scrolls to the edge)", SEARCH_BODY_PADDING_RIGHT, 14);
   equal("row slot", SEARCH_LINE_MIN_HEIGHT, 22);
   equal("row indent", SEARCH_LINE_PADDING_LEFT, 14);
   equal("file header gap", SEARCH_FILE_GAP, 8);
   equal("empty state padding", JSON.stringify([SEARCH_EMPTY_PADDING_VERTICAL, SEARCH_EMPTY_PADDING_HORIZONTAL]), "[12,14]");
 
-  const head = searchHeadStyle(COLORS);
-  equal("header is one row", head.flexDirection, "row");
-  equal("header padding", JSON.stringify([head.paddingVertical, head.paddingHorizontal]), "[9,14]");
-  equal("the banner sits on its own surface (DSH's banner token)", head.backgroundColor, COLORS.surface2);
   const summary = searchSummaryTextStyle(COLORS);
   equal("the stats line takes the free space", summary.flex, 1);
   check("and can shrink", summary.minWidth === 0);
@@ -473,15 +381,11 @@ console.log("the search card");
   equal("the line number is muted", searchLineNumberTextStyle(COLORS).color, COLORS.foregroundMuted);
   equal("the match text is muted, not primary", searchLineTextStyle(COLORS).color, COLORS.foregroundMuted);
   check("nothing shrinks: the row scrolls sideways instead", searchLineTextStyle(COLORS).flexShrink === 0 && searchLineNumberTextStyle(COLORS).flexShrink === 0);
-  equal("the fold control aligns with the rows", searchExpandTextStyle(COLORS).paddingLeft, SEARCH_LINE_PADDING_LEFT);
   equal("the empty state is muted", searchEmptyTextStyle(COLORS).color, COLORS.foregroundMuted);
 }
 
 console.log("the read card");
 {
-  equal("body padding top", READ_BODY_PADDING_TOP, 6);
-  equal("body padding bottom", READ_BODY_PADDING_BOTTOM, 20);
-  equal("body padding H", READ_BODY_PADDING_HORIZONTAL, 22);
   equal("gutter margin", READ_GUTTER_MARGIN, 12);
   equal("gutter holds at least three digits (DSH's max(3, digits)ch)", READ_GUTTER_MIN_DIGITS, 3);
   equal("a `ch` at the 11px code size", READ_GUTTER_CHAR_WIDTH, 6.6);
@@ -494,17 +398,10 @@ console.log("the read card");
   equal("the code takes the rest without shrinking", readLineTextStyle(COLORS).flexShrink, 0);
   equal("the read code is grey like its gutter", readLineTextStyle(COLORS).color, COLORS.foregroundMuted);
   equal("a read row is one code line tall", readLineStyle().minHeight, CODE_LINE_HEIGHT);
-  equal(
-    "the fold control starts where the code starts",
-    readExpandTextStyle(COLORS, 3).paddingLeft,
-    readGutterWidth(3) + READ_GUTTER_MARGIN,
-  );
 }
 
 console.log("the diff card's chrome");
 {
-  equal("a row pads 22 (DSH's `.line { padding: 0 22px }`)", diffRowStyle().paddingHorizontal, 22);
-  equal("the body pads 6 / 20", JSON.stringify(diffBodyStyle()), JSON.stringify({ paddingTop: 6, paddingBottom: 20 }));
   equal("path and hunk headers are muted", diffChromeTextStyle(COLORS).color, COLORS.foregroundMuted);
   equal("and monospace", diffChromeTextStyle(COLORS).fontFamily, CODE_FONT_FAMILY);
   equal(
@@ -516,15 +413,12 @@ console.log("the diff card's chrome");
 
 console.log("the web card");
 {
-  equal("padding V", WEB_PADDING_VERTICAL, 12);
-  equal("padding H", WEB_PADDING_HORIZONTAL, 14);
   equal("fetch gap", WEB_GAP, 6);
   equal("url size", WEB_URL_FONT_SIZE, 13);
   equal("url line height", WEB_URL_LINE_HEIGHT, 19);
   equal("meta gap", WEB_META_GAP, 12);
   equal("status size", WEB_STATUS_FONT_SIZE, 13);
   equal("status line height", WEB_STATUS_LINE_HEIGHT, 20);
-  equal("the list caps at 320px", WEB_SOURCES_MAX_HEIGHT, 320);
   equal("sources gap", WEB_SOURCE_GAP, 10);
   equal("the reference number column", WEB_SOURCE_INDEX_WIDTH, 24);
   equal("with its own gap", WEB_SOURCE_INDEX_GAP, 8);
@@ -536,7 +430,6 @@ console.log("the web card");
   equal("published line height", WEB_PUBLISHED_LINE_HEIGHT, 20);
   equal("the search card's truncation note keeps DSH's 8px", WEB_TRUNCATED_MARGIN_TOP, 8);
 
-  equal("the card body is one padded surface", JSON.stringify(webCardBodyStyle()), JSON.stringify({ paddingVertical: 12, paddingHorizontal: 14 }));
   equal("the fetch shape is a column", webFetchStyle().flexDirection, "column");
   equal("with the gap", webFetchStyle().gap, WEB_GAP);
   equal("the URL uses the theme's link colour", webUrlTextStyle(COLORS).color, COLORS.accent);
@@ -549,7 +442,6 @@ console.log("the web card");
   equal("the number column is muted", webSourceIndexTextStyle(COLORS).color, COLORS.foregroundMuted);
   equal("a source row is a row", webSourceRowStyle().flexDirection, "row");
   equal("and carries the list gap", webSourceRowStyle().marginBottom, WEB_SOURCE_GAP);
-  equal("the scroller caps its height", webSourcesStyle().maxHeight, 320);
   equal("a snippet is muted", webSnippetTextStyle(COLORS).color, COLORS.foregroundMuted);
   equal("a date is muted", webPublishedTextStyle(COLORS).color, COLORS.foregroundMuted);
   equal("the fetch truncation note has no top margin (DSH zeroes it there)", webTruncatedTextStyle(COLORS).marginTop, 0);
@@ -581,12 +473,6 @@ console.log("diff lines: 3px bar, 8% (12% dark) wash");
   equal("added text is semantic", diffTextColor(COLORS, "add"), COLORS.statusSuccess);
   equal("removed text is semantic", diffTextColor(COLORS, "del"), COLORS.statusDanger);
   equal("context text is muted", diffTextColor(COLORS, "context"), COLORS.foregroundMuted);
-  equal("diff line padding H", DIFF_LINE_PADDING_HORIZONTAL, 22);
-  equal(
-    "the diff body's lines line up with the card head",
-    DIFF_LINE_PADDING_HORIZONTAL,
-    cardHeadStyle().paddingLeft,
-  );
 
   const marker = diffMarkerTextStyle(COLORS, "add");
   const body = diffBodyTextStyle(COLORS, "add");
@@ -596,19 +482,12 @@ console.log("diff lines: 3px bar, 8% (12% dark) wash");
   equal("diff body text takes the rest of the line", body.flex, 1);
 }
 
-console.log("the card");
+console.log("the divider hairline");
 {
-  equal("card radius", CARD_RADIUS, 16);
   equal("hairline design value", HAIRLINE, 0.5);
-  const card = cardStyle(COLORS);
-  equal("radius in the style", card.borderRadius, 16);
-  equal("border is one hairline", card.borderWidth, 0.5);
-  equal("border colour is the theme's", card.borderColor, COLORS.border);
-  equal("card surface", card.backgroundColor, COLORS.surface1);
-  equal("the card clips its own corners", card.overflow, "hidden");
-  equal("RN's device hairline passes through", cardStyle(COLORS, 0.33).borderWidth, 0.33);
   equal("divider is the same hairline", dividerStyle(COLORS).height, 0.5);
   equal("divider colour", dividerStyle(COLORS).backgroundColor, COLORS.border);
+  equal("RN's device hairline passes through", dividerStyle(COLORS, 0.33).height, 0.33);
 }
 
 console.log("light or dark decides the wash");
@@ -769,19 +648,36 @@ console.log("state colours");
   );
 }
 
-console.log("folding and caps for the next phase");
+console.log("retired card/fold/fixed-cap exports are removed from client/tokens.ts");
 {
-  equal("diff folds 9 lines", FOLD_LINES.diff, 9);
-  equal("read folds 8", FOLD_LINES.read, 8);
-  equal("search folds 8", FOLD_LINES.search, 8);
-  equal("a diff fold is head 5 + tail 4", FOLD_LINES.diff, 5 + 4);
-  equal("search folds head 4 + tail 4", FOLD_LINES.search, 4 + 4);
-  equal("terminal never folds", TERMINAL_MAX_LINES, Number.POSITIVE_INFINITY);
-  // DSH binds this to `--dsl-terminal-output-max-height` on `.terminalBody` and
-  // `.output` uses it as `max-height`; the whole output is rendered and this is
-  // the only thing keeping a long log from pushing the timeline down.
-  equal("the terminal output scrolls in 224px", TERMINAL_OUTPUT_MAX_HEIGHT, 224);
-  equal("the code card caps at 260px", CODE_MAX_HEIGHT, 260);
+  const retiredExports = [
+    "CARD_RADIUS",
+    "cardStyle",
+    "cardHeadStyle",
+    "commandRegionStyle",
+    "outputRegionStyle",
+    "codeRegionStyle",
+    "searchHeadStyle",
+    "searchExpandTextStyle",
+    "readExpandTextStyle",
+    "diffRowStyle",
+    "diffBodyStyle",
+    "webCardBodyStyle",
+    "webSourcesStyle",
+    "WEB_SOURCES_MAX_HEIGHT",
+    "foldWindow",
+    "FOLD_LINES",
+    "TERMINAL_MAX_LINES",
+    "TERMINAL_OUTPUT_MAX_HEIGHT",
+    "terminalOutputScrollStyle",
+    "CODE_MAX_HEIGHT",
+  ];
+  const lingering = retiredExports.filter((name) => name in tokensModule);
+  check(
+    "retired card/fold/fixed-cap exports are no longer exported by client/tokens.js",
+    lingering.length === 0,
+    lingering.join(", "),
+  );
 }
 
 console.log("frameless expanded block and scroll cap tokens");

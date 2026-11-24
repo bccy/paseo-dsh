@@ -185,39 +185,11 @@ export function diffStatTextStyle(colors: TokenColors, kind: "added" | "removed"
 }
 
 /* -------------------------------------------------------------------------- */
-/* Card                                                                       */
+/* Divider & frameless expanded block                                         */
 /* -------------------------------------------------------------------------- */
 
-/** DSH's card radius (`--dsw-radius-lg` at this size). */
-export const CARD_RADIUS = 16;
-/** DSH's card border: `.5px solid var(--dsw-alias-border-l1)`. */
+/** DSH's hairline divider thickness: `.5px solid var(--dsw-alias-border-l1)`. */
 export const HAIRLINE = 0.5;
-
-/**
- * The card every expanded block lives in: 16px radius, one hairline border, and
- * a card surface rather than a translucent wash over the timeline.
- *
- * `hairline` defaults to the design value; the renderer passes
- * `StyleSheet.hairlineWidth` so a 3x device gets its own thinner hairline.
- */
-export function cardStyle(
-  colors: TokenColors,
-  hairline: number = HAIRLINE,
-): {
-  borderRadius: number;
-  borderWidth: number;
-  borderColor: string;
-  backgroundColor: string;
-  overflow: "hidden";
-} {
-  return {
-    borderRadius: CARD_RADIUS,
-    borderWidth: hairline,
-    borderColor: colors.border,
-    backgroundColor: colors.surface1,
-    overflow: "hidden",
-  };
-}
 
 /** A full-bleed hairline: DSH draws them at the same `.5px` as the border. */
 export function dividerStyle(
@@ -303,17 +275,10 @@ export const CODE_FONT_SIZE = 11;
 /** …at 19px of line. Diff, read and search blocks all use it. */
 export const CODE_LINE_HEIGHT = 19;
 
-/** Body padding for the text/code cards (diff lines pad themselves). */
-export const CODE_PADDING_VERTICAL = 12;
-export const CODE_PADDING_HORIZONTAL = 14;
-
 /* -------------------------------------------------------------------------- */
 /* Command banner and output (DSH's TerminalBlock)                            */
 /* -------------------------------------------------------------------------- */
 
-/** `.header { padding: 9px 14px }` — full width, no gutter of our own. */
-export const COMMAND_PADDING_VERTICAL = 9;
-export const COMMAND_PADDING_HORIZONTAL = 14;
 /** `--dsw-font-markdown-code-block-small`: 11px. */
 export const COMMAND_FONT_SIZE = 11;
 /**
@@ -337,21 +302,7 @@ export const OUTPUT_LINE_HEIGHT = 18;
  */
 export const COMMAND_LINE_HEIGHT = 18;
 
-/** `.output { padding: 12px 14px 12px 0 }`, minus DSH's 30px dot gutter. */
-export const OUTPUT_PADDING_VERTICAL = 12;
-export const OUTPUT_PADDING_HORIZONTAL = 14;
 export const OUTPUT_FONT_SIZE = 11;
-
-/** The command banner's own box. */
-export function commandRegionStyle(): {
-  paddingVertical: number;
-  paddingHorizontal: number;
-} {
-  return {
-    paddingVertical: COMMAND_PADDING_VERTICAL,
-    paddingHorizontal: COMMAND_PADDING_HORIZONTAL,
-  };
-}
 
 /**
  * The command: the same grey as the row's own title.
@@ -375,17 +326,6 @@ export function commandTextStyle(colors: TokenColors): {
   };
 }
 
-/** The output region's own box. */
-export function outputRegionStyle(): {
-  paddingVertical: number;
-  paddingHorizontal: number;
-} {
-  return {
-    paddingVertical: OUTPUT_PADDING_VERTICAL,
-    paddingHorizontal: OUTPUT_PADDING_HORIZONTAL,
-  };
-}
-
 /** The printed output: 11/18, the expanded card's one grey (DSH's `.line`). */
 export function outputTextStyle(colors: TokenColors): {
   fontFamily: string;
@@ -398,17 +338,6 @@ export function outputTextStyle(colors: TokenColors): {
     fontSize: OUTPUT_FONT_SIZE,
     lineHeight: OUTPUT_LINE_HEIGHT,
     color: colors.foregroundMuted,
-  };
-}
-
-/** The box a plain text/code body sits in. */
-export function codeRegionStyle(): {
-  paddingVertical: number;
-  paddingHorizontal: number;
-} {
-  return {
-    paddingVertical: CODE_PADDING_VERTICAL,
-    paddingHorizontal: CODE_PADDING_HORIZONTAL,
   };
 }
 
@@ -444,14 +373,6 @@ export const DIFF_BAR_WIDTH = 3;
 /** Added/removed wash over the card: 8% on light, 12% on dark. */
 export const DIFF_TINT_LIGHT = 0.08;
 export const DIFF_TINT_DARK = 0.12;
-/**
- * `.line { padding: 0 22px }` — DSH's own inset, not the card's body padding.
- *
- * Phase 1 trimmed this to 14 because every surface then carried its own 14px
- * body padding; the diff card now has DSH's `padding: 6px 0 20px`, so the lines
- * pad themselves to 22 and line up with the card head's own 22px left inset.
- */
-export const DIFF_LINE_PADDING_HORIZONTAL = 22;
 /** The `+`/`-` marker column, so a full-width body still aligns under itself. */
 export const DIFF_MARKER_WIDTH = 12;
 
@@ -706,16 +627,6 @@ export function diffStat(data: {
 /* Card head (DSH's `CodeToolbar`)                                            */
 /* -------------------------------------------------------------------------- */
 
-/**
- * `.header { padding: 10px 18px 8px 22px }` on DSH's code card.
- *
- * The asymmetry is DSH's own: the head lines up with the diff body's own
- * `padding: 0 22px` on the left and with its narrower right inset on the right.
- */
-export const CARD_HEAD_PADDING_TOP = 10;
-export const CARD_HEAD_PADDING_RIGHT = 18;
-export const CARD_HEAD_PADDING_BOTTOM = 8;
-export const CARD_HEAD_PADDING_LEFT = 22;
 /** `.heading { gap: 12px }` between the language tag and the title. */
 export const CARD_HEAD_GAP = 12;
 /** `font: 11px/18px` on the whole banner; the language tag is monospace. */
@@ -745,29 +656,6 @@ export function cardHeadActionsStyle(): {
   flexShrink: number;
 } {
   return { flexDirection: "row", alignItems: "center", gap: CARD_HEAD_ACTION_GAP, flexShrink: 0 };
-}
-
-/** The banner above a read/diff body: language, title, status, copy. */
-export function cardHeadStyle(): {
-  flexDirection: "row";
-  alignItems: "center";
-  justifyContent: "space-between";
-  gap: number;
-  paddingTop: number;
-  paddingRight: number;
-  paddingBottom: number;
-  paddingLeft: number;
-} {
-  return {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: CARD_HEAD_GAP,
-    paddingTop: CARD_HEAD_PADDING_TOP,
-    paddingRight: CARD_HEAD_PADDING_RIGHT,
-    paddingBottom: CARD_HEAD_PADDING_BOTTOM,
-    paddingLeft: CARD_HEAD_PADDING_LEFT,
-  };
 }
 
 /** The language tag: `--dsw-alias-label-tertiary`, monospace, never shrunk. */
@@ -838,17 +726,9 @@ export function cardHeadActionTextStyle(colors: TokenColors): {
 /* Search block (DSH's `SearchBlock`)                                         */
 /* -------------------------------------------------------------------------- */
 
-/** `.header { padding: 9px 14px; gap: 12px }` — the stats banner. */
-export const SEARCH_HEAD_PADDING_VERTICAL = 9;
-export const SEARCH_HEAD_PADDING_HORIZONTAL = 14;
-export const SEARCH_HEAD_GAP = 12;
 /** `.summary { font: var(--dsw-font-xs-13) }` = 13px/20px, one ellipsised line. */
 export const SEARCH_SUMMARY_FONT_SIZE = 13;
 export const SEARCH_SUMMARY_LINE_HEIGHT = 20;
-/** `.body { padding: 8px 14px 12px 0 }` — right 0, so a long line scrolls flush. */
-export const SEARCH_BODY_PADDING_TOP = 8;
-export const SEARCH_BODY_PADDING_BOTTOM = 12;
-export const SEARCH_BODY_PADDING_RIGHT = 14;
 /** `--dsl-search-line-height: 22px` on every row (a `min-height`, not a line box). */
 export const SEARCH_LINE_MIN_HEIGHT = 22;
 /** `.line { padding-left: 14px }`. */
@@ -858,31 +738,6 @@ export const SEARCH_FILE_GAP = 8;
 /** `.empty { padding: 12px 14px }`. */
 export const SEARCH_EMPTY_PADDING_VERTICAL = 12;
 export const SEARCH_EMPTY_PADDING_HORIZONTAL = 14;
-
-/**
- * The stats banner: 9/14 padding, one line of 13/20 with the copy on the right.
- *
- * Unlike the code card's head (which shares the card's surface), DSH paints this
- * one on `--dsw-alias-markdown-code-block-banner`; `surface2` is the theme's
- * nearest raised surface. The card's `overflow: hidden` clips it to the corners.
- */
-export function searchHeadStyle(colors: TokenColors): {
-  flexDirection: "row";
-  alignItems: "center";
-  gap: number;
-  paddingVertical: number;
-  paddingHorizontal: number;
-  backgroundColor: string;
-} {
-  return {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: SEARCH_HEAD_GAP,
-    paddingVertical: SEARCH_HEAD_PADDING_VERTICAL,
-    paddingHorizontal: SEARCH_HEAD_PADDING_HORIZONTAL,
-    backgroundColor: colors.surface2,
-  };
-}
 
 /** The statistics line: 13/20 secondary, takes the free space, one line. */
 export function searchSummaryTextStyle(colors: TokenColors): {
@@ -1009,25 +864,6 @@ export function searchFileCountTextStyle(colors: TokenColors): {
   };
 }
 
-/** The fold control. Same 11/19 mono, tertiary, aligned with the rows. */
-export function searchExpandTextStyle(colors: TokenColors): {
-  flexShrink: number;
-  paddingLeft: number;
-  fontFamily: string;
-  fontSize: number;
-  lineHeight: number;
-  color: string;
-} {
-  return {
-    flexShrink: 0,
-    paddingLeft: SEARCH_LINE_PADDING_LEFT,
-    fontFamily: CODE_FONT_FAMILY,
-    fontSize: CODE_FONT_SIZE,
-    lineHeight: CODE_LINE_HEIGHT,
-    color: colors.foregroundMuted,
-  };
-}
-
 /** `.empty { padding: 12px 14px }`, tertiary. */
 export function searchEmptyTextStyle(colors: TokenColors): {
   paddingVertical: number;
@@ -1051,10 +887,6 @@ export function searchEmptyTextStyle(colors: TokenColors): {
 /* Read block (DSH's `ReadBlock`)                                             */
 /* -------------------------------------------------------------------------- */
 
-/** `.body { padding: 6px 22px 20px }` on the read/diff card. */
-export const READ_BODY_PADDING_TOP = 6;
-export const READ_BODY_PADDING_BOTTOM = 20;
-export const READ_BODY_PADDING_HORIZONTAL = 22;
 /** `.gutter { margin-right: 12px }`, between the line number and the code. */
 export const READ_GUTTER_MARGIN = 12;
 /**
@@ -1117,25 +949,6 @@ export function readLineTextStyle(colors: TokenColors): {
   };
 }
 
-/** `.expand { padding-left: calc(gutter + 12px) }` — aligned with the code. */
-export function readExpandTextStyle(colors: TokenColors, digits: number): {
-  flexShrink: number;
-  paddingLeft: number;
-  fontFamily: string;
-  fontSize: number;
-  lineHeight: number;
-  color: string;
-} {
-  return {
-    flexShrink: 0,
-    paddingLeft: readGutterWidth(digits) + READ_GUTTER_MARGIN,
-    fontFamily: CODE_FONT_FAMILY,
-    fontSize: CODE_FONT_SIZE,
-    lineHeight: CODE_LINE_HEIGHT,
-    color: colors.foregroundMuted,
-  };
-}
-
 /** A diff row's path header and hunk header share one muted line style. */
 export function diffChromeTextStyle(colors: TokenColors): {
   fontFamily: string;
@@ -1151,26 +964,10 @@ export function diffChromeTextStyle(colors: TokenColors): {
   };
 }
 
-/** A diff row's box: the same `padding: 0 22px` and 19px line as the read block. */
-export function diffRowStyle(): {
-  flexDirection: "row";
-  paddingHorizontal: number;
-} {
-  return { flexDirection: "row", paddingHorizontal: DIFF_LINE_PADDING_HORIZONTAL };
-}
-
-/** `.body { padding: 6px 0 20px }` on the diff card (the lines pad themselves). */
-export function diffBodyStyle(): { paddingTop: number; paddingBottom: number } {
-  return { paddingTop: READ_BODY_PADDING_TOP, paddingBottom: READ_BODY_PADDING_BOTTOM };
-}
-
 /* -------------------------------------------------------------------------- */
 /* Web block (DSH's `WebBlock`)                                               */
 /* -------------------------------------------------------------------------- */
 
-/** `.block { padding: 12px 14px }` — one surface, no banner of its own. */
-export const WEB_PADDING_VERTICAL = 12;
-export const WEB_PADDING_HORIZONTAL = 14;
 /** `.fetch { gap: 6px }` between the URL and its status row. */
 export const WEB_GAP = 6;
 /** `.fetchUrl { font-family: code; font-size: 13px; line-height: 19px }`. */
@@ -1180,8 +977,6 @@ export const WEB_URL_LINE_HEIGHT = 19;
 export const WEB_META_GAP = 12;
 export const WEB_STATUS_FONT_SIZE = 13;
 export const WEB_STATUS_LINE_HEIGHT = 20;
-/** `.sources { max-height: 320px; overflow-y: auto; gap: 10px }`. */
-export const WEB_SOURCES_MAX_HEIGHT = 320;
 export const WEB_SOURCE_GAP = 10;
 /**
  * RN has no `<ol>` and no `value` attribute, so the reference number is drawn as
@@ -1199,14 +994,6 @@ export const WEB_SNIPPET_LINE_HEIGHT = 19;
 export const WEB_SNIPPET_MARGIN_TOP = 2;
 /** `.published { margin-top: 2px; font: 13px/20px }`, and `.truncated` too. */
 export const WEB_PUBLISHED_LINE_HEIGHT = 20;
-
-/** The card's own box: one padded surface for both web shapes. */
-export function webCardBodyStyle(): {
-  paddingVertical: number;
-  paddingHorizontal: number;
-} {
-  return { paddingVertical: WEB_PADDING_VERTICAL, paddingHorizontal: WEB_PADDING_HORIZONTAL };
-}
 
 /** The fetch shape's column: URL over a status/truncation row. */
 export function webFetchStyle(): {
@@ -1265,11 +1052,6 @@ export function webTruncatedTextStyle(
     lineHeight: WEB_PUBLISHED_LINE_HEIGHT,
     color: colors.foregroundMuted,
   };
-}
-
-/** The scroll container the whole citation list lives in (`max-height: 320px`). */
-export function webSourcesStyle(): { maxHeight: number } {
-  return { maxHeight: WEB_SOURCES_MAX_HEIGHT };
 }
 
 /** One numbered reference row: the number column plus the source. */
@@ -1346,72 +1128,15 @@ export function webPublishedTextStyle(colors: TokenColors): {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Folding                                                                    */
-/* -------------------------------------------------------------------------- */
-
-export interface FoldWindow {
-  /** Rows the cap hides. `<= 0` means the block is short enough to show whole. */
-  readonly hidden: number;
-  /** Whether the middle is actually folded right now. */
-  readonly capped: boolean;
-  /** Rows kept at the top while folded. */
-  readonly headLines: number;
-  /** Rows kept at the bottom while folded. */
-  readonly tailLines: number;
-}
-
-/**
- * DSH's `headTailCap` (`dsh-client-ui-primitives/lib/index.js`), verbatim.
- *
- * Shared by the search, read and diff blocks and asserted offline, because the
- * numbers are invisible-but-exact: an 8-line cap shows 4 + 4, a 9-line cap shows
- * 5 + 4, and "is it folded at all" is `hidden > 0 && !expanded`.
- */
-export function foldWindow(total: number, maxLines: number, expanded: boolean): FoldWindow {
-  const hidden = total - maxLines;
-  const headLines = Math.ceil(maxLines / 2);
-  return { hidden, capped: hidden > 0 && !expanded, headLines, tailLines: maxLines - headLines };
-}
-
-/**
- * Lines a block shows before folding, per DSH's `maxLines`.
- *
- * The fold is head + "… 其余 N 行" + tail, and a diff folds 9 (head 5 + tail 4)
- * while search and read fold 8 (head 4 + tail 4).
- */
-export const FOLD_LINES = { diff: 9, read: 8, search: 8 } as const;
-/** DSH's TerminalBlock passes `maxLines: Infinity`. */
-export const TERMINAL_MAX_LINES = Number.POSITIVE_INFINITY;
-/**
- * The terminal output's scroll window.
- *
- * DSH's tool-row stylesheet binds `--dsl-terminal-output-max-height: 224px` on
- * the terminal body and the block's `.output` uses it as `max-height` with
- * `overflow-y: auto`; `TERMINAL_MAX_LINES = Infinity` is the other half of the
- * same decision — the whole output is rendered, and this is what keeps it from
- * pushing the timeline down. Without it the card grew with the log.
- */
-export const TERMINAL_OUTPUT_MAX_HEIGHT = 224;
-/** `.output { max-height: var(--dsl-terminal-output-max-height) }`. */
-export function terminalOutputScrollStyle(): { maxHeight: number } {
-  return { maxHeight: TERMINAL_OUTPUT_MAX_HEIGHT };
-}
-/** `.bodyScroll { max-height: 260px }` on the code-tool card. */
-export const CODE_MAX_HEIGHT = 260;
-
-/* -------------------------------------------------------------------------- */
 /* Goal result card                                                           */
 /* -------------------------------------------------------------------------- */
 
 /**
  * DSH's details card for the goal tools (`dsh-client-ui-tool`'s
- * `ToolDetails.module.css`): `.item { padding: 10px 14px }`, a title line, then
- * `.fields` 6px below it as a `5.5em | 1fr` grid with a 12px column gap and 4px
- * between rows; the label is the caption colour. At the row's 13px that 5.5em is
- * 71.5px, rounded to 72.
+ * `ToolDetails.module.css`): a title line, then `.fields` 6px below it as a
+ * `5.5em | 1fr` grid with a 12px column gap and 4px between rows; the label is
+ * the caption colour. At the row's 13px that 5.5em is 71.5px, rounded to 72.
  */
-export const GOAL_CARD_PADDING_VERTICAL = 10;
-export const GOAL_CARD_PADDING_HORIZONTAL = 14;
 export const GOAL_FIELDS_MARGIN_TOP = 6;
 export const GOAL_FIELD_ROW_GAP = 4;
 export const GOAL_FIELD_COLUMN_GAP = 12;
