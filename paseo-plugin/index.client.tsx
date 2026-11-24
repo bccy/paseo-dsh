@@ -327,8 +327,9 @@ function buildContributions(client: PluginClientContext): () => void {
           hideResultCaption: z.boolean().optional(),
         })
         .nullable(),
-      // DSH's failure code and, for a known one, the words drawn for it.
+      // DSH's failure code, error class, and words drawn for a known code.
       errorCode: z.string(),
+      errorName: z.string().optional(),
       errorShort: z.string(),
       errorHint: z.string(),
     }),

@@ -366,10 +366,6 @@ export type ToolFieldsData = {
 export interface BlockCopy {
   copy: string;
   copied: string;
-  collapse: string;
-  expandRest(count: number): string;
-  expandAria(count: number): string;
-  collapseAria: string;
   pathsSummary(shown: number, total: number, truncated: boolean): string;
   matchesSummary(shown: number, total: number, files: number, truncated: boolean): string;
   /** DSH's `search.noResults` — the grep/glob card's empty state. */
@@ -388,10 +384,6 @@ const BLOCK_COPY: Record<"en" | "zh-CN", BlockCopy> = {
   en: {
     copy: "Copy",
     copied: "Copied",
-    collapse: "Collapse",
-    expandRest: (count) => `… ${count} more lines`,
-    expandAria: (count) => `Expand ${count} more lines`,
-    collapseAria: "Collapse",
     pathsSummary: (shown, total, truncated) =>
       truncated ? `Showing ${shown} of ${total} paths` : `${shown} paths`,
     matchesSummary: (shown, total, files, truncated) =>
@@ -410,10 +402,6 @@ const BLOCK_COPY: Record<"en" | "zh-CN", BlockCopy> = {
   "zh-CN": {
     copy: "复制",
     copied: "复制成功",
-    collapse: "收起",
-    expandRest: (count) => `… 其余 ${count} 行`,
-    expandAria: (count) => `展开其余 ${count} 行`,
-    collapseAria: "收起内容",
     pathsSummary: (shown, total, truncated) =>
       truncated ? `显示 ${shown} / 共 ${total} 个路径` : `${shown} 个路径`,
     matchesSummary: (shown, total, files, truncated) =>

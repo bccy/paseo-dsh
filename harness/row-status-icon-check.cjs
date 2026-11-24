@@ -705,6 +705,15 @@ console.log("source wiring in tool-call.tsx and inline-thinking.tsx");
         mentions(attributeOf(wrappers[0], "colors").value, "colors"),
       `${wrappers.length} wrapper(s)`,
     );
+    check(
+      "InlineToolCall folds localized rowStatus into its head Pressable accessibilityLabel and forwards accessibilityLabel to RowStatusIcon",
+      mentions(body, "rowStatus") &&
+        wrappers.length === 1 &&
+        attributeOf(wrappers[0], "accessibilityLabel") !== undefined &&
+        elementsWithAttributes(body, ["accessibilityRole", "accessibilityLabel"]).some(
+          (el) => el.tag === "Pressable" && mentions(attributeOf(el, "accessibilityLabel").value, "headAccessibilityLabel"),
+        ),
+    );
   }
 
   if (thinkPath) {
@@ -723,6 +732,76 @@ console.log("source wiring in tool-call.tsx and inline-thinking.tsx");
         attributeOf(wrappers[0], "spinBase") !== undefined,
       `${wrappers.length} wrapper(s)`,
     );
+    check(
+      "InlineThinking folds localized rowStatus into its head Pressable accessibilityLabel and forwards accessibilityLabel to RowStatusIcon",
+      mentions(body, "rowStatus") &&
+        wrappers.length === 1 &&
+        attributeOf(wrappers[0], "accessibilityLabel") !== undefined &&
+        elementsWithAttributes(body, ["accessibilityRole", "accessibilityLabel"]).some(
+          (el) => el.tag === "Pressable" && mentions(attributeOf(el, "accessibilityLabel").value, "thinkingStatusLabel"),
+        ),
+    );
+  }
+}
+
+console.log("accessibility semantics on RowStatusIcon slot and decorative badges");
+{
+  // Verify runtime accessibility props on compiled RowStatusIcon:
+  // - slot forwards accessibilityLabel
+  // - decorative corner badges hide themselves from screen readers
+  const harness = createHooksHarness();
+  const prevDoc = global.document;
+  global.document = {
+    getElementById: () => null,
+    createElement: (tag) => ({ tag, id: "", textContent: "" }),
+    head: { appendChild: () => {} },
+  };
+  try {
+    const mod = loadComponentWithRnStub(
+      { Platform: { OS: "web" }, View: "View", Image: "Image" },
+      harness.hooks,
+    );
+    const {
+      RowStatusIcon,
+      ROW_ICON_SLOT_TEST_ID,
+      ROW_BADGE_RUNNING_TEST_ID,
+      ROW_BADGE_COMPLETED_TEST_ID,
+      ROW_BADGE_FAILED_TEST_ID,
+    } = mod;
+    const cases = [
+      { status: "running", label: "运行中", badgeId: ROW_BADGE_RUNNING_TEST_ID },
+      { status: "completed", label: "已完成", badgeId: ROW_BADGE_COMPLETED_TEST_ID },
+      { status: "failed", label: "失败", badgeId: ROW_BADGE_FAILED_TEST_ID },
+    ];
+    for (const c of cases) {
+      harness.unmountAll();
+      const tree = harness.render(RowStatusIcon, {
+        status: c.status,
+        size: 16,
+        colors: COLORS,
+        accessibilityLabel: c.label,
+        children: { type: "Glyph", props: {} },
+      });
+      const slot = findAll(tree, (n) => n.props?.testID === ROW_ICON_SLOT_TEST_ID)[0];
+      const badge = findAll(tree, (n) => n.props?.testID === c.badgeId)[0];
+      check(
+        `RowStatusIcon(${c.status}) forwards accessibilityLabel="${c.label}" onto icon slot`,
+        slot?.props?.accessibilityLabel === c.label,
+        JSON.stringify(slot?.props?.accessibilityLabel),
+      );
+      check(
+        `RowStatusIcon(${c.status}) marks decorative badge hidden from screen readers`,
+        badge?.props?.accessibilityElementsHidden === true &&
+          badge?.props?.importantForAccessibility === "no-hide-descendants",
+        JSON.stringify({
+          hidden: badge?.props?.accessibilityElementsHidden,
+          important: badge?.props?.importantForAccessibility,
+        }),
+      );
+    }
+    harness.unmountAll();
+  } finally {
+    global.document = prevDoc;
   }
 }
 

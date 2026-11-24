@@ -1072,6 +1072,10 @@ export function InlineThinking({
     };
   }, [theme, layout.compact, growing, style, expandedMaxHeight]);
 
+  const thinkingIconStatus = resolveThinkingIconStatus(growing);
+  const thinkingStatusLabel =
+    thinkingIconStatus === "idle" ? "" : copy.rowStatus[thinkingIconStatus];
+
   return (
     <RowEntrance
       agentId={agentId}
@@ -1085,7 +1089,11 @@ export function InlineThinking({
             with tapping the toggle or pushes the timeline off screen. */}
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel={open ? copy.collapseThinking : copy.expandThinking}
+          accessibilityLabel={
+            thinkingStatusLabel === ""
+              ? open ? copy.collapseThinking : copy.expandThinking
+              : `${open ? copy.collapseThinking : copy.expandThinking} · ${thinkingStatusLabel}`
+          }
           onPress={() => setManual((value) => !(value ?? false))}
           style={styles.row}
           onLayout={(event) => setRowWidth(event.nativeEvent.layout.width)}
@@ -1095,6 +1103,7 @@ export function InlineThinking({
             size={THINK_ICON_SIZE}
             colors={theme.colors}
             spinBase
+            accessibilityLabel={thinkingStatusLabel || undefined}
           >
             <Image
               source={{ uri: THINK_ICON }}

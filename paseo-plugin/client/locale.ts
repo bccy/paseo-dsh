@@ -274,6 +274,8 @@ export interface UiText {
   expandThinking: string;
   /** Screen-reader label of the expanded reasoning row. */
   collapseThinking: string;
+  /** Screen-reader status words for timeline row leading status icons. */
+  rowStatus: { running: string; completed: string; failed: string };
   /** Title of an `exit_plan_mode` row, before its plan text. */
   planTitle: string;
   /** Appended to a body cut at the client's size limit. */
@@ -1146,6 +1148,7 @@ const TEXT: Record<Locale, UiText> = {
     thinking: "Thinking",
     expandThinking: "Expand thinking",
     collapseThinking: "Collapse thinking",
+    rowStatus: { running: "Running", completed: "Completed", failed: "Failed" },
     planTitle: "Plan",
     truncated: "\n… (truncated)",
     goalCard: {
@@ -1801,6 +1804,7 @@ const TEXT: Record<Locale, UiText> = {
     thinking: "思考",
     expandThinking: "展开思考",
     collapseThinking: "收起思考",
+    rowStatus: { running: "运行中", completed: "已完成", failed: "失败" },
     planTitle: "计划",
     truncated: "\n…（已截断）",
     goalCard: {

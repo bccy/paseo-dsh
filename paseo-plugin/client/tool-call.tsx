@@ -182,12 +182,29 @@ function inferLang(headline: string, body: string): string | undefined {
  */
 function useCopy(text: string): { copied: boolean; onCopy: () => void } {
   const [copied, setCopied] = useState(false);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (timerRef.current !== null) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+  }, []);
   const onCopy = useCallback(() => {
     if (copied) return;
     copyText(text).then(
       () => {
+        if (!mountedRef.current) return;
         setCopied(true);
-        setTimeout(() => setCopied(false), 1000);
+        if (timerRef.current !== null) clearTimeout(timerRef.current);
+        timerRef.current = setTimeout(() => {
+          timerRef.current = null;
+          if (mountedRef.current) setCopied(false);
+        }, 1000);
       },
       () => {},
     );
@@ -619,8 +636,7 @@ function DiffBlockView({
   onCollapse: (event?: unknown) => void;
 }) {
   const copy = blockCopy();
-  const rawLang = (data as { lang?: string }).lang;
-  const lang = rawLang !== undefined && rawLang !== "" ? rawLang : extensionOf(data.path);
+  const lang = extensionOf(data.path);
   const mode = highlightModeFor(lang);
   const status =
     data.operation === "create" ? copy.create : data.operation === "update" ? copy.update : undefined;
@@ -1525,6 +1541,9 @@ export function InlineToolCall({
       ? inferLang(data.headline, data.body)
       : undefined;
 
+  const statusLabel = iconStatus === "idle" ? "" : text.rowStatus[iconStatus];
+  const headAccessibilityLabel = [displayLabel, headSummary, statusLabel].filter(Boolean).join(" ");
+
   return (
     <RowEntrance
       agentId={agentId}
@@ -1535,7 +1554,7 @@ export function InlineToolCall({
       <View style={styles.root}>
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel={`${displayLabel} ${headSummary}`}
+          accessibilityLabel={headAccessibilityLabel}
           onPress={() => {
             if (canExpand) setExpanded((value) => !value);
           }}
@@ -1545,7 +1564,12 @@ export function InlineToolCall({
               edit, plus a bottom-right corner badge (blue ring while running, bare
               green checkmark when completed, red cross on failure). A Paseo-owned
               tool with no glyph of its own draws Paseo's mark, tinted the same. */}
-          <RowStatusIcon status={iconStatus} size={iconSize} colors={colors}>
+          <RowStatusIcon
+            status={iconStatus}
+            size={iconSize}
+            colors={colors}
+            accessibilityLabel={statusLabel || undefined}
+          >
             {data.paseoMark ? (
               <Image
                 source={{ uri: PASEO_MARK_ICON }}

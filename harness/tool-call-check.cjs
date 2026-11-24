@@ -2962,10 +2962,6 @@ console.log("the block copy is localized and complete");
 {
   equal("zh copy", blockCopy().copy, "复制");
   equal("zh copied", blockCopy().copied, "复制成功");
-  equal("zh collapse", blockCopy().collapse, "收起");
-  equal("zh expandRest", blockCopy().expandRest(3), "… 其余 3 行");
-  equal("zh expandAria", blockCopy().expandAria(3), "展开其余 3 行");
-  equal("zh collapseAria", blockCopy().collapseAria, "收起内容");
   equal("zh matches", blockCopy().matchesSummary(12, 12, 3, false), "12 处匹配 · 3 个文件");
   equal(
     "zh matches truncated",
@@ -2977,7 +2973,6 @@ console.log("the block copy is localized and complete");
 
   setLocale("en");
   equal("en copy", blockCopy().copy, "Copy");
-  equal("en expandRest", blockCopy().expandRest(3), "… 3 more lines");
   equal("en matches", blockCopy().matchesSummary(12, 12, 3, false), "12 matches · 3 files");
   equal(
     "en matches truncated",
@@ -2992,6 +2987,13 @@ console.log("the block copy is localized and complete");
   setLocale(undefined);
 
   const tables = allBlockCopy();
+  for (const retired of ["collapse", "expandRest", "expandAria", "collapseAria"]) {
+    check(
+      `retired fold copy key ${retired} is absent from both locales`,
+      !(retired in tables.en) && !(retired in tables["zh-CN"]),
+      JSON.stringify({ en: retired in tables.en, zh: retired in tables["zh-CN"] }),
+    );
+  }
   equal(
     "both locales define the same block-copy keys",
     Object.keys(tables.en).sort(),
@@ -3114,17 +3116,31 @@ console.log("the renderer's schema and ToolCallData cannot drift apart");
   const schemaKeys = sourcePath === undefined ? [] : dshToolSchemaKeys(fs.readFileSync(sourcePath, "utf8"));
   check("the dsh-tool renderer's schema was found", schemaKeys.length > 0, JSON.stringify(schemaKeys));
 
-  const dataKeys = Object.keys(
+  const completedDataKeys = Object.keys(
     toolCallData(
       { name: "bash", status: "completed", detail: { type: "shell", command: "ls" } },
       "complete",
     ),
   );
-  equal(
-    "the schema's field set matches ToolCallData exactly",
-    [...schemaKeys].sort(),
-    [...dataKeys].sort(),
+  const failedWithErrorNameKeys = Object.keys(
+    toolCallData(
+      {
+        name: "bash",
+        status: "failed",
+        detail: { type: "shell", command: "ls" },
+        error: { message: "denied" },
+        metadata: { errorCode: "APPROVAL_REJECTED", errorName: "ApprovalError" },
+      },
+      "complete",
+    ),
   );
+  const allDataKeys = Array.from(new Set([...completedDataKeys, ...failedWithErrorNameKeys]));
+  equal(
+    "the schema's field set matches ToolCallData exactly (including optional errorName)",
+    [...schemaKeys].sort(),
+    allDataKeys.sort(),
+  );
+  check("the schema declares errorName so Paseo does not strip the failure class", schemaKeys.includes("errorName"), JSON.stringify(schemaKeys));
   check("the schema declares callId for stable rowKey forwarding", schemaKeys.includes("callId"), JSON.stringify(schemaKeys));
   equal(
     "toolCallData forwards string item.callId verbatim",
@@ -3370,6 +3386,24 @@ console.log("the renderer reads the state the data layer now carries");
   check(
     "DiffBlockView scrolls in a bounded ScrollView bound to styles.expandedScroll with SCROLL_BOX_TEST_ID",
     hasBoundedScrollView(diffView),
+  );
+  check(
+    "DiffBlockView derives lang directly from extensionOf(data.path) without dead rawLang cast",
+    !/\brawLang\b/.test(diffView) &&
+      !/as\s*\{\s*lang\?:\s*string\s*\}/.test(diffView) &&
+      /\bextensionOf\s*\(\s*data\.path\s*\)/.test(diffView),
+  );
+  const useCopyBody = functionBody(renderedCode, "useCopy") ?? "";
+  const useCopyEffectCleanup =
+    useCopyBody.match(/useEffect\s*\(\s*\(\)\s*=>\s*\{[\s\S]*?return\s*\(\)\s*=>\s*\{([\s\S]*?)\}\s*;\s*\}\s*,\s*\[\s*\]\s*\)/)?.[1] ?? "";
+  check(
+    "useCopy tracks its reset timeout and clears it inside useEffect unmount cleanup without post-unmount setCopied",
+    useCopyBody.length > 0 &&
+      /mountedRef\.current\s*=\s*false/.test(useCopyEffectCleanup) &&
+      /clearTimeout\s*\(\s*timerRef\.current\s*\)/.test(useCopyEffectCleanup) &&
+      /if\s*\(\s*!mountedRef\.current\s*\)\s*return/.test(useCopyBody) &&
+      /if\s*\(\s*mountedRef\.current\s*\)\s*setCopied\s*\(\s*false\s*\)/.test(useCopyBody),
+    useCopyEffectCleanup || "missing useEffect unmount cleanup",
   );
   check(
     "SearchBlockView scrolls in a bounded ScrollView bound to styles.expandedScroll with SCROLL_BOX_TEST_ID",

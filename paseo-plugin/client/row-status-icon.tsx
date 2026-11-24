@@ -145,6 +145,8 @@ export interface RowStatusIconProps {
   colors: RowStatusIconColors;
   /** Smoothly rotate the base glyph while running (used for thinking petals). */
   spinBase?: boolean;
+  /** Optional localized screen-reader status label for the icon slot. */
+  accessibilityLabel?: string;
   children: ReactNode;
 }
 
@@ -345,6 +347,7 @@ export function RowStatusIcon({
   size,
   colors,
   spinBase = false,
+  accessibilityLabel,
   children,
 }: RowStatusIconProps): ReactElement {
   // Track previous status in state (React's render-phase derived transition
@@ -387,6 +390,8 @@ export function RowStatusIcon({
       <View
         testID={ROW_BADGE_RUNNING_TEST_ID}
         pointerEvents="none"
+        accessibilityElementsHidden={true}
+        importantForAccessibility="no-hide-descendants"
         style={{
           position: "absolute",
           right: metrics.offset,
@@ -409,6 +414,8 @@ export function RowStatusIcon({
         key={`completed:${transition.seq}`}
         testID={ROW_BADGE_COMPLETED_TEST_ID}
         pointerEvents="none"
+        accessibilityElementsHidden={true}
+        importantForAccessibility="no-hide-descendants"
         style={badgeSlotStyle}
       >
         <PopBadge pop={transition.popping}>
@@ -426,6 +433,8 @@ export function RowStatusIcon({
         key={`failed:${transition.seq}`}
         testID={ROW_BADGE_FAILED_TEST_ID}
         pointerEvents="none"
+        accessibilityElementsHidden={true}
+        importantForAccessibility="no-hide-descendants"
         style={badgeSlotStyle}
       >
         <PopBadge pop={transition.popping}>
@@ -453,6 +462,7 @@ export function RowStatusIcon({
   return (
     <View
       testID={ROW_ICON_SLOT_TEST_ID}
+      accessibilityLabel={accessibilityLabel}
       style={{
         position: "relative",
         width: size,
