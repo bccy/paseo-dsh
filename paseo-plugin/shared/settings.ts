@@ -4,34 +4,6 @@ import { z } from "zod";
 export const EXPANDED_MAX_HEIGHT_DEFAULT = 260;
 
 /**
- * Available visual presentations for the inline thinking row (`InlineThinking`).
- *
- * - `classic`: the original single-line tail-scrolling row with plain expanded text
- * - `rail`: breathing 2px left rail with 3-line streaming peek & structured prose
- * - `silk`: strictly single-line subtitle swap (zero height jump) with expanded toolbar
- * - `capsule`: soft `surface1` capsule with gliding progress bar & compact footer
- * - `stepper`: vertical step-node timeline parsed from headings/paragraphs
- * - `editorial`: quiet marginalia with dashed quote rail and 2-line mist peek
- */
-export const THINKING_STYLE_CHOICES = [
-  "classic",
-  "rail",
-  "silk",
-  "capsule",
-  "stepper",
-  "editorial",
-] as const;
-
-export type ThinkingStyleChoice = (typeof THINKING_STYLE_CHOICES)[number];
-
-export const THINKING_STYLE_DEFAULT: ThinkingStyleChoice = "classic";
-
-export function isThinkingStyleChoice(value: unknown): value is ThinkingStyleChoice {
-  return typeof value === "string"
-    && (THINKING_STYLE_CHOICES as readonly string[]).includes(value);
-}
-
-/**
  * Host-scoped presentation knobs for the DSH timeline rows and the tool drawer.
  *
  * Defaults preserve this fork's current `client/tokens.ts` layout rather than
@@ -66,9 +38,6 @@ export const timelineStyleSettings = defineSettings({
     if (typeof rest["expandedMaxHeight"] !== "number") {
       rest["expandedMaxHeight"] = EXPANDED_MAX_HEIGHT_DEFAULT;
     }
-    if (!isThinkingStyleChoice(rest["thinkingStyle"])) {
-      rest["thinkingStyle"] = THINKING_STYLE_DEFAULT;
-    }
     return rest;
   },
   schema: z.object({
@@ -79,7 +48,6 @@ export const timelineStyleSettings = defineSettings({
     expandedMaxHeight: z.number().min(120).max(640).default(EXPANDED_MAX_HEIGHT_DEFAULT),
     commandMaxHeightRatio: z.number().min(0.1).max(0.6).default(0.25),
     commandMinHeight: z.number().min(60).max(360).default(150),
-    thinkingStyle: z.enum(THINKING_STYLE_CHOICES).default(THINKING_STYLE_DEFAULT),
   }),
 });
 
@@ -119,7 +87,6 @@ export const TIMELINE_STYLE_DEFAULTS: TimelineStyleValues = {
   expandedMaxHeight: EXPANDED_MAX_HEIGHT_DEFAULT,
   commandMaxHeightRatio: 0.25,
   commandMinHeight: 150,
-  thinkingStyle: THINKING_STYLE_DEFAULT,
 };
 
 export const LANGUAGE_DEFAULTS: LanguageValues = {
@@ -127,8 +94,8 @@ export const LANGUAGE_DEFAULTS: LanguageValues = {
 };
 
 /**
- * Numeric field editor order for the Display settings screen. Label and hint
- * copy lives in `client/locale.ts` so the shared contract stays language-agnostic.
+ * Editor order for the Display settings screen. Label and hint copy lives in
+ * `client/locale.ts` so the shared contract stays language-agnostic.
  */
 export const TIMELINE_STYLE_KEYS = [
   "rowMarginY",
@@ -139,8 +106,6 @@ export const TIMELINE_STYLE_KEYS = [
   "commandMaxHeightRatio",
   "commandMinHeight",
 ] as const satisfies readonly TimelineStyleKey[];
-
-export type TimelineStyleNumericKey = (typeof TIMELINE_STYLE_KEYS)[number];
 
 /**
  * Resolve the pixel cap for an expanded command block from the current window

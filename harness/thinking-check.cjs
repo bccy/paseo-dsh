@@ -32,13 +32,8 @@ const {
   firstLine,
   formatThinkingDuration,
   latestCompletedParagraphFirstLine,
-  parseInlineRuns,
-  parseThinkingSections,
   reasoningPreview,
   streamingTail,
-  thinkingHeadline,
-  thinkingPeekTail,
-  thinkingSubtitleKey,
 } = require("./client/thinking-text.js");
 
 /**
@@ -259,6 +254,28 @@ console.log("the tail window the collapsed line shows while streaming");
   );
 }
 
+console.log("formatThinkingDuration: tenths under 1m, whole minutes and seconds from 1m up");
+{
+  check("0ms renders empty (no noisy 0.0s)", formatThinkingDuration(0) === "");
+  check("99ms renders empty", formatThinkingDuration(99) === "");
+  check("negative renders empty", formatThinkingDuration(-200) === "");
+  check(
+    "NaN and +/-Infinity render empty",
+    formatThinkingDuration(Number.NaN) === "" &&
+      formatThinkingDuration(Number.POSITIVE_INFINITY) === "" &&
+      formatThinkingDuration(Number.NEGATIVE_INFINITY) === "",
+  );
+  check("100ms formats as 0.1s", formatThinkingDuration(100) === "0.1s", formatThinkingDuration(100));
+  check("1240ms formats as 1.2s", formatThinkingDuration(1240) === "1.2s", formatThinkingDuration(1240));
+  check("1250ms rounds up to 1.3s", formatThinkingDuration(1250) === "1.3s", formatThinkingDuration(1250));
+  check("59949ms stays 59.9s", formatThinkingDuration(59949) === "59.9s", formatThinkingDuration(59949));
+  check("59950ms rolls cleanly to 1m 0s (never 60.0s)", formatThinkingDuration(59950) === "1m 0s", formatThinkingDuration(59950));
+  check("60949ms stays 1m 0s at whole-second boundary", formatThinkingDuration(60949) === "1m 0s", formatThinkingDuration(60949));
+  check("60950ms advances cleanly to 1m 1s", formatThinkingDuration(60950) === "1m 1s", formatThinkingDuration(60950));
+  check("61200ms formats as 1m 1s", formatThinkingDuration(61200) === "1m 1s", formatThinkingDuration(61200));
+  check("125000ms formats as 2m 5s", formatThinkingDuration(125000) === "2m 5s", formatThinkingDuration(125000));
+}
+
 console.log("the row wires the window in");
 {
   // The window is worthless if the component neither measures a usable width nor
@@ -375,8 +392,8 @@ console.log("the row settles when the last frame both grows and completes");
   }
   const Module = require("node:module");
 
-  // Fake clock: the settle window is the only timer the component schedules,
-  // and the defect was that nothing ever fired to clear the latch.
+  // Fake clock: settle timeouts and duration intervals are tracked separately
+  // so settle-window assertions remain exact and intervals never leak.
   let timers = new Map();
   let nextTimerId = 0;
   const realSetTimeout = global.setTimeout;
@@ -388,6 +405,19 @@ console.log("the row settles when the last frame both grows and completes");
   };
   global.clearTimeout = (id) => {
     timers.delete(id);
+  };
+
+  let intervals = new Map();
+  let nextIntervalId = 0;
+  const realSetInterval = global.setInterval;
+  const realClearInterval = global.clearInterval;
+  global.setInterval = (callback) => {
+    nextIntervalId += 1;
+    intervals.set(nextIntervalId, callback);
+    return nextIntervalId;
+  };
+  global.clearInterval = (id) => {
+    intervals.delete(id);
   };
 
   // The hook slots live across passes, so `useState` holds its value the way
@@ -438,13 +468,6 @@ console.log("the row settles when the last frame both grows and completes");
       }
       return slots[index].value;
     },
-    useCallback(fn, deps) {
-      const index = cursor++;
-      if (!(index in slots) || !sameDeps(slots[index].deps, deps)) {
-        slots[index] = { deps, value: fn };
-      }
-      return slots[index].value;
-    },
     useSyncExternalStore(_subscribe, getSnapshot) {
       return getSnapshot();
     },
@@ -458,23 +481,9 @@ console.log("the row settles when the last frame both grows and completes");
     commandMaxHeightRatio: 0.25,
     commandMinHeight: 150,
   };
-  const FULL_COLORS = {
-    surface0: "#09090b",
-    surface1: "#141418",
-    surface2: "#1c1c22",
-    border: "#27272a",
-    foreground: "#fafafa",
-    foregroundMuted: "#a1a1aa",
-    accent: "#60a5fa",
-    statusSuccess: "#4ade80",
-    statusWarning: "#facc15",
-    statusDanger: "#f87171",
-  };
-  let copiedPayloads = [];
 
-  // Stand-ins for the host modules only; `./thinking-text`, `./thinking-styles`,
-  // `./thinking-motion`, `./tokens`, `./row-entrance`, `./newest`, and `./locale`
-  // are the real compiled modules.
+  // Stand-ins for the host modules only; `./thinking-text`, `./tokens`,
+  // `./row-entrance`, `./newest`, and `./locale` are the real compiled modules.
   const stubs = {
     react: () => hooks,
     "react/jsx-runtime": () => ({
@@ -486,7 +495,6 @@ console.log("the row settles when the last frame both grows and completes");
       Image: "Image",
       Pressable: "Pressable",
       ScrollView: "ScrollView",
-      StyleSheet: { hairlineWidth: 0.5 },
       Text: "Text",
       View: "View",
     }),
@@ -495,12 +503,6 @@ console.log("the row settles when the last frame both grows and completes");
     }),
     "@getpaseo/plugin/client": () => ({
       useSettings: () => ({ status: "ready", values: styleSettingsValues }),
-    }),
-    "@getpaseo/plugin/client/react-native": () => ({
-      copyText: (value) => {
-        copiedPayloads.push(value);
-        return Promise.resolve();
-      },
     }),
     "./text-shimmer": () => ({ TextShimmer: "TextShimmer" }),
   };
@@ -511,8 +513,14 @@ console.log("the row settles when the last frame both grows and completes");
     return originalLoad.call(this, request, parent, isMain);
   };
   let InlineThinking;
+  let THINKING_DURATION_TEST_ID;
+  let resetThinkingDurationsForTests;
   try {
-    ({ InlineThinking } = require(componentPath));
+    ({
+      InlineThinking,
+      THINKING_DURATION_TEST_ID,
+      resetThinkingDurationsForTests,
+    } = require(componentPath));
   } finally {
     // Scoped to the load: the component resolves its module graph at require
     // time, so nothing below needs the stubs.
@@ -538,7 +546,7 @@ console.log("the row settles when the last frame both grows and completes");
     cursor = 0;
     const tree = InlineThinking({
       theme: {
-        colors: FULL_COLORS,
+        colors: { foreground: "#ffffff", foregroundMuted: "#888888", surface0: "#000000" },
       },
       layout: { compact: false },
       item: { data: { text, phase } },
@@ -850,947 +858,501 @@ console.log("the row settles when the last frame both grows and completes");
     resetNewestForTests(strictAgent);
   }
 
-  global.setTimeout = realSetTimeout;
-  global.clearTimeout = realClearTimeout;
-}
+  console.log("right-aligned thinking duration ticks live, freezes on settle, and survives remount");
+  {
+    const realDateNow = Date.now;
+    let fakeNow = 1_700_000_000_000;
+    Date.now = () => fakeNow;
 
-console.log("pure parsers for enhanced thinking-row styles");
-{
-  const structured = "**定位根因**\n先读 `inline-thinking.tsx` 和 **tokens.ts**。\n\n**收敛方案**\n统一用主题 token。";
-  const sections = parseThinkingSections(structured);
-  check("parseThinkingSections splits explicit bold headings", sections.length === 2);
-  check(
-    "explicit headings preserve title and body",
-    sections[0]?.explicitTitle === true &&
-      sections[0]?.title === "定位根因" &&
-      sections[0]?.body === "先读 `inline-thinking.tsx` 和 **tokens.ts**。",
-    JSON.stringify(sections[0]),
-  );
-  const plainSections = parseThinkingSections("这是一段很长很长很长很长很长很长没有小标题的思考段落内容\r\n第二行");
-  check(
-    "implicit paragraph truncates title cleanly by code points without stripping body",
-    plainSections.length === 1 &&
-      plainSections[0].explicitTitle === false &&
-      plainSections[0].title.endsWith("…") &&
-      plainSections[0].body.includes("第二行"),
-    JSON.stringify(plainSections[0]),
-  );
-  check("whitespace-only thought parses to empty sections", parseThinkingSections("  \n\n  ").length === 0);
-
-  const runs = parseInlineRuns("读 `tokens.ts` 与 **主题色** 和未闭合 `tail");
-  check(
-    "parseInlineRuns extracts code, bold, and leaves unclosed delimiters intact",
-    runs.length === 5 &&
-      runs[0].kind === "text" &&
-      runs[1].kind === "code" &&
-      runs[1].text === "tokens.ts" &&
-      runs[3].kind === "bold" &&
-      runs[3].text === "主题色" &&
-      runs[4].kind === "text" &&
-      runs[4].text.includes("`tail"),
-    JSON.stringify(runs),
-  );
-  const crossLine = parseInlineRuns("`no\nwrap` **also\nno**");
-  check(
-    "parseInlineRuns never spans across newlines",
-    crossLine.every((r) => r.kind === "text") && crossLine.map((r) => r.text).join("") === "`no\nwrap` **also\nno**",
-  );
-
-  check("thinkingHeadline settled returns first non-empty line without **", thinkingHeadline(structured, false) === "定位根因");
-  check("thinkingHeadline running returns latest explicit heading", thinkingHeadline(structured, true) === "收敛方案");
-  check(
-    "thinkingHeadline running splits latest clause for plain paragraph",
-    thinkingHeadline("第一句。第二句，检查边界；第三句准备落码", true) === "第三句准备落码",
-  );
-  check("thinkingHeadline returns empty string on blank input", thinkingHeadline("  \n ", true) === "");
-
-  check("thinkingPeekTail keeps short text whole", thinkingPeekTail("短句 **测试**", 20) === "短句 测试");
-  const emojiTail = thinkingPeekTail("开始分析 🚀🔥🎯 结论完成", 6);
-  check(
-    "thinkingPeekTail slices by Unicode code points (no broken surrogate pairs)",
-    emojiTail.startsWith("…") && emojiTail.isWellFormed() && emojiTail.includes("🎯"),
-    emojiTail,
-  );
-  const longPaddedTail = `${"前置内容 ".repeat(120)}末尾关键词${" ".repeat(400)}`;
-  check(
-    "thinkingPeekTail handles long text and whitespace-heavy tail fallback cleanly",
-    thinkingPeekTail(longPaddedTail, 12).endsWith("末尾关键词"),
-    thinkingPeekTail(longPaddedTail, 12),
-  );
-  check("thinkingPeekTail returns empty on non-positive maxChars", thinkingPeekTail("abc", 0) === "");
-
-  const keyA = thinkingSubtitleKey(parseThinkingSections("第一句。\n第二句。\n第三句准备落码"), true);
-  const keyB = thinkingSubtitleKey(parseThinkingSections("第一句。\n第二句。\n第三句准备落码并且"), true);
-  const keyC = thinkingSubtitleKey(parseThinkingSections("第一句。\n第二句。\n第三句准备落码并且。\n第四句"), true);
-  const keyHeading1 = thinkingSubtitleKey(parseThinkingSections("**定位问题**\n读取"), true);
-  const keyHeading2 = thinkingSubtitleKey(parseThinkingSections("**定位问题**\n读取更多内容"), true);
-  check(
-    "thinkingSubtitleKey stays stable on per-token growth and changes on clause/paragraph swaps",
-    keyA === keyB && keyB !== keyC && keyHeading1 === keyHeading2 && keyHeading1 !== keyC,
-    `A=${keyA}, B=${keyB}, C=${keyC}, H1=${keyHeading1}, H2=${keyHeading2}`,
-  );
-
-  check("formatThinkingDuration suppresses sub-100ms and non-finite values", formatThinkingDuration(0) === "" && formatThinkingDuration(99) === "" && formatThinkingDuration(Number.NaN) === "");
-  check("formatThinkingDuration formats seconds to 1 decimal", formatThinkingDuration(2340) === "2.3s");
-  check("formatThinkingDuration rounds 59.95s–59.999s to 1m 0s (never 60.0s)", formatThinkingDuration(59_950) === "1m 0s" && formatThinkingDuration(59_999) === "1m 0s");
-  check("formatThinkingDuration formats minutes and seconds", formatThinkingDuration(72_400) === "1m 12s");
-}
-
-console.log("all 5 enhanced thinking styles execute end-to-end (rail, silk, capsule, stepper, editorial)");
-{
-  const Module = require("node:module");
-  const componentPath = join(__dirname, "client", "inline-thinking.js");
-  const COLORS = {
-    surface0: "#09090b",
-    surface1: "#141418",
-    surface2: "#1c1c22",
-    border: "#27272a",
-    foreground: "#fafafa",
-    foregroundMuted: "#a1a1aa",
-    accent: "#60a5fa",
-    statusSuccess: "#4ade80",
-    statusWarning: "#facc15",
-    statusDanger: "#f87171",
-  };
-
-  function createTreeHarness(rnOverrides = {}) {
-    const instances = new Map();
-    let currentKey = "root";
-    let currentCursor = 0;
-    let pendingEffects = [];
-    let styleSetting = {
-      rowMarginY: 0,
-      toolRowPaddingY: 0,
-      toolRowMinHeight: 24,
-      toolRowGap: 6,
-      expandedMaxHeight: 280,
-      commandMaxHeightRatio: 0.25,
-      commandMinHeight: 150,
-      thinkingStyle: "rail",
-    };
-    const copied = [];
-    const sameDeps = (a, b) =>
-      Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => Object.is(v, b[i]));
-    function bucket() {
-      if (!instances.has(currentKey)) instances.set(currentKey, { slots: [] });
-      return instances.get(currentKey);
+    function findNode(node, predicate) {
+      if (node === null || typeof node !== "object") return null;
+      if (predicate(node)) return node;
+      const children = node.props === undefined ? undefined : node.props.children;
+      for (const child of Array.isArray(children) ? children : [children]) {
+        const hit = findNode(child, predicate);
+        if (hit !== null) return hit;
+      }
+      return null;
     }
-    const hooks = {
-      useState(init) {
-        const b = bucket();
-        const i = currentCursor++;
-        if (!(i in b.slots)) b.slots[i] = typeof init === "function" ? init() : init;
-        return [
-          b.slots[i],
-          (next) => {
-            const val = typeof next === "function" ? next(b.slots[i]) : next;
-            b.slots[i] = val;
+
+    function childArray(node) {
+      const c = node?.props?.children;
+      return Array.isArray(c) ? c.filter(Boolean) : c ? [c] : [];
+    }
+
+    function resetHooks() {
+      slots = [];
+      cursor = 0;
+      effects = [];
+      changed = false;
+      timers.clear();
+      intervals.clear();
+    }
+
+    function renderRow(props) {
+      let tree;
+      let passes = 0;
+      do {
+        changed = false;
+        effects = [];
+        cursor = 0;
+        tree = InlineThinking({
+          theme: {
+            colors: { foreground: "#ffffff", foregroundMuted: "#888888", surface0: "#000000" },
           },
-        ];
-      },
-      useRef(init) {
-        const b = bucket();
-        const i = currentCursor++;
-        if (!(i in b.slots)) b.slots[i] = { current: init };
-        return b.slots[i];
-      },
-      useEffect(fn, deps) {
-        const b = bucket();
-        const i = currentCursor++;
-        const prev = b.slots[i];
-        if (prev !== undefined && sameDeps(prev.deps, deps)) return;
-        b.slots[i] = { deps, cleanup: prev?.cleanup };
-        pendingEffects.push({ bucket: b, index: i, fn });
-      },
-      useLayoutEffect(fn, deps) {
-        const b = bucket();
-        const i = currentCursor++;
-        const prev = b.slots[i];
-        if (prev !== undefined && sameDeps(prev.deps, deps)) return;
-        b.slots[i] = { deps, cleanup: prev?.cleanup };
-        pendingEffects.push({ bucket: b, index: i, fn });
-      },
-      useMemo(fn, deps) {
-        const b = bucket();
-        const i = currentCursor++;
-        const prev = b.slots[i];
-        if (prev === undefined || !sameDeps(prev.deps, deps)) {
-          b.slots[i] = { deps, value: fn() };
+          layout: { compact: false },
+          ...props,
+        });
+        for (const { index, effect } of effects) {
+          const slot = slots[index];
+          if (typeof slot.cleanup === "function") slot.cleanup();
+          const cleanup = effect();
+          slot.cleanup = typeof cleanup === "function" ? cleanup : undefined;
         }
-        return b.slots[i].value;
-      },
-      useCallback(fn, deps) {
-        const b = bucket();
-        const i = currentCursor++;
-        const prev = b.slots[i];
-        if (prev === undefined || !sameDeps(prev.deps, deps)) {
-          b.slots[i] = { deps, value: fn };
-        }
-        return b.slots[i].value;
-      },
-      useSyncExternalStore(_sub, snap) {
-        return snap();
-      },
-    };
-
-    const rnStub = {
-      Platform: { OS: "web" },
-      Image: "Image",
-      Pressable: "Pressable",
-      ScrollView: "ScrollView",
-      StyleSheet: { hairlineWidth: 0.5 },
-      Text: "Text",
-      View: "View",
-      ...rnOverrides,
-    };
-
-    const stubs = {
-      react: () => hooks,
-      "react/jsx-runtime": () => ({
-        jsx: (type, props, key) => ({ type, props: props ?? {}, key }),
-        jsxs: (type, props, key) => ({ type, props: props ?? {}, key }),
-        Fragment: "Fragment",
-      }),
-      "react-native": () => rnStub,
-      "@getpaseo/plugin": () => ({ defineSettings: (cfg) => cfg }),
-      "@getpaseo/plugin/client": () => ({
-        useSettings: () => ({ status: "ready", values: styleSetting }),
-      }),
-      "@getpaseo/plugin/client/react-native": () => ({
-        copyText: (val) => {
-          copied.push(val);
-          return Promise.resolve();
-        },
-      }),
-    };
-
-    const originalLoad = Module._load;
-    const savedCache = new Map();
-    for (const k of Object.keys(require.cache)) {
-      if (k.includes("/client/")) {
-        savedCache.set(k, require.cache[k]);
-        delete require.cache[k];
-      }
-    }
-    Module._load = function load(req, parent, isMain) {
-      if (stubs[req] !== undefined) return stubs[req]();
-      return originalLoad.call(this, req, parent, isMain);
-    };
-    let InlineThinkingMod;
-    try {
-      InlineThinkingMod = require(componentPath);
-    } finally {
-      Module._load = originalLoad;
-      for (const k of Object.keys(require.cache)) {
-        if (k.includes("/client/") && !savedCache.has(k)) delete require.cache[k];
-      }
-      for (const [k, v] of savedCache) require.cache[k] = v;
-    }
-
-    function expand(node, path = "root") {
-      if (node === null || node === undefined || typeof node !== "object") return node;
-      if (Array.isArray(node)) return node.map((child, idx) => expand(child, `${path}[${idx}]`));
-      if (typeof node.type === "function") {
-        const key = `${path}:${node.type.name || "anon"}${node.key !== undefined ? `#${String(node.key)}` : ""}`;
-        const prevKey = currentKey;
-        const prevCursor = currentCursor;
-        currentKey = key;
-        currentCursor = 0;
-        let out;
-        try {
-          out = node.type(node.props);
-        } finally {
-          currentKey = prevKey;
-          currentCursor = prevCursor;
-        }
-        return expand(out, key);
-      }
-      const nextProps = { ...node.props };
-      if (nextProps.children !== undefined) {
-        if (typeof nextProps.children === "function") {
-          nextProps.children = expand(nextProps.children(null), `${path}.fn`);
-        } else {
-          nextProps.children = expand(nextProps.children, `${path}.c`);
-        }
-      }
-      return { ...node, props: nextProps };
-    }
-
-    function flushEffects() {
-      const batch = pendingEffects;
-      pendingEffects = [];
-      for (const item of batch) {
-        if (typeof item.bucket.slots[item.index]?.cleanup === "function") {
-          item.bucket.slots[item.index].cleanup();
-        }
-        const cleanup = item.fn();
-        item.bucket.slots[item.index].cleanup = typeof cleanup === "function" ? cleanup : undefined;
-      }
-    }
-
-    function render(props) {
-      pendingEffects = [];
-      const tree = expand({ type: InlineThinkingMod.InlineThinking, props });
-      flushEffects();
+        passes += 1;
+      } while (changed && passes < 10);
       return tree;
     }
 
-    function unmountAll() {
-      for (const b of instances.values()) {
-        for (const s of b.slots) {
-          if (s && typeof s.cleanup === "function") {
-            s.cleanup();
-            s.cleanup = undefined;
-          }
-        }
-      }
-      instances.clear();
+    function tickIntervals() {
+      for (const callback of [...intervals.values()]) callback();
     }
 
-    return {
-      render,
-      unmountAll,
-      copied,
-      setStyle(patch) {
-        styleSetting = { ...styleSetting, ...patch };
-      },
-    };
-  }
+    try {
+      resetThinkingDurationsForTests();
 
-  function findAll(node, pred, acc = []) {
-    if (node === null || node === undefined || typeof node !== "object") return acc;
-    if (Array.isArray(node)) {
-      for (const c of node) findAll(c, pred, acc);
-      return acc;
-    }
-    if (pred(node)) acc.push(node);
-    const ch = node.props?.children;
-    if (ch !== undefined) findAll(ch, pred, acc);
-    return acc;
-  }
-
-  function collectText(node) {
-    if (typeof node === "string" || typeof node === "number") return String(node);
-    if (node === null || node === undefined || typeof node !== "object") return "";
-    if (Array.isArray(node)) return node.map(collectText).join("");
-    return collectText(node.props?.children);
-  }
-
-  const sampleThought = "**第一步：分析代码**\n读取 `inline-thinking.tsx` 并核对 **TokenColors**。\n\n**第二步：设计方案**\n保留经典基线并加入 5 套样式。";
-
-  // 1. Breathing Rail (A)
-  {
-    const h = createTreeHarness();
-    h.setStyle({ thinkingStyle: "rail", expandedMaxHeight: 310 });
-    const runningTree = h.render({
-      theme: { colors: COLORS },
-      layout: { compact: false },
-      item: { data: { text: sampleThought, phase: "streaming" } },
-    });
-    const railPeek = findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-peek")[0];
-    check(
-      "rail running mounts style container, breathing rail, and unclipped 3-line peek window",
-      findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-style-rail").length === 1 &&
-        findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-rail-breathe").length === 1 &&
-        railPeek !== undefined &&
-        (railPeek.props?.style?.maxHeight ?? 0) >= 70,
-      `maxHeight=${railPeek?.props?.style?.maxHeight}`,
-    );
-    const headBtn = findAll(runningTree, (n) => n.type === "Pressable")[0];
-    headBtn.props.onPress();
-    const expandedTree = h.render({
-      theme: { colors: COLORS },
-      layout: { compact: false },
-      item: { data: { text: sampleThought, phase: "complete" } },
-    });
-    const scroll = findAll(expandedTree, (n) => n.type === "ScrollView")[0];
-    check(
-      "rail expanded mounts bounded ScrollView with expandedMaxHeight and structured headings",
-      scroll?.props?.testID === "dsh-scroll-box" &&
-        scroll?.props?.style?.maxHeight === 310 &&
-        collectText(scroll).includes("第一步：分析代码"),
-    );
-    const bodyCollapseBtn = findAll(scroll, (n) => n.type === "Pressable")[0];
-    bodyCollapseBtn?.props?.onPress();
-    const collapsedTree = h.render({
-      theme: { colors: COLORS },
-      layout: { compact: false },
-      item: { data: { text: sampleThought, phase: "complete" } },
-    });
-    check(
-      "tapping inside rail expanded ScrollView collapses the row",
-      findAll(collapsedTree, (n) => n.type === "ScrollView").length === 0,
-    );
-    h.unmountAll();
-  }
-
-  // 2. Silk Subtitle (B)
-  {
-    const h = createTreeHarness();
-    h.setStyle({ thinkingStyle: "silk" });
-    const runningTree = h.render({
-      theme: { colors: COLORS },
-      layout: { compact: false },
-      item: { data: { text: sampleThought, phase: "streaming" } },
-    });
-    check(
-      "silk running stays strictly single-line (no peek box or ScrollView)",
-      findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-style-silk").length === 1 &&
-        findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-peek").length === 0 &&
-        findAll(runningTree, (n) => n.type === "ScrollView").length === 0,
-    );
-    const headBtn = findAll(runningTree, (n) => n.type === "Pressable")[0];
-    headBtn.props.onPress();
-    const expandedTree = h.render({
-      theme: { colors: COLORS },
-      layout: { compact: false },
-      item: { data: { text: sampleThought, phase: "complete" } },
-    });
-    const copyBtn = findAll(expandedTree, (n) => n.props?.testID === "dsh-thinking-copy")[0];
-    copyBtn?.props?.onPress();
-    check(
-      "silk expanded toolbar Copy button calls copyText with raw thought",
-      copyBtn !== undefined && h.copied.length === 1 && h.copied[0] === sampleThought,
-    );
-    h.unmountAll();
-  }
-
-  // 3. Soft Capsule (C)
-  {
-    const h = createTreeHarness();
-    h.setStyle({ thinkingStyle: "capsule" });
-    const runningTree = h.render({
-      theme: { colors: COLORS },
-      layout: { compact: false },
-      item: { data: { text: sampleThought, phase: "streaming" } },
-    });
-    const runningBadge = findAll(runningTree, (n) => n.props?.testID === "dsh-row-badge-running")[0];
-    const hasSurface1Backdrop =
-      runningBadge !== undefined &&
-      findAll(runningBadge, (n) => n.props?.style?.backgroundColor === COLORS.surface1).length >= 1;
-    check(
-      "capsule running mounts gliding progress bar, peek window, and surface1 badge backdrop",
-      findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-style-capsule").length === 1 &&
-        findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-progress-bar").length === 1 &&
-        findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-peek").length === 1 &&
-        hasSurface1Backdrop,
-      `hasSurface1Backdrop=${hasSurface1Backdrop}`,
-    );
-    const settledTree = h.render({
-      theme: { colors: COLORS },
-      layout: { compact: false },
-      item: { data: { text: sampleThought, phase: "complete" } },
-    });
-    const headBtn = findAll(settledTree, (n) => n.type === "Pressable")[0];
-    headBtn.props.onPress();
-    const expandedTree = h.render({
-      theme: { colors: COLORS },
-      layout: { compact: false },
-      item: { data: { text: sampleThought, phase: "complete" } },
-    });
-    check(
-      "capsule expanded renders bounded ScrollView inside surface1 container",
-      findAll(expandedTree, (n) => n.type === "ScrollView" && n.props?.testID === "dsh-scroll-box").length === 1,
-    );
-    h.unmountAll();
-  }
-
-  // 4. Stepper Timeline (D)
-  {
-    const h = createTreeHarness();
-    h.setStyle({ thinkingStyle: "stepper" });
-    const multiParaLong = [
-      "**步骤一**\n读取设置 schema。",
-      "**步骤二**\n核对双语词表。",
-      "**步骤三**\n检查样式接线。",
-      `**步骤四**\n${"长段落内容持续输出中，用于验证折叠流式预览高度与字符截断边界。".repeat(12)}`,
-    ].join("\n\n");
-    const runningTree = h.render({
-      theme: { colors: COLORS },
-      layout: { compact: false },
-      item: { data: { text: multiParaLong, phase: "streaming" } },
-    });
-    const runningPeek = findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-peek")[0];
-    const runningStepsText = collectText(runningPeek);
-    check(
-      "stepper running bounds collapsed preview height and slices to recent 2 steps",
-      findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-style-stepper").length === 1 &&
-        findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-steps").length === 1 &&
-        runningPeek?.props?.style?.maxHeight <= 96 &&
-        runningPeek?.props?.style?.overflow === "hidden" &&
-        !runningStepsText.includes("步骤一") &&
-        runningStepsText.includes("步骤三") &&
-        runningStepsText.includes("步骤四") &&
-        runningStepsText.length < 240,
-      `maxHeight=${runningPeek?.props?.style?.maxHeight}, len=${runningStepsText.length}`,
-    );
-    // Fresh settled instance: historic complete row collapses steps and never fabricates ANY duration.
-    const hSettled = createTreeHarness();
-    hSettled.setStyle({ thinkingStyle: "stepper" });
-    const historicTree = hSettled.render({
-      theme: { colors: COLORS },
-      layout: { compact: false },
-      item: { data: { text: sampleThought, phase: "complete" } },
-    });
-    const historicText = collectText(historicTree);
-    check(
-      "stepper historic settled row starts collapsed with honest step count (no fabricated duration)",
-      findAll(historicTree, (n) => n.props?.testID === "dsh-thinking-steps").length === 0 &&
-        !/\d+(?:\.\d+)?s\b/.test(historicText) &&
-        !/\d+m\s+\d+s/.test(historicText),
-      historicText,
-    );
-    const headBtn = findAll(historicTree, (n) => n.type === "Pressable")[0];
-    headBtn.props.onPress();
-    const expandedTree = hSettled.render({
-      theme: { colors: COLORS },
-      layout: { compact: false },
-      item: { data: { text: sampleThought, phase: "complete" } },
-    });
-    check(
-      "stepper expanded wraps steps inside bounded ScrollView",
-      findAll(expandedTree, (n) => n.type === "ScrollView" && n.props?.testID === "dsh-scroll-box").length === 1 &&
-        findAll(expandedTree, (n) => n.props?.testID === "dsh-thinking-steps").length === 1,
-    );
-    // Implicit paragraphs (no **Heading**) must never duplicate their first line in stepper expanded view.
-    const hImplicit = createTreeHarness();
-    hImplicit.setStyle({ thinkingStyle: "stepper" });
-    const implicitThought = "没有小标题的首行内容\n第二行补充说明。\n\n另一个隐式段落。";
-    const implicitInit = hImplicit.render({
-      theme: { colors: COLORS },
-      layout: { compact: false },
-      item: { data: { text: implicitThought, phase: "complete" } },
-    });
-    findAll(implicitInit, (n) => n.type === "Pressable")[0].props.onPress();
-    const implicitExpanded = hImplicit.render({
-      theme: { colors: COLORS },
-      layout: { compact: false },
-      item: { data: { text: implicitThought, phase: "complete" } },
-    });
-    const implicitSteps = findAll(implicitExpanded, (n) => n.props?.testID === "dsh-thinking-steps")[0];
-    const implicitText = collectText(implicitSteps);
-    const countOccurrences = (haystack, needle) => haystack.split(needle).length - 1;
-    check(
-      "stepper expanded does not duplicate first line of implicit paragraphs",
-      countOccurrences(implicitText, "没有小标题的首行内容") === 1 &&
-        countOccurrences(implicitText, "另一个隐式段落。") === 1,
-      implicitText,
-    );
-    h.unmountAll();
-    hSettled.unmountAll();
-    hImplicit.unmountAll();
-  }
-
-  // 5. Editorial Marginalia (E)
-  {
-    const h = createTreeHarness();
-    h.setStyle({ thinkingStyle: "editorial" });
-    const runningTree = h.render({
-      theme: { colors: COLORS },
-      layout: { compact: false },
-      item: { data: { text: sampleThought, phase: "streaming" } },
-    });
-    check(
-      "editorial running mounts style container and 2-line peek",
-      findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-style-editorial").length === 1 &&
-        findAll(runningTree, (n) => n.props?.testID === "dsh-thinking-peek").length === 1,
-    );
-    const headBtn = findAll(runningTree, (n) => n.type === "Pressable")[0];
-    headBtn.props.onPress();
-    const expandedTree = h.render({
-      theme: { colors: COLORS },
-      layout: { compact: false },
-      item: { data: { text: sampleThought, phase: "complete" } },
-    });
-    check(
-      "editorial expanded renders dashed quote border and bounded ScrollView",
-      findAll(expandedTree, (n) => n.props?.style?.borderStyle === "dashed").length >= 1 &&
-        findAll(expandedTree, (n) => n.type === "ScrollView" && n.props?.testID === "dsh-scroll-box").length === 1,
-    );
-    h.unmountAll();
-  }
-
-  // 6. Native Animated loop cleanup across BreathingRail & BreathingDot
-  {
-    let starts = 0;
-    const activeAnims = new Set();
-    const makeAnim = () => {
-      const token = {
-        start: () => {
-          starts += 1;
-          activeAnims.add(token);
-        },
-        stop: () => {
-          activeAnims.delete(token);
-        },
-      };
-      return token;
-    };
-    class FakeAnimatedValue {
-      constructor(v) {
-        this._v = v;
-      }
-      setValue(v) {
-        this._v = v;
-      }
-      interpolate() {
-        return this._v;
-      }
-    }
-    const hNative = createTreeHarness({
-      Platform: { OS: "ios" },
-      Easing: { linear: "linear", sin: "sin", quad: "quad", cubic: "cubic", inOut: (x) => x, out: (x) => x },
-      Animated: {
-        Value: FakeAnimatedValue,
-        View: "Animated.View",
-        delay: () => makeAnim(),
-        timing: () => makeAnim(),
-        sequence: () => makeAnim(),
-        parallel: () => makeAnim(),
-        loop: () => makeAnim(),
-      },
-    });
-    hNative.setStyle({ thinkingStyle: "rail" });
-    const nativeTree = hNative.render({
-      theme: { colors: COLORS },
-      layout: { compact: false },
-      item: { data: { text: sampleThought, phase: "streaming" } },
-    });
-    const animatedViews = findAll(nativeTree, (n) => n.type === "Animated.View").length;
-    const activeWhileMounted = activeAnims.size;
-    hNative.unmountAll();
-    check(
-      "Native rail starts Animated loops and stops every loop cleanly on unmount",
-      animatedViews >= 3 && starts >= 3 && activeWhileMounted >= 3 && activeAnims.size === 0,
-      `animatedViews=${animatedViews}, starts=${starts}, activeWhileMounted=${activeWhileMounted}, leaked=${activeAnims.size}`,
-    );
-
-    // 6b. Native silk subtitle does NOT restart animation on per-token growth, only on clause/paragraph swaps
-    const hSilkNative = createTreeHarness({
-      Platform: { OS: "ios" },
-      Easing: { linear: "linear", sin: "sin", quad: "quad", cubic: "cubic", inOut: (x) => x, out: (x) => x },
-      Animated: {
-        Value: FakeAnimatedValue,
-        View: "Animated.View",
-        delay: () => makeAnim(),
-        timing: () => makeAnim(),
-        sequence: () => makeAnim(),
-        parallel: () => makeAnim(),
-        loop: () => makeAnim(),
-      },
-    });
-    hSilkNative.setStyle({ thinkingStyle: "silk" });
-    hSilkNative.render({
-      theme: { colors: COLORS },
-      layout: { compact: false },
-      item: { data: { text: "第一句。\n第二句。\n第三句准备落码", phase: "streaming" } },
-    });
-    const startsAfterBase = starts;
-    hSilkNative.render({
-      theme: { colors: COLORS },
-      layout: { compact: false },
-      item: { data: { text: "第一句。\n第二句。\n第三句准备落码并且继续", phase: "streaming" } },
-    });
-    const startsAfterToken = starts;
-    hSilkNative.render({
-      theme: { colors: COLORS },
-      layout: { compact: false },
-      item: { data: { text: "第一句。\n第二句。\n第三句准备落码并且继续。\n第四句新起点", phase: "streaming" } },
-    });
-    const startsAfterClause = starts;
-    hSilkNative.unmountAll();
-    check(
-      "Native silk subtitle keeps 0 extra Animated starts on per-token growth and triggers on clause swap",
-      startsAfterToken === startsAfterBase &&
-        startsAfterClause > startsAfterToken &&
-        activeAnims.size === 0,
-      `base=${startsAfterBase}, token=${startsAfterToken}, clause=${startsAfterClause}, leaked=${activeAnims.size}`,
-    );
-  }
-
-  // 7. Zero hardcoded colors across all thinking & status icon client files
-  {
-    const colorPattern = /#[0-9a-fA-F]{3,8}\b|\b(?:rgba?|hsla?)\s*\(/;
-    for (const [label, relPath] of [
-      ["thinking-styles.tsx", "client/thinking-styles.tsx"],
-      ["thinking-motion.tsx", "client/thinking-motion.tsx"],
-      ["inline-thinking.tsx", "client/inline-thinking.tsx"],
-      ["row-status-icon.tsx", "client/row-status-icon.tsx"],
-    ]) {
-      const srcPath = findRepoFile(relPath);
-      check(`located ${label} for colour audit`, srcPath !== undefined);
-      if (srcPath !== undefined) {
-        const code = readFileSync(srcPath, "utf8")
-          .split("\n")
-          .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
-          .join("\n");
-        check(
-          `${label} contains no hardcoded hex/rgb/hsl colours`,
-          !colorPattern.test(code),
-        );
-      }
-    }
-  }
-
-  // 8. Display settings screen: 6 thinking styles, draft preservation, save failure rollback, concurrency lock, reset
-  {
-    const settingsPath = join(__dirname, "client", "settings-screen.js");
-    check("compiled client/settings-screen.js exists", existsSync(settingsPath));
-    if (existsSync(settingsPath)) {
-      const savedCalls = [];
-      let nextSaveBehavior = "succeed";
-      let pendingResolve = null;
-      let currentStyleValues = {
-        rowMarginY: 0,
-        toolRowPaddingY: 0,
-        toolRowMinHeight: 24,
-        toolRowGap: 6,
-        expandedMaxHeight: 260,
-        commandMaxHeightRatio: 0.25,
-        commandMinHeight: 150,
-        thinkingStyle: "classic",
-      };
-      const screenSlots = [];
-      let screenCursor = 0;
-      const screenHooks = {
-        Component: class Component {},
-        useState(init) {
-          const i = screenCursor++;
-          if (!(i in screenSlots)) screenSlots[i] = typeof init === "function" ? init() : init;
-          return [
-            screenSlots[i],
-            (next) => {
-              screenSlots[i] = typeof next === "function" ? next(screenSlots[i]) : next;
-            },
-          ];
-        },
-        useRef(init) {
-          const i = screenCursor++;
-          if (!(i in screenSlots)) screenSlots[i] = { current: init };
-          return screenSlots[i];
-        },
-        useMemo(fn) {
-          return fn();
-        },
-        useSyncExternalStore(_sub, snap) {
-          return snap();
-        },
-      };
-      const screenStubs = {
-        react: () => screenHooks,
-        "react/jsx-runtime": () => ({
-          jsx: (type, props, key) => ({ type, props: props ?? {}, key }),
-          jsxs: (type, props, key) => ({ type, props: props ?? {}, key }),
-          Fragment: "Fragment",
-        }),
-        "react-native": () => ({
-          Platform: { OS: "web" },
-          Pressable: "Pressable",
-          ScrollView: "ScrollView",
-          Text: "Text",
-          View: "View",
-        }),
-        "@getpaseo/plugin": () => ({ defineSettings: (cfg) => cfg }),
-        "@getpaseo/plugin/client": () => ({
-          useSettings: (def) => {
-            if (def?.id === "language") {
-              return {
-                status: "ready",
-                values: { language: "auto" },
-                revision: 1,
-                saving: false,
-                saveError: null,
-                save: async () => true,
-                reset: async () => true,
-              };
-            }
-            return {
-              status: "ready",
-              values: currentStyleValues,
-              revision: 7,
-              saving: false,
-              saveError: null,
-              save: async (data, rev) => {
-                savedCalls.push({ data, rev });
-                if (nextSaveBehavior === "fail") {
-                  nextSaveBehavior = "succeed";
-                  return false;
-                }
-                if (nextSaveBehavior === "defer") {
-                  nextSaveBehavior = "succeed";
-                  return new Promise((resolve) => {
-                    pendingResolve = (ok) => {
-                      if (ok) currentStyleValues = data;
-                      resolve(ok);
-                    };
-                  });
-                }
-                currentStyleValues = data;
-                return true;
-              },
-              reset: async () => true,
-            };
-          },
-        }),
-        "@getpaseo/plugin/client/ui": () => ({ TextInput: "TextInput" }),
-      };
-      const origLoad = Module._load;
-      const savedCache = new Map();
-      for (const k of Object.keys(require.cache)) {
-        if (k.includes("/client/settings-screen")) {
-          savedCache.set(k, require.cache[k]);
-          delete require.cache[k];
-        }
-      }
-      Module._load = function load(req, parent, isMain) {
-        if (screenStubs[req] !== undefined) return screenStubs[req]();
-        return origLoad.call(this, req, parent, isMain);
-      };
-      let TimelineSettingsScreen;
-      try {
-        ({ TimelineSettingsScreen } = require(settingsPath));
-      } finally {
-        Module._load = origLoad;
-        for (const k of Object.keys(require.cache)) {
-          if (k.includes("/client/settings-screen") && !savedCache.has(k)) delete require.cache[k];
-        }
-        for (const [k, v] of savedCache) require.cache[k] = v;
-      }
-
-      const renderScreen = () => {
-        screenCursor = 0;
-        return TimelineSettingsScreen({
-          theme: {
-            colors: {
-              ...COLORS,
-              accentForeground: "#ffffff",
-            },
-          },
-          layout: { compact: false },
-        });
-      };
-      const flushMicrotasks = () =>
-        Promise.resolve()
-          .then(() => Promise.resolve())
-          .then(() => Promise.resolve());
-
-      const screenTree = renderScreen();
-      const pressables = findAll(screenTree, (n) => n.type === "Pressable");
-      const styleKeys = ["classic", "rail", "silk", "capsule", "stepper", "editorial"];
-      const styleButtons = pressables.filter((n) => styleKeys.includes(n.key));
+      // 1. Historic / replayed thought: mounts complete and never grows -> no timer, no badge.
+      resetHooks();
+      const historicTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: 1_700_000_001_000,
+        item: { data: { text: "already finished thought", phase: "complete" } },
+      });
       check(
-        "Display settings renders all 6 thinkingStyle buttons with classic initially selected",
-        styleButtons.length === 6 &&
-          styleButtons.find((b) => b.key === "classic")?.props?.accessibilityState?.selected === true &&
-          styleButtons.find((b) => b.key === "rail")?.props?.accessibilityState?.selected === false,
-        `found ${styleButtons.length} button(s)`,
+        "historic completed row starts no duration interval",
+        intervals.size === 0,
+        `${intervals.size} interval(s)`,
+      );
+      check(
+        "historic completed row does not render a duration badge",
+        findNode(historicTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID) === null,
+      );
+      unmount();
+
+      // 2. Live streaming thought: ticks on the right, stays visible when expanded, freezes on settle.
+      resetHooks();
+      const liveTs = 1_700_000_002_000;
+      const t0Tree = renderRow({
+        agentId: "dur-agent",
+        timestamp: liveTs,
+        item: { data: { text: "starting", phase: "streaming" } },
+      });
+      check(
+        "live streaming row starts one duration interval",
+        intervals.size === 1,
+        `${intervals.size} interval(s)`,
+      );
+      check(
+        "at 0ms elapsed, no noisy 0.0s duration is rendered",
+        findNode(t0Tree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID) === null,
       );
 
-      // Edit numeric draft (expandedMaxHeight -> "320"), then pick 'rail' thinking style.
-      const inputs = findAll(screenTree, (n) => n.type === "TextInput");
-      const maxHeightInput = inputs.find((n) => n.props?.value === "260");
-      maxHeightInput?.props?.onChangeText?.("320");
-      const treeWithDraft = renderScreen();
-      const railButton = findAll(treeWithDraft, (n) => n.type === "Pressable").find((b) => b.key === "rail");
-      railButton?.props?.onPress();
+      fakeNow += 1250;
+      tickIntervals();
+      const t1Tree = renderRow({
+        agentId: "dur-agent",
+        timestamp: liveTs,
+        item: { data: { text: "starting to reason through the layout", phase: "streaming" } },
+      });
+      const durNode1 = findNode(t1Tree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID);
+      check(
+        "after 1250ms tick, right-side duration shows 1.3s with tabular-nums and theme color",
+        durNode1?.props?.children === "1.3s" &&
+          durNode1?.props?.style?.color === "#888888" &&
+          Array.isArray(durNode1?.props?.style?.fontVariant) &&
+          durNode1.props.style.fontVariant.includes("tabular-nums"),
+        JSON.stringify({ text: durNode1?.props?.children, style: durNode1?.props?.style }),
+      );
 
-      flushMicrotasks()
-        .then(() => {
-          const afterRailTree = renderScreen();
-          const preservedInput = findAll(afterRailTree, (n) => n.type === "TextInput").find(
-            (n) => n.props?.value === "320",
-          );
-          check(
-            "tapping Breathing Rail saves thinkingStyle='rail' with current revision and preserves numeric draft",
-            savedCalls.length === 1 &&
-              savedCalls[0].data.thinkingStyle === "rail" &&
-              savedCalls[0].rev === 7 &&
-              preservedInput !== undefined,
-            JSON.stringify(savedCalls),
-          );
-          // Saving numeric draft must keep thinkingStyle='rail' (never revert to 'classic').
-          const saveBtn = findAll(afterRailTree, (n) => n.type === "Pressable").find(
-            (n) => n.props?.accessibilityLabel === "保存" || n.props?.accessibilityLabel === "Save",
-          );
-          saveBtn?.props?.onPress();
-          return flushMicrotasks();
-        })
-        .then(() => {
-          check(
-            "saving numeric draft persists expandedMaxHeight=320 while preserving thinkingStyle='rail'",
-            savedCalls.length === 2 &&
-              savedCalls[1].data.expandedMaxHeight === 320 &&
-              savedCalls[1].data.thinkingStyle === "rail",
-            JSON.stringify(savedCalls[1]),
-          );
-          // Failure path: save returns false without mutating values -> rolls back picked style and shows error.
-          const beforeFailTree = renderScreen();
-          nextSaveBehavior = "fail";
-          const stepperBtn = findAll(beforeFailTree, (n) => n.type === "Pressable").find(
-            (b) => b.key === "stepper",
-          );
-          stepperBtn?.props?.onPress();
-          return flushMicrotasks();
-        })
-        .then(() => {
-          const afterFailTree = renderScreen();
-          const afterFailButtons = findAll(afterFailTree, (n) => n.type === "Pressable").filter((b) =>
-            styleKeys.includes(b.key),
-          );
-          const errorTexts = findAll(
-            afterFailTree,
-            (n) => n.type === "Text" && n.props?.style?.color === COLORS.statusDanger,
-          );
-          check(
-            "failed style save rolls back selection to 'rail' and shows fallback error banner",
-            savedCalls.length === 3 &&
-              afterFailButtons.find((b) => b.key === "rail")?.props?.accessibilityState?.selected === true &&
-              afterFailButtons.find((b) => b.key === "stepper")?.props?.accessibilityState?.selected === false &&
-              errorTexts.length >= 1,
-            `selected=${afterFailButtons.find((b) => b.props?.accessibilityState?.selected)?.key}, errors=${errorTexts.length}`,
-          );
-          // Concurrency guard: two rapid taps while save promise is in-flight only fire one save.
-          nextSaveBehavior = "defer";
-          const silkBtn = afterFailButtons.find((b) => b.key === "silk");
-          const capsuleBtn = afterFailButtons.find((b) => b.key === "capsule");
-          silkBtn?.props?.onPress();
-          capsuleBtn?.props?.onPress();
-          return flushMicrotasks();
-        })
-        .then(() => {
-          check(
-            "synchronous inFlight lock blocks rapid double-tap from firing duplicate concurrent saves",
-            savedCalls.length === 4 && savedCalls[3].data.thinkingStyle === "silk",
-            `calls=${savedCalls.length}`,
-          );
-          pendingResolve?.(true);
-          pendingResolve = null;
-          return flushMicrotasks();
-        })
-        .then(() => {
-          const afterSilkTree = renderScreen();
-          const resetBtn = findAll(afterSilkTree, (n) => n.type === "Pressable").find(
-            (n) => n.props?.accessibilityLabel === "恢复默认" || n.props?.accessibilityLabel === "Restore defaults",
-          );
-          resetBtn?.props?.onPress();
-          return flushMicrotasks();
-        })
-        .then(() => {
-          check(
-            "tapping Restore defaults resets thinkingStyle back to 'classic'",
-            savedCalls.length === 5 && savedCalls[4].data.thinkingStyle === "classic",
-            JSON.stringify(savedCalls[4]),
-          );
-          console.log(`\n${passed} passed, ${failed} failed`);
-          process.exit(failed === 0 ? 0 : 1);
-        })
-        .catch((err) => {
-          console.error(err);
-          process.exit(1);
+      const headPressable = findNode(t1Tree, (n) => n.type === "Pressable");
+      const headChildren = childArray(headPressable);
+      const mainIndex = headChildren.findIndex((c) => findNode(c, (n) => n.type === "TextShimmer") !== null);
+      const durIndex = headChildren.findIndex((c) => findNode(c, (n) => n.props?.testID === THINKING_DURATION_TEST_ID) !== null);
+      const labelStyle = findNode(
+        findNode(t1Tree, (n) => n.type === "TextShimmer").props.children(null),
+        (n) => n.type === "Text" && typeof n.props?.onLayout === "function",
+      )?.props?.style;
+      const flatLabelStyle = Array.isArray(labelStyle) ? Object.assign({}, ...labelStyle.filter(Boolean)) : labelStyle;
+      check(
+        "duration sits on the right of the TextShimmer main slot with web-safe overflow guards",
+        mainIndex >= 0 &&
+          durIndex > mainIndex &&
+          headChildren[mainIndex]?.props?.style?.flex === 1 &&
+          headChildren[mainIndex]?.props?.style?.minWidth === 0 &&
+          headChildren[durIndex]?.props?.style?.flexShrink === 0 &&
+          durNode1?.props?.numberOfLines === 1 &&
+          flatLabelStyle?.flexShrink === 0,
+        JSON.stringify({
+          mainIndex,
+          durIndex,
+          mainStyle: headChildren[mainIndex]?.props?.style,
+          durBoxStyle: headChildren[durIndex]?.props?.style,
+          durLines: durNode1?.props?.numberOfLines,
+          labelShrink: flatLabelStyle?.flexShrink,
+        }),
+      );
+
+      // Expanding the row keeps the duration visible on the head row.
+      headPressable.props.onPress();
+      const expandedDurTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: liveTs,
+        item: { data: { text: "starting to reason through the layout", phase: "streaming" } },
+      });
+      check(
+        "duration remains visible on the right when the thought is expanded",
+        findNode(expandedDurTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "1.3s",
+      );
+
+      // Width budget: reporting durationBox width narrows streamingTail's budget.
+      headPressable.props.onPress(); // collapse again
+      const longStreaming = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+      const measuredTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: liveTs,
+        item: { data: { text: longStreaming, phase: "streaming" } },
+      });
+      const headForMeasure = findNode(measuredTree, (n) => n.type === "Pressable");
+      headForMeasure.props.onLayout({ nativeEvent: { layout: { width: 220 } } });
+      const shimmerForMeasure = findNode(measuredTree, (n) => n.type === "TextShimmer");
+      const shimmerChildrenBefore = shimmerForMeasure.props.children(null);
+      const labelNode = findNode(shimmerChildrenBefore, (n) => n.type === "Text" && typeof n.props?.onLayout === "function");
+      labelNode.props.onLayout({ nativeEvent: { layout: { width: 26 } } });
+      const treeBeforeDurWidth = renderRow({
+        agentId: "dur-agent",
+        timestamp: liveTs,
+        item: { data: { text: longStreaming, phase: "streaming" } },
+      });
+      const lineBeforeDurWidth = findNode(
+        findNode(treeBeforeDurWidth, (n) => n.type === "TextShimmer").props.children(null),
+        (n) => n.type === "Text" && n.props?.numberOfLines === 1,
+      )?.props?.children;
+
+      const durBoxNode = childArray(findNode(treeBeforeDurWidth, (n) => n.type === "Pressable")).find(
+        (c) => findNode(c, (n) => n.props?.testID === THINKING_DURATION_TEST_ID) !== null,
+      );
+      durBoxNode.props.onLayout({ nativeEvent: { layout: { width: 38 } } });
+      const treeAfterDurWidth = renderRow({
+        agentId: "dur-agent",
+        timestamp: liveTs,
+        item: { data: { text: longStreaming, phase: "streaming" } },
+      });
+      const lineAfterDurWidth = findNode(
+        findNode(treeAfterDurWidth, (n) => n.type === "TextShimmer").props.children(null),
+        (n) => n.type === "Text" && n.props?.numberOfLines === 1,
+      )?.props?.children;
+      check(
+        "duration width is subtracted from streamingTail line width budget",
+        typeof lineBeforeDurWidth === "string" &&
+          typeof lineAfterDurWidth === "string" &&
+          lineAfterDurWidth.length < lineBeforeDurWidth.length,
+        `before=${String(lineBeforeDurWidth).length} after=${String(lineAfterDurWidth).length}`,
+      );
+
+      // Final chunk arrives at 2400ms total; advancing wall clock by SETTLE_WINDOW_MS (300ms)
+      // before firing the settle timer must still freeze at 2.4s (not 2.7s).
+      fakeNow += 1150;
+      renderRow({
+        agentId: "dur-agent",
+        timestamp: liveTs,
+        item: { data: { text: `${longStreaming}!`, phase: "complete" } },
+      });
+      fakeNow += 300;
+      for (const cb of [...timers.values()]) cb();
+      timers.clear();
+      const settledTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: liveTs,
+        item: { data: { text: `${longStreaming}!`, phase: "complete" } },
+      });
+      check(
+        "settling clears the duration interval and freezes at 2.4s without adding the 300ms settle window",
+        intervals.size === 0 &&
+          findNode(settledTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "2.4s",
+        `intervals=${intervals.size}, text=${findNode(settledTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+
+      // Further wall-clock advance while still mounted does not change the frozen duration.
+      fakeNow += 600_000;
+      const stillFrozenTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: liveTs,
+        item: { data: { text: `${longStreaming}!`, phase: "complete" } },
+      });
+      check(
+        "frozen duration stays 2.4s after wall clock advances",
+        findNode(stillFrozenTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "2.4s",
+      );
+
+      // Late growth or streaming jitter on an already-settled row must NOT restart
+      // the timer using the stale startedAt (would jump from 2.4s to 10m+).
+      const lateGrowthTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: liveTs,
+        item: { data: { text: `${longStreaming}! (patch)`, phase: "streaming" } },
+      });
+      check(
+        "settled row stays frozen at 2.4s with 0 intervals even if late growth/streaming arrives",
+        intervals.size === 0 &&
+          findNode(lateGrowthTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "2.4s",
+        `intervals=${intervals.size}, text=${findNode(lateGrowthTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      unmount();
+
+      // 3. Remounting the same row (virtual-list recycle) 10 minutes later preserves 2.4s.
+      resetHooks();
+      const remountedTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: liveTs,
+        item: { data: { text: `${longStreaming}!`, phase: "complete" } },
+      });
+      check(
+        "remounting settled row preserves cached 2.4s without inflating or starting intervals",
+        intervals.size === 0 &&
+          findNode(remountedTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "2.4s",
+        `intervals=${intervals.size}, text=${findNode(remountedTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      unmount();
+
+      // 4. Unmounting mid-stream clears interval and remounting later as complete keeps last observed elapsed.
+      resetHooks();
+      const midTs = 1_700_000_003_000;
+      renderRow({
+        agentId: "dur-agent",
+        timestamp: midTs,
+        item: { data: { text: "mid", phase: "streaming" } },
+      });
+      fakeNow += 1500;
+      tickIntervals();
+      renderRow({
+        agentId: "dur-agent",
+        timestamp: midTs,
+        item: { data: { text: "mid stream", phase: "streaming" } },
+      });
+      unmount();
+      check("unmounting mid-stream clears the interval", intervals.size === 0, `${intervals.size}`);
+
+      fakeNow += 300_000;
+      resetHooks();
+      const remountMidTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: midTs,
+        item: { data: { text: "mid stream done", phase: "complete" } },
+      });
+      check(
+        "remounting mid-stream row as complete keeps last observed 1.5s without adding unmounted gap",
+        intervals.size === 0 &&
+          findNode(remountMidTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "1.5s",
+        `intervals=${intervals.size}, text=${findNode(remountMidTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+
+      // 5. In-place key recycling (same mounted instance switches to a historic row without unmounting)
+      // must not leak the previous row's elapsed time or startedAt into the new key.
+      const recycledHistoricTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: 1_700_000_004_000,
+        item: { data: { text: "unrelated historic row", phase: "complete" } },
+      });
+      check(
+        "in-place key switch to an unseen historic row clears duration without leaking previous row",
+        intervals.size === 0 &&
+          findNode(recycledHistoricTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID) === null,
+        `intervals=${intervals.size}, text=${findNode(recycledHistoricTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      unmount();
+
+      // 6. Actively streaming row recycled in-place to a shorter historic row clears interval & duration immediately.
+      resetHooks();
+      renderRow({
+        agentId: "dur-agent",
+        timestamp: 1_700_000_005_000,
+        item: { data: { text: "currently streaming long reasoning text", phase: "streaming" } },
+      });
+      fakeNow += 800;
+      tickIntervals();
+      const switchedFromStreamingTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: 1_700_000_000_500,
+        item: { data: { text: "short old", phase: "complete" } },
+      });
+      check(
+        "in-place switch from active streaming row to shorter historic row stops interval and clears badge",
+        intervals.size === 0 &&
+          findNode(switchedFromStreamingTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID) === null,
+        `intervals=${intervals.size}, text=${findNode(switchedFromStreamingTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      unmount();
+
+      // 7. Host merge-timestamp advance during live streaming and final complete frame
+      // carries the same thought's timer forward and migrates cache to the final timestamp.
+      resetHooks();
+      const driftTs1 = 1_700_000_006_000;
+      const driftTs2 = 1_700_000_007_000;
+      const driftTs3 = 1_700_000_008_000;
+      renderRow({
+        agentId: "dur-agent",
+        timestamp: driftTs1,
+        item: { data: { text: "step 1", phase: "streaming" } },
+      });
+      fakeNow += 1200;
+      tickIntervals();
+      const driftMidTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: driftTs2,
+        item: { data: { text: "step 1 -> step 2", phase: "streaming" } },
+      });
+      check(
+        "host timestamp advance mid-stream preserves running duration without resetting to 0",
+        intervals.size === 1 &&
+          findNode(driftMidTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "1.2s",
+        `intervals=${intervals.size}, text=${findNode(driftMidTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      fakeNow += 600;
+      renderRow({
+        agentId: "dur-agent",
+        timestamp: driftTs3,
+        item: { data: { text: "step 1 -> step 2 -> done", phase: "complete" } },
+      });
+      fakeNow += 300;
+      for (const cb of [...timers.values()]) cb();
+      timers.clear();
+      const driftSettledTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: driftTs3,
+        item: { data: { text: "step 1 -> step 2 -> done", phase: "complete" } },
+      });
+      check(
+        "host timestamp advance on final complete frame freezes at cumulative 1.8s",
+        intervals.size === 0 &&
+          findNode(driftSettledTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "1.8s",
+        `intervals=${intervals.size}, text=${findNode(driftSettledTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      unmount();
+
+      resetHooks();
+      const driftRemountTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: driftTs3,
+        item: { data: { text: "step 1 -> step 2 -> done", phase: "complete" } },
+      });
+      check(
+        "remounting with final drifted timestamp preserves migrated 1.8s duration",
+        findNode(driftRemountTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "1.8s",
+      );
+      unmount();
+
+      // 8. Ultra-short (<100ms) thought does not cross 100ms during the 300ms settle window.
+      resetHooks();
+      const shortTs = 1_700_000_009_000;
+      renderRow({
+        agentId: "dur-agent",
+        timestamp: shortTs,
+        item: { data: { text: "ok", phase: "streaming" } },
+      });
+      fakeNow += 50;
+      renderRow({
+        agentId: "dur-agent",
+        timestamp: shortTs,
+        item: { data: { text: "ok!", phase: "complete" } },
+      });
+      fakeNow += 300;
+      for (const cb of [...timers.values()]) cb();
+      timers.clear();
+      const shortSettledTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: shortTs,
+        item: { data: { text: "ok!", phase: "complete" } },
+      });
+      check(
+        "ultra-short 50ms thought stays hidden after 300ms settle window (never flashes 0.3s)",
+        intervals.size === 0 &&
+          findNode(shortSettledTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID) === null,
+        `text=${findNode(shortSettledTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      unmount();
+
+      // 9. System clock rollback during streaming preserves monotonicity.
+      resetHooks();
+      const rollbackTs = 1_700_000_010_000;
+      renderRow({
+        agentId: "dur-agent",
+        timestamp: rollbackTs,
+        item: { data: { text: "clock", phase: "streaming" } },
+      });
+      fakeNow += 1500;
+      tickIntervals();
+      fakeNow -= 5000; // clock jumps backward before startedAt
+      tickIntervals();
+      const rollbackTree = renderRow({
+        agentId: "dur-agent",
+        timestamp: rollbackTs,
+        item: { data: { text: "clock rollback", phase: "streaming" } },
+      });
+      check(
+        "wall-clock rollback keeps elapsed duration strictly monotonic at 1.5s",
+        findNode(rollbackTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "1.5s",
+        `text=${findNode(rollbackTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children}`,
+      );
+      fakeNow += 5000;
+      unmount();
+
+      // 10. MAX_DURATION_RECORDS (500) eviction boundary: 501st row evicts the oldest entry.
+      resetThinkingDurationsForTests();
+      const baseEvictTs = 1_700_001_000_000;
+      for (let i = 0; i < 501; i++) {
+        resetHooks();
+        renderRow({
+          agentId: "evict-agent",
+          timestamp: baseEvictTs + i * 1000,
+          item: { data: { text: `row-${i}`, phase: "streaming" } },
         });
-      return;
+        fakeNow += 500;
+        tickIntervals();
+        unmount();
+      }
+      resetHooks();
+      const evictedOldestTree = renderRow({
+        agentId: "evict-agent",
+        timestamp: baseEvictTs,
+        item: { data: { text: "row-0", phase: "complete" } },
+      });
+      unmount();
+      resetHooks();
+      const retainedNewestTree = renderRow({
+        agentId: "evict-agent",
+        timestamp: baseEvictTs + 500 * 1000,
+        item: { data: { text: "row-500", phase: "complete" } },
+      });
+      check(
+        "duration cache evicts oldest entry beyond MAX_DURATION_RECORDS (500) while retaining newest",
+        findNode(evictedOldestTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID) === null &&
+          findNode(retainedNewestTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children === "0.5s",
+        JSON.stringify({
+          oldest: findNode(evictedOldestTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children,
+          newest: findNode(retainedNewestTree, (n) => n.props?.testID === THINKING_DURATION_TEST_ID)?.props?.children,
+        }),
+      );
+      unmount();
+    } finally {
+      Date.now = realDateNow;
+      resetThinkingDurationsForTests();
     }
   }
+
+  global.setTimeout = realSetTimeout;
+  global.clearTimeout = realClearTimeout;
+  global.setInterval = realSetInterval;
+  global.clearInterval = realClearInterval;
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

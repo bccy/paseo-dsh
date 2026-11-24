@@ -26,11 +26,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Image, Pressable, ScrollView, Text, View } from "react-native";
 import {
   EXPANDED_MAX_HEIGHT_DEFAULT,
-  THINKING_STYLE_DEFAULT,
   TIMELINE_STYLE_DEFAULTS,
-  isThinkingStyleChoice,
   timelineStyleSettings,
-  type ThinkingStyleChoice,
 } from "../shared/settings";
 import { normalizeRowTimestamp, noteRender } from "./newest";
 import {
@@ -42,8 +39,7 @@ import {
 } from "./row-entrance";
 import { RowStatusIcon, resolveThinkingIconStatus } from "./row-status-icon";
 import { TextShimmer } from "./text-shimmer";
-import { EnhancedThinkingView } from "./thinking-styles";
-import { reasoningPreview, streamingTail } from "./thinking-text";
+import { formatThinkingDuration, reasoningPreview, streamingTail } from "./thinking-text";
 import { BODY_INDENT, ROW_FONT_SIZE, ROW_GAP, ROW_LINE_HEIGHT } from "./tokens";
 import { useLocaleText } from "./use-locale";
 
@@ -87,20 +83,348 @@ const SETTLE_WINDOW_MS = 300;
  * `complete` has held for {@link SETTLE_WINDOW_MS}; every new frame re-runs the
  * effect, which cancels the pending settle and demands the window again.
  */
-function useGrowing(text: string, phase: "streaming" | "complete"): boolean {
-  const [growing, setGrowing] = useState(phase === "streaming");
-  const lastLength = useRef(text.length);
+interface GrowingState {
+  identity: string | undefined;
+  agentId: string | undefined;
+  rowAt: number;
+  text: string;
+  growing: boolean;
+  lastActivityAt: number;
+}
+
+interface GrowingResult {
+  growing: boolean;
+  lastActivityAt: number;
+  continuedKeyShift: boolean;
+}
+
+/**
+ * Distinguish a host merge-timestamp advance on the *same* live thought from a
+ * virtual-list in-place recycle onto a different row.
+ *
+ * Paseo's timeline projection can overwrite a merged row's `timestamp` with the
+ * latest chunk's record time (`docs/FIELD-NOTES.md` #26 / `client/newest.ts`).
+ * When that happens mid-stream or on the final `complete` frame, the same
+ * mounted component sees a newer timestamp for the same agent with monotonic
+ * prefix growth and an unseen key — carry the live timer forward instead of
+ * resetting to 0 or dropping the duration on finish.
+ */
+function isSameThoughtKeyShift(
+  prev: {
+    identity: string | undefined;
+    agentId: string | undefined;
+    rowAt: number;
+    text: string;
+    growing: boolean;
+  },
+  next: {
+    identity: string | undefined;
+    agentId: string | undefined;
+    rowAt: number;
+    text: string;
+    phase: "streaming" | "complete";
+  },
+): boolean {
+  if (prev.identity === next.identity) return false;
+  if (!prev.growing) return false;
+  if (prev.agentId !== next.agentId) return false;
+  if (next.rowAt < prev.rowAt) return false;
+  if (next.identity !== undefined && durationRecords.has(next.identity)) return false;
+  return prev.text.length > 0 ? next.text.startsWith(prev.text) : next.phase === "streaming";
+}
+
+function useGrowing(
+  text: string,
+  phase: "streaming" | "complete",
+  rowIdentity: string | undefined,
+  agentId: string | undefined,
+  rowAt: number,
+): GrowingResult {
+  const [state, setState] = useState<GrowingState>(() => ({
+    identity: rowIdentity,
+    agentId,
+    rowAt,
+    text,
+    growing: phase === "streaming",
+    lastActivityAt: Date.now(),
+  }));
+  const prevIdentity = useRef<string | undefined>(rowIdentity);
+  const prevAgentId = useRef<string | undefined>(agentId);
+  const prevRowAt = useRef<number>(rowAt);
+  const prevText = useRef<string>(text);
+  const prevPhase = useRef<"streaming" | "complete">(phase);
+  const prevGrowing = useRef<boolean>(phase === "streaming");
+  const lastActivityAtRef = useRef<number>(state.lastActivityAt);
+
+  const continuedKeyShift = isSameThoughtKeyShift(state, {
+    identity: rowIdentity,
+    agentId,
+    rowAt,
+    text,
+    phase,
+  });
+
   useEffect(() => {
-    const grew = text.length > lastLength.current;
-    lastLength.current = text.length;
-    if (grew) setGrowing(true);
+    const switched = prevIdentity.current !== rowIdentity;
+    const isContinuation =
+      switched &&
+      isSameThoughtKeyShift(
+        {
+          identity: prevIdentity.current,
+          agentId: prevAgentId.current,
+          rowAt: prevRowAt.current,
+          text: prevText.current,
+          growing: prevGrowing.current,
+        },
+        { identity: rowIdentity, agentId, rowAt, text, phase },
+      );
+
+    if (switched && !isContinuation) {
+      const now = Date.now();
+      prevIdentity.current = rowIdentity;
+      prevAgentId.current = agentId;
+      prevRowAt.current = rowAt;
+      prevText.current = text;
+      prevPhase.current = phase;
+      prevGrowing.current = phase === "streaming";
+      lastActivityAtRef.current = now;
+      setState({
+        identity: rowIdentity,
+        agentId,
+        rowAt,
+        text,
+        growing: phase === "streaming",
+        lastActivityAt: now,
+      });
+      return;
+    }
+
+    const grew = text.length > prevText.current.length;
+    const becameComplete = prevPhase.current === "streaming" && phase === "complete";
+    const nextActivityAt =
+      phase === "streaming" || grew || becameComplete ? Date.now() : lastActivityAtRef.current;
+
+    prevIdentity.current = rowIdentity;
+    prevAgentId.current = agentId;
+    prevRowAt.current = rowAt;
+    prevText.current = text;
+    prevPhase.current = phase;
+    lastActivityAtRef.current = nextActivityAt;
+
+    const nextGrowing = grew || phase === "streaming" ? true : prevGrowing.current;
+    prevGrowing.current = nextGrowing;
+
+    setState((prev) =>
+      prev.identity === rowIdentity &&
+      prev.agentId === agentId &&
+      prev.rowAt === rowAt &&
+      prev.text === text &&
+      prev.growing === nextGrowing &&
+      prev.lastActivityAt === nextActivityAt
+        ? prev
+        : {
+            identity: rowIdentity,
+            agentId,
+            rowAt,
+            text,
+            growing: nextGrowing,
+            lastActivityAt: nextActivityAt,
+          },
+    );
+
     if (phase !== "complete") return;
-    const timer = setTimeout(() => setGrowing(false), SETTLE_WINDOW_MS);
+    const timer = setTimeout(() => {
+      prevGrowing.current = false;
+      setState((prev) =>
+        prev.identity === rowIdentity && !prev.growing ? prev : { ...prev, growing: false },
+      );
+    }, SETTLE_WINDOW_MS);
     // Runs on unmount and before the next frame's effect, so a timer never
     // outlives the row and a stream that continues never settles.
     return () => clearTimeout(timer);
-  }, [text, phase]);
-  return growing;
+  }, [text, phase, rowIdentity, agentId, rowAt]);
+
+  const sameOrContinued = state.identity === rowIdentity || continuedKeyShift;
+  return {
+    growing: sameOrContinued ? state.growing : phase === "streaming",
+    lastActivityAt: sameOrContinued ? state.lastActivityAt : Date.now(),
+    continuedKeyShift,
+  };
+}
+
+/** Polling cadence for the live thinking timer (matches 0.1s display granularity). */
+const DURATION_TICK_MS = 100;
+
+/** Bounded cache so virtual-list recycles keep an observed thought's duration. */
+const MAX_DURATION_RECORDS = 500;
+
+/** Test ID for the right-aligned thinking duration text. */
+export const THINKING_DURATION_TEST_ID = "dsh-thinking-duration";
+
+interface DurationRecord {
+  startedAt: number;
+  elapsedMs: number;
+  settled: boolean;
+}
+
+const durationRecords = new Map<string, DurationRecord>();
+
+function rememberDuration(key: string, record: DurationRecord): void {
+  if (!durationRecords.has(key) && durationRecords.size >= MAX_DURATION_RECORDS) {
+    const oldest = durationRecords.keys().next().value;
+    if (oldest !== undefined) durationRecords.delete(oldest);
+  }
+  durationRecords.set(key, record);
+}
+
+/** Clear cached thinking durations; test-only helper. */
+export function resetThinkingDurationsForTests(): void {
+  durationRecords.clear();
+}
+
+/**
+ * Observe live elapsed duration strictly when the row is seen streaming.
+ *
+ * Historic / replayed rows that mount already settled keep `0` so the UI never
+ * invents a fake elapsed time. Once observed streaming, the elapsed time ticks
+ * monotonically (guarded against system clock rollbacks) until the row settles,
+ * freezes at the last real activity moment so the 300ms settle window does not
+ * inflate the final reading, and is cached in memory per row key so
+ * virtual-list recycling preserves the observed duration without inflating it
+ * across unmounted intervals or re-opening a settled record.
+ */
+function useThinkingDuration(
+  growing: boolean,
+  phase: "streaming" | "complete",
+  cacheKey: string | undefined,
+  lastActivityAt: number,
+  continuedKeyShift: boolean,
+): number {
+  const cached = cacheKey === undefined ? undefined : durationRecords.get(cacheKey);
+  const prevKeyRef = useRef<string | undefined>(cacheKey);
+  const startedAtRef = useRef<number | null>(
+    cached !== undefined && !cached.settled ? cached.startedAt : null,
+  );
+  const maxElapsedRef = useRef<number>(cached?.elapsedMs ?? 0);
+  const wasGrowingRef = useRef<boolean>(false);
+  const [state, setState] = useState<{ key: string | undefined; elapsedMs: number }>(() => ({
+    key: cacheKey,
+    elapsedMs: cached?.elapsedMs ?? 0,
+  }));
+
+  useEffect(() => {
+    const commit = (nextElapsed: number) => {
+      setState((prev) =>
+        prev.key === cacheKey && prev.elapsedMs === nextElapsed
+          ? prev
+          : { key: cacheKey, elapsedMs: nextElapsed },
+      );
+    };
+
+    if (prevKeyRef.current !== cacheKey) {
+      const oldKey = prevKeyRef.current;
+      prevKeyRef.current = cacheKey;
+      if (continuedKeyShift && startedAtRef.current !== null) {
+        if (oldKey !== undefined) {
+          durationRecords.delete(oldKey);
+        }
+        if (cacheKey !== undefined) {
+          rememberDuration(cacheKey, {
+            startedAt: startedAtRef.current,
+            elapsedMs: maxElapsedRef.current,
+            settled: false,
+          });
+        }
+        commit(maxElapsedRef.current);
+      } else {
+        wasGrowingRef.current = false;
+        const keyCached = cacheKey === undefined ? undefined : durationRecords.get(cacheKey);
+        startedAtRef.current =
+          keyCached !== undefined && !keyCached.settled ? keyCached.startedAt : null;
+        maxElapsedRef.current = keyCached?.elapsedMs ?? 0;
+        commit(maxElapsedRef.current);
+      }
+    }
+
+    const currentCached = cacheKey === undefined ? undefined : durationRecords.get(cacheKey);
+    if (currentCached?.settled) {
+      wasGrowingRef.current = false;
+      startedAtRef.current = null;
+      maxElapsedRef.current = currentCached.elapsedMs;
+      commit(currentCached.elapsedMs);
+      return undefined;
+    }
+
+    if (growing) {
+      wasGrowingRef.current = true;
+      if (startedAtRef.current === null) {
+        startedAtRef.current = Date.now();
+      }
+      const recordSample = (sampleAt: number) => {
+        if (startedAtRef.current === null) return;
+        const next = Math.max(maxElapsedRef.current, sampleAt - startedAtRef.current);
+        maxElapsedRef.current = next;
+        if (cacheKey !== undefined) {
+          rememberDuration(cacheKey, {
+            startedAt: startedAtRef.current,
+            elapsedMs: next,
+            settled: false,
+          });
+        }
+        commit(next);
+      };
+
+      if (phase === "streaming") {
+        const tick = () => recordSample(Date.now());
+        tick();
+        const id = setInterval(tick, DURATION_TICK_MS);
+        return () => {
+          clearInterval(id);
+          if (startedAtRef.current !== null && cacheKey !== undefined) {
+            const existing = durationRecords.get(cacheKey);
+            if (existing === undefined || !existing.settled) {
+              const flushed = Math.max(maxElapsedRef.current, Date.now() - startedAtRef.current);
+              maxElapsedRef.current = flushed;
+              rememberDuration(cacheKey, {
+                startedAt: startedAtRef.current,
+                elapsedMs: flushed,
+                settled: false,
+              });
+            }
+          }
+        };
+      }
+
+      // Inside the settle debounce window (`phase === "complete"`): anchor to
+      // the last real activity moment rather than ticking through the 300ms wait.
+      recordSample(lastActivityAt);
+      return undefined;
+    }
+
+    if (wasGrowingRef.current && startedAtRef.current !== null) {
+      wasGrowingRef.current = false;
+      const finalMs = Math.max(maxElapsedRef.current, lastActivityAt - startedAtRef.current);
+      maxElapsedRef.current = finalMs;
+      if (cacheKey !== undefined) {
+        rememberDuration(cacheKey, {
+          startedAt: startedAtRef.current,
+          elapsedMs: finalMs,
+          settled: true,
+        });
+      }
+      startedAtRef.current = null;
+      commit(finalMs);
+    } else if (cacheKey !== undefined) {
+      const existing = durationRecords.get(cacheKey);
+      if (existing !== undefined && !existing.settled) {
+        rememberDuration(cacheKey, { ...existing, settled: true });
+      }
+    }
+    return undefined;
+  }, [growing, phase, cacheKey, lastActivityAt, continuedKeyShift]);
+
+  if (state.key === cacheKey || continuedKeyShift) return state.elapsedMs;
+  return cached?.elapsedMs ?? 0;
 }
 
 export function InlineThinking({
@@ -111,12 +435,30 @@ export function InlineThinking({
   item,
 }: PluginTimelineItemProps<InlineThinkingData>) {
   const { text, phase } = item.data;
-  const growing = useGrowing(text, phase);
   const rowAt = normalizeRowTimestamp(timestamp);
   if (typeof agentId === "string" && agentId !== "" && rowAt !== 0) {
     noteRender(agentId, rowAt);
   }
   const rowKey = rowAt !== 0 ? `thinking:${rowAt}` : undefined;
+  const durationKey =
+    typeof agentId === "string" && agentId !== "" && rowKey !== undefined
+      ? `${agentId}\0${rowKey}`
+      : undefined;
+  const { growing, lastActivityAt, continuedKeyShift } = useGrowing(
+    text,
+    phase,
+    durationKey,
+    agentId,
+    rowAt,
+  );
+  const elapsedMs = useThinkingDuration(
+    growing,
+    phase,
+    durationKey,
+    lastActivityAt,
+    continuedKeyShift,
+  );
+  const durationText = formatThinkingDuration(elapsedMs);
   // The width the preview line has to work with, derived from its ancestors.
   //
   // Measuring the line itself does not work: the sweep container is
@@ -124,8 +466,8 @@ export function InlineThinking({
   // sweep is sized by its content), so a `flex: 1` child inside it has no
   // definite basis and reports its own content width — a feedback loop that
   // collapsed the window to a couple of characters on the desktop client while
-  // the settled row (which needs no width) looked fine. The row and the label are
-  // both definite, so the line is what is left over.
+  // the settled row (which needs no width) looked fine. The row, the label, and
+  // the trailing duration box are all definite, so the line is what is left over.
   const styleState = useSettings(timelineStyleSettings);
   const style = styleState.status === "ready" ? styleState.values : TIMELINE_STYLE_DEFAULTS;
   const expandedMaxHeight =
@@ -133,14 +475,18 @@ export function InlineThinking({
     typeof (style as { expandedMaxHeight?: unknown }).expandedMaxHeight === "number"
       ? (style as { expandedMaxHeight: number }).expandedMaxHeight
       : EXPANDED_MAX_HEIGHT_DEFAULT;
-  const thinkingStyle: ThinkingStyleChoice = isThinkingStyleChoice(style.thinkingStyle)
-    ? style.thinkingStyle
-    : THINKING_STYLE_DEFAULT;
   const [rowWidth, setRowWidth] = useState(0);
   const [labelWidth, setLabelWidth] = useState(0);
+  const [durationWidth, setDurationWidth] = useState(0);
+  const reservedDurationWidth = durationText !== "" ? durationWidth + style.toolRowGap : 0;
   const lineWidth = Math.max(
     0,
-    rowWidth - THINK_ICON_SIZE - style.toolRowGap - labelWidth - style.toolRowGap,
+    rowWidth -
+      THINK_ICON_SIZE -
+      style.toolRowGap -
+      labelWidth -
+      style.toolRowGap -
+      reservedDurationWidth,
   );
   const [manual, setManual] = useState<boolean | null>(null);
   const open = manual ?? false;
@@ -152,28 +498,24 @@ export function InlineThinking({
   const copy = useLocaleText();
 
 
-  const isClassic = thinkingStyle === "classic";
-
   // While streaming the collapsed line is a **tail window**: it advances with
   // every arrived character instead of waiting for a paragraph to finish, which
   // is what made it lag the expanded view. Before the box has been measured (the
   // very first frame) and once the thought settles, dsh's own rule applies —
   // the latest completed paragraph's first line, then the first line outright.
-  const line = isClassic
-    ? growing && lineWidth > 0
+  const line =
+    growing && lineWidth > 0
       ? streamingTail(text, lineWidth, ROW_FONT_SIZE)
-      : reasoningPreview(text, growing)
-    : "";
-  const tailSliding = isClassic && growing && lineWidth > 0 && line.startsWith("…");
+      : reasoningPreview(text, growing);
+  const tailSliding = growing && lineWidth > 0 && line.startsWith("…");
   const stream = useInkStreamReveal({
     agentId,
     timestamp,
     rowKey,
-    liveHint: isClassic && (phase === "streaming" || growing),
-    label: isClassic ? copy.thinking : "",
-    summary: isClassic && !open && !tailSliding ? line : "",
-    streamSummary: isClassic && !open && !tailSliding,
-    enabled: isClassic,
+    liveHint: phase === "streaming" || growing,
+    label: copy.thinking,
+    summary: !open && !tailSliding ? line : "",
+    streamSummary: !open && !tailSliding,
   });
 
   const styles = useMemo(() => {
@@ -193,6 +535,12 @@ export function InlineThinking({
         gap: style.toolRowGap,
         minHeight: style.toolRowMinHeight,
       },
+      main: {
+        flex: 1,
+        minWidth: 0,
+        flexDirection: "row" as const,
+        alignItems: "center" as const,
+      },
       textRow: {
         flex: 1,
         minWidth: 0,
@@ -201,6 +549,7 @@ export function InlineThinking({
         gap: style.toolRowGap,
       },
       label: {
+        flexShrink: 0,
         color: theme.colors.foregroundMuted,
         fontSize: ROW_FONT_SIZE,
         lineHeight: rowLineHeight,
@@ -214,6 +563,16 @@ export function InlineThinking({
         lineHeight: rowLineHeight,
         opacity: growing ? 0.95 : 0.7,
       },
+      durationBox: {
+        flexShrink: 0,
+      },
+      duration: {
+        color: theme.colors.foregroundMuted,
+        fontSize: ROW_FONT_SIZE - 1,
+        lineHeight: rowLineHeight,
+        opacity: growing ? 0.85 : 0.55,
+        fontVariant: ["tabular-nums" as const],
+      },
       fullScroll: {
         maxHeight: expandedMaxHeight,
       },
@@ -226,38 +585,6 @@ export function InlineThinking({
       },
     };
   }, [theme, layout.compact, growing, style, expandedMaxHeight]);
-
-  const toggleOpen = () => setManual((value) => !(value ?? false));
-
-  if (thinkingStyle !== "classic") {
-    return (
-      <RowEntrance
-        agentId={agentId}
-        timestamp={timestamp}
-        rowKey={rowKey}
-        liveHint={phase === "streaming" || growing}
-      >
-        <EnhancedThinkingView
-          variant={thinkingStyle}
-          text={text}
-          growing={growing}
-          open={open}
-          onToggle={toggleOpen}
-          onCollapse={collapseBody}
-          colors={theme.colors}
-          compact={layout.compact}
-          iconUri={THINK_ICON}
-          iconSize={THINK_ICON_SIZE}
-          rowMarginY={style.rowMarginY}
-          rowPaddingY={style.toolRowPaddingY}
-          rowMinHeight={style.toolRowMinHeight}
-          rowGap={style.toolRowGap}
-          expandedMaxHeight={expandedMaxHeight}
-          copy={copy}
-        />
-      </RowEntrance>
-    );
-  }
 
   return (
     <RowEntrance
@@ -273,7 +600,7 @@ export function InlineThinking({
         <Pressable
           accessibilityRole="button"
           accessibilityLabel={open ? copy.collapseThinking : copy.expandThinking}
-          onPress={toggleOpen}
+          onPress={() => setManual((value) => !(value ?? false))}
           style={styles.row}
           onLayout={(event) => setRowWidth(event.nativeEvent.layout.width)}
         >
@@ -289,35 +616,47 @@ export function InlineThinking({
               tintColor={theme.colors.foregroundMuted}
             />
           </RowStatusIcon>
-          <TextShimmer
-            active={growing && !open}
-            contentStyle={styles.textRow}
-            highlightColor={theme.colors.foreground}
-            surfaceColor={theme.colors.surface0}
-          >
-            {(color) => (
-              <>
-                {/* DSH titles every reasoning row "思考" (its English table says
-                    "Thinking") and never swaps it for a finished form; the
-                    "已思考" string it ships belongs to its collapsed whole-turn
-                    summary, not to this row. */}
-                <Text
-                  style={[styles.label, color === null ? null : { color }]}
-                  onLayout={(event) => setLabelWidth(event.nativeEvent.layout.width)}
-                >
-                  {renderInkTrailText(copy.thinking, stream.labelProgress, theme.colors.foreground, color)}
-                </Text>
-                {!open ? (
+          <View style={styles.main}>
+            <TextShimmer
+              active={growing && !open}
+              contentStyle={styles.textRow}
+              highlightColor={theme.colors.foreground}
+              surfaceColor={theme.colors.surface0}
+            >
+              {(color) => (
+                <>
+                  {/* DSH titles every reasoning row "思考" (its English table says
+                      "Thinking") and never swaps it for a finished form; the
+                      "已思考" string it ships belongs to its collapsed whole-turn
+                      summary, not to this row. */}
                   <Text
-                    style={[styles.line, color === null ? null : { color }]}
-                    numberOfLines={1}
+                    style={[styles.label, color === null ? null : { color }]}
+                    onLayout={(event) => setLabelWidth(event.nativeEvent.layout.width)}
                   >
-                    {renderInkTrailText(line, stream.summaryProgress, theme.colors.foreground, color)}
+                    {renderInkTrailText(copy.thinking, stream.labelProgress, theme.colors.foreground, color)}
                   </Text>
-                ) : null}
-              </>
-            )}
-          </TextShimmer>
+                  {!open ? (
+                    <Text
+                      style={[styles.line, color === null ? null : { color }]}
+                      numberOfLines={1}
+                    >
+                      {renderInkTrailText(line, stream.summaryProgress, theme.colors.foreground, color)}
+                    </Text>
+                  ) : null}
+                </>
+              )}
+            </TextShimmer>
+          </View>
+          {durationText !== "" ? (
+            <View
+              style={styles.durationBox}
+              onLayout={(event) => setDurationWidth(event.nativeEvent.layout.width)}
+            >
+              <Text style={styles.duration} numberOfLines={1} testID={THINKING_DURATION_TEST_ID}>
+                {durationText}
+              </Text>
+            </View>
+          ) : null}
         </Pressable>
         {open ? (
           // Render the raw source, not the paced reveal: a per-frame re-render of

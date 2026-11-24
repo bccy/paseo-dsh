@@ -1,20 +1,16 @@
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import { Platform, Pressable, ScrollView, Text, View } from "react-native";
 import type { PluginClientContext, PluginSurfaceProps } from "@getpaseo/plugin/client";
 import { useSettings } from "@getpaseo/plugin/client";
 import { TextInput } from "@getpaseo/plugin/client/ui";
 import {
   LANGUAGE_DEFAULTS,
-  THINKING_STYLE_CHOICES,
-  THINKING_STYLE_DEFAULT,
   TIMELINE_STYLE_DEFAULTS,
   TIMELINE_STYLE_KEYS,
-  isThinkingStyleChoice,
   languageSettings,
   timelineStyleSettings,
   type LanguageChoice,
-  type ThinkingStyleChoice,
-  type TimelineStyleNumericKey,
+  type TimelineStyleKey,
   type TimelineStyleValues,
 } from "../shared/settings";
 import { PluginsBoundary, PluginsFailedCard, report } from "./dsh-plugins-guard";
@@ -30,7 +26,7 @@ import { useLocaleText } from "./use-locale";
 /** The display settings screen id, shared by every entry point that opens it. */
 export const DISPLAY_SETTINGS_ID = "timeline-style";
 
-const FIELD_BOUNDS: Record<TimelineStyleNumericKey, { readonly min: number; readonly max: number }> = {
+const FIELD_BOUNDS: Record<TimelineStyleKey, { readonly min: number; readonly max: number }> = {
   rowMarginY: { min: -16, max: 24 },
   toolRowPaddingY: { min: 0, max: 12 },
   toolRowMinHeight: { min: 12, max: 64 },
@@ -56,7 +52,7 @@ type FeedbackState =
   | { kind: "fallbackError"; action: "save" | "reset" };
 
 function keyboardTypeFor(
-  key: TimelineStyleNumericKey,
+  key: TimelineStyleKey,
 ): "default" | "numbers-and-punctuation" | "decimal-pad" | "numeric" {
   if (Platform.OS === "web") return "default";
   if (key === "rowMarginY") return "numbers-and-punctuation";
@@ -72,27 +68,17 @@ function guardAsync(label: string, run: () => Promise<void>): void {
     });
 }
 
-/** Numeric editor for timeline row spacing and command drawer height, plus plugin language override and thinking style. */
+/** Numeric editor for timeline row spacing and command drawer height, plus plugin language override. */
 export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
   const text = useLocaleText().settings;
   const settings = useSettings(timelineStyleSettings);
   const language = useSettings(languageSettings);
-  const [draft, setDraft] = useState<Partial<Record<TimelineStyleNumericKey, string>>>({});
+  const [draft, setDraft] = useState<Partial<Record<TimelineStyleKey, string>>>({});
   const [pickedLanguage, setPickedLanguage] = useState<LanguageChoice | null>(null);
-  const [pickedThinkingStyle, setPickedThinkingStyle] = useState<ThinkingStyleChoice | null>(null);
   const [feedback, setFeedback] = useState<FeedbackState | null>(null);
-  // Synchronous in-flight locks close the rapid double-tap window before the
-  // host hook flips `saving: true` on the next render, preventing duplicate
-  // writes against the same revision.
-  const styleInFlightRef = useRef(false);
-  const languageInFlightRef = useRef(false);
 
   const current: TimelineStyleValues =
     settings.status === "ready" ? settings.values : TIMELINE_STYLE_DEFAULTS;
-  const savedThinkingStyle: ThinkingStyleChoice = isThinkingStyleChoice(current.thinkingStyle)
-    ? current.thinkingStyle
-    : THINKING_STYLE_DEFAULT;
-  const currentThinkingStyle: ThinkingStyleChoice = pickedThinkingStyle ?? savedThinkingStyle;
   const currentLanguage: LanguageChoice =
     pickedLanguage
     ?? (language.status === "ready" ? language.values.language : LANGUAGE_DEFAULTS.language);
@@ -137,19 +123,6 @@ export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
       },
       languageLabel: { color: theme.colors.foreground, fontSize: compact ? 12.5 : 13, fontWeight: "600" as const },
       languageLabelSelected: { color: theme.colors.accentForeground },
-      thinkingStyleDesc: {
-        borderWidth: 1,
-        borderColor: theme.colors.border,
-        borderRadius: 8,
-        paddingHorizontal: 10,
-        paddingVertical: 8,
-        backgroundColor: theme.colors.surface1,
-      },
-      thinkingStyleDescText: {
-        color: theme.colors.foregroundMuted,
-        fontSize: compact ? 12 : 12.5,
-        lineHeight: 18,
-      },
       actions: { flexDirection: "row" as const, gap: 10, marginTop: 4 },
       button: {
         paddingHorizontal: 16,
@@ -173,16 +146,16 @@ export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
     [theme, compact],
   );
 
-  const textOf = (key: TimelineStyleNumericKey): string => draft[key] ?? String(current[key]);
-  const edit = (key: TimelineStyleNumericKey, value: string) => {
+  const textOf = (key: TimelineStyleKey): string => draft[key] ?? String(current[key]);
+  const edit = (key: TimelineStyleKey, value: string) => {
     if (settings.saving) return;
     setDraft((previous) => ({ ...previous, [key]: value }));
     setFeedback(null);
   };
 
   const save = async () => {
-    if (settings.status !== "ready" || settings.saving || styleInFlightRef.current) return;
-    const candidate: TimelineStyleValues = { ...current, thinkingStyle: currentThinkingStyle };
+    if (settings.status !== "ready" || settings.saving) return;
+    const candidate: TimelineStyleValues = { ...current };
     for (const key of TIMELINE_STYLE_KEYS) {
       const raw = textOf(key).trim();
       const value = raw === "" ? Number.NaN : Number(raw);
@@ -209,20 +182,10 @@ export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
       });
       return;
     }
-    styleInFlightRef.current = true;
     setFeedback(null);
-    let saved = false;
-    try {
-      saved = await settings.save(parsed.data, settings.revision);
-    } catch (error) {
-      report("timeline style save", error);
-      saved = false;
-    } finally {
-      styleInFlightRef.current = false;
-    }
+    const saved = await settings.save(parsed.data, settings.revision);
     if (saved) {
       setDraft({});
-      setPickedThinkingStyle(null);
       setFeedback({ kind: "saved" });
     } else {
       setFeedback({ kind: "fallbackError", action: "save" });
@@ -230,84 +193,26 @@ export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
   };
 
   const reset = async () => {
-    if (settings.saving || styleInFlightRef.current) return;
-    if (settings.status !== "ready" && settings.status !== "invalid") return;
-    styleInFlightRef.current = true;
+    if (settings.saving) return;
     let saved = false;
     setFeedback(null);
-    try {
-      if (settings.status === "ready") {
-        saved = await settings.save(TIMELINE_STYLE_DEFAULTS, settings.revision);
-      } else {
-        saved = await settings.reset();
-      }
-    } catch (error) {
-      report("timeline style reset", error);
-      saved = false;
-    } finally {
-      styleInFlightRef.current = false;
+    if (settings.status === "ready") {
+      saved = await settings.save(TIMELINE_STYLE_DEFAULTS, settings.revision);
+    } else if (settings.status === "invalid") {
+      saved = await settings.reset();
+    } else {
+      return;
     }
     if (saved) {
       setDraft({});
-      setPickedThinkingStyle(null);
       setFeedback({ kind: "reset" });
     } else {
       setFeedback({ kind: "fallbackError", action: "reset" });
     }
   };
 
-  const chooseThinkingStyle = async (choice: ThinkingStyleChoice) => {
-    if (
-      settings.status !== "ready"
-      || settings.saving
-      || styleInFlightRef.current
-      || choice === currentThinkingStyle
-    ) {
-      return;
-    }
-    const previousPicked = pickedThinkingStyle;
-    const parsed = timelineStyleSettings.schema.safeParse({
-      ...current,
-      thinkingStyle: choice,
-    });
-    if (!parsed.success) {
-      setFeedback({
-        kind: "validationError",
-        message: parsed.error.issues[0]?.message ?? text.saveFailed,
-      });
-      return;
-    }
-    styleInFlightRef.current = true;
-    setPickedThinkingStyle(choice);
-    setFeedback(null);
-    let saved = false;
-    try {
-      saved = await settings.save(parsed.data, settings.revision);
-    } catch (error) {
-      report("thinking style save", error);
-      saved = false;
-    } finally {
-      styleInFlightRef.current = false;
-    }
-    if (saved) {
-      setPickedThinkingStyle(null);
-      setFeedback({ kind: "saved" });
-    } else {
-      setPickedThinkingStyle(previousPicked);
-      setFeedback({ kind: "fallbackError", action: "save" });
-    }
-  };
-
   const chooseLanguage = async (choice: LanguageChoice) => {
-    if (
-      language.status !== "ready"
-      || language.saving
-      || languageInFlightRef.current
-      || choice === currentLanguage
-    ) {
-      return;
-    }
-    languageInFlightRef.current = true;
+    if (language.status !== "ready" || language.saving || choice === currentLanguage) return;
     const previousOverride = getLanguageOverride();
     const previousPicked = pickedLanguage;
     setPickedLanguage(choice);
@@ -319,8 +224,6 @@ export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
     } catch (error) {
       report("language save", error);
       saved = false;
-    } finally {
-      languageInFlightRef.current = false;
     }
     if (saved) {
       setPickedLanguage(null);
@@ -367,41 +270,6 @@ export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
           })}
         </View>
         <Text style={styles.hint}>{text.language.hint}</Text>
-      </View>
-
-      <View style={styles.field}>
-        <Text style={styles.label}>{text.thinkingStyle.label}</Text>
-        <View style={styles.languageRow}>
-          {THINKING_STYLE_CHOICES.map((choice) => {
-            const selected = currentThinkingStyle === choice;
-            const optionCopy = text.thinkingStyle.options[choice];
-            return (
-              <Pressable
-                key={choice}
-                accessibilityRole="button"
-                accessibilityState={{ selected }}
-                accessibilityLabel={optionCopy.label}
-                disabled={!canSave}
-                onPress={() => guardAsync("thinking style save", () => chooseThinkingStyle(choice))}
-                style={[
-                  styles.languageButton,
-                  selected ? styles.languageButtonSelected : null,
-                  !canSave ? styles.languageButtonDisabled : null,
-                ]}
-              >
-                <Text style={[styles.languageLabel, selected ? styles.languageLabelSelected : null]}>
-                  {optionCopy.label}
-                </Text>
-              </Pressable>
-            );
-          })}
-        </View>
-        <View style={styles.thinkingStyleDesc}>
-          <Text style={styles.thinkingStyleDescText}>
-            {text.thinkingStyle.options[currentThinkingStyle].description}
-          </Text>
-        </View>
-        <Text style={styles.hint}>{text.thinkingStyle.hint}</Text>
       </View>
 
       {TIMELINE_STYLE_KEYS.map((key) => {
@@ -508,7 +376,7 @@ export function contributeDisplaySettingsCommand(client: PluginClientContext): (
     id: "dsh-display-settings",
     title: localeText().settings.command,
     icon: SlidersIcon,
-    keywords: ["DSH", "display", "timeline", "spacing", "language", "thinking", "reasoning", "显示", "时间线", "行间距", "语言", "思考", "样式"],
+    keywords: ["DSH", "display", "timeline", "spacing", "language", "显示", "时间线", "行间距", "语言"],
     context: "global",
     onSelect: (command) => {
       void Promise.resolve()

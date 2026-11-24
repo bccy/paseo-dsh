@@ -231,18 +231,17 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
       `TOOL_CONTEXT_UNAVAILABLE`（rc.3 新增）、`UNKNOWN_TOOL`。`errorName` 只在展开区
       （灰色 `code（name）`），`errorReason` 只在结果文本为空时兜底。**动了失败行的 metadata、
       `toolFailures` 表或 `tool-call.tsx` 的 hint 分支必跑。**
-- `harness/thinking-check.cjs` — 思考行折叠预览与多样式渲染：结束后取**第一行**、运行中取最后一个首行已终结
-  的段落（`client/thinking-text.ts`）、折叠行流式宽度接线与防抖 settle 状态机；同时断言 5 套可选思考行
-  样式的纯解析函数（`parseThinkingSections`、`parseInlineRuns`、`thinkingHeadline`、`thinkingSubtitleKey`、
-  `thinkingPeekTail`、`formatThinkingDuration` 含 59.95s 进位）、6 套样式（`classic` / `rail` / `silk` /
-  `capsule` / `stepper` / `editorial`）在真实编译组件下的流式/展开/收起（rail 展开区点按收起与 peek 高度、
-  silk 复制按钮与 Native 字幕仅段落切换重启、capsule `surface1` 角标底色接线、stepper 隐式段不重复与流式有界预览及历史行零伪耗时、
-  Native `Animated` 清理、4 文件零硬编码色审计），以及显示设置页的 6 样式即时保存、失败回滚、数字草稿保留、
-  保存数字项不回退样式、并发防重入锁与恢复默认重置。**动了思考行显示、样式切换或文本解析必跑。**
-- `harness/row-status-icon-check.cjs` — 工具行与思考行左侧动态状态图标（`client/row-status-icon.tsx`、
-  `client/row-status-icon-data.ts`）：状态映射、完成态弹出判定、16px/14px 几何尺寸、48×48 PNG 角标资源、
-  Web CSS 注入与 Native `Animated` 启停清理、`backdropColor` 卡片底色镂空（供柔雾思考舱等抬升表面使用），
-  以及 `tool-call.tsx` / `inline-thinking.tsx` 接线。**动了行头状态图标或角标必跑。**
+- `harness/thinking-check.cjs` — 思考行折叠预览、右侧思考时长与计时生命周期：结束后取**第一行**、
+  运行中取最后一个首行已终结的段落（都是 DSH 的行为，逐字移植在 `client/thinking-text.ts`），
+  折叠行在流式中的宽度接线（行测自己的宽度、标签与右侧时长盒各自测宽、行宽由行宽扣减图标/标签/时长
+  得出，`useRevealedText` 不许再接管文本节奏）；`formatThinkingDuration` 边界（`<100ms`/非有限值为空、
+  `59950ms` 进位为 `1m 0s`、整秒边界单调）；以及 `InlineThinking` 真实组件计时生命周期（历史已完成行
+  不启计时器不显徽章、流式 0.1s 递增且展开后仍可见、settle 防抖窗口不计入时长、已定格行遇晚到抖动不重启、
+  虚拟列表重挂保留与原位切键不泄漏、宿主合并刷新 `timestamp` 无缝续计并迁移键、时钟回拨单调、`MAX_DURATION_RECORDS=500`
+  上限淘汰）。**它不断言行标题**：标题恒为 `思考` 是 `client/locale.ts` 标签表里的一个键，
+  由 `harness/locale-check.cjs` 的整表遍历覆盖——改坏了标题，这个脚本不会红。
+  **动了思考行显示或思考时长必跑。** 运行步骤现在需要同时编译 `client/inline-thinking.tsx`
+  （`--jsx react-jsx --noCheck`），见文件头。
 - `harness/subagent-check.cjs` 里另有归档用例：假桥的 replay 列表带一条 `archived: true` 的
   子会话，断言它**不被重放播报**（归档重启后必须仍然成立）；还断言归档往返本身——有打开的
   会话时代为转发、**没有**打开的会话时经一次性 probe 仍能往返、以及 registry 拒绝的 id 必须

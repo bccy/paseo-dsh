@@ -491,40 +491,6 @@ console.log("component execution — Native Animated lifecycle & minimal stub sa
     `starts=${starts}, stops=${stops}`,
   );
 
-  // Custom backdropColor overrides colors.surface0 for elevated cards (e.g. Capsule thinking style).
-  const elevatedHarness = createHooksHarness();
-  const { RowStatusIcon: ElevatedIcon } = loadComponentWithRnStub(
-    { Platform: { OS: "web" }, View: "View", Image: "Image" },
-    elevatedHarness.hooks,
-  );
-  const elevatedRunning = elevatedHarness.render(ElevatedIcon, {
-    status: "running",
-    size: 16,
-    colors: COLORS,
-    backdropColor: "#141418",
-    children: { type: "BaseGlyph", props: {} },
-  });
-  const elevatedRunningBadge = findAll(elevatedRunning, (n) => n.props?.testID === "dsh-row-badge-running")[0];
-  check(
-    "backdropColor overrides running-ring knockout backgroundColor (for surface1 cards)",
-    findAll(elevatedRunningBadge, (n) => n.props?.style?.backgroundColor === "#141418").length >= 1,
-    JSON.stringify(elevatedRunningBadge),
-  );
-  const elevatedCompleted = elevatedHarness.render(ElevatedIcon, {
-    status: "completed",
-    size: 16,
-    colors: COLORS,
-    backdropColor: "#141418",
-    children: { type: "BaseGlyph", props: {} },
-  });
-  const elevatedBadge = findAll(elevatedCompleted, (n) => n.props?.testID === "dsh-row-badge-completed")[0];
-  check(
-    "backdropColor overrides badge knockout backgroundColor (for surface1 cards)",
-    elevatedBadge?.props?.style?.backgroundColor === "#141418",
-    String(elevatedBadge?.props?.style?.backgroundColor),
-  );
-  elevatedHarness.unmountAll();
-
   // Minimal stub (no Platform, Animated, Easing, statusSuccess, statusDanger) must never throw.
   const stubHarness = createHooksHarness();
   const { RowStatusIcon: StubIcon } = loadComponentWithRnStub(

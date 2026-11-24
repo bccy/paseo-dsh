@@ -5,11 +5,8 @@ const { test } = require("node:test");
 const {
   EXPANDED_MAX_HEIGHT_DEFAULT,
   LANGUAGE_DEFAULTS,
-  THINKING_STYLE_CHOICES,
-  THINKING_STYLE_DEFAULT,
   TIMELINE_STYLE_DEFAULTS,
   TIMELINE_STYLE_KEYS,
-  isThinkingStyleChoice,
   languageSettings,
   resolveCommandMaxHeight,
   timelineStyleSettings,
@@ -28,11 +25,6 @@ const {
 test("TIMELINE_STYLE_DEFAULTS mirrors schema defaults and preserves fork layout", () => {
   const defaults = timelineStyleSettings.schema.parse({});
   assert.equal(EXPANDED_MAX_HEIGHT_DEFAULT, 260);
-  assert.equal(THINKING_STYLE_DEFAULT, "classic");
-  assert.deepEqual(
-    THINKING_STYLE_CHOICES,
-    ["classic", "rail", "silk", "capsule", "stepper", "editorial"],
-  );
   assert.deepEqual(
     TIMELINE_STYLE_DEFAULTS,
     {
@@ -43,23 +35,22 @@ test("TIMELINE_STYLE_DEFAULTS mirrors schema defaults and preserves fork layout"
       expandedMaxHeight: 260,
       commandMaxHeightRatio: 0.25,
       commandMinHeight: 150,
-      thinkingStyle: "classic",
     },
-    "defaults must keep the fork's tokens.ts spacing and classic thinking style",
+    "defaults must keep the fork's tokens.ts spacing",
   );
   assert.deepEqual(TIMELINE_STYLE_DEFAULTS, defaults, "TIMELINE_STYLE_DEFAULTS must mirror the schema");
   assert.ok(TIMELINE_STYLE_KEYS.includes("expandedMaxHeight"), "TIMELINE_STYLE_KEYS must include expandedMaxHeight");
   assert.deepEqual(
-    [...TIMELINE_STYLE_KEYS, "thinkingStyle"].sort(),
+    [...TIMELINE_STYLE_KEYS].sort(),
     Object.keys(defaults).sort(),
-    "TIMELINE_STYLE_KEYS + thinkingStyle must cover every schema field exactly once",
+    "TIMELINE_STYLE_KEYS must cover every schema field exactly once",
   );
   assert.equal(timelineStyleSettings.id, "timeline-style");
   assert.equal(timelineStyleSettings.scope, "host");
   assert.equal(timelineStyleSettings.version, 6);
 });
 
-test("timelineStyleSettings schema enforces numeric bounds and thinkingStyle enum", () => {
+test("timelineStyleSettings schema enforces numeric bounds", () => {
   assert.throws(() => timelineStyleSettings.schema.parse({ rowMarginY: -17 }));
   assert.throws(() => timelineStyleSettings.schema.parse({ rowMarginY: 25 }));
   assert.throws(() => timelineStyleSettings.schema.parse({ toolRowPaddingY: -1 }));
@@ -76,16 +67,9 @@ test("timelineStyleSettings schema enforces numeric bounds and thinkingStyle enu
   assert.throws(() => timelineStyleSettings.schema.parse({ commandMaxHeightRatio: 0.61 }));
   assert.throws(() => timelineStyleSettings.schema.parse({ commandMinHeight: 59 }));
   assert.throws(() => timelineStyleSettings.schema.parse({ commandMinHeight: 361 }));
-  for (const choice of THINKING_STYLE_CHOICES) {
-    assert.equal(isThinkingStyleChoice(choice), true);
-    assert.equal(timelineStyleSettings.schema.parse({ thinkingStyle: choice }).thinkingStyle, choice);
-  }
-  assert.equal(isThinkingStyleChoice("unknown"), false);
-  assert.equal(isThinkingStyleChoice(123), false);
-  assert.throws(() => timelineStyleSettings.schema.parse({ thinkingStyle: "unknown" }));
 });
 
-test("v1-v5 migrate collapses legacy margin fields, backfills expandedMaxHeight & thinkingStyle, and preserves valid values", () => {
+test("v1-v5 migrate collapses legacy margin fields, backfills expandedMaxHeight, and preserves valid values", () => {
   assert.deepEqual(
     timelineStyleSettings.migrate(
       {
@@ -98,51 +82,49 @@ test("v1-v5 migrate collapses legacy margin fields, backfills expandedMaxHeight 
       },
       5,
     ),
-    { rowMarginY: 2, toolRowGap: 10, expandedMaxHeight: 260, thinkingStyle: "classic" },
+    { rowMarginY: 2, toolRowGap: 10, expandedMaxHeight: 260 },
   );
   assert.deepEqual(
     timelineStyleSettings.migrate(
       {
         rowMarginY: 2,
         expandedMaxHeight: 400,
-        thinkingStyle: "stepper",
       },
       5,
     ),
-    { rowMarginY: 2, expandedMaxHeight: 400, thinkingStyle: "stepper" },
+    { rowMarginY: 2, expandedMaxHeight: 400 },
   );
   assert.deepEqual(
     timelineStyleSettings.migrate(
       {
         rowMarginY: 2,
         expandedMaxHeight: "invalid",
-        thinkingStyle: "bogus",
       },
       5,
     ),
-    { rowMarginY: 2, expandedMaxHeight: 260, thinkingStyle: "classic" },
+    { rowMarginY: 2, expandedMaxHeight: 260 },
   );
   assert.deepEqual(
     timelineStyleSettings.migrate(
       { toolRowMarginY: -8, liveReasoningRowMarginY: -8, liveRowMarginY: 12 },
       4,
     ),
-    { rowMarginY: -8, expandedMaxHeight: 260, thinkingStyle: "classic" },
+    { rowMarginY: -8, expandedMaxHeight: 260 },
   );
   assert.deepEqual(
     timelineStyleSettings.migrate(
       { toolRowMarginY: 4, liveReasoningRowMarginY: 16 },
       3,
     ),
-    { rowMarginY: 4, expandedMaxHeight: 260, thinkingStyle: "classic" },
+    { rowMarginY: 4, expandedMaxHeight: 260 },
   );
   assert.deepEqual(
     timelineStyleSettings.migrate({ liveRowMarginY: 8, liveToolRowMarginY: -4 }, 1),
-    { rowMarginY: 8, expandedMaxHeight: 260, thinkingStyle: "classic" },
+    { rowMarginY: 8, expandedMaxHeight: 260 },
   );
   assert.deepEqual(
     timelineStyleSettings.migrate({}, 1),
-    { rowMarginY: 0, expandedMaxHeight: 260, thinkingStyle: "classic" },
+    { rowMarginY: 0, expandedMaxHeight: 260 },
   );
   assert.equal(timelineStyleSettings.migrate(null, 1), null);
   assert.deepEqual(timelineStyleSettings.migrate([1, 2], 1), [1, 2]);
@@ -232,24 +214,12 @@ test("client/locale language override precedence and subscriber notifications", 
   }
 });
 
-test("client/locale settings and thinkingUi copy is symmetric across en and zh-CN", () => {
+test("client/locale settings copy is symmetric across en and zh-CN", () => {
   const en = allText().en.settings;
   const zh = allText()["zh-CN"].settings;
 
   assert.deepEqual(Object.keys(en).sort(), Object.keys(zh).sort());
   assert.deepEqual(Object.keys(en.language).sort(), Object.keys(zh.language).sort());
-  assert.deepEqual(Object.keys(en.thinkingStyle.options).sort(), [...THINKING_STYLE_CHOICES].sort());
-  assert.deepEqual(Object.keys(zh.thinkingStyle.options).sort(), [...THINKING_STYLE_CHOICES].sort());
-  assert.ok(en.thinkingStyle.label.trim().length > 0);
-  assert.ok(zh.thinkingStyle.label.trim().length > 0);
-  assert.ok(en.thinkingStyle.hint.trim().length > 0);
-  assert.ok(zh.thinkingStyle.hint.trim().length > 0);
-  for (const choice of THINKING_STYLE_CHOICES) {
-    assert.ok(en.thinkingStyle.options[choice].label.trim().length > 0);
-    assert.ok(en.thinkingStyle.options[choice].description.trim().length > 0);
-    assert.ok(zh.thinkingStyle.options[choice].label.trim().length > 0);
-    assert.ok(zh.thinkingStyle.options[choice].description.trim().length > 0);
-  }
   assert.deepEqual(Object.keys(en.fields).sort(), [...TIMELINE_STYLE_KEYS].sort());
   assert.deepEqual(Object.keys(zh.fields).sort(), [...TIMELINE_STYLE_KEYS].sort());
   for (const key of TIMELINE_STYLE_KEYS) {
@@ -258,23 +228,4 @@ test("client/locale settings and thinkingUi copy is symmetric across en and zh-C
     assert.ok(zh.fields[key].label.trim().length > 0);
     assert.ok(zh.fields[key].hint.trim().length > 0);
   }
-
-  const enUi = allText().en.thinkingUi;
-  const zhUi = allText()["zh-CN"].thinkingUi;
-  assert.deepEqual(Object.keys(enUi).sort(), Object.keys(zhUi).sort());
-  const enhancedChoices = THINKING_STYLE_CHOICES.filter((c) => c !== "classic");
-  assert.deepEqual(Object.keys(enUi.labels).sort(), [...enhancedChoices].sort());
-  assert.deepEqual(Object.keys(zhUi.labels).sort(), [...enhancedChoices].sort());
-  for (const choice of enhancedChoices) {
-    assert.ok(enUi.labels[choice].running.trim().length > 0);
-    assert.ok(enUi.labels[choice].done.trim().length > 0);
-    assert.ok(zhUi.labels[choice].running.trim().length > 0);
-    assert.ok(zhUi.labels[choice].done.trim().length > 0);
-  }
-  assert.ok(enUi.sectionCount(2).includes("2"));
-  assert.ok(zhUi.sectionCount(2).includes("2"));
-  assert.ok(enUi.stepCount(3).includes("3"));
-  assert.ok(zhUi.stepCount(3).includes("3"));
-  assert.ok(enUi.runningStep(1).includes("1"));
-  assert.ok(zhUi.runningStep(1).includes("1"));
 });

@@ -227,32 +227,6 @@ export type DisplaySettingsFieldKey =
   | "commandMaxHeightRatio"
   | "commandMinHeight";
 
-/**
- * Available visual styles for the inline thinking row. Kept structurally
- * equivalent to `shared/settings.ts`'s `ThinkingStyleChoice` so this module
- * stays free of `@getpaseo/plugin` and `zod`.
- */
-export type ThinkingStyleOptionKey =
-  | "classic"
-  | "rail"
-  | "silk"
-  | "capsule"
-  | "stepper"
-  | "editorial";
-
-/** Copy used by the enhanced thinking-row styles (`rail`, `silk`, `capsule`, `stepper`, `editorial`). */
-export interface ThinkingUiText {
-  organizing: string;
-  copy: string;
-  copied: string;
-  collapse: string;
-  tapToCollapse: string;
-  sectionCount: (count: number) => string;
-  stepCount: (count: number) => string;
-  runningStep: (count: number) => string;
-  labels: Record<Exclude<ThinkingStyleOptionKey, "classic">, { running: string; done: string }>;
-}
-
 /** Copy for the Display settings screen and its Command Center shortcut. */
 export interface DisplaySettingsText {
   /** Settings screen title and header link label on the DSH Plugins page. */
@@ -277,11 +251,6 @@ export interface DisplaySettingsText {
     en: string;
     zhCN: string;
   };
-  thinkingStyle: {
-    label: string;
-    hint: string;
-    options: Record<ThinkingStyleOptionKey, { label: string; description: string }>;
-  };
   fields: Record<DisplaySettingsFieldKey, { label: string; hint: string }>;
   renderFailed: string;
 }
@@ -305,8 +274,6 @@ export interface UiText {
   expandThinking: string;
   /** Screen-reader label of the expanded reasoning row. */
   collapseThinking: string;
-  /** Copy for the selectable enhanced thinking-row styles. */
-  thinkingUi: ThinkingUiText;
   /** Title of an `exit_plan_mode` row, before its plan text. */
   planTitle: string;
   /** Appended to a body cut at the client's size limit. */
@@ -1179,23 +1146,6 @@ const TEXT: Record<Locale, UiText> = {
     thinking: "Thinking",
     expandThinking: "Expand thinking",
     collapseThinking: "Collapse thinking",
-    thinkingUi: {
-      organizing: "Organizing thoughts…",
-      copy: "Copy",
-      copied: "Copied",
-      collapse: "Collapse",
-      tapToCollapse: "Tap to collapse",
-      sectionCount: (count) => `${count} ${count === 1 ? "section" : "sections"}`,
-      stepCount: (count) => `${count} ${count === 1 ? "step" : "steps"}`,
-      runningStep: (count) => `Step ${count}`,
-      labels: {
-        rail: { running: "Thinking", done: "Thought" },
-        silk: { running: "Thinking", done: "Thought" },
-        capsule: { running: "Thinking", done: "Thought" },
-        stepper: { running: "Deep thinking", done: "Thought" },
-        editorial: { running: "Reasoning", done: "Thought" },
-      },
-    },
     planTitle: "Plan",
     truncated: "\n… (truncated)",
     goalCard: {
@@ -1587,36 +1537,6 @@ const TEXT: Record<Locale, UiText> = {
         en: "English",
         zhCN: "简体中文",
       },
-      thinkingStyle: {
-        label: "Thinking row style",
-        hint: "Choose how reasoning rows render while streaming, collapsed, and expanded. Applies immediately across conversations.",
-        options: {
-          classic: {
-            label: "Classic",
-            description: "Original single-line tail scroll with raw expanded text.",
-          },
-          rail: {
-            label: "Breathing Rail (Recommended)",
-            description: "2px breathing left rail, 3-line streaming peek window, and structured prose.",
-          },
-          silk: {
-            label: "Silk Subtitle",
-            description: "Strict single-line header with zero height jump, live pill, and copy toolbar.",
-          },
-          capsule: {
-            label: "Soft Capsule",
-            description: "Subtle surface1 capsule with gliding progress bar and compact collapse footer.",
-          },
-          stepper: {
-            label: "Stepper Timeline",
-            description: "Vertical step-node timeline parsed from headings and paragraphs.",
-          },
-          editorial: {
-            label: "Editorial Quote",
-            description: "Ultra-quiet marginalia with dashed quote rail and 2-line mist peek.",
-          },
-        },
-      },
       fields: {
         rowMarginY: {
           label: "Extra spacing between rows",
@@ -1881,23 +1801,6 @@ const TEXT: Record<Locale, UiText> = {
     thinking: "思考",
     expandThinking: "展开思考",
     collapseThinking: "收起思考",
-    thinkingUi: {
-      organizing: "正在整理思路…",
-      copy: "复制",
-      copied: "已复制",
-      collapse: "收起",
-      tapToCollapse: "轻点收起",
-      sectionCount: (count) => `${count} 段`,
-      stepCount: (count) => `${count} 步`,
-      runningStep: (count) => `第 ${count} 步`,
-      labels: {
-        rail: { running: "正在思考", done: "思考" },
-        silk: { running: "思考", done: "思考" },
-        capsule: { running: "思考中", done: "思考完成" },
-        stepper: { running: "深度思考", done: "已思考" },
-        editorial: { running: "思绪推演", done: "思考" },
-      },
-    },
     planTitle: "计划",
     truncated: "\n…（已截断）",
     goalCard: {
@@ -2287,36 +2190,6 @@ const TEXT: Record<Locale, UiText> = {
         auto: "自动",
         en: "English",
         zhCN: "简体中文",
-      },
-      thinkingStyle: {
-        label: "思考行样式",
-        hint: "切换思考行在流式输出、折叠与展开时的视觉与交互形态，点选后即时生效。",
-        options: {
-          classic: {
-            label: "经典基线",
-            description: "原有单行尾部滚动预览 + 裸文本展开。",
-          },
-          rail: {
-            label: "呼吸竖轨（推荐）",
-            description: "与无框工具行统一的 2px 呼吸左轨，流式自动露 3 行柔窗，展开分段排版。",
-          },
-          silk: {
-            label: "丝绸单行",
-            description: "全程严格单行不跳高度，段落字幕轻滑切换，展开顶栏带复制/收起。",
-          },
-          capsule: {
-            label: "柔雾思考舱",
-            description: "极轻 surface1 柔舱与细流光进度条，与工具行和正文天然分层。",
-          },
-          stepper: {
-            label: "思维脉络",
-            description: "按小标题与段落拆成纵向步骤节点时间线，快速扫读长思考。",
-          },
-          editorial: {
-            label: "静谧引用",
-            description: "页边注轻阅读风格与虚线引用轨，把视觉焦点让给工具和正文回答。",
-          },
-        },
       },
       fields: {
         rowMarginY: {

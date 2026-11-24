@@ -263,8 +263,6 @@ export interface InkStreamOptions {
   summary: string;
   /** When false, only the left action label streams while summary renders live as-is. */
   streamSummary?: boolean;
-  /** When false, bypasses entrance/rAF timers completely (e.g. non-classic thinking styles). */
-  enabled?: boolean;
 }
 
 export interface InkStreamState {
@@ -290,12 +288,10 @@ export function useInkStreamReveal({
   label,
   summary,
   streamSummary = true,
-  enabled = true,
 }: InkStreamOptions): InkStreamState {
   const at = normalizeRowTimestamp(timestamp);
   const [animate] = useState(
     () =>
-      enabled &&
       !prefersReducedMotion() &&
       shouldEnterLive(agentId ?? "", at, liveHint ?? false, rowKey),
   );
@@ -306,7 +302,7 @@ export function useInkStreamReveal({
   targetRef.current = { label, summary, streamSummary };
 
   useEffect(() => {
-    if (!animate || !enabled) return;
+    if (!animate) return;
     let cancelled = false;
     let rafId: number | null = null;
     let timerId: ReturnType<typeof setTimeout> | null = null;
@@ -378,12 +374,11 @@ export function useInkStreamReveal({
       if (rafId !== null && typeof cancelRaf === "function") cancelRaf(rafId);
       if (timerId !== null) clearTimeout(timerId);
     };
-  }, [animate, enabled]);
+  }, [animate]);
 
-  const effectiveCursor = enabled ? cursor : Number.POSITIVE_INFINITY;
-  const split = splitRowStreamProgress(label, summary, effectiveCursor, streamSummary);
+  const split = splitRowStreamProgress(label, summary, cursor, streamSummary);
   return {
-    active: Number.isFinite(effectiveCursor),
+    active: Number.isFinite(cursor),
     labelProgress: split.labelProgress,
     summaryProgress: split.summaryProgress,
     showSeparator: split.showSeparator,
