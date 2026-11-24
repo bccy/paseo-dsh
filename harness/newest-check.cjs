@@ -1361,6 +1361,55 @@ async function main() {
             shouldEnterLive(mixedUpdateAgent, base + 70, true, "tool:new-live-2", Date.now()) === true,
           `mixedEntered=${mixedEntered}`,
         );
+
+        // 5c. Concurrent render slicing across microtask yields:
+        //     Slice 1 mounts rows 1..N (or even a single first row) -> microtask flush runs before commit ->
+        //     Slice 2 mounts the final row -> commit phase must still classify the whole commit as a batch
+        //     (0 entrance animations) and retire the sealed batch on the post-commit microtask.
+        const slicedAgent = "agent-concurrent-slice";
+        const abandonedAgent = "agent-abandoned-render";
+        resetNewestForTests(slicedAgent);
+        resetNewestForTests(abandonedAgent);
+        const sliceNow = Date.now();
+        // Two-slice history mount where slice 1 has 1 row and yields across a microtask before slice 2 renders row 2.
+        noteMountCandidate(slicedAgent, base + 200, "tool:slice-1", sliceNow);
+        await settle(); // flush() runs before commit — unsealed batch must survive!
+        noteMountCandidate(slicedAgent, base + 201, "tool:slice-2", sliceNow + 10);
+        const slice1Commit = commitMountEntrance(slicedAgent, base + 200, true, "tool:slice-1", sliceNow + 12);
+        const slice2Commit = commitMountEntrance(slicedAgent, base + 201, true, "tool:slice-2", sliceNow + 12);
+        await settle(); // sealed batch must now be retired cleanly
+        const postReplayLive = commitMountEntrance(
+          slicedAgent,
+          base + 300,
+          true,
+          "tool:slice-live-after",
+          sliceNow + BULK_WINDOW_MS + 50,
+        );
+        check(
+          "concurrent render slices separated by a microtask yield still coalesce into a suppressed batch and resume live after replay window",
+          slice1Commit === false && slice2Commit === false && postReplayLive === true,
+          JSON.stringify({ slice1Commit, slice2Commit, postReplayLive }),
+        );
+
+        // Abandoned uncommitted single-row render ages out after BULK_WINDOW_MS so a later genuine live row still enters.
+        noteMountCandidate(abandonedAgent, base + 400, "tool:abandoned-1", sliceNow);
+        await settle();
+        const laterLiveNow = sliceNow + BULK_WINDOW_MS + 20;
+        noteMountCandidate(abandonedAgent, base + 410, "tool:later-live", laterLiveNow);
+        const laterLiveCommit = commitMountEntrance(
+          abandonedAgent,
+          base + 410,
+          true,
+          "tool:later-live",
+          laterLiveNow,
+        );
+        check(
+          "abandoned uncommitted single-row render expires after BULK_WINDOW_MS and does not suppress a later live row",
+          laterLiveCommit === true,
+          `laterLiveCommit=${laterLiveCommit}`,
+        );
+        resetNewestForTests(slicedAgent);
+        resetNewestForTests(abandonedAgent);
       } finally {
         global.document = prevDoc;
         global.window = prevWin;

@@ -83,6 +83,8 @@ interface MountBatch {
   isBatch: boolean;
   /** Cached entrance decision per row key so RowEntrance & useInkStreamReveal agree. */
   decisions: Map<string, boolean>;
+  /** Last render-candidate timestamp (ms) so abandoned uncommitted renders age out. */
+  updatedAt: number;
 }
 
 const rows = new Map<string, AgentRows>();
@@ -167,9 +169,13 @@ function passFreshCount(pass: PendingPass | undefined): number {
   );
 }
 
-function pendingFreshCount(agentId: string): number {
+function pendingFreshCount(agentId: string, now = Date.now()): number {
   const fromPass = passFreshCount(pending.get(agentId));
-  const fromMounts = mountBatches.get(agentId)?.keys.size ?? 0;
+  const batch = mountBatches.get(agentId);
+  const fromMounts =
+    batch !== undefined && (batch.sealed || now - batch.updatedAt < BULK_WINDOW_MS)
+      ? batch.keys.size
+      : 0;
   return Math.max(fromPass, fromMounts);
 }
 
@@ -192,7 +198,20 @@ function flush(): void {
     }
   }
   pending.clear();
-  mountBatches.clear();
+  // Only retire mount batches that have already committed (`sealed`) or aged out
+  // after an abandoned render. Unsealed batches stay alive across microtask yields
+  // so React concurrent render slices that yield before commit still coalesce into
+  // one batch decision.
+  for (const [agentId, batch] of mountBatches) {
+    if (batch.sealed || now - batch.updatedAt >= BULK_WINDOW_MS) {
+      mountBatches.delete(agentId);
+      continue;
+    }
+    if (batch.keys.size >= 2) {
+      const state = stateOf(agentId);
+      state.replayUntil = Math.max(state.replayUntil, now + BULK_WINDOW_MS);
+    }
+  }
 }
 
 /**
@@ -335,19 +354,27 @@ export function markRowAnimated(agentId: string, at: number, rowKey?: string): v
  * renders and shared across `RowEntrance` + `useInkStreamReveal` on the same
  * row). Does not mutate `rows` or `animatedKeys`.
  */
-export function noteMountCandidate(agentId: string, at: number, rowKey?: string): void {
+export function noteMountCandidate(
+  agentId: string,
+  at: number,
+  rowKey?: string,
+  now = Date.now(),
+): void {
   if (agentId === "") return;
   const key = rowAnimationKey(at, rowKey);
   if (animatedKeys.get(agentId)?.has(key)) return;
   let batch = mountBatches.get(agentId);
-  if (batch === undefined || batch.sealed) {
+  if (batch === undefined || batch.sealed || now - batch.updatedAt >= BULK_WINDOW_MS) {
     batch = {
       keys: new Set<string>(),
       sealed: false,
       isBatch: false,
       decisions: new Map<string, boolean>(),
+      updatedAt: now,
     };
     mountBatches.set(agentId, batch);
+  } else {
+    batch.updatedAt = now;
   }
   batch.keys.add(key);
   scheduleFlush();
@@ -380,9 +407,9 @@ export function commitMountEntrance(
       sealed: false,
       isBatch: false,
       decisions: new Map<string, boolean>(),
+      updatedAt: now,
     };
     mountBatches.set(agentId, batch);
-    scheduleFlush();
   }
 
   if (!batch.sealed) {
@@ -393,6 +420,9 @@ export function commitMountEntrance(
       const state = stateOf(agentId);
       state.replayUntil = Math.max(state.replayUntil, now + BULK_WINDOW_MS);
     }
+    // Retire the sealed batch in the post-commit microtask once every row in
+    // this commit phase has read its cached decision.
+    scheduleFlush();
   }
 
   const cached = batch.decisions.get(key);
@@ -429,7 +459,7 @@ export function shouldEnterLive(
   const state = rows.get(agentId);
   if (state !== undefined) {
     if (now < state.replayUntil) return false;
-    if (pendingFreshCount(agentId) >= 2) return false;
+    if (pendingFreshCount(agentId, now) >= 2) return false;
     if (state.recent.filter((t) => now - t < BULK_WINDOW_MS).length >= BULK_MIN_ROWS - 1) {
       return false;
     }
@@ -441,7 +471,7 @@ export function shouldEnterLive(
   // (e.g. a brand-new session's first streaming thought or running tool) when
   // no multi-row history pass is queued. Deliberately avoids touching `rows` so
   // `noteRender`'s first-pass `known === undefined` invariant stays intact.
-  if (liveHint === true && pendingFreshCount(agentId) <= 1) {
+  if (liveHint === true && pendingFreshCount(agentId, now) <= 1) {
     return true;
   }
   return false;
