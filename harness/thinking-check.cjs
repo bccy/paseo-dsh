@@ -2751,6 +2751,430 @@ console.log("the row settles when the last frame both grows and completes");
   global.clearTimeout = realClearTimeout;
   global.setInterval = realSetInterval;
   global.clearInterval = realClearInterval;
+
+  // 13. Display settings screen runtime suite (restored P2-2 + P2-5 live title refresh):
+  //     draft preservation, save persistence, rejection/failure rollback + error banner,
+  //     synchronous double-tap inFlight locks, restore defaults, and dynamic title refresh
+  //     when persisted language resolves asynchronously after initial registration.
+  console.log("display settings screen: draft preservation, rollback, inFlight locks, reset & live title");
+  {
+    const settingsPath = join(__dirname, "client", "settings-screen.js");
+    const localePath = join(__dirname, "client", "locale.js");
+    check("compiled client/settings-screen.js exists", existsSync(settingsPath));
+    if (existsSync(settingsPath)) {
+      const styleSaves = [];
+      const langSaves = [];
+      let nextStyleBehavior = "succeed";
+      let nextLangBehavior = "succeed";
+      let pendingStyleResolve = null;
+      let pendingLangResolve = null;
+      let currentStyleValues = {
+        rowMarginY: 0,
+        toolRowPaddingY: 0,
+        toolRowMinHeight: 24,
+        toolRowGap: 6,
+        expandedMaxHeight: 260,
+        commandMaxHeightRatio: 0.25,
+        commandMinHeight: 150,
+      };
+      let currentLangValues = { language: "auto" };
+
+      const screenSlots = [];
+      let screenCursor = 0;
+      const screenHooks = {
+        Component: class Component {},
+        useState(init) {
+          const i = screenCursor++;
+          if (!(i in screenSlots)) screenSlots[i] = typeof init === "function" ? init() : init;
+          return [
+            screenSlots[i],
+            (next) => {
+              screenSlots[i] = typeof next === "function" ? next(screenSlots[i]) : next;
+            },
+          ];
+        },
+        useRef(init) {
+          const i = screenCursor++;
+          if (!(i in screenSlots)) screenSlots[i] = { current: init };
+          return screenSlots[i];
+        },
+        useMemo(fn) {
+          return fn();
+        },
+        useSyncExternalStore(_sub, snap) {
+          return snap();
+        },
+      };
+      const screenStubs = {
+        react: () => screenHooks,
+        "react/jsx-runtime": () => ({
+          jsx: (type, props, key) => ({ type, props: props ?? {}, key }),
+          jsxs: (type, props, key) => ({ type, props: props ?? {}, key }),
+          Fragment: "Fragment",
+        }),
+        "react-native": () => ({
+          Platform: { OS: "web" },
+          Pressable: "Pressable",
+          ScrollView: "ScrollView",
+          Text: "Text",
+          View: "View",
+        }),
+        "@getpaseo/plugin": () => ({ defineSettings: (cfg) => cfg }),
+        "@getpaseo/plugin/client": () => ({
+          useSettings: (def) => {
+            if (def?.id === "language") {
+              return {
+                status: "ready",
+                values: currentLangValues,
+                revision: 3,
+                saving: false,
+                saveError: null,
+                save: async (data, rev) => {
+                  langSaves.push({ data, rev });
+                  const mode = nextLangBehavior;
+                  nextLangBehavior = "succeed";
+                  if (mode === "fail") return false;
+                  if (mode === "throw") throw new Error("lang rpc boom");
+                  if (mode === "defer") {
+                    return new Promise((resolve) => {
+                      pendingLangResolve = (ok) => {
+                        if (ok) currentLangValues = data;
+                        resolve(ok);
+                      };
+                    });
+                  }
+                  currentLangValues = data;
+                  return true;
+                },
+                reset: async () => true,
+              };
+            }
+            return {
+              status: "ready",
+              values: currentStyleValues,
+              revision: 7,
+              saving: false,
+              saveError: null,
+              save: async (data, rev) => {
+                styleSaves.push({ data, rev });
+                const mode = nextStyleBehavior;
+                nextStyleBehavior = "succeed";
+                if (mode === "fail") return false;
+                if (mode === "throw") throw new Error("style rpc boom");
+                if (mode === "defer") {
+                  return new Promise((resolve) => {
+                    pendingStyleResolve = (ok) => {
+                      if (ok) currentStyleValues = data;
+                      resolve(ok);
+                    };
+                  });
+                }
+                currentStyleValues = data;
+                return true;
+              },
+              reset: async () => true,
+            };
+          },
+        }),
+        "@getpaseo/plugin/client/ui": () => ({ TextInput: "TextInput" }),
+      };
+
+      const origLoad = Module._load;
+      const savedCache = new Map();
+      for (const k of Object.keys(require.cache)) {
+        if (k.includes("/client/settings-screen") || k.includes("/client/use-locale")) {
+          savedCache.set(k, require.cache[k]);
+          delete require.cache[k];
+        }
+      }
+      Module._load = function load(req, parent, isMain) {
+        if (screenStubs[req] !== undefined) return screenStubs[req]();
+        return origLoad.call(this, req, parent, isMain);
+      };
+      let TimelineSettingsScreen;
+      let contributeTimelineSettings;
+      let contributeDisplaySettingsCommand;
+      const localeMod = require(localePath);
+      try {
+        ({
+          TimelineSettingsScreen,
+          contributeTimelineSettings,
+          contributeDisplaySettingsCommand,
+        } = require(settingsPath));
+      } finally {
+        Module._load = origLoad;
+        for (const k of Object.keys(require.cache)) {
+          if (
+            (k.includes("/client/settings-screen") || k.includes("/client/use-locale")) &&
+            !savedCache.has(k)
+          ) {
+            delete require.cache[k];
+          }
+        }
+        for (const [k, v] of savedCache) require.cache[k] = v;
+      }
+
+      const findAllNodes = (node, predicate, out = []) => {
+        if (node === null || node === undefined || typeof node !== "object") return out;
+        if (Array.isArray(node)) {
+          for (const child of node) findAllNodes(child, predicate, out);
+          return out;
+        }
+        if (predicate(node)) out.push(node);
+        if (node.props && node.props.children !== undefined) {
+          findAllNodes(node.props.children, predicate, out);
+        }
+        return out;
+      };
+      const COLORS = {
+        surface0: "#141414",
+        surface1: "#1e1e1e",
+        border: "#333333",
+        foreground: "#ffffff",
+        foregroundMuted: "#999999",
+        accent: "#3b82f6",
+        accentForeground: "#ffffff",
+        statusDanger: "#ef4444",
+      };
+      const renderScreen = () => {
+        screenCursor = 0;
+        return TimelineSettingsScreen({
+          theme: { colors: COLORS },
+          layout: { compact: false },
+        });
+      };
+      const flushMicrotasks = () =>
+        Promise.resolve()
+          .then(() => Promise.resolve())
+          .then(() => Promise.resolve())
+          .then(() => Promise.resolve());
+
+      localeMod.setLanguageOverride("auto");
+      localeMod.setLocale(undefined);
+
+      // 13a. Live title refresh when persisted language resolves asynchronously (P2-5).
+      const settingsScreenHistory = [];
+      const commandHistory = [];
+      const activeSettingsScreens = [];
+      const activeCommands = [];
+      const fakeClient = {
+        addSettingsScreen(contrib) {
+          settingsScreenHistory.push(contrib.title);
+          activeSettingsScreens.push(contrib);
+          return () => {
+            const idx = activeSettingsScreens.indexOf(contrib);
+            if (idx !== -1) activeSettingsScreens.splice(idx, 1);
+          };
+        },
+        addCommandCenterItem(contrib) {
+          commandHistory.push(contrib.title);
+          activeCommands.push(contrib);
+          return () => {
+            const idx = activeCommands.indexOf(contrib);
+            if (idx !== -1) activeCommands.splice(idx, 1);
+          };
+        },
+      };
+      const disposeScreenReg = contributeTimelineSettings(fakeClient);
+      const disposeCmdReg = contributeDisplaySettingsCommand(fakeClient);
+      const initialTitles = {
+        screen: activeSettingsScreens[0]?.title,
+        cmd: activeCommands[0]?.title,
+      };
+      localeMod.setLanguageOverride("en");
+      const enTitles = {
+        screen: activeSettingsScreens[0]?.title,
+        cmd: activeCommands[0]?.title,
+        screenCount: activeSettingsScreens.length,
+        cmdCount: activeCommands.length,
+      };
+      disposeScreenReg();
+      disposeCmdReg();
+      localeMod.setLanguageOverride("zh-CN");
+      check(
+        "contributeTimelineSettings & contributeDisplaySettingsCommand refresh titles when persisted language resolves asynchronously and clean up cleanly",
+        initialTitles.screen === "显示设置" &&
+          initialTitles.cmd === "DSH 显示设置" &&
+          enTitles.screen === "Display settings" &&
+          enTitles.cmd === "DSH display settings" &&
+          enTitles.screenCount === 1 &&
+          enTitles.cmdCount === 1 &&
+          activeSettingsScreens.length === 0 &&
+          activeCommands.length === 0 &&
+          settingsScreenHistory.length === 2 &&
+          commandHistory.length === 2,
+        JSON.stringify({ initialTitles, enTitles, settingsScreenHistory, commandHistory }),
+      );
+      localeMod.setLanguageOverride("auto");
+
+      const initialTree = renderScreen();
+      const langKeys = ["auto", "en", "zh-CN"];
+      const initialLangBtns = findAllNodes(initialTree, (n) => n.type === "Pressable").filter((b) =>
+        langKeys.includes(b.key),
+      );
+      const initialInputs = findAllNodes(initialTree, (n) => n.type === "TextInput");
+      check(
+        "settings screen renders 3 language choices and 7 numeric TextInputs with default expandedMaxHeight=260",
+        initialLangBtns.length === 3 &&
+          initialInputs.length === 7 &&
+          initialLangBtns.find((b) => b.key === "auto")?.props?.accessibilityState?.selected === true &&
+          initialInputs.some((n) => n.props?.value === "260"),
+        `langs=${initialLangBtns.length}, inputs=${initialInputs.length}`,
+      );
+
+      // Edit numeric draft (expandedMaxHeight -> "320"), then pick language 'en'.
+      const maxHeightInput = initialInputs.find((n) => n.props?.value === "260");
+      maxHeightInput?.props?.onChangeText?.("320");
+      const treeWithDraft = renderScreen();
+      const enBtn = findAllNodes(treeWithDraft, (n) => n.type === "Pressable").find((b) => b.key === "en");
+      enBtn?.props?.onPress?.();
+
+      flushMicrotasks()
+        .then(() => {
+          const afterLangTree = renderScreen();
+          const preservedInput = findAllNodes(afterLangTree, (n) => n.type === "TextInput").find(
+            (n) => n.props?.value === "320",
+          );
+          check(
+            "switching language saves language='en' with revision=3 and preserves unsaved numeric draft",
+            langSaves.length === 1 &&
+              langSaves[0].data.language === "en" &&
+              langSaves[0].rev === 3 &&
+              preservedInput !== undefined,
+            JSON.stringify({ langSaves, preserved: preservedInput?.props?.value }),
+          );
+          // Save numeric draft.
+          const saveBtn = findAllNodes(afterLangTree, (n) => n.type === "Pressable").find(
+            (n) => n.props?.accessibilityLabel === "保存" || n.props?.accessibilityLabel === "Save",
+          );
+          saveBtn?.props?.onPress?.();
+          return flushMicrotasks();
+        })
+        .then(() => {
+          check(
+            "saving numeric draft persists expandedMaxHeight=320 with current revision=7",
+            styleSaves.length === 1 &&
+              styleSaves[0].data.expandedMaxHeight === 320 &&
+              styleSaves[0].rev === 7,
+            JSON.stringify(styleSaves[0]),
+          );
+          // Failed language save rolls back selection + override and shows error banner.
+          const beforeFailLangTree = renderScreen();
+          nextLangBehavior = "fail";
+          const zhBtn = findAllNodes(beforeFailLangTree, (n) => n.type === "Pressable").find(
+            (b) => b.key === "zh-CN",
+          );
+          zhBtn?.props?.onPress?.();
+          return flushMicrotasks();
+        })
+        .then(() => {
+          const afterFailLangTree = renderScreen();
+          const langBtns = findAllNodes(afterFailLangTree, (n) => n.type === "Pressable").filter((b) =>
+            langKeys.includes(b.key),
+          );
+          const errorTexts = findAllNodes(
+            afterFailLangTree,
+            (n) => n.type === "Text" && n.props?.style?.color === COLORS.statusDanger,
+          );
+          check(
+            "failed language save rolls back selection & override to 'en' and displays error banner",
+            langSaves.length === 2 &&
+              localeMod.getLanguageOverride() === "en" &&
+              langBtns.find((b) => b.key === "en")?.props?.accessibilityState?.selected === true &&
+              langBtns.find((b) => b.key === "zh-CN")?.props?.accessibilityState?.selected === false &&
+              errorTexts.length >= 1,
+            JSON.stringify({ override: localeMod.getLanguageOverride(), errors: errorTexts.length }),
+          );
+          // Rejected style save catches error, shows error banner, and releases styleInFlightRef in finally.
+          const beforeThrowTree = renderScreen();
+          const inputForThrow = findAllNodes(beforeThrowTree, (n) => n.type === "TextInput").find(
+            (n) => n.props?.value === "320",
+          );
+          inputForThrow?.props?.onChangeText?.("340");
+          const throwDraftTree = renderScreen();
+          nextStyleBehavior = "throw";
+          const saveBtnThrow = findAllNodes(throwDraftTree, (n) => n.type === "Pressable").find(
+            (n) => n.props?.accessibilityLabel === "保存" || n.props?.accessibilityLabel === "Save",
+          );
+          saveBtnThrow?.props?.onPress?.();
+          return flushMicrotasks();
+        })
+        .then(() => {
+          const afterThrowTree = renderScreen();
+          const errorTexts = findAllNodes(
+            afterThrowTree,
+            (n) => n.type === "Text" && n.props?.style?.color === COLORS.statusDanger,
+          );
+          const preservedDraft = findAllNodes(afterThrowTree, (n) => n.type === "TextInput").find(
+            (n) => n.props?.value === "340",
+          );
+          check(
+            "rejected style save preserves draft, shows fallback error banner, and releases lock in finally",
+            styleSaves.length === 2 && errorTexts.length >= 1 && preservedDraft !== undefined,
+            JSON.stringify({ styleSaves: styleSaves.length, errors: errorTexts.length }),
+          );
+          // Synchronous styleInFlightRef lock: rapid double-tap on Save while in-flight fires only once.
+          nextStyleBehavior = "defer";
+          const saveBtnDouble = findAllNodes(afterThrowTree, (n) => n.type === "Pressable").find(
+            (n) => n.props?.accessibilityLabel === "保存" || n.props?.accessibilityLabel === "Save",
+          );
+          saveBtnDouble?.props?.onPress?.();
+          saveBtnDouble?.props?.onPress?.();
+          // Synchronous languageInFlightRef lock: rapid taps on two language options while in-flight fire only once.
+          nextLangBehavior = "defer";
+          const autoBtn = findAllNodes(afterThrowTree, (n) => n.type === "Pressable").find(
+            (b) => b.key === "auto",
+          );
+          const zhBtn2 = findAllNodes(afterThrowTree, (n) => n.type === "Pressable").find(
+            (b) => b.key === "zh-CN",
+          );
+          autoBtn?.props?.onPress?.();
+          zhBtn2?.props?.onPress?.();
+          return flushMicrotasks();
+        })
+        .then(() => {
+          check(
+            "synchronous styleInFlightRef and languageInFlightRef locks block duplicate concurrent saves",
+            styleSaves.length === 3 &&
+              styleSaves[2].data.expandedMaxHeight === 340 &&
+              langSaves.length === 3 &&
+              langSaves[2].data.language === "auto",
+            JSON.stringify({ styleSaves: styleSaves.length, langSaves: langSaves.length }),
+          );
+          pendingStyleResolve?.(true);
+          pendingStyleResolve = null;
+          pendingLangResolve?.(true);
+          pendingLangResolve = null;
+          return flushMicrotasks();
+        })
+        .then(() => {
+          const afterResolveTree = renderScreen();
+          const resetBtn = findAllNodes(afterResolveTree, (n) => n.type === "Pressable").find(
+            (n) =>
+              n.props?.accessibilityLabel === "恢复默认" ||
+              n.props?.accessibilityLabel === "Restore defaults",
+          );
+          resetBtn?.props?.onPress?.();
+          return flushMicrotasks();
+        })
+        .then(() => {
+          check(
+            "tapping Restore defaults saves TIMELINE_STYLE_DEFAULTS (expandedMaxHeight=260)",
+            styleSaves.length === 4 && styleSaves[3].data.expandedMaxHeight === 260,
+            JSON.stringify(styleSaves[3]),
+          );
+          localeMod.setLanguageOverride("auto");
+          localeMod.setLocale(undefined);
+          console.log(`\n${passed} passed, ${failed} failed`);
+          process.exit(failed === 0 ? 0 : 1);
+        })
+        .catch((err) => {
+          console.error(err);
+          process.exit(1);
+        });
+      return;
+    }
+  }
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

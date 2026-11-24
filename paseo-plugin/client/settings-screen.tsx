@@ -19,6 +19,7 @@ import {
   getLanguageOverride,
   localeText,
   setLanguageOverride,
+  subscribeLocale,
   type DisplaySettingsText,
 } from "./locale";
 import { useLocaleText } from "./use-locale";
@@ -388,14 +389,49 @@ function GuardedTimelineSettingsScreen(props: PluginSurfaceProps) {
   );
 }
 
+function registerWithLiveTitle(
+  label: string,
+  titleOf: () => string,
+  register: (title: string) => () => void,
+): () => void {
+  let currentTitle = titleOf();
+  let remove = register(currentTitle);
+  let disposed = false;
+  const unsubscribe = subscribeLocale(() => {
+    if (disposed) return;
+    const nextTitle = titleOf();
+    if (nextTitle === currentTitle) return;
+    currentTitle = nextTitle;
+    try {
+      const prevRemove = remove;
+      remove = () => {};
+      prevRemove();
+      remove = register(nextTitle);
+    } catch (error) {
+      report(label, error);
+    }
+  });
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    unsubscribe();
+    remove();
+  };
+}
+
 /** Register the Display settings screen under the plugin's host settings. */
 export function contributeTimelineSettings(client: PluginClientContext): () => void {
-  return client.addSettingsScreen({
-    id: DISPLAY_SETTINGS_ID,
-    title: localeText().settings.title,
-    icon: SlidersIcon,
-    Component: GuardedTimelineSettingsScreen,
-  });
+  return registerWithLiveTitle(
+    "timeline settings title refresh",
+    () => localeText().settings.title,
+    (title) =>
+      client.addSettingsScreen({
+        id: DISPLAY_SETTINGS_ID,
+        title,
+        icon: SlidersIcon,
+        Component: GuardedTimelineSettingsScreen,
+      }),
+  );
 }
 
 /**
@@ -403,18 +439,23 @@ export function contributeTimelineSettings(client: PluginClientContext): () => v
  * Settings → Plugins → DeepSeek Harness.
  */
 export function contributeDisplaySettingsCommand(client: PluginClientContext): () => void {
-  return client.addCommandCenterItem({
-    id: "dsh-display-settings",
-    title: localeText().settings.command,
-    icon: SlidersIcon,
-    keywords: ["DSH", "display", "timeline", "spacing", "language", "显示", "时间线", "行间距", "语言"],
-    context: "global",
-    onSelect: (command) => {
-      void Promise.resolve()
-        .then(() => command.openSettings(DISPLAY_SETTINGS_ID))
-        .catch((error) => {
-          report("open display settings", error);
-        });
-    },
-  });
+  return registerWithLiveTitle(
+    "display settings command title refresh",
+    () => localeText().settings.command,
+    (title) =>
+      client.addCommandCenterItem({
+        id: "dsh-display-settings",
+        title,
+        icon: SlidersIcon,
+        keywords: ["DSH", "display", "timeline", "spacing", "language", "显示", "时间线", "行间距", "语言"],
+        context: "global",
+        onSelect: (command) => {
+          void Promise.resolve()
+            .then(() => command.openSettings(DISPLAY_SETTINGS_ID))
+            .catch((error) => {
+              report("open display settings", error);
+            });
+        },
+      }),
+  );
 }
