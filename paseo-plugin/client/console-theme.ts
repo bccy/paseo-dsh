@@ -51,11 +51,19 @@ export const font = {
   overline: { fontSize: 11, lineHeight: 14, fontWeight: "600" as const, letterSpacing: 0.4 },
 };
 
-export const mono: string = Platform.select({
-  ios: "Menlo",
-  android: "monospace",
-  default: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-});
+/**
+ * Platform-specific monospace stack.
+ *
+ * Resolved through `Platform.OS` rather than `Platform.select` so importing this
+ * module at load time stays safe in headless harness stubs, which only expose
+ * `Platform.OS` (same convention as `shimmer-css.ts#SHIMMER_SUPPORTED`).
+ */
+export const mono: string =
+  Platform.OS === "ios"
+    ? "Menlo"
+    : Platform.OS === "android"
+      ? "monospace"
+      : "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
 
 /**
  * Tabular numerals style for tables, counters, and aligned metrics.
