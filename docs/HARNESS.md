@@ -33,8 +33,14 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   句柄，cleanup 全部释放；open.before / create.before / 多余 close hook 均不能混入。
   改 server 入口或 hook 名称必跑；不创建 profile，不开 provider connection。
 - `harness/timeline-kind-check.cjs`：执行编译的 client entry 与 stream-stats 注册逻辑，
-  拦截实际 `addTimelineRenderer` 的四个 kind，按 `^[a-z][a-z0-9-]*$` 校验。UI 组件不挂载；
-  在内存里把实际注册的 kind 改为大写字符串，必须拒绝（负向变异控制）。新增 renderer 必跑。
+  拦截实际 `addTimelineRenderer` 的四个 kind，按 `^[a-z][a-z0-9-]*$` 校验。UI 组件不挂载，
+  `requireClient` 桩掉控制台壳与各 Tab 模块（`./client/console-screen`、`./client/console-diagnostics`、
+  `./client/console-usage`、`./client/console-pricing`、`./client/console-heatmap`、
+  `./client/deepseek-mark-svg`、`./client/use-locale`、`DshPluginsContent`、
+  `registerWithLiveTitle`）以及 `client/stream-stats.tsx` 新增的相对导入（`./console-format`、
+  `./console-theme`、`./console-ui`、`./use-locale`）；
+  在内存里把实际注册的 kind 改为大写字符串，必须拒绝（负向变异控制）。新增 renderer 或改动
+  `index.client.tsx` / `client/stream-stats.tsx` 的顶层 client 导入必跑。
 - `harness/plugins-lock-check.cjs`：DSH Plugins 页唯一直接写入（启停 bundle，改
   `dsh.profile.bundles`）的 profile 锁协议：`<profile>/package.json.lock`，`wx` 创建、
   内容 `` `${pid}\n` ``，与 DSH 自己的 `@deepseek-ai/dsh-atomic-write` 互斥。断言成功写入
@@ -50,6 +56,43 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   不可卸载/更新）。夹具自建三种布局并用显式 `installAnchor`（`null` 关闭安装解析），不读真实
   `$DSH_HOME` 或全局安装、不起 `dsh`。**改 `server/dsh-plugins.ts` 的 `resolveBundlePackage`、
   `#describe`、`setEnabled`、remove/update 或 `readRows` 的包目录来源必跑。**
+- `paseo-plugin/test/diagnostics.test.cjs` — DSH 控制台「设置」Tab 环境概览与按需 Doctor 诊断回归
+  （**10 条**；已登记在 `offline-checks.cjs` 的 `pluginTests`，纳入 portable CI）：断言抽取自
+  `paseo-plugin/lib/doctor.mjs` 的共用纯函数 `runDoctorChecks` / `runDoctorChecksAsync`；
+  凭据脱敏防泄密（含畸形 YAML、缺失 `version: 1`、非法键名、内联 key、Authorization 头、URL
+  userinfo 与 query 参数，严禁泄漏 `.credentials.yaml` 原文或解析错误片段）；POSIX 权限判定
+  （`0644` / `0600`）、缺失凭据文件 / 缺失 ref / 旧扁平布局检测；`dsh.diagnostics.overview`
+  快速只读概览（零子进程版本探测与缓存）对比 `dsh.diagnostics.run-doctor` 完整 `--dump-config` 诊断；
+  4 路并发单飞互斥（single-flight mutex）与 20s 超时清理（含挂起 runner 与真实挂起子进程）；
+  以及 `paseo-dsh doctor` CLI 零回退。运行：`cd paseo-plugin && node --test test/diagnostics.test.cjs`。
+  **动了 `lib/doctor.mjs` 共用校验、`shared/diagnostics.ts`、`server/diagnostics.ts` 或
+  `index.server.ts` 的诊断 RPC 接线必跑。**
+- `paseo-plugin/test/pricing.test.cjs` — 双币种模型估价引擎、持久化存储与 RPC 契约回归
+  （**11 条**；已登记在 `offline-checks.cjs` 的 `pluginTests`，纳入 portable CI）：通用公开模型族
+  前缀匹配与边界安全（`deepseek-*`、`claude-*`、`gpt-*`、`o1/o3/o4-*`、`gemini-*`）及自定义覆盖优先；
+  长上下文阶梯（`longContextThreshold`）与 `cacheWrite` 回退；`USD` / `CNY` 混币种按各自原生币种计算
+  并按汇率统一折算；未定价模型排除在 `pricedRequests` 之外；`$DSH_HOME/.cache/paseo-dsh-pricing-v1.json`
+  原子写入（`tmp + rename`、`0o600`）与并发串行更新；覆盖项增删与 `resetOverrides`/`resetAll`、
+  非法汇率/负单价/畸形输入校验与损坏文件安全恢复；以及 `dsh.pricing.get` / `dsh.pricing.update`
+  RPC 契约往返。运行：`cd paseo-plugin && node --test test/pricing.test.cjs`。
+  **动了 `shared/pricing.ts`、`server/pricing.ts` 或 `index.server.ts` 的定价 RPC 接线必跑。**
+- `paseo-plugin/test/usage-stats.test.cjs` — DSH 会话日志用量引擎与落盘增量缓存回归
+  （**5 条**；已登记在 `offline-checks.cjs` 的 `pluginTests`，纳入 portable CI）：解析
+  `.v4.jsonl.zstd` 与未压缩 `.jsonl` 会话日志；`$DSH_HOME/.cache/paseo-dsh-usage-v1.json` 原子增量缓存的
+  命中、mtime/size 变动失效与已删文件自动清理；损坏/截断文件容错；主/子代理拆分（`all`/`main`/`subagent`）
+  与按 `provider` / `model` 交叉筛选；首字延迟 TTFT `0..300s` 钳制与输出速度 `<=3000 tok/s` 边界过滤；
+  371 天每日汇总与连续活跃天数（streak）；以及异步后台预热（background prewarm）与实时
+  `indexing: { active, done, total }` 状态上报。运行：`cd paseo-plugin && node --test test/usage-stats.test.cjs`。
+  **动了 `shared/usage.ts`、`server/usage-stats.ts` 或 `index.server.ts` 的用量统计 RPC / 预热接线必跑。**
+- `paseo-plugin/test/subagent-card.test.cjs` — 时间线子代理卡片服务端元数据与状态摘要解析回归
+  （**13 条**；已登记在 `offline-checks.cjs` 的 `pluginTests`，纳入 portable CI）：
+  `item.metadata.dshSubagent` 只携带观测到的事实（缺失即省略，不伪造，启动回执不作最终报告，且不改
+  `detail` 协议形状、过 `ProviderEventSchema.parse`）；冷重开无终态子会话收尾为 `canceled`、与
+  活进程加入（`reused: true`）保持 `running` 区分；按 `stepKey` 幂等累计 `outputTokens` 防 replay/live
+  重叠重复计数；以及 `list_agents` 三代输出格式（rc.3+ 纯文本、rc.2 树形 JSON、≤0.2.1 名册 JSON，排除 Lead）
+  与 `archive_subagents`（文本/dry-run/JSON）解析器（畸形/混合形状一律 fail-closed）。运行：
+  `cd paseo-plugin && node --test test/subagent-card.test.cjs`。
+  **动了 `shared/subagent-card.ts`、`server/timeline.ts` / `server/session.ts` 的子代理元数据或重放预取必跑。**
 - `paseo-plugin/test/timeline-spacing.test.cjs` — 时间线间距、展开区高度上限与显示语言设置回归：
   `TIMELINE_STYLE_DEFAULTS` / `TIMELINE_STYLE_KEYS` / `EXPANDED_MAX_HEIGHT_DEFAULT`（260）与
   `timelineStyleSettings` schema（v6）默认值和数值边界一致；v1–v5 `migrate()` 折叠旧 margin 字段、
@@ -258,6 +301,16 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
       `TOOL_CONTEXT_UNAVAILABLE`（rc.3 新增）、`UNKNOWN_TOOL`。`errorName` 只在展开区
       （灰色 `code（name）`），`errorReason` 只在结果文本为空时兜底。**动了失败行的 metadata、
       `toolFailures` 表或 `tool-call.tsx` 的 hint 分支必跑。**
+    - 子代理轻量展开卡与状态摘要 chip（+61，总计 **988** 条）：`client/tool-call-data.ts`
+      新增始终存在的 `subagent` / `subagentChips` 字段（缺省为 `null`，与 `index.client.tsx`
+      `dsh-tool` Zod schema 键 1:1 对齐），保留 `subagent`（`icon: "Bot"`、`kind: "generic"`）与
+      `subagent_fork`（`icon: "GitFork"`、标签「派生子智能体分支」）；覆盖 `resolveSubagentCardMetadata`
+      与 `parseSubagentStatusChips` 数据映射、`client/tool-call.tsx` 分发接线（`<SubagentCard>`
+      位于 `<RowEntrance>` 内、`list_agents`/`archive_subagents` 行尾内联 `<SubagentStatusChips>`，
+      且不引入额外色值或 `color=`/`tintColor=` prop），以及 `client/subagent-card.tsx` 编译后真实运行期
+      断言（仅展示观测事实、启动回执不作报告、原地展开任务与报告、复制与双语状态 chip）。**动了
+      `client/subagent-card.tsx`、`client/tool-call-data.ts` / `client/tool-call.tsx` 的子代理分支、
+      或 `index.client.tsx` 的 `dsh-tool` schema 必跑。**
 - `harness/thinking-check.cjs` — 思考行折叠预览、右侧思考时长与计时生命周期：结束后取**第一行**、
   运行中取最后一个首行已终结的段落（都是 DSH 的行为，逐字移植在 `client/thinking-text.ts`），
   折叠行在流式中的宽度接线（行测自己的宽度、标签与右侧时长盒各自测宽、行宽由行宽扣减图标/标签/时长

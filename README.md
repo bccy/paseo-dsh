@@ -25,6 +25,8 @@ DSH 侧是一个 profile bundle。
 | 斜杠命令 / 技能 | ⚠️ 多为命令子集 | ✅ `/` 菜单列出 DSH 命令与 user-invocable 技能；命令在运行时执行，技能按 `/name` 注入 |
 | 权限模式（沙箱） | ❌ 无统一开关 | ✅ composer 里的 **Permissions** 下拉，切换 DSH 的沙箱 + 审批预设 |
 | 人设预设（Preset） | ❌ | ✅ profile 挂了 agent-preset registry 时，composer 出现 **Preset** 下拉（建会话时选、首回合后锁定） |
+| DSH 控制台 | — | ✅ 侧栏顶部统一入口打开 3-Tab 控制台（Paseo 设置页与 Command Center 直达「设置」Tab）：**用量**（53 周热力图、24h/7d/30d、6 项 KPI + sparkline、全指标主图、8 列可排序模型表、主/子代理拆分、Provider 路由筛选、落盘增量缓存与 `USD $` / `CNY ¥` 双币种估价）、**插件**（管理 profile bundle 的启停/安装/更新/卸载）、**设置**（秒开环境与路由概览、按需完整 Doctor 诊断、界面语言、默认币种/汇率、时间线样式一键预设与高级间距微调） |
+| 时间线卡片与统计行 | — | ✅ `subagent` / `subagent_fork` 升级为轻量可展开卡片（仅展示实测事实，原地展开任务全文与报告并支持复制）；`list_agents` / `archive_subagents` 行尾内联状态计数 chip；`stream-stats` 中英双语 + 色阶上下文条与三色 Token 堆叠条；`team-card` 真实溢出折叠；`RewindNotice` 轻量无框状态行 |
 | 会话恢复 / 导入 | ❌ 无历史、无法导入 | ✅ 重开按 Paseo 的 `history: replay` 回放历史；**导入** DSH 原生会话（`session.list`，从 `~/.dsh/sessions` 列举） |
 | 后台任务（jobs） | — | ✅ composer 的 pill 显示 DSH 后台任务（终端图标，运行中右下角叠转环）：只在有运行中/停止中的任务时显示，文字只写「后台」（数量在面板里），全部结束即隐藏；多个 pill 同屏时可左右滑动浏览（宿主的 pill 轨道 0.15.3 起可横向滚动），目标 / 团队 / 后台各按自身规则独立显示；点开看每个任务的明细（弹层里运行中且可停的任务行带停止按钮：不弹确认，停止中转圈、以推送为准，失败在行下显示原因） |
 | 目标（goal）pill | — | ✅ composer 的 pill 显示 DSH 目标，文字与手机面板标题恒为「目标」，状态由图标表达（运行中右下角叠转环、完成绿色对勾），面板首行说出完整状态；点开看目标（带 DeepSeek 标志，点文本即可在小号输入框里编辑）、「第 N 轮 · 预算 M」、「正在：<当前任务>」与受阻原因，按钮暂停 / 继续 / 清除（清除二次确认）；目标完成后 pill 再显示一次（只读，只能清除，只有点开并关闭面板后才隐藏；不点开时发送新消息不会隐藏）；重开会话后自动续跑会停，pill 直接给出恢复入口 |
@@ -259,15 +261,21 @@ paseo-dsh/
 │   ├── lib/server.js    #   会话/计划/思考档位/catalog 的实现
 │   └── cordis.patch.yml #   bundle 补丁：往 dsh-base 上挂桥接与提问工具
 ├── paseo-plugin/        # Paseo 侧：provider 插件（direct provider 实现；同名 npm 包由上游发布）
-│   ├── index.server.ts  #   registerProvider() + 首次加载时自举 DSH profile
+│   ├── index.server.ts  #   registerProvider() + RPC 注册 + 首次加载时自举 DSH profile
+│   ├── index.client.tsx #   DSH 控制台入口、时间线 renderer、pill 与工作区徽标注册
 │   ├── server/
 │   │   ├── provider.ts  #   连接、catalog、会话生命周期、权限卡片
 │   │   ├── session.ts   #   单会话：提问→卡片、计划、思考档位、用量
 │   │   ├── dsh-process.ts # 一个连接共用的 dsh 子进程（cwd/路由/MCP 按会话下发）
 │   │   ├── timeline.ts  #   DSH 会话事件 → Paseo 时间线
+│   │   ├── usage-stats.ts # 会话日志增量解析、磁盘缓存与用量统计 RPC
+│   │   ├── pricing.ts   #   双币种模型单价配置持久化与 RPC
+│   │   ├── diagnostics.ts # 快速环境概览与按需 Doctor 诊断 RPC
 │   │   ├── bootstrap.ts #   自举：写 profile 文件 + 把内嵌 bridge 落盘
 │   │   └── bridge-assets.ts # 生成物：bridge 的 base64 内嵌副本
-│   ├── lib/             #   doctor（自检）/ probe（能力探测）
+│   ├── client/          #   DSH 控制台 3-Tab（用量/插件/设置）与时间线卡片/统计行/pill UI
+│   ├── shared/          #   Hermes 安全共享模块与 RPC 契约（usage/pricing/diagnostics/subagent-card 等）
+│   ├── lib/             #   doctor（自检，CLI 与控制台共用）/ probe（能力探测）
 │   └── bin/paseo-dsh.mjs#   CLI：doctor / probe
 ├── tools/               # 探测工具的瘦启动器（实现在 paseo-plugin/lib 里）
 ├── templates/           # profile 配置模板（含必踩的坑的注释）
@@ -413,7 +421,7 @@ composer 里的模式、思考档位、权限/预设下拉，以及 `/` 斜杠�
   手改会被回滚。所以中文说明放在插件的 `SKILL_COPY` 表里（`server/locale.ts`）；
   表里没有的技能走下面的自动翻译。
 
-语言按这个顺序决定（**这是服务端文案的口径；客户端 bundle 读不到 daemon 环境，默认 `zh-CN`**）：
+语言按这个顺序决定（**这是服务端文案的口径**；客户端控制台与时间线 UI 支持在 **DSH 控制台 → 设置** 里切换 `自动 / English / 简体中文`，自动模式下启动时先同步宿主语言并在收到服务端 `metadata.locale` 后对齐，缺省为 `zh-CN`）：
 
 1. 环境变量 `DSH_PASEO_LANG`——`zh` 开头 → 中文，其他 → English，显式覆盖一切；
 2. daemon 自己的 `LC_ALL` / `LC_MESSAGES` / `LANG`——`zh` 开头 → 中文；
@@ -561,21 +569,36 @@ settings 在 `describe()` 时对比 revision 后发出；绕过 `settings.write`
 两个 `dsh` 子进程共用同一个 profile 时是 last-writer-wins，`revision`/`expectedValue` 只防单进程
 内的 stale 点击，跨进程不保证。
 
-## DSH 插件页
+## DSH 控制台与时间线升级
 
-左侧栏新增 **DSH Plugins** 入口，管理本插件所驱动的 profile（默认
-`~/.dsh/profiles/paseo`）：列出 `@deepseek-ai/dsh-base`、桥接包以及 profile 里的每个
-bundle 与依赖；每行显示版本、是否声明 `dsh.bundle`（普通依赖不会成为 profile 层）、
-以及是否自带 DSH Web/Desktop 客户端界面——那套界面不由 Paseo 承载，所以行上只做标注，
-不会隐藏。
+左侧栏顶部提供统一的 **DSH 控制台**入口，内含三个 Tab：**`用量`（Usage）**、**`插件`（Plugins）**、
+**`设置`（Settings）**。从侧栏进入默认落到「用量」Tab；从 Paseo 原生设置页或 Command Center 进入则直达「设置」Tab。
 
-启停只改有序的 `dsh.profile.bundles`（已装代码保留，所以停用不需要重新下载），
-写入时持有 profile 自己的 `package.json.lock`；安装、卸载、更新走 `dsh plugin`，
-新装 bundle 的激活也由它完成，没有 `dsh.bundle` 的包会被它拒绝。所有改动只对新会话生效，
-正在运行的会话保持启动时的 bundle 集合。页面不会在没有「检查 + 确认」的情况下安装任何
-东西，除了 bundle 列表之外也不改写 profile 文件。包操作需要 daemon 的 `PATH` 上有
-`pnpm`（与 `dsh plugin` 的要求相同）以及可用的 npm registry；失败会显示一句说明加原始
-`dsh` 输出，不会当成功处理。
+### 1. 用量（`用量` / Usage）
+
+- **数据源与增量缓存**：直接解析 `$DSH_HOME/sessions/**/*.v4.jsonl.zstd`（兼容未压缩 `.jsonl`），将解析结果原子落盘至 `$DSH_HOME/.cache/paseo-dsh-usage-v1.json`（仅重解新增或变更文件，自动清理已删会话），插件启动后延迟异步后台预热并实时回报索引进度。
+- **活动热力图与多维统计**：提供 53 周活动热力图（四分位色阶、悬浮/点击详情、4 项汇总指标，窄屏自动缩周数并切换内联详情条）、`24h / 7d / 30d` 区间切换、6 张可点击 KPI 卡片（Token、估算费用、请求数、输出速度、缓存命中、首字延迟，均内嵌 sparkline）、悬浮/点击全指标主图，以及 8 列可排序模型占比表（点击行交叉筛选，窄屏自动切换双行紧凑卡）。
+- **主/子代理拆分与路由筛选**：存在子代理数据时展示 `全部 / 主对话 / 子代理` 切换；存在多个 Provider 路由时展示带请求数与折算费用的路由筛选 chip。
+- **双币种估价**：默认以 **`USD $`** 显示，支持一键切换 **`CNY ¥`**（默认汇率 `7.2`，可自定义调整）。内置通用公开模型族参考价（`deepseek-*`、`claude-*`、`gpt-*`、`o1/o3/o4-*`、`gemini-*`），并支持按模型覆盖或补充自定义单价，配置原子保存在 `$DSH_HOME/.cache/paseo-dsh-pricing-v1.json`；未匹配参考表且未自定义的模型显示 `—` 且不计入已定价请求统计。
+
+### 2. 插件（`插件` / Plugins）
+
+管理本插件所驱动的 profile（默认 `~/.dsh/profiles/paseo`）：保留单列卡片、外露启停开关 / 更新 / 卸载 / 查看组件按钮与「检查 + 确认」安装流，同时升级卡片与无框圆点徽标观感，卸载/更新确认改为宿主 `Modal`（兼容旧宿主自动回退），操作成败通过 `Toast` 反馈。
+
+列出 `@deepseek-ai/dsh-base`、桥接包以及 profile 里的每个 bundle 与依赖；每行显示版本、是否声明 `dsh.bundle`（普通依赖不会成为 profile 层）、以及是否自带 DSH Web/Desktop 客户端界面——那套界面不由 Paseo 承载，所以行上只做标注，不会隐藏。启停只改有序的 `dsh.profile.bundles`（已装代码保留，停用无需重新下载），写入时持有 profile 自己的 `package.json.lock`；安装、卸载、更新走 `dsh plugin`（需要 daemon 的 `PATH` 上有 `pnpm` 及可用的 npm registry），新装 bundle 的激活也由它完成，没有 `dsh.bundle` 的包会被拒绝。所有改动只对新会话生效，正在运行的会话保持启动时的 bundle 集合；失败会显示说明加原始 `dsh` 输出，不会当成功处理。
+
+### 3. 设置（`设置` / Settings）
+
+- **环境与路由概览 + 按需 Doctor 诊断**：打开即秒显只读环境概览（DSH CLI 版本与路径、Profile 名称与目录、Bridge 状态、默认路由、脱敏 Provider/模型汇总、凭据文件权限与 ref 就绪态）；点击「运行完整诊断」按需执行与 CLI 共用核心的完整 Doctor 检查（含 `dsh --dump-config`，带单飞互斥与超时保护），以 `ok / warn / fail` 徽标列出结果，存在失败项时给出可执行的修复建议与「重新检查」按钮。
+- **常规与费用偏好**：直接切换界面语言（`自动 / English / 简体中文`）、默认展示币种（`USD / CNY`）、`USD → CNY` 汇率，并可打开「模型单价管理」弹窗。
+- **时间线显示样式**：采用宿主原生 `SettingsCard` 布局，提供 **`紧凑 / 默认 / 宽松`（`Compact / Default / Relaxed`）** 一键预设，并将 7 项像素级微调参数收纳在可折叠的「高级间距微调」区域内（保留边界校验与恢复默认）。
+
+### 4. 时间线卡片与细节升级
+
+- **子代理轻量可展开卡片（`subagent` / `subagent_fork`）**：保留普通工具的紧凑无框节奏；子代理调用渲染为可原地展开的轻量卡片（角色、预设/模型、状态徽标、2 行任务预览与仅来自实测数据的 `步数 · 耗时 · 产出 token` 事实行，缺失项省略不伪造），点击原地展开任务全文与最终报告并提供一键复制，不另建独立子代理面板。
+- **子代理状态摘要行（`list_agents` / `archive_subagents`）**：保持单行紧凑高度，在行尾内联渲染柔和彩色状态计数 chip（无需展开即可扫读运行中/已完成/已归档数量），点击仍可展开原始明细。
+- **回答统计行（`stream-stats`）**：补齐中英双语；展开态将上下文与 Token 展示升级为色阶上下文进度 `Bar` 与缓存/新输入/输出三色 `TokenBar`。
+- **团队卡片（`team-card`）与撤回提示（`RewindNotice`）**：团队任务长描述改用真实溢出检测的 `Expandable`（仅溢出时显示渐隐遮罩与展开/收起）；`RewindNotice` 改为轻量无框状态行（成功态透明融入时间线，警告/部分失败态使用柔和浅底，保留既有实时 Toast 监视机制）。
 
 ## 版本策略
 
