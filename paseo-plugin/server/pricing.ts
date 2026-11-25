@@ -7,6 +7,10 @@
  * Uses atomic `tmp + rename` writes (`0o600`) serialized through per-file promise
  * queues so concurrent mutations or syncs never race or leave half-written files.
  * Network or parse failures never crash RPCs or wipe a valid existing disk cache.
+ * Unreadable (non-ENOENT) files are first quarantined as `<path>.corrupt-<timestamp>`
+ * so their contents stay recoverable; the config recovery is surfaced through the
+ * `readError` / `recoveredFromCorruption` / `corruptBackupPath` state fields, and
+ * `update()` refuses to overwrite a file that could not be quarantined.
  *
  * @module dsh-paseo/server/pricing
  */
@@ -242,6 +246,15 @@ export class PricingStore {
   private lastFailedAttemptAt = 0;
   private disposed = false;
 
+  /** Compact error from the persisted-config read that forced defaults, or null. */
+  private readError: string | null = null;
+  /** True when the persisted config was unreadable and built-in defaults were applied. */
+  private recoveredFromCorruption = false;
+  /** Where the unreadable config file was moved, or null when no backup could be made. */
+  private corruptBackupPath: string | null = null;
+  /** True once the pre-overwrite warning for a recovered config has been emitted. */
+  private overwriteWarningEmitted = false;
+
   constructor(options: PricingStoreOptions = {}) {
     this.filePath = pricingFilePath(options);
     this.catalogPath = pricingCatalogFilePath(options);
@@ -434,6 +447,24 @@ export class PricingStore {
         overrides: normalizeOverridesRecord(next.overrides),
       });
 
+      // A config recovered from an unreadable file must never be replaced silently:
+      // either its original content is preserved in a `.corrupt-*` backup, or we
+      // refuse to write at all (the only copy would be destroyed).
+      if (this.recoveredFromCorruption) {
+        if (this.corruptBackupPath === null) {
+          throw new Error(
+            `Refusing to overwrite pricing config at ${this.filePath}: the unreadable existing file could not be quarantined, so writing would discard it. Repair or move that file, then retry.`,
+          );
+        }
+        if (!this.overwriteWarningEmitted) {
+          this.overwriteWarningEmitted = true;
+          this.warn(
+            `overwriting unreadable pricing config at ${this.filePath} with a validated config; original preserved at ${this.corruptBackupPath}`,
+            new Error("pricing config was recovered from a corrupt file"),
+          );
+        }
+      }
+
       await this.writeAtomicFile(this.filePath, validated);
       this.config = validated;
       return structuredClone(this.config);
@@ -588,6 +619,9 @@ export class PricingStore {
       models: rows,
       overrides: structuredClone(overrides),
       hasCustomOverrides: this.hasCustomOverrides(),
+      readError: this.readError,
+      recoveredFromCorruption: this.recoveredFromCorruption,
+      corruptBackupPath: this.corruptBackupPath,
     });
   }
 
@@ -722,12 +756,32 @@ export class PricingStore {
         autoSync: parsed.autoSync,
         overrides: normalizeOverridesRecord(parsed.overrides),
       });
+      this.readError = null;
+      this.recoveredFromCorruption = false;
+      this.corruptBackupPath = null;
+      this.overwriteWarningEmitted = false;
     } catch (error) {
-      const code = (error as { code?: string } | null)?.code;
-      if (code !== "ENOENT") {
-        this.warn(`could not read pricing config at ${this.filePath}, using defaults`, error);
-      }
       this.config = defaultPricingConfig();
+      const code = (error as { code?: string } | null)?.code;
+      if (code === "ENOENT") {
+        this.readError = null;
+        this.recoveredFromCorruption = false;
+        this.corruptBackupPath = null;
+        this.overwriteWarningEmitted = false;
+        return structuredClone(this.config);
+      }
+      // Preserve the unreadable file instead of letting the next `update()` overwrite it.
+      const backupPath = await this.quarantineUnreadableFile(this.filePath);
+      this.readError = compactError(error);
+      this.recoveredFromCorruption = true;
+      this.corruptBackupPath = backupPath;
+      this.overwriteWarningEmitted = false;
+      this.warn(
+        backupPath !== null
+          ? `could not read pricing config at ${this.filePath}, moved it to ${backupPath} and using built-in defaults`
+          : `could not read pricing config at ${this.filePath} and could not quarantine it; using built-in defaults without touching the existing file`,
+        error,
+      );
     }
     return structuredClone(this.config);
   }
@@ -739,15 +793,40 @@ export class PricingStore {
       this.catalog = syncedPricingCatalogSchema.parse(rawJson);
     } catch (error) {
       const code = (error as { code?: string } | null)?.code;
-      if (code !== "ENOENT") {
-        this.warn(
-          `could not read synced pricing catalog at ${this.catalogPath}, falling back to built-in reference`,
-          error,
-        );
+      if (code === "ENOENT") {
+        this.catalog = null;
+        return this.catalog;
       }
+      // The synced catalog is a re-fetchable cache, but keep the bad copy around
+      // for diagnostics instead of leaving it for the next sync to overwrite.
+      const backupPath = await this.quarantineUnreadableFile(this.catalogPath);
       this.catalog = null;
+      this.warn(
+        backupPath !== null
+          ? `could not read synced pricing catalog at ${this.catalogPath}, moved it to ${backupPath} and falling back to built-in reference`
+          : `could not read synced pricing catalog at ${this.catalogPath} and could not quarantine it; falling back to built-in reference without touching the existing file`,
+        error,
+      );
     }
     return this.catalog;
+  }
+
+  /**
+   * Moves an unreadable (corrupt/schema-invalid/unreadable) file aside as
+   * `<path>.corrupt-<timestamp>` in the same directory so its contents remain
+   * recoverable and a later write cannot silently discard them. Returns the
+   * backup path, or `null` when the file could not be moved.
+   */
+  private async quarantineUnreadableFile(targetPath: string): Promise<string | null> {
+    const stamp = new Date(this.now()).toISOString().replace(/[:.]/gu, "-");
+    const backupPath = `${targetPath}.corrupt-${stamp}`;
+    try {
+      await rename(targetPath, backupPath);
+      return backupPath;
+    } catch (error) {
+      this.warn(`could not move unreadable pricing file at ${targetPath} aside`, error);
+      return null;
+    }
   }
 
   private persistCatalog(catalog: SyncedPricingCatalog): Promise<void> {

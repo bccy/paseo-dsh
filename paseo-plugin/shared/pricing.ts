@@ -2079,6 +2079,22 @@ export const pricingStateSchema = z.object({
   models: z.array(pricingModelRowSchema),
   overrides: z.record(z.string(), modelRatesSchema),
   hasCustomOverrides: z.boolean(),
+  /**
+   * Summary of the persisted-config read failure that forced built-in defaults
+   * in this session, or null when the config loaded cleanly (or was simply absent).
+   */
+  readError: z.string().nullable(),
+  /**
+   * True when the persisted config file was unreadable (corrupt JSON,
+   * schema-invalid, or I/O failure) and built-in defaults were applied. Stays
+   * true after a successful rewrite so `corruptBackupPath` remains discoverable.
+   */
+  recoveredFromCorruption: z.boolean(),
+  /**
+   * Absolute path of the `.corrupt-<timestamp>` backup kept when the persisted
+   * config could not be read, or null when no backup was made.
+   */
+  corruptBackupPath: z.string().nullable(),
 });
 
 export type PricingState = z.infer<typeof pricingStateSchema>;

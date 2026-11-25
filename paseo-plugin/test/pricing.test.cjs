@@ -540,6 +540,7 @@ test("PricingStore recovers safely with defaults when disk file is corrupt or sc
   const warnings1 = [];
   const store1 = new PricingStore({
     pricingPath: corruptPath,
+    catalogPath: path.join(tmp, "catalog-1.json"),
     onWarning: (msg, err) => warnings1.push({ msg, err }),
   });
   assert.deepEqual(await store1.load(), defaultPricingConfig());
@@ -560,11 +561,160 @@ test("PricingStore recovers safely with defaults when disk file is corrupt or sc
   const warnings2 = [];
   const store2 = new PricingStore({
     pricingPath: badSchemaPath,
+    catalogPath: path.join(tmp, "catalog-2.json"),
     onWarning: (msg, err) => warnings2.push({ msg, err }),
   });
   assert.deepEqual(await store2.load(), defaultPricingConfig());
   assert.equal(warnings2.length, 1);
 });
+
+test("PricingStore quarantines unreadable files, exposes recovery state, and never loses the corrupt original", async (t) => {
+  const tmp = makeTempDir(t);
+  const pricingPath = path.join(tmp, "pricing.json");
+  const catalogPath = path.join(tmp, "pricing-catalog.json");
+  const corruptConfigText =
+    '{"version":1,"displayCurrency":"CNY","usdToCnyRate":7.15,"overrides":{"custom-model":{"currency":"USD","input":1,"cached":0,"output":2}},';
+  const corruptCatalogText =
+    '{"version":1,"source":"models.dev","syncedAt":"2026-11-26T00:00:00.000Z","models":{';
+  fs.writeFileSync(pricingPath, corruptConfigText, "utf8");
+  fs.writeFileSync(catalogPath, corruptCatalogText, "utf8");
+
+  const warnings = [];
+  const store = new PricingStore({
+    pricingPath,
+    catalogPath,
+    onWarning: (msg, err) => warnings.push({ msg, err }),
+  });
+  t.after(() => store.dispose());
+
+  // Unreadable config falls back to defaults, and BOTH unreadable files are quarantined.
+  assert.deepEqual(await store.load(), defaultPricingConfig());
+  assert.equal(fs.existsSync(pricingPath), false, "corrupt config must be moved aside");
+  assert.equal(fs.existsSync(catalogPath), false, "corrupt catalog must be moved aside");
+  const backupNames = fs.readdirSync(tmp).filter((name) => name.includes(".corrupt-"));
+  assert.equal(backupNames.length, 2, `expected 2 quarantined files, saw ${backupNames.join(", ")}`);
+  const configBackupName = backupNames.find((name) => name.startsWith("pricing.json.corrupt-"));
+  const catalogBackupName = backupNames.find((name) =>
+    name.startsWith("pricing-catalog.json.corrupt-"),
+  );
+  assert.ok(configBackupName, "config backup must keep the original filename + .corrupt-<timestamp>");
+  assert.ok(
+    catalogBackupName,
+    "catalog backup must keep the original filename + .corrupt-<timestamp>",
+  );
+  const configBackupPath = path.join(tmp, configBackupName);
+  assert.equal(fs.readFileSync(configBackupPath, "utf8"), corruptConfigText);
+  assert.equal(fs.readFileSync(path.join(tmp, catalogBackupName), "utf8"), corruptCatalogText);
+  assert.equal(warnings.length, 2, "both unreadable files must warn");
+  assert.deepEqual(store.snapshot(), defaultPricingConfig());
+
+  // State surfaces the read failure + recovery info for the UI.
+  const state = await store.state();
+  assert.doesNotThrow(() => pricingStateSchema.parse(state));
+  assert.equal(typeof state.readError, "string");
+  assert.ok(state.readError.length > 0);
+  assert.equal(state.recoveredFromCorruption, true);
+  assert.equal(state.corruptBackupPath, configBackupPath);
+
+  // First subsequent update is loud (pre-overwrite warning) and preserves the quarantined original.
+  const warningsBeforeUpdate = warnings.length;
+  const updated = await store.update({ displayCurrency: "CNY", usdToCnyRate: 7.4 });
+  assert.equal(updated.displayCurrency, "CNY");
+  assert.equal(updated.usdToCnyRate, 7.4);
+  assert.equal(warnings.length, warningsBeforeUpdate + 1, "first overwrite after recovery must warn");
+  assert.match(warnings[warnings.length - 1].msg, /preserved/i);
+  const rewritten = JSON.parse(fs.readFileSync(pricingPath, "utf8"));
+  assert.equal(rewritten.displayCurrency, "CNY");
+  assert.equal(rewritten.usdToCnyRate, 7.4);
+  assert.equal(
+    fs.readFileSync(configBackupPath, "utf8"),
+    corruptConfigText,
+    "quarantined original must stay byte-identical",
+  );
+
+  // The overwrite warning is emitted once, and recovery facts stay discoverable.
+  const warningsAfterFirstUpdate = warnings.length;
+  await store.update({ autoSync: false });
+  assert.equal(warnings.length, warningsAfterFirstUpdate, "overwrite warning must not repeat");
+  const stateAfterUpdate = await store.state();
+  assert.equal(stateAfterUpdate.recoveredFromCorruption, true);
+  assert.equal(stateAfterUpdate.corruptBackupPath, configBackupPath);
+});
+
+test("PricingStore treats missing files as a clean first run (no quarantine, no recovery flags)", async (t) => {
+  const tmp = makeTempDir(t);
+  const pricingPath = path.join(tmp, "pricing.json");
+  const catalogPath = path.join(tmp, "pricing-catalog.json");
+  const warnings = [];
+  const store = new PricingStore({
+    pricingPath,
+    catalogPath,
+    onWarning: (msg, err) => warnings.push({ msg, err }),
+  });
+  t.after(() => store.dispose());
+
+  assert.deepEqual(await store.load(), defaultPricingConfig());
+  const state = await store.state();
+  assert.equal(state.readError, null);
+  assert.equal(state.recoveredFromCorruption, false);
+  assert.equal(state.corruptBackupPath, null);
+  assert.equal(warnings.length, 0, "missing files are a normal first run and must not warn");
+  assert.deepEqual(fs.readdirSync(tmp), [], "missing files must not create backups or files");
+
+  // A normal first save reads back cleanly on a fresh instance with no recovery state.
+  await store.update({ displayCurrency: "CNY" });
+  assert.deepEqual(fs.readdirSync(tmp), ["pricing.json"]);
+  const reloaded = new PricingStore({ pricingPath, catalogPath });
+  t.after(() => reloaded.dispose());
+  const reloadedState = await reloaded.state();
+  assert.equal(reloadedState.displayCurrency, "CNY");
+  assert.equal(reloadedState.readError, null);
+  assert.equal(reloadedState.recoveredFromCorruption, false);
+  assert.equal(reloadedState.corruptBackupPath, null);
+});
+
+test("PricingStore refuses to overwrite a corrupt config it could not quarantine", async (t) => {
+  const tmp = makeTempDir(t);
+  const lockedDir = path.join(tmp, "locked");
+  fs.mkdirSync(lockedDir);
+  const pricingPath = path.join(lockedDir, "pricing.json");
+  const corruptText = '{"version":1,"displayCurrency":"CNY",';
+  fs.writeFileSync(pricingPath, corruptText, "utf8");
+
+  const store = new PricingStore({
+    pricingPath,
+    catalogPath: path.join(tmp, "pricing-catalog.json"),
+    onWarning: () => {},
+  });
+  t.after(() => store.dispose());
+
+  if (typeof process.getuid === "function" && process.getuid() === 0) {
+    t.skip("running as root: directory permissions cannot force a rename failure");
+    return;
+  }
+
+  fs.chmodSync(lockedDir, 0o500);
+  try {
+    assert.deepEqual(await store.load(), defaultPricingConfig());
+    const state = await store.state();
+    assert.equal(state.recoveredFromCorruption, true);
+    assert.equal(state.corruptBackupPath, null, "no backup path when the file could not be moved");
+
+    await assert.rejects(
+      () => store.update({ displayCurrency: "CNY" }),
+      /Refusing to overwrite pricing config/,
+    );
+    // The only copy of the original file is left untouched (not deleted, not overwritten).
+    assert.equal(fs.readFileSync(pricingPath, "utf8"), corruptText);
+    assert.equal(
+      fs.readdirSync(lockedDir).filter((name) => name.includes(".corrupt-")).length,
+      0,
+    );
+  } finally {
+    fs.chmodSync(lockedDir, 0o700);
+  }
+});
+
 
 // ---- RPC handlers (`dsh.pricing.get` / `dsh.pricing.update`) -------------------------------
 
