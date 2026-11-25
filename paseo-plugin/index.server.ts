@@ -125,6 +125,8 @@ export default function contribute(server: PluginServerContext) {
   const usageEngine = new UsageStatsEngine({ pricer: pricingStore });
   const disposePricing = registerPricingRpc(server, pricingStore, {
     getSeenModels: () => usageEngine.seenPricingModels({ waitMs: 0 }),
+    startAutoSync: true,
+    autoSyncDelayMs: 4_000,
     onContext: capture,
   });
   const disposeUsageStats = registerUsageStatsRpc(server, usageEngine, {

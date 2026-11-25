@@ -3,8 +3,9 @@
  * (used by both Tab 1 Usage and Tab 3 Settings).
  *
  * Loads live `PricingState` via `dsh.pricing.get`, updates display currency,
- * `USD -> CNY` exchange rate, and per-model overrides via `dsh.pricing.update`,
- * and auto-expands/promotes `focusModel` (even when unpriced/unmatched).
+ * `USD -> CNY` exchange rate, auto-sync preference, and per-model overrides via
+ * `dsh.pricing.update`, syncs official API prices via `dsh.pricing.sync`, and
+ * auto-expands/promotes `focusModel` (even when unpriced/unmatched).
  *
  * Pure React Native + Paseo UI primitives (with graceful guards for Paseo
  * `>= 0.16.0`), zero browser-only APIs, Hermes-safe, and fully bilingual
@@ -34,6 +35,7 @@ import {
   type ScrollView as NativeScrollView,
 } from "react-native";
 import {
+  DEFAULT_PRICING_SYNC_SOURCE,
   DEFAULT_USD_TO_CNY_RATE,
   MAX_LONG_CONTEXT_THRESHOLD,
   MAX_RATE_PER_MILLION,
@@ -45,15 +47,17 @@ import {
   modelRatesSchema,
   normalizeModelKey,
   pricingGetRpc,
+  pricingSyncRpc,
   pricingUpdateRpc,
   resolvePricingKey,
+  stripProviderPrefix,
   type Currency,
   type ModelRates,
   type PricingModelRow,
   type PricingState,
   type PricingUpdateInput,
 } from "../shared/pricing";
-import { currencySymbol, money, tokens } from "./console-format";
+import { currencySymbol, integer, money, relative, tokens } from "./console-format";
 import { font, mono, radius, space, tabular, tint, type Colors } from "./console-theme";
 import { Badge, Button, Callout, Card, Divider, Muted, SegmentedControl } from "./console-ui";
 import { useCurrentLocale } from "./use-locale";
@@ -64,6 +68,8 @@ export const MODAL_TRANSITION_MS = 180;
 const DEFAULT_LONG_CONTEXT_THRESHOLD = 200_000;
 const MAX_MODEL_KEY_LENGTH = 160;
 const NARROW_WIDTH_PX = 480;
+const INITIAL_VISIBLE_ROWS = 50;
+const BACKGROUND_SYNC_POLL_MS = 1_500;
 
 export interface PricingDialogProps {
   visible: boolean;
@@ -76,7 +82,7 @@ export interface PricingDialogProps {
   onUpdated?: (state: PricingState) => void;
 }
 
-type StatusFilter = "all" | "active" | "unpriced";
+type StatusFilter = "all" | "active" | "synced" | "unpriced";
 
 interface CopyTable {
   title: string;
@@ -88,6 +94,22 @@ interface CopyTable {
   close: string;
   cancel: string;
   save: string;
+  syncTitle: string;
+  syncAction: string;
+  syncingAction: string;
+  syncAutoLabel: string;
+  syncAutoHint: string;
+  syncBadgeSynced: string;
+  syncBadgeSyncing: string;
+  syncBadgeNever: string;
+  syncBadgeCachedError: string;
+  syncBadgeError: string;
+  syncSummarySynced: (source: string, count: string, when: string) => string;
+  syncSummaryNever: (source: string) => string;
+  syncErrorFallbackNote: (error: string) => string;
+  syncSuccessToast: (count: string) => string;
+  syncFailedToast: (error: string) => string;
+  autoSyncSavedToast: (enabled: boolean) => string;
   displayCurrency: string;
   displayCurrencyHint: string;
   exchangeRate: string;
@@ -100,15 +122,18 @@ interface CopyTable {
   exchangeRateSaved: string;
   currencySaved: (currency: Currency) => string;
   modelsHeading: string;
-  modelsCount: (total: number, customCount: number) => string;
+  modelsCount: (total: number, syncedCount: number, customCount: number) => string;
   searchPlaceholder: string;
   clearSearch: string;
   filterAll: string;
   filterActive: string;
+  filterSynced: string;
   filterUnpriced: string;
+  showAllModels: (total: number) => string;
   emptyMatches: string;
   badgeFocused: string;
   badgeCustom: string;
+  badgeSynced: string;
   badgeReference: string;
   badgeUnpriced: string;
   badgeSeen: string;
@@ -127,9 +152,11 @@ interface CopyTable {
   longCachedLabel: string;
   longCacheWriteLabel: string;
   longOutputLabel: string;
+  syncedSummary: (provider: string | null, summary: string) => string;
   referenceSummary: (summary: string) => string;
   convertedPreview: (summary: string, rate: number) => string;
   prefixesLabel: (prefixes: string) => string;
+  resetToSynced: string;
   resetToReference: string;
   removeCustom: string;
   addModel: string;
@@ -164,6 +191,25 @@ const COPY: Record<"en" | "zh-CN", CopyTable> = {
     close: "Close",
     cancel: "Cancel",
     save: "Save",
+    syncTitle: "Official API Pricing Sync",
+    syncAction: "Sync Official Prices",
+    syncingAction: "Syncing…",
+    syncAutoLabel: "Auto-sync",
+    syncAutoHint: "Refresh every 24h in background",
+    syncBadgeSynced: "Synced",
+    syncBadgeSyncing: "Syncing…",
+    syncBadgeNever: "Not synced",
+    syncBadgeCachedError: "Cached · sync error",
+    syncBadgeError: "Sync failed",
+    syncSummarySynced: (source, count, when) =>
+      `Source: ${source} · ${count} official models · Updated ${when}`,
+    syncSummaryNever: (source) =>
+      `Source: ${source} · Never synced — using built-in reference rates`,
+    syncErrorFallbackNote: (error) => `Last sync failed (${error}). Cached & built-in rates remain active.`,
+    syncSuccessToast: (count) => `Synced official prices for ${count} models.`,
+    syncFailedToast: (error) => `Official pricing sync failed: ${error}`,
+    autoSyncSavedToast: (enabled) =>
+      enabled ? "Automatic official price sync enabled." : "Automatic official price sync disabled.",
     displayCurrency: "Display currency",
     displayCurrencyHint: "Usage charts, totals, and tables convert costs into this currency.",
     exchangeRate: "USD → CNY rate",
@@ -176,17 +222,24 @@ const COPY: Record<"en" | "zh-CN", CopyTable> = {
     exchangeRateSaved: "Exchange rate saved.",
     currencySaved: (currency) => `Display currency switched to ${currency}.`,
     modelsHeading: "Model rates (per 1M tokens)",
-    modelsCount: (total, customCount) =>
-      customCount > 0 ? `${total} entries · ${customCount} custom` : `${total} entries`,
-    searchPlaceholder: "Filter by model ID or family…",
+    modelsCount: (total, syncedCount, customCount) => {
+      const parts = [`${total} entries`];
+      if (syncedCount > 0) parts.push(`${syncedCount} synced`);
+      if (customCount > 0) parts.push(`${customCount} custom`);
+      return parts.join(" · ");
+    },
+    searchPlaceholder: "Filter by model ID, provider, or family…",
     clearSearch: "Clear filter",
     filterAll: "All",
     filterActive: "Used & custom",
+    filterSynced: "Synced",
     filterUnpriced: "Unpriced",
+    showAllModels: (total) => `Show all ${total} models`,
     emptyMatches: "No matching model entries.",
     badgeFocused: "Selected",
     badgeCustom: "Custom",
-    badgeReference: "Reference",
+    badgeSynced: "Synced",
+    badgeReference: "Built-in",
     badgeUnpriced: "Unpriced",
     badgeSeen: "Used",
     perMillionShort: "/ 1M",
@@ -204,10 +257,13 @@ const COPY: Record<"en" | "zh-CN", CopyTable> = {
     longCachedLabel: "Long cached",
     longCacheWriteLabel: "Long cache write (opt.)",
     longOutputLabel: "Long output",
-    referenceSummary: (summary) => `Reference: ${summary}`,
+    syncedSummary: (provider, summary) =>
+      provider ? `Official (${provider}): ${summary}` : `Official synced: ${summary}`,
+    referenceSummary: (summary) => `Built-in reference: ${summary}`,
     convertedPreview: (summary, rate) => `Display equivalent (1 USD = ¥${rate}): ${summary}`,
     prefixesLabel: (prefixes) => `Matches: ${prefixes}`,
-    resetToReference: "Reset to reference",
+    resetToSynced: "Reset to synced",
+    resetToReference: "Reset to built-in",
     removeCustom: "Remove override",
     addModel: "Add custom model",
     addModelTitle: "Add custom model rates",
@@ -239,6 +295,24 @@ const COPY: Record<"en" | "zh-CN", CopyTable> = {
     close: "关闭",
     cancel: "取消",
     save: "保存",
+    syncTitle: "官方 API 价格同步",
+    syncAction: "同步官方价格",
+    syncingAction: "正在同步…",
+    syncAutoLabel: "自动同步",
+    syncAutoHint: "每 24 小时后台自动刷新",
+    syncBadgeSynced: "已同步",
+    syncBadgeSyncing: "同步中…",
+    syncBadgeNever: "未同步",
+    syncBadgeCachedError: "使用缓存 · 同步失败",
+    syncBadgeError: "同步失败",
+    syncSummarySynced: (source, count, when) =>
+      `来源：${source} · 已同步 ${count} 个官方模型 · 上次同步：${when}`,
+    syncSummaryNever: (source) => `来源：${source} · 尚未同步，当前使用内置参考价`,
+    syncErrorFallbackNote: (error) => `上次同步失败（${error}），已回退到缓存与内置参考价。`,
+    syncSuccessToast: (count) => `已同步 ${count} 个官方模型价格。`,
+    syncFailedToast: (error) => `同步官方价格失败：${error}`,
+    autoSyncSavedToast: (enabled) =>
+      enabled ? "已开启官方价格自动同步。" : "已关闭官方价格自动同步。",
     displayCurrency: "显示币种",
     displayCurrencyHint: "用量图表、汇总卡片与模型表均折算为此币种展示。",
     exchangeRate: "USD → CNY 汇率",
@@ -251,17 +325,24 @@ const COPY: Record<"en" | "zh-CN", CopyTable> = {
     exchangeRateSaved: "汇率已保存。",
     currencySaved: (currency) => `已切换显示币种为 ${currency}。`,
     modelsHeading: "模型单价（每 1M token）",
-    modelsCount: (total, customCount) =>
-      customCount > 0 ? `共 ${total} 项 · ${customCount} 项自定义` : `共 ${total} 项`,
-    searchPlaceholder: "搜索模型 ID 或模型族…",
+    modelsCount: (total, syncedCount, customCount) => {
+      const parts = [`共 ${total} 项`];
+      if (syncedCount > 0) parts.push(`${syncedCount} 项官方同步`);
+      if (customCount > 0) parts.push(`${customCount} 项自定义`);
+      return parts.join(" · ");
+    },
+    searchPlaceholder: "搜索模型 ID、官方提供方或模型族…",
     clearSearch: "清空筛选",
     filterAll: "全部",
     filterActive: "已用 / 自定义",
+    filterSynced: "官方同步",
     filterUnpriced: "未定价",
+    showAllModels: (total) => `展开全部 ${total} 个模型`,
     emptyMatches: "没有匹配的模型条目。",
     badgeFocused: "当前选中",
     badgeCustom: "自定义",
-    badgeReference: "参考价",
+    badgeSynced: "官方同步",
+    badgeReference: "内置参考",
     badgeUnpriced: "未定价",
     badgeSeen: "已使用",
     perMillionShort: "/ 1M",
@@ -279,10 +360,13 @@ const COPY: Record<"en" | "zh-CN", CopyTable> = {
     longCachedLabel: "长上下文缓存读",
     longCacheWriteLabel: "长上下文缓存写（可选）",
     longOutputLabel: "长上下文输出",
+    syncedSummary: (provider, summary) =>
+      provider ? `官方同步价（${provider}）：${summary}` : `官方同步价：${summary}`,
     referenceSummary: (summary) => `内置参考价：${summary}`,
     convertedPreview: (summary, rate) => `按 1 USD = ¥${rate} 折算：${summary}`,
     prefixesLabel: (prefixes) => `匹配前缀：${prefixes}`,
-    resetToReference: "恢复参考价",
+    resetToSynced: "恢复官方价",
+    resetToReference: "恢复内置价",
     removeCustom: "删除自定义价",
     addModel: "添加自定义模型",
     addModelTitle: "新增模型单价",
@@ -562,6 +646,12 @@ function resolveFocusTarget(
   const exactMatch = state.models.find((row) => normalizeModelKey(row.key) === normalized);
   if (exactMatch) return { key: exactMatch.key, syntheticRow: null };
 
+  const bare = stripProviderPrefix(normalized);
+  if (bare && bare !== normalized) {
+    const bareMatch = state.models.find((row) => normalizeModelKey(row.key) === bare);
+    if (bareMatch) return { key: bareMatch.key, syntheticRow: null };
+  }
+
   const resolvedKey = resolvePricingKey(raw, undefined, state.overrides);
   const resolvedMatch = state.models.find((row) => normalizeModelKey(row.key) === resolvedKey);
   if (resolvedMatch) return { key: resolvedMatch.key, syntheticRow: null };
@@ -578,8 +668,11 @@ function resolveFocusTarget(
     family: matchedRef?.family ?? null,
     prefixes: [],
     reference: matchedRef ? { ...matchedRef.rates } : null,
+    synced: null,
+    syncedProvider: null,
     custom: null,
     effective: matchedRef ? { ...matchedRef.rates } : null,
+    source: matchedRef ? "reference" : null,
     note: matchedRef?.note ?? null,
     seenLocally: true,
   };
@@ -591,6 +684,7 @@ function matchesSearch(row: PricingModelRow, query: string): boolean {
   if (row.key.toLowerCase().includes(query)) return true;
   if (row.label.toLowerCase().includes(query)) return true;
   if (row.family && row.family.toLowerCase().includes(query)) return true;
+  if (row.syncedProvider && row.syncedProvider.toLowerCase().includes(query)) return true;
   return row.prefixes.some((prefix) => prefix.toLowerCase().includes(query));
 }
 
@@ -955,11 +1049,14 @@ function PricingModelRowCard({
   }, [effectiveFingerprint, displayCurrency, row.key]);
 
   const disabled = busy || globalBusy;
-  const sourceBadge = row.custom
-    ? { label: copy.badgeCustom, tone: "accent" as const }
-    : row.reference
-      ? { label: copy.badgeReference, tone: "neutral" as const }
-      : { label: copy.badgeUnpriced, tone: "warning" as const };
+  const sourceBadge =
+    row.source === "override" || row.custom
+      ? { label: copy.badgeCustom, tone: "accent" as const }
+      : row.source === "synced" || row.synced
+        ? { label: copy.badgeSynced, tone: "success" as const }
+        : row.source === "reference" || row.reference
+          ? { label: copy.badgeReference, tone: "neutral" as const }
+          : { label: copy.badgeUnpriced, tone: "warning" as const };
 
   const summaryText = row.effective
     ? `${formatRatesSummary(row.effective)} ${copy.perMillionShort}`
@@ -1107,18 +1204,33 @@ function PricingModelRowCard({
             borderTopColor: colors.border,
           }}
         >
-          {row.reference ? (
+          {row.synced || row.reference ? (
             <View style={{ gap: 2 }}>
-              <Muted colors={colors} small>
-                {copy.referenceSummary(
-                  `${formatRatesSummary(row.reference)} ${copy.perMillionShort}${
-                    row.reference.cacheWrite !== undefined
-                      ? ` · CW ${currencySymbol(row.reference.currency)}${fmtCompactNumber(row.reference.cacheWrite)}`
-                      : ""
-                  }`,
-                )}
-                {row.note ? ` · ${row.note}` : ""}
-              </Muted>
+              {row.synced ? (
+                <Muted colors={colors} small>
+                  {copy.syncedSummary(
+                    row.syncedProvider,
+                    `${formatRatesSummary(row.synced)} ${copy.perMillionShort}${
+                      row.synced.cacheWrite !== undefined
+                        ? ` · CW ${currencySymbol(row.synced.currency)}${fmtCompactNumber(row.synced.cacheWrite)}`
+                        : ""
+                    }`,
+                  )}
+                  {row.note ? ` · ${row.note}` : ""}
+                </Muted>
+              ) : null}
+              {row.reference ? (
+                <Muted colors={colors} small>
+                  {copy.referenceSummary(
+                    `${formatRatesSummary(row.reference)} ${copy.perMillionShort}${
+                      row.reference.cacheWrite !== undefined
+                        ? ` · CW ${currencySymbol(row.reference.currency)}${fmtCompactNumber(row.reference.cacheWrite)}`
+                        : ""
+                    }`,
+                  )}
+                  {!row.synced && row.note ? ` · ${row.note}` : ""}
+                </Muted>
+              ) : null}
               {row.prefixes.length > 0 ? (
                 <Text
                   numberOfLines={2}
@@ -1137,7 +1249,11 @@ function PricingModelRowCard({
             draft={draft}
             displayCurrency={displayCurrency}
             usdToCnyRate={usdToCnyRate}
-            defaultLongThreshold={row.reference?.longContextThreshold ?? DEFAULT_LONG_CONTEXT_THRESHOLD}
+            defaultLongThreshold={
+              row.synced?.longContextThreshold ??
+              row.reference?.longContextThreshold ??
+              DEFAULT_LONG_CONTEXT_THRESHOLD
+            }
             disabled={disabled}
             narrow={narrow}
             onChange={(next) => {
@@ -1163,7 +1279,13 @@ function PricingModelRowCard({
                 size="sm"
                 variant="ghost"
                 icon="RotateCcw"
-                label={row.reference ? copy.resetToReference : copy.removeCustom}
+                label={
+                  row.synced
+                    ? copy.resetToSynced
+                    : row.reference
+                      ? copy.resetToReference
+                      : copy.removeCustom
+                }
                 disabled={disabled}
                 onPress={() => void handleReset()}
               />
@@ -1225,6 +1347,7 @@ export function PricingDialog({
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState("");
   const [mutating, setMutating] = useState(false);
+  const [syncBusy, setSyncBusy] = useState(false);
 
   const [rateInput, setRateInput] = useState(String(DEFAULT_USD_TO_CNY_RATE));
   const [rateError, setRateError] = useState("");
@@ -1233,6 +1356,7 @@ export function PricingDialog({
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [showAllRows, setShowAllRows] = useState(false);
 
   const [adding, setAdding] = useState(false);
   const [newKey, setNewKey] = useState("");
@@ -1269,6 +1393,7 @@ export function PricingDialog({
         appliedFocusTokenRef.current = null;
         setSearchQuery("");
         setStatusFilter("all");
+        setShowAllRows(false);
         setAdding(false);
         setAddError("");
         setConfirmResetAll(false);
@@ -1324,6 +1449,17 @@ export function PricingDialog({
     }
     void loadState();
   }, [visible, loadState]);
+
+  // If a background auto-sync was in progress when the dialog loaded, refresh once shortly after.
+  useEffect(() => {
+    if (!visible || !state?.sync.syncing || syncBusy) return;
+    const timer = setTimeout(() => {
+      if (mountedRef.current && !mutationInFlightRef.current) {
+        void loadState();
+      }
+    }, BACKGROUND_SYNC_POLL_MS);
+    return () => clearTimeout(timer);
+  }, [visible, state?.sync.syncing, syncBusy, loadState]);
 
   const applyUpdate = useCallback(
     async (payload: PricingUpdateInput): Promise<PricingState> => {
@@ -1391,8 +1527,16 @@ export function PricingDialog({
     () => (state ? Object.keys(state.overrides).length : 0),
     [state],
   );
+  const syncedCount = useMemo(
+    () => allRows.filter((row) => row.synced !== null).length,
+    [allRows],
+  );
   const hasActiveRows = useMemo(
     () => allRows.some((row) => row.seenLocally || row.custom !== null),
+    [allRows],
+  );
+  const hasSyncedRows = useMemo(
+    () => allRows.some((row) => row.source === "synced" || row.synced !== null),
     [allRows],
   );
   const hasUnpricedRows = useMemo(
@@ -1410,9 +1554,18 @@ export function PricingDialog({
       { value: "all", label: copy.filterAll },
     ];
     if (hasActiveRows) opts.push({ value: "active", label: copy.filterActive });
+    if (hasSyncedRows) opts.push({ value: "synced", label: copy.filterSynced });
     if (hasUnpricedRows) opts.push({ value: "unpriced", label: copy.filterUnpriced });
     return opts;
-  }, [copy.filterActive, copy.filterAll, copy.filterUnpriced, hasActiveRows, hasUnpricedRows]);
+  }, [
+    copy.filterActive,
+    copy.filterAll,
+    copy.filterSynced,
+    copy.filterUnpriced,
+    hasActiveRows,
+    hasSyncedRows,
+    hasUnpricedRows,
+  ]);
 
   const effectiveFilter: StatusFilter = filterOptions.some((opt) => opt.value === statusFilter)
     ? statusFilter
@@ -1422,10 +1575,58 @@ export function PricingDialog({
     const normalizedQuery = searchQuery.trim().toLowerCase();
     return allRows.filter((row) => {
       if (effectiveFilter === "active" && !row.seenLocally && row.custom === null) return false;
+      if (effectiveFilter === "synced" && row.synced === null) return false;
       if (effectiveFilter === "unpriced" && row.effective !== null) return false;
       return matchesSearch(row, normalizedQuery);
     });
   }, [allRows, effectiveFilter, searchQuery]);
+
+  const trimmedSearch = searchQuery.trim();
+  const canCollapseList =
+    trimmedSearch.length === 0 && !showAllRows && visibleRows.length > INITIAL_VISIBLE_ROWS;
+  const renderedRows = canCollapseList ? visibleRows.slice(0, INITIAL_VISIBLE_ROWS) : visibleRows;
+
+  const handleSyncNow = async () => {
+    if (!state || mutating || syncBusy || mutationInFlightRef.current) return;
+    mutationInFlightRef.current = true;
+    setMutating(true);
+    setSyncBusy(true);
+    try {
+      const next = await client.rpc(pricingSyncRpc, { force: true });
+      if (mountedRef.current) {
+        setState(next);
+        setRateInput(String(next.usdToCnyRate));
+        setRateError("");
+      }
+      onUpdated?.(next);
+      if (next.sync.lastError) {
+        toast.error(copy.syncFailedToast(next.sync.lastError));
+      } else {
+        toast.show(copy.syncSuccessToast(integer(next.sync.modelCount, locale)), {
+          variant: "success",
+        });
+      }
+    } catch (reason) {
+      toast.error(copy.syncFailedToast(errorMessage(reason, copy.saveFailed)));
+    } finally {
+      mutationInFlightRef.current = false;
+      if (mountedRef.current) {
+        setSyncBusy(false);
+        setMutating(false);
+      }
+    }
+  };
+
+  const handleToggleAutoSync = async () => {
+    if (!state || mutating || syncBusy) return;
+    const nextEnabled = !state.autoSync;
+    try {
+      await applyUpdate({ autoSync: nextEnabled });
+      toast.show(copy.autoSyncSavedToast(nextEnabled), { variant: "success" });
+    } catch (reason) {
+      toast.error(errorMessage(reason, copy.saveFailed));
+    }
+  };
 
   const handleCurrencyChange = async (nextCurrency: Currency) => {
     if (!state || nextCurrency === state.displayCurrency || mutating) return;
@@ -1515,6 +1716,29 @@ export function PricingDialog({
 
   const usdOnePreview = money(previewRate, "CNY", locale);
   const cnyTenPreview = money(10 / previewRate, "USD", locale);
+  const syncStatus = state?.sync ?? null;
+  const syncActive = syncBusy || Boolean(syncStatus?.syncing);
+  const syncBadge = syncActive
+    ? { label: copy.syncBadgeSyncing, tone: "accent" as const, dot: true }
+    : syncStatus?.lastError
+      ? syncStatus.syncedAt
+        ? { label: copy.syncBadgeCachedError, tone: "warning" as const, dot: true }
+        : { label: copy.syncBadgeError, tone: "danger" as const, dot: true }
+      : syncStatus?.syncedAt && syncStatus.modelCount > 0
+        ? { label: copy.syncBadgeSynced, tone: "success" as const, dot: true }
+        : { label: copy.syncBadgeNever, tone: "neutral" as const, dot: false };
+  const syncRelativeTime = syncStatus?.syncedAt
+    ? relative(syncStatus.syncedAt, Date.now(), locale) || syncStatus.syncedAt
+    : "";
+  const syncCaption = syncStatus
+    ? syncStatus.syncedAt && syncStatus.modelCount > 0
+      ? copy.syncSummarySynced(
+          syncStatus.source,
+          integer(syncStatus.modelCount, locale),
+          syncRelativeTime,
+        )
+      : copy.syncSummaryNever(syncStatus.source)
+    : copy.syncSummaryNever(DEFAULT_PRICING_SYNC_SOURCE);
 
   const body = (
     <View
@@ -1525,6 +1749,112 @@ export function PricingDialog({
       style={{ gap: space.lg }}
     >
       <Muted colors={colors}>{copy.subtitle}</Muted>
+
+      {/* Official API Pricing Sync strip (models.dev) */}
+      <Card colors={colors} style={{ padding: space.md, gap: space.sm + 2 }}>
+        <View
+          style={{
+            flexDirection: narrow ? "column" : "row",
+            alignItems: narrow ? "flex-start" : "center",
+            justifyContent: "space-between",
+            gap: space.sm,
+          }}
+        >
+          <View style={{ flex: 1, minWidth: 0, gap: 4 }}>
+            <View
+              style={{
+                flexDirection: "row",
+                alignItems: "center",
+                flexWrap: "wrap",
+                gap: space.xs + 2,
+              }}
+            >
+              <Text style={{ ...font.small, fontWeight: "600", color: colors.foreground }}>
+                {copy.syncTitle}
+              </Text>
+              <Badge
+                colors={colors}
+                tone={syncBadge.tone}
+                dot={syncBadge.dot}
+                label={syncBadge.label}
+              />
+            </View>
+            <Muted colors={colors} small>
+              {syncCaption}
+            </Muted>
+          </View>
+
+          <Button
+            colors={colors}
+            size="sm"
+            variant="secondary"
+            icon="RefreshCw"
+            label={syncActive ? copy.syncingAction : copy.syncAction}
+            loading={syncActive}
+            disabled={!state || mutating || syncActive}
+            onPress={() => void handleSyncNow()}
+          />
+        </View>
+
+        {syncStatus?.lastError ? (
+          <Callout
+            colors={colors}
+            tone={syncStatus.syncedAt ? "warning" : "danger"}
+            icon="CircleAlert"
+            title={copy.syncErrorFallbackNote(syncStatus.lastError)}
+          />
+        ) : null}
+
+        <Divider colors={colors} />
+
+        <Pressable
+          accessibilityRole="switch"
+          accessibilityState={{
+            checked: Boolean(state?.autoSync ?? true),
+            disabled: !state || mutating || syncActive,
+          }}
+          accessibilityLabel={copy.syncAutoLabel}
+          disabled={!state || mutating || syncActive}
+          onPress={() => void handleToggleAutoSync()}
+          style={{
+            flexDirection: "row",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: space.sm,
+            opacity: !state || mutating || syncActive ? 0.55 : 1,
+          }}
+        >
+          <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
+            <Text style={{ ...font.small, fontWeight: "500", color: colors.foreground }}>
+              {copy.syncAutoLabel}
+            </Text>
+            <Muted colors={colors} small>
+              {copy.syncAutoHint}
+            </Muted>
+          </View>
+          <View
+            style={{
+              width: 36,
+              height: 20,
+              borderRadius: radius.pill,
+              padding: 2,
+              justifyContent: "center",
+              backgroundColor:
+                (state?.autoSync ?? true) ? colors.accent : tint(colors.foreground, 0.18),
+              alignItems: (state?.autoSync ?? true) ? "flex-end" : "flex-start",
+            }}
+          >
+            <View
+              style={{
+                width: 16,
+                height: 16,
+                borderRadius: radius.pill,
+                backgroundColor: colors.surface0,
+              }}
+            />
+          </View>
+        </Pressable>
+      </Card>
 
       {/* Currency & USD -> CNY exchange rate controls */}
       <Card colors={colors} style={{ padding: space.md, gap: space.md }}>
@@ -1671,7 +2001,7 @@ export function PricingDialog({
             <Text style={{ ...font.heading, color: colors.foreground }}>{copy.modelsHeading}</Text>
             {state ? (
               <Muted colors={colors} small>
-                {copy.modelsCount(allRows.length, customCount)}
+                {copy.modelsCount(allRows.length, syncedCount, customCount)}
               </Muted>
             ) : null}
           </View>
@@ -1788,7 +2118,7 @@ export function PricingDialog({
             {loadError ? (
               <Callout colors={colors} tone="danger" icon="CircleAlert" title={loadError} />
             ) : null}
-            {visibleRows.map((row) => (
+            {renderedRows.map((row) => (
               <PricingModelRowCard
                 key={row.key}
                 colors={colors}
@@ -1816,6 +2146,17 @@ export function PricingDialog({
                 }}
               />
             ))}
+            {canCollapseList ? (
+              <View style={{ alignItems: "center", paddingTop: space.xs }}>
+                <Button
+                  colors={colors}
+                  size="sm"
+                  variant="secondary"
+                  label={copy.showAllModels(visibleRows.length)}
+                  onPress={() => setShowAllRows(true)}
+                />
+              </View>
+            ) : null}
           </View>
         )}
       </View>
