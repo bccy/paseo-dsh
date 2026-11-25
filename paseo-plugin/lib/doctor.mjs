@@ -31,34 +31,25 @@
  * else is written, and judging the patch with DSH's algorithm instead of a
  * second implementation is what makes the verdict the one DSH will reach.
  *
- * ### What "configured" has to mean
+ * ### Shared core
  *
- * The check used to ask whether the words `agent-default-model` and `providers:`
- * appear. A file with `provider:` present and *empty* satisfied that, and so did
- * a file with a YAML syntax error on the next line — both reported `ok` with no
- * detail, and a fresh install that could not possibly run printed
- * "All checks passed". The route and credential checks now read the *parsed*
- * document: the route has to name a non-empty provider/model in
- * `agent-default-model.config`, that provider has to be a key of the composed
- * `llm-pi-ai.config.providers`, and every referenced `apiKeyEnv` needs a
- * non-empty string under `.credentials.yaml`'s `refs:`.
+ * Core inspection and verdict evaluation live in exportable, side-effect-free
+ * functions (`inspectInstallFiles`, `runDoctorChecks`, `runDoctorChecksAsync`)
+ * shared by both the standalone CLI (`runDoctor`) and the plugin server
+ * (`server/diagnostics.ts`). The CLI only renders the structured report and
+ * sets `process.exitCode`.
  *
- * YAML syntax is parsed for real when a parser resolves — from the plugin's own
- * `node_modules` in a development checkout, or from the DSH install in a
- * published one (`loadYaml`). The second place is what makes this check real for
- * an install from npm: the plugin ships no `node_modules`, so the plugin-local
- * lookup alone found nothing and every such install got `[warn]` + exit 0 for a
- * patch file that was not YAML. When neither place resolves, that is **said out
- * loud** rather than assumed away, because "we could not check this" and "this
- * is fine" are different answers and only one of them is honest.
+ * Security invariant: raw `.credentials.yaml` contents, secret values, and
+ * YAML parser error snippets for `.credentials.yaml` are NEVER returned or
+ * printed by any function in this module.
  *
  * @module paseo-dsh/lib/doctor
  */
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveDshCommand } from "../server/dsh-command.mjs";
 
@@ -77,7 +68,7 @@ const RESET = "\u001b[0m";
  * whose core digits are 0.16.0 does not satisfy the package/manifest >=0.16.0
  * floor. App and daemon versions can differ; the client guards its badge API.
  */
-const MINIMUM_PASEO = "0.16.0";
+export const MINIMUM_PASEO = "0.16.0";
 
 /**
  * The DSH compatibility floor; the latest tracked runtime is `0.2.2-rc.3`.
@@ -88,53 +79,166 @@ const MINIMUM_PASEO = "0.16.0";
  * blocking issue, not a warning: the plugin's version line tracks DSH only at
  * `major.minor`, which cannot tell `0.2.0` from `0.2.1`.
  */
-const MINIMUM_DSH = "0.2.1";
+export const MINIMUM_DSH = "0.2.1";
 
 /** The bundle package `bootstrap.ts` writes into `dsh.profile.bundles`. */
-const BRIDGE_PACKAGE = "dsh-paseo-bridge";
+export const BRIDGE_PACKAGE = "dsh-paseo-bridge";
 
 /**
  * The ref-name grammar `dsh-credentials` enforces (`REF_PATTERN` in its
  * `lib/index.js`): `parseRefs()` runs every `refs:` key through it and rejects
  * the whole document on a miss, so `MY.GATEWAY_KEY` never resolves.
  */
-const CREDENTIAL_REF = /^[A-Za-z_][A-Za-z0-9_]*$/;
+export const CREDENTIAL_REF = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /**
  * Permission bits outside the owner. `dsh-credentials-local` refuses to load a
  * credentials document carrying any of them (`assertOwnerOnly()`, before the
  * file is even read); the provider writes and replaces the file at `0600`.
  */
-const CREDENTIALS_GROUP_OTHER = 0o77;
+export const CREDENTIALS_GROUP_OTHER = 0o77;
 
 /** How long `dsh --dump-config` may take before the composition is called unjudged. */
-const DUMP_TIMEOUT_MS = 20_000;
+export const DUMP_TIMEOUT_MS = 20_000;
 
-// `doctor | head -1` closes stdout early. Unhandled, that dies with an
-// `'error'` event and exit code 1 — which is exactly the code that means
-// "blocking issue", so a consumer cannot tell a crash from a diagnosis.
-process.stdout.on("error", (error) => {
-  if (error.code === "EPIPE") process.exit(process.exitCode ?? 0);
-  throw error;
-});
+/** Default timeout for short version/list CLI probes in async mode. */
+const CLI_PROBE_TIMEOUT_MS = 5_000;
 
-let results = [];
-function report(level, label, detail) {
-  results.push(level);
-  const tag =
-    level === "ok" ? `${GREEN}ok  ${RESET}` : level === "warn" ? `${YELLOW}warn${RESET}` : `${RED}fail${RESET}`;
-  process.stdout.write(`  [${tag}] ${label}${detail ? `\n         ${DIM}${detail}${RESET}` : ""}\n`);
+/** Maximum captured stderr bytes from `--dump-config` in async mode. */
+const MAX_DUMP_STDERR_BYTES = 256 * 1024;
+
+let stdoutEpipeInstalled = false;
+function installStdoutEpipeGuard() {
+  if (stdoutEpipeInstalled) return;
+  stdoutEpipeInstalled = true;
+  // `doctor | head -1` closes stdout early. Unhandled, that dies with an
+  // `'error'` event and exit code 1 — which is exactly the code that means
+  // "blocking issue", so a consumer cannot tell a crash from a diagnosis.
+  process.stdout.on("error", (error) => {
+    if (error.code === "EPIPE") process.exit(process.exitCode ?? 0);
+    throw error;
+  });
 }
 
-function run(cmd, args) {
+function expandHomePath(value) {
+  if (value === "~") return homedir();
+  if (value.startsWith("~/") || value.startsWith("~\\")) return join(homedir(), value.slice(2));
+  return value;
+}
+
+/**
+ * Resolve `$DSH_HOME` consistently with DSH and `server/bootstrap.ts`.
+ *
+ * @param {Readonly<Record<string, string | undefined>>} [env]
+ * @param {string} [cwd]
+ * @returns {string}
+ */
+export function resolveDshHome(env = process.env, cwd = process.cwd()) {
+  const configured = env.DSH_HOME;
+  if (configured !== undefined && configured.trim() !== "") {
+    return resolve(cwd, expandHomePath(configured));
+  }
+  return join(homedir(), ".dsh");
+}
+
+function runSync(cmd, args, opts = {}) {
   try {
-    const out = execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    const out = execFileSync(cmd, args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      env: opts.env,
+      cwd: opts.cwd,
+      timeout: opts.timeoutMs,
+    }).trim();
     // Exit 0 with nothing on stdout is not a version, and treating `""` as one
     // printed `[ok] dsh ` with the line check silently skipped.
     return out === "" ? undefined : out;
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Terminate a child process cleanly, escalating to SIGKILL if it ignores SIGTERM.
+ * All timers are unref'd so cleanup never keeps Node alive.
+ */
+function killChild(child) {
+  if (child.killed || child.exitCode !== null) return;
+  try {
+    child.kill("SIGTERM");
+  } catch {
+    return;
+  }
+  const forceTimer = setTimeout(() => {
+    if (child.exitCode === null) {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* already exited */
+      }
+    }
+  }, 400);
+  forceTimer.unref?.();
+}
+
+function runAsync(cmd, args, opts = {}) {
+  return new Promise((resolveRun) => {
+    if (opts.signal?.aborted) {
+      resolveRun(undefined);
+      return;
+    }
+    let child;
+    try {
+      child = spawn(cmd, args, {
+        stdio: ["ignore", "pipe", "ignore"],
+        env: opts.env,
+        cwd: opts.cwd,
+      });
+    } catch {
+      resolveRun(undefined);
+      return;
+    }
+
+    let settled = false;
+    let out = "";
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", onAbort);
+      resolveRun(value);
+    };
+
+    const onAbort = () => {
+      killChild(child);
+      finish(undefined);
+    };
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+
+    const timeoutMs = opts.timeoutMs ?? CLI_PROBE_TIMEOUT_MS;
+    const timer =
+      timeoutMs > 0
+        ? setTimeout(() => {
+            killChild(child);
+            finish(undefined);
+          }, timeoutMs)
+        : undefined;
+    timer?.unref?.();
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      if (out.length < 64 * 1024) out += chunk;
+    });
+    child.on("error", () => finish(undefined));
+    child.on("close", (code) => {
+      if (code !== 0) {
+        finish(undefined);
+        return;
+      }
+      const trimmed = out.trim();
+      finish(trimmed === "" ? undefined : trimmed);
+    });
+  });
 }
 
 /** Read a file the doctor needs, reporting the reason instead of throwing. */
@@ -168,20 +272,11 @@ function pathExists(path) {
 /**
  * The bridge package directories DSH resolves, in DSH's own order.
  *
- * `resolveBundleDir()` in `dsh-app-boot` resolves a profile bundle from the
- * installation first, then from `createRequire(<profile>/package.json)`, which
- * is Node's lookup order: `<profile>/node_modules`, then the parent's
- * `node_modules`. `bootstrap.ts` provisions the shared anchor because pnpm owns
- * the profile's own `node_modules` and moved the undeclared bridge into
- * `.ignored` on every `dsh plugin` command; the profile-local path is still
- * checked first because a pre-migration install has the bridge there, and DSH
- * resolves that copy before the shared one.
- *
- * @param profileDir - absolute profile directory.
- * @param dshHome - absolute `$DSH_HOME`.
+ * @param {string} profileDir - absolute profile directory.
+ * @param {string} dshHome - absolute `$DSH_HOME`.
  * @returns {{ local: string, shared: string }}
  */
-function bridgeLocations(profileDir, dshHome) {
+export function bridgeLocations(profileDir, dshHome) {
   return {
     local: join(profileDir, "node_modules", BRIDGE_PACKAGE),
     shared: join(dshHome, "profiles", "node_modules", BRIDGE_PACKAGE),
@@ -191,41 +286,33 @@ function bridgeLocations(profileDir, dshHome) {
 /**
  * Whether the profile directory is a DSH profile package that loads the bridge.
  *
- * DSH resolves a profile by its `package.json` (`loadProfile()` in
- * `dsh-app-boot`): without one it either initializes a shipped template or
- * throws `profile "<name>" does not exist`, and with one it composes exactly
- * the bundles under `dsh.profile.bundles`. The bridge is a bundle package, not
- * a plugin the profile picks up on its own, so a list without
- * `dsh-paseo-bridge` boots a perfectly healthy DSH that never answers
- * `initialize` — while this doctor used to report the directory alone as `ok`.
- *
- * `bootstrap.ts` writes the manifest with `writeIfAbsent()`, deliberately: the
- * file belongs to the user. A profile that predates the plugin, or one the user
- * edited, keeps its own list, so "the plugin creates it on load" does not
- * repair this and the doctor has to name the exact missing entry.
- *
- * @param profileDir - absolute profile directory.
- * @param profile - profile name, for the diagnostic.
- * @returns {{ ok: true } | { ok: false, label: string, detail: string }}
+ * @param {string} profileDir - absolute profile directory.
+ * @param {string} profile - profile name, for the diagnostic.
+ * @returns {{ ok: true, bundles: string[] } | { ok: false, bundles: string[], label: string, detail: string, fixHint: string }}
  */
-function profileBundleVerdict(profileDir, profile) {
+export function profileBundleVerdict(profileDir, profile) {
   const manifestPath = join(profileDir, "package.json");
   const read = readText(manifestPath);
   if (read.error !== undefined) {
     if (!existsSync(manifestPath)) {
       return {
         ok: false,
+        bundles: [],
         label: `DSH profile "${profile}" has no package.json`,
         detail:
           `expected ${manifestPath}; without it DSH reports the profile does not exist. The plugin writes it when it ` +
           `provisions the profile — reinstall the plugin and restart the daemon, or create the file with ` +
           `"dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "${BRIDGE_PACKAGE}"] } }.`,
+        fixHint:
+          `Reload the dsh-paseo plugin or create ${manifestPath} with "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "${BRIDGE_PACKAGE}"] } }, then restart the Paseo daemon.`,
       };
     }
     return {
       ok: false,
+      bundles: [],
       label: `DSH profile package.json is unreadable`,
       detail: `${manifestPath}: ${read.error}; DSH cannot load a profile it cannot read.`,
+      fixHint: `Check file permissions on ${manifestPath} so the Paseo daemon user can read it.`,
     };
   }
   let manifest;
@@ -234,82 +321,151 @@ function profileBundleVerdict(profileDir, profile) {
   } catch (error) {
     return {
       ok: false,
+      bundles: [],
       label: `DSH profile package.json is not valid JSON`,
       detail: `${manifestPath}: ${error instanceof Error ? error.message : String(error)}; DSH fails to boot this profile.`,
+      fixHint: `Fix the JSON syntax in ${manifestPath} and restart the Paseo daemon.`,
     };
   }
   if (manifest === null || typeof manifest !== "object" || Array.isArray(manifest)) {
     return {
       ok: false,
+      bundles: [],
       label: `DSH profile package.json does not hold an object`,
       detail: `${manifestPath}; DSH refuses a profile manifest that is not a JSON object.`,
+      fixHint: `Replace ${manifestPath} with a valid JSON object declaring "dsh.profile.bundles".`,
     };
   }
   const bundles = manifest.dsh?.profile?.bundles;
   if (!Array.isArray(bundles)) {
     return {
       ok: false,
+      bundles: [],
       label: `DSH profile declares no bundle list`,
       detail:
         `${manifestPath} has no "dsh.profile.bundles" array, so DSH boots this profile with no bundles at all and ` +
         `the bridge is never loaded. Add "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "${BRIDGE_PACKAGE}"] } }.`,
+      fixHint: `Add "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "${BRIDGE_PACKAGE}"] } } to ${manifestPath} and restart the Paseo daemon.`,
     };
   }
-  if (!bundles.includes(BRIDGE_PACKAGE)) {
+  const normalizedBundles = bundles.filter((entry) => typeof entry === "string");
+  if (!normalizedBundles.includes(BRIDGE_PACKAGE)) {
     return {
       ok: false,
+      bundles: normalizedBundles,
       label: `DSH profile does not load the bridge bundle`,
       detail:
         `"${BRIDGE_PACKAGE}" is missing from dsh.profile.bundles in ${manifestPath}; DSH boots without the bridge ` +
         `and every session waits for initialize until it times out. Add "${BRIDGE_PACKAGE}" to that list (keep the ` +
         `other entries) and restart the daemon.`,
+      fixHint: `Add "${BRIDGE_PACKAGE}" to dsh.profile.bundles in ${manifestPath} and restart the Paseo daemon.`,
     };
   }
-  return { ok: true };
+  return { ok: true, bundles: normalizedBundles };
 }
 
 /**
- * Compose the profile through DSH's own patch algorithm and report what it skipped.
+ * Compose the profile through DSH's own patch algorithm synchronously.
  *
- * `dsh --profile <p> --dump-config` is the launcher's offline composition
- * (`runDumpConfig()` → `renderConfigDump()` in `dsh-app-boot`): it stacks the
- * bundle layers and the profile's `cordis.patch.yml` with the same
- * `applyEntryPatches()` the boot include uses. Every patch it cannot apply is a
- * warning on stderr — a `name` that does not match the composed row, an `id`
- * that matches nothing, an insert into a missing group, a bundle that failed to
- * load — and the boot itself prints those once and carries on. That is why a
- * route can look configured in the profile patch while the running profile is
- * on the base default: the patch was skipped, and only this warning says so.
- *
- * The dump is not a pure read: DSH rewrites the profile's generated
- * `cordis.yml` root file (constant content; the same write happens on every
- * boot). Nothing else is touched.
- *
- * @param profile - profile name.
- * @param launcher - the resolved DSH launcher (command + leading args).
- * @returns {{ status: number|null, stderr: string, error?: Error }}
+ * @param {string} profile
+ * @param {{ command: string, args: string[] }} launcher
+ * @param {{ env?: NodeJS.ProcessEnv, cwd?: string, timeoutMs?: number }} [opts]
+ * @returns {{ status: number|null, stderr: string, error?: Error, timedOut?: boolean }}
  */
-function dumpProfile(profile, launcher) {
+function dumpProfileSync(profile, launcher, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? DUMP_TIMEOUT_MS;
   const result = spawnSync(launcher.command, [...launcher.args, "--profile", profile, "--dump-config"], {
     encoding: "utf8",
     stdio: ["ignore", "ignore", "pipe"],
-    timeout: DUMP_TIMEOUT_MS,
+    env: opts.env,
+    cwd: opts.cwd,
+    timeout: timeoutMs,
   });
   return {
     status: result.status,
     stderr: typeof result.stderr === "string" ? result.stderr : "",
     error: result.error,
+    timedOut: result.error?.code === "ETIMEDOUT",
   };
 }
 
 /**
- * The composition diagnostics DSH printed, one per line.
+ * Compose the profile through DSH's own patch algorithm asynchronously without
+ * blocking the event loop. Always discards stdout so composed config is never
+ * buffered in memory.
  *
- * Everything the dump reports is either a skipped patch entry
- * (`dsh: [<layer>] patch: …`) or a bundle that failed to load
- * (`dsh: skipping profile bundle "…": …`); there is no benign `dsh:` line on
- * this path. They are kept verbatim so the doctor can quote DSH instead of
- * paraphrasing it.
+ * @param {string} profile
+ * @param {{ command: string, args: string[] }} launcher
+ * @param {{ env?: NodeJS.ProcessEnv, cwd?: string, timeoutMs?: number, signal?: AbortSignal }} [opts]
+ * @returns {Promise<{ status: number|null, stderr: string, error?: Error, timedOut?: boolean }>}
+ */
+function dumpProfileAsync(profile, launcher, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? DUMP_TIMEOUT_MS;
+  return new Promise((resolveDump) => {
+    if (opts.signal?.aborted) {
+      const err = new Error("aborted");
+      err.code = "ETIMEDOUT";
+      resolveDump({ status: null, stderr: "", error: err, timedOut: true });
+      return;
+    }
+
+    let child;
+    try {
+      child = spawn(launcher.command, [...launcher.args, "--profile", profile, "--dump-config"], {
+        stdio: ["ignore", "ignore", "pipe"],
+        env: opts.env,
+        cwd: opts.cwd,
+      });
+    } catch (error) {
+      resolveDump({
+        status: null,
+        stderr: "",
+        error: error instanceof Error ? error : new Error(String(error)),
+        timedOut: false,
+      });
+      return;
+    }
+
+    let settled = false;
+    let stderr = "";
+    const finish = (outcome) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", onAbort);
+      resolveDump(outcome);
+    };
+
+    const failTimeout = () => {
+      killChild(child);
+      const err = new Error(`timed out after ${timeoutMs}ms`);
+      err.code = "ETIMEDOUT";
+      finish({ status: null, stderr, error: err, timedOut: true });
+    };
+
+    const onAbort = () => failTimeout();
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+
+    const timer = timeoutMs > 0 ? setTimeout(failTimeout, timeoutMs) : undefined;
+    timer?.unref?.();
+
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < MAX_DUMP_STDERR_BYTES) {
+        stderr += chunk.slice(0, MAX_DUMP_STDERR_BYTES - stderr.length);
+      }
+    });
+    child.on("error", (error) => {
+      finish({ status: null, stderr, error, timedOut: false });
+    });
+    child.on("close", (code) => {
+      finish({ status: code, stderr, error: undefined, timedOut: false });
+    });
+  });
+}
+
+/**
+ * The composition diagnostics DSH printed, one per line.
  */
 function dumpDiagnostics(stderr) {
   return stderr
@@ -327,14 +483,12 @@ function quoteDiagnostics(entries) {
 
 /**
  * The first line of a failed dump that names the failure, without the stack.
- *
- * A failed `--dump-config` prints an uncaught error, so stderr starts with a
- * `file://…` frame and ends with `Node.js v…`; the one useful line is the
- * `Error: dsh: …` message.
  */
-function dumpFailure(dumped) {
+function dumpFailure(dumped, timeoutMs = DUMP_TIMEOUT_MS) {
+  if (dumped.timedOut || dumped.error?.code === "ETIMEDOUT" || dumped.error?.name === "AbortError") {
+    return `dsh --dump-config did not finish within ${Math.max(1, Math.round(timeoutMs / 1000))}s`;
+  }
   if (dumped.error !== undefined) {
-    if (dumped.error.code === "ETIMEDOUT") return `dsh --dump-config did not finish within ${DUMP_TIMEOUT_MS / 1000}s`;
     return `could not run dsh --dump-config (${dumped.error.message})`;
   }
   for (const entry of dumped.stderr.split("\n")) {
@@ -347,17 +501,23 @@ function dumpFailure(dumped) {
 }
 
 /**
+ * Whether a malformed ref key name looks like an accidentally pasted secret or
+ * multi-token line rather than a benign identifier typo like `MY.GATEWAY_KEY`.
+ */
+function safeCredentialRefNameForDisplay(name) {
+  if (
+    name.length > 64 ||
+    /\s/.test(name) ||
+    /[:=]/.test(name) ||
+    /^(?:sk|pk|ak|rk|ghp|gho|ghu|github_pat|xox[a-z]|AIza|Bearer)[-_]/i.test(name)
+  ) {
+    return "<redacted>";
+  }
+  return name;
+}
+
+/**
  * Whether a document is the pre-release flat credentials layout DSH migrates.
- *
- * `renderFlatLayoutMigration()` in `dsh-credentials-local` recognizes exactly a
- * non-empty top-level mapping of ref names to non-empty string scalars, with no
- * `version` key and no document directives; it then rewrites the file as
- * `version: 1` + `refs:` and boots. Failing that layout here would be a false
- * red on a file DSH is about to upgrade, so the doctor accepts it too — and
- * says so, because the rewrite is about to happen.
- *
- * @param text - the document's text (directive lines are matched on it).
- * @param root - the parsed document.
  */
 function isFlatLayout(text, root) {
   const keys = Object.keys(root);
@@ -375,23 +535,15 @@ function isFlatLayout(text, root) {
 /**
  * Check a parsed credentials document against the contract DSH enforces.
  *
- * The reference implementation is `dsh-credentials-local/lib/index.js`:
- * `parseCredentialsDocument()` requires a non-empty document to declare
- * `version: 1` and validates `refs` with `parseRefs()` (the `credentialRef()`
- * grammar from `dsh-credentials/lib/index.js`, non-empty string values);
- * `renderFlatLayoutMigration()` is the one accepted legacy layout. A document
- * that fails any of those is refused before a single credential is read, so
- * the doctor must not report `credential … found` for one.
+ * Security rule: NEVER include any credential value or arbitrary non-numeric
+ * scalar from the document in `problems`.
  *
- * The `records` section (machine-written by the Models page) is not inspected;
- * see the delivery note on the audit item.
- *
- * @param document - the parsed YAML document.
- * @param text - its text, for the flat-layout recognizer.
- * @param path - absolute path, for the repair instructions.
- * @returns {{ refs: Record<string, unknown>, problems: { label: string, detail: string }[], legacy: boolean }}
+ * @param {unknown} document - the parsed YAML document.
+ * @param {string} text - its text, for the flat-layout recognizer.
+ * @param {string} path - absolute path, for the repair instructions.
+ * @returns {{ refs: Record<string, unknown>, problems: { label: string, detail: string, fixHint: string }[], legacy: boolean }}
  */
-function credentialContract(document, text, path) {
+export function credentialContract(document, text, path) {
   const problems = [];
   const root = document === null ? {} : document;
   if (typeof root !== "object" || Array.isArray(root)) {
@@ -402,6 +554,7 @@ function credentialContract(document, text, path) {
         {
           label: "credentials document is not a mapping",
           detail: `${path} must hold a YAML mapping with "version: 1" and "refs:" at the top level.`,
+          fixHint: `Rewrite ${path} as a YAML mapping with "version: 1" and "refs:" at the top level, with mode 0600.`,
         },
       ],
     };
@@ -418,11 +571,15 @@ function credentialContract(document, text, path) {
           `${path} uses the pre-release flat layout, which DSH rejects: add "version: 1" as the first line and ` +
           `nest the existing ${String(keys.length)} ${keys.length === 1 ? "entry" : "entries"} under "refs:" ` +
           `(no value needs to change).`,
+        fixHint: `Add "version: 1" at the top of ${path} and place your keys under "refs:" (keep mode 0600).`,
       });
   } else if (root.version !== 1) {
+    // Only echo safe numeric versions; never echo arbitrary strings/objects that could carry secret text.
+    const versionDisplay = typeof root.version === "number" ? JSON.stringify(root.version) : "an invalid value";
     problems.push({
-      label: `credentials document declares version ${JSON.stringify(root.version)}`,
+      label: `credentials document declares version ${versionDisplay}`,
       detail: `${path} must say "version: 1" (a number, unquoted); this DSH build reads version 1 only.`,
+      fixHint: `Set "version: 1" (unquoted integer) at the top of ${path}.`,
     });
   }
   const section = legacy ? root : root.refs;
@@ -430,66 +587,79 @@ function credentialContract(document, text, path) {
     problems.push({
       label: "credentials refs is not a mapping",
       detail: `"refs:" in ${path} must be a mapping of NAME: <key>; DSH rejects the whole document otherwise.`,
+      fixHint: `Fix "refs:" in ${path} so it is a YAML key-value mapping of ENV_NAME: <key>.`,
     });
     return { refs: {}, problems, legacy };
   }
   const refs = section ?? {};
   for (const [name, value] of Object.entries(refs)) {
+    const safeName = safeCredentialRefNameForDisplay(name);
     if (!CREDENTIAL_REF.test(name))
       problems.push({
-        label: `credentials ref "${name}" is not a valid name`,
+        label: `credentials ref "${safeName}" is not a valid name`,
         detail:
           `DSH requires /^[A-Za-z_][A-Za-z0-9_]*$/ (no dots or dashes) for a ref name; rename it in ${path}. ` +
           `The route's apiKeyEnv has to use the same name.`,
+        fixHint: `Rename the invalid ref in ${path} to match /^[A-Za-z_][A-Za-z0-9_]*$/ and update apiKeyEnv in cordis.patch.yml to match.`,
       });
     else if (typeof value !== "string" || value.length === 0)
       problems.push({
-        label: `credentials ref "${name}" has no usable value`,
-        detail: `the value for "${name}" in ${path} must be a non-empty string; quote it, or remove the key.`,
+        label: `credentials ref "${safeName}" has no usable value`,
+        detail: `the value for "${safeName}" in ${path} must be a non-empty string; quote it, or remove the key.`,
+        fixHint: `Set a non-empty string value for "${safeName}" in ${path} (quote numeric values), or remove the unused entry.`,
       });
   }
   return { refs, problems, legacy };
 }
 
-function findPaseo() {
+function findPaseoSync(env, execFn, checkBundledPaseo, cwd) {
   // Prefer the app-bundled CLI: a `paseo` on PATH is often a stale npm install.
-  if (process.env.PASEO_CLI) {
-    const version = run(process.env.PASEO_CLI, ["--version"]);
-    if (version !== undefined) return { cmd: process.env.PASEO_CLI, version };
+  if (env.PASEO_CLI) {
+    const version = execFn(env.PASEO_CLI, ["--version"], { env, cwd, timeoutMs: CLI_PROBE_TIMEOUT_MS });
+    if (version !== undefined) return { cmd: env.PASEO_CLI, version };
   }
   const bundled = "/Applications/Paseo.app/Contents/Resources/bin/paseo";
-  if (existsSync(bundled)) {
-    const v = run(bundled, ["--version"]);
+  if (checkBundledPaseo && existsSync(bundled)) {
+    const v = execFn(bundled, ["--version"], { env, cwd, timeoutMs: CLI_PROBE_TIMEOUT_MS });
     if (v !== undefined) return { cmd: bundled, version: v };
   }
-  const v = run("paseo", ["--version"]);
+  const v = execFn("paseo", ["--version"], { env, cwd, timeoutMs: CLI_PROBE_TIMEOUT_MS });
   if (v !== undefined) return { cmd: "paseo", version: v };
   return undefined;
 }
 
-function line(v) {
+async function findPaseoAsync(env, execFn, checkBundledPaseo, cwd, signal, timeoutMs) {
+  if (env.PASEO_CLI) {
+    const version = await execFn(env.PASEO_CLI, ["--version"], { env, cwd, signal, timeoutMs });
+    if (version !== undefined) return { cmd: env.PASEO_CLI, version };
+  }
+  const bundled = "/Applications/Paseo.app/Contents/Resources/bin/paseo";
+  if (checkBundledPaseo && existsSync(bundled)) {
+    const v = await execFn(bundled, ["--version"], { env, cwd, signal, timeoutMs });
+    if (v !== undefined) return { cmd: bundled, version: v };
+  }
+  const v = await execFn("paseo", ["--version"], { env, cwd, signal, timeoutMs });
+  if (v !== undefined) return { cmd: "paseo", version: v };
+  return undefined;
+}
+
+function firstLine(v) {
   return v.split("\n").find((entry) => entry.trim() !== "") ?? v;
 }
 
 /**
  * `>= minimum`, compared component by component.
- *
- * `Number(minor) < 9` called `paseo 0.9.0` fine although the plugin API needs
- * 0.9.2, and warned about `1.0.0`.
  */
-function atLeast(version, minimum) {
+export function atLeast(version, minimum) {
   const got = parseVersion(version);
   const want = parseVersion(minimum);
-  // A prerelease of the floor predates the stable badge API. A later
-  // prerelease retains the existing non-blocking warning policy, not a claim
-  // that its behavior has been verified.
   if (got === undefined || want === undefined) return false;
   const core = compareCore(got, want);
   return core > 0 || (core === 0 && got.prerelease === undefined);
 }
 
 /** `major.minor.patch` plus the prerelease tag, or `undefined` when unreadable. */
-function parseVersion(value) {
+export function parseVersion(value) {
   const match = String(value ?? "").match(/(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?/);
   if (match === null) return undefined;
   return {
@@ -502,12 +672,8 @@ function parseVersion(value) {
 
 /**
  * Compare only `major.minor.patch`.
- *
- * A prerelease of the minimum counts as the minimum: `0.2.1-rc.2` is the build
- * this repository was verified against, and semver would otherwise rank it below
- * `0.2.1` and fail the very version the project runs on.
  */
-function compareCore(a, b) {
+export function compareCore(a, b) {
   for (const key of ["major", "minor", "patch"]) {
     if (a[key] !== b[key]) return a[key] > b[key] ? 1 : -1;
   }
@@ -521,10 +687,6 @@ function parseYaml(yaml, text) {
 
 /**
  * The loader patch entries of `cordis.patch.yml`, or an error.
- *
- * DSH parses this file as a *top-level YAML array* of loader patch entries and
- * fails the whole profile when it is anything else, so "parsed as YAML" alone is
- * not enough: a mapping with the right words in it is still not a patch list.
  */
 function patchEntries(document) {
   if (!Array.isArray(document)) return { error: "it is not a top-level YAML array of loader patch entries" };
@@ -540,12 +702,6 @@ function patchEntries(document) {
 
 /**
  * The patch entry with this `id`, with later same-id entries folded in.
- *
- * The profile patch is a loader patch list: each entry targets a *composed*
- * entry by id and sets fields on it. Two entries with the same id are not two
- * routes, they are two overrides — the later value wins, and `config` replaces
- * the whole config object (`applyEntryPatches()`). Folding them here means the
- * doctor judges the same route DSH will compose instead of the first fragment.
  */
 function entryById(entries, id) {
   let found;
@@ -566,27 +722,72 @@ function providerProfiles(entry) {
 }
 
 /**
+ * Redact a provider baseURL to scheme + host only (strips userinfo, path, query, fragment).
+ */
+export function redactBaseUrlHost(rawUrl) {
+  if (typeof rawUrl !== "string" || rawUrl.trim() === "") return undefined;
+  try {
+    const parsed = new URL(rawUrl.trim());
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Extract a strictly allowlisted, secret-free summary of configured providers
+ * and models from `llm-pi-ai.config.providers`.
+ */
+function extractRedactedProviders(providers, defaultProviderId) {
+  if (providers === undefined) return { providers: [], referencedApiKeyEnvs: [] };
+  const redacted = [];
+  const referenced = [];
+  for (const [id, rawProfile] of Object.entries(providers)) {
+    if (rawProfile === null || typeof rawProfile !== "object" || Array.isArray(rawProfile)) continue;
+    const displayName =
+      typeof rawProfile.displayName === "string" && rawProfile.displayName.trim() !== ""
+        ? rawProfile.displayName.trim()
+        : undefined;
+    const api = typeof rawProfile.api === "string" && rawProfile.api.trim() !== "" ? rawProfile.api.trim() : undefined;
+    const apiKeyEnv =
+      typeof rawProfile.apiKeyEnv === "string" && rawProfile.apiKeyEnv.trim() !== ""
+        ? rawProfile.apiKeyEnv.trim()
+        : undefined;
+    if (apiKeyEnv !== undefined) referenced.push(apiKeyEnv);
+    const baseUrlHost = redactBaseUrlHost(rawProfile.baseURL ?? rawProfile.baseUrl);
+    const models = [];
+    if (Array.isArray(rawProfile.models)) {
+      for (const rawModel of rawProfile.models) {
+        if (typeof rawModel === "string" && rawModel.trim() !== "") {
+          models.push({ id: rawModel.trim() });
+        } else if (rawModel !== null && typeof rawModel === "object" && !Array.isArray(rawModel)) {
+          const modelId = typeof rawModel.id === "string" ? rawModel.id.trim() : "";
+          if (modelId === "") continue;
+          const modelName =
+            typeof rawModel.name === "string" && rawModel.name.trim() !== "" ? rawModel.name.trim() : undefined;
+          models.push(modelName !== undefined ? { id: modelId, name: modelName } : { id: modelId });
+        }
+      }
+    }
+    redacted.push({
+      id,
+      ...(displayName === undefined ? {} : { displayName }),
+      ...(api === undefined ? {} : { api }),
+      ...(baseUrlHost === undefined ? {} : { baseUrlHost }),
+      ...(apiKeyEnv === undefined ? {} : { apiKeyEnv }),
+      isDefault: defaultProviderId !== undefined && id === defaultProviderId,
+      models,
+    });
+  }
+  return { providers: redacted, referencedApiKeyEnvs: [...new Set(referenced)] };
+}
+
+/**
  * Every file the bridge package must contain, taken from the generated
  * `server/bridge-assets.ts`.
- *
- * `ensurePaseoProfile()` (bootstrap.ts) writes *all* of `BRIDGE_FILES`, and only
- * that whole set is a bridge DSH can load: `lib/index.js` imports
- * `./transport.js` and `./server.js` when it loads, and those import the rest
- * (`child-anchors`, `revert`, `mcp-gateway`, …). Looking for the entry alone is
- * how a half-written bridge used to report `ok` while DSH printed
- * `ERR_MODULE_NOT_FOUND` without exiting and the plugin sat waiting for
- * `initialize` to time out.
- *
- * The generated module is TypeScript and `runDoctor()` is synchronous — the CLI
- * calls it without awaiting — so `import()` is out. Node 22.18+ can `require()`
- * a `.ts` file; older lines throw, and the keys are read out of the generated
- * source instead. That fallback is not a guess at the format: the generator
- * emits exactly one JSON-string key per entry (scripts/generate-bridge-assets.mjs)
- * and `harness/bridge-assets-check.mjs` parses the same block the same way. If
- * neither path yields a key, the caller says so rather than assuming the bridge
- * is complete.
  */
-function loadBridgeFileList() {
+export function loadBridgeFileList() {
   const assetsPath = join(HERE, "..", "server", "bridge-assets.ts");
   try {
     const assets = require(assetsPath);
@@ -601,33 +802,51 @@ function loadBridgeFileList() {
   if (read.error !== undefined) return { error: `${assetsPath} is unreadable (${read.error})` };
   const block = /export const BRIDGE_FILES[^{]*\{([\s\S]*?)\n\};/.exec(read.text)?.[1];
   if (block === undefined) return { error: `BRIDGE_FILES not found in ${assetsPath}` };
-  // A key line is a JSON string followed by `:`; the base64 values that follow
-  // are bare string literals joined with `+`, so they cannot match this.
   const keys = [...block.matchAll(/^[ \t]*("(?:[^"\\]|\\.)*"):/gm)].map((match) => JSON.parse(match[1]));
   if (keys.length === 0) return { error: `BRIDGE_FILES has no entries in ${assetsPath}` };
   return { keys };
 }
 
+function normalizeBridgeFileList(override) {
+  if (override === undefined) return loadBridgeFileList();
+  if (Array.isArray(override)) {
+    return override.length > 0 ? { keys: [...override] } : { error: "bridge file list is empty" };
+  }
+  if (override !== null && typeof override === "object") {
+    if (typeof override.error === "string") return { error: override.error };
+    if (Array.isArray(override.keys) && override.keys.length > 0) return { keys: [...override.keys] };
+  }
+  return { error: "bridge file list is invalid" };
+}
+
 /**
  * Absolute path of the file that actually implements `dsh`, or `undefined`.
- *
- * On POSIX this is the `dsh` found on PATH (a symlink into the global install,
- * as before). On Windows the launcher is a `.cmd` shim that does not live in the
- * package, so the Node entry a resolved npm launch names is the file to walk up
- * from. `which` is not used: it is a separate process, absent on some minimal
- * hosts, and the dsh row above has already proved the CLI is startable by the
- * time this matters.
  */
-function whichDsh(launcher) {
+export function whichDsh(launcher, env = process.env, platform = process.platform, cwd = process.cwd()) {
   if (launcher !== undefined && launcher.args.length > 0) {
     const entry = launcher.args[0];
     if (existsSync(entry)) return entry;
   }
-  const names = process.platform === "win32" ? ["dsh.exe", "dsh.cmd", "dsh"] : ["dsh"];
-  for (const entry of (process.env.PATH ?? "").split(delimiter)) {
-    if (entry === "") continue;
+  const command = launcher?.command ?? "dsh";
+  if (command.includes("/") || command.includes("\\")) {
+    const explicit = resolve(cwd, command);
+    if (existsSync(explicit)) return explicit;
+    return undefined;
+  }
+  const pathKey = Object.keys(env).sort().find((key) => key.toLowerCase() === "path");
+  const pathValue = pathKey === undefined ? "" : (env[pathKey] ?? "");
+  const pathSep = platform === "win32" ? ";" : delimiter;
+  const names =
+    platform === "win32"
+      ? /\.[a-z0-9]+$/i.test(command)
+        ? [command]
+        : [`${command}.exe`, `${command}.cmd`, command]
+      : [command];
+  for (const entry of pathValue.split(pathSep)) {
+    const cleaned = entry.replace(/^"|"$/g, "");
+    if (cleaned === "") continue;
     for (const name of names) {
-      const candidate = join(entry, name);
+      const candidate = join(cleaned, name);
       if (existsSync(candidate)) return candidate;
     }
   }
@@ -636,50 +855,26 @@ function whichDsh(launcher) {
 
 /**
  * A `require` anchored at the DSH install, or `undefined`.
- *
- * This module cannot resolve `yaml` in a real install: `paseo-plugin/package.json`
- * declares no `dependencies`, and `files` does not ship `node_modules`, so both
- * `yaml` and `js-yaml` are dev-only and absent from what
- * `paseo plugin add github:bccy/paseo-dsh:paseo-plugin` unpacks. DSH, on the
- * other hand, carries a YAML parser for its own config — and that is the parser
- * `cordis.patch.yml` is actually read by, so judging the file with the same
- * implementation is the more faithful answer than a repo-local dev copy.
- *
- * `dsh` on PATH is a symlink into the global install, so its realpath is walked
- * up to the package root that owns it. `undefined` when `dsh` is missing or the
- * layout does not match, and the caller then says the syntax was not validated.
- *
- * @param launcher - the resolved DSH launcher, whose Node entry (if any) points
- *   straight at the package on Windows.
  */
-function dshPackageRequire(launcher) {
-  const dsh = whichDsh(launcher);
+function dshPackageRequire(launcher, env = process.env, platform = process.platform, cwd = process.cwd()) {
+  const dsh = whichDsh(launcher, env, platform, cwd);
   if (dsh === undefined) return undefined;
   try {
     let dir = dirname(realpathSync(dsh));
-    // `/…/@deepseek-ai/dsh/lib/bin.js` -> the package root; the loop tolerates a
-    // differently-shaped `bin` entry or a symlink into another directory.
     while (dir !== dirname(dir)) {
       if (existsSync(join(dir, "package.json"))) return createRequire(join(dir, "package.json"));
       dir = dirname(dir);
     }
   } catch {
-    // Unresolvable `dsh` is not an error here: the dsh row above already reports
-    // the CLI, and the YAML row reports that the syntax went unchecked.
+    // Unresolvable `dsh` is not an error here.
   }
   return undefined;
 }
 
 /**
  * Whatever YAML parser this install happens to carry, or `undefined`.
- *
- * Two places, in this order: this module's own resolution chain (what a
- * development checkout has) and then the DSH install (what a published install
- * has). Only when neither resolves is the syntax reported as unvalidated — a
- * published install used to land there every time, which turned "this patch is
- * not YAML at all" into a `[warn]` and exit 0.
  */
-function loadYaml(launcher) {
+export function loadYaml(launcher, env = process.env, platform = process.platform, cwd = process.cwd()) {
   for (const name of ["yaml", "js-yaml"]) {
     try {
       return { name, module: require(name) };
@@ -687,7 +882,7 @@ function loadYaml(launcher) {
       // Try the next spelling; the caller reports when none resolves.
     }
   }
-  const fromDsh = dshPackageRequire(launcher);
+  const fromDsh = dshPackageRequire(launcher, env, platform, cwd);
   if (fromDsh === undefined) return undefined;
   for (const name of ["yaml", "js-yaml"]) {
     try {
@@ -699,331 +894,694 @@ function loadYaml(launcher) {
   return undefined;
 }
 
-export function runDoctor() {
-  results = [];
+/**
+ * Scrub accidental inline secrets from non-credential diagnostic error strings
+ * (e.g. a YAML syntax error in `cordis.patch.yml`).
+ */
+function scrubErrorSnippet(message) {
+  const line = String(message ?? "").split("\n")[0].trim();
+  return line
+    .replace(/\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, "$1<redacted>")
+    .replace(/\b((?:sk|pk|ak|rk|ghp|gho|ghu|github_pat|xox[a-z]|AIza)[-_])[A-Za-z0-9._-]{6,}/gi, "$1<redacted>")
+    .replace(/((?:api[_-]?key|token|secret|password)\s*[:=]\s*["']?)([^\s,"'\]}]+)/gi, "$1<redacted>");
+}
 
+function readPluginVersion(explicitVersion) {
+  if (explicitVersion !== undefined) return { version: explicitVersion };
   const pluginRead = readText(join(HERE, "..", "package.json"));
   if (pluginRead.error !== undefined) {
-    process.stderr.write(`cannot read the plugin's package.json: ${pluginRead.error}\n`);
-    process.exitCode = 1;
-    return;
+    return { error: `cannot read the plugin's package.json: ${pluginRead.error}` };
   }
-  const pluginVersion = JSON.parse(pluginRead.text).version;
-  const dshHome = process.env.DSH_HOME ?? join(homedir(), ".dsh");
-  const profileFromEnv = process.env.DSH_PASEO_PROFILE !== undefined;
-  const profile = process.env.DSH_PASEO_PROFILE ?? "paseo";
-  const profileDir = join(dshHome, "profiles", profile);
+  try {
+    const parsed = JSON.parse(pluginRead.text);
+    if (typeof parsed?.version === "string" && parsed.version !== "") {
+      return { version: parsed.version };
+    }
+    return { error: "cannot read the plugin's package.json: missing version" };
+  } catch (error) {
+    return { error: `cannot read the plugin's package.json: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
 
-  process.stdout.write(`\n${DIM}paseo-dsh doctor  (plugin ${pluginVersion})${RESET}\n`);
-  process.stdout.write(
-    `${DIM}profile "${profile}" (${profileFromEnv ? "DSH_PASEO_PROFILE" : "default; the daemon must use the same value"})${RESET}\n\n`,
-  );
+/**
+ * Pure read-only inspection of the DSH profile, bridge, `cordis.patch.yml`,
+ * and `.credentials.yaml` (zero subprocesses).
+ *
+ * Shared by both `dsh.diagnostics.overview` and full doctor runs so the two
+ * layers never drift. Never returns raw `.credentials.yaml` text, key values,
+ * or YAML parser errors from `.credentials.yaml`.
+ */
+export function inspectInstallFiles(options = {}) {
+  const env = options.env ?? process.env;
+  const cwd = options.cwd ?? process.cwd();
+  const platform = options.platform ?? process.platform;
+  const dshHome = options.dshHome ?? resolveDshHome(env, cwd);
+  const profileFromEnv = options.profileFromEnv ?? (options.profile === undefined && env.DSH_PASEO_PROFILE !== undefined);
+  const profile = options.profile ?? env.DSH_PASEO_PROFILE ?? "paseo";
+  const profileDir = join(dshHome, "profiles", profile);
+  const binary = options.binary ?? env.DSH_BINARY ?? "dsh";
+  const launcher = options.launcher ?? resolveDshCommand(binary, env, cwd);
+  const dshPath = whichDsh(launcher, env, platform, cwd);
+
+  // 1. Profile directory & manifest
+  const profileExists = existsSync(profileDir);
+  const profileBundle = profileExists
+    ? profileBundleVerdict(profileDir, profile)
+    : {
+        ok: false,
+        bundles: [],
+        label: `DSH profile "${profile}" missing`,
+        detail: `expected ${profileDir}. Install the plugin and restart the daemon — the plugin creates it on load.`,
+        fixHint: `Install or reload the dsh-paseo plugin and restart the Paseo daemon so it provisions ${profileDir}.`,
+      };
+
+  // 2. Bridge files
+  const bridgeLocs = bridgeLocations(profileDir, dshHome);
+  const localBridge = pathExists(bridgeLocs.local);
+  const sharedBridge = pathExists(bridgeLocs.shared);
+  const bridgeDir = localBridge ? bridgeLocs.local : bridgeLocs.shared;
+  const bridgeFileList = normalizeBridgeFileList(options.bridgeFiles);
+  let bridgeStatus;
+  let expectedFiles = 0;
+  let presentFiles = 0;
+  let missingFiles = [];
+  let entryExists = false;
+  if (bridgeFileList.error !== undefined) {
+    bridgeStatus = "unverified";
+    entryExists = existsSync(join(bridgeDir, "lib", "index.js"));
+  } else {
+    expectedFiles = bridgeFileList.keys.length;
+    missingFiles = bridgeFileList.keys.filter((relativePath) => !existsSync(join(bridgeDir, relativePath)));
+    presentFiles = expectedFiles - missingFiles.length;
+    if (missingFiles.length === 0) {
+      bridgeStatus = localBridge && sharedBridge ? "shadowed" : "provisioned";
+    } else if (!localBridge && !sharedBridge) {
+      bridgeStatus = "missing";
+    } else {
+      bridgeStatus = "incomplete";
+    }
+  }
+  const bridgeLocationKind =
+    localBridge && sharedBridge ? "both" : localBridge ? "local" : sharedBridge ? "shared" : "none";
+
+  // 3. YAML parser resolution (read-only, no subprocess)
+  const yaml = options.yamlParser === undefined ? loadYaml(launcher, env, platform, cwd) : options.yamlParser ?? undefined;
+
+  // 4. Model route (`cordis.patch.yml`)
+  const patchPath = join(profileDir, "cordis.patch.yml");
+  const patchExists = profileExists && existsSync(patchPath);
+  const patchRead = patchExists ? readText(patchPath) : undefined;
+  let routeStatus = "unverified";
+  let defaultProvider;
+  let defaultModel;
+  let defaultReasoningEffort;
+  let routeLabel;
+  let routeDetail;
+  let routeFixHint;
+  let patchYamlError;
+  let patchListError;
+  let redactedProviders = [];
+  let referencedApiKeyEnvs = [];
+
+  if (!patchExists) {
+    routeStatus = "missing-patch";
+    routeLabel = "no cordis.patch.yml";
+    routeDetail = `the plugin should have written one at ${patchPath}`;
+    routeFixHint = `Restart the Paseo daemon to generate ${patchPath}, then configure your provider and default model.`;
+  } else if (patchRead.error !== undefined) {
+    routeStatus = "missing-patch";
+    routeLabel = "cordis.patch.yml is unreadable";
+    routeDetail = patchRead.error;
+    routeFixHint = `Check file permissions on ${patchPath} so it can be read.`;
+  } else if (yaml === undefined) {
+    routeStatus = "unverified";
+    routeLabel = "model route not verified";
+    routeDetail = "no YAML parser resolves from here, so the parsed route cannot be judged";
+    routeFixHint = "Ensure DeepSeek Harness (dsh) is installed so its YAML parser can validate cordis.patch.yml.";
+  } else {
+    let patchDocument;
+    try {
+      patchDocument = parseYaml(yaml, patchRead.text);
+    } catch (error) {
+      routeStatus = "invalid-yaml";
+      patchYamlError = scrubErrorSnippet(error instanceof Error ? error.message : String(error));
+      routeLabel = "cordis.patch.yml is not valid YAML";
+      routeDetail = patchYamlError;
+      routeFixHint = `Fix the YAML syntax error in ${patchPath} and restart the Paseo daemon.`;
+    }
+    if (patchYamlError === undefined) {
+      const patchList = patchEntries(patchDocument);
+      if (patchList.error !== undefined) {
+        routeStatus = "invalid-patch";
+        patchListError = patchList.error;
+        routeLabel = "cordis.patch.yml is not a loader patch list";
+        routeDetail = patchList.error;
+        routeFixHint = `Ensure ${patchPath} is a top-level YAML list of loader patch entries (each starting with "- id:").`;
+      } else {
+        const entries = patchList.entries;
+        const defaultEntry = entryById(entries, "agent-default-model");
+        const providers = providerProfiles(entryById(entries, "llm-pi-ai"));
+
+        if (defaultEntry === undefined) {
+          routeStatus = "missing-default";
+          routeLabel = "no agent-default-model in the profile patch";
+          routeDetail = `edit ${patchPath} (see the README install walkthrough) then restart the daemon`;
+          routeFixHint = `Add an "agent-default-model" entry with provider and model to ${patchPath}, then restart the daemon.`;
+        } else if (defaultEntry.disabled === true) {
+          routeStatus = "disabled";
+          routeLabel = "agent-default-model is disabled";
+          routeDetail = `remove \`disabled: true\` from the agent-default-model entry in ${patchPath}`;
+          routeFixHint = `Remove "disabled: true" from agent-default-model in ${patchPath} and restart the daemon.`;
+        } else {
+          const routeConfig = defaultEntry.config;
+          const provider =
+            routeConfig !== null && typeof routeConfig === "object" && !Array.isArray(routeConfig)
+              ? routeConfig.provider
+              : undefined;
+          const model =
+            routeConfig !== null && typeof routeConfig === "object" && !Array.isArray(routeConfig)
+              ? routeConfig.model
+              : undefined;
+          const reasoningEffort =
+            routeConfig !== null && typeof routeConfig === "object" && !Array.isArray(routeConfig)
+              ? routeConfig.reasoningEffort
+              : undefined;
+          const providerName = typeof provider === "string" ? provider.trim() : "";
+          const modelName = typeof model === "string" ? model.trim() : "";
+          if (providerName !== "") defaultProvider = providerName;
+          if (modelName !== "") defaultModel = modelName;
+          if (typeof reasoningEffort === "string" && reasoningEffort.trim() !== "") {
+            defaultReasoningEffort = reasoningEffort.trim();
+          }
+
+          if (providerName === "" || modelName === "") {
+            routeStatus = "incomplete";
+            routeLabel = "model route is incomplete";
+            routeDetail = `set both provider: and model: under agent-default-model in ${patchPath}`;
+            routeFixHint = `Set non-empty provider and model under agent-default-model.config in ${patchPath}, then restart the daemon.`;
+          } else if (providers === undefined || Object.keys(providers).length === 0) {
+            routeStatus = "unknown-provider";
+            routeLabel = `model route references provider "${providerName}" but no providers are configured`;
+            routeDetail = `add it under the llm-pi-ai entry's config.providers in ${patchPath}`;
+            routeFixHint = `Configure "${providerName}" under llm-pi-ai.config.providers in ${patchPath}, then restart the daemon.`;
+          } else if (!Object.prototype.hasOwnProperty.call(providers, providerName)) {
+            routeStatus = "unknown-provider";
+            routeLabel = `model route references unknown provider "${providerName}"`;
+            routeDetail = `providers defined in ${patchPath}: ${Object.keys(providers).join(", ")}`;
+            routeFixHint = `Set agent-default-model.config.provider in ${patchPath} to one of: ${Object.keys(providers).join(", ")}, or add "${providerName}" under llm-pi-ai.config.providers.`;
+          } else {
+            routeStatus = "configured";
+            routeLabel = "model route configured";
+            routeDetail = `default: ${providerName} / ${modelName}`;
+          }
+        }
+
+        const extracted = extractRedactedProviders(providers, defaultProvider);
+        redactedProviders = extracted.providers;
+        referencedApiKeyEnvs = extracted.referencedApiKeyEnvs;
+      }
+    }
+  }
+
+  // 5. Credentials (`.credentials.yaml`) — NEVER expose raw contents or YAML parser errors!
+  const credentialPath = join(dshHome, ".credentials.yaml");
+  const credentialExists = existsSync(credentialPath);
+  const credentialMode = credentialExists ? statMode(credentialPath) : undefined;
+  const credentialModeBits = credentialMode !== undefined ? credentialMode & 0o777 : undefined;
+  const credentialModeOctal =
+    platform !== "win32" && credentialModeBits !== undefined
+      ? `0${credentialModeBits.toString(8).padStart(3, "0")}`
+      : undefined;
+  const ownerOnly =
+    platform === "win32"
+      ? true
+      : credentialMode !== undefined
+        ? (credentialMode & CREDENTIALS_GROUP_OTHER) === 0
+        : undefined;
+  const credentialRead = readText(credentialPath);
+  const credentialReadable = credentialRead.error === undefined;
+
+  let credentialFormatValid;
+  let credentialLegacy = false;
+  let credentialContractProblems = [];
+  let referencedRefs = [];
+  let missingRefs = [];
+  let credentialStatus;
+  let credentialFixHint;
+
+  if (!credentialExists) {
+    credentialStatus = "missing-file";
+    credentialFixHint = `Create ${credentialPath} with mode 0600 ("chmod 600 ${credentialPath}"), "version: 1", and your "refs:" entries.`;
+  } else if (!credentialReadable) {
+    credentialStatus = "unreadable";
+    credentialFixHint = `Check permissions on ${credentialPath} so the current user can read it (recommended mode 0600).`;
+  } else if (yaml === undefined) {
+    credentialStatus = ownerOnly === false ? "bad-permissions" : "unverified";
+    if (ownerOnly === false) {
+      credentialFixHint = `Run "chmod 600 ${credentialPath}" — DSH refuses to start with a credentials document other users can read.`;
+    }
+  } else {
+    let parsedCreds;
+    let yamlOk = true;
+    try {
+      parsedCreds = parseYaml(yaml, credentialRead.text);
+    } catch {
+      // NEVER read or echo error.message: YAML parsers quote offending lines
+      // which may contain raw API keys.
+      yamlOk = false;
+    }
+    credentialFormatValid = yamlOk;
+    if (!yamlOk) {
+      credentialStatus = ownerOnly === false ? "bad-permissions" : "invalid-yaml";
+      credentialFixHint =
+        ownerOnly === false
+          ? `Run "chmod 600 ${credentialPath}" and fix YAML syntax errors in ${credentialPath} (use "version: 1" + "refs:").`
+          : `Fix YAML syntax errors in ${credentialPath} (must be a valid YAML document with "version: 1" and "refs:").`;
+    } else {
+      const contract = credentialContract(parsedCreds, credentialRead.text, credentialPath);
+      credentialLegacy = contract.legacy;
+      credentialContractProblems = contract.problems;
+      if (contract.problems.length > 0) {
+        credentialStatus = ownerOnly === false ? "bad-permissions" : "invalid-contract";
+        credentialFixHint =
+          ownerOnly === false
+            ? `Run "chmod 600 ${credentialPath}" and fix the credentials document format (${contract.problems[0].label}).`
+            : contract.problems[0].fixHint;
+      } else {
+        const refsObject = contract.refs;
+        const refMap = new Map();
+        for (const name of referencedApiKeyEnvs) {
+          const value = refsObject[name];
+          const present = typeof value === "string" && value.trim() !== "";
+          refMap.set(name, present);
+          referencedRefs.push({ name, present });
+          if (!present) missingRefs.push(name);
+        }
+        // Attach boolean readiness per provider (never any secret value!)
+        redactedProviders = redactedProviders.map((provider) =>
+          provider.apiKeyEnv === undefined
+            ? provider
+            : { ...provider, credentialReady: refMap.get(provider.apiKeyEnv) === true },
+        );
+        const refLocation = credentialLegacy ? "at the top level" : 'under "refs:"';
+        if (ownerOnly === false) {
+          credentialStatus = "bad-permissions";
+          credentialFixHint = `Run "chmod 600 ${credentialPath}" — DSH refuses to start with a credentials document other users can read.`;
+        } else if (referencedApiKeyEnvs.length === 0) {
+          credentialStatus = "no-refs-needed";
+        } else if (missingRefs.length > 0) {
+          credentialStatus = "missing-refs";
+          credentialFixHint =
+            `Add ${missingRefs.map((n) => `"${n}: <your-key>"`).join(", ")} ${refLocation} in ${credentialPath} ` +
+            `(with "version: 1" and mode 0600).`;
+        } else {
+          credentialStatus = "ready";
+        }
+      }
+    }
+  }
+
+  return {
+    dshHome,
+    profile,
+    profileFromEnv,
+    profileDir,
+    binary,
+    launcher,
+    dshPath,
+    platform,
+    profileExists,
+    profileBundle,
+    bridge: {
+      status: bridgeStatus,
+      location: bridgeLocationKind,
+      activeDir: bridgeDir,
+      localDir: bridgeLocs.local,
+      sharedDir: bridgeLocs.shared,
+      localExists: localBridge,
+      sharedExists: sharedBridge,
+      shadowed: localBridge && sharedBridge,
+      fileListError: bridgeFileList.error,
+      entryExists,
+      expectedFiles,
+      presentFiles,
+      missingFiles,
+    },
+    yamlAvailable: yaml !== undefined,
+    patch: {
+      path: patchPath,
+      exists: patchExists,
+      readError: patchRead?.error,
+      yamlError: patchYamlError,
+      listError: patchListError,
+      status: routeStatus,
+      defaultProvider,
+      defaultModel,
+      defaultReasoningEffort,
+      label: routeLabel,
+      detail: routeDetail,
+      fixHint: routeFixHint,
+    },
+    providers: redactedProviders,
+    referencedApiKeyEnvs,
+    credentials: {
+      path: credentialPath,
+      exists: credentialExists,
+      readable: credentialReadable,
+      readError: credentialRead.error,
+      mode: credentialMode,
+      modeBits: credentialModeBits,
+      modeOctal: credentialModeOctal,
+      ownerOnly,
+      formatValid: credentialFormatValid,
+      legacy: credentialLegacy,
+      contractProblems: credentialContractProblems,
+      referencedRefs,
+      missingRefs,
+      status: credentialStatus,
+      fixHint: credentialFixHint,
+    },
+  };
+}
+
+/**
+ * Evaluate the ordered list of doctor checks from pre-gathered probes + file
+ * inspection. Used identically by both `runDoctorChecks` (sync) and
+ * `runDoctorChecksAsync` (async).
+ */
+function evaluateDoctorChecks({
+  pluginVersion,
+  files,
+  dshVersion,
+  paseo,
+  paseoPluginsListed,
+  dumped,
+  dumpTimeoutMs,
+}) {
+  const checks = [];
+  const add = (id, category, level, label, detail, fixHint) => {
+    checks.push({
+      id,
+      category,
+      level,
+      label,
+      ...(detail === undefined || detail === "" ? {} : { detail }),
+      ...(fixHint === undefined || fixHint === "" ? {} : { fixHint }),
+    });
+  };
+
+  const finalize = () => {
+    let ok = 0;
+    let warn = 0;
+    let fail = 0;
+    for (const item of checks) {
+      if (item.level === "ok") ok += 1;
+      else if (item.level === "warn") warn += 1;
+      else fail += 1;
+    }
+    return {
+      pluginVersion,
+      dshHome: files.dshHome,
+      profile: files.profile,
+      profileFromEnv: files.profileFromEnv,
+      profileDir: files.profileDir,
+      binary: files.binary,
+      dshPath: files.dshPath,
+      dshVersion: dshVersion === undefined ? undefined : firstLine(dshVersion),
+      paseoVersion: paseo?.version,
+      checks,
+      summary: {
+        ok,
+        warn,
+        fail,
+        total: checks.length,
+        blocking: fail > 0,
+        exitCode: fail > 0 ? 1 : 0,
+      },
+      timedOut: Boolean(dumped?.timedOut),
+    };
+  };
 
   // 1. CLIs
-  // The doctor must launch DSH the same way the provider will: on Windows the
-  // npm global install is a `.cmd` shim that neither `run()` nor `dumpProfile()`
-  // can execute directly. `PASEO_CLI` is the explicit escape hatch for hosts
-  // where the desktop app's bundled CLI is not on PATH.
-  const launcher = resolveDshCommand(process.env.DSH_BINARY ?? "dsh", process.env);
-  const dshVersion = run(launcher.command, [...launcher.args, "--version"]);
   if (dshVersion === undefined) {
-    report("fail", "dsh on PATH", "install the official DeepSeek Harness and put `dsh` on the daemon's PATH");
+    add(
+      "dsh-cli",
+      "cli",
+      "fail",
+      "dsh on PATH",
+      "install the official DeepSeek Harness and put `dsh` on the daemon's PATH",
+      `Install DeepSeek Harness (npm install -g @deepseek-ai/dsh) and ensure "dsh" is on the daemon's PATH, or set DSH_BINARY.`,
+    );
   } else {
-    const dshLine = line(dshVersion);
+    const dshLine = firstLine(dshVersion);
     const got = parseVersion(dshLine);
     const minimum = parseVersion(MINIMUM_DSH);
-    const pluginMM = pluginVersion.match(/^(\d+)\.(\d+)/);
+    const pluginMM = typeof pluginVersion === "string" ? pluginVersion.match(/^(\d+)\.(\d+)/) : null;
     if (got === undefined) {
-      // "We could not check this" and "this is fine" are different answers; the
-      // bridge imports five DSH packages, so refuse to assume.
-      report("warn", `dsh ${dshLine}`, `could not read a version; this plugin needs DSH >= ${MINIMUM_DSH}`);
+      add("dsh-cli", "cli", "warn", `dsh ${dshLine}`, `could not read a version; this plugin needs DSH >= ${MINIMUM_DSH}`);
     } else if (minimum !== undefined && compareCore(got, minimum) < 0) {
-      report(
+      add(
+        "dsh-cli",
+        "cli",
         "fail",
         `dsh ${dshLine}`,
         `needs DSH >= ${MINIMUM_DSH}: the bridge imports @deepseek-ai/dsh-{cmdline,brand,llm,attachment,agent}, and 0.2.1 changed prompt variables and catalog materialization`,
+        `Upgrade DeepSeek Harness to >= ${MINIMUM_DSH} (npm install -g @deepseek-ai/dsh@latest) and restart the Paseo daemon.`,
       );
     } else if (pluginMM && `${got.major}.${got.minor}` !== `${pluginMM[1]}.${pluginMM[2]}`) {
-      report(
+      add(
+        "dsh-cli",
+        "cli",
         "warn",
         `dsh ${dshLine}`,
         `plugin ${pluginVersion} targets the ${pluginMM[1]}.${pluginMM[2]}.x DSH line; this line was not verified`,
       );
     } else {
-      report("ok", `dsh ${dshLine}`);
+      add("dsh-cli", "cli", "ok", `dsh ${dshLine}`);
     }
   }
 
-  const paseo = findPaseo();
   if (paseo === undefined) {
-    // The Windows desktop app can host this provider without a PATH CLI, so a
-    // missing `paseo` is not a blocking install defect there; the app's own
-    // version has to be checked in the app instead (this row cannot read it).
-    report(
-      process.platform === "win32" ? "warn" : "fail",
-      process.platform === "win32" ? "paseo CLI version not checked" : "paseo CLI not found",
-      process.platform === "win32"
+    const isWin = files.platform === "win32";
+    add(
+      "paseo-cli",
+      "cli",
+      isWin ? "warn" : "fail",
+      isWin ? "paseo CLI version not checked" : "paseo CLI not found",
+      isWin
         ? `the Windows desktop app can run without a PATH CLI; verify its version in the app (Paseo >= ${MINIMUM_PASEO})`
         : "expected `paseo` on PATH, PASEO_CLI, or /Applications/Paseo.app",
+      isWin ? undefined : 'Ensure "paseo" is on PATH or set PASEO_CLI to the Paseo CLI path.',
     );
   } else if (!atLeast(paseo.version, MINIMUM_PASEO)) {
-    report(
+    add(
+      "paseo-cli",
+      "cli",
       "fail",
       `paseo ${paseo.version}`,
       `needs Paseo >= ${MINIMUM_PASEO} stable (this build uses the stable workspace badge API; 0.16.0 prerelease hosts do not satisfy this floor)`,
+      `Upgrade Paseo to >= ${MINIMUM_PASEO} stable and restart the daemon.`,
     );
   } else {
     if (parseVersion(paseo.version)?.prerelease !== undefined) {
-      report("warn", `paseo ${paseo.version}`, "this later prerelease was not verified; run the host contract checks before adopting it");
+      add(
+        "paseo-cli",
+        "cli",
+        "warn",
+        `paseo ${paseo.version}`,
+        "this later prerelease was not verified; run the host contract checks before adopting it",
+      );
     } else {
-      report("ok", `paseo ${paseo.version}`);
+      add("paseo-cli", "cli", "ok", `paseo ${paseo.version}`);
     }
-    // The profile can exist without the plugin — `install.sh` creates one too —
-    // so "profile is there" never proved the plugin is.
-    const listed = run(paseo.cmd, ["plugin", "ls"]);
-    if (listed === undefined) {
-      report("warn", "could not list Paseo plugins", "run `paseo plugin ls` to confirm dsh-paseo is enabled");
+    if (paseoPluginsListed === undefined) {
+      add("paseo-plugin", "plugin", "warn", "could not list Paseo plugins", "run `paseo plugin ls` to confirm dsh-paseo is enabled");
     } else {
-      const row = listed.split("\n").find((entry) => entry.trimStart().startsWith("dsh-paseo"));
+      const row = paseoPluginsListed.split("\n").find((entry) => entry.trimStart().startsWith("dsh-paseo"));
       if (row === undefined) {
-        report(
+        add(
+          "paseo-plugin",
+          "plugin",
           "fail",
           "dsh-paseo is not installed in Paseo",
           "install it with `paseo plugin add github:bccy/paseo-dsh:paseo-plugin` (the npm `paseo-dsh` is the upstream stable line and does not carry this branch)",
+          'Install the plugin with "paseo plugin add github:bccy/paseo-dsh:paseo-plugin" and restart the daemon.',
         );
       } else if (!/\brunning\b/.test(row)) {
-        report("warn", "dsh-paseo is installed but not running", "enable it and restart the daemon");
+        add("paseo-plugin", "plugin", "warn", "dsh-paseo is installed but not running", "enable it and restart the daemon");
       } else {
-        report("ok", "dsh-paseo plugin running");
+        add("paseo-plugin", "plugin", "ok", "dsh-paseo plugin running");
       }
     }
   }
 
-  // 2. profile provisioned by the plugin
-  if (!existsSync(profileDir)) {
-    report(
+  // 2. Profile provisioned by the plugin
+  if (!files.profileExists) {
+    add(
+      "profile-dir",
+      "profile",
       "fail",
-      `DSH profile "${profile}" missing`,
-      `expected ${profileDir}. Install the plugin and restart the daemon — the plugin creates it on load.`,
+      `DSH profile "${files.profile}" missing`,
+      `expected ${files.profileDir}. Install the plugin and restart the daemon — the plugin creates it on load.`,
+      `Install or reload the dsh-paseo plugin and restart the Paseo daemon so it creates ${files.profileDir}.`,
     );
-    finish();
-    return;
+    return finalize();
   }
-  report("ok", `DSH profile at ${profileDir}`);
+  add("profile-dir", "profile", "ok", `DSH profile at ${files.profileDir}`);
 
-  // The directory alone is not a profile DSH can load, and a profile whose
-  // bundle list omits the bridge boots without it. Both were `ok` before.
-  const profileBundle = profileBundleVerdict(profileDir, profile);
-  if (profileBundle.ok) report("ok", `profile loads the ${BRIDGE_PACKAGE} bundle`);
-  else report("fail", profileBundle.label, profileBundle.detail);
+  if (files.profileBundle.ok) {
+    add("profile-manifest", "profile", "ok", `profile loads the ${BRIDGE_PACKAGE} bundle`);
+  } else {
+    add(
+      "profile-manifest",
+      "profile",
+      "fail",
+      files.profileBundle.label,
+      files.profileBundle.detail,
+      files.profileBundle.fixHint,
+    );
+  }
 
-  const bridge = bridgeLocations(profileDir, dshHome);
-  const localBridge = pathExists(bridge.local);
-  const sharedBridge = pathExists(bridge.shared);
-  const bridgeDir = localBridge ? bridge.local : bridge.shared;
-  if (localBridge && sharedBridge) {
-    // Both copies exist, and DSH resolves the profile-local one first, so the
-    // shared generation the plugin just wrote is not what boots. That is the
-    // state a failed migration or a manual copy leaves behind; naming it keeps
-    // doctor from reporting the provisioned copy while DSH loads the stale one.
-    report(
+  if (files.bridge.shadowed) {
+    add(
+      "bridge-shadow",
+      "bridge",
       "warn",
       "a legacy bridge copy shadows the provisioned one",
-      `${bridge.local} is resolved before ${bridge.shared}, so DSH loads the legacy copy. ` +
-        `Restart the Paseo daemon (the plugin moves it to the shared anchor on load) or delete ${bridge.local}.`,
+      `${files.bridge.localDir} is resolved before ${files.bridge.sharedDir}, so DSH loads the legacy copy. ` +
+        `Restart the Paseo daemon (the plugin moves it to the shared anchor on load) or delete ${files.bridge.localDir}.`,
+      `Delete ${files.bridge.localDir} or restart the Paseo daemon so DSH loads the shared bridge.`,
     );
   }
-  // Every file the plugin writes, not just the entry. `lib/index.js` exists in a
-  // bridge missing `lib/child-anchors.js` and still fails to load, and that is
-  // exactly the case this check used to call `ok` (see loadBridgeFileList).
-  const bridgeFiles = loadBridgeFileList();
-  if (bridgeFiles.error !== undefined) {
-    // `fail`, not `warn`: the file list is generated from the plugin's own
-    // `server/bridge-assets.ts`, so a run that cannot read it is a run that
-    // cannot tell a complete bridge from a half-written one. Warning here and
-    // then reporting the entry alone put "1 warning(s) — nothing blocking" and
-    // exit 0 on a bridge missing 15 of 18 files, which is the same verdict a
-    // working install gets for one DSH cannot load. "We could not check this"
-    // and "this is fine" are different answers; the YAML row above already
-    // refuses to conflate them.
-    report(
+
+  if (files.bridge.fileListError !== undefined) {
+    add(
+      "bridge-files",
+      "bridge",
       "fail",
       "bridge contents not verified",
-      `${bridgeFiles.error}. The complete file list is required to judge the bridge, so this install ` +
+      `${files.bridge.fileListError}. The complete file list is required to judge the bridge, so this install ` +
         `cannot be called healthy; reinstall the plugin from a complete checkout, then restart the daemon.`,
+      "Reinstall the dsh-paseo plugin from a complete package or checkout, then restart the Paseo daemon.",
     );
-    const entryOnly = join(bridgeDir, "lib", "index.js");
-    if (!existsSync(entryOnly)) {
-      report("fail", "bridge bundle missing", `expected ${entryOnly}; restart the daemon to let the plugin re-provision`);
-    }
-  } else {
-    const missing = bridgeFiles.keys.filter((relativePath) => !existsSync(join(bridgeDir, relativePath)));
-    if (missing.length === 0) {
-      report("ok", `bridge bundle provisioned (${bridgeFiles.keys.length} files)`, bridgeDir);
-    } else {
-      // Name the files: "the bridge is incomplete" leaves the user guessing which
-      // half-written file to look at, and there is no partial repair to offer —
-      // the plugin rewrites the whole package or nothing.
-      const shown = missing.slice(0, 5).join(", ");
-      const more = missing.length > 5 ? ` and ${missing.length - 5} more` : "";
-      report(
+    if (!files.bridge.entryExists) {
+      const entryOnly = join(files.bridge.activeDir, "lib", "index.js");
+      add(
+        "bridge-entry",
+        "bridge",
         "fail",
-        `bridge bundle incomplete — ${missing.length} of ${bridgeFiles.keys.length} files missing`,
-        `missing: ${shown}${more}. Restart the Paseo daemon so the plugin re-provisions ${bridgeDir}; ` +
-          `if it persists, delete that directory and restart`,
+        "bridge bundle missing",
+        `expected ${entryOnly}; restart the daemon to let the plugin re-provision`,
+        "Restart the Paseo daemon so the plugin provisions the bridge bundle.",
       );
     }
+  } else if (files.bridge.missingFiles.length === 0) {
+    add("bridge-files", "bridge", "ok", `bridge bundle provisioned (${files.bridge.expectedFiles} files)`, files.bridge.activeDir);
+  } else {
+    const missing = files.bridge.missingFiles;
+    const shown = missing.slice(0, 5).join(", ");
+    const more = missing.length > 5 ? ` and ${missing.length - 5} more` : "";
+    add(
+      "bridge-files",
+      "bridge",
+      "fail",
+      `bridge bundle incomplete — ${missing.length} of ${files.bridge.expectedFiles} files missing`,
+      `missing: ${shown}${more}. Restart the Paseo daemon so the plugin re-provisions ${files.bridge.activeDir}; ` +
+        `if it persists, delete that directory and restart`,
+      `Restart the Paseo daemon to re-provision ${files.bridge.activeDir}; if files remain missing, delete that directory and restart.`,
+    );
   }
 
-  // 3. model route
-  const patchPath = join(profileDir, "cordis.patch.yml");
-  if (!existsSync(patchPath)) {
-    report("fail", "no cordis.patch.yml", `the plugin should have written one at ${patchPath}`);
-    finish();
-    return;
+  // 3. Model route
+  if (!files.patch.exists) {
+    add("patch-file", "route", "fail", "no cordis.patch.yml", `the plugin should have written one at ${files.patch.path}`, files.patch.fixHint);
+    return finalize();
   }
-  const patchRead = readText(patchPath);
-  if (patchRead.error !== undefined) {
-    report("fail", "cordis.patch.yml is unreadable", patchRead.error);
-    finish();
-    return;
+  if (files.patch.readError !== undefined) {
+    add("patch-file", "route", "fail", "cordis.patch.yml is unreadable", files.patch.readError, files.patch.fixHint);
+    return finalize();
   }
-  const patch = patchRead.text;
-
-  const yaml = loadYaml(launcher);
-  if (yaml === undefined) {
-    // Semantics are judged on the parsed document now, so without a parser
-    // there is nothing honest to say about the route or the credentials. Say
-    // that out loud instead of falling back to the text scan that produced the
-    // false greens this check exists to prevent.
-    report(
+  if (!files.yamlAvailable) {
+    add(
+      "yaml-parser",
+      "route",
       "warn",
       "YAML syntax not validated",
       "no YAML parser resolves from here; the route and credential semantics are not inspected either",
     );
-    report("warn", "model route not verified", "no YAML parser resolves from here, so the parsed route cannot be judged");
-    report("warn", "credentials not verified", "no YAML parser resolves from here, so refs: cannot be judged");
-    finish();
-    return;
+    add("model-route", "route", "warn", "model route not verified", "no YAML parser resolves from here, so the parsed route cannot be judged");
+    add("credentials", "credentials", "warn", "credentials not verified", "no YAML parser resolves from here, so refs: cannot be judged");
+    return finalize();
   }
-  let patchDocument;
-  try {
-    patchDocument = parseYaml(yaml, patch);
-  } catch (error) {
-    report("fail", "cordis.patch.yml is not valid YAML", String(error.message).split("\n")[0]);
-    finish();
-    return;
+  if (files.patch.yamlError !== undefined) {
+    add("patch-yaml", "route", "fail", "cordis.patch.yml is not valid YAML", files.patch.yamlError, files.patch.fixHint);
+    return finalize();
   }
-
-  const patchList = patchEntries(patchDocument);
-  if (patchList.error !== undefined) {
-    report("fail", "cordis.patch.yml is not a loader patch list", patchList.error);
-    finish();
-    return;
+  if (files.patch.listError !== undefined) {
+    add("patch-list", "route", "fail", "cordis.patch.yml is not a loader patch list", files.patch.listError, files.patch.fixHint);
+    return finalize();
   }
-  const entries = patchList.entries;
-  const defaultEntry = entryById(entries, "agent-default-model");
-  const providers = providerProfiles(entryById(entries, "llm-pi-ai"));
-
-  if (defaultEntry === undefined) {
-    report(
-      "fail",
-      "no agent-default-model in the profile patch",
-      `edit ${patchPath} (see the README install walkthrough) then restart the daemon`,
-    );
-  } else if (defaultEntry.disabled === true) {
-    // DSH composes the patch by id: `disabled: true` turns the default-model
-    // service off, so the route is not merely invalid — it is not active at all.
-    report(
-      "fail",
-      "agent-default-model is disabled",
-      `remove \`disabled: true\` from the agent-default-model entry in ${patchPath}`,
-    );
+  if (files.patch.status === "configured") {
+    add("model-route", "route", "ok", files.patch.label, files.patch.detail);
   } else {
-    const routeConfig = defaultEntry.config;
-    const provider =
-      routeConfig !== null && typeof routeConfig === "object" && !Array.isArray(routeConfig)
-        ? routeConfig.provider
-        : undefined;
-    const model =
-      routeConfig !== null && typeof routeConfig === "object" && !Array.isArray(routeConfig)
-        ? routeConfig.model
-        : undefined;
-    // Non-empty *strings* after trimming: `provider: ""` and `provider:` both
-    // used to satisfy the old regex, and a number is not a route id either.
-    const providerName = typeof provider === "string" ? provider.trim() : "";
-    const modelName = typeof model === "string" ? model.trim() : "";
-    if (providerName === "" || modelName === "") {
-      report(
-        "fail",
-        "model route is incomplete",
-        `set both provider: and model: under agent-default-model in ${patchPath}`,
-      );
-    } else if (providers === undefined || Object.keys(providers).length === 0) {
-      report(
-        "fail",
-        `model route references provider "${providerName}" but no providers are configured`,
-        `add it under the llm-pi-ai entry's config.providers in ${patchPath}`,
-      );
-    } else if (!Object.prototype.hasOwnProperty.call(providers, providerName)) {
-      report(
-        "fail",
-        `model route references unknown provider "${providerName}"`,
-        `providers defined in ${patchPath}: ${Object.keys(providers).join(", ")}`,
-      );
-    } else {
-      report("ok", "model route configured", `default: ${providerName} / ${modelName}`);
-    }
+    add("model-route", "route", "fail", files.patch.label, files.patch.detail, files.patch.fixHint);
   }
 
-  // 3b. DSH must actually apply the patch, not skip it with a warning.
-  // The dump is only meaningful once the profile is a profile DSH can load
-  // (a missing package.json makes it print `profile does not exist`, which the
-  // row above already reports) and once the dsh CLI was found.
-  if (profileBundle.ok && dshVersion !== undefined) {
-    const dumped = dumpProfile(profile, launcher);
+  // 3b. DSH composition (`dsh --profile <p> --dump-config`)
+  if (dumped !== undefined) {
     const diagnostics = dumpDiagnostics(dumped.stderr);
-    const profileSkips = diagnostics.filter((entry) => entry.includes(`[${patchPath}]`));
+    const profileSkips = diagnostics.filter((entry) => entry.includes(`[${files.patch.path}]`));
     const skippedBundles = diagnostics.filter((entry) => /^dsh: skipping profile bundle "[^"]*":/.test(entry));
     const skippedBridge = skippedBundles.filter((entry) => entry.includes(`"${BRIDGE_PACKAGE}"`));
     const others = diagnostics.filter((entry) => !profileSkips.includes(entry) && !skippedBundles.includes(entry));
     const otherBundles = skippedBundles.filter((entry) => !skippedBridge.includes(entry));
+
     if (dumped.error !== undefined || dumped.status !== 0) {
-      report(
+      add(
+        "profile-composition",
+        "composition",
         "fail",
-        `DSH cannot compose profile "${profile}"`,
-        `${dumpFailure(dumped)}. The bundle and patch layers were not composed, so DSH cannot boot this profile; ` +
-          `fix that error (run \`dsh --profile ${profile} --dump-config\` for the full output) before anything else.`,
+        `DSH cannot compose profile "${files.profile}"`,
+        `${dumpFailure(dumped, dumpTimeoutMs)}. The bundle and patch layers were not composed, so DSH cannot boot this profile; ` +
+          `fix that error (run \`dsh --profile ${files.profile} --dump-config\` for the full output) before anything else.`,
+        `Run "dsh --profile ${files.profile} --dump-config" in a terminal to inspect and fix the composition error.`,
       );
     } else {
       if (profileSkips.length === 0 && skippedBridge.length === 0) {
-        report(
+        add(
+          "profile-composition",
+          "composition",
           "ok",
           "profile patch applied by DSH",
-          `dsh --profile ${profile} --dump-config composed it without skipping a patch entry`,
+          `dsh --profile ${files.profile} --dump-config composed it without skipping a patch entry`,
         );
       }
       if (profileSkips.length > 0) {
-        // This is the silent failure the check exists for: `name` does not match
-        // the composed row (or `id` matches nothing), DSH warns once at boot and
-        // continues on the base route, and the patch file still looks right.
-        report(
+        add(
+          "profile-composition-skips",
+          "composition",
           "fail",
-          `DSH skipped ${profileSkips.length === 1 ? "a patch entry" : `${String(profileSkips.length)} patch entries`} from ${patchPath}`,
+          `DSH skipped ${profileSkips.length === 1 ? "a patch entry" : `${String(profileSkips.length)} patch entries`} from ${files.patch.path}`,
           `${quoteDiagnostics(profileSkips)} Fix the entry's id/name so it matches the composed row, then restart ` +
-            `the daemon; \`dsh --profile ${profile} --dump-config\` prints the same warning and the composed result.`,
+            `the daemon; \`dsh --profile ${files.profile} --dump-config\` prints the same warning and the composed result.`,
+          `Fix the mismatched id/name in ${files.patch.path} so DSH applies the entry, then restart the Paseo daemon.`,
         );
       }
       if (skippedBridge.length > 0) {
-        report(
+        add(
+          "profile-composition-bridge",
+          "composition",
           "fail",
           `DSH skipped the ${BRIDGE_PACKAGE} bundle`,
           `${quoteDiagnostics(skippedBridge)} The bridge cannot answer a session unless DSH loads it; reinstall the ` +
             `plugin, then restart the daemon.`,
+          "Reinstall or reload the dsh-paseo plugin so the bridge bundle is intact, then restart the Paseo daemon.",
         );
       }
       if (others.length > 0 || otherBundles.length > 0) {
-        report(
+        add(
+          "profile-composition-warnings",
+          "composition",
           "warn",
           "other profile composition warnings",
           `${quoteDiagnostics([...others, ...otherBundles])} These come from the bundle layers or the home-level ` +
@@ -1034,96 +1592,262 @@ export function runDoctor() {
     }
   }
 
-  // 4. credentials: DSH's document contract first, then every referenced apiKeyEnv
-  const credentialPath = join(dshHome, ".credentials.yaml");
-  const credentialRead = readText(credentialPath);
-  if (credentialRead.error !== undefined) {
-    report("fail", `cannot read ${credentialPath}`, credentialRead.error);
-    finish();
-    return;
+  // 4. Credentials: DSH's document contract first, then every referenced apiKeyEnv
+  const cred = files.credentials;
+  if (cred.readError !== undefined) {
+    add("credentials-file", "credentials", "fail", `cannot read ${cred.path}`, cred.readError, cred.fixHint);
+    return finalize();
   }
-  // DSH refuses the document before reading a single value when other OS users
-  // can read it (`assertOwnerOnly()` in dsh-credentials-local), and a
-  // hand-written file carries the umask's 0644 — the whole credentials service
-  // then fails to activate and every turn waits on it.
-  const credentialMode = statMode(credentialPath);
-  if (
-    process.platform !== "win32" &&
-    credentialMode !== undefined &&
-    (credentialMode & CREDENTIALS_GROUP_OTHER) !== 0
-  ) {
-    report(
+  if (files.platform !== "win32" && cred.mode !== undefined && (cred.mode & CREDENTIALS_GROUP_OTHER) !== 0) {
+    add(
+      "credentials-permissions",
+      "credentials",
       "fail",
-      `credentials file is readable beyond its owner (mode ${(credentialMode & 0o777).toString(8)})`,
-      `run "chmod 600 ${credentialPath}" — DSH refuses to start with a credentials document other users can read.`,
+      `credentials file is readable beyond its owner (mode ${(cred.mode & 0o777).toString(8)})`,
+      `run "chmod 600 ${cred.path}" — DSH refuses to start with a credentials document other users can read.`,
+      `Run "chmod 600 ${cred.path}" so only your OS user can read the credentials file.`,
     );
   }
-  let credentialDocument;
-  try {
-    credentialDocument = parseYaml(yaml, credentialRead.text);
-  } catch {
+  if (cred.formatValid === false) {
     // Never echo the parser's message: it can quote the offending source line,
     // and this file is where the raw credentials live.
-    report("fail", `${credentialPath} is not valid YAML`);
-    finish();
-    return;
+    add(
+      "credentials-yaml",
+      "credentials",
+      "fail",
+      `${cred.path} is not valid YAML`,
+      undefined,
+      `Fix YAML syntax errors in ${cred.path} (must contain "version: 1" and a "refs:" mapping, with mode 0600).`,
+    );
+    return finalize();
   }
-  // Judge the parsed document against the contract DSH enforces. A document
-  // DSH refuses cannot yield a "found" credential, so the per-ref rows are
-  // skipped rather than contradicting the blocking issue above them.
-  const contract = credentialContract(credentialDocument, credentialRead.text, credentialPath);
-  for (const problem of contract.problems) report("fail", problem.label, problem.detail);
-  if (contract.problems.length > 0) {
-    finish();
-    return;
+  for (let i = 0; i < cred.contractProblems.length; i += 1) {
+    const problem = cred.contractProblems[i];
+    add(`credentials-contract-${i}`, "credentials", "fail", problem.label, problem.detail, problem.fixHint);
   }
-  if (contract.legacy) {
-    report(
+  if (cred.contractProblems.length > 0) {
+    return finalize();
+  }
+  if (cred.legacy) {
+    add(
+      "credentials-legacy",
+      "credentials",
       "ok",
       "credentials document uses the pre-release flat layout",
-      `DSH migrates ${credentialPath} to "version: 1" + "refs:" in place on its next start; no hand edit needed.`,
+      `DSH migrates ${cred.path} to "version: 1" + "refs:" in place on its next start; no hand edit needed.`,
     );
   }
-  // `refs:` is the only place a credential may live: a key of the same name in
-  // another top-level section (or after `refs:` has ended) is not one. Parsed
-  // as an object, so YAML's own scoping decides that instead of a line window.
-  const refsObject = contract.refs;
-  const referenced = [];
-  for (const profile of Object.values(providers ?? {})) {
-    if (profile === null || typeof profile !== "object" || Array.isArray(profile)) continue;
-    if (typeof profile.apiKeyEnv === "string" && profile.apiKeyEnv.trim() !== "") referenced.push(profile.apiKeyEnv.trim());
-  }
-  const unique = [...new Set(referenced)];
-  // A flat-layout document keeps its refs at the top level until DSH migrates
-  // it; naming `refs:` there would produce the document the contract row above
-  // rejects.
-  const refLocation = contract.legacy ? "at the top level" : 'under "refs:"';
-  if (unique.length === 0) {
-    report("fail", "no apiKeyEnv referenced", "the route above should name the credential to use");
+
+  const refLocation = cred.legacy ? "at the top level" : 'under "refs:"';
+  if (files.referencedApiKeyEnvs.length === 0) {
+    add(
+      "credentials-refs",
+      "credentials",
+      "fail",
+      "no apiKeyEnv referenced",
+      "the route above should name the credential to use",
+      `Set "apiKeyEnv" on your provider under llm-pi-ai.config.providers in ${files.patch.path}.`,
+    );
   } else {
-    for (const name of unique) {
-      // The value has to be a non-empty string: `NAME:` with nothing after it
-      // parses as null and then 401'd on every turn.
-      const value = refsObject[name];
-      if (typeof value === "string" && value.trim() !== "") report("ok", `credential ${name} found`);
-      else
-        report(
+    for (const ref of cred.referencedRefs) {
+      if (ref.present) {
+        add(`credential-ref-${ref.name}`, "credentials", "ok", `credential ${ref.name} found`);
+      } else {
+        add(
+          `credential-ref-${ref.name}`,
+          "credentials",
           "fail",
-          `credential ${name} missing`,
-          // The repair has to produce a file DSH accepts: `refs:` without
-          // `version: 1`, or a 0644 file, is refused before the key is read.
-          `add "${name}: <your-key>" ${refLocation} in ${credentialPath}; the document needs "version: 1" at the ` +
-            `top and mode 0600 (chmod 600 ${credentialPath}).`,
+          `credential ${ref.name} missing`,
+          `add "${ref.name}: <your-key>" ${refLocation} in ${cred.path}; the document needs "version: 1" at the ` +
+            `top and mode 0600 (chmod 600 ${cred.path}).`,
+          `Add "${ref.name}: <your-key>" ${refLocation} in ${cred.path} (with "version: 1" and mode 0600).`,
         );
+      }
     }
   }
 
-  finish();
+  return finalize();
 }
 
-function finish() {
-  const fails = results.filter((r) => r === "fail").length;
-  const warns = results.filter((r) => r === "warn").length;
+/**
+ * Pure-style synchronous doctor check runner, usable by both CLI and offline tests.
+ *
+ * @param {object} [options]
+ * @returns {object} structured doctor report
+ */
+export function runDoctorChecks(options = {}) {
+  const env = options.env ?? process.env;
+  const cwd = options.cwd ?? process.cwd();
+  const dumpTimeoutMs = options.dumpTimeoutMs ?? DUMP_TIMEOUT_MS;
+  const checkBundledPaseo = options.checkBundledPaseo !== false;
+  const execFn = options.runner?.exec ?? runSync;
+  const dumpFn = options.runner?.dumpProfile ?? dumpProfileSync;
+
+  const pkg = readPluginVersion(options.pluginVersion);
+  if (pkg.error !== undefined) {
+    return {
+      fatalError: pkg.error,
+      pluginVersion: undefined,
+      dshHome: options.dshHome ?? resolveDshHome(env, cwd),
+      profile: options.profile ?? env.DSH_PASEO_PROFILE ?? "paseo",
+      profileFromEnv: options.profileFromEnv ?? (options.profile === undefined && env.DSH_PASEO_PROFILE !== undefined),
+      profileDir: join(options.dshHome ?? resolveDshHome(env, cwd), "profiles", options.profile ?? env.DSH_PASEO_PROFILE ?? "paseo"),
+      binary: options.binary ?? env.DSH_BINARY ?? "dsh",
+      dshPath: undefined,
+      dshVersion: undefined,
+      paseoVersion: undefined,
+      checks: [],
+      summary: { ok: 0, warn: 0, fail: 1, total: 0, blocking: true, exitCode: 1 },
+      timedOut: false,
+    };
+  }
+
+  const files = inspectInstallFiles(options);
+  const childEnv = { ...env, DSH_HOME: files.dshHome };
+
+  const dshVersion = execFn(files.launcher.command, [...files.launcher.args, "--version"], {
+    env: childEnv,
+    cwd,
+    timeoutMs: CLI_PROBE_TIMEOUT_MS,
+  });
+
+  const paseo = findPaseoSync(env, execFn, checkBundledPaseo, cwd);
+  const paseoPluginsListed =
+    paseo !== undefined && atLeast(paseo.version, MINIMUM_PASEO)
+      ? execFn(paseo.cmd, ["plugin", "ls"], { env, cwd, timeoutMs: CLI_PROBE_TIMEOUT_MS })
+      : undefined;
+
+  const canDump =
+    !options.skipDumpConfig &&
+    files.profileExists &&
+    files.profileBundle.ok &&
+    files.patch.exists &&
+    files.patch.readError === undefined &&
+    files.yamlAvailable &&
+    files.patch.yamlError === undefined &&
+    files.patch.listError === undefined &&
+    dshVersion !== undefined;
+
+  const dumped = canDump
+    ? dumpFn(files.profile, files.launcher, { env: childEnv, cwd, timeoutMs: dumpTimeoutMs })
+    : undefined;
+
+  return evaluateDoctorChecks({
+    pluginVersion: pkg.version,
+    files,
+    dshVersion,
+    paseo,
+    paseoPluginsListed,
+    dumped,
+    dumpTimeoutMs,
+  });
+}
+
+/**
+ * Non-blocking async doctor check runner for the Paseo plugin server, sharing
+ * 100% of validation logic with `runDoctorChecks` and the CLI.
+ *
+ * @param {object} [options]
+ * @returns {Promise<object>} structured doctor report
+ */
+export async function runDoctorChecksAsync(options = {}) {
+  const env = options.env ?? process.env;
+  const cwd = options.cwd ?? process.cwd();
+  const totalBudgetMs = options.timeoutMs ?? options.dumpTimeoutMs ?? DUMP_TIMEOUT_MS;
+  const deadline = Date.now() + totalBudgetMs;
+  const remainingMs = () => Math.max(1, deadline - Date.now());
+  const signal = options.signal;
+  const checkBundledPaseo = options.checkBundledPaseo !== false;
+  const execFn = options.runner?.exec ?? runAsync;
+  const dumpFn = options.runner?.dumpProfile ?? dumpProfileAsync;
+
+  const pkg = readPluginVersion(options.pluginVersion);
+  const files = inspectInstallFiles(options);
+  const childEnv = { ...env, DSH_HOME: files.dshHome };
+
+  const dshVersion = await execFn(files.launcher.command, [...files.launcher.args, "--version"], {
+    env: childEnv,
+    cwd,
+    signal,
+    timeoutMs: Math.min(CLI_PROBE_TIMEOUT_MS, remainingMs()),
+  });
+
+  const paseo = await findPaseoAsync(
+    env,
+    execFn,
+    checkBundledPaseo,
+    cwd,
+    signal,
+    Math.min(CLI_PROBE_TIMEOUT_MS, remainingMs()),
+  );
+  const paseoPluginsListed =
+    paseo !== undefined && atLeast(paseo.version, MINIMUM_PASEO)
+      ? await execFn(paseo.cmd, ["plugin", "ls"], {
+          env,
+          cwd,
+          signal,
+          timeoutMs: Math.min(CLI_PROBE_TIMEOUT_MS, remainingMs()),
+        })
+      : undefined;
+
+  const canDump =
+    !options.skipDumpConfig &&
+    files.profileExists &&
+    files.profileBundle.ok &&
+    files.patch.exists &&
+    files.patch.readError === undefined &&
+    files.yamlAvailable &&
+    files.patch.yamlError === undefined &&
+    files.patch.listError === undefined &&
+    dshVersion !== undefined;
+
+  const dumpTimeoutMs = Math.min(options.dumpTimeoutMs ?? totalBudgetMs, remainingMs());
+  const dumped = canDump
+    ? await dumpFn(files.profile, files.launcher, {
+        env: childEnv,
+        cwd,
+        signal,
+        timeoutMs: dumpTimeoutMs,
+      })
+    : undefined;
+
+  return evaluateDoctorChecks({
+    pluginVersion: pkg.version,
+    files,
+    dshVersion,
+    paseo,
+    paseoPluginsListed,
+    dumped,
+    dumpTimeoutMs: options.dumpTimeoutMs ?? totalBudgetMs,
+  });
+}
+
+/**
+ * Render a `runDoctorChecks()` report to stdout/stderr with the exact CLI
+ * layout and exit codes expected by `paseo-dsh doctor` and `harness/doctor-check.mjs`.
+ */
+export function runDoctor(options) {
+  installStdoutEpipeGuard();
+  const report = runDoctorChecks(options);
+  if (report.fatalError !== undefined) {
+    process.stderr.write(`${report.fatalError}\n`);
+    process.exitCode = 1;
+    return;
+  }
+
+  process.stdout.write(`\n${DIM}paseo-dsh doctor  (plugin ${report.pluginVersion})${RESET}\n`);
+  process.stdout.write(
+    `${DIM}profile "${report.profile}" (${report.profileFromEnv ? "DSH_PASEO_PROFILE" : "default; the daemon must use the same value"})${RESET}\n\n`,
+  );
+
+  for (const item of report.checks) {
+    const tag =
+      item.level === "ok" ? `${GREEN}ok  ${RESET}` : item.level === "warn" ? `${YELLOW}warn${RESET}` : `${RED}fail${RESET}`;
+    process.stdout.write(`  [${tag}] ${item.label}${item.detail ? `\n         ${DIM}${item.detail}${RESET}` : ""}\n`);
+  }
+
+  const fails = report.summary.fail;
+  const warns = report.summary.warn;
   process.stdout.write("\n");
   if (fails > 0) {
     process.stdout.write(`${RED}${fails} blocking issue(s)${RESET}${warns ? `, ${warns} warning(s)` : ""}.\n`);
