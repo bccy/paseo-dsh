@@ -257,6 +257,12 @@ function formatDurationMs(ms: number, locale: string, allowSubSecond: boolean): 
     : formatUnit(hours, "hour", zh);
 }
 
+function looksLikeLocaleTag(value: string): boolean {
+  const trimmed = value.trim();
+  if (trimmed === "") return true;
+  return /^[a-z]{2,3}(?:[-_][a-z0-9]{2,8})*$/i.test(trimmed);
+}
+
 /**
  * Elapsed duration (`"420ms"`, `"1.4s"`, `"12s"`, `"9m"`, `"1h 15m"` / `"12秒"`,
  * `"9分"`, `"1小时 15分"`).
@@ -275,7 +281,10 @@ export function duration(
   second?: string | number | null | undefined,
   third?: string,
 ): string | null {
-  if (typeof first === "number" && (second === undefined || typeof second === "string")) {
+  const isLocaleArg =
+    typeof second === "string" &&
+    (looksLikeLocaleTag(second) || !Number.isFinite(Date.parse(second)));
+  if (arguments.length < 3 && typeof first === "number" && (second === undefined || isLocaleArg)) {
     if (!Number.isFinite(first) || first < 0) return "";
     return formatDurationMs(first, second ?? "en", true);
   }
