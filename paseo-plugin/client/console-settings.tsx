@@ -13,7 +13,7 @@ import { ActivityIndicator, Platform, Pressable, Text, View } from "react-native
 import { Icon } from "@getpaseo/plugin/client/ui";
 import type { PluginHostProps } from "@getpaseo/plugin/client";
 import { TIMELINE_STYLE_KEYS } from "../shared/settings";
-import type { Currency } from "./console-format";
+import { currencySymbol, type Currency } from "./console-format";
 import { font, radius, space, tabular, tint, type Colors, type Tone } from "./console-theme";
 import { Badge, Button, Callout, Muted, SegmentedControl } from "./console-ui";
 import type { Locale, TimelinePresetKey } from "./locale";
@@ -23,7 +23,6 @@ import {
   TIMELINE_PRESET_KEYS,
   guardAsync,
   keyboardTypeFor,
-  renderHostSettingsAction,
   renderHostSettingsCard,
   renderHostSettingsRow,
   renderHostSettingsSelect,
@@ -31,6 +30,8 @@ import {
   useTimelineStyleController,
 } from "./settings-screen";
 import { useCurrentLocale, useLocaleText } from "./use-locale";
+
+type PressState = { pressed: boolean; hovered?: boolean };
 
 const DEFAULT_DISPLAY_CURRENCY: Currency = "USD";
 const DEFAULT_USD_TO_CNY_RATE = 7.2;
@@ -202,8 +203,8 @@ function EnvironmentSection({
                   flexDirection: "row",
                   alignItems: "center",
                   gap: space.sm,
-                  paddingHorizontal: space.lg,
-                  paddingVertical: 14,
+                  paddingHorizontal: compact ? space.md : space.lg,
+                  paddingVertical: compact ? 12 : 14,
                 }}
               >
                 <ActivityIndicator size="small" color={colors.accent} />
@@ -293,8 +294,8 @@ function EnvironmentSection({
               <View
                 style={{
                   gap: space.sm,
-                  paddingHorizontal: space.lg,
-                  paddingVertical: 14,
+                  paddingHorizontal: compact ? space.md : space.lg,
+                  paddingVertical: compact ? 12 : 14,
                 }}
               >
                 {environment.doctorChecks.map((item) => (
@@ -416,6 +417,7 @@ function GeneralAndCostSection({
   }));
 
   const currentCurrency: Currency = pricing?.currency ?? DEFAULT_DISPLAY_CURRENCY;
+  const currencySym = currencySymbol(currentCurrency);
   const currentRate = pricing?.usdToCnyRate ?? DEFAULT_USD_TO_CNY_RATE;
   const rateText = rateDraft ?? String(currentRate);
   const pricingBusy = Boolean(pricing?.saving);
@@ -423,6 +425,15 @@ function GeneralAndCostSection({
   const canChangeRate = Boolean(pricing?.onChangeExchangeRate) && !pricingBusy;
   const canOpenPricing = Boolean(pricing?.onOpenPricingModal);
   const rateDirty = rateDraft !== null && rateDraft.trim() !== String(currentRate);
+  const rateErrorMessage = rateError ?? pricing?.error ?? null;
+  const rowPaddingX = compact ? space.md : space.lg;
+  const rowPaddingY = compact ? 12 : 14;
+  const exchangeRateHint = pricing?.onChangeExchangeRate
+    ? generalCopy.exchangeRateHint
+    : `${generalCopy.exchangeRateHint} ${generalCopy.pricingPendingHint}`;
+  const pricingHint = canOpenPricing
+    ? generalCopy.pricingHint
+    : `${generalCopy.pricingHint} ${generalCopy.pricingPendingHint}`;
 
   const applyExchangeRate = async () => {
     if (!pricing?.onChangeExchangeRate || pricingBusy || rateInFlightRef.current) return;
@@ -448,6 +459,81 @@ function GeneralAndCostSection({
     langCtrl.error
     ?? langCtrl.saveError
     ?? (langCtrl.failed ? settingsCopy.saveFailed : null);
+
+  const exchangeRateFormula = (
+    <View
+      style={{
+        flexDirection: "row",
+        alignItems: "center",
+        gap: 6,
+        flexShrink: 0,
+      }}
+    >
+      <Text
+        numberOfLines={1}
+        style={{ ...font.caption, ...tabular, color: colors.foregroundMuted }}
+      >
+        1 USD =
+      </Text>
+      <HostTextInput
+        value={rateText}
+        editable={canChangeRate}
+        onChangeText={(value: string) => {
+          setRateDraft(value);
+          setRateError(null);
+        }}
+        keyboardType={Platform.OS === "web" ? "default" : "decimal-pad"}
+        autoCapitalize="none"
+        autoCorrect={false}
+        accessibilityLabel={generalCopy.exchangeRateLabel}
+        style={{
+          borderWidth: 1,
+          borderColor: rateErrorMessage ? colors.statusDanger : colors.border,
+          borderRadius: radius.md,
+          paddingHorizontal: space.sm + 2,
+          paddingVertical: 5,
+          height: 30,
+          width: compact ? 74 : 80,
+          minWidth: compact ? 74 : 80,
+          textAlign: "right",
+          ...font.small,
+          ...tabular,
+          color: canChangeRate ? colors.foreground : colors.foregroundMuted,
+          backgroundColor: colors.surface0,
+          opacity: canChangeRate ? 1 : 0.65,
+        }}
+      />
+      <Text
+        numberOfLines={1}
+        style={{ ...font.caption, ...tabular, color: colors.foregroundMuted }}
+      >
+        CNY
+      </Text>
+    </View>
+  );
+
+  const exchangeRateApplyButton =
+    rateDirty && canChangeRate ? (
+      <Button
+        colors={colors}
+        size="sm"
+        variant="primary"
+        label={generalCopy.exchangeRateApply}
+        onPress={() => guardAsync("exchange rate save", applyExchangeRate)}
+      />
+    ) : null;
+
+  const pricingActionButton = (
+    <Button
+      colors={colors}
+      size="sm"
+      variant="secondary"
+      icon="Coins"
+      label={generalCopy.pricingAction}
+      disabled={!canOpenPricing || pricingBusy}
+      onPress={() => pricing?.onOpenPricingModal?.()}
+    />
+  );
 
   return (
     <View style={{ gap: space.md }}>
@@ -477,129 +563,188 @@ function GeneralAndCostSection({
             compact,
             inline: true,
             children: (
-              <SegmentedControl<Currency>
-                colors={colors}
-                value={currentCurrency}
-                size="sm"
-                options={[
-                  { value: "USD", label: generalCopy.currencyUsd, disabled: !canChangeCurrency },
-                  { value: "CNY", label: generalCopy.currencyCny, disabled: !canChangeCurrency },
-                ]}
-                onChange={(next) => {
-                  if (!pricing?.onChangeCurrency || next === currentCurrency) return;
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={`${generalCopy.currencyLabel}: ${currentCurrency === "USD" ? generalCopy.currencyUsd : generalCopy.currencyCny}`}
+                accessibilityState={{ disabled: !canChangeCurrency }}
+                disabled={!canChangeCurrency}
+                hitSlop={4}
+                onPress={() => {
+                  if (!canChangeCurrency || !pricing?.onChangeCurrency) return;
+                  const next: Currency = currentCurrency === "USD" ? "CNY" : "USD";
                   guardAsync("currency update", async () => {
                     await pricing.onChangeCurrency?.(next);
                   });
                 }}
-              />
+                style={(state) => {
+                  const active =
+                    canChangeCurrency
+                    && ((state as PressState).pressed || Boolean((state as PressState).hovered));
+                  return {
+                    height: 30,
+                    paddingHorizontal: space.sm + 2,
+                    borderRadius: radius.md,
+                    borderWidth: 1,
+                    borderColor: colors.border,
+                    backgroundColor: active ? tint(colors.foreground, 0.06) : colors.surface0,
+                    flexDirection: "row",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    gap: 5,
+                    flexShrink: 0,
+                    opacity: canChangeCurrency ? 1 : 0.45,
+                  };
+                }}
+              >
+                <Text
+                  numberOfLines={1}
+                  style={{
+                    ...font.small,
+                    ...tabular,
+                    fontWeight: "600",
+                    color: canChangeCurrency ? colors.accent : colors.foregroundMuted,
+                  }}
+                >
+                  {currencySym}
+                </Text>
+                <Text
+                  numberOfLines={1}
+                  style={{
+                    ...font.small,
+                    ...tabular,
+                    fontWeight: "600",
+                    color: colors.foreground,
+                  }}
+                >
+                  {currentCurrency}
+                </Text>
+                <Icon name="ArrowLeftRight" size={12} color={colors.foregroundMuted} />
+              </Pressable>
             ),
           })}
 
-          {renderHostSettingsRow(colors, {
-            label: generalCopy.exchangeRateLabel,
-            hint: pricing?.onChangeExchangeRate
-              ? generalCopy.exchangeRateHint
-              : `${generalCopy.exchangeRateHint} ${generalCopy.pricingPendingHint}`,
-            error: rateError ?? pricing?.error ?? null,
-            compact,
-            inline: true,
-            children: (
+          {compact ? (
+            <View
+              style={{
+                paddingHorizontal: rowPaddingX,
+                paddingVertical: rowPaddingY,
+                gap: 10,
+              }}
+            >
+              <View style={{ gap: 2 }}>
+                <Text style={{ ...font.small, fontWeight: "600", color: colors.foreground }}>
+                  {generalCopy.exchangeRateLabel}
+                </Text>
+                <Muted colors={colors} small>
+                  {exchangeRateHint}
+                </Muted>
+              </View>
               <View
                 style={{
                   flexDirection: "row",
-                  flexWrap: "wrap",
                   alignItems: "center",
-                  justifyContent: "flex-end",
+                  justifyContent: "space-between",
                   gap: space.sm,
-                  flexShrink: 0,
                 }}
               >
-                <HostTextInput
-                  value={rateText}
-                  editable={canChangeRate}
-                  onChangeText={(value: string) => {
-                    setRateDraft(value);
-                    setRateError(null);
-                  }}
-                  keyboardType={Platform.OS === "web" ? "default" : "decimal-pad"}
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                  accessibilityLabel={generalCopy.exchangeRateLabel}
-                  style={{
-                    borderWidth: 1,
-                    borderColor: colors.border,
-                    borderRadius: radius.md,
-                    paddingHorizontal: space.sm + 2,
-                    paddingVertical: 6,
-                    width: compact ? 76 : 86,
-                    minWidth: compact ? 76 : 86,
-                    textAlign: "right",
-                    ...font.small,
-                    ...tabular,
-                    color: canChangeRate ? colors.foreground : colors.foregroundMuted,
-                    backgroundColor: colors.surface0,
-                    opacity: canChangeRate ? 1 : 0.7,
-                  }}
-                />
-                {rateDirty && canChangeRate ? (
-                  <Button
-                    colors={colors}
-                    size="sm"
-                    variant="primary"
-                    label={generalCopy.exchangeRateApply}
-                    onPress={() => guardAsync("exchange rate save", applyExchangeRate)}
-                  />
-                ) : null}
+                {exchangeRateFormula}
+                {exchangeRateApplyButton}
               </View>
-            ),
-          })}
+              {rateErrorMessage ? (
+                <Text style={{ ...font.caption, color: colors.statusDanger }}>
+                  {rateErrorMessage}
+                </Text>
+              ) : null}
+            </View>
+          ) : (
+            renderHostSettingsRow(colors, {
+              label: generalCopy.exchangeRateLabel,
+              hint: exchangeRateHint,
+              error: rateErrorMessage,
+              compact,
+              inline: true,
+              children: (
+                <View
+                  style={{
+                    flexDirection: "row",
+                    alignItems: "center",
+                    justifyContent: "flex-end",
+                    gap: space.sm,
+                    flexShrink: 0,
+                  }}
+                >
+                  {exchangeRateFormula}
+                  {exchangeRateApplyButton}
+                </View>
+              ),
+            })
+          )}
 
-          {canOpenPricing && !pricing?.hasCustomOverrides
-            ? renderHostSettingsAction(colors, {
-                label: generalCopy.pricingLabel,
-                hint: generalCopy.pricingHint,
-                actionLabel: generalCopy.pricingAction,
-                disabled: pricingBusy,
-                compact,
-                onPress: () => pricing?.onOpenPricingModal?.(),
-              })
-            : renderHostSettingsRow(colors, {
-                label: generalCopy.pricingLabel,
-                hint: canOpenPricing
-                  ? generalCopy.pricingHint
-                  : `${generalCopy.pricingHint} ${generalCopy.pricingPendingHint}`,
-                compact,
-                inline: true,
-                children: (
-                  <View
-                    style={{
-                      flexDirection: "row",
-                      flexWrap: "wrap",
-                      alignItems: "center",
-                      justifyContent: "flex-end",
-                      gap: space.sm,
-                      flexShrink: 0,
-                    }}
-                  >
-                    {pricing?.hasCustomOverrides ? (
-                      <Badge
-                        colors={colors}
-                        tone="accent"
-                        label={generalCopy.pricingCustomBadge}
-                      />
-                    ) : null}
-                    <Button
+          {compact ? (
+            <View
+              style={{
+                flexDirection: "row",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: space.md,
+                paddingHorizontal: rowPaddingX,
+                paddingVertical: rowPaddingY,
+              }}
+            >
+              <View style={{ flex: 1, minWidth: 0, gap: 3 }}>
+                <View
+                  style={{
+                    flexDirection: "row",
+                    flexWrap: "wrap",
+                    alignItems: "center",
+                    gap: space.xs + 2,
+                  }}
+                >
+                  <Text style={{ ...font.small, fontWeight: "600", color: colors.foreground }}>
+                    {generalCopy.pricingLabel}
+                  </Text>
+                  {pricing?.hasCustomOverrides ? (
+                    <Badge
                       colors={colors}
-                      size="sm"
-                      variant="secondary"
-                      icon="DollarSign"
-                      label={generalCopy.pricingAction}
-                      disabled={!canOpenPricing || pricingBusy}
-                      onPress={() => pricing?.onOpenPricingModal?.()}
+                      tone="accent"
+                      label={generalCopy.pricingCustomBadge}
                     />
-                  </View>
-                ),
-              })}
+                  ) : null}
+                </View>
+                <Muted colors={colors} small>
+                  {pricingHint}
+                </Muted>
+              </View>
+              <View style={{ flexShrink: 0 }}>{pricingActionButton}</View>
+            </View>
+          ) : (
+            renderHostSettingsRow(colors, {
+              label: generalCopy.pricingLabel,
+              hint: pricingHint,
+              compact,
+              inline: true,
+              children: (
+                <View
+                  style={{
+                    flexDirection: "row",
+                    alignItems: "center",
+                    justifyContent: "flex-end",
+                    gap: space.sm,
+                    flexShrink: 0,
+                  }}
+                >
+                  {pricing?.hasCustomOverrides ? (
+                    <Badge
+                      colors={colors}
+                      tone="accent"
+                      label={generalCopy.pricingCustomBadge}
+                    />
+                  ) : null}
+                  {pricingActionButton}
+                </View>
+              ),
+            })
+          )}
         </>,
         "dsh-console-general-card",
       )}
@@ -705,13 +850,13 @@ function TimelineDisplaySection({
             <View
               testID="dsh-timeline-presets-row"
               style={{
-                paddingHorizontal: space.lg,
-                paddingVertical: 14,
+                paddingHorizontal: space.md,
+                paddingVertical: 12,
                 gap: 10,
               }}
             >
               <View style={{ gap: 2 }}>
-                <Text style={{ ...font.body, fontWeight: "600", color: colors.foreground }}>
+                <Text style={{ ...font.small, fontWeight: "600", color: colors.foreground }}>
                   {settingsCopy.presets.label}
                 </Text>
                 <Muted colors={colors} small>
@@ -742,16 +887,22 @@ function TimelineDisplaySection({
               alignItems: "center",
               justifyContent: "space-between",
               gap: space.md,
-              paddingHorizontal: space.lg,
-              paddingVertical: 14,
+              paddingHorizontal: compact ? space.md : space.lg,
+              paddingVertical: compact ? 12 : 14,
               backgroundColor:
-                state.pressed || Boolean((state as { hovered?: boolean }).hovered)
+                state.pressed || Boolean((state as PressState).hovered)
                   ? tint(colors.foreground, 0.05)
                   : "transparent",
             })}
           >
             <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
-              <Text style={{ ...font.body, fontWeight: "600", color: colors.foreground }}>
+              <Text
+                style={{
+                  ...(compact ? font.small : font.body),
+                  fontWeight: "600",
+                  color: colors.foreground,
+                }}
+              >
                 {settingsCopy.advanced.title}
               </Text>
               <Muted colors={colors} small>
@@ -798,9 +949,10 @@ function TimelineDisplaySection({
                         borderColor: colors.border,
                         borderRadius: radius.md,
                         paddingHorizontal: space.sm + 2,
-                        paddingVertical: compact ? 7 : 8,
-                        width: compact ? 80 : 88,
-                        minWidth: compact ? 80 : 88,
+                        paddingVertical: compact ? 5 : 6,
+                        height: compact ? 30 : 32,
+                        width: compact ? 76 : 86,
+                        minWidth: compact ? 76 : 86,
                         textAlign: "right",
                         ...font.small,
                         ...tabular,
@@ -820,8 +972,8 @@ function TimelineDisplaySection({
                   alignItems: "center",
                   justifyContent: "space-between",
                   gap: space.sm,
-                  paddingHorizontal: space.lg,
-                  paddingVertical: 14,
+                  paddingHorizontal: compact ? space.md : space.lg,
+                  paddingVertical: compact ? 12 : 14,
                 }}
               >
                 <View style={{ flexDirection: "row", alignItems: "center", flexShrink: 1 }}>
@@ -901,7 +1053,7 @@ export function ConsoleSettingsTab({
 }: ConsoleSettingsTabProps) {
   const locale = useCurrentLocale();
   return (
-    <View style={{ gap: compact ? space.xl : space.xxl }}>
+    <View style={{ gap: compact ? space.lg : space.xl }}>
       <EnvironmentSection
         colors={colors}
         host={host}

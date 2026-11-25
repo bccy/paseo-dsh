@@ -249,7 +249,8 @@ assert("job rows stay read-only", (() => {
   // element in its trailing slot (2026-11-11), so the row's own element must not
   // carry `onPress` — that is what would make the whole panel width a button.
   const rowElements = shape.jsxElements(body);
-  return !rowElements.some((element) => element.tag === "View" && shape.hasAttribute(element, "onPress"))
+  return !rowElements.some((element) => element.tag === "Pressable")
+    && !rowElements.some((element) => element.tag === "View" && shape.hasAttribute(element, "onPress"))
     && rowElements.some((element) => element.tag === "StopJobButton");
 })());
 
@@ -511,8 +512,44 @@ assert("the row title comes from the shared rule", /const\s+title\s*=\s*jobRowTi
 assert("…and the stop button's name uses the same rule", /jobStopA11yLabel\(text, jobRowTitle\(job\)\)/.test(pillSource));
 assert("a missing description keeps the command as the title", /const\s+titled\s*=\s*description\s*!==\s*undefined/.test(pillSource));
 assert("the command stays visible when the description becomes the title", /titled\s*\?\s*job\.label\s*:\s*undefined/.test(pillSource));
+const jobRowBody = shape.functionBody(pillSource, "JobRow") ?? "";
+const jobRowTexts = shape.jsxElements(jobRowBody).filter((element) => element.tag === "Text");
+const titleTextEl = jobRowTexts.find((element) => shape.mentions(attr(element, "style"), "TITLE_FONT_SIZE"));
+const titleSpan = titleTextEl === undefined ? "" : jobRowBody.slice(titleTextEl.end, jobRowBody.indexOf("</Text>", titleTextEl.end));
 assert("the title line renders the resolved title, not the raw label",
-  /fontSize:\s*TITLE_FONT_SIZE[\s\S]{0,160}?\{\s*title\s*\}/.test(pillSource));
+  titleTextEl !== undefined
+    && attr(titleTextEl, "numberOfLines").trim() === "1"
+    && /\{\s*title\s*\}/.test(titleSpan),
+  JSON.stringify(titleSpan.slice(0, 80)));
+// Layered JobRow facts: semantic status/elapsed run (tabular, live blue via
+// ringColorFor, failed via statusDanger) + monospace command run on one row.
+assert("live job status run uses ringColorFor(theme.colors.surface0) and failed uses statusDanger",
+  /ringColorFor\(\s*theme\.colors\.surface0\s*\)/.test(jobRowBody)
+    && /theme\.colors\.statusDanger/.test(jobRowBody));
+assert("job status run uses tabular numerals",
+  jobRowTexts.some((element) =>
+    shape.mentions(attr(element, "style"), "tabular")
+      && shape.mentions(attr(element, "style"), "statusColor")));
+assert("job command run uses monospace with single-line truncation",
+  jobRowTexts.some((element) =>
+    shape.mentions(attr(element, "style"), "mono")
+      && attr(element, "numberOfLines").trim() === "1"));
+// Running section header: quiet PopoverSectionHeader gated by live.length > 0 above live rows.
+const runningHeaders = shape.jsxElements(popoverBody).filter((element) => element.tag === "PopoverSectionHeader");
+check("the popover renders one running section header", runningHeaders.length, 1);
+const runningHeader = runningHeaders[0];
+assert("the running section header labels running jobs with their live count",
+  runningHeader !== undefined
+    && attr(runningHeader, "label").replace(/\s/g, "") === "text.statuses.running"
+    && attr(runningHeader, "count").replace(/\s/g, "") === "live.length",
+  runningHeader === undefined ? "no PopoverSectionHeader" : JSON.stringify(runningHeader.attributes));
+const runningGateBrace = runningHeader === undefined ? -1 : enclosingBrace(popoverBody, runningHeader.start);
+const runningGateExpr = runningGateBrace < 0 ? "" : popoverBody.slice(runningGateBrace + 1, runningHeader.start).trim();
+assert("the running section header is gated by live.length > 0",
+  /^live\.length\s*>\s*0\s*[?&]/.test(runningGateExpr),
+  JSON.stringify(runningGateExpr));
+assert("the running section header sits above the live rows",
+  runningHeader !== undefined && popoverBody.indexOf("{live.map(") > runningHeader.start);
 
 // The rows must be drawn in `orderJobs`' order, not the registry's registration
 // order: a settled row above a running one is exactly the bug. The pure rule is

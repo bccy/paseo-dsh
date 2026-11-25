@@ -1,38 +1,40 @@
 /**
- * The team panel (T3, design T2 direction B; roster reworked in T5): the
- * shared tasks grouped by state, under a one-line roster summary, and an
- * in-place detail page for one task.
+ * The team panel (T3, design T2 direction B; roster reworked in T5; readability
+ * refresh with shared frameless popover primitives): the shared tasks grouped
+ * by state, under a one-line roster summary, and an in-place detail page for
+ * one task.
  *
  * **No member rows (T5).** Ten members filled a phone's first screen and could
  * not be opened, while Paseo's own subagent panel already lists them and opens
  * each conversation. The roster is one headline (T7): whale + 「DeepSeek」 +
- * 「N 名成员」 (teammates only) and small status chips (创建失败 red, 运行中 with the host ring,
- * 已停止 grey dot, 任务完成 N/M with the host check), and who is working shows
- * where it matters: right after an owner's name, the host running ring when the
- * server says the owner runs, a grey 已停止 tag when it says the owner stopped
- * (an in-progress task left behind — DSH does not release on exit), and the
- * 进行中 header counts the latter.
+ * 「N 名成员」 (teammates only) and soft-tinted status pills (创建失败 danger,
+ * 运行中 with the host ring, 已停止 neutral dot, 任务完成 N/M with the host
+ * check), and who is working shows where it matters: right after an owner's
+ * name, the host running ring when the server says the owner runs, a warning
+ * 已停止 tag when it says the owner stopped (an in-progress task left behind —
+ * DSH does not release on exit), and the 进行中 header counts the latter.
  *
- * Every box is one this plugin already draws: `rowBox` (the host's track row,
- * 32/40px), 14px title + 12px muted facts, 16px marks, the host's running ring
- * (`StatusRingMark`), the jobs panel's folding header for the done group, and
- * the host `MenuLabel` geometry for section headers.
+ * **Native Paseo frameless.** Pure `surface0`, `rowBox` track geometry
+ * (32/40px), `surface2` hover/press fill, `1px` hairlines, soft-tinted pills,
+ * and structured selectable prose — zero boxed `surface1` cards and zero
+ * HTML/DOM/CSS.
  *
  * **The detail page is in place, not a host page.** The host's sub-pages
  * (`MenuSurface pages`) are reachable only from a `menu` behavior; a `popover`
- * Content cannot register one in Paseo 0.15. So the page is a mode of this body
- * (like the goal panel's edit page) with the host sheet header's own back row:
- * an 18px muted `ChevronLeft` in a 24px box, then the title at 14px medium.
+ * Content cannot register one in Paseo 0.15+. So the page is a mode of this
+ * body (like the goal panel's edit page) with a minimal back bar on the left
+ * and quiet monospace task id + revision on the right.
  *
  * Read-only throughout: there is no team write path the bridge could carry.
  *
  * @module dsh-paseo/client/team-popover
  */
-import type { PluginButtonContentProps } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/ui";
 import { useState } from "react";
 import { Platform, Pressable, Text, View, type PressableStateCallbackType } from "react-native";
 import type { TeamMember, TeamTask, TeamView } from "../shared/team";
+import { mono, tint } from "./console-theme";
+import { DeepSeekMark } from "./deepseek-mark";
 import {
   CHEVRON_BOX,
   FACTS_FONT_SIZE,
@@ -46,31 +48,42 @@ import {
   rowTextColumn,
 } from "./jobs-popover-layout";
 import type { TeamText } from "./locale";
-import { DeepSeekMark } from "./deepseek-mark";
+import { parseProseBlocks } from "./popover-prose";
+import {
+  POPOVER_DETAIL_TITLE_LINE,
+  POPOVER_DETAIL_TITLE_SIZE,
+  PopoverAlertRow,
+  PopoverHairline,
+  PopoverPill,
+  PopoverProse,
+  PopoverSectionHeader,
+  type PopoverPillTone,
+  type PopoverTheme,
+} from "./popover-ui";
 import { StatusRingMark } from "./status-ring";
 import {
-  TEAM_TASK_ICONS,
   TEAM_HEAD_LEVELS,
+  TEAM_TASK_ICONS,
   teamHeadAt,
   teamHeadItems,
   teamHeadLabel,
   teamHeadLevel,
   teamMateCount,
+  teamOwnerLabel,
   teamOwnerState,
   teamStoppedOwnerCount,
   teamTaskFacts,
   teamTaskFactsParts,
-  teamTaskFields,
   teamTaskGroups,
   teamTaskMark,
   teamWarningText,
   type TeamHeadItem,
+  type TeamHeadKey,
   type TeamHeadLevel,
   type TeamOwnerState,
   type TeamTaskMark,
 } from "./team-polling";
 
-type PopoverTheme = PluginButtonContentProps["theme"];
 type HoverState = PressableStateCallbackType & { hovered?: boolean };
 
 /** The mark slot: the host's 16px icon slot (`task-list-row.tsx`). */
@@ -78,6 +91,8 @@ export const TEAM_MARK_SIZE = 16;
 /** Title / facts line boxes (host `fontSize.base` 14 → 20, `sm` 12 → 16). */
 const TITLE_LINE = 20;
 const FACTS_LINE = 16;
+/** The main list shows at most two lines of a task's subject. */
+export const TEAM_SUBJECT_LINES = 2;
 /** The main list shows at most two lines of a task's description. */
 export const TEAM_DESCRIPTION_LINES = 2;
 
@@ -86,61 +101,44 @@ function extraMuted(theme: PopoverTheme): string {
   return (theme.colors as Record<string, string>).foregroundExtraMuted ?? theme.colors.foregroundMuted;
 }
 
-/** Host `MenuLabel`: 12px muted, 12px sides, 8 top / 4 bottom; the count in the trailing slot. */
-function SectionLabel({ theme, label, count, note }: { theme: PopoverTheme; label: string; count?: number; note?: string }) {
-  return (
-    <View
-      accessibilityRole="header"
-      style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 12, paddingTop: 8, paddingBottom: 4 }}
-    >
-      <Text style={{ flexGrow: 1, flexShrink: 1, fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}>{label}</Text>
-      {count === undefined ? null : (
-        <Text numberOfLines={1} style={{ flexShrink: 2, minWidth: 0, fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}>
-          {note === undefined || note === "" ? String(count) : `${String(count)} · ${note}`}
-        </Text>
-      )}
-    </View>
-  );
-}
-
 /** The owner's running ring: the host ring at the 12px facts line's size (the ring's own 12px box). */
 export const TEAM_OWNER_RING_SIZE = 12;
 
 /**
  * The mark after an owner's name, in a facts line or the detail page's owner
- * field (T5): the host running ring when the server says the owner runs, a grey
- * 已停止 tag when it says the owner stopped, nothing otherwise
+ * strip (T5): the host running ring when the server says the owner runs, a
+ * warning-tinted 已停止 pill when it says the owner stopped, nothing otherwise
  * (`teamOwnerState`).
  */
 function OwnerMark({ state, theme, text }: { state: TeamOwnerState | undefined; theme: PopoverTheme; text: TeamText }) {
   if (state === "running") {
     return (
-      <View accessibilityRole="progressbar" style={{ width: TEAM_OWNER_RING_SIZE, height: FACTS_LINE, alignItems: "center", justifyContent: "center", marginLeft: 4 }}>
+      <View
+        accessibilityRole="progressbar"
+        style={{ width: TEAM_OWNER_RING_SIZE, height: FACTS_LINE, alignItems: "center", justifyContent: "center", marginLeft: 4 }}
+      >
         <StatusRingMark size={TEAM_OWNER_RING_SIZE} color={ringColorFor(theme.colors.surface0)} />
       </View>
     );
   }
   if (state === "stopped") {
-    return (
-      <View style={{ marginLeft: 4, paddingHorizontal: 4, borderRadius: 4, backgroundColor: theme.colors.surface2, flexShrink: 0 }}>
-        <Text style={{ fontSize: TEAM_TAG_FONT_SIZE, lineHeight: FACTS_LINE - 2, color: theme.colors.foregroundMuted }}>{text.ownerStopped}</Text>
-      </View>
-    );
+    return <PopoverPill theme={theme} label={text.ownerStopped} tone="warning" compact style={{ marginLeft: 4 }} />;
   }
   return null;
 }
 
-/** The stopped tag's text: one step under the 12px facts line. */
-const TEAM_TAG_FONT_SIZE = 11;
-
-/**
- * The status chips' box (T7). Deliberately **not** the composer pill's shape
- * (the pill sits right under this panel): 18px tall against the pill's ~28,
- * a 4px corner against its full round, no border, and a flat tint instead of
- * the pill's surface + border + hover fill. Not pressable, no chevron.
- */
-export const TEAM_CHIP_HEIGHT = 18;
-export const TEAM_CHIP_RADIUS = 4;
+function headChipTone(key: TeamHeadKey): PopoverPillTone {
+  switch (key) {
+    case "running":
+      return "running";
+    case "done":
+      return "success";
+    case "failed":
+      return "danger";
+    case "stopped":
+      return "neutral";
+  }
+}
 
 /** A chip's leading glyph: host ring (运行中), grey dot (已停止), host check (任务完成), red dot (创建失败). */
 function HeadGlyph({ item, theme }: { item: TeamHeadItem; theme: PopoverTheme }) {
@@ -167,32 +165,16 @@ function HeadGlyph({ item, theme }: { item: TeamHeadItem; theme: PopoverTheme })
   );
 }
 
-/** A tint of a `#rrggbb` theme colour; anything else falls back to `surface2`. */
-function tint(color: string, fallback: string): string {
-  return /^#[0-9a-f]{6}$/i.test(color) ? `${color}24` : fallback;
-}
-
 function HeadChip({ item, theme, text, short }: { item: TeamHeadItem; theme: PopoverTheme; text: TeamText; short: boolean }) {
-  const failed = item.key === "failed";
   return (
-    <View
+    <PopoverPill
+      theme={theme}
+      label={teamHeadLabel(item, text, short)}
+      tone={headChipTone(item.key)}
+      leading={<HeadGlyph item={item} theme={theme} />}
+      compact
       testID={`team-chip-${item.key}`}
-      style={{
-        flexDirection: "row",
-        alignItems: "center",
-        gap: 4,
-        height: TEAM_CHIP_HEIGHT,
-        borderRadius: TEAM_CHIP_RADIUS,
-        paddingHorizontal: 5,
-        backgroundColor: failed ? tint(theme.colors.statusDanger, theme.colors.surface2) : theme.colors.surface2,
-        flexShrink: 0,
-      }}
-    >
-      <HeadGlyph item={item} theme={theme} />
-      <Text numberOfLines={1} style={{ fontSize: FACTS_FONT_SIZE, lineHeight: 16, color: failed ? theme.colors.statusDanger : theme.colors.foregroundMuted }}>
-        {teamHeadLabel(item, text, short)}
-      </Text>
-    </View>
+    />
   );
 }
 
@@ -226,10 +208,10 @@ function TeamHeadline({ team, theme, text }: { team: TeamView; theme: PopoverThe
       accessible
       accessibilityRole="header"
       accessibilityLabel={[text.head.title, ...(members === undefined ? [] : [members]), ...shown.map((item) => teamHeadLabel(item, text, false))].join("，")}
-      style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 12, paddingTop: 10, paddingBottom: 6 }}
+      style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 12, paddingTop: 10, paddingBottom: 8 }}
     >
       <DeepSeekMark size={16} />
-      <Text numberOfLines={1} style={{ flexShrink: 0, fontSize: TITLE_FONT_SIZE, fontWeight: "500", color: theme.colors.foreground }}>
+      <Text numberOfLines={1} style={{ flexShrink: 0, fontSize: TITLE_FONT_SIZE, fontWeight: "600", color: theme.colors.foreground }}>
         {text.head.title}
       </Text>
       {members === undefined ? null : (
@@ -270,23 +252,84 @@ function TeamHeadline({ team, theme, text }: { team: TeamView; theme: PopoverThe
   );
 }
 
-/** The host task-list row's marks: running blue `CircleDot`, muted `Circle`, extra-muted `CircleCheck`; plus `CircleDashed`. */
-function TaskMarkIcon({ mark, theme }: { mark: TeamTaskMark; theme: PopoverTheme }) {
-  const color = mark === "doing" ? ringColorFor(theme.colors.surface0) : mark === "ready" ? theme.colors.foregroundMuted : extraMuted(theme);
+function taskMarkTone(mark: TeamTaskMark): PopoverPillTone {
+  switch (mark) {
+    case "doing":
+      return "running";
+    case "done":
+      return "success";
+    case "blocked":
+      return "warning";
+    case "ready":
+      return "neutral";
+  }
+}
+
+/** The host task-list row's marks: running blue `CircleDot`, muted `Circle`, warning `CircleDashed`, extra-muted `CircleCheck`. */
+function TaskMarkIcon({ mark, theme, lineHeight = TITLE_LINE }: { mark: TeamTaskMark; theme: PopoverTheme; lineHeight?: number }) {
+  const color =
+    mark === "doing"
+      ? ringColorFor(theme.colors.surface0)
+      : mark === "blocked"
+        ? theme.colors.statusWarning
+        : mark === "ready"
+          ? theme.colors.foregroundMuted
+          : extraMuted(theme);
   return (
-    <View style={{ width: TEAM_MARK_SIZE, height: TITLE_LINE, justifyContent: "center" }}>
+    <View style={{ width: TEAM_MARK_SIZE, height: lineHeight, justifyContent: "center" }}>
       <Icon name={TEAM_TASK_ICONS[mark]} size={TEAM_MARK_SIZE} color={color} />
     </View>
   );
 }
 
-/** One task row: mark, title, facts, warnings, two lines of description; the whole row opens the detail page. */
-function TaskRow({ task, members, theme, text, compact, onOpen }: { task: TeamTask; members: readonly TeamMember[]; theme: PopoverTheme; text: TeamText; compact: boolean; onOpen: () => void }) {
+function TaskDetailStatusGlyph({ mark, ownerState, theme }: { mark: TeamTaskMark; ownerState: TeamOwnerState | undefined; theme: PopoverTheme }) {
+  const box = { width: 12, height: 12, alignItems: "center", justifyContent: "center" } as const;
+  if (mark === "doing" && ownerState === "running") {
+    return (
+      <View style={box}>
+        <StatusRingMark size={12} ring={10} color={ringColorFor(theme.colors.surface0)} />
+      </View>
+    );
+  }
+  const color =
+    mark === "doing"
+      ? ringColorFor(theme.colors.surface0)
+      : mark === "done"
+        ? theme.colors.statusSuccess
+        : mark === "blocked"
+          ? theme.colors.statusWarning
+          : theme.colors.foregroundMuted;
+  return (
+    <View style={box}>
+      <Icon name={TEAM_TASK_ICONS[mark]} size={11} color={color} />
+    </View>
+  );
+}
+
+/** One task row: mark, two-line subject, facts, warnings, two lines of description; the whole row opens the detail page. */
+function TaskRow({
+  task,
+  members,
+  theme,
+  text,
+  compact,
+  onOpen,
+}: {
+  task: TeamTask;
+  members: readonly TeamMember[];
+  theme: PopoverTheme;
+  text: TeamText;
+  compact: boolean;
+  onOpen: () => void;
+}) {
   const mark = teamTaskMark(task);
   const facts = teamTaskFactsParts(task, text);
   const ownerState = teamOwnerState(task, members);
   const done = mark === "done";
   const description = task.description.replace(/\s*\n+\s*/g, " ").trim();
+  const hasIdPrefix = task.id !== "" && facts.lead.startsWith(task.id);
+  const idPart = hasIdPrefix ? task.id : "";
+  const ownerPart = hasIdPrefix ? facts.lead.slice(task.id.length) : facts.lead;
   return (
     <Pressable
       onPress={onOpen}
@@ -302,22 +345,38 @@ function TaskRow({ task, members, theme, text, compact, onOpen }: { task: TeamTa
           <TaskMarkIcon mark={mark} theme={theme} />
           <View style={rowTextColumn()}>
             <Text
-              numberOfLines={1}
+              numberOfLines={TEAM_SUBJECT_LINES}
               style={{
                 fontSize: TITLE_FONT_SIZE,
                 lineHeight: TITLE_LINE,
+                fontWeight: "500",
                 color: done ? extraMuted(theme) : theme.colors.foreground,
                 textDecorationLine: done ? "line-through" : "none",
               }}
             >
               {task.subject}
             </Text>
-            {/* The owner's ring sits right after the owner's name, so the line
-                is three runs: id · owner, the ring, then · blockers · scopes. */}
-            <View style={{ flexDirection: "row", alignItems: "center", minWidth: 0 }}>
-              <Text numberOfLines={1} style={{ flexShrink: 0, fontSize: FACTS_FONT_SIZE, lineHeight: FACTS_LINE, color: theme.colors.foregroundMuted }}>
-                {facts.lead}
-              </Text>
+            {/* The owner's mark sits right after the owner's name, so the line
+                is id (mono), owner, the mark, then · blockers · scopes. */}
+            <View style={{ flexDirection: "row", alignItems: "center", minWidth: 0, marginTop: 2 }}>
+              {idPart === "" ? null : (
+                <Text numberOfLines={1} style={{ flexShrink: 0, fontFamily: mono, fontSize: 11.5, lineHeight: FACTS_LINE, color: extraMuted(theme) }}>
+                  {idPart}
+                </Text>
+              )}
+              {ownerPart === "" ? null : (
+                <Text
+                  numberOfLines={1}
+                  style={{
+                    flexShrink: 0,
+                    fontSize: FACTS_FONT_SIZE,
+                    lineHeight: FACTS_LINE,
+                    color: done ? extraMuted(theme) : facts.owner ? tint(theme.colors.foreground, 0.78) : theme.colors.foregroundMuted,
+                  }}
+                >
+                  {ownerPart}
+                </Text>
+              )}
               {facts.owner ? <OwnerMark state={ownerState} theme={theme} text={text} /> : null}
               {facts.trail === "" ? null : (
                 <Text numberOfLines={1} style={{ flexShrink: 1, minWidth: 0, fontSize: FACTS_FONT_SIZE, lineHeight: FACTS_LINE, color: theme.colors.foregroundMuted }}>
@@ -326,7 +385,7 @@ function TaskRow({ task, members, theme, text, compact, onOpen }: { task: TeamTa
               )}
             </View>
             {task.writeScopeWarnings.map((warning) => (
-              <View key={warning} style={{ flexDirection: "row", alignItems: "center", gap: 4 }}>
+              <View key={warning} style={{ flexDirection: "row", alignItems: "center", gap: 4, marginTop: 2 }}>
                 <Icon name="TriangleAlert" size={12} color={theme.colors.statusWarning} />
                 <Text numberOfLines={1} style={{ flexShrink: 1, fontSize: FACTS_FONT_SIZE, lineHeight: FACTS_LINE, color: theme.colors.statusWarning }}>
                   {teamWarningText(warning, text)}
@@ -336,7 +395,7 @@ function TaskRow({ task, members, theme, text, compact, onOpen }: { task: TeamTa
             {description === "" ? null : (
               <Text
                 numberOfLines={TEAM_DESCRIPTION_LINES}
-                style={{ marginTop: 2, fontSize: FACTS_FONT_SIZE, lineHeight: 18, color: theme.colors.foregroundMuted }}
+                style={{ marginTop: 3, fontSize: 12.5, lineHeight: 18, color: theme.colors.foregroundMuted }}
               >
                 {description}
               </Text>
@@ -352,7 +411,21 @@ function TaskRow({ task, members, theme, text, compact, onOpen }: { task: TeamTa
 }
 
 /** The done group's header: the jobs panel's folding row (label, trailing count, turning chevron). */
-function DoneHeader({ theme, text, count, open, compact, onToggle }: { theme: PopoverTheme; text: TeamText; count: number; open: boolean; compact: boolean; onToggle: () => void }) {
+function DoneHeader({
+  theme,
+  text,
+  count,
+  open,
+  compact,
+  onToggle,
+}: {
+  theme: PopoverTheme;
+  text: TeamText;
+  count: number;
+  open: boolean;
+  compact: boolean;
+  onToggle: () => void;
+}) {
   return (
     <Pressable
       onPress={onToggle}
@@ -389,84 +462,202 @@ function NoteLine({ theme, compact, children }: { theme: PopoverTheme; compact: 
   );
 }
 
-/** DSH's projection failure: a red row, the sentence verbatim and selectable. */
-function FailureRow({ theme, text, compact, failure }: { theme: PopoverTheme; text: TeamText; compact: boolean; failure: string }) {
+/** DSH's projection failure: a danger alert row, the sentence verbatim and selectable. */
+function FailureRow({ theme, text, failure }: { theme: PopoverTheme; text: TeamText; failure: string }) {
   return (
-    <View style={{ ...rowBox({ compact }), alignItems: "flex-start" }} accessibilityRole="alert">
-      <View style={{ height: 18, justifyContent: "center" }}>
-        <Icon name="CircleAlert" size={TEAM_MARK_SIZE} color={theme.colors.statusDanger} />
-      </View>
-      <Text selectable style={{ ...rowTextColumn(), fontSize: FACTS_FONT_SIZE, lineHeight: 18, color: theme.colors.statusDanger }}>
-        {text.failure(failure)}
-      </Text>
+    <View style={{ paddingTop: 8, paddingBottom: 2 }}>
+      <PopoverAlertRow theme={theme} tone="danger" icon="CircleAlert" message={text.failure(failure)} />
     </View>
   );
 }
 
 /**
- * One task in full: the host sheet header's back row, the subject, its fields
- * (the timeline card's 72px label column), and the whole description.
+ * One task in full: minimal top bar (back on left, quiet mono id · vN on right),
+ * 16px semibold title, single-line status + owner meta strip, optional
+ * blockers / write scopes / warnings, hairline divider, and structured
+ * selectable prose description.
  */
-function TaskDetail({ task, members, theme, text, compact, onBack }: { task: TeamTask; members: readonly TeamMember[]; theme: PopoverTheme; text: TeamText; compact: boolean; onBack: () => void }) {
+function TaskDetail({
+  task,
+  members,
+  theme,
+  text,
+  compact,
+  onBack,
+}: {
+  task: TeamTask;
+  members: readonly TeamMember[];
+  theme: PopoverTheme;
+  text: TeamText;
+  compact: boolean;
+  onBack: () => void;
+}) {
   const mark = teamTaskMark(task);
+  const done = mark === "done";
+  const ownerLabel = teamOwnerLabel(task);
+  const ownerState = teamOwnerState(task, members);
+  const hasDescription = task.description.trim() !== "";
+  const firstBlock = hasDescription ? parseProseBlocks(task.description)[0] : undefined;
+  const showDescriptionLabel = firstBlock !== undefined && firstBlock.kind !== "kicker" && firstBlock.kind !== "heading";
+  const hasExtraMeta = task.blockedBy.length > 0 || task.writeScopes.length > 0;
+
   return (
-    <View style={{ ...popoverRootBox(), margin: -12, paddingBottom: 8 }}>
-      <Pressable
-        onPress={onBack}
-        accessibilityRole="button"
-        accessibilityLabel={text.back}
-        style={({ hovered = false, pressed }: HoverState) => {
-          const fill = rowActiveFill(hovered, pressed);
-          return [rowBox({ compact }), fill === undefined ? undefined : { backgroundColor: theme.colors[fill] }];
+    <View style={{ ...popoverRootBox(), margin: -12, paddingBottom: 12 }}>
+      <View
+        style={{
+          flexDirection: "row",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 8,
+          paddingHorizontal: 4,
+          paddingTop: 4,
+          paddingBottom: 2,
         }}
       >
-        <View style={{ width: 24, height: 24, alignItems: "center", justifyContent: "center", marginLeft: -4 }}>
-          <Icon name="ChevronLeft" size={18} color={theme.colors.foregroundMuted} />
-        </View>
-        <Text numberOfLines={1} style={{ ...rowTextColumn(), fontSize: TITLE_FONT_SIZE, fontWeight: "500", color: theme.colors.foreground }}>
-          {`${task.id} · ${text.marks[mark]}`}
+        <Pressable
+          onPress={onBack}
+          accessibilityRole="button"
+          accessibilityLabel={text.back}
+          style={({ hovered = false, pressed }: HoverState) => {
+            const fill = rowActiveFill(hovered, pressed);
+            return [
+              {
+                flexDirection: "row",
+                alignItems: "center",
+                gap: 4,
+                minHeight: compact ? 36 : 28,
+                paddingLeft: 4,
+                paddingRight: 10,
+                paddingVertical: compact ? 6 : 4,
+                borderRadius: 6,
+              },
+              fill === undefined ? undefined : { backgroundColor: theme.colors[fill] },
+            ];
+          }}
+        >
+          {({ hovered = false, pressed }: HoverState) => (
+            <>
+              <Icon name="ChevronLeft" size={16} color={theme.colors[chevronColorToken(hovered, pressed)]} />
+              <Text numberOfLines={1} style={{ fontSize: 13, fontWeight: "500", color: theme.colors[chevronColorToken(hovered, pressed)] }}>
+                {text.back}
+              </Text>
+            </>
+          )}
+        </Pressable>
+        <Text
+          selectable
+          numberOfLines={1}
+          style={{
+            flexShrink: 1,
+            paddingRight: 8,
+            fontFamily: mono,
+            fontSize: 11.5,
+            lineHeight: 16,
+            color: extraMuted(theme),
+          }}
+        >
+          {`${task.id} · v${String(task.revision)}`}
         </Text>
-      </Pressable>
-      <View style={{ paddingHorizontal: 12, paddingTop: 4, gap: 8 }}>
+      </View>
+
+      <View style={{ paddingHorizontal: 12, paddingTop: 6, gap: 8 }}>
         <View style={{ flexDirection: "row", gap: 8, alignItems: "flex-start" }}>
-          <TaskMarkIcon mark={mark} theme={theme} />
-          <Text selectable style={{ flex: 1, minWidth: 0, fontSize: TITLE_FONT_SIZE, lineHeight: TITLE_LINE, color: theme.colors.foreground }}>
+          <TaskMarkIcon mark={mark} theme={theme} lineHeight={POPOVER_DETAIL_TITLE_LINE} />
+          <Text
+            selectable
+            style={{
+              flex: 1,
+              minWidth: 0,
+              fontSize: POPOVER_DETAIL_TITLE_SIZE,
+              lineHeight: POPOVER_DETAIL_TITLE_LINE,
+              fontWeight: "600",
+              color: done ? extraMuted(theme) : theme.colors.foreground,
+              textDecorationLine: done ? "line-through" : "none",
+            }}
+          >
             {task.subject}
           </Text>
         </View>
-        <View style={{ gap: 4 }}>
-          {teamTaskFields(task, text, members).map((field, index) => (
-            <View key={`${field.label}-${String(index)}`} style={{ flexDirection: "row", alignItems: "flex-start", gap: 12 }}>
-              <Text style={{ width: 72, fontSize: FACTS_FONT_SIZE, lineHeight: 18, color: theme.colors.foregroundMuted }}>{field.label}</Text>
-              <Text
-                selectable
-                style={{
-                  ...(field.owner === undefined ? { flex: 1 } : { flexShrink: 1 }),
-                  minWidth: 0,
-                  fontSize: FACTS_FONT_SIZE,
-                  lineHeight: 18,
-                  color: field.tone === "warning" ? theme.colors.statusWarning : theme.colors.foreground,
-                }}
-              >
-                {field.value}
-              </Text>
-              {field.owner === undefined ? null : (
-                <View style={{ height: 18, justifyContent: "center", marginLeft: -8 }}>
-                  <OwnerMark state={field.owner} theme={theme} text={text} />
-                </View>
-              )}
-            </View>
-          ))}
-        </View>
-        {task.description.trim() === "" ? null : (
-          <View style={{ gap: 4 }}>
-            <Text style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}>{text.fields.description}</Text>
-            <Text selectable style={{ fontSize: FACTS_FONT_SIZE, lineHeight: 18, color: theme.colors.foreground }}>
-              {task.description}
+
+        <View style={{ paddingLeft: 24, flexDirection: "row", flexWrap: "wrap", alignItems: "center", rowGap: 6, columnGap: 10 }}>
+          <PopoverPill
+            theme={theme}
+            label={text.marks[mark]}
+            tone={taskMarkTone(mark)}
+            leading={<TaskDetailStatusGlyph mark={mark} ownerState={ownerState} theme={theme} />}
+          />
+          <View style={{ flexDirection: "row", alignItems: "center", flexShrink: 1, minWidth: 0 }}>
+            <Text style={{ fontSize: FACTS_FONT_SIZE, lineHeight: 18, color: theme.colors.foregroundMuted, marginRight: 5 }}>
+              {text.fields.owner}
             </Text>
+            <Text
+              selectable
+              numberOfLines={1}
+              style={{
+                flexShrink: 1,
+                minWidth: 0,
+                fontSize: FACTS_FONT_SIZE,
+                lineHeight: 18,
+                fontWeight: "500",
+                color: ownerLabel === undefined ? theme.colors.foregroundMuted : theme.colors.foreground,
+              }}
+            >
+              {ownerLabel ?? text.unowned}
+            </Text>
+            {ownerState === undefined ? null : <OwnerMark state={ownerState} theme={theme} text={text} />}
           </View>
-        )}
+        </View>
+
+        {hasExtraMeta ? (
+          <View style={{ paddingLeft: 24, gap: 4 }}>
+            {task.blockedBy.length === 0 ? null : (
+              <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 8 }}>
+                <Text style={{ fontSize: FACTS_FONT_SIZE, lineHeight: 18, color: theme.colors.foregroundMuted, flexShrink: 0 }}>
+                  {text.fields.blockedBy}
+                </Text>
+                <Text selectable style={{ flex: 1, minWidth: 0, fontFamily: mono, fontSize: 12, lineHeight: 18, color: theme.colors.foreground }}>
+                  {task.blockedBy.join(text.listSeparator)}
+                </Text>
+              </View>
+            )}
+            {task.writeScopes.length === 0 ? null : (
+              <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 8 }}>
+                <Text style={{ fontSize: FACTS_FONT_SIZE, lineHeight: 18, color: theme.colors.foregroundMuted, flexShrink: 0 }}>
+                  {text.fields.writeScopes}
+                </Text>
+                <Text selectable style={{ flex: 1, minWidth: 0, fontFamily: mono, fontSize: 11.5, lineHeight: 18, color: theme.colors.foreground }}>
+                  {task.writeScopes.join("\n")}
+                </Text>
+              </View>
+            )}
+          </View>
+        ) : null}
+
+        {task.writeScopeWarnings.map((warning) => (
+          <PopoverAlertRow
+            key={warning}
+            theme={theme}
+            tone="warning"
+            icon="TriangleAlert"
+            message={teamWarningText(warning, text)}
+            marginHorizontal={0}
+          />
+        ))}
       </View>
+
+      {hasDescription ? (
+        <>
+          <PopoverHairline theme={theme} inset={12} marginVertical={10} />
+          <View style={{ paddingHorizontal: 12, gap: 6 }}>
+            {showDescriptionLabel ? (
+              <Text style={{ fontSize: 11.5, lineHeight: 16, fontWeight: "600", color: theme.colors.foregroundMuted }}>
+                {text.fields.description}
+              </Text>
+            ) : null}
+            <PopoverProse text={task.description} theme={theme} />
+          </View>
+        </>
+      ) : null}
     </View>
   );
 }
@@ -500,31 +691,37 @@ export function TeamPanel({ team, text, theme, compact, initialTaskId, initialDo
     team.tasks.filter((task) => teamTaskMark(task) === "doing"),
     team.members,
   );
+  const groups = teamTaskGroups(team.tasks);
+  const hasActiveGroups = groups.some((group) => group.mark !== "done");
   const row = (task: TeamTask) => (
     <TaskRow key={task.id} task={task} members={team.members} theme={theme} text={text} compact={compact} onOpen={() => setTaskId(task.id)} />
   );
   return (
-    <View style={{ ...popoverRootBox(), margin: -12, paddingBottom: 4 }}>
-      {team.failure === undefined ? null : <FailureRow theme={theme} text={text} compact={compact} failure={team.failure} />}
+    <View style={{ ...popoverRootBox(), margin: -12, paddingBottom: 6 }}>
+      {team.failure === undefined ? null : <FailureRow theme={theme} text={text} failure={team.failure} />}
       <TeamHeadline team={team} theme={theme} text={text} />
+      <PopoverHairline theme={theme} marginVertical={2} />
       {team.tasks.length === 0 ? (
         <NoteLine theme={theme} compact={compact}>
           {text.noTasks}
         </NoteLine>
       ) : (
-        teamTaskGroups(team.tasks).map((group) =>
+        groups.map((group, index) =>
           group.mark === "done" ? (
             <View key={group.mark}>
+              {hasActiveGroups ? <PopoverHairline theme={theme} marginVertical={4} /> : null}
               <DoneHeader theme={theme} text={text} count={group.tasks.length} open={doneOpen} compact={compact} onToggle={() => setDoneOpen(!doneOpen)} />
               {doneOpen ? group.tasks.map(row) : null}
             </View>
           ) : (
             <View key={group.mark}>
-              <SectionLabel
+              <PopoverSectionHeader
                 theme={theme}
                 label={text.marks[group.mark]}
                 count={group.tasks.length}
                 note={group.mark === "doing" && stopped > 0 ? text.stoppedOwners(stopped) : undefined}
+                noteTone={group.mark === "doing" && stopped > 0 ? "warning" : "muted"}
+                paddingTop={index === 0 ? 6 : 10}
               />
               {group.tasks.map(row)}
             </View>

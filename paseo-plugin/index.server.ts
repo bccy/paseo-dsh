@@ -127,6 +127,35 @@ export default function contribute(server: PluginServerContext) {
   const usageEngine = new UsageStatsEngine({ pricer: pricingStore });
   const disposePricing = registerPricingRpc(server, pricingStore, {
     getSeenModels: () => usageEngine.seenPricingModels({ waitMs: 0 }),
+    getConfiguredModels: async () => {
+      try {
+        const [overview, resolver] = await Promise.all([
+          diagnostics.overview(),
+          pricingStore.resolver(),
+        ]);
+        const configured = new Map<string, string>();
+        const record = (modelId: string | undefined, providerId: string | undefined, label?: string): void => {
+          const trimmedId = modelId?.trim();
+          if (!trimmedId) return;
+          const key = resolver.resolveKey(trimmedId, providerId);
+          if (!key || key === "unknown") return;
+          if (!configured.has(key)) {
+            configured.set(key, label?.trim() || trimmedId);
+          }
+        };
+        for (const provider of overview.providers) {
+          for (const model of provider.models) {
+            record(model.id, provider.id, model.name);
+          }
+        }
+        if (overview.route.model) {
+          record(overview.route.model, overview.route.provider);
+        }
+        return configured;
+      } catch {
+        return new Map<string, string>();
+      }
+    },
     startAutoSync: true,
     autoSyncDelayMs: 4_000,
     onContext: capture,

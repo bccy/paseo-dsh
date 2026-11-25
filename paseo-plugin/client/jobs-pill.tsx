@@ -43,8 +43,9 @@ import {
   View,
   type PressableStateCallbackType,
 } from "react-native";
-import { jobsSnapshot, jobsStop, splitJobs, type Job, type JobsAnswer } from "../shared/jobs";
+import { isLiveStatus, jobsSnapshot, jobsStop, splitJobs, type Job, type JobsAnswer } from "../shared/jobs";
 import { createAgentSubscriptions, createPillObserver, type PillObserver } from "./agent-subscriptions";
+import { mono, tabular } from "./console-theme";
 import {
   JOB_STOP_BOX,
   JOB_STOP_GLYPH,
@@ -85,6 +86,7 @@ import {
   chevronColorToken,
   chevronRotation,
   popoverRootBox,
+  ringColorFor,
   rowActiveFill,
   rowBox,
   rowTextColumn,
@@ -94,6 +96,7 @@ import {
 } from "./jobs-popover-layout";
 import { JobsPillIcon, JobsSpinner } from "./jobs-spinner";
 import { localeText, type JobsText } from "./locale";
+import { PopoverSectionHeader } from "./popover-ui";
 
 /** One agent's latest answer, plus the listeners the popover subscribes with. */
 interface AgentJobs {
@@ -216,8 +219,10 @@ function JobRow({
   /** The trailing stop control, present only for a row the runtime can stop. */
   stop?: { readonly pending: boolean; readonly onPress: () => void };
 }) {
+  const live = isLiveStatus(job.status);
   const statusWord = text.statuses[job.status] ?? job.status;
   const progress = job.progress ?? job.detail;
+  const hasProgress = progress !== undefined && progress !== "";
   const description = job.description;
   // With a description the title is prose and the command moves down; without
   // one the row is unchanged, so a job whose call this session never saw (or a
@@ -225,22 +230,70 @@ function JobRow({
   const titled = description !== undefined && description !== "";
   const title = jobRowTitle(job);
   // The command is only worth repeating when it is not already the title.
-  const facts = [statusWord, titled ? job.label : undefined, progress]
-    .filter((part): part is string => part !== undefined && part !== "")
-    .join(" · ");
+  const command = titled ? job.label : undefined;
+  const hasCommand = command !== undefined && command !== "";
+  const statusText =
+    live && job.status === "running" && hasProgress && progress.length > 12
+      ? progress
+      : [statusWord, hasProgress ? progress : undefined]
+          .filter((part): part is string => part !== undefined)
+          .join(" · ");
+  const statusColor = live
+    ? ringColorFor(theme.colors.surface0)
+    : job.status === "failed"
+      ? theme.colors.statusDanger
+      : theme.colors.foregroundMuted;
   return (
     <View style={rowBox({ compact })}>
       <JobMark status={job.status} theme={theme} />
       <View style={rowTextColumn()}>
-        <Text numberOfLines={1} style={{ fontSize: TITLE_FONT_SIZE, color: theme.colors.foreground }}>
-          {title}
-        </Text>
         <Text
           numberOfLines={1}
-          style={{ fontSize: FACTS_FONT_SIZE, color: theme.colors.foregroundMuted }}
+          style={{
+            fontSize: TITLE_FONT_SIZE,
+            lineHeight: 20,
+            fontWeight: live ? "500" : "400",
+            color: theme.colors.foreground,
+          }}
         >
-          {facts}
+          {title}
         </Text>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 6, minWidth: 0 }}>
+          <Text
+            numberOfLines={1}
+            style={{
+              ...tabular,
+              flexShrink: hasCommand && statusText.length <= 24 ? 0 : 1,
+              minWidth: 0,
+              fontSize: 11.5,
+              lineHeight: 16,
+              fontWeight: live ? "500" : "400",
+              color: statusColor,
+            }}
+          >
+            {statusText}
+          </Text>
+          {hasCommand ? (
+            <>
+              <Text style={{ fontSize: 11.5, lineHeight: 16, color: theme.colors.foregroundMuted, flexShrink: 0 }}>
+                ·
+              </Text>
+              <Text
+                numberOfLines={1}
+                style={{
+                  fontFamily: mono,
+                  fontSize: 11.5,
+                  lineHeight: 16,
+                  color: theme.colors.foregroundMuted,
+                  flexShrink: 1,
+                  minWidth: 0,
+                }}
+              >
+                {command}
+              </Text>
+            </>
+          ) : null}
+        </View>
       </View>
       {stop === undefined ? null : (
         <StopJobButton job={job} theme={theme} text={text} pending={stop.pending} onPress={stop.onPress} />
@@ -357,7 +410,10 @@ function NoteLine({
         numberOfLines={numberOfLines}
         style={{
           fontSize: FACTS_FONT_SIZE,
+          lineHeight: 17,
           color: tone === "error" ? theme.colors.statusDanger : theme.colors.foregroundMuted,
+          flexShrink: 1,
+          minWidth: 0,
         }}
       >
         {children}
@@ -468,6 +524,7 @@ function SettledHeader({
           <Text
             numberOfLines={1}
             style={{
+              ...tabular,
               flexShrink: 2,
               minWidth: 0,
               fontSize: FACTS_FONT_SIZE,
@@ -698,12 +755,21 @@ function makeJobsPopover(client: PluginClientContext, store: JobStore, agentId: 
       height: SECTION_SEPARATOR_HEIGHT,
       marginVertical: SECTION_SEPARATOR_MARGIN_VERTICAL,
       backgroundColor: theme.colors[SECTION_SEPARATOR_COLOR],
+      opacity: 0.7,
     } as const;
 
     return (
       <View style={root}>
         {/* Above the rows so the failure is readable without scrolling. */}
         {unavailableNote}
+        {live.length > 0 ? (
+          <PopoverSectionHeader
+            theme={theme}
+            label={text.statuses.running}
+            count={live.length}
+            paddingTop={6}
+          />
+        ) : null}
         {/* Live rows first in start order — the thing the user opened this for. */}
         {live.map((job) => {
           const note = jobStopNoteOf(stops, job.id);

@@ -160,6 +160,53 @@ function isHostComponent(value: unknown): boolean {
   return typeof value === "function" || (typeof value === "object" && value !== null);
 }
 
+/**
+ * Pure React Native / Hermes-safe opacity tint helper matching `console-theme.ts#tint`
+ * without importing `Platform.select` (kept lightweight for minimal headless test stubs).
+ */
+function tintColor(color: string, alpha: number): string {
+  const value = color.trim();
+  const safeAlpha = Number.isFinite(alpha) ? alpha : 1;
+  const hex = /^#([0-9a-f]{3,8})$/i.exec(value)?.[1];
+  if (hex) {
+    const full =
+      hex.length === 3 || hex.length === 4
+        ? hex
+            .split("")
+            .map((digit) => digit + digit)
+            .join("")
+        : hex;
+    if (full.length === 6 || full.length === 8) {
+      const base = full.length === 8 ? parseInt(full.slice(6, 8), 16) / 255 : 1;
+      const combined = Math.round(Math.max(0, Math.min(1, base * safeAlpha)) * 10_000) / 10_000;
+      return `rgba(${parseInt(full.slice(0, 2), 16)}, ${parseInt(full.slice(2, 4), 16)}, ${parseInt(full.slice(4, 6), 16)}, ${combined})`;
+    }
+  }
+  const rgb = /^rgba?\(([^)]+)\)$/i.exec(value)?.[1];
+  if (rgb) {
+    const tokens = rgb.split(/[\s,/]+/).filter(Boolean);
+    if (tokens.length >= 3) {
+      const r = Number(tokens[0]);
+      const g = Number(tokens[1]);
+      const b = Number(tokens[2]);
+      if (Number.isFinite(r) && Number.isFinite(g) && Number.isFinite(b)) {
+        const rawBase = tokens[3];
+        const base =
+          rawBase === undefined
+            ? 1
+            : rawBase.endsWith("%")
+              ? (Number(rawBase.slice(0, -1)) || 100) / 100
+              : Number.isFinite(Number(rawBase))
+                ? Number(rawBase)
+                : 1;
+        const combined = Math.round(Math.max(0, Math.min(1, base * safeAlpha)) * 10_000) / 10_000;
+        return `rgba(${Math.max(0, Math.min(255, Math.round(r)))}, ${Math.max(0, Math.min(255, Math.round(g)))}, ${Math.max(0, Math.min(255, Math.round(b)))}, ${combined})`;
+      }
+    }
+  }
+  return color;
+}
+
 const uiExports = PaseoUi as Record<string, unknown>;
 
 /**
@@ -244,6 +291,7 @@ export function renderHostSettingsCard(
       </CardComp>
     );
   }
+  const dividerColor = tintColor(colors.border, 0.7);
   return (
     <View
       testID={testID}
@@ -259,7 +307,7 @@ export function renderHostSettingsCard(
         <View
           key={index}
           style={
-            index > 0 ? { borderTopWidth: 1, borderTopColor: colors.border } : undefined
+            index > 0 ? { borderTopWidth: 1, borderTopColor: dividerColor } : undefined
           }
         >
           {row}
@@ -271,7 +319,7 @@ export function renderHostSettingsCard(
 
 export interface GuardedSettingsRowOptions extends SettingsRowProps {
   compact?: boolean;
-  /** Lay label and control side-by-side on wide layouts when falling back without host SettingsRow. */
+  /** Lay label and control side-by-side when falling back without host SettingsRow. */
   inline?: boolean;
 }
 
@@ -291,13 +339,13 @@ export function renderHostSettingsRow(
       </RowComp>
     );
   }
-  const sideBySide = inline && !compact;
+  const sideBySide = inline;
   return (
     <View
       testID={testID}
       style={{
-        paddingHorizontal: 16,
-        paddingVertical: compact ? 14 : 16,
+        paddingHorizontal: compact ? 12 : 16,
+        paddingVertical: compact ? 12 : 14,
         gap: 6,
       }}
     >
@@ -309,11 +357,12 @@ export function renderHostSettingsRow(
           gap: sideBySide ? 12 : 8,
         }}
       >
-        <View style={{ flex: sideBySide ? 1 : undefined, minWidth: 0, gap: 3 }}>
+        <View style={{ flex: sideBySide ? 1 : undefined, minWidth: 0, gap: 2 }}>
           <Text
             style={{
               color: colors.foreground,
               fontSize: compact ? 13 : 14,
+              lineHeight: compact ? 18 : 20,
               fontWeight: "600",
             }}
           >
@@ -324,14 +373,18 @@ export function renderHostSettingsRow(
               style={{
                 color: colors.foregroundMuted,
                 fontSize: compact ? 12 : 12.5,
-                lineHeight: 17,
+                lineHeight: compact ? 16 : 17,
               }}
             >
               {hint}
             </Text>
           ) : null}
         </View>
-        {children ?? null}
+        {sideBySide && children !== undefined && children !== null ? (
+          <View style={{ flexShrink: 0 }}>{children}</View>
+        ) : (
+          children ?? null
+        )}
       </View>
       {error ? (
         <Text style={{ color: colors.statusDanger, fontSize: compact ? 12 : 13 }}>{error}</Text>
@@ -484,7 +537,7 @@ export function renderHostSettingsAction(
           borderWidth: 1,
           borderColor: colors.border,
           opacity: disabled ? 0.5 : 1,
-          alignSelf: compact ? "flex-start" : "center",
+          alignSelf: "center",
         }}
       >
         <Text
@@ -797,8 +850,8 @@ export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
         ...(compact ? { width: "100%" as const } : { flexShrink: 0 }),
       },
       presetStackedRow: {
-        paddingHorizontal: 16,
-        paddingVertical: 14,
+        paddingHorizontal: compact ? 12 : 16,
+        paddingVertical: compact ? 12 : 14,
         gap: 10,
       },
       presetStackedHeader: { gap: 3 },

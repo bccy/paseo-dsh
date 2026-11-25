@@ -14,6 +14,7 @@ const {
   normalizeUsagePricingKey,
   usageDailyRpc,
   usageDailySchema,
+  usageStatsInputSchema,
   usageStatsRpc,
   usageStatsSchema,
 } = require("../shared/usage.ts");
@@ -424,7 +425,7 @@ test("engine parses zstd + jsonl, caches incrementally, invalidates on edit, pru
     assert.equal(afterEdit.parsed, 1);
     assert.equal(afterEdit.pruned, 0);
 
-    const statsAfterEdit = await engine2.stats({ range: "24h" });
+    const statsAfterEdit = await engine2.stats({ range: "today" });
     assert.equal(statsAfterEdit.totals.requests, 3);
 
     // Delete subagent file -> auto-pruned from cache and stats
@@ -434,7 +435,7 @@ test("engine parses zstd + jsonl, caches incrementally, invalidates on edit, pru
     assert.equal(afterDelete.parsed, 0);
     assert.equal(afterDelete.pruned, 1);
 
-    const statsAfterDelete = await engine2.stats({ range: "24h" });
+    const statsAfterDelete = await engine2.stats({ range: "today" });
     assert.equal(statsAfterDelete.totals.requests, 1);
     assert.equal(statsAfterDelete.hasSubagents, false);
 
@@ -539,7 +540,7 @@ test("mixed-currency pricer aggregation, unpriced exclusion, scope/provider/mode
     });
 
     // Default USD query
-    const statsUsd = await engine.stats({ range: "24h" });
+    const statsUsd = await engine.stats({ range: "today" });
     usageStatsSchema.parse(statsUsd);
 
     assert.equal(statsUsd.bins.length, 24);
@@ -591,32 +592,32 @@ test("mixed-currency pricer aggregation, unpriced exclusion, scope/provider/mode
     assert.equal(rowUnpriced.pricedRequests, 0);
 
     // Currency override to CNY: $3.45 * 7.2 + ¥15.12 = ¥24.84 + ¥15.12 = ¥39.96
-    const statsCny = await engine.stats({ range: "24h", currency: "CNY" });
+    const statsCny = await engine.stats({ range: "today", currency: "CNY" });
     assert.equal(statsCny.displayCurrency, "CNY");
     assert.ok(Math.abs(statsCny.totals.cost - (3.45 * 7.2 + 15.12)) < 1e-9);
 
     // Scope filtering
-    const mainOnly = await engine.stats({ range: "24h", scope: "main" });
+    const mainOnly = await engine.stats({ range: "today", scope: "main" });
     assert.equal(mainOnly.totals.requests, 2);
     assert.equal(mainOnly.breakdown.main.requests, 2);
     assert.equal(mainOnly.breakdown.subagent.requests, 2);
 
-    const subOnly = await engine.stats({ range: "24h", scope: "subagent" });
+    const subOnly = await engine.stats({ range: "today", scope: "subagent" });
     assert.equal(subOnly.totals.requests, 2);
     assert.equal(subOnly.sessions, 2);
 
     // Provider filter narrows totals/models while keeping both providers in provider chips
-    const betaOnly = await engine.stats({ range: "24h", provider: "route-beta" });
+    const betaOnly = await engine.stats({ range: "today", provider: "route-beta" });
     assert.equal(betaOnly.totals.requests, 2);
     assert.equal(betaOnly.providers.length, 2);
     assert.equal(betaOnly.models.length, 2);
 
     // Model filter matches both bare model name and composite provider/model, keeping table intact
-    const bareModel = await engine.stats({ range: "24h", model: "model-unpriced" });
+    const bareModel = await engine.stats({ range: "today", model: "model-unpriced" });
     assert.equal(bareModel.totals.requests, 2);
     assert.equal(bareModel.models.length, 4);
 
-    const compositeModel = await engine.stats({ range: "24h", model: "route-alpha/model-unpriced" });
+    const compositeModel = await engine.stats({ range: "today", model: "route-alpha/model-unpriced" });
     assert.equal(compositeModel.totals.requests, 1);
     assert.equal(compositeModel.models.length, 4);
 
@@ -802,18 +803,27 @@ test("background prewarm, registerUsageStatsRpc, buildCalendarBins, and UNPRICED
     assert.equal(fs.existsSync(engine.cachePath), true);
     assert.deepEqual(engine.getIndexingStatus(), { active: false, done: 1, total: 1 });
 
-    const rpcStats = await handlers.get("dsh.usage.stats")({ range: "24h" }, { tag: "ctx-1" });
+    const rpcStats = await handlers.get("dsh.usage.stats")({ range: "today" }, { tag: "ctx-1" });
     usageStatsSchema.parse(rpcStats);
+    assert.equal(rpcStats.range, "today");
     assert.equal(rpcStats.totals.requests, 1);
     assert.equal(rpcStats.totals.pricedRequests, 0);
     assert.equal(rpcStats.totals.cost, 0);
     assert.equal(rpcStats.models[0].priced, "none");
 
+    // Legacy "24h" alias normalizes cleanly to "today" via RPC input schema & handler
+    const parsedLegacy = usageStatsInputSchema.parse({ range: "24h" });
+    assert.equal(parsedLegacy.range, "today");
+    const legacyRpcStats = await handlers.get("dsh.usage.stats")({ range: "24h" }, { tag: "ctx-1b" });
+    usageStatsSchema.parse(legacyRpcStats);
+    assert.equal(legacyRpcStats.range, "today");
+    assert.equal(legacyRpcStats.totals.requests, 1);
+
     const rpcDaily = await handlers.get("dsh.usage.daily")({}, { tag: "ctx-2" });
     usageDailySchema.parse(rpcDaily);
     assert.equal(rpcDaily.summary.totalCost, null);
     assert.equal(rpcDaily.summary.activeDays, 1);
-    assert.deepEqual(contextsSeen, [{ tag: "ctx-1" }, { tag: "ctx-2" }]);
+    assert.deepEqual(contextsSeen, [{ tag: "ctx-1" }, { tag: "ctx-1b" }, { tag: "ctx-2" }]);
 
     const seen = await engine.seenModels();
     assert.deepEqual(seen, [{ provider: "route-alpha", model: "unknown-family-x", pricingKey: "unknown-family-x" }]);
@@ -883,11 +893,11 @@ test("background prewarm, registerUsageStatsRpc, buildCalendarBins, and UNPRICED
       });
       const refreshPromise = batchEngine.refresh();
       // Poll immediately with waitMs: 0 while discovery/batched indexing is active
-      const midStats = await batchEngine.stats({ range: "24h" }, { waitMs: 0 });
+      const midStats = await batchEngine.stats({ range: "today" }, { waitMs: 0 });
       usageStatsSchema.parse(midStats);
       assert.equal(midStats.indexing.active, true);
       await refreshPromise;
-      const doneStats = await batchEngine.stats({ range: "24h" });
+      const doneStats = await batchEngine.stats({ range: "today" });
       assert.deepEqual(doneStats.indexing, { active: false, done: 6, total: 6 });
       assert.equal(doneStats.totals.requests, 6);
       batchEngine.dispose();
@@ -896,7 +906,7 @@ test("background prewarm, registerUsageStatsRpc, buildCalendarBins, and UNPRICED
     }
 
     // Verify monotonic calendar bins
-    for (const range of ["24h", "7d", "30d"]) {
+    for (const range of ["today", "7d", "30d"]) {
       const bins = buildCalendarBins(fixedNow, range);
       for (let i = 1; i < bins.length; i += 1) {
         assert.equal(bins[i].start, bins[i - 1].end);
@@ -904,6 +914,140 @@ test("background prewarm, registerUsageStatsRpc, buildCalendarBins, and UNPRICED
     }
 
     dispose();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("range 'today' anchors at local midnight 00:00 and strictly excludes yesterday even within 24 hours", async () => {
+  const dir = makeTempDir("paseo-usage-today-");
+  try {
+    const sessionsDir = path.join(dir, "sessions");
+    const fixedNow = new Date(2026, 10, 26, 5, 30, 0, 0).getTime();
+    const localMidnight = new Date(2026, 10, 26, 0, 0, 0, 0).getTime();
+    const nextMidnight = new Date(2026, 10, 27, 0, 0, 0, 0).getTime();
+
+    const yesterday2330 = new Date(2026, 10, 25, 23, 30, 0, 0).getTime();
+    const yesterdayLastMs = localMidnight - 1;
+    const today0005 = new Date(2026, 10, 26, 0, 5, 0, 0).getTime();
+    const today0500 = new Date(2026, 10, 26, 5, 0, 0, 0).getTime();
+
+    // Yesterday session (only 6 hours ago at 05:30 AM, plus 1ms before midnight!)
+    writeSessionFile(sessionsDir, "yesterday.jsonl", [
+      sessionHeader({ id: "sess-yesterday", delegationDepth: 0 }),
+      ...makeCallLines({
+        turn: 1,
+        step: 1,
+        eventMs: yesterday2330,
+        finishMs: yesterday2330,
+        provider: "route-yesterday",
+        model: "model-usd",
+        inputTokens: 900_000,
+        outputTokens: 100_000,
+      }),
+      ...makeCallLines({
+        turn: 1,
+        step: 2,
+        eventMs: yesterdayLastMs,
+        finishMs: yesterdayLastMs,
+        provider: "route-yesterday",
+        model: "model-usd",
+        inputTokens: 50_000,
+        outputTokens: 5_000,
+      }),
+    ]);
+
+    // Today session (00:05 and 05:00) plus a boundary timestamp at tomorrow 00:00:00.000
+    writeSessionFile(sessionsDir, "today.jsonl", [
+      sessionHeader({ id: "sess-today", delegationDepth: 0 }),
+      ...makeCallLines({
+        turn: 1,
+        step: 1,
+        eventMs: today0005,
+        finishMs: today0005,
+        provider: "route-today",
+        model: "model-usd",
+        inputTokens: 1_000,
+        outputTokens: 200,
+      }),
+      ...makeCallLines({
+        turn: 1,
+        step: 2,
+        eventMs: today0500,
+        finishMs: today0500,
+        provider: "route-today",
+        model: "model-cny",
+        inputTokens: 2_000,
+        outputTokens: 300,
+      }),
+      ...makeCallLines({
+        turn: 1,
+        step: 3,
+        eventMs: nextMidnight,
+        finishMs: nextMidnight,
+        provider: "route-tomorrow",
+        model: "model-usd",
+        inputTokens: 9_000,
+        outputTokens: 1_000,
+      }),
+    ]);
+
+    const engine = new UsageStatsEngine({
+      dshHome: dir,
+      pricer: makeMixedCurrencyPricer(),
+      now: () => fixedNow,
+    });
+
+    const todayStats = await engine.stats({ range: "today" });
+    usageStatsSchema.parse(todayStats);
+
+    assert.equal(todayStats.range, "today");
+    assert.equal(todayStats.bins.length, 24);
+    assert.equal(todayStats.bins[0].start, localMidnight);
+    assert.equal(todayStats.bins[23].end, nextMidnight);
+
+    // Only today's 2 calls (00:05 and 05:00) are included; yesterday 23:30 / 23:59:59.999 and tomorrow 00:00 are excluded
+    assert.equal(todayStats.totals.requests, 2);
+    assert.equal(todayStats.totals.input, 3_000);
+    assert.equal(todayStats.totals.output, 500);
+    assert.equal(todayStats.sessions, 1);
+    assert.deepEqual(
+      todayStats.providers.map((p) => p.provider),
+      ["route-today"],
+    );
+    assert.deepEqual(
+      todayStats.models.map((m) => m.id).sort(),
+      ["route-today/model-cny", "route-today/model-usd"],
+    );
+
+    // Verify exact hourly bin placement: hour 0 (00:05) and hour 5 (05:00)
+    assert.equal(todayStats.bins[0].requests, 1);
+    assert.equal(todayStats.bins[0].input, 1_000);
+    assert.equal(todayStats.bins[5].requests, 1);
+    assert.equal(todayStats.bins[5].input, 2_000);
+    for (let h = 0; h < 24; h += 1) {
+      if (h !== 0 && h !== 5) {
+        assert.equal(todayStats.bins[h].requests, 0, `expected hour ${h} to have 0 requests`);
+      }
+    }
+
+    // Legacy "24h" input alias parses to "today" and produces identical today-only stats
+    const parsedAlias = usageStatsInputSchema.parse({ range: "24h" });
+    assert.equal(parsedAlias.range, "today");
+    const aliasStats = await engine.stats(parsedAlias);
+    assert.equal(aliasStats.range, "today");
+    assert.equal(aliasStats.totals.requests, 2);
+    assert.equal(aliasStats.bins[0].start, localMidnight);
+
+    // Invalid range is still rejected
+    assert.throws(() => usageStatsInputSchema.parse({ range: "48h" }));
+
+    // Confirm yesterday's calls ARE still present in the cache and visible in "7d"
+    const weekStats = await engine.stats({ range: "7d" });
+    assert.equal(weekStats.totals.requests, 4);
+    assert.equal(weekStats.sessions, 2);
+
+    engine.dispose();
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

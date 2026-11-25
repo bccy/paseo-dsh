@@ -32,6 +32,7 @@ import {
   Text,
   TextInput as RNTextInput,
   View,
+  type GestureResponderEvent,
   type ScrollView as NativeScrollView,
 } from "react-native";
 import {
@@ -41,6 +42,7 @@ import {
   MAX_RATE_PER_MILLION,
   MAX_USD_TO_CNY_RATE,
   MIN_USD_TO_CNY_RATE,
+  PRICING_CATALOG_SCHEMA_VERSION,
   convertCurrency,
   exchangeRateSchema,
   matchReferenceEntry,
@@ -51,11 +53,15 @@ import {
   pricingUpdateRpc,
   resolvePricingKey,
   stripProviderPrefix,
+  suggestClosestPricing,
   type Currency,
   type ModelRates,
   type PricingModelRow,
   type PricingState,
+  type PricingSuggestion,
   type PricingUpdateInput,
+  type SyncedCatalogEntry,
+  type SyncedPricingCatalog,
 } from "../shared/pricing";
 import { currencySymbol, integer, money, relative, tokens } from "./console-format";
 import { font, mono, radius, space, tabular, tint, type Colors } from "./console-theme";
@@ -83,7 +89,17 @@ export interface PricingDialogProps {
   onUpdated?: (state: PricingState) => void;
 }
 
-type StatusFilter = "all" | "active" | "synced" | "unpriced";
+type StatusFilter = "connected" | "unpriced" | "catalog";
+
+/** True when a model is actively configured in DSH, observed in local logs, or has custom pricing. */
+function isConnectedRow(row: PricingModelRow): boolean {
+  return Boolean(row.configured || row.seenLocally || row.custom !== null);
+}
+
+/** True when a model belongs to the official synced or built-in reference pricing library. */
+function isCatalogRow(row: PricingModelRow): boolean {
+  return row.synced !== null || row.reference !== null;
+}
 
 interface CopyTable {
   title: string;
@@ -123,21 +139,33 @@ interface CopyTable {
   exchangeRateSaved: string;
   currencySaved: (currency: Currency) => string;
   modelsHeading: string;
-  modelsCount: (total: number, syncedCount: number, customCount: number) => string;
+  modelsCountConnected: (
+    total: number,
+    syncedCount: number,
+    customCount: number,
+    unpricedCount: number,
+  ) => string;
+  modelsCountUnpriced: (count: number) => string;
+  modelsCountCatalog: (total: number, syncedCount: number, customCount: number) => string;
   searchPlaceholder: string;
   clearSearch: string;
-  filterAll: string;
-  filterActive: string;
-  filterSynced: string;
-  filterUnpriced: string;
+  filterConnected: (count: number) => string;
+  filterUnpriced: (count: number) => string;
+  filterCatalog: string;
   showAllModels: (total: number) => string;
   emptyMatches: string;
+  emptyConnectedHint: string;
+  emptySearchConnectedHint: (query: string, catalogMatches: number) => string;
+  searchInCatalogCta: (count: number) => string;
+  moreInCatalogHint: (count: number) => string;
+  browseCatalogCta: string;
   badgeFocused: string;
   badgeCustom: string;
   badgeSynced: string;
   badgeReference: string;
   badgeUnpriced: string;
   badgeSeen: string;
+  badgeConfigured: string;
   perMillionShort: string;
   unpricedSummary: string;
   rateCurrency: string;
@@ -173,11 +201,19 @@ interface CopyTable {
   invalidOptionalRate: (max: number) => string;
   invalidThreshold: (max: number) => string;
   savedToast: string;
+  appliedSuggestionToast: (label: string) => string;
   resetOneToast: string;
   resetAllToast: string;
   saveFailed: string;
   expandRowLabel: (label: string) => string;
   collapseRowLabel: (label: string) => string;
+  closestOfficialLabel: string;
+  suggestedRatesHeading: string;
+  applySuggestion: string;
+  fillSuggestion: string;
+  applySuggestionLabel: (label: string) => string;
+  fillSuggestionLabel: (label: string) => string;
+  fillReferenceChip: (label: string, summary: string) => string;
 }
 
 const COPY: Record<"en" | "zh-CN", CopyTable> = {
@@ -223,26 +259,41 @@ const COPY: Record<"en" | "zh-CN", CopyTable> = {
     exchangeRateSaved: "Exchange rate saved.",
     currencySaved: (currency) => `Display currency switched to ${currency}.`,
     modelsHeading: "Model rates (per 1M tokens)",
-    modelsCount: (total, syncedCount, customCount) => {
-      const parts = [`${total} entries`];
+    modelsCountConnected: (total, syncedCount, customCount, unpricedCount) => {
+      const parts = [`${total} connected ${total === 1 ? "model" : "models"}`];
+      if (syncedCount > 0) parts.push(`${syncedCount} synced`);
+      if (customCount > 0) parts.push(`${customCount} custom`);
+      if (unpricedCount > 0) parts.push(`${unpricedCount} unpriced`);
+      return parts.join(" · ");
+    },
+    modelsCountUnpriced: (count) =>
+      `${count} connected ${count === 1 ? "model" : "models"} unpriced`,
+    modelsCountCatalog: (total, syncedCount, customCount) => {
+      const parts = [`Official catalog · ${total} entries`];
       if (syncedCount > 0) parts.push(`${syncedCount} synced`);
       if (customCount > 0) parts.push(`${customCount} custom`);
       return parts.join(" · ");
     },
     searchPlaceholder: "Filter by model ID, provider, or family…",
     clearSearch: "Clear filter",
-    filterAll: "All",
-    filterActive: "Used & custom",
-    filterSynced: "Synced",
-    filterUnpriced: "Unpriced",
+    filterConnected: (count) => (count > 0 ? `Connected (${count})` : "Connected"),
+    filterUnpriced: (count) => `Unpriced (${count})`,
+    filterCatalog: "Official catalog",
     showAllModels: (total) => `Show all ${total} models`,
     emptyMatches: "No matching model entries.",
+    emptyConnectedHint: "No DSH models configured or used yet.",
+    emptySearchConnectedHint: (query, catalogMatches) =>
+      `No connected models match "${query}". Found ${catalogMatches} in the official catalog.`,
+    searchInCatalogCta: (count) => `View ${count} in official catalog`,
+    moreInCatalogHint: (count) => `See ${count} more in official catalog`,
+    browseCatalogCta: "Browse official catalog",
     badgeFocused: "Selected",
     badgeCustom: "Custom",
     badgeSynced: "Synced",
     badgeReference: "Built-in",
     badgeUnpriced: "Unpriced",
     badgeSeen: "Used",
+    badgeConfigured: "Connected",
     perMillionShort: "/ 1M",
     unpricedSummary: "Unpriced — tap to set",
     rateCurrency: "Rate currency",
@@ -280,11 +331,19 @@ const COPY: Record<"en" | "zh-CN", CopyTable> = {
     invalidOptionalRate: (max) => `Optional cache write must be empty or between 0 and ${max}.`,
     invalidThreshold: (max) => `Enter a whole-number token threshold between 1 and ${max}.`,
     savedToast: "Pricing saved.",
+    appliedSuggestionToast: (label) => `Applied pricing from ${label}.`,
     resetOneToast: "Override removed.",
     resetAllToast: "All custom overrides reset.",
     saveFailed: "Could not save pricing changes.",
     expandRowLabel: (label) => `Edit pricing for ${label}`,
     collapseRowLabel: (label) => `Collapse pricing editor for ${label}`,
+    closestOfficialLabel: "Closest official:",
+    suggestedRatesHeading: "Suggested official rates (closest match)",
+    applySuggestion: "Apply",
+    fillSuggestion: "Fill",
+    applySuggestionLabel: (label) => `Apply pricing from ${label}`,
+    fillSuggestionLabel: (label) => `Fill draft with pricing from ${label}`,
+    fillReferenceChip: (label, summary) => `Fill reference: ${label} (${summary})`,
   },
   "zh-CN": {
     title: "模型单价与汇率设置",
@@ -326,26 +385,40 @@ const COPY: Record<"en" | "zh-CN", CopyTable> = {
     exchangeRateSaved: "汇率已保存。",
     currencySaved: (currency) => `已切换显示币种为 ${currency}。`,
     modelsHeading: "模型单价（每 1M token）",
-    modelsCount: (total, syncedCount, customCount) => {
-      const parts = [`共 ${total} 项`];
+    modelsCountConnected: (total, syncedCount, customCount, unpricedCount) => {
+      const parts = [`已接入 ${total} 个模型`];
+      if (syncedCount > 0) parts.push(`${syncedCount} 项官方同步`);
+      if (customCount > 0) parts.push(`${customCount} 项自定义`);
+      if (unpricedCount > 0) parts.push(`${unpricedCount} 项未定价`);
+      return parts.join(" · ");
+    },
+    modelsCountUnpriced: (count) => `${count} 个已接入模型尚未定价`,
+    modelsCountCatalog: (total, syncedCount, customCount) => {
+      const parts = [`官方价格库共 ${total} 项`];
       if (syncedCount > 0) parts.push(`${syncedCount} 项官方同步`);
       if (customCount > 0) parts.push(`${customCount} 项自定义`);
       return parts.join(" · ");
     },
     searchPlaceholder: "搜索模型 ID、官方提供方或模型族…",
     clearSearch: "清空筛选",
-    filterAll: "全部",
-    filterActive: "已用 / 自定义",
-    filterSynced: "官方同步",
-    filterUnpriced: "未定价",
+    filterConnected: (count) => (count > 0 ? `已接入模型 (${count})` : "已接入模型"),
+    filterUnpriced: (count) => `未定价 (${count})`,
+    filterCatalog: "官方价格库",
     showAllModels: (total) => `展开全部 ${total} 个模型`,
     emptyMatches: "没有匹配的模型条目。",
+    emptyConnectedHint: "当前尚未接入或使用任何 DSH 模型。",
+    emptySearchConnectedHint: (query, catalogMatches) =>
+      `已接入模型中未找到「${query}」，官方价格库中有 ${catalogMatches} 项匹配。`,
+    searchInCatalogCta: (count) => `在官方价格库中查看 (${count})`,
+    moreInCatalogHint: (count) => `官方价格库中还有 ${count} 项匹配`,
+    browseCatalogCta: "浏览官方价格库",
     badgeFocused: "当前选中",
     badgeCustom: "自定义",
     badgeSynced: "官方同步",
     badgeReference: "内置参考",
     badgeUnpriced: "未定价",
     badgeSeen: "已使用",
+    badgeConfigured: "已接入",
     perMillionShort: "/ 1M",
     unpricedSummary: "未定价 · 点击填写",
     rateCurrency: "单价币种",
@@ -383,11 +456,19 @@ const COPY: Record<"en" | "zh-CN", CopyTable> = {
     invalidOptionalRate: (max) => `可选缓存写入单价须留空或填写 0 到 ${max} 之间的数字。`,
     invalidThreshold: (max) => `请输入 1 到 ${max} 之间的正整数 token 阈值。`,
     savedToast: "单价已保存。",
+    appliedSuggestionToast: (label) => `已应用「${label}」的官方单价。`,
     resetOneToast: "已移除自定义单价。",
     resetAllToast: "已重置全部自定义单价。",
     saveFailed: "保存单价配置失败。",
     expandRowLabel: (label) => `编辑 ${label} 的单价`,
     collapseRowLabel: (label) => `收起 ${label} 的单价编辑`,
+    closestOfficialLabel: "最接近官方：",
+    suggestedRatesHeading: "推荐参考单价（按名称最接近）",
+    applySuggestion: "应用",
+    fillSuggestion: "填入",
+    applySuggestionLabel: (label) => `应用 ${label} 的官方单价`,
+    fillSuggestionLabel: (label) => `填入 ${label} 的参考单价`,
+    fillReferenceChip: (label, summary) => `填入参考价：${label}（${summary}）`,
   },
 };
 
@@ -634,9 +715,49 @@ function buildConvertedRatesPreview(
   }
 }
 
+function buildClientSyncedCatalog(state: PricingState | null): SyncedPricingCatalog | null {
+  if (!state) return null;
+  const models: Record<string, SyncedCatalogEntry> = {};
+  const providerModels: Record<string, SyncedCatalogEntry> = {};
+  let count = 0;
+
+  for (const row of state.models) {
+    if (!row.synced) continue;
+    const bareId = stripProviderPrefix(row.key);
+    if (!bareId) continue;
+    const provider = row.syncedProvider ?? "official";
+    const entry: SyncedCatalogEntry = {
+      id: bareId,
+      name: row.label,
+      provider,
+      rates: row.synced,
+    };
+    if (!(bareId in models)) {
+      models[bareId] = entry;
+      count += 1;
+    }
+    if (row.syncedProvider) {
+      const scoped = `${normalizeModelKey(row.syncedProvider)}/${bareId}`;
+      if (!(scoped in providerModels)) {
+        providerModels[scoped] = entry;
+      }
+    }
+  }
+
+  if (count === 0) return null;
+  return {
+    version: PRICING_CATALOG_SCHEMA_VERSION,
+    source: state.sync.source || DEFAULT_PRICING_SYNC_SOURCE,
+    syncedAt: state.sync.syncedAt ?? new Date(0).toISOString(),
+    models,
+    providerModels,
+  };
+}
+
 function resolveFocusTarget(
   focusModel: string | null | undefined,
   state: PricingState | null,
+  syncedCatalog: SyncedPricingCatalog | null,
 ): { readonly key: string | null; readonly syntheticRow: PricingModelRow | null } {
   const raw = focusModel?.trim() ?? "";
   if (!raw || !state) return { key: null, syntheticRow: null };
@@ -653,7 +774,7 @@ function resolveFocusTarget(
     if (bareMatch) return { key: bareMatch.key, syntheticRow: null };
   }
 
-  const resolvedKey = resolvePricingKey(raw, undefined, state.overrides);
+  const resolvedKey = resolvePricingKey(raw, undefined, state.overrides, syncedCatalog);
   const resolvedMatch = state.models.find((row) => normalizeModelKey(row.key) === resolvedKey);
   if (resolvedMatch) return { key: resolvedMatch.key, syntheticRow: null };
 
@@ -663,6 +784,7 @@ function resolveFocusTarget(
   if (!syntheticKey) return { key: null, syntheticRow: null };
 
   const matchedRef = matchReferenceEntry(raw);
+  const suggestions = suggestClosestPricing(raw, syncedCatalog, 3);
   const syntheticRow: PricingModelRow = {
     key: syntheticKey,
     label: raw.slice(0, MAX_MODEL_KEY_LENGTH),
@@ -676,6 +798,7 @@ function resolveFocusTarget(
     source: matchedRef ? "reference" : null,
     note: matchedRef?.note ?? null,
     seenLocally: true,
+    ...(suggestions.length > 0 ? { suggestions } : {}),
   };
   return { key: syntheticRow.key, syntheticRow };
 }
@@ -829,7 +952,7 @@ function RateFieldsEditor({
       <View
         style={{
           flexDirection: narrow ? "column" : "row",
-          alignItems: narrow ? "flex-start" : "center",
+          alignItems: narrow ? "stretch" : "center",
           justifyContent: "space-between",
           gap: space.sm,
         }}
@@ -841,6 +964,7 @@ function RateFieldsEditor({
           colors={colors}
           value={draft.currency}
           options={currencyOptions}
+          fullWidth={narrow}
           onChange={(currency) => {
             if (!disabled) onChange({ ...draft, currency });
           }}
@@ -1007,6 +1131,85 @@ function RateFieldsEditor({
   );
 }
 
+function InlineActionButton({
+  colors,
+  label,
+  icon,
+  variant = "primary",
+  loading = false,
+  disabled = false,
+  accessibilityLabel,
+  onPress,
+}: {
+  colors: Colors;
+  label: string;
+  icon?: string;
+  variant?: "primary" | "tinted" | "secondary";
+  loading?: boolean;
+  disabled?: boolean;
+  accessibilityLabel?: string;
+  onPress(event: GestureResponderEvent): void;
+}) {
+  const inactive = disabled || loading;
+  const foreground =
+    variant === "primary"
+      ? colors.accentForeground
+      : variant === "tinted"
+        ? colors.accent
+        : colors.foreground;
+
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel ?? label}
+      accessibilityState={{ disabled: inactive, busy: loading }}
+      disabled={inactive}
+      onPress={(event) => {
+        event?.stopPropagation?.();
+        onPress(event);
+      }}
+      style={(state) => {
+        const active =
+          !inactive && (state.pressed || Boolean((state as { hovered?: boolean }).hovered));
+        const backgroundColor =
+          variant === "primary"
+            ? colors.accent
+            : variant === "tinted"
+              ? tint(colors.accent, active ? 0.22 : 0.13)
+              : active
+                ? tint(colors.foreground, 0.08)
+                : colors.surface1;
+        return {
+          height: 28,
+          paddingHorizontal: space.sm + 2,
+          borderRadius: radius.sm,
+          flexDirection: "row",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: 5,
+          flexShrink: 0,
+          backgroundColor,
+          borderWidth: variant === "secondary" ? 1 : 0,
+          borderColor: colors.border,
+          opacity: disabled ? 0.45 : variant === "primary" && state.pressed ? 0.85 : 1,
+        };
+      }}
+    >
+      {loading ? (
+        <ActivityIndicator size="small" color={foreground} />
+      ) : icon ? (
+        <SafeIcon name={icon} size={13} color={foreground} />
+      ) : null}
+      <Text
+        numberOfLines={1}
+        style={{ ...font.caption, fontWeight: "600", color: foreground }}
+      >
+        {label}
+      </Text>
+    </Pressable>
+  );
+}
+
 function PricingModelRowCard({
   colors,
   copy,
@@ -1033,13 +1236,14 @@ function PricingModelRowCard({
   narrow: boolean;
   globalBusy: boolean;
   onToggle(): void;
-  onSave(rates: ModelRates): Promise<void>;
+  onSave(rates: ModelRates, appliedLabel?: string): Promise<void>;
   onReset(): Promise<void>;
 }) {
   const [draft, setDraft] = useState<RateDraft>(() =>
     draftFromRates(row.effective, displayCurrency),
   );
   const [busy, setBusy] = useState(false);
+  const [applyingId, setApplyingId] = useState<string | null>(null);
   const [error, setError] = useState("");
   const inFlightRef = useRef(false);
 
@@ -1050,6 +1254,10 @@ function PricingModelRowCard({
   }, [effectiveFingerprint, displayCurrency, row.key]);
 
   const disabled = busy || globalBusy;
+  const suggestions = row.suggestions ?? [];
+  const topSuggestion = suggestions[0] ?? null;
+  const showQuickApplyStrip = row.effective === null && topSuggestion !== null;
+
   const sourceBadge =
     row.source === "override" || row.custom
       ? { label: copy.badgeCustom, tone: "accent" as const }
@@ -1074,6 +1282,7 @@ function PricingModelRowCard({
     }
     inFlightRef.current = true;
     setBusy(true);
+    setApplyingId(null);
     setError("");
     try {
       await onSave(validated.rates);
@@ -1085,10 +1294,34 @@ function PricingModelRowCard({
     }
   };
 
+  const handleApplySuggestion = async (suggestion: PricingSuggestion) => {
+    if (disabled || inFlightRef.current) return;
+    inFlightRef.current = true;
+    setBusy(true);
+    setApplyingId(suggestion.id);
+    setError("");
+    try {
+      await onSave(suggestion.rates, suggestion.label);
+    } catch (reason) {
+      setError(errorMessage(reason, copy.saveFailed));
+    } finally {
+      inFlightRef.current = false;
+      setApplyingId(null);
+      setBusy(false);
+    }
+  };
+
+  const handleFillSuggestion = (suggestion: PricingSuggestion) => {
+    if (disabled) return;
+    setDraft(draftFromRates(suggestion.rates, displayCurrency));
+    setError("");
+  };
+
   const handleReset = async () => {
     if (disabled || inFlightRef.current) return;
     inFlightRef.current = true;
     setBusy(true);
+    setApplyingId(null);
     setError("");
     try {
       await onReset();
@@ -1148,6 +1381,8 @@ function PricingModelRowCard({
               <Badge colors={colors} label={sourceBadge.label} tone={sourceBadge.tone} />
               {row.seenLocally ? (
                 <Badge colors={colors} label={copy.badgeSeen} tone="success" dot />
+              ) : row.configured ? (
+                <Badge colors={colors} label={copy.badgeConfigured} tone="accent" dot />
               ) : null}
             </View>
             {showKeySubtitle ? (
@@ -1196,6 +1431,84 @@ function PricingModelRowCard({
         ) : null}
       </Pressable>
 
+      {showQuickApplyStrip && topSuggestion ? (
+        <View
+          style={{
+            borderTopWidth: 1,
+            borderTopColor: tint(colors.accent, 0.18),
+            backgroundColor: tint(colors.accent, 0.06),
+            paddingHorizontal: space.md,
+            paddingVertical: space.sm,
+            gap: space.xs + 2,
+          }}
+        >
+          <View
+            style={{
+              flexDirection: "row",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: space.sm,
+            }}
+          >
+            <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
+              <View
+                style={{
+                  flexDirection: "row",
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                  gap: 4,
+                }}
+              >
+                <SafeIcon name="Sparkles" size={12} color={colors.accent} />
+                <Text style={{ ...font.caption, color: colors.foregroundMuted }}>
+                  {copy.closestOfficialLabel}
+                </Text>
+                <Text
+                  numberOfLines={1}
+                  style={{
+                    ...font.caption,
+                    fontWeight: "600",
+                    color: colors.foreground,
+                    flexShrink: 1,
+                  }}
+                >
+                  {topSuggestion.label}
+                </Text>
+                {topSuggestion.provider ? (
+                  <Text
+                    numberOfLines={1}
+                    style={{ ...font.caption, color: colors.foregroundMuted }}
+                  >
+                    · {topSuggestion.provider}
+                  </Text>
+                ) : null}
+              </View>
+              <Text
+                numberOfLines={1}
+                style={{ ...font.caption, ...tabular, color: colors.foregroundMuted }}
+              >
+                {formatRatesSummary(topSuggestion.rates)} {copy.perMillionShort}
+              </Text>
+            </View>
+
+            <InlineActionButton
+              colors={colors}
+              label={copy.applySuggestion}
+              icon="Check"
+              variant="primary"
+              loading={busy && applyingId === topSuggestion.id}
+              disabled={disabled && applyingId !== topSuggestion.id}
+              accessibilityLabel={copy.applySuggestionLabel(topSuggestion.label)}
+              onPress={() => void handleApplySuggestion(topSuggestion)}
+            />
+          </View>
+
+          {!expanded && error ? (
+            <Callout colors={colors} tone="danger" icon="CircleAlert" title={error} />
+          ) : null}
+        </View>
+      ) : null}
+
       {expanded ? (
         <View
           style={{
@@ -1205,6 +1518,133 @@ function PricingModelRowCard({
             borderTopColor: colors.border,
           }}
         >
+          {suggestions.length > 0 ? (
+            <View style={{ gap: space.xs + 2 }}>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 5 }}>
+                <SafeIcon name="Sparkles" size={13} color={colors.accent} />
+                <Text
+                  style={{
+                    ...font.caption,
+                    fontWeight: "600",
+                    color: colors.foregroundMuted,
+                  }}
+                >
+                  {copy.suggestedRatesHeading}
+                </Text>
+              </View>
+              <View
+                style={{
+                  borderWidth: 1,
+                  borderColor: colors.border,
+                  borderRadius: radius.sm,
+                  backgroundColor: colors.surface0,
+                  overflow: "hidden",
+                }}
+              >
+                {suggestions.slice(0, 3).map((candidate, index) => {
+                  const candidateRatesText = `${formatRatesSummary(candidate.rates)} ${copy.perMillionShort}${
+                    candidate.rates.cacheWrite !== undefined
+                      ? ` · CW ${currencySymbol(candidate.rates.currency)}${fmtCompactNumber(candidate.rates.cacheWrite)}`
+                      : ""
+                  }`;
+                  const candidateBadgeLabel =
+                    candidate.source === "synced"
+                      ? candidate.provider ?? copy.badgeSynced
+                      : copy.badgeReference;
+                  const candidateBadgeTone =
+                    candidate.source === "synced" ? ("success" as const) : ("neutral" as const);
+
+                  return (
+                    <View
+                      key={`${candidate.source}:${candidate.id}`}
+                      style={{
+                        paddingHorizontal: space.sm + 2,
+                        paddingVertical: space.sm,
+                        gap: space.xs + 2,
+                        borderTopWidth: index > 0 ? 1 : 0,
+                        borderTopColor: tint(colors.border, 0.7),
+                        flexDirection: narrow ? "column" : "row",
+                        alignItems: narrow ? "stretch" : "center",
+                        justifyContent: "space-between",
+                      }}
+                    >
+                      <View style={{ flex: narrow ? undefined : 1, minWidth: 0, gap: 3 }}>
+                        <View
+                          style={{
+                            flexDirection: "row",
+                            alignItems: "center",
+                            flexWrap: "wrap",
+                            gap: space.xs,
+                          }}
+                        >
+                          <Text
+                            numberOfLines={1}
+                            style={{
+                              ...font.small,
+                              fontWeight: "600",
+                              color: colors.foreground,
+                              flexShrink: 1,
+                            }}
+                          >
+                            {candidate.label}
+                          </Text>
+                          <Badge
+                            colors={colors}
+                            label={candidateBadgeLabel}
+                            tone={candidateBadgeTone}
+                          />
+                        </View>
+                        <Text
+                          numberOfLines={1}
+                          style={{ ...font.caption, ...tabular, color: colors.foregroundMuted }}
+                        >
+                          {candidateRatesText}
+                        </Text>
+                        {candidate.note ? (
+                          <Text
+                            numberOfLines={1}
+                            style={{ ...font.caption, color: colors.foregroundMuted }}
+                          >
+                            {candidate.note}
+                          </Text>
+                        ) : null}
+                      </View>
+
+                      <View
+                        style={{
+                          flexDirection: "row",
+                          alignItems: "center",
+                          justifyContent: narrow ? "flex-end" : "flex-end",
+                          gap: space.xs,
+                          flexShrink: 0,
+                        }}
+                      >
+                        <InlineActionButton
+                          colors={colors}
+                          label={copy.fillSuggestion}
+                          variant="secondary"
+                          disabled={disabled}
+                          accessibilityLabel={copy.fillSuggestionLabel(candidate.label)}
+                          onPress={() => handleFillSuggestion(candidate)}
+                        />
+                        <InlineActionButton
+                          colors={colors}
+                          label={copy.applySuggestion}
+                          icon="Check"
+                          variant="tinted"
+                          loading={busy && applyingId === candidate.id}
+                          disabled={disabled && applyingId !== candidate.id}
+                          accessibilityLabel={copy.applySuggestionLabel(candidate.label)}
+                          onPress={() => void handleApplySuggestion(candidate)}
+                        />
+                      </View>
+                    </View>
+                  );
+                })}
+              </View>
+            </View>
+          ) : null}
+
           {row.synced || row.reference ? (
             <View style={{ gap: 2 }}>
               {row.synced ? (
@@ -1305,8 +1745,8 @@ function PricingModelRowCard({
               variant="primary"
               icon="Check"
               label={copy.save}
-              loading={busy}
-              disabled={globalBusy && !busy}
+              loading={busy && applyingId === null}
+              disabled={(globalBusy || applyingId !== null) && !(busy && applyingId === null)}
               onPress={() => void handleSave()}
             />
           </View>
@@ -1356,7 +1796,7 @@ export function PricingDialog({
 
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("connected");
   const [showAllRows, setShowAllRows] = useState(false);
 
   const [adding, setAdding] = useState(false);
@@ -1370,6 +1810,7 @@ export function PricingDialog({
 
   const [bodyWidth, setBodyWidth] = useState(0);
   const narrow = bodyWidth > 0 && bodyWidth < NARROW_WIDTH_PX;
+  const stackFilters = bodyWidth > 0 && bodyWidth < 580;
 
   useEffect(() => {
     mountedRef.current = true;
@@ -1393,7 +1834,7 @@ export function PricingDialog({
         openSessionRef.current += 1;
         appliedFocusTokenRef.current = null;
         setSearchQuery("");
-        setStatusFilter("all");
+        setStatusFilter("connected");
         setShowAllRows(false);
         setAdding(false);
         setAddError("");
@@ -1529,32 +1970,23 @@ export function PricingDialog({
     [client, copy.saveFailed, onUpdated],
   );
 
-  const focusTarget = useMemo(() => resolveFocusTarget(focusModel, state), [focusModel, state]);
+  const clientSyncedCatalog = useMemo(() => buildClientSyncedCatalog(state), [state]);
 
-  useEffect(() => {
-    if (!visible || !state) return;
-    const token = `${openSessionRef.current}:${focusModel ?? ""}`;
-    if (appliedFocusTokenRef.current === token) return;
-    appliedFocusTokenRef.current = token;
-    if (focusTarget.key) {
-      setExpandedKey(focusTarget.key);
-      setStatusFilter("all");
-      setSearchQuery("");
-      fallbackScrollRef.current?.scrollTo({ y: 0, animated: false });
-    }
-  }, [visible, state, focusModel, focusTarget.key]);
-
-  const displayCurrency: Currency = state?.displayCurrency ?? "USD";
-  const currentRate = state?.usdToCnyRate ?? DEFAULT_USD_TO_CNY_RATE;
-  const parsedDraftRate = parseExchangeRateInput(rateInput);
-  const rateDirty = state !== null && rateInput.trim() !== String(state.usdToCnyRate);
-  const previewRate = parsedDraftRate ?? currentRate;
+  const focusTarget = useMemo(
+    () => resolveFocusTarget(focusModel, state, clientSyncedCatalog),
+    [focusModel, state, clientSyncedCatalog],
+  );
 
   const allRows = useMemo(() => {
     if (!state) return [];
+    const hydrated = state.models.map((row) => {
+      if (row.suggestions !== undefined || row.effective !== null) return row;
+      const derived = suggestClosestPricing(row.key, clientSyncedCatalog, 3);
+      return derived.length > 0 ? { ...row, suggestions: derived } : row;
+    });
     const base = focusTarget.syntheticRow
-      ? [focusTarget.syntheticRow, ...state.models]
-      : [...state.models];
+      ? [focusTarget.syntheticRow, ...hydrated]
+      : hydrated;
 
     if (!focusTarget.key) return base;
 
@@ -1563,27 +1995,73 @@ export function PricingDialog({
     if (index <= 0) return base;
     const [focused] = base.splice(index, 1);
     return focused ? [focused, ...base] : base;
-  }, [state, focusTarget]);
+  }, [state, focusTarget, clientSyncedCatalog]);
+
+  const newKeySuggestions = useMemo(() => {
+    const trimmed = newKey.trim();
+    if (!adding || !trimmed) return [];
+    return suggestClosestPricing(trimmed, clientSyncedCatalog, 3);
+  }, [adding, newKey, clientSyncedCatalog]);
+
+  useEffect(() => {
+    if (!visible || !state) return;
+    const token = `${openSessionRef.current}:${focusModel ?? ""}`;
+    if (appliedFocusTokenRef.current === token) return;
+    appliedFocusTokenRef.current = token;
+    if (focusTarget.key) {
+      const focusedRow = allRows.find((row) => row.key === focusTarget.key);
+      const nextFilter: StatusFilter =
+        focusTarget.syntheticRow || (focusedRow && isConnectedRow(focusedRow))
+          ? "connected"
+          : "catalog";
+      setExpandedKey(focusTarget.key);
+      setStatusFilter(nextFilter);
+      setSearchQuery("");
+      setShowAllRows(false);
+      fallbackScrollRef.current?.scrollTo({ y: 0, animated: false });
+    }
+  }, [visible, state, focusModel, focusTarget.key, focusTarget.syntheticRow, allRows]);
+
+  const displayCurrency: Currency = state?.displayCurrency ?? "USD";
+  const currentRate = state?.usdToCnyRate ?? DEFAULT_USD_TO_CNY_RATE;
+  const parsedDraftRate = parseExchangeRateInput(rateInput);
+  const rateDirty = state !== null && rateInput.trim() !== String(state.usdToCnyRate);
+  const previewRate = parsedDraftRate ?? currentRate;
 
   const customCount = useMemo(
     () => (state ? Object.keys(state.overrides).length : 0),
     [state],
   );
-  const syncedCount = useMemo(
-    () => allRows.filter((row) => row.synced !== null).length,
+  const connectedRows = useMemo(
+    () => allRows.filter((row) => isConnectedRow(row)),
     [allRows],
   );
-  const hasActiveRows = useMemo(
-    () => allRows.some((row) => row.seenLocally || row.custom !== null),
-    [allRows],
+  const catalogRows = useMemo(
+    () =>
+      allRows.filter(
+        (row) => isCatalogRow(row) || (focusTarget.key !== null && row.key === focusTarget.key),
+      ),
+    [allRows, focusTarget.key],
   );
-  const hasSyncedRows = useMemo(
-    () => allRows.some((row) => row.source === "synced" || row.synced !== null),
-    [allRows],
+  const connectedSyncedCount = useMemo(
+    () => connectedRows.filter((row) => row.custom === null && row.synced !== null).length,
+    [connectedRows],
   );
-  const hasUnpricedRows = useMemo(
-    () => allRows.some((row) => row.effective === null),
-    [allRows],
+  const connectedCustomCount = useMemo(
+    () => connectedRows.filter((row) => row.custom !== null).length,
+    [connectedRows],
+  );
+  const unpricedConnectedCount = useMemo(
+    () => connectedRows.filter((row) => row.effective === null).length,
+    [connectedRows],
+  );
+  const catalogSyncedCount = useMemo(
+    () => catalogRows.filter((row) => row.synced !== null).length,
+    [catalogRows],
+  );
+  const catalogCustomCount = useMemo(
+    () => catalogRows.filter((row) => row.custom !== null).length,
+    [catalogRows],
   );
 
   const displayCurrencyOptions = useMemo(
@@ -1592,38 +2070,69 @@ export function PricingDialog({
   );
 
   const filterOptions = useMemo(() => {
-    const opts: { readonly value: StatusFilter; readonly label: string }[] = [
-      { value: "all", label: copy.filterAll },
-    ];
-    if (hasActiveRows) opts.push({ value: "active", label: copy.filterActive });
-    if (hasSyncedRows) opts.push({ value: "synced", label: copy.filterSynced });
-    if (hasUnpricedRows) opts.push({ value: "unpriced", label: copy.filterUnpriced });
+    const opts: { readonly value: StatusFilter; readonly label: string }[] = [];
+    if (connectedRows.length > 0) {
+      opts.push({ value: "connected", label: copy.filterConnected(connectedRows.length) });
+    }
+    if (unpricedConnectedCount > 0) {
+      opts.push({ value: "unpriced", label: copy.filterUnpriced(unpricedConnectedCount) });
+    }
+    opts.push({ value: "catalog", label: copy.filterCatalog });
     return opts;
   }, [
-    copy.filterActive,
-    copy.filterAll,
-    copy.filterSynced,
+    connectedRows.length,
+    unpricedConnectedCount,
+    copy.filterConnected,
     copy.filterUnpriced,
-    hasActiveRows,
-    hasSyncedRows,
-    hasUnpricedRows,
+    copy.filterCatalog,
   ]);
 
+  const defaultFilter: StatusFilter = connectedRows.length > 0 ? "connected" : "catalog";
   const effectiveFilter: StatusFilter = filterOptions.some((opt) => opt.value === statusFilter)
     ? statusFilter
-    : "all";
-
-  const visibleRows = useMemo(() => {
-    const normalizedQuery = searchQuery.trim().toLowerCase();
-    return allRows.filter((row) => {
-      if (effectiveFilter === "active" && !row.seenLocally && row.custom === null) return false;
-      if (effectiveFilter === "synced" && row.synced === null) return false;
-      if (effectiveFilter === "unpriced" && row.effective !== null) return false;
-      return matchesSearch(row, normalizedQuery);
-    });
-  }, [allRows, effectiveFilter, searchQuery]);
+    : defaultFilter;
 
   const trimmedSearch = searchQuery.trim();
+  const normalizedQuery = trimmedSearch.toLowerCase();
+
+  const visibleRows = useMemo(() => {
+    const pool =
+      effectiveFilter === "connected"
+        ? allRows.filter(
+            (row) =>
+              isConnectedRow(row) || (focusTarget.key !== null && row.key === focusTarget.key),
+          )
+        : effectiveFilter === "unpriced"
+          ? connectedRows.filter((row) => row.effective === null)
+          : catalogRows;
+    return pool.filter((row) => matchesSearch(row, normalizedQuery));
+  }, [allRows, connectedRows, catalogRows, effectiveFilter, focusTarget.key, normalizedQuery]);
+
+  const catalogSearchMatches = useMemo(() => {
+    if (!normalizedQuery || effectiveFilter === "catalog") return 0;
+    return catalogRows.filter((row) => matchesSearch(row, normalizedQuery)).length;
+  }, [catalogRows, effectiveFilter, normalizedQuery]);
+
+  const extraCatalogSearchMatches = useMemo(() => {
+    if (!normalizedQuery || effectiveFilter === "catalog" || visibleRows.length === 0) return 0;
+    const shownKeys = new Set(visibleRows.map((row) => row.key));
+    return catalogRows.filter(
+      (row) => !shownKeys.has(row.key) && matchesSearch(row, normalizedQuery),
+    ).length;
+  }, [catalogRows, effectiveFilter, normalizedQuery, visibleRows]);
+
+  const modelsCountSummary =
+    effectiveFilter === "connected"
+      ? copy.modelsCountConnected(
+          connectedRows.length,
+          connectedSyncedCount,
+          connectedCustomCount,
+          unpricedConnectedCount,
+        )
+      : effectiveFilter === "unpriced"
+        ? copy.modelsCountUnpriced(unpricedConnectedCount)
+        : copy.modelsCountCatalog(catalogRows.length, catalogSyncedCount, catalogCustomCount);
+
   const canCollapseList =
     trimmedSearch.length === 0 && !showAllRows && visibleRows.length > INITIAL_VISIBLE_ROWS;
   const renderedRows = canCollapseList ? visibleRows.slice(0, INITIAL_VISIBLE_ROWS) : visibleRows;
@@ -1732,6 +2241,7 @@ export function PricingDialog({
       setAdding(false);
       setNewKey("");
       setExpandedKey(null);
+      setStatusFilter("connected");
       toast.show(copy.savedToast, { variant: "success" });
     } catch (reason) {
       setAddError(errorMessage(reason, copy.saveFailed));
@@ -1798,21 +2308,36 @@ export function PricingDialog({
         <View
           style={{
             flexDirection: narrow ? "column" : "row",
-            alignItems: narrow ? "flex-start" : "center",
+            alignItems: narrow ? "stretch" : "center",
             justifyContent: "space-between",
             gap: space.sm,
           }}
         >
-          <View style={{ flex: 1, minWidth: 0, gap: 4 }}>
+          <View
+            style={{
+              flex: narrow ? undefined : 1,
+              minWidth: 0,
+              gap: 4,
+            }}
+          >
             <View
               style={{
                 flexDirection: "row",
                 alignItems: "center",
-                flexWrap: "wrap",
+                justifyContent: narrow ? "space-between" : "flex-start",
+                flexWrap: narrow ? "nowrap" : "wrap",
                 gap: space.xs + 2,
               }}
             >
-              <Text style={{ ...font.small, fontWeight: "600", color: colors.foreground }}>
+              <Text
+                numberOfLines={narrow ? 1 : undefined}
+                style={{
+                  ...font.small,
+                  fontWeight: "600",
+                  color: colors.foreground,
+                  flexShrink: 1,
+                }}
+              >
                 {copy.syncTitle}
               </Text>
               <Badge
@@ -1820,6 +2345,7 @@ export function PricingDialog({
                 tone={syncBadge.tone}
                 dot={syncBadge.dot}
                 label={syncBadge.label}
+                style={{ flexShrink: 0 }}
               />
             </View>
             <Muted colors={colors} small>
@@ -1835,6 +2361,7 @@ export function PricingDialog({
             label={syncActive ? copy.syncingAction : copy.syncAction}
             loading={syncActive}
             disabled={!state || mutating || syncActive}
+            style={narrow ? { width: "100%" } : { flexShrink: 0 }}
             onPress={() => void handleSyncNow()}
           />
         </View>
@@ -1904,12 +2431,12 @@ export function PricingDialog({
         <View
           style={{
             flexDirection: narrow ? "column" : "row",
-            alignItems: narrow ? "flex-start" : "center",
+            alignItems: narrow ? "stretch" : "center",
             justifyContent: "space-between",
             gap: space.sm,
           }}
         >
-          <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
+          <View style={{ flex: narrow ? undefined : 1, minWidth: 0, gap: 2 }}>
             <Text style={{ ...font.small, fontWeight: "600", color: colors.foreground }}>
               {copy.displayCurrency}
             </Text>
@@ -1921,6 +2448,7 @@ export function PricingDialog({
             colors={colors}
             value={displayCurrency}
             options={displayCurrencyOptions}
+            fullWidth={narrow}
             onChange={(next) => void handleCurrencyChange(next)}
           />
         </View>
@@ -1933,9 +2461,9 @@ export function PricingDialog({
           </Text>
           <View
             style={{
-              flexDirection: "row",
-              flexWrap: "wrap",
-              alignItems: "center",
+              flexDirection: narrow ? "column" : "row",
+              alignItems: narrow ? "stretch" : "center",
+              flexWrap: narrow ? "nowrap" : "wrap",
               gap: space.sm,
             }}
           >
@@ -1946,7 +2474,14 @@ export function PricingDialog({
                 gap: space.xs + 2,
               }}
             >
-              <Text style={{ ...font.small, ...tabular, color: colors.foregroundMuted }}>
+              <Text
+                style={{
+                  ...font.small,
+                  ...tabular,
+                  color: colors.foregroundMuted,
+                  flexShrink: 0,
+                }}
+              >
                 {copy.exchangeRateUnitPrefix}
               </Text>
               <View
@@ -1958,7 +2493,7 @@ export function PricingDialog({
                   borderColor: rateError ? colors.statusDanger : colors.border,
                   borderRadius: radius.sm,
                   paddingHorizontal: space.sm,
-                  width: 96,
+                  ...(narrow ? { flex: 1, minWidth: 88 } : { width: 96 }),
                   minHeight: 32,
                 }}
               >
@@ -1991,12 +2526,18 @@ export function PricingDialog({
                   }}
                 />
               </View>
-              <Text style={{ ...font.small, color: colors.foregroundMuted }}>
+              <Text style={{ ...font.small, color: colors.foregroundMuted, flexShrink: 0 }}>
                 {copy.exchangeRateUnitSuffix}
               </Text>
             </View>
 
-            <View style={{ flexDirection: "row", alignItems: "center", gap: space.xs }}>
+            <View
+              style={{
+                flexDirection: "row",
+                alignItems: "center",
+                gap: narrow ? space.sm : space.xs,
+              }}
+            >
               <Button
                 colors={colors}
                 size="sm"
@@ -2004,15 +2545,17 @@ export function PricingDialog({
                 label={copy.saveRate}
                 loading={rateBusy}
                 disabled={!rateDirty || (mutating && !rateBusy)}
+                style={narrow ? { flex: 1 } : undefined}
                 onPress={() => void handleSaveRate()}
               />
               {state && state.usdToCnyRate !== DEFAULT_USD_TO_CNY_RATE ? (
                 <Button
                   colors={colors}
                   size="sm"
-                  variant="ghost"
+                  variant={narrow ? "secondary" : "ghost"}
                   label={copy.resetRate(DEFAULT_USD_TO_CNY_RATE)}
                   disabled={mutating}
+                  style={narrow ? { flex: 1 } : undefined}
                   onPress={() => void handleSaveRate(DEFAULT_USD_TO_CNY_RATE)}
                 />
               ) : null}
@@ -2044,7 +2587,7 @@ export function PricingDialog({
             <Text style={{ ...font.heading, color: colors.foreground }}>{copy.modelsHeading}</Text>
             {state ? (
               <Muted colors={colors} small>
-                {copy.modelsCount(allRows.length, syncedCount, customCount)}
+                {modelsCountSummary}
               </Muted>
             ) : null}
           </View>
@@ -2063,14 +2606,14 @@ export function PricingDialog({
         {state ? (
           <View
             style={{
-              flexDirection: narrow ? "column" : "row",
-              alignItems: narrow ? "stretch" : "center",
+              flexDirection: stackFilters ? "column" : "row",
+              alignItems: stackFilters ? "stretch" : "center",
               gap: space.sm,
             }}
           >
             <View
               style={{
-                flex: narrow ? undefined : 1,
+                flex: stackFilters ? undefined : 1,
                 flexDirection: "row",
                 alignItems: "center",
                 gap: space.xs,
@@ -2112,12 +2655,36 @@ export function PricingDialog({
             </View>
 
             {filterOptions.length > 1 ? (
-              <SegmentedControl<StatusFilter>
-                colors={colors}
-                value={effectiveFilter}
-                options={filterOptions}
-                onChange={(next) => setStatusFilter(next)}
-              />
+              stackFilters ? (
+                <RNScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  style={{ flexGrow: 0 }}
+                  contentContainerStyle={{ flexDirection: "row" }}
+                >
+                  <SegmentedControl<StatusFilter>
+                    colors={colors}
+                    value={effectiveFilter}
+                    options={filterOptions}
+                    style={{ flexWrap: "nowrap" }}
+                    onChange={(next) => {
+                      setStatusFilter(next);
+                      setShowAllRows(false);
+                    }}
+                  />
+                </RNScrollView>
+              ) : (
+                <SegmentedControl<StatusFilter>
+                  colors={colors}
+                  value={effectiveFilter}
+                  options={filterOptions}
+                  style={{ flexWrap: "nowrap" }}
+                  onChange={(next) => {
+                    setStatusFilter(next);
+                    setShowAllRows(false);
+                  }}
+                />
+              )
             ) : null}
           </View>
         ) : null}
@@ -2153,9 +2720,39 @@ export function PricingDialog({
             }
           />
         ) : visibleRows.length === 0 ? (
-          <Muted colors={colors} style={{ paddingVertical: space.md }}>
-            {copy.emptyMatches}
-          </Muted>
+          <View style={{ paddingVertical: space.md, gap: space.sm, alignItems: "flex-start" }}>
+            <Muted colors={colors}>
+              {effectiveFilter !== "catalog" && trimmedSearch.length > 0 && catalogSearchMatches > 0
+                ? copy.emptySearchConnectedHint(trimmedSearch, catalogSearchMatches)
+                : effectiveFilter === "connected" && trimmedSearch.length === 0
+                  ? copy.emptyConnectedHint
+                  : copy.emptyMatches}
+            </Muted>
+            {effectiveFilter !== "catalog" && trimmedSearch.length > 0 && catalogSearchMatches > 0 ? (
+              <Button
+                colors={colors}
+                size="sm"
+                variant="secondary"
+                icon="Search"
+                label={copy.searchInCatalogCta(catalogSearchMatches)}
+                onPress={() => {
+                  setStatusFilter("catalog");
+                  setShowAllRows(false);
+                }}
+              />
+            ) : effectiveFilter === "connected" && trimmedSearch.length === 0 ? (
+              <Button
+                colors={colors}
+                size="sm"
+                variant="secondary"
+                label={copy.browseCatalogCta}
+                onPress={() => {
+                  setStatusFilter("catalog");
+                  setShowAllRows(false);
+                }}
+              />
+            ) : null}
+          </View>
         ) : (
           <View style={{ gap: space.sm }}>
             {loadError ? (
@@ -2177,10 +2774,13 @@ export function PricingDialog({
                 onToggle={() =>
                   setExpandedKey((current) => (current === row.key ? null : row.key))
                 }
-                onSave={async (rates) => {
+                onSave={async (rates, appliedLabel) => {
                   await applyUpdate({ key: row.key, rates });
                   setExpandedKey(null);
-                  toast.show(copy.savedToast, { variant: "success" });
+                  toast.show(
+                    appliedLabel ? copy.appliedSuggestionToast(appliedLabel) : copy.savedToast,
+                    { variant: "success" },
+                  );
                 }}
                 onReset={async () => {
                   await applyUpdate({ key: row.key, rates: null });
@@ -2197,6 +2797,23 @@ export function PricingDialog({
                   variant="secondary"
                   label={copy.showAllModels(visibleRows.length)}
                   onPress={() => setShowAllRows(true)}
+                />
+              </View>
+            ) : null}
+            {effectiveFilter !== "catalog" &&
+            trimmedSearch.length > 0 &&
+            extraCatalogSearchMatches > 0 ? (
+              <View style={{ alignItems: "center", paddingTop: space.xs }}>
+                <Button
+                  colors={colors}
+                  size="sm"
+                  variant="ghost"
+                  icon="Search"
+                  label={copy.moreInCatalogHint(extraCatalogSearchMatches)}
+                  onPress={() => {
+                    setStatusFilter("catalog");
+                    setShowAllRows(false);
+                  }}
                 />
               </View>
             ) : null}
@@ -2275,6 +2892,78 @@ export function PricingDialog({
                 paddingVertical: 7,
               }}
             />
+            {newKeySuggestions.length > 0 ? (
+              <View
+                style={{
+                  flexDirection: "row",
+                  flexWrap: "wrap",
+                  alignItems: "center",
+                  gap: space.xs,
+                  paddingTop: 2,
+                }}
+              >
+                {newKeySuggestions.map((candidate, index) => {
+                  const ratesText = formatRatesSummary(candidate.rates);
+                  const chipLabel =
+                    index === 0
+                      ? copy.fillReferenceChip(candidate.label, ratesText)
+                      : `${candidate.label} (${ratesText})`;
+                  return (
+                    <Pressable
+                      key={`${candidate.source}:${candidate.id}`}
+                      accessibilityRole="button"
+                      accessibilityLabel={copy.fillSuggestionLabel(candidate.label)}
+                      disabled={addBusy || mutating}
+                      onPress={(event) => {
+                        event?.stopPropagation?.();
+                        setNewDraft(draftFromRates(candidate.rates, displayCurrency));
+                        if (addError) setAddError("");
+                      }}
+                      style={(state) => ({
+                        flexDirection: "row",
+                        alignItems: "center",
+                        gap: 5,
+                        maxWidth: "100%",
+                        paddingHorizontal: space.sm + 2,
+                        paddingVertical: 5,
+                        borderRadius: radius.pill,
+                        backgroundColor:
+                          index === 0
+                            ? tint(
+                                colors.accent,
+                                state.pressed || Boolean((state as { hovered?: boolean }).hovered)
+                                  ? 0.2
+                                  : 0.12,
+                              )
+                            : tint(
+                                colors.foreground,
+                                state.pressed || Boolean((state as { hovered?: boolean }).hovered)
+                                  ? 0.1
+                                  : 0.06,
+                              ),
+                        opacity: addBusy || mutating ? 0.5 : 1,
+                      })}
+                    >
+                      {index === 0 ? (
+                        <SafeIcon name="Sparkles" size={12} color={colors.accent} />
+                      ) : null}
+                      <Text
+                        numberOfLines={1}
+                        style={{
+                          ...font.caption,
+                          ...tabular,
+                          fontWeight: index === 0 ? "600" : "500",
+                          color: index === 0 ? colors.accent : colors.foreground,
+                          flexShrink: 1,
+                        }}
+                      >
+                        {chipLabel}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+            ) : null}
           </View>
 
           <RateFieldsEditor

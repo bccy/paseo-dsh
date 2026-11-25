@@ -3,7 +3,8 @@
  *
  * - Wrapped in `PluginsBoundary` so render errors never abort a release app.
  * - Top header pairs the DeepSeek whale `Avatar` with a responsive 3-tab
- *   `SegmentedControl` (inline on wide layouts, stacked full-width on compact).
+ *   `SegmentedControl` on wide layouts, and omits the redundant title row on
+ *   compact mobile where Paseo's native navigation bar already renders the title.
  * - Supports `initialTab`, URL `params.tab`, and live `requestConsoleTab()` so
  *   Paseo Settings & Command Center open directly on Tab 3 (`settings`) even if
  *   the screen is already mounted on another tab.
@@ -411,7 +412,8 @@ function DshConsoleBody({
       <View
         style={{
           paddingHorizontal: horizontalPadding,
-          paddingVertical: compact ? space.md : space.lg,
+          paddingTop: compact ? space.sm : space.lg,
+          paddingBottom: compact ? space.md : space.lg,
           alignItems: "center",
         }}
       >
@@ -422,36 +424,34 @@ function DshConsoleBody({
             flexDirection: narrowHeader ? "column" : "row",
             alignItems: narrowHeader ? "stretch" : "center",
             justifyContent: "space-between",
-            gap: compact ? space.md : space.lg,
+            gap: compact ? 0 : space.lg,
           }}
         >
-          <View style={{ flexDirection: "row", alignItems: "center", gap: space.md, flex: narrowHeader ? undefined : 1, minWidth: 0 }}>
-            <Avatar
-              colors={colors}
-              label="DSH"
-              logo={DEEPSEEK_MARK_SVG}
-              size={compact ? 36 : 42}
-            />
-            <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
-              <Text
-                accessibilityRole="header"
-                numberOfLines={1}
-                style={{
-                  ...font.title,
-                  fontSize: compact ? 18 : font.title.fontSize,
-                  lineHeight: compact ? 24 : font.title.lineHeight,
-                  color: colors.foreground,
-                }}
-              >
-                {copy.title}
-              </Text>
-              {compact ? null : (
+          {compact ? null : (
+            <View style={{ flexDirection: "row", alignItems: "center", gap: space.md, flex: narrowHeader ? undefined : 1, minWidth: 0 }}>
+              <Avatar
+                colors={colors}
+                label="DSH"
+                logo={DEEPSEEK_MARK_SVG}
+                size={42}
+              />
+              <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
+                <Text
+                  accessibilityRole="header"
+                  numberOfLines={1}
+                  style={{
+                    ...font.title,
+                    color: colors.foreground,
+                  }}
+                >
+                  {copy.title}
+                </Text>
                 <Muted colors={colors} small numberOfLines={1}>
                   {copy.subtitle}
                 </Muted>
-              )}
+              </View>
             </View>
-          </View>
+          )}
 
           <SegmentedControl<ConsoleTabId>
             colors={colors}
@@ -472,7 +472,9 @@ function DshConsoleBody({
         style={{ flex: 1 }}
         keyboardShouldPersistTaps="handled"
         contentContainerStyle={{
-          padding: horizontalPadding,
+          paddingHorizontal: horizontalPadding,
+          paddingTop: compact ? space.md : space.xl,
+          paddingBottom: compact ? space.xl : horizontalPadding,
           alignItems: "center",
         }}
       >

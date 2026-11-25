@@ -62,7 +62,7 @@ const DAY_MS = 86_400_000;
 const RECENT_CORRUPT_GRACE_MS = 10_000;
 
 const RANGES: Record<UsageRange, { binMs: number; bins: number }> = {
-  "24h": { binMs: 3_600_000, bins: 24 },
+  today: { binMs: 3_600_000, bins: 24 },
   "7d": { binMs: 6 * 3_600_000, bins: 28 },
   "30d": { binMs: DAY_MS, bins: 30 },
 };
@@ -461,15 +461,16 @@ export function parseSessionJsonl(
 }
 
 /**
- * Local-calendar-aligned bin windows (DST-safe for 7d/30d, monotonic real hours for 24h).
+ * Local-calendar-aligned bin windows (hourly bins from local midnight 00:00 for
+ * `today`, 6-hour slots for `7d`, and calendar days for `30d`).
  */
 export function buildCalendarBins(now: number, range: UsageRange): Array<{ start: number; end: number }> {
-  const { binMs, bins: count } = RANGES[range];
+  const { bins: count } = RANGES[range];
   const anchor = new Date(now);
+  const year = anchor.getFullYear();
+  const month = anchor.getMonth();
+  const day = anchor.getDate();
   if (range === "30d") {
-    const year = anchor.getFullYear();
-    const month = anchor.getMonth();
-    const day = anchor.getDate();
     return Array.from({ length: count }, (_, index) => {
       const offset = index - (count - 1);
       const start = new Date(year, month, day + offset, 0, 0, 0, 0).getTime();
@@ -478,9 +479,6 @@ export function buildCalendarBins(now: number, range: UsageRange): Array<{ start
     });
   }
   if (range === "7d") {
-    const year = anchor.getFullYear();
-    const month = anchor.getMonth();
-    const day = anchor.getDate();
     const slot = Math.floor(anchor.getHours() / 6);
     const currentIndex = day * 4 + slot;
     return Array.from({ length: count }, (_, index) => {
@@ -495,18 +493,10 @@ export function buildCalendarBins(now: number, range: UsageRange): Array<{ start
       return { start, end };
     });
   }
-  const currentHour = new Date(
-    anchor.getFullYear(),
-    anchor.getMonth(),
-    anchor.getDate(),
-    anchor.getHours(),
-    0,
-    0,
-    0,
-  ).getTime();
-  return Array.from({ length: count }, (_, index) => {
-    const start = currentHour - (count - 1 - index) * binMs;
-    return { start, end: start + binMs };
+  return Array.from({ length: count }, (_, hour) => {
+    const start = new Date(year, month, day, hour, 0, 0, 0).getTime();
+    const end = new Date(year, month, day, hour + 1, 0, 0, 0).getTime();
+    return { start, end };
   });
 }
 
@@ -1066,7 +1056,7 @@ export class UsageStatsEngine {
         ? pricerSnapshot.usdToCnyRate
         : DEFAULT_USD_TO_CNY_RATE;
 
-    const range = input.range;
+    const range: UsageRange = (input.range as string) === "24h" ? "today" : input.range;
     const scope: UsageScope = input.scope ?? "all";
     const filterProvider = input.provider;
     const filterModel = input.model;
@@ -1074,10 +1064,11 @@ export class UsageStatsEngine {
     const now = this.now();
     const windows = buildCalendarBins(now, range);
     const firstStart = windows[0]!.start;
-    const lastEnd = Math.max(windows[windows.length - 1]!.end, now + 60_000);
+    const windowEnd = windows[windows.length - 1]!.end;
+    const lastEnd = Math.max(windowEnd, now + 60_000);
 
     // Also inspect the 371-day window for `hasSubagents` so the scope switcher stays visible
-    // when subagent activity appears in the 53-week heatmap even if today's 24h window is quiet.
+    // when subagent activity appears in the 53-week heatmap even if today's window is quiet.
     const anchor = new Date(now);
     const dailyStart = new Date(
       anchor.getFullYear(),
@@ -1111,7 +1102,11 @@ export class UsageStatsEngine {
         if (entry.isSubagent && call.at >= dailyStart && call.at <= lastEnd) {
           hasSubagents = true;
         }
-        if (call.at < firstStart || call.at > lastEnd) continue;
+        if (range === "today") {
+          if (call.at < firstStart || call.at >= windowEnd) continue;
+        } else if (call.at < firstStart || call.at > lastEnd) {
+          continue;
+        }
 
         const { pricingKey, cost: callCost } = priceCallInCurrency(
           pricerSnapshot,

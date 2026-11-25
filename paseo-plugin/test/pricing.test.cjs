@@ -32,12 +32,15 @@ const {
   normalizeModelKey,
   parseModelsDevCatalog,
   pricingGetRpc,
+  pricingStateSchema,
+  pricingSuggestionSchema,
   pricingSyncRpc,
   pricingUpdateInputSchema,
   pricingUpdateRpc,
   resolveModelRates,
   resolvePricingKey,
   stripProviderPrefix,
+  suggestClosestPricing,
 } = require("../shared/pricing.ts");
 
 const {
@@ -1299,11 +1302,492 @@ test("registerPricingRpc wires dsh.pricing.sync, lazy stale refresh on get, and 
   dispose2();
 });
 
+// ---- Closest Official Pricing Suggestions --------------------------------------------------
+
+function buildRichSuggestionCatalog() {
+  return parseModelsDevCatalog(
+    {
+      deepseek: {
+        name: "DeepSeek",
+        models: {
+          "deepseek-v4-pro": {
+            name: "DeepSeek V4 Pro",
+            cost: { input: 0.66, output: 1.98, cache_read: 0.022 },
+          },
+          "deepseek-v4-flash": {
+            name: "DeepSeek V4 Flash",
+            cost: { input: 0.15, output: 0.6, cache_read: 0.003 },
+          },
+        },
+      },
+      anthropic: {
+        name: "Anthropic",
+        models: {
+          "claude-sonnet-4-5": {
+            name: "Claude Sonnet 4.5",
+            cost: { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
+          },
+          "claude-opus-4-6": {
+            name: "Claude Opus 4.6",
+            cost: { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 },
+          },
+        },
+      },
+      openai: {
+        name: "OpenAI",
+        models: {
+          "gpt-5.4": {
+            name: "GPT-5.4",
+            cost: {
+              input: 2.5,
+              output: 15,
+              cache_read: 0.25,
+              tiers: [
+                { input: 5, output: 22.5, cache_read: 0.5, tier: { type: "context", size: 272000 } },
+              ],
+            },
+          },
+          "gpt-5": {
+            name: "GPT-5",
+            cost: { input: 1.25, output: 10, cache_read: 0.125 },
+          },
+          "gpt-5-pro": {
+            name: "GPT-5 Pro",
+            cost: { input: 15, output: 120 },
+          },
+          "gpt-5-mini": {
+            name: "GPT-5 Mini",
+            cost: { input: 0.25, output: 2, cache_read: 0.025 },
+          },
+          "gpt-4.1": {
+            name: "GPT-4.1",
+            cost: { input: 2, output: 8, cache_read: 0.5 },
+          },
+          "gpt-3.5-turbo": {
+            name: "GPT-3.5 Turbo",
+            cost: { input: 0.5, output: 1.5 },
+          },
+          "gpt-4o-mini-tts": {
+            name: "GPT-4o Mini TTS",
+            cost: { input: 0.6, output: 12 },
+          },
+          "gpt-image-1": {
+            name: "GPT Image 1",
+            cost: { input: 5, output: 40 },
+          },
+          "gpt-4o-realtime-preview": {
+            name: "GPT-4o Realtime",
+            cost: { input: 5, output: 20 },
+          },
+          "text-embedding-3-large": {
+            name: "Text Embedding 3 Large",
+            cost: { input: 0.13, output: 0 },
+          },
+        },
+      },
+      google: {
+        name: "Google",
+        models: {
+          "gemini-3.1-pro": {
+            name: "Gemini 3.1 Pro",
+            cost: {
+              input: 2,
+              output: 12,
+              cache_read: 0.2,
+              context_over_200k: { input: 4, output: 18, cache_read: 0.4 },
+            },
+          },
+          "gemini-2.5-pro": {
+            name: "Gemini 2.5 Pro",
+            cost: {
+              input: 1.25,
+              output: 10,
+              cache_read: 0.125,
+              context_over_200k: { input: 2.5, output: 15, cache_read: 0.25 },
+            },
+          },
+          "gemini-2.5-flash-image": {
+            name: "Gemini 2.5 Flash Image",
+            cost: { input: 0.3, output: 30 },
+          },
+          "gemini-2.5-flash-preview-tts": {
+            name: "Gemini 2.5 Flash TTS",
+            cost: { input: 0.5, output: 10 },
+          },
+          "gemini-2.0-flash-live-001": {
+            name: "Gemini 2.0 Flash Live",
+            cost: { input: 0.35, output: 1.5 },
+          },
+          "gemini-embedding-001": {
+            name: "Gemini Embedding",
+            cost: { input: 0.15, output: 0 },
+          },
+        },
+      },
+    },
+    "2026-11-26T00:00:00.000Z",
+  );
+}
+
+test("suggestClosestPricing handles multi-segment relay prefixes and stays within family/tier", () => {
+  const catalog = buildRichSuggestionCatalog();
+  const suggestions = suggestClosestPricing("proxy/sub/gemini-3.8-flash", catalog, 3);
+
+  assert.equal(suggestions.length, 3);
+  for (const item of suggestions) {
+    assert.doesNotThrow(() => pricingSuggestionSchema.parse(item));
+    assert.ok(item.id.startsWith("gemini-"), `must stay within Gemini family, got ${item.id}`);
+    assert.ok(!item.id.includes("image") && !item.id.includes("tts") && !item.id.includes("live"));
+  }
+
+  // Top match must be a Gemini Flash model (NOT Pro or Claude).
+  assert.equal(suggestions[0].id, "gemini-3-flash");
+  assert.ok(suggestions[0].id.includes("flash"));
+  assert.ok(suggestions[1].id.includes("flash"));
+  assert.ok(suggestions[0].score >= suggestions[1].score);
+  assert.ok(suggestions[1].score >= suggestions[2].score);
+
+  // Deduplication: synced gemini-2.5-pro takes priority over built-in reference gemini-2.5-pro.
+  const proMatches = suggestClosestPricing("relay/v2/gemini-2.5-pro-custom", catalog, 3);
+  const g25ProEntries = proMatches.filter((s) => s.id === "gemini-2.5-pro");
+  assert.equal(g25ProEntries.length, 1);
+  assert.equal(g25ProEntries[0].source, "synced");
+  assert.equal(g25ProEntries[0].provider, "google");
+});
+
+test("suggestClosestPricing prefers newest flagship models for future/codename versions", () => {
+  const catalog = buildRichSuggestionCatalog();
+
+  // Future Gemini version -> newest Gemini flagship/flash (NOT older v2.0 or specialized modality).
+  const gemini4 = suggestClosestPricing("proxy/gemini-4-custom", catalog, 3);
+  assert.equal(gemini4.length, 3);
+  assert.equal(gemini4[0].id, "gemini-3.1-pro");
+  assert.ok(
+    gemini4.some((s) => s.id === "gemini-3-flash"),
+    "expected gemini-3-flash in top 3 for proxy/gemini-4-custom",
+  );
+  for (const item of gemini4) {
+    assert.ok(item.id.startsWith("gemini-"));
+    assert.notEqual(item.id, "gemini-2.0-flash");
+    assert.ok(!item.id.includes("image") && !item.id.includes("tts") && !item.id.includes("embedding"));
+  }
+
+  // Future GPT version -> newest GPT-5+ flagships (NOT gpt-3.5-turbo, tts, image, or realtime).
+  const gpt61 = suggestClosestPricing("proxy/gpt-6.1-custom", catalog, 3);
+  assert.equal(gpt61.length, 3);
+  assert.equal(gpt61[0].id, "gpt-5.4");
+  assert.equal(gpt61[0].source, "synced");
+  assert.equal(gpt61[1].id, "gpt-5");
+  for (const item of gpt61) {
+    assert.ok(item.id.startsWith("gpt-5"), `expected GPT-5+ flagship, got ${item.id}`);
+    assert.notEqual(item.id, "gpt-3.5-turbo");
+    assert.ok(!item.id.includes("tts") && !item.id.includes("image") && !item.id.includes("realtime"));
+  }
+
+  // Without synced catalog (reference-only), future GPT still prefers GPT-5 flagship first.
+  const gpt61Offline = suggestClosestPricing("proxy/gpt-6.1-custom", null, 3);
+  assert.equal(gpt61Offline[0].id, "gpt-5");
+  assert.equal(gpt61Offline[0].source, "reference");
+});
+
+test("suggestClosestPricing handles non-standard DeepSeek tiers and modality protection", () => {
+  // Without synced deepseek-*-flash: proxy/deepseek-flash prefers deepseek-chat over deepseek-reasoner!
+  const dsOffline = suggestClosestPricing("proxy/deepseek-flash", null, 3);
+  assert.equal(dsOffline.length, 2);
+  assert.equal(dsOffline[0].id, "deepseek-chat");
+  assert.equal(dsOffline[1].id, "deepseek-reasoner");
+  assert.ok(dsOffline[0].score > dsOffline[1].score);
+
+  // With synced deepseek-v4-flash: exact flash match wins, followed by deepseek-chat.
+  const catalog = buildRichSuggestionCatalog();
+  const dsSynced = suggestClosestPricing("proxy/deepseek-flash", catalog, 3);
+  assert.equal(dsSynced[0].id, "deepseek-v4-flash");
+  assert.equal(dsSynced[0].source, "synced");
+  assert.equal(dsSynced[1].id, "deepseek-chat");
+
+  // Reasoning variant prefers deepseek-reasoner when offline.
+  const dsReason = suggestClosestPricing("proxy/deepseek-thinking", null, 2);
+  assert.equal(dsReason[0].id, "deepseek-reasoner");
+
+  // Modality guard: specialized modality candidates never pollute text model suggestions,
+  // even when asking for more results than normal.
+  const textGpt = suggestClosestPricing("proxy/gpt-4o-custom", catalog, 5);
+  for (const item of textGpt) {
+    assert.ok(
+      !/(?:tts|image|realtime|embed|audio|video|live|translate)/.test(item.id),
+      `specialized modality model leaked into text suggestions: ${item.id}`,
+    );
+  }
+
+  // When query explicitly asks for a modality, that modality candidate IS suggested first.
+  const ttsGpt = suggestClosestPricing("proxy/gpt-5-tts", catalog, 3);
+  assert.equal(ttsGpt[0].id, "gpt-4o-mini-tts");
+  const imgGem = suggestClosestPricing("proxy/gemini-3-image", catalog, 3);
+  assert.equal(imgGem[0].id, "gemini-2.5-flash-image");
+});
+
+test("suggestClosestPricing returns [] for unrelated names and handles edge cases cleanly", () => {
+  const catalog = buildRichSuggestionCatalog();
+
+  assert.deepEqual(suggestClosestPricing("totally-unknown-xyz-999", catalog), []);
+  assert.deepEqual(suggestClosestPricing("proxy/sub/totally-unknown-xyz-999", null), []);
+  assert.deepEqual(suggestClosestPricing("", catalog), []);
+  assert.deepEqual(suggestClosestPricing("   ///  ", catalog), []);
+  assert.deepEqual(suggestClosestPricing("proxy/gemini-4-custom", catalog, 0), []);
+  assert.deepEqual(suggestClosestPricing("proxy/gemini-4-custom", catalog, -2), []);
+
+  // Unanchored partial name with strong token/bigram overlap still matches.
+  const unanchored = suggestClosestPricing("sonnet-4.5", catalog, 2);
+  assert.ok(unanchored.length >= 1);
+  assert.equal(unanchored[0].id, "claude-sonnet-4-5");
+  assert.ok(unanchored[0].score >= 0.35);
+
+  // Returned rates are cloned (mutating suggestion must not corrupt catalog/reference).
+  const one = suggestClosestPricing("proxy/gemini-4-custom", catalog, 1);
+  assert.equal(one.length, 1);
+  const originalInput = catalog.models["gemini-3.1-pro"].rates.input;
+  one[0].rates.input = 9999;
+  assert.equal(catalog.models["gemini-3.1-pro"].rates.input, originalInput);
+});
+
+test("PricingStore.state attaches suggestions to non-standard models and preserves them after override", async (t) => {
+  const tmp = makeTempDir(t);
+  const store = new PricingStore({
+    dshHome: tmp,
+    fetchImpl: async () =>
+      makeJsonResponse({
+        openai: {
+          name: "OpenAI",
+          models: {
+            "gpt-5.4": { name: "GPT-5.4", cost: { input: 2.5, output: 15, cache_read: 0.25 } },
+            "gpt-4o-mini-tts": { name: "GPT-4o Mini TTS", cost: { input: 0.6, output: 12 } },
+          },
+        },
+        google: {
+          name: "Google",
+          models: {
+            "gemini-3.1-pro": { name: "Gemini 3.1 Pro", cost: { input: 2, output: 12, cache_read: 0.2 } },
+          },
+        },
+      }),
+  });
+  t.after(() => store.dispose());
+  await store.syncOfficialCatalog({ force: true });
+
+  const seenModels = new Map([
+    ["proxy/sub/gemini-3.8-flash", "proxy/sub/gemini-3.8-flash"],
+    ["proxy/gpt-6.1-custom", "proxy/gpt-6.1-custom"],
+    ["proxy/deepseek-flash", "proxy/deepseek-flash"],
+    ["totally-unknown-xyz-999", "totally-unknown-xyz-999"],
+    ["gpt-5.4", "GPT-5.4"],
+  ]);
+
+  const state = await store.state(seenModels);
+  assert.doesNotThrow(() => pricingStateSchema.parse(state));
+
+  const gemRow = state.models.find((row) => row.key === "gemini-3.8-flash");
+  assert.ok(gemRow, "expected non-standard gemini-3.8-flash row");
+  assert.equal(gemRow.effective, null);
+  assert.ok(Array.isArray(gemRow.suggestions) && gemRow.suggestions.length === 3);
+  assert.equal(gemRow.suggestions[0].id, "gemini-3-flash");
+
+  const gptRow = state.models.find((row) => row.key === "gpt-6.1-custom");
+  assert.ok(gptRow, "expected non-standard gpt-6.1-custom row");
+  assert.equal(gptRow.effective, null);
+  assert.ok(Array.isArray(gptRow.suggestions) && gptRow.suggestions.length > 0);
+  assert.equal(gptRow.suggestions[0].id, "gpt-5.4");
+
+  const dsRow = state.models.find((row) => row.key === "deepseek-flash");
+  assert.ok(dsRow, "expected non-standard deepseek-flash row");
+  assert.equal(dsRow.suggestions?.[0]?.id, "deepseek-chat");
+
+  const unknownRow = state.models.find((row) => row.key === "totally-unknown-xyz-999");
+  assert.ok(unknownRow);
+  assert.deepEqual(unknownRow.suggestions, []);
+
+  // Exact synced/reference rows do not need suggestions attached.
+  const exactSyncedRow = state.models.find((row) => row.key === "gpt-5.4");
+  assert.equal(exactSyncedRow?.suggestions, undefined);
+  const refRow = state.models.find((row) => row.key === "claude-sonnet-4");
+  assert.equal(refRow?.suggestions, undefined);
+
+  // Saving a custom override on a non-standard key preserves `suggestions` for comparison/re-apply.
+  await store.update({
+    key: "gemini-3.8-flash",
+    rates: gemRow.suggestions[0].rates,
+  });
+  const afterOverride = await store.state(seenModels);
+  assert.doesNotThrow(() => pricingStateSchema.parse(afterOverride));
+  const overriddenGem = afterOverride.models.find((row) => row.key === "gemini-3.8-flash");
+  assert.equal(overriddenGem?.source, "override");
+  assert.equal(overriddenGem?.effective?.input, gemRow.suggestions[0].rates.input);
+  assert.ok(
+    Array.isArray(overriddenGem?.suggestions) && overriddenGem.suggestions[0]?.id === "gemini-3-flash",
+    "suggestions should remain available after applying a custom override",
+  );
+});
+
+test("PricingStore.state and registerPricingRpc surface DSH-configured models cleanly without duplicates", async (t) => {
+  const tmp = makeTempDir(t);
+  const store = new PricingStore({
+    dshHome: tmp,
+    fetchImpl: async () =>
+      makeJsonResponse({
+        deepseek: {
+          name: "DeepSeek",
+          models: {
+            "deepseek-v4-pro": {
+              name: "DeepSeek V4 Pro",
+              cost: { input: 0.66, output: 1.98, cache_read: 0.022 },
+            },
+          },
+        },
+        google: {
+          name: "Google",
+          models: {
+            "gemini-3.1-pro": {
+              name: "Gemini 3.1 Pro",
+              cost: { input: 2, output: 12, cache_read: 0.2 },
+            },
+          },
+        },
+      }),
+  });
+  t.after(() => store.dispose());
+  await store.syncOfficialCatalog({ force: true });
+
+  const seenModels = new Map([
+    ["claude-sonnet-4-5-20250929", "Claude Sonnet 4.5 (Seen)"],
+    ["proxy/sub/gemini-3.8-flash", "Gemini 3.8 Flash (Seen)"],
+  ]);
+  const configuredModels = new Map([
+    // Overlaps with seenModels on built-in reference key `claude-sonnet-4` (must unify, no duplicate).
+    ["anthropic/claude-sonnet-4-20250514", "Claude Sonnet 4 (Configured)"],
+    // Configured built-in reference model not yet seen locally -> promoted to rank 0.
+    ["gpt-4.1", "GPT-4.1 Configured"],
+    // Configured synced catalog model not yet seen locally -> appears in extras with synced rates.
+    ["deepseek-v4-pro", "DeepSeek V4 Pro Configured"],
+    // Overlaps with seenModels on non-standard key `gemini-3.8-flash` -> seen label wins, no duplicate.
+    ["relay/gemini-3.8-flash", "Gemini 3.8 Flash (Configured)"],
+    // Configured-only unpriced non-standard model -> gets `configured: true`, `seenLocally: false`, and suggestions.
+    ["relay/gemini-4-custom", "Gemini 4 Custom"],
+    // Ignored invalid sentinel.
+    ["unknown", "Unknown"],
+  ]);
+
+  const state = await store.state(seenModels, configuredModels);
+  assert.doesNotThrow(() => pricingStateSchema.parse(state));
+
+  // No duplicate keys across the entire model list.
+  const keys = state.models.map((row) => row.key);
+  assert.equal(new Set(keys).size, keys.length, "state.models must not contain duplicate keys");
+  assert.equal(keys.includes("unknown"), false);
+
+  // Built-in reference model that is BOTH seen and configured.
+  const sonnetRow = state.models.find((row) => row.key === "claude-sonnet-4");
+  assert.equal(sonnetRow?.seenLocally, true);
+  assert.equal(sonnetRow?.configured, true);
+
+  // Configured-only built-in reference model is promoted to rank 0 (before unconfigured reference models).
+  const gpt41Index = state.models.findIndex((row) => row.key === "gpt-4.1");
+  const unconfiguredRefIndex = state.models.findIndex((row) => row.key === "deepseek-chat");
+  assert.ok(gpt41Index >= 0 && unconfiguredRefIndex > gpt41Index, "configured reference row must rank ahead of unconfigured reference rows");
+  assert.equal(state.models[gpt41Index].configured, true);
+  assert.equal(state.models[gpt41Index].seenLocally, false);
+  assert.equal(state.models[unconfiguredRefIndex].configured, false);
+  assert.equal(state.models[unconfiguredRefIndex].seenLocally, false);
+
+  // Configured-only synced catalog model gets `configured: true`, `seenLocally: false`, synced rates, and configured label.
+  const dsV4Row = state.models.find((row) => row.key === "deepseek-v4-pro");
+  assert.equal(dsV4Row?.configured, true);
+  assert.equal(dsV4Row?.seenLocally, false);
+  assert.equal(dsV4Row?.label, "DeepSeek V4 Pro Configured");
+  assert.equal(dsV4Row?.source, "synced");
+  assert.equal(dsV4Row?.effective?.input, 0.66);
+
+  // Remaining unconfigured synced catalog model has `configured: false` and `seenLocally: false`.
+  const remainingSyncedRow = state.models.find((row) => row.key === "gemini-3.1-pro");
+  assert.equal(remainingSyncedRow?.configured, false);
+  assert.equal(remainingSyncedRow?.seenLocally, false);
+  assert.equal(remainingSyncedRow?.source, "synced");
+
+  // Merged non-standard model (both seen and configured): seen label wins, suggestions attached.
+  const gem38Rows = state.models.filter((row) => row.key === "gemini-3.8-flash");
+  assert.equal(gem38Rows.length, 1);
+  assert.equal(gem38Rows[0].seenLocally, true);
+  assert.equal(gem38Rows[0].configured, true);
+  assert.equal(gem38Rows[0].label, "Gemini 3.8 Flash (Seen)");
+  assert.equal(gem38Rows[0].effective, null);
+  assert.ok(Array.isArray(gem38Rows[0].suggestions) && gem38Rows[0].suggestions.length > 0);
+  assert.equal(gem38Rows[0].suggestions[0].id, "gemini-3-flash");
+
+  // Configured-only unpriced non-standard model: `configured: true`, `seenLocally: false`, configured label, suggestions attached.
+  const gem4Row = state.models.find((row) => row.key === "gemini-4-custom");
+  assert.ok(gem4Row, "expected configured-only unpriced non-standard model");
+  assert.equal(gem4Row.seenLocally, false);
+  assert.equal(gem4Row.configured, true);
+  assert.equal(gem4Row.label, "Gemini 4 Custom");
+  assert.equal(gem4Row.effective, null);
+  assert.ok(Array.isArray(gem4Row.suggestions) && gem4Row.suggestions.length > 0);
+  assert.equal(gem4Row.suggestions[0].id, "gemini-3.1-pro");
+
+  // Array form of configuredModels works cleanly too.
+  const arrayState = await store.state(undefined, ["deepseek-reasoner", "relay/custom-unused"]);
+  assert.doesNotThrow(() => pricingStateSchema.parse(arrayState));
+  assert.equal(arrayState.models.find((row) => row.key === "deepseek-reasoner")?.configured, true);
+  assert.equal(arrayState.models.find((row) => row.key === "custom-unused")?.configured, true);
+  assert.equal(arrayState.models.find((row) => row.key === "custom-unused")?.seenLocally, false);
+
+  // registerPricingRpc threads getConfiguredModels through get, update, and sync, and survives errors safely.
+  const handlers = new Map();
+  let shouldFailConfigured = false;
+  const dispose = registerPricingRpc(
+    { handle: (contract, handler) => handlers.set(contract.name, { contract, handler }) },
+    store,
+    {
+      getSeenModels: async () => new Map([["claude-sonnet-4", "Claude Sonnet 4"]]),
+      getConfiguredModels: async () => {
+        if (shouldFailConfigured) throw new Error("diagnostics overview failed");
+        return new Map([["relay/gemini-4-custom", "Gemini 4 Custom"]]);
+      },
+    },
+  );
+  t.after(dispose);
+
+  async function callRpc(name, rawInput) {
+    const entry = handlers.get(name);
+    const parsedInput = entry.contract.input.parse(rawInput);
+    const result = await entry.handler(parsedInput, { paseo: {} });
+    return entry.contract.output.parse(result);
+  }
+
+  const rpcGet = await callRpc("dsh.pricing.get", {});
+  assert.equal(rpcGet.models.find((row) => row.key === "gemini-4-custom")?.configured, true);
+
+  const rpcUpdate = await callRpc("dsh.pricing.update", {
+    key: "gemini-4-custom",
+    rates: { currency: "USD", input: 1.5, cached: 0.15, output: 6 },
+  });
+  const updatedGem4 = rpcUpdate.models.find((row) => row.key === "gemini-4-custom");
+  assert.equal(updatedGem4?.configured, true);
+  assert.equal(updatedGem4?.source, "override");
+
+  const rpcSync = await callRpc("dsh.pricing.sync", { force: true });
+  assert.equal(rpcSync.models.find((row) => row.key === "gemini-4-custom")?.configured, true);
+
+  // If getConfiguredModels throws, RPC handlers still succeed cleanly with configured: false.
+  shouldFailConfigured = true;
+  const rpcFallback = await callRpc("dsh.pricing.get", {});
+  assert.equal(rpcFallback.models.find((row) => row.key === "claude-sonnet-4")?.seenLocally, true);
+  assert.equal(rpcFallback.models.find((row) => row.key === "claude-sonnet-4")?.configured, false);
+});
+
 test("shared/pricing.ts stays Hermes-safe and index.server.ts registers zero agent.open.before hooks", () => {
   const sharedSrc = fs.readFileSync(path.join(__dirname, "../shared/pricing.ts"), "utf8");
   const sharedCode = sharedSrc.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
   assert.equal(/["']node:/.test(sharedCode), false, "shared/pricing.ts must have zero node:* imports");
   assert.equal(/\bstructuredClone\b/.test(sharedCode), false, "shared/pricing.ts must not use structuredClone");
+  assert.equal(/\(\?<[=!]/.test(sharedCode), false, "shared/pricing.ts must not use regex lookbehind");
 
   const serverEntry = fs.readFileSync(path.join(__dirname, "../index.server.ts"), "utf8");
   const serverCode = serverEntry.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");

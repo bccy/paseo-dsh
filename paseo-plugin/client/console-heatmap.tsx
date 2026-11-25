@@ -58,6 +58,7 @@ interface HeatmapCopy {
   title: string;
   totalYear(value: string): string;
   totalWeeks(value: string, weeks: number): string;
+  totalWeeksCompact(value: string, weeks: number): string;
   tokensReadout(value: string): string;
   requestsReadout(count: number, formatted: string): string;
   costLabel: string;
@@ -78,6 +79,7 @@ const COPY_EN: HeatmapCopy = {
   title: "Activity",
   totalYear: (value) => `${value} tokens in the last year`,
   totalWeeks: (value, weeks) => `${value} tokens in the last ${weeks} weeks`,
+  totalWeeksCompact: (value, weeks) => `${value} tokens · ${weeks}w`,
   tokensReadout: (value) => `${value} tokens`,
   requestsReadout: (count, formatted) => `${formatted} ${count === 1 ? "request" : "requests"}`,
   costLabel: "Cost",
@@ -98,6 +100,7 @@ const COPY_ZH: HeatmapCopy = {
   title: "活跃度",
   totalYear: (value) => `近一年共 ${value} tokens`,
   totalWeeks: (value, weeks) => `近 ${weeks} 周共 ${value} tokens`,
+  totalWeeksCompact: (value, weeks) => `近 ${weeks} 周共 ${value} tokens`,
   tokensReadout: (value) => `${value} tokens`,
   requestsReadout: (_count, formatted) => `${formatted} 次请求`,
   costLabel: "估算费用",
@@ -345,7 +348,7 @@ function SummaryFigure({
   detail?: string;
 }) {
   return (
-    <View style={{ gap: 2, minWidth: 88 }}>
+    <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
       <Text numberOfLines={1} style={{ ...font.caption, color: colors.foregroundMuted }}>
         {label}
       </Text>
@@ -486,32 +489,36 @@ export function ConsoleHeatmap({
   const heading = data
     ? weeks >= 52
       ? copy.totalYear(tokens(calendar.total))
-      : copy.totalWeeks(tokens(calendar.total), weeks)
+      : narrow
+        ? copy.totalWeeksCompact(tokens(calendar.total), weeks)
+        : copy.totalWeeks(tokens(calendar.total), weeks)
     : copy.title;
 
   const activeCostText =
     activeCell && activeCell.cost !== null ? moneyFixed(activeCell.cost, currency, locale) : "—";
 
+  const swatchSize = narrow ? Math.min(cell, 10) : Math.min(cell, 12);
+
   const legend = (
     <View
-      style={{ flexDirection: "row", alignItems: "center", gap: 3 }}
+      style={{ flexDirection: "row", alignItems: "center", gap: 3, flexShrink: 0 }}
       accessibilityLabel={copy.legend}
     >
-      <Text style={{ ...font.caption, color: colors.foregroundMuted, marginRight: 3 }}>
+      <Text style={{ ...font.caption, color: colors.foregroundMuted, marginRight: 2 }}>
         {copy.less}
       </Text>
       {LEVELS.map((level) => (
         <View
           key={level}
           style={{
-            width: Math.min(cell, 12),
-            height: Math.min(cell, 12),
+            width: swatchSize,
+            height: swatchSize,
             borderRadius: corner,
             backgroundColor: levelColor(level),
           }}
         />
       ))}
-      <Text style={{ ...font.caption, color: colors.foregroundMuted, marginLeft: 3 }}>
+      <Text style={{ ...font.caption, color: colors.foregroundMuted, marginLeft: 2 }}>
         {copy.more}
       </Text>
     </View>
@@ -530,7 +537,14 @@ export function ConsoleHeatmap({
       style={{ width: "100%", zIndex: 2 }}
     >
       <Card colors={colors} style={{ padding, gap: space.md, opacity: dimmed ? 0.6 : 1 }}>
-        <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm }}>
+        <View
+          style={{
+            flexDirection: "row",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: space.sm,
+          }}
+        >
           <Text
             accessibilityRole="header"
             numberOfLines={1}
@@ -538,6 +552,7 @@ export function ConsoleHeatmap({
           >
             {heading}
           </Text>
+          {legend}
         </View>
 
         {error ? (
@@ -685,121 +700,142 @@ export function ConsoleHeatmap({
           ) : null}
         </View>
 
-        {/* Narrow screens: tap-selected inline detail bar below the grid (zero hover dependency). */}
+        {/* Narrow screens: subtle tap hint when idle; accent-tinted detail card when a day is selected. */}
         {narrow ? (
-          <View
-            style={{
-              flexDirection: "row",
-              alignItems: "center",
-              justifyContent: "space-between",
-              gap: space.sm,
-              paddingHorizontal: space.sm + 2,
-              paddingVertical: space.xs + 2,
-              borderRadius: radius.md,
-              backgroundColor: activeCell
-                ? tint(colors.accent, 0.08)
-                : tint(colors.foreground, 0.04),
-              borderWidth: 1,
-              borderColor: activeCell ? tint(colors.accent, 0.25) : "transparent",
-              minHeight: 38,
-            }}
-          >
-            {activeCell ? (
-              <>
-                <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
-                  <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm, flexWrap: "wrap" }}>
-                    <Text
-                      numberOfLines={1}
-                      style={{ ...font.caption, ...tabular, fontWeight: "600", color: colors.foreground }}
-                    >
-                      {longDate(localDate(activeCell.day), locale)}
-                    </Text>
-                    <Text
-                      numberOfLines={1}
-                      style={{ ...font.caption, ...tabular, fontWeight: "600", color: colors.accent }}
-                    >
-                      {activeCell.tokens > 0
-                        ? copy.tokensReadout(tokens(activeCell.tokens))
-                        : copy.none}
-                    </Text>
-                  </View>
+          activeCell ? (
+            <View
+              style={{
+                flexDirection: "row",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: space.sm,
+                paddingHorizontal: space.sm + 2,
+                paddingVertical: space.xs + 2,
+                borderRadius: radius.md,
+                backgroundColor: tint(colors.accent, 0.08),
+                borderWidth: 1,
+                borderColor: tint(colors.accent, 0.25),
+              }}
+            >
+              <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
+                <View style={{ flexDirection: "row", alignItems: "baseline", gap: space.sm, flexWrap: "wrap" }}>
                   <Text
                     numberOfLines={1}
-                    style={{ ...font.caption, ...tabular, color: colors.foregroundMuted }}
+                    style={{ ...font.caption, ...tabular, fontWeight: "600", color: colors.foreground }}
                   >
-                    {`${copy.requestsReadout(
-                      activeCell.requests,
-                      integer(activeCell.requests, locale),
-                    )} · ${copy.costLabel} ${activeCostText}`}
+                    {longDate(localDate(activeCell.day), locale)}
+                  </Text>
+                  <Text
+                    numberOfLines={1}
+                    style={{ ...font.caption, ...tabular, fontWeight: "600", color: colors.accent }}
+                  >
+                    {activeCell.tokens > 0
+                      ? copy.tokensReadout(tokens(activeCell.tokens))
+                      : copy.none}
                   </Text>
                 </View>
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel={copy.dismissSelection}
-                  hitSlop={8}
-                  onPress={() => setActive(null)}
-                  style={{
-                    width: 24,
-                    height: 24,
-                    borderRadius: radius.pill,
-                    alignItems: "center",
-                    justifyContent: "center",
-                    backgroundColor: tint(colors.foreground, 0.06),
-                  }}
+                <Text
+                  numberOfLines={1}
+                  style={{ ...font.caption, ...tabular, color: colors.foregroundMuted }}
                 >
-                  <Icon name="X" size={12} color={colors.foregroundMuted} />
-                </Pressable>
-              </>
-            ) : (
-              <Text numberOfLines={1} style={{ ...font.caption, color: colors.foregroundMuted }}>
-                {copy.tapHint}
-              </Text>
-            )}
-          </View>
+                  {`${copy.requestsReadout(
+                    activeCell.requests,
+                    integer(activeCell.requests, locale),
+                  )} · ${copy.costLabel} ${activeCostText}`}
+                </Text>
+              </View>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={copy.dismissSelection}
+                hitSlop={8}
+                onPress={() => setActive(null)}
+                style={{
+                  width: 24,
+                  height: 24,
+                  borderRadius: radius.pill,
+                  alignItems: "center",
+                  justifyContent: "center",
+                  backgroundColor: tint(colors.foreground, 0.06),
+                }}
+              >
+                <Icon name="X" size={12} color={colors.foregroundMuted} />
+              </Pressable>
+            </View>
+          ) : (
+            <Text
+              numberOfLines={1}
+              style={{
+                fontSize: 11.5,
+                lineHeight: 15,
+                color: colors.foregroundMuted,
+              }}
+            >
+              {copy.tapHint}
+            </Text>
+          )
         ) : null}
 
         <View
           style={{
-            flexDirection: "row",
-            flexWrap: "wrap",
-            alignItems: "flex-end",
-            justifyContent: "space-between",
-            columnGap: space.xl,
-            rowGap: space.md,
+            borderTopWidth: 1,
+            borderTopColor: tint(colors.border, 0.7),
+            paddingTop: space.sm + 2,
+            gap: space.md,
           }}
         >
-          <View
-            style={{
-              flexDirection: "row",
-              flexWrap: "wrap",
-              columnGap: narrow ? space.lg : space.xxl,
-              rowGap: space.sm,
-              flexShrink: 1,
-            }}
-          >
-            <SummaryFigure
-              colors={colors}
-              label={copy.activeDays}
-              value={integer(calendar.activeDays, locale)}
-            />
-            <SummaryFigure
-              colors={colors}
-              label={copy.peakDay}
-              value={calendar.busiest ? tokens(calendar.busiest.tokens) : "—"}
-              detail={calendar.busiest ? dayLabel(localDate(calendar.busiest.day), locale) : undefined}
-            />
-            <SummaryFigure
-              colors={colors}
-              label={copy.activeDailyAvg}
-              value={calendar.activeDays > 0 ? tokens(Math.round(calendar.average)) : "—"}
-            />
-            <SummaryFigure
-              colors={colors}
-              label={copy.streak}
-              value={copy.daysCount(calendar.streak, integer(calendar.streak, locale))}
-            />
-          </View>
-          {legend}
+          {narrow ? (
+            <>
+              <View style={{ flexDirection: "row", gap: space.md }}>
+                <SummaryFigure
+                  colors={colors}
+                  label={copy.activeDays}
+                  value={integer(calendar.activeDays, locale)}
+                />
+                <SummaryFigure
+                  colors={colors}
+                  label={copy.peakDay}
+                  value={calendar.busiest ? tokens(calendar.busiest.tokens) : "—"}
+                  detail={calendar.busiest ? dayLabel(localDate(calendar.busiest.day), locale) : undefined}
+                />
+              </View>
+              <View style={{ flexDirection: "row", gap: space.md }}>
+                <SummaryFigure
+                  colors={colors}
+                  label={copy.activeDailyAvg}
+                  value={calendar.activeDays > 0 ? tokens(Math.round(calendar.average)) : "—"}
+                />
+                <SummaryFigure
+                  colors={colors}
+                  label={copy.streak}
+                  value={copy.daysCount(calendar.streak, integer(calendar.streak, locale))}
+                />
+              </View>
+            </>
+          ) : (
+            <View style={{ flexDirection: "row", gap: space.lg }}>
+              <SummaryFigure
+                colors={colors}
+                label={copy.activeDays}
+                value={integer(calendar.activeDays, locale)}
+              />
+              <SummaryFigure
+                colors={colors}
+                label={copy.peakDay}
+                value={calendar.busiest ? tokens(calendar.busiest.tokens) : "—"}
+                detail={calendar.busiest ? dayLabel(localDate(calendar.busiest.day), locale) : undefined}
+              />
+              <SummaryFigure
+                colors={colors}
+                label={copy.activeDailyAvg}
+                value={calendar.activeDays > 0 ? tokens(Math.round(calendar.average)) : "—"}
+              />
+              <SummaryFigure
+                colors={colors}
+                label={copy.streak}
+                value={copy.daysCount(calendar.streak, integer(calendar.streak, locale))}
+              />
+            </View>
+          )}
         </View>
       </Card>
     </View>

@@ -7,14 +7,17 @@
  * the section order (failure → roster summary → tasks), the B groups and their
  * order, the done group folded by default and opening in place, a blocked task
  * never under 可开始, **no member rows** (T5), the roster headline (T7: whale +
- * 「DeepSeek」 + 「N 名成员」 (teammates only, none → no count) + status chips — 运行中/已停止 only from `running`,
- * no chip for a zero count, failed red, chips not pill-shaped), the
- * owner's mark (the ring after a running owner, a grey 已停止 tag after an
- * owner the server saw stop, nothing when running is unknown; list and detail
- * page) and the 进行中 header's 「N 个负责人已停止」, the description clamped to two lines in the list,
- * the detail page (back row, every field, the whole description, back returns),
- * the empty board and Lead-only states, and that the panel is read-only (the
- * only buttons are task rows, the done fold and the back row).
+ * 「DeepSeek」 + 「N 名成员」 (teammates only, none → no count) + soft-tinted
+ * status pills — 运行中/已停止 only from `running`, no chip for a zero count,
+ * failed red, borderless 18px pills), the owner's mark (the ring after a
+ * running owner, a warning-tinted 已停止 pill after an owner the server saw
+ * stop, nothing when running is unknown; list and detail page) and the 进行中
+ * header's 「N 个负责人已停止」, the 2-line subject and 2-line description clamp
+ * in the list, the detail page (minimal top bar with back + id · vN and no copy
+ * button, 16px subject, single-line status/owner meta strip, optional blockers,
+ * write scopes, warning alert rows, structured selectable prose description,
+ * back returns), the empty board and Lead-only states, and that the panel is
+ * read-only (the only buttons are task rows, the done fold and the back button).
  *
  * Run: HOST_APP=/path/to/paseo node harness/team-popover-render-check.cjs
  * Without HOST_APP it exits 2 (incomplete), like the goal/jobs render checks.
@@ -243,9 +246,9 @@ console.log("\nthe roster headline (T7): DeepSeek + N 名成员 + status chips")
   check("the chips, in order", JSON.stringify(chipKeys(container)), JSON.stringify(["running", "stopped", "done"]));
   assert("the running chip carries the host ring", chip(container, "running")?.querySelector("div div") !== null && chip(container, "running")?.textContent === "1 运行中");
   assert("the done chip carries the host check", chip(container, "done")?.querySelector('[data-icon="CircleCheck"]') !== null && chip(container, "done")?.textContent === "1/5 任务完成");
-  // Not a composer pill: 18px tall, 4px corner, no border.
+  // Compact borderless status pill: 18px tall, full pill radius, no border.
   const style = chip(container, "running")?.getAttribute("style") ?? "";
-  assert("a chip is 18px tall with a 4px corner", /height:\s*18px/.test(style) && /border-top-left-radius:\s*4px/.test(style), style);
+  assert("a chip is an 18px compact pill", /height:\s*18px/.test(style) && /border-top-left-radius:\s*999px/.test(style), style);
   assert("…and has no border", !/border-(top|left)-width:\s*[1-9]/.test(style), style);
   for (const name of ["lead", "reviewer", "elsewhere", "fixer"]) {
     assert(`no member row: ${name} is not drawn`, !texts(container).includes(name), texts(container).join("|"));
@@ -286,7 +289,13 @@ console.log("\nthe owner's running ring (T5)");
   assert("…inside task-5's row", (ringRow?.getAttribute("aria-label") ?? "").startsWith("返工补丁"), ringRow?.getAttribute("aria-label"));
   const facts = rings[0]?.parentElement;
   const runs = [...(facts?.querySelectorAll('[dir="auto"]') ?? [])].map((node) => node.textContent);
-  assert("…right after the owner's name", runs[0] === "task-5 · fixer" && runs[1] === " · src/", JSON.stringify(runs));
+  assert(
+    "…right after the owner's name",
+    runs.join("") === "task-5 · fixer · src/"
+      && rings[0]?.previousElementSibling?.textContent === " · fixer"
+      && rings[0]?.nextElementSibling?.textContent === " · src/",
+    JSON.stringify(runs),
+  );
   const ringBox = rings[0];
   assert("…at the facts line's 12px", /width:\s*12px/.test(ringBox?.getAttribute("style") ?? ""), ringBox?.getAttribute("style"));
   const reviewerRow = byLabelStart(container, "独立审查修复");
@@ -316,7 +325,10 @@ console.log("\nstopped owners (T5): 已停止 only from running:false");
   const doneRow = byLabelStart(doneOpen, "修复选页错位");
   assert("a completed task never carries 已停止", doneRow !== undefined && !doneRow.textContent.includes("已停止"), doneRow?.textContent);
   const header = [...container.querySelectorAll('[role="heading"]')].find((node) => (node.textContent ?? "").startsWith("进行中"));
-  check("the 进行中 header counts stopped owners", header?.textContent, "进行中2 · 1 个负责人已停止");
+  const headerRuns = [...(header?.querySelectorAll('[dir="auto"]') ?? [])].map((node) => node.textContent);
+  check("the 进行中 header counts stopped owners", JSON.stringify(headerRuns), JSON.stringify(["进行中", "2", "1 个负责人已停止"]));
+  const stoppedNoteNode = [...(header?.querySelectorAll('[dir="auto"]') ?? [])].find((node) => node.textContent === "1 个负责人已停止");
+  assert("…in statusWarning", /color:\s*rgb\(123, 93, 57\)/.test(stoppedNoteNode?.getAttribute("style") ?? ""), stoppedNoteNode?.getAttribute("style"));
   // Running unknown for everyone: no 已停止 anywhere and no count.
   const unknownBoard = { enabled: true, members: BOARD.members.map(({ running, ...rest }) => rest), tasks: BOARD.tasks };
   const unknown = render({ team: unknownBoard }).container;
@@ -330,7 +342,8 @@ console.log("\nstopped owners (T5): 已停止 only from running:false");
   };
   const all = render({ team: ten }).container;
   const allHeader = [...all.querySelectorAll('[role="heading"]')].find((node) => (node.textContent ?? "").startsWith("进行中"));
-  check("all ten stopped: the header says so", allHeader?.textContent, "进行中10 · 10 个负责人已停止");
+  const allHeaderRuns = [...(allHeader?.querySelectorAll('[dir="auto"]') ?? [])].map((node) => node.textContent);
+  check("all ten stopped: the header says so", JSON.stringify(allHeaderRuns), JSON.stringify(["进行中", "10", "10 个负责人已停止"]));
   check("…ten 已停止 tags", [...all.querySelectorAll('[dir="auto"]')].filter((node) => node.textContent === "已停止").length, 10);
   check("…the headline has a stopped chip and no running chip", JSON.stringify(chipKeys(all)), JSON.stringify(["stopped"]));
   assert("…and the tasks stay under 进行中 (DSH's status, not re-judged)", !all.textContent.includes("已完成"), all.textContent);
@@ -363,6 +376,7 @@ console.log("\ntask rows: facts, warnings, two-line description");
   assert("…as a multi-line clamp, not one truncated line", /WebkitBoxOrient/.test(classes) && !/whiteSpace/.test(classes), `${style} | ${classes}`);
   const popoverSource = fs.readFileSync(path.join(pluginRoot, "client/team-popover.tsx"), "utf8");
   assert("…of exactly two lines", /export const TEAM_DESCRIPTION_LINES = 2;/.test(popoverSource) && /numberOfLines=\{TEAM_DESCRIPTION_LINES\}/.test(popoverSource));
+  assert("the list allows a 2-line task subject", /export const TEAM_SUBJECT_LINES = 2;/.test(popoverSource) && /numberOfLines=\{TEAM_SUBJECT_LINES\}/.test(popoverSource));
 }
 
 console.log("\nthe detail page");
@@ -371,14 +385,39 @@ console.log("\nthe detail page");
   const row = byLabelStart(container, "独立审查修复，进行中");
   assert("a task row is a button", row?.getAttribute("role") === "button", row?.outerHTML?.slice(0, 120));
   click(row);
-  assert("the page names the task and its state in the back row", container.textContent.includes("task-2 · 进行中"));
-  for (const label of ["状态", "负责人", "写入范围", "修订"]) assert(`the page shows ${label}`, texts(container).includes(label));
-  assert("the page shows the whole description, newlines kept", [...container.querySelectorAll('[dir="auto"]')].some((node) => node.textContent === LONG));
+  assert("the detail top bar shows quiet id · vN", container.textContent.includes("task-2 · v1"), container.textContent);
+  assert("the detail top bar does not repeat status next to id", !container.textContent.includes("task-2 · 进行中"), container.textContent);
+  check("the detail page is read-only with only the back button (no copy button)", container.querySelectorAll('[role="button"]').length, 1);
+  assert("the page shows the subject at 16px semibold", [...container.querySelectorAll('[dir="auto"]')].some((node) => {
+    const s = node.getAttribute("style") ?? "";
+    return node.textContent === "独立审查修复" && /font-size:\s*16px/.test(s) && /font-weight:\s*600/.test(s);
+  }));
+  for (const label of ["进行中", "负责人", "reviewer", "已停止", "写入范围", "docs/audits/"]) {
+    assert(`the page shows ${label}`, texts(container).includes(label), texts(container).join("|"));
+  }
+  for (const clause of ["第一段", "只读审查实现。", "第二段", "逐条给结论与 file:line。", "第三段", "变异抽查。", "第四段", "交付报告写到编排目录。"]) {
+    assert(`the structured description renders "${clause}"`, container.textContent.includes(clause), container.textContent);
+  }
   assert("the roster summary is gone while the page is open", !container.textContent.includes("名成员"));
   const back = byLabel(container, "返回");
   assert("the back row is a button", back?.getAttribute("role") === "button");
   click(back);
   assert("back returns to the list", container.textContent.includes("名成员") && container.textContent.includes("等待依赖"));
+  // Blocked task detail: shows blockedBy.
+  click(byLabelStart(container, "复审返工"));
+  assert("a blocked task detail shows blockedBy", texts(container).includes("依赖") && texts(container).includes("task-2"), texts(container).join("|"));
+  click(byLabel(container, "返回"));
+  // Task with write scopes and warning alert row.
+  click(byLabelStart(container, "整理证据"));
+  assert("a warning task detail renders writeScopes and warning alert", container.querySelector('[role="alert"]')?.textContent?.includes("写入范围与 task-2 重叠") && container.textContent.includes("docs/a/") && container.textContent.includes("docs/b/"));
+  // Plain non-kicker description renders the quiet 说明 header.
+  const plainBoard = {
+    enabled: true,
+    members: [LEAD],
+    tasks: [task({ id: "task-9", subject: "补齐单测", status: "pending", ready: true, description: "为状态切换路径补充单元测试。" })],
+  };
+  const plain = render({ team: plainBoard, initialTaskId: "task-9" }).container;
+  assert("plain description shows 说明 label and full prose", texts(plain).includes("说明") && plain.textContent.includes("为状态切换路径补充单元测试。"));
 }
 
 console.log("\nempty, Lead-only, failure, read-only");

@@ -977,6 +977,636 @@ export function matchSyncedCatalogEntry(
   return matchSyncedWithIndex(model, provider, buildSyncedCatalogIndex(catalog));
 }
 
+// ---- Closest Official Pricing Suggestions --------------------------------------------------
+
+export const pricingSuggestionSchema = z
+  .object({
+    /** Canonical model ID or built-in reference key of the suggested official model. */
+    id: z.string().min(1).max(MODEL_KEY_MAX_LENGTH),
+    /** Human-readable official model display name. */
+    label: z.string().min(1).max(MODEL_KEY_MAX_LENGTH),
+    /** Official provider ID if from synced catalog, or null if from built-in reference. */
+    provider: z.string().nullable(),
+    /** Source of the suggested rate ("synced" from models.dev or "reference" built-in). */
+    source: z.enum(["synced", "reference"]),
+    /** Suggested native per-1M token rates. */
+    rates: modelRatesSchema,
+    /** Optional short long-context / pricing note. */
+    note: z.string().nullable(),
+    /** Normalized match score in [0, 1] used for deterministic ranking. */
+    score: z.number().min(0).max(1),
+  })
+  .strict();
+
+export type PricingSuggestion = z.infer<typeof pricingSuggestionSchema>;
+
+type GenericFamilyAnchor =
+  | "deepseek"
+  | "claude"
+  | "gpt"
+  | "openai-o"
+  | "gemini"
+  | "gemma"
+  | "grok"
+  | "moonshot"
+  | "glm"
+  | "qwen"
+  | "minimax"
+  | "mistral"
+  | "command"
+  | "sonar"
+  | "llama"
+  | "step";
+
+const GLUED_FAMILY_RE =
+  /^(deepseek|claude|gpt|gemini|gemma|grok|kimi|moonshot|glm|qwen|minimax|mistral|ministral|codestral|devstral|pixtral|magistral|voxtral|command|sonar|llama|step)(v?\d.*)$/;
+
+const SPECIALIZED_MODALITY_MAP: Readonly<Record<string, string>> = {
+  image: "image",
+  imagen: "image",
+  audio: "audio",
+  tts: "tts",
+  speech: "tts",
+  transcribe: "transcribe",
+  video: "video",
+  embed: "embed",
+  embedding: "embed",
+  realtime: "realtime",
+  live: "live",
+  translate: "translate",
+  moderation: "moderation",
+  rerank: "rerank",
+  ocr: "ocr",
+};
+
+const TIER_GROUP_MAP: Readonly<Record<string, string>> = {
+  flash: "flash",
+  flashx: "flash",
+  pro: "pro",
+  mini: "mini",
+  nano: "nano",
+  lite: "lite",
+  opus: "opus",
+  sonnet: "sonnet",
+  haiku: "haiku",
+  coder: "coder",
+  codex: "coder",
+  reasoner: "reasoner",
+  r1: "reasoner",
+  thinking: "reasoner",
+  reasoning: "reasoner",
+  chat: "chat",
+  fast: "fast",
+  turbo: "turbo",
+  air: "air",
+  ultra: "ultra",
+  max: "max",
+  plus: "plus",
+  small: "small",
+  medium: "medium",
+  large: "large",
+  highspeed: "fast",
+  spot: "spot",
+  search: "search",
+  research: "research",
+};
+
+const FAST_LIGHT_QUERY_TIERS = new Set([
+  "flash",
+  "fast",
+  "turbo",
+  "lite",
+  "mini",
+  "nano",
+  "air",
+  "haiku",
+  "small",
+]);
+
+const FAST_CHAT_COMPAT_TIERS = new Set([
+  "chat",
+  "flash",
+  "mini",
+  "lite",
+  "nano",
+  "haiku",
+  "fast",
+  "turbo",
+  "air",
+  "small",
+]);
+
+const FLAGSHIP_TIERS = new Set(["pro", "opus", "sonnet", "ultra", "max", "plus", "large"]);
+
+const GENERAL_FLAGSHIP_TIERS = new Set(["pro", "sonnet", "chat", "opus", "plus", "large"]);
+
+const HEAVY_TIERS = new Set(["pro", "opus", "ultra", "max", "reasoner", "coder"]);
+
+const NOISE_TOKENS = new Set([
+  "latest",
+  "preview",
+  "exp",
+  "experimental",
+  "beta",
+  "alpha",
+  "stable",
+  "custom",
+  "default",
+  "official",
+  "instruct",
+  "it",
+  "free",
+]);
+
+const SUGGESTION_NO_ANCHOR_MIN_SCORE = 0.35;
+const SUGGESTION_WITHIN_FAMILY_MIN_SCORE = 0.15;
+
+interface ParsedModelFeatures {
+  readonly bare: string;
+  readonly cleanedBare: string;
+  readonly normalizedText: string;
+  readonly tokens: readonly string[];
+  readonly meaningfulTokens: ReadonlySet<string>;
+  readonly family: GenericFamilyAnchor | null;
+  readonly version: number | null;
+  readonly tiers: ReadonlySet<string>;
+  readonly modalities: ReadonlySet<string>;
+}
+
+interface CandidatePoolItem {
+  readonly id: string;
+  readonly label: string;
+  readonly provider: string | null;
+  readonly source: "synced" | "reference";
+  readonly rates: ModelRates;
+  readonly note: string | null;
+  readonly features: ParsedModelFeatures;
+}
+
+function extractBareModelForMatching(raw: string): string {
+  const normalized = normalizeModelKey(raw);
+  if (!normalized) return "";
+  const segments = normalized
+    .split("/")
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+  return segments.length > 0 ? segments[segments.length - 1]! : "";
+}
+
+function tokenizeModelString(bare: string): string[] {
+  const rawSegments = bare.split(/[-_:@/+\s]+/).filter((part) => part.length > 0);
+  const tokens: string[] = [];
+  for (const segment of rawSegments) {
+    const glued = GLUED_FAMILY_RE.exec(segment);
+    if (glued) {
+      tokens.push(glued[1]!, glued[2]!);
+    } else {
+      tokens.push(segment);
+    }
+  }
+  return tokens;
+}
+
+function detectFamilyAnchor(tokens: readonly string[]): GenericFamilyAnchor | null {
+  for (const token of tokens) {
+    if (token === "deepseek") return "deepseek";
+    if (token === "claude") return "claude";
+    if (token === "gpt" || token === "chatgpt") return "gpt";
+    if (/^o[134](?:\.\d+)?$/.test(token)) return "openai-o";
+    if (token === "gemini") return "gemini";
+    if (token === "gemma") return "gemma";
+    if (token === "grok") return "grok";
+    if (token === "kimi" || token === "moonshot") return "moonshot";
+    if (token === "glm" || token === "chatglm") return "glm";
+    if (token === "qwen") return "qwen";
+    if (token === "minimax") return "minimax";
+    if (
+      token === "mistral" ||
+      token === "ministral" ||
+      token === "codestral" ||
+      token === "devstral" ||
+      token === "pixtral" ||
+      token === "magistral" ||
+      token === "voxtral"
+    ) {
+      return "mistral";
+    }
+    if (token === "command") return "command";
+    if (token === "sonar") return "sonar";
+    if (token === "llama") return "llama";
+    if (token === "step" || token === "stepfun") return "step";
+  }
+  return null;
+}
+
+function extractPrimaryVersion(tokens: readonly string[]): number | null {
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i]!;
+
+    // Plain numeric version (e.g. `3.8`, `4`, `5.4`, or hyphenated `4` + `5` -> `4.5`).
+    // Skip zero-padded tokens like `001` or `05` and large numbers like `70`, `128`, `2025`.
+    if (!/^0\d/.test(token)) {
+      const plain = /^(\d{1,2})(?:\.(\d{1,2}))?$/.exec(token);
+      if (plain) {
+        const major = Number(plain[1]);
+        if (major >= 1 && major <= 20) {
+          if (plain[2] !== undefined) {
+            return Number(`${major}.${plain[2]}`);
+          }
+          const next = tokens[i + 1];
+          if (next !== undefined && /^\d$/.test(next)) {
+            return Number(`${major}.${next}`);
+          }
+          return major;
+        }
+      }
+    }
+
+    // Letter-prefixed series version (`v3.2`, `v4`, `k3.1`, `m3`).
+    const prefixed = /^[vkm](\d{1,2})(?:\.(\d{1,2}))?$/.exec(token);
+    if (prefixed) {
+      const major = Number(prefixed[1]);
+      if (major >= 1 && major <= 20) {
+        return prefixed[2] !== undefined ? Number(`${major}.${prefixed[2]}`) : major;
+      }
+    }
+
+    // OpenAI o-series (`o1`, `o3`, `o4`) and DeepSeek r-series (`r1`, `r2`).
+    const series = /^[or]([1-9])(?:\.(\d{1,2}))?$/.exec(token);
+    if (series) {
+      return series[2] !== undefined ? Number(`${series[1]}.${series[2]}`) : Number(series[1]);
+    }
+
+    // Omni suffix (`4o` -> `4`).
+    const omni = /^(\d{1,2})o$/.exec(token);
+    if (omni) {
+      const major = Number(omni[1]);
+      if (major >= 1 && major <= 20) return major;
+    }
+  }
+  return null;
+}
+
+function parseModelFeatures(rawModel: string): ParsedModelFeatures {
+  const bare = extractBareModelForMatching(rawModel);
+  const cleanedBare = stripReleaseSuffixes(bare) || bare;
+  const rawTokens = tokenizeModelString(bare);
+  const cleanedTokens = tokenizeModelString(cleanedBare);
+
+  const family = detectFamilyAnchor(cleanedTokens) ?? detectFamilyAnchor(rawTokens);
+  const version = extractPrimaryVersion(cleanedTokens);
+
+  const tiers = new Set<string>();
+  for (const token of cleanedTokens) {
+    const group = TIER_GROUP_MAP[token];
+    if (group) tiers.add(group);
+  }
+
+  // Inspect raw tokens for modalities so trailing release/preview suffixes never hide them.
+  const modalities = new Set<string>();
+  for (const token of rawTokens) {
+    const modality = SPECIALIZED_MODALITY_MAP[token];
+    if (modality) modalities.add(modality);
+  }
+
+  const normalizedText = cleanedBare.replace(/(\d)-(\d)/g, "$1.$2");
+  const meaningfulTokens = new Set<string>();
+  for (const token of tokenizeModelString(normalizedText)) {
+    if (!NOISE_TOKENS.has(token)) {
+      meaningfulTokens.add(token);
+    }
+  }
+
+  return {
+    bare,
+    cleanedBare,
+    normalizedText,
+    tokens: cleanedTokens,
+    meaningfulTokens,
+    family,
+    version,
+    tiers,
+    modalities,
+  };
+}
+
+function tokenJaccardSimilarity(
+  left: ReadonlySet<string>,
+  right: ReadonlySet<string>,
+): number {
+  if (left.size === 0 || right.size === 0) return 0;
+  let shared = 0;
+  for (const token of left) {
+    if (right.has(token)) shared += 1;
+  }
+  const union = left.size + right.size - shared;
+  return union > 0 ? shared / union : 0;
+}
+
+function charBigramDiceSimilarity(left: string, right: string): number {
+  if (!left || !right) return 0;
+  if (left === right) return 1;
+  if (left.length < 2 || right.length < 2) return 0;
+
+  const leftCounts = new Map<string, number>();
+  const leftTotal = left.length - 1;
+  for (let i = 0; i < leftTotal; i += 1) {
+    const gram = left.slice(i, i + 2);
+    leftCounts.set(gram, (leftCounts.get(gram) ?? 0) + 1);
+  }
+
+  let shared = 0;
+  const rightTotal = right.length - 1;
+  for (let i = 0; i < rightTotal; i += 1) {
+    const gram = right.slice(i, i + 2);
+    const remaining = leftCounts.get(gram) ?? 0;
+    if (remaining > 0) {
+      shared += 1;
+      leftCounts.set(gram, remaining - 1);
+    }
+  }
+
+  return (2 * shared) / (leftTotal + rightTotal);
+}
+
+function buildSuggestionCandidatePool(
+  syncedCatalog?: SyncedPricingCatalog | null,
+): CandidatePoolItem[] {
+  const pool: CandidatePoolItem[] = [];
+  const seenIds = new Set<string>();
+
+  if (syncedCatalog?.models) {
+    for (const entry of Object.values(syncedCatalog.models)) {
+      const id = normalizeModelKey(entry.id);
+      if (!id || id.length > MODEL_KEY_MAX_LENGTH || seenIds.has(id)) continue;
+      seenIds.add(id);
+      const label = (entry.name.trim() || id).slice(0, MODEL_KEY_MAX_LENGTH);
+      pool.push({
+        id,
+        label,
+        provider: entry.provider,
+        source: "synced",
+        rates: { ...entry.rates },
+        note: formatLongContextNote(entry.rates),
+        features: parseModelFeatures(id),
+      });
+    }
+  }
+
+  for (const entry of REFERENCE_PRICING) {
+    const id = normalizeModelKey(entry.key);
+    if (!id || id.length > MODEL_KEY_MAX_LENGTH || seenIds.has(id)) continue;
+    seenIds.add(id);
+    pool.push({
+      id,
+      label: entry.label.slice(0, MODEL_KEY_MAX_LENGTH),
+      provider: null,
+      source: "reference",
+      rates: { ...entry.rates },
+      note: entry.note ?? formatLongContextNote(entry.rates),
+      features: parseModelFeatures(id),
+    });
+  }
+
+  return pool;
+}
+
+function hasAnyTier(tiers: ReadonlySet<string>, target: ReadonlySet<string>): boolean {
+  for (const tier of tiers) {
+    if (target.has(tier)) return true;
+  }
+  return false;
+}
+
+function scoreWithinFamilyTier(
+  queryTiers: ReadonlySet<string>,
+  candTiers: ReadonlySet<string>,
+): number {
+  if (queryTiers.size === 0) {
+    if (candTiers.size === 0) return 0.12;
+    if (hasAnyTier(candTiers, GENERAL_FLAGSHIP_TIERS)) return 0.09;
+    if (candTiers.has("flash")) return 0.06;
+    if (candTiers.has("reasoner")) return 0.02;
+    return -0.05;
+  }
+
+  let overlap = 0;
+  for (const tier of queryTiers) {
+    if (candTiers.has(tier)) overlap += 1;
+  }
+
+  if (overlap > 0) {
+    const extraCand = candTiers.size - overlap;
+    const missingQuery = queryTiers.size - overlap;
+    if (extraCand === 0 && missingQuery === 0) return 0.28;
+    return 0.28 * (overlap / (overlap + 0.5 * extraCand + 0.7 * missingQuery));
+  }
+
+  // No exact tier overlap: apply soft compatibility rules.
+  if (hasAnyTier(queryTiers, FAST_LIGHT_QUERY_TIERS)) {
+    if (hasAnyTier(candTiers, FAST_CHAT_COMPAT_TIERS)) return 0.1;
+    if (candTiers.size === 0) return 0.02;
+    if (hasAnyTier(candTiers, HEAVY_TIERS)) return -0.08;
+    return -0.04;
+  }
+
+  if (hasAnyTier(queryTiers, FLAGSHIP_TIERS)) {
+    if (candTiers.size === 0 || hasAnyTier(candTiers, FLAGSHIP_TIERS)) return 0.05;
+    if (hasAnyTier(candTiers, FAST_LIGHT_QUERY_TIERS)) return -0.08;
+    return -0.04;
+  }
+
+  if (queryTiers.has("reasoner") || queryTiers.has("coder")) {
+    if (candTiers.size === 0 || hasAnyTier(candTiers, GENERAL_FLAGSHIP_TIERS)) return 0.02;
+    return -0.08;
+  }
+
+  return candTiers.size === 0 ? 0 : -0.08;
+}
+
+function scoreWithinFamilyVersion(
+  queryVersion: number | null,
+  candVersion: number | null,
+  maxFamilyVersion: number | null,
+): number {
+  const weight = 0.24;
+  if (queryVersion !== null && candVersion !== null) {
+    if (maxFamilyVersion !== null && queryVersion > maxFamilyVersion) {
+      // Query is newer than every known official model in this family: strongly prefer the newest ones.
+      const gapFromTop = Math.max(0, maxFamilyVersion - candVersion);
+      return weight * (1 / (1 + gapFromTop * 1.1));
+    }
+    const diff = Math.abs(queryVersion - candVersion);
+    if (diff === 0) return weight;
+    const proximity = 1 / (1 + diff * 1.25);
+    const newerNudge = candVersion > queryVersion ? 0.01 : 0;
+    return weight * Math.min(1, proximity + newerNudge);
+  }
+  if (queryVersion !== null && candVersion === null) {
+    return weight * 0.35;
+  }
+  if (queryVersion === null && candVersion !== null) {
+    if (maxFamilyVersion !== null) {
+      const gapFromTop = Math.max(0, maxFamilyVersion - candVersion);
+      return weight * 0.5 * (1 / (1 + gapFromTop * 0.8));
+    }
+    return weight * 0.5;
+  }
+  return weight * 0.5;
+}
+
+function scoreModalityAlignment(
+  queryModalities: ReadonlySet<string>,
+  candModalities: ReadonlySet<string>,
+): number {
+  let candExtra = 0;
+  for (const mod of candModalities) {
+    if (!queryModalities.has(mod)) candExtra += 1;
+  }
+  if (candExtra > 0) return -0.55;
+
+  if (queryModalities.size === 0) return 0;
+
+  let matched = 0;
+  for (const mod of queryModalities) {
+    if (candModalities.has(mod)) matched += 1;
+  }
+  if (matched === queryModalities.size) return 0.15;
+  if (matched > 0) return 0.06;
+  return -0.22;
+}
+
+function clampAndRoundScore(raw: number): number {
+  const clamped = Math.max(0, Math.min(1, raw));
+  return Math.round(clamped * 1000) / 1000;
+}
+
+function compareSuggestions(left: PricingSuggestion, right: PricingSuggestion): number {
+  if (left.score !== right.score) return right.score - left.score;
+  const leftSourceRank = left.source === "synced" ? 0 : 1;
+  const rightSourceRank = right.source === "synced" ? 0 : 1;
+  if (leftSourceRank !== rightSourceRank) return leftSourceRank - rightSourceRank;
+
+  const leftProviderRank = officialProviderRank(left.provider);
+  const rightProviderRank = officialProviderRank(right.provider);
+  if (leftProviderRank !== rightProviderRank) {
+    return leftProviderRank < rightProviderRank ? -1 : 1;
+  }
+  return left.id.localeCompare(right.id);
+}
+
+/**
+ * Computes the closest matching official pricing candidates for non-standard
+ * or relay-prefixed model names (e.g. `proxy/sub/gemini-3.8-flash` -> Gemini
+ * Flash official models), combining synced `models.dev` entries (preferred on
+ * duplicate IDs) with built-in generic reference entries.
+ *
+ * Strictly generic & runtime-neutral (Hermes-safe, zero `node:*`, zero regex
+ * lookbehind).
+ */
+export function suggestClosestPricing(
+  model: string,
+  syncedCatalog?: SyncedPricingCatalog | null,
+  maxSuggestions: number = 3,
+): PricingSuggestion[] {
+  const limit = Math.floor(maxSuggestions);
+  if (!Number.isFinite(limit) || limit <= 0) return [];
+
+  const query = parseModelFeatures(model);
+  if (!query.bare) return [];
+
+  const pool = buildSuggestionCandidatePool(syncedCatalog);
+  if (pool.length === 0) return [];
+
+  const scored: PricingSuggestion[] = [];
+
+  if (query.family !== null) {
+    const familyCandidates = pool.filter((item) => item.features.family === query.family);
+    if (familyCandidates.length === 0) return [];
+
+    // Compute highest known version among non-specialized-modality models in this family
+    // (falling back to all family candidates if every candidate is specialized).
+    let maxFamilyVersion: number | null = null;
+    for (const item of familyCandidates) {
+      if (item.features.version === null) continue;
+      if (query.modalities.size === 0 && item.features.modalities.size > 0) continue;
+      if (maxFamilyVersion === null || item.features.version > maxFamilyVersion) {
+        maxFamilyVersion = item.features.version;
+      }
+    }
+    if (maxFamilyVersion === null) {
+      for (const item of familyCandidates) {
+        if (item.features.version === null) continue;
+        if (maxFamilyVersion === null || item.features.version > maxFamilyVersion) {
+          maxFamilyVersion = item.features.version;
+        }
+      }
+    }
+
+    for (const item of familyCandidates) {
+      const tierScore = scoreWithinFamilyTier(query.tiers, item.features.tiers);
+      const versionScore = scoreWithinFamilyVersion(
+        query.version,
+        item.features.version,
+        maxFamilyVersion,
+      );
+      const modalityScore = scoreModalityAlignment(query.modalities, item.features.modalities);
+      const lexical =
+        0.5 * tokenJaccardSimilarity(query.meaningfulTokens, item.features.meaningfulTokens) +
+        0.5 * charBigramDiceSimilarity(query.normalizedText, item.features.normalizedText);
+
+      const rawScore = 0.32 + tierScore + versionScore + modalityScore + 0.14 * lexical;
+      if (rawScore < SUGGESTION_WITHIN_FAMILY_MIN_SCORE) continue;
+
+      scored.push({
+        id: item.id,
+        label: item.label,
+        provider: item.provider,
+        source: item.source,
+        rates: { ...item.rates },
+        note: item.note,
+        score: clampAndRoundScore(rawScore),
+      });
+    }
+  } else {
+    for (const item of pool) {
+      const tokenOverlap = tokenJaccardSimilarity(
+        query.meaningfulTokens,
+        item.features.meaningfulTokens,
+      );
+      const bigramDice = charBigramDiceSimilarity(
+        query.normalizedText,
+        item.features.normalizedText,
+      );
+      let rawScore = 0.55 * tokenOverlap + 0.45 * bigramDice;
+
+      // Guard against suggesting specialized modality rates for generic text names.
+      for (const mod of item.features.modalities) {
+        if (!query.modalities.has(mod)) {
+          rawScore -= 0.4;
+          break;
+        }
+      }
+
+      const finalScore = clampAndRoundScore(rawScore);
+      if (finalScore < SUGGESTION_NO_ANCHOR_MIN_SCORE) continue;
+
+      scored.push({
+        id: item.id,
+        label: item.label,
+        provider: item.provider,
+        source: item.source,
+        rates: { ...item.rates },
+        note: item.note,
+        score: finalScore,
+      });
+    }
+  }
+
+  scored.sort(compareSuggestions);
+  return scored.slice(0, limit);
+}
+
 // ---- Rate Resolution & Cost Calculation ----------------------------------------------------
 
 export interface TokenUsageInput {
@@ -1432,6 +2062,10 @@ export const pricingModelRowSchema = z.object({
   note: z.string().nullable(),
   /** True when this model appeared in local DSH session logs. */
   seenLocally: z.boolean(),
+  /** True when this model is currently configured in the user's active DSH profile. */
+  configured: z.boolean().optional(),
+  /** Closest official pricing candidates for non-standard/unmatched model names (best first). */
+  suggestions: z.array(pricingSuggestionSchema).optional(),
 });
 
 export type PricingModelRow = z.infer<typeof pricingModelRowSchema>;

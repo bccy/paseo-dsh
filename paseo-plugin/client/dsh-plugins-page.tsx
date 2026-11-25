@@ -8,6 +8,7 @@ import {
   Text,
   TextInput,
   View,
+  type TextStyle,
 } from "react-native";
 import type {
   PluginClientContext,
@@ -47,6 +48,7 @@ import type {
 } from "./locale";
 import { useCurrentLocale, useLocaleText } from "./use-locale";
 import { PluginsBoundary, PluginsFailedCard } from "./dsh-plugins-guard";
+import { parseInlineSpans } from "./popover-prose";
 import {
   inspectSpecRpc,
   jobStatusRpc,
@@ -81,6 +83,8 @@ type ConfirmDialog =
   | { kind: "update"; name: string; title?: string; currentVersion?: string; version: string }
   | { kind: "update-all"; targets: readonly UpdateTarget[] };
 
+type PressState = { pressed: boolean; hovered?: boolean };
+
 interface PluginsExtraText {
   removeModalTitle: string;
   removeModalBody: (name: string) => string;
@@ -92,6 +96,9 @@ interface PluginsExtraText {
   toastEnabled: (name: string) => string;
   toastDisabled: (name: string) => string;
   toastUpToDate: string;
+  details: string;
+  detailsWithCount: (componentCount: string) => string;
+  collapse: string;
 }
 
 const EXTRA_TEXT: Record<Locale, PluginsExtraText> = {
@@ -109,6 +116,9 @@ const EXTRA_TEXT: Record<Locale, PluginsExtraText> = {
     toastEnabled: (name) => `已启用 ${name}`,
     toastDisabled: (name) => `已停用 ${name}`,
     toastUpToDate: "所有插件均为最新版本",
+    details: "详情",
+    detailsWithCount: (componentCount) => `详情 · ${componentCount}`,
+    collapse: "收起",
   },
   en: {
     removeModalTitle: "Remove plugin",
@@ -125,6 +135,9 @@ const EXTRA_TEXT: Record<Locale, PluginsExtraText> = {
     toastEnabled: (name) => `Enabled ${name}`,
     toastDisabled: (name) => `Disabled ${name}`,
     toastUpToDate: "All plugins are up to date",
+    details: "Details",
+    detailsWithCount: (componentCount) => `Details · ${componentCount}`,
+    collapse: "Hide",
   },
 };
 
@@ -279,7 +292,7 @@ function createStyles(colors: Colors, compact: boolean) {
       alignSelf: "center" as const,
     },
     embeddedContent: {
-      gap: space.lg,
+      gap: compact ? space.md : space.lg,
       width: "100%" as const,
     },
     header: {
@@ -288,6 +301,39 @@ function createStyles(colors: Colors, compact: boolean) {
       justifyContent: "space-between" as const,
       gap: space.md,
       flexWrap: "wrap" as const,
+    },
+    embeddedHeader: {
+      flexDirection: "row" as const,
+      alignItems: "center" as const,
+      justifyContent: "space-between" as const,
+      gap: space.sm,
+    },
+    embeddedHeaderTitleRow: {
+      flex: 1,
+      minWidth: 0,
+      flexDirection: "row" as const,
+      alignItems: "center" as const,
+      gap: space.sm,
+    },
+    embeddedTitle: {
+      ...font.heading,
+      color: colors.foreground,
+      flexShrink: 1,
+    },
+    profilePill: {
+      backgroundColor: tint(colors.foreground, 0.06),
+      paddingHorizontal: space.sm,
+      height: 22,
+      borderRadius: radius.pill,
+      alignItems: "center" as const,
+      justifyContent: "center" as const,
+      flexShrink: 1,
+      maxWidth: compact ? 96 : 180,
+    },
+    profilePillText: {
+      ...font.caption,
+      fontFamily: mono,
+      color: colors.foregroundMuted,
     },
     headerText: { flex: 1, minWidth: 180, gap: space.xs },
     profileTitle: {
@@ -303,26 +349,42 @@ function createStyles(colors: Colors, compact: boolean) {
       ...font.caption,
       color: colors.foregroundMuted,
     },
+    embeddedFooter: {
+      gap: space.xxs,
+      paddingHorizontal: space.xxs,
+    },
     headerActions: {
       flexDirection: "row" as const,
       alignItems: "center" as const,
-      gap: space.sm,
+      gap: space.xs + 2,
       flexWrap: "wrap" as const,
     },
-    section: { gap: space.md - 2 },
+    embeddedHeaderActions: {
+      flexDirection: "row" as const,
+      alignItems: "center" as const,
+      gap: space.xs + 2,
+      flexShrink: 0,
+    },
+    groupsStack: {
+      gap: space.lg,
+    },
+    section: { gap: space.sm },
     groupHeader: {
       flexDirection: "row" as const,
       alignItems: "center" as const,
       gap: space.sm,
+      paddingHorizontal: space.xxs,
     },
     groupTitle: {
-      ...font.heading,
-      color: colors.foreground,
+      ...font.small,
+      fontWeight: "600" as const,
+      color: colors.foregroundMuted,
     },
     groupCountPill: {
       backgroundColor: tint(colors.foreground, 0.06),
-      paddingHorizontal: space.sm,
-      paddingVertical: space.xxs,
+      paddingHorizontal: 7,
+      minWidth: 22,
+      height: 20,
       borderRadius: radius.pill,
       alignItems: "center" as const,
       justifyContent: "center" as const,
@@ -333,20 +395,183 @@ function createStyles(colors: Colors, compact: boolean) {
       fontWeight: "600" as const,
       color: colors.foregroundMuted,
     },
+    groupedCard: {
+      overflow: "hidden" as const,
+    },
+    rowDivider: {
+      backgroundColor: tint(colors.border, 0.7),
+    },
+    installBar: {
+      flexDirection: "row" as const,
+      alignItems: "center" as const,
+      justifyContent: "space-between" as const,
+      gap: space.sm,
+      minHeight: 44,
+      paddingHorizontal: compact ? space.md : space.lg,
+      paddingVertical: space.sm + 2,
+    },
+    installBarLeft: {
+      flex: 1,
+      minWidth: 0,
+      flexDirection: "row" as const,
+      alignItems: "center" as const,
+      gap: space.sm,
+    },
+    installBarIcon: {
+      width: 24,
+      height: 24,
+      borderRadius: radius.sm,
+      alignItems: "center" as const,
+      justifyContent: "center" as const,
+      backgroundColor: tint(colors.accent, 0.12),
+      flexShrink: 0,
+    },
+    installBarTitle: {
+      ...font.body,
+      fontWeight: "600" as const,
+      color: colors.foreground,
+      flexShrink: 1,
+    },
+    installBody: {
+      padding: compact ? space.md : space.lg,
+      gap: space.sm + 2,
+    },
     cardBody: {
       padding: compact ? space.md : space.lg,
       gap: space.sm,
     },
+    bundleRow: {
+      width: "100%" as const,
+    },
+    bundleRowSurface: {
+      paddingHorizontal: compact ? space.md : space.lg,
+      paddingVertical: compact ? space.md : space.md + 2,
+      gap: space.xs + 2,
+    },
+    bundleHeader: {
+      flexDirection: "row" as const,
+      alignItems: "center" as const,
+      justifyContent: "space-between" as const,
+      gap: space.md,
+    },
+    bundleIdentity: {
+      flex: 1,
+      minWidth: 0,
+    },
+    bundleTitleRow: {
+      flexDirection: "row" as const,
+      alignItems: "center" as const,
+      gap: space.xs + 2,
+      minWidth: 0,
+    },
+    bundleTitle: {
+      fontSize: 14.5,
+      lineHeight: 20,
+      fontWeight: "600" as const,
+      color: colors.foreground,
+      flexShrink: 1,
+    },
+    bundleMetaRow: {
+      flexDirection: "row" as const,
+      alignItems: "center" as const,
+      marginTop: 2,
+      overflow: "hidden" as const,
+    },
+    bundleMeta: {
+      fontSize: 12,
+      lineHeight: 16,
+      color: colors.foregroundMuted,
+    },
+    bundleMetaMono: {
+      fontSize: 12,
+      lineHeight: 16,
+      ...tabular,
+      fontFamily: mono,
+      color: colors.foregroundMuted,
+    },
+    bundleTrailing: {
+      flexDirection: "row" as const,
+      alignItems: "center" as const,
+      gap: space.xs,
+      flexShrink: 0,
+    },
+    switchGuard: {
+      flexDirection: "row" as const,
+      alignItems: "center" as const,
+      gap: space.xs,
+    },
+    lockIconBox: {
+      width: 28,
+      height: 28,
+      borderRadius: radius.sm,
+      alignItems: "center" as const,
+      justifyContent: "center" as const,
+      backgroundColor: tint(colors.foreground, 0.05),
+    },
+    statusBadgeRow: {
+      flexDirection: "row" as const,
+      alignItems: "center" as const,
+      flexWrap: "wrap" as const,
+      gap: space.xs + 2,
+    },
+    compactBadge: {
+      height: 20,
+      paddingHorizontal: 7,
+      flexShrink: 0,
+    },
+    bottomBar: {
+      flexDirection: "row" as const,
+      alignItems: "center" as const,
+      justifyContent: "space-between" as const,
+      flexWrap: "wrap" as const,
+      gap: space.sm,
+      marginTop: space.xs,
+    },
+    disclosureButton: {
+      flexDirection: "row" as const,
+      alignItems: "center" as const,
+      gap: 4,
+      height: 28,
+      paddingHorizontal: 6,
+      marginLeft: -6,
+      borderRadius: radius.sm,
+      flexShrink: 1,
+      minWidth: 0,
+    },
+    disclosureChevron: {
+      width: 14,
+      height: 14,
+      alignItems: "center" as const,
+      justifyContent: "center" as const,
+      flexShrink: 0,
+    },
+    disclosureLabel: {
+      ...font.caption,
+      ...tabular,
+      fontWeight: "500" as const,
+      color: colors.foregroundMuted,
+      flexShrink: 1,
+    },
+    bottomActions: {
+      flexDirection: "row" as const,
+      alignItems: "center" as const,
+      justifyContent: "flex-end" as const,
+      flexWrap: "wrap" as const,
+      gap: space.xs,
+      flexShrink: 0,
+      marginLeft: "auto" as const,
+    },
     rowTop: {
       flexDirection: "row" as const,
       alignItems: "center" as const,
-      gap: space.sm,
+      gap: space.xs + 2,
       flexWrap: "wrap" as const,
     },
     name: {
       ...font.body,
       fontWeight: "600" as const,
       color: colors.foreground,
+      flexShrink: 1,
     },
     subtitle: {
       ...font.small,
@@ -361,35 +586,48 @@ function createStyles(colors: Colors, compact: boolean) {
     },
     description: {
       ...font.small,
+      lineHeight: 19,
       color: colors.foregroundMuted,
     },
-    rowFooter: {
-      flexDirection: "row" as const,
-      alignItems: "center" as const,
-      justifyContent: "space-between" as const,
-      gap: space.sm,
-      flexWrap: "wrap" as const,
-      marginTop: space.xxs,
+    inlineCode: {
+      fontFamily: mono,
+      fontSize: 12,
+      color: colors.foreground,
     },
-    rowActions: {
-      flexDirection: "row" as const,
-      alignItems: "center" as const,
-      gap: space.sm,
-      flexWrap: "wrap" as const,
+    inlineStrong: {
+      fontWeight: "600" as const,
+      color: colors.foreground,
     },
-    disclosureButton: {
-      flexDirection: "row" as const,
-      alignItems: "center" as const,
-      gap: space.xs,
-      paddingVertical: space.xs,
-      paddingHorizontal: space.xs,
-      borderRadius: radius.sm,
+    expandedDivider: {
+      backgroundColor: tint(colors.border, 0.6),
+      marginHorizontal: compact ? space.md : space.lg,
     },
-    disclosureText: {
+    expandedSection: {
+      paddingHorizontal: compact ? space.md : space.lg,
+      paddingTop: space.sm + 2,
+      paddingBottom: compact ? space.md : space.md + 2,
+      gap: space.sm + 2,
+    },
+    detailPackageText: {
       ...font.caption,
       ...tabular,
+      fontFamily: mono,
       color: colors.foregroundMuted,
+      flexShrink: 1,
+    },
+    detailBlock: {
+      gap: space.xs + 2,
+    },
+    detailSectionLabel: {
+      ...font.caption,
+      ...tabular,
       fontWeight: "500" as const,
+      color: colors.foregroundMuted,
+    },
+    expandedRowsBox: {
+      backgroundColor: tint(colors.foreground, 0.035),
+      borderRadius: radius.md,
+      padding: space.sm,
     },
     input: {
       ...font.body,
@@ -400,7 +638,7 @@ function createStyles(colors: Colors, compact: boolean) {
       borderRadius: radius.md,
       paddingHorizontal: space.md,
       paddingVertical: space.sm + 1,
-      minHeight: 36,
+      minHeight: compact ? 38 : 36,
     },
     inputRow: {
       flexDirection: "row" as const,
@@ -411,7 +649,9 @@ function createStyles(colors: Colors, compact: boolean) {
     inputGrow: { flex: 1, minWidth: 0 },
     checkRow: {
       flexDirection: "row" as const,
+      alignItems: "center" as const,
       justifyContent: "flex-end" as const,
+      gap: space.sm,
     },
     resultRow: {
       flexDirection: "row" as const,
@@ -504,10 +744,153 @@ function FailureCallout({
   );
 }
 
+/**
+ * Renders inline `` `code` `` and `**strong**` runs inside a single native
+ * `Text` so backticks never show verbatim while `numberOfLines` truncation
+ * stays intact on iOS, Android, and Web.
+ */
+function InlineProseText({
+  content,
+  numberOfLines,
+  style,
+  codeStyle,
+  strongStyle,
+}: {
+  content: string;
+  numberOfLines?: number;
+  style: TextStyle;
+  codeStyle: TextStyle;
+  strongStyle: TextStyle;
+}) {
+  const spans = useMemo(() => parseInlineSpans(content), [content]);
+  return (
+    <Text numberOfLines={numberOfLines} style={style}>
+      {spans.map((span, index) => {
+        if (span.kind === "code") {
+          return (
+            <Text key={index} style={codeStyle}>
+              {span.text}
+            </Text>
+          );
+        }
+        if (span.kind === "strong") {
+          return (
+            <Text key={index} style={strongStyle}>
+              {span.text}
+            </Text>
+          );
+        }
+        return span.text;
+      })}
+    </Text>
+  );
+}
+
+type RowActionTone =
+  | "danger-ghost"
+  | "danger-confirm"
+  | "accent"
+  | "accent-confirm"
+  | "ghost";
+
+/**
+ * Compact 28px action button placed in `BundleRow`'s bottom bar.
+ * Always calls `event.stopPropagation?.()` so tapping Update or Remove
+ * triggers the action directly without toggling the row's details drawer.
+ */
+function RowActionButton({
+  colors,
+  tone,
+  icon,
+  label,
+  accessibilityLabel,
+  disabled = false,
+  onPress,
+}: {
+  colors: Colors;
+  tone: RowActionTone;
+  icon?: string;
+  label: string;
+  accessibilityLabel?: string;
+  disabled?: boolean;
+  onPress: () => void;
+}) {
+  const ink =
+    tone === "danger-ghost"
+      ? tint(colors.statusDanger, 0.9)
+      : tone === "danger-confirm"
+        ? colors.statusDanger
+        : tone === "accent"
+          ? colors.accent
+          : tone === "accent-confirm"
+            ? colors.accentForeground
+            : colors.foregroundMuted;
+
+  const isStrong = tone === "danger-confirm" || tone === "accent-confirm";
+
+  const background = (state: PressState): string => {
+    const active = !disabled && (state.pressed || Boolean(state.hovered));
+    switch (tone) {
+      case "danger-ghost":
+        return active ? tint(colors.statusDanger, 0.14) : "transparent";
+      case "danger-confirm":
+        return tint(colors.statusDanger, active ? 0.22 : 0.14);
+      case "accent":
+        return tint(colors.accent, active ? 0.2 : 0.12);
+      case "accent-confirm":
+        return colors.accent;
+      default:
+        return active ? tint(colors.foreground, 0.07) : "transparent";
+    }
+  };
+
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel ?? label}
+      accessibilityState={{ disabled }}
+      disabled={disabled}
+      hitSlop={4}
+      onPress={(event) => {
+        event.stopPropagation?.();
+        onPress();
+      }}
+      style={(state) => ({
+        height: 28,
+        paddingHorizontal: tone === "accent-confirm" ? 9 : 8,
+        borderRadius: radius.sm,
+        flexDirection: "row",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 4,
+        backgroundColor: background(state as PressState),
+        opacity: disabled
+          ? 0.45
+          : tone === "accent-confirm" && (state as PressState).pressed
+            ? 0.85
+            : 1,
+      })}
+    >
+      {icon === undefined ? null : renderHostIcon(icon, 13, ink)}
+      <Text
+        numberOfLines={1}
+        style={{
+          ...font.caption,
+          fontWeight: isStrong ? "600" : "500",
+          color: ink,
+        }}
+      >
+        {label}
+      </Text>
+    </Pressable>
+  );
+}
+
 function BundleRow({
   bundle,
   colors,
   text,
+  extra,
   styles,
   busy,
   toggleBusy,
@@ -521,6 +904,7 @@ function BundleRow({
   bundle: BundleInfo;
   colors: Colors;
   text: DshPluginsText;
+  extra: PluginsExtraText;
   styles: Styles;
   busy: boolean;
   toggleBusy: string | null;
@@ -537,177 +921,342 @@ function BundleRow({
   const removePending = !useModalConfirm && confirmRemove === bundle.name;
   const updatePending = !useModalConfirm && confirmUpdate?.name === bundle.name;
   const rowBusy = busy || isToggling;
-  // Disclosure only: a card lists its component ids when asked, not by default.
-  // The state is render-local by design (no persistence, no RPC).
-  const [rowsOpen, setRowsOpen] = useState(false);
+  // Disclosure only: expands full description, selectable spec, notes, and components on demand.
+  const [detailsOpen, setDetailsOpen] = useState(false);
 
-  return (
-    <Card colors={colors} style={styles.cardBody}>
-      <View style={styles.rowTop}>
-        <Text style={styles.name}>{bundle.name}</Text>
-        {bundle.version === undefined ? null : <Text style={styles.version}>{bundle.version}</Text>}
-        {bundle.official ? (
-          <Badge colors={colors} tone="neutral" icon="ShieldCheck" label={text.badges.official} />
-        ) : null}
-        {bundle.protected ? (
-          <Badge colors={colors} tone="accent" icon="Lock" label={text.badges.protected} />
-        ) : null}
-        {bundle.client ? (
-          <Badge colors={colors} tone="warning" icon="Monitor" label={text.badges.client} />
-        ) : null}
-        {bundle.platformSupported ? null : (
-          <Badge colors={colors} tone="danger" dot label={text.badges.platformUnsupported} />
-        )}
-        {bundle.installed ? null : (
-          <Badge colors={colors} tone="danger" dot label={text.badges.missing} />
-        )}
-        {bundle.update === undefined ? null : (
-          <Badge
-            colors={colors}
-            tone="warning"
-            dot
-            label={text.badges.updateAvailable(bundle.update)}
-          />
-        )}
-      </View>
+  const trimmedTitle = bundle.title?.trim() ?? "";
+  const hasTitle = trimmedTitle !== "" && trimmedTitle !== bundle.name;
+  const displayTitle = hasTitle ? trimmedTitle : bundle.name;
+  const hasVersion = bundle.version !== undefined && bundle.version !== "";
+  const builtinLabel = bundle.official
+    ? text.badges.official
+    : bundle.protected
+      ? text.badges.protected
+      : null;
 
-      {/* Package names stay the row's identity (the actions address them); a
-          localized display title rides under it as a subtitle instead of
-          replacing the name, so a third-party package remains recognizable. */}
-      {bundle.title === undefined || bundle.title === ""
-        ? null
-        : <Text style={styles.subtitle}>{bundle.title}</Text>}
-      {bundle.description === undefined || bundle.description === ""
-        ? null
-        : <Text style={styles.description}>{bundle.description}</Text>}
+  const hasDescription = bundle.description !== undefined && bundle.description.trim() !== "";
+  const hasLongDescription =
+    bundle.description !== undefined && bundle.description.length > 44;
+  const hasComponentRows = bundle.rows.length > 0;
+  const hasNotes = bundle.client || isDependency || !bundle.platformSupported;
+  const canUpdate =
+    bundle.update !== undefined && bundle.update !== "" && !bundle.protected;
+  const canRemove = bundle.removable && !bundle.protected && !bundle.official;
+  const hasActions = canUpdate || canRemove;
+  const hasStatusBadges =
+    canUpdate || !bundle.installed || !bundle.platformSupported;
+  const canExpand = hasTitle || hasComponentRows || hasNotes || hasLongDescription;
+  const showBottomBar = canExpand || hasActions;
+  const expanded = canExpand && detailsOpen;
 
-      {isDependency ? <Muted colors={colors}>{text.bundle.dependencyNote}</Muted> : null}
-      {bundle.client ? <Muted colors={colors}>{text.bundle.clientNote}</Muted> : null}
-      {bundle.platformSupported
-        ? null
-        : bundle.platformReason === undefined || bundle.platformReason === ""
-          ? <Muted colors={colors}>{text.bundle.platformsUnknown}</Muted>
-          : <Muted colors={colors}>{text.bundle.platforms(bundle.platformReason)}</Muted>}
+  const toggleDetails = () => {
+    if (!canExpand) return;
+    setDetailsOpen((open) => !open);
+  };
 
-      <View style={styles.rowFooter}>
-        <View style={styles.rowActions}>
-          {canToggle ? (
-            <Switch
-              accessibilityLabel={bundle.name}
-              value={bundle.enabled}
-              disabled={
-                rowBusy
-                || (!bundle.enabled && (bundle.installed === false || !bundle.platformSupported))
-              }
-              onValueChange={() => onToggle(bundle)}
-              trackColor={{ false: colors.surface2, true: colors.accent }}
-              thumbColor={bundle.enabled ? colors.accentForeground : colors.foreground}
-            />
-          ) : null}
-          {isToggling ? <ActivityIndicator size="small" color={colors.accent} /> : null}
+  const versionSuffix = hasVersion ? ` · ${bundle.version}` : "";
+  const builtinSuffix = builtinLabel !== null ? ` · ${builtinLabel}` : "";
+  const collapsedSubtitleNoTitle = hasVersion
+    ? `${bundle.version}${builtinSuffix}`
+    : builtinLabel ?? "";
+  const collapsedDisclosureLabel = hasComponentRows
+    ? extra.detailsWithCount(text.bundle.componentCount(bundle.rows.length))
+    : extra.details;
+  const disclosureLabel = expanded ? extra.collapse : collapsedDisclosureLabel;
 
-          {bundle.update === undefined ? null : updatePending ? (
-            <>
-              <Button
+  const rowContent = (
+    <>
+      {/* Row 1: Human-readable title (+ inline client UI pill) + single-line muted mono metadata on left; Switch / Lock on right */}
+      <View style={styles.bundleHeader}>
+        <View style={styles.bundleIdentity}>
+          <View style={styles.bundleTitleRow}>
+            <Text numberOfLines={1} style={styles.bundleTitle}>
+              {displayTitle}
+            </Text>
+            {bundle.client ? (
+              <Badge
                 colors={colors}
-                size="sm"
-                variant="primary"
-                icon="ArrowUpCircle"
-                label={text.bundle.confirmUpdate(bundle.update)}
-                disabled={rowBusy}
-                onPress={() => onUpdate(bundle)}
+                tone="warning"
+                icon="Monitor"
+                label={text.badges.client}
+                style={styles.compactBadge}
               />
-              <Button
-                colors={colors}
-                size="sm"
-                variant="ghost"
-                label={text.bundle.cancel}
-                disabled={rowBusy}
-                onPress={() => onUpdate(null)}
-              />
-            </>
-          ) : (
-            <Button
-              colors={colors}
-              size="sm"
-              variant="secondary"
-              icon="ArrowUpCircle"
-              label={text.bundle.update(bundle.update)}
-              disabled={rowBusy}
-              onPress={() => onUpdate(bundle)}
-            />
-          )}
+            ) : null}
+          </View>
 
-          {bundle.removable ? (
-            removePending ? (
-              <>
-                <Button
-                  colors={colors}
-                  size="sm"
-                  variant="danger"
-                  icon="Trash2"
-                  label={text.bundle.confirmRemove}
-                  disabled={rowBusy}
-                  onPress={() => onRemove(bundle)}
-                />
-                <Button
-                  colors={colors}
-                  size="sm"
-                  variant="ghost"
-                  label={text.bundle.cancel}
-                  disabled={rowBusy}
-                  onPress={() => onRemove(null)}
-                />
-              </>
-            ) : (
-              <Button
-                colors={colors}
-                size="sm"
-                variant="danger"
-                icon="Trash2"
-                label={text.bundle.remove}
-                disabled={rowBusy}
-                onPress={() => onRemove(bundle)}
-              />
-            )
+          {hasTitle ? (
+            <View style={styles.bundleMetaRow}>
+              <Text numberOfLines={1} style={[styles.bundleMetaMono, { flexShrink: 1 }]}>
+                {bundle.name}
+              </Text>
+              {versionSuffix !== "" || builtinSuffix !== "" ? (
+                <Text numberOfLines={1} style={[styles.bundleMeta, { flexShrink: 0 }]}>
+                  {versionSuffix !== "" ? (
+                    <Text style={styles.bundleMetaMono}>{versionSuffix}</Text>
+                  ) : null}
+                  {builtinSuffix}
+                </Text>
+              ) : null}
+            </View>
+          ) : collapsedSubtitleNoTitle !== "" ? (
+            <View style={styles.bundleMetaRow}>
+              <Text numberOfLines={1} style={styles.bundleMeta}>
+                {hasVersion ? (
+                  <Text style={styles.bundleMetaMono}>{bundle.version}</Text>
+                ) : null}
+                {hasVersion ? builtinSuffix : builtinLabel}
+              </Text>
+            </View>
           ) : null}
         </View>
 
-        {/* Default-collapsed component list. The line itself is the toggle; a card
-            with no rows shows nothing (a "0 components" row would be noise). */}
-        {bundle.rows.length === 0 ? null : (
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel={text.bundle.componentCount(bundle.rows.length)}
-            accessibilityState={{ expanded: rowsOpen }}
-            onPress={() => setRowsOpen((open) => !open)}
-            style={styles.disclosureButton}
-          >
-            {renderHostIcon(
-              rowsOpen ? "ChevronDown" : "ChevronRight",
-              14,
-              colors.foregroundMuted,
-            )}
-            <Text style={styles.disclosureText}>
-              {text.bundle.componentCount(bundle.rows.length)}
-            </Text>
-          </Pressable>
-        )}
+        <View style={styles.bundleTrailing}>
+          {canToggle ? (
+            <Pressable
+              accessible={false}
+              onPress={(event) => {
+                event.stopPropagation?.();
+              }}
+              style={styles.switchGuard}
+            >
+              {isToggling ? (
+                <ActivityIndicator size="small" color={colors.accent} />
+              ) : null}
+              <Switch
+                accessibilityLabel={bundle.name}
+                value={bundle.enabled}
+                disabled={
+                  rowBusy
+                  || (!bundle.enabled && (bundle.installed === false || !bundle.platformSupported))
+                }
+                onValueChange={() => onToggle(bundle)}
+                trackColor={{ false: colors.surface2, true: colors.accent }}
+                thumbColor={bundle.enabled ? colors.accentForeground : colors.foreground}
+              />
+            </Pressable>
+          ) : bundle.protected ? (
+            <View accessibilityLabel={text.badges.protected} style={styles.lockIconBox}>
+              {renderHostIcon("Lock", 14, colors.foregroundMuted)}
+            </View>
+          ) : null}
+        </View>
       </View>
 
-      {bundle.rows.length > 0 && rowsOpen ? (
-        <>
-          <Divider colors={colors} />
-          <View style={styles.rowTags}>
-            {bundle.rows.map((row) => (
-              <View key={row.id} style={styles.tag}>
-                <Text style={styles.tagText}>{row.id}</Text>
+      {/* Row 2: Exceptional compact status pills (update available / missing / unsupported) */}
+      {hasStatusBadges ? (
+        <View style={styles.statusBadgeRow}>
+          {canUpdate ? (
+            <Badge
+              colors={colors}
+              tone="accent"
+              dot
+              label={`→ ${bundle.update}`}
+              style={styles.compactBadge}
+            />
+          ) : null}
+          {bundle.installed ? null : (
+            <Badge
+              colors={colors}
+              tone="danger"
+              dot
+              label={text.badges.missing}
+              style={styles.compactBadge}
+            />
+          )}
+          {bundle.platformSupported ? null : (
+            <Badge
+              colors={colors}
+              tone="warning"
+              dot
+              label={text.badges.platformUnsupported}
+              style={styles.compactBadge}
+            />
+          )}
+        </View>
+      ) : null}
+
+      {/* Row 3: Clean description (backticks rendered as quiet mono, 2-line clamp when collapsed) */}
+      {hasDescription ? (
+        <InlineProseText
+          content={bundle.description!}
+          numberOfLines={expanded ? undefined : 2}
+          style={styles.description}
+          codeStyle={styles.inlineCode}
+          strongStyle={styles.inlineStrong}
+        />
+      ) : null}
+
+      {/* Row 4: Compact bottom bar — quiet details disclosure on left, update/remove actions on right */}
+      {showBottomBar ? (
+        <View style={styles.bottomBar}>
+          {canExpand ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={`${displayTitle} · ${disclosureLabel}`}
+              accessibilityState={{ expanded }}
+              hitSlop={4}
+              onPress={(event) => {
+                event.stopPropagation?.();
+                toggleDetails();
+              }}
+              style={(state) => [
+                styles.disclosureButton,
+                (state as PressState).pressed || Boolean((state as PressState).hovered)
+                  ? { backgroundColor: tint(colors.foreground, 0.06) }
+                  : null,
+              ]}
+            >
+              <View
+                style={[
+                  styles.disclosureChevron,
+                  { transform: [{ rotate: expanded ? "90deg" : "0deg" }] },
+                ]}
+              >
+                {renderHostIcon("ChevronRight", 13, colors.foregroundMuted)}
               </View>
-            ))}
+              <Text numberOfLines={1} style={styles.disclosureLabel}>
+                {disclosureLabel}
+              </Text>
+            </Pressable>
+          ) : null}
+
+          {hasActions ? (
+            <View style={styles.bottomActions}>
+              {canUpdate ? (
+                updatePending ? (
+                  <>
+                    <RowActionButton
+                      colors={colors}
+                      tone="accent-confirm"
+                      icon="ArrowUpCircle"
+                      label={text.bundle.confirmUpdate(bundle.update!)}
+                      disabled={rowBusy}
+                      onPress={() => onUpdate(bundle)}
+                    />
+                    <RowActionButton
+                      colors={colors}
+                      tone="ghost"
+                      label={text.bundle.cancel}
+                      disabled={rowBusy}
+                      onPress={() => onUpdate(null)}
+                    />
+                  </>
+                ) : (
+                  <RowActionButton
+                    colors={colors}
+                    tone="accent"
+                    icon="ArrowUpCircle"
+                    label={text.job.updateAction}
+                    accessibilityLabel={text.bundle.update(bundle.update!)}
+                    disabled={rowBusy}
+                    onPress={() => onUpdate(bundle)}
+                  />
+                )
+              ) : null}
+
+              {canRemove ? (
+                removePending ? (
+                  <>
+                    <RowActionButton
+                      colors={colors}
+                      tone="danger-confirm"
+                      icon="Trash2"
+                      label={text.bundle.confirmRemove}
+                      disabled={rowBusy}
+                      onPress={() => onRemove(bundle)}
+                    />
+                    <RowActionButton
+                      colors={colors}
+                      tone="ghost"
+                      label={text.bundle.cancel}
+                      disabled={rowBusy}
+                      onPress={() => onRemove(null)}
+                    />
+                  </>
+                ) : (
+                  <RowActionButton
+                    colors={colors}
+                    tone="danger-ghost"
+                    icon="Trash2"
+                    label={text.bundle.remove}
+                    disabled={rowBusy}
+                    onPress={() => onRemove(bundle)}
+                  />
+                )
+              ) : null}
+            </View>
+          ) : null}
+        </View>
+      ) : null}
+    </>
+  );
+
+  return (
+    <View style={styles.bundleRow}>
+      {canExpand ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`${displayTitle} · ${disclosureLabel}`}
+          accessibilityState={{ expanded }}
+          onPress={toggleDetails}
+          style={(state) => [
+            styles.bundleRowSurface,
+            (state as PressState).pressed || Boolean((state as PressState).hovered)
+              ? { backgroundColor: tint(colors.foreground, 0.03) }
+              : null,
+          ]}
+        >
+          {rowContent}
+        </Pressable>
+      ) : (
+        <View style={styles.bundleRowSurface}>{rowContent}</View>
+      )}
+
+      {/* Expanded details drawer: selectable spec, client/dependency/platform notes, and components */}
+      {expanded ? (
+        <>
+          <Divider colors={colors} style={styles.expandedDivider} />
+          <View style={styles.expandedSection}>
+            <Text selectable style={styles.detailPackageText}>
+              {hasVersion ? `${bundle.name}@${bundle.version}` : bundle.name}
+            </Text>
+
+            {bundle.client ? (
+              <Muted colors={colors} small>{text.bundle.clientNote}</Muted>
+            ) : null}
+            {isDependency ? (
+              <Muted colors={colors} small>{text.bundle.dependencyNote}</Muted>
+            ) : null}
+            {bundle.platformSupported
+              ? null
+              : bundle.platformReason === undefined || bundle.platformReason === ""
+                ? <Muted colors={colors} small>{text.bundle.platformsUnknown}</Muted>
+                : <Muted colors={colors} small>{text.bundle.platforms(bundle.platformReason)}</Muted>}
+
+            {hasComponentRows ? (
+              <View style={styles.detailBlock}>
+                <Text style={styles.detailSectionLabel}>
+                  {text.bundle.componentCount(bundle.rows.length)}
+                </Text>
+                <View style={styles.expandedRowsBox}>
+                  <View style={styles.rowTags}>
+                    {bundle.rows.map((row) => (
+                      <View key={row.id} style={styles.tag}>
+                        <Text numberOfLines={1} style={styles.tagText}>
+                          {row.module !== undefined && row.module !== ""
+                            ? `${row.id} · ${row.module}`
+                            : row.id}
+                        </Text>
+                      </View>
+                    ))}
+                  </View>
+                </View>
+              </View>
+            ) : null}
           </View>
         </>
       ) : null}
-    </Card>
+    </View>
   );
 }
 
@@ -935,6 +1484,7 @@ function DshPluginsBody({
   const [spec, setSpec] = useState("");
   const [inspection, setInspection] = useState<InspectSpecOutput | null>(null);
   const [inspecting, setInspecting] = useState(false);
+  const [installOpen, setInstallOpen] = useState(false);
   const [toggleBusy, setToggleBusy] = useState<string | null>(null);
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
   const [confirmUpdate, setConfirmUpdate] = useState<{ name: string; version: string } | null>(null);
@@ -1109,6 +1659,7 @@ function DshPluginsBody({
     if (job?.state === "succeeded" && job.kind === "install") {
       setSpec("");
       setInspection(null);
+      setInstallOpen(false);
     }
   }, [job?.kind, job?.state]);
 
@@ -1217,6 +1768,7 @@ function DshPluginsBody({
       return;
     }
     if (confirmRemove !== bundle.name) {
+      setConfirmUpdate(null);
       setConfirmRemove(bundle.name);
       return;
     }
@@ -1241,6 +1793,7 @@ function DshPluginsBody({
       return;
     }
     if (confirmUpdate?.name !== bundle.name || confirmUpdate.version !== targetVersion) {
+      setConfirmRemove(null);
       setConfirmUpdate({ name: bundle.name, version: targetVersion });
       return;
     }
@@ -1307,7 +1860,7 @@ function DshPluginsBody({
   const checkButton = (
     <Button
       colors={colors}
-      size="md"
+      size={compact ? "sm" : "md"}
       variant="secondary"
       icon="Search"
       label={inspecting ? text.install.checking : text.install.check}
@@ -1318,6 +1871,10 @@ function DshPluginsBody({
       }}
     />
   );
+
+  const hasInstallDraft = inspection !== null || spec.trim() !== "";
+  const isInstallExpanded = installOpen || hasInstallDraft;
+  const checkingUpdates = job?.kind === "check" && job.state === "running";
 
   const groups = [
     {
@@ -1344,57 +1901,112 @@ function DshPluginsBody({
     ? Object.keys(job.updates).length
     : 0;
 
+  const refreshIconButton = (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={text.header.refresh}
+      accessibilityState={{ disabled: refreshing, busy: refreshing }}
+      disabled={refreshing}
+      hitSlop={4}
+      onPress={() => {
+        void refresh(true);
+      }}
+      style={(state) => {
+        const active =
+          !refreshing
+          && ((state as PressState).pressed || Boolean((state as PressState).hovered));
+        return {
+          width: 30,
+          height: 30,
+          borderRadius: radius.md,
+          borderWidth: 1,
+          borderColor: colors.border,
+          backgroundColor: active ? tint(colors.foreground, 0.06) : colors.surface1,
+          alignItems: "center",
+          justifyContent: "center",
+          flexShrink: 0,
+          opacity: refreshing ? 0.65 : 1,
+        };
+      }}
+    >
+      {refreshing ? (
+        <ActivityIndicator size="small" color={colors.foreground} />
+      ) : (
+        renderHostIcon("RefreshCw", 15, colors.foreground)
+      )}
+    </Pressable>
+  );
+
+  const checkUpdatesButton = (
+    <Button
+      colors={colors}
+      size="sm"
+      variant="secondary"
+      icon="ArrowUpCircle"
+      label={checkingUpdates ? text.header.checkingUpdates : text.header.checkUpdates}
+      loading={checkingUpdates}
+      disabled={busy}
+      onPress={() => {
+        void beginJob({ kind: "check" });
+      }}
+    />
+  );
+
   const body = (
     <>
-      <View style={styles.header}>
-        <View style={styles.headerText}>
-          <Text style={styles.profileTitle}>{profileHeadline}</Text>
-          {snapshot === null ? null : (
-            <Text selectable style={styles.path}>{snapshot.displayDir}</Text>
-          )}
-          <Text style={styles.notice}>{text.header.notice}</Text>
+      {embedded ? (
+        <View style={styles.embeddedHeader}>
+          <View style={styles.embeddedHeaderTitleRow}>
+            <Text
+              accessibilityRole="header"
+              numberOfLines={1}
+              style={styles.embeddedTitle}
+            >
+              {text.pageTitle}
+            </Text>
+            {snapshot === null ? null : (
+              <View style={styles.profilePill}>
+                <Text numberOfLines={1} style={styles.profilePillText}>
+                  {snapshot.profile}
+                </Text>
+              </View>
+            )}
+          </View>
+          <View style={styles.embeddedHeaderActions}>
+            {refreshIconButton}
+            {checkUpdatesButton}
+          </View>
         </View>
-        <View style={styles.headerActions}>
-          <Button
-            colors={colors}
-            size="sm"
-            variant="secondary"
-            icon="RefreshCw"
-            label={refreshing ? text.header.refreshing : text.header.refresh}
-            loading={refreshing}
-            disabled={refreshing}
-            onPress={() => {
-              void refresh(true);
-            }}
-          />
-          <Button
-            colors={colors}
-            size="sm"
-            variant="secondary"
-            icon="ArrowUpCircle"
-            label={job?.kind === "check" && job.state === "running"
-              ? text.header.checkingUpdates
-              : text.header.checkUpdates}
-            loading={job?.kind === "check" && job.state === "running"}
-            disabled={busy}
-            onPress={() => {
-              void beginJob({ kind: "check" });
-            }}
-          />
-          {openDisplaySettings === undefined ? null : (
-            <Button
-              colors={colors}
-              size="sm"
-              variant="ghost"
-              icon="SlidersHorizontal"
-              label={uiText.settings.title}
-              onPress={openDisplaySettings}
-            />
-          )}
-        </View>
-      </View>
-
-      <Divider colors={colors} />
+      ) : (
+        <>
+          <View style={styles.header}>
+            <View style={styles.headerText}>
+              <Text accessibilityRole="header" style={styles.profileTitle}>
+                {profileHeadline}
+              </Text>
+              {snapshot === null ? null : (
+                <Text selectable style={styles.path}>{snapshot.displayDir}</Text>
+              )}
+              <Text style={styles.notice}>{text.header.notice}</Text>
+            </View>
+            <View style={styles.headerActions}>
+              {refreshIconButton}
+              {checkUpdatesButton}
+              {openDisplaySettings === undefined ? null : (
+                <Button
+                  colors={colors}
+                  size="sm"
+                  variant="ghost"
+                  icon="SlidersHorizontal"
+                  label={uiText.settings.title}
+                  onPress={openDisplaySettings}
+                />
+              )}
+            </View>
+          </View>
+          <Divider colors={colors} />
+        </>
+      )}
 
       {loadError === null ? null : (
         <FailureCallout
@@ -1523,112 +2135,194 @@ function DshPluginsBody({
         </Card>
       )}
 
-      <Card colors={colors} style={styles.cardBody}>
-        <Text style={styles.groupTitle}>{text.install.title}</Text>
-        <Muted colors={colors}>{text.install.hint}</Muted>
-        {/* Wide: the input grows and the check button sits on its right edge.
-            Compact: the button moves under the input, right-aligned. */}
-        <View style={compact ? styles.inputStack : styles.inputRow}>
-          <TextInput
-            value={spec}
-            onChangeText={(value: string) => {
-              setSpec(value);
-              setInspection(null);
-            }}
-            placeholder={text.install.placeholder}
-            placeholderTextColor={tint(colors.foregroundMuted, 0.7)}
-            editable={!busy && !inspecting && !(inspection?.ok === true)}
-            autoCapitalize="none"
-            autoCorrect={false}
-            style={compact ? styles.input : [styles.input, styles.inputGrow]}
-          />
-          {compact ? null : checkButton}
-        </View>
-        {compact ? <View style={styles.checkRow}>{checkButton}</View> : null}
-
-        {inspection === null ? null : inspection.ok ? (
-          <View style={styles.infoBox}>
-            <View style={styles.rowTop}>
-              <Text style={styles.name}>{inspection.name ?? text.install.unknown}</Text>
-              {inspection.version === undefined ? null : (
-                <Badge colors={colors} tone="accent" label={inspection.version} />
-              )}
-              {inspection.client ? (
-                <Badge colors={colors} tone="warning" icon="Monitor" label={text.badges.client} />
-              ) : null}
+      {/* Collapsible install bar: 1 clean 44px row by default so installed plugins sit front-and-center */}
+      <Card colors={colors} style={styles.groupedCard}>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={text.install.title}
+          accessibilityState={{ expanded: isInstallExpanded }}
+          onPress={() => {
+            if (!hasInstallDraft) {
+              setInstallOpen((open) => !open);
+            }
+          }}
+          style={(state) => [
+            styles.installBar,
+            !hasInstallDraft
+            && ((state as PressState).pressed || Boolean((state as PressState).hovered))
+              ? { backgroundColor: tint(colors.foreground, 0.04) }
+              : null,
+          ]}
+        >
+          <View style={styles.installBarLeft}>
+            <View style={styles.installBarIcon}>
+              {renderHostIcon("Plus", 14, colors.accent)}
             </View>
-            {inspection.description === undefined || inspection.description === ""
-              ? null
-              : <Text style={styles.description}>{inspection.description}</Text>}
-            {inspection.client ? <Muted colors={colors}>{text.bundle.clientNote}</Muted> : null}
-            <Callout colors={colors} tone="warning" title={text.install.trust} />
-            <View style={styles.rowActions}>
-              <Button
-                colors={colors}
-                size="sm"
-                variant="primary"
-                icon="Download"
-                label={text.install.confirm}
-                disabled={busy}
-                onPress={() => {
-                  void install();
-                }}
-              />
-              <Button
-                colors={colors}
-                size="sm"
-                variant="ghost"
-                label={text.bundle.cancel}
-                disabled={busy}
-                onPress={() => {
-                  setInspection(null);
-                }}
-              />
-            </View>
+            <Text numberOfLines={1} style={styles.installBarTitle}>
+              {text.install.title}
+            </Text>
           </View>
-        ) : inspection.errorCode === "not-a-bundle" ? (
-          <Callout
-            colors={colors}
-            tone="danger"
-            title={text.install.notBundle}
-            action={(
-              <Button
-                colors={colors}
-                size="sm"
-                variant="ghost"
-                label={text.bundle.cancel}
-                disabled={busy || inspecting}
-                onPress={() => {
-                  setInspection(null);
-                }}
-              />
-            )}
-          />
-        ) : (
-          <FailureCallout
-            colors={colors}
-            text={text}
-            failure={{
-              code: inspection.errorCode ?? "command-failed",
-              ...(inspection.errorDetail === undefined
-                ? {}
-                : { detail: inspection.errorDetail }),
-            }}
-            styles={styles}
-            action={(
-              <Button
-                colors={colors}
-                size="sm"
-                variant="ghost"
-                label={text.bundle.cancel}
-                disabled={busy || inspecting}
-                onPress={() => {
-                  setInspection(null);
-                }}
-              />
-            )}
-          />
-        )}
+          {renderHostIcon(
+            isInstallExpanded ? "ChevronDown" : "ChevronRight",
+            16,
+            colors.foregroundMuted,
+          )}
+        </Pressable>
+
+        {isInstallExpanded ? (
+          <>
+            <Divider colors={colors} style={styles.rowDivider} />
+            <View style={styles.installBody}>
+              <Muted colors={colors} small>{text.install.hint}</Muted>
+              {/* Wide: the input grows and the check button sits on its right edge.
+                  Compact: input takes full width with clean right-aligned action row below. */}
+              <View style={compact ? styles.inputStack : styles.inputRow}>
+                <TextInput
+                  value={spec}
+                  onChangeText={(value: string) => {
+                    setSpec(value);
+                    setInspection(null);
+                  }}
+                  placeholder={text.install.placeholder}
+                  placeholderTextColor={tint(colors.foregroundMuted, 0.7)}
+                  editable={!busy && !inspecting && !(inspection?.ok === true)}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  style={compact ? styles.input : [styles.input, styles.inputGrow]}
+                />
+                {compact ? null : (
+                  <>
+                    {spec.trim() !== "" && inspection === null ? (
+                      <Button
+                        colors={colors}
+                        size="md"
+                        variant="ghost"
+                        label={text.bundle.cancel}
+                        disabled={busy || inspecting}
+                        onPress={() => {
+                          setSpec("");
+                          setInspection(null);
+                          setInstallOpen(false);
+                        }}
+                      />
+                    ) : null}
+                    {checkButton}
+                  </>
+                )}
+              </View>
+              {compact ? (
+                <View style={styles.checkRow}>
+                  {spec.trim() !== "" && inspection === null ? (
+                    <Button
+                      colors={colors}
+                      size="sm"
+                      variant="ghost"
+                      label={text.bundle.cancel}
+                      disabled={busy || inspecting}
+                      onPress={() => {
+                        setSpec("");
+                        setInspection(null);
+                        setInstallOpen(false);
+                      }}
+                    />
+                  ) : null}
+                  {checkButton}
+                </View>
+              ) : null}
+
+              {inspection === null ? null : inspection.ok ? (
+                <View style={styles.infoBox}>
+                  <View style={styles.rowTop}>
+                    <Text style={styles.name}>{inspection.name ?? text.install.unknown}</Text>
+                    {inspection.version === undefined ? null : (
+                      <Badge colors={colors} tone="accent" label={inspection.version} />
+                    )}
+                    {inspection.client ? (
+                      <Badge colors={colors} tone="warning" icon="Monitor" label={text.badges.client} />
+                    ) : null}
+                  </View>
+                  {inspection.description === undefined || inspection.description === ""
+                    ? null
+                    : (
+                      <InlineProseText
+                        content={inspection.description}
+                        style={styles.description}
+                        codeStyle={styles.inlineCode}
+                        strongStyle={styles.inlineStrong}
+                      />
+                    )}
+                  {inspection.client ? <Muted colors={colors} small>{text.bundle.clientNote}</Muted> : null}
+                  <Callout colors={colors} tone="warning" title={text.install.trust} />
+                  <View style={styles.modalActions}>
+                    <Button
+                      colors={colors}
+                      size="sm"
+                      variant="ghost"
+                      label={text.bundle.cancel}
+                      disabled={busy}
+                      onPress={() => {
+                        setInspection(null);
+                      }}
+                    />
+                    <Button
+                      colors={colors}
+                      size="sm"
+                      variant="primary"
+                      icon="Download"
+                      label={text.install.confirm}
+                      disabled={busy}
+                      onPress={() => {
+                        void install();
+                      }}
+                    />
+                  </View>
+                </View>
+              ) : inspection.errorCode === "not-a-bundle" ? (
+                <Callout
+                  colors={colors}
+                  tone="danger"
+                  title={text.install.notBundle}
+                  action={(
+                    <Button
+                      colors={colors}
+                      size="sm"
+                      variant="ghost"
+                      label={text.bundle.cancel}
+                      disabled={busy || inspecting}
+                      onPress={() => {
+                        setInspection(null);
+                      }}
+                    />
+                  )}
+                />
+              ) : (
+                <FailureCallout
+                  colors={colors}
+                  text={text}
+                  failure={{
+                    code: inspection.errorCode ?? "command-failed",
+                    ...(inspection.errorDetail === undefined
+                      ? {}
+                      : { detail: inspection.errorDetail }),
+                  }}
+                  styles={styles}
+                  action={(
+                    <Button
+                      colors={colors}
+                      size="sm"
+                      variant="ghost"
+                      label={text.bundle.cancel}
+                      disabled={busy || inspecting}
+                      onPress={() => {
+                        setInspection(null);
+                      }}
+                    />
+                  )}
+                />
+              )}
+            </View>
+          </>
+        ) : null}
       </Card>
 
       {snapshot === null && loadError === null ? (
@@ -1638,39 +2332,59 @@ function DshPluginsBody({
         </Card>
       ) : null}
 
-      {groups.map((group) => (
-        <View key={group.title} style={styles.section}>
-          <View style={styles.groupHeader}>
-            <Text style={styles.groupTitle}>{group.title}</Text>
-            <View style={styles.groupCountPill}>
-              <Text style={styles.groupCountText}>{group.items.length}</Text>
+      {groups.length > 0 ? (
+        <View style={styles.groupsStack}>
+          {groups.map((group) => (
+            <View key={group.title} style={styles.section}>
+              <View style={styles.groupHeader}>
+                <Text accessibilityRole="header" style={styles.groupTitle}>
+                  {group.title}
+                </Text>
+                <View style={styles.groupCountPill}>
+                  <Text style={styles.groupCountText}>{group.items.length}</Text>
+                </View>
+              </View>
+              <Card colors={colors} style={styles.groupedCard}>
+                {group.items.map((bundle, index) => (
+                  <View key={bundle.name}>
+                    {index > 0 ? <Divider colors={colors} style={styles.rowDivider} /> : null}
+                    <BundleRow
+                      bundle={bundle}
+                      colors={colors}
+                      text={text}
+                      extra={extra}
+                      styles={styles}
+                      busy={busy}
+                      toggleBusy={toggleBusy}
+                      useModalConfirm={useModalConfirm}
+                      confirmRemove={confirmRemove}
+                      confirmUpdate={confirmUpdate}
+                      onToggle={(item) => {
+                        void toggle(item);
+                      }}
+                      onRemove={(item) => {
+                        void handleRemovePress(item);
+                      }}
+                      onUpdate={(item) => {
+                        void handleUpdatePress(item);
+                      }}
+                    />
+                  </View>
+                ))}
+              </Card>
             </View>
-          </View>
-          {group.items.map((bundle) => (
-            <BundleRow
-              key={bundle.name}
-              bundle={bundle}
-              colors={colors}
-              text={text}
-              styles={styles}
-              busy={busy}
-              toggleBusy={toggleBusy}
-              useModalConfirm={useModalConfirm}
-              confirmRemove={confirmRemove}
-              confirmUpdate={confirmUpdate}
-              onToggle={(item) => {
-                void toggle(item);
-              }}
-              onRemove={(item) => {
-                void handleRemovePress(item);
-              }}
-              onUpdate={(item) => {
-                void handleUpdatePress(item);
-              }}
-            />
           ))}
         </View>
-      ))}
+      ) : null}
+
+      {embedded ? (
+        <View style={styles.embeddedFooter}>
+          <Text style={styles.notice}>{text.header.notice}</Text>
+          {snapshot === null ? null : (
+            <Text selectable style={styles.path}>{snapshot.displayDir}</Text>
+          )}
+        </View>
+      ) : null}
 
       {modalComponent !== null && confirmDialog !== null ? (
         <ConfirmActionModal

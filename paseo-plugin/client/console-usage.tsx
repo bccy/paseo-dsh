@@ -11,7 +11,14 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/ui";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { ActivityIndicator, Pressable, Text, View, useWindowDimensions } from "react-native";
+import {
+  ActivityIndicator,
+  Pressable,
+  ScrollView,
+  Text,
+  View,
+  useWindowDimensions,
+} from "react-native";
 import { pricingUpdateRpc } from "../shared/pricing";
 import {
   deriveUsageMetrics,
@@ -29,6 +36,7 @@ import {
 } from "../shared/usage";
 import {
   clockTime,
+  currencySymbol,
   dayLabel,
   integer,
   money,
@@ -72,10 +80,11 @@ const METRICS: readonly ChartMetric[] = [
 interface UsageCopy {
   title: string;
   pricingButton: string;
+  switchCurrencyLabel(currency: Currency, symbol: string): string;
   scopeAll: string;
   scopeMain: string;
   scopeSubagent: string;
-  range24h: string;
+  rangeToday: string;
   range7d: string;
   range30d: string;
   allProviders: string;
@@ -114,16 +123,22 @@ interface UsageCopy {
   totalRow: string;
   partialPriceHint: string;
   unpricedHint: string;
+  setPriceCta: string;
+  setPriceShort: string;
+  unpricedBanner(count: number): string;
+  configureNow: string;
   col: Record<TableSortKey, string>;
 }
 
 const COPY_EN: UsageCopy = {
   title: "Usage",
   pricingButton: "Pricing",
+  switchCurrencyLabel: (currency, symbol) =>
+    `Switch display currency, currently ${currency} ${symbol}`,
   scopeAll: "All",
   scopeMain: "Main",
   scopeSubagent: "Subagent",
-  range24h: "24h",
+  rangeToday: "Today",
   range7d: "7d",
   range30d: "30d",
   allProviders: "All providers",
@@ -169,6 +184,11 @@ const COPY_EN: UsageCopy = {
   totalRow: "Total",
   partialPriceHint: "Partially priced — click to set rates",
   unpricedHint: "Unpriced — click to set rates",
+  setPriceCta: "Set price",
+  setPriceShort: "Set rate",
+  unpricedBanner: (count) =>
+    `${count} ${count === 1 ? "model has" : "models have"} no price configured`,
+  configureNow: "Configure",
   col: {
     model: "Model",
     requests: "Reqs",
@@ -184,12 +204,13 @@ const COPY_EN: UsageCopy = {
 const COPY_ZH: UsageCopy = {
   title: "用量统计",
   pricingButton: "单价设置",
+  switchCurrencyLabel: (currency, symbol) => `切换显示币种，当前 ${currency} ${symbol}`,
   scopeAll: "全部",
   scopeMain: "主对话",
   scopeSubagent: "子代理",
-  range24h: "24 小时",
-  range7d: "7 天",
-  range30d: "30 天",
+  rangeToday: "今天",
+  range7d: "7天",
+  range30d: "30天",
   allProviders: "全部路由",
   filterModel: (model) => `模型：${model}`,
   clearFilter: "清除筛选",
@@ -233,6 +254,10 @@ const COPY_ZH: UsageCopy = {
   totalRow: "合计",
   partialPriceHint: "部分未计价，点击设置单价",
   unpricedHint: "未计价，点击设置单价",
+  setPriceCta: "配置单价",
+  setPriceShort: "未定价",
+  unpricedBanner: (count) => `${count} 个模型尚未配置单价`,
+  configureNow: "去配置",
   col: {
     model: "模型",
     requests: "请求",
@@ -434,7 +459,7 @@ function activeIndexingOf(
   return a ?? b ?? null;
 }
 
-/** Tiny embedded column sparkline; emphasizes the latest bin in accent. */
+/** Tiny embedded column sparkline; emphasizes the latest active bin in accent. */
 function MiniColumns({
   colors,
   values,
@@ -445,7 +470,14 @@ function MiniColumns({
   height?: number;
 }) {
   const peak = Math.max(0, ...values.map((value) => (value && Number.isFinite(value) ? value : 0)));
-  const last = values.length - 1;
+  let lastActiveIndex = -1;
+  for (let index = values.length - 1; index >= 0; index -= 1) {
+    const value = values[index];
+    if (value !== null && value !== undefined && Number.isFinite(value) && value > 0) {
+      lastActiveIndex = index;
+      break;
+    }
+  }
   const maxBarHeight = Math.max(4, height - 2);
   return (
     <View
@@ -466,7 +498,8 @@ function MiniColumns({
                 height: Math.max(2, (value / peak) * maxBarHeight),
                 borderTopLeftRadius: 2,
                 borderTopRightRadius: 2,
-                backgroundColor: index === last ? colors.accent : tint(colors.foreground, 0.2),
+                backgroundColor:
+                  index === lastActiveIndex ? colors.accent : tint(colors.foreground, 0.2),
               }}
             />
           ) : null}
@@ -1135,6 +1168,11 @@ function ModelTable({
     </View>
   );
 
+  const unpricedModels = useMemo(
+    () => stats.models.filter((row) => row.priced === "none"),
+    [stats.models],
+  );
+
   const renderCostCell = (row: UsageModelRow, text: string, cellWidth?: number) => {
     const isUnpriced = row.priced === "none";
     const isPartial = row.priced === "partial";
@@ -1155,12 +1193,47 @@ function ModelTable({
           width: cellWidth,
           alignItems: "flex-end",
           justifyContent: "center",
-          opacity: (state as PressState).hovered || (state as PressState).pressed ? 0.65 : 1,
+          flexShrink: 0,
+          opacity: (state as PressState).hovered || (state as PressState).pressed ? 0.7 : 1,
         })}
       >
-        <Text numberOfLines={1} style={{ ...font.small, ...tabular, color: costColor, fontWeight: isUnpriced ? "600" : "500" }}>
-          {text}
-        </Text>
+        {isUnpriced ? (
+          <View
+            style={{
+              flexDirection: "row",
+              alignItems: "center",
+              gap: 3,
+              paddingHorizontal: isCardLayout ? space.sm : 6,
+              height: isCardLayout ? 24 : 22,
+              borderRadius: radius.pill,
+              borderWidth: 1,
+              borderColor: tint(colors.statusWarning, 0.35),
+              backgroundColor: tint(colors.statusWarning, 0.12),
+            }}
+          >
+            <Text
+              numberOfLines={1}
+              style={{ ...font.caption, fontWeight: "600", color: colors.statusWarning }}
+            >
+              {isCardLayout ? copy.setPriceCta : copy.setPriceShort}
+            </Text>
+            {isCardLayout ? (
+              <Icon name="ArrowRight" size={11} color={colors.statusWarning} />
+            ) : null}
+          </View>
+        ) : (
+          <Text
+            numberOfLines={1}
+            style={{
+              ...font.small,
+              ...tabular,
+              color: costColor,
+              fontWeight: isPartial ? "600" : "500",
+            }}
+          >
+            {text}
+          </Text>
+        )}
       </Pressable>
     );
   };
@@ -1192,51 +1265,100 @@ function ModelTable({
         <Text style={{ ...font.caption, color: colors.foregroundMuted }}>{copy.modelsHint}</Text>
       </View>
 
+      {unpricedModels.length > 0 ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={copy.editPricingFor(unpricedModels[0]!.label)}
+          onPress={() => onOpenPricing(unpricedModels[0]!.pricingKey)}
+          style={(state) => ({
+            flexDirection: "row",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: space.sm,
+            paddingHorizontal: space.sm + 2,
+            paddingVertical: space.xs + 2,
+            borderRadius: radius.md,
+            borderWidth: 1,
+            borderColor: tint(colors.statusWarning, 0.25),
+            backgroundColor: tint(colors.statusWarning, 0.08),
+            opacity: (state as PressState).pressed || (state as PressState).hovered ? 0.78 : 1,
+          })}
+        >
+          <View style={{ flexDirection: "row", alignItems: "center", gap: space.xs + 2, flex: 1, minWidth: 0 }}>
+            <Icon name="DollarSign" size={13} color={colors.statusWarning} />
+            <Text
+              numberOfLines={1}
+              style={{ ...font.caption, color: colors.foreground, flexShrink: 1 }}
+            >
+              {copy.unpricedBanner(unpricedModels.length)}
+            </Text>
+          </View>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 2, flexShrink: 0 }}>
+            <Text style={{ ...font.caption, fontWeight: "600", color: colors.statusWarning }}>
+              {copy.configureNow}
+            </Text>
+            <Icon name="ArrowRight" size={11} color={colors.statusWarning} />
+          </View>
+        </Pressable>
+      ) : null}
+
       {isCardLayout ? (
-        <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: space.xs }}>
-          <Text style={{ ...font.caption, color: colors.foregroundMuted, marginRight: 2 }}>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: space.xs + 2 }}>
+          <Text style={{ ...font.caption, color: colors.foregroundMuted, flexShrink: 0 }}>
             {copy.sortLabel}
           </Text>
-          {compactSortOptions.map((key) => {
-            const active = sort.key === key;
-            return (
-              <Pressable
-                key={key}
-                accessibilityRole="button"
-                accessibilityLabel={copy.sortBy(copy.col[key])}
-                accessibilityState={{ selected: active }}
-                onPress={() => toggleSort(key)}
-                style={{
-                  flexDirection: "row",
-                  alignItems: "center",
-                  gap: 2,
-                  paddingHorizontal: space.sm,
-                  height: 24,
-                  borderRadius: radius.pill,
-                  backgroundColor: active
-                    ? tint(colors.accent, 0.16)
-                    : tint(colors.foreground, 0.06),
-                }}
-              >
-                <Text
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            style={{ flex: 1 }}
+            contentContainerStyle={{
+              flexDirection: "row",
+              alignItems: "center",
+              gap: space.xs,
+              paddingRight: space.xs,
+            }}
+          >
+            {compactSortOptions.map((key) => {
+              const active = sort.key === key;
+              return (
+                <Pressable
+                  key={key}
+                  accessibilityRole="button"
+                  accessibilityLabel={copy.sortBy(copy.col[key])}
+                  accessibilityState={{ selected: active }}
+                  onPress={() => toggleSort(key)}
                   style={{
-                    ...font.caption,
-                    fontWeight: active ? "600" : "400",
-                    color: active ? colors.accent : colors.foregroundMuted,
+                    flexDirection: "row",
+                    alignItems: "center",
+                    gap: 2,
+                    paddingHorizontal: space.sm,
+                    height: 24,
+                    borderRadius: radius.pill,
+                    borderWidth: 1,
+                    borderColor: active ? tint(colors.accent, 0.35) : colors.border,
+                    backgroundColor: active ? tint(colors.accent, 0.14) : colors.surface0,
                   }}
                 >
-                  {copy.col[key]}
-                </Text>
-                {active ? (
-                  <Icon
-                    name={sort.descending ? "ArrowDown" : "ArrowUp"}
-                    size={10}
-                    color={colors.accent}
-                  />
-                ) : null}
-              </Pressable>
-            );
-          })}
+                  <Text
+                    style={{
+                      ...font.caption,
+                      fontWeight: active ? "600" : "400",
+                      color: active ? colors.accent : colors.foregroundMuted,
+                    }}
+                  >
+                    {copy.col[key]}
+                  </Text>
+                  {active ? (
+                    <Icon
+                      name={sort.descending ? "ArrowDown" : "ArrowUp"}
+                      size={10}
+                      color={colors.accent}
+                    />
+                  ) : null}
+                </Pressable>
+              );
+            })}
+          </ScrollView>
         </View>
       ) : (
         <View
@@ -1507,7 +1629,7 @@ export function ConsoleUsageTab({
   const windowDims = useWindowDimensions();
 
   const [measuredWidth, setMeasuredWidth] = useState(0);
-  const [range, setRange] = useState<UsageRange>("7d");
+  const [range, setRange] = useState<UsageRange>("today");
   const [scope, setScope] = useState<UsageScope>("all");
   const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
   const [selectedModel, setSelectedModel] = useState<SelectedModelFilter | null>(null);
@@ -1739,6 +1861,240 @@ export function ConsoleUsageTab({
     return copy.sessionsCount(stats.sessions, integer(stats.sessions, locale));
   }, [stats, hasSubagents, scope, selectedModel, copy, locale]);
 
+  const currencySym = currencySymbol(effectiveCurrency);
+
+  const scopeControl = (
+    <SegmentedControl<UsageScope>
+      colors={colors}
+      value={scope}
+      size="sm"
+      fullWidth={isNarrow}
+      options={[
+        { value: "all", label: copy.scopeAll },
+        { value: "main", label: copy.scopeMain },
+        { value: "subagent", label: copy.scopeSubagent },
+      ]}
+      onChange={(next) => {
+        setScope(next);
+        setSelectedModel(null);
+      }}
+    />
+  );
+
+  const compactTopControls = (
+    <>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={copy.switchCurrencyLabel(effectiveCurrency, currencySym)}
+        hitSlop={4}
+        onPress={() => handleCurrencyToggle(effectiveCurrency === "USD" ? "CNY" : "USD")}
+        style={(state) => {
+          const active =
+            (state as PressState).pressed || Boolean((state as PressState).hovered);
+          return {
+            height: 30,
+            paddingHorizontal: space.sm + 2,
+            borderRadius: radius.md,
+            borderWidth: 1,
+            borderColor: colors.border,
+            backgroundColor: active ? tint(colors.foreground, 0.06) : colors.surface1,
+            flexDirection: "row",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 5,
+            flexShrink: 0,
+          };
+        }}
+      >
+        <Text
+          numberOfLines={1}
+          style={{ ...font.small, ...tabular, fontWeight: "600", color: colors.accent }}
+        >
+          {currencySym}
+        </Text>
+        <Text
+          numberOfLines={1}
+          style={{ ...font.small, ...tabular, fontWeight: "600", color: colors.foreground }}
+        >
+          {effectiveCurrency}
+        </Text>
+        <Icon name="ArrowLeftRight" size={12} color={colors.foregroundMuted} />
+      </Pressable>
+
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={copy.pricingButton}
+        hitSlop={4}
+        onPress={() => onOpenPricing?.(null)}
+        style={(state) => {
+          const active =
+            (state as PressState).pressed || Boolean((state as PressState).hovered);
+          return {
+            width: 30,
+            height: 30,
+            borderRadius: radius.md,
+            borderWidth: 1,
+            borderColor: colors.border,
+            backgroundColor: active ? tint(colors.foreground, 0.06) : colors.surface1,
+            alignItems: "center",
+            justifyContent: "center",
+            flexShrink: 0,
+          };
+        }}
+      >
+        <Icon name="Coins" size={15} color={colors.foreground} />
+      </Pressable>
+    </>
+  );
+
+  const providerScrollView = (
+    <ScrollView
+      horizontal
+      showsHorizontalScrollIndicator={false}
+      contentContainerStyle={{
+        flexDirection: "row",
+        alignItems: "center",
+        gap: space.xs + 2,
+        paddingRight: space.xs,
+      }}
+    >
+      <Pressable
+        accessibilityRole="button"
+        accessibilityState={{ selected: selectedProvider === null }}
+        onPress={() => {
+          setSelectedProvider(null);
+          setSelectedModel(null);
+        }}
+        style={(state) => ({
+          flexDirection: "row",
+          alignItems: "center",
+          paddingHorizontal: space.sm + 2,
+          height: 28,
+          borderRadius: radius.pill,
+          borderWidth: 1,
+          borderColor:
+            selectedProvider === null ? tint(colors.accent, 0.35) : colors.border,
+          backgroundColor:
+            selectedProvider === null
+              ? tint(colors.accent, 0.14)
+              : colors.surface1,
+          opacity: (state as PressState).pressed ? 0.75 : 1,
+        })}
+      >
+        <Text
+          numberOfLines={1}
+          style={{
+            ...font.caption,
+            fontWeight: selectedProvider === null ? "600" : "500",
+            color: selectedProvider === null ? colors.accent : colors.foregroundMuted,
+          }}
+        >
+          {copy.allProviders}
+        </Text>
+      </Pressable>
+
+      {providerRows.map((row) => {
+        const active = selectedProvider === row.provider;
+        const costText =
+          row.pricedRequests > 0
+            ? ` · ${money(row.cost, effectiveCurrency, locale)}`
+            : "";
+        return (
+          <Pressable
+            key={row.provider}
+            accessibilityRole="button"
+            accessibilityState={{ selected: active }}
+            onPress={() => {
+              setSelectedProvider(active ? null : row.provider);
+              setSelectedModel(null);
+            }}
+            style={(state) => ({
+              flexDirection: "row",
+              alignItems: "center",
+              paddingHorizontal: space.sm + 2,
+              height: 28,
+              borderRadius: radius.pill,
+              borderWidth: 1,
+              borderColor: active ? tint(colors.accent, 0.35) : colors.border,
+              backgroundColor: active ? tint(colors.accent, 0.14) : colors.surface1,
+              opacity: (state as PressState).pressed ? 0.75 : 1,
+            })}
+          >
+            <Text
+              numberOfLines={1}
+              style={{
+                ...font.caption,
+                ...tabular,
+                fontWeight: active ? "600" : "500",
+                color: active ? colors.accent : colors.foregroundMuted,
+              }}
+            >
+              {`${row.provider} · ${integer(row.requests, locale)}${costText}`}
+            </Text>
+          </Pressable>
+        );
+      })}
+    </ScrollView>
+  );
+
+  const singleProviderChip =
+    providerRows.length <= 1 && selectedProvider !== null ? (
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`${copy.clearFilter}: ${selectedProvider}`}
+        onPress={() => {
+          setSelectedProvider(null);
+          setSelectedModel(null);
+        }}
+        style={(state) => ({
+          flexDirection: "row",
+          alignItems: "center",
+          gap: 4,
+          paddingHorizontal: space.sm + 2,
+          height: 28,
+          borderRadius: radius.pill,
+          borderWidth: 1,
+          borderColor: tint(colors.accent, 0.35),
+          backgroundColor: tint(colors.accent, 0.14),
+          opacity: (state as PressState).pressed ? 0.75 : 1,
+        })}
+      >
+        <Text numberOfLines={1} style={{ ...font.caption, fontWeight: "600", color: colors.accent }}>
+          {selectedProvider}
+        </Text>
+        <Icon name="X" size={12} color={colors.accent} />
+      </Pressable>
+    ) : null;
+
+  const activeModelChip = selectedModel ? (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={`${copy.clearFilter}: ${selectedModel.label}`}
+      onPress={() => setSelectedModel(null)}
+      style={(state) => ({
+        flexDirection: "row",
+        alignItems: "center",
+        gap: 4,
+        paddingHorizontal: space.sm + 2,
+        height: 28,
+        borderRadius: radius.pill,
+        borderWidth: 1,
+        borderColor: tint(colors.accent, 0.35),
+        backgroundColor: tint(colors.accent, 0.14),
+        opacity: (state as PressState).pressed ? 0.75 : 1,
+      })}
+    >
+      <Text numberOfLines={1} style={{ ...font.caption, fontWeight: "600", color: colors.accent }}>
+        {copy.filterModel(
+          providerRows.length > 1 && selectedProvider === null
+            ? `${selectedModel.label} (${selectedModel.provider})`
+            : selectedModel.label,
+        )}
+      </Text>
+      <Icon name="X" size={12} color={colors.accent} />
+    </Pressable>
+  ) : null;
+
   return (
     <View
       onLayout={(event) => {
@@ -1748,56 +2104,79 @@ export function ConsoleUsageTab({
       style={{ gap: space.md, width: "100%" }}
     >
       {/* Top control bar */}
-      <View
-        style={{
-          flexDirection: "row",
-          flexWrap: "wrap",
-          alignItems: "center",
-          justifyContent: "space-between",
-          gap: space.sm,
-        }}
-      >
-        <Text style={{ ...font.heading, color: colors.foreground, marginRight: "auto" }}>
-          {copy.title}
-        </Text>
+      {isNarrow ? (
+        <View style={{ gap: space.sm }}>
+          {/* Row 1: Title + Currency + Pricing */}
+          <View
+            style={{
+              flexDirection: "row",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: space.sm,
+            }}
+          >
+            <Text
+              numberOfLines={1}
+              style={{ ...font.heading, color: colors.foreground, flexShrink: 1 }}
+            >
+              {copy.title}
+            </Text>
 
-        <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: space.sm }}>
-          {showScopeControl ? (
-            <SegmentedControl<UsageScope>
-              colors={colors}
-              value={scope}
-              options={[
-                { value: "all", label: copy.scopeAll },
-                { value: "main", label: copy.scopeMain },
-                { value: "subagent", label: copy.scopeSubagent },
-              ]}
-              onChange={(next) => {
-                setScope(next);
-                setSelectedModel(null);
+            <View
+              style={{
+                flexDirection: "row",
+                alignItems: "center",
+                gap: space.xs + 2,
+                flexShrink: 0,
               }}
-            />
-          ) : null}
+            >
+              {compactTopControls}
+            </View>
+          </View>
 
-          <SegmentedControl<Currency>
-            colors={colors}
-            value={effectiveCurrency}
-            options={[
-              { value: "USD", label: "USD $" },
-              { value: "CNY", label: "CNY ¥" },
-            ]}
-            onChange={handleCurrencyToggle}
-          />
-
-          <Button
-            colors={colors}
-            size="sm"
-            variant="secondary"
-            icon="DollarSign"
-            label={copy.pricingButton}
-            onPress={() => onOpenPricing?.(null)}
-          />
+          {/* Row 2: Scope switcher (full width when subagents exist or non-all scope is active) */}
+          {showScopeControl ? scopeControl : null}
         </View>
-      </View>
+      ) : (
+        <View
+          style={{
+            flexDirection: "row",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: space.md,
+          }}
+        >
+          <Text
+            numberOfLines={1}
+            style={{ ...font.heading, color: colors.foreground, flexShrink: 0 }}
+          >
+            {copy.title}
+          </Text>
+
+          <View
+            style={{
+              flexDirection: "row",
+              alignItems: "center",
+              justifyContent: "flex-end",
+              gap: space.sm,
+              flexShrink: 1,
+              minWidth: 0,
+            }}
+          >
+            {showScopeControl ? scopeControl : null}
+            <View
+              style={{
+                flexDirection: "row",
+                alignItems: "center",
+                gap: space.xs + 2,
+                flexShrink: 0,
+              }}
+            >
+              {compactTopControls}
+            </View>
+          </View>
+        </View>
+      )}
 
       {/* Cold-indexing progress bar */}
       {isIndexingActive && indexing ? (
@@ -1842,127 +2221,21 @@ export function ConsoleUsageTab({
 
       {/* Provider routing filter chips + active model filter chip */}
       {showFilterRow ? (
-        <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: space.xs }}>
-          {providerRows.length > 1 ? (
-            <>
-              <Pressable
-                accessibilityRole="button"
-                accessibilityState={{ selected: selectedProvider === null }}
-                onPress={() => {
-                  setSelectedProvider(null);
-                  setSelectedModel(null);
-                }}
-                style={{
-                  paddingHorizontal: space.sm + 2,
-                  height: 26,
-                  borderRadius: radius.pill,
-                  justifyContent: "center",
-                  backgroundColor:
-                    selectedProvider === null
-                      ? tint(colors.accent, 0.16)
-                      : tint(colors.foreground, 0.06),
-                }}
-              >
-                <Text
-                  style={{
-                    ...font.caption,
-                    fontWeight: selectedProvider === null ? "600" : "500",
-                    color: selectedProvider === null ? colors.accent : colors.foregroundMuted,
-                  }}
-                >
-                  {copy.allProviders}
-                </Text>
-              </Pressable>
+        <View style={{ gap: space.xs + 2 }}>
+          {providerRows.length > 1 ? providerScrollView : null}
 
-              {providerRows.map((row) => {
-                const active = selectedProvider === row.provider;
-                const costText =
-                  row.pricedRequests > 0
-                    ? ` · ${money(row.cost, effectiveCurrency, locale)}`
-                    : "";
-                return (
-                  <Pressable
-                    key={row.provider}
-                    accessibilityRole="button"
-                    accessibilityState={{ selected: active }}
-                    onPress={() => {
-                      setSelectedProvider(active ? null : row.provider);
-                      setSelectedModel(null);
-                    }}
-                    style={{
-                      paddingHorizontal: space.sm + 2,
-                      height: 26,
-                      borderRadius: radius.pill,
-                      justifyContent: "center",
-                      backgroundColor: active
-                        ? tint(colors.accent, 0.16)
-                        : tint(colors.foreground, 0.06),
-                    }}
-                  >
-                    <Text
-                      numberOfLines={1}
-                      style={{
-                        ...font.caption,
-                        ...tabular,
-                        fontWeight: active ? "600" : "500",
-                        color: active ? colors.accent : colors.foregroundMuted,
-                      }}
-                    >
-                      {`${row.provider} · ${integer(row.requests, locale)}${costText}`}
-                    </Text>
-                  </Pressable>
-                );
-              })}
-            </>
-          ) : selectedProvider !== null ? (
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel={`${copy.clearFilter}: ${selectedProvider}`}
-              onPress={() => {
-                setSelectedProvider(null);
-                setSelectedModel(null);
-              }}
+          {singleProviderChip || activeModelChip ? (
+            <View
               style={{
                 flexDirection: "row",
+                flexWrap: "wrap",
                 alignItems: "center",
-                gap: 4,
-                paddingHorizontal: space.sm + 2,
-                height: 26,
-                borderRadius: radius.pill,
-                backgroundColor: tint(colors.accent, 0.16),
+                gap: space.xs + 2,
               }}
             >
-              <Text style={{ ...font.caption, fontWeight: "600", color: colors.accent }}>
-                {selectedProvider}
-              </Text>
-              <Icon name="X" size={12} color={colors.accent} />
-            </Pressable>
-          ) : null}
-
-          {selectedModel ? (
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel={`${copy.clearFilter}: ${selectedModel.label}`}
-              onPress={() => setSelectedModel(null)}
-              style={{
-                flexDirection: "row",
-                alignItems: "center",
-                gap: 4,
-                paddingHorizontal: space.sm + 2,
-                height: 26,
-                borderRadius: radius.pill,
-                backgroundColor: tint(colors.accent, 0.16),
-              }}
-            >
-              <Text style={{ ...font.caption, fontWeight: "600", color: colors.accent }}>
-                {copy.filterModel(
-                  providerRows.length > 1 && selectedProvider === null
-                    ? `${selectedModel.label} (${selectedModel.provider})`
-                    : selectedModel.label,
-                )}
-              </Text>
-              <Icon name="X" size={12} color={colors.accent} />
-            </Pressable>
+              {singleProviderChip}
+              {activeModelChip}
+            </View>
           ) : null}
         </View>
       ) : null}
@@ -2003,23 +2276,31 @@ export function ConsoleUsageTab({
       <View
         style={{
           flexDirection: "row",
-          flexWrap: "wrap",
+          flexWrap: width < 310 ? "wrap" : "nowrap",
           alignItems: "center",
+          justifyContent: "space-between",
           gap: space.sm,
           marginTop: space.xs,
         }}
       >
         <Text
           numberOfLines={1}
-          style={{ ...font.small, ...tabular, color: colors.foregroundMuted, flex: 1, minWidth: 120 }}
+          style={{
+            ...(isNarrow ? font.caption : font.small),
+            ...tabular,
+            color: colors.foregroundMuted,
+            flex: 1,
+            minWidth: 0,
+          }}
         >
           {stats ? windowLabel(stats, locale, copy) : ""}
         </Text>
         <SegmentedControl<UsageRange>
           colors={colors}
           value={range}
+          size="sm"
           options={[
-            { value: "24h", label: copy.range24h },
+            { value: "today", label: copy.rangeToday },
             { value: "7d", label: copy.range7d },
             { value: "30d", label: copy.range30d },
           ]}

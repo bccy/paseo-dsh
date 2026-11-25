@@ -35,6 +35,7 @@ import {
   pricingUpdateInputSchema,
   pricingUpdateRpc,
   resolvePricingKey,
+  suggestClosestPricing,
   syncedPricingCatalogSchema,
   type ModelRates,
   type PricingConfig,
@@ -102,6 +103,8 @@ export type SeenModelsInput = ReadonlyMap<string, string> | ReadonlyArray<string
 export interface RegisterPricingRpcOptions {
   /** Supplies models observed in local DSH session logs (`pricingKey -> label` or model IDs). */
   getSeenModels?: () => Promise<SeenModelsInput> | SeenModelsInput;
+  /** Supplies models configured in the user's active DSH profile (`pricingKey -> label` or model IDs). */
+  getConfiguredModels?: () => Promise<SeenModelsInput> | SeenModelsInput;
   /** Schedule delayed non-blocking startup auto-sync when cache is missing or stale (default `false`). */
   startAutoSync?: boolean;
   /** Trigger non-blocking lazy sync on `dsh.pricing.get` / `autoSync: true` when stale (defaults to `startAutoSync === true`). */
@@ -445,13 +448,15 @@ export class PricingStore {
 
   /**
    * Builds the full UI/RPC pricing table combining locally observed models,
-   * user overrides, built-in reference families, and synced official models.
+   * DSH-configured models, user overrides, built-in reference families, and
+   * synced official models.
    */
-  async state(seenModels?: SeenModelsInput): Promise<PricingState> {
+  async state(seenModels?: SeenModelsInput, configuredModels?: SeenModelsInput): Promise<PricingState> {
     await this.load();
     const overrides = this.config.overrides;
     const catalog = this.catalog;
     const seenByKey = this.normalizeSeenModels(seenModels);
+    const configuredByKey = this.normalizeSeenModels(configuredModels);
 
     const rows: PricingModelRow[] = [];
     const listed = new Set<string>();
@@ -469,8 +474,9 @@ export class PricingStore {
           : { ...entry.rates };
       const source: PricingRateSource = custom ? "override" : syncedEntry ? "synced" : "reference";
       const seenLocally = seenByKey.has(entry.key);
+      const configured = configuredByKey.has(entry.key);
 
-      rankByKey.set(entry.key, seenLocally || custom !== null ? 0 : 1);
+      rankByKey.set(entry.key, seenLocally || configured || custom !== null ? 0 : 1);
       rows.push({
         key: entry.key,
         label: entry.label,
@@ -484,11 +490,16 @@ export class PricingStore {
         source,
         note: syncedEntry ? formatLongContextNote(syncedEntry.rates) : (entry.note ?? null),
         seenLocally,
+        configured,
       });
     }
 
-    // 2. Locally observed and user-overridden models not covered by a listed reference key.
-    const extras = new Set<string>([...Object.keys(overrides), ...seenByKey.keys()]);
+    // 2. Locally observed, DSH-configured, and user-overridden models not covered by a listed reference key.
+    const extras = new Set<string>([
+      ...Object.keys(overrides),
+      ...seenByKey.keys(),
+      ...configuredByKey.keys(),
+    ]);
     for (const key of [...extras].sort((left, right) => left.localeCompare(right))) {
       if (listed.has(key)) continue;
       listed.add(key);
@@ -510,11 +521,14 @@ export class PricingStore {
             ? "reference"
             : null;
       const seenLocally = seenByKey.has(key);
+      const configured = configuredByKey.has(key);
+      const suggestions =
+        !syncedEntry && !matchedRef ? suggestClosestPricing(key, catalog, 3) : undefined;
 
       rankByKey.set(key, 0);
       rows.push({
         key,
-        label: seenByKey.get(key) ?? syncedEntry?.name ?? key,
+        label: seenByKey.get(key) ?? configuredByKey.get(key) ?? syncedEntry?.name ?? key,
         family: matchedRef?.family ?? inferModelFamily(key, syncedEntry?.provider),
         prefixes: [],
         reference: matchedRef ? { ...matchedRef.rates } : null,
@@ -525,6 +539,8 @@ export class PricingStore {
         source,
         note: syncedEntry ? formatLongContextNote(syncedEntry.rates) : (matchedRef?.note ?? null),
         seenLocally,
+        configured,
+        ...(suggestions !== undefined ? { suggestions } : {}),
       });
     }
 
@@ -555,11 +571,12 @@ export class PricingStore {
           source: "synced",
           note: formatLongContextNote(entry.rates),
           seenLocally: false,
+          configured: false,
         });
       }
     }
 
-    // Surface locally observed and user-customized rows first, then built-in families, then synced-only rows.
+    // Surface locally observed, DSH-configured, and user-customized rows first, then built-in families, then synced-only rows.
     rows.sort((left, right) => (rankByKey.get(left.key) ?? 2) - (rankByKey.get(right.key) ?? 2));
 
     return pricingStateSchema.parse({
@@ -782,13 +799,30 @@ export function registerPricingRpc(
     }
   };
 
+  const readConfiguredModels = async (): Promise<SeenModelsInput> => {
+    if (!options.getConfiguredModels) return new Map<string, string>();
+    try {
+      return await options.getConfiguredModels();
+    } catch {
+      return new Map<string, string>();
+    }
+  };
+
+  const readState = async (): Promise<PricingState> => {
+    const [seenModels, configuredModels] = await Promise.all([
+      readSeenModels(),
+      readConfiguredModels(),
+    ]);
+    return store.state(seenModels, configuredModels);
+  };
+
   server.handle(pricingGetRpc, async (_input, context) => {
     options.onContext?.(context);
     await store.load();
     if (lazySync) {
       store.maybeTriggerLazySync();
     }
-    return store.state(await readSeenModels());
+    return readState();
   });
 
   server.handle(pricingUpdateRpc, async (input, context) => {
@@ -797,13 +831,13 @@ export function registerPricingRpc(
     if (lazySync && input.autoSync === true) {
       store.maybeTriggerLazySync();
     }
-    return store.state(await readSeenModels());
+    return readState();
   });
 
   server.handle(pricingSyncRpc, async (input, context) => {
     options.onContext?.(context);
     await store.syncOfficialCatalog({ force: input.force ?? true });
-    return store.state(await readSeenModels());
+    return readState();
   });
 
   if (options.startAutoSync === true) {

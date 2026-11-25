@@ -301,28 +301,29 @@ console.log("the objective row is the panel's only action target");
   assert("the pause icon button is named 暂停目标", byLabel(container, "暂停目标") !== undefined);
   assert("the clear icon button is named 清除目标", byLabel(container, "清除目标") !== undefined);
 
-  // The two lines: one truncated objective, one facts line.
+  // Multi-line readable objective (up to 3 lines) + semantic status pill + rounds.
   const objective = [...container.querySelectorAll("div,span")].find((node) =>
     (node.textContent ?? "").trim() === baseGoal.objective,
   );
   assert("the objective is drawn", objective !== undefined);
   if (objective !== undefined) {
-    // `numberOfLines={1}` reaches the DOM as react-native-web's single-line
-    // class (`r-whiteSpace-*` / `r-overflow-*` / `r-textOverflow-*`), not as an
-    // inline style; jsdom also computes it when the injected sheet is present.
     const style = objective.getAttribute("style") ?? "";
     const classes = objective.getAttribute("class") ?? "";
     const computed = global.getComputedStyle(objective);
     assert(
-      "the objective is one truncated line",
-      /nowrap/.test(computed.whiteSpace ?? "") ||
-        /white-space:\s*nowrap/.test(style) ||
-        (/whiteSpace/.test(classes) && /textOverflow/.test(classes)),
+      "the objective allows up to 3 lines (not single-line nowrap)",
+      !/nowrap/.test(computed.whiteSpace ?? "") &&
+        !/white-space:\s*nowrap/.test(style) &&
+        (/font-size:\s*14\.5px/.test(style) || /WebkitLineClamp|line-clamp|maxWidth/.test(`${style} | ${classes}`)),
       `${style} | ${classes}`,
     );
   }
-  assert("the facts line is drawn", container.textContent.includes("进行中 · 第 3 轮 · 预算 10"));
-  assert("the now line is drawn", container.textContent.includes("正在：清理 node_modules 中的缓存目录"));
+  assert("the status pill shows 目标进行中", container.textContent.includes("目标进行中"));
+  assert("the rounds text is drawn", container.textContent.includes("第 3 轮 · 预算 10"));
+  check("the state word is not duplicated in view mode", container.textContent.split("进行中").length - 1, 1);
+  assert("the now label is drawn", container.textContent.includes("正在"));
+  assert("the now task text is drawn", container.textContent.includes(baseGoal.currentTask));
+  assert("the now row draws CircleDot", container.querySelector('[data-icon="CircleDot"]') !== null);
 
   // The icon button must stop its own press. On react-native-web the nested
   // Pressable already swallows the click, so the behavioural check above cannot
@@ -374,7 +375,7 @@ console.log("\nthe edit page is a small composer");
   assert("there is no 保存 menu row", byLabel(container, "保存") === undefined);
   assert("the save button is named 保存目标", byLabel(container, "保存目标") !== undefined);
   // The now line is hidden while editing: the panel does one thing at a time.
-  assert("the now line is hidden while editing", !container.textContent.includes("正在："));
+  assert("the now line is hidden while editing", !container.textContent.includes(baseGoal.currentTask) && !container.textContent.includes("正在"));
   click(byLabel(container, "取消"));
   check("取消 leaves the edit page", calls.cancelEdit, 1);
 }
@@ -541,18 +542,18 @@ console.log("\nthe complete page is read-only, with only clear (UI-v7)");
   assert("the row is not a button", row?.getAttribute("role") !== "button", row?.getAttribute("role"));
   click(row);
   check("clicking the row opens no editor", calls.beginEdit, 0);
-  // One truncated line, the same rule as the other states.
+  // Up to 3 readable lines, same typography as active view mode.
   const objective = [...container.querySelectorAll("div,span")].find(
     (node) => (node.textContent ?? "").trim() === baseGoal.objective,
   );
-  const classes = objective?.getAttribute("class") ?? "";
   const style = objective?.getAttribute("style") ?? "";
   assert(
-    "the objective is one truncated line",
-    objective !== undefined && ((/whiteSpace/.test(classes) && /textOverflow/.test(classes)) || /white-space:\s*nowrap/.test(style)),
-    `${style} | ${classes}`,
+    "the complete objective allows up to 3 lines",
+    objective !== undefined && !/white-space:\s*nowrap/.test(style) && /font-size:\s*14\.5px/.test(style),
+    style,
   );
-  assert("the facts say 已完成", container.textContent.includes("已完成 · 第 3 轮 · 预算 10"));
+  assert("the status pill says 目标已完成", container.textContent.includes("目标已完成"));
+  assert("the rounds text is drawn on complete", container.textContent.includes("第 3 轮 · 预算 10"));
   assert("the hint points at the closing message", container.textContent.includes("完成总结见会话最后一条助手消息"));
   assert("there is no running ring", container.querySelector('[role="progressbar"]') === null);
   click(byLabel(container, "清除目标"));
@@ -584,7 +585,14 @@ console.log("\ncontrol errors are shown in Chinese, DSH's sentence kept (UI-v9)"
   assert("「No goal to clear.」 is shown in Chinese", known.textContent.includes("没有可清除的目标。"), known.textContent);
   assert("…with DSH's sentence kept under it", known.textContent.includes("No goal to clear."), known.textContent);
   const alert = known.querySelector('[role="alert"]');
-  assert("…as one alert named by both", alert?.getAttribute("aria-label") === "没有可清除的目标。 No goal to clear.", alert?.getAttribute("aria-label"));
+  assert(
+    "…as one alert carrying both lines and CircleAlert",
+    alert !== null &&
+      alert.textContent.includes("没有可清除的目标。") &&
+      alert.textContent.includes("No goal to clear.") &&
+      alert.querySelector('[data-icon="CircleAlert"]') !== null,
+    alert?.outerHTML,
+  );
   const zhLine = [...known.querySelectorAll('[dir="auto"]')].find((node) => (node.textContent ?? "").trim() === "没有可清除的目标。");
   assert("…the Chinese line is red", /color:\s*rgb\(157, 67, 59\)/.test(zhLine?.getAttribute("style") ?? ""), zhLine?.outerHTML);
   const original = [...known.querySelectorAll('[dir="auto"]')].find((node) => (node.textContent ?? "").trim() === "No goal to clear.");
@@ -616,13 +624,16 @@ console.log("\nthe disarmed and blocked pages keep the design's rows");
     disarmed.textContent.includes("重开会话后自动续跑会停止，点「继续」恢复"),
     disarmed.textContent,
   );
-  // The facts line must agree with the pill's 目标未在续跑, not say 进行中.
-  assert("a disarmed goal's facts say 未在续跑", disarmed.textContent.includes("未在续跑 · 第 3 轮 · 预算 10"));
+  // The status pill must agree with the pill's 目标未在续跑, not say 进行中.
+  assert("a disarmed goal's status pill says 目标未在续跑", disarmed.textContent.includes("目标未在续跑"));
+  assert("a disarmed goal shows rounds", disarmed.textContent.includes("第 3 轮 · 预算 10"));
   assert("a disarmed goal's facts do not say 进行中", !disarmed.textContent.includes("进行中"));
   const blocked = render({
     goal: { ...baseGoal, phase: "blocked", blockedReason: { code: "round-limit", message: "需要确认能否删除 dist/legacy，模型不会自行决定" } },
   }).container;
   assert("a blocked goal shows DSH's sentence", blocked.textContent.includes("需要确认能否删除 dist/legacy"));
+  assert("a blocked goal renders its reason as an alert row", blocked.querySelector('[role="alert"]') !== null);
+  assert("a blocked goal draws TriangleAlert", blocked.querySelector('[data-icon="TriangleAlert"]') !== null);
 }
 
 /* The real container (UI-v8): leaving the editor closes the panel ----------- */
@@ -1027,6 +1038,7 @@ async function independentPillChecks() {
     for (let waited = 0; waited < 3000 && !condition(); waited += 10) await pause(10);
   };
   const board = (tasks) => ({
+    enabled: true,
     members: [{ id: "lead", name: "Lead", role: "lead", phase: "active" }],
     tasks,
   });

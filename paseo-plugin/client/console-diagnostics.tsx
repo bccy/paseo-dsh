@@ -18,8 +18,17 @@
  */
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import * as PaseoUi from "@getpaseo/plugin/client/ui";
-import type { SettingsRowProps } from "@getpaseo/plugin/client/ui";
-import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from "react";
+import { Icon, type SettingsRowProps } from "@getpaseo/plugin/client/ui";
+import {
+  Children,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentType,
+  type ReactNode,
+} from "react";
 import { ActivityIndicator, Pressable, Text, View, type LayoutChangeEvent } from "react-native";
 import {
   diagnosticsOverviewRpc,
@@ -102,6 +111,8 @@ interface DiagnosticsCopy {
   readonly credentialsGroupOtherReadable: string;
   readonly credentialsRefsProgress: (ready: string, total: string) => string;
   readonly credentialsLegacyNote: string;
+  readonly providersCardTitle: string;
+  readonly providersCardRefsOnly: (count: string) => string;
   readonly providerDetailsHeading: string;
   readonly credentialRefsHeading: string;
   readonly doctorTitle: string;
@@ -209,6 +220,8 @@ const COPY: Readonly<Record<Locale, DiagnosticsCopy>> = {
     credentialsGroupOtherReadable: "readable by others (run chmod 600)",
     credentialsRefsProgress: (ready, total) => `${ready}/${total} refs ready`,
     credentialsLegacyNote: "Legacy flat layout (auto-migrated on next DSH start)",
+    providersCardTitle: "Providers & Credential Details",
+    providersCardRefsOnly: (count) => `${count} credential refs`,
     providerDetailsHeading: "Configured providers (redacted)",
     credentialRefsHeading: "Referenced credential keys",
     doctorTitle: "Full Doctor Diagnostics",
@@ -329,6 +342,8 @@ const COPY: Readonly<Record<Locale, DiagnosticsCopy>> = {
     credentialsGroupOtherReadable: "其他用户可读（需 chmod 600）",
     credentialsRefsProgress: (ready, total) => `${ready}/${total} 项引用就绪`,
     credentialsLegacyNote: "旧版扁平格式（下次启动 DSH 时自动迁移）",
+    providersCardTitle: "提供方与凭据详情",
+    providersCardRefsOnly: (count) => `${count} 项凭据引用`,
     providerDetailsHeading: "已配置提供方（脱敏摘要）",
     credentialRefsHeading: "已引用的凭据键名",
     doctorTitle: "完整 Doctor 诊断",
@@ -375,6 +390,8 @@ const COPY: Readonly<Record<Locale, DiagnosticsCopy>> = {
   },
 };
 
+type PressState = { pressed: boolean; hovered?: boolean };
+
 function isHostComponent(value: unknown): boolean {
   return typeof value === "function" || (typeof value === "object" && value !== null);
 }
@@ -396,9 +413,15 @@ function HostSettingsCard({
   if (isHostComponent(SettingsCardComp) && SettingsCardComp) {
     return <SettingsCardComp testID={testID}>{children}</SettingsCardComp>;
   }
+  const rows = Children.toArray(children).filter(Boolean);
   return (
-    <Card colors={colors} testID={testID} style={{ padding: space.lg, gap: space.md }}>
-      {children}
+    <Card colors={colors} testID={testID} style={{ overflow: "hidden" }}>
+      {rows.map((row, index) => (
+        <View key={index}>
+          {index > 0 ? <Divider colors={colors} /> : null}
+          {row}
+        </View>
+      ))}
     </Card>
   );
 }
@@ -409,11 +432,13 @@ function HostSettingsRow({
   hint,
   error,
   compact,
+  stackOnCompact = false,
   children,
   testID,
 }: SettingsRowProps & {
   colors: Colors;
   compact: boolean;
+  stackOnCompact?: boolean;
 }) {
   const SettingsRowComp = paseoUiExports["SettingsRow"] as ComponentType<SettingsRowProps> | undefined;
   if (isHostComponent(SettingsRowComp) && SettingsRowComp) {
@@ -423,20 +448,28 @@ function HostSettingsRow({
       </SettingsRowComp>
     );
   }
+  const shouldStack = Boolean(stackOnCompact && compact);
   return (
-    <View testID={testID} style={{ gap: space.xs }}>
+    <View
+      testID={testID}
+      style={{
+        paddingHorizontal: space.md,
+        paddingVertical: space.sm + 2,
+        gap: space.xs,
+      }}
+    >
       <View
         style={{
-          flexDirection: compact ? "column" : "row",
-          alignItems: compact ? "flex-start" : "center",
+          flexDirection: shouldStack ? "column" : "row",
+          alignItems: shouldStack ? "flex-start" : "center",
           justifyContent: "space-between",
-          gap: space.sm,
+          gap: shouldStack ? space.xs : space.sm,
         }}
       >
-        <View style={{ flex: compact ? undefined : 1, minWidth: 0, gap: space.xxs }}>
+        <View style={{ flex: shouldStack ? undefined : 1, minWidth: 0, gap: space.xxs }}>
           <Text style={{ ...font.small, fontWeight: "600", color: colors.foreground }}>{label}</Text>
           {hint ? (
-            <Muted colors={colors} small>
+            <Muted colors={colors} small numberOfLines={compact ? 2 : undefined}>
               {hint}
             </Muted>
           ) : null}
@@ -444,9 +477,9 @@ function HostSettingsRow({
         {children ? (
           <View
             style={{
-              flexShrink: compact ? 1 : 0,
-              maxWidth: compact ? "100%" : "58%",
-              alignItems: compact ? "flex-start" : "flex-end",
+              flexShrink: shouldStack ? 1 : 0,
+              maxWidth: shouldStack ? "100%" : compact ? "56%" : "58%",
+              alignItems: shouldStack ? "flex-start" : "flex-end",
             }}
           >
             {children}
@@ -577,8 +610,9 @@ function ProviderSummaryItem({
   return (
     <View
       style={{
-        gap: space.xs,
-        padding: space.sm,
+        gap: space.xs + 2,
+        paddingHorizontal: space.sm + 2,
+        paddingVertical: space.sm,
         borderRadius: radius.md,
         backgroundColor: tint(colors.foreground, 0.035),
       }}
@@ -586,24 +620,38 @@ function ProviderSummaryItem({
       <View
         style={{
           flexDirection: "row",
-          flexWrap: "wrap",
           alignItems: "center",
           justifyContent: "space-between",
           gap: space.xs,
         }}
       >
-        <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: space.xs, flex: 1, minWidth: 0 }}>
+        <View
+          style={{
+            flexDirection: "row",
+            alignItems: "center",
+            gap: space.xs,
+            flex: 1,
+            minWidth: 0,
+          }}
+        >
           <Text
+            numberOfLines={1}
             style={{
               ...font.small,
               fontWeight: "600",
               color: colors.foreground,
+              flexShrink: 1,
             }}
           >
             {title}
           </Text>
           {provider.isDefault ? (
-            <Badge colors={colors} tone="accent" label={copy.defaultTag} />
+            <Badge
+              colors={colors}
+              tone="accent"
+              label={copy.defaultTag}
+              style={{ flexShrink: 0 }}
+            />
           ) : null}
         </View>
         {provider.apiKeyEnv ? (
@@ -618,18 +666,17 @@ function ProviderSummaryItem({
                   : "neutral"
             }
             label={
-              provider.credentialReady === true
-                ? copy.providerKeyReady(provider.apiKeyEnv)
-                : provider.credentialReady === false
-                  ? copy.providerKeyMissing(provider.apiKeyEnv)
-                  : copy.providerKeyRef(provider.apiKeyEnv)
+              provider.credentialReady === false
+                ? copy.providerKeyMissing(provider.apiKeyEnv)
+                : provider.apiKeyEnv
             }
+            style={{ flexShrink: 1, maxWidth: "50%" }}
           />
         ) : null}
       </View>
 
       {metaParts.length > 0 ? (
-        <Muted colors={colors} small style={{ fontFamily: mono }}>
+        <Muted colors={colors} small numberOfLines={1} style={{ fontFamily: mono }}>
           {metaParts.join(" · ")}
         </Muted>
       ) : null}
@@ -644,10 +691,10 @@ function ProviderSummaryItem({
             <View
               key={model.id}
               style={{
-                paddingHorizontal: space.sm,
+                paddingHorizontal: space.sm - 1,
                 paddingVertical: space.xxs,
                 borderRadius: radius.sm,
-                backgroundColor: tint(colors.foreground, 0.05),
+                backgroundColor: tint(colors.foreground, 0.055),
               }}
             >
               <Text
@@ -785,12 +832,14 @@ export function ConsoleDiagnosticsSection({
   const [overviewRefreshing, setOverviewRefreshing] = useState(false);
   const [overviewError, setOverviewError] = useState<string | null>(null);
   const [providersExpanded, setProvidersExpanded] = useState(false);
+  const [providersCardOpenOverride, setProvidersCardOpenOverride] = useState<boolean | null>(null);
 
   const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
   const [doctorRunning, setDoctorRunning] = useState(false);
   const [doctorError, setDoctorError] = useState<string | null>(null);
 
   const mountedRef = useRef(true);
+  const prevHasIssuesRef = useRef<boolean | null>(null);
   const overviewInFlightRef = useRef(false);
   const overviewRequestIdRef = useRef(0);
   const doctorInFlightRef = useRef(false);
@@ -850,6 +899,17 @@ export function ConsoleDiagnosticsSection({
   useEffect(() => {
     void fetchOverview({ refreshVersion: false, silent: false, force: true });
   }, [fetchOverview]);
+
+  useEffect(() => {
+    if (!overview) return;
+    if (prevHasIssuesRef.current !== null && prevHasIssuesRef.current !== overview.hasIssues) {
+      setProvidersCardOpenOverride(null);
+    }
+    prevHasIssuesRef.current = overview.hasIssues;
+  }, [overview]);
+
+  const providersCardOpen =
+    providersCardOpenOverride !== null ? providersCardOpenOverride : Boolean(overview?.hasIssues);
 
   const handleRefreshOverview = useCallback(() => {
     void fetchOverview({ refreshVersion: true, silent: false });
@@ -1049,20 +1109,32 @@ export function ConsoleDiagnosticsSection({
     return copy.doctorErrorTitle;
   }, [doctorError, doctorReport?.timedOut, failingChecksCount, copy, locale]);
 
+  const routeConfigured = Boolean(
+    overview &&
+      overview.route.status === "configured" &&
+      overview.route.provider &&
+      overview.route.model,
+  );
+  const routeDisplay = routeConfigured
+    ? `${overview!.route.provider} / ${overview!.route.model}`
+    : "";
+  const stackRouteOnCompact = routeConfigured && routeDisplay.length > 20;
+  const refreshBusy = overviewRefreshing && overview !== null;
+  const refreshDisabled = (overviewLoading && overview === null) || refreshBusy;
+
   return (
-    <View testID={testID} onLayout={handleLayout} style={{ gap: space.lg }}>
+    <View testID={testID} onLayout={handleLayout} style={{ gap: space.md }}>
       {/* Instant read-only Environment & Route Overview */}
       <View style={{ gap: space.sm }}>
         <View
           style={{
             flexDirection: "row",
-            flexWrap: "wrap",
             alignItems: "center",
             justifyContent: "space-between",
             gap: space.sm,
           }}
         >
-          <View style={{ flex: 1, minWidth: 160, gap: space.xxs }}>
+          <View style={{ flex: 1, minWidth: 0, gap: space.xxs }}>
             <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: space.sm }}>
               <Text accessibilityRole="header" style={{ ...font.heading, color: colors.foreground }}>
                 {copy.overviewTitle}
@@ -1076,21 +1148,43 @@ export function ConsoleDiagnosticsSection({
                 />
               ) : null}
             </View>
-            <Muted colors={colors} small>
-              {updatedTimeLabel ?? copy.overviewSubtitle}
-            </Muted>
+            {updatedTimeLabel ? (
+              <Muted colors={colors} small style={tabular}>
+                {updatedTimeLabel}
+              </Muted>
+            ) : null}
           </View>
-          <Button
-            colors={colors}
-            variant="ghost"
-            size="sm"
-            icon="RefreshCw"
-            label={isCompact ? undefined : overviewRefreshing ? copy.refreshing : copy.refreshOverview}
+          <Pressable
+            accessibilityRole="button"
             accessibilityLabel={copy.refreshOverview}
-            loading={overviewRefreshing && overview !== null}
-            disabled={overviewLoading && overview === null}
+            accessibilityState={{ disabled: refreshDisabled, busy: refreshBusy }}
+            disabled={refreshDisabled}
+            hitSlop={4}
             onPress={handleRefreshOverview}
-          />
+            style={(state) => {
+              const active =
+                !refreshDisabled &&
+                ((state as PressState).pressed || Boolean((state as PressState).hovered));
+              return {
+                width: 30,
+                height: 30,
+                borderRadius: radius.md,
+                borderWidth: 1,
+                borderColor: colors.border,
+                backgroundColor: active ? tint(colors.foreground, 0.06) : colors.surface1,
+                alignItems: "center",
+                justifyContent: "center",
+                flexShrink: 0,
+                opacity: overviewLoading && overview === null ? 0.45 : 1,
+              };
+            }}
+          >
+            {refreshBusy ? (
+              <ActivityIndicator size="small" color={colors.foreground} />
+            ) : (
+              <Icon name="RefreshCw" size={15} color={colors.foreground} />
+            )}
+          </Pressable>
         </View>
 
         {overviewError ? (
@@ -1165,7 +1259,15 @@ export function ConsoleDiagnosticsSection({
                 hint={profileHint}
                 error={overview.profile.issue}
               >
-                <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: space.xs }}>
+                <View
+                  style={{
+                    flexDirection: "row",
+                    flexWrap: "wrap",
+                    alignItems: "center",
+                    justifyContent: "flex-end",
+                    gap: space.xs,
+                  }}
+                >
                   <Text
                     selectable
                     style={{
@@ -1224,6 +1326,7 @@ export function ConsoleDiagnosticsSection({
               <HostSettingsRow
                 colors={colors}
                 compact={isCompact}
+                stackOnCompact={stackRouteOnCompact}
                 label={copy.routeLabel}
                 hint={routeHint}
                 error={
@@ -1232,9 +1335,7 @@ export function ConsoleDiagnosticsSection({
                     : undefined
                 }
               >
-                {overview.route.status === "configured" &&
-                overview.route.provider &&
-                overview.route.model ? (
+                {routeConfigured ? (
                   <Text
                     selectable
                     numberOfLines={2}
@@ -1243,11 +1344,11 @@ export function ConsoleDiagnosticsSection({
                       fontFamily: mono,
                       fontWeight: "500",
                       color: colors.foreground,
-                      textAlign: isCompact ? "left" : "right",
+                      textAlign: stackRouteOnCompact && isCompact ? "left" : "right",
                       flexShrink: 1,
                     }}
                   >
-                    {overview.route.provider} / {overview.route.model}
+                    {routeDisplay}
                   </Text>
                 ) : (
                   <Badge
@@ -1301,67 +1402,135 @@ export function ConsoleDiagnosticsSection({
               <Card
                 colors={colors}
                 testID="dsh-diagnostics-providers-card"
-                style={{ padding: space.md, gap: space.sm }}
+                style={{ overflow: "hidden" }}
               >
-                {visibleProviders.length > 0 ? (
-                  <View style={{ gap: space.sm }}>
-                    <Text style={{ ...font.overline, color: colors.foregroundMuted }}>
-                      {copy.providerDetailsHeading}
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={copy.providersCardTitle}
+                  accessibilityState={{ expanded: providersCardOpen }}
+                  onPress={() => setProvidersCardOpenOverride(!providersCardOpen)}
+                  style={(state) => ({
+                    flexDirection: "row",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: space.sm,
+                    paddingHorizontal: space.md,
+                    paddingVertical: space.sm + 2,
+                    backgroundColor:
+                      (state as PressState).pressed || Boolean((state as PressState).hovered)
+                        ? tint(colors.foreground, 0.04)
+                        : "transparent",
+                  })}
+                >
+                  <Text
+                    numberOfLines={1}
+                    style={{
+                      ...font.small,
+                      fontWeight: "600",
+                      color: colors.foreground,
+                      flexShrink: 1,
+                      minWidth: 0,
+                    }}
+                  >
+                    {copy.providersCardTitle}
+                  </Text>
+                  <View
+                    style={{
+                      flexDirection: "row",
+                      alignItems: "center",
+                      gap: space.xs,
+                      flexShrink: 0,
+                    }}
+                  >
+                    <Text
+                      numberOfLines={1}
+                      style={{ ...font.caption, ...tabular, color: colors.foregroundMuted }}
+                    >
+                      {sortedProviders.length > 0
+                        ? copy.providersSummary(
+                            integer(sortedProviders.length, locale),
+                            integer(totalModelCount, locale),
+                          )
+                        : copy.providersCardRefsOnly(
+                            integer(overview.credentials.referencedRefs.length, locale),
+                          )}
                     </Text>
-                    {visibleProviders.map((provider) => (
-                      <ProviderSummaryItem
-                        key={provider.id}
-                        provider={provider}
-                        colors={colors}
-                        copy={copy}
-                        locale={locale}
-                      />
-                    ))}
-                    {hiddenProviderCount > 0 ? (
-                      <Pressable
-                        accessibilityRole="button"
-                        onPress={() => setProvidersExpanded(true)}
-                        style={{ alignSelf: "flex-start", paddingVertical: space.xxs }}
-                      >
-                        <Text style={{ ...font.caption, fontWeight: "500", color: colors.accent }}>
-                          {copy.showAllProviders(integer(sortedProviders.length, locale))}
-                        </Text>
-                      </Pressable>
-                    ) : sortedProviders.length > INITIAL_VISIBLE_PROVIDERS && providersExpanded ? (
-                      <Pressable
-                        accessibilityRole="button"
-                        onPress={() => setProvidersExpanded(false)}
-                        style={{ alignSelf: "flex-start", paddingVertical: space.xxs }}
-                      >
-                        <Text style={{ ...font.caption, fontWeight: "500", color: colors.accent }}>
-                          {copy.showFewerProviders}
-                        </Text>
-                      </Pressable>
-                    ) : null}
-                  </View>
-                ) : null}
-
-                {visibleProviders.length > 0 && overview.credentials.referencedRefs.length > 0 ? (
-                  <Divider colors={colors} />
-                ) : null}
-
-                {overview.credentials.referencedRefs.length > 0 ? (
-                  <View style={{ gap: space.xs }}>
-                    <Text style={{ ...font.overline, color: colors.foregroundMuted }}>
-                      {copy.credentialRefsHeading}
-                    </Text>
-                    <View style={{ flexDirection: "row", flexWrap: "wrap", gap: space.xs }}>
-                      {overview.credentials.referencedRefs.map((ref) => (
-                        <Badge
-                          key={ref.name}
-                          colors={colors}
-                          dot
-                          tone={ref.present ? "success" : "danger"}
-                          label={ref.name}
-                        />
-                      ))}
+                    <View
+                      style={{
+                        transform: [{ rotate: providersCardOpen ? "90deg" : "0deg" }],
+                      }}
+                    >
+                      <Icon name="ChevronRight" size={14} color={colors.foregroundMuted} />
                     </View>
                   </View>
+                </Pressable>
+
+                {providersCardOpen ? (
+                  <>
+                    <Divider colors={colors} />
+                    <View style={{ padding: space.md, gap: space.sm }}>
+                      {visibleProviders.length > 0 ? (
+                        <View style={{ gap: space.sm }}>
+                          <Text style={{ ...font.overline, color: colors.foregroundMuted }}>
+                            {copy.providerDetailsHeading}
+                          </Text>
+                          {visibleProviders.map((provider) => (
+                            <ProviderSummaryItem
+                              key={provider.id}
+                              provider={provider}
+                              colors={colors}
+                              copy={copy}
+                              locale={locale}
+                            />
+                          ))}
+                          {hiddenProviderCount > 0 ? (
+                            <Pressable
+                              accessibilityRole="button"
+                              onPress={() => setProvidersExpanded(true)}
+                              style={{ alignSelf: "flex-start", paddingVertical: space.xxs }}
+                            >
+                              <Text style={{ ...font.caption, fontWeight: "500", color: colors.accent }}>
+                                {copy.showAllProviders(integer(sortedProviders.length, locale))}
+                              </Text>
+                            </Pressable>
+                          ) : sortedProviders.length > INITIAL_VISIBLE_PROVIDERS && providersExpanded ? (
+                            <Pressable
+                              accessibilityRole="button"
+                              onPress={() => setProvidersExpanded(false)}
+                              style={{ alignSelf: "flex-start", paddingVertical: space.xxs }}
+                            >
+                              <Text style={{ ...font.caption, fontWeight: "500", color: colors.accent }}>
+                                {copy.showFewerProviders}
+                              </Text>
+                            </Pressable>
+                          ) : null}
+                        </View>
+                      ) : null}
+
+                      {visibleProviders.length > 0 && overview.credentials.referencedRefs.length > 0 ? (
+                        <Divider colors={colors} />
+                      ) : null}
+
+                      {overview.credentials.referencedRefs.length > 0 ? (
+                        <View style={{ gap: space.xs }}>
+                          <Text style={{ ...font.overline, color: colors.foregroundMuted }}>
+                            {copy.credentialRefsHeading}
+                          </Text>
+                          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: space.xs }}>
+                            {overview.credentials.referencedRefs.map((ref) => (
+                              <Badge
+                                key={ref.name}
+                                colors={colors}
+                                dot
+                                tone={ref.present ? "success" : "danger"}
+                                label={ref.name}
+                              />
+                            ))}
+                          </View>
+                        </View>
+                      ) : null}
+                    </View>
+                  </>
                 ) : null}
               </Card>
             ) : null}
@@ -1373,17 +1542,17 @@ export function ConsoleDiagnosticsSection({
       <Card
         colors={colors}
         testID="dsh-diagnostics-doctor-card"
-        style={{ padding: space.lg, gap: space.md }}
+        style={{ padding: isCompact ? space.md : space.lg, gap: space.sm + 2 }}
       >
         <View
           style={{
-            flexDirection: isCompact ? "column" : "row",
-            alignItems: isCompact ? "flex-start" : "center",
+            flexDirection: "row",
+            alignItems: "center",
             justifyContent: "space-between",
             gap: space.sm,
           }}
         >
-          <View style={{ flex: isCompact ? undefined : 1, minWidth: 0, gap: space.xxs }}>
+          <View style={{ flex: 1, minWidth: 0, gap: space.xxs }}>
             <Text accessibilityRole="header" style={{ ...font.heading, color: colors.foreground }}>
               {copy.doctorTitle}
             </Text>
@@ -1400,6 +1569,7 @@ export function ConsoleDiagnosticsSection({
             loading={doctorRunning}
             disabled={doctorRunning}
             onPress={() => void handleRunDoctor()}
+            style={{ flexShrink: 0 }}
             testID="dsh-diagnostics-run-doctor-btn"
           />
         </View>
@@ -1418,10 +1588,6 @@ export function ConsoleDiagnosticsSection({
               {copy.doctorRunningHint}
             </Muted>
           </View>
-        ) : !doctorReport && !doctorError ? (
-          <Muted colors={colors} small>
-            {copy.doctorIdleHint}
-          </Muted>
         ) : null}
 
         {doctorReport ? (

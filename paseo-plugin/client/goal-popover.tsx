@@ -6,13 +6,16 @@
  *
  * - **The objective row** is a `ComposerTrackRow` (`composer/tracks.tsx:347-379`:
  *   32px / 40px compact, 4px inset, 8px padding, 6px radius) whose whole body is
- *   the edit entry. It carries the whale, the objective on **one** truncated line
- *   (`numberOfLines={1}`), a facts line (`进行中 · 第 3 轮 · 预算 10`) and two
- *   row-end icon buttons — pause/continue and clear. There is no edit button: the
- *   row itself is the edit affordance (hover/press fills `surface2`, the host's
- *   `rowActive`), which is how the host's pressable track rows read.
- * - **The "now" row** is a track row with a `CircleDot` and the current todo.
- * - **Blocked / disarmed / error** are the design's one-line rows and hint.
+ *   the edit entry. It carries the top-aligned whale, up to **three** readable
+ *   lines of objective (`numberOfLines={3}`, `14.5px/21px`, medium weight), a
+ *   semantic `PopoverPill` status badge beside tabular round/budget facts, and
+ *   two row-end icon buttons — pause/continue and clear. There is no edit
+ *   button: the row itself is the edit affordance (hover/press fills `surface2`,
+ *   the host's `rowActive`), which is how the host's pressable track rows read.
+ * - **The lower details** sit below a `PopoverHairline` divider whenever present:
+ *   the "now" row (top-aligned `CircleDot` in running blue, quiet label + up to
+ *   2 lines of current todo), a warning `PopoverAlertRow` for blocked reasons,
+ *   the disarmed/complete hint, and a danger `PopoverAlertRow` for control errors.
  * - **Edit** (design-opus-v4 direction C) is a small Paseo composer: a header
  *   (whale + 编辑目标, and on desktop an `Esc 取消` hint), then the host composer's
  *   box (`composer/input/input.tsx:2259-2287`: 16px radius, same surface as the
@@ -43,7 +46,6 @@
  *
  * @module dsh-paseo/client/goal-popover
  */
-import type { PluginButtonContentProps } from "@getpaseo/plugin/client";
 import { Icon, TextInput as UiTextInput } from "@getpaseo/plugin/client/ui";
 import { useEffect, useState, type ReactNode } from "react";
 import {
@@ -55,6 +57,7 @@ import {
   type PressableStateCallbackType,
 } from "react-native";
 import type { GoalState } from "../shared/goal";
+import { tabular } from "./console-theme";
 import { DeepSeekMark } from "./deepseek-mark";
 import {
   GOAL_EDITOR_GAP,
@@ -97,10 +100,14 @@ import {
   ringColorFor,
 } from "./jobs-popover-layout";
 import { goalControlErrorDisplay, type GoalText } from "./locale";
+import {
+  PopoverAlertRow,
+  PopoverHairline,
+  PopoverPill,
+  type PopoverPillTone,
+  type PopoverTheme,
+} from "./popover-ui";
 import { StatusRingMark } from "./status-ring";
-
-/** The host's popover theme slot, so the type is not spelled at every call. */
-type PopoverTheme = PluginButtonContentProps["theme"];
 
 /** The host's hover/press callback state, as `jobs-pill.tsx` reads it. */
 type HoverState = PressableStateCallbackType & { hovered?: boolean };
@@ -110,6 +117,66 @@ export type GoalPanelMode = "view" | "edit" | "confirm";
 
 /** A disabled control's opacity, matching the host's disabled button. */
 const BUSY_OPACITY = 0.5;
+
+/** View-mode objective typography: up to 3 readable lines instead of 1-line truncation. */
+const GOAL_VIEW_OBJECTIVE_FONT_SIZE = 14.5;
+const GOAL_VIEW_OBJECTIVE_LINE_HEIGHT = 21;
+
+/** View-mode current task typography: up to 2 readable lines under a quiet label. */
+const GOAL_CURRENT_TASK_FONT_SIZE = 13.5;
+const GOAL_CURRENT_TASK_LINE_HEIGHT = 20;
+
+/** Semantic pill tone for the goal's view-mode status badge. */
+function goalPillTone(goal: GoalState): PopoverPillTone {
+  if (goal.phase === "complete") return "success";
+  if (goal.phase === "blocked") return "warning";
+  if (goal.phase === "paused" || goal.activation === "disarmed") return "neutral";
+  return "running";
+}
+
+/** Semantic status pill paired with tabular round/budget facts beneath the objective. */
+function GoalStatusRow({
+  goal,
+  stateName,
+  rounds,
+  running,
+  theme,
+}: {
+  goal: GoalState;
+  stateName: string;
+  rounds: string;
+  running: boolean;
+  theme: PopoverTheme;
+}) {
+  const tone = goalPillTone(goal);
+  return (
+    <View style={{ flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 6, marginTop: 4 }}>
+      <PopoverPill
+        theme={theme}
+        label={stateName}
+        tone={tone}
+        compact
+        leading={
+          tone === "running" && running ? (
+            <StatusRingMark size={10} ring={10} color={ringColorFor(theme.colors.surface0)} />
+          ) : undefined
+        }
+      />
+      <Text
+        numberOfLines={1}
+        style={{
+          flexShrink: 1,
+          fontSize: FACTS_FONT_SIZE,
+          lineHeight: GOAL_FACTS_LINE_HEIGHT,
+          color: theme.colors.foregroundMuted,
+          ...tabular,
+        }}
+      >
+        {rounds}
+      </Text>
+    </View>
+  );
+}
 
 /**
  * The whale with the running ring on its bottom-right corner.
@@ -236,27 +303,14 @@ function Hint({ theme, children }: { theme: PopoverTheme; children: string }) {
 function ControlError({ theme, text, error }: { theme: PopoverTheme; text: GoalText; error: string }) {
   const shown = goalControlErrorDisplay(error, text);
   return (
-    <View
-      accessible
-      accessibilityRole="alert"
-      accessibilityLabel={shown.original === undefined ? shown.message : `${shown.message} ${shown.original}`}
-      style={{
-        paddingHorizontal: GOAL_HINT_PADDING_HORIZONTAL,
-        paddingVertical: GOAL_HINT_PADDING_VERTICAL,
-        gap: 2,
-      }}
-    >
-      <Text style={{ fontSize: FACTS_FONT_SIZE, lineHeight: GOAL_FACTS_LINE_HEIGHT, color: theme.colors.statusDanger }}>
-        {shown.message}
-      </Text>
-      {shown.original === undefined ? null : (
-        <Text
-          selectable
-          style={{ fontSize: FACTS_FONT_SIZE - 1, lineHeight: GOAL_FACTS_LINE_HEIGHT - 1, color: theme.colors.foregroundMuted }}
-        >
-          {shown.original}
-        </Text>
-      )}
+    <View style={{ marginVertical: 4 }}>
+      <PopoverAlertRow
+        theme={theme}
+        tone="danger"
+        icon="CircleAlert"
+        message={shown.message}
+        detail={shown.original}
+      />
     </View>
   );
 }
@@ -384,7 +438,7 @@ function GoalEditor({
           borderWidth: 1,
           // The composer's `borderAccent` is not in the plugin theme (DESIGN v4 §6).
           borderColor: theme.colors.border,
-          backgroundColor: theme.colors.surface1,
+          backgroundColor: theme.colors.surface0,
         }}
       >
         <View style={{ position: "relative" }}>
@@ -577,7 +631,7 @@ function GoalClearConfirm({ goal, text, theme, compact, busy, error, onConfirmCl
           accessibilityLabel={text.rowLabel(goalStateName(goal, text), goal.objective)}
           style={{ flexDirection: "row", alignItems: "center", gap: 8, flexGrow: 1, flexShrink: 1, flexBasis: "auto", minWidth: 0 }}
         >
-          <Whale running={false} theme={theme} backdrop={theme.colors.surface1} label={text.runningA11y} />
+          <Whale running={false} theme={theme} backdrop={theme.colors.surface0} label={text.runningA11y} />
           <View style={{ flexGrow: 1, flexShrink: 1, flexBasis: "auto", minWidth: 0 }}>
             <Text
               numberOfLines={1}
@@ -729,7 +783,7 @@ export function GoalPopoverBody({
   const [hot, setHot] = useState(false);
   const iconButton = goalIconButton(compact);
   const resumable = goal.phase !== "active" || goal.activation === "disarmed";
-  const facts = goalFactsLine(goal, text.statuses, text.rounds);
+  const rounds = text.rounds(goal.roundsStarted, goal.maxGoalRounds);
   const currentTask = goalCurrentTaskLine(goal);
   const root = { ...popoverRootBox() } as const;
 
@@ -770,52 +824,57 @@ export function GoalPopoverBody({
 
   if (goal.phase === "complete") {
     // UI-v7: read-only. The objective row is a plain View (no press, no hover
-    // fill — nothing here edits), the whale has no ring, the objective is the
-    // same one truncated line as every other state, and the only action is
-    // clear. The hint points at the model's closing message: DSH has no
-    // summary field to show instead.
+    // fill — nothing here edits), the whale has no ring, the objective allows
+    // up to 3 readable lines, and the only action is clear. The hint points at
+    // the model's closing message: DSH has no summary field to show instead.
     return (
       <View style={{ ...root, margin: -12 }}>
-        <View accessible accessibilityLabel={text.rowLabel(stateName, goal.objective)} style={row}>
-          <Whale running={false} theme={theme} backdrop={theme.colors.surface1} label={text.runningA11y} />
+        <View
+          accessible
+          accessibilityLabel={text.rowLabel(stateName, goal.objective)}
+          style={[row, { alignItems: "flex-start" }]}
+        >
+          <View style={{ marginTop: 2, flexShrink: 0 }}>
+            <Whale running={false} theme={theme} backdrop={theme.colors.surface0} label={text.runningA11y} />
+          </View>
           <View style={{ flexGrow: 1, flexShrink: 1, flexBasis: "auto", minWidth: 0 }}>
             <Text
-              numberOfLines={1}
+              numberOfLines={3}
               style={{
-                fontSize: TITLE_FONT_SIZE,
-                lineHeight: GOAL_OBJECTIVE_LINE_HEIGHT,
+                fontSize: GOAL_VIEW_OBJECTIVE_FONT_SIZE,
+                lineHeight: GOAL_VIEW_OBJECTIVE_LINE_HEIGHT,
+                fontWeight: "500",
                 color: theme.colors.foreground,
               }}
             >
               {goal.objective}
             </Text>
-            <Text
-              numberOfLines={1}
-              style={{
-                fontSize: FACTS_FONT_SIZE,
-                lineHeight: GOAL_FACTS_LINE_HEIGHT,
-                color: theme.colors.foregroundMuted,
-              }}
-            >
-              {facts}
-            </Text>
+            <GoalStatusRow goal={goal} stateName={stateName} rounds={rounds} running={false} theme={theme} />
           </View>
-          <IconButton
-            name="Trash2"
-            glyph={iconButton.glyph}
-            size={iconButton.size}
-            color={theme.colors.foregroundMuted}
-            disabled={busy}
-            theme={theme}
-            label={text.actions.clearTarget}
-            onPress={onBeginClear}
-          />
+          <View style={{ marginTop: compact ? 0 : 1, flexShrink: 0 }}>
+            <IconButton
+              name="Trash2"
+              glyph={iconButton.glyph}
+              size={iconButton.size}
+              color={theme.colors.foregroundMuted}
+              disabled={busy}
+              theme={theme}
+              label={text.actions.clearTarget}
+              onPress={onBeginClear}
+            />
+          </View>
         </View>
+        <PopoverHairline theme={theme} />
         <Hint theme={theme}>{text.completeHint}</Hint>
         {error === undefined ? null : <ControlError theme={theme} text={text} error={error} />}
       </View>
     );
   }
+
+  const hasBlocked = goal.phase === "blocked" && goal.blockedReason !== undefined;
+  const isDisarmed = goal.phase === "active" && goal.activation === "disarmed";
+  const hasLowerDetails = currentTask !== undefined || hasBlocked || isDisarmed || error !== undefined;
+  const currentTaskLabel = text.currentTaskPrefix.replace(/[：:]\s*$/, "");
 
   return (
     <View style={{ ...root, margin: -12 }}>
@@ -829,38 +888,33 @@ export function GoalPopoverBody({
         onHoverOut={() => setHot(false)}
         style={({ hovered = false, pressed }: HoverState) => ({
           ...row,
+          alignItems: "flex-start",
           backgroundColor: hovered || pressed || hot ? theme.colors.surface2 : "transparent",
         })}
       >
-        <Whale
-          running={running}
-          theme={theme}
-          backdrop={hot ? theme.colors.surface2 : theme.colors.surface1}
-          label={text.runningA11y}
-        />
+        <View style={{ marginTop: 2, flexShrink: 0 }}>
+          <Whale
+            running={running}
+            theme={theme}
+            backdrop={hot ? theme.colors.surface2 : theme.colors.surface0}
+            label={text.runningA11y}
+          />
+        </View>
         <View style={{ flexGrow: 1, flexShrink: 1, flexBasis: "auto", minWidth: 0 }}>
           <Text
-            numberOfLines={1}
+            numberOfLines={3}
             style={{
-              fontSize: TITLE_FONT_SIZE,
-              lineHeight: GOAL_OBJECTIVE_LINE_HEIGHT,
+              fontSize: GOAL_VIEW_OBJECTIVE_FONT_SIZE,
+              lineHeight: GOAL_VIEW_OBJECTIVE_LINE_HEIGHT,
+              fontWeight: "500",
               color: theme.colors.foreground,
             }}
           >
             {goal.objective}
           </Text>
-          <Text
-            numberOfLines={1}
-            style={{
-              fontSize: FACTS_FONT_SIZE,
-              lineHeight: GOAL_FACTS_LINE_HEIGHT,
-              color: theme.colors.foregroundMuted,
-            }}
-          >
-            {facts}
-          </Text>
+          <GoalStatusRow goal={goal} stateName={stateName} rounds={rounds} running={running} theme={theme} />
         </View>
-        <View style={{ flexDirection: "row", gap: 4 }}>
+        <View style={{ flexDirection: "row", gap: 4, marginTop: compact ? 0 : 1, flexShrink: 0 }}>
           <IconButton
             name={resumable ? "Play" : "Pause"}
             glyph={iconButton.glyph}
@@ -883,39 +937,47 @@ export function GoalPopoverBody({
           />
         </View>
       </Pressable>
+      {hasLowerDetails ? <PopoverHairline theme={theme} /> : null}
       {currentTask === undefined ? null : (
-        <View style={row}>
-          <Icon name="CircleDot" size={16} color={theme.colors.foregroundMuted} />
-          <Text
-            numberOfLines={1}
-            style={{ flexShrink: 1, fontSize: TITLE_FONT_SIZE, color: theme.colors.foreground }}
-          >
-            <Text style={{ color: theme.colors.foregroundMuted }}>{text.currentTaskPrefix}</Text>
-            {currentTask}
-          </Text>
+        <View style={[row, { alignItems: "flex-start" }]}>
+          <View style={{ marginTop: 2, flexShrink: 0 }}>
+            <Icon name="CircleDot" size={14} color={ringColorFor(theme.colors.surface0)} />
+          </View>
+          <View style={{ flexGrow: 1, flexShrink: 1, flexBasis: "auto", minWidth: 0, gap: 2 }}>
+            <Text
+              style={{
+                fontSize: 11.5,
+                lineHeight: 16,
+                fontWeight: "600",
+                color: theme.colors.foregroundMuted,
+              }}
+            >
+              {currentTaskLabel}
+            </Text>
+            <Text
+              numberOfLines={2}
+              style={{
+                fontSize: GOAL_CURRENT_TASK_FONT_SIZE,
+                lineHeight: GOAL_CURRENT_TASK_LINE_HEIGHT,
+                color: theme.colors.foreground,
+              }}
+            >
+              {currentTask}
+            </Text>
+          </View>
         </View>
       )}
-      {goal.phase === "blocked" && goal.blockedReason !== undefined ? (
-        <View style={[row, { alignItems: "flex-start" }]}>
-          <View style={{ marginTop: 2 }}>
-            <Icon name="CircleAlert" size={16} color={theme.colors.statusDanger} />
-          </View>
-          <Text
-            numberOfLines={2}
-            style={{
-              flexShrink: 1,
-              fontSize: TITLE_FONT_SIZE,
-              lineHeight: GOAL_OBJECTIVE_LINE_HEIGHT,
-              color: theme.colors.foregroundMuted,
-            }}
-          >
-            {goal.blockedReason.message}
-          </Text>
+      {hasBlocked && goal.blockedReason !== undefined ? (
+        <View style={{ marginVertical: 4 }}>
+          <PopoverAlertRow
+            theme={theme}
+            tone="warning"
+            icon="TriangleAlert"
+            message={goal.blockedReason.message}
+          />
         </View>
       ) : null}
-      {goal.phase === "active" && goal.activation === "disarmed" ? (
-        <Hint theme={theme}>{text.disarmedHint}</Hint>
-      ) : null}
+      {isDisarmed ? <Hint theme={theme}>{text.disarmedHint}</Hint> : null}
       {error === undefined ? null : <ControlError theme={theme} text={text} error={error} />}
     </View>
   );

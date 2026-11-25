@@ -22,7 +22,7 @@ export const USAGE_MAX_TPS = 3000;
 /** Fallback USD -> CNY exchange rate when no pricer config overrides it. */
 export const DEFAULT_USD_TO_CNY_RATE = 7.2;
 
-export const USAGE_RANGES = ["24h", "7d", "30d"] as const;
+export const USAGE_RANGES = ["today", "7d", "30d"] as const;
 export const usageRangeSchema = z.enum(USAGE_RANGES);
 export type UsageRange = z.infer<typeof usageRangeSchema>;
 
@@ -126,9 +126,18 @@ export const usageModelRowSchema = usageTotalsSchema.extend({
 });
 export type UsageModelRow = z.infer<typeof usageModelRowSchema>;
 
+/**
+ * Accept legacy `"24h"` on RPC input during live plugin reload transitions and
+ * normalize it to `"today"`, while keeping `UsageRange` strictly `"today" | "7d" | "30d"`.
+ */
+const usageStatsRangeInputSchema = z.preprocess(
+  (value) => (value === "24h" ? "today" : value),
+  usageRangeSchema,
+);
+
 export const usageStatsInputSchema = z
   .object({
-    range: usageRangeSchema,
+    range: usageStatsRangeInputSchema,
     scope: usageScopeSchema.optional(),
     provider: z.string().min(1).max(120).optional(),
     model: z.string().min(1).max(240).optional(),
@@ -221,7 +230,7 @@ export const usageDailySchema = z.object({
 });
 export type UsageDaily = z.infer<typeof usageDailySchema>;
 
-/** Time-windowed usage analytics RPC (`24h` / `7d` / `30d`). */
+/** Time-windowed usage analytics RPC (`today` / `7d` / `30d`). */
 export const usageStatsRpc = defineRpc({
   name: "dsh.usage.stats",
   input: usageStatsInputSchema,
