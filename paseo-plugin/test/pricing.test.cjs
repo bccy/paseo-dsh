@@ -1227,7 +1227,11 @@ test("registerPricingRpc wires dsh.pricing.sync, lazy stale refresh on get, and 
   };
 
   const dispose = registerPricingRpc(mockServer, store, {
-    getSeenModels: async () => new Map([["deepseek-v4-pro", "DeepSeek V4 Pro"]]),
+    getSeenModels: async () =>
+      new Map([
+        ["deepseek-v4-pro", "DeepSeek V4 Pro"],
+        ["claude-sonnet-4-5", "Claude Sonnet 4.5"],
+      ]),
     startAutoSync: true,
     autoSyncDelayMs: 60_000, // far future; disposed before firing
     lazySyncOnGet: true,
@@ -1258,6 +1262,17 @@ test("registerPricingRpc wires dsh.pricing.sync, lazy stale refresh on get, and 
   assert.equal(dsRow?.syncedProvider, "deepseek");
   assert.equal(dsRow?.seenLocally, true);
   assert.equal(dsRow?.effective?.input, 0.66);
+
+  // Synced model without long-context tier MUST NOT inherit built-in reference's `>200K` note.
+  const sonnet45Row = syncedState.models.find((row) => row.key === "claude-sonnet-4-5");
+  assert.equal(sonnet45Row?.source, "synced");
+  assert.equal(sonnet45Row?.reference?.longContextThreshold, 200_000);
+  assert.equal(sonnet45Row?.note, null);
+
+  // Synced model WITH long-context tier carries its own synced tier note.
+  const gemRow = syncedState.models.find((row) => row.key === "gemini-2.5-pro");
+  assert.equal(gemRow?.source, "synced");
+  assert.match(gemRow?.note ?? "", /^>200K prompts:/);
 
   const dsChatRow = syncedState.models.find((row) => row.key === "deepseek-chat");
   assert.equal(dsChatRow?.source, "reference");

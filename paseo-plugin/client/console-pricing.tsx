@@ -70,6 +70,7 @@ const MAX_MODEL_KEY_LENGTH = 160;
 const NARROW_WIDTH_PX = 480;
 const INITIAL_VISIBLE_ROWS = 50;
 const BACKGROUND_SYNC_POLL_MS = 1_500;
+const MAX_BACKGROUND_SYNC_POLLS = 20;
 
 export interface PricingDialogProps {
   visible: boolean;
@@ -1450,16 +1451,56 @@ export function PricingDialog({
     void loadState();
   }, [visible, loadState]);
 
-  // If a background auto-sync was in progress when the dialog loaded, refresh once shortly after.
+  // Poll silently until a background auto-sync settles so >1.5s fetches never stall
+  // the Sync strip, without clobbering an unsaved exchange-rate draft, and notify
+  // parent tabs (`onUpdated`) as soon as `syncing` transitions from `true` -> `false`.
   useEffect(() => {
     if (!visible || !state?.sync.syncing || syncBusy) return;
-    const timer = setTimeout(() => {
-      if (mountedRef.current && !mutationInFlightRef.current) {
-        void loadState();
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let attempts = 0;
+
+    const schedule = () => {
+      if (cancelled || attempts >= MAX_BACKGROUND_SYNC_POLLS) return;
+      timer = setTimeout(() => {
+        timer = null;
+        void pollOnce();
+      }, BACKGROUND_SYNC_POLL_MS);
+    };
+
+    const pollOnce = async () => {
+      if (cancelled || !mountedRef.current) return;
+      if (mutationInFlightRef.current) {
+        schedule();
+        return;
       }
-    }, BACKGROUND_SYNC_POLL_MS);
-    return () => clearTimeout(timer);
-  }, [visible, state?.sync.syncing, syncBusy, loadState]);
+      attempts += 1;
+      const requestId = ++loadRequestIdRef.current;
+      try {
+        const next = await client.rpc(pricingGetRpc, {});
+        if (cancelled || !mountedRef.current || loadRequestIdRef.current !== requestId) return;
+        setState(next);
+        if (!next.sync.syncing) {
+          onUpdated?.(next);
+          return;
+        }
+      } catch {
+        // Ignore transient poll errors and keep checking up to MAX_BACKGROUND_SYNC_POLLS.
+      }
+      if (!cancelled && mountedRef.current) {
+        schedule();
+      }
+    };
+
+    schedule();
+    return () => {
+      cancelled = true;
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+  }, [visible, state?.sync.syncing, syncBusy, client, onUpdated]);
 
   const applyUpdate = useCallback(
     async (payload: PricingUpdateInput): Promise<PricingState> => {
@@ -1469,6 +1510,7 @@ export function PricingDialog({
       mutationInFlightRef.current = true;
       setMutating(true);
       try {
+        loadRequestIdRef.current += 1;
         const next = await client.rpc(pricingUpdateRpc, payload);
         if (mountedRef.current) {
           setState(next);
@@ -1592,6 +1634,7 @@ export function PricingDialog({
     setMutating(true);
     setSyncBusy(true);
     try {
+      loadRequestIdRef.current += 1;
       const next = await client.rpc(pricingSyncRpc, { force: true });
       if (mountedRef.current) {
         setState(next);

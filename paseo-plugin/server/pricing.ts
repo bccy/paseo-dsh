@@ -482,7 +482,7 @@ export class PricingStore {
         custom: custom ? { ...custom } : null,
         effective,
         source,
-        note: (syncedEntry ? formatLongContextNote(syncedEntry.rates) : null) ?? entry.note ?? null,
+        note: syncedEntry ? formatLongContextNote(syncedEntry.rates) : (entry.note ?? null),
         seenLocally,
       });
     }
@@ -523,10 +523,7 @@ export class PricingStore {
         custom: custom ? { ...custom } : null,
         effective,
         source,
-        note:
-          (syncedEntry ? formatLongContextNote(syncedEntry.rates) : null) ??
-          matchedRef?.note ??
-          null,
+        note: syncedEntry ? formatLongContextNote(syncedEntry.rates) : (matchedRef?.note ?? null),
         seenLocally,
       });
     }
