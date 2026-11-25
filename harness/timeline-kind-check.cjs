@@ -52,7 +52,7 @@ function readKinds(source) {
         useCurrentLocale: () => 'zh-CN',
       };
     }
-    if (id === './client/dsh-plugins-page') return { DshPluginsPage: () => null };
+    if (id === './client/dsh-plugins-page') return { DshPluginsPage: () => null, DshPluginsContent: () => null };
     if (id === './client/dsh-plugins-icon') return { PluginsIcon: () => null };
     if (id === './client/settings-screen') {
       return {

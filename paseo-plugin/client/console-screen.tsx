@@ -26,7 +26,7 @@ import { font, radius, space, tint, type Colors } from "./console-theme";
 import { Avatar, Badge, Card, Divider, Muted, SegmentedControl } from "./console-ui";
 import { DEEPSEEK_MARK_SVG } from "./deepseek-mark-svg";
 import { PluginsBoundary, PluginsFailedCard } from "./dsh-plugins-guard";
-import { DshPluginsPage } from "./dsh-plugins-page";
+import { DshPluginsContent } from "./dsh-plugins-page";
 import type { Locale } from "./locale";
 import { useCurrentLocale, useLocaleText } from "./use-locale";
 
@@ -320,49 +320,45 @@ function DshConsoleBody({
 
       <Divider colors={colors} />
 
-      {/* Active tab body — Tab 2 avoids nested ScrollView when mounting DshPluginsPage directly */}
-      {activeTab === "plugins" && !renderPlugins ? (
-        <View style={{ flex: 1 }}>
-          <DshPluginsPage
-            theme={theme}
-            host={host}
-            layout={layout}
-            navigation={navigation}
-            params={params ?? {}}
-            openDisplaySettings={() => setActiveTab("settings")}
-          />
-        </View>
-      ) : (
-        <HostScrollView
-          style={{ flex: 1 }}
-          keyboardShouldPersistTaps="handled"
-          contentContainerStyle={{
-            padding: horizontalPadding,
-            alignItems: "center",
-          }}
-        >
-          <View style={{ width: contentWidth || "100%", maxWidth: 980 }}>
-            {activeTab === "usage" ? (
-              renderUsage ? (
-                renderUsage(tabContext)
-              ) : (
-                <UsagePlaceholder colors={colors} compact={compact} />
-              )
-            ) : activeTab === "plugins" && renderPlugins ? (
+      {/* Active tab body — single HostScrollView shared by all 3 tabs */}
+      <HostScrollView
+        style={{ flex: 1 }}
+        keyboardShouldPersistTaps="handled"
+        contentContainerStyle={{
+          padding: horizontalPadding,
+          alignItems: "center",
+        }}
+      >
+        <View style={{ width: contentWidth || "100%", maxWidth: 980 }}>
+          {activeTab === "usage" ? (
+            renderUsage ? (
+              renderUsage(tabContext)
+            ) : (
+              <UsagePlaceholder colors={colors} compact={compact} />
+            )
+          ) : activeTab === "plugins" ? (
+            renderPlugins ? (
               renderPlugins(tabContext)
             ) : (
-              <ConsoleSettingsTab
+              <DshPluginsContent
                 colors={colors}
                 host={host}
-                compact={compact}
-                environment={environment}
-                renderEnvironment={renderEnvironment}
-                pricing={pricing}
+                layout={layout}
+                embedded
               />
-            )}
-          </View>
-        </HostScrollView>
-      )}
+            )
+          ) : (
+            <ConsoleSettingsTab
+              colors={colors}
+              host={host}
+              compact={compact}
+              environment={environment}
+              renderEnvironment={renderEnvironment}
+              pricing={pricing}
+            />
+          )}
+        </View>
+      </HostScrollView>
     </View>
   );
 }
