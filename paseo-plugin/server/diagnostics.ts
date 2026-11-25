@@ -2,7 +2,9 @@
  * Daemon-side Environment Overview and On-Demand Doctor service.
  *
  * Delegates all profile, bridge, route, composition, and credential validation
- * to the shared core in `lib/doctor.mjs` (zero duplicated validation logic).
+ * to the shared pure core in `server/doctor-core.mjs` via a static import so
+ * Paseo's server bundler inlines it directly with zero runtime filesystem
+ * lookup (`lib/doctor.mjs` re-exports the same core for the standalone CLI).
  *
  * - `dsh.diagnostics.overview`: fast read-only file inspection + lightweight
  *   in-memory DSH version cache (reads `@deepseek-ai/dsh/package.json` when
@@ -35,6 +37,7 @@ import {
   type RunDoctorInput,
 } from "../shared/diagnostics";
 import { BRIDGE_FILES } from "./bridge-assets";
+import * as bundledDoctorModule from "./doctor-core.mjs";
 import { resolveDshCommand } from "./dsh-command.mjs";
 
 export const DEFAULT_DOCTOR_TIMEOUT_MS = 20_000;
@@ -43,7 +46,7 @@ const VERSION_PROBE_TIMEOUT_MS = 3_000;
 const MIN_RPC_TIMEOUT_MS = 1_000;
 const MAX_RPC_TIMEOUT_MS = 60_000;
 
-/** Runtime shape of `lib/doctor.mjs` exports consumed by this module. */
+/** Runtime shape of `server/doctor-core.mjs` exports consumed by this module. */
 export interface DoctorModule {
   MINIMUM_DSH: string;
   MINIMUM_PASEO: string;
@@ -475,9 +478,10 @@ function stackFrameDirs(): string[] {
 }
 
 /**
- * Locate `lib/doctor.mjs` across all execution environments:
- * source checkout (`paseo-plugin/server`), compiled harness trees
- * (`paseo-plugin/.dbg-xxx/server`), Paseo plugin-process, and explicit overrides.
+ * Locate an on-disk `lib/doctor.mjs` (used only when an explicit
+ * `options.doctorModulePath` test override is supplied, or by external callers
+ * resolving the standalone CLI module on disk). Production `DiagnosticsService`
+ * imports `server/doctor-core.mjs` statically so Paseo's bundler inlines it.
  */
 export function resolveDoctorModulePath(options?: {
   doctorModulePath?: string;
@@ -520,23 +524,65 @@ export function resolveDoctorModulePath(options?: {
   return undefined;
 }
 
-function readPluginVersionNear(doctorPath?: string): string | undefined {
-  if (doctorPath === undefined) return undefined;
-  const pkgPath = join(dirname(doctorPath), "..", "package.json");
+function readPackageVersion(pkgPath: string, requirePluginIdentity: boolean): string | undefined {
   try {
     const parsed: unknown = JSON.parse(readFileSync(pkgPath, "utf8"));
-    if (
-      parsed !== null &&
-      typeof parsed === "object" &&
-      !Array.isArray(parsed) &&
-      typeof (parsed as { version?: unknown }).version === "string"
-    ) {
-      const version = (parsed as { version: string }).version.trim();
-      return version === "" ? undefined : version;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const record = parsed as { name?: unknown; version?: unknown };
+    if (typeof record.version !== "string") return undefined;
+    const version = record.version.trim();
+    if (version === "") return undefined;
+    if (requirePluginIdentity) {
+      const isPluginPkg = record.name === "paseo-dsh" || existsSync(join(dirname(pkgPath), "paseo-plugin.json"));
+      if (!isPluginPkg) return undefined;
     }
+    return version;
   } catch {
-    /* optional metadata */
+    return undefined;
   }
+}
+
+/**
+ * Best-effort lookup of the plugin package version across source checkouts,
+ * compiled harness trees (`paseo-plugin/.dbg-xxx/server`), and explicit plugin
+ * directories. Cleanly returns `undefined` inside Paseo's eval'd server bundle
+ * when `package.json` is not on disk (Paseo's compiler boundary forbids static
+ * imports outside `server/`/`shared/`/`client/`).
+ */
+function discoverPluginVersion(options: {
+  doctorModulePath?: string;
+  pluginDir?: string;
+  env?: Readonly<Record<string, string | undefined>>;
+  cwd?: string;
+}): string | undefined {
+  if (options.doctorModulePath !== undefined) {
+    const fromDoctor = readPackageVersion(join(dirname(resolve(options.doctorModulePath)), "..", "package.json"), false);
+    if (fromDoctor !== undefined) return fromDoctor;
+  }
+  if (options.pluginDir !== undefined) {
+    const fromPluginDir = readPackageVersion(join(resolve(options.pluginDir), "package.json"), false);
+    if (fromPluginDir !== undefined) return fromPluginDir;
+  }
+  const envDir = (options.env ?? process.env)["PASEO_PLUGIN_DIR"];
+  if (typeof envDir === "string" && envDir.trim() !== "") {
+    const fromEnv = readPackageVersion(join(resolve(envDir), "package.json"), false);
+    if (fromEnv !== undefined) return fromEnv;
+  }
+  if (typeof __dirname === "string" && __dirname !== "") {
+    let dir = resolve(__dirname);
+    for (let depth = 0; depth <= 4; depth += 1) {
+      const version = readPackageVersion(join(dir, "package.json"), true);
+      if (version !== undefined) return version;
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  }
+  const cwd = options.cwd ?? process.cwd();
+  const fromCwd = readPackageVersion(join(cwd, "package.json"), true);
+  if (fromCwd !== undefined) return fromCwd;
+  const fromSubCwd = readPackageVersion(join(cwd, "paseo-plugin", "package.json"), true);
+  if (fromSubCwd !== undefined) return fromSubCwd;
   return undefined;
 }
 
@@ -558,6 +604,7 @@ export class DiagnosticsService {
   #doctorModulePromise: Promise<DoctorModule> | undefined;
   #doctorModulePath: string | undefined;
   #cachedPluginVersion: string | undefined;
+  #pluginVersionResolved = false;
   #inFlightDoctor: Promise<DoctorReport> | undefined;
   #activeAbort: AbortController | undefined;
   #disposed = false;
@@ -566,6 +613,7 @@ export class DiagnosticsService {
     this.#options = options;
     if (options.pluginVersion !== undefined) {
       this.#cachedPluginVersion = options.pluginVersion;
+      this.#pluginVersionResolved = true;
     }
   }
 
@@ -593,6 +641,9 @@ export class DiagnosticsService {
     if (this.#options.doctorModule !== undefined) {
       return this.#options.doctorModule;
     }
+    if (this.#options.doctorModulePath === undefined) {
+      return bundledDoctorModule;
+    }
     if (this.#doctorModulePromise !== undefined) {
       return this.#doctorModulePromise;
     }
@@ -603,9 +654,7 @@ export class DiagnosticsService {
       cwd: this.#cwd(),
     });
     if (resolved === undefined) {
-      throw new Error(
-        "could not locate lib/doctor.mjs; reinstall the dsh-paseo plugin from a complete package or checkout",
-      );
+      throw new Error(`could not locate doctor module at ${this.#options.doctorModulePath}`);
     }
     this.#doctorModulePath = resolved;
     const loading = nativeDynamicImport(pathToFileURL(resolved).href).then((mod) => {
@@ -614,7 +663,7 @@ export class DiagnosticsService {
         typeof candidate.inspectInstallFiles !== "function" ||
         typeof candidate.runDoctorChecksAsync !== "function"
       ) {
-        throw new Error(`lib/doctor.mjs at ${resolved} does not export inspectInstallFiles/runDoctorChecksAsync`);
+        throw new Error(`doctor module at ${resolved} does not export inspectInstallFiles/runDoctorChecksAsync`);
       }
       return candidate as DoctorModule;
     });
@@ -626,10 +675,15 @@ export class DiagnosticsService {
   }
 
   #pluginVersion(): string | undefined {
-    if (this.#cachedPluginVersion !== undefined) return this.#cachedPluginVersion;
-    const version = readPluginVersionNear(this.#doctorModulePath);
-    if (version !== undefined) this.#cachedPluginVersion = version;
-    return version;
+    if (this.#pluginVersionResolved) return this.#cachedPluginVersion;
+    this.#cachedPluginVersion = discoverPluginVersion({
+      doctorModulePath: this.#doctorModulePath ?? this.#options.doctorModulePath,
+      pluginDir: this.#options.pluginDir,
+      env: this.#env(),
+      cwd: this.#cwd(),
+    });
+    this.#pluginVersionResolved = true;
+    return this.#cachedPluginVersion;
   }
 
   #versionCacheKey(
@@ -1060,13 +1114,14 @@ export class DiagnosticsService {
             ? `Doctor check timed out after ${timeoutSec}s`
             : undefined;
 
+      const resolvedPluginVersion = winner.pluginVersion ?? pluginVersion;
       return {
         ok: !summary.blocking && !timedOut && error === undefined,
         ranAt: startedAt,
         durationMs,
         timedOut,
         sharedInFlight: false,
-        ...(winner.pluginVersion === undefined ? {} : { pluginVersion: winner.pluginVersion }),
+        ...(resolvedPluginVersion === undefined ? {} : { pluginVersion: resolvedPluginVersion }),
         profile: winner.profile,
         profileDir: winner.profileDir,
         displayProfileDir: shortPath(winner.profileDir),

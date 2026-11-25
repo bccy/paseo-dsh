@@ -239,11 +239,15 @@ mkdirSync(join(DEGRADED_PLUGIN, "lib"), { recursive: true });
 mkdirSync(join(DEGRADED_PLUGIN, "server"), { recursive: true });
 copyFileSync(join(HERE, "..", "paseo-plugin", "lib", "doctor.mjs"), join(DEGRADED_PLUGIN, "lib", "doctor.mjs"));
 copyFileSync(join(HERE, "..", "paseo-plugin", "package.json"), join(DEGRADED_PLUGIN, "package.json"));
-// The doctor imports the shared launcher resolver; the sandbox copy must carry
-// every runtime module it reaches, not just the file under test.
+// The doctor imports the shared launcher resolver and pure core; the sandbox
+// copy must carry every runtime module it reaches, not just the file under test.
 copyFileSync(
   join(HERE, "..", "paseo-plugin", "server", "dsh-command.mjs"),
   join(DEGRADED_PLUGIN, "server", "dsh-command.mjs"),
+);
+copyFileSync(
+  join(HERE, "..", "paseo-plugin", "server", "doctor-core.mjs"),
+  join(DEGRADED_PLUGIN, "server", "doctor-core.mjs"),
 );
 // Valid TypeScript that simply does not export `BRIDGE_FILES`: what a truncated
 // or half-written generated asset looks like to the doctor.
@@ -710,6 +714,10 @@ const check = (name, pass, detail) => {
   copyFileSync(
     join(HERE, "..", "paseo-plugin", "server", "dsh-command.mjs"),
     join(NO_PARSER_PLUGIN, "server", "dsh-command.mjs"),
+  );
+  copyFileSync(
+    join(HERE, "..", "paseo-plugin", "server", "doctor-core.mjs"),
+    join(NO_PARSER_PLUGIN, "server", "doctor-core.mjs"),
   );
   // The real asset file, so the bridge row is green and cannot be the reason a
   // verdict below differs between the two runs.

@@ -921,3 +921,277 @@ test("runDoctorChecks is pure/injectable and runDoctor CLI preserves exact outpu
   assert.match(failCli.stdout, /1 blocking issue\(s\)/);
   assert.match(failCli.stdout, /DSH skipped a patch entry/);
 });
+
+// ---- 8. Paseo bundled runtime regressions (zero lib/doctor.mjs lookup) -----
+
+test("bundled DiagnosticsService runs from isolated /tmp with zero lib/doctor.mjs reachable", async (t) => {
+  const { spawnSync } = require("node:child_process");
+  const ts = require("typescript");
+
+  const pluginRoot = path.resolve(__dirname, "..");
+  const isolatedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paseo-diag-bundled-"));
+  t.after(() => fs.rmSync(isolatedRoot, { recursive: true, force: true }));
+
+  const bundleDir = path.join(isolatedRoot, "bundle");
+  const daemonCwd = path.join(isolatedRoot, "daemon-cwd");
+  fs.mkdirSync(path.join(bundleDir, "server"), { recursive: true });
+  fs.mkdirSync(path.join(bundleDir, "shared"), { recursive: true });
+  fs.mkdirSync(daemonCwd, { recursive: true });
+  fs.writeFileSync(path.join(bundleDir, "package.json"), '{"type":"commonjs"}\n');
+
+  const transpileToCjs = (srcRel, outRel) => {
+    const srcPath = path.join(pluginRoot, srcRel);
+    const { outputText } = ts.transpileModule(fs.readFileSync(srcPath, "utf8"), {
+      compilerOptions: {
+        module: ts.ModuleKind.CommonJS,
+        target: ts.ScriptTarget.ES2022,
+        esModuleInterop: true,
+      },
+      fileName: srcPath,
+    });
+    fs.writeFileSync(path.join(bundleDir, outRel), outputText);
+  };
+
+  transpileToCjs("shared/diagnostics.ts", "shared/diagnostics.js");
+  transpileToCjs("server/bridge-assets.ts", "server/bridge-assets.js");
+  transpileToCjs("server/diagnostics.ts", "server/diagnostics.js");
+  fs.copyFileSync(path.join(pluginRoot, "server", "dsh-command.mjs"), path.join(bundleDir, "server", "dsh-command.mjs"));
+  fs.copyFileSync(path.join(pluginRoot, "server", "doctor-core.mjs"), path.join(bundleDir, "server", "doctor-core.mjs"));
+
+  // Explicitly ensure no lib/doctor.mjs exists anywhere in the isolated tree.
+  assert.equal(fs.existsSync(path.join(bundleDir, "lib", "doctor.mjs")), false);
+
+  const box = makeSandbox(t);
+  const dshPkg = makeFakePackageDsh(box.root, "0.2.2-rc.5");
+  // Mirror a real @deepseek-ai/dsh install carrying its own yaml parser.
+  fs.mkdirSync(path.join(dshPkg.pkgDir, "node_modules"), { recursive: true });
+  fs.symlinkSync(
+    path.join(pluginRoot, "node_modules", "yaml"),
+    path.join(dshPkg.pkgDir, "node_modules", "yaml"),
+    "dir",
+  );
+  const fakePaseo = path.join(dshPkg.binDir, "paseo");
+  fs.writeFileSync(
+    fakePaseo,
+    [
+      `#!${process.execPath}`,
+      'if (process.argv.includes("--version")) { console.log("0.17.4"); process.exit(0); }',
+      'if (process.argv[2] === "plugin" && process.argv[3] === "ls") { console.log("dsh-paseo  running  yes"); process.exit(0); }',
+      "process.exit(1);",
+      "",
+    ].join("\n"),
+  );
+  fs.chmodSync(fakePaseo, 0o755);
+
+  const runnerScript = path.join(isolatedRoot, "run-isolated.cjs");
+  fs.writeFileSync(
+    runnerScript,
+    [
+      '"use strict";',
+      'const assert = require("node:assert/strict");',
+      'const { diagnosticsOverviewSchema, doctorReportSchema } = require("./bundle/shared/diagnostics.js");',
+      'const { DiagnosticsService, resolveDoctorModulePath } = require("./bundle/server/diagnostics.js");',
+      "(async () => {",
+      "  const env = { PATH: process.env.TEST_BIN_DIR, DSH_HOME: process.env.TEST_DSH_HOME, PASEO_CLI: process.env.TEST_PASEO_CLI };",
+      "  assert.equal(resolveDoctorModulePath({ env, cwd: process.cwd() }), undefined, 'lib/doctor.mjs must not be reachable in isolated /tmp');",
+      "  const service = new DiagnosticsService({",
+      "    dshHome: process.env.TEST_DSH_HOME,",
+      "    profile: process.env.TEST_PROFILE,",
+      "    binary: process.env.TEST_DSH_LINK,",
+      "    env,",
+      "    cwd: process.cwd(),",
+      "    checkBundledPaseo: false,",
+      "  });",
+      "  const overview = diagnosticsOverviewSchema.parse(await service.overview());",
+      "  assert.equal(overview.hasIssues, false);",
+      '  assert.equal(overview.route.status, "configured");',
+      '  assert.equal(overview.credentials.status, "ready");',
+      '  assert.equal(overview.dsh.version, "0.2.2-rc.5");',
+      "  const report = doctorReportSchema.parse(await service.runDoctor());",
+      "  assert.equal(report.ok, true);",
+      "  assert.equal(report.summary.fail, 0);",
+      "  service.dispose();",
+      '  process.stdout.write(JSON.stringify({ overviewOk: !overview.hasIssues, reportOk: report.ok }) + "\\n");',
+      "})().catch((err) => { console.error(err); process.exit(1); });",
+      "",
+    ].join("\n"),
+  );
+
+  const child = spawnSync(process.execPath, [runnerScript], {
+    cwd: daemonCwd,
+    encoding: "utf8",
+    env: {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      NODE_PATH: path.join(pluginRoot, "node_modules"),
+      TEST_BIN_DIR: dshPkg.binDir,
+      TEST_DSH_HOME: box.dshHome,
+      TEST_DSH_LINK: dshPkg.link,
+      TEST_PASEO_CLI: fakePaseo,
+      TEST_PROFILE: PROFILE,
+    },
+    timeout: 15_000,
+  });
+
+  assert.equal(
+    child.status,
+    0,
+    `isolated /tmp DiagnosticsService failed (exit ${String(child.status)}):\nstdout: ${child.stdout}\nstderr: ${child.stderr}`,
+  );
+  const parsed = JSON.parse(child.stdout.trim());
+  assert.deepEqual(parsed, { overviewOk: true, reportOk: true });
+});
+
+test("eval-wrapped Paseo bundle shape (import.meta.url === undefined, no __dirname) runs cleanly", async (t) => {
+  const ts = require("typescript");
+  const pluginRoot = path.resolve(__dirname, "..");
+
+  const evalWrappedCjs = (source, filename, customRequire) => {
+    // Mirror Paseo's compiler-build.js: esbuild format:"cjs" strips import.meta to {}
+    // (so import.meta.url is undefined), and wrapCommonJsBundle wraps in
+    // `(function(require) { ... })` with NO __dirname / __filename parameters.
+    const sanitized = source.replace(/\bimport\.meta\.url\b/g, "undefined");
+    const { outputText } = ts.transpileModule(sanitized, {
+      compilerOptions: {
+        module: ts.ModuleKind.CommonJS,
+        target: ts.ScriptTarget.ES2022,
+        esModuleInterop: true,
+        allowJs: true,
+      },
+      // TypeScript forces ESM output for `.mjs` filenames even under CommonJS;
+      // use `.js` so transpileModule emits the CommonJS shape esbuild produces.
+      fileName: filename.replace(/\.mjs$/, ".js"),
+    });
+    const wrapped = `(function(require) {\nconst module = { exports: {} };\nconst exports = module.exports;\n${outputText}\nreturn module.exports;\n})`;
+    const factory = globalThis.eval(wrapped);
+    return factory(customRequire);
+  };
+
+  const dshCommandMod = evalWrappedCjs(
+    fs.readFileSync(path.join(pluginRoot, "server", "dsh-command.mjs"), "utf8"),
+    "dsh-command.mjs",
+    (spec) => require(spec),
+  );
+  const doctorCoreMod = evalWrappedCjs(
+    fs.readFileSync(path.join(pluginRoot, "server", "doctor-core.mjs"), "utf8"),
+    "doctor-core.mjs",
+    (spec) => {
+      if (spec === "./dsh-command.mjs") return dshCommandMod;
+      if (spec === "yaml" || spec === "js-yaml") {
+        // Simulate a Paseo host process without yaml installed so doctor-core
+        // must fall back to DSH's own yaml parser cleanly.
+        const err = new Error(`Cannot find module '${spec}'`);
+        err.code = "MODULE_NOT_FOUND";
+        throw err;
+      }
+      return require(spec);
+    },
+  );
+  const sharedDiagMod = require("../shared/diagnostics.ts");
+  const bridgeAssetsMod = require("../server/bridge-assets.ts");
+  const bundledDiagMod = evalWrappedCjs(
+    fs.readFileSync(path.join(pluginRoot, "server", "diagnostics.ts"), "utf8"),
+    "diagnostics.ts",
+    (spec) => {
+      if (spec === "./doctor-core.mjs") return doctorCoreMod;
+      if (spec === "./dsh-command.mjs") return dshCommandMod;
+      if (spec === "./bridge-assets") return bridgeAssetsMod;
+      if (spec === "../shared/diagnostics") return sharedDiagMod;
+      if (spec.includes("lib/doctor")) {
+        throw new Error(`unexpected runtime load of ${spec}`);
+      }
+      return require(spec);
+    },
+  );
+
+  const box = makeSandbox(t);
+  const dshPkg = makeFakePackageDsh(box.root, "0.2.2-rc.5");
+  fs.mkdirSync(path.join(dshPkg.pkgDir, "node_modules"), { recursive: true });
+  fs.symlinkSync(
+    path.join(pluginRoot, "node_modules", "yaml"),
+    path.join(dshPkg.pkgDir, "node_modules", "yaml"),
+    "dir",
+  );
+  const isolatedCwd = path.join(box.root, "empty-cwd");
+  fs.mkdirSync(isolatedCwd, { recursive: true });
+
+  const service = new bundledDiagMod.DiagnosticsService({
+    dshHome: box.dshHome,
+    profile: PROFILE,
+    binary: dshPkg.link,
+    env: { PATH: dshPkg.binDir, DSH_HOME: box.dshHome },
+    cwd: isolatedCwd,
+    checkBundledPaseo: false,
+    runner: makeHealthyRunner(),
+  });
+
+  const overview = diagnosticsOverviewSchema.parse(await service.overview());
+  assert.equal(overview.hasIssues, false);
+  assert.equal(overview.route.status, "configured");
+  assert.equal(overview.credentials.status, "ready");
+  assert.equal(overview.pluginVersion, undefined, "missing package.json in eval bundle cleanly omits pluginVersion");
+
+  const report = doctorReportSchema.parse(await service.runDoctor());
+  assert.equal(report.ok, true);
+  assert.equal(report.summary.fail, 0);
+  service.dispose();
+});
+
+test("options.doctorModule and options.doctorModulePath overrides remain supported", async (t) => {
+  const box = makeSandbox(t);
+  const dshPkg = makeFakePackageDsh(box.root, "0.2.2-rc.5");
+
+  // 1. In-memory options.doctorModule override
+  let inspectCalls = 0;
+  const realDoctor = await loadDoctor();
+  const stubService = new DiagnosticsService({
+    dshHome: box.dshHome,
+    profile: PROFILE,
+    binary: dshPkg.link,
+    env: { PATH: dshPkg.binDir, DSH_HOME: box.dshHome },
+    checkBundledPaseo: false,
+    runner: makeHealthyRunner(),
+    doctorModule: {
+      ...realDoctor,
+      inspectInstallFiles(opts) {
+        inspectCalls += 1;
+        return realDoctor.inspectInstallFiles(opts);
+      },
+    },
+  });
+  const stubOverview = diagnosticsOverviewSchema.parse(await stubService.overview());
+  assert.equal(stubOverview.hasIssues, false);
+  assert.equal(inspectCalls, 1, "options.doctorModule override must be invoked");
+  stubService.dispose();
+
+  // 2. Explicit options.doctorModulePath override pointing to an existing .mjs file
+  const pathService = new DiagnosticsService({
+    dshHome: box.dshHome,
+    profile: PROFILE,
+    binary: dshPkg.link,
+    env: { PATH: dshPkg.binDir, DSH_HOME: box.dshHome },
+    checkBundledPaseo: false,
+    runner: makeHealthyRunner(),
+    doctorModulePath: DOCTOR_MJS,
+  });
+  const pathOverview = diagnosticsOverviewSchema.parse(await pathService.overview());
+  assert.equal(pathOverview.hasIssues, false);
+  assert.ok(pathOverview.pluginVersion, "doctorModulePath resolves sibling package.json version");
+  pathService.dispose();
+
+  // 3. Explicit nonexistent options.doctorModulePath fails loudly instead of falling back
+  const missingPath = path.join(box.root, "does-not-exist", "doctor.mjs");
+  const badService = new DiagnosticsService({
+    dshHome: box.dshHome,
+    profile: PROFILE,
+    binary: dshPkg.link,
+    env: { PATH: dshPkg.binDir, DSH_HOME: box.dshHome },
+    checkBundledPaseo: false,
+    doctorModulePath: missingPath,
+  });
+  await assert.rejects(() => badService.overview(), /could not locate doctor module/);
+  const badReport = doctorReportSchema.parse(await badService.runDoctor());
+  assert.equal(badReport.ok, false);
+  assert.match(badReport.error ?? "", /could not locate doctor module/);
+  badService.dispose();
+});
