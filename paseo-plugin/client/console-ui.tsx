@@ -518,6 +518,7 @@ export function SegmentedControl<T extends string>({
         {
           flexDirection: "row",
           flexWrap: fullWidth ? "nowrap" : "wrap",
+          ...(fullWidth ? { width: "100%" } : { flexShrink: 0 }),
           padding: 2,
           borderRadius: radius.md,
           backgroundColor: tint(colors.foreground, 0.06),
@@ -537,7 +538,7 @@ export function SegmentedControl<T extends string>({
             disabled={disabled}
             onPress={() => onChange(option.value)}
             style={(state) => ({
-              flex: fullWidth ? 1 : undefined,
+              ...(fullWidth ? { flex: 1, minWidth: 0 } : { flexShrink: 0 }),
               paddingHorizontal: space.md,
               height,
               flexDirection: "row",

@@ -1,3 +1,4 @@
+import * as React from "react";
 import {
   useMemo,
   useRef,
@@ -167,6 +168,59 @@ const uiExports = PaseoUi as Record<string, unknown>;
  */
 export const HostTextInput = PaseoUi.TextInput;
 
+const REACT_FRAGMENT_SYMBOL =
+  typeof Symbol === "function" ? Symbol.for("react.fragment") : undefined;
+
+let cachedFragmentType: unknown;
+let resolvedFragmentType = false;
+
+function getFragmentType(): unknown {
+  if (!resolvedFragmentType) {
+    resolvedFragmentType = true;
+    cachedFragmentType = (<></>).type;
+  }
+  return cachedFragmentType;
+}
+
+function isFragmentElement(node: unknown): node is { props?: { children?: ReactNode } } {
+  if (typeof node !== "object" || node === null) return false;
+  const type = (node as { type?: unknown }).type;
+  if (type === undefined || type === null) return false;
+  const jsxFragment = getFragmentType();
+  return (
+    (jsxFragment !== undefined && type === jsxFragment) ||
+    (React.Fragment !== undefined && type === React.Fragment) ||
+    type === "Fragment" ||
+    (REACT_FRAGMENT_SYMBOL !== undefined && type === REACT_FRAGMENT_SYMBOL)
+  );
+}
+
+/**
+ * Flatten top-level and nested React Fragments / arrays into direct row children
+ * so Paseo's native `SettingsCard` (`React.Children.toArray`) sees every row
+ * individually and renders its native `rowBorder` divider between rows.
+ */
+export function flattenSettingsCardChildren(
+  node: ReactNode,
+  out: ReactNode[] = [],
+): ReactNode[] {
+  if (node === null || node === undefined || typeof node === "boolean") {
+    return out;
+  }
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      flattenSettingsCardChildren(item, out);
+    }
+    return out;
+  }
+  if (isFragmentElement(node)) {
+    flattenSettingsCardChildren(node.props?.children, out);
+    return out;
+  }
+  out.push(node);
+  return out;
+}
+
 /**
  * Render Paseo's native `SettingsCard` when exported by the host (>=0.17 / 0.16.x),
  * falling back to a matching React Native `View` container on older hosts or minimal mocks.
@@ -176,11 +230,19 @@ export function renderHostSettingsCard(
   children: ReactNode,
   testID?: string,
 ): ReactNode {
+  const rows = flattenSettingsCardChildren(children);
   const CardComp = uiExports["SettingsCard"] as
-    | ComponentType<{ children: ReactNode; testID?: string }>
+    | ComponentType<{ children?: ReactNode; testID?: string }>
     | undefined;
   if (isHostComponent(CardComp) && CardComp) {
-    return <CardComp testID={testID}>{children}</CardComp>;
+    if (typeof React.createElement === "function") {
+      return React.createElement(CardComp, testID !== undefined ? { testID } : null, ...rows);
+    }
+    return (
+      <CardComp testID={testID}>
+        {rows.length === 0 ? null : rows.length === 1 ? rows[0] : rows}
+      </CardComp>
+    );
   }
   return (
     <View
@@ -190,11 +252,19 @@ export function renderHostSettingsCard(
         borderWidth: 1,
         borderColor: colors.border,
         borderRadius: 12,
-        padding: 14,
-        gap: 12,
+        overflow: "hidden",
       }}
     >
-      {children}
+      {rows.map((row, index) => (
+        <View
+          key={index}
+          style={
+            index > 0 ? { borderTopWidth: 1, borderTopColor: colors.border } : undefined
+          }
+        >
+          {row}
+        </View>
+      ))}
     </View>
   );
 }
@@ -223,16 +293,23 @@ export function renderHostSettingsRow(
   }
   const sideBySide = inline && !compact;
   return (
-    <View testID={testID} style={{ gap: 6 }}>
+    <View
+      testID={testID}
+      style={{
+        paddingHorizontal: 16,
+        paddingVertical: compact ? 14 : 16,
+        gap: 6,
+      }}
+    >
       <View
         style={{
           flexDirection: sideBySide ? "row" : "column",
           alignItems: sideBySide ? "center" : "stretch",
           justifyContent: sideBySide ? "space-between" : "flex-start",
-          gap: sideBySide ? 12 : 6,
+          gap: sideBySide ? 12 : 8,
         }}
       >
-        <View style={{ flex: sideBySide ? 1 : undefined, gap: 3 }}>
+        <View style={{ flex: sideBySide ? 1 : undefined, minWidth: 0, gap: 3 }}>
           <Text
             style={{
               color: colors.foreground,
@@ -713,8 +790,30 @@ export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
         minWidth: 84,
         textAlign: "right" as const,
       },
-      presetRow: { flexDirection: "row" as const, flexWrap: "wrap" as const, gap: 8 },
+      presetRow: {
+        flexDirection: "row" as const,
+        flexWrap: compact ? ("nowrap" as const) : ("wrap" as const),
+        gap: 8,
+        ...(compact ? { width: "100%" as const } : { flexShrink: 0 }),
+      },
+      presetStackedRow: {
+        paddingHorizontal: 16,
+        paddingVertical: 14,
+        gap: 10,
+      },
+      presetStackedHeader: { gap: 3 },
+      presetStackedLabel: {
+        color: colors.foreground,
+        fontSize: 13,
+        fontWeight: "600" as const,
+      },
+      presetStackedHint: {
+        color: colors.foregroundMuted,
+        fontSize: 12,
+        lineHeight: 17,
+      },
       presetButton: {
+        ...(compact ? { flex: 1, minWidth: 0, alignItems: "center" as const } : { flexShrink: 0 }),
         borderWidth: 1,
         borderColor: colors.border,
         borderRadius: 8,
@@ -802,11 +901,14 @@ export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
       {renderHostSettingsCard(
         colors,
         <>
-          {renderHostSettingsRow(colors, {
-            label: text.presets.label,
-            hint: styleCtrl.activePreset === null ? text.presets.custom : text.presets.hint,
-            compact,
-            children: (
+          {compact ? (
+            <View style={styles.presetStackedRow}>
+              <View style={styles.presetStackedHeader}>
+                <Text style={styles.presetStackedLabel}>{text.presets.label}</Text>
+                <Text style={styles.presetStackedHint}>
+                  {styleCtrl.activePreset === null ? text.presets.custom : text.presets.hint}
+                </Text>
+              </View>
               <View style={styles.presetRow}>
                 {TIMELINE_PRESET_KEYS.map((presetKey) => {
                   const selected = styleCtrl.activePreset === presetKey;
@@ -831,6 +933,7 @@ export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
                       ]}
                     >
                       <Text
+                        numberOfLines={1}
                         style={[
                           styles.presetLabel,
                           selected ? styles.presetLabelSelected : null,
@@ -842,36 +945,77 @@ export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
                   );
                 })}
               </View>
-            ),
-          })}
+            </View>
+          ) : (
+            renderHostSettingsRow(colors, {
+              label: text.presets.label,
+              hint: styleCtrl.activePreset === null ? text.presets.custom : text.presets.hint,
+              compact,
+              inline: true,
+              children: (
+                <View style={styles.presetRow}>
+                  {TIMELINE_PRESET_KEYS.map((presetKey) => {
+                    const selected = styleCtrl.activePreset === presetKey;
+                    const presetLabel = text.presets[presetKey];
+                    return (
+                      <Pressable
+                        key={`preset-${presetKey}`}
+                        accessibilityRole="button"
+                        accessibilityState={{ selected, disabled: !styleCtrl.canSave }}
+                        accessibilityLabel={presetLabel}
+                        disabled={!styleCtrl.canSave}
+                        onPress={() => {
+                          langCtrl.clearFailed();
+                          guardAsync(`timeline preset ${presetKey}`, () =>
+                            styleCtrl.applyPreset(presetKey),
+                          );
+                        }}
+                        style={[
+                          styles.presetButton,
+                          selected ? styles.presetButtonSelected : null,
+                          styleCtrl.canSave ? null : styles.buttonDisabled,
+                        ]}
+                      >
+                        <Text
+                          numberOfLines={1}
+                          style={[
+                            styles.presetLabel,
+                            selected ? styles.presetLabelSelected : null,
+                          ]}
+                        >
+                          {presetLabel}
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              ),
+            })
+          )}
 
           {TIMELINE_STYLE_KEYS.map((key) => {
             const fieldCopy = text.fields[key];
-            return (
-              <View key={key}>
-                {renderHostSettingsRow(colors, {
-                  label: fieldCopy.label,
-                  hint: fieldCopy.hint,
-                  compact,
-                  inline: true,
-                  children: (
-                    <HostTextInput
-                      value={styleCtrl.textOf(key)}
-                      editable={!styleCtrl.saving}
-                      onChangeText={(value: string) => {
-                        langCtrl.clearFailed();
-                        styleCtrl.edit(key, value);
-                      }}
-                      keyboardType={keyboardTypeFor(key)}
-                      autoCapitalize="none"
-                      autoCorrect={false}
-                      accessibilityLabel={fieldCopy.label}
-                      style={styles.input}
-                    />
-                  ),
-                })}
-              </View>
-            );
+            return renderHostSettingsRow(colors, {
+              label: fieldCopy.label,
+              hint: fieldCopy.hint,
+              compact,
+              inline: true,
+              children: (
+                <HostTextInput
+                  value={styleCtrl.textOf(key)}
+                  editable={!styleCtrl.saving}
+                  onChangeText={(value: string) => {
+                    langCtrl.clearFailed();
+                    styleCtrl.edit(key, value);
+                  }}
+                  keyboardType={keyboardTypeFor(key)}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  accessibilityLabel={fieldCopy.label}
+                  style={styles.input}
+                />
+              ),
+            });
           })}
         </>,
       )}

@@ -15,7 +15,7 @@ import type { PluginHostProps } from "@getpaseo/plugin/client";
 import { TIMELINE_STYLE_KEYS } from "../shared/settings";
 import type { Currency } from "./console-format";
 import { font, radius, space, tabular, tint, type Colors, type Tone } from "./console-theme";
-import { Badge, Button, Callout, Divider, Muted, SegmentedControl } from "./console-ui";
+import { Badge, Button, Callout, Muted, SegmentedControl } from "./console-ui";
 import type { Locale, TimelinePresetKey } from "./locale";
 import {
   HostTextInput,
@@ -121,7 +121,10 @@ function SectionHeading({
         gap: space.sm,
       }}
     >
-      <Text accessibilityRole="header" style={{ ...font.heading, color: colors.foreground }}>
+      <Text
+        accessibilityRole="header"
+        style={{ ...font.heading, color: colors.foreground, flexShrink: 1 }}
+      >
         {title}
       </Text>
       {trailing ?? null}
@@ -199,7 +202,8 @@ function EnvironmentSection({
                   flexDirection: "row",
                   alignItems: "center",
                   gap: space.sm,
-                  paddingVertical: space.sm,
+                  paddingHorizontal: space.lg,
+                  paddingVertical: 14,
                 }}
               >
                 <ActivityIndicator size="small" color={colors.accent} />
@@ -286,8 +290,13 @@ function EnvironmentSection({
               : null}
 
             {environment.doctorChecks && environment.doctorChecks.length > 0 ? (
-              <View style={{ gap: space.sm, paddingTop: space.xs }}>
-                <Divider colors={colors} />
+              <View
+                style={{
+                  gap: space.sm,
+                  paddingHorizontal: space.lg,
+                  paddingVertical: 14,
+                }}
+              >
                 {environment.doctorChecks.map((item) => (
                   <View
                     key={item.id}
@@ -495,7 +504,16 @@ function GeneralAndCostSection({
             compact,
             inline: true,
             children: (
-              <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
+              <View
+                style={{
+                  flexDirection: "row",
+                  flexWrap: "wrap",
+                  alignItems: "center",
+                  justifyContent: "flex-end",
+                  gap: space.sm,
+                  flexShrink: 0,
+                }}
+              >
                 <HostTextInput
                   value={rateText}
                   editable={canChangeRate}
@@ -513,7 +531,8 @@ function GeneralAndCostSection({
                     borderRadius: radius.md,
                     paddingHorizontal: space.sm + 2,
                     paddingVertical: 6,
-                    minWidth: 82,
+                    width: compact ? 76 : 86,
+                    minWidth: compact ? 76 : 86,
                     textAlign: "right",
                     ...font.small,
                     ...tabular,
@@ -552,7 +571,16 @@ function GeneralAndCostSection({
                 compact,
                 inline: true,
                 children: (
-                  <View style={{ flexDirection: "row", alignItems: "center", gap: space.sm }}>
+                  <View
+                    style={{
+                      flexDirection: "row",
+                      flexWrap: "wrap",
+                      alignItems: "center",
+                      justifyContent: "flex-end",
+                      gap: space.sm,
+                      flexShrink: 0,
+                    }}
+                  >
                     {pricing?.hasCustomOverrides ? (
                       <Badge
                         colors={colors}
@@ -601,17 +629,71 @@ function TimelineDisplaySection({
   const saveErrorMessage = styleCtrl.saveError;
   const feedback = styleCtrl.feedback;
 
+  const statusBadge =
+    feedback?.kind === "saved" ? (
+      <Badge
+        colors={colors}
+        tone="success"
+        icon="CircleCheck"
+        label={settingsCopy.saved}
+        testID="dsh-timeline-feedback-badge"
+      />
+    ) : feedback?.kind === "reset" ? (
+      <Badge
+        colors={colors}
+        tone="success"
+        icon="RotateCcw"
+        label={settingsCopy.resetDone}
+        testID="dsh-timeline-feedback-badge"
+      />
+    ) : null;
+
+  const showHeaderStatus = !advancedOpen && statusBadge !== null;
+  const showCustomBadge = styleCtrl.activePreset === null;
+  const headingTrailing =
+    showCustomBadge || showHeaderStatus ? (
+      <View
+        style={{
+          flexDirection: "row",
+          alignItems: "center",
+          flexWrap: "wrap",
+          justifyContent: "flex-end",
+          gap: space.xs,
+          flexShrink: 0,
+        }}
+      >
+        {showHeaderStatus ? statusBadge : null}
+        {showCustomBadge ? (
+          <Badge colors={colors} tone="accent" label={settingsCopy.presets.custom} />
+        ) : null}
+      </View>
+    ) : null;
+
+  const presetControl = (
+    <SegmentedControl<TimelinePresetKey | "">
+      colors={colors}
+      value={styleCtrl.activePreset ?? ""}
+      options={presetOptions}
+      size="sm"
+      fullWidth={compact}
+      style={compact ? { width: "100%" } : undefined}
+      testID="dsh-timeline-presets"
+      onChange={(presetKey) => {
+        if (presetKey === "") return;
+        guardAsync(`timeline preset ${presetKey}`, () =>
+          styleCtrl.applyPreset(presetKey),
+        );
+      }}
+    />
+  );
+
   return (
     <View style={{ gap: space.md }}>
       <View style={{ gap: space.xs }}>
         <SectionHeading
           colors={colors}
           title={sectionCopy.title}
-          trailing={
-            styleCtrl.activePreset === null ? (
-              <Badge colors={colors} tone="accent" label={settingsCopy.presets.custom} />
-            ) : null
-          }
+          trailing={headingTrailing}
         />
         <Muted colors={colors}>{sectionCopy.intro}</Muted>
       </View>
@@ -619,31 +701,38 @@ function TimelineDisplaySection({
       {renderHostSettingsCard(
         colors,
         <>
-          {renderHostSettingsRow(colors, {
-            label: settingsCopy.presets.label,
-            hint: settingsCopy.presets.hint,
-            compact,
-            inline: !compact,
-            children: (
-              <SegmentedControl<TimelinePresetKey | "">
-                colors={colors}
-                value={styleCtrl.activePreset ?? ""}
-                options={presetOptions}
-                size="sm"
-                fullWidth={compact}
-                onChange={(presetKey) => {
-                  if (presetKey === "") return;
-                  guardAsync(`timeline preset ${presetKey}`, () =>
-                    styleCtrl.applyPreset(presetKey),
-                  );
-                }}
-              />
-            ),
-          })}
-
-          <Divider colors={colors} />
+          {compact ? (
+            <View
+              testID="dsh-timeline-presets-row"
+              style={{
+                paddingHorizontal: space.lg,
+                paddingVertical: 14,
+                gap: 10,
+              }}
+            >
+              <View style={{ gap: 2 }}>
+                <Text style={{ ...font.body, fontWeight: "600", color: colors.foreground }}>
+                  {settingsCopy.presets.label}
+                </Text>
+                <Muted colors={colors} small>
+                  {settingsCopy.presets.hint}
+                </Muted>
+              </View>
+              {presetControl}
+            </View>
+          ) : (
+            renderHostSettingsRow(colors, {
+              label: settingsCopy.presets.label,
+              hint: settingsCopy.presets.hint,
+              compact,
+              inline: true,
+              testID: "dsh-timeline-presets-row",
+              children: presetControl,
+            })
+          )}
 
           <Pressable
+            testID="dsh-timeline-advanced-toggle"
             accessibilityRole="button"
             accessibilityState={{ expanded: advancedOpen }}
             accessibilityLabel={settingsCopy.advanced.title}
@@ -653,9 +742,8 @@ function TimelineDisplaySection({
               alignItems: "center",
               justifyContent: "space-between",
               gap: space.md,
-              paddingVertical: space.sm,
-              paddingHorizontal: space.xs,
-              borderRadius: radius.md,
+              paddingHorizontal: space.lg,
+              paddingVertical: 14,
               backgroundColor:
                 state.pressed || Boolean((state as { hovered?: boolean }).hovered)
                   ? tint(colors.foreground, 0.05)
@@ -670,7 +758,14 @@ function TimelineDisplaySection({
                 {settingsCopy.advanced.hint}
               </Muted>
             </View>
-            <View style={{ flexDirection: "row", alignItems: "center", gap: space.xs }}>
+            <View
+              style={{
+                flexDirection: "row",
+                alignItems: "center",
+                gap: space.xs,
+                flexShrink: 0,
+              }}
+            >
               <Text style={{ ...font.caption, fontWeight: "500", color: colors.foregroundMuted }}>
                 {advancedOpen ? settingsCopy.advanced.collapse : settingsCopy.advanced.expand}
               </Text>
@@ -681,77 +776,89 @@ function TimelineDisplaySection({
           </Pressable>
 
           {advancedOpen ? (
-            <View style={{ gap: space.md, paddingTop: space.xs }}>
+            <>
               {TIMELINE_STYLE_KEYS.map((key) => {
                 const fieldCopy = settingsCopy.fields[key];
-                return (
-                  <View key={key}>
-                    {renderHostSettingsRow(colors, {
-                      label: fieldCopy.label,
-                      hint: fieldCopy.hint,
-                      compact,
-                      inline: true,
-                      children: (
-                        <HostTextInput
-                          value={styleCtrl.textOf(key)}
-                          editable={!styleCtrl.saving}
-                          onChangeText={(value: string) => styleCtrl.edit(key, value)}
-                          keyboardType={keyboardTypeFor(key)}
-                          autoCapitalize="none"
-                          autoCorrect={false}
-                          accessibilityLabel={fieldCopy.label}
-                          style={{
-                            borderWidth: 1,
-                            borderColor: colors.border,
-                            borderRadius: radius.md,
-                            paddingHorizontal: space.sm + 2,
-                            paddingVertical: compact ? 7 : 8,
-                            minWidth: 86,
-                            textAlign: "right",
-                            ...font.small,
-                            ...tabular,
-                            color: colors.foreground,
-                            backgroundColor: colors.surface0,
-                          }}
-                        />
-                      ),
-                    })}
-                  </View>
-                );
+                return renderHostSettingsRow(colors, {
+                  label: fieldCopy.label,
+                  hint: fieldCopy.hint,
+                  compact,
+                  inline: true,
+                  children: (
+                    <HostTextInput
+                      value={styleCtrl.textOf(key)}
+                      editable={!styleCtrl.saving}
+                      onChangeText={(value: string) => styleCtrl.edit(key, value)}
+                      keyboardType={keyboardTypeFor(key)}
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      accessibilityLabel={fieldCopy.label}
+                      style={{
+                        borderWidth: 1,
+                        borderColor: colors.border,
+                        borderRadius: radius.md,
+                        paddingHorizontal: space.sm + 2,
+                        paddingVertical: compact ? 7 : 8,
+                        width: compact ? 80 : 88,
+                        minWidth: compact ? 80 : 88,
+                        textAlign: "right",
+                        ...font.small,
+                        ...tabular,
+                        color: colors.foreground,
+                        backgroundColor: colors.surface0,
+                      }}
+                    />
+                  ),
+                });
               })}
 
               <View
+                testID="dsh-timeline-advanced-footer"
                 style={{
                   flexDirection: "row",
                   flexWrap: "wrap",
                   alignItems: "center",
+                  justifyContent: "space-between",
                   gap: space.sm,
-                  paddingTop: space.xs,
+                  paddingHorizontal: space.lg,
+                  paddingVertical: 14,
                 }}
               >
-                <Button
-                  colors={colors}
-                  variant="primary"
-                  size="sm"
-                  icon="Check"
-                  label={styleCtrl.saving ? settingsCopy.saving : settingsCopy.save}
-                  accessibilityLabel={settingsCopy.save}
-                  loading={styleCtrl.saving}
-                  disabled={!styleCtrl.canSave}
-                  onPress={() => guardAsync("settings save", styleCtrl.save)}
-                />
-                <Button
-                  colors={colors}
-                  variant="secondary"
-                  size="sm"
-                  icon="RotateCcw"
-                  label={settingsCopy.reset}
-                  accessibilityLabel={settingsCopy.reset}
-                  disabled={!styleCtrl.canReset}
-                  onPress={() => guardAsync("settings reset", styleCtrl.reset)}
-                />
+                <View style={{ flexDirection: "row", alignItems: "center", flexShrink: 1 }}>
+                  {statusBadge}
+                </View>
+                <View
+                  style={{
+                    flexDirection: "row",
+                    alignItems: "center",
+                    gap: space.sm,
+                    marginLeft: "auto",
+                  }}
+                >
+                  <Button
+                    colors={colors}
+                    variant="secondary"
+                    size="sm"
+                    icon="RotateCcw"
+                    label={settingsCopy.reset}
+                    accessibilityLabel={settingsCopy.reset}
+                    disabled={!styleCtrl.canReset}
+                    onPress={() => guardAsync("settings reset", styleCtrl.reset)}
+                  />
+                  <Button
+                    colors={colors}
+                    variant="primary"
+                    size="sm"
+                    icon="Check"
+                    label={styleCtrl.saving ? settingsCopy.saving : settingsCopy.save}
+                    accessibilityLabel={settingsCopy.save}
+                    loading={styleCtrl.saving}
+                    disabled={!styleCtrl.canSave}
+                    onPress={() => guardAsync("settings save", styleCtrl.save)}
+                  />
+                </View>
               </View>
-            </View>
+            </>
           ) : null}
         </>,
         "dsh-console-timeline-card",
@@ -769,17 +876,9 @@ function TimelineDisplaySection({
         <Callout colors={colors} tone="danger" icon="CircleAlert" title={saveErrorMessage} />
       ) : null}
 
-      {feedback === null ? null : feedback.kind === "saved" ? (
-        <View style={{ flexDirection: "row", alignItems: "center" }}>
-          <Badge colors={colors} tone="success" icon="CircleCheck" label={settingsCopy.saved} />
-        </View>
-      ) : feedback.kind === "reset" ? (
-        <View style={{ flexDirection: "row", alignItems: "center" }}>
-          <Badge colors={colors} tone="success" icon="RotateCcw" label={settingsCopy.resetDone} />
-        </View>
-      ) : feedback.kind === "validationError" ? (
+      {feedback === null ? null : feedback.kind === "validationError" ? (
         <Callout colors={colors} tone="danger" icon="CircleAlert" title={feedback.message} />
-      ) : saveErrorMessage === null ? (
+      ) : feedback.kind === "fallbackError" && saveErrorMessage === null ? (
         <Callout
           colors={colors}
           tone="danger"
