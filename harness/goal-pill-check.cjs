@@ -96,6 +96,7 @@ const {
   goalIconName,
   goalPanelNext,
   goalPillCopy,
+  goalPillMark,
   goalPillPresentation,
   goalRunningMark,
   goalSeenKey,
@@ -514,6 +515,20 @@ console.log("\nthe running mark follows the design's truth table");
   equal("at the hold boundary", goalRunningMark({ ...idle, now: 2000 }), false);
 }
 
+/* The trigger's mark (the icon the registration swaps) ---------------------- */
+
+console.log("\nthe trigger's mark: the running ring outranks the tone");
+{
+  // The registration swaps a stable icon component per mark; the mark is what
+  // F-01's status-only upsert changes (the running ring is not a tone — the
+  // glyph keeps its normal colour under the ring).
+  equal("a running goal wears the running mark", goalPillMark("normal", true), "running");
+  equal("…even if its tone is not normal", goalPillMark("warning", true), "running");
+  for (const tone of ["normal", "warning", "error", "success"]) {
+    equal(`a ${tone} goal without the ring keeps its tone`, goalPillMark(tone, false), tone);
+  }
+}
+
 /* The trigger glyph's colour ------------------------------------------------ */
 
 console.log("\nthe trigger glyph is muted, warning or danger");
@@ -675,6 +690,23 @@ console.log("\nthe trigger and popover wiring");
   // The static glyph's name comes from the pure rule (Target, or the completed
   // check), asserted behaviourally above; this pins the call site.
   assert("the static glyph's name comes from goalIconName", /name=\{goalIconName\(tone\)\}/.test(pill));
+  // F-01 (2026-11-26): the running mark's data source is the agent directory
+  // push, folded through the hold machine in `client/goal-running.tsx` — not a
+  // `useAgent` second reader inside the icon (that reader never repainted the
+  // composer pill). The mark then swaps a stable icon component via `update`.
+  assert(
+    "the directory status is folded into the running hold machine",
+    /goalRunningStep\(previous, status, Date\.now\(\)\)/.test(pill) && /agent\.status as GoalAgentStatus/.test(pill),
+  );
+  assert(
+    "a status-only upsert re-presents the pill",
+    /if \(seen\.observe\(agent\) \|\| statusChanged\) present\(agent\.id\);/.test(pill),
+  );
+  assert("the trigger icon is swapped by mark through the update", /icon: goalPillIcon\(mark\)/.test(pill));
+  assert(
+    "one stable icon component per mark (no store read inside the icon)",
+    /const GOAL_ICONS: Record<GoalPillMark,/.test(pill) && !/export function makeGoalIcon/.test(pill) && !/useAgent\(/.test(pill),
+  );
   // The objective row is the host's track row and the edit entry.
   assert("the objective row is a track row", /goalTrackRow\(compact\)/.test(popover));
   assert("the objective is one truncated line", /numberOfLines=\{1\}[\s\S]{0,400}?\{goal\.objective\}/.test(popover));
@@ -775,8 +807,8 @@ console.log("\nthe goal popover's close is confirmed, not assumed");
   assert("…and is imported, not copied, from ./seen-close-gate", /from "\.\/seen-close-gate"/.test(pill));
   assert("…the old unmount-is-a-close effect is gone", !/useEffect\(\(\) => \(\) => onClosed\(/.test(pill));
   assert("no pill file re-implements the gate", !/function createSeenCloseGate/.test(pill + teamPill));
-  assert("present publishes only a real change (visible/label/title)",
-    /before\.visible === presentation\.visible && before\.label === label && before\.title === title/.test(pill));
+  assert("present publishes only a real change (visible/label/title/mark)",
+    /before\.visible === presentation\.visible &&\s*before\.label === label &&\s*before\.title === title &&\s*before\.mark === mark/.test(pill));
 }
 
 /* The poll cadence is the jobs pill's ---------------------------------------- */

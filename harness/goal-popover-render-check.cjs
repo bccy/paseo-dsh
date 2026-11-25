@@ -92,18 +92,12 @@ const stubSource = [
 ].join("\n");
 fs.writeFileSync(stub, stubSource);
 
-// The container (`makeGoalPopover`) reads the agent's status through the plugin
-// SDK's `useAgent`, a host hook; this stand-in answers "idle", which is all the
-// panel's close/stay behaviour needs.
-const clientStub = path.join(work, "client-stub.ts");
-fs.writeFileSync(clientStub, "export function useAgent() { return \"idle\"; }\n");
-
 const entry = path.join(work, "entry.tsx");
 fs.writeFileSync(
   entry,
   `export { GoalPopoverBody } from ${JSON.stringify(path.join(pluginRoot, "client/goal-popover.tsx"))};
 export { allText } from ${JSON.stringify(path.join(pluginRoot, "client/locale.ts"))};
-export { makeGoalPopover, makeGoalIcon, contributeGoalPill } from ${JSON.stringify(path.join(pluginRoot, "client/goal-pill.tsx"))};
+export { makeGoalPopover, goalPillIcon, contributeGoalPill } from ${JSON.stringify(path.join(pluginRoot, "client/goal-pill.tsx"))};
 export { SEEN_CLOSE_CONFIRM_MS } from ${JSON.stringify(path.join(pluginRoot, "client/seen-close-gate.ts"))};
 export { contributeJobsPill } from ${JSON.stringify(path.join(pluginRoot, "client/jobs-pill.tsx"))};
 export { contributeTeamPill } from ${JSON.stringify(path.join(pluginRoot, "client/team-pill.tsx"))};
@@ -136,7 +130,6 @@ esbuild.buildSync({
     "react-dom/client": path.join(hostModules, "react-dom/client.js"),
     "react-native": "react-native-web",
     "@getpaseo/plugin/client/ui": stub,
-    "@getpaseo/plugin/client": clientStub,
   },
   loader: { ".tsx": "tsx", ".ts": "ts" },
   logLevel: "warning",
@@ -160,7 +153,7 @@ const {
   GoalPopoverBody,
   allText,
   makeGoalPopover,
-  makeGoalIcon,
+  goalPillIcon,
   SEEN_CLOSE_CONFIRM_MS,
   contributeGoalPill,
   contributeJobsPill,
@@ -925,6 +918,37 @@ async function separatePillChecks() {
     check("…its live icon is the terminal glyph with the corner ring", merged(jobsReg).icon, JobsPillIcon);
     check("…registered with that icon from the start (no static flash)", jobsReg.contribution.button.icon, JobsPillIcon);
 
+    // F-01 (2026-11-26): the running ring's data source is the **agent
+    // directory's status**, folded through the 1.5s hold machine and swapped
+    // through `registration.update`'s icon — not a `useAgent` hook inside the
+    // icon (that second reader never repainted the composer pill). The goal
+    // answer does not change in these steps; only the agent status does.
+    check("an idle agent: the goal pill draws the plain Target", merged(goalReg).icon, goalPillIcon("normal"));
+    const updatesBeforeRunning = goalReg.updates.length;
+    agent.status = "running";
+    agentFeed.update({ type: "agent_update", payload: { kind: "upsert", agent } });
+    await pause(20);
+    check("a status-only upsert swaps the goal pill icon to the ringed one", merged(goalReg).icon, goalPillIcon("running"));
+    assert(
+      "…and really sends the host an update",
+      goalReg.updates.length > updatesBeforeRunning,
+      `${String(goalReg.updates.length)} vs ${String(updatesBeforeRunning)}`,
+    );
+    const updatesBeforeIdle = goalReg.updates.length;
+    agent.status = "idle";
+    agentFeed.update({ type: "agent_update", payload: { kind: "upsert", agent } });
+    await pause(20);
+    // Between goal rounds the agent is idle for a flush gap; the hold keeps the
+    // ring turning there, which is exactly where the old trigger went still.
+    check("an agent that idles between rounds keeps the ring (the 1.5s hold)", merged(goalReg).icon, goalPillIcon("running"));
+    check("…so the unchanged mark sends no second update", goalReg.updates.length, updatesBeforeIdle);
+    // The next round starts: the hold is cleared (no timer left behind), and the
+    // mark does not change, so the host is not repainted.
+    agent.status = "running";
+    agentFeed.update({ type: "agent_update", payload: { kind: "upsert", agent } });
+    await pause(20);
+    check("the next round keeps the ring and sends no update", goalReg.updates.length, updatesBeforeIdle);
+
     // Three running: still 「后台」, no count anywhere on the trigger.
     scene.jobs = { available: true, jobs: [runningJob, { ...runningJob, id: "job-2" }, { ...runningJob, id: "job-3", status: "stopping" }] };
     // The label does not change, so this answer sends no update; pushing it is
@@ -1269,15 +1293,35 @@ function iconChecks() {
     const jobs = mount(React.createElement(JobsPillIcon, { size: 14, color: "#71717a", theme }));
     check("the jobs trigger icon is the terminal glyph", jobs.querySelectorAll('[data-icon="SquareTerminal"]').length, 1);
     check("…with the corner ring", jobs.querySelectorAll('[data-testid="pill-corner-ring"]').length, 1);
-    // The real goal trigger glyph: running keeps the Target under the ring.
-    // (`useAgent` is stubbed to "idle" here, so the running state is driven
-    // through CornerRingIcon above; this mounts the real component idle.)
-    const store = new Map([["agent-1", { goal: { ...baseGoal, phase: "paused" }, available: true, listeners: new Set() }]]);
-    const GoalIcon = makeGoalIcon(store, "agent-1");
-    const goalIcon = mount(React.createElement(GoalIcon, { size: 14, color: "#71717a", theme, context: "agent", workspaceId: "w", agentId: "agent-1", host: { id: "h", label: "h" }, layout: { compact: true, platform: "web" } }));
-    check("the goal trigger draws the Target", goalIcon.querySelectorAll('[data-icon="Target"]').length, 1);
-    const goalFrame = goalIcon.firstElementChild?.getAttribute("style") ?? "";
-    assert("…in a 14×14 frame", /width:\s*14px/.test(goalFrame) && /height:\s*14px/.test(goalFrame), goalFrame);
+    // The real goal trigger icons: one stable component per mark (team-pill
+    // pattern), so `registration.update` can swap the identity. The running mark
+    // is the only one with the corner ring, and the glyph always stays under it —
+    // the idle marks keep the Target (or the completed check) with no ring.
+    const goalIconProps = {
+      size: 14,
+      color: "#71717a",
+      theme,
+      context: "agent",
+      workspaceId: "w",
+      agentId: "agent-1",
+      host: { id: "h", label: "h" },
+      layout: { compact: true, platform: "web" },
+    };
+    for (const [mark, glyph, rings] of [
+      ["running", "Target", 1],
+      ["normal", "Target", 0],
+      ["warning", "Target", 0],
+      ["error", "Target", 0],
+      ["success", "CircleCheck", 0],
+    ]) {
+      const icon = mount(React.createElement(goalPillIcon(mark), goalIconProps));
+      check(`the goal trigger (${mark}) draws the ${glyph} glyph`, icon.querySelectorAll(`[data-icon="${glyph}"]`).length, 1);
+      check(`the goal trigger (${mark}) has ${rings} corner ring(s)`, icon.querySelectorAll('[data-testid="pill-corner-ring"]').length, rings);
+      if (mark === "running") {
+        const frame = icon.firstElementChild?.getAttribute("style") ?? "";
+        assert("…the running trigger still draws in the 14×14 frame", /width:\s*14px/.test(frame) && /height:\s*14px/.test(frame), frame);
+      }
+    }
   }
 }
 

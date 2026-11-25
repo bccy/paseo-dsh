@@ -46,6 +46,7 @@
  */
 import type {
   PluginButtonContentProps,
+  PluginButtonIcon,
   PluginButtonIconProps,
   PluginButtonRegistration,
   PluginClientContext,
@@ -64,18 +65,27 @@ import { GOAL_SEEN_METADATA_KEY } from "../shared/pill-metadata";
 import { createAgentSubscriptions, createPillObserver, type PillObserver } from "./agent-subscriptions";
 import { CornerRingIcon } from "./corner-ring";
 import { GoalPopoverBody } from "./goal-popover";
-import { useAgent, useGoalRunningMark } from "./goal-running";
+import {
+  goalRunningHoldRemaining,
+  goalRunningStateMark,
+  goalRunningStep,
+  initialGoalRunningState,
+  type GoalRunningState,
+} from "./goal-running";
 import {
   goalCompleteSeenStep,
   goalEditSubmittable,
   goalIconColorToken,
   goalIconName,
   goalPillCopy,
-  goalPanelNext,
+  goalPillMark,
   goalPillPresentation,
+  goalPanelNext,
   goalSeenKey,
   projectGoalAnswer,
+  type GoalAgentStatus,
   type GoalCompleteEvent,
+  type GoalPillMark,
   type GoalTone,
   type GoalViewState,
 } from "./goal-polling";
@@ -92,26 +102,31 @@ interface AgentGoal {
   error?: string;
   /** The remembered `id:revision` of the completed goal the user has seen. */
   seen?: string;
-  /** The trigger's glyph and the popover re-render from this set when a poll lands. */
+  /**
+   * The agent's live status, from the agent directory push (`updateAgent`).
+   *
+   * The running ring's data source: the host reports it on the same subscription
+   * the "seen" metadata arrives on (`client/agent-subscriptions.ts`), including
+   * during background goal rounds. It is read from here rather than by a
+   * `useAgent` hook inside the icon — that second reader never repainted the
+   * composer pill (F-01, 2026-11-26).
+   */
+  agentStatus: GoalAgentStatus | null | undefined;
+  /**
+   * Whether the running ring turns right now.
+   *
+   * Derived by the controller from the goal phase + the status above
+   * (`goalRunningStateMark`, including the 1.5s idle hold) and stored, so the
+   * trigger icon and the panel's whale read the **same** flag. The controller
+   * re-presents once when a hold expires (`goalRunningHoldRemaining`).
+   */
+  running: boolean;
+  /** The trigger's mark and the popover re-render from this set when a poll lands. */
   readonly listeners: Set<() => void>;
 }
 
 /** The live answer per agent, shared by the pill, its glyph and its popover. */
 export type GoalStore = Map<string, AgentGoal>;
-
-/** The tone the trigger's glyph should draw with for one stored answer. */
-function goalToneOf(entry: AgentGoal | undefined): GoalTone {
-  const presentation = goalPillPresentation(
-    {
-      available: entry?.available ?? true,
-      goal: entry?.goal ?? null,
-    },
-    entry?.seen,
-  );
-  // A hidden pill draws nothing; the warning tone is only the initial value
-  // before the first poll, and the glyph is invisible then anyway.
-  return presentation.visible ? presentation.tone : "warning";
-}
 
 function publish(store: GoalStore, agentId: string, next: Omit<AgentGoal, "listeners">): void {
   const previous = store.get(agentId);
@@ -127,42 +142,20 @@ function publish(store: GoalStore, agentId: string, next: Omit<AgentGoal, "liste
 }
 
 /**
- * The trigger's glyph: the Target mark coloured by the goal's tone, with the
- * running ring on its corner while the goal really runs.
+ * The trigger's icon, one stable component per mark — the team pill's pattern
+ * (`client/team-pill.tsx` `ICONS`): `present` swaps the registration's icon
+ * identity and the host repaints the button, so a status push alone (no goal
+ * answer, no label change) really reaches the composer. A component that
+ * subscribed to the store itself was the F-01 failure: its repaint never
+ * reached the pill.
  *
- * The host paints a plugin pill's icon with a fixed muted colour (`color` is
- * `foregroundMuted` there) and its label as plain text, so a custom icon
- * component is the only channel through which the state can reach the trigger.
- * The component subscribes to the same store the popover reads, so a tone change
- * repaints the glyph without re-registering the button (a `registration.update`
- * per poll would republish the composer for nothing).
+ * The glyph always stays — the tone-coloured `Target`, or the green
+ * `CircleCheck` for an unseen completed goal — and only the running mark adds
+ * the corner ring (`./corner-ring`). The ring used to replace the glyph, so a
+ * goal pill the host shrank to its icon was one more anonymous blue ring.
  */
-export function makeGoalIcon(store: GoalStore, agentId: string) {
-  function GoalPillIcon({ size, theme }: PluginButtonIconProps) {
-    const [tone, setTone] = useState<GoalTone>(() => goalToneOf(store.get(agentId)));
-    const [goal, setGoal] = useState<GoalState | null>(() => store.get(agentId)?.goal ?? null);
-    useEffect(() => {
-      const current = store.get(agentId);
-      if (current === undefined) return;
-      const listener = () => {
-        setTone(goalToneOf(store.get(agentId)));
-        setGoal(store.get(agentId)?.goal ?? null);
-      };
-      current.listeners.add(listener);
-      return () => {
-        current.listeners.delete(listener);
-      };
-    }, []);
-    const agentStatus = useAgent(agentId, (agent) => agent.status);
-    const running = useGoalRunningMark(
-      goal?.phase ?? "complete",
-      goal?.activation ?? "armed",
-      agentStatus,
-    );
-    // The glyph always stays — the tone-coloured Target, or the green check
-    // for an unseen completed goal — and a running goal adds the corner ring
-    // (`./corner-ring`). The ring used to replace the glyph, so a goal pill the
-    // host shrank to its icon was one more anonymous blue ring.
+function createGoalIcon(tone: GoalTone, running: boolean) {
+  return function GoalMarkIcon({ size, theme }: PluginButtonIconProps) {
     return (
       <CornerRingIcon
         name={goalIconName(tone)}
@@ -172,9 +165,26 @@ export function makeGoalIcon(store: GoalStore, agentId: string) {
         theme={theme}
       />
     );
-  }
-  GoalPillIcon.displayName = "GoalPillIcon";
-  return GoalPillIcon;
+  };
+}
+
+/** One icon per mark; `running` outranks the tone (`goalPillMark`). */
+const GOAL_ICONS: Record<GoalPillMark, ReturnType<typeof createGoalIcon>> = {
+  running: createGoalIcon("normal", true),
+  normal: createGoalIcon("normal", false),
+  warning: createGoalIcon("warning", false),
+  error: createGoalIcon("error", false),
+  success: createGoalIcon("success", false),
+};
+
+/**
+ * The trigger's icon component for one mark.
+ *
+ * Exported only so `harness/goal-popover-render-check.cjs` can mount the real
+ * icon and assert the glyph + corner ring.
+ */
+export function goalPillIcon(mark: GoalPillMark): PluginButtonIcon {
+  return GOAL_ICONS[mark];
 }
 
 /**
@@ -301,10 +311,10 @@ export function makeGoalPopover(
       }
     };
 
-    // The pill's icon and the panel's whale share the running decision; the
-    // popover reads the agent's live status the same way the icon does.
-    const agentStatus = useAgent(agentId, (agent) => agent.status);
-    const running = useGoalRunningMark(goal.phase, goal.activation, agentStatus);
+    // The trigger icon and the panel's whale read the **same** stored flag: the
+    // controller owns the truth table and the 1.5s hold, so the two surfaces
+    // cannot drift (F-01).
+    const running = entry?.running ?? false;
     const resumable = goal.phase !== "active" || goal.activation === "disarmed";
 
     const onToggleRunning = (): void => {
@@ -395,7 +405,21 @@ export function contributeGoalPill(client: PluginClientContext, observer?: PillO
   /** agentId -> the last pushed answer, to re-present it when only "seen" changed. */
   const answers = new Map<string, GoalViewState>();
   /** agentId -> what the host was last told; an unchanged poll publishes nothing. */
-  const published = new Map<string, { visible: boolean; label: string; title: string }>();
+  const published = new Map<
+    string,
+    { visible: boolean; label: string; title: string; mark: GoalPillMark }
+  >();
+  /**
+   * agentId -> the status hold machine.
+   *
+   * The agent directory push is the running ring's data source (the host updates
+   * `PillAgent.status` on every turn, including background goal rounds, on the
+   * same subscription as the "seen" metadata); `updateAgent` folds it through
+   * `client/goal-running.tsx`.
+   */
+  const runningStates = new Map<string, GoalRunningState>();
+  /** agentId -> the one timer that re-presents when an idle hold expires. */
+  const holdTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const lifetime = new AbortController();
   const observation = createPillObserver(observer,
     agentId => published.get(agentId)?.visible === true,
@@ -429,7 +453,7 @@ export function contributeGoalPill(client: PluginClientContext, observer?: PillO
 
   /**
    * Publish one pushed answer: the popover store first (its listeners redraw from
-   * it, including the trigger's glyph), then the registration. The
+   * it, including the panel's whale), then the registration. The
    * visibility/label rule is {@link goalPillPresentation}; this function only
    * turns its keys into copy.
    */
@@ -439,29 +463,84 @@ export function contributeGoalPill(client: PluginClientContext, observer?: PillO
     if (registration === undefined || next === undefined) return;
     const currentKey = next.goal === null ? undefined : goalSeenKey(next.goal);
     const remembered = currentKey !== undefined && seen.hasSeen(agentId, currentKey) ? currentKey : undefined;
+    // The running flag is derived **here**, once, from the goal and the pushed
+    // agent status: the store carries it so the trigger icon and the panel's
+    // whale read the same fact and cannot drift (F-01).
+    const state = runningStates.get(agentId) ?? initialGoalRunningState(undefined);
+    const running = goalRunningStateMark(
+      state,
+      next.goal?.phase ?? "complete",
+      next.goal?.activation ?? "armed",
+      Date.now(),
+    );
     publish(store, agentId, {
       goal: next.goal,
       available: next.available,
+      agentStatus: state.agentStatus,
+      running,
       ...(next.error === undefined ? {} : { error: next.error }),
       ...(remembered === undefined ? {} : { seen: remembered }),
     });
     const presentation = goalPillPresentation(next, remembered);
+    const mark = goalPillMark(presentation.visible ? presentation.tone : "warning", running);
     const text = localeText().goal;
     // The label and the title are the noun in every state (UI-v7): the title is
     // also the phone sheet's header, which must read 「目标」. The state is the
     // glyph's, and the panel's first row speaks it. Never the objective — that
     // would print it twice on a phone.
     const { label, title } = goalPillCopy(presentation, text);
-    // A poll answers every few seconds and almost always says the same thing; an
-    // identical update would rebuild the host's button view and the popover's
-    // page elements for nothing (the team pill's rule).
+    // A poll answers every few seconds and a status push can repeat the same
+    // status; an identical update would rebuild the host's button view and the
+    // popover's page elements for nothing (the team pill's rule). **The mark is
+    // part of the comparison**: a status-only push changes nothing else, and it
+    // is exactly the change that must swap the icon and repaint the trigger.
     const before = published.get(agentId);
-    if (before !== undefined && before.visible === presentation.visible && before.label === label && before.title === title) {
+    if (
+      before !== undefined &&
+      before.visible === presentation.visible &&
+      before.label === label &&
+      before.title === title &&
+      before.mark === mark
+    ) {
+      scheduleRunningRefresh(agentId);
       return;
     }
-    registration.update({ visible: presentation.visible, label, title });
-    published.set(agentId, { visible: presentation.visible, label, title });
+    registration.update({ visible: presentation.visible, label, title, icon: goalPillIcon(mark) });
+    published.set(agentId, { visible: presentation.visible, label, title, mark });
     observation.presented(agentId);
+    scheduleRunningRefresh(agentId);
+  };
+
+  /**
+   * Keep the ring's 1.5s idle hold honest: nothing else pushes after the agent
+   * turns idle, so the controller schedules one re-present at the end of the
+   * hold. A real `running` status has no deadline
+   * (`goalRunningHoldRemaining` answers undefined) and a stopped hold is already
+   * off, so no timer is left behind.
+   */
+  const scheduleRunningRefresh = (agentId: string): void => {
+    const pending = holdTimers.get(agentId);
+    if (pending !== undefined) {
+      clearTimeout(pending);
+      holdTimers.delete(agentId);
+    }
+    const state = runningStates.get(agentId);
+    const next = answers.get(agentId);
+    if (state === undefined || next === undefined) return;
+    const remaining = goalRunningHoldRemaining(
+      state,
+      next.goal?.phase ?? "complete",
+      next.goal?.activation ?? "armed",
+      Date.now(),
+    );
+    if (remaining === undefined) return;
+    holdTimers.set(
+      agentId,
+      setTimeout(() => {
+        holdTimers.delete(agentId);
+        present(agentId);
+      }, remaining + 16),
+    );
   };
 
   /** Feed one event to an agent's "seen" machine; re-present when it changed visibility. */
@@ -531,14 +610,18 @@ export function contributeGoalPill(client: PluginClientContext, observer?: PillO
       // pill exists is what removes the old hydrate gate — `present` below always
       // has an answer, so a completed goal the user already closed never flashes.
       seen.observe(agent);
+      // The status this snapshot carries is the ring's first input. Until an
+      // answer lands the pill is hidden, so the initial mark is the muted one.
+      runningStates.set(agent.id, initialGoalRunningState(agent.status as GoalAgentStatus | undefined));
       const registration = client.addComposerPill({
         id: "dsh-goal",
         workspaceId: agent.workspaceId ?? "",
         agentId: agent.id,
         button: {
-          // A custom component so the Target glyph can carry the goal's tone
-          // (the host would paint a plain icon name muted for every state).
-          icon: makeGoalIcon(store, agent.id),
+          // A stable component per mark so `present` can swap the icon identity
+          // and the host repaints the trigger (the team pill's pattern); the
+          // mark is derived from the goal + the pushed agent status.
+          icon: goalPillIcon("normal"),
           title: text.title,
           // Hidden until the first poll proves otherwise: a pill that appears and
           // then disappears is worse.
@@ -561,8 +644,9 @@ export function contributeGoalPill(client: PluginClientContext, observer?: PillO
         },
       });
       pills.set(agent.id, registration);
-      // The registration starts hidden with the noun as its effective label.
-      published.set(agent.id, { visible: false, label: text.title, title: text.title });
+      // The registration starts hidden with the noun as its effective label; the
+      // glyph is invisible until the first answer anyway.
+      published.set(agent.id, { visible: false, label: text.title, title: text.title, mark: "normal" });
       store.delete(agent.id);
       answers.delete(agent.id);
       // The metadata store owns both pending local closes and confirmed remote
@@ -571,10 +655,20 @@ export function contributeGoalPill(client: PluginClientContext, observer?: PillO
 
     },
     updateAgent: (agent) => {
-      // The "seen" key of this agent changed — this session's own close echoed
-      // back, or another window's close. Either way the pill must re-decide its
-      // visibility now instead of waiting for the next goal answer.
-      if (seen.observe(agent)) present(agent.id);
+      // Two independent live facts arrive on this channel, and the pill needs
+      // both:
+      // - the durable "seen" key of a completed goal (this session's own close
+      //   echoed back, or another window's): the pill re-decides visibility now;
+      // - the agent's status, the running ring's data source. It is folded
+      //   through the hold machine, and a status-only upsert re-presents so the
+      //   mark comparison in `present` swaps the icon (F-01).
+      const status = agent.status as GoalAgentStatus | undefined;
+      const previous = runningStates.get(agent.id) ?? initialGoalRunningState(status);
+      const next = goalRunningStep(previous, status, Date.now());
+      runningStates.set(agent.id, next);
+      const statusChanged =
+        previous.agentStatus !== next.agentStatus || previous.holdUntil !== next.holdUntil;
+      if (seen.observe(agent) || statusChanged) present(agent.id);
       // The agent's status is **not** a "seen" signal: a turn starting after the
       // completing one ended is usually just the user sending the next message,
       // and a completed pill must stay until its panel is opened and closed.
@@ -586,6 +680,12 @@ export function contributeGoalPill(client: PluginClientContext, observer?: PillO
       entry.remove();
       answers.delete(agentId);
       published.delete(agentId);
+      runningStates.delete(agentId);
+      const holdTimer = holdTimers.get(agentId);
+      if (holdTimer !== undefined) {
+        clearTimeout(holdTimer);
+        holdTimers.delete(agentId);
+      }
       // The metadata store survives removal (2026-11-09).
       // A "seen" key is `id:revision` — DSH mints a fresh `goal-<uuid>` per
       // created goal (`dsh-goal/lib/index.js`), so a remembered key can only
@@ -685,5 +785,7 @@ export function contributeGoalPill(client: PluginClientContext, observer?: PillO
     lifetime.abort();
     subscriptions.dispose();
     seen.dispose();
+    for (const timer of holdTimers.values()) clearTimeout(timer);
+    holdTimers.clear();
   };
 }

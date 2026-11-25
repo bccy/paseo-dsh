@@ -79,8 +79,8 @@ export type GoalTone = "normal" | "warning" | "error" | "success";
  *
  * `normal` is `foregroundMuted`, not `accent`: the design's rule is one signal
  * one token, and on the composer rail every host mark is a single muted glyph.
- * A running goal's glyph is not even this — it is the running ring (see
- * `goalRunningMark`); this colour is what a *non-running* normal goal draws.
+ * A running goal adds the corner ring on top of this glyph (see
+ * `goalRunningMark`); the glyph itself keeps this colour either way.
  * The not-continuing states reuse the warning/danger text colours. The host
  * paints a plugin pill's label itself (plain text, no colour channel), so the
  * glyph is the only place this tone can reach the trigger.
@@ -110,6 +110,26 @@ export function goalIconColorToken(
  */
 export function goalIconName(tone: GoalTone): "CircleCheck" | "Target" {
   return tone === "success" ? "CircleCheck" : "Target";
+}
+
+/**
+ * The trigger's icon states: the four tones, or the running ring.
+ *
+ * `running` is not a tone — the glyph keeps its `normal` colour under the ring
+ * (`./corner-ring`), so the two are separate axes.
+ */
+export type GoalPillMark = "running" | GoalTone;
+
+/**
+ * Which trigger icon a goal wears.
+ *
+ * The running ring outranks the tone: the ring is only possible for an
+ * `active + armed` goal, whose tone is already `normal`, but the icon's name is
+ * derived here (from the controller's `present`) rather than in a second switch
+ * at the call site.
+ */
+export function goalPillMark(tone: GoalTone, running: boolean): GoalPillMark {
+  return running ? "running" : tone;
 }
 
 /** What the trigger shows for one answer. */
@@ -527,6 +547,12 @@ export interface GoalRunningInput {
  * design: it spins while DSH is not working, which is the "silent degradation"
  * class this project treats as a bug. When the host cannot answer the agent's
  * status at all, the mark stays static rather than guessing.
+ *
+ * `agentStatus` comes from the **agent directory push** (`PillAgent.status` in
+ * `client/agent-subscriptions.ts`, folded by `client/goal-running.tsx`), not
+ * from a `useAgent` hook inside the icon: F-01 (2026-11-26) — the hook reader
+ * never repainted the composer pill, so an armed goal working a round showed a
+ * still trigger. The truth table itself is unchanged.
  */
 export function goalRunningMark(input: GoalRunningInput): boolean {
   if (input.phase !== "active" || input.activation !== "armed") return false;

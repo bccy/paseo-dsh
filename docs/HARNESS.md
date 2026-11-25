@@ -1378,7 +1378,7 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   `dsh-bridge/lib/server.js` 的 `paseo/goal` 或 dispatch 必跑；改桥后先重生成内嵌桥
   （`node paseo-plugin/scripts/generate-bridge-assets.mjs`）再跑 `bridge-assets-check.mjs`，
   否则真机检查跑在旧桥上假绿。**
-- `harness/goal-pill-check.cjs` — goal pill 与行式面板的**数据层与 UI 规则**（**309 条**；假订阅
+- `harness/goal-pill-check.cjs` — goal pill 与行式面板的**数据层与 UI 规则**（**323 条**；假订阅
   宿主 + 假目录页，不 import React/host；2026-11-11（0.16 订阅改造）：
   - **订阅控制器**一节（`client/agent-subscriptions` + `projectGoalAnswer`）：首答发布、同答案不
     重发、phase 变化与 `goal=null` 各自发布；**瞬态失败保持上一状态**（不发布、不摘 pill、不释放）；
@@ -1404,7 +1404,7 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   `shared/pill-metadata.ts` 或 `client/locale.ts` 的 goal 表必跑。先红后绿证据：
   `/tmp/paseo-dsh-orch/push-evidence/mutation3-goal.log`（丢掉 pending 优先 → 2 红）。**
 
-- `harness/goal-popover-render-check.cjs` — 面板的**渲染行为**（**246 条**；用 esbuild 现编真实
+- `harness/goal-popover-render-check.cjs` — 面板的**渲染行为**（**269 条**；用 esbuild 现编真实
   `contributeGoalPill` / `contributeJobsPill` / `contributeTeamPill` + `makeGoalPopover`，经
   react-native-web 渲染进 jsdom，`HOST_APP` 提供 react/esbuild/jsdom）：目标的编辑/保存/清除/
   Esc/IME/防误触、关闭是 confirmed-close、两颗/三颗 pill 各按自身规则显示、目标徽标几何。

@@ -113,7 +113,7 @@ goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等�
 
 | 状态 | 完整状态名（面板目标行读屏；pill 的 label/title 恒为「目标」/「Goal」） | 图标 | 行尾操作 |
 |---|---|---|---|
-| active + armed | `目标进行中` / `Goal running` | `Target`（`foregroundMuted`），agent 在跑时右下角叠运行环 | 暂停、清除；点行编辑 |
+| active + armed | `目标进行中` / `Goal running` | `Target`（`foregroundMuted`），agent 在跑时右下角叠运行环（与面板「目标进行中」同源） | 暂停、清除；点行编辑 |
 | active + disarmed | `目标未在续跑` / `Goal not running` | `Target`（`statusWarning`） | 继续、清除；点行编辑 |
 | paused | `目标已暂停` / `Goal paused` | `Target`（`statusWarning`） | 继续、清除；点行编辑 |
 | blocked | `目标受阻` / `Goal blocked` | `Target`（`statusDanger`） | 继续、清除；点行编辑 |
@@ -129,8 +129,14 @@ goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等�
 压成纯图标时目标、后台、团队都只剩一个蓝环，分不出来；现在三者底图标分别是 `Target`、`SquareTerminal`、`Users`。
 运行判定是纯函数 `goalRunningMark`：`active + armed` 且 agent `running` 才转；agent 转 `idle` 后
 保持 **1.5s**（`GOAL_RUNNING_HOLD_MS`）；disarmed/paused/blocked/complete、agent 非 running、或
-读不到 agent 状态都不转（不猜）。`useAgent(agentId, a => a.status)` 读宿主 session store，不轮询
-（`client/goal-running.tsx`）。面板里鲸鱼右下角叠同一个环（`-5`、14px 框、行底色镂空）。
+读不到 agent 状态都不转（不猜）。**数据源是 pill 已有的 `agents.list({subscribe})` 目录快照与 upsert 里的
+agent status**（`PillAgent.status`，和「已读」元数据走同一条订阅；宿主在每回合——含后台 goal 轮次——都会推），
+`client/goal-running.tsx` 的 hold 状态机折叠它，pill 控制器据此算出运行位写进 store，图标与面板鲸鱼都读这一个
+运行位。**不再用 `useAgent` 在图标组件里旁路读**：F-01（2026-11-26）——那个第二读取器不会触发 composer pill
+重绘，目标实际在工作时 pill 却是静止的，只有打开面板才看到「目标进行中」。图标按 mark（running / 各 tone）是
+**稳定组件**，状态变化通过 `registration.update({ icon })` 换图标（team pill 的同一模式），所以「status 变了但
+目标答案没变」也会实时重绘；面板鲸鱼读同一 store 运行位，因此与 pill 同源。面板里鲸鱼右下角叠同一个环
+（`-5`、14px 框、行底色镂空）。
 
 **popover 面板**（`paseo-plugin/client/goal-popover.tsx`，v5 行式）：
 
@@ -196,7 +202,9 @@ goal 栈）→ **移除 pill**，与「这个 profile 没有 goal 功能」等�
   卸载后一直没回来 → 记已读（修复前把任何卸载都当关闭：桌面端点开已完成目标 pill 就消失、面板没显示，手机端 sheet 不走这条重挂载路径所以正常）。
   **发送新消息不算已读**（2026-11-07 修复）：完成当轮的 running→idle 与用户下一条消息触发的 idle→running 都不写 seen——此前把「下一回合开始」当作用户已看过，
   未点开面板的目标会在发下一条消息后消失；若首次观察到 complete 时 agent 已 idle，也只等待面板关闭。清除后 goal 为 null，自然隐藏。
-  agent 状态仍从 pill 已有的 `agents.list({subscribe})` 快照与 upsert 记录，但只用于运行环等展示，不参与「已读」判定。
+  agent 状态仍从 pill 已有的 `agents.list({subscribe})` 快照与 upsert 记录（`client/agent-subscriptions.ts` 的
+  `PillAgent.status` → `client/goal-running.tsx` 的 hold 状态机 → pill 控制器写进 store 的运行位），只用于运行环
+  等展示，不参与「已读」判定。
 - **持久化（2026-11-08 起；2026-11-11 换到 agent metadata）**：`seen` 现在是 Paseo **agent 记录上的插件元数据**，键
   `dsh.goalSeen`，值就是 `id:revision`（`shared/pill-metadata.ts` + `client/seen-metadata.ts`）：**确认关闭**后写一次
   （`paseo.agents.ref(agentId).setMetadata`，非 React、对空闲 agent 也有效），读则随 agent 目录快照一起到达——注册 pill 之前就已知，
@@ -418,8 +426,8 @@ DSH 判参数非法。两者都在写入前拒绝，目标不受影响（FIELD-N
 | 检查 | 断言 | 依赖 | 触发 |
 |---|---|---|---|
 | `harness/goal-bridge-check.mjs` | 15/15 | **本机 DSH 安装**（从全局安装解析 `@deepseek-ai/*`，`DSH_PACKAGES_DIR`/`DSH_INSTALL_DIR` 可覆盖；没有就 exit 2） | 动 `dsh-bridge/lib/server.js` 的 `paseo/goal` / dispatch |
-| `harness/goal-pill-check.cjs` | 309/309 | 纯模块（`tsc -p harness/goal-pill.tsconfig.json`） | 动 `client/goal-polling.ts`、`client/goal-popover.tsx`、`client/goal-pill.tsx`、`client/goal-running.tsx`、`client/agent-subscriptions.ts`、`client/seen-metadata.ts`、`shared/goal.ts`、`shared/pill-metadata.ts` 或 locale goal 表 |
-| `harness/goal-popover-render-check.cjs` | 245/245 | `HOST_APP` 指向 Paseo 检出（react-native-web + jsdom 渲染真实面板）；未设置 exit 2 | 动 `client/goal-popover.tsx`、`client/deepseek-mark*.tsx` 或面板用到的 `goal-polling.ts` 规则 |
+| `harness/goal-pill-check.cjs` | 323/323 | 纯模块（`tsc -p harness/goal-pill.tsconfig.json`） | 动 `client/goal-polling.ts`、`client/goal-popover.tsx`、`client/goal-pill.tsx`、`client/goal-running.tsx`、`client/agent-subscriptions.ts`、`client/seen-metadata.ts`、`shared/goal.ts`、`shared/pill-metadata.ts` 或 locale goal 表 |
+| `harness/goal-popover-render-check.cjs` | 269/269 | `HOST_APP` 指向 Paseo 检出（react-native-web + jsdom 渲染真实面板）；未设置 exit 2 | 动 `client/goal-popover.tsx`、`client/deepseek-mark*.tsx` 或面板用到的 `goal-polling.ts` 规则 |
 | `harness/goal-server-check.cjs` | 39/39 | 真实插件 + 假桥（一次性 `DSH_HOME`） | 动 `server/provider.ts` / `server/session.ts` 的 goal 读写、`server/dsh-process.ts` 的 goal 分级与 `currentTask`、`index.server.ts` 的 handler、桥的缺失服务文案 |
 | `harness/goal-timeline-check.cjs` | 6 组 | 真实 `DshSession` + 假进程传输（`plugin-build.cjs` 自编译） | 动 `server/activity-timeline.ts` 的 goal 行、`server/session.ts` 的重放过滤、`server/locale.ts` 的 `goalRound` |
 
