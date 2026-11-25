@@ -153,12 +153,7 @@ function EnvironmentSection({
   const copy = useLocaleText().console.settingsSections.environment;
 
   if (renderEnvironment) {
-    return (
-      <View style={{ gap: space.md }}>
-        <SectionHeading colors={colors} title={copy.title} />
-        {renderEnvironment({ colors, compact, locale })}
-      </View>
-    );
+    return <>{renderEnvironment({ colors, compact, locale })}</>;
   }
 
   const hasDoctorFailures =

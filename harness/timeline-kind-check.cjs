@@ -38,6 +38,7 @@ function readKinds(source) {
         (name) => name === 'react-native' ? {} : fromBuild(name));
     }
     if (id === './client/rewind-notice-live') return { startRewindLiveMonitor: () => noop };
+    if (id === './client/console-diagnostics') return { ConsoleDiagnosticsSection: () => null };
     if (id === './client/console-screen') {
       return {
         CONSOLE_SCREEN_ID: 'dsh-console',

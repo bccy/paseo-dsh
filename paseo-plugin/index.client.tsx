@@ -25,6 +25,7 @@ import type {
 } from "@getpaseo/plugin/client";
 import { SidebarRow } from "@getpaseo/plugin/client/ui";
 import { z } from "zod";
+import { ConsoleDiagnosticsSection } from "./client/console-diagnostics";
 import {
   CONSOLE_SCREEN_ID,
   DshConsoleScreen,
@@ -394,11 +395,23 @@ function buildContributions(client: PluginClientContext): () => void {
   // open directly on Tab 3 (`settings`), even if the console is already mounted.
   // Titles are registered as resolved strings via `registerWithLiveTitle` so
   // native hosts render them safely and refresh them when language changes.
+  const renderEnvironment = ({
+    colors,
+    compact,
+  }: {
+    colors: PluginScreenProps["theme"]["colors"];
+    compact: boolean;
+  }) => <ConsoleDiagnosticsSection client={client} colors={colors} compact={compact} />;
   const ConsoleScreen = (props: PluginScreenProps) => (
-    <DshConsoleScreen {...props} initialTab="usage" />
+    <DshConsoleScreen {...props} initialTab="usage" renderEnvironment={renderEnvironment} />
   );
   const ConsoleSettingsEntry = (props: PluginSurfaceProps) => (
-    <DshConsoleScreen {...props} initialTab="settings" subscribeTabRequests={false} />
+    <DshConsoleScreen
+      {...props}
+      initialTab="settings"
+      subscribeTabRequests={false}
+      renderEnvironment={renderEnvironment}
+    />
   );
   const openConsoleSettings = (command: PluginGlobalCommandContext) => {
     requestConsoleTab("settings");

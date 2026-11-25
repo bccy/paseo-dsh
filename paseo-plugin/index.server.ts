@@ -5,6 +5,7 @@ import { isTerminalTeamErrorCode, teamSnapshot, type TeamAnswer } from "./shared
 import { rewindNoticeArm } from "./shared/rewind-notice";
 import { languageSettings, timelineStyleSettings } from "./shared/settings";
 import { ensurePaseoProfile } from "./server/bootstrap";
+import { DiagnosticsService, registerDiagnosticsRpc } from "./server/diagnostics";
 import { DshPlugins } from "./server/dsh-plugins";
 import { registerDshPluginsRpc } from "./server/dsh-plugins-rpc";
 import { createPillFeed } from "./server/pill-feed";
@@ -113,6 +114,10 @@ export default function contribute(server: PluginServerContext) {
   const dshPlugins = new DshPlugins();
   const disposeDshPlugins = registerDshPluginsRpc(server, dshPlugins);
 
+  // Environment & Route Overview + on-demand full Doctor RPCs for Console Tab 3.
+  const diagnostics = new DiagnosticsService();
+  const disposeDiagnostics = registerDiagnosticsRpc(server, diagnostics, { onCall: capture });
+
   /**
    * One feed per pill. Each is a singleton for the plugin process, which is what
    * makes "two app windows, one read" true: the second window's subscription
@@ -198,6 +203,7 @@ export default function contribute(server: PluginServerContext) {
   });
 
   return () => {
+    disposeDiagnostics();
     disposeDshPlugins();
     for (const cleanup of cleanups) cleanup();
     jobsFeed.dispose();
