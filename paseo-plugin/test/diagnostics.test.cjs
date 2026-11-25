@@ -729,6 +729,14 @@ test("runDoctor times out cleanly on hung runner and releases mutex for recovery
   const box = makeSandbox(t);
   const dshPkg = makeFakePackageDsh(box.root);
 
+  // Hold one live handle for the duration of this test. The production timeout
+  // timer is deliberately unref'd, and a never-settling Promise holds no handle,
+  // so on Node 22 node:test can see an empty event loop and cancel the test
+  // (cancelledByParent) before the timeout fires. A real hung child process
+  // keeps the event loop alive, so the fake hanging runner must do the same.
+  const keepAlive = setInterval(() => {}, 1000);
+  t.after(() => clearInterval(keepAlive));
+
   let shouldHang = true;
   let signalAborted = false;
 

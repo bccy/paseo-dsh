@@ -1208,6 +1208,16 @@ test("resolution precedence: overrides > synced official catalog > built-in refe
 
 test("PricingStore official catalog sync: atomic disk cache, TTL, single-flight, backward-compat autoSync, and safe error fallback", async (t) => {
   const tmp = makeTempDir(t);
+
+  // Hold one live handle for the duration of this test. The production sync
+  // timeout timer is deliberately unref'd (server/pricing.ts) and the "timeout"
+  // fetch mode never settles on its own, so with no other active handle Node 22
+  // node:test sees an empty event loop and cancels the test (cancelledByParent)
+  // before the 60ms timeout fires. A real daemon keeps the loop alive; simulate
+  // that here so the timeout path itself is exercised.
+  const keepAlive = setInterval(() => {}, 1000);
+  t.after(() => clearInterval(keepAlive));
+
   let nowMs = Date.parse("2026-11-26T10:00:00.000Z");
 
   // Seed legacy pricing config file WITHOUT `autoSync` field -> must load cleanly with autoSync: true!
