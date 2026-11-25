@@ -25,7 +25,7 @@ DSH 侧是一个 profile bundle。
 | 斜杠命令 / 技能 | ⚠️ 多为命令子集 | ✅ `/` 菜单列出 DSH 命令与 user-invocable 技能；命令在运行时执行，技能按 `/name` 注入 |
 | 权限模式（沙箱） | ❌ 无统一开关 | ✅ composer 里的 **Permissions** 下拉，切换 DSH 的沙箱 + 审批预设 |
 | 人设预设（Preset） | ❌ | ✅ profile 挂了 agent-preset registry 时，composer 出现 **Preset** 下拉（建会话时选、首回合后锁定） |
-| DSH 控制台 | — | ✅ 侧栏顶部统一入口打开 3-Tab 控制台（Paseo 设置页与 Command Center 直达「设置」Tab）：**用量**（53 周热力图、24h/7d/30d、6 项 KPI + sparkline、全指标主图、8 列可排序模型表、主/子代理拆分、Provider 路由筛选、落盘增量缓存与 `USD $` / `CNY ¥` 双币种估价）、**插件**（管理 profile bundle 的启停/安装/更新/卸载）、**设置**（秒开环境与路由概览、按需完整 Doctor 诊断、界面语言、默认币种/汇率、时间线样式一键预设与高级间距微调） |
+| DSH 控制台 | — | ✅ 侧栏顶部统一入口打开 3-Tab 控制台（Paseo 设置页与 Command Center 直达「设置」Tab）：**用量**（53 周热力图、24h/7d/30d、6 项 KPI + sparkline、全指标主图、8 列可排序模型表、主/子代理拆分、Provider 路由筛选、落盘增量缓存与 `USD $` / `CNY ¥` 双币种估价，支持 `models.dev` 官方 API 价格自动同步）、**插件**（管理 profile bundle 的启停/安装/更新/卸载）、**设置**（秒开环境与路由概览、按需完整 Doctor 诊断、界面语言、默认币种/汇率、时间线样式一键预设与高级间距微调） |
 | 时间线卡片与统计行 | — | ✅ `subagent` / `subagent_fork` 升级为轻量可展开卡片（仅展示实测事实，原地展开任务全文与报告并支持复制）；`list_agents` / `archive_subagents` 行尾内联状态计数 chip；`stream-stats` 中英双语 + 色阶上下文条与三色 Token 堆叠条；`team-card` 真实溢出折叠；`RewindNotice` 轻量无框状态行 |
 | 会话恢复 / 导入 | ❌ 无历史、无法导入 | ✅ 重开按 Paseo 的 `history: replay` 回放历史；**导入** DSH 原生会话（`session.list`，从 `~/.dsh/sessions` 列举） |
 | 后台任务（jobs） | — | ✅ composer 的 pill 显示 DSH 后台任务（终端图标，运行中右下角叠转环）：只在有运行中/停止中的任务时显示，文字只写「后台」（数量在面板里），全部结束即隐藏；多个 pill 同屏时可左右滑动浏览（宿主的 pill 轨道 0.15.3 起可横向滚动），目标 / 团队 / 后台各按自身规则独立显示；点开看每个任务的明细（弹层里运行中且可停的任务行带停止按钮：不弹确认，停止中转圈、以推送为准，失败在行下显示原因） |
@@ -269,8 +269,9 @@ paseo-dsh/
 │   │   ├── dsh-process.ts # 一个连接共用的 dsh 子进程（cwd/路由/MCP 按会话下发）
 │   │   ├── timeline.ts  #   DSH 会话事件 → Paseo 时间线
 │   │   ├── usage-stats.ts # 会话日志增量解析、磁盘缓存与用量统计 RPC
-│   │   ├── pricing.ts   #   双币种模型单价配置持久化与 RPC
-│   │   ├── diagnostics.ts # 快速环境概览与按需 Doctor 诊断 RPC
+│   │   ├── pricing.ts   #   双币种模型单价、models.dev 官方价同步持久化与 RPC
+│   │   ├── diagnostics.ts # 快速环境概览与按需 Doctor 诊断 RPC（静态内嵌 doctor-core）
+│   │   ├── doctor-core.mjs # CLI 与控制台共用的纯 Doctor 诊断核心
 │   │   ├── bootstrap.ts #   自举：写 profile 文件 + 把内嵌 bridge 落盘
 │   │   └── bridge-assets.ts # 生成物：bridge 的 base64 内嵌副本
 │   ├── client/          #   DSH 控制台 3-Tab（用量/插件/设置）与时间线卡片/统计行/pill UI
@@ -579,7 +580,7 @@ settings 在 `describe()` 时对比 revision 后发出；绕过 `settings.write`
 - **数据源与增量缓存**：直接解析 `$DSH_HOME/sessions/**/*.v4.jsonl.zstd`（兼容未压缩 `.jsonl`），将解析结果原子落盘至 `$DSH_HOME/.cache/paseo-dsh-usage-v1.json`（仅重解新增或变更文件，自动清理已删会话），插件启动后延迟异步后台预热并实时回报索引进度。
 - **活动热力图与多维统计**：提供 53 周活动热力图（四分位色阶、悬浮/点击详情、4 项汇总指标，窄屏自动缩周数并切换内联详情条）、`24h / 7d / 30d` 区间切换、6 张可点击 KPI 卡片（Token、估算费用、请求数、输出速度、缓存命中、首字延迟，均内嵌 sparkline）、悬浮/点击全指标主图，以及 8 列可排序模型占比表（点击行交叉筛选，窄屏自动切换双行紧凑卡）。
 - **主/子代理拆分与路由筛选**：存在子代理数据时展示 `全部 / 主对话 / 子代理` 切换；存在多个 Provider 路由时展示带请求数与折算费用的路由筛选 chip。
-- **双币种估价**：默认以 **`USD $`** 显示，支持一键切换 **`CNY ¥`**（默认汇率 `7.2`，可自定义调整）。内置通用公开模型族参考价（`deepseek-*`、`claude-*`、`gpt-*`、`o1/o3/o4-*`、`gemini-*`），并支持按模型覆盖或补充自定义单价，配置原子保存在 `$DSH_HOME/.cache/paseo-dsh-pricing-v1.json`；未匹配参考表且未自定义的模型显示 `—` 且不计入已定价请求统计。
+- **双币种估价与官方价自动同步**：默认以 **`USD $`** 显示，支持一键切换 **`CNY ¥`**（默认汇率 `7.2`，可自定义调整）。插件默认启用从 **`models.dev`** 自动同步第一方官方 API 价格（每 24 小时自动刷新，也支持在定价弹窗内一键手动触发 `dsh.pricing.sync` RPC 或关闭自动同步），同步目录以 `0600` 原子缓存在 `$DSH_HOME/.cache/paseo-dsh-pricing-catalog-v1.json`，离线或网络失败时保留现有缓存并安全回退内置通用公开模型族参考表（`deepseek-*`、`claude-*`、`gpt-*`、`o1/o3/o4-*`、`gemini-*`）。解析优先级为 **自定义覆盖 > 官方同步价 > 内置参考表**，自定义单价原子保存在 `$DSH_HOME/.cache/paseo-dsh-pricing-v1.json`；未匹配任何来源的模型显示 `—` 且不计入已定价请求统计。
 
 ### 2. 插件（`插件` / Plugins）
 

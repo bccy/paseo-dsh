@@ -57,25 +57,33 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   `$DSH_HOME` 或全局安装、不起 `dsh`。**改 `server/dsh-plugins.ts` 的 `resolveBundlePackage`、
   `#describe`、`setEnabled`、remove/update 或 `readRows` 的包目录来源必跑。**
 - `paseo-plugin/test/diagnostics.test.cjs` — DSH 控制台「设置」Tab 环境概览与按需 Doctor 诊断回归
-  （**10 条**；已登记在 `offline-checks.cjs` 的 `pluginTests`，纳入 portable CI）：断言抽取自
-  `paseo-plugin/lib/doctor.mjs` 的共用纯函数 `runDoctorChecks` / `runDoctorChecksAsync`；
+  （**13 条**；已登记在 `offline-checks.cjs` 的 `pluginTests`，纳入 portable CI）：断言抽取至
+  `paseo-plugin/server/doctor-core.mjs`（由 `server/diagnostics.ts` 静态内嵌、`lib/doctor.mjs`
+  薄壳重导出）的共用纯函数 `runDoctorChecks` / `runDoctorChecksAsync`；
   凭据脱敏防泄密（含畸形 YAML、缺失 `version: 1`、非法键名、内联 key、Authorization 头、URL
   userinfo 与 query 参数，严禁泄漏 `.credentials.yaml` 原文或解析错误片段）；POSIX 权限判定
   （`0644` / `0600`）、缺失凭据文件 / 缺失 ref / 旧扁平布局检测；`dsh.diagnostics.overview`
   快速只读概览（零子进程版本探测与缓存）对比 `dsh.diagnostics.run-doctor` 完整 `--dump-config` 诊断；
   4 路并发单飞互斥（single-flight mutex）与 20s 超时清理（含挂起 runner 与真实挂起子进程）；
+  Paseo 打包隔离回归（独立 `/tmp` 子进程 `resolveDoctorModulePath(...) === undefined` 下 `overview()` /
+  `runDoctor()` 正常、Paseo `eval` 包装 CJS bundle 下 `import.meta.url === undefined` 且无 `__dirname`
+  正常求值，以及 `options.doctorModule` / `options.doctorModulePath` 测试覆盖）；
   以及 `paseo-dsh doctor` CLI 零回退。运行：`cd paseo-plugin && node --test test/diagnostics.test.cjs`。
-  **动了 `lib/doctor.mjs` 共用校验、`shared/diagnostics.ts`、`server/diagnostics.ts` 或
+  **动了 `server/doctor-core.mjs`、`lib/doctor.mjs` 共用校验、`shared/diagnostics.ts`、`server/diagnostics.ts` 或
   `index.server.ts` 的诊断 RPC 接线必跑。**
-- `paseo-plugin/test/pricing.test.cjs` — 双币种模型估价引擎、持久化存储与 RPC 契约回归
-  （**11 条**；已登记在 `offline-checks.cjs` 的 `pluginTests`，纳入 portable CI）：通用公开模型族
-  前缀匹配与边界安全（`deepseek-*`、`claude-*`、`gpt-*`、`o1/o3/o4-*`、`gemini-*`）及自定义覆盖优先；
-  长上下文阶梯（`longContextThreshold`）与 `cacheWrite` 回退；`USD` / `CNY` 混币种按各自原生币种计算
-  并按汇率统一折算；未定价模型排除在 `pricedRequests` 之外；`$DSH_HOME/.cache/paseo-dsh-pricing-v1.json`
-  原子写入（`tmp + rename`、`0o600`）与并发串行更新；覆盖项增删与 `resetOverrides`/`resetAll`、
-  非法汇率/负单价/畸形输入校验与损坏文件安全恢复；以及 `dsh.pricing.get` / `dsh.pricing.update`
-  RPC 契约往返。运行：`cd paseo-plugin && node --test test/pricing.test.cjs`。
-  **动了 `shared/pricing.ts`、`server/pricing.ts` 或 `index.server.ts` 的定价 RPC 接线必跑。**
+- `paseo-plugin/test/pricing.test.cjs` — 双币种模型估价引擎、官方价格自动同步、持久化存储与 RPC 契约回归
+  （**16 条**；已登记在 `offline-checks.cjs` 的 `pluginTests`，纳入 portable CI）：`models.dev` 官方 API
+  目录解析（`parseModelsDevCatalog`、官方第一方 provider 优先级与厂商命名空间防抢占、上下文阶梯与
+  `cache_read` 回退）、通用公开模型族前缀匹配与边界安全（`deepseek-*`、`claude-*`、`gpt-*`、`o1/o3/o4-*`、
+  `gemini-*`，含 tier 限定词防错折与解析优先级 `overrides > synced > reference > unpriced`、已同步行不泄漏
+  内置参考备注）；长上下文阶梯（`longContextThreshold`）与 `cacheWrite` 回退；`USD` / `CNY` 混币种按各自
+  原生币种计算并按汇率统一折算；未定价模型排除在 `pricedRequests` 之外；`$DSH_HOME/.cache/paseo-dsh-pricing-v1.json`
+  与官方同步缓存 `$DSH_HOME/.cache/paseo-dsh-pricing-catalog-v1.json` 原子写入（`tmp + rename`、`0o600`）、
+  24h TTL / 单飞互斥 / 并发串行更新与网络/HTTP/畸形 JSON/体积上限/超时失败保底（不破坏有效缓存并回退内置参考表）；
+  覆盖项增删与 `resetOverrides`/`resetAll`、非法汇率/负单价/畸形输入校验与损坏文件安全恢复；
+  `dsh.pricing.get` / `dsh.pricing.update` / `dsh.pricing.sync` RPC 契约与启动定时同步 `dispose()` 清理；
+  以及 `shared/pricing.ts` Hermes 安全与 lifecycle-hook 红线断言。运行：`cd paseo-plugin && node --test test/pricing.test.cjs`。
+  **动了 `shared/pricing.ts`、`server/pricing.ts`、`client/console-pricing.tsx` 或 `index.server.ts` 的定价 RPC 接线必跑。**
 - `paseo-plugin/test/usage-stats.test.cjs` — DSH 会话日志用量引擎与落盘增量缓存回归
   （**5 条**；已登记在 `offline-checks.cjs` 的 `pluginTests`，纳入 portable CI）：解析
   `.v4.jsonl.zstd` 与未压缩 `.jsonl` 会话日志；`$DSH_HOME/.cache/paseo-dsh-usage-v1.json` 原子增量缓存的

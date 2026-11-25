@@ -67,8 +67,11 @@ What you get that the ACP boundary can't carry:
   heatmap, `24h`/`7d`/`30d` KPI tiles + sparklines, hover/tap full-metric chart,
   8-column sortable model breakdown, main/subagent split, provider routing
   chips, incremental disk cache in `$DSH_HOME/.cache/paseo-dsh-usage-v1.json`,
-  and dual-currency `USD $` / `CNY ¥` pricing with editable FX rate and custom
-  overrides in `$DSH_HOME/.cache/paseo-dsh-pricing-v1.json`), **Plugins**
+  and dual-currency `USD $` / `CNY ¥` pricing with editable FX rate, automatic
+  official API pricing sync from `models.dev` (cached in
+  `$DSH_HOME/.cache/paseo-dsh-pricing-catalog-v1.json`, refreshable via
+  `dsh.pricing.sync`, with built-in fallback), and custom overrides in
+  `$DSH_HOME/.cache/paseo-dsh-pricing-v1.json`), **Plugins**
   (manage profile bundles with Modal confirmations and Toast feedback; changes
   apply to new sessions), and **Settings** (instant read-only Environment &
   Route Overview, on-demand Full Doctor diagnostics, UI language & currency/FX
@@ -163,7 +166,7 @@ ACP 承载不了、而这里都有：
 - DSH `approval/request` 的**工具审批卡**
 - **撤回**：对话 + 文件都回退（消息行消失、被编辑工具改过的文件恢复、模型看不到被撤内容）；Paseo 0.15+ 时间线由宿主原生刷新，无需 Reload
 - 统一的 **DSH 控制台**（侧栏入口，3-Tab；Paseo 设置页与 Command Center 直达「设置」Tab）：
-  - **用量**：53 周热力图、`24h`/`7d`/`30d`、6 项可点 KPI + sparkline、全指标主图、8 列可排序模型占比表、主/子代理拆分与 Provider 路由筛选、落盘增量缓存（`$DSH_HOME/.cache/paseo-dsh-usage-v1.json`）与后台预热，以及 `USD $` / `CNY ¥` 双币种估价（默认 USD、汇率 `7.2` 可调、通用公开模型族参考表 + 自定义单价保存于 `$DSH_HOME/.cache/paseo-dsh-pricing-v1.json`）
+  - **用量**：53 周热力图、`24h`/`7d`/`30d`、6 项可点 KPI + sparkline、全指标主图、8 列可排序模型占比表、主/子代理拆分与 Provider 路由筛选、落盘增量缓存（`$DSH_HOME/.cache/paseo-dsh-usage-v1.json`）与后台预热，以及 `USD $` / `CNY ¥` 双币种估价（默认 USD、汇率 `7.2` 可调、支持从 `models.dev` 自动同步官方 API 价格并缓存于 `$DSH_HOME/.cache/paseo-dsh-pricing-catalog-v1.json`，可通过 `dsh.pricing.sync` 手动刷新，内置参考表兜底 + 自定义单价保存于 `$DSH_HOME/.cache/paseo-dsh-pricing-v1.json`）
   - **插件**：列出并启停、安装、卸载、更新 profile 里的 bundle（新会话生效），带宿主 Modal 确认与 Toast 反馈
   - **设置**：秒开只读环境与路由概览 + 按需完整 Doctor 诊断（`ok/warn/fail` 徽标与修复提示）、界面语言与默认币种/汇率偏好、以及 `紧凑 / 默认 / 宽松` 时间线样式预设和可折叠的高级间距微调
 - **时间线卡片升级**：`subagent` / `subagent_fork` 轻量可展开卡片（仅展示实测事实，原地展开任务全文与报告并支持复制）、`list_agents` / `archive_subagents` 行尾内联状态计数 chip、中英双语 `stream-stats`（色阶上下文 `Bar` + 三色 `TokenBar`）、`team-card` 真实溢出折叠、轻量无框 `RewindNotice`
