@@ -52,7 +52,8 @@ import {
 import { dshHome } from "./bootstrap";
 import { assistantStreamFirstTokenTime } from "./first-token";
 
-const CACHE_VERSION = 1 as const;
+// v2: seeded/fork sessions no longer re-count their fork-inherited event prefix.
+const CACHE_VERSION = 2 as const;
 const DEFAULT_CACHE_FILENAME = "paseo-dsh-usage-v1.json";
 const DEFAULT_CONCURRENCY = 8;
 const DEFAULT_PREWARM_DELAY_MS = 3_000;
@@ -253,18 +254,78 @@ function lineMayBeRelevant(line: string): boolean {
   );
 }
 
+/** Canonical row prefix of a DSH v4 `session/end-seed` event (fast pre-scan). */
+const END_SEED_ROW_PREFIX = '{"type":"session/end-seed"';
+/** Substring form for non-canonical rows whose keys are reordered. */
+const END_SEED_TYPE_TOKEN = '"session/end-seed"';
+
+/**
+ * Locate the fork-inherited cut of a seeded DSH v4 session file: the `seq` of
+ * the final `session/end-seed` event carrying `data.inherited === true`.
+ * DSH's own v4 decoder derives `inheritedEventCount` from exactly that event
+ * (a seeded header must carry one and no inherited marker may follow it), so
+ * every event at `seq <= cut` belongs to the fork parent and the child file
+ * must not count it again.
+ *
+ * Only rows that can be a marker event are JSON-parsed; quoted copies of the
+ * marker text inside messages/tool results carry escaped quotes and are skipped.
+ *
+ * @returns the cut seq, or `undefined` when the file has no inherited marker.
+ */
+function findInheritedSeedCut(content: string): number | undefined {
+  let cut: number | undefined;
+  let from = 0;
+  for (;;) {
+    const hit = content.indexOf(END_SEED_TYPE_TOKEN, from);
+    if (hit === -1) return cut;
+    const lineStart = content.lastIndexOf("\n", hit) + 1;
+    let lineEnd = content.indexOf("\n", hit + END_SEED_TYPE_TOKEN.length);
+    if (lineEnd === -1) lineEnd = content.length;
+    const line = content.slice(lineStart, lineEnd);
+    // Canonical rows are O(1)-classified; reordered keys also surface as `"inherited"`.
+    if (line.startsWith(END_SEED_ROW_PREFIX) || line.includes('"inherited"')) {
+      let event: unknown;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        event = undefined;
+      }
+      if (
+        isRecord(event) &&
+        event.type === "session/end-seed" &&
+        isRecord(event.data) &&
+        event.data.inherited === true &&
+        typeof event.seq === "number" &&
+        Number.isSafeInteger(event.seq) &&
+        event.seq >= 0
+      ) {
+        cut = event.seq;
+      }
+    }
+    from = lineEnd + 1;
+  }
+}
+
 /**
  * Parse the decompressed JSONL text of one DSH v4 session file into subagent
  * classification and metered LLM call records.
  *
  * Tolerates trailing/mid-file corrupt JSON lines without throwing so partially
  * flushed or damaged logs yield all valid calls they contain.
+ *
+ * For seeded (fork) sessions — whose log begins with a copy of the parent's
+ * event prefix — only events after the inherited cut are counted, so parent
+ * usage is not double-counted in the child file. A seeded file without an
+ * inherited `session/end-seed` marker is structurally corrupt and throws (the
+ * caller records it via the existing corrupt-file path).
  */
 export function parseSessionJsonl(
   content: string,
   fallbackTimeMs?: number,
 ): { isSubagent: boolean; calls: CachedCallRecord[] } {
   let isSubagent = false;
+  /** Last inherited `session/end-seed` seq; only events after it are child-owned. */
+  let inheritedCut: number | undefined;
   const calls: CachedCallRecord[] = [];
   const stepStarts = new Map<string, number>();
   let lastContext: { provider?: string; model?: string; contextWindow?: number } | null = null;
@@ -296,6 +357,12 @@ export function parseSessionJsonl(
         isSubagent =
           header.origin === "subagent" ||
           (typeof header.delegationDepth === "number" && header.delegationDepth > 0);
+        if (header.isSeeded === true) {
+          inheritedCut = findInheritedSeedCut(content);
+          if (inheritedCut === undefined) {
+            throw new Error("seeded session is missing its inherited session/end-seed marker");
+          }
+        }
         continue;
       }
       // If line 0 wasn't a session header (e.g. truncated/headless log), process it normally below.
@@ -329,6 +396,11 @@ export function parseSessionJsonl(
       continue;
     }
     if (isRecord(event)) {
+      // Seeded sessions: everything at or before the inherited cut is the fork
+      // parent's history, already counted in the parent file.
+      if (inheritedCut !== undefined && !(typeof event.seq === "number" && event.seq > inheritedCut)) {
+        continue;
+      }
       processEvent(event);
     }
   }

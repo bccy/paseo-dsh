@@ -51,14 +51,14 @@ function writeSessionFile(sessionsDir, relPath, lines, { zstd = false, mtimeMs }
   return abs;
 }
 
-function sessionHeader({ id = "sess-1", origin, delegationDepth = 0 } = {}) {
+function sessionHeader({ id = "sess-1", origin, delegationDepth = 0, isSeeded = false } = {}) {
   return {
     type: "session",
     version: 4,
     id,
     createdAt: 1_750_000_000_000,
     cwd: "/workspace/demo",
-    isSeeded: false,
+    isSeeded,
     ...(origin ? { origin } : {}),
     delegationDepth,
   };
@@ -288,6 +288,219 @@ test("parseSessionJsonl handles subagent detection, provider/model fallback, pac
   assert.equal(parsed.calls[3].generationSec, 2);
 });
 
+test("parseSessionJsonl skips the fork-inherited prefix of seeded sessions", () => {
+  const base = 1_760_000_000_000;
+  const finishStream = (atMs, provider, model) => [
+    { type: "chunk", time: atMs - 2_000, chunk: { type: "text-delta", text: "ok" } },
+    {
+      type: "chunk",
+      time: atMs,
+      chunk: { type: "finish", reason: "stop", replayState: { response: { provider, model } } },
+    },
+  ];
+  const usageCall = (seq, turn, step, eventMs, inputTokens, outputTokens, provider, model) => ({
+    type: "assistant/message",
+    seq,
+    time: eventMs,
+    data: {
+      turn,
+      step,
+      message: { role: "assistant", content: "ok" },
+      usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens },
+      stream: finishStream(eventMs, provider, model),
+    },
+  });
+
+  const lines = [
+    sessionHeader({ id: "seeded-child", origin: "subagent", delegationDepth: 1, isSeeded: true }),
+    // Inherited parent setup. Text that merely quotes the marker must not become a cut.
+    { type: "request/context", seq: 0, time: base - 90_000, data: { provider: "parent-prov", model: "parent-model", contextWindow: 200_000 } },
+    { type: "user/message", seq: 1, time: base - 85_000, data: { text: 'history mentions "session/end-seed" in prose' } },
+    usageCall(2, 1, 1, base - 80_000, 9_000, 1_000, "parent-prov", "parent-model"),
+    // An ancestor cut inside the inherited prefix (fork of a fork)...
+    { type: "session/end-seed", seq: 3, time: base - 75_000, data: { inherited: true } },
+    // ...followed by the immediate parent's own inherited call.
+    usageCall(4, 2, 1, base - 70_000, 4_000, 500, "parent-prov", "parent-model"),
+    // This file's inherited cut: the FINAL inherited marker wins. Reordered keys exercise the tolerant pre-scan.
+    JSON.stringify({ seq: 5, time: base - 65_000, data: { inherited: true }, type: "session/end-seed" }),
+    // Child-owned history starts here.
+    { type: "step/start", seq: 6, time: base - 10_000, data: { turn: 3, step: 1 } },
+    usageCall(7, 3, 1, base - 5_000, 100, 50, "child-prov", "child-model"),
+    // Ordinary resume marker (`data.inherited` absent) must not move the cut.
+    { type: "session/end-seed", seq: 8, time: base - 4_000, data: {} },
+  ];
+
+  const parsed = parseSessionJsonl(lines.map((line) => (typeof line === "string" ? line : JSON.stringify(line))).join("\n"), base);
+  assert.equal(parsed.isSubagent, true);
+  // Only the child-owned call after the final inherited marker is counted; the
+  // 13,000 inherited input tokens never reach the child's usage totals.
+  assert.equal(parsed.calls.length, 1);
+  assert.equal(parsed.calls[0].input, 100);
+  assert.equal(parsed.calls[0].output, 50);
+  assert.equal(parsed.calls[0].provider, "child-prov");
+  assert.equal(parsed.calls[0].model, "child-model");
+  assert.equal(parsed.calls[0].firstTokenSec, 3);
+
+  // A seeded header whose log has no inherited cut is structurally corrupt (DSH v4 requires one).
+  const brokenSeed = [
+    sessionHeader({ id: "seeded-broken", isSeeded: true, delegationDepth: 1 }),
+    { type: "session/end-seed", seq: 0, time: base, data: {} },
+    usageCall(1, 1, 1, base - 5_000, 100, 50, "child-prov", "child-model"),
+  ];
+  assert.throws(
+    () => parseSessionJsonl(brokenSeed.map((line) => JSON.stringify(line)).join("\n"), base),
+    /missing its inherited session\/end-seed marker/,
+  );
+
+  // Only a seeded header opts into cut handling; unseeded logs keep every call.
+  const unseeded = [
+    sessionHeader({ id: "plain" }),
+    { type: "session/end-seed", seq: 0, time: base, data: { inherited: true } },
+    usageCall(1, 1, 1, base - 5_000, 100, 50, "child-prov", "child-model"),
+  ];
+  assert.equal(parseSessionJsonl(unseeded.map((line) => JSON.stringify(line)).join("\n"), base).calls.length, 1);
+});
+
+test("engine counts only fork-owned events in seeded files and caches seeded files without an inherited cut as corrupt", async () => {
+  const dir = makeTempDir();
+  try {
+    const sessionsDir = path.join(dir, "sessions");
+    const cachePath = usageCachePath(dir);
+    const fixedNow = new Date(2026, 10, 20, 14, 30, 0, 0).getTime();
+
+    // 1. Seeded subagent session: inherited prefix (2 parent calls) + cut + 1 child-owned call.
+    writeSessionFile(
+      sessionsDir,
+      "proj-a/sess-seeded/session.v4.jsonl.zstd",
+      [
+        sessionHeader({ id: "sess-seeded", origin: "subagent", delegationDepth: 1, isSeeded: true }),
+        ...makeCallLines({
+          turn: 1,
+          step: 1,
+          stepStartMs: fixedNow - 60_000,
+          firstTokenMs: fixedNow - 58_000,
+          finishMs: fixedNow - 56_000,
+          eventMs: fixedNow - 56_000,
+          provider: "route-parent",
+          model: "model-usd",
+          inputTokens: 1_000_000,
+          outputTokens: 200_000,
+        }),
+        ...makeCallLines({
+          turn: 2,
+          step: 2,
+          stepStartMs: fixedNow - 55_000,
+          firstTokenMs: fixedNow - 54_000,
+          finishMs: fixedNow - 53_000,
+          eventMs: fixedNow - 53_000,
+          provider: "route-parent",
+          model: "model-usd",
+          inputTokens: 500_000,
+          outputTokens: 100_000,
+        }),
+        // Inherited cut: makeCallLines emits seq 30/35 for turn 3 step 3 below, so 26 lands right before it.
+        { type: "session/end-seed", seq: 26, time: fixedNow - 50_000, data: { inherited: true } },
+        ...makeCallLines({
+          turn: 3,
+          step: 3,
+          stepStartMs: fixedNow - 12_000,
+          firstTokenMs: fixedNow - 11_000,
+          finishMs: fixedNow - 9_000,
+          eventMs: fixedNow - 9_000,
+          provider: "route-child",
+          model: "model-cny",
+          inputTokens: 2_000,
+          outputTokens: 400,
+        }),
+      ],
+      { zstd: true, mtimeMs: fixedNow - 60_000 },
+    );
+
+    // 2. Seeded header whose log lost its inherited marker -> corrupt (old enough to be cached as corrupt).
+    writeSessionFile(
+      sessionsDir,
+      "proj-b/sess-seeded-broken/session.v4.jsonl.zstd",
+      [
+        sessionHeader({ id: "sess-seeded-broken", origin: "subagent", delegationDepth: 1, isSeeded: true }),
+        ...makeCallLines({
+          turn: 1,
+          step: 1,
+          stepStartMs: fixedNow - 40_000,
+          firstTokenMs: fixedNow - 39_000,
+          finishMs: fixedNow - 37_000,
+          eventMs: fixedNow - 37_000,
+          provider: "route-parent",
+          model: "model-usd",
+          inputTokens: 700_000,
+          outputTokens: 70_000,
+        }),
+      ],
+      { zstd: true, mtimeMs: fixedNow - 300_000 },
+    );
+
+    // 3. Ordinary unseeded main session.
+    writeSessionFile(sessionsDir, "proj-c/sess-main/session.jsonl", [
+      sessionHeader({ id: "sess-main", delegationDepth: 0 }),
+      ...makeCallLines({
+        turn: 1,
+        step: 1,
+        stepStartMs: fixedNow - 20_000,
+        firstTokenMs: fixedNow - 19_000,
+        finishMs: fixedNow - 17_000,
+        eventMs: fixedNow - 17_000,
+        provider: "route-main",
+        model: "model-usd",
+        inputTokens: 1_000,
+        outputTokens: 100,
+      }),
+    ], { mtimeMs: fixedNow - 60_000 });
+
+    const engine = new UsageStatsEngine({
+      dshHome: dir,
+      pricer: UNPRICED_PRICER,
+      now: () => fixedNow,
+    });
+
+    const report = await engine.refresh();
+    assert.equal(report.scanned, 3);
+    assert.equal(report.parsed, 3);
+    assert.equal(report.corrupt, 1);
+
+    // Bumped cache version invalidates older caches and records the seeded outcome.
+    const diskCache = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+    assert.equal(diskCache.version, 2);
+    const seededEntry = diskCache.files["proj-a/sess-seeded/session.v4.jsonl.zstd"];
+    assert.equal(seededEntry.isSubagent, true);
+    assert.equal(seededEntry.calls.length, 1);
+    assert.equal(seededEntry.calls[0].input, 2_000);
+    assert.equal(seededEntry.calls[0].output, 400);
+    const brokenEntry = diskCache.files["proj-b/sess-seeded-broken/session.v4.jsonl.zstd"];
+    assert.equal(brokenEntry.corrupt, true);
+    assert.deepEqual(brokenEntry.calls, []);
+
+    const stats = await engine.stats({ range: "today" });
+    usageStatsSchema.parse(stats);
+    // Main 1 call + child-owned 1 call. The 1.5M inherited prefix tokens are not counted again.
+    assert.equal(stats.totals.requests, 2);
+    assert.equal(stats.totals.input, 3_000);
+    assert.equal(stats.totals.output, 500);
+    assert.equal(stats.sessions, 2);
+    assert.equal(stats.hasSubagents, true);
+    assert.equal(stats.breakdown.main.requests, 1);
+    assert.equal(stats.breakdown.subagent.requests, 1);
+
+    // The 53-week rollup follows the same own-events-only rule.
+    const daily = await engine.daily();
+    usageDailySchema.parse(daily);
+    assert.equal(daily.summary.totalRequests, 2);
+    assert.equal(daily.summary.totalTokens, 3_500);
+
+    engine.dispose();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("engine parses zstd + jsonl, caches incrementally, invalidates on edit, prunes deleted, and tolerates corrupt files", async () => {
   const dir = makeTempDir();
   try {
@@ -369,7 +582,7 @@ test("engine parses zstd + jsonl, caches incrementally, invalidates on edit, pru
     const cacheDirFiles = fs.readdirSync(path.dirname(cachePath));
     assert.deepEqual(cacheDirFiles, ["paseo-dsh-usage-v1.json"]);
     const diskCache = JSON.parse(fs.readFileSync(cachePath, "utf8"));
-    assert.equal(diskCache.version, 1);
+    assert.equal(diskCache.version, 2);
     assert.equal(Object.keys(diskCache.files).length, 3);
     assert.equal(diskCache.files["proj-a/sess-main/session.v4.jsonl.zstd"].isSubagent, false);
     assert.equal(diskCache.files["proj-a/sess-sub/session.jsonl"].isSubagent, true);
