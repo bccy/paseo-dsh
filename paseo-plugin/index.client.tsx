@@ -18,14 +18,20 @@
 import { settingsRpc } from "@getpaseo/plugin";
 import type {
   PluginClientContext,
+  PluginGlobalCommandContext,
   PluginScreenProps,
   PluginSidebarItemProps,
+  PluginSurfaceProps,
 } from "@getpaseo/plugin/client";
 import { SidebarRow } from "@getpaseo/plugin/client/ui";
 import { z } from "zod";
-import { DshPluginsPage } from "./client/dsh-plugins-page";
+import {
+  CONSOLE_SCREEN_ID,
+  DshConsoleScreen,
+  requestConsoleTab,
+} from "./client/console-screen";
+import { DEEPSEEK_MARK_SVG } from "./client/deepseek-mark-svg";
 import { guardCleanup, installFatalGuard, report } from "./client/dsh-plugins-guard";
-import { PluginsIcon } from "./client/dsh-plugins-icon";
 import { contributeGoalPill } from "./client/goal-pill";
 import { InlineThinking } from "./client/inline-thinking";
 import { contributeJobsPill } from "./client/jobs-pill";
@@ -33,12 +39,15 @@ import {
   DISPLAY_SETTINGS_ID,
   contributeDisplaySettingsCommand,
   contributeTimelineSettings,
+  registerWithLiveTitle,
 } from "./client/settings-screen";
 import { contributeStreamStats } from "./client/stream-stats";
 import { contributeTeamPill } from "./client/team-pill";
+import { useLocaleText } from "./client/use-locale";
 import { createWorkspaceStatusStore } from "./client/workspace-status";
 import { contributeWorkspaceBadges } from "./client/workspace-badges";
 import {
+  adoptHostLocale,
   localeFromMetadata,
   localeText,
   setLanguageOverride,
@@ -60,25 +69,25 @@ import {
 } from "./shared/rewind-notice";
 import { languageSettings } from "./shared/settings";
 
-/** The screen's id; the sidebar row opens this same id. */
-const PLUGINS_SCREEN_ID = "dsh-plugins";
-
 /**
- * The sidebar header row that opens the page.
+ * The sidebar header row that opens the unified DSH Console on Tab 1 (`usage`).
  *
- * A component, not a host-drawn icon+surface pair: host 0.16's current API
- * (`addSidebarHeaderItem`) takes a component rendering `SidebarRow`, and the
- * deprecated `addSidebarItem({ icon, surface })` that upstream 0.2.22 used is
- * not worth adopting in a new port. The registered title is a resolved string
- * (see `contribute`), which is what the native app can render safely; the icon
- * is view-drawn for the same reason (`client/dsh-plugins-icon`).
+ * Uses host 0.16+'s `addSidebarHeaderItem` + `SidebarRow` with the DeepSeek whale
+ * mark and a live-localized label from `useLocaleText()`.
  */
-function PluginsSidebarItem({ currentScreen, openScreen }: PluginSidebarItemProps) {
+function ConsoleSidebarItem({ currentScreen, openScreen }: PluginSidebarItemProps) {
+  const title = useLocaleText().console.title;
   return (
     <SidebarRow
-      icon={PluginsIcon}
-      active={currentScreen?.screenId === PLUGINS_SCREEN_ID}
-      onPress={() => openScreen({ screenId: PLUGINS_SCREEN_ID })}
+      icon={{ svg: DEEPSEEK_MARK_SVG }}
+      label={title}
+      active={currentScreen?.screenId === CONSOLE_SCREEN_ID}
+      onPress={() => {
+        if (currentScreen?.screenId !== CONSOLE_SCREEN_ID) {
+          requestConsoleTab("usage");
+        }
+        openScreen({ screenId: CONSOLE_SCREEN_ID, params: { tab: "usage" } });
+      }}
     />
   );
 }
@@ -102,8 +111,8 @@ export default function contribute(client: PluginClientContext) {
 /**
  * Read the host's persisted language choice once at plugin load.
  *
- * Failures degrade silently to `"auto"` (relayed locale or client default) so
- * an older host or transient RPC failure never blocks client startup.
+ * Failures degrade silently to `"auto"` (relayed/host locale or client default)
+ * so an older host or transient RPC failure never blocks client startup.
  */
 function bootstrapLanguage(client: PluginClientContext): void {
   void Promise.resolve()
@@ -119,6 +128,10 @@ function bootstrapLanguage(client: PluginClientContext): void {
 }
 
 function buildContributions(client: PluginClientContext): () => void {
+  // Sync Paseo's active UI locale immediately on startup (guarded with optional
+  // chaining for Paseo 0.16 / headless mocks) so the console and first rows
+  // match the host language before the first tool call arrives.
+  adoptHostLocale(client.i18n?.locale);
   bootstrapLanguage(client);
   client.addTimelineTransformer({
     id: "dsh-inline-thinking",
@@ -376,44 +389,57 @@ function buildContributions(client: PluginClientContext): () => void {
   // (host v0.15.3), so all three may be visible together and each decides its
   // own visibility — no cross-pill coordination.
   const workspaceStatus = createWorkspaceStatusStore();
-  // The DSH Plugins page. `localeText()` is the fork's client half of the copy
-  // tables (`client/locale.ts`): the title registered with the host is the
-  // *resolved* string, because on native the host renders contribution titles
-  // outside this plugin's boundaries and a message object it cannot resolve is
-  // the failure mode the 0.2.22 native-safety work removed. Each registration is
-  // guarded on its own: a host that rejects one (unknown icon, unsupported
-  // surface) costs that entry only, never the four timeline renderers above.
-  const pluginsTitle = localeText().plugins.pageTitle;
-  const openDisplaySettings = () => {
-    void Promise.resolve()
-      .then(() => client.openSettings(DISPLAY_SETTINGS_ID))
-      .catch((error) => {
-        report("open display settings", error);
-      });
-  };
-  const PluginsScreen = (props: PluginScreenProps) => (
-    <DshPluginsPage {...props} openDisplaySettings={openDisplaySettings} />
+  // Unified 3-tab DSH Console (Usage / Plugins / Settings).
+  // Sidebar top entry opens Tab 1 (`usage`); Paseo Settings & Command Center
+  // open directly on Tab 3 (`settings`), even if the console is already mounted.
+  // Titles are registered as resolved strings via `registerWithLiveTitle` so
+  // native hosts render them safely and refresh them when language changes.
+  const ConsoleScreen = (props: PluginScreenProps) => (
+    <DshConsoleScreen {...props} initialTab="usage" />
   );
+  const ConsoleSettingsEntry = (props: PluginSurfaceProps) => (
+    <DshConsoleScreen {...props} initialTab="settings" subscribeTabRequests={false} />
+  );
+  const openConsoleSettings = (command: PluginGlobalCommandContext) => {
+    requestConsoleTab("settings");
+    if (typeof command.openScreen === "function") {
+      command.openScreen({ screenId: CONSOLE_SCREEN_ID, params: { tab: "settings" } });
+      return;
+    }
+    command.openSettings(DISPLAY_SETTINGS_ID);
+  };
   const cleanups = [
     contributeStreamStats(client),
     contributeJobsPill(client, workspaceStatus.observer("jobs")),
     contributeGoalPill(client, workspaceStatus.observer("goal")),
     contributeTeamPill(client, workspaceStatus.observer("team")),
     contributeWorkspaceBadges(client, workspaceStatus),
-    guardCleanup("timeline settings", () => contributeTimelineSettings(client)),
-    guardCleanup("display settings command", () => contributeDisplaySettingsCommand(client)),
-    guardCleanup("plugins screen", () =>
-      client.addScreen({
-        id: PLUGINS_SCREEN_ID,
-        title: pluginsTitle,
-        Component: PluginsScreen,
-      })),
-    guardCleanup("plugins sidebar", () =>
-      client.addSidebarHeaderItem({
-        id: PLUGINS_SCREEN_ID,
-        title: pluginsTitle,
-        Component: PluginsSidebarItem,
-      })),
+    guardCleanup("timeline settings", () =>
+      contributeTimelineSettings(client, ConsoleSettingsEntry)),
+    guardCleanup("display settings command", () =>
+      contributeDisplaySettingsCommand(client, openConsoleSettings)),
+    guardCleanup("console screen", () =>
+      registerWithLiveTitle(
+        "console screen title refresh",
+        () => localeText().console.title,
+        (title) =>
+          client.addScreen({
+            id: CONSOLE_SCREEN_ID,
+            title,
+            Component: ConsoleScreen,
+          }),
+      )),
+    guardCleanup("console sidebar", () =>
+      registerWithLiveTitle(
+        "console sidebar title refresh",
+        () => localeText().console.title,
+        (title) =>
+          client.addSidebarHeaderItem({
+            id: CONSOLE_SCREEN_ID,
+            title,
+            Component: ConsoleSidebarItem,
+          }),
+      )),
     () => workspaceStatus.dispose(),
     retainRowEntranceObservers(),
   ];

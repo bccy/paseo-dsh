@@ -227,6 +227,9 @@ export type DisplaySettingsFieldKey =
   | "commandMaxHeightRatio"
   | "commandMinHeight";
 
+/** Quick-preset keys for timeline spacing. */
+export type TimelinePresetKey = "compact" | "default" | "relaxed";
+
 /** Copy for the Display settings screen and its Command Center shortcut. */
 export interface DisplaySettingsText {
   /** Settings screen title and header link label on the DSH Plugins page. */
@@ -251,8 +254,92 @@ export interface DisplaySettingsText {
     en: string;
     zhCN: string;
   };
+  presets: {
+    label: string;
+    hint: string;
+    custom: string;
+    compact: string;
+    default: string;
+    relaxed: string;
+  };
+  advanced: {
+    title: string;
+    hint: string;
+    expand: string;
+    collapse: string;
+  };
   fields: Record<DisplaySettingsFieldKey, { label: string; hint: string }>;
   renderFailed: string;
+}
+
+/** Copy for the unified 3-tab DSH Console screen and its Settings tab sections. */
+export interface ConsoleText {
+  /** Unified console screen title and sidebar row label. */
+  title: string;
+  /** Concise subtitle shown in the console header on wide layouts. */
+  subtitle: string;
+  /** Error boundary fallback for the unified console screen. */
+  renderFailed: string;
+  tabs: {
+    usage: string;
+    plugins: string;
+    settings: string;
+  };
+  usagePlaceholder: {
+    title: string;
+    description: string;
+    badge: string;
+    highlights: {
+      heatmap: string;
+      metrics: string;
+      pricing: string;
+    };
+  };
+  settingsSections: {
+    environment: {
+      title: string;
+      description: string;
+      readyBadge: string;
+      placeholderTitle: string;
+      placeholderHint: string;
+      hostLabel: string;
+      cliLabel: string;
+      cliMissing: string;
+      profileLabel: string;
+      bridgeLabel: string;
+      routeLabel: string;
+      credentialsLabel: string;
+      providersModels: (providers: number, models: number) => string;
+      runDoctor: string;
+      runningDoctor: string;
+      recheck: string;
+      statusOk: string;
+      statusWarn: string;
+      statusFail: string;
+      failCalloutTitle: string;
+      loading: string;
+    };
+    general: {
+      title: string;
+      currencyLabel: string;
+      currencyHint: string;
+      currencyUsd: string;
+      currencyCny: string;
+      exchangeRateLabel: string;
+      exchangeRateHint: string;
+      exchangeRateInvalid: string;
+      exchangeRateApply: string;
+      pricingLabel: string;
+      pricingHint: string;
+      pricingAction: string;
+      pricingCustomBadge: string;
+      pricingPendingHint: string;
+    };
+    timeline: {
+      title: string;
+      intro: string;
+    };
+  };
 }
 
 export interface UiText {
@@ -306,6 +393,8 @@ export interface UiText {
   plugins: DshPluginsText;
   /** Copy for the Display settings screen and its entry points. */
   settings: DisplaySettingsText;
+  /** Copy for the unified DSH Console screen, tabs, and Settings tab sections. */
+  console: ConsoleText;
 }
 
 /**
@@ -1535,10 +1624,24 @@ const TEXT: Record<Locale, UiText> = {
       outOfRange: (label, min, max) => `“${label}” must be between ${min} and ${max}`,
       language: {
         label: "Language",
-        hint: "Automatic follows the server-relayed locale (defaulting to Simplified Chinese). A choice here overrides it for this plugin's own UI.",
+        hint: "Automatic follows the host or server locale (defaulting to Simplified Chinese). A choice here overrides it for this plugin's own UI.",
         auto: "Automatic",
         en: "English",
         zhCN: "简体中文",
+      },
+      presets: {
+        label: "Quick presets",
+        hint: "Apply a balanced spacing preset immediately, or fine-tune individual pixel values below.",
+        custom: "Custom spacing active",
+        compact: "Compact",
+        default: "Default",
+        relaxed: "Relaxed",
+      },
+      advanced: {
+        title: "Advanced spacing tweaks",
+        hint: "Fine-tune individual row spacing, minimum heights, and drawer caps.",
+        expand: "Show",
+        collapse: "Hide",
       },
       fields: {
         rowMarginY: {
@@ -1571,6 +1674,71 @@ const TEXT: Record<Locale, UiText> = {
         },
       },
       renderFailed: "This screen could not be rendered.",
+    },
+    console: {
+      title: "DSH Console",
+      subtitle: "Usage, plugins, diagnostics, and display preferences",
+      renderFailed: "The DSH Console could not be rendered. Reopen it; if the issue persists, check the daemon log.",
+      tabs: {
+        usage: "Usage",
+        plugins: "Plugins",
+        settings: "Settings",
+      },
+      usagePlaceholder: {
+        title: "Usage & Cost Overview",
+        description: "Local DSH session analytics, dual-currency cost estimates, and per-model breakdowns will appear here once the usage engine is connected.",
+        badge: "Ready for Usage Engine",
+        highlights: {
+          heatmap: "53-week activity heatmap & daily streaks",
+          metrics: "24h / 7d / 30d KPI tiles, token throughput, cache hit rate & TTFT",
+          pricing: "Dual-currency USD / CNY estimates with customizable model pricing",
+        },
+      },
+      settingsSections: {
+        environment: {
+          title: "Environment & Route Overview",
+          description: "Inspect DSH runtime paths, profile readiness, default route, and run full diagnostics on demand.",
+          readyBadge: "Ready",
+          placeholderTitle: "Diagnostics service not connected yet",
+          placeholderHint: "Environment overview and on-demand Doctor checks will appear here once the diagnostics RPC is wired.",
+          hostLabel: "Host",
+          cliLabel: "DSH CLI",
+          cliMissing: "Not found",
+          profileLabel: "Profile",
+          bridgeLabel: "Bridge",
+          routeLabel: "Default route",
+          credentialsLabel: "Credentials",
+          providersModels: (providers, models) => `${providers} provider${providers === 1 ? "" : "s"} · ${models} model${models === 1 ? "" : "s"}`,
+          runDoctor: "Run full diagnostics",
+          runningDoctor: "Running diagnostics…",
+          recheck: "Re-check",
+          statusOk: "OK",
+          statusWarn: "Warning",
+          statusFail: "Failed",
+          failCalloutTitle: "Diagnostics reported issues that need attention",
+          loading: "Checking environment…",
+        },
+        general: {
+          title: "General & Cost Preferences",
+          currencyLabel: "Default display currency",
+          currencyHint: "Choose how estimated usage costs are displayed across the console.",
+          currencyUsd: "USD ($)",
+          currencyCny: "CNY (¥)",
+          exchangeRateLabel: "USD → CNY exchange rate",
+          exchangeRateHint: "Used to convert between USD and CNY model rates (default 7.2).",
+          exchangeRateInvalid: "Enter a positive number between 0.01 and 1000.",
+          exchangeRateApply: "Apply",
+          pricingLabel: "Model pricing",
+          pricingHint: "Review reference model family rates or set per-model overrides.",
+          pricingAction: "Manage pricing",
+          pricingCustomBadge: "Custom",
+          pricingPendingHint: "Available once the usage & pricing service is connected.",
+        },
+        timeline: {
+          title: "Timeline Display Style",
+          intro: "Choose a spacing preset or expand advanced tweaks to fine-tune individual timeline metrics.",
+        },
+      },
     },
   },
   "zh-CN": {
@@ -2190,10 +2358,24 @@ const TEXT: Record<Locale, UiText> = {
       outOfRange: (label, min, max) => `「${label}」须在 ${min} ~ ${max} 之间`,
       language: {
         label: "界面语言",
-        hint: "「自动」跟随服务端透传的语言（默认简体中文）；在这里选择后，本插件自己的界面优先使用所选语言。",
+        hint: "「自动」跟随宿主或服务端透传的语言（默认简体中文）；在这里选择后，本插件自己的界面优先使用所选语言。",
         auto: "自动",
         en: "English",
         zhCN: "简体中文",
+      },
+      presets: {
+        label: "快捷预设",
+        hint: "一键套用均衡的间距预设，或展开下方高级微调逐项设定像素值。",
+        custom: "当前为自定义间距",
+        compact: "紧凑",
+        default: "默认",
+        relaxed: "宽松",
+      },
+      advanced: {
+        title: "高级间距微调",
+        hint: "逐项调整行间距、最小高度与展开/命令块滚动上限。",
+        expand: "展开",
+        collapse: "收起",
       },
       fields: {
         rowMarginY: {
@@ -2226,6 +2408,71 @@ const TEXT: Record<Locale, UiText> = {
         },
       },
       renderFailed: "这个页面渲染失败。",
+    },
+    console: {
+      title: "DSH 控制台",
+      subtitle: "用量统计、插件管理、环境诊断与显示偏好",
+      renderFailed: "DSH 控制台渲染失败。重新打开试试；如果反复出现，请检查 daemon 日志。",
+      tabs: {
+        usage: "用量",
+        plugins: "插件",
+        settings: "设置",
+      },
+      usagePlaceholder: {
+        title: "用量与费用概览",
+        description: "接入本地用量引擎后，这里将展示 DSH 会话消耗统计、双币种费用估算与按模型占比明细。",
+        badge: "用量引擎槽位就绪",
+        highlights: {
+          heatmap: "53 周活跃热力图与连续活跃天数",
+          metrics: "24h / 7d / 30d 核心指标卡片、输出速度、缓存命中率与首字延迟",
+          pricing: "支持 USD / CNY 双币种折算与自定义模型单价管理",
+        },
+      },
+      settingsSections: {
+        environment: {
+          title: "环境与路由概览",
+          description: "查看 DSH 运行环境、Profile 就绪态与默认路由，并按需执行完整诊断。",
+          readyBadge: "已就绪",
+          placeholderTitle: "诊断服务尚未接入",
+          placeholderHint: "接入诊断 RPC 后，这里将展示只读环境概览与按需 Doctor 完整检查。",
+          hostLabel: "当前主机",
+          cliLabel: "DSH CLI",
+          cliMissing: "未找到",
+          profileLabel: "Profile",
+          bridgeLabel: "桥接状态",
+          routeLabel: "默认路由",
+          credentialsLabel: "凭据状态",
+          providersModels: (providers, models) => `${providers} 个 Provider · ${models} 个模型`,
+          runDoctor: "运行完整诊断",
+          runningDoctor: "正在运行诊断…",
+          recheck: "重新检查",
+          statusOk: "正常",
+          statusWarn: "警告",
+          statusFail: "失败",
+          failCalloutTitle: "诊断发现需要处理的问题",
+          loading: "正在读取环境信息…",
+        },
+        general: {
+          title: "常规与费用偏好",
+          currencyLabel: "默认费用币种",
+          currencyHint: "选择控制台内估算费用的默认显示币种。",
+          currencyUsd: "USD ($)",
+          currencyCny: "CNY (¥)",
+          exchangeRateLabel: "USD → CNY 汇率",
+          exchangeRateHint: "用于 USD 与 CNY 模型单价之间的折算（默认 7.2）。",
+          exchangeRateInvalid: "请输入 0.01 ~ 1000 之间的有效正数。",
+          exchangeRateApply: "应用",
+          pricingLabel: "模型单价管理",
+          pricingHint: "查看内置通用模型族参考价或配置单模型覆盖价。",
+          pricingAction: "管理单价",
+          pricingCustomBadge: "已自定义",
+          pricingPendingHint: "随用量与定价服务接入后启用。",
+        },
+        timeline: {
+          title: "时间线显示样式",
+          intro: "选择快捷间距预设，或展开高级微调逐项设定时间线行距与展开高度。",
+        },
+      },
     },
   },
 };
@@ -2270,8 +2517,11 @@ export function resolveLocale(
   );
 }
 
-/** The locale a host has relayed, if any. Unset means "nobody told us". */
+/** The locale a host has relayed on a timeline item, if any. Unset means "nobody told us". */
 let relayed: Locale | undefined;
+
+/** The host client's own UI locale (from `client.i18n?.locale`), if provided at startup. */
+let hostLocale: Locale | undefined;
 
 /** Explicit user language choice from Display settings, if any. */
 let override: Locale | undefined;
@@ -2283,6 +2533,20 @@ function notifyLocaleListeners(): void {
   for (const listener of Array.from(listeners)) {
     listener();
   }
+}
+
+/**
+ * Adopt the host app's active locale (e.g. `client.i18n?.locale`) on startup so
+ * client surfaces match the host immediately before the first tool-call item
+ * relays the server's locale.
+ *
+ * Precedence: explicit user override (`setLanguageOverride`) > server-relayed
+ * locale (`setLocale`) > host client locale (`adoptHostLocale`) > `DEFAULT_LOCALE`.
+ */
+export function adoptHostLocale(raw: unknown): void {
+  const previous = currentLocale();
+  hostLocale = normalizeLocale(raw);
+  if (currentLocale() !== previous) notifyLocaleListeners();
 }
 
 /**
@@ -2303,7 +2567,7 @@ export function setLocale(value: unknown): void {
  *
  * Only exact bundled locales (`"en"` / `"zh-CN"`) activate an override;
  * `"auto"` or anything else clears it so `currentLocale()` falls back to
- * `relayed ?? DEFAULT_LOCALE`.
+ * `relayed ?? hostLocale ?? DEFAULT_LOCALE`.
  */
 export function setLanguageOverride(value: unknown): void {
   const previous = currentLocale();
@@ -2311,7 +2575,7 @@ export function setLanguageOverride(value: unknown): void {
   if (currentLocale() !== previous) notifyLocaleListeners();
 }
 
-/** The active language override (`"auto"` when following relayed/default). */
+/** The active language override (`"auto"` when following relayed/host/default). */
 export function getLanguageOverride(): LanguageOverride {
   return override ?? "auto";
 }
@@ -2326,7 +2590,7 @@ export function subscribeLocale(listener: () => void): () => void {
 
 /** The locale the client renders in right now. */
 export function currentLocale(): Locale {
-  return override ?? relayed ?? DEFAULT_LOCALE;
+  return override ?? relayed ?? hostLocale ?? DEFAULT_LOCALE;
 }
 
 /** The copy for the current locale. Read it per render, never hoist it. */

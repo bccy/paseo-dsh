@@ -1,8 +1,23 @@
-import { useMemo, useRef, useState } from "react";
+import {
+  useMemo,
+  useRef,
+  useState,
+  type ComponentType,
+  type ReactNode,
+} from "react";
 import { Platform, Pressable, ScrollView, Text, View } from "react-native";
-import type { PluginClientContext, PluginSurfaceProps } from "@getpaseo/plugin/client";
+import type {
+  PluginClientContext,
+  PluginGlobalCommandContext,
+  PluginSurfaceProps,
+} from "@getpaseo/plugin/client";
 import { useSettings } from "@getpaseo/plugin/client";
-import { TextInput } from "@getpaseo/plugin/client/ui";
+import * as PaseoUi from "@getpaseo/plugin/client/ui";
+import type {
+  SettingsActionProps,
+  SettingsRowProps,
+  SettingsSelectProps,
+} from "@getpaseo/plugin/client/ui";
 import {
   LANGUAGE_DEFAULTS,
   TIMELINE_STYLE_DEFAULTS,
@@ -21,13 +36,31 @@ import {
   setLanguageOverride,
   subscribeLocale,
   type DisplaySettingsText,
+  type TimelinePresetKey,
 } from "./locale";
 import { useLocaleText } from "./use-locale";
 
 /** The display settings screen id, shared by every entry point that opens it. */
 export const DISPLAY_SETTINGS_ID = "timeline-style";
 
-const FIELD_BOUNDS: Record<TimelineStyleKey, { readonly min: number; readonly max: number }> = {
+/** Subset of Paseo's theme colors needed by settings surfaces (compatible with Paseo >=0.16.0). */
+export type SettingsThemeColors = Pick<
+  PluginSurfaceProps["theme"]["colors"],
+  | "surface0"
+  | "surface1"
+  | "border"
+  | "foreground"
+  | "foregroundMuted"
+  | "accent"
+  | "accentForeground"
+  | "statusDanger"
+>;
+
+/** Bounds mirrored from `shared/settings.ts` for client-side validation messages. */
+export const TIMELINE_STYLE_FIELD_BOUNDS: Record<
+  TimelineStyleKey,
+  { readonly min: number; readonly max: number }
+> = {
   rowMarginY: { min: -16, max: 24 },
   toolRowPaddingY: { min: 0, max: 12 },
   toolRowMinHeight: { min: 12, max: 64 },
@@ -37,7 +70,40 @@ const FIELD_BOUNDS: Record<TimelineStyleKey, { readonly min: number; readonly ma
   commandMinHeight: { min: 60, max: 360 },
 };
 
-const LANGUAGE_OPTIONS: readonly {
+/**
+ * One-tap timeline spacing presets (Compact / Default / Relaxed).
+ *
+ * `default` mirrors `TIMELINE_STYLE_DEFAULTS` (`shared/settings.ts` v6) verbatim.
+ */
+export const TIMELINE_STYLE_PRESETS: Readonly<Record<TimelinePresetKey, TimelineStyleValues>> = {
+  compact: {
+    rowMarginY: -6,
+    toolRowPaddingY: 0,
+    toolRowMinHeight: 20,
+    toolRowGap: 4,
+    expandedMaxHeight: 200,
+    commandMaxHeightRatio: 0.2,
+    commandMinHeight: 120,
+  },
+  default: TIMELINE_STYLE_DEFAULTS,
+  relaxed: {
+    rowMarginY: 4,
+    toolRowPaddingY: 3,
+    toolRowMinHeight: 30,
+    toolRowGap: 8,
+    expandedMaxHeight: 340,
+    commandMaxHeightRatio: 0.32,
+    commandMinHeight: 180,
+  },
+};
+
+export const TIMELINE_PRESET_KEYS: readonly TimelinePresetKey[] = [
+  "compact",
+  "default",
+  "relaxed",
+];
+
+export const LANGUAGE_OPTIONS: readonly {
   readonly value: LanguageChoice;
   readonly labelKey: keyof Pick<DisplaySettingsText["language"], "auto" | "en" | "zhCN">;
 }[] = [
@@ -46,13 +112,33 @@ const LANGUAGE_OPTIONS: readonly {
   { value: "zh-CN", labelKey: "zhCN" },
 ];
 
-type FeedbackState =
+export type TimelineFeedbackState =
   | { kind: "saved" }
   | { kind: "reset" }
   | { kind: "validationError"; message: string }
   | { kind: "fallbackError"; action: "save" | "reset" };
 
-function keyboardTypeFor(
+function numbersMatch(a: number, b: number): boolean {
+  return Math.abs(a - b) < 1e-6;
+}
+
+/** Return which quick preset matches `values`, or `null` when custom spacing is active. */
+export function matchTimelineStylePreset(values: TimelineStyleValues): TimelinePresetKey | null {
+  for (const presetKey of TIMELINE_PRESET_KEYS) {
+    const preset = TIMELINE_STYLE_PRESETS[presetKey];
+    let matches = true;
+    for (const key of TIMELINE_STYLE_KEYS) {
+      if (!numbersMatch(values[key], preset[key])) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) return presetKey;
+  }
+  return null;
+}
+
+export function keyboardTypeFor(
   key: TimelineStyleKey,
 ): "default" | "numbers-and-punctuation" | "decimal-pad" | "numeric" {
   if (Platform.OS === "web") return "default";
@@ -61,7 +147,7 @@ function keyboardTypeFor(
   return "numeric";
 }
 
-function guardAsync(label: string, run: () => Promise<void>): void {
+export function guardAsync(label: string, run: () => Promise<void>): void {
   void Promise.resolve()
     .then(run)
     .catch((error) => {
@@ -69,118 +155,421 @@ function guardAsync(label: string, run: () => Promise<void>): void {
     });
 }
 
-/** Numeric editor for timeline row spacing and command drawer height, plus plugin language override. */
-export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
-  const text = useLocaleText().settings;
-  const settings = useSettings(timelineStyleSettings);
+function isHostComponent(value: unknown): boolean {
+  return typeof value === "function" || (typeof value === "object" && value !== null);
+}
+
+const uiExports = PaseoUi as Record<string, unknown>;
+
+/**
+ * Host `TextInput` from `@getpaseo/plugin/client/ui` (always present in Paseo >=0.16.0
+ * and stubbed in offline harness tests).
+ */
+export const HostTextInput = PaseoUi.TextInput;
+
+/**
+ * Render Paseo's native `SettingsCard` when exported by the host (>=0.17 / 0.16.x),
+ * falling back to a matching React Native `View` container on older hosts or minimal mocks.
+ */
+export function renderHostSettingsCard(
+  colors: SettingsThemeColors,
+  children: ReactNode,
+  testID?: string,
+): ReactNode {
+  const CardComp = uiExports["SettingsCard"] as
+    | ComponentType<{ children: ReactNode; testID?: string }>
+    | undefined;
+  if (isHostComponent(CardComp) && CardComp) {
+    return <CardComp testID={testID}>{children}</CardComp>;
+  }
+  return (
+    <View
+      testID={testID}
+      style={{
+        backgroundColor: colors.surface1,
+        borderWidth: 1,
+        borderColor: colors.border,
+        borderRadius: 12,
+        padding: 14,
+        gap: 12,
+      }}
+    >
+      {children}
+    </View>
+  );
+}
+
+export interface GuardedSettingsRowOptions extends SettingsRowProps {
+  compact?: boolean;
+  /** Lay label and control side-by-side on wide layouts when falling back without host SettingsRow. */
+  inline?: boolean;
+}
+
+/**
+ * Render Paseo's native `SettingsRow` when exported by the host, falling back to a clean
+ * responsive React Native row on older hosts or minimal test mocks.
+ */
+export function renderHostSettingsRow(
+  colors: SettingsThemeColors,
+  { label, hint, error, children, testID, compact = false, inline = false }: GuardedSettingsRowOptions,
+): ReactNode {
+  const RowComp = uiExports["SettingsRow"] as ComponentType<SettingsRowProps> | undefined;
+  if (isHostComponent(RowComp) && RowComp) {
+    return (
+      <RowComp label={label} hint={hint} error={error} testID={testID}>
+        {children}
+      </RowComp>
+    );
+  }
+  const sideBySide = inline && !compact;
+  return (
+    <View testID={testID} style={{ gap: 6 }}>
+      <View
+        style={{
+          flexDirection: sideBySide ? "row" : "column",
+          alignItems: sideBySide ? "center" : "stretch",
+          justifyContent: sideBySide ? "space-between" : "flex-start",
+          gap: sideBySide ? 12 : 6,
+        }}
+      >
+        <View style={{ flex: sideBySide ? 1 : undefined, gap: 3 }}>
+          <Text
+            style={{
+              color: colors.foreground,
+              fontSize: compact ? 13 : 14,
+              fontWeight: "600",
+            }}
+          >
+            {label}
+          </Text>
+          {hint ? (
+            <Text
+              style={{
+                color: colors.foregroundMuted,
+                fontSize: compact ? 12 : 12.5,
+                lineHeight: 17,
+              }}
+            >
+              {hint}
+            </Text>
+          ) : null}
+        </View>
+        {children ?? null}
+      </View>
+      {error ? (
+        <Text style={{ color: colors.statusDanger, fontSize: compact ? 12 : 13 }}>{error}</Text>
+      ) : null}
+    </View>
+  );
+}
+
+export interface GuardedSettingsSelectOptions<Value extends string>
+  extends SettingsSelectProps<Value> {
+  compact?: boolean;
+}
+
+/**
+ * Render Paseo's native `SettingsSelect` when exported by the host, falling back to a
+ * horizontal pill-button selector on older hosts or test harnesses that omit `SettingsSelect`.
+ */
+export function renderHostSettingsSelect<Value extends string>(
+  colors: SettingsThemeColors,
+  {
+    label,
+    hint,
+    error,
+    value,
+    options,
+    onValueChange,
+    disabled = false,
+    testID,
+    compact = false,
+  }: GuardedSettingsSelectOptions<Value>,
+): ReactNode {
+  const SelectComp = uiExports["SettingsSelect"] as
+    | ((props: SettingsSelectProps<Value>) => ReactNode)
+    | undefined;
+  if (isHostComponent(SelectComp) && SelectComp) {
+    return (
+      <SelectComp
+        label={label}
+        hint={hint}
+        error={error}
+        value={value}
+        options={options}
+        onValueChange={onValueChange}
+        disabled={disabled}
+        testID={testID}
+      />
+    );
+  }
+  return renderHostSettingsRow(colors, {
+    label,
+    hint,
+    error,
+    compact,
+    testID,
+    children: (
+      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+        {options.map((option) => {
+          const selected = option.value === value;
+          return (
+            <Pressable
+              key={option.value}
+              accessibilityRole="button"
+              accessibilityState={{ selected, disabled }}
+              accessibilityLabel={option.label}
+              disabled={disabled}
+              onPress={() => onValueChange(option.value)}
+              style={{
+                borderWidth: 1,
+                borderColor: selected ? colors.accent : colors.border,
+                borderRadius: 8,
+                paddingHorizontal: 14,
+                paddingVertical: compact ? 8 : 9,
+                backgroundColor: selected ? colors.accent : colors.surface1,
+                opacity: disabled ? 0.6 : 1,
+              }}
+            >
+              <Text
+                style={{
+                  color: selected ? colors.accentForeground : colors.foreground,
+                  fontSize: compact ? 12.5 : 13,
+                  fontWeight: "600",
+                }}
+              >
+                {option.label}
+              </Text>
+            </Pressable>
+          );
+        })}
+      </View>
+    ),
+  });
+}
+
+export interface GuardedSettingsActionOptions extends SettingsActionProps {
+  compact?: boolean;
+}
+
+/**
+ * Render Paseo's native `SettingsAction` when exported by the host, falling back to a row
+ * with a secondary button on older hosts.
+ */
+export function renderHostSettingsAction(
+  colors: SettingsThemeColors,
+  {
+    label,
+    hint,
+    error,
+    actionLabel,
+    onPress,
+    disabled = false,
+    testID,
+    compact = false,
+  }: GuardedSettingsActionOptions,
+): ReactNode {
+  const ActionComp = uiExports["SettingsAction"] as
+    | ComponentType<SettingsActionProps>
+    | undefined;
+  if (isHostComponent(ActionComp) && ActionComp) {
+    return (
+      <ActionComp
+        label={label}
+        hint={hint}
+        error={error}
+        actionLabel={actionLabel}
+        onPress={onPress}
+        disabled={disabled}
+        testID={testID}
+      />
+    );
+  }
+  return renderHostSettingsRow(colors, {
+    label,
+    hint,
+    error,
+    compact,
+    inline: true,
+    testID,
+    children: (
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={actionLabel}
+        accessibilityState={{ disabled }}
+        disabled={disabled}
+        onPress={onPress}
+        style={{
+          paddingHorizontal: 14,
+          paddingVertical: compact ? 8 : 9,
+          borderRadius: 8,
+          backgroundColor: colors.surface0,
+          borderWidth: 1,
+          borderColor: colors.border,
+          opacity: disabled ? 0.5 : 1,
+          alignSelf: compact ? "flex-start" : "center",
+        }}
+      >
+        <Text
+          style={{
+            color: colors.foreground,
+            fontSize: compact ? 12.5 : 13,
+            fontWeight: "600",
+          }}
+        >
+          {actionLabel}
+        </Text>
+      </Pressable>
+    ),
+  });
+}
+
+export interface LanguageSettingsController {
+  readonly status: "loading" | "error" | "invalid" | "ready";
+  readonly saving: boolean;
+  readonly error: string | null;
+  readonly saveError: string | null;
+  readonly currentLanguage: LanguageChoice;
+  readonly disabled: boolean;
+  readonly failed: boolean;
+  readonly chooseLanguage: (choice: LanguageChoice) => Promise<void>;
+  readonly clearFailed: () => void;
+}
+
+/**
+ * Shared language override state & persistence controller with synchronous double-tap
+ * lock (`languageInFlightRef`) and rollback on rejected/false saves.
+ */
+export function useLanguageSettingsController(): LanguageSettingsController {
   const language = useSettings(languageSettings);
-  const [draft, setDraft] = useState<Partial<Record<TimelineStyleKey, string>>>({});
   const [pickedLanguage, setPickedLanguage] = useState<LanguageChoice | null>(null);
-  const [feedback, setFeedback] = useState<FeedbackState | null>(null);
-  // Synchronous in-flight locks close the rapid double-tap window before the
+  const [failed, setFailed] = useState(false);
+  // Synchronous in-flight lock closes the rapid double-tap window before the
   // host hook flips `saving: true` on the next render, preventing duplicate
   // writes against the same revision.
-  const styleInFlightRef = useRef(false);
   const languageInFlightRef = useRef(false);
 
-  const current: TimelineStyleValues =
-    settings.status === "ready" ? settings.values : TIMELINE_STYLE_DEFAULTS;
   const currentLanguage: LanguageChoice =
     pickedLanguage
     ?? (language.status === "ready" ? language.values.language : LANGUAGE_DEFAULTS.language);
-  const compact = layout.compact;
-  const canSave = settings.status === "ready" && !settings.saving;
-  const canReset = (settings.status === "ready" || settings.status === "invalid") && !settings.saving;
 
-  const styles = useMemo(
-    () => ({
-      screen: { flex: 1, backgroundColor: theme.colors.surface0 },
-      content: { padding: compact ? 16 : 24, gap: compact ? 12 : 14 },
-      title: { color: theme.colors.foreground, fontSize: compact ? 16 : 18, fontWeight: "600" as const },
-      intro: { color: theme.colors.foregroundMuted, fontSize: compact ? 13 : 14, lineHeight: compact ? 19 : 21 },
-      field: { gap: 5 },
-      label: { color: theme.colors.foreground, fontSize: compact ? 13 : 14, fontWeight: "600" as const },
-      hint: { color: theme.colors.foregroundMuted, fontSize: compact ? 12 : 12.5, lineHeight: 17 },
-      input: {
-        borderWidth: 1,
-        borderColor: theme.colors.border,
-        borderRadius: 8,
-        paddingHorizontal: 12,
-        paddingVertical: compact ? 9 : 10,
-        color: theme.colors.foreground,
-        backgroundColor: theme.colors.surface1,
-        fontSize: compact ? 13 : 14,
-      },
-      languageRow: { flexDirection: "row" as const, flexWrap: "wrap" as const, gap: 8 },
-      languageButton: {
-        borderWidth: 1,
-        borderColor: theme.colors.border,
-        borderRadius: 8,
-        paddingHorizontal: 14,
-        paddingVertical: compact ? 8 : 9,
-        backgroundColor: theme.colors.surface1,
-      },
-      languageButtonSelected: {
-        borderColor: theme.colors.accent,
-        backgroundColor: theme.colors.accent,
-      },
-      languageButtonDisabled: {
-        opacity: 0.6,
-      },
-      languageLabel: { color: theme.colors.foreground, fontSize: compact ? 12.5 : 13, fontWeight: "600" as const },
-      languageLabelSelected: { color: theme.colors.accentForeground },
-      actions: { flexDirection: "row" as const, gap: 10, marginTop: 4 },
-      button: {
-        paddingHorizontal: 16,
-        paddingVertical: compact ? 9 : 10,
-        borderRadius: 8,
-        backgroundColor: theme.colors.accent,
-      },
-      buttonDisabled: {
-        opacity: 0.6,
-      },
-      secondary: {
-        backgroundColor: theme.colors.surface1,
-        borderWidth: 1,
-        borderColor: theme.colors.border,
-      },
-      buttonText: { color: theme.colors.accentForeground, fontWeight: "600" as const, fontSize: compact ? 13 : 14 },
-      secondaryText: { color: theme.colors.foreground, fontWeight: "600" as const, fontSize: compact ? 13 : 14 },
-      notice: { color: theme.colors.foregroundMuted, fontSize: compact ? 12 : 13 },
-      errorText: { color: theme.colors.statusDanger, fontSize: compact ? 12 : 13 },
-    }),
-    [theme, compact],
-  );
+  const chooseLanguage = async (choice: LanguageChoice) => {
+    if (
+      language.status !== "ready"
+      || language.saving
+      || languageInFlightRef.current
+      || choice === currentLanguage
+    ) {
+      return;
+    }
+    languageInFlightRef.current = true;
+    const previousOverride = getLanguageOverride();
+    const previousPicked = pickedLanguage;
+    setPickedLanguage(choice);
+    setLanguageOverride(choice);
+    setFailed(false);
+    let saved = false;
+    try {
+      saved = await language.save({ language: choice }, language.revision);
+    } catch (error) {
+      report("language save", error);
+      saved = false;
+    } finally {
+      languageInFlightRef.current = false;
+    }
+    if (saved) {
+      setPickedLanguage(null);
+    } else {
+      setPickedLanguage(previousPicked);
+      setLanguageOverride(previousOverride);
+      setFailed(true);
+    }
+  };
+
+  return {
+    status: language.status,
+    saving: language.saving,
+    error: language.status === "error" || language.status === "invalid" ? language.error : null,
+    saveError: language.saveError,
+    currentLanguage,
+    disabled: language.status !== "ready" || language.saving,
+    failed,
+    chooseLanguage,
+    clearFailed: () => setFailed(false),
+  };
+}
+
+export interface TimelineStyleController {
+  readonly status: "loading" | "error" | "invalid" | "ready";
+  readonly saving: boolean;
+  readonly error: string | null;
+  readonly saveError: string | null;
+  readonly current: TimelineStyleValues;
+  readonly activePreset: TimelinePresetKey | null;
+  readonly hasDraft: boolean;
+  readonly canSave: boolean;
+  readonly canReset: boolean;
+  readonly feedback: TimelineFeedbackState | null;
+  readonly textOf: (key: TimelineStyleKey) => string;
+  readonly edit: (key: TimelineStyleKey, value: string) => void;
+  readonly save: () => Promise<void>;
+  readonly reset: () => Promise<void>;
+  readonly applyPreset: (presetKey: TimelinePresetKey) => Promise<void>;
+  readonly clearFeedback: () => void;
+}
+
+/**
+ * Shared timeline style state, preset matching, numeric validation, and persistence
+ * controller with synchronous double-tap lock (`styleInFlightRef`).
+ */
+export function useTimelineStyleController(text: DisplaySettingsText): TimelineStyleController {
+  const settings = useSettings(timelineStyleSettings);
+  const [draft, setDraft] = useState<Partial<Record<TimelineStyleKey, string>>>({});
+  const [feedback, setFeedback] = useState<TimelineFeedbackState | null>(null);
+  // Synchronous in-flight lock closes the rapid double-tap window before the
+  // host hook flips `saving: true` on the next render, preventing duplicate
+  // writes against the same revision.
+  const styleInFlightRef = useRef(false);
+
+  const current: TimelineStyleValues =
+    settings.status === "ready" ? settings.values : TIMELINE_STYLE_DEFAULTS;
+  const canSave = settings.status === "ready" && !settings.saving;
+  const canReset =
+    (settings.status === "ready" || settings.status === "invalid") && !settings.saving;
 
   const textOf = (key: TimelineStyleKey): string => draft[key] ?? String(current[key]);
+
+  const effectiveValues = useMemo<TimelineStyleValues>(() => {
+    const merged: TimelineStyleValues = { ...current };
+    for (const key of TIMELINE_STYLE_KEYS) {
+      const raw = draft[key];
+      if (raw === undefined) continue;
+      const trimmed = raw.trim();
+      if (trimmed === "") return { ...current, [key]: Number.NaN };
+      const parsed = Number(trimmed);
+      if (!Number.isFinite(parsed)) return { ...current, [key]: Number.NaN };
+      merged[key] = parsed;
+    }
+    return merged;
+  }, [current, draft]);
+
+  const activePreset = matchTimelineStylePreset(effectiveValues);
+  const hasDraft = Object.keys(draft).length > 0;
+
   const edit = (key: TimelineStyleKey, value: string) => {
     if (settings.saving) return;
     setDraft((previous) => ({ ...previous, [key]: value }));
     setFeedback(null);
   };
 
-  const save = async () => {
+  const persistValues = async (
+    values: TimelineStyleValues,
+    successKind: "saved" | "reset",
+    action: "save" | "reset",
+    logLabel: string,
+  ) => {
     if (settings.status !== "ready" || settings.saving || styleInFlightRef.current) return;
-    const candidate: TimelineStyleValues = { ...current };
-    for (const key of TIMELINE_STYLE_KEYS) {
-      const raw = textOf(key).trim();
-      const value = raw === "" ? Number.NaN : Number(raw);
-      const fieldCopy = text.fields[key];
-      if (!Number.isFinite(value)) {
-        setFeedback({ kind: "validationError", message: text.invalidNumber(fieldCopy.label) });
-        return;
-      }
-      const bounds = FIELD_BOUNDS[key];
-      if (value < bounds.min || value > bounds.max) {
-        setFeedback({
-          kind: "validationError",
-          message: text.outOfRange(fieldCopy.label, bounds.min, bounds.max),
-        });
-        return;
-      }
-      candidate[key] = value;
-    }
-    const parsed = timelineStyleSettings.schema.safeParse(candidate);
+    const parsed = timelineStyleSettings.schema.safeParse(values);
     if (!parsed.success) {
       setFeedback({
         kind: "validationError",
@@ -194,17 +583,41 @@ export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
     try {
       saved = await settings.save(parsed.data, settings.revision);
     } catch (error) {
-      report("timeline style save", error);
+      report(logLabel, error);
       saved = false;
     } finally {
       styleInFlightRef.current = false;
     }
     if (saved) {
       setDraft({});
-      setFeedback({ kind: "saved" });
+      setFeedback({ kind: successKind });
     } else {
-      setFeedback({ kind: "fallbackError", action: "save" });
+      setFeedback({ kind: "fallbackError", action });
     }
+  };
+
+  const save = async () => {
+    if (settings.status !== "ready" || settings.saving || styleInFlightRef.current) return;
+    const candidate: TimelineStyleValues = { ...current };
+    for (const key of TIMELINE_STYLE_KEYS) {
+      const raw = textOf(key).trim();
+      const value = raw === "" ? Number.NaN : Number(raw);
+      const fieldCopy = text.fields[key];
+      if (!Number.isFinite(value)) {
+        setFeedback({ kind: "validationError", message: text.invalidNumber(fieldCopy.label) });
+        return;
+      }
+      const bounds = TIMELINE_STYLE_FIELD_BOUNDS[key];
+      if (value < bounds.min || value > bounds.max) {
+        setFeedback({
+          kind: "validationError",
+          message: text.outOfRange(fieldCopy.label, bounds.min, bounds.max),
+        });
+        return;
+      }
+      candidate[key] = value;
+    }
+    await persistValues(candidate, "saved", "save", "timeline style save");
   };
 
   const reset = async () => {
@@ -233,139 +646,280 @@ export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
     }
   };
 
-  const chooseLanguage = async (choice: LanguageChoice) => {
-    if (
-      language.status !== "ready"
-      || language.saving
-      || languageInFlightRef.current
-      || choice === currentLanguage
-    ) {
+  const applyPreset = async (presetKey: TimelinePresetKey) => {
+    if (presetKey === "default" && settings.status === "invalid") {
+      await reset();
       return;
     }
-    languageInFlightRef.current = true;
-    const previousOverride = getLanguageOverride();
-    const previousPicked = pickedLanguage;
-    setPickedLanguage(choice);
-    setLanguageOverride(choice);
-    setFeedback(null);
-    let saved = false;
-    try {
-      saved = await language.save({ language: choice }, language.revision);
-    } catch (error) {
-      report("language save", error);
-      saved = false;
-    } finally {
-      languageInFlightRef.current = false;
-    }
-    if (saved) {
-      setPickedLanguage(null);
-    } else {
-      setPickedLanguage(previousPicked);
-      setLanguageOverride(previousOverride);
-      setFeedback({ kind: "fallbackError", action: "save" });
-    }
+    await persistValues(
+      TIMELINE_STYLE_PRESETS[presetKey],
+      "saved",
+      "save",
+      `timeline preset ${presetKey}`,
+    );
   };
 
-  const languageDisabled = language.status !== "ready" || language.saving;
-  const saveErrorMessage = settings.saveError ?? language.saveError;
+  return {
+    status: settings.status,
+    saving: settings.saving,
+    error: settings.status === "error" || settings.status === "invalid" ? settings.error : null,
+    saveError: settings.saveError,
+    current,
+    activePreset,
+    hasDraft,
+    canSave,
+    canReset,
+    feedback,
+    textOf,
+    edit,
+    save,
+    reset,
+    applyPreset,
+    clearFeedback: () => setFeedback(null),
+  };
+}
+
+/**
+ * Standalone numeric editor for timeline row spacing and command drawer height, plus plugin
+ * language override. Uses host-native `SettingsCard` / `SettingsRow` / `SettingsSelect` when
+ * provided by Paseo and falls back gracefully on older hosts / headless unit tests.
+ */
+export function TimelineSettingsScreen({ theme, layout }: PluginSurfaceProps) {
+  const text = useLocaleText().settings;
+  const styleCtrl = useTimelineStyleController(text);
+  const langCtrl = useLanguageSettingsController();
+
+  const compact = layout.compact;
+  const colors = theme.colors;
+  const styles = useMemo(
+    () => ({
+      screen: { flex: 1, backgroundColor: colors.surface0 },
+      content: { padding: compact ? 16 : 24, gap: compact ? 12 : 14 },
+      title: { color: colors.foreground, fontSize: compact ? 16 : 18, fontWeight: "600" as const },
+      intro: {
+        color: colors.foregroundMuted,
+        fontSize: compact ? 13 : 14,
+        lineHeight: compact ? 19 : 21,
+      },
+      input: {
+        borderWidth: 1,
+        borderColor: colors.border,
+        borderRadius: 8,
+        paddingHorizontal: 10,
+        paddingVertical: compact ? 7 : 8,
+        color: colors.foreground,
+        backgroundColor: colors.surface0,
+        fontSize: compact ? 13 : 14,
+        minWidth: 84,
+        textAlign: "right" as const,
+      },
+      presetRow: { flexDirection: "row" as const, flexWrap: "wrap" as const, gap: 8 },
+      presetButton: {
+        borderWidth: 1,
+        borderColor: colors.border,
+        borderRadius: 8,
+        paddingHorizontal: 12,
+        paddingVertical: compact ? 7 : 8,
+        backgroundColor: colors.surface0,
+      },
+      presetButtonSelected: {
+        borderColor: colors.accent,
+        backgroundColor: colors.accent,
+      },
+      presetLabel: {
+        color: colors.foreground,
+        fontSize: compact ? 12.5 : 13,
+        fontWeight: "600" as const,
+      },
+      presetLabelSelected: {
+        color: colors.accentForeground,
+      },
+      actions: { flexDirection: "row" as const, gap: 10, marginTop: 4 },
+      button: {
+        paddingHorizontal: 16,
+        paddingVertical: compact ? 9 : 10,
+        borderRadius: 8,
+        backgroundColor: colors.accent,
+      },
+      buttonDisabled: {
+        opacity: 0.6,
+      },
+      secondary: {
+        backgroundColor: colors.surface1,
+        borderWidth: 1,
+        borderColor: colors.border,
+      },
+      buttonText: {
+        color: colors.accentForeground,
+        fontWeight: "600" as const,
+        fontSize: compact ? 13 : 14,
+      },
+      secondaryText: {
+        color: colors.foreground,
+        fontWeight: "600" as const,
+        fontSize: compact ? 13 : 14,
+      },
+      notice: { color: colors.foregroundMuted, fontSize: compact ? 12 : 13 },
+      errorText: { color: colors.statusDanger, fontSize: compact ? 12 : 13 },
+    }),
+    [colors, compact],
+  );
+
+  const languageSelectOptions = useMemo(
+    () =>
+      LANGUAGE_OPTIONS.map((option) => ({
+        value: option.value,
+        label: text.language[option.labelKey],
+      })),
+    [text.language],
+  );
+
+  const saveErrorMessage = styleCtrl.saveError ?? langCtrl.saveError;
+  const effectiveFeedback: TimelineFeedbackState | null =
+    styleCtrl.feedback ?? (langCtrl.failed ? { kind: "fallbackError", action: "save" } : null);
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
       <Text style={styles.title}>{text.title}</Text>
       <Text style={styles.intro}>{text.intro}</Text>
 
-      <View style={styles.field}>
-        <Text style={styles.label}>{text.language.label}</Text>
-        <View style={styles.languageRow}>
-          {LANGUAGE_OPTIONS.map((option) => {
-            const selected = currentLanguage === option.value;
-            const optionLabel = text.language[option.labelKey];
+      {renderHostSettingsCard(
+        colors,
+        renderHostSettingsSelect(colors, {
+          label: text.language.label,
+          hint: text.language.hint,
+          value: langCtrl.currentLanguage,
+          options: languageSelectOptions,
+          disabled: langCtrl.disabled,
+          compact,
+          onValueChange: (choice) => {
+            styleCtrl.clearFeedback();
+            guardAsync("language save", () => langCtrl.chooseLanguage(choice));
+          },
+        }),
+      )}
+
+      {renderHostSettingsCard(
+        colors,
+        <>
+          {renderHostSettingsRow(colors, {
+            label: text.presets.label,
+            hint: styleCtrl.activePreset === null ? text.presets.custom : text.presets.hint,
+            compact,
+            children: (
+              <View style={styles.presetRow}>
+                {TIMELINE_PRESET_KEYS.map((presetKey) => {
+                  const selected = styleCtrl.activePreset === presetKey;
+                  const presetLabel = text.presets[presetKey];
+                  return (
+                    <Pressable
+                      key={`preset-${presetKey}`}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected, disabled: !styleCtrl.canSave }}
+                      accessibilityLabel={presetLabel}
+                      disabled={!styleCtrl.canSave}
+                      onPress={() => {
+                        langCtrl.clearFailed();
+                        guardAsync(`timeline preset ${presetKey}`, () =>
+                          styleCtrl.applyPreset(presetKey),
+                        );
+                      }}
+                      style={[
+                        styles.presetButton,
+                        selected ? styles.presetButtonSelected : null,
+                        styleCtrl.canSave ? null : styles.buttonDisabled,
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.presetLabel,
+                          selected ? styles.presetLabelSelected : null,
+                        ]}
+                      >
+                        {presetLabel}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+            ),
+          })}
+
+          {TIMELINE_STYLE_KEYS.map((key) => {
+            const fieldCopy = text.fields[key];
             return (
-              <Pressable
-                key={option.value}
-                accessibilityRole="button"
-                accessibilityState={{ selected }}
-                accessibilityLabel={optionLabel}
-                disabled={languageDisabled}
-                onPress={() => guardAsync("language save", () => chooseLanguage(option.value))}
-                style={[
-                  styles.languageButton,
-                  selected ? styles.languageButtonSelected : null,
-                  languageDisabled ? styles.languageButtonDisabled : null,
-                ]}
-              >
-                <Text style={[styles.languageLabel, selected ? styles.languageLabelSelected : null]}>
-                  {optionLabel}
-                </Text>
-              </Pressable>
+              <View key={key}>
+                {renderHostSettingsRow(colors, {
+                  label: fieldCopy.label,
+                  hint: fieldCopy.hint,
+                  compact,
+                  inline: true,
+                  children: (
+                    <HostTextInput
+                      value={styleCtrl.textOf(key)}
+                      editable={!styleCtrl.saving}
+                      onChangeText={(value: string) => {
+                        langCtrl.clearFailed();
+                        styleCtrl.edit(key, value);
+                      }}
+                      keyboardType={keyboardTypeFor(key)}
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                      accessibilityLabel={fieldCopy.label}
+                      style={styles.input}
+                    />
+                  ),
+                })}
+              </View>
             );
           })}
-        </View>
-        <Text style={styles.hint}>{text.language.hint}</Text>
-      </View>
-
-      {TIMELINE_STYLE_KEYS.map((key) => {
-        const fieldCopy = text.fields[key];
-        return (
-          <View key={key} style={styles.field}>
-            <Text style={styles.label}>{fieldCopy.label}</Text>
-            <TextInput
-              value={textOf(key)}
-              editable={!settings.saving}
-              onChangeText={(value: string) => edit(key, value)}
-              keyboardType={keyboardTypeFor(key)}
-              autoCapitalize="none"
-              autoCorrect={false}
-              accessibilityLabel={fieldCopy.label}
-              style={styles.input}
-            />
-            <Text style={styles.hint}>{fieldCopy.hint}</Text>
-          </View>
-        );
-      })}
+        </>,
+      )}
 
       <View style={styles.actions}>
         <Pressable
           accessibilityRole="button"
           accessibilityLabel={text.save}
-          disabled={!canSave}
-          onPress={() => guardAsync("settings save", save)}
-          style={[styles.button, canSave ? null : styles.buttonDisabled]}
+          disabled={!styleCtrl.canSave}
+          onPress={() => {
+            langCtrl.clearFailed();
+            guardAsync("settings save", styleCtrl.save);
+          }}
+          style={[styles.button, styleCtrl.canSave ? null : styles.buttonDisabled]}
         >
-          <Text style={styles.buttonText}>{settings.saving ? text.saving : text.save}</Text>
+          <Text style={styles.buttonText}>{styleCtrl.saving ? text.saving : text.save}</Text>
         </Pressable>
         <Pressable
           accessibilityRole="button"
           accessibilityLabel={text.reset}
-          disabled={!canReset}
-          onPress={() => guardAsync("settings reset", reset)}
-          style={[styles.button, styles.secondary, canReset ? null : styles.buttonDisabled]}
+          disabled={!styleCtrl.canReset}
+          onPress={() => {
+            langCtrl.clearFailed();
+            guardAsync("settings reset", styleCtrl.reset);
+          }}
+          style={[styles.button, styles.secondary, styleCtrl.canReset ? null : styles.buttonDisabled]}
         >
           <Text style={styles.secondaryText}>{text.reset}</Text>
         </Pressable>
       </View>
 
-      {settings.status === "loading" || language.status === "loading" ? (
+      {styleCtrl.status === "loading" || langCtrl.status === "loading" ? (
         <Text style={styles.notice}>{text.loading}</Text>
       ) : null}
-      {settings.status === "error" || settings.status === "invalid" ? (
-        <Text style={styles.errorText}>{settings.error}</Text>
-      ) : null}
-      {language.status === "error" || language.status === "invalid" ? (
-        <Text style={styles.errorText}>{language.error}</Text>
-      ) : null}
+      {styleCtrl.error !== null ? <Text style={styles.errorText}>{styleCtrl.error}</Text> : null}
+      {langCtrl.error !== null ? <Text style={styles.errorText}>{langCtrl.error}</Text> : null}
       {saveErrorMessage === null ? null : (
         <Text style={styles.errorText}>{saveErrorMessage}</Text>
       )}
-      {feedback === null ? null : feedback.kind === "saved" ? (
+      {effectiveFeedback === null ? null : effectiveFeedback.kind === "saved" ? (
         <Text style={styles.notice}>{text.saved}</Text>
-      ) : feedback.kind === "reset" ? (
+      ) : effectiveFeedback.kind === "reset" ? (
         <Text style={styles.notice}>{text.resetDone}</Text>
-      ) : feedback.kind === "validationError" ? (
-        <Text style={styles.errorText}>{feedback.message}</Text>
+      ) : effectiveFeedback.kind === "validationError" ? (
+        <Text style={styles.errorText}>{effectiveFeedback.message}</Text>
       ) : saveErrorMessage === null ? (
         <Text style={styles.errorText}>
-          {feedback.action === "reset" ? text.resetFailed : text.saveFailed}
+          {effectiveFeedback.action === "reset" ? text.resetFailed : text.saveFailed}
         </Text>
       ) : null}
     </ScrollView>
@@ -389,7 +943,11 @@ function GuardedTimelineSettingsScreen(props: PluginSurfaceProps) {
   );
 }
 
-function registerWithLiveTitle(
+/**
+ * Register a host contribution whose title refreshes live whenever the active locale
+ * changes (for example after persisted language settings finish loading asynchronously).
+ */
+export function registerWithLiveTitle(
   label: string,
   titleOf: () => string,
   register: (title: string) => () => void,
@@ -419,8 +977,17 @@ function registerWithLiveTitle(
   };
 }
 
-/** Register the Display settings screen under the plugin's host settings. */
-export function contributeTimelineSettings(client: PluginClientContext): () => void {
+/**
+ * Register the Display settings screen under the plugin's host settings.
+ *
+ * Accepts an optional `Component` override so the unified console can mount directly on its
+ * Settings tab when opened from Paseo Settings while keeping `DISPLAY_SETTINGS_ID` and live
+ * title updates intact.
+ */
+export function contributeTimelineSettings(
+  client: PluginClientContext,
+  Component: ComponentType<PluginSurfaceProps> = GuardedTimelineSettingsScreen,
+): () => void {
   return registerWithLiveTitle(
     "timeline settings title refresh",
     () => localeText().settings.title,
@@ -429,7 +996,7 @@ export function contributeTimelineSettings(client: PluginClientContext): () => v
         id: DISPLAY_SETTINGS_ID,
         title,
         icon: SlidersIcon,
-        Component: GuardedTimelineSettingsScreen,
+        Component,
       }),
   );
 }
@@ -438,7 +1005,10 @@ export function contributeTimelineSettings(client: PluginClientContext): () => v
  * Reach the Display settings from the Command Center without navigating
  * Settings → Plugins → DeepSeek Harness.
  */
-export function contributeDisplaySettingsCommand(client: PluginClientContext): () => void {
+export function contributeDisplaySettingsCommand(
+  client: PluginClientContext,
+  onOpen?: (command: PluginGlobalCommandContext) => void | Promise<void>,
+): () => void {
   return registerWithLiveTitle(
     "display settings command title refresh",
     () => localeText().settings.command,
@@ -447,11 +1017,29 @@ export function contributeDisplaySettingsCommand(client: PluginClientContext): (
         id: "dsh-display-settings",
         title,
         icon: SlidersIcon,
-        keywords: ["DSH", "display", "timeline", "spacing", "language", "显示", "时间线", "行间距", "语言"],
+        keywords: [
+          "DSH",
+          "console",
+          "display",
+          "timeline",
+          "spacing",
+          "language",
+          "settings",
+          "doctor",
+          "控制台",
+          "显示",
+          "时间线",
+          "行间距",
+          "语言",
+          "设置",
+          "诊断",
+        ],
         context: "global",
         onSelect: (command) => {
           void Promise.resolve()
-            .then(() => command.openSettings(DISPLAY_SETTINGS_ID))
+            .then(() =>
+              onOpen ? onOpen(command) : command.openSettings(DISPLAY_SETTINGS_ID),
+            )
             .catch((error) => {
               report("open display settings", error);
             });

@@ -38,13 +38,28 @@ function readKinds(source) {
         (name) => name === 'react-native' ? {} : fromBuild(name));
     }
     if (id === './client/rewind-notice-live') return { startRewindLiveMonitor: () => noop };
+    if (id === './client/console-screen') {
+      return {
+        CONSOLE_SCREEN_ID: 'dsh-console',
+        DshConsoleScreen: () => null,
+        requestConsoleTab: noop,
+      };
+    }
+    if (id === './client/deepseek-mark-svg') return { DEEPSEEK_MARK_SVG: '<svg/>' };
+    if (id === './client/use-locale') {
+      return {
+        useLocaleText: () => ({ console: { title: 'DSH Console' } }),
+        useCurrentLocale: () => 'zh-CN',
+      };
+    }
     if (id === './client/dsh-plugins-page') return { DshPluginsPage: () => null };
     if (id === './client/dsh-plugins-icon') return { PluginsIcon: () => null };
     if (id === './client/settings-screen') {
       return {
-        DISPLAY_SETTINGS_ID: 'dsh-display',
+        DISPLAY_SETTINGS_ID: 'timeline-style',
         contributeDisplaySettingsCommand: () => noop,
         contributeTimelineSettings: () => noop,
+        registerWithLiveTitle: (_label, titleOf, register) => register(titleOf()),
       };
     }
     // The entry runs `installFatalGuard()` on load and registers the screen and
