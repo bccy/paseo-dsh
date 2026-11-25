@@ -22,19 +22,29 @@
  * @module dsh-paseo/client/rewind-notice
  */
 import type { PluginTimelineItemProps } from "@getpaseo/plugin/client";
-import { useToast } from "@getpaseo/plugin/client/ui";
+import { Icon, useToast } from "@getpaseo/plugin/client/ui";
 import { useEffect } from "react";
 import { Text, View } from "react-native";
+import { font, radius, space, tint } from "./console-theme";
 import { rewindToastMessage, type RewindNoticeData } from "./rewind-notice-data";
 import { activeRewindLiveMonitor } from "./rewind-notice-live";
-import { ROW_FONT_SIZE, ROW_LINE_HEIGHT } from "./tokens";
+
+/** Split a report into its first-line sentence and any verbatim detail lines. */
+function splitNoticeMessage(message: string): { headline: string; detail: string } {
+  const newline = message.indexOf("\n");
+  if (newline === -1) return { headline: message, detail: "" };
+  return {
+    headline: message.slice(0, newline),
+    detail: message.slice(newline + 1).trim(),
+  };
+}
 
 /**
- * One rewind report line.
+ * One lightweight rewind report row.
  *
- * The full report text is shown verbatim (a partial-file failure keeps its
- * detail lines). The capsule only repeats the headline — see
- * `rewindToastMessage`.
+ * Success renders borderless over the timeline surface; warning/partial failure
+ * adds a soft danger wash and preserves every verbatim detail line underneath
+ * the headline. The capsule only repeats the headline — see `rewindToastMessage`.
  */
 export function RewindNotice({
   agentId,
@@ -43,8 +53,11 @@ export function RewindNotice({
 }: PluginTimelineItemProps<RewindNoticeData>) {
   const toast = useToast();
   const data = item.data;
-  // The failure row keeps the host's original error tint; success is green.
-  const color = data.tone === "warning" ? theme.colors.statusDanger : theme.colors.statusSuccess;
+  const { colors } = theme;
+  const isWarning = data.tone === "warning";
+  const iconName = isWarning ? "TriangleAlert" : "RotateCcw";
+  const iconColor = isWarning ? colors.statusDanger : colors.statusSuccess;
+  const { headline, detail } = splitNoticeMessage(data.message);
 
   useEffect(() => {
     const monitor = activeRewindLiveMonitor();
@@ -62,21 +75,29 @@ export function RewindNotice({
   return (
     <View
       style={{
-        marginVertical: 4,
-        paddingHorizontal: 12,
-        paddingVertical: 8,
-        borderRadius: 8,
-        backgroundColor: theme.colors.surface1,
-        borderLeftWidth: 3,
-        borderLeftColor: color,
+        flexDirection: "row",
+        gap: space.sm,
+        alignItems: "flex-start",
+        marginVertical: space.xs,
+        paddingVertical: space.xs,
+        paddingHorizontal: space.sm,
+        borderRadius: radius.md,
+        backgroundColor: isWarning ? tint(colors.statusDanger, 0.08) : "transparent",
       }}
     >
-      <Text
-        selectable
-        style={{ color: theme.colors.foreground, fontSize: ROW_FONT_SIZE, lineHeight: ROW_LINE_HEIGHT }}
-      >
-        {data.message}
-      </Text>
+      <View style={{ paddingTop: 2 }}>
+        <Icon name={iconName} size={14} color={iconColor} />
+      </View>
+      <View style={{ flex: 1, minWidth: 0, gap: space.xxs }}>
+        <Text selectable style={{ ...font.small, color: colors.foreground }}>
+          {headline}
+        </Text>
+        {detail !== "" ? (
+          <Text selectable style={{ ...font.caption, color: colors.foregroundMuted }}>
+            {detail}
+          </Text>
+        ) : null}
+      </View>
     </View>
   );
 }

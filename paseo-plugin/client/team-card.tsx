@@ -5,7 +5,8 @@
  * caps the task list inside a bounded scroll region (`expandedScrollStyle`) so
  * long team boards scroll in place without pushing the timeline down. Each task
  * keeps the host task-list mark, its `task-N` id, key/value fields, and a
- * two-line clamped description with an in-place 展开/收起 toggle.
+ * description wrapped in `Expandable` (which reveals its fade mask and
+ * expand/collapse toggle only when the text genuinely overflows two lines).
  *
  * Its own module rather than a block inside `./tool-call`: the row's head is
  * held to one colour per glyph by `harness/style-check.cjs`, and the task
@@ -15,9 +16,9 @@
  * @module dsh-paseo/client/team-card
  */
 import { Icon, ScrollView } from "@getpaseo/plugin/client/react-native";
-import { useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import { EXPANDED_MAX_HEIGHT_DEFAULT } from "../shared/settings";
+import { Expandable } from "./console-ui";
 import { SCROLL_BOX_TEST_ID } from "./row-entrance";
 import { TEAM_TASK_ICONS } from "./team-polling";
 import type { TeamBlockData, TeamTaskCard } from "./tool-call-data";
@@ -42,15 +43,18 @@ export interface TeamCardColors extends TokenColors {
   warning: string;
 }
 
-/** Small muted text: captions, the id after a subject, the toggle. */
+/** Small muted text: captions and the id after a subject. */
 const SMALL = 12;
 
+/** Two-line clip height aligned to `GOAL_CARD_LINE_HEIGHT` so cuts land between lines. */
+const DESCRIPTION_COLLAPSED_HEIGHT = GOAL_CARD_LINE_HEIGHT * 2;
+
 function TeamTaskItem({ card, colors, divided, hairline }: { card: TeamTaskCard; colors: TeamCardColors; divided: boolean; hairline: number }) {
-  const [open, setOpen] = useState(false);
   const text = useLocaleText().team;
   const markColor = card.mark === "doing" ? colors.running : card.mark === "ready" ? colors.foregroundMuted : colors.extraMuted;
   const description = card.description.trim();
   const value = { color: colors.foreground, fontSize: ROW_FONT_SIZE, lineHeight: GOAL_CARD_LINE_HEIGHT, flex: 1, minWidth: 0 } as const;
+  const descriptionText = { color: colors.foregroundMuted, fontSize: ROW_FONT_SIZE, lineHeight: GOAL_CARD_LINE_HEIGHT } as const;
   const label = { color: colors.foregroundMuted, fontSize: ROW_FONT_SIZE, lineHeight: GOAL_CARD_LINE_HEIGHT, width: GOAL_FIELD_LABEL_WIDTH } as const;
   return (
     <View
@@ -80,24 +84,18 @@ function TeamTaskItem({ card, colors, divided, hairline }: { card: TeamTaskCard;
         {description === "" ? null : (
           <View style={{ flexDirection: "row", gap: GOAL_FIELD_COLUMN_GAP }}>
             <Text style={label}>{text.fields.description}</Text>
-            <View style={{ flex: 1, minWidth: 0 }}>
-              <Text style={{ ...value, color: colors.foregroundMuted }} numberOfLines={open ? undefined : 2} selectable={open}>
-                {open ? description : description.replace(/\s*\n+\s*/g, " ")}
+            <Expandable
+              colors={colors}
+              height={DESCRIPTION_COLLAPSED_HEIGHT}
+              background={colors.surface0}
+              expandLabel={text.card.expand}
+              collapseLabel={text.card.collapse}
+              style={{ flex: 1, minWidth: 0 }}
+            >
+              <Text style={descriptionText} selectable>
+                {description}
               </Text>
-              <Pressable
-                onPress={(event) => {
-                  event?.stopPropagation?.();
-                  setOpen(!open);
-                }}
-                accessibilityRole="button"
-                hitSlop={6}
-                style={{ alignSelf: "flex-start" }}
-              >
-                <Text style={{ color: colors.foregroundMuted, fontSize: SMALL, lineHeight: GOAL_CARD_LINE_HEIGHT, textDecorationLine: "underline" }}>
-                  {open ? text.card.collapse : text.card.expand}
-                </Text>
-              </Pressable>
-            </View>
+            </Expandable>
           </View>
         )}
       </View>
