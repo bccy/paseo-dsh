@@ -2176,10 +2176,23 @@ export class DshSession {
             }),
           ]);
           if (history === undefined || this.#closed || history.available === false) continue;
-          const telemetry = extractSubagentTelemetryFromEvents(
+          const extracted = extractSubagentTelemetryFromEvents(
             history.events,
             history.inheritedEventCount,
           );
+          // Match `DshChildSession.replay()`'s exact cold-start proof: on a cold
+          // reopen (not joined to a live shared process and not announced live),
+          // a readable child log without a terminal `turn/end` (killed mid-turn
+          // or never started) cannot still be running and will be closed as
+          // `canceled` by `replaySubagents()`. Stamp `canceled` here so the
+          // parent `tool_call` row emitted during `replayHistory()` does not
+          // stay stuck in `"running"` forever. Durable `subagent-settled` facts
+          // still take precedence in `TimelineBuilder`.
+          const announcedLive = this.#children.has(childId) || this.#isPendingChild(childId);
+          const telemetry: SubagentTelemetry =
+            extracted.status === undefined && !this.#joinedLiveProcess && !announcedLive
+              ? { ...extracted, status: "canceled" }
+              : extracted;
           if (Object.keys(telemetry).length === 0) continue;
           this.#childTelemetry.set(childId, telemetry);
           builder.recordSubagentTelemetry(childId, telemetry);
@@ -4281,8 +4294,8 @@ export class DshChildSession {
   /** Observed telemetry accumulated from this child's own events (past fork prefix). */
   #telemetrySteps = new Set<string>();
   #telemetryAnonStep = 0;
-  #telemetryOutputTokens = 0;
-  #telemetryHasOutputTokens = false;
+  /** Per-step output tokens keyed identically to `#telemetrySteps` so replay/live overlap never double-counts. */
+  #telemetryStepOutputTokens = new Map<string, number>();
   #telemetryActiveTurnStart: number | undefined;
   #telemetryDurationMs = 0;
   #telemetryHasDuration = false;
@@ -4343,6 +4356,12 @@ export class DshChildSession {
 
   /** Snapshot of real measured telemetry observed on this child session so far. */
   telemetry(): SubagentTelemetry {
+    let outputTokens: number | undefined;
+    if (this.#telemetryStepOutputTokens.size > 0) {
+      let sum = 0;
+      for (const value of this.#telemetryStepOutputTokens.values()) sum += value;
+      outputTokens = Math.round(sum);
+    }
     return {
       ...(this.#telemetryStatus === undefined ? {} : { status: this.#telemetryStatus }),
       ...(this.#telemetryReport === undefined ? {} : { report: this.#telemetryReport }),
@@ -4352,9 +4371,7 @@ export class DshChildSession {
       ...(this.#telemetryLabel === undefined ? {} : { label: this.#telemetryLabel }),
       ...(this.#telemetrySteps.size > 0 ? { steps: this.#telemetrySteps.size } : {}),
       ...(this.#telemetryHasDuration ? { durationMs: Math.round(this.#telemetryDurationMs) } : {}),
-      ...(this.#telemetryHasOutputTokens
-        ? { outputTokens: Math.round(this.#telemetryOutputTokens) }
-        : {}),
+      ...(outputTokens === undefined ? {} : { outputTokens }),
     };
   }
 
@@ -4399,17 +4416,15 @@ export class DshChildSession {
     if (event.type === "assistant/message") {
       const turn = typeof data.turn === "number" ? data.turn : undefined;
       const step = typeof data.step === "number" ? data.step : undefined;
-      if (turn !== undefined && step !== undefined) {
-        this.#telemetrySteps.add(`${turn}:${step}`);
-      } else {
-        this.#telemetryAnonStep += 1;
-        this.#telemetrySteps.add(`anon:${this.#telemetryAnonStep}`);
-      }
+      const stepKey =
+        turn !== undefined && step !== undefined
+          ? `${turn}:${step}`
+          : `anon:${++this.#telemetryAnonStep}`;
+      this.#telemetrySteps.add(stepKey);
       if (isRecord(data.usage)) {
         const out = data.usage.outputTokens;
         if (typeof out === "number" && Number.isFinite(out) && out >= 0) {
-          this.#telemetryOutputTokens += out;
-          this.#telemetryHasOutputTokens = true;
+          this.#telemetryStepOutputTokens.set(stepKey, out);
         }
       }
       const message = isRecord(data.message) ? data.message : undefined;

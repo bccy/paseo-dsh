@@ -389,10 +389,9 @@ export function extractSubagentTelemetryFromEvents(
   inheritedEventCount = 0,
 ): SubagentTelemetry {
   const seenSteps = new Set<string>();
+  const stepOutputTokens = new Map<string, number>();
   let fallbackSeq = 0;
   let anonStep = 0;
-  let outputTokensTotal = 0;
-  let hasOutputTokens = false;
   let activeTurnStart: number | undefined;
   let durationTotal = 0;
   let hasDuration = false;
@@ -444,17 +443,13 @@ export function extractSubagentTelemetryFromEvents(
     if (event.type === "assistant/message") {
       const turn = typeof data.turn === "number" ? data.turn : undefined;
       const step = typeof data.step === "number" ? data.step : undefined;
-      if (turn !== undefined && step !== undefined) {
-        seenSteps.add(`${turn}:${step}`);
-      } else {
-        anonStep += 1;
-        seenSteps.add(`anon:${anonStep}`);
-      }
+      const stepKey =
+        turn !== undefined && step !== undefined ? `${turn}:${step}` : `anon:${++anonStep}`;
+      seenSteps.add(stepKey);
       if (isRecord(data.usage)) {
         const out = nonNegativeFiniteNumber(data.usage.outputTokens);
         if (out !== undefined) {
-          outputTokensTotal += out;
-          hasOutputTokens = true;
+          stepOutputTokens.set(stepKey, out);
         }
       }
       const message = isRecord(data.message) ? data.message : undefined;
@@ -463,6 +458,13 @@ export function extractSubagentTelemetryFromEvents(
         if (text !== "") report = text;
       }
     }
+  }
+
+  let outputTokensTotal: number | undefined;
+  if (stepOutputTokens.size > 0) {
+    let sum = 0;
+    for (const value of stepOutputTokens.values()) sum += value;
+    outputTokensTotal = Math.round(sum);
   }
 
   return {
@@ -474,7 +476,7 @@ export function extractSubagentTelemetryFromEvents(
     ...(label === undefined ? {} : { label }),
     ...(seenSteps.size > 0 ? { steps: seenSteps.size } : {}),
     ...(hasDuration ? { durationMs: Math.round(durationTotal) } : {}),
-    ...(hasOutputTokens ? { outputTokens: Math.round(outputTokensTotal) } : {}),
+    ...(outputTokensTotal === undefined ? {} : { outputTokens: outputTokensTotal }),
   };
 }
 

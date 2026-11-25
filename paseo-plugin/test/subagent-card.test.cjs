@@ -1097,3 +1097,187 @@ test("parseArchiveSubagentsOutput and parseSubagentStatusChips handle text, dry-
   assert.equal(mapSubagentStopReason("max-tokens"), "failed");
   assert.equal(mapSubagentStopReason(undefined), undefined);
 });
+
+test("cold reopen closes killed/empty async subagent metadata as canceled while live-joined keeps running", async () => {
+  const buildRootEvents = () => [
+    { type: "turn/start", seq: 1, time: 1000, data: { turn: 1 } },
+    {
+      type: "tool/call",
+      seq: 2,
+      time: 1010,
+      data: { callId: "c-mid", name: "subagent", arguments: { name: "mid-worker", description: "Killed mid-turn", prompt: "Work mid" } },
+    },
+    {
+      type: "subagent/catalog",
+      seq: 3,
+      data: { version: 3, childId: "child-mid", mode: "continuable", label: "Killed mid-turn", name: "mid-worker" },
+    },
+    {
+      type: "tool/result",
+      seq: 4,
+      time: 1050,
+      data: { toolCallId: "c-mid", meta: { kind: "activation", name: "mid-worker" }, message: { content: [{ type: "text", text: "started subagent mid-worker" }] } },
+    },
+    {
+      type: "tool/call",
+      seq: 5,
+      time: 1060,
+      data: { callId: "c-empty", name: "subagent", arguments: { name: "empty-worker", description: "Never started", prompt: "Work empty" } },
+    },
+    {
+      type: "subagent/catalog",
+      seq: 6,
+      data: { version: 3, childId: "child-empty", mode: "continuable", label: "Never started", name: "empty-worker" },
+    },
+    {
+      type: "tool/result",
+      seq: 7,
+      time: 1090,
+      data: { toolCallId: "c-empty", meta: { kind: "activation", name: "empty-worker" }, message: { content: [{ type: "text", text: "started subagent empty-worker" }] } },
+    },
+    { type: "turn/end", seq: 8, time: 1100, data: { turn: 1, reason: { kind: "completed" } } },
+  ];
+
+  const runScenario = async (reused) => {
+    const histories = new Map([
+      ["root-reopen", { available: true, inheritedEventCount: 0, events: buildRootEvents() }],
+      [
+        "child-mid",
+        {
+          available: true,
+          inheritedEventCount: 0,
+          events: [
+            { type: "turn/start", seq: 0, time: 1060, data: { turn: 1 } },
+            {
+              type: "assistant/message",
+              seq: 1,
+              time: 1500,
+              data: { turn: 1, step: 1, usage: { outputTokens: 75 }, message: { content: [{ type: "text", text: "Partial work" }] } },
+            },
+          ],
+        },
+      ],
+      ["child-empty", { available: true, inheritedEventCount: 0, events: [] }],
+    ]);
+    const fakeProcess = {
+      async start() {},
+      async shutdown() {},
+      async attachSession() {},
+      async closeSession() {},
+      async usage() { return { available: false }; },
+      async history(sid) { return histories.get(sid); },
+    };
+    const emitted = [];
+    const session = new DshSession({
+      sessionId: "root-reopen",
+      cwd: "/work",
+      env: {},
+      route: { provider: "fixture", model: "alpha" },
+      mode: "build",
+      modes: [],
+      models: [],
+      thinkingOptions: [],
+      subsession: true,
+      emit: (event) => emitted.push(event),
+      log() {},
+      acquireProcess: async () => ({ process: fakeProcess, reused }),
+      releaseProcess: () => {},
+    });
+    await session.open();
+    await session.replayHistory();
+    await session.close();
+    const completedByCallId = (callId) =>
+      emitted
+        .filter((e) => e.type === "timeline.item" && e.item?.type === "tool_call" && e.item?.callId === callId && e.item?.status === "completed")
+        .at(-1)?.item?.metadata?.[DSH_SUBAGENT_METADATA_KEY];
+    return { mid: completedByCallId("c-mid"), empty: completedByCallId("c-empty") };
+  };
+
+  // Cold reopen (`reused: false`): both mid-turn killed and empty never-started children must close as canceled
+  const cold = await runScenario(false);
+  assert.equal(cold.mid.status, "canceled");
+  assert.equal(cold.mid.steps, 1);
+  assert.equal(cold.mid.outputTokens, 75);
+  assert.equal("durationMs" in cold.mid, false);
+  assert.equal(cold.empty.status, "canceled");
+  assert.equal("steps" in cold.empty, false);
+  assert.equal("outputTokens" in cold.empty, false);
+
+  // Live-joined (`reused: true`): mid-turn child in the still-running shared process stays running
+  const liveJoined = await runScenario(true);
+  assert.equal(liveJoined.mid.status, "running");
+  assert.equal(liveJoined.mid.steps, 1);
+  assert.equal(liveJoined.mid.outputTokens, 75);
+});
+
+test("overlapping replay and live assistant/message for the same (turn, step) does not double-count outputTokens", () => {
+  const duplicateEvent = {
+    type: "assistant/message",
+    seq: 2,
+    time: 2000,
+    data: {
+      turn: 1,
+      step: 1,
+      usage: { outputTokens: 256 },
+      message: { content: [{ type: "text", text: "Step 1 answer" }] },
+    },
+  };
+
+  // 1. DshChildSession: replay() followed by buffered live event() for the same (turn, step)
+  const child = new DshChildSession({
+    id: "root:sub:overlap-1",
+    nativeId: "overlap-1",
+    subsession: true,
+    cwd: "/work",
+    closed: () => false,
+    emit() {},
+    log() {},
+    resolvePermission() {},
+  });
+  child.replay(
+    [
+      { type: "turn/start", seq: 1, time: 1000, data: { turn: 1 } },
+      duplicateEvent,
+    ],
+    0,
+    true,
+  );
+  // Buffered live frame for the exact same (turn: 1, step: 1) arrives immediately after replay
+  child.event(duplicateEvent);
+  // Genuine next step (turn: 1, step: 2) adds cleanly
+  child.event({
+    type: "assistant/message",
+    seq: 3,
+    time: 3000,
+    data: {
+      turn: 1,
+      step: 2,
+      usage: { outputTokens: 144 },
+      message: { content: [{ type: "text", text: "Step 2 answer" }] },
+    },
+  });
+  child.event({ type: "turn/end", seq: 4, time: 3500, data: { turn: 1, reason: { kind: "completed" } } });
+
+  assert.deepEqual(child.telemetry(), {
+    status: "completed",
+    report: "Step 2 answer",
+    steps: 2,
+    durationMs: 2500,
+    outputTokens: 400,
+  });
+
+  // 2. Pure extractor symmetry: duplicate (turn, step) in an event stream is idempotent
+  const extracted = extractSubagentTelemetryFromEvents([
+    { type: "turn/start", seq: 1, time: 1000, data: { turn: 1 } },
+    duplicateEvent,
+    duplicateEvent,
+    { type: "turn/end", seq: 3, time: 2500, data: { turn: 1, reason: { kind: "completed" } } },
+  ]);
+  assert.deepEqual(extracted, {
+    status: "completed",
+    report: "Step 1 answer",
+    steps: 1,
+    durationMs: 1500,
+    outputTokens: 256,
+  });
+});
