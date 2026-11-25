@@ -53,6 +53,7 @@ const pluginTests = [
   'test/diagnostics.test.cjs',
   'test/pricing.test.cjs',
   'test/usage-stats.test.cjs',
+  'test/subagent-card.test.cjs',
   'test/paseo-0171.test.cjs',
   'test/paseo-0173.test.cjs',
   'test/timeline-spacing.test.cjs',
