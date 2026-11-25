@@ -68,6 +68,9 @@ interface TrackedSubagentCall {
 export interface SubagentTimelineStateSnapshot {
   catalogByChildId: ReadonlyMap<string, SubagentCatalogRecord>;
   catalogByName: ReadonlyMap<string, string>;
+  calls: ReadonlyMap<string, TrackedSubagentCall>;
+  callByChildId: ReadonlyMap<string, string>;
+  callByName: ReadonlyMap<string, string>;
   telemetry: ReadonlyMap<string, SubagentTelemetry>;
   settlements: ReadonlyMap<string, SubagentSettlementRecord>;
   agentMessages: ReadonlyMap<string, string>;
@@ -978,6 +981,8 @@ export class TimelineBuilder {
   #subagentSettlements = new Map<string, SubagentSettlementRecord>();
   /** Latest relayed `agent-message` text per child id (used when settlement omits closing text). */
   #subagentAgentMessages = new Map<string, string>();
+  /** Last emitted `DshSubagentMetadata` JSON signature per callId (covers replayed calls too). */
+  #lastSubagentMetaSignature = new Map<string, string>();
   /** Earliest observed durable `event.time` per tool callId (for sync duration measurement). */
   #toolCallTimes = new Map<string, number>();
   /**
@@ -1151,12 +1156,13 @@ export class TimelineBuilder {
   /**
    * Record durable `subagent/catalog` v3 identity (`childId`, `name`, `label`,
    * `mode`, `childCreatedAt`) so `subagent` / `subagent_fork` tool calls can
-   * correlate to their child session and measured telemetry.
+   * correlate to their child session and measured telemetry. Returns `childId`
+   * when absorbed.
    */
-  #absorbSubagentCatalog(data: Record<string, unknown>): void {
-    if (data.version !== 3) return;
+  #absorbSubagentCatalog(data: Record<string, unknown>): string | undefined {
+    if (data.version !== 3) return undefined;
     const childId = stringField(data, "childId");
-    if (childId === undefined) return;
+    if (childId === undefined) return undefined;
     const prev = this.#subagentCatalogByChildId.get(childId);
     const name = stringField(data, "name") ?? prev?.name;
     const label = stringField(data, "label") ?? prev?.label;
@@ -1188,6 +1194,7 @@ export class TimelineBuilder {
         }
       }
     }
+    return childId;
   }
 
   /**
@@ -1297,9 +1304,16 @@ export class TimelineBuilder {
 
   /** Snapshot subagent correlation state so the live builder inherits replay knowledge. */
   subagentStateSnapshot(): SubagentTimelineStateSnapshot {
+    const calls = new Map<string, TrackedSubagentCall>();
+    for (const [callId, tracked] of this.#subagentCalls) {
+      calls.set(callId, { ...tracked });
+    }
     return {
       catalogByChildId: new Map(this.#subagentCatalogByChildId),
       catalogByName: new Map(this.#subagentCatalogByName),
+      calls,
+      callByChildId: new Map(this.#subagentCallByChildId),
+      callByName: new Map(this.#subagentCallByName),
       telemetry: new Map(this.#subagentTelemetry),
       settlements: new Map(this.#subagentSettlements),
       agentMessages: new Map(this.#subagentAgentMessages),
@@ -1316,6 +1330,21 @@ export class TimelineBuilder {
     for (const [name, childId] of snapshot.catalogByName) {
       if (!this.#subagentCatalogByName.has(name)) {
         this.#subagentCatalogByName.set(name, childId);
+      }
+    }
+    for (const [callId, tracked] of snapshot.calls) {
+      if (!this.#subagentCalls.has(callId)) {
+        this.#subagentCalls.set(callId, { ...tracked });
+      }
+    }
+    for (const [childId, callId] of snapshot.callByChildId) {
+      if (!this.#subagentCallByChildId.has(childId)) {
+        this.#subagentCallByChildId.set(childId, callId);
+      }
+    }
+    for (const [name, callId] of snapshot.callByName) {
+      if (!this.#subagentCallByName.has(name)) {
+        this.#subagentCallByName.set(name, callId);
       }
     }
     for (const [childId, telemetry] of snapshot.telemetry) {
@@ -1335,15 +1364,27 @@ export class TimelineBuilder {
     }
   }
 
+  /** Current `callId -> DshSubagentMetadata` snapshot for all tracked subagent calls. */
+  subagentCardsSnapshot(): Record<string, DshSubagentMetadata> {
+    const out: Record<string, DshSubagentMetadata> = {};
+    for (const [callId, tracked] of this.#subagentCalls) {
+      const meta = this.#buildSubagentMetadata(tracked);
+      out[callId] = meta;
+      this.#lastSubagentMetaSignature.set(callId, JSON.stringify(meta));
+    }
+    return out;
+  }
+
   /**
    * Record real measured telemetry for a child session and, if a correlated
-   * `subagent` / `subagent_fork` tool row already exists in this builder and its
-   * metadata changed, return the updated item for same-turn emission.
+   * `subagent` / `subagent_fork` tool call's metadata changed, return the
+   * updated metadata (plus the in-place `ProviderTimelineItem` when that call
+   * lives in this builder's items map).
    */
   recordSubagentTelemetry(
     childId: string,
     telemetry: SubagentTelemetry,
-  ): { callId: string; item: ProviderTimelineItem } | undefined {
+  ): { callId: string; metadata: DshSubagentMetadata; item?: ProviderTimelineItem } | undefined {
     if (childId === "") return undefined;
     const prev = this.#subagentTelemetry.get(childId);
     const merged: SubagentTelemetry = {
@@ -1367,12 +1408,25 @@ export class TimelineBuilder {
 
   /**
    * Observe a live parent `user/message` (`subagent-settled` or `agent-message`)
-   * and return the updated tool row if a correlated subagent call changed.
+   * and return the updated metadata/item if a correlated subagent call changed.
    */
   observeSubagentUserMessage(
     data: Record<string, unknown>,
-  ): { callId: string; item: ProviderTimelineItem } | undefined {
+  ): { callId: string; metadata: DshSubagentMetadata; item?: ProviderTimelineItem } | undefined {
     const childId = this.#absorbSubagentUserMessage(data);
+    if (childId === undefined) return undefined;
+    return this.#refreshSubagentItem(childId);
+  }
+
+  /**
+   * Refresh any correlated subagent card after a live `subagent/catalog` event
+   * arrives (e.g. supplying the child's localized `label` or `childId` after
+   * `tool/result`).
+   */
+  observeSubagentCatalog(
+    data: Record<string, unknown>,
+  ): { callId: string; metadata: DshSubagentMetadata; item?: ProviderTimelineItem } | undefined {
+    const childId = this.#absorbSubagentCatalog(data);
     if (childId === undefined) return undefined;
     return this.#refreshSubagentItem(childId);
   }
@@ -1484,7 +1538,9 @@ export class TimelineBuilder {
     };
   }
 
-  #refreshSubagentItem(childId: string): { callId: string; item: ProviderTimelineItem } | undefined {
+  #refreshSubagentItem(
+    childId: string,
+  ): { callId: string; metadata: DshSubagentMetadata; item?: ProviderTimelineItem } | undefined {
     let callId = this.#subagentCallByChildId.get(childId);
     if (callId === undefined) {
       const catalog = this.#subagentCatalogByChildId.get(childId);
@@ -1502,23 +1558,33 @@ export class TimelineBuilder {
     }
     if (callId === undefined) return undefined;
     const tracked = this.#subagentCalls.get(callId);
-    const existing = this.#items.get(`tool:${callId}`);
-    if (tracked === undefined || existing === undefined || existing.type !== "tool_call") return undefined;
+    if (tracked === undefined) return undefined;
 
     const nextMeta = this.#buildSubagentMetadata(tracked);
-    const existingMeta = isRecord(existing.metadata) ? existing.metadata : {};
-    const prevSubagent = existingMeta[DSH_SUBAGENT_METADATA_KEY];
-    if (JSON.stringify(prevSubagent) === JSON.stringify(nextMeta)) return undefined;
+    const nextSignature = JSON.stringify(nextMeta);
+    const existing = this.#items.get(`tool:${callId}`);
+    if (existing !== undefined && existing.type === "tool_call") {
+      const existingMeta = isRecord(existing.metadata) ? existing.metadata : {};
+      const prevSubagent = existingMeta[DSH_SUBAGENT_METADATA_KEY];
+      if (JSON.stringify(prevSubagent) === nextSignature) {
+        this.#lastSubagentMetaSignature.set(callId, nextSignature);
+        return undefined;
+      }
+      const updated: ProviderTimelineItem = {
+        ...existing,
+        metadata: {
+          ...existingMeta,
+          [DSH_SUBAGENT_METADATA_KEY]: nextMeta as unknown as JsonValue,
+        },
+      };
+      this.#items.set(updated.id, updated);
+      this.#lastSubagentMetaSignature.set(callId, nextSignature);
+      return { callId, metadata: nextMeta, item: updated };
+    }
 
-    const updated: ProviderTimelineItem = {
-      ...existing,
-      metadata: {
-        ...existingMeta,
-        [DSH_SUBAGENT_METADATA_KEY]: nextMeta as unknown as JsonValue,
-      },
-    };
-    this.#items.set(updated.id, updated);
-    return { callId, item: updated };
+    if (this.#lastSubagentMetaSignature.get(callId) === nextSignature) return undefined;
+    this.#lastSubagentMetaSignature.set(callId, nextSignature);
+    return { callId, metadata: nextMeta };
   }
 
   /**

@@ -5054,6 +5054,7 @@ console.log("Phase 4: subagent expandable card & status chips (data layer + real
       "@getpaseo/plugin/client/ui": () => uiStub,
       "./row-entrance": () => ({ SCROLL_BOX_TEST_ID: "dsh-scroll-box" }),
       "./status-ring": () => ({ StatusRingMark: "StatusRingMark" }),
+      "./subagent-live": () => ({ useLiveSubagentCard: (_agentId, _callId, initial) => initial }),
     };
 
     const originalLoad = Module._load;
@@ -5085,6 +5086,7 @@ console.log("Phase 4: subagent expandable card & status chips (data layer + real
       SUBAGENT_CHIPS_TEST_ID,
       SubagentCard,
       SubagentStatusChips,
+      resolveSubagentDisplayTitle,
       safeCopyText,
       subagentFactParts,
       subagentStatusChipItems,
@@ -5145,6 +5147,51 @@ console.log("Phase 4: subagent expandable card & status chips (data layer + real
       statusWarning: "#d8b47b",
       statusDanger: "#d8847b",
     };
+
+    // Display title resolution: prefer localized human title over English ASCII role slug,
+    // localize generic/auto/built-in English slugs, and suppress generic "default" noise.
+    equal(
+      "resolveSubagentDisplayTitle prefers Chinese title over English role slug",
+      resolveSubagentDisplayTitle(
+        { kind: "subagent", title: "宿主子代理接口只读核实", role: "host-api-scout", preset: "default" },
+        "zh-CN",
+      ),
+      { primaryTitle: "宿主子代理接口只读核实", secondaryLabel: "host-api-scout" },
+    );
+    equal(
+      "resolveSubagentDisplayTitle hides auto-assigned agent-N and default preset beside Chinese title",
+      resolveSubagentDisplayTitle(
+        { kind: "subagent", title: "检查时间线样式", role: "agent-1", preset: "default" },
+        "zh-CN",
+      ),
+      { primaryTitle: "检查时间线样式", secondaryLabel: "" },
+    );
+    equal(
+      "resolveSubagentDisplayTitle localizes generic default role to 子智能体",
+      resolveSubagentDisplayTitle({ kind: "subagent", role: "default", preset: "default" }, "zh-CN"),
+      { primaryTitle: "子智能体", secondaryLabel: "" },
+    );
+    equal(
+      "resolveSubagentDisplayTitle localizes auto agent-2 without title",
+      resolveSubagentDisplayTitle({ kind: "subagent", role: "agent-2" }, "zh-CN"),
+      { primaryTitle: "子智能体 #2", secondaryLabel: "" },
+    );
+    equal(
+      "resolveSubagentDisplayTitle localizes built-in explore role in zh-CN and en",
+      [
+        resolveSubagentDisplayTitle({ kind: "subagent", role: "explore", preset: "explore" }, "zh-CN"),
+        resolveSubagentDisplayTitle({ kind: "subagent", role: "explore", preset: "explore" }, "en"),
+      ],
+      [
+        { primaryTitle: "探索子智能体", secondaryLabel: "" },
+        { primaryTitle: "Explore subagent", secondaryLabel: "" },
+      ],
+    );
+    equal(
+      "resolveSubagentDisplayTitle localizes fork default title",
+      resolveSubagentDisplayTitle({ kind: "subagent_fork", role: "default" }, "zh-CN"),
+      { primaryTitle: "子智能体分支", secondaryLabel: "" },
+    );
 
     // Pure helpers: facts never fabricate missing numbers; bilingual zh-CN & en
     equal("subagentFactParts omits all unmeasured fields", subagentFactParts({}, "zh-CN"), []);

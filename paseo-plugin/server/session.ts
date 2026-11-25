@@ -57,6 +57,8 @@ import {
   formatSubagentModel,
   isSubagentToolName,
   mapSubagentStopReason,
+  subagentMetadataFromItemMetadata,
+  type DshSubagentMetadata,
   type SubagentMode,
   type SubagentStatus,
   type SubagentTelemetry,
@@ -723,6 +725,8 @@ export class DshSession {
   #childByProviderId = new Map<string, DshChildSession>();
   /** Measured child execution telemetry keyed by DSH child session id. */
   #childTelemetry = new Map<string, SubagentTelemetry>();
+  /** Live subscribers for cross-turn `subagent` / `subagent_fork` card updates. */
+  #subagentCardListeners = new Set<(cards: Record<string, DshSubagentMetadata>) => void>();
   /**
    * `callId -> root turnId` for `subagent` / `subagent_fork` rows emitted in the
    * currently active root turn.
@@ -730,7 +734,8 @@ export class DshSession {
    * Paseo's `timeline-projection.js` merges `tool_call` updates in place ONLY
    * when `existing.turnId === entry.turnId`; a cross-turn re-emit duplicates the
    * row at the bottom of the timeline. Tracking the spawning turn here gates
-   * live telemetry/settlement updates to same-turn refreshes only.
+   * live telemetry/settlement updates to same-turn refreshes only, while
+   * cross-turn updates ride `#subagentCardListeners` (`dsh.subagent.live`).
    */
   #subagentCallTurns = new Map<string, string>();
   /** Whether Paseo negotiated `session.subsession`; gates every child emission. */
@@ -2131,6 +2136,7 @@ export class DshSession {
     this.#timeline.mergeTeamRoster(builder.rosterSnapshot());
     this.#timeline.mergeSubagentState(builder.subagentStateSnapshot());
     this.#syncChildRosters();
+    this.#publishSubagentSnapshot();
   }
 
   /**
@@ -3117,6 +3123,7 @@ export class DshSession {
     this.#cancelTurnLocally();
     this.#closed = true;
     this.#subagentCallTurns.clear();
+    this.#subagentCardListeners.clear();
     this.#childTelemetry.clear();
     clearTimeout(this.#usageRefreshTimer);
     this.#clearUsageReplays();
@@ -3751,19 +3758,34 @@ export class DshSession {
     // one arrival feeds both halves of the feature.
     if (event.type === ASSISTANT_DELTA_EVENT) this.#observeStreamSnapshot(isRecord(event.data) ? event.data : {});
     for (const item of this.#timeline.consume(event)) {
-      if (
-        item.type === "tool_call" &&
-        isSubagentToolName(item.name) &&
-        this.#turnStarted &&
-        this.#turnId !== null
-      ) {
-        this.#subagentCallTurns.set(item.callId, this.#turnId);
+      if (item.type === "tool_call" && isSubagentToolName(item.name)) {
+        if (this.#turnStarted && this.#turnId !== null) {
+          this.#subagentCallTurns.set(item.callId, this.#turnId);
+        }
+        const subagentMeta = subagentMetadataFromItemMetadata(item.metadata);
+        if (subagentMeta !== null) {
+          this.#publishSubagentCard(item.callId, subagentMeta);
+        }
       }
       this.#emitItem(item);
     }
+    if (event.type === "subagent/catalog") {
+      const catalogUpdated = this.#timeline.observeSubagentCatalog(isRecord(event.data) ? event.data : {});
+      if (catalogUpdated !== undefined) {
+        this.#publishSubagentCard(catalogUpdated.callId, catalogUpdated.metadata);
+        if (catalogUpdated.item !== undefined) {
+          this.#emitSameTurnSubagentUpdate(catalogUpdated.callId, catalogUpdated.item);
+        }
+      }
+    }
     if (event.type === "user/message") {
       const settled = this.#timeline.observeSubagentUserMessage(isRecord(event.data) ? event.data : {});
-      if (settled !== undefined) this.#emitSameTurnSubagentUpdate(settled.callId, settled.item);
+      if (settled !== undefined) {
+        this.#publishSubagentCard(settled.callId, settled.metadata);
+        if (settled.item !== undefined) {
+          this.#emitSameTurnSubagentUpdate(settled.callId, settled.item);
+        }
+      }
     }
     // A live `spawn_teammate` / `list_agents` row (or rc.3's durable
     // `subagent/catalog` fact) just taught the parent's builder a description;
@@ -3956,17 +3978,67 @@ export class DshSession {
     this.#options.emit({ type: "timeline.item", sessionId: this.id, item });
   }
 
+  /** Current `callId -> DshSubagentMetadata` snapshot for live card subscribers. */
+  subagentCardsSnapshot(): Record<string, DshSubagentMetadata> {
+    if (this.#closed) return {};
+    return this.#timeline.subagentCardsSnapshot();
+  }
+
   /**
-   * Absorb a child session's measured telemetry and, when the spawning
-   * `subagent` / `subagent_fork` row belongs to the currently active root turn,
-   * re-emit the enriched row in place.
+   * Subscribe to live `subagent` / `subagent_fork` card updates (including
+   * cross-turn settlements that Paseo's `timeline-projection.js` cannot merge
+   * via `timeline.item`).
+   */
+  subscribeSubagentCards(
+    listener: (cards: Record<string, DshSubagentMetadata>) => void,
+  ): () => void {
+    if (this.#closed) return () => {};
+    this.#subagentCardListeners.add(listener);
+    return () => {
+      this.#subagentCardListeners.delete(listener);
+    };
+  }
+
+  #publishSubagentCard(callId: string, metadata: DshSubagentMetadata): void {
+    if (this.#closed || this.#subagentCardListeners.size === 0) return;
+    const delta: Record<string, DshSubagentMetadata> = { [callId]: metadata };
+    for (const listener of [...this.#subagentCardListeners]) {
+      try {
+        listener(delta);
+      } catch (error) {
+        this.#options.log(`subagent live subscriber failed: ${messageOf(error)}`);
+      }
+    }
+  }
+
+  #publishSubagentSnapshot(): void {
+    if (this.#closed || this.#subagentCardListeners.size === 0) return;
+    const cards = this.#timeline.subagentCardsSnapshot();
+    if (Object.keys(cards).length === 0) return;
+    for (const listener of [...this.#subagentCardListeners]) {
+      try {
+        listener(cards);
+      } catch (error) {
+        this.#options.log(`subagent live subscriber failed: ${messageOf(error)}`);
+      }
+    }
+  }
+
+  /**
+   * Absorb a child session's measured telemetry, push live updates to card
+   * subscribers (including cross-turn), and when the spawning `subagent` /
+   * `subagent_fork` row belongs to the currently active root turn, re-emit the
+   * enriched row in place.
    */
   #onChildTelemetry(nativeId: string, telemetry: SubagentTelemetry): void {
     if (this.#closed) return;
     this.#childTelemetry.set(nativeId, telemetry);
     const updated = this.#timeline.recordSubagentTelemetry(nativeId, telemetry);
     if (updated !== undefined) {
-      this.#emitSameTurnSubagentUpdate(updated.callId, updated.item);
+      this.#publishSubagentCard(updated.callId, updated.metadata);
+      if (updated.item !== undefined) {
+        this.#emitSameTurnSubagentUpdate(updated.callId, updated.item);
+      }
     }
   }
 
@@ -4522,8 +4594,14 @@ export class DshChildSession {
       return;
     }
     // Idle with no explicit `turn/end` observed: close the turn as completed
-    // rather than leaving the child stuck "running" forever.
-    if (this.#turnId !== null && !this.#turnEnded) this.#endTurn("completed");
+    // rather than leaving the child stuck "running" forever, and notify the
+    // parent's subagent card telemetry so live cards settle promptly too.
+    const closedTurn = this.#turnId !== null && !this.#turnEnded;
+    if (closedTurn) this.#endTurn("completed");
+    if (this.#telemetryStatus === "running" || (closedTurn && this.#telemetryStatus === undefined)) {
+      this.#telemetryStatus = "completed";
+      this.#notifyTelemetry();
+    }
   }
 
   /**

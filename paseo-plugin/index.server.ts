@@ -2,6 +2,7 @@ import type { PluginHandlerContext, PluginServerContext } from "@getpaseo/plugin
 import { goalControl, goalSnapshot, isTerminalGoalErrorCode, type GoalAnswer } from "./shared/goal";
 import { isTerminalJobsErrorCode, jobsSnapshot, jobsStop, type JobsAnswer } from "./shared/jobs";
 import { isTerminalTeamErrorCode, teamSnapshot, type TeamAnswer } from "./shared/team";
+import { subagentLiveSnapshot } from "./shared/subagent-live";
 import { rewindNoticeArm } from "./shared/rewind-notice";
 import { languageSettings, timelineStyleSettings } from "./shared/settings";
 import { ensurePaseoProfile } from "./server/bootstrap";
@@ -19,6 +20,7 @@ import {
   readAgentJobs,
   readAgentTeam,
   stopAgentJob,
+  subscribeAgentSubagents,
 } from "./server/provider";
 
 /**
@@ -187,6 +189,13 @@ export default function contribute(server: PluginServerContext) {
   server.handle(teamSnapshot, ({ agentId }, context) => {
     capture(context);
     teamFeed.subscribe(agentId, (answer) => context.push(answer), context.signal);
+  });
+
+  // Event-driven cross-turn live updates for `subagent` / `subagent_fork`
+  // timeline cards (zero polling; opened only while a card is `"running"`).
+  server.handle(subagentLiveSnapshot, ({ agentId }, context) => {
+    capture(context);
+    subscribeAgentSubagents(agentId, (event) => context.push(event), context.signal);
   });
 
   // The jobs popover's stop button. Paseo's own background-task bar

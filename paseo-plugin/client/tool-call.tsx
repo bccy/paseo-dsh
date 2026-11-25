@@ -1562,6 +1562,8 @@ export function InlineToolCall({
         <View style={styles.root}>
           <SubagentCard
             subagent={data.subagent}
+            agentId={agentId}
+            callId={data.callId}
             colors={colors}
             hairline={StyleSheet.hairlineWidth}
             expandedMaxHeight={expandedMaxHeight}

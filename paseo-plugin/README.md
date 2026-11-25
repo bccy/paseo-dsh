@@ -79,9 +79,9 @@ What you get that the ACP boundary can't carry:
   collapsible advanced spacing tweaks; Paseo Settings and Command Center jump
   directly here)
 - Upgraded **timeline cards**: expandable `subagent` / `subagent_fork` cards
-  with observed-only facts and in-place task/report copy, inline status count
-  chips on `list_agents` / `archive_subagents`, bilingual `stream-stats` with
-  color-scale context `Bar` and 3-color `TokenBar`, overflow-gated `Expandable`
+  with localized human titles, event-driven live cross-turn settlement,
+  observed-only facts and in-place task/report copy, inline status count
+  chips on `list_agents` / `archive_subagents`, overflow-gated `Expandable`
   in `team-card`, and a lightweight `RewindNotice` row
 - **Session usage** — `used / limit` next to the composer, reported per session
   (each session keeps its own numbers while one `dsh` process serves several
@@ -169,7 +169,7 @@ ACP 承载不了、而这里都有：
   - **用量**：53 周热力图、`24h`/`7d`/`30d`、6 项可点 KPI + sparkline、全指标主图、8 列可排序模型占比表、主/子代理拆分与 Provider 路由筛选、落盘增量缓存（`$DSH_HOME/.cache/paseo-dsh-usage-v1.json`）与后台预热，以及 `USD $` / `CNY ¥` 双币种估价（默认 USD、汇率 `7.2` 可调、支持从 `models.dev` 自动同步官方 API 价格并缓存于 `$DSH_HOME/.cache/paseo-dsh-pricing-catalog-v1.json`，可通过 `dsh.pricing.sync` 手动刷新，内置参考表兜底 + 自定义单价保存于 `$DSH_HOME/.cache/paseo-dsh-pricing-v1.json`）
   - **插件**：列出并启停、安装、卸载、更新 profile 里的 bundle（新会话生效），带宿主 Modal 确认与 Toast 反馈
   - **设置**：秒开只读环境与路由概览 + 按需完整 Doctor 诊断（`ok/warn/fail` 徽标与修复提示）、界面语言与默认币种/汇率偏好、以及 `紧凑 / 默认 / 宽松` 时间线样式预设和可折叠的高级间距微调
-- **时间线卡片升级**：`subagent` / `subagent_fork` 轻量可展开卡片（仅展示实测事实，原地展开任务全文与报告并支持复制）、`list_agents` / `archive_subagents` 行尾内联状态计数 chip、中英双语 `stream-stats`（色阶上下文 `Bar` + 三色 `TokenBar`）、`team-card` 真实溢出折叠、轻量无框 `RewindNotice`
+- **时间线卡片升级**：`subagent` / `subagent_fork` 轻量可展开卡片（优先显示中文/可读描述标题、事件驱动跨回合实时同步完成态、仅展示实测事实，原地展开任务全文与报告并支持复制）、`list_agents` / `archive_subagents` 行尾内联状态计数 chip、`team-card` 真实溢出折叠、轻量无框 `RewindNotice`
 - **会话用量**：输入框旁显示 `已用 / 上限`，按会话上报（一个 `dsh` 进程服务多个 Paseo 会话时各算各的）
 - profile 挂了 `systemPrompt` 服务时，支持**会话级 system prompt**
 

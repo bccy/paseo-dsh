@@ -1281,3 +1281,363 @@ test("overlapping replay and live assistant/message for the same (turn, step) do
     outputTokens: 256,
   });
 });
+
+test("DshSession pushes cross-turn subagent completions over subscribeSubagentCards without duplicating timeline tool_call", async () => {
+  let handlers;
+  const fakeProcess = {
+    async start() {},
+    async shutdown() {},
+    async attachSession(_sid, h) { handlers = h; },
+    async closeSession() {},
+    async usage() { return { available: false }; },
+    async history() { return { available: true, events: [], inheritedEventCount: 0 }; },
+    async subagents() { return { available: true, subagents: [] }; },
+  };
+  const emitted = [];
+  const session = new DshSession({
+    sessionId: "root-cross-turn",
+    cwd: "/work",
+    env: { PASEO_AGENT_ID: "agent-cross-1" },
+    route: { provider: "fixture", model: "alpha" },
+    mode: "build",
+    modes: [],
+    models: [],
+    thinkingOptions: [],
+    subsession: true,
+    emit: (event) => emitted.push(event),
+    log() {},
+    acquireProcess: async () => ({ process: fakeProcess, reused: false }),
+    releaseProcess: () => {},
+  });
+
+  await session.open();
+  session.markRootReady();
+
+  const pushed = [];
+  const unsub = session.subscribeSubagentCards((cards) => {
+    pushed.push(cards);
+  });
+
+  // Turn 1 spawns async subagent, then Turn 1 finishes before child completes.
+  handlers.onStatus("running", "root-cross-turn");
+  handlers.onEvent({
+    sessionId: "root-cross-turn",
+    event: {
+      type: "tool/call",
+      seq: 1,
+      time: 1000,
+      data: {
+        callId: "call-async-1",
+        name: "subagent",
+        arguments: { name: "scout-async", description: "后台核查接口", prompt: "检查全部导出" },
+      },
+    },
+  });
+  handlers.onEvent({
+    sessionId: "root-cross-turn",
+    event: {
+      type: "tool/result",
+      seq: 2,
+      time: 1060,
+      data: {
+        toolCallId: "call-async-1",
+        meta: { kind: "activation", name: "scout-async" },
+        message: { content: [{ type: "text", text: "started subagent scout-async" }] },
+      },
+    },
+  });
+  // Catalog arrives live AFTER tool/result -> binds childId and updates card
+  handlers.onEvent({
+    sessionId: "root-cross-turn",
+    event: {
+      type: "subagent/catalog",
+      seq: 3,
+      data: {
+        version: 3,
+        childId: "child-async-1",
+        mode: "continuable",
+        label: "后台核查接口",
+        name: "scout-async",
+      },
+    },
+  });
+  handlers.onChildOpened({
+    sessionId: "child-async-1",
+    parentSessionId: "root-cross-turn",
+    mode: "continuable",
+    label: "后台核查接口",
+  });
+  handlers.onEvent({
+    sessionId: "root-cross-turn",
+    event: { type: "turn/end", seq: 4, data: { turn: 1, reason: { kind: "completed" } } },
+  });
+  handlers.onStatus("idle", "root-cross-turn");
+
+  const toolRowsBefore = emitted.filter(
+    (e) => e.type === "timeline.item" && e.sessionId === "root-cross-turn" && e.item?.callId === "call-async-1",
+  ).length;
+  assert.equal(session.subagentCardsSnapshot()["call-async-1"]?.status, "running");
+
+  // Child finishes AFTER Turn 1 ended (root is idle): subscription MUST receive completed card!
+  handlers.onEvent({
+    sessionId: "child-async-1",
+    event: { type: "turn/start", seq: 1, time: 2000, data: { turn: 1 } },
+  });
+  handlers.onEvent({
+    sessionId: "child-async-1",
+    event: {
+      type: "assistant/message",
+      seq: 2,
+      time: 3200,
+      data: {
+        turn: 1,
+        step: 1,
+        usage: { outputTokens: 180 },
+        message: { content: [{ type: "text", text: "全部导出核查完成。" }] },
+      },
+    },
+  });
+  handlers.onEvent({
+    sessionId: "child-async-1",
+    event: { type: "turn/end", seq: 3, time: 4500, data: { turn: 1, reason: { kind: "completed" } } },
+  });
+
+  const latestPushed = pushed.at(-1)?.["call-async-1"];
+  assert.deepEqual(latestPushed, {
+    kind: "subagent",
+    status: "completed",
+    role: "scout-async",
+    title: "后台核查接口",
+    task: "检查全部导出",
+    report: "全部导出核查完成。",
+    childSessionId: "child-async-1",
+    mode: "continuable",
+    steps: 1,
+    durationMs: 2500,
+    outputTokens: 180,
+  });
+  assert.deepEqual(session.subagentCardsSnapshot()["call-async-1"], latestPushed);
+
+  const toolRowsAfter = emitted.filter(
+    (e) => e.type === "timeline.item" && e.sessionId === "root-cross-turn" && e.item?.callId === "call-async-1",
+  ).length;
+  assert.equal(toolRowsAfter, toolRowsBefore, "cross-turn live completion must never duplicate timeline tool_call");
+
+  unsub();
+  await session.close();
+});
+
+test("reopened-while-running subagent settles live over subscribeSubagentCards after mergeSubagentState", async () => {
+  let handlers;
+  const histories = new Map([
+    [
+      "root-reopen-live",
+      {
+        available: true,
+        inheritedEventCount: 0,
+        events: [
+          { type: "turn/start", seq: 1, time: 1000, data: { turn: 1 } },
+          {
+            type: "tool/call",
+            seq: 2,
+            time: 1010,
+            data: { callId: "call-live-reopen", name: "subagent", arguments: { name: "runner-1", description: "持续运行任务", prompt: "继续检查" } },
+          },
+          {
+            type: "subagent/catalog",
+            seq: 3,
+            data: { version: 3, childId: "child-live-reopen", mode: "continuable", label: "持续运行任务", name: "runner-1" },
+          },
+          {
+            type: "tool/result",
+            seq: 4,
+            time: 1050,
+            data: { toolCallId: "call-live-reopen", meta: { kind: "activation", name: "runner-1" }, message: { content: [{ type: "text", text: "started subagent runner-1" }] } },
+          },
+          { type: "turn/end", seq: 5, time: 1100, data: { turn: 1, reason: { kind: "completed" } } },
+        ],
+      },
+    ],
+    [
+      "child-live-reopen",
+      {
+        available: true,
+        inheritedEventCount: 0,
+        events: [{ type: "turn/start", seq: 0, time: 1060, data: { turn: 1 } }],
+      },
+    ],
+  ]);
+  const fakeProcess = {
+    async start() {},
+    async shutdown() {},
+    async attachSession(_sid, h) { handlers = h; },
+    async closeSession() {},
+    async usage() { return { available: false }; },
+    async history(sid) { return histories.get(sid); },
+    async subagents() { return { available: true, subagents: [] }; },
+  };
+  const session = new DshSession({
+    sessionId: "root-reopen-live",
+    cwd: "/work",
+    env: { PASEO_AGENT_ID: "agent-reopen-live" },
+    route: { provider: "fixture", model: "alpha" },
+    mode: "build",
+    modes: [],
+    models: [],
+    thinkingOptions: [],
+    subsession: true,
+    emit() {},
+    log() {},
+    acquireProcess: async () => ({ process: fakeProcess, reused: true }),
+    releaseProcess: () => {},
+  });
+
+  await session.open();
+  await session.replayHistory();
+  session.markRootReady();
+
+  assert.equal(session.subagentCardsSnapshot()["call-live-reopen"]?.status, "running");
+
+  const pushed = [];
+  const unsub = session.subscribeSubagentCards((cards) => pushed.push(cards));
+
+  // Later parent receives subagent-settled for the replayed running call
+  handlers.onEvent({
+    sessionId: "root-reopen-live",
+    event: {
+      type: "user/message",
+      seq: 6,
+      data: {
+        source: { kind: "subagent-settled", form: "notice", stopReason: "completed", senderSessionId: "child-live-reopen" },
+        content: [
+          { type: "text", text: "Background subagent runner-1 finished." },
+          { type: "text", text: "Its closing message:" },
+          { type: "text", text: "重开后完成报告。" },
+        ],
+      },
+    },
+  });
+
+  assert.equal(pushed.at(-1)?.["call-live-reopen"]?.status, "completed");
+  assert.equal(pushed.at(-1)?.["call-live-reopen"]?.report, "重开后完成报告。");
+  assert.equal(session.subagentCardsSnapshot()["call-live-reopen"]?.status, "completed");
+
+  unsub();
+  await session.close();
+});
+
+test("DshChildSession.status('idle') without turn/end closes telemetry as completed and notifies parent", () => {
+  const reports = [];
+  const child = new DshChildSession({
+    id: "root:sub:idle-only",
+    nativeId: "idle-only",
+    subsession: true,
+    cwd: "/work",
+    closed: () => false,
+    emit() {},
+    log() {},
+    resolvePermission() {},
+    onTelemetry: (nativeId, telemetry) => reports.push({ nativeId, telemetry }),
+  });
+
+  child.status("running");
+  child.event({
+    type: "assistant/message",
+    time: 2000,
+    data: { turn: 1, step: 1, usage: { outputTokens: 55 }, message: { content: [{ type: "text", text: "Done via status idle" }] } },
+  });
+  child.status("idle");
+
+  assert.equal(child.telemetry().status, "completed");
+  assert.equal(child.telemetry().report, "Done via status idle");
+  assert.equal(reports.at(-1)?.telemetry.status, "completed");
+});
+
+test("client/subagent-live shares one subscription per agent, merges settled updates, keeps LRU cache on remount, and aborts on settle", () => {
+  const Module = require("node:module");
+  const path = require("node:path");
+  const liveModPath = require.resolve("../client/subagent-live.ts");
+  const listeners = new Set();
+  const effectCleanups = [];
+  const reactStub = {
+    useSyncExternalStore(subscribe, getSnapshot) {
+      const unsub = subscribe(() => {});
+      listeners.add(unsub);
+      return getSnapshot();
+    },
+    useEffect(effect) {
+      const cleanup = effect();
+      if (typeof cleanup === "function") effectCleanups.push(cleanup);
+    },
+  };
+  const originalLoad = Module._load;
+  Module._load = function load(request, parent, isMain) {
+    if (request === "react") return reactStub;
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  let liveMod;
+  try {
+    delete require.cache[liveModPath];
+    liveMod = require(liveModPath);
+  } finally {
+    Module._load = originalLoad;
+  }
+
+  const subscriptions = [];
+  const fakeClient = {
+    subscribe(_def, input, onEvent, options) {
+      const record = { input, onEvent, signal: options.signal, aborted: false };
+      options.signal.addEventListener("abort", () => { record.aborted = true; });
+      subscriptions.push(record);
+      return { ready: Promise.resolve(), close() {} };
+    },
+  };
+
+  liveMod.resetSubagentLiveStoreForTests();
+  const unbind = liveMod.bindSubagentLiveClient(fakeClient);
+  try {
+    const initialA = { kind: "subagent", status: "running", role: "scout-a", title: "任务 A", task: "细节 A" };
+    const initialB = { kind: "subagent", status: "running", role: "scout-b", title: "任务 B", task: "细节 B" };
+
+    // Two running cards on the same agent share ONE subscription
+    const rA1 = liveMod.useLiveSubagentCard("agent-1", "call-a", initialA);
+    const rB1 = liveMod.useLiveSubagentCard("agent-1", "call-b", initialB);
+    assert.equal(rA1.status, "running");
+    assert.equal(rB1.status, "running");
+    assert.equal(subscriptions.length, 1);
+    assert.equal(subscriptions[0].aborted, false);
+
+    // Server pushes live completion for call-a (without repeating task) -> task preserved, status flipped
+    subscriptions[0].onEvent({
+      cards: {
+        "call-a": { kind: "subagent", status: "completed", role: "scout-a", title: "任务 A", report: "报告 A", steps: 2, durationMs: 3100, outputTokens: 240 },
+      },
+    });
+    const rA2 = liveMod.useLiveSubagentCard("agent-1", "call-a", initialA);
+    assert.equal(rA2.status, "completed");
+    assert.equal(rA2.task, "细节 A");
+    assert.equal(rA2.report, "报告 A");
+    assert.equal(rA2.steps, 2);
+
+    // Unmount both running effects -> subscription aborts cleanly, cache stays warm for scroll remount
+    while (effectCleanups.length > 0) effectCleanups.pop()();
+    assert.equal(subscriptions[0].aborted, true);
+
+    // Remount call-a with stale initial "running" -> reads settled state from cache with ZERO new subscription!
+    const rA3 = liveMod.useLiveSubagentCard("agent-1", "call-a", initialA);
+    assert.equal(rA3.status, "completed");
+    assert.equal(rA3.report, "报告 A");
+    assert.equal(subscriptions.length, 1);
+
+    // Settled initial snapshot is never overwritten by older cache
+    const settledInitial = { kind: "subagent", status: "completed", role: "scout-a", title: "任务 A", report: "重放终版", steps: 5 };
+    const rA4 = liveMod.useLiveSubagentCard("agent-1", "call-a", settledInitial);
+    assert.equal(rA4.report, "重放终版");
+    assert.equal(rA4.steps, 5);
+  } finally {
+    for (const unsub of listeners) unsub();
+    unbind();
+    liveMod.resetSubagentLiveStoreForTests();
+    delete require.cache[liveModPath];
+  }
+});

@@ -34,17 +34,10 @@ function readKinds(source) {
   const requireClient = (id) => {
     if (id === './client/stream-stats') {
       const file = path.join(build, 'client/stream-stats.js');
-      return evaluate(
-        fs.readFileSync(file, 'utf8'),
-        file,
-        (name) =>
-          name === 'react-native'
-          || /^\.\/(console-format|console-theme|console-ui|use-locale)$/.test(name)
-            ? {}
-            : fromBuild(name),
-      );
+      return evaluate(fs.readFileSync(file, 'utf8'), file, (name) => name === 'react-native' ? {} : fromBuild(name));
     }
     if (id === './client/rewind-notice-live') return { startRewindLiveMonitor: () => noop };
+    if (id === './client/subagent-live') return { bindSubagentLiveClient: () => noop };
     if (id === './client/console-diagnostics') return { ConsoleDiagnosticsSection: () => null };
     if (id === './client/console-usage') return { ConsoleUsageTab: () => null };
     if (id === './client/console-pricing') return { PricingDialog: () => null };

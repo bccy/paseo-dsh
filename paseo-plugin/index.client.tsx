@@ -61,6 +61,7 @@ import {
 } from "./client/rewind-notice-data";
 import { startRewindLiveMonitor } from "./client/rewind-notice-live";
 import { retainRowEntranceObservers } from "./client/row-entrance";
+import { bindSubagentLiveClient } from "./client/subagent-live";
 import { InlineToolCall } from "./client/tool-call";
 import { toolCallData } from "./client/tool-call-data";
 import {
@@ -516,6 +517,7 @@ function buildContributions(client: PluginClientContext): () => void {
           }),
       )),
     () => workspaceStatus.dispose(),
+    bindSubagentLiveClient(client),
     retainRowEntranceObservers(),
   ];
 

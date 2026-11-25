@@ -77,6 +77,7 @@ import {
 import type { GoalAction, GoalErrorCode, GoalState } from "../shared/goal";
 import type { JobErrorCode, JobStopResult } from "../shared/jobs";
 import { teamMemberSchema, teamProjectionSchema, type TeamErrorCode, type TeamView } from "../shared/team";
+import type { SubagentLiveEvent } from "../shared/subagent-live";
 import { PROVIDER_ID } from "../shared/provider";
 
 /**
@@ -2863,6 +2864,7 @@ class DshConnection implements ProviderConnection {
         },
       });
       this.#sessions.set(sessionId, session);
+      notifySubagentSession(session);
 
       // The claim was taken before this `try` (see above) — deliberately, because
       // the awaits in between made "check then claim" non-atomic. Nothing here
@@ -3398,6 +3400,92 @@ const SERVING_SHARED_DSH = new Set<number>();
  * it). A `RETIRING` set would be a second source of truth for the same fact and
  * was, in fact, only ever written.
  */
+
+/**
+ * Live event-driven subscribers for cross-turn `subagent` / `subagent_fork`
+ * timeline card updates, keyed by Paseo agent id.
+ */
+interface SubagentSubscriber {
+  readonly push: (event: SubagentLiveEvent) => void;
+  detachSession?: () => void;
+}
+const SUBAGENT_SUBSCRIBERS = new Map<string, Set<SubagentSubscriber>>();
+
+function safePushSubagentEvent(
+  subscriber: SubagentSubscriber,
+  event: SubagentLiveEvent,
+): void {
+  if (Object.keys(event.cards).length === 0) return;
+  try {
+    subscriber.push(event);
+  } catch {
+    /* ignore closed subscription stream */
+  }
+}
+
+function attachSubagentSubscriber(
+  subscriber: SubagentSubscriber,
+  session: DshSession,
+): void {
+  subscriber.detachSession?.();
+  subscriber.detachSession = session.subscribeSubagentCards((cards) => {
+    safePushSubagentEvent(subscriber, { cards });
+  });
+  const snapshot = session.subagentCardsSnapshot();
+  safePushSubagentEvent(subscriber, { cards: snapshot });
+}
+
+function notifySubagentSession(session: DshSession): void {
+  const agentId = session.paseoAgentId;
+  if (agentId === undefined || agentId === "") return;
+  const listeners = SUBAGENT_SUBSCRIBERS.get(agentId);
+  if (listeners === undefined || listeners.size === 0) return;
+  for (const subscriber of [...listeners]) {
+    attachSubagentSubscriber(subscriber, session);
+  }
+}
+
+/**
+ * Subscribe to live `subagent` / `subagent_fork` timeline card updates for
+ * `agentId` until `signal` aborts.
+ *
+ * Zero-polling and event-driven: immediately pushes the session's current
+ * subagent card snapshot (if a session is already open), then pushes only
+ * changed `callId -> DshSubagentMetadata` entries as child sessions run and
+ * settle (including across turns).
+ */
+export function subscribeAgentSubagents(
+  agentId: string,
+  push: (event: SubagentLiveEvent) => void,
+  signal: AbortSignal,
+): void {
+  if (agentId === "" || signal.aborted) return;
+  const subscriber: SubagentSubscriber = { push };
+  let listeners = SUBAGENT_SUBSCRIBERS.get(agentId);
+  if (listeners === undefined) {
+    listeners = new Set();
+    SUBAGENT_SUBSCRIBERS.set(agentId, listeners);
+  }
+  listeners.add(subscriber);
+
+  for (const connection of CONNECTIONS) {
+    const session = connection.sessionForAgent(agentId);
+    if (session !== undefined) {
+      attachSubagentSubscriber(subscriber, session);
+      break;
+    }
+  }
+
+  const cleanup = (): void => {
+    subscriber.detachSession?.();
+    subscriber.detachSession = undefined;
+    const set = SUBAGENT_SUBSCRIBERS.get(agentId);
+    if (set === undefined) return;
+    set.delete(subscriber);
+    if (set.size === 0) SUBAGENT_SUBSCRIBERS.delete(agentId);
+  };
+  signal.addEventListener("abort", cleanup, { once: true });
+}
 
 /**
  * Read one agent's background jobs through whichever connection serves it.

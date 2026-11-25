@@ -36,11 +36,10 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   拦截实际 `addTimelineRenderer` 的四个 kind，按 `^[a-z][a-z0-9-]*$` 校验。UI 组件不挂载，
   `requireClient` 桩掉控制台壳与各 Tab 模块（`./client/console-screen`、`./client/console-diagnostics`、
   `./client/console-usage`、`./client/console-pricing`、`./client/console-heatmap`、
-  `./client/deepseek-mark-svg`、`./client/use-locale`、`DshPluginsContent`、
-  `registerWithLiveTitle`）以及 `client/stream-stats.tsx` 新增的相对导入（`./console-format`、
-  `./console-theme`、`./console-ui`、`./use-locale`）；
+  `./client/deepseek-mark-svg`、`./client/use-locale`、`./client/subagent-live`、`DshPluginsContent`、
+  `registerWithLiveTitle`）；
   在内存里把实际注册的 kind 改为大写字符串，必须拒绝（负向变异控制）。新增 renderer 或改动
-  `index.client.tsx` / `client/stream-stats.tsx` 的顶层 client 导入必跑。
+  `index.client.tsx` 的顶层 client 导入必跑。
 - `harness/plugins-lock-check.cjs`：DSH Plugins 页唯一直接写入（启停 bundle，改
   `dsh.profile.bundles`）的 profile 锁协议：`<profile>/package.json.lock`，`wx` 创建、
   内容 `` `${pid}\n` ``，与 DSH 自己的 `@deepseek-ai/dsh-atomic-write` 互斥。断言成功写入
@@ -92,15 +91,18 @@ node harness/offline-checks.cjs --list       # 只列出当前机器可执行清
   371 天每日汇总与连续活跃天数（streak）；以及异步后台预热（background prewarm）与实时
   `indexing: { active, done, total }` 状态上报。运行：`cd paseo-plugin && node --test test/usage-stats.test.cjs`。
   **动了 `shared/usage.ts`、`server/usage-stats.ts` 或 `index.server.ts` 的用量统计 RPC / 预热接线必跑。**
-- `paseo-plugin/test/subagent-card.test.cjs` — 时间线子代理卡片服务端元数据与状态摘要解析回归
-  （**13 条**；已登记在 `offline-checks.cjs` 的 `pluginTests`，纳入 portable CI）：
+- `paseo-plugin/test/subagent-card.test.cjs` — 时间线子代理卡片服务端元数据、跨回合实时推送与状态摘要解析回归
+  （**17 条**；已登记在 `offline-checks.cjs` 的 `pluginTests`，纳入 portable CI）：
   `item.metadata.dshSubagent` 只携带观测到的事实（缺失即省略，不伪造，启动回执不作最终报告，且不改
-  `detail` 协议形状、过 `ProviderEventSchema.parse`）；冷重开无终态子会话收尾为 `canceled`、与
-  活进程加入（`reused: true`）保持 `running` 区分；按 `stepKey` 幂等累计 `outputTokens` 防 replay/live
-  重叠重复计数；以及 `list_agents` 三代输出格式（rc.3+ 纯文本、rc.2 树形 JSON、≤0.2.1 名册 JSON，排除 Lead）
-  与 `archive_subagents`（文本/dry-run/JSON）解析器（畸形/混合形状一律 fail-closed）。运行：
-  `cd paseo-plugin && node --test test/subagent-card.test.cjs`。
-  **动了 `shared/subagent-card.ts`、`server/timeline.ts` / `server/session.ts` 的子代理元数据或重放预取必跑。**
+  `detail` 协议形状、过 `ProviderEventSchema.parse`）；跨回合实时完成（`DshSession.subscribeSubagentCards` /
+  `dsh.subagent.live`）、重开运行中子代理经 `mergeSubagentState` 后的实时收尾、`DshChildSession.status("idle")`
+  无 `turn/end` 时的 telemetry 收尾、`client/subagent-live.ts` 按 `agentId` 共享单订阅与滚动防回弹缓存；
+  冷重开无终态子会话收尾为 `canceled`、与活进程加入（`reused: true`）保持 `running` 区分；按 `stepKey`
+  幂等累计 `outputTokens` 防 replay/live 重叠重复计数；以及 `list_agents` 三代输出格式（rc.3+ 纯文本、
+  rc.2 树形 JSON、≤0.2.1 名册 JSON，排除 Lead）与 `archive_subagents`（文本/dry-run/JSON）解析器
+  （畸形/混合形状一律 fail-closed）。运行：`cd paseo-plugin && node --test test/subagent-card.test.cjs`。
+  **动了 `shared/subagent-card.ts`、`shared/subagent-live.ts`、`client/subagent-live.ts`、
+  `server/timeline.ts` / `server/session.ts` / `server/provider.ts` 的子代理元数据、重放预取或实时推送必跑。**
 - `paseo-plugin/test/timeline-spacing.test.cjs` — 时间线间距、展开区高度上限与显示语言设置回归：
   `TIMELINE_STYLE_DEFAULTS` / `TIMELINE_STYLE_KEYS` / `EXPANDED_MAX_HEIGHT_DEFAULT`（260）与
   `timelineStyleSettings` schema（v6）默认值和数值边界一致；v1–v5 `migrate()` 折叠旧 margin 字段、

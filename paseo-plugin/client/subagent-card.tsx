@@ -42,6 +42,7 @@ import { Badge, Expandable } from "./console-ui";
 import type { Locale } from "./locale";
 import { SCROLL_BOX_TEST_ID } from "./row-entrance";
 import { StatusRingMark } from "./status-ring";
+import { useLiveSubagentCard } from "./subagent-live";
 import type { SubagentCardData, SubagentStatusChipsData } from "./tool-call-data";
 import { useCurrentLocale } from "./use-locale";
 
@@ -201,6 +202,133 @@ const SETTLED_STATUS_ICON: Record<Exclude<SubagentStatus, "running">, string> = 
 };
 
 const EXPANDABLE_TASK_HEIGHT = 108;
+
+/** Generic ASCII placeholder slugs that should never display verbatim as a card title. */
+const GENERIC_SUBAGENT_SLUGS = new Set([
+  "default",
+  "general",
+  "general-purpose",
+  "subagent",
+  "sub_agent",
+  "subagent_fork",
+  "assistant",
+  "agent",
+]);
+
+/** Localized display labels for common built-in English subagent role/preset slugs. */
+const BUILTIN_ROLE_LABELS: Record<Locale, Readonly<Record<string, string>>> = {
+  "zh-CN": {
+    explore: "探索子智能体",
+    explorer: "探索子智能体",
+    plan: "规划子智能体",
+    planner: "规划子智能体",
+    code: "编码子智能体",
+    coder: "编码子智能体",
+    research: "调研子智能体",
+    researcher: "调研子智能体",
+    review: "审查子智能体",
+    reviewer: "审查子智能体",
+    search: "检索子智能体",
+    searcher: "检索子智能体",
+    analyst: "分析子智能体",
+    worker: "执行子智能体",
+    scout: "探查子智能体",
+  },
+  en: {
+    explore: "Explore subagent",
+    explorer: "Explore subagent",
+    plan: "Plan subagent",
+    planner: "Plan subagent",
+    code: "Code subagent",
+    coder: "Code subagent",
+    research: "Research subagent",
+    researcher: "Research subagent",
+    review: "Review subagent",
+    reviewer: "Review subagent",
+    search: "Search subagent",
+    searcher: "Search subagent",
+    analyst: "Analyst subagent",
+    worker: "Worker subagent",
+    scout: "Scout subagent",
+  },
+};
+
+/**
+ * Resolve the primary display title and muted secondary metadata caption for a
+ * subagent card.
+ *
+ * DSH requires ASCII identifiers for `name` / `agent_preset` (e.g.
+ * `"host-api-scout"`, `"agent-1"`, `"default"`) while storing the human-readable
+ * localized label in `args.description` / `subagent/catalog.label` (`title`).
+ * Prefer `title` first so cards show the user's language by default; localize
+ * generic or built-in English slugs when no explicit `title` was supplied.
+ */
+export function resolveSubagentDisplayTitle(
+  subagent: Pick<SubagentCardData, "kind" | "title" | "role" | "preset" | "model">,
+  locale: Locale,
+): { primaryTitle: string; secondaryLabel: string } {
+  const copy = SUBAGENT_COPY[locale];
+  const isFork = subagent.kind === "subagent_fork";
+  const defaultTitle = isFork ? copy.defaultForkTitle : copy.defaultTitle;
+  const trimmedTitle = subagent.title?.trim() ?? "";
+  const trimmedRole = subagent.role?.trim() ?? "";
+  const roleKey = trimmedRole.toLowerCase();
+
+  let primaryTitle: string;
+  let roleConsumedAsPrimary = false;
+  if (trimmedTitle !== "") {
+    primaryTitle = trimmedTitle;
+  } else if (trimmedRole === "" || GENERIC_SUBAGENT_SLUGS.has(roleKey)) {
+    primaryTitle = defaultTitle;
+    roleConsumedAsPrimary = true;
+  } else {
+    const autoIdMatch = /^agent-(\d+)$/i.exec(trimmedRole);
+    if (autoIdMatch !== null) {
+      primaryTitle = `${defaultTitle} #${autoIdMatch[1]}`;
+      roleConsumedAsPrimary = true;
+    } else {
+      const localizedBuiltIn = BUILTIN_ROLE_LABELS[locale][roleKey];
+      if (localizedBuiltIn !== undefined) {
+        primaryTitle = localizedBuiltIn;
+        roleConsumedAsPrimary = true;
+      } else {
+        primaryTitle = trimmedRole;
+        roleConsumedAsPrimary = true;
+      }
+    }
+  }
+
+  const parts: string[] = [];
+  const seen = new Set<string>([primaryTitle.trim().toLowerCase()]);
+  if (roleConsumedAsPrimary && roleKey !== "") {
+    seen.add(roleKey);
+  }
+  const pushUnique = (raw: string | undefined, skipGeneric = false) => {
+    if (raw === undefined) return;
+    const trimmed = raw.trim();
+    if (trimmed === "") return;
+    const key = trimmed.toLowerCase();
+    if (skipGeneric && GENERIC_SUBAGENT_SLUGS.has(key)) return;
+    if (seen.has(key)) return;
+    seen.add(key);
+    parts.push(trimmed);
+  };
+
+  const roleIsAutoId = /^agent-\d+$/i.test(trimmedRole);
+  if (!roleConsumedAsPrimary && !roleIsAutoId) {
+    pushUnique(trimmedRole, true);
+  }
+  pushUnique(subagent.preset, true);
+  pushUnique(subagent.model, false);
+  if (parts.length === 0 && isFork && primaryTitle !== copy.defaultForkTitle) {
+    pushUnique(copy.forkTag);
+  }
+
+  return {
+    primaryTitle,
+    secondaryLabel: parts.join(" · "),
+  };
+}
 
 /**
  * Safe clipboard helper over Paseo's `copyText`.
@@ -421,6 +549,10 @@ function CopyChipButton({
 
 export interface SubagentCardProps {
   subagent: SubagentCardData;
+  /** Paseo agent id used for event-driven cross-turn live updates while running. */
+  agentId?: string;
+  /** Tool call id matching `subagent` / `subagent_fork` in the server session. */
+  callId?: string;
   colors: SubagentCardColors;
   hairline?: number;
   expandedMaxHeight?: number;
@@ -445,6 +577,8 @@ export interface SubagentCardProps {
  */
 export function SubagentCard({
   subagent,
+  agentId,
+  callId,
   colors,
   hairline = 1,
   expandedMaxHeight = 260,
@@ -460,6 +594,7 @@ export function SubagentCard({
 }: SubagentCardProps) {
   const locale = useCurrentLocale();
   const copy = SUBAGENT_COPY[locale];
+  const liveSubagent = useLiveSubagentCard(agentId, callId, subagent);
   const [uncontrolledExpanded, setUncontrolledExpanded] = useState(false);
   const expanded = controlledExpanded ?? uncontrolledExpanded;
 
@@ -471,42 +606,29 @@ export function SubagentCard({
     }
   }, [onToggle]);
 
-  const isFork = subagent.kind === "subagent_fork";
-  const statusTone = STATUS_TONE[subagent.status];
+  const isFork = liveSubagent.kind === "subagent_fork";
+  const statusTone = STATUS_TONE[liveSubagent.status];
   const statusColor = toneColor(colors, statusTone);
-  const statusLabel = copy.statuses[subagent.status];
+  const statusLabel = copy.statuses[liveSubagent.status];
   const statusIcon: string | ReactNode =
-    subagent.status === "running"
+    liveSubagent.status === "running"
       ? <StatusRingMark size={12} ring={10} color={statusColor} />
-      : SETTLED_STATUS_ICON[subagent.status];
+      : SETTLED_STATUS_ICON[liveSubagent.status];
 
-  const primaryTitle =
-    subagent.role ??
-    subagent.title ??
-    (isFork ? copy.defaultForkTitle : copy.defaultTitle);
+  const { primaryTitle, secondaryLabel } = useMemo(
+    () => resolveSubagentDisplayTitle(liveSubagent, locale),
+    [
+      liveSubagent.kind,
+      liveSubagent.title,
+      liveSubagent.role,
+      liveSubagent.preset,
+      liveSubagent.model,
+      locale,
+    ],
+  );
 
-  const secondaryLabel = useMemo(() => {
-    const parts: string[] = [];
-    const seen = new Set<string>([primaryTitle.trim().toLowerCase()]);
-    const pushUnique = (raw: string | undefined) => {
-      if (raw === undefined) return;
-      const trimmed = raw.trim();
-      if (trimmed === "") return;
-      const key = trimmed.toLowerCase();
-      if (seen.has(key)) return;
-      seen.add(key);
-      parts.push(trimmed);
-    };
-    pushUnique(subagent.preset);
-    pushUnique(subagent.model);
-    if (parts.length === 0 && isFork && subagent.role !== undefined) {
-      pushUnique(copy.forkTag);
-    }
-    return parts.join(" · ");
-  }, [primaryTitle, subagent.preset, subagent.model, subagent.role, isFork, copy.forkTag]);
-
-  const trimmedTitle = subagent.title?.trim() ?? "";
-  const trimmedTask = subagent.task?.trim() ?? "";
+  const trimmedTitle = liveSubagent.title?.trim() ?? "";
+  const trimmedTask = liveSubagent.task?.trim() ?? "";
   const showTitleInPreview =
     trimmedTitle !== "" && trimmedTitle !== primaryTitle.trim();
 
@@ -533,18 +655,18 @@ export function SubagentCard({
   }, [fallbackBody, error]);
 
   const reportText =
-    subagent.report !== undefined && subagent.report.trim() !== ""
-      ? subagent.report
+    liveSubagent.report !== undefined && liveSubagent.report.trim() !== ""
+      ? liveSubagent.report
       : cleanFallbackBody;
   const hasExplicitReport =
-    subagent.report !== undefined && subagent.report.trim() !== "";
+    liveSubagent.report !== undefined && liveSubagent.report.trim() !== "";
   const fullTaskText =
-    trimmedTask !== "" ? (subagent.task ?? trimmedTask) : showTitleInPreview ? trimmedTitle : "";
+    trimmedTask !== "" ? (liveSubagent.task ?? trimmedTask) : showTitleInPreview ? trimmedTitle : "";
 
   const trimmedError = error.trim();
   const errorFirstLine = trimmedError === "" ? "" : trimmedError.split("\n")[0] ?? "";
   const errorPreview =
-    subagent.status === "failed"
+    liveSubagent.status === "failed"
       ? errorShort !== ""
         ? errorShort
         : errorFirstLine
@@ -552,15 +674,15 @@ export function SubagentCard({
   const hasErrorBlock = trimmedError !== "" || errorHint !== "" || errorCode !== "";
 
   const factLine = useMemo(
-    () => subagentFactParts(subagent, locale).join(" · "),
-    [subagent.steps, subagent.durationMs, subagent.outputTokens, locale],
+    () => subagentFactParts(liveSubagent, locale).join(" · "),
+    [liveSubagent.steps, liveSubagent.durationMs, liveSubagent.outputTokens, locale],
   );
 
   const canExpand =
     fullTaskText !== "" ||
     reportText !== "" ||
     hasErrorBlock ||
-    subagent.status === "running";
+    liveSubagent.status === "running";
 
   const cardAccessibilityLabel = [
     primaryTitle,
@@ -861,7 +983,7 @@ export function SubagentCard({
                 </Text>
               </ScrollView>
             </View>
-          ) : subagent.status === "running" ? (
+          ) : liveSubagent.status === "running" ? (
             <Text style={{ ...font.caption, color: colors.foregroundMuted }}>
               {copy.runningNoReport}
             </Text>
