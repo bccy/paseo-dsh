@@ -882,9 +882,10 @@ test("background prewarm, registerUsageStatsRpc, buildCalendarBins, and UNPRICED
         now: () => fixedNow,
       });
       const refreshPromise = batchEngine.refresh();
-      // Poll immediately with waitMs: 0 while batched indexing is active
+      // Poll immediately with waitMs: 0 while discovery/batched indexing is active
       const midStats = await batchEngine.stats({ range: "24h" }, { waitMs: 0 });
       usageStatsSchema.parse(midStats);
+      assert.equal(midStats.indexing.active, true);
       await refreshPromise;
       const doneStats = await batchEngine.stats({ range: "24h" });
       assert.deepEqual(doneStats.indexing, { active: false, done: 6, total: 6 });

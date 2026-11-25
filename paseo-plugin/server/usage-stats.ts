@@ -821,7 +821,11 @@ export class UsageStatsEngine {
           const entry = sanitizeCachedEntry(rawEntry);
           if (entry) this.entries.set(relPath, entry);
         }
-        this.indexing = { active: false, done: this.entries.size, total: this.entries.size };
+        this.indexing = {
+          active: this.indexing.active,
+          done: this.entries.size,
+          total: Math.max(this.indexing.total, this.entries.size),
+        };
       } catch (error) {
         const code = (error as { code?: string } | null)?.code;
         if (code !== "ENOENT") {
@@ -917,73 +921,82 @@ export class UsageStatsEngine {
       this.prewarmTimer = null;
     }
 
-    await this.loadDiskCache();
     if (this.disposed) {
       return { scanned: 0, parsed: 0, pruned: 0, corrupt: 0 };
     }
 
-    const discovered = await discoverSessionFiles(this.sessionsDir);
-    const seen = new Set<string>();
-    const dirty: DiscoveredFile[] = [];
+    this.indexing = { active: true, done: this.entries.size, total: this.entries.size };
 
-    for (const file of discovered) {
-      seen.add(file.relPath);
-      const cached = this.entries.get(file.relPath);
-      if (!cached || cached.mtimeMs !== file.mtimeMs || cached.size !== file.size) {
-        dirty.push(file);
+    try {
+      await this.loadDiskCache();
+      if (this.disposed) {
+        return { scanned: 0, parsed: 0, pruned: 0, corrupt: 0 };
       }
-    }
 
-    // Auto-prune deleted session files from cache.
-    let pruned = 0;
-    for (const relPath of this.entries.keys()) {
-      if (!seen.has(relPath)) {
-        this.entries.delete(relPath);
-        pruned += 1;
-      }
-    }
+      const discovered = await discoverSessionFiles(this.sessionsDir);
+      const seen = new Set<string>();
+      const dirty: DiscoveredFile[] = [];
 
-    const total = discovered.length;
-    const unchanged = total - dirty.length;
-    let done = unchanged;
-    let parsedCount = 0;
-    let corruptCount = 0;
-    let cacheMutated = pruned > 0;
-
-    if (dirty.length > 0) {
-      this.indexing = { active: true, done, total };
-      for (let offset = 0; offset < dirty.length; offset += this.concurrency) {
-        if (this.disposed) break;
-        const batch = dirty.slice(offset, offset + this.concurrency);
-        await Promise.all(
-          batch.map(async (file) => {
-            const result = await this.parseOneFile(file);
-            if (result.corrupt) corruptCount += 1;
-            if (result.entry) {
-              this.entries.set(file.relPath, result.entry);
-              cacheMutated = true;
-            }
-            parsedCount += 1;
-            done += 1;
-            this.indexing = { active: true, done, total };
-          }),
-        );
-        if (offset + this.concurrency < dirty.length) {
-          await yieldToEventLoop();
+      for (const file of discovered) {
+        seen.add(file.relPath);
+        const cached = this.entries.get(file.relPath);
+        if (!cached || cached.mtimeMs !== file.mtimeMs || cached.size !== file.size) {
+          dirty.push(file);
         }
       }
+
+      // Auto-prune deleted session files from cache.
+      let pruned = 0;
+      for (const relPath of this.entries.keys()) {
+        if (!seen.has(relPath)) {
+          this.entries.delete(relPath);
+          pruned += 1;
+        }
+      }
+
+      const total = discovered.length;
+      const unchanged = total - dirty.length;
+      let done = unchanged;
+      let parsedCount = 0;
+      let corruptCount = 0;
+      let cacheMutated = pruned > 0;
+
+      this.indexing = { active: true, done, total };
+
+      if (dirty.length > 0) {
+        for (let offset = 0; offset < dirty.length; offset += this.concurrency) {
+          if (this.disposed) break;
+          const batch = dirty.slice(offset, offset + this.concurrency);
+          await Promise.all(
+            batch.map(async (file) => {
+              const result = await this.parseOneFile(file);
+              if (result.corrupt) corruptCount += 1;
+              if (result.entry) {
+                this.entries.set(file.relPath, result.entry);
+                cacheMutated = true;
+              }
+              parsedCount += 1;
+              done += 1;
+              this.indexing = { active: true, done, total };
+            }),
+          );
+          if (offset + this.concurrency < dirty.length) {
+            await yieldToEventLoop();
+          }
+        }
+      }
+
+      if (cacheMutated && !this.disposed) {
+        await this.persistDiskCache().catch((error: unknown) => {
+          const msg = error instanceof Error ? error.message : String(error);
+          process.stderr.write(`[dsh-paseo] could not save usage cache: ${msg}\n`);
+        });
+      }
+
+      return { scanned: total, parsed: parsedCount, pruned, corrupt: corruptCount };
+    } finally {
+      this.indexing = { active: false, done: this.entries.size, total: this.entries.size };
     }
-
-    this.indexing = { active: false, done: this.entries.size, total: this.entries.size };
-
-    if (cacheMutated && !this.disposed) {
-      await this.persistDiskCache().catch((error: unknown) => {
-        const msg = error instanceof Error ? error.message : String(error);
-        process.stderr.write(`[dsh-paseo] could not save usage cache: ${msg}\n`);
-      });
-    }
-
-    return { scanned: total, parsed: parsedCount, pruned, corrupt: corruptCount };
   }
 
   private async prepareSnapshot(options?: UsageQueryOptions): Promise<void> {
