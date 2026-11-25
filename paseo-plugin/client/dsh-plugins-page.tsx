@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ActivityIndicator,
+  Platform,
   Pressable,
   ScrollView,
   Switch,
@@ -8,11 +9,41 @@ import {
   TextInput,
   View,
 } from "react-native";
-import type { PluginScreenProps } from "@getpaseo/plugin/client";
+import type {
+  PluginClientContext,
+  PluginHostProps,
+  PluginScreenProps,
+  PluginSurfaceProps,
+} from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
+import {
+  Icon,
+  Modal as HostModal,
+  useToast as useHostToast,
+  type ModalComponent,
+  type ToastApi,
+} from "@getpaseo/plugin/client/ui";
+import {
+  font,
+  mono,
+  radius,
+  space,
+  tabular,
+  tint,
+  type Colors,
+} from "./console-theme";
+import {
+  Badge,
+  Button,
+  Callout,
+  Card,
+  Divider,
+  Muted,
+} from "./console-ui";
 import type {
   DshPluginsFailureCode,
   DshPluginsText,
+  Locale,
 } from "./locale";
 import { useCurrentLocale, useLocaleText } from "./use-locale";
 import { PluginsBoundary, PluginsFailedCard } from "./dsh-plugins-guard";
@@ -28,14 +59,121 @@ import {
   type JobStatus,
   type PluginsSnapshot,
   type StartJobInput,
+  type UpdateTarget,
 } from "../shared/dsh-plugins-api";
 
-type ThemeColors = PluginScreenProps["theme"]["colors"];
+type ThemeColors = PluginSurfaceProps["theme"]["colors"];
 type Styles = ReturnType<typeof createStyles>;
+
+/** Delay between closing one native overlay/modal and opening another (iOS/Android safety). */
+const MODAL_TRANSITION_MS = 180;
+
+/** Maximum targets listed individually in the batch-update modal before summarizing the rest. */
+const MAX_MODAL_TARGETS = 8;
 
 interface UiFailure {
   code: DshPluginsFailureCode;
   detail?: string;
+}
+
+type ConfirmDialog =
+  | { kind: "remove"; name: string; title?: string; version?: string }
+  | { kind: "update"; name: string; title?: string; currentVersion?: string; version: string }
+  | { kind: "update-all"; targets: readonly UpdateTarget[] };
+
+interface PluginsExtraText {
+  removeModalTitle: string;
+  removeModalBody: (name: string) => string;
+  updateModalTitle: string;
+  updateModalBody: (name: string, targetVersion: string, currentVersion?: string) => string;
+  updateAllModalTitle: string;
+  updateAllModalBody: (count: number) => string;
+  moreTargets: (count: number) => string;
+  toastEnabled: (name: string) => string;
+  toastDisabled: (name: string) => string;
+  toastUpToDate: string;
+}
+
+const EXTRA_TEXT: Record<Locale, PluginsExtraText> = {
+  "zh-CN": {
+    removeModalTitle: "卸载插件",
+    removeModalBody: (name) => `将从当前 DSH profile 中卸载「${name}」。`,
+    updateModalTitle: "更新插件",
+    updateModalBody: (name, targetVersion, currentVersion) =>
+      currentVersion !== undefined && currentVersion !== ""
+        ? `将「${name}」从 ${currentVersion} 更新到 ${targetVersion}。`
+        : `将「${name}」更新到 ${targetVersion}。`,
+    updateAllModalTitle: "批量更新插件",
+    updateAllModalBody: (count) => `即将把以下 ${count} 个插件更新到最新版本：`,
+    moreTargets: (count) => `其余 ${count} 项…`,
+    toastEnabled: (name) => `已启用 ${name}`,
+    toastDisabled: (name) => `已停用 ${name}`,
+    toastUpToDate: "所有插件均为最新版本",
+  },
+  en: {
+    removeModalTitle: "Remove plugin",
+    removeModalBody: (name) => `Remove “${name}” from this DSH profile.`,
+    updateModalTitle: "Update plugin",
+    updateModalBody: (name, targetVersion, currentVersion) =>
+      currentVersion !== undefined && currentVersion !== ""
+        ? `Update “${name}” from ${currentVersion} to ${targetVersion}.`
+        : `Update “${name}” to ${targetVersion}.`,
+    updateAllModalTitle: "Update all plugins",
+    updateAllModalBody: (count) =>
+      `Update ${count} plugin${count === 1 ? "" : "s"} to the latest available versions:`,
+    moreTargets: (count) => `and ${count} more…`,
+    toastEnabled: (name) => `Enabled ${name}`,
+    toastDisabled: (name) => `Disabled ${name}`,
+    toastUpToDate: "All plugins are up to date",
+  },
+};
+
+/**
+ * Runtime check for Paseo's host `Modal` component (`>= 0.16.0` compatibility).
+ * If an older host omits `Modal` or `Modal.Content`, confirmation falls back
+ * cleanly to inline two-step buttons instead of crashing.
+ */
+function resolveHostModal(): ModalComponent | null {
+  const candidate = HostModal as unknown;
+  if (
+    (typeof candidate === "function" || (typeof candidate === "object" && candidate !== null))
+    && "Content" in (candidate as Record<string, unknown>)
+  ) {
+    const content = (candidate as { Content?: unknown }).Content;
+    if (typeof content === "function" || (typeof content === "object" && content !== null)) {
+      return candidate as ModalComponent;
+    }
+  }
+  return null;
+}
+
+const NOOP_TOAST: ToastApi = {
+  show() {},
+  error() {},
+};
+
+/**
+ * Guarded wrapper around Paseo's `useToast()` hook.
+ * Calls `useHostToast` unconditionally when the runtime exports it so React's
+ * hook order stays stable, and returns a no-op stub if absent or outside a
+ * Toast provider.
+ */
+function useSafeToast(): ToastApi {
+  if (typeof useHostToast !== "function") return NOOP_TOAST;
+  try {
+    const api = useHostToast();
+    if (api && typeof api.show === "function" && typeof api.error === "function") {
+      return api;
+    }
+  } catch {
+    // Older host or test render without a toast provider.
+  }
+  return NOOP_TOAST;
+}
+
+function renderHostIcon(name: string, size: number, color: string) {
+  if (typeof Icon !== "function" && (typeof Icon !== "object" || Icon === null)) return null;
+  return <Icon name={name} size={size} color={color} />;
 }
 
 /**
@@ -81,15 +219,18 @@ function failureOf(error: unknown): UiFailure {
 }
 
 /**
- * The words for one failure.
+ * Split one failure into its localized headline and optional verbatim tail.
  *
  * Raw `dsh`/pnpm output rides under the sentence only for the failures where it
  * explains something the sentence cannot (a command's exit tail, the platforms
  * a bundle lists, the raw request error); a wrong-but-plausible paragraph is
  * worse than a short sentence.
  */
-function failureText(text: DshPluginsText, failure: UiFailure): string {
-  const base = text.errors[failure.code];
+function failureParts(
+  text: DshPluginsText,
+  failure: UiFailure,
+): { headline: string; detail?: string } {
+  const headline = text.errors[failure.code];
   if (
     failure.detail !== undefined
     && (failure.code === "command-failed"
@@ -97,9 +238,9 @@ function failureText(text: DshPluginsText, failure: UiFailure): string {
       || failure.code === "invalid-platform"
       || failure.code === "request-failed")
   ) {
-    return `${base}\n${failure.detail}`;
+    return { headline, detail: failure.detail };
   }
-  return base;
+  return { headline };
 }
 
 function tailLines(text: string, count: number): string {
@@ -127,134 +268,147 @@ function jobTitle(job: JobStatus, text: DshPluginsText): string {
   return text.job.succeeded(action);
 }
 
-function createStyles(colors: ThemeColors, compact: boolean) {
+function createStyles(colors: Colors, compact: boolean) {
   return {
     content: {
-      padding: compact ? 16 : 24,
+      padding: compact ? space.lg : space.xxl,
       paddingBottom: 40,
-      gap: 16,
+      gap: space.lg,
       width: "100%" as const,
       maxWidth: 880,
       alignSelf: "center" as const,
     },
+    embeddedContent: {
+      gap: space.lg,
+      width: "100%" as const,
+    },
     header: {
       flexDirection: "row" as const,
       alignItems: "flex-start" as const,
-      gap: 12,
+      justifyContent: "space-between" as const,
+      gap: space.md,
       flexWrap: "wrap" as const,
     },
-    headerText: { flex: 1, minWidth: 180, gap: 4 },
-    muted: { color: colors.foregroundMuted, fontSize: 13, lineHeight: 19 },
-    path: { color: colors.foregroundMuted, fontSize: 12 },
-    notice: { color: colors.foregroundMuted, fontSize: 12, lineHeight: 18 },
+    headerText: { flex: 1, minWidth: 180, gap: space.xs },
+    profileTitle: {
+      ...font.heading,
+      color: colors.foreground,
+    },
+    path: {
+      ...font.caption,
+      fontFamily: mono,
+      color: colors.foregroundMuted,
+    },
+    notice: {
+      ...font.caption,
+      color: colors.foregroundMuted,
+    },
     headerActions: {
       flexDirection: "row" as const,
       alignItems: "center" as const,
-      gap: 8,
+      gap: space.sm,
       flexWrap: "wrap" as const,
     },
-    section: { gap: 10 },
-    groupTitle: {
-      color: colors.foreground,
-      fontSize: 15,
-      fontWeight: "600" as const,
+    section: { gap: space.md - 2 },
+    groupHeader: {
+      flexDirection: "row" as const,
+      alignItems: "center" as const,
+      gap: space.sm,
     },
-    card: {
-      backgroundColor: colors.surface1,
-      borderColor: colors.border,
-      borderWidth: 1,
-      borderRadius: 12,
-      padding: compact ? 12 : 14,
-      gap: 8,
+    groupTitle: {
+      ...font.heading,
+      color: colors.foreground,
+    },
+    groupCountPill: {
+      backgroundColor: tint(colors.foreground, 0.06),
+      paddingHorizontal: space.sm,
+      paddingVertical: space.xxs,
+      borderRadius: radius.pill,
+      alignItems: "center" as const,
+      justifyContent: "center" as const,
+    },
+    groupCountText: {
+      ...font.caption,
+      ...tabular,
+      fontWeight: "600" as const,
+      color: colors.foregroundMuted,
+    },
+    cardBody: {
+      padding: compact ? space.md : space.lg,
+      gap: space.sm,
     },
     rowTop: {
       flexDirection: "row" as const,
       alignItems: "center" as const,
-      gap: 8,
+      gap: space.sm,
       flexWrap: "wrap" as const,
     },
-    name: { color: colors.foreground, fontSize: 14, fontWeight: "600" as const },
-    subtitle: { color: colors.foreground, fontSize: 13, fontWeight: "500" as const },
-    version: { color: colors.foregroundMuted, fontSize: 12 },
-    description: { color: colors.foregroundMuted, fontSize: 13, lineHeight: 19 },
-    badgeRow: {
+    name: {
+      ...font.body,
+      fontWeight: "600" as const,
+      color: colors.foreground,
+    },
+    subtitle: {
+      ...font.small,
+      fontWeight: "500" as const,
+      color: colors.foreground,
+    },
+    version: {
+      ...font.caption,
+      ...tabular,
+      fontFamily: mono,
+      color: colors.foregroundMuted,
+    },
+    description: {
+      ...font.small,
+      color: colors.foregroundMuted,
+    },
+    rowFooter: {
       flexDirection: "row" as const,
-      gap: 6,
+      alignItems: "center" as const,
+      justifyContent: "space-between" as const,
+      gap: space.sm,
       flexWrap: "wrap" as const,
+      marginTop: space.xxs,
     },
-    badge: {
-      backgroundColor: colors.surface2,
-      borderRadius: 6,
-      paddingHorizontal: 7,
-      paddingVertical: 2,
-    },
-    badgeText: { color: colors.foregroundMuted, fontSize: 11 },
-    badgeWarn: {
-      backgroundColor: colors.surface2,
-      borderColor: colors.statusWarning,
-      borderWidth: 1,
-      borderRadius: 6,
-      paddingHorizontal: 7,
-      paddingVertical: 2,
-    },
-    badgeWarnText: { color: colors.statusWarning, fontSize: 11 },
-    badgeDanger: {
-      backgroundColor: colors.surface2,
-      borderColor: colors.statusDanger,
-      borderWidth: 1,
-      borderRadius: 6,
-      paddingHorizontal: 7,
-      paddingVertical: 2,
-    },
-    badgeDangerText: { color: colors.statusDanger, fontSize: 11 },
-    badgeSuccess: {
-      backgroundColor: colors.surface2,
-      borderColor: colors.statusSuccess,
-      borderWidth: 1,
-      borderRadius: 6,
-      paddingHorizontal: 7,
-      paddingVertical: 2,
-    },
-    badgeSuccessText: { color: colors.statusSuccess, fontSize: 11 },
     rowActions: {
       flexDirection: "row" as const,
       alignItems: "center" as const,
-      gap: 8,
+      gap: space.sm,
       flexWrap: "wrap" as const,
     },
-    button: {
-      borderColor: colors.border,
-      borderWidth: 1,
-      borderRadius: 8,
-      paddingHorizontal: 10,
-      paddingVertical: 6,
-      backgroundColor: colors.surface2,
+    disclosureButton: {
+      flexDirection: "row" as const,
+      alignItems: "center" as const,
+      gap: space.xs,
+      paddingVertical: space.xs,
+      paddingHorizontal: space.xs,
+      borderRadius: radius.sm,
     },
-    buttonPrimary: { backgroundColor: colors.accent, borderColor: colors.accent },
-    buttonDisabled: { opacity: 0.45 },
-    buttonText: { color: colors.foreground, fontSize: 12, fontWeight: "500" as const },
-    buttonPrimaryText: {
-      color: colors.accentForeground,
-      fontSize: 12,
-      fontWeight: "600" as const,
+    disclosureText: {
+      ...font.caption,
+      ...tabular,
+      color: colors.foregroundMuted,
+      fontWeight: "500" as const,
     },
     input: {
+      ...font.body,
       color: colors.foreground,
-      backgroundColor: colors.surface2,
+      backgroundColor: colors.surface0,
       borderColor: colors.border,
       borderWidth: 1,
-      borderRadius: 8,
-      paddingHorizontal: 12,
-      paddingVertical: 10,
-      fontSize: 14,
+      borderRadius: radius.md,
+      paddingHorizontal: space.md,
+      paddingVertical: space.sm + 1,
+      minHeight: 36,
     },
     inputRow: {
       flexDirection: "row" as const,
       alignItems: "center" as const,
-      gap: 8,
+      gap: space.sm,
     },
-    inputStack: { gap: 8 },
-    inputGrow: { flex: 1 },
+    inputStack: { gap: space.sm },
+    inputGrow: { flex: 1, minWidth: 0 },
     checkRow: {
       flexDirection: "row" as const,
       justifyContent: "flex-end" as const,
@@ -264,117 +418,100 @@ function createStyles(colors: ThemeColors, compact: boolean) {
       alignItems: "center" as const,
       flexWrap: "wrap" as const,
       justifyContent: "space-between" as const,
-      gap: 8,
+      gap: space.sm,
     },
     resultAction: { marginLeft: "auto" as const },
-    resultItem: { gap: 4 },
-    statusCard: {
-      backgroundColor: colors.surface1,
-      borderColor: colors.border,
-      borderWidth: 1,
-      borderRadius: 12,
-      padding: 12,
-      gap: 8,
+    resultItem: { gap: space.xs },
+    detailMono: {
+      ...font.caption,
+      fontFamily: mono,
+      color: colors.statusDanger,
     },
-    errorCard: {
-      backgroundColor: colors.surface1,
-      borderColor: colors.statusDanger,
-      borderWidth: 1,
-      borderRadius: 12,
-      padding: 12,
-      gap: 8,
+    outputBox: {
+      backgroundColor: tint(colors.foreground, 0.04),
+      borderRadius: radius.md,
+      padding: space.sm,
     },
-    errorText: { color: colors.statusDanger, fontSize: 13, lineHeight: 19 },
-    output: { color: colors.foregroundMuted, fontSize: 11, lineHeight: 16 },
+    output: {
+      ...font.caption,
+      fontFamily: mono,
+      color: colors.foregroundMuted,
+    },
     rowTags: {
       flexDirection: "row" as const,
-      gap: 6,
+      gap: space.xs + 2,
       flexWrap: "wrap" as const,
     },
     tag: {
-      backgroundColor: colors.surface2,
-      borderRadius: 4,
-      paddingHorizontal: 6,
-      paddingVertical: 2,
+      backgroundColor: tint(colors.foreground, 0.06),
+      borderRadius: radius.sm,
+      paddingHorizontal: space.sm,
+      paddingVertical: 3,
     },
-    tagText: { color: colors.foregroundMuted, fontSize: 10 },
+    tagText: {
+      ...font.caption,
+      fontFamily: mono,
+      color: colors.foregroundMuted,
+    },
     infoBox: {
-      backgroundColor: colors.surface2,
-      borderRadius: 8,
-      padding: 10,
-      gap: 6,
+      backgroundColor: tint(colors.foreground, 0.04),
+      borderRadius: radius.md,
+      padding: space.md,
+      gap: space.sm,
+    },
+    loadingCard: {
+      padding: space.lg,
+      flexDirection: "row" as const,
+      alignItems: "center" as const,
+      gap: space.md,
+    },
+    modalSummaryBox: {
+      backgroundColor: tint(colors.foreground, 0.04),
+      borderRadius: radius.md,
+      padding: space.md,
+      gap: space.xs,
+    },
+    modalActions: {
+      flexDirection: "row" as const,
+      justifyContent: "flex-end" as const,
+      alignItems: "center" as const,
+      gap: space.sm,
+      flexWrap: "wrap" as const,
     },
   };
 }
 
-function ActionButton({
-  label,
-  onPress,
-  disabled,
-  primary,
+function FailureCallout({
+  colors,
+  text,
+  failure,
   styles,
+  action,
 }: {
-  label: string;
-  onPress: () => void;
-  disabled?: boolean;
-  primary?: boolean;
+  colors: Colors;
+  text: DshPluginsText;
+  failure: UiFailure;
   styles: Styles;
+  action?: ReactNode;
 }) {
+  const parts = failureParts(text, failure);
   return (
-    <Pressable
-      accessibilityRole="button"
-      accessibilityLabel={label}
-      disabled={disabled}
-      onPress={onPress}
-      style={[
-        styles.button,
-        primary === true ? styles.buttonPrimary : null,
-        disabled === true ? styles.buttonDisabled : null,
-      ]}
-    >
-      <Text style={[styles.buttonText, primary === true ? styles.buttonPrimaryText : null]}>
-        {label}
-      </Text>
-    </Pressable>
-  );
-}
-
-function Badge({
-  label,
-  tone = "muted",
-  styles,
-}: {
-  label: string;
-  tone?: "muted" | "warn" | "danger" | "success";
-  styles: Styles;
-}) {
-  const badgeStyle = tone === "warn"
-    ? styles.badgeWarn
-    : tone === "danger"
-      ? styles.badgeDanger
-      : tone === "success"
-        ? styles.badgeSuccess
-        : styles.badge;
-  const textStyle = tone === "warn"
-    ? styles.badgeWarnText
-    : tone === "danger"
-      ? styles.badgeDangerText
-      : tone === "success"
-        ? styles.badgeSuccessText
-        : styles.badgeText;
-  return (
-    <View style={badgeStyle}>
-      <Text style={textStyle}>{label}</Text>
-    </View>
+    <Callout colors={colors} tone="danger" title={parts.headline} action={action}>
+      {parts.detail === undefined ? null : (
+        <Text selectable style={styles.detailMono}>{parts.detail}</Text>
+      )}
+    </Callout>
   );
 }
 
 function BundleRow({
   bundle,
+  colors,
   text,
   styles,
   busy,
   toggleBusy,
+  useModalConfirm,
   confirmRemove,
   confirmUpdate,
   onToggle,
@@ -382,38 +519,56 @@ function BundleRow({
   onUpdate,
 }: {
   bundle: BundleInfo;
+  colors: Colors;
   text: DshPluginsText;
   styles: Styles;
   busy: boolean;
   toggleBusy: string | null;
+  useModalConfirm: boolean;
   confirmRemove: string | null;
   confirmUpdate: { name: string; version: string } | null;
   onToggle: (bundle: BundleInfo) => void;
-  onRemove: (name: string) => void;
-  onUpdate: (name: string, version: string) => void;
+  onRemove: (bundle: BundleInfo | null) => void;
+  onUpdate: (bundle: BundleInfo | null) => void;
 }) {
   const isDependency = bundle.kind === "dependency";
   const canToggle = bundle.kind !== "dependency" && !bundle.protected;
-  const removePending = confirmRemove === bundle.name;
-  const updatePending = confirmUpdate?.name === bundle.name;
-  const rowBusy = busy || toggleBusy === bundle.name;
+  const isToggling = toggleBusy === bundle.name;
+  const removePending = !useModalConfirm && confirmRemove === bundle.name;
+  const updatePending = !useModalConfirm && confirmUpdate?.name === bundle.name;
+  const rowBusy = busy || isToggling;
   // Disclosure only: a card lists its component ids when asked, not by default.
   // The state is render-local by design (no persistence, no RPC).
   const [rowsOpen, setRowsOpen] = useState(false);
 
   return (
-    <View style={styles.card}>
+    <Card colors={colors} style={styles.cardBody}>
       <View style={styles.rowTop}>
         <Text style={styles.name}>{bundle.name}</Text>
         {bundle.version === undefined ? null : <Text style={styles.version}>{bundle.version}</Text>}
-        {bundle.official ? <Badge label={text.badges.official} styles={styles} /> : null}
-        {bundle.protected ? <Badge label={text.badges.protected} styles={styles} /> : null}
-        {bundle.client ? <Badge label={text.badges.client} tone="warn" styles={styles} /> : null}
-        {bundle.platformSupported ? null : <Badge label={text.badges.platformUnsupported} tone="danger" styles={styles} />}
-        {bundle.installed ? null : <Badge label={text.badges.missing} tone="danger" styles={styles} />}
-        {bundle.update === undefined
-          ? null
-          : <Badge label={text.badges.updateAvailable(bundle.update)} tone="warn" styles={styles} />}
+        {bundle.official ? (
+          <Badge colors={colors} tone="neutral" icon="ShieldCheck" label={text.badges.official} />
+        ) : null}
+        {bundle.protected ? (
+          <Badge colors={colors} tone="accent" icon="Lock" label={text.badges.protected} />
+        ) : null}
+        {bundle.client ? (
+          <Badge colors={colors} tone="warning" icon="Monitor" label={text.badges.client} />
+        ) : null}
+        {bundle.platformSupported ? null : (
+          <Badge colors={colors} tone="danger" dot label={text.badges.platformUnsupported} />
+        )}
+        {bundle.installed ? null : (
+          <Badge colors={colors} tone="danger" dot label={text.badges.missing} />
+        )}
+        {bundle.update === undefined ? null : (
+          <Badge
+            colors={colors}
+            tone="warning"
+            dot
+            label={text.badges.updateAvailable(bundle.update)}
+          />
+        )}
       </View>
 
       {/* Package names stay the row's identity (the actions address them); a
@@ -426,103 +581,345 @@ function BundleRow({
         ? null
         : <Text style={styles.description}>{bundle.description}</Text>}
 
-      {isDependency
-        ? <Text style={styles.muted}>{text.bundle.dependencyNote}</Text>
-        : null}
-      {bundle.client
-        ? <Text style={styles.muted}>{text.bundle.clientNote}</Text>
-        : null}
+      {isDependency ? <Muted colors={colors}>{text.bundle.dependencyNote}</Muted> : null}
+      {bundle.client ? <Muted colors={colors}>{text.bundle.clientNote}</Muted> : null}
       {bundle.platformSupported
         ? null
         : bundle.platformReason === undefined || bundle.platformReason === ""
-          ? <Text style={styles.muted}>{text.bundle.platformsUnknown}</Text>
-          : <Text style={styles.muted}>{text.bundle.platforms(bundle.platformReason)}</Text>}
+          ? <Muted colors={colors}>{text.bundle.platformsUnknown}</Muted>
+          : <Muted colors={colors}>{text.bundle.platforms(bundle.platformReason)}</Muted>}
 
-      <View style={styles.rowActions}>
-        {canToggle ? (
-          <Switch
-            value={bundle.enabled}
-            disabled={rowBusy || (!bundle.enabled && (bundle.installed === false || !bundle.platformSupported))}
-            onValueChange={() => onToggle(bundle)}
-            trackColor={{ false: styles.button.backgroundColor, true: styles.buttonPrimary.backgroundColor }}
-            thumbColor={styles.name.color}
-          />
-        ) : null}
+      <View style={styles.rowFooter}>
+        <View style={styles.rowActions}>
+          {canToggle ? (
+            <Switch
+              accessibilityLabel={bundle.name}
+              value={bundle.enabled}
+              disabled={
+                rowBusy
+                || (!bundle.enabled && (bundle.installed === false || !bundle.platformSupported))
+              }
+              onValueChange={() => onToggle(bundle)}
+              trackColor={{ false: colors.surface2, true: colors.accent }}
+              thumbColor={bundle.enabled ? colors.accentForeground : colors.foreground}
+            />
+          ) : null}
+          {isToggling ? <ActivityIndicator size="small" color={colors.accent} /> : null}
 
-        {bundle.removable ? (
-          removePending ? (
+          {bundle.update === undefined ? null : updatePending ? (
             <>
-              <ActionButton
-                label={text.bundle.confirmRemove}
+              <Button
+                colors={colors}
+                size="sm"
+                variant="primary"
+                icon="ArrowUpCircle"
+                label={text.bundle.confirmUpdate(bundle.update)}
                 disabled={rowBusy}
-                onPress={() => onRemove(bundle.name)}
-                styles={styles}
+                onPress={() => onUpdate(bundle)}
               />
-              <ActionButton label={text.bundle.cancel} disabled={rowBusy} onPress={() => onRemove("")} styles={styles} />
+              <Button
+                colors={colors}
+                size="sm"
+                variant="ghost"
+                label={text.bundle.cancel}
+                disabled={rowBusy}
+                onPress={() => onUpdate(null)}
+              />
             </>
           ) : (
-            <ActionButton
-              label={text.bundle.remove}
+            <Button
+              colors={colors}
+              size="sm"
+              variant="secondary"
+              icon="ArrowUpCircle"
+              label={text.bundle.update(bundle.update)}
               disabled={rowBusy}
-              onPress={() => onRemove(bundle.name)}
-              styles={styles}
+              onPress={() => onUpdate(bundle)}
             />
-          )
-        ) : null}
+          )}
 
-        {bundle.update === undefined ? null : updatePending ? (
-          <>
-            <ActionButton
-              label={text.bundle.confirmUpdate(bundle.update)}
-              disabled={rowBusy}
-              primary
-              onPress={() => onUpdate(bundle.name, bundle.update as string)}
-              styles={styles}
-            />
-            <ActionButton label={text.bundle.cancel} disabled={rowBusy} onPress={() => onUpdate("", "")} styles={styles} />
-          </>
-        ) : (
-          <ActionButton
-            label={text.bundle.update(bundle.update)}
-            disabled={rowBusy}
-            onPress={() => onUpdate(bundle.name, bundle.update as string)}
-            styles={styles}
-          />
-        )}
-      </View>
+          {bundle.removable ? (
+            removePending ? (
+              <>
+                <Button
+                  colors={colors}
+                  size="sm"
+                  variant="danger"
+                  icon="Trash2"
+                  label={text.bundle.confirmRemove}
+                  disabled={rowBusy}
+                  onPress={() => onRemove(bundle)}
+                />
+                <Button
+                  colors={colors}
+                  size="sm"
+                  variant="ghost"
+                  label={text.bundle.cancel}
+                  disabled={rowBusy}
+                  onPress={() => onRemove(null)}
+                />
+              </>
+            ) : (
+              <Button
+                colors={colors}
+                size="sm"
+                variant="danger"
+                icon="Trash2"
+                label={text.bundle.remove}
+                disabled={rowBusy}
+                onPress={() => onRemove(bundle)}
+              />
+            )
+          ) : null}
+        </View>
 
-      {/* Default-collapsed component list. The line itself is the toggle; a card
-          with no rows shows nothing (a "0 components" row would be noise). */}
-      {bundle.rows.length === 0 ? null : (
-        <>
+        {/* Default-collapsed component list. The line itself is the toggle; a card
+            with no rows shows nothing (a "0 components" row would be noise). */}
+        {bundle.rows.length === 0 ? null : (
           <Pressable
             accessibilityRole="button"
             accessibilityLabel={text.bundle.componentCount(bundle.rows.length)}
+            accessibilityState={{ expanded: rowsOpen }}
             onPress={() => setRowsOpen((open) => !open)}
+            style={styles.disclosureButton}
           >
-            <Text style={styles.muted}>{text.bundle.componentCount(bundle.rows.length)}</Text>
+            {renderHostIcon(
+              rowsOpen ? "ChevronDown" : "ChevronRight",
+              14,
+              colors.foregroundMuted,
+            )}
+            <Text style={styles.disclosureText}>
+              {text.bundle.componentCount(bundle.rows.length)}
+            </Text>
           </Pressable>
-          {rowsOpen ? (
-            <View style={styles.rowTags}>
-              {bundle.rows.map((row) => (
-                <View key={row.id} style={styles.tag}>
-                  <Text style={styles.tagText}>{row.id}</Text>
-                </View>
-              ))}
-            </View>
-          ) : null}
+        )}
+      </View>
+
+      {bundle.rows.length > 0 && rowsOpen ? (
+        <>
+          <Divider colors={colors} />
+          <View style={styles.rowTags}>
+            {bundle.rows.map((row) => (
+              <View key={row.id} style={styles.tag}>
+                <Text style={styles.tagText}>{row.id}</Text>
+              </View>
+            ))}
+          </View>
         </>
-      )}
-    </View>
+      ) : null}
+    </Card>
   );
 }
 
-function DshPluginsPageBody({ theme, host, layout, openDisplaySettings }: DshPluginsPageProps) {
-  const compact = layout.compact || layout.platform === "ios" || layout.platform === "android";
+function ConfirmActionModal({
+  ModalComponent,
+  dialog,
+  colors,
+  text,
+  extra,
+  styles,
+  busy,
+  submitting,
+  onConfirm,
+  onClose,
+}: {
+  ModalComponent: ModalComponent;
+  dialog: ConfirmDialog;
+  colors: Colors;
+  text: DshPluginsText;
+  extra: PluginsExtraText;
+  styles: Styles;
+  busy: boolean;
+  submitting: boolean;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  const locked = busy || submitting;
+  const title = dialog.kind === "remove"
+    ? extra.removeModalTitle
+    : dialog.kind === "update"
+      ? extra.updateModalTitle
+      : extra.updateAllModalTitle;
+  const modalIcon = dialog.kind === "remove"
+    ? renderHostIcon("Trash2", 16, colors.statusDanger)
+    : renderHostIcon("ArrowUpCircle", 16, colors.accent);
+
+  const shownTargets = dialog.kind === "update-all"
+    ? dialog.targets.length > MAX_MODAL_TARGETS + 1
+      ? dialog.targets.slice(0, MAX_MODAL_TARGETS)
+      : dialog.targets
+    : [];
+  const hiddenTargetCount = dialog.kind === "update-all"
+    ? dialog.targets.length - shownTargets.length
+    : 0;
+
+  return (
+    <ModalComponent
+      open
+      title={title}
+      icon={modalIcon ?? undefined}
+      onOpenChange={(open) => {
+        if (!open && !submitting) onClose();
+      }}
+    >
+      <ModalComponent.Content>
+        {dialog.kind === "remove" ? (
+          <>
+            <Muted colors={colors}>{extra.removeModalBody(dialog.name)}</Muted>
+            <View style={styles.modalSummaryBox}>
+              <View style={styles.rowTop}>
+                <Text style={styles.name}>{dialog.name}</Text>
+                {dialog.version === undefined ? null : (
+                  <Text style={styles.version}>{dialog.version}</Text>
+                )}
+              </View>
+              {dialog.title === undefined || dialog.title === "" || dialog.title === dialog.name ? null : (
+                <Muted colors={colors} small>{dialog.title}</Muted>
+              )}
+            </View>
+            <Muted colors={colors} small>{text.header.notice}</Muted>
+            <View style={styles.modalActions}>
+              <Button
+                colors={colors}
+                variant="ghost"
+                label={text.bundle.cancel}
+                disabled={submitting}
+                onPress={onClose}
+              />
+              <Button
+                colors={colors}
+                variant="danger"
+                icon="Trash2"
+                label={text.bundle.confirmRemove}
+                loading={submitting}
+                disabled={locked}
+                onPress={onConfirm}
+              />
+            </View>
+          </>
+        ) : dialog.kind === "update" ? (
+          <>
+            <Muted colors={colors}>
+              {extra.updateModalBody(dialog.name, dialog.version, dialog.currentVersion)}
+            </Muted>
+            <View style={styles.modalSummaryBox}>
+              <View style={styles.rowTop}>
+                <Text style={styles.name}>{dialog.name}</Text>
+                <Badge
+                  colors={colors}
+                  tone="warning"
+                  dot
+                  label={
+                    dialog.currentVersion !== undefined && dialog.currentVersion !== ""
+                      ? `${dialog.currentVersion} → ${dialog.version}`
+                      : dialog.version
+                  }
+                />
+              </View>
+              {dialog.title === undefined || dialog.title === "" || dialog.title === dialog.name ? null : (
+                <Muted colors={colors} small>{dialog.title}</Muted>
+              )}
+            </View>
+            <Muted colors={colors} small>{text.header.notice}</Muted>
+            <View style={styles.modalActions}>
+              <Button
+                colors={colors}
+                variant="ghost"
+                label={text.bundle.cancel}
+                disabled={submitting}
+                onPress={onClose}
+              />
+              <Button
+                colors={colors}
+                variant="primary"
+                icon="ArrowUpCircle"
+                label={text.bundle.confirmUpdate(dialog.version)}
+                loading={submitting}
+                disabled={locked}
+                onPress={onConfirm}
+              />
+            </View>
+          </>
+        ) : (
+          <>
+            <Muted colors={colors}>{extra.updateAllModalBody(dialog.targets.length)}</Muted>
+            <View style={styles.modalSummaryBox}>
+              {shownTargets.map((target) => (
+                <View key={target.name} style={styles.rowTop}>
+                  <Text style={styles.subtitle}>{target.name}</Text>
+                  <Text style={styles.version}>{target.version}</Text>
+                </View>
+              ))}
+              {hiddenTargetCount > 0 ? (
+                <Muted colors={colors} small>{extra.moreTargets(hiddenTargetCount)}</Muted>
+              ) : null}
+            </View>
+            <Muted colors={colors} small>{text.header.notice}</Muted>
+            <View style={styles.modalActions}>
+              <Button
+                colors={colors}
+                variant="ghost"
+                label={text.bundle.cancel}
+                disabled={submitting}
+                onPress={onClose}
+              />
+              <Button
+                colors={colors}
+                variant="primary"
+                icon="ArrowUpCircle"
+                label={text.job.confirmUpdateAll(dialog.targets.length)}
+                loading={submitting}
+                disabled={locked}
+                onPress={onConfirm}
+              />
+            </View>
+          </>
+        )}
+      </ModalComponent.Content>
+    </ModalComponent>
+  );
+}
+
+export interface DshPluginsContentProps {
+  /** Theme color palette (`theme.colors`). */
+  colors: ThemeColors;
+  /** Host metadata (`{ id, label }`) shown in the profile subtitle when provided. */
+  host?: PluginHostProps["host"];
+  /** Host layout (`{ compact, platform }`); defaults to platform compact heuristics when omitted. */
+  layout?: PluginHostProps["layout"];
+  /**
+   * Optional client handle accepted for callers that pass `PluginClientContext`.
+   * RPC calls run through Paseo's `useRpc` hook (matching `DshPluginsPage`).
+   */
+  client?: PluginClientContext;
+  /** Opens the display settings; the header shows no button without it. */
+  openDisplaySettings?: () => void;
+  /**
+   * When true (mounted inside the 3-tab DSH console), omits the standalone
+   * `ScrollView` wrapper and outer page padding so the parent console owns
+   * scrolling and top-level chrome.
+   */
+  embedded?: boolean;
+}
+
+function DshPluginsBody({
+  colors,
+  host,
+  layout,
+  openDisplaySettings,
+  embedded = false,
+}: DshPluginsContentProps) {
+  const compact = layout !== undefined
+    ? layout.compact || layout.platform === "ios" || layout.platform === "android"
+    : Platform.OS === "ios" || Platform.OS === "android";
   const uiText = useLocaleText();
   const text = uiText.plugins;
   const locale = useCurrentLocale();
-  const styles = useMemo(() => createStyles(theme.colors, compact), [theme.colors, compact]);
+  const extra = EXTRA_TEXT[locale];
+  const toast = useSafeToast();
+  const modalComponent = useMemo(() => resolveHostModal(), []);
+  const useModalConfirm = modalComponent !== null;
+  const styles = useMemo(() => createStyles(colors, compact), [colors, compact]);
 
   const list = useRpc(listRpc);
   const setEnabled = useRpc(setEnabledRpc);
@@ -541,23 +938,79 @@ function DshPluginsPageBody({ theme, host, layout, openDisplaySettings }: DshPlu
   const [toggleBusy, setToggleBusy] = useState<string | null>(null);
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
   const [confirmUpdate, setConfirmUpdate] = useState<{ name: string; version: string } | null>(null);
-  // The batch button has the same two-step confirm as a row's update button:
-  // one press asks, the second runs. A new job clears the ask.
+  // The batch button has the same two-step confirm fallback when host Modal is unavailable.
   const [confirmUpdateAll, setConfirmUpdateAll] = useState(false);
+  const [confirmDialog, setConfirmDialog] = useState<ConfirmDialog | null>(null);
+  const [confirmSubmitting, setConfirmSubmitting] = useState(false);
 
-  const refresh = useCallback(async (): Promise<void> => {
+  // Refs keep polling callbacks fresh without restarting the 1s interval on
+  // toast/locale identity changes, and guard timers against unmount races.
+  const toastRef = useRef<ToastApi>(toast);
+  toastRef.current = toast;
+  const textRef = useRef<DshPluginsText>(text);
+  textRef.current = text;
+  const extraRef = useRef<PluginsExtraText>(extra);
+  extraRef.current = extra;
+  const dialogRef = useRef<ConfirmDialog | null>(confirmDialog);
+  dialogRef.current = confirmDialog;
+  const lastToastedJobIdRef = useRef<string | null>(null);
+  const modalTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (modalTimerRef.current !== null) {
+        clearTimeout(modalTimerRef.current);
+        modalTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const closeConfirmDialog = useCallback(() => {
+    if (modalTimerRef.current !== null) {
+      clearTimeout(modalTimerRef.current);
+      modalTimerRef.current = null;
+    }
+    setConfirmDialog(null);
+  }, []);
+
+  const openConfirmDialog = useCallback((next: ConfirmDialog, fromClosingOverlay = false) => {
+    if (modalTimerRef.current !== null) {
+      clearTimeout(modalTimerRef.current);
+      modalTimerRef.current = null;
+    }
+    const replacingOpenModal = dialogRef.current !== null;
+    if ((fromClosingOverlay || replacingOpenModal) && Platform.OS !== "web") {
+      setConfirmDialog(null);
+      modalTimerRef.current = setTimeout(() => {
+        modalTimerRef.current = null;
+        if (mountedRef.current) setConfirmDialog(next);
+      }, MODAL_TRANSITION_MS);
+      return;
+    }
+    setConfirmDialog(next);
+  }, []);
+
+  const refresh = useCallback(async (notifyOnFailure = false): Promise<void> => {
     setRefreshing(true);
     try {
       // The locale files live on the daemon; ask for the language this page
       // renders in so the localized title/description come back resolved.
       const next = await list({ locale });
+      if (!mountedRef.current) return;
       setSnapshot(next);
-      setLoadError(next.errorCode === undefined
+      const nextLoadError: UiFailure | null = next.errorCode === undefined
         ? null
         : {
           code: next.errorCode,
           ...(next.errorDetail === undefined ? {} : { detail: next.errorDetail }),
-        });
+        };
+      setLoadError(nextLoadError);
+      if (notifyOnFailure && nextLoadError !== null) {
+        toastRef.current.error(failureParts(textRef.current, nextLoadError).headline);
+      }
       setJob((current) => {
         if (next.activeJobId === undefined) return current;
         if (current !== null && current.id === next.activeJobId) return current;
@@ -570,14 +1023,19 @@ function DshPluginsPageBody({ theme, host, layout, openDisplaySettings }: DshPlu
         };
       });
     } catch (error) {
-      setLoadError(failureOf(error));
+      if (!mountedRef.current) return;
+      const failure = failureOf(error);
+      setLoadError(failure);
+      if (notifyOnFailure) {
+        toastRef.current.error(failureParts(textRef.current, failure).headline);
+      }
     } finally {
-      setRefreshing(false);
+      if (mountedRef.current) setRefreshing(false);
     }
   }, [list, locale]);
 
   useEffect(() => {
-    void refresh();
+    void refresh(false);
   }, [refresh]);
 
   useEffect(() => {
@@ -590,11 +1048,40 @@ function DshPluginsPageBody({ theme, host, layout, openDisplaySettings }: DshPlu
         const next = await jobStatus({ id: job.id });
         if (cancelled) return;
         setJob(next);
-        if (next.state !== "running") await refresh();
+        if (next.state !== "running") {
+          if (lastToastedJobIdRef.current !== next.id) {
+            lastToastedJobIdRef.current = next.id;
+            const currentText = textRef.current;
+            const currentExtra = extraRef.current;
+            if (next.state === "succeeded") {
+              if (next.kind === "check") {
+                const count = next.updates !== undefined ? Object.keys(next.updates).length : 0;
+                if (count > 0) {
+                  toastRef.current.show(currentText.job.updatesFound(count), { variant: "info" });
+                } else {
+                  toastRef.current.show(currentExtra.toastUpToDate, { variant: "success" });
+                }
+              } else {
+                toastRef.current.show(jobTitle(next, currentText), { variant: "success" });
+              }
+            } else {
+              const title = jobTitle(next, currentText);
+              const detail = next.errorCode !== undefined
+                ? currentText.errors[next.errorCode]
+                : undefined;
+              toastRef.current.error(detail === undefined ? title : `${title}: ${detail}`);
+            }
+          }
+          await refresh(false);
+        }
       } catch (error) {
         if (cancelled) return;
         const failure = failureOf(error);
         setActionError(failure);
+        if (lastToastedJobIdRef.current !== job.id) {
+          lastToastedJobIdRef.current = job.id;
+          toastRef.current.error(failureParts(textRef.current, failure).headline);
+        }
         setJob((current) => current === null
           ? current
           : {
@@ -632,10 +1119,12 @@ function DshPluginsPageBody({ theme, host, layout, openDisplaySettings }: DshPlu
     try {
       const started = await startJob(input);
       if (!started.ok || started.id === undefined) {
-        setActionError({
+        const failure: UiFailure = {
           code: started.errorCode ?? "command-failed",
           ...(started.errorDetail === undefined ? {} : { detail: started.errorDetail }),
-        });
+        };
+        setActionError(failure);
+        toastRef.current.error(failureParts(textRef.current, failure).headline);
         return false;
       }
       setJob({
@@ -655,7 +1144,9 @@ function DshPluginsPageBody({ theme, host, layout, openDisplaySettings }: DshPlu
         });
       return true;
     } catch (error) {
-      setActionError(failureOf(error));
+      const failure = failureOf(error);
+      setActionError(failure);
+      toastRef.current.error(failureParts(textRef.current, failure).headline);
       return false;
     }
   }, [startJob]);
@@ -669,9 +1160,11 @@ function DshPluginsPageBody({ theme, host, layout, openDisplaySettings }: DshPlu
     try {
       setInspection(await inspectSpec({ spec: value }));
     } catch (error) {
-      setActionError(failureOf(error));
+      const failure = failureOf(error);
+      setActionError(failure);
+      toast.error(failureParts(text, failure).headline);
     } finally {
-      setInspecting(false);
+      if (mountedRef.current) setInspecting(false);
     }
   };
 
@@ -687,51 +1180,84 @@ function DshPluginsPageBody({ theme, host, layout, openDisplaySettings }: DshPlu
     try {
       const result = await setEnabled({ name: bundle.name, enabled: !bundle.enabled });
       if (!result.ok) {
-        setActionError({
+        const failure: UiFailure = {
           code: result.errorCode ?? "command-failed",
           ...(result.errorDetail === undefined ? {} : { detail: result.errorDetail }),
-        });
+        };
+        setActionError(failure);
+        toast.error(failureParts(text, failure).headline);
         return;
       }
-      await refresh();
+      toast.show(
+        result.enabled ? extra.toastEnabled(bundle.name) : extra.toastDisabled(bundle.name),
+        { variant: "success" },
+      );
+      await refresh(false);
     } catch (error) {
-      setActionError(failureOf(error));
+      const failure = failureOf(error);
+      setActionError(failure);
+      toast.error(failureParts(text, failure).headline);
     } finally {
-      setToggleBusy(null);
+      if (mountedRef.current) setToggleBusy(null);
     }
   };
 
-  const remove = async (name: string): Promise<void> => {
-    if (name === "") {
+  const handleRemovePress = async (bundle: BundleInfo | null): Promise<void> => {
+    if (bundle === null) {
       setConfirmRemove(null);
       return;
     }
-    if (confirmRemove !== name) {
-      setConfirmRemove(name);
+    if (useModalConfirm) {
+      openConfirmDialog({
+        kind: "remove",
+        name: bundle.name,
+        title: bundle.title,
+        version: bundle.version,
+      });
+      return;
+    }
+    if (confirmRemove !== bundle.name) {
+      setConfirmRemove(bundle.name);
       return;
     }
     setConfirmRemove(null);
-    await beginJob({ kind: "remove", name });
+    await beginJob({ kind: "remove", name: bundle.name });
   };
 
-  const update = async (name: string, version: string): Promise<void> => {
-    if (name === "" || version === "") {
+  const handleUpdatePress = async (bundle: BundleInfo | null): Promise<void> => {
+    if (bundle === null || bundle.update === undefined || bundle.update === "") {
       setConfirmUpdate(null);
       return;
     }
-    if (confirmUpdate?.name !== name || confirmUpdate.version !== version) {
-      setConfirmUpdate({ name, version });
+    const targetVersion = bundle.update;
+    if (useModalConfirm) {
+      openConfirmDialog({
+        kind: "update",
+        name: bundle.name,
+        title: bundle.title,
+        currentVersion: bundle.version,
+        version: targetVersion,
+      });
+      return;
+    }
+    if (confirmUpdate?.name !== bundle.name || confirmUpdate.version !== targetVersion) {
+      setConfirmUpdate({ name: bundle.name, version: targetVersion });
       return;
     }
     setConfirmUpdate(null);
-    await beginJob({ kind: "update", name, version });
+    await beginJob({ kind: "update", name: bundle.name, version: targetVersion });
   };
 
-  // A new or finished job invalidates a pending "confirm update all": the
-  // button must not keep an armed state across a refresh or a re-check.
+  // A new or finished job invalidates any armed confirmation state: neither
+  // inline buttons nor an open modal should survive across a refresh or re-check.
   useEffect(() => {
     setConfirmUpdateAll(false);
-  }, [job?.id, job?.state]);
+    setConfirmRemove(null);
+    setConfirmUpdate(null);
+    closeConfirmDialog();
+  }, [job?.id, job?.state, closeConfirmDialog]);
+
+  const bundles = snapshot?.bundles ?? [];
 
   /**
    * Update every row that currently reads updatable.
@@ -748,6 +1274,10 @@ function DshPluginsPageBody({ theme, host, layout, openDisplaySettings }: DshPlu
       setConfirmUpdateAll(false);
       return;
     }
+    if (useModalConfirm) {
+      openConfirmDialog({ kind: "update-all", targets });
+      return;
+    }
     if (!confirmUpdateAll) {
       setConfirmUpdateAll(true);
       return;
@@ -756,167 +1286,246 @@ function DshPluginsPageBody({ theme, host, layout, openDisplaySettings }: DshPlu
     await beginJob({ kind: "update-all", targets });
   };
 
-  const bundles = snapshot?.bundles ?? [];
+  const submitConfirmDialog = async (): Promise<void> => {
+    const active = dialogRef.current;
+    if (active === null || confirmSubmitting) return;
+    setConfirmSubmitting(true);
+    try {
+      if (active.kind === "remove") {
+        await beginJob({ kind: "remove", name: active.name });
+      } else if (active.kind === "update") {
+        await beginJob({ kind: "update", name: active.name, version: active.version });
+      } else {
+        await beginJob({ kind: "update-all", targets: [...active.targets] });
+      }
+      if (mountedRef.current) closeConfirmDialog();
+    } finally {
+      if (mountedRef.current) setConfirmSubmitting(false);
+    }
+  };
 
   const checkButton = (
-    <ActionButton
+    <Button
+      colors={colors}
+      size="md"
+      variant="secondary"
+      icon="Search"
       label={inspecting ? text.install.checking : text.install.check}
+      loading={inspecting}
       disabled={busy || inspecting || spec.trim() === ""}
       onPress={() => {
         void inspect();
       }}
-      styles={styles}
     />
   );
+
   const groups = [
-    { title: text.groups.enabled, items: bundles.filter((bundle) => bundle.enabled && bundle.kind !== "dependency") },
-    { title: text.groups.disabled, items: bundles.filter((bundle) => !bundle.enabled && bundle.kind !== "dependency") },
-    { title: text.groups.dependencies, items: bundles.filter((bundle) => bundle.kind === "dependency") },
+    {
+      title: text.groups.enabled,
+      items: bundles.filter((bundle) => bundle.enabled && bundle.kind !== "dependency"),
+    },
+    {
+      title: text.groups.disabled,
+      items: bundles.filter((bundle) => !bundle.enabled && bundle.kind !== "dependency"),
+    },
+    {
+      title: text.groups.dependencies,
+      items: bundles.filter((bundle) => bundle.kind === "dependency"),
+    },
   ].filter((group) => group.items.length > 0);
 
-  return (
-    <ScrollView
-      style={{ flex: 1, backgroundColor: theme.colors.surface0 }}
-      contentContainerStyle={styles.content}
-    >
+  const profileHeadline = snapshot !== null
+    ? host?.label
+      ? text.header.profile(snapshot.profile, host.label)
+      : snapshot.profile
+    : host?.label ?? text.pageTitle;
+
+  const updateCount = job?.kind === "check" && job.updates !== undefined
+    ? Object.keys(job.updates).length
+    : 0;
+
+  const body = (
+    <>
       <View style={styles.header}>
         <View style={styles.headerText}>
-          <Text style={styles.muted}>
-            {snapshot === null
-              ? host.label
-              : text.header.profile(snapshot.profile, host.label)}
-          </Text>
-          {snapshot === null ? null : <Text style={styles.path}>{snapshot.displayDir}</Text>}
+          <Text style={styles.profileTitle}>{profileHeadline}</Text>
+          {snapshot === null ? null : (
+            <Text selectable style={styles.path}>{snapshot.displayDir}</Text>
+          )}
           <Text style={styles.notice}>{text.header.notice}</Text>
         </View>
         <View style={styles.headerActions}>
-          <ActionButton
+          <Button
+            colors={colors}
+            size="sm"
+            variant="secondary"
+            icon="RefreshCw"
             label={refreshing ? text.header.refreshing : text.header.refresh}
+            loading={refreshing}
             disabled={refreshing}
             onPress={() => {
-              void refresh();
+              void refresh(true);
             }}
-            styles={styles}
           />
-          <ActionButton
+          <Button
+            colors={colors}
+            size="sm"
+            variant="secondary"
+            icon="ArrowUpCircle"
             label={job?.kind === "check" && job.state === "running"
               ? text.header.checkingUpdates
               : text.header.checkUpdates}
+            loading={job?.kind === "check" && job.state === "running"}
             disabled={busy}
             onPress={() => {
               void beginJob({ kind: "check" });
             }}
-            styles={styles}
           />
           {openDisplaySettings === undefined ? null : (
-            <ActionButton
+            <Button
+              colors={colors}
+              size="sm"
+              variant="ghost"
+              icon="SlidersHorizontal"
               label={uiText.settings.title}
               onPress={openDisplaySettings}
-              styles={styles}
             />
           )}
         </View>
       </View>
 
+      <Divider colors={colors} />
+
       {loadError === null ? null : (
-        <View style={styles.errorCard}>
-          <Text style={styles.errorText}>{failureText(text, loadError)}</Text>
-          <ActionButton
-            label={text.header.retry}
-            onPress={() => {
-              void refresh();
-            }}
-            styles={styles}
-          />
-        </View>
+        <FailureCallout
+          colors={colors}
+          text={text}
+          failure={loadError}
+          styles={styles}
+          action={(
+            <Button
+              colors={colors}
+              size="sm"
+              variant="secondary"
+              icon="RotateCcw"
+              label={text.header.retry}
+              onPress={() => {
+                void refresh(true);
+              }}
+            />
+          )}
+        />
       )}
 
       {actionError === null ? null : (
-        <View style={styles.errorCard}>
-          <Text style={styles.errorText}>{failureText(text, actionError)}</Text>
-        </View>
+        <FailureCallout
+          colors={colors}
+          text={text}
+          failure={actionError}
+          styles={styles}
+        />
       )}
 
       {job === null ? null : (
-        <View style={styles.statusCard}>
+        <Card colors={colors} style={styles.cardBody}>
           <View style={styles.rowTop}>
             {job.state === "running" ? (
-              <ActivityIndicator size="small" color={theme.colors.accent} />
+              <ActivityIndicator size="small" color={colors.accent} />
             ) : null}
             <Text style={styles.name}>{jobTitle(job, text)}</Text>
-            {job.state === "failed" ? <Badge label={text.job.failedBadge} tone="danger" styles={styles} /> : null}
-            {job.state === "succeeded" ? <Badge label={text.job.doneBadge} tone="success" styles={styles} /> : null}
+            {job.state === "failed" ? (
+              <Badge colors={colors} tone="danger" dot label={text.job.failedBadge} />
+            ) : null}
+            {job.state === "succeeded" ? (
+              <Badge colors={colors} tone="success" dot label={text.job.doneBadge} />
+            ) : null}
           </View>
-          {job.errorCode === undefined
-            ? null
-            : (
-              <Text style={styles.errorText}>
-                {failureText(text, {
-                  code: job.errorCode,
-                  ...(job.errorDetail === undefined ? {} : { detail: job.errorDetail }),
-                })}
-              </Text>
-            )}
-          {job.kind === "check" && job.updates !== undefined && Object.keys(job.updates).length > 0 ? (
-            <View style={styles.resultRow}>
-              <Text style={styles.muted}>
-                {text.job.updatesFound(Object.keys(job.updates).length)}
-              </Text>
-              {/* marginLeft:"auto" right-aligns the button on the same line
-                  when it fits, and on its own wrapped line when it does not. */}
-              <View style={styles.resultAction}>
-                <ActionButton
-                  label={confirmUpdateAll
-                    ? text.job.confirmUpdateAll(Object.keys(job.updates).length)
-                    : text.job.updateAll}
-                  disabled={busy}
-                  primary={confirmUpdateAll}
-                  onPress={() => {
-                    void runUpdateAll();
-                  }}
-                  styles={styles}
-                />
+          {job.errorCode === undefined ? null : (
+            <FailureCallout
+              colors={colors}
+              text={text}
+              failure={{
+                code: job.errorCode,
+                ...(job.errorDetail === undefined ? {} : { detail: job.errorDetail }),
+              }}
+              styles={styles}
+            />
+          )}
+          {updateCount > 0 ? (
+            <>
+              <Divider colors={colors} />
+              <View style={styles.resultRow}>
+                <Muted colors={colors}>{text.job.updatesFound(updateCount)}</Muted>
+                {/* marginLeft:"auto" right-aligns the button on the same line
+                    when it fits, and on its own wrapped line when it does not. */}
+                <View style={styles.resultAction}>
+                  <Button
+                    colors={colors}
+                    size="sm"
+                    variant={useModalConfirm || confirmUpdateAll ? "primary" : "secondary"}
+                    icon="ArrowUpCircle"
+                    label={!useModalConfirm && confirmUpdateAll
+                      ? text.job.confirmUpdateAll(updateCount)
+                      : text.job.updateAll}
+                    disabled={busy}
+                    onPress={() => {
+                      void runUpdateAll();
+                    }}
+                  />
+                </View>
               </View>
-            </View>
+            </>
           ) : null}
           {job.updateResults === undefined || job.updateResults.length === 0 ? null : (
-            <View style={styles.section}>
-              <Text style={styles.muted}>
-                {text.job.updateResultsSummary(
-                  job.updateResults.filter((outcome) => outcome.ok).length,
-                  job.updateResults.filter((outcome) => !outcome.ok).length,
-                )}
-              </Text>
-              {job.updateResults.map((outcome) => (
-                <View key={outcome.name} style={styles.resultItem}>
-                  <View style={styles.rowTop}>
-                    <Text style={styles.name}>{outcome.name}</Text>
-                    <Text style={styles.version}>{outcome.version}</Text>
-                    {outcome.ok
-                      ? <Badge label={text.job.doneBadge} tone="success" styles={styles} />
-                      : <Badge label={text.job.failedBadge} tone="danger" styles={styles} />}
-                  </View>
-                  {outcome.ok ? null : (
-                    <Text style={styles.errorText}>
-                      {failureText(text, {
-                        code: outcome.errorCode ?? "command-failed",
-                        ...(outcome.errorDetail === undefined ? {} : { detail: outcome.errorDetail }),
-                      })}
-                    </Text>
+            <>
+              <Divider colors={colors} />
+              <View style={styles.section}>
+                <Muted colors={colors} style={tabular}>
+                  {text.job.updateResultsSummary(
+                    job.updateResults.filter((outcome) => outcome.ok).length,
+                    job.updateResults.filter((outcome) => !outcome.ok).length,
                   )}
-                </View>
-              ))}
-            </View>
+                </Muted>
+                {job.updateResults.map((outcome) => (
+                  <View key={outcome.name} style={styles.resultItem}>
+                    <View style={styles.rowTop}>
+                      <Text style={styles.name}>{outcome.name}</Text>
+                      <Text style={styles.version}>{outcome.version}</Text>
+                      {outcome.ok ? (
+                        <Badge colors={colors} tone="success" dot label={text.job.doneBadge} />
+                      ) : (
+                        <Badge colors={colors} tone="danger" dot label={text.job.failedBadge} />
+                      )}
+                    </View>
+                    {outcome.ok ? null : (
+                      <FailureCallout
+                        colors={colors}
+                        text={text}
+                        failure={{
+                          code: outcome.errorCode ?? "command-failed",
+                          ...(outcome.errorDetail === undefined
+                            ? {}
+                            : { detail: outcome.errorDetail }),
+                        }}
+                        styles={styles}
+                      />
+                    )}
+                  </View>
+                ))}
+              </View>
+            </>
           )}
           {job.output === "" ? null : (
-            <Text style={styles.output}>{tailLines(job.output, 12)}</Text>
+            <View style={styles.outputBox}>
+              <Text selectable style={styles.output}>{tailLines(job.output, 12)}</Text>
+            </View>
           )}
-        </View>
+        </Card>
       )}
 
-      <View style={styles.card}>
+      <Card colors={colors} style={styles.cardBody}>
         <Text style={styles.groupTitle}>{text.install.title}</Text>
-        <Text style={styles.muted}>{text.install.hint}</Text>
+        <Muted colors={colors}>{text.install.hint}</Muted>
         {/* Wide: the input grows and the check button sits on its right edge.
             Compact: the button moves under the input, right-aligned. */}
         <View style={compact ? styles.inputStack : styles.inputRow}>
@@ -927,7 +1536,7 @@ function DshPluginsPageBody({ theme, host, layout, openDisplaySettings }: DshPlu
               setInspection(null);
             }}
             placeholder={text.install.placeholder}
-            placeholderTextColor={theme.colors.foregroundMuted}
+            placeholderTextColor={tint(colors.foregroundMuted, 0.7)}
             editable={!busy && !inspecting && !(inspection?.ok === true)}
             autoCapitalize="none"
             autoCorrect={false}
@@ -936,102 +1545,185 @@ function DshPluginsPageBody({ theme, host, layout, openDisplaySettings }: DshPlu
           {compact ? null : checkButton}
         </View>
         {compact ? <View style={styles.checkRow}>{checkButton}</View> : null}
-        {inspection === null ? null : (
-          <View style={styles.rowActions}>
-            <ActionButton
-              label={text.bundle.cancel}
-              disabled={busy || inspecting}
-              onPress={() => {
-                setInspection(null);
-              }}
-              styles={styles}
-            />
-          </View>
-        )}
 
         {inspection === null ? null : inspection.ok ? (
           <View style={styles.infoBox}>
-            <Text style={styles.name}>
-              {inspection.name ?? text.install.unknown}
-              {inspection.version === undefined ? "" : ` ${inspection.version}`}
-            </Text>
+            <View style={styles.rowTop}>
+              <Text style={styles.name}>{inspection.name ?? text.install.unknown}</Text>
+              {inspection.version === undefined ? null : (
+                <Badge colors={colors} tone="accent" label={inspection.version} />
+              )}
+              {inspection.client ? (
+                <Badge colors={colors} tone="warning" icon="Monitor" label={text.badges.client} />
+              ) : null}
+            </View>
             {inspection.description === undefined || inspection.description === ""
               ? null
               : <Text style={styles.description}>{inspection.description}</Text>}
-            {inspection.client
-              ? <Text style={styles.muted}>{text.bundle.clientNote}</Text>
-              : null}
-            <Text style={styles.muted}>{text.install.trust}</Text>
+            {inspection.client ? <Muted colors={colors}>{text.bundle.clientNote}</Muted> : null}
+            <Callout colors={colors} tone="warning" title={text.install.trust} />
             <View style={styles.rowActions}>
-              <ActionButton
+              <Button
+                colors={colors}
+                size="sm"
+                variant="primary"
+                icon="Download"
                 label={text.install.confirm}
-                primary
                 disabled={busy}
                 onPress={() => {
                   void install();
                 }}
-                styles={styles}
               />
-              <ActionButton
+              <Button
+                colors={colors}
+                size="sm"
+                variant="ghost"
                 label={text.bundle.cancel}
                 disabled={busy}
                 onPress={() => {
                   setInspection(null);
                 }}
-                styles={styles}
               />
             </View>
           </View>
+        ) : inspection.errorCode === "not-a-bundle" ? (
+          <Callout
+            colors={colors}
+            tone="danger"
+            title={text.install.notBundle}
+            action={(
+              <Button
+                colors={colors}
+                size="sm"
+                variant="ghost"
+                label={text.bundle.cancel}
+                disabled={busy || inspecting}
+                onPress={() => {
+                  setInspection(null);
+                }}
+              />
+            )}
+          />
         ) : (
-          <View style={styles.infoBox}>
-            <Text style={styles.errorText}>
-              {inspection.errorCode === "not-a-bundle"
-                ? text.install.notBundle
-                : failureText(text, {
-                  code: inspection.errorCode ?? "command-failed",
-                  ...(inspection.errorDetail === undefined ? {} : { detail: inspection.errorDetail }),
-                })}
-            </Text>
-          </View>
+          <FailureCallout
+            colors={colors}
+            text={text}
+            failure={{
+              code: inspection.errorCode ?? "command-failed",
+              ...(inspection.errorDetail === undefined
+                ? {}
+                : { detail: inspection.errorDetail }),
+            }}
+            styles={styles}
+            action={(
+              <Button
+                colors={colors}
+                size="sm"
+                variant="ghost"
+                label={text.bundle.cancel}
+                disabled={busy || inspecting}
+                onPress={() => {
+                  setInspection(null);
+                }}
+              />
+            )}
+          />
         )}
-      </View>
+      </Card>
 
       {snapshot === null && loadError === null ? (
-        <View style={styles.statusCard}>
-          <ActivityIndicator size="small" color={theme.colors.accent} />
-          <Text style={styles.muted}>{text.status.loadingProfile}</Text>
-        </View>
+        <Card colors={colors} style={styles.loadingCard}>
+          <ActivityIndicator size="small" color={colors.accent} />
+          <Muted colors={colors}>{text.status.loadingProfile}</Muted>
+        </Card>
       ) : null}
 
       {groups.map((group) => (
         <View key={group.title} style={styles.section}>
-          <Text style={styles.groupTitle}>
-            {group.title} · {group.items.length}
-          </Text>
+          <View style={styles.groupHeader}>
+            <Text style={styles.groupTitle}>{group.title}</Text>
+            <View style={styles.groupCountPill}>
+              <Text style={styles.groupCountText}>{group.items.length}</Text>
+            </View>
+          </View>
           {group.items.map((bundle) => (
             <BundleRow
               key={bundle.name}
               bundle={bundle}
+              colors={colors}
               text={text}
               styles={styles}
               busy={busy}
               toggleBusy={toggleBusy}
+              useModalConfirm={useModalConfirm}
               confirmRemove={confirmRemove}
               confirmUpdate={confirmUpdate}
               onToggle={(item) => {
                 void toggle(item);
               }}
-              onRemove={(name) => {
-                void remove(name);
+              onRemove={(item) => {
+                void handleRemovePress(item);
               }}
-              onUpdate={(name, version) => {
-                void update(name, version);
+              onUpdate={(item) => {
+                void handleUpdatePress(item);
               }}
             />
           ))}
         </View>
       ))}
+
+      {modalComponent !== null && confirmDialog !== null ? (
+        <ConfirmActionModal
+          ModalComponent={modalComponent}
+          dialog={confirmDialog}
+          colors={colors}
+          text={text}
+          extra={extra}
+          styles={styles}
+          busy={busy}
+          submitting={confirmSubmitting}
+          onConfirm={() => {
+            void submitConfirmDialog();
+          }}
+          onClose={closeConfirmDialog}
+        />
+      ) : null}
+    </>
+  );
+
+  if (embedded) {
+    return <View style={styles.embeddedContent}>{body}</View>;
+  }
+
+  return (
+    <ScrollView
+      style={{ flex: 1, backgroundColor: colors.surface0 }}
+      contentContainerStyle={styles.content}
+    >
+      {body}
     </ScrollView>
+  );
+}
+
+/**
+ * Reusable Plugins management content mounted either standalone inside
+ * `DshPluginsPage` or embedded inside the 3-tab DSH Console (`embedded: true`).
+ * Wrapped in `PluginsBoundary` so a render error stays isolated to this view.
+ */
+export function DshPluginsContent(props: DshPluginsContentProps) {
+  const text = useLocaleText().plugins;
+  return (
+    <PluginsBoundary
+      fallback={(
+        <PluginsFailedCard
+          message={text.errors.render}
+          color={props.colors.statusDanger}
+          background={props.colors.surface0}
+        />
+      )}
+    >
+      <DshPluginsBody {...props} />
+    </PluginsBoundary>
   );
 }
 
@@ -1046,19 +1738,19 @@ export interface DshPluginsPageProps extends PluginScreenProps {
  * one malformed field or host prop from taking the sidebar and every open agent
  * down with it.
  */
-export function DshPluginsPage(props: DshPluginsPageProps) {
-  const text = useLocaleText().plugins;
+export function DshPluginsPage({
+  theme,
+  host,
+  layout,
+  openDisplaySettings,
+}: DshPluginsPageProps) {
   return (
-    <PluginsBoundary
-      fallback={(
-        <PluginsFailedCard
-          message={text.errors.render}
-          color={props.theme.colors.statusDanger}
-          background={props.theme.colors.surface0}
-        />
-      )}
-    >
-      <DshPluginsPageBody {...props} />
-    </PluginsBoundary>
+    <DshPluginsContent
+      colors={theme.colors}
+      host={host}
+      layout={layout}
+      openDisplaySettings={openDisplaySettings}
+      embedded={false}
+    />
   );
 }
